@@ -67,6 +67,11 @@ inline constexpr uint16_t FID_SLOT_COUNT       = cst_wire::FID_SLOT_COUNT;
 inline constexpr size_t  MAX_WIDE_BYTES       = cst_wire::WIDE_BYTES_MAX;
 inline constexpr int     MAX_INSN_BYTES       = cst_wire::INSN_BYTES_MAX;
 
+/* One resolved FID per wire slot of a slotted family (see ResolvedIds).
+ * Sized by the wire ceiling rather than by observed occupancy: it is a
+ * fixed per-header table, not a per-entry or per-template structure. */
+using FidSlotArray = std::array<uint16_t, FID_SLOT_COUNT>;
+
 /* ===== Resolved IDs =====
  *
  * parse_header reverse-resolves the well-known names in the trace's
@@ -91,30 +96,32 @@ struct ResolvedIds {
 
     /* field_id map: per-slot FID arrays + singletons.  FIDs are
      * ULEB128 on the wire; per-slot arrays are filled by name lookup
-     * of CST_FID_<family><k> per k (no stride assumption). */
+     * of CST_FID_<family><k> per k (no stride assumption).  Sized by
+     * FID_SLOT_COUNT so the arrays track the wire's slot ceiling
+     * automatically; an entry a trace does not advertise stays 0. */
     uint16_t fid_n_loads          = 0;
     uint16_t fid_n_stores         = 0;
     uint16_t fid_metaflags        = 0;
-    std::array<uint16_t, 64> fid_load_addr             {};
-    std::array<uint16_t, 64> fid_store_addr            {};
-    std::array<uint16_t, 64> fid_load_data             {};
-    std::array<uint16_t, 64> fid_store_data            {};
-    std::array<uint16_t, 64> fid_dst_reg               {};
+    FidSlotArray fid_load_addr             {};
+    FidSlotArray fid_store_addr            {};
+    FidSlotArray fid_load_data             {};
+    FidSlotArray fid_store_data            {};
+    FidSlotArray fid_dst_reg               {};
     /* Per-slot byte width of each memop value / dst-register write
      * (CST_FID_LOAD_SIZE / STORE_SIZE / DST_REG_WIDTH), for value
      * prediction.  Gated with their value families. */
-    std::array<uint16_t, 64> fid_load_size             {};
-    std::array<uint16_t, 64> fid_store_size            {};
-    std::array<uint16_t, 64> fid_dst_reg_width         {};
-    std::array<uint16_t, 64> fid_src_lane_mask         {};
-    std::array<uint16_t, 64> fid_dst_lane_mask         {};
-    std::array<uint16_t, 64> fid_load_data_lane_mask   {};
-    std::array<uint16_t, 64> fid_store_data_lane_mask  {};
+    FidSlotArray fid_load_size             {};
+    FidSlotArray fid_store_size            {};
+    FidSlotArray fid_dst_reg_width         {};
+    FidSlotArray fid_src_lane_mask         {};
+    FidSlotArray fid_dst_lane_mask         {};
+    FidSlotArray fid_load_data_lane_mask   {};
+    FidSlotArray fid_store_data_lane_mask  {};
     /* Per-slot physical PAGE base of each memop (CST_FID_LOAD_PPAGE /
      * STORE_PPAGE).  Present only on CST_FLAG_PHYSADDR (system-mode) traces;
      * absent -> sentinel 0, so a non-physaddr trace resolves none. */
-    std::array<uint16_t, 64> fid_load_ppage            {};
-    std::array<uint16_t, 64> fid_store_ppage           {};
+    FidSlotArray fid_load_ppage            {};
+    FidSlotArray fid_store_ppage           {};
     uint16_t fid_insn_bytes_lo    = 0;
     uint16_t fid_insn_bytes_hi    = 0;
     uint16_t fid_insn_opcode      = 0;

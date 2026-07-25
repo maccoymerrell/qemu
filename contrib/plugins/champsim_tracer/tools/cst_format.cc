@@ -323,7 +323,7 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
     resolve_optional(maps.field_id, "CST_FID_N_STORES",  &ids->fid_n_stores);
     resolve_optional(maps.field_id, "CST_FID_METAFLAGS", &ids->fid_metaflags);
     static const struct { const char *prefix;
-                          std::array<uint16_t, 64> ResolvedIds::*arr; } fam[] = {
+                          FidSlotArray ResolvedIds::*arr; } fam[] = {
         { "CST_FID_LOAD_ADDR",            &ResolvedIds::fid_load_addr            },
         { "CST_FID_STORE_ADDR",           &ResolvedIds::fid_store_addr           },
         { "CST_FID_LOAD_DATA",            &ResolvedIds::fid_load_data            },

@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "champsim_tracer_generic_ids.h"
+#include "cst_wire_spec.h"
 
 /* Null-safe string equality (g_strcmp0 replacement).  Defined here,
  * not in champsim_tracer.h, because the per-ISA mnemonic headers are
@@ -74,21 +75,48 @@ typedef struct {
  * without the rest of the tracer internals.
  */
 /*
- * Per-insn template-static caps.  Bound the static InsnFields arrays
- * and the dep-mask bit layout; must match the wire format's per-family
- * FID slot ceiling (CST_FID_SLOT_COUNT).  Source regs aren't
- * FID-slotted but the dep-mask layout uses MAX_SRC_REGS as the
- * lower-band boundary, so it grows in lockstep.
+ * Per-insn TEMPLATE-STATIC caps.  These bound what the operand walker
+ * may record at translation time — the static register and memop
+ * operand counts Capstone reports for one instruction encoding — and
+ * they fix the dep-mask bit layout below.
+ *
+ * They are deliberately NOT the same quantity as the wire's per-family
+ * FID slot ceiling (CST_FID_SLOT_COUNT), which bounds the DYNAMIC
+ * per-execution memop count.  The two diverge whenever one static memory
+ * operand expands into many architectural accesses: x86 XSAVEOPT is a
+ * single static store operand that issues 88 stores on a Haswell-class
+ * guest, and a rep-string is one static operand with an unbounded
+ * dynamic fan-out.  The wire ceiling must cover the dynamic count; the
+ * static caps need only cover an encoding's operand list (the widest
+ * real case is ARM LD4/ST4 at 4).
+ *
+ * Keeping the static caps at 64 is load-bearing, not incidental:
+ *   - The dep masks are uint64_t.  Their bit layout stacks
+ *     n_src_regs + max_dep_loads + 1 (immediate) bits into those 64
+ *     bits, and the walker clamps each band independently
+ *     (add_src_reg / the max_dep_loads guard in
+ *     champsim_tracer_decode.cc), so the layout only has room while the
+ *     two bands together stay under 64 — which real encodings do by a
+ *     wide margin.  Raising either cap toward the wire ceiling would
+ *     make the sum unrepresentable.
+ *   - InsnFieldsScratch's build-time backing arrays are sized by these
+ *     caps.  Raising them to the wire ceiling would restore exactly the
+ *     fixed-64-slot-array footprint that made per-insn metadata dominate
+ *     the plugin heap at 3272 B/insn.
+ *
+ * The invariant that DOES have to hold is static <= dynamic, asserted
+ * below: a template-static slot must always be addressable on the wire.
  */
 #define MAX_SRC_REGS 64
 #define MAX_DST_REGS 64
-/*
- * Per-insn template-static memop caps.  Match CST_FID_SLOT_COUNT.
- * Real insns stay well below (ARM LD4/ST4 maxes at 4); the cap is
- * generous since cost is per InsnFields slot, not per emitted byte.
- */
 #define MAX_STORES   64
 #define MAX_LOADS    64
+
+static_assert(MAX_SRC_REGS <= cst_wire::FID_SLOT_COUNT &&
+              MAX_DST_REGS <= cst_wire::FID_SLOT_COUNT &&
+              MAX_LOADS    <= cst_wire::FID_SLOT_COUNT &&
+              MAX_STORES   <= cst_wire::FID_SLOT_COUNT,
+              "a template-static slot must be addressable on the wire");
 
 /*
  * Lane-mask dispatch kinds (InsnFields.lane_mask_kind).  Let the

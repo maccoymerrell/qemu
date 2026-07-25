@@ -436,6 +436,36 @@ extern "C" {
 /* Total well-known field-id count, for sanity / encoding-map size. */
 #define CST_FID_COUNT            (CST_FID_BRANCH_TARGET + 1)
 
+/*
+ * Field-ID map disjointness.  Every block above derives its base and
+ * extent from CST_FID_SLOT_COUNT, so the map is parametric in the slot
+ * ceiling: raising the ceiling slides the lane / insn-metadata / ppage /
+ * branch blocks upward as a unit and never collides.  These assertions
+ * pin that property so a future edit to a base, a stride, or the slot
+ * count cannot silently overlap two families onto one ID.
+ *
+ * Ordering: hot singletons < slotted block < lane block < insn metadata
+ * + EXTENDED < ppage block < branch block.
+ */
+static_assert(CST_FID_METAFLAGS < CST_FID_LOAD_ADDR_BASE,
+              "hot singletons must precede the slotted block");
+static_assert(CST_FID_DST_REG_WIDTH_BASE
+                  == CST_FID_LOAD_ADDR_BASE + CST_FID_SLOT_STRIDE - 1,
+              "the 8 slotted family bases must be adjacent and match the "
+              "stride, or slot k of one family aliases slot k+1 of another");
+static_assert(CST_FID_LANE_BLOCK_BASE > CST_FID_SLOTTED_END,
+              "lane block overlaps the slotted block");
+static_assert(CST_FID_INSN_BYTES_LO > CST_FID_LANE_BLOCK_END,
+              "insn-metadata block overlaps the lane block");
+static_assert(CST_FID_PPAGE_BLOCK_BASE > CST_FID_EXTENDED,
+              "ppage block overlaps the EXTENDED escape");
+static_assert(CST_FID_BRANCH_BLOCK_BASE > CST_FID_PPAGE_BLOCK_END,
+              "branch block overlaps the ppage block");
+/* Slot 0 of every slotted family, plus the hot singletons, must stay in
+ * the 1-byte ULEB range so the common per-memop record costs one byte. */
+static_assert(CST_FID_DST_REG_WIDTH_BASE < 128,
+              "slot-0 field IDs must remain 1-byte ULEB128");
+
 /* ===== Types ===== */
 
 /* InsnFields is defined in champsim_tracer_mnemonics.h. */

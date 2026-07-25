@@ -41,12 +41,14 @@ namespace cst {
  * an unordered_map<u64,Wide> (~10% of decode time in hash lookups). */
 /* FIELD_STATE_SLOT_COUNT is the LOGICAL slot-index space produced by
  * slot_lut_build (the fid -> dense-slot LUT):
- *   3 singletons (N_LOADS, N_STORES, METAFLAGS) + 12 * FID_SLOT_COUNT
+ *   3 singletons (N_LOADS, N_STORES, METAFLAGS) + 14 * FID_SLOT_COUNT
  *   slot-major slotted cells (families: load_addr/store_addr/load_data/
  *   store_data/dst_reg/load_size/store_size/dst_reg_width + the 4
- *   lane-mask families) + 7 insn-metadata singletons.  EXTENDED has no
- *   persistent cell.  Bump alongside the writer when new families are
- *   added.
+ *   lane-mask families + the 2 physical-page families) + 7
+ *   insn-metadata singletons + the 2 branch-outcome singletons.
+ *   EXTENDED has no persistent cell.  Bump alongside the writer when
+ *   new families are added.  (Kept in step with FS_N_FAMILIES /
+ *   FS_SLOTTED_END in cst_decode.cc, which own the same layout.)
  *
  * The PHYSICAL block layout is compacted per FieldStateBlock::max_slots
  * (see cell_read/cell_write in cst_decode.cc): fixed singletons first,
@@ -55,11 +57,20 @@ namespace cst {
  * decomposed on access; a slot >= max_slots reads as a miss and grows
  * the block on write. */
 inline constexpr size_t  FIELD_STATE_SLOT_COUNT   =
-    3 + 8 * FID_SLOT_COUNT + 4 * FID_SLOT_COUNT + 7;
+    3 + 14 * FID_SLOT_COUNT + 9;
 inline constexpr uint16_t FIELD_STATE_SLOT_INVALID = 0xFFFFu;
-/* fid space is ULEB-encoded; the highest slotted FID at slot 63 is
- * ~322.  Round to next power-of-two for a single-load slot lookup. */
-inline constexpr size_t  FID_LUT_SIZE             = 1024;
+/* Reverse index over the wire's ULEB-encoded field-id space: a fid at or
+ * above this is treated as unknown and its record skipped.  It must
+ * therefore cover the WHOLE well-known fid space, which the writer sizes
+ * from FID_SLOT_COUNT (the top of the branch block sits just past
+ * 14 * FID_SLOT_COUNT).  Rounded to a power of two for a single-load
+ * lookup; at 512 slots the highest well-known fid is ~7180. */
+inline constexpr size_t  FID_LUT_SIZE             = 8192;
+static_assert(FID_LUT_SIZE > FIELD_STATE_SLOT_COUNT,
+              "fid LUT must span the whole well-known field-id space");
+static_assert(FIELD_STATE_SLOT_COUNT < FIELD_STATE_SLOT_INVALID,
+              "logical slot indices must stay distinguishable from the "
+              "invalid sentinel");
 
 struct FieldStateBlock {
     uint32_t              n_insns = 0;

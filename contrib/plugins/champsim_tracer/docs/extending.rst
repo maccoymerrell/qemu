@@ -316,7 +316,7 @@ canonical authority for the layout is the wire-format spec
 ``champsim_tracer.h``.  Slotted families (load/store addresses,
 load/store data, destination-register snapshots, load/store/dst-register
 byte widths) each span
-``CST_FID_SLOT_COUNT`` (64) slots, interleaved by slot with a
+``CST_FID_SLOT_COUNT`` (512) slots, interleaved by slot with a
 per-family stride of ``CST_FID_SLOT_STRIDE`` so slot 0 of every family
 plus the hot singletons occupy the cheap low-ID range.  The lane-mask
 block follows at ``CST_FID_LANE_BLOCK_BASE`` (stride

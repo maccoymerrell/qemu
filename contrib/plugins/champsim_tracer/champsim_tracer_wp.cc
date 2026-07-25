@@ -430,7 +430,7 @@ static WpStep wp_check_forward_progress(WpWalkState &st)
              * on every fetch, making no forward progress at all.  Those
              * must die fast: in a system-mode kernel a stuck excursion
              * recurs on essentially every BB, and at the old
-             * CST_FID_SLOT_COUNT (64) threshold each wasted ~64 steps,
+             * per-insn memop cap each wasted a full cap's worth of steps,
              * so the trace never advanced (observed: ~900k degenerate
              * kernel excursions pinning an aarch64 system-mode run).
              * Bail after two no-progress repeats; rep-string keeps the

@@ -577,6 +577,21 @@ static void write_header_encoding_maps(BitWriter *main_bw)
 
 typedef struct FieldStateTable FieldStateTable;
 
+/*
+ * Per-thread scratch backing one entry's EntryView.
+ *
+ * load_slots / store_slots are [n_insns x slot_stride] slot-lookup
+ * tables.  @slot_stride is DEMAND-DRIVEN, not the wire's
+ * CST_FID_SLOT_COUNT ceiling: it starts at a small value and grows (a
+ * process-lifetime high-water mark, capped at CST_FID_SLOT_COUNT) only
+ * when an instruction is actually observed issuing that many memops.
+ * The wire can address 512 memops per instruction, but the
+ * overwhelmingly common instruction issues 0-2, and a ceiling-sized
+ * stride would cost 4 KiB of pointers per instruction per plane whether
+ * or not those slots exist.  Sizing by occupancy keeps the scalar case
+ * at exactly the footprint it had when the ceiling was 64, while an
+ * XSAVE-class instruction grows the tables once and keeps them.
+ */
 typedef struct {
     uint32_t *actual_n_loads;
     uint32_t *actual_n_stores;
@@ -585,8 +600,14 @@ typedef struct {
     const DynParam **load_slots;
     const DynParam **store_slots;
     uint32_t n_cap;
-    size_t slot_cap;
+    uint32_t slot_stride;      /* slots materialised per insn (>= 1)   */
+    size_t slot_cap;           /* allocated entries per plane          */
 } EntryViewScratch;
+
+/* Initial per-insn slot stride.  Covers the memop count of essentially
+ * every instruction outside the XSAVE / rep-string tail, so the tables
+ * reach their final size on the first entry and never grow again. */
+#define CST_EV_SLOT_STRIDE_MIN 4
 
 struct BodyStreamState {
     /* Body stream — writes through @bw to the segment body output.
@@ -1142,7 +1163,7 @@ static void bw_write_sleb128_u512(BitWriter *bw, U512 v)
 /*
  * Per-template prev-value store (the baseline each entry's deltas are
  * computed against).  Sparse by design: the wire reserves
- * CST_FID_SLOT_COUNT (64) slots per family, but real BBs touch a tiny
+ * CST_FID_SLOT_COUNT slots per family, but real BBs touch a tiny
  * fraction (mcf: ≤1 load + ≤1 store + ≤2 dst regs per insn), so rather than
  * a dense [insn × family × 64] array the store is split into two planes,
  * each sized to the runtime high-water slot occupancy (max_slots) and grown
@@ -1155,7 +1176,7 @@ static void bw_write_sleb128_u512(BitWriter *bw, U512 v)
  *   - wide plane (U512 cells): the 3 genuinely-wide families
  *     (LOAD_DATA / STORE_DATA / DST_REG) × max_slots.
  *
- * The slot *space* on the wire is still CST_FID_SLOT_COUNT (64) — the
+ * The slot *space* on the wire is still CST_FID_SLOT_COUNT — the
  * cap on memops/dst-regs per insn — but a block only ever materialises
  * cells up to the largest slot index it has actually observed.  This is
  * a producer-internal representation; the wire format is unchanged, so
@@ -1173,11 +1194,16 @@ enum {
                                      * dst_reg_width, 4 lane masks,
                                      * load/store ppage */
     FIELD_STATE_N_WIDE_FAM   = 3,   /* load_data, store_data, dst_reg */
-    /* Power-of-two so fid -> location is a single load.  Largest FID
-     * ~906 at slot count 64 / stride-8 slotted, stride-4 lane block,
-     * stride-2 ppage block. */
-    FIELD_STATE_LUT_SIZE     = 1024,
+    /* Power-of-two so fid -> location is a single load.  Must cover the
+     * whole well-known FID space (largest ~7180 at slot count 512 /
+     * stride-8 slotted, stride-4 lane block, stride-2 ppage block).
+     * This LUT and the header's field_id encoding map are the only two
+     * structures sized by the slot CEILING rather than by observed
+     * occupancy; both are one-shot, not per-entry. */
+    FIELD_STATE_LUT_SIZE     = 8192,
 };
+static_assert(CST_FID_COUNT <= FIELD_STATE_LUT_SIZE,
+              "field-id LUT must cover the whole well-known FID space");
 
 /* Per-insn cell counts for a block sized to @ms high-water slots. */
 static inline uint32_t fs_scalar_stride(uint32_t ms)
@@ -1206,11 +1232,12 @@ typedef struct FieldStateBlock {
  */
 /* FS_LOC_* enum lifted up next to kSlottedFamilies (see above). */
 typedef struct FidLoc {
-    uint8_t cls;
-    uint8_t a;       /* fixed: prefix offset; slotted: family ordinal */
-    uint8_t slot;    /* slotted only */
-    uint8_t _pad;
+    uint8_t  cls;
+    uint8_t  a;       /* fixed: prefix offset; slotted: family ordinal */
+    uint16_t slot;    /* slotted only; up to CST_FID_SLOT_COUNT-1 */
 } FidLoc;
+static_assert(CST_FID_SLOT_COUNT <= UINT16_MAX + 1,
+              "FidLoc.slot must hold every slot index");
 
 /*
  * Per-(template_id) FieldStateBlock cache, vector indexed by
@@ -1243,10 +1270,10 @@ static bool   g_field_state_slot_lut_built = false;
 static void field_state_slot_lut_build(void)
 {
     for (unsigned i = 0; i < FIELD_STATE_LUT_SIZE; i++) {
-        g_fid_loc[i] = FidLoc{ FS_LOC_INVALID, 0, 0, 0 };
+        g_fid_loc[i] = FidLoc{ FS_LOC_INVALID, 0, 0 };
     }
     auto set_fixed = [](unsigned fid, uint8_t off) {
-        g_fid_loc[fid] = FidLoc{ FS_LOC_SCALAR_FIXED, off, 0, 0 };
+        g_fid_loc[fid] = FidLoc{ FS_LOC_SCALAR_FIXED, off, 0 };
     };
     set_fixed(CST_FID_N_LOADS,   0);
     set_fixed(CST_FID_N_STORES,  1);
@@ -1265,7 +1292,7 @@ static void field_state_slot_lut_build(void)
         for (unsigned f = 0; f < G_N_ELEMENTS(kSlottedFamilies); f++) {
             unsigned fid = kSlottedFamilies[f].base + k * CST_FID_SLOT_STRIDE;
             g_fid_loc[fid] = FidLoc{ kSlottedFamilies[f].cls,
-                                     kSlottedFamilies[f].ord, (uint8_t)k, 0 };
+                                     kSlottedFamilies[f].ord, (uint16_t)k };
         }
     }
     /* The 4 stride-CST_FID_LANE_BLOCK_STRIDE lane families (shared
@@ -1274,7 +1301,7 @@ static void field_state_slot_lut_build(void)
         for (unsigned f = 0; f < G_N_ELEMENTS(kLaneFamilies); f++) {
             unsigned fid = kLaneFamilies[f].base + k * CST_FID_LANE_BLOCK_STRIDE;
             g_fid_loc[fid] = FidLoc{ FS_LOC_SCALAR_SLOT, (uint8_t)(5 + f),
-                                     (uint8_t)k, 0 };
+                                     (uint16_t)k };
         }
     }
     /* The 2 stride-CST_FID_PPAGE_BLOCK_STRIDE physical-page families
@@ -1287,7 +1314,7 @@ static void field_state_slot_lut_build(void)
             unsigned fid = kPpageFamilies[f].base
                 + k * CST_FID_PPAGE_BLOCK_STRIDE;
             g_fid_loc[fid] = FidLoc{ FS_LOC_SCALAR_SLOT,
-                                     kPpageFamilies[f].ord, (uint8_t)k, 0 };
+                                     kPpageFamilies[f].ord, (uint16_t)k };
         }
     }
     g_field_state_slot_lut_built = true;
@@ -1296,7 +1323,7 @@ static void field_state_slot_lut_build(void)
 static inline FidLoc field_state_loc(unsigned field_id)
 {
     if (field_id >= FIELD_STATE_LUT_SIZE) {
-        return FidLoc{ FS_LOC_INVALID, 0, 0, 0 };
+        return FidLoc{ FS_LOC_INVALID, 0, 0 };
     }
     return g_fid_loc[field_id];
 }
@@ -1506,6 +1533,11 @@ struct EntryView {
     const uint32_t *insn_rs_off;
     const DynParam **load_slots;
     const DynParam **store_slots;
+    /* Row stride of load_slots / store_slots: slot s of insn i lives at
+     * [i * slot_stride + s].  Demand-driven high-water occupancy, NOT
+     * CST_FID_SLOT_COUNT — see EntryViewScratch.  Always >= every
+     * insn's capped memop count in this entry. */
+    uint32_t slot_stride;
     /* vCPU the entry executed on.  Used by lane-mask extractors when
      * the InsnFields lane_mask_kind is dynamic (reads a runtime CSR
      * via cst_reg_read_u64). */
@@ -1529,13 +1561,13 @@ typedef struct {
      * family.  1 for non-slotted singletons; CST_FID_SLOT_STRIDE for
      * the slotted families that share an interleaved range. */
     uint8_t  slot_stride;
-    uint8_t  slot_count;        /* 1 for non-slotted families */
+    uint16_t slot_count;        /* 1 for non-slotted families */
     bool gated_by_mem_data;
     bool gated_by_reg_data;
     /* extract: returns true and writes *out_val if (ins_pos, slot)
      * has an observable value in this entry; returns false to skip
      * (e.g. unused memop slot). */
-    bool (*extract)(const EntryView *ev, uint32_t ins_pos, uint8_t slot,
+    bool (*extract)(const EntryView *ev, uint32_t ins_pos, uint16_t slot,
                     U512 *out_val);
     /* template_default: baseline used on first sighting of
      * (template_id, ins_pos, field_id).  For dynamic-runtime fields
@@ -1543,14 +1575,14 @@ typedef struct {
      * fields it's the template's static value, so unchanged-from-
      * template fields cost zero record bytes. */
     U512 (*template_default)(const BBTemplate *tmpl,
-                             uint32_t ins_pos, uint8_t slot);
+                             uint32_t ins_pos, uint16_t slot);
     /* runtime_slot_cap: optional callback that returns the actual upper
      * bound on slots-with-content for instruction @i.  Used by the
      * memop and DST_REG families to skip slots that the fixed
      * slot_count loop would visit only to have extract() return
      * false.  Null for families whose slot_count is the real bound
      * (or trivially 1). */
-    uint8_t (*runtime_slot_cap)(const EntryView *ev, uint32_t i);
+    uint16_t (*runtime_slot_cap)(const EntryView *ev, uint32_t i);
 
     /* Narrow (u64) fast-path siblings of extract / template_default.
      * When non-null the emitter compares two u64s in registers and
@@ -1558,10 +1590,10 @@ typedef struct {
      * round-trip dominated the encoder hot loop on mcf).  Both set
      * together; either null -> wide pair (LOAD_DATA, STORE_DATA,
      * DST_REG genuinely need >64 bits). */
-    bool (*extract_u64)(const EntryView *ev, uint32_t ins_pos, uint8_t slot,
+    bool (*extract_u64)(const EntryView *ev, uint32_t ins_pos, uint16_t slot,
                         uint64_t *out_val);
     uint64_t (*template_default_u64)(const BBTemplate *tmpl,
-                                     uint32_t ins_pos, uint8_t slot);
+                                     uint32_t ins_pos, uint16_t slot);
 
     /* True iff extract == template_default for every entry of a
      * (template, ins_pos) — purely template-derived, never produces a
@@ -1578,19 +1610,19 @@ typedef struct {
  * typical insns use 0-2.  Iterating all of them just to have extract()
  * return false was ~30% of plugin runtime; these caps terminate the
  * slot loop at the actual count. */
-static inline uint8_t cap_min(uint32_t v)
+static inline uint16_t cap_min(uint32_t v)
 {
-    return v < CST_FID_SLOT_COUNT ? (uint8_t)v : (uint8_t)CST_FID_SLOT_COUNT;
+    return v < CST_FID_SLOT_COUNT ? (uint16_t)v : (uint16_t)CST_FID_SLOT_COUNT;
 }
-static uint8_t cap_loads(const EntryView *ev, uint32_t i)
+static uint16_t cap_loads(const EntryView *ev, uint32_t i)
 {
     return ev->actual_n_loads ? cap_min(ev->actual_n_loads[i]) : 0;
 }
-static uint8_t cap_stores(const EntryView *ev, uint32_t i)
+static uint16_t cap_stores(const EntryView *ev, uint32_t i)
 {
     return ev->actual_n_stores ? cap_min(ev->actual_n_stores[i]) : 0;
 }
-static uint8_t cap_dst_regs(const EntryView *ev, uint32_t i)
+static uint16_t cap_dst_regs(const EntryView *ev, uint32_t i)
 {
     if (!ev->tmpl) return 0;
     return ev->tmpl->insn_fields[i].n_dst_regs;
@@ -1598,7 +1630,7 @@ static uint8_t cap_dst_regs(const EntryView *ev, uint32_t i)
 
 /* ---------- Per-family extract/default callbacks ---------- */
 
-static bool extr_n_loads(const EntryView *ev, uint32_t i, uint8_t slot,
+static bool extr_n_loads(const EntryView *ev, uint32_t i, uint16_t slot,
                          U512 *out)
 {
     (void)slot;
@@ -1607,7 +1639,7 @@ static bool extr_n_loads(const EntryView *ev, uint32_t i, uint8_t slot,
     return true;
 }
 
-static bool extr_n_stores(const EntryView *ev, uint32_t i, uint8_t slot,
+static bool extr_n_stores(const EntryView *ev, uint32_t i, uint16_t slot,
                           U512 *out)
 {
     (void)slot;
@@ -1619,17 +1651,17 @@ static bool extr_n_stores(const EntryView *ev, uint32_t i, uint8_t slot,
 /* Locate the @slot-th memop of @insn matching @want_type
  * (DYN_LOAD_ADDR or DYN_STORE_ADDR).  Returns nullptr if absent. */
 static const DynParam *find_memop_slot(const EntryView *ev, uint32_t i,
-                                       uint8_t slot, uint8_t want_type)
+                                       uint16_t slot, uint8_t want_type)
 {
-    if (!ev->dyn_params || slot >= CST_FID_SLOT_COUNT) return nullptr;
-    size_t idx = ((size_t)i * CST_FID_SLOT_COUNT) + slot;
+    if (!ev->dyn_params || slot >= ev->slot_stride) return nullptr;
+    size_t idx = ((size_t)i * ev->slot_stride) + slot;
     if (want_type == DYN_LOAD_ADDR) {
         return ev->load_slots[idx];
     }
     return ev->store_slots[idx];
 }
 
-static bool extr_load_addr(const EntryView *ev, uint32_t i, uint8_t slot,
+static bool extr_load_addr(const EntryView *ev, uint32_t i, uint16_t slot,
                            U512 *out)
 {
     const DynParam *dp = find_memop_slot(ev, i, slot, DYN_LOAD_ADDR);
@@ -1637,7 +1669,7 @@ static bool extr_load_addr(const EntryView *ev, uint32_t i, uint8_t slot,
     *out = cst_wide_from_u64(dp->value);
     return true;
 }
-static bool extr_store_addr(const EntryView *ev, uint32_t i, uint8_t slot,
+static bool extr_store_addr(const EntryView *ev, uint32_t i, uint16_t slot,
                             U512 *out)
 {
     const DynParam *dp = find_memop_slot(ev, i, slot, DYN_STORE_ADDR);
@@ -1645,10 +1677,10 @@ static bool extr_store_addr(const EntryView *ev, uint32_t i, uint8_t slot,
     *out = cst_wide_from_u64(dp->value);
     return true;
 }
-static U512 deflt_zero(const BBTemplate *t, uint32_t i, uint8_t slot)
+static U512 deflt_zero(const BBTemplate *t, uint32_t i, uint16_t slot)
 { (void)t; (void)i; (void)slot; return cst_wide_from_u64(0); }
 
-static bool extr_load_data(const EntryView *ev, uint32_t i, uint8_t slot,
+static bool extr_load_data(const EntryView *ev, uint32_t i, uint16_t slot,
                            U512 *out)
 {
     const DynParam *dp = find_memop_slot(ev, i, slot, DYN_LOAD_ADDR);
@@ -1657,7 +1689,7 @@ static bool extr_load_data(const EntryView *ev, uint32_t i, uint8_t slot,
     u512_mask_bytes(out, dp->data_size);
     return true;
 }
-static bool extr_store_data(const EntryView *ev, uint32_t i, uint8_t slot,
+static bool extr_store_data(const EntryView *ev, uint32_t i, uint16_t slot,
                             U512 *out)
 {
     const DynParam *dp = find_memop_slot(ev, i, slot, DYN_STORE_ADDR);
@@ -1674,7 +1706,7 @@ static bool extr_store_data(const EntryView *ev, uint32_t i, uint8_t slot,
  * consumer derives any reg's value from the most recent post-exec dst
  * observation, which dominates the pre-exec source view (every
  * architectural write, fewer dsts than srcs per insn). */
-static bool extr_dst_reg(const EntryView *ev, uint32_t i, uint8_t slot,
+static bool extr_dst_reg(const EntryView *ev, uint32_t i, uint16_t slot,
                          U512 *out)
 {
     if (!ev->reg_snaps || !ev->tmpl) return false;
@@ -1704,7 +1736,7 @@ static int find_flags_slot(const InsnFields *f)
     return -1;
 }
 
-static bool extr_metaflags(const EntryView *ev, uint32_t i, uint8_t slot,
+static bool extr_metaflags(const EntryView *ev, uint32_t i, uint16_t slot,
                            U512 *out)
 {
     if (slot != 0 || !ev->reg_snaps || !ev->tmpl) return false;
@@ -1721,7 +1753,7 @@ static bool extr_metaflags(const EntryView *ev, uint32_t i, uint8_t slot,
     return true;
 }
 
-static bool extr_u64_metaflags(const EntryView *ev, uint32_t i, uint8_t slot,
+static bool extr_u64_metaflags(const EntryView *ev, uint32_t i, uint16_t slot,
                                uint64_t *out)
 {
     if (slot != 0 || !ev->reg_snaps || !ev->tmpl) return false;
@@ -1738,13 +1770,13 @@ static bool extr_u64_metaflags(const EntryView *ev, uint32_t i, uint8_t slot,
     return true;
 }
 
-static U512 deflt_metaflags(const BBTemplate *t, uint32_t i, uint8_t slot)
+static U512 deflt_metaflags(const BBTemplate *t, uint32_t i, uint16_t slot)
 {
     (void)t; (void)i; (void)slot;
     return cst_wide_from_u64(0);
 }
 static uint64_t deflt_u64_metaflags(const BBTemplate *t, uint32_t i,
-                                    uint8_t slot)
+                                    uint16_t slot)
 {
     (void)t; (void)i; (void)slot;
     return 0;
@@ -1754,7 +1786,7 @@ static uint64_t deflt_u64_metaflags(const BBTemplate *t, uint32_t i,
  * returns the template's static value (delta always zero, no record).
  * If SMC is added, point extract at the runtime value; keep
  * template_default. */
-static U512 deflt_insn_bytes_lo(const BBTemplate *t, uint32_t i, uint8_t slot)
+static U512 deflt_insn_bytes_lo(const BBTemplate *t, uint32_t i, uint16_t slot)
 {
     (void)slot;
     if (!t || i >= t->n_insns) return cst_wide_from_u64(0);
@@ -1765,11 +1797,11 @@ static U512 deflt_insn_bytes_lo(const BBTemplate *t, uint32_t i, uint8_t slot)
     for (int b = 0; b < sz; b++) v |= ((uint64_t)p[b]) << (b * 8);
     return cst_wide_from_u64(v);
 }
-static bool extr_insn_bytes_lo(const EntryView *ev, uint32_t i, uint8_t slot,
+static bool extr_insn_bytes_lo(const EntryView *ev, uint32_t i, uint16_t slot,
                                U512 *out)
 { *out = deflt_insn_bytes_lo(ev->tmpl, i, slot); return true; }
 
-static U512 deflt_insn_bytes_hi(const BBTemplate *t, uint32_t i, uint8_t slot)
+static U512 deflt_insn_bytes_hi(const BBTemplate *t, uint32_t i, uint16_t slot)
 {
     (void)slot;
     if (!t || i >= t->n_insns) return cst_wide_from_u64(0);
@@ -1782,32 +1814,32 @@ static U512 deflt_insn_bytes_hi(const BBTemplate *t, uint32_t i, uint8_t slot)
     for (int b = 0; b < extra; b++) v |= ((uint64_t)p[b]) << (b * 8);
     return cst_wide_from_u64(v);
 }
-static bool extr_insn_bytes_hi(const EntryView *ev, uint32_t i, uint8_t slot,
+static bool extr_insn_bytes_hi(const EntryView *ev, uint32_t i, uint16_t slot,
                                U512 *out)
 { *out = deflt_insn_bytes_hi(ev->tmpl, i, slot); return true; }
 
-static U512 deflt_insn_opcode(const BBTemplate *t, uint32_t i, uint8_t slot)
+static U512 deflt_insn_opcode(const BBTemplate *t, uint32_t i, uint16_t slot)
 {
     (void)slot;
     if (!t || i >= t->n_insns) return cst_wide_from_u64(0);
     return cst_wide_from_u64((uint8_t)t->insn_fields[i].opcode);
 }
-static bool extr_insn_opcode(const EntryView *ev, uint32_t i, uint8_t slot,
+static bool extr_insn_opcode(const EntryView *ev, uint32_t i, uint16_t slot,
                              U512 *out)
 { *out = deflt_insn_opcode(ev->tmpl, i, slot); return true; }
 
 static U512 deflt_insn_branch_type(const BBTemplate *t, uint32_t i,
-                                   uint8_t slot)
+                                   uint16_t slot)
 {
     (void)slot;
     if (!t || i >= t->n_insns) return cst_wide_from_u64(0);
     return cst_wide_from_u64((uint8_t)t->insn_fields[i].branch_type);
 }
-static bool extr_insn_branch_type(const EntryView *ev, uint32_t i, uint8_t slot,
+static bool extr_insn_branch_type(const EntryView *ev, uint32_t i, uint16_t slot,
                                   U512 *out)
 { *out = deflt_insn_branch_type(ev->tmpl, i, slot); return true; }
 
-static U512 deflt_insn_flags(const BBTemplate *t, uint32_t i, uint8_t slot)
+static U512 deflt_insn_flags(const BBTemplate *t, uint32_t i, uint16_t slot)
 {
     (void)slot;
     if (!t || i >= t->n_insns) return cst_wide_from_u64(0);
@@ -1818,11 +1850,11 @@ static U512 deflt_insn_flags(const BBTemplate *t, uint32_t i, uint8_t slot)
     if (f->is_atomic)          flags |= CST_INSN_FLAG_ATOMIC;
     return cst_wide_from_u64(flags);
 }
-static bool extr_insn_flags(const EntryView *ev, uint32_t i, uint8_t slot,
+static bool extr_insn_flags(const EntryView *ev, uint32_t i, uint16_t slot,
                             U512 *out)
 { *out = deflt_insn_flags(ev->tmpl, i, slot); return true; }
 
-static U512 deflt_insn_imm(const BBTemplate *t, uint32_t i, uint8_t slot)
+static U512 deflt_insn_imm(const BBTemplate *t, uint32_t i, uint16_t slot)
 {
     (void)slot;
     if (!t || i >= t->n_insns) return cst_wide_from_u64(0);
@@ -1830,17 +1862,17 @@ static U512 deflt_insn_imm(const BBTemplate *t, uint32_t i, uint8_t slot)
     if (!f->has_immediate) return cst_wide_from_u64(0);
     return cst_wide_from_i64((int64_t)f->immediate);
 }
-static bool extr_insn_imm(const EntryView *ev, uint32_t i, uint8_t slot,
+static bool extr_insn_imm(const EntryView *ev, uint32_t i, uint16_t slot,
                           U512 *out)
 { *out = deflt_insn_imm(ev->tmpl, i, slot); return true; }
 
-static U512 deflt_insn_size(const BBTemplate *t, uint32_t i, uint8_t slot)
+static U512 deflt_insn_size(const BBTemplate *t, uint32_t i, uint16_t slot)
 {
     (void)slot;
     if (!t || i >= t->n_insns) return cst_wide_from_u64(0);
     return cst_wide_from_u64(t->insn_sizes[i]);
 }
-static bool extr_insn_size(const EntryView *ev, uint32_t i, uint8_t slot,
+static bool extr_insn_size(const EntryView *ev, uint32_t i, uint16_t slot,
                            U512 *out)
 { *out = deflt_insn_size(ev->tmpl, i, slot); return true; }
 
@@ -1850,7 +1882,7 @@ static bool extr_insn_size(const EntryView *ev, uint32_t i, uint8_t slot,
  * LOAD_DATA / STORE_DATA / DST_REG).  The emitter's fast path uses
  * these to avoid the U512 stack round-trip.
  */
-static bool extr_u64_n_loads(const EntryView *ev, uint32_t i, uint8_t slot,
+static bool extr_u64_n_loads(const EntryView *ev, uint32_t i, uint16_t slot,
                              uint64_t *out)
 {
     (void)slot;
@@ -1858,10 +1890,10 @@ static bool extr_u64_n_loads(const EntryView *ev, uint32_t i, uint8_t slot,
     *out = ev->actual_n_loads[i];
     return true;
 }
-static uint64_t deflt_u64_zero(const BBTemplate *t, uint32_t i, uint8_t slot)
+static uint64_t deflt_u64_zero(const BBTemplate *t, uint32_t i, uint16_t slot)
 { (void)t; (void)i; (void)slot; return 0; }
 
-static bool extr_u64_n_stores(const EntryView *ev, uint32_t i, uint8_t slot,
+static bool extr_u64_n_stores(const EntryView *ev, uint32_t i, uint16_t slot,
                               uint64_t *out)
 {
     (void)slot;
@@ -1870,7 +1902,7 @@ static bool extr_u64_n_stores(const EntryView *ev, uint32_t i, uint8_t slot,
     return true;
 }
 
-static bool extr_u64_load_addr(const EntryView *ev, uint32_t i, uint8_t slot,
+static bool extr_u64_load_addr(const EntryView *ev, uint32_t i, uint16_t slot,
                                uint64_t *out)
 {
     const DynParam *dp = find_memop_slot(ev, i, slot, DYN_LOAD_ADDR);
@@ -1879,7 +1911,7 @@ static bool extr_u64_load_addr(const EntryView *ev, uint32_t i, uint8_t slot,
     return true;
 }
 
-static bool extr_u64_store_addr(const EntryView *ev, uint32_t i, uint8_t slot,
+static bool extr_u64_store_addr(const EntryView *ev, uint32_t i, uint16_t slot,
                                 uint64_t *out)
 {
     const DynParam *dp = find_memop_slot(ev, i, slot, DYN_STORE_ADDR);
@@ -1889,7 +1921,7 @@ static bool extr_u64_store_addr(const EntryView *ev, uint32_t i, uint8_t slot,
 }
 
 static uint64_t deflt_u64_insn_bytes_lo(const BBTemplate *t, uint32_t i,
-                                        uint8_t slot)
+                                        uint16_t slot)
 {
     (void)slot;
     if (!t || i >= t->n_insns) return 0;
@@ -1901,11 +1933,11 @@ static uint64_t deflt_u64_insn_bytes_lo(const BBTemplate *t, uint32_t i,
     return v;
 }
 static bool extr_u64_insn_bytes_lo(const EntryView *ev, uint32_t i,
-                                   uint8_t slot, uint64_t *out)
+                                   uint16_t slot, uint64_t *out)
 { *out = deflt_u64_insn_bytes_lo(ev->tmpl, i, slot); return true; }
 
 static uint64_t deflt_u64_insn_bytes_hi(const BBTemplate *t, uint32_t i,
-                                        uint8_t slot)
+                                        uint16_t slot)
 {
     (void)slot;
     if (!t || i >= t->n_insns) return 0;
@@ -1919,33 +1951,33 @@ static uint64_t deflt_u64_insn_bytes_hi(const BBTemplate *t, uint32_t i,
     return v;
 }
 static bool extr_u64_insn_bytes_hi(const EntryView *ev, uint32_t i,
-                                   uint8_t slot, uint64_t *out)
+                                   uint16_t slot, uint64_t *out)
 { *out = deflt_u64_insn_bytes_hi(ev->tmpl, i, slot); return true; }
 
 static uint64_t deflt_u64_insn_opcode(const BBTemplate *t, uint32_t i,
-                                      uint8_t slot)
+                                      uint16_t slot)
 {
     (void)slot;
     if (!t || i >= t->n_insns) return 0;
     return (uint8_t)t->insn_fields[i].opcode;
 }
-static bool extr_u64_insn_opcode(const EntryView *ev, uint32_t i, uint8_t slot,
+static bool extr_u64_insn_opcode(const EntryView *ev, uint32_t i, uint16_t slot,
                                  uint64_t *out)
 { *out = deflt_u64_insn_opcode(ev->tmpl, i, slot); return true; }
 
 static uint64_t deflt_u64_insn_branch_type(const BBTemplate *t, uint32_t i,
-                                           uint8_t slot)
+                                           uint16_t slot)
 {
     (void)slot;
     if (!t || i >= t->n_insns) return 0;
     return (uint8_t)t->insn_fields[i].branch_type;
 }
 static bool extr_u64_insn_branch_type(const EntryView *ev, uint32_t i,
-                                      uint8_t slot, uint64_t *out)
+                                      uint16_t slot, uint64_t *out)
 { *out = deflt_u64_insn_branch_type(ev->tmpl, i, slot); return true; }
 
 static uint64_t deflt_u64_insn_flags(const BBTemplate *t, uint32_t i,
-                                     uint8_t slot)
+                                     uint16_t slot)
 {
     (void)slot;
     if (!t || i >= t->n_insns) return 0;
@@ -1956,12 +1988,12 @@ static uint64_t deflt_u64_insn_flags(const BBTemplate *t, uint32_t i,
     if (f->is_atomic)          flags |= CST_INSN_FLAG_ATOMIC;
     return flags;
 }
-static bool extr_u64_insn_flags(const EntryView *ev, uint32_t i, uint8_t slot,
+static bool extr_u64_insn_flags(const EntryView *ev, uint32_t i, uint16_t slot,
                                 uint64_t *out)
 { *out = deflt_u64_insn_flags(ev->tmpl, i, slot); return true; }
 
 static uint64_t deflt_u64_insn_imm(const BBTemplate *t, uint32_t i,
-                                   uint8_t slot)
+                                   uint16_t slot)
 {
     (void)slot;
     if (!t || i >= t->n_insns) return 0;
@@ -1969,18 +2001,18 @@ static uint64_t deflt_u64_insn_imm(const BBTemplate *t, uint32_t i,
     if (!f->has_immediate) return 0;
     return (uint64_t)(int64_t)f->immediate;
 }
-static bool extr_u64_insn_imm(const EntryView *ev, uint32_t i, uint8_t slot,
+static bool extr_u64_insn_imm(const EntryView *ev, uint32_t i, uint16_t slot,
                               uint64_t *out)
 { *out = deflt_u64_insn_imm(ev->tmpl, i, slot); return true; }
 
 static uint64_t deflt_u64_insn_size(const BBTemplate *t, uint32_t i,
-                                    uint8_t slot)
+                                    uint16_t slot)
 {
     (void)slot;
     if (!t || i >= t->n_insns) return 0;
     return t->insn_sizes[i];
 }
-static bool extr_u64_insn_size(const EntryView *ev, uint32_t i, uint8_t slot,
+static bool extr_u64_insn_size(const EntryView *ev, uint32_t i, uint16_t slot,
                                uint64_t *out)
 { *out = deflt_u64_insn_size(ev->tmpl, i, slot); return true; }
 
@@ -1989,28 +2021,28 @@ static bool extr_u64_insn_size(const EntryView *ev, uint32_t i, uint8_t slot,
 /* Lane-mask slot caps.  0 when the insn has no lane info (most
  * non-vec insns), suppressing emission; else only the actual
  * reg/memop slots are walked. */
-static uint8_t cap_src_lane_masks(const EntryView *ev, uint32_t i)
+static uint16_t cap_src_lane_masks(const EntryView *ev, uint32_t i)
 {
     if (!ev->tmpl || i >= ev->tmpl->n_insns) return 0;
     const InsnFields *f = &ev->tmpl->insn_fields[i];
     if (!f->has_vec_lanes) return 0;
     return f->n_src_regs;
 }
-static uint8_t cap_dst_lane_masks(const EntryView *ev, uint32_t i)
+static uint16_t cap_dst_lane_masks(const EntryView *ev, uint32_t i)
 {
     if (!ev->tmpl || i >= ev->tmpl->n_insns) return 0;
     const InsnFields *f = &ev->tmpl->insn_fields[i];
     if (!f->has_vec_lanes) return 0;
     return f->n_dst_regs;
 }
-static uint8_t cap_load_data_lane_masks(const EntryView *ev, uint32_t i)
+static uint16_t cap_load_data_lane_masks(const EntryView *ev, uint32_t i)
 {
     if (!ev->tmpl || i >= ev->tmpl->n_insns) return 0;
     const InsnFields *f = &ev->tmpl->insn_fields[i];
     if (!f->has_vec_lanes) return 0;
     return f->max_dep_loads;
 }
-static uint8_t cap_store_data_lane_masks(const EntryView *ev, uint32_t i)
+static uint16_t cap_store_data_lane_masks(const EntryView *ev, uint32_t i)
 {
     if (!ev->tmpl || i >= ev->tmpl->n_insns) return 0;
     const InsnFields *f = &ev->tmpl->insn_fields[i];
@@ -2079,9 +2111,22 @@ static uint64_t lane_active_gate(const InsnFields *f, unsigned cpu_index)
  * guess would lie about the dataflow.
  */
 static uint64_t memop_data_lane_mask(const EntryView *ev, uint32_t i,
-                                     uint8_t slot, uint8_t want_type,
+                                     uint16_t slot, uint8_t want_type,
                                      const InsnFields *f)
 {
+    /* Per-memop lane attribution is recoverable only from the
+     * TEMPLATE-STATIC dep masks, whose extent is max_dep_loads /
+     * max_dep_stores (<= MAX_LOADS / MAX_STORES).  The dynamic memop
+     * count can exceed that (one static store operand issuing many
+     * accesses: XSAVE, rep-string), and the wire's slot ceiling is far
+     * wider still, so bound the slot against the mask arrays before
+     * indexing them or shifting by the slot index.  An out-of-extent
+     * slot has no static attribution — empty mask, same answer the
+     * all-to-all case gives. */
+    uint8_t static_extent = (want_type == DYN_LOAD_ADDR)
+        ? f->max_dep_loads : f->max_dep_stores;
+    if (slot >= static_extent) return 0;
+
     const DynParam *dp = find_memop_slot(ev, i, slot, want_type);
     if (!dp) return 0;
 
@@ -2098,7 +2143,7 @@ static uint64_t memop_data_lane_mask(const EntryView *ev, uint32_t i,
      * matching the decode-time INSERT/EXTRACT reg-mask narrowing.
      *
      * Single-memop check goes through actual_n_loads/n_stores instead
-     * of probing load_slots[i*64+1] for null: the slot-array entries
+     * of probing load_slots[i*slot_stride+1] for null: the slot-array entries
      * past actual_n_loads[i] aren't guaranteed cleared (the scratch
      * skips that memset for cost, see entry_view_scratch_ensure), so
      * a stale pointer from a prior emit would mis-trigger the probe. */
@@ -2183,7 +2228,7 @@ static uint64_t memop_data_lane_mask(const EntryView *ev, uint32_t i,
 }
 
 static bool extr_u64_src_lane_mask(const EntryView *ev, uint32_t i,
-                                   uint8_t slot, uint64_t *out)
+                                   uint16_t slot, uint64_t *out)
 {
     if (!ev->tmpl || i >= ev->tmpl->n_insns) return false;
     const InsnFields *f = &ev->tmpl->insn_fields[i];
@@ -2192,7 +2237,7 @@ static bool extr_u64_src_lane_mask(const EntryView *ev, uint32_t i,
     return true;
 }
 static bool extr_u64_dst_lane_mask(const EntryView *ev, uint32_t i,
-                                   uint8_t slot, uint64_t *out)
+                                   uint16_t slot, uint64_t *out)
 {
     if (!ev->tmpl || i >= ev->tmpl->n_insns) return false;
     const InsnFields *f = &ev->tmpl->insn_fields[i];
@@ -2201,7 +2246,7 @@ static bool extr_u64_dst_lane_mask(const EntryView *ev, uint32_t i,
     return true;
 }
 static bool extr_u64_load_data_lane_mask(const EntryView *ev, uint32_t i,
-                                         uint8_t slot, uint64_t *out)
+                                         uint16_t slot, uint64_t *out)
 {
     if (!ev->tmpl || i >= ev->tmpl->n_insns) return false;
     const InsnFields *f = &ev->tmpl->insn_fields[i];
@@ -2211,7 +2256,7 @@ static bool extr_u64_load_data_lane_mask(const EntryView *ev, uint32_t i,
     return true;
 }
 static bool extr_u64_store_data_lane_mask(const EntryView *ev, uint32_t i,
-                                          uint8_t slot, uint64_t *out)
+                                          uint16_t slot, uint64_t *out)
 {
     if (!ev->tmpl || i >= ev->tmpl->n_insns) return false;
     const InsnFields *f = &ev->tmpl->insn_fields[i];
@@ -2225,10 +2270,10 @@ static bool extr_u64_store_data_lane_mask(const EntryView *ev, uint32_t i,
  * baselines flow on the wire as the first observation's delta-from-zero;
  * subsequent observations with the same value cost zero bytes. */
 static U512 deflt_lane_mask_zero(const BBTemplate *t, uint32_t i,
-                                 uint8_t slot)
+                                 uint16_t slot)
 { (void)t; (void)i; (void)slot; return cst_wide_from_u64(0); }
 
-static bool extr_src_lane_mask(const EntryView *ev, uint32_t i, uint8_t slot,
+static bool extr_src_lane_mask(const EntryView *ev, uint32_t i, uint16_t slot,
                                U512 *out)
 {
     uint64_t v;
@@ -2236,7 +2281,7 @@ static bool extr_src_lane_mask(const EntryView *ev, uint32_t i, uint8_t slot,
     *out = cst_wide_from_u64(v);
     return true;
 }
-static bool extr_dst_lane_mask(const EntryView *ev, uint32_t i, uint8_t slot,
+static bool extr_dst_lane_mask(const EntryView *ev, uint32_t i, uint16_t slot,
                                U512 *out)
 {
     uint64_t v;
@@ -2245,7 +2290,7 @@ static bool extr_dst_lane_mask(const EntryView *ev, uint32_t i, uint8_t slot,
     return true;
 }
 static bool extr_load_data_lane_mask(const EntryView *ev, uint32_t i,
-                                     uint8_t slot, U512 *out)
+                                     uint16_t slot, U512 *out)
 {
     uint64_t v;
     if (!extr_u64_load_data_lane_mask(ev, i, slot, &v)) return false;
@@ -2253,7 +2298,7 @@ static bool extr_load_data_lane_mask(const EntryView *ev, uint32_t i,
     return true;
 }
 static bool extr_store_data_lane_mask(const EntryView *ev, uint32_t i,
-                                      uint8_t slot, U512 *out)
+                                      uint16_t slot, U512 *out)
 {
     uint64_t v;
     if (!extr_u64_store_data_lane_mask(ev, i, slot, &v)) return false;
@@ -2423,16 +2468,24 @@ static void dyn_params_sort_template_order(std::vector<DynParam> &dyn_params)
 }
 
 /* Build per-insn offset arrays into dyn_params and reg_snaps so
- * descriptor extracts run in O(1) per slot. */
-static void build_entry_view(EntryView *ev, const BBTemplate *tmpl,
-                             const std::vector<DynParam> *dyn_params,
-                             const std::vector<RegSnap> *reg_snaps,
-                             uint32_t *actual_n_loads,
-                             uint32_t *actual_n_stores,
-                             uint32_t *insn_dp_off,
-                             uint32_t *insn_rs_off,
-                             const DynParam **load_slots,
-                             const DynParam **store_slots)
+ * descriptor extracts run in O(1) per slot.
+ *
+ * Returns the highest per-insn memop count seen (capped at
+ * CST_FID_SLOT_COUNT).  When that exceeds @slot_stride the slot tables
+ * were too narrow to hold every memop, and the caller re-runs the build
+ * against widened tables — see entry_view_scratch_ensure.  The counts in
+ * actual_n_loads / actual_n_stores are always complete; only the slot
+ * lookup tables are stride-limited. */
+static uint32_t build_entry_view(EntryView *ev, const BBTemplate *tmpl,
+                                 const std::vector<DynParam> *dyn_params,
+                                 const std::vector<RegSnap> *reg_snaps,
+                                 uint32_t *actual_n_loads,
+                                 uint32_t *actual_n_stores,
+                                 uint32_t *insn_dp_off,
+                                 uint32_t *insn_rs_off,
+                                 const DynParam **load_slots,
+                                 const DynParam **store_slots,
+                                 uint32_t slot_stride)
 {
     ev->tmpl = tmpl;
     ev->dyn_params = dyn_params;
@@ -2443,10 +2496,12 @@ static void build_entry_view(EntryView *ev, const BBTemplate *tmpl,
     ev->insn_rs_off = insn_rs_off;
     ev->load_slots = load_slots;
     ev->store_slots = store_slots;
+    ev->slot_stride = slot_stride;
 
-    if (!tmpl) return;
+    if (!tmpl) return 0;
 
     uint32_t n = tmpl->n_insns;
+    uint32_t high_water = 0;
     /* Walk dyn_params (already sorted by insn_index, type) once. */
     uint32_t k = 0;
     uint32_t total_dp = dyn_params ? (uint32_t)dyn_params->size() : 0;
@@ -2459,17 +2514,21 @@ static void build_entry_view(EntryView *ev, const BBTemplate *tmpl,
             if (dp->insn_index != i) break;
             if (dp->type == DYN_LOAD_ADDR) {
                 uint32_t slot = actual_n_loads[i]++;
-                if (slot < CST_FID_SLOT_COUNT) {
-                    load_slots[(size_t)i * CST_FID_SLOT_COUNT + slot] = dp;
+                if (slot < slot_stride) {
+                    load_slots[(size_t)i * slot_stride + slot] = dp;
                 }
             } else {
                 uint32_t slot = actual_n_stores[i]++;
-                if (slot < CST_FID_SLOT_COUNT) {
-                    store_slots[(size_t)i * CST_FID_SLOT_COUNT + slot] = dp;
+                if (slot < slot_stride) {
+                    store_slots[(size_t)i * slot_stride + slot] = dp;
                 }
             }
             k++;
         }
+        uint32_t hi = cap_min(actual_n_loads[i]);
+        uint32_t hs = cap_min(actual_n_stores[i]);
+        if (hs > hi) hi = hs;
+        if (hi > high_water) high_water = hi;
     }
     insn_dp_off[n] = k;
 
@@ -2483,9 +2542,16 @@ static void build_entry_view(EntryView *ev, const BBTemplate *tmpl,
         r += f->n_dst_regs;
     }
     insn_rs_off[n] = r;
+    return high_water;
 }
 
-static void entry_view_scratch_ensure(EntryViewScratch *scratch, uint32_t n)
+/* Size the scratch for an @n-insn entry at a per-insn stride of
+ * @want_stride slots (clamped to [CST_EV_SLOT_STRIDE_MIN,
+ * CST_FID_SLOT_COUNT]).  The stride is a high-water mark: it never
+ * shrinks, so the slot tables settle after the widest instruction the
+ * process has executed and steady state does no work here. */
+static void entry_view_scratch_ensure(EntryViewScratch *scratch, uint32_t n,
+                                      uint32_t want_stride)
 {
     uint32_t need_n = n ? n : 1;
     if (scratch->n_cap < need_n) {
@@ -2508,10 +2574,20 @@ static void entry_view_scratch_ensure(EntryViewScratch *scratch, uint32_t n)
         scratch->n_cap = new_cap;
     }
 
-    size_t need_slots = (size_t)need_n * CST_FID_SLOT_COUNT;
+    if (want_stride < CST_EV_SLOT_STRIDE_MIN) {
+        want_stride = CST_EV_SLOT_STRIDE_MIN;
+    }
+    if (want_stride > CST_FID_SLOT_COUNT) {
+        want_stride = CST_FID_SLOT_COUNT;
+    }
+    if (want_stride > scratch->slot_stride) {
+        scratch->slot_stride = want_stride;
+    }
+
+    size_t need_slots = (size_t)need_n * scratch->slot_stride;
     if (scratch->slot_cap < need_slots) {
         size_t new_cap = scratch->slot_cap ? scratch->slot_cap :
-            (16 * CST_FID_SLOT_COUNT);
+            (16 * (size_t)CST_EV_SLOT_STRIDE_MIN);
         while (new_cap < need_slots) {
             new_cap *= 2;
         }
@@ -2531,9 +2607,13 @@ static void entry_view_scratch_ensure(EntryViewScratch *scratch, uint32_t n)
      * leaves stale data in newly-grown regions, but those are bounded
      * by the same per-insn actual count so the hot loop never reads
      * them.  perf attributed ~2 KB-30 KB of per-emit memset traffic
-     * (per template's n_insns × 64 slots × 8 bytes × 2 arrays); for
+     * (per template's n_insns × slots × 8 bytes × 2 arrays); for
      * mcf with 2M emits this is multiple GB of writes per run that
-     * were producing no observable effect. */
+     * were producing no observable effect.
+     *
+     * A stride GROWTH does not need a relayout either: the caller
+     * rebuilds the whole entry from dyn_params after growing, so every
+     * cell the emit loop will read is rewritten. */
 }
 
 static void entry_view_scratch_free(EntryViewScratch *scratch)
@@ -2558,7 +2638,7 @@ static U512 field_state_get(FieldStateBlock *state_block,
                             uint16_t field_id,
                             const FieldDescriptor *fd,
                             const BBTemplate *tmpl,
-                            uint8_t slot)
+                            uint16_t slot)
 {
     U512 cur;
     FidLoc loc = field_state_loc(field_id);
@@ -2615,9 +2695,11 @@ stage_rec_reserve(StageRec **stage, unsigned int *stage_len,
 }
 
 /* CP memop overflow warning.  The slot loop silently clamps a
- * dynamic memop count exceeding CST_FID_SLOT_COUNT; the cap is well
- * above realistic ISA ceilings (AVX-512 <=16, max-VLEN SVE <=64) so
- * any overflow gets a per-occurrence breadcrumb. */
+ * dynamic memop count exceeding CST_FID_SLOT_COUNT.  The cap is sized
+ * for the widest real single-instruction fan-out — x86 XSAVE-family
+ * state save/restore, ~320 8-byte stores for a full AVX-512 area, well
+ * above AVX-512 gather/scatter (<=16) and max-VLEN SVE (<=64) — so any
+ * overflow that still happens gets a per-occurrence breadcrumb. */
 static void warn_memop_overflow(const BBTemplate *tmpl, uint32_t insn_i,
                                 uint32_t n_loads, uint32_t n_stores)
 {
@@ -2685,7 +2767,7 @@ stage_wide_delta(StageRec **stage_p, unsigned int *stage_len,
                  FieldStateBlock *state_block, uint32_t state_generation,
                  FieldStateBlock *base_block, uint32_t base_generation,
                  const EntryView *ev, uint32_t i, uint16_t fid,
-                 const FieldDescriptor *fd, uint8_t slot, const U512 &cur)
+                 const FieldDescriptor *fd, uint16_t slot, const U512 &cur)
 {
     U512 base = field_state_get(state_block, state_generation,
                                 base_block, base_generation,
@@ -2874,13 +2956,13 @@ static void emit_field_delta_section(BitWriter *main_bw,
             }
 
             /* Memop families — sparse over actual_n_loads / n_stores.
-             * Inlined extract: load_slots[i*SLOT_COUNT + s] is the
+             * Inlined extract: load_slots[i*slot_stride + s] is the
              * authoritative source (see find_memop_slot). */
-            uint8_t n_loads_cap  = cap_min(insn_n_loads);
-            uint8_t n_stores_cap = cap_min(insn_n_stores);
+            uint16_t n_loads_cap  = cap_min(insn_n_loads);
+            uint16_t n_stores_cap = cap_min(insn_n_stores);
             if (load_slots) {
-                size_t la_base = (size_t)i * CST_FID_SLOT_COUNT;
-                for (uint8_t s = 0; s < n_loads_cap; s++) {
+                size_t la_base = (size_t)i * ev->slot_stride;
+                for (uint16_t s = 0; s < n_loads_cap; s++) {
                     const DynParam *dp = load_slots[la_base + s];
                     if (!dp) continue;
                     uint16_t la_fid = (uint16_t)(CST_FID_LOAD_ADDR_BASE +
@@ -2917,8 +2999,8 @@ static void emit_field_delta_section(BitWriter *main_bw,
                 }
             }
             if (store_slots) {
-                size_t sa_base = (size_t)i * CST_FID_SLOT_COUNT;
-                for (uint8_t s = 0; s < n_stores_cap; s++) {
+                size_t sa_base = (size_t)i * ev->slot_stride;
+                for (uint16_t s = 0; s < n_stores_cap; s++) {
                     const DynParam *dp = store_slots[sa_base + s];
                     if (!dp) continue;
                     uint16_t sa_fid = (uint16_t)(CST_FID_STORE_ADDR_BASE +
@@ -3280,14 +3362,33 @@ static void emit_one_bb_delta_with_base(BitWriter *bw, BodyStreamState *st,
     EntryView ev;
     uint32_t n = rec.tmpl ? rec.tmpl->n_insns : 0;
     EntryViewScratch *scratch = &st->ev_scratch;
-    entry_view_scratch_ensure(scratch, n);
-    build_entry_view(&ev, rec.tmpl, rec.dyn_params, rec.reg_snaps,
-                     scratch->actual_n_loads,
-                     scratch->actual_n_stores,
-                     scratch->insn_dp_off,
-                     scratch->insn_rs_off,
-                     scratch->load_slots,
-                     scratch->store_slots);
+    /* Build against the current high-water slot stride.  If this entry
+     * holds an instruction wider than anything seen so far (the XSAVE /
+     * rep-string tail), widen the tables and rebuild once — the counts
+     * the first pass produced tell us exactly how wide to go, and the
+     * stride never shrinks, so this costs one extra walk the first time
+     * a workload's widest instruction appears and nothing thereafter. */
+    entry_view_scratch_ensure(scratch, n, scratch->slot_stride);
+    uint32_t high_water =
+        build_entry_view(&ev, rec.tmpl, rec.dyn_params, rec.reg_snaps,
+                         scratch->actual_n_loads,
+                         scratch->actual_n_stores,
+                         scratch->insn_dp_off,
+                         scratch->insn_rs_off,
+                         scratch->load_slots,
+                         scratch->store_slots,
+                         scratch->slot_stride);
+    if (high_water > scratch->slot_stride) {
+        entry_view_scratch_ensure(scratch, n, high_water);
+        build_entry_view(&ev, rec.tmpl, rec.dyn_params, rec.reg_snaps,
+                         scratch->actual_n_loads,
+                         scratch->actual_n_stores,
+                         scratch->insn_dp_off,
+                         scratch->insn_rs_off,
+                         scratch->load_slots,
+                         scratch->store_slots,
+                         scratch->slot_stride);
+    }
     ev.cpu_index = cpu_index;
     ev.branch_known         = rec.branch_known;
     ev.branch_successor_pc  = rec.branch_successor_pc;

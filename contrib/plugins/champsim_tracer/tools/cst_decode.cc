@@ -48,7 +48,7 @@ void slot_lut_build(const ResolvedIds &ids,
      * each (family, k) pair takes on the wire comes from
      * ResolvedIds' per-slot arrays (resolved by name) and is not
      * assumed to follow any stride. */
-    const std::array<uint16_t, FID_SLOT_COUNT> *const slotted_fams[] = {
+    const FidSlotArray *const slotted_fams[] = {
         &ids.fid_load_addr,
         &ids.fid_store_addr,
         &ids.fid_load_data,
@@ -1033,10 +1033,10 @@ void apply_record_deltas(BodyWalker &walker, Reader &sec, uint64_t n_records,
  * stride assumption). */
 void materialise_slotted_memops(uint32_t insn_idx, uint64_t n_fixed,
                                 DynParam::Type type,
-                                const std::array<uint16_t, FID_SLOT_COUNT> &addr_fids,
-                                const std::array<uint16_t, FID_SLOT_COUNT> &data_fids,
-                                const std::array<uint16_t, FID_SLOT_COUNT> &size_fids,
-                                const std::array<uint16_t, FID_SLOT_COUNT> &ppage_fids,
+                                const FidSlotArray &addr_fids,
+                                const FidSlotArray &data_fids,
+                                const FidSlotArray &size_fids,
+                                const FidSlotArray &ppage_fids,
                                 bool has_mem,
                                 bool has_ppage,
                                 const FieldStateBlock *state_blk,
@@ -1240,10 +1240,10 @@ void BodyWalker::decode_field_delta(Reader &outer,
         if (lane_masks) {
             const InsnTemplate &it = tmpl->insns[i];
             auto emit_fam = [&](LaneMaskEntry::Family fam,
-                                const std::array<uint16_t, FID_SLOT_COUNT> &fids,
-                                uint8_t n_slots) {
+                                const FidSlotArray &fids,
+                                uint16_t n_slots) {
                 if (n_slots > FID_SLOT_COUNT) n_slots = FID_SLOT_COUNT;
-                for (uint8_t s = 0; s < n_slots; s++) {
+                for (uint16_t s = 0; s < n_slots; s++) {
                     uint16_t fid = fids[s];
                     if (fid == 0) continue;
                     Wide v = lookup_cell(state_blk, state_gen,
@@ -1260,15 +1260,15 @@ void BodyWalker::decode_field_delta(Reader &outer,
                 }
             };
             emit_fam(LaneMaskEntry::Src,       ids.fid_src_lane_mask,
-                     (uint8_t)it.src_regs.size());
+                     (uint16_t)it.src_regs.size());
             emit_fam(LaneMaskEntry::Dst,       ids.fid_dst_lane_mask,
-                     (uint8_t)it.dst_regs.size());
+                     (uint16_t)it.dst_regs.size());
             emit_fam(LaneMaskEntry::LoadData,  ids.fid_load_data_lane_mask,
-                     (uint8_t)std::min<uint32_t>(it.max_dep_loads,
-                                                 (uint32_t)n_loads));
+                     (uint16_t)std::min<uint32_t>(it.max_dep_loads,
+                                                  (uint32_t)n_loads));
             emit_fam(LaneMaskEntry::StoreData, ids.fid_store_data_lane_mask,
-                     (uint8_t)std::min<uint32_t>(it.max_dep_stores,
-                                                 (uint32_t)n_stores));
+                     (uint16_t)std::min<uint32_t>(it.max_dep_stores,
+                                                  (uint32_t)n_stores));
         }
     }
 

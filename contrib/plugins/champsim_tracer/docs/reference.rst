@@ -582,8 +582,10 @@ mapping.
    rather than family-then-slot; the four lane-mask families form a
    separate block after them, interleaved by slot with a stride of
    4 (``CST_FID_LANE_BLOCK_STRIDE``).  Each slotted family has
-   exactly 64 slots — ``CST_FID_SLOT_COUNT`` — so the slot index
-   ``k`` runs over ``[0, 64)``.
+   exactly 512 slots — ``CST_FID_SLOT_COUNT`` — so the slot index
+   ``k`` runs over ``[0, 512)``.  The ceiling bounds what the wire can
+   *address*, not what a decoder must allocate: size per-slot storage
+   by the highest slot a trace actually uses.
 
 .. list-table::
    :header-rows: 1
@@ -601,21 +603,21 @@ mapping.
        sets ``writes_int_flags`` (its dst maps to a
        ``RegClassification`` row with ``.is_int_flags = true``).
    * - ``CST_FID_LOAD_ADDR{k}`` / ``CST_FID_STORE_ADDR{k}``,
-       ``k ∈ [0, 64)``
+       ``k ∈ [0, 512)``
      - Scalar delta of the load / store access vaddr for memop
        slot ``k``.
    * - ``CST_FID_LOAD_DATA{k}`` / ``CST_FID_STORE_DATA{k}``,
-       ``k ∈ [0, 64)``
+       ``k ∈ [0, 512)``
      - Scalar delta of the loaded / stored value for memop slot
        ``k`` (up to 512 bits, ``SLEB_WIDE``).  Gated by
        ``CST_FLAG_MEM_DATA``.
-   * - ``CST_FID_DST_REG{k}``, ``k ∈ [0, 64)``
+   * - ``CST_FID_DST_REG{k}``, ``k ∈ [0, 512)``
      - Scalar delta of the destination-register post-execution
        snapshot for ``dst_regs[k]``.  Gated by
        ``CST_FLAG_REG_DATA``.  Source-register values are not
        emitted — consumers reconstruct them from the regfile.
    * - ``CST_FID_LOAD_SIZE{k}`` / ``CST_FID_STORE_SIZE{k}`` /
-       ``CST_FID_DST_REG_WIDTH{k}``, ``k ∈ [0, 64)``
+       ``CST_FID_DST_REG_WIDTH{k}``, ``k ∈ [0, 512)``
      - Scalar delta — byte width (1..``CST_MAX_WIDE_BYTES``) of the
        memop value / destination-register write for slot ``k``, for
        value-prediction consumers (the width is not recoverable from
@@ -624,13 +626,13 @@ mapping.
        families: ``LOAD_SIZE`` / ``STORE_SIZE`` gated by
        ``CST_FLAG_MEM_DATA``, ``DST_REG_WIDTH`` by ``CST_FLAG_REG_DATA``.
    * - ``CST_FID_SRC_LANE_MASK{k}`` /
-       ``CST_FID_DST_LANE_MASK{k}``, ``k ∈ [0, 64)``
+       ``CST_FID_DST_LANE_MASK{k}``, ``k ∈ [0, 512)``
      - Scalar delta — per-source / per-destination vector lane
        participation bitmap (bit ``j`` = lane ``j`` active).
        Emitted only when the insn's ``CST_INSN_FLAG_VEC`` bit is
        set; src and dst masks are independent.
    * - ``CST_FID_LOAD_DATA_LANE_MASK{k}`` /
-       ``CST_FID_STORE_DATA_LANE_MASK{k}``, ``k ∈ [0, 64)``
+       ``CST_FID_STORE_DATA_LANE_MASK{k}``, ``k ∈ [0, 512)``
      - Scalar delta — which lanes take their value from / are
        drained by memop slot ``k``, computed per memop from its
        address + size vs the access base and element width.  Gated

@@ -126,17 +126,20 @@ links to the prose that explains the consequence of hitting it.
        "no preset length"; count body entries via the trailer's
        ``num_entries`` instead.
    * - Slotted load addresses / data per instruction
-     - ``CST_FID_SLOT_COUNT`` = 64
-     - ``LOAD_ADDR``/``LOAD_DATA`` slots 0..63.  There is no
-       overflow vector; a single instruction issuing more than 64
-       loads is not representable (no supported ISA instruction
-       does — AVX-512 gather is 16-wide).
+     - ``CST_FID_SLOT_COUNT`` = 512
+     - ``LOAD_ADDR``/``LOAD_DATA`` slots 0..511.  There is no
+       overflow vector; a single instruction issuing more than 512
+       loads is not representable.  The widest real case is an x86
+       ``XRSTOR`` reloading the extended state area, well inside the
+       ceiling; AVX-512 gather is only 16-wide.
    * - Slotted store addresses / data per instruction
-     - ``CST_FID_SLOT_COUNT`` = 64
-     - ``STORE_ADDR``/``STORE_DATA`` slots 0..63; likewise no
-       overflow vector.
+     - ``CST_FID_SLOT_COUNT`` = 512
+     - ``STORE_ADDR``/``STORE_DATA`` slots 0..511; likewise no
+       overflow vector.  Sized by ``XSAVE``-family state saves — 88
+       stores from one ``XSAVEOPT`` on a Haswell-class guest, about
+       320 for a full AVX-512 area.
    * - WP-side memops captured per instruction
-     - ``CST_FID_SLOT_COUNT`` = 64
+     - ``CST_FID_SLOT_COUNT`` = 512
      - ``MemAccessRecorder::record`` drops memops past this on the
        wrong path (no overflow vector on WP).
    * - Load/store data value width
@@ -151,12 +154,14 @@ links to the prose that explains the consequence of hitting it.
      - 255 (``REG_ID_COUNT``) is the count sentinel; an ISA needing
        more than 255 register IDs requires a wire-format change.
    * - Stuck-PC speculative-loop guard
-     - 64 same-PC iterations (reuses ``CST_FID_SLOT_COUNT``)
+     - ``CST_FID_SLOT_COUNT`` same-PC iterations
      - A wrong-path instruction that never advances PC (e.g. an x86
        ``rep`` whose sandboxed write keeps PC anchored) is forced
-       past once the same-PC iteration count *exceeds* 64.  The 64
-       threshold is a reuse of ``CST_FID_SLOT_COUNT`` for
-       convenience, not an independently tuned bound.
+       past once the same-PC iteration count *exceeds* the per-insn
+       memop cap — past that point its memops are no longer
+       representable, so further iterations record nothing.  A repeat
+       that makes *no* progress at all (memop count not climbing) is
+       bailed after two strikes and never waits for this bound.
    * - Wrong-path chain depth
      - ``wpdepth`` instructions (configurable)
      - The speculative side-trip after each correct-path branch is
@@ -220,13 +225,14 @@ single load/store value is encoded in up to 64 bytes.  ``rep movs``
 and other multi-iteration instructions surface one body entry per
 iteration (see the wire-format spec's *REP-prefixed self-loop BBs*
 section), so each entry carries at most 1 load + 1 store — the
-slotted ``LOAD_ADDR[0..63]`` / ``STORE_ADDR[0..63]`` (and matching
+slotted ``LOAD_ADDR[0..511]`` / ``STORE_ADDR[0..511]`` (and matching
 ``DATA``) families cover every supported instruction; there is no
-overflow vector, and the widest single-instruction memops (AVX-512
-gather/scatter, 16-wide) sit well inside the 64 slots.
+overflow vector, and the widest single-instruction memop fan-out —
+an x86 ``XSAVE``-family state save, about 320 stores for a full
+AVX-512 area — sits inside the 512 slots.
 
-**Memops capped at 64 per insn.**  ``MemAccessRecorder::record``
-caps per-instruction memops at ``CST_FID_SLOT_COUNT`` = 64 and
+**Memops capped at 512 per insn.**  ``MemAccessRecorder::record``
+caps per-instruction memops at ``CST_FID_SLOT_COUNT`` = 512 and
 drops the rest.  Real workloads almost never hit this;
 pathological cases involve x86 ``rep`` opcodes on the wrong path,
 where speculative iteration is bounded by the WP depth budget

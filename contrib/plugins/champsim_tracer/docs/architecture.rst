@@ -1767,9 +1767,9 @@ branch.
 CP-side capture is straightforward: each iteration's memops attach to
 that iteration's own body entry (1 load + 1 store on REP MOVS, 1 store
 on REP STOS, etc.), so the slotted families ``CST_FID_LOAD_ADDR*`` /
-``CST_FID_STORE_ADDR*`` stay well within their 0..63 range even on
+``CST_FID_STORE_ADDR*`` stay well within their 0..511 range even on
 long REP runs.  ``MemAccessRecorder::record`` caps per-instruction
-memops at ``CST_FID_SLOT_COUNT`` = 64 and drops the rest — there is
+memops at ``CST_FID_SLOT_COUNT`` = 512 and drops the rest — there is
 no overflow vector — which also bounds the WP simulator's spec mode,
 where ``REP`` can iterate arbitrarily many times against a sandboxed
 memory.  The matching

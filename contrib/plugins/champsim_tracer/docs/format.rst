@@ -840,9 +840,9 @@ Loop until a ``BODY_TAG_END`` is seen:
           Reference §5 for the field-state semantics.
 
 All memops are addressed through the slotted families
-(``LOAD_ADDR[0..63]`` / ``STORE_ADDR[0..63]`` and their ``DATA``
+(``LOAD_ADDR[0..511]`` / ``STORE_ADDR[0..511]`` and their ``DATA``
 counterparts); there is no overflow vector.  An instruction whose
-dynamic memop count exceeds ``CST_FID_SLOT_COUNT`` (64) has the
+dynamic memop count exceeds ``CST_FID_SLOT_COUNT`` (512) has the
 excess dropped at the writer.
 
 A SLEB_WIDE / ULEB_WIDE primitive: like LEB128 but the value is
@@ -919,7 +919,7 @@ state for the same field.
 ::
 
    CST_MAGIC              = 0x1D545343       bytes: 'C' 'S' 'T' 0x1D
-   CST_FID_SLOT_COUNT     = 64               max memops / dst regs per insn
+   CST_FID_SLOT_COUNT     = 512              max memops / dst regs per insn
 
 ``CST_MAGIC`` and ``CST_FID_SLOT_COUNT`` are the only numerically-fixed
 constants in the format: a reader compares the magic literally, and
@@ -2085,7 +2085,7 @@ absent for one of these valid slots, the value is unchanged from
 that slot's current baseline.
 
 If an instruction's dynamic ``n_loads`` or ``n_stores`` would exceed
-``CST_FID_SLOT_COUNT = 64``, the writer is permitted to elide the
+``CST_FID_SLOT_COUNT = 512``, the writer is permitted to elide the
 trailing memops past the cap and emit a warning to
 ``unknown_warnings.log`` identifying the PC, opcode, and dropped-memop
 count.  Consumers see only the first ``CST_FID_SLOT_COUNT`` memops in
@@ -2093,12 +2093,25 @@ that case; the elision is observable as the dynamic count being
 clamped to the cap.  The wire format reserves no overflow path —
 there is no ``EXTRA_*`` raw-vector escape.
 
-The 64-slot ceiling covers AVX-512 gather/scatter (≤ 16 lanes),
-ARM SVE2 at VLEN ≤ 4096 (≤ 64 element loads), and RISC-V V at
-LMUL × VLEN/SEW ≤ 64.  Workloads that genuinely need more either
-fan the instruction out into multiple body entries (analogous to
-the REP-prefixed self-loop fan-out for x86 string ops; see §5.2
-below) or accept the writer-side clamp.
+The 512-slot ceiling is sized by the widest memop fan-out a real
+instruction issues, which is not a vector instruction but a
+processor-state save: x86 ``XSAVE``/``XSAVEOPT``/``XRSTOR`` write or
+read the whole extended state area in one instruction — 88 stores on
+a Haswell-class guest, and roughly 320 8-byte stores for a full
+AVX-512 area of about 2.5 KiB.  The vector cases sit far below it:
+AVX-512 gather/scatter is at most 16 lanes, ARM SVE2 at VLEN ≤ 4096
+is at most 64 element loads, and RISC-V V at LMUL × VLEN/SEW is at
+most 64.  Workloads that genuinely need more either fan the
+instruction out into multiple body entries (analogous to the
+REP-prefixed self-loop fan-out for x86 string ops; see §5.2 below)
+or accept the writer-side clamp.
+
+The ceiling is a *wire* quantity only.  Sizing structures by it is
+not required and the writer does not do it: the per-template field
+state and the per-entry memop slot tables are both sized by the
+highest slot an instruction has actually been observed to use, so an
+instruction with one load costs the same as it did at a 64-slot
+ceiling.  Consumers should size the same way.
 
 5.3 Memory Data
 ^^^^^^^^^^^^^^^

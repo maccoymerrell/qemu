@@ -3666,7 +3666,17 @@ static RISCVException rmw_mip64(CPURISCVState *env, int csrno,
     }
 
     if (mask) {
+#ifdef CONFIG_PLUGIN
+        /* The guest's own write: its effect on mip is architectural register
+         * state, so a speculative one must be rolled back with everything
+         * else.  Tell riscv_cpu_update_mip not to log it as an external
+         * device assertion needing replay. */
+        env->plugin_mip_guest_write = true;
+#endif
         old_mip = riscv_cpu_update_mip(env, mask, (new_val & mask));
+#ifdef CONFIG_PLUGIN
+        env->plugin_mip_guest_write = false;
+#endif
     } else {
         old_mip = env->mip;
     }

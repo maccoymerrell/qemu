@@ -884,6 +884,40 @@ uint64_t riscv_cpu_update_mip(CPURISCVState *env, uint64_t mask, uint64_t value)
 
     env->mip = (env->mip & ~mask) | (value & mask);
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * Pending-interrupt replay (part of the spec_clock_resync contract).
+     * env->mip lives inside the wrong-path register snapshot, so the
+     * excursion-exit restore rewinds it.  For bits the GUEST changed that is
+     * exactly right — a speculative CSR write to sip must be discarded.  For
+     * bits an EXTERNAL device changed while the excursion was in flight it is
+     * wrong: the PLIC (SEIP/MEIP), the ACLINT software interrupt (MSIP/SSIP),
+     * hgeip (SGEIP) and the PMU overflow counter (LCOFIP) have no
+     * re-derivation path at excursion exit the way the timer bits do, so a
+     * raise landing inside the window is simply lost and the device waits
+     * forever for an acknowledgement that never comes.
+     *
+     * Record the externally-caused delta so the restore can replay it.  The
+     * timer bits (MTIP/STIP/VSTIP) are excluded because the timer reconcile
+     * re-derives them from the architected compare registers; carrying them
+     * here as well perturbed interrupt-delivery timing across the wrong-path
+     * merge (#77).
+     */
+    {
+        CPUState *cs = env_cpu(env);
+        if (unlikely((cs->plugin_spec_mode || cs->plugin_spec_vtime_paused) &&
+                     !env->plugin_mip_guest_write)) {
+            uint64_t ext = ~(uint64_t)(MIP_MTIP | MIP_STIP | MIP_VSTIP);
+            uint64_t raised = (env->mip & ~old) & ext;
+            uint64_t lowered = (old & ~env->mip) & ext;
+            env->plugin_spec_mip_set =
+                (env->plugin_spec_mip_set & ~lowered) | raised;
+            env->plugin_spec_mip_clear =
+                (env->plugin_spec_mip_clear & ~raised) | lowered;
+        }
+    }
+#endif
+
     riscv_cpu_interrupt(env);
 
     return old;

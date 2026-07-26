@@ -90,6 +90,16 @@ struct Stats {
      * upstream of the drain, the class the offline lint (cst_lint.h)
      * fails traces on. */
     uint64_t cp_impossible_slot_memops = 0;
+    /* Memops an entry could not address, because the instruction issued
+     * more than CST_FID_SLOT_COUNT of one direction and the wire has no
+     * slot to hold them.  The entry reports the capped count so it stays
+     * self-describing (see extr_n_loads); this counts what the cap left
+     * out.  The unbounded issuers are the AArch64 FEAT_MOPS bulk-memory
+     * instructions — SETM / CPYM transfer the whole page-aligned body of
+     * a memset / memcpy in a single execution — for which the
+     * per-template profile still carries the untruncated memop totals
+     * and the full touched address extent. */
+    uint64_t memops_over_slot_ceiling = 0;
     /* Emitted entries whose pending reg-snap count did not equal the
      * template's Σ n_dst_regs — the positional reg-snap invariant the wire
      * relies on (build_entry_view prefix-sums n_dst_regs).  The entry's

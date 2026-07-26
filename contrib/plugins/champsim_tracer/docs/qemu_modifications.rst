@@ -1074,6 +1074,86 @@ not populate the normal-mode TLB they bypass.
    ``qemu_plugin_path_to_binary()`` from ``vcpu_init_cb`` to find
    the guest ELF for the build-attributes parse.
 
+Bulk-memory instrumentation
+---------------------------
+
+A handful of AArch64 instructions move memory in bulk from inside a TCG
+helper rather than through ``qemu_ld`` / ``qemu_st`` ops: the ARMv8.8
+FEAT_MOPS families ``SETP`` / ``SETM`` / ``SETE`` and ``CPYP`` /
+``CPYM`` / ``CPYE``, whose three-instruction triples implement a whole
+``memset`` or ``memcpy``, and ``DC ZVA``, which zeroes a
+cache-block-sized run.
+Each helper takes a trapless ``tlb_vaddr_to_host()`` lookup and, on
+success, transfers the page-bounded chunk with a host ``memset()`` or
+``memmove()``.  Plugin memory instrumentation is emitted by ``accel/tcg``
+around the *TCG* memory ops, so a bulk transfer that hits the
+host-pointer fast path is invisible: the instruction reports no memory
+access at all.  Only the byte-at-a-time fallbacks — taken for I/O,
+watchpoints, unmapped pages and, in this fork, speculative execution —
+are instrumented, which is why the wrong path records this traffic and
+the correct path does not.
+
+This matters far beyond exotic code.  glibc's AArch64 ``memcpy`` /
+``memmove`` / ``memset`` dispatch to the FEAT_MOPS implementations
+whenever ``HWCAP2_MOPS`` is set, which is the case on a ``-cpu max``
+guest, so on the correct path an unfixed base hides essentially all of a
+program's bulk memory traffic.
+
+``target/arm/tcg/helper-a64.c`` — ``arm_plugin_bulk_mem_cb``
+
+   Reports the transfer to the plugin layer explicitly.  The range is
+   decomposed into naturally aligned power-of-two accesses of at most 16
+   bytes and one ``qemu_plugin_vcpu_mem_cb`` is emitted per piece, so
+   every access carries a real address, a real size and the right
+   direction.  The 16-byte ceiling is the widest size the plugin memory
+   API can describe (``qemu_plugin_mem_get_value()`` asserts above
+   ``MO_128``), and AArch64 already issues 16-byte accesses for ``LDP`` /
+   ``STP`` of Q registers and for the LSE 128-bit atomics, so a consumer
+   sees no access shape it could not see already.  The whole body is
+   gated on ``cpu->neg.plugin_mem_cbs``: with no plugin attached the cost
+   is one load and one branch per page-sized chunk.
+
+   The call sites are the four FEAT_MOPS step helpers ``set_step``,
+   ``set_step_tags``, ``copy_step`` and ``copy_step_rev``.  A copy
+   reports its load before the host ``memmove`` and its store after, so
+   an overlapping ``memmove`` records the value each access actually saw.
+   The copy helpers' *mixed* slow path — where only one of the source and
+   destination resolved to a host pointer — is covered too: there the
+   instrumented ``cpu_ldub`` / ``cpu_stb`` handles one side while the
+   other is a bare host access, which would otherwise leave the copy
+   reporting a store with no load or a load with no store.
+
+   ``HELPER(dc_zva)`` is **not** a call site, though its bulk ``memset``
+   has the identical defect.  Capstone decodes ``DC ZVA`` as the generic
+   ``AARCH64_INS_SYS``, which the plugin's AArch64 mnemonic table
+   classifies ``GEN_OP_VEC_LOGIC`` with no memory operand, so reported
+   stores would land on a slot the trace declares incapable of touching
+   memory and every trace containing a ``DC ZVA`` — the Linux
+   ``clear_page``, for one — would fail the impossible-attribution lint.
+   Reporting it needs that ``SYS`` classification fixed first, which in
+   turn needs a decision on whether ``DC ZVA`` models as cache
+   maintenance (whose ``GEN_OP_CACHE_FLUSH`` path synthesises a competing
+   effective address) or as the block store it performs.  Until then a
+   correct-path ``DC ZVA`` still records no memory access.
+
+   The alternative fix is to make ``tlb_vaddr_to_host()`` honour
+   ``cpu_plugin_mem_cbs_enabled()`` the way ``probe_access_flags()``
+   already does, so these helpers fall back to their instrumented slow
+   paths — which is how SVE contiguous loads, RISC-V vector and s390x
+   already behave.  It is rejected here because those MOPS fallbacks
+   transfer **one byte per iteration**: a 4 KiB page-sized step would
+   surface as 4096 one-byte accesses instead of 256 sixteen-byte ones,
+   exhausting the wire's 512 memop slots inside the first 512 bytes and
+   turning every ``memcpy`` in the guest into a per-byte softmmu loop.
+
+   The one instruction class this leaves bounded is the ``M`` member of
+   each triple.  ``SETM`` and ``CPYM`` transfer every whole page of the
+   operation in a single execution, so one instruction can issue
+   arbitrarily many accesses — 3840 stores for a 64 KiB ``memset``.  The
+   wire addresses at most ``CST_FID_SLOT_COUNT`` = 512 per direction per
+   instruction; see :doc:`limitations` for what the trace carries past
+   that point.
+
 Build wiring
 ------------
 

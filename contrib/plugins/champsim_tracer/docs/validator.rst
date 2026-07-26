@@ -448,6 +448,25 @@ outside the repo as standalone scripts):
 ``features.wp_tlb_cold``
    WP fetch of a valid-PTE but TLB-cold code page captures real
    bytes; a no-PTE target terminates the chain (system mode).
+``features.mops_memops``
+   AArch64 FEAT_MOPS bulk transfers reach the memory instrumentation
+   on the correct path.  ``SETP``/``SETM``/``SETE`` and
+   ``CPYP``/``CPYM``/``CPYE`` move memory from inside a TCG helper
+   with a host ``memset``/``memmove``, never through a ``qemu_ld`` /
+   ``qemu_st`` op, so without the base's ``arm_plugin_bulk_mem_cb``
+   (see :doc:`qemu_modifications`) they record no memory access at
+   all — and glibc routes every ``memcpy``/``memmove``/``memset``
+   through them on a guest advertising ``HWCAP2_MOPS``.  The check
+   issues both triples directly, so nothing depends on a libc ifunc
+   choice, over page-aligned buffers at a size — two whole pages plus
+   64 bytes — that puts work on all six instructions.  The assertion
+   is a *tiling* one, which pins addresses and sizes and not just a
+   count: the ``SET`` triple's stores must cover the destination
+   range exactly (contiguous, no gap, no overlap, every access
+   naturally aligned and at most 16 bytes), and the ``CPY`` triple's
+   loads and stores must likewise tile the source and the
+   destination.  Against a base without the fix all six instructions
+   are silent and every tiling is empty.
 ``features.options_smoke``
    Direct qemu-user drive of the long-tail options no other check
    sets (``histogram``, ``wp_memdata``, ``wp_regdata``,

@@ -33,6 +33,8 @@
 #include "exec/cpu_ldst.h"
 #include "qemu/int128.h"
 #include "qemu/atomic128.h"
+#include "qemu/plugin.h"
+#include "exec/memopidx.h"
 #include "fpu/softfloat.h"
 #include <zlib.h> /* for crc32 */
 #ifdef CONFIG_USER_ONLY
@@ -798,6 +800,108 @@ illegal_return:
                   "resuming execution at 0x%" PRIx64 "\n", cur_el, env->pc);
 }
 
+/*
+ * Report a bulk guest-memory transfer to the TCG plugin layer.
+ *
+ * The AArch64 bulk-memory helpers (DC ZVA and the FEAT_MOPS
+ * SETP/SETM/SETE and CPYP/CPYM/CPYE families) take a trapless
+ * tlb_vaddr_to_host() lookup and then move the whole block with a host
+ * memset()/memmove().  That bulk move never goes through a qemu_ld /
+ * qemu_st TCG op, so the plugin memory instrumentation accel/tcg emits
+ * around those ops never fires: to a plugin, a bulk instruction that
+ * hits the host-pointer fast path performs no memory access at all.
+ * Only the byte-at-a-time fallbacks (taken for I/O, watchpoints,
+ * unmapped pages, and — in this tree — plugin speculative execution)
+ * are instrumented, so the accesses are visible exactly on the paths a
+ * plugin is least interested in and invisible on the common one.
+ *
+ * The callers are the four FEAT_MOPS step helpers.  DC ZVA has the same
+ * defect but is deliberately not reported yet; see the comment at its
+ * host memset() in HELPER(dc_zva).
+ *
+ * @addr / @size describe the guest range in ascending order, @host
+ * points at the host mapping of @addr (NULL if the data value is not
+ * available), @rw is the direction.  The range is decomposed into
+ * naturally aligned power-of-two accesses of at most 16 bytes and one
+ * callback is emitted per piece, so every callback carries a real
+ * address, a real size and the right direction.  16 bytes is the
+ * ceiling because MO_128 is the widest access the plugin memory API
+ * can describe (qemu_plugin_mem_get_value() asserts above it), and
+ * because AArch64 already issues 16-byte accesses for LDP/STP of Q
+ * registers and for the LSE 128-bit atomics — a plugin sees nothing it
+ * could not see already.
+ *
+ * The alternative — making tlb_vaddr_to_host() honour
+ * cpu_plugin_mem_cbs_enabled() the way probe_access_flags() does, so
+ * the bulk helpers fall back to their instrumented slow paths — is
+ * rejected here: those fallbacks transfer one byte per iteration, so a
+ * plugin would see a 4 KiB page-sized MOPS step as 4096 one-byte
+ * accesses instead of 256 sixteen-byte ones, and every glibc memcpy
+ * would become a per-byte softmmu loop.
+ *
+ * The value is assembled little-endian from memory order and the memop
+ * is tagged MO_LE to match.  A bulk block transfer moves bytes, not
+ * scalars, so it has no endianness of its own; memory order is the
+ * only meaningful reading of the payload.
+ */
+static void arm_plugin_bulk_mem_cb(CPUARMState *env, uint64_t addr,
+                                   uint64_t size, const void *host,
+                                   int memidx, enum qemu_plugin_mem_rw rw)
+{
+#ifdef CONFIG_PLUGIN
+    CPUState *cs = env_cpu(env);
+
+    if (likely(!cs->neg.plugin_mem_cbs)) {
+        return;
+    }
+
+    while (size != 0) {
+        const uint8_t *p = host;
+        uint64_t low = 0, high = 0;
+        unsigned bytes;
+        int sz;
+
+        /* Widest naturally aligned power-of-two piece, at most MO_128. */
+        for (sz = MO_128; sz > MO_8; sz--) {
+            if (((uint64_t)1 << sz) <= size &&
+                (addr & (((uint64_t)1 << sz) - 1)) == 0) {
+                break;
+            }
+        }
+        bytes = 1u << sz;
+
+        if (p) {
+            switch (sz) {
+            case MO_8:
+                low = ldub_p(p);
+                break;
+            case MO_16:
+                low = lduw_le_p(p);
+                break;
+            case MO_32:
+                low = ldl_le_p(p);
+                break;
+            case MO_64:
+                low = ldq_le_p(p);
+                break;
+            default:
+                low = ldq_le_p(p);
+                high = ldq_le_p(p + 8);
+                break;
+            }
+            host = p + bytes;
+        }
+
+        qemu_plugin_vcpu_mem_cb(cs, addr, low, high,
+                                make_memop_idx(MO_LE | sz, memidx), rw);
+        addr += bytes;
+        size -= bytes;
+    }
+#else
+    (void)env; (void)addr; (void)size; (void)host; (void)memidx; (void)rw;
+#endif
+}
+
 void HELPER(dc_zva)(CPUARMState *env, uint64_t vaddr_in)
 {
     uintptr_t ra = GETPC();
@@ -852,6 +956,20 @@ void HELPER(dc_zva)(CPUARMState *env, uint64_t vaddr_in)
     }
 #endif
 
+    /*
+     * DC ZVA has exactly the plugin-visibility defect arm_plugin_bulk_mem_cb
+     * exists to fix — this bulk memset is a bare host write no plugin can
+     * see — but it is deliberately NOT reported here.  Capstone decodes
+     * DC ZVA as the generic AARCH64_INS_SYS, which the consuming tracer's
+     * mnemonic table classifies GEN_OP_VEC_LOGIC with no memory operand, so
+     * reported stores would land on a slot the trace declares incapable of
+     * touching memory and every AArch64 trace containing a DC ZVA (the
+     * kernel's clear_page, for one) would fail its attribution lint.
+     * Reporting it needs the SYS classification fixed first, and that in
+     * turn needs a decision on whether DC ZVA models as cache maintenance —
+     * whose GEN_OP_CACHE_FLUSH path synthesises a competing effective
+     * address — or as the block store it actually performs.
+     */
     set_helper_retaddr(ra);
     memset(mem, 0, blocklen);
     clear_helper_retaddr();
@@ -1004,6 +1122,8 @@ static uint64_t set_step(CPUARMState *env, uint64_t toaddr,
     set_helper_retaddr(ra);
     memset(mem, data, setsize);
     clear_helper_retaddr();
+    arm_plugin_bulk_mem_cb(env, toaddr, setsize, mem, memidx,
+                           QEMU_PLUGIN_MEM_W);
     return setsize;
 }
 
@@ -1047,6 +1167,8 @@ static uint64_t set_step_tags(CPUARMState *env, uint64_t toaddr,
     set_helper_retaddr(ra);
     memset(mem, data, setsize);
     clear_helper_retaddr();
+    arm_plugin_bulk_mem_cb(env, cleanaddr, setsize, mem, memidx,
+                           QEMU_PLUGIN_MEM_W);
     mte_mops_set_tags(env, toaddr, setsize, *mtedesc);
     return setsize;
 }
@@ -1406,20 +1528,33 @@ static uint64_t copy_step(CPUARMState *env, uint64_t toaddr, uint64_t fromaddr,
         uint8_t byte;
         if (rmem) {
             byte = *(uint8_t *)rmem;
+            /* Bare host read: report it, the cpu_ldub path would not be. */
+            arm_plugin_bulk_mem_cb(env, fromaddr, 1, rmem, rmemidx,
+                                   QEMU_PLUGIN_MEM_R);
         } else {
             byte = cpu_ldub_mmuidx_ra(env, fromaddr, rmemidx, ra);
         }
         if (wmem) {
             *(uint8_t *)wmem = byte;
+            arm_plugin_bulk_mem_cb(env, toaddr, 1, wmem, wmemidx,
+                                   QEMU_PLUGIN_MEM_W);
         } else {
             cpu_stb_mmuidx_ra(env, toaddr, byte, wmemidx, ra);
         }
         return 1;
     }
-    /* Easy case: just memmove the host memory */
+    /*
+     * Easy case: just memmove the host memory.  The load is reported
+     * before the move and the store after it, so an overlapping copy
+     * reports the value each access actually saw.
+     */
+    arm_plugin_bulk_mem_cb(env, fromaddr, copysize, rmem, rmemidx,
+                           QEMU_PLUGIN_MEM_R);
     set_helper_retaddr(ra);
     memmove(wmem, rmem, copysize);
     clear_helper_retaddr();
+    arm_plugin_bulk_mem_cb(env, toaddr, copysize, wmem, wmemidx,
+                           QEMU_PLUGIN_MEM_W);
     return copysize;
 }
 
@@ -1478,11 +1613,16 @@ static uint64_t copy_step_rev(CPUARMState *env, uint64_t toaddr,
         uint8_t byte;
         if (rmem) {
             byte = *(uint8_t *)rmem;
+            /* Bare host read: report it, the cpu_ldub path would not be. */
+            arm_plugin_bulk_mem_cb(env, fromaddr, 1, rmem, rmemidx,
+                                   QEMU_PLUGIN_MEM_R);
         } else {
             byte = cpu_ldub_mmuidx_ra(env, fromaddr, rmemidx, ra);
         }
         if (wmem) {
             *(uint8_t *)wmem = byte;
+            arm_plugin_bulk_mem_cb(env, toaddr, 1, wmem, wmemidx,
+                                   QEMU_PLUGIN_MEM_W);
         } else {
             cpu_stb_mmuidx_ra(env, toaddr, byte, wmemidx, ra);
         }
@@ -1490,11 +1630,19 @@ static uint64_t copy_step_rev(CPUARMState *env, uint64_t toaddr,
     }
     /*
      * Easy case: just memmove the host memory. Note that wmem and
-     * rmem here point to the *last* byte to copy.
+     * rmem here point to the *last* byte to copy.  The plugin reports
+     * take the ascending base of the range (load before the move,
+     * store after it — see copy_step()).
      */
+    arm_plugin_bulk_mem_cb(env, fromaddr - (copysize - 1), copysize,
+                           rmem - (copysize - 1), rmemidx,
+                           QEMU_PLUGIN_MEM_R);
     set_helper_retaddr(ra);
     memmove(wmem - (copysize - 1), rmem - (copysize - 1), copysize);
     clear_helper_retaddr();
+    arm_plugin_bulk_mem_cb(env, toaddr - (copysize - 1), copysize,
+                           wmem - (copysize - 1), wmemidx,
+                           QEMU_PLUGIN_MEM_W);
     return copysize;
 }
 

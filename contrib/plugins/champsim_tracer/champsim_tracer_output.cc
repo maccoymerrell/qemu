@@ -1630,12 +1630,30 @@ static uint16_t cap_dst_regs(const EntryView *ev, uint32_t i)
 
 /* ---------- Per-family extract/default callbacks ---------- */
 
+/*
+ * The emitted count is the SLOT-CAPPED count, not the raw observed one.
+ *
+ * CST_FID_SLOT_COUNT slot records is all an entry can address, so a
+ * count above the ceiling would promise a consumer more addresses than
+ * the entry carries; it would read the ceiling's worth and then walk
+ * off into slots the delta stream never wrote, re-reading whichever
+ * address the previous entry left there.  Reporting the capped count
+ * keeps every entry self-describing: n_loads / n_stores is exactly how
+ * many LOAD_ADDR / STORE_ADDR slots follow.
+ *
+ * Instructions this bites are the unbounded bulk-memory ones — AArch64
+ * FEAT_MOPS SETM / CPYM, whose single execution transfers the whole
+ * page-aligned body of a memset/memcpy.  The truncation is counted in
+ * memops_over_slot_ceiling, and the per-template profile keeps the
+ * untruncated totals (memops_cp) and the full touched address extent,
+ * so the loss is visible and bounded to per-entry slot detail.
+ */
 static bool extr_n_loads(const EntryView *ev, uint32_t i, uint16_t slot,
                          U512 *out)
 {
     (void)slot;
     if (!ev->tmpl || i >= ev->tmpl->n_insns) return false;
-    *out = cst_wide_from_u64(ev->actual_n_loads[i]);
+    *out = cst_wide_from_u64(cap_min(ev->actual_n_loads[i]));
     return true;
 }
 
@@ -1644,7 +1662,7 @@ static bool extr_n_stores(const EntryView *ev, uint32_t i, uint16_t slot,
 {
     (void)slot;
     if (!ev->tmpl || i >= ev->tmpl->n_insns) return false;
-    *out = cst_wide_from_u64(ev->actual_n_stores[i]);
+    *out = cst_wide_from_u64(cap_min(ev->actual_n_stores[i]));
     return true;
 }
 
@@ -1887,7 +1905,7 @@ static bool extr_u64_n_loads(const EntryView *ev, uint32_t i, uint16_t slot,
 {
     (void)slot;
     if (!ev->tmpl || i >= ev->tmpl->n_insns) return false;
-    *out = ev->actual_n_loads[i];
+    *out = cap_min(ev->actual_n_loads[i]);   /* see extr_n_loads */
     return true;
 }
 static uint64_t deflt_u64_zero(const BBTemplate *t, uint32_t i, uint16_t slot)
@@ -1898,7 +1916,7 @@ static bool extr_u64_n_stores(const EntryView *ev, uint32_t i, uint16_t slot,
 {
     (void)slot;
     if (!ev->tmpl || i >= ev->tmpl->n_insns) return false;
-    *out = ev->actual_n_stores[i];
+    *out = cap_min(ev->actual_n_stores[i]);  /* see extr_n_loads */
     return true;
 }
 
@@ -2527,6 +2545,13 @@ static uint32_t build_entry_view(EntryView *ev, const BBTemplate *tmpl,
         }
         uint32_t hi = cap_min(actual_n_loads[i]);
         uint32_t hs = cap_min(actual_n_stores[i]);
+        /* Count what the wire's per-insn slot ceiling leaves out, so a
+         * truncated bulk-memory instruction is visible in the stats
+         * rather than silently short. */
+        if (actual_n_loads[i] > hi || actual_n_stores[i] > hs) {
+            thread_stats_get().memops_over_slot_ceiling +=
+                (actual_n_loads[i] - hi) + (actual_n_stores[i] - hs);
+        }
         if (hs > hi) hi = hs;
         if (hi > high_water) high_water = hi;
     }

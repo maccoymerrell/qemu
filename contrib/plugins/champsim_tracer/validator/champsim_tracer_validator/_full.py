@@ -144,6 +144,7 @@ FEATURES: dict[str, str] = {
     "behavior:wrong_path_coverage": "static_templates=1: minted-alternate never-executed fall-through + BTB target coverage, deepened by static_depth (4-ISA)",
     "behavior:segment_final_memops": "the segment's last body entry carries its memory operands, matching the earlier executions of the same true BB (the deferred icount/simpoint window close emits it after it has run, not before)",
     "behavior:smc_revisions": "self-modifying code: correct-path template-revision minting for rewrites that preserve OR change the block's instruction boundaries, content-signature id reuse, and the per-pc revision cap (4-ISA)",
+    "behavior:bulk_mem_visible": "aarch64 FEAT_MOPS bulk transfers (SETP/SETM/SETE, CPYP/CPYM/CPYE) reach the memory instrumentation on the correct path: their recorded accesses tile the transferred range exactly instead of vanishing into the helper's host memset/memmove",
     "behavior:reg_snap_accounting": "the plugin's own dropped-slice completeness invariant for the positional reg-snap capture — CP reg-snap slice dropped == CP reg-snap leak trimmed (D4-class completeness oracle; the wire has no record of it, so this is read from the <outfile>.stats.log sidecar, offline via cst_audit --stats-log)",
     "behavior:memop_bimodality": "per-template memop bimodality: a memop-capable template's CP executions overwhelmingly nonzero with a small minority of zero-memop outliers is a completeness loss (D4-class oracle generalised past the segment-final-entry special case; cst_lint.h MemopBimodalityLint + validator.py's mirror, both gating)",
 }
@@ -684,6 +685,24 @@ def _chk_tagged_ptr(ctx: Ctx) -> Outcome:
     tail = "\n".join(out.splitlines()[-6:])
     if "SKIP" in out and p.returncode == 0:
         return Outcome("skip", f"cross-compiler absent\n{tail}")
+    return Outcome("pass" if p.returncode == 0 else "fail",
+                   f"rc={p.returncode}\n{tail}")
+
+
+def _chk_mops_memops(ctx: Ctx) -> Outcome:
+    t = (Path(__file__).resolve().parent / "tests" / "test_mops_memops.py")
+    if not t.is_file():
+        return Outcome("skip", f"test not found: {t}")
+    env = dict(os.environ, CST_BUILD_DIR=str(ctx.build_dir),
+               BUILD_DIR=str(ctx.build_dir))
+    p = subprocess.run([sys.executable, str(t)], text=True,
+                       capture_output=True, env=env)
+    out = (p.stdout or "") + (p.stderr or "")
+    tail = "\n".join(out.splitlines()[-8:])
+    # A missing AArch64 cross toolchain skips the whole class, which unittest
+    # still reports as rc 0.  Surface that as a skip, not a silent pass.
+    if p.returncode == 0 and re.search(r"OK \(skipped=\d+\)", out):
+        return Outcome("skip", tail)
     return Outcome("pass" if p.returncode == 0 else "fail",
                    f"rc={p.returncode}\n{tail}")
 
@@ -1391,6 +1410,11 @@ def build_checks() -> list:
     C.append(Check("features.tagged_ptr", "features",
                    "aarch64 tagged-pointer data-is-address heuristic",
                    ["behavior:addr_is_data"], _chk_tagged_ptr))
+    C.append(Check("features.mops_memops", "features",
+                   "aarch64 FEAT_MOPS bulk transfers reach the memory "
+                   "instrumentation and tile the transferred range",
+                   ["behavior:bulk_mem_visible", "wire:FID_mem_addr",
+                    "wire:FID_mem_size"], _chk_mops_memops))
     C.append(Check("features.wp_fault", "features",
                    "WP execution-time fault continues to budget",
                    ["behavior:wp_fault_to_budget"], _chk_wp_fault))

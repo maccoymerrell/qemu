@@ -1829,7 +1829,13 @@ Field families (one canonical name each):
 * ``CST_FID_N_LOADS`` — count of valid load slots for this insn
   execution.  Encoded as a non-negative scalar delta against the
   prior observation of ``(template_id, ins_pos)``; baseline default
-  is zero.  Always emitted on entries whose insn has memops.
+  is zero.  Always emitted on entries whose insn has memops.  It
+  is a count of *slots present in this entry*, so it never exceeds
+  ``CST_FID_SLOT_COUNT``: an instruction that performs more loads
+  than the wire has slots for reports the ceiling, and a decoder can
+  read ``N_LOADS`` slots unconditionally.  ``LOAD_ADDR{k}`` for
+  ``k ≥ N_LOADS`` is meaningless — the delta stream leaves whatever
+  the previous observation of that slot wrote.
 
 * ``CST_FID_N_STORES`` — analogous, for stores.
 

@@ -150,15 +150,18 @@ links to the prose that explains the consequence of hitting it.
      - ``CST_FID_SLOT_COUNT`` = 512
      - ``LOAD_ADDR``/``LOAD_DATA`` slots 0..511.  There is no
        overflow vector; a single instruction issuing more than 512
-       loads is not representable.  The widest real case is an x86
+       loads is not representable.  The widest x86 case is an
        ``XRSTOR`` reloading the extended state area, well inside the
-       ceiling; AVX-512 gather is only 16-wide.
+       ceiling, and AVX-512 gather is only 16-wide; the one class that
+       genuinely exceeds it is the AArch64 bulk-memory ``CPYM``
+       (see :ref:`bulk memory <limits-bulk-memory>`).
    * - Slotted store addresses / data per instruction
      - ``CST_FID_SLOT_COUNT`` = 512
      - ``STORE_ADDR``/``STORE_DATA`` slots 0..511; likewise no
        overflow vector.  Sized by ``XSAVE``-family state saves — 88
        stores from one ``XSAVEOPT`` on a Haswell-class guest, about
-       320 for a full AVX-512 area.
+       320 for a full AVX-512 area — and exceeded only by the AArch64
+       bulk-memory ``SETM`` / ``CPYM`` (see :ref:`bulk memory <limits-bulk-memory>`).
    * - WP-side memops captured per instruction
      - ``CST_FID_SLOT_COUNT`` = 512
      - ``MemAccessRecorder::record`` drops memops past this on the
@@ -248,16 +251,62 @@ iteration (see the wire-format spec's *REP-prefixed self-loop BBs*
 section), so each entry carries at most 1 load + 1 store — the
 slotted ``LOAD_ADDR[0..511]`` / ``STORE_ADDR[0..511]`` (and matching
 ``DATA``) families cover every supported instruction; there is no
-overflow vector, and the widest single-instruction memop fan-out —
-an x86 ``XSAVE``-family state save, about 320 stores for a full
+overflow vector, and the widest single-instruction memop fan-out on
+x86 — an ``XSAVE``-family state save, about 320 stores for a full
 AVX-512 area — sits inside the 512 slots.
 
-**Memops capped at 512 per insn.**  ``MemAccessRecorder::record``
-caps per-instruction memops at ``CST_FID_SLOT_COUNT`` = 512 and
-drops the rest.  Real workloads almost never hit this;
-pathological cases involve x86 ``rep`` opcodes on the wrong path,
-where speculative iteration is bounded by the WP depth budget
-anyway.
+**Memops capped at 512 per insn.**  512 = ``CST_FID_SLOT_COUNT`` is
+all an entry can address, in each direction, for one instruction.  On
+the wrong path ``MemAccessRecorder::record`` stops recording past the
+cap; on the correct path the accesses are recorded and the cap applies
+when the entry is written, where the emitted ``N_LOADS`` / ``N_STORES``
+is the *capped* count so that the entry stays self-describing — a
+consumer is never promised more addresses than the entry carries.  The
+per-run total left out this way is reported as ``Memops over slot
+ceiling`` in the statistics summary.
+
+.. _limits-bulk-memory:
+
+**AArch64 bulk-memory instructions can exceed the slot ceiling.**
+The FEAT_MOPS ``SETM`` and ``CPYM`` instructions are the one real class
+that does.  QEMU implements the ``M`` member of each triple as "transfer
+every whole page of the operation", so a single execution moves the
+entire page-aligned body of a ``memset`` or ``memcpy`` — 3840 stores for
+a 64 KiB ``memset``, against 512 addressable slots.  This is intrinsic
+to the architecture, not to the wire: one instruction performs an
+unbounded, register-sized transfer, so no finite slot count can address
+it.  glibc routes ``memcpy`` / ``memmove`` / ``memset`` through these
+instructions on any guest advertising ``HWCAP2_MOPS``, so it is reached
+by ordinary code, not just by microbenchmarks.
+
+What survives the cap: the ``P`` and ``E`` members of each triple are
+architecturally bounded to less than a page each, so their accesses are
+always represented in full, and ``M`` carries the first 512 accesses of
+each direction — the leading, contiguous, 16-byte-strided run of the
+transfer.  The per-template profile is not slot-bound and keeps the
+untruncated ``memops_cp`` total and the full touched address extent, so
+a consumer can see both how much traffic the instruction really did and
+the address range it spanned.  The traffic that is lost is per-entry
+slot detail in the interior of transfers larger than 8 KiB.
+
+**AArch64 DC ZVA records no memory access.**  ``DC ZVA`` zeroes a
+cache-block-sized run (512 bytes on a ``-cpu max`` guest) from inside a
+TCG helper with a bare host ``memset``, so like the FEAT_MOPS families
+it never reaches the memory instrumentation — but unlike them it is not
+yet reported, because Capstone decodes it as the generic
+``AARCH64_INS_SYS`` and the AArch64 mnemonic table classifies that
+``GEN_OP_VEC_LOGIC``, an opcode with no memory operand.  Emitting its
+stores against that classification would make every trace containing a
+``DC ZVA`` — Linux ``clear_page`` uses it, so every system-mode AArch64
+trace — fail the impossible-attribution lint.  The fix is a
+classification one (``SYS`` covers the whole ``DC`` / ``IC`` / ``AT`` /
+``TLBI`` maintenance space and needs a refiner over Capstone's sysop
+detail), and it carries a modelling decision: cache maintenance under
+``GEN_OP_CACHE_FLUSH``, whose synthesised effective address would
+compete with the real stores, or the block store the instruction
+performs.  Guests whose libc routes ``memset`` through FEAT_MOPS — any
+guest advertising ``HWCAP2_MOPS`` — do not reach ``DC ZVA`` from user
+code at all; the exposure is kernel page clearing in system mode.
 
 .. _limits-kernel-strand:
 

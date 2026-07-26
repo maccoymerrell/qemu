@@ -979,9 +979,9 @@ bool qemu_plugin_insn_detail(const struct qemu_plugin_insn *insn,
 
 /**
  * qemu_plugin_cap_decode() - decode raw instruction bytes via Capstone
- * @cap_arch: Capstone architecture — pass a Capstone `cs_arch` enum value
+ * @cap_arch: Capstone architecture — pass a Capstone ``cs_arch`` enum value
  *            (e.g. CS_ARCH_X86, CS_ARCH_AARCH64, CS_ARCH_RISCV, CS_ARCH_MIPS).
- * @cap_mode: Capstone mode flags — pass a bitmask of Capstone `cs_mode`
+ * @cap_mode: Capstone mode flags — pass a bitmask of Capstone ``cs_mode``
  *            enum values (e.g. CS_MODE_64, CS_MODE_RISCV64 | CS_MODE_RISCV_C).
  * @data: pointer to raw instruction bytes
  * @size: number of bytes available at @data
@@ -1572,7 +1572,7 @@ void qemu_plugin_spec_mode_end(void);
  * Pause the guest's virtual clock (QEMU_CLOCK_VIRTUAL) for the duration of a
  * wrong-path excursion so the speculative run's host wall-clock time does not
  * advance the guest's architected timer counters (e.g. aarch64 CNTVCT, x86
- * TSC, riscv `time`, mips Count).  Call once at the OUTER excursion boundary,
+ * TSC, riscv ``time``, mips Count).  Call once at the OUTER excursion boundary,
  * before qemu_plugin_spec_mode_begin(); pair with qemu_plugin_spec_vtime_resume().
  * Idempotent and a no-op in user-mode emulation.
  */
@@ -1728,7 +1728,7 @@ void qemu_plugin_async_int_reset(void);
  * transitions as FAULT_ENTER/FAULT_RETURN events with per-event depth_after
  * stamps; this accessor reads the live depth at a point in time (e.g. to
  * baseline a trace window) without consuming events.  Reads zero in
- * *-linux-user and on uninstrumented targets.  Must be called from a vCPU
+ * ``*-linux-user`` and on uninstrumented targets.  Must be called from a vCPU
  * context (e.g. an exec callback).
  */
 QEMU_PLUGIN_API
@@ -1774,7 +1774,7 @@ bool qemu_plugin_spec_mem_faulted_take(void);
  * the guest has ahead of a mispredicted branch, including syscall
  * instructions; the walk continues past them at their architectural
  * fall-through, but the call itself must never be performed, because in
- * *-linux-user it is served by the HOST and would produce real side effects on
+ * ``*-linux-user`` it is served by the HOST and would produce real side effects on
  * a path the guest never takes.  That suppression is structural — a syscall
  * instruction executed under qemu_plugin_spec_mode_begin() unwinds into
  * qemu_plugin_exec_tb()'s landing pad, never into the syscall dispatcher — so
@@ -1811,7 +1811,7 @@ void qemu_plugin_spec_clear_exception(void);
  * qemu_plugin_get_priv_level() - current privilege level of the executing vCPU
  *
  * Returns a normalized privilege ordinal: 0 = user / least privileged,
- * larger = more privileged (kernel/supervisor/hypervisor).  In *-linux-user
+ * larger = more privileged (kernel/supervisor/hypervisor).  In ``*-linux-user``
  * this is always 0.  Lets a plugin tell user-space execution from kernel /
  * system execution (e.g. to count only the target program's user-space
  * instructions, or stamp a kernel-vs-user bit).  Must be called from a vCPU
@@ -1826,7 +1826,7 @@ int qemu_plugin_get_priv_level(void);
  * Returns the architectural identifier of the current address space — the
  * page-table base / ASID register (x86 CR3, RISC-V SATP, Arm TTBR, MIPS
  * ASID).  Unique per process address space, so a plugin can pin tracing to a
- * single target process.  Returns 0 in *-linux-user (one address space).
+ * single target process.  Returns 0 in ``*-linux-user`` (one address space).
  * Must be called from a vCPU context.
  */
 QEMU_PLUGIN_API
@@ -1837,7 +1837,7 @@ uint64_t qemu_plugin_get_addr_space_id(void);
  *
  * Returns true when the executing vCPU's MMU / paging translation is active
  * (x86 CR0.PG, Arm SCTLR.M, RISC-V SATP!=Bare; MIPS always has a TLB so
- * reports true), false otherwise.  Always true in *-linux-user.  A plugin
+ * reports true), false otherwise.  Always true in ``*-linux-user``.  A plugin
  * that speculatively executes wrong-path code relies on the MMU to fault on
  * fetches into non-code; with paging disabled there is no such bound, so the
  * plugin should refrain from speculating.  Must be called from a vCPU context.
@@ -1862,7 +1862,7 @@ bool qemu_plugin_paging_enabled(void);
  * narrow, recycled ASID (MIPS EntryHi.ASID) can silently alias them.
  * A plugin pinned to one process can therefore verify address-space
  * identity by physical page when the ASID value alone is ambiguous.
- * In *-linux-user (one address space, no guest MMU) the identity map
+ * In ``*-linux-user`` (one address space, no guest MMU) the identity map
  * is returned.  Must be called from a vCPU context.
  */
 QEMU_PLUGIN_API
@@ -1883,7 +1883,7 @@ bool qemu_plugin_vaddr_to_paddr(uint64_t vaddr, uint64_t *paddr);
  * and independent of the current privilege level (which speculative execution
  * can mis-observe).
  *
- * Returns false unconditionally in *-linux-user (no kernel address space) and
+ * Returns false unconditionally in ``*-linux-user`` (no kernel address space) and
  * on any target that does not implement the classification.  Must be called
  * from a vCPU context.
  */
@@ -1947,7 +1947,7 @@ bool qemu_plugin_thread_ptr_tracks_current(void);
  * NOT stop guest time from advancing during a speculative excursion.  A plugin
  * that speculatively executes wrong-path code should refrain from speculating
  * under icount (the excursion's instructions would leak into guest time).
- * Always false in *-linux-user.
+ * Always false in ``*-linux-user``.
  */
 QEMU_PLUGIN_API
 bool qemu_plugin_icount_enabled(void);

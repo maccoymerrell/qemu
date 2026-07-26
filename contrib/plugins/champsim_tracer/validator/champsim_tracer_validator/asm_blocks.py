@@ -2621,21 +2621,32 @@ class RegIdSweep(CodeBlock):
 
 
 @register
-class MipsMidTbTeqSplit(CodeBlock):
+class MipsInlineConditionalTrap(CodeBlock):
     """
-    Exercises the tracer's mid-TB fragment splitter on MIPS.  A MIPS
-    `teq` (trap-if-equal) is classified as ``BRANCH_SYSCALL_TYPE`` by
-    the Capstone-based decoder, but QEMU's MIPS TCG keeps translating
-    past it because the trap is dynamic — TCG can't prove statically
-    whether the registers compare equal, so it emits a conditional
-    helper and continues.  The resulting QEMU TB therefore contains
-    insns on both sides of the `teq`, which ``split_tb_into_fragments``
-    must break at the `teq` (terminus = COMPLETE) so the trace shows
-    two true-BBs from one QEMU TB.  We seed the operands so the
-    comparison is NEVER equal (the trap is never taken), so the
-    program continues normally and the trace covers both fragments.
+    Pins the classification of a MIPS conditional trap: `teq` must NOT
+    split the block it sits in.
+
+    A `teq` raises only when its registers compare equal and carries no
+    target field, so nothing about it redirects fetch — it is a compare
+    that may except (``GEN_OP_CMP`` / ``BRANCH_NONE``, the same shape
+    x86's BOUND has).  QEMU's MIPS TCG agrees and keeps translating past
+    it, emitting a conditional helper, because the trap is dynamic.  The
+    true-BB must therefore run straight THROUGH the `teq` to the jump
+    that really ends it, and the trace must show ONE block carrying the
+    load, the compare, the arithmetic, both stores and the branch.
+
+    This is the regression test for the misclassification it replaces.
+    Typing `teq` as an unconditional transfer sealed a block at it, and
+    since a trap has no walkable target the result was a degenerate
+    single-instruction block with no wrong path at all — 188,726 of them
+    in one mcf trace, every one a GCC divide-by-zero guard that never
+    fires.  Under that bug the assertions below fail: the store and the
+    branch land in a different template than the compare.
+
+    We seed the operands so the comparison is NEVER equal, so the trap
+    is never taken and the program continues normally.
     """
-    name = "mips_midtb_teq_split"
+    name = "mips_inline_conditional_trap"
     scratch_slots = 2
     supported_isas = ("mipsel",)
     randomizable = False
@@ -2656,10 +2667,13 @@ class MipsMidTbTeqSplit(CodeBlock):
                 ExpectedMemOp("load",  s_load,  8, a),
                 ExpectedMemOp("store", s_store, 8, _u32(a + 17)),
             ],
-            coarse_opcodes={"LOAD": 1, "STORE": 1, "INT_ADD": 2,
-                             "SYSCALL": 1, "BRANCH": 1},
-            asserted_branch_types=["BRANCH_SYSCALL", "BRANCH_DIRECT_JUMP"],
-            asserted_opcodes=["SYSCALL", "LOAD", "STORE", "INT_ADD",
+            coarse_opcodes={"LOAD": 1, "STORE": 2, "INT_ADD": 2,
+                             "CMP": 1, "BRANCH": 1},
+            # BRANCH_DIRECT_JUMP alone: the terminating jump is the block's
+            # ONLY branch.  A conditional trap that regressed to a transfer
+            # type would seal the block early and split these apart.
+            asserted_branch_types=["BRANCH_DIRECT_JUMP"],
+            asserted_opcodes=["CMP", "LOAD", "STORE", "INT_ADD",
                               "BRANCH"],
         )
 
@@ -2668,10 +2682,9 @@ class MipsMidTbTeqSplit(CodeBlock):
         s_load  = plan.memops[0].arena_u64_index
         s_store = plan.memops[1].arena_u64_index
         # $t0 holds the loaded value; $t1 = $t0 + 1 makes
-        # `teq $t0, $t1` guaranteed NOT to trap.  The post-teq
-        # addiu/store live in a second fragment after the splitter
-        # ends the first fragment on `teq` (BRANCH_SYSCALL_TYPE,
-        # TB_TERMINUS_COMPLETE).
+        # `teq $t0, $t1` guaranteed NOT to trap.  Everything here —
+        # before and after the teq — belongs to ONE true-BB, sealed at
+        # the trailing jump.
         lines = _prologue(ctx.block_id) + _load_base(ctx.isa) + [
             f"  lw $t0, {s_load * 8}($t8)",
             "  addiu $t1, $t0, 1",

@@ -126,7 +126,8 @@ aarch64 M-cs-mem-llvm-none adr
 # instruction therefore loses its accumulator dependency.  The tracer does
 # not target SME workloads and QEMU's SME support is itself partial.
 # Closing this needs an operand-ABI extension, not a boundary fix.
-aarch64 Z-unmodelled-op *
+# (was a class-wide rule; narrowed to explicit signatures so a NEW
+#  unmodelled operand type on AArch64 still fails the gate)
 aarch64 R-*-missing * +za*
 aarch64 R-*-phantom * +za*
 aarch64 R-rd-missing * +r#,za*
@@ -198,9 +199,6 @@ mipsel D-cs-only *
 # case where Capstone is the MORE correct of the two — LLVM decodes the hint
 # as a plain `ori`.
 riscv64 D-cs-only *
-riscv64 D-llvm-only *
-riscv64 B-* *
-riscv64 M-cs-mem-llvm-none *
 riscv64 R-wr-missing cmop.* +r#
 riscv64 R-rd-missing *ntl* +r#
 
@@ -1417,3 +1415,135 @@ x86_64 Z-access0 nopq MEM
 x86_64 Z-access0 nopq REG
 x86_64 Z-access0 nopw MEM
 x86_64 Z-access0 nopw REG
+
+# --- aarch64: SME operands (ZA tiles and slices) and system-register /
+#     system-alias operands, which the plugin operand ABI has no
+#     representation for.  Listed explicitly rather than as a class-wide
+#     rule so a NEW unmodelled operand type still fails the gate.
+aarch64 Z-unmodelled-op addha
+aarch64 Z-unmodelled-op addva
+aarch64 Z-unmodelled-op at
+aarch64 Z-unmodelled-op bfdot
+aarch64 Z-unmodelled-op bfmla
+aarch64 Z-unmodelled-op bfmls
+aarch64 Z-unmodelled-op bfmlsl
+aarch64 Z-unmodelled-op bfmopa
+aarch64 Z-unmodelled-op bfvdot
+aarch64 Z-unmodelled-op cntb
+aarch64 Z-unmodelled-op cntd
+aarch64 Z-unmodelled-op cnth
+aarch64 Z-unmodelled-op cntp
+aarch64 Z-unmodelled-op cntw
+aarch64 Z-unmodelled-op dc
+aarch64 Z-unmodelled-op decb
+aarch64 Z-unmodelled-op decd
+aarch64 Z-unmodelled-op dech
+aarch64 Z-unmodelled-op decw
+aarch64 Z-unmodelled-op fadd
+aarch64 Z-unmodelled-op fcmeq
+aarch64 Z-unmodelled-op fcmge
+aarch64 Z-unmodelled-op fcmgt
+aarch64 Z-unmodelled-op fcmle
+aarch64 Z-unmodelled-op fcmlt
+aarch64 Z-unmodelled-op fcmne
+aarch64 Z-unmodelled-op fdot
+aarch64 Z-unmodelled-op fmax
+aarch64 Z-unmodelled-op fmaxnm
+aarch64 Z-unmodelled-op fmin
+aarch64 Z-unmodelled-op fminnm
+aarch64 Z-unmodelled-op fmla
+aarch64 Z-unmodelled-op fmlal
+aarch64 Z-unmodelled-op fmlall
+aarch64 Z-unmodelled-op fmls
+aarch64 Z-unmodelled-op fmopa
+aarch64 Z-unmodelled-op fmov
+aarch64 Z-unmodelled-op fmul
+aarch64 Z-unmodelled-op fsub
+aarch64 Z-unmodelled-op fsubr
+aarch64 Z-unmodelled-op fvdot
+aarch64 Z-unmodelled-op fvdott
+aarch64 Z-unmodelled-op incb
+aarch64 Z-unmodelled-op incd
+aarch64 Z-unmodelled-op inch
+aarch64 Z-unmodelled-op incw
+aarch64 Z-unmodelled-op ld1b
+aarch64 Z-unmodelled-op ld1d
+aarch64 Z-unmodelled-op ld1h
+aarch64 Z-unmodelled-op ld1q
+aarch64 Z-unmodelled-op ld1w
+aarch64 Z-unmodelled-op ldr
+aarch64 Z-unmodelled-op mov
+aarch64 Z-unmodelled-op movaz
+aarch64 Z-unmodelled-op mrrs
+aarch64 Z-unmodelled-op mrs
+aarch64 Z-unmodelled-op msr
+aarch64 Z-unmodelled-op msrr
+aarch64 Z-unmodelled-op prfb
+aarch64 Z-unmodelled-op prfd
+aarch64 Z-unmodelled-op prfh
+aarch64 Z-unmodelled-op prfm
+aarch64 Z-unmodelled-op prfum
+aarch64 Z-unmodelled-op prfw
+aarch64 Z-unmodelled-op ptrue
+aarch64 Z-unmodelled-op ptrues
+aarch64 Z-unmodelled-op rprfm
+aarch64 Z-unmodelled-op sdot
+aarch64 Z-unmodelled-op smlal
+aarch64 Z-unmodelled-op smlall
+aarch64 Z-unmodelled-op smopa
+aarch64 Z-unmodelled-op sqdecb
+aarch64 Z-unmodelled-op sqdecd
+aarch64 Z-unmodelled-op sqdech
+aarch64 Z-unmodelled-op sqdecw
+aarch64 Z-unmodelled-op sqincb
+aarch64 Z-unmodelled-op sqincd
+aarch64 Z-unmodelled-op sqinch
+aarch64 Z-unmodelled-op sqincw
+aarch64 Z-unmodelled-op st1b
+aarch64 Z-unmodelled-op st1d
+aarch64 Z-unmodelled-op st1h
+aarch64 Z-unmodelled-op st1q
+aarch64 Z-unmodelled-op st1w
+aarch64 Z-unmodelled-op str
+aarch64 Z-unmodelled-op sub
+aarch64 Z-unmodelled-op sudot
+aarch64 Z-unmodelled-op sumopa
+aarch64 Z-unmodelled-op svdot
+aarch64 Z-unmodelled-op sys
+aarch64 Z-unmodelled-op sysl
+aarch64 Z-unmodelled-op sysp
+aarch64 Z-unmodelled-op tlbi
+aarch64 Z-unmodelled-op tlbip
+aarch64 Z-unmodelled-op udot
+aarch64 Z-unmodelled-op umlsl
+aarch64 Z-unmodelled-op umlsll
+aarch64 Z-unmodelled-op umopa
+aarch64 Z-unmodelled-op uqdecb
+aarch64 Z-unmodelled-op uqdecd
+aarch64 Z-unmodelled-op uqdech
+aarch64 Z-unmodelled-op uqdecw
+aarch64 Z-unmodelled-op uqincb
+aarch64 Z-unmodelled-op uqincd
+aarch64 Z-unmodelled-op uqinch
+aarch64 Z-unmodelled-op uqincw
+aarch64 Z-unmodelled-op usmlall
+aarch64 Z-unmodelled-op usmopa
+aarch64 Z-unmodelled-op uvdot
+aarch64 Z-unmodelled-op whilegt
+aarch64 Z-unmodelled-op whilehi
+aarch64 Z-unmodelled-op whilele
+aarch64 Z-unmodelled-op whilels
+aarch64 Z-unmodelled-op zero
+
+# --- riscv64: branch-taxonomy and memory-presence differences on the
+#     vendor/draft extensions the chosen LLVM subtarget does not enable,
+#     plus the LLVM-only decodes of the same space.  Explicit for the same
+#     reason as above.
+riscv64 B-call-mismatch jalr cs-nocall
+riscv64 B-flow-presence jal cs-no llvm-yes
+riscv64 B-flow-presence j cs-no llvm-yes
+riscv64 B-ret-mismatch jr cs-noret
+riscv64 B-ret-mismatch ret cs-noret
+riscv64 M-cs-mem-llvm-none prefetch.i
+riscv64 M-cs-mem-llvm-none prefetch.r
+riscv64 M-cs-mem-llvm-none prefetch.w

@@ -431,11 +431,20 @@ outside the repo as standalone scripts):
    Disk-I/O bracketing records (virtio-blk, system mode): a pairing
    oracle (every STOP pairs a prior START) plus an exact payload
    oracle (R/W, byte count, LBA match the workload's known request
-   list).
+   list).  Needs a guest kernel with ``CONFIG_VIRTIO_BLK=y`` **built
+   in** (not ``=m`` — the busybox guest has no modprobe/hotplug wiring
+   to pull in a module), or the probe reports the ``NO_VDA`` skip.
+   ``_devio_kernel()`` looks for that kernel at a conventional path,
+   ``vmlinuz-devio`` next to the ISA's default system-mode kernel
+   (same ``SYSTEST_ROOT`` layout as ``default_kernel``); a
+   ``CST_DEVIO_KERNEL`` environment override takes precedence over
+   both for a maintainer who wants to point at a kernel elsewhere
+   without moving every OTHER system-mode check off the default one.
 ``features.devio_attrib``
    Exact-owner disk-I/O attribution: two CONCURRENTLY marked
    processes (``-smp 2``, disjoint LBA bands) must each own only
-   their own band's ``DEVIO_START`` records.
+   their own band's ``DEVIO_START`` records.  Same kernel requirement
+   as ``features.devio``.
 ``features.faults_interrupts``
    Synchronous-fault exclusion plus asynchronous-interrupt capture
    (``faults=0`` / ``interrupts=1``, system mode).

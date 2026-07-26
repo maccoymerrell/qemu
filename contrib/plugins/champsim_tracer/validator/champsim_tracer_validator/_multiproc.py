@@ -788,9 +788,23 @@ def _devio_kernel(isa: str) -> Path:
     overrides the shared system-mode kernel asset (SYS.default_kernel) for
     exactly these probes, so a maintainer with a virtio-blk-enabled build
     can point at it without moving every OTHER system-mode check off the
-    default kernel."""
+    default kernel.
+
+    Absent an explicit override, look for the conventional asset
+    ``vmlinuz-devio`` next to the ISA's default kernel (same directory,
+    same SYSTEST_ROOT layout as ``default_kernel``) before falling back
+    to the default kernel.  This is what makes the devio checks RUN
+    instead of skip out of the box on a systest tree that carries one
+    (built via the standard kbuild flow with CONFIG_VIRTIO_BLK=y; see
+    VALIDATION.md), while a tree without it keeps today's graceful
+    NO_VDA skip -- no maintainer has to remember to export
+    CST_DEVIO_KERNEL by hand."""
     override = os.environ.get("CST_DEVIO_KERNEL")
-    return Path(override) if override else SYS.default_kernel(isa)
+    if override:
+        return Path(override)
+    default = SYS.default_kernel(isa)
+    conventional = default.with_name("vmlinuz-devio")
+    return conventional if conventional.exists() else default
 
 
 # x86-64 START/END markers: 3x `mov $imm,%eax` (champsim_marker.h) inlined

@@ -467,6 +467,26 @@ outside the repo as standalone scripts):
    loads and stores must likewise tile the source and the
    destination.  Against a base without the fix all six instructions
    are silent and every tiling is empty.
+``features.string_memops``
+   x86 ``REP`` string instructions fan out per architectural iteration
+   with the right per-iteration memop count, and the operand model
+   matches what each instruction really reads and writes.  A
+   ``REP``-prefixed string op derives its per-iteration memop count
+   from the Capstone access flags on its memory operands, so a lost
+   flag makes that count zero — and a zero count disables the fan-out
+   entirely, collapsing the whole repeated operation onto one body
+   entry whose memops its template says it cannot perform.  The check
+   runs ``cmpsb``, ``cmpsl``, ``scasb``, ``lodsb``, ``stosb`` and
+   ``movsb`` over page-separated buffers and asserts, per instruction,
+   that every body entry carries exactly one iteration's memops, that
+   the entry count equals the iteration count, and that the accesses
+   tile each buffer exactly.  It also pins the static lane counts for
+   the scalar ``ROUNDSS`` / ``ROUNDSD`` memory form (a real load that
+   was being dropped) and for the multi-byte ``NOP`` (a phantom load
+   lane on an instruction that touches no memory), and requires
+   ``cst_decode --strict`` to be clean.  Against a base without the
+   corrections in :doc:`qemu_modifications` the ``cmpsl`` fan-out and
+   the lane assertions fail.
 ``features.options_smoke``
    Direct qemu-user drive of the long-tail options no other check
    sets (``histogram``, ``wp_memdata``, ``wp_regdata``,

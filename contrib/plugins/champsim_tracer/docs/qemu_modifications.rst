@@ -910,25 +910,81 @@ Disassembly and target metadata
      ``cap_fill_x86_operands`` forces plain ``READ`` on every
      ``TEST`` operand, which is what the architecture says and so
      cannot disturb the correctly-reported encodings.
-   * x86 ``STOS``.  ``STOS`` writes the accumulator to ``ES:[rDI]``;
-     Capstone reports that memory operand ``READ``, at every operand
-     size and with or without a ``REP`` prefix.  The direction is
-     simply inverted, so the operand walker mints a load slot where
-     a store belongs: a ``memset``'s traffic lands in the dependency
-     model's load lane, and the REP per-iteration split counts it as
-     ``rep_loads_per_iter`` instead of ``rep_stores_per_iter``.  (The
-     memop records themselves come from QEMU's memory callbacks, not
-     from Capstone, and were always correct stores — PIN and the
-     tracer agree 100 % on store counts and addresses.)  The same
-     filler forces ``WRITE`` on the memory operand; note Capstone
-     folds the repeat prefix into the mnemonic string
-     (``"rep stosq"``), which ``cap_x86_is_string_store`` steps over.
-     The sibling string ops are reported correctly (``MOVS`` gives
-     ``READ`` + ``WRITE``, ``SCAS`` / ``LODS`` give ``READ``).
-     ``CMPS`` and ``INS`` / ``OUTS`` report ``access == 0`` — the
-     same upstream bug family, but "unknown" rather than inverted, so
-     the walker already treats them as carrying no access info; they
-     are left alone pending a Capstone fix.
+   * x86 string family (``MOVS`` / ``CMPS`` / ``SCAS`` / ``LODS`` /
+     ``STOS`` / ``INS`` / ``OUTS``).  These address memory only through
+     ``(%rSI)`` and ``(%rDI)``, and which of the two each reads and
+     writes is fixed by the architecture, so
+     ``cap_x86_string_mem_access`` derives the access from the
+     (mnemonic, base register) pair and sets it for the whole family.
+     Three distinct defects make that necessary.  ``STOS`` reports its
+     ``ES:[rDI]`` destination ``READ`` — *inverted* — at every operand
+     size and with or without a ``REP`` prefix, so the walker mints a
+     load slot where a store belongs and the REP per-iteration split
+     counts it as ``rep_loads_per_iter``.  ``CMPS`` **at 32-bit operand
+     size only** (opcode ``A7`` with neither ``66`` nor ``REX.W``)
+     reports *both* memory operands ``access == 0``, while ``cmpsb`` /
+     ``cmpsw`` / ``cmpsq`` are correct — the same one-operand-size shape
+     as the ``TEST A9`` defect above.  ``INS`` and ``OUTS`` report their
+     memory operand ``access == 0`` at *every* size, and their 32-bit
+     forms additionally drop the ``READ`` on the ``%dx`` port operand.
+
+     The lost-flag cases do the most damage, because a REP-prefixed
+     string op derives its per-iteration memop count from exactly these
+     flags: a zero count disables the fan-out entirely, so a
+     ``rep cmpsl`` over *N* dwords collapses from *N* body entries of two
+     loads each into a single entry carrying all 2*N* memops, none of
+     which its template says the instruction can perform.  (The memop
+     records themselves come from QEMU's memory callbacks, not from
+     Capstone, and were always correct — PIN and the tracer agree 100 %
+     on string-op memop counts and addresses.  Only the operand, lane
+     and fan-out model was wrong.)  Note Capstone folds the repeat
+     prefix into the mnemonic string (``"rep stosq"``), which
+     ``cap_x86_skip_rep`` steps over.
+   * x86 scalar ``ROUNDSS`` / ``ROUNDSD``.  Their memory-source form
+     reports the memory operand ``access == 0``, while the packed
+     ``ROUNDPS`` / ``ROUNDPD`` and the register form of the very same
+     instructions are correct.  Because the destination operand does
+     carry an access, the walker sees "access info present" and simply
+     drops the source: a real 4- or 8-byte load gets no load lane, no
+     address dependency, and any memop observed on it is an impossible
+     attribution.  ``cap_x86_is_scalar_round`` forces ``READ``; these
+     instructions never write memory, so that is exact.
+   * x86 ``WRSS`` / ``WRUSS``.  The CET shadow-stack writes report
+     *both* operands ``access == 0``, so a genuine store is modelled
+     with no store lane.  ``cap_x86_is_shadow_stack_store`` sets
+     ``READ`` on the register data source and ``WRITE`` on the memory
+     target.
+   * x86 multi-byte ``NOP`` (``0F 1F``).  This is the opposite
+     direction — a *phantom* access rather than a lost one.  The
+     instruction takes a ModRM and so names a memory operand, but it
+     performs no memory access whatsoever (Intel SDM); Capstone reports
+     that operand ``READ`` at the sizes a compiler actually emits for
+     alignment padding, and ``access == 0`` (correct) only for the
+     ``REX.W`` form.  Left alone it mints a load lane and an address
+     dependency on the base and index registers for a load that can
+     never occur, on one of the most frequent instructions in any
+     optimised binary.  ``cap_x86_mem_is_never_accessed`` clears it.
+     This is deliberately **not** applied to the cache-hint
+     instructions (``PREFETCH*``, ``CLFLUSH``, ``CLWB``, ``CLDEMOTE``),
+     whose memory operand Capstone also reports ``READ``: those do name
+     a real address a memory-system consumer wants, and the tracer
+     routes them through its synthetic-EA path precisely because their
+     TCG translation emits no memop.
+   * x86 ``PUSH %fs`` / ``%gs``.  The segment-register forms report
+     their operand ``access == 0``, while the general-register form and
+     every ``POP`` are correct, so the pushed segment register is
+     dropped from the dependency model.  ``cap_x86_is_push`` sets
+     ``READ``; a ``PUSH`` operand is a read in every encoding.
+
+     Three further encodings whose operands report ``access == 0`` are
+     deliberately left alone, because ``0`` is either right or
+     unknowable: ``CLDEMOTE`` (a cache hint that reads and writes no
+     data), ``BSWAPW`` (``66``-prefixed ``BSWAP`` is an undefined
+     encoding), and ``FFREEP`` (an undocumented x87 opcode that touches
+     no memory).  Immediate operands also report ``access == 0``; that
+     is correct and universal, and the walker never derives a lane from
+     one.
+
    * MIPS memory access flags.  MSA vector loads/stores and the
      unaligned scalar family (``LWL`` / ``LWR`` / ``LDL`` / ``LDR``
      / ``SWL`` / ``SWR`` / ``SDL`` / ``SDR``) report their memory

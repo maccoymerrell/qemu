@@ -474,10 +474,24 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
      * every TEST operand below.  Architecturally exact, and a no-op on
      * the encodings Capstone already reports correctly. */
     bool test_read = cap_x86_is_test(insn->mnemonic);
-    /* Capstone-6.0.0-Alpha7 bug: STOS reports its (%rdi) destination
-     * READ — see cap_x86_is_string_store.  Force WRITE on the MEM
-     * operand below. */
-    bool string_store = cap_x86_is_string_store(insn->mnemonic);
+    /* Capstone-6.0.0-Alpha7 access-flag bugs across the string family —
+     * see cap_x86_string_mem_access.  Every string op's MEM operands get
+     * their architectural access forced from the (mnemonic, base
+     * register) pair below. */
+    bool string_op = cap_x86_is_string_op(insn->mnemonic);
+    /* Capstone-6.0.0-Alpha7 bug: the MEM source of the scalar ROUNDSS /
+     * ROUNDSD comes back access == 0 — see cap_x86_is_scalar_round. */
+    bool scalar_round = cap_x86_is_scalar_round(insn->mnemonic);
+    /* Capstone-6.0.0-Alpha7 bug: WRSS / WRUSS report both operands
+     * access == 0 — see cap_x86_is_shadow_stack_store. */
+    bool shstk_store = cap_x86_is_shadow_stack_store(insn->mnemonic);
+    /* Capstone-6.0.0-Alpha7 bug: the multi-byte NOP's MEM operand comes
+     * back READ although the insn performs no memory access at all —
+     * see cap_x86_mem_is_never_accessed. */
+    bool mem_unused = cap_x86_mem_is_never_accessed(insn->mnemonic);
+    /* Capstone-6.0.0-Alpha7 bug: PUSH of a segment register reports its
+     * operand access == 0 — see cap_x86_is_push. */
+    bool push_read = cap_x86_is_push(insn->mnemonic);
 
     for (uint8_t i = 0; i < n; i++) {
         const cs_x86_op *cop = &x86->operands[i];
@@ -504,6 +518,15 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
             op->index_name[0] = '\0';
             op->index_id   = 0;
             op->imm = 0;
+            /* Capstone-6.0.0-Alpha7: register operands that lost their
+             * access.  The port number of an INS / OUTS, the data source
+             * of a WRSS / WRUSS and the operand of a PUSH are all pure
+             * reads; saying so is architecturally exact and therefore a
+             * no-op on the encodings already reported correctly. */
+            if ((string_op || shstk_store || push_read) &&
+                op->access == 0) {
+                op->access = QEMU_PLUGIN_OP_ACC_READ;
+            }
             break;
         case X86_OP_IMM:
             op->type = QEMU_PLUGIN_OP_IMM;
@@ -534,10 +557,38 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
              */
             op->segment_id = cop->mem.segment;
             /* Capstone-6.0.0-Alpha7 bugs: the r/m destination of a
-             * store-form extract, and the (%rdi) destination of a STOS,
-             * are write targets, not reads. */
-            if (extract_store || move_store || string_store) {
+             * store-form extract is a write target, not a read. */
+            if (extract_store || move_store) {
                 op->access = QEMU_PLUGIN_OP_ACC_WRITE;
+            }
+            /* Capstone-6.0.0-Alpha7 bugs across the string family: STOS
+             * reports its (%rdi) destination READ, the 32-bit CMPS
+             * reports both operands access == 0, and INS / OUTS report
+             * theirs access == 0 at every size.  The architectural
+             * access follows from the mnemonic and the base register,
+             * so set it for the whole family. */
+            if (string_op) {
+                uint8_t a = cap_x86_string_mem_access(insn->mnemonic,
+                                                      cop->mem.base);
+                if (a) {
+                    op->access = a;
+                }
+            }
+            /* The MEM operand of a scalar ROUNDSS / ROUNDSD is the
+             * source; these never write memory. */
+            if (scalar_round) {
+                op->access = QEMU_PLUGIN_OP_ACC_READ;
+            }
+            /* WRSS / WRUSS store to the shadow stack. */
+            if (shstk_store) {
+                op->access = QEMU_PLUGIN_OP_ACC_WRITE;
+            }
+            /* The multi-byte NOP names a memory operand it never
+             * touches; leaving Capstone's phantom READ in place mints a
+             * load lane and an address dependency for an access that
+             * can never happen. */
+            if (mem_unused) {
+                op->access = 0;
             }
             break;
         default:
@@ -660,60 +711,309 @@ static bool cap_x86_is_test(const char *mnem)
 }
 
 /*
- * Capstone 6.0.0-Alpha7 x86 access-flag bug workaround: STOS.
+ * Capstone 6.0.0-Alpha7 x86 access-flag bugs across the string family.
  *
- * STOS writes the accumulator to ES:[rDI] -- its single MEM operand is
- * a pure store target.  This Capstone version reports it CS_AC_READ, at
- * every operand size and with or without a REP prefix:
+ * The seven string instructions address memory only through (%rSI) and
+ * (%rDI), and which of the two they read and write is fixed by the
+ * architecture:
  *
- *   f3 48 ab   rep stosq %rax,(%rdi)   op0 MEM base=rdi access=READ  <-- WRONG
- *   48 ab      stosq %rax,(%rdi)       op0 MEM base=rdi access=READ  <-- WRONG
- *   aa/ab/66 ab  stosb/stosl/stosw     op0 MEM base=rdi access=READ  <-- WRONG
+ *   insn    (%rSI)   (%rDI)    what it does
+ *   ------  -------  -------   -----------------------------------------
+ *   MOVS    READ     WRITE     ES:[rDI] <- DS:[rSI]
+ *   CMPS    READ     READ      compare DS:[rSI] with ES:[rDI], flags only
+ *   SCAS    --       READ      compare AL/AX/EAX/RAX with ES:[rDI]
+ *   LODS    READ     --        AL/AX/EAX/RAX <- DS:[rSI]
+ *   STOS    --       WRITE     ES:[rDI] <- AL/AX/EAX/RAX
+ *   INS     --       WRITE     ES:[rDI] <- port DX
+ *   OUTS    READ     --        port DX <- DS:[rSI]
  *
- * The direction is simply inverted, so the operand walker mints a load
- * slot instead of a store slot: the dependency model attributes a
- * memset's traffic to the LOAD lane, and the REP per-iteration memop
- * split counts it as rep_loads_per_iter rather than rep_stores_per_iter.
- * (The emitted memop record itself is a correct STORE -- it comes from
- * QEMU's memory callbacks, not from Capstone -- so only the operand /
- * lane model was wrong; PIN and this tracer agree 100% on store counts
- * and addresses.)  The sibling string ops are reported correctly:
- * MOVS gives op0 (%rsi) READ + op1 (%rdi) WRITE, SCAS and LODS give
- * their MEM operand READ.
+ * (Intel SDM Vol. 2, the individual instruction pages.)  This Capstone
+ * version breaks that in three separate ways:
  *
- * Detect by mnemonic -- no other x86 mnemonic starts with "stos" -- and
- * force WRITE on the MEM operand.  Revisit / remove when Capstone is
- * bumped past 6.0.0-Alpha7.
+ *   1. INVERTED.  STOS reports its (%rdi) destination CS_AC_READ, at
+ *      every operand size and with or without a REP prefix:
  *
- * Adjacent, deliberately NOT corrected here because their access is
- * reported as 0 ("unknown") rather than inverted, which the operand
- * walker already treats as "no access info" instead of as a wrong
- * direction: CMPS reports both MEM operands access=0, and INS / OUTS
- * report their MEM operand access=0.  Worth reporting upstream in the
- * same bug, but they need a different correction (synthesising the
- * missing accesses) and none of them appears in the cross-validated
- * spans.
+ *        f3 48 ab     rep stosq %rax,(%rdi)   op0 MEM base=rdi READ  <-- WRONG
+ *        48 ab        stosq %rax,(%rdi)       op0 MEM base=rdi READ  <-- WRONG
+ *        aa/ab/66 ab  stosb/stosl/stosw       op0 MEM base=rdi READ  <-- WRONG
+ *
+ *   2. LOST, OPERAND-SIZE-SPECIFIC.  CMPS at 32-bit operand size --
+ *      opcode A7 with neither the 66 prefix nor REX.W -- reports BOTH
+ *      MEM operands access == 0.  Every other CMPS size is correct:
+ *
+ *        a7           cmpsl (%rdi),(%rsi)     op0/op1 access=0       <-- WRONG
+ *        f3 a7        repz cmpsl              op0/op1 access=0       <-- WRONG
+ *        f2 a7        repnz cmpsl             op0/op1 access=0       <-- WRONG
+ *        a6           cmpsb                   op0/op1 access=READ
+ *        66 a7        cmpsw                   op0/op1 access=READ
+ *        48 a7        cmpsq                   op0/op1 access=READ
+ *
+ *      This is the same shape of defect as the TEST A9-32 one above:
+ *      one operand size of one opcode, everything around it correct.
+ *
+ *   3. LOST, EVERY SIZE.  INS and OUTS report their MEM operand
+ *      access == 0 at every operand size, and the 32-bit forms
+ *      additionally drop the READ on the %dx port operand:
+ *
+ *        6c / 66 6d   insb / insw    op1 MEM access=0                <-- WRONG
+ *        6d           insl           op0 REG(dx)=0, op1 MEM=0        <-- WRONG
+ *        6e / 66 6f   outsb / outsw  op0 MEM access=0                <-- WRONG
+ *        6f           outsl          op0 MEM=0, op1 REG(dx)=0        <-- WRONG
+ *
+ * Consequences, in increasing order of damage.  An inverted flag (1)
+ * makes the operand walker mint a load slot instead of a store slot, so
+ * the dependency model attributes a memset's traffic to the LOAD lane.
+ * A lost flag on one MEM operand of a multi-operand insn (3) makes that
+ * operand contribute no lane at all, because the walker treats a zero
+ * access as "no information" and another operand still carries one.
+ * Worst is (2): a REP-prefixed string op derives its per-iteration
+ * memop count from exactly these flags (rep_loads_per_iter /
+ * rep_stores_per_iter in the consuming tracer), so losing them makes
+ * that count zero, and a zero count disables the per-iteration fan-out
+ * entirely -- a `rep cmpsl` over N dwords collapses from N body entries
+ * of two loads each into a single entry carrying all 2N memops, none of
+ * which the template says the instruction can perform.
+ *
+ * In every case the emitted memop records themselves are correct: they
+ * come from QEMU's memory callbacks, not from Capstone, which is why
+ * PIN and this tracer already agree 100% on string-op memop counts and
+ * addresses.  Only the operand / lane / fan-out model was wrong.
+ *
+ * All three are corrected the same way and at the same boundary as the
+ * PEXTR, store-move and TEST defects: identify the family by mnemonic
+ * and set the access the architecture specifies, which cannot disturb
+ * the encodings Capstone already reports correctly.  Returns 0 when
+ * @mnem is not a string op or @base_reg is not one of the two string
+ * pointers, in which case the caller leaves the operand alone.
+ *
+ * Revisit / remove when Capstone is bumped past 6.0.0-Alpha7; verify
+ * with `cstool -d x64 a7` (both MEM operands must show READ) and
+ * `cstool -d x64 6c` (the MEM operand must show WRITE).
  */
-static bool cap_x86_is_string_store(const char *mnem)
+
+/* Step over the repeat prefix Capstone folds INTO the mnemonic string
+ * ("rep stosq", "repne scasb") rather than leaving to prefix[] alone. */
+static const char *cap_x86_skip_rep(const char *mnem)
 {
-    if (!mnem) {
-        return false;
-    }
-    /* Capstone folds the repeat prefix INTO the mnemonic string
-     * ("rep stosq", "repne scasb") rather than leaving it to the
-     * prefix[] array alone, so step over it before matching. */
     const char *sp = strchr(mnem, ' ');
     if (sp && (g_str_has_prefix(mnem, "rep ") ||
                g_str_has_prefix(mnem, "repe ") ||
                g_str_has_prefix(mnem, "repz ") ||
                g_str_has_prefix(mnem, "repne ") ||
                g_str_has_prefix(mnem, "repnz "))) {
-        mnem = sp + 1;
+        return sp + 1;
     }
-    /* AT&T syntax (QEMU's) size-suffixes the mnemonic: stosb/stosw/
-     * stosl/stosq.  No other x86 mnemonic starts with "stos". */
-    return g_str_has_prefix(mnem, "stos");
+    return mnem;
 }
+
+static bool cap_x86_is_string_op(const char *mnem)
+{
+    if (!mnem) {
+        return false;
+    }
+    mnem = cap_x86_skip_rep(mnem);
+    /* AT&T syntax (QEMU's) size-suffixes the mnemonic: movsb/movsw/
+     * movsl/movsq and so on.  MOVSX / MOVSXD / MOVZX are sign- and
+     * zero-extending moves, not string moves, and must not match --
+     * "movs" is a prefix of "movsx", so exclude them explicitly. */
+    if (g_str_has_prefix(mnem, "movs")) {
+        return !g_str_has_prefix(mnem, "movsx") &&
+               !g_str_has_prefix(mnem, "movsxd");
+    }
+    return g_str_has_prefix(mnem, "cmps") ||
+           g_str_has_prefix(mnem, "scas") ||
+           g_str_has_prefix(mnem, "lods") ||
+           g_str_has_prefix(mnem, "stos") ||
+           g_str_has_prefix(mnem, "ins")  ||
+           g_str_has_prefix(mnem, "outs");
+}
+
+static uint8_t cap_x86_string_mem_access(const char *mnem, unsigned base_reg)
+{
+    if (!mnem) {
+        return 0;
+    }
+    mnem = cap_x86_skip_rep(mnem);
+
+    /* The address-size prefix picks rSI/eSI/SI and rDI/eDI/DI. */
+    bool via_si = (base_reg == X86_REG_RSI || base_reg == X86_REG_ESI ||
+                   base_reg == X86_REG_SI);
+    bool via_di = (base_reg == X86_REG_RDI || base_reg == X86_REG_EDI ||
+                   base_reg == X86_REG_DI);
+    if (!via_si && !via_di) {
+        return 0;
+    }
+
+    /* (%rSI) is the source of every string op that names it. */
+    if (via_si) {
+        return QEMU_PLUGIN_OP_ACC_READ;
+    }
+    /* (%rDI) is compared by CMPS and SCAS, written by everything else
+     * that names it (MOVS, STOS, INS). */
+    if (g_str_has_prefix(mnem, "cmps") || g_str_has_prefix(mnem, "scas")) {
+        return QEMU_PLUGIN_OP_ACC_READ;
+    }
+    return QEMU_PLUGIN_OP_ACC_WRITE;
+}
+
+/*
+ * Capstone 6.0.0-Alpha7 x86 access-flag bug workaround: scalar ROUND.
+ *
+ * ROUNDSS / ROUNDSD round one scalar element of their source into the
+ * low element of their destination, leaving the destination's upper
+ * bits intact.  Their memory form reads 4 or 8 bytes.  This Capstone
+ * version reports that MEM source access == 0, while the packed forms
+ * of the very same instruction group are correct:
+ *
+ *   66 0f 3a 0a  roundss $imm,(%rip),%xmm1   op1 MEM access=0   <-- WRONG
+ *   66 0f 3a 0b  roundsd $imm,(%rip),%xmm1   op1 MEM access=0   <-- WRONG
+ *   c4 e3 .. 0a  vroundss $imm,(%rip),..     op1 MEM access=0   <-- WRONG
+ *   c4 e3 .. 0b  vroundsd $imm,(%rip),..     op1 MEM access=0   <-- WRONG
+ *   66 0f 3a 08  roundps $imm,(%rip),%xmm1   op1 MEM access=READ
+ *   66 0f 3a 09  roundpd $imm,(%rip),%xmm1   op1 MEM access=READ
+ *
+ * The register form is also correct (op1 REG access=READ), so the
+ * defect is specific to the scalar memory form.  Because the
+ * destination operand does carry an access, the walker sees "access
+ * info present" and simply drops the source: a real load gets no load
+ * lane, no address dependency, and any memop observed on it is an
+ * impossible attribution.  The register-form neighbours (ADDSS, CMPSS,
+ * DPPS, INSERTPS, BLENDVPS, PCMPISTRI) are all reported correctly.
+ *
+ * These instructions never write memory -- their destination is always
+ * an XMM register -- so forcing READ on the MEM operand is exact.
+ *
+ * Revisit / remove when Capstone is bumped past 6.0.0-Alpha7; verify
+ * with `cstool -d x64 660f3a0a0d0000000000` (the MEM operand must show
+ * READ).
+ */
+static bool cap_x86_is_scalar_round(const char *mnem)
+{
+    if (!mnem || !mnem[0]) {
+        return false;
+    }
+    if (mnem[0] == 'v') {
+        mnem++;                        /* VEX/EVEX prefix */
+    }
+    return g_str_equal(mnem, "roundss") || g_str_equal(mnem, "roundsd");
+}
+
+/*
+ * Capstone 6.0.0-Alpha7 x86 access-flag bug workaround: WRSS / WRUSS.
+ *
+ * The CET shadow-stack writes store their register source to the
+ * shadow stack at the memory operand's effective address.  This
+ * Capstone version reports BOTH operands access == 0:
+ *
+ *   0f 38 f6     wrssd %ecx,(%rip)    op0 REG=0, op1 MEM=0       <-- WRONG
+ *   48 0f 38 f6  wrssq %rcx,(%rip)    op0 REG=0, op1 MEM=0       <-- WRONG
+ *   66 0f 38 f5  wrussd %ecx,(%rip)   op0 REG=0, op1 MEM=0       <-- WRONG
+ *
+ * With no operand carrying an access at all the walker falls back to
+ * its opcode-indexed heuristic, and a genuine store is modelled with
+ * no store lane.  The register operand is the data source and the MEM
+ * operand is the store target, unconditionally, so setting them is
+ * exact.  Rare in practice -- only CET-enabled binaries on a
+ * shadow-stack-enabled kernel reach these -- but a dropped store is a
+ * dropped store.
+ *
+ * Revisit / remove when Capstone is bumped past 6.0.0-Alpha7; verify
+ * with `cstool -d x64 0f38f60d00000000` (REG must show READ, MEM
+ * WRITE).
+ */
+static bool cap_x86_is_shadow_stack_store(const char *mnem)
+{
+    return mnem && (g_str_has_prefix(mnem, "wrss") ||
+                    g_str_has_prefix(mnem, "wruss"));
+}
+
+/*
+ * Capstone 6.0.0-Alpha7 x86 access-flag bug workaround: multi-byte NOP.
+ *
+ * The 0F 1F multi-byte NOP takes a ModRM and therefore names a memory
+ * operand, but it performs no memory access whatsoever -- Intel SDM
+ * Vol. 2B, NOP: "This instruction does not affect the ... memory".
+ * The recommended alignment padding a compiler emits is exactly this
+ * form.  This Capstone version reports the operand CS_AC_READ at the
+ * sizes that matter, and access == 0 (correct) only for the REX.W one:
+ *
+ *   66 0f 1f 44 00 00  nopw 0(%rax,%rax,1)   op0 MEM access=READ  <-- WRONG
+ *   0f 1f 40 00        nopl 0(%rax)          op0 MEM access=READ  <-- WRONG
+ *   48 0f 1f 0d ..     nopq (%rip)           op0 MEM access=0
+ *
+ * This is the opposite direction to the defects above -- a phantom
+ * access rather than a lost one -- so it does not lose data, but it
+ * mints a load lane and an address dependency on the base and index
+ * registers for a load that can never occur, on one of the most
+ * frequent instructions in any optimised binary.
+ *
+ * Forcing access == 0 on the operand matches the architecture and
+ * leaves the instruction with no memory lane, which is what the
+ * REX.W-prefixed sibling already produces.
+ *
+ * Note this is deliberately NOT applied to the cache-hint instructions
+ * (PREFETCH*, CLFLUSH, CLWB, CLDEMOTE), whose MEM operand Capstone also
+ * reports READ: those DO name a real address that a memory-system
+ * consumer wants, and the tracer routes them through its synthetic-EA
+ * path precisely because their TCG translation emits no memop.
+ *
+ * Revisit / remove when Capstone is bumped past 6.0.0-Alpha7; verify
+ * with `cstool -d x64 660f1f440000` (the MEM operand must show no
+ * access).
+ */
+static bool cap_x86_mem_is_never_accessed(const char *mnem)
+{
+    /* AT&T size-suffixes it: nop / nopw / nopl / nopq.  No other x86
+     * mnemonic starts with "nop". */
+    return mnem && g_str_has_prefix(mnem, "nop");
+}
+
+/*
+ * Capstone 6.0.0-Alpha7 x86 access-flag bug workaround: PUSH %seg.
+ *
+ * PUSH reads its operand and writes it to the stack.  This Capstone
+ * version reports the segment-register forms with access == 0, while
+ * the general-register form and every POP are correct:
+ *
+ *   0f a0  pushq %fs   op0 REG(fs) access=0     <-- WRONG
+ *   0f a8  pushq %gs   op0 REG(gs) access=0     <-- WRONG
+ *   50     pushq %rax  op0 REG(rax) access=READ
+ *   0f a1  popq %fs    op0 REG(fs) access=WRITE
+ *
+ * The segment register is genuinely a source of the instruction (it is
+ * the value pushed), so without the correction it is dropped from the
+ * dependency model.  A PUSH operand is a read in every encoding, so
+ * setting READ where Capstone reported nothing is exact.
+ *
+ * Revisit / remove when Capstone is bumped past 6.0.0-Alpha7; verify
+ * with `cstool -d x64 0fa0` (the operand must show READ).
+ */
+static bool cap_x86_is_push(const char *mnem)
+{
+    /* AT&T size-suffixes it: pushw / pushq.  POP is a separate
+     * mnemonic and is reported correctly. */
+    return mnem && g_str_has_prefix(mnem, "push");
+}
+
+/*
+ * Sweep note -- x86-64 encodings whose REG/MEM operands Capstone
+ * 6.0.0-Alpha7 reports access == 0 and which are deliberately NOT
+ * corrected here, because 0 is either right or unknowable:
+ *
+ *   CLDEMOTE     a cache hint that reads and writes no data; the
+ *                tracer classifies it with the other hint opcodes and
+ *                takes its address from the synthetic-EA path.
+ *   BSWAPW       66-prefixed BSWAP is an undefined encoding (Intel
+ *                SDM: "the result is undefined"); no compiler emits
+ *                it and there is no architectural access to state.
+ *   FFREEP       an undocumented x87 opcode (DF C0+i) with no
+ *                architectural definition of its operand access; it
+ *                touches no memory, so nothing is lost.
+ *
+ * The IMM operands of many instructions also report access == 0; that
+ * is correct and universal -- an immediate is not a state access -- and
+ * the operand walker never derives a lane from an IMM.
+ */
 
 /*
  * Capstone 6.0.0 x86 store-move access-flag bug workaround.

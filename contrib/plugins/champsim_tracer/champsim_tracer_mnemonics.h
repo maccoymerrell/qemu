@@ -635,7 +635,19 @@ const IsaProperties isa_properties[] = {
         .marker_seq_insns  = CST_MARKER_PAIR_SEQ_INSNS,
     },
     [TRACE_ISA_RISCV]   = {
-        .include_implicit_regs = false,
+        /* RISC-V MUST fold implicit regs too.  The vector-configuration
+         * CSRs are the reason: `vl` and `vtype` never appear in an
+         * operand field — `vsetvli` names only its GPR destination and a
+         * vector op names only its vector registers — so without the
+         * fold the edge every RVV instruction has on the `vsetvli` that
+         * configured it does not exist, and a vector kernel's ops float
+         * free of their own configuration.  The same applies to the FP
+         * rounding mode `frm` on scalar and vector FP.  The historical
+         * double-count worry is moot for the same reason it is on MIPS:
+         * add_src/dst_cap_reg dedup by generic reg id, so a register
+         * named both by an operand and by the implicit list occupies one
+         * slot. */
+        .include_implicit_regs = true,
         .target_prefixes = isa_prefixes_riscv,
         .cap_arch = CS_ARCH_RISCV,
         .cap_mode_for_target = cap_mode_riscv,

@@ -1732,6 +1732,27 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
 }
 
 /*
+ * RVV multiply-accumulate family test — see the tied-operand workaround
+ * in cap_fill_generic_operands().  Capstone spells the whole family
+ * v[f][w][n]m{acc,add,sac,sub}.{vv,vx,vf}; matching on the accumulate
+ * infix covers vmacc/vmadd/vnmsac/vnmsub, vwmacc{,u,su,us}, and every
+ * vf[w][n]m{acc,add,sac,sub} without enumerating 55 mnemonics.  The
+ * single-element inserts vmv.s.x / vfmv.s.f share the tied shape but not
+ * the infix, so they are named explicitly.
+ */
+static bool cap_riscv_is_tied_vd(const char *mnem)
+{
+    if (!mnem || mnem[0] != 'v') {
+        return false;
+    }
+    if (!strcmp(mnem, "vmv.s.x") || !strcmp(mnem, "vfmv.s.f")) {
+        return true;
+    }
+    return strstr(mnem, "macc") || strstr(mnem, "madd") ||
+           strstr(mnem, "msac") || strstr(mnem, "msub");
+}
+
+/*
  * Extract per-operand detail for RISC-V or MIPS (no access info).
  */
 static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
@@ -1799,6 +1820,87 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                 op->index_id   = 0;
                 op->imm = 0;
                 break;
+            }
+        }
+        /*
+         * Capstone 6.0.0-Alpha7 RVV tied-operand bug workaround.
+         *
+         * Every RVV multiply-accumulate form takes `vd` as BOTH an
+         * accumulator source and the destination — the tied-operand
+         * constraint LLVM records on the instruction description.
+         * Capstone honours the read but drops the write, so `vd` reports
+         * READ-only and the accumulation chain has no producer at all:
+         * a reduction loop's carried dependency vanishes and every
+         * iteration looks independent.  `vmv.s.x` / `vfmv.s.f` have the
+         * same shape (they write element 0 and preserve the rest) and the
+         * same defect.
+         *
+         * The scoping is exact: every non-accumulating vector op
+         * (`vadd.vv`, `vmul.vv`, `vxor.vv`, `vwsub.wv`, `vwredsum.vs`, …)
+         * reports `WR{vd}` correctly.  Detect the family by the
+         * accumulate infix that names it — Capstone spells these
+         * v[f][w][n]m{acc,add,sac,sub}.{vv,vx,vf} — and restore the write.
+         *
+         * Revisit / remove when Capstone is bumped past 6.0.0-Alpha7;
+         * verify with `cstool -d riscv64 57a4a4b6` (bytes
+         * `57 a4 a4 b6`, `vmacc.vv v8,v9,v10`) -- fixed, operands[0] must
+         * show READ|WRITE.  Use a `cstool` built from
+         * `subprojects/capstone`, not a system package, or run
+         * `capstone_workaround_probe`; see docs/troubleshooting.rst.
+         */
+        if (cap_riscv_is_tied_vd(insn->mnemonic) && n >= 1
+            && out->operands[0].type == QEMU_PLUGIN_OP_REG) {
+            out->operands[0].access |= QEMU_PLUGIN_OP_ACC_READ
+                                     | QEMU_PLUGIN_OP_ACC_WRITE;
+        }
+        /*
+         * Capstone 6.0.0-Alpha7 RVV vector-configuration bug workaround.
+         *
+         * Every RVV instruction's behaviour is a function of the `vl` and
+         * `vtype` CSRs that the preceding `vsetvli` wrote, so the
+         * configuration edge is a real dependency and LLVM records it on
+         * both ends.  Capstone reports it for the integer vector ops but
+         * omits it from the floating-point ones, which name only `frm` —
+         * so an FP vector kernel's ops float free of the `vsetvli` that
+         * configured them.
+         *
+         * Supply the missing reads, and only the missing ones: an
+         * instruction that already names `vl` keeps Capstone's answer.
+         * Every RISC-V mnemonic beginning with `v` is a vector
+         * instruction (the base ISA has none), and `vsetvl*` is excluded
+         * because it *writes* the configuration rather than consuming it.
+         *
+         * Revisit / remove when Capstone is bumped past 6.0.0-Alpha7;
+         * verify with `cstool -d riscv64 5794a4b2` (bytes
+         * `57 94 a4 b2`, `vfmacc.vv v8,v9,v10`) -- fixed, the implicit
+         * read list must name vl and vtype alongside frm.  Use a `cstool`
+         * built from `subprojects/capstone`, not a system package, or run
+         * `capstone_workaround_probe`; see docs/troubleshooting.rst.
+         */
+        if (insn->mnemonic[0] == 'v'
+            && !g_str_has_prefix(insn->mnemonic, "vsetvl")) {
+            bool has_vl = false;
+            for (uint8_t i = 0; i < out->n_regs_read; i++) {
+                if (out->regs_read_id[i] == RISCV_REG_VL
+                    || out->regs_read_id[i] == RISCV_REG_VTYPE) {
+                    has_vl = true;
+                    break;
+                }
+            }
+            if (!has_vl) {
+                static const uint16_t vcfg[] = { RISCV_REG_VL,
+                                                 RISCV_REG_VTYPE };
+                for (size_t k = 0; k < ARRAY_SIZE(vcfg); k++) {
+                    if (out->n_regs_read
+                        >= QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS) {
+                        break;
+                    }
+                    cap_copy_reg_name(out->regs_read[out->n_regs_read],
+                                      QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                                      handle, vcfg[k], cap_arch);
+                    out->regs_read_id[out->n_regs_read] = vcfg[k];
+                    out->n_regs_read++;
+                }
             }
         }
     } else if (cap_arch == CS_ARCH_MIPS) {

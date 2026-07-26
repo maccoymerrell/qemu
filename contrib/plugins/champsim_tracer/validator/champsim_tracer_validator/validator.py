@@ -1404,6 +1404,79 @@ def _check_segment_final_memops(
          "peer_executions": len(peers)})]
 
 
+def _check_memop_bimodality(
+        cp_entries: list[dict],
+        templates_by_id: dict[int, dict],
+        min_execs: int = 8,
+        max_outlier_rate: float = 0.10) -> list[Issue]:
+    """Per-template memop bimodality — the GENERAL D4-class completeness
+    oracle (mirrors ``cst_lint.h``'s ``MemopBimodalityLint``, so the
+    Python-side oracle chain — and its mutation-tier teeth — exercise the
+    same invariant the offline C++ tools do).
+
+    ``_check_segment_final_memops`` above catches exactly the D4
+    mechanism: ONE specific entry (the segment's last) losing its memops
+    to a positional emission bug.  This check generalises the same
+    signature to every entry, not just the last one: a memop-capable
+    template whose executions are overwhelmingly nonzero, with a small
+    minority realising none, is flagged regardless of WHERE in the
+    stream the outlier sits — so any future memop-loss bug of the same
+    shape (not necessarily positional, not necessarily confined to
+    segment close) is caught too, not just this one mechanism.
+
+    Deliberately statistical rather than absolute, for the same reason
+    ``AttributionLint``'s memop rule is one-sided: a memop-capable insn
+    legitimately producing zero memops this execution is normal
+    (predication, a zero-count REP, a suppressed fault).  A template
+    that is legitimately bimodal AT SCALE (heavy predication, a REP loop
+    that is empty as often as it is not) has a zero-rate the default
+    threshold does not consider an "outlier", so it is not flagged; only
+    a template whose zero executions are a small minority against an
+    established nonzero majority trips this check.  Both thresholds are
+    tunable (min_execs, max_outlier_rate) for a workload whose
+    predication rate genuinely warrants a wider band.  Correct-path
+    only — wrong-path wandering carries no dataflow contract.
+    """
+    from collections import defaultdict
+    per_tid: dict[int, list[int]] = defaultdict(list)
+    for e in cp_entries:
+        tid = e.get("template_id")
+        tmpl = templates_by_id.get(tid) or {}
+        insns = tmpl.get("insns") or []
+        if not any(int(i.get("n_loads", 0)) or int(i.get("n_stores", 0))
+                   for i in insns):
+            continue                      # not memop-capable; not tracked
+        per_tid[tid].append(len(e.get("dyn_params") or []))
+
+    issues: list[Issue] = []
+    for tid, counts in per_tid.items():
+        total = len(counts)
+        if total < min_execs:
+            continue
+        zero = sum(1 for c in counts if c == 0)
+        nonzero = total - zero
+        if zero == 0 or nonzero == 0:
+            continue
+        rate = zero / total
+        if rate > max_outlier_rate:
+            continue
+        issues.append(Issue(
+            "memop_bimodality", "error",
+            f"template {tid}: {zero}/{total} CP executions realised zero "
+            f"memops (rate {rate:.4f}) against a {nonzero}-execution "
+            f"nonzero majority — memop bimodality (D4-class completeness "
+            f"loss)",
+            {"template_id": tid, "total": total, "zero": zero,
+             "nonzero": nonzero, "rate": rate}))
+    if not issues:
+        issues.append(Issue(
+            "memop_bimodality", "info",
+            f"clean: 0 templates with a nonzero-majority / zero-outlier "
+            f"memop split among {len(per_tid)} memop-capable template(s) "
+            f"(min_execs={min_execs}, max_outlier_rate={max_outlier_rate})"))
+    return issues
+
+
 def _check_per_execution_memop_data(
         entries: list[dict],
         template_runs: dict[int, list[tuple[int, int]]],
@@ -3545,8 +3618,7 @@ def _check_wrong_path_chains(entries: list[dict],
                              templates_by_id: dict | None = None,
                              marker: bool = False,
                              wpprune: int = 0,
-                             reg_name_to_id: dict | None = None,
-                             syscall_ids: set | None = None) -> list[Issue]:
+                             reg_name_to_id: dict | None = None) -> list[Issue]:
     """For every CP position predicted to fork, walk the trace's
     ``wp_entries`` for that block's TB and compare the distinct-block
     sequence against the predicted ``wp_chain`` as a prefix.
@@ -3587,12 +3659,15 @@ def _check_wrong_path_chains(entries: list[dict],
       is only legitimate when it ended on a real terminator: the depth
       budget, a privilege-domain crossing into the kernel (``is_system``
       template), a mid-chain / first-fetch translation-unavailable
-      event, a syscall-class terminator (``BRANCH_SYSCALL_TYPE`` on the
-      last block, which escalates privilege into an unfollowable kernel
-      path), or a whole-path wpprune.  This gate holds regardless of
-      faults — a fault must CONTINUE to one of these, not truncate — so a
-      short chain with no terminator and below budget is a truncation
-      error even when it carries a fault.
+      event, or a whole-path wpprune.  Every one of those is a FETCH
+      condition — the wrong path could not fetch the next block.  A
+      syscall-class terminator is NOT among them: the wrong path
+      continues past a syscall at its architectural fall-through, the
+      same not-taken side it takes for any other branch, so a chain that
+      stops at one is a truncation like any other.  This gate holds
+      regardless of faults — a fault must CONTINUE to one of these, not
+      truncate — so a short chain with no terminator and below budget is
+      a truncation error even when it carries a fault.
     """
     issues: list[Issue] = []
     cp_pos = -1
@@ -3693,21 +3768,6 @@ def _check_wrong_path_chains(entries: list[dict],
             if crossed:
                 wp_left_user = True
 
-        # Syscall-class terminator: the LAST wrong-path block ends in a
-        # BRANCH_SYSCALL_TYPE instruction (syscall / int / svc / ecall /
-        # brk, or a conditional trap).  Its correct resolution is a
-        # privilege escalation the single-address-space spec model cannot
-        # follow, so the plugin commits the block and terminates the
-        # excursion there (commit 7b69c88aa4) — a legitimate short chain.
-        ended_at_syscall = False
-        if wp_list and syscall_ids:
-            last = wp_list[-1]
-            lt = (templates_by_id or {}).get(last["template_id"])
-            linsns = (lt or {}).get("insns") or []
-            n_last = min(int(last.get("n_insns", 0) or 0), len(linsns))
-            if n_last > 0 and int(linsns[n_last - 1].get("branch_type", 0)) \
-                    in syscall_ids:
-                ended_at_syscall = True
 
         actual_wp = _collapse_runs(wp_raw)
         # Collapsed index at which the wrong path left the enumerable user CFG.
@@ -3742,7 +3802,6 @@ def _check_wrong_path_chains(entries: list[dict],
             "n_wp_entries": len(wp_list),
             "has_fault": has_fault,
             "first_fault_pos": first_fault_pos,
-            "ended_at_syscall": ended_at_syscall,
             # Chain-level TRANSLATION_UNAVAIL event (format spec §4.4):
             # the excursion was kicked but its first fetch could not
             # complete, so the chain is empty and says so explicitly.
@@ -3849,14 +3908,6 @@ def _check_wrong_path_chains(entries: list[dict],
             if wp_left_user and left_user_at is not None \
                     and left_user_at >= len(exp_chain):
                 continue
-            # Syscall-class terminator: the last wrong-path block ends in a
-            # BRANCH_SYSCALL_TYPE instruction.  Its correct resolution is a
-            # privilege escalation into an unfollowable kernel path, so the
-            # plugin commits the block and terminates the excursion there
-            # (commit 7b69c88aa4) — a legitimate short chain, like a
-            # translation-unavailable boundary.
-            if rec["ended_at_syscall"]:
-                continue
             # Chain-level TRANSLATION_UNAVAIL event (format spec §4.4):
             # the plugin kicked the excursion but the first fetch could
             # not complete — on a software-managed-TLB ISA the refill
@@ -3900,7 +3951,9 @@ def _check_wrong_path_chains(entries: list[dict],
                 continue
             # A shorter-than-predicted chain that reached none of the
             # terminators above (budget / privilege crossing / translation-
-            # unavailable / syscall / wpprune) is a real plugin truncation.
+            # unavailable / wpprune) is a real plugin truncation.  A syscall is
+            # deliberately not on that list: the wrong path continues past one
+            # at its fall-through, so stopping there is a truncation too.
             # This holds even when the chain carries a FAULT: the live policy
             # is that a synthetic-data fault CONTINUES on placeholder data to
             # a real terminator, so a fault that stops the excursion short is
@@ -7087,6 +7140,7 @@ def validate(meta_path: Path, trace_path: Path,
             meta.get("isa", "x86_64"))
 
     issues += _check_segment_final_memops(cp_entries, templates_by_id)
+    issues += _check_memop_bimodality(cp_entries, templates_by_id)
 
     isa = meta.get("isa", "x86_64")
 
@@ -7156,12 +7210,6 @@ def validate(meta_path: Path, trace_path: Path,
             _wp_reg_name_to_id[_rname] = int(_rid)
         except (TypeError, ValueError):
             continue
-    # Syscall-class branch ids for the wrong-path syscall-terminator
-    # acceptance (self-describing map; the name is BRANCH_SYSCALL_TYPE —
-    # match the SYSCALL substring so a rename can't silently disable it).
-    _wp_syscall_ids = {int(k) for k, v in
-                       (trace_meta.get("branch_names") or {}).items()
-                       if "SYSCALL" in str(v)}
     issues += _check_wrong_path_chains(cp_entries, template_runs,
                                        cp_block_seq, correct_path,
                                        meta["wrong_paths"],
@@ -7173,8 +7221,7 @@ def validate(meta_path: Path, trace_path: Path,
                                        templates_by_id=templates_by_id,
                                        marker=marker,
                                        wpprune=wpprune,
-                                       reg_name_to_id=_wp_reg_name_to_id,
-                                       syscall_ids=_wp_syscall_ids)
+                                       reg_name_to_id=_wp_reg_name_to_id)
 
     # wpprune drops the wrong path for monomorphic indirects, so the
     # one-target/multi-target WP-shape assertions no longer hold.  The

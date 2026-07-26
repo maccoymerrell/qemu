@@ -411,6 +411,16 @@ bool branch_is_none(const cst::Header &h, uint64_t bt)
     return n && *n == "BRANCH_NONE";
 }
 
+/* Syscall-class terminator: a syscall, software interrupt or unconditional
+ * trap.  Matched on the SYSCALL substring of the self-describing map name, as
+ * the validator does, so a rename cannot silently disable the rules keyed off
+ * it. */
+bool branch_is_syscall(const cst::Header &h, uint64_t bt)
+{
+    const std::string *n = branch_name_lookup(h, bt);
+    return n && n->find("SYSCALL") != std::string::npos;
+}
+
 const char *branch_mnem_from_name(const std::string *name)
 {
     if (!name) return nullptr;
@@ -2673,6 +2683,15 @@ int run_body_render(const Options &opts, const cst::Header &h,
  * The chain's last block has no in-chain successor and is left unchecked; a
  * block the wp_events section marks as faulting or untranslatable ends its
  * strand, so a mismatch there is tallied as a diversion rather than an error.
+ *
+ * A syscall-class block is the one exception to that diversion licence, and is
+ * checked HARDER than any other.  It used to end the excursion, so it was
+ * always the chain's last block and never cross-checked at all.  The wrong
+ * path now continues past it at the architectural fall-through, which puts it
+ * mid-chain AND makes its successor exactly predictable, so its target is
+ * verified against that fall-through and the fault marker it always carries
+ * (raising is how a syscall leaves speculative execution) does not excuse a
+ * mismatch.
  * Returns 0 iff every checked CP entry and WP block agreed.
  */
 namespace {
@@ -2758,6 +2777,11 @@ int run_verify_branch(const Options &opts, const cst::Header &h,
      * in-chain successor and is not checked). */
     uint64_t n_wp_branch = 0, n_wp_checked = 0;
     uint64_t n_wp_target_mism = 0, n_wp_taken_mism = 0;
+    /* Wrong-path syscall blocks whose successor is not the syscall's
+     * architectural fall-through.  The policy says it always is, so this is an
+     * invariant with a counter, not a tolerance: any hit is a mismatch and is
+     * folded into the exit status through n_wp_target_mism above. */
+    uint64_t n_wp_syscall_fallthrough_mism = 0;
     uint64_t n_wp_diverted = 0;
     uint64_t n_resume_unnamed = 0;
     std::string examples;
@@ -2967,10 +2991,11 @@ int run_verify_branch(const Options &opts, const cst::Header &h,
             const cst::Template *wn = get_tmpl(e.wp_entries[w + 1].template_id);
             if (!wt || !wn) continue;
             uint64_t succ = wn->start_pc;
-            bool wcond = false;
+            bool wcond = false, wsys = false;
             for (int j = (int)wt->insns.size() - 1; j >= 0; j--) {
                 if (wt->insns[j].branch_type != 0) {
                     wcond = wt->insns[j].branch_conditional;
+                    wsys  = branch_is_syscall(h, wt->insns[j].branch_type);
                     break;
                 }
             }
@@ -2982,8 +3007,21 @@ int run_verify_branch(const Options &opts, const cst::Header &h,
             /* Symmetric with the CP side: a block the wp_events section marks
              * as faulting or untranslatable ends its strand, so its successor
              * in the chain need not be its architectural target.  Tallied as
-             * a diversion, not an error. */
-            if (tmism && (wp.fault || wp.translation_unavailable)) {
+             * a diversion, not an error.
+             *
+             * A syscall-class terminator is exempt from that exemption.  It is
+             * always marked faulting — raising is how it leaves speculative
+             * execution — yet its wrong-path successor is not open-ended at
+             * all: the walk continues at the architectural fall-through, so
+             * the successor is EXACTLY predictable and the check stays strict.
+             * Excusing it would leave every syscall block on the wrong path
+             * unverified, which is the same blind spot the old policy had for
+             * a different reason (a syscall ended the chain, and the chain's
+             * last block is never cross-checked). */
+            if (wsys && succ != wt->fall_through_pc) {
+                n_wp_syscall_fallthrough_mism++;
+            }
+            if (tmism && !wsys && (wp.fault || wp.translation_unavailable)) {
                 n_wp_diverted++;
                 tmism = false;
             }
@@ -3061,18 +3099,21 @@ int run_verify_branch(const Options &opts, const cst::Header &h,
         "cross-checked %llu in-chain (next block's start_pc)\n"
         "  WP target mismatches: %llu\n"
         "  WP taken  mismatches: %llu\n"
-        "  WP diverted (block carries a fault/translation event): %llu\n",
+        "  WP diverted (block carries a fault/translation event): %llu\n"
+        "  WP syscall blocks not continued at the fall-through: %llu\n",
         (unsigned long long)n_wp_branch,
         (unsigned long long)n_wp_checked,
         (unsigned long long)n_wp_target_mism,
         (unsigned long long)n_wp_taken_mism,
-        (unsigned long long)n_wp_diverted);
+        (unsigned long long)n_wp_diverted,
+        (unsigned long long)n_wp_syscall_fallthrough_mism);
     if (!examples.empty()) {
         std::fprintf(stdout, "first mismatches:\n%s", examples.c_str());
     }
     return (n_target_mism == 0 && n_taken_mism == 0 &&
             n_resume_unnamed == 0 &&
-            n_wp_target_mism == 0 && n_wp_taken_mism == 0) ? 0 : 1;
+            n_wp_target_mism == 0 && n_wp_taken_mism == 0 &&
+            n_wp_syscall_fallthrough_mism == 0) ? 0 : 1;
 }
 
 int run(const Options &opts)

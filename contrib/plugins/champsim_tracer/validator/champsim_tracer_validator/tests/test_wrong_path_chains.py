@@ -13,9 +13,12 @@ continue-to-budget policy the plugin now implements:
     is a bug).  Past a marked fault the tail is synthetic placeholder, so a
     divergence at a position strictly after the first fault is EXPECTED.
   * TERMINATION: a short chain is only legitimate at a real terminator —
-    depth budget, privilege-domain crossing, translation-unavailable, a
-    syscall-class terminator, or wpprune.  A fault must CONTINUE to one of
-    these; a fault that truncates the excursion short is itself an error.
+    depth budget, privilege-domain crossing, translation-unavailable, or
+    wpprune.  Every one is a FETCH condition.  A syscall is NOT a terminator:
+    the wrong path continues past it at its architectural fall-through, the
+    not-taken side it takes for any other branch.  A fault must CONTINUE to a
+    real terminator; a fault that truncates the excursion short is itself an
+    error.
   * The kill policy is RETIRED: a fault-carrying chain that resolves a
     fault-dependent branch and CONTINUES is now correct output, never an
     error — the exact inversion of the old policy's canonical negative test.
@@ -111,7 +114,6 @@ def run_case(wp_entries, exp_chain, budget=64, n_insns_by_bid=None,
         wp_insn_budget=budget,
         templates_by_id=templates_by_id,
         reg_name_to_id=REG_NAME_TO_ID,
-        syscall_ids=SYSCALL_IDS,
     )
 
 
@@ -217,25 +219,39 @@ def test_budget_exhaustion_accepted():
         f"budget exhaustion must be accepted, got {[i.message for i in issues]}"
 
 
-def test_syscall_terminator_accepted():
-    # Short chain whose LAST block ends in a syscall-class branch: the
-    # excursion legitimately terminates at the privilege escalation.
+def test_syscall_does_not_terminate_a_chain():
+    # Short chain whose LAST block ends in a syscall-class branch.  The wrong
+    # path continues past a syscall at its architectural fall-through, so
+    # stopping there is a truncation like any other -- the exact inversion of
+    # the terminate-at-syscall policy this suite used to assert.
     wps = [_wp(13, n_insns=14), _wp(14, n_insns=11)]
     issues = run_case(wps, [13, 14, 15, 16, 17], n_insns_by_bid=N_BY_BID,
                       syscall_bids=(14,))
-    assert not issues, \
-        f"syscall terminator must be accepted, got {[i.message for i in issues]}"
+    errs = _errs(issues)
+    assert len(errs) == 1 and "truncated" in errs[0].message, \
+        f"a syscall must not terminate a chain, got {[i.message for i in issues]}"
 
 
-def test_syscall_terminator_only_on_last_block():
-    # A syscall on a MIDDLE block does not terminate; the chain is still
-    # short at a non-syscall last block -> truncation error.
+def test_syscall_mid_chain_does_not_terminate():
+    # Same verdict from the other side: a syscall on a MIDDLE block never
+    # licensed a short chain even under the old policy, and still does not.
     wps = [_wp(13, n_insns=14), _wp(14, n_insns=11)]
     issues = run_case(wps, [13, 14, 15, 16, 17], n_insns_by_bid=N_BY_BID,
                       syscall_bids=(13,))
     errs = _errs(issues)
     assert len(errs) == 1 and "truncated" in errs[0].message, \
         f"a mid-chain syscall must not terminate, got {[i.message for i in issues]}"
+
+
+def test_syscall_chain_continuing_to_budget_is_clean():
+    # And the positive: a chain that walks THROUGH a syscall block and on to
+    # the budget is correct output, no issue at all.
+    wps = [_wp(13, n_insns=14), _wp(14, n_insns=11), _wp(15, n_insns=11),
+           _wp(16, n_insns=15), _wp(17, n_insns=11)]
+    issues = run_case(wps, [13, 14, 15, 16, 17], n_insns_by_bid=N_BY_BID,
+                      syscall_bids=(14,))
+    assert not issues, \
+        f"walking past a syscall must be clean, got {[i.message for i in issues]}"
 
 
 if __name__ == "__main__":

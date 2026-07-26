@@ -250,8 +250,21 @@ public:
      * *previous* TB's entry once its branch direction is known — so a TB
      * ended by a process-exiting syscall has no "next" TB and its memops
      * would vanish without this.  No wrong-path (WP undefined after
-     * exit).  Caller holds exec_lock. */
-    void flush_final();
+     * exit).  Caller holds exec_lock.
+     *
+     * @walk_prev says whether the pending-seal slot holds a TB that has
+     * RUN.  It does on every close the guest's own progress raises —
+     * process exit, the END marker, the dead-latch sweep — which is the
+     * case this flush exists for: the slot's TB executed (wholly, or up
+     * to the scoreboard's last-executed fragment) and its memops and dst
+     * snaps sit in this thread's accumulators awaiting a successor step
+     * that will never come.  It does NOT on the deferred icount /
+     * simpoint window close, which fires at the tail of a step that has
+     * just promoted the *currently dispatching* TB into the slot: walking
+     * it there emits instructions before they execute, against empty
+     * accumulators (see run_deferred_window_closes).  The in-flight chain
+     * is finalized either way. */
+    void flush_final(bool walk_prev = true);
 
     /* Lazy per-vCPU event-queue enable, done by the glue on this thread's
      * first CP exec (must run on the owning vCPU thread). */
@@ -549,9 +562,12 @@ private:
  * thread). */
 PathBuilder &path_builder_tls();
 
-/* Free-function trampoline for the segment-finish flush hook
+/* Free-function trampolines for the segment-finish flush hook
  * (TraceSegmentManager::finish takes a plain callback): flush the
- * calling thread's pending final body entry. */
+ * calling thread's pending final body entry.  The _chain_only variant
+ * is PathBuilder::flush_final(false) — the deferred window close, whose
+ * pending-seal slot holds a TB that has not run yet. */
 void path_builder_flush_final();
+void path_builder_flush_final_chain_only();
 
 #endif /* CHAMPSIM_TRACER_PATH_BUILDER_H */

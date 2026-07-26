@@ -461,8 +461,11 @@ small sleb.  On the wrong path the singletons delta through the same
 per-chain WP field-state overlay as ``LOAD_ADDR``
 (``wp_state → CP → default``), so WP branch overhead tracks CP branch
 overhead instead of paying a fresh baseline per excursion.  They appear only
-on blocks whose template ends in a branch; a page-split continuation and the
-segment-final flush carry neither.  A ``REP`` fan-out reports each iteration's
+on blocks whose template ends in a branch; a page-split continuation and an
+entry the segment-final flush emitted with no observed successor (the guest
+stopped there) carry neither, while a segment closed by its icount or
+simpoint budget ends on a normally sealed, branch-resolved entry.  A ``REP``
+fan-out reports each iteration's
 self-loop (taken to the REP PC) until the final iteration exits.  The encoded
 target is the ARCHITECTURAL successor, which on a system-mode trace is not
 always the next record: a fault, a syscall, an interrupt, an interleaved

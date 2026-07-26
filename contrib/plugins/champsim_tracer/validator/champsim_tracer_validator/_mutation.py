@@ -310,6 +310,31 @@ def _m_memdata_addr_swap(triple, gen_meta) -> Optional[str]:
     return None
 
 
+def _m_final_entry_memops_dropped(triple, gen_meta) -> Optional[str]:
+    """Strip the memops from the trace's LAST body entry — the shape of the
+    segment-close loss, where the entry is flushed before its instructions
+    have run and its memop accumulator is therefore still empty.  Only
+    meaningful when the final entry's template repeats with an invariant
+    memop shape, which is exactly the condition the check asserts on."""
+    _meta, _tmpl, entries = triple
+    if len(entries) < 3:
+        return None
+    final = entries[-1]
+    tid = final.get("template_id")
+    peers = [e for e in entries[:-1] if e.get("template_id") == tid]
+    if len(peers) < 2:
+        return None
+    counts = {len(p.get("dyn_params") or []) for p in peers}
+    if len(counts) != 1 or 0 in counts:
+        return None
+    n = len(final.get("dyn_params") or [])
+    if n == 0:
+        return None
+    final["dyn_params"] = []
+    return (f"dropped {n} memop(s) from the final body entry "
+            f"(seq={final.get('seq_num')}, template {tid})")
+
+
 def _m_memdata_data_flip(triple, gen_meta) -> Optional[str]:
     _meta, _tmpl, entries = triple
     for e in entries:
@@ -933,6 +958,18 @@ CATALOGUE: list = [
              "flip a captured load/store data byte",
              _m_memdata_data_flip,
              expect=("cp_memops", "per_execution_memop_data")),
+    Mutation("final_entry_memops_dropped", "oracle",
+             "strip the memops from the segment's last body entry",
+             _m_final_entry_memops_dropped,
+             expect=("segment_final_memops",),
+             # The standard substrate closes its window at the guest's exit
+             # syscall, so its last entry is the exit block — no memops and
+             # no repeat, hence nothing for this mutation to strip.  The
+             # strictness is proven end-to-end on a substrate that DOES
+             # close mid-flight (a real deferred icount-window close, all
+             # four ISAs), where the pre-fix plugin's own output is the
+             # mutation.
+             covered_by="features.final_entry_memops (4-ISA, gating)"),
     Mutation("opcode_class_change", "oracle",
              "relabel a pinned instruction's opcode class",
              _m_opcode_class_change,

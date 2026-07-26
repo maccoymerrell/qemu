@@ -2348,9 +2348,14 @@ Coverage and gating:
   A trace produced by a writer that predates the feature names neither, and
   a consumer then falls back to successor look-ahead.
 * **Branch-terminated blocks only.**  A page-split continuation (no
-  terminating branch) and the lone segment-final entry flushed with no
-  observed successor carry neither FID; a decoder surfaces the outcome only
-  when the template ends in a branch.
+  terminating branch) carries neither FID; a decoder surfaces the outcome
+  only when the template ends in a branch.  A segment can also end on an
+  entry the segment-final flush emitted with no observed successor — the
+  guest stopped there (process exit, END marker, dead-latch sweep), so no
+  later block resolves the edge — and that lone entry likewise carries
+  neither.  A segment closed by its icount or simpoint budget does not
+  produce one: that close waits for the budget-crossing block to execute
+  and seal normally, so its final entry is branch-resolved like any other.
 * **REP string operations** fan out into one entry per iteration, all at the
   REP PC; the self-looping REP "branch" is reported taken to its own PC for
   every iteration but the last, which exits to the real successor — so the

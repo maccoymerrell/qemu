@@ -454,6 +454,29 @@ outside the repo as standalone scripts):
    ``program``/``comment``); asserts the trace decodes clean.
 ``features.mutation_strictness``
    The :ref:`mutation <validator-mutation>` matrix, run in-process.
+``features.final_entry_memops``
+   The segment's **last** body entry keeps its memory operands.
+   Body entries are emitted one TB late, so an entry flushed on a
+   path that runs before its instructions execute carries no memops
+   at all — one entry per segment, and invisible to every byte-level
+   gate (``cst_audit``'s rollup reconciles the records that *are*
+   present, and the impossible-attribution lint only rejects a memop
+   on a memop-incapable slot, never a memop-capable slot with no
+   memop, which predication and a zero-count ``REP`` make legal).
+   The check forces a genuine deferred window close — an ``icount``
+   stop reached mid-run, with the plugin reporting the segment ``OK``
+   rather than ``UNDER``/``END`` — then requires the trace's final
+   entry to land on a true BB that statically accesses memory and has
+   executed before with an invariant memop shape, and asserts the
+   final execution carries that same shape (count, and which
+   instruction slot performs which access).  Self-calibrating: the
+   oracle is the trace's own repetition, so there is no per-workload
+   expectation to maintain.  A window whose final entry cannot supply
+   the oracle is retried at a different stop, and a sweep that never
+   finds one fails rather than passing vacuously.  All four ISAs.  The
+   same assertion runs inside ``validate()`` as
+   ``segment_final_memops``, where it is silent on traces that close
+   at the guest's exit.
 ``features.wrong_path_coverage``
    ``static_templates=1`` fall-through / BTB coverage oracle across
    all four ISAs (minted-alternate blocks, deepened by

@@ -226,8 +226,11 @@ void PathBuilder::on_segment_open()
  * the last-executed fragment (matched by the scoreboard's @prev_start),
  * same as the per-exec seal walk; no later CP step will fire after
  * shutdown, so this is the only chance to flush the trailing chain.
+ * @walk_prev is false on the deferred window close, whose slot holds the
+ * TB about to dispatch rather than one that has run (see the
+ * declaration); the in-flight chain is finalized either way.
  */
-void PathBuilder::flush_final()
+void PathBuilder::flush_final(bool walk_prev)
 {
     BodyStreamState *out_stream = g_trace_segments.body_stream();
     /* This builder's own vCPU (recorded at the lazy event-queue enable;
@@ -243,7 +246,8 @@ void PathBuilder::flush_final()
     std::vector<BBTemplate *> finalized;
     if (out_stream && prev_start != 0) {
         g_mutex_lock(&data_lock);
-        for (BBTemplate *frag = prev_tb_; frag != nullptr;
+        for (BBTemplate *frag = walk_prev ? prev_tb_ : nullptr;
+             frag != nullptr;
              frag = frag->next_tb_fragment) {
             bool is_last_executed = (frag->start_pc == prev_start);
 
@@ -326,6 +330,11 @@ void PathBuilder::flush_final()
 void path_builder_flush_final()
 {
     path_builder_tls().flush_final();
+}
+
+void path_builder_flush_final_chain_only()
+{
+    path_builder_tls().flush_final(/* walk_prev= */ false);
 }
 
 /*

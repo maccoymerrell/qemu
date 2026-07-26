@@ -142,6 +142,7 @@ FEATURES: dict[str, str] = {
     "behavior:wire_determinism": "byte-for-byte reproducible wire (golden net)",
     "behavior:mutation_strictness": "oracle catches deliberate trace corruption (mutation matrix)",
     "behavior:wrong_path_coverage": "static_templates=1: minted-alternate never-executed fall-through + BTB target coverage, deepened by static_depth (4-ISA)",
+    "behavior:segment_final_memops": "the segment's last body entry carries its memory operands, matching the earlier executions of the same true BB (the deferred icount/simpoint window close emits it after it has run, not before)",
     "behavior:smc_revisions": "self-modifying code: correct-path template-revision minting for rewrites that preserve OR change the block's instruction boundaries, content-signature id reuse, and the per-pc revision cap (4-ISA)",
 }
 
@@ -784,6 +785,148 @@ def _chk_options_smoke(ctx: Ctx) -> Outcome:
                    f"audit[{asum}] strict_rc={src_rc}", subs)
 
 
+_SEG_CLOSE_RE = re.compile(
+    r"finished segment \[icount (\d+) \.\. (\d+)\].*?"
+    r"actual_icount=(\d+).*?\b(OK|UNDER|END)\s*$")
+
+
+def _final_entry_memop_probe(cst: Path):
+    """Decode @cst and score the segment's LAST body entry against the
+    earlier executions of the same true BB.
+
+    Returns (verdict, detail) where verdict is one of:
+      "pass"        final entry's memop shape matches its peers
+      "drop"        peers all perform N>0 memops, the final entry performs
+                    fewer (the segment-close memop loss)
+      "unusable"    the final entry's template is a one-shot, has no static
+                    memop slot, or its memop shape varies across executions
+                    -- no invariant to assert, so the trace does not gate
+    """
+    from . import validator as V
+    _meta, templates, entries = \
+        V._load_decoder().decode_champsim_tracer(cst)
+    cp = list(entries)          # decode_champsim_tracer yields CP entries
+    if len(cp) < 3:                    # (WP blocks hang off e["wp_entries"])
+        return "unusable", f"only {len(cp)} CP entries"
+    by_id = {t["template_id"]: t for t in templates}
+    final = cp[-1]
+    tid = final.get("template_id")
+    tmpl = by_id.get(tid) or {}
+    slots = sum(1 for i in (tmpl.get("insns") or [])
+                if int(i.get("n_loads", 0)) or int(i.get("n_stores", 0)))
+    if slots == 0:
+        return "unusable", (f"final template {tid} has no static memop "
+                            f"slot ({tmpl.get('n_insns')} insns)")
+
+    def shape(e):
+        dps = e.get("dyn_params") or []
+        tally = {}
+        for dp in dps:
+            k = (int(getattr(dp, "insn_index", -1)),
+                 str(getattr(dp, "type_name", "")))
+            tally[k] = tally.get(k, 0) + 1
+        return (len(dps), tuple(sorted(tally.items())))
+
+    peers = [e for e in cp[:-1] if e.get("template_id") == tid]
+    if len(peers) < 2:
+        return "unusable", f"final template {tid} executes {len(peers)+1}x"
+    shapes = {shape(p) for p in peers}
+    if len(shapes) != 1:
+        return "unusable", (f"final template {tid} memop shape varies over "
+                            f"{len(peers)} executions")
+    want = shapes.pop()
+    if want[0] == 0:
+        return "unusable", (f"final template {tid} performs no memops "
+                            f"despite {slots} static slot(s)")
+    got = shape(final)
+    if got == want:
+        return "pass", (f"final entry (seq {final.get('seq_num')}, template "
+                        f"{tid}) carries {got[0]} memops == "
+                        f"{len(peers)} peer executions")
+    return "drop", (f"final entry (seq {final.get('seq_num')}, template "
+                    f"{tid}) carries {got[0]} memops but its {len(peers)} "
+                    f"peer executions all carry {want[0]}")
+
+
+def _chk_final_entry_memops(ctx: Ctx) -> Outcome:
+    """The segment's LAST body entry keeps its memory operands (4 ISAs).
+
+    Body entries are emitted one TB late — the seal walk emits the
+    *previous* TB's entry once its successor is known — so an entry
+    flushed on a path that runs BEFORE its instructions execute carries no
+    memops at all.  Exactly one entry per segment is exposed, and no
+    byte-level gate can see it: cst_audit's rollup reconciles the records
+    that ARE present, and the impossible-attribution lint only rejects a
+    memop on a memop-incapable slot, never a memop-capable slot with no
+    memop (which predication and zero-count REP make legal).
+
+    So this check reads the loss directly.  It forces a genuine deferred
+    window close (icount stop reached mid-run, plugin reports the segment
+    OK rather than UNDER/END), then requires the trace's final entry to
+    land on a true BB that (a) statically accesses memory and (b) has
+    executed before with an invariant memop shape -- and asserts the final
+    execution carries that same shape.  A window whose final entry cannot
+    supply that oracle is retried at a different stop; if no stop in the
+    sweep yields one, the check FAILS rather than passing vacuously.
+    """
+    from . import __main__ as M
+    from . import generator as G
+    subs: list = []
+    all_ok = True
+    for isa in ISA_ALL:
+        d = ctx.dir(f"feat_final_memops_{isa}")
+        cc = M.ISA_COMPILER.get(isa)
+        if not cc:
+            subs.append({"name": isa, "ok": True, "detail": "skip (no compiler)"})
+            continue
+        # Long-running so the icount window closes mid-flight; dense enough
+        # in load/store blocks that most stops land on a memop-carrying BB.
+        params = G.GenerateParams(seed=ctx.seed, isa=isa, num_diamonds=8,
+                                  hot_iters=4000)
+        src, _m = G.generate(params, d, f"fem_{isa}")
+        binp = d / f"fem_{isa}"
+        if subprocess.call([cc] + M.ISA_CFLAGS[isa] +
+                           ["-O1", str(src), "-o", str(binp)]) != 0:
+            subs.append({"name": isa, "ok": True, "detail": "skip (build failed)"})
+            continue
+        qemu = ctx.build_dir / f"qemu-{isa}"
+        verdict, detail, used_stop = "none", "no window closed OK", 0
+        for stop in (120000, 137000, 151000, 166000, 183000, 201000):
+            out = d / f"fem_{isa}_{stop}"
+            log = d / f"fem_{isa}_{stop}.log"
+            with open(log, "w") as f:
+                rc = subprocess.call(
+                    [str(qemu), "-plugin",
+                     f"{ctx.plugin},outfile={out},wpdepth=16,memdata=1,"
+                     f"regdata=1,trace_window=icount:start=0;stop={stop}",
+                     str(binp)], stdout=subprocess.DEVNULL, stderr=f)
+            cst = Path(f"{out}.cst")
+            if rc != 0 or not cst.is_file():
+                continue
+            close = ""
+            for line in log.read_text(errors="replace").splitlines():
+                m = _SEG_CLOSE_RE.search(line.strip())
+                if m:
+                    close = m.group(4)
+            if close != "OK":
+                # UNDER/END: the guest ended before the stop, so the close
+                # was the exit flush, not the deferred window close.
+                continue
+            v, det = _final_entry_memop_probe(cst)
+            used_stop = stop
+            if v in ("pass", "drop"):
+                verdict, detail = v, det
+                break
+            verdict, detail = v, det
+        ok = verdict == "pass"
+        all_ok = all_ok and ok
+        subs.append({"name": isa, "ok": ok,
+                     "detail": f"stop={used_stop} {verdict}: {detail}"})
+    return Outcome("pass" if all_ok else "fail",
+                   "segment-final body entry keeps its memops (4 ISAs, "
+                   "deferred icount-window close)", subs)
+
+
 def _static_cov_analyze(cst: Path):
     """Decode @cst and score the branch-alternate minting coverage oracle.
     Classifies every template executed vs never-executed by its profile
@@ -1183,6 +1326,11 @@ def build_checks() -> list:
     C.append(Check("features.wrong_path_coverage", "features",
                    "static_templates=1 fall-through/BTB coverage oracle (4-ISA)",
                    ["behavior:wrong_path_coverage"], _chk_static_coverage))
+    C.append(Check("features.final_entry_memops", "features",
+                   "segment-final body entry keeps its memops across a "
+                   "deferred icount-window close (4-ISA)",
+                   ["behavior:segment_final_memops", "opt:window_icount",
+                    "wire:BODY_TAG_ENTRY"], _chk_final_entry_memops))
     C.append(Check("features.smc", "features",
                    "self-modifying code: revision minting (shape-preserving "
                    "AND shape-changing) / id reuse / cap / discriminator "

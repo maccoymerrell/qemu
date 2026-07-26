@@ -691,9 +691,28 @@ load-bearing — under ``exec_lock``:
     TB twice (once via the segment-final flush, once as a later walk
     of the slot) while dropping the deferred previous TB's entry
     outright.  Deferring to the step tail lets the seal phase emit
-    the previous TB normally; the segment-final flush then drains
-    the pending-seal slot — the budget-crossing TB whose
-    instructions the window clock already counted — exactly once.
+    the previous TB normally.
+
+    The icount and simpoint closes defer once further, by a whole
+    step.  The window clock is bumped by a per-TB inline add at TB
+    *entry*, so the crossing that arms the close is observed with the
+    dispatching TB's instructions already counted — while that TB has
+    not run: the step has only just promoted it into the pending-seal
+    slot, its memory callbacks have not fired and its destination
+    registers have not been snapped.  A close taken at that step's
+    tail would flush that TB out of the slot ahead of its own
+    execution, against empty accumulators, and the segment's last body
+    entry would carry no memory operands and no register deltas.  The
+    first satisfied visit therefore only *arms*; the close runs at the
+    tail of the next step, by which time the budget-crossing TB has
+    executed and the ordinary seal walk has emitted it exactly like
+    every other entry — memops, register deltas, resolved terminal
+    branch, wrong path.  The slot at that point holds the *next*
+    dispatching TB, which the flush must not walk, so the deferred
+    window close passes ``flush_final(walk_prev=false)`` and finalizes
+    the in-flight chain only.  The closes the guest's own progress
+    raises — process exit, the END marker, the dead-latch sweep — all
+    fire on a TB that has run, and walk the slot as usual.
 
 **The seal walk** (``collect_finalized_bbs``; shared by the per-step
 seal, the fault-merge fold, and the segment-final flush) walks the
@@ -862,7 +881,17 @@ zeroes and re-primes lazily, and the mute window closes.
 ``flush_final`` is the segment-finish counterpart: it drains the
 pending-seal slot through the same fragment walk (including the
 delay-slot tail snaps) so the segment's last TB is not lost to the
-one-step deferral.
+one-step deferral.  The walk applies only when the slot holds a TB
+that has *run* — which is every close raised by the guest's own
+progress, the case the flush exists for, since the slot's TB executed
+up to the scoreboard's last-executed fragment and its memops and dst
+snaps are waiting in the thread's accumulators for a successor step
+that will never come.  The deferred icount / simpoint window close
+instead fires at a step tail, where the slot holds the TB about to
+dispatch, and passes ``walk_prev=false`` so nothing is emitted ahead
+of its own execution; that close waits a step precisely so the
+budget-crossing TB seals normally first (step 6 above).  Either way
+the in-flight chain is finalized.
 
 .. _template-lifetimes:
 

@@ -1311,6 +1311,99 @@ def _check_memop_count_assertions(
     return issues
 
 
+def _check_segment_final_memops(
+        cp_entries: list[dict],
+        templates_by_id: dict[int, dict]) -> list[Issue]:
+    """The segment's LAST body entry carries its memory operands, exactly
+    like every other execution of the same true BB.
+
+    A body entry's memops are drained from the per-thread accumulator when
+    the entry is emitted, and emission is deferred by one TB — so an entry
+    flushed on a path that runs *before* its instructions execute carries
+    no memop records at all.  The loss is confined to one entry per
+    segment and is invisible to every byte-level gate: the audit's
+    byte-rollup partitions the records that ARE present (a record never
+    written contributes nothing to reconcile), and the impossible-
+    attribution lint only rejects a memop landing on a memop-incapable
+    slot — never the converse, because an instruction with static memop
+    slots legitimately producing no access is normal (predication, a
+    zero-count REP, a suppressed fault).
+
+    The oracle here is the trace's own repetition.  The final entry's
+    template is looked up among the entries before it; when every earlier
+    execution of that same template agrees on how many memops it performs
+    and on which instruction slots perform them, that agreement is this
+    template's invariant and the final execution must satisfy it too.
+    Self-calibrating (no per-workload expectation to keep in sync) and
+    silent when the final template is a one-shot or genuinely variable.
+    """
+    if len(cp_entries) < 3:
+        return [Issue("segment_final_memops", "info",
+                      "fewer than 3 CP entries; no final-entry oracle")]
+    final = cp_entries[-1]
+    tid = final.get("template_id")
+    peers = [e for e in cp_entries[:-1] if e.get("template_id") == tid]
+    tmpl = templates_by_id.get(tid) or {}
+    tmpl_insns = tmpl.get("insns") or []
+    static_memop_slots = sum(
+        1 for i in tmpl_insns
+        if int(i.get("n_loads", 0)) or int(i.get("n_stores", 0)))
+
+    def shape(e: dict) -> tuple:
+        """(count, sorted per-instruction load/store tally) — the part of
+        an execution's memop set that a template repeats verbatim.  The
+        ADDRESSES legitimately move between executions (a striding loop);
+        which instruction accesses memory, and how often, does not."""
+        dps = e.get("dyn_params") or []
+        tally: dict[tuple, int] = {}
+        for dp in dps:
+            key = (int(getattr(dp, "insn_index", -1)),
+                   str(getattr(dp, "type_name", "")))
+            tally[key] = tally.get(key, 0) + 1
+        return (len(dps), tuple(sorted(tally.items())))
+
+    if len(peers) < 2:
+        return [Issue("segment_final_memops", "info",
+                      f"final entry's template {tid} executes "
+                      f"{len(peers) + 1}x; no repetition oracle "
+                      f"(static memop slots={static_memop_slots})")]
+    peer_shapes = {shape(p) for p in peers}
+    if len(peer_shapes) != 1:
+        return [Issue("segment_final_memops", "info",
+                      f"final entry's template {tid} has a variable memop "
+                      f"shape across {len(peers)} earlier executions; "
+                      f"no invariant to assert")]
+    want = peer_shapes.pop()
+    if want[0] == 0:
+        return [Issue("segment_final_memops", "info",
+                      f"final entry's template {tid} performs no memops "
+                      f"(static memop slots={static_memop_slots})")]
+    got = shape(final)
+    if got != want:
+        return [Issue(
+            "segment_final_memops", "error",
+            f"segment's final body entry (seq {final.get('seq_num')}, "
+            f"template {tid}) carries {got[0]} memops, but all "
+            f"{len(peers)} earlier executions of that template carry "
+            f"{want[0]} — the final entry's memory operands were dropped",
+            {"template_id": tid,
+             "final_seq": final.get("seq_num"),
+             "final_memops": got[0],
+             "expected_memops": want[0],
+             "peer_executions": len(peers),
+             "static_memop_slots": static_memop_slots,
+             "final_shape": [list(k) + [v] for k, v in got[1]],
+             "expected_shape": [list(k) + [v] for k, v in want[1]]},
+        )]
+    return [Issue(
+        "segment_final_memops", "info",
+        f"segment's final body entry carries its {want[0]} memops "
+        f"(template {tid}, matched against {len(peers)} earlier "
+        f"executions)",
+        {"template_id": tid, "memops": want[0],
+         "peer_executions": len(peers)})]
+
+
 def _check_per_execution_memop_data(
         entries: list[dict],
         template_runs: dict[int, list[tuple[int, int]]],
@@ -6992,6 +7085,8 @@ def validate(meta_path: Path, trace_path: Path,
             cp_entries, template_runs, blocks_by_id,
             cp_set, arena_addr, arena_size,
             meta.get("isa", "x86_64"))
+
+    issues += _check_segment_final_memops(cp_entries, templates_by_id)
 
     isa = meta.get("isa", "x86_64")
 

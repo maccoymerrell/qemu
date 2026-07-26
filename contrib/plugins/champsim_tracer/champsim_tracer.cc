@@ -1785,6 +1785,26 @@ thread_local bool g_icount_shutdown_pending = false;
  * or never triggered the bump in the first place. */
 thread_local bool g_simpoint_close_pending = false;
 
+/* One-step arm shared by both deferred window closes.  The crossing is
+ * detected at TB-START with the dispatching TB's instructions already
+ * folded into icount, so that TB must be emitted for the trace to cover
+ * the requested window — but at the tail of the step that detects the
+ * crossing it has not RUN yet: step_events has only just promoted it into
+ * the pending-seal slot, its memory callbacks have not fired, and its dst
+ * registers have not been snapped.  Closing there emitted it through
+ * flush_final against empty accumulators, which is how the segment's last
+ * body entry came to carry no memop records and no register deltas at all
+ * (the "CP reg-snap slice dropped" counter reads 1 per segment).
+ *
+ * So the first satisfied visit only arms; the close runs at the tail of
+ * the NEXT step, by which time that TB has executed and the ordinary seal
+ * walk has emitted it exactly like every other entry — memops, register
+ * deltas, resolved terminal branch, wrong path.  The now-pending slot at
+ * that point is the next dispatching TB, which flush_final must not walk
+ * (path_builder_flush_final_chain_only).  Cleared at segment open and
+ * whenever the pending condition lapses. */
+thread_local bool g_window_close_armed = false;
+
 /* Next icount threshold above which vcpu_tb_exec MUST take the slow
  * path (acquire exec_lock and call tw_manage_window).  Below this
  * threshold the callback is allowed to just bump the per-vCPU icount
@@ -2298,6 +2318,9 @@ static void reset_segment_local_state(void)
     g_cp_chain.reset();
     g_mem_recorder.clear_cp();
     pending_reg_snaps.clear();
+    /* A fresh window is never mid-close (the arm self-clears the moment
+     * neither close is pending, so this is belt-and-braces). */
+    g_window_close_armed = false;
 
     /* Per-segment disk-I/O record state: request ids are compact and
      * monotonic WITHIN a segment, so the counter, the pending queues,
@@ -3296,8 +3319,14 @@ static inline BBTemplate *cp_chain_finalize_if_complete(void)
 /*
  * Finalize and write the current trace segment.  Must be called with
  * exec_lock held.
+ *
+ * @prev_executed says whether the calling thread's pending-seal slot
+ * holds a TB that has run (see PathBuilder::flush_final).  Every close
+ * the guest's own progress raises — process exit, END marker, dead-latch
+ * sweep — closes on a TB that executed; only the deferred icount /
+ * simpoint window close fires on a freshly promoted, not-yet-run TB.
  */
-static void finish_trace_segment(void)
+static void finish_trace_segment(bool prev_executed = true)
 {
     uint64_t lo = g_trace_segments.window_start();
     uint64_t hi = g_trace_segments.window_stop();
@@ -3313,7 +3342,9 @@ static void finish_trace_segment(void)
      * one or more times, which bumps g_seg_arch_insns — so we print
      * the per-segment stats AFTER finish() returns so the counter
      * reflects the entire segment, including the trailing chain. */
-    g_trace_segments.finish(path_builder_flush_final);
+    g_trace_segments.finish(prev_executed
+                                ? path_builder_flush_final
+                                : path_builder_flush_final_chain_only);
 
     /* Actual icount at finish — must be >= window_stop for the
      * trace to be at-least-budget.  Underrun means we stopped
@@ -4136,9 +4167,12 @@ static void tw_manage_window(unsigned int cpu_index,
              * entry outright — the [body, head, head] duplicate-final-
              * entry corruption.  Defer to the same sealed-step tail the
              * icount window-stop uses: the seal phase first emits the
-             * deferred prev normally, then the tail's segment-final flush
-             * drains the pending-seal slot (the budget-crossing TB whose
-             * insns the clock already counted) exactly once. */
+             * deferred prev normally, and the close then waits one step
+             * more so the budget-crossing TB — whose insns the clock
+             * already counted, but which has not run at the tail that
+             * detects the crossing — executes and seals normally too,
+             * carrying its memops and register deltas (see
+             * g_window_close_armed). */
             g_icount_shutdown_pending = true;
         }
         if (g_window_mode == PluginConfig::WIN_SYMBOL &&
@@ -4529,15 +4563,35 @@ static std::atomic<bool> g_spec_flush_latched{false};
  * LEAST the requested window").  Caller holds exec_lock; the close paths
  * unlock it themselves before exit(0).  @pb is the calling thread's
  * builder (its pending-seal slot must be cleared on the simpoint close).
+ *
+ * The close also waits one step past the first boundary it could take, so
+ * the TB whose instruction count carried icount over window_stop is EMITTED
+ * BY THE ORDINARY SEAL — with its memops, its register deltas and its
+ * terminal branch — instead of being flushed out of the pending-seal slot
+ * before it has run (see g_window_close_armed).  The pending slot at the
+ * close therefore holds a TB that has not executed, and the flush skips it.
  */
 static void run_deferred_window_closes(PathBuilder &pb)
 {
+    if (!g_icount_shutdown_pending && !g_simpoint_close_pending) {
+        g_window_close_armed = false;
+        return;
+    }
+    /* Not at a BB boundary yet (or the segment already closed under us):
+     * hold the arm and let a later step take the close. */
+    if (g_cp_chain.has_active_chain() || !g_trace_segments.is_active()) {
+        return;
+    }
+    if (!g_window_close_armed) {
+        g_window_close_armed = true;
+        return;
+    }
+    g_window_close_armed = false;
+
     /* Deferred-exit on icount window-stop.  The trigger was set in
      * tw_manage_window when icount first crossed window_stop. */
-    if (g_icount_shutdown_pending &&
-        !g_cp_chain.has_active_chain() &&
-        g_trace_segments.is_active()) {
-        finish_trace_segment();
+    if (g_icount_shutdown_pending) {
+        finish_trace_segment(/* prev_executed= */ false);
         g_trace_segments.set_shutting_down();
         g_icount_shutdown_pending = false;
         /* No need to recompute_budget: we're exiting immediately and
@@ -4549,10 +4603,8 @@ static void run_deferred_window_closes(PathBuilder &pb)
     /* Simpoint analogue: finalize only after the chain has drained to a
      * BB boundary so the trace covers AT LEAST eff_stop - eff_start
      * (warmup + simulation) insns. */
-    if (g_simpoint_close_pending &&
-        !g_cp_chain.has_active_chain() &&
-        g_trace_segments.is_active()) {
-        finish_trace_segment();
+    if (g_simpoint_close_pending) {
+        finish_trace_segment(/* prev_executed= */ false);
         g_simpoints.advance();
         g_simpoint_close_pending = false;
         pb.clear_prev();

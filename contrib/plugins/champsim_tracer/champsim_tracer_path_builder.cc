@@ -17,6 +17,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <utility>
 
 #include "champsim_tracer_path_builder.h"
 #include "champsim_tracer_bb_chain_assembler.h"
@@ -62,6 +64,187 @@ static bool pb_depth_diag()
 {
     static const bool v = getenv("CST_DEPTH_DIAG") != nullptr;
     return v;
+}
+
+/*
+ * ---- CST_JUMP_DIAG: the syscall_fault_nesting oracle, raised ONLINE ----
+ *
+ * The offline oracle names a violating seq number long after the machinery
+ * state that produced it is gone.  Under the gate every emit is checked
+ * against the same rule (consecutive same-tid entries at the same privilege
+ * step by <= 1) at the instant of the emit, and a violation prints the depth
+ * pipeline's live state plus a ring of the preceding emits and seal steps —
+ * naming the code path that stamped the depth.  Off the gate the only cost
+ * is the mirror stores, which are plain thread-local writes on paths that
+ * already run.
+ */
+bool cst_jump_diag(void)
+{
+    static const bool v = getenv("CST_JUMP_DIAG") != nullptr;
+    return v;
+}
+
+static const char *dsrc_name(uint8_t s)
+{
+    switch (s) {
+    case CST_DSRC_PIPELINE:    return "pipeline";
+    case CST_DSRC_MERGE:       return "merge";
+    case CST_DSRC_MERGE_PLAIN: return "merge-plain";
+    case CST_DSRC_MERGE_ZERO:  return "merge-zero";
+    case CST_DSRC_UNWIND:      return "unwind-flush";
+    case CST_DSRC_FLUSH_FINAL: return "flush-final";
+    default:                   return "none";
+    }
+}
+
+static const char *pdsrc_name(uint8_t s)
+{
+    switch (s) {
+    case CST_PDSRC_SEAL:   return "seal";
+    case CST_PDSRC_RESUME: return "resume";
+    default:               return "none";
+    }
+}
+
+namespace {
+
+struct JumpEmitRec {
+    uint64_t seq, pc;
+    uint32_t tid, depth;
+    uint8_t  src, is_sys;
+    uint16_t n_anchors;
+};
+struct JumpStepRec {
+    uint64_t cur_pc, prev_pc;
+    uint32_t raw, inflight, async_cap, depth_next, prev_depth, walk_depth;
+    uint16_t frames, susp;
+    uint8_t  priv, pinned, pdsrc, wdsrc;
+    const char *tag;
+};
+constexpr size_t JD_RING = 32;
+
+}  /* namespace */
+
+/* Process-wide rings on the HEAP: the plugin is dlopen'd and the tracer's
+ * TLS block already all but fills glibc's static-TLS surplus, so a
+ * thread_local ring would fail the plugin load.  Every writer runs under
+ * exec_lock (which serialises the whole CP step), so one shared ring records
+ * the true global interleave — better evidence than per-thread rings.
+ * Deliberately never freed (immortal, like the tracer's other process-wide
+ * aggregates) so a teardown racing a late emit cannot touch freed storage. */
+static JumpEmitRec *g_jd_emits = nullptr;
+static size_t       g_jd_emit_n = 0;
+static JumpStepRec *g_jd_steps = nullptr;
+static size_t       g_jd_step_n = 0;
+/* Last emit per guest thread id, so the online check mirrors the oracle's
+ * per-tid (not per-vCPU) adjacency.  emit_body_entry runs under exec_lock,
+ * so a plain process-wide map is safe; immortal for the same reason. */
+static std::map<uint32_t, std::pair<uint32_t, int>> *g_jd_last_by_tid = nullptr;
+
+void cst_jump_diag_step(uint64_t cur_pc, uint64_t prev_pc, int priv,
+                        int pinned, const char *tag)
+{
+    if (!cst_jump_diag()) {
+        return;
+    }
+    if (!g_jd_steps) {
+        g_jd_steps = new JumpStepRec[JD_RING]();
+    }
+    JumpStepRec &r = g_jd_steps[g_jd_step_n % JD_RING];
+    g_jd_step_n++;
+    r.cur_pc = cur_pc;
+    r.prev_pc = prev_pc;
+    r.raw = g_dbg_raw_depth;
+    r.inflight = g_dbg_inflight;
+    r.async_cap = g_dbg_async_captured;
+    r.depth_next = g_dbg_depth_next;
+    r.prev_depth = g_dbg_prev_depth;
+    r.walk_depth = g_dbg_walk_depth;
+    r.frames = (uint16_t)g_dbg_frames;
+    r.susp = (uint16_t)g_dbg_susp;
+    r.priv = (uint8_t)priv;
+    r.pinned = (uint8_t)pinned;
+    r.pdsrc = g_dbg_prev_depth_src;
+    r.wdsrc = g_dbg_walk_depth_src;
+    r.tag = tag;
+}
+
+void cst_jump_diag_emit(uint64_t seq, uint32_t tid, uint64_t pc,
+                        uint32_t depth, int is_sys, size_t n_anchors)
+{
+    if (!cst_jump_diag()) {
+        return;
+    }
+    if (!g_jd_emits) {
+        g_jd_emits = new JumpEmitRec[JD_RING]();
+    }
+    if (!g_jd_last_by_tid) {
+        g_jd_last_by_tid = new std::map<uint32_t, std::pair<uint32_t, int>>();
+    }
+    auto it = g_jd_last_by_tid->find(tid);
+    bool viol = false;
+    const char *kind = "";
+    uint32_t pd = 0;
+    if (it != g_jd_last_by_tid->end()) {
+        pd = it->second.first;
+        const bool same_priv = (it->second.second == is_sys);
+        if (same_priv &&
+            (depth > pd ? depth - pd : pd - depth) > 1) {
+            viol = true;
+            kind = "JUMP";
+        }
+        if (n_anchors && pd <= depth) {
+            viol = true;
+            kind = kind[0] ? "JUMP+ANCHOR" : "ANCHOR";
+        }
+    }
+    JumpEmitRec &e = g_jd_emits[g_jd_emit_n % JD_RING];
+    g_jd_emit_n++;
+    e.seq = seq;
+    e.pc = pc;
+    e.tid = tid;
+    e.depth = depth;
+    e.src = g_dbg_depth_src;
+    e.is_sys = (uint8_t)is_sys;
+    e.n_anchors = (uint16_t)n_anchors;
+    (*g_jd_last_by_tid)[tid] = {depth, is_sys};
+
+    if (!viol) {
+        return;
+    }
+    fprintf(stderr,
+            "\n[jumpdiag] *** %s seq=%" PRIu64 " tid=%u pc=0x%" PRIx64
+            " sys=%d depth %u -> %u src=%s nanchor=%zu\n"
+            "[jumpdiag]     live: raw=%u inflight=%u async=%u depth_next=%u"
+            " prev_depth=%u(%s) walk_depth=%u(%s) frames=%zu susp=%zu\n",
+            kind, seq, tid, pc, is_sys, pd, depth,
+            dsrc_name(g_dbg_depth_src), n_anchors,
+            g_dbg_raw_depth, g_dbg_inflight, g_dbg_async_captured,
+            g_dbg_depth_next, g_dbg_prev_depth,
+            pdsrc_name(g_dbg_prev_depth_src), g_dbg_walk_depth,
+            pdsrc_name(g_dbg_walk_depth_src), g_dbg_frames, g_dbg_susp);
+    size_t n = g_jd_emit_n < JD_RING ? g_jd_emit_n : JD_RING;
+    for (size_t i = 0; i < n; i++) {
+        const JumpEmitRec &r =
+            g_jd_emits[(g_jd_emit_n - n + i) % JD_RING];
+        fprintf(stderr, "[jumpdiag]   emit[-%02zu] seq=%" PRIu64 " tid=%u "
+                "d=%u sys=%u anch=%u pc=0x%" PRIx64 " src=%s\n",
+                n - 1 - i, r.seq, r.tid, r.depth, r.is_sys, r.n_anchors,
+                r.pc, dsrc_name(r.src));
+    }
+    size_t m = g_jd_step_n < JD_RING ? g_jd_step_n : JD_RING;
+    for (size_t i = 0; i < m; i++) {
+        const JumpStepRec &r =
+            g_jd_steps[(g_jd_step_n - m + i) % JD_RING];
+        fprintf(stderr, "[jumpdiag]   step[-%02zu] %-16s cur=0x%" PRIx64
+                " prev=0x%" PRIx64 " priv=%u pin=%u raw=%u infl=%u async=%u "
+                "next=%u prev_d=%u(%s) walk_d=%u(%s) frames=%u susp=%u\n",
+                m - 1 - i, r.tag ? r.tag : "?", r.cur_pc, r.prev_pc,
+                r.priv, r.pinned, r.raw, r.inflight, r.async_cap,
+                r.depth_next, r.prev_depth, pdsrc_name(r.pdsrc),
+                r.walk_depth, pdsrc_name(r.wdsrc), r.frames, r.susp);
+    }
+    fflush(stderr);
 }
 
 PathBuilder &path_builder_tls()
@@ -756,6 +939,8 @@ void PathBuilder::classify_fault_enter(const struct qemu_plugin_cpu_event &ev,
         g_mutex_lock(&data_lock);
         g_cp_chain.reset();
         g_mutex_unlock(&data_lock);
+        cst_jump_diag_step(resume, walk_prev_->start_pc, (int)ev.priv, 1,
+                           "fault-enter(a)");
         collect_piece(frames_[(size_t)cont], resume);
         frames_[(size_t)cont].returned = false;   /* back in flight */
         *prev_stashed = true;
@@ -770,6 +955,8 @@ void PathBuilder::classify_fault_enter(const struct qemu_plugin_cpu_event &ev,
         /* The depth the faulting BB ran at: prev's promote-time stamp
          * (NOT this event's depth_after, which is post-entry). */
         f.depth = walk_depth_;
+        cst_jump_diag_step(resume, walk_prev_->start_pc, (int)ev.priv, 1,
+                           "fault-enter(b)");
         collect_piece(f, resume);
         *prev_stashed = true;
         return;
@@ -788,6 +975,8 @@ void PathBuilder::apply_fault_return(const struct qemu_plugin_cpu_event &ev)
     if (idx >= 0) {
         frames_[(size_t)idx].returned = true;
     }
+    cst_jump_diag_step(ev.pc, 0, (int)ev.priv, (int)(idx >= 0),
+                       idx >= 0 ? "fault-return" : "fault-return/nomatch");
     if (pb_diag()) {
         fprintf(stderr, "[pathbuilder] RET resume=0x%" PRIx64 " depth=%u "
                 "frame=%td\n", ev.pc, ev.depth_after, idx);
@@ -1087,6 +1276,8 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
      * next surviving seal). */
     walk_prev_ = prev_tb_;
     walk_depth_ = prev_depth_;
+    g_dbg_walk_depth = walk_depth_;
+    g_dbg_walk_depth_src = g_dbg_prev_depth_src;
     walk_in_sync_ = prev_in_sync_;
     set_prev(in.cur);
     /* Record cur's owning (thread,asid) so a later foreign span that
@@ -1161,6 +1352,7 @@ PathBuilder::complete_merge(size_t idx,
             g_mutex_unlock(&data_lock);
         }
         g_emit_fault_depth = 0;
+        g_dbg_depth_src = CST_DSRC_MERGE_ZERO;
         g_emit_fault_anchors.clear();
         BBTemplate *merged0 = f0.full_tmpl;
         uint64_t merge_wrong0 = pb_no_fault_wp() ? 0 : pe0.wrong_target;
@@ -1299,9 +1491,11 @@ PathBuilder::complete_merge(size_t idx,
      * predecessor, in which case g_last_emit is deep and the anchor stays. */
     if (g_last_emit_fault_depth > f.depth) {
         g_emit_fault_depth = f.depth;
+        g_dbg_depth_src = CST_DSRC_MERGE;
         g_emit_fault_anchors = f.anchors;
     } else {
         g_emit_fault_depth = g_last_emit_fault_depth;
+        g_dbg_depth_src = CST_DSRC_MERGE_PLAIN;
         g_emit_fault_anchors.clear();
         if (pb_diag() || pb_susp_diag()) {
             fprintf(stderr, "[pathbuilder] MERGE-DEANCHOR full=0x%" PRIx64
@@ -1375,6 +1569,7 @@ void PathBuilder::flush_frame_unwound(size_t idx, BodyStreamState *out_stream,
     g_mem_recorder.prepend_cp(f.mem);
     pending_reg_snaps = f.snaps;
     g_emit_fault_depth = f.depth;
+    g_dbg_depth_src = CST_DSRC_UNWIND;
     g_emit_fault_anchors = f.anchors;
 
     if (pb_diag() || pb_depth_diag()) {
@@ -1458,6 +1653,8 @@ void PathBuilder::suspend_prev(uint64_t owner_asid, uint64_t owner_live,
     pending_reg_snaps.clear();
     s.chain = g_cp_chain.detach_state();
     g_stats.susp_pushed++;
+    g_dbg_susp = susp_stack_.size();
+    cst_jump_diag_step(0, s.prev ? s.prev->start_pc : 0, -1, 1, "SUSPEND");
     if (pb_diag() || pb_susp_diag()) {
         fprintf(stderr, "[pathbuilder] SUSPEND prev=0x%" PRIx64 " depth=%u "
                 "asid=0x%" PRIx64 " live=0x%" PRIx64 " nmem=%zu nsnaps=%zu "
@@ -1495,6 +1692,8 @@ bool PathBuilder::resume_suspension(uint64_t resume_asid, uint64_t resume_live)
         }
         prev_tb_ = s.prev;                       /* re-arm the pending seal */
         prev_depth_ = s.depth;
+        g_dbg_prev_depth_src = CST_PDSRC_RESUME;
+        g_dbg_prev_depth = prev_depth_;
         prev_owner_asid_ = s.asid;
         prev_owner_live_ = s.owner_live;
         g_mem_recorder.prepend_cp(s.mem);        /* restore committed memops */
@@ -1503,6 +1702,8 @@ bool PathBuilder::resume_suspension(uint64_t resume_asid, uint64_t resume_live)
                                      s.snaps.begin(), s.snaps.end());
         }
         g_cp_chain.attach_state(std::move(s.chain));
+        cst_jump_diag_step(0, prev_tb_ ? prev_tb_->start_pc : 0, -1, 1,
+                           "RESUME");
         if (pb_diag() || pb_susp_diag()) {
             fprintf(stderr, "[pathbuilder] RESUME prev=0x%" PRIx64 " depth=%u "
                     "asid=0x%" PRIx64 " live=0x%" PRIx64 " stack=%zu\n",
@@ -1677,6 +1878,9 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
             for (CtxFrame &f : frames_) {
                 if (!f.returned) {
                     leaked++;
+                    cst_jump_diag_step(in.cur ? in.cur->start_pc : 0,
+                                       f.full_tmpl ? f.full_tmpl->start_pc : 0,
+                                       0, 1, "RETIRE-LEAK");
                     if (pb_diag()) {
                         fprintf(stderr, "[pathbuilder] RETIRE-LEAK user_tb=0x%"
                                 PRIx64 " frame full=0x%" PRIx64 " resume=0x%"
@@ -1743,6 +1947,12 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
          * captured async level.  async_captured_ is 0 with interrupts=0, so
          * the trailer is byte-identical to today there. */
         depth_next_ = pinned_inflight + async_captured_;
+        g_dbg_raw_depth = raw_depth_;
+        g_dbg_inflight = pinned_inflight;
+        g_dbg_async_captured = async_captured_;
+        g_dbg_depth_next = depth_next_;
+        g_dbg_frames = frames_.size();
+        g_dbg_susp = susp_stack_.size();
         /* Skip the pure user/steady-state (depth 0, no frames, prev depth 0)
          * UNLESS the current TB is a REP string op (rep_subtmpl), whose
          * fanned-out emit is the residual jump's locus: keep every step that
@@ -1780,6 +1990,8 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
      * per-vCPU stack cannot attribute frames per guest thread, an
      * accepted approximation. */
     prev_depth_ = (in.pinned && in.live_priv == 0) ? 0 : depth_next_;
+    g_dbg_prev_depth_src = CST_PDSRC_SEAL;
+    g_dbg_prev_depth = prev_depth_;
     /* Synchronous-fault-span stamp (faults=0 handler suppression): true when
      * cur runs while an un-returned synchronous-fault frame is in flight and
      * cur is not user code.  pinned_inflight == depth_next_ - async_captured_
@@ -1799,7 +2011,12 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
     }
     if (fault_on) {
         g_emit_fault_depth = walk_depth_;
+        g_dbg_depth_src = CST_DSRC_PIPELINE;
     }
+    cst_jump_diag_step(in.cur ? in.cur->start_pc : 0,
+                       walk_prev_ ? walk_prev_->start_pc : 0,
+                       in.live_priv, (int)in.pinned,
+                       prev_stashed ? "seal/STASHED" : "seal");
 
     if (prev_stashed) {
         /* prev was folded into a fault frame: nothing seals, and the

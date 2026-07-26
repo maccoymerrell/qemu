@@ -107,6 +107,58 @@ extern thread_local uint32_t g_emit_fault_depth CST_TLS_HOT;
  * deeper one); never write it elsewhere. */
 extern thread_local uint32_t g_last_emit_fault_depth;
 extern thread_local uint64_t g_dbg_last_emit_seq;
+
+/* ---- CST_JUMP_DIAG: online depth-step violation detector (diagnostic) ----
+ *
+ * The syscall_fault_nesting oracle is an OFFLINE check over the finished
+ * wire, so a violation names a seq number with no view of the machinery
+ * state that produced it.  These mirrors let emit_body_entry raise the same
+ * assertion ONLINE, at the instant of the emit, with the pipeline state and
+ * a ring of the preceding steps attached.  Every write is a plain store on
+ * a path that already runs; the reads happen only under the env gate.
+ * Control-flow inert: nothing here is consulted by the tracer's logic. */
+enum CstDepthSrc : uint8_t {
+    CST_DSRC_NONE = 0,
+    CST_DSRC_PIPELINE,       /* step_seal: g_emit_fault_depth = walk_depth_ */
+    CST_DSRC_MERGE,          /* complete_merge, anchored at f.depth         */
+    CST_DSRC_MERGE_PLAIN,    /* complete_merge, de-anchored to last_emit    */
+    CST_DSRC_MERGE_ZERO,     /* complete_merge deeper-frame flush at 0      */
+    CST_DSRC_UNWIND,         /* flush_frame_unwound at f.depth              */
+    CST_DSRC_FLUSH_FINAL,    /* segment-final flush                         */
+};
+/* Provenance of prev_depth_ / walk_depth_, so a restored suspension's frozen
+ * stamp is distinguishable from a freshly computed one. */
+enum CstPrevDepthSrc : uint8_t {
+    CST_PDSRC_NONE = 0,
+    CST_PDSRC_SEAL,          /* computed from frames_ at this step's seal   */
+    CST_PDSRC_RESUME,        /* restored from a SuspendedPrev's frozen stamp*/
+};
+/* PROCESS-WIDE, deliberately NOT thread_local.  The plugin is dlopen'd, so
+ * its whole TLS block comes out of glibc's static-TLS surplus (1664 B); the
+ * tracer already sits at ~1640 B, so ANY new thread_local fails the plugin
+ * load outright ("cannot allocate memory in static TLS block").  Correctness
+ * is unaffected: every writer runs inside vcpu_tb_exec under exec_lock, which
+ * serialises the CP step (including nested WP), so these are ordered exactly
+ * as the body stream they describe. */
+extern uint8_t  g_dbg_depth_src;
+extern uint8_t  g_dbg_prev_depth_src;
+extern uint8_t  g_dbg_walk_depth_src;
+extern uint32_t g_dbg_raw_depth;
+extern uint32_t g_dbg_inflight;
+extern uint32_t g_dbg_async_captured;
+extern uint32_t g_dbg_depth_next;
+extern uint32_t g_dbg_prev_depth;
+extern uint32_t g_dbg_walk_depth;
+extern size_t   g_dbg_frames;
+extern size_t   g_dbg_susp;
+
+bool cst_jump_diag(void);
+/* Record one seal-phase step into the ring (no-op unless gated). */
+void cst_jump_diag_step(uint64_t cur_pc, uint64_t prev_pc, int priv,
+                        int pinned, const char *tag);
+/* Raise the online assertion for an emit at @depth (no-op unless gated). */
+void cst_jump_diag_emit(uint64_t seq, uint32_t tid, uint64_t pc,
+                        uint32_t depth, int is_sys, size_t n_anchors);
 extern thread_local std::vector<uint32_t> g_emit_fault_anchors CST_TLS_HOT;
 extern thread_local std::vector<RegSnap> pending_reg_snaps CST_TLS_HOT;
 

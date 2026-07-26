@@ -1752,6 +1752,21 @@ thread_local uint32_t g_last_emit_fault_depth = 0;
  * this thread, so the per-step depth diag can be tied to a wire position. */
 thread_local uint64_t g_dbg_last_emit_seq = 0;
 
+/* CST_JUMP_DIAG mirrors (see champsim_tracer_path_builder.h): the depth
+ * pipeline's provenance, published so the online step-discipline assertion
+ * in emit_body_entry can name the code path that stamped the depth. */
+uint8_t  g_dbg_depth_src = CST_DSRC_NONE;
+uint8_t  g_dbg_prev_depth_src = CST_PDSRC_NONE;
+uint8_t  g_dbg_walk_depth_src = CST_PDSRC_NONE;
+uint32_t g_dbg_raw_depth = 0;
+uint32_t g_dbg_inflight = 0;
+uint32_t g_dbg_async_captured = 0;
+uint32_t g_dbg_depth_next = 0;
+uint32_t g_dbg_prev_depth = 0;
+uint32_t g_dbg_walk_depth = 0;
+size_t   g_dbg_frames = 0;
+size_t   g_dbg_susp = 0;
+
 /* Anchors (faulting-insn indices) for the whole-BB merge emit currently in
  * flight; read by emit_body_entry into the entry's fault trailer. */
 thread_local std::vector<uint32_t> g_emit_fault_anchors CST_TLS_HOT;
@@ -3058,6 +3073,13 @@ void emit_body_entry(BodyStreamState *out_stream,
      * derived from it at wire-emit time. */
     entry.branch_successor_pc    = branch_successor_pc;
     entry.branch_successor_known = branch_successor_known;
+
+    /* CST_JUMP_DIAG: raise the syscall_fault_nesting step/anchor discipline
+     * ONLINE, at the emit, with the depth pipeline's live state attached. */
+    cst_jump_diag_emit(entry.seq_num, entry.thread_id,
+                       bb_tmpl ? bb_tmpl->start_pc : 0, entry.fault_depth,
+                       bb_tmpl && bb_tmpl->is_system ? 1 : 0,
+                       entry.fault_anchors.size());
 
     g_mem_recorder.drain_cp_into_dyn_params(entry.dyn_params, bb_tmpl);
     /* Backstop for the positional reg-snap invariant.  The wire attributes

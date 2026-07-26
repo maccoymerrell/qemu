@@ -419,6 +419,7 @@ static uint8_t cap_lane_bytes_from_mnemonic(const char *mnem);
 static bool cap_x86_is_extract_store(const char *mnem);
 static bool cap_x86_is_move_family(const char *mnem);
 static bool cap_x86_is_test(const char *mnem);
+static bool cap_x86_is_string_store(const char *mnem);
 
 /*
  * Extract per-operand detail for x86 into the plugin operand struct.
@@ -473,6 +474,10 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
      * every TEST operand below.  Architecturally exact, and a no-op on
      * the encodings Capstone already reports correctly. */
     bool test_read = cap_x86_is_test(insn->mnemonic);
+    /* Capstone-6.0.0-Alpha7 bug: STOS reports its (%rdi) destination
+     * READ — see cap_x86_is_string_store.  Force WRITE on the MEM
+     * operand below. */
+    bool string_store = cap_x86_is_string_store(insn->mnemonic);
 
     for (uint8_t i = 0; i < n; i++) {
         const cs_x86_op *cop = &x86->operands[i];
@@ -528,9 +533,10 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
              * the access uses the default segment.
              */
             op->segment_id = cop->mem.segment;
-            /* Capstone-6.0.0-Alpha7 bug: the r/m destination of a
-             * store-form extract is the write target, not a read. */
-            if (extract_store || move_store) {
+            /* Capstone-6.0.0-Alpha7 bugs: the r/m destination of a
+             * store-form extract, and the (%rdi) destination of a STOS,
+             * are write targets, not reads. */
+            if (extract_store || move_store || string_store) {
                 op->access = QEMU_PLUGIN_OP_ACC_WRITE;
             }
             break;
@@ -651,6 +657,62 @@ static bool cap_x86_is_test(const char *mnem)
      * testl/testq.  Prefix-match — no other x86 mnemonic starts with
      * "test" (ktest/vptest begin with k/v). */
     return mnem && g_str_has_prefix(mnem, "test");
+}
+
+/*
+ * Capstone 6.0.0-Alpha7 x86 access-flag bug workaround: STOS.
+ *
+ * STOS writes the accumulator to ES:[rDI] -- its single MEM operand is
+ * a pure store target.  This Capstone version reports it CS_AC_READ, at
+ * every operand size and with or without a REP prefix:
+ *
+ *   f3 48 ab   rep stosq %rax,(%rdi)   op0 MEM base=rdi access=READ  <-- WRONG
+ *   48 ab      stosq %rax,(%rdi)       op0 MEM base=rdi access=READ  <-- WRONG
+ *   aa/ab/66 ab  stosb/stosl/stosw     op0 MEM base=rdi access=READ  <-- WRONG
+ *
+ * The direction is simply inverted, so the operand walker mints a load
+ * slot instead of a store slot: the dependency model attributes a
+ * memset's traffic to the LOAD lane, and the REP per-iteration memop
+ * split counts it as rep_loads_per_iter rather than rep_stores_per_iter.
+ * (The emitted memop record itself is a correct STORE -- it comes from
+ * QEMU's memory callbacks, not from Capstone -- so only the operand /
+ * lane model was wrong; PIN and this tracer agree 100% on store counts
+ * and addresses.)  The sibling string ops are reported correctly:
+ * MOVS gives op0 (%rsi) READ + op1 (%rdi) WRITE, SCAS and LODS give
+ * their MEM operand READ.
+ *
+ * Detect by mnemonic -- no other x86 mnemonic starts with "stos" -- and
+ * force WRITE on the MEM operand.  Revisit / remove when Capstone is
+ * bumped past 6.0.0-Alpha7.
+ *
+ * Adjacent, deliberately NOT corrected here because their access is
+ * reported as 0 ("unknown") rather than inverted, which the operand
+ * walker already treats as "no access info" instead of as a wrong
+ * direction: CMPS reports both MEM operands access=0, and INS / OUTS
+ * report their MEM operand access=0.  Worth reporting upstream in the
+ * same bug, but they need a different correction (synthesising the
+ * missing accesses) and none of them appears in the cross-validated
+ * spans.
+ */
+static bool cap_x86_is_string_store(const char *mnem)
+{
+    if (!mnem) {
+        return false;
+    }
+    /* Capstone folds the repeat prefix INTO the mnemonic string
+     * ("rep stosq", "repne scasb") rather than leaving it to the
+     * prefix[] array alone, so step over it before matching. */
+    const char *sp = strchr(mnem, ' ');
+    if (sp && (g_str_has_prefix(mnem, "rep ") ||
+               g_str_has_prefix(mnem, "repe ") ||
+               g_str_has_prefix(mnem, "repz ") ||
+               g_str_has_prefix(mnem, "repne ") ||
+               g_str_has_prefix(mnem, "repnz "))) {
+        mnem = sp + 1;
+    }
+    /* AT&T syntax (QEMU's) size-suffixes the mnemonic: stosb/stosw/
+     * stosl/stosq.  No other x86 mnemonic starts with "stos". */
+    return g_str_has_prefix(mnem, "stos");
 }
 
 /*

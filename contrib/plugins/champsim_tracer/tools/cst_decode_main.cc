@@ -845,6 +845,14 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
      * filter out the immediate from the default. */
     uint64_t src_bits_mask = (n_src == 64) ? ~(uint64_t)0
                                            : (((uint64_t)1 << n_src) - 1);
+
+    /* Load slots occupy pool bits [n_src, n_src + max_dep_loads); shift
+     * them down to slot indices for the caller.  n_src saturates at
+     * MAX_SRC_REGS (64), where the shift would be undefined and no load
+     * slot can be addressed anyway. */
+    auto shift_out = [&](uint64_t m) -> uint64_t {
+        return n_src >= 64 ? 0 : (m >> n_src);
+    };
     addr_only_srcs &= src_bits_mask;
 
     uint64_t all_inputs = 0;
@@ -1013,10 +1021,10 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
             line.append(inputs[i]);
             if (i < 64) placed |= ((uint64_t)1 << i);
         }
-        if (out_placed_loads) *out_placed_loads = placed >> n_src;
+        if (out_placed_loads) *out_placed_loads = shift_out(placed);
         return any;
     }
-    if (out_placed_loads) *out_placed_loads = placed >> n_src;
+    if (out_placed_loads) *out_placed_loads = shift_out(placed);
     return true;
 }
 

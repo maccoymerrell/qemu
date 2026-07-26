@@ -875,6 +875,25 @@ Disassembly and target metadata
      ``cap_fill_x86_operands`` forces plain ``READ`` on every
      ``TEST`` operand, which is what the architecture says and so
      cannot disturb the correctly-reported encodings.
+   * x86 ``STOS``.  ``STOS`` writes the accumulator to ``ES:[rDI]``;
+     Capstone reports that memory operand ``READ``, at every operand
+     size and with or without a ``REP`` prefix.  The direction is
+     simply inverted, so the operand walker mints a load slot where
+     a store belongs: a ``memset``'s traffic lands in the dependency
+     model's load lane, and the REP per-iteration split counts it as
+     ``rep_loads_per_iter`` instead of ``rep_stores_per_iter``.  (The
+     memop records themselves come from QEMU's memory callbacks, not
+     from Capstone, and were always correct stores — PIN and the
+     tracer agree 100 % on store counts and addresses.)  The same
+     filler forces ``WRITE`` on the memory operand; note Capstone
+     folds the repeat prefix into the mnemonic string
+     (``"rep stosq"``), which ``cap_x86_is_string_store`` steps over.
+     The sibling string ops are reported correctly (``MOVS`` gives
+     ``READ`` + ``WRITE``, ``SCAS`` / ``LODS`` give ``READ``).
+     ``CMPS`` and ``INS`` / ``OUTS`` report ``access == 0`` — the
+     same upstream bug family, but "unknown" rather than inverted, so
+     the walker already treats them as carrying no access info; they
+     are left alone pending a Capstone fix.
    * MIPS memory access flags.  MSA vector loads/stores and the
      unaligned scalar family (``LWL`` / ``LWR`` / ``LDL`` / ``LDR``
      / ``SWL`` / ``SWR`` / ``SDL`` / ``SDR``) report their memory

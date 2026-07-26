@@ -996,7 +996,18 @@ static WpStep wp_handle_fault_fragment(WpWalkState &st, BBTemplate *cur,
                      * block we are about to commit.
                      */
                     qemu_plugin_spec_clear_exception();
-                    if (n_executed_in_cur > 0) {
+                    /* Same exemption as the direct-match path below: a
+                     * syscall-class instruction raises every time by design, so
+                     * poisoning it would kill the excursion the second time
+                     * speculation reached the same syscall.  AArch64 lands
+                     * here rather than there -- SVC raises with ELR already at
+                     * SVC+4 -- so without this the exemption would cover every
+                     * ISA but the one whose kernel entry is most common. */
+                    bool syscall_class_raiser =
+                        n_executed_in_cur > 0 &&
+                        cur->insn_fields[n_executed_in_cur - 1].branch_type
+                            == BRANCH_SYSCALL_TYPE;
+                    if (n_executed_in_cur > 0 && !syscall_class_raiser) {
                         poisoned_targets.insert(
                             cur->insn_pcs[n_executed_in_cur - 1]);
                     }
@@ -1025,17 +1036,25 @@ static WpStep wp_handle_fault_fragment(WpWalkState &st, BBTemplate *cur,
                         bb_complete = true;
                         awaiting_delay_slot = false;
                     } else {
+                        /* Mid-BB: resume where the unwind already left the PC.
+                         * @skip_pc would be wrong here -- it is built for the
+                         * direct match, where the PC sits ON the raising insn
+                         * and one instruction length has to be added to step
+                         * over it.  In a post-completion match that step has
+                         * already happened, so adding it again would skip the
+                         * instruction AFTER the raiser, silently dropping it
+                         * from the wrong path. */
                         if (repeated_fault_pc >= 16) {
                             early_exit = true;
                             walk_done = true;
                             return WpStep::BREAK_WALK;
                         }
-                        if (poisoned_targets.count(skip_pc)) {
+                        if (poisoned_targets.count(fault_pc)) {
                             early_exit = true;
                             walk_done = true;
                             return WpStep::BREAK_WALK;
                         }
-                        qemu_plugin_set_pc(skip_pc);
+                        qemu_plugin_set_pc(fault_pc);
                         walk_done = true;
                         return WpStep::BREAK_WALK;
                     }

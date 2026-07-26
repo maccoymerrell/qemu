@@ -1486,6 +1486,14 @@ interrupt handler — that detoured execution at that nesting level.
 User-privilege entries always carry depth ``0``: user code is never handler
 content.
 
+The nesting is a property of the entry's own ``thread_id``.  Concurrent
+threads detour independently, so a consumer reads the depth column per
+thread: within one thread's entries the depth steps one level at a time,
+into a handler and back out of it, while a peer thread scheduled onto the
+same core during that excursion carries its own — normally ``0`` — depth.
+Interleaving two threads' entries and reading the column as a single stack
+is a consumer error, not a wire property.
+
 ``n_anchors`` / ``anchor`` mark a *faulting basic block reassembled whole*.
 When a synchronous fault interrupts a block mid-flight, the plugin merges
 the block's pre-fault prefix and its post-return suffix back into one

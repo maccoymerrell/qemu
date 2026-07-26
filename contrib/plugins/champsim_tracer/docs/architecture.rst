@@ -835,9 +835,9 @@ shutdown / active / segment-boundary gates) applies the retained
 fault events exactly once, then runs the shared seal walk:
 
 * **Depth pipeline.**  The fault-trailer depth the current TB runs at
-  is the count of the pinned process's *own* un-returned merge frames
-  — the live entries in ``frames_``.  It is deliberately **not**
-  derived from the per-vCPU ``plugin_fault_depth``.  That stack is a
+  is the count of un-returned merge frames — the live entries in
+  ``frames_`` — that the *executing guest thread itself* entered.  It is
+  deliberately **not** derived from the per-vCPU ``plugin_fault_depth``.  That stack is a
   single object shared by every guest process, and under multi-process
   churn it interleaves the pinned process's frames with a busy boot's
   leaked frames (a non-LIFO guest exception return — a context switch
@@ -865,6 +865,30 @@ fault events exactly once, then runs the shared seal walk:
   of the count immediately even though its merge completion (the resume
   suffix's seal) is still pending.  ``raw_depth_`` tracks the last
   event's ``depth_after`` for the ``CST_DEPTH_DIAG`` log only.
+
+  **Frames are owned per guest thread.**  ``frames_`` is per-vCPU, and a
+  vCPU multiplexes guest threads, so the ledger alone cannot say whose
+  excursion a frame is: a thread the guest scheduler puts on this vCPU
+  while a *peer* thread sits inside a fault handler would inherit the
+  peer's nesting, and would step back down to its own level — with no
+  unwind in between — the moment it was rescheduled after the peer's
+  return.  Each ``CtxFrame`` therefore records the guest thread that
+  entered the excursion (``CtxFrame::tid``, the identity the faulting
+  block itself is emitted with), and three places consult it: the depth
+  stamp counts only the executing thread's own frames, the pinned-user
+  leak sweep retires only the frames of the thread whose user code proves
+  it is at depth ``0``, and a merge completion's deeper-frame unwind
+  skips frames a peer put above it on the ledger — those nest
+  concurrently, not inside.  This is what ``fault_depth`` is defined to
+  mean (:doc:`format` §4.2a): the depth *this* basic block executed at.  A thread that *migrates* across vCPUs mid-excursion
+  leaves its frames behind on the vacated vCPU and is counted at depth
+  ``0`` on the new one — the documented single-core-pin scope boundary,
+  the same one the migration warning names; ownership prevents a thread
+  from inheriting a stranger's depth, it does not move an excursion
+  between ledgers.  Where the target cannot sample the thread pointer at
+  kernel privilege (RISC-V), kernel code inherits the entering thread's
+  identity and its frames with it — the KERNEL-STRAND degradation
+  described in :doc:`limitations`, unchanged here.
 
   The stamp is taken **twice per seal**, because the seal moves
   ``frames_`` twice: the event drain at its head pushes new frames and

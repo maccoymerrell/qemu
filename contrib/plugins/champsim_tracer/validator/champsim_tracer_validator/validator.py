@@ -5579,12 +5579,25 @@ def _check_syscall_fault_nesting(entries: list[dict],
         # A fault-anchored entry is the whole-BB merge of the block the
         # excursion interrupted, so it must sit at the unwind: the same
         # tid's previous entry ran one level deeper (inside the fault
-        # handler this merge is returning from).  Multi-thread traces
-        # interleave guest threads on one vCPU, so the same-tid
-        # predecessor may be an unrelated thread's entry — the unwind
-        # adjacency only holds single-threaded.
-        if (guest_threads <= 1 and
-                e.get("fault_anchors") and pd is not None and pd <= d):
+        # handler this merge is returning from).
+        #
+        # This ran single-threaded ONLY, on the reasoning that a
+        # multi-thread trace's same-tid predecessor "may be an unrelated
+        # thread's entry" — which cannot happen: prev_depth_by_tid is keyed
+        # BY tid, so the predecessor is the same thread by construction.
+        # The real multi-thread caveat is the one the step rule already
+        # names: a preemptible kernel can put a thread's user entry (clamped
+        # to depth 0) next to its own kernel entries, and the fault stack is
+        # per-vCPU, so a PRIVILEGE-CROSSING predecessor carries no usable
+        # depth.  Exempting exactly that pair keeps every real multi-thread
+        # anchor assertion live instead of switching the whole check off —
+        # it was dark in system.churn_x86, the one regime where the merge
+        # machinery runs under multi-process fault contention, i.e. exactly
+        # where an anchor-at-unwind regression would first appear.
+        anchor_exempt = (guest_threads > 1 and ps is not None
+                         and ps != is_sys)
+        if (not anchor_exempt
+                and e.get("fault_anchors") and pd is not None and pd <= d):
             issues.append(Issue(
                 "syscall_fault_nesting", "error",
                 f"entry seq={e.get('seq_num')} thread={tid} carries fault "

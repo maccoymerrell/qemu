@@ -527,7 +527,12 @@ outside the repo as standalone scripts):
    A template that is legitimately bimodal AT SCALE (heavy predication,
    a REP loop empty as often as not) is not flagged; the zero-rate
    threshold below which executions count as "a small minority of
-   outliers" is tunable.  Implemented twice, deliberately kept in sync:
+   outliers" is tunable.  A fault-TRUNCATED execution — an entry
+   carrying fault anchors, which stopped part-way through its template
+   and so never had the chance to realise its memops — is excluded from
+   the population entirely, since the wire already explains its
+   shortfall; the silent loss the oracle hunts carries no anchor.
+   Implemented twice, deliberately kept in sync:
    ``cst::MemopBimodalityLint`` (``tools/cst_lint.h``) feeds
    ``cst_audit``'s always-on ``MEMOP BIMODALITY`` report section
    (``--bimodal-min-execs`` / ``--bimodal-max-outlier-rate`` /

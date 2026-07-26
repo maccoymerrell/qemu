@@ -467,9 +467,22 @@ public:
      * execution's realised-memop verdict (its running total, post this
      * entry's deltas, is nonzero or not) into the template's histogram.
      * A no-op for a template with no static memop slot at all — its
-     * running total is definitionally always zero and uninteresting. */
-    void on_cp_entry_end(uint32_t thread, uint32_t template_id) {
+     * running total is definitionally always zero and uninteresting.
+     *
+     * @fault_truncated entries are excluded from the population.  An
+     * entry carrying fault anchors stopped part-way through its
+     * template — in the limit at insn 0, before any memop-capable insn
+     * retired — so it never had the chance to realise the template's
+     * memops, and the wire records exactly that.  Counting it as a
+     * zero-memop outlier would report a completeness loss the trace
+     * already explains (the canonical case is a kernel copy loop taking
+     * a page fault on its first store).  No strictness is lost: the
+     * loss this lint exists to catch is a SILENT one, and a silently
+     * dropped memop section carries no anchor. */
+    void on_cp_entry_end(uint32_t thread, uint32_t template_id,
+                         bool fault_truncated = false) {
         if (!tracks(template_id)) return;
+        if (fault_truncated) { truncated_++; return; }
         bool nonzero = running_[cell_key(thread, template_id)] != 0;
         Hist &h = hist_[template_id];
         h.total++;
@@ -498,6 +511,10 @@ public:
 
     uint64_t flagged_templates() const { return flagged().size(); }
 
+    /* CP executions excluded from the population because a fault
+     * truncated them (reported, so the exclusion is never silent). */
+    uint64_t truncated_execs() const { return truncated_; }
+
 private:
     struct Hist {
         uint64_t total = 0, zero = 0, nonzero = 0;
@@ -507,6 +524,7 @@ private:
     }
 
     Config cfg_;
+    uint64_t truncated_ = 0;              /* fault-truncated, excluded */
     std::unordered_set<uint32_t> memop_capable_;
     std::unordered_map<uint64_t, uint64_t> running_;   /* (thread,tid)->total */
     std::unordered_map<uint32_t, Hist> hist_;          /* tid -> histogram */

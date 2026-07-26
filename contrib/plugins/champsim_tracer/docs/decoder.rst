@@ -475,6 +475,18 @@ unambiguous.  A template that is legitimately bimodal AT SCALE (heavy
 predication, a REP loop empty as often as not) has a zero-rate the
 default threshold does not consider an outlier, so it is not flagged.
 
+A fault-truncated execution is excluded from the population outright.
+An entry carrying fault anchors (``fault_at``, format.rst §6.7) stopped
+part-way through its template — in the limit at instruction 0, before
+any memop-capable instruction retired — so it never had the opportunity
+to realise the template's memops, and the wire records precisely that.
+The canonical case is a kernel copy loop taking a page fault on its
+first store: one truncated execution against fifty complete ones is the
+D4 *shape* without being a D4 *loss*.  Excluding them costs the oracle
+no strictness, because the loss it exists to catch is a silent one and a
+silently dropped memop section carries no anchor.  The report prints the
+excluded count so the exclusion is never invisible.
+
 The lint is implemented in ``tools/cst_lint.h``
 (``cst::MemopBimodalityLint``), correct-path only — wrong-path
 wandering carries no dataflow contract, the same scoping the

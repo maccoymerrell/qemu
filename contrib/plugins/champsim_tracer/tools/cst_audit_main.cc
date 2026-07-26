@@ -466,22 +466,17 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
              * what the decoder's resolved cells would report. */
             tracker.on_cp_entry_end((uint32_t)current_thread,
                                     (uint32_t)prev_cp_tid);
-            /* Bimodality histogram: this execution's realised-memop
-             * verdict (its running total, after this entry's own deltas)
-             * folds into the template's zero/nonzero tally. */
-            if (bimodal) {
-                bimodal->on_cp_entry_end((uint32_t)current_thread,
-                                         (uint32_t)prev_cp_tid);
-            }
 
             /* Per-entry sync-fault trailer (CST_FLAG_FAULT): exception-nesting
              * depth ULEB, between the CP delta and the WP sections.  Charge
              * its bytes to CP-field-delta overhead so the budget rolls to
              * 100%. */
+            uint64_t cp_fault_anchors = 0;
             if (have_fault) {
                 size_t ft_st = body.consumed();
                 (void)body.uleb();                  /* fault depth */
                 uint64_t n_anchors = body.uleb();   /* anchor count */
+                cp_fault_anchors = n_anchors;
                 for (uint64_t a = 0; a < n_anchors; a++) {
                     (void)body.uleb();
                 }
@@ -489,6 +484,19 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
                 s->cp_field_delta.bytes += ft_bytes;
                 cpfd_b[BIDX_OVERHEAD].bytes += ft_bytes;
                 cpfd_b[BIDX_OVERHEAD].count += 1;
+            }
+
+            /* Bimodality histogram: this execution's realised-memop
+             * verdict (its running total, after this entry's own deltas)
+             * folds into the template's zero/nonzero tally.  Folded only
+             * AFTER the fault trailer is read, because an entry carrying
+             * fault anchors was truncated mid-template and is excluded
+             * from the population — see MemopBimodalityLint. */
+            if (bimodal) {
+                bimodal->on_cp_entry_end((uint32_t)current_thread,
+                                         (uint32_t)prev_cp_tid,
+                                         /*fault_truncated=*/
+                                         cp_fault_anchors > 0);
             }
 
             /* WP chain + events present only under CST_FLAG_WP. */
@@ -1252,6 +1260,9 @@ int main(int argc, char **argv)
             std::printf("\n=== MEMOP BIMODALITY (Oracle 2; min_execs=%u, "
                         "max_outlier_rate=%.2f) ===\n",
                         bimodal_cfg.min_execs, bimodal_cfg.max_outlier_rate);
+            std::printf("  %s fault-truncated CP execution(s) excluded "
+                        "from the population\n",
+                        fmt_n(bimodal.truncated_execs()).c_str());
             if (findings.empty()) {
                 std::printf("  clean: 0 templates with a nonzero-majority / "
                             "zero-outlier memop split\n");

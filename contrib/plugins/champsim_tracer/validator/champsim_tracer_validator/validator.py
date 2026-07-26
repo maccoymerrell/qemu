@@ -1436,9 +1436,21 @@ def _check_memop_bimodality(
     tunable (min_execs, max_outlier_rate) for a workload whose
     predication rate genuinely warrants a wider band.  Correct-path
     only — wrong-path wandering carries no dataflow contract.
+
+    A fault-TRUNCATED execution is excluded from the population
+    entirely.  An entry carrying fault anchors (``fault_at``) stopped
+    part-way through its template — in the limit at insn 0, before any
+    memop-capable instruction retired — so it never had the chance to
+    realise the template's memops, and the wire says so explicitly.
+    Counting it as a zero-memop outlier reports a completeness loss the
+    trace itself already explains (a kernel copy loop taking a page
+    fault on its first store is the canonical case).  This costs the
+    oracle no strictness: the loss it exists to catch is a SILENT one,
+    and a silently dropped memop section carries no anchor.
     """
     from collections import defaultdict
     per_tid: dict[int, list[int]] = defaultdict(list)
+    truncated = 0
     for e in cp_entries:
         tid = e.get("template_id")
         tmpl = templates_by_id.get(tid) or {}
@@ -1446,6 +1458,9 @@ def _check_memop_bimodality(
         if not any(int(i.get("n_loads", 0)) or int(i.get("n_stores", 0))
                    for i in insns):
             continue                      # not memop-capable; not tracked
+        if e.get("fault_anchors"):
+            truncated += 1                # partial execution; not comparable
+            continue
         per_tid[tid].append(len(e.get("dyn_params") or []))
 
     issues: list[Issue] = []
@@ -1473,7 +1488,8 @@ def _check_memop_bimodality(
             "memop_bimodality", "info",
             f"clean: 0 templates with a nonzero-majority / zero-outlier "
             f"memop split among {len(per_tid)} memop-capable template(s) "
-            f"(min_execs={min_execs}, max_outlier_rate={max_outlier_rate})"))
+            f"(min_execs={min_execs}, max_outlier_rate={max_outlier_rate}, "
+            f"{truncated} fault-truncated execution(s) excluded)"))
     return issues
 
 

@@ -1065,12 +1065,28 @@ static bool cap_x86_is_move_family(const char *mnem)
     if (!mnem || !mnem[0]) return false;
     if (mnem[0] == 'v') mnem++;            /* VEX/EVEX prefix */
     if (!g_str_has_prefix(mnem, "mov")) return false;
-    /* Sign/zero-extending and string moves never take a MEM
-     * operand 0 (their destination is a register); excluding them
-     * keeps the rule "MEM op0 of a move ⇒ store target" exact. */
+    /* Sign/zero-extending moves never take a MEM operand 0 (their
+     * destination is a register); excluding them keeps the rule
+     * "MEM op0 of a move ⇒ store target" exact.
+     *
+     * QEMU drives Capstone in AT&T syntax, which does NOT print these
+     * as movsx / movzx / movsxd -- it spells them with a source and a
+     * destination size suffix: movsbl / movsbw / movsbq / movswl /
+     * movswq / movslq, and movzbl / movzbw / movzbq / movzwl / movzwq.
+     * Match that shape ("mov" + s|z + b|w|l + w|l|q) rather than the
+     * Intel names, which never appear and so never excluded anything.
+     * (Today this exclusion is belt-and-braces -- the caller's
+     * "no operand carries WRITE" test already rejects an extending
+     * move, whose destination register is written -- but the predicate
+     * should mean what it says.) */
+    if ((mnem[3] == 's' || mnem[3] == 'z') &&
+        (mnem[4] == 'b' || mnem[4] == 'w' || mnem[4] == 'l') &&
+        (mnem[5] == 'w' || mnem[5] == 'l' || mnem[5] == 'q') &&
+        mnem[6] == '\0') {
+        return false;
+    }
     return !g_str_has_prefix(mnem, "movsx") &&
            !g_str_has_prefix(mnem, "movzx") &&
-           !g_str_has_prefix(mnem, "movsxd") &&
            !g_str_has_prefix(mnem, "movbe") &&
            !g_str_has_prefix(mnem, "movmsk");
 }

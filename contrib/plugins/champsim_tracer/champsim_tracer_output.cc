@@ -1672,6 +1672,35 @@ static const DynParam *find_memop_slot(const EntryView *ev, uint32_t i,
                                        uint16_t slot, uint8_t want_type)
 {
     if (!ev->dyn_params || slot >= ev->slot_stride) return nullptr;
+    /*
+     * Bound the slot by the number of memops this execution actually
+     * produced, not just by the scratch stride.  entry_view_scratch_ensure
+     * deliberately skips clearing the slot arrays past
+     * actual_n_{loads,stores}[i] -- that memset is a measurable cost on the
+     * hot path -- so an entry past the live count still holds whatever
+     * pointer a previous emit left there, i.e. a DynParam belonging to an
+     * entry that has since been reused.
+     *
+     * The static extent (max_dep_{loads,stores}) that callers iterate to is
+     * an upper bound on the dynamic count, never a promise: a masked or
+     * predicated vector store whose mask came up empty, a conditional store
+     * that did not fire, and a fault-truncated execution all leave declared
+     * slots unfilled.  Without this bound such a slot yields the stale
+     * pointer, and dereferencing it reads freed memory -- observed as a
+     * SIGBUS in memop_data_lane_mask(), and reported by valgrind as a
+     * conditional jump on an uninitialised value even when it does not
+     * fault.
+     *
+     * Returning nullptr is the same answer the caller already handles for a
+     * slot with no memop, so this only replaces undefined behaviour.
+     */
+    if (want_type == DYN_LOAD_ADDR) {
+        if (ev->actual_n_loads && slot >= ev->actual_n_loads[i]) {
+            return nullptr;
+        }
+    } else if (ev->actual_n_stores && slot >= ev->actual_n_stores[i]) {
+        return nullptr;
+    }
     size_t idx = ((size_t)i * ev->slot_stride) + slot;
     if (want_type == DYN_LOAD_ADDR) {
         return ev->load_slots[idx];

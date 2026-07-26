@@ -209,6 +209,16 @@ struct CtxFrame {
                                         * Stage 3, suspend/resume */
     uint64_t resume_pc = 0;            /* faulting insn = where ERET lands */
     uint32_t depth = 0;                /* depth the faulting BB ran at */
+    uint32_t tid = 0;                  /* OWNING guest thread: the identity
+                                        * the faulting BB is emitted with.
+                                        * frames_ is per-vCPU, but a vCPU
+                                        * multiplexes guest threads, so an
+                                        * excursion belongs to the thread that
+                                        * entered it — a peer thread scheduled
+                                        * on the same vCPU is at its own
+                                        * nesting depth (format.rst §4.2a:
+                                        * fault_depth is the depth THIS basic
+                                        * block executed at) */
     bool returned = false;             /* FAULT_RETURN observed, seal pending */
     std::vector<WPMemAccess> mem;      /* accumulated memops (insn_pc-keyed) */
     std::vector<RegSnap> snaps;        /* accumulated reg snaps (insn order) */
@@ -245,6 +255,16 @@ public:
         size_t n_evs;
         unsigned int cpu_index;
         uint64_t watch_pc;        /* CST_BLKWATCH, 0 when unset */
+        /* Guest-thread identities across the seal boundary (seal phase
+         * only; the glue fills them just before step_seal).  @walk_tid is
+         * the COMMITTED identity — the thread that ran the deferred prev
+         * this seal emits, hence the owner of any fault frame the seal
+         * opens for it.  @cur_tid is the thread the TB executing NOW
+         * belongs to, hence whose frames the depth stamp counts.  Equal
+         * except on the step where the guest scheduler switched tasks on
+         * this vCPU; in user mode both are cpu_index. */
+        uint32_t walk_tid = 0;
+        uint32_t cur_tid = 0;
     };
 
     /* What the step did, so the glue can pick the right continuation:
@@ -344,8 +364,10 @@ private:
     void kexc_user_tb(uint64_t live_asid, bool owned);
     bool kexc_kernel_tb_keep(void);
     void kexc_reset();
+    /* @owner_tid is StepIn::walk_tid: a frame opened here is the deferred
+     * prev's excursion, so the thread that ran that block owns it. */
     void classify_fault_enter(const struct qemu_plugin_cpu_event &ev,
-                              bool *prev_stashed);
+                              bool *prev_stashed, uint32_t owner_tid);
     void apply_fault_return(const struct qemu_plugin_cpu_event &ev);
     ptrdiff_t frame_idx_for_resume(uint64_t resume_pc, uint64_t asid) const;
     ptrdiff_t frame_idx_for_block(const BBTemplate *piece, uint64_t resume,
@@ -462,10 +484,11 @@ private:
     uint32_t depth_next_ = 0;
 
     /* Stamp cur's fault depth (and the faults=0 sync-span flag) from the
-     * CURRENT frame ledger.  Called twice per seal — after the event drain
-     * and again after the seal walk's merge completions retire frames — so a
-     * block following a reassembled faulting BB carries the post-unwind
-     * depth.  See the definition for why the second call is load-bearing. */
+     * CURRENT frame ledger, counting only the frames StepIn::cur_tid owns.
+     * Called twice per seal — after the event drain and again after the seal
+     * walk's merge completions retire frames — so a block following a
+     * reassembled faulting BB carries the post-unwind depth.  See the
+     * definition for why the second call is load-bearing. */
     void stamp_cur_depth(const StepIn &in, bool post_merge = false);
     uint32_t raw_depth_ = 0;
 

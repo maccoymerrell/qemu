@@ -912,7 +912,7 @@ BBTemplate *PathBuilder::fold_prev_full_bb(BBTemplate *prev)
  * stash is no longer lost behind a nested handler fault's entry.
  */
 void PathBuilder::classify_fault_enter(const struct qemu_plugin_cpu_event &ev,
-                                       bool *prev_stashed)
+                                       bool *prev_stashed, uint32_t owner_tid)
 {
     /* Gated on a non-null deferred prev: post-drop or post-boundary
      * entries are consumed with no action. */
@@ -955,6 +955,12 @@ void PathBuilder::classify_fault_enter(const struct qemu_plugin_cpu_event &ev,
         /* The depth the faulting BB ran at: prev's promote-time stamp
          * (NOT this event's depth_after, which is post-entry). */
         f.depth = walk_depth_;
+        /* The excursion belongs to the thread that ran the faulting BB —
+         * @owner_tid is exactly the identity that block is emitted with, so
+         * the frame and its interrupted block agree by construction.  This is
+         * what keeps a peer thread scheduled onto this vCPU during the
+         * excursion at its OWN nesting depth. */
+        f.tid = owner_tid;
         cst_jump_diag_step(resume, walk_prev_->start_pc, (int)ev.priv, 1,
                            "fault-enter(b)");
         collect_piece(f, resume);
@@ -1403,8 +1409,20 @@ PathBuilder::complete_merge(size_t idx,
      * violation. */
     if (out_stream) {
         const uint64_t complete_asid = frames_[idx].asid;
+        const uint32_t complete_tid = frames_[idx].tid;
         for (size_t i = frames_.size(); i-- > idx + 1; ) {
             if (frames_[i].depth < 1) {
+                continue;
+            }
+            /* Ownership IS filtered, unlike the asid stamp below: "deeper on
+             * the stack" only means "nested inside" within ONE guest thread.
+             * A peer thread's frame sitting above this one on the shared
+             * per-vCPU ledger is a concurrent excursion, not an inner one —
+             * flushing it here would emit that thread's level into the
+             * completing thread's stream, fabricating the very depth jump the
+             * flush exists to prevent.  It stays for its own unwind. */
+            if (frames_[i].tid != complete_tid) {
+                g_stats.depth_tid_deeper_spared++;
                 continue;
             }
             if (pb_diag() && frames_[i].asid != complete_asid) {
@@ -1745,12 +1763,20 @@ void PathBuilder::retire_suspension(size_t idx, unsigned int cpu_index)
  * Stamp the depth cur (already promoted by step_events) runs at, and with it
  * the synchronous-fault-span flag the faults=0 handler suppression reads.
  *
- * The depth is the pinned process's OWN un-returned merge-frame count, so it
- * is a function of frames_ AT THE MOMENT OF THE STAMP — and step_seal moves
- * frames_ twice: the event drain at its head pushes/returns frames, and the
- * seal walk at its tail RETIRES them (complete_merge erases the completing
- * frame and flushes any deeper ones).  Both movements bracket cur, so the
- * stamp is taken at the head AND re-taken after the walk.
+ * The depth is the count of un-returned merge frames that CUR'S OWN GUEST
+ * THREAD entered.  frames_ is per-vCPU and a vCPU multiplexes guest threads,
+ * so ownership is what separates them: a thread descheduled across a peer's
+ * excursion would otherwise inherit the peer's nesting and step back down to
+ * its own when rescheduled (the single-sided `2 -> 0` the oracle reports).
+ * StepIn::cur_tid names the executing TB's thread and is sampled before the
+ * seal for exactly this reason — the committed identity is still the previous
+ * block's, so counting against it would be one step late.
+ *
+ * The count is a function of frames_ AT THE MOMENT OF THE STAMP — and
+ * step_seal moves frames_ twice: the event drain at its head pushes/returns
+ * frames, and the seal walk at its tail RETIRES them (complete_merge erases
+ * the completing frame and flushes any deeper ones).  Both movements bracket
+ * cur, so the stamp is taken at the head AND re-taken after the walk.
  *
  * The re-stamp is the fix for the residual syscall_fault_nesting depth-JUMP.
  * A completion proves the excursion is over: the resume suffix only executes
@@ -1774,9 +1800,31 @@ void PathBuilder::stamp_cur_depth(const StepIn &in, bool post_merge)
 {
     const uint32_t was = prev_depth_;
     uint32_t pinned_inflight = 0;
+    uint32_t foreign_inflight = 0;
     for (const CtxFrame &f : frames_) {
-        if (!f.returned) {
+        if (f.returned) {
+            continue;
+        }
+        if (f.tid == in.cur_tid) {
             pinned_inflight++;
+        } else {
+            foreign_inflight++;
+        }
+    }
+    if (foreign_inflight) {
+        /* The Class-B condition, counted directly: another guest thread's
+         * excursion was in flight while THIS thread's block executed.  Every
+         * one of these was inherited before frames carried an owner. */
+        g_stats.depth_tid_foreign_inflight += foreign_inflight;
+        g_stats.depth_tid_stamps_corrected++;
+        if (foreign_inflight > g_stats.depth_tid_max_foreign) {
+            g_stats.depth_tid_max_foreign = foreign_inflight;
+        }
+        if (pb_diag() || pb_depth_diag() || cst_jump_diag()) {
+            fprintf(stderr, "[pathbuilder] TID-DISOWN cur=0x%" PRIx64
+                    " tid=%u own=%u foreign=%u frames=%zu\n",
+                    in.cur ? in.cur->start_pc : 0, in.cur_tid,
+                    pinned_inflight, foreign_inflight, frames_.size());
         }
     }
     depth_next_ = pinned_inflight + async_captured_;
@@ -1787,14 +1835,18 @@ void PathBuilder::stamp_cur_depth(const StepIn &in, bool post_merge)
      * code while the interrupted task's fault frames are still live on this
      * vCPU's stack — without the clamp those user entries would carry the
      * interrupted excursion's depth (observed: depth-4 user loop blocks under
-     * a two-thread yield workload).  The other thread's KERNEL work keeps the
-     * raw-baselined depth — the per-vCPU stack cannot attribute frames per
-     * guest thread, an accepted approximation. */
+     * a two-thread yield workload).  That peer thread's KERNEL work is
+     * covered by frame ownership, not by this clamp: the count above skips
+     * frames another thread entered, so the peer's kernel blocks stand at
+     * their own nesting depth, which is what format.rst §4.2a defines
+     * fault_depth to be. */
     prev_depth_ = (in.pinned && in.live_priv == 0) ? 0 : depth_next_;
     /* Synchronous-fault-span stamp (faults=0 handler suppression): true when
-     * cur runs while an un-returned synchronous-fault frame is in flight and
-     * cur is not user code.  A user TB is never handler content, so it stamps
-     * false, mirroring the depth clamp above. */
+     * cur runs while an un-returned synchronous-fault frame OF CUR'S OWN
+     * THREAD is in flight and cur is not user code.  A peer thread's block is
+     * not this excursion's handler content — same ownership rule as the depth
+     * — and a user TB is never handler content at all, so it stamps false,
+     * mirroring the depth clamp above. */
     prev_in_sync_ = (in.pinned && in.live_priv == 0)
                         ? false
                         : (depth_next_ - async_captured_) > 0;
@@ -1898,7 +1950,7 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
                             ev.pc, ev.depth_after, ev.asid, ev.priv);
                 }
                 if (fault_on && !pb_no_merge()) {
-                    classify_fault_enter(ev, &prev_stashed);
+                    classify_fault_enter(ev, &prev_stashed, in.walk_tid);
                 }
             } else if (ev.kind == QEMU_PLUGIN_CPU_EV_FAULT_RETURN) {
                 raw_depth_ = ev.depth_after;
@@ -1950,14 +2002,23 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
          * residual 0<->2 churn jump).  Retire such frames: mark them
          * returned so they drop out of the depth count, but do NOT erase
          * them — their merge completion stays possible if the resume suffix
-         * still seals.  This is the single-address-space, one-core-pinned
-         * regime the tracer supports; a preemptible multi-thread guest can
-         * legitimately run another thread's user code beside a live handler,
-         * but that privilege boundary is already exempted by the nesting
-         * check as a documented approximation. */
+         * still seals.
+         *
+         * The proof is per guest THREAD, so the sweep is too: this user TB
+         * says THIS thread is at depth 0 and says nothing about a peer whose
+         * handler is still live on the same vCPU.  Sweeping a peer's frames
+         * here is the mirror image of counting them — it would drop that
+         * thread's nesting the moment any other thread touched user code, and
+         * its next kernel block would step down without an unwind. */
         if (fault_on && in.pinned && in.live_priv == 0) {
             uint32_t leaked = 0;
             for (CtxFrame &f : frames_) {
+                if (f.tid != in.cur_tid) {
+                    if (!f.returned) {
+                        g_stats.depth_tid_sweep_spared++;
+                    }
+                    continue;                  /* a peer thread's excursion */
+                }
                 if (!f.returned) {
                     leaked++;
                     cst_jump_diag_step(in.cur ? in.cur->start_pc : 0,
@@ -2021,7 +2082,7 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
         }
         uint32_t pinned_inflight = 0;
         for (const CtxFrame &f : frames_) {
-            if (!f.returned) {
+            if (!f.returned && f.tid == in.cur_tid) {
                 pinned_inflight++;
             }
         }

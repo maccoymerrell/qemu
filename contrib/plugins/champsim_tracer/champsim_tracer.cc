@@ -852,6 +852,21 @@ static bool g_pin_multivcpu_warned = false;
 static constexpr uint64_t CST_TP_UNSEEN = UINT64_MAX;
 static uint64_t g_vcpu_last_tp[CST_PIN_MAX_VCPUS];
 
+/* The step's identity sample, taken BEFORE the seal and applied AFTER it.
+ *
+ * The seal needs both halves of the boundary at once: it EMITS the deferred
+ * prev, which belongs to the thread the vCPU was running before this TB
+ * (g_vcpu_cur_tid, still the committed value), and it STAMPS the executing
+ * TB's fault depth, which belongs to the thread running now.  Sampling once
+ * into these slots gives the seal the incoming identity without disturbing
+ * the outgoing one; thread_identity_commit then advances g_vcpu_cur_tid at
+ * exactly the point the refresh always happened.  Byte-inert: the mapping
+ * (thread_ptr_to_tid, first-sighting order) is unchanged and nothing between
+ * the sample and the commit reads the map. */
+static uint64_t g_vcpu_pending_tp[CST_PIN_MAX_VCPUS];
+static uint32_t g_vcpu_pending_tid[CST_PIN_MAX_VCPUS];
+static bool     g_vcpu_pending_tid_valid[CST_PIN_MAX_VCPUS];
+
 /* CST_TIDDIAG accounting for the kernel-privilege sample's effect on the
  * wire.  g_vcpu_user_tid[c] is what vCPU c's identity WOULD be if only
  * user-privilege samples were trusted — the attribution rule before the
@@ -1024,6 +1039,7 @@ static void thread_identity_reset(void)
         g_vcpu_user_tid[i] = 0;
         g_vcpu_cur_asid_index[i] = 0;
         g_vcpu_last_tp[i] = CST_TP_UNSEEN;
+        g_vcpu_pending_tid_valid[i] = false;
     }
     g_pin_user_vcpu_mask = 0;
     g_pin_multivcpu_warned = false;
@@ -1058,6 +1074,60 @@ static inline uint32_t resolve_thread_id(unsigned int cpu_index)
         return g_vcpu_cur_tid[cpu_index];
     }
     return (uint32_t)cpu_index;
+}
+
+/*
+ * Sample the guest-thread identity of the TB executing NOW and return it,
+ * holding the advance in the pending slot for thread_identity_commit.
+ *
+ * The seal phase needs this value to attribute fault frames per guest thread:
+ * a fault frame belongs to the thread that was inside the handler, and the
+ * depth stamped on the executing TB counts only ITS OWN thread's frames.
+ * resolve_thread_id cannot supply it — the committed identity is still the
+ * previous TB's, deliberately, so the block the seal emits carries the thread
+ * that ran it.  Caller holds exec_lock (the map mint below mutates it).
+ */
+static uint32_t thread_identity_sample(unsigned int cpu_index, int live_priv)
+{
+    if (!g_system_mode || cpu_index >= CST_PIN_MAX_VCPUS) {
+        /* User mode: qemu-user gives every guest thread its own CPUState, so
+         * the index IS the thread (see resolve_thread_id). */
+        return (uint32_t)cpu_index;
+    }
+    g_vcpu_pending_tid_valid[cpu_index] = false;
+    uint64_t tp;
+    if (thread_ptr_sample(live_priv, &tp) && tp != g_vcpu_last_tp[cpu_index]) {
+        uint32_t tid = thread_ptr_to_tid(tp);
+        g_vcpu_pending_tp[cpu_index] = tp;
+        g_vcpu_pending_tid[cpu_index] = tid;
+        g_vcpu_pending_tid_valid[cpu_index] = true;
+        return tid;
+    }
+    /* Unchanged, or a privilege where the register does not name the current
+     * task (RISC-V kernel): the strand keeps the entering thread. */
+    return g_vcpu_cur_tid[cpu_index];
+}
+
+/* Apply the pending sample: this vCPU's identity advances AFTER the deferred
+ * prev has been sealed, so the just-emitted BB is attributed to the thread
+ * that executed it and the refresh takes effect for the NEXT emit.  Caller
+ * holds exec_lock. */
+static void thread_identity_commit(unsigned int cpu_index, int live_priv)
+{
+    if (!g_system_mode || cpu_index >= CST_PIN_MAX_VCPUS) {
+        return;
+    }
+    if (g_vcpu_pending_tid_valid[cpu_index]) {
+        g_vcpu_pending_tid_valid[cpu_index] = false;
+        g_vcpu_last_tp[cpu_index] = g_vcpu_pending_tp[cpu_index];
+        g_vcpu_cur_tid[cpu_index] = g_vcpu_pending_tid[cpu_index];
+        if (tiddiag_on()) {
+            tiddiag_note_binding(cpu_index, g_vcpu_cur_tid[cpu_index]);
+        }
+    }
+    if (tiddiag_on() && live_priv == 0) {
+        g_vcpu_user_tid[cpu_index] = g_vcpu_cur_tid[cpu_index];
+    }
 }
 
 /*
@@ -4851,6 +4921,17 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
     in.prev_ft    = qemu_plugin_u64_get(g_scoreboard.prev_fall_through,
                                         cpu_index);
 
+    /* Guest-thread identity across the seal boundary.  walk_tid is the
+     * committed identity — the thread that ran the deferred prev this seal
+     * emits, and the thread that owns a fault frame the seal opens for it.
+     * cur_tid is this step's sample: the thread the TB executing NOW belongs
+     * to, which is what the depth stamp counts frames for.  They differ
+     * exactly on the step where the guest scheduler switched tasks on this
+     * vCPU, and that step is where a peer thread would otherwise inherit the
+     * descheduled thread's fault nesting. */
+    in.walk_tid = resolve_thread_id(cpu_index);
+    in.cur_tid = thread_identity_sample(cpu_index, live_priv);
+
     st = pb.step_seal(in, out_stream);
 
     if (tiddiag_level() >= 2 && g_system_mode) {
@@ -4863,8 +4944,10 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
      * it, so this refresh takes effect only for the NEXT emit.  Under
      * exec_lock — thread_ptr_to_tid mutates the per-segment map.
      *
-     * The sample is taken at whatever privilege this TB runs at, so long as
-     * the target's register still names the current task there
+     * The sample itself was taken just before the seal (thread_identity_
+     * sample, which the seal's per-thread frame ownership needs); this is
+     * where it lands.  It is taken at whatever privilege this TB runs at, so
+     * long as the target's register still names the current task there
      * (thread_ptr_sample).  That is what makes a strand's identity follow
      * the guest scheduler rather than the vCPU: a task switch performed
      * entirely inside the kernel — the tail of a clone handing the child
@@ -4874,21 +4957,7 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
      * whichever thread last returned to user on it.  Where the register is
      * only trustworthy at user privilege the sample is skipped and kernel
      * code inherits the entering thread, as before. */
-    if (g_system_mode && cpu_index < CST_PIN_MAX_VCPUS) {
-        uint64_t tp;
-        if (thread_ptr_sample(in.live_priv, &tp) &&
-            tp != g_vcpu_last_tp[cpu_index]) {
-            g_vcpu_last_tp[cpu_index] = tp;
-            uint32_t new_tid = thread_ptr_to_tid(tp);
-            g_vcpu_cur_tid[cpu_index] = new_tid;
-            if (tiddiag_on()) {
-                tiddiag_note_binding(cpu_index, new_tid);
-            }
-        }
-        if (tiddiag_on() && in.live_priv == 0) {
-            g_vcpu_user_tid[cpu_index] = g_vcpu_cur_tid[cpu_index];
-        }
-    }
+    thread_identity_commit(cpu_index, in.live_priv);
     if (in.pinned && in.user_owned && in.live_priv == 0 &&
         cpu_index < CST_PIN_MAX_VCPUS) {
         /* Context-asid sibling of the tid refresh: the live user root at

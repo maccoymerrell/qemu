@@ -244,6 +244,24 @@ struct Stats {
     uint64_t depth_restamp_jumps = 0;
     uint32_t depth_restamp_max_delta = 0;
 
+    /* Per-guest-thread frame ownership, measured at the condition rather
+     * than at the oracle failure it produces.  foreign_inflight counts, per
+     * depth stamp, the un-returned fault frames a guest thread OTHER than the
+     * executing one entered — every one of them a level the executing block
+     * would have inherited before frames carried an owner; stamps_corrected
+     * is the number of stamps where at least one did.  max_foreign is the
+     * widest such inheritance (>= 2 is a depth-JUMP's worth).  sweep_spared
+     * counts frames the pinned-user leak sweep left to their own thread, and
+     * deeper_spared the frames a merge completion did not unwind because a
+     * peer thread, not a nested fault, put them above it on the ledger.  All
+     * zero on a single-threaded guest, so a nonzero value is exactly the
+     * multi-thread condition. */
+    uint64_t depth_tid_foreign_inflight = 0;
+    uint64_t depth_tid_stamps_corrected = 0;
+    uint32_t depth_tid_max_foreign = 0;
+    uint64_t depth_tid_sweep_spared = 0;
+    uint64_t depth_tid_deeper_spared = 0;
+
     /* Per-execution attribution.  cp_* bumped at vcpu_tb_exec walking
      * the prev TB's template; wp_* inside the WP per-iteration loop.
      * Sized by the generic enum sentinels to stay in lockstep. */

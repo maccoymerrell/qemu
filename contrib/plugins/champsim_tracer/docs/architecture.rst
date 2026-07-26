@@ -865,6 +865,21 @@ fault events exactly once, then runs the shared seal walk:
   of the count immediately even though its merge completion (the resume
   suffix's seal) is still pending.  ``raw_depth_`` tracks the last
   event's ``depth_after`` for the ``CST_DEPTH_DIAG`` log only.
+
+  The stamp is taken **twice per seal**, because the seal moves
+  ``frames_`` twice: the event drain at its head pushes new frames and
+  marks returns, and the seal walk at its tail *retires* frames (a merge
+  completion erases the completing frame and flushes any deeper ones).
+  The current TB is promoted between those two movements, so a single
+  head-only stamp gives the block that follows a reassembled faulting BB
+  the *pre*-completion count.  That is invisible while every
+  ``FAULT_RETURN`` is observed — a returned frame is already out of the
+  count — but a guest exception return that the host's strict-LIFO fault
+  pop suppresses leaves its frame flagged in-flight right through its own
+  merge, and the following block then carries one excess level per
+  suppressed frame.  Re-taking the stamp after the walk gives that block
+  the post-unwind depth a completion proves it runs at: the resume suffix
+  only executes after the exception return.
 * **Fault-entry classification.**  Each ``FAULT_ENTER`` is handled
   individually against the deferred prev — see
   :ref:`fault-excursions` for the three cases and the context-frame

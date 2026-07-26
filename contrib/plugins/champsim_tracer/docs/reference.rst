@@ -1209,6 +1209,15 @@ trace run.
    * - ``CST_FAULT_DIAG``
      - *Diagnostic.*  PathBuilder fault-machinery event log (stash /
        return / merge-emit / orphan lines).
+   * - ``CST_JUMP_DIAG``
+     - *Diagnostic.*  Raises the ``syscall_fault_nesting`` step and
+       anchor rules ONLINE, at the emit rather than offline over the
+       finished trace.  A violation prints the depth pipeline's live
+       state (frame ledger, suspension stack, the provenance of each
+       pipeline stage) plus a ring of the preceding 32 emits and 32
+       seal steps, each tagged with the code path that stamped its
+       depth — so a depth-JUMP names its losing path instead of only
+       a sequence number.
    * - ``CST_NO_FAULT``
      - *Diagnostic.*  Marker-mode runs without the fault-excursion
        feature (no per-entry fault trailer).

@@ -19,7 +19,8 @@ Standard from-scratch:
 ```sh
 mkdir build && cd build
 ../configure --enable-plugins \
-             --target-list=x86_64-linux-user,aarch64-linux-user,riscv64-linux-user,mipsel-linux-user
+             --target-list=x86_64-linux-user,aarch64-linux-user,riscv64-linux-user,mipsel-linux-user,\
+x86_64-softmmu,aarch64-softmmu,riscv64-softmmu,mipsel-softmmu
 make                                  # full build
 ```
 

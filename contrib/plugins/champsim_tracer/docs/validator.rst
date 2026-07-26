@@ -421,7 +421,7 @@ outside the repo as standalone scripts):
    line is checked against that *same* asid.  See "Dead-latch
    determinism" in ``VALIDATION.md`` for the full design rationale.
 
-**features** — 19 checks.  Plugin options and wire records that no
+**features** — 20 checks.  Plugin options and wire records that no
 ``quick`` / ``system`` / ``multiproc`` check happens to exercise:
 
 ``features.simpoint``
@@ -604,6 +604,50 @@ outside the repo as standalone scripts):
    all four ISAs (minted-alternate blocks, deepened by
    ``static_depth``), with a minting-off run proving the oracle has
    teeth.
+``features.isa_crosscheck``
+   The one check in the battery whose ground truth comes from outside
+   the tracer.  Every other oracle here reads the same Capstone-derived
+   metadata the tracer does, so a decoder defect corrupts the trace and
+   the oracles agree with the corruption; Intel PIN broke that circle on
+   x86 and found five real defects, and it reaches none of the other
+   three ISAs.  ``isaxcheck`` feeds identical encoding bytes to the
+   tracer's own decode boundary — ``cap_disas_raw_detail()`` in
+   ``disas/capstone.c``, Capstone plus every correction applied on top —
+   and to the LLVM MC layer, a separately maintained decoder and
+   instruction-description database, then buckets every disagreement by
+   ``(class, mnemonic, difference)`` signature.  Five classes are
+   compared: decode agreement and instruction length; operands the
+   boundary cannot model or that carry no access bits; memory presence
+   and direction against ``mayLoad``/``mayStore``; branch taxonomy; and
+   the architectural register read/write sets, with the plugin's own
+   ``include_implicit_regs`` policy modelled so that what is compared is
+   what the dependency model would actually record.
+
+   The sweep is exhaustive over the opcode-bearing bit space — 16.8 M
+   AArch64 encodings, 12.6 M RISC-V including every compressed halfword,
+   16.8 M MIPS — and takes about 18 seconds for all four ISAs on 8
+   cores.  That cheapness is the point: it is affordable on every
+   Capstone bump, which is what keeps the ``disas/capstone.c``
+   workarounds retirable instead of permanent.  Because the Capstone side
+   is the *boundary*, a workaround that works shows up as the ABSENCE of
+   a disagreement, and one that has become unnecessary keeps the gate
+   green — ``capstone_workaround_probe`` answers the complementary
+   question of whether it can now be deleted.
+
+   GATING on any signature outside
+   ``tools/isaxcheck_allow.txt``.  Entries above that file's baseline
+   block each name the disagreement, why it is not a tracer defect, and
+   how to check whether it can be removed; below it, every remaining
+   signature is listed individually rather than by wildcard, so a NEW
+   disagreement still fails.  ``x86_64`` is swept for regression
+   detection only — its independent ground truth is the PIN pairing, and
+   its LLVM residual is dominated by prefix-consumption and
+   flag-modelling differences that describe no defect.
+
+   LLVM MC is an optional host dependency (``llvm-18-dev`` or newer
+   supplying ``llvm-config``).  Without it meson skips the ``isaxcheck``
+   target with a warning and this check fails with that diagnosis rather
+   than silently passing.
 ``features.smc``
    Self-modifying code: revision minting, content-signature id
    reuse, and the per-pc revision cap, across four ISAs and nine SMC

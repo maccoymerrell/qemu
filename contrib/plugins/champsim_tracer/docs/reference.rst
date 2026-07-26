@@ -523,8 +523,17 @@ without implying any particular numeric base.
        guest ISA exposes (XMM, YMM, ZMM on x86; Q on aarch64;
        V on RISC-V).  Snapshot capture truncates to 512 bits.
    * - ``REG_PRED0`` .. ``REG_PRED31``
-     - Predicate / mask registers (SVE, AVX-512 ``k`` regs,
-       RVV mask).
+     - Predicate / mask registers (SVE ``p0``..``p15`` and their
+       predicate-as-counter ``pn`` view, AVX-512 ``k`` regs, RVV
+       mask, MIPS floating-point condition codes ``$fcc0``..``$fcc7``).
+       On SVE these carry the governing-predicate dependency in full: a
+       predicate producer (``ptrue``, ``whilelt``, the
+       predicate-writing compares, ``brka``/``brkb``) records its
+       destination here, a predicated operation records its governing
+       predicate as a source, and the predicate-to-predicate logical
+       ops record both.  The predicate's runtime *value* is not
+       evaluated — see :doc:`limitations` for what that costs and what
+       it does not.
    * - ``REG_SEG0`` .. ``REG_SEG5``
      - x86 segment registers, in Capstone's order: ``REG_SEG0`` =
        ``cs``, ``REG_SEG1`` = ``ds``, ``REG_SEG2`` = ``es``,
@@ -552,10 +561,16 @@ without implying any particular numeric base.
    * - ``REG_SYS``
      - Generic system register (per-arch MSR / MRS / CSR space).
    * - ``REG_FCSR``
-     - Floating-point control / status register.
+     - Floating-point control / status register (RISC-V ``frm`` /
+       ``fflags``, AArch64 ``FPCR``, MIPS ``FCR``\ *n*).
    * - ``REG_VCTRL``
-     - Vector control register (RVV ``vtype`` / ``vl``,
-       SVE ``ZCR``).
+     - Vector control register (RVV ``vtype`` / ``vl`` / ``vlenb`` /
+       ``vxrm`` / ``vxsat``, SVE ``ZCR`` / ``FFR`` / ``VG``, MIPS MSA
+       control).  On RISC-V this carries the vector-configuration edge:
+       ``vsetvli`` / ``vsetivli`` / ``vsetvl`` write it and every
+       vector instruction reads it, so a vector kernel's operations are
+       ordered against the configuration that decides how many elements
+       they process.
    * - ``REG_SP``
      - Stack pointer.
    * - ``REG_FLAGS``

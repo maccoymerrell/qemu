@@ -421,6 +421,79 @@ outside the guest that measures real time — a host-side watchdog, an
 NTP peer, an interactive session — sees that stretch.  Time *inside*
 the guest remains self-consistent.
 
+Decode-metadata bounds
+----------------------
+
+The dependency model is only as good as the per-instruction operand
+metadata the decoder supplies, and that metadata comes from Capstone by
+way of the correction boundary in ``disas/capstone.c``.  Because every
+self-consistency check the tracer owns reads the *same* metadata, a
+decoder defect corrupts the trace and the checks agree with the
+corruption.  The independent instrument for that class is the
+``isaxcheck`` cross-check (:doc:`validator`, gating check
+``features.isa_crosscheck``), which compares the boundary's answer
+against the LLVM MC layer over an exhaustive sweep of the opcode-bearing
+encoding space on all four ISAs.  What follows are the gaps it leaves
+standing, each recorded rather than fixed.
+
+**SME is not modelled.**  Capstone reports the AArch64 ZA matrix
+accumulator and its tile/slice operands as a dedicated ``SME`` operand
+type — a tile, a slice-select general-purpose register and an immediate
+index in one operand — and the plugin's operand ABI has exactly one
+register slot per operand.  Every SME instruction therefore loses its
+accumulator dependency, and the slice-select register with it.  Closing
+this needs an operand-ABI extension, not a boundary correction.  The
+neighbouring SVE forms are unaffected.
+
+**SVE predicate registers are modelled; the predicate's runtime VALUE is
+not.**  Predicate registers occupy ``REG_PRED0``..``REG_PRED31`` in the
+generic register space, and the whole predicated dataflow edge is
+recorded: a predicate producer (``ptrue``, ``whilelt``, the
+predicate-writing compares, ``brka``/``brkb``) records its destination,
+a predicated operation records its governing predicate as a source, and
+the predicate-to-predicate logical ops record both.  What the tracer does
+not do is *evaluate* a predicate at decode time.  For memory that costs
+nothing — the per-lane memory callbacks already reflect the active lanes,
+so a ``ptrue p0.s, vl4`` gated load fans out to exactly four memops and a
+``vl2`` gated load to two.  For a predicated register operation the lane
+mask is the static full-width one: an inactive lane is not excluded from
+the destination's lane set.  A consumer that needs per-lane liveness on a
+masked arithmetic op has the predicate register dependency but must
+derive activity itself.
+
+**SME's second predicate field is dropped.**  An SME predicate operand
+carries a governing predicate *and* a vector-select register; only the
+first is represented, for the same one-slot reason as above.
+
+**RISC-V CSR indices have no generic register id.**  The tracer models
+the specific control registers its ISA tables name — ``frm``/``fflags``
+onto ``REG_FCSR``, ``vl``/``vtype``/``vlenb`` onto ``REG_VCTRL`` — so
+those dependency edges are real.  A general ``csrrw``/``csrrs`` against
+an arbitrary CSR number records the general-purpose operands but no CSR
+dependency, because the generic register space has no slot to put it in.
+
+**MIPS coprocessor and control banks collapse.**  Every coprocessor
+register folds onto ``REG_SYS`` and every FP control register onto
+``REG_FCSR``, so COP0 register 3 and COP2 register 3 are one slot, as are
+``FCR0`` and ``FCR31``.  The HI and LO halves of a MIPS accumulator
+likewise share one ``REG_ACC`` slot.  These are deliberate: the
+dependency model tracks the hazard, not the architectural bank.
+
+**Wrong-path decode of arbitrary bytes is best-effort.**  Capstone
+accepts encodings whose architecturally-fixed fields hold reserved
+values.  ``0x88c08022`` has ``Rs != 0b11111`` and ``Rt2 != 0b11111`` and
+is therefore not a valid ``LDAR``; Capstone decodes it as
+``ldar w2, [x1]`` where LLVM rejects it, and 28 such signatures exist on
+AArch64 and 4 on MIPS.  On the correct path the bytes never occur.  On
+the wrong path, where the tracer decodes whatever the mispredicted target
+happens to contain, it means a template can describe a plausible
+instruction where the hardware — and QEMU — would raise UNDEFINED.  The
+tracer does not reject these: rejecting them would replace a
+plausible-but-wrong instruction with no instruction at all, which is a
+worse model of a machine that fetches and decodes down a wrong path
+before the fault resolves.  Wrong-path *instruction identity* is
+best-effort by design; wrong-path *control flow* and *addresses* are not.
+
 Reproducibility caveats
 -----------------------
 

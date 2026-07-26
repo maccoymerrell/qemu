@@ -284,14 +284,29 @@ ones a given Capstone bump has already fixed.
    The tool always links ``subprojects/capstone`` — the same
    dependency ``cst_decode`` uses — never a system Capstone; see below
    for why that distinction matters.
-4. A ``RETIRE CANDIDATE`` means Capstone now reports *that one
+4. Run the decoder cross-check, which sweeps the whole encoding space
+   rather than one representative per family::
+
+      python -m champsim_tracer_validator full --build-dir build \
+          --only features.isa_crosscheck
+
+   This compares the boundary's answer for 12.6-16.8 M encodings per
+   ISA against the LLVM MC layer, and takes about 18 seconds for all
+   four ISAs.  It is the complement of the probe: the probe says
+   whether a workaround has become *unnecessary*, the cross-check says
+   whether the boundary's overall answer is still *right*.  A bump that
+   fixes one defect and regresses another shows up here even when every
+   probe case reports ``RETIRE CANDIDATE``.  New disagreements are
+   listed by signature; triage each into
+   ``tools/isaxcheck_allow.txt`` with a justification, or fix it.
+5. A ``RETIRE CANDIDATE`` means Capstone now reports *that one
    representative encoding* correctly, not necessarily the whole
    family the comment documents.  Hand-sweep the rest of the family
    with the ``cstool`` invocations quoted in the comment (again, a
    ``cstool`` built from ``subprojects/capstone`` — see
    ``subprojects/capstone/cstool/README.md``, or just ``cd
    subprojects/capstone/cstool && make``) before trusting it.
-5. Once a family is confirmed fixed end to end, delete its predicate
+6. Once a family is confirmed fixed end to end, delete its predicate
    function, its call site(s) in the relevant ``cap_fill_*_operands``,
    and its case(s) in ``capstone_workaround_probe.cc``, all in the same
    change.  Re-run the golden nets

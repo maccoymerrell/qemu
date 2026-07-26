@@ -2542,6 +2542,116 @@ def _capstone_reg_class_for_isa(isa: str) -> dict[int, _RegClassEntry]:
     return out
 
 
+def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
+                                add, exp_src: set, exp_dst: set) -> None:
+    """Mirror the decode-boundary corrections in `disas/capstone.c`.
+
+    The oracle above builds its expectation from the RAW Capstone the
+    Python bindings expose, but the trace is built from Capstone AFTER
+    `disas/capstone.c` repairs the operand metadata Capstone 6.0.0-Alpha7
+    gets wrong.  Without mirroring those repairs here the oracle would
+    report every repair as a defect — and, worse, would go green again if
+    a repair were ever silently dropped.  Each correction below names the
+    workaround it mirrors; see that file's comment for the encoding-level
+    evidence and the retirement procedure, and `isaxcheck` for the
+    exhaustive sweep that found them.
+    """
+    mnem = (getattr(d, "mnemonic", "") or "").lower()
+
+    if isa == "aarch64":
+        # Register-form shift aliases: Capstone drops the third operand
+        # and parks the shift-amount REGISTER in operands[1].shift.value
+        # (shift.type is one of the *_REG kinds).  `lsl x2, x1, x9` would
+        # otherwise lose x9 entirely.
+        if mnem in ("lsl", "lsr", "asr", "ror") and len(ops) == 2:
+            sh = getattr(ops[1], "shift", None)
+            if sh is not None and int(getattr(sh, "type", 0) or 0) >= 6:
+                add(exp_src, int(getattr(sh, "value", 0) or 0))
+        # SVE / SME governing predicates arrive as a dedicated PRED
+        # operand type with the register in op.pred.reg, so the operand
+        # walk above cannot see them.
+        for op in ops:
+            pred = getattr(op, "pred", None)
+            reg = int(getattr(pred, "reg", 0) or 0) if pred is not None else 0
+            if not reg:
+                continue
+            access = int(getattr(op, "access", 0) or 0)
+            if access & 1:
+                add(exp_src, reg)
+            if access & 2:
+                add(exp_dst, reg)
+        # The compare-and-swap forms: the result register's write is
+        # restored, and the phantom write of the address base that
+        # detail->writeback fabricates is dropped.
+        if mnem.startswith(("cas", "rcwcas", "rcwscas")):
+            base = set()
+            for op in ops:
+                if op.type == op_mem_kind:
+                    add(base, int(getattr(op.mem, "base", 0) or 0))
+            exp_dst -= base
+            if mnem.startswith("cas") and not mnem.startswith("casp"):
+                for op in ops:
+                    if op.type == op_reg_kind:
+                        add(exp_src, op.reg)
+                        add(exp_dst, op.reg)
+                        break
+        # The SVE merging-predicated `mov` alias of SEL keeps its
+        # destination's previous value in the inactive lanes.
+        if mnem == "mov" and len(ops) == 3:
+            for op in ops:
+                if op.type == op_reg_kind:
+                    add(exp_src, op.reg)
+                    break
+        # SIMD pre-/post-index writeback: Capstone claims writeback but
+        # lists the base write only for the scalar forms.
+        if getattr(d, "writeback", False):
+            for op in ops:
+                if op.type != op_mem_kind:
+                    continue
+                mem = op.mem
+                if int(getattr(mem, "disp", 0) or 0) or int(
+                        getattr(mem, "index", 0) or 0):
+                    add(exp_dst, int(getattr(mem, "base", 0) or 0))
+                break
+
+    elif isa == "mipsel":
+        # Tied destinations: bit-field insert, lane insert/shuffle,
+        # masked select, multiply-accumulate, and the conditional moves,
+        # each of which preserves part of its destination.
+        tied = ("ins", "dins", "append", "prepend", "insv",
+                "binsl", "binsr", "bmnz", "bmz", "bsel",
+                "insert", "insve", "sld", "vshf",
+                "maddv", "msubv", "madd_q", "maddr_q", "msub_q",
+                "msubr_q", "fmadd", "fmsub", "dpa", "dps",
+                "movn", "movz", "movt", "movf")
+        if mnem.startswith(tied):
+            for op in ops:
+                if op.type == op_reg_kind:
+                    add(exp_src, op.reg)
+                    break
+        # The floating-point compare/branch condition-code edge, and the
+        # phantom $at write Capstone puts on the branch.
+        try:
+            import capstone as _cs
+            fcc0 = _cs.mips.MIPS_REG_FCC0
+            fcc7 = _cs.mips.MIPS_REG_FCC7
+            at = _cs.mips.MIPS_REG_AT
+        except Exception:
+            return
+        names_cc = any(op.type == op_reg_kind and fcc0 <= op.reg <= fcc7
+                       for op in ops)
+        is_br = mnem in ("bc1t", "bc1f", "bc1tl", "bc1fl")
+        if is_br:
+            phantom = set()
+            add(phantom, at)
+            exp_dst -= phantom
+        if not names_cc:
+            if mnem.startswith("c."):
+                add(exp_dst, fcc0)
+            elif is_br:
+                add(exp_src, fcc0)
+
+
 def _check_static_reg_sets(
     templates: list[dict],
     isa: str,
@@ -2655,17 +2765,20 @@ def _check_static_reg_sets(
                 elif op.type == op_imm_kind:
                     continue
 
-            # Implicit regs (regs_read[]/regs_write[]) fold in only
-            # where the tracer's ISA properties say so — matches
-            # decode.cc's `isa_properties[..].include_implicit_regs`
-            # gate (true for x86 + AArch64 + MIPS — MIPS needs it for
-            # the HI:LO accumulator, which only exists implicitly —
-            # false for RISC-V).
-            if isa != "riscv64":
-                for cap_id in getattr(d, "regs_read", []) or []:
-                    add(exp_src, cap_id)
-                for cap_id in getattr(d, "regs_write", []) or []:
-                    add(exp_dst, cap_id)
+            # Implicit regs (regs_read[]/regs_write[]) fold in for every
+            # ISA — matches decode.cc's
+            # `isa_properties[..].include_implicit_regs` gate, which is
+            # now true everywhere.  MIPS needs it for the HI:LO
+            # accumulator and RISC-V for the vector-configuration CSRs
+            # (`vl`/`vtype`) and the FP rounding mode (`frm`), none of
+            # which appear in an operand field.
+            for cap_id in getattr(d, "regs_read", []) or []:
+                add(exp_src, cap_id)
+            for cap_id in getattr(d, "regs_write", []) or []:
+                add(exp_dst, cap_id)
+
+            _apply_boundary_corrections(isa, d, ops, op_reg_kind,
+                                        op_mem_kind, add, exp_src, exp_dst)
 
             # Translate trace's numeric reg ids → symbolic names via
             # the trace's own ENCODINGS reg map.  Unknown ids (no entry

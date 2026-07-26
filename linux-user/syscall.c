@@ -14064,6 +14064,36 @@ abi_long do_syscall(CPUArchState *cpu_env, int num, abi_long arg1,
     CPUState *cpu = env_cpu(cpu_env);
     abi_long ret;
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path syscall barrier.
+     *
+     * A plugin exploring a mispredicted path executes whatever instructions
+     * the guest has there, and the wrong-path policy is to continue past a
+     * syscall at its architectural fall-through rather than end the walk — a
+     * real out-of-order core fetches around it and squashes at retire.  What
+     * a real core also does is never let it commit, and in *-linux-user a
+     * syscall commits against the HOST: it would write files, send packets,
+     * fork or exit on a path the guest never takes.
+     *
+     * Suppression is structural.  Every target's syscall instruction leaves
+     * TCG through a guest exception (EXCP_SYSCALL, EXCP_SWI, ECALL, TRAP),
+     * and while cpu->plugin_spec_mode is set that exception unwinds into
+     * cpu_plugin_exec_tb()'s own sigsetjmp landing pad, which returns to the
+     * plugin instead of to cpu_loop().  do_syscall() is only ever reached
+     * from cpu_loop(), so it is unreachable on a wrong path.
+     *
+     * This guard is the standing proof of that reasoning rather than the
+     * mechanism enforcing it: reaching it means the unwind grew a hole, so it
+     * refuses the call, records it, and reports -ENOSYS to the discarded
+     * path.  qemu_plugin_spec_syscall_blocked must read 0 on every run.
+     */
+    if (unlikely(cpu->plugin_spec_mode)) {
+        qemu_plugin_spec_syscall_blocked++;
+        return -TARGET_ENOSYS;
+    }
+#endif
+
 #ifdef DEBUG_ERESTARTSYS
     /* Debug-only code for exercising the syscall-restart code paths
      * in the per-architecture cpu main loops: restart every syscall

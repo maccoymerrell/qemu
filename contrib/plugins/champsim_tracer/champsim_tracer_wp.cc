@@ -47,14 +47,6 @@ struct WpAccum {
      * uop speculation would actually squash on. */
     bool        bb_has_fault     = false;
     uint32_t    bb_first_fault_idx = 0;
-    /* A POST-COMPLETION system-mode fault (an SVC/ECALL that retired, then its
-     * kernel-entry failed out of spec mode) sealed this BB.  Execution-time
-     * arithmetic / illegal / trap faults no longer set this — they skip the
-     * faulting insn and CONTINUE to the depth budget, just like memory faults.
-     * Only the kernel-entry post-completion path keeps the interim graceful
-     * STOP: set in the tb_ok=false fault path, consumed at commit to end the
-     * walk.  Memory and execution faults set bb_has_fault but NOT this. */
-    bool        bb_fault_stop    = false;
 
     /* Reset per-BB state.  bb_reg_snaps is intentionally NOT cleared here:
      * its lifecycle is caller-managed (cleared after a no-template drop,
@@ -71,7 +63,6 @@ struct WpAccum {
         bb_symbol_name = nullptr;
         bb_has_fault = false;
         bb_first_fault_idx = 0;
-        bb_fault_stop = false;
     }
 
     /* Build a WPBBEntry from the current accumulator, moving bb_dyn_params /
@@ -127,7 +118,6 @@ struct WpWalkState {
     /* --- loop-carried scalars --- */
     uint64_t     sim_insns           = 0;
     bool         early_exit          = false;
-    bool         fault_stop          = false;
     uint64_t     last_fault_pc       = UINT64_MAX;
     unsigned int repeated_fault_pc   = 0;
     bool         awaiting_delay_slot = false;
@@ -155,14 +145,10 @@ struct WpWalkState {
  *   - the outer driver loop: PROCEED (run the next phase this iteration),
  *     NEXT_ITER (continue the outer while), or a terminal reason
  *     (DOMAIN_CROSS / TRANSLATION_UNAVAIL / STUCK_BAIL / RETRY_SESSION) —
- *     for every terminal the phase has already latched st.early_exit or
- *     st.fault_stop, exactly as the monolith did, so the driver's tail
- *     break fires;
+ *     for every terminal the phase has already latched st.early_exit,
+ *     exactly as the monolith did, so the driver's tail break fires;
  *   - the inner fragment loop (in wp_walk_fragments): BREAK_WALK (break the
  *     fragment for-loop) or PROCEED (fall through to the commit).
- * The post-completion graceful stop (a syscall-boundary fault) is signaled
- * by setting st.fault_stop directly inside the fragment loop, not by a
- * dedicated WpStep value.
  */
 enum class WpStep {
     PROCEED,              // fall through to the next phase / the commit
@@ -479,9 +465,10 @@ static WpStep wp_check_forward_progress(WpWalkState &st)
          * follows it.  End the excursion cleanly here, the same shape as the
          * translation-unavailable terminate: the sealed chain so far is
          * preserved and its last entry marked, and the crossing block is NOT
-         * fetched.  This complements the syscall-boundary terminate (a
-         * legitimate CORRECT-path domain transition, never a wrong-path one)
-         * and eliminates the cross-domain mis-stamp at its source, so a
+         * fetched.  It is the one remaining wrong-path terminate that a
+         * BLOCK can trigger — a syscall no longer ends the walk, it continues
+         * at its fall-through — and it eliminates the cross-domain mis-stamp
+         * at its source, so a
          * committed wrong-path block's VA class is always its true domain.
          */
         if (cst_va_is_kernel_code(pre_pc) != excursion_is_kernel) {
@@ -708,14 +695,13 @@ static void wp_attribute_memops(WpWalkState &st, BBTemplate *cur,
  * template cache (seeding is_system from its VA class), record the
  * terminal-branch taken edge for non-indirect branches, and push the
  * WPBBEntry onto the chain.  Reports the block's landing PC in
- * @commit_post_pc and whether it sealed on a post-completion fault-stop in
- * @this_bb_fault_stop (both consumed by the fragment loop's terminal
- * checks, which run after acc.clear()).  Body moved verbatim.
+ * @commit_post_pc (consumed by the fragment loop's terminal checks, which run
+ * after acc.clear()).  Body moved verbatim.
  */
 static void wp_commit_bb(WpWalkState &st, BBTemplate *cur,
                          uint32_t n_executed_in_cur, uint8_t last_insn_size,
                          uint64_t fault_redispatch_pc,
-                         uint64_t &commit_post_pc, bool &this_bb_fault_stop)
+                         uint64_t &commit_post_pc)
 {
     auto &acc               = st.acc;
     auto &bb_pcs            = acc.bb_pcs;
@@ -851,8 +837,6 @@ static void wp_commit_bb(WpWalkState &st, BBTemplate *cur,
                 }
             }
 
-            this_bb_fault_stop = acc.bb_fault_stop;
-
             /* Terminal-branch outcome for the CST_FID_BRANCH_* singletons on
              * this WP block.  commit_post_pc is the PC the block's terminating
              * branch actually reached — the next chain block's start_pc (and,
@@ -940,19 +924,34 @@ static WpStep wp_handle_fault_fragment(WpWalkState &st, BBTemplate *cur,
                  * inside this BB.  Memory faults never reach here (the load /
                  * store seam garbage-fills inline and keeps tb_ok true); this
                  * is either an EXECUTION-TIME fault at a retiring insn — x86
-                 * #DE/#UD/#GP/#AC, INTO/BOUND; MIPS arithmetic overflow or a
-                 * teq-family trap (fault_direct_match) — or a POST-COMPLETION
-                 * system-mode kernel-entry (an SVC/ECALL that retired, then its
-                 * handler failed out of spec mode).
+                 * #DE/#UD/#GP/#AC, a conditional trap; MIPS arithmetic
+                 * overflow; or a syscall-class kernel entry (syscall / int /
+                 * svc / ecall / break) — reported as a DIRECT match when the
+                 * unwind rewinds the PC to the instruction itself, or as a
+                 * POST-COMPLETION match when the architecture leaves the PC at
+                 * the following instruction (AArch64 SVC, whose ELR already
+                 * points past it).
                  *
-                 * Nothing retires on a wrong path, so an execution-time fault
-                 * must NOT truncate the excursion: mark the block synthetic,
-                 * clear the pending exception, skip the faulting insn, and
-                 * re-dispatch at its architectural fall-through to the wpdepth
-                 * budget — the faulting insn's destination stays stale (a
-                 * deterministic placeholder, exactly as the dominant memory
-                 * case).  The post-completion kernel-entry keeps the interim
-                 * graceful stop (out of scope for the arithmetic pass).
+                 * Nothing retires on a wrong path, so NO synchronous exception
+                 * truncates the excursion — a kernel entry least of all.  A
+                 * real out-of-order core fetches straight past a syscall and
+                 * squashes it at retire; the wrong path models that by taking
+                 * the syscall's unfollowable kernel edge as the taken side of
+                 * an ordinary branch and continuing on the NOT-taken side, its
+                 * architectural fall-through.  So every case here does the
+                 * same thing: mark the block synthetic, clear the pending
+                 * exception, skip the faulting instruction, and re-dispatch at
+                 * its fall-through until the wpdepth budget runs out.  The
+                 * skipped instruction's destinations stay stale — the
+                 * deterministic placeholder the dominant memory case already
+                 * uses — so its dependents still execute.
+                 *
+                 * The call itself is never performed.  In *-linux-user the
+                 * unwind lands in cpu_plugin_exec_tb()'s pad rather than
+                 * cpu_loop(), so the host-side dispatcher is unreachable (and
+                 * do_syscall()'s wrong-path barrier stands as the proof); in
+                 * system mode the x86 inline escalation unwinds here too
+                 * instead of loading LSTAR.
                  */
                 uint64_t fault_pc = post_pc_now;
 
@@ -982,17 +981,25 @@ static WpStep wp_handle_fault_fragment(WpWalkState &st, BBTemplate *cur,
 
                 if (!fault_direct_match) {
                     /*
-                     * POST-COMPLETION match: the insn retired and a downstream
-                     * event (a system-mode SVC/ECALL handler entry) failed out
-                     * of spec mode — not an execution-time fault at a retiring
-                     * insn.  Keep the interim graceful STOP: run the BB out to
-                     * its natural branch and seal it with the fault marker,
-                     * then end the excursion (acc.bb_fault_stop, consumed at
-                     * commit).  Under CST_NO_FAULT this instead continues to
-                     * the depth budget, exactly as before this policy existed.
+                     * POST-COMPLETION match: the exception was raised with the
+                     * PC ALREADY past the instruction that raised it, which is
+                     * how AArch64 reports a kernel entry (SVC leaves ELR at
+                     * SVC+4) and how a downstream handler-entry failure
+                     * surfaces.  @fault_pc is therefore the raising
+                     * instruction's own architectural fall-through — precisely
+                     * where the wrong path continues — so there is nothing to
+                     * skip: drop the pending exception and let the walk run on
+                     * from the PC it already holds.
+                     *
+                     * Poison the RAISING instruction, not @fault_pc: poisoning
+                     * the fall-through would abort the excursion at the very
+                     * block we are about to commit.
                      */
-                    acc.bb_fault_stop = g_features.wp_synthetic_marking;
-                    poisoned_targets.insert(fault_pc);
+                    qemu_plugin_spec_clear_exception();
+                    if (n_executed_in_cur > 0) {
+                        poisoned_targets.insert(
+                            cur->insn_pcs[n_executed_in_cur - 1]);
+                    }
 
                     /* Don't force-commit a BARE_BRANCH fragment that faulted:
                      * its delay slot is in the next QEMU TB and never landed
@@ -1073,43 +1080,55 @@ static WpStep wp_handle_fault_fragment(WpWalkState &st, BBTemplate *cur,
                      */
                     qemu_plugin_spec_clear_exception();
                     qemu_plugin_set_pc(skip_pc);
-                    poisoned_targets.insert(fault_pc);
+
+                    /*
+                     * Poison the faulting PC so a wrong path that circles back
+                     * to it gives up instead of re-faulting forever — but NOT
+                     * for a syscall-class instruction.  That one does not
+                     * "fault": it raises every single time, by design, and the
+                     * skip past it is its defined wrong-path behaviour.
+                     * Poisoning it would kill the excursion the second time the
+                     * speculation reached the same syscall — the exact chain
+                     * truncation this policy exists to remove, and a common
+                     * shape (glibc's _exit issues exit_group then exit in a
+                     * loop, and a retry loop around any syscall does the same).
+                     * Forward progress is still bounded by repeated_fault_pc
+                     * above and, ultimately, by the depth budget.
+                     */
+                    bool syscall_class_fault =
+                        n_executed_in_cur > 0 &&
+                        cur->insn_fields[n_executed_in_cur - 1].branch_type
+                            == BRANCH_SYSCALL_TYPE;
+                    if (!syscall_class_fault) {
+                        poisoned_targets.insert(fault_pc);
+                    }
 
                     if (branch_fired || bb_complete) {
                         /*
-                         * The faulting insn IS the BB terminator, i.e. a
-                         * deliberate control-transfer-to-kernel instruction that
-                         * faulted out of spec mode: a syscall / software
-                         * interrupt (syscall/int/svc/ecall/brk) or a conditional
-                         * trap (MIPS teq-family / x86 INTO) — all
-                         * BRANCH_SYSCALL_TYPE, and a plain branch never raises.
+                         * The faulting insn IS the BB terminator: a deliberate
+                         * control transfer to the kernel that raised out of
+                         * spec mode — a syscall or software interrupt
+                         * (syscall/int/svc/ecall/break), or a trap
+                         * (BRANCH_SYSCALL_TYPE either way) — since a plain
+                         * branch never raises.
                          *
-                         * Its correct resolution is a privilege escalation into
-                         * the kernel, which the single-address-space,
-                         * side-effect-free spec model cannot follow; falling
-                         * through to skip_pc would fabricate a path the real
-                         * machine never takes, breaking the "correct path on the
-                         * wrong path" guarantee.  So this is a genuine wrong-path
-                         * boundary (like translation-unavailable): commit the
-                         * complete true BB with the fault marker and TERMINATE
-                         * the excursion here, rather than continue.  (Contrast
-                         * the mid-BB computation faults below — div/#DE, a bad
-                         * load — whose fall-through IS correct, so they continue
-                         * on a garbage placeholder.)
+                         * Its architectural resolution is a privilege
+                         * escalation the single-address-space, side-effect-free
+                         * spec model cannot follow.  That makes the kernel edge
+                         * the UNFOLLOWABLE side of a two-way instruction, not a
+                         * reason to stop: a real out-of-order core fetches
+                         * straight past the syscall and squashes it at retire,
+                         * so the wrong path takes the other side — the
+                         * architectural fall-through at skip_pc — exactly as it
+                         * takes the not-taken side of any other branch.  Seal
+                         * the true BB here (the terminator did terminate a
+                         * block) and land the excursion at skip_pc, marked
+                         * synthetic because the syscall's own results are the
+                         * deterministic placeholder its dependents will read.
                          */
                         bb_complete = true;
                         awaiting_delay_slot = false;
-                        bool syscall_boundary =
-                            n_executed_in_cur > 0 &&
-                            cur->insn_fields[n_executed_in_cur - 1].branch_type
-                                == BRANCH_SYSCALL_TYPE;
-                        if (syscall_boundary) {
-                            acc.bb_fault_stop = g_features.wp_synthetic_marking;
-                        } else {
-                            /* Defensive: a non-syscall terminator that somehow
-                             * raised keeps the continue (should not arise). */
-                            fault_redispatch_pc = skip_pc;
-                        }
+                        fault_redispatch_pc = skip_pc;
                     } else {
                         /* Mid-BB fault: run the BB out to its natural branch
                          * (no partial, template-polluting commit).  Resume the
@@ -1125,8 +1144,8 @@ static WpStep wp_handle_fault_fragment(WpWalkState &st, BBTemplate *cur,
 /*
  * Walk the fragment list one speculative exec_tb produced, committing each
  * true BB it completes.  Owns the per-exec_tb fragment loop and its
- * abnormal-exit tail; all outcomes land in st (early_exit / fault_stop /
- * walk_done / fault_consumed), which the driver inspects after the call.
+ * abnormal-exit tail; all outcomes land in st (early_exit / walk_done /
+ * fault_consumed), which the driver inspects after the call.
  * The former outer-while break in the fault-PC-outside-TB tail becomes a
  * return (early_exit is latched, so the driver's tail break fires); every
  * break/continue inside the for-loop keeps steering the fragment loop.
@@ -1149,7 +1168,6 @@ static void wp_walk_fragments(WpWalkState &st)
     auto &sim_insns          = st.sim_insns;
     auto &awaiting_delay_slot = st.awaiting_delay_slot;
     auto &early_exit         = st.early_exit;
-    auto &fault_stop         = st.fault_stop;
     auto &poisoned_targets   = st.poisoned_targets;
     unsigned int cpu_index   = st.cpu_index;
     Stats &stats = *st.stats;
@@ -1384,29 +1402,20 @@ static void wp_walk_fragments(WpWalkState &st)
             }
 
             uint64_t commit_post_pc;
-            bool this_bb_fault_stop;
             wp_commit_bb(st, cur, n_executed_in_cur, last_insn_size,
-                         fault_redispatch_pc, commit_post_pc,
-                         this_bb_fault_stop);
+                         fault_redispatch_pc, commit_post_pc);
 
             acc.clear();
 
             /*
-             * Graceful fault-stop: this BB sealed carrying a POST-COMPLETION
-             * system-mode fault (an SVC/ECALL that retired, then its kernel
-             * entry failed out of spec mode).  The excursion ends cleanly HERE
-             * — the entry just pushed carries CST_WP_EVENT_FAULT at
-             * fault_insn_index as the explicit chain terminator.  Memory faults
-             * AND execution-time arithmetic / illegal / trap faults, by
-             * contrast, run on a deterministic placeholder / skip the faulting
-             * insn and do NOT set this — they continue to the depth budget.
+             * No synchronous exception ends the excursion here.  Memory faults
+             * run on a deterministic placeholder; execution-time arithmetic,
+             * illegal-instruction and trap faults skip the faulting insn; and
+             * a syscall-class kernel entry continues at its architectural
+             * fall-through.  All three carry CST_WP_EVENT_FAULT at
+             * fault_insn_index so the consumer knows where speculation would
+             * have squashed, and all three run on to the depth budget.
              */
-            if (this_bb_fault_stop) {
-                fault_stop = true;
-                walk_done = true;
-                break;
-            }
-
             if (poisoned_targets.count(commit_post_pc)) {
                 early_exit = true;
                 walk_done = true;
@@ -1499,7 +1508,6 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
      * set this: they skip the faulting insn and continue to the budget.
      * Distinct from early_exit (an abnormal drop): the chain so far is honest
      * and terminated on a marked fault, not truncated. */
-    auto &fault_stop = st.fault_stop;
     /* last_fault_pc / repeated_fault_pc / awaiting_delay_slot live in st,
      * owned by the fault / walk phases. */
 
@@ -1568,7 +1576,7 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
      * WP-walk driver.  Each outer iteration runs the phase pipeline over one
      * speculative step and dispatches on the WpStep each phase returns:
      * NEXT_ITER retries the iteration, PROCEED advances to the next phase,
-     * and any terminal reason has already latched st.early_exit / st.fault_stop
+     * and any terminal reason has already latched st.early_exit
      * so the tail break ends the excursion.  This compact dispatch is the
      * SealedBB -> simulate_wrong_path seam a future WpScheduler (task #92)
      * slots into.
@@ -1608,7 +1616,7 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
 
         wp_walk_fragments(st);
 
-        if (early_exit || fault_stop) {
+        if (early_exit) {
             break;
         }
     }

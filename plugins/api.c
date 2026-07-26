@@ -968,6 +968,11 @@ bool qemu_plugin_spec_mem_faulted_take(void)
     return true;
 }
 
+uint64_t qemu_plugin_spec_syscall_blocked_count(void)
+{
+    return qemu_plugin_spec_syscall_blocked;
+}
+
 void qemu_plugin_spec_clear_exception(void)
 {
     g_assert(current_cpu);

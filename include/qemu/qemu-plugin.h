@@ -1767,6 +1767,27 @@ QEMU_PLUGIN_API
 bool qemu_plugin_spec_mem_faulted_take(void);
 
 /**
+ * qemu_plugin_spec_syscall_blocked_count() - wrong-path syscalls refused
+ *
+ * Returns how many times a syscall was refused because the vCPU issuing it was
+ * on a plugin wrong path.  A speculative walk fetches and executes whatever
+ * the guest has ahead of a mispredicted branch, including syscall
+ * instructions; the walk continues past them at their architectural
+ * fall-through, but the call itself must never be performed, because in
+ * *-linux-user it is served by the HOST and would produce real side effects on
+ * a path the guest never takes.  That suppression is structural — a syscall
+ * instruction executed under qemu_plugin_spec_mode_begin() unwinds into
+ * qemu_plugin_exec_tb()'s landing pad, never into the syscall dispatcher — so
+ * this counter is a standing self-check rather than a policy knob and reads 0
+ * on a healthy run; a non-zero value means the suppression developed a hole
+ * and the trace ran with real side effects on it.  Always 0 in system
+ * emulation, where a syscall is guest kernel entry and has no host effect.
+ * Process-wide (all vCPUs); safe to call from plugin_exit().
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_spec_syscall_blocked_count(void);
+
+/**
  * qemu_plugin_spec_clear_exception() - drop a pending speculative exception
  *
  * Clears the guest exception a wrong-path EXECUTION-TIME fault latched when it

@@ -633,6 +633,24 @@ qemu_plugin_vcpu_syscall(CPUState *cpu, int64_t num, uint64_t a1, uint64_t a2,
 }
 
 /*
+ * Wrong-path (speculative) syscalls refused before they could reach the host.
+ *
+ * A plugin walking a mispredicted path fetches and executes whatever the guest
+ * has there, including a syscall instruction.  The wrong-path policy is that
+ * such an instruction is fetched and its wrong-path successors keep executing,
+ * but the call itself is NEVER performed: in *-linux-user a syscall is served
+ * by the host, so performing one speculatively would write files, send packets
+ * or kill the process on a path the guest never takes.  Suppression is
+ * structural — every target's syscall instruction unwinds through
+ * cpu_plugin_exec_tb()'s own landing pad, so do_syscall() is unreachable while
+ * cpu->plugin_spec_mode is set — and this counter is the standing proof: the
+ * guard in do_syscall() bumps it instead of executing, so a non-zero value
+ * means the structural suppression developed a hole.  Read through
+ * qemu_plugin_spec_syscall_blocked_count().
+ */
+uint64_t qemu_plugin_spec_syscall_blocked;
+
+/*
  * Disable CFI checks.
  * The callback function has been loaded from an external library so we do not
  * have type information

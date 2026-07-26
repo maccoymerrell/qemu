@@ -2300,6 +2300,20 @@ void helper_lret_protected(CPUX86State *env, int shift, int addend)
 
 void helper_sysenter(CPUX86State *env)
 {
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path SYSENTER: the fast-entry twin of the system-mode
+     * helper_syscall(), and likewise an inline privilege escalation rather
+     * than a raised exception.  Unwind so the speculative walk resumes at the
+     * architectural fall-through instead of running the guest's kernel entry
+     * path.  (This file is built for both modes; in *-linux-user SYSENTER is
+     * not a syscall ABI, but the guard costs one predicted branch.)
+     */
+    if (unlikely(env_cpu(env)->plugin_spec_mode)) {
+        cpu_loop_exit_restore(env_cpu(env), GETPC());
+    }
+#endif
+
     if (env->sysenter_cs == 0) {
         raise_exception_err_ra(env, EXCP0D_GPF, 0, GETPC());
     }

@@ -176,6 +176,13 @@ qemu_plugin_vcpu_syscall(CPUState *cpu, int64_t num, uint64_t a1,
                          uint64_t a6, uint64_t a7, uint64_t a8);
 void qemu_plugin_vcpu_syscall_ret(CPUState *cpu, int64_t num, int64_t ret);
 
+/*
+ * Count of syscalls refused because the vCPU was on a plugin wrong path.
+ * The suppression is structural (see plugins/core.c); this counter is the
+ * standing proof that it holds, and stays 0 on a healthy run.
+ */
+extern uint64_t qemu_plugin_spec_syscall_blocked;
+
 void qemu_plugin_vcpu_mem_cb(CPUState *cpu, uint64_t vaddr,
                              uint64_t value_low,
                              uint64_t value_high,

@@ -812,26 +812,47 @@ static const char *cap_x86_skip_rep(const char *mnem)
     return mnem;
 }
 
+/*
+ * Match a string-op mnemonic EXACTLY: one of the seven bases followed by
+ * exactly one AT&T size suffix.  Prefix matching is NOT safe here --
+ * several SSE mnemonics share these prefixes and take ordinary memory
+ * operands whose base register may perfectly well be %rsi or %rdi:
+ *
+ *   movss / movsd    scalar FP moves      ("movs" + s/d)
+ *   cmpss / cmpsd    scalar FP compares   ("cmps" + s/d)
+ *   movsx / movsxd   sign-extending moves
+ *   insertps         ("ins" + ...)
+ *
+ * Treating `movsd (%rdi), %xmm0` -- a load, and %rdi is the first
+ * argument register -- as a string op would give its memory operand the
+ * (%rDI) direction and so turn a load into a store.  The string size
+ * suffixes (b/w/l/q) are disjoint from the scalar-FP ones (s/d), and the
+ * 32-bit string compare is spelled `cmpsl` in AT&T and never `cmpsd`, so
+ * an exact base+suffix match separates the two families cleanly.
+ */
 static bool cap_x86_is_string_op(const char *mnem)
 {
+    static const char *const bases[] = {
+        "movs", "cmps", "scas", "lods", "stos", "ins", "outs",
+    };
     if (!mnem) {
         return false;
     }
     mnem = cap_x86_skip_rep(mnem);
-    /* AT&T syntax (QEMU's) size-suffixes the mnemonic: movsb/movsw/
-     * movsl/movsq and so on.  MOVSX / MOVSXD / MOVZX are sign- and
-     * zero-extending moves, not string moves, and must not match --
-     * "movs" is a prefix of "movsx", so exclude them explicitly. */
-    if (g_str_has_prefix(mnem, "movs")) {
-        return !g_str_has_prefix(mnem, "movsx") &&
-               !g_str_has_prefix(mnem, "movsxd");
+    size_t len = strlen(mnem);
+    for (size_t i = 0; i < ARRAY_SIZE(bases); i++) {
+        size_t bl = strlen(bases[i]);
+        if (len != bl + 1 || memcmp(mnem, bases[i], bl) != 0) {
+            continue;
+        }
+        switch (mnem[bl]) {
+        case 'b': case 'w': case 'l': case 'q':
+            return true;
+        default:
+            return false;
+        }
     }
-    return g_str_has_prefix(mnem, "cmps") ||
-           g_str_has_prefix(mnem, "scas") ||
-           g_str_has_prefix(mnem, "lods") ||
-           g_str_has_prefix(mnem, "stos") ||
-           g_str_has_prefix(mnem, "ins")  ||
-           g_str_has_prefix(mnem, "outs");
+    return false;
 }
 
 static uint8_t cap_x86_string_mem_access(const char *mnem, unsigned base_reg)

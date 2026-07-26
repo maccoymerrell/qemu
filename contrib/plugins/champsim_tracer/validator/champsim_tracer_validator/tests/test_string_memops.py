@@ -158,6 +158,27 @@ pc_roundsd:
 pc_nop:
     nopw 0(%%rax,%%rax,1)
 
+    /* ---- scalar-FP mnemonics that merely LOOK like string ops -------
+     * movss/movsd/cmpss/cmpsd share a prefix with movs/cmps, and their
+     * base register here is deliberately %%rdi and %%rsi -- the two
+     * string pointers.  A prefix-matching string-op rule would give
+     * these the (%%rDI)/(%%rSI) direction and turn `movsd (%%rdi),%%xmm`
+     * -- a load -- into a store. */
+    lea  bufA(%%rip), %%rdi
+    lea  bufA(%%rip), %%rsi
+    .globl pc_movsd_ld
+pc_movsd_ld:
+    movsd (%%rdi), %%xmm0
+    .globl pc_movss_ld
+pc_movss_ld:
+    movss (%%rsi), %%xmm1
+    .globl pc_cmpsd_ld
+pc_cmpsd_ld:
+    cmpsd $0, (%%rdi), %%xmm2
+    .globl pc_movsd_st
+pc_movsd_st:
+    movsd %%xmm0, (%%rdi)
+
     /* exit(0) */
     mov  $60, %%eax
     xor  %%edi, %%edi
@@ -191,6 +212,12 @@ EXPECT_LANES = {
     # The multi-byte NOP performs no memory access, so it must claim
     # neither lane.
     "pc_nop":     (0, 0),
+    # Scalar-FP loads/stores that share a prefix with the string ops.
+    # Their direction must follow the instruction, not the base register.
+    "pc_movsd_ld": (1, 0),
+    "pc_movss_ld": (1, 0),
+    "pc_cmpsd_ld": (1, 0),
+    "pc_movsd_st": (0, 1),
 }
 
 
@@ -257,8 +284,8 @@ class StringMemopsTest(unittest.TestCase):
                          f"assembling the probe failed:\n{build.stderr[-800:]}")
 
         pcs = _label_pcs(binp)
-        missing = [k for k in list(EXPECT) + ["pc_roundss", "pc_roundsd",
-                                              "pc_nop"] if k not in pcs]
+        missing = [k for k in set(list(EXPECT) + list(EXPECT_LANES))
+                   if k not in pcs]
         self.assertFalse(missing, f"symbol table did not show {missing}")
 
         out = work / "strops"
@@ -393,6 +420,17 @@ class StringMemopsTest(unittest.TestCase):
             "pc_nop": "the multi-byte NOP performs no memory access at all "
                       "(Intel SDM), but its MEM operand comes back READ "
                       "(cap_x86_mem_is_never_accessed)",
+            "pc_movsd_ld": "movsd is a scalar-FP load, not a string move; a "
+                           "prefix-matching string-op rule would give its "
+                           "(%rdi) operand the string destination's WRITE "
+                           "direction (cap_x86_is_string_op)",
+            "pc_movss_ld": "movss is a scalar-FP load, not a string move "
+                           "(cap_x86_is_string_op)",
+            "pc_cmpsd_ld": "cmpsd is a scalar-FP compare, not the 32-bit "
+                           "string compare -- that one is spelled cmpsl in "
+                           "AT&T (cap_x86_is_string_op)",
+            "pc_movsd_st": "movsd is a scalar-FP store, not a string move "
+                           "(cap_x86_is_string_op)",
         }
         for lbl, want in EXPECT_LANES.items():
             got = lanes.get(lbl)

@@ -466,14 +466,12 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
     }
     bool move_store = mv_fam && mv_has_mem && mv_has_reg
         && !mv_any_write;
-    /* Capstone-6.0.0 bug: the register-source form of TEST (opcodes
-     * 84/85, `test r/m, r`) reports EVERY operand with empty access, so
-     * its MEM operand's READ is lost and it mints no load slot (the
-     * offline lint then flags the observed load as impossible).  TEST
-     * only reads its operands — it writes flags, never memory or a
-     * register — so force READ on any empty-access operand below.  The
-     * immediate forms (F6/F7) already report the MEM operand READ and
-     * are left untouched (their access is non-zero). */
+    /* Capstone-6.0.0 access-flag bugs on TEST — see cap_x86_is_test.
+     * TEST computes `src1 AND src2`, discards the result and writes
+     * only EFLAGS: it never writes an operand.  Two distinct defects
+     * violate that, in opposite directions, so force plain READ on
+     * every TEST operand below.  Architecturally exact, and a no-op on
+     * the encodings Capstone already reports correctly. */
     bool test_read = cap_x86_is_test(insn->mnemonic);
 
     for (uint8_t i = 0; i < n; i++) {
@@ -481,7 +479,7 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
         qemu_plugin_operand *op = &out->operands[i];
 
         op->access = cop->access;
-        if (test_read && op->access == 0) {
+        if (test_read) {
             op->access = QEMU_PLUGIN_OP_ACC_READ;
         }
         op->size = cop->size;
@@ -600,10 +598,44 @@ static bool cap_x86_is_extract_store(const char *mnem)
            g_str_equal(mnem, "extractps");
 }
 
-/* The scalar integer TEST (`test r/m, r` / `test r/m, imm`).  Its
- * register-source encodings lose all Capstone access flags (see the
- * test_read workaround in cap_fill_x86_operands); TEST never writes an
- * operand, so any empty-access operand is a lost READ. */
+/*
+ * Capstone 6.0.0-Alpha7 x86 access-flag bugs on TEST.
+ *
+ * TEST (`test r/m, r` / `test r/m, imm`) ANDs its two operands, throws
+ * the result away and writes EFLAGS only -- it never writes an operand.
+ * This Capstone version breaks that in two ways:
+ *
+ *   1. LOST READ.  Some register-source encodings report EVERY operand
+ *      with empty access, so a MEM operand's READ is lost and the insn
+ *      mints no load slot (the offline lint then flags the observed
+ *      load as impossible).
+ *
+ *   2. PHANTOM WRITE.  Opcode A9 (`test eAX, imm32`) AT 32-BIT OPERAND
+ *      SIZE ONLY reports its accumulator operand CS_AC_READ|CS_AC_WRITE
+ *      and additionally lists eax in regs_access()'s write set:
+ *
+ *        a9 00 00 20 00     testl $0x200000,%eax   op1 eax access=RW  <-- WRONG
+ *        a8 01              testb $1,%al           op1 al   access=READ
+ *        66 a9 00 20        testw $0x2000,%ax      op1 ax   access=READ
+ *        48 a9 00 00 20 00  testq $0x200000,%rax   op1 rax  access=READ
+ *        f7 c0 ...          testl $0x200000,%eax   op1 eax  access=READ
+ *        85 c0 / 84 c0      test %eax,%eax         both     access=READ
+ *
+ *      The 8-bit (A8), 16-bit (66 A9), 64-bit (REX.W A9) and every
+ *      ModRM form (F6/F7 /0, 84, 85) are correct; only A9-32 is
+ *      mis-flagged.  Left uncorrected it mints a phantom destination
+ *      register on one of the hottest insns in an interpreter loop --
+ *      false WAW/RAW edges and a wasted ChampSim destination slot
+ *      (34,096 insns, 0.68% of the cross-validated perlbench span;
+ *      PIN/XED reports dst={flags}, this reports dst={flags,rax}).
+ *
+ * Both are corrected the same way and at the same boundary as the
+ * PEXTR and store-move access-flag defects: identify the family by
+ * mnemonic and force plain CS_AC_READ on every operand, which is what
+ * the architecture says and therefore cannot disturb the encodings
+ * Capstone already reports correctly.  Revisit / remove when Capstone
+ * is bumped past 6.0.0-Alpha7.
+ */
 static bool cap_x86_is_test(const char *mnem)
 {
     /* AT&T syntax (QEMU's) size-suffixes the mnemonic: testb/testw/

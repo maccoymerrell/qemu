@@ -851,6 +851,19 @@ Disassembly and target metadata
      ``VMOVUPS`` and kin writing memory).  Capstone marks the
      memory destination ``READ``-only; the same filler forces
      ``WRITE``.
+   * x86 ``TEST``.  ``TEST`` ANDs its operands, discards the result
+     and writes ``EFLAGS`` only — it never writes an operand.
+     Capstone breaks that in both directions: some register-source
+     encodings report every operand with ``access == 0`` (a lost
+     ``READ``, so a memory operand mints no load slot), and opcode
+     ``A9`` **at 32-bit operand size only** reports its accumulator
+     operand ``READ|WRITE`` (a phantom destination register — false
+     WAW/RAW edges and a wasted ChampSim destination slot).  The
+     8-bit ``A8``, 16-bit ``66 A9``, 64-bit ``REX.W A9`` and every
+     ModRM form (``F6``/``F7 /0``, ``84``, ``85``) are correct.
+     ``cap_fill_x86_operands`` forces plain ``READ`` on every
+     ``TEST`` operand, which is what the architecture says and so
+     cannot disturb the correctly-reported encodings.
    * MIPS memory access flags.  MSA vector loads/stores and the
      unaligned scalar family (``LWL`` / ``LWR`` / ``LDL`` / ``LDR``
      / ``SWL`` / ``SWR`` / ``SDL`` / ``SDR``) report their memory

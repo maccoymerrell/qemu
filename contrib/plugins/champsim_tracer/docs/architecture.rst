@@ -357,7 +357,8 @@ stream in order.  The validator asserts it directly — see the
 ``thread_strand`` check in :doc:`validator`, which fails a trace in which
 two concurrent streams braid inside one context.
 
-RISC-V is the documented exception (:ref:`limits-kernel-strand`): its trap
+RISC-V is the documented exception (:ref:`kernel-strand identity
+<limits-kernel-strand>`): its trap
 entry repurposes ``tp``, so only user-privilege samples are trusted there
 and kernel code is attributed to the thread that entered the kernel on
 that vCPU — correct while a process stays put, wrong for work left on a

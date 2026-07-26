@@ -329,6 +329,17 @@ enum qemu_plugin_mem_value_type {
     QEMU_PLUGIN_MEM_VALUE_U32,
     QEMU_PLUGIN_MEM_VALUE_U64,
     QEMU_PLUGIN_MEM_VALUE_U128,
+    /*
+     * The access is wider than the 128 bits qemu_plugin_mem_value can
+     * carry (CPUState only ever latches the low 128 bits into
+     * plugin_mem_value_low/high — see tcg_gen_plugin_mem_cb() in
+     * tcg/tcg-op-ldst.c).  No in-tree target currently emits a MemOp
+     * whose size shift exceeds MO_128, so this is a forward-compat
+     * degrade path rather than a live case; appended at the end of the
+     * enum to avoid renumbering the existing values.  data.u128 is
+     * zeroed rather than left uninitialized.
+     */
+    QEMU_PLUGIN_MEM_VALUE_INVALID,
 };
 
 /* typedef qemu_plugin_mem_value - value accessed during a load/store */
@@ -661,7 +672,10 @@ bool qemu_plugin_mem_is_store(qemu_plugin_meminfo_t info);
  * qemu_plugin_mem_get_value() - return last value loaded/stored
  * @info: opaque memory transaction handle
  *
- * Returns: memory value
+ * Returns: memory value. If the access is wider than 128 bits — which no
+ * in-tree target currently emits, since CPUState only latches the low 128
+ * bits of an access for plugin use — the returned value has type
+ * QEMU_PLUGIN_MEM_VALUE_INVALID and zeroed data, rather than aborting.
  */
 QEMU_PLUGIN_API
 qemu_plugin_mem_value qemu_plugin_mem_get_value(qemu_plugin_meminfo_t info);

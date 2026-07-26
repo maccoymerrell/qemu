@@ -406,7 +406,23 @@ qemu_plugin_mem_value qemu_plugin_mem_get_value(qemu_plugin_meminfo_t info)
         value.data.u128.high = current_cpu->neg.plugin_mem_value_high;
         break;
     default:
-        g_assert_not_reached();
+        /*
+         * No in-tree target emits a MemOp whose size shift exceeds
+         * MO_128, and CPUState only ever latches the low 128 bits of an
+         * access into plugin_mem_value_low/high (tcg_gen_plugin_mem_cb()
+         * in tcg/tcg-op-ldst.c) — a wider access has already lost its
+         * upper bits before this function is reached, so there is
+         * nothing correct to return.  Degrade instead of aborting the
+         * whole emulator: report the access as unrepresentable and let
+         * the plugin decide what to do with it.
+         */
+        warn_report_once("qemu_plugin_mem_get_value: access wider than "
+                          "128 bits (size shift %u) is not representable; "
+                          "returning QEMU_PLUGIN_MEM_VALUE_INVALID",
+                          qemu_plugin_mem_size_shift(info));
+        value.type = QEMU_PLUGIN_MEM_VALUE_INVALID;
+        memset(&value.data, 0, sizeof(value.data));
+        break;
     }
     return value;
 }

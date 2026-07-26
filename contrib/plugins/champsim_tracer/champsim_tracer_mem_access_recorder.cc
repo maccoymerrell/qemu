@@ -68,6 +68,16 @@ void capture_mem_value(qemu_plugin_meminfo_t info,
             acc->data.limb[0] = val.data.u128.low;
             acc->data.limb[1] = val.data.u128.high;
             break;
+        case QEMU_PLUGIN_MEM_VALUE_INVALID:
+        default:
+            /* qemu_plugin_mem_get_value() degrades to this rather than
+             * aborting when the access is wider than 128 bits (see
+             * plugins/api.c).  Unreachable today -- the shift <= 4 guard
+             * above already excludes anything past MO_128 -- but a
+             * missing case here would silently mis-decode a future
+             * wider MemOp instead of failing safe. */
+            cst_wide_zero(&acc->data);
+            break;
         }
         return;
     }

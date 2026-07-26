@@ -1094,10 +1094,12 @@ struct BodyEntry {
      * merge): the indices of the instructions that faulted, one per
      * excursion, in order.  Empty for ordinary entries. */
     std::vector<uint32_t> fault_anchors;
-    /* Wire thread identity: the guest-thread id (system-mode pin,
-     * resolved from the kernel per-thread pointer and stable across vCPU
-     * migration) or the vCPU index (user mode / unpinned).  This is the
-     * ONLY thread field that reaches the stream. */
+    /* Wire thread identity: always a GUEST-THREAD id, stable across vCPU
+     * migration and distinct for threads that time-slice one vCPU.  System
+     * mode resolves it from the kernel per-thread pointer; user mode uses
+     * cpu_index, which qemu-user allocates per guest thread.  The vCPU is
+     * never on the wire; this is the ONLY thread field that reaches the
+     * stream. */
     uint32_t thread_id;
     /* Wire address-space identity: the compact asid index of the live
      * page-table root at capture (0 in user mode / a single address space).

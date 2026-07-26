@@ -752,35 +752,60 @@ uint64_t cst_pinned_asid_sig(void)
     return g_pin_repr_sig.load(std::memory_order_relaxed);
 }
 
+/* Full-system emulation (qemu_info_t::system_emulation, latched at
+ * install).  Declared here because the guest-thread identity below is what
+ * distinguishes the two emulation modes: system mode has one CPUState per
+ * vCPU and must derive the thread from guest state, user mode has one per
+ * guest thread and gets it for free. */
+static bool g_system_mode;
+
 /*
- * Guest-thread identity for a system-mode pin.
+ * Guest-thread identity.
  *
  * The wire's thread_id names a GUEST thread, not the vCPU it happens to
  * run on: a thread that migrates across vCPUs keeps one identity, and two
  * threads time-slicing one vCPU are two identities.  The vCPU index (the
  * QEMU cpu_index) is a scheduling slot and never reaches the wire.
  *
- * The kernel-maintained per-thread pointer register (x86 FS/GS.base,
- * AArch64 TPIDR_EL0, RISC-V tp, MIPS CP0 UserLocal — qemu_plugin_get_
- * thread_ptr) is that identity: every mainstream kernel context-switches
- * it per software thread.  A per-SEGMENT map assigns each distinct value a
- * compact tid in first-sighting order (0, 1, 2, …), so a single-threaded
- * pinned process is always tid 0 regardless of vCPU, and the field width
- * (small ints) is never stressed.  The map is meaningful only at USER
- * privilege for the pinned process; it is populated exactly where the pin
- * machinery already confirms that context (a user-owned priv-0 TB).
+ * In USER mode the two coincide by construction and nothing below runs:
+ * qemu-user gives every guest thread its own CPUState (clone's CLONE_VM
+ * path calls cpu_copy(), which cpu_create()s a vCPU and cpu_list_add()
+ * hands it the next free index), so a "vCPU" there IS a guest thread and
+ * cpu_index is a per-thread identifier, stable for that thread's whole
+ * lifetime.  See resolve_thread_id() for the one boundary on that
+ * equivalence.
  *
- * g_vcpu_cur_tid[c] tracks the tid of the most recent user TB on vCPU c;
- * kernel TBs of the pinned process carry it unchanged (they inherit the
- * thread that entered the kernel), and it is advanced AFTER the deferred-
- * prev seal so an emitted BB is attributed to the thread that executed it,
- * not the one about to run next.  Both structures are guarded by exec_lock
- * (every sample and every emit runs under it) and reset per segment.
+ * SYSTEM mode has to derive the identity, because one vCPU hosts every
+ * thread the guest scheduler puts on it.  The kernel-maintained per-thread
+ * pointer register (x86-64 FS.base, AArch64 TPIDR_EL0, RISC-V tp, MIPS CP0
+ * UserLocal — qemu_plugin_get_thread_ptr) is that identity: every
+ * mainstream kernel reloads it from the incoming task at each context
+ * switch.  A per-SEGMENT map assigns each distinct value a compact tid in
+ * first-sighting order (0, 1, 2, …), so a single-threaded traced process is
+ * always tid 0 regardless of vCPU, and the field width (small ints) is
+ * never stressed.
+ *
+ * g_vcpu_cur_tid[c] tracks the identity of the task vCPU c is CURRENTLY
+ * executing, sampled per TB and advanced AFTER the deferred-prev seal so an
+ * emitted BB is attributed to the thread that executed it, not the one
+ * about to run next.  Where the target reports
+ * qemu_plugin_thread_ptr_tracks_current() the sample is taken at every
+ * privilege level, which is what lets a task switch that happens entirely
+ * inside the kernel be followed: a freshly cloned child finishing its
+ * ret_from_fork before it has ever run a user instruction, a kernel thread
+ * scheduled in on a borrowed mm, or a handler running after the scheduler
+ * moved on.  Where it does not (RISC-V, whose trap entry repurposes tp),
+ * only user-privilege samples are trusted and kernel code inherits the
+ * thread that entered the kernel on that vCPU — see the KERNEL-STRAND
+ * degradation note in docs/limitations.rst.  Both structures are guarded by
+ * exec_lock (every sample and every emit runs under it) and reset per
+ * segment.
  *
  * Degradation, documented: a target/model whose thread pointer is never
  * written (no MIPS Config3.ULRI, a guest that sets no TLS) reports 0 for
  * every thread, so all threads collapse to tid 0 — honest indistinctness,
- * not fabricated identity.
+ * not fabricated identity.  Kernel threads, which carry no TLS pointer,
+ * likewise share the tid minted for the value 0.
  */
 static std::unordered_map<uint64_t, uint32_t> *g_thread_tid_map;
 static uint32_t g_thread_tid_next = 0;
@@ -827,17 +852,71 @@ static bool g_pin_multivcpu_warned = false;
 static constexpr uint64_t CST_TP_UNSEEN = UINT64_MAX;
 static uint64_t g_vcpu_last_tp[CST_PIN_MAX_VCPUS];
 
-/* CST_TIDDIAG: emit (thread_ptr -> tid) and (vcpu <-> tid) bindings to
- * stderr so an offline check can confirm the wire's tid is decoupled from
- * the vCPU (one tid spanning vCPUs = migration; two tids on one vCPU =
- * time-slice).  vCPU never reaches the wire; this is a stderr-only aid. */
+/* CST_TIDDIAG accounting for the kernel-privilege sample's effect on the
+ * wire.  g_vcpu_user_tid[c] is what vCPU c's identity WOULD be if only
+ * user-privilege samples were trusted — the attribution rule before the
+ * kernel-strand sample, and still the live rule on a target that reports
+ * no qemu_plugin_thread_ptr_tracks_current().  Comparing it against the
+ * emitted thread_id per entry says exactly which entries the kernel sample
+ * re-attributed, and at which privilege, in ONE run: a full-system boot is
+ * not reproducible across processes, so a two-run decode diff cannot
+ * isolate the change.  Diagnostic only; never consulted by the wire. */
+static uint32_t g_vcpu_user_tid[CST_PIN_MAX_VCPUS];
+static uint64_t g_tiddiag_kern_retagged;
+static uint64_t g_tiddiag_user_retagged;
+static uint64_t g_tiddiag_kern_entries;
+static uint64_t g_tiddiag_user_entries;
+
+/* CST_TIDDIAG: stderr-only thread-identity diagnostics, never wire content.
+ *
+ *   1  the (thread_ptr -> tid) and (vcpu <-> tid) bindings, so an offline
+ *      check can confirm the wire's tid is decoupled from the vCPU (one tid
+ *      spanning vCPUs = migration; two tids on one vCPU = time-slice), plus
+ *      the end-of-run kernel-strand re-attribution tally.
+ *   2  additionally every transition of the thread-pointer register as seen
+ *      on each vCPU, at whatever privilege — the bring-up probe for "does
+ *      this target's register discriminate KERNEL strands?".
+ */
+static int tiddiag_level(void)
+{
+    static int lvl = -1;
+    if (lvl < 0) {
+        const char *s = getenv("CST_TIDDIAG");
+        lvl = s ? (s[0] >= '1' && s[0] <= '9' ? s[0] - '0' : 1) : 0;
+    }
+    return lvl;
+}
+
 static bool tiddiag_on(void)
 {
-    static int flag = -1;
-    if (flag < 0) {
-        flag = getenv("CST_TIDDIAG") ? 1 : 0;
+    return tiddiag_level() > 0;
+}
+
+/* CST_TIDDIAG=2: trace every transition of the thread-pointer register as
+ * sampled on THIS vCPU, at whatever privilege the TB runs at, so an offline
+ * check can answer whether the register discriminates KERNEL strands (a
+ * kthread, a handler running after an in-kernel switch) from the user thread
+ * that entered.  Diagnostic only — nothing here reaches the wire, and the
+ * attribution path still samples at user privilege. */
+static void tiddiag_probe_ktp(unsigned int cpu_index, int priv, uint64_t pc)
+{
+    static uint64_t last[CST_PIN_MAX_VCPUS];
+    static bool primed[CST_PIN_MAX_VCPUS];
+    static unsigned budget = 3000;      /* a wandering guest can switch a lot */
+    if (cpu_index >= CST_PIN_MAX_VCPUS) {
+        return;
     }
-    return flag != 0;
+    uint64_t tp = qemu_plugin_get_thread_ptr();
+    if (primed[cpu_index] && last[cpu_index] == tp) {
+        return;
+    }
+    primed[cpu_index] = true;
+    last[cpu_index] = tp;
+    if (budget-- == 0) {
+        return;
+    }
+    fprintf(stderr, "champsim_tracer: [tiddiag] ktp vcpu=%u priv=%d "
+            "tp=0x%" PRIx64 " pc=0x%" PRIx64 "\n", cpu_index, priv, tp, pc);
 }
 
 /* Log the first sighting of each distinct (vCPU, tid) pair.  A set-based
@@ -857,9 +936,37 @@ static void tiddiag_note_binding(unsigned int cpu_index, uint32_t tid)
     }
 }
 
+/* Whether this target's thread-pointer register still names the executing
+ * software thread when sampled above user privilege.  Latched once (the
+ * answer is a property of the target, not of the run); first call is from a
+ * vCPU context, which the plugin API requires. */
+static bool thread_ptr_tracks_current(void)
+{
+    static int cap = -1;
+    if (cap < 0) {
+        cap = qemu_plugin_thread_ptr_tracks_current() ? 1 : 0;
+    }
+    return cap != 0;
+}
+
+/* Read the guest-thread pointer for the vCPU running at @live_priv, into
+ * @tp.  Returns false when the register cannot be trusted at that
+ * privilege — i.e. above user privilege on a target whose kernel entry
+ * repurposes it — in which case the caller must leave the vCPU's current
+ * identity alone and let kernel code inherit the entering thread. */
+static bool thread_ptr_sample(int live_priv, uint64_t *tp)
+{
+    if (live_priv != 0 && !thread_ptr_tracks_current()) {
+        return false;
+    }
+    *tp = qemu_plugin_get_thread_ptr();
+    return true;
+}
+
 /* Map a guest thread-pointer value to its compact per-segment tid
  * (first-sighting order).  Caller holds exec_lock and has established the
- * value was sampled at user privilege for the pinned process. */
+ * value was sampled at a privilege where it names the current task
+ * (thread_ptr_sample). */
 static uint32_t thread_ptr_to_tid(uint64_t tp)
 {
     if (!g_thread_tid_map) {
@@ -914,6 +1021,7 @@ static void thread_identity_reset(void)
     g_thread_tid_next = 0;
     for (unsigned i = 0; i < CST_PIN_MAX_VCPUS; i++) {
         g_vcpu_cur_tid[i] = 0;
+        g_vcpu_user_tid[i] = 0;
         g_vcpu_cur_asid_index[i] = 0;
         g_vcpu_last_tp[i] = CST_TP_UNSEEN;
     }
@@ -921,14 +1029,32 @@ static void thread_identity_reset(void)
     g_pin_multivcpu_warned = false;
 }
 
-/* The thread_id stamped on an emitted body entry.  System-mode pin: the
- * guest-thread identity (stable across vCPU migration).  User mode and any
- * unpinned run: the vCPU index verbatim, exactly as before this mapping
- * existed, so those traces stay byte-identical. */
+/* The thread_id stamped on an emitted body entry — always a guest-thread
+ * identifier, never a vCPU index.
+ *
+ * SYSTEM mode (pinned or not) resolves the identity the guest-thread map
+ * minted for the task the vCPU is currently executing.  It is deliberately
+ * NOT conditioned on the pin: an unpinned system trace (trace-all, or a
+ * plain icount window with no marker) runs many threads on each vCPU, so
+ * returning cpu_index there would stamp every thread on vCPU N with the
+ * same id and hand the consumer the scheduling slot the format promises it
+ * will never see.
+ *
+ * USER mode returns cpu_index, and that value already satisfies the
+ * contract rather than escaping it: qemu-user creates a CPUState per guest
+ * thread (clone/CLONE_VM -> cpu_copy -> cpu_create -> cpu_list_add), so the
+ * index is a per-guest-thread tag, held for the thread's entire lifetime,
+ * with no scheduler multiplexing behind it.  One boundary, and it is the
+ * only one: cpu_list_remove() releases the index when a thread exits and
+ * cpu_get_free_index() may hand the same number to a thread created later,
+ * so ids are unique among threads that are alive together (which is what a
+ * consumer keying per-thread state needs) but may be reused across a
+ * thread's death.  The guest-thread map is not used here because the
+ * identity is already exact and because minting fresh values would change
+ * every user-mode trace byte-for-byte for no gain in meaning. */
 static inline uint32_t resolve_thread_id(unsigned int cpu_index)
 {
-    if (g_pinned_asid.load(std::memory_order_relaxed) != CST_ASID_UNPINNED &&
-        cpu_index < CST_PIN_MAX_VCPUS) {
+    if (g_system_mode && cpu_index < CST_PIN_MAX_VCPUS) {
         return g_vcpu_cur_tid[cpu_index];
     }
     return (uint32_t)cpu_index;
@@ -1730,7 +1856,8 @@ static char     *start_symbol            = nullptr;
 static uint64_t  start_symbol_occurrence = 1;
 static uint64_t  start_symbol_match_count = 0;
 static int       g_window_mode           = 0; /* PluginConfig::WIN_AUTO */
-static bool g_system_mode;                 /* full-system emulation (set at install) */
+/* g_system_mode (full-system emulation, set at install) is declared with the
+ * guest-thread identity block above, which is what turns on it. */
 static inline bool pinned_simpoint_mode(void);
 
 /* Recompute g_next_threshold given the current segments / simpoint
@@ -1806,11 +1933,14 @@ static void recompute_budget(unsigned int cpu_index)
 
 /* ========================= Thread ID assignment =========================
  *
- * thread_id on the wire is resolve_thread_id()'s result: the vCPU index
- * verbatim in user mode / any unpinned run, or the remapped guest-thread
- * identity (stable across vCPU migration) in a system-mode pinned trace.
- * Each segment's body opens with an explicit BODY_TAG_THREAD_SWITCH
- * naming the starting thread.
+ * thread_id on the wire is resolve_thread_id()'s result, and it always
+ * names a GUEST THREAD — never the vCPU, which is a host scheduling slot
+ * the format keeps off the wire entirely.  In system mode that is the
+ * identity minted for the task the vCPU is currently running (see the
+ * guest-thread identity block near thread_ptr_to_tid); in user mode it is
+ * cpu_index, which qemu-user already allocates one-per-guest-thread.  Each
+ * segment's body opens with an explicit BODY_TAG_THREAD_SWITCH naming the
+ * starting thread.
  */
 
 /* ========================= SimPoints ========================= */
@@ -2581,30 +2711,36 @@ static void start_trace_segment(const char *label,
     std::vector<InitialRegSnap> regfile;
     capture_initial_regfile(cpu_index, &regfile);
 
-    /* Seed thread id: the opener's guest-thread identity.  The map was
-     * just reset (reset_segment_local_state), so the first user-privilege
-     * thread pointer sampled here takes tid 0 — a single-threaded pinned
-     * process is thread 0 on any vCPU, and single-thread system goldens
-     * stay byte-stable (cpu_index 0 and first-sighting 0 coincide).  A
-     * non-pinned (user-mode / plain-icount) open keeps the vCPU index as
-     * the seed, preserving byte-identical output.  When the open lands on
-     * a kernel TB (no meaningful thread pointer yet) the seed is thread 0
-     * and the first user TB establishes the mapping. */
+    /* Seed thread id: the opener's guest-thread identity.  The map was just
+     * reset (reset_segment_local_state), so the thread pointer sampled here
+     * takes tid 0 — a single-threaded traced process is thread 0 on any
+     * vCPU, and single-thread system goldens stay byte-stable (cpu_index 0
+     * and first-sighting 0 coincide).  User mode keeps cpu_index, which is
+     * already the guest thread there (see resolve_thread_id).  When the
+     * open lands on a kernel TB of a target whose thread pointer is not
+     * readable at that privilege, the seed is thread 0 and the first user
+     * TB establishes the mapping. */
     uint32_t seed_thread_id = (uint32_t)cpu_index;
-    if (g_pinned_asid.load(std::memory_order_relaxed) != CST_ASID_UNPINNED &&
-        cpu_index < CST_PIN_MAX_VCPUS) {
+    if (g_system_mode && cpu_index < CST_PIN_MAX_VCPUS) {
+        int seed_priv = qemu_plugin_get_priv_level();
+        uint64_t seed_tp;
         seed_thread_id = 0;
-        uint32_t seed_asid_index = 0;
-        if (qemu_plugin_get_priv_level() == 0) {
-            uint64_t tp = qemu_plugin_get_thread_ptr();
-            seed_thread_id = thread_ptr_to_tid(tp);
-            g_vcpu_last_tp[cpu_index] = tp;
-            /* Opener sampled at user privilege: seed the migration-detect
-             * guard's per-segment vCPU set with this vCPU. */
-            pin_user_vcpu_observe(cpu_index);
+        if (thread_ptr_sample(seed_priv, &seed_tp)) {
+            seed_thread_id = thread_ptr_to_tid(seed_tp);
+            g_vcpu_last_tp[cpu_index] = seed_tp;
             if (tiddiag_on()) {
                 tiddiag_note_binding(cpu_index, seed_thread_id);
             }
+        }
+        g_vcpu_cur_tid[cpu_index] = seed_thread_id;
+    }
+    if (g_pinned_asid.load(std::memory_order_relaxed) != CST_ASID_UNPINNED &&
+        cpu_index < CST_PIN_MAX_VCPUS) {
+        uint32_t seed_asid_index = 0;
+        if (qemu_plugin_get_priv_level() == 0) {
+            /* Opener sampled at user privilege: seed the migration-detect
+             * guard's per-segment vCPU set with this vCPU. */
+            pin_user_vcpu_observe(cpu_index);
             /* The live user root at priv 0 IS the process's user CR3, so
              * seed the context asid to it (the tables' process key).  A
              * kernel excursion before the first user TB then folds to the
@@ -2629,7 +2765,6 @@ static void start_trace_segment(const char *label,
                     seed_root, asid_first_sight_sig(seed_root));
             }
         }
-        g_vcpu_cur_tid[cpu_index] = seed_thread_id;
         g_vcpu_cur_asid_index[cpu_index] = seed_asid_index;
     }
 
@@ -2849,10 +2984,17 @@ void emit_body_entry(BodyStreamState *out_stream,
      * emitted level regardless. */
     g_last_emit_fault_depth = g_emit_fault_depth;
     entry.fault_anchors = g_emit_fault_anchors;
-    /* Guest-thread identity on the wire (system-mode pin); the raw vCPU
-     * index otherwise.  cpu_index is retained for live register reads only
-     * (regfile capture, WP lane gates) and never reaches the stream. */
+    /* Guest-thread identity on the wire.  cpu_index is a lookup key for the
+     * per-vCPU identity (and for live register reads — regfile capture, WP
+     * lane gates); the index itself never reaches the stream. */
     entry.thread_id = resolve_thread_id(cpu_index);
+    if (tiddiag_on() && g_system_mode && cpu_index < CST_PIN_MAX_VCPUS) {
+        bool sys = bb_tmpl && bb_tmpl->is_system;
+        (sys ? g_tiddiag_kern_entries : g_tiddiag_user_entries)++;
+        if (entry.thread_id != g_vcpu_user_tid[cpu_index]) {
+            (sys ? g_tiddiag_kern_retagged : g_tiddiag_user_retagged)++;
+        }
+    }
     /* Context asid (regfile / FieldState table key ONLY): the process asid,
      * held stable across a kernel excursion.  Equals asid_index in user
      * mode / unpinned, so the key is unchanged there. */
@@ -4637,17 +4779,31 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
 
     st = pb.step_seal(in, out_stream);
 
+    if (tiddiag_level() >= 2 && g_system_mode) {
+        tiddiag_probe_ktp(cpu_index, in.live_priv,
+                          in.cur ? in.cur->start_pc : 0);
+    }
+
     /* Advance this vCPU's guest-thread identity AFTER the deferred-prev
      * seal above: the just-emitted BB belongs to the thread that executed
-     * it (the previous user TB), so this refresh takes effect only for the
-     * NEXT emit.  A user-owned priv-0 TB re-reads the thread pointer (which
-     * survives vCPU migration); a kernel TB leaves it, inheriting the
-     * thread that entered the kernel.  Under exec_lock — thread_ptr_to_tid
-     * mutates the per-segment map. */
-    if (in.pinned && in.user_owned && in.live_priv == 0 &&
-        cpu_index < CST_PIN_MAX_VCPUS) {
-        uint64_t tp = qemu_plugin_get_thread_ptr();
-        if (tp != g_vcpu_last_tp[cpu_index]) {
+     * it, so this refresh takes effect only for the NEXT emit.  Under
+     * exec_lock — thread_ptr_to_tid mutates the per-segment map.
+     *
+     * The sample is taken at whatever privilege this TB runs at, so long as
+     * the target's register still names the current task there
+     * (thread_ptr_sample).  That is what makes a strand's identity follow
+     * the guest scheduler rather than the vCPU: a task switch performed
+     * entirely inside the kernel — the tail of a clone handing the child
+     * its first run, a kernel thread scheduled in on a borrowed mm, an
+     * interrupt handler running after the scheduler moved on — retags the
+     * vCPU here instead of leaving every later kernel block credited to
+     * whichever thread last returned to user on it.  Where the register is
+     * only trustworthy at user privilege the sample is skipped and kernel
+     * code inherits the entering thread, as before. */
+    if (g_system_mode && cpu_index < CST_PIN_MAX_VCPUS) {
+        uint64_t tp;
+        if (thread_ptr_sample(in.live_priv, &tp) &&
+            tp != g_vcpu_last_tp[cpu_index]) {
             g_vcpu_last_tp[cpu_index] = tp;
             uint32_t new_tid = thread_ptr_to_tid(tp);
             g_vcpu_cur_tid[cpu_index] = new_tid;
@@ -4655,6 +4811,12 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
                 tiddiag_note_binding(cpu_index, new_tid);
             }
         }
+        if (tiddiag_on() && in.live_priv == 0) {
+            g_vcpu_user_tid[cpu_index] = g_vcpu_cur_tid[cpu_index];
+        }
+    }
+    if (in.pinned && in.user_owned && in.live_priv == 0 &&
+        cpu_index < CST_PIN_MAX_VCPUS) {
         /* Context-asid sibling of the tid refresh: the live user root at
          * priv 0 IS the process's user CR3.  Record it (idempotent — same
          * root maps to the same index) so a subsequent kernel excursion
@@ -6520,6 +6682,17 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
 
     if (g_trace_segments.is_active()) {
         finish_trace_segment();
+    }
+
+    if (tiddiag_on() && g_system_mode) {
+        /* One-run accounting of what the kernel-privilege thread-pointer
+         * sample changed on the wire (see g_vcpu_user_tid). */
+        fprintf(stderr, "champsim_tracer: [tiddiag] kernel-strand "
+                "re-attribution: %" PRIu64 "/%" PRIu64 " kernel entries and "
+                "%" PRIu64 "/%" PRIu64 " user entries carry a thread_id "
+                "other than the last user-privilege thread on their vCPU\n",
+                g_tiddiag_kern_retagged, g_tiddiag_kern_entries,
+                g_tiddiag_user_retagged, g_tiddiag_user_entries);
     }
 
     g_autoptr(GString) report = g_string_new("");

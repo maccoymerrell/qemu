@@ -112,11 +112,17 @@ typedef uint64_t qemu_plugin_id_t;
  *   (main-loop) issue notification is correlated back to the issuing vCPU
  *   through a device token, giving exact owner attribution instead of a
  *   positional guess.
+ *
+ * version 13:
+ * - added qemu_plugin_thread_ptr_tracks_current (whether the target's
+ *   thread-pointer register still names the executing software thread
+ *   when sampled inside the kernel, so a guest task switch that happens
+ *   entirely in kernel code can be followed).
  */
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 12
+#define QEMU_PLUGIN_VERSION 13
 
 /**
  * struct qemu_info_t - system information for plugins
@@ -1855,16 +1861,42 @@ bool qemu_plugin_vaddr_is_kernel(uint64_t vaddr);
  * stable per-guest-thread identity that survives vCPU migration —
  * unlike the vCPU index, which names a scheduling slot, not a thread.
  *
- * The value is only meaningful when sampled at user privilege: inside
- * the kernel the register may hold the previous task's value mid-switch
- * (or, for RISC-V tp, the kernel's own per-CPU pointer).  Returns 0
- * when the target provides no hook or the register was never written
- * (e.g. a CPU model without the feature, or a guest that sets no TLS);
- * threads without a thread pointer are architecturally
- * indistinguishable.  Must be called from a vCPU context.
+ * A sample taken above user privilege is meaningful only on targets for
+ * which qemu_plugin_thread_ptr_tracks_current() reports true; elsewhere
+ * the kernel repurposes the register on entry (RISC-V tp) and the value
+ * names something other than a guest thread.  Returns 0 when the target
+ * provides no hook or the register was never written (e.g. a CPU model
+ * without the feature, or a guest that sets no TLS); threads without a
+ * thread pointer are architecturally indistinguishable.  Must be called
+ * from a vCPU context.
  */
 QEMU_PLUGIN_API
 uint64_t qemu_plugin_get_thread_ptr(void);
+
+/**
+ * qemu_plugin_thread_ptr_tracks_current() - is the thread pointer valid
+ *                                           above user privilege?
+ *
+ * Reports whether the register qemu_plugin_get_thread_ptr() reads keeps
+ * naming the software thread the vCPU is executing when sampled inside
+ * the kernel — i.e. whether the guest kernel reloads it from the incoming
+ * task at every context switch and otherwise leaves it alone.  Where this
+ * is true a plugin can follow a guest task switch that happens entirely
+ * in kernel code (a freshly cloned child taking over before it has ever
+ * run a user instruction, a kernel thread scheduled in, a handler running
+ * after the scheduler moved on) instead of attributing that work to
+ * whichever thread last entered the kernel on that vCPU.
+ *
+ * True for MIPS (CP0 UserLocal), AArch64 (TPIDR_EL0) and x86-64
+ * (FS.base).  False for RISC-V, where the trap entry swaps tp with
+ * sscratch so in-kernel tp holds the kernel's own per-task pointer — a
+ * different value space from the user thread pointer, which would split a
+ * single thread's user and kernel code across two identities.  False on
+ * any target without the thread-pointer hook.  Must be called from a vCPU
+ * context.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_thread_ptr_tracks_current(void);
 
 /**
  * qemu_plugin_icount_enabled() - whether QEMU is running with -icount

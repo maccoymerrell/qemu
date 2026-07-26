@@ -275,6 +275,11 @@ static const TCGCPUOps x86_tcg_ops = {
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = x86_get_plugin_state,
     .get_plugin_thread_ptr = x86_get_plugin_thread_ptr,
+    /* A 64-bit kernel keeps its own per-CPU base in GS (swapgs on entry)
+     * and reloads FS.base from the incoming task in __switch_to(), so the
+     * FS.base this hook reads above user privilege names the current
+     * task. */
+    .plugin_thread_ptr_tracks_current = true,
     .vaddr_is_kernel = x86_vaddr_is_kernel,
     .spec_clock_resync = x86_spec_clock_resync,
 #endif

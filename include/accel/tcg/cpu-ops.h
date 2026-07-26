@@ -101,6 +101,28 @@ struct TCGCPUOps {
     uint64_t (*get_plugin_thread_ptr)(CPUState *cpu);
 
     /**
+     * @plugin_thread_ptr_tracks_current: the thread pointer also names the
+     * current task at privileged level
+     *
+     * Set when the register @get_plugin_thread_ptr reports keeps naming the
+     * software thread the vCPU is executing even above user privilege, so a
+     * sample taken inside the kernel identifies the task that is CURRENT
+     * rather than the one that last ran in user mode.  True where the
+     * register is architecturally separate from anything the kernel needs
+     * for its own use and every mainstream kernel therefore reloads it from
+     * the incoming task at each context switch, leaving it untouched in
+     * between (MIPS CP0 UserLocal, AArch64 TPIDR_EL0, x86-64 FS.base).
+     * False where the kernel repurposes the register for itself on entry —
+     * RISC-V swaps tp with sscratch so it holds the kernel's own per-task
+     * pointer, a different value space from the user thread pointer, which
+     * would split one thread's user and kernel code across two identities.
+     *
+     * Only meaningful alongside @get_plugin_thread_ptr; see
+     * qemu_plugin_thread_ptr_tracks_current().
+     */
+    bool plugin_thread_ptr_tracks_current;
+
+    /**
      * @vaddr_is_kernel: classify a code virtual address's privilege domain
      *
      * Optional.  Returns true when @vaddr lies in the guest's KERNEL

@@ -690,6 +690,14 @@ uint64_t qemu_plugin_get_thread_ptr(void)
     return 0;
 }
 
+bool qemu_plugin_thread_ptr_tracks_current(void)
+{
+    g_assert(current_cpu);
+    const TCGCPUOps *ops = current_cpu->cc->tcg_ops;
+    return ops && ops->get_plugin_thread_ptr &&
+           ops->plugin_thread_ptr_tracks_current;
+}
+
 bool qemu_plugin_vaddr_is_kernel(uint64_t vaddr)
 {
     /* Defensive: the classification needs the live vCPU's paging config, but

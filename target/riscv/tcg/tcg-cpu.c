@@ -222,6 +222,10 @@ static const TCGCPUOps riscv_tcg_ops = {
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = riscv_get_plugin_state,
     .get_plugin_thread_ptr = riscv_get_plugin_thread_ptr,
+    /* Trap entry swaps tp with sscratch, so in-kernel tp is the kernel's
+     * own per-task pointer -- a different value space from the user
+     * thread pointer, not a continuation of it. */
+    .plugin_thread_ptr_tracks_current = false,
     .vaddr_is_kernel = riscv_vaddr_is_kernel,
     .spec_clock_resync = riscv_spec_clock_resync,
 #endif

@@ -2791,6 +2791,11 @@ static const TCGCPUOps arm_tcg_ops = {
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = arm_get_plugin_state,
     .get_plugin_thread_ptr = arm_get_plugin_thread_ptr,
+    /* TPIDR_EL0 is the EL0 thread pointer; EL1 has TPIDR_EL1 for its own
+     * per-CPU use, so the kernel only ever writes TPIDR_EL0 from the
+     * incoming task (tls_thread_switch()) and a read at EL1 names the
+     * current task. */
+    .plugin_thread_ptr_tracks_current = true,
     .vaddr_is_kernel = arm_vaddr_is_kernel,
     .spec_clock_resync = arm_spec_clock_resync,
 #endif

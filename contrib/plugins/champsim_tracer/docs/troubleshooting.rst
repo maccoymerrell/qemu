@@ -241,6 +241,84 @@ against it.
 The validator gates on all three symptoms directly, on all four
 ISAs, in ``system.clock_progress_<isa>``.
 
+Capstone workaround maintenance
+--------------------------------
+
+**Retiring a Capstone workaround**
+
+``disas/capstone.c`` carries roughly a dozen boundary workarounds for
+access-flag and operand-modelling defects in Capstone 6.0.0-Alpha7, the
+revision ``subprojects/capstone.wrap`` pins.  Each lives behind a
+narrowly-scoped predicate function (``cap_x86_is_test``,
+``cap_aarch64_infer_mem_access``, ``cap_fill_mips_operands``'s inline
+MSA/unaligned check, ...), and each function's comment states three
+things: the Capstone version the defect was observed on, the exact
+encodings affected — and, just as load-bearing, the sibling encodings
+Capstone already reports correctly, which is what makes the defect
+credible as a narrow Capstone bug rather than a misunderstanding of the
+architecture — and a ``cstool`` one-liner or
+``capstone_workaround_probe`` case name to re-check it.
+
+None of these workarounds are meant to be permanent.  Each is scoped to
+one opcode, one operand size, or one instruction family specifically so
+that a fixed Capstone makes the corresponding predicate a silent no-op
+rather than newly wrong; the intent is to retire them individually as
+upstream Capstone fixes land, not to carry them indefinitely.  The
+retest procedure below is the single documented way to find out which
+ones a given Capstone bump has already fixed.
+
+*Procedure:*
+
+1. Bump ``subprojects/capstone.wrap``'s ``revision`` to the new
+   Capstone tag or commit and reconfigure.
+2. Rebuild: ``ninja -C build contrib-plugins``.  This rebuilds
+   ``disas/capstone.c`` too (it links into ``libcommon.a``, shared by
+   every QEMU target binary) along with the plugin and offline tools.
+3. Run ``build/contrib/plugins/capstone_workaround_probe``.  It
+   re-derives the same minimal repro bytes cited in each
+   ``disas/capstone.c`` comment, decodes them with whatever Capstone
+   the binary was linked against, and reports each workaround as
+   ``STILL NEEDED``, ``RETIRE CANDIDATE``, or ``INCONCLUSIVE`` (the
+   last meaning the repro bytes themselves failed to decode at all —
+   the case needs updating before it says anything about the bug).
+   The tool always links ``subprojects/capstone`` — the same
+   dependency ``cst_decode`` uses — never a system Capstone; see below
+   for why that distinction matters.
+4. A ``RETIRE CANDIDATE`` means Capstone now reports *that one
+   representative encoding* correctly, not necessarily the whole
+   family the comment documents.  Hand-sweep the rest of the family
+   with the ``cstool`` invocations quoted in the comment (again, a
+   ``cstool`` built from ``subprojects/capstone`` — see
+   ``subprojects/capstone/cstool/README.md``, or just ``cd
+   subprojects/capstone/cstool && make``) before trusting it.
+5. Once a family is confirmed fixed end to end, delete its predicate
+   function, its call site(s) in the relevant ``cap_fill_*_operands``,
+   and its case(s) in ``capstone_workaround_probe.cc``, all in the same
+   change.  Re-run the golden nets
+   (``contrib/plugins/champsim_tracer/tests/golden_net.py check`` and
+   ``--system``) and the full validator (``python -m
+   champsim_tracer_validator full``) before committing the removal —
+   a workaround retirement is expected to change decode output for the
+   handful of encodings it used to correct, so treat a byte-identical
+   golden net as a sign the affected encodings never appeared in the
+   golden corpus (check by hand with ``cst_decode --format=disasm``),
+   not as confirmation the removal was safe.
+
+*Why not just trust a system* ``cstool``:  a system-installed
+``cstool`` is routinely a different Capstone major version than the one
+QEMU actually links — confirmed during authoring of this procedure:
+this project's development host has Capstone 5.0.1 on ``$PATH``, three
+major versions behind the 6.0.0-Alpha7 the wrap pins.  None of the
+defects documented in ``disas/capstone.c`` reproduce against 5.0.1; a
+system ``cstool`` reports the *already-fixed* behavior for every one of
+them, which looks identical to "this workaround is retirable" but
+proves nothing about the Capstone QEMU actually builds against.  Always
+build ``cstool`` from ``subprojects/capstone`` (matching
+``capstone.wrap``'s pinned revision) before running a ``cstool``
+command a workaround comment suggests, or skip the ambiguity entirely
+and use ``capstone_workaround_probe``, which links the correct copy
+unconditionally and cannot make this mistake.
+
 Where to look next
 ------------------
 

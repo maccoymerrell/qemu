@@ -660,7 +660,18 @@ static bool cap_decode_aarch64_vas(unsigned vas,
  * store-data dependency on the source vector register.
  *
  * Detect by mnemonic and, for the MEM operand, force WRITE access.
- * Revisit / remove when Capstone is bumped past Alpha7.
+ *
+ * Revisit / remove when Capstone is bumped past 6.0.0-Alpha7; verify
+ * with `cstool -d x64 660f3a160001` (bytes `66 0f 3a 16 00 01`,
+ * `pextrd $1,%xmm0,(%rax)`) -- the MEM operand must show WRITE.  Note
+ * `cstool` here means one built from `subprojects/capstone`: a system
+ * package `cstool` is routinely a different Capstone major version
+ * (this host's is v5.0.1, which cannot reproduce Alpha7-specific
+ * defects at all) and gives no evidence either way.  Simplest is
+ * `contrib/plugins/champsim_tracer/tools/capstone_workaround_probe`,
+ * which links the pinned copy and checks this exact case
+ * (`cap_x86_is_extract_store`) automatically -- see
+ * docs/troubleshooting.rst ("Retiring a Capstone workaround").
  */
 static bool cap_x86_is_extract_store(const char *mnem)
 {
@@ -1057,8 +1068,16 @@ static bool cap_x86_is_push(const char *mnem)
  * in AT&T syntax, which reverses the detail operand array).  Without
  * the correction the operand walker models a vector store as a
  * phantom load (laddr/ld block instead of sdata/saddr) — the
- * dropped-store / wrong-latency footgun.  Revisit when Capstone is
- * bumped past 6.0.0.
+ * dropped-store / wrong-latency footgun.
+ *
+ * Revisit / remove when Capstone is bumped past 6.0.0; verify with
+ * `cstool -d x64 c5fd7f00` (bytes `c5 fd 7f 00`, `vmovdqa
+ * %ymm0,(%rax)`) -- no operand should be left without WRITE once
+ * fixed.  As with the other x86 workarounds in this file, use a
+ * `cstool` built from `subprojects/capstone` (capstone.wrap's pinned
+ * revision), not a system package, or run
+ * `capstone_workaround_probe` (`cap_x86_is_move_family` case); see
+ * docs/troubleshooting.rst.
  */
 static bool cap_x86_is_move_family(const char *mnem)
 {
@@ -1219,6 +1238,15 @@ static bool cap_aarch64_is_block_zero_sysop(const cs_arm64 *a64, uint8_t n)
  * Capstone still parks the shift count in operands[1].shift.value when
  * this happens, so the fix is to detect the broken alias by mnemonic +
  * op_count==2 and synthesise the missing IMM from operands[1].shift.
+ *
+ * Revisit / remove when Capstone is bumped past 6.0.0; verify with
+ * `cstool -d arm64 20701d53` (bytes `20 70 1d 53`, `lsl w0,w1,#3`) --
+ * fixed, op_count must be 3 with operands[2] a HAS_IMM of value 3; as
+ * long as the bug holds, op_count stays 2.  Use a `cstool` built from
+ * `subprojects/capstone` (capstone.wrap's pinned revision), not a
+ * system package, or run `capstone_workaround_probe`
+ * (`cap_aarch64_is_buggy_shift_imm_alias` case); see
+ * docs/troubleshooting.rst.
  */
 static bool cap_aarch64_is_buggy_shift_imm_alias(const char *mnem)
 {
@@ -1258,6 +1286,14 @@ static bool cap_aarch64_is_buggy_shift_imm_alias(const char *mnem)
  * these forms, its answer wins and this inference is dead code.
  * Revisit / remove on a Capstone bump past 6.0.0-Alpha7 (the SWP
  * rows need a fix that has not landed upstream yet).
+ *
+ * Verify with `cstool -d arm64 408021b8` (bytes `40 80 21 b8`, `swp
+ * w1,w0,[x2]`) -- fixed, the MEM operand (operands[2]) must show
+ * READ|WRITE instead of access == 0.  Use a `cstool` built from
+ * `subprojects/capstone` (capstone.wrap's pinned revision), not a
+ * system package, or run `capstone_workaround_probe`
+ * (`cap_aarch64_infer_mem_access (SWP)` case); see
+ * docs/troubleshooting.rst.
  */
 static unsigned cap_aarch64_infer_mem_access(const char *mnem)
 {
@@ -1570,8 +1606,18 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
          * computed with ADDIU), so a 0-access MIPS MEM operand is
          * always this defect and the direction can be inferred from
          * the data register operand: a load writes it (MEM is READ),
-         * a store reads it (MEM is WRITTEN).  Revisit when Capstone
-         * is bumped past 6.0.0.
+         * a store reads it (MEM is WRITTEN).
+         *
+         * Revisit / remove when Capstone is bumped past 6.0.0; verify
+         * with `cstool -d mips64el 20200078` (bytes `20 20 00 78`,
+         * `ld.b $w0,0($a0)`, MSA) and `cstool -d mips64el 03008888`
+         * (bytes `03 00 88 88`, `lwl $t0,3($a0)`, unaligned scalar) --
+         * fixed, the MEM operand of both must show READ (loads) once
+         * corrected.  Use a `cstool` built from `subprojects/capstone`
+         * (capstone.wrap's pinned revision), not a system package, or
+         * run `capstone_workaround_probe`
+         * (`cap_fill_mips_operands (MSA access==0)` /
+         * `(unaligned access==0)` cases); see docs/troubleshooting.rst.
          */
         for (uint8_t i = 0; i < n; i++) {
             qemu_plugin_operand *mem = &out->operands[i];
@@ -1604,6 +1650,15 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
          *
          * Promote $rt's access to READ|WRITE for the SC family.
          * The first register operand is the data/result register.
+         *
+         * Revisit / remove when Capstone is bumped past 6.0.0; verify
+         * with `cstool -d mips64el 000088e0` (bytes `00 00 88 e0`,
+         * `sc $t0,0($a0)`) -- fixed, $t0 (operands[0]) must show
+         * READ|WRITE instead of READ-only.  Use a `cstool` built from
+         * `subprojects/capstone` (capstone.wrap's pinned revision),
+         * not a system package, or run `capstone_workaround_probe`
+         * (`cap_fill_mips_operands (SC success-bit write)` case); see
+         * docs/troubleshooting.rst.
          */
         if (insn->id == MIPS_INS_SC || insn->id == MIPS_INS_SCD
             || insn->id == MIPS_INS_SCE || insn->id == MIPS_INS_SCWP) {
@@ -1627,8 +1682,17 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
          * write's dependency on the previous register value is lost
          * and consumers see the pair as a full overwrite.  Promote
          * $rt to READ|WRITE.  The stores of the family (SWL/SWR/...)
-         * already read $rt and need no correction.  Revisit when
-         * Capstone is bumped past 6.0.0.
+         * already read $rt and need no correction.
+         *
+         * Revisit / remove when Capstone is bumped past 6.0.0; verify
+         * with `cstool -d mips64el 03008888` (bytes `03 00 88 88`,
+         * `lwl $t0,3($a0)`) -- fixed, $t0 (operands[0]) must show
+         * READ|WRITE instead of WRITE-only.  Use a `cstool` built
+         * from `subprojects/capstone` (capstone.wrap's pinned
+         * revision), not a system package, or run
+         * `capstone_workaround_probe`
+         * (`cap_fill_mips_operands (LWL/LWR partial write)` case);
+         * see docs/troubleshooting.rst.
          */
         if (insn->id == MIPS_INS_LWL || insn->id == MIPS_INS_LWR
             || insn->id == MIPS_INS_LDL || insn->id == MIPS_INS_LDR) {

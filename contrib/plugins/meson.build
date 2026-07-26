@@ -124,6 +124,17 @@ if get_option('plugins')
     cpp_args: cst_tools_cpp_args,
     link_with: cst_tools_common,
     install: false)
+  # capstone_workaround_probe: retest harness for the Capstone-defect
+  # workarounds catalogued in disas/capstone.c -- see that file and
+  # docs/troubleshooting.rst ("Retiring a Capstone workaround") for the
+  # full retirement procedure this tool automates. Pins to the same
+  # subprojects/capstone build as cst_decode, for the same reason.
+  t += executable(
+    'capstone_workaround_probe',
+    files('champsim_tracer/tools/capstone_workaround_probe.cc'),
+    cpp_args: cst_tools_cpp_args,
+    dependencies: [cst_capstone_dep],
+    install: false)
   # cst_attach: ptrace launcher that injects the trace marker at a target's
   # entry so the plugin attaches + pins to its address space (system mode).
   # Plain C, no deps.  It runs INSIDE the guest, so this host build only

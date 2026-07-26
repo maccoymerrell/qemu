@@ -131,6 +131,7 @@ FEATURES: dict[str, str] = {
     "behavior:user_code_identity": "ASID-pin: user templates byte-match binary",
     "behavior:marker_injection": "cst_attach ptrace-injects the marker into an unmarked target's entry point",
     "behavior:guest_thread_identity": "thread_id is guest thread, not vCPU",
+    "behavior:thread_strand_sequential": "every (thread_id, asid) context reads as one sequential strand: concurrent guest threads never share an id, so a kernel strand is never braided with another vCPU's",
     "behavior:asid_recycle":     "narrow-ASID recycle-no-cross-attribution",
     "behavior:spec_clock_resync": "wrong-path excursions are time-transparent: every guest clock, host timer and interrupt line is resynchronised to the frozen virtual time on exit, so the guest keeps taking interrupts and making user-space progress (4-ISA, system mode)",
     "behavior:whole_system_capture": "trace-all captures an unmarked peer",
@@ -555,6 +556,16 @@ def _chk_thread_system(ctx: Ctx) -> Outcome:
     d = ctx.dir("system_thread_x86")
     rc, tail = _run_cli(
         ["thread_test", "--isa", "x86_64", "--build-dir", str(ctx.build_dir),
+         "-o", str(d), "--system", "--smp", "2", "--iters", "250000",
+         "--stop", "200000", "--seeds", "1"],
+        timeout=900, log_path=d / "run.log")
+    return _cli_outcome(rc, tail, 900)
+
+
+def _chk_thread_system_mipsel(ctx: Ctx) -> Outcome:
+    d = ctx.dir("system_thread_mipsel")
+    rc, tail = _run_cli(
+        ["thread_test", "--isa", "mipsel", "--build-dir", str(ctx.build_dir),
          "-o", str(d), "--system", "--smp", "2", "--iters", "250000",
          "--stop", "200000", "--seeds", "1"],
         timeout=900, log_path=d / "run.log")
@@ -1066,7 +1077,18 @@ def build_checks() -> list:
     C.append(Check("system.thread_x86", "system",
                    "SMP guest-thread identity (x86, --smp 2)",
                    ["wire:BODY_TAG_THREAD_SWITCH",
-                    "behavior:guest_thread_identity"], _chk_thread_system))
+                    "behavior:guest_thread_identity",
+                    "behavior:thread_strand_sequential"],
+                   _chk_thread_system))
+    # mipsel is where a shared thread_id was reproducible: a narrow ASID
+    # folds every strand of the pinned process into one asid, so two vCPUs'
+    # kernel work lands in the SAME (thread_id, asid) context the moment
+    # their thread ids agree — which is exactly what thread_strand catches.
+    C.append(Check("system.thread_mipsel", "system",
+                   "SMP guest-thread identity, narrow ASID (mipsel, "
+                   "--smp 2)",
+                   ["behavior:thread_strand_sequential"],
+                   _chk_thread_system_mipsel))
     C.append(Check("system.smc_x86", "system",
                    "self-modifying code mints revisions under the marker "
                    "window / pinned ASID (x86 system boot)",

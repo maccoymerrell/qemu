@@ -177,12 +177,14 @@ _INSN_RE = re.compile(
     r"(?:  prof: (.*))?$"
 )
 _ENTRY_HEAD_RE = re.compile(
-    r"^ENTRY (\d+) thread=(\d+)(?: asid=\d+)?(?: switch=(\d))?"
+    r"^ENTRY (\d+) thread=(\d+)(?: asid=(\d+))?(?: switch=(\d))?"
     r"(?: fault_depth=(\d+))?(?: fault_at=([\d,]+))? template=BB(\d+)"
     # Terminal-branch direction/target (CST_FID_BRANCH_*), decoded directly
-    # per branch-terminated entry.  Non-capturing so group indices 1..6 are
-    # unchanged; the validator derives direction/target from the templates.
-    r"(?: branch=(?:taken|not-taken) target=0x[0-9a-f]+)?$"
+    # per branch-terminated entry.  The strand-sequentiality check reads the
+    # RESOLVED successor from here rather than re-deriving the possible
+    # successor set from the template, which is what lets it tell a genuine
+    # resumption from a coincidental fall-through match.
+    r"(?: branch=(taken|not-taken) target=0x([0-9a-f]+))?$"
 )
 _WP_HEAD_RE = re.compile(
     r"^  wp\[(\d+)\] template=BB(\d+) n_insns=(\d+)"
@@ -563,11 +565,16 @@ def _iter_body(lines: list[str], i: int,
             continue
         seq_num = int(m.group(1))
         thread_id = int(m.group(2))
-        thread_switched = m.group(3) == "1"
-        fault_depth = int(m.group(4)) if m.group(4) is not None else 0
-        fault_anchors = ([int(x) for x in m.group(5).split(",")]
-                         if m.group(5) else [])
-        template_id = int(m.group(6))
+        asid_index = int(m.group(3)) if m.group(3) is not None else 0
+        thread_switched = m.group(4) == "1"
+        fault_depth = int(m.group(5)) if m.group(5) is not None else 0
+        fault_anchors = ([int(x) for x in m.group(6).split(",")]
+                         if m.group(6) else [])
+        template_id = int(m.group(7))
+        branch_taken = (None if m.group(8) is None
+                        else m.group(8) == "taken")
+        branch_target = (None if m.group(9) is None
+                         else int(m.group(9), 16))
         i += 1
         # CP block: indented "cp:" header followed by observations.
         cp_dyn: list[DynParam] = []
@@ -635,7 +642,10 @@ def _iter_body(lines: list[str], i: int,
             "seq_num": seq_num,
             "template_id": template_id,
             "thread_id": thread_id,
+            "asid_index": asid_index,
             "thread_switched": thread_switched,
+            "branch_taken": branch_taken,
+            "branch_target": branch_target,
             "fault_depth": fault_depth,
             "fault_anchors": fault_anchors,
             "dyn_params": cp_dyn,

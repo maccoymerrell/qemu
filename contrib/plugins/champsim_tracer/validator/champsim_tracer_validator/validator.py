@@ -4612,18 +4612,33 @@ def _check_unconditional_direction(templates: list[dict],
 
 
 def _check_regfile_records(body_stats: dict,
-                           expected_threads: int = 1) -> list[Issue]:
+                           expected_threads: int = 1,
+                           entries: list[dict] | None = None) -> list[Issue]:
     """A BODY_TAG_REGFILE record must precede each thread's first
     BODY_TAG_ENTRY in the segment.  Single-segment, single-thread
     traces should therefore carry exactly one REGFILE.  Multi-thread
-    runs scale to one per (thread, segment)."""
+    runs scale to one per (thread, segment).
+
+    @expected_threads is the traced process's thread population, which in
+    system mode is a LOWER bound on the contexts that emit: a kernel-only
+    strand (a kernel thread on a borrowed mm) is its own guest thread and
+    needs its own initial register file.  Given @entries the expectation is
+    therefore the number of distinct thread ids that actually contributed,
+    which must still be at least @expected_threads; ``thread_records`` is
+    the check that asserts each REGFILE's *position* relative to its
+    thread's first entry.
+    """
     actual = int(body_stats.get("regfile_count", 0))
-    if actual != expected_threads:
+    expected = expected_threads
+    if entries is not None:
+        observed = len({int(e.get("thread_id", 0)) for e in entries})
+        expected = max(expected_threads, observed)
+    if actual != expected:
         return [Issue(
             "regfile_records", "error",
-            f"regfile_count={actual}, expected {expected_threads} "
+            f"regfile_count={actual}, expected {expected} "
             f"(one per (segment, thread))",
-            {"actual": actual, "expected": expected_threads},
+            {"actual": actual, "expected": expected},
         )]
     return [Issue(
         "regfile_records", "info",
@@ -4723,14 +4738,33 @@ def _check_thread_switch(body_stats: dict,
 
 
 def _check_thread_distribution(entries: list[dict],
-                               expected_threads: int) -> list[Issue]:
+                               expected_threads: int,
+                               templates_by_id: dict | None = None
+                               ) -> list[Issue]:
     """Verify the trace's per-thread entry counts add up sensibly:
     every expected thread contributed at least one entry, and every
-    observed thread_id was within range [0, expected_threads)."""
+    observed thread_id that ran USER code was within range
+    [0, expected_threads).
+
+    @expected_threads bounds the traced *process*'s thread population, and
+    that is a bound on threads with user code.  A system-mode trace may
+    additionally carry kernel-only strands — a kernel thread scheduled onto
+    a borrowed mm passes the address-space gate and executes under the
+    traced process's asid, and it is a genuinely different guest thread, so
+    it carries its own id.  Those are counted and reported, not treated as
+    a population violation; a thread id with even one user entry is held to
+    the bound.  Without @templates_by_id the privilege of an entry cannot
+    be told, so every id is held to the bound (the pre-identity behaviour).
+    """
     counts: dict[int, int] = {}
+    user_counts: dict[int, int] = {}
     for e in entries:
         tid = int(e.get("thread_id", 0))
         counts[tid] = counts.get(tid, 0) + 1
+        if templates_by_id is not None:
+            t = templates_by_id.get(e["template_id"])
+            if t is not None and not t.get("is_system"):
+                user_counts[tid] = user_counts.get(tid, 0) + 1
     if expected_threads > 1:
         missing = [tid for tid in range(expected_threads)
                    if counts.get(tid, 0) == 0]
@@ -4741,19 +4775,22 @@ def _check_thread_distribution(entries: list[dict],
                 f"{missing} contributed zero entries to the trace",
                 {"observed_counts": counts, "missing": missing},
             )]
-    extras = [tid for tid in counts if tid >= expected_threads]
+    bound = counts if templates_by_id is None else user_counts
+    extras = [tid for tid in bound if tid >= expected_threads]
     if extras:
         return [Issue(
             "thread_distribution", "error",
-            f"trace contains entries from thread_id(s) >= expected_"
+            f"trace contains USER entries from thread_id(s) >= expected_"
             f"threads={expected_threads}: {extras}",
             {"observed_counts": counts,
              "expected_threads": expected_threads},
         )]
+    kernel_only = sorted(t for t in counts if t not in bound)
+    note = (f"; kernel-only strands: {kernel_only}" if kernel_only else "")
     return [Issue(
         "thread_distribution", "info",
-        f"per-thread entry counts: {counts}",
-        {"counts": counts},
+        f"per-thread entry counts: {counts}{note}",
+        {"counts": counts, "kernel_only": kernel_only},
     )]
 
 
@@ -5000,6 +5037,142 @@ def _check_thread_chain(entries: list[dict],
         f"adjacency: {tid_connected}/{tid_pairs} connected",
         {"user_entries": n_user, "chains": n_chains,
          "tid_pairs": tid_pairs, "tid_connected": tid_connected})]
+
+
+def _check_thread_strand_sequential(entries: list[dict],
+                                    templates_by_id: dict) -> list[Issue]:
+    """Every ``(thread_id, asid)`` context is ONE sequential strand.
+
+    The format's contract is that ``thread_id`` names a guest thread and the
+    vCPU is absent from the wire.  What a consumer does with that is key its
+    per-thread state on ``(thread_id, asid)`` and read the entries under one
+    key as a single instruction stream, in order.  That reading is only
+    sound if no two threads ever carry the same id at the same time — the
+    property this check tests, using the only evidence the wire has:
+    control flow.
+
+    Filtered to one context, entry N's terminal branch names entry N+1's
+    start (or one of its fault anchors, for a merged block).  When it does
+    not, the strand was diverted, and the diversion is remembered.  Every
+    diversion the format documents ends the strand's participation for a
+    while and resumes exactly where a *nesting* boundary says it should:
+    entering an excursion raises ``fault_depth``, returning lowers it, a
+    privilege-domain gap is visible as an is_system change.  A diversion at
+    the SAME depth and the SAME privilege, whose dangling target is picked
+    up later while the entries in between chained happily among themselves,
+    is none of those — it is two independent instruction streams braided
+    into one context, which is exactly what a shared ``thread_id`` looks
+    like from the outside.  Those are reported as errors.
+
+    Diversions that never resume are NOT errors here: an excursion the
+    tracer excludes, a privilege domain outside the trace's coverage, or a
+    strand that simply ends leave a dangling target with no braid, and the
+    documented-diversion census (``cst_decode --verify-branch``) is the tool
+    for those.  This check is deliberately about the braid alone.
+
+    Two guards keep an ordinary loop from being mistaken for a braid, since
+    a loop re-executes the same PCs indefinitely and would otherwise match
+    any old dangling target:
+
+    * a dangling target is only tested against an entry that is ITSELF
+      unexplained by its immediate predecessor.  A resumption is by
+      definition a place the flow did not arrive at from the previous
+      entry; an entry that continued its predecessor normally is not
+      resuming anything, whatever PC it starts at.
+    * a dangling target expires after ``BRAID_WINDOW`` further entries of
+      its context.  Braiding is an *alternation* — the two streams trade
+      off within a few blocks of each other (the observed chunks are
+      single digits) — so a target picked up thousands of entries later is
+      a loop revisiting a PC, not a second stream still waiting its turn.
+    """
+    issues: list[Issue] = []
+
+    # Per context: the previous entry's summary, the still-dangling branch
+    # targets it left behind, and how many entries that context has seen
+    # (the clock the dangling targets expire on).
+    prev_by_ctx: dict[tuple, dict] = {}
+    open_by_ctx: dict[tuple, list[dict]] = {}
+    seen_by_ctx: dict[tuple, int] = {}
+    OPEN_CAP = 64
+    BRAID_WINDOW = 64
+
+    braids: list[tuple] = []          # (defer_seq, resume_seq, ctx, target)
+    n_chained = n_diverted = 0
+
+    for e in entries:
+        t = templates_by_id.get(e["template_id"])
+        if t is None:
+            continue
+        ctx = (int(e.get("thread_id", 0)), int(e.get("asid_index", 0)))
+        depth = int(e.get("fault_depth", 0) or 0)
+        is_sys = bool(t.get("is_system"))
+        clock = seen_by_ctx.get(ctx, 0) + 1
+        seen_by_ctx[ctx] = clock
+
+        # Where control may legitimately land in THIS entry: its own start,
+        # or any instruction a fault anchor resumes it at (merged block).
+        resume_pcs = {int(t.get("start_pc", 0))}
+        insns = t.get("insns") or []
+        for a in e.get("fault_anchors") or []:
+            if 0 <= int(a) < len(insns):
+                resume_pcs.add(int(insns[int(a)]["pc"]))
+
+        prev = prev_by_ctx.get(ctx)
+        known = prev is not None and prev["target"] is not None
+        chained = known and prev["target"] in resume_pcs
+
+        openl = open_by_ctx.setdefault(ctx, [])
+        if openl:
+            openl[:] = [o for o in openl if clock - o["clock"] <= BRAID_WINDOW]
+        if openl and known and not chained:
+            for i in range(len(openl) - 1, -1, -1):
+                if openl[i]["target"] in resume_pcs:
+                    if openl[i]["braid"]:
+                        braids.append((openl[i]["seq"], e.get("seq_num"), ctx,
+                                       openl[i]["target"]))
+                    openl.pop(i)
+
+        if known:
+            if chained:
+                n_chained += 1
+            else:
+                n_diverted += 1
+                # A same-depth, same-privilege break is the braid candidate;
+                # everything else is a documented nesting boundary.
+                braid = (depth == prev["depth"]
+                         and is_sys == prev["is_sys"]
+                         and not e.get("thread_switched"))
+                openl.append({"target": prev["target"], "seq": prev["seq"],
+                              "braid": braid, "clock": clock})
+                if len(openl) > OPEN_CAP:
+                    del openl[:len(openl) - OPEN_CAP]
+
+        prev_by_ctx[ctx] = {"target": e.get("branch_target"),
+                            "seq": e.get("seq_num"), "depth": depth,
+                            "is_sys": is_sys}
+
+    for dseq, rseq, ctx, tgt in braids[:5]:
+        issues.append(Issue(
+            "thread_strand", "error",
+            f"context (thread={ctx[0]}, asid={ctx[1]}) is braided: the "
+            f"branch at seq={dseq} to 0x{tgt:x} was left dangling and only "
+            f"resumed at seq={rseq}, with unrelated entries of the SAME "
+            f"context, depth and privilege in between — two concurrent "
+            f"instruction streams are sharing one thread_id",
+            {"defer_seq": dseq, "resume_seq": rseq, "thread": ctx[0],
+             "asid": ctx[1], "target": tgt}))
+    if len(braids) > 5:
+        issues.append(Issue(
+            "thread_strand", "error",
+            f"...and {len(braids) - 5} more braided resumptions"))
+    if issues:
+        return issues
+    return [Issue(
+        "thread_strand", "info",
+        f"{n_chained} in-strand successions, {n_diverted} diversions, "
+        f"0 braided resumptions: every (thread_id, asid) context reads as "
+        f"one sequential strand",
+        {"chained": n_chained, "diverted": n_diverted, "braids": 0})]
 
 
 def _check_user_code_identity(templates: list[dict],
@@ -6469,7 +6642,8 @@ def validate_structural(trace_path: Path,
     issues += _check_unconditional_direction(templates, entries,
                                              templates_by_id, trace_meta)
     issues += _check_iframe_cadence(body_stats, entries, trace_meta)
-    issues += _check_regfile_records(body_stats, expected_threads)
+    issues += _check_regfile_records(body_stats, expected_threads,
+                                     entries)
     issues += _check_thread_switch(body_stats, expected_threads)
     if marker:
         # System-mode thread_ids are GUEST-THREAD identities, dense
@@ -6479,13 +6653,16 @@ def validate_structural(trace_path: Path,
         # pinned process's own thread count: @expected_guest_threads
         # (the clone test's 2) or, absent that, @expected_threads.
         issues += _check_thread_distribution(
-            entries, expected_guest_threads or expected_threads)
+            entries, expected_guest_threads or expected_threads,
+            templates_by_id)
     else:
-        issues += _check_thread_distribution(entries, expected_threads)
+        issues += _check_thread_distribution(entries, expected_threads,
+                                             templates_by_id)
     issues += _check_thread_record_cadence(
         entries, trace_meta.get("body_record_order") or [])
     issues += _check_thread_chain(entries, templates_by_id,
                                   expected_guest_threads, trace_meta)
+    issues += _check_thread_strand_sequential(entries, templates_by_id)
     if marker:
         issues += _check_syscall_transitions(
             entries, templates_by_id, trace_meta,
@@ -6904,8 +7081,10 @@ def validate(meta_path: Path, trace_path: Path,
     # now catches directly (stronger than the old -smp index bound, which
     # accepted any tid < smp).
     threads_effective = expected_threads
-    issues += _check_thread_distribution(entries, expected_threads)
-    issues += _check_regfile_records(body_stats, threads_effective)
+    issues += _check_thread_distribution(entries, expected_threads,
+                                         templates_by_id)
+    issues += _check_regfile_records(body_stats, threads_effective,
+                                     entries)
     issues += _check_thread_switch(body_stats, threads_effective)
     issues += _check_thread_record_cadence(
         entries, trace_meta.get("body_record_order") or [])
@@ -6919,6 +7098,7 @@ def validate(meta_path: Path, trace_path: Path,
     issues += _check_thread_chain(entries, templates_by_id,
                                   expected_guest_threads=1,
                                   trace_meta=trace_meta)
+    issues += _check_thread_strand_sequential(entries, templates_by_id)
     # WP-event tallies are global (the writer counts every WP fault,
     # including those in the pre-window prologue — which in system mode
     # is the whole kernel boot + marker wait, where wrong-path faults are

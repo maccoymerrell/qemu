@@ -985,6 +985,24 @@ Disassembly and target metadata
      is correct and universal, and the walker never derives a lane from
      one.
 
+   * AArch64 ``SYS`` alias space (``DC`` / ``IC`` / ``AT`` / ``TLBI``).
+     Not an access-flag bug but a modelling gap with the same effect.
+     Capstone decodes every one of these to
+     ``insn->id == AARCH64_INS_SYS`` and, for ``DC ZVA`` — which is not
+     maintenance at all but a store of zeros over a whole
+     ``DCZID_EL0``-sized block — provides no memory operand of any kind,
+     only the ``Xt`` address register described as a plain read.  A
+     consumer therefore mints no store lane, and every store the
+     instruction performs is an attribution to an instruction that
+     cannot perform one.  The structured detail *does* identify the
+     operation exactly (``operands[0].type == AARCH64_OP_SYSALIAS``,
+     ``sysop.sub_type == AARCH64_OP_DC``,
+     ``sysop.alias.dc == AARCH64_DC_ZVA``), so
+     ``cap_aarch64_is_block_zero_sysop`` uses it to recognise ``DC ZVA``
+     and ``DC GZVA`` and present their ``Xt`` operand as the written
+     memory operand it is.  Every other ``DC`` operation, and all of
+     ``IC`` / ``AT`` / ``TLBI``, moves no architectural data and gets no
+     memory operand.
    * MIPS memory access flags.  MSA vector loads/stores and the
      unaligned scalar family (``LWL`` / ``LWR`` / ``LDL`` / ``LDR``
      / ``SWL`` / ``SWR`` / ``SDL`` / ``SDR``) report their memory
@@ -1179,18 +1197,33 @@ program's bulk memory traffic.
    other is a bare host access, which would otherwise leave the copy
    reporting a store with no load or a load with no store.
 
-   ``HELPER(dc_zva)`` is **not** a call site, though its bulk ``memset``
-   has the identical defect.  Capstone decodes ``DC ZVA`` as the generic
-   ``AARCH64_INS_SYS``, which the plugin's AArch64 mnemonic table
-   classifies ``GEN_OP_VEC_LOGIC`` with no memory operand, so reported
-   stores would land on a slot the trace declares incapable of touching
-   memory and every trace containing a ``DC ZVA`` — the Linux
-   ``clear_page``, for one — would fail the impossible-attribution lint.
-   Reporting it needs that ``SYS`` classification fixed first, which in
-   turn needs a decision on whether ``DC ZVA`` models as cache
-   maintenance (whose ``GEN_OP_CACHE_FLUSH`` path synthesises a competing
-   effective address) or as the block store it performs.  Until then a
-   correct-path ``DC ZVA`` still records no memory access.
+   ``HELPER(dc_zva)`` is a call site too.  ``DC ZVA, Xt`` zeroes a
+   naturally aligned block whose size comes from ``DCZID_EL0.BS`` (512
+   bytes on a ``-cpu max`` guest) through the same bare host ``memset``
+   behind a trapless ``tlb_vaddr_to_host()``.  Linux's ``clear_page`` is
+   built on it, so on a system-mode trace it carries a large share of all
+   store traffic.  The call passes the already block-aligned ``vaddr``
+   and the CPU's own ``blocklen``, so the decomposition is exact rather
+   than assuming a block size; the helper's two other exits zero the
+   block with ``cpu_stb_mmuidx_ra()`` and are instrumented already.
+
+   Reporting it also required the instruction to be *classifiable* as a
+   memory instruction, which it was not.  Capstone folds the whole
+   ``DC`` / ``IC`` / ``AT`` / ``TLBI`` alias space into
+   ``AARCH64_INS_SYS`` and gives ``DC ZVA`` no memory operand at all, so
+   the plugin classified it ``GEN_OP_VEC_LOGIC`` and any store reported
+   against it was an impossible attribution — which is why an earlier
+   attempt at this call site had to be withdrawn.  ``disas/capstone.c``
+   (``cap_aarch64_is_block_zero_sysop``) now recognises the block-zeroing
+   operations from Capstone's structured sysop detail
+   (``sysop.sub_type == AARCH64_OP_DC`` with
+   ``sysop.alias.dc == AARCH64_DC_ZVA`` or ``_GZVA``) and presents their
+   ``Xt`` operand as the written memory operand it really is; the
+   plugin's ``refine_arm64_sysop`` then classifies them ``GEN_OP_STORE``
+   and leaves the rest of the ``SYS`` space as maintenance.  The block
+   size is deliberately not encoded at the disassembly boundary — it is a
+   runtime CPU property, not a property of the encoding — so the sizes on
+   the wire come from the helper.
 
    The alternative fix is to make ``tlb_vaddr_to_host()`` honour
    ``cpu_plugin_mem_cbs_enabled()`` the way ``probe_access_flags()``

@@ -289,25 +289,6 @@ a consumer can see both how much traffic the instruction really did and
 the address range it spanned.  The traffic that is lost is per-entry
 slot detail in the interior of transfers larger than 8 KiB.
 
-**AArch64 DC ZVA records no memory access.**  ``DC ZVA`` zeroes a
-cache-block-sized run (512 bytes on a ``-cpu max`` guest) from inside a
-TCG helper with a bare host ``memset``, so like the FEAT_MOPS families
-it never reaches the memory instrumentation — but unlike them it is not
-yet reported, because Capstone decodes it as the generic
-``AARCH64_INS_SYS`` and the AArch64 mnemonic table classifies that
-``GEN_OP_VEC_LOGIC``, an opcode with no memory operand.  Emitting its
-stores against that classification would make every trace containing a
-``DC ZVA`` — Linux ``clear_page`` uses it, so every system-mode AArch64
-trace — fail the impossible-attribution lint.  The fix is a
-classification one (``SYS`` covers the whole ``DC`` / ``IC`` / ``AT`` /
-``TLBI`` maintenance space and needs a refiner over Capstone's sysop
-detail), and it carries a modelling decision: cache maintenance under
-``GEN_OP_CACHE_FLUSH``, whose synthesised effective address would
-compete with the real stores, or the block store the instruction
-performs.  Guests whose libc routes ``memset`` through FEAT_MOPS — any
-guest advertising ``HWCAP2_MOPS`` — do not reach ``DC ZVA`` from user
-code at all; the exposure is kernel page clearing in system mode.
-
 .. _limits-kernel-strand:
 
 **Kernel-strand identity depends on the target's thread-pointer

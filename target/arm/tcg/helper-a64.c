@@ -957,22 +957,26 @@ void HELPER(dc_zva)(CPUARMState *env, uint64_t vaddr_in)
 #endif
 
     /*
-     * DC ZVA has exactly the plugin-visibility defect arm_plugin_bulk_mem_cb
-     * exists to fix — this bulk memset is a bare host write no plugin can
-     * see — but it is deliberately NOT reported here.  Capstone decodes
-     * DC ZVA as the generic AARCH64_INS_SYS, which the consuming tracer's
-     * mnemonic table classifies GEN_OP_VEC_LOGIC with no memory operand, so
-     * reported stores would land on a slot the trace declares incapable of
-     * touching memory and every AArch64 trace containing a DC ZVA (the
-     * kernel's clear_page, for one) would fail its attribution lint.
-     * Reporting it needs the SYS classification fixed first, and that in
-     * turn needs a decision on whether DC ZVA models as cache maintenance —
-     * whose GEN_OP_CACHE_FLUSH path synthesises a competing effective
-     * address — or as the block store it actually performs.
+     * DC ZVA has the same plugin-visibility defect arm_plugin_bulk_mem_cb
+     * exists to fix: this bulk memset is a bare host write, so the memory
+     * callbacks accel/tcg emits around qemu_st never fire and the whole
+     * block-zeroing store disappears from a plugin's view.  The kernel's
+     * clear_page() is built on DC ZVA, so on a system-mode trace that is a
+     * large share of all store traffic.
+     *
+     * Report it explicitly, decomposed into naturally aligned pieces, the
+     * same way the FEAT_MOPS SET and CPY steps do.  @vaddr is already
+     * rounded down to the block and @blocklen comes from DCZID_EL0, so the
+     * decomposition is exact rather than assuming a block size.
+     *
+     * The other two paths above need no such call: they zero the block with
+     * cpu_stb_mmuidx_ra(), which is instrumented already.
      */
     set_helper_retaddr(ra);
     memset(mem, 0, blocklen);
     clear_helper_retaddr();
+    arm_plugin_bulk_mem_cb(env, vaddr, blocklen, mem, mmu_idx,
+                           QEMU_PLUGIN_MEM_W);
 }
 
 void HELPER(unaligned_access)(CPUARMState *env, uint64_t addr,

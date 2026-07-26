@@ -416,10 +416,16 @@ static bool cap_decode_aarch64_vas(unsigned vas,
                                    uint8_t *lane_bytes,
                                    uint8_t *total_bytes);
 static uint8_t cap_lane_bytes_from_mnemonic(const char *mnem);
+static bool cap_aarch64_is_block_zero_sysop(const cs_arm64 *a64, uint8_t n);
 static bool cap_x86_is_extract_store(const char *mnem);
 static bool cap_x86_is_move_family(const char *mnem);
 static bool cap_x86_is_test(const char *mnem);
-static bool cap_x86_is_string_store(const char *mnem);
+static uint8_t cap_x86_string_mem_access(const char *mnem, unsigned base_reg);
+static bool cap_x86_is_string_op(const char *mnem);
+static bool cap_x86_is_scalar_round(const char *mnem);
+static bool cap_x86_is_shadow_stack_store(const char *mnem);
+static bool cap_x86_mem_is_never_accessed(const char *mnem);
+static bool cap_x86_is_push(const char *mnem);
 
 /*
  * Extract per-operand detail for x86 into the plugin operand struct.
@@ -1101,6 +1107,69 @@ static uint8_t cap_lane_bytes_from_mnemonic(const char *mnem)
 }
 
 /*
+ * AArch64 DC ZVA / DC GZVA: Capstone models no memory operand.
+ *
+ * `DC ZVA, Xt` zeroes a whole naturally-aligned block of memory whose
+ * size comes from DCZID_EL0.BS and whose address is Xt (rounded down to
+ * the block).  Architecturally it is a block store, and Linux's
+ * clear_page() is built on it, so it carries a large share of a
+ * system-mode trace's store traffic.
+ *
+ * Capstone decodes the whole SYS alias space -- DC, IC, AT, TLBI -- with
+ * insn->id == AARCH64_INS_SYS, printing the alias as the mnemonic
+ * ("dc") with the operation in op_str ("zva, x0").  The structured
+ * detail identifies the operation exactly:
+ *
+ *   operands[0].type            == AARCH64_OP_SYSALIAS
+ *   operands[0].sysop.sub_type  == AARCH64_OP_DC
+ *   operands[0].sysop.alias.dc  == AARCH64_DC_ZVA   (0x1ba1)
+ *   operands[1]                 == AARCH64_OP_REG, Xt, access READ
+ *
+ * (IC / TLBI use AARCH64_OP_SYSREG and sysop.reg instead; a SYS
+ * encoding Capstone does not recognise as an alias keeps mnemonic
+ * "sys" and sets no sysop at all.)  So the operation is unambiguous --
+ * but there is no AARCH64_OP_MEM operand anywhere in it, and Xt is
+ * described as a plain register read rather than as an address.
+ *
+ * That is not an access-flag bug like the ones above; it is a modelling
+ * gap.  Its effect is the same, though: with no memory operand the
+ * consumer mints no store lane, and every store the instruction
+ * performs is an attribution to an instruction that -- as far as the
+ * decoded operands go -- cannot perform one.
+ *
+ * The correction is to present Xt as what it is: the base register of a
+ * written memory operand.  The block size is deliberately NOT encoded
+ * here -- it is a runtime CPU property (DCZID_EL0), not a property of
+ * the encoding, and disas/ is target-independent code.  The emitted
+ * memop records carry the true addresses and sizes; they come from
+ * HELPER(dc_zva) via arm_plugin_bulk_mem_cb(), which reads the block
+ * size from the CPU.
+ *
+ * DC GZVA (the MTE tag-and-data zeroing form) writes the same block and
+ * is treated identically.  Every other DC operation (CVAC, CVAU, CIVAC,
+ * IVAC ...) is cache maintenance that moves no architectural data, and
+ * IC / AT / TLBI touch no data at all, so none of them gets a memory
+ * operand.
+ *
+ * Revisit when Capstone grows a memory operand for DC ZVA; verify with
+ * `cstool -d arm64 200774d5` (dc zva, x0), whose operands should then
+ * include a MEM form.
+ */
+static bool cap_aarch64_is_block_zero_sysop(const cs_arm64 *a64, uint8_t n)
+{
+    if (n < 2) {
+        return false;
+    }
+    const cs_arm64_op *o = &a64->operands[0];
+    if (o->type != AARCH64_OP_SYSALIAS ||
+        o->sysop.sub_type != AARCH64_OP_DC) {
+        return false;
+    }
+    return o->sysop.alias.dc == AARCH64_DC_ZVA ||
+           o->sysop.alias.dc == AARCH64_DC_GZVA;
+}
+
+/*
  * Capstone-6.0.0 bug: when UBFM/SBFM/EXTR resolves to one of the
  * three-operand alias mnemonics whose printed form is `Rd, Rn, #imm`
  * (LSL #imm, LSR #imm, ASR #imm, ROR #imm), the disassembler emits the
@@ -1190,6 +1259,12 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
     uint8_t n = MIN(a64->op_count, QEMU_PLUGIN_INSN_DETAIL_MAX_OPS);
     out->n_operands = n;
 
+    /* Capstone models no memory operand for the block-zeroing data-cache
+     * maintenance ops — see cap_aarch64_is_block_zero_sysop.  Detect them
+     * up front so the Xt operand can be turned into the store target it
+     * really is. */
+    bool block_zero = cap_aarch64_is_block_zero_sysop(a64, n);
+
     for (uint8_t i = 0; i < n; i++) {
         const cs_arm64_op *cop = &a64->operands[i];
         qemu_plugin_operand *op = &out->operands[i];
@@ -1221,6 +1296,19 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
             op->index_name[0] = '\0';
             op->index_id   = 0;
             op->imm = 0;
+            /* DC ZVA / DC GZVA: Xt is not a value the instruction reads,
+             * it is the address of the block the instruction zeroes.
+             * Capstone gives no MEM operand at all, so present this one
+             * as the store target — base = Xt, no index, no
+             * displacement.  The operand walker then mints the store
+             * lane and its address dependency exactly as it would for
+             * any other store, and the block's stores stop being
+             * impossible attributions. */
+            if (block_zero) {
+                op->type   = QEMU_PLUGIN_OP_MEM;
+                op->access = QEMU_PLUGIN_OP_ACC_WRITE;
+                op->imm    = 0;
+            }
             break;
         case ARM64_OP_IMM:
             op->type = QEMU_PLUGIN_OP_IMM;

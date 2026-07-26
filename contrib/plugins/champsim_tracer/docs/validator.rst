@@ -467,6 +467,24 @@ outside the repo as standalone scripts):
    loads and stores must likewise tile the source and the
    destination.  Against a base without the fix all six instructions
    are silent and every tiling is empty.
+``features.dc_zva_memops``
+   AArch64 ``DC ZVA`` reaches the memory instrumentation on the
+   correct path *and* is modelled as the block store it is.  The
+   instruction zeroes a naturally aligned block whose size comes from
+   ``DCZID_EL0.BS``, through the same helper-internal host ``memset``
+   the FEAT_MOPS families use, and Linux's ``clear_page`` is built on
+   it — so on a system-mode trace it is a large share of all store
+   traffic.  The check zeroes four consecutive blocks, reading the
+   block size from the guest's own ``DCZID_EL0`` rather than assuming
+   64 or 512 bytes, and asserts the same *tiling* the MOPS check does
+   over the whole run.  It separately asserts that the instruction's
+   template declares a store lane: Capstone gives ``DC ZVA`` no memory
+   operand at all, and without the boundary correction (see
+   :doc:`qemu_modifications`) reported stores land on an instruction
+   the trace declares incapable of touching memory.  The two halves
+   fail independently — a base with neither records no accesses at
+   all, and a base with the instrumentation but not the classification
+   fails ``cst_decode --strict`` instead.
 ``features.string_memops``
    x86 ``REP`` string instructions fan out per architectural iteration
    with the right per-iteration memop count, and the operand model

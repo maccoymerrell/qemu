@@ -2531,12 +2531,30 @@ def classify_aarch64(m: str) -> Entry:
         return ent("GEN_OP_NOP")
     if m in {"dmb", "dsb", "isb", "sb", "csdb", "psb", "tsb", "clrex", "sdsb"}:
         return ent("GEN_OP_FENCE", flags="MF_ATOMIC")
+    # AArch64 has no AARCH64_INS_DC / _IC / _AT / _TLBI constant: Capstone
+    # folds the entire DC / IC / AT / TLBI alias space into
+    # AARCH64_INS_SYS and distinguishes the members only in the decoded
+    # operand detail (and in the mnemonic it prints).  These three rules
+    # therefore never fire from the enum sweep; they are kept because they
+    # state the intended per-operation mapping, which refine_arm64_sysop
+    # applies at decode time.  See the "sys" rule just below.
     if m.startswith(("dc_", "ic_")):
         return ent("GEN_OP_CACHE_FLUSH", flags="MF_ATOMIC")
     if m.startswith("tlbi"):
         return ent("GEN_OP_TLB_FLUSH", flags="MF_ATOMIC")
     if m.startswith("at_"):
         return ent("GEN_OP_FENCE", flags="MF_ATOMIC")
+    # SYS / SYSL carry every DC / IC / AT / TLBI operation under the one
+    # instruction id.  Cache maintenance is the honest static answer for
+    # the family -- it is what all but one member does, and it is a class
+    # the attribution lint already knows performs memory work the decoded
+    # operands do not show.  refine_arm64_sysop then reads the operands
+    # and splits out the members that behave differently, above all
+    # DC ZVA, which is a block store rather than maintenance.  Before
+    # this rule existed these fell through to the vector catch-all below
+    # and came out GEN_OP_VEC_LOGIC, lane-parallel.
+    if m in {"sys", "sysl"}:
+        return ent("GEN_OP_CACHE_FLUSH", flags="MF_ATOMIC")
     if m.startswith("prf") or m.startswith("rprf") or m.startswith("pli"):
         return ent("GEN_OP_PREFETCH")
     if m.startswith(("sysp", "trcit", "wkdmc", "wkdmd", "rdsvl")):

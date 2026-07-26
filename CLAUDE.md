@@ -108,8 +108,13 @@ Read `docs/architecture.rst` for the full picture; the key load-bearing pieces:
   is grabbed inside that window for cache mutations. `unknown_warn_lock` serialises the sidecar log.
 
 - **Multi-vCPU:** one body stream per segment, interleaved across vCPUs through `exec_lock`. `thread_id`
-  in records is the QEMU `cpu_index` verbatim. Each thread has its own `FieldStateTable`; an initial
-  `BODY_TAG_REGFILE` rides with the body stream before each thread's first entry.
+  in records is a **guest-thread identifier, never a vCPU id** — the vCPU is deliberately absent from the
+  wire (`docs/format.rst` is the contract). System mode derives it from the guest's per-thread pointer
+  register, sampled at every privilege level where the target reports
+  `qemu_plugin_thread_ptr_tracks_current()`, so a task switch inside the kernel retags the strand; user
+  mode uses `cpu_index`, which qemu-user allocates one-per-guest-thread. Each thread has its own
+  `FieldStateTable`; an initial `BODY_TAG_REGFILE` rides with the body stream before each thread's first
+  entry.
 
 - **Wire format:** frozen during pre-release. `CST_MAGIC` is the format-epoch identifier — it **may**
   bump at a formal release, but **do not bump it now**, and don't write "never changes" into the spec

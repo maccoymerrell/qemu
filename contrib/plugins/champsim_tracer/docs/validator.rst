@@ -188,8 +188,10 @@ Sub-commands
    hand-written 2-thread program for the requested ISA (parent +
    child both run identical atomic-RMW loops), traces it, and
    asserts both threads are visible.  With ``--system --smp N`` the
-   same clone pair runs marker-pinned inside a booted guest and the
-   assertions run against the vCPU-indexed body stream.
+   same clone pair runs marker-pinned inside a booted guest, and the
+   assertions run against the guest-thread identities the tracer
+   resolves from the kernel per-thread pointer — the vCPU is absent
+   from the wire, so they hold however the scheduler placed the pair.
 
 ``churn_test``
    :ref:`Multi-process churn test <validator-churn>`.  System-mode
@@ -327,11 +329,14 @@ checks and a byte-for-byte golden regression net:
    path rather than its own per-check directory) — byte-for-byte
    wire and ``cst_visualize`` SVG regression.
 
-**system** — 10 checks.  ``system.churn_x86``,
-``system.churn_mipsel``, ``system.thread_x86`` and the four
-``system.clock_progress_<isa>`` checks literally invoke the
+**system** — 11 checks.  ``system.churn_x86``,
+``system.churn_mipsel``, ``system.thread_x86``, ``system.thread_mipsel``
+and the four ``system.clock_progress_<isa>`` checks literally invoke the
 ``churn_test`` / ``thread_test`` sub-commands documented above under
 fixed arguments; cross-reference those sections for what they assert.
+``system.thread_mipsel`` is the ``thread_strand`` gate's home ISA: a
+narrow ASID folds the pinned process's every strand into one asid, so two
+vCPUs' kernel work shares a context the moment their thread ids agree.
 ``system.user_x86``, ``system.smc_x86``, and ``system.attach_mipsel``
 add coverage no other sub-command exposes:
 
@@ -657,6 +662,30 @@ These don't need a generator ``meta.json`` and run on any ``.cst``.
    wired into the ``all`` battery — it correctly fails on a known
    fault-merge defect (see the comment at the ``validate()`` call
    site).
+
+``thread_strand``
+   Sequentiality of every ``(thread_id, asid)`` context — the property a
+   consumer relies on when it keys per-thread state on that pair and
+   reads the entries under one key as a single instruction stream.
+   Where ``thread_chain`` follows *user* code per thread, this check
+   walks the whole stream, kernel included, and uses each entry's
+   resolved terminal branch: filtered to one context, entry N's branch
+   target should name entry N+1's start PC (or one of its fault anchors,
+   for a merged block).  When it does not, the strand was diverted, and
+   the dangling target is remembered.  Every diversion the format
+   documents crosses a boundary the wire makes visible — entering an
+   excursion raises ``fault_depth``, returning lowers it, a
+   privilege-domain gap changes ``is_system``.  A diversion at the SAME
+   depth and privilege whose target is picked up *later*, while the
+   entries in between chained happily among themselves, is none of
+   those: it is two independent instruction streams braided into one
+   context, which is what a shared ``thread_id`` looks like from outside.
+   Braided resumptions are errors; diversions that never resume are not
+   (a strand that simply ends, or an excursion outside the trace's
+   coverage, leaves a dangling target with no braid — the
+   ``cst_decode --verify-branch`` census is the tool for those).  This is
+   the check that fails a trace in which two vCPUs' kernel work shares
+   one thread id.  Runs in ``validate_structural`` and ``validate``.
 
 ``syscall_fault_nesting``
    Nested-excursion discipline (system-mode marker runs).  The
@@ -985,7 +1014,11 @@ vCPU indexes.  So:
 * ``thread_chain`` decomposes the user entries into the two guest
   threads' control-flow chains **per tid** — one well-formed chain each,
   which a migrating thread keeps intact because it holds one tid across
-  vCPUs, and
+  vCPUs,
+* ``thread_strand`` extends that to kernel code: with two vCPUs both
+  running kernel work for the pinned process, each ``(thread_id, asid)``
+  context must still read as one sequential strand, which is only true
+  if the two vCPUs' strands carry different thread ids, and
 * the captured console log's segment-close line must not report an
   under-budget close.
 

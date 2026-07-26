@@ -241,28 +241,27 @@ the trace stream:
 * **``thread_id`` names a guest thread, not the vCPU.**  The vCPU
   (host scheduling slot) is deliberately absent from the wire — the
   consumer owns the thread-to-core mapping, not the tracer.  In a
-  user-mode trace each guest thread is its own host thread and
-  ``thread_id`` is that thread's index.  In a **system-mode pinned**
-  trace the id is resolved from the guest kernel's per-thread pointer
-  register (x86 ``FS.base``, AArch64 ``TPIDR_EL0``, RISC-V ``tp``,
-  MIPS CP0 ``UserLocal`` — :c:func:`qemu_plugin_get_thread_ptr`),
-  sampled at user privilege for the pinned process and mapped to a
-  compact id in first-sighting order within the segment.  Because that
-  pointer follows the software thread, the id is **stable across vCPU
-  migration**: a thread the guest scheduler moves between vCPUs keeps
-  one ``thread_id``, and two threads time-slicing a single vCPU are two
+  user-mode trace each guest thread is its own host thread — qemu-user
+  gives every ``clone`` its own ``CPUState`` — so ``thread_id`` is that
+  thread's index and there is no scheduler multiplexing behind it.  In a
+  **system-mode** trace, pinned or not, the id is resolved from the
+  guest kernel's per-thread pointer register (x86-64 ``FS.base``,
+  AArch64 ``TPIDR_EL0``, RISC-V ``tp``, MIPS CP0 ``UserLocal`` —
+  :c:func:`qemu_plugin_get_thread_ptr`) and mapped to a compact id in
+  first-sighting order within the segment.  Because that pointer follows
+  the software thread, the id is **stable across vCPU migration**: a
+  thread the guest scheduler moves between vCPUs keeps one
+  ``thread_id``, and two threads time-slicing a single vCPU are two
   distinct ids — the opposite of a vCPU index, which would split the
-  first and merge the second.  A single-threaded pinned process is
-  ``thread_id`` 0 regardless of which vCPU(s) it ran on; kernel entries
-  inherit the tid of the thread that entered the kernel (a kernel TB
-  before any user TB of the segment reads as thread 0).  Each segment's
+  first and merge the second.  A single-threaded traced process is
+  ``thread_id`` 0 regardless of which vCPU(s) it ran on.  Each segment's
   body opens with an explicit ``BODY_TAG_THREAD_SWITCH`` naming the
   starting thread; the per-segment thread-id map is reset at each open.
   *Degradation:* a target/model whose thread-pointer register is never
   written (no MIPS ``Config3.ULRI``, a guest that sets no TLS) reports
   0 for every thread, so its threads collapse to one id — honest
-  indistinctness, never a fabricated identity.  For the attribution
-  envelope and the migration boundary see :ref:`single-address-space`.
+  indistinctness, never a fabricated identity.  For kernel-side
+  attribution see :ref:`single-address-space`.
 * **``icount`` is per-vCPU.**  The plugin maintains one instruction
   counter per QEMU vCPU.  Segment-window comparisons (``start=N``
   / ``stop=N``, simpoint windows) consult the firing vCPU's
@@ -332,37 +331,47 @@ canonical configuration), a process's synchronous kernel excursions share
 that process's ASID, so kernel and user code of one process fold to a
 single address space, told apart only by the per-insn ``SYSTEM`` bit.
 
-Clean per-thread attribution of *kernel* code still rests on the traced
-process **not migrating across vCPUs**:
+Per-thread attribution of *kernel* code follows the guest scheduler, not
+the vCPU:
 
 * **User code is exact.**  ``thread_id`` is read from the per-thread
-  pointer, a user register the kernel context-switches, so a thread's
+  pointer, a register the kernel context-switches, so a thread's
   user-space blocks carry one id wherever the guest scheduler runs them —
   stable across a migration.
-* **Kernel code is attributed by entry, within a vCPU.**  A user-to-kernel
-  excursion (syscall, fault handler) inherits the tid of the thread that
-  entered it on that vCPU.  This is correct while the process stays on one
-  vCPU.  It has **no architecturally-clean answer across a migration**:
-  kernel code carries no per-thread register (the thread pointer is a user
-  register; no ISA exposes a kernel-privilege one), so scheduler /
-  context-switch code the guest runs on a vCPU a thread has just left, or
-  arrives on before reaching user, belongs to no single thread the wire
-  can name.
+* **Kernel code carries the CURRENT task.**  A syscall or fault handler
+  runs as its caller and inherits that thread, which is what an excursion
+  should look like.  But a context switch performed entirely inside the
+  kernel hands the rest of the strand to the incoming task, and the
+  producer follows it: on x86-64, AArch64 and MIPS the thread-pointer
+  register still names the current task at kernel privilege (Linux
+  reloads it from the incoming task in ``switch_to()`` and touches it
+  nowhere else), so the sample is taken at every privilege level and the
+  strand retags itself at the switch.  A freshly cloned child finishing
+  its return path before it has ever run a user instruction is the child,
+  not its parent; a kernel thread scheduled in on a borrowed mm is
+  itself, not whoever last returned to user on that vCPU.
 
-The tracer therefore treats a migrating pinned process as **outside the
-clean-attribution envelope** rather than fabricating a kernel-thread
-identity for it.  The supported path keeps it inside the envelope by
-pinning: :program:`cst_attach` confines the target to one guest CPU by
+The property this preserves is **strand sequentiality**: filtered to one
+``(thread_id, asid)`` context, the entries read as a single instruction
+stream in order.  The validator asserts it directly — see the
+``thread_strand`` check in :doc:`validator`, which fails a trace in which
+two concurrent streams braid inside one context.
+
+RISC-V is the documented exception (:ref:`limits-kernel-strand`): its trap
+entry repurposes ``tp``, so only user-privilege samples are trusted there
+and kernel code is attributed to the thread that entered the kernel on
+that vCPU — correct while a process stays put, wrong for work left on a
+vCPU it has migrated off.  Pinning keeps a RISC-V trace inside that
+envelope: :program:`cst_attach` confines the target to one guest CPU by
 default (``--pin-cpu N`` / ``--no-pin``), and ``taskset`` / ``isolcpus``
-do the same for a compiled-in marker.  When a segment nonetheless observes
-the pinned process running **user** code on more than one vCPU — the
-architectural migration signal — the plugin emits **one** stderr warning
-per segment and sets the ``pin_multivcpu_observed`` stat, making the
-misuse loud rather than silent.  Only the user-code tid is guaranteed
-across such a migration; the per-vCPU kernel-nesting discipline the
-validator's ``syscall_fault_nesting`` check asserts is relaxed at the
-migration seam for exactly this reason (a documented boundary, verified by
-the forced-migration test, not a papered-over defect).
+do the same for a compiled-in marker.  When a segment observes the pinned
+process running **user** code on more than one vCPU — the architectural
+migration signal — the plugin emits **one** stderr warning per segment and
+sets the ``pin_multivcpu_observed`` stat, making the exposure loud rather
+than silent.  The per-vCPU kernel-nesting discipline the validator's
+``syscall_fault_nesting`` check asserts is relaxed at the migration seam
+for the same reason (a documented boundary, verified by the
+forced-migration test, not a papered-over defect).
 
 .. _tb-vs-true-bb:
 

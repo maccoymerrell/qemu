@@ -636,17 +636,36 @@ address space is traced.
 ``thread_id`` is an **opaque guest-thread identifier**, and the vCPU (host
 scheduling slot) the thread ran on is deliberately NOT on the wire — the
 consumer maps threads onto simulated cores however its model requires.  In
-a system-mode pinned trace the producer derives the id from the guest
-kernel's per-thread pointer register, so it names a software thread that is
-stable across vCPU migration: a thread that the guest scheduler moves
-between vCPUs keeps ONE ``thread_id``, and two threads that time-slice a
-single vCPU are two distinct ``thread_id``\ s.  Ids are small integers assigned
-in first-sighting order within a segment (0, 1, 2, …); a single-threaded
-traced process is ``thread_id`` 0.  In a user-mode trace each guest thread is
-its own host thread and ``thread_id`` is that thread's index, likewise stable
-for the thread's lifetime.  Either way a decoder needs no knowledge of the
-mapping — it keys per-thread state (the initial regfile, the field-delta
-overlays) on the id as an opaque tag.
+a system-mode trace the producer derives the id from the guest kernel's
+per-thread pointer register, so it names a software thread that is stable
+across vCPU migration: a thread that the guest scheduler moves between
+vCPUs keeps ONE ``thread_id``, and two threads that time-slice a single vCPU
+are two distinct ``thread_id``\ s.  Ids are small integers assigned in
+first-sighting order within a segment (0, 1, 2, …); a single-threaded traced
+process is ``thread_id`` 0.  In a user-mode trace each guest thread is its
+own host thread and ``thread_id`` is that thread's index, likewise stable for
+the thread's lifetime — with the one boundary that a user-mode index is
+released when its thread exits and may be handed to a thread created later,
+so ids are unique among threads that are alive *together* rather than over
+all time.  Either way a decoder needs no knowledge of the mapping — it keys
+per-thread state (the initial regfile, the field-delta overlays) on the id
+as an opaque tag.
+
+Kernel blocks carry the ``thread_id`` of the task that is CURRENT while they
+execute, which is not always the thread that entered the kernel: a syscall
+or fault handler runs as its caller, but a context switch performed entirely
+inside the kernel hands the rest of the strand to the incoming task — a
+freshly cloned child finishing its return path before it has ever executed a
+user instruction, or a kernel thread scheduled in, is that task and not its
+predecessor.  The producer follows those switches wherever the target's
+thread-pointer register still names the current task at kernel privilege
+(see :doc:`limitations` for the targets where it does not, and for the
+consequences when it does not).  The practical guarantee this buys a
+consumer is **strand sequentiality**: filtered to one ``(asid, thread_id)``
+context, the entries read as a single instruction stream in order, with
+breaks only at the nesting boundaries the format makes visible
+(``fault_depth`` changes, privilege-domain gaps).  Two concurrently
+executing threads never share a ``thread_id``.
 
 **Address space (asid).**  The ``asid`` dimension names the address space a
 block executed in, carried alongside ``thread_id`` as the second half of the

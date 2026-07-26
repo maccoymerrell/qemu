@@ -259,6 +259,39 @@ pathological cases involve x86 ``rep`` opcodes on the wrong path,
 where speculative iteration is bounded by the WP depth budget
 anyway.
 
+.. _limits-kernel-strand:
+
+**Kernel-strand identity depends on the target's thread-pointer
+register.**  ``thread_id`` on a kernel block names the task that is
+current while it runs, and the producer learns that from the same
+per-thread pointer register it uses for user code (x86-64 ``FS.base``,
+AArch64 ``TPIDR_EL0``, MIPS CP0 ``UserLocal``).  Those three are
+architecturally the kernel's to reload and nothing else's, so Linux
+writes them from the incoming task at every context switch and a read
+inside the kernel is exact.  **RISC-V is the exception**: its trap
+entry swaps ``tp`` with ``sscratch``, so in-kernel ``tp`` is the
+kernel's own per-task pointer, a different value space from the user
+thread pointer — using it would split one thread's user and kernel code
+across two identities.  The producer therefore trusts only
+user-privilege samples on RISC-V, and a RISC-V kernel block carries the
+thread that *entered* the kernel on that vCPU.  Where that thread is not
+the one actually running — a kernel thread scheduled in on a borrowed
+mm, or work left behind on a vCPU the traced thread has migrated off —
+the block is credited to the wrong thread, and two such strands can
+braid inside one ``(thread_id, asid)`` context.  Where the register is
+never written at all (a MIPS model without ``Config3.ULRI``, a guest
+that sets no TLS) every thread reports 0 and they collapse to one id:
+honest indistinctness, not fabricated identity.  Kernel threads, which
+carry no TLS pointer, likewise share the id minted for 0.
+
+On the targets where the sample *is* trusted at kernel privilege, the
+handoff lands where the guest kernel declares the incoming task — the
+``switch_to()`` write, a few instructions ahead of the actual stack
+switch — so a short run of instructions inside the scheduler is credited
+to the incoming task while the outgoing one is still architecturally
+executing.  The window is bounded by that fixed instruction distance and
+is entirely inside kernel scheduler code.
+
 **Sub-instruction WP coverage past faults is limited.**  The WP
 simulator continues *past* in-flight faults on non-branch
 instructions to preserve the "BBs always end in a branch"

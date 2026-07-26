@@ -139,6 +139,17 @@ Plugin API additions
      identity independent of the vCPU a thread happens to be scheduled
      on.  The plugin keys ``thread_id`` off it rather than the vCPU
      index.
+   * ``qemu_plugin_thread_ptr_tracks_current`` — whether that register
+     still names the executing software thread when sampled *above* user
+     privilege.  It is a per-target property: MIPS ``UserLocal``,
+     AArch64 ``TPIDR_EL0`` and x86-64 ``FS.base`` are the kernel's to
+     reload and nobody else's, so a kernel-privilege read names the
+     current task; RISC-V swaps ``tp`` with ``sscratch`` on trap entry,
+     so its in-kernel value is a different quantity entirely.  Where the
+     answer is yes the plugin samples at every privilege level, which is
+     what lets a guest context switch performed entirely inside the
+     kernel retag the strand instead of leaving the work credited to
+     whichever thread last returned to user on that vCPU.
    * ``qemu_plugin_vaddr_is_kernel`` — classifies a code virtual
      address's privilege domain through the target's own MMU / segment
      logic: a kernel-vs-user split that needs no page-table walk and is

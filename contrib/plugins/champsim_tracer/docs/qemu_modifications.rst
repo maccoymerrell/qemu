@@ -1198,14 +1198,18 @@ program's bulk memory traffic.
    reporting a store with no load or a load with no store.
 
    ``HELPER(dc_zva)`` is a call site too.  ``DC ZVA, Xt`` zeroes a
-   naturally aligned block whose size comes from ``DCZID_EL0.BS`` (512
-   bytes on a ``-cpu max`` guest) through the same bare host ``memset``
-   behind a trapless ``tlb_vaddr_to_host()``.  Linux's ``clear_page`` is
-   built on it, so on a system-mode trace it carries a large share of all
-   store traffic.  The call passes the already block-aligned ``vaddr``
-   and the CPU's own ``blocklen``, so the decomposition is exact rather
-   than assuming a block size; the helper's two other exits zero the
-   block with ``cpu_stb_mmuidx_ra()`` and are instrumented already.
+   naturally aligned block whose size comes from ``DCZID_EL0.BS``,
+   through the same bare host ``memset`` behind a trapless
+   ``tlb_vaddr_to_host()``.  Linux's ``clear_page`` is built on it, so on
+   a system-mode trace it carries a large share of all store traffic.
+   The call passes the already block-aligned ``vaddr`` and the CPU's own
+   ``blocklen``, so the decomposition is exact rather than assuming a
+   block size — which matters, because the size is a property of the CPU
+   model and not a constant: the same tracer sees 512-byte blocks under
+   ``qemu-aarch64`` and 64-byte blocks under ``qemu-system-aarch64 -cpu
+   max``, where ``clear_page`` accordingly loops 64 times to cover a
+   4 KiB page.  The helper's two other exits zero the block with
+   ``cpu_stb_mmuidx_ra()`` and are instrumented already.
 
    Reporting it also required the instruction to be *classifiable* as a
    memory instruction, which it was not.  Capstone folds the whole

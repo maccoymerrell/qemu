@@ -142,6 +142,7 @@ FEATURES: dict[str, str] = {
     "behavior:wire_determinism": "byte-for-byte reproducible wire (golden net)",
     "behavior:mutation_strictness": "oracle catches deliberate trace corruption (mutation matrix)",
     "behavior:wrong_path_coverage": "static_templates=1: minted-alternate never-executed fall-through + BTB target coverage, deepened by static_depth (4-ISA)",
+    "behavior:isa_crosscheck": "the decode metadata the tracer consumes (Capstone + the disas/capstone.c correction boundary) agrees with an independently maintained decoder (LLVM MC) across an exhaustive sweep of the opcode-bearing encoding space, on all four ISAs, outside a justified allowlist",
     "behavior:segment_final_memops": "the segment's last body entry carries its memory operands, matching the earlier executions of the same true BB (the deferred icount/simpoint window close emits it after it has run, not before)",
     "behavior:smc_revisions": "self-modifying code: correct-path template-revision minting for rewrites that preserve OR change the block's instruction boundaries, content-signature id reuse, and the per-pc revision cap (4-ISA)",
     "behavior:bulk_mem_visible": "aarch64 FEAT_MOPS bulk transfers (SETP/SETM/SETE, CPYP/CPYM/CPYE) reach the memory instrumentation on the correct path: their recorded accesses tile the transferred range exactly instead of vanishing into the helper's host memset/memmove",
@@ -1308,6 +1309,80 @@ def _chk_static_coverage(ctx: Ctx) -> Outcome:
                    "static_depth-deepened (4 ISAs, minting-off teeth)", subs)
 
 
+# Subtarget arguments per ISA for the decoder cross-check.  The Capstone side
+# is fixed by disas/capstone.c; these widen the LLVM subtarget so that "LLVM
+# rejects it" means "genuinely not an encoding of this ISA" rather than
+# "feature not enabled in the default subtarget", which is the single largest
+# source of false positives in that tool.
+_ISAX_LLVM_ARGS = {
+    "aarch64": ["--mattr=+all"],
+    "mipsel": ["--mattr=+mips32r2,+msa,+dsp,+dspr2,+dspr3,+fp64,+eva,+virt,"
+               "+ginv,+crc,+abs2008,+nan2008,+mt", "--mcpu=mips32r2"],
+    "riscv64": [],
+    "x86_64": [],
+}
+
+
+def _chk_isa_crosscheck(ctx: Ctx) -> Outcome:
+    """Independent ground truth for the decode metadata the tracer consumes.
+
+    Every other oracle in this battery reads the same Capstone-derived
+    metadata the tracer does, so a decoder defect is invisible to all of
+    them: the trace is corrupted and the checks agree with the corruption.
+    isaxcheck breaks that circle by feeding identical encoding bytes to the
+    tracer's own boundary (cap_disas_raw_detail() in disas/capstone.c —
+    Capstone plus every correction applied on top) and to the LLVM MC layer,
+    a separately maintained decoder and instruction-description database,
+    then bucketing every disagreement by (class, mnemonic, difference)
+    signature.
+
+    GATING on any signature outside tools/isaxcheck_allow.txt, for all four
+    ISAs.  The whole sweep is ~25 s on 8 cores over 12.6-16.8 M encodings per
+    ISA, which is cheap enough to run on every Capstone bump — the point
+    being that the disas/capstone.c workarounds should be retirable rather
+    than permanent.  A workaround that works shows up here as the ABSENCE of
+    a disagreement; capstone_workaround_probe answers the complementary
+    question of whether it has become unnecessary.
+    """
+    tool = ctx.build_dir / "contrib/plugins/isaxcheck"
+    # __file__ = .../champsim_tracer/validator/champsim_tracer_validator/_full.py
+    allow = (Path(__file__).resolve().parents[2]
+             / "tools" / "isaxcheck_allow.txt")
+    if not tool.is_file():
+        return Outcome("fail",
+                       f"isaxcheck not built at {tool}.  It needs LLVM MC "
+                       "(llvm-18-dev or newer supplying llvm-config); meson "
+                       "skips the target with a warning when llvm-config is "
+                       "absent, and the gate cannot vouch for decode "
+                       "metadata without it.")
+    if not allow.is_file():
+        return Outcome("fail", f"allowlist missing at {allow}")
+
+    subs: list = []
+    all_ok = True
+    for isa in ISA_ALL:
+        cmd = ([str(tool), f"--isa={isa}", "--jobs=8"]
+               + _ISAX_LLVM_ARGS.get(isa, [])
+               + [f"--allow={allow}", "--check"])
+        p = subprocess.run(cmd, text=True, capture_output=True, timeout=900)
+        head = (p.stdout or "").splitlines()
+        summary = head[0] if head else (p.stderr or "").strip()[:200]
+        ok = p.returncode == 0
+        all_ok = all_ok and ok
+        detail = summary
+        if not ok:
+            # Every line the tool prints under --check is a signature that
+            # is NOT allowlisted; show a bounded sample.
+            new = [ln for ln in head[1:] if ln.startswith("NEW")]
+            detail += "\n" + "\n".join(ln[:160] for ln in new[:8])
+            if len(new) > 8:
+                detail += f"\n... and {len(new) - 8} more"
+        subs.append({"name": isa, "ok": ok, "detail": detail})
+    return Outcome("pass" if all_ok else "fail",
+                   "boundary-vs-LLVM-MC decode metadata agreement "
+                   "(4 ISAs, ~57 M encodings, allowlisted residual)", subs)
+
+
 def _chk_smc(ctx: Ctx) -> Outcome:
     """Self-modifying-code revision oracle (smc_plan.md §3).  Across all four
     ISAs, drive the SMC families whose expected revision structure is known a
@@ -1580,6 +1655,10 @@ def build_checks() -> list:
     C.append(Check("features.wrong_path_coverage", "features",
                    "static_templates=1 fall-through/BTB coverage oracle (4-ISA)",
                    ["behavior:wrong_path_coverage"], _chk_static_coverage))
+    C.append(Check("features.isa_crosscheck", "features",
+                   "decode metadata vs an independent decoder (LLVM MC), "
+                   "exhaustive encoding sweep (4-ISA)",
+                   ["behavior:isa_crosscheck"], _chk_isa_crosscheck))
     C.append(Check("features.final_entry_memops", "features",
                    "segment-final body entry keeps its memops across a "
                    "deferred icount-window close (4-ISA)",

@@ -1,0 +1,1121 @@
+/*
+ * isaxcheck — independent ground-truth cross-check of the decode metadata
+ * the ChampSim Tracer actually consumes, against the LLVM MC layer.
+ *
+ * Author: Maccoy Merrell
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * Per instruction the tracer consumes (a) whether it touches memory and in
+ * which direction, (b) its architectural register read/write sets, (c) its
+ * branch taxonomy.  All three come from Capstone by way of the correction
+ * boundary in disas/capstone.c.  Every self-consistency check the project
+ * owns reads that same metadata, so a decoder defect is invisible to all of
+ * them — it corrupts the trace and the checks agree with the corruption.
+ * Intel PIN cross-validation broke that circle on x86 and found five real
+ * defects.  PIN cannot reach aarch64 / riscv64 / mipsel; LLVM's MC layer can,
+ * and is a second, independently maintained decoder plus instruction
+ * description database.
+ *
+ * WHAT IS COMPARED — AND WHY IT IS THE BOUNDARY, NOT RAW CAPSTONE
+ * ---------------------------------------------------------------
+ * The Capstone side of this tool is `cap_disas_raw_detail()` from
+ * disas/capstone.c: the exact entry point the plugin calls, with the exact
+ * per-ISA operand fillers and defect workarounds applied.  Comparing raw
+ * Capstone would be the wrong instrument twice over — every existing
+ * workaround would show up as a permanent disagreement needing an allowlist
+ * entry, and a newly added workaround would not be verified by the gate at
+ * all.  Driving the boundary means:
+ *
+ *   - a workaround that works makes its defect *disappear* from the report,
+ *     which is the proof the workaround is correct;
+ *   - a workaround that stops being necessary after a Capstone bump keeps the
+ *     gate green (it is then a no-op) — `capstone_workaround_probe` is the
+ *     tool that tells you it has become removable;
+ *   - a defect not yet worked around stays visible until it is either fixed
+ *     or explicitly allowlisted with a justification.
+ *
+ * The register-set comparison also models the plugin's own
+ * `include_implicit_regs` per-ISA policy (see kIncludeImplicitRegs below), so
+ * "what LLVM says" is compared against "what the tracer's dependency model
+ * would actually record", not against an intermediate that nothing consumes.
+ *
+ * WHAT IT CANNOT SEE
+ * ------------------
+ * Capstone's AArch64 / Mips / RISCV instruction tables are auto-synced from
+ * LLVM TableGen, so a defect the two share is invisible here.  What this
+ * catches is Capstone's *runtime detail path* — alias handling, tied-operand
+ * handling, register-class mapping — which is where every defect found so far
+ * has lived.  x86's tables are hand-maintained and independent.
+ *
+ * SUBTARGET MATCHING IS LOAD-BEARING
+ * ----------------------------------
+ * The Capstone mode must be the one the tracer selects and the LLVM feature
+ * set must match it, or "LLVM rejects it" degenerates into "feature not
+ * enabled".  An early run with the default RISC-V subtarget produced 1.6M
+ * spurious hits that vanished once the mode was aligned.  See kIsaTable and
+ * its cross-reference to `cap_mode_*()`.
+ */
+
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
+
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <capstone/capstone.h>
+
+#include "qemu/qemu-plugin.h"
+
+/* Implemented by disas/capstone.c, which is compiled into this tool. */
+extern "C" bool cap_disas_raw_detail(int cap_arch, unsigned int cap_mode,
+                                     const uint8_t *data, size_t data_size,
+                                     uint64_t pc,
+                                     struct qemu_plugin_insn_info *out);
+
+#include "llvm/MC/MCAsmInfo.h"
+#include "llvm/MC/MCContext.h"
+#include "llvm/MC/MCDisassembler/MCDisassembler.h"
+#include "llvm/MC/MCInst.h"
+#include "llvm/MC/MCInstPrinter.h"
+#include "llvm/MC/MCInstrAnalysis.h"
+#include "llvm/MC/MCInstrDesc.h"
+#include "llvm/MC/MCInstrInfo.h"
+#include "llvm/MC/MCRegisterInfo.h"
+#include "llvm/MC/MCSubtargetInfo.h"
+#include "llvm/MC/MCTargetOptions.h"
+#include "llvm/MC/TargetRegistry.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/TargetParser/Triple.h"
+
+// ---------------------------------------------------------------------------
+// ISA description
+// ---------------------------------------------------------------------------
+
+enum Isa { ISA_AARCH64, ISA_RISCV64, ISA_MIPSEL, ISA_X86_64 };
+
+struct IsaCfg {
+    const char *name;
+    const char *triple;
+    const char *cpu;
+    const char *features;
+    int cs_arch;
+    unsigned cs_mode;
+    // Mirrors IsaProperties::include_implicit_regs in
+    // contrib/plugins/champsim_tracer/champsim_tracer_mnemonics.h.  The
+    // plugin folds Capstone's implicit regs_read[]/regs_write[] into the
+    // dependency sets only when this is set, so the comparison must model it
+    // or the report describes a register set nothing consumes.
+    bool include_implicit_regs;
+};
+
+static IsaCfg cfg;
+static Isa isa;
+
+/*
+ * Capstone modes below are the fallback sets `cap_mode_aarch64()`,
+ * `cap_mode_riscv()` and `cap_mode_mips()` select when no guest ELF is
+ * available (champsim_tracer_mnemonics_<isa>.h).  Those functions cannot be
+ * called from here — they resolve the extension set from the *guest binary*
+ * via qemu_plugin_path_to_binary(), a plugin-runtime API — so the fallback is
+ * restated.  WHEN cap_mode_*() CHANGES, CHANGE THIS TOO: a mode mismatch is
+ * the single largest source of false positives in this tool, and it is silent.
+ * The LLVM feature strings are chosen to describe the same ISA subset.
+ */
+static const IsaCfg kIsaTable[] = {
+    {"aarch64", "aarch64-unknown-linux-gnu", "generic",
+     "+v8.5a,+sve,+crypto,+lse,+rdm,+dotprod",
+     CS_ARCH_AARCH64, CS_MODE_LITTLE_ENDIAN, true},
+    {"riscv64", "riscv64-unknown-linux-gnu", "generic-rv64",
+     "+64bit,+i,+m,+a,+f,+d,+c,+v,+zicsr,+zifencei,+zba,+zbb,+zbc,"
+     "+zbkb,+zbkc,+zbkx,+zbs,+zfh,+zfhmin,+zvl64b,+zve64d,+zvfh",
+     CS_ARCH_RISCV,
+     CS_MODE_RISCV64 | CS_MODE_RISCV_C | CS_MODE_RISCV_FD | CS_MODE_RISCV_A |
+         CS_MODE_RISCV_V | CS_MODE_RISCV_ZBA | CS_MODE_RISCV_ZBB |
+         CS_MODE_RISCV_ZBC | CS_MODE_RISCV_ZBKB | CS_MODE_RISCV_ZBKC |
+         CS_MODE_RISCV_ZBKX | CS_MODE_RISCV_ZBS,
+     true},
+    {"mipsel", "mipsel-unknown-linux-gnu", "mips32r2", "",
+     CS_ARCH_MIPS, CS_MODE_MIPS32R2 | CS_MODE_LITTLE_ENDIAN, true},
+    {"x86_64", "x86_64-unknown-linux-gnu", "x86-64", "",
+     CS_ARCH_X86, CS_MODE_64, true},
+};
+
+// ---------------------------------------------------------------------------
+// Boundary (Capstone + disas/capstone.c) side
+// ---------------------------------------------------------------------------
+
+struct CsView {
+    bool ok = false;
+    unsigned size = 0;
+    std::string mnem, ops;
+    bool has_mem = false;
+    bool mem_read = false;    // some MEM operand carries READ
+    bool mem_write = false;   // some MEM operand carries WRITE
+    bool mem_unknown = false; // some MEM operand has access == 0
+    bool reg_unknown = false; // some REG operand has access == 0
+    bool has_invalid_op = false; // an operand the boundary could not model
+    unsigned n_ops = 0;
+    std::set<std::string> rd, wr; // normalised architectural register names
+    bool g_jump = false, g_call = false, g_ret = false, g_branch_rel = false;
+};
+
+// ---------------------------------------------------------------------------
+// Register-name normalisation.  Both decoders name the same architectural
+// register differently; fold both onto one canonical token so set difference
+// is meaningful.  Width is deliberately dropped (the tracer models the
+// architectural register, not the access width) but the register *class* is
+// kept so an integer/vector confusion still shows up.
+// ---------------------------------------------------------------------------
+
+static std::string lower(std::string s) {
+    for (auto &c : s) c = (char)std::tolower((unsigned char)c);
+    return s;
+}
+
+static bool all_digits(const char *p) {
+    if (!*p) return false;
+    for (; *p; p++) if (!std::isdigit((unsigned char)*p)) return false;
+    return true;
+}
+
+static std::string norm_aarch64(std::string r) {
+    r = lower(r);
+    if (r.empty()) return r;
+    if (r[0] == '$') r.erase(0, 1);
+    if (r == "fp") return "r29";
+    if (r == "lr" || r == "x30" || r == "w30") return "r30";
+    if (r == "sp" || r == "wsp") return "sp";
+    if (r == "xzr" || r == "wzr") return "zr";
+    if (r == "nzcv" || r == "cpsr" || r == "pstate") return "nzcv";
+    if ((r[0] == 'w' || r[0] == 'x') && all_digits(r.c_str() + 1))
+        return "r" + r.substr(1);
+    if ((r[0] == 'b' || r[0] == 'h' || r[0] == 's' || r[0] == 'd' ||
+         r[0] == 'q' || r[0] == 'v') && all_digits(r.c_str() + 1))
+        return "v" + r.substr(1);
+    // SVE Z<n> and the SIMD&FP V<n>/Q<n>/D<n>/S<n>/H<n>/B<n> views name the
+    // SAME architectural register (V<n> is the low 128 bits of Z<n>), and the
+    // tracer maps both onto REG_VEC<n>.  The two decoders pick different
+    // views for the same operand -- Capstone prints the reduction
+    // `andv b2, p0, z1.b` destination as b2, LLVM as z2 -- so folding them
+    // together is required for the set difference to mean anything.
+    if (r[0] == 'z' && all_digits(r.c_str() + 1)) return "v" + r.substr(1);
+    if (r[0] == 'p' && all_digits(r.c_str() + 1)) return "p" + r.substr(1);
+    // PN<n> is the predicate-as-counter VIEW of predicate register P<n>
+    // (SVE2.1 / SME2), not a separate register file.
+    if (r.size() > 2 && r[0] == 'p' && r[1] == 'n' &&
+        all_digits(r.c_str() + 2))
+        return "p" + r.substr(2);
+    if (r.compare(0, 2, "za") == 0) {
+        std::string d;
+        for (char ch : r) if (std::isdigit((unsigned char)ch)) d += ch;
+        if (!d.empty()) return "za" + d;
+    }
+    size_t us = r.find('_');
+    if (us != std::string::npos) return norm_aarch64(r.substr(0, us));
+    return r;
+}
+
+static const char *rv_abi[32] = {
+    "zero","ra","sp","gp","tp","t0","t1","t2","s0","s1","a0","a1","a2","a3",
+    "a4","a5","a6","a7","s2","s3","s4","s5","s6","s7","s8","s9","s10","s11",
+    "t3","t4","t5","t6"};
+static const char *rv_fabi[32] = {
+    "ft0","ft1","ft2","ft3","ft4","ft5","ft6","ft7","fs0","fs1","fa0","fa1",
+    "fa2","fa3","fa4","fa5","fa6","fa7","fs2","fs3","fs4","fs5","fs6","fs7",
+    "fs8","fs9","fs10","fs11","ft8","ft9","ft10","ft11"};
+
+static std::string norm_riscv(std::string r) {
+    r = lower(r);
+    if (r.empty()) return r;
+    if (r[0] == '$') r.erase(0, 1);
+    if (r[0] == 'x' && all_digits(r.c_str() + 1)) {
+        int n = atoi(r.c_str() + 1);
+        if (n >= 0 && n < 32) return std::string("r") + std::to_string(n);
+    }
+    if (r[0] == 'f' && r.size() > 1 && std::isdigit((unsigned char)r[1])) {
+        int n = atoi(r.c_str() + 1);
+        if (n >= 0 && n < 32) return std::string("f") + std::to_string(n);
+    }
+    if (r[0] == 'v' && all_digits(r.c_str() + 1)) return r;
+    // LLVM names an LMUL>1 vector register GROUP with a single tuple name
+    // (V0M2 / V0M4 / V0M8) where Capstone names the base register.  The
+    // tracer models the base register, so fold the tuple onto it.
+    if (r[0] == 'v' && r.size() > 2) {
+        size_t m = r.find('m', 1);
+        if (m != std::string::npos && m + 1 < r.size()) {
+            std::string base = r.substr(1, m - 1);
+            if (!base.empty() && all_digits(base.c_str()) &&
+                all_digits(r.c_str() + m + 1))
+                return "v" + base;
+        }
+    }
+    if (r == "s0" || r == "fp") return "r8";
+    for (int i = 0; i < 32; i++) if (r == rv_abi[i]) return std::string("r") + std::to_string(i);
+    for (int i = 0; i < 32; i++) if (r == rv_fabi[i]) return std::string("f") + std::to_string(i);
+    return r;
+}
+
+/*
+ * MIPS names its coprocessor registers as bare numbers on the Capstone side
+ * ("3" for COP0 register 3, "31" for FCR31) while LLVM names them "COP03" /
+ * "FCR31".  Folding a bare number onto the GPR namespace — which an earlier
+ * prototype of this tool did — manufactures a whole family of phantom
+ * "coprocessor write attributed to a GPR" findings that do not exist: the
+ * Capstone *register id* the boundary hands the plugin is MIPS_REG_COP03, and
+ * the plugin maps it to REG_SYS correctly.  A bare number is therefore folded
+ * onto the coprocessor namespace, which is what it is.  GPR operands always
+ * arrive under an ABI name.
+ */
+static std::string norm_mips(std::string r) {
+    r = lower(r);
+    if (r.empty()) return r;
+    if (r[0] == '$') r.erase(0, 1);
+    if (all_digits(r.c_str())) return "cop" + r;
+    static const char *abi[32] = {
+        "zero","at","v0","v1","a0","a1","a2","a3","t0","t1","t2","t3","t4",
+        "t5","t6","t7","s0","s1","s2","s3","s4","s5","s6","s7","t8","t9",
+        "k0","k1","gp","sp","fp","ra"};
+    for (int i = 0; i < 32; i++) if (r == abi[i]) return std::string("r") + std::to_string(i);
+    if (r == "s8") return "r30";
+    if (r.compare(0, 3, "cop") == 0) {
+        // LLVM "COP03" / "COP21" -> cop<number>, dropping the coprocessor
+        // index; the tracer folds every coprocessor register onto REG_SYS, so
+        // distinguishing COP0 from COP2 here would report a difference the
+        // dependency model cannot express.
+        std::string d;
+        for (char ch : r) if (std::isdigit((unsigned char)ch)) d += ch;
+        return "cop" + (d.empty() ? std::string("0") : d.substr(d.size() - 1));
+    }
+    if (r.compare(0, 3, "fcr") == 0 || r == "fcsr") return "fcsr";
+    // DSPOutFlag<n> / DSPOutFlag<a>_<b> / DSPCCond / DSPCarry are bit fields
+    // of the one DSPControl register; both decoders slice it differently and
+    // the tracer folds every slice onto REG_FLAGS.
+    if (r.compare(0, 3, "dsp") == 0) return "dsp";
+    if (r.compare(0, 3, "fcc") == 0) {
+        std::string d;
+        for (char ch : r) if (std::isdigit((unsigned char)ch)) d += ch;
+        return "fcc" + (d.empty() ? std::string("0") : d);
+    }
+    if (r[0] == 'f' && all_digits(r.c_str() + 1)) return r;
+    if (r.size() > 3 && r[0] == 'd' && r.compare(r.size() - 3, 3, "_64") == 0 &&
+        all_digits(r.substr(1, r.size() - 4).c_str()))
+        return "f" + r.substr(1, r.size() - 4);
+    // HI<n> and LO<n> are the two halves of accumulator <n>; the tracer maps
+    // both onto the single REG_ACC<n> slot (champsim_tracer_mnemonics.h
+    // documents the fold), so distinguishing them here would report a
+    // difference the dependency model cannot express.
+    if (r.compare(0, 2, "hi") == 0 || r.compare(0, 2, "lo") == 0 ||
+        r.compare(0, 2, "ac") == 0) {
+        std::string d;
+        for (char ch : r) if (std::isdigit((unsigned char)ch)) d += ch;
+        return "ac" + (d.empty() ? std::string("0") : d);
+    }
+    return r;
+}
+
+static std::string norm_x86(std::string r) {
+    r = lower(r);
+    if (r.empty()) return r;
+    static const char *g64[16] = {"rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
+                                  "r8","r9","r10","r11","r12","r13","r14","r15"};
+    static const char *g32[16] = {"eax","ecx","edx","ebx","esp","ebp","esi","edi",
+                                  "r8d","r9d","r10d","r11d","r12d","r13d","r14d","r15d"};
+    static const char *g16[16] = {"ax","cx","dx","bx","sp","bp","si","di",
+                                  "r8w","r9w","r10w","r11w","r12w","r13w","r14w","r15w"};
+    static const char *g8[16]  = {"al","cl","dl","bl","spl","bpl","sil","dil",
+                                  "r8b","r9b","r10b","r11b","r12b","r13b","r14b","r15b"};
+    static const char *g8h[4]  = {"ah","ch","dh","bh"};
+    for (int i = 0; i < 16; i++) {
+        if (r == g64[i] || r == g32[i] || r == g16[i] || r == g8[i])
+            return std::string("r") + std::to_string(i);
+    }
+    for (int i = 0; i < 4; i++) if (r == g8h[i]) return std::string("r") + std::to_string(i);
+    if (r.size() > 3 && r.compare(0, 3, "xmm") == 0) return "v" + r.substr(3);
+    if (r.size() > 3 && r.compare(0, 3, "ymm") == 0) return "v" + r.substr(3);
+    if (r.size() > 3 && r.compare(0, 3, "zmm") == 0) return "v" + r.substr(3);
+    if (r == "eflags" || r == "flags" || r == "rflags") return "flags";
+    // Any segment register is an address input via its base; which one it is
+    // does not change the dependency, and the plugin folds them all onto the
+    // same REG_SEG bank.  Capstone surfaces the override only as the MEM
+    // operand's segment_id (see cs_decode), never in a reg list, so both
+    // sides are folded onto one token.
+    if (r == "fs" || r == "gs" || r == "cs" || r == "ds" || r == "es" ||
+        r == "ss")
+        return "seg";
+    return r;
+}
+
+static bool drop_zero = true;
+
+/*
+ * Registers folded out of BOTH sides before the set difference.  Each entry
+ * is a place where the two decoders describe the same architecture with
+ * different modelling conventions, so a difference there is not evidence of
+ * a defect and would otherwise swamp the report:
+ *
+ *   - the architectural zero register: reads always yield 0 and writes are
+ *     discarded, so it is a dataflow no-op.  LLVM names it in def/use lists,
+ *     Capstone usually does not.
+ *   - the program counter: the tracer carries control flow through the
+ *     BRANCH_* taxonomy and the entry stream, never through a REG_IP
+ *     dependency edge, and LLVM's MCInstrDesc does not model PC at all.
+ *   - x86 MXCSR: LLVM gives every SSE/AVX instruction an implicit MXCSR use
+ *     (rounding mode + exception mask); Capstone models none, and the
+ *     tracer's x86 register classifier has no MXCSR slot to put it in.
+ *   - x86 SSP (shadow stack pointer): an LLVM-side modelling artifact on
+ *     call/ret, not an architectural GPR read a consumer can schedule on.
+ */
+static bool is_dropped_reg(const std::string &c)
+{
+    if (c == "pc" || c == "rip" || c == "eip" || c == "ip") return true;
+    if (isa == ISA_X86_64 && (c == "mxcsr" || c == "ssp")) return true;
+    if (!drop_zero) return false;
+    switch (isa) {
+    case ISA_AARCH64: return c == "zr";
+    case ISA_RISCV64: return c == "r0";
+    case ISA_MIPSEL:  return c == "r0";
+    default:          return false;
+    }
+}
+
+static std::string norm_reg(const std::string &r) {
+    switch (isa) {
+    case ISA_AARCH64: return norm_aarch64(r);
+    case ISA_RISCV64: return norm_riscv(r);
+    case ISA_MIPSEL:  return norm_mips(r);
+    default:          return norm_x86(r);
+    }
+}
+
+/*
+ * Build the view the plugin's operand walker would build from the boundary's
+ * output.  Deliberately mirrors decode_detail_to_generic() in
+ * champsim_tracer_decode.cc: REG operands contribute by access flag, MEM
+ * base/index/segment registers are address inputs and contribute to the read
+ * set, and implicit registers fold in only under include_implicit_regs.
+ */
+static void cs_decode(const uint8_t *b, size_t n, CsView &v)
+{
+    qemu_plugin_insn_info info;
+    if (!cap_disas_raw_detail(cfg.cs_arch, cfg.cs_mode, b, n, 0x100000, &info))
+        return;
+    v.ok = true;
+    v.size = info.insn_size;
+    v.mnem = info.mnemonic;
+    v.ops = info.op_str;
+    v.n_ops = info.n_operands;
+    v.g_jump = (info.groups & QEMU_PLUGIN_GRP_JUMP) != 0;
+    v.g_call = (info.groups & QEMU_PLUGIN_GRP_CALL) != 0;
+    v.g_ret = (info.groups & QEMU_PLUGIN_GRP_RET) != 0;
+    v.g_branch_rel = (info.groups & QEMU_PLUGIN_GRP_BRANCH_REL) != 0;
+
+    for (unsigned k = 0; k < info.n_operands; k++) {
+        const qemu_plugin_operand *op = &info.operands[k];
+        switch (op->type) {
+        case QEMU_PLUGIN_OP_MEM: {
+            v.has_mem = true;
+            if (op->access == 0) v.mem_unknown = true;
+            if (op->access & QEMU_PLUGIN_OP_ACC_READ) v.mem_read = true;
+            if (op->access & QEMU_PLUGIN_OP_ACC_WRITE) v.mem_write = true;
+            if (op->reg_name[0]) v.rd.insert(norm_reg(op->reg_name));
+            if (op->index_name[0]) v.rd.insert(norm_reg(op->index_name));
+            // An x86 segment override is a genuine address input the plugin
+            // folds into the memop's source set; Capstone exposes it only
+            // here, with no name field, so it is recorded by class.
+            if (op->segment_id) v.rd.insert("seg");
+            break;
+        }
+        case QEMU_PLUGIN_OP_REG: {
+            if (op->access == 0) v.reg_unknown = true;
+            if (!op->reg_name[0]) break;
+            std::string nm = norm_reg(op->reg_name);
+            if (op->access & QEMU_PLUGIN_OP_ACC_READ) v.rd.insert(nm);
+            if (op->access & QEMU_PLUGIN_OP_ACC_WRITE) v.wr.insert(nm);
+            break;
+        }
+        case QEMU_PLUGIN_OP_INVALID:
+            // An operand Capstone reported that the boundary has no
+            // representation for.  Every register it names is silently lost
+            // from the dependency model, so it is worth a class of its own.
+            v.has_invalid_op = true;
+            break;
+        default:
+            break;
+        }
+    }
+
+    if (cfg.include_implicit_regs) {
+        for (unsigned k = 0; k < info.n_regs_read; k++)
+            if (info.regs_read[k][0]) v.rd.insert(norm_reg(info.regs_read[k]));
+        for (unsigned k = 0; k < info.n_regs_write; k++)
+            if (info.regs_write[k][0]) v.wr.insert(norm_reg(info.regs_write[k]));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LLVM side
+// ---------------------------------------------------------------------------
+
+struct LlView {
+    bool ok = false;
+    unsigned size = 0;
+    std::string text;
+    unsigned opcode = 0;
+    bool may_load = false, may_store = false;
+    bool is_branch = false, is_call = false, is_ret = false,
+         is_indirect = false, is_term = false;
+    std::set<std::string> rd, wr;
+};
+
+static const llvm::Target *LT;
+static std::unique_ptr<llvm::MCSubtargetInfo> LSTI;
+static std::unique_ptr<llvm::MCRegisterInfo> LMRI;
+static std::unique_ptr<llvm::MCAsmInfo> LMAI;
+static std::unique_ptr<llvm::MCContext> LCTX;
+static std::unique_ptr<llvm::MCDisassembler> LDIS;
+static std::unique_ptr<llvm::MCInstrInfo> LMII;
+static std::unique_ptr<llvm::MCInstPrinter> LIP;
+static std::unique_ptr<llvm::MCInstrAnalysis> LMIA;
+
+static void llvm_init()
+{
+    LLVMInitializeAArch64TargetInfo(); LLVMInitializeAArch64TargetMC();
+    LLVMInitializeAArch64Disassembler();
+    LLVMInitializeRISCVTargetInfo();   LLVMInitializeRISCVTargetMC();
+    LLVMInitializeRISCVDisassembler();
+    LLVMInitializeMipsTargetInfo();    LLVMInitializeMipsTargetMC();
+    LLVMInitializeMipsDisassembler();
+    LLVMInitializeX86TargetInfo();     LLVMInitializeX86TargetMC();
+    LLVMInitializeX86Disassembler();
+    std::string err;
+    LT = llvm::TargetRegistry::lookupTarget(cfg.triple, err);
+    if (!LT) { fprintf(stderr, "llvm target %s: %s\n", cfg.triple, err.c_str()); exit(1); }
+    llvm::Triple TT(cfg.triple);
+    LSTI.reset(LT->createMCSubtargetInfo(cfg.triple, cfg.cpu, cfg.features));
+    LMRI.reset(LT->createMCRegInfo(cfg.triple));
+    llvm::MCTargetOptions opt;
+    LMAI.reset(LT->createMCAsmInfo(*LMRI, cfg.triple, opt));
+    LCTX.reset(new llvm::MCContext(TT, LMAI.get(), LMRI.get(), LSTI.get()));
+    LDIS.reset(LT->createMCDisassembler(*LSTI, *LCTX));
+    LMII.reset(LT->createMCInstrInfo());
+    LIP.reset(LT->createMCInstPrinter(TT, LMAI->getAssemblerDialect(), *LMAI,
+                                      *LMII, *LMRI));
+    LMIA.reset(LT->createMCInstrAnalysis(LMII.get()));
+    if (!LDIS || !LMII) { fprintf(stderr, "llvm mc init failed\n"); exit(1); }
+}
+
+static void ll_decode(const uint8_t *b, size_t n, LlView &v)
+{
+    llvm::MCInst I;
+    uint64_t sz = 0;
+    llvm::ArrayRef<uint8_t> bytes(b, n);
+    auto st = LDIS->getInstruction(I, sz, bytes, 0x100000, llvm::nulls());
+    if (st != llvm::MCDisassembler::Success) return;
+    v.ok = true;
+    v.size = (unsigned)sz;
+    v.opcode = I.getOpcode();
+    const llvm::MCInstrDesc &D = LMII->get(I.getOpcode());
+    v.may_load = D.mayLoad();
+    v.may_store = D.mayStore();
+    v.is_branch = LMIA ? LMIA->isBranch(I) : D.isBranch();
+    v.is_call = LMIA ? LMIA->isCall(I) : D.isCall();
+    v.is_ret = LMIA ? LMIA->isReturn(I) : D.isReturn();
+    v.is_indirect = LMIA ? LMIA->isIndirectBranch(I) : D.isIndirectBranch();
+    v.is_term = D.isTerminator();
+
+    std::string s;
+    llvm::raw_string_ostream os(s);
+    LIP->printInst(&I, 0x100000, "", *LSTI, os);
+    os.flush();
+    std::string t;
+    bool sp = false;
+    for (char c : s) {
+        if (c == '\t' || c == ' ') { if (!t.empty()) sp = true; continue; }
+        if (sp) { t += ' '; sp = false; }
+        t += c;
+    }
+    v.text = t;
+
+    unsigned ndefs = D.getNumDefs();
+    for (unsigned i = 0; i < I.getNumOperands(); i++) {
+        const llvm::MCOperand &O = I.getOperand(i);
+        if (!O.isReg() || O.getReg() == 0) continue;
+        // LLVM names register *tuples* (AArch64 Q2_Q3_Q4_Q5 lists, MIPS
+        // D0_64) with a single super-register where Capstone names each
+        // member.  Underscores are LLVM's tuple-naming convention, so expand
+        // only those — expanding ordinary registers would drag in unrelated
+        // sub-register views (Z0 -> Q0/D0/S0...) and manufacture noise.
+        const char *nm = LMRI->getName(O.getReg());
+        if (!nm) continue;
+        std::vector<std::string> names;
+        if (strchr(nm, '_')) {
+            for (llvm::MCPhysReg sub : LMRI->subregs(O.getReg())) {
+                const char *sn = LMRI->getName(sub);
+                if (sn && !strchr(sn, '_')) names.push_back(norm_reg(sn));
+            }
+        }
+        if (names.empty()) names.push_back(norm_reg(nm));
+        for (const std::string &cn : names) {
+            if (i < ndefs) {
+                v.wr.insert(cn);
+                if (i < D.getNumOperands() &&
+                    D.getOperandConstraint(i, llvm::MCOI::TIED_TO) != -1)
+                    v.rd.insert(cn);
+            } else {
+                v.rd.insert(cn);
+                int tied = (i < D.getNumOperands())
+                               ? D.getOperandConstraint(i, llvm::MCOI::TIED_TO) : -1;
+                if (tied != -1) v.wr.insert(cn);
+            }
+        }
+    }
+    // LLVM's call instructions carry an ABI-modelling implicit use of SP that
+    // is not an architectural read; Capstone (correctly) omits it.
+    if (v.is_call) v.rd.erase(isa == ISA_AARCH64 ? "sp" : "r2");
+    for (llvm::MCPhysReg r : D.implicit_defs()) {
+        const char *nm = LMRI->getName(r); if (nm) v.wr.insert(norm_reg(nm));
+    }
+    for (llvm::MCPhysReg r : D.implicit_uses()) {
+        const char *nm = LMRI->getName(r); if (nm) v.rd.insert(norm_reg(nm));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Disagreement bucketing
+// ---------------------------------------------------------------------------
+
+struct Bucket { std::string sample; unsigned long n = 0; };
+static std::map<std::string, Bucket> buckets;
+
+// A signature key is CLASS + mnemonic (+ a short qualifier).  It carries no
+// counts, so an allowlist entry can name it exactly and stay stable as the
+// sweep shape changes.
+static void note(const std::string &key, const std::string &sample)
+{
+    auto &b = buckets[key];
+    if (!b.n) b.sample = sample;
+    b.n++;
+}
+
+static std::string hexbytes(const uint8_t *b, unsigned n)
+{
+    char t[64]; std::string s;
+    for (unsigned i = 0; i < n && i < 16; i++) { snprintf(t, sizeof t, "%02x", b[i]); s += t; }
+    return s;
+}
+
+/*
+ * Render a difference set into a signature key.  Register *numbers* are
+ * erased (r3 -> r#) because the sweep visits the same instruction with many
+ * register fillings and the defect is never specific to one of them; the
+ * register CLASS is kept, because an integer/vector confusion is a defect.
+ */
+static std::string liststr(const std::vector<std::string> &v)
+{
+    std::set<std::string> cls;
+    for (const std::string &e : v) {
+        std::string k;
+        for (char ch : e) k += std::isdigit((unsigned char)ch) ? '#' : ch;
+        // collapse runs of '#'
+        std::string t;
+        for (char ch : k) if (ch != '#' || t.empty() || t.back() != '#') t += ch;
+        cls.insert(t);
+    }
+    std::string r;
+    for (auto &e : cls) { if (!r.empty()) r += ","; r += e; }
+    return r.empty() ? "-" : r;
+}
+
+static std::string setstr(const std::set<std::string> &s)
+{
+    std::string r;
+    for (auto &e : s) { if (!r.empty()) r += ","; r += e; }
+    return r.empty() ? "-" : r;
+}
+
+// Which comparison classes are enabled.
+static bool want_decode = true, want_mem = true, want_branch = true,
+            want_regs = true, want_zeroacc = true;
+
+static void compare(const uint8_t *b, size_t n)
+{
+    CsView c; LlView l;
+    cs_decode(b, n, c);
+    ll_decode(b, n, l);
+
+    if (!c.ok && !l.ok) return;
+
+    unsigned bl = c.ok ? c.size : (l.ok ? l.size : (unsigned)n);
+    std::string hx = hexbytes(b, bl);
+    std::string cd = c.ok ? (c.mnem + " " + c.ops) : std::string("<cs-reject>");
+    std::string ld = l.ok ? l.text : std::string("<llvm-reject>");
+    std::string sample = hx + "  cs{" + cd + "}  llvm{" + ld + "}";
+    std::string m = c.ok ? c.mnem : std::string("?");
+
+    // --- class D: decode agreement -----------------------------------------
+    if (want_decode) {
+        if (c.ok && !l.ok) note("D-cs-only " + m, sample);
+        else if (!c.ok && l.ok) {
+            std::string lm = l.text.substr(0, l.text.find(' '));
+            note("D-llvm-only " + lm, sample);
+        } else if (c.size != l.size)
+            note("D-size-mismatch " + m,
+                 sample + "  cs=" + std::to_string(c.size) +
+                     " llvm=" + std::to_string(l.size));
+    }
+    if (!c.ok || !l.ok) return;
+
+    // --- class Z: metadata holes the boundary hands the plugin --------------
+    if (want_zeroacc) {
+        if (c.mem_unknown) note("Z-access0 " + m + " MEM", sample);
+        if (c.reg_unknown) note("Z-access0 " + m + " REG", sample);
+        if (c.has_invalid_op) note("Z-unmodelled-op " + m, sample);
+    }
+
+    // --- class M: memory direction ------------------------------------------
+    if (want_mem) {
+        bool cl = c.mem_read, cw = c.mem_write;
+        bool ll = l.may_load, lw = l.may_store;
+        if (c.has_mem && !ll && !lw)
+            note("M-cs-mem-llvm-none " + m, sample);
+        else if (!c.has_mem && (ll || lw))
+            note(std::string("M-llvm-mem-cs-none ") + m +
+                     (ll ? " load" : "") + (lw ? " store" : ""), sample);
+        else if (c.has_mem) {
+            if (ll && !cl) note("M-miss-load " + m, sample);
+            if (lw && !cw) note("M-miss-store " + m, sample);
+            if (cl && !ll) note("M-extra-load " + m, sample);
+            if (cw && !lw) note("M-extra-store " + m, sample);
+        }
+    }
+
+    // --- class B: branch taxonomy -------------------------------------------
+    if (want_branch) {
+        bool cj = c.g_jump || c.g_call || c.g_ret;
+        bool lj = l.is_branch || l.is_call || l.is_ret;
+        if (cj != lj)
+            note(std::string("B-flow-presence ") + m +
+                     (cj ? " cs-yes" : " cs-no") + (lj ? " llvm-yes" : " llvm-no"),
+                 sample);
+        else if (cj) {
+            if (l.is_call != c.g_call)
+                note(std::string("B-call-mismatch ") + m +
+                         (c.g_call ? " cs-call" : " cs-nocall"), sample);
+            if (l.is_ret != c.g_ret)
+                note(std::string("B-ret-mismatch ") + m +
+                         (c.g_ret ? " cs-ret" : " cs-noret"), sample);
+        }
+    }
+
+    // --- class R: register read/write sets ----------------------------------
+    if (want_regs) {
+        for (auto *S : {&c.rd, &c.wr, &l.rd, &l.wr}) {
+            for (auto it = S->begin(); it != S->end(); )
+                it = is_dropped_reg(*it) ? S->erase(it) : std::next(it);
+        }
+        std::vector<std::string> wonly, conly;
+        std::set_difference(l.wr.begin(), l.wr.end(), c.wr.begin(), c.wr.end(),
+                            std::back_inserter(wonly));
+        std::set_difference(c.wr.begin(), c.wr.end(), l.wr.begin(), l.wr.end(),
+                            std::back_inserter(conly));
+        if (!wonly.empty())
+            note("R-wr-missing " + m + " +" + liststr(wonly),
+                 sample + "  csWR{" + setstr(c.wr) + "} llvmWR{" + setstr(l.wr) + "}");
+        if (!conly.empty())
+            note("R-wr-phantom " + m + " +" + liststr(conly),
+                 sample + "  csWR{" + setstr(c.wr) + "} llvmWR{" + setstr(l.wr) + "}");
+        std::vector<std::string> ronly, cronly;
+        std::set_difference(l.rd.begin(), l.rd.end(), c.rd.begin(), c.rd.end(),
+                            std::back_inserter(ronly));
+        std::set_difference(c.rd.begin(), c.rd.end(), l.rd.begin(), l.rd.end(),
+                            std::back_inserter(cronly));
+        if (!ronly.empty())
+            note("R-rd-missing " + m + " +" + liststr(ronly),
+                 sample + "  csRD{" + setstr(c.rd) + "} llvmRD{" + setstr(l.rd) + "}");
+        if (!cronly.empty())
+            note("R-rd-phantom " + m + " +" + liststr(cronly),
+                 sample + "  csRD{" + setstr(c.rd) + "} llvmRD{" + setstr(l.rd) + "}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sweeps
+// ---------------------------------------------------------------------------
+
+static unsigned long total_tried = 0;
+
+static void try_word(uint32_t w)
+{
+    uint8_t b[8];
+    b[0] = w & 0xff; b[1] = (w >> 8) & 0xff; b[2] = (w >> 16) & 0xff; b[3] = w >> 24;
+    b[4] = b[5] = b[6] = b[7] = 0;
+    total_tried++;
+    compare(b, 4);
+}
+
+static void try_half(uint16_t h)
+{
+    uint8_t b[4];
+    b[0] = h & 0xff; b[1] = h >> 8; b[2] = 0; b[3] = 0;
+    total_tried++;
+    compare(b, 2);
+}
+
+// aarch64: opcode-bearing bits are [31:10]; [9:5]=Rn, [4:0]=Rd/Rt.
+// Sweep [31:10] exhaustively across a few (Rn,Rd) fillings so that encodings
+// that overload the register fields as opcode extensions are still reached.
+static void sweep_aarch64(unsigned shard, unsigned nshard)
+{
+    static const struct { unsigned rn, rd; } fills[] = {
+        {1, 2}, {31, 31}, {0, 31}, {31, 0},
+    };
+    for (uint32_t top = shard; top < (1u << 22); top += nshard)
+        for (auto &f : fills)
+            try_word((top << 10) | (f.rn << 5) | f.rd);
+}
+
+// riscv64: sweep [31:20] (funct7 + rs2 / I-imm) x [14:12] funct3 x [6:0] opcode
+// = 2^22, with rs1/rd filled a few ways.  Plus every 16-bit compressed word.
+static void sweep_riscv(unsigned shard, unsigned nshard)
+{
+    static const struct { unsigned rs1, rd; } fills[] = {
+        {6, 5}, {0, 0}, {2, 1},
+    };
+    for (uint32_t i = shard; i < (1u << 22); i += nshard) {
+        uint32_t hi12 = (i >> 10) & 0xfff;
+        uint32_t f3   = (i >> 7) & 0x7;
+        uint32_t opc  = i & 0x7f;
+        for (auto &f : fills)
+            try_word((hi12 << 20) | (f.rs1 << 15) | (f3 << 12) | (f.rd << 7) | opc);
+    }
+    if (shard == 0)
+        for (uint32_t h = 0; h < (1u << 16); h++) try_half((uint16_t)h);
+}
+
+// mipsel: op[31:26], rs[25:21], rt[20:16], rd[15:11], sa[10:6], funct[5:0].
+// op/rs/rt/funct all carry opcode meaning somewhere in the ISA; sweep those
+// 2^22 with rd/sa filled a few ways.
+static void sweep_mips(unsigned shard, unsigned nshard)
+{
+    static const struct { unsigned rd, sa; } fills[] = {
+        {3, 0}, {0, 0}, {3, 1}, {0, 4},
+    };
+    for (uint32_t i = shard; i < (1u << 22); i += nshard) {
+        uint32_t op = (i >> 16) & 0x3f;
+        uint32_t rs = (i >> 11) & 0x1f;
+        uint32_t rt = (i >> 6) & 0x1f;
+        uint32_t fn = i & 0x3f;
+        for (auto &f : fills)
+            try_word((op << 26) | (rs << 21) | (rt << 16) | (f.rd << 11) |
+                     (f.sa << 6) | fn);
+    }
+}
+
+// x86_64: prefix x escape x opcode x ModRM-tail shape.
+static void sweep_x86(unsigned shard, unsigned nshard)
+{
+    static const struct { unsigned char p[4]; int np; } pre[] = {
+        {{0},0}, {{0x66},1}, {{0x48},1}, {{0xf3},1}, {{0xf2},1},
+        {{0xf3,0x48},2}, {{0xf2,0x48},2}, {{0x66,0xf3},2}, {{0xf0},1}, {{0x64},1},
+    };
+    static const unsigned char tail_mem[] = {0x0d,0,0,0,0, 0x11,0x22,0x33,0x44, 0,0,0,0};
+    static const unsigned char tail_reg[] = {0xc1, 0x11,0x22,0x33,0x44, 0,0,0,0,0,0,0,0};
+    static const unsigned char tail_sib[] = {0x04,0x8d,0,0,0,0, 0x11,0x22,0x33,0x44, 0,0};
+    unsigned idx = 0;
+    uint8_t buf[24];
+    for (unsigned pi = 0; pi < sizeof(pre)/sizeof(pre[0]); pi++)
+      for (int esc = 0; esc < 4; esc++)
+        for (unsigned op = 0; op < 256; op++)
+          for (int t = 0; t < 3; t++) {
+            if ((idx++ % nshard) != shard) continue;
+            const unsigned char *tail = t==0?tail_mem : t==1?tail_reg : tail_sib;
+            size_t n = 0;
+            for (int k = 0; k < pre[pi].np; k++) buf[n++] = pre[pi].p[k];
+            if (esc >= 1) buf[n++] = 0x0f;
+            if (esc == 2) buf[n++] = 0x38;
+            if (esc == 3) buf[n++] = 0x3a;
+            buf[n++] = (uint8_t)op;
+            memcpy(buf + n, tail, 13); n += 13;
+            total_tried++;
+            compare(buf, n);
+          }
+}
+
+static void run_sweep(unsigned shard, unsigned nshard)
+{
+    switch (isa) {
+    case ISA_AARCH64: sweep_aarch64(shard, nshard); break;
+    case ISA_RISCV64: sweep_riscv(shard, nshard); break;
+    case ISA_MIPSEL:  sweep_mips(shard, nshard); break;
+    case ISA_X86_64:  sweep_x86(shard, nshard); break;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Allowlist
+// ---------------------------------------------------------------------------
+
+/*
+ * Allowlist file format, one entry per line:
+ *
+ *     <isa> <signature key>
+ *
+ * A line whose first non-blank character is `#` is a comment; blank lines
+ * are ignored.  `#` is NOT an inline comment introducer, because it occurs
+ * inside signature keys (an elided register number).  `*` in the key is a glob
+ * wildcard matching any run of characters, so one entry can name a family by
+ * mnemonic stem and register class at once.  Every entry in the shipped
+ * allowlist carries a comment naming the defect, the Capstone version it was
+ * observed on, and how to verify it can be removed — see
+ * isaxcheck_allow.txt.
+ */
+struct AllowRule { std::string isa, key; };
+static std::vector<AllowRule> allow_rules;
+
+/* Minimal glob: '*' matches any run of characters, everything else literal. */
+static bool glob_match(const char *pat, const char *str)
+{
+    const char *star = nullptr, *mark = nullptr;
+    while (*str) {
+        if (*pat == '*') { star = pat++; mark = str; }
+        else if (*pat == *str) { pat++; str++; }
+        else if (star) { pat = star + 1; str = ++mark; }
+        else return false;
+    }
+    while (*pat == '*') pat++;
+    return *pat == '\0';
+}
+
+static bool load_allow(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    char line[1024];
+    while (fgets(line, sizeof line, f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        /* Comments are whole-line only: '#' also occurs INSIDE a key, where
+         * it stands for an elided register number (`+ac#`), so an inline
+         * comment rule would silently truncate half the allowlist. */
+        if (*p == '#') continue;
+        size_t len = strlen(p);
+        while (len && (p[len-1] == '\n' || p[len-1] == '\r' ||
+                       p[len-1] == ' ' || p[len-1] == '\t')) p[--len] = '\0';
+        if (!len) continue;
+        char *sp = strchr(p, ' ');
+        if (!sp) continue;
+        *sp = '\0';
+        std::string i = p, k = sp + 1;
+        while (!k.empty() && k[0] == ' ') k.erase(0, 1);
+        allow_rules.push_back({i, k});
+    }
+    fclose(f);
+    return true;
+}
+
+static bool is_allowed(const std::string &key)
+{
+    for (const auto &r : allow_rules) {
+        if (r.isa != cfg.name && r.isa != "*") continue;
+        if (glob_match(r.key.c_str(), key.c_str())) return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+
+static void usage(void)
+{
+    fprintf(stderr,
+        "usage: isaxcheck --isa={aarch64|riscv64|mipsel|x86_64} [options]\n"
+        "  --jobs=N        fork N sweep shards and merge (default 1)\n"
+        "  --shard=I --nshard=N   run one shard only (used internally)\n"
+        "  --classes=DZMBR        comparison classes to enable\n"
+        "  --hex=BYTES     decode one encoding with both decoders and exit\n"
+        "  --allow=FILE    allowlist of justified residual signatures\n"
+        "  --check         exit 1 if any non-allowlisted signature remains\n"
+        "  --mattr=... --mcpu=...  override the LLVM subtarget\n"
+        "  --keep-zero     do not fold the architectural zero register out\n");
+}
+
+int main(int argc, char **argv)
+{
+    const char *isaname = "aarch64";
+    unsigned shard = 0, nshard = 1, jobs = 1;
+    const char *classes = "DZMBR";
+    const char *hexone = nullptr;
+    const char *mattr = nullptr, *mcpu = nullptr, *allow = nullptr;
+    bool check = false, emit_raw = false;
+
+    for (int i = 1; i < argc; i++) {
+        if (!strncmp(argv[i], "--isa=", 6)) isaname = argv[i] + 6;
+        else if (!strncmp(argv[i], "--shard=", 8)) shard = atoi(argv[i] + 8);
+        else if (!strncmp(argv[i], "--nshard=", 9)) nshard = atoi(argv[i] + 9);
+        else if (!strncmp(argv[i], "--jobs=", 7)) jobs = atoi(argv[i] + 7);
+        else if (!strncmp(argv[i], "--classes=", 10)) classes = argv[i] + 10;
+        else if (!strncmp(argv[i], "--hex=", 6)) hexone = argv[i] + 6;
+        else if (!strncmp(argv[i], "--mattr=", 8)) mattr = argv[i] + 8;
+        else if (!strncmp(argv[i], "--mcpu=", 7)) mcpu = argv[i] + 7;
+        else if (!strncmp(argv[i], "--allow=", 8)) allow = argv[i] + 8;
+        else if (!strcmp(argv[i], "--check")) check = true;
+        else if (!strcmp(argv[i], "--emit-raw")) emit_raw = true;
+        else if (!strcmp(argv[i], "--keep-zero")) drop_zero = false;
+        else { usage(); return 2; }
+    }
+    want_decode = strchr(classes, 'D');
+    want_zeroacc = strchr(classes, 'Z');
+    want_mem = strchr(classes, 'M');
+    want_branch = strchr(classes, 'B');
+    want_regs = strchr(classes, 'R');
+
+    bool found = false;
+    for (size_t i = 0; i < sizeof(kIsaTable)/sizeof(kIsaTable[0]); i++) {
+        if (!strcmp(isaname, kIsaTable[i].name)) {
+            isa = (Isa)i; cfg = kIsaTable[i]; found = true; break;
+        }
+    }
+    if (!found) { fprintf(stderr, "unknown isa %s\n", isaname); return 2; }
+    if (mattr) cfg.features = mattr;
+    if (mcpu)  cfg.cpu = mcpu;
+    if (allow && !load_allow(allow)) {
+        fprintf(stderr, "cannot read allowlist %s\n", allow); return 2;
+    }
+
+    llvm_init();
+
+    if (hexone) {
+        uint8_t b[24]; unsigned n = 0;
+        for (const char *p = hexone; p[0] && p[1] && n < 24; p += 2)
+            b[n++] = (uint8_t)strtoul(std::string(p, p + 2).c_str(), nullptr, 16);
+        CsView c; LlView l;
+        cs_decode(b, n, c); ll_decode(b, n, l);
+        printf("bytes    %s\n", hexbytes(b, n).c_str());
+        printf("boundary ok=%d sz=%u  %s %s\n", c.ok, c.size, c.mnem.c_str(), c.ops.c_str());
+        printf("   mem=%d r=%d w=%d unkMEM=%d unkREG=%d unmodelled-op=%d nops=%u\n",
+               c.has_mem, c.mem_read, c.mem_write, c.mem_unknown, c.reg_unknown,
+               c.has_invalid_op, c.n_ops);
+        printf("   groups: jmp=%d call=%d ret=%d relbr=%d\n", c.g_jump, c.g_call,
+               c.g_ret, c.g_branch_rel);
+        printf("   RD{%s}\n   WR{%s}\n", setstr(c.rd).c_str(), setstr(c.wr).c_str());
+        printf("llvm     ok=%d sz=%u  %s   (opc=%u)\n", l.ok, l.size, l.text.c_str(), l.opcode);
+        printf("   mayLoad=%d mayStore=%d br=%d call=%d ret=%d indir=%d term=%d\n",
+               l.may_load, l.may_store, l.is_branch, l.is_call, l.is_ret,
+               l.is_indirect, l.is_term);
+        printf("   RD{%s}\n   WR{%s}\n", setstr(l.rd).c_str(), setstr(l.wr).c_str());
+        return 0;
+    }
+
+    // Child shard: dump machine-readable buckets and exit.
+    if (emit_raw) {
+        run_sweep(shard, nshard);
+        printf("#tried\t%lu\n", total_tried);
+        for (auto &kv : buckets)
+            printf("%s\t%lu\t%s\n", kv.first.c_str(), kv.second.n,
+                   kv.second.sample.c_str());
+        return 0;
+    }
+
+    if (jobs > 1) {
+        /*
+         * Fork one child per shard.  Each child sweeps its stripe and writes
+         * its bucket map to a pipe; the parent drains the pipes in order and
+         * merges.  Draining sequentially cannot deadlock — a child that fills
+         * its pipe simply blocks until the parent reaches it, and by then the
+         * expensive part (the sweep itself) has already run concurrently.
+         * Process isolation also means a decoder that faults on one hostile
+         * encoding cannot take the whole sweep down silently.
+         */
+        std::vector<int> fds;
+        std::vector<pid_t> pids;
+        for (unsigned j = 0; j < jobs; j++) {
+            int pfd[2];
+            if (pipe(pfd) != 0) { perror("pipe"); return 2; }
+            pid_t pid = fork();
+            if (pid < 0) { perror("fork"); return 2; }
+            if (pid == 0) {
+                close(pfd[0]);
+                dup2(pfd[1], STDOUT_FILENO);
+                close(pfd[1]);
+                run_sweep(j, jobs);
+                printf("#tried\t%lu\n", total_tried);
+                for (auto &kv : buckets)
+                    printf("%s\t%lu\t%s\n", kv.first.c_str(), kv.second.n,
+                           kv.second.sample.c_str());
+                fflush(stdout);
+                _exit(0);
+            }
+            close(pfd[1]);
+            fds.push_back(pfd[0]);
+            pids.push_back(pid);
+        }
+        buckets.clear();
+        for (size_t j = 0; j < fds.size(); j++) {
+            FILE *f = fdopen(fds[j], "r");
+            if (!f) { perror("fdopen"); return 2; }
+            std::string acc;
+            char chunk[8192];
+            size_t got;
+            while ((got = fread(chunk, 1, sizeof chunk, f)) > 0)
+                acc.append(chunk, got);
+            fclose(f);
+            size_t pos = 0;
+            while (pos < acc.size()) {
+                size_t nl = acc.find('\n', pos);
+                if (nl == std::string::npos) nl = acc.size();
+                std::string line = acc.substr(pos, nl - pos);
+                pos = nl + 1;
+                if (line.empty()) continue;
+                size_t t1 = line.find('\t');
+                if (t1 == std::string::npos) continue;
+                size_t t2 = line.find('\t', t1 + 1);
+                std::string key = line.substr(0, t1);
+                unsigned long cnt = strtoul(line.c_str() + t1 + 1, nullptr, 10);
+                std::string samp = (t2 == std::string::npos)
+                                       ? std::string()
+                                       : line.substr(t2 + 1);
+                if (key == "#tried") { total_tried += cnt; continue; }
+                auto &b = buckets[key];
+                if (!b.n) b.sample = samp;
+                b.n += cnt;
+            }
+        }
+        int bad = 0;
+        for (pid_t p : pids) {
+            int st = 0;
+            waitpid(p, &st, 0);
+            if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) bad++;
+        }
+        if (bad) {
+            fprintf(stderr, "isaxcheck: %d shard(s) failed\n", bad);
+            return 2;
+        }
+    } else {
+        run_sweep(shard, nshard);
+    }
+
+    unsigned long unallowed = 0;
+    for (auto &kv : buckets) if (!is_allowed(kv.first)) unallowed++;
+
+    printf("# isa=%s encodings_tried=%lu distinct_signatures=%zu "
+           "allowlisted=%zu unallowed=%lu\n",
+           cfg.name, total_tried, buckets.size(),
+           buckets.size() - unallowed, unallowed);
+    for (auto &kv : buckets) {
+        bool ok = is_allowed(kv.first);
+        if (check && ok) continue;
+        printf("%-4s %-46s n=%-9lu %s\n", ok ? "ALLOW" : "NEW",
+               kv.first.c_str(), kv.second.n, kv.second.sample.c_str());
+    }
+
+    return (check && unallowed) ? 1 : 0;
+}

@@ -135,6 +135,55 @@ if get_option('plugins')
     cpp_args: cst_tools_cpp_args,
     dependencies: [cst_capstone_dep],
     install: false)
+  # isaxcheck: static cross-check of the decode metadata the tracer actually
+  # consumes against a second, independently maintained decoder (the LLVM MC
+  # layer).  The Capstone side is cap_disas_raw_detail() from
+  # disas/capstone.c -- the exact boundary the plugin calls, workarounds
+  # included -- so a working workaround shows up as the *absence* of a
+  # disagreement.  That is why disas/capstone.c is compiled in here rather
+  # than the tool re-deriving Capstone detail on its own: re-deriving would
+  # duplicate the code under test.  The extra include directory is the
+  # project root, which resolves both the in-tree headers disas/capstone.c
+  # needs and the generated config-host.h in the build tree.
+  #
+  # LLVM is an optional host dependency (llvm-18-dev or newer supplying
+  # llvm-config).  Without it the target is skipped and the validator's
+  # gating check reports the gate as unavailable rather than silently
+  # passing -- see validator _full.py, check "features.isa_crosscheck".
+  llvm_config = find_program('llvm-config-18', 'llvm-config-19',
+                             'llvm-config-20', 'llvm-config',
+                             required: false)
+  if llvm_config.found()
+    llvm_cxxflags = []
+    foreach f : run_command(llvm_config, '--cxxflags',
+                            check: true).stdout().strip().split()
+      # Drop the C++ standard llvm-config asks for; cst_tools_cpp_args pins
+      # gnu++17 and a duplicate -std= is a hard error on some compilers.
+      if not f.startswith('-std=')
+        llvm_cxxflags += f
+      endif
+    endforeach
+    llvm_ldflags = run_command(llvm_config, '--link-shared', '--ldflags',
+                               check: true).stdout().strip().split()
+    llvm_libs = run_command(llvm_config, '--link-shared', '--libs',
+                            check: true).stdout().strip().split()
+    t += executable(
+      'isaxcheck',
+      files('champsim_tracer/tools/isaxcheck.cc') + files('../../disas/capstone.c'),
+      cpp_args: cst_tools_cpp_args + llvm_cxxflags,
+      c_args: ['-std=gnu11'],
+      link_args: llvm_ldflags + llvm_libs,
+      # NOTE: deliberately NOT ../../include/qemu -- that directory holds
+      # include/qemu/ctype.h, which shadows the C++ standard library's
+      # <cctype> for any TU that reaches for it.  Everything this tool needs
+      # is spelled "qemu/..." and resolves through ../../include.
+      include_directories: ['../../include', '../..'],
+      dependencies: [glib, cst_capstone_dep],
+      install: false)
+  else
+    warning('llvm-config not found: skipping the isaxcheck decoder ' +
+            'cross-check gate (install llvm-18-dev or newer)')
+  endif
   # cst_attach: ptrace launcher that injects the trace marker at a target's
   # entry so the plugin attaches + pins to its address space (system mode).
   # Plain C, no deps.  It runs INSIDE the guest, so this host build only

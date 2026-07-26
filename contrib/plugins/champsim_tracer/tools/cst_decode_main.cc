@@ -3110,10 +3110,29 @@ int run_verify_branch(const Options &opts, const cst::Header &h,
     if (!examples.empty()) {
         std::fprintf(stdout, "first mismatches:\n%s", examples.c_str());
     }
-    return (n_target_mism == 0 && n_taken_mism == 0 &&
-            n_resume_unnamed == 0 &&
-            n_wp_target_mism == 0 && n_wp_taken_mism == 0 &&
-            n_wp_syscall_fallthrough_mism == 0) ? 0 : 1;
+    bool branch_ok = (n_target_mism == 0 && n_taken_mism == 0 &&
+                      n_resume_unnamed == 0 &&
+                      n_wp_target_mism == 0 && n_wp_taken_mism == 0 &&
+                      n_wp_syscall_fallthrough_mism == 0);
+    /*
+     * --verify-branch walks the body itself rather than going through
+     * run_body_render, so it has to apply --strict to its own walker.
+     * Without this the two flags together silently disabled the
+     * attribution lint -- and `--strict --verify-branch` is exactly how
+     * the acceptance gates invoke the decoder, so the strict half of
+     * that gate was checking nothing.
+     */
+    const cst::AttributionLint &lint = walker.lint();
+    if (lint.any()) {
+        if (opts.strict) {
+            std::fprintf(stderr, "cst_decode: impossible attributions: %s\n",
+                         lint.summary().c_str());
+            return 1;
+        }
+        std::fprintf(stdout, "; impossible attributions: %s\n",
+                     lint.summary().c_str());
+    }
+    return branch_ok ? 0 : 1;
 }
 
 int run(const Options &opts)

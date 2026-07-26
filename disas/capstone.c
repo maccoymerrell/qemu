@@ -1732,6 +1732,51 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
 }
 
 /*
+ * MIPS tied-destination family test.  Every member writes its first
+ * register operand while PRESERVING part of its previous value — a
+ * bit-field insert, a lane insert/shuffle, a masked select, a
+ * multiply-accumulate, or a conditional move that leaves the
+ * destination alone when the condition fails.  LLVM records the tie;
+ * Capstone reports the operand WRITE-only, so the read-modify-write
+ * looks like a full overwrite and a real RAW edge is reported as WAW.
+ *
+ * The membership list was derived from the isaxcheck sweep (every MIPS
+ * `R-rd-missing` signature whose missing read is the instruction's own
+ * destination), not from guesswork; re-derive it the same way on a
+ * Capstone bump.  Prefixes are used where a family has per-element-size
+ * spellings (maddv.b/.h/.w/.d).  Note what is deliberately NOT here:
+ * the two-operand `madd $rs, $rt` / `msub` accumulate into the implicit
+ * HI:LO pair rather than into an operand, so their first register
+ * operand is a pure source.
+ */
+static bool cap_mips_is_tied_dst(const char *mnem)
+{
+    static const char *const stems[] = {
+        /* scalar and DSP bit-field insert / concatenate */
+        "ins", "dins", "append", "prepend", "insv",
+        /* MSA bit insert / select */
+        "binsl", "binsr", "bmnz", "bmz", "bsel",
+        /* MSA lane insert / shift-and-insert / shuffle */
+        "insert", "insve", "sld", "vshf",
+        /* MSA and DSP multiply-accumulate (integer, fixed-point, FP) */
+        "maddv", "msubv", "madd_q", "maddr_q", "msub_q", "msubr_q",
+        "fmadd", "fmsub", "dpa", "dps",
+        /* conditional moves: the destination survives a failed condition */
+        "movn", "movz", "movt", "movf",
+    };
+
+    if (!mnem || !mnem[0]) {
+        return false;
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(stems); i++) {
+        if (g_str_has_prefix(mnem, stems[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
  * RVV multiply-accumulate family test — see the tied-operand workaround
  * in cap_fill_generic_operands().  Capstone spells the whole family
  * v[f][w][n]m{acc,add,sac,sub}.{vv,vx,vf}; matching on the accumulate
@@ -2093,6 +2138,213 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                 op->access = QEMU_PLUGIN_OP_ACC_READ
                            | QEMU_PLUGIN_OP_ACC_WRITE;
                 break;
+            }
+        }
+        /*
+         * Capstone 6.0.0 MIPS tied-destination bug workaround
+         * (see cap_mips_is_tied_dst for the family).
+         *
+         * `INS rt, rs, pos, size` copies a bit field out of $rs into $rt
+         * and PRESERVES every bit of $rt outside that field, so $rt is a
+         * genuine source as well as the destination.  Capstone reports it
+         * WRITE-only, which turns a read-modify-write into a full
+         * overwrite: two INS into the same register look WAW when the
+         * second really carries a RAW edge from the first.
+         *
+         * Revisit / remove when Capstone is bumped past 6.0.0; verify with
+         * `cstool -d mips32r2 0459287d` (bytes `04 59 28 7d`,
+         * `ins $t0,$t1,4,8`) -- fixed, $t0 (operands[0]) must show
+         * READ|WRITE instead of WRITE-only.  Use a `cstool` built from
+         * `subprojects/capstone`, not a system package, or run
+         * `capstone_workaround_probe`; see docs/troubleshooting.rst.
+         */
+        if (cap_mips_is_tied_dst(insn->mnemonic)) {
+            for (uint8_t i = 0; i < n; i++) {
+                qemu_plugin_operand *op = &out->operands[i];
+                if (op->type != QEMU_PLUGIN_OP_REG) {
+                    continue;
+                }
+                op->access |= QEMU_PLUGIN_OP_ACC_READ
+                            | QEMU_PLUGIN_OP_ACC_WRITE;
+                break;
+            }
+        }
+        /*
+         * Capstone 6.0.0 MIPS register-indexed load/store bug workaround.
+         *
+         * The indexed FP forms (LWXC1 / LDXC1 / LUXC1 / SWXC1 / SDXC1 /
+         * SUXC1) and the DSP indexed integer loads (LWX / LHX / LBUX)
+         * address memory as `index(base)` — two registers, no
+         * displacement.  Capstone models the pair as two bare REG operands
+         * and emits NO MEM operand at all, so the operand walker never
+         * gates the HAS_ADDR address-dependency block: the effective
+         * address still arrives from QEMU's memory callback and is
+         * correct, but the address-generation chain feeding it
+         * (`lw $a0` -> `addiu $a0` -> `lwxc1`) does not exist in the
+         * trace.  On the FP forms the two address registers additionally
+         * carry access == 0, so they are not even read.
+         *
+         * Fold the pair into the MEM operand it describes: base from the
+         * second register operand, index from the first, direction
+         * inferred from the data register exactly as the MSA/unaligned
+         * correction above does (a load writes it, a store reads it).
+         * The now-redundant second register operand is retired.
+         *
+         * Revisit / remove when Capstone is bumped past 6.0.0; verify with
+         * `cstool -d mips32r2 8000854c` (bytes `80 00 85 4c`,
+         * `lwxc1 $f2,$a1($a0)`) -- fixed, the instruction must expose a
+         * MEM operand with base $a0 and index $a1.  Use a `cstool` built
+         * from `subprojects/capstone`, not a system package, or run
+         * `capstone_workaround_probe`; see docs/troubleshooting.rst.
+         */
+        if ((insn->id == MIPS_INS_LWXC1 || insn->id == MIPS_INS_LDXC1
+             || insn->id == MIPS_INS_LUXC1 || insn->id == MIPS_INS_SWXC1
+             || insn->id == MIPS_INS_SDXC1 || insn->id == MIPS_INS_SUXC1
+             || insn->id == MIPS_INS_LWX || insn->id == MIPS_INS_LHX
+             || insn->id == MIPS_INS_LBUX)
+            && n == 3
+            && out->operands[0].type == QEMU_PLUGIN_OP_REG
+            && out->operands[1].type == QEMU_PLUGIN_OP_REG
+            && out->operands[2].type == QEMU_PLUGIN_OP_REG) {
+            uint16_t index_id = out->operands[1].reg_id;
+            uint16_t base_id  = out->operands[2].reg_id;
+            char index_name[QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ];
+            char base_name[QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ];
+            memcpy(index_name, out->operands[1].reg_name, sizeof(index_name));
+            memcpy(base_name, out->operands[2].reg_name, sizeof(base_name));
+
+            qemu_plugin_operand *mem = &out->operands[1];
+            mem->type = QEMU_PLUGIN_OP_MEM;
+            mem->access = (out->operands[0].access & QEMU_PLUGIN_OP_ACC_WRITE)
+                ? QEMU_PLUGIN_OP_ACC_READ
+                : QEMU_PLUGIN_OP_ACC_WRITE;
+            mem->reg_id = base_id;
+            memcpy(mem->reg_name, base_name, sizeof(base_name));
+            mem->index_id = index_id;
+            memcpy(mem->index_name, index_name, sizeof(index_name));
+            mem->imm = 0;
+
+            /* The second address register now lives in the MEM operand's
+             * index field, so the operand it came from is retired rather
+             * than left behind as an unmodelled slot. */
+            memset(&out->operands[2], 0, sizeof(out->operands[2]));
+            out->n_operands = 2;
+            n = 2;
+        }
+        /*
+         * Capstone 6.0.0 MIPS FP-control-register bank bug workaround.
+         *
+         * `CTC1 rt, fs` / `CFC1 rt, fs` move to and from a *floating-point*
+         * control register (FCR0 / FCR25 / FCR26 / FCR28 / FCR31).
+         * Capstone names the low-numbered ones as COP0 registers instead
+         * — `ctc1 $zero, $3` reports MIPS_REG_COP03 where it should report
+         * MIPS_REG_FCR3 — which lands the dependency in the tracer's
+         * REG_SYS bucket (system coprocessor) rather than REG_FCSR (FP
+         * control/status).  The high-numbered forms are named correctly,
+         * so `ctc1 $t0, $31` already reports FCR31; only the aliasing
+         * range is wrong.  Remap the bank while keeping the index.
+         *
+         * Revisit / remove when Capstone is bumped past 6.0.0; verify with
+         * `cstool -d mips32r2 0018c044` (bytes `00 18 c0 44`,
+         * `ctc1 $zero,$3`) -- fixed, the control operand must name $f3's
+         * control register (FCR3), not COP0 register 3.  Use a `cstool`
+         * built from `subprojects/capstone`, not a system package, or run
+         * `capstone_workaround_probe`; see docs/troubleshooting.rst.
+         */
+        if (!strcmp(insn->mnemonic, "ctc1") || !strcmp(insn->mnemonic, "cfc1")) {
+            for (uint8_t i = 0; i < n; i++) {
+                qemu_plugin_operand *op = &out->operands[i];
+                if (op->type != QEMU_PLUGIN_OP_REG
+                    || op->reg_id < MIPS_REG_COP00
+                    || op->reg_id > MIPS_REG_COP09) {
+                    continue;
+                }
+                op->reg_id = MIPS_REG_FCR0 + (op->reg_id - MIPS_REG_COP00);
+                cap_copy_reg_name(op->reg_name,
+                                  QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                                  handle, op->reg_id, cap_arch);
+            }
+        }
+        /*
+         * Capstone 6.0.0 MIPS floating-point condition-code bug
+         * workaround.
+         *
+         * The FP compare/branch pair is the only dependency edge between
+         * a `c.<cond>.<fmt>` and the `bc1t`/`bc1f` that consumes it.  In
+         * the forms that name the condition code explicitly
+         * (`c.eq.s $fcc1, $f0, $f1`, `bc1t $fcc1, label`) Capstone models
+         * the edge correctly.  In the far more common implicit-$fcc0
+         * forms it models neither end: the compare reports no destination
+         * and the branch reports no source, so EVERY MIPS
+         * floating-point conditional branch is dependency-free — the
+         * branch does not depend on the compare that decides it.  The
+         * integer compare/branch pair is unaffected (it carries a real
+         * GPR edge), which is why no self-consistency check has ever seen
+         * this.
+         *
+         * The branch forms additionally carry a phantom implicit WRITE of
+         * $at: Capstone's implicit list for BC1T/BC1F names register 1,
+         * and a conditional branch writes no GPR at all.  Left in, it
+         * fabricates a WAW/RAW hazard on $at against the surrounding code.
+         *
+         * Supply the missing $fcc0 read/write and drop the phantom.  Both
+         * corrections are conditional on Capstone having modelled nothing,
+         * so a fixed Capstone's own answer wins.
+         *
+         * Revisit / remove when Capstone is bumped past 6.0.0; verify with
+         * `cstool -d mips32r2 32000146` (bytes `32 00 01 46`,
+         * `c.eq.s $f0,$f1`) -- fixed, $fcc0 must appear as a written
+         * register -- and `cstool -d mips32r2 03000145` (bytes
+         * `03 00 01 45`, `bc1t`) -- fixed, $fcc0 must appear as a read and
+         * $at must NOT appear as a write.  Use a `cstool` built from
+         * `subprojects/capstone`, not a system package, or run
+         * `capstone_workaround_probe`; see docs/troubleshooting.rst.
+         */
+        {
+            bool is_fp_cmp = g_str_has_prefix(insn->mnemonic, "c.");
+            bool is_fp_br = insn->id == MIPS_INS_BC1T
+                         || insn->id == MIPS_INS_BC1F
+                         || insn->id == MIPS_INS_BC1TL
+                         || insn->id == MIPS_INS_BC1FL;
+            bool names_cc = false;
+            for (uint8_t i = 0; i < n; i++) {
+                if (out->operands[i].type == QEMU_PLUGIN_OP_REG
+                    && out->operands[i].reg_id >= MIPS_REG_FCC0
+                    && out->operands[i].reg_id <= MIPS_REG_FCC7) {
+                    names_cc = true;
+                    break;
+                }
+            }
+            if (is_fp_br) {
+                /* Drop the phantom $at write. */
+                uint8_t keep = 0;
+                for (uint8_t i = 0; i < out->n_regs_write; i++) {
+                    if (out->regs_write_id[i] == MIPS_REG_AT) {
+                        continue;
+                    }
+                    if (keep != i) {
+                        memcpy(out->regs_write[keep], out->regs_write[i],
+                               QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ);
+                        out->regs_write_id[keep] = out->regs_write_id[i];
+                    }
+                    keep++;
+                }
+                out->n_regs_write = keep;
+            }
+            if ((is_fp_cmp || is_fp_br) && !names_cc) {
+                uint16_t *ids = is_fp_cmp ? out->regs_write_id
+                                          : out->regs_read_id;
+                uint8_t *cnt = is_fp_cmp ? &out->n_regs_write
+                                         : &out->n_regs_read;
+                char (*names)[QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ] =
+                    is_fp_cmp ? out->regs_write : out->regs_read;
+                if (*cnt < QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS) {
+                    cap_copy_reg_name(names[*cnt],
+                                      QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                                      handle, MIPS_REG_FCC0, cap_arch);
+                    ids[*cnt] = MIPS_REG_FCC0;
+                    (*cnt)++;
+                }
             }
         }
     } else {

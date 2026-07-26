@@ -421,7 +421,7 @@ outside the repo as standalone scripts):
    line is checked against that *same* asid.  See "Dead-latch
    determinism" in ``VALIDATION.md`` for the full design rationale.
 
-**features** — 14 checks.  Plugin options and wire records that no
+**features** — 19 checks.  Plugin options and wire records that no
 ``quick`` / ``system`` / ``multiproc`` check happens to exercise:
 
 ``features.simpoint``

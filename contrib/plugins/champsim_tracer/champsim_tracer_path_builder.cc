@@ -1770,8 +1770,9 @@ void PathBuilder::retire_suspension(size_t idx, unsigned int cpu_index)
  * counted and the re-stamp reproduces the head's value exactly.  Only the
  * suppressed-return case, which is the bug, changes.
  */
-void PathBuilder::stamp_cur_depth(const StepIn &in)
+void PathBuilder::stamp_cur_depth(const StepIn &in, bool post_merge)
 {
+    const uint32_t was = prev_depth_;
     uint32_t pinned_inflight = 0;
     for (const CtxFrame &f : frames_) {
         if (!f.returned) {
@@ -1802,6 +1803,24 @@ void PathBuilder::stamp_cur_depth(const StepIn &in)
     g_dbg_inflight = pinned_inflight;
     g_dbg_depth_next = depth_next_;
     g_dbg_frames = frames_.size();
+    /* Measure the correction the second stamp makes; see the counters. */
+    if (post_merge && prev_depth_ != was) {
+        uint32_t delta = was > prev_depth_ ? was - prev_depth_
+                                           : prev_depth_ - was;
+        g_stats.depth_restamp_corrections++;
+        if (delta >= 2) {
+            g_stats.depth_restamp_jumps++;
+        }
+        if (delta > g_stats.depth_restamp_max_delta) {
+            g_stats.depth_restamp_max_delta = delta;
+        }
+        if (pb_diag() || pb_depth_diag() || cst_jump_diag()) {
+            fprintf(stderr, "[pathbuilder] RESTAMP cur=0x%" PRIx64
+                    " %u -> %u (delta %u) frames=%zu\n",
+                    in.cur ? in.cur->start_pc : 0, was, prev_depth_, delta,
+                    frames_.size());
+        }
+    }
 }
 
 PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
@@ -2116,7 +2135,7 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
         /* The merge just RETIRED this excursion's frames.  cur is the block
          * the pinned process runs AFTER the faulting BB reassembled, so it
          * is at the post-unwind depth — re-stamp it (see stamp_cur_depth). */
-        stamp_cur_depth(in);
+        stamp_cur_depth(in, /*post_merge=*/true);
         return st;
     }
 

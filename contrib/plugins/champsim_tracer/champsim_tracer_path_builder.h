@@ -466,7 +466,7 @@ private:
      * and again after the seal walk's merge completions retire frames — so a
      * block following a reassembled faulting BB carries the post-unwind
      * depth.  See the definition for why the second call is load-bearing. */
-    void stamp_cur_depth(const StepIn &in);
+    void stamp_cur_depth(const StepIn &in, bool post_merge = false);
     uint32_t raw_depth_ = 0;
 
     /* Captured asynchronous-interrupt depth (interrupts=1 only).  QEMU emits

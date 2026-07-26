@@ -227,6 +227,23 @@ struct Stats {
      * off the async-recovery path. */
     uint64_t susp_abandoned = 0;
 
+    /* Post-merge depth re-stamp (the seal takes the depth stamp again after
+     * its merge completions retire frames).  corrections counts the steps
+     * where the second stamp DIFFERS from the first — i.e. a completing
+     * frame was still flagged in-flight when the current TB was first
+     * stamped, because the guest's exception return was suppressed by the
+     * host's strict-LIFO fault pop.  max_delta is the largest such
+     * correction: a delta >= 2 is exactly a syscall_fault_nesting depth-JUMP
+     * that would have reached the wire (the block after the reassembled
+     * faulting BB emitted two or more levels above its neighbours), a delta
+     * of 1 a silent one-level over-count.  Zero on any run whose fault
+     * returns are all observed, which is every uncontended run — so a
+     * nonzero value is a direct, per-step measure of the contention
+     * condition, not of the rare end-to-end oracle failure it produces. */
+    uint64_t depth_restamp_corrections = 0;
+    uint64_t depth_restamp_jumps = 0;
+    uint32_t depth_restamp_max_delta = 0;
+
     /* Per-execution attribution.  cp_* bumped at vcpu_tb_exec walking
      * the prev TB's template; wp_* inside the WP per-iteration loop.
      * Sized by the generic enum sentinels to stay in lockstep. */

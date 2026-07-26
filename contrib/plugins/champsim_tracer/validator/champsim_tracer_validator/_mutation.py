@@ -335,6 +335,42 @@ def _m_final_entry_memops_dropped(triple, gen_meta) -> Optional[str]:
             f"(seq={final.get('seq_num')}, template {tid})")
 
 
+def _m_mid_entry_memops_dropped(triple, gen_meta) -> Optional[str]:
+    """Strip the memops from ONE non-final execution of a template that
+    otherwise always performs memops — the GENERAL shape
+    ``memop_bimodality`` detects, as opposed to
+    ``_m_final_entry_memops_dropped``'s positional (always-the-very-last-
+    entry) special case.  Targets whichever template has the most
+    invariant-nonzero executions in the substrate, so the single dropped
+    execution is comfortably a minority outlier (clears both
+    ``min_execs`` and ``max_outlier_rate``) regardless of substrate size,
+    and picks an execution near the MIDDLE of that template's run so the
+    corruption is unambiguously not the final-entry mechanism."""
+    _meta, _tmpl, entries = triple
+    per_tid: dict = {}
+    for e in entries:
+        per_tid.setdefault(e.get("template_id"), []).append(e)
+    best_tid, best_execs = None, []
+    for tid, execs in per_tid.items():
+        if len(execs) < 12:            # headroom over min_execs=8 so a
+            continue                   # single outlier stays <= 10% rate
+        counts = {len(e.get("dyn_params") or []) for e in execs}
+        if len(counts) != 1 or 0 in counts:
+            continue
+        if len(execs) > len(best_execs):
+            best_tid, best_execs = tid, execs
+    if best_tid is None:
+        return None
+    victim = best_execs[len(best_execs) // 2]
+    n = len(victim.get("dyn_params") or [])
+    if n == 0:
+        return None
+    victim["dyn_params"] = []
+    return (f"dropped {n} memop(s) from a MID-STREAM execution "
+            f"(seq={victim.get('seq_num')}, template {best_tid}, 1 of "
+            f"{len(best_execs)} otherwise-invariant executions)")
+
+
 def _m_memdata_data_flip(triple, gen_meta) -> Optional[str]:
     _meta, _tmpl, entries = triple
     for e in entries:
@@ -970,6 +1006,13 @@ CATALOGUE: list = [
              # four ISAs), where the pre-fix plugin's own output is the
              # mutation.
              covered_by="features.final_entry_memops (4-ISA, gating)"),
+    Mutation("mid_entry_memops_dropped", "oracle",
+             "strip the memops from one non-final, otherwise-invariant "
+             "execution of a template — the general memop-bimodality "
+             "shape (D4-class loss anywhere in the stream, not just the "
+             "segment's last entry)",
+             _m_mid_entry_memops_dropped,
+             expect=("memop_bimodality",)),
     Mutation("opcode_class_change", "oracle",
              "relabel a pinned instruction's opcode class",
              _m_opcode_class_change,

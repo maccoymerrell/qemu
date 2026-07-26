@@ -477,6 +477,50 @@ outside the repo as standalone scripts):
    same assertion runs inside ``validate()`` as
    ``segment_final_memops``, where it is silent on traces that close
    at the guest's exit.
+``features.reg_snap_accounting``
+   Oracle 1 of the two general D4-class completeness checks (see
+   ``features.final_entry_memops`` above for the specific mechanism
+   that motivated both).  The plugin already counts a completeness
+   invariant at every seal walk — ``Stats.reg_snap_slice_dropped`` /
+   ``Stats.reg_snap_leak_trimmed`` (champsim_tracer_stats.h) — but
+   neither counter ever reaches the wire; they exist only in the
+   plugin's stderr summary and its ``<outfile>.stats.log`` sidecar, so
+   no byte-level check on the trace file can see them.  This check
+   traces a short workload per ISA, reads the two counters back out of
+   the sidecar, and asserts ``dropped == trimmed`` — the invariant, not
+   "both zero": a fault-storm trace can legitimately trim many leaked
+   prefixes while dropping none, so requiring zero would false-positive
+   on exactly the traces most likely to exercise the recovery path (the
+   ``mcf_user_mipsel`` sample trace's 188,726 leak trims from the
+   mipsel ``teq``-as-syscall issue are exactly that shape).  The same
+   two counters, and the same verdict, are available offline to a
+   consumer holding both files via ``cst_audit --stats-log=...`` (see
+   :doc:`decoder`, *COMPLETENESS (Oracle 1)*).
+``behavior:memop_bimodality`` (Oracle 2)
+   The general form of the D4 signature, generalised past
+   ``features.final_entry_memops``'s single-last-entry special case:
+   for each memop-capable template, tally how many of its CP
+   executions realised at least one memop versus how many realised
+   none.  A template that is overwhelmingly nonzero with only a SMALL
+   minority of zero-memop outliers is flagged — any future memop-loss
+   bug with this shape is caught, not just the exact D4 mechanism, and
+   not only when the loss happens to land on the segment's last entry.
+   A template that is legitimately bimodal AT SCALE (heavy predication,
+   a REP loop empty as often as not) is not flagged; the zero-rate
+   threshold below which executions count as "a small minority of
+   outliers" is tunable.  Implemented twice, deliberately kept in sync:
+   ``cst::MemopBimodalityLint`` (``tools/cst_lint.h``) feeds
+   ``cst_audit``'s always-on ``MEMOP BIMODALITY`` report section
+   (``--bimodal-min-execs`` / ``--bimodal-max-outlier-rate`` /
+   ``--bimodal-off``; see :doc:`decoder`), and ``validator.py``'s
+   ``_check_memop_bimodality`` runs inside every ``validate()`` call as
+   the ``memop_bimodality`` check — so it rides along with every
+   ``quick.user_*`` invocation of ``full`` (tagged onto the
+   ``core_user`` feature list) without a dedicated check of its own.
+   Mutation-tier teeth: ``mid_entry_memops_dropped`` (see
+   :ref:`validator-mutation`) strips the memops from one non-final,
+   otherwise-invariant execution — proving the check catches the
+   general shape, not merely a positional special case.
 ``features.wrong_path_coverage``
    ``static_templates=1`` fall-through / BTB coverage oracle across
    all four ISAs (minted-alternate blocks, deepened by
@@ -531,21 +575,30 @@ Four mutation layers, matching where strictness has to live:
    oracle is re-run against the damaged decode through a
    decoder-shaped stand-in (no re-tracing needed); it must raise a
    gating error in one of the mutation's declared ``expect`` checks.
-   17 of the 23 catalogue entries are this layer: flipping a captured
+   19 of the 25 catalogue entries are this layer: flipping a captured
    dst-register value or misattributing it to the wrong register id,
    swapping two memop addresses or flipping a captured load/store data
-   byte, relabeling a pinned instruction's opcode class or branch
-   classification, flipping a raw instruction byte in a template,
-   truncating / reordering the first two blocks of a predicted
-   wrong-path chain, a depth-0 WP missequence paired with a later
-   synthetic fault mark (the fault must not excuse the earlier
-   divergence), reordering two correct-path entries, forging a
-   foreign guest-thread id onto an entry, corrupting a per-memop
-   physical-page value, dropping a ``DEVIO_STOP`` record, corrupting a
-   self-modified block's non-baseline revision bytes, and corrupting a
-   *shape-changed* revision's bytes (a revision minted at a different
-   instruction count than the block's original template — the class
-   only shape-agnostic minting produces).  The DEVIO and SMC mutations
+   byte, dropping the memops from the segment's final body entry (the
+   D4 mechanism itself — a no-op on the shared diamond substrate, whose
+   window always closes on the exit syscall, so strictness is proven
+   end-to-end by ``features.final_entry_memops`` instead) alongside its
+   general form, dropping the memops from one non-final,
+   otherwise-invariant execution of whichever template repeats the
+   most (``mid_entry_memops_dropped`` — the ``memop_bimodality`` check's
+   teeth, proving it catches the D4 *shape* anywhere in the stream, not
+   only a positional last-entry special case), relabeling a pinned
+   instruction's opcode class or branch classification, flipping a raw
+   instruction byte in a template, truncating / reordering the first
+   two blocks of a predicted wrong-path chain, a depth-0 WP
+   missequence paired with a later synthetic fault mark (the fault
+   must not excuse the earlier divergence), reordering two
+   correct-path entries, forging a foreign guest-thread id onto an
+   entry, corrupting a per-memop physical-page value, dropping a
+   ``DEVIO_STOP`` record, corrupting a self-modified block's
+   non-baseline revision bytes, and corrupting a *shape-changed*
+   revision's bytes (a revision minted at a different instruction
+   count than the block's original template — the class only
+   shape-agnostic minting produces).  The DEVIO and SMC mutations
    run against dedicated purpose-built substrates rather than the
    shared diamond-CFG one, since the diamond CFG carries neither disk
    I/O nor self-modification; the two SMC mutations use different

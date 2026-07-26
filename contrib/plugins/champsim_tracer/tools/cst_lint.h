@@ -77,6 +77,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -355,6 +356,160 @@ private:
     std::unordered_set<uint64_t> distinct_mem_;
     std::unordered_set<uint64_t> distinct_reg_;
     std::unordered_set<uint32_t> distinct_dangling_;
+};
+
+/*
+ * Per-template memop bimodality lint — the D4-class completeness oracle.
+ *
+ * AttributionLint (above) is one-sided by design: it only rejects a memop
+ * on an insn that statically CANNOT produce one.  It has no converse rule,
+ * because a memop-capable insn legitimately producing zero memops this
+ * execution is common (predication, a zero-count REP, a suppressed
+ * fault) — a naive "every execution must match" rule would false-positive
+ * on all of those.  That asymmetry is exactly the hole the D4 bug rode
+ * through: the plugin's deferred-window-close path emitted the segment's
+ * final body entry BEFORE its instructions had run, so the entry carried
+ * zero memops for a template whose every other execution carried the
+ * same nonzero count — and every existing offline check passed, because
+ * "zero memops on a memop-capable insn" is, on its own, unremarkable.
+ *
+ * This lint closes the hole statistically instead of absolutely: for
+ * each memop-capable template, tally how many of its correct-path
+ * executions realised at least one memop versus how many realised none.
+ * A template that is OVERWHELMINGLY nonzero with a SMALL minority of
+ * zero-memop outliers is the D4 signature — one (or a handful) of
+ * executions silently lost their memops while the template's normal
+ * behaviour is unambiguous.  A template that is legitimately bimodal at
+ * scale (heavy predication, a REP loop that is empty as often as not)
+ * has a zero-rate the default threshold does not consider an "outlier",
+ * so it is not flagged.  Both bounds are tunable — see Config — for a
+ * workload whose predication rate genuinely warrants a wider band.
+ *
+ * Correct-path only: wrong-path wandering is not held to any dataflow
+ * contract (same scoping as AttributionLint's MEM/REG rules) — feed this
+ * class only from CP field-delta sections.
+ *
+ * Realised-memop-this-execution signal: CST_FID_N_LOADS / CST_FID_N_STORES
+ * are the writer's PERSISTENT per-(template_id, ins_pos) cells (format.rst
+ * §5), delta-encoded like every other field — a record is emitted only
+ * when the count *changes* from the last observation, not on every
+ * execution.  So record PRESENCE in one entry is not a "this insn had
+ * memops now" signal (a steady-state repeated count emits nothing after
+ * its first observation).  The cell's *reconstructed current value* is
+ * the real signal, and — because it is linear — the total memop count
+ * across an entire template's insns can be tracked as a single running
+ * per-(thread, template_id) accumulator: every N_LOADS/N_STORES delta,
+ * regardless of which insn position it targets, is added to that one
+ * running total, and the total after an entry's section is fully applied
+ * is that execution's realised memop count.  Only zero-vs-nonzero is
+ * asked of it, so no per-insn breakdown is needed.
+ */
+/* Hoisted out of MemopBimodalityLint (rather than nested) so its default
+ * member initializers are complete at the point the class below uses
+ * `MemopBimodalityConfig()` as a constructor default argument — a nested
+ * class's default member initializers are only complete once the
+ * ENCLOSING class's definition ends, which is too late for the
+ * enclosing class's own constructor to default-construct one. */
+struct MemopBimodalityConfig {
+    /* A template needs at least this many CP executions before its
+     * zero-rate is judged at all — too few samples make "1 zero out of
+     * 3" indistinguishable from noise. */
+    uint32_t min_execs = 8;
+    /* Zero-memop executions at or below this FRACTION of total
+     * executions count as "a small minority of outliers" (the D4
+     * shape).  Above it, zero is common enough to be the template's own
+     * legitimate behaviour (predication, a REP loop that is empty as
+     * often as it is not), not a completeness bug. */
+    double   max_outlier_rate = 0.10;
+};
+
+class MemopBimodalityLint {
+public:
+    using Config = MemopBimodalityConfig;
+
+    struct Finding {
+        uint32_t template_id;
+        uint64_t total;
+        uint64_t zero;
+        uint64_t nonzero;
+        double   rate;      /* zero / total */
+    };
+
+    MemopBimodalityLint(const std::vector<Template> &templates,
+                        Config cfg = Config())
+        : cfg_(cfg)
+    {
+        for (const Template &t : templates) {
+            for (const InsnTemplate &I : t.insns) {
+                if (I.max_dep_loads > 0 || I.max_dep_stores > 0) {
+                    memop_capable_.insert(t.template_id);
+                    break;
+                }
+            }
+        }
+    }
+
+    /* Whether @template_id has at least one insn with a nonzero static
+     * memop capacity — the only templates worth tracking at all. */
+    bool tracks(uint32_t template_id) const {
+        return memop_capable_.count(template_id) != 0;
+    }
+
+    /* One CP CST_FID_N_LOADS/N_STORES delta record for @template_id on
+     * @thread, at any insn position — the running total is per-template,
+     * not per-insn, so the position does not matter here. */
+    void on_count_delta(uint32_t thread, uint32_t template_id,
+                        uint64_t delta) {
+        running_[cell_key(thread, template_id)] += delta;    /* mod 2^64 */
+    }
+
+    /* End of one CP ENTRY on (thread, template_id): tally this
+     * execution's realised-memop verdict (its running total, post this
+     * entry's deltas, is nonzero or not) into the template's histogram.
+     * A no-op for a template with no static memop slot at all — its
+     * running total is definitionally always zero and uninteresting. */
+    void on_cp_entry_end(uint32_t thread, uint32_t template_id) {
+        if (!tracks(template_id)) return;
+        bool nonzero = running_[cell_key(thread, template_id)] != 0;
+        Hist &h = hist_[template_id];
+        h.total++;
+        if (nonzero) h.nonzero++; else h.zero++;
+    }
+
+    /* Templates whose zero-memop rate is a small (but nonzero) minority
+     * against an established nonzero majority — the D4 signature.
+     * Sorted by descending total executions (busiest offenders first). */
+    std::vector<Finding> flagged() const {
+        std::vector<Finding> out;
+        for (const auto &kv : hist_) {
+            const Hist &h = kv.second;
+            if (h.total < cfg_.min_execs) continue;
+            if (h.zero == 0 || h.nonzero == 0) continue;
+            double rate = (double)h.zero / (double)h.total;
+            if (rate > cfg_.max_outlier_rate) continue;
+            out.push_back({kv.first, h.total, h.zero, h.nonzero, rate});
+        }
+        std::sort(out.begin(), out.end(),
+                  [](const Finding &a, const Finding &b) {
+                      return a.total > b.total;
+                  });
+        return out;
+    }
+
+    uint64_t flagged_templates() const { return flagged().size(); }
+
+private:
+    struct Hist {
+        uint64_t total = 0, zero = 0, nonzero = 0;
+    };
+    static uint64_t cell_key(uint32_t thread, uint32_t template_id) {
+        return ((uint64_t)thread << 32) | template_id;
+    }
+
+    Config cfg_;
+    std::unordered_set<uint32_t> memop_capable_;
+    std::unordered_map<uint64_t, uint64_t> running_;   /* (thread,tid)->total */
+    std::unordered_map<uint32_t, Hist> hist_;          /* tid -> histogram */
 };
 
 }  /* namespace cst */

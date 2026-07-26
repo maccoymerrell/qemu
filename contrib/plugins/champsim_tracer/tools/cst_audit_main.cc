@@ -284,6 +284,9 @@ struct LintCtx {
     uint32_t                            thread;
     uint32_t                            template_id;
     uint64_t                            entry_ordinal;  /* debug locator */
+    /* Memop bimodality lint (cst_lint.h) — null when disabled
+     * (--bimodal-off) or, like @lint above, for WP sections. */
+    cst::MemopBimodalityLint           *bimodal;
 };
 
 /* Tally one field-delta record's bytes into @fd_b.  Format 0x1D:
@@ -312,17 +315,33 @@ static inline void tally_fd_record(
         }
     }
 
-    /* Mem-side lint: N_LOADS/N_STORES deltas landing on an insn whose
-     * static max memop counts are both zero feed the tracker's cell
-     * reconstruction; every other record keeps the skip fast path. */
-    if (lctx && lctx->row &&
-        (f == ids.fid_n_loads || f == ids.fid_n_stores) &&
+    /* Mem-side: an N_LOADS/N_STORES delta feeds two independent trackers
+     * that both need the decoded value, so decode once and hand it to
+     * whichever wants it — every other record keeps the skip fast path.
+     *   - impossible-attribution: only for a delta landing on an insn
+     *     whose static max memop counts are both zero (the existing
+     *     one-sided lint).
+     *   - bimodality (cst_lint.h MemopBimodalityLint): every delta on a
+     *     memop-CAPABLE template, regardless of insn position — it
+     *     tracks a single running per-template total (see its header
+     *     comment for why record presence alone cannot be used). */
+    bool is_count_fid = (f == ids.fid_n_loads || f == ids.fid_n_stores);
+    bool want_impossible = lctx && lctx->row && is_count_fid &&
         *ipos < lctx->row->size() &&
-        ((*lctx->row)[*ipos] & cst::AttributionLint::MEM_IMPOSSIBLE)) {
+        ((*lctx->row)[*ipos] & cst::AttributionLint::MEM_IMPOSSIBLE);
+    bool want_bimodal = lctx && lctx->bimodal && is_count_fid &&
+        lctx->bimodal->tracks(lctx->template_id);
+    if (want_impossible || want_bimodal) {
         std::array<uint64_t, 8> wd = sec.sleb_wide();  /* same bytes */
-        lctx->tracker->on_count_delta(lctx->thread, lctx->template_id,
-                                      *ipos, f == ids.fid_n_stores,
-                                      wd[0], lctx->entry_ordinal);
+        if (want_impossible) {
+            lctx->tracker->on_count_delta(lctx->thread, lctx->template_id,
+                                          *ipos, f == ids.fid_n_stores,
+                                          wd[0], lctx->entry_ordinal);
+        }
+        if (want_bimodal) {
+            lctx->bimodal->on_count_delta(lctx->thread, lctx->template_id,
+                                          wd[0]);
+        }
     } else {
         sec.skip_varint();                   /* sleb_wide delta */
     }
@@ -355,7 +374,8 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
                const std::unordered_map<uint32_t, uint32_t> &insns_by_tid,
                const std::vector<cst::Template> &templates,
                const std::unordered_map<uint32_t, size_t> &by_id,
-               Stats *s, cst::AttributionLint *lint)
+               Stats *s, cst::AttributionLint *lint,
+               cst::MemopBimodalityLint *bimodal /* nullptr disables it */)
 {
     const bool have_wp = (header_flags & ids.flag_wp) != 0;
     const bool have_fault = (ids.flag_fault != 0) &&
@@ -429,7 +449,7 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
             LintCtx lctx = {
                 lint, &tracker, lint->row((uint32_t)prev_cp_tid),
                 (uint32_t)current_thread, (uint32_t)prev_cp_tid,
-                s->cp_entries,
+                s->cp_entries, bimodal,
             };
             uint32_t cp_ipos = 0;
             for (uint64_t r = 0; r < n_records; r++) {
@@ -446,6 +466,13 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
              * what the decoder's resolved cells would report. */
             tracker.on_cp_entry_end((uint32_t)current_thread,
                                     (uint32_t)prev_cp_tid);
+            /* Bimodality histogram: this execution's realised-memop
+             * verdict (its running total, after this entry's own deltas)
+             * folds into the template's zero/nonzero tally. */
+            if (bimodal) {
+                bimodal->on_cp_entry_end((uint32_t)current_thread,
+                                         (uint32_t)prev_cp_tid);
+            }
 
             /* Per-entry sync-fault trailer (CST_FLAG_FAULT): exception-nesting
              * depth ULEB, between the CP delta and the WP sections.  Charge
@@ -717,6 +744,97 @@ std::string row(const std::string &label, uint64_t b, uint64_t total,
     return buf;
 }
 
+/*
+ * Oracle 1 surface — the plugin's own dropped-slice accounting.
+ *
+ * "CP reg-snap slice dropped" / "CP reg-snap leak trimmed" (Stats in
+ * champsim_tracer_stats.h, printed by append_stats_summary) are a
+ * completeness invariant the plugin already computes at trace-generation
+ * time but does not put on the wire: a positional reg-snap shortfall the
+ * seal walk could not recover is counted as "dropped" (its entry's whole
+ * reg-data section is discarded rather than mis-sliced onto the wrong
+ * insn); a leaked prefix the walk COULD recover by trimming is counted as
+ * "trimmed", separately.  On a conformant run these two counters are
+ * equal — every genuine shortfall is either a recoverable leak (trimmed)
+ * or an unrecoverable drop the counter itself accounts for; the invariant
+ * this audit checks is `dropped == trimmed`, not "both zero" (a busy
+ * fault-storm trace can legitimately trim many leaked prefixes while
+ * dropping none of them, and vice versa on a run with an upstream bug
+ * feeding it bad data — the shape that matters is that the two counters
+ * reconcile, mirroring how the byte-budget rollup above reconciles what
+ * IS on the wire; this is the same reconciliation applied to what the
+ * plugin observed but chose not to serialise).
+ *
+ * The counters live only in the plugin's own `<outfile>.stats.log`
+ * sidecar (or the equivalent stderr report) — never on the wire, so a
+ * pure trace-file reader cannot recover them after the fact.  This is
+ * the offline half of the gate the validator enforces at run time
+ * (champsim_tracer_validator._full, features.reg_snap_accounting):
+ * passing --stats-log (or letting cst_audit auto-detect the sidecar next
+ * to the trace) lets an offline consumer, with both files in hand, see
+ * the same numbers and the same verdict cst_audit's exit code reflects.
+ */
+struct CompletenessStats {
+    bool     present  = false;
+    uint64_t dropped  = 0;
+    uint64_t trimmed  = 0;
+};
+
+CompletenessStats read_completeness_stats(const std::string &path)
+{
+    CompletenessStats out;
+    FILE *f = std::fopen(path.c_str(), "r");
+    if (!f) return out;
+    char line[512];
+    static const char *kDropped = "CP reg-snap slice dropped";
+    static const char *kTrimmed = "CP reg-snap leak trimmed";
+    bool saw_dropped = false, saw_trimmed = false;
+    while (std::fgets(line, sizeof(line), f)) {
+        unsigned long long v;
+        size_t dn = std::strlen(kDropped), tn = std::strlen(kTrimmed);
+        if (std::strncmp(line, kDropped, dn) == 0 &&
+            std::sscanf(line + dn, "%llu", &v) == 1) {
+            out.dropped = v;
+            saw_dropped = true;
+        } else if (std::strncmp(line, kTrimmed, tn) == 0 &&
+                   std::sscanf(line + tn, "%llu", &v) == 1) {
+            out.trimmed = v;
+            saw_trimmed = true;
+        }
+    }
+    std::fclose(f);
+    /* Cumulative totals (the section this audit wants) are the LAST
+     * occurrence in the file: the plugin prints a per-segment summary at
+     * every segment close plus one final "Cumulative" summary at exit,
+     * so later occurrences supersede earlier ones — exactly like
+     * re-reading a running counter.  The loop above already keeps
+     * overwriting @out with each match, so it naturally lands on the
+     * last (cumulative) one. */
+    out.present = saw_dropped && saw_trimmed;
+    return out;
+}
+
+/* Auto-detect the sidecar beside @trace_path: the plugin names it
+ * `<outfile>.stats.log`, where `<outfile>` is the SAME basename the
+ * `.cst` itself was derived from (quickstart.rst, `outfile=` — a
+ * trailing `.cst` on the user's basename is stripped before either
+ * suffix is appended).  So for the common non-simpoint case, stripping
+ * the trace's own `.cst` suffix and appending `.stats.log` recovers it
+ * exactly.  Simpoint mode's `<basename>-<positionB>.cst` segment files
+ * do NOT map back to the shared `.stats.log` this way (the position
+ * suffix has no fixed un-delimiting rule) — pass --stats-log explicitly
+ * in that case. */
+std::string default_stats_log_path(const std::string &trace_path)
+{
+    std::string p = trace_path;
+    static const char kSuffix[] = ".cst";
+    size_t sn = sizeof(kSuffix) - 1;
+    if (p.size() >= sn && p.compare(p.size() - sn, sn, kSuffix) == 0) {
+        p.resize(p.size() - sn);
+    }
+    return p + ".stats.log";
+}
+
 std::string fd_row(const std::string &label, const Bucket &cp,
                    const Bucket &wp, uint64_t total)
 {
@@ -917,19 +1035,83 @@ void print_report(const Stats &s, const cst::Header &h)
 
 }  /* namespace */
 
+static void usage(const char *argv0)
+{
+    std::fprintf(stderr,
+        "usage: %s [options] <trace.cst>\n"
+        "  --stats-log=PATH          plugin sidecar for the completeness\n"
+        "                            check (Oracle 1); default: auto-detect\n"
+        "                            <trace-without-.cst>.stats.log beside\n"
+        "                            the trace\n"
+        "  --no-stats-log            skip the completeness check even if a\n"
+        "                            sidecar is auto-detected\n"
+        "  --bimodal-off             skip the memop bimodality lint (Oracle 2)\n"
+        "  --bimodal-min-execs=N     min CP executions before a template's\n"
+        "                            zero-rate is judged (default 8)\n"
+        "  --bimodal-max-outlier-rate=F   zero-memop executions at or below\n"
+        "                            this fraction of total are flagged as\n"
+        "                            outliers (default 0.10)\n",
+        argv0);
+}
+
 int main(int argc, char **argv)
 {
-    if (argc != 2) {
-        std::fprintf(stderr, "usage: %s <trace.cst>\n", argv[0]);
+    const char *trace_path = nullptr;
+    std::string stats_log_path;
+    bool stats_log_explicit = false;
+    bool no_stats_log = false;
+    bool bimodal_off = false;
+    cst::MemopBimodalityLint::Config bimodal_cfg;
+
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        auto val_after = [&](const std::string &prefix) -> const char * {
+            return a.c_str() + prefix.size();
+        };
+        if (a.rfind("--stats-log=", 0) == 0) {
+            stats_log_path = val_after("--stats-log=");
+            stats_log_explicit = true;
+        } else if (a == "--no-stats-log") {
+            no_stats_log = true;
+        } else if (a == "--bimodal-off") {
+            bimodal_off = true;
+        } else if (a.rfind("--bimodal-min-execs=", 0) == 0) {
+            bimodal_cfg.min_execs =
+                (uint32_t)std::strtoul(val_after("--bimodal-min-execs="),
+                                       nullptr, 10);
+        } else if (a.rfind("--bimodal-max-outlier-rate=", 0) == 0) {
+            bimodal_cfg.max_outlier_rate =
+                std::strtod(val_after("--bimodal-max-outlier-rate="),
+                           nullptr);
+        } else if (a == "-h" || a == "--help") {
+            usage(argv[0]);
+            return 0;
+        } else if (!a.empty() && a[0] == '-') {
+            std::fprintf(stderr, "cst_audit: unrecognized option: %s\n",
+                         a.c_str());
+            usage(argv[0]);
+            return 2;
+        } else if (!trace_path) {
+            trace_path = argv[i];
+        } else {
+            usage(argv[0]);
+            return 2;
+        }
+    }
+    if (!trace_path) {
+        usage(argv[0]);
         return 2;
+    }
+    if (!stats_log_explicit && !no_stats_log) {
+        stats_log_path = default_stats_log_path(trace_path);
     }
 
     try {
         /* cst_file_open resolves both tar members + decompresses. */
-        std::unique_ptr<cst::CstFile> cf = cst::cst_file_open(argv[1]);
+        std::unique_ptr<cst::CstFile> cf = cst::cst_file_open(trace_path);
 
         struct stat st;
-        if (::stat(argv[1], &st) != 0) {
+        if (::stat(trace_path, &st) != 0) {
             throw std::runtime_error("stat failed");
         }
 
@@ -1007,9 +1189,11 @@ int main(int argc, char **argv)
         }
 
         cst::AttributionLint lint(h, templates);
+        cst::MemopBimodalityLint bimodal(templates, bimodal_cfg);
         try {
             walk_body(body_stream->reader(), h.ids, h.flags,
-                      insns_by_tid, templates, by_id, &s, &lint);
+                      insns_by_tid, templates, by_id, &s, &lint,
+                      bimodal_off ? nullptr : &bimodal);
         } catch (const std::exception &e) {
             std::fprintf(stderr,
                 "cst_audit: body walk failed at cp_entries=%lu wp_entries=%lu thread_switches=%lu iframes=%lu: %s\n",
@@ -1037,9 +1221,16 @@ int main(int argc, char **argv)
 
         print_report(s, h);
 
+        bool fail = false;
+
         /* Impossible-attribution lint verdict (cst_lint.h): always
          * printed, and a nonzero count fails the audit — a corrupt
-         * trace must not exit 0. */
+         * trace must not exit 0.  A conservation-only check (the byte
+         * rollup above) reconciles what the wire DOES carry; this and
+         * the two sections below are completeness checks — they look
+         * for what should be on the wire and is not, which a rollup
+         * can never see (a record never written contributes to neither
+         * side of a byte partition, so it reconciles trivially). */
         std::printf("\n=== ATTRIBUTION LINT ===\n");
         std::printf("  impossible attributions: %s\n",
                     lint.summary().c_str());
@@ -1047,6 +1238,80 @@ int main(int argc, char **argv)
             std::fprintf(stderr,
                          "cst_audit: FAIL: impossible attributions: %s\n",
                          lint.summary().c_str());
+            fail = true;
+        }
+
+        /* Oracle 2 — memop bimodality (cst_lint.h MemopBimodalityLint):
+         * a template whose CP executions overwhelmingly realise memops,
+         * with a small minority realising none, is the D4 signature.
+         * Always printed when enabled; a nonzero flagged-template count
+         * fails the audit, same contract as the attribution lint. */
+        if (!bimodal_off) {
+            std::vector<cst::MemopBimodalityLint::Finding> findings =
+                bimodal.flagged();
+            std::printf("\n=== MEMOP BIMODALITY (Oracle 2; min_execs=%u, "
+                        "max_outlier_rate=%.2f) ===\n",
+                        bimodal_cfg.min_execs, bimodal_cfg.max_outlier_rate);
+            if (findings.empty()) {
+                std::printf("  clean: 0 templates with a nonzero-majority / "
+                            "zero-outlier memop split\n");
+            } else {
+                for (const auto &fnd : findings) {
+                    std::printf("  template %-8u %8s executions, %6s "
+                                "zero-memop outlier(s)  (rate %.4f)\n",
+                                fnd.template_id,
+                                fmt_n(fnd.total).c_str(),
+                                fmt_n(fnd.zero).c_str(), fnd.rate);
+                    std::fprintf(stderr,
+                        "cst_audit: FAIL: template %u: %llu/%llu CP "
+                        "executions realised zero memops (rate %.4f) "
+                        "against a %llu-execution nonzero majority — "
+                        "memop bimodality (D4-class completeness loss)\n",
+                        fnd.template_id,
+                        (unsigned long long)fnd.zero,
+                        (unsigned long long)fnd.total, fnd.rate,
+                        (unsigned long long)fnd.nonzero);
+                }
+                fail = true;
+            }
+        }
+
+        /* Oracle 1 — the plugin's own dropped-slice accounting, surfaced
+         * from the <outfile>.stats.log sidecar when available (see
+         * read_completeness_stats above).  Silently absent when no
+         * sidecar was found and none was requested; --stats-log=PATH
+         * makes an unreadable/malformed sidecar an explicit failure. */
+        if (!no_stats_log && !stats_log_path.empty()) {
+            CompletenessStats cs = read_completeness_stats(stats_log_path);
+            if (cs.present) {
+                bool ok = cs.dropped == cs.trimmed;
+                std::printf("\n=== COMPLETENESS (Oracle 1; %s) ===\n",
+                            stats_log_path.c_str());
+                std::printf("  CP reg-snap slice dropped   %14s\n",
+                            fmt_n(cs.dropped).c_str());
+                std::printf("  CP reg-snap leak trimmed    %14s\n",
+                            fmt_n(cs.trimmed).c_str());
+                std::printf("  invariant dropped == trimmed: %s\n",
+                            ok ? "OK" : "MISMATCH");
+                if (!ok) {
+                    std::fprintf(stderr,
+                        "cst_audit: FAIL: dropped-slice accounting "
+                        "mismatch: dropped=%llu trimmed=%llu (%s)\n",
+                        (unsigned long long)cs.dropped,
+                        (unsigned long long)cs.trimmed, stats_log_path.c_str());
+                    fail = true;
+                }
+            } else if (stats_log_explicit) {
+                std::fprintf(stderr,
+                    "cst_audit: FAIL: --stats-log=%s did not carry both "
+                    "completeness counters\n", stats_log_path.c_str());
+                fail = true;
+            }
+            /* Auto-detected path that doesn't exist: silent, matching
+             * the auto-detection's best-effort contract. */
+        }
+
+        if (fail) {
             return 1;
         }
     } catch (const std::exception &e) {

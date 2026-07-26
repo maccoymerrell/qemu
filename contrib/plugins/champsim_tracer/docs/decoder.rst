@@ -424,6 +424,139 @@ A clean trace always reads ``impossible attributions: 0 memop (0
 distinct insns), 0 regdata (0 distinct insns), 0 dangling template
 refs (0 distinct ids)``.
 
+Conservation vs. completeness
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Everything above this point — the byte-budget breakdown, the
+``[rollup 100.00%]`` assertions, the register-data breakdown, even the
+attribution lint — is a **conservation** check: it partitions and
+cross-foots bytes and records that ARE on the wire.  A record the
+writer never emitted contributes to neither side of a partition, so
+its absence reconciles exactly and silently.  That blind spot is not
+hypothetical: it is exactly how the D4 bug — a deferred trace-window
+close that flushed a segment's final body entry before its
+instructions had run, so the entry carried no memops and no register
+deltas at all — passed every one of the checks above in every affected
+trace, with the header breakdown rolling up to 100.00% and the
+attribution lint reading all-zero throughout.
+
+The two sections below are **completeness** checks instead: they look
+for what SHOULD be on the wire, by the trace's own internal evidence,
+and is not.  Both are off by default in neither direction — they run
+automatically and gate ``cst_audit``'s exit code exactly like the
+attribution lint — but both are statistical or sidecar-dependent
+rather than absolute, precisely because "an instruction produced no
+observation this execution" is legitimate on its own (predication, a
+zero-count REP, a suppressed fault, ordinary wrong-path wandering) and
+only becomes suspicious in the pattern these checks look for.
+
+.. _bimodality-cc:
+
+MEMOP BIMODALITY (Oracle 2)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. index::
+   single: memop bimodality
+   single: MemopBimodalityLint
+
+For each memop-capable template (at least one instruction with a
+nonzero static load or store count), ``cst_audit`` tallies how many of
+its correct-path executions realised at least one memop versus how
+many realised none — reconstructed from the persistent
+``CST_FID_N_LOADS`` / ``CST_FID_N_STORES`` cells (format.rst §5.2),
+not from raw record presence, because those fields are delta-encoded
+against their own prior observation like every other field: a steady
+repeated count re-emits nothing after its first sighting, so record
+presence alone cannot tell "unchanged" from "never happened".  A
+template that is overwhelmingly nonzero with only a SMALL minority of
+zero-memop executions is the D4 signature: one or a few executions
+silently lost their memops while the template's ordinary behaviour is
+unambiguous.  A template that is legitimately bimodal AT SCALE (heavy
+predication, a REP loop empty as often as not) has a zero-rate the
+default threshold does not consider an outlier, so it is not flagged.
+
+The lint is implemented in ``tools/cst_lint.h``
+(``cst::MemopBimodalityLint``), correct-path only — wrong-path
+wandering carries no dataflow contract, the same scoping the
+attribution lint's MEM/REG rules use.  Two tunables tighten or loosen
+the statistical band for a workload whose legitimate zero-rate
+genuinely warrants it:
+
+.. code-block:: console
+
+   $ build/contrib/plugins/cst_audit --bimodal-min-execs=20 \
+         --bimodal-max-outlier-rate=0.05 trace.cst
+   $ build/contrib/plugins/cst_audit --bimodal-off trace.cst   # skip it
+
+``--bimodal-min-execs=N`` (default 8) is the minimum CP-execution count
+before a template's zero-rate is judged at all — too few samples make
+"1 zero out of 3" indistinguishable from noise.
+``--bimodal-max-outlier-rate=F`` (default 0.10) is the fraction of
+zero-memop executions, at or below which they count as "a small
+minority of outliers" rather than the template's own normal behaviour.
+The report section always prints, clean or not:
+
+.. code-block:: console
+
+   === MEMOP BIMODALITY (Oracle 2; min_execs=8, max_outlier_rate=0.10) ===
+     clean: 0 templates with a nonzero-majority / zero-outlier memop split
+
+A nonzero finding prints one line per flagged template (id, execution
+count, outlier count, rate) and fails the audit (exit 1), the same
+contract as the attribution lint.
+
+.. _completeness-cc:
+
+COMPLETENESS (Oracle 1)
+~~~~~~~~~~~~~~~~~~~~~~~
+
+.. index::
+   single: completeness check
+   single: reg-snap accounting
+   single: stats.log
+
+The plugin already computes a completeness invariant at trace-generation
+time that never reaches the wire at all: ``CP reg-snap slice dropped``
+and ``CP reg-snap leak trimmed`` (:doc:`reference`, Stats), printed in
+the plugin's own per-segment and cumulative summaries.  A positional
+reg-snap shortfall the seal walk cannot recover drops that entry's
+whole register-data section rather than mis-slicing it onto the wrong
+instruction (counted as *dropped*); a leaked prefix the walk CAN
+recover by trimming is counted separately as *trimmed*.  On a
+conformant run these two counters are equal — every genuine shortfall
+is either a recoverable leak or an unrecoverable drop the counter
+itself accounts for.  The invariant is ``dropped == trimmed``, not
+"both zero": a busy fault-storm trace can legitimately trim many
+leaked prefixes while dropping none of them, so requiring zero would
+false-positive on exactly the traces most likely to exercise the
+recovery path.
+
+Because the two counters live only in the plugin's own
+``<outfile>.stats.log`` sidecar (:doc:`quickstart`, *Output files and
+stderr*) — never on the wire — a pure trace-file reader cannot recover
+them after the fact.  ``cst_audit`` auto-detects the sidecar beside the
+trace (stripping a trailing ``.cst`` from the trace path and appending
+``.stats.log`` — the common ``outfile=run`` case, where it lands at
+``run.stats.log``; simpoint mode's position-suffixed segment files do
+not map back this way and need ``--stats-log`` explicitly) or accepts
+an explicit path:
+
+.. code-block:: console
+
+   $ build/contrib/plugins/cst_audit --stats-log=run.stats.log run.cst
+   === COMPLETENESS (Oracle 1; run.stats.log) ===
+     CP reg-snap slice dropped               0
+     CP reg-snap leak trimmed                0
+     invariant dropped == trimmed: OK
+
+When no sidecar is found (auto-detected path missing) the section is
+silently omitted — this is the offline half of a check the validator
+also runs at trace-generation time as a registered, gating feature
+(``features.reg_snap_accounting``, :doc:`validator`); passing an
+explicit ``--stats-log`` that turns out unreadable or missing either
+counter IS an error (``cst_audit`` exits 1), so a consumer who
+deliberately asks for the check gets a hard answer, not a silent skip.
+
 Validating a trace
 ------------------
 

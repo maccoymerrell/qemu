@@ -144,6 +144,8 @@ FEATURES: dict[str, str] = {
     "behavior:wrong_path_coverage": "static_templates=1: minted-alternate never-executed fall-through + BTB target coverage, deepened by static_depth (4-ISA)",
     "behavior:segment_final_memops": "the segment's last body entry carries its memory operands, matching the earlier executions of the same true BB (the deferred icount/simpoint window close emits it after it has run, not before)",
     "behavior:smc_revisions": "self-modifying code: correct-path template-revision minting for rewrites that preserve OR change the block's instruction boundaries, content-signature id reuse, and the per-pc revision cap (4-ISA)",
+    "behavior:reg_snap_accounting": "the plugin's own dropped-slice completeness invariant for the positional reg-snap capture — CP reg-snap slice dropped == CP reg-snap leak trimmed (D4-class completeness oracle; the wire has no record of it, so this is read from the <outfile>.stats.log sidecar, offline via cst_audit --stats-log)",
+    "behavior:memop_bimodality": "per-template memop bimodality: a memop-capable template's CP executions overwhelmingly nonzero with a small minority of zero-memop outliers is a completeness loss (D4-class oracle generalised past the segment-final-entry special case; cst_lint.h MemopBimodalityLint + validator.py's mirror, both gating)",
 }
 
 
@@ -848,6 +850,87 @@ def _final_entry_memop_probe(cst: Path):
                     f"peer executions all carry {want[0]}")
 
 
+def _chk_reg_snap_accounting(ctx: Ctx) -> Outcome:
+    """The plugin's own dropped-slice completeness invariant (Oracle 1 of
+    the two D4-class completeness checks — see features.final_entry_memops
+    and the cst_lint.h MemopBimodalityLint for the other one).
+
+    ``Stats.reg_snap_slice_dropped`` / ``Stats.reg_snap_leak_trimmed``
+    (champsim_tracer_stats.h) are counted by the plugin at every seal walk:
+    a positional reg-snap shortfall the walk cannot recover drops that
+    entry's whole register-data section rather than mis-slicing it onto
+    the wrong instruction (dropped); a leaked prefix the walk CAN recover
+    by trimming is counted separately (trimmed).  Neither counter ever
+    reaches the wire — they exist only in the plugin's own per-segment and
+    cumulative stderr summary and its ``<outfile>.stats.log`` sidecar — so
+    no byte-level gate on the trace file itself can see them; every
+    existing offline check (cst_audit's rollup, the impossible-attribution
+    lint) reconciles a D4-affected trace as perfectly clean because a
+    record that was never written contributes to neither side of a byte
+    partition.
+
+    The invariant this check reads is ``dropped == trimmed``, NOT "both
+    zero": a busy fault-storm trace can legitimately trim many leaked
+    prefixes while dropping none of them (mcf_user_mipsel's sample trace
+    shows 188,726 leak trims from the separate mipsel `teq`-as-syscall
+    issue, with dropped==trimmed still holding), so requiring zero would
+    false-positive on exactly the traces most likely to exercise the
+    recovery path.  Runs its own short trace per ISA — deliberately not
+    reusing another check's output directory — so it exercises the
+    invariant in the ordinary course of tracing, not a manufactured
+    scenario."""
+    from . import __main__ as M
+    from . import generator as G
+    subs: list = []
+    all_ok = True
+    for isa in ISA_ALL:
+        d = ctx.dir(f"feat_reg_snap_accounting_{isa}")
+        cc = M.ISA_COMPILER.get(isa)
+        if not cc:
+            subs.append({"name": isa, "ok": True, "detail": "skip (no compiler)"})
+            continue
+        params = G.GenerateParams(seed=ctx.seed, isa=isa, num_diamonds=8,
+                                  hot_iters=1000)
+        src, _m = G.generate(params, d, f"rsa_{isa}")
+        binp = d / f"rsa_{isa}"
+        bcmd = [cc] + M.ISA_CFLAGS[isa] + ["-O1", str(src), "-o", str(binp)]
+        if subprocess.call(bcmd) != 0:
+            subs.append({"name": isa, "ok": True, "detail": "skip (build failed)"})
+            continue
+        qemu = ctx.build_dir / f"qemu-{isa}"
+        out_base = d / f"rsa_{isa}"
+        opts = (f"outfile={out_base},wpdepth=32,regdata=1,memdata=1,"
+                f"trace_window=icount:start=0;stop=400000")
+        rc = subprocess.call([str(qemu), "-plugin", f"{ctx.plugin},{opts}",
+                             str(binp)], stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+        stats = Path(f"{out_base}.stats.log")
+        if rc != 0 or not stats.is_file():
+            subs.append({"name": isa, "ok": False,
+                        "detail": f"trace rc={rc} stats_present={stats.is_file()}"})
+            all_ok = False
+            continue
+        dropped = trimmed = None
+        for line in stats.read_text(errors="replace").splitlines():
+            if line.startswith("CP reg-snap slice dropped"):
+                dropped = int(line.rsplit(None, 1)[-1])
+            elif line.startswith("CP reg-snap leak trimmed"):
+                trimmed = int(line.rsplit(None, 1)[-1])
+        if dropped is None or trimmed is None:
+            subs.append({"name": isa, "ok": False,
+                        "detail": f"counters not found in {stats.name}"})
+            all_ok = False
+            continue
+        ok = dropped == trimmed
+        all_ok = all_ok and ok
+        subs.append({"name": isa, "ok": ok,
+                    "detail": f"dropped={dropped} trimmed={trimmed}"})
+    return Outcome("pass" if all_ok else "fail",
+                   "plugin's own dropped-slice accounting invariant "
+                   "(dropped == trimmed), read from <outfile>.stats.log "
+                   "(4 ISAs)", subs)
+
+
 def _chk_final_entry_memops(ctx: Ctx) -> Outcome:
     """The segment's LAST body entry keeps its memory operands (4 ISAs).
 
@@ -1158,7 +1241,7 @@ def build_checks() -> list:
         "tool:cst_decode_legacy",
         "behavior:opcode_coverage", "behavior:branch_taxonomy",
         "behavior:reg_coverage", "behavior:dep_refine",
-        "behavior:wrong_path_chains",
+        "behavior:wrong_path_chains", "behavior:memop_bimodality",
     ]
     for isa in ISA_ALL:
         C.append(Check(f"quick.user_{isa}", "quick",
@@ -1331,6 +1414,13 @@ def build_checks() -> list:
                    "deferred icount-window close (4-ISA)",
                    ["behavior:segment_final_memops", "opt:window_icount",
                     "wire:BODY_TAG_ENTRY"], _chk_final_entry_memops))
+    C.append(Check("features.reg_snap_accounting", "features",
+                   "plugin's own dropped-slice completeness invariant "
+                   "(dropped == trimmed) for the positional reg-snap "
+                   "capture — the D4-class completeness oracle no "
+                   "byte-level wire check can see (4-ISA)",
+                   ["behavior:reg_snap_accounting", "tool:cst_audit"],
+                   _chk_reg_snap_accounting))
     C.append(Check("features.smc", "features",
                    "self-modifying code: revision minting (shape-preserving "
                    "AND shape-changing) / id reuse / cap / discriminator "

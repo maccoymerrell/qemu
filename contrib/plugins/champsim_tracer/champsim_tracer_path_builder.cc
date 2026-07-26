@@ -2038,20 +2038,9 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
         }
     }
 
-    /* Stamp cur (already promoted by step_events) with the depth it runs
-     * at, and expose prev's execute-time depth for this step's emits.
-     *
-     * User-privilege TBs stamp depth 0 regardless of the vCPU's raw
-     * fault-stack depth: user code is never fault-handler content, but a
-     * preemptible kernel can context-switch INSIDE a blocking fault
-     * handler (cond_resched in the fault path) and resume another guest
-     * thread's user code while the interrupted task's fault frames are
-     * still live on this vCPU's stack — without the clamp those user
-     * entries would carry the interrupted excursion's depth (observed:
-     * depth-4 user loop blocks under a two-thread yield workload).  The
-     * other thread's KERNEL work keeps the raw-baselined depth — the
-     * per-vCPU stack cannot attribute frames per guest thread, an
-     * accepted approximation. */
+    /* Stamp cur (already promoted by step_events) with the depth it runs at,
+     * from the ledger as the event drain above left it.  The seal walk below
+     * may retire frames, and takes the stamp again when it does. */
     stamp_cur_depth(in);
     /* faults=0: suspend capture across the synchronous-fault handler exactly
      * as the async mute does — the handler's memops / reg snaps never pool

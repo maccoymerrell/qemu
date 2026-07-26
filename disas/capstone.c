@@ -1226,6 +1226,85 @@ static bool cap_aarch64_is_block_zero_sysop(const cs_arm64 *a64, uint8_t n)
 }
 
 /*
+ * Capstone 6.0.0-Alpha7 bug: the single-register compare-and-swap forms
+ * (CAS / CASA / CASL / CASAL and the B/H size variants) mis-attribute
+ * their destination.
+ *
+ * `CAS <Ws>, <Wt>, [<Xn|SP>]` compares Ws against memory and, whatever
+ * the outcome, writes the value it loaded back into Ws — Ws is the
+ * carried dependency of every CAS retry loop.  Capstone reports Ws as
+ * READ-only, and sets detail->writeback, which makes the *address base*
+ * Xn appear in the implicit regs_write[] list.  Two errors at once: the
+ * result register's write is lost, and a phantom write is fabricated on
+ * the address base that every later consumer of Xn will honour.
+ *
+ * The scoping is exact.  The pair forms (CASP / CASPA / CASPL / CASPAL)
+ * get their result registers right — both report READ|WRITE — but share
+ * the spurious writeback claim, so the phantom suppression covers the
+ * whole CAS family (including the FEAT_THE rcwcas / rcwscas variants)
+ * while the operand promotion applies only to the single-register forms.
+ * The LD<op> / ST<op> LSE RMW family and SWP are correct throughout.
+ *
+ * Fix: promote the first register operand to READ|WRITE and drop the
+ * memory base register from the implicit write list.  Neither correction
+ * can mask a fixed Capstone — a corrected Capstone reports the same
+ * READ|WRITE on operand 0, and stops emitting the phantom this removes.
+ *
+ * Revisit / remove when Capstone is bumped past 6.0.0-Alpha7; verify
+ * with `cstool -d arm64 227ca088` (bytes `22 7c a0 88`, `cas w0,w2,[x1]`)
+ * -- fixed, operands[0] must show READ|WRITE and detail->writeback must
+ * be 0.  Use a `cstool` built from `subprojects/capstone`
+ * (capstone.wrap's pinned revision), not a system package, or run
+ * `capstone_workaround_probe`; see docs/troubleshooting.rst.
+ */
+static bool cap_aarch64_is_cas(const char *mnem)
+{
+    return g_str_has_prefix(mnem, "cas")
+        || g_str_has_prefix(mnem, "rcwcas")
+        || g_str_has_prefix(mnem, "rcwscas");
+}
+
+static bool cap_aarch64_is_single_cas(const char *mnem)
+{
+    if (!g_str_has_prefix(mnem, "cas")) {
+        return false;
+    }
+    /* casp / caspa / caspl / caspal are the pair forms.  Their result
+     * registers are already reported READ|WRITE; only the phantom base
+     * write applies to them. */
+    return mnem[3] != 'p';
+}
+
+/*
+ * Capstone 6.0.0-Alpha7 bug: FEAT_MOPS memset (SETP / SETM / SETE and
+ * the tag-setting SETG*, unprivileged *T, non-temporal *N and *TN
+ * variants) reports its memory operand as READ|WRITE.  A memset only
+ * writes; LLVM agrees (mayStore without mayLoad).  Uncorrected the
+ * operand walker mints a load lane on a memset — a phantom load, with a
+ * phantom address dependency and a phantom cache access, on the
+ * instruction sequence newer glibc uses for memset() whenever
+ * HWCAP2_MOPS is present.
+ *
+ * The scoping is exact: the memcpy forms (CPYP / CPYM / CPYE and their
+ * variants) genuinely both load and store, and both decoders agree on
+ * them.  Only the *set* forms are wrong.
+ *
+ * Revisit / remove when Capstone is bumped past 6.0.0-Alpha7; verify
+ * with `cstool -d arm64 2004c219` (bytes `20 04 c2 19`,
+ * `setp [x0]!, x1!, x2`) -- fixed, the MEM operand must show WRITE
+ * without READ.  Use a `cstool` built from `subprojects/capstone`, not a
+ * system package, or run `capstone_workaround_probe`; see
+ * docs/troubleshooting.rst.
+ */
+static bool cap_aarch64_is_mops_set(const char *mnem)
+{
+    /* SETF8 / SETF16 (FEAT_FlagM2) also start with "set" but have no
+     * memory operand, so they never reach the correction; excluded
+     * explicitly so the intent is legible. */
+    return g_str_has_prefix(mnem, "set") && !g_str_has_prefix(mnem, "setf");
+}
+
+/*
  * Capstone-6.0.0 bug: when UBFM/SBFM/EXTR resolves to one of the
  * three-operand alias mnemonics whose printed form is `Rd, Rn, #imm`
  * (LSL #imm, LSR #imm, ASR #imm, ROR #imm), the disassembler emits the
@@ -1412,6 +1491,39 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
                 op->access = cap_aarch64_infer_mem_access(insn->mnemonic);
             }
             break;
+        case ARM64_OP_PRED:
+            /*
+             * SVE / SME governing predicate.  Capstone rewrites every
+             * p0..p15 / pn0..pn15 operand out of the REG type into its own
+             * PRED type, parking the register in cop->pred.reg — see
+             * AArch64_set_detail_op_reg() in the Capstone tree.  It is not a
+             * defect, it is a different representation, but presenting it as
+             * an unmodelled operand loses the whole predicated dataflow
+             * edge: the governing predicate of every masked SVE operation,
+             * and the destination of every predicate producer (ptrue,
+             * whilelt, the predicate-writing compares).
+             *
+             * The generic register space already carries predicate registers
+             * (REG_PRED0..REG_PRED31) and the plugin's AArch64 register table
+             * already maps AARCH64_REG_P0..P15 / PN0..PN15 onto them; those
+             * rows were simply unreachable while this arm dropped the
+             * operand.  Present the predicate as an ordinary REG operand so
+             * they become reachable.  The access flags Capstone attaches to
+             * the PRED operand are correct and are forwarded verbatim.
+             *
+             * SME's second predicate field, pred.vec_select, has no second
+             * register slot in the plugin operand and is not represented.
+             * That is an SME-only gap, recorded in docs/limitations.rst.
+             */
+            op->type = QEMU_PLUGIN_OP_REG;
+            cap_copy_reg_name(op->reg_name,
+                              QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                              handle, cop->pred.reg, CS_ARCH_ARM64);
+            op->reg_id     = cop->pred.reg;
+            op->index_name[0] = '\0';
+            op->index_id   = 0;
+            op->imm = 0;
+            break;
         default:
             op->type = QEMU_PLUGIN_OP_INVALID;
             op->reg_name[0] = '\0';
@@ -1424,10 +1536,174 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
     }
 
     /*
-     * Capstone-6.0.0 LSL/LSR/ASR/ROR-#imm alias bug workaround
+     * Capstone 6.0.0-Alpha7 SIMD writeback bug workaround.
+     *
+     * A pre-/post-index addressing mode updates its base register:
+     * `st1 { v0.16b }, [x1], #16` leaves x1 sixteen bytes higher.  That
+     * update is the induction variable of every hand-written and
+     * autovectorised NEON loop, so losing it makes each iteration's
+     * address look independent of the last.
+     *
+     * Capstone sets detail->writeback for these forms but populates the
+     * implicit regs_write[] list only for the SCALAR ones: `ldr x0,
+     * [x1], #16` reports the x1 write, `ld1 { v2.b }[0], [x1], #1` and
+     * the whole LD1..LD4 / ST1..ST4 structure family report nothing.
+     * Add the base register when writeback is claimed and the write is
+     * not already listed, so a Capstone that starts reporting it cannot
+     * be double-counted.
+     *
+     * This runs BEFORE the CAS correction below on purpose: CAS sets
+     * writeback spuriously, and the CAS block is what removes the base
+     * register again for that one family.
+     *
+     * Revisit / remove when Capstone is bumped past 6.0.0-Alpha7; verify
+     * with `cstool -d arm64 20709f4c` (bytes `20 70 9f 4c`,
+     * `st1 {v0.16b},[x1],#16`) -- fixed, x1 must appear in the implicit
+     * write list as it already does for the scalar `ldr` post-index
+     * form.  Use a `cstool` built from `subprojects/capstone`, not a
+     * system package, or run `capstone_workaround_probe`; see
+     * docs/troubleshooting.rst.
+     */
+    if (insn->detail->writeback) {
+        for (uint8_t i = 0; i < n; i++) {
+            if (out->operands[i].type != QEMU_PLUGIN_OP_MEM
+                || out->operands[i].reg_id == 0) {
+                continue;
+            }
+            /* detail->writeback is set on SIMD structure accesses that
+             * have no writeback at all (`ld1 { v2.b }[0], [x1]` claims
+             * it), so the flag alone would fabricate the very phantom
+             * this is meant to avoid.  Require an actual index amount as
+             * well: a real pre-/post-index form always carries the
+             * increment, either as the MEM displacement or as an index
+             * register. */
+            if (out->operands[i].imm == 0 && out->operands[i].index_id == 0) {
+                break;
+            }
+            uint16_t base = out->operands[i].reg_id;
+            bool listed = false;
+            for (uint8_t k = 0; k < out->n_regs_write; k++) {
+                if (out->regs_write_id[k] == base) {
+                    listed = true;
+                    break;
+                }
+            }
+            if (!listed
+                && out->n_regs_write < QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS) {
+                cap_copy_reg_name(out->regs_write[out->n_regs_write],
+                                  QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                                  handle, base, CS_ARCH_ARM64);
+                out->regs_write_id[out->n_regs_write] = base;
+                out->n_regs_write++;
+            }
+            break;
+        }
+    }
+
+    /*
+     * Capstone 6.0.0-Alpha7 single-register CAS workaround
+     * (see cap_aarch64_is_single_cas).  Restore the write to the
+     * compare/result register and drop the phantom write of the address
+     * base that detail->writeback fabricates.
+     */
+    if (cap_aarch64_is_cas(insn->mnemonic)) {
+        unsigned base_reg = 0;
+        for (uint8_t i = 0; i < n; i++) {
+            if (out->operands[i].type == QEMU_PLUGIN_OP_MEM) {
+                base_reg = out->operands[i].reg_id;
+                break;
+            }
+        }
+        if (cap_aarch64_is_single_cas(insn->mnemonic)) {
+            for (uint8_t i = 0; i < n; i++) {
+                if (out->operands[i].type == QEMU_PLUGIN_OP_REG) {
+                    out->operands[i].access |= QEMU_PLUGIN_OP_ACC_READ
+                                             | QEMU_PLUGIN_OP_ACC_WRITE;
+                    break;
+                }
+            }
+        }
+        if (base_reg) {
+            uint8_t keep = 0;
+            for (uint8_t i = 0; i < out->n_regs_write; i++) {
+                if (out->regs_write_id[i] == base_reg) {
+                    continue;
+                }
+                if (keep != i) {
+                    memcpy(out->regs_write[keep], out->regs_write[i],
+                           QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ);
+                    out->regs_write_id[keep] = out->regs_write_id[i];
+                }
+                keep++;
+            }
+            out->n_regs_write = keep;
+        }
+    }
+
+    /*
+     * Capstone 6.0.0-Alpha7 FEAT_MOPS memset workaround
+     * (see cap_aarch64_is_mops_set).  A memset stores; it does not load.
+     */
+    if (cap_aarch64_is_mops_set(insn->mnemonic)) {
+        for (uint8_t i = 0; i < n; i++) {
+            if (out->operands[i].type == QEMU_PLUGIN_OP_MEM) {
+                out->operands[i].access = QEMU_PLUGIN_OP_ACC_WRITE;
+            }
+        }
+    }
+
+    /*
+     * Capstone 6.0.0-Alpha7 bug: the SVE merging-predicated move
+     * `mov <Zd>.<T>, <Pg>/M, <Zn>.<T>` is an alias of
+     * `SEL <Zd>, <Pg>, <Zn>, <Zd>`.  Under /M the inactive lanes keep
+     * Zd's previous value, so Zd is genuinely a source — the fourth
+     * operand of the underlying SEL.  Capstone's alias printer drops that
+     * operand and the metadata follows the printed alias, so Zd reports
+     * WRITE only and the merge's dependency on its own previous value
+     * disappears.
+     *
+     * The scoping is exact: the printed SEL form keeps all four operands
+     * and is correct, and the CPY-based `mov <Zd>.<T>, <Pg>/M, #imm` /
+     * `..., <Wn>` forms already report READ|WRITE.  Detect the alias by
+     * insn id SEL with a three-operand shape and restore Zd's read.
+     *
+     * Revisit / remove when Capstone is bumped past 6.0.0-Alpha7; verify
+     * with `cstool -d arm64 e0c32005` (bytes `e0 c3 20 05`,
+     * `mov z0.b, p0/m, z31.b`) -- fixed, operands[0] must show READ|WRITE,
+     * or the alias must expand to four operands.  Use a `cstool` built
+     * from `subprojects/capstone`, not a system package, or run
+     * `capstone_workaround_probe`; see docs/troubleshooting.rst.
+     */
+    if (insn->id == ARM64_INS_SEL && out->n_operands == 3 &&
+        out->operands[0].type == QEMU_PLUGIN_OP_REG &&
+        out->operands[2].type == QEMU_PLUGIN_OP_REG) {
+        out->operands[0].access |= QEMU_PLUGIN_OP_ACC_READ;
+    }
+
+
+    /*
+     * Capstone-6.0.0 LSL/LSR/ASR/ROR alias bug workaround
      * (see cap_aarch64_is_buggy_shift_imm_alias).  When the shape
-     * matches, synthesise the dropped IMM from operands[1].shift.value
-     * so plugins see HAS_IMM and the correct shift count.
+     * matches, synthesise the dropped third operand from
+     * operands[1].shift.
+     *
+     * The shift *type* says how to read shift.value, and both cases
+     * occur here.  For the immediate aliases (`lsl w0, w1, #3`) it is a
+     * shift count and the synthesised operand is an IMM, so plugins see
+     * HAS_IMM and the correct count.  For the REGISTER aliases
+     * (`lsl x2, x1, x9` — LSLV / LSRV / ASRV / RORV) Capstone sets one
+     * of the *_REG shift types and parks the shift-amount REGISTER in
+     * the same field: `lsl x2, x1, x9` yields shift.value == 247 ==
+     * AARCH64_REG_X9.  Reading that as an immediate loses the third
+     * source register from the dependency model AND fabricates a
+     * constant shift of a nonsensical amount, on an instruction
+     * ordinary compiler output emits constantly.  Synthesise a REG
+     * operand in that case, as the header's own note on shift.value
+     * prescribes.
+     *
+     * Verify the register half with `cstool -d arm64 2220c99a` (bytes
+     * `22 20 c9 9a`, `lsl x2,x1,x9`) -- fixed, op_count must be 3 with
+     * operands[2] a REG naming x9.
      */
     if (out->n_operands == 2 &&
         out->n_operands < QEMU_PLUGIN_INSN_DETAIL_MAX_OPS &&
@@ -1435,11 +1711,22 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
         a64->op_count >= 2 &&
         a64->operands[1].shift.type != AARCH64_SFT_INVALID) {
         uint8_t k = out->n_operands;
+        unsigned shift_type = a64->operands[1].shift.type;
+        unsigned shift_val = a64->operands[1].shift.value;
         qemu_plugin_operand *op = &out->operands[k];
         memset(op, 0, sizeof(*op));
-        op->type = QEMU_PLUGIN_OP_IMM;
         op->scale = 1;
-        op->imm = (int64_t)a64->operands[1].shift.value;
+        if (shift_type >= AARCH64_SFT_LSL_REG) {
+            op->type = QEMU_PLUGIN_OP_REG;
+            op->access = QEMU_PLUGIN_OP_ACC_READ;
+            op->reg_id = (uint16_t)shift_val;
+            cap_copy_reg_name(op->reg_name,
+                              QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                              handle, shift_val, CS_ARCH_ARM64);
+        } else {
+            op->type = QEMU_PLUGIN_OP_IMM;
+            op->imm = (int64_t)shift_val;
+        }
         out->n_operands = k + 1;
     }
 }

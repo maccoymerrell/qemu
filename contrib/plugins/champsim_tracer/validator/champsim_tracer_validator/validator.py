@@ -4741,20 +4741,25 @@ def _check_thread_distribution(entries: list[dict],
                                expected_threads: int,
                                templates_by_id: dict | None = None
                                ) -> list[Issue]:
-    """Verify the trace's per-thread entry counts add up sensibly:
-    every expected thread contributed at least one entry, and every
-    observed thread_id that ran USER code was within range
-    [0, expected_threads).
+    """Verify the trace's per-thread entry counts add up sensibly: exactly
+    as many thread ids carried USER code as the traced process has threads.
 
-    @expected_threads bounds the traced *process*'s thread population, and
-    that is a bound on threads with user code.  A system-mode trace may
-    additionally carry kernel-only strands — a kernel thread scheduled onto
-    a borrowed mm passes the address-space gate and executes under the
-    traced process's asid, and it is a genuinely different guest thread, so
-    it carries its own id.  Those are counted and reported, not treated as
-    a population violation; a thread id with even one user entry is held to
-    the bound.  Without @templates_by_id the privilege of an entry cannot
-    be told, so every id is held to the bound (the pre-identity behaviour).
+    @expected_threads is the traced *process*'s thread population, which
+    bounds the threads that run user code and nothing else.  A system-mode
+    trace may additionally carry kernel-only strands: a kernel thread
+    scheduled onto a borrowed mm passes the address-space gate and executes
+    under the traced process's asid, and it is a genuinely different guest
+    thread, so it carries its own id.  Those are counted and reported, not
+    treated as a population violation.
+
+    The assertion is on the COUNT of user-carrying ids, not on their
+    numeric values, because ids are minted in first-sighting order across
+    ALL strands: a kernel thread sighted between a process's two threads
+    takes the id in between, leaving the process on 0 and 2.  That is the
+    format's stated numbering and not a defect, so a value-range test would
+    fail a correct trace.  Without @templates_by_id the privilege of an
+    entry cannot be told, so every id is held to the range instead (the
+    pre-identity behaviour).
     """
     counts: dict[int, int] = {}
     user_counts: dict[int, int] = {}
@@ -4765,32 +4770,58 @@ def _check_thread_distribution(entries: list[dict],
             t = templates_by_id.get(e["template_id"])
             if t is not None and not t.get("is_system"):
                 user_counts[tid] = user_counts.get(tid, 0) + 1
-    if expected_threads > 1:
-        missing = [tid for tid in range(expected_threads)
-                   if counts.get(tid, 0) == 0]
-        if missing:
+
+    if templates_by_id is None:
+        if expected_threads > 1:
+            missing = [tid for tid in range(expected_threads)
+                       if counts.get(tid, 0) == 0]
+            if missing:
+                return [Issue(
+                    "thread_distribution", "error",
+                    f"expected_threads={expected_threads} but threads "
+                    f"{missing} contributed zero entries to the trace",
+                    {"observed_counts": counts, "missing": missing},
+                )]
+        extras = [tid for tid in counts if tid >= expected_threads]
+        if extras:
             return [Issue(
                 "thread_distribution", "error",
-                f"expected_threads={expected_threads} but threads "
-                f"{missing} contributed zero entries to the trace",
-                {"observed_counts": counts, "missing": missing},
+                f"trace contains entries from thread_id(s) >= expected_"
+                f"threads={expected_threads}: {extras}",
+                {"observed_counts": counts,
+                 "expected_threads": expected_threads},
             )]
-    bound = counts if templates_by_id is None else user_counts
-    extras = [tid for tid in bound if tid >= expected_threads]
-    if extras:
+        return [Issue("thread_distribution", "info",
+                      f"per-thread entry counts: {counts}",
+                      {"counts": counts})]
+
+    user_ids = sorted(user_counts)
+    if len(user_ids) > expected_threads:
         return [Issue(
             "thread_distribution", "error",
-            f"trace contains USER entries from thread_id(s) >= expected_"
-            f"threads={expected_threads}: {extras}",
-            {"observed_counts": counts,
+            f"{len(user_ids)} thread ids carried USER entries ({user_ids}) "
+            f"but the traced process has {expected_threads} thread(s) "
+            f"(foreign thread leaked past the pin?)",
+            {"observed_counts": counts, "user_ids": user_ids,
              "expected_threads": expected_threads},
         )]
-    kernel_only = sorted(t for t in counts if t not in bound)
+    if expected_threads > 1 and len(user_ids) < expected_threads:
+        return [Issue(
+            "thread_distribution", "error",
+            f"only {len(user_ids)} thread id(s) carried USER entries "
+            f"({user_ids}) but the traced process has {expected_threads} "
+            f"thread(s); one never reached the trace",
+            {"observed_counts": counts, "user_ids": user_ids,
+             "expected_threads": expected_threads},
+        )]
+    kernel_only = sorted(t for t in counts if t not in user_counts)
     note = (f"; kernel-only strands: {kernel_only}" if kernel_only else "")
     return [Issue(
         "thread_distribution", "info",
-        f"per-thread entry counts: {counts}{note}",
-        {"counts": counts, "kernel_only": kernel_only},
+        f"per-thread entry counts: {counts} (user-carrying ids "
+        f"{user_ids}){note}",
+        {"counts": counts, "user_ids": user_ids,
+         "kernel_only": kernel_only},
     )]
 
 

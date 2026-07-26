@@ -884,7 +884,12 @@ Coverage / WP
    ``wpdepth`` instruction budget).  Threads a
    ``cp_pos_offset`` through when ``--start-symbol`` trimmed the
    prologue so the per-CP-position lookups index against the
-   original CFG.
+   original CFG.  A chain SHORTER than its prediction is accepted only
+   at a real terminator — the depth budget, a privilege-domain crossing,
+   a translation-unavailable boundary, or a whole-path ``wpprune`` —
+   every one of which is a *fetch* condition.  A syscall is not one of
+   them: the wrong path continues past a syscall at its fall-through, so
+   a chain that stops at one is a truncation like any other.
 
 ``indirect_wp_assertion``
    Validates the specific ``indirect_wp_one_target`` /

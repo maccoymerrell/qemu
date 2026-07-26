@@ -741,6 +741,41 @@ Aborting unsandboxable instructions
      side effects would pollute the correct path) nor escalate to a
      triple fault.
 
+Wrong-path syscalls: fetched, never performed
+---------------------------------------------
+
+   The wrong path walks *past* a syscall at its architectural
+   fall-through rather than stopping there (see :doc:`architecture`),
+   which makes it load-bearing that the call is never carried out.  On a
+   discarded path a syscall would otherwise write files, send packets or
+   exit the process in ``*-linux-user``, and run the guest's real kernel
+   entry in system mode.
+
+   In ``*-linux-user`` the suppression is structural.  Every target's
+   syscall instruction leaves TCG through a guest exception, and under
+   ``plugin_spec_mode`` that exception unwinds into
+   ``cpu_plugin_exec_tb``'s own ``sigsetjmp`` landing pad instead of
+   returning to ``cpu_loop()`` — and ``do_syscall()`` is only ever
+   reached from ``cpu_loop()``.  ``linux-user/syscall.c`` carries a
+   barrier at the top of ``do_syscall()`` that makes this a checked
+   invariant rather than an argument: reaching it on a wrong path
+   refuses the call, returns ``-ENOSYS`` to the discarded path, and
+   increments ``qemu_plugin_spec_syscall_blocked``.  A plugin reads that
+   through ``qemu_plugin_spec_syscall_blocked_count()``; the tracer
+   prints it as ``WP host syscalls blocked`` and it reads 0 on a healthy
+   run, so a non-zero value means the unwind grew a hole and the trace
+   ran with real side effects on it.
+
+   System-mode x86 is the one target that does not raise: ``SYSCALL``
+   and ``SYSENTER`` perform the privilege escalation inline in
+   ``helper_syscall`` / ``helper_sysenter``, loading CS/SS and
+   redirecting EIP to LSTAR.  Both now call ``cpu_loop_exit_restore``
+   under ``plugin_spec_mode`` — the same shape ``raise_interrupt2`` uses
+   for a speculative exception — so the wrong path resumes at the
+   fall-through there too, and RCX/R11 keep their pre-syscall values as
+   the deterministic placeholder the walker already applies to a skipped
+   instruction's destinations.
+
 x86 lazy-flags resolution for plugin reads
 ------------------------------------------
 

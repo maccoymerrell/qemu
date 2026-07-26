@@ -2412,7 +2412,12 @@ well: each of its resume PCs — ``start_pc`` and every anchor's instruction PC
 — must be the encoded target of some branch in that context.  Non-final WP
 blocks are cross-checked in-chain against the next chain block's
 ``start_pc``; a block the ``wp_events`` section marks faulting or
-untranslatable ends its strand and is tallied as a diversion.
+untranslatable ends its strand and is tallied as a diversion.  A
+syscall-class block is exempt from that licence and checked strictly: the
+wrong path continues past a syscall at its architectural fall-through, so
+its successor is exactly predictable, and the fault marker it always
+carries (raising is how a syscall leaves speculative execution) does not
+excuse a mismatch.
 
 6. Templates Section
 ~~~~~~~~~~~~~~~~~~~~

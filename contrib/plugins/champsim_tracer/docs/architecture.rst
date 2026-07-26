@@ -1089,11 +1089,27 @@ its own wire semantics.  Consumers should treat them differently:
   absent page is sandboxed rather than faulting, exactly as a
   present-page speculative store is.  A **non-memory** synchronous
   fault (arithmetic / illegal-opcode) still longjmps out of spec mode;
-  it is marked the same way but — pending a value model for its result
-  — ends the chain cleanly at its marked block (the block runs out to
-  its natural branch first, so no partial template is committed).  Such
-  a block is the chain's last, distinguished from a memory fault only
-  by being terminal.
+  it is marked the same way, and the walk skips the faulting
+  instruction and continues at its architectural fall-through, leaving
+  that instruction's destinations stale as the deterministic
+  placeholder its dependents read.
+* **Syscall-class instruction.**  A syscall, software interrupt or
+  unconditional trap (``syscall`` / ``int`` / ``svc`` / ``ecall`` /
+  ``break``) is a control transfer whose taken side is a privilege
+  escalation the single-address-space speculative model cannot follow.
+  That makes the kernel edge *unfollowable*, not *terminal*: an
+  out-of-order frontend fetches straight past a syscall and squashes it
+  at retire, so the excursion takes the other side — the architectural
+  fall-through — exactly as it takes the not-taken side of any other
+  branch.  The block is sealed there (the terminator did end a block)
+  and marked ``fault`` at the syscall, because the call itself is
+  **never performed**: in ``*-linux-user`` the raise unwinds into the
+  plugin's own landing pad rather than into the syscall dispatcher, and
+  in system mode the one target that escalated inline (x86 ``SYSCALL``
+  / ``SYSENTER``) unwinds the same way.  The syscall's result registers
+  therefore hold the deterministic placeholder, and its dependents
+  execute on it.  The exit summary's ``WP host syscalls blocked`` is
+  the standing proof of the suppression and reads 0.
 * **Translation unavailable, mid-chain.**  The *next* wrong-path
   target could not be fetched or translated — un-resident code under
   demand paging is the architectural case.  The last completed

@@ -255,8 +255,12 @@ records.
    * - ``GEN_OP_NOP``
      - No-op (architectural or padding).
    * - ``GEN_OP_SYSCALL``
-     - System call. Pairs with ``branch_type = BRANCH_SYSCALL_TYPE``. In
-       WP simulation, a syscall ends the speculative chain.
+     - System call, software interrupt or unconditional trap. Pairs with
+       ``branch_type = BRANCH_SYSCALL_TYPE``. In WP simulation the chain
+       continues past it at the fall-through; the call is suppressed. A
+       *conditional* trap (MIPS ``teq`` family, x86 ``into`` / ``bound``)
+       is not in this class — it carries no target, so it is a
+       ``GEN_OP_CMP`` that may except.
    * - ``GEN_OP_FENCE``
      - Memory / instruction barrier. Every classifier row that maps to
        ``FENCE`` has ``MF_ATOMIC``, so the resulting insn always sets
@@ -407,13 +411,19 @@ Branch types (``BranchType``)
      - Indirect via return address.  Grouped with
        ``BRANCH_INDIRECT_JUMP`` in WP-target picking — same rule.
    * - ``BRANCH_SYSCALL_TYPE``
-     - System-call-style transfer (``syscall``, ``svc``,
-       ``ecall``).  WP simulation continues *into* the syscall as
-       any other branch, but if the syscall's TB raises a fault
-       (the architectural common case in spec mode) the natural
-       ``ends_in_branch`` test commits the BB and the post-PC
-       poisoning then breaks out of the WP chain.  Speculative
-       state past the syscall is not modeled.
+     - System-call-style transfer: a syscall (``syscall``, ``svc``,
+       ``ecall``), a software interrupt (``int``) or an unconditional
+       trap (``ud2``, ``brk``, ``ebreak``, ``break``) — anything that
+       always transfers to a vector.  Its taken side is a privilege
+       escalation the speculative model cannot follow, so on the wrong
+       path it behaves as an unfollowable taken edge: the block is
+       sealed there and the excursion continues on the NOT-taken side,
+       the architectural fall-through, exactly as for any other branch.
+       The instruction raises (that is how it leaves speculative
+       execution) so the block carries ``CST_WP_EVENT_FAULT`` at it, and
+       the call is never performed — the syscall's result registers hold
+       the deterministic placeholder.  A *conditional* trap has no
+       target and does not belong here; see ``GEN_OP_CMP``.
    * - ``BRANCH_COND_DIRECT``
      - PC-relative conditional.  WP target is the *not-taken*
        static target when CP took the branch (i.e., the

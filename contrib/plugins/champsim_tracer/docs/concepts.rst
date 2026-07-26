@@ -302,8 +302,13 @@ singletons that give its dynamic outcome directly:
 branch), so a consumer recovers direction and target without decoding
 ahead to the successor.  The wrong-path chain models which alternate
 path a misprediction would have entered, bounded by ``wpdepth``
-instructions.  Useful for predictor accuracy, branch-history length
-studies, and BTB capacity work.
+instructions, and it walks *through* a syscall or trap at the
+fall-through rather than stopping there — a real frontend fetches
+around one and squashes it at retire.  A *conditional* trap
+(MIPS ``teq`` family, x86 ``into`` / ``bound``) is not a branch at
+all: it carries no target, nothing predicts it, and the block simply
+runs on through it.  Useful for predictor accuracy, branch-history
+length studies, and BTB capacity work.
 
 **Prefetcher evaluation.**  Software prefetch hints
 (``GEN_OP_PREFETCH``) are surfaced as synthetic loads carrying

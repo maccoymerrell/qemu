@@ -292,11 +292,18 @@ to the incoming task while the outgoing one is still architecturally
 executing.  The window is bounded by that fixed instruction distance and
 is entirely inside kernel scheduler code.
 
-**Sub-instruction WP coverage past faults is limited.**  The WP
-simulator continues *past* in-flight faults on non-branch
-instructions to preserve the "BBs always end in a branch"
-invariant.  But syscall-style branches that fault terminate the
-WP chain — speculative state past the syscall is not modeled.
+**A speculatively fetched syscall is never performed.**  The WP
+simulator walks *past* a syscall, software interrupt or trap at its
+architectural fall-through — an out-of-order frontend fetches around
+one and squashes it at retire — but the call itself is suppressed, so
+its result registers hold the deterministic placeholder rather than a
+real return value.  Dependents of a wrong-path syscall therefore
+execute on synthetic data, which is the same contract every other
+wrong-path fault carries and is marked the same way
+(``CST_WP_EVENT_FAULT`` at the syscall).  What is *not* modelled is the
+kernel side: the trace never contains the handler a wrong-path syscall
+would have entered, because the correct resolution is a privilege
+escalation and no real core commits one on a mispredicted path.
 
 **``total_target_insns = 0`` means "unbounded".**  Non-simpoint
 runs without an explicit ``stop=`` set the header field to zero.

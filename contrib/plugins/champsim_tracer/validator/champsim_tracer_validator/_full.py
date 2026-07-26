@@ -148,6 +148,7 @@ FEATURES: dict[str, str] = {
     "behavior:dc_zva_visible": "aarch64 DC ZVA reaches the memory instrumentation on the correct path and is modelled as the block store it is: its recorded stores tile the DCZID_EL0-sized block exactly instead of vanishing into the helper's host memset, and the instruction declares the store lane that makes them attributable",
     "behavior:string_op_memops": "x86 REP string instructions fan out per architectural iteration with the right per-iteration memop count, and the operand model matches what each instruction really reads and writes (Capstone access-flag corrections in disas/capstone.c)",
     "behavior:reg_snap_accounting": "the plugin's own dropped-slice completeness invariant for the positional reg-snap capture — CP reg-snap slice dropped == CP reg-snap leak trimmed (D4-class completeness oracle; the wire has no record of it, so this is read from the <outfile>.stats.log sidecar, offline via cst_audit --stats-log)",
+    "behavior:mips_fragment_split_absence": "split_tb_into_fragments's mid-TB continuation path (a branch-classified insn QEMU's translator keeps decoding past) has no current MIPS instance — the T-family conditional trap was the only one and 5bf597d751 correctly reclassified it to BRANCH_NONE, leaving x86 BRANCH_REP (X86RepIterationFanout) as the path's sole exerciser; this pins that fact and fails if MIPS regains an un-covered instance",
     "behavior:memop_bimodality": "per-template memop bimodality: a memop-capable template's CP executions overwhelmingly nonzero with a small minority of zero-memop outliers is a completeness loss (D4-class oracle generalised past the segment-final-entry special case; cst_lint.h MemopBimodalityLint + validator.py's mirror, both gating)",
 }
 
@@ -646,6 +647,102 @@ def _chk_branch_verify(ctx: Ctx) -> Outcome:
     tail = "\n".join((p.stdout or p.stderr).splitlines()[-5:])
     return Outcome("pass" if p.returncode == 0 else "fail",
                    f"--verify-branch rc={p.returncode}\n{tail}")
+
+
+def _chk_mips_fragment_split_absence(ctx: Ctx) -> Outcome:
+    """Pin the current MIPS fact behind ``split_tb_into_fragments``'s
+    mid-TB continuation path (see ``behavior:mips_fragment_split_absence``).
+
+    The splitter's "seal a fragment at a branch-classified insn that is
+    NOT the TB's last insn, then keep walking" branch can only ever be
+    exercised by an instruction QEMU's translator itself keeps decoding
+    past despite the tracer classifying it as a branch.  On MIPS the
+    T-family conditional trap (teq/tne/tlt/tltu/tge/tgeu + the immediate
+    forms) was the only such instruction -- ``gen_trap`` emits a
+    conditional TCG branch to a helper call and leaves
+    ``ctx->base.is_jmp`` at ``DISAS_NEXT``, so translation runs straight
+    on.  5bf597d751 correctly reclassified the family as
+    ``GEN_OP_CMP``/``BRANCH_NONE`` (a compare that may except, exactly
+    x86 BOUND's shape) because it never redirects fetch -- which also
+    means MIPS lost its only exercise of this splitter path.  An audit
+    of every remaining MIPS ``branch_type != BRANCH_NONE`` mnemonic
+    against ``target/mips/tcg/translate.c`` (every direct/indirect
+    jump/call/return/conditional branch, and every syscall/unconditional
+    trap) shows each one ends the QEMU TB immediately -- there is
+    currently no other MIPS instruction with the T-family's shape.  x86
+    still exercises the path via ``BRANCH_REP``
+    (``X86RepIterationFanout``, ``rep movsq`` mid-TB).
+
+    Rather than leave that fact undocumented, decode a MIPS trace built
+    with ``--coverage`` (chains in every registered ``coverage_probe``
+    block, including ``MipsInlineConditionalTrap`` -- the regression
+    test for the misclassification itself) and assert the structural
+    invariant that fact implies: no template's instruction list may
+    carry a branch-classified insn anywhere before its last two
+    positions (last = a bare/non-delay-slot terminus; second-to-last =
+    a branch immediately followed by its one architectural delay-slot
+    insn).  A future classification change that gives some MIPS
+    instruction the T-family's shape again -- branch-classified, but
+    QEMU translates past it -- will show up as an earlier occurrence and
+    this check must fail until a dedicated coverage_probe (mirroring
+    X86RepIterationFanout / MipsInlineConditionalTrap) exists to prove
+    the splitter folds it correctly."""
+    from . import __main__ as M
+    from . import _cst_decode_runner as DEC
+    d = ctx.dir("feat_mips_fragsplit")
+    args = _mk(out_dir=d, isa=["mipsel"], build_dir=ctx.build_dir,
+               prog="mfs", seed=ctx.seed, diamonds=8, coverage=True,
+               hot_iters=200, stop=200_000)
+    M.cmd_generate(args, "mipsel")
+    if M.cmd_build(args, "mipsel") != 0:
+        return Outcome("fail", "build failed")
+    if M.cmd_trace(args, "mipsel") != 0:
+        return Outcome("fail", "trace failed")
+    cst = d / "mfs_mipsel.cst"
+    old_decode_env = os.environ.get("CST_DECODE")
+    os.environ["CST_DECODE"] = str(ctx.build_dir / "contrib/plugins/cst_decode")
+    try:
+        meta, templates, _entries = DEC.decode_champsim_tracer(cst)
+    finally:
+        if old_decode_env is None:
+            os.environ.pop("CST_DECODE", None)
+        else:
+            os.environ["CST_DECODE"] = old_decode_env
+
+    none_id = 0
+    for bid, name in (meta.get("branch_names") or {}).items():
+        if name == "NONE":
+            none_id = int(bid)
+            break
+
+    violations = []
+    for t in templates:
+        insns = t.get("insns") or []
+        n = len(insns)
+        for i, insn in enumerate(insns):
+            if i >= n - 2:
+                continue        # last two positions: bare or delay-slot pair
+            if int(insn.get("branch_type", none_id)) != none_id:
+                violations.append((t.get("template_id"), i, n))
+
+    if violations:
+        tid, i, n = violations[0]
+        return Outcome(
+            "fail",
+            f"{len(violations)} MIPS template insn(s) carry a "
+            f"branch-classified insn before the last 2 positions of "
+            f"their fragment (e.g. template {tid} insn {i}/{n}) -- MIPS "
+            f"has regained an instruction shaped like the old teq "
+            f"misclassification (QEMU translates past a "
+            f"branch-classified insn) with no dedicated coverage_probe; "
+            f"add one (see X86RepIterationFanout / "
+            f"MipsInlineConditionalTrap in asm_blocks.py) before "
+            f"relaxing this check")
+    return Outcome(
+        "pass",
+        f"{len(templates)} mipsel templates audited, 0 mid-fragment "
+        f"branch-classified insns -- matches the current MIPS ISA fact "
+        f"(the teq family was the only case; 5bf597d751 fixed it)")
 
 
 def _chk_physaddr(ctx: Ctx) -> Outcome:
@@ -1421,6 +1518,12 @@ def build_checks() -> list:
                    ["tool:cst_decode_verify_branch",
                     "wire:FID_branch_taken", "wire:FID_branch_target"],
                    _chk_branch_verify))
+    C.append(Check("features.mips_fragment_split_absence", "features",
+                   "split_tb_into_fragments mid-TB continuation path: "
+                   "MIPS has no current instance (teq family fixed by "
+                   "5bf597d751); fails if one regains it un-covered",
+                   ["behavior:mips_fragment_split_absence"],
+                   _chk_mips_fragment_split_absence))
     C.append(Check("features.physaddr", "features",
                    "per-memop physical-page capture (system)",
                    ["opt:physaddr", "wire:FLAG_PHYSADDR", "wire:FID_ppage"],

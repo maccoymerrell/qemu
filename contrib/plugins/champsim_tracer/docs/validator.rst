@@ -414,7 +414,7 @@ outside the repo as standalone scripts):
    sensitive; the trace well-formedness assertions still run once it
    closes.
 
-**features** — 13 checks.  Plugin options and wire records that no
+**features** — 14 checks.  Plugin options and wire records that no
 ``quick`` / ``system`` / ``multiproc`` check happens to exercise:
 
 ``features.simpoint``
@@ -608,6 +608,38 @@ outside the repo as standalone scripts):
    the discriminator directly, covering the extent-only branch
    (byte-identical overlap, different extent — must not mint) that no
    guest workload can reach.
+``features.mips_fragment_split_absence``
+   Pins the current fact behind ``split_tb_into_fragments``'s mid-TB
+   continuation path (the splitter branch that seals a fragment at a
+   branch-classified insn that is NOT the owning TB's last insn, then
+   keeps walking): on MIPS there is currently no instruction that
+   exercises it.  The MIPS T-family conditional trap
+   (``teq``/``tne``/``tlt``/``tltu``/``tge``/``tgeu`` and the
+   immediate forms) was the only one — ``gen_trap`` in
+   ``target/mips/tcg/translate.c`` emits a conditional TCG branch to a
+   helper and leaves translation running straight on, so QEMU
+   literally keeps decoding past an insn the tracer classified as a
+   branch — until ``5bf597d751`` correctly reclassified the family as
+   ``GEN_OP_CMP``/``BRANCH_NONE`` (a compare that may except, the same
+   shape x86 ``BOUND`` has; see ``features.reg_snap_accounting``
+   above for the 188,726-block cost of the old misclassification on
+   the ``mcf_user_mipsel`` sample).  That fix also removed MIPS's only
+   exercise of this splitter path — x86 still covers it via
+   ``BRANCH_REP`` (``X86RepIterationFanout``, ``rep movsq`` mid-TB;
+   see ``features.string_memops`` above).  Rather than leave the
+   MIPS absence undocumented, this check decodes a ``--coverage``
+   mipsel trace (chains in every registered ``coverage_probe`` block,
+   including ``MipsInlineConditionalTrap`` — the regression test for
+   the misclassification itself) and asserts that no template's
+   instruction list carries a branch-classified insn anywhere before
+   its last two positions (last = a bare terminus; second-to-last = a
+   branch immediately followed by its one architectural delay-slot
+   insn).  A future classification change that gives some MIPS
+   instruction the T-family's shape again will surface as an earlier
+   occurrence, and this check fails until a dedicated
+   ``coverage_probe`` (mirroring ``X86RepIterationFanout`` /
+   ``MipsInlineConditionalTrap``) exists to prove the splitter folds
+   it correctly.
 
 .. _validator-mutation:
 

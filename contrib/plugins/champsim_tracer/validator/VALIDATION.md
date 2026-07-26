@@ -104,13 +104,49 @@ RED.  Currently:
   (metaflags parity, regdata dst snapshots).  Non-gating until the plugin
   fix lands; `system.churn_*` and `system.thread_x86` keep the marker/pin
   machinery as hard gates and claim those features in the coverage map.
-* `multiproc.dead_latch_x86` — dead-latch aging is wall-clock/scheduling
-  sensitive (detector vs. poweroff backstop) and the boot is hard-capped;
-  non-gating so contention can't wedge or false-RED it.
 * `multiproc.trace_all_x86` — trace-all peer capture depends on the guest
   scheduling the unmarked peer *inside* the marked window; non-gating as a
   contention safety net (it is otherwise a hard 6/6 with the ordered
   launch, and the latch-differential half always asserts).
+
+### Dead-latch determinism
+
+`multiproc.dead_latch_x86` is a hard gate, not an XFAIL, even though the
+detector it exercises is unavoidably wall-clock driven:
+`deadlatch_now_ms()` reads `CLOCK_MONOTONIC` by design (real host time is
+the only clock that keeps advancing once every owned process has died —
+see the comment on `g_latch_timeout_ms` in `champsim_tracer.cc`), so the
+mechanism itself cannot be reworked onto guest virtual time without
+changing what it is.  What made the check flaky was not that wall clock —
+it was pitting a 3-second `latch_timeout` against an unrelated,
+comparably-sized budget (progA's own runtime plus a post-kill churn
+loop): whether that budget finished in more or less than ~3s of real time
+was a coin flip under host contention.
+
+`run_x86_dead_latch_kill` shrinks `latch_timeout` to 750ms, a value
+picked empirically rather than guessed: an earlier attempt at 25ms
+measured `idle=97ms` and falsely aged out a still-alive process seconds
+into boot, because ordinary two/three-way scheduling contention between
+progA, progB and the init shell routinely opens gaps close to the guest
+kernel's scheduling quantum — real scheduler jitter, not death. 750ms
+clears that jitter with comfortable headroom (observed `idle=1393ms` for
+the genuinely-killed peer in the same scenario) while staying far below
+what progA's run plus the churn loop reliably takes, and it cannot
+falsely age out a *live* root either way: `deadlatch_clock_check()`
+refreshes the running root's own timestamp on every throttled call, so
+only a root that is never scheduled again goes stale.
+
+The check's assertions are also causal now, not just "a trace exists".
+Subcheck 1 does not depend on the guest's own "killed B" echo reaching
+the console — qemu exits the instant the trace's last window closes
+(`deadlatch_close_segment`'s "caller should exit(0)"), and that abrupt
+teardown can beat the guest's still-buffered serial-console bytes to
+being drained, losing output the guest already produced.  Instead it
+reads the plugin's own host-stderr line ("marker opened additional
+window for asid ... (2 owned)", never routed through the guest UART) to
+confirm B was genuinely alive and under active tracing before it died.
+Subcheck 2 then cross-checks that the *same* asid is the one the
+dead-latch detector later closes.
 
 ### System-mode guest CPU
 

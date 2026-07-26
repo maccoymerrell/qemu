@@ -1498,16 +1498,12 @@ def build_checks() -> list:
                    "narrow-ASID two-process latch + recycle (mipsel)",
                    ["behavior:asid_recycle"], _chk_mips_latch))
     C.append(Check("multiproc.dead_latch_x86", "multiproc",
-                   "dead-latch ages a killed peer's window out (x86)",
+                   "dead-latch ages a killed peer's window out (x86), "
+                   "proven causally via the detector's own log line, "
+                   "at a threshold (latch_timeout=750ms) picked to clear "
+                   "guest scheduling jitter without racing progA's runtime",
                    ["opt:latch_timeout", "behavior:dead_latch"],
-                   _chk_dead_latch,
-                   known_issue=(
-                       "dead-latch aging is wall-clock/scheduling sensitive: "
-                       "whether the killed peer's window is aged out by the "
-                       "detector vs. the guest's poweroff backstop varies with "
-                       "host load, and the boot is hard-capped at 180s.  "
-                       "Non-gating to avoid a false RED / a hang; the trace "
-                       "well-formedness assertions still run when it closes.")))
+                   _chk_dead_latch))
 
     C.append(Check("features.simpoint", "features",
                    "per-simpoint segment independence + consistency",

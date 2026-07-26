@@ -409,10 +409,17 @@ outside the repo as standalone scripts):
 ``multiproc.dead_latch_x86``
    A marked peer is ``kill -9``'d mid-window with no END marker; the
    dead-latch detector must age it out so the segment still closes
-   cleanly.  **Non-gating** — whether the detector or the guest's
-   poweroff backstop closes the window first is wall-clock/scheduling
-   sensitive; the trace well-formedness assertions still run once it
-   closes.
+   cleanly.  ``latch_timeout=750ms`` — small enough that ordinary
+   guest scheduling contention can never be mistaken for the timeout
+   racing progA's own runtime (the old 3000ms default's failure mode),
+   large enough that live-root scheduling jitter can never be
+   mistaken for death.  The assertions are causal: the plugin's own
+   "marker opened additional window ... (2 owned)" stderr line (never
+   routed through the guest UART, so it survives the abrupt
+   ``exit(0)`` that follows the last window closing) proves the peer
+   was genuinely alive before it died, and the "dead-latch close"
+   line is checked against that *same* asid.  See "Dead-latch
+   determinism" in ``VALIDATION.md`` for the full design rationale.
 
 **features** — 14 checks.  Plugin options and wire records that no
 ``quick`` / ``system`` / ``multiproc`` check happens to exercise:

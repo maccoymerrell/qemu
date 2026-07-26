@@ -650,8 +650,54 @@ def run_mips_latch(cfg: MPConfig) -> MPResult:
 # scenario 3: x86 dead-latch kill (peer killed mid-window, no END)
 # ---------------------------------------------------------------------------
 
-def run_x86_dead_latch_kill(cfg: MPConfig, latch_timeout: int = 3000,
+def run_x86_dead_latch_kill(cfg: MPConfig, latch_timeout: int = 750,
                             kill_after: int = 2, churn: int = 60) -> MPResult:
+    """Kill progB mid-window (no END marker) and prove the dead-latch
+    detector -- not some other backstop -- is what closes its window.
+
+    ``latch_timeout`` (ms) is deliberately small, not the ~3s a human
+    would reach for.  ``deadlatch_now_ms()`` is unavoidably
+    ``CLOCK_MONOTONIC`` (real host wall time is the only clock that
+    keeps advancing once every owned process has died -- see the
+    comment on ``g_latch_timeout_ms`` in champsim_tracer.cc), so the
+    detector's firing genuinely is wall-clock driven and cannot be
+    made to run on guest virtual time.  What made the OLD 3000ms
+    default flaky was pitting that wall clock against an unrelated,
+    comparably-sized budget: whether progA's own run plus the
+    post-kill churn loop took more or less than ~3s of REAL time was a
+    coin flip under host contention, and a fast/quiet host could reach
+    "last window closes" before the timeout ever elapsed.
+
+    750ms was picked empirically, not guessed: an earlier attempt at
+    25ms (a couple of TCG-instrumented instructions' worth of wall
+    time, in theory "thousands of instructions of headroom") measured
+    idle=97ms and FALSELY aged out a still-alive process seconds into
+    boot -- ordinary two-and-three-way scheduling contention between
+    progA, progB and the init shell routinely opens gaps close to a
+    guest kernel's scheduling quantum, which is real, guest-scheduler-
+    driven wall-clock jitter, not death.  750ms clears that jitter
+    with headroom (observed idle=1393ms for the genuinely-killed peer
+    in the same scenario) while staying far below what progA's own
+    run + the churn loop reliably takes.  It cannot falsely age out a
+    LIVE root either way -- deadlatch_clock_check() refreshes the
+    running root's own timestamp on every throttled call, so only a
+    root that is never scheduled again (the actually-dead one) can go
+    stale.
+
+    Subcheck 1 deliberately does NOT depend on the guest's own "killed
+    B" echo reaching the console: qemu exits the instant the trace's
+    last window closes (deadlatch_close_segment's "caller should
+    exit(0)"), and that abrupt teardown can beat the guest's
+    still-buffered serial-console bytes to being drained -- losing
+    output the guest already produced, not evidence it never ran.
+    "marker opened additional window for asid ... (2 owned)" is the
+    plugin's OWN host-stderr line (unbuffered, never routed through
+    the guest UART) and is what proves B was genuinely alive and under
+    active tracing before it died.  Subcheck 2 then cross-checks that
+    THE SAME asid is the one the dead-latch detector later closes --
+    causal proof, not just "a trace exists" (which is all the old
+    version checked, so it could pass without ever proving its own
+    headline claim)."""
     isa = "x86_64"
     skip = _preconditions(cfg, isa)
     if skip:
@@ -659,9 +705,9 @@ def run_x86_dead_latch_kill(cfg: MPConfig, latch_timeout: int = 3000,
                         skip_reason=skip)
     od = cfg.out_dir
     od.mkdir(parents=True, exist_ok=True)
-    # progA: modest hold (< latch_timeout) then a long-enough active phase
-    # to outlast progB's dead-latch timeout; progB: marks + sleeps long, is
-    # killed mid-sleep (never runs its END).
+    # progA: modest hold then a long-enough active phase to keep driving
+    # deadlatch_clock_check() well past progB's (tiny) timeout; progB:
+    # marks + sleeps long, is killed mid-sleep (never runs its END).
     bin_a = _gen_build(isa, "progA", cfg.seed_a, 6, 800, 1, True, od / "A")
     bin_b = _gen_build(isa, "progB", cfg.seed_b, 8, 800, 12, True, od / "B")
     init = _INIT_KILL % {"kill_after": kill_after, "churn": churn}
@@ -675,31 +721,56 @@ def run_x86_dead_latch_kill(cfg: MPConfig, latch_timeout: int = 3000,
     ctext = console.read_text(errors="replace") if console.exists() else ""
     subs: list = []
     if rc == 124:
-        # Boot hit the wall-clock cap before the dead-latch aged the killed
-        # peer's window out (scheduling-sensitive under load).  Report it
-        # without decoding the truncated trace; the check is non-gating.
+        # At this threshold the boot cap means the guest never reached the
+        # kill/churn phase at all (e.g. a wedged kernel boot) -- a real
+        # failure, not aging-lost-the-race.  Gating: report it as such.
         subs.append(SubCheck(
             "dead-latch closed the segment within the boot cap", False,
-            f"boot exceeded {cfg.boot_timeout_s}s cap "
-            f"(killed B={'killed B' in ctext}); aging did not close in time"))
+            f"boot exceeded {cfg.boot_timeout_s}s cap; the guest never "
+            f"reached poweroff -- not a timing race at this threshold"))
         return _emit("x86 dead-latch kill", subs)
+
+    # Subcheck 1 deliberately does NOT grep for the guest's own "killed B"
+    # echo: qemu exits the instant the trace's last window closes (see
+    # deadlatch_close_segment's "caller should exit(0)"), which can beat
+    # the abrupt process teardown to draining the guest's still-buffered
+    # serial-console bytes -- losing output the guest already executed,
+    # not a sign it never ran.  "marker opened additional window for asid
+    # ... (2 owned)" is the plugin's OWN host-stderr line (unbuffered, not
+    # routed through the guest UART at all) confirming B was genuinely
+    # alive and under active tracing before it died -- a reliable proxy
+    # for the same fact the echo was meant to show.
+    open_re = re.compile(
+        r"marker opened additional window for asid (0x[0-9a-fA-F]+) "
+        r"\((\d+) owned\)")
+    open_m = open_re.search(ctext)
     subs.append(SubCheck(
-        "1. peer killed mid-window (no END marker)",
-        "killed B" in ctext,
-        "guest reported the kill -9" if "killed B" in ctext
-        else "guest never reported the kill"))
+        "1. peer B was alive and under active tracing before it died",
+        bool(open_m) and open_m.group(2) == "2",
+        f"opened: {open_m.group(0)}" if open_m
+        else "no second owned window ever opened"))
+
+    dl_lines = [ln for ln in ctext.splitlines() if "dead-latch close" in ln]
+    dl_re = re.compile(r"dead-latch close asid=(0x[0-9a-fA-F]+)")
+    dl_asids = {m.group(1) for ln in dl_lines
+               for m in [dl_re.search(ln)] if m}
+    same_asid = bool(open_m) and open_m.group(1) in dl_asids
     subs.append(SubCheck(
-        "2. dead-latch closed the segment: qemu exited, trace present",
-        rc == 0 and cst.exists(),
+        "2. dead-latch detector itself closed THAT SAME peer's window "
+        "(causal, not just 'a trace exists')",
+        rc == 0 and cst.exists() and same_asid,
         f"qemu_rc={rc} cst={'exists' if cst.exists() else 'MISSING'} "
-        f"(hang-to-budget or timeout would leave rc!=0 / no clean exit)"))
+        f"opened_asid={open_m.group(1) if open_m else None} "
+        f"dead_latch_asids={sorted(dl_asids)}"))
+
     if cst.exists():
         idents = _raw_identities(cfg, cst)
         ok_audit, asum = _audit_clean(cfg, cst)
         src = _strict_rc(cfg, cst)
         subs.append(SubCheck(
-            "3. surviving process (progA) attributed; trace well-formed",
-            len(idents) >= 1 and ok_audit and src == 0,
+            "3. both processes attributed (killed peer traced up to its "
+            "death, survivor traced throughout); trace well-formed",
+            len(idents) == 2 and ok_audit and src == 0,
             f"asid_idx={sorted(idents)} strict_rc={src} audit[{asum}]"))
     else:
         subs.append(SubCheck("3. trace well-formed", False, "no trace"))

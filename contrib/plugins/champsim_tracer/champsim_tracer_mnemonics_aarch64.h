@@ -5047,7 +5047,7 @@ static const InsnClassification aarch64_insn_class[AARCH64_INS_ENDING] = {
                                         .dep_refine = dep_all_to_all,
                                         .lane_mask_kind = LANE_MASK_KIND_STATIC,
                                         .lane_parallel = true },
-    [AARCH64_INS_UDF]                     = { .opcode = GEN_OP_NOP,    .branch_type = BRANCH_NONE,           .flags = MF_NONE,
+    [AARCH64_INS_UDF]                     = { .opcode = GEN_OP_SYSCALL, .branch_type = BRANCH_SYSCALL_TYPE,   .flags = MF_NONE,
                                         .dep_refine = dep_all_to_all },
     [AARCH64_INS_UDIVR]                   = { .opcode = GEN_OP_INT_DIV, .branch_type = BRANCH_NONE,           .flags = MF_NONE,
                                         .dep_refine = dep_all_to_all,

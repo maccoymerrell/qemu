@@ -2144,9 +2144,28 @@ def classify_x86(m: str) -> Entry:
         return ent("GEN_OP_BRANCH", "BRANCH_DIRECT_CALL")
     if m.startswith("ret") or m.startswith("iret"):
         return ent("GEN_OP_RET", "BRANCH_RETURN")
-    if m in {"syscall", "sysenter", "sysexit", "int", "int1", "int3", "into", "vmcall", "vmmcall"}:
+    # Trap taxonomy (see the identical rules in the other classify_* below).
+    # Three behaviours hide under "trap", and only the first two redirect fetch:
+    #   syscall           -- a deliberate call into the kernel; always transfers.
+    #   unconditional trap -- always raises (ud2, int3, brk, ebreak, break).
+    #                        Fetch diverts to a vector every time, so it ends a
+    #                        block exactly as a syscall does.
+    #   CONDITIONAL trap   -- raises only when its condition holds, and carries
+    #                        no target field: nothing to fetch, no prediction to
+    #                        make, so the front end simply runs on to the next
+    #                        instruction.  It is a compare that may except, and
+    #                        is classified as one -- the same GEN_OP_CMP /
+    #                        BRANCH_NONE that BOUND has always had.  Typing it
+    #                        as an unconditional transfer instead seals a block
+    #                        at an edge nothing can walk, which is how MIPS's
+    #                        divide-by-zero guards became degenerate one-
+    #                        instruction blocks with no wrong path at all.  When
+    #                        one does fire, it is an exception, and the fault
+    #                        machinery models it as such.
+    if m in {"syscall", "sysenter", "sysexit", "int", "int1", "int3", "vmcall", "vmmcall",
+             "ud0", "ud1", "ud2"}:
         return ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE")
-    if m in {"ud0", "ud1", "ud2", "hlt", "cpuid", "rdtsc", "rdtscp", "xgetbv", "xsetbv", "endbr32", "endbr64", "wait", "clc", "cld", "cli", "sti", "clac", "stac", "clts", "cmc", "stc", "std", "pause", "rdsspq", "clgi", "getsec", "pconfig", "rsm", "skinit", "stgi", "swapgs", "encls", "enclu", "enclv", "emms", "data16", "lock", "rep", "repne", "rex64", "xacquire", "xrelease"}:
+    if m in {"hlt", "cpuid", "rdtsc", "rdtscp", "xgetbv", "xsetbv", "endbr32", "endbr64", "wait", "clc", "cld", "cli", "sti", "clac", "stac", "clts", "cmc", "stc", "std", "pause", "rdsspq", "clgi", "getsec", "pconfig", "rsm", "skinit", "stgi", "swapgs", "encls", "enclu", "enclv", "emms", "data16", "lock", "rep", "repne", "rex64", "xacquire", "xrelease"}:
         return ent("GEN_OP_NOP")
     if m.startswith("prefetch"):
         return ent("GEN_OP_PREFETCH")
@@ -2232,7 +2251,10 @@ def classify_x86(m: str) -> Entry:
         return ent("GEN_OP_LOAD")
     if m.startswith("bndstx"):
         return ent("GEN_OP_STORE")
-    if m.startswith(("bndcl", "bndcu", "bndcn", "bound", "arpl")):
+    # Conditional traps: INTO raises only when OF is set, BOUND only when the
+    # index is out of range.  Compares that may except -- see the taxonomy note
+    # above.
+    if m in {"into"} or m.startswith(("bndcl", "bndcu", "bndcn", "bound", "arpl")):
         return ent("GEN_OP_CMP")
     if m.startswith(("bndmk", "bndmov", "lar", "lsl", "lahf", "sahf", "lwpins", "lwpval", "rdfsbase", "rdgsbase", "rdrand", "rdseed", "rdpid", "rdpkru", "rdsspd", "saveprevssp", "wrfsbase", "wrgsbase", "wrmsr", "wrpkru")):
         return ent("GEN_OP_MOV")
@@ -2500,9 +2522,12 @@ def classify_aarch64(m: str) -> Entry:
         return ent("GEN_OP_BRANCH", "BRANCH_INDIRECT_JUMP")
     if m.startswith("ret") or m.startswith("eret"):
         return ent("GEN_OP_RET", "BRANCH_RETURN")
-    if m in {"svc", "hvc", "smc", "brk", "hlt", "dcps1", "dcps2", "dcps3"}:
+    # Syscalls (svc/hvc/smc/dcps) and unconditional traps (brk/hlt/udf): both
+    # always transfer to a vector, so both end a block.  AArch64 has no
+    # conditional trap.  See the taxonomy note in classify_x86.
+    if m in {"svc", "hvc", "smc", "brk", "hlt", "udf", "dcps1", "dcps2", "dcps3"}:
         return ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE")
-    if m in {"nop", "hint", "wfe", "wfi", "wfet", "wfit", "sev", "sevl", "yield", "xaflag", "axflag", "cfinv", "gmi", "irg", "rmif", "udf"}:
+    if m in {"nop", "hint", "wfe", "wfi", "wfet", "wfit", "sev", "sevl", "yield", "xaflag", "axflag", "cfinv", "gmi", "irg", "rmif"}:
         return ent("GEN_OP_NOP")
     if m in {"dmb", "dsb", "isb", "sb", "csdb", "psb", "tsb", "clrex", "sdsb"}:
         return ent("GEN_OP_FENCE", flags="MF_ATOMIC")
@@ -2747,7 +2772,10 @@ def classify_riscv(m: str) -> Entry:
         return ent("GEN_OP_BRANCH", "BRANCH_INDIRECT_CALL")
     if m in {"c_jr"}:
         return ent("GEN_OP_BRANCH", "BRANCH_INDIRECT_JUMP")
-    if m in {"ecall", "ebreak", "c_ebreak"}:
+    # ECALL is the syscall; EBREAK and the all-zeros/all-ones UNIMP encodings
+    # are unconditional traps (they raise every time).  RISC-V has no
+    # conditional trap.  See the taxonomy note in classify_x86.
+    if m in {"ecall", "ebreak", "c_ebreak", "unimp", "c_unimp"}:
         return ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE")
     if m in {"mret", "sret", "uret", "dret"}:
         return ent("GEN_OP_RET", "BRANCH_RETURN")
@@ -2755,7 +2783,7 @@ def classify_riscv(m: str) -> Entry:
         return ent("GEN_OP_TLB_FLUSH", flags="MF_ATOMIC")
     if m.startswith(("fence", "sfence", "hfence")):
         return ent("GEN_OP_FENCE", flags="MF_ATOMIC")
-    if m in {"wfi", "unimp", "c_unimp", "pause", "c_nop"} or m.startswith(("mop_", "cmop_")):
+    if m in {"wfi", "pause", "c_nop"} or m.startswith(("mop_", "cmop_")):
         return ent("GEN_OP_NOP")
     if m in {"call", "tail"}:
         return ent("GEN_OP_BRANCH", "BRANCH_DIRECT_CALL")
@@ -3041,7 +3069,15 @@ def classify_mips(m: str) -> Entry:
         return ent("GEN_OP_BRANCH", "BRANCH_COND_DIRECT")
     if m in {"eret", "eretnc", "deret"}:
         return ent("GEN_OP_RET", "BRANCH_RETURN")
-    if m.startswith(("syscall", "break", "hypcall", "sdbbp", "sigrie", "teq", "tge", "tgeu", "tlt", "tltu", "tne")):
+    # Conditional traps: the T-family raises only when its comparison holds and
+    # has no target field, so fetch runs straight on to the next instruction.
+    # Compares that may except -- see the taxonomy note in classify_x86.  Listed
+    # exactly rather than by prefix so tlb*/tlbg* keep their own rules.
+    if m in {"teq", "tne", "tlt", "tltu", "tge", "tgeu",
+             "teqi", "tnei", "tlti", "tltiu", "tgei", "tgeiu"}:
+        return ent("GEN_OP_CMP")
+    # Syscalls (syscall/hypcall) and unconditional traps (break/sdbbp/sigrie).
+    if m.startswith(("syscall", "break", "hypcall", "sdbbp", "sigrie")):
         return ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE")
     if m.startswith(("sync", "synci", "pause", "wait", "yield")):
         return ent("GEN_OP_FENCE", flags="MF_ATOMIC")

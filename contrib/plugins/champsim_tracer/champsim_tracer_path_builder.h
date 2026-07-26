@@ -460,6 +460,13 @@ private:
      * so the trailer counts our own frames instead.  raw_depth_ tracks
      * depth_after of the last fault event for the CST_DEPTH_DIAG log only. */
     uint32_t depth_next_ = 0;
+
+    /* Stamp cur's fault depth (and the faults=0 sync-span flag) from the
+     * CURRENT frame ledger.  Called twice per seal — after the event drain
+     * and again after the seal walk's merge completions retire frames — so a
+     * block following a reassembled faulting BB carries the post-unwind
+     * depth.  See the definition for why the second call is load-bearing. */
+    void stamp_cur_depth(const StepIn &in);
     uint32_t raw_depth_ = 0;
 
     /* Captured asynchronous-interrupt depth (interrupts=1 only).  QEMU emits

@@ -1741,6 +1741,69 @@ void PathBuilder::retire_suspension(size_t idx, unsigned int cpu_index)
     }
 }
 
+/*
+ * Stamp the depth cur (already promoted by step_events) runs at, and with it
+ * the synchronous-fault-span flag the faults=0 handler suppression reads.
+ *
+ * The depth is the pinned process's OWN un-returned merge-frame count, so it
+ * is a function of frames_ AT THE MOMENT OF THE STAMP — and step_seal moves
+ * frames_ twice: the event drain at its head pushes/returns frames, and the
+ * seal walk at its tail RETIRES them (complete_merge erases the completing
+ * frame and flushes any deeper ones).  Both movements bracket cur, so the
+ * stamp is taken at the head AND re-taken after the walk.
+ *
+ * The re-stamp is the fix for the residual syscall_fault_nesting depth-JUMP.
+ * A completion proves the excursion is over: the resume suffix only executes
+ * after the exception return, so the block that follows the reassembled
+ * faulting BB is at the POST-unwind depth.  Stamping it only at the head gave
+ * it the PRE-completion count, and whenever a frame's FAULT_RETURN had been
+ * suppressed (QEMU's strict-LIFO cpu_plugin_fault_pop drops a pinned frame's
+ * return when a foreign churn frame sits above it on the shared per-vCPU
+ * stack, so the frame is still flagged un-returned when its merge completes)
+ * that count was too high — by one per suppressed frame.  With two such
+ * frames (a nested fault: the copy_user BB, then a fault inside its handler)
+ * the single block after the merge emitted at depth 2 between depth-0
+ * neighbours: the observed 0 -> 2 -> 0 spike.
+ *
+ * Byte-inert wherever the returns are observed: apply_fault_return has
+ * already cleared `returned` for the completing frames, so they were never
+ * counted and the re-stamp reproduces the head's value exactly.  Only the
+ * suppressed-return case, which is the bug, changes.
+ */
+void PathBuilder::stamp_cur_depth(const StepIn &in)
+{
+    uint32_t pinned_inflight = 0;
+    for (const CtxFrame &f : frames_) {
+        if (!f.returned) {
+            pinned_inflight++;
+        }
+    }
+    depth_next_ = pinned_inflight + async_captured_;
+    /* User-privilege TBs stamp depth 0 regardless of the vCPU's raw
+     * fault-stack depth: user code is never fault-handler content, but a
+     * preemptible kernel can context-switch INSIDE a blocking fault handler
+     * (cond_resched in the fault path) and resume another guest thread's user
+     * code while the interrupted task's fault frames are still live on this
+     * vCPU's stack — without the clamp those user entries would carry the
+     * interrupted excursion's depth (observed: depth-4 user loop blocks under
+     * a two-thread yield workload).  The other thread's KERNEL work keeps the
+     * raw-baselined depth — the per-vCPU stack cannot attribute frames per
+     * guest thread, an accepted approximation. */
+    prev_depth_ = (in.pinned && in.live_priv == 0) ? 0 : depth_next_;
+    /* Synchronous-fault-span stamp (faults=0 handler suppression): true when
+     * cur runs while an un-returned synchronous-fault frame is in flight and
+     * cur is not user code.  A user TB is never handler content, so it stamps
+     * false, mirroring the depth clamp above. */
+    prev_in_sync_ = (in.pinned && in.live_priv == 0)
+                        ? false
+                        : (depth_next_ - async_captured_) > 0;
+    g_dbg_prev_depth_src = CST_PDSRC_SEAL;
+    g_dbg_prev_depth = prev_depth_;
+    g_dbg_inflight = pinned_inflight;
+    g_dbg_depth_next = depth_next_;
+    g_dbg_frames = frames_.size();
+}
+
 PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
                                                BodyStreamState *out_stream)
 {
@@ -1989,17 +2052,7 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
      * other thread's KERNEL work keeps the raw-baselined depth — the
      * per-vCPU stack cannot attribute frames per guest thread, an
      * accepted approximation. */
-    prev_depth_ = (in.pinned && in.live_priv == 0) ? 0 : depth_next_;
-    g_dbg_prev_depth_src = CST_PDSRC_SEAL;
-    g_dbg_prev_depth = prev_depth_;
-    /* Synchronous-fault-span stamp (faults=0 handler suppression): true when
-     * cur runs while an un-returned synchronous-fault frame is in flight and
-     * cur is not user code.  pinned_inflight == depth_next_ - async_captured_
-     * (both members); a user TB is never handler content, so it stamps false,
-     * mirroring the depth clamp above. */
-    prev_in_sync_ = (in.pinned && in.live_priv == 0)
-                        ? false
-                        : (depth_next_ - async_captured_) > 0;
+    stamp_cur_depth(in);
     /* faults=0: suspend capture across the synchronous-fault handler exactly
      * as the async mute does — the handler's memops / reg snaps never pool
      * into the interrupted block's slots, and its BB is dropped at the seal
@@ -2069,8 +2122,13 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
                 mtop, frames_.size());
     }
     if (mtop >= 0) {
-        return complete_merge((size_t)mtop, pending_emits, out_stream,
-                              in.cpu_index);
+        StepStatus st = complete_merge((size_t)mtop, pending_emits, out_stream,
+                                       in.cpu_index);
+        /* The merge just RETIRED this excursion's frames.  cur is the block
+         * the pinned process runs AFTER the faulting BB reassembled, so it
+         * is at the post-unwind depth — re-stamp it (see stamp_cur_depth). */
+        stamp_cur_depth(in);
+        return st;
     }
 
     if (!any_finalize) {

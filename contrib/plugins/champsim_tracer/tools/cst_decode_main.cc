@@ -631,6 +631,58 @@ inline uint64_t lane_at(const std::vector<uint64_t> &v, size_t i)
     return i < v.size() ? v[i] : 0;
 }
 
+/* Render load_data slot @k as "ld[<addr_inputs>](addr){lanes}", sized
+ * off the matching HAS_ADDR mask, the dynamic address (when available),
+ * and the load-data lane set (when --show-lanes).  An address mask in
+ * HAS_ADDR has the layout bits [0, n_src) src, bit n_src imm (no
+ * load_data — addresses are computed before any load fires).  Mirrors
+ * render_store_sink; shared by the input pool and by the trailing
+ * memop column, so a load prints the same way wherever it surfaces. */
+std::string render_load_source(const DisasmContext &ctx,
+                               const cst::Instruction &insn,
+                               unsigned k,
+                               const std::vector<uint64_t> &load_addrs,
+                               bool have_load_addrs)
+{
+    auto reg_str = [&](uint8_t r) {
+        std::string sx;
+        append_regref(&sx, ctx, r);
+        return sx;
+    };
+    std::string s = "ld";
+    unsigned n_src = (unsigned)insn.src_regs.size();
+    if (k < insn.load_addr_dep_mask.size()) {
+        uint64_t am = insn.load_addr_dep_mask[k];
+        std::string addr_inputs;
+        bool any = false;
+        for (unsigned i = 0; i < n_src; i++) {
+            if (am & ((uint64_t)1 << i)) {
+                if (any) addr_inputs.push_back('+');
+                addr_inputs.append(reg_str(insn.src_regs[i]));
+                any = true;
+            }
+        }
+        if (am & ((uint64_t)1 << n_src)) {
+            if (any) addr_inputs.push_back('+');
+            addr_inputs.append("$0x");
+            append_hex(&addr_inputs, (uint64_t)insn.immediate);
+            any = true;
+        }
+        s.push_back('[');
+        s.append(addr_inputs);
+        s.push_back(']');
+    }
+    if (have_load_addrs && k < load_addrs.size()) {
+        s.append("(0x");
+        append_hex(&s, load_addrs[k]);
+        s.push_back(')');
+    }
+    if (ctx.show_lanes) {
+        append_lane_set(&s, lane_at(insn.load_data_lane_mask, k));
+    }
+    return s;
+}
+
 /* Pre-render the input pool (src_regs + load_data + imm) into strings
  * keyed by HAS_REG mask-bit position (layout in cst_common.h).  Loads
  * render with address inputs inline when HAS_ADDR is available. */
@@ -640,69 +692,28 @@ void render_input_pool(std::vector<std::string> &out,
                        const std::vector<uint64_t> &load_addrs,
                        bool have_load_addrs)
 {
-    auto reg_str = [&](uint8_t r) {
-        std::string s;
-        append_regref(&s, ctx, r);
-        return s;
-    };
-    auto imm_str = [&]() {
-        std::string s = "$0x";
-        append_hex(&s, (uint64_t)insn.immediate);
-        return s;
-    };
     /* src_reg slots — with --show-lanes, suffix each name with its
      * participating lane set ("{0..3,6}").  Empty mask = no suffix
      * so scalar srcs render unchanged. */
     for (size_t i = 0; i < insn.src_regs.size(); i++) {
-        std::string s = reg_str(insn.src_regs[i]);
+        std::string s;
+        append_regref(&s, ctx, insn.src_regs[i]);
         if (ctx.show_lanes) {
             append_lane_set(&s, lane_at(insn.src_lane_mask, i));
         }
         out.push_back(std::move(s));
     }
-    /* load_data slots — each renders as "ld[<addr_inputs>](addr)" using
-     * the matching HAS_ADDR mask + dynamic address.  An address mask
-     * in HAS_ADDR has the layout bits [0, n_src) src, bit n_src imm
-     * (no load_data — addresses are computed before any load fires).
-     * With --show-lanes, append the load_data lane set ("{0..1}") so
-     * vector loads show which lanes they populated. */
-    unsigned n_src = (unsigned)insn.src_regs.size();
+    /* load_data slots. */
     for (unsigned k = 0; k < insn.max_dep_loads; k++) {
-        std::string s = "ld";
-        if (k < insn.load_addr_dep_mask.size()) {
-            uint64_t am = insn.load_addr_dep_mask[k];
-            std::string addr_inputs;
-            bool any = false;
-            for (unsigned i = 0; i < n_src; i++) {
-                if (am & ((uint64_t)1 << i)) {
-                    if (any) addr_inputs.push_back('+');
-                    addr_inputs.append(reg_str(insn.src_regs[i]));
-                    any = true;
-                }
-            }
-            if (am & ((uint64_t)1 << n_src)) {
-                if (any) addr_inputs.push_back('+');
-                addr_inputs.append(imm_str());
-                any = true;
-            }
-            s.push_back('[');
-            s.append(addr_inputs);
-            s.push_back(']');
-        }
-        if (have_load_addrs && k < load_addrs.size()) {
-            s.append("(0x");
-            append_hex(&s, load_addrs[k]);
-            s.push_back(')');
-        }
-        if (ctx.show_lanes) {
-            append_lane_set(&s, lane_at(insn.load_data_lane_mask, k));
-        }
-        out.push_back(std::move(s));
+        out.push_back(render_load_source(ctx, insn, k, load_addrs,
+                                         have_load_addrs));
     }
     /* imm slot — only when has_immediate; the bit position is fixed
      * by the wire layout even if we don't push a name when absent. */
     if (insn.has_immediate) {
-        out.push_back(imm_str());
+        std::string s = "$0x";
+        append_hex(&s, (uint64_t)insn.immediate);
+        out.push_back(std::move(s));
     }
 }
 
@@ -712,12 +723,16 @@ void render_input_pool(std::vector<std::string> &out,
  * the sink only where its lanes intersect @sink_lanes — if empty it's
  * dropped (PINSRD $3's pass-through %v0{0..2} does not feed written
  * lane %v0{3}).  Inputs with no lane mask pass through unchanged.
- * @in_lane(i) returns input i's lane mask. */
+ * @in_lane(i) returns input i's lane mask.
+ *
+ * @placed, when non-null, accumulates the pool indices actually
+ * written — the trailing memop column needs to know which load slots
+ * the operand renderer really placed, not merely which ones exist. */
 template <typename LaneFn>
 void render_input_set_laned(std::string &line, uint64_t mask,
                             const std::vector<std::string> &input_names,
                             bool show_lanes, uint64_t sink_lanes,
-                            LaneFn in_lane)
+                            LaneFn in_lane, uint64_t *placed = nullptr)
 {
     bool any = false;
     for (size_t i = 0; i < input_names.size(); i++) {
@@ -728,6 +743,7 @@ void render_input_set_laned(std::string &line, uint64_t mask,
         }
         if (any) line.append(", ");
         line.append(input_names[i]);
+        if (placed && i < 64) *placed |= ((uint64_t)1 << i);
         any = true;
     }
 }
@@ -787,10 +803,20 @@ std::string render_store_sink(const DisasmContext &ctx,
  * synthesizes a default "all inputs" mask per sink (matching the
  * consumer's all-to-all fallback).  Register-flat insns collapse to
  * "<srcs> -> <dsts>" (legacy flat layout).
+ *
+ * @out_placed_loads, when non-null, receives a bitmask of the load
+ * slots this renderer actually printed.  A load slot exists in the
+ * template yet reaches no sink whenever the wire's dep masks route the
+ * store data around it (`push m64`: sdata0 names the address register,
+ * not the load), and such a slot never appears on the line — so
+ * emit_disasm_memops needs this to decide which loads still owe the
+ * reader an address.
  */
 bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
-                          const cst::Instruction &insn)
+                          const cst::Instruction &insn,
+                          uint64_t *out_placed_loads = nullptr)
 {
+    uint64_t placed = 0;
     std::vector<uint64_t> load_addrs, store_addrs;
     for (const auto &dp : insn.dyn_params) {
         if (dp.type == cst::DynParam::Load)  load_addrs.push_back(dp.addr);
@@ -911,6 +937,7 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
         for (size_t i : contributors) {
             open_group();
             line.append(inputs[i]);
+            if (i < 64) placed |= ((uint64_t)1 << i);
             line.append(" -> ");
             emit_dst_name(k, input_lane_mask(i));
         }
@@ -939,7 +966,7 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
         render_input_set_laned(line, effective(mask), inputs,
                                ctx.show_lanes,
                                lane_at(insn.dst_lane_mask, d),
-                               input_lane_mask);
+                               input_lane_mask, &placed);
         line.append(" -> ");
         for (size_t k = d; k < end; k++) {
             if (k > d) line.append(", ");
@@ -963,7 +990,7 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
         render_input_set_laned(line, effective(mask), inputs,
                                ctx.show_lanes,
                                lane_at(insn.store_data_lane_mask, s),
-                               input_lane_mask);
+                               input_lane_mask, &placed);
         line.append(" -> ");
         for (size_t k = s; k < end; k++) {
             if (k > s) line.append(", ");
@@ -984,9 +1011,12 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
         for (size_t i = 0; i < inputs.size(); i++) {
             sep();
             line.append(inputs[i]);
+            if (i < 64) placed |= ((uint64_t)1 << i);
         }
+        if (out_placed_loads) *out_placed_loads = placed >> n_src;
         return any;
     }
+    if (out_placed_loads) *out_placed_loads = placed >> n_src;
     return true;
 }
 
@@ -1004,22 +1034,52 @@ void emit_disasm_metaflags(std::string &line, const DisasmContext &ctx,
 
 /*
  * Memops covered inline by the operand renderer are skipped here.
- * Uncovered ones — typically implicit stack memops on CALL/PUSH/POP/
- * RET that Capstone doesn't enumerate, so the walker never bumped
- * max_dep_loads/stores — get a trailing "  ld(0x..)"/"  st(0x..)".
+ * Uncovered ones get a trailing "  ld[..](0x..)"/"  st(0x..)".  Two
+ * kinds are uncovered:
+ *
+ *   - No static slot at all (load_idx >= max_dep_loads): typically the
+ *     implicit stack memops on CALL/PUSH/POP/RET that Capstone doesn't
+ *     enumerate, so the walker never bumped max_dep_loads/stores.  The
+ *     decoder has no address-input set for these and prints a bare
+ *     "ld(0x..)".
+ *   - A static slot that the operand renderer did not place: the slot
+ *     exists and HAS_ADDR describes it, but the wire's dep masks route
+ *     every sink around the load_data input, so it reached no arrow.
+ *     `push m64` is the case in point — sdata0 names the address
+ *     register rather than the loaded value, leaving the load slot
+ *     unreferenced and its address invisible.  Render these the same
+ *     way the input pool would have ("ld[%gp8](0x..)"), so the memory
+ *     source shows up as memory, with its address.
+ *
  * With MEM_DATA every dp also gets a "  ld=0x.."/"  st=0x.." column.
  */
 void emit_disasm_memops(std::string &line, const DisasmContext &ctx,
-                        const cst::Instruction &insn)
+                        const cst::Instruction &insn,
+                        uint64_t placed_loads)
 {
     bool with_data = ctx.h->has_mem_data();
+    std::vector<uint64_t> load_addrs;
+    for (const auto &dp : insn.dyn_params) {
+        if (dp.type == cst::DynParam::Load) load_addrs.push_back(dp.addr);
+    }
     unsigned load_idx = 0, store_idx = 0;
     for (const auto &dp : insn.dyn_params) {
         bool is_load = dp.type == cst::DynParam::Load;
-        bool covered = is_load
-                           ? load_idx  < insn.max_dep_loads
-                           : store_idx < insn.max_dep_stores;
-        if (!covered) {
+        bool has_slot = is_load ? load_idx  < insn.max_dep_loads
+                                : store_idx < insn.max_dep_stores;
+        /* A load with a slot is only "covered" if the operand renderer
+         * actually printed that slot.  Stores always render (the store
+         * loop iterates every slot up to max_dep_stores). */
+        bool covered = has_slot &&
+            (!is_load || (load_idx < 64 &&
+                          (placed_loads & ((uint64_t)1 << load_idx))));
+        if (!covered && is_load && has_slot) {
+            /* Slot exists but went unplaced — render it in full, with
+             * its HAS_ADDR input set and address. */
+            line.append("  ");
+            line.append(render_load_source(ctx, insn, load_idx,
+                                           load_addrs, !load_addrs.empty()));
+        } else if (!covered) {
             /* Untracked memop — surface its address (no
              * address-input set; the walker has no info). */
             line.append(is_load ? "  ld(0x" : "  st(0x");
@@ -1353,9 +1413,10 @@ void render_disasm_insn(FILE *out, const DisasmContext &ctx,
     if (ctx.od) emit_disasm_objdump_column(line, *ctx.od, insn);
     emit_disasm_mnemonic(line, ctx, insn);
 
-    bool any_operand = emit_disasm_operands(line, ctx, insn);
+    uint64_t placed_loads = 0;
+    bool any_operand = emit_disasm_operands(line, ctx, insn, &placed_loads);
     emit_disasm_metaflags(line, ctx, insn, any_operand);
-    emit_disasm_memops(line, ctx, insn);
+    emit_disasm_memops(line, ctx, insn, placed_loads);
     emit_disasm_branch_target(line, ctx, insn);
     emit_disasm_trailing_meta(line, ctx, insn, wp_status);
 

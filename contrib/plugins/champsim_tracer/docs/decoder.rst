@@ -117,7 +117,13 @@ Captured per-instruction data is folded into the operand line:
 * ``ld[<base>](<addr>)`` / ``st[<base>](<addr>)`` in the operand
   list — a memory operation's base register and effective address
   (``ld(<addr>)`` / ``st(<addr>)`` when no base register resolves,
-  e.g. an absolute address).  With ``memdata=1`` the loaded / stored
+  e.g. an absolute address).  A load whose value reaches no sink in
+  the template's dependency masks has no place in the operand list,
+  and renders in the same form *after* it instead — ``push m64``
+  routes its store data straight off the address register, so its
+  load appears as a trailing ``ld[%gp8](0x…)``.  Either way every
+  memop the trace recorded shows its address exactly once.
+  With ``memdata=1`` the loaded / stored
   value rides a trailing ``ld=<value>/w<n>`` / ``st=<value>/w<n>``
   token, where ``/w<n>`` is the access byte width — the
   ``CST_FID_LOAD_SIZE`` / ``CST_FID_STORE_SIZE`` field — for

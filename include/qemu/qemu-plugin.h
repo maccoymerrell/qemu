@@ -900,6 +900,25 @@ typedef struct qemu_plugin_operand {
     uint8_t  scale;
     uint16_t reg_id;   /* Capstone register ID for reg_name (0 = none) */
     uint16_t index_id; /* Capstone register ID for index_name (0 = none) */
+    /*
+     * x86 segment-override register on a MEM operand: the Capstone
+     * register ID of the segment whose base participates in the
+     * effective address (X86_REG_FS / X86_REG_GS / ...), or 0 when the
+     * access uses the default segment.  Zero for every non-MEM operand
+     * and for every non-x86 ISA (no other supported ISA has segmented
+     * addressing).
+     *
+     * The segment register is a genuine ADDRESS INPUT: the linear
+     * address is seg.base + base + index * scale + disp, so an
+     * instruction like `mov %fs:0x28, %rax` reads fs.  Capstone only
+     * exposes it here -- x86 segment overrides do NOT appear in the
+     * implicit regs_read[] list -- so a plugin that walks operands
+     * alone would silently drop the dependency (TLS and stack-protector
+     * accesses would look input-less).  Plugins attributing address
+     * dependencies should add this to the memop's source set alongside
+     * reg_id and index_id.
+     */
+    uint16_t segment_id;
     int64_t  imm;      /* IMM value, or MEM displacement */
     /*
      * AArch64 register-form addressing modifier.  shift_type matches

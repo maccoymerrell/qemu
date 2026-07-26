@@ -487,6 +487,7 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
         op->scale = 1;
         op->shift_type = 0;
         op->shift_amount = 0;
+        op->segment_id = 0;   /* MEM branch fills the override, if any */
 
         switch (cop->type) {
         case X86_OP_REG:
@@ -519,6 +520,14 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
             op->index_id   = cop->mem.index;
             op->imm = cop->mem.disp;
             op->scale = (uint8_t)cop->mem.scale;
+            /*
+             * Segment override (%fs: / %gs: ...).  Capstone reports it
+             * only here -- it is absent from the implicit regs_read[]
+             * list -- and its base is a real input to the effective
+             * address, so surface it as its own operand field.  0 when
+             * the access uses the default segment.
+             */
+            op->segment_id = cop->mem.segment;
             /* Capstone-6.0.0-Alpha7 bug: the r/m destination of a
              * store-form extract is the write target, not a read. */
             if (extract_store || move_store) {

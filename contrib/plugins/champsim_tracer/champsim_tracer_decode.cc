@@ -560,14 +560,28 @@ void decode_detail_to_generic(uint64_t pc,
         case QEMU_PLUGIN_OP_MEM: {
             /*
              * Track which src_regs[] slots this MEM operand's base +
-             * index addressing regs land in, OR'd together, to populate
-             * load/store_addr_dep_mask[k] — structural per-memop "when
-             * can this fire?" data for precise load/store scheduling
-             * (avoid waiting on dst-as-src for RMW forms, etc.).
+             * index + segment addressing regs land in, OR'd together, to
+             * populate load/store_addr_dep_mask[k] — structural
+             * per-memop "when can this fire?" data for precise
+             * load/store scheduling (avoid waiting on dst-as-src for RMW
+             * forms, etc.).
+             *
+             * The segment register belongs in that set for the same
+             * reason base and index do: on x86 the linear address is
+             * seg.base + base + index * scale + disp, so a `%fs:`- or
+             * `%gs:`-prefixed access genuinely reads the segment
+             * register.  It has to be taken from the operand because
+             * Capstone does NOT list x86 segment overrides among the
+             * implicit regs_read[] the fold below consumes — leaving it
+             * out made every TLS and stack-protector access look
+             * address-input-less (`ld[]`), which is what PIN's source
+             * sets disagreed with.  Non-x86 ISAs have no segmented
+             * addressing and always report 0 here.
              */
             uint64_t addr_mask = 0;
             addr_mask |= add_src_cap_reg(out, out_names, op->reg_id);
             addr_mask |= add_src_cap_reg(out, out_names, op->index_id);
+            addr_mask |= add_src_cap_reg(out, out_names, op->segment_id);
 
             /*
              * Count against the template-static MAX load/store totals,

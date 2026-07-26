@@ -219,6 +219,17 @@ Plugin API additions
    register-name strings into the public buffers, and recovers x86
    ``LOCK`` / ``REP`` prefix flags from the Capstone detail block.
 
+   ``qemu_plugin_operand`` also carries ``segment_id``: the Capstone
+   register ID of an x86 segment override on a ``MEM`` operand
+   (``X86_REG_FS`` / ``X86_REG_GS`` / ...), 0 when the access uses
+   the default segment and for every non-x86 ISA.  The segment
+   register is a genuine address input — the linear address is
+   ``seg.base + base + index * scale + disp`` — and Capstone exposes
+   it *only* on the operand: x86 segment overrides do not appear in
+   the implicit ``regs_read[]`` list.  Without the field a plugin
+   walking operands cannot see it at all, so ``%fs:``-prefixed TLS
+   and stack-protector accesses look address-input-less.
+
 Static branch-target plumbing
 -----------------------------
 

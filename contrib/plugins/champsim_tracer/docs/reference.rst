@@ -513,8 +513,14 @@ without implying any particular numeric base.
      - Predicate / mask registers (SVE, AVX-512 ``k`` regs,
        RVV mask).
    * - ``REG_SEG0`` .. ``REG_SEG5``
-     - x86 segment registers (``cs`` / ``ds`` / ... ).  Other ISAs
-       leave this family empty.
+     - x86 segment registers, in Capstone's order: ``REG_SEG0`` =
+       ``cs``, ``REG_SEG1`` = ``ds``, ``REG_SEG2`` = ``es``,
+       ``REG_SEG3`` = ``fs``, ``REG_SEG4`` = ``gs``, ``REG_SEG5`` =
+       ``ss``.  They appear as a source whenever a memory operand
+       carries a segment override — the override's base is part of
+       the effective address, so ``mov %fs:0x28, %rax`` reads
+       ``REG_SEG3`` and lists it in that load's address-dep mask.
+       Other ISAs leave this family empty.
    * - ``REG_CTRL``
      - Architectural control register family (CR0..N on x86,
        SCTLR on aarch64).

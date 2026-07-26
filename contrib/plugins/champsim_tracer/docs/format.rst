@@ -2506,6 +2506,13 @@ before any load fires:
    bits [0, n_src)                            depends on src_reg[i]
    bit  n_src                                 depends on the immediate
 
+An address mask names every register the effective address reads: the
+base and index registers, and — on x86 with a segment override — the
+segment register whose base is added in (``mov %fs:0x28, %rax`` reads
+``fs``, so ``REG_SEG3`` is among that memop's address inputs, and among
+the instruction's ``src_reg`` entries).  Segment registers appear only
+in this role; no other ISA has segmented addressing.
+
 Absence of ``CST_INSN_FLAG_HAS_DEP_BLOCK`` is the implicit all-to-all
 over-approximation: every dst / store depends on every src / load.
 Consumers that don't model intra-instruction dataflow can ignore

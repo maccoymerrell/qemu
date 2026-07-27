@@ -2037,8 +2037,28 @@ def classify_mips_reg(name: str) -> RegEntry:
         return reg_ent(numbered("REG_GPR", MIPS_GPR_NUM[stem]))
     if match := re.fullmatch(r"F(\d+)", stem):
         return reg_ent(numbered("REG_FPR", int(match.group(1))))
+    # The double-precision VIEW of the FP register file, and which
+    # register `D<n>` denotes depends on FR.  Under FR=1 -- the `_64`
+    # rows -- a double is $f<n>, one for one.  Under FR=0 it is the
+    # even-odd PAIR starting at $f<2n>, which is why Capstone prints
+    # D<n> as "f<2n>".  Mapping the FR=0 row to REG_FPR<n> gave one
+    # architectural register two generic IDs: `D1` (printed f2) landed
+    # on REG_FPR1 while `F2` (printed f2) landed on REG_FPR2.  Latent
+    # rather than live -- Capstone returns F<n> ids in the mode the
+    # tracer opens, so a real `add.d` decode never consults these rows
+    # -- but a table that disagrees with itself is a defect waiting for
+    # the mode to change.
+    #
+    # The pair's odd half is deliberately NOT named here.  In FR=0 an
+    # `add.d $f2, ...` reads f3 as well, and the LIVE path models that
+    # the same way this does: `F2` maps to REG_FPR2 alone.  Naming the
+    # second half on the dead row only would make the two paths
+    # disagree about the same architectural fact; if the pair is ever
+    # modelled it belongs on both.
     if match := re.fullmatch(r"D(\d+)", stem):
-        return reg_ent(numbered("REG_FPR", int(match.group(1))))
+        num = int(match.group(1))
+        return reg_ent(numbered("REG_FPR", num if name.endswith("_64")
+                                else 2 * num))
     if match := re.fullmatch(r"F_HI(\d+)", stem):
         return reg_ent(numbered("REG_FPR", int(match.group(1))))
     if match := re.fullmatch(r"W(\d+)", stem):
@@ -3629,8 +3649,16 @@ def qemu_mips_reg_key(name: str) -> QemuRegKey | None:
         return QemuRegKey(feature, "hi")
     if stem in MIPS_GPR_NUM:
         return QemuRegKey(feature, gpr_names[MIPS_GPR_NUM[stem]])
-    if match := re.fullmatch(r"[FD](\d+)", stem):
+    if match := re.fullmatch(r"F(\d+)", stem):
         num = int(match.group(1))
+        return QemuRegKey(feature, f"f{num}") if num < 32 else None
+    # See classify_mips_reg: an FR=0 double is the pair starting at
+    # $f<2n>, an FR=1 double is $f<n>.  The GDB-stub name has to follow,
+    # or a value read for `D1` would fetch $f1 instead of $f2.
+    if match := re.fullmatch(r"D(\d+)", stem):
+        num = int(match.group(1))
+        if not name.endswith("_64"):
+            num *= 2
         return QemuRegKey(feature, f"f{num}") if num < 32 else None
     if stem == "FCR31":
         return QemuRegKey(feature, "fcr31")

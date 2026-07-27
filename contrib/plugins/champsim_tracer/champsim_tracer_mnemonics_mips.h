@@ -238,21 +238,21 @@ static const RegClassification mips_reg_class[MIPS_REG_ENDING] = {
     [MIPS_REG_COP330] = { .reg_id = REG_SYS },  /* cop330 */
     [MIPS_REG_COP331] = { .reg_id = REG_SYS },  /* cop331 */
     [MIPS_REG_D0] = { .reg_id = REG_FPR0, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f0" } },  /* d0 */
-    [MIPS_REG_D1] = { .reg_id = REG_FPR1, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f1" } },  /* d1 */
-    [MIPS_REG_D2] = { .reg_id = REG_FPR2, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f2" } },  /* d2 */
-    [MIPS_REG_D3] = { .reg_id = REG_FPR3, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f3" } },  /* d3 */
-    [MIPS_REG_D4] = { .reg_id = REG_FPR4, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f4" } },  /* d4 */
-    [MIPS_REG_D5] = { .reg_id = REG_FPR5, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f5" } },  /* d5 */
-    [MIPS_REG_D6] = { .reg_id = REG_FPR6, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f6" } },  /* d6 */
-    [MIPS_REG_D7] = { .reg_id = REG_FPR7, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f7" } },  /* d7 */
-    [MIPS_REG_D8] = { .reg_id = REG_FPR8, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f8" } },  /* d8 */
-    [MIPS_REG_D9] = { .reg_id = REG_FPR9, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f9" } },  /* d9 */
-    [MIPS_REG_D10] = { .reg_id = REG_FPR10, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f10" } },  /* d10 */
-    [MIPS_REG_D11] = { .reg_id = REG_FPR11, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f11" } },  /* d11 */
-    [MIPS_REG_D12] = { .reg_id = REG_FPR12, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f12" } },  /* d12 */
-    [MIPS_REG_D13] = { .reg_id = REG_FPR13, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f13" } },  /* d13 */
-    [MIPS_REG_D14] = { .reg_id = REG_FPR14, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f14" } },  /* d14 */
-    [MIPS_REG_D15] = { .reg_id = REG_FPR15, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f15" } },  /* d15 */
+    [MIPS_REG_D1] = { .reg_id = REG_FPR2, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f2" } },  /* d1 */
+    [MIPS_REG_D2] = { .reg_id = REG_FPR4, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f4" } },  /* d2 */
+    [MIPS_REG_D3] = { .reg_id = REG_FPR6, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f6" } },  /* d3 */
+    [MIPS_REG_D4] = { .reg_id = REG_FPR8, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f8" } },  /* d4 */
+    [MIPS_REG_D5] = { .reg_id = REG_FPR10, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f10" } },  /* d5 */
+    [MIPS_REG_D6] = { .reg_id = REG_FPR12, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f12" } },  /* d6 */
+    [MIPS_REG_D7] = { .reg_id = REG_FPR14, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f14" } },  /* d7 */
+    [MIPS_REG_D8] = { .reg_id = REG_FPR16, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f16" } },  /* d8 */
+    [MIPS_REG_D9] = { .reg_id = REG_FPR18, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f18" } },  /* d9 */
+    [MIPS_REG_D10] = { .reg_id = REG_FPR20, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f20" } },  /* d10 */
+    [MIPS_REG_D11] = { .reg_id = REG_FPR22, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f22" } },  /* d11 */
+    [MIPS_REG_D12] = { .reg_id = REG_FPR24, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f24" } },  /* d12 */
+    [MIPS_REG_D13] = { .reg_id = REG_FPR26, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f26" } },  /* d13 */
+    [MIPS_REG_D14] = { .reg_id = REG_FPR28, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f28" } },  /* d14 */
+    [MIPS_REG_D15] = { .reg_id = REG_FPR30, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f30" } },  /* d15 */
     [MIPS_REG_DSPOUTFLAG20] = { .reg_id = REG_DSPCTRL },  /* dspoutflag20 */
     [MIPS_REG_DSPOUTFLAG21] = { .reg_id = REG_DSPCTRL },  /* dspoutflag21 */
     [MIPS_REG_DSPOUTFLAG22] = { .reg_id = REG_DSPCTRL },  /* dspoutflag22 */

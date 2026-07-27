@@ -1431,15 +1431,55 @@ static void try_half(uint16_t h)
  *
  * aarch64: opcode-bearing bits are [31:10]; [9:5]=Rn, [4:0]=Rd/Rt.
  * (30, 0) reaches the `ret` alias.
+ *
+ * TWO WHOLE ENCODING SPACES USE THESE FIELDS AS OPCODE, NOT AS REGISTERS,
+ * and a short list of register-looking pairs reaches neither:
+ *
+ *   Exception generation (`1101 0100 opc imm16 op2 LL`) puts op2:LL in
+ *   [4:0] and the whole imm16 across [20:5].  Rn is therefore free and Rd
+ *   IS THE INSTRUCTION: 0 is BRK/HLT, 1 is SVC and DCPS1, 2 is HVC and
+ *   DCPS2, 3 is SMC and DCPS3.  The old fills happened to carry rd = 0 and
+ *   rd = 2, so BRK, HLT, HVC and DCPS2 were swept and SVC — the system-call
+ *   instruction, on the hot path of every AArch64 trace — was not.  {0,1}
+ *   and {0,3} complete the column.
+ *
+ *   Hint and barrier space (`1101 0101 0000 0011 0010 CRm op2 11111`) is
+ *   reached only when Rt is 31, and once it is, [9:5] carries CRm[1:0]:op2
+ *   — the selector that tells NOP from YIELD from WFE from BTI from DMB
+ *   from ISB.  CRm[3:2] lives in [11:10] and is swept already, so ranging
+ *   [9:5] over all 32 values at Rt = 31 covers the space exhaustively
+ *   rather than sampling it.  That loop subsumes the old {0,31} and
+ *   {31,31} pairs, which are its sel = 0 and sel = 31 members.
+ *
+ * The same Rt = 31 loop is what reaches the system-register moves whose
+ * sysreg encoding is spread across [19:5]: `mrs xN, TPIDR_EL0` needs
+ * [9:5] = 2 and takes any Rt, and no fill offered it.
+ *
+ * Two more pairs, each for a reason the rule above names:
+ *
+ *   {0, 0} — SVE `wrffr pN.b` puts Pn in [8:5] and zero in [4:0], so no
+ *   pair with Rd != 0 or Rn > 15 can reach it.  (It is also the single
+ *   most-executed [9:5]:[4:0] pair in a traced AArch64 population, which
+ *   is a coincidence: the sweep abstracts data-register choice on purpose.)
+ *
+ *   {1, 1} — Rt == Rn.  LDTR and the unprivileged / atomic load-store
+ *   families make that combination CONSTRAINED UNPREDICTABLE, and LLVM
+ *   answers SoftFail where Capstone decodes; every other fill keeps the
+ *   two fields apart, so the whole constraint was outside the sweep.
+ *
+ * Sweep cost 21.0 M -> 163.6 M encodings, ~5 s -> ~42 s at --jobs=8.
  */
 static void sweep_aarch64(unsigned shard, unsigned nshard)
 {
     static const struct { unsigned rn, rd; } fills[] = {
-        {1, 2}, {31, 31}, {0, 31}, {31, 0}, {30, 0},
+        {1, 2}, {31, 0}, {30, 0}, {0, 1}, {0, 3}, {0, 0}, {1, 1},
     };
-    for (uint32_t top = shard; top < (1u << 22); top += nshard)
+    for (uint32_t top = shard; top < (1u << 22); top += nshard) {
         for (auto &f : fills)
             try_word((top << 10) | (f.rn << 5) | f.rd);
+        for (unsigned sel = 0; sel < 32; sel++)
+            try_word((top << 10) | (sel << 5) | 31);
+    }
 }
 
 // riscv64: sweep [31:20] (funct7 + rs2 / I-imm) x [14:12] funct3 x [6:0] opcode

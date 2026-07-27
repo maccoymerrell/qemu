@@ -102,8 +102,14 @@ riscv64 R-rd-phantom vfmerge.v*m +v#
 # enters now, and none of them disagree.)
 
 # LLVM gives AArch64 MRS/MSR an NZCV def that the architecture does not.
+# The def is attached to the whole MSR-immediate-to-PSTATE-field form,
+# because one of the fields it can name IS NZCV — so every alias of that
+# form inherits it, including the SME streaming-mode switches, which write
+# PSTATE.SM and PSTATE.ZA and leave the condition flags alone.
 aarch64 R-wr-missing mrs +nzcv
 aarch64 R-wr-missing msr +nzcv
+aarch64 R-wr-missing smstart +nzcv
+aarch64 R-wr-missing smstop +nzcv
 
 # The TLBI operations that take NO Xt argument (TLBI VMALLE1, VMALLS12E1IS,
 # ALLE2, …) are still encoded in the SYS format, which has an Rt field; the
@@ -255,10 +261,16 @@ mipsel R-wr-phantom ctc1 +cop#
 # plausible instruction where the hardware would raise UNDEFINED; the
 # tracer's wrong-path fidelity contract already treats wrong-path
 # instruction identity as best-effort.
+# AXFLAG and XAFLAG join on the same terms from the other side of the
+# encoding space: they are MSR-immediate forms whose CRm field the
+# architecture fixes at 0b0000, and `0xd500415f` sets CRm = 0b0001.  The
+# properly-encoded `0xd500405f` decodes identically on both sides, which is
+# how the two were told apart.
 # Verify with `cstool -d arm64 22e0c088` on a Capstone bump: if Capstone
 # starts rejecting the reserved encodings, every line here goes dead and
 # the tool says so.
 aarch64 D-cs-only addg
+aarch64 D-cs-only axflag
 aarch64 D-cs-only ldar
 aarch64 D-cs-only ldarb
 aarch64 D-cs-only ldarh
@@ -279,6 +291,7 @@ aarch64 D-cs-only stlr
 aarch64 D-cs-only stlrb
 aarch64 D-cs-only stlrh
 aarch64 D-cs-only subg
+aarch64 D-cs-only xaflag
 
 # (b) CONSTRAINED UNPREDICTABLE register aliasing on the pair forms.  The
 # architecture leaves `ldp w2, w2, [x1], #28` (Rt == Rt2) and
@@ -293,6 +306,46 @@ aarch64 D-cs-only ldpsw
 aarch64 D-cs-only ldxp
 aarch64 D-cs-only stgp
 aarch64 D-cs-only stp
+
+# The single-register half of the same family, reachable since the sweep
+# started filling Rt == Rn (see sweep_aarch64).  A writeback load whose
+# transfer register IS its base register — `ldr w0, [x0], #1`,
+# `ldr w0, [x0, #0]!`, and the pointer-authenticated `ldraa`/`ldrab` — has
+# two definitions of one register and the architecture leaves it
+# CONSTRAINED UNPREDICTABLE.  LLVM SoftFails, Capstone decodes; the store
+# forms are unconstrained and agree, which is how the boundary of the
+# family was located.
+aarch64 D-cs-only ldr
+aarch64 D-cs-only ldraa
+aarch64 D-cs-only ldrab
+aarch64 D-cs-only ldrb
+aarch64 D-cs-only ldrh
+aarch64 D-cs-only ldrsb
+aarch64 D-cs-only ldrsh
+
+# (c) THE ONE BELOW IS AN LLVM DEFECT, not a subtarget gap, and it is
+# recorded here only because a rejected LLVM decode is what the class
+# means.  `ldtr w0, [x0, #1]` is a perfectly well-defined instruction:
+# LDTR is the UNPRIVILEGED load, it has no writeback, and the ARM ARM puts
+# no constraint on Rt == Rn for it.  LLVM refuses it anyway, because
+# AArch64Disassembler.cpp's DecodeSignedLdStInstruction() tests
+#
+#     bool IsIndexed = fieldFromInstruction(insn, 10, 2) != 0;
+#     // Cannot write back to a transfer register (but xzr != sp).
+#     if (IsLoad && IsIndexed && !IsFP && Rn != 31 && Rt == Rn)
+#       return SoftFail;
+#
+# and bits [11:10] select the addressing form: 0b01 post-index, 0b11
+# pre-index — and 0b10 LDTR, which writes back nothing.  The check's own
+# comment says what it is for; the predicate admits one form it was not
+# meant to cover.  Fix upstream: exclude 0b10 from IsIndexed.  Capstone
+# and the tracer are right, so nothing here needs changing, and these
+# lines go dead when LLVM is fixed.
+aarch64 D-cs-only ldtr
+aarch64 D-cs-only ldtrb
+aarch64 D-cs-only ldtrh
+aarch64 D-cs-only ldtrsb
+aarch64 D-cs-only ldtrsh
 
 # =====================================================================
 # 4b. Residual class-R/Z findings on the RISC-V space the closed subtarget
@@ -352,7 +405,17 @@ riscv64 R-wr-missing jalr +r#
 #     SVE2.1-only forms, and the load/store-multiple writeback tuple naming.
 #     Each was inspected: the register is present on both sides under a
 #     different tuple spelling, or belongs to a feature above.
+# Exception generation.  Capstone puts BRK / HLT / SVC / HVC / SMC in a
+# control group and LLVM's MCInstrDesc gives them none — it describes them
+# as ordinary instructions with an immediate, because a trap's edge is not
+# one a compiler's CFG follows.  The tracer needs the edge: a trap ends a
+# true BB.  `svc` and `smc` are here rather than only `hvc` because the
+# sweep now fills Rd = 1 and Rd = 3, which is what selects them (see
+# sweep_aarch64); the classification they get is asserted in
+# isaxcheck_fixups.txt, which is the file that would notice it regressing.
 aarch64 B-flow-presence hvc cs-yes llvm-no
+aarch64 B-flow-presence smc cs-yes llvm-no
+aarch64 B-flow-presence svc cs-yes llvm-no
 aarch64 M-cs-mem-llvm-none dc
 aarch64 M-cs-mem-llvm-none ld64b
 aarch64 M-cs-mem-llvm-none ldapursb
@@ -366,13 +429,45 @@ aarch64 M-cs-mem-llvm-none st64bv
 aarch64 M-cs-mem-llvm-none st64bv0
 aarch64 M-cs-mem-llvm-none stgm
 aarch64 M-cs-mem-llvm-none stzgm
+# mayLoad / mayStore are LLVM SCHEDULING properties, not semantics: they
+# say "do not move memory across me", which is precisely what a barrier is
+# for, and LLVM sets both on the whole barrier and hint space to get that
+# ordering for free.  None of these instructions touches memory, and
+# Capstone reports no memory operand for any of them.  `bti`, `hint`, `nop`
+# and `tcancel` were the members the old fills happened to reach; sweeping
+# the hint selector (see sweep_aarch64) reaches the rest of the space, and
+# it is the same artifact throughout.  `setffr` / `wrffr` are the SVE
+# first-fault register writers, where the mayStore is LLVM modelling FFR as
+# ordered state rather than as a register.
 aarch64 M-llvm-mem-cs-none bti load store
+aarch64 M-llvm-mem-cs-none clrbhb load store
+aarch64 M-llvm-mem-cs-none clrex load store
+aarch64 M-llvm-mem-cs-none csdb load store
+aarch64 M-llvm-mem-cs-none dfb load store
+aarch64 M-llvm-mem-cs-none dgh load store
+aarch64 M-llvm-mem-cs-none dmb load store
+aarch64 M-llvm-mem-cs-none dsb load store
+aarch64 M-llvm-mem-cs-none esb load store
+aarch64 M-llvm-mem-cs-none gcsb load store
 aarch64 M-llvm-mem-cs-none hint load store
+aarch64 M-llvm-mem-cs-none isb load store
 aarch64 M-llvm-mem-cs-none luti2 load
 aarch64 M-llvm-mem-cs-none luti4 load
 aarch64 M-llvm-mem-cs-none mov load store
 aarch64 M-llvm-mem-cs-none nop load store
+aarch64 M-llvm-mem-cs-none psb load store
+aarch64 M-llvm-mem-cs-none pssbb load store
+aarch64 M-llvm-mem-cs-none setffr store
+aarch64 M-llvm-mem-cs-none sev load store
+aarch64 M-llvm-mem-cs-none sevl load store
+aarch64 M-llvm-mem-cs-none ssbb load store
 aarch64 M-llvm-mem-cs-none tcancel load store
+aarch64 M-llvm-mem-cs-none tcommit load store
+aarch64 M-llvm-mem-cs-none tstart load store
+aarch64 M-llvm-mem-cs-none wfe load store
+aarch64 M-llvm-mem-cs-none wfi load store
+aarch64 M-llvm-mem-cs-none wrffr store
+aarch64 M-llvm-mem-cs-none yield load store
 aarch64 M-miss-load st1b
 aarch64 M-miss-load st1d
 aarch64 M-miss-load st1h
@@ -1467,7 +1562,18 @@ x86_64 Z-access0 nopw REG
 #     system-alias operands, which the plugin operand ABI has no
 #     representation for.  Listed explicitly rather than as a class-wide
 #     rule so a NEW unmodelled operand type still fails the gate.
+#
+#     The hint and barrier members below arrived with the hint-selector
+#     sweep.  Their unmodelled operand is the option field — DMB/DSB's
+#     domain-and-direction (`ish`, `oshld`), ISB's, BTI's target class,
+#     PSB/TSB's `csync`, IC's cache-maintenance alias — an operand that
+#     names WHICH variant of an ordering or maintenance operation this is.
+#     None of them carries a value between instructions, which is what the
+#     dependency model records, so there is nothing for the operand ABI to
+#     represent; the ordering itself is the consumer's memory model to
+#     enforce, from the opcode.
 aarch64 Z-unmodelled-op at
+aarch64 Z-unmodelled-op bti
 aarch64 Z-unmodelled-op cntb
 aarch64 Z-unmodelled-op cntd
 aarch64 Z-unmodelled-op cnth
@@ -1478,6 +1584,8 @@ aarch64 Z-unmodelled-op decb
 aarch64 Z-unmodelled-op decd
 aarch64 Z-unmodelled-op dech
 aarch64 Z-unmodelled-op decw
+aarch64 Z-unmodelled-op dmb
+aarch64 Z-unmodelled-op dsb
 aarch64 Z-unmodelled-op fadd
 aarch64 Z-unmodelled-op fcmeq
 aarch64 Z-unmodelled-op fcmge
@@ -1493,10 +1601,12 @@ aarch64 Z-unmodelled-op fmov
 aarch64 Z-unmodelled-op fmul
 aarch64 Z-unmodelled-op fsub
 aarch64 Z-unmodelled-op fsubr
+aarch64 Z-unmodelled-op ic
 aarch64 Z-unmodelled-op incb
 aarch64 Z-unmodelled-op incd
 aarch64 Z-unmodelled-op inch
 aarch64 Z-unmodelled-op incw
+aarch64 Z-unmodelled-op isb
 aarch64 Z-unmodelled-op msr
 aarch64 Z-unmodelled-op prfb
 aarch64 Z-unmodelled-op prfd
@@ -1504,9 +1614,11 @@ aarch64 Z-unmodelled-op prfh
 aarch64 Z-unmodelled-op prfm
 aarch64 Z-unmodelled-op prfum
 aarch64 Z-unmodelled-op prfw
+aarch64 Z-unmodelled-op psb
 aarch64 Z-unmodelled-op ptrue
 aarch64 Z-unmodelled-op ptrues
 aarch64 Z-unmodelled-op rprfm
+aarch64 Z-unmodelled-op smstart
 aarch64 Z-unmodelled-op sqdecb
 aarch64 Z-unmodelled-op sqdecd
 aarch64 Z-unmodelled-op sqdech
@@ -1520,6 +1632,7 @@ aarch64 Z-unmodelled-op sysl
 aarch64 Z-unmodelled-op sysp
 aarch64 Z-unmodelled-op tlbi
 aarch64 Z-unmodelled-op tlbip
+aarch64 Z-unmodelled-op tsb
 aarch64 Z-unmodelled-op uqdecb
 aarch64 Z-unmodelled-op uqdecd
 aarch64 Z-unmodelled-op uqdech
@@ -2262,6 +2375,25 @@ aarch64 R-rd-phantom mrs +fcsr
 aarch64 R-wr-phantom msr +fcsr
 aarch64 R-wr-phantom msrr +fcsr
 
+# The other two system registers the tracer models specifically, reached by
+# the same MRS/MSR pair once the sweep covered the sysreg selector in [9:5]
+# (see sweep_aarch64).  LLVM's MRS/MSR descriptions carry the system
+# register as an IMMEDIATE — the 15-bit encoding, unexpanded — so there is
+# no register operand on that side for any member of this family; the
+# section header above says what a `phantom` verdict means here.
+#
+# REG_TLS is TPIDR_EL0, and `mrs xN, tpidr_el0` is how every thread-local
+# access on AArch64 begins, so this is the member with real dynamic weight.
+# REG_FLAGS is NZCV reached as a system register rather than as the
+# condition flags; the tracer folds it onto the same id it uses for the
+# flag writes of ordinary arithmetic, which is right — `msr nzcv, x0` does
+# define what a later `b.eq` tests, and a consumer that kept the two apart
+# would miss the edge.
+aarch64 R-rd-phantom mrs +flags
+aarch64 R-rd-phantom mrs +tls
+aarch64 R-wr-phantom msr +flags
+aarch64 R-wr-phantom msr +tls
+
 # Vector-register differences.  On AArch64 these are the SME multi-vector
 # register LISTS, and the cause is OURS rather than Capstone's: `bfmls
 # za.h[w8, 7, vgx4], { z0.h - z3.h }, { z4.h - z7.h }` has NINE operands --
@@ -2280,14 +2412,29 @@ aarch64 R-wr-phantom msrr +fcsr
 # source; the Sail model records exactly this and LLVM does not.
 aarch64 R-rd-missing bfmls +v#
 aarch64 R-rd-missing fdot +v#
+aarch64 R-rd-missing fmla +v#
 aarch64 R-rd-missing fmlal +v#
+aarch64 R-rd-missing fmlall +v#
 aarch64 R-rd-missing fmls +v#
+aarch64 R-rd-missing sdot +v#
+aarch64 R-rd-missing sel +v#
+aarch64 R-rd-missing smax +v#
+aarch64 R-rd-missing smlal +v#
+aarch64 R-rd-missing smlall +v#
+aarch64 R-rd-missing sqdmulh +v#
 aarch64 R-rd-missing sub +v#
 aarch64 R-rd-missing udot +v#
+aarch64 R-rd-missing umax +v#
+aarch64 R-rd-missing umin +v#
 
 # SME ZA tile and slice indexing, where the two decoders number the
-# accumulator differently.  Same zero-weight SME space.
+# accumulator differently.  Same zero-weight SME space.  `zero {za}` names
+# the WHOLE array rather than a tile, so it keys on the bare `+za`: there
+# Capstone reports the array write and LLVM has no register operand at all,
+# because it models the tile list as an immediate mask — the same shape as
+# the system-register block above, in the SME register file.
 aarch64 R-rd-phantom zero +za#
+aarch64 R-wr-phantom zero +za
 aarch64 R-wr-phantom zero +za#
 
 # The general system-register space (REG_SYS): AArch64 MRS/MSR/MRRS/MSRR and

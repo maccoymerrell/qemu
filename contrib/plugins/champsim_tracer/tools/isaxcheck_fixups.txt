@@ -44,17 +44,32 @@
 # --- aarch64 -----------------------------------------------------------
 #
 # Trap and exception-generating instructions.  Capstone reports no control
-# group for BRK / HLT / UDF / DCPS<n>, and reports HVC as a plain call; the
-# ISA table classifies all of them as BRANCH_SYSCALL_TYPE, which is what the
-# tracer's BB chain needs to seal a block at a trap.  DRPS is the reverse:
-# Capstone calls it a control transfer and the table does not, because a
-# debug-state exception return is not an edge any consumer can follow.
+# group for BRK / HLT / UDF / DCPS<n>, and reports HVC / SMC / SVC as plain
+# calls; the ISA table classifies all of them as BRANCH_SYSCALL_TYPE, which
+# is what the tracer's BB chain needs to seal a block at a trap.  DRPS is
+# the reverse: Capstone calls it a control transfer and the table does not,
+# because a debug-state exception return is not an edge any consumer can
+# follow.
+#
+# SVC is the load-bearing member and it is the one that was missing.  Every
+# system call in an AArch64 trace is an SVC, and this reclassification is
+# what makes the BB seal there.  The row could not be written before,
+# because the encoding sat outside the swept space: exception generation
+# carries its whole selector in [4:0] — 0b00000 BRK/HLT, 0b00001 SVC,
+# 0b00010 HVC, 0b00011 SMC — and no fill offered Rd = 1.  The siblings that
+# WERE recorded are exactly the ones whose selector the old fills happened
+# to carry.  Rd = 1 and Rd = 3 complete the column (see sweep_aarch64), and
+# with them SVC, SMC, DCPS1 and DCPS3.
 aarch64 W-flow-added brk BRANCH_SYSCALL_TYPE
+aarch64 W-flow-added dcps1 BRANCH_SYSCALL_TYPE
 aarch64 W-flow-added dcps2 BRANCH_SYSCALL_TYPE
+aarch64 W-flow-added dcps3 BRANCH_SYSCALL_TYPE
 aarch64 W-flow-added hlt BRANCH_SYSCALL_TYPE
 aarch64 W-flow-added udf BRANCH_SYSCALL_TYPE
 aarch64 W-flow-dropped drps BRANCH_NONE
 aarch64 W-flow-reclassed hvc BRANCH_SYSCALL_TYPE
+aarch64 W-flow-reclassed smc BRANCH_SYSCALL_TYPE
+aarch64 W-flow-reclassed svc BRANCH_SYSCALL_TYPE
 
 # SVE2.1 / SME2 predicate-PAIR destinations.  `whilege { p14.b, p15.b }, ...`
 # writes two predicate registers and Capstone reports only the first; the

@@ -301,59 +301,6 @@ aarch64 D-cs-only stp
 #     binary the tracer traces today, and each names its fix.
 # =====================================================================
 
-# Zacas compare-and-swap: `amocas.d t0, s2, (t1)` has rd tied — it is the
-# comparand on the way in and the loaded value on the way out — and
-# Capstone reports it READ-only, so the destination is dropped ENTIRELY
-# (csWR{} against llvmWR{r5}).  This is the same Capstone tied-operand
-# handling that loses the RVV multiply-accumulate destination, which
-# disas/capstone.c already repairs; the Zacas family needs the same
-# treatment there.  Not reachable yet: it takes -march=...\_zacas to emit
-# one.  FIX: extend the RISC-V tied-destination repair in
-# cap_fill_generic_operands() to the amocas.* forms; delete these lines
-# when it lands.
-riscv64 R-wr-missing amocas.d +r#
-riscv64 R-wr-missing amocas.d.aq +r#
-riscv64 R-wr-missing amocas.d.aqrl +r#
-riscv64 R-wr-missing amocas.d.rl +r#
-riscv64 R-wr-missing amocas.w +r#
-riscv64 R-wr-missing amocas.w.aq +r#
-riscv64 R-wr-missing amocas.w.aqrl +r#
-riscv64 R-wr-missing amocas.w.rl +r#
-
-# CORE-V (XCVmac) `cv.*nr` accumulate-and-round forms: identical shape to
-# the Zacas case above — a tied destination Capstone reports read-only.
-# A vendor extension; QEMU implements no CORE-V core, so no trace can ever
-# contain one.  MODELLING DECISION: not worth a boundary workaround on its
-# own; it would fall out of a general tied-destination repair.
-riscv64 R-wr-missing cv.addnr +r#
-riscv64 R-wr-missing cv.addrnr +r#
-riscv64 R-wr-missing cv.addunr +r#
-riscv64 R-wr-missing cv.addurnr +r#
-riscv64 R-wr-missing cv.subnr +r#
-riscv64 R-wr-missing cv.subrnr +r#
-riscv64 R-wr-missing cv.subunr +r#
-riscv64 R-wr-missing cv.suburnr +r#
-
-# XVentanaCondOps `vt.maskc` / `vt.maskcn` are SCALAR conditional moves
-# whose mnemonic happens to begin "vt."; Capstone files them with the
-# vector forms and attaches the RVV context reads (vl, vtype) that every
-# real vector instruction has.  Phantom dependencies on a vendor extension
-# QEMU does not implement.  WONT-FIX at the boundary: the fix belongs in
-# Capstone's own instruction description, and a name-based exclusion here
-# would be a second guess at the same table.
-riscv64 R-rd-phantom vt.maskc +vl,vtype
-riscv64 R-rd-phantom vt.maskcn +vl,vtype
-
-# Zfa `fli.s/d/h` load an immediate from a 32-entry constant table, and
-# Capstone types that operand RISCV_OP_FP — a type the boundary's RISC-V
-# operand filler has no case for, so it lands in QEMU_PLUGIN_OP_INVALID and
-# the instruction's immediate is lost.  The register sets agree, so no
-# dependency edge is wrong; what is missing is the constant.  Same class as
-# the RISC-V CSR operands in section 2.  FIX: a RISCV_OP_FP case in
-# cap_fill_generic_operands() alongside RISCV_OP_IMM.
-riscv64 Z-unmodelled-op fli.d
-riscv64 Z-unmodelled-op fli.h
-riscv64 Z-unmodelled-op fli.s
 
 # RVV whole-register MOVE reports the vector-context CSRs it does not read.
 # `vmv2r.v` copies a register GROUP by architecture, independent of vl and

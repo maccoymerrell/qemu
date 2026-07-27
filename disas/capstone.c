@@ -2224,6 +2224,166 @@ static bool cap_riscv_reads_dynamic_frm(const cs_insn *insn)
 }
 
 /*
+ * RISC-V scalar tied-destination families -- see the workaround in
+ * cap_fill_generic_operands().
+ *
+ * The same Capstone tied-operand handling that loses the RVV
+ * multiply-accumulate destination (cap_riscv_is_tied_vd) also loses two
+ * families outside the vector unit, and there it loses the destination
+ * ENTIRELY: the operand arrives READ-only, so the instruction reports no
+ * write at all and produces nothing anything can depend on.
+ *
+ * Zacas `amocas.w/.d/.q rd, rs2, (rs1)` is a compare-and-swap, and rd
+ * carries both directions of it.  The unprivileged ISA manual's Zacas
+ * chapter states the operation as: load the word addressed by rs1,
+ * compare it with rd, store rs2 if they matched, and write the loaded
+ * word to rd -- rd is the COMPARAND on the way in and the OBSERVED
+ * MEMORY VALUE on the way out.  Reporting it READ-only makes the "did
+ * my CAS win" comparison that follows every compare-and-swap loop read
+ * a register nothing in the trace ever wrote.  The double-width forms
+ * (amocas.d on RV32, amocas.q on RV64) name an even-odd register pair,
+ * which does not change the direction question: Capstone prints the
+ * even register and it is read and written either way.
+ *
+ * CORE-V (XCValu) `cv.{add,sub}[u][r]nr rD, rs1, rs2` normalises in
+ * place -- rD = (rD +/- rs1) >> rs2[4:0], `u` selecting the unsigned
+ * (logical) shift and `r` adding the round-to-nearest half before it --
+ * so rD is an accumulator, exactly like the RVV multiply-accumulate
+ * shape.  The trailing `nr` is what separates them from the
+ * immediate-shift siblings `cv.addn` / `cv.addun` / ..., which take the
+ * shift amount as an immediate and write a fresh rD; Capstone's XCValu
+ * name table contains exactly eight `nr` mnemonics and they are the
+ * whole family, so the suffix test is closed and cannot over-reach.
+ * The XCVmac multiply-accumulates (`cv.mac`, `cv.macsn`, ...) are the
+ * same accumulator shape but the tracer's Capstone mode does not enable
+ * XCVmac, so they never reach this path and are deliberately not named
+ * here.
+ *
+ * Revisit / remove when Capstone is bumped past 6.0.0-Alpha7; verify
+ * with `isaxcheck --isa=riscv64 --hex=af221328` (`amocas.w t0, ra,
+ * (t1)`) and `--hex=ab321380` (`cv.addnr t0, t1, ra`) -- fixed, the
+ * boundary's WR set must name r5 without this workaround.
+ */
+static bool cap_riscv_is_tied_rd(const char *mnem)
+{
+    size_t len;
+
+    if (!mnem) {
+        return false;
+    }
+    if (g_str_has_prefix(mnem, "amocas.")) {
+        return true;
+    }
+    if (!g_str_has_prefix(mnem, "cv.")) {
+        return false;
+    }
+    len = strlen(mnem);
+    return len > 5 && !strcmp(mnem + len - 2, "nr");
+}
+
+/*
+ * Is this encoding in the RVV instruction space?
+ *
+ * The vl/vtype restore in cap_fill_generic_operands() keys off the
+ * mnemonic, and a mnemonic is not enough: RISC-V vendor extensions put
+ * non-vector instructions in the `v` namespace.  XVentanaCondOps spells
+ * its two SCALAR conditional moves `vt.maskc` / `vt.maskcn` -- GPR in,
+ * GPR out, major opcode custom-3, the vendor precursor of Zicond's
+ * `czero.nez` / `czero.eqz` -- so a name test files them with the
+ * vector unit and hangs the RVV configuration CSRs on them, inventing a
+ * dependency on the last `vsetvli` for an instruction that has nothing
+ * to do with the vector unit and does not change behaviour with vl.
+ *
+ * Decide it from the encoding instead, which is the architecture rather
+ * than a second guess at a name table.  RVV v1.0 occupies exactly three
+ * major opcodes: OP-V (0b1010111) holds the arithmetic, permute, mask
+ * and `vsetvl*` configuration instructions, and LOAD-FP (0b0000111) /
+ * STORE-FP (0b0100111) hold the vector loads and stores, told apart
+ * from the scalar FP loads and stores that share those opcodes by the
+ * width field -- vector uses 0b000/0b101/0b110/0b111 for 8/16/32/64-bit
+ * elements, scalar FP uses 0b001/0b010/0b011/0b100 for h/w/d/q.
+ * Nothing else in RVV 1.0 is encoded outside those three (the vector
+ * AMOs that would have been were dropped before ratification), and
+ * there are no compressed vector encodings, so a 2-byte instruction
+ * cannot be one.
+ */
+static bool cap_riscv_is_vector_encoding(const cs_insn *insn)
+{
+    uint32_t word;
+
+    if (insn->size != 4) {
+        return false;
+    }
+    word = (uint32_t)insn->bytes[0] | ((uint32_t)insn->bytes[1] << 8) |
+           ((uint32_t)insn->bytes[2] << 16) | ((uint32_t)insn->bytes[3] << 24);
+
+    switch (word & 0x7f) {
+    case 0x57:                              /* OP-V */
+        return true;
+    case 0x07:                              /* LOAD-FP  */
+    case 0x27:                              /* STORE-FP */
+        switch ((word >> 12) & 0x7) {       /* width */
+        case 0:                             /* 8-bit elements  */
+        case 5:                             /* 16-bit elements */
+        case 6:                             /* 32-bit elements */
+        case 7:                             /* 64-bit elements */
+            return true;
+        default:                            /* scalar flh/flw/fld/flq */
+            return false;
+        }
+    default:
+        return false;
+    }
+}
+
+/*
+ * Zfa `fli` table index.
+ *
+ * `fli.h/s/d/q rd, <constant>` materialises one of 32 constants, and the
+ * constant is not what the instruction encodes: the Zfa chapter defines
+ * the 5-bit rs1 field as an INDEX into a fixed table (row 0 is -1.0, row
+ * 1 the smallest positive normal number of the format, rows 2..29 a
+ * fixed ladder of powers and simple fractions, row 30 +inf and row 31 a
+ * canonical NaN), and QEMU's own translator says the same thing in one
+ * line -- `tcg_gen_movi_i64(dest, fli_s_table[a->rs1])` in
+ * target/riscv/insn_trans/trans_rvzfa.c.inc.  Both disassemblers print
+ * the decoded constant (`fli.s ft5, 0.0625`, `fli.s ft5, min`), which is
+ * the assembly syntax, not the operand's encoded value.
+ *
+ * Recognise the shape rather than trusting the operand type alone:
+ * OP-FP with rm = 0, the rs2 field holding the fli selector 1, and a
+ * funct7 in the fmv/fli block 0b11110xx that names the format.  A
+ * RISCV_OP_FP operand on anything else is a Capstone representation the
+ * boundary has not been taught, and the caller leaves it unmodelled so
+ * the decode gate reports it rather than silently inventing a number.
+ */
+static bool cap_riscv_fli_index(const cs_insn *insn, int64_t *index)
+{
+    uint32_t word;
+
+    if (insn->size != 4) {
+        return false;
+    }
+    word = (uint32_t)insn->bytes[0] | ((uint32_t)insn->bytes[1] << 8) |
+           ((uint32_t)insn->bytes[2] << 16) | ((uint32_t)insn->bytes[3] << 24);
+
+    if ((word & 0x7f) != 0x53) {            /* not OP-FP */
+        return false;
+    }
+    if (((word >> 12) & 0x7) != 0) {        /* rm != 0 */
+        return false;
+    }
+    if (((word >> 20) & 0x1f) != 1) {       /* rs2 != the fli selector */
+        return false;
+    }
+    if ((word >> 27) != 0x1e) {             /* funct7 not 0b11110xx */
+        return false;
+    }
+    *index = (int64_t)((word >> 15) & 0x1f);
+    return true;
+}
+
+/*
  * Zicsr access direction.
  *
  * Capstone reports every CSR operand as READ|WRITE, but the ISA
@@ -2418,6 +2578,45 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                 op->index_id   = 0;
                 op->imm = cop->mem.disp;
                 break;
+            case RISCV_OP_FP:
+                /*
+                 * The constant a Zfa `fli` names.  Capstone rewrites
+                 * this operand out of the immediate type into its own
+                 * FP type, parking the DECODED constant in cop->dimm as
+                 * a C double -- so presented as anything else the
+                 * instruction arrives with an unmodelled operand and no
+                 * immediate at all, and presented as cop->dimm cast to
+                 * an integer every constant below 1.0 would arrive as
+                 * zero.
+                 *
+                 * Carry the encoded field, exactly as the CSR arm below
+                 * carries the raw 12-bit CSR number rather than a name:
+                 * what `fli` encodes is a 5-bit index into the Zfa
+                 * constant table (see cap_riscv_fli_index), and the
+                 * decoded value the disassembly prints is a property of
+                 * that table and the format suffix, not of the operand.
+                 *
+                 * An FP operand on any other encoding is a Capstone
+                 * representation this boundary has not been taught, and
+                 * is deliberately left unmodelled so the decode gate
+                 * reports it instead of it arriving as a plausible
+                 * number.
+                 */
+                {
+                    int64_t fli_index;
+                    if (cap_riscv_fli_index(insn, &fli_index)) {
+                        op->type = QEMU_PLUGIN_OP_IMM;
+                        op->imm  = fli_index;
+                    } else {
+                        op->type = QEMU_PLUGIN_OP_INVALID;
+                        op->imm  = 0;
+                    }
+                }
+                op->reg_name[0] = '\0';
+                op->reg_id     = 0;
+                op->index_name[0] = '\0';
+                op->index_id   = 0;
+                break;
             case RISCV_OP_CSR:
                 /*
                  * The control and status register a Zicsr instruction
@@ -2559,6 +2758,30 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                                      | QEMU_PLUGIN_OP_ACC_WRITE;
         }
         /*
+         * Capstone 6.0.0-Alpha7 scalar tied-destination bug workaround.
+         *
+         * The same defect as the RVV one above, outside the vector unit
+         * and one step worse: Zacas `amocas.*` and CORE-V `cv.*nr`
+         * arrive with their destination operand marked READ-only, so
+         * the instruction reports NO destination at all -- `amocas.w
+         * t0, ra, (t1)` says csWR{} where the architecture and LLVM
+         * both say t0 is written.  A compare-and-swap that produces
+         * nothing breaks the retry loop it exists to serialise, and an
+         * accumulate that produces nothing breaks the chain it
+         * accumulates along.
+         *
+         * See cap_riscv_is_tied_rd for what each family does with the
+         * register and why the mnemonic sets are closed.  Restoring the
+         * pair (not just the write) is correct for both: the read
+         * Capstone reports is real -- the comparand for Zacas, the
+         * accumulator for CORE-V.
+         */
+        if (cap_riscv_is_tied_rd(insn->mnemonic) && n >= 1
+            && out->operands[0].type == QEMU_PLUGIN_OP_REG) {
+            out->operands[0].access |= QEMU_PLUGIN_OP_ACC_READ
+                                     | QEMU_PLUGIN_OP_ACC_WRITE;
+        }
+        /*
          * Capstone 6.0.0-Alpha7 RVV vector-configuration bug workaround.
          *
          * Every RVV instruction's behaviour is a function of the `vl` and
@@ -2660,8 +2883,19 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                 out->n_regs_read++;
             }
         }
+        /*
+         * ... and only for instructions that are actually in the vector
+         * unit.  `insn->mnemonic[0] == 'v'` is the family the defect
+         * lives in, but it is not the family boundary: XVentanaCondOps
+         * spells two SCALAR conditional moves `vt.maskc` / `vt.maskcn`,
+         * and attaching the RVV configuration reads to those invents a
+         * dependency on a `vsetvli` for an instruction whose result does
+         * not depend on vl or vtype at all.  cap_riscv_is_vector_encoding
+         * settles it from the major opcode instead of from a name.
+         */
         if (insn->mnemonic[0] == 'v'
-            && !g_str_has_prefix(insn->mnemonic, "vsetvl")) {
+            && !g_str_has_prefix(insn->mnemonic, "vsetvl")
+            && cap_riscv_is_vector_encoding(insn)) {
             bool has_vl = false;
             for (uint8_t i = 0; i < out->n_regs_read; i++) {
                 if (out->regs_read_id[i] == RISCV_REG_VL

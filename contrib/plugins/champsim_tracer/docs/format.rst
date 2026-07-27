@@ -2294,9 +2294,21 @@ Current generic register layout:
    | 129..192    | REG_VEC0..63       |
    | 193..224    | REG_PRED0..31      |
    | 225..230    | REG_SEG0..5        |
-   | 231..245    | compressed special |
+   | 231..249    | compressed special |
    | 250..254    | common specials    |
    +-------------+--------------------+
+
+The compressed-special band holds the classes that are one register
+rather than a bank: ``REG_CTRL``, ``REG_DEBUG``, ``REG_BOUND0..3``,
+``REG_ACC0..3``, ``REG_ZERO``, ``REG_MATRIX``, ``REG_SYS``,
+``REG_FCSR``, ``REG_VCTRL``, ``REG_TLS``, ``REG_VSTART``,
+``REG_DSPCTRL`` and ``REG_MSACSR``.  System and control registers are
+spread across several of those rather than folded onto ``REG_SYS``,
+because an edge onto a register the instruction never touched misleads
+a consumer as badly as a missing one — a thread-pointer read must not
+be ordered behind an unrelated ``mrs``, and a vector op clearing
+``vstart`` must not look like it redefined ``vl``.  :doc:`reference`
+carries the per-ID notes.
 
 The header map, not this table, is authoritative for decoding names.
 
@@ -2800,5 +2812,6 @@ Steps 1-7 cover the same flow at byte granularity, with the names a
 decoder reverse-looks-up in each encoding map (Step 3.3).
 
 The header maps are the compatibility mechanism for custom traces. If a
-future trace adds ``REG_FOO = 246`` or a new generic opcode, the numeric
-value and its string name travel together in the header member.
+future trace adds a register ID this build does not know or a new
+generic opcode, the numeric value and its string name travel together
+in the header member.

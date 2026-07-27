@@ -498,19 +498,48 @@ derive activity itself.
 carries a governing predicate *and* a vector-select register; only the
 first is represented, for the same one-slot reason as above.
 
-**RISC-V CSR indices have no generic register id.**  The tracer models
-the specific control registers its ISA tables name — ``frm``/``fflags``
-onto ``REG_FCSR``, ``vl``/``vtype``/``vlenb`` onto ``REG_VCTRL`` — so
-those dependency edges are real.  A general ``csrrw``/``csrrs`` against
-an arbitrary CSR number records the general-purpose operands but no CSR
-dependency, because the generic register space has no slot to put it in.
+**Cumulative FP exception status is not modelled.**  AArch64 ``FPSR``
+and the RISC-V ``fflags`` accumulation are written by every FP
+instruction that can raise an exception; the tracer records neither.
+The register model carries dataflow registers, and threading a
+read-modify-write of one status word through the whole FP stream would
+put every FP instruction on a serial chain no implementation renames —
+a false dependency on that scale misleads a consumer further than the
+missing edge does.  The *control* half is modelled in full: ``FPCR``
+and ``frm`` are read wherever the rounding mode is an input, and an
+explicit ``msr fpsr`` or ``fscsr`` is a real write of ``REG_FCSR``.
 
-**MIPS coprocessor and control banks collapse.**  Every coprocessor
-register folds onto ``REG_SYS`` and every FP control register onto
-``REG_FCSR``, so COP0 register 3 and COP2 register 3 are one slot, as are
-``FCR0`` and ``FCR31``.  The HI and LO halves of a MIPS accumulator
-likewise share one ``REG_ACC`` slot.  These are deliberate: the
-dependency model tracks the hazard, not the architectural bank.
+**RISC-V ``vstart`` is modelled only where it is moved explicitly.**
+Architecturally every vector instruction reads ``vstart`` and clears
+it.  The tracer records ``REG_VSTART`` only for the ``csrr`` /
+``csrrw`` accesses that name it: outside a mid-instruction trap resume
+``vstart`` is zero and stays zero, so threading it through every vector
+op would serialise the vector stream on a register whose value never
+changes.
+
+**The tail-undisturbed RVV destination read is not statically
+decidable.**  Under ``vtype.vta == 0``, ``vtype.vma == 0`` or
+``vstart > 0`` a vector destination keeps its previous contents in the
+inactive elements, which makes ``vd`` a source of nearly every vector
+instruction.  Those bits live in a CSR an earlier ``vsetvl`` wrote, so
+a per-opcode template cannot express the dependency without carrying
+``vtype`` in its key, and the tracer does not model it.  The one
+sub-case that *is* decidable from the instruction word is modelled:
+when the destination is a **mask** register — the integer and FP
+compares, ``vmadc``/``vmsbc``, the mask-logical ops,
+``vmsbf``/``vmsif``/``vmsof`` and ``vlm.v`` — the mask tail is
+undisturbed regardless of ``vta``, so ``vd`` is recorded as a source.
+
+**MIPS coprocessor banks collapse.**  Every coprocessor register folds
+onto ``REG_SYS``, so COP0 register 3 and COP2 register 3 are one slot;
+every FP control register folds onto ``REG_FCSR``, so are ``FCR0`` and
+``FCR31``.  The HI and LO halves of a MIPS accumulator likewise share
+one ``REG_ACC`` slot.  These are deliberate: the dependency model
+tracks the hazard, not the architectural bank.  The registers pulled
+back out of ``REG_SYS`` are the ones where the collapse invented edges
+rather than merging them — the ``rdhwr $29`` thread pointer
+(``REG_TLS``), ``DSPControl`` (``REG_DSPCTRL``) and MSA's control word
+(``REG_MSACSR``).
 
 **Wrong-path decode of arbitrary bytes is best-effort.**  Capstone
 accepts encodings whose architecturally-fixed fields hold reserved

@@ -557,20 +557,63 @@ without implying any particular numeric base.
      - Hardwired-zero register (RISC-V ``x0``, MIPS ``$zero``,
        aarch64 ``xzr``).
    * - ``REG_MATRIX``
-     - Tile/matrix register family (AMX TMM, SME ZA).
+     - Tile/matrix register family (AMX TMM, SME ZA).  An SME
+       ``ldr``/``str``/``mova`` names the ZA tile here and the ``w12``
+       slice-index GPR alongside it.
    * - ``REG_SYS``
-     - Generic system register (per-arch MSR / MRS / CSR space).
+     - Generic system register: the long tail of the per-arch MSR /
+       MRS / CSR / CP0 space — everything the ISA's system-register
+       mapper does not name specifically.  AArch64 ``mrs``/``msr`` and
+       RISC-V ``csrr``/``csrrw`` reach it through the
+       ``QEMU_PLUGIN_OP_SYSREG`` operand, which carries the raw
+       architectural encoding rather than a decoder register id.
    * - ``REG_FCSR``
      - Floating-point control / status register (RISC-V ``frm`` /
-       ``fflags``, AArch64 ``FPCR``, MIPS ``FCR``\ *n*).
+       ``fflags`` / ``fcsr``, AArch64 ``FPCR`` / ``FPSR`` / ``FPMR``,
+       MIPS ``FCR``\ *n*).  Read by FP arithmetic wherever the rounding
+       mode is an input: on RISC-V that is any FP encoding whose ``rm``
+       field is ``DYN``, on AArch64 every FP form.  The cumulative
+       exception-status half (AArch64 ``FPSR``, RISC-V ``fflags``
+       accumulation) is deliberately not modelled as a per-instruction
+       write — see :doc:`limitations`.
    * - ``REG_VCTRL``
      - Vector control register (RVV ``vtype`` / ``vl`` / ``vlenb`` /
-       ``vxrm`` / ``vxsat``, SVE ``ZCR`` / ``FFR`` / ``VG``, MIPS MSA
-       control).  On RISC-V this carries the vector-configuration edge:
+       ``vxrm`` / ``vxsat`` / ``vcsr``, SVE ``ZCR`` / ``FFR`` /
+       ``VG``).  On RISC-V this carries the vector-configuration edge:
        ``vsetvli`` / ``vsetivli`` / ``vsetvl`` write it and every
        vector instruction reads it, so a vector kernel's operations are
        ordered against the configuration that decides how many elements
        they process.
+   * - ``REG_TLS``
+     - Thread pointer: AArch64 ``TPIDR_EL0`` / ``TPIDRRO_EL0``, and the
+       MIPS CP0 UserLocal word ``rdhwr $29`` reads.  Distinct from
+       ``REG_SYS`` because every thread-local access reads it, and on
+       the shared ID each of those reads would be ordered behind
+       whatever unrelated system register the last ``mrs`` or ``mfc0``
+       happened to touch.  AArch64 ``TPIDR_EL1``, the kernel's per-CPU
+       base, is a different register and stays ``REG_SYS``.
+   * - ``REG_VSTART``
+     - RISC-V ``vstart``, the element index a partially executed vector
+       instruction resumes from.  Distinct from ``REG_VCTRL`` because
+       every vector instruction clears it: on the shared ID each vector
+       op would look like it redefined ``vl`` and ``vtype``, replacing a
+       kernel's edges onto its configuring ``vsetvli`` with edges onto
+       its own predecessor.  Only the explicit accesses — a ``csrr`` or
+       ``csrrw`` naming ``vstart`` — appear; the per-vector-op clear is
+       not modelled, see :doc:`limitations`.
+   * - ``REG_DSPCTRL``
+     - MIPS ``DSPControl``.  One ID for one architectural register: its
+       ``ccond``, ``carry``, ``ouflag``, ``pos``, ``scount`` and
+       ``EFI`` fields all land here.  ``rddsp`` and ``wrdsp`` move the
+       whole word, ``bposge32`` branches on ``pos``, ``mthlip`` reads
+       and updates it, and the saturating DSP arithmetic writes
+       ``ouflag``.
+   * - ``REG_MSACSR``
+     - MIPS MSA control / status register, reached by ``cfcmsa`` and
+       ``ctcmsa``.  Separate from ``REG_VCTRL``, which carries a
+       different ISA's vector configuration, and from ``REG_SYS``,
+       where Capstone's coprocessor-register rendering would otherwise
+       place it beside every CP0 access.
    * - ``REG_SP``
      - Stack pointer.
    * - ``REG_FLAGS``

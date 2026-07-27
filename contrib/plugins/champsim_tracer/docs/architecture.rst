@@ -581,6 +581,51 @@ serializes the per-vCPU execution callback so the WP simulator can
 run synchronously inside it.  See `Synchronization summary`_ for why
 ``exec_lock`` is recursive.
 
+.. _sysreg-operands:
+
+System and control registers
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Every other register reaches the plugin as a Capstone register id and
+resolves through ``<isa>_reg_class[]``.  System registers cannot: an
+ISA that names them outside its register file numbers them in a space
+of its own — an AArch64 ``mrs`` operand carries the packed
+``op0:op1:CRn:CRm:op2`` word (``NZCV`` is ``0xda10``, while the
+ordinary ``AARCH64_REG_NZCV`` is ``5``), and a RISC-V Zicsr
+instruction carries a bare 12-bit CSR number in what is architecturally
+an immediate field.  Indexing the register table with either would read
+the wrong row or run off its end.
+
+They travel instead as ``QEMU_PLUGIN_OP_SYSREG`` operands whose
+``reg_id`` holds the raw architectural encoding, and
+``decode_detail_to_generic`` resolves them through
+``IsaProperties::sysreg_to_generic`` — one small function per ISA,
+living beside that ISA's register table.  Two consequences are worth
+stating:
+
+* **Direction comes from the boundary, not from Capstone.**  Capstone
+  leaves the AArch64 system operand's access bits empty and reports
+  every RISC-V CSR operand as read-modify-write.  ``disas/capstone.c``
+  fills the access from the instruction form instead: ``MRS`` reads and
+  ``MSR`` writes (the operand's own ``sysop.sub_type`` says which), and
+  Zicsr follows its suppression rules — ``csrrw`` with ``rd == x0``
+  does not read, ``csrrs``/``csrrc`` with a zero ``rs1`` does not
+  write.  Getting that wrong is not cosmetic: reporting ``csrr a0, vl``
+  as a write of ``vl`` would reroute every following vector
+  instruction's configuration edge onto it.
+
+* **The mapping is deliberately not one slot.**  ``REG_SYS`` takes the
+  long tail, but the registers with their own dependency populations
+  get their own IDs — ``REG_FLAGS`` for AArch64 ``NZCV`` (so an ``msr
+  nzcv`` and the ``b.eq`` after it meet), ``REG_FCSR`` for the FP
+  control words, ``REG_TLS`` for the thread pointer, ``REG_VSTART`` for
+  the RISC-V vector resume index.  A dependency edge onto a register
+  the instruction never touched costs a consumer as much as a missing
+  one; :doc:`reference` records the reasoning per ID.
+
+An ISA that surfaces no such operands leaves ``sysreg_to_generic``
+NULL and the operand type is simply never produced for it.
+
 .. _cp-flow:
 
 Correct-path flow

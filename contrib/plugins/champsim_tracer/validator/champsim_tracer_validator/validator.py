@@ -2555,8 +2555,12 @@ _AARCH64_SYSREG_GENERIC = {
 _RISCV_CSR_GENERIC = {
     0x001: "REG_FCSR", 0x002: "REG_FCSR", 0x003: "REG_FCSR",
     0x008: "REG_VSTART",
-    0x009: "REG_VCTRL", 0x00a: "REG_VCTRL", 0x00f: "REG_VCTRL",
-    0xc20: "REG_VCTRL", 0xc21: "REG_VCTRL", 0xc22: "REG_VCTRL",
+    # vxsat / vxrm / vcsr are status, not configuration.
+    0x009: "REG_VCSR", 0x00a: "REG_VCSR", 0x00f: "REG_VCSR",
+    # vl / vtype are the configuration a vsetvl writes as a pair.
+    0xc20: "REG_VCTRL", 0xc21: "REG_VCTRL",
+    # vlenb is a read-only implementation constant.
+    0xc22: "REG_SYS",
 }
 
 

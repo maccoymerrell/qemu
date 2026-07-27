@@ -623,8 +623,34 @@ stating:
   the instruction never touched costs a consumer as much as a missing
   one; :doc:`reference` records the reasoning per ID.
 
+The rule that decides where a control register lands is *what would
+alias what*, not what the manual calls it.  Two registers share an ID
+when a consumer ordering one against the other is right, and get
+separate IDs when it is not:
+
+* RISC-V ``vl`` and ``vtype`` share ``REG_VCTRL`` because a ``vsetvl``
+  writes them as a pair and every vector instruction reads both — no
+  edge exists between them that the shared ID invents.
+* ``vxrm`` and ``vxsat`` do **not** join them.  They are ``vcsr``'s
+  fields, and a saturating op writes ``vxsat`` without touching ``vl``;
+  on the shared ID every one of them would appear to redefine the
+  vector length its neighbours read.  They get ``REG_VCSR``, together
+  with MIPS ``MSACSR``, which plays the same role for MSA.
+* ``vlenb`` is read-only — VLEN in bytes, which nothing writes — so it
+  sits in ``REG_SYS`` with the identification registers rather than
+  taking a false edge from the last ``vsetvli``.
+
 An ISA that surfaces no such operands leaves ``sysreg_to_generic``
 NULL and the operand type is simply never produced for it.
+
+One consequence reaches the tooling.  A system register's dependency is
+recorded at the granularity of its generic ID, so the decode gate and
+the implicit-operand table compare AGAINST THAT CLASS, not against the
+architectural name: ``mrs x0, nzcv`` reads ``REG_FLAGS``, and the fact
+that it was spelled ``NZCV`` rather than ``PSTATE`` is not a dependency
+fact.  ``tools/implicit_audit.py`` carries the name-to-class
+correspondence in its ``ACCEPT`` table; a register newly given a class
+needs its name added there.
 
 .. _cp-flow:
 

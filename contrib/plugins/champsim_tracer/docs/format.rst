@@ -2302,7 +2302,7 @@ The compressed-special band holds the classes that are one register
 rather than a bank: ``REG_CTRL``, ``REG_DEBUG``, ``REG_BOUND0..3``,
 ``REG_ACC0..3``, ``REG_ZERO``, ``REG_MATRIX``, ``REG_SYS``,
 ``REG_FCSR``, ``REG_VCTRL``, ``REG_TLS``, ``REG_VSTART``,
-``REG_DSPCTRL`` and ``REG_MSACSR``.  System and control registers are
+``REG_DSPCTRL`` and ``REG_VCSR``.  System and control registers are
 spread across several of those rather than folded onto ``REG_SYS``,
 because an edge onto a register the instruction never touched misleads
 a consumer as badly as a missing one — a thread-pointer read must not

@@ -1942,8 +1942,23 @@ def classify_riscv_reg(name: str) -> RegEntry:
         return reg_ent("REG_SP")
     if name in {"FFLAGS", "FRM"}:
         return reg_ent("REG_FCSR")
-    if name in {"VL", "VLENB", "VTYPE", "VXRM", "VXSAT"}:
+    # vl and vtype are the vector CONFIGURATION a vsetvl writes as a
+    # pair and every vector instruction reads.
+    if name in {"VL", "VTYPE"}:
         return reg_ent("REG_VCTRL")
+    # vxrm and vxsat are fields of vcsr -- the fixed-point rounding mode
+    # and the saturation flag.  Not configuration: a saturating op
+    # writes vxsat without touching vl, and on REG_VCTRL every one of
+    # them would appear to redefine the vector length its neighbours
+    # read.
+    if name in {"VXRM", "VXSAT"}:
+        return reg_ent("REG_VCSR")
+    # vlenb is VLEN in bytes: a read-only implementation constant, in
+    # the same class as the ID registers, and never written by anything.
+    # On REG_VCTRL a read of it would take a false edge from the last
+    # vsetvli, which does not change VLEN.
+    if name == "VLENB":
+        return reg_ent("REG_SYS")
     if re.fullmatch(r"X\d+", name):
         num = first_number(name) or 0
         if num == 1:
@@ -2022,12 +2037,12 @@ def classify_mips_reg(name: str) -> RegEntry:
     # two populations DSPControl has no relationship with.
     if stem.startswith("DSP"):
         return reg_ent("REG_DSPCTRL")
-    # MSA control and status.  Distinct from REG_VCTRL, which on the
-    # other vector ISA carries the RISC-V vl/vtype configuration; MSACSR
-    # is the MSA rounding mode and exception status, and it is the only
-    # MSA control register any instruction reaches.
+    # MSA control and status: the vector unit's rounding mode and
+    # exception flags.  REG_VCSR, not REG_VCTRL -- that ID carries
+    # vector *configuration* (the other vector ISA's vl/vtype), and a
+    # status word an FP op updates is not configuration.
     if stem.startswith("MSA"):
-        return reg_ent("REG_MSACSR")
+        return reg_ent("REG_VCSR")
     return reg_none()
 
 

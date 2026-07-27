@@ -277,15 +277,22 @@ enum GenericRegId {
      *               across REG_FLAGS and REG_VCTRL — where the halves
      *               aliased arithmetic condition flags and MSA vector
      *               control respectively.
-     *   REG_MSACSR  the MIPS MSA control/status register.  Capstone
-     *               renders it as a coprocessor register, which lands
-     *               it on REG_SYS beside every CP0 access, so a
-     *               `cfcmsa` reads whatever the last `mtc0` wrote.
+     *   REG_VCSR    the vector unit's rounding-mode and status word:
+     *               RISC-V `vcsr` and its `vxrm` / `vxsat` fields, MIPS
+     *               `MSACSR`.  Distinct from REG_VCTRL because it is
+     *               not configuration — a saturating fixed-point op
+     *               writes `vxsat` without touching `vl`, so sharing
+     *               the ID would make every one of them appear to
+     *               redefine the vector length its neighbours read.
+     *               Distinct from REG_SYS because Capstone renders
+     *               MSACSR as a coprocessor register, which would put
+     *               it beside every CP0 access and make `cfcmsa` read
+     *               whatever the last `mtc0` wrote.
      */
     REG_TLS = 246,
     REG_VSTART = 247,
     REG_DSPCTRL = 248,
-    REG_MSACSR = 249,
+    REG_VCSR = 249,
     /* Common architectural special registers: 250-254 */
     REG_SP = 250,
     REG_FLAGS = 251,
@@ -430,7 +437,7 @@ static inline const char *generic_reg_name(unsigned id)
     case REG_TLS:     return "REG_TLS";
     case REG_VSTART:  return "REG_VSTART";
     case REG_DSPCTRL: return "REG_DSPCTRL";
-    case REG_MSACSR:  return "REG_MSACSR";
+    case REG_VCSR:    return "REG_VCSR";
     case REG_SP:      return "REG_SP";
     case REG_FLAGS:   return "REG_FLAGS";
     case REG_IP:      return "REG_IP";

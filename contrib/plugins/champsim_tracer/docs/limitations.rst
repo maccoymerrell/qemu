@@ -539,7 +539,7 @@ tracks the hazard, not the architectural bank.  The registers pulled
 back out of ``REG_SYS`` are the ones where the collapse invented edges
 rather than merging them — the ``rdhwr $29`` thread pointer
 (``REG_TLS``), ``DSPControl`` (``REG_DSPCTRL``) and MSA's control word
-(``REG_MSACSR``).
+(``REG_VCSR``).
 
 **Wrong-path decode of arbitrary bytes is best-effort.**  Capstone
 accepts encodings whose architecturally-fixed fields hold reserved

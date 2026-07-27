@@ -186,10 +186,21 @@ static uint64_t riscv_canonicalize_addr(uint64_t a)
  *   use, so an `fsrm` and the `fadd.d` that consumes its rounding mode
  *   meet on one slot.
  *
- *   The vector configuration (vl / vtype / vlenb, and the fixed-point
- *   vxrm / vxsat / vcsr that travel with them) is REG_VCTRL, again
- *   matching the register rows, so `csrr a0, vl` reads what `vsetvli`
- *   wrote.
+ *   The vector CONFIGURATION -- vl and vtype, which a vsetvl writes as
+ *   a pair and every vector instruction reads -- is REG_VCTRL, matching
+ *   the register rows, so `csrr a0, vl` reads what `vsetvli` wrote.
+ *
+ *   The fixed-point rounding mode and saturation flag (vxrm / vxsat,
+ *   and the vcsr that is the two of them in one word) are REG_VCSR, not
+ *   REG_VCTRL.  They are status, not configuration: a saturating op
+ *   writes vxsat without touching vl, and sharing the ID would make
+ *   every one of them appear to redefine the vector length its
+ *   neighbours read -- the same fabrication REG_VSTART exists to avoid.
+ *
+ *   vlenb is VLEN in bytes, a read-only implementation constant nothing
+ *   writes, so it belongs with the identification registers in REG_SYS.
+ *   On REG_VCTRL a read of it would take an edge from the last vsetvli,
+ *   which does not change VLEN.
  *
  *   vstart is deliberately NOT REG_VCTRL.  It is the resume index of a
  *   partially executed vector instruction, and every vector
@@ -216,10 +227,12 @@ static uint8_t riscv_csr_to_generic(uint16_t csr)
     case 0x009:  /* vxsat  */
     case 0x00a:  /* vxrm   */
     case 0x00f:  /* vcsr   */
+        return REG_VCSR;
     case 0xc20:  /* vl     */
     case 0xc21:  /* vtype  */
-    case 0xc22:  /* vlenb  */
         return REG_VCTRL;
+    case 0xc22:  /* vlenb  */
+        return REG_SYS;
     default:
         return REG_SYS;
     }
@@ -235,10 +248,10 @@ static const RegClassification riscv_reg_class[RISCV_REG_ENDING] = {
     [RISCV_REG_FRM] = { .reg_id = REG_FCSR },  /* frm */
     [RISCV_REG_SSP] = { .reg_id = REG_SP },  /* ssp */
     [RISCV_REG_VL] = { .reg_id = REG_VCTRL },  /* vl */
-    [RISCV_REG_VLENB] = { .reg_id = REG_VCTRL },  /* vlenb */
+    [RISCV_REG_VLENB] = { .reg_id = REG_SYS },  /* vlenb */
     [RISCV_REG_VTYPE] = { .reg_id = REG_VCTRL },  /* vtype */
-    [RISCV_REG_VXRM] = { .reg_id = REG_VCTRL },  /* vxrm */
-    [RISCV_REG_VXSAT] = { .reg_id = REG_VCTRL },  /* vxsat */
+    [RISCV_REG_VXRM] = { .reg_id = REG_VCSR },  /* vxrm */
+    [RISCV_REG_VXSAT] = { .reg_id = REG_VCSR },  /* vxsat */
     [RISCV_REG_DUMMY_REG_PAIR_WITH_X0] = { .reg_id = REG_ZERO },  /* dummy_reg_pair_with_x0 */
     [RISCV_REG_V0] = { .reg_id = REG_VEC0, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v0" } },  /* v0 */
     [RISCV_REG_V1] = { .reg_id = REG_VEC1, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v1" } },  /* v1 */

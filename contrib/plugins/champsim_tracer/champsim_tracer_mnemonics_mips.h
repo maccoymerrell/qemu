@@ -117,14 +117,14 @@ static const RegClassification mips_reg_class[MIPS_REG_ENDING] = {
     [MIPS_REG_FP_NM] = { .reg_id = REG_FP_REG, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "s8" } },  /* fp_nm */
     [MIPS_REG_GP] = { .reg_id = REG_GPR28, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "gp" } },  /* gp */
     [MIPS_REG_GP_NM] = { .reg_id = REG_GPR28, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "gp" } },  /* gp_nm */
-    [MIPS_REG_MSAACCESS] = { .reg_id = REG_MSACSR },  /* msaaccess */
-    [MIPS_REG_MSACSR] = { .reg_id = REG_MSACSR },  /* msacsr */
-    [MIPS_REG_MSAIR] = { .reg_id = REG_MSACSR },  /* msair */
-    [MIPS_REG_MSAMAP] = { .reg_id = REG_MSACSR },  /* msamap */
-    [MIPS_REG_MSAMODIFY] = { .reg_id = REG_MSACSR },  /* msamodify */
-    [MIPS_REG_MSAREQUEST] = { .reg_id = REG_MSACSR },  /* msarequest */
-    [MIPS_REG_MSASAVE] = { .reg_id = REG_MSACSR },  /* msasave */
-    [MIPS_REG_MSAUNMAP] = { .reg_id = REG_MSACSR },  /* msaunmap */
+    [MIPS_REG_MSAACCESS] = { .reg_id = REG_VCSR },  /* msaaccess */
+    [MIPS_REG_MSACSR] = { .reg_id = REG_VCSR },  /* msacsr */
+    [MIPS_REG_MSAIR] = { .reg_id = REG_VCSR },  /* msair */
+    [MIPS_REG_MSAMAP] = { .reg_id = REG_VCSR },  /* msamap */
+    [MIPS_REG_MSAMODIFY] = { .reg_id = REG_VCSR },  /* msamodify */
+    [MIPS_REG_MSAREQUEST] = { .reg_id = REG_VCSR },  /* msarequest */
+    [MIPS_REG_MSASAVE] = { .reg_id = REG_VCSR },  /* msasave */
+    [MIPS_REG_MSAUNMAP] = { .reg_id = REG_VCSR },  /* msaunmap */
     [MIPS_REG_PC] = { .reg_id = REG_IP, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "pc" } },  /* pc */
     [MIPS_REG_RA] = { .reg_id = REG_LR, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "ra" } },  /* ra */
     [MIPS_REG_RA_NM] = { .reg_id = REG_LR, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "ra" } },  /* ra_nm */

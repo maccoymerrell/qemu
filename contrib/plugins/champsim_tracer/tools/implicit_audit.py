@@ -169,16 +169,66 @@ NOT_MODELLED = {
 }
 
 
-# A spec token that one boundary name does not exhaust.  The tracer names
-# state the spec tables write collectively, and the tracer is the MORE precise
-# of the two: MIPS `cfc1 $6,$25` reads the FCCR view of the FP control/status
-# register and the boundary says so, where the spec table writes `fcsr` for
-# all four views; the SME ZA array is named per tile.  Any one of the accepted
-# names satisfies the row.
+# A spec token that one boundary name does not exhaust.  Any one of the
+# accepted names satisfies the row, and the mismatch runs in both
+# directions.
+#
+# Sometimes the TRACER is the more precise of the two: MIPS `cfc1 $6,$25`
+# reads the FCCR view of the FP control/status register and the boundary
+# says so, where the spec table writes `fcsr` for all four views; the SME
+# ZA array is named per tile.
+#
+# Sometimes the SPEC TABLE is.  A system register does not live in the
+# ISA's register file, so it reaches the boundary as its own operand type
+# carrying an architectural encoding, and the boundary reports the CLASS
+# the dependency model records for it -- `flags`, `fcsr`, `tls`, `vctrl`,
+# `vcsr`, `vstart`, `sys` -- because that is the granularity at which the
+# trace expresses a dependency.  The spec tables name the architectural
+# register, which is finer.  Asserting one against the other is what the
+# entries below make possible; the rule, and why each class groups the
+# registers it does, is stated in docs/reference.rst under the register
+# IDs.  Adding a register to a class means adding its name here.
 ACCEPT = {
-    "mipsel": {"fcsr": {"fcsr", "cop25", "cop26", "cop28", "cop31"}},
-    "aarch64": {"za": {"za"} | {"za%d" % i for i in range(16)}},
-    "riscv64": {},
+    "mipsel": {
+        "fcsr": {"fcsr", "cop25", "cop26", "cop28", "cop31"},
+        "msacsr": {"msacsr", "vcsr"},
+        "dspctrl": {"dsp", "dspctrl"},
+    },
+    "aarch64": {
+        "za": {"za"} | {"za%d" % i for i in range(16)},
+        # A system register reaches the boundary as its own operand
+        # type, and the boundary reports the CLASS the dependency model
+        # records for it rather than the architectural name -- see the
+        # note above.  The same register named by an ordinary operand
+        # still arrives under its own name (`adds` writes `nzcv`, `mrs
+        # x0, nzcv` reads `flags`), so both spellings are accepted.
+        "nzcv": {"nzcv", "flags"},
+        "fpcr": {"fpcr", "fcsr"},
+        "fpsr": {"fpsr", "fcsr"},
+        "tpidr_el0": {"tpidr", "tls"},
+        "tpidrro_el0": {"tpidr", "tls"},
+    },
+    "riscv64": {
+        # Same class-vs-name rule.  The classes are architecturally
+        # meaningful, and the grouping is the answer to a real question:
+        # vl and vtype are the configuration a vsetvl writes as a pair
+        # (`vctrl`); vxrm and vxsat are the fixed-point rounding mode
+        # and saturation flag, which are status and NOT configuration
+        # (`vcsr`), because a saturating op writes vxsat without
+        # touching vl; vstart has its own ID because every vector op
+        # clears it; and vlenb is a read-only implementation constant
+        # that belongs with the ID registers (`sys`).
+        "vl": {"vl", "vctrl"},
+        "vtype": {"vtype", "vctrl"},
+        "vxrm": {"vxrm", "vcsr"},
+        "vxsat": {"vxsat", "vcsr"},
+        "vcsr": {"vcsr"},
+        "vlenb": {"vlenb", "sys"},
+        "vstart": {"vstart"},
+        "fcsr": {"fcsr"},
+        "fflags": {"fflags", "fcsr"},
+        "frm": {"frm", "fcsr"},
+    },
 }
 
 

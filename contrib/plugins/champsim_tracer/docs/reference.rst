@@ -577,13 +577,17 @@ without implying any particular numeric base.
        accumulation) is deliberately not modelled as a per-instruction
        write — see :doc:`limitations`.
    * - ``REG_VCTRL``
-     - Vector control register (RVV ``vtype`` / ``vl`` / ``vlenb`` /
-       ``vxrm`` / ``vxsat`` / ``vcsr``, SVE ``ZCR`` / ``FFR`` /
-       ``VG``).  On RISC-V this carries the vector-configuration edge:
-       ``vsetvli`` / ``vsetivli`` / ``vsetvl`` write it and every
-       vector instruction reads it, so a vector kernel's operations are
+     - Vector **configuration**: RVV ``vl`` and ``vtype``, SVE ``ZCR`` /
+       ``FFR`` / ``VG``.  On RISC-V this carries the
+       vector-configuration edge — ``vsetvli`` / ``vsetivli`` /
+       ``vsetvl`` write ``vl`` and ``vtype`` as a pair and every vector
+       instruction reads them, so a vector kernel's operations are
        ordered against the configuration that decides how many elements
-       they process.
+       they process.  Deliberately *only* configuration; see
+       ``REG_VCSR`` and ``REG_VSTART``, and note that RVV ``vlenb`` is a
+       read-only implementation constant and lives in ``REG_SYS`` with
+       the other identification registers, so reading it takes no edge
+       from a ``vsetvli`` that cannot change it.
    * - ``REG_TLS``
      - Thread pointer: AArch64 ``TPIDR_EL0`` / ``TPIDRRO_EL0``, and the
        MIPS CP0 UserLocal word ``rdhwr $29`` reads.  Distinct from
@@ -608,12 +612,17 @@ without implying any particular numeric base.
        whole word, ``bposge32`` branches on ``pos``, ``mthlip`` reads
        and updates it, and the saturating DSP arithmetic writes
        ``ouflag``.
-   * - ``REG_MSACSR``
-     - MIPS MSA control / status register, reached by ``cfcmsa`` and
-       ``ctcmsa``.  Separate from ``REG_VCTRL``, which carries a
-       different ISA's vector configuration, and from ``REG_SYS``,
-       where Capstone's coprocessor-register rendering would otherwise
-       place it beside every CP0 access.
+   * - ``REG_VCSR``
+     - The vector unit's rounding-mode and status word: RISC-V ``vcsr``
+       and its ``vxrm`` / ``vxsat`` fields, MIPS ``MSACSR``.  Separate
+       from ``REG_VCTRL`` because it is *status, not configuration* — a
+       saturating fixed-point op writes ``vxsat`` without touching
+       ``vl``, and sharing the ID would make every one of them look as
+       though it redefined the vector length its neighbours read.
+       Separate from ``REG_SYS`` because Capstone renders MSACSR as a
+       coprocessor register, which would place it beside every CP0
+       access and leave a ``cfcmsa`` reading whatever the last ``mtc0``
+       wrote.
    * - ``REG_SP``
      - Stack pointer.
    * - ``REG_FLAGS``

@@ -41,6 +41,40 @@
  * "what LLVM says" is compared against "what the tracer's dependency model
  * would actually record", not against an intermediate that nothing consumes.
  *
+ * TWO LAYERS, AND THE ASSERTION BETWEEN THEM
+ * ------------------------------------------
+ * The boundary is still not the last word.  The plugin repairs some defects
+ * one layer further in, inside `decode_detail_to_generic()`:
+ * `apply_isa_branch_fixups()` restores the `ra` read RISC-V `ret` loses and
+ * the `ra` write `jal`/`jalr` lose — on the order of a billion dynamic
+ * instructions per reference trace — and the operand walker, the dependency
+ * refiners and the lane-mask refiners rewrite the rest.  Measured against
+ * the boundary alone, a repaired defect looks exactly like an unrepaired
+ * one, so the gate reports it as a disagreement it does not actually have;
+ * and — the reason this matters — IF THE REPAIR REGRESSED THE GATE WOULD
+ * NOT NOTICE, because the defect a regression reintroduces is already in
+ * the gate's expected output.  A repair no check can see is a repair
+ * nothing holds in place.
+ *
+ * So there are two layers and three modes:
+ *
+ *   --layer=boundary  (default)  LLVM vs cap_disas_raw_detail()
+ *   --layer=fields               LLVM vs the InsnFields the dependency
+ *                                model records — generic register ids,
+ *                                branch class, memop counts, lane-mask
+ *                                kind — obtained by compiling the plugin's
+ *                                own champsim_tracer_decode.cc into this
+ *                                tool (see isaxcheck_fields.h).  Signature
+ *                                classes carry an `F` prefix.
+ *   --fixups                     the difference BETWEEN the two layers,
+ *                                which is the inventory of plugin-side
+ *                                repairs.  Asserted both ways against
+ *                                isaxcheck_fixups.txt: a listed repair
+ *                                that stops happening fails, and a repair
+ *                                nobody wrote down fails.  That is what
+ *                                makes a regression in either layer
+ *                                visible instead of cancelling out.
+ *
  * WHAT IT CANNOT SEE
  * ------------------
  * Capstone's AArch64 / Mips / RISCV instruction tables are auto-synced from
@@ -103,6 +137,10 @@
 #include <capstone/capstone.h>
 
 #include "qemu/qemu-plugin.h"
+
+/* The tracer's own dependency model, linked in as a static library so the
+ * plugin's include world stays out of this file.  See isaxcheck_fields.h. */
+#include "isaxcheck_fields.h"
 
 /* Implemented by disas/capstone.c, which is compiled into this tool. */
 extern "C" bool cap_disas_raw_detail(int cap_arch, unsigned int cap_mode,
@@ -261,6 +299,10 @@ struct CsView {
     bool has_invalid_op = false; // an operand the boundary could not model
     unsigned n_ops = 0;
     std::set<std::string> rd, wr; // normalised architectural register names
+    // The same two sets in the dependency model's own vocabulary
+    // (GenericRegId), so the fields layer can be diffed against the
+    // boundary without a second, hand-written correspondence table.
+    std::set<unsigned> grd, gwr;
     bool g_jump = false, g_call = false, g_ret = false, g_branch_rel = false;
 };
 
@@ -492,6 +534,97 @@ static std::string norm_reg(const std::string &r) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Register NAME -> GenericRegId, derived from the tracer's own table
+// ---------------------------------------------------------------------------
+
+/*
+ * The fields layer compares in GenericRegId space, which means LLVM's
+ * register names have to reach it.  Rather than write a second
+ * correspondence by hand -- a table that would drift the moment the
+ * tracer's register classification changed, and drift silently -- the
+ * index is built FROM the tracer's table: for every Capstone register id
+ * the table classifies, ask Capstone for the name, run it through the same
+ * normaliser both decoders' names go through, and record what the tracer
+ * maps it to.  LLVM's "X30", Capstone's "lr" and Capstone's "x30" all
+ * normalise to `r30` and land on the one entry the tracer wrote.
+ *
+ * A token two different generic ids both claim is recorded as ambiguous
+ * and dropped rather than guessed at; the count is reported, because a
+ * nonzero one would mean the normaliser is folding two register files
+ * together and every finding downstream of it would be suspect.
+ */
+static std::map<std::string, std::set<unsigned>> name_to_generic;
+
+/*
+ * A token that lands on more than one GenericRegId is not a defect in this
+ * index; it is the tracer's own classification splitting what the
+ * normaliser considers one architectural register across two generic ids.
+ * AArch64 is the live example: Capstone's `lr` maps to REG_LR while its
+ * `w30` -- the 32-bit view of the SAME register -- maps to REG_GPR30, and
+ * `fp` / `w29` split the same way.  The index keeps every candidate rather
+ * than guessing, matching succeeds on any of them, and the count is
+ * reported so the split itself stays visible.
+ */
+static unsigned regmap_ambiguous_tokens;
+
+static const std::set<unsigned> *generic_candidates(const std::string &tok)
+{
+    auto it = name_to_generic.find(tok);
+    return it == name_to_generic.end() ? nullptr : &it->second;
+}
+
+static void build_name_to_generic(void)
+{
+    csh h;
+    if (cs_open((cs_arch)cfg.cs_arch, (cs_mode)cfg.cs_mode, &h) != CS_ERR_OK)
+        return;
+    for (unsigned i = 1; i < isax_reg_table_size(); i++) {
+        unsigned g = isax_generic_reg(i);
+        if (!g) continue;
+        const char *nm = cs_reg_name(h, i);
+        if (!nm || !nm[0]) continue;
+        std::string tok = norm_reg(nm);
+        if (tok.empty()) continue;
+        name_to_generic[tok].insert(g);
+    }
+    cs_close(&h);
+    for (const auto &kv : name_to_generic)
+        if (kv.second.size() > 1) regmap_ambiguous_tokens++;
+}
+
+/* Render a GenericRegId set into a signature-friendly list, with the
+ * bank index collapsed the way liststr() collapses register numbers. */
+static std::string genliststr(const std::vector<unsigned> &v)
+{
+    std::set<std::string> cls;
+    for (unsigned g : v) {
+        std::string k = isax_generic_reg_name(g);
+        std::string t;
+        for (char ch : k) {
+            if (std::isdigit((unsigned char)ch)) {
+                if (t.empty() || t.back() != '#') t += '#';
+            } else {
+                t += ch;
+            }
+        }
+        cls.insert(t);
+    }
+    std::string r;
+    for (auto &e : cls) { if (!r.empty()) r += ","; r += e; }
+    return r.empty() ? "-" : r;
+}
+
+static std::string gensetstr(const std::set<unsigned> &s)
+{
+    std::string r;
+    for (unsigned g : s) {
+        if (!r.empty()) r += ",";
+        r += isax_generic_reg_name(g);
+    }
+    return r.empty() ? "-" : r;
+}
+
 /*
  * Build the view the plugin's operand walker would build from the boundary's
  * output.  Deliberately mirrors decode_detail_to_generic() in
@@ -499,11 +632,17 @@ static std::string norm_reg(const std::string &r) {
  * base/index/segment registers are address inputs and contribute to the read
  * set, and implicit registers fold in only under include_implicit_regs.
  */
-static void cs_decode(const uint8_t *b, size_t n, CsView &v)
+static void cs_decode(const uint8_t *b, size_t n, CsView &v,
+                      qemu_plugin_insn_info *keep = nullptr)
 {
     qemu_plugin_insn_info info;
     if (!cap_disas_raw_detail(cfg.cs_arch, cfg.cs_mode, b, n, 0x100000, &info))
         return;
+    /* The fields layer re-runs the plugin's own decode over this same
+     * struct, so the caller can ask to keep it rather than have the two
+     * layers disassemble the bytes twice and risk describing different
+     * instructions. */
+    if (keep) *keep = info;
     v.ok = true;
     v.size = info.insn_size;
     v.mnem = info.mnemonic;
@@ -522,20 +661,34 @@ static void cs_decode(const uint8_t *b, size_t n, CsView &v)
             if (op->access == 0) v.mem_unknown = true;
             if (op->access & QEMU_PLUGIN_OP_ACC_READ) v.mem_read = true;
             if (op->access & QEMU_PLUGIN_OP_ACC_WRITE) v.mem_write = true;
-            if (op->reg_name[0]) v.rd.insert(norm_reg(op->reg_name));
-            if (op->index_name[0]) v.rd.insert(norm_reg(op->index_name));
+            if (op->reg_name[0]) {
+                v.rd.insert(norm_reg(op->reg_name));
+                v.grd.insert(isax_generic_reg(op->reg_id));
+            }
+            if (op->index_name[0]) {
+                v.rd.insert(norm_reg(op->index_name));
+                v.grd.insert(isax_generic_reg(op->index_id));
+            }
             // An x86 segment override is a genuine address input the plugin
             // folds into the memop's source set; Capstone exposes it only
             // here, with no name field, so it is recorded by class.
-            if (op->segment_id) v.rd.insert("seg");
+            if (op->segment_id) {
+                v.rd.insert("seg");
+                v.grd.insert(isax_generic_reg(op->segment_id));
+            }
             break;
         }
         case QEMU_PLUGIN_OP_REG: {
             if (op->access == 0) v.reg_unknown = true;
             if (!op->reg_name[0]) break;
             std::string nm = norm_reg(op->reg_name);
-            if (op->access & QEMU_PLUGIN_OP_ACC_READ) v.rd.insert(nm);
-            if (op->access & QEMU_PLUGIN_OP_ACC_WRITE) v.wr.insert(nm);
+            unsigned g = isax_generic_reg(op->reg_id);
+            if (op->access & QEMU_PLUGIN_OP_ACC_READ) {
+                v.rd.insert(nm); v.grd.insert(g);
+            }
+            if (op->access & QEMU_PLUGIN_OP_ACC_WRITE) {
+                v.wr.insert(nm); v.gwr.insert(g);
+            }
             break;
         }
         case QEMU_PLUGIN_OP_INVALID:
@@ -550,11 +703,25 @@ static void cs_decode(const uint8_t *b, size_t n, CsView &v)
     }
 
     if (cfg.include_implicit_regs) {
+        /* The implicit lists carry the Capstone register id alongside the
+         * name, and the id is what the plugin classifies (add_src_cap_reg /
+         * add_dst_cap_reg).  Using it here rather than re-deriving from the
+         * name keeps the boundary's generic view identical to the one the
+         * dependency model starts from, so any difference between the two
+         * is a repair rather than a difference in how they were read. */
         for (unsigned k = 0; k < info.n_regs_read; k++)
-            if (info.regs_read[k][0]) v.rd.insert(norm_reg(info.regs_read[k]));
+            if (info.regs_read[k][0]) {
+                v.rd.insert(norm_reg(info.regs_read[k]));
+                v.grd.insert(isax_generic_reg(info.regs_read_id[k]));
+            }
         for (unsigned k = 0; k < info.n_regs_write; k++)
-            if (info.regs_write[k][0]) v.wr.insert(norm_reg(info.regs_write[k]));
+            if (info.regs_write[k][0]) {
+                v.wr.insert(norm_reg(info.regs_write[k]));
+                v.gwr.insert(isax_generic_reg(info.regs_write_id[k]));
+            }
     }
+    v.grd.erase(0);
+    v.gwr.erase(0);
 }
 
 // ---------------------------------------------------------------------------
@@ -805,11 +972,40 @@ static std::string setstr(const std::set<std::string> &s)
 static bool want_decode = true, want_mem = true, want_branch = true,
             want_regs = true, want_zeroacc = true;
 
+/*
+ * WHICH LAYER IS ON THE CAPSTONE SIDE.
+ *
+ *   LAYER_BOUNDARY  cap_disas_raw_detail() -- Capstone plus the
+ *                   disas/capstone.c corrections.
+ *   LAYER_FIELDS    the InsnFields the dependency model records, i.e. the
+ *                   boundary PLUS the plugin's own operand walker, branch
+ *                   fixups and dep/lane refiners.  This is what the trace
+ *                   is built from, so it is what a consumer sees.
+ *   LAYER_FIXUPS    neither: the DIFFERENCE between the two, which is the
+ *                   inventory of plugin-side repairs, asserted exactly.
+ *
+ * The three share every sweep, normaliser and allowlist mechanism; only
+ * the Capstone-side view changes.  Signature classes are prefixed so one
+ * allowlist file can carry all of them without collision.
+ */
+enum Layer { LAYER_BOUNDARY, LAYER_FIELDS, LAYER_FIXUPS };
+static Layer layer = LAYER_BOUNDARY;
+
+/* BranchType values from champsim_tracer_generic_ids.h.  Restated rather
+ * than included: pulling that header in would drag the plugin's include
+ * world into the translation unit that owns LLVM's.  The names are
+ * resolved symbolically through isax_branch_name(), so a renumbering
+ * shows up in every signature key rather than silently. */
+enum { BR_NONE = 0, BR_RETURN = 3, BR_DIRECT_CALL = 7, BR_INDIRECT_CALL = 8 };
+
 static void compare(const uint8_t *b, size_t n)
 {
     CsView c; LlView l;
-    cs_decode(b, n, c);
+    qemu_plugin_insn_info info;
+    IsaxFieldsView f;
+    cs_decode(b, n, c, &info);
     ll_decode(b, n, l);
+    if (c.ok && layer != LAYER_BOUNDARY) isax_fields_decode(&info, &f);
 
     if (!c.ok && !l.ok) return;
 
@@ -821,7 +1017,10 @@ static void compare(const uint8_t *b, size_t n)
     std::string m = c.ok ? c.mnem : std::string("?");
 
     // --- class D: decode agreement -----------------------------------------
-    if (want_decode) {
+    // Not in fixups mode: that mode measures the tracer against itself, so
+    // whether LLVM also accepted the bytes says nothing about whether the
+    // plugin layer repaired something.
+    if (want_decode && layer != LAYER_FIXUPS) {
         if (c.ok && !l.ok) note("D-cs-only " + m, sample);
         else if (!c.ok && l.ok) {
             std::string lm = l.text.substr(0, l.text.find(' '));
@@ -831,10 +1030,125 @@ static void compare(const uint8_t *b, size_t n)
                  sample + "  cs=" + std::to_string(c.size) +
                      " llvm=" + std::to_string(l.size));
     }
+    /*
+     * FIXUP INVENTORY.  Everything the plugin layer changes about the
+     * boundary's register sets, expressed in GenericRegId space so the two
+     * are directly comparable, and keyed by mnemonic + the class of what
+     * moved.  This does not need LLVM at all -- it is the tracer measured
+     * against itself -- so it runs whether or not LLVM accepted the
+     * encoding, which matters: a repair on an encoding LLVM rejects is
+     * exactly the kind the other layers cannot reach.
+     */
+    if (layer == LAYER_FIXUPS) {
+        if (!c.ok || !f.ok) return;
+        std::set<unsigned> fsrc(f.src.begin(), f.src.end());
+        std::set<unsigned> fdst(f.dst.begin(), f.dst.end());
+        std::set<unsigned> bsrc = c.grd, bdst = c.gwr;
+        for (auto *S : {&fsrc, &fdst, &bsrc, &bdst}) {
+            for (auto it = S->begin(); it != S->end(); )
+                it = isax_generic_reg_dropped(*it) ? S->erase(it)
+                                                   : std::next(it);
+        }
+        const struct {
+            const char *name;
+            std::set<unsigned> *plugin, *boundary;
+        } dirs[] = {
+            {"rd", &fsrc, &bsrc},
+            {"wr", &fdst, &bdst},
+        };
+        std::string ctx = sample + "  boundary{RD " + gensetstr(bsrc) +
+                          " | WR " + gensetstr(bdst) + "}  fields{RD " +
+                          gensetstr(fsrc) + " | WR " + gensetstr(fdst) + "}";
+        for (auto &d : dirs) {
+            std::vector<unsigned> added, removed;
+            std::set_difference(d.plugin->begin(), d.plugin->end(),
+                                d.boundary->begin(), d.boundary->end(),
+                                std::back_inserter(added));
+            std::set_difference(d.boundary->begin(), d.boundary->end(),
+                                d.plugin->begin(), d.plugin->end(),
+                                std::back_inserter(removed));
+            if (!added.empty())
+                note(std::string("W-") + d.name + "-added " + m + " +" +
+                         genliststr(added), ctx);
+            if (!removed.empty())
+                note(std::string("W-") + d.name + "-dropped " + m + " -" +
+                         genliststr(removed), ctx);
+        }
+        /* A control transfer the boundary reports and the dependency model
+         * does not classify (or the reverse) is the same kind of repair,
+         * one layer over: the RISC-V aliased forms are the worked example,
+         * where the branch class is what the link-register fixup keys off. */
+        bool bflow = c.g_jump || c.g_call || c.g_ret;
+        bool fflow = f.branch_type != BR_NONE;
+        if (bflow != fflow)
+            note(std::string("W-flow-") + (fflow ? "added " : "dropped ") + m +
+                     " " + isax_branch_name(f.branch_type), ctx);
+        else if (fflow && (c.g_ret != (f.branch_type == BR_RETURN) ||
+                           c.g_call != (f.branch_type == BR_DIRECT_CALL ||
+                                        f.branch_type == BR_INDIRECT_CALL)))
+            note(std::string("W-flow-reclassed ") + m + " " +
+                     isax_branch_name(f.branch_type), ctx);
+        return;
+    }
+
     if (!c.ok || !l.ok) return;
 
+    /*
+     * FIELDS LAYER.  Swap the Capstone side over to what the dependency
+     * model records before any of the classes below run.  The register
+     * sets move into GenericRegId space and LLVM's names are carried
+     * across with them through the tracer's own register table, so the
+     * comparison is stated in the vocabulary the trace is written in --
+     * `REG_LR`, not `x30` on one side and `r30` on the other.
+     */
+    std::string fpfx;
+    std::set<unsigned> lgrd, lgwr;
+    if (layer == LAYER_FIELDS) {
+        fpfx = "F";
+        if (!f.ok) {
+            /* decode_detail_to_generic() bailed at GEN_OP_UNKNOWN: the
+             * mnemonic is not in the ISA table, so there is no dependency
+             * model output to compare.  The tracer already logs this to
+             * its sidecar; here it is a class of its own so the gate does
+             * not silently score an empty set against LLVM's. */
+            note("FU-unclassified " + m, sample);
+            return;
+        }
+        std::set<unsigned> fsrc0(f.src.begin(), f.src.end());
+        std::set<unsigned> fdst0(f.dst.begin(), f.dst.end());
+        for (const auto *S : {&l.rd, &l.wr}) {
+            bool is_rd = (S == &l.rd);
+            std::set<unsigned> *out = is_rd ? &lgrd : &lgwr;
+            const std::set<unsigned> &have = is_rd ? fsrc0 : fdst0;
+            for (const std::string &tok : *S) {
+                if (is_dropped_reg(tok)) continue;
+                const std::set<unsigned> *cand = generic_candidates(tok);
+                if (!cand || cand->empty()) {
+                    /* A register LLVM names that the tracer's own table
+                     * does not classify at all.  Dropping it quietly would
+                     * be a blind spot of exactly the shape this tool exists
+                     * to remove, so it gets a bucket. */
+                    note("FN-unmapped-llvm-reg " + m + " " + tok, sample);
+                    continue;
+                }
+                /* Where the token has several candidates -- the tracer
+                 * splitting one architectural register across generic ids
+                 * -- any of them counts as the register being present.
+                 * Picking one arbitrarily would report a difference that
+                 * only the choice created. */
+                unsigned g = *cand->begin();
+                for (unsigned k : *cand) if (have.count(k)) { g = k; break; }
+                if (!isax_generic_reg_dropped(g)) out->insert(g);
+            }
+        }
+    }
+
     // --- class Z: metadata holes the boundary hands the plugin --------------
-    if (want_zeroacc) {
+    // Boundary-only.  An operand the boundary cannot model is missing from
+    // the fields too, by construction; reporting it under both layers would
+    // double-count one hole.  The fields layer's own version of "nothing to
+    // compare" is FU-unclassified, above.
+    if (want_zeroacc && layer == LAYER_BOUNDARY) {
         if (c.mem_unknown) note("Z-access0 " + m + " MEM", sample);
         if (c.reg_unknown) note("Z-access0 " + m + " REG", sample);
         if (c.has_invalid_op) note("Z-unmodelled-op " + m, sample);
@@ -842,41 +1156,84 @@ static void compare(const uint8_t *b, size_t n)
 
     // --- class M: memory direction ------------------------------------------
     if (want_mem) {
-        bool cl = c.mem_read, cw = c.mem_write;
+        // The fields layer's memory presence is the template-static memop
+        // count the operand walker declared, which is what the trace
+        // reserves slots for -- not the boundary's per-operand access bits.
+        bool cl = layer == LAYER_FIELDS ? f.max_dep_loads > 0 : c.mem_read;
+        bool cw = layer == LAYER_FIELDS ? f.max_dep_stores > 0 : c.mem_write;
+        bool cm = layer == LAYER_FIELDS ? (cl || cw) : c.has_mem;
         bool ll = l.may_load, lw = l.may_store;
-        if (c.has_mem && !ll && !lw)
-            note("M-cs-mem-llvm-none " + m, sample);
-        else if (!c.has_mem && (ll || lw))
-            note(std::string("M-llvm-mem-cs-none ") + m +
+        if (cm && !ll && !lw)
+            note(fpfx + "M-cs-mem-llvm-none " + m, sample);
+        else if (!cm && (ll || lw))
+            note(fpfx + "M-llvm-mem-cs-none " + m +
                      (ll ? " load" : "") + (lw ? " store" : ""), sample);
-        else if (c.has_mem) {
-            if (ll && !cl) note("M-miss-load " + m, sample);
-            if (lw && !cw) note("M-miss-store " + m, sample);
-            if (cl && !ll) note("M-extra-load " + m, sample);
-            if (cw && !lw) note("M-extra-store " + m, sample);
+        else if (cm) {
+            if (ll && !cl) note(fpfx + "M-miss-load " + m, sample);
+            if (lw && !cw) note(fpfx + "M-miss-store " + m, sample);
+            if (cl && !ll) note(fpfx + "M-extra-load " + m, sample);
+            if (cw && !lw) note(fpfx + "M-extra-store " + m, sample);
         }
     }
 
     // --- class B: branch taxonomy -------------------------------------------
     if (want_branch) {
-        bool cj = c.g_jump || c.g_call || c.g_ret;
+        bool cj, ccall, cret;
+        if (layer == LAYER_FIELDS) {
+            cj = f.branch_type != BR_NONE;
+            ccall = f.branch_type == BR_DIRECT_CALL ||
+                    f.branch_type == BR_INDIRECT_CALL;
+            cret = f.branch_type == BR_RETURN;
+        } else {
+            cj = c.g_jump || c.g_call || c.g_ret;
+            ccall = c.g_call;
+            cret = c.g_ret;
+        }
         bool lj = l.is_branch || l.is_call || l.is_ret;
         if (cj != lj)
-            note(std::string("B-flow-presence ") + m +
+            note(fpfx + "B-flow-presence " + m +
                      (cj ? " cs-yes" : " cs-no") + (lj ? " llvm-yes" : " llvm-no"),
                  sample);
         else if (cj) {
-            if (l.is_call != c.g_call)
-                note(std::string("B-call-mismatch ") + m +
-                         (c.g_call ? " cs-call" : " cs-nocall"), sample);
-            if (l.is_ret != c.g_ret)
-                note(std::string("B-ret-mismatch ") + m +
-                         (c.g_ret ? " cs-ret" : " cs-noret"), sample);
+            if (l.is_call != ccall)
+                note(fpfx + "B-call-mismatch " + m +
+                         (ccall ? " cs-call" : " cs-nocall"), sample);
+            if (l.is_ret != cret)
+                note(fpfx + "B-ret-mismatch " + m +
+                         (cret ? " cs-ret" : " cs-noret"), sample);
         }
     }
 
     // --- class R: register read/write sets ----------------------------------
-    if (want_regs) {
+    if (want_regs && layer == LAYER_FIELDS) {
+        std::set<unsigned> fsrc(f.src.begin(), f.src.end());
+        std::set<unsigned> fdst(f.dst.begin(), f.dst.end());
+        for (auto *S : {&fsrc, &fdst}) {
+            for (auto it = S->begin(); it != S->end(); )
+                it = isax_generic_reg_dropped(*it) ? S->erase(it)
+                                                   : std::next(it);
+        }
+        std::string ctx = sample + "  fieldsRD{" + gensetstr(fsrc) +
+                          "} fieldsWR{" + gensetstr(fdst) + "} llvmRD{" +
+                          gensetstr(lgrd) + "} llvmWR{" + gensetstr(lgwr) + "}";
+        std::vector<unsigned> wonly, conly, ronly, cronly;
+        std::set_difference(lgwr.begin(), lgwr.end(), fdst.begin(), fdst.end(),
+                            std::back_inserter(wonly));
+        std::set_difference(fdst.begin(), fdst.end(), lgwr.begin(), lgwr.end(),
+                            std::back_inserter(conly));
+        std::set_difference(lgrd.begin(), lgrd.end(), fsrc.begin(), fsrc.end(),
+                            std::back_inserter(ronly));
+        std::set_difference(fsrc.begin(), fsrc.end(), lgrd.begin(), lgrd.end(),
+                            std::back_inserter(cronly));
+        if (!wonly.empty())
+            note("FR-wr-missing " + m + " +" + genliststr(wonly), ctx);
+        if (!conly.empty())
+            note("FR-wr-phantom " + m + " +" + genliststr(conly), ctx);
+        if (!ronly.empty())
+            note("FR-rd-missing " + m + " +" + genliststr(ronly), ctx);
+        if (!cronly.empty())
+            note("FR-rd-phantom " + m + " +" + genliststr(cronly), ctx);
+    } else if (want_regs) {
         for (auto *S : {&c.rd, &c.wr, &l.rd, &l.wr}) {
             for (auto it = S->begin(); it != S->end(); )
                 it = is_dropped_reg(*it) ? S->erase(it) : std::next(it);
@@ -1145,6 +1502,13 @@ static void usage(void)
         "  --hex=BYTES     decode one encoding with both decoders and exit\n"
         "  --batch         read hex encodings on stdin; write one TSV row\n"
         "                  per encoding carrying both decoders' views\n"
+        "  --layer=boundary|fields   compare LLVM against the decode\n"
+        "                  boundary (default) or against the InsnFields the\n"
+        "                  dependency model records\n"
+        "  --fixups        report the difference BETWEEN the two layers --\n"
+        "                  the plugin-side repairs -- and assert it exactly\n"
+        "                  against --allow (a listed repair that stops\n"
+        "                  happening fails, as does an unlisted one)\n"
         "  --allow=FILE    allowlist of justified residual signatures\n"
         "  --check         exit 1 if any non-allowlisted signature remains\n"
         "  --mattr=... --mcpu=...  override the LLVM subtarget\n"
@@ -1168,6 +1532,12 @@ int main(int argc, char **argv)
         else if (!strncmp(argv[i], "--classes=", 10)) classes = argv[i] + 10;
         else if (!strncmp(argv[i], "--hex=", 6)) hexone = argv[i] + 6;
         else if (!strcmp(argv[i], "--batch")) batch = true;
+        else if (!strncmp(argv[i], "--layer=", 8)) {
+            if (!strcmp(argv[i] + 8, "boundary")) layer = LAYER_BOUNDARY;
+            else if (!strcmp(argv[i] + 8, "fields")) layer = LAYER_FIELDS;
+            else { usage(); return 2; }
+        }
+        else if (!strcmp(argv[i], "--fixups")) layer = LAYER_FIXUPS;
         else if (!strncmp(argv[i], "--mattr=", 8)) mattr = argv[i] + 8;
         else if (!strncmp(argv[i], "--mcpu=", 7)) mcpu = argv[i] + 7;
         else if (!strncmp(argv[i], "--allow=", 8)) allow = argv[i] + 8;
@@ -1200,12 +1570,26 @@ int main(int argc, char **argv)
 
     llvm_init();
 
+    /* The tracer's own tables and the register-name index derived from
+     * them.  Unconditional: the boundary layer records generic ids too,
+     * so `--hex` shows both vocabularies whichever layer is selected. */
+    if (!isax_fields_init(cfg.name)) {
+        fprintf(stderr,
+                "isaxcheck: the tracer has no classification tables for %s\n",
+                cfg.name);
+        return 2;
+    }
+    build_name_to_generic();
+
     if (hexone) {
         uint8_t b[24]; unsigned n = 0;
         for (const char *p = hexone; p[0] && p[1] && n < 24; p += 2)
             b[n++] = (uint8_t)strtoul(std::string(p, p + 2).c_str(), nullptr, 16);
         CsView c; LlView l;
-        cs_decode(b, n, c); ll_decode(b, n, l);
+        qemu_plugin_insn_info info;
+        IsaxFieldsView f;
+        cs_decode(b, n, c, &info); ll_decode(b, n, l);
+        if (c.ok) isax_fields_decode(&info, &f);
         printf("bytes    %s\n", hexbytes(b, n).c_str());
         printf("boundary ok=%d sz=%u  %s %s\n", c.ok, c.size, c.mnem.c_str(), c.ops.c_str());
         printf("   mem=%d r=%d w=%d unkMEM=%d unkREG=%d unmodelled-op=%d nops=%u\n",
@@ -1219,6 +1603,26 @@ int main(int argc, char **argv)
                l.may_load, l.may_store, l.is_branch, l.is_call, l.is_ret,
                l.is_indirect, l.is_term);
         printf("   RD{%s}\n   WR{%s}\n", setstr(l.rd).c_str(), setstr(l.wr).c_str());
+        /* The third view: what the dependency model records, which is what
+         * the trace is built from.  Where it differs from the boundary
+         * above, the difference is a plugin-side repair -- `--fixups`
+         * inventories and asserts them. */
+        if (c.ok) {
+            std::set<unsigned> fs(f.src.begin(), f.src.end());
+            std::set<unsigned> fd(f.dst.begin(), f.dst.end());
+            printf("fields   ok=%d  %s  %s%s%s\n", f.ok,
+                   isax_opcode_name(f.opcode), isax_branch_name(f.branch_type),
+                   f.branch_conditional ? " cond" : "",
+                   f.is_atomic ? " atomic" : "");
+            printf("   loads=%u stores=%u regdeps=%d addrdeps=%d vec=%d "
+                   "lanekind=%u\n", f.max_dep_loads, f.max_dep_stores,
+                   f.has_reg_deps, f.has_addr_deps, f.has_vec_lanes,
+                   f.lane_mask_kind);
+            printf("   SRC{%s}\n   DST{%s}\n", gensetstr(fs).c_str(),
+                   gensetstr(fd).c_str());
+            printf("boundary-in-generic\n   RD{%s}\n   WR{%s}\n",
+                   gensetstr(c.grd).c_str(), gensetstr(c.gwr).c_str());
+        }
         return 0;
     }
 
@@ -1377,12 +1781,22 @@ int main(int argc, char **argv)
     for (const auto &r : allow_rules)
         if (!r.used && r.isa == cfg.name) dead.push_back(&r);
 
-    printf("# isa=%s encodings_tried=%lu distinct_signatures=%zu "
-           "allowlisted=%zu unallowed=%lu subtarget_gap=%lu/%lu "
-           "dead_allow_rules=%zu\n",
-           cfg.name, total_tried, buckets.size(),
-           buckets.size() - unallowed, unallowed, gap_sigs, gap_encodings,
-           dead.size());
+    /* subtarget_gap only means anything where an LLVM rejection is one of
+     * the outcomes.  --fixups compares the tracer against itself. */
+    if (layer == LAYER_FIXUPS)
+        printf("# isa=%s layer=fixups encodings_tried=%lu "
+               "distinct_signatures=%zu allowlisted=%zu unallowed=%lu "
+               "dead_allow_rules=%zu\n",
+               cfg.name, total_tried, buckets.size(),
+               buckets.size() - unallowed, unallowed, dead.size());
+    else
+        printf("# isa=%s layer=%s encodings_tried=%lu distinct_signatures=%zu "
+               "allowlisted=%zu unallowed=%lu subtarget_gap=%lu/%lu "
+               "dead_allow_rules=%zu ambiguous_reg_tokens=%u\n",
+               cfg.name, layer == LAYER_FIELDS ? "fields" : "boundary",
+               total_tried, buckets.size(),
+               buckets.size() - unallowed, unallowed, gap_sigs, gap_encodings,
+               dead.size(), regmap_ambiguous_tokens);
     if (!opt_taken.empty() || !opt_skipped.empty()) {
         printf("# llvm=%s optional_features_taken=%s skipped=%s\n",
                LLVM_VERSION_STRING, join(opt_taken).c_str(),

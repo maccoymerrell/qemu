@@ -1,0 +1,258 @@
+# isaxcheck fixup assertion table — the repairs the plugin makes to the
+# decode boundary, asserted rather than tolerated.
+#
+# Author: Maccoy Merrell
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# WHAT THIS FILE IS
+# -----------------
+# `isaxcheck --fixups` runs the tracer's decode boundary and the tracer's own
+# decode_detail_to_generic() over the same encodings and reports every place
+# the second changes the first.  That difference is not noise and it is not a
+# residual: it IS the set of defects the plugin repairs downstream of
+# disas/capstone.c, plus the classification the ISA tables supply that
+# Capstone has no opinion about.
+#
+# It is asserted BOTH WAYS.  A line here that stops matching fails the gate
+# (dead rule) — that is a repair that has silently stopped happening.  A
+# repair that appears and is not written down here also fails.  The boundary
+# gate cannot do either: measured against the boundary alone, a regressed
+# repair reintroduces exactly the disagreement the boundary allowlist already
+# expects, so it cancels out and nothing turns red.  RISC-V `ret` is the
+# worked example — the boundary loses its `ra` read, the plugin restores it,
+# and roughly a billion dynamic instructions per reference trace depend on
+# that restoration.
+#
+# Format:  <isa> <signature key>          (`#` starts a whole-line comment)
+# Keys are `W-<what>-<direction> <mnemonic> <delta>`, with register bank
+# indices collapsed to `#`.  `-added` / `-dropped` are from the plugin's
+# point of view: `W-rd-added ret +REG_LR` means the dependency model reads a
+# register the boundary did not report.
+#
+# HOW TO CHANGE IT.  Do not edit a line to make the gate green.  A line that
+# has gone dead is either a repair that regressed (fix the plugin) or one that
+# became unnecessary because Capstone was fixed (delete the line, and check
+# whether the matching entry in isaxcheck_allow.txt can go too).  A new line
+# is either a repair somebody added without recording it, or the dependency
+# model changing what it records — both want a sentence here saying which.
+#
+# Observed against Capstone 6.0.0-Alpha7 (subprojects/capstone.wrap).
+# Regenerate the raw set with:
+#   isaxcheck --isa=<isa> --jobs=N --fixups
+
+
+# --- aarch64 -----------------------------------------------------------
+#
+# Trap and exception-generating instructions.  Capstone reports no control
+# group for BRK / HLT / UDF / DCPS<n>, and reports HVC as a plain call; the
+# ISA table classifies all of them as BRANCH_SYSCALL_TYPE, which is what the
+# tracer's BB chain needs to seal a block at a trap.  DRPS is the reverse:
+# Capstone calls it a control transfer and the table does not, because a
+# debug-state exception return is not an edge any consumer can follow.
+aarch64 W-flow-added brk BRANCH_SYSCALL_TYPE
+aarch64 W-flow-added dcps2 BRANCH_SYSCALL_TYPE
+aarch64 W-flow-added hlt BRANCH_SYSCALL_TYPE
+aarch64 W-flow-added udf BRANCH_SYSCALL_TYPE
+aarch64 W-flow-dropped drps BRANCH_NONE
+aarch64 W-flow-reclassed hvc BRANCH_SYSCALL_TYPE
+
+# SVE2.1 / SME2 predicate-PAIR destinations.  `whilege { p14.b, p15.b }, ...`
+# writes two predicate registers and Capstone reports only the first; the
+# table supplies the second.  Note what this means for the OTHER gate: the
+# `aarch64 R-wr-missing while* +p#` entry in isaxcheck_allow.txt describes a
+# disagreement that never reaches a trace, because the repair asserted here
+# removes it one layer down.  That is the false-positive half of why this
+# file exists.
+aarch64 W-wr-added pext +REG_PRED#
+aarch64 W-wr-added whilegt +REG_PRED#
+aarch64 W-wr-added whilehi +REG_PRED#
+aarch64 W-wr-added whilele +REG_PRED#
+aarch64 W-wr-added whilels +REG_PRED#
+
+# --- riscv64 -----------------------------------------------------------
+#
+# Branch taxonomy.  Capstone has no control group for the RISC-V aliases at
+# all, so every classification below comes from the ISA table: J / JAL / JALR
+# / RET, and the ECALL / EBREAK / UNIMP traps.
+riscv64 W-flow-added ebreak BRANCH_SYSCALL_TYPE
+riscv64 W-flow-added ecall BRANCH_SYSCALL_TYPE
+riscv64 W-flow-added j BRANCH_DIRECT_JUMP
+riscv64 W-flow-added jal BRANCH_DIRECT_CALL
+riscv64 W-flow-added unimp BRANCH_SYSCALL_TYPE
+riscv64 W-flow-reclassed jalr BRANCH_INDIRECT_CALL
+riscv64 W-flow-reclassed ret BRANCH_RETURN
+
+# THE LINK-REGISTER REPAIR.  The aliased forms hide `ra` COMPLETELY in
+# Capstone 6 -- it is in neither the operand list nor the (always empty for
+# RISC-V) implicit lists -- so without apply_isa_branch_fixups() a call's
+# return-address write and a return's read vanish from the dataflow
+# entirely.  This is the single highest-weight repair in the tracer, and it
+# is the reason this file exists: the boundary gate reports the missing
+# write as a defect (isaxcheck_allow.txt, `riscv64 R-wr-missing jal +r#`),
+# so a regression here would restore a disagreement the boundary gate is
+# already expecting and nothing would turn red.
+#
+# `dret` / `mret` / `sret` are on this list and SHOULD NOT BE.  A privileged
+# return resumes from mepc/sepc/dpc, not from `ra`; the fixup keys off
+# BRANCH_RETURN and adds a link-register read those instructions do not
+# perform.  Weight is zero in user mode and small in system mode, but it is
+# a phantom dependency, not a repair.  Listed so it is visible; the line
+# goes when the branch fixup stops treating a trap return as a call return.
+riscv64 W-rd-added dret +REG_LR
+riscv64 W-rd-added mret +REG_LR
+riscv64 W-rd-added ret +REG_LR
+riscv64 W-rd-added sret +REG_LR
+riscv64 W-wr-added jal +REG_LR
+riscv64 W-wr-added jalr +REG_LR
+
+# RVV whole-register load/store.  `vl8re64.v v8, (a0)` moves EIGHT vector
+# registers and Capstone names only the base; the tracer expands the group,
+# which is what makes the dependency edges for the other seven exist.
+riscv64 W-rd-added vs2r.v +REG_VEC#
+riscv64 W-rd-added vs4r.v +REG_VEC#
+riscv64 W-rd-added vs8r.v +REG_VEC#
+riscv64 W-wr-added vl2r.v +REG_VEC#
+riscv64 W-wr-added vl2re16.v +REG_VEC#
+riscv64 W-wr-added vl2re32.v +REG_VEC#
+riscv64 W-wr-added vl2re64.v +REG_VEC#
+riscv64 W-wr-added vl4r.v +REG_VEC#
+riscv64 W-wr-added vl4re16.v +REG_VEC#
+riscv64 W-wr-added vl4re32.v +REG_VEC#
+riscv64 W-wr-added vl4re64.v +REG_VEC#
+riscv64 W-wr-added vl8r.v +REG_VEC#
+riscv64 W-wr-added vl8re16.v +REG_VEC#
+riscv64 W-wr-added vl8re32.v +REG_VEC#
+riscv64 W-wr-added vl8re64.v +REG_VEC#
+
+# --- mipsel ------------------------------------------------------------
+#
+# Traps and exception returns: Capstone reports no control group for
+# SYSCALL / BREAK / SDBBP / ERET / DERET.
+#
+# `jr` reclassed to BRANCH_RETURN is the `jr $ra` recognition -- the ISA has
+# no dedicated return instruction, so the return is a register jump whose
+# register happens to be $ra, and only the operand text says so.
+#
+# The branch-and-link forms (BAL / BGEZAL / BGEZALL / BLTZAL / BLTZALL) are
+# reclassed to BRANCH_COND_DIRECT, which LOSES the link.  They are
+# conditional calls: they write $ra and a consumer driving a return-address
+# stack needs to see the push.  BRANCH_DIRECT_CALL exists and is what they
+# should carry.  Listed so the loss is recorded rather than implied.
+mipsel W-flow-added break BRANCH_SYSCALL_TYPE
+mipsel W-flow-added deret BRANCH_RETURN
+mipsel W-flow-added eret BRANCH_RETURN
+mipsel W-flow-added sdbbp BRANCH_SYSCALL_TYPE
+mipsel W-flow-added syscall BRANCH_SYSCALL_TYPE
+mipsel W-flow-reclassed bal BRANCH_COND_DIRECT
+mipsel W-flow-reclassed bgezal BRANCH_COND_DIRECT
+mipsel W-flow-reclassed bgezall BRANCH_COND_DIRECT
+mipsel W-flow-reclassed bltzal BRANCH_COND_DIRECT
+mipsel W-flow-reclassed bltzall BRANCH_COND_DIRECT
+mipsel W-flow-reclassed jr BRANCH_RETURN
+
+# Traps, interrupt/system returns and the LOOP family: control transfers
+# Capstone gives no group for.  The `bnd`-prefixed and `repz`-prefixed
+# call/return forms are reclassifications rather than additions -- the
+# prefix is a hint, and the instruction under it is still the call or the
+# return it always was.
+x86_64 W-flow-added int BRANCH_SYSCALL_TYPE
+x86_64 W-flow-added int1 BRANCH_SYSCALL_TYPE
+x86_64 W-flow-added int3 BRANCH_SYSCALL_TYPE
+x86_64 W-flow-added iretl BRANCH_RETURN
+x86_64 W-flow-added iretq BRANCH_RETURN
+x86_64 W-flow-added iretw BRANCH_RETURN
+x86_64 W-flow-added loop BRANCH_COND_DIRECT
+x86_64 W-flow-added loope BRANCH_COND_DIRECT
+x86_64 W-flow-added loopne BRANCH_COND_DIRECT
+x86_64 W-flow-added syscall BRANCH_SYSCALL_TYPE
+x86_64 W-flow-added sysenter BRANCH_SYSCALL_TYPE
+x86_64 W-flow-added sysexitl BRANCH_SYSCALL_TYPE
+x86_64 W-flow-added sysexitq BRANCH_RETURN
+x86_64 W-flow-added sysretl BRANCH_RETURN
+x86_64 W-flow-added sysretq BRANCH_RETURN
+x86_64 W-flow-added ud0 BRANCH_SYSCALL_TYPE
+x86_64 W-flow-added ud1 BRANCH_SYSCALL_TYPE
+x86_64 W-flow-added ud2 BRANCH_SYSCALL_TYPE
+x86_64 W-flow-added vmcall BRANCH_SYSCALL_TYPE
+x86_64 W-flow-reclassed bnd callq BRANCH_REP
+x86_64 W-flow-reclassed bnd lretl BRANCH_REP
+x86_64 W-flow-reclassed bnd lretq BRANCH_REP
+x86_64 W-flow-reclassed bnd retq BRANCH_REP
+
+# --- x86_64 ------------------------------------------------------------
+#
+# REP / REPE / REPNE promote a string operation to a self-looping branch.
+# Capstone reports the prefix and the string op; the tracer turns the pair
+# into BRANCH_REP, which is what lets the body emitter fan one TB execution
+# into per-iteration entries on a one-instruction self-loop sub-template.
+# Without the promotion a `rep movsq` would be one entry however many bytes
+# it moved.
+x86_64 W-flow-added rep insb BRANCH_REP
+x86_64 W-flow-added rep insl BRANCH_REP
+x86_64 W-flow-added rep insw BRANCH_REP
+x86_64 W-flow-added rep lodsb BRANCH_REP
+x86_64 W-flow-added rep lodsl BRANCH_REP
+x86_64 W-flow-added rep lodsq BRANCH_REP
+x86_64 W-flow-added rep lodsw BRANCH_REP
+x86_64 W-flow-added rep movsb BRANCH_REP
+x86_64 W-flow-added rep movsl BRANCH_REP
+x86_64 W-flow-added rep movsq BRANCH_REP
+x86_64 W-flow-added rep movsw BRANCH_REP
+x86_64 W-flow-added rep outsb BRANCH_REP
+x86_64 W-flow-added rep outsl BRANCH_REP
+x86_64 W-flow-added rep outsw BRANCH_REP
+x86_64 W-flow-added rep stosb BRANCH_REP
+x86_64 W-flow-added rep stosl BRANCH_REP
+x86_64 W-flow-added rep stosq BRANCH_REP
+x86_64 W-flow-added rep stosw BRANCH_REP
+x86_64 W-flow-added repe cmpsb BRANCH_REP
+x86_64 W-flow-added repe cmpsl BRANCH_REP
+x86_64 W-flow-added repe cmpsq BRANCH_REP
+x86_64 W-flow-added repe cmpsw BRANCH_REP
+x86_64 W-flow-added repe scasb BRANCH_REP
+x86_64 W-flow-added repe scasl BRANCH_REP
+x86_64 W-flow-added repe scasq BRANCH_REP
+x86_64 W-flow-added repe scasw BRANCH_REP
+x86_64 W-flow-added repne cmpsb BRANCH_REP
+x86_64 W-flow-added repne cmpsl BRANCH_REP
+x86_64 W-flow-added repne cmpsq BRANCH_REP
+x86_64 W-flow-added repne insb BRANCH_REP
+x86_64 W-flow-added repne insl BRANCH_REP
+x86_64 W-flow-added repne lodsb BRANCH_REP
+x86_64 W-flow-added repne lodsl BRANCH_REP
+x86_64 W-flow-added repne lodsq BRANCH_REP
+x86_64 W-flow-added repne movsb BRANCH_REP
+x86_64 W-flow-added repne movsl BRANCH_REP
+x86_64 W-flow-added repne movsq BRANCH_REP
+x86_64 W-flow-added repne outsb BRANCH_REP
+x86_64 W-flow-added repne outsl BRANCH_REP
+x86_64 W-flow-added repne scasb BRANCH_REP
+x86_64 W-flow-added repne scasl BRANCH_REP
+x86_64 W-flow-added repne scasq BRANCH_REP
+x86_64 W-flow-added repne stosb BRANCH_REP
+x86_64 W-flow-added repne stosl BRANCH_REP
+x86_64 W-flow-added repne stosq BRANCH_REP
+x86_64 W-flow-added xacquire xchgb BRANCH_REP
+x86_64 W-flow-added xacquire xchgl BRANCH_REP
+x86_64 W-flow-added xrelease xchgb BRANCH_REP
+x86_64 W-flow-added xrelease xchgl BRANCH_REP
+x86_64 W-flow-reclassed repz retq BRANCH_REP
+x86_64 W-flow-reclassed repz retw BRANCH_REP
+
+# Multi-byte NOP: `nopw 0(%rax,%rax,1)` carries a full addressing operand
+# that computes nothing.  The tracer records the address inputs, because the
+# encoding really does read those registers even though the result is
+# discarded -- a consumer modelling the AGU sees the same work the hardware
+# does.
+#
+# `bswapw` and `ffreep` are encodings whose behaviour the architecture does
+# not define (a 16-bit BSWAP) or that no assembler emits (FFREEP is the
+# undocumented FFREE+pop).  The table gives them a destination; Capstone
+# gives them none.
+x86_64 W-rd-added nopl +REG_GPR#
+x86_64 W-rd-added nopq +REG_GPR#
+x86_64 W-rd-added nopw +REG_GPR#
+x86_64 W-wr-added bswapw +REG_FP_REG
+x86_64 W-wr-added bswapw +REG_GPR#
+x86_64 W-wr-added bswapw +REG_SP
+x86_64 W-wr-added ffreep +REG_FPR#

@@ -153,6 +153,36 @@ if get_option('plugins')
   llvm_config = find_program('llvm-config-18', 'llvm-config-19',
                              'llvm-config-20', 'llvm-config',
                              required: false)
+  # isaxcheck_fields: the tracer's own dependency model, linked into
+  # isaxcheck so the gate can compare the InsnFields the trace is actually
+  # built from and not only the decode boundary those fields derive from.
+  # The plugin repairs some Capstone defects INSIDE
+  # decode_detail_to_generic() -- apply_isa_branch_fixups() restores the
+  # RISC-V link-register dataflow the aliased jal/jalr/ret forms hide --
+  # and a gate that stops at the boundary cannot tell a working repair from
+  # a regressed one, because the defect a regression would reintroduce is
+  # already in the gate's expected output.
+  #
+  # A separate static library rather than more sources on the isaxcheck
+  # target, for one concrete reason: the plugin's headers are reached as
+  # "qemu-plugin.h" and need ../../include/qemu on the include path, which
+  # is exactly the directory isaxcheck must NOT have (include/qemu/ctype.h
+  # shadows <cctype> for any TU that reaches for it).  Per-target include
+  # directories keep the two include worlds apart.
+  # champsim_tracer_decode.cc is compiled in here verbatim: there is no
+  # second copy of the dependency model, because a gate measuring a
+  # reimplementation would measure the wrong thing.
+  isaxcheck_fields = static_library(
+    'isaxcheck_fields',
+    files('champsim_tracer/tools/isaxcheck_fields.cc',
+          'champsim_tracer/champsim_tracer_decode.cc',
+          'champsim_tracer/champsim_tracer_mnemonic_tables.cc',
+          'champsim_tracer/champsim_tracer_reg_handle_cache.cc'),
+    include_directories: ['../../include/qemu', '../../include',
+                          'champsim_tracer'],
+    cpp_args: champsim_tracer_cpp_args,
+    dependencies: [glib, cst_capstone_dep],
+    install: false)
   if llvm_config.found()
     llvm_cxxflags = []
     foreach f : run_command(llvm_config, '--cxxflags',
@@ -178,6 +208,7 @@ if get_option('plugins')
       # <cctype> for any TU that reaches for it.  Everything this tool needs
       # is spelled "qemu/..." and resolves through ../../include.
       include_directories: ['../../include', '../..'],
+      link_with: isaxcheck_fields,
       dependencies: [glib, cst_capstone_dep],
       install: false)
   else

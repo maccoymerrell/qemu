@@ -855,7 +855,7 @@ char *qemu_plugin_insn_disas(const struct qemu_plugin_insn *insn);
  * Register names are ISA-native Capstone register name strings.
  */
 
-#define QEMU_PLUGIN_INSN_DETAIL_MAX_OPS    8
+#define QEMU_PLUGIN_INSN_DETAIL_MAX_OPS    16
 #define QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS  12
 #define QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ 12
 #define QEMU_PLUGIN_INSN_DETAIL_MNEMSZ     32

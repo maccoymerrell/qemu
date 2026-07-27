@@ -993,7 +993,12 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
      - Cold-branch wrong-path pruning level (see :doc:`quickstart`).
    * - ``memdata=0|1``
      - ``0``
-     - Capture load/store *values* on the correct path.
+     - Capture load/store *values* on the correct path.  Addresses and
+       sizes are recorded regardless.  A value up to 128 bits comes
+       from QEMU's memory-value API; a wider single access is read
+       back out of guest memory instead, capped at 64 bytes, and
+       carries no value at all if that read fails — see
+       :ref:`memory-value width <limits-mem-value-width>`.
    * - ``regdata=0|1``
      - ``0``
      - Capture destination-register post-execution snapshots.

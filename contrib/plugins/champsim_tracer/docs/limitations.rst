@@ -255,6 +255,39 @@ overflow vector, and the widest single-instruction memop fan-out on
 x86 — an ``XSAVE``-family state save, about 320 stores for a full
 AVX-512 area — sits inside the 512 slots.
 
+.. _limits-mem-value-width:
+
+**A memop value wider than 128 bits is read back, not observed.**
+QEMU hands a plugin the value of an access only up to ``MO_128``:
+``CPUState`` latches just the low 128 bits, so
+``qemu_plugin_mem_get_value()`` reports nothing above that (it returns
+``QEMU_PLUGIN_MEM_VALUE_INVALID``; see ``plugins/api.c``).  For a
+single access wider than that the tracer falls back to reading the
+bytes out of guest memory itself, at callback time, capped at
+``CST_MAX_WIDE_BYTES`` = 64.  Three consequences follow, and they
+apply only to the value — the *address* and the *size* of such a
+memop are always recorded:
+
+* The value is the memory's CONTENT, not the transferred datum.  For
+  a store it is read after the write has committed, which agrees with
+  the stored value for an ordinary store but not for one whose bytes
+  another agent changes in between.
+* The read-back can fail (the page may no longer be readable).  The
+  memop then carries its address and size and NO value: the data FID
+  is simply absent, which a consumer must distinguish from a recorded
+  value of zero by the FID's absence, not by its content.
+* Past 512 bits the value is truncated to the low 64 bytes while the
+  recorded size still reports the whole access.
+
+In practice no in-tree target hands the plugin a memop wider than
+``MO_128``.  SVE contiguous loads and RISC-V vector loads fall back to
+instrumented per-element paths, so an ``ld1d`` at VL=512 or a
+``vle32.v`` at LMUL=2 surfaces as many narrow memops, each with its
+own value; AArch64 FEAT_MOPS bulk transfers are decomposed into
+naturally aligned pieces of at most 16 bytes for exactly this reason
+(``arm_plugin_bulk_mem_cb``, ``docs/qemu_modifications.rst``).  What
+those families do run into is the slot ceiling below, not this one.
+
 **Memops capped at 512 per insn.**  512 = ``CST_FID_SLOT_COUNT`` is
 all an entry can address, in each direction, for one instruction.  On
 the wrong path ``MemAccessRecorder::record`` stops recording past the

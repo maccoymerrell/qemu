@@ -2189,10 +2189,16 @@ path; the slot ceiling and overflow handling described in §5.2
 apply uniformly to addresses and data.
 
 Narrow accesses are masked to their low accessed bytes before
-emission as a scalar delta. The current QEMU plugin mem-value API directly
-exposes values up to 128 bits; wider values are representable by
-the wire format and by register snapshots, and can be populated by
-capture paths that can provide up to 64 bytes.
+emission as a scalar delta.  The QEMU plugin mem-value API delivers a
+value directly only up to 128 bits; a wider single access is read back
+out of guest memory instead, up to the format's 64-byte ceiling.  A
+data slot is therefore OPTIONAL independently of its address slot: an
+address and a size are recorded whether or not the value could be
+obtained, and a consumer distinguishes "no value" from "a value of
+zero" by the absence of the ``LOAD_DATA[k]`` / ``STORE_DATA[k]`` field,
+never by its content.  See :ref:`memory-value width
+<limits-mem-value-width>` for what the read-back does and does not
+observe.
 
 5.3.1 Physical Addresses (physaddr)
 """""""""""""""""""""""""""""""""""

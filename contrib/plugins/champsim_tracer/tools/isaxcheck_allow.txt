@@ -55,11 +55,12 @@ mipsel R-rd-phantom jr +r#
 mipsel R-rd-phantom jalr +r#
 mipsel B-ret-mismatch jr cs-ret
 
-# LWL/LWR read their own destination (the partial-merge workaround in
-# disas/capstone.c supplies it — see the unaligned-load merge comment).
-# LLVM models the merge as a tied operand on the *store* side only, so it
-# reports no such read.  The tracer's answer is the architectural one.
-mipsel R-rd-phantom lw[lr] +r#
+# (LWL/LWR read their own destination — the partial-merge workaround in
+# disas/capstone.c supplies it, LLVM models the merge as a tied operand on
+# the *store* side only.  Covered by the explicit `lwl` / `lwr` entries in
+# section 3; the class-wide form that used to live here spelled the family
+# `lw[lr]`, which the matcher reads literally — `*` is its only wildcard —
+# so it never matched anything.)
 
 # LLVM gives every SSE/AVX-class RISC-V FP vector op `Uses = [FRM]` but, in
 # LLVM 18, drops the `[VL, VTYPE]` the base class supplies — so the FP
@@ -102,6 +103,18 @@ aarch64 R-rd-missing bl* +sp
 # LLVM gives AArch64 MRS/MSR an NZCV def that the architecture does not.
 aarch64 R-wr-missing mrs +nzcv
 aarch64 R-wr-missing msr +nzcv
+
+# The TLBI operations that take NO Xt argument (TLBI VMALLE1, VMALLS12E1IS,
+# ALLE2, …) are still encoded in the SYS format, which has an Rt field; the
+# architecture requires that field to be 0b11111 for them.  LLVM keeps the
+# syntactic operand and reports it read whatever it holds, so an encoding
+# that puts a real register number in an Rt the operation does not use looks
+# like a lost read.  Capstone is right — the operation reads no register —
+# and the disagreement exists only on reserved encodings no assembler emits
+# (`tlbi vmalls12e1is` written properly names XZR, which folds away).  The
+# argument-taking forms (`tlbi vae2is, x0`) agree on both sides.  Newly
+# reachable since the sweep started filling Rn=30 (see sweep_aarch64).
+aarch64 R-rd-missing tlbi +r#
 
 # =====================================================================
 # 2. Deliberate tracer modelling decisions.  The disagreement is real but
@@ -148,8 +161,10 @@ aarch64 M-cs-mem-llvm-none adr
 # Closing this needs an operand-ABI extension, not a boundary fix.
 # (was a class-wide rule; narrowed to explicit signatures so a NEW
 #  unmodelled operand type on AArch64 still fails the gate)
+#  the complementary `R-*-phantom * +za*` form is deliberately absent: the
+#  boundary drops SME operands, so a ZA register can only ever be MISSING
+#  from its sets, never phantom in them.)
 aarch64 R-*-missing * +za*
-aarch64 R-*-phantom * +za*
 aarch64 R-rd-missing * +r#,za*
 
 # SVE2.1 / SME2 predicate-as-counter PAIR destinations: `whilege
@@ -190,10 +205,12 @@ mipsel R-*-missing *c2 +cop#
 mipsel R-*-phantom *c2 +cop#
 mipsel R-rd-missing mthc1 +f#
 
-# MIPS DSP accumulators $ac1..$ac3 on the two-operand MADD/MSUB forms:
+# (MIPS DSP accumulators $ac1..$ac3 on the two-operand MADD/MSUB forms:
 # Capstone names only the implicit HI:LO pair.  The tracer's HI:LO chain is
 # intact (probe_implicit_acc pins it); the extra DSP accumulators are not.
-mipsel R-rd-missing m[as][du][db]* +ac#
+# Covered by the explicit madd / maddu / msub / msubu entries in section 3;
+# the class-wide form that used to live here spelled the family
+# `m[as][du][db]*`, which the matcher reads literally and never matched.)
 
 # =====================================================================
 # 4. Decoder laxity and subtarget scope (class D).  Recorded rather than
@@ -1443,6 +1460,7 @@ x86_64 Z-access0 nopw REG
 aarch64 Z-unmodelled-op addha
 aarch64 Z-unmodelled-op addva
 aarch64 Z-unmodelled-op at
+aarch64 Z-unmodelled-op bfadd
 aarch64 Z-unmodelled-op bfdot
 aarch64 Z-unmodelled-op bfmla
 aarch64 Z-unmodelled-op bfmls
@@ -1481,6 +1499,7 @@ aarch64 Z-unmodelled-op fmul
 aarch64 Z-unmodelled-op fsub
 aarch64 Z-unmodelled-op fsubr
 aarch64 Z-unmodelled-op fvdot
+aarch64 Z-unmodelled-op fvdotb
 aarch64 Z-unmodelled-op fvdott
 aarch64 Z-unmodelled-op incb
 aarch64 Z-unmodelled-op incd

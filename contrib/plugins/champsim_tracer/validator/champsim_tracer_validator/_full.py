@@ -1314,18 +1314,13 @@ def _chk_static_coverage(ctx: Ctx) -> Outcome:
                    "static_depth-deepened (4 ISAs, minting-off teeth)", subs)
 
 
-# Subtarget arguments per ISA for the decoder cross-check.  The Capstone side
-# is fixed by disas/capstone.c; these widen the LLVM subtarget so that "LLVM
-# rejects it" means "genuinely not an encoding of this ISA" rather than
-# "feature not enabled in the default subtarget", which is the single largest
-# source of false positives in that tool.
-_ISAX_LLVM_ARGS = {
-    "aarch64": ["--mattr=+all"],
-    "mipsel": ["--mattr=+mips32r2,+msa,+dsp,+dspr2,+dspr3,+fp64,+eva,+virt,"
-               "+ginv,+crc,+abs2008,+nan2008,+mt", "--mcpu=mips32r2"],
-    "riscv64": [],
-    "x86_64": [],
-}
+# The LLVM subtarget per ISA used to be supplied here, as flags this one
+# caller passed on the command line.  That left the tool itself wrong: run
+# from anywhere else it compared against a default subtarget that does not
+# describe the ISA Capstone decodes, and the gate's verdict depended on who
+# invoked it.  The subtargets now live in isaxcheck's own kIsaTable, which
+# is where a fact about the ISA belongs; --mattr / --mcpu remain as
+# interactive overrides for probing a Capstone or LLVM bump.
 
 
 def _chk_isa_crosscheck(ctx: Ctx) -> Outcome:
@@ -1342,7 +1337,7 @@ def _chk_isa_crosscheck(ctx: Ctx) -> Outcome:
     signature.
 
     GATING on any signature outside tools/isaxcheck_allow.txt, for all four
-    ISAs.  The whole sweep is ~25 s on 8 cores over 12.6-16.8 M encodings per
+    ISAs.  The whole sweep is ~30 s on 8 cores over 12.6-21.0 M encodings per
     ISA, which is cheap enough to run on every Capstone bump — the point
     being that the disas/capstone.c workarounds should be retirable rather
     than permanent.  A workaround that works shows up here as the ABSENCE of
@@ -1366,9 +1361,8 @@ def _chk_isa_crosscheck(ctx: Ctx) -> Outcome:
     subs: list = []
     all_ok = True
     for isa in ISA_ALL:
-        cmd = ([str(tool), f"--isa={isa}", "--jobs=8"]
-               + _ISAX_LLVM_ARGS.get(isa, [])
-               + [f"--allow={allow}", "--check"])
+        cmd = [str(tool), f"--isa={isa}", "--jobs=8",
+               f"--allow={allow}", "--check"]
         p = subprocess.run(cmd, text=True, capture_output=True, timeout=900)
         head = (p.stdout or "").splitlines()
         summary = head[0] if head else (p.stderr or "").strip()[:200]
@@ -1385,7 +1379,7 @@ def _chk_isa_crosscheck(ctx: Ctx) -> Outcome:
         subs.append({"name": isa, "ok": ok, "detail": detail})
     return Outcome("pass" if all_ok else "fail",
                    "boundary-vs-LLVM-MC decode metadata agreement "
-                   "(4 ISAs, ~57 M encodings, allowlisted residual)", subs)
+                   "(4 ISAs, ~50 M encodings, allowlisted residual)", subs)
 
 
 def _chk_smc(ctx: Ctx) -> Outcome:

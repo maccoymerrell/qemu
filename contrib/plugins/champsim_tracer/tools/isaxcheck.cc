@@ -130,10 +130,23 @@ static Isa isa;
  * restated.  WHEN cap_mode_*() CHANGES, CHANGE THIS TOO: a mode mismatch is
  * the single largest source of false positives in this tool, and it is silent.
  * The LLVM feature strings are chosen to describe the same ISA subset.
+ *
+ * THIS TABLE IS THE GATE'S SUBTARGET.  It used to be corrected by flags the
+ * one calling harness passed on the command line, which left the tool itself
+ * wrong: run bare (or from any other harness) it reported hundreds of
+ * disagreements that were only "LLVM was not told about this extension", and
+ * anything genuinely wrong inside a mis-modelled register file was invisible
+ * underneath them.  The mipsel row is the worked example: a default MIPS
+ * subtarget is FR=0, whose 64-bit FP values live in the AFGR64 pair file
+ * (D0..D15), while Capstone, QEMU and every binary the tracer runs use FGR64
+ * (f0..f31) -- so the whole MIPS FP-double space compared a register file
+ * against a different register file.  Anything a caller needs to override to
+ * make this tool correct belongs HERE, not in the caller.
  */
 static const IsaCfg kIsaTable[] = {
-    {"aarch64", "aarch64-unknown-linux-gnu", "generic",
-     "+v8.5a,+sve,+crypto,+lse,+rdm,+dotprod",
+    /* Capstone's AArch64 decoder gates nothing on features, so the matching
+     * LLVM subtarget is the whole architecture, not a version snapshot. */
+    {"aarch64", "aarch64-unknown-linux-gnu", "generic", "+all",
      CS_ARCH_AARCH64, CS_MODE_LITTLE_ENDIAN, true},
     {"riscv64", "riscv64-unknown-linux-gnu", "generic-rv64",
      "+64bit,+i,+m,+a,+f,+d,+c,+v,+zicsr,+zifencei,+zba,+zbb,+zbc,"
@@ -144,7 +157,16 @@ static const IsaCfg kIsaTable[] = {
          CS_MODE_RISCV_ZBC | CS_MODE_RISCV_ZBKB | CS_MODE_RISCV_ZBKC |
          CS_MODE_RISCV_ZBKX | CS_MODE_RISCV_ZBS,
      true},
-    {"mipsel", "mipsel-unknown-linux-gnu", "mips32r2", "",
+    /* `+fp64` is load-bearing, not decoration: without it LLVM selects the
+     * FR=0 AFGR64 register file and names every 64-bit FP operand D0..D15
+     * where Capstone and QEMU name f0..f31.  Every binary the tracer traces
+     * is FPXX or better, so the tracer's 64-bit-FPR model is the correct
+     * one.  The remaining features are the ASEs Capstone's MIPS32R2 mode
+     * decodes; omitting one turns "LLVM was not told about this extension"
+     * into a decode disagreement. */
+    {"mipsel", "mipsel-unknown-linux-gnu", "mips32r2",
+     "+mips32r2,+msa,+dsp,+dspr2,+dspr3,+fp64,+eva,+virt,+ginv,+crc,"
+     "+abs2008,+nan2008,+mt",
      CS_ARCH_MIPS, CS_MODE_MIPS32R2 | CS_MODE_LITTLE_ENDIAN, true},
     {"x86_64", "x86_64-unknown-linux-gnu", "x86-64", "",
      CS_ARCH_X86, CS_MODE_64, true},
@@ -774,10 +796,19 @@ static void try_half(uint16_t h)
 // aarch64: opcode-bearing bits are [31:10]; [9:5]=Rn, [4:0]=Rd/Rt.
 // Sweep [31:10] exhaustively across a few (Rn,Rd) fillings so that encodings
 // that overload the register fields as opcode extensions are still reached.
+//
+// (30, 0) is not decoration.  X30 is the one general register whose VALUE
+// changes what an instruction is: `RET X30` prints as the aliased `ret`,
+// with its operand dropped, and no other Rn reaches that alias.  Without
+// this filling the whole `ret` alias -- the most executed control transfer
+// in any AArch64 trace -- was outside the swept space, and the boundary's
+// loss of its link-register read sat there unseen through every green run
+// of this gate.  A register field that selects a decode has to be swept
+// with the value that selects it.
 static void sweep_aarch64(unsigned shard, unsigned nshard)
 {
     static const struct { unsigned rn, rd; } fills[] = {
-        {1, 2}, {31, 31}, {0, 31}, {31, 0},
+        {1, 2}, {31, 31}, {0, 31}, {31, 0}, {30, 0},
     };
     for (uint32_t top = shard; top < (1u << 22); top += nshard)
         for (auto &f : fills)

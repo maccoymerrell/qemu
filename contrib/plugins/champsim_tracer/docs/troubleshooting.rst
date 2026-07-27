@@ -346,6 +346,153 @@ command a workaround comment suggests, or skip the ambiguity entirely
 and use ``capstone_workaround_probe``, which links the correct copy
 unconditionally and cannot make this mistake.
 
+The three-way decoder tripwire
+------------------------------
+
+``isaxcheck`` compares two decoders: the tracer's boundary
+(``cap_disas_raw_detail()`` in ``disas/capstone.c`` — Capstone plus
+every correction the boundary applies) and the LLVM MC layer.  Those
+two are not independent.  Capstone's AArch64, Mips and RISCV
+instruction tables are auto-synced from LLVM TableGen, so a defect the
+two share is structurally invisible to any comparison between them.
+
+``tools/isax3way.py`` adds a third opinion — GNU binutils/opcodes,
+through the cross ``objdump``\ s — whose opcode tables are a separate,
+hand-maintained codebase.  It runs the boundary and LLVM through
+``isaxcheck --batch`` (one TSV row per encoding, carrying both
+decoders' views and echoing the input bytes back in a ``hex`` column),
+disassembles the same bytes with ``objdump``, joins the three on
+``hex``, and buckets every disagreement::
+
+   contrib/plugins/champsim_tracer/tools/isax3way.py \
+       --isaxcheck build/contrib/plugins/isaxcheck --out 3way/
+
+About five seconds for aarch64, riscv64 and mipsel on the checked-in
+representatives, fifteen with executed populations added.  Each
+report is a ``.3way`` file naming the buckets, their encoding counts,
+their dynamic weight if an executed population was supplied, and three
+sample encodings apiece:
+
+``V-accept=…``
+   validity vote — which of the three accepted the encoding at all.
+``L-cs=…,llvm=…,gnu=…``
+   instruction-length vote.
+``M-cs=llvm!=gnu``, ``M-gnu=llvm!=cs``, ``M-cs=gnu!=llvm``, ``M-all-differ``
+   mnemonic vote.  ``M-cs=llvm!=gnu`` is the shared-blind-spot
+   signal; ``M-gnu=llvm!=cs`` says binutils broke the tie against the
+   boundary.
+``X-…``
+   the registers named in the *explicit* operand text, same voting
+   scheme.
+
+An ``X-`` bucket on a branch instruction deserves a look at its sample
+before it is believed.  binutils renders a branch target as a bare
+section-relative hex address with no ``0x``, and such an address can
+spell an ABI register name — ``jal fa6`` is a target, not a write of
+``fa6`` — so whether the bucket appears at all depends on where the
+encoding happened to land in the batch.  The other three vote classes
+have no such ambiguity.
+
+**Why this is periodic and not per-commit**
+
+binutils yields disassembly *text*.  No access metadata, no def/use
+sets.  So it can rule on encoding validity, instruction length,
+mnemonic identity and explicitly-named registers, and on nothing
+else — a strict subset of what ``isaxcheck`` already checks on every
+commit, over a far smaller population.
+
+What it uniquely answers is a *version* question.  When the boundary
+decodes an encoding LLVM rejects, there are two very different
+explanations: the LLVM subtarget in ``isaxcheck``'s ``kIsaTable`` is
+narrower than the Capstone mode the tracer runs in, or Capstone is
+over-accepting an encoding the architecture reserves.  binutils
+separates them.  ``V-accept=cs`` — binutils rejecting alongside LLVM —
+is unambiguously the second; ``V-accept=csgnu`` puts the encoding
+beyond Capstone's word alone and points at the first, with the
+qualification below.  The per-commit gate now
+measures the *size* of that gap directly and reports it as
+``subtarget_gap=`` on its summary line, so the standing need is not to
+re-derive the interpretation every commit but to confirm it still
+holds after a decoder moves underneath it.
+
+Run it on a Capstone bump (``subprojects/capstone.wrap``), an LLVM
+bump, or a binutils bump, and diff the new ``.3way`` reports against
+the previous run's.  The bucket names are stable across versions of
+the tool on purpose: a bucket-by-bucket diff is the whole deliverable.
+
+**Reading a nonzero** ``V-accept=csgnu``
+
+Two independent decoders accept an encoding LLVM refuses, so the
+encoding is not a Capstone invention.  The default reading is that the
+LLVM subtarget is missing the feature that decodes it, and the fix is
+to widen the subtarget — add the LLVM feature to that ISA's
+``features`` string in ``isaxcheck``'s ``kIsaTable`` — **not** to add a
+line to ``tools/isaxcheck_allow.txt``.  An allowlist line hides the
+encoding from the register, memory and branch comparisons entirely,
+because a rejection short-circuits the whole compare; the gate would
+then be blind to exactly the extension the tripwire just proved
+exists.
+
+An allowlist line is correct only when there is no LLVM feature left
+to enable.  AArch64 is that case and is worth knowing as the worked
+example: its subtarget is already ``+all``, there is nothing wider to
+select, and its residual ``V-accept=csgnu`` is Capstone and binutils
+*both* being lenient about fields the architecture reserves —
+``08400022`` decodes as ``ldxrb w2, [x1]`` in both even though ``Rs``
+and ``Rt2`` are not the required all-ones, and LLVM enforces them.
+Shared leniency between two decoders is not evidence of a missing
+feature.  So the third opinion narrows the question rather than
+answering it outright: ``V-accept=cs``, with binutils rejecting
+alongside LLVM, is unambiguously Capstone alone; ``V-accept=csgnu`` is
+either a subtarget gap or a shared over-acceptance, and which one it
+is follows from whether the ISA has a feature left to turn on.
+
+**Populations, and why the sweep is not exhaustive**
+
+Two populations feed the tool.  The representatives, checked in under
+``tools/isax3way_pop/<isa>_rep.hex``, are the structured
+opcode-space sweep decimated to at most 24 encodings per distinct
+*three-way answer* — the answer being each decoder's verdict and
+mnemonic, which is the whole of what binutils can testify to.  Every
+bucket the exhaustive sweep produces therefore survives into the
+representative population by construction; what is capped is bucket
+magnitude.  Magnitude that matters comes from the second population:
+the encodings a real workload actually retired, passed with ``--hex
+aarch64=run.hex`` and weighted by execution count with ``--weights
+aarch64=run.weights.tsv``, which is what turns a bucket from
+"reachable" into "reached ten million times".  Regenerate the
+representatives after a decoder bump with ``--gen-rep`` (minutes, not
+seconds — it walks the full sweep).
+
+Exhaustive is not merely slow on AArch64, it is unavailable.
+binutils 2.42's AArch64 disassembler aborts on an assertion::
+
+   aarch64-linux-gnu-objdump: ../../opcodes/aarch64-dis.c:251:
+   get_sreg_qualifier_from_value: Assertion `value <= 0x4 &&
+   aarch64_get_qualifier_standard_value (qualifier) == value' failed.
+
+The abort is reachable only *in sequence*: the same encoding
+disassembled on its own decodes cleanly as ``.inst 0x… ; undefined``.
+binutils carries decoder state across instructions (the MOVPRFX
+sequence constraint), so it is the adjacency an exhaustive sweep
+creates that trips it, and no single-encoding test finds it.  On this
+project's development host — binutils 2.42, Ubuntu — the 4 194 304-
+encoding AArch64 sweep dies with ``SIGABRT`` at encoding 1 531 836
+(``0x5d7ef022``), and the aborts come in dense storms: six
+4096-encoding regions of the opcode space in which very nearly every
+encoding aborts.  ``isax3way.py`` survives them by resuming past the
+offending
+slot with an exponentially growing quarantine distance, answering the
+quarantined slots ``(gnu-internal-error)`` and counting them in the
+report's ``#gnu-internal-errors`` line.  That is a reportable binutils
+defect, not a decode opinion — and it is why the third opinion runs on
+representatives rather than on the full space.
+
+x86_64 is deliberately out of scope.  Capstone's x86 tables are
+hand-maintained and independent of LLVM's, so the shared-blind-spot
+argument that motivates a third opinion does not apply, and x86
+already has Intel PIN cross-validation.
+
 Where to look next
 ------------------
 

@@ -1856,6 +1856,45 @@ static bool cap_riscv_is_tied_vd(const char *mnem)
 }
 
 /*
+ * RVV unconditionally-masked carry / merge family test.
+ *
+ * Almost every RVV instruction takes an OPTIONAL mask, spelled `, v0.t`
+ * when present; Capstone models that one correctly as a fourth operand
+ * reading v0.  Six families are different: their mask is not optional
+ * and not a predicate but a DATA input — the carry-in of vadc/vmadc,
+ * the borrow-in of vsbc/vmsbc, the select control of vmerge/vfmerge —
+ * so the assembler spells it with a trailing `m` on the operand-shape
+ * suffix (`.vvm` / `.vxm` / `.vim` / `.vfm`) and v0 is a mandatory,
+ * non-maskable operand.  That is the complete closure: these four
+ * suffixes exist on RISC-V for these six families and nothing else
+ * (vadc, vmadc, vsbc, vmsbc, vmerge, vfmerge — 14 mnemonics), and the
+ * unmasked siblings that omit the carry-in are spelled without the `m`
+ * (`vmadc.vv`, `vmsbc.vx`), so the suffix test cannot over-reach.
+ */
+static bool cap_riscv_reads_v0_mask(const char *mnem)
+{
+    size_t len;
+
+    if (!mnem || mnem[0] != 'v') {
+        return false;
+    }
+    len = strlen(mnem);
+    if (len < 5 || mnem[len - 1] != 'm' || mnem[len - 3] != 'v'
+        || mnem[len - 4] != '.') {
+        return false;
+    }
+    switch (mnem[len - 2]) {
+    case 'v':   /* .vvm */
+    case 'x':   /* .vxm */
+    case 'i':   /* .vim */
+    case 'f':   /* .vfm */
+        return true;
+    default:
+        return false;
+    }
+}
+
+/*
  * Extract per-operand detail for RISC-V or MIPS (no access info).
  */
 static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
@@ -1980,6 +2019,59 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
          * built from `subprojects/capstone`, not a system package, or run
          * `capstone_workaround_probe`; see docs/troubleshooting.rst.
          */
+        /*
+         * RVV unconditionally-masked carry/merge v0 restore
+         * (see cap_riscv_reads_v0_mask for the family and its closure).
+         *
+         * This one is NOT a Capstone-only defect and it is not verifiable
+         * by cross-checking a second decoder: Capstone and LLVM both PRINT
+         * `v0` in the operand string and NEITHER reports it as a read, so
+         * isaxcheck sees two decoders agreeing and can never flag it.  It
+         * is fixed from the ISA specification instead — RVV v1.0 §11.4
+         * (vadc/vsbc), §11.5 (vmadc/vmsbc) and §11.15 (vmerge/vfmerge) all
+         * define v0 as an operand the instruction reads, not as a mask
+         * that may be disabled — and it carries its own regression check
+         * (probe_rv_v0_carry_mask) for the same reason.
+         *
+         * Without it a carry-propagating multiword add chain
+         * (vadc/vmadc alternating through v0) reports no dependency on
+         * the carry at all: each limb looks independent of the one
+         * below it, which is the whole serialisation the chain exists
+         * to express.  The optional `, v0.t` mask is unaffected —
+         * Capstone models that one correctly as a fourth operand, and
+         * SVE governing predicates are likewise correct.
+         *
+         * Not revisitable on a Capstone bump: the printed alias is not
+         * a defect, the metadata simply does not describe a mandatory
+         * mask operand.  Removable only if Capstone starts reporting
+         * v0 for this family, which the sweep would then show as a
+         * duplicate read (harmless — the guard below is idempotent).
+         */
+        if (cap_riscv_reads_v0_mask(insn->mnemonic)) {
+            bool has_v0 = false;
+            for (uint8_t i = 0; i < out->n_regs_read; i++) {
+                if (out->regs_read_id[i] == RISCV_REG_V0) {
+                    has_v0 = true;
+                    break;
+                }
+            }
+            for (uint8_t i = 0; !has_v0 && i < n; i++) {
+                if (out->operands[i].type == QEMU_PLUGIN_OP_REG
+                    && out->operands[i].reg_id == RISCV_REG_V0
+                    && (out->operands[i].access
+                        & QEMU_PLUGIN_OP_ACC_READ)) {
+                    has_v0 = true;
+                }
+            }
+            if (!has_v0
+                && out->n_regs_read < QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS) {
+                cap_copy_reg_name(out->regs_read[out->n_regs_read],
+                                  QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                                  handle, RISCV_REG_V0, cap_arch);
+                out->regs_read_id[out->n_regs_read] = RISCV_REG_V0;
+                out->n_regs_read++;
+            }
+        }
         if (insn->mnemonic[0] == 'v'
             && !g_str_has_prefix(insn->mnemonic, "vsetvl")) {
             bool has_vl = false;

@@ -73,6 +73,26 @@ riscv64 R-rd-phantom vf* +vl,vtype
 riscv64 R-rd-phantom vl*.v +vl,vtype
 riscv64 R-rd-phantom vs*.v +vl,vtype
 
+# The RVV unconditionally-masked carry/merge families (`.vvm` / `.vxm` /
+# `.vim` / `.vfm`) take v0 as a mandatory DATA operand: the carry-in of
+# vadc/vmadc, the borrow-in of vsbc/vmsbc, the select control of
+# vmerge/vfmerge.  RVV v1.0 §11.4, §11.5 and §11.15 all define it as read.
+# BOTH decoders print `v0` in the operand string and NEITHER reports the
+# read, so this is the one disagreement class this tool could never have
+# discovered — it was fixed from the specification (see the v0 restore in
+# cap_fill_generic_operands) and carries its own regression check,
+# probe_rv_v0_carry_mask, precisely because the sweep cannot cover it.
+# Without the read a multiword add chain's carry serialisation vanishes.
+# The unmasked siblings (`vmadc.vv`, `vmsbc.vx`) genuinely do not read v0
+# and are deliberately not matched.  Removable when LLVM's
+# RISCVInstrInfoV descriptions mark the V0 operand a use.
+riscv64 R-rd-phantom vadc.v*m +v#
+riscv64 R-rd-phantom vmadc.v*m +v#
+riscv64 R-rd-phantom vsbc.v*m +v#
+riscv64 R-rd-phantom vmsbc.v*m +v#
+riscv64 R-rd-phantom vmerge.v*m +v#
+riscv64 R-rd-phantom vfmerge.v*m +v#
+
 # LLVM adds an ABI-modelling implicit SP use to call instructions.  It is
 # not an architectural read; the tool already suppresses it for the plain
 # call forms, but not for the pointer-authenticated ones, which LLVM

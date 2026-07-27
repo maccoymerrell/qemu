@@ -554,6 +554,61 @@ _register_probe('probe_rv_vec_arith', {'riscv64': {'asm': '".option push\\n\\t"\
                          'VEC_MADD',
                          'VEC_MSUB']}})
 
+# The RVV unconditionally-masked carry/merge families take v0 as a
+# MANDATORY data operand — the carry-in of vadc/vmadc, the borrow-in of
+# vsbc/vmsbc, the select control of vmerge/vfmerge (RVV v1.0 §11.4,
+# §11.5, §11.15) — spelled with the trailing `m` on the operand-shape
+# suffix.  This probe exists because NO cross-check can cover it: both
+# Capstone and LLVM MC print `v0` in the operand string and neither
+# reports the read, so isaxcheck sees two decoders agreeing and stays
+# green either way.  disas/capstone.c restores the read from the
+# specification; the author-declared reg_sets below are the only thing
+# that will go red if that restoration is ever dropped.
+#
+# The unmasked siblings `vmadc.vv` / `vmsbc.vv` are included as the
+# negative control: they encode no carry-in and must NOT name v0.
+_register_probe('probe_rv_v0_carry_mask', {
+    'riscv64': {
+        'asm':      '".option push\\n\\t"\n'
+                    '    ".option arch, +v\\n\\t"\n'
+                    '    "vsetvli t0, zero, e64, m1, ta, ma\\n\\t"\n'
+                    '    "vadc.vvm   v4, v5, v6, v0\\n\\t"\n'
+                    '    "vsbc.vvm   v7, v8, v9, v0\\n\\t"\n'
+                    '    "vmadc.vvm  v10, v11, v12, v0\\n\\t"\n'
+                    '    "vmsbc.vvm  v13, v14, v15, v0\\n\\t"\n'
+                    '    "vmerge.vvm v16, v17, v18, v0\\n\\t"\n'
+                    '    "vmerge.vxm v19, v20, t1, v0\\n\\t"\n'
+                    '    "vmadc.vv   v21, v22, v23\\n\\t"\n'
+                    '    "vmsbc.vv   v24, v25, v26\\n\\t"\n'
+                    '    ".option pop"',
+        'clobbers': '"t0","memory"',
+        'opcodes':  [],
+        # REG_VCTRL is vl/vtype, the vector configuration every RVV
+        # instruction consumes; REG_VEC0 is the carry/select operand
+        # this probe exists for.  Note its absence on the last two.
+        'reg_sets': [
+            {'src': ['REG_ZERO'],
+             'dst': ['REG_GPR5', 'REG_VCTRL']},                 # vsetvli
+            {'src': ['REG_VEC5', 'REG_VEC6', 'REG_VCTRL', 'REG_VEC0'],
+             'dst': ['REG_VEC4']},                              # vadc.vvm
+            {'src': ['REG_VEC8', 'REG_VEC9', 'REG_VCTRL', 'REG_VEC0'],
+             'dst': ['REG_VEC7']},                              # vsbc.vvm
+            {'src': ['REG_VEC11', 'REG_VEC12', 'REG_VCTRL', 'REG_VEC0'],
+             'dst': ['REG_VEC10']},                             # vmadc.vvm
+            {'src': ['REG_VEC14', 'REG_VEC15', 'REG_VCTRL', 'REG_VEC0'],
+             'dst': ['REG_VEC13']},                             # vmsbc.vvm
+            {'src': ['REG_VEC17', 'REG_VEC18', 'REG_VCTRL', 'REG_VEC0'],
+             'dst': ['REG_VEC16']},                             # vmerge.vvm
+            {'src': ['REG_VEC20', 'REG_GPR6', 'REG_VCTRL', 'REG_VEC0'],
+             'dst': ['REG_VEC19']},                             # vmerge.vxm
+            {'src': ['REG_VEC22', 'REG_VEC23', 'REG_VCTRL'],
+             'dst': ['REG_VEC21']},                             # vmadc.vv
+            {'src': ['REG_VEC25', 'REG_VEC26', 'REG_VCTRL'],
+             'dst': ['REG_VEC24']},                             # vmsbc.vv
+        ],
+    },
+})
+
 _register_probe('probe_mips_mov', {'mipsel': {'asm': '"move $t0, $t1"', 'clobbers': '"$t0"', 'opcodes': ['OR']}})
 
 _register_probe('probe_mips_neg_not', {'mipsel': {'asm': '"negu $t0, $t1\\n\\t"\n    "not  $t2, $t3"',

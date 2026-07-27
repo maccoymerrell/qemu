@@ -2157,6 +2157,226 @@ static bool cap_riscv_reads_v0_mask(const char *mnem)
 }
 
 /*
+ * RVV mask-destination family test — the one statically decidable case
+ * of "the vector destination is also a source".
+ *
+ * Under tail-undisturbed or mask-undisturbed the destination keeps its
+ * old contents in the inactive elements, so architecturally vd is a
+ * source of nearly every vector op.  That general case is NOT decidable
+ * from the instruction word: it depends on vtype.vta, vtype.vma and vl
+ * against VLMAX, all written by an earlier vsetvl, so a per-opcode
+ * template cannot express it without carrying vtype in its key.  It is
+ * deliberately left unmodelled.
+ *
+ * The sub-case where the destination is a MASK register is different:
+ * Sail's write_vmask leaves the mask tail undisturbed unconditionally,
+ * regardless of vta, so vd is a source no matter what the runtime
+ * configuration says.  That covers the integer and FP compares, the
+ * carry/borrow-out producers vmadc/vmsbc, the mask-logical ops, the
+ * set-before/including/only-first scans, and the mask load vlm.v.
+ *
+ * The mnemonic space is closed: every RVV instruction whose destination
+ * is a mask register is spelled vms* (compares, vmsbc, vmsbf/vmsif/
+ * vmsof), vmf* (FP compares), vmadc*, a mask-logical vm*.mm, or vlm.v.
+ * Instructions that merely *read* a mask into a scalar (vcpop.m,
+ * vfirst.m) write a GPR and are not in any of those shapes.
+ */
+static bool cap_riscv_is_mask_dst(const char *mnem)
+{
+    size_t len;
+
+    if (!mnem || mnem[0] != 'v') {
+        return false;
+    }
+    if (!strcmp(mnem, "vlm.v")) {
+        return true;
+    }
+    /* Mask-logical pseudo-instructions Capstone prints in place of the
+     * .mm form they encode: vmmv.m (vmand.mm vd,vs,vs), vmnot.m
+     * (vmnand.mm vd,vs,vs), vmclr.m (vmxor.mm vd,vd,vd), vmset.m
+     * (vmxnor.mm vd,vd,vd). */
+    if (!strcmp(mnem, "vmmv.m") || !strcmp(mnem, "vmnot.m") ||
+        !strcmp(mnem, "vmclr.m") || !strcmp(mnem, "vmset.m")) {
+        return true;
+    }
+    if (g_str_has_prefix(mnem, "vms") || g_str_has_prefix(mnem, "vmf") ||
+        g_str_has_prefix(mnem, "vmadc")) {
+        return true;
+    }
+    /* Mask-logical: vmand/vmnand/vmandn/vmor/vmnor/vmorn/vmxor/vmxnor,
+     * all spelled with a .mm operand-shape suffix. */
+    len = strlen(mnem);
+    return len > 5 && mnem[1] == 'm' && !strcmp(mnem + len - 3, ".mm");
+}
+
+/*
+ * RISC-V scalar FP dynamic rounding: the frm read with no encoded field.
+ *
+ * An FP instruction's 3-bit rm field names a rounding mode directly
+ * except for the value 0b111 (DYN), which means "use the rounding mode
+ * in fcsr.frm".  Sail states it exactly -- select_instr_or_fcsr_rm reads
+ * fcsr[FRM] only in that case -- and it is the case a compiler emits for
+ * every ordinary FP operation, so essentially all scalar FP arithmetic
+ * in a trace depends on the last fsrm/fscsr and the boundary said it
+ * depended on nothing.
+ *
+ * Read from the instruction word rather than the mnemonic because the
+ * mnemonic does not carry it: `fcvt.w.d a0, fa0` and `fcvt.w.d a0, fa0,
+ * rtz` are the same mnemonic with different rm, and only the first
+ * reads frm.  The rm field doubles as a function selector on the
+ * compare / sign-inject / min-max / class / move forms, but none of
+ * those uses the value 0b111, so testing for DYN excludes them without
+ * having to enumerate them.
+ *
+ * Restricted to the five FP major opcodes -- OP-FP and the four
+ * fused-multiply-add forms -- and to 32-bit encodings, so the
+ * compressed FP loads and stores (which have no rm field and no
+ * rounding) cannot match.
+ */
+static bool cap_riscv_reads_dynamic_frm(const cs_insn *insn)
+{
+    uint32_t word;
+    uint32_t opcode;
+
+    if (insn->size != 4) {
+        return false;
+    }
+    word = (uint32_t)insn->bytes[0] | ((uint32_t)insn->bytes[1] << 8) |
+           ((uint32_t)insn->bytes[2] << 16) | ((uint32_t)insn->bytes[3] << 24);
+    opcode = word & 0x7f;
+    /* MADD / MSUB / NMSUB / NMADD / OP-FP. */
+    if (opcode != 0x43 && opcode != 0x47 && opcode != 0x4b &&
+        opcode != 0x4f && opcode != 0x53) {
+        return false;
+    }
+    return ((word >> 12) & 0x7) == 0x7;   /* rm == DYN */
+}
+
+/*
+ * Copy the @index'th comma-separated token of a disassembler's printed
+ * operand string into @dst, lower-cased and stripped of surrounding
+ * space.  Used to recover a name for operands whose Capstone
+ * representation carries a number but no name lookup (the RISC-V CSR
+ * field).  Capstone prints operands in detail order, so the index is
+ * the operand index.  Leaves @dst empty when the string has no such
+ * token -- some alias forms print fewer operands than they model.
+ */
+static void cap_copy_op_str_token(char *dst, size_t dstsz,
+                                  const char *op_str, unsigned index)
+{
+    const char *p = op_str;
+    const char *end;
+    size_t n;
+
+    dst[0] = '\0';
+    if (!op_str) {
+        return;
+    }
+    for (unsigned i = 0; i < index; i++) {
+        p = strchr(p, ',');
+        if (!p) {
+            return;
+        }
+        p++;
+    }
+    while (*p == ' ') {
+        p++;
+    }
+    end = strchr(p, ',');
+    if (!end) {
+        end = p + strlen(p);
+    }
+    while (end > p && end[-1] == ' ') {
+        end--;
+    }
+    n = (size_t)(end - p);
+    if (n == 0) {
+        return;
+    }
+    if (n >= dstsz) {
+        n = dstsz - 1;
+    }
+    for (size_t i = 0; i < n; i++) {
+        dst[i] = (char)g_ascii_tolower(p[i]);
+    }
+    dst[n] = '\0';
+}
+
+/*
+ * Zicsr access direction.
+ *
+ * Capstone reports every CSR operand as READ|WRITE, but the ISA
+ * suppresses one side by encoding: CSRRW / CSRRWI with rd == x0 does not
+ * read the CSR, and CSRRS / CSRRC / CSRRSI / CSRRCI with a zero rs1 or
+ * uimm does not write it (Sail's csr_access_type states the whole
+ * table).  The suppression is not cosmetic -- `csrr a0, vl` is the
+ * spelling of "read vl", and reporting it as a write of vl would make
+ * every following vector instruction depend on it instead of on the
+ * vsetvli that configured them.
+ *
+ * The alias mnemonics Capstone prints (csrr, csrw, frflags, fsrm, ...)
+ * omit the x0 operand that decides this, so the fields come from the
+ * instruction word.
+ */
+/*
+ * Name for a synthesised CSR operand.  Capstone has no CSR-number
+ * lookup, and the alias forms that need synthesising are exactly the
+ * ones whose printed text no longer contains the register, so the
+ * handful of user-level CSRs those aliases cover are named here and
+ * everything else is left unnamed.  Only informational: the plugin maps
+ * from the number.
+ */
+static const char *cap_riscv_csr_name(unsigned csr)
+{
+    switch (csr) {
+    case 0x001: return "fflags";
+    case 0x002: return "frm";
+    case 0x003: return "fcsr";
+    case 0x008: return "vstart";
+    case 0x009: return "vxsat";
+    case 0x00a: return "vxrm";
+    case 0x00f: return "vcsr";
+    case 0xc20: return "vl";
+    case 0xc21: return "vtype";
+    case 0xc22: return "vlenb";
+    default:    return NULL;
+    }
+}
+
+static uint8_t cap_riscv_csr_access(const cs_insn *insn)
+{
+    uint32_t word;
+    unsigned funct3, rd, rs1;
+
+    if (insn->size != 4) {
+        return QEMU_PLUGIN_OP_ACC_READ | QEMU_PLUGIN_OP_ACC_WRITE;
+    }
+    word = (uint32_t)insn->bytes[0] | ((uint32_t)insn->bytes[1] << 8) |
+           ((uint32_t)insn->bytes[2] << 16) | ((uint32_t)insn->bytes[3] << 24);
+    if ((word & 0x7f) != 0x73) {           /* not SYSTEM */
+        return QEMU_PLUGIN_OP_ACC_READ | QEMU_PLUGIN_OP_ACC_WRITE;
+    }
+    funct3 = (word >> 12) & 0x7;
+    rd     = (word >> 7) & 0x1f;
+    rs1    = (word >> 15) & 0x1f;          /* also the uimm of the I forms */
+
+    switch (funct3) {
+    case 1:                                 /* CSRRW  */
+    case 5:                                 /* CSRRWI */
+        return QEMU_PLUGIN_OP_ACC_WRITE |
+               (rd ? QEMU_PLUGIN_OP_ACC_READ : 0);
+    case 2:                                 /* CSRRS  */
+    case 3:                                 /* CSRRC  */
+    case 6:                                 /* CSRRSI */
+    case 7:                                 /* CSRRCI */
+        return QEMU_PLUGIN_OP_ACC_READ |
+               (rs1 ? QEMU_PLUGIN_OP_ACC_WRITE : 0);
+    default:
+        return QEMU_PLUGIN_OP_ACC_READ | QEMU_PLUGIN_OP_ACC_WRITE;
+    }
+}
+
+/*
  * Extract per-operand detail for RISC-V or MIPS (no access info).
  */
 static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
@@ -2216,6 +2436,30 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                 op->index_id   = 0;
                 op->imm = cop->mem.disp;
                 break;
+            case RISCV_OP_CSR:
+                /*
+                 * The control and status register a Zicsr instruction
+                 * exists to move.  Capstone carries it as a bare 12-bit
+                 * number in its own operand type -- a numbering space
+                 * disjoint from riscv_reg -- so presented as anything
+                 * else `csrr a0, vl` reads nothing and `fscsr a0, a1`
+                 * writes nothing, and a vector kernel's edge onto the
+                 * vsetvli that configured it, or an FP kernel's onto
+                 * the fsrm that set its rounding mode, does not exist.
+                 * It goes out as QEMU_PLUGIN_OP_SYSREG carrying the raw
+                 * CSR number, with the direction refined from the
+                 * encoding (see cap_riscv_csr_access).
+                 */
+                op->type = QEMU_PLUGIN_OP_SYSREG;
+                op->access = cap_riscv_csr_access(insn);
+                op->reg_id = (uint16_t)cop->csr;
+                cap_copy_op_str_token(op->reg_name,
+                                      QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                                      insn->op_str, i);
+                op->index_name[0] = '\0';
+                op->index_id   = 0;
+                op->imm = 0;
+                break;
             default:
                 op->type = QEMU_PLUGIN_OP_INVALID;
                 op->reg_name[0] = '\0';
@@ -2225,6 +2469,69 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                 op->imm = 0;
                 break;
             }
+        }
+        /*
+         * Zicsr alias forms drop the CSR operand altogether.
+         *
+         * With the F/D extension enabled Capstone prints `csrrw a0,
+         * frm, a1` as its alias `fsrm a0, a1` and `csrrs a2, frm, x0`
+         * as `frrm a2` -- and the structured detail follows the printed
+         * alias, so the CSR operand disappears from the operand array
+         * exactly as x30 disappears from an aliased AArch64 `ret`.  The
+         * plain `csrr a3, vstart` form keeps it.  The result is that
+         * every fsrm/frrm/fscsr/frflags -- the instructions a program
+         * uses to set and read the FP rounding mode -- moves nothing,
+         * while the same access spelled without an alias is correct.
+         *
+         * Recover it from the encoding, which states it plainly: for a
+         * SYSTEM opcode with a Zicsr funct3, the CSR number is the top
+         * 12 bits.  funct3 0 (ECALL / EBREAK / xRET / WFI) and 4 are
+         * not CSR accesses and are excluded.  Synthesised only when
+         * Capstone reported no CSR operand, so the non-aliased forms
+         * keep their own.
+         */
+        if (insn->size == 4) {
+            uint32_t word = (uint32_t)insn->bytes[0] |
+                            ((uint32_t)insn->bytes[1] << 8) |
+                            ((uint32_t)insn->bytes[2] << 16) |
+                            ((uint32_t)insn->bytes[3] << 24);
+            unsigned funct3 = (word >> 12) & 0x7;
+            if ((word & 0x7f) == 0x73 && funct3 != 0 && funct3 != 4) {
+                bool has_csr = false;
+                for (uint8_t i = 0; i < out->n_operands; i++) {
+                    if (out->operands[i].type == QEMU_PLUGIN_OP_SYSREG) {
+                        has_csr = true;
+                        break;
+                    }
+                }
+                if (!has_csr &&
+                    out->n_operands < QEMU_PLUGIN_INSN_DETAIL_MAX_OPS) {
+                    unsigned csr = (word >> 20) & 0xfff;
+                    const char *name = cap_riscv_csr_name(csr);
+                    qemu_plugin_operand *op = &out->operands[out->n_operands];
+                    op->type   = QEMU_PLUGIN_OP_SYSREG;
+                    op->access = cap_riscv_csr_access(insn);
+                    op->reg_id = (uint16_t)csr;
+                    op->scale  = 1;
+                    if (name) {
+                        g_strlcpy(op->reg_name, name,
+                                  QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ);
+                    }
+                    out->n_operands++;
+                    n = out->n_operands;
+                }
+            }
+        }
+        /*
+         * A mask destination is read as well as written, whatever the
+         * runtime tail policy says (see cap_riscv_is_mask_dst).  Set
+         * before the tied-vd correction below so the two cannot fight;
+         * both only ever add the READ|WRITE pair.
+         */
+        if (cap_riscv_is_mask_dst(insn->mnemonic) && n >= 1
+            && out->operands[0].type == QEMU_PLUGIN_OP_REG) {
+            out->operands[0].access |= QEMU_PLUGIN_OP_ACC_READ
+                                     | QEMU_PLUGIN_OP_ACC_WRITE;
         }
         /*
          * Capstone 6.0.0-Alpha7 RVV tied-operand bug workaround.
@@ -2331,6 +2638,31 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                                   QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
                                   handle, RISCV_REG_V0, cap_arch);
                 out->regs_read_id[out->n_regs_read] = RISCV_REG_V0;
+                out->n_regs_read++;
+            }
+        }
+        /*
+         * Scalar FP with a dynamic rounding mode reads frm (see
+         * cap_riscv_reads_dynamic_frm).  Architectural, from Sail, not
+         * a Capstone-version defect: the rm field is in the encoding
+         * and no disassembler reports the fcsr read it implies.  Added
+         * only when absent, so a decoder that starts reporting it
+         * cannot be double-counted.
+         */
+        if (cap_riscv_reads_dynamic_frm(insn)) {
+            bool has_frm = false;
+            for (uint8_t i = 0; i < out->n_regs_read; i++) {
+                if (out->regs_read_id[i] == RISCV_REG_FRM) {
+                    has_frm = true;
+                    break;
+                }
+            }
+            if (!has_frm
+                && out->n_regs_read < QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS) {
+                cap_copy_reg_name(out->regs_read[out->n_regs_read],
+                                  QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                                  handle, RISCV_REG_FRM, cap_arch);
+                out->regs_read_id[out->n_regs_read] = RISCV_REG_FRM;
                 out->n_regs_read++;
             }
         }

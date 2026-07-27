@@ -170,6 +170,61 @@ static uint64_t riscv_canonicalize_addr(uint64_t a)
     return a;
 }
 
+/*
+ * RISC-V CSR number -> generic register ID.
+ *
+ * Zicsr names its register in a 12-bit immediate field rather than a
+ * register field, so these numbers are their own space, disjoint from
+ * riscv_reg; the values are the architectural CSR addresses.
+ *
+ * Three groups are named and the rest -- machine and supervisor trap
+ * handling, the counters, the identification registers -- folds to
+ * REG_SYS.
+ *
+ *   The FP control and status word (fflags / frm / fcsr) is REG_FCSR,
+ *   the same ID Capstone's own fflags and frm register rows already
+ *   use, so an `fsrm` and the `fadd.d` that consumes its rounding mode
+ *   meet on one slot.
+ *
+ *   The vector configuration (vl / vtype / vlenb, and the fixed-point
+ *   vxrm / vxsat / vcsr that travel with them) is REG_VCTRL, again
+ *   matching the register rows, so `csrr a0, vl` reads what `vsetvli`
+ *   wrote.
+ *
+ *   vstart is deliberately NOT REG_VCTRL.  It is the resume index of a
+ *   partially executed vector instruction, and every vector
+ *   instruction clears it -- so on REG_VCTRL each vector op would
+ *   appear to redefine vl and vtype, and a kernel's edges onto its
+ *   configuring vsetvli would all become edges onto the previous
+ *   instruction instead.  Note that the per-vector-op read and write of
+ *   vstart is itself unmodelled: it is architecturally zero except
+ *   while resuming a trapped vector instruction, so threading it
+ *   through every vector op would serialise the whole vector stream on
+ *   a register that does not change value.  What this ID exists for is
+ *   the explicit access -- `csrr a0, vstart`, `csrrw a0, vstart, a1` --
+ *   which does move a value and previously moved nothing.
+ */
+static uint8_t riscv_csr_to_generic(uint16_t csr)
+{
+    switch (csr) {
+    case 0x001:  /* fflags */
+    case 0x002:  /* frm    */
+    case 0x003:  /* fcsr   */
+        return REG_FCSR;
+    case 0x008:  /* vstart */
+        return REG_VSTART;
+    case 0x009:  /* vxsat  */
+    case 0x00a:  /* vxrm   */
+    case 0x00f:  /* vcsr   */
+    case 0xc20:  /* vl     */
+    case 0xc21:  /* vtype  */
+    case 0xc22:  /* vlenb  */
+        return REG_VCTRL;
+    default:
+        return REG_SYS;
+    }
+}
+
 
 /* Register classification table. */
 static const RegClassification riscv_reg_class[RISCV_REG_ENDING] = {

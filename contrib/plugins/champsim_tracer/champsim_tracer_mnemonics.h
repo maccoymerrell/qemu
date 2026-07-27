@@ -679,6 +679,7 @@ const IsaProperties isa_properties[] = {
         .marker_encode_seq = cst_marker_riscv_encode_seq_imm,
         .marker_insn_bytes = CST_MARKER_PAIR_INSN_BYTES,
         .marker_seq_insns  = CST_MARKER_PAIR_SEQ_INSNS,
+        .sysreg_to_generic = riscv_csr_to_generic,
     },
     [TRACE_ISA_MIPS]    = {
         .branch_delay_slots = 1,

@@ -1216,6 +1216,40 @@ _register_probe('probe_exact_store_rm', {
 # set assertions; {} entries are unchecked setup instructions.
 # ============================================================================
 
+# The stack-push family's store DATA, when the pushed value is not a
+# named register operand.  `pushq (%rax)` reads its base register to
+# FORM an address and pushes what the load returns; naming the base as
+# the stored datum is a false dependency edge that no decoder
+# cross-check and no PIN comparison can see (the store's count,
+# address, width and value are all correct — only the mask is wrong).
+# Two bases, because they failed differently: with a non-SP base the
+# store's data named the BASE REGISTER, and with the stack pointer
+# itself as the base there was no non-SP source left to name at all,
+# so the push declared no store whatsoever.
+# The sibling shape on `call`, where the pushed value is the return
+# address rather than the indirect target, is covered class-wide by
+# the validator's `call_return_store` invariant, which needs no probe
+# because a call terminates its basic block.
+_register_probe('probe_x86_push_mem', {'x86_64': {
+    'asm':      '"movq %%rsp, %%rax\\n\\t"\n'
+                '    "pushq (%%rax)\\n\\t"\n'
+                '    "addq $8, %%rsp\\n\\t"\n'
+                '    "pushq (%%rsp)\\n\\t"\n'
+                '    "addq $8, %%rsp"',
+    'clobbers': '"rax","memory","cc"',
+    'opcodes':  ['PUSH'],
+    'insns': [
+        {},
+        _insn("GEN_OP_PUSH",
+              store_data_deps=[["load_data[0]"]]),
+        {},
+        _insn("GEN_OP_PUSH",
+              load_addr_deps=[["src_reg[0]"]],
+              store_addr_deps=[["src_reg[0]"]],
+              store_data_deps=[["load_data[0]"]]),
+        {},
+    ]}})
+
 # x86 read-modify-write direction.  `add r,(m)` and `add (m),r` share
 # X86_INS_ADD, and Capstone-under-AT&T reverses the operand array vs the
 # Intel docs — exactly the conditions under which a load/store direction

@@ -2664,6 +2664,91 @@ def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
                 add(exp_src, fcc0)
 
 
+def _check_call_return_store(
+    templates: list[dict],
+    isa: str,
+    reg_id_to_name: dict[int, str],
+) -> list[Issue]:
+    """A call that pushes a return address must say it pushes the IP.
+
+    On the ISAs that write the return address to memory (x86), the
+    store's DATA dependency is the return address and nothing else --
+    not the register a `call *%rax` reads to find its target, not the
+    base register a `call *0x10(%rax)` reads to form the address of the
+    target.  Naming either of those puts a false dependency edge on one
+    of the most frequent instructions a program executes: a consumer
+    would let the return-address store issue when `rax` is ready
+    instead of when the return address is.
+
+    Nothing else can see this.  The store's count, address, width and
+    value are all correct and were cross-validated against Intel PIN --
+    PIN's trace format carries no intra-instruction dependency masks, so
+    it cannot adjudicate the mask, and neither can any decoder
+    cross-check, since the mask is the tracer's own construction rather
+    than anything a decoder reports.  Hence a direct invariant.
+
+    Vacuous on the ISAs whose calls write a link REGISTER (aarch64,
+    riscv64, mipsel): they declare no store, and the check says so
+    rather than passing silently.
+    """
+    _, branch_names = _load_name_tables()
+    call_types = {"BRANCH_DIRECT_CALL", "BRANCH_INDIRECT_CALL",
+                  "DIRECT_CALL", "INDIRECT_CALL"}
+    ip_names = {"REG_IP", "IP"}
+
+    issues: list[Issue] = []
+    n_checked = 0
+    n_errors = 0
+    err_cap = 20
+
+    for tmpl in templates:
+        for idx, ins in enumerate(tmpl.get("insns", [])):
+            bt = branch_names.get(int(ins.get("branch_type", 0)), "")
+            if bt not in call_types:
+                continue
+            sd = ins.get("store_data_dep_mask") or []
+            if not sd:
+                continue
+            n_checked += 1
+            srcs = ins.get("src_regs") or []
+            ip_bits = 0
+            for i, r in enumerate(srcs):
+                if reg_id_to_name.get(int(r), "") in ip_names:
+                    ip_bits |= 1 << i
+            bad = (len(sd) != 1 or ip_bits == 0 or sd[0] != ip_bits)
+            if not bad:
+                continue
+            n_errors += 1
+            if n_errors <= err_cap:
+                issues.append(Issue(
+                    "call_return_store", "error",
+                    f"template t{tmpl['template_id']} insn #{idx} "
+                    f"pc=0x{int(ins['pc']):x}: a call's store-data "
+                    f"dependency must name the return address (REG_IP) "
+                    f"and only that",
+                    {"template_id": int(tmpl["template_id"]),
+                     "insn_index": idx,
+                     "pc": int(ins["pc"]),
+                     "store_data_dep_mask": [hex(v) for v in sd],
+                     "expected_mask": hex(ip_bits),
+                     "src_regs": [reg_id_to_name.get(int(r), str(r))
+                                  for r in srcs]},
+                ))
+
+    stores_expected = isa == "x86_64"
+    issues.append(Issue(
+        "call_return_store",
+        "warning" if (stores_expected and not n_checked) else "info",
+        f"call return-address stores: checked={n_checked} "
+        f"errors={n_errors}"
+        + ("" if n_checked
+           else " — no call declares a store slot; expected on the "
+                "link-register ISAs, a coverage hole on x86_64"),
+        {"checked": n_checked, "errors": n_errors},
+    ))
+    return issues
+
+
 def _check_static_reg_sets(
     templates: list[dict],
     isa: str,
@@ -7306,6 +7391,7 @@ def validate(meta_path: Path, trace_path: Path,
     # GenericRegId enum automatically.
     reg_id_to_name = dict(trace_meta.get("encoding_maps", {}).get("reg", {}))
     issues += _check_static_reg_sets(templates, isa, reg_id_to_name)
+    issues += _check_call_return_store(templates, isa, reg_id_to_name)
 
     # Per-instruction memop attribution: ensure every dyn_param's
     # insn_index points at an instruction whose schema declares the

@@ -223,6 +223,36 @@ static int find_dst_slot(const InsnFields *f, uint8_t reg_id)
     return -1;
 }
 
+static int find_src_slot(const InsnFields *f, uint8_t reg_id)
+{
+    for (uint8_t i = 0; i < f->n_src_regs; i++) {
+        if (f->src_regs[i] == reg_id) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+/*
+ * Source bits that exist only to COMPUTE AN ADDRESS, never to supply a
+ * value.  The operand walker fills load_addr_dep_mask / store_addr_dep_mask
+ * before any .dep_refine runs, so a refiner deciding "which of my sources
+ * is the datum" can subtract these instead of guessing.  Without it a
+ * stack push whose operand is in memory names its base register as the
+ * pushed value.
+ */
+static uint64_t addr_only_input_mask(const InsnFields *f, uint8_t n_stores)
+{
+    uint64_t m = 0;
+    for (uint8_t k = 0; k < f->max_dep_loads; k++) {
+        m |= f->load_addr_dep_mask[k];
+    }
+    for (uint8_t s = 0; s < n_stores; s++) {
+        m |= f->store_addr_dep_mask[s];
+    }
+    return m;
+}
+
 /*
  * dep_x86_stack_push: covers every "store one or more values to a
  * stack-style pointer, decrement the pointer" pattern Capstone
@@ -234,13 +264,35 @@ static int find_dst_slot(const InsnFields *f, uint8_t reg_id)
  *
  * The refiner identifies the stack pointer as the src_reg also
  * present in dst_regs (RMW pattern — read for addressing, written
- * after the adjust).  For every OTHER src_reg, it emits one
- * implicit store whose address depends on the stack pointer and
- * whose data depends on that src_reg.  For PUSH imm with no
- * other srcs, the imm itself becomes the store data.  CALL imm
- * has both the imm (branch target) and an implicit IP read; only
- * the IP becomes store_data — the imm is the target, not the
- * pushed value.
+ * after the adjust).  It then has to answer one question per store:
+ * WHICH INPUT IS THE PUSHED VALUE.  A source can be present for
+ * three different reasons, and only one of them is the datum:
+ *
+ *   - it is the stack pointer (address, and the RMW destination);
+ *   - it is an address input of a memory operand — `pushq -8(%rbp)`
+ *     reads rbp to FORM an address, the value pushed is what the
+ *     load returns;
+ *   - it is the indirect branch target of a call — `callq *%rax`
+ *     reads rax to decide WHERE TO GO, the value pushed is the
+ *     return address.
+ *
+ * Naming any of the other two as the store's data is a false
+ * dependency edge on some of the most frequent instructions a
+ * program executes, so all three are separated here:
+ *
+ *   - the stack pointer is skipped, as it always was;
+ *   - address inputs come from addr_only_input_mask(), which reads
+ *     the load/store address masks the operand walker already
+ *     filled in;
+ *   - a CALL pushes exactly one value, its return address, so when
+ *     an IP source is present it is the only store the call emits.
+ *     (A 16/32-bit far call also pushes CS; that form carries no IP
+ *     source here, so it falls through to the general rule
+ *     unchanged.)
+ *
+ * What is left over is the datum.  When nothing is left over the
+ * pushed value is the memory operand's load result (`push m64`) or,
+ * failing that, the immediate (`push $imm`).
  *
  * Reg-side: the stack-pointer dst's dep narrows to "just the
  * stack-pointer src + imm-if-present" (a single-source decrement;
@@ -264,15 +316,41 @@ void dep_x86_stack_push(const struct qemu_plugin_insn_info *info,
      * the SP src via intersection with dst_regs). */
     int sp_dst = find_dst_slot(f, f->src_regs[sp_src]);
 
-    /* Emit one implicit store per non-SP src.  Multi-memop ops
-     * (PUSHA/ENTER) get N stores; single-memop PUSH/CALL get 1. */
+    /* Address-only sources, snapshotted before max_dep_stores grows. */
+    const uint64_t addr_inputs = addr_only_input_mask(f, f->max_dep_stores);
+    const bool is_call = (f->branch_type == BRANCH_DIRECT_CALL ||
+                          f->branch_type == BRANCH_INDIRECT_CALL);
+
     bool any_store = false;
-    for (uint8_t i = 0; i < f->n_src_regs; i++) {
-        if ((int)i == sp_src) continue;
-        if (f->max_dep_stores >= MAX_STORES) break;
+    int ip_src = is_call ? find_src_slot(f, REG_IP) : -1;
+    if (ip_src >= 0 && f->max_dep_stores < MAX_STORES) {
+        /* A call pushes its return address and nothing else, whatever
+         * else it happens to read to find its target. */
         uint8_t s = f->max_dep_stores++;
         f->store_addr_dep_mask[s] = sp_bit;
-        f->store_data_dep_mask[s] = ((uint64_t)1 << i);
+        f->store_data_dep_mask[s] = ((uint64_t)1 << ip_src);
+        any_store = true;
+    } else {
+        /* Emit one implicit store per non-SP, non-address-only src.
+         * Multi-memop ops (PUSHA/ENTER) get N stores; single-memop
+         * PUSH gets 1. */
+        for (uint8_t i = 0; i < f->n_src_regs; i++) {
+            if ((int)i == sp_src) continue;
+            if (addr_inputs & ((uint64_t)1 << i)) continue;
+            if (f->max_dep_stores >= MAX_STORES) break;
+            uint8_t s = f->max_dep_stores++;
+            f->store_addr_dep_mask[s] = sp_bit;
+            f->store_data_dep_mask[s] = ((uint64_t)1 << i);
+            any_store = true;
+        }
+    }
+    /* PUSH m64: every register source went into the address, so the
+     * pushed value is what the load returned. */
+    if (!any_store && f->max_dep_loads > 0 &&
+        f->max_dep_stores < MAX_STORES) {
+        uint8_t s = f->max_dep_stores++;
+        f->store_addr_dep_mask[s] = sp_bit;
+        f->store_data_dep_mask[s] = ((uint64_t)1 << f->n_src_regs);
         any_store = true;
     }
     /* PUSH imm with no register srcs: the imm itself is the data.

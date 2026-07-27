@@ -143,6 +143,7 @@ FEATURES: dict[str, str] = {
     "behavior:mutation_strictness": "oracle catches deliberate trace corruption (mutation matrix)",
     "behavior:wrong_path_coverage": "static_templates=1: minted-alternate never-executed fall-through + BTB target coverage, deepened by static_depth (4-ISA)",
     "behavior:isa_crosscheck": "the decode metadata the tracer consumes (Capstone + the disas/capstone.c correction boundary) agrees with an independently maintained decoder (LLVM MC) across an exhaustive sweep of the opcode-bearing encoding space, on all four ISAs, outside a justified allowlist",
+    "behavior:decode_fixups": "the repairs the plugin makes to the decode boundary -- the register edges apply_isa_branch_fixups() restores, the register groups the operand walker expands, the branch taxonomy the ISA tables supply -- still happen, asserted per signature in both directions so a repair that silently stops fails as surely as one nobody wrote down; the boundary comparison cannot see this, because a regressed repair reintroduces exactly the disagreement its allowlist already expects",
     "behavior:implicit_operands": "the implicit operands — architectural state an instruction touches that its encoding does not name — that the decode boundary reports today are still reported, asserted per encoding against expectations derived from BEHAVIOUR rather than from any decoder (Arm's Machine Readable Architecture, the Sail RISC-V model, QEMU's MIPS TCG translator), so the class of defect where Capstone and LLVM agree and are both wrong is visible at all; each row carries a disposition and the dynamic weight of its instruction form",
     "behavior:segment_final_memops": "the segment's last body entry carries its memory operands, matching the earlier executions of the same true BB (the deferred icount/simpoint window close emits it after it has run, not before)",
     "behavior:smc_revisions": "self-modifying code: correct-path template-revision minting for rewrites that preserve OR change the block's instruction boundaries, content-signature id reuse, and the per-pc revision cap (4-ISA)",
@@ -1387,6 +1388,67 @@ def _chk_isa_crosscheck(ctx: Ctx) -> Outcome:
                    "(4 ISAs, ~50 M encodings, allowlisted residual)", subs)
 
 
+def _chk_decode_fixups(ctx: Ctx) -> Outcome:
+    """The repairs the plugin makes to what the decode boundary handed it.
+
+    features.isa_crosscheck compares LLVM against cap_disas_raw_detail().
+    The trace is not built from that.  It is built from the InsnFields
+    decode_detail_to_generic() produces, and that function repairs some of
+    what the boundary gives it -- most consequentially the RISC-V link
+    register, which the aliased jal/jalr/ret forms hide from Capstone
+    entirely, so without the repair a call's return-address write and a
+    return's read are simply absent from the dataflow.
+
+    Which means the boundary comparison CANNOT hold that repair in place.
+    A regression there reintroduces the very disagreement the boundary
+    allowlist already expects (`riscv64 R-wr-missing jal +r#` is sitting in
+    it), the two cancel, and the run stays green while the trace loses its
+    call graph.
+
+    This check runs the boundary and the dependency model over the same
+    encodings and asserts their difference against tools/isaxcheck_fixups.txt
+    EXACTLY, both ways: a repair that stops happening fails as a dead rule,
+    and a repair nobody recorded fails as a new signature.  It needs no
+    second decoder -- it is the tracer measured against itself -- so it also
+    covers encodings LLVM rejects, which is where a repair is least likely
+    to be noticed.
+
+    GATING, all four ISAs.
+    """
+    tool = ctx.build_dir / "contrib/plugins/isaxcheck"
+    fixups = (Path(__file__).resolve().parents[2]
+              / "tools" / "isaxcheck_fixups.txt")
+    if not tool.is_file():
+        return Outcome("fail",
+                       f"isaxcheck not built at {tool}.  It needs LLVM MC "
+                       "(llvm-18-dev or newer supplying llvm-config); the "
+                       "fixup assertion links the plugin's own decode "
+                       "translation unit into that same binary.")
+    if not fixups.is_file():
+        return Outcome("fail", f"fixup table missing at {fixups}")
+
+    subs: list = []
+    all_ok = True
+    for isa in ISA_ALL:
+        cmd = [str(tool), f"--isa={isa}", "--jobs=8", "--fixups",
+               f"--allow={fixups}", "--check"]
+        p = subprocess.run(cmd, text=True, capture_output=True, timeout=900)
+        head = (p.stdout or "").splitlines()
+        detail = head[0] if head else (p.stderr or "").strip()[:200]
+        ok = p.returncode == 0
+        all_ok = all_ok and ok
+        if not ok:
+            bad = [ln for ln in head[1:]
+                   if ln.startswith("NEW") or ln.startswith("DEAD")]
+            detail += "\n" + "\n".join(ln[:160] for ln in bad[:8])
+            if len(bad) > 8:
+                detail += f"\n... and {len(bad) - 8} more"
+        subs.append({"name": isa, "ok": ok, "detail": detail})
+    return Outcome("pass" if all_ok else "fail",
+                   "plugin-side decode repairs asserted against the boundary "
+                   "(4 ISAs, both directions)", subs)
+
+
 def _chk_implicit_operands(ctx: Ctx) -> Outcome:
     """Ground truth that never passed through a decoder at all.
 
@@ -1729,6 +1791,10 @@ def build_checks() -> list:
                    "decode metadata vs an independent decoder (LLVM MC), "
                    "exhaustive encoding sweep (4-ISA)",
                    ["behavior:isa_crosscheck"], _chk_isa_crosscheck))
+    C.append(Check("features.decode_fixups", "features",
+                   "the plugin's own repairs to the decode boundary, "
+                   "asserted in both directions (4-ISA)",
+                   ["behavior:decode_fixups"], _chk_decode_fixups))
     C.append(Check("features.implicit_operands", "features",
                    "implicit-operand assertion table: expectations derived "
                    "from behaviour (MRA / Sail / TCG translators), not from "

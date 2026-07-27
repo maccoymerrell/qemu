@@ -632,12 +632,43 @@ outside the repo as standalone scripts):
    ``include_implicit_regs`` policy modelled so that what is compared is
    what the dependency model would actually record.
 
-   The sweep is exhaustive over the opcode-bearing bit space — 16.8 M
-   AArch64 encodings, 12.6 M RISC-V including every compressed halfword,
-   16.8 M MIPS — and takes about 18 seconds for all four ISAs on 8
+   The sweep is exhaustive over the opcode-bearing bit space — 21.0 M
+   AArch64 encodings, 16.8 M RISC-V including every compressed halfword,
+   21.0 M MIPS — and takes about 20 seconds for all four ISAs on 8
    cores.  That cheapness is the point: it is affordable on every
    Capstone bump, which is what keeps the ``disas/capstone.c``
-   workarounds retirable instead of permanent.  Because the Capstone side
+   workarounds retirable instead of permanent.
+
+   **The register fill sets are coverage, not convenience.**  Each sweep
+   walks the opcode-bearing bits exhaustively and fills the register
+   fields from a short list, and that list has one rule to satisfy: *any
+   register value that selects a different decode must be in it.*  A
+   register field is usually data, but where a particular value picks an
+   alias, a different printed form, or a different instruction outright,
+   omitting the value puts the whole form outside the swept space — and a
+   defect there is not something the gate missed, it is somewhere the
+   gate never looked.
+
+   AArch64 ``ret`` is the worked example: it is the alias of ``RET X30``
+   and no other ``Rn`` reaches it, so the boundary's loss of the link
+   register read on the most executed control transfer in any AArch64
+   trace sat outside the sweep through every green run until ``Rn = 30``
+   was added.  The same shape holds elsewhere, and each fill set names
+   its case: RISC-V's uncompressed ``ret`` is ``jalr x0, x1, 0`` (the
+   compressed sweep covered ``c.jr ra`` for free, which is exactly why
+   the 32-bit form went unnoticed — the alias *looked* swept); MIPS
+   prints ``JALR`` with ``rd = 31`` in its two-operand form; and x86's
+   ``ModRM.reg`` is an opcode *extension* on the group opcodes, so
+   sweeping two of its eight values left six members of every group —
+   SUB, AND, XOR, CMP, the shift family, NOT/NEG/MUL/DIV,
+   INC/DEC/CALL/JMP/PUSH — and the entire x87 escape space unreached.
+
+   Closing those found a defect in this tool as well as in the space it
+   measures: its MIPS normaliser dropped a coprocessor index by keeping
+   the *last* digit, so COP0 register 31 read as ``cop1`` and every
+   coprocessor register above 9 was compared against the wrong one.  Ten
+   allowlist entries existed only to excuse that, and the dead-rule
+   report retired all ten.  Because the Capstone side
    is the *boundary*, a workaround that works shows up as the ABSENCE of
    a disagreement, and one that has become unnecessary keeps the gate
    green — ``capstone_workaround_probe`` answers the complementary
@@ -707,6 +738,73 @@ outside the repo as standalone scripts):
    supplying ``llvm-config``).  Without it meson skips the ``isaxcheck``
    target with a warning and this check fails with that diagnosis rather
    than silently passing.
+``features.decode_fixups``
+   The boundary is not the last word on what the trace records.  The
+   plugin repairs some of what it is handed, one layer further in, inside
+   ``decode_detail_to_generic()``: ``apply_isa_branch_fixups()`` restores
+   the ``ra`` read RISC-V ``ret`` loses and the ``ra`` write ``jal`` and
+   ``jalr`` lose — Capstone 6 hides the link register *completely* on the
+   aliased forms, in neither the operand list nor the (always empty for
+   RISC-V) implicit lists — and the operand walker, the dependency
+   refiners and the lane-mask refiners rewrite the rest.
+
+   Measured against the boundary alone, a repaired defect is
+   indistinguishable from an unrepaired one.  That costs a false positive.
+   It also means **a regressed repair cannot fail that gate**: the
+   disagreement a regression reintroduces is the one the boundary
+   allowlist already expects — ``riscv64 R-wr-missing jal +r#`` is sitting
+   in it — so the two cancel and the run stays green while the trace loses
+   its call graph.  A repair no check can see is a repair nothing holds in
+   place.
+
+   So ``isaxcheck`` reaches the other layer.  ``champsim_tracer_decode.cc``
+   is compiled into it verbatim, through a small static library, and three
+   modes follow: ``--layer=boundary`` (the default, and what
+   ``features.isa_crosscheck`` gates on), ``--layer=fields`` (LLVM against
+   the ``InsnFields`` the trace is written from, stated in the dependency
+   model's own vocabulary — ``REG_LR``, not ``x30`` on one side and
+   ``r30`` on the other), and ``--fixups``, the difference between the two.
+
+   This check gates on ``--fixups``, asserted against
+   ``tools/isaxcheck_fixups.txt`` **exactly, in both directions**: a repair
+   that stops happening fails as a dead rule, and a repair nobody recorded
+   fails as a new signature.  It needs no second decoder — it is the
+   tracer measured against itself — so it also covers the encodings LLVM
+   rejects, which is where a repair is least likely to be noticed
+   otherwise.  131 signatures across four ISAs: the RISC-V link dataflow,
+   the RVV whole-register group expansion, the trap and exception-return
+   classifications no Capstone group covers, the x86 REP promotion to a
+   self-looping branch, the AArch64 predicate-pair destination.
+
+   Two entries are recorded because they are **wrong**, which is the other
+   thing an inventory buys.  RISC-V ``dret``/``mret``/``sret`` receive a
+   link-register read from a fixup that keys off ``BRANCH_RETURN``, and a
+   privileged return resumes from ``mepc``/``sepc``/``dpc``; that is a
+   phantom dependency.  The MIPS branch-and-link forms (``bal``,
+   ``bgezal``, ``bgezall``, ``bltzal``, ``bltzall``) are reclassified to
+   ``BRANCH_COND_DIRECT``, which loses the link a return-address stack
+   needs.  The AArch64 predicate-pair entry shows the false-positive half
+   of the same coin: ``aarch64 R-wr-missing while* +p#`` in
+   ``isaxcheck_allow.txt`` describes a disagreement that never reaches a
+   trace, because the ISA table supplies the second predicate one layer
+   down.
+
+   The register correspondence the fields layer needs is derived from the
+   tracer's own classification table rather than written by hand — every
+   Capstone register id the table classifies is named through Capstone,
+   normalised the way both decoders' names already are, and recorded
+   against what the tracer maps it to.  A token two generic ids both claim
+   is kept as both and matched against either, because that ambiguity is
+   the tracer splitting one architectural register across two ids rather
+   than an error in the index.  AArch64 does exactly this: ``lr`` maps to
+   ``REG_LR`` and ``w30``, the 32-bit view of the same register, to
+   ``REG_GPR30``.  The count is reported as ``ambiguous_reg_tokens`` on
+   the summary line.
+
+   ``--layer=fields`` itself is a diagnostic view rather than a gate: its
+   residual against LLVM has not been triaged to the depth the boundary
+   layer's allowlist has, and a derived baseline in its place would assert
+   only that nothing changed, not that anything is right.
 ``features.implicit_operands``
    An *implicit* operand is architectural state an instruction touches
    that its encoding does not name: AArch64 ``ret`` reading ``x30``,

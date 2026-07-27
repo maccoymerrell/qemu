@@ -425,13 +425,22 @@ static std::string norm_mips(std::string r) {
     for (int i = 0; i < 32; i++) if (r == abi[i]) return std::string("r") + std::to_string(i);
     if (r == "s8") return "r30";
     if (r.compare(0, 3, "cop") == 0) {
-        // LLVM "COP03" / "COP21" -> cop<number>, dropping the coprocessor
-        // index; the tracer folds every coprocessor register onto REG_SYS, so
-        // distinguishing COP0 from COP2 here would report a difference the
-        // dependency model cannot express.
+        // LLVM "COP03" / "COP21" -> cop<number>, dropping the LEADING
+        // coprocessor index; the tracer folds every coprocessor register
+        // onto REG_SYS, so distinguishing COP0 from COP2 here would report
+        // a difference the dependency model cannot express.
+        //
+        // Take the index off the FRONT, not the number off the back.
+        // Keeping only the last digit read "COP031" -- COP0 register 31 --
+        // as `cop1`, so every COP0 register above 9 compared against the
+        // wrong one.  It stayed invisible because the sweep filled Rd from
+        // a list that never reached 31, which is the same blind spot the
+        // fill sets above exist to close; adding (31, 0) to the MIPS fills
+        // is what surfaced it.
         std::string d;
         for (char ch : r) if (std::isdigit((unsigned char)ch)) d += ch;
-        return "cop" + (d.empty() ? std::string("0") : d.substr(d.size() - 1));
+        if (d.empty()) return "cop0";
+        return "cop" + (d.size() > 1 ? d.substr(1) : d);
     }
     if (r.compare(0, 3, "fcr") == 0 || r == "fcsr") return "fcsr";
     // DSPOutFlag<n> / DSPOutFlag<a>_<b> / DSPCCond / DSPCarry are bit fields
@@ -1286,18 +1295,34 @@ static void try_half(uint16_t h)
     compare(b, 2);
 }
 
-// aarch64: opcode-bearing bits are [31:10]; [9:5]=Rn, [4:0]=Rd/Rt.
-// Sweep [31:10] exhaustively across a few (Rn,Rd) fillings so that encodings
-// that overload the register fields as opcode extensions are still reached.
-//
-// (30, 0) is not decoration.  X30 is the one general register whose VALUE
-// changes what an instruction is: `RET X30` prints as the aliased `ret`,
-// with its operand dropped, and no other Rn reaches that alias.  Without
-// this filling the whole `ret` alias -- the most executed control transfer
-// in any AArch64 trace -- was outside the swept space, and the boundary's
-// loss of its link-register read sat there unseen through every green run
-// of this gate.  A register field that selects a decode has to be swept
-// with the value that selects it.
+/*
+ * THE FILL SETS ARE PART OF THE COVERAGE, NOT A CONVENIENCE.
+ *
+ * Each sweep walks the opcode-bearing bits exhaustively and fills the
+ * register fields from a short list.  The rule that list has to satisfy:
+ * ANY REGISTER VALUE THAT SELECTS A DIFFERENT DECODE MUST BE IN IT.  A
+ * register field is usually just data, but where a particular value picks
+ * an alias, a different printed form, or a different instruction outright,
+ * omitting that value puts the whole form outside the swept space -- and a
+ * defect there is not a finding this gate missed, it is a place the gate
+ * never looked.
+ *
+ * That is not hypothetical.  AArch64 `ret` is the alias of `RET X30`, and
+ * no Rn but 30 reaches it; the boundary's loss of the link-register read on
+ * the most executed control transfer in any AArch64 trace sat outside the
+ * sweep through every green run of this gate until (30, 0) was added.  The
+ * same shape holds elsewhere and the fills below name it each time:
+ * RISC-V's 32-bit `ret` is `jalr x0, x1, 0`, MIPS prints JALR with rd = 31
+ * as the two-operand form, and x86's ModRM.reg field is an opcode
+ * EXTENSION for the group opcodes, so sweeping two of its eight values
+ * leaves six group members per opcode unreached.
+ *
+ * When adding an ISA, ask what a register value can change about the
+ * decode before choosing the fills.
+ *
+ * aarch64: opcode-bearing bits are [31:10]; [9:5]=Rn, [4:0]=Rd/Rt.
+ * (30, 0) reaches the `ret` alias.
+ */
 static void sweep_aarch64(unsigned shard, unsigned nshard)
 {
     static const struct { unsigned rn, rd; } fills[] = {
@@ -1310,10 +1335,17 @@ static void sweep_aarch64(unsigned shard, unsigned nshard)
 
 // riscv64: sweep [31:20] (funct7 + rs2 / I-imm) x [14:12] funct3 x [6:0] opcode
 // = 2^22, with rs1/rd filled a few ways.  Plus every 16-bit compressed word.
+//
+// (1, 0) is the alias-selecting fill: `jalr x0, x1, 0` is what the
+// uncompressed `ret` IS, and rs1 = ra with rd = zero is the only way to
+// reach it.  The compressed sweep covers `c.jr ra` for free because it
+// enumerates every halfword, which is exactly why the 32-bit form went
+// unnoticed -- the alias appeared to be swept when only its short
+// encoding was.
 static void sweep_riscv(unsigned shard, unsigned nshard)
 {
     static const struct { unsigned rs1, rd; } fills[] = {
-        {6, 5}, {0, 0}, {2, 1},
+        {6, 5}, {0, 0}, {2, 1}, {1, 0},
     };
     for (uint32_t i = shard; i < (1u << 22); i += nshard) {
         uint32_t hi12 = (i >> 10) & 0xfff;
@@ -1328,11 +1360,14 @@ static void sweep_riscv(unsigned shard, unsigned nshard)
 
 // mipsel: op[31:26], rs[25:21], rt[20:16], rd[15:11], sa[10:6], funct[5:0].
 // op/rs/rt/funct all carry opcode meaning somewhere in the ISA; sweep those
-// 2^22 with rd/sa filled a few ways.
+// 2^22 with rd/sa filled a few ways.  rs and rt are swept exhaustively, so
+// the `jr $ra` / `move` / `b` aliases that key off THEM are reached
+// already; rd is not, and rd = 31 is what prints JALR in its two-operand
+// form -- hence (31, 0).
 static void sweep_mips(unsigned shard, unsigned nshard)
 {
     static const struct { unsigned rd, sa; } fills[] = {
-        {3, 0}, {0, 0}, {3, 1}, {0, 4},
+        {3, 0}, {0, 0}, {3, 1}, {0, 4}, {31, 0},
     };
     for (uint32_t i = shard; i < (1u << 22); i += nshard) {
         uint32_t op = (i >> 16) & 0x3f;
@@ -1345,7 +1380,15 @@ static void sweep_mips(unsigned shard, unsigned nshard)
     }
 }
 
-// x86_64: prefix x escape x opcode x ModRM-tail shape.
+// x86_64: prefix x escape x opcode x ModRM-tail shape x ModRM.reg.
+//
+// ModRM.reg is swept because on the group opcodes (0x80/0x81/0x83, 0xC0/
+// 0xC1/0xD0-0xD3, 0xF6/0xF7, 0xFE/0xFF and most of the 0x0F groups) it is
+// not a register at all, it is an OPCODE EXTENSION: `81 /0` is ADD and
+// `81 /5` is SUB.  Two fixed tails reached two of its eight values, which
+// left six members of every group opcode -- SUB, AND, XOR, CMP, the whole
+// shift family, NOT/NEG/MUL/DIV, INC/DEC/CALL/JMP/PUSH -- outside the swept
+// space entirely.
 static void sweep_x86(unsigned shard, unsigned nshard)
 {
     static const struct { unsigned char p[4]; int np; } pre[] = {
@@ -1360,19 +1403,23 @@ static void sweep_x86(unsigned shard, unsigned nshard)
     for (unsigned pi = 0; pi < sizeof(pre)/sizeof(pre[0]); pi++)
       for (int esc = 0; esc < 4; esc++)
         for (unsigned op = 0; op < 256; op++)
-          for (int t = 0; t < 3; t++) {
-            if ((idx++ % nshard) != shard) continue;
-            const unsigned char *tail = t==0?tail_mem : t==1?tail_reg : tail_sib;
-            size_t n = 0;
-            for (int k = 0; k < pre[pi].np; k++) buf[n++] = pre[pi].p[k];
-            if (esc >= 1) buf[n++] = 0x0f;
-            if (esc == 2) buf[n++] = 0x38;
-            if (esc == 3) buf[n++] = 0x3a;
-            buf[n++] = (uint8_t)op;
-            memcpy(buf + n, tail, 13); n += 13;
-            total_tried++;
-            compare(buf, n);
-          }
+          for (int t = 0; t < 3; t++)
+            for (unsigned reg = 0; reg < 8; reg++) {
+              if ((idx++ % nshard) != shard) continue;
+              const unsigned char *tail = t==0?tail_mem : t==1?tail_reg : tail_sib;
+              size_t n = 0;
+              for (int k = 0; k < pre[pi].np; k++) buf[n++] = pre[pi].p[k];
+              if (esc >= 1) buf[n++] = 0x0f;
+              if (esc == 2) buf[n++] = 0x38;
+              if (esc == 3) buf[n++] = 0x3a;
+              buf[n++] = (uint8_t)op;
+              memcpy(buf + n, tail, 13);
+              /* ModRM is the tail's first byte; replace only its reg field. */
+              buf[n] = (uint8_t)((buf[n] & ~0x38u) | (reg << 3));
+              n += 13;
+              total_tried++;
+              compare(buf, n);
+            }
 }
 
 static void run_sweep(unsigned shard, unsigned nshard)

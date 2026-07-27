@@ -1705,6 +1705,64 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
      * `22 20 c9 9a`, `lsl x2,x1,x9`) -- fixed, op_count must be 3 with
      * operands[2] a REG naming x9.
      */
+    /*
+     * Capstone 6.0.0-Alpha7 aliased-RET workaround.
+     *
+     * `ret` with no printed operand is the alias of `RET X30`: the
+     * return address comes from the link register, and that is the ONE
+     * register dependency every AArch64 return carries.  Capstone's
+     * detail follows the printed alias, so the operand disappears and
+     * `detail->regs_read` is left empty — the boundary sees an
+     * instruction that reads nothing, and the return of every function
+     * in the trace floats free of the `ldp`/`mov` that restored x30.
+     * The non-aliased `ret x1` keeps its operand and is correct.
+     *
+     * Capstone knows the answer but only exposes it through
+     * cs_regs_access(), which special-cases AARCH64_INS_ALIAS_RET
+     * (AArch64_reg_access() in the Capstone tree).  The boundary cannot
+     * adopt that entry point wholesale: it MERGES the explicit operand
+     * registers into one flat list, which would double-count every
+     * operand the walker already consumes, and it switches on
+     * insn->alias_id WITHOUT consulting insn->is_alias — a field
+     * Capstone leaves stale across decodes on a reused handle, so after
+     * one `ret` it fabricates an x30 read on every later `eret`, `drps`,
+     * `braa`, `blraa` and even `ret x1`.  (That staleness is a second
+     * upstream defect; report it with this one.)
+     *
+     * Restore the read directly instead, keyed on the exact shape that
+     * cannot be anything else: AARCH64_INS_RET printed with no operand.
+     * This mirrors the RISC-V aliased-link restore in
+     * refine_branch_type() (champsim_tracer_decode.cc), which repairs
+     * the same class of loss on the other ISA — placed HERE rather than
+     * in the plugin so isaxcheck, which drives this boundary, verifies
+     * it.  x30 joins the implicit read list, which is exactly how
+     * Capstone already reports the same dependency for `retaa`/`retab`.
+     *
+     * Revisit / remove when Capstone is bumped past 6.0.0-Alpha7; verify
+     * with `cstool -d aarch64 c0035fd6` (bytes `c0 03 5f d6`, `ret`) --
+     * fixed, either operands[0] must name x30 or the implicit read list
+     * must carry it.  Use a `cstool` built from `subprojects/capstone`,
+     * not a system package, or run `capstone_workaround_probe`; see
+     * docs/troubleshooting.rst.
+     */
+    if (insn->id == ARM64_INS_RET && a64->op_count == 0) {
+        bool listed = false;
+        for (uint8_t i = 0; i < out->n_regs_read; i++) {
+            if (out->regs_read_id[i] == AARCH64_REG_LR) {
+                listed = true;
+                break;
+            }
+        }
+        if (!listed
+            && out->n_regs_read < QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS) {
+            cap_copy_reg_name(out->regs_read[out->n_regs_read],
+                              QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                              handle, AARCH64_REG_LR, CS_ARCH_ARM64);
+            out->regs_read_id[out->n_regs_read] = AARCH64_REG_LR;
+            out->n_regs_read++;
+        }
+    }
+
     if (out->n_operands == 2 &&
         out->n_operands < QEMU_PLUGIN_INSN_DETAIL_MAX_OPS &&
         cap_aarch64_is_buggy_shift_imm_alias(insn->mnemonic) &&

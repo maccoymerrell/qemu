@@ -2602,6 +2602,18 @@ def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
                 if op.type == op_reg_kind:
                     add(exp_src, op.reg)
                     break
+        # The aliased `ret` (no printed operand) is `RET X30`: Capstone
+        # follows the printed alias and reports neither an operand nor
+        # an implicit read, so the return address dependency of every
+        # AArch64 function return would vanish.  The boundary restores
+        # the link register; assert it positively — the non-aliased
+        # `ret x1` keeps its operand and must NOT gain x30.
+        if mnem == "ret" and not ops:
+            try:
+                import capstone as _cs
+                add(exp_src, _cs.aarch64.AARCH64_REG_LR)
+            except Exception:
+                pass
         # SIMD pre-/post-index writeback: Capstone claims writeback but
         # lists the base write only for the scalar forms.
         if getattr(d, "writeback", False):

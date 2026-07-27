@@ -1143,6 +1143,8 @@ static void usage(void)
         "  --shard=I --nshard=N   run one shard only (used internally)\n"
         "  --classes=DZMBR        comparison classes to enable\n"
         "  --hex=BYTES     decode one encoding with both decoders and exit\n"
+        "  --batch         read hex encodings on stdin; write one TSV row\n"
+        "                  per encoding carrying both decoders' views\n"
         "  --allow=FILE    allowlist of justified residual signatures\n"
         "  --check         exit 1 if any non-allowlisted signature remains\n"
         "  --mattr=... --mcpu=...  override the LLVM subtarget\n"
@@ -1156,7 +1158,7 @@ int main(int argc, char **argv)
     const char *classes = "DZMBR";
     const char *hexone = nullptr;
     const char *mattr = nullptr, *mcpu = nullptr, *allow = nullptr;
-    bool check = false, emit_raw = false;
+    bool check = false, emit_raw = false, batch = false;
 
     for (int i = 1; i < argc; i++) {
         if (!strncmp(argv[i], "--isa=", 6)) isaname = argv[i] + 6;
@@ -1165,6 +1167,7 @@ int main(int argc, char **argv)
         else if (!strncmp(argv[i], "--jobs=", 7)) jobs = atoi(argv[i] + 7);
         else if (!strncmp(argv[i], "--classes=", 10)) classes = argv[i] + 10;
         else if (!strncmp(argv[i], "--hex=", 6)) hexone = argv[i] + 6;
+        else if (!strcmp(argv[i], "--batch")) batch = true;
         else if (!strncmp(argv[i], "--mattr=", 8)) mattr = argv[i] + 8;
         else if (!strncmp(argv[i], "--mcpu=", 7)) mcpu = argv[i] + 7;
         else if (!strncmp(argv[i], "--allow=", 8)) allow = argv[i] + 8;
@@ -1216,6 +1219,52 @@ int main(int argc, char **argv)
                l.may_load, l.may_store, l.is_branch, l.is_call, l.is_ret,
                l.is_indirect, l.is_term);
         printf("   RD{%s}\n   WR{%s}\n", setstr(l.rd).c_str(), setstr(l.wr).c_str());
+        return 0;
+    }
+
+    /*
+     * Batch mode: one TSV row per encoding read on stdin, carrying BOTH
+     * decoders' views verbatim.  The sweep above answers "does anything
+     * disagree"; this answers "what does each of them say about exactly
+     * these bytes", which is what the checks that do not sweep need —
+     * the implicit-operand assertion table (which has its own
+     * spec-derived expectation and only needs the boundary's answer) and
+     * the three-way version tripwire (which joins GNU binutils onto the
+     * `hex` column, hence echoing the input bytes back).
+     */
+    if (batch) {
+        printf("hex\tb_ok\tb_sz\tb_mnem\tb_ops\tb_mem\tb_r\tb_w\tb_unkmem\t"
+               "b_unkreg\tb_unmodelled\tb_jmp\tb_call\tb_ret\tb_rd\tb_wr\t"
+               "l_ok\tl_sz\tl_text\tl_ld\tl_st\tl_br\tl_call\tl_ret\t"
+               "l_rd\tl_wr\n");
+        char line[256];
+        while (fgets(line, sizeof line, stdin)) {
+            char *p = line;
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p == '#' || *p == '\n' || !*p) continue;
+            uint8_t b[24]; unsigned n = 0;
+            for (; p[0] && p[1] && isxdigit((unsigned char)p[0]) &&
+                   isxdigit((unsigned char)p[1]) && n < 24; p += 2)
+                b[n++] = (uint8_t)strtoul(std::string(p, p + 2).c_str(),
+                                          nullptr, 16);
+            if (!n) continue;
+            CsView c; LlView l;
+            cs_decode(b, n, c); ll_decode(b, n, l);
+            /* The printer emits tabs inside operand lists; this is a TSV. */
+            std::string t = l.text;
+            for (auto &ch : t)
+                if (ch == '\t' || ch == '\n' || ch == '\r') ch = ' ';
+            printf("%s\t%d\t%u\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t"
+                   "%s\t%s\t%d\t%u\t%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\n",
+                   hexbytes(b, n).c_str(), c.ok, c.size, c.mnem.c_str(),
+                   c.ops.c_str(), c.has_mem, c.mem_read, c.mem_write,
+                   c.mem_unknown, c.reg_unknown, c.has_invalid_op,
+                   c.g_jump, c.g_call, c.g_ret,
+                   setstr(c.rd).c_str(), setstr(c.wr).c_str(),
+                   l.ok, l.size, t.c_str(), l.may_load, l.may_store,
+                   l.is_branch, l.is_call, l.is_ret,
+                   setstr(l.rd).c_str(), setstr(l.wr).c_str());
+        }
         return 0;
     }
 

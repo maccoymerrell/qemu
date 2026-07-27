@@ -973,14 +973,30 @@ static void ll_decode(const uint8_t *b, size_t n, LlView &v)
             }
         }
     }
-    // LLVM's call instructions carry an ABI-modelling implicit use of SP that
-    // is not an architectural read; Capstone (correctly) omits it.
-    if (v.is_call) v.rd.erase(isa == ISA_AARCH64 ? "sp" : "r2");
     for (llvm::MCPhysReg r : D.implicit_defs()) {
         const char *nm = LMRI->getName(r); if (nm) v.wr.insert(norm_reg(nm));
     }
+    /*
+     * LLVM's AArch64 call descriptions carry `Uses = [SP]`: an ABI model of
+     * the callee's stack discipline, not a register BL or BLR reads.  It is
+     * dropped where it enters, in the IMPLICIT use list, rather than erased
+     * from the finished read set — so a call that names the stack pointer
+     * as an explicit operand keeps it.  Erasing afterwards cannot tell the
+     * two apart.
+     *
+     * The suppression is AArch64-only because the artifact is.  Every other
+     * target here models a call's stack effect the way the architecture
+     * does or not at all: x86 CALL genuinely reads and updates RSP, and
+     * RISC-V JAL / JALR and MIPS JAL / JALR touch no stack pointer, so LLVM
+     * claims no use to suppress.
+     */
+    bool drop_abi_sp = (isa == ISA_AARCH64) && v.is_call;
     for (llvm::MCPhysReg r : D.implicit_uses()) {
-        const char *nm = LMRI->getName(r); if (nm) v.rd.insert(norm_reg(nm));
+        const char *nm = LMRI->getName(r);
+        if (!nm) continue;
+        std::string cn = norm_reg(nm);
+        if (drop_abi_sp && cn == "sp") continue;
+        v.rd.insert(cn);
     }
 }
 

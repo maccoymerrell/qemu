@@ -44,15 +44,15 @@
 # MCInstrDesc, which is not expected.
 mipsel R-wr-missing bc1* +r#
 
-# LLVM's MIPS BGEZAL / BLTZAL / *ALL describe the tested register as an
-# operand of the pseudo rather than a use, so it reports no reads at all.
-# Capstone (and the architecture) are right: the branch reads the register
-# it compares against zero.
-mipsel R-rd-phantom b*zal* +r#
-
-# LLVM's MIPS JR / JALR pseudos likewise omit the target register read.
-mipsel R-rd-phantom jr +r#
-mipsel R-rd-phantom jalr +r#
+# (The MIPS branch-and-link and JR / JALR target-read entries that used to
+# sit here were an artifact of this tool, not a disagreement.  Its call-site
+# suppression of LLVM's AArch64 ABI stack-pointer use spelled the non-
+# AArch64 register `r2` — the RISC-V stack pointer — and applied it to every
+# ISA, so on MIPS it deleted $v0 from the read set of anything LLVM calls a
+# call.  `jalr $t0` compared clean and `jalr $v0` did not; signature keys
+# collapse register numbers, so one erased value read as a class-wide LLVM
+# defect.  The justification that stood here said LLVM "reports no reads at
+# all" for these forms.  It never did.)
 mipsel B-ret-mismatch jr cs-ret
 
 # (LWL/LWR read their own destination — the partial-merge workaround in
@@ -94,11 +94,12 @@ riscv64 R-rd-phantom vmsbc.v*m +v#
 riscv64 R-rd-phantom vmerge.v*m +v#
 riscv64 R-rd-phantom vfmerge.v*m +v#
 
-# LLVM adds an ABI-modelling implicit SP use to call instructions.  It is
-# not an architectural read; the tool already suppresses it for the plain
-# call forms, but not for the pointer-authenticated ones, which LLVM
-# classifies differently.
-aarch64 R-rd-missing bl* +sp
+# (`aarch64 R-rd-missing bl* +sp` used to sit here, over LLVM's ABI-
+# modelling implicit SP use on AArch64 calls.  The suppression it said was
+# already working ran BEFORE the loop that inserts the implicit uses, so it
+# suppressed nothing at all; the glob then hid every form, plain and
+# pointer-authenticated alike.  The suppression happens where the use
+# enters now, and none of them disagree.)
 
 # LLVM gives AArch64 MRS/MSR an NZCV def that the architecture does not.
 aarch64 R-wr-missing mrs +nzcv
@@ -323,7 +324,10 @@ riscv64 R-wr-missing c.* +r#
 # this tool measures.  The trace is correct; the boundary alone is not.
 riscv64 R-wr-missing jal +r#
 riscv64 R-wr-missing jalr +r#
-riscv64 R-rd-phantom jalr +r#
+# (`riscv64 R-rd-phantom jalr +r#` used to close this block.  It was the
+# same tool artifact the MIPS note in section 1 describes, and on RISC-V the
+# erased token `r2` IS the stack pointer: `jalr ra, 0(sp)` lost the one
+# register it reads.  LLVM reported it correctly throughout.)
 
 # =====================================================================
 # 5. Explicit residual baseline.
@@ -402,7 +406,6 @@ riscv64 R-rd-missing ntl.p1 +r#
 riscv64 R-rd-missing ntl.pall +r#
 riscv64 R-rd-missing ntl.s1 +r#
 riscv64 R-rd-missing ret +r#
-riscv64 R-rd-phantom jalr +r#
 riscv64 R-rd-phantom vmv1r.v +vl,vtype
 riscv64 R-rd-phantom vsetivli +vl,vtype
 riscv64 R-wr-missing c.addi +r#
@@ -430,14 +433,8 @@ mipsel M-llvm-mem-cs-none absq_s.qb load store
 mipsel M-llvm-mem-cs-none cmpgu.eq.qb load store
 mipsel M-llvm-mem-cs-none cmpu.eq.qb load store
 mipsel M-llvm-mem-cs-none insv load
-mipsel R-rd-phantom bgezall +r#
-mipsel R-rd-phantom bgezal +r#
-mipsel R-rd-phantom bltzall +r#
-mipsel R-rd-phantom bltzal +r#
 mipsel R-rd-phantom cfc1 +cop#
 mipsel R-rd-phantom cfcmsa +cop#
-mipsel R-rd-phantom jalr +r#
-mipsel R-rd-phantom jr +r#
 mipsel R-rd-phantom lwl +r#
 mipsel R-rd-phantom lwr +r#
 mipsel R-wr-missing bc1fl +r#

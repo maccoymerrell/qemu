@@ -1370,9 +1370,13 @@ def _chk_isa_crosscheck(ctx: Ctx) -> Outcome:
         all_ok = all_ok and ok
         detail = summary
         if not ok:
-            # Every line the tool prints under --check is a signature that
-            # is NOT allowlisted; show a bounded sample.
-            new = [ln for ln in head[1:] if ln.startswith("NEW")]
+            # Under --check the tool prints only what failed.  NEW is a
+            # signature that is not allowlisted; DEAD is an allowlist entry
+            # that matched nothing, which is the direction a decoder bump
+            # breaks first — a justification left standing over a
+            # disagreement that has since moved.  Both are shown.
+            new = [ln for ln in head[1:]
+                   if ln.startswith("NEW") or ln.startswith("DEAD")]
             detail += "\n" + "\n".join(ln[:160] for ln in new[:8])
             if len(new) > 8:
                 detail += f"\n... and {len(new) - 8} more"

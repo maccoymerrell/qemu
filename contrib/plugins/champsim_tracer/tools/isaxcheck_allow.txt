@@ -213,29 +213,145 @@ mipsel R-rd-missing mthc1 +f#
 # `m[as][du][db]*`, which the matcher reads literally and never matched.)
 
 # =====================================================================
-# 4. Decoder laxity and subtarget scope (class D).  Recorded rather than
-#    fixed; see docs/limitations.rst, "Wrong-path decode of arbitrary
-#    bytes".
+# 4. The subtarget gap (class D-cs-only): the boundary decoded it and
+#    LLVM did not.
+#
+#    THIS CLASS IS SPECIAL AND THE TOOL ENFORCES IT.  A `D-cs-only`
+#    signature is not one finding among many — it is an encoding on which
+#    the register, memory and branch comparisons DO NOT RUN AT ALL, because
+#    a rejected LLVM decode short-circuits the compare.  The number of
+#    signatures here is therefore the size of this gate's blind spot, and
+#    isaxcheck reports it as `subtarget_gap=<signatures>/<encodings>` in
+#    its summary line.
+#
+#    Two rules follow, and isaxcheck refuses an allowlist that breaks the
+#    first of them:
+#
+#      * NO WILDCARDS.  `aarch64 D-cs-only *` was one line, and it hid
+#        every extension family a Capstone bump might add.  Each signature
+#        is named, or the entry is refused at load time.
+#      * A LINE HERE IS THE SECOND-CHOICE FIX.  The first choice is to add
+#        the missing feature to kIsaTable so the gap CLOSES.  That is what
+#        happened to mipsel (+mips3d) and to the whole of riscv64, which
+#        now reports subtarget_gap=0/0 — and closing the RISC-V gap is what
+#        made the Zacas `amocas.*` dropped destination visible at all.
+#
+#    So the only entries below are AArch64's, where `+all` is already the
+#    widest subtarget LLVM has and the residue is Capstone accepting
+#    encodings the architecture does not define.  See also
+#    docs/limitations.rst, "Wrong-path decode of arbitrary bytes".
 # =====================================================================
 
-# Capstone accepts encodings whose architecturally-fixed fields hold
-# reserved values — `0x88c08022` has Rs != 0b11111 and Rt2 != 0b11111 and is
-# therefore not a valid LDAR, but Capstone decodes it as `ldar w2, [x1]`
-# while LLVM rejects it.  On the correct path the bytes never occur.  On the
-# wrong path, where the tracer decodes arbitrary bytes, it means a template
-# can describe a plausible instruction where the hardware would raise
-# UNDEFINED.  The tracer's own wrong-path fidelity contract already treats
-# wrong-path instruction identity as best-effort.
-aarch64 D-cs-only *
-mipsel D-cs-only *
+# (a) Architecturally-fixed fields holding reserved values.  `0x88c0e022`
+# has Rs != 0b11111 and is therefore not a valid LDAR, but Capstone decodes
+# it as `ldar w2, [x1]` while LLVM rejects it.  The same shape covers the
+# load/store-exclusive and acquire/release families (Rs and Rt2 must both
+# read 0b11111), ADDG/SUBG (op3 must be 0b00) and SB (CRm must be 0b0000).
+# On the correct path the bytes never occur.  On the wrong path, where the
+# tracer decodes arbitrary bytes, it means a template can describe a
+# plausible instruction where the hardware would raise UNDEFINED; the
+# tracer's wrong-path fidelity contract already treats wrong-path
+# instruction identity as best-effort.
+# Verify with `cstool -d arm64 22e0c088` on a Capstone bump: if Capstone
+# starts rejecting the reserved encodings, every line here goes dead and
+# the tool says so.
+aarch64 D-cs-only addg
+aarch64 D-cs-only ldar
+aarch64 D-cs-only ldarb
+aarch64 D-cs-only ldarh
+aarch64 D-cs-only ldaxr
+aarch64 D-cs-only ldaxrb
+aarch64 D-cs-only ldaxrh
+aarch64 D-cs-only ldlar
+aarch64 D-cs-only ldlarb
+aarch64 D-cs-only ldlarh
+aarch64 D-cs-only ldxr
+aarch64 D-cs-only ldxrb
+aarch64 D-cs-only ldxrh
+aarch64 D-cs-only sb
+aarch64 D-cs-only stllr
+aarch64 D-cs-only stllrb
+aarch64 D-cs-only stllrh
+aarch64 D-cs-only stlr
+aarch64 D-cs-only stlrb
+aarch64 D-cs-only stlrh
+aarch64 D-cs-only subg
 
-# RISC-V: Capstone decodes vendor and draft extensions (cv.*, xtheed*, vt.*,
-# mop.*, cmop.*, the Zicfiss/Zimop hint space, the crypto scalar
-# sha/sm3/sm4 forms) that the LLVM subtarget chosen to match cap_mode_riscv
-# does not enable.  Expected, not a defect.  `prefetch.r/w/i` (Zicbop) is a
-# case where Capstone is the MORE correct of the two — LLVM decodes the hint
-# as a plain `ori`.
-riscv64 D-cs-only *
+# (b) CONSTRAINED UNPREDICTABLE register aliasing on the pair forms.  The
+# architecture leaves `ldp w2, w2, [x1], #28` (Rt == Rt2) and
+# `stp wzr, w0, [x0], #40` (writeback Rn == Rt2) undefined; LLVM refuses
+# them, Capstone decodes them.  This is the same best-effort wrong-path
+# space as (a) — the difference is that the fields are legal in isolation
+# and only their COMBINATION is not, so no field check would catch it.
+aarch64 D-cs-only ldaxp
+aarch64 D-cs-only ldnp
+aarch64 D-cs-only ldp
+aarch64 D-cs-only ldpsw
+aarch64 D-cs-only ldxp
+aarch64 D-cs-only stgp
+aarch64 D-cs-only stp
+
+# =====================================================================
+# 4b. Residual class-R/Z findings on the RISC-V space the closed subtarget
+#     gap made visible.  These were inside "LLVM rejects this" until the
+#     kIsaTable feature list was completed; none of them is reachable by a
+#     binary the tracer traces today, and each names its fix.
+# =====================================================================
+
+# Zacas compare-and-swap: `amocas.d t0, s2, (t1)` has rd tied — it is the
+# comparand on the way in and the loaded value on the way out — and
+# Capstone reports it READ-only, so the destination is dropped ENTIRELY
+# (csWR{} against llvmWR{r5}).  This is the same Capstone tied-operand
+# handling that loses the RVV multiply-accumulate destination, which
+# disas/capstone.c already repairs; the Zacas family needs the same
+# treatment there.  Not reachable yet: it takes -march=...\_zacas to emit
+# one.  FIX: extend the RISC-V tied-destination repair in
+# cap_fill_generic_operands() to the amocas.* forms; delete these lines
+# when it lands.
+riscv64 R-wr-missing amocas.d +r#
+riscv64 R-wr-missing amocas.d.aq +r#
+riscv64 R-wr-missing amocas.d.aqrl +r#
+riscv64 R-wr-missing amocas.d.rl +r#
+riscv64 R-wr-missing amocas.w +r#
+riscv64 R-wr-missing amocas.w.aq +r#
+riscv64 R-wr-missing amocas.w.aqrl +r#
+riscv64 R-wr-missing amocas.w.rl +r#
+
+# CORE-V (XCVmac) `cv.*nr` accumulate-and-round forms: identical shape to
+# the Zacas case above — a tied destination Capstone reports read-only.
+# A vendor extension; QEMU implements no CORE-V core, so no trace can ever
+# contain one.  MODELLING DECISION: not worth a boundary workaround on its
+# own; it would fall out of a general tied-destination repair.
+riscv64 R-wr-missing cv.addnr +r#
+riscv64 R-wr-missing cv.addrnr +r#
+riscv64 R-wr-missing cv.addunr +r#
+riscv64 R-wr-missing cv.addurnr +r#
+riscv64 R-wr-missing cv.subnr +r#
+riscv64 R-wr-missing cv.subrnr +r#
+riscv64 R-wr-missing cv.subunr +r#
+riscv64 R-wr-missing cv.suburnr +r#
+
+# XVentanaCondOps `vt.maskc` / `vt.maskcn` are SCALAR conditional moves
+# whose mnemonic happens to begin "vt."; Capstone files them with the
+# vector forms and attaches the RVV context reads (vl, vtype) that every
+# real vector instruction has.  Phantom dependencies on a vendor extension
+# QEMU does not implement.  WONT-FIX at the boundary: the fix belongs in
+# Capstone's own instruction description, and a name-based exclusion here
+# would be a second guess at the same table.
+riscv64 R-rd-phantom vt.maskc +vl,vtype
+riscv64 R-rd-phantom vt.maskcn +vl,vtype
+
+# Zfa `fli.s/d/h` load an immediate from a 32-entry constant table, and
+# Capstone types that operand RISCV_OP_FP — a type the boundary's RISC-V
+# operand filler has no case for, so it lands in QEMU_PLUGIN_OP_INVALID and
+# the instruction's immediate is lost.  The register sets agree, so no
+# dependency edge is wrong; what is missing is the constant.  Same class as
+# the RISC-V CSR operands in section 2.  FIX: a RISCV_OP_FP case in
+# cap_fill_generic_operands() alongside RISCV_OP_IMM.
+riscv64 Z-unmodelled-op fli.d
+riscv64 Z-unmodelled-op fli.h
+riscv64 Z-unmodelled-op fli.s
+
 riscv64 R-wr-missing cmop.* +r#
 riscv64 R-rd-missing *ntl* +r#
 
@@ -1583,6 +1699,8 @@ riscv64 B-flow-presence jal cs-no llvm-yes
 riscv64 B-flow-presence j cs-no llvm-yes
 riscv64 B-ret-mismatch jr cs-noret
 riscv64 B-ret-mismatch ret cs-noret
-riscv64 M-cs-mem-llvm-none prefetch.i
-riscv64 M-cs-mem-llvm-none prefetch.r
-riscv64 M-cs-mem-llvm-none prefetch.w
+# (The three `M-cs-mem-llvm-none prefetch.r/w/i` entries that used to close
+# this file recorded LLVM decoding the Zicbop hints as a plain `ori` with no
+# memory operand.  `+zicbop` in kIsaTable makes LLVM model them as the
+# memory hints they are and the disagreement is gone; the tool's dead-rule
+# report is what said so.)

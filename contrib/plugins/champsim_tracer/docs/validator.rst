@@ -643,8 +643,58 @@ outside the repo as standalone scripts):
    green — ``capstone_workaround_probe`` answers the complementary
    question of whether it can now be deleted.
 
+   **The subtarget gap, and why the gate measures its own blindness.**
+   A comparison against a second decoder is only as wide as the narrower
+   decoder's configuration.  When the LLVM subtarget describes less of
+   the ISA than the Capstone mode does, two things happen at once, and
+   the second is the dangerous one: the report fills with "LLVM was not
+   told about this extension" — 84% of the AArch64 findings, at one
+   point — and every encoding LLVM *rejects* is one the register, memory
+   and branch comparisons never run on at all, because a rejection
+   short-circuits the whole compare.  A too-narrow subtarget does not
+   merely add noise; it removes coverage, silently, in exactly the space
+   the noise is drawing attention away from.
+
+   So the gap is a first-class measurement.  ``isaxcheck`` reports
+   ``subtarget_gap=<signatures>/<encodings>`` on its summary line — that
+   number is the size of its own blind spot — and it enforces two rules
+   that keep the number honest:
+
+   * a subtarget-gap signature (class ``D-cs-only``) can only be
+     allowlisted by an **exact** entry.  A wildcard there is refused at
+     load time, because one ``*`` is enough to hide an entire ISA
+     extension arriving in a decoder bump.
+   * an allowlist entry that matches **nothing** is reported as ``DEAD``
+     and fails the gate.  That is the opposite direction: when a decoder
+     bump closes a disagreement, the justification standing over it
+     becomes a claim about something that no longer happens.
+
+   The maintenance action for a new gap is to widen the LLVM subtarget
+   in ``kIsaTable``, not to add an allowlist line; a line is right only
+   where LLVM has no feature to enable.  Under that rule ``riscv64`` and
+   ``mipsel`` reach ``subtarget_gap=0/0``, and closing the RISC-V gap is
+   what made the Zacas ``amocas.*`` dropped destination — a real defect,
+   the same tied-operand shape Capstone loses on the RVV
+   multiply-accumulates — visible at all.  ``aarch64`` keeps 28 named
+   signatures because ``+all`` is already the widest subtarget LLVM
+   offers, and the residue is Capstone accepting encodings the
+   architecture reserves.
+
+   Because ``kIsaTable`` now carries features LLVM must recognise,
+   ``isaxcheck`` verifies every one of them against the target's own
+   feature table before decoding anything, and fails naming the
+   offender if one is absent: LLVM answers an unknown feature with a
+   warning and an otherwise normal subtarget, which would reopen the
+   blind spot in the middle of an otherwise green run.  Features whose
+   spelling is version-dependent — extensions carrying an
+   ``experimental-`` prefix until they ratify — live in a separate
+   optional list, are probed individually, and are reported as taken or
+   skipped on the summary line so a run is reproducible from its own
+   output.
+
    GATING on any signature outside
-   ``tools/isaxcheck_allow.txt``.  Entries above that file's baseline
+   ``tools/isaxcheck_allow.txt``, and on any entry inside it that
+   matches nothing.  Entries above that file's baseline
    block each name the disagreement, why it is not a tracer defect, and
    how to check whether it can be removed; below it, every remaining
    signature is listed individually rather than by wildcard, so a NEW

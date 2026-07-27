@@ -49,13 +49,41 @@
  * handling, register-class mapping — which is where every defect found so far
  * has lived.  x86's tables are hand-maintained and independent.
  *
- * SUBTARGET MATCHING IS LOAD-BEARING
- * ----------------------------------
+ * SUBTARGET MATCHING IS LOAD-BEARING — AND SELF-DETECTING
+ * -------------------------------------------------------
  * The Capstone mode must be the one the tracer selects and the LLVM feature
  * set must match it, or "LLVM rejects it" degenerates into "feature not
  * enabled".  An early run with the default RISC-V subtarget produced 1.6M
  * spurious hits that vanished once the mode was aligned.  See kIsaTable and
  * its cross-reference to `cap_mode_*()`.
+ *
+ * A mismatch used to be silent in BOTH directions.  Too NARROW an LLVM
+ * subtarget floods the report with "LLVM was not told about this extension"
+ * — 84% of the aarch64 findings at one point — and, far worse, every
+ * encoding LLVM rejects is one the register / memory / branch comparisons
+ * never run on at all: a rejection short-circuits the whole compare.  Too
+ * WIDE a subtarget is the mirror image, and both drift on their own when
+ * either decoder is bumped.
+ *
+ * So the mismatch is now the gate's own instrument.  `D-cs-only` — the
+ * boundary decodes it, LLVM rejects it — IS the subtarget-gap signal, and
+ * it is reported as a first-class quantity (`subtarget_gap=` in the summary
+ * line, counted in encodings as well as signatures) rather than as one
+ * bucket among hundreds.  Two rules keep it honest:
+ *
+ *   - a `D-cs-only` signature can only be allowlisted by an EXACT entry.
+ *     A wildcard there is refused at load time, because one `*` is enough
+ *     to hide an entire ISA extension's worth of blindness — which is what
+ *     `aarch64 D-cs-only *` did.
+ *   - an allowlist rule that matches nothing is reported and fails the
+ *     gate.  That is the other direction: when an LLVM bump grows a feature
+ *     the subtarget now enables, the entry justifying the old gap goes
+ *     dead, and a dead entry is an unmaintained one.
+ *
+ * The maintenance action for a new gap signature is to add the LLVM feature
+ * to kIsaTable, not to add an allowlist line.  A line is correct only when
+ * LLVM has no such feature to enable (a vendor extension, or Capstone
+ * decoding a reserved encoding LLVM refuses); the allowlist says which.
  */
 
 #include <algorithm>
@@ -82,6 +110,7 @@ extern "C" bool cap_disas_raw_detail(int cap_arch, unsigned int cap_mode,
                                      uint64_t pc,
                                      struct qemu_plugin_insn_info *out);
 
+#include "llvm/Config/llvm-config.h"
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCDisassembler/MCDisassembler.h"
@@ -107,7 +136,18 @@ struct IsaCfg {
     const char *name;
     const char *triple;
     const char *cpu;
+    // Required subtarget features.  Verified after construction with
+    // MCSubtargetInfo::checkFeatures(): LLVM only WARNS about a feature it
+    // does not recognise, and a warning on stderr in the middle of a sweep
+    // is exactly the silent drift this tool exists to prevent.
     const char *features;
+    // Features whose LLVM spelling is version-dependent — extensions that
+    // were `experimental-` when this gate was written and are named plainly
+    // once they ratify.  Each is probed independently and kept only if it
+    // takes; both spellings can be listed and the one that exists wins.
+    // Which ones resolved is printed in the summary line, so a run is
+    // reproducible from its own output.
+    const char *opt_features;
     int cs_arch;
     unsigned cs_mode;
     // Mirrors IsaProperties::include_implicit_regs in
@@ -145,12 +185,43 @@ static Isa isa;
  */
 static const IsaCfg kIsaTable[] = {
     /* Capstone's AArch64 decoder gates nothing on features, so the matching
-     * LLVM subtarget is the whole architecture, not a version snapshot. */
-    {"aarch64", "aarch64-unknown-linux-gnu", "generic", "+all",
+     * LLVM subtarget is the whole architecture, not a version snapshot.
+     * There is nothing wider to select, so AArch64 is the one ISA whose
+     * residual subtarget gap cannot be closed by a feature: what is left is
+     * Capstone accepting encodings the architecture reserves, and it is
+     * enumerated one signature at a time in the allowlist. */
+    {"aarch64", "aarch64-unknown-linux-gnu", "generic", "+all", "",
      CS_ARCH_AARCH64, CS_MODE_LITTLE_ENDIAN, true},
+    /*
+     * RISC-V is where the subtarget-gap measurement pays for itself.
+     * Capstone's RISC-V decoder does not gate on extension features at all
+     * — it decodes every extension it was built with — so any extension
+     * absent from this list is a hole the register/memory/branch
+     * comparisons never look through.  The list is therefore "everything
+     * Capstone decodes that LLVM can be told about", not "the extensions a
+     * compiler emits", and it is complete: riscv64 reports
+     * subtarget_gap=0/0.
+     *
+     * Two of the entries show why the gap has to be measured rather than
+     * assumed.  `+zihintntl` is not a rejection case at all: without it
+     * LLVM decodes `c.ntl.*` as `c.add`, inventing a register read the hint
+     * does not perform, so a missing feature can be a WRONG decode that
+     * looks exactly like a tracer defect.  And closing the last of the gap
+     * is what made the Zacas `amocas.*` dropped destination visible — a
+     * real defect that had been sitting inside "LLVM rejects this".
+     */
     {"riscv64", "riscv64-unknown-linux-gnu", "generic-rv64",
      "+64bit,+i,+m,+a,+f,+d,+c,+v,+zicsr,+zifencei,+zba,+zbb,+zbc,"
-     "+zbkb,+zbkc,+zbkx,+zbs,+zfh,+zfhmin,+zvl64b,+zve64d,+zvfh",
+     "+zbkb,+zbkc,+zbkx,+zbs,+zfh,+zfhmin,+zvl64b,+zve64d,+zvfh,"
+     "+zcb,+zicond,+zihintntl,+zfa,+zknd,+zkne,+zknh,+zksed,+zksh,"
+     "+zvbb,+zvbc,+zvkb,+zvkg,+zvkned,+zvknhb,+zvksed,+zvksh,"
+     "+zicbom,+zicboz,+zicbop,+zawrs,+h,+svinval,+xventanacondops,"
+     "+xcvalu,+xcvbitmanip,+xcvmac,+xcvsimd,+xcvmem,+xcvelw,+xcvbi",
+     /* Ratified after LLVM 18, where they carry the `experimental-`
+      * prefix; both spellings are offered so the gate keeps its coverage
+      * across the bump instead of quietly regrowing a gap. */
+     "experimental-zacas,zacas,experimental-zimop,zimop,"
+     "experimental-zfbfmin,zfbfmin,experimental-zvfbfwma,zvfbfwma",
      CS_ARCH_RISCV,
      CS_MODE_RISCV64 | CS_MODE_RISCV_C | CS_MODE_RISCV_FD | CS_MODE_RISCV_A |
          CS_MODE_RISCV_V | CS_MODE_RISCV_ZBA | CS_MODE_RISCV_ZBB |
@@ -163,12 +234,14 @@ static const IsaCfg kIsaTable[] = {
      * is FPXX or better, so the tracer's 64-bit-FPR model is the correct
      * one.  The remaining features are the ASEs Capstone's MIPS32R2 mode
      * decodes; omitting one turns "LLVM was not told about this extension"
-     * into a decode disagreement. */
+     * into a decode disagreement.  `+mips3d` closes the last four
+     * (addr.ps / mulr.ps / cvt.ps.pw / cvt.pw.ps), taking mipsel to
+     * subtarget_gap=0/0. */
     {"mipsel", "mipsel-unknown-linux-gnu", "mips32r2",
      "+mips32r2,+msa,+dsp,+dspr2,+dspr3,+fp64,+eva,+virt,+ginv,+crc,"
-     "+abs2008,+nan2008,+mt",
-     CS_ARCH_MIPS, CS_MODE_MIPS32R2 | CS_MODE_LITTLE_ENDIAN, true},
-    {"x86_64", "x86_64-unknown-linux-gnu", "x86-64", "",
+     "+abs2008,+nan2008,+mt,+mips3d",
+     "", CS_ARCH_MIPS, CS_MODE_MIPS32R2 | CS_MODE_LITTLE_ENDIAN, true},
+    {"x86_64", "x86_64-unknown-linux-gnu", "x86-64", "", "",
      CS_ARCH_X86, CS_MODE_64, true},
 };
 
@@ -500,6 +573,8 @@ struct LlView {
 };
 
 static const llvm::Target *LT;
+static std::string resolved_features;
+static std::vector<std::string> opt_taken, opt_skipped;
 static std::unique_ptr<llvm::MCSubtargetInfo> LSTI;
 static std::unique_ptr<llvm::MCRegisterInfo> LMRI;
 static std::unique_ptr<llvm::MCAsmInfo> LMAI;
@@ -508,6 +583,13 @@ static std::unique_ptr<llvm::MCDisassembler> LDIS;
 static std::unique_ptr<llvm::MCInstrInfo> LMII;
 static std::unique_ptr<llvm::MCInstPrinter> LIP;
 static std::unique_ptr<llvm::MCInstrAnalysis> LMIA;
+
+static std::string join(const std::vector<std::string> &v)
+{
+    std::string r;
+    for (const std::string &e : v) { if (!r.empty()) r += ","; r += e; }
+    return r.empty() ? "-" : r;
+}
 
 static void llvm_init()
 {
@@ -523,7 +605,61 @@ static void llvm_init()
     LT = llvm::TargetRegistry::lookupTarget(cfg.triple, err);
     if (!LT) { fprintf(stderr, "llvm target %s: %s\n", cfg.triple, err.c_str()); exit(1); }
     llvm::Triple TT(cfg.triple);
-    LSTI.reset(LT->createMCSubtargetInfo(cfg.triple, cfg.cpu, cfg.features));
+    /*
+     * Resolve the subtarget BEFORE anything is decoded, and prove it took.
+     * LLVM answers an unrecognised feature with a warning on stderr and an
+     * otherwise normal subtarget, so a renamed or dropped feature would
+     * silently reopen a decode blind spot in the middle of an otherwise
+     * green run.  checkFeatures() turns that into a hard failure naming the
+     * feature; the optional list is where a version-dependent spelling is
+     * allowed to be absent, and what resolved is reported.
+     */
+    std::unique_ptr<llvm::MCSubtargetInfo> bare(
+        LT->createMCSubtargetInfo(cfg.triple, cfg.cpu, ""));
+    if (!bare) { fprintf(stderr, "llvm subtarget init failed\n"); exit(1); }
+    /* The target's own feature table, which is the only authority on
+     * whether a name means anything.  checkFeatures() is NOT: an
+     * unrecognised name contributes no bit, so a typo'd requirement passes
+     * it trivially. */
+    std::set<std::string> known;
+    for (const auto &kv : bare->getAllProcessorFeatures()) known.insert(kv.Key);
+
+    std::vector<std::string> missing;
+    for (const char *p = cfg.features; p && *p; ) {
+        const char *comma = strchr(p, ',');
+        std::string f(p, comma ? (size_t)(comma - p) : strlen(p));
+        p = comma ? comma + 1 : p + f.size();
+        if (!f.empty() && (f[0] == '+' || f[0] == '-')) f.erase(0, 1);
+        if (!f.empty() && !known.count(f)) missing.push_back(f);
+    }
+    if (!missing.empty()) {
+        fprintf(stderr,
+                "isaxcheck: LLVM %s has no such subtarget feature for %s: %s\n"
+                "A feature this LLVM does not know is a decode blind spot, "
+                "not a warning: every encoding it would have enabled becomes "
+                "an LLVM rejection, and the register/memory/branch "
+                "comparisons never run on it.  Either build against an LLVM "
+                "that has it, or move it to the optional list in kIsaTable "
+                "and re-derive the allowlist.\n",
+                LLVM_VERSION_STRING, cfg.name, join(missing).c_str());
+        exit(1);
+    }
+
+    resolved_features = cfg.features;
+    for (const char *p = cfg.opt_features; p && *p; ) {
+        const char *comma = strchr(p, ',');
+        std::string f(p, comma ? (size_t)(comma - p) : strlen(p));
+        p = comma ? comma + 1 : p + f.size();
+        if (f.empty()) continue;
+        if (known.count(f)) {
+            resolved_features += ",+" + f;
+            opt_taken.push_back(f);
+        } else {
+            opt_skipped.push_back(f);
+        }
+    }
+    LSTI.reset(LT->createMCSubtargetInfo(cfg.triple, cfg.cpu,
+                                         resolved_features));
     LMRI.reset(LT->createMCRegInfo(cfg.triple));
     llvm::MCTargetOptions opt;
     LMAI.reset(LT->createMCAsmInfo(*LMRI, cfg.triple, opt));
@@ -910,8 +1046,20 @@ static void run_sweep(unsigned shard, unsigned nshard)
  * observed on, and how to verify it can be removed — see
  * isaxcheck_allow.txt.
  */
-struct AllowRule { std::string isa, key; };
+struct AllowRule { std::string isa, key; unsigned lineno; bool used = false; };
 static std::vector<AllowRule> allow_rules;
+
+/*
+ * The signature class that means "the boundary decoded this and LLVM did
+ * not".  It is the subtarget-gap signal (see the file header): every
+ * encoding in it is one the register / memory / branch comparisons never
+ * ran on, so it is the gate's own measure of how blind it is.
+ */
+static const char kGapClass[] = "D-cs-only ";
+static bool is_gap_key(const std::string &k)
+{
+    return k.compare(0, sizeof(kGapClass) - 1, kGapClass) == 0;
+}
 
 /* Minimal glob: '*' matches any run of characters, everything else literal. */
 static bool glob_match(const char *pat, const char *str)
@@ -932,7 +1080,10 @@ static bool load_allow(const char *path)
     FILE *f = fopen(path, "r");
     if (!f) return false;
     char line[1024];
+    unsigned lineno = 0;
+    bool bad = false;
     while (fgets(line, sizeof line, f)) {
+        lineno++;
         char *p = line;
         while (*p == ' ' || *p == '\t') p++;
         /* Comments are whole-line only: '#' also occurs INSIDE a key, where
@@ -948,19 +1099,38 @@ static bool load_allow(const char *path)
         *sp = '\0';
         std::string i = p, k = sp + 1;
         while (!k.empty() && k[0] == ' ') k.erase(0, 1);
-        allow_rules.push_back({i, k});
+        /*
+         * A wildcard is refused in the subtarget-gap class.  `aarch64
+         * D-cs-only *` is one line, and it hid every encoding on which
+         * this tool's register, memory and branch comparisons do not run
+         * at all -- including whole ISA extensions arriving in a Capstone
+         * bump.  Naming them one at a time is the whole mechanism: the
+         * count of lines IS the size of the blind spot, and a new one has
+         * to be justified by hand.
+         */
+        if (is_gap_key(k) && k.find('*') != std::string::npos) {
+            fprintf(stderr,
+                    "%s:%u: `%s' wildcards the subtarget-gap class.  Name "
+                    "each signature exactly, or widen the LLVM subtarget in "
+                    "kIsaTable so the gap closes.\n",
+                    path, lineno, k.c_str());
+            bad = true;
+            continue;
+        }
+        allow_rules.push_back({i, k, lineno, false});
     }
     fclose(f);
-    return true;
+    return !bad;
 }
 
 static bool is_allowed(const std::string &key)
 {
-    for (const auto &r : allow_rules) {
+    bool hit = false;
+    for (auto &r : allow_rules) {
         if (r.isa != cfg.name && r.isa != "*") continue;
-        if (glob_match(r.key.c_str(), key.c_str())) return true;
+        if (glob_match(r.key.c_str(), key.c_str())) { r.used = true; hit = true; }
     }
-    return false;
+    return hit;
 }
 
 // ---------------------------------------------------------------------------
@@ -1016,7 +1186,10 @@ int main(int argc, char **argv)
         }
     }
     if (!found) { fprintf(stderr, "unknown isa %s\n", isaname); return 2; }
-    if (mattr) cfg.features = mattr;
+    /* An explicit --mattr is an interactive experiment, not the shipped
+     * subtarget: it replaces the optional list too, so what is compared is
+     * exactly what was asked for. */
+    if (mattr) { cfg.features = mattr; cfg.opt_features = ""; }
     if (mcpu)  cfg.cpu = mcpu;
     if (allow && !load_allow(allow)) {
         fprintf(stderr, "cannot read allowlist %s\n", allow); return 2;
@@ -1135,18 +1308,46 @@ int main(int argc, char **argv)
     }
 
     unsigned long unallowed = 0;
-    for (auto &kv : buckets) if (!is_allowed(kv.first)) unallowed++;
-
-    printf("# isa=%s encodings_tried=%lu distinct_signatures=%zu "
-           "allowlisted=%zu unallowed=%lu\n",
-           cfg.name, total_tried, buckets.size(),
-           buckets.size() - unallowed, unallowed);
+    unsigned long gap_sigs = 0, gap_encodings = 0;
+    std::map<std::string, bool> allowed_of;
     for (auto &kv : buckets) {
         bool ok = is_allowed(kv.first);
+        allowed_of[kv.first] = ok;
+        if (!ok) unallowed++;
+        if (is_gap_key(kv.first)) { gap_sigs++; gap_encodings += kv.second.n; }
+    }
+
+    /*
+     * A rule that matches nothing is not harmless.  It is a justification
+     * for a disagreement that no longer happens, which means either the
+     * disagreement was fixed and the note was left behind, or -- the case
+     * that matters -- a decoder bump moved the signature and the rule now
+     * silently protects nothing while the reader believes it does.
+     */
+    std::vector<const AllowRule *> dead;
+    for (const auto &r : allow_rules)
+        if (!r.used && r.isa == cfg.name) dead.push_back(&r);
+
+    printf("# isa=%s encodings_tried=%lu distinct_signatures=%zu "
+           "allowlisted=%zu unallowed=%lu subtarget_gap=%lu/%lu "
+           "dead_allow_rules=%zu\n",
+           cfg.name, total_tried, buckets.size(),
+           buckets.size() - unallowed, unallowed, gap_sigs, gap_encodings,
+           dead.size());
+    if (!opt_taken.empty() || !opt_skipped.empty()) {
+        printf("# llvm=%s optional_features_taken=%s skipped=%s\n",
+               LLVM_VERSION_STRING, join(opt_taken).c_str(),
+               join(opt_skipped).c_str());
+    }
+    for (auto &kv : buckets) {
+        bool ok = allowed_of[kv.first];
         if (check && ok) continue;
         printf("%-4s %-46s n=%-9lu %s\n", ok ? "ALLOW" : "NEW",
                kv.first.c_str(), kv.second.n, kv.second.sample.c_str());
     }
+    for (const AllowRule *r : dead)
+        printf("DEAD %s:%u %s %s\n", allow ? allow : "-", r->lineno,
+               r->isa.c_str(), r->key.c_str());
 
-    return (check && unallowed) ? 1 : 0;
+    return (check && (unallowed || !dead.empty())) ? 1 : 0;
 }

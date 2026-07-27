@@ -498,6 +498,20 @@ derive activity itself.
 carries a governing predicate *and* a vector-select register; only the
 first is represented, for the same one-slot reason as above.
 
+**An instruction with more than eight operands loses the rest.**
+``qemu_plugin_insn_info`` carries ``QEMU_PLUGIN_INSN_DETAIL_MAX_OPS``
+= 8 operands, and the boundary truncates past that.  One family
+reaches it: the SME2 four-vector-group forms, where ``bfmls
+za.h[w8, 7, vgx4], { z0.h - z3.h }, { z4.h - z7.h }`` has nine — the ZA
+tile plus eight Z registers — so ``z7`` never reaches the register set.
+The decoder is not at fault; Capstone reports all nine and its own
+operand array holds sixteen.  Raising the cap widens every decode
+struct in the plugin by about 48 bytes per added slot, which is not
+worth paying for a feature no guest the tracer runs executes, so the
+cap stands and the six affected signatures are recorded in
+``tools/isaxcheck_allow.txt``.  Revisit if an SME2 workload ever
+becomes a target.
+
 **Cumulative FP exception status is not modelled.**  AArch64 ``FPSR``
 and the RISC-V ``fflags`` accumulation are written by every FP
 instruction that can raise an exception; the tracer records neither.

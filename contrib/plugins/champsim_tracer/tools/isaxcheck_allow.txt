@@ -2365,9 +2365,18 @@ aarch64 R-wr-phantom msr +fcsr
 aarch64 R-wr-phantom msrr +fcsr
 
 # Vector-register differences.  On AArch64 these are the SME multi-vector
-# register LISTS -- `{ z4.h - z7.h }` names four and Capstone reports three
-# -- a residual boundary gap on a feature no guest the tracer runs can
-# execute, so the weight is zero.  On RISC-V they are the vector
+# register LISTS, and the cause is OURS rather than Capstone's: `bfmls
+# za.h[w8, 7, vgx4], { z0.h - z3.h }, { z4.h - z7.h }` has NINE operands --
+# the ZA tile plus eight Z registers -- and Capstone reports all nine
+# correctly (its own NUM_AARCH64_OPS is 16), but qemu_plugin_insn_info
+# carries QEMU_PLUGIN_INSN_DETAIL_MAX_OPS == 8, so the ninth is truncated at
+# the boundary and z7 never reaches the register sets.  Raising the cap
+# widens every decode struct in the plugin by ~48 bytes per added slot, for
+# a feature no guest the tracer runs can execute -- weight zero -- so the
+# cap stands and the truncation is recorded, here and in
+# docs/limitations.rst.  Check it with `cstool -d aarch64 1f10e5c1`: the
+# operand count is 9, and z7 is the one that does not fit.
+# On RISC-V they are the vector
 # DESTINATION read: under tail-undisturbed and mask-undisturbed policy the
 # elements `vd` does not write keep their old values, so `vd` really is a
 # source; the Sail model records exactly this and LLVM does not.
@@ -2451,8 +2460,9 @@ riscv64 R-wr-phantom fsflagsi +fcsr
 riscv64 R-wr-phantom fsrm +fcsr
 riscv64 R-wr-phantom fsrmi +fcsr
 
-# RISC-V vector control (REG_VCTRL): vl / vtype / vxrm / vxsat reached
-# through a CSR access.
+# RISC-V vector configuration (REG_VCTRL): vl and vtype reached through a
+# CSR access.  Only those two -- they are what a vsetvl writes as a pair
+# and what every vector instruction reads.
 riscv64 R-rd-phantom csrc +vctrl
 riscv64 R-rd-phantom csrci +vctrl
 riscv64 R-rd-phantom csrr +vctrl
@@ -2476,6 +2486,37 @@ riscv64 R-wr-phantom csrs +vctrl
 riscv64 R-wr-phantom csrsi +vctrl
 riscv64 R-wr-phantom csrw +vctrl
 riscv64 R-wr-phantom csrwi +vctrl
+
+# RISC-V vector status (REG_VCSR): the fixed-point rounding mode and
+# saturation flag, vxrm / vxsat / vcsr, reached through a CSR access.
+# Separate from REG_VCTRL because they are not configuration -- a
+# saturating op writes vxsat without touching vl -- so they key their own
+# signatures.  Same underlying disagreement as every other CSR entry
+# here: the boundary reports the register the instruction moves and
+# LLVM's description has no register operand for it.
+riscv64 R-rd-phantom csrc +vcsr
+riscv64 R-rd-phantom csrci +vcsr
+riscv64 R-rd-phantom csrr +vcsr
+riscv64 R-rd-phantom csrrc +vcsr
+riscv64 R-rd-phantom csrrci +vcsr
+riscv64 R-rd-phantom csrrs +vcsr
+riscv64 R-rd-phantom csrrsi +vcsr
+riscv64 R-rd-phantom csrrw +vcsr
+riscv64 R-rd-phantom csrrwi +vcsr
+riscv64 R-rd-phantom csrs +vcsr
+riscv64 R-rd-phantom csrsi +vcsr
+riscv64 R-wr-phantom csrc +vcsr
+riscv64 R-wr-phantom csrci +vcsr
+riscv64 R-wr-phantom csrrc +vcsr
+riscv64 R-wr-phantom csrrci +vcsr
+riscv64 R-wr-phantom csrrs +vcsr
+riscv64 R-wr-phantom csrrsi +vcsr
+riscv64 R-wr-phantom csrrw +vcsr
+riscv64 R-wr-phantom csrrwi +vcsr
+riscv64 R-wr-phantom csrs +vcsr
+riscv64 R-wr-phantom csrsi +vcsr
+riscv64 R-wr-phantom csrw +vcsr
+riscv64 R-wr-phantom csrwi +vcsr
 
 # RISC-V vstart (REG_VSTART): the element index a trapped vector
 # instruction resumes from.
@@ -2573,9 +2614,18 @@ riscv64 R-rd-phantom fsub.h +frm
 riscv64 R-rd-phantom fsub.s +frm
 
 # Vector-register differences.  On AArch64 these are the SME multi-vector
-# register LISTS -- `{ z4.h - z7.h }` names four and Capstone reports three
-# -- a residual boundary gap on a feature no guest the tracer runs can
-# execute, so the weight is zero.  On RISC-V they are the vector
+# register LISTS, and the cause is OURS rather than Capstone's: `bfmls
+# za.h[w8, 7, vgx4], { z0.h - z3.h }, { z4.h - z7.h }` has NINE operands --
+# the ZA tile plus eight Z registers -- and Capstone reports all nine
+# correctly (its own NUM_AARCH64_OPS is 16), but qemu_plugin_insn_info
+# carries QEMU_PLUGIN_INSN_DETAIL_MAX_OPS == 8, so the ninth is truncated at
+# the boundary and z7 never reaches the register sets.  Raising the cap
+# widens every decode struct in the plugin by ~48 bytes per added slot, for
+# a feature no guest the tracer runs can execute -- weight zero -- so the
+# cap stands and the truncation is recorded, here and in
+# docs/limitations.rst.  Check it with `cstool -d aarch64 1f10e5c1`: the
+# operand count is 9, and z7 is the one that does not fit.
+# On RISC-V they are the vector
 # DESTINATION read: under tail-undisturbed and mask-undisturbed policy the
 # elements `vd` does not write keep their old values, so `vd` really is a
 # source; the Sail model records exactly this and LLVM does not.

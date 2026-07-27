@@ -92,16 +92,11 @@ riscv64 W-flow-reclassed ret BRANCH_RETURN
 # so a regression here would restore a disagreement the boundary gate is
 # already expecting and nothing would turn red.
 #
-# `dret` / `mret` / `sret` are on this list and SHOULD NOT BE.  A privileged
-# return resumes from mepc/sepc/dpc, not from `ra`; the fixup keys off
-# BRANCH_RETURN and adds a link-register read those instructions do not
-# perform.  Weight is zero in user mode and small in system mode, but it is
-# a phantom dependency, not a repair.  Listed so it is visible; the line
-# goes when the branch fixup stops treating a trap return as a call return.
-riscv64 W-rd-added dret +REG_LR
-riscv64 W-rd-added mret +REG_LR
+# Only the ALIASED forms are on this list.  `dret` / `mret` / `sret` are
+# not: a privileged return resumes from mepc/sepc/dpc rather than from
+# `ra`, so the fixup keys off the alias that hides the link register and
+# not off the resulting BRANCH_RETURN, which those instructions also carry.
 riscv64 W-rd-added ret +REG_LR
-riscv64 W-rd-added sret +REG_LR
 riscv64 W-wr-added jal +REG_LR
 riscv64 W-wr-added jalr +REG_LR
 
@@ -138,21 +133,17 @@ riscv64 W-wr-added vmv2r.v +REG_VEC#
 # no dedicated return instruction, so the return is a register jump whose
 # register happens to be $ra, and only the operand text says so.
 #
-# The branch-and-link forms (BAL / BGEZAL / BGEZALL / BLTZAL / BLTZALL) are
-# reclassed to BRANCH_COND_DIRECT, which LOSES the link.  They are
-# conditional calls: they write $ra and a consumer driving a return-address
-# stack needs to see the push.  BRANCH_DIRECT_CALL exists and is what they
-# should carry.  Listed so the loss is recorded rather than implied.
+# The branch-and-link forms (BAL / BGEZAL / BGEZALL / BLTZAL / BLTZALL) do
+# not appear: they carry BRANCH_DIRECT_CALL plus MF_CONDITIONAL from the
+# classification table itself, so the boundary and the dependency model
+# agree and there is no repair to record.  They are calls that may not
+# happen -- they write $ra, and a consumer driving a return-address stack
+# needs the push.
 mipsel W-flow-added break BRANCH_SYSCALL_TYPE
 mipsel W-flow-added deret BRANCH_RETURN
 mipsel W-flow-added eret BRANCH_RETURN
 mipsel W-flow-added sdbbp BRANCH_SYSCALL_TYPE
 mipsel W-flow-added syscall BRANCH_SYSCALL_TYPE
-mipsel W-flow-reclassed bal BRANCH_COND_DIRECT
-mipsel W-flow-reclassed bgezal BRANCH_COND_DIRECT
-mipsel W-flow-reclassed bgezall BRANCH_COND_DIRECT
-mipsel W-flow-reclassed bltzal BRANCH_COND_DIRECT
-mipsel W-flow-reclassed bltzall BRANCH_COND_DIRECT
 mipsel W-flow-reclassed jr BRANCH_RETURN
 
 # Traps, interrupt/system returns and the LOOP family: control transfers

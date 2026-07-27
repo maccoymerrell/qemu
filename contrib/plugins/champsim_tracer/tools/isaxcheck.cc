@@ -598,8 +598,23 @@ static void build_name_to_generic(void)
         name_to_generic[tok].insert(g);
     }
     cs_close(&h);
+    /*
+     * ISAX_DUMP_AMBIG names the split tokens.  The bare count says a split
+     * exists but not where, and the two causes need opposite responses: a
+     * DELIBERATE fold (x86's six segment registers onto one REG_SEG bank,
+     * MIPS coprocessor registers onto one `cop<n>` token) is a modelling
+     * convention and expected, while a table error is a defect.  Telling
+     * them apart from the count alone is impossible.
+     */
     for (const auto &kv : name_to_generic)
-        if (kv.second.size() > 1) regmap_ambiguous_tokens++;
+        if (kv.second.size() > 1) {
+            regmap_ambiguous_tokens++;
+            if (getenv("ISAX_DUMP_AMBIG")) {
+                fprintf(stderr, "AMBIG %s ->", kv.first.c_str());
+                for (unsigned g : kv.second) fprintf(stderr, " %u", g);
+                fprintf(stderr, "\n");
+            }
+        }
 }
 
 /* Render a GenericRegId set into a signature-friendly list, with the

@@ -74,17 +74,24 @@ Sample, with ``wp=1,memdata=1,regdata=1`` capture flags:
    ; ----- BB 5 entry pc=0x401010 insns=9 seq=2 tid=0 asid=0 branch=taken target=0x401036 -----
    ; profile: exec_cp=1 exec_wp=0
    ; target[0]: pc=0x401036 taken_cp=1 nottaken_cp=0 taken_wp=0 nottaken_wp=0
-   0x000000401010 <blk_0+0x0>: 4c 8d 3d e9 0f 00 00     lea     %ip -> %gp13[0x402000/w8]
-   0x000000401017 <blk_0+0x7>: 4d 8b 47 60              mov     ld[%gp13](0x402060) -> %gp6[0x1360/w8]  ld=0x1360/w8  prof: memops_cp=1 pat_cp=CST_PAT_REGULAR cp=[0x402060-0x402060]
-   0x00000040101f <blk_0+0xf>: 4d 31 c8                 xor     %gp7, %gp6 -> %gp6[0x6c92/w8], %flags[0x202/w4], %mflags[-]
-   0x000000401029 <blk_0+0x19>: 4d 89 47 70              mov     %gp6 -> st[%gp13](0x402070)  st=0xc23c/w8
+   0x000000401010 <blk_0>: 4c 8d 3d e9 0f 00 00     lea     %ip -> %gp13[0x402000/w8]
+   0x000000401017 <blk_0>: 4d 8b 47 60              mov     ld[%gp13](0x402060) -> %gp6[0x1360/w8]  ld=0x1360/w8  prof: memops_cp=1 pat_cp=CST_PAT_REGULAR cp=[0x402060-0x402060]
+   0x00000040101f <blk_0>: 4d 31 c8                 xor     %gp7, %gp6 -> %gp6[0x6c92/w8], %flags[0x202/w4], %mflags[-]
+   0x000000401029 <blk_0>: 4d 89 47 70              mov     %gp6 -> st[%gp13](0x402070)  st=0xc23c/w8
    ...
 
 Per-instruction line columns:
 
 * PC, 12 hex digits zero-padded.
-* Optional ``<symbol+offset>`` annotation when the captured
-  template named the TB's owning symbol.
+* Optional ``<symbol>`` annotation when the captured template named
+  the TB's owning symbol.  It names the function the instruction is
+  in; the absolute PC beside it is the location, and there is no
+  ``+offset`` — a template carries the symbol's NAME but not its
+  base address, because the plugin API QEMU exposes
+  (``qemu_plugin_insn_symbol``) returns only the name.  Printing an
+  offset here would have to measure from the basic block rather than
+  from the symbol, which is not what ``<sym+off>`` means anywhere
+  else.
 * Raw instruction bytes from the template.
 * Generic-opcode mnemonic (``add`` / ``fmul`` / ``jmp`` / …).
 * Operand list in a fake AT&T syntax: register references print
@@ -136,7 +143,7 @@ Captured per-instruction data is folded into the operand line:
   ``CST_FID_STORE_PPAGE``) ORed with the virtual in-page offset.
   Absent for a memop with no observed translation and from every
   user-mode or non-``physaddr`` trace.
-* ``# 0x<target> <symbol+offset>`` trailing comment — the branch's
+* ``# 0x<target> <symbol>`` trailing comment — the branch's
   landing PC, decoded from the per-entry ``CST_FID_BRANCH_TAKEN`` /
   ``CST_FID_BRANCH_TARGET`` singletons (the encoded target = branch PC
   + signed displacement), with the matching symbol name when known.

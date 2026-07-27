@@ -481,7 +481,7 @@ inline const std::string *table_lookup(const std::vector<std::string> &t,
  *
  * Each architectural-instance instruction renders to a single line:
  *
- *   0x<addr> <sym+off>: <bytes...>  <mnem>   <imm/srcs> -> <dsts[v]>  ; meta
+ *   0x<addr> <sym>: <bytes...>  <mnem>   <imm/srcs> -> <dsts[v]>  ; meta
  *
  * The line is composed from a sequence of per-column emit_disasm_*
  * helpers, each appending to a shared thread_local buffer.  Layout:
@@ -563,7 +563,30 @@ constexpr int BYTES_COL_PAD      = BYTES_COL_BYTES * 3 + 4;
 constexpr int OBJDUMP_COL_WIDTH  = 40;
 constexpr int MNEM_COL_WIDTH     = 8;
 
-/* "0x<pc> [<symbol+offset>]: " */
+/* "0x<pc> [<symbol>]: "
+ *
+ * The symbol reference names the function the instruction is in; the
+ * absolute PC printed beside it is its location.  It deliberately carries
+ * NO offset.  `<sym+0x..>` is objdump's notation for "this many bytes past
+ * the symbol's address", and nothing in the trace can compute that: a
+ * template carries `symbol_name` but no symbol base, because the only
+ * symbol API QEMU exposes to a plugin (qemu_plugin_insn_symbol ->
+ * lookup_symbol) returns the name and discards the address.  What used to
+ * be printed there was the offset from the BASIC BLOCK's start_pc, so
+ * every entry's first instruction read `<sym+0x0>` — in one window
+ * 49,603 of 49,603 of them — and every later one understated the real
+ * offset by however far into the function the block began.  Printing a
+ * number in that syntax that is not that number is worse than printing
+ * none, particularly in a dump whose purpose is locating code.
+ *
+ * This also makes the prefix agree with emit_disasm_branch_target(),
+ * which has always rendered `# 0x<target> <SYM>` without an offset.
+ *
+ * Restoring a true offset needs a symbol BASE on the wire, which needs a
+ * QEMU-side API that returns one; it is not recoverable offline (the
+ * lowest start_pc seen for a symbol is a lower bound, not the base, and a
+ * partial trace would make it silently wrong in exactly the same way).
+ */
 void emit_disasm_pc_prefix(std::string &line, const cst::Instruction &insn)
 {
     line.append("0x");
@@ -571,8 +594,6 @@ void emit_disasm_pc_prefix(std::string &line, const cst::Instruction &insn)
     if (insn.bb_template && !insn.bb_template->symbol_name.empty()) {
         line.append(" <");
         line.append(insn.bb_template->symbol_name);
-        line.append("+0x");
-        append_hex(&line, insn.pc - insn.bb_template->start_pc);
         line.push_back('>');
     }
     line.append(": ");

@@ -3123,6 +3123,55 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
             }
         }
         /*
+         * `MTHC1 rt, fs` writes the UPPER half of the FP register and
+         * preserves the lower half, so the destination is also a source.
+         * The MIPS32r2 pseudocode says so literally --
+         * StoreFPR(fs, UNINTERPRETED_DOUBLEWORD,
+         *          ValueFPR(fs, UNINTERPRETED_DOUBLEWORD)_31..0 ||
+         *          GPR[rt]_31..0)
+         * -- and QEMU's translator agrees: gen_store_fpr32h() emits
+         * tcg_gen_deposit_i64(fpu_f64[reg], fpu_f64[reg], t64, 32, 32).
+         * Capstone reports the FP operand WRITE-only.
+         *
+         * This belongs to the same family as cap_mips_is_tied_dst(), and
+         * it is a member that list could not carry: that loop promotes the
+         * FIRST register operand because the family writes operand zero,
+         * while MTHC1 prints the GPR source first and the tied FP
+         * destination second.  Promoting by ACCESS rather than by position
+         * is what makes it structural -- the operand corrected is the one
+         * Capstone itself calls the destination.
+         *
+         * What it costs to omit: `mtc1 lo,$fN ; mthc1 hi,$fN` is THE way a
+         * 64-bit double is assembled from a register pair on a 32-bit
+         * MIPS, and without the read the two halves share no dependency at
+         * all -- the `mtc1` reads as a dead write and the pair is free to
+         * reorder.  (`mfhc1` is deliberately absent: it writes a whole GPR
+         * from the upper half and merges nothing.  So is `mtc1`, whose
+         * upper half the architecture leaves UNPREDICTABLE rather than
+         * preserved -- QEMU happens to deposit, but modelling a dependency
+         * the ISA does not define would invent a serialisation.  `mthc2`
+         * has the same shape on paper, but COP2 is implementation-defined
+         * and neither decoder accepts the encoding in this subtarget.)
+         *
+         * Revisit / remove when Capstone is bumped past 6.0.0; verify with
+         * `cstool -d mips32r2 0010e144` (bytes `00 10 e1 44`,
+         * `mthc1 $at, $f2`) -- fixed, $f2 (operands[1]) must show
+         * READ|WRITE instead of WRITE-only.  Use a `cstool` built from
+         * `subprojects/capstone`, not a system package; see
+         * docs/troubleshooting.rst.
+         */
+        if (insn->id == MIPS_INS_MTHC1) {
+            for (uint8_t i = 0; i < n; i++) {
+                qemu_plugin_operand *op = &out->operands[i];
+                if (op->type != QEMU_PLUGIN_OP_REG ||
+                    !(op->access & QEMU_PLUGIN_OP_ACC_WRITE)) {
+                    continue;
+                }
+                op->access |= QEMU_PLUGIN_OP_ACC_READ;
+                break;
+            }
+        }
+        /*
          * DSPControl on the four instructions that exist to move it.
          *
          * Capstone's DSP table names DSPControl on most of the ASE --

@@ -206,7 +206,6 @@ mipsel R-rd-missing cfc1 +fcsr
 mipsel R-rd-phantom cfc1 +cop#
 mipsel R-wr-missing ctc1 +fcsr
 mipsel R-wr-phantom ctc1 +cop#
-mipsel R-rd-missing mthc1 +f#
 
 # (MIPS DSP accumulators $ac1..$ac3 on the two-operand MADD/MSUB forms:
 # Capstone names only the implicit HI:LO pair.  The tracer's HI:LO chain is
@@ -431,7 +430,6 @@ mipsel M-llvm-mem-cs-none absq_s.qb load store
 mipsel M-llvm-mem-cs-none cmpgu.eq.qb load store
 mipsel M-llvm-mem-cs-none cmpu.eq.qb load store
 mipsel M-llvm-mem-cs-none insv load
-mipsel R-rd-missing mthc1 +f#
 mipsel R-rd-phantom bgezall +r#
 mipsel R-rd-phantom bgezal +r#
 mipsel R-rd-phantom bltzall +r#

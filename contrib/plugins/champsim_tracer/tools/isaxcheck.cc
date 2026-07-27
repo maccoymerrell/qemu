@@ -442,6 +442,22 @@ static std::string norm_mips(std::string r) {
         if (d.empty()) return "cop0";
         return "cop" + (d.size() > 1 ? d.substr(1) : d);
     }
+    /*
+     * The hardware registers RDHWR reads.  Capstone HAS proper
+     * MIPS_REG_HWR<n> ids -- and names them with a bare number, like every
+     * other MIPS register outside the GPR file -- so Capstone's HWR29
+     * arrives here as "29" and lands in the coprocessor namespace above.
+     * LLVM spells it "HWR29".  Folding LLVM's spelling onto the same token
+     * puts the two in the bucket Capstone's id already occupies; the
+     * generic id the fields layer resolves through it stays REG_TLS,
+     * because that is what the tracer's table says MIPS_REG_HWR29 is.
+     *
+     * $29 is the Linux thread pointer (ULR), read by every TLS access in a
+     * MIPS trace, so the alternative -- reporting the two spellings as a
+     * disagreement -- is a standing false positive on hot code.
+     */
+    if (r.compare(0, 3, "hwr") == 0 && all_digits(r.c_str() + 3))
+        return "cop" + r.substr(3);
     if (r.compare(0, 3, "fcr") == 0 || r == "fcsr") return "fcsr";
     // DSPOutFlag<n> / DSPOutFlag<a>_<b> / DSPCCond / DSPCarry are bit fields
     // of the one DSPControl register; both decoders slice it differently and
@@ -596,6 +612,23 @@ static void build_name_to_generic(void)
         std::string tok = norm_reg(nm);
         if (tok.empty()) continue;
         name_to_generic[tok].insert(g);
+        /*
+         * A register whose two decoders do not share a SPELLING still has
+         * to reach the index, or the fields layer reports
+         * FN-unmapped-llvm-reg -- "this tool cannot name the register" --
+         * which is not a finding about the tracer and hides whether the
+         * comparison would have agreed.
+         *
+         * MIPS FP control is the case: Capstone names FCR<n> with a bare
+         * number, so `cfc1 $zero, $3` indexes under `cop3` and the token
+         * `fcsr` LLVM uses for the same operand exists on neither side of
+         * the index.  The second token is added HERE, against the generic
+         * id the tracer's own table gave the Capstone id, so it stays
+         * derived rather than becoming a hand-written correspondence that
+         * would drift silently the moment that classification changed.
+         */
+        if (isa == ISA_MIPSEL && i >= MIPS_REG_FCR0 && i <= MIPS_REG_FCR31)
+            name_to_generic["fcsr"].insert(g);
     }
     cs_close(&h);
     /*
@@ -1440,10 +1473,17 @@ static void sweep_riscv(unsigned shard, unsigned nshard)
 // the `jr $ra` / `move` / `b` aliases that key off THEM are reached
 // already; rd is not, and rd = 31 is what prints JALR in its two-operand
 // form -- hence (31, 0).
+//
+// (29, 0) is RDHWR.  Its rd field is not a register at all, it SELECTS the
+// hardware register, and 29 -- the Linux thread pointer, read by every TLS
+// access in a MIPS trace -- is the only value either decoder accepts in
+// this subtarget.  Without it the instruction was not merely under-swept,
+// it was absent: every RDHWR encoding the sweep built decoded on neither
+// side, so the whole form sat outside the gate.
 static void sweep_mips(unsigned shard, unsigned nshard)
 {
     static const struct { unsigned rd, sa; } fills[] = {
-        {3, 0}, {0, 0}, {3, 1}, {0, 4}, {31, 0},
+        {3, 0}, {0, 0}, {3, 1}, {0, 4}, {31, 0}, {29, 0},
     };
     for (uint32_t i = shard; i < (1u << 22); i += nshard) {
         uint32_t op = (i >> 16) & 0x3f;

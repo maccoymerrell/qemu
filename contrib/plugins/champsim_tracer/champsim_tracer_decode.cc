@@ -386,6 +386,49 @@ static void refine_branch_type(const qemu_plugin_insn_info *info,
     case TRACE_ISA_RISCV: {
         const char *m = info->mnemonic;
         /*
+         * The C-extension HINT code points: C.ADDI with nzimm == 0, and
+         * C.SLLI / C.SRLI / C.SRAI with shamt == 0.  Capstone gives the
+         * degenerate member of each family its own mnemonic and prints the
+         * ordinary member expanded (`addi rd, rd, imm`, `slli rd, rd,
+         * shamt`), so the name alone separates them; the n_dst_regs guard
+         * is the belt to that brace.
+         *
+         * The unprivileged spec is explicit that a HINT does not modify
+         * architectural state, and Capstone already agrees on the write
+         * half: it reports no destination for any of them.  It leaves the
+         * READ on, and half a no-op is worse than either whole — a source
+         * with no destination is an instruction that waits for a producer
+         * and then delivers nothing.  The register field on a HINT is
+         * PAYLOAD, selecting which hint this is, not a value the
+         * instruction consumes; modelling it as a read fabricates a RAW
+         * edge onto an instruction that architecturally does nothing.
+         *
+         * The read is dropped here rather than at the decode boundary
+         * because clearing an operand's access bits there means something
+         * else: an operand with no flags is how the boundary says Capstone
+         * SUPPLIED no direction, which sends the whole instruction down
+         * the !have_access_info positional path in the operand walk above
+         * and turns the payload register into a DESTINATION — the opposite
+         * of the intent.
+         *
+         * Weight is zero on the correct path; no compiler emits these.
+         * The wrong path decodes arbitrary bytes, which is where an
+         * instruction with an unbalanced operand shape gets to matter.
+         */
+        if (!strcmp(m, "c.addi") || !strcmp(m, "c.slli64") ||
+            !strcmp(m, "c.srli64") || !strcmp(m, "c.srai64")) {
+            if (out->n_dst_regs == 0) {
+                for (uint8_t i = 0; i < out->n_src_regs; i++) {
+                    out->src_regs[i] = REG_NONE;
+                    if (out_names) {
+                        out_names->src_qemu_reg_keys[i] = nullptr;
+                    }
+                }
+                out->n_src_regs = 0;
+            }
+            break;
+        }
+        /*
          * Whether THIS mnemonic is one of the aliases that hides the
          * link register.  The fixup below has to key on that and not on
          * the resulting branch_type: the trap returns MRET / SRET /

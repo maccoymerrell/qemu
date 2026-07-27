@@ -115,6 +115,36 @@ riscv64 W-rd-added ret +REG_LR
 riscv64 W-wr-added jal +REG_LR
 riscv64 W-wr-added jalr +REG_LR
 
+# The C-extension HINT code points, finished.  C.ADDI with nzimm == 0 and
+# C.SLLI / C.SRLI / C.SRAI with shamt == 0 are reserved as HINTs, and the
+# unprivileged spec says a HINT does not modify architectural state.
+# Capstone agrees on the write half — it reports no destination for any of
+# them — and leaves the READ on, which describes an instruction that waits
+# for a producer and then delivers nothing.  The register field on a HINT
+# is payload, naming which hint this is, not a value it consumes, so the
+# dependency model drops the read and the code point arrives as the no-op
+# it is.  The boundary is left alone deliberately: an operand with no
+# access bits is how it says Capstone supplied no DIRECTION, which sends
+# the whole instruction down the positional fallback and would turn the
+# payload register into a destination.
+#
+# One line per register class rather than one per mnemonic, because the
+# class is what the key carries and `c.addi ra, 0` and `c.addi sp, 0` land
+# in different ones.  Correct-path weight is zero — no compiler emits these
+# — and they are reachable because the wrong path decodes arbitrary bytes.
+riscv64 W-rd-dropped c.addi -REG_FP_REG
+riscv64 W-rd-dropped c.addi -REG_GPR#
+riscv64 W-rd-dropped c.addi -REG_LR
+riscv64 W-rd-dropped c.addi -REG_SP
+riscv64 W-rd-dropped c.slli64 -REG_FP_REG
+riscv64 W-rd-dropped c.slli64 -REG_GPR#
+riscv64 W-rd-dropped c.slli64 -REG_LR
+riscv64 W-rd-dropped c.slli64 -REG_SP
+riscv64 W-rd-dropped c.srai64 -REG_FP_REG
+riscv64 W-rd-dropped c.srai64 -REG_GPR#
+riscv64 W-rd-dropped c.srli64 -REG_FP_REG
+riscv64 W-rd-dropped c.srli64 -REG_GPR#
+
 # RVV whole-register load/store.  `vl8re64.v v8, (a0)` moves EIGHT vector
 # registers and Capstone names only the base; the tracer expands the group,
 # which is what makes the dependency edges for the other seven exist.

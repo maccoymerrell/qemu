@@ -369,6 +369,11 @@ riscv64 R-rd-missing *ntl* +r#
 # RISC-V hint encodings whose architectural effect is "nothing":
 # `c.addi rd, 0`, `c.slli64`, `c.srai64`, `c.srli64` are HINTs.  Capstone
 # reports no write (correct for a hint); LLVM reports the nominal write.
+# It reports the nominal READ too, and that half the tracer does not keep:
+# the dependency model drops it so a HINT arrives as a whole no-op rather
+# than as a source with no destination.  That repair is one layer down and
+# asserted in isaxcheck_fixups.txt (`riscv64 W-rd-dropped c.addi -*`), so
+# the read still agrees HERE — this entry covers only the write.
 riscv64 R-wr-missing c.* +r#
 
 # RISC-V JAL/JALR link-register write: the alias-hidden link dataflow is

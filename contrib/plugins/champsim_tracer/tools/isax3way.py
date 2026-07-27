@@ -824,10 +824,12 @@ def main():
 
     isas = a.isa or list(ISA_ORDER)
     isaxcheck = find_isaxcheck(a.isaxcheck)
-    # Deliberately the working directory, not $TMPDIR: the objdump blobs run
-    # to tens of megabytes under --gen-rep and this project keeps bulk output
-    # off the OS disk.  Point --scratch wherever the space is.
-    scratch = a.scratch or os.path.join(os.getcwd(), '.isax3way')
+    # Deliberately not $TMPDIR: the objdump blobs run to tens of megabytes
+    # under --gen-rep and this project keeps bulk output off the OS disk.
+    # Alongside the reports when there are reports, else the working
+    # directory — which is why a run from a source tree does not leave a
+    # stray directory in it.  Point --scratch wherever the space is.
+    scratch = a.scratch or os.path.join(a.out or os.getcwd(), '.isax3way')
     os.makedirs(scratch, exist_ok=True)
     if a.out:
         os.makedirs(a.out, exist_ok=True)

@@ -143,6 +143,7 @@ FEATURES: dict[str, str] = {
     "behavior:mutation_strictness": "oracle catches deliberate trace corruption (mutation matrix)",
     "behavior:wrong_path_coverage": "static_templates=1: minted-alternate never-executed fall-through + BTB target coverage, deepened by static_depth (4-ISA)",
     "behavior:isa_crosscheck": "the decode metadata the tracer consumes (Capstone + the disas/capstone.c correction boundary) agrees with an independently maintained decoder (LLVM MC) across an exhaustive sweep of the opcode-bearing encoding space, on all four ISAs, outside a justified allowlist",
+    "behavior:implicit_operands": "the implicit operands — architectural state an instruction touches that its encoding does not name — that the decode boundary reports today are still reported, asserted per encoding against expectations derived from BEHAVIOUR rather than from any decoder (Arm's Machine Readable Architecture, the Sail RISC-V model, QEMU's MIPS TCG translator), so the class of defect where Capstone and LLVM agree and are both wrong is visible at all; each row carries a disposition and the dynamic weight of its instruction form",
     "behavior:segment_final_memops": "the segment's last body entry carries its memory operands, matching the earlier executions of the same true BB (the deferred icount/simpoint window close emits it after it has run, not before)",
     "behavior:smc_revisions": "self-modifying code: correct-path template-revision minting for rewrites that preserve OR change the block's instruction boundaries, content-signature id reuse, and the per-pc revision cap (4-ISA)",
     "behavior:bulk_mem_visible": "aarch64 FEAT_MOPS bulk transfers (SETP/SETM/SETE, CPYP/CPYM/CPYE) reach the memory instrumentation on the correct path: their recorded accesses tile the transferred range exactly instead of vanishing into the helper's host memset/memmove",
@@ -1386,6 +1387,72 @@ def _chk_isa_crosscheck(ctx: Ctx) -> Outcome:
                    "(4 ISAs, ~50 M encodings, allowlisted residual)", subs)
 
 
+def _chk_implicit_operands(ctx: Ctx) -> Outcome:
+    """Ground truth that never passed through a decoder at all.
+
+    ``features.isa_crosscheck`` above compares two decoders, which can only
+    ever see where they DISAGREE.  It therefore fails open when both move
+    together, and they do: a disassembler transcribes encodings and does not
+    model behaviour, so Capstone and LLVM share a blind spot on exactly the
+    operands that are absent from the encoding and present only in the
+    semantics.  The RVV ``v0`` mask class is the standing example — both
+    decoders agree, and both are wrong.
+
+    This check asserts AGREEMENT with expectations derived from behaviour
+    instead: Arm's Machine Readable Architecture for aarch64, the Sail
+    RISC-V model for riscv64, and QEMU's own TCG translators for mipsel,
+    where the translator is the only correct witness because the two
+    candidate substitutes (binutils' ``pinfo`` bits, the REMS Sail MIPS
+    model) share the same tied-destination error.  Each row states what must
+    be true of one encoding, so it goes red when the boundary stops
+    reporting it no matter what any other decoder does — which is what makes
+    a future Capstone bump unable to silently drop ``x30`` from a return.
+
+    Two gating modes, both cheap because neither sweeps:
+
+      assert     every row recorded OK must still be OK.
+      known-gap  every row that is neither OK nor NOT-MODELLED carries a
+                 disposition (fix / modelling-decision / wont-fix) and a
+                 justification, keyed by the whole row so a NEW member of an
+                 already-known family fails while the family stays green,
+                 and a justification standing over a gap that has since
+                 closed fails in the other direction.
+
+    Every row carries the dynamic weight its instruction FORM reached in a
+    traced population, so a reviewer ranks a finding by what it costs rather
+    than by how loud it is.
+    """
+    audit = (Path(__file__).resolve().parents[2]
+             / "tools" / "implicit_audit.py")
+    if not audit.is_file():
+        return Outcome("fail", f"implicit_audit.py missing at {audit}")
+    tool = ctx.build_dir / "contrib/plugins/isaxcheck"
+    if not tool.is_file():
+        return Outcome("fail",
+                       f"isaxcheck not built at {tool}.  It needs LLVM MC "
+                       "(llvm-18-dev or newer supplying llvm-config); the "
+                       "implicit-operand table reads the tracer's decode "
+                       "boundary through its --batch mode.")
+    subs: list = []
+    all_ok = True
+    for mode in ("assert", "known-gap"):
+        p = subprocess.run(
+            [sys.executable, str(audit), "--mode", mode,
+             "--build-dir", str(ctx.build_dir)],
+            text=True, capture_output=True, timeout=600)
+        ok = p.returncode == 0
+        all_ok = all_ok and ok
+        out = (p.stdout or "").strip().splitlines()
+        detail = "\n".join(ln[:200] for ln in out[:12])
+        if not ok and p.stderr:
+            detail += "\n" + p.stderr.strip()[:400]
+        subs.append({"name": mode, "ok": ok, "detail": detail})
+    return Outcome("pass" if all_ok else "fail",
+                   "implicit-operand assertion table vs the decode boundary "
+                   "(aarch64 MRA / riscv64 Sail / mipsel TCG translator, "
+                   "435 objdump-verified probes)", subs)
+
+
 def _chk_smc(ctx: Ctx) -> Outcome:
     """Self-modifying-code revision oracle (smc_plan.md §3).  Across all four
     ISAs, drive the SMC families whose expected revision structure is known a
@@ -1662,6 +1729,11 @@ def build_checks() -> list:
                    "decode metadata vs an independent decoder (LLVM MC), "
                    "exhaustive encoding sweep (4-ISA)",
                    ["behavior:isa_crosscheck"], _chk_isa_crosscheck))
+    C.append(Check("features.implicit_operands", "features",
+                   "implicit-operand assertion table: expectations derived "
+                   "from behaviour (MRA / Sail / TCG translators), not from "
+                   "a decoder, so the shared blind spot is visible (3-ISA)",
+                   ["behavior:implicit_operands"], _chk_implicit_operands))
     C.append(Check("features.final_entry_memops", "features",
                    "segment-final body entry keeps its memops across a "
                    "deferred icount-window close (4-ISA)",

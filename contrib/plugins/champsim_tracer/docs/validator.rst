@@ -707,6 +707,162 @@ outside the repo as standalone scripts):
    supplying ``llvm-config``).  Without it meson skips the ``isaxcheck``
    target with a warning and this check fails with that diagnosis rather
    than silently passing.
+``features.implicit_operands``
+   An *implicit* operand is architectural state an instruction touches
+   that its encoding does not name: AArch64 ``ret`` reading ``x30``,
+   RISC-V ``vmerge`` reading ``v0``, every RVV instruction reading ``vl``
+   and ``vtype``, MIPS ``c.eq.s`` writing an FCC and ``bc1t`` reading it,
+   MIPS ``ins`` reading its own destination.  Every decode defect this
+   project has found has been one of these.  This check holds a table of
+   435 objdump-verified probe encodings — 169 AArch64, 146 RISC-V, 120
+   MIPS — expanded into 1,105 rows: 1,061 per-operand assertions, plus a
+   liveness row for each probe whose whole expectation is state the model
+   does not carry or is a deliberate negative result, so that a probe
+   rotting into ``PROBE-BAD`` is caught rather than quietly leaving the
+   table.  Three properties separate it from
+   every other oracle in this battery, and they are the point of it.
+
+   **It is not derived from a decoder.**  Everything else here reads the
+   same Capstone-derived metadata the tracer consumes, so a decoder
+   defect is invisible to all of it: the trace is corrupted and the
+   oracles agree with the corruption.  The expectations in this table
+   come from sources derived from *behaviour*, never from an operand
+   list.  For ``aarch64`` that is Arm's **Machine Readable Architecture**
+   — the A64 ISA XML, read as execute-clause ASL, with tied destinations
+   found structurally (a bank indexed by the same decode variable
+   appearing on both sides of an assignment inside one execute block,
+   which is what surfaces MOVK, BFM, CAS, LDG, PACIA and the SVE
+   ``/M`` merging forms).  For ``riscv64`` it is the **Sail RISC-V
+   model**, whose ``execute`` clauses name every architectural read and
+   write explicitly, so "implicit" reduces to state the ``execute``
+   clause touches that the ``encdec`` clause does not carry;
+   ``riscv-opcodes`` supplies encodings only, since it carries no
+   semantics.  For ``mipsel`` it is **QEMU's own TCG translators**, and
+   for MIPS the translator is the only correct witness: no vendor
+   machine-readable MIPS specification exists, and both candidate
+   substitutes share the same error — binutils' ``mips-opc.c`` ``pinfo``
+   bits and the REMS Sail MIPS model each report the destinations of
+   ``movn`` / ``movz`` / ``ins`` / ``lwl`` / ``lwr`` as write-only, with
+   ``mips_regfp.sail`` conceding the gap in a comment.  A table lifted
+   from either would silently drop those read-after-write edges.
+
+   **It asserts agreement rather than detecting difference.**  A
+   comparison between two decoders can only see where they disagree, so
+   it fails open when both move together — and they do, because a
+   disassembler transcribes encodings and does not model behaviour.  The
+   RVV ``v0`` mask class is exactly that case: Capstone and LLVM agree,
+   and both are wrong.  No n-way decoder comparison, ``isa_crosscheck``
+   included, can ever see it.  Here each row states what must be true, so
+   it goes red when the boundary stops reporting it regardless of what
+   any other decoder does.  That is what makes a future Capstone bump
+   unable to silently drop ``x30`` from a return: the AArch64 ``ret``
+   row's source is the MRA, and dropping ``x30`` turns the row red on its
+   own evidence.
+
+   **It carries dynamic weight.**  Each row records the dynamic
+   instruction count its *form* reached in a traced population, so a
+   reviewer ranks a finding by what it costs: SME ZA state missing scores
+   0, ``mrs x0, tpidr_el0`` losing ``tpidr_el0`` scores 18.7 M.  The
+   weighting is by instruction **form** — the operand text with register
+   numbers and immediates wildcarded — and deliberately not by mnemonic,
+   because weighting ``ldr za[w12,0],[x0]`` by every ``ldr`` in the trace
+   is a gross over-estimate; the SME form and the ordinary load share
+   nothing but four letters.  Matching the form keeps them apart while
+   still folding across register numbers.
+
+   ``tools/implicit_audit.py`` runs three modes over
+   ``tools/implicit/<isa>.tsv``, reading the boundary through
+   ``isaxcheck --batch`` (``cap_disas_raw_detail()``, with the plugin's
+   ``include_implicit_regs`` policy modelled, so what is compared is what
+   the dependency model would actually record).  The check runs the first
+   two, both GATING, in about half a second:
+
+   ``assert``
+      Every row recorded ``OK`` must still score ``OK``.  Only the probe
+      encodings are decoded — no sweep — which is what makes it
+      affordable on every build rather than only on a Capstone bump.
+   ``known-gap``
+      Every row that is neither ``OK`` nor ``NOT-MODELLED`` carries an
+      explicit disposition — ``fix``, ``modelling-decision`` or
+      ``wont-fix`` — and a justification.  Dispositions are keyed by the
+      whole row, ``(family, hex, kind, operand)``, and never by family,
+      so a NEW member of an already-known family arrives as a row nothing
+      covers and fails while the family's existing rows stay green; the
+      mode proves that key property on itself, against a synthetic new
+      member of each known-gap family, before checking anything.  A
+      disposition standing over a gap that has since closed fails in the
+      other direction, on the same reasoning that makes an ``isaxcheck``
+      allowlist entry matching nothing a ``DEAD`` failure: a
+      justification is a claim about something that happens.
+   ``regenerate``
+      Rebuilds the table against a newer MRA, Sail model or translator
+      and prints the diff.  It writes ``<isa>.tsv.new`` beside the table
+      and never overwrites, so the reviewer sees what moved and promotes
+      it by hand; the human columns (``source``, ``disposition``,
+      ``justification``) are carried forward by row key, so regenerating
+      does not discard the reasoning attached to a gap that is still
+      open.  Run bare it re-scores the encodings the table already
+      carries, which is what a Capstone bump calls for; ``--probes``
+      names a directory of ``<isa>_probes.tsv`` from a derivation that
+      adds probes, and ``--weights`` a directory of ``<isa>.weights.tsv``
+      (``hex`` TAB dynamic count) from a fresh traced population.
+
+   A row's verdict is ``OK``, ``MISS-BOUNDARY`` (the spec and LLVM have
+   it, the boundary does not — the two-way gate could have caught this),
+   ``MISS-BOUNDARY-LLVMREJ`` (LLVM will not decode the encoding, so only
+   the spec can judge), ``MISS-BOTH`` (the shared blind spot, and the
+   reason the table exists), ``MISS-STRUCTURAL`` (the expectation names a
+   relationship a register-name set cannot express — the implied second
+   register of a CASP pair, the seven consecutive registers of an LS64
+   group, the upper half of a SIMD destination — recorded rather than
+   scored as either agreement or a blind spot, because it is neither),
+   ``NOT-MODELLED`` (state the tracer's register model deliberately does
+   not carry, so scoring it as a defect would report a modelling decision
+   as a bug), or ``PROBE-BAD`` (the encoding did not decode at all).
+
+   As it stands the table is green in both gating modes with 542 of its
+   1,105 rows scoring ``OK``, and the residual sorts into three shapes.  The largest ``fix`` class is a single defect wearing three
+   ISAs' clothes: **an instruction whose entire purpose is to move a
+   control register moves nothing at the boundary.**  AArch64 ``mrs x0,
+   tpidr_el0`` (18.7 M), ``mrs``/``msr`` of ``NZCV`` and ``FPCR``,
+   RISC-V ``csrrw``/``csrrs`` of ``fcsr`` and the vector CSRs, and MIPS
+   ``rdhwr $6,$29`` reading CP0 UserLocal (9.7 M) all report the register
+   as text or as a bare immediate and never as a register — so every TLS
+   access in an AArch64 or MIPS trace reads a value nothing appears to
+   have produced.  MIPS ``mfc0`` scoring ``OK`` on the same CP0 register
+   is what shows the boundary is capable of naming it.  The
+   ``modelling-decision`` class is dominated by state the register model
+   deliberately does not carry: cumulative FP exception status (AArch64
+   ``FPSR``, RISC-V ``fflags``, MIPS ``FCSR``), which would put the whole
+   FP stream on a serial read-modify-write chain through one register no
+   implementation renames; the LR/SC reservation and the AArch64
+   exclusive monitor, which are memory-system state a consumer models in
+   its memory model; and RISC-V ``vstart`` plus the tail/mask-undisturbed
+   ``vd`` read, which Sail itself records as not encoding-decidable —
+   whether ``vd`` is a source depends on ``vtype.vta``, ``vtype.vma`` and
+   ``vl`` versus ``VLMAX``, all written by an earlier ``vsetvl``, so a
+   per-opcode template cannot decide it without carrying ``vtype`` in its
+   key.  The ``wont-fix`` class is where the expectation is already
+   satisfied by something coarser the model does record: the AArch64
+   upper-half zeroing of a SIMD destination (25.3 M, the table's
+   heaviest row) happens inside a write of the whole architectural
+   register the boundary already reports.
+
+   One family is worth reading closely because it shows what the table
+   measures and what it does not.  RISC-V ``jal``, ``jalr`` and ``ret``
+   in their aliased forms score ``MISS-BOUNDARY`` on the link register:
+   Capstone hides ``ra`` completely, in neither the operand list nor the
+   (always empty for RISC-V) implicit register arrays, and those three
+   rows carry the three heaviest weights in the RISC-V table — 500 M,
+   448 M, 128 M.  The trace is nonetheless correct, because the plugin
+   restores the link register *above* this boundary, in
+   ``refine_branch_type()`` (``champsim_tracer_decode.cc``), which adds
+   ``REG_LR`` as a destination to a call that decoded with none and as a
+   source to a return that decoded with none.  A decoded ``ret`` in a
+   real trace reads ``%lr``.  The rows are carried as
+   ``modelling-decision`` with that reasoning attached, and they are the
+   standing reminder that this table's subject is the decode boundary,
+   not the whole decode path.
 ``features.smc``
    Self-modifying code: revision minting, content-signature id
    reuse, and the per-pc revision cap, across four ISAs and nine SMC

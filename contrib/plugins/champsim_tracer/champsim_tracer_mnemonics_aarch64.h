@@ -279,22 +279,22 @@ static const RegClassification aarch64_reg_class[AARCH64_REG_ENDING] = {
     [AARCH64_REG_P13] = { .reg_id = REG_PRED13, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.sve", .name = "p13" } },  /* p13 */
     [AARCH64_REG_P14] = { .reg_id = REG_PRED14, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.sve", .name = "p14" } },  /* p14 */
     [AARCH64_REG_P15] = { .reg_id = REG_PRED15, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.sve", .name = "p15" } },  /* p15 */
-    [AARCH64_REG_PN0] = { .reg_id = REG_PRED16 },  /* pn0 */
-    [AARCH64_REG_PN1] = { .reg_id = REG_PRED17 },  /* pn1 */
-    [AARCH64_REG_PN2] = { .reg_id = REG_PRED18 },  /* pn2 */
-    [AARCH64_REG_PN3] = { .reg_id = REG_PRED19 },  /* pn3 */
-    [AARCH64_REG_PN4] = { .reg_id = REG_PRED20 },  /* pn4 */
-    [AARCH64_REG_PN5] = { .reg_id = REG_PRED21 },  /* pn5 */
-    [AARCH64_REG_PN6] = { .reg_id = REG_PRED22 },  /* pn6 */
-    [AARCH64_REG_PN7] = { .reg_id = REG_PRED23 },  /* pn7 */
-    [AARCH64_REG_PN8] = { .reg_id = REG_PRED24 },  /* pn8 */
-    [AARCH64_REG_PN9] = { .reg_id = REG_PRED25 },  /* pn9 */
-    [AARCH64_REG_PN10] = { .reg_id = REG_PRED26 },  /* pn10 */
-    [AARCH64_REG_PN11] = { .reg_id = REG_PRED27 },  /* pn11 */
-    [AARCH64_REG_PN12] = { .reg_id = REG_PRED28 },  /* pn12 */
-    [AARCH64_REG_PN13] = { .reg_id = REG_PRED29 },  /* pn13 */
-    [AARCH64_REG_PN14] = { .reg_id = REG_PRED30 },  /* pn14 */
-    [AARCH64_REG_PN15] = { .reg_id = REG_PRED31 },  /* pn15 */
+    [AARCH64_REG_PN0] = { .reg_id = REG_PRED0 },  /* pn0 */
+    [AARCH64_REG_PN1] = { .reg_id = REG_PRED1 },  /* pn1 */
+    [AARCH64_REG_PN2] = { .reg_id = REG_PRED2 },  /* pn2 */
+    [AARCH64_REG_PN3] = { .reg_id = REG_PRED3 },  /* pn3 */
+    [AARCH64_REG_PN4] = { .reg_id = REG_PRED4 },  /* pn4 */
+    [AARCH64_REG_PN5] = { .reg_id = REG_PRED5 },  /* pn5 */
+    [AARCH64_REG_PN6] = { .reg_id = REG_PRED6 },  /* pn6 */
+    [AARCH64_REG_PN7] = { .reg_id = REG_PRED7 },  /* pn7 */
+    [AARCH64_REG_PN8] = { .reg_id = REG_PRED8 },  /* pn8 */
+    [AARCH64_REG_PN9] = { .reg_id = REG_PRED9 },  /* pn9 */
+    [AARCH64_REG_PN10] = { .reg_id = REG_PRED10 },  /* pn10 */
+    [AARCH64_REG_PN11] = { .reg_id = REG_PRED11 },  /* pn11 */
+    [AARCH64_REG_PN12] = { .reg_id = REG_PRED12 },  /* pn12 */
+    [AARCH64_REG_PN13] = { .reg_id = REG_PRED13 },  /* pn13 */
+    [AARCH64_REG_PN14] = { .reg_id = REG_PRED14 },  /* pn14 */
+    [AARCH64_REG_PN15] = { .reg_id = REG_PRED15 },  /* pn15 */
     [AARCH64_REG_Q0] = { .reg_id = REG_VEC0, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.fpu", .name = "v0" } },  /* q0 */
     [AARCH64_REG_Q1] = { .reg_id = REG_VEC1, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.fpu", .name = "v1" } },  /* q1 */
     [AARCH64_REG_Q2] = { .reg_id = REG_VEC2, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.fpu", .name = "v2" } },  /* q2 */
@@ -388,8 +388,8 @@ static const RegClassification aarch64_reg_class[AARCH64_REG_ENDING] = {
     [AARCH64_REG_W26] = { .reg_id = REG_GPR26, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.core", .name = "x26" } },  /* w26 */
     [AARCH64_REG_W27] = { .reg_id = REG_GPR27, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.core", .name = "x27" } },  /* w27 */
     [AARCH64_REG_W28] = { .reg_id = REG_GPR28, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.core", .name = "x28" } },  /* w28 */
-    [AARCH64_REG_W29] = { .reg_id = REG_GPR29, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.core", .name = "x29" } },  /* w29 */
-    [AARCH64_REG_W30] = { .reg_id = REG_GPR30, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.core", .name = "x30" } },  /* w30 */
+    [AARCH64_REG_W29] = { .reg_id = REG_FP_REG, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.core", .name = "x29" } },  /* w29 */
+    [AARCH64_REG_W30] = { .reg_id = REG_LR, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.core", .name = "x30" } },  /* w30 */
     [AARCH64_REG_X0] = { .reg_id = REG_GPR0, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.core", .name = "x0" } },  /* x0 */
     [AARCH64_REG_X1] = { .reg_id = REG_GPR1, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.core", .name = "x1" } },  /* x1 */
     [AARCH64_REG_X2] = { .reg_id = REG_GPR2, .qemu_reg = { .feature = "org.gnu.gdb.aarch64.core", .name = "x2" } },  /* x2 */
@@ -703,7 +703,7 @@ static const RegClassification aarch64_reg_class[AARCH64_REG_ENDING] = {
     [AARCH64_REG_X16_X17_X18_X19_X20_X21_X22_X23] = { .reg_id = REG_GPR16, .n_regs = 8, .regs = { REG_GPR16, REG_GPR17, REG_GPR18, REG_GPR19, REG_GPR20, REG_GPR21, REG_GPR22, REG_GPR23 } },  /* x16_x17_x18_x19_x20_x21_x22_x23 */
     [AARCH64_REG_X18_X19_X20_X21_X22_X23_X24_X25] = { .reg_id = REG_GPR18, .n_regs = 8, .regs = { REG_GPR18, REG_GPR19, REG_GPR20, REG_GPR21, REG_GPR22, REG_GPR23, REG_GPR24, REG_GPR25 } },  /* x18_x19_x20_x21_x22_x23_x24_x25 */
     [AARCH64_REG_X20_X21_X22_X23_X24_X25_X26_X27] = { .reg_id = REG_GPR20, .n_regs = 8, .regs = { REG_GPR20, REG_GPR21, REG_GPR22, REG_GPR23, REG_GPR24, REG_GPR25, REG_GPR26, REG_GPR27 } },  /* x20_x21_x22_x23_x24_x25_x26_x27 */
-    [AARCH64_REG_W30_WZR] = { .reg_id = REG_GPR30, .n_regs = 2, .regs = { REG_GPR30, REG_ZERO } },  /* w30_wzr */
+    [AARCH64_REG_W30_WZR] = { .reg_id = REG_LR, .n_regs = 2, .regs = { REG_LR, REG_ZERO } },  /* w30_wzr */
     [AARCH64_REG_W0_W1] = { .reg_id = REG_GPR0, .n_regs = 2, .regs = { REG_GPR0, REG_GPR1 } },  /* w0_w1 */
     [AARCH64_REG_W2_W3] = { .reg_id = REG_GPR2, .n_regs = 2, .regs = { REG_GPR2, REG_GPR3 } },  /* w2_w3 */
     [AARCH64_REG_W4_W5] = { .reg_id = REG_GPR4, .n_regs = 2, .regs = { REG_GPR4, REG_GPR5 } },  /* w4_w5 */
@@ -718,7 +718,7 @@ static const RegClassification aarch64_reg_class[AARCH64_REG_ENDING] = {
     [AARCH64_REG_W22_W23] = { .reg_id = REG_GPR22, .n_regs = 2, .regs = { REG_GPR22, REG_GPR23 } },  /* w22_w23 */
     [AARCH64_REG_W24_W25] = { .reg_id = REG_GPR24, .n_regs = 2, .regs = { REG_GPR24, REG_GPR25 } },  /* w24_w25 */
     [AARCH64_REG_W26_W27] = { .reg_id = REG_GPR26, .n_regs = 2, .regs = { REG_GPR26, REG_GPR27 } },  /* w26_w27 */
-    [AARCH64_REG_W28_W29] = { .reg_id = REG_GPR28, .n_regs = 2, .regs = { REG_GPR28, REG_GPR29 } },  /* w28_w29 */
+    [AARCH64_REG_W28_W29] = { .reg_id = REG_GPR28, .n_regs = 2, .regs = { REG_GPR28, REG_FP_REG } },  /* w28_w29 */
     [AARCH64_REG_LR_XZR] = { .reg_id = REG_LR, .n_regs = 2, .regs = { REG_LR, REG_ZERO } },  /* lr_xzr */
     [AARCH64_REG_X28_FP] = { .reg_id = REG_GPR28, .n_regs = 2, .regs = { REG_GPR28, REG_FP_REG } },  /* x28_fp */
     [AARCH64_REG_X0_X1] = { .reg_id = REG_GPR0, .n_regs = 2, .regs = { REG_GPR0, REG_GPR1 } },  /* x0_x1 */

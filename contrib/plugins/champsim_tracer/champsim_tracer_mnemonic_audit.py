@@ -1883,6 +1883,25 @@ def classify_x86_reg(name: str) -> RegEntry:
     return reg_none()
 
 
+def aarch64_gpr(num: int) -> str:
+    """One generic ID per architectural GPR, whichever way it is spelled.
+
+    Capstone names x29 and x30 as FP and LR in the 64-bit view and as W29
+    and W30 in the 32-bit one.  They are one register each: `mov w30, w0`
+    writes exactly what `ret` reads.  Classifying the two spellings apart
+    put the write on REG_GPR30 and the read on REG_LR and left no
+    dependency edge between them at all, which is the same severance as a
+    dropped operand and harder to see.  The semantic IDs win over the
+    numeric ones, because a consumer driving a return-address stack keys
+    on REG_LR.
+    """
+    if num == 29:
+        return "REG_FP_REG"
+    if num == 30:
+        return "REG_LR"
+    return numbered("REG_GPR", num)
+
+
 def classify_aarch64_reg(name: str) -> RegEntry:
     if name in {"X_LANE", "Y_LANE"}:
         return reg_none()
@@ -1906,8 +1925,16 @@ def classify_aarch64_reg(name: str) -> RegEntry:
         return reg_ent("REG_MATRIX")
     if re.fullmatch(r"P\d+", name):
         return reg_ent(numbered("REG_PRED", int(name[1:])))
+    # PN<n> is the predicate-as-counter VIEW of predicate register P<n>
+    # (SVE2.1 / SME2), not a seventeenth-to-thirty-second predicate
+    # register: AArch64 has one 16-entry predicate file and these
+    # instructions reinterpret its contents.  Giving the two views
+    # separate IDs meant a `ptrue p8.b` and the `pext ..., pn8[0]` that
+    # consumes it recorded no edge.  disas/capstone.c and isaxcheck's
+    # normaliser both already state the aliasing; this is the table
+    # agreeing with them.
     if re.fullmatch(r"PN\d+", name):
-        return reg_ent(numbered("REG_PRED", 16 + int(name[2:])))
+        return reg_ent(numbered("REG_PRED", int(name[2:])))
     if name.startswith("P") and "_" in name:
         regs = reg_names_from_tokens(name, "P", "REG_PRED")
         return reg_ent(regs[0], regs) if regs else reg_none()
@@ -1917,7 +1944,7 @@ def classify_aarch64_reg(name: str) -> RegEntry:
         regs = reg_names_from_tokens(name, name[0], "REG_VEC")
         return reg_ent(regs[0], regs) if regs else reg_none()
     if re.fullmatch(r"W\d+", name) or re.fullmatch(r"X\d+", name):
-        return reg_ent(numbered("REG_GPR", first_number(name) or 0))
+        return reg_ent(aarch64_gpr(first_number(name) or 0))
     if name.startswith(("W", "X")) and "_" in name:
         regs: list[str] = []
         for token in name.split("_"):
@@ -1926,7 +1953,7 @@ def classify_aarch64_reg(name: str) -> RegEntry:
             elif token in {"LR", "XZR", "WZR"}:
                 reg = "REG_LR" if token == "LR" else "REG_ZERO"
             elif re.fullmatch(r"[WX]\d+", token):
-                reg = numbered("REG_GPR", first_number(token) or 0)
+                reg = aarch64_gpr(first_number(token) or 0)
             else:
                 reg = None
             if reg and reg not in regs:

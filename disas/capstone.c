@@ -1375,38 +1375,6 @@ static bool cap_aarch64_is_mops_set(const char *mnem)
 }
 
 /*
- * FEAT_MOPS prologue: the half of the P -> M -> E chain Capstone drops.
- *
- * A bulk copy or set is three instructions that hand state to each other
- * through PSTATE.NZCV — the prologue records how much of the operation
- * it performed and which direction it chose, and the main and epilogue
- * forms resume from that.  Capstone reports the prologue's NZCV WRITE
- * and the main/epilogue forms' NZCV READ, but not the prologue's own
- * read: the MRA's SETP and CPYP pseudocode consults PSTATE.NZCV to tell
- * a fresh start from a re-entry after an interrupt, so the P form reads
- * the register it then rewrites.
- *
- * Without it the prologue looks like a pure producer, and a re-executed
- * P form — which is exactly what happens when the operation is
- * interrupted and restarted — appears independent of the state that
- * says how far it already got.  glibc's memcpy() and memset() use these
- * whenever HWCAP2_MOPS is present, so this is 3.2 M executions in the
- * survey population, not a corner.
- *
- * The prologue mnemonics are CPYP / CPYFP / SETP / SETGP and their
- * suffixed variants (…wn, …rn, …n, …t, …tn).  SETF8 / SETF16 share the
- * "set" stem but are FEAT_FlagM2 flag-setters with no MOPS chain, and
- * are excluded by requiring the "p" that names the prologue.
- */
-static bool cap_aarch64_is_mops_prologue(const char *mnem)
-{
-    return g_str_has_prefix(mnem, "cpyp") ||
-           g_str_has_prefix(mnem, "cpyfp") ||
-           g_str_has_prefix(mnem, "setp") ||
-           g_str_has_prefix(mnem, "setgp");
-}
-
-/*
  * FP forms whose FPCR read Capstone reports on their siblings and not
  * on them.
  *
@@ -1962,18 +1930,13 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
      * docs/troubleshooting.rst.
      */
     /*
-     * The FEAT_MOPS prologue's own NZCV read (see
-     * cap_aarch64_is_mops_prologue) and the FPCR read Capstone reports
-     * on these forms' siblings but not on them (see
-     * cap_aarch64_reads_fpcr_unreported).  Both are architectural facts
-     * from the MRA rather than version-specific Capstone defects, so
-     * neither is conditional on a Capstone revision; both add only when
+     * The FPCR read Capstone reports on these forms' siblings but not on
+     * them (see cap_aarch64_reads_fpcr_unreported) is an architectural
+     * fact from the MRA rather than a version-specific Capstone defect,
+     * so it is not conditional on a Capstone revision; it adds only when
      * the register is not already listed, so a Capstone that starts
-     * reporting them cannot double-count.
+     * reporting it cannot double-count.
      */
-    if (cap_aarch64_is_mops_prologue(insn->mnemonic)) {
-        cap_aarch64_add_implicit_read(out, handle, AARCH64_REG_NZCV);
-    }
     if (cap_aarch64_reads_fpcr_unreported(insn->mnemonic)) {
         cap_aarch64_add_implicit_read(out, handle, AARCH64_REG_FPCR);
     }

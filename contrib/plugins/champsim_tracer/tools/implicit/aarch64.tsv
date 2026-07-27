@@ -128,7 +128,6 @@ mops_cpym	4004411d	cpym [x0]!, [x1]!, x2!	WRITE	x0	MRA	OK	3209184	-	-
 mops_cpym	4004411d	cpym [x0]!, [x1]!, x2!	WRITE	x1	MRA	OK	3209184	-	-
 mops_cpym	4004411d	cpym [x0]!, [x1]!, x2!	WRITE	x2	MRA	OK	3209184	-	-
 mops_cpyp	4004011d	cpyp [x0]!, [x1]!, x2!	READ	<tied-dst>	MRA	OK	3209184	-	-
-mops_cpyp	4004011d	cpyp [x0]!, [x1]!, x2!	READ	nzcv	MRA	OK	3209184	-	-
 mops_cpyp	4004011d	cpyp [x0]!, [x1]!, x2!	WRITE	nzcv	MRA	OK	3209184	-	-
 mops_cpyp	4004011d	cpyp [x0]!, [x1]!, x2!	WRITE	x0	MRA	OK	3209184	-	-
 mops_cpyp	4004011d	cpyp [x0]!, [x1]!, x2!	WRITE	x1	MRA	OK	3209184	-	-
@@ -143,7 +142,6 @@ mops_setm	2044c219	setm [x0]!, x1!, x2	READ	nzcv	MRA	OK	1724716	-	-
 mops_setm	2044c219	setm [x0]!, x1!, x2	WRITE	x0	MRA	OK	1724716	-	-
 mops_setm	2044c219	setm [x0]!, x1!, x2	WRITE	x1	MRA	OK	1724716	-	-
 mops_setp	2004c219	setp [x0]!, x1!, x2	READ	<tied-dst>	MRA	OK	1724716	-	-
-mops_setp	2004c219	setp [x0]!, x1!, x2	READ	nzcv	MRA	OK	1724716	-	-
 mops_setp	2004c219	setp [x0]!, x1!, x2	WRITE	nzcv	MRA	OK	1724716	-	-
 mops_setp	2004c219	setp [x0]!, x1!, x2	WRITE	x0	MRA	OK	1724716	-	-
 mops_setp	2004c219	setp [x0]!, x1!, x2	WRITE	x1	MRA	OK	1724716	-	-
@@ -204,7 +202,6 @@ ldsetal	4130e0f8	ldsetal x0, x1, [x2]	-	-	MRA	OK	0	-	-
 ldsmax	414020f8	ldsmax x0, x1, [x2]	-	-	MRA	OK	0	-	-
 lse128_swpp	40802119	swpp x0, x1, [x2]	READ	<tied-dst>	MRA	OK	0	-	-
 mops_setgp	2004c21d	setgp [x0]!, x1!, x2	READ	<tied-dst>	MRA	OK	0	-	-
-mops_setgp	2004c21d	setgp [x0]!, x1!, x2	READ	nzcv	MRA	OK	0	-	-
 mops_setgp	2004c21d	setgp [x0]!, x1!, x2	WRITE	nzcv	MRA	OK	0	-	-
 mops_setgp	2004c21d	setgp [x0]!, x1!, x2	WRITE	x0	MRA	OK	0	-	-
 mops_setgp	2004c21d	setgp [x0]!, x1!, x2	WRITE	x1	MRA	OK	0	-	-

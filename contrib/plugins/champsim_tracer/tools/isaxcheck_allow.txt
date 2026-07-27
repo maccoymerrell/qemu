@@ -2249,50 +2249,6 @@ aarch64 R-rd-phantom uqxtn2 +fpcr
 aarch64 R-rd-phantom uqxtnb +fpcr
 aarch64 R-rd-phantom uqxtnt +fpcr
 
-# AArch64 FEAT_MOPS NZCV: the CPYFP / CPYP / SETP prologue reads NZCV, and
-# it is the ONLY register edge tying a P -> M -> E chain together.  The
-# implicit table carried these at 3.2 M and 1.7 M dynamic weight and scored
-# them `fix` until the repair landed.  LLVM models no NZCV use on them.
-aarch64 R-rd-phantom cpyfp +nzcv
-aarch64 R-rd-phantom cpyfpn +nzcv
-aarch64 R-rd-phantom cpyfprn +nzcv
-aarch64 R-rd-phantom cpyfprt +nzcv
-aarch64 R-rd-phantom cpyfprtn +nzcv
-aarch64 R-rd-phantom cpyfprtrn +nzcv
-aarch64 R-rd-phantom cpyfprtwn +nzcv
-aarch64 R-rd-phantom cpyfpt +nzcv
-aarch64 R-rd-phantom cpyfptn +nzcv
-aarch64 R-rd-phantom cpyfptrn +nzcv
-aarch64 R-rd-phantom cpyfptwn +nzcv
-aarch64 R-rd-phantom cpyfpwn +nzcv
-aarch64 R-rd-phantom cpyfpwt +nzcv
-aarch64 R-rd-phantom cpyfpwtn +nzcv
-aarch64 R-rd-phantom cpyfpwtrn +nzcv
-aarch64 R-rd-phantom cpyfpwtwn +nzcv
-aarch64 R-rd-phantom cpyp +nzcv
-aarch64 R-rd-phantom cpypn +nzcv
-aarch64 R-rd-phantom cpyprn +nzcv
-aarch64 R-rd-phantom cpyprt +nzcv
-aarch64 R-rd-phantom cpyprtn +nzcv
-aarch64 R-rd-phantom cpyprtrn +nzcv
-aarch64 R-rd-phantom cpyprtwn +nzcv
-aarch64 R-rd-phantom cpypt +nzcv
-aarch64 R-rd-phantom cpyptn +nzcv
-aarch64 R-rd-phantom cpyptrn +nzcv
-aarch64 R-rd-phantom cpyptwn +nzcv
-aarch64 R-rd-phantom cpypwn +nzcv
-aarch64 R-rd-phantom cpypwt +nzcv
-aarch64 R-rd-phantom cpypwtn +nzcv
-aarch64 R-rd-phantom cpypwtrn +nzcv
-aarch64 R-rd-phantom cpypwtwn +nzcv
-aarch64 R-rd-phantom setgp +nzcv
-aarch64 R-rd-phantom setgpn +nzcv
-aarch64 R-rd-phantom setgpt +nzcv
-aarch64 R-rd-phantom setgptn +nzcv
-aarch64 R-rd-phantom setp +nzcv
-aarch64 R-rd-phantom setpn +nzcv
-aarch64 R-rd-phantom setpt +nzcv
-aarch64 R-rd-phantom setptn +nzcv
 
 # The general system-register space (REG_SYS): AArch64 MRS/MSR/MRRS/MSRR and
 # the RISC-V Zicsr accesses.  The boundary reports the register the

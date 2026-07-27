@@ -2515,6 +2515,15 @@ static uint64_t g_alt_mint_budget_used = 0;
  * an unterminated cap/edge stop) and *out_taken to the terminal
  * direct-branch's decoded target (0 if none).  Takes NO lock (pure guest
  * read + decode).
+ *
+ * @fscratch / @nscratch are the CALLER-OWNED per-instruction decode backing.
+ * InsnFields is a struct of SPANS (champsim_tracer_mnemonics.h) — its
+ * register arrays and every dep/lane mask live in the InsnFieldsScratch that
+ * produced them — so one scratch per instruction is required (a shared one
+ * leaves all N entries pointing at the last instruction decoded), and it must
+ * outlive commit_alt_bb's pack, which is what deep-copies out of it.  Held by
+ * unique_ptr so growing the pool cannot move an already-wired element: the
+ * scratch types are self-referential and must never be relocated.
  */
 static uint32_t alt_decode_one_bb(uint64_t pc,
                                   std::vector<uint64_t> &pcs,
@@ -2522,6 +2531,10 @@ static uint32_t alt_decode_one_bb(uint64_t pc,
                                   std::vector<InsnRegNames> &regnames,
                                   std::vector<uint8_t> &sizes,
                                   std::vector<uint8_t> &bytes,
+                                  std::vector<std::unique_ptr<
+                                      InsnFieldsScratch>> &fscratch,
+                                  std::vector<std::unique_ptr<
+                                      InsnRegNamesScratch>> &nscratch,
                                   bool with_names,
                                   uint64_t *out_ft,
                                   uint64_t *out_taken)
@@ -2551,9 +2564,6 @@ static uint32_t alt_decode_one_bb(uint64_t pc,
         return *avail > 0;
     };
 
-    InsnFieldsScratch   fs;
-    InsnRegNamesScratch ns;
-
     /* Decode the insn at @at into slot @i; returns bytes consumed (0 on
      * failure) and reports the branch type in @out_bt. */
     auto decode_one = [&](uint64_t at, uint32_t i, uint8_t *out_bt,
@@ -2572,12 +2582,22 @@ static uint32_t alt_decode_one_bb(uint64_t pc,
         if (sz == 0 || sz > MAX_INSN_BYTES || sz > avail) {
             return 0;
         }
-        insn_fields_scratch_reset(&fs);
-        if (with_names) {
-            insn_reg_names_scratch_reset(&ns);
+        /* Grow the caller's pool to cover slot @i.  Growth appends
+         * unique_ptrs, so no already-decoded element moves. */
+        while (fscratch.size() <= i) {
+            fscratch.push_back(std::make_unique<InsnFieldsScratch>());
         }
-        decode_detail_to_generic(at, &info, &fs.f, with_names ? &ns.rn
-                                                              : nullptr);
+        InsnFieldsScratch &fs = *fscratch[i];
+        insn_fields_scratch_reset(&fs);
+        InsnRegNamesScratch *ns = nullptr;
+        if (with_names) {
+            while (nscratch.size() <= i) {
+                nscratch.push_back(std::make_unique<InsnRegNamesScratch>());
+            }
+            ns = nscratch[i].get();
+            insn_reg_names_scratch_reset(ns);
+        }
+        decode_detail_to_generic(at, &info, &fs.f, ns ? &ns->rn : nullptr);
         uint8_t bt = fs.f.branch_type;
         pcs[i]   = at;
         sizes[i] = sz;
@@ -2586,9 +2606,12 @@ static uint32_t alt_decode_one_bb(uint64_t pc,
             memset(&bytes[(size_t)i * MAX_INSN_BYTES + sz], 0,
                    MAX_INSN_BYTES - sz);
         }
+        /* Shallow copy of the descriptor: its spans stay pointed at
+         * fscratch[i] / nscratch[i], which the caller keeps alive across
+         * commit_alt_bb. */
         fields[i] = fs.f;
         if (with_names) {
-            regnames[i] = ns.rn;
+            regnames[i] = ns->rn;
         }
         *out_bt = bt;
         *out_dslot = (delay_isa && bt != BRANCH_NONE &&
@@ -2626,6 +2649,12 @@ static uint32_t alt_decode_one_bb(uint64_t pc,
              bt == BRANCH_DIRECT_CALL) &&
             fields[branch_idx].has_immediate) {
             *out_taken = (uint64_t)fields[branch_idx].immediate;
+            /* The executed path stamps this from the per-ISA translator
+             * (create_tb_template); a never-executed block has no
+             * translation, so the decoded immediate IS its static target.
+             * Leaving it zero is what made a minted branch's declared
+             * target readable only at template level. */
+            fields[branch_idx].taken_target_pc = *out_taken;
         }
         sealed = true;
         break;
@@ -2676,10 +2705,9 @@ static bool altmint_one(uint64_t pc, uint64_t *out_ft, uint64_t *out_taken)
 
     const bool with_names = g_features.reg_data || g_features.wp_reg_data;
 
-    /* Per-BB scratch (plain locals; a mint is rare after warmup — misses
-     * trend to zero — so a fresh allocation here keeps these large buffers
-     * out of the plugin's static TLS block).  fscratch/nscratch back the
-     * span copies inside build_bb_template's pack, which deep-copies. */
+    /* Per-BB descriptor arrays (plain locals; a mint is rare after warmup —
+     * misses trend to zero — so a fresh allocation here keeps these buffers
+     * out of the plugin's static TLS block). */
     std::vector<uint64_t>      pcs(CST_ALT_BB_MAX_INSNS);
     std::vector<InsnFields>    fields(CST_ALT_BB_MAX_INSNS);
     std::vector<InsnRegNames>  regnames(CST_ALT_BB_MAX_INSNS);
@@ -2687,13 +2715,34 @@ static bool altmint_one(uint64_t pc, uint64_t *out_ft, uint64_t *out_taken)
     std::vector<uint8_t>       bytes((size_t)CST_ALT_BB_MAX_INSNS *
                                      MAX_INSN_BYTES);
 
+    /* Per-INSTRUCTION decode backing, one scratch per slot.  It is the
+     * register identities and every dep/lane mask — an InsnFields carries
+     * those as spans into the scratch that built them (SPAN MEMBERS,
+     * champsim_tracer_mnemonics.h), so the descriptors above are only as
+     * good as the scratch they point at.  Grown on demand and reused
+     * across mints rather than sized to CST_ALT_BB_MAX_INSNS: a full-cap
+     * preallocation would be tens of MB zeroed per mint, and a true BB is
+     * a few instructions long.  Held by unique_ptr because the scratch
+     * types are self-referential and must never be relocated; kept alive
+     * until after commit_alt_bb, which is where the pack deep-copies.
+     *
+     * Plain locals, deliberately NOT thread_local: the plugin is dlopen'd
+     * and its static TLS block is already within ~80 bytes of glibc's
+     * static-TLS surplus, so even an empty thread_local vector here makes
+     * every guest refuse to load the plugin ("cannot allocate memory in
+     * static TLS block").  A mint is rare after warmup and this function
+     * already allocates its descriptor arrays per call. */
+    std::vector<std::unique_ptr<InsnFieldsScratch>>   fscratch;
+    std::vector<std::unique_ptr<InsnRegNamesScratch>> nscratch;
+
     uint64_t ft = 0, taken = 0;
     /* The guest read + decode runs WITHOUT data_lock: the probing read takes
      * the mmap_lock (user) / walks the page table (system), and the
      * translation path holds mmap_lock before data_lock — holding data_lock
      * across the read would invert that order. */
     uint32_t n = alt_decode_one_bb(pc, pcs, fields, regnames, sizes,
-                                   bytes, with_names, &ft, &taken);
+                                   bytes, fscratch, nscratch,
+                                   with_names, &ft, &taken);
     if (n == 0) {
         g_alt_mint.skips_unmapped++;   /* unmapped page or undecodable head */
         return false;

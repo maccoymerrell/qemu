@@ -2007,12 +2007,27 @@ def classify_mips_reg(name: str) -> RegEntry:
         return reg_ent(numbered("REG_ACC", int(match.group(1)) % 4))
     if stem.startswith("FCR"):
         return reg_ent("REG_FCSR")
+    # Hardware register 29 is CP0 UserLocal, the MIPS thread pointer, and
+    # the only CP0 word user code reads directly (through rdhwr).  On
+    # REG_SYS every TLS access would share a slot with the entire CP0
+    # population, so it gets the same REG_TLS the AArch64 TPIDR_EL0 does.
+    if stem == "HWR29":
+        return reg_ent("REG_TLS")
     if stem.startswith(("HWR", "COP")):
         return reg_ent("REG_SYS")
+    # DSPControl is ONE architectural register: its condition, carry,
+    # outflag, pos, scount and EFI fields are fields of the same word.
+    # Splitting them across REG_FLAGS and REG_VCTRL aliased them onto
+    # arithmetic condition flags and MSA vector control respectively --
+    # two populations DSPControl has no relationship with.
     if stem.startswith("DSP"):
-        return reg_ent("REG_FLAGS" if "COND" in stem or "CARRY" in stem or "OUTFLAG" in stem else "REG_VCTRL")
+        return reg_ent("REG_DSPCTRL")
+    # MSA control and status.  Distinct from REG_VCTRL, which on the
+    # other vector ISA carries the RISC-V vl/vtype configuration; MSACSR
+    # is the MSA rounding mode and exception status, and it is the only
+    # MSA control register any instruction reaches.
     if stem.startswith("MSA"):
-        return reg_ent("REG_VCTRL")
+        return reg_ent("REG_MSACSR")
     return reg_none()
 
 

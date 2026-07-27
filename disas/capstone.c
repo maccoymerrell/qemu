@@ -2377,6 +2377,67 @@ static uint8_t cap_riscv_csr_access(const cs_insn *insn)
 }
 
 /*
+ * MIPS accumulator read-modify-write family.
+ *
+ * A multiply-accumulate adds its product to what the accumulator
+ * already holds -- QEMU's DP_NOFUNC_PH and its siblings read
+ * env->active_tc.HI[ac] / LO[ac] before writing them back -- so the
+ * accumulator is a source as well as the destination.  Capstone gets
+ * this right for the base-MIPS forms that leave the accumulator
+ * implicit (`madd $4, $5` reports ac0 in both lists) and wrong for
+ * every form that NAMES the accumulator, which is all of DSP: `madd
+ * $ac2, $4, $5` reports the write and drops the read, so a
+ * multiply-accumulate loop's carried dependency -- the whole point of
+ * the instruction -- does not exist.
+ *
+ * SHILO and MTHLIP are the same shape without the multiply: they shift
+ * the accumulator's current contents, so they read what they write.
+ *
+ * The mnemonic test is deliberately paired with a structural one at the
+ * use site (the operand must actually name an accumulator register), so
+ * the FP fused forms `madd.s` / `msub.d`, which share the stem but
+ * write an FP register, cannot match.
+ */
+static bool cap_mips_is_acc_rmw(const char *mnem)
+{
+    return g_str_has_prefix(mnem, "madd")  || g_str_has_prefix(mnem, "msub") ||
+           g_str_has_prefix(mnem, "dpa")   || g_str_has_prefix(mnem, "dps")  ||
+           g_str_has_prefix(mnem, "maq")   || g_str_has_prefix(mnem, "mulsa") ||
+           g_str_has_prefix(mnem, "shilo") || g_str_has_prefix(mnem, "mthlip");
+}
+
+static bool cap_mips_is_acc_reg(uint16_t reg)
+{
+    return (reg >= MIPS_REG_AC0 && reg <= MIPS_REG_AC3) ||
+           (reg >= MIPS_REG_HI0 && reg <= MIPS_REG_HI3) ||
+           (reg >= MIPS_REG_LO0 && reg <= MIPS_REG_LO3);
+}
+
+/* Append @reg to the implicit write (@is_write) or read list of a MIPS
+ * decode unless it is already there. */
+static void cap_mips_add_implicit(qemu_plugin_insn_info *out, csh handle,
+                                  unsigned int reg, bool is_write)
+{
+    uint16_t *ids   = is_write ? out->regs_write_id : out->regs_read_id;
+    uint8_t  *cnt   = is_write ? &out->n_regs_write : &out->n_regs_read;
+    char (*names)[QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ] =
+        is_write ? out->regs_write : out->regs_read;
+
+    for (uint8_t i = 0; i < *cnt; i++) {
+        if (ids[i] == reg) {
+            return;
+        }
+    }
+    if (*cnt >= QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS) {
+        return;
+    }
+    cap_copy_reg_name(names[*cnt], QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                      handle, reg, CS_ARCH_MIPS);
+    ids[*cnt] = reg;
+    (*cnt)++;
+}
+
+/*
  * Extract per-operand detail for RISC-V or MIPS (no access info).
  */
 static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
@@ -2912,6 +2973,61 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                             | QEMU_PLUGIN_OP_ACC_WRITE;
                 break;
             }
+        }
+        /*
+         * The accumulate half of a multiply-accumulate that names its
+         * accumulator (see cap_mips_is_acc_rmw).  Structural on both
+         * sides: the mnemonic must be in the family AND the operand must
+         * be an accumulator register, so `madd.s` cannot match.
+         */
+        if (cap_mips_is_acc_rmw(insn->mnemonic)) {
+            for (uint8_t i = 0; i < n; i++) {
+                qemu_plugin_operand *op = &out->operands[i];
+                if (op->type != QEMU_PLUGIN_OP_REG ||
+                    !cap_mips_is_acc_reg(op->reg_id)) {
+                    continue;
+                }
+                op->access |= QEMU_PLUGIN_OP_ACC_READ
+                            | QEMU_PLUGIN_OP_ACC_WRITE;
+                break;
+            }
+        }
+        /*
+         * DSPControl on the four instructions that exist to move it.
+         *
+         * Capstone's DSP table names DSPControl on most of the ASE --
+         * ADDQ_S reports the outflag write, EXTP the pos read, PICK the
+         * condition read -- and omits it from the four forms whose whole
+         * purpose is DSPControl: RDDSP reads it into a GPR, WRDSP writes
+         * it from one, BPOSGE32 branches on its pos field, and MTHLIP
+         * reads the pos it then updates.  The absence is an
+         * inconsistency in that table, not a statement that these do not
+         * touch the register.
+         *
+         * DSPControl has no whole-register id in Capstone's enum, only
+         * per-field ones; they all map to the one generic REG_DSPCTRL,
+         * so the field named here is chosen to describe the access
+         * (DSPPos for the pos readers, DSPCCond standing for the whole
+         * word on the two register moves).
+         */
+        if (insn->id == MIPS_INS_RDDSP) {
+            cap_mips_add_implicit(out, handle, MIPS_REG_DSPCCOND, false);
+        } else if (insn->id == MIPS_INS_WRDSP) {
+            cap_mips_add_implicit(out, handle, MIPS_REG_DSPCCOND, true);
+        } else if (insn->id == MIPS_INS_BPOSGE32 ||
+                   insn->id == MIPS_INS_MTHLIP) {
+            cap_mips_add_implicit(out, handle, MIPS_REG_DSPPOS, false);
+        }
+        /*
+         * `ctcmsa $1, $6` writes the MSA control register named by its
+         * first operand; Capstone reports that operand as a READ, which
+         * both loses the definition and fabricates a dependency on
+         * whatever last wrote it.  Its sibling `cfcmsa $6, $1` reports
+         * the read correctly.
+         */
+        if (insn->id == MIPS_INS_CTCMSA && n >= 1 &&
+            out->operands[0].type == QEMU_PLUGIN_OP_REG) {
+            out->operands[0].access = QEMU_PLUGIN_OP_ACC_WRITE;
         }
         /*
          * Capstone 6.0.0 MIPS register-indexed load/store bug workaround.

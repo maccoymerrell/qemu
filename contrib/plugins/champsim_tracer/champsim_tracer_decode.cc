@@ -369,15 +369,39 @@ static void refine_branch_type(const qemu_plugin_insn_info *info,
             !strcmp(info->op_str, "$ra")) {
             out->branch_type = BRANCH_RETURN;
         }
+        /*
+         * `bal target` is the alias of `bgezal $zero, target`, and
+         * Capstone decodes it to that instruction id — so it inherits
+         * the row's MF_CONDITIONAL along with the link.  The condition
+         * is `$zero >= 0`, which is always true: BAL is an
+         * unconditional call, and reporting it as conditional hands a
+         * branch predictor a decision that does not exist.  The
+         * printed alias is the only thing that distinguishes it.
+         */
+        if (!strcmp(m, "bal") || !strcmp(m, "balc")) {
+            out->branch_conditional = false;
+        }
         break;
     }
     case TRACE_ISA_RISCV: {
         const char *m = info->mnemonic;
+        /*
+         * Whether THIS mnemonic is one of the aliases that hides the
+         * link register.  The fixup below has to key on that and not on
+         * the resulting branch_type: the trap returns MRET / SRET /
+         * DRET are also BRANCH_RETURN and also carry no operands, but
+         * they resume from mepc / sepc / dpc and never read ra at all.
+         * Keyed on branch_type, the fixup invented a return-address
+         * dependency on every exception return in a system trace.
+         */
+        bool aliased_link = false;
         if (!strcmp(m, "jal") || !strcmp(m, "c_jal") ||
             !strcmp(m, "call") || !strcmp(m, "tail")) {
             out->branch_type = BRANCH_DIRECT_CALL;
+            aliased_link = true;
         } else if (!strcmp(m, "jalr") || !strcmp(m, "c_jalr")) {
             out->branch_type = BRANCH_INDIRECT_CALL;
+            aliased_link = true;
         } else if (!strcmp(m, "j") || !strcmp(m, "c_j") ||
                    !strcmp(m, "jump")) {
             out->branch_type = BRANCH_DIRECT_JUMP;
@@ -385,6 +409,7 @@ static void refine_branch_type(const qemu_plugin_insn_info *info,
             out->branch_type = BRANCH_INDIRECT_JUMP;
         } else if (!strcmp(m, "ret")) {
             out->branch_type = BRANCH_RETURN;
+            aliased_link = true;
         }
         /*
          * Aliased link forms hide ra COMPLETELY in Capstone 6 — it is
@@ -396,6 +421,9 @@ static void refine_branch_type(const qemu_plugin_insn_info *info,
          * the n_dst/n_src==0 guards leave untouched.  (Caught by
          * probe_rv_link_dataflow.)
          */
+        if (!aliased_link) {
+            break;
+        }
         if (out->branch_type == BRANCH_DIRECT_CALL ||
             out->branch_type == BRANCH_INDIRECT_CALL) {
             if (out->n_dst_regs == 0) {

@@ -3136,8 +3136,18 @@ def classify_mips(m: str) -> Entry:
         return ent("GEN_OP_BRANCH", "BRANCH_DIRECT_CALL")
     if m.startswith(("jalr", "jialc")):
         return ent("GEN_OP_BRANCH", "BRANCH_INDIRECT_CALL")
+    # The conditional link-and-branch family (BGEZAL / BLTZAL and their
+    # likely / short / compact variants).  The `al` suffix IS the link:
+    # taken, they write $ra exactly as BAL does, and the `jr $ra` that
+    # eventually matches them is a BRANCH_RETURN.  Typed as plain
+    # conditional branches they pushed nothing onto a consumer's
+    # return-address stack while still popping it, so the RAS drifted by
+    # one on every PIC-prologue `bltzal`.  They are calls that may not
+    # happen: the taxonomy carries that as BRANCH_DIRECT_CALL plus
+    # MF_CONDITIONAL, and the per-entry taken / not-taken outcome tells
+    # the consumer whether this one pushed.
     if re.match(r"^b(g|l|eq|ne|lt|ge|gt|le|z|nz).*al", m) and m not in {"bal", "balc"}:
-        return ent("GEN_OP_BRANCH", "BRANCH_COND_DIRECT")
+        return ent("GEN_OP_BRANCH", "BRANCH_DIRECT_CALL", "MF_CONDITIONAL")
     if m.startswith(("bbit", "bposge", "bteqz", "btnez")):
         return ent("GEN_OP_BRANCH", "BRANCH_COND_DIRECT")
     if m.startswith(("beq", "bne", "bge", "bgt", "ble", "blt", "bc1", "bc2", "bnv", "bnz", "bz", "bovc", "bnvc")):
@@ -3795,10 +3805,7 @@ def targeted_fix(isa: str, const_name: str, old: Entry, new: Entry) -> bool:
     if isa == "mips":
         if const_name.startswith("MIPS_INS_ASUB") or const_name.startswith("MIPS_INS_INSERT_"):
             return True
-        return const_name in {
-            "MIPS_INS_BGEZAL", "MIPS_INS_BGEZALL", "MIPS_INS_BGEZALS",
-            "MIPS_INS_BLTZAL", "MIPS_INS_BLTZALL", "MIPS_INS_BLTZALS",
-        }
+        return False
     return False
 
 

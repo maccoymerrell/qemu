@@ -1280,21 +1280,24 @@ static bool cap_aarch64_sysreg_operand(const cs_arm64_op *o, uint8_t *access)
  * Recover the printed system-register name from the instruction text.
  * Capstone exposes no name lookup for aarch64_sysreg, but it prints the
  * register in op_str -- "x3, NZCV" for MRS, "NZCV, x3" for MSR -- so the
- * name is the operand on the side sub_type already told us about.
- * Lower-cased to match every other register name crossing this boundary.
+ * name is the operand on the side sub_type already identified.
+ * Lower-cased to match every other register name crossing this boundary,
+ * and truncated to the field width like any other (the ABI's authority
+ * on WHICH register this is, is reg_id).
  */
 static void cap_aarch64_copy_sysreg_name(char *dst, size_t dstsz,
                                          const char *op_str, bool is_read)
 {
     const char *start = op_str;
     const char *end;
+    size_t n;
 
     dst[0] = '\0';
     if (!op_str || !op_str[0]) {
         return;
     }
     if (is_read) {
-        /* MRS: "<Xt>, <sysreg>" -- take the text after the last comma. */
+        /* MRS: "<Xt>, <sysreg>" -- the text after the last comma. */
         const char *comma = strrchr(op_str, ',');
         if (!comma) {
             return;
@@ -1305,13 +1308,13 @@ static void cap_aarch64_copy_sysreg_name(char *dst, size_t dstsz,
         }
         end = start + strlen(start);
     } else {
-        /* MSR: "<sysreg>, <Xt>" -- take the text before the first comma. */
+        /* MSR: "<sysreg>, <Xt>" -- the text before the first comma. */
         end = strchr(op_str, ',');
         if (!end) {
             return;
         }
     }
-    size_t n = (size_t)(end - start);
+    n = (size_t)(end - start);
     if (n == 0) {
         return;
     }
@@ -1324,38 +1327,6 @@ static void cap_aarch64_copy_sysreg_name(char *dst, size_t dstsz,
     dst[n] = '\0';
 }
 
-/*
- * Capstone 6.0.0-Alpha7 bug: the single-register compare-and-swap forms
- * (CAS / CASA / CASL / CASAL and the B/H size variants) mis-attribute
- * their destination.
- *
- * `CAS <Ws>, <Wt>, [<Xn|SP>]` compares Ws against memory and, whatever
- * the outcome, writes the value it loaded back into Ws — Ws is the
- * carried dependency of every CAS retry loop.  Capstone reports Ws as
- * READ-only, and sets detail->writeback, which makes the *address base*
- * Xn appear in the implicit regs_write[] list.  Two errors at once: the
- * result register's write is lost, and a phantom write is fabricated on
- * the address base that every later consumer of Xn will honour.
- *
- * The scoping is exact.  The pair forms (CASP / CASPA / CASPL / CASPAL)
- * get their result registers right — both report READ|WRITE — but share
- * the spurious writeback claim, so the phantom suppression covers the
- * whole CAS family (including the FEAT_THE rcwcas / rcwscas variants)
- * while the operand promotion applies only to the single-register forms.
- * The LD<op> / ST<op> LSE RMW family and SWP are correct throughout.
- *
- * Fix: promote the first register operand to READ|WRITE and drop the
- * memory base register from the implicit write list.  Neither correction
- * can mask a fixed Capstone — a corrected Capstone reports the same
- * READ|WRITE on operand 0, and stops emitting the phantom this removes.
- *
- * Revisit / remove when Capstone is bumped past 6.0.0-Alpha7; verify
- * with `cstool -d arm64 227ca088` (bytes `22 7c a0 88`, `cas w0,w2,[x1]`)
- * -- fixed, operands[0] must show READ|WRITE and detail->writeback must
- * be 0.  Use a `cstool` built from `subprojects/capstone`
- * (capstone.wrap's pinned revision), not a system package, or run
- * `capstone_workaround_probe`; see docs/troubleshooting.rst.
- */
 static bool cap_aarch64_is_cas(const char *mnem)
 {
     return g_str_has_prefix(mnem, "cas")
@@ -2253,56 +2224,6 @@ static bool cap_riscv_reads_dynamic_frm(const cs_insn *insn)
 }
 
 /*
- * Copy the @index'th comma-separated token of a disassembler's printed
- * operand string into @dst, lower-cased and stripped of surrounding
- * space.  Used to recover a name for operands whose Capstone
- * representation carries a number but no name lookup (the RISC-V CSR
- * field).  Capstone prints operands in detail order, so the index is
- * the operand index.  Leaves @dst empty when the string has no such
- * token -- some alias forms print fewer operands than they model.
- */
-static void cap_copy_op_str_token(char *dst, size_t dstsz,
-                                  const char *op_str, unsigned index)
-{
-    const char *p = op_str;
-    const char *end;
-    size_t n;
-
-    dst[0] = '\0';
-    if (!op_str) {
-        return;
-    }
-    for (unsigned i = 0; i < index; i++) {
-        p = strchr(p, ',');
-        if (!p) {
-            return;
-        }
-        p++;
-    }
-    while (*p == ' ') {
-        p++;
-    }
-    end = strchr(p, ',');
-    if (!end) {
-        end = p + strlen(p);
-    }
-    while (end > p && end[-1] == ' ') {
-        end--;
-    }
-    n = (size_t)(end - p);
-    if (n == 0) {
-        return;
-    }
-    if (n >= dstsz) {
-        n = dstsz - 1;
-    }
-    for (size_t i = 0; i < n; i++) {
-        dst[i] = (char)g_ascii_tolower(p[i]);
-    }
-    dst[n] = '\0';
-}
-
-/*
  * Zicsr access direction.
  *
  * Capstone reports every CSR operand as READ|WRITE, but the ISA
@@ -2319,12 +2240,12 @@ static void cap_copy_op_str_token(char *dst, size_t dstsz,
  * instruction word.
  */
 /*
- * Name for a synthesised CSR operand.  Capstone has no CSR-number
- * lookup, and the alias forms that need synthesising are exactly the
- * ones whose printed text no longer contains the register, so the
- * handful of user-level CSRs those aliases cover are named here and
- * everything else is left unnamed.  Only informational: the plugin maps
- * from the number.
+ * Name for a CSR operand.  Capstone has no CSR-number lookup and
+ * prints an unrecognised CSR as its bare number, so the user-level
+ * CSRs the generic model names are spelled here and everything else is
+ * left unnamed -- "0x1a0" is not a register name, and carrying it would
+ * put 4096 meaningless tokens into every name-keyed comparison.  Purely
+ * informational either way: the consumer maps from the number.
  */
 static const char *cap_riscv_csr_name(unsigned csr)
 {
@@ -2514,9 +2435,21 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                 op->type = QEMU_PLUGIN_OP_SYSREG;
                 op->access = cap_riscv_csr_access(insn);
                 op->reg_id = (uint16_t)cop->csr;
-                cap_copy_op_str_token(op->reg_name,
-                                      QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
-                                      insn->op_str, i);
+                {
+                    /* Only a real name.  Capstone prints an unrecognised
+                     * CSR as its bare number, and "0x1a0" is not a
+                     * register name -- carrying it here would put 4096
+                     * distinct tokens into every name-keyed comparison
+                     * for no information, since the consumer maps from
+                     * reg_id anyway. */
+                    const char *nm = cap_riscv_csr_name(cop->csr);
+                    if (nm) {
+                        g_strlcpy(op->reg_name, nm,
+                                  QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ);
+                    } else {
+                        op->reg_name[0] = '\0';
+                    }
+                }
                 op->index_name[0] = '\0';
                 op->index_id   = 0;
                 op->imm = 0;

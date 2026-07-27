@@ -2542,6 +2542,65 @@ def _capstone_reg_class_for_isa(isa: str) -> dict[int, _RegClassEntry]:
     return out
 
 
+# Raw system-register encoding -> generic register name, mirroring the
+# per-ISA `sysreg_to_generic` mappers the decoder uses.  A
+# system-register operand carries an architectural encoding, not a
+# Capstone register id, so it cannot go through the reg-class table the
+# rest of this oracle uses; anything not listed folds to REG_SYS.
+_AARCH64_SYSREG_GENERIC = {
+    0xda10: "REG_FLAGS",                                      # NZCV
+    0xda20: "REG_FCSR", 0xda21: "REG_FCSR", 0xda22: "REG_FCSR",
+    0xde82: "REG_TLS", 0xde83: "REG_TLS",                     # TPIDR*_EL0
+}
+_RISCV_CSR_GENERIC = {
+    0x001: "REG_FCSR", 0x002: "REG_FCSR", 0x003: "REG_FCSR",
+    0x008: "REG_VSTART",
+    0x009: "REG_VCTRL", 0x00a: "REG_VCTRL", 0x00f: "REG_VCTRL",
+    0xc20: "REG_VCTRL", 0xc21: "REG_VCTRL", 0xc22: "REG_VCTRL",
+}
+
+
+def _riscv_csr_access(raw: bytes) -> int:
+    """Zicsr access direction read from the encoding, as
+    `cap_riscv_csr_access` reads it: CSRRW/CSRRWI with rd == x0 does not
+    read the CSR, CSRRS/CSRRC with a zero rs1 or uimm does not write it."""
+    if len(raw) < 4:
+        return 3
+    word = int.from_bytes(bytes(raw[:4]), "little")
+    if (word & 0x7f) != 0x73:
+        return 3
+    funct3 = (word >> 12) & 0x7
+    rd = (word >> 7) & 0x1f
+    rs1 = (word >> 15) & 0x1f
+    if funct3 in (1, 5):
+        return 2 | (1 if rd else 0)
+    if funct3 in (2, 3, 6, 7):
+        return 1 | (2 if rs1 else 0)
+    return 3
+
+
+def _riscv_reads_dynamic_frm(raw: bytes) -> bool:
+    """A scalar FP encoding whose rm field is DYN reads fcsr.frm."""
+    if len(raw) < 4:
+        return False
+    word = int.from_bytes(bytes(raw[:4]), "little")
+    if (word & 0x7f) not in (0x43, 0x47, 0x4b, 0x4f, 0x53):
+        return False
+    return ((word >> 12) & 0x7) == 0x7
+
+
+def _riscv_is_mask_dst(mnem: str) -> bool:
+    """RVV forms whose destination is a mask register, and whose mask tail
+    is therefore undisturbed unconditionally — see `cap_riscv_is_mask_dst`."""
+    if not mnem.startswith("v"):
+        return False
+    if mnem in ("vlm.v", "vmmv.m", "vmnot.m", "vmclr.m", "vmset.m"):
+        return True
+    if mnem.startswith(("vms", "vmf", "vmadc")):
+        return True
+    return len(mnem) > 5 and mnem[1] == "m" and mnem.endswith(".mm")
+
+
 def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
                                 add, exp_src: set, exp_dst: set) -> None:
     """Mirror the decode-boundary corrections in `disas/capstone.c`.
@@ -2625,6 +2684,91 @@ def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
                         getattr(mem, "index", 0) or 0):
                     add(exp_dst, int(getattr(mem, "base", 0) or 0))
                 break
+        try:
+            import capstone as _cs
+            _a64 = _cs.aarch64
+        except Exception:
+            return
+        # The system register an MRS/MSR moves.  Capstone models it with
+        # its own operand type, in its own numbering space, and leaves
+        # the access bits empty; the direction is in sysop.sub_type.
+        for op in ops:
+            if op.type not in (_a64.AARCH64_OP_SYSREG,
+                               _a64.AARCH64_OP_REG_MRS,
+                               _a64.AARCH64_OP_REG_MSR):
+                continue
+            sysop = getattr(op, "sysop", None)
+            if sysop is None:
+                continue
+            sub = int(getattr(sysop, "sub_type", 0) or 0)
+            if sub not in (_a64.AARCH64_OP_REG_MRS, _a64.AARCH64_OP_REG_MSR):
+                continue          # TLBI / IC: an operation, not a register
+            enc = int(getattr(getattr(sysop, "reg", None), "sysreg", 0) or 0)
+            gen = _AARCH64_SYSREG_GENERIC.get(enc, "REG_SYS")
+            (exp_src if sub == _a64.AARCH64_OP_REG_MRS
+             else exp_dst).add(gen)
+        # An SME operand names a ZA tile and the GPR that selects the
+        # slice; neither is reachable through the plain REG arm.
+        for op in ops:
+            if op.type != _a64.AARCH64_OP_SME:
+                continue
+            sme = getattr(op, "sme", None)
+            if sme is None:
+                continue
+            access = int(getattr(op, "access", 0) or 0)
+            tile = int(getattr(sme, "tile", 0) or 0)
+            if access & 1:
+                add(exp_src, tile)
+            if access & 2:
+                add(exp_dst, tile)
+            add(exp_src, int(getattr(sme, "slice_reg", 0) or 0))
+        # The FEAT_MOPS prologue reads the PSTATE.NZCV it then rewrites.
+        if mnem.startswith(("cpyp", "cpyfp", "setp", "setgp")):
+            add(exp_src, _a64.AARCH64_REG_NZCV)
+        # The FPCR read Capstone reports on these forms' siblings and
+        # not on them.
+        if (mnem.startswith(("fccmp", "fabs", "fneg", "fadda"))
+                or (mnem[:1] in ("s", "u") and mnem[1:2] == "q")):
+            add(exp_src, _a64.AARCH64_REG_FPCR)
+
+    elif isa == "riscv64":
+        try:
+            import capstone as _cs
+            _rv = _cs.riscv
+        except Exception:
+            return
+        raw = bytes(getattr(d, "bytes", b"") or b"")
+        # The CSR a Zicsr instruction exists to move.  Capstone carries
+        # it as a bare number in its own operand type, and the F/D alias
+        # forms (fsrm / frrm / fscsr / frflags) drop the operand
+        # entirely, so it is recovered from the encoding when absent.
+        csr = None
+        for op in ops:
+            if op.type == _rv.RISCV_OP_CSR:
+                csr = int(getattr(op, "csr", 0) or 0)
+                break
+        if csr is None and len(raw) >= 4:
+            word = int.from_bytes(raw[:4], "little")
+            funct3 = (word >> 12) & 0x7
+            if (word & 0x7f) == 0x73 and funct3 not in (0, 4):
+                csr = (word >> 20) & 0xfff
+        if csr is not None:
+            gen = _RISCV_CSR_GENERIC.get(csr, "REG_SYS")
+            acc = _riscv_csr_access(raw)
+            if acc & 1:
+                exp_src.add(gen)
+            if acc & 2:
+                exp_dst.add(gen)
+        # Scalar FP with a dynamic rounding mode reads fcsr.frm.
+        if _riscv_reads_dynamic_frm(raw):
+            add(exp_src, _rv.RISCV_REG_FRM)
+        # A mask destination is read as well as written, whatever the
+        # runtime tail policy says.
+        if _riscv_is_mask_dst(mnem):
+            for op in ops:
+                if op.type == op_reg_kind:
+                    add(exp_src, op.reg)
+                    break
 
     elif isa == "mipsel":
         # Tied destinations: bit-field insert, lane insert/shuffle,
@@ -2662,6 +2806,35 @@ def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
                 add(exp_dst, fcc0)
             elif is_br:
                 add(exp_src, fcc0)
+        # A multiply-accumulate that NAMES its accumulator reads it too;
+        # Capstone reports that read only for the implicit-ac0 forms.
+        # Paired with a structural test so `madd.s`, which shares the
+        # stem and writes an FP register, cannot match.
+        if mnem.startswith(("madd", "msub", "dpa", "dps", "maq",
+                            "mulsa", "shilo", "mthlip")):
+            for op in ops:
+                if op.type != op_reg_kind:
+                    continue
+                r = int(op.reg)
+                if (_cs.mips.MIPS_REG_AC0 <= r <= _cs.mips.MIPS_REG_AC3
+                        or _cs.mips.MIPS_REG_HI0 <= r <= _cs.mips.MIPS_REG_HI3
+                        or _cs.mips.MIPS_REG_LO0 <= r <= _cs.mips.MIPS_REG_LO3):
+                    add(exp_src, r)
+                    add(exp_dst, r)
+                    break
+        # DSPControl on the four forms that exist to move it.
+        if mnem == "rddsp":
+            add(exp_src, _cs.mips.MIPS_REG_DSPCCOND)
+        elif mnem == "wrdsp":
+            add(exp_dst, _cs.mips.MIPS_REG_DSPCCOND)
+        elif mnem in ("bposge32", "mthlip"):
+            add(exp_src, _cs.mips.MIPS_REG_DSPPOS)
+        # `ctcmsa` WRITES the control register Capstone reports as read.
+        if mnem == "ctcmsa" and ops and ops[0].type == op_reg_kind:
+            written = set()
+            add(written, int(ops[0].reg))
+            exp_src -= written
+            exp_dst |= written
 
 
 def _check_call_return_store(

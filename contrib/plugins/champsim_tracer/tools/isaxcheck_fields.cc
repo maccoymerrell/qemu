@@ -173,6 +173,18 @@ uint8_t isax_generic_reg(unsigned cap_reg_id)
     return active_reg_table[cap_reg_id].reg_id;
 }
 
+/*
+ * A QEMU_PLUGIN_OP_SYSREG operand's reg_id is the ISA's raw
+ * system-register encoding -- a numbering space disjoint from the
+ * Capstone register enum -- so it resolves through the per-ISA mapper
+ * the decoder itself uses, not through the register table.
+ */
+uint8_t isax_generic_sysreg(unsigned enc)
+{
+    SysRegToGenericFn map = isa_properties[trace_isa].sysreg_to_generic;
+    return map ? map((uint16_t)enc) : REG_NONE;
+}
+
 unsigned isax_reg_table_size(void)
 {
     return active_reg_table_size;

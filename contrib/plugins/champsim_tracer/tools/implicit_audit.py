@@ -146,8 +146,13 @@ COLS = ("family", "hex", "asm", "kind", "operand", "source", "expect",
 # (norm_aarch64 / norm_riscv / norm_mips in tools/isaxcheck.cc).
 # ---------------------------------------------------------------------------
 NAMEMAP = {
+    # norm_aarch64 truncates a register name at its first underscore, so
+    # the two decoders' spellings of a system register meet on a common
+    # stem; a spec token carrying the full architectural name has to be
+    # reduced the same way to compare against it.
     "aarch64": {"x30": "r30", "lr": "r30", "sp": "sp", "pstate": "nzcv",
-                "nzcv": "nzcv", "xzr": "zr", "wzr": "zr"},
+                "nzcv": "nzcv", "xzr": "zr", "wzr": "zr",
+                "tpidr_el0": "tpidr", "tpidrro_el0": "tpidr"},
     "riscv64": {"ra": "r1", "sp": "r2", "zero": "r0", "x1": "r1", "x2": "r2"},
     "mipsel":  {"hi": "ac0", "lo": "ac0", "ac0": "ac0", "ac1": "ac1",
                 "ac2": "ac2", "ac3": "ac3", "dspctrl": "dsp",

@@ -700,6 +700,29 @@ static void cs_decode(const uint8_t *b, size_t n, CsView &v,
             }
             break;
         }
+        case QEMU_PLUGIN_OP_SYSREG: {
+            // A system / control register named outside the ISA's register
+            // file: an AArch64 MRS/MSR operand, a RISC-V Zicsr CSR.  reg_id
+            // is the raw architectural encoding, in a numbering space
+            // disjoint from the Capstone register enum, so the generic id
+            // comes from the per-ISA system-register mapper rather than
+            // from the register table.  Dropping it here would leave the
+            // comparison blind to exactly the operand class it exists to
+            // catch: an instruction whose whole purpose is to move a
+            // control register, appearing to move nothing.
+            unsigned g = isax_generic_sysreg(op->reg_id);
+            std::string nm = op->reg_name[0] ? norm_reg(op->reg_name)
+                                             : std::string();
+            if (op->access & QEMU_PLUGIN_OP_ACC_READ) {
+                if (!nm.empty()) v.rd.insert(nm);
+                v.grd.insert(g);
+            }
+            if (op->access & QEMU_PLUGIN_OP_ACC_WRITE) {
+                if (!nm.empty()) v.wr.insert(nm);
+                v.gwr.insert(g);
+            }
+            break;
+        }
         case QEMU_PLUGIN_OP_INVALID:
             // An operand Capstone reported that the boundary has no
             // representation for.  Every register it names is silently lost

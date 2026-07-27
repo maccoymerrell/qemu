@@ -198,11 +198,34 @@ void dep_lea(const struct qemu_plugin_insn_info *info, InsnFields *f)
  * uses RBP as the implicit address source while also clobbering it).
  * Returns the src-slot index, or -1 when no intersection exists.
  *
+ * REG_SP is matched explicitly first, rather than taken as whichever
+ * intersection happens to come first, because "first" is an operand-
+ * order accident and another register can wear the same RMW shape.
+ * The form that exposed it is the PLT/GOT call `call *disp(%rip)`
+ * (`ff 15`): RIP-relative addressing READS %ip and the call WRITES
+ * it, so %ip intersects too and precedes %sp in the operand array.
+ * The whole refiner then hung off the wrong register — the SP
+ * destination took a dependency on the load, the IP destination
+ * depended on itself instead of on the load, and the store carried
+ * an %ip address where the architecture uses %sp.  LEAVE is why this
+ * cannot simply REQUIRE REG_SP: its stack pointer really is RBP, so
+ * the first-intersection scan remains as the fallback.
+ *
  * find_dst_slot: find a specific reg_id in dst_regs[] (used to
  * narrow the SP-dst's dep_mask to just the SP src bit).
  */
 static int find_stack_ptr_src(const InsnFields *f)
 {
+    for (uint8_t i = 0; i < f->n_src_regs; i++) {
+        if (f->src_regs[i] != REG_SP) {
+            continue;
+        }
+        for (uint8_t j = 0; j < f->n_dst_regs; j++) {
+            if (f->dst_regs[j] == REG_SP) {
+                return (int)i;
+            }
+        }
+    }
     for (uint8_t i = 0; i < f->n_src_regs; i++) {
         for (uint8_t j = 0; j < f->n_dst_regs; j++) {
             if (f->src_regs[i] == f->dst_regs[j]) {

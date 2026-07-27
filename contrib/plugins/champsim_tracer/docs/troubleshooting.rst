@@ -222,6 +222,18 @@ system-mode runs sit between roughly 1 and 8 traced architectural
 instructions per covered user instruction; a wedged guest runs into
 the hundreds.
 
+That ratio is only meaningful once the window has covered a few
+thousand user instructions.  Below that, fixed per-segment overhead
+(guest boot, marker injection, the first scheduler passes before the
+workload gets the CPU) dominates the denominator and the ratio reads
+high *by construction* — a normal ``END`` close (the workload simply
+exited early, having done little work) at a few hundred covered
+instructions is the common shape here, not a corner case.  The
+validator's ratio leg only judges segments past that floor
+(``CLOCK_INFLATION_MIN_COVERED`` in ``_system.py``); the ``UNDER``-close
+leg has no such floor and always fires, since closing under budget is
+a failure at any window size.
+
 The cause is a guest clock that did not survive a wrong-path
 excursion: a host timer left parked, an interrupt line left
 disagreeing with its pending register, or an externally-asserted

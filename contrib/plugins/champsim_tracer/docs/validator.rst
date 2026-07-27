@@ -362,12 +362,21 @@ add coverage no other sub-command exposes:
    faithfully, so every structural oracle passes on a well-formed
    trace of a wedged machine.  Three symptom detectors run instead:
    a window that closes ``UNDER`` budget, a traced/user instruction
-   ratio past 20 (healthy runs sit between 1 and 8.5), and a
+   ratio past 20 once the window has covered at least 5000 user
+   instructions (healthy runs sit between 1 and 8.5), and a
    user-instruction clock that stops advancing in wall time.  The
-   first two are asserted by ``_check_segment_coverage`` — so every
-   system-mode check in the suite carries them — and the third by a
-   live watchdog in the system trace path, which also bounds a
-   wedged run's cost, since a spinning guest never exits on its own.
+   covered-count floor exists because fixed per-segment overhead
+   (guest boot, marker injection, early scheduling) dominates the
+   ratio below it — a window that legitimately covers only a few
+   hundred instructions before closing (``system.attach_mipsel``'s
+   shape) reads as a multi-hundred-x "stall" by construction, not
+   because anything froze; every real stall on record instead closes
+   ``UNDER`` at a covered count orders of magnitude past the floor,
+   so it is caught either way.  The first two are asserted by
+   ``_check_segment_coverage`` — so every system-mode check in the
+   suite carries them — and the third by a live watchdog in the
+   system trace path, which also bounds a wedged run's cost, since a
+   spinning guest never exits on its own.
 
    None of the three knows anything about timers or interrupt lines,
    which is the point: they detect the symptom, so a clock source

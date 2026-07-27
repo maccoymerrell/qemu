@@ -140,9 +140,47 @@ def parse_finished_segments(console_text: str) -> list[dict]:
 # factor of 3.4 below the mildest stall.  Kept uniform across ISAs rather than
 # tuned per ISA: the separation is orders of magnitude wide, and one number
 # cannot rot into a per-ISA exemption.
+#
+# The ratio is only informative once the window has covered enough user
+# instructions to amortise fixed per-segment overhead (guest boot, ptrace
+# marker injection, the first scheduler passes before the workload gets the
+# CPU) -- below that, the fixed cost dominates the denominator and inflates
+# the ratio *by construction*, with no stall involved.  A window that closes
+# ``END`` (the workload exited on its own, under budget) after covering only
+# a few hundred instructions is the common case here, not a corner case: it
+# is exactly ``system.attach_mipsel``'s shape.  Measured by sweeping the
+# validator's own synthetic workload (``all --system --attach``, 8 diamonds,
+# ``--hot-iters`` scaling the amount of user work) across all four ISAs on a
+# quiet host, budget large enough that every cell closes ``END``:
+#
+#   covered      x86_64   aarch64   riscv64   mipsel
+#     ~350-570    40.8      26.9      28.9      17.6
+#     ~960-1400   14.8      11.3      12.1       8.0
+#   ~2600-3800     6.0       4.7       5.1       3.6
+#   ~6000-8600     3.2       2.7       2.8       2.2
+#  ~23000-31000    1.6       1.4       1.5       1.3
+# ~112000-160000   1.1       1.1       1.1       1.1
+#
+# The ratio is still explained almost entirely by fixed cost below ~1000
+# covered (worst case 14.8, less than 1.4x clear of the 20 bound -- exactly
+# the margin that made this check flaky under host contention) and has
+# settled into the steady-state healthy band (matching the 5M-window figures
+# above) by ~2600.  CLOCK_INFLATION_MIN_COVERED sits at 5000: past the knee
+# of the curve with better than 3x headroom under the worst nearby measurement
+# (3.2), so the leg only fires once the ratio it is judging is actually
+# measuring the guest rather than the boot.  It does not weaken the other two
+# legs: the UNDER-close check below is unconditional, and every real stall on
+# record (the pre-fix aarch64 gt-timer class, 5M-window cells at 67.6-645x;
+# the irqvol reproducers at 24x/116x) closes UNDER with covered orders of
+# magnitude above this floor, so both legs still catch it.
 # --------------------------------------------------------------------------
 
 CLOCK_INFLATION_MAX = 20.0
+
+# See the sweep above: below this many covered user instructions, fixed
+# per-segment overhead dominates the traced/user ratio and a reading past
+# CLOCK_INFLATION_MAX is expected, not a symptom.
+CLOCK_INFLATION_MIN_COVERED = 5000
 
 # Wall-clock seconds the guest may go without the user-instruction clock
 # advancing before the run is declared stalled.  The plugin prints a progress
@@ -182,7 +220,14 @@ def assess_clock_progress(segments: list[dict], label: str = "") -> list[str]:
     alongside the guest (see run_with_clock_watchdog).  All three are symptom
     detectors, deliberately: they know nothing about timers or interrupt
     lines, so they cannot be defeated by a new clock source nobody thought to
-    reconcile."""
+    reconcile.
+
+    The ratio leg only judges segments that covered at least
+    CLOCK_INFLATION_MIN_COVERED user instructions -- below that, fixed
+    per-segment overhead (boot, marker injection, early scheduling) dominates
+    the ratio by construction, not a stall (see the module-level comment for
+    the measured curve).  The UNDER leg has no such floor: closing under
+    budget is a failure at any window size."""
     if not segments:
         return [f"{label}: no 'finished segment' line "
                 f"(the plugin never closed a window)"]
@@ -193,7 +238,7 @@ def assess_clock_progress(segments: list[dict], label: str = "") -> list[str]:
                        f"(covered={s['covered']} budget={s['budget']}) -- "
                        f"the guest stopped making user-space progress")
         cov, arch = s["covered"], s["trace_arch_insns"]
-        if cov > 0 and arch / cov > CLOCK_INFLATION_MAX:
+        if cov >= CLOCK_INFLATION_MIN_COVERED and arch / cov > CLOCK_INFLATION_MAX:
             bad.append(
                 f"{label}: traced/user instruction ratio {arch / cov:.1f} "
                 f"exceeds {CLOCK_INFLATION_MAX:.0f} "

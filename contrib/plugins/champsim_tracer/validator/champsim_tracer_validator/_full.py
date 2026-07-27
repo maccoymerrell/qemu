@@ -520,7 +520,12 @@ def _chk_clock_progress(isa: str):
     which is what this check reads -- the window closes UNDER budget, the
     traced/user instruction ratio explodes, and the user clock stops
     advancing in wall time (_system.assess_clock_progress and
-    run_with_clock_watchdog, both wired into the system trace path).
+    run_with_clock_watchdog, both wired into the system trace path).  This
+    check's window covers deep into the millions of user instructions, so
+    the ratio leg's CLOCK_INFLATION_MIN_COVERED floor (below which fixed
+    boot/scheduling overhead alone can inflate the ratio -- see
+    system.attach_mipsel, whose tiny window sits under that floor on
+    purpose) never comes into play here.
 
     Runs on all four ISAs deliberately.  The class has been fixed three times
     as per-ISA point patches and recurred each time, and the reason the suite

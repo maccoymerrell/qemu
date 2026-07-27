@@ -551,6 +551,48 @@ void decode_detail_to_generic(uint64_t pc,
             }
             break;
         }
+        case QEMU_PLUGIN_OP_SYSREG: {
+            /*
+             * A system / control register named by the encoding but
+             * living outside the ordinary register file: an AArch64
+             * MRS/MSR system register, a RISC-V Zicsr CSR.  reg_id
+             * holds the ISA's raw encoding, in a numbering space
+             * disjoint from the Capstone register enum, so it resolves
+             * through the per-ISA mapper rather than the reg table.
+             * Direction comes from the boundary, which derives it from
+             * the instruction form -- Capstone leaves the AArch64
+             * system operand's own access bits empty.
+             */
+            SysRegToGenericFn map = isa_properties[trace_isa].sysreg_to_generic;
+            if (!map) {
+                break;
+            }
+            uint8_t gen = map(op->reg_id);
+            if (gen == REG_NONE) {
+                break;
+            }
+            if (op->access & QEMU_PLUGIN_OP_ACC_READ) {
+                add_src_reg(out, out_names, gen, qemu_reg_for_generic(gen));
+            }
+            if (op->access & QEMU_PLUGIN_OP_ACC_WRITE) {
+                add_dst_reg(out, out_names, gen, qemu_reg_for_generic(gen));
+                /*
+                 * `msr nzcv, x3` really does define the arithmetic
+                 * flags, so it owes the CST_FID_METAFLAGS record an
+                 * arithmetic flag-setter emits.  The condition mirrors
+                 * the .is_int_flags marker on the reg table: REG_FLAGS
+                 * carries arithmetic condition flags only on the ISAs
+                 * that supply a metaflags mapper — on MIPS the same ID
+                 * names DSP status bits, which no mapper turns into
+                 * Z/N/C/V.
+                 */
+                if (gen == REG_FLAGS &&
+                    isa_properties[trace_isa].flags_to_metaflags) {
+                    out->writes_int_flags = true;
+                }
+            }
+            break;
+        }
         case QEMU_PLUGIN_OP_IMM:
             if (!out->has_immediate) {
                 out->has_immediate = true;

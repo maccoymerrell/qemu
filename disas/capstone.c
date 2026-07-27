@@ -1226,6 +1226,105 @@ static bool cap_aarch64_is_block_zero_sysop(const cs_arm64 *a64, uint8_t n)
 }
 
 /*
+ * AArch64 MRS / MSR: the system register the instruction exists to move.
+ *
+ * `mrs x3, nzcv` reads PSTATE.NZCV into x3 and `msr nzcv, x3` writes it
+ * back, and the conditional branch that follows reads NZCV again.  Both
+ * halves of that chain live in the system-register field, and Capstone
+ * models it with an operand type of its own:
+ *
+ *   operands[k].type           == AARCH64_OP_SYSREG
+ *   operands[k].sysop.sub_type == AARCH64_OP_REG_MRS   (a read)
+ *                              or AARCH64_OP_REG_MSR   (a write)
+ *   operands[k].sysop.reg.sysreg == AARCH64_SYSREG_NZCV (0xda10)
+ *
+ * Presented as an unmodelled operand, an MRS reads nothing and an MSR
+ * writes nothing, so the branch after `msr nzcv, x3` reads a register no
+ * instruction in the trace produced -- the same severance MIPS suffered
+ * on its FP condition codes, on the ISA where it costs the most (18.7 M
+ * dynamic MRS/MSR executions in the survey population).
+ *
+ * Two things make this a translation rather than a fix.  Capstone leaves
+ * the operand's access bits empty, so the direction is taken from
+ * sub_type, which states it exactly.  And the system-register numbering
+ * is disjoint from aarch64_reg -- AARCH64_SYSREG_NZCV is 0xda10 while
+ * AARCH64_REG_NZCV is 5 -- so the value cannot be handed over as a
+ * register id.  It goes out as QEMU_PLUGIN_OP_SYSREG, whose reg_id is
+ * documented to carry the raw encoding, leaving the ISA-specific
+ * encoding->register mapping to the consumer.
+ *
+ * IC / TLBI reuse AARCH64_OP_SYSREG with a TLBI or IC sub_type for a
+ * maintenance operation rather than a register, and are left alone.
+ */
+static bool cap_aarch64_sysreg_operand(const cs_arm64_op *o, uint8_t *access)
+{
+    if (o->type != AARCH64_OP_SYSREG &&
+        o->type != AARCH64_OP_REG_MRS &&
+        o->type != AARCH64_OP_REG_MSR) {
+        return false;
+    }
+    switch (o->sysop.sub_type) {
+    case AARCH64_OP_REG_MRS:
+        *access = QEMU_PLUGIN_OP_ACC_READ;
+        return true;
+    case AARCH64_OP_REG_MSR:
+        *access = QEMU_PLUGIN_OP_ACC_WRITE;
+        return true;
+    default:
+        /* TLBI / IC / an operand Capstone left unclassified. */
+        return false;
+    }
+}
+
+/*
+ * Recover the printed system-register name from the instruction text.
+ * Capstone exposes no name lookup for aarch64_sysreg, but it prints the
+ * register in op_str -- "x3, NZCV" for MRS, "NZCV, x3" for MSR -- so the
+ * name is the operand on the side sub_type already told us about.
+ * Lower-cased to match every other register name crossing this boundary.
+ */
+static void cap_aarch64_copy_sysreg_name(char *dst, size_t dstsz,
+                                         const char *op_str, bool is_read)
+{
+    const char *start = op_str;
+    const char *end;
+
+    dst[0] = '\0';
+    if (!op_str || !op_str[0]) {
+        return;
+    }
+    if (is_read) {
+        /* MRS: "<Xt>, <sysreg>" -- take the text after the last comma. */
+        const char *comma = strrchr(op_str, ',');
+        if (!comma) {
+            return;
+        }
+        start = comma + 1;
+        while (*start == ' ') {
+            start++;
+        }
+        end = start + strlen(start);
+    } else {
+        /* MSR: "<sysreg>, <Xt>" -- take the text before the first comma. */
+        end = strchr(op_str, ',');
+        if (!end) {
+            return;
+        }
+    }
+    size_t n = (size_t)(end - start);
+    if (n == 0) {
+        return;
+    }
+    if (n >= dstsz) {
+        n = dstsz - 1;
+    }
+    for (size_t i = 0; i < n; i++) {
+        dst[i] = (char)g_ascii_tolower(start[i]);
+    }
+    dst[n] = '\0';
+}
+
+/*
  * Capstone 6.0.0-Alpha7 bug: the single-register compare-and-swap forms
  * (CAS / CASA / CASL / CASAL and the B/H size variants) mis-attribute
  * their destination.
@@ -1302,6 +1401,98 @@ static bool cap_aarch64_is_mops_set(const char *mnem)
      * memory operand, so they never reach the correction; excluded
      * explicitly so the intent is legible. */
     return g_str_has_prefix(mnem, "set") && !g_str_has_prefix(mnem, "setf");
+}
+
+/*
+ * FEAT_MOPS prologue: the half of the P -> M -> E chain Capstone drops.
+ *
+ * A bulk copy or set is three instructions that hand state to each other
+ * through PSTATE.NZCV — the prologue records how much of the operation
+ * it performed and which direction it chose, and the main and epilogue
+ * forms resume from that.  Capstone reports the prologue's NZCV WRITE
+ * and the main/epilogue forms' NZCV READ, but not the prologue's own
+ * read: the MRA's SETP and CPYP pseudocode consults PSTATE.NZCV to tell
+ * a fresh start from a re-entry after an interrupt, so the P form reads
+ * the register it then rewrites.
+ *
+ * Without it the prologue looks like a pure producer, and a re-executed
+ * P form — which is exactly what happens when the operation is
+ * interrupted and restarted — appears independent of the state that
+ * says how far it already got.  glibc's memcpy() and memset() use these
+ * whenever HWCAP2_MOPS is present, so this is 3.2 M executions in the
+ * survey population, not a corner.
+ *
+ * The prologue mnemonics are CPYP / CPYFP / SETP / SETGP and their
+ * suffixed variants (…wn, …rn, …n, …t, …tn).  SETF8 / SETF16 share the
+ * "set" stem but are FEAT_FlagM2 flag-setters with no MOPS chain, and
+ * are excluded by requiring the "p" that names the prologue.
+ */
+static bool cap_aarch64_is_mops_prologue(const char *mnem)
+{
+    return g_str_has_prefix(mnem, "cpyp") ||
+           g_str_has_prefix(mnem, "cpyfp") ||
+           g_str_has_prefix(mnem, "setp") ||
+           g_str_has_prefix(mnem, "setgp");
+}
+
+/*
+ * FP forms whose FPCR read Capstone reports on their siblings and not
+ * on them.
+ *
+ * The implicit-register table is inconsistent here rather than
+ * deliberately silent: FCMP and FCMPE carry `fpcr`, FCCMP and FCCMPE
+ * — the same comparison under a condition — carry none; SQDMULH
+ * carries it, SQADD and UQADD do not.  The MRA has all of them reading
+ * FPCR, and for the one-source sign forms it is not incidental:
+ * FEAT_AFP's FPCR.AH changes what FABS and FNEG do to a NaN, and
+ * FPCR.NEP changes whether they merge from Vd.
+ *
+ * Over-reporting an FPCR read is the safe direction.  FPCR is written
+ * once at process start and then read by everything, so a spurious read
+ * adds an edge onto a producer that retired long ago; a spurious FPSR
+ * *write* would instead chain every FP instruction to the last one,
+ * which is why the cumulative-status half of this stays unmodelled.
+ */
+static bool cap_aarch64_reads_fpcr_unreported(const char *mnem)
+{
+    /* Conditional FP compares — siblings FCMP/FCMPE report FPCR. */
+    if (g_str_has_prefix(mnem, "fccmp")) {
+        return true;
+    }
+    /* One-source sign manipulation — FPCR.AH / FPCR.NEP dependent. */
+    if (g_str_has_prefix(mnem, "fabs") || g_str_has_prefix(mnem, "fneg")) {
+        return true;
+    }
+    /* SVE strictly-ordered FP reduction. */
+    if (g_str_has_prefix(mnem, "fadda")) {
+        return true;
+    }
+    /* Saturating integer arithmetic — sibling SQDMULH reports FPCR.
+     * The whole family writes FPSR.QC and takes its saturation
+     * behaviour from FPCR, and Capstone reports it on only part of it. */
+    if ((mnem[0] == 's' || mnem[0] == 'u') && mnem[1] == 'q') {
+        return true;
+    }
+    return false;
+}
+
+/* Append @reg to the implicit-read list unless it is already there. */
+static void cap_aarch64_add_implicit_read(qemu_plugin_insn_info *out,
+                                          csh handle, unsigned int reg)
+{
+    for (uint8_t i = 0; i < out->n_regs_read; i++) {
+        if (out->regs_read_id[i] == reg) {
+            return;
+        }
+    }
+    if (out->n_regs_read >= QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS) {
+        return;
+    }
+    cap_copy_reg_name(out->regs_read[out->n_regs_read],
+                      QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                      handle, reg, CS_ARCH_ARM64);
+    out->regs_read_id[out->n_regs_read] = reg;
+    out->n_regs_read++;
 }
 
 /*
@@ -1524,7 +1715,60 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
             op->index_id   = 0;
             op->imm = 0;
             break;
-        default:
+        case AARCH64_OP_SME:
+            /*
+             * SME matrix operand.  Capstone parks the ZA tile in
+             * cop->sme.tile and the GPR that selects the slice in
+             * cop->sme.slice_reg, neither of which is reachable through
+             * the ordinary REG arm — so `str za[w12, 0], [x0]` arrives
+             * with a store whose data comes from nowhere and whose
+             * slice index is not read at all.
+             *
+             * The tile is a real register the generic model already
+             * names (AARCH64_REG_ZA maps to REG_MATRIX), so present it
+             * as one and carry Capstone's access verbatim.  The slice
+             * register is an ordinary GPR read that selects which slice
+             * of the array moves; it joins the implicit read list
+             * rather than claiming a second operand slot, because the
+             * operand ABI has one register field per operand.
+             *
+             * pred.vec_select — SME's second predicate field — remains
+             * unrepresented; that gap is recorded in
+             * docs/limitations.rst.
+             */
+            op->type = QEMU_PLUGIN_OP_REG;
+            cap_copy_reg_name(op->reg_name,
+                              QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                              handle, cop->sme.tile, CS_ARCH_ARM64);
+            op->reg_id     = cop->sme.tile;
+            op->index_name[0] = '\0';
+            op->index_id   = 0;
+            op->imm = 0;
+            if (cop->sme.slice_reg != AARCH64_REG_INVALID) {
+                cap_aarch64_add_implicit_read(out, handle,
+                                              cop->sme.slice_reg);
+            }
+            break;
+        default: {
+            /*
+             * The system register an MRS / MSR moves -- see
+             * cap_aarch64_sysreg_operand.  reg_id carries the raw
+             * aarch64_sysreg encoding, not a Capstone register id.
+             */
+            uint8_t sysacc = 0;
+            if (cap_aarch64_sysreg_operand(cop, &sysacc)) {
+                op->type   = QEMU_PLUGIN_OP_SYSREG;
+                op->access = sysacc;
+                op->reg_id = (uint16_t)cop->sysop.reg.sysreg;
+                cap_aarch64_copy_sysreg_name(
+                    op->reg_name, QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                    insn->op_str,
+                    sysacc == QEMU_PLUGIN_OP_ACC_READ);
+                op->index_name[0] = '\0';
+                op->index_id   = 0;
+                op->imm = 0;
+                break;
+            }
             op->type = QEMU_PLUGIN_OP_INVALID;
             op->reg_name[0] = '\0';
             op->reg_id     = 0;
@@ -1532,6 +1776,7 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
             op->index_id   = 0;
             op->imm = 0;
             break;
+        }
         }
     }
 
@@ -1745,6 +1990,23 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
      * not a system package, or run `capstone_workaround_probe`; see
      * docs/troubleshooting.rst.
      */
+    /*
+     * The FEAT_MOPS prologue's own NZCV read (see
+     * cap_aarch64_is_mops_prologue) and the FPCR read Capstone reports
+     * on these forms' siblings but not on them (see
+     * cap_aarch64_reads_fpcr_unreported).  Both are architectural facts
+     * from the MRA rather than version-specific Capstone defects, so
+     * neither is conditional on a Capstone revision; both add only when
+     * the register is not already listed, so a Capstone that starts
+     * reporting them cannot double-count.
+     */
+    if (cap_aarch64_is_mops_prologue(insn->mnemonic)) {
+        cap_aarch64_add_implicit_read(out, handle, AARCH64_REG_NZCV);
+    }
+    if (cap_aarch64_reads_fpcr_unreported(insn->mnemonic)) {
+        cap_aarch64_add_implicit_read(out, handle, AARCH64_REG_FPCR);
+    }
+
     if (insn->id == ARM64_INS_RET && a64->op_count == 0) {
         bool listed = false;
         for (uint8_t i = 0; i < out->n_regs_read; i++) {

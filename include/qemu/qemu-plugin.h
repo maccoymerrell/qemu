@@ -866,6 +866,33 @@ char *qemu_plugin_insn_disas(const struct qemu_plugin_insn *insn);
 #define QEMU_PLUGIN_OP_REG     1
 #define QEMU_PLUGIN_OP_IMM     2
 #define QEMU_PLUGIN_OP_MEM     3
+/*
+ * A system / control register named by the encoding but living outside
+ * the ISA's ordinary register file: an AArch64 MRS/MSR system register,
+ * a RISC-V Zicsr CSR, and their kin.  Capstone models these with their
+ * own operand types and their own numbering (aarch64_sysreg,
+ * cs_riscv_op.csr), disjoint from the register enum that reg_id
+ * otherwise carries, so presenting them as QEMU_PLUGIN_OP_REG would
+ * index the wrong table.
+ *
+ * reg_id therefore holds the ISA's RAW SYSTEM-REGISTER ENCODING, not a
+ * Capstone register id:
+ *   AArch64: the aarch64_sysreg value, i.e. the packed
+ *            op0:op1:CRn:CRm:op2 field (NZCV = 0xda10, FPCR = 0xda20,
+ *            TPIDR_EL0 = 0xde82).
+ *   RISC-V : the 12-bit CSR number (fflags = 0x001, vstart = 0x008,
+ *            vl = 0xc20).
+ * reg_name carries the printed name where the disassembler supplies
+ * one.  access is filled from the direction the instruction form
+ * implies (MRS reads, MSR writes, Zicsr per its rd/rs1 suppression
+ * rules) because Capstone leaves the AArch64 system operand's access
+ * bits empty.
+ *
+ * A plugin that does not model system registers can ignore this type
+ * exactly as it ignores QEMU_PLUGIN_OP_INVALID; one that does needs a
+ * per-ISA encoding->register mapping of its own.
+ */
+#define QEMU_PLUGIN_OP_SYSREG  4
 
 /* Operand access mode (bitmask) */
 #define QEMU_PLUGIN_OP_ACC_READ  1

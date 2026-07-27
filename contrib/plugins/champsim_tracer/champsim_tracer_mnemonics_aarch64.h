@@ -96,6 +96,57 @@ static uint64_t aarch64_canonicalize_addr(uint64_t a)
     return a & ((UINT64_C(1) << 48) - 1);
 }
 
+/*
+ * AArch64 system register (MRS / MSR operand) -> generic register ID.
+ *
+ * The encoding is the packed op0:op1:CRn:CRm:op2 word Capstone carries
+ * in aarch64_sysreg; it is a different numbering space from
+ * aarch64_reg, so these values cannot go through aarch64_reg_class.
+ *
+ * Four architectural roles are named, and everything else -- the
+ * identification registers, the translation and exception control
+ * registers, the counters, the debug registers -- folds to REG_SYS.
+ * The named ones are the ones whose traffic would otherwise be
+ * fabricated onto an unrelated population:
+ *
+ *   NZCV     is the condition-flag register the rest of the ISA already
+ *            reads and writes as REG_FLAGS.  Mapping it anywhere else
+ *            would leave `msr nzcv, x3` writing a register the `b.eq`
+ *            after it does not read -- the severance this fix exists to
+ *            close -- so it must land on the same ID the arithmetic
+ *            forms use.
+ *   FPCR /
+ *   FPSR /
+ *   FPMR     are the FP control and status words, already REG_FCSR
+ *            wherever Capstone names AARCH64_REG_FPCR directly.
+ *   TPIDR_EL0 /
+ *   TPIDRRO_EL0
+ *            are the user thread pointer.  Every TLS access reads one
+ *            of them, and on REG_SYS that read would be ordered behind
+ *            whatever system register the last MRS in the trace
+ *            happened to touch.
+ *
+ * TPIDR_EL1 is deliberately NOT REG_TLS: it is the kernel's per-CPU
+ * base pointer, a different register serving a different purpose that
+ * merely shares a name stem.
+ */
+static uint8_t aarch64_sysreg_to_generic(uint16_t enc)
+{
+    switch (enc) {
+    case AARCH64_SYSREG_NZCV:
+        return REG_FLAGS;
+    case AARCH64_SYSREG_FPCR:
+    case AARCH64_SYSREG_FPSR:
+    case AARCH64_SYSREG_FPMR:
+        return REG_FCSR;
+    case AARCH64_SYSREG_TPIDR_EL0:
+    case AARCH64_SYSREG_TPIDRRO_EL0:
+        return REG_TLS;
+    default:
+        return REG_SYS;
+    }
+}
+
 
 /* Register classification table. */
 static const RegClassification aarch64_reg_class[AARCH64_REG_ENDING] = {

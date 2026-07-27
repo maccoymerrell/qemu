@@ -239,7 +239,7 @@ enum GenericRegId {
     REG_PRED18, REG_PRED19, REG_PRED20, REG_PRED21, REG_PRED22,
     REG_PRED23, REG_PRED24, REG_PRED25, REG_PRED26, REG_PRED27,
     REG_PRED28, REG_PRED29, REG_PRED30, REG_PRED31,
-    /* Special-purpose hardware/value register classes: 225-245 */
+    /* Special-purpose hardware/value register classes: 225-249 */
     REG_SEG0 = 225,
     REG_SEG1, REG_SEG2, REG_SEG3, REG_SEG4, REG_SEG5,
     REG_CTRL = 231,
@@ -253,7 +253,39 @@ enum GenericRegId {
     REG_SYS = 243,
     REG_FCSR = 244,
     REG_VCTRL = 245,
-    /* 246..249 unallocated. */
+    /*
+     * System/control registers whose architectural role is distinct
+     * enough that folding them onto REG_SYS / REG_VCTRL / REG_FLAGS
+     * would manufacture dependencies rather than record them.  A false
+     * edge misleads a consumer as badly as a missing one, so each of
+     * these exists because one concrete population would otherwise
+     * alias something it has no relationship with:
+     *
+     *   REG_TLS     the thread pointer — AArch64 TPIDR_EL0 / TPIDRRO_EL0
+     *               and the MIPS CP0 UserLocal word `rdhwr $29` reads.
+     *               On REG_SYS every TLS access shares a slot with the
+     *               whole CP0 / MRS population.
+     *   REG_VSTART  the RISC-V vector start index.  Every vector
+     *               instruction writes it, so on REG_VCTRL each vector
+     *               op would appear to redefine `vl` and `vtype`, and
+     *               the edge onto the `vsetvli` that configured the
+     *               kernel would be replaced by a chain through the
+     *               op's own predecessors.
+     *   REG_DSPCTRL the MIPS DSPControl register (ccond / carry /
+     *               ouflag / pos / scount / EFI).  One architectural
+     *               register gets one ID, rather than being split
+     *               across REG_FLAGS and REG_VCTRL — where the halves
+     *               aliased arithmetic condition flags and MSA vector
+     *               control respectively.
+     *   REG_MSACSR  the MIPS MSA control/status register.  Capstone
+     *               renders it as a coprocessor register, which lands
+     *               it on REG_SYS beside every CP0 access, so a
+     *               `cfcmsa` reads whatever the last `mtc0` wrote.
+     */
+    REG_TLS = 246,
+    REG_VSTART = 247,
+    REG_DSPCTRL = 248,
+    REG_MSACSR = 249,
     /* Common architectural special registers: 250-254 */
     REG_SP = 250,
     REG_FLAGS = 251,
@@ -379,9 +411,9 @@ static inline const char *branch_type_name_or_unknown(unsigned id)
 /*
  * Symbolic register name: a well-known special name, a class+index
  * name for the dense banks (REG_GPR<N>, REG_FPR<N>, ...), or
- * REG_CTRL/REG_DEBUG.  NULL for unallocated holes (246..249).  The
- * dense-bank result lives in a thread_local buffer; don't retain the
- * pointer past the next call.
+ * REG_CTRL/REG_DEBUG.  NULL for any ID the enum does not allocate.
+ * The dense-bank result lives in a thread_local buffer; don't retain
+ * the pointer past the next call.
  */
 static inline const char *generic_reg_name(unsigned id)
 {
@@ -395,6 +427,10 @@ static inline const char *generic_reg_name(unsigned id)
     case REG_SYS:     return "REG_SYS";
     case REG_FCSR:    return "REG_FCSR";
     case REG_VCTRL:   return "REG_VCTRL";
+    case REG_TLS:     return "REG_TLS";
+    case REG_VSTART:  return "REG_VSTART";
+    case REG_DSPCTRL: return "REG_DSPCTRL";
+    case REG_MSACSR:  return "REG_MSACSR";
     case REG_SP:      return "REG_SP";
     case REG_FLAGS:   return "REG_FLAGS";
     case REG_IP:      return "REG_IP";
@@ -419,7 +455,7 @@ static inline const char *generic_reg_name(unsigned id)
     } else if (id >= REG_ACC0 && id < REG_ACC0 + 4) {
         snprintf(buf, sizeof(buf), "REG_ACC%u", id - REG_ACC0);
     } else {
-        return NULL;  /* unallocated hole (246..249) */
+        return NULL;  /* unallocated ID */
     }
     return buf;
 }

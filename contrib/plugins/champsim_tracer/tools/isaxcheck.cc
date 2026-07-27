@@ -634,6 +634,17 @@ static std::string gensetstr(const std::set<unsigned> &s)
     return r.empty() ? "-" : r;
 }
 
+/* GenericRegId -> the short class token the signature keys use, matching
+ * the vocabulary norm_*() already produces for the registers that DO live
+ * in the ISA's register file (`fcsr` on MIPS, for instance). */
+static std::string sysreg_class_token(unsigned gen_id)
+{
+    if (!gen_id) return std::string();
+    std::string n = isax_generic_reg_name(gen_id);
+    if (n.compare(0, 4, "REG_") == 0) n.erase(0, 4);
+    return lower(n);
+}
+
 /*
  * Build the view the plugin's operand walker would build from the boundary's
  * output.  Deliberately mirrors decode_detail_to_generic() in
@@ -711,8 +722,19 @@ static void cs_decode(const uint8_t *b, size_t n, CsView &v,
             // catch: an instruction whose whole purpose is to move a
             // control register, appearing to move nothing.
             unsigned g = isax_generic_sysreg(op->reg_id);
-            std::string nm = op->reg_name[0] ? norm_reg(op->reg_name)
-                                             : std::string();
+            // The TOKEN is the class the dependency model records, not the
+            // architectural name.  The tracer folds the whole system
+            // register space onto REG_SYS apart from the few it models
+            // specifically (REG_FCSR, REG_VCTRL, REG_VSTART), so a token
+            // per architectural register would key a separate signature
+            // for every one of them -- 11445 on RISC-V alone, one line of
+            // allowlist per CSR number, which is the same problem
+            // liststr() already solves by collapsing register indices.
+            // Which SPECIFIC system register an instruction touches is a
+            // real question, and it is the implicit-operand table's, whose
+            // expectations come from the MRA and the Sail model and name
+            // the register exactly.
+            std::string nm = sysreg_class_token(g);
             if (op->access & QEMU_PLUGIN_OP_ACC_READ) {
                 if (!nm.empty()) v.rd.insert(nm);
                 v.grd.insert(g);

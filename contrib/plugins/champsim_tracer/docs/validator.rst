@@ -771,7 +771,7 @@ outside the repo as standalone scripts):
    fails as a new signature.  It needs no second decoder — it is the
    tracer measured against itself — so it also covers the encodings LLVM
    rejects, which is where a repair is least likely to be noticed
-   otherwise.  131 signatures across four ISAs: the RISC-V link dataflow,
+   otherwise.  140 signatures across four ISAs: the RISC-V link dataflow,
    the RVV whole-register group expansion, the trap and exception-return
    classifications no Capstone group covers, the x86 REP promotion to a
    self-looping branch, the AArch64 predicate-pair destination.

@@ -164,8 +164,6 @@ aarch64 M-cs-mem-llvm-none adr
 #  the complementary `R-*-phantom * +za*` form is deliberately absent: the
 #  boundary drops SME operands, so a ZA register can only ever be MISSING
 #  from its sets, never phantom in them.)
-aarch64 R-*-missing * +za*
-aarch64 R-rd-missing * +r#,za*
 
 # SVE2.1 / SME2 predicate-as-counter PAIR destinations: `whilege
 # { p14.b, p15.b }, ...` writes two predicate registers and Capstone reports
@@ -183,7 +181,6 @@ aarch64 R-rd-missing psel +r#
 # dependency.  The tracer models CSRs only through the specific ones the ISA
 # tables name (frm/fflags -> REG_FCSR, vl/vtype -> REG_VCTRL); a general CSR
 # index has no generic register id.  Documented in docs/limitations.rst.
-riscv64 Z-unmodelled-op csr*
 
 # MIPS MSA and FP control-register banks: MSAIR / MSACSR / MSASave /
 # MSAModify and the low-numbered FP control registers are named by Capstone
@@ -435,54 +432,10 @@ aarch64 M-miss-store prfb
 aarch64 M-miss-store prfd
 aarch64 M-miss-store prfh
 aarch64 M-miss-store prfw
-aarch64 R-rd-missing bfdot +r#,za
-aarch64 R-rd-missing bfmla +r#,za
-aarch64 R-rd-missing bfmlsl +r#,za
-aarch64 R-rd-missing bfmls +r#,v#,za
-aarch64 R-rd-missing bfmls +r#,za
-aarch64 R-rd-missing bfvdot +r#,za
-aarch64 R-rd-missing fdot +r#,v#,za
-aarch64 R-rd-missing fdot +r#,za
-aarch64 R-rd-missing fmlall +r#,za
-aarch64 R-rd-missing fmlal +r#,v#,za
-aarch64 R-rd-missing fmlal +r#,za
-aarch64 R-rd-missing fmla +r#,za
-aarch64 R-rd-missing fmls +r#,v#,za
-aarch64 R-rd-missing fmls +r#,za
-aarch64 R-rd-missing fvdot +r#,za
-aarch64 R-rd-missing fvdott +r#,za
-aarch64 R-rd-missing ld1b +r#
-aarch64 R-rd-missing ld1d +r#
-aarch64 R-rd-missing ld1h +r#
-aarch64 R-rd-missing ld1q +r#
-aarch64 R-rd-missing ld1w +r#
-aarch64 R-rd-missing ldr +r#
-aarch64 R-rd-missing movaz +r#,za#
-aarch64 R-rd-missing mov +r#,za
-aarch64 R-rd-missing mov +r#,za#
 aarch64 R-rd-missing psel +r#
-aarch64 R-rd-missing sdot +r#,za
-aarch64 R-rd-missing smlall +r#,za
-aarch64 R-rd-missing smlal +r#,za
-aarch64 R-rd-missing st1b +r#,za#
-aarch64 R-rd-missing st1d +r#,za#
-aarch64 R-rd-missing st1h +r#,za#
-aarch64 R-rd-missing st1q +r#,za#
-aarch64 R-rd-missing st1w +r#,za#
 aarch64 R-rd-missing st64b +r#
 aarch64 R-rd-missing st64bv0 +r#
 aarch64 R-rd-missing st64bv +r#
-aarch64 R-rd-missing str +r#,za
-aarch64 R-rd-missing sub +r#,v#,za
-aarch64 R-rd-missing sub +r#,za
-aarch64 R-rd-missing sudot +r#,za
-aarch64 R-rd-missing svdot +r#,za
-aarch64 R-rd-missing udot +r#,v#,za
-aarch64 R-rd-missing udot +r#,za
-aarch64 R-rd-missing umlsll +r#,za
-aarch64 R-rd-missing umlsl +r#,za
-aarch64 R-rd-missing usmlall +r#,za
-aarch64 R-rd-missing uvdot +r#,za
 aarch64 R-wr-missing ld64b +r#
 aarch64 R-wr-missing pext +p#
 aarch64 R-wr-missing whilegt +p#
@@ -503,8 +456,6 @@ riscv64 R-rd-missing ntl.p1 +r#
 riscv64 R-rd-missing ntl.pall +r#
 riscv64 R-rd-missing ntl.s1 +r#
 riscv64 R-rd-missing ret +r#
-riscv64 R-rd-missing vmclr.m +v#
-riscv64 R-rd-missing vmset.m +v#
 riscv64 R-rd-phantom jalr +r#
 riscv64 R-rd-phantom vmv1r.v +vl,vtype
 riscv64 R-rd-phantom vsetivli +vl,vtype
@@ -533,10 +484,6 @@ mipsel M-llvm-mem-cs-none absq_s.qb load store
 mipsel M-llvm-mem-cs-none cmpgu.eq.qb load store
 mipsel M-llvm-mem-cs-none cmpu.eq.qb load store
 mipsel M-llvm-mem-cs-none insv load
-mipsel R-rd-missing madd +ac#
-mipsel R-rd-missing maddu +ac#
-mipsel R-rd-missing msub +ac#
-mipsel R-rd-missing msubu +ac#
 mipsel R-rd-missing mthc1 +f#
 mipsel R-rd-phantom bgezall +r#
 mipsel R-rd-phantom bgezal +r#
@@ -544,7 +491,6 @@ mipsel R-rd-phantom bltzall +r#
 mipsel R-rd-phantom bltzal +r#
 mipsel R-rd-phantom cfc1 +cop#
 mipsel R-rd-phantom cfcmsa +cop#
-mipsel R-rd-phantom ctcmsa +cop#
 mipsel R-rd-phantom jalr +r#
 mipsel R-rd-phantom jr +r#
 mipsel R-rd-phantom lwl +r#
@@ -1579,16 +1525,7 @@ x86_64 Z-access0 nopw REG
 #     system-alias operands, which the plugin operand ABI has no
 #     representation for.  Listed explicitly rather than as a class-wide
 #     rule so a NEW unmodelled operand type still fails the gate.
-aarch64 Z-unmodelled-op addha
-aarch64 Z-unmodelled-op addva
 aarch64 Z-unmodelled-op at
-aarch64 Z-unmodelled-op bfadd
-aarch64 Z-unmodelled-op bfdot
-aarch64 Z-unmodelled-op bfmla
-aarch64 Z-unmodelled-op bfmls
-aarch64 Z-unmodelled-op bfmlsl
-aarch64 Z-unmodelled-op bfmopa
-aarch64 Z-unmodelled-op bfvdot
 aarch64 Z-unmodelled-op cntb
 aarch64 Z-unmodelled-op cntd
 aarch64 Z-unmodelled-op cnth
@@ -1606,39 +1543,19 @@ aarch64 Z-unmodelled-op fcmgt
 aarch64 Z-unmodelled-op fcmle
 aarch64 Z-unmodelled-op fcmlt
 aarch64 Z-unmodelled-op fcmne
-aarch64 Z-unmodelled-op fdot
 aarch64 Z-unmodelled-op fmax
 aarch64 Z-unmodelled-op fmaxnm
 aarch64 Z-unmodelled-op fmin
 aarch64 Z-unmodelled-op fminnm
-aarch64 Z-unmodelled-op fmla
-aarch64 Z-unmodelled-op fmlal
-aarch64 Z-unmodelled-op fmlall
-aarch64 Z-unmodelled-op fmls
-aarch64 Z-unmodelled-op fmopa
 aarch64 Z-unmodelled-op fmov
 aarch64 Z-unmodelled-op fmul
 aarch64 Z-unmodelled-op fsub
 aarch64 Z-unmodelled-op fsubr
-aarch64 Z-unmodelled-op fvdot
-aarch64 Z-unmodelled-op fvdotb
-aarch64 Z-unmodelled-op fvdott
 aarch64 Z-unmodelled-op incb
 aarch64 Z-unmodelled-op incd
 aarch64 Z-unmodelled-op inch
 aarch64 Z-unmodelled-op incw
-aarch64 Z-unmodelled-op ld1b
-aarch64 Z-unmodelled-op ld1d
-aarch64 Z-unmodelled-op ld1h
-aarch64 Z-unmodelled-op ld1q
-aarch64 Z-unmodelled-op ld1w
-aarch64 Z-unmodelled-op ldr
-aarch64 Z-unmodelled-op mov
-aarch64 Z-unmodelled-op movaz
-aarch64 Z-unmodelled-op mrrs
-aarch64 Z-unmodelled-op mrs
 aarch64 Z-unmodelled-op msr
-aarch64 Z-unmodelled-op msrr
 aarch64 Z-unmodelled-op prfb
 aarch64 Z-unmodelled-op prfd
 aarch64 Z-unmodelled-op prfh
@@ -1648,10 +1565,6 @@ aarch64 Z-unmodelled-op prfw
 aarch64 Z-unmodelled-op ptrue
 aarch64 Z-unmodelled-op ptrues
 aarch64 Z-unmodelled-op rprfm
-aarch64 Z-unmodelled-op sdot
-aarch64 Z-unmodelled-op smlal
-aarch64 Z-unmodelled-op smlall
-aarch64 Z-unmodelled-op smopa
 aarch64 Z-unmodelled-op sqdecb
 aarch64 Z-unmodelled-op sqdecd
 aarch64 Z-unmodelled-op sqdech
@@ -1660,25 +1573,11 @@ aarch64 Z-unmodelled-op sqincb
 aarch64 Z-unmodelled-op sqincd
 aarch64 Z-unmodelled-op sqinch
 aarch64 Z-unmodelled-op sqincw
-aarch64 Z-unmodelled-op st1b
-aarch64 Z-unmodelled-op st1d
-aarch64 Z-unmodelled-op st1h
-aarch64 Z-unmodelled-op st1q
-aarch64 Z-unmodelled-op st1w
-aarch64 Z-unmodelled-op str
-aarch64 Z-unmodelled-op sub
-aarch64 Z-unmodelled-op sudot
-aarch64 Z-unmodelled-op sumopa
-aarch64 Z-unmodelled-op svdot
 aarch64 Z-unmodelled-op sys
 aarch64 Z-unmodelled-op sysl
 aarch64 Z-unmodelled-op sysp
 aarch64 Z-unmodelled-op tlbi
 aarch64 Z-unmodelled-op tlbip
-aarch64 Z-unmodelled-op udot
-aarch64 Z-unmodelled-op umlsl
-aarch64 Z-unmodelled-op umlsll
-aarch64 Z-unmodelled-op umopa
 aarch64 Z-unmodelled-op uqdecb
 aarch64 Z-unmodelled-op uqdecd
 aarch64 Z-unmodelled-op uqdech
@@ -1687,14 +1586,10 @@ aarch64 Z-unmodelled-op uqincb
 aarch64 Z-unmodelled-op uqincd
 aarch64 Z-unmodelled-op uqinch
 aarch64 Z-unmodelled-op uqincw
-aarch64 Z-unmodelled-op usmlall
-aarch64 Z-unmodelled-op usmopa
-aarch64 Z-unmodelled-op uvdot
 aarch64 Z-unmodelled-op whilegt
 aarch64 Z-unmodelled-op whilehi
 aarch64 Z-unmodelled-op whilele
 aarch64 Z-unmodelled-op whilels
-aarch64 Z-unmodelled-op zero
 
 # --- riscv64: branch-taxonomy and memory-presence differences on the
 #     vendor/draft extensions the chosen LLVM subtarget does not enable,
@@ -2268,3 +2163,475 @@ x86_64 Z-access0 rdsspd REG
 x86_64 Z-access0 rdsspq REG
 x86_64 Z-access0 rstorssp MEM
 x86_64 Z-access0 umonitor REG
+
+# =====================================================================
+# 7. The control state the boundary started reporting, that LLVM does
+#    not describe.
+#
+#    Three repairs landed after this file was last derived -- the AArch64
+#    system-register operand, the RISC-V CSR operand, and the FPCR/NZCV
+#    implicit reads -- and they moved the disagreement to the other side.
+#    Where the boundary used to drop a register and LLVM named it, the
+#    boundary now names state LLVM's MCInstrDesc carries no implicit use
+#    for at all.  A `phantom` verdict in this section does NOT mean the
+#    tracer invented a dependency: it means the second decoder has no
+#    description of that state, the same way it has none for x86 MXCSR
+#    (section 1).  Where the two disagree about architectural fact rather
+#    than about modelling, the instrument that decides is the
+#    implicit-operand table, whose ground truth is the Arm MRA and the
+#    Sail model rather than a decoder -- and it now scores these rows OK.
+#
+#    The system-register TOKEN in these keys is the class the dependency
+#    model records (`sys`, `fcsr`, `vctrl`, `vstart`), not the
+#    architectural name.  The tracer folds the whole system-register space
+#    onto REG_SYS apart from the few it models specifically, so a token per
+#    architectural register would key a separate signature for each -- 11445
+#    of them on RISC-V, one allowlist line per CSR number.  WHICH system
+#    register an instruction touches is a real question and it is the
+#    implicit table's, which names each one exactly.
+# =====================================================================
+
+# AArch64 FPCR: every SVE and scalar-FP operation reads the rounding mode
+# and the flush-to-zero controls.  The MRA says so, the boundary now
+# reports it, and LLVM models no FPCR use.
+aarch64 R-rd-phantom fabs +fpcr
+aarch64 R-rd-phantom fadda +fpcr
+aarch64 R-rd-phantom fccmp +fpcr
+aarch64 R-rd-phantom fccmpe +fpcr
+aarch64 R-rd-phantom fneg +fpcr
+aarch64 R-rd-phantom sqabs +fpcr
+aarch64 R-rd-phantom sqadd +fpcr
+aarch64 R-rd-phantom sqcadd +fpcr
+aarch64 R-rd-phantom sqcvt +fpcr
+aarch64 R-rd-phantom sqcvtn +fpcr
+aarch64 R-rd-phantom sqcvtu +fpcr
+aarch64 R-rd-phantom sqcvtun +fpcr
+aarch64 R-rd-phantom sqdecb +fpcr
+aarch64 R-rd-phantom sqdecd +fpcr
+aarch64 R-rd-phantom sqdech +fpcr
+aarch64 R-rd-phantom sqdecp +fpcr
+aarch64 R-rd-phantom sqdecw +fpcr
+aarch64 R-rd-phantom sqdmlal +fpcr
+aarch64 R-rd-phantom sqdmlal2 +fpcr
+aarch64 R-rd-phantom sqdmlalb +fpcr
+aarch64 R-rd-phantom sqdmlalbt +fpcr
+aarch64 R-rd-phantom sqdmlalt +fpcr
+aarch64 R-rd-phantom sqdmlsl +fpcr
+aarch64 R-rd-phantom sqdmlsl2 +fpcr
+aarch64 R-rd-phantom sqdmlslb +fpcr
+aarch64 R-rd-phantom sqdmlslbt +fpcr
+aarch64 R-rd-phantom sqdmlslt +fpcr
+aarch64 R-rd-phantom sqdmulh +fpcr
+aarch64 R-rd-phantom sqdmull +fpcr
+aarch64 R-rd-phantom sqdmull2 +fpcr
+aarch64 R-rd-phantom sqdmullb +fpcr
+aarch64 R-rd-phantom sqdmullt +fpcr
+aarch64 R-rd-phantom sqincb +fpcr
+aarch64 R-rd-phantom sqincd +fpcr
+aarch64 R-rd-phantom sqinch +fpcr
+aarch64 R-rd-phantom sqincp +fpcr
+aarch64 R-rd-phantom sqincw +fpcr
+aarch64 R-rd-phantom sqneg +fpcr
+aarch64 R-rd-phantom sqrdcmlah +fpcr
+aarch64 R-rd-phantom sqrdmlah +fpcr
+aarch64 R-rd-phantom sqrdmlsh +fpcr
+aarch64 R-rd-phantom sqrdmulh +fpcr
+aarch64 R-rd-phantom sqrshl +fpcr
+aarch64 R-rd-phantom sqrshlr +fpcr
+aarch64 R-rd-phantom sqrshr +fpcr
+aarch64 R-rd-phantom sqrshrn +fpcr
+aarch64 R-rd-phantom sqrshrn2 +fpcr
+aarch64 R-rd-phantom sqrshrnb +fpcr
+aarch64 R-rd-phantom sqrshrnt +fpcr
+aarch64 R-rd-phantom sqrshru +fpcr
+aarch64 R-rd-phantom sqrshrun +fpcr
+aarch64 R-rd-phantom sqrshrun2 +fpcr
+aarch64 R-rd-phantom sqrshrunb +fpcr
+aarch64 R-rd-phantom sqrshrunt +fpcr
+aarch64 R-rd-phantom sqshl +fpcr
+aarch64 R-rd-phantom sqshlr +fpcr
+aarch64 R-rd-phantom sqshlu +fpcr
+aarch64 R-rd-phantom sqshrn +fpcr
+aarch64 R-rd-phantom sqshrn2 +fpcr
+aarch64 R-rd-phantom sqshrnb +fpcr
+aarch64 R-rd-phantom sqshrnt +fpcr
+aarch64 R-rd-phantom sqshrun +fpcr
+aarch64 R-rd-phantom sqshrun2 +fpcr
+aarch64 R-rd-phantom sqshrunb +fpcr
+aarch64 R-rd-phantom sqshrunt +fpcr
+aarch64 R-rd-phantom sqsub +fpcr
+aarch64 R-rd-phantom sqsubr +fpcr
+aarch64 R-rd-phantom sqxtn +fpcr
+aarch64 R-rd-phantom sqxtn2 +fpcr
+aarch64 R-rd-phantom sqxtnb +fpcr
+aarch64 R-rd-phantom sqxtnt +fpcr
+aarch64 R-rd-phantom sqxtun +fpcr
+aarch64 R-rd-phantom sqxtun2 +fpcr
+aarch64 R-rd-phantom sqxtunb +fpcr
+aarch64 R-rd-phantom sqxtunt +fpcr
+aarch64 R-rd-phantom uqadd +fpcr
+aarch64 R-rd-phantom uqcvt +fpcr
+aarch64 R-rd-phantom uqcvtn +fpcr
+aarch64 R-rd-phantom uqdecb +fpcr
+aarch64 R-rd-phantom uqdecd +fpcr
+aarch64 R-rd-phantom uqdech +fpcr
+aarch64 R-rd-phantom uqdecp +fpcr
+aarch64 R-rd-phantom uqdecw +fpcr
+aarch64 R-rd-phantom uqincb +fpcr
+aarch64 R-rd-phantom uqincd +fpcr
+aarch64 R-rd-phantom uqinch +fpcr
+aarch64 R-rd-phantom uqincp +fpcr
+aarch64 R-rd-phantom uqincw +fpcr
+aarch64 R-rd-phantom uqrshl +fpcr
+aarch64 R-rd-phantom uqrshlr +fpcr
+aarch64 R-rd-phantom uqrshr +fpcr
+aarch64 R-rd-phantom uqrshrn +fpcr
+aarch64 R-rd-phantom uqrshrn2 +fpcr
+aarch64 R-rd-phantom uqrshrnb +fpcr
+aarch64 R-rd-phantom uqrshrnt +fpcr
+aarch64 R-rd-phantom uqshl +fpcr
+aarch64 R-rd-phantom uqshlr +fpcr
+aarch64 R-rd-phantom uqshrn +fpcr
+aarch64 R-rd-phantom uqshrn2 +fpcr
+aarch64 R-rd-phantom uqshrnb +fpcr
+aarch64 R-rd-phantom uqshrnt +fpcr
+aarch64 R-rd-phantom uqsub +fpcr
+aarch64 R-rd-phantom uqsubr +fpcr
+aarch64 R-rd-phantom uqxtn +fpcr
+aarch64 R-rd-phantom uqxtn2 +fpcr
+aarch64 R-rd-phantom uqxtnb +fpcr
+aarch64 R-rd-phantom uqxtnt +fpcr
+
+# AArch64 FEAT_MOPS NZCV: the CPYFP / CPYP / SETP prologue reads NZCV, and
+# it is the ONLY register edge tying a P -> M -> E chain together.  The
+# implicit table carried these at 3.2 M and 1.7 M dynamic weight and scored
+# them `fix` until the repair landed.  LLVM models no NZCV use on them.
+aarch64 R-rd-phantom cpyfp +nzcv
+aarch64 R-rd-phantom cpyfpn +nzcv
+aarch64 R-rd-phantom cpyfprn +nzcv
+aarch64 R-rd-phantom cpyfprt +nzcv
+aarch64 R-rd-phantom cpyfprtn +nzcv
+aarch64 R-rd-phantom cpyfprtrn +nzcv
+aarch64 R-rd-phantom cpyfprtwn +nzcv
+aarch64 R-rd-phantom cpyfpt +nzcv
+aarch64 R-rd-phantom cpyfptn +nzcv
+aarch64 R-rd-phantom cpyfptrn +nzcv
+aarch64 R-rd-phantom cpyfptwn +nzcv
+aarch64 R-rd-phantom cpyfpwn +nzcv
+aarch64 R-rd-phantom cpyfpwt +nzcv
+aarch64 R-rd-phantom cpyfpwtn +nzcv
+aarch64 R-rd-phantom cpyfpwtrn +nzcv
+aarch64 R-rd-phantom cpyfpwtwn +nzcv
+aarch64 R-rd-phantom cpyp +nzcv
+aarch64 R-rd-phantom cpypn +nzcv
+aarch64 R-rd-phantom cpyprn +nzcv
+aarch64 R-rd-phantom cpyprt +nzcv
+aarch64 R-rd-phantom cpyprtn +nzcv
+aarch64 R-rd-phantom cpyprtrn +nzcv
+aarch64 R-rd-phantom cpyprtwn +nzcv
+aarch64 R-rd-phantom cpypt +nzcv
+aarch64 R-rd-phantom cpyptn +nzcv
+aarch64 R-rd-phantom cpyptrn +nzcv
+aarch64 R-rd-phantom cpyptwn +nzcv
+aarch64 R-rd-phantom cpypwn +nzcv
+aarch64 R-rd-phantom cpypwt +nzcv
+aarch64 R-rd-phantom cpypwtn +nzcv
+aarch64 R-rd-phantom cpypwtrn +nzcv
+aarch64 R-rd-phantom cpypwtwn +nzcv
+aarch64 R-rd-phantom setgp +nzcv
+aarch64 R-rd-phantom setgpn +nzcv
+aarch64 R-rd-phantom setgpt +nzcv
+aarch64 R-rd-phantom setgptn +nzcv
+aarch64 R-rd-phantom setp +nzcv
+aarch64 R-rd-phantom setpn +nzcv
+aarch64 R-rd-phantom setpt +nzcv
+aarch64 R-rd-phantom setptn +nzcv
+
+# The general system-register space (REG_SYS): AArch64 MRS/MSR/MRRS/MSRR and
+# the RISC-V Zicsr accesses.  The boundary reports the register the
+# instruction moves; LLVM's description of these instructions has no
+# register operand for it at all.
+aarch64 R-rd-phantom mrrs +sys
+aarch64 R-rd-phantom mrs +sys
+aarch64 R-wr-phantom msr +sys
+aarch64 R-wr-phantom msrr +sys
+
+# The FP control/status register the tracer models specifically (REG_FCSR):
+# AArch64 FPSR/FPCR reached through MSR/MRS, RISC-V fflags / frm / fcsr and
+# the FP-alias CSR forms.
+aarch64 R-rd-phantom mrrs +fcsr
+aarch64 R-rd-phantom mrs +fcsr
+aarch64 R-wr-phantom msr +fcsr
+aarch64 R-wr-phantom msrr +fcsr
+
+# Vector-register differences.  On AArch64 these are the SME multi-vector
+# register LISTS -- `{ z4.h - z7.h }` names four and Capstone reports three
+# -- a residual boundary gap on a feature no guest the tracer runs can
+# execute, so the weight is zero.  On RISC-V they are the vector
+# DESTINATION read: under tail-undisturbed and mask-undisturbed policy the
+# elements `vd` does not write keep their old values, so `vd` really is a
+# source; the Sail model records exactly this and LLVM does not.
+aarch64 R-rd-missing bfmls +v#
+aarch64 R-rd-missing fdot +v#
+aarch64 R-rd-missing fmlal +v#
+aarch64 R-rd-missing fmls +v#
+aarch64 R-rd-missing sub +v#
+aarch64 R-rd-missing udot +v#
+
+# SME ZA tile and slice indexing, where the two decoders number the
+# accumulator differently.  Same zero-weight SME space.
+aarch64 R-rd-phantom zero +za#
+aarch64 R-wr-phantom zero +za#
+
+# The general system-register space (REG_SYS): AArch64 MRS/MSR/MRRS/MSRR and
+# the RISC-V Zicsr accesses.  The boundary reports the register the
+# instruction moves; LLVM's description of these instructions has no
+# register operand for it at all.
+riscv64 R-rd-phantom csrc +sys
+riscv64 R-rd-phantom csrci +sys
+riscv64 R-rd-phantom csrr +sys
+riscv64 R-rd-phantom csrrc +sys
+riscv64 R-rd-phantom csrrci +sys
+riscv64 R-rd-phantom csrrs +sys
+riscv64 R-rd-phantom csrrsi +sys
+riscv64 R-rd-phantom csrrw +sys
+riscv64 R-rd-phantom csrrwi +sys
+riscv64 R-rd-phantom csrs +sys
+riscv64 R-rd-phantom csrsi +sys
+riscv64 R-rd-phantom rdcycle +sys
+riscv64 R-rd-phantom rdinstret +sys
+riscv64 R-rd-phantom rdtime +sys
+riscv64 R-wr-phantom csrc +sys
+riscv64 R-wr-phantom csrci +sys
+riscv64 R-wr-phantom csrrc +sys
+riscv64 R-wr-phantom csrrci +sys
+riscv64 R-wr-phantom csrrs +sys
+riscv64 R-wr-phantom csrrsi +sys
+riscv64 R-wr-phantom csrrw +sys
+riscv64 R-wr-phantom csrrwi +sys
+riscv64 R-wr-phantom csrs +sys
+riscv64 R-wr-phantom csrsi +sys
+riscv64 R-wr-phantom csrw +sys
+riscv64 R-wr-phantom csrwi +sys
+riscv64 R-wr-phantom unimp +sys
+
+# The FP control/status register the tracer models specifically (REG_FCSR):
+# AArch64 FPSR/FPCR reached through MSR/MRS, RISC-V fflags / frm / fcsr and
+# the FP-alias CSR forms.
+riscv64 R-rd-phantom csrc +fcsr
+riscv64 R-rd-phantom csrci +fcsr
+riscv64 R-rd-phantom csrrc +fcsr
+riscv64 R-rd-phantom csrrci +fcsr
+riscv64 R-rd-phantom csrrs +fcsr
+riscv64 R-rd-phantom csrrsi +fcsr
+riscv64 R-rd-phantom csrrwi +fcsr
+riscv64 R-rd-phantom csrs +fcsr
+riscv64 R-rd-phantom csrsi +fcsr
+riscv64 R-rd-phantom frcsr +fcsr
+riscv64 R-rd-phantom frflags +fcsr
+riscv64 R-rd-phantom frrm +fcsr
+riscv64 R-rd-phantom fscsr +fcsr
+riscv64 R-rd-phantom fsflags +fcsr
+riscv64 R-rd-phantom fsflagsi +fcsr
+riscv64 R-rd-phantom fsrm +fcsr
+riscv64 R-rd-phantom fsrmi +fcsr
+riscv64 R-wr-phantom csrc +fcsr
+riscv64 R-wr-phantom csrci +fcsr
+riscv64 R-wr-phantom csrrc +fcsr
+riscv64 R-wr-phantom csrrci +fcsr
+riscv64 R-wr-phantom csrrs +fcsr
+riscv64 R-wr-phantom csrrsi +fcsr
+riscv64 R-wr-phantom csrrwi +fcsr
+riscv64 R-wr-phantom csrs +fcsr
+riscv64 R-wr-phantom csrsi +fcsr
+riscv64 R-wr-phantom csrwi +fcsr
+riscv64 R-wr-phantom fscsr +fcsr
+riscv64 R-wr-phantom fsflags +fcsr
+riscv64 R-wr-phantom fsflagsi +fcsr
+riscv64 R-wr-phantom fsrm +fcsr
+riscv64 R-wr-phantom fsrmi +fcsr
+
+# RISC-V vector control (REG_VCTRL): vl / vtype / vxrm / vxsat reached
+# through a CSR access.
+riscv64 R-rd-phantom csrc +vctrl
+riscv64 R-rd-phantom csrci +vctrl
+riscv64 R-rd-phantom csrr +vctrl
+riscv64 R-rd-phantom csrrc +vctrl
+riscv64 R-rd-phantom csrrci +vctrl
+riscv64 R-rd-phantom csrrs +vctrl
+riscv64 R-rd-phantom csrrsi +vctrl
+riscv64 R-rd-phantom csrrw +vctrl
+riscv64 R-rd-phantom csrrwi +vctrl
+riscv64 R-rd-phantom csrs +vctrl
+riscv64 R-rd-phantom csrsi +vctrl
+riscv64 R-wr-phantom csrc +vctrl
+riscv64 R-wr-phantom csrci +vctrl
+riscv64 R-wr-phantom csrrc +vctrl
+riscv64 R-wr-phantom csrrci +vctrl
+riscv64 R-wr-phantom csrrs +vctrl
+riscv64 R-wr-phantom csrrsi +vctrl
+riscv64 R-wr-phantom csrrw +vctrl
+riscv64 R-wr-phantom csrrwi +vctrl
+riscv64 R-wr-phantom csrs +vctrl
+riscv64 R-wr-phantom csrsi +vctrl
+riscv64 R-wr-phantom csrw +vctrl
+riscv64 R-wr-phantom csrwi +vctrl
+
+# RISC-V vstart (REG_VSTART): the element index a trapped vector
+# instruction resumes from.
+riscv64 R-rd-phantom csrc +vstart
+riscv64 R-rd-phantom csrci +vstart
+riscv64 R-rd-phantom csrr +vstart
+riscv64 R-rd-phantom csrrc +vstart
+riscv64 R-rd-phantom csrrci +vstart
+riscv64 R-rd-phantom csrrs +vstart
+riscv64 R-rd-phantom csrrsi +vstart
+riscv64 R-rd-phantom csrrw +vstart
+riscv64 R-rd-phantom csrrwi +vstart
+riscv64 R-rd-phantom csrs +vstart
+riscv64 R-rd-phantom csrsi +vstart
+riscv64 R-wr-phantom csrc +vstart
+riscv64 R-wr-phantom csrci +vstart
+riscv64 R-wr-phantom csrrc +vstart
+riscv64 R-wr-phantom csrrci +vstart
+riscv64 R-wr-phantom csrrs +vstart
+riscv64 R-wr-phantom csrrsi +vstart
+riscv64 R-wr-phantom csrrw +vstart
+riscv64 R-wr-phantom csrrwi +vstart
+riscv64 R-wr-phantom csrs +vstart
+riscv64 R-wr-phantom csrsi +vstart
+riscv64 R-wr-phantom csrw +vstart
+riscv64 R-wr-phantom csrwi +vstart
+
+# RISC-V `frm`: the dynamic rounding mode every FP operation encoded with
+# rm = 111 reads.  Sail records it; LLVM models no `frm` use.
+riscv64 R-rd-phantom fadd.d +frm
+riscv64 R-rd-phantom fadd.h +frm
+riscv64 R-rd-phantom fadd.s +frm
+riscv64 R-rd-phantom fcvt.bf16.s +frm
+riscv64 R-rd-phantom fcvt.d.h +frm
+riscv64 R-rd-phantom fcvt.d.l +frm
+riscv64 R-rd-phantom fcvt.d.lu +frm
+riscv64 R-rd-phantom fcvt.d.s +frm
+riscv64 R-rd-phantom fcvt.d.w +frm
+riscv64 R-rd-phantom fcvt.d.wu +frm
+riscv64 R-rd-phantom fcvt.h.d +frm
+riscv64 R-rd-phantom fcvt.h.l +frm
+riscv64 R-rd-phantom fcvt.h.lu +frm
+riscv64 R-rd-phantom fcvt.h.s +frm
+riscv64 R-rd-phantom fcvt.h.w +frm
+riscv64 R-rd-phantom fcvt.h.wu +frm
+riscv64 R-rd-phantom fcvt.l.d +frm
+riscv64 R-rd-phantom fcvt.l.h +frm
+riscv64 R-rd-phantom fcvt.l.s +frm
+riscv64 R-rd-phantom fcvt.lu.d +frm
+riscv64 R-rd-phantom fcvt.lu.h +frm
+riscv64 R-rd-phantom fcvt.lu.s +frm
+riscv64 R-rd-phantom fcvt.s.bf16 +frm
+riscv64 R-rd-phantom fcvt.s.d +frm
+riscv64 R-rd-phantom fcvt.s.h +frm
+riscv64 R-rd-phantom fcvt.s.l +frm
+riscv64 R-rd-phantom fcvt.s.lu +frm
+riscv64 R-rd-phantom fcvt.s.w +frm
+riscv64 R-rd-phantom fcvt.s.wu +frm
+riscv64 R-rd-phantom fcvt.w.d +frm
+riscv64 R-rd-phantom fcvt.w.h +frm
+riscv64 R-rd-phantom fcvt.w.s +frm
+riscv64 R-rd-phantom fcvt.wu.d +frm
+riscv64 R-rd-phantom fcvt.wu.h +frm
+riscv64 R-rd-phantom fcvt.wu.s +frm
+riscv64 R-rd-phantom fcvtmod.w.d +frm
+riscv64 R-rd-phantom fdiv.d +frm
+riscv64 R-rd-phantom fdiv.h +frm
+riscv64 R-rd-phantom fdiv.s +frm
+riscv64 R-rd-phantom fmadd.d +frm
+riscv64 R-rd-phantom fmadd.h +frm
+riscv64 R-rd-phantom fmadd.s +frm
+riscv64 R-rd-phantom fmsub.d +frm
+riscv64 R-rd-phantom fmsub.h +frm
+riscv64 R-rd-phantom fmsub.s +frm
+riscv64 R-rd-phantom fmul.d +frm
+riscv64 R-rd-phantom fmul.h +frm
+riscv64 R-rd-phantom fmul.s +frm
+riscv64 R-rd-phantom fnmadd.d +frm
+riscv64 R-rd-phantom fnmadd.h +frm
+riscv64 R-rd-phantom fnmadd.s +frm
+riscv64 R-rd-phantom fnmsub.d +frm
+riscv64 R-rd-phantom fnmsub.h +frm
+riscv64 R-rd-phantom fnmsub.s +frm
+riscv64 R-rd-phantom fround.d +frm
+riscv64 R-rd-phantom fround.h +frm
+riscv64 R-rd-phantom fround.s +frm
+riscv64 R-rd-phantom froundnx.d +frm
+riscv64 R-rd-phantom froundnx.h +frm
+riscv64 R-rd-phantom froundnx.s +frm
+riscv64 R-rd-phantom fsqrt.d +frm
+riscv64 R-rd-phantom fsqrt.h +frm
+riscv64 R-rd-phantom fsqrt.s +frm
+riscv64 R-rd-phantom fsub.d +frm
+riscv64 R-rd-phantom fsub.h +frm
+riscv64 R-rd-phantom fsub.s +frm
+
+# Vector-register differences.  On AArch64 these are the SME multi-vector
+# register LISTS -- `{ z4.h - z7.h }` names four and Capstone reports three
+# -- a residual boundary gap on a feature no guest the tracer runs can
+# execute, so the weight is zero.  On RISC-V they are the vector
+# DESTINATION read: under tail-undisturbed and mask-undisturbed policy the
+# elements `vd` does not write keep their old values, so `vd` really is a
+# source; the Sail model records exactly this and LLVM does not.
+riscv64 R-rd-phantom vlm.v +v#
+riscv64 R-rd-phantom vmadc.vi +v#
+riscv64 R-rd-phantom vmadc.vv +v#
+riscv64 R-rd-phantom vmadc.vx +v#
+riscv64 R-rd-phantom vmand.mm +v#
+riscv64 R-rd-phantom vmandn.mm +v#
+riscv64 R-rd-phantom vmfeq.vf +v#
+riscv64 R-rd-phantom vmfeq.vv +v#
+riscv64 R-rd-phantom vmfge.vf +v#
+riscv64 R-rd-phantom vmfgt.vf +v#
+riscv64 R-rd-phantom vmfle.vf +v#
+riscv64 R-rd-phantom vmfle.vv +v#
+riscv64 R-rd-phantom vmflt.vf +v#
+riscv64 R-rd-phantom vmflt.vv +v#
+riscv64 R-rd-phantom vmfne.vf +v#
+riscv64 R-rd-phantom vmfne.vv +v#
+riscv64 R-rd-phantom vmmv.m +v#
+riscv64 R-rd-phantom vmnand.mm +v#
+riscv64 R-rd-phantom vmnor.mm +v#
+riscv64 R-rd-phantom vmnot.m +v#
+riscv64 R-rd-phantom vmor.mm +v#
+riscv64 R-rd-phantom vmorn.mm +v#
+riscv64 R-rd-phantom vmsbc.vv +v#
+riscv64 R-rd-phantom vmsbc.vx +v#
+riscv64 R-rd-phantom vmsbf.m +v#
+riscv64 R-rd-phantom vmseq.vi +v#
+riscv64 R-rd-phantom vmseq.vv +v#
+riscv64 R-rd-phantom vmseq.vx +v#
+riscv64 R-rd-phantom vmsgt.vi +v#
+riscv64 R-rd-phantom vmsgt.vx +v#
+riscv64 R-rd-phantom vmsgtu.vi +v#
+riscv64 R-rd-phantom vmsgtu.vx +v#
+riscv64 R-rd-phantom vmsle.vi +v#
+riscv64 R-rd-phantom vmsle.vv +v#
+riscv64 R-rd-phantom vmsle.vx +v#
+riscv64 R-rd-phantom vmsleu.vi +v#
+riscv64 R-rd-phantom vmsleu.vv +v#
+riscv64 R-rd-phantom vmsleu.vx +v#
+riscv64 R-rd-phantom vmslt.vv +v#
+riscv64 R-rd-phantom vmslt.vx +v#
+riscv64 R-rd-phantom vmsltu.vv +v#
+riscv64 R-rd-phantom vmsltu.vx +v#
+riscv64 R-rd-phantom vmsne.vi +v#
+riscv64 R-rd-phantom vmsne.vv +v#
+riscv64 R-rd-phantom vmsne.vx +v#
+riscv64 R-rd-phantom vmsof.m +v#
+riscv64 R-rd-phantom vmxnor.mm +v#
+riscv64 R-rd-phantom vmxor.mm +v#
+
+# MIPS DSPControl: `bposge32` branches on the DSPControl `pos` field, and
+# the boundary now reports the read.  LLVM models no DSPControl use.
+mipsel R-rd-phantom bposge32 +dsp
+
+# MIPS MSA control registers reached through CTCMSA, which the boundary
+# reports and LLVM does not.
+mipsel R-wr-phantom ctcmsa +cop#

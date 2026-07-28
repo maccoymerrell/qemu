@@ -773,7 +773,7 @@ static void cs_decode(const uint8_t *b, size_t n, CsView &v,
             // The TOKEN is the class the dependency model records, not the
             // architectural name.  The tracer folds the whole system
             // register space onto REG_SYS apart from the few it models
-            // specifically (REG_FCSR, REG_VCTRL, REG_VSTART), so a token
+            // specifically (REG_FCSR, REG_VCTRL, REG_TLS), so a token
             // per architectural register would key a separate signature
             // for every one of them -- 11445 on RISC-V alone, one line of
             // allowlist per CSR number, which is the same problem

@@ -458,6 +458,35 @@ static std::string norm_mips(std::string r) {
      */
     if (r.compare(0, 3, "hwr") == 0 && all_digits(r.c_str() + 3))
         return "cop" + r.substr(3);
+    /*
+     * The MSA control registers, same problem as HWR one step further: the
+     * MSA specification gives them NAMES and Capstone gives them NUMBERS, so
+     * `ctcmsa $1, $v1` arrives here as "1" and lands in the coprocessor
+     * namespace while LLVM spells the same operand "MSACSR".
+     *
+     * The correspondence below is not a second opinion about what these
+     * registers ARE -- it is the register-number column of the MSA
+     * specification (MSAIR is control register 0, MSACSR is 1, and so on
+     * through MSAUnmap at 7), which is architectural and cannot move.  What
+     * it deliberately does NOT do is map a name to a GenericRegId: LLVM's
+     * spelling is folded onto the token Capstone's id already occupies, so
+     * the generic id still comes from the tracer's own table, exactly as it
+     * does for HWR29 above.  That is the property that keeps a spelling
+     * table from drifting -- it carries no classification of its own.
+     *
+     * Without it the tool could not tell the two decoders were naming the
+     * same register, and reported that as seven boundary disagreements and
+     * five FN-unmapped-llvm-reg diagnostics.  What is left once the spelling
+     * is folded is one real modelling difference, on CTCMSA only: LLVM's
+     * MCInstrDesc carries the control register as a USE, where Capstone and
+     * the tracer both make it the DEF that a "copy to control register"
+     * instruction plainly writes.
+     */
+    static const char *msa_ctl[8] = {
+        "msair", "msacsr", "msaaccess", "msasave",
+        "msamodify", "msarequest", "msamap", "msaunmap"};
+    for (int i = 0; i < 8; i++)
+        if (r == msa_ctl[i]) return "cop" + std::to_string(i);
     if (r.compare(0, 3, "fcr") == 0 || r == "fcsr") return "fcsr";
     // DSPOutFlag<n> / DSPOutFlag<a>_<b> / DSPCCond / DSPCarry are bit fields
     // of the one DSPControl register; both decoders slice it differently and

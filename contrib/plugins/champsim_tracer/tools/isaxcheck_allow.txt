@@ -189,18 +189,17 @@ aarch64 R-rd-missing psel +r#
 # tables name (frm/fflags -> REG_FCSR, vl/vtype -> REG_VCTRL); a general CSR
 # index has no generic register id.  Documented in docs/limitations.rst.
 
-# MIPS MSA and FP control-register banks: MSAIR / MSACSR / MSASave /
-# MSAModify and the low-numbered FP control registers are named by Capstone
-# as bare coprocessor indices.  The tracer folds every coprocessor register
-# onto REG_SYS and every FP control register onto REG_FCSR, so the bank
-# distinction is not expressible in the dependency model even when the
-# decoders agree on it.  Note this is NOT the "coprocessor writes
-# attributed to a same-numbered GPR" family the ground-truth study
-# reported: at the boundary those registers arrive as MIPS_REG_COP0n /
-# MIPS_REG_COP2n and map correctly (verified with
-# `cstool -d mips32r2 00188040`, `mtc0 $zero,$3`).
-mipsel R-rd-missing c*cmsa +msa*
-mipsel R-rd-phantom c*cmsa +cop#
+# (The two `c*cmsa` entries that used to stand here were not a disagreement
+# between the decoders at all.  They said the bank distinction between the
+# MSA control registers was inexpressible, but what the tool was actually
+# reporting is that it could not tell Capstone's bare control-register
+# NUMBER and LLVM's MSA control-register NAME were the same operand.  The
+# MIPS normaliser folds LLVM's spelling onto the number now, using the
+# register-number column of the MSA specification, and CFCMSA agrees
+# outright.  What survives is one real difference, on CTCMSA only, and it
+# is listed at the end of this file with the reason it happens.  The FP
+# control registers keep their own entries below; only the MSA half of the
+# old block was a spelling artifact.)
 # (The ten `*c2` coprocessor-register entries that used to open this block
 # were an artifact of this tool, not a disagreement.  Its MIPS normaliser
 # dropped the coprocessor index by keeping only the LAST digit, so COP2
@@ -533,7 +532,6 @@ mipsel M-llvm-mem-cs-none cmpgu.eq.qb load store
 mipsel M-llvm-mem-cs-none cmpu.eq.qb load store
 mipsel M-llvm-mem-cs-none insv load
 mipsel R-rd-phantom cfc1 +cop#
-mipsel R-rd-phantom cfcmsa +cop#
 mipsel R-rd-phantom lwl +r#
 mipsel R-rd-phantom lwr +r#
 mipsel R-wr-missing bc1fl +r#
@@ -2644,8 +2642,19 @@ riscv64 R-rd-phantom vmxor.mm +v#
 # the boundary now reports the read.  LLVM models no DSPControl use.
 mipsel R-rd-phantom bposge32 +dsp
 
-# MIPS MSA control registers reached through CTCMSA, which the boundary
-# reports and LLVM does not.
+# MIPS MSA control registers reached through CTCMSA, and the one place the
+# two decoders genuinely disagree about this bank once the spelling is
+# folded (see norm_mips): LLVM's MCInstrDesc carries the control register as
+# a USE of the instruction, so it appears in LLVM's read set and never in
+# its write set, while Capstone and the tracer both make it the DEF that a
+# "copy TO control register" instruction plainly writes.  Both entries below
+# are that single difference seen from its two sides.  Capstone is the
+# correct one and the tracer follows it, so nothing here needs repairing.
+#
+# The sibling CFCMSA -- "copy FROM control register" -- has no such
+# disagreement and no entry: it agreed the moment the tool could tell the
+# two spellings apart.
+mipsel R-rd-missing ctcmsa +cop#
 mipsel R-wr-phantom ctcmsa +cop#
 
 # =====================================================================

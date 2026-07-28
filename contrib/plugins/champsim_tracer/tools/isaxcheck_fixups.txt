@@ -356,3 +356,68 @@ x86_64 W-flow-reclassed bnd retw BRANCH_REP
 # and QEMU's TCG x86 translator implements no RTM at all, so XBEGIN cannot
 # retire on a correct path in the first place.
 x86_64 W-flow-dropped xbegin BRANCH_NONE
+
+# The repairs the WIDENED x86 sweep (REX as a full field, ModRM.mod = 01/10,
+# and the whole VEX space) newly asserts.  Two kinds, and both are the
+# existing machinery being held in place on more encodings rather than new
+# behaviour.
+#
+# 1. The 16-bit REPNE string forms.  `66 f2 a7` and its siblings become
+# reachable once mod = 10 lets a string opcode sit where the ModRM byte
+# goes.  The tracer's branch classifier keys on the REP/REPNE prefix and
+# gives them BRANCH_REP, which the boundary does not carry -- the same
+# reclassification already listed for the 32- and 64-bit spellings.
+x86_64 W-flow-added repne cmpsw BRANCH_REP
+x86_64 W-flow-added repne insw BRANCH_REP
+x86_64 W-flow-added repne lodsw BRANCH_REP
+x86_64 W-flow-added repne movsw BRANCH_REP
+x86_64 W-flow-added repne outsw BRANCH_REP
+x86_64 W-flow-added repne scasw BRANCH_REP
+x86_64 W-flow-added repne stosw BRANCH_REP
+
+# 2. The operand walker recovering registers Capstone dropped.  Capstone
+# 6.0.0-Alpha7 reports access == 0 on the register operands of the AVX-512
+# mask ops (kadd*, ktest*, kunpck*) and of vpermil2pd/ps, vbroadcasti128 and
+# vcvtpd2psx, so the boundary's implicit read/write sets come back EMPTY --
+# `--hex=c5c54ac0` (`kaddb %k0,%k7,%k0`) shows boundary RD{} WR{} against
+# fields RD{REG_PRED0,REG_PRED7} WR{REG_PRED0}.  The plugin's own operand
+# walker reads the operand list rather than the access flags and puts the
+# dependencies back.  These lines are what proves that recovery still
+# happens: the boundary-layer allowlist records the same encodings as a
+# Capstone defect (Z-access0), and WITHOUT these entries a regression in the
+# walker would cancel out against that record and the gate would stay green
+# while the trace lost the registers.  The MEM half of the same Capstone
+# defect is NOT recovered -- see the cause-4 block in isaxcheck_allow.txt.
+x86_64 W-rd-added kaddb +REG_PRED#
+x86_64 W-rd-added kaddd +REG_PRED#
+x86_64 W-rd-added kaddq +REG_PRED#
+x86_64 W-rd-added kaddw +REG_PRED#
+x86_64 W-rd-added ktestb +REG_PRED#
+x86_64 W-rd-added ktestd +REG_PRED#
+x86_64 W-rd-added ktestq +REG_PRED#
+x86_64 W-rd-added ktestw +REG_PRED#
+x86_64 W-rd-added kunpckdq +REG_PRED#
+x86_64 W-rd-added kunpckwd +REG_PRED#
+x86_64 W-rd-added vpermil2pd +REG_VEC#
+x86_64 W-rd-added vpermil2ps +REG_VEC#
+x86_64 W-wr-added kaddb +REG_PRED#
+x86_64 W-wr-added kaddd +REG_PRED#
+x86_64 W-wr-added kaddq +REG_PRED#
+x86_64 W-wr-added kaddw +REG_PRED#
+x86_64 W-wr-added ktestb +REG_PRED#
+x86_64 W-wr-added ktestd +REG_PRED#
+x86_64 W-wr-added ktestq +REG_PRED#
+x86_64 W-wr-added ktestw +REG_PRED#
+x86_64 W-wr-added kunpckdq +REG_PRED#
+x86_64 W-wr-added kunpckwd +REG_PRED#
+x86_64 W-wr-added vbroadcasti128 +REG_VEC#
+x86_64 W-wr-added vcvtpd2psx +REG_VEC#
+x86_64 W-wr-added vpermil2pd +REG_VEC#
+x86_64 W-wr-added vpermil2ps +REG_VEC#
+
+# JALR.HB is JALR with a hazard barrier: it links, so it is a call.  The
+# boundary carries no call group for it; the tracer's branch classifier
+# gives it BRANCH_INDIRECT_CALL, which is what keeps it out of the plain
+# indirect-jump bucket in the branch taxonomy.  Reachable only once `sa`
+# is swept (JALR.HB is JALR with bit 10 set, i.e. sa = 16).
+mipsel W-flow-added jalr.hb BRANCH_INDIRECT_CALL

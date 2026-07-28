@@ -856,7 +856,20 @@ char *qemu_plugin_insn_disas(const struct qemu_plugin_insn *insn);
  */
 
 #define QEMU_PLUGIN_INSN_DETAIL_MAX_OPS    16
-#define QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS  12
+/*
+ * The implicit register lists are copied out of Capstone's
+ * regs_read[] / regs_write[] under a MIN() against this cap, so a cap
+ * below what any instruction reports does not fail -- it silently
+ * deletes architectural registers from the dependency model.  It was 12,
+ * and the x86 VZEROUPPER / VZEROALL pair reports sixteen YMM destination
+ * writes; the last four were being dropped on 1.26% of the dynamic
+ * instructions in the reference x86 traces.  Sixteen is the widest
+ * implicit list either decoder produces for any encoding the sweeps
+ * reach on the four supported ISAs, so this is a ceiling and not a
+ * sample -- if that stops being true, isaxcheck's register comparison is
+ * what says so.
+ */
+#define QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS  16
 #define QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ 12
 #define QEMU_PLUGIN_INSN_DETAIL_MNEMSZ     32
 #define QEMU_PLUGIN_INSN_DETAIL_OPSTRSZ    160

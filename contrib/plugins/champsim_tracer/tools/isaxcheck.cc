@@ -1549,19 +1549,48 @@ static void sweep_riscv(unsigned shard, unsigned nshard)
 // this subtarget.  Without it the instruction was not merely under-swept,
 // it was absent: every RDHWR encoding the sweep built decoded on neither
 // side, so the whole form sat outside the gate.
+//
+// `sa` IS AN OPCODE FIELD AND IS NOW SWEPT WHOLE, not filled.  Under
+// SPECIAL3 (op = 011111) the five bits at [10:6] are not a shift amount,
+// they are the instruction selector: funct = 0x20 is the BSHFL column
+// where sa picks WSBH (2), SEB (16) and SEH (24), and funct = 0x38 is the
+// DSP column where sa picks RDDSP (18) and WRDSP (19).  A three-value fill
+// {0, 1, 4} reached none of them.  SEB alone retires 1.32 M times in the
+// reference mipsel traces and sat outside the gate; RDDSP and WRDSP were
+// found by the trace-driven cross-check for exactly this reason -- the
+// sweep structurally could not build them.  Measured against the 58,526
+// distinct encodings a traced mipsel population retires, pinning `sa` put
+// 52.83% of distinct encodings and 18.33% of dynamic weight outside the
+// swept space; ranging it over all 32 values removes that entirely.
+//
+// The loop runs at rd = 3 rather than rd = 0 so the forms whose rd is a
+// real destination (SEB, SEH, RDDSP) compare a live register instead of
+// one the zero-fold erases; it subsumes the old {3, 0} and {3, 1} pairs.
+//
+// WHAT IS STILL PINNED: `rd` keeps its fill set, because outside the
+// selector columns above it is an ordinary destination register and
+// abstracting data-register choice is deliberate.  Measured, so it stays a
+// number rather than an absence: 30.43% of distinct encodings and 28.26%
+// of dynamic weight carry an rd the fill set does not name.  The values
+// that make rd an OPCODE are all present -- 29 (RDHWR's thread pointer),
+// 31 (JALR's two-operand print form), 3 (a live destination) and 0.
+//
+// Cost: 25,165,824 -> 150,994,944 encodings, 5.4 s -> 27.6 s at --jobs=16.
 static void sweep_mips(unsigned shard, unsigned nshard)
 {
     static const struct { unsigned rd, sa; } fills[] = {
-        {3, 0}, {0, 0}, {3, 1}, {0, 4}, {31, 0}, {29, 0},
+        {0, 0}, {0, 4}, {31, 0}, {29, 0},
     };
     for (uint32_t i = shard; i < (1u << 22); i += nshard) {
         uint32_t op = (i >> 16) & 0x3f;
         uint32_t rs = (i >> 11) & 0x1f;
         uint32_t rt = (i >> 6) & 0x1f;
         uint32_t fn = i & 0x3f;
+        uint32_t base = (op << 26) | (rs << 21) | (rt << 16) | fn;
         for (auto &f : fills)
-            try_word((op << 26) | (rs << 21) | (rt << 16) | (f.rd << 11) |
-                     (f.sa << 6) | fn);
+            try_word(base | (f.rd << 11) | (f.sa << 6));
+        for (unsigned sa = 0; sa < 32; sa++)
+            try_word(base | (3u << 11) | (sa << 6));
     }
 }
 
@@ -1602,56 +1631,177 @@ static void sweep_mips(unsigned shard, unsigned nshard)
 //     and left `(%rax)`-style base addressing -- with the base register the
 //     memop model has to name -- out of the sweep on all of them.
 //
-// Cost is the 8x the field is wide: 245,760 -> 1,966,080 encodings, 0.21 s
-// -> 0.77 s at --jobs=8.  Measured against the distinct encodings a traced
-// x86 population actually retires (mcf and perlbench, user and system), the
-// share of that population lying inside the swept space moves from 53.8% to
-// 62.8% of distinct encodings, and from 33.6% to 58.8% weighted by dynamic
-// execution count.
+// REX IS A DIMENSION, NOT A PREFIX SPELLING.  It used to be three literal
+// entries in the prefix table (`48`, `f3 48`, `f2 48`), which swept exactly
+// one of its sixteen values.  The other fifteen are not decoration:
 //
-// The rest of that population is outside for two reasons this sweep still
-// pins, named here so they stay measured rather than merely absent:
-// prefix sequences the pre[] table does not spell -- overwhelmingly REX
-// bytes other than exactly 0x48, i.e. the R/X/B extension bits (20.3% of
-// distinct, 26.6% by weight) -- and ModRM.mod = 01 / 10, the disp8 and
-// disp32 base+displacement forms (16.9% of distinct, 14.6% by weight).
+//   - W selects the 64-bit operand size, and that is the one bit the old
+//     table had.
+//   - R, X and B extend ModRM.reg, SIB.index and ModRM.rm/SIB.base to
+//     r8..r15.  The register-set comparison is the substance of this gate,
+//     and half the register file was unreachable by it.
+//   - B also extends the OPCODE-EMBEDDED register of the `50+rd` / `58+rd`
+//     / `b8+rd` columns, and `41 90` is `xchg %r8d, %eax` where `90` is NOP
+//     -- an opcode change, not a register change.
+//   - The mere PRESENCE of any REX byte, `40` included, reassigns byte
+//     register encodings 4..7 from ah/ch/dh/bh to spl/bpl/sil/dil.  `40`
+//     sets no bit and is not a no-op.
+//
+// So the table below spells LEGACY prefixes only and REX is enumerated over
+// all sixteen values plus absent.  The old table is a strict subset.
+//
+// ModRM.mod gets its two missing values for the same reason.  mod = 00 and
+// mod = 11 were swept; 01 and 10 -- base+disp8 and base+disp32 -- were not,
+// and they are not merely "the same address with a constant added".  At
+// mod = 00, rm = 101 is RIP-relative and names NO base register; at mod =
+// 01/10 the same rm names %rbp.  The whole frame-pointer addressing form
+// that dominates unoptimised and debug-built code was outside the sweep,
+// with it the base register the memop model has to name.
+//
+// VEX IS THE THIRD, AND IT WAS TOTAL.  The sweep emitted no `c5` or `c4`
+// byte anywhere, so every VEX-encoded instruction -- the whole of AVX,
+// AVX2 and BMI -- was outside it, 100% unreached rather than
+// under-sampled.  That is where the largest single-instruction defect this
+// gate has found was hiding: `vzeroupper` (`c5 f8 77`), 1.26% of the
+// dynamic instructions in the reference x86 traces, whose sixteen YMM
+// destination writes the boundary was silently truncating to twelve.  The
+// trace-driven cross-check found it because the sweep structurally could
+// not.  VEX2 enumerates its whole second byte (R, vvvv, L and pp all carry
+// decode); VEX3 enumerates the three defined `mmmmm` escape maps with RXB
+// free, and its second byte over W x L x pp with vvvv on a three-value
+// fill -- 1111 (the "no third operand" spelling that some forms require
+// and others reject), and two ordinary register values.
+//
+// Cost: 1,966,080 -> 154,337,280 encodings, 0.49 s -> 10.5 s at --jobs=16,
+// which is half what the aarch64 sweep already costs.  Measured against the
+// 47,512 distinct encodings a traced x86 population actually retires (mcf
+// and perlbench, user and system, 1.64 G dynamic instructions), the share
+// lying inside the swept space moves from 62.76% to 98.07% of distinct
+// encodings, and from 58.82% to 99.66% weighted by dynamic execution count.
+//
+// WHAT IS STILL PINNED.  A blind spot is not a smaller sweep, it is an
+// unmeasured one, so each of these carries its measurement against that
+// same population rather than merely being absent:
+//
+//   - Legacy prefix sequences outside the seven bases above: 752 distinct
+//     encodings (1.583%), 1,365,550 dynamic (0.083%).  All of them are
+//     segment overrides the seven do not spell -- `3e` (DS) and `65` (GS),
+//     plus three two- and three-prefix combinations.  This is the residue
+//     the `+seg` register-set family lives in.
+//
+//   - VEX3's vvvv field is a three-value fill, not all sixteen: 166
+//     distinct encodings (0.349%), 4,302,325 dynamic (0.262%) carry a vvvv
+//     the fill does not name.  VEX2's second byte is enumerated whole, so
+//     no VEX2 encoding is outside for this reason.
+//
+//   - The SIB byte is pinned to two values (`8d` on the SIB tail, `00` on
+//     the mem tail), so SIB.scale and SIB.index are sampled, not swept.
+//     This is the largest remaining pin and it is NOT counted in the 98.07%
+//     above, because the membership definition that figure inherits
+//     constrains only the prefix and ModRM.mod.  Measured separately:
+//     4,240 distinct encodings (8.92%) and 201,289,233 dynamic (12.25%)
+//     carry a SIB byte, and of those 99.13% of distinct and 93.04% of
+//     dynamic weight use a SIB byte that is neither `8d` nor `00`.
+//
+//   - EVEX (`62`, AVX-512) and XOP (`8f`) are not emitted at all.  The
+//     reference population contains zero encodings of either, so this
+//     costs nothing measurable today and the whole of AVX-512 the day an
+//     AVX-512 binary is traced.
 static void sweep_x86(unsigned shard, unsigned nshard)
 {
-    static const struct { unsigned char p[4]; int np; } pre[] = {
-        {{0},0}, {{0x66},1}, {{0x48},1}, {{0xf3},1}, {{0xf2},1},
-        {{0xf3,0x48},2}, {{0xf2,0x48},2}, {{0x66,0xf3},2}, {{0xf0},1}, {{0x64},1},
+    /* Legacy prefix sequences only.  REX is the separate dimension below. */
+    static const struct { unsigned char p[4]; int np; } leg[] = {
+        {{0},0}, {{0x66},1}, {{0xf3},1}, {{0xf2},1}, {{0x66,0xf3},2},
+        {{0xf0},1}, {{0x64},1},
     };
-    static const unsigned char tail_mem[] = {0x0d,0,0,0,0, 0x11,0x22,0x33,0x44, 0,0,0,0};
-    static const unsigned char tail_reg[] = {0xc1, 0x11,0x22,0x33,0x44, 0,0,0,0,0,0,0,0};
-    static const unsigned char tail_sib[] = {0x04,0x8d,0,0,0,0, 0x11,0x22,0x33,0x44, 0,0};
+    /*
+     * The ModRM tails.  Only bits 7:6 -- `mod` -- survive from a tail's
+     * first byte; the sweep overwrites `reg` and `rm`.  What follows the
+     * ModRM byte is then reinterpreted by the rm just written (a SIB at
+     * rm = 100, a displacement otherwise), which is the point: the same
+     * tail bytes spell a different addressing form for each rm and every
+     * one of them is a real encoding.
+     *
+     * Declared as a 2-D array so every row is exactly the 13 bytes the
+     * emitter copies.  It used to be three separate arrays of which the
+     * SIB one held only 12 initialisers, so the copy read one byte past
+     * its end on every SIB-tail encoding.
+     */
+    static const unsigned char tails[5][13] = {
+        {0x0d,0,0,0,0, 0x11,0x22,0x33,0x44},            /* mod=00          */
+        {0xc1, 0x11,0x22,0x33,0x44},                    /* mod=11          */
+        {0x04,0x8d,0,0,0,0, 0x11,0x22,0x33,0x44},       /* mod=00 + SIB    */
+        {0x4d,0x20, 0x11,0x22,0x33,0x44},               /* mod=01 disp8    */
+        {0x8d,0x44,0x33,0x22,0x11},                     /* mod=10 disp32   */
+    };
     unsigned idx = 0;
-    uint8_t buf[24];
-    for (unsigned pi = 0; pi < sizeof(pre)/sizeof(pre[0]); pi++)
-      for (int esc = 0; esc < 4; esc++)
-        for (unsigned op = 0; op < 256; op++)
-          for (int t = 0; t < 3; t++)
-            for (unsigned reg = 0; reg < 8; reg++)
-              for (unsigned rm = 0; rm < 8; rm++) {
-                if ((idx++ % nshard) != shard) continue;
-                const unsigned char *tail = t==0?tail_mem : t==1?tail_reg : tail_sib;
-                size_t n = 0;
-                for (int k = 0; k < pre[pi].np; k++) buf[n++] = pre[pi].p[k];
-                if (esc >= 1) buf[n++] = 0x0f;
-                if (esc == 2) buf[n++] = 0x38;
-                if (esc == 3) buf[n++] = 0x3a;
-                buf[n++] = (uint8_t)op;
-                memcpy(buf + n, tail, 13);
-                /* ModRM is the tail's first byte.  The tail owns `mod`; both
-                 * register fields are replaced.  What follows the ModRM byte
-                 * is then reinterpreted by the rm just written -- a SIB at
-                 * rm = 100, a displacement otherwise -- which is the point:
-                 * the same tail bytes spell a different addressing form for
-                 * each rm, and every one of them is a real encoding. */
-                buf[n] = (uint8_t)((buf[n] & ~0x3fu) | (reg << 3) | rm);
-                n += 13;
-                total_tried++;
-                compare(buf, n);
-              }
+    uint8_t buf[32];
+
+    /* Emit one encoding: @head is the already-built prefix/escape/opcode
+     * run, @t picks the tail, @reg and @rm replace the ModRM fields. */
+    auto emit = [&](const uint8_t *head, size_t nh, unsigned t,
+                    unsigned reg, unsigned rm) {
+        if ((idx++ % nshard) != shard) return;
+        memcpy(buf, head, nh);
+        memcpy(buf + nh, tails[t], 13);
+        buf[nh] = (uint8_t)((buf[nh] & ~0x3fu) | (reg << 3) | rm);
+        total_tried++;
+        compare(buf, nh + 13);
+    };
+
+    /* Legacy x REX x escape x opcode x tail x ModRM.reg x ModRM.rm. */
+    for (unsigned li = 0; li < sizeof(leg)/sizeof(leg[0]); li++)
+      for (unsigned rex = 0; rex < 17; rex++)   /* 0 = absent, 1..16 = 40..4f */
+        for (int esc = 0; esc < 4; esc++)
+          for (unsigned op = 0; op < 256; op++) {
+            uint8_t head[8]; size_t nh = 0;
+            for (int k = 0; k < leg[li].np; k++) head[nh++] = leg[li].p[k];
+            if (rex) head[nh++] = (uint8_t)(0x3f + rex);
+            if (esc >= 1) head[nh++] = 0x0f;
+            if (esc == 2) head[nh++] = 0x38;
+            if (esc == 3) head[nh++] = 0x3a;
+            head[nh++] = (uint8_t)op;
+            for (int t = 0; t < 5; t++)
+              for (unsigned reg = 0; reg < 8; reg++)
+                for (unsigned rm = 0; rm < 8; rm++)
+                  emit(head, nh, t, reg, rm);
+          }
+
+    /* VEX 2-byte: c5 <R vvvv L pp> <opcode> <ModRM...>.  The second byte
+     * is enumerated whole -- R extends ModRM.reg, vvvv names a source
+     * register whose 1111 spelling is what two-operand forms require, L
+     * picks 128- vs 256-bit and pp is the mandatory-prefix selector.  All
+     * four change the decode. */
+    for (unsigned b1 = 0; b1 < 256; b1++)
+      for (unsigned op = 0; op < 256; op++) {
+        uint8_t head[4] = {0xc5, (uint8_t)b1, (uint8_t)op};
+        for (int t = 0; t < 5; t++)
+          for (unsigned reg = 0; reg < 8; reg++)
+            for (unsigned rm = 0; rm < 8; rm++)
+              emit(head, 3, t, reg, rm);
+      }
+
+    /* VEX 3-byte: c4 <RXB mmmmm> <W vvvv L pp> <opcode> <ModRM...>.
+     * mmmmm selects the escape map and only 1/2/3 are defined; RXB is
+     * free.  In the third byte W, L and pp are enumerated and vvvv takes
+     * the three-value fill named above. */
+    static const unsigned char vvvv_fill[3] = {0xf, 0x7, 0x0};
+    for (unsigned rxb = 0; rxb < 8; rxb++)
+      for (unsigned mm = 1; mm <= 3; mm++)
+        for (unsigned w = 0; w < 2; w++)
+          for (unsigned vi = 0; vi < 3; vi++)
+            for (unsigned l = 0; l < 2; l++)
+              for (unsigned pp = 0; pp < 4; pp++)
+                for (unsigned op = 0; op < 256; op++) {
+                  uint8_t head[5] = {
+                      0xc4, (uint8_t)((rxb << 5) | mm),
+                      (uint8_t)((w << 7) | (vvvv_fill[vi] << 3) | (l << 2) | pp),
+                      (uint8_t)op };
+                  for (int t = 0; t < 5; t++)
+                    for (unsigned reg = 0; reg < 8; reg++)
+                      for (unsigned rm = 0; rm < 8; rm++)
+                        emit(head, 4, t, reg, rm);
+                }
 }
 
 static void run_sweep(unsigned shard, unsigned nshard)

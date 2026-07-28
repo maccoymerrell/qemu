@@ -3580,3 +3580,1351 @@ x86_64 M-llvm-mem-cs-none wrpkru load store
 x86_64 R-wr-phantom bnd notrack callq +r#
 x86_64 R-wr-phantom bnd retw +r#
 x86_64 R-wr-phantom notrack callq +r#
+
+# --- x86_64: the residual the WIDENED sweep reaches.
+#
+# The sweep gained three dimensions at once -- REX as a full 16-value
+# field instead of the single `48` spelling, ModRM.mod = 01 / 10, and the
+# whole VEX space, which had never been emitted at all.  Encodings tried
+# went 1,966,080 -> 154,337,280 and the share of a traced x86 population
+# lying inside the swept space went 62.76% -> 98.07% of distinct
+# encodings, 58.82% -> 99.66% by dynamic weight.  What follows is what
+# that newly-reached space disagrees about, split by CAUSE rather than
+# recorded as one undifferentiated block -- three of the four causes
+# describe no defect and the fourth is a real one, and collapsing them
+# would bury it.
+#
+# The x86 policy stated further up still holds: PIN remains the dynamic
+# authority for x86 and this block exists so that a Capstone or LLVM bump
+# shows up as a gate failure rather than as silent trace corruption.
+#
+# CAUSE 1 (751 entries) -- REX IS NOT THE LAST PREFIX.  Every sample here
+# carries a REX byte followed by another prefix, or a second REX.  Intel
+# SDM Vol. 2A 2.2.1: "Only one REX prefix is allowed per instruction" and
+# it "must immediately precede the opcode byte or the escape opcode
+# byte"; a REX anywhere else is simply not a REX and the architecture
+# gives the byte no meaning there.  Capstone tolerates the sequence and
+# folds it, LLVM either rejects it (`D-cs-only`) or stops at the stray
+# prefix and returns it as a one- or two-byte instruction of its own
+# (`D-size-mismatch`, and the register/flow families downstream of that
+# length disagreement).  No assembler emits this and it is not a decode
+# defect on either side -- it is two decoders resolving an encoding the
+# architecture does not define.  VERIFIED against the reference
+# population: 0 of 47,512 distinct encodings and 0 of 1.64 G dynamic
+# instructions carry a REX that is not the last prefix.
+x86_64 B-flow-presence bnd ja cs-yes llvm-no
+x86_64 B-flow-presence bnd jae cs-yes llvm-no
+x86_64 B-flow-presence bnd jb cs-yes llvm-no
+x86_64 B-flow-presence bnd jbe cs-yes llvm-no
+x86_64 B-flow-presence bnd je cs-yes llvm-no
+x86_64 B-flow-presence bnd jg cs-yes llvm-no
+x86_64 B-flow-presence bnd jl cs-yes llvm-no
+x86_64 B-flow-presence bnd jle cs-yes llvm-no
+x86_64 B-flow-presence bnd jne cs-yes llvm-no
+x86_64 B-flow-presence bnd jno cs-yes llvm-no
+x86_64 B-flow-presence bnd jnp cs-yes llvm-no
+x86_64 B-flow-presence bnd jns cs-yes llvm-no
+x86_64 B-flow-presence bnd jo cs-yes llvm-no
+x86_64 B-flow-presence bnd jp cs-yes llvm-no
+x86_64 B-flow-presence bnd js cs-yes llvm-no
+x86_64 B-flow-presence ja cs-yes llvm-no
+x86_64 B-flow-presence jae cs-yes llvm-no
+x86_64 B-flow-presence jb cs-yes llvm-no
+x86_64 B-flow-presence jbe cs-yes llvm-no
+x86_64 B-flow-presence je cs-yes llvm-no
+x86_64 B-flow-presence jg cs-yes llvm-no
+x86_64 B-flow-presence jl cs-yes llvm-no
+x86_64 B-flow-presence jle cs-yes llvm-no
+x86_64 B-flow-presence jne cs-yes llvm-no
+x86_64 B-flow-presence jno cs-yes llvm-no
+x86_64 B-flow-presence jnp cs-yes llvm-no
+x86_64 B-flow-presence jns cs-yes llvm-no
+x86_64 B-flow-presence jo cs-yes llvm-no
+x86_64 B-flow-presence jp cs-yes llvm-no
+x86_64 B-flow-presence js cs-yes llvm-no
+x86_64 D-cs-only adcw
+x86_64 D-cs-only addw
+x86_64 D-cs-only andw
+x86_64 D-cs-only bnd ja
+x86_64 D-cs-only bnd jae
+x86_64 D-cs-only bnd jb
+x86_64 D-cs-only bnd jbe
+x86_64 D-cs-only bnd je
+x86_64 D-cs-only bnd jg
+x86_64 D-cs-only bnd jl
+x86_64 D-cs-only bnd jle
+x86_64 D-cs-only bnd jne
+x86_64 D-cs-only bnd jno
+x86_64 D-cs-only bnd jnp
+x86_64 D-cs-only bnd jns
+x86_64 D-cs-only bnd jo
+x86_64 D-cs-only bnd jp
+x86_64 D-cs-only bnd js
+x86_64 D-cs-only cbtw
+x86_64 D-cs-only cltd
+x86_64 D-cs-only cltq
+x86_64 D-cs-only cmpsb
+x86_64 D-cs-only cmpsl
+x86_64 D-cs-only cmpsq
+x86_64 D-cs-only cmpsw
+x86_64 D-cs-only cmpw
+x86_64 D-cs-only cqto
+x86_64 D-cs-only cwtd
+x86_64 D-cs-only cwtl
+x86_64 D-cs-only imull
+x86_64 D-cs-only imulq
+x86_64 D-cs-only imulw
+x86_64 D-cs-only insb
+x86_64 D-cs-only insl
+x86_64 D-cs-only insw
+x86_64 D-cs-only inw
+x86_64 D-cs-only iretw
+x86_64 D-cs-only ja
+x86_64 D-cs-only jae
+x86_64 D-cs-only jb
+x86_64 D-cs-only jbe
+x86_64 D-cs-only je
+x86_64 D-cs-only jg
+x86_64 D-cs-only jl
+x86_64 D-cs-only jle
+x86_64 D-cs-only jne
+x86_64 D-cs-only jno
+x86_64 D-cs-only jnp
+x86_64 D-cs-only jns
+x86_64 D-cs-only jo
+x86_64 D-cs-only jp
+x86_64 D-cs-only js
+x86_64 D-cs-only lahf
+x86_64 D-cs-only leaq
+x86_64 D-cs-only leaw
+x86_64 D-cs-only lock adcw
+x86_64 D-cs-only lodsb
+x86_64 D-cs-only lodsl
+x86_64 D-cs-only lodsq
+x86_64 D-cs-only lodsw
+x86_64 D-cs-only lretw
+x86_64 D-cs-only movabsb
+x86_64 D-cs-only movabsl
+x86_64 D-cs-only movabsq
+x86_64 D-cs-only movabsw
+x86_64 D-cs-only movb
+x86_64 D-cs-only movl
+x86_64 D-cs-only movsb
+x86_64 D-cs-only movsl
+x86_64 D-cs-only movslq
+x86_64 D-cs-only movsq
+x86_64 D-cs-only movsw
+x86_64 D-cs-only movw
+x86_64 D-cs-only notw
+x86_64 D-cs-only orw
+x86_64 D-cs-only outsb
+x86_64 D-cs-only outsl
+x86_64 D-cs-only outsw
+x86_64 D-cs-only outw
+x86_64 D-cs-only pause
+x86_64 D-cs-only popfq
+x86_64 D-cs-only popfw
+x86_64 D-cs-only popq
+x86_64 D-cs-only popw
+x86_64 D-cs-only pushfq
+x86_64 D-cs-only pushfw
+x86_64 D-cs-only pushq
+x86_64 D-cs-only pushw
+x86_64 D-cs-only rclw
+x86_64 D-cs-only rep insb
+x86_64 D-cs-only rep insl
+x86_64 D-cs-only rep insw
+x86_64 D-cs-only rep lodsb
+x86_64 D-cs-only rep lodsl
+x86_64 D-cs-only rep lodsq
+x86_64 D-cs-only rep lodsw
+x86_64 D-cs-only rep movsb
+x86_64 D-cs-only rep movsl
+x86_64 D-cs-only rep movsq
+x86_64 D-cs-only rep movsw
+x86_64 D-cs-only rep outsb
+x86_64 D-cs-only rep outsl
+x86_64 D-cs-only rep outsw
+x86_64 D-cs-only rep stosb
+x86_64 D-cs-only rep stosl
+x86_64 D-cs-only rep stosq
+x86_64 D-cs-only rep stosw
+x86_64 D-cs-only repe cmpsb
+x86_64 D-cs-only repe cmpsl
+x86_64 D-cs-only repe cmpsq
+x86_64 D-cs-only repe cmpsw
+x86_64 D-cs-only repe scasb
+x86_64 D-cs-only repe scasl
+x86_64 D-cs-only repe scasq
+x86_64 D-cs-only repe scasw
+x86_64 D-cs-only repne cmpsb
+x86_64 D-cs-only repne cmpsl
+x86_64 D-cs-only repne cmpsq
+x86_64 D-cs-only repne insb
+x86_64 D-cs-only repne insl
+x86_64 D-cs-only repne lodsb
+x86_64 D-cs-only repne lodsl
+x86_64 D-cs-only repne lodsq
+x86_64 D-cs-only repne movsb
+x86_64 D-cs-only repne movsl
+x86_64 D-cs-only repne movsq
+x86_64 D-cs-only repne outsb
+x86_64 D-cs-only repne outsl
+x86_64 D-cs-only repne scasb
+x86_64 D-cs-only repne scasl
+x86_64 D-cs-only repne scasq
+x86_64 D-cs-only repne stosb
+x86_64 D-cs-only repne stosl
+x86_64 D-cs-only repne stosq
+x86_64 D-cs-only repz retw
+x86_64 D-cs-only retw
+x86_64 D-cs-only sahf
+x86_64 D-cs-only sbbw
+x86_64 D-cs-only scasb
+x86_64 D-cs-only scasl
+x86_64 D-cs-only scasq
+x86_64 D-cs-only scasw
+x86_64 D-cs-only stosb
+x86_64 D-cs-only stosl
+x86_64 D-cs-only stosq
+x86_64 D-cs-only stosw
+x86_64 D-cs-only subw
+x86_64 D-cs-only wait
+x86_64 D-cs-only xchgb
+x86_64 D-cs-only xchgl
+x86_64 D-cs-only xchgq
+x86_64 D-cs-only xchgw
+x86_64 D-cs-only xorw
+x86_64 D-size-mismatch bnd ja
+x86_64 D-size-mismatch bnd jae
+x86_64 D-size-mismatch bnd jb
+x86_64 D-size-mismatch bnd jbe
+x86_64 D-size-mismatch bnd je
+x86_64 D-size-mismatch bnd jg
+x86_64 D-size-mismatch bnd jl
+x86_64 D-size-mismatch bnd jle
+x86_64 D-size-mismatch bnd jne
+x86_64 D-size-mismatch bnd jno
+x86_64 D-size-mismatch bnd jnp
+x86_64 D-size-mismatch bnd jns
+x86_64 D-size-mismatch bnd jo
+x86_64 D-size-mismatch bnd jp
+x86_64 D-size-mismatch bnd js
+x86_64 D-size-mismatch cbtw
+x86_64 D-size-mismatch cltd
+x86_64 D-size-mismatch cltq
+x86_64 D-size-mismatch cmpsb
+x86_64 D-size-mismatch cmpsl
+x86_64 D-size-mismatch cmpsq
+x86_64 D-size-mismatch cmpsw
+x86_64 D-size-mismatch cqto
+x86_64 D-size-mismatch cwtd
+x86_64 D-size-mismatch cwtl
+x86_64 D-size-mismatch imull
+x86_64 D-size-mismatch imulq
+x86_64 D-size-mismatch imulw
+x86_64 D-size-mismatch insb
+x86_64 D-size-mismatch insl
+x86_64 D-size-mismatch insw
+x86_64 D-size-mismatch lahf
+x86_64 D-size-mismatch leaq
+x86_64 D-size-mismatch lock xchgw
+x86_64 D-size-mismatch lodsb
+x86_64 D-size-mismatch lodsl
+x86_64 D-size-mismatch lodsq
+x86_64 D-size-mismatch lodsw
+x86_64 D-size-mismatch movabsb
+x86_64 D-size-mismatch movabsl
+x86_64 D-size-mismatch movabsq
+x86_64 D-size-mismatch movabsw
+x86_64 D-size-mismatch movq
+x86_64 D-size-mismatch movsb
+x86_64 D-size-mismatch movsl
+x86_64 D-size-mismatch movslq
+x86_64 D-size-mismatch movsq
+x86_64 D-size-mismatch movsw
+x86_64 D-size-mismatch outsb
+x86_64 D-size-mismatch outsl
+x86_64 D-size-mismatch outsw
+x86_64 D-size-mismatch pause
+x86_64 D-size-mismatch popfq
+x86_64 D-size-mismatch popfw
+x86_64 D-size-mismatch popq
+x86_64 D-size-mismatch popw
+x86_64 D-size-mismatch pushfq
+x86_64 D-size-mismatch pushfw
+x86_64 D-size-mismatch pushq
+x86_64 D-size-mismatch pushw
+x86_64 D-size-mismatch rep insb
+x86_64 D-size-mismatch rep insl
+x86_64 D-size-mismatch rep insw
+x86_64 D-size-mismatch rep lodsb
+x86_64 D-size-mismatch rep lodsl
+x86_64 D-size-mismatch rep lodsq
+x86_64 D-size-mismatch rep lodsw
+x86_64 D-size-mismatch rep movsb
+x86_64 D-size-mismatch rep movsl
+x86_64 D-size-mismatch rep movsq
+x86_64 D-size-mismatch rep movsw
+x86_64 D-size-mismatch rep outsb
+x86_64 D-size-mismatch rep outsl
+x86_64 D-size-mismatch rep outsw
+x86_64 D-size-mismatch rep stosb
+x86_64 D-size-mismatch rep stosl
+x86_64 D-size-mismatch rep stosq
+x86_64 D-size-mismatch rep stosw
+x86_64 D-size-mismatch repe cmpsb
+x86_64 D-size-mismatch repe cmpsl
+x86_64 D-size-mismatch repe cmpsq
+x86_64 D-size-mismatch repe cmpsw
+x86_64 D-size-mismatch repe scasb
+x86_64 D-size-mismatch repe scasl
+x86_64 D-size-mismatch repe scasq
+x86_64 D-size-mismatch repe scasw
+x86_64 D-size-mismatch repne cmpsb
+x86_64 D-size-mismatch repne cmpsl
+x86_64 D-size-mismatch repne cmpsq
+x86_64 D-size-mismatch repne cmpsw
+x86_64 D-size-mismatch repne insb
+x86_64 D-size-mismatch repne insl
+x86_64 D-size-mismatch repne insw
+x86_64 D-size-mismatch repne lodsb
+x86_64 D-size-mismatch repne lodsl
+x86_64 D-size-mismatch repne lodsq
+x86_64 D-size-mismatch repne lodsw
+x86_64 D-size-mismatch repne movsb
+x86_64 D-size-mismatch repne movsl
+x86_64 D-size-mismatch repne movsq
+x86_64 D-size-mismatch repne movsw
+x86_64 D-size-mismatch repne outsb
+x86_64 D-size-mismatch repne outsl
+x86_64 D-size-mismatch repne outsw
+x86_64 D-size-mismatch repne scasb
+x86_64 D-size-mismatch repne scasl
+x86_64 D-size-mismatch repne scasq
+x86_64 D-size-mismatch repne scasw
+x86_64 D-size-mismatch repne stosb
+x86_64 D-size-mismatch repne stosl
+x86_64 D-size-mismatch repne stosq
+x86_64 D-size-mismatch repne stosw
+x86_64 D-size-mismatch sahf
+x86_64 D-size-mismatch scasb
+x86_64 D-size-mismatch scasl
+x86_64 D-size-mismatch scasq
+x86_64 D-size-mismatch scasw
+x86_64 D-size-mismatch stosb
+x86_64 D-size-mismatch stosl
+x86_64 D-size-mismatch stosq
+x86_64 D-size-mismatch stosw
+x86_64 D-size-mismatch testb
+x86_64 D-size-mismatch testl
+x86_64 D-size-mismatch testq
+x86_64 D-size-mismatch testw
+x86_64 D-size-mismatch wait
+x86_64 D-size-mismatch xchgq
+x86_64 M-cs-mem-llvm-none imull
+x86_64 M-cs-mem-llvm-none imulq
+x86_64 M-cs-mem-llvm-none imulw
+x86_64 M-cs-mem-llvm-none lock xchgw
+x86_64 M-cs-mem-llvm-none movabsb
+x86_64 M-cs-mem-llvm-none movabsl
+x86_64 M-cs-mem-llvm-none movabsq
+x86_64 M-cs-mem-llvm-none movabsw
+x86_64 M-cs-mem-llvm-none movq
+x86_64 M-cs-mem-llvm-none movslq
+x86_64 M-cs-mem-llvm-none popq
+x86_64 M-cs-mem-llvm-none popw
+x86_64 M-cs-mem-llvm-none testb
+x86_64 M-cs-mem-llvm-none testl
+x86_64 M-cs-mem-llvm-none testq
+x86_64 M-cs-mem-llvm-none testw
+x86_64 M-cs-mem-llvm-none xchgl
+x86_64 M-cs-mem-llvm-none xchgq
+x86_64 R-rd-missing adcw +df
+x86_64 R-rd-missing addw +df
+x86_64 R-rd-missing addw +df,r#
+x86_64 R-rd-missing andw +df
+x86_64 R-rd-missing andw +df,r#
+x86_64 R-rd-missing bnd ja +df,r#
+x86_64 R-rd-missing bnd jae +df,r#
+x86_64 R-rd-missing bnd jb +df,r#
+x86_64 R-rd-missing bnd jbe +df,r#
+x86_64 R-rd-missing bnd je +df,r#
+x86_64 R-rd-missing bnd jg +df,r#
+x86_64 R-rd-missing bnd jl +df,r#
+x86_64 R-rd-missing bnd jle +df,r#
+x86_64 R-rd-missing bnd jne +df,r#
+x86_64 R-rd-missing bnd jno +df,r#
+x86_64 R-rd-missing bnd jnp +df,r#
+x86_64 R-rd-missing bnd jns +df,r#
+x86_64 R-rd-missing bnd jo +df,r#
+x86_64 R-rd-missing bnd jp +df,r#
+x86_64 R-rd-missing bnd js +df,r#
+x86_64 R-rd-missing bnd lretw +df,r#
+x86_64 R-rd-missing bnd retw +df,r#
+x86_64 R-rd-missing cbtw +df,r#
+x86_64 R-rd-missing cltd +df,r#
+x86_64 R-rd-missing cmpw +df
+x86_64 R-rd-missing cmpw +df,r#
+x86_64 R-rd-missing cwtd +df,r#
+x86_64 R-rd-missing cwtl +df,r#
+x86_64 R-rd-missing imull +df,r#
+x86_64 R-rd-missing imulw +df,r#
+x86_64 R-rd-missing inw +df,r#
+x86_64 R-rd-missing iretw +df,r#
+x86_64 R-rd-missing ja +df,r#
+x86_64 R-rd-missing jae +df,r#
+x86_64 R-rd-missing jb +df,r#
+x86_64 R-rd-missing jbe +df,r#
+x86_64 R-rd-missing je +df,r#
+x86_64 R-rd-missing jg +df,r#
+x86_64 R-rd-missing jl +df,r#
+x86_64 R-rd-missing jle +df,r#
+x86_64 R-rd-missing jne +df,r#
+x86_64 R-rd-missing jno +df,r#
+x86_64 R-rd-missing jnp +df,r#
+x86_64 R-rd-missing jns +df,r#
+x86_64 R-rd-missing jo +df,r#
+x86_64 R-rd-missing jp +df,r#
+x86_64 R-rd-missing js +df,r#
+x86_64 R-rd-missing lahf +df,r#
+x86_64 R-rd-missing leaw +df,r#
+x86_64 R-rd-missing lock adcw +df,r#
+x86_64 R-rd-missing lretw +df,r#
+x86_64 R-rd-missing movabsb +df,r#
+x86_64 R-rd-missing movabsl +df,r#
+x86_64 R-rd-missing movabsw +df,r#
+x86_64 R-rd-missing movb +df,r#
+x86_64 R-rd-missing movl +df,r#
+x86_64 R-rd-missing movw +df,r#
+x86_64 R-rd-missing nop +df,r#
+x86_64 R-rd-missing notw +df
+x86_64 R-rd-missing orw +df
+x86_64 R-rd-missing orw +df,r#
+x86_64 R-rd-missing outw +df,r#
+x86_64 R-rd-missing pause +df,r#
+x86_64 R-rd-missing popfq +df,r#
+x86_64 R-rd-missing popfw +df,r#
+x86_64 R-rd-missing popq +df,r#
+x86_64 R-rd-missing popw +df,r#
+x86_64 R-rd-missing pushfq +df,r#
+x86_64 R-rd-missing pushfw +df,r#
+x86_64 R-rd-missing pushq +df
+x86_64 R-rd-missing pushq +df,r#
+x86_64 R-rd-missing pushw +df
+x86_64 R-rd-missing pushw +df,r#
+x86_64 R-rd-missing rclw +df
+x86_64 R-rd-missing repz retw +df,r#
+x86_64 R-rd-missing sahf +df,r#
+x86_64 R-rd-missing sbbw +df
+x86_64 R-rd-missing sbbw +df,r#
+x86_64 R-rd-missing subw +df
+x86_64 R-rd-missing subw +df,r#
+x86_64 R-rd-missing testb +df,r#
+x86_64 R-rd-missing testl +df,r#
+x86_64 R-rd-missing testw +df,r#
+x86_64 R-rd-missing wait +df,r#
+x86_64 R-rd-missing xchgb +df,r#
+x86_64 R-rd-missing xchgl +df
+x86_64 R-rd-missing xchgl +df,r#
+x86_64 R-rd-missing xchgw +df
+x86_64 R-rd-missing xchgw +df,r#
+x86_64 R-rd-missing xorw +df
+x86_64 R-rd-missing xorw +df,r#
+x86_64 R-rd-phantom adcq +flags,r#,seg
+x86_64 R-rd-phantom adcw +flags,r#,seg
+x86_64 R-rd-phantom addq +r#,seg
+x86_64 R-rd-phantom addw +r#,seg
+x86_64 R-rd-phantom andq +r#,seg
+x86_64 R-rd-phantom andw +r#,seg
+x86_64 R-rd-phantom bnd ja +flags
+x86_64 R-rd-phantom bnd jae +flags
+x86_64 R-rd-phantom bnd jb +flags
+x86_64 R-rd-phantom bnd jbe +flags
+x86_64 R-rd-phantom bnd je +flags
+x86_64 R-rd-phantom bnd jg +flags
+x86_64 R-rd-phantom bnd jl +flags
+x86_64 R-rd-phantom bnd jle +flags
+x86_64 R-rd-phantom bnd jne +flags
+x86_64 R-rd-phantom bnd jno +flags
+x86_64 R-rd-phantom bnd jnp +flags
+x86_64 R-rd-phantom bnd jns +flags
+x86_64 R-rd-phantom bnd jo +flags
+x86_64 R-rd-phantom bnd jp +flags
+x86_64 R-rd-phantom bnd js +flags
+x86_64 R-rd-phantom cbtw +r#
+x86_64 R-rd-phantom cltd +r#
+x86_64 R-rd-phantom cltq +r#
+x86_64 R-rd-phantom cmpq +r#,seg
+x86_64 R-rd-phantom cmpsb +flags,r#
+x86_64 R-rd-phantom cmpsb +flags,r#,seg
+x86_64 R-rd-phantom cmpsl +flags,r#
+x86_64 R-rd-phantom cmpsl +flags,r#,seg
+x86_64 R-rd-phantom cmpsq +flags,r#
+x86_64 R-rd-phantom cmpsq +flags,r#,seg
+x86_64 R-rd-phantom cmpsw +flags,r#
+x86_64 R-rd-phantom cmpsw +flags,r#,seg
+x86_64 R-rd-phantom cmpw +r#,seg
+x86_64 R-rd-phantom cqto +r#
+x86_64 R-rd-phantom cwtd +r#
+x86_64 R-rd-phantom cwtl +r#
+x86_64 R-rd-phantom fistl +seg
+x86_64 R-rd-phantom fists +seg
+x86_64 R-rd-phantom fstl +seg
+x86_64 R-rd-phantom fsts +seg
+x86_64 R-rd-phantom imull +r#
+x86_64 R-rd-phantom imull +r#,seg
+x86_64 R-rd-phantom imulq +r#
+x86_64 R-rd-phantom imulq +r#,seg
+x86_64 R-rd-phantom imulw +r#
+x86_64 R-rd-phantom imulw +r#,seg
+x86_64 R-rd-phantom insb +flags,r#
+x86_64 R-rd-phantom insl +flags,r#
+x86_64 R-rd-phantom insw +flags,r#
+x86_64 R-rd-phantom ja +flags
+x86_64 R-rd-phantom jae +flags
+x86_64 R-rd-phantom jb +flags
+x86_64 R-rd-phantom jbe +flags
+x86_64 R-rd-phantom je +flags
+x86_64 R-rd-phantom jg +flags
+x86_64 R-rd-phantom jl +flags
+x86_64 R-rd-phantom jle +flags
+x86_64 R-rd-phantom jne +flags
+x86_64 R-rd-phantom jno +flags
+x86_64 R-rd-phantom jnp +flags
+x86_64 R-rd-phantom jns +flags
+x86_64 R-rd-phantom jo +flags
+x86_64 R-rd-phantom jp +flags
+x86_64 R-rd-phantom js +flags
+x86_64 R-rd-phantom lahf +flags
+x86_64 R-rd-phantom leaq +r#
+x86_64 R-rd-phantom leaq +r#,seg
+x86_64 R-rd-phantom leaw +r#,seg
+x86_64 R-rd-phantom lock adcw +flags,r#,seg
+x86_64 R-rd-phantom lock xchgw +r#
+x86_64 R-rd-phantom lodsb +flags,r#
+x86_64 R-rd-phantom lodsb +flags,r#,seg
+x86_64 R-rd-phantom lodsl +flags,r#
+x86_64 R-rd-phantom lodsl +flags,r#,seg
+x86_64 R-rd-phantom lodsq +flags,r#
+x86_64 R-rd-phantom lodsq +flags,r#,seg
+x86_64 R-rd-phantom lodsw +flags,r#
+x86_64 R-rd-phantom lodsw +flags,r#,seg
+x86_64 R-rd-phantom movabsb +r#
+x86_64 R-rd-phantom movabsb +r#,seg
+x86_64 R-rd-phantom movabsb +seg
+x86_64 R-rd-phantom movabsl +r#
+x86_64 R-rd-phantom movabsl +r#,seg
+x86_64 R-rd-phantom movabsl +seg
+x86_64 R-rd-phantom movabsq +r#
+x86_64 R-rd-phantom movabsq +r#,seg
+x86_64 R-rd-phantom movabsq +seg
+x86_64 R-rd-phantom movabsw +r#
+x86_64 R-rd-phantom movabsw +r#,seg
+x86_64 R-rd-phantom movabsw +seg
+x86_64 R-rd-phantom movb +r#,seg
+x86_64 R-rd-phantom movb +seg
+x86_64 R-rd-phantom movl +r#,seg
+x86_64 R-rd-phantom movl +seg
+x86_64 R-rd-phantom movq +r#
+x86_64 R-rd-phantom movq +r#,seg
+x86_64 R-rd-phantom movsb +flags,r#
+x86_64 R-rd-phantom movsb +flags,r#,seg
+x86_64 R-rd-phantom movsl +flags,r#
+x86_64 R-rd-phantom movsl +flags,r#,seg
+x86_64 R-rd-phantom movslq +r#
+x86_64 R-rd-phantom movslq +r#,seg
+x86_64 R-rd-phantom movsq +flags,r#
+x86_64 R-rd-phantom movsq +flags,r#,seg
+x86_64 R-rd-phantom movsw +flags,r#
+x86_64 R-rd-phantom movsw +flags,r#,seg
+x86_64 R-rd-phantom movw +r#,seg
+x86_64 R-rd-phantom notb +seg
+x86_64 R-rd-phantom notl +seg
+x86_64 R-rd-phantom notq +r#,seg
+x86_64 R-rd-phantom notw +r#,seg
+x86_64 R-rd-phantom orq +r#,seg
+x86_64 R-rd-phantom orw +r#,seg
+x86_64 R-rd-phantom outsb +flags,r#
+x86_64 R-rd-phantom outsb +flags,r#,seg
+x86_64 R-rd-phantom outsl +flags,r#
+x86_64 R-rd-phantom outsl +flags,r#,seg
+x86_64 R-rd-phantom outsw +flags,r#
+x86_64 R-rd-phantom outsw +flags,r#,seg
+x86_64 R-rd-phantom popfq +r#
+x86_64 R-rd-phantom popfw +r#
+x86_64 R-rd-phantom popq +r#,seg
+x86_64 R-rd-phantom popw +r#,seg
+x86_64 R-rd-phantom pushfq +flags,r#
+x86_64 R-rd-phantom pushfw +flags,r#
+x86_64 R-rd-phantom pushq +r#
+x86_64 R-rd-phantom pushw +r#
+x86_64 R-rd-phantom rclb +seg
+x86_64 R-rd-phantom rcll +seg
+x86_64 R-rd-phantom rclq +r#,seg
+x86_64 R-rd-phantom rclw +r#,seg
+x86_64 R-rd-phantom rep lodsb +flags,r#,seg
+x86_64 R-rd-phantom rep lodsl +flags,r#,seg
+x86_64 R-rd-phantom rep lodsw +flags,r#,seg
+x86_64 R-rd-phantom rep movsb +flags,r#,seg
+x86_64 R-rd-phantom rep movsl +flags,r#,seg
+x86_64 R-rd-phantom rep movsw +flags,r#,seg
+x86_64 R-rd-phantom rep outsb +flags,r#,seg
+x86_64 R-rd-phantom rep outsl +flags,r#,seg
+x86_64 R-rd-phantom rep outsw +flags,r#,seg
+x86_64 R-rd-phantom repe cmpsb +flags,r#,seg
+x86_64 R-rd-phantom repe cmpsl +flags,r#,seg
+x86_64 R-rd-phantom repe cmpsw +flags,r#,seg
+x86_64 R-rd-phantom repne cmpsb +flags,r#,seg
+x86_64 R-rd-phantom repne cmpsl +flags,r#,seg
+x86_64 R-rd-phantom repne lodsb +flags,r#,seg
+x86_64 R-rd-phantom repne lodsl +flags,r#,seg
+x86_64 R-rd-phantom repne movsb +flags,r#,seg
+x86_64 R-rd-phantom repne movsl +flags,r#,seg
+x86_64 R-rd-phantom repne outsb +flags,r#,seg
+x86_64 R-rd-phantom repne outsl +flags,r#,seg
+x86_64 R-rd-phantom sahf +r#
+x86_64 R-rd-phantom sbbq +flags,r#,seg
+x86_64 R-rd-phantom sbbw +flags,r#,seg
+x86_64 R-rd-phantom scasb +flags,r#
+x86_64 R-rd-phantom scasl +flags,r#
+x86_64 R-rd-phantom scasq +flags,r#
+x86_64 R-rd-phantom scasw +flags,r#
+x86_64 R-rd-phantom stosb +flags,r#
+x86_64 R-rd-phantom stosl +flags,r#
+x86_64 R-rd-phantom stosq +flags,r#
+x86_64 R-rd-phantom stosw +flags,r#
+x86_64 R-rd-phantom subq +r#,seg
+x86_64 R-rd-phantom subw +r#,seg
+x86_64 R-rd-phantom testb +r#
+x86_64 R-rd-phantom testb +r#,seg
+x86_64 R-rd-phantom testl +r#
+x86_64 R-rd-phantom testl +r#,seg
+x86_64 R-rd-phantom testq +r#
+x86_64 R-rd-phantom testq +r#,seg
+x86_64 R-rd-phantom testw +r#
+x86_64 R-rd-phantom testw +r#,seg
+x86_64 R-rd-phantom xchgb +r#,seg
+x86_64 R-rd-phantom xchgl +r#,seg
+x86_64 R-rd-phantom xchgq +r#
+x86_64 R-rd-phantom xchgq +r#,seg
+x86_64 R-rd-phantom xchgw +r#,seg
+x86_64 R-rd-phantom xorq +r#,seg
+x86_64 R-rd-phantom xorw +r#,seg
+x86_64 R-wr-missing addw +r#
+x86_64 R-wr-missing andw +r#
+x86_64 R-wr-missing bnd ja +r#
+x86_64 R-wr-missing bnd jae +r#
+x86_64 R-wr-missing bnd jb +r#
+x86_64 R-wr-missing bnd jbe +r#
+x86_64 R-wr-missing bnd je +r#
+x86_64 R-wr-missing bnd jg +r#
+x86_64 R-wr-missing bnd jl +r#
+x86_64 R-wr-missing bnd jle +r#
+x86_64 R-wr-missing bnd jne +r#
+x86_64 R-wr-missing bnd jno +r#
+x86_64 R-wr-missing bnd jnp +r#
+x86_64 R-wr-missing bnd jns +r#
+x86_64 R-wr-missing bnd jo +r#
+x86_64 R-wr-missing bnd jp +r#
+x86_64 R-wr-missing bnd js +r#
+x86_64 R-wr-missing bnd lretw +r#
+x86_64 R-wr-missing bnd retw +r#
+x86_64 R-wr-missing cbtw +r#
+x86_64 R-wr-missing cltd +r#
+x86_64 R-wr-missing cmpw +r#
+x86_64 R-wr-missing cwtd +r#
+x86_64 R-wr-missing cwtl +r#
+x86_64 R-wr-missing imull +r#
+x86_64 R-wr-missing imulw +r#
+x86_64 R-wr-missing inw +r#
+x86_64 R-wr-missing iretw +r#
+x86_64 R-wr-missing ja +r#
+x86_64 R-wr-missing jae +r#
+x86_64 R-wr-missing jb +r#
+x86_64 R-wr-missing jbe +r#
+x86_64 R-wr-missing je +r#
+x86_64 R-wr-missing jg +r#
+x86_64 R-wr-missing jl +r#
+x86_64 R-wr-missing jle +r#
+x86_64 R-wr-missing jne +r#
+x86_64 R-wr-missing jno +r#
+x86_64 R-wr-missing jnp +r#
+x86_64 R-wr-missing jns +r#
+x86_64 R-wr-missing jo +r#
+x86_64 R-wr-missing jp +r#
+x86_64 R-wr-missing js +r#
+x86_64 R-wr-missing lahf +r#
+x86_64 R-wr-missing leaw +r#
+x86_64 R-wr-missing lock adcw +r#
+x86_64 R-wr-missing lretw +r#
+x86_64 R-wr-missing movabsb +r#
+x86_64 R-wr-missing movabsl +r#
+x86_64 R-wr-missing movabsw +r#
+x86_64 R-wr-missing movb +r#
+x86_64 R-wr-missing movl +r#
+x86_64 R-wr-missing movw +r#
+x86_64 R-wr-missing nop +r#
+x86_64 R-wr-missing notw +r#
+x86_64 R-wr-missing orw +r#
+x86_64 R-wr-missing outw +r#
+x86_64 R-wr-missing pause +r#
+x86_64 R-wr-missing popfq +r#
+x86_64 R-wr-missing popfw +r#
+x86_64 R-wr-missing popq +r#
+x86_64 R-wr-missing popw +r#
+x86_64 R-wr-missing pushfq +r#
+x86_64 R-wr-missing pushfw +r#
+x86_64 R-wr-missing pushq +r#
+x86_64 R-wr-missing pushw +r#
+x86_64 R-wr-missing rclw +r#
+x86_64 R-wr-missing repz retw +r#
+x86_64 R-wr-missing sahf +r#
+x86_64 R-wr-missing sbbw +r#
+x86_64 R-wr-missing subw +r#
+x86_64 R-wr-missing testb +r#
+x86_64 R-wr-missing testl +r#
+x86_64 R-wr-missing testw +r#
+x86_64 R-wr-missing wait +r#
+x86_64 R-wr-missing xchgb +r#
+x86_64 R-wr-missing xchgl +r#
+x86_64 R-wr-missing xchgw +r#
+x86_64 R-wr-missing xorw +r#
+x86_64 R-wr-phantom cbtw +r#
+x86_64 R-wr-phantom cltd +r#
+x86_64 R-wr-phantom cltq +r#
+x86_64 R-wr-phantom cmpsb +flags,r#
+x86_64 R-wr-phantom cmpsl +flags,r#
+x86_64 R-wr-phantom cmpsq +flags,r#
+x86_64 R-wr-phantom cmpsw +flags,r#
+x86_64 R-wr-phantom cqto +r#
+x86_64 R-wr-phantom cwtd +r#
+x86_64 R-wr-phantom cwtl +r#
+x86_64 R-wr-phantom imull +flags,r#
+x86_64 R-wr-phantom imulq +flags,r#
+x86_64 R-wr-phantom imulw +flags,r#
+x86_64 R-wr-phantom insb +r#
+x86_64 R-wr-phantom insl +r#
+x86_64 R-wr-phantom insw +r#
+x86_64 R-wr-phantom lahf +r#
+x86_64 R-wr-phantom leaq +r#
+x86_64 R-wr-phantom lock xchgw +r#
+x86_64 R-wr-phantom lodsb +r#
+x86_64 R-wr-phantom lodsl +r#
+x86_64 R-wr-phantom lodsq +r#
+x86_64 R-wr-phantom lodsw +r#
+x86_64 R-wr-phantom movabsb +r#
+x86_64 R-wr-phantom movabsl +r#
+x86_64 R-wr-phantom movabsq +r#
+x86_64 R-wr-phantom movabsw +r#
+x86_64 R-wr-phantom movq +r#
+x86_64 R-wr-phantom movsb +r#
+x86_64 R-wr-phantom movsl +r#
+x86_64 R-wr-phantom movslq +r#
+x86_64 R-wr-phantom movsq +r#
+x86_64 R-wr-phantom movsw +r#
+x86_64 R-wr-phantom movw +seg
+x86_64 R-wr-phantom outsb +r#
+x86_64 R-wr-phantom outsl +r#
+x86_64 R-wr-phantom outsw +r#
+x86_64 R-wr-phantom popfq +flags,r#
+x86_64 R-wr-phantom popfw +flags,r#
+x86_64 R-wr-phantom popq +r#
+x86_64 R-wr-phantom popw +r#
+x86_64 R-wr-phantom pushfq +r#
+x86_64 R-wr-phantom pushfw +r#
+x86_64 R-wr-phantom repe cmpsb +flags,r#
+x86_64 R-wr-phantom repe cmpsl +flags,r#
+x86_64 R-wr-phantom repe cmpsq +flags,r#
+x86_64 R-wr-phantom repe cmpsw +flags,r#
+x86_64 R-wr-phantom repe scasb +flags,r#
+x86_64 R-wr-phantom repe scasl +flags,r#
+x86_64 R-wr-phantom repe scasq +flags,r#
+x86_64 R-wr-phantom repe scasw +flags,r#
+x86_64 R-wr-phantom repne cmpsb +flags,r#
+x86_64 R-wr-phantom repne cmpsl +flags,r#
+x86_64 R-wr-phantom repne cmpsq +flags,r#
+x86_64 R-wr-phantom repne cmpsw +flags,r#
+x86_64 R-wr-phantom repne scasb +flags,r#
+x86_64 R-wr-phantom repne scasl +flags,r#
+x86_64 R-wr-phantom repne scasq +flags,r#
+x86_64 R-wr-phantom repne scasw +flags,r#
+x86_64 R-wr-phantom sahf +flags
+x86_64 R-wr-phantom scasb +flags,r#
+x86_64 R-wr-phantom scasl +flags,r#
+x86_64 R-wr-phantom scasq +flags,r#
+x86_64 R-wr-phantom scasw +flags,r#
+x86_64 R-wr-phantom stosb +r#
+x86_64 R-wr-phantom stosl +r#
+x86_64 R-wr-phantom stosq +r#
+x86_64 R-wr-phantom stosw +r#
+x86_64 R-wr-phantom testb +flags
+x86_64 R-wr-phantom testl +flags
+x86_64 R-wr-phantom testq +flags
+x86_64 R-wr-phantom testw +flags
+x86_64 R-wr-phantom xchgq +r#
+
+# CAUSE 2 (73 entries) -- LLVM RETURNS A PREFIX AS ITS OWN INSTRUCTION.
+# Almost all of these are `lock` with REX.W: LLVM's MC disassembler
+# decodes `f0` as the one-byte LOCK pseudo-instruction and stops, where
+# the boundary decodes the whole fused RMW.  Every register, memory and
+# length finding on these encodings is downstream of that single
+# convention difference.  The identical family for the non-REX.W
+# spellings (`lock cmpxchgl`, `lock xaddl`, ...) is already recorded
+# above; only the mnemonic changed, because REX.W renames the
+# instruction and the signature key carries the mnemonic.  The remainder
+# are `66`+`f3`+REX.W sequences carrying two mandatory prefixes at once,
+# where the two decoders pick different members of the mandatory-prefix
+# column (`lfence` vs `incsspq`, `xsave` vs `ptwriteq`, `clwb` vs
+# `xsaveopt64`).  Also 0 occurrences in the reference population.
+x86_64 D-llvm-only aandq
+x86_64 D-llvm-only incsspq
+x86_64 D-llvm-only ptwriteq
+x86_64 D-llvm-only rdfsbaseq
+x86_64 D-llvm-only rdgsbaseq
+x86_64 D-llvm-only rdsspq
+x86_64 D-llvm-only wrfsbaseq
+x86_64 D-llvm-only wrgsbaseq
+x86_64 D-size-mismatch lock btcq
+x86_64 D-size-mismatch lock btrq
+x86_64 D-size-mismatch lock btsq
+x86_64 D-size-mismatch lock cmpxchg16b
+x86_64 D-size-mismatch lock cmpxchgq
+x86_64 D-size-mismatch lock decq
+x86_64 D-size-mismatch lock incq
+x86_64 D-size-mismatch lock negq
+x86_64 D-size-mismatch lock xaddq
+x86_64 D-size-mismatch lock xchgq
+x86_64 M-cs-mem-llvm-none lock btcq
+x86_64 M-cs-mem-llvm-none lock btrq
+x86_64 M-cs-mem-llvm-none lock btsq
+x86_64 M-cs-mem-llvm-none lock cmpxchg16b
+x86_64 M-cs-mem-llvm-none lock cmpxchgq
+x86_64 M-cs-mem-llvm-none lock decq
+x86_64 M-cs-mem-llvm-none lock incq
+x86_64 M-cs-mem-llvm-none lock negq
+x86_64 M-cs-mem-llvm-none lock xaddq
+x86_64 M-cs-mem-llvm-none lock xchgq
+x86_64 M-llvm-mem-cs-none tpause load store
+x86_64 M-miss-load wrussq
+x86_64 R-rd-missing clwb +r#
+x86_64 R-rd-missing lfence +r#
+x86_64 R-rd-phantom lock adcq +flags
+x86_64 R-rd-phantom lock adcq +flags,r#,riz
+x86_64 R-rd-phantom lock addq +r#,riz
+x86_64 R-rd-phantom lock andq +r#,riz
+x86_64 R-rd-phantom lock btcq +r#
+x86_64 R-rd-phantom lock btcq +r#,riz
+x86_64 R-rd-phantom lock btrq +r#
+x86_64 R-rd-phantom lock btrq +r#,riz
+x86_64 R-rd-phantom lock btsq +r#
+x86_64 R-rd-phantom lock btsq +r#,riz
+x86_64 R-rd-phantom lock cmpxchg16b +r#
+x86_64 R-rd-phantom lock cmpxchg16b +r#,riz
+x86_64 R-rd-phantom lock cmpxchgq +r#
+x86_64 R-rd-phantom lock cmpxchgq +r#,riz
+x86_64 R-rd-phantom lock decq +r#
+x86_64 R-rd-phantom lock decq +r#,riz
+x86_64 R-rd-phantom lock incq +r#
+x86_64 R-rd-phantom lock incq +r#,riz
+x86_64 R-rd-phantom lock negq +r#
+x86_64 R-rd-phantom lock negq +r#,riz
+x86_64 R-rd-phantom lock notq +r#,riz
+x86_64 R-rd-phantom lock orq +r#,riz
+x86_64 R-rd-phantom lock sbbq +flags
+x86_64 R-rd-phantom lock sbbq +flags,r#,riz
+x86_64 R-rd-phantom lock subq +r#,riz
+x86_64 R-rd-phantom lock xaddq +r#
+x86_64 R-rd-phantom lock xaddq +r#,riz
+x86_64 R-rd-phantom lock xchgq +r#
+x86_64 R-rd-phantom lock xchgq +r#,riz
+x86_64 R-rd-phantom lock xorq +r#,riz
+x86_64 R-rd-phantom xsave +r#
+x86_64 R-wr-phantom lock btcq +flags
+x86_64 R-wr-phantom lock btrq +flags
+x86_64 R-wr-phantom lock btsq +flags
+x86_64 R-wr-phantom lock cmpxchg16b +flags,r#
+x86_64 R-wr-phantom lock cmpxchgq +flags,r#
+x86_64 R-wr-phantom lock decq +flags
+x86_64 R-wr-phantom lock incq +flags
+x86_64 R-wr-phantom lock negq +flags
+x86_64 R-wr-phantom lock xaddq +r#
+x86_64 R-wr-phantom lock xchgq +r#
+
+# CAUSE 3 (143 entries) -- SEGMENT AND DIRECTION-FLAG MODELLING.  Reached
+# because mod = 10 puts a string-op opcode where the ModRM byte goes, so
+# a prefix byte in the opcode slot now produces real segment-overridden
+# string forms.  Two sub-shapes, both benign, both checked:
+#
+#   `+seg`: LLVM's X86 memory operand always carries a segment-register
+#   slot, so an explicit override makes LLVM report a segment read.  For
+#   the overrides here -- ES (`26`), CS, SS and DS (`3e`) -- 64-bit mode
+#   forces the segment base to zero and the override contributes nothing
+#   to the effective address, so the boundary is right not to record a
+#   dependency.  THIS IS NOT THE SAME AS DROPPING FS/GS: those two do
+#   have a live base, and the tracer records them.  Verified directly --
+#   `--hex=64488b042500000000` (`movq %fs:0, %rax`) gives boundary
+#   RD{seg}, LLVM RD{seg} and fields SRC{REG_SEG3}, and the `%gs:` form
+#   gives REG_SEG4.  The benign family and the family that would have
+#   been a real defect are distinguishable, and only the benign one is
+#   here.
+#
+#   `+df`: LLVM reports the direction flag as a read on the string ops.
+#   The tracer's x86 register normaliser has no `df` token, so it is
+#   dropped before the comparison rather than compared -- which means
+#   this line records a GATE blind spot, not agreement.  DF is a real
+#   architectural input to every string op; it is folded into REG_FLAGS
+#   on the boundary side, which the normaliser cannot see through.
+x86_64 D-llvm-only cmovel
+x86_64 D-llvm-only cmoveq
+x86_64 D-llvm-only cmovew
+x86_64 D-size-mismatch xacquire lock xchgb
+x86_64 D-size-mismatch xacquire lock xchgl
+x86_64 D-size-mismatch xrelease lock xchgb
+x86_64 D-size-mismatch xrelease lock xchgl
+x86_64 M-cs-mem-llvm-none repne cmpsw
+x86_64 M-cs-mem-llvm-none repne insw
+x86_64 M-cs-mem-llvm-none repne lodsw
+x86_64 M-cs-mem-llvm-none repne movsw
+x86_64 M-cs-mem-llvm-none repne outsw
+x86_64 M-cs-mem-llvm-none repne scasw
+x86_64 M-cs-mem-llvm-none repne stosw
+x86_64 M-cs-mem-llvm-none xacquire lock xchgb
+x86_64 M-cs-mem-llvm-none xacquire lock xchgl
+x86_64 M-cs-mem-llvm-none xrelease lock xchgb
+x86_64 M-cs-mem-llvm-none xrelease lock xchgl
+x86_64 R-rd-missing cmpsb +df,seg
+x86_64 R-rd-missing cmpsl +df,seg
+x86_64 R-rd-missing cmpsw +df,seg
+x86_64 R-rd-missing imull +seg
+x86_64 R-rd-missing imulw +seg
+x86_64 R-rd-missing lodsb +df,seg
+x86_64 R-rd-missing lodsl +df,seg
+x86_64 R-rd-missing lodsw +df,seg
+x86_64 R-rd-missing movabsb +seg
+x86_64 R-rd-missing movabsl +seg
+x86_64 R-rd-missing movabsw +seg
+x86_64 R-rd-missing movb +seg
+x86_64 R-rd-missing movl +seg
+x86_64 R-rd-missing movsb +df,seg
+x86_64 R-rd-missing movsl +df,seg
+x86_64 R-rd-missing movsw +df,seg
+x86_64 R-rd-missing movw +seg
+x86_64 R-rd-missing outsb +df,seg
+x86_64 R-rd-missing outsl +df,seg
+x86_64 R-rd-missing outsw +df,seg
+x86_64 R-rd-missing popq +seg
+x86_64 R-rd-missing popw +seg
+x86_64 R-rd-missing rep lodsb +df,seg
+x86_64 R-rd-missing rep lodsl +df,seg
+x86_64 R-rd-missing rep lodsw +df,seg
+x86_64 R-rd-missing rep movsb +df,seg
+x86_64 R-rd-missing rep movsl +df,seg
+x86_64 R-rd-missing rep movsw +df,seg
+x86_64 R-rd-missing rep outsb +df,seg
+x86_64 R-rd-missing rep outsl +df,seg
+x86_64 R-rd-missing rep outsw +df,seg
+x86_64 R-rd-missing repe cmpsb +df,seg
+x86_64 R-rd-missing repe cmpsl +df,seg
+x86_64 R-rd-missing repe cmpsw +df,seg
+x86_64 R-rd-missing repne cmpsb +df,seg
+x86_64 R-rd-missing repne cmpsl +df,seg
+x86_64 R-rd-missing repne cmpsw +df
+x86_64 R-rd-missing repne insw +df
+x86_64 R-rd-missing repne lodsb +df,seg
+x86_64 R-rd-missing repne lodsl +df,seg
+x86_64 R-rd-missing repne lodsw +df
+x86_64 R-rd-missing repne movsb +df,seg
+x86_64 R-rd-missing repne movsl +df,seg
+x86_64 R-rd-missing repne movsw +df
+x86_64 R-rd-missing repne outsb +df,seg
+x86_64 R-rd-missing repne outsl +df,seg
+x86_64 R-rd-missing repne outsw +df
+x86_64 R-rd-missing repne scasw +df
+x86_64 R-rd-missing repne stosw +df
+x86_64 R-rd-missing testb +seg
+x86_64 R-rd-missing testl +seg
+x86_64 R-rd-missing testw +seg
+x86_64 R-rd-missing ud1 +r#,riz
+x86_64 R-rd-missing ud1 +r#,riz,seg
+x86_64 R-rd-missing xchgb +seg
+x86_64 R-rd-missing xchgl +seg
+x86_64 R-rd-missing xchgw +seg
+x86_64 R-rd-phantom lock adcb +flags,r#,riz
+x86_64 R-rd-phantom lock adcl +flags,r#,riz
+x86_64 R-rd-phantom lock addb +r#,riz
+x86_64 R-rd-phantom lock addl +r#,riz
+x86_64 R-rd-phantom lock andb +r#,riz
+x86_64 R-rd-phantom lock andl +r#,riz
+x86_64 R-rd-phantom lock btcl +r#,riz
+x86_64 R-rd-phantom lock btrl +r#,riz
+x86_64 R-rd-phantom lock btsl +r#,riz
+x86_64 R-rd-phantom lock cmpxchg8b +r#,riz
+x86_64 R-rd-phantom lock cmpxchgb +r#,riz
+x86_64 R-rd-phantom lock cmpxchgl +r#,riz
+x86_64 R-rd-phantom lock decb +r#,riz
+x86_64 R-rd-phantom lock decl +r#,riz
+x86_64 R-rd-phantom lock incb +r#,riz
+x86_64 R-rd-phantom lock incl +r#,riz
+x86_64 R-rd-phantom lock negb +r#,riz
+x86_64 R-rd-phantom lock negl +r#,riz
+x86_64 R-rd-phantom lock nopl +r#,riz
+x86_64 R-rd-phantom lock notb +r#,riz
+x86_64 R-rd-phantom lock notl +r#,riz
+x86_64 R-rd-phantom lock orb +r#,riz
+x86_64 R-rd-phantom lock orl +r#,riz
+x86_64 R-rd-phantom lock sbbb +flags,r#,riz
+x86_64 R-rd-phantom lock sbbl +flags,r#,riz
+x86_64 R-rd-phantom lock subb +r#,riz
+x86_64 R-rd-phantom lock subl +r#,riz
+x86_64 R-rd-phantom lock xaddb +r#,riz
+x86_64 R-rd-phantom lock xaddl +r#,riz
+x86_64 R-rd-phantom lock xchgb +r#,riz
+x86_64 R-rd-phantom lock xchgb +r#,seg
+x86_64 R-rd-phantom lock xchgl +r#,riz
+x86_64 R-rd-phantom lock xchgl +r#,seg
+x86_64 R-rd-phantom lock xorb +r#,riz
+x86_64 R-rd-phantom lock xorl +r#,riz
+x86_64 R-rd-phantom movb +r#,riz
+x86_64 R-rd-phantom movl +r#,riz
+x86_64 R-rd-phantom movw +r#,riz
+x86_64 R-rd-phantom repne cmpsw +flags,r#
+x86_64 R-rd-phantom repne insw +flags,r#
+x86_64 R-rd-phantom repne lodsw +flags,r#
+x86_64 R-rd-phantom repne movsw +flags,r#
+x86_64 R-rd-phantom repne outsw +flags,r#
+x86_64 R-rd-phantom repne scasw +flags,r#
+x86_64 R-rd-phantom repne stosw +flags,r#
+x86_64 R-rd-phantom xacquire lock andb +r#,seg
+x86_64 R-rd-phantom xacquire lock xchgb +r#
+x86_64 R-rd-phantom xacquire lock xchgl +r#
+x86_64 R-rd-phantom xacquire xchgb +r#,riz
+x86_64 R-rd-phantom xacquire xchgl +r#,riz
+x86_64 R-rd-phantom xchgb +r#,riz
+x86_64 R-rd-phantom xchgw +r#,riz
+x86_64 R-rd-phantom xrelease lock andb +r#,seg
+x86_64 R-rd-phantom xrelease lock xchgb +r#
+x86_64 R-rd-phantom xrelease lock xchgl +r#
+x86_64 R-rd-phantom xrelease xchgb +r#,riz
+x86_64 R-rd-phantom xrelease xchgl +r#,riz
+x86_64 R-wr-phantom repne cmpsw +r#
+x86_64 R-wr-phantom repne insw +r#
+x86_64 R-wr-phantom repne lodsw +r#
+x86_64 R-wr-phantom repne movsw +r#
+x86_64 R-wr-phantom repne outsw +r#
+x86_64 R-wr-phantom repne scasw +r#
+x86_64 R-wr-phantom repne stosw +r#
+x86_64 R-wr-phantom xacquire lock xchgb +r#
+x86_64 R-wr-phantom xacquire lock xchgl +r#
+x86_64 R-wr-phantom xrelease lock xchgb +r#
+x86_64 R-wr-phantom xrelease lock xchgl +r#
+
+# CAUSE 4 (159 entries) -- CAPSTONE'S VEX OPERAND DETAIL IS WRONG.  These
+# ARE defects, and they were invisible for as long as the sweep emitted
+# no VEX byte.  They are the same bug class already worked around at the
+# boundary for the SSE spellings (`cap_x86_is_extract_store`,
+# `cap_x86_is_move_family` in disas/capstone.c), which strip a leading
+# `v` and so cover VPEXTR*/VEXTRACTPS and the VEX MOV family -- but not
+# the forms below.  Observed with Capstone 6.0.0-Alpha7 and LLVM 18.
+# Three shapes, each with a reproducer:
+#
+#   Extract-to-memory that Capstone calls a load.  The MEM operand is the
+#   DESTINATION and is reported READ-only, so the operand walker models
+#   the store as a phantom load and never emits the store-data
+#   dependency.  `--hex=c4037d190000` (`vextractf128 $0,%ymm8,(%r8)`)
+#   -- fields records loads=1 stores=0 DST{-} for an instruction that
+#   only writes memory.  Same for vextracti128, vcvtps2ph, and the
+#   `kmov{b,w,d,q} %k,(mem)` mask stores, which `cap_x86_is_move_family`
+#   misses because it requires the mnemonic to begin `mov` after the `v`
+#   strip and these begin `k`.
+#
+#   Masked stores reported as loads: `--hex=c402792f00`
+#   (`vmaskmovpd %xmm8,%xmm0,(%r8)`), likewise vmaskmovps, vpmaskmovd,
+#   vpmaskmovq -- fields records loads=1 stores=0 DST{-}.
+#
+#   access == 0 on both the MEM and the REG operand, so the memory
+#   operand vanishes entirely rather than pointing the wrong way:
+#   `--hex=c4027d5a00` (`vbroadcasti128 (%r8),%ymm8`) -- fields records
+#   loads=0 stores=0, a load instruction that the trace says touches no
+#   memory.  Same for vcvtpd2psx and the vpermil2pd/ps five-operand
+#   forms; the AVX-512 mask ops (kadd*, ktest*, kunpck*) have it on
+#   their register operands only, where the plugin's own operand walker
+#   recovers them, which is why those appear as fixups rather than as
+#   dropped state.  The gather family (vpgatherdd and relatives) loses
+#   the write to the mask register the gather zeroes on completion.
+#
+# FIX PATH, not a limitation: extend `cap_x86_is_extract_store` with the
+# VEX extract-to-memory forms and let `cap_x86_is_move_family` see the
+# `k` mask moves, then re-run this gate -- a correct workaround makes its
+# own signature disappear, which is the proof.  Deliberately NOT done in
+# the same change as the sweep widening: it moves AVX trace semantics and
+# wants its own validation pass.
+#
+# MEASURED EXPOSURE.  In the four reference traces these cost nothing
+# today: every mnemonic in this cause has 0 correct-path executions
+# (vstmxcsr has 2,826 wrong-path and nothing else).  VEX as a whole is
+# 2.51% of distinct encodings and 2.59% of dynamic weight there, but it
+# is dominated by vzeroupper and the vmovdq* moves, which are correct.
+# The exposure is an AVX2-heavy or AVX-512 workload, not these four.
+x86_64 D-llvm-only cmpbexadd
+x86_64 D-llvm-only cmpbxadd
+x86_64 D-llvm-only cmplexadd
+x86_64 D-llvm-only cmplxadd
+x86_64 D-llvm-only cmpnbexadd
+x86_64 D-llvm-only cmpnbxadd
+x86_64 D-llvm-only cmpnlexadd
+x86_64 D-llvm-only cmpnlxadd
+x86_64 D-llvm-only cmpnoxadd
+x86_64 D-llvm-only cmpnpxadd
+x86_64 D-llvm-only cmpnsxadd
+x86_64 D-llvm-only cmpnzxadd
+x86_64 D-llvm-only cmpoxadd
+x86_64 D-llvm-only cmppxadd
+x86_64 D-llvm-only cmpsxadd
+x86_64 D-llvm-only cmpzxadd
+x86_64 D-llvm-only ldtilecfg
+x86_64 D-llvm-only sttilecfg
+x86_64 D-llvm-only tcmmimfp16ps
+x86_64 D-llvm-only tcmmrlfp16ps
+x86_64 D-llvm-only tdpbf16ps
+x86_64 D-llvm-only tdpbssd
+x86_64 D-llvm-only tdpbsud
+x86_64 D-llvm-only tdpbusd
+x86_64 D-llvm-only tdpbuud
+x86_64 D-llvm-only tdpfp16ps
+x86_64 D-llvm-only tileloadd
+x86_64 D-llvm-only tileloaddt1
+x86_64 D-llvm-only tilerelease
+x86_64 D-llvm-only tilestored
+x86_64 D-llvm-only tilezero
+x86_64 D-llvm-only vbcstnebf162ps
+x86_64 D-llvm-only vbcstnesh2ps
+x86_64 D-llvm-only vcvtneebf162ps
+x86_64 D-llvm-only vcvtneeph2ps
+x86_64 D-llvm-only vcvtneobf162ps
+x86_64 D-llvm-only vcvtneoph2ps
+x86_64 D-llvm-only vpackusdw
+x86_64 D-llvm-only vpcmpestri
+x86_64 D-llvm-only vpcmpestrm
+x86_64 D-llvm-only vpcmpistri
+x86_64 D-llvm-only vpcmpistrm
+x86_64 D-llvm-only vpdpbssd
+x86_64 D-llvm-only vpdpbssds
+x86_64 D-llvm-only vpdpbsud
+x86_64 D-llvm-only vpdpbsuds
+x86_64 D-llvm-only vpdpbuud
+x86_64 D-llvm-only vpdpbuuds
+x86_64 D-llvm-only vpdpwsud
+x86_64 D-llvm-only vpdpwsuds
+x86_64 D-llvm-only vpdpwusd
+x86_64 D-llvm-only vpdpwusds
+x86_64 D-llvm-only vpdpwuud
+x86_64 D-llvm-only vpdpwuuds
+x86_64 D-llvm-only vpextrb
+x86_64 D-llvm-only vpextrw
+x86_64 D-llvm-only vphsubd
+x86_64 D-llvm-only vpinsrb
+x86_64 D-llvm-only vpinsrw
+x86_64 D-llvm-only vsha512msg1
+x86_64 D-llvm-only vsha512msg2
+x86_64 D-llvm-only vsha512rnds2
+x86_64 D-llvm-only vsm3msg1
+x86_64 D-llvm-only vsm3msg2
+x86_64 D-llvm-only vsm3rnds2
+x86_64 D-llvm-only vsm4key4
+x86_64 D-llvm-only vsm4rnds4
+x86_64 D-llvm-only {vex}
+x86_64 M-extra-load kmovb
+x86_64 M-extra-load kmovd
+x86_64 M-extra-load kmovq
+x86_64 M-extra-load kmovw
+x86_64 M-extra-load vcvtps2ph
+x86_64 M-extra-load vextractf128
+x86_64 M-extra-load vextracti128
+x86_64 M-extra-load vstmxcsr
+x86_64 M-llvm-mem-cs-none vmaskmovdqu load store
+x86_64 M-miss-load vbroadcasti128
+x86_64 M-miss-load vcvtpd2psx
+x86_64 M-miss-load vpermil2pd
+x86_64 M-miss-load vpermil2ps
+x86_64 M-miss-store kmovb
+x86_64 M-miss-store kmovd
+x86_64 M-miss-store kmovq
+x86_64 M-miss-store kmovw
+x86_64 M-miss-store vcvtps2ph
+x86_64 M-miss-store vextractf128
+x86_64 M-miss-store vextracti128
+x86_64 M-miss-store vldmxcsr
+x86_64 M-miss-store vmaskmovpd
+x86_64 M-miss-store vmaskmovps
+x86_64 M-miss-store vpmaskmovd
+x86_64 M-miss-store vpmaskmovq
+x86_64 M-miss-store vstmxcsr
+x86_64 R-rd-missing kaddb +k#
+x86_64 R-rd-missing kaddd +k#
+x86_64 R-rd-missing kaddq +k#
+x86_64 R-rd-missing kaddw +k#
+x86_64 R-rd-missing ktestb +k#
+x86_64 R-rd-missing ktestd +k#
+x86_64 R-rd-missing ktestq +k#
+x86_64 R-rd-missing ktestw +k#
+x86_64 R-rd-missing kunpckdq +k#
+x86_64 R-rd-missing kunpckwd +k#
+x86_64 R-rd-missing vgatherdpd +v#
+x86_64 R-rd-missing vgatherdps +v#
+x86_64 R-rd-missing vgatherqpd +v#
+x86_64 R-rd-missing vgatherqps +v#
+x86_64 R-rd-missing vpcmpestrm +r#
+x86_64 R-rd-missing vpermil2pd +v#
+x86_64 R-rd-missing vpermil2ps +v#
+x86_64 R-rd-missing vpgatherdd +v#
+x86_64 R-rd-missing vpgatherdq +v#
+x86_64 R-rd-missing vpgatherqd +v#
+x86_64 R-rd-missing vpgatherqq +v#
+x86_64 R-wr-missing kaddb +k#
+x86_64 R-wr-missing kaddd +k#
+x86_64 R-wr-missing kaddq +k#
+x86_64 R-wr-missing kaddw +k#
+x86_64 R-wr-missing ktestb +flags
+x86_64 R-wr-missing ktestd +flags
+x86_64 R-wr-missing ktestq +flags
+x86_64 R-wr-missing ktestw +flags
+x86_64 R-wr-missing kunpckdq +k#
+x86_64 R-wr-missing kunpckwd +k#
+x86_64 R-wr-missing vbroadcasti128 +v#
+x86_64 R-wr-missing vcvtpd2psx +v#
+x86_64 R-wr-missing vgatherdpd +v#
+x86_64 R-wr-missing vgatherdps +v#
+x86_64 R-wr-missing vgatherqpd +v#
+x86_64 R-wr-missing vgatherqps +v#
+x86_64 R-wr-missing vpcmpestrm +flags,v#
+x86_64 R-wr-missing vpcmpistrm +flags,v#
+x86_64 R-wr-missing vpermil2pd +v#
+x86_64 R-wr-missing vpermil2ps +v#
+x86_64 R-wr-missing vpgatherdd +v#
+x86_64 R-wr-missing vpgatherdq +v#
+x86_64 R-wr-missing vpgatherqd +v#
+x86_64 R-wr-missing vpgatherqq +v#
+x86_64 R-wr-phantom vpermil2pd +v#
+x86_64 R-wr-phantom vpermil2ps +v#
+x86_64 Z-access0 kaddb REG
+x86_64 Z-access0 kaddd REG
+x86_64 Z-access0 kaddq REG
+x86_64 Z-access0 kaddw REG
+x86_64 Z-access0 ktestb REG
+x86_64 Z-access0 ktestd REG
+x86_64 Z-access0 ktestq REG
+x86_64 Z-access0 ktestw REG
+x86_64 Z-access0 kunpckdq REG
+x86_64 Z-access0 kunpckwd REG
+x86_64 Z-access0 vbroadcasti128 MEM
+x86_64 Z-access0 vbroadcasti128 REG
+x86_64 Z-access0 vcvtpd2psx MEM
+x86_64 Z-access0 vcvtpd2psx REG
+x86_64 Z-access0 vpermil2pd MEM
+x86_64 Z-access0 vpermil2pd REG
+x86_64 Z-access0 vpermil2ps MEM
+x86_64 Z-access0 vpermil2ps REG
+
+# --- mipsel: the residual the `sa`-swept sweep reaches.
+#
+# `sa` stopped being a three-value fill and became an exhaustively swept
+# opcode field (see sweep_mips), which opened the SPECIAL3 selector
+# columns -- BSHFL and the whole DSP ASE -- for the first time.  Three
+# causes, and they are NOT the same thing even though two of them share
+# a signature class.
+#
+# CAUSE 1 -- LLVM MARKS THE DSP ARITHMETIC OPS mayLoad AND mayStore.
+# These are register-to-register operations on packed data; they touch no
+# memory.  LLVM's MIPS tablegen gives the DSP ASE entries conservative
+# memory flags because they read and write the DSPControl register as
+# implicit state, and mayLoad/mayStore is how that side effect is spelled.
+# Capstone models no memory operand, which is right.
+#
+# THIS CLASS IS A KNOWN COLLISION HAZARD and was checked rather than
+# assumed: `M-llvm-mem-cs-none` is also what a MISIDENTIFIED instruction
+# produces (the two decoders naming different instructions and therefore
+# disagreeing about memory).  Verified for all 38 members below -- the
+# mnemonic Capstone prints and the mnemonic LLVM prints are byte-identical
+# in every one, so no member of this block is a misidentification wearing
+# the benign family's signature.
+mipsel M-llvm-mem-cs-none absq_s.ph load store
+mipsel M-llvm-mem-cs-none absq_s.w load store
+mipsel M-llvm-mem-cs-none addq_s.w load store
+mipsel M-llvm-mem-cs-none addsc load store
+mipsel M-llvm-mem-cs-none addu.ph load store
+mipsel M-llvm-mem-cs-none addu_s.ph load store
+mipsel M-llvm-mem-cs-none addwc load store
+mipsel M-llvm-mem-cs-none cmpgdu.eq.qb load store
+mipsel M-llvm-mem-cs-none cmpgdu.le.qb load store
+mipsel M-llvm-mem-cs-none cmpgdu.lt.qb load store
+mipsel M-llvm-mem-cs-none cmpgu.le.qb load store
+mipsel M-llvm-mem-cs-none cmpgu.lt.qb load store
+mipsel M-llvm-mem-cs-none mul.ph load store
+mipsel M-llvm-mem-cs-none mul_s.ph load store
+mipsel M-llvm-mem-cs-none muleq_s.w.phl load store
+mipsel M-llvm-mem-cs-none muleq_s.w.phr load store
+mipsel M-llvm-mem-cs-none muleu_s.ph.qbl load store
+mipsel M-llvm-mem-cs-none muleu_s.ph.qbr load store
+mipsel M-llvm-mem-cs-none mulq_rs.ph load store
+mipsel M-llvm-mem-cs-none mulq_rs.w load store
+mipsel M-llvm-mem-cs-none mulq_s.ph load store
+mipsel M-llvm-mem-cs-none mulq_s.w load store
+mipsel M-llvm-mem-cs-none pick.ph load
+mipsel M-llvm-mem-cs-none pick.qb load
+mipsel M-llvm-mem-cs-none precr.qb.ph load store
+mipsel M-llvm-mem-cs-none precrq_rs.ph.w load store
+mipsel M-llvm-mem-cs-none precrqu_s.qb.ph load store
+mipsel M-llvm-mem-cs-none rddsp load
+mipsel M-llvm-mem-cs-none shll_s.ph load store
+mipsel M-llvm-mem-cs-none shll_s.w load store
+mipsel M-llvm-mem-cs-none shllv.ph load store
+mipsel M-llvm-mem-cs-none shllv.qb load store
+mipsel M-llvm-mem-cs-none shllv_s.ph load store
+mipsel M-llvm-mem-cs-none shllv_s.w load store
+mipsel M-llvm-mem-cs-none subq_s.w load store
+mipsel M-llvm-mem-cs-none subu.ph load store
+mipsel M-llvm-mem-cs-none subu_s.ph load store
+mipsel M-llvm-mem-cs-none wrdsp load store
+
+# CAUSE 2 -- CAPSTONE MODELS DSPControl AND LLVM DOES NOT.  Here Capstone
+# is the correct one and the tracer follows it.  RDDSP copies selected
+# DSPControl fields into a GPR, WRDSP writes them, and MTHLIP reads the
+# DSPControl `pos` field it then decrements; QEMU's own translator agrees
+# (OPC_RDDSP / OPC_WRDSP / OPC_MTHLIP in target/mips/tcg/translate.c).
+# LLVM keeps DSPControl out of its register sets entirely, so it is LLVM
+# that is under-reporting.  Recorded so that if the tracer ever LOSES the
+# DSPControl dependency these lines go dead and say so.
+#
+# RDDSP and WRDSP are also the two encodings the trace-driven cross-check
+# flagged that this sweep could not previously build at all -- they live at
+# sa = 18 and sa = 19.
+mipsel R-rd-phantom mthlip +dsp
+mipsel R-rd-phantom rddsp +dsp
+mipsel R-wr-phantom wrdsp +dsp
+
+# CAUSE 3 -- A REAL DEFECT: CAPSTONE LOSES THE TIED SOURCE READ.  BALIGN,
+# PRECR_SRA.PH.W and PRECR_SRA_R.PH.W are read-modify-write on `rt`: the
+# destination is also an input.  Capstone reports it write-only, so the
+# architectural read is deleted, and it is deleted all the way through --
+# `--hex=311c017c` (`balign $at, $zero, 3`) gives fields SRC{REG_ZERO}
+# DST{REG_GPR1} with no read of $at at all.  Verified against QEMU's own
+# translator rather than against the other decoder: target/mips/tcg/
+# translate.c OPC_BALIGN reads cpu_gpr[rt] (`tcg_gen_shli_tl(cpu_gpr[rt],
+# cpu_gpr[rt], 8 * sa)`) before writing it.  LLVM reports the read; the
+# boundary does not.
+#
+# This is the same defect SHAPE as the AArch64 `ret` link-register loss
+# and the x86 indirect-call source erase -- a lost architectural read on a
+# tied operand -- and like those it is fixable at the boundary, by adding
+# the tied-operand repair for these three mnemonics in
+# cap_fill_mips_operands().  Observed with Capstone 6.0.0-Alpha7.
+#
+# MEASURED EXPOSURE: the whole MIPS DSP ASE retires 19 dynamic
+# instructions across the reference mipsel traces (RDDSP 10, WRDSP 9) and
+# these three retire none, so the cost today is zero and the reason to fix
+# it is a DSP-using workload, not these.  It is recorded here as a defect,
+# not as a convention difference.
+mipsel R-rd-missing balign +r#
+mipsel R-rd-missing precr_sra.ph.w +r#
+mipsel R-rd-missing precr_sra_r.ph.w +r#

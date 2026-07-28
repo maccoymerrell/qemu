@@ -1672,22 +1672,21 @@ static void sweep_mips(unsigned shard, unsigned nshard)
 // fill -- 1111 (the "no third operand" spelling that some forms require
 // and others reject), and two ordinary register values.
 //
-// Cost: 1,966,080 -> 154,337,280 encodings, 0.49 s -> 10.5 s at --jobs=16,
-// which is half what the aarch64 sweep already costs.  Measured against the
+// Cost: 1,966,080 -> 171,048,960 encodings, 0.49 s -> 11.9 s at --jobs=16,
+// which is under what the aarch64 sweep already costs.  Measured against the
 // 47,512 distinct encodings a traced x86 population actually retires (mcf
 // and perlbench, user and system, 1.64 G dynamic instructions), the share
-// lying inside the swept space moves from 62.76% to 98.07% of distinct
-// encodings, and from 58.82% to 99.66% weighted by dynamic execution count.
+// lying inside the swept space moves from 62.76% to 99.60% of distinct
+// encodings, and from 58.82% to 99.74% weighted by dynamic execution count.
 //
 // WHAT IS STILL PINNED.  A blind spot is not a smaller sweep, it is an
 // unmeasured one, so each of these carries its measurement against that
 // same population rather than merely being absent:
 //
-//   - Legacy prefix sequences outside the seven bases above: 752 distinct
-//     encodings (1.583%), 1,365,550 dynamic (0.083%).  All of them are
-//     segment overrides the seven do not spell -- `3e` (DS) and `65` (GS),
-//     plus three two- and three-prefix combinations.  This is the residue
-//     the `+seg` register-set family lives in.
+//   - Legacy prefix sequences outside the ten bases above: 26 distinct
+//     encodings (0.055%), 2,840 dynamic (0.0002%).  What is left is the
+//     three multi-prefix combinations `65 66`, `66 2e` and `66 66 2e`; the
+//     reason the last two are not bases is measured at the leg[] table.
 //
 //   - VEX3's vvvv field is a three-value fill, not all sixteen: 166
 //     distinct encodings (0.349%), 4,302,325 dynamic (0.262%) carry a vvvv
@@ -1709,10 +1708,35 @@ static void sweep_mips(unsigned shard, unsigned nshard)
 //     AVX-512 binary is traced.
 static void sweep_x86(unsigned shard, unsigned nshard)
 {
-    /* Legacy prefix sequences only.  REX is the separate dimension below. */
+    /* Legacy prefix sequences only.  REX is the separate dimension below.
+     *
+     * All four segment overrides that a 64-bit binary actually emits are
+     * here, and the reason is that they are NOT interchangeable.  FS (`64`)
+     * and GS (`65`) have a live base and the tracer records it; CS (`2e`)
+     * and DS (`3e`) have a base forced to zero in 64-bit mode and it
+     * records nothing.  Sweeping only FS made the two cases look like one
+     * and left the whole `+seg` disagreement family -- which is what the
+     * zero-base overrides produce against LLVM, and which the kernel emits
+     * constantly as `3e`-prefixed atomics -- reachable only by the
+     * trace-driven cross-check.
+     *
+     * MEASURED AND DELIBERATELY NOT CLOSED: `66 2e` and `66 66 2e`, the
+     * long-NOP idiom GAS emits for alignment padding.  Two distinct
+     * encodings in the reference population, 2,664 correct-path and 3.3 M
+     * wrong-path executions -- 0.00016% of dynamic weight -- and they
+     * produce one signature, `R-rd-missing nopw +seg`, which is the same
+     * zero-base CS override already justified below.  Adding the two
+     * sequences as bases was tried and costs 653 further allowlist entries,
+     * because a `66` separated from its opcode by a segment override is a
+     * legal prefix ORDER that LLVM's decoder rejects across the whole
+     * 66-mandatory SSE map.  That is a real LLVM limitation and not a
+     * tracer defect, and 653 entries recording it would bury the block that
+     * does describe defects.  The trade was refused on purpose; this
+     * paragraph is the measurement that makes it a decision and not an
+     * oversight. */
     static const struct { unsigned char p[4]; int np; } leg[] = {
         {{0},0}, {{0x66},1}, {{0xf3},1}, {{0xf2},1}, {{0x66,0xf3},2},
-        {{0xf0},1}, {{0x64},1},
+        {{0xf0},1}, {{0x64},1}, {{0x65},1}, {{0x3e},1}, {{0x2e},1},
     };
     /*
      * The ModRM tails.  Only bits 7:6 -- `mod` -- survive from a tail's

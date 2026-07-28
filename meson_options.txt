@@ -87,6 +87,8 @@ option('plugins', type: 'boolean', value: false,
        description: 'TCG plugins via shared library loading')
 option('debug_tcg', type: 'boolean', value: false,
        description: 'TCG debugging')
+option('oracle', type: 'boolean', value: false,
+       description: 'behavioural oracle: derive instruction write sets from emulation')
 option('debug_remap', type: 'boolean', value: false,
        description: 'syscall buffer debugging support')
 option('tcg_interpreter', type: 'boolean', value: false,

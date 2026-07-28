@@ -14,6 +14,7 @@
 #include "exec/translator.h"
 #include "exec/cpu_ldst.h"
 #include "exec/plugin-gen.h"
+#include "exec/oracle.h"
 #include "exec/cpu_ldst.h"
 #include "exec/tswap.h"
 #include "tcg/tcg-op-common.h"
@@ -166,6 +167,16 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
         if (plugin_enabled) {
             plugin_gen_insn_start(cpu, db);
         }
+
+#ifdef CONFIG_ORACLE
+        /*
+         * One call site delimits instructions for every target: the probe
+         * forces TCG to spill the guest registers it is holding in host
+         * registers, so CPUArchState is coherent and the delta since the
+         * previous boundary is exactly what the previous instruction wrote.
+         */
+        oracle_gen_insn_boundary(db->pc_next);
+#endif
 
         /*
          * Disassemble one instruction.  The translate_insn hook should

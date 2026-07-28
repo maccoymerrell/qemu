@@ -41,6 +41,7 @@
 #include "exec/replay-core.h"
 #include "system/tcg.h"
 #include "exec/helper-proto-common.h"
+#include "exec/oracle.h"
 #include "qemu/qemu-plugin.h"
 #include "tb-jmp-cache.h"
 #include "tb-hash.h"
@@ -2383,6 +2384,15 @@ bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
         assert(tcg_ops->translate_code);
         tcg_ops->initialize();
         tcg_target_initialized = true;
+#ifdef CONFIG_ORACLE
+        /*
+         * The target has just registered its architectural registers as TCG
+         * globals, so this is the first moment the offset -> register map
+         * exists.  sizeof(CPUArchState) is only real in per-target code,
+         * which this file is.
+         */
+        oracle_init(sizeof(CPUArchState), TARGET_NAME);
+#endif
     }
 
     cpu->tb_jmp_cache = g_new0(CPUJumpCache, 1);

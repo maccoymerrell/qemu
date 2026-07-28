@@ -16,6 +16,9 @@ tcg_specific_ss.add(when: 'CONFIG_SYSTEM_ONLY', if_false: files('user-exec-stub.
 if get_option('plugins')
   tcg_specific_ss.add(files('plugin-gen.c'))
 endif
+if get_option('oracle')
+  tcg_specific_ss.add(files('oracle.c'))
+endif
 specific_ss.add_all(when: 'CONFIG_TCG', if_true: tcg_specific_ss)
 
 specific_ss.add(when: ['CONFIG_SYSTEM_ONLY', 'CONFIG_TCG'], if_true: files(

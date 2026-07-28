@@ -43,6 +43,8 @@ meson_options_help() {
   printf "%s\n" '                           jemalloc/system/tcmalloc)'
   printf "%s\n" '  --enable-module-upgrades try to load modules from alternate paths for'
   printf "%s\n" '                           upgrades'
+  printf "%s\n" '  --enable-oracle          behavioural oracle: derive instruction write sets'
+  printf "%s\n" '                           from emulation'
   printf "%s\n" '  --enable-rng-none        dummy RNG, avoid using /dev/(u)random and'
   printf "%s\n" '                           getrandom()'
   printf "%s\n" '  --enable-safe-stack      SafeStack Stack Smash Protection (requires'
@@ -421,6 +423,8 @@ _meson_option_parse() {
     --disable-nvmm) printf "%s" -Dnvmm=disabled ;;
     --enable-opengl) printf "%s" -Dopengl=enabled ;;
     --disable-opengl) printf "%s" -Dopengl=disabled ;;
+    --enable-oracle) printf "%s" -Doracle=true ;;
+    --disable-oracle) printf "%s" -Doracle=false ;;
     --enable-oss) printf "%s" -Doss=enabled ;;
     --disable-oss) printf "%s" -Doss=disabled ;;
     --enable-pa) printf "%s" -Dpa=enabled ;;

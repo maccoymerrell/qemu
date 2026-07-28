@@ -57,6 +57,7 @@
 #include "tcg-internal.h"
 #include "tcg/perf.h"
 #include "tcg-has.h"
+#include "exec/oracle.h"
 #ifdef CONFIG_USER_ONLY
 #include "user/guest-base.h"
 #endif
@@ -2444,6 +2445,18 @@ static void tcg_gen_callN(void *func, TCGHelperInfo *info,
     int n_extend = 0;
     TCGOp *op;
     int i, n, pi = 0, total_args;
+#ifdef CONFIG_ORACLE
+    /*
+     * Choke point for the behavioural oracle.  Every helper on every target
+     * is emitted through here, so bracketing this one function instruments
+     * all of them without a line of per-helper code.
+     */
+    bool oracle_probe = oracle_gen_helper_probe_wanted(info);
+
+    if (oracle_probe) {
+        oracle_gen_helper_probe(info, true, ret);
+    }
+#endif
 
     if (unlikely(g_once_init_enter(HELPER_INFO_INIT(info)))) {
         init_call_layout(info);
@@ -2528,6 +2541,12 @@ static void tcg_gen_callN(void *func, TCGHelperInfo *info,
     for (i = 0; i < n_extend; ++i) {
         tcg_temp_free_i64(extend_free[i]);
     }
+
+#ifdef CONFIG_ORACLE
+    if (oracle_probe) {
+        oracle_gen_helper_probe(info, false, ret);
+    }
+#endif
 }
 
 void tcg_gen_call0(void *func, TCGHelperInfo *info, TCGTemp *ret)

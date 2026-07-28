@@ -214,22 +214,35 @@ void dep_lea(const struct qemu_plugin_insn_info *info, InsnFields *f)
  * find_dst_slot: find a specific reg_id in dst_regs[] (used to
  * narrow the SP-dst's dep_mask to just the SP src bit).
  */
-static int find_stack_ptr_src(const InsnFields *f)
+static int find_stack_ptr_src(const InsnFields *f, bool stack_op_is_store)
 {
-    for (uint8_t i = 0; i < f->n_src_regs; i++) {
-        if (f->src_regs[i] != REG_SP) {
-            continue;
+    /*
+     * Ground truth first: the register the stack access actually
+     * addresses through.  A push writes the stack, so its STORE names
+     * the pointer; a pop reads it, so its LOAD does.  Reading it from
+     * the operand walk's own address mask settles both awkward forms
+     * without a name test -- LEAVE's load addresses through RBP, and
+     * `call *disp(%rip)` loads through %ip but pushes through %sp.
+     */
+    (void)stack_op_is_store;
+    uint64_t explicit_addr = 0;
+    if (f->has_addr_deps) {
+        for (uint8_t k = 0; k < f->max_dep_loads && k < MAX_LOADS; k++) {
+            explicit_addr |= f->load_addr_dep_mask[k];
         }
-        for (uint8_t j = 0; j < f->n_dst_regs; j++) {
-            if (f->dst_regs[j] == REG_SP) {
-                return (int)i;
-            }
+        for (uint8_t k = 0; k < f->max_dep_stores && k < MAX_STORES; k++) {
+            explicit_addr |= f->store_addr_dep_mask[k];
         }
     }
-    for (uint8_t i = 0; i < f->n_src_regs; i++) {
-        for (uint8_t j = 0; j < f->n_dst_regs; j++) {
-            if (f->src_regs[i] == f->dst_regs[j]) {
-                return (int)i;
+    for (uint8_t pass = 0; pass < 2; pass++) {
+        for (uint8_t i = 0; i < f->n_src_regs; i++) {
+            if (pass == 0 && (explicit_addr & ((uint64_t)1 << i))) {
+                continue;
+            }
+            for (uint8_t j = 0; j < f->n_dst_regs; j++) {
+                if (f->src_regs[i] == f->dst_regs[j]) {
+                    return (int)i;
+                }
             }
         }
     }
@@ -329,7 +342,7 @@ static uint64_t addr_only_input_mask(const InsnFields *f, uint8_t n_stores)
 void dep_x86_stack_push(const struct qemu_plugin_insn_info *info,
                         InsnFields *f)
 {
-    int sp_src = find_stack_ptr_src(f);
+    int sp_src = find_stack_ptr_src(f, /*stack_op_is_store=*/true);
     if (sp_src < 0) {
         dep_all_to_all(info, f);
         return;
@@ -434,7 +447,7 @@ void dep_x86_stack_push(const struct qemu_plugin_insn_info *info,
 void dep_x86_stack_pop(const struct qemu_plugin_insn_info *info,
                        InsnFields *f)
 {
-    int sp_src = find_stack_ptr_src(f);
+    int sp_src = find_stack_ptr_src(f, /*stack_op_is_store=*/false);
     if (sp_src < 0) {
         dep_all_to_all(info, f);
         return;

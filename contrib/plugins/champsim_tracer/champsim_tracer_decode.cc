@@ -329,8 +329,13 @@ static const InsnClassification *classify_insn_id(
 }
 
 /*
- * Refine the table's branch_type from per-instance Capstone detail for
- * the cases a single insn_id cannot resolve statically.
+ * Repair the fields a single insn_id cannot resolve, using the per-instance
+ * detail Capstone printed.
+ *
+ * The classification table is keyed by insn_id, so wherever one id covers
+ * several architectural behaviours the table can only carry one of them and
+ * the discriminator is what Capstone printed for THIS instance -- the alias,
+ * or an operand the alias implies.  Every arm below exists for that reason:
  *
  *  - riscv: one insn_id covers jal+j and jalr+jr+ret, and the
  *    call/jump/return role is carried by rd (Capstone prints the alias):
@@ -340,15 +345,26 @@ static const InsnClassification *classify_insn_id(
  *    DIRECT_JUMP); the condition lives only in the printed mnemonic.
  *  - mips: every "jr <rs>" shares MIPS_INS_JR (static default
  *    INDIRECT_JUMP); "jr $ra" is the architectural return idiom and the
- *    register is only visible per instance.
+ *    register is only visible per instance.  `bal` is the always-taken
+ *    alias of `bgezal $zero`, so it inherits a condition it does not have.
+ *
+ * BRANCH TYPE IS NOT THE ONLY FIELD IT REPAIRS, which is why it is not
+ * named for one.  The same alias that hides a RISC-V call's role also hides
+ * its link register completely, so the register sets are repaired here too:
+ * REG_LR is added back to an aliased call's destinations and an aliased
+ * return's sources, and the C-extension HINT code points -- whose insn_id
+ * they share with a real ADDI or shift -- have their read dropped, because
+ * a HINT's register field is payload and not a value it consumes.  Both are
+ * the same problem as the branch class: one id, several behaviours, and only
+ * the printed form tells them apart.
  *
  * x86 (call direct/indirect) is handled by the per-row .refine callback
  * refine_x86_call_branch in the generated table; the remaining aarch64 /
  * mips control transfers (bl/blr/ret, jal/jalr/j) have distinct insn_ids
  * and need no refinement.
  */
-static void refine_branch_type(const qemu_plugin_insn_info *info,
-                               InsnFields *out, InsnRegNames *out_names)
+static void refine_alias_fields(const qemu_plugin_insn_info *info,
+                                InsnFields *out, InsnRegNames *out_names)
 {
     switch (trace_isa) {
     case TRACE_ISA_AARCH64: {
@@ -569,7 +585,7 @@ void decode_detail_to_generic(uint64_t pc,
         }
     }
 
-    /* refine_branch_type moved below the operand walk: its riscv arm
+    /* refine_alias_fields moved below the operand walk: its riscv arm
      * inspects n_src/n_dst_regs to detect alias-hidden link registers,
      * so it needs the explicit operands already populated. */
 
@@ -738,7 +754,7 @@ void decode_detail_to_generic(uint64_t pc,
      * aarch64 b vs b.<cc>, mips jr $ra).  Runs after the operand walk
      * (the riscv arm needs n_src/n_dst populated) and before the
      * per-row .refine (whose x86 call body overrides this one). */
-    refine_branch_type(info, out, out_names);
+    refine_alias_fields(info, out, out_names);
 
     /*
      * Optional ISA-specific post-classification .refine: fixes up

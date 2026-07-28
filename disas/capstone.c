@@ -1983,7 +1983,7 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
      * Restore the read directly instead, keyed on the exact shape that
      * cannot be anything else: AARCH64_INS_RET printed with no operand.
      * This mirrors the RISC-V aliased-link restore in
-     * refine_branch_type() (champsim_tracer_decode.cc), which repairs
+     * refine_alias_fields() (champsim_tracer_decode.cc), which repairs
      * the same class of loss on the other ISA — placed HERE rather than
      * in the plugin so isaxcheck, which drives this boundary, verifies
      * it.  x30 joins the implicit read list, which is exactly how

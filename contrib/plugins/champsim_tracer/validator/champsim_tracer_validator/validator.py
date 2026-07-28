@@ -3170,7 +3170,7 @@ def _check_static_reg_sets(
                 continue
             # Aliased link forms hide ra completely in Capstone 6 (not
             # in operands NOR the always-empty riscv implicit arrays);
-            # the tracer re-adds REG_LR in refine_branch_type.  Assert
+            # the tracer re-adds REG_LR in refine_alias_fields.  Assert
             # that restoration positively instead of skipping: raw
             # Capstone's sets plus the link register ARE the expected
             # truth.  Plain "jal imm" / 1-reg "jalr rs" write ra;

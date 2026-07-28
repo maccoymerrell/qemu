@@ -954,7 +954,7 @@ outside the repo as standalone scripts):
    rows carry the three heaviest weights in the RISC-V table — 500 M,
    448 M, 128 M.  The trace is nonetheless correct, because the plugin
    restores the link register *above* this boundary, in
-   ``refine_branch_type()`` (``champsim_tracer_decode.cc``), which adds
+   ``refine_alias_fields()`` (``champsim_tracer_decode.cc``), which adds
    ``REG_LR`` as a destination to a call that decoded with none and as a
    source to a return that decoded with none.  A decoded ``ret`` in a
    real trace reads ``%lr``.  The rows are carried as

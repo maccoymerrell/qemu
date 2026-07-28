@@ -2857,7 +2857,7 @@ def classify_riscv(m: str) -> Entry:
     # printed "j"/"jr") and the return (jalr x0,0(ra), printed "ret").
     # The static table can only hold one value per insn_id, so these are
     # DEFAULTS for the linking case; the decoder refines from the live
-    # mnemonic alias (see refine_branch_type in champsim_tracer_decode.cc).
+    # mnemonic alias (see refine_alias_fields in champsim_tracer_decode.cc).
     if m in {"jal", "c_jal"}:
         return ent("GEN_OP_BRANCH", "BRANCH_DIRECT_CALL")
     if m in {"c_j"}:

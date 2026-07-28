@@ -407,6 +407,9 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
     cpu_get_tb_cpu_state(env, &pc, &cs_base, &flags);
 
     cflags = curr_cflags(cpu);
+#ifdef CONFIG_ORACLE
+    cflags |= oracle_tb_cflags(pc);
+#endif
     if (check_for_breakpoints(cpu, pc, &cflags)) {
         cpu_loop_exit(cpu);
     }
@@ -415,6 +418,16 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
     if (tb == NULL) {
         return tcg_code_gen_epilogue;
     }
+#ifdef CONFIG_ORACLE
+    /*
+     * goto_ptr would jump straight into a TB carrying no probes, leaving the
+     * instruction that just executed unreported.  Go back to the execution
+     * loop instead, where oracle_tb_exit() reads it off.
+     */
+    if (unlikely(oracle_must_exit_before(tb))) {
+        return tcg_code_gen_epilogue;
+    }
+#endif
 
     if (qemu_loglevel_mask(CPU_LOG_TB_CPU | CPU_LOG_EXEC)) {
         log_cpu_exec(pc, cpu, tb);
@@ -456,6 +469,16 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
 
     qemu_thread_jit_execute();
     ret = tcg_qemu_tb_exec(cpu_env(cpu), tb_ptr);
+#ifdef CONFIG_ORACLE
+    /*
+     * The last instruction of an armed TB has no following boundary probe, so
+     * its delta is still unreported when control arrives back here.  An armed
+     * TB is only ever allowed to chain onwards into another armed TB, whose
+     * first instruction always carries a probe, so this and that probe between
+     * them cover every way out.
+     */
+    oracle_tb_exit(cpu_env(cpu));
+#endif
     cpu->neg.can_do_io = true;
     qemu_plugin_disable_mem_helpers(cpu);
     /*
@@ -639,6 +662,9 @@ void cpu_exec_step_atomic(CPUState *cpu)
         cflags &= ~CF_PARALLEL;
         /* After 1 insn, return and release the exclusive lock. */
         cflags |= CF_NO_GOTO_TB | CF_NO_GOTO_PTR | 1;
+#ifdef CONFIG_ORACLE
+        cflags |= oracle_tb_cflags(pc);
+#endif
         /*
          * No need to check_for_breakpoints here.
          * We only arrive in cpu_exec_step_atomic after beginning execution
@@ -2282,6 +2308,9 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 cpu->cflags_next_tb = -1;
             }
 
+#ifdef CONFIG_ORACLE
+            cflags |= oracle_tb_cflags(pc);
+#endif
             if (check_for_breakpoints(cpu, pc, &cflags)) {
                 break;
             }
@@ -2317,6 +2346,11 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
             }
 #endif
             /* See if we can patch the calling TB. */
+#ifdef CONFIG_ORACLE
+            if (last_tb && !oracle_tb_chain_ok(last_tb, tb)) {
+                last_tb = NULL;
+            }
+#endif
             if (last_tb) {
                 tb_add_jump(last_tb, tb_exit, tb);
             }

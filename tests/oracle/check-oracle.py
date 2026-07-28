@@ -85,6 +85,41 @@ PROBES = {
             ("vmul.vv",   {"raw@576", "raw@584"}),      # vreg(512) + 4 * 16
         ],
     },
+    "probe_aarch64": {
+        "arch": "aarch64",
+        "cflags": [],
+        # AArch64 keeps the condition flags as four separate 32-bit words, and
+        # keeps ZF *inverted* -- the Z condition holds when the word is zero.
+        # None of the four is a TCG global on this target, so the oracle names
+        # them from the globals table and the interpretation layer supplies the
+        # inversion.  Several entries here are short by exactly the writes
+        # value equality hides; the comment says which.
+        "expect": [
+            ("add",   {"x2"}),                    # no flag write at all
+            ("adds",  {"ZF", "x3"}),              # N, C, V unchanged from 0
+            ("subs",  {"CF", "ZF"}),              # rd = 0 over 0: invisible
+            ("cmp",   {"CF", "NF", "ZF"}),        # V unchanged
+            ("ccmp",  {"NF"}),                    # the rest unchanged
+            ("fadd",  {"raw@4342"}),              # zregs[4]: only 2 bytes move
+            ("fdiv",  {"raw@4592", "raw@12234"}), # zregs[5] + sticky FP flags
+            ("fcmp",  {"NF", "ZF"}),              # C and V already clear
+        ],
+    },
+    "probe_mipsel_fpu": {
+        "arch": "mipsel",
+        "cflags": ["-mfp32", "-modd-spreg"],
+        # QEMU gives every FP register its own sixteen-byte fpr_t slot in both
+        # FR modes and emulates FR=0's aliasing by redirection, so an odd
+        # single lands in fpr[odd] and never at fpr[even] + 4.
+        "expect": [
+            ("lwc1",  {"f1"}),                    # odd single: its own slot
+            ("add.s", {"f3"}),
+            ("add.s", {"f4"}),
+            ("mul.s", {"f5"}),
+            ("div.s", {"f6"}),                    # inexact, but flags already set
+            ("add.d", {"f8", "raw@817"}),         # one contiguous slot, not two
+        ],
+    },
     "probe_mipsel": {
         "arch": "mipsel",
         "cflags": [],
@@ -102,6 +137,7 @@ PROBES = {
 CROSS = {
     "riscv64": "riscv64-linux-gnu-",
     "mipsel": "mipsel-linux-gnu-",
+    "aarch64": "aarch64-linux-gnu-",
 }
 
 

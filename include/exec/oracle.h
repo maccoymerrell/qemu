@@ -34,8 +34,36 @@ bool oracle_active(void);
  * Choke point 2 of 2 in the translator: emit the per-instruction boundary
  * probe.  Called from translator_loop() before each guest instruction is
  * translated, so it covers every target with a single call site.
+ *
+ * The probe goes only into a TB whose cflags carry CF_ORACLE, so a TB outside
+ * the observation window costs nothing at all rather than costing a call that
+ * returns immediately.
  */
-void oracle_gen_insn_boundary(uint64_t pc);
+void oracle_gen_insn_boundary(uint64_t pc, bool first_insn);
+
+/*
+ * Translation-time gating.  Returns the cflags a TB starting at @pc must
+ * carry: CF_ORACLE, or nothing.  The answer is a pure function of @pc, so one
+ * pc always gets one decision and an armed and an unarmed TB for the same pc
+ * can never both be cached.
+ */
+uint32_t oracle_tb_cflags(uint64_t pc);
+
+/*
+ * Chaining.  An armed TB may only jump straight into another armed TB; the
+ * destination's first instruction is what closes out the source's last one.
+ * Both take TranslationBlock pointers, as void, so that a caller does not need
+ * the oracle's headers in scope.
+ */
+bool oracle_tb_chain_ok(const void *from, const void *to);
+bool oracle_must_exit_before(const void *to);
+
+/*
+ * Called when a TB returns to the execution loop.  A boundary probe reports an
+ * instruction's writes at the *next* boundary, so the last instruction of an
+ * armed TB has no probe left to close it; this is that probe.
+ */
+void oracle_tb_exit(void *env);
 
 /*
  * Choke point 1: helper call interposition, driven from tcg_gen_callN().

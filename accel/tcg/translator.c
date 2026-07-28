@@ -174,8 +174,13 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
          * forces TCG to spill the guest registers it is holding in host
          * registers, so CPUArchState is coherent and the delta since the
          * previous boundary is exactly what the previous instruction wrote.
+         *
+         * Whether a probe is emitted at all is decided here, at translation
+         * time, from the TB's CF_ORACLE flag and the instruction's pc.  An
+         * instruction outside the observation window costs nothing rather
+         * than costing a call that returns immediately.
          */
-        oracle_gen_insn_boundary(db->pc_next);
+        oracle_gen_insn_boundary(db->pc_next, db->num_insns == 1);
 #endif
 
         /*

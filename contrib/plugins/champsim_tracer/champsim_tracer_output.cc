@@ -2978,11 +2978,22 @@ static void emit_field_delta_section(BitWriter *main_bw,
 
         for (uint32_t i = 0; i < ev->tmpl->n_insns; i++) {
             const InsnFields *f = &ev->tmpl->insn_fields[i];
-            uint32_t insn_n_loads  = ev->actual_n_loads
+            uint32_t raw_n_loads  = ev->actual_n_loads
                 ? ev->actual_n_loads[i]  : 0;
-            uint32_t insn_n_stores = ev->actual_n_stores
+            uint32_t raw_n_stores = ev->actual_n_stores
                 ? ev->actual_n_stores[i] : 0;
-            warn_memop_overflow(ev->tmpl, i, insn_n_loads, insn_n_stores);
+            /* The warning describes what the instruction actually did,
+             * so it takes the uncapped counts. */
+            warn_memop_overflow(ev->tmpl, i, raw_n_loads, raw_n_stores);
+
+            /* The WIRE carries the clamped counts.  format.rst makes the
+             * elision observable as the dynamic count being clamped to
+             * the slot ceiling, and the slot loop below writes at most
+             * that many; staging the raw count would advertise slots
+             * that are not on the wire, and a consumer that believed it
+             * would read past the end of the entry. */
+            uint32_t insn_n_loads  = cap_min(raw_n_loads);
+            uint32_t insn_n_stores = cap_min(raw_n_stores);
 
             /* N_LOADS / N_STORES — per-iter runtime counts, always
              * visited.  Default 0 (template carries no static count). */

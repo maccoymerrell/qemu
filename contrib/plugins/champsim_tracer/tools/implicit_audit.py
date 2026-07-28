@@ -191,8 +191,20 @@ NOT_MODELLED = {
 ACCEPT = {
     "mipsel": {
         "fcsr": {"fcsr", "cop25", "cop26", "cop28", "cop31"},
-        "msacsr": {"msacsr", "vcsr"},
-        "dspctrl": {"dsp", "dspctrl"},
+        # MSA control and status folds onto REG_FCSR -- it is the vector
+        # unit's rounding-mode and status word, the role that ID already
+        # carries for the scalar FP unit.  It briefly held an ID of its
+        # own, REG_VCSR, hence the retired `vcsr` spelling; a register
+        # only MIPS has does not earn a generic ID.
+        # `cop1` is how BOTH decoders now spell it: MSA control registers
+        # are numbered (MSAIR 0 .. MSAUnmap 7) and the normaliser folds
+        # the name onto the number, so LLVM's `msair`/`msacsr` and
+        # Capstone's `cop<n>` meet.  Accepting it here is safe because
+        # every row asserting `msacsr` is an MSA instruction, where
+        # control register 1 is unambiguous.
+        "msacsr": {"msacsr", "fcsr", "vcsr", "cop1"},
+        # DSPControl likewise folds onto REG_FLAGS.
+        "dspctrl": {"dsp", "dspctrl", "flags"},
     },
     "aarch64": {
         "za": {"za"} | {"za%d" % i for i in range(16)},

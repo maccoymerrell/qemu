@@ -180,9 +180,9 @@ NOT_MODELLED = {
 #
 # Sometimes the SPEC TABLE is.  A system register does not live in the
 # ISA's register file, so it reaches the boundary as its own operand type
-# carrying an architectural encoding, and the boundary reports the CLASS
-# the dependency model records for it -- `flags`, `fcsr`, `tls`, `vctrl`,
-# `vcsr`, `vstart`, `sys` -- because that is the granularity at which the
+# carrying its architectural ROLE, and the boundary reports the CLASS the
+# dependency model records for it -- `flags`, `fcsr`, `tls`, `vctrl`,
+# `sys` -- because that is the granularity at which the
 # trace expresses a dependency.  The spec tables name the architectural
 # register, which is finer.  Asserting one against the other is what the
 # entries below make possible; the rule, and why each class groups the
@@ -209,22 +209,30 @@ ACCEPT = {
         "tpidrro_el0": {"tpidr", "tls"},
     },
     "riscv64": {
-        # Same class-vs-name rule.  The classes are architecturally
-        # meaningful, and the grouping is the answer to a real question:
-        # vl and vtype are the configuration a vsetvl writes as a pair
-        # (`vctrl`); vxrm and vxsat are the fixed-point rounding mode
-        # and saturation flag, which are status and NOT configuration
-        # (`vcsr`), because a saturating op writes vxsat without
-        # touching vl; vstart has its own ID because every vector op
-        # clears it; and vlenb is a read-only implementation constant
-        # that belongs with the ID registers (`sys`).
+        # Same class-vs-name rule.  The vector CONFIGURATION -- vl and
+        # vtype, which a vsetvl writes as a pair, plus the vstart resume
+        # index -- is `vctrl`.  vxrm, vxsat and the vcsr that is the two
+        # of them in one word are the fixed-point rounding mode and
+        # saturation flag, which is what `fcsr` already means.  vlenb is
+        # a read-only implementation constant that belongs with the ID
+        # registers (`sys`).
+        #
+        # vstart and vcsr held generic IDs of their own until those were
+        # retired for naming a register that exists in exactly one ISA
+        # (see the register IDs in docs/reference.rst).  The
+        # architectural names stay in the assertion tables, which are
+        # derived from the Sail model and say `vstart` because that is
+        # the register Sail reads; the fold belongs here, where the
+        # class the trace records is matched against the name the spec
+        # uses -- exactly as `vl` has always been matched against
+        # `vctrl`.
         "vl": {"vl", "vctrl"},
         "vtype": {"vtype", "vctrl"},
-        "vxrm": {"vxrm", "vcsr"},
-        "vxsat": {"vxsat", "vcsr"},
-        "vcsr": {"vcsr"},
+        "vstart": {"vstart", "vctrl"},
+        "vxrm": {"vxrm", "fcsr"},
+        "vxsat": {"vxsat", "fcsr"},
+        "vcsr": {"vcsr", "fcsr"},
         "vlenb": {"vlenb", "sys"},
-        "vstart": {"vstart"},
         "fcsr": {"fcsr"},
         "fflags": {"fflags", "fcsr"},
         "frm": {"frm", "fcsr"},

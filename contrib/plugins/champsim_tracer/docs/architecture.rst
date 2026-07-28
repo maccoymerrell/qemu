@@ -587,21 +587,30 @@ System and control registers
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Every other register reaches the plugin as a Capstone register id and
-resolves through ``<isa>_reg_class[]``.  System registers cannot: an
-ISA that names them outside its register file numbers them in a space
-of its own — an AArch64 ``mrs`` operand carries the packed
-``op0:op1:CRn:CRm:op2`` word (``NZCV`` is ``0xda10``, while the
-ordinary ``AARCH64_REG_NZCV`` is ``5``), and a RISC-V Zicsr
-instruction carries a bare 12-bit CSR number in what is architecturally
-an immediate field.  Indexing the register table with either would read
-the wrong row or run off its end.
+resolves through ``<isa>_reg_class[]``.  System registers cannot, for
+two separate reasons.  They are numbered in a space of their own — an
+AArch64 ``mrs`` operand carries the packed ``op0:op1:CRn:CRm:op2`` word
+(``NZCV`` is ``0xda10``, while the ordinary ``AARCH64_REG_NZCV`` is
+``5``), and a RISC-V Zicsr instruction carries a bare 12-bit CSR number
+in what is architecturally an immediate field, so indexing the register
+table with either would read the wrong row or run off its end.  And,
+more decisively, Capstone mostly has no register id to offer: of the
+1214 entries in its ``aarch64_sysreg`` enum exactly two, ``NZCV`` and
+``FPCR``, have a same-named ``aarch64_reg``.  ``TPIDR_EL0`` — read by
+every TLS access, and 45 of the 50 ``mrs``/``msr`` sites in a
+hello-world static binary — has none, nor does any EL1 control
+register.
 
-They travel instead as ``QEMU_PLUGIN_OP_SYSREG`` operands whose
-``reg_id`` holds the raw architectural encoding, and
-``decode_detail_to_generic`` resolves them through
-``IsaProperties::sysreg_to_generic`` — one small function per ISA,
-living beside that ISA's register table.  Two consequences are worth
-stating:
+So the translation cannot be done by renumbering, and it is done where
+every other Capstone gap is closed: at the boundary.  ``disas/capstone.c``
+resolves the operand's architectural ROLE and emits a
+``QEMU_PLUGIN_OP_SYSREG`` operand carrying it in ``sysreg_class`` —
+``QEMU_PLUGIN_SYSREG_FLAGS``, ``_FPCTRL``, ``_VECCTRL``, ``_THREADPTR``
+or ``_OTHER``.  ``reg_id`` still carries the raw architectural encoding
+for identification, but nothing classifies from it.  The plugin side is
+then ISA-independent: ``generic_reg_for_sysreg_class()`` renames the
+role into a generic ID, with no per-ISA branch and nothing to keep in
+step with an ISA table.  Two consequences are worth stating:
 
 * **Direction comes from the boundary, not from Capstone.**  Capstone
   leaves the AArch64 system operand's access bits empty and reports
@@ -617,11 +626,11 @@ stating:
 * **The mapping is deliberately not one slot.**  ``REG_SYS`` takes the
   long tail, but the registers with their own dependency populations
   get their own IDs — ``REG_FLAGS`` for AArch64 ``NZCV`` (so an ``msr
-  nzcv`` and the ``b.eq`` after it meet), ``REG_FCSR`` for the FP
-  control words, ``REG_TLS`` for the thread pointer, ``REG_VSTART`` for
-  the RISC-V vector resume index.  A dependency edge onto a register
-  the instruction never touched costs a consumer as much as a missing
-  one; :doc:`reference` records the reasoning per ID.
+  nzcv`` and the ``b.eq`` after it meet), ``REG_FCSR`` for the FP and
+  fixed-point control words, ``REG_TLS`` for the thread pointer,
+  ``REG_VCTRL`` for the RISC-V vector configuration.  A dependency edge
+  onto a register the instruction never touched costs a consumer as
+  much as a missing one; :doc:`reference` records the reasoning per ID.
 
 The rule that decides where a control register lands is *what would
 alias what*, not what the manual calls it.  Two registers share an ID
@@ -632,16 +641,21 @@ separate IDs when it is not:
   writes them as a pair and every vector instruction reads both — no
   edge exists between them that the shared ID invents.
 * ``vxrm`` and ``vxsat`` do **not** join them.  They are ``vcsr``'s
-  fields, and a saturating op writes ``vxsat`` without touching ``vl``;
-  on the shared ID every one of them would appear to redefine the
-  vector length its neighbours read.  They get ``REG_VCSR``, together
-  with MIPS ``MSACSR``, which plays the same role for MSA.
+  fields — a rounding mode and a status flag for the arithmetic unit,
+  which is what ``REG_FCSR`` already means — and a saturating op writes
+  ``vxsat`` without touching ``vl``, so on ``REG_VCTRL`` every one of
+  them would appear to redefine the vector length its neighbours read.
 * ``vlenb`` is read-only — VLEN in bytes, which nothing writes — so it
   sits in ``REG_SYS`` with the identification registers rather than
   taking a false edge from the last ``vsetvli``.
 
-An ISA that surfaces no such operands leaves ``sysreg_to_generic``
-NULL and the operand type is simply never produced for it.
+An ISA whose system registers Capstone does surface as ordinary
+registers needs nothing here: MIPS names its coprocessor registers
+``MIPS_REG_COP0``\ *n*, so they resolve through ``mips_reg_class[]``
+like any other register and never produce this operand type.  Should a
+Capstone bump grow ``aarch64_reg`` or ``riscv_reg`` ids for the system
+registers, the same becomes true there and the boundary tables shrink
+to nothing.
 
 One consequence reaches the tooling.  A system register's dependency is
 recorded at the granularity of its generic ID, so the decode gate and

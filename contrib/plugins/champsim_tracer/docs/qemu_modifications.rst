@@ -230,6 +230,27 @@ Plugin API additions
    walking operands cannot see it at all, so ``%fs:``-prefixed TLS
    and stack-protector accesses look address-input-less.
 
+   ``qemu_plugin_operand`` also carries ``sysreg_class``, the
+   architectural role of a ``QEMU_PLUGIN_OP_SYSREG`` operand
+   (``QEMU_PLUGIN_SYSREG_FLAGS`` / ``_FPCTRL`` / ``_VECCTRL`` /
+   ``_THREADPTR`` / ``_OTHER``).  Capstone models system registers
+   outside its register enum *and* has ids for almost none of them —
+   two of the 1214 entries in ``aarch64_sysreg`` — so there is no
+   register id to hand over and ``reg_id`` cannot be used to classify
+   them.  ``cap_aarch64_sysreg_class`` and ``cap_riscv_csr_class``
+   resolve the role here, beside the other Capstone workarounds,
+   which keeps the per-ISA knowledge on the side of the boundary that
+   already holds the rest of it; ``reg_id`` still carries the raw
+   architectural encoding for identification.  The field occupies a
+   pre-existing padding byte, so the structure's size is unchanged.
+
+   The same operands need their ``access`` synthesised, because
+   Capstone leaves the AArch64 system operand's access bits empty and
+   reports every RISC-V CSR operand as read-modify-write:
+   ``sysop.sub_type`` says whether an ``mrs`` reads or an ``msr``
+   writes, and ``cap_riscv_csr_access`` applies Zicsr's rd/rs1
+   suppression rules.
+
 Static branch-target plumbing
 -----------------------------
 

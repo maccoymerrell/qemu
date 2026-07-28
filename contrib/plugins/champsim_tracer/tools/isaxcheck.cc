@@ -761,15 +761,15 @@ static void cs_decode(const uint8_t *b, size_t n, CsView &v,
         }
         case QEMU_PLUGIN_OP_SYSREG: {
             // A system / control register named outside the ISA's register
-            // file: an AArch64 MRS/MSR operand, a RISC-V Zicsr CSR.  reg_id
-            // is the raw architectural encoding, in a numbering space
-            // disjoint from the Capstone register enum, so the generic id
-            // comes from the per-ISA system-register mapper rather than
-            // from the register table.  Dropping it here would leave the
-            // comparison blind to exactly the operand class it exists to
-            // catch: an instruction whose whole purpose is to move a
-            // control register, appearing to move nothing.
-            unsigned g = isax_generic_sysreg(op->reg_id);
+            // file: an AArch64 MRS/MSR operand, a RISC-V Zicsr CSR.
+            // Capstone has register ids for almost none of these, so the
+            // boundary resolves the architectural role and the generic id
+            // is a rename of that role rather than a register-table
+            // lookup.  Dropping it here would leave the comparison blind
+            // to exactly the operand class it exists to catch: an
+            // instruction whose whole purpose is to move a control
+            // register, appearing to move nothing.
+            unsigned g = isax_generic_sysreg(op->sysreg_class);
             // The TOKEN is the class the dependency model records, not the
             // architectural name.  The tracer folds the whole system
             // register space onto REG_SYS apart from the few it models

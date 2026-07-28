@@ -869,30 +869,68 @@ char *qemu_plugin_insn_disas(const struct qemu_plugin_insn *insn);
 /*
  * A system / control register named by the encoding but living outside
  * the ISA's ordinary register file: an AArch64 MRS/MSR system register,
- * a RISC-V Zicsr CSR, and their kin.  Capstone models these with their
- * own operand types and their own numbering (aarch64_sysreg,
- * cs_riscv_op.csr), disjoint from the register enum that reg_id
- * otherwise carries, so presenting them as QEMU_PLUGIN_OP_REG would
- * index the wrong table.
+ * a RISC-V Zicsr CSR, and their kin.
  *
- * reg_id therefore holds the ISA's RAW SYSTEM-REGISTER ENCODING, not a
- * Capstone register id:
- *   AArch64: the aarch64_sysreg value, i.e. the packed
- *            op0:op1:CRn:CRm:op2 field (NZCV = 0xda10, FPCR = 0xda20,
- *            TPIDR_EL0 = 0xde82).
- *   RISC-V : the 12-bit CSR number (fflags = 0x001, vstart = 0x008,
- *            vl = 0xc20).
- * reg_name carries the printed name where the disassembler supplies
- * one.  access is filled from the direction the instruction form
- * implies (MRS reads, MSR writes, Zicsr per its rd/rs1 suppression
- * rules) because Capstone leaves the AArch64 system operand's access
- * bits empty.
+ * These get an operand type of their own because Capstone cannot name
+ * them as registers.  It numbers them in spaces of their own
+ * (aarch64_sysreg, cs_riscv_op.csr) disjoint from the register enum
+ * reg_id otherwise carries, and its register enum has ids for almost
+ * none of them: of the 1214 entries in Capstone 6.0.0-Alpha7's
+ * aarch64_sysreg, exactly two -- NZCV and FPCR -- have a same-named
+ * aarch64_reg, and TPIDR_EL0, FPSR and every EL1 control register have
+ * none.  So there is no register id to hand over, and a consumer given
+ * the raw encoding would have to carry a per-ISA table to make sense
+ * of it.
+ *
+ * sysreg_class therefore carries the ARCHITECTURAL ROLE, resolved at
+ * the Capstone boundary where the rest of the per-instruction register
+ * knowledge already lives (see disas/capstone.c).  It is what a
+ * consumer maps from; see QEMU_PLUGIN_SYSREG_* below.
+ *
+ * reg_id holds the raw architectural encoding for identification and
+ * reporting -- the aarch64_sysreg value, i.e. the packed
+ * op0:op1:CRn:CRm:op2 field (NZCV = 0xda10, TPIDR_EL0 = 0xde82), or
+ * the 12-bit RISC-V CSR number (fflags = 0x001, vl = 0xc20).  It is
+ * deliberately NOT a Capstone register id and must not be looked up in
+ * one.  reg_name carries the printed name where the disassembler
+ * supplies one.
+ *
+ * access is filled from the direction the instruction form implies
+ * (MRS reads, MSR writes, Zicsr per its rd/rs1 suppression rules)
+ * because Capstone leaves the AArch64 system operand's access bits
+ * empty.
  *
  * A plugin that does not model system registers can ignore this type
- * exactly as it ignores QEMU_PLUGIN_OP_INVALID; one that does needs a
- * per-ISA encoding->register mapping of its own.
+ * exactly as it ignores QEMU_PLUGIN_OP_INVALID.
  */
 #define QEMU_PLUGIN_OP_SYSREG  4
+
+/*
+ * Architectural role of a QEMU_PLUGIN_OP_SYSREG operand.
+ *
+ * The vocabulary is deliberately tiny and names ROLES, not registers:
+ * a dependency model schedules against the role, and the specific
+ * register is already in reg_id / reg_name for anything that needs it.
+ * Every value but OTHER exists because folding that role into OTHER
+ * would put a hot, narrow dependency into the same slot as the whole
+ * identification / trap / debug register space -- an edge onto
+ * whichever system register the last MRS happened to touch.
+ *
+ * QEMU_PLUGIN_SYSREG_OTHER is the default and the long tail; it is
+ * also what an operand carries when the boundary has no opinion, so a
+ * zeroed operand reads as "some system register" rather than as a
+ * specific one.
+ */
+#define QEMU_PLUGIN_SYSREG_OTHER     0  /* the long tail: ID, trap,
+                                         * translation, counter, debug */
+#define QEMU_PLUGIN_SYSREG_FLAGS     1  /* condition flags (AArch64 NZCV) */
+#define QEMU_PLUGIN_SYSREG_FPCTRL    2  /* FP / fixed-point rounding-mode
+                                         * and status word (FPCR, FPSR,
+                                         * fcsr, frm, vxrm, ...) */
+#define QEMU_PLUGIN_SYSREG_VECCTRL   3  /* vector configuration (vl,
+                                         * vtype, vstart) */
+#define QEMU_PLUGIN_SYSREG_THREADPTR 4  /* userspace thread pointer
+                                         * (TPIDR_EL0, TPIDRRO_EL0) */
 
 /* Operand access mode (bitmask) */
 #define QEMU_PLUGIN_OP_ACC_READ  1
@@ -972,7 +1010,13 @@ typedef struct qemu_plugin_operand {
      */
     uint8_t  shift_type;
     uint8_t  shift_amount;
-    uint8_t  _pad[1];
+    /*
+     * QEMU_PLUGIN_SYSREG_* — the architectural role of a
+     * QEMU_PLUGIN_OP_SYSREG operand.  Zero (OTHER) on every other
+     * operand type, which is also its meaning there: no system
+     * register is named, so no role is claimed.
+     */
+    uint8_t  sysreg_class;
     /* REG name (or MEM base register name); empty string if none */
     char     reg_name[QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ];
     /* MEM index register name; empty string if none or not MEM */

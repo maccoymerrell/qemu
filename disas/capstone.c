@@ -1246,12 +1246,9 @@ static bool cap_aarch64_is_block_zero_sysop(const cs_arm64 *a64, uint8_t n)
  *
  * Two things make this a translation rather than a fix.  Capstone leaves
  * the operand's access bits empty, so the direction is taken from
- * sub_type, which states it exactly.  And the system-register numbering
- * is disjoint from aarch64_reg -- AARCH64_SYSREG_NZCV is 0xda10 while
- * AARCH64_REG_NZCV is 5 -- so the value cannot be handed over as a
- * register id.  It goes out as QEMU_PLUGIN_OP_SYSREG, whose reg_id is
- * documented to carry the raw encoding, leaving the ISA-specific
- * encoding->register mapping to the consumer.
+ * sub_type, which states it exactly.  And the register cannot be handed
+ * over as a register id, because Capstone has almost none of them --
+ * see cap_aarch64_sysreg_class.
  *
  * IC / TLBI reuse AARCH64_OP_SYSREG with a TLBI or IC sub_type for a
  * maintenance operation rather than a register, and are left alone.
@@ -1273,6 +1270,73 @@ static bool cap_aarch64_sysreg_operand(const cs_arm64_op *o, uint8_t *access)
     default:
         /* TLBI / IC / an operand Capstone left unclassified. */
         return false;
+    }
+}
+
+/*
+ * The architectural role of an AArch64 system register.
+ *
+ * This is the boundary-side translation table the register enum cannot
+ * provide.  Capstone 6.0.0-Alpha7's aarch64_sysreg has 1214 entries; its
+ * aarch64_reg has a same-named id for exactly two of them, NZCV (5) and
+ * FPCR (3).  There is no AARCH64_REG_TPIDR_EL0, no AARCH64_REG_FPSR, no
+ * AARCH64_REG_FPMR, and nothing at all for the EL1 control space --
+ * `cstool -d arm64 44d03bd5` (mrs x4, tpidr_el0) reports the operand as
+ * AARCH64_OP_SYSREG with sysop.reg.sysreg = 0xde82 and no register.
+ * Capstone does hold the names internally
+ * (AArch64SysReg_lookupSysRegByEncoding in arch/AArch64/AArch64BaseInfo.h)
+ * but exports neither them nor any encoding->register mapping; cstool
+ * itself prints the bare number.  Revisit on a Capstone bump: if the
+ * register enum grows these, they become ordinary REG operands and this
+ * table shrinks to nothing.
+ *
+ * Four roles are named and everything else -- the identification
+ * registers, the translation and exception control registers, the
+ * counters, the debug registers -- is OTHER.  The named ones are the
+ * ones whose traffic would otherwise be fabricated onto an unrelated
+ * population:
+ *
+ *   NZCV     is the condition-flag register the rest of the ISA already
+ *            reads and writes.  On any other role `msr nzcv, x3` would
+ *            write a register the `b.eq` after it does not read -- the
+ *            severance this translation exists to close.
+ *   FPCR /
+ *   FPSR /
+ *   FPMR     are the FP control and status words, which is what
+ *            AARCH64_REG_FPCR already is wherever Capstone names it
+ *            directly (`fadd` reports an implicit FPCR read).
+ *   TPIDR_EL0 /
+ *   TPIDRRO_EL0
+ *            are the user thread pointer.  Every TLS access reads one
+ *            of them -- 45 of the 50 MRS/MSR sites in a hello-world
+ *            static binary -- and as OTHER that read would be ordered
+ *            behind whatever system register the last MRS in the trace
+ *            happened to touch.
+ *
+ * TPIDR_EL1 is deliberately NOT THREADPTR: it is the kernel's per-CPU
+ * base pointer, a different register serving a different purpose that
+ * merely shares a name stem.
+ *
+ * Reproducers (`cstool -d arm64 <hex>`):
+ *   200420d5  msr nzcv, x0        sysreg 0xda10
+ *   00443bd5  mrs x0, fpcr        sysreg 0xda20
+ *   44d03bd5  mrs x4, tpidr_el0   sysreg 0xde82
+ *   e0003bd5  mrs x0, dczid_el0   sysreg 0xd807 (OTHER)
+ */
+static uint8_t cap_aarch64_sysreg_class(unsigned sysreg)
+{
+    switch (sysreg) {
+    case AARCH64_SYSREG_NZCV:
+        return QEMU_PLUGIN_SYSREG_FLAGS;
+    case AARCH64_SYSREG_FPCR:
+    case AARCH64_SYSREG_FPSR:
+    case AARCH64_SYSREG_FPMR:
+        return QEMU_PLUGIN_SYSREG_FPCTRL;
+    case AARCH64_SYSREG_TPIDR_EL0:
+    case AARCH64_SYSREG_TPIDRRO_EL0:
+        return QEMU_PLUGIN_SYSREG_THREADPTR;
+    default:
+        return QEMU_PLUGIN_SYSREG_OTHER;
     }
 }
 
@@ -1691,14 +1755,17 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
         default: {
             /*
              * The system register an MRS / MSR moves -- see
-             * cap_aarch64_sysreg_operand.  reg_id carries the raw
-             * aarch64_sysreg encoding, not a Capstone register id.
+             * cap_aarch64_sysreg_operand.  sysreg_class carries the
+             * architectural role; reg_id carries the raw aarch64_sysreg
+             * encoding for identification, not a Capstone register id.
              */
             uint8_t sysacc = 0;
             if (cap_aarch64_sysreg_operand(cop, &sysacc)) {
                 op->type   = QEMU_PLUGIN_OP_SYSREG;
                 op->access = sysacc;
                 op->reg_id = (uint16_t)cop->sysop.reg.sysreg;
+                op->sysreg_class =
+                    cap_aarch64_sysreg_class(cop->sysop.reg.sysreg);
                 cap_aarch64_copy_sysreg_name(
                     op->reg_name, QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
                     insn->op_str,
@@ -2368,7 +2435,7 @@ static bool cap_riscv_fli_index(const cs_insn *insn, int64_t *index)
  * CSRs the generic model names are spelled here and everything else is
  * left unnamed -- "0x1a0" is not a register name, and carrying it would
  * put 4096 meaningless tokens into every name-keyed comparison.  Purely
- * informational either way: the consumer maps from the number.
+ * informational either way: the consumer maps from sysreg_class.
  */
 static const char *cap_riscv_csr_name(unsigned csr)
 {
@@ -2384,6 +2451,63 @@ static const char *cap_riscv_csr_name(unsigned csr)
     case 0xc21: return "vtype";
     case 0xc22: return "vlenb";
     default:    return NULL;
+    }
+}
+
+/*
+ * The architectural role of a RISC-V CSR.
+ *
+ * Zicsr names its register in a 12-bit immediate field, so the CSR
+ * space is its own numbering, disjoint from riscv_reg.  Capstone does
+ * have register ids for the shadow forms of seven of these
+ * (RISCV_REG_FFLAGS, FRM, VL, VTYPE, VXRM, VXSAT, VLENB) -- which is
+ * how `fadd.d` reports its implicit rounding-mode read -- but none for
+ * fcsr (0x003), vstart (0x008) or vcsr (0x00f), and none for the other
+ * 4086 CSR numbers.  `cstool -d riscv64 73254000` (csrr a0, satp)
+ * reports RISCV_OP_CSR with cop->csr = 0x180 and no register.  Rather
+ * than split the operand class on which CSRs Capstone happens to
+ * shadow, every one of them carries its role here.
+ *
+ *   The FP control and status word (fflags / frm / fcsr) is FPCTRL, so
+ *   an `fsrm` and the `fadd.d` that consumes its rounding mode meet on
+ *   one slot.
+ *
+ *   The fixed-point rounding mode and saturation flag (vxrm / vxsat,
+ *   and the vcsr that is the two of them in one word) are FPCTRL too.
+ *   That role already means "rounding mode and status for the
+ *   arithmetic unit", and vcsr is fcsr's sibling CSR.
+ *
+ *   The vector CONFIGURATION -- vl and vtype, which a vsetvl writes as
+ *   a pair and every vector instruction reads, plus the vstart resume
+ *   index -- is VECCTRL, so `csrr a0, vl` reads what `vsetvli` wrote.
+ *
+ *   vlenb is VLEN in bytes, a read-only implementation constant nothing
+ *   writes, so it belongs with the identification registers in OTHER.
+ *   On VECCTRL a read of it would take an edge from the last vsetvli,
+ *   which does not change VLEN.
+ *
+ * Reproducers (`cstool -d riscv64 <hex>`):
+ *   73270010  frflags a4      csr 0x001
+ *   73252000  csrr a0, vl     csr 0xc20
+ *   73254000  csrr a0, satp   csr 0x180 (OTHER)
+ */
+static uint8_t cap_riscv_csr_class(unsigned csr)
+{
+    switch (csr) {
+    case 0x001:  /* fflags */
+    case 0x002:  /* frm    */
+    case 0x003:  /* fcsr   */
+    case 0x009:  /* vxsat  */
+    case 0x00a:  /* vxrm   */
+    case 0x00f:  /* vcsr   */
+        return QEMU_PLUGIN_SYSREG_FPCTRL;
+    case 0x008:  /* vstart */
+    case 0xc20:  /* vl     */
+    case 0xc21:  /* vtype  */
+        return QEMU_PLUGIN_SYSREG_VECCTRL;
+    default:
+        /* vlenb (0xc22) included: a read-only implementation constant. */
+        return QEMU_PLUGIN_SYSREG_OTHER;
     }
 }
 
@@ -2590,13 +2714,15 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                  * writes nothing, and a vector kernel's edge onto the
                  * vsetvli that configured it, or an FP kernel's onto
                  * the fsrm that set its rounding mode, does not exist.
-                 * It goes out as QEMU_PLUGIN_OP_SYSREG carrying the raw
-                 * CSR number, with the direction refined from the
+                 * It goes out as QEMU_PLUGIN_OP_SYSREG with its role in
+                 * sysreg_class (see cap_riscv_csr_class), the raw CSR
+                 * number in reg_id, and the direction refined from the
                  * encoding (see cap_riscv_csr_access).
                  */
                 op->type = QEMU_PLUGIN_OP_SYSREG;
                 op->access = cap_riscv_csr_access(insn);
                 op->reg_id = (uint16_t)cop->csr;
+                op->sysreg_class = cap_riscv_csr_class(cop->csr);
                 {
                     /* Only a real name.  Capstone prints an unrecognised
                      * CSR as its bare number, and "0x1a0" is not a
@@ -2668,6 +2794,7 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                     op->type   = QEMU_PLUGIN_OP_SYSREG;
                     op->access = cap_riscv_csr_access(insn);
                     op->reg_id = (uint16_t)csr;
+                    op->sysreg_class = cap_riscv_csr_class(csr);
                     op->scale  = 1;
                     if (name) {
                         g_strlcpy(op->reg_name, name,

@@ -2612,11 +2612,15 @@ def _capstone_reg_class_for_isa(isa: str) -> dict[int, _RegClassEntry]:
     return out
 
 
-# Raw system-register encoding -> generic register name, mirroring the
-# per-ISA `sysreg_to_generic` mappers the decoder uses.  A
-# system-register operand carries an architectural encoding, not a
-# Capstone register id, so it cannot go through the reg-class table the
-# rest of this oracle uses; anything not listed folds to REG_SYS.
+# Raw system-register encoding -> generic register name.  Derived
+# INDEPENDENTLY of the decode boundary that classifies these at run
+# time (cap_aarch64_sysreg_class / cap_riscv_csr_class in
+# disas/capstone.c): an oracle that imported the mapping it is checking
+# would agree with a wrong one.  Keyed by encoding, which the operand
+# still carries in reg_id, because a system-register operand carries an
+# architectural encoding and not a Capstone register id, so it cannot
+# go through the reg-class table the rest of this oracle uses; anything
+# not listed folds to REG_SYS.
 _AARCH64_SYSREG_GENERIC = {
     0xda10: "REG_FLAGS",                                      # NZCV
     0xda20: "REG_FCSR", 0xda21: "REG_FCSR", 0xda22: "REG_FCSR",

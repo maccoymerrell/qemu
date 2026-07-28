@@ -555,22 +555,35 @@ typedef uint64_t (*AddrCanonicalizeFn)(uint64_t addr);
 typedef int (*MarkerEncodeSeqFn)(uint8_t *out, uint32_t imm);
 
 /*
- * Per-ISA system/control-register mapper.  A QEMU_PLUGIN_OP_SYSREG
- * operand carries the ISA's raw system-register encoding (the packed
- * AArch64 op0:op1:CRn:CRm:op2 word, the RISC-V 12-bit CSR number)
- * rather than a Capstone register id, because those numbering spaces
- * are disjoint from the register enum the ordinary reg table is keyed
- * by.  This turns that encoding into a generic register ID.
+ * A QEMU_PLUGIN_OP_SYSREG operand's architectural role -> generic ID.
  *
- * The long tail folds to REG_SYS.  Registers whose own dependency
- * population is worth separating -- the thread pointer, the vector
- * start index, the FP control word -- get their own IDs, because a
- * consumer is misled as badly by an edge onto a register the
- * instruction never touched as by a missing one.  Return REG_NONE to
- * drop the operand entirely.  NULL on an ISA with no system-register
- * operands.
+ * A system register named by the encoding -- an AArch64 MRS/MSR
+ * operand, a RISC-V Zicsr CSR -- arrives already classified, because
+ * Capstone cannot name these as registers (2 of its 1214 AArch64
+ * system registers have a register id) and disas/capstone.c is where
+ * that gap is closed, alongside the rest of the per-instruction
+ * register knowledge the boundary already carries.
+ *
+ * So there is no per-ISA branch here and nothing to keep in step with
+ * an ISA table: this is a rename from QEMU's role vocabulary into the
+ * generic one.  The long tail is REG_SYS; the roles with an ID of
+ * their own are the ones whose dependency population is worth
+ * separating -- the thread pointer, the vector configuration, the
+ * arithmetic control word -- because a consumer is misled as badly by
+ * an edge onto a register the instruction never touched as by a
+ * missing one.
  */
-typedef uint8_t (*SysRegToGenericFn)(uint16_t enc);
+static inline uint8_t generic_reg_for_sysreg_class(uint8_t sysreg_class)
+{
+    switch (sysreg_class) {
+    case QEMU_PLUGIN_SYSREG_FLAGS:     return REG_FLAGS;
+    case QEMU_PLUGIN_SYSREG_FPCTRL:    return REG_FCSR;
+    case QEMU_PLUGIN_SYSREG_VECCTRL:   return REG_VCTRL;
+    case QEMU_PLUGIN_SYSREG_THREADPTR: return REG_TLS;
+    case QEMU_PLUGIN_SYSREG_OTHER:
+    default:                           return REG_SYS;
+    }
+}
 
 typedef struct {
     uint8_t               branch_delay_slots;
@@ -614,9 +627,6 @@ typedef struct {
     MarkerEncodeSeqFn     marker_encode_seq;
     uint8_t               marker_insn_bytes;
     uint8_t               marker_seq_insns;
-    /* Raw system-register encoding -> generic ID; NULL when the ISA
-     * surfaces no QEMU_PLUGIN_OP_SYSREG operands. */
-    SysRegToGenericFn     sysreg_to_generic;
 } IsaProperties;
 
 #ifdef CHAMPSIM_MNEMONIC_TABLES_IMPL
@@ -654,7 +664,6 @@ const IsaProperties isa_properties[] = {
         .marker_encode_seq = cst_marker_a64_encode_seq_imm,
         .marker_insn_bytes = CST_MARKER_PAIR_INSN_BYTES,
         .marker_seq_insns  = CST_MARKER_PAIR_SEQ_INSNS,
-        .sysreg_to_generic = aarch64_sysreg_to_generic,
     },
     [TRACE_ISA_RISCV]   = {
         /* RISC-V MUST fold implicit regs too.  The vector-configuration
@@ -679,7 +688,6 @@ const IsaProperties isa_properties[] = {
         .marker_encode_seq = cst_marker_riscv_encode_seq_imm,
         .marker_insn_bytes = CST_MARKER_PAIR_INSN_BYTES,
         .marker_seq_insns  = CST_MARKER_PAIR_SEQ_INSNS,
-        .sysreg_to_generic = riscv_csr_to_generic,
     },
     [TRACE_ISA_MIPS]    = {
         .branch_delay_slots = 1,

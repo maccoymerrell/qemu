@@ -72,10 +72,11 @@ bool isax_fields_decode(const struct qemu_plugin_insn_info *info,
  * classify or that is out of range. */
 uint8_t isax_generic_reg(unsigned cap_reg_id);
 
-/* The tracer's raw-system-register-encoding -> GenericRegId mapping, for
- * QEMU_PLUGIN_OP_SYSREG operands whose reg_id is NOT a Capstone register
- * id.  REG_NONE on an ISA that surfaces no such operands. */
-uint8_t isax_generic_sysreg(unsigned enc);
+/* The tracer's QEMU_PLUGIN_SYSREG_* role -> GenericRegId mapping, for
+ * QEMU_PLUGIN_OP_SYSREG operands.  Capstone cannot name these as
+ * registers, so the boundary hands over the role and there is no
+ * register id to classify. */
+uint8_t isax_generic_sysreg(unsigned sysreg_class);
 
 /* Number of rows in the active register table; the caller enumerates it
  * to build a register-NAME -> GenericRegId map without duplicating the

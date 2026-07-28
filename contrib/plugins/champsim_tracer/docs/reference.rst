@@ -562,11 +562,13 @@ without implying any particular numeric base.
        slice-index GPR alongside it.
    * - ``REG_SYS``
      - Generic system register: the long tail of the per-arch MSR /
-       MRS / CSR / CP0 space — everything the ISA's system-register
-       mapper does not name specifically.  AArch64 ``mrs``/``msr`` and
-       RISC-V ``csrr``/``csrrw`` reach it through the
-       ``QEMU_PLUGIN_OP_SYSREG`` operand, which carries the raw
-       architectural encoding rather than a decoder register id.
+       MRS / CSR / CP0 space — everything the decode boundary does not
+       give a role of its own.  AArch64 ``mrs``/``msr`` and RISC-V
+       ``csrr``/``csrrw`` reach it through the
+       ``QEMU_PLUGIN_OP_SYSREG`` operand, which carries the
+       architectural role (``QEMU_PLUGIN_SYSREG_OTHER`` here) rather
+       than a decoder register id — Capstone has one for almost none of
+       these registers.
    * - ``REG_FCSR``
      - Floating-point control / status register (RISC-V ``frm`` /
        ``fflags`` / ``fcsr``, AArch64 ``FPCR`` / ``FPSR`` / ``FPMR``,

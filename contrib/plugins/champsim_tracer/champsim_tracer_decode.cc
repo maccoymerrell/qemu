@@ -626,19 +626,16 @@ void decode_detail_to_generic(uint64_t pc,
             /*
              * A system / control register named by the encoding but
              * living outside the ordinary register file: an AArch64
-             * MRS/MSR system register, a RISC-V Zicsr CSR.  reg_id
-             * holds the ISA's raw encoding, in a numbering space
-             * disjoint from the Capstone register enum, so it resolves
-             * through the per-ISA mapper rather than the reg table.
-             * Direction comes from the boundary, which derives it from
-             * the instruction form -- Capstone leaves the AArch64
-             * system operand's own access bits empty.
+             * MRS/MSR system register, a RISC-V Zicsr CSR.  Capstone
+             * has register ids for almost none of them, so the
+             * boundary resolves the architectural role and this side
+             * only renames it: no ISA table is consulted and no
+             * per-ISA branch is taken.  Direction likewise comes from
+             * the boundary, which derives it from the instruction form
+             * because Capstone leaves the AArch64 system operand's own
+             * access bits empty.
              */
-            SysRegToGenericFn map = isa_properties[trace_isa].sysreg_to_generic;
-            if (!map) {
-                break;
-            }
-            uint8_t gen = map(op->reg_id);
+            uint8_t gen = generic_reg_for_sysreg_class(op->sysreg_class);
             if (gen == REG_NONE) {
                 break;
             }

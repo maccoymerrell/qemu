@@ -33,7 +33,14 @@ static inline int plus_2(DisasContext *s, int x)
 /* Include the auto-generated decoder.  */
 #include "decode-msa.c.inc"
 
-static const char msaregnames[][6] = {
+/*
+ * Room for the terminating NUL: the longest entry, "w31.d1", is six
+ * characters.  These strings become TCGTemp::name, which its consumers
+ * (tcg_dump_ops and the TCG IR log) read as C strings, so a table exactly as
+ * wide as its longest entry leaves every two-digit register name
+ * unterminated and sends those readers off the end of the array.
+ */
+static const char msaregnames[][7] = {
     "w0.d0",  "w0.d1",  "w1.d0",  "w1.d1",
     "w2.d0",  "w2.d1",  "w3.d0",  "w3.d1",
     "w4.d0",  "w4.d1",  "w5.d0",  "w5.d1",

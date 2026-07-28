@@ -340,7 +340,7 @@ static inline void tally_fd_record(
         }
         if (want_bimodal) {
             lctx->bimodal->on_count_delta(lctx->thread, lctx->template_id,
-                                          wd[0]);
+                                          *ipos, wd[0]);
         }
     } else {
         sec.skip_varint();                   /* sleb_wide delta */
@@ -493,6 +493,23 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
              * fault anchors was truncated mid-template and is excluded
              * from the population — see MemopBimodalityLint. */
             if (bimodal) {
+                /* CST_BIMODAL_DIAG=<tid>: one line per zero-memop CP
+                 * execution of that template — investigation aid, off
+                 * unless the environment asks for it. */
+                static const char *diag_env = std::getenv("CST_BIMODAL_DIAG");
+                static const long  diag_tid =
+                    diag_env ? std::strtol(diag_env, nullptr, 0) : -1;
+                if (diag_env && (long)prev_cp_tid == diag_tid &&
+                    bimodal->tracks((uint32_t)prev_cp_tid) &&
+                    bimodal->running_total((uint32_t)current_thread,
+                                           (uint32_t)prev_cp_tid) == 0) {
+                    std::fprintf(stderr,
+                        "BIMODAL_DIAG entry=%llu thread=%d tid=%d "
+                        "n_records=%llu fault_anchors=%llu\n",
+                        (unsigned long long)s->cp_entries, current_thread,
+                        prev_cp_tid, (unsigned long long)n_records,
+                        (unsigned long long)cp_fault_anchors);
+                }
                 bimodal->on_cp_entry_end((uint32_t)current_thread,
                                          (uint32_t)prev_cp_tid,
                                          /*fault_truncated=*/
@@ -1197,7 +1214,7 @@ int main(int argc, char **argv)
         }
 
         cst::AttributionLint lint(h, templates);
-        cst::MemopBimodalityLint bimodal(templates, bimodal_cfg);
+        cst::MemopBimodalityLint bimodal(h.isa, templates, bimodal_cfg);
         try {
             walk_body(body_stream->reader(), h.ids, h.flags,
                       insns_by_tid, templates, by_id, &s, &lint,
@@ -1263,6 +1280,12 @@ int main(int argc, char **argv)
             std::printf("  %s fault-truncated CP execution(s) excluded "
                         "from the population\n",
                         fmt_n(bimodal.truncated_execs()).c_str());
+            if (bimodal.excluded_templates() > 0) {
+                std::printf("  %s template(s) untracked: every memop-capable "
+                            "insn they carry has an architecturally-optional "
+                            "access (AArch64 FEAT_MOPS, RISC-V SC)\n",
+                            fmt_n(bimodal.excluded_templates()).c_str());
+            }
             if (findings.empty()) {
                 std::printf("  clean: 0 templates with a nonzero-majority / "
                             "zero-outlier memop split\n");

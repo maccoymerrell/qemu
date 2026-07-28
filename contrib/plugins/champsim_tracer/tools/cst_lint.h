@@ -423,6 +423,66 @@ struct MemopBimodalityConfig {
     double   max_outlier_rate = 0.10;
 };
 
+/*
+ * Instructions whose memory access is ARCHITECTURALLY OPTIONAL: the
+ * encoding declares a memory operand, but whether any access happens at
+ * all is decided at run time by a register value, so a zero-memop
+ * execution is the architecture working, not an observation the writer
+ * lost.  Such an instruction cannot be held to "every execution realises
+ * a memop", which is the whole premise of the bimodality lint below, so
+ * its slots are excluded from that lint's running total.
+ *
+ * This is a static property of the encoding, decided here from the raw
+ * bytes the template already carries.  The families:
+ *
+ *   AArch64 FEAT_MOPS  CPYP/CPYM/CPYE, CPYFP/CPYFM/CPYFE (top byte 0x1D)
+ *                      SETP/SETM/SETE, SETGP/SETGM/SETGE (top byte 0x19)
+ *     The size register Xn selects how much is transferred; at zero the
+ *     helper's transfer loop never runs and the instruction touches no
+ *     memory.  glibc routes every memcpy/memmove/memset through these on
+ *     a FEAT_MOPS guest, so `memmove(dst, src, 0)` — a routine thing in
+ *     a string-heavy program — reaches the wire as a zero-memop
+ *     execution of an otherwise busy template.
+ *
+ *   RISC-V  SC.W / SC.D  (AMO major opcode, funct5 = 0b00011)
+ *     A store-conditional whose reservation address does not match skips
+ *     the compare-and-swap entirely and only writes the failure code to
+ *     rd, so the failing iteration of an LR/SC retry loop realises no
+ *     memop while every successful one realises two.
+ *
+ * The same class exists elsewhere and is NOT covered here, because no
+ * trace has exercised it yet and a guessed encoding would silently blind
+ * the lint: MIPS SC/SCD, x86 REP-prefixed string operations entered with
+ * RCX == 0, and predicated SVE / masked AVX-512 accesses with an
+ * all-false predicate.  The durable fix is a static wire flag set from
+ * the writer's own Capstone classification, which would retire this
+ * table; see the note in the lint's report.
+ */
+inline bool memop_is_architecturally_optional(uint8_t isa,
+                                              const std::vector<uint8_t> &raw)
+{
+    if (raw.size() < 4) return false;
+    uint32_t w = (uint32_t)raw[0] | ((uint32_t)raw[1] << 8) |
+                 ((uint32_t)raw[2] << 16) | ((uint32_t)raw[3] << 24);
+    switch (isa) {
+    case 2:   /* aarch64 */
+        /* Memory Copy and Memory Set class: bits[31:24] select the
+         * family (0x19 set, 0x1D copy) and bits[11:10] == 0b01 pin the
+         * class against the neighbouring load/store encodings. */
+        return (w & 0xFF000C00u) == 0x19000400u ||
+               (w & 0xFF000C00u) == 0x1D000400u;
+    case 3:   /* riscv64 */
+        /* AMO major opcode 0b0101111 with funct5 0b00011 = SC.  funct3
+         * is pinned to 2/3 (word/doubleword) so the vector indexed-AMO
+         * encodings, which share the major opcode and use funct3 for the
+         * element width, cannot be swept in. */
+        return (w & 0x7Fu) == 0x2Fu && ((w >> 27) & 0x1Fu) == 0x03u &&
+               (((w >> 12) & 0x7u) == 2u || ((w >> 12) & 0x7u) == 3u);
+    default:
+        return false;
+    }
+}
+
 class MemopBimodalityLint {
 public:
     using Config = MemopBimodalityConfig;
@@ -435,31 +495,55 @@ public:
         double   rate;      /* zero / total */
     };
 
-    MemopBimodalityLint(const std::vector<Template> &templates,
+    MemopBimodalityLint(uint8_t isa,
+                        const std::vector<Template> &templates,
                         Config cfg = Config())
         : cfg_(cfg)
     {
         for (const Template &t : templates) {
-            for (const InsnTemplate &I : t.insns) {
-                if (I.max_dep_loads > 0 || I.max_dep_stores > 0) {
-                    memop_capable_.insert(t.template_id);
-                    break;
+            bool mandatory = false, optional = false;
+            std::vector<bool> opt(t.insns.size(), false);
+            for (size_t i = 0; i < t.insns.size(); i++) {
+                const InsnTemplate &I = t.insns[i];
+                if (I.max_dep_loads == 0 && I.max_dep_stores == 0) continue;
+                if (memop_is_architecturally_optional(isa, I.raw_bytes)) {
+                    opt[i] = true;
+                    optional = true;
+                } else {
+                    mandatory = true;
                 }
+            }
+            /* Track only a template that still has a memop-capable insn
+             * whose access the architecture cannot suppress.  A template
+             * whose whole memop capacity is optional has no "should have
+             * realised a memop" contract to violate. */
+            if (mandatory) {
+                memop_capable_.insert(t.template_id);
+                if (optional) optional_slots_[t.template_id] = opt;
+            } else if (optional) {
+                excluded_templates_++;
             }
         }
     }
 
     /* Whether @template_id has at least one insn with a nonzero static
-     * memop capacity — the only templates worth tracking at all. */
+     * memop capacity that the architecture cannot suppress — the only
+     * templates worth tracking at all. */
     bool tracks(uint32_t template_id) const {
         return memop_capable_.count(template_id) != 0;
     }
 
     /* One CP CST_FID_N_LOADS/N_STORES delta record for @template_id on
-     * @thread, at any insn position — the running total is per-template,
-     * not per-insn, so the position does not matter here. */
+     * @thread at insn position @ipos.  The running total is per-template,
+     * not per-insn, so the position only matters for skipping the slots
+     * of an architecturally-optional access (see the note above). */
     void on_count_delta(uint32_t thread, uint32_t template_id,
-                        uint64_t delta) {
+                        uint32_t ipos, uint64_t delta) {
+        auto it = optional_slots_.find(template_id);
+        if (it != optional_slots_.end() &&
+            ipos < it->second.size() && it->second[ipos]) {
+            return;
+        }
         running_[cell_key(thread, template_id)] += delta;    /* mod 2^64 */
     }
 
@@ -515,6 +599,19 @@ public:
      * truncated them (reported, so the exclusion is never silent). */
     uint64_t truncated_execs() const { return truncated_; }
 
+    /* Templates left untracked because every memop-capable insn they
+     * carry has an architecturally-optional access (reported, so the
+     * exclusion is never silent). */
+    uint64_t excluded_templates() const { return excluded_templates_; }
+
+    /* Running realised-memop total for (thread, template) — the value
+     * on_cp_entry_end() turns into this execution's zero/nonzero
+     * verdict.  Exposed for diagnostics only. */
+    uint64_t running_total(uint32_t thread, uint32_t template_id) const {
+        auto it = running_.find(cell_key(thread, template_id));
+        return it == running_.end() ? 0 : it->second;
+    }
+
 private:
     struct Hist {
         uint64_t total = 0, zero = 0, nonzero = 0;
@@ -525,7 +622,11 @@ private:
 
     Config cfg_;
     uint64_t truncated_ = 0;              /* fault-truncated, excluded */
+    uint64_t excluded_templates_ = 0;     /* all-optional, untracked */
     std::unordered_set<uint32_t> memop_capable_;
+    /* tid -> per-ipos "this slot's access is architecturally optional",
+     * present only for a MIXED template (some optional, some not). */
+    std::unordered_map<uint32_t, std::vector<bool>> optional_slots_;
     std::unordered_map<uint64_t, uint64_t> running_;   /* (thread,tid)->total */
     std::unordered_map<uint32_t, Hist> hist_;          /* tid -> histogram */
 };

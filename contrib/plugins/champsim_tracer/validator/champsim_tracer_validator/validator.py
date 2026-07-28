@@ -1404,9 +1404,47 @@ def _check_segment_final_memops(
          "peer_executions": len(peers)})]
 
 
+def _memop_is_architecturally_optional(isa: str, raw) -> bool:
+    """Whether this encoding's memory access can be suppressed at run
+    time by a register value, so that a zero-memop execution is the
+    architecture working rather than an observation the writer lost.
+
+    Mirrors ``cst::memop_is_architecturally_optional`` in
+    ``tools/cst_lint.h`` — keep the two in step.  The families:
+
+    * AArch64 FEAT_MOPS ``CPYP/CPYM/CPYE``, ``CPYFP/CPYFM/CPYFE``,
+      ``SETP/SETM/SETE``, ``SETGP/SETGM/SETGE``.  The size register Xn
+      decides how much moves; at zero the helper's transfer loop never
+      runs and nothing is touched.  glibc routes every memcpy / memmove /
+      memset through these on a FEAT_MOPS guest, so ``memmove(d, s, 0)``
+      reaches the wire as a zero-memop execution of a busy template.
+    * RISC-V ``SC.W`` / ``SC.D``.  A store-conditional whose reservation
+      address does not match skips the compare-and-swap entirely and only
+      writes the failure code to rd, so the failing iteration of an LR/SC
+      retry loop realises no memop while every successful one realises
+      two.
+    """
+    if raw is None or len(raw) < 4:
+        return False
+    w = int.from_bytes(bytes(raw)[:4], "little")
+    if isa == "aarch64":
+        # Memory Copy and Memory Set class: bits[31:24] select the family
+        # (0x19 set / forward-only copy, 0x1D copy) and bits[11:10] == 0b01
+        # pins the class against the neighbouring load/store encodings.
+        return (w & 0xFF000C00) in (0x19000400, 0x1D000400)
+    if isa.startswith("riscv"):
+        # AMO major opcode with funct5 = 0b00011 (SC); funct3 pinned to
+        # 2/3 so the vector indexed-AMO encodings, which share the major
+        # opcode and use funct3 for the element width, cannot be swept in.
+        return ((w & 0x7F) == 0x2F and (w >> 27) & 0x1F == 0x03
+                and (w >> 12) & 0x7 in (2, 3))
+    return False
+
+
 def _check_memop_bimodality(
         cp_entries: list[dict],
         templates_by_id: dict[int, dict],
+        isa: str = "",
         min_execs: int = 8,
         max_outlier_rate: float = 0.10) -> list[Issue]:
     """Per-template memop bimodality — the GENERAL D4-class completeness
@@ -1451,17 +1489,47 @@ def _check_memop_bimodality(
     from collections import defaultdict
     per_tid: dict[int, list[int]] = defaultdict(list)
     truncated = 0
+    excluded: set[int] = set()            # not memop-capable, or all-optional
+    optional_only: set[int] = set()       # all-optional (reported)
+    # tid -> set of insn indices whose memop capacity is architecturally
+    # optional; those slots are left out of the realised count so a
+    # template that MIXES optional and mandatory accesses is still judged
+    # on the mandatory ones.
+    optional_slots: dict[int, set[int]] = {}
     for e in cp_entries:
         tid = e.get("template_id")
         tmpl = templates_by_id.get(tid) or {}
         insns = tmpl.get("insns") or []
-        if not any(int(i.get("n_loads", 0)) or int(i.get("n_stores", 0))
-                   for i in insns):
-            continue                      # not memop-capable; not tracked
+        if tid not in optional_slots and tid not in excluded:
+            opt, mandatory = set(), False
+            for idx, i in enumerate(insns):
+                if not (int(i.get("n_loads", 0)) or int(i.get("n_stores", 0))):
+                    continue
+                if _memop_is_architecturally_optional(isa, i.get("raw_bytes")):
+                    opt.add(idx)
+                else:
+                    mandatory = True
+            if mandatory:
+                optional_slots[tid] = opt
+            else:
+                excluded.add(tid)         # nothing here to hold to the rule
+                if opt:
+                    optional_only.add(tid)
+        if tid in excluded:
+            continue                      # nothing here to hold to the rule
         if e.get("fault_anchors"):
             truncated += 1                # partial execution; not comparable
             continue
-        per_tid[tid].append(len(e.get("dyn_params") or []))
+        dps = e.get("dyn_params") or []
+        opt = optional_slots.get(tid, set())
+        if not opt:
+            per_tid[tid].append(len(dps))
+        else:
+            def _idx(dp):
+                if isinstance(dp, dict):
+                    return int(dp.get("insn_index", -1))
+                return int(getattr(dp, "insn_index", -1))
+            per_tid[tid].append(sum(1 for dp in dps if _idx(dp) not in opt))
 
     issues: list[Issue] = []
     for tid, counts in per_tid.items():
@@ -1489,7 +1557,9 @@ def _check_memop_bimodality(
             f"clean: 0 templates with a nonzero-majority / zero-outlier "
             f"memop split among {len(per_tid)} memop-capable template(s) "
             f"(min_execs={min_execs}, max_outlier_rate={max_outlier_rate}, "
-            f"{truncated} fault-truncated execution(s) excluded)"))
+            f"{truncated} fault-truncated execution(s) excluded, "
+            f"{len(optional_only)} template(s) untracked as "
+            f"architecturally-optional-only)"))
     return issues
 
 
@@ -7556,7 +7626,8 @@ def validate(meta_path: Path, trace_path: Path,
             meta.get("isa", "x86_64"))
 
     issues += _check_segment_final_memops(cp_entries, templates_by_id)
-    issues += _check_memop_bimodality(cp_entries, templates_by_id)
+    issues += _check_memop_bimodality(cp_entries, templates_by_id,
+                                      meta.get("isa", "x86_64"))
 
     isa = meta.get("isa", "x86_64")
 

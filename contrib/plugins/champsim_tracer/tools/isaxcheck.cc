@@ -1536,15 +1536,56 @@ static void sweep_mips(unsigned shard, unsigned nshard)
     }
 }
 
-// x86_64: prefix x escape x opcode x ModRM-tail shape x ModRM.reg.
+// x86_64: prefix x escape x opcode x ModRM-tail shape x ModRM.reg x ModRM.rm.
 //
-// ModRM.reg is swept because on the group opcodes (0x80/0x81/0x83, 0xC0/
-// 0xC1/0xD0-0xD3, 0xF6/0xF7, 0xFE/0xFF and most of the 0x0F groups) it is
-// not a register at all, it is an OPCODE EXTENSION: `81 /0` is ADD and
-// `81 /5` is SUB.  Two fixed tails reached two of its eight values, which
-// left six members of every group opcode -- SUB, AND, XOR, CMP, the whole
-// shift family, NOT/NEG/MUL/DIV, INC/DEC/CALL/JMP/PUSH -- outside the swept
-// space entirely.
+// BOTH ModRM register fields carry opcode, which is why both are enumerated
+// and only the tail's `mod` stays pinned.
+//
+// ModRM.reg is an OPCODE EXTENSION on the group opcodes (0x80/0x81/0x83,
+// 0xC0/0xC1/0xD0-0xD3, 0xF6/0xF7, 0xFE/0xFF and most of the 0x0F groups):
+// `81 /0` is ADD and `81 /5` is SUB.  Two fixed tails reached two of its
+// eight values, which left six members of every group opcode -- SUB, AND,
+// XOR, CMP, the whole shift family, NOT/NEG/MUL/DIV, INC/DEC/CALL/JMP/PUSH
+// -- outside the swept space entirely.
+//
+// ModRM.rm is the same argument one field over, and it stayed pinned to
+// %rcx (or to the addressing form the tail encoded) after reg was freed.
+// Three separate things ride on it:
+//
+//   - At mod = 11 it names the second register operand, so a pinned rm swept
+//     ONE of eight register choices per encoding.  `callq *%rcx` (ff d1) was
+//     inside the swept space and `callq *%rdx` (ff d2) was not -- and it was
+//     the encoding OUTSIDE it that exposed a boundary defect deleting a real
+//     architectural read from every indirect call.  A pinned field is not a
+//     smaller sweep, it is an unmeasured one.
+//
+//   - At mod = 11 it is ALSO an opcode extension in its own right, one level
+//     below reg.  `0f 01 /0` is SGDT for a memory rm and VMCALL / VMLAUNCH /
+//     VMRESUME / VMXOFF at rm = 1/2/3/4; `0f 01 /2` is LGDT or XGETBV /
+//     XSETBV at rm = 0/1; `0f ae /5 /6 /7` are LFENCE / MFENCE / SFENCE only
+//     at mod = 11, all three at rm = 0; `0f c7 /6 /7` are RDRAND / RDSEED
+//     there.  A pinned rm reaches at most one member of each such column.
+//
+//   - At mod != 11 it selects the ADDRESSING FORM: rm = 100 means a SIB byte
+//     follows, rm = 101 with mod = 00 is RIP-relative, and every other value
+//     is a plain base register.  Pinning rm made two of those three forms
+//     reachable only because two of the three tails happened to spell them,
+//     and left `(%rax)`-style base addressing -- with the base register the
+//     memop model has to name -- out of the sweep on all of them.
+//
+// Cost is the 8x the field is wide: 245,760 -> 1,966,080 encodings, 0.21 s
+// -> 0.77 s at --jobs=8.  Measured against the distinct encodings a traced
+// x86 population actually retires (mcf and perlbench, user and system), the
+// share of that population lying inside the swept space moves from 53.8% to
+// 62.8% of distinct encodings, and from 33.6% to 58.8% weighted by dynamic
+// execution count.
+//
+// The rest of that population is outside for two reasons this sweep still
+// pins, named here so they stay measured rather than merely absent:
+// prefix sequences the pre[] table does not spell -- overwhelmingly REX
+// bytes other than exactly 0x48, i.e. the R/X/B extension bits (20.3% of
+// distinct, 26.6% by weight) -- and ModRM.mod = 01 / 10, the disp8 and
+// disp32 base+displacement forms (16.9% of distinct, 14.6% by weight).
 static void sweep_x86(unsigned shard, unsigned nshard)
 {
     static const struct { unsigned char p[4]; int np; } pre[] = {
@@ -1560,22 +1601,28 @@ static void sweep_x86(unsigned shard, unsigned nshard)
       for (int esc = 0; esc < 4; esc++)
         for (unsigned op = 0; op < 256; op++)
           for (int t = 0; t < 3; t++)
-            for (unsigned reg = 0; reg < 8; reg++) {
-              if ((idx++ % nshard) != shard) continue;
-              const unsigned char *tail = t==0?tail_mem : t==1?tail_reg : tail_sib;
-              size_t n = 0;
-              for (int k = 0; k < pre[pi].np; k++) buf[n++] = pre[pi].p[k];
-              if (esc >= 1) buf[n++] = 0x0f;
-              if (esc == 2) buf[n++] = 0x38;
-              if (esc == 3) buf[n++] = 0x3a;
-              buf[n++] = (uint8_t)op;
-              memcpy(buf + n, tail, 13);
-              /* ModRM is the tail's first byte; replace only its reg field. */
-              buf[n] = (uint8_t)((buf[n] & ~0x38u) | (reg << 3));
-              n += 13;
-              total_tried++;
-              compare(buf, n);
-            }
+            for (unsigned reg = 0; reg < 8; reg++)
+              for (unsigned rm = 0; rm < 8; rm++) {
+                if ((idx++ % nshard) != shard) continue;
+                const unsigned char *tail = t==0?tail_mem : t==1?tail_reg : tail_sib;
+                size_t n = 0;
+                for (int k = 0; k < pre[pi].np; k++) buf[n++] = pre[pi].p[k];
+                if (esc >= 1) buf[n++] = 0x0f;
+                if (esc == 2) buf[n++] = 0x38;
+                if (esc == 3) buf[n++] = 0x3a;
+                buf[n++] = (uint8_t)op;
+                memcpy(buf + n, tail, 13);
+                /* ModRM is the tail's first byte.  The tail owns `mod`; both
+                 * register fields are replaced.  What follows the ModRM byte
+                 * is then reinterpreted by the rm just written -- a SIB at
+                 * rm = 100, a displacement otherwise -- which is the point:
+                 * the same tail bytes spell a different addressing form for
+                 * each rm, and every one of them is a real encoding. */
+                buf[n] = (uint8_t)((buf[n] & ~0x3fu) | (reg << 3) | rm);
+                n += 13;
+                total_tried++;
+                compare(buf, n);
+              }
 }
 
 static void run_sweep(unsigned shard, unsigned nshard)

@@ -310,3 +310,49 @@ x86_64 W-rd-added umonitor +REG_GPR#
 x86_64 W-wr-added incsspd +REG_GPR#
 x86_64 W-wr-added incsspq +REG_GPR#
 x86_64 W-wr-added rdsspd +REG_GPR#
+
+# The rm half of the ModRM sweep reaches the rest of these same repairs.
+#
+# The multi-byte NOP and the CET shadow-stack ops above were listed for
+# `+REG_GPR#` only because the sweep pinned ModRM.rm to %rcx; rm = 4 and
+# rm = 5 are %rsp and %rbp, which the tracer maps to their own generic ids
+# rather than folding them into the GPR bank, so the same repair keys a
+# separate signature for each.  Nothing new is being repaired here -- these
+# are the stack and frame pointers arriving in a field that was pinned.
+x86_64 W-rd-added nopl +REG_FP_REG
+x86_64 W-rd-added nopl +REG_SP
+x86_64 W-rd-added nopq +REG_FP_REG
+x86_64 W-rd-added nopq +REG_SP
+x86_64 W-rd-added nopw +REG_FP_REG
+x86_64 W-rd-added nopw +REG_SP
+x86_64 W-rd-added rdsspq +REG_FP_REG
+x86_64 W-rd-added rdsspq +REG_SP
+x86_64 W-rd-added umonitor +REG_FP_REG
+x86_64 W-rd-added umonitor +REG_SP
+x86_64 W-wr-added incsspd +REG_FP_REG
+x86_64 W-wr-added incsspd +REG_SP
+x86_64 W-wr-added incsspq +REG_FP_REG
+x86_64 W-wr-added incsspq +REG_SP
+x86_64 W-wr-added rdsspd +REG_FP_REG
+x86_64 W-wr-added rdsspd +REG_SP
+
+# The BND prefix reclassification, on the three spellings the wider sweep
+# adds.  `bnd retq` and `bnd callq` were already listed; BND reuses the F2
+# byte that is otherwise REPNE, and the tracer's branch classifier keys on
+# the prefix, so the whole `bnd` family reads as BRANCH_REP.  That is the
+# existing behaviour being asserted on more encodings, not a new one -- and
+# it is written down here precisely so that if the classifier is ever taught
+# to tell BND from REPNE, these lines go dead and say so.
+x86_64 W-flow-reclassed bnd lretw BRANCH_REP
+x86_64 W-flow-reclassed bnd notrack callq BRANCH_REP
+x86_64 W-flow-reclassed bnd retw BRANCH_REP
+
+# XBEGIN is the one genuinely new KIND of repair the rm sweep exposes, and
+# it is a deliberate modelling decision rather than a defect on either side.
+# `c7 f8` sits at ModRM.reg = 7, rm = 0, so no pinned rm reached it.
+# Capstone puts XBEGIN in a jump group because its abort path is a control
+# transfer; the tracer classifies it as fall-through, which is what keeps the
+# true-BB chain correct -- the abort edge has no target the trace could name,
+# and QEMU's TCG x86 translator implements no RTM at all, so XBEGIN cannot
+# retire on a correct path in the first place.
+x86_64 W-flow-dropped xbegin BRANCH_NONE

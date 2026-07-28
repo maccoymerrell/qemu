@@ -453,7 +453,21 @@ void dep_x86_stack_pop(const struct qemu_plugin_insn_info *info,
         return;
     }
     const uint64_t sp_bit = (uint64_t)1 << sp_src;
-    int sp_dst = find_dst_slot(f, f->src_regs[sp_src]);
+    /*
+     * Two roles that coincide for POP and RET and separate for LEAVE:
+     * the register the load addresses THROUGH, and the register the
+     * pointer arithmetic lands ON.  POP reads [rsp] and writes rsp, so
+     * both are rsp.  LEAVE reads [rbp] but adjusts rsp -- rsp gets
+     * rbp+8 and rbp gets the loaded value -- so keying the arithmetic
+     * off the addressing register hands each of them the other's
+     * dependency.  The stack pointer is always what is adjusted, so
+     * REG_SP names the arithmetic destination; sp_src still names what
+     * the load addresses through, and the arithmetic depends on it.
+     */
+    int sp_dst = find_dst_slot(f, REG_SP);
+    if (sp_dst < 0) {
+        sp_dst = find_dst_slot(f, f->src_regs[sp_src]);
+    }
 
     /* Track the dst → load_idx mapping as we go (mask bit positions
      * use n_src_regs + load_idx, locked in once we stop adding). */

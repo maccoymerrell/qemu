@@ -191,29 +191,31 @@ static uint64_t riscv_canonicalize_addr(uint64_t a)
  *   the register rows, so `csrr a0, vl` reads what `vsetvli` wrote.
  *
  *   The fixed-point rounding mode and saturation flag (vxrm / vxsat,
- *   and the vcsr that is the two of them in one word) are REG_VCSR, not
- *   REG_VCTRL.  They are status, not configuration: a saturating op
- *   writes vxsat without touching vl, and sharing the ID would make
- *   every one of them appear to redefine the vector length its
- *   neighbours read -- the same fabrication REG_VSTART exists to avoid.
+ *   and the vcsr that is the two of them in one word) are REG_FCSR.
+ *   That ID already means "rounding mode and status for the arithmetic
+ *   unit", and vcsr is fcsr's sibling CSR, so the roles match.  Sharing
+ *   an ID with fcsr does let a saturating vector op alias a scalar FP
+ *   status update, which is a real cost -- and the ordinary price of a
+ *   generic format.  It does not justify an ID of its own: the space is
+ *   255 entries shared across every ISA, and precision comes back
+ *   through the refiners, which are per-behaviour rather than per-ISA.
  *
  *   vlenb is VLEN in bytes, a read-only implementation constant nothing
  *   writes, so it belongs with the identification registers in REG_SYS.
  *   On REG_VCTRL a read of it would take an edge from the last vsetvli,
  *   which does not change VLEN.
  *
- *   vstart is deliberately NOT REG_VCTRL.  It is the resume index of a
- *   partially executed vector instruction, and every vector
- *   instruction clears it -- so on REG_VCTRL each vector op would
- *   appear to redefine vl and vtype, and a kernel's edges onto its
- *   configuring vsetvli would all become edges onto the previous
- *   instruction instead.  Note that the per-vector-op read and write of
- *   vstart is itself unmodelled: it is architecturally zero except
- *   while resuming a trapped vector instruction, so threading it
- *   through every vector op would serialise the whole vector stream on
- *   a register that does not change value.  What this ID exists for is
- *   the explicit access -- `csrr a0, vstart`, `csrrw a0, vstart, a1` --
- *   which does move a value and previously moved nothing.
+ *   vstart is REG_VCTRL.  It is the resume index of a partially
+ *   executed vector instruction, which is vector control state, and
+ *   RISC-V is the only ISA that has one -- a single-ISA register does
+ *   not earn a generic ID.  The fold is not free: every vector op
+ *   clears vstart, so an explicit `csrr a0, vstart` shares a slot with
+ *   the vl and vtype a vsetvli wrote.  Note the per-vector-op read and
+ *   write of vstart is unmodelled regardless -- it is architecturally
+ *   zero except while resuming a trapped vector instruction, and
+ *   threading it through every vector op would serialise the whole
+ *   vector stream on a register that does not change value.  So what
+ *   reaches the wire is the explicit access alone.
  */
 static uint8_t riscv_csr_to_generic(uint16_t csr)
 {
@@ -223,11 +225,11 @@ static uint8_t riscv_csr_to_generic(uint16_t csr)
     case 0x003:  /* fcsr   */
         return REG_FCSR;
     case 0x008:  /* vstart */
-        return REG_VSTART;
+        return REG_VCTRL;
     case 0x009:  /* vxsat  */
     case 0x00a:  /* vxrm   */
     case 0x00f:  /* vcsr   */
-        return REG_VCSR;
+        return REG_FCSR;
     case 0xc20:  /* vl     */
     case 0xc21:  /* vtype  */
         return REG_VCTRL;
@@ -250,8 +252,8 @@ static const RegClassification riscv_reg_class[RISCV_REG_ENDING] = {
     [RISCV_REG_VL] = { .reg_id = REG_VCTRL },  /* vl */
     [RISCV_REG_VLENB] = { .reg_id = REG_SYS },  /* vlenb */
     [RISCV_REG_VTYPE] = { .reg_id = REG_VCTRL },  /* vtype */
-    [RISCV_REG_VXRM] = { .reg_id = REG_VCSR },  /* vxrm */
-    [RISCV_REG_VXSAT] = { .reg_id = REG_VCSR },  /* vxsat */
+    [RISCV_REG_VXRM] = { .reg_id = REG_FCSR },  /* vxrm */
+    [RISCV_REG_VXSAT] = { .reg_id = REG_FCSR },  /* vxsat */
     [RISCV_REG_DUMMY_REG_PAIR_WITH_X0] = { .reg_id = REG_ZERO },  /* dummy_reg_pair_with_x0 */
     [RISCV_REG_V0] = { .reg_id = REG_VEC0, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v0" } },  /* v0 */
     [RISCV_REG_V1] = { .reg_id = REG_VEC1, .qemu_reg = { .feature = "org.gnu.gdb.riscv.vector", .name = "v1" } },  /* v1 */

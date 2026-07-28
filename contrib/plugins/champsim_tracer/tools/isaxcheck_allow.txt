@@ -2444,10 +2444,12 @@ riscv64 R-wr-phantom unimp +sys
 # the FP-alias CSR forms.
 riscv64 R-rd-phantom csrc +fcsr
 riscv64 R-rd-phantom csrci +fcsr
+riscv64 R-rd-phantom csrr +fcsr
 riscv64 R-rd-phantom csrrc +fcsr
 riscv64 R-rd-phantom csrrci +fcsr
 riscv64 R-rd-phantom csrrs +fcsr
 riscv64 R-rd-phantom csrrsi +fcsr
+riscv64 R-rd-phantom csrrw +fcsr
 riscv64 R-rd-phantom csrrwi +fcsr
 riscv64 R-rd-phantom csrs +fcsr
 riscv64 R-rd-phantom csrsi +fcsr
@@ -2465,9 +2467,11 @@ riscv64 R-wr-phantom csrrc +fcsr
 riscv64 R-wr-phantom csrrci +fcsr
 riscv64 R-wr-phantom csrrs +fcsr
 riscv64 R-wr-phantom csrrsi +fcsr
+riscv64 R-wr-phantom csrrw +fcsr
 riscv64 R-wr-phantom csrrwi +fcsr
 riscv64 R-wr-phantom csrs +fcsr
 riscv64 R-wr-phantom csrsi +fcsr
+riscv64 R-wr-phantom csrw +fcsr
 riscv64 R-wr-phantom csrwi +fcsr
 riscv64 R-wr-phantom fscsr +fcsr
 riscv64 R-wr-phantom fsflags +fcsr
@@ -2501,63 +2505,6 @@ riscv64 R-wr-phantom csrs +vctrl
 riscv64 R-wr-phantom csrsi +vctrl
 riscv64 R-wr-phantom csrw +vctrl
 riscv64 R-wr-phantom csrwi +vctrl
-
-# RISC-V vector status (REG_VCSR): the fixed-point rounding mode and
-# saturation flag, vxrm / vxsat / vcsr, reached through a CSR access.
-# Separate from REG_VCTRL because they are not configuration -- a
-# saturating op writes vxsat without touching vl -- so they key their own
-# signatures.  Same underlying disagreement as every other CSR entry
-# here: the boundary reports the register the instruction moves and
-# LLVM's description has no register operand for it.
-riscv64 R-rd-phantom csrc +vcsr
-riscv64 R-rd-phantom csrci +vcsr
-riscv64 R-rd-phantom csrr +vcsr
-riscv64 R-rd-phantom csrrc +vcsr
-riscv64 R-rd-phantom csrrci +vcsr
-riscv64 R-rd-phantom csrrs +vcsr
-riscv64 R-rd-phantom csrrsi +vcsr
-riscv64 R-rd-phantom csrrw +vcsr
-riscv64 R-rd-phantom csrrwi +vcsr
-riscv64 R-rd-phantom csrs +vcsr
-riscv64 R-rd-phantom csrsi +vcsr
-riscv64 R-wr-phantom csrc +vcsr
-riscv64 R-wr-phantom csrci +vcsr
-riscv64 R-wr-phantom csrrc +vcsr
-riscv64 R-wr-phantom csrrci +vcsr
-riscv64 R-wr-phantom csrrs +vcsr
-riscv64 R-wr-phantom csrrsi +vcsr
-riscv64 R-wr-phantom csrrw +vcsr
-riscv64 R-wr-phantom csrrwi +vcsr
-riscv64 R-wr-phantom csrs +vcsr
-riscv64 R-wr-phantom csrsi +vcsr
-riscv64 R-wr-phantom csrw +vcsr
-riscv64 R-wr-phantom csrwi +vcsr
-
-# RISC-V vstart (REG_VSTART): the element index a trapped vector
-# instruction resumes from.
-riscv64 R-rd-phantom csrc +vstart
-riscv64 R-rd-phantom csrci +vstart
-riscv64 R-rd-phantom csrr +vstart
-riscv64 R-rd-phantom csrrc +vstart
-riscv64 R-rd-phantom csrrci +vstart
-riscv64 R-rd-phantom csrrs +vstart
-riscv64 R-rd-phantom csrrsi +vstart
-riscv64 R-rd-phantom csrrw +vstart
-riscv64 R-rd-phantom csrrwi +vstart
-riscv64 R-rd-phantom csrs +vstart
-riscv64 R-rd-phantom csrsi +vstart
-riscv64 R-wr-phantom csrc +vstart
-riscv64 R-wr-phantom csrci +vstart
-riscv64 R-wr-phantom csrrc +vstart
-riscv64 R-wr-phantom csrrci +vstart
-riscv64 R-wr-phantom csrrs +vstart
-riscv64 R-wr-phantom csrrsi +vstart
-riscv64 R-wr-phantom csrrw +vstart
-riscv64 R-wr-phantom csrrwi +vstart
-riscv64 R-wr-phantom csrs +vstart
-riscv64 R-wr-phantom csrsi +vstart
-riscv64 R-wr-phantom csrw +vstart
-riscv64 R-wr-phantom csrwi +vstart
 
 # RISC-V `frm`: the dynamic rounding mode every FP operation encoded with
 # rm = 111 reads.  Sail records it; LLVM models no `frm` use.

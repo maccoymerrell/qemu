@@ -107,24 +107,24 @@ static const RegClassification mips_reg_class[MIPS_REG_ENDING] = {
     [MIPS_REG_INVALID] = {},
     [MIPS_REG_AT] = { .reg_id = REG_GPR1, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "at" } },  /* at */
     [MIPS_REG_AT_NM] = { .reg_id = REG_GPR1, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "at" } },  /* at_nm */
-    [MIPS_REG_DSPCCOND] = { .reg_id = REG_DSPCTRL },  /* dspccond */
-    [MIPS_REG_DSPCARRY] = { .reg_id = REG_DSPCTRL },  /* dspcarry */
-    [MIPS_REG_DSPEFI] = { .reg_id = REG_DSPCTRL },  /* dspefi */
-    [MIPS_REG_DSPOUTFLAG] = { .reg_id = REG_DSPCTRL },  /* dspoutflag */
-    [MIPS_REG_DSPPOS] = { .reg_id = REG_DSPCTRL },  /* dsppos */
-    [MIPS_REG_DSPSCOUNT] = { .reg_id = REG_DSPCTRL },  /* dspscount */
+    [MIPS_REG_DSPCCOND] = { .reg_id = REG_FLAGS },  /* dspccond */
+    [MIPS_REG_DSPCARRY] = { .reg_id = REG_FLAGS },  /* dspcarry */
+    [MIPS_REG_DSPEFI] = { .reg_id = REG_FLAGS },  /* dspefi */
+    [MIPS_REG_DSPOUTFLAG] = { .reg_id = REG_FLAGS },  /* dspoutflag */
+    [MIPS_REG_DSPPOS] = { .reg_id = REG_FLAGS },  /* dsppos */
+    [MIPS_REG_DSPSCOUNT] = { .reg_id = REG_FLAGS },  /* dspscount */
     [MIPS_REG_FP] = { .reg_id = REG_FP_REG, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "s8" } },  /* fp */
     [MIPS_REG_FP_NM] = { .reg_id = REG_FP_REG, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "s8" } },  /* fp_nm */
     [MIPS_REG_GP] = { .reg_id = REG_GPR28, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "gp" } },  /* gp */
     [MIPS_REG_GP_NM] = { .reg_id = REG_GPR28, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "gp" } },  /* gp_nm */
-    [MIPS_REG_MSAACCESS] = { .reg_id = REG_VCSR },  /* msaaccess */
-    [MIPS_REG_MSACSR] = { .reg_id = REG_VCSR },  /* msacsr */
-    [MIPS_REG_MSAIR] = { .reg_id = REG_VCSR },  /* msair */
-    [MIPS_REG_MSAMAP] = { .reg_id = REG_VCSR },  /* msamap */
-    [MIPS_REG_MSAMODIFY] = { .reg_id = REG_VCSR },  /* msamodify */
-    [MIPS_REG_MSAREQUEST] = { .reg_id = REG_VCSR },  /* msarequest */
-    [MIPS_REG_MSASAVE] = { .reg_id = REG_VCSR },  /* msasave */
-    [MIPS_REG_MSAUNMAP] = { .reg_id = REG_VCSR },  /* msaunmap */
+    [MIPS_REG_MSAACCESS] = { .reg_id = REG_FCSR },  /* msaaccess */
+    [MIPS_REG_MSACSR] = { .reg_id = REG_FCSR },  /* msacsr */
+    [MIPS_REG_MSAIR] = { .reg_id = REG_FCSR },  /* msair */
+    [MIPS_REG_MSAMAP] = { .reg_id = REG_FCSR },  /* msamap */
+    [MIPS_REG_MSAMODIFY] = { .reg_id = REG_FCSR },  /* msamodify */
+    [MIPS_REG_MSAREQUEST] = { .reg_id = REG_FCSR },  /* msarequest */
+    [MIPS_REG_MSASAVE] = { .reg_id = REG_FCSR },  /* msasave */
+    [MIPS_REG_MSAUNMAP] = { .reg_id = REG_FCSR },  /* msaunmap */
     [MIPS_REG_PC] = { .reg_id = REG_IP, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "pc" } },  /* pc */
     [MIPS_REG_RA] = { .reg_id = REG_LR, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "ra" } },  /* ra */
     [MIPS_REG_RA_NM] = { .reg_id = REG_LR, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "ra" } },  /* ra_nm */
@@ -253,10 +253,10 @@ static const RegClassification mips_reg_class[MIPS_REG_ENDING] = {
     [MIPS_REG_D13] = { .reg_id = REG_FPR26, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f26" } },  /* d13 */
     [MIPS_REG_D14] = { .reg_id = REG_FPR28, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f28" } },  /* d14 */
     [MIPS_REG_D15] = { .reg_id = REG_FPR30, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f30" } },  /* d15 */
-    [MIPS_REG_DSPOUTFLAG20] = { .reg_id = REG_DSPCTRL },  /* dspoutflag20 */
-    [MIPS_REG_DSPOUTFLAG21] = { .reg_id = REG_DSPCTRL },  /* dspoutflag21 */
-    [MIPS_REG_DSPOUTFLAG22] = { .reg_id = REG_DSPCTRL },  /* dspoutflag22 */
-    [MIPS_REG_DSPOUTFLAG23] = { .reg_id = REG_DSPCTRL },  /* dspoutflag23 */
+    [MIPS_REG_DSPOUTFLAG20] = { .reg_id = REG_FLAGS },  /* dspoutflag20 */
+    [MIPS_REG_DSPOUTFLAG21] = { .reg_id = REG_FLAGS },  /* dspoutflag21 */
+    [MIPS_REG_DSPOUTFLAG22] = { .reg_id = REG_FLAGS },  /* dspoutflag22 */
+    [MIPS_REG_DSPOUTFLAG23] = { .reg_id = REG_FLAGS },  /* dspoutflag23 */
     [MIPS_REG_F0] = { .reg_id = REG_FPR0, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f0" } },  /* f0 */
     [MIPS_REG_F1] = { .reg_id = REG_FPR1, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f1" } },  /* f1 */
     [MIPS_REG_F2] = { .reg_id = REG_FPR2, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f2" } },  /* f2 */
@@ -713,7 +713,7 @@ static const RegClassification mips_reg_class[MIPS_REG_ENDING] = {
     [MIPS_REG_D29_64] = { .reg_id = REG_FPR29, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f29" } },  /* d29_64 */
     [MIPS_REG_D30_64] = { .reg_id = REG_FPR30, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f30" } },  /* d30_64 */
     [MIPS_REG_D31_64] = { .reg_id = REG_FPR31, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f31" } },  /* d31_64 */
-    [MIPS_REG_DSPOUTFLAG16_19] = { .reg_id = REG_DSPCTRL },  /* dspoutflag16_19 */
+    [MIPS_REG_DSPOUTFLAG16_19] = { .reg_id = REG_FLAGS },  /* dspoutflag16_19 */
     [MIPS_REG_HI0_64] = { .reg_id = REG_ACC0 },  /* hi0_64 */
     [MIPS_REG_K0_64] = { .reg_id = REG_GPR26, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "k0" } },  /* k0_64 */
     [MIPS_REG_K1_64] = { .reg_id = REG_GPR27, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "k1" } },  /* k1_64 */

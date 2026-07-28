@@ -2624,9 +2624,12 @@ _AARCH64_SYSREG_GENERIC = {
 }
 _RISCV_CSR_GENERIC = {
     0x001: "REG_FCSR", 0x002: "REG_FCSR", 0x003: "REG_FCSR",
-    0x008: "REG_VSTART",
-    # vxsat / vxrm / vcsr are status, not configuration.
-    0x009: "REG_VCSR", 0x00a: "REG_VCSR", 0x00f: "REG_VCSR",
+    # vstart is vector control state, and RISC-V is the only ISA that
+    # has one -- a single-ISA register does not earn a generic ID.
+    0x008: "REG_VCTRL",
+    # vxsat / vxrm / vcsr are a rounding-mode-and-status word, which is
+    # what REG_FCSR already means; vcsr is fcsr's sibling CSR.
+    0x009: "REG_FCSR", 0x00a: "REG_FCSR", 0x00f: "REG_FCSR",
     # vl / vtype are the configuration a vsetvl writes as a pair.
     0xc20: "REG_VCTRL", 0xc21: "REG_VCTRL",
     # vlenb is a read-only implementation constant.

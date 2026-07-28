@@ -1974,12 +1974,12 @@ def classify_riscv_reg(name: str) -> RegEntry:
     if name in {"VL", "VTYPE"}:
         return reg_ent("REG_VCTRL")
     # vxrm and vxsat are fields of vcsr -- the fixed-point rounding mode
-    # and the saturation flag.  Not configuration: a saturating op
-    # writes vxsat without touching vl, and on REG_VCTRL every one of
-    # them would appear to redefine the vector length its neighbours
-    # read.
+    # and the saturation flag.  A rounding-mode-and-status word is what
+    # REG_FCSR already is, and `vcsr` is `fcsr`'s sibling CSR, so they
+    # fold there rather than onto the vector CONFIGURATION ID.  The
+    # generic space does not mint an ID per architectural quirk.
     if name in {"VXRM", "VXSAT"}:
-        return reg_ent("REG_VCSR")
+        return reg_ent("REG_FCSR")
     # vlenb is VLEN in bytes: a read-only implementation constant, in
     # the same class as the ID registers, and never written by anything.
     # On REG_VCTRL a read of it would take a false edge from the last
@@ -2077,19 +2077,18 @@ def classify_mips_reg(name: str) -> RegEntry:
         return reg_ent("REG_TLS")
     if stem.startswith(("HWR", "COP")):
         return reg_ent("REG_SYS")
-    # DSPControl is ONE architectural register: its condition, carry,
-    # outflag, pos, scount and EFI fields are fields of the same word.
-    # Splitting them across REG_FLAGS and REG_VCTRL aliased them onto
-    # arithmetic condition flags and MSA vector control respectively --
-    # two populations DSPControl has no relationship with.
+    # DSPControl's fields are condition, carry, outflag, pos, scount and
+    # EFI -- a flags word, which is what REG_FLAGS is.  It exists on
+    # MIPS alone, so it gets no ID of its own: a single-ISA register
+    # folds onto whichever existing ID roughly matches its role.
     if stem.startswith("DSP"):
-        return reg_ent("REG_DSPCTRL")
-    # MSA control and status: the vector unit's rounding mode and
-    # exception flags.  REG_VCSR, not REG_VCTRL -- that ID carries
-    # vector *configuration* (the other vector ISA's vl/vtype), and a
-    # status word an FP op updates is not configuration.
+        return reg_ent("REG_FLAGS")
+    # MSA control and status is the vector unit's rounding mode and
+    # exception flags -- the role REG_FCSR already carries for the
+    # scalar FP unit.  Folds there rather than onto REG_VCTRL, which
+    # carries vector CONFIGURATION.
     if stem.startswith("MSA"):
-        return reg_ent("REG_VCSR")
+        return reg_ent("REG_FCSR")
     return reg_none()
 
 

@@ -254,45 +254,41 @@ enum GenericRegId {
     REG_FCSR = 244,
     REG_VCTRL = 245,
     /*
-     * System/control registers whose architectural role is distinct
-     * enough that folding them onto REG_SYS / REG_VCTRL / REG_FLAGS
-     * would manufacture dependencies rather than record them.  A false
-     * edge misleads a consumer as badly as a missing one, so each of
-     * these exists because one concrete population would otherwise
-     * alias something it has no relationship with:
+     * These IDs are GENERIC.  They abstract a guest register onto the
+     * behaviour class a consumer schedules against; they are not, and
+     * are not meant to be, an exact naming of the architectural
+     * register underneath.  The space holds 255 entries and is shared
+     * by every ISA, so minting a new one needs strong justification —
+     * and a register that exists in a SINGLE ISA never qualifies.  Fold
+     * it onto whichever existing ID roughly matches its role.
      *
-     *   REG_TLS     the thread pointer — AArch64 TPIDR_EL0 / TPIDRRO_EL0
-     *               and the MIPS CP0 UserLocal word `rdhwr $29` reads.
-     *               On REG_SYS every TLS access shares a slot with the
-     *               whole CP0 / MRS population.
-     *   REG_VSTART  the RISC-V vector start index.  Every vector
-     *               instruction writes it, so on REG_VCTRL each vector
-     *               op would appear to redefine `vl` and `vtype`, and
-     *               the edge onto the `vsetvli` that configured the
-     *               kernel would be replaced by a chain through the
-     *               op's own predecessors.
-     *   REG_DSPCTRL the MIPS DSPControl register (ccond / carry /
-     *               ouflag / pos / scount / EFI).  One architectural
-     *               register gets one ID, rather than being split
-     *               across REG_FLAGS and REG_VCTRL — where the halves
-     *               aliased arithmetic condition flags and MSA vector
-     *               control respectively.
-     *   REG_VCSR    the vector unit's rounding-mode and status word:
-     *               RISC-V `vcsr` and its `vxrm` / `vxsat` fields, MIPS
-     *               `MSACSR`.  Distinct from REG_VCTRL because it is
-     *               not configuration — a saturating fixed-point op
-     *               writes `vxsat` without touching `vl`, so sharing
-     *               the ID would make every one of them appear to
-     *               redefine the vector length its neighbours read.
-     *               Distinct from REG_SYS because Capstone renders
-     *               MSACSR as a coprocessor register, which would put
-     *               it beside every CP0 access and make `cfcmsa` read
-     *               whatever the last `mtc0` wrote.
+     * A fold can manufacture a dependency the guest does not have, and
+     * that is a real cost.  It is not, on its own, grounds for a new
+     * ID: it is the ordinary price of a generic format, paid so that a
+     * consumer sees one register model instead of four.  Precision is
+     * bought back through the refiners, which are per-behaviour rather
+     * than per-ISA.
+     *
+     *   REG_TLS     the thread pointer — AArch64 TPIDR_EL0 /
+     *               TPIDRRO_EL0, the MIPS CP0 UserLocal word that
+     *               `rdhwr $29` reads, and x86-64 FS.base.  Earns an ID
+     *               on two counts: it spans three ISAs, and it is a
+     *               POINTER the guest computes addresses from rather
+     *               than a status word, so the whole CP0 / MRS
+     *               population on REG_SYS is the wrong neighbourhood
+     *               for it.  On RISC-V the thread pointer is `tp` (x4),
+     *               an ordinary GPR, and needs nothing here.
+     *
+     * 247-249 are deliberately unallocated.  They briefly held
+     * REG_VSTART (RISC-V vector start), REG_DSPCTRL (MIPS DSPControl)
+     * and REG_VCSR (RISC-V vcsr / MIPS MSACSR).  The first two named a
+     * register from exactly one ISA, which is the fragmentation this
+     * space exists to avoid; the third split a rounding-mode-and-status
+     * word away from REG_FCSR, which already is one.  They now fold to
+     * REG_VCTRL, REG_FLAGS and REG_FCSR respectively.  Left as holes
+     * rather than reused so nothing renumbers.
      */
     REG_TLS = 246,
-    REG_VSTART = 247,
-    REG_DSPCTRL = 248,
-    REG_VCSR = 249,
     /* Common architectural special registers: 250-254 */
     REG_SP = 250,
     REG_FLAGS = 251,
@@ -435,9 +431,6 @@ static inline const char *generic_reg_name(unsigned id)
     case REG_FCSR:    return "REG_FCSR";
     case REG_VCTRL:   return "REG_VCTRL";
     case REG_TLS:     return "REG_TLS";
-    case REG_VSTART:  return "REG_VSTART";
-    case REG_DSPCTRL: return "REG_DSPCTRL";
-    case REG_VCSR:    return "REG_VCSR";
     case REG_SP:      return "REG_SP";
     case REG_FLAGS:   return "REG_FLAGS";
     case REG_IP:      return "REG_IP";

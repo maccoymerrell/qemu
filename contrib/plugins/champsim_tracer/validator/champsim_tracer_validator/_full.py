@@ -268,10 +268,37 @@ def _run_cli(argv: list, timeout: int, log_path: Path,
     return rc, tail
 
 
+def _classify_cli_failure(tail: str) -> str:
+    """Name the cause on the summary line.
+
+    The summary renders only the detail's FIRST line, so leading with
+    `rc=N` says nothing a reader can act on -- every failure of a
+    CLI-driven check looked identical, and the cause sat in the tail
+    where the summary never showed it.  `system.clock_progress_aarch64`
+    was misdiagnosed as host contention for months on that basis; it was
+    really a fault-depth violation, and the two are not related.
+
+    Prefer the sub-check's own verdict line, then a recognised stall,
+    then the last non-empty line, which is where a CLI puts its
+    complaint when it has no structured verdict to offer.
+    """
+    lines = [ln.strip() for ln in tail.splitlines() if ln.strip()]
+    for ln in lines:
+        if ln.startswith("! "):
+            return ln[2:].strip()
+    for ln in lines:
+        low = ln.lower()
+        if "stall" in low or "clock" in low and "progress" in low:
+            return ln
+    return lines[-1] if lines else "no output"
+
+
 def _cli_outcome(rc: int, tail: str, timeout: int) -> Outcome:
     if rc == 124:
         return Outcome("fail", f"TIMEOUT after {timeout}s\n{tail}")
-    return Outcome("pass" if rc == 0 else "fail", f"rc={rc}\n{tail}")
+    if rc == 0:
+        return Outcome("pass", f"rc={rc}\n{tail}")
+    return Outcome("fail", f"{_classify_cli_failure(tail)} (rc={rc})\n{tail}")
 
 
 def _rc_outcome(rc, detail_prefix="") -> Outcome:

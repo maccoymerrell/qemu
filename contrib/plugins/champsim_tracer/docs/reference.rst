@@ -432,18 +432,24 @@ Branch types (``BranchType``)
        ``qemu_plugin_insn_branch_target_pc``, not the raw encoded
        immediate — when CP fell through.
    * - ``BRANCH_REP``
-     - x86 REP / REPNZ self-loop terminator (string ops MOVS /
-       STOS / LODS / CMPS / SCAS / INS / OUTS with a REP prefix).
-       Conditional self-loop: target = the REP's own PC,
-       fall-through = the next PC.  The tracer fans each
-       architectural iteration of the REP loop into its own true-BB
-       visit; iter 1 stays on the BB that *enters* the REP loop,
-       iter 2..N each emit on a 1-insn self-loop sub-template at
-       the REP's PC carrying that iteration's memops (1 load + 1
-       store for MOVS, 2 loads for CMPS, etc.).  Distinguished
-       from ``BRANCH_COND_DIRECT`` so simulators that model branch
-       behaviour can skip target-diversity tracking on REP (target
-       is always self-PC) and so the fan-out shape is obvious at
+     - Self-loop terminator for an instruction whose memory fan-out
+       is bounded only by a register value: an x86 REP / REPNZ
+       string op (MOVS / STOS / LODS / CMPS / SCAS / INS / OUTS) or
+       an AArch64 FEAT_MOPS bulk copy/set (CPYP / CPYM / CPYE,
+       CPYFP / CPYFM / CPYFE, SETP / SETM / SETE, SETGP / SETGM /
+       SETGE and their option-suffixed variants).  Conditional
+       self-loop: target = the instruction's own PC, fall-through =
+       the next PC.  The tracer fans each iteration of the loop into
+       its own true-BB visit; iter 1 stays on the BB that *enters*
+       the loop, iter 2..N each emit on a 1-insn self-loop
+       sub-template at the instruction's PC carrying that
+       iteration's memops.  One iteration is one architectural
+       element on x86 (1 load + 1 store for MOVS, 2 loads for CMPS,
+       etc.) and one memory access on MOPS, which has no
+       architectural iteration to count.  Distinguished from
+       ``BRANCH_COND_DIRECT`` so simulators that model branch
+       behaviour can skip target-diversity tracking here (target is
+       always self-PC) and so the fan-out shape is obvious at
        template-parse time.
 
 Per-block branch outcome (``CST_FID_BRANCH_TAKEN`` / ``CST_FID_BRANCH_TARGET``)

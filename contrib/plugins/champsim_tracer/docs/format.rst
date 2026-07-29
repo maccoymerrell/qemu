@@ -969,10 +969,12 @@ header member begins with ``CST_MAGIC`` (no trailing magic; the member
 naturally ends after its templates section).
 
 ``CST_FID_SLOT_COUNT`` is the per-family slot ceiling for the
-field-delta sections (loads, stores, destination registers).  When
-an instruction's dynamic memop count exceeds this cap, the
-writer clamps the trailing memops and emits a warning to
-``unknown_warnings.log``; there is no ``EXTRA_*`` overflow path (see
+field-delta sections (loads, stores, destination registers).  Should
+an instruction's dynamic memop count exceed this cap, the writer
+clamps the trailing memops and emits a warning to
+``unknown_warnings.log``; there is no ``EXTRA_*`` overflow path.  The
+clamp is a backstop only — the instructions that could reach it are
+fanned out into a self-loop of one entry per iteration instead (see
 Reference §5.2).
 
 Field-delta ``fid`` is a ULEB128.  Numeric field-IDs are
@@ -2079,36 +2081,56 @@ vector pipe, etc.). Consumer code should handle them so foreign
 traces remain decodable; in-tree traces always carry the more specific
 opcode classifications above.
 
-REP-prefixed self-loop BBs (x86)
-""""""""""""""""""""""""""""""""
+.. _fanout-self-loop-bbs:
 
-``BranchType`` carries a dedicated value ``BRANCH_REP`` (resolved through
-the ``branch_type`` map) for any template instruction whose Capstone
-detail reports the REP / REPNZ
-prefix (x86 string ops MOVS / STOS / LODS / CMPS / SCAS / INS /
-OUTS).  These instructions are emitted as self-looping conditional
-branches: target = the REP's own PC, fall-through = the next PC.
-Consumers that model branch behaviour should treat ``BRANCH_REP``
-distinctly from ``BRANCH_COND_DIRECT``:
+Bulk-memory self-loop BBs
+"""""""""""""""""""""""""
+
+``BranchType`` carries a dedicated value ``BRANCH_REP`` (resolved
+through the ``branch_type`` map) for a template instruction whose
+memory fan-out is bounded by nothing but a register value.  Two
+families qualify, and no other instruction on any supported ISA does:
+
+* **x86 REP / REPNZ string operations** — MOVS / STOS / LODS / CMPS /
+  SCAS / INS / OUTS, identified from the Capstone prefix detail.  The
+  count register bounds the loop.
+* **AArch64 FEAT_MOPS bulk copy and set** — CPYP / CPYM / CPYE,
+  CPYFP / CPYFM / CPYFE, SETP / SETM / SETE, SETGP / SETGM / SETGE and
+  their option-suffixed variants.  The size register Xn bounds the
+  transfer, and glibc routes every ``memcpy`` / ``memmove`` / ``memset``
+  through them on a FEAT_MOPS guest.
+
+Both are emitted as self-looping conditional branches: target = the
+instruction's own PC, fall-through = the next PC.  Consumers that model
+branch behaviour should treat ``BRANCH_REP`` distinctly from
+``BRANCH_COND_DIRECT``:
 
 * The taken-target is always the insn's own PC, so a predictor
   does not need to track target diversity for these branches.
-* The not-taken path exits the architectural loop (ECX == 0 or a
-  REPZ/REPNZ comparison terminator).
+* The not-taken path exits the loop (x86: ECX == 0 or a REPZ/REPNZ
+  comparison terminator; MOPS: the size register is exhausted).
 
-The body stream models each architectural iteration of a REP loop
-as its own true-BB visit:
+The body stream models each iteration of the loop as its own true-BB
+visit:
 
-1. The BB that *enters* the REP loop ends at the first iteration's
-   REP instruction.  Its body entry carries iter 1's load and/or
-   store memops on the REP insn's slot, alongside the pre-REP
-   setup insns' regular state.
+1. The BB that *enters* the loop ends at the fan-out instruction.  Its
+   body entry carries iteration 1's memops on that insn's slot,
+   alongside the preceding setup insns' regular state.
 2. Iterations 2..N each emit a separate body entry on a 1-insn
    self-loop sub-template.  The sub-template's single instruction
-   is the REP itself with ``BRANCH_REP`` and `start_pc =
+   is the fan-out insn itself with ``BRANCH_REP`` and `start_pc =
    fall_through_pc - insn_size` so the BB is structurally a
-   self-loop.  Each entry's dyn_params carry exactly one
-   iteration's worth of memops:
+   self-loop.
+3. Both the parent BB template and the sub-template appear in the
+   templates section; their ``template_id``\ s are independent and
+   delta-encoded as usual in the body stream.
+
+What one iteration *is* differs by family, because only one of the two
+has an architectural iteration to count.
+
+For an x86 REP the loop is architectural — the count register
+decrements once per element — so an iteration is one element, and each
+entry's dyn_params carry that element's memops:
 
    - MOVS  → 1 load + 1 store
    - CMPS  → 2 loads
@@ -2118,14 +2140,28 @@ as its own true-BB visit:
    - INS   → 1 store (port → memory)
    - OUTS  → 1 load (memory → port)
 
-3. Both the parent BB template and the sub-template appear in the
-   templates section; their ``template_id``\ s are independent and
-   delta-encoded as usual in the body stream.
+A FEAT_MOPS instruction has no architectural iteration at all: it is
+one instruction that moves an arbitrary span, and how that span is
+divided into accesses is a property of the machine rather than of the
+program.  The fan-out unit is therefore **one memory access** — each
+body entry carries exactly one load or one store.  A copy consequently
+alternates load-carrying and store-carrying entries in the order the
+accesses occurred, rather than pairing them; that is the order the
+transfer ran in, and the only one the wire asserts.  Read the iteration
+count of a MOPS self-loop as a count of memory accesses, not of
+architectural instructions: a single ``CPYM`` covering a megabyte
+appears as roughly 65,000 entries.
 
-Each architectural REP iteration is its own body entry; the
-iterations are never aggregated onto a single entry with
-``N_LOADS = N``.  This keeps each REP insn's per-iteration memop
-count within ``CST_FID_SLOT_COUNT`` for high-count REPs.
+An execution that moves nothing still executed the instruction and
+still emits exactly one entry, carrying zero memops.  That is routine
+rather than exceptional: ``memset(d, c, 0)`` does it, and so does every
+transfer small enough for the prologue form to finish on its own,
+leaving the main and epilogue forms with nothing to move.
+
+Iterations are never aggregated onto a single entry with
+``N_LOADS = N``.  That is what keeps these instructions — the only
+unbounded memop issuers in the supported ISAs — within
+``CST_FID_SLOT_COUNT`` however much memory they move.
 
 ::
 
@@ -2149,18 +2185,33 @@ that case; the elision is observable as the dynamic count being
 clamped to the cap.  The wire format reserves no overflow path —
 there is no ``EXTRA_*`` raw-vector escape.
 
-The 512-slot ceiling is sized by the widest memop fan-out a real
-instruction issues, which is not a vector instruction but a
+This clamp is a backstop and nothing more: no instruction the writer
+currently emits can reach it.  Instructions divide cleanly into two
+groups, and the ceiling is where the line between them falls.
+
+Every instruction with a *bounded* fan-out uses slots, and all of them
+fit with room to spare.  The widest is not a vector instruction but a
 processor-state save: x86 ``XSAVE``/``XSAVEOPT``/``XRSTOR`` write or
-read the whole extended state area in one instruction — 88 stores on
-a Haswell-class guest, and roughly 320 8-byte stores for a full
-AVX-512 area of about 2.5 KiB.  The vector cases sit far below it:
-AVX-512 gather/scatter is at most 16 lanes, ARM SVE2 at VLEN ≤ 4096
-is at most 64 element loads, and RISC-V V at LMUL × VLEN/SEW is at
-most 64.  Workloads that genuinely need more either fan the
-instruction out into multiple body entries (analogous to the
-REP-prefixed self-loop fan-out for x86 string ops; see §5.2 below)
-or accept the writer-side clamp.
+read the whole extended state area in one instruction — 88 stores on a
+Haswell-class guest, and roughly 320 8-byte stores for a full AVX-512
+area of about 2.5 KiB.  The vector cases sit far below that: AVX-512
+gather/scatter is at most 16 lanes, ARM SVE2 at VLEN ≤ 4096 is at most
+64 element loads, and RISC-V V at LMUL × VLEN/SEW is at most 64.  The
+512-slot ceiling is sized by the ~320 case.
+
+The instructions whose fan-out is *unbounded* — bounded only by a
+register value, so that no ceiling could be chosen — are not clamped at
+all.  They are fanned out into a self-loop of one body entry per
+iteration, which puts every memop on the wire whatever the register
+held: x86 REP-prefixed string operations and the AArch64 FEAT_MOPS bulk
+copy/set family.  Those two are the whole of that class across the
+supported ISAs; see :ref:`bulk-memory self-loop BBs
+<fanout-self-loop-bbs>`.
+
+An instruction outside both groups — a future ISA extension with an
+unbounded fan-out the writer does not yet fan out — is what the clamp
+exists for, and the ``memop_overflow`` warning is how it announces
+itself.
 
 The ceiling is a *wire* quantity only.  Sizing structures by it is
 not required and the writer does not do it: the per-template field

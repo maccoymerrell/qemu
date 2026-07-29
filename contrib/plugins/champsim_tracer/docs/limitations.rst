@@ -245,15 +245,16 @@ RVV at VLEN=2048, AMX tile registers) are truncated to the first
 beyond the wire format's current shape.
 
 **Memory-data values are 512-bit-capped.**  Same width budget; a
-single load/store value is encoded in up to 64 bytes.  ``rep movs``
-and other multi-iteration instructions surface one body entry per
-iteration (see the wire-format spec's *REP-prefixed self-loop BBs*
+single load/store value is encoded in up to 64 bytes.  ``rep movs``,
+the AArch64 FEAT_MOPS bulk copy/set family, and any other instruction
+whose memory fan-out a register bounds surface one body entry per
+iteration (see the wire-format spec's *Bulk-memory self-loop BBs*
 section), so each entry carries at most 1 load + 1 store — the
 slotted ``LOAD_ADDR[0..511]`` / ``STORE_ADDR[0..511]`` (and matching
 ``DATA``) families cover every supported instruction; there is no
-overflow vector, and the widest single-instruction memop fan-out on
-x86 — an ``XSAVE``-family state save, about 320 stores for a full
-AVX-512 area — sits inside the 512 slots.
+overflow vector, and the widest *bounded* single-instruction memop
+fan-out on x86 — an ``XSAVE``-family state save, about 320 stores for
+a full AVX-512 area — sits inside the 512 slots.
 
 .. _limits-mem-value-width:
 

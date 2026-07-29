@@ -151,7 +151,7 @@ FEATURES: dict[str, str] = {
     "behavior:dc_zva_visible": "aarch64 DC ZVA reaches the memory instrumentation on the correct path and is modelled as the block store it is: its recorded stores tile the DCZID_EL0-sized block exactly instead of vanishing into the helper's host memset, and the instruction declares the store lane that makes them attributable",
     "behavior:string_op_memops": "x86 REP string instructions fan out per architectural iteration with the right per-iteration memop count, and the operand model matches what each instruction really reads and writes (Capstone access-flag corrections in disas/capstone.c)",
     "behavior:reg_snap_accounting": "the plugin's own dropped-slice completeness invariant for the positional reg-snap capture — CP reg-snap slice dropped == CP reg-snap leak trimmed (D4-class completeness oracle; the wire has no record of it, so this is read from the <outfile>.stats.log sidecar, offline via cst_audit --stats-log)",
-    "behavior:mips_fragment_split_absence": "split_tb_into_fragments's mid-TB continuation path (a branch-classified insn QEMU's translator keeps decoding past) has no current MIPS instance — the T-family conditional trap was the only one and 5bf597d751 correctly reclassified it to BRANCH_NONE, leaving x86 BRANCH_REP (X86RepIterationFanout) as the path's sole exerciser; this pins that fact and fails if MIPS regains an un-covered instance",
+    "behavior:mips_fragment_split_absence": "split_tb_into_fragments's mid-TB continuation path (a branch-classified insn QEMU's translator keeps decoding past) has no current MIPS instance — the T-family conditional trap was the only one and 5bf597d751 correctly reclassified it to BRANCH_NONE, leaving BRANCH_REP as the path's exerciser (x86 X86RepIterationFanout rep movsq, and the aarch64 FEAT_MOPS bulk copy/set triple); this pins that fact and fails if MIPS regains an un-covered instance",
     "behavior:memop_bimodality": "per-template memop bimodality: a memop-capable template's CP executions overwhelmingly nonzero with a small minority of zero-memop outliers is a completeness loss (D4-class oracle generalised past the segment-final-entry special case; cst_lint.h MemopBimodalityLint + validator.py's mirror, both gating)",
 }
 
@@ -677,9 +677,11 @@ def _chk_mips_fragment_split_absence(ctx: Ctx) -> Outcome:
     against ``target/mips/tcg/translate.c`` (every direct/indirect
     jump/call/return/conditional branch, and every syscall/unconditional
     trap) shows each one ends the QEMU TB immediately -- there is
-    currently no other MIPS instruction with the T-family's shape.  x86
-    still exercises the path via ``BRANCH_REP``
-    (``X86RepIterationFanout``, ``rep movsq`` mid-TB).
+    currently no other MIPS instruction with the T-family's shape.  The
+    path is still exercised elsewhere via ``BRANCH_REP``: x86
+    (``X86RepIterationFanout``, ``rep movsq`` mid-TB) and aarch64, whose
+    FEAT_MOPS prologue/main/epilogue triple QEMU translates straight
+    through inside one TB.
 
     Rather than leave that fact undocumented, decode a MIPS trace built
     with ``--coverage`` (chains in every registered ``coverage_probe``
@@ -1339,10 +1341,12 @@ def _chk_isa_crosscheck(ctx: Ctx) -> Outcome:
     signature.
 
     GATING on any signature outside tools/isaxcheck_allow.txt, for all four
-    ISAs.  The whole sweep is ~30 s on 8 cores over 12.6-21.0 M encodings per
-    ISA, which is cheap enough to run on every Capstone bump — the point
-    being that the disas/capstone.c workarounds should be retirable rather
-    than permanent.  A workaround that works shows up here as the ABSENCE of
+    ISAs.  The sweep covers 1.58 G encodings — 1.25 G x86_64, 164 M aarch64,
+    151 M mipsel, 16.8 M riscv64 — which is still cheap enough to run on
+    every Capstone bump, the point being that the disas/capstone.c
+    workarounds should be retirable rather than permanent.  x86_64 is the
+    bulk of it and the bulk of that is the SIB dimension (see sweep_x86 in
+    isaxcheck.cc for what each dimension buys and what it cost).  A workaround that works shows up here as the ABSENCE of
     a disagreement; capstone_workaround_probe answers the complementary
     question of whether it has become unnecessary.
     """
@@ -1385,7 +1389,7 @@ def _chk_isa_crosscheck(ctx: Ctx) -> Outcome:
         subs.append({"name": isa, "ok": ok, "detail": detail})
     return Outcome("pass" if all_ok else "fail",
                    "boundary-vs-LLVM-MC decode metadata agreement "
-                   "(4 ISAs, ~50 M encodings, allowlisted residual)", subs)
+                   "(4 ISAs, ~1.58 G encodings, allowlisted residual)", subs)
 
 
 def _chk_decode_fixups(ctx: Ctx) -> Outcome:

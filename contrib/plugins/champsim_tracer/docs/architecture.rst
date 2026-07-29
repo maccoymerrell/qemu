@@ -2012,29 +2012,51 @@ referencing the last revision, and a loud once-per-segment warning
 plus the ``smc_overflow_events`` / ``smc_overflow_pcs`` statistics
 flag the anomaly.
 
-*REP-prefixed x86 string instructions fan out per iteration.*  An x86
-``REP MOVS`` executes N times against architectural memory.  The
-tracer surfaces each iteration as its own ``BODY_TAG_ENTRY``: iter 1
-stays on the BB that *enters* the REP loop (terminating that BB at
-the REP's PC), and iters 2..N each emit a fresh body entry on a
-1-insn self-loop BB whose start_pc == fall_through_pc == the REP's
-own PC.  See the *"REP-prefixed self-loop BBs (x86)"* subsection of
-*Part II §5.2 "Memory Counts and Addresses"* of the wire-format spec
-for the encoding details.
-The REP-self-loop BB's terminating insn carries
+*Instructions with an unbounded memory fan-out are fanned out into a
+self-loop.*  An x86 ``REP MOVS`` executes N times against architectural
+memory; an AArch64 FEAT_MOPS ``CPYM`` moves a register-sized span in
+one execution.  Neither has any fan-out bound the wire could size a
+slot table against, so instead of issuing hundreds of thousands of
+memops on one entry the tracer surfaces each iteration as its own
+``BODY_TAG_ENTRY``: iter 1 stays on the BB that *enters* the loop
+(terminating that BB at the instruction's PC), and iters 2..N each emit
+a fresh body entry on a 1-insn self-loop BB whose start_pc ==
+fall_through_pc == that instruction's own PC.  See the *"Bulk-memory
+self-loop BBs"* subsection of *Part II §5.2 "Memory Counts and
+Addresses"* of the wire-format spec for the encoding details.
+The self-loop BB's terminating insn carries
 ``branch_type = BRANCH_REP`` to alert consumers that the BB is a
 synthetic 1-insn self-loop rather than an ordinary direct conditional
 branch.
 
-CP-side capture is straightforward: each iteration's memops attach to
-that iteration's own body entry (1 load + 1 store on REP MOVS, 1 store
-on REP STOS, etc.), so the slotted families ``CST_FID_LOAD_ADDR*`` /
-``CST_FID_STORE_ADDR*`` stay well within their 0..511 range even on
-long REP runs.  ``MemAccessRecorder::record`` caps per-instruction
-memops at ``CST_FID_SLOT_COUNT`` = 512 and drops the rest — there is
-no overflow vector — which also bounds the WP simulator's spec mode,
-where ``REP`` can iterate arbitrarily many times against a sandboxed
-memory.  The matching
+The fan-out UNIT is per family, because only x86 has an architectural
+iteration to count: one element for a REP string op (1 load + 1 store
+on REP MOVS, 1 store on REP STOS), one memory ACCESS for a MOPS bulk
+copy/set, whose step size is a property of the implementation and whose
+loads and stores arrive in per-step runs rather than in pairs.  Either
+way each iteration's memops attach to that iteration's own body entry,
+so the slotted families ``CST_FID_LOAD_ADDR*`` /
+``CST_FID_STORE_ADDR*`` stay at the low end of their 0..511 range
+however much memory the instruction moves, and the writer-side clamp is
+left as a backstop that nothing currently reaches.
+
+The splitter is what makes this work at the BB layer: neither QEMU's
+x86 nor its AArch64 translator ends a TB at these instructions, so the
+fragment splitter cuts the TB at each one.  A glibc ``memcpy`` on a
+FEAT_MOPS guest is a prologue/main/epilogue triple in a single TB and
+becomes three consecutive entries, all of whose memops arrive in one
+buffer — which is why the recorder's straggler carry is bounded by
+emission progress rather than by a fixed number of drains (see
+``drain_cp_into_dyn_params``).
+
+``MemAccessRecorder::record`` caps per-instruction memops at
+``CST_FID_SLOT_COUNT`` = 512 on the WRONG path and drops the rest —
+there is no overflow vector — which bounds the WP simulator's spec
+mode, where ``REP`` can iterate arbitrarily many times against a
+sandboxed memory.  (MOPS needs a second bound there: it runs its whole
+transfer inside one TCG helper, so the plugin never regains control to
+stop it, and ``mops_spec_clamp`` in ``target/arm/tcg/helper-a64.c``
+truncates the spec-mode transfer size instead.)  The matching
 forward-progress guard inside the WP loop catches the related case
 where spec-mode ``REP`` returns from ``exec_tb`` without advancing
 PC and would otherwise spin forever.

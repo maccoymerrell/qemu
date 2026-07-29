@@ -632,12 +632,24 @@ outside the repo as standalone scripts):
    ``include_implicit_regs`` policy modelled so that what is compared is
    what the dependency model would actually record.
 
-   The sweep is exhaustive over the opcode-bearing bit space — 21.0 M
+   The sweep is exhaustive over the opcode-bearing bit space — 164 M
    AArch64 encodings, 16.8 M RISC-V including every compressed halfword,
-   21.0 M MIPS — and takes about 20 seconds for all four ISAs on 8
-   cores.  That cheapness is the point: it is affordable on every
-   Capstone bump, which is what keeps the ``disas/capstone.c``
-   workarounds retirable instead of permanent.
+   151 M MIPS, and 1.25 G x86_64 — 1.58 G in all, a couple of minutes for
+   all four ISAs at ``--jobs=16``.  That cheapness is the point: it is
+   affordable on every Capstone bump, which is what keeps the
+   ``disas/capstone.c`` workarounds retirable instead of permanent.
+
+   x86_64 dominates because its encoding is the one with several
+   independent variable dimensions rather than one fixed word, and each
+   was closed only after its blind spot was measured against a traced
+   population: ModRM.reg and ModRM.rm (both carry opcode), REX as
+   sixteen values rather than one spelling, ModRM.mod's two missing
+   addressing forms, the whole of VEX, and — most recently — SIB.index
+   and SIB.base, which 12.25% of a traced x86 population's dynamic
+   weight passes through and which were sampled at four of sixty-four
+   values before.  ``sweep_x86()`` in ``isaxcheck.cc`` carries the
+   measurement for each, including the one dimension deliberately left
+   pinned and why.
 
    **The register fill sets are coverage, not convenience.**  Each sweep
    walks the opcode-bearing bits exhaustively and fills the register
@@ -997,9 +1009,11 @@ outside the repo as standalone scripts):
    shape x86 ``BOUND`` has; see ``features.reg_snap_accounting``
    above for the 188,726-block cost of the old misclassification on
    the ``mcf_user_mipsel`` sample).  That fix also removed MIPS's only
-   exercise of this splitter path — x86 still covers it via
-   ``BRANCH_REP`` (``X86RepIterationFanout``, ``rep movsq`` mid-TB;
-   see ``features.string_memops`` above).  Rather than leave the
+   exercise of this splitter path — ``BRANCH_REP`` still covers it
+   elsewhere, on x86 (``X86RepIterationFanout``, ``rep movsq`` mid-TB;
+   see ``features.string_memops`` above) and on aarch64, whose
+   FEAT_MOPS bulk copy/set triple QEMU translates straight through
+   inside one TB (see ``features.mops_memops``).  Rather than leave the
    MIPS absence undocumented, this check decodes a ``--coverage``
    mipsel trace (chains in every registered ``coverage_probe`` block,
    including ``MipsInlineConditionalTrap`` — the regression test for

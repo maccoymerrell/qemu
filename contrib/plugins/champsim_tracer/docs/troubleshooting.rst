@@ -302,9 +302,10 @@ ones a given Capstone bump has already fixed.
       python -m champsim_tracer_validator full --build-dir build \
           --only features.isa_crosscheck
 
-   This compares the boundary's answer for 12.6-16.8 M encodings per
-   ISA against the LLVM MC layer, and takes about 18 seconds for all
-   four ISAs.  It is the complement of the probe: the probe says
+   This compares the boundary's answer for 1.58 G encodings against the
+   LLVM MC layer — 1.25 G x86_64, 164 M aarch64, 151 M mipsel, 16.8 M
+   riscv64 — a couple of minutes for all four ISAs at ``--jobs=16``.
+   It is the complement of the probe: the probe says
    whether a workaround has become *unnecessary*, the cross-check says
    whether the boundary's overall answer is still *right*.  A bump that
    fixes one defect and regresses another shows up here even when every

@@ -5562,12 +5562,13 @@ def _template_successor_pcs(t: dict,
     actually took on the correct path (covers indirect branches, whose
     static target list is empty).
 
-    A template whose terminal instruction is the x86 ``BRANCH_REP``
-    additionally hands control to that instruction's own PC: REP
-    iterations 2..N each ride a synthetic 1-insn self-loop BB whose
-    start_pc is the REP's PC (format spec, "REP-prefixed self-loop
-    BBs"), so both the block that ENTERS a REP loop and the self-loop
-    BB itself may legitimately be followed by an entry starting there.
+    A template whose terminal instruction is ``BRANCH_REP`` (an x86
+    REP string op or an AArch64 FEAT_MOPS bulk copy/set) additionally
+    hands control to that instruction's own PC: iterations 2..N each
+    ride a synthetic 1-insn self-loop BB whose start_pc is that
+    instruction's PC (format spec, "Bulk-memory self-loop BBs"), so
+    both the block that ENTERS the loop and the self-loop BB itself
+    may legitimately be followed by an entry starting there.
     """
     s: set[int] = set()
     ft = int(t.get("fall_through_pc", 0) or 0)

@@ -57,8 +57,24 @@ See `contrib/plugins/champsim_tracer/docs/quickstart.rst` for the option referen
 The seed-driven generator validates the plugin across 4 ISAs. Canonical entrypoint:
 
 ```sh
-python -m champsim_tracer_validator all --isa x86_64 --run
+# run from contrib/plugins/champsim_tracer/validator/
+python -m champsim_tracer_validator all --isa x86_64 --seed 4242 \
+       --build-dir /mnt/md0/QEMU/qemu/build -o /mnt/md0/QEMU/cst_runs/<name>
 ```
+
+`--isa`, `--seed`, `--build-dir` and `-o` are all required, and there is **no `--run` flag**.
+`--compress` here takes a keyword (`none|xz|zstd|gzip`), unlike the plugin's own `compress=` option,
+which takes a command string.
+
+The whole-suite entrypoint is a different subcommand, `full`:
+
+```sh
+python -m champsim_tracer_validator full --build-dir <build> -o <out-dir>
+```
+
+When validating a build dir that is **not** the canonical `build/`, set `CST_DECODE` to that dir's
+`cst_decode`. `_cst_decode_runner.py` otherwise falls back to `../../build/contrib/plugins/cst_decode`
+and decodes the traces with the shared binary, producing false system-tier failures.
 
 Do **not** invoke `tests/run_roundtrip.sh` directly. When changing the `--format=legacy` output of `cst_decode`,
 update `validator/champsim_tracer_validator/_cst_decode_runner.py` (it shells out to `cst_decode --format=legacy`

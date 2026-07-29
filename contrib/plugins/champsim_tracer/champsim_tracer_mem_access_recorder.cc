@@ -17,13 +17,26 @@ MemAccessRecorder g_mem_recorder;
 namespace {
 
 thread_local std::vector<WPMemAccess> tls_cp_mem_accesses CST_TLS_HOT;
-/* Memops whose insn_pc missed the previous drain's template, retained
- * for exactly one more drain.  The legitimate producer is a split BB
- * (e.g. the MIPS page-split branch whose delay slot executes in the
- * next TB): the straggler belongs to the neighboring entry, whose
- * drain immediately follows and whose template does contain its PC.
- * A second miss means the memop is a true orphan — recorded by an
- * executed-but-never-emitted path — and is dropped and counted. */
+/* Memops whose insn_pc missed a drain's template, held for a later
+ * one.  The legitimate producers are entries that follow the recording
+ * entry in execution order: a split BB (the MIPS page-split branch
+ * whose delay slot executes in the next TB), and a TB the splitter cut
+ * into several memop-carrying fragments — the CPYFP/CPYFM/CPYFE
+ * prologue/main/epilogue triple glibc's memcpy is on a FEAT_MOPS
+ * guest becomes three consecutive entries whose memops all arrive in
+ * one buffer, so the first entry's drain sees two entries' worth of
+ * stragglers and the second entry's drain still sees one.
+ *
+ * A straggler is a true orphan — recorded by an executed-but-never-
+ * emitted path — once the emission stream has moved PAST it, and the
+ * evidence for that is a drain that claimed memops but none of the
+ * carried ones: memops are drained in execution order, so an entry
+ * claiming a NEWER memop while an older one goes unclaimed has left
+ * the older one nothing to belong to.  A drain that claims nothing at
+ * all is not that evidence and must not drop the carry — an
+ * intermediate fan-out fragment legitimately moves no memory (a MOPS
+ * main step with a sub-page transfer already finished by its prologue
+ * is a routine case), and so does any memop-free BB. */
 thread_local std::vector<WPMemAccess> tls_cp_carry;
 thread_local GByteArray              *tls_mem_read_buf CST_TLS_HOT = nullptr;
 
@@ -368,29 +381,46 @@ void MemAccessRecorder::drain_cp_into_dyn_params(
         dyn_params.push_back(dp);
     };
 
-    /* Carried stragglers first (they are older than the live buffer);
-     * a second miss is terminal. */
+    /* Carried stragglers first (they are older than the live buffer).
+     * Survivors compact to the front of the carry in place, so the
+     * common case — nothing carried, or everything carried claimed —
+     * allocates nothing. */
     unsigned int idx = 0;
-    for (const WPMemAccess &acc : tls_cp_carry) {
+    bool claimed_carry = false;
+    size_t n_stranded = 0;
+    for (size_t r = 0; r < tls_cp_carry.size(); r++) {
+        const WPMemAccess acc = tls_cp_carry[r];
         int slot = slot_for(acc, idx);
         if (slot < 0) {
-            thread_stats_get().cp_orphan_mem_accesses++;
+            tls_cp_carry[n_stranded++] = acc;
             continue;
         }
+        claimed_carry = true;
         push_dp(acc, slot);
     }
-    tls_cp_carry.clear();
+    tls_cp_carry.resize(n_stranded);
 
     idx = 0;
+    bool claimed_live = false;
     for (const WPMemAccess &acc : tls_cp_mem_accesses) {
         int slot = slot_for(acc, idx);
         if (slot < 0) {
             tls_cp_carry.push_back(acc);
             continue;
         }
+        claimed_live = true;
         push_dp(acc, slot);
     }
     tls_cp_mem_accesses.clear();
+
+    /* This entry took memops, but none of the ones already waiting:
+     * the stream has passed them (see tls_cp_carry).  Drop exactly
+     * those — the freshly-missed tail behind them is still in flight. */
+    if (n_stranded && !claimed_carry && claimed_live) {
+        thread_stats_get().cp_orphan_mem_accesses += n_stranded;
+        tls_cp_carry.erase(tls_cp_carry.begin(),
+                           tls_cp_carry.begin() + n_stranded);
+    }
 }
 
 void MemAccessRecorder::cleanup_current_thread()

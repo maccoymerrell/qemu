@@ -2638,13 +2638,35 @@ def classify_aarch64(m: str) -> Entry:
 
     if m in {"ccmn"}:
         return ent("GEN_OP_CMP")
+    # FEAT_MOPS bulk memory set / copy.  These are the ISA's only
+    # instructions whose memory fan-out is bounded by nothing but a
+    # register — SETM / CPYM transfer the whole page-aligned body of a
+    # memset / memcpy in one execution, which glibc routes every
+    # memset/memcpy/memmove through on a FEAT_MOPS guest — so no wire
+    # slot ceiling can hold one.  BRANCH_REP hands them to the same
+    # self-loop fan-out the x86 REP-prefixed string ops use: the
+    # instruction becomes its own true BB and its execution is emitted
+    # as one body entry per memory access.  See rep_memops_per_iter in
+    # champsim_tracer_mnemonics.h for the fan-out unit, which is per
+    # memory access here and per architectural element on x86.
+    #
+    # The prologue form (SETP / CPYP / CPYFP) additionally WRITES NZCV
+    # to advertise which implementation option it chose; it does not
+    # read it, so it takes no flags dependency.
     if m in {
         "setge", "setgen", "setget", "setgetn", "sete", "seten",
         "setet", "setetn", "setgm", "setgmn", "setgmt", "setgmtn",
         "setgp", "setgpn", "setgpt", "setgptn", "setm", "setmn",
         "setmt", "setmtn", "setp", "setpn", "setpt", "setptn",
     }:
-        return ent("GEN_OP_STORE")
+        return ent("GEN_OP_STORE", "BRANCH_REP")
+    # The copy half.  Matched by prefix because the option suffixes
+    # (read/write x temporal/non-temporal) span 16 spellings per form;
+    # the six prefixes below are exact heads of the MOPS copy family
+    # and of nothing else (the SVE element copy is the bare "cpy", the
+    # SVE FP copy is "fcpy").
+    if m.startswith(("cpyp", "cpym", "cpye", "cpyfp", "cpyfm", "cpyfe")):
+        return ent("GEN_OP_MOV", "BRANCH_REP")
 
     if m.startswith(("cas", "casp", "swp")):
         return ent("GEN_OP_XCHG", flags="MF_ATOMIC")

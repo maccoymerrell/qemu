@@ -897,14 +897,15 @@ struct BBTemplate {
      * emissions on a per-template cadence. */
     uint64_t emit_count;
     /*
-     * Set when this template's terminator is an x86 REP-prefixed
-     * string op (rep_loads_per_iter + rep_stores_per_iter > 0 on the
-     * last canonical insn): a 1-insn self-loop sub-template at the
-     * REP's PC, built at translation time.  Body emitter fans a single
-     * TB-exec into N entries (iter 1 on this template, iter 2..N on
-     * rep_subtmpl).  Stale/null handle on non-REP TBs.  Materialized
-     * lazily on first chain-finalize use, but only emitted at >= 2
-     * iters, so an unexercised REP leaves a 0/0-exec template in the
+     * Set when this template's terminator is a fan-out instruction —
+     * an x86 REP-prefixed string op or an AArch64 FEAT_MOPS bulk
+     * copy/set (rep_memops_per_iter > 0 on the last canonical insn):
+     * a 1-insn self-loop sub-template at that instruction's PC, built
+     * at translation time.  Body emitter fans a single TB-exec into N
+     * entries (iter 1 on this template, iter 2..N on rep_subtmpl).
+     * Stale/null handle on non-fan-out TBs.  Materialized lazily on
+     * first chain-finalize use, but only emitted at >= 2 iters, so an
+     * unexercised fan-out insn leaves a 0/0-exec template in the
      * dictionary — expected and benign; consumers treat it as a
      * pre-declared, unreferenced self-loop.  A SegRef because the
      * pointee lives in bb_map_ (segment lifetime) while this template

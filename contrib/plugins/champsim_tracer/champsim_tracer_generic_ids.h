@@ -156,13 +156,14 @@ enum BranchType {
     BRANCH_SYSCALL_TYPE = 4,
     BRANCH_COND_DIRECT = 5,
     /*
-     * x86 REP / REPNZ self-loop terminator: a conditional self-loop
-     * branch (target = self-PC, fall-through = next PC).  The tracer
-     * fans iterations into per-iteration entries on a 1-insn
-     * self-loop sub-template (see docs/format.rst
-     * §"REP-prefixed self-loop BBs").  Kept distinct from
-     * BRANCH_COND_DIRECT so consumers see the no-target-diversity
-     * self-loop semantics.
+     * Self-loop terminator for an instruction whose memory fan-out is
+     * bounded only by a register value — an x86 REP / REPNZ string op
+     * or an AArch64 FEAT_MOPS bulk copy/set.  A conditional self-loop
+     * branch (target = self-PC, fall-through = next PC): the tracer
+     * fans iterations into per-iteration entries on a 1-insn self-loop
+     * sub-template (see docs/format.rst §"Bulk-memory self-loop BBs").
+     * Kept distinct from BRANCH_COND_DIRECT so consumers see the
+     * no-target-diversity self-loop semantics.
      */
     BRANCH_REP = 6,
     /*

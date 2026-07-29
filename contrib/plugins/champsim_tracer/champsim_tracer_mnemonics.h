@@ -274,13 +274,33 @@ typedef struct InsnFields {
      * predicate reg on AArch64 SVE.  Empty key on STATIC rows. */
     QemuRegKey            lane_mask_source_reg;
     /*
-     * x86 REP / REPNZ string-op metadata: memops issued per iteration.
-     * The body emitter fans one TB-exec into N iteration entries (iter
-     * 1 on the parent BB template, 2..N on its rep_subtmpl 1-insn
-     * self-loop sub-template).  Zero on non-REP insns.
+     * Self-loop fan-out metadata: memops issued per fanned-out
+     * iteration.  Nonzero marks an instruction whose single execution
+     * is split into N body entries (iter 1 on the parent BB template,
+     * 2..N on its rep_subtmpl 1-insn self-loop sub-template), so an
+     * instruction with an unbounded memory fan-out reaches the wire
+     * whole instead of being clamped at CST_FID_SLOT_COUNT.
+     *
+     * The value is the fan-out UNIT, and it differs by family:
+     *
+     *   x86 REP / REPNZ string ops — the iteration is architectural
+     *     (RCX decrements once per element), so the unit is one
+     *     element: loads + stores per iteration, counted from the
+     *     Capstone MEM operand access flags (MOVS 1L+1S, CMPS 2L,
+     *     STOS 1S, LODS/SCAS 1L, INS 1S, OUTS 1L).
+     *
+     *   AArch64 FEAT_MOPS bulk copy/set — the instruction has NO
+     *     architectural iteration (QEMU's copy_step/set_step move up
+     *     to a page per step, an implementation detail), so the unit
+     *     is one memory access: 1.  That is also the only unit robust
+     *     to the arrival ORDER, which for a copy is a run of loads
+     *     followed by a run of stores (one bulk callback per step per
+     *     direction), not the interleaved load/store pairs a REP
+     *     string op produces.
+     *
+     * Zero on everything else.
      */
-    uint8_t  rep_loads_per_iter;
-    uint8_t  rep_stores_per_iter;
+    uint8_t  rep_memops_per_iter;
 } InsnFields;
 
 /*

@@ -94,11 +94,18 @@ struct Stats {
      * more than CST_FID_SLOT_COUNT of one direction and the wire has no
      * slot to hold them.  The entry reports the capped count so it stays
      * self-describing (see extr_n_loads); this counts what the cap left
-     * out.  The unbounded issuers are the AArch64 FEAT_MOPS bulk-memory
-     * instructions — SETM / CPYM transfer the whole page-aligned body of
-     * a memset / memcpy in a single execution — for which the
-     * per-template profile still carries the untruncated memop totals
-     * and the full touched address extent. */
+     * out.
+     *
+     * Must be 0 on a correct run.  The only instructions with no
+     * fan-out bound at all — x86 REP string ops and the AArch64
+     * FEAT_MOPS bulk copy/set family — are fanned out into a
+     * per-iteration self-loop before they reach the slot tables, so
+     * every memop they issue lands in a slot.  Everything else is
+     * bounded well below the ceiling (XSAVE ~320, AVX-512
+     * gather/scatter 16, SVE2 64, RISC-V V 64).  A nonzero count means
+     * a new unbounded issuer has appeared and wants the same fan-out
+     * treatment; until then the per-template profile still carries the
+     * untruncated memop totals and the full touched address extent. */
     uint64_t memops_over_slot_ceiling = 0;
     /* Emitted entries whose pending reg-snap count did not equal the
      * template's Σ n_dst_regs — the positional reg-snap invariant the wire

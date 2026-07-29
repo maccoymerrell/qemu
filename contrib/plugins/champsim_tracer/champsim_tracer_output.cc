@@ -2750,10 +2750,14 @@ stage_rec_reserve(StageRec **stage, unsigned int *stage_len,
 
 /* CP memop overflow warning.  The slot loop silently clamps a
  * dynamic memop count exceeding CST_FID_SLOT_COUNT.  The cap is sized
- * for the widest real single-instruction fan-out — x86 XSAVE-family
+ * for the widest BOUNDED single-instruction fan-out — x86 XSAVE-family
  * state save/restore, ~320 8-byte stores for a full AVX-512 area, well
- * above AVX-512 gather/scatter (<=16) and max-VLEN SVE (<=64) — so any
- * overflow that still happens gets a per-occurrence breadcrumb. */
+ * above AVX-512 gather/scatter (<=16) and max-VLEN SVE (<=64).  The
+ * instructions with no bound at all (x86 REP string ops, AArch64
+ * FEAT_MOPS bulk copy/set) never arrive here whole: emit_body_entry
+ * fans them into one entry per iteration first.  So the clamp is a
+ * backstop for an issuer nobody has classified yet, and every
+ * occurrence gets a breadcrumb naming the PC that needs it. */
 static void warn_memop_overflow(const BBTemplate *tmpl, uint32_t insn_i,
                                 uint32_t n_loads, uint32_t n_stores)
 {

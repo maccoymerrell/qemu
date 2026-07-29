@@ -563,8 +563,8 @@ void decode_detail_to_generic(uint64_t pc,
      * Conditional: the loop exits when ECX==0 or the REPZ/REPNZ compare
      * breaks.  info->has_rep is x86-only (false elsewhere → no-op).
      *
-     * rep_{loads,stores}_per_iter = memops per REP iteration, counted
-     * from Capstone MEM operand access flags (mnemonic-agnostic: MOVS
+     * rep_memops_per_iter = memops per REP iteration, counted from
+     * Capstone MEM operand access flags (mnemonic-agnostic: MOVS
      * 1L+1S, CMPS 2L, STOS 1S, LODS/SCAS 1L, INS 1S, OUTS 1L).  Lets
      * the body emitter fan one TB-exec's memop stream into N entries.
      */
@@ -577,12 +577,34 @@ void decode_detail_to_generic(uint64_t pc,
                 continue;
             }
             if (op->access & QEMU_PLUGIN_OP_ACC_READ) {
-                out->rep_loads_per_iter++;
+                out->rep_memops_per_iter++;
             }
             if (op->access & QEMU_PLUGIN_OP_ACC_WRITE) {
-                out->rep_stores_per_iter++;
+                out->rep_memops_per_iter++;
             }
         }
+    } else if (out->branch_type == BRANCH_REP) {
+        /*
+         * Fan-out declared by the mnemonic table rather than by a
+         * prefix: an instruction whose memory fan-out is bounded only
+         * by a register, so no slot ceiling can hold it.  The AArch64
+         * FEAT_MOPS bulk copy/set family (CPYP/CPYM/CPYE, CPYFP/CPYFM/
+         * CPYFE, SETP/SETM/SETE, SETGP/SETGM/SETGE and their
+         * option-suffixed variants) is the whole of this class today —
+         * every other wide issuer is bounded well below the ceiling
+         * (XSAVE ~320, AVX-512 gather/scatter 16, SVE2 64, RISC-V V
+         * 64) and keeps using slots.
+         *
+         * These have no architectural iteration to count elements
+         * against, so the fan-out unit is one memory access; see
+         * rep_memops_per_iter in champsim_tracer_mnemonics.h.  Marked
+         * conditional for the same reason a REP is: the self-loop
+         * exits on a register value (here the size register Xn), so a
+         * zero-size transfer executes the block exactly once and falls
+         * straight through.
+         */
+        out->branch_conditional  = true;
+        out->rep_memops_per_iter = 1;
     }
 
     /* refine_alias_fields moved below the operand walk: its riscv arm

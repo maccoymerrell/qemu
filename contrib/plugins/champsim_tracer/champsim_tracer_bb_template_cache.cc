@@ -1464,16 +1464,18 @@ BBTemplate *TemplateStore::create_tb_template(
 void TemplateStore::ensure_rep_subtmpl(BBTemplate *tb)
 {
     /* No-op when already live in this segment (a stale prior-segment
-     * handle derefs to nullptr and is rebuilt), when not a REP TB, or
-     * on a degenerate template (no insns).  commit_true_bb dedups by
-     * start_pc, so repeated calls within a segment are safe — but the
-     * early-out keeps the hot path branch-predicted. */
+     * handle derefs to nullptr and is rebuilt), when the terminator is
+     * not a fan-out insn (x86 REP string op, AArch64 FEAT_MOPS bulk
+     * copy/set), or on a degenerate template (no insns).
+     * commit_true_bb dedups by start_pc, so repeated calls within a
+     * segment are safe — but the early-out keeps the hot path
+     * branch-predicted. */
     if (!tb || seg_deref(tb->rep_subtmpl) || tb->n_insns == 0) {
         return;
     }
     uint32_t last = tb->n_insns - 1;
     const InsnFields *lf = &tb->insn_fields[last];
-    if (lf->rep_loads_per_iter + lf->rep_stores_per_iter == 0) {
+    if (lf->rep_memops_per_iter == 0) {
         return;
     }
     /* 1-insn self-loop sub-template at the REP PC with the same

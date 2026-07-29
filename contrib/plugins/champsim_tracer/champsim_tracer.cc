@@ -1920,12 +1920,19 @@ std::atomic<uint64_t> g_next_threshold{UINT64_MAX};
  * slot inside vcpu_tb_exec; it stays valid through plugin_exit. */
 thread_local uint64_t g_host_icount CST_TLS_HOT = 0;
 
-/* Total sub-entries emitted by REP fan-out (sum of (n_iter - 1)
- * across every emit_body_entry call that fanned out).  Each
- * sub-entry uses the 1-insn rep_subtmpl, so this counter is the
- * architectural insns the trace contains BEYOND the per-TB-exec
- * inline_add count, scoped to in-segment because emit_body_entry
- * only runs when a trace stream is open. */
+/* Total sub-entries emitted by self-loop fan-out (sum of (n_iter - 1)
+ * across every emit_body_entry call that fanned out) — x86 REP string
+ * ops and AArch64 FEAT_MOPS bulk copy/set alike.  Each sub-entry uses
+ * the 1-insn rep_subtmpl, so this counter is the architectural insns
+ * the trace contains BEYOND the per-TB-exec inline_add count, scoped
+ * to in-segment because emit_body_entry only runs when a trace stream
+ * is open.
+ *
+ * Its scale is per FAN-OUT UNIT, which is per family: an x86 iteration
+ * is an architectural element, a MOPS iteration is one memory access.
+ * A megabyte memcpy on a FEAT_MOPS guest therefore contributes ~65K
+ * here off a single instruction, which is what the trace genuinely
+ * contains and what any icount-derived quantity must be read against. */
 std::atomic<uint64_t> g_rep_fanout_extra_insns{0};
 
 /* Sum of per-segment `covered` (icount[finish] - icount[start])
@@ -3283,14 +3290,25 @@ void emit_body_entry(BodyStreamState *out_stream,
     }
 
     /*
-     * REP fan-out: split a single REP TB-exec's memop stream into N
-     * iteration entries (iter 1 on @entry, iter 2..N on rep_subtmpl).
-     * Memops arrive in execution order under the REP PC, mpi per
-     * iteration (1 for LODS/STOS/SCAS/INS/OUTS, 2 for MOVS/CMPS), so
-     * the partition is a direct slice.  WP entries and reg_snaps stay
-     * on iter 1: the WP simulator sees REP as one architectural
-     * branch, and per-iter RSI/RDI/RCX deltas ride the field-delta
-     * stream like any repeated BB visit.
+     * Self-loop fan-out: split a single fan-out insn's TB-exec memop
+     * stream into N iteration entries (iter 1 on @entry, iter 2..N on
+     * rep_subtmpl).  Memops arrive in execution order under the insn's
+     * PC, mpi per iteration, so the partition is a direct slice.
+     *
+     * mpi is the family's fan-out unit (see rep_memops_per_iter): one
+     * architectural element for an x86 REP string op (1 for
+     * LODS/STOS/SCAS/INS/OUTS, 2 for MOVS/CMPS), one memory access for
+     * an AArch64 FEAT_MOPS bulk copy/set, whose transfer has no
+     * architectural iteration and whose loads and stores arrive in
+     * per-step runs rather than pairs.  The unit is what keeps the
+     * unbounded issuers off the CST_FID_SLOT_COUNT clamp — a MOPS
+     * memcpy of a megabyte reaches the wire as ~65K one-memop entries
+     * instead of one entry with 65K memops of which 512 survive.
+     *
+     * WP entries and reg_snaps stay on iter 1: the WP simulator sees
+     * the whole instruction as one architectural branch, and per-iter
+     * register deltas (x86 RSI/RDI/RCX, MOPS Xd/Xs/Xn) ride the
+     * field-delta stream like any repeated BB visit.
      */
     BBTemplate *rep_sub = bb_tmpl
         ? g_template_store.seg_deref(bb_tmpl->rep_subtmpl)
@@ -3298,8 +3316,7 @@ void emit_body_entry(BodyStreamState *out_stream,
     if (rep_sub && bb_tmpl->n_insns > 0) {
         uint32_t last = bb_tmpl->n_insns - 1;
         const InsnFields *lf = &bb_tmpl->insn_fields[last];
-        unsigned mpi = (unsigned)lf->rep_loads_per_iter
-                     + (unsigned)lf->rep_stores_per_iter;
+        unsigned mpi = (unsigned)lf->rep_memops_per_iter;
         if (mpi > 0) {
             /* Split REP-attributed memops out, preserving order. */
             std::vector<DynParam> rep_dps;
@@ -6900,10 +6917,12 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
      *   traced_icount   — sum of per-segment `covered` (in-segment
      *                     architectural insns).  Should match the
      *                     number of CP body entries in the trace
-     *                     files, BEFORE REP fan-out expansion.
+     *                     files, BEFORE self-loop fan-out expansion.
      *
-     *   rep_fanout      — total sub-entries emitted by REP fan-out
-     *                     inside emit_body_entry, in-segment only.
+     *   rep_fanout      — total sub-entries emitted by self-loop
+     *                     fan-out (x86 REP string ops, AArch64
+     *                     FEAT_MOPS bulk copy/set) inside
+     *                     emit_body_entry, in-segment only.
      *
      * Identity the trace files satisfy:
      *   sum of cst_audit "CP insns (total)" across segments

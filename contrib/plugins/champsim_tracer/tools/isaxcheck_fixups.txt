@@ -377,8 +377,8 @@ x86_64 W-flow-added repne stosw BRANCH_REP
 
 # 2. The operand walker recovering registers Capstone dropped.  Capstone
 # 6.0.0-Alpha7 reports access == 0 on the register operands of the AVX-512
-# mask ops (kadd*, ktest*, kunpck*) and of vpermil2pd/ps, vbroadcasti128 and
-# vcvtpd2psx, so the boundary's implicit read/write sets come back EMPTY --
+# mask ops (kadd*, ktest*, kunpck*) and of vpermil2pd/ps and vcvtpd2psx, so
+# the boundary's implicit read/write sets come back EMPTY --
 # `--hex=c5c54ac0` (`kaddb %k0,%k7,%k0`) shows boundary RD{} WR{} against
 # fields RD{REG_PRED0,REG_PRED7} WR{REG_PRED0}.  The plugin's own operand
 # walker reads the operand list rather than the access flags and puts the
@@ -387,7 +387,19 @@ x86_64 W-flow-added repne stosw BRANCH_REP
 # Capstone defect (Z-access0), and WITHOUT these entries a regression in the
 # walker would cancel out against that record and the gate would stay green
 # while the trace lost the registers.  The MEM half of the same Capstone
-# defect is NOT recovered -- see the cause-4 block in isaxcheck_allow.txt.
+# defect is NOT recovered for these -- see the cause-4 block in
+# isaxcheck_allow.txt.
+#
+# vbroadcasti128 USED to be in that list and no longer is.  Its erasure hit
+# both operands, and repairing only the MEM half at the boundary made things
+# worse rather than better: the walker stopped synthesising the destination
+# once the insn looked like an ordinary load, trading loads=0/DST{REG_VEC0}
+# for loads=1/DST{-}.  Both halves are now repaired in
+# `cap_x86_is_erased_mem_load` (disas/capstone.c), the walker's recovery
+# became unnecessary, and its `W-wr-added vbroadcasti128 +REG_VEC#` line went
+# dead and was deleted with the change that retired it -- which is exactly
+# the lifecycle this file's header prescribes for a repair the boundary has
+# taken over.
 x86_64 W-rd-added kaddb +REG_PRED#
 x86_64 W-rd-added kaddd +REG_PRED#
 x86_64 W-rd-added kaddq +REG_PRED#
@@ -410,7 +422,6 @@ x86_64 W-wr-added ktestq +REG_PRED#
 x86_64 W-wr-added ktestw +REG_PRED#
 x86_64 W-wr-added kunpckdq +REG_PRED#
 x86_64 W-wr-added kunpckwd +REG_PRED#
-x86_64 W-wr-added vbroadcasti128 +REG_VEC#
 x86_64 W-wr-added vcvtpd2psx +REG_VEC#
 x86_64 W-wr-added vpermil2pd +REG_VEC#
 x86_64 W-wr-added vpermil2ps +REG_VEC#
@@ -421,3 +432,138 @@ x86_64 W-wr-added vpermil2ps +REG_VEC#
 # indirect-jump bucket in the branch taxonomy.  Reachable only once `sa`
 # is swept (JALR.HB is JALR with bit 10 set, i.e. sa = 16).
 mipsel W-flow-added jalr.hb BRANCH_INDIRECT_CALL
+
+# AArch64 FEAT_MOPS bulk-memory self-loop.  The CPY / SET families move
+# a register-sized amount of memory in one architectural instruction --
+# bounded only by the size register, so unbounded -- and the tracer fans
+# them out into a BRANCH_REP self-loop, one iteration per memory access,
+# exactly as it already does for the x86 REP-string prefix.  Capstone
+# reports them with no branch class at all, which is correct for a
+# disassembler: the loop is in the instruction's semantics, not its
+# encoding.  The reclassification is the tracer's, so it is recorded
+# here rather than allowlisted as a disagreement.
+#
+# Without the fan-out these overflow the 512-slot memop ceiling and the
+# trailing accesses are elided: one megabyte memcpy issues 65,280 memops
+# against a cap of 512.  Fanning out retires that truncation entirely --
+# see the bounded/unbounded split in docs/format.rst.
+aarch64 W-flow-added cpye BRANCH_REP
+aarch64 W-flow-added cpyen BRANCH_REP
+aarch64 W-flow-added cpyern BRANCH_REP
+aarch64 W-flow-added cpyert BRANCH_REP
+aarch64 W-flow-added cpyertn BRANCH_REP
+aarch64 W-flow-added cpyertrn BRANCH_REP
+aarch64 W-flow-added cpyertwn BRANCH_REP
+aarch64 W-flow-added cpyet BRANCH_REP
+aarch64 W-flow-added cpyetn BRANCH_REP
+aarch64 W-flow-added cpyetrn BRANCH_REP
+aarch64 W-flow-added cpyetwn BRANCH_REP
+aarch64 W-flow-added cpyewn BRANCH_REP
+aarch64 W-flow-added cpyewt BRANCH_REP
+aarch64 W-flow-added cpyewtn BRANCH_REP
+aarch64 W-flow-added cpyewtrn BRANCH_REP
+aarch64 W-flow-added cpyewtwn BRANCH_REP
+aarch64 W-flow-added cpyfe BRANCH_REP
+aarch64 W-flow-added cpyfen BRANCH_REP
+aarch64 W-flow-added cpyfern BRANCH_REP
+aarch64 W-flow-added cpyfert BRANCH_REP
+aarch64 W-flow-added cpyfertn BRANCH_REP
+aarch64 W-flow-added cpyfertrn BRANCH_REP
+aarch64 W-flow-added cpyfertwn BRANCH_REP
+aarch64 W-flow-added cpyfet BRANCH_REP
+aarch64 W-flow-added cpyfetn BRANCH_REP
+aarch64 W-flow-added cpyfetrn BRANCH_REP
+aarch64 W-flow-added cpyfetwn BRANCH_REP
+aarch64 W-flow-added cpyfewn BRANCH_REP
+aarch64 W-flow-added cpyfewt BRANCH_REP
+aarch64 W-flow-added cpyfewtn BRANCH_REP
+aarch64 W-flow-added cpyfewtrn BRANCH_REP
+aarch64 W-flow-added cpyfewtwn BRANCH_REP
+aarch64 W-flow-added cpyfm BRANCH_REP
+aarch64 W-flow-added cpyfmn BRANCH_REP
+aarch64 W-flow-added cpyfmrn BRANCH_REP
+aarch64 W-flow-added cpyfmrt BRANCH_REP
+aarch64 W-flow-added cpyfmrtn BRANCH_REP
+aarch64 W-flow-added cpyfmrtrn BRANCH_REP
+aarch64 W-flow-added cpyfmrtwn BRANCH_REP
+aarch64 W-flow-added cpyfmt BRANCH_REP
+aarch64 W-flow-added cpyfmtn BRANCH_REP
+aarch64 W-flow-added cpyfmtrn BRANCH_REP
+aarch64 W-flow-added cpyfmtwn BRANCH_REP
+aarch64 W-flow-added cpyfmwn BRANCH_REP
+aarch64 W-flow-added cpyfmwt BRANCH_REP
+aarch64 W-flow-added cpyfmwtn BRANCH_REP
+aarch64 W-flow-added cpyfmwtrn BRANCH_REP
+aarch64 W-flow-added cpyfmwtwn BRANCH_REP
+aarch64 W-flow-added cpyfp BRANCH_REP
+aarch64 W-flow-added cpyfpn BRANCH_REP
+aarch64 W-flow-added cpyfprn BRANCH_REP
+aarch64 W-flow-added cpyfprt BRANCH_REP
+aarch64 W-flow-added cpyfprtn BRANCH_REP
+aarch64 W-flow-added cpyfprtrn BRANCH_REP
+aarch64 W-flow-added cpyfprtwn BRANCH_REP
+aarch64 W-flow-added cpyfpt BRANCH_REP
+aarch64 W-flow-added cpyfptn BRANCH_REP
+aarch64 W-flow-added cpyfptrn BRANCH_REP
+aarch64 W-flow-added cpyfptwn BRANCH_REP
+aarch64 W-flow-added cpyfpwn BRANCH_REP
+aarch64 W-flow-added cpyfpwt BRANCH_REP
+aarch64 W-flow-added cpyfpwtn BRANCH_REP
+aarch64 W-flow-added cpyfpwtrn BRANCH_REP
+aarch64 W-flow-added cpyfpwtwn BRANCH_REP
+aarch64 W-flow-added cpym BRANCH_REP
+aarch64 W-flow-added cpymn BRANCH_REP
+aarch64 W-flow-added cpymrn BRANCH_REP
+aarch64 W-flow-added cpymrt BRANCH_REP
+aarch64 W-flow-added cpymrtn BRANCH_REP
+aarch64 W-flow-added cpymrtrn BRANCH_REP
+aarch64 W-flow-added cpymrtwn BRANCH_REP
+aarch64 W-flow-added cpymt BRANCH_REP
+aarch64 W-flow-added cpymtn BRANCH_REP
+aarch64 W-flow-added cpymtrn BRANCH_REP
+aarch64 W-flow-added cpymtwn BRANCH_REP
+aarch64 W-flow-added cpymwn BRANCH_REP
+aarch64 W-flow-added cpymwt BRANCH_REP
+aarch64 W-flow-added cpymwtn BRANCH_REP
+aarch64 W-flow-added cpymwtrn BRANCH_REP
+aarch64 W-flow-added cpymwtwn BRANCH_REP
+aarch64 W-flow-added cpyp BRANCH_REP
+aarch64 W-flow-added cpypn BRANCH_REP
+aarch64 W-flow-added cpyprn BRANCH_REP
+aarch64 W-flow-added cpyprt BRANCH_REP
+aarch64 W-flow-added cpyprtn BRANCH_REP
+aarch64 W-flow-added cpyprtrn BRANCH_REP
+aarch64 W-flow-added cpyprtwn BRANCH_REP
+aarch64 W-flow-added cpypt BRANCH_REP
+aarch64 W-flow-added cpyptn BRANCH_REP
+aarch64 W-flow-added cpyptrn BRANCH_REP
+aarch64 W-flow-added cpyptwn BRANCH_REP
+aarch64 W-flow-added cpypwn BRANCH_REP
+aarch64 W-flow-added cpypwt BRANCH_REP
+aarch64 W-flow-added cpypwtn BRANCH_REP
+aarch64 W-flow-added cpypwtrn BRANCH_REP
+aarch64 W-flow-added cpypwtwn BRANCH_REP
+aarch64 W-flow-added sete BRANCH_REP
+aarch64 W-flow-added seten BRANCH_REP
+aarch64 W-flow-added setet BRANCH_REP
+aarch64 W-flow-added setetn BRANCH_REP
+aarch64 W-flow-added setge BRANCH_REP
+aarch64 W-flow-added setgen BRANCH_REP
+aarch64 W-flow-added setget BRANCH_REP
+aarch64 W-flow-added setgetn BRANCH_REP
+aarch64 W-flow-added setgm BRANCH_REP
+aarch64 W-flow-added setgmn BRANCH_REP
+aarch64 W-flow-added setgmt BRANCH_REP
+aarch64 W-flow-added setgmtn BRANCH_REP
+aarch64 W-flow-added setgp BRANCH_REP
+aarch64 W-flow-added setgpn BRANCH_REP
+aarch64 W-flow-added setgpt BRANCH_REP
+aarch64 W-flow-added setgptn BRANCH_REP
+aarch64 W-flow-added setm BRANCH_REP
+aarch64 W-flow-added setmn BRANCH_REP
+aarch64 W-flow-added setmt BRANCH_REP
+aarch64 W-flow-added setmtn BRANCH_REP
+aarch64 W-flow-added setp BRANCH_REP
+aarch64 W-flow-added setpn BRANCH_REP
+aarch64 W-flow-added setpt BRANCH_REP
+aarch64 W-flow-added setptn BRANCH_REP

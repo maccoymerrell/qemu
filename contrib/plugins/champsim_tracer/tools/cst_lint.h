@@ -442,7 +442,15 @@ struct MemopBimodalityConfig {
  *     memory.  glibc routes every memcpy/memmove/memset through these on
  *     a FEAT_MOPS guest, so `memmove(dst, src, 0)` — a routine thing in
  *     a string-heavy program — reaches the wire as a zero-memop
- *     execution of an otherwise busy template.
+ *     execution of an otherwise busy template.  So does every SMALL
+ *     transfer: the prologue form may complete the whole thing on its
+ *     own, leaving the main and epilogue forms with nothing to move.
+ *     The writer's self-loop fan-out (format.rst §5.2) does not retire
+ *     this — it splits an execution into one entry PER MEMORY ACCESS,
+ *     and a transfer of nothing still executed the instruction, so it
+ *     still owes the wire exactly one zero-memop entry.  Measured: with
+ *     this exclusion lifted, a fanned-out memcpy/memset workload flags
+ *     four templates at rates of 0.0000-0.0024, all of them legitimate.
  *
  *   RISC-V  SC.W / SC.D  (AMO major opcode, funct5 = 0b00011)
  *     A store-conditional whose reservation address does not match skips

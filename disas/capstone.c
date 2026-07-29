@@ -426,6 +426,7 @@ static bool cap_x86_is_scalar_round(const char *mnem);
 static bool cap_x86_is_shadow_stack_store(const char *mnem);
 static bool cap_x86_mem_is_never_accessed(const char *mnem);
 static bool cap_x86_is_push(const char *mnem);
+static bool cap_x86_is_erased_mem_load(const char *mnem);
 
 /*
  * Extract per-operand detail for x86 into the plugin operand struct.
@@ -498,6 +499,10 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
     /* Capstone-6.0.0-Alpha7 bug: PUSH of a segment register reports its
      * operand access == 0 — see cap_x86_is_push. */
     bool push_read = cap_x86_is_push(insn->mnemonic);
+    /* Capstone-6.0.0-Alpha7 bug: VBROADCASTI128 reports access == 0 on
+     * both operands, erasing its memory source rather than mis-pointing
+     * it — see cap_x86_is_erased_mem_load. */
+    bool erased_load = cap_x86_is_erased_mem_load(insn->mnemonic);
 
     for (uint8_t i = 0; i < n; i++) {
         const cs_x86_op *cop = &x86->operands[i];
@@ -532,6 +537,12 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
             if ((string_op || shstk_store || push_read) &&
                 op->access == 0) {
                 op->access = QEMU_PLUGIN_OP_ACC_READ;
+            }
+            /* VBROADCASTI128's sole register operand is its destination
+             * (the source is the memory operand); Capstone erases its
+             * WRITE along with the memory access. */
+            if (erased_load && op->access == 0) {
+                op->access = QEMU_PLUGIN_OP_ACC_WRITE;
             }
             break;
         case X86_OP_IMM:
@@ -596,6 +607,12 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
             if (mem_unused) {
                 op->access = 0;
             }
+            /* VBROADCASTI128's memory source came back with no access
+             * at all; without this the load lane and the address
+             * dependency are both dropped. */
+            if (erased_load && op->access == 0) {
+                op->access = QEMU_PLUGIN_OP_ACC_READ;
+            }
             break;
         default:
             op->type = QEMU_PLUGIN_OP_INVALID;
@@ -659,11 +676,44 @@ static bool cap_decode_aarch64_vas(unsigned vas,
  * the store destination as a phantom load and never emits the
  * store-data dependency on the source vector register.
  *
+ * The VEX LANE extracts VEXTRACTF128 / VEXTRACTI128 have the same
+ * defect and are matched here too.  Their EVEX relatives
+ * VEXTRACT{F,I}{32X4,64X2,32X8,64X4} are reported CORRECTLY by this
+ * Capstone (checked: `62f37d28190001` = `vextractf32x4 $1,%ymm0,(%rax)`
+ * already shows MEM WRITE); they fall inside the stem match anyway and
+ * the repair is a no-op on them, which is safe for the same reason the
+ * other unconditional repairs in this file are -- it sets the access the
+ * architecture specifies, so it cannot disturb an encoding Capstone
+ * already gets right.  Ground truth is QEMU's own translator rather than
+ * plausibility:
+ * target/i386/tcg/decode-new.c.inc gives 0F3A 19 / 39 as
+ * `X86_OP_ENTRY3(VEXTRACTx128, W,dq, V,qq, I,b, ...)` -- operand 0, the
+ * r/m, is the DESTINATION -- and emit.c.inc's gen_VEXTRACTx128() takes
+ * the `decode->op[0].has_ea` arm to gen_sto_env_A0(), an unambiguous
+ * store.  Matching on the stem cannot pick up a load: every x86
+ * mnemonic stemmed `extract` extracts INTO its r/m operand, the insert
+ * direction is spelled VINSERT*, and SSE4a's EXTRQ has no `extract`
+ * stem.
+ *
+ * VCVTPS2PH joins them for the same structural reason and NOT by family
+ * resemblance: decode-new.c.inc has 0F3A 1D as
+ * `X86_OP_ENTRY3(VCVTPS2PH, W,xh, V,x, I,b, ...)`, r/m destination
+ * again, so its memory form is a pure store.  It is matched by exact
+ * spelling because its LOAD counterpart VCVTPH2PS (0F38 13,
+ * `X86_OP_ENTRY2(VCVTPH2PS, V,x, W,xh, ...)`) differs only in the
+ * transposed digits and IS reported correctly by Capstone -- treating
+ * `cvt..ph..` as a family would invert it.
+ *
  * Detect by mnemonic and, for the MEM operand, force WRITE access.
+ * Unconditional for this set: an extract's -- or VCVTPS2PH's -- sole
+ * memory operand is always the r/m destination, never a source.
  *
  * Revisit / remove when Capstone is bumped past 6.0.0-Alpha7; verify
  * with `cstool -d x64 660f3a160001` (bytes `66 0f 3a 16 00 01`,
- * `pextrd $1,%xmm0,(%rax)`) -- the MEM operand must show WRITE.  Note
+ * `pextrd $1,%xmm0,(%rax)`), `cstool -d x64 c4037d190000`
+ * (`vextractf128 $0,%ymm8,(%r8)`) and `cstool -d x64 c4e37d1d0000`
+ * (`vcvtps2ph $0,%ymm0,(%rax)`) -- the MEM operand must show WRITE in
+ * all three.  Note
  * `cstool` here means one built from `subprojects/capstone`: a system
  * package `cstool` is routinely a different Capstone major version
  * (this host's is v5.0.1, which cannot reproduce Alpha7-specific
@@ -678,7 +728,65 @@ static bool cap_x86_is_extract_store(const char *mnem)
     if (!mnem || !mnem[0]) return false;
     if (mnem[0] == 'v') mnem++;            /* VEX/EVEX prefix */
     return g_str_has_prefix(mnem, "pextr") ||
-           g_str_equal(mnem, "extractps");
+           g_str_has_prefix(mnem, "extract") ||
+           g_str_equal(mnem, "cvtps2ph");
+}
+
+/*
+ * Capstone 6.0.0-Alpha7 x86 access-flag bug workaround.
+ *
+ * A stronger form of the flag defects above: VBROADCASTI128 comes back
+ * with access == 0 on BOTH its operands, so the memory operand does not
+ * point the wrong way — it vanishes.  The operand walker derives its
+ * load lane from the access flag, so the trace records loads=0
+ * stores=0 for an instruction whose only job is to read 16 bytes of
+ * memory and splat them, and the effective address never appears.
+ *
+ * Ground truth from QEMU's translator: target/i386/tcg/decode-new.c.inc
+ * gives 0F38 5A as `X86_OP_ENTRY3(VBROADCASTx128, V,qq, None,None,
+ * WM,dq, ...)` — destination V is the vector register, source WM is
+ * memory.  There is no register-source encoding of VBROADCASTI128 at
+ * all; the memory form is the only form.
+ *
+ * MATCHED BY EXACT SPELLING, and that is the whole point.  This is NOT
+ * a `vbroadcast*` family defect: the sibling encodings were checked one
+ * by one against this same Capstone and VBROADCASTSS (0F38 18),
+ * VBROADCASTSD (19), VBROADCASTF128 (1A), VPBROADCASTD (58),
+ * VPBROADCASTQ (59), VPBROADCASTB (78) and VPBROADCASTW (79) all report
+ * MEM READ and REG WRITE CORRECTLY.  VBROADCASTF128 in particular is
+ * the exact 128-bit twin of the broken one, one opcode byte away and
+ * correct — so a stem match on `vbroadcast` would be a repair applied
+ * to seven encodings that do not need it, which is how a benign
+ * convention difference and a real defect get conflated.
+ *
+ * BOTH OPERANDS ARE REPAIRED, and repairing only one is worse than
+ * repairing neither -- this was measured, not assumed.  The plugin's
+ * operand walker used to recover the lost vector destination on its own
+ * (asserted as `x86_64 W-wr-added vbroadcasti128 +REG_VEC#` in
+ * isaxcheck_fixups.txt), and the tempting minimal change was to fix the
+ * MEM half only and leave that recovery in place.  It does not survive
+ * contact: with MEM alone marked READ the walker reclassifies the insn
+ * as an ordinary load and stops synthesising the destination, so the
+ * fields layer goes from `loads=0 stores=0 DST{REG_VEC0}` to `loads=1
+ * stores=0 DST{-}` -- one defect traded for another.  Marking the
+ * register WRITE as well gives `loads=1 DST{REG_VEC0}`, which is the
+ * instruction.  The walker's recovery correspondingly becomes dead and
+ * its fixups line is removed in the same change, which is the intended
+ * lifecycle for a repair the boundary has taken over.
+ *
+ * Both repairs are gated on `access == 0`, so an encoding Capstone
+ * reports correctly is never touched.
+ *
+ * Revisit / remove when Capstone is bumped past 6.0.0-Alpha7; verify
+ * with `cstool -d x64 c4e27d5a00` (`vbroadcasti128 (%rax),%ymm0`) --
+ * the MEM operand must show READ and the REG operand WRITE.  Use a
+ * `cstool` built from `subprojects/capstone`, or run
+ * `capstone_workaround_probe`; see docs/troubleshooting.rst.
+ */
+static bool cap_x86_is_erased_mem_load(const char *mnem)
+{
+    if (!mnem || !mnem[0]) return false;
+    return g_str_equal(mnem, "vbroadcasti128");
 }
 
 /*
@@ -1064,11 +1172,57 @@ static bool cap_x86_is_push(const char *mnem)
  * READ-only (and no register written) while MOVAPS / MOVDQU report
  * it WRITE.  This predicate only identifies family membership; the
  * load/store disambiguation is done by the caller from the operand
- * access pattern (operand order is unusable — QEMU drives Capstone
- * in AT&T syntax, which reverses the detail operand array).  Without
- * the correction the operand walker models a vector store as a
- * phantom load (laddr/ld block instead of sdata/saddr) — the
- * dropped-store / wrong-latency footgun.
+ * ACCESS PATTERN: a member with both a MEM and a REG operand where no
+ * operand carries WRITE is the store form whose MEM lost its flag,
+ * because a real load always has its destination register marked
+ * WRITE.  Without the correction the operand walker models a vector
+ * store as a phantom load (laddr/ld block instead of sdata/saddr) —
+ * the dropped-store / wrong-latency footgun.
+ *
+ * The access pattern is used in preference to operand ORDER, which
+ * would also separate the two: QEMU drives Capstone in AT&T syntax
+ * (cs_option CS_OPT_SYNTAX_ATT above), and the detail operand array
+ * follows the printed AT&T order — reversed with respect to the Intel
+ * manuals, so the DESTINATION is the last operand, and a load's MEM is
+ * operand 0 while a store's MEM is the final one (`488b00` = `movq
+ * (%rax),%rax` gives [0]MEM [1]REG, `488900` = `movq %rax,(%rax)`
+ * gives [0]REG [1]MEM).  The access test is preferred because it is
+ * self-retiring: the moment Capstone marks the store's MEM operand
+ * WRITE, `mv_any_write` becomes true and the repair stops firing on
+ * its own, which is what makes the dead-rule half of
+ * `isaxcheck --fixups` able to see the workaround become unnecessary.
+ *
+ * MEMBERSHIP EXTENDS BEYOND `mov`, to the two other move families whose
+ * mnemonic is identical in both directions and whose store form has the
+ * same lost WRITE:
+ *
+ *   AVX/AVX2 masked moves — VMASKMOV{PS,PD} and VPMASKMOV{D,Q}.
+ *   target/i386/tcg/decode-new.c.inc separates them by opcode, not by
+ *   name: 0F38 2E/2F/8E are `X86_OP_ENTRY3(VMASKMOVPS_st, M,x, V,x,
+ *   H,x, ...)` and friends, whose operand 0 is `M` — memory ONLY, a
+ *   store — while 0F38 2C/2D/8C are `X86_OP_ENTRY3(VMASKMOVPS, V,x,
+ *   H,x, WM,x, ...)`, register destination and memory source.  Capstone
+ *   spells both `vmaskmovps`, so nothing but the access pattern can
+ *   tell them apart, and it does: the load form marks its destination
+ *   register WRITE, the store form marks nothing WRITE at all.
+ *
+ *   AVX-512 mask-register moves — KMOV{B,W,D,Q}.  Opcode 0F 91 stores
+ *   a mask register to m8/16/32/64 and 0F 90 loads one; both print as
+ *   `kmovw` and only the load marks its %k destination WRITE.  These
+ *   begin `k`, not `mov` after the `v` strip, which is why the original
+ *   predicate missed them.  NOTE these are decode-only coverage: QEMU's
+ *   i386 TCG front end implements no AVX-512 and no EVEX, so a KMOV can
+ *   never be translated and never reaches a trace — the entry keeps the
+ *   boundary honest for the offline decoders and for a future front
+ *   end, and is not load-bearing for any trace produced today.
+ *
+ * MASKMOVDQU / MASKMOVQ / VMASKMOVDQU (0F F7) also match the `maskmov`
+ * stem -- those three plus the four above are the whole of Capstone's
+ * `*maskmov*` mnemonic set -- and that is harmless rather than lucky:
+ * they store through an IMPLICIT (%rdi) and Capstone reports two REG
+ * operands and no MEM at all, so the caller's `mv_has_mem` test is false
+ * and no repair fires.  Their missing implicit store is a separate
+ * defect, not this one.
  *
  * Revisit / remove when Capstone is bumped past 6.0.0; verify with
  * `cstool -d x64 c5fd7f00` (bytes `c5 fd 7f 00`, `vmovdqa
@@ -1082,7 +1236,17 @@ static bool cap_x86_is_push(const char *mnem)
 static bool cap_x86_is_move_family(const char *mnem)
 {
     if (!mnem || !mnem[0]) return false;
+    /* AVX-512 mask-register moves are spelled `kmov*`, before any `v`
+     * strip could apply. */
+    if (g_str_has_prefix(mnem, "kmov")) return true;
     if (mnem[0] == 'v') mnem++;            /* VEX/EVEX prefix */
+    /* AVX/AVX2 masked moves: `maskmov{ps,pd}` and `pmaskmov{d,q}` after
+     * the strip.  MASKMOVDQU / MASKMOVQ land here too and are inert —
+     * they carry no MEM operand for the caller's test to act on. */
+    if (g_str_has_prefix(mnem, "maskmov") ||
+        g_str_has_prefix(mnem, "pmaskmov")) {
+        return true;
+    }
     if (!g_str_has_prefix(mnem, "mov")) return false;
     /* Sign/zero-extending moves never take a MEM operand 0 (their
      * destination is a register); excluding them keeps the rule
@@ -2069,12 +2233,28 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
  * the two-operand `madd $rs, $rt` / `msub` accumulate into the implicit
  * HI:LO pair rather than into an operand, so their first register
  * operand is a pure source.
+ *
+ * Every member promotes by POSITION -- the first register operand -- and
+ * that is checked, not assumed: for each stem below Capstone prints the
+ * tied destination first, which is what makes the loop's `break` land on
+ * it.  MTHC1 is the one member of the wider family that could not be
+ * carried here for exactly that reason; it has its own access-keyed
+ * correction further down.
+ *
+ * `precr_sra` is spelled as a stem rather than as two names because it
+ * has to be one: it must cover `precr_sra.ph.w` and `precr_sra_r.ph.w`
+ * while NOT covering the five neighbouring DSP `precr*` forms
+ * (precr.qb.ph, precrq.qb.ph, precrq.ph.w, precrq_rs.ph.w,
+ * precrqu_s.qb.ph), none of which reads its destination -- QEMU's
+ * translator passes cpu_gpr[ret] to their helpers as an output only.
  */
 static bool cap_mips_is_tied_dst(const char *mnem)
 {
     static const char *const stems[] = {
         /* scalar and DSP bit-field insert / concatenate */
-        "ins", "dins", "append", "prepend", "insv",
+        "ins", "dins", "append", "prepend", "insv", "balign",
+        /* DSP precision-reduce that merges the destination's own half */
+        "precr_sra",
         /* MSA bit insert / select */
         "binsl", "binsr", "bmnz", "bmz", "bsel",
         /* MSA lane insert / shift-and-insert / shuffle */
@@ -3213,12 +3393,31 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
          * overwrite: two INS into the same register look WAW when the
          * second really carries a RAW edge from the first.
          *
+         * The DSP members `BALIGN rt, rs, bp` and
+         * `PRECR_SRA[_R].PH.W rt, rs, sa` are the same shape and were
+         * verified against QEMU's own translator rather than against the
+         * other decoder: OPC_BALIGN emits
+         * `tcg_gen_shli_tl(cpu_gpr[rt], cpu_gpr[rt], 8 * sa)` and ORs the
+         * shifted-down $rs into it, and OPC_PRECR_SRA[_R]_PH_W passes
+         * cpu_gpr[ret] to its helper as the `rt` INPUT as well as the
+         * result (`helper_precr_sra_ph_w` builds its low halfword out of
+         * `(int32_t)rt >> sa`).  Both keep half of the destination, so
+         * the destination is an input; Capstone reported both WRITE-only
+         * and the architectural read was deleted all the way through to
+         * the recorded InsnFields.
+         *
          * Revisit / remove when Capstone is bumped past 6.0.0; verify with
          * `cstool -d mips32r2 0459287d` (bytes `04 59 28 7d`,
          * `ins $t0,$t1,4,8`) -- fixed, $t0 (operands[0]) must show
-         * READ|WRITE instead of WRITE-only.  Use a `cstool` built from
-         * `subprojects/capstone`, not a system package, or run
-         * `capstone_workaround_probe`; see docs/troubleshooting.rst.
+         * READ|WRITE instead of WRITE-only.  The two DSP members need
+         * their own encodings, because a family member can be fixed
+         * alone: `isaxcheck --isa=mipsel --hex=311c017c`
+         * (`balign $at, $zero, 3`) and `--hex=9117817c`
+         * (`precr_sra.ph.w $at, $a0, 2`) must each show $at in the
+         * boundary's `RD{}` set, matching the `llvm` line above it.  Use a
+         * `cstool` built from `subprojects/capstone`, not a system
+         * package, or run `capstone_workaround_probe`; see
+         * docs/troubleshooting.rst.
          */
         if (cap_mips_is_tied_dst(insn->mnemonic)) {
             for (uint8_t i = 0; i < n; i++) {

@@ -83,6 +83,30 @@
  * handling, register-class mapping — which is where every defect found so far
  * has lived.  x86's tables are hand-maintained and independent.
  *
+ * SYSTEM-REGISTER SELECTORS ENCODED AS IMMEDIATES ARE STRUCTURALLY OUT OF
+ * REACH, and RISC-V Zicsr is the case that cannot be argued around.  LLVM's
+ * description of every `csr*` instruction carries the CSR as the 12-bit
+ * immediate the encoding spells and gives it no register operand at all, so
+ * `sys` — the class the tracer records the access in — can NEVER appear on
+ * LLVM's side for any Zicsr instruction.  `--hex=73700110`
+ * (`csrci sstatus, 2`) is the whole demonstration: the boundary reports
+ * RD{sys} WR{sys} and LLVM reports RD{-} WR{r0}.  No normalisation closes
+ * that; a fold has to have something to fold onto, and there is nothing.
+ * AArch64 MRS/MSR is the same shape in the same way.
+ *
+ * This is stated here rather than papered over in the allowlist because the
+ * `riscv64 R-*-phantom csr* +sys` entries there are NOT records of a checked
+ * agreement — they are records of a comparison that does not happen, and a
+ * reader who mistakes one for the other would think the CSR dependency was
+ * vouched for by this tool.  It is not.  What DOES vouch for it is
+ * `implicit_audit.py`, whose riscv64 rows come from the Sail model rather
+ * than from a second disassembler and therefore do not need LLVM to name a
+ * register: 22 CSR rows there assert the access at the REG_SYS / REG_FCSR /
+ * REG_VCTRL granularity the trace actually expresses, and they fail if the
+ * boundary stops reporting it.  The division of labour is the point — when
+ * an oracle structurally cannot answer, the answer belongs to the other
+ * instrument, not to an allowlist line.
+ *
  * SUBTARGET MATCHING IS LOAD-BEARING — AND SELF-DETECTING
  * -------------------------------------------------------
  * The Capstone mode must be the one the tracer selects and the LLVM feature
@@ -534,7 +558,25 @@ static std::string norm_x86(std::string r) {
     if (r.size() > 3 && r.compare(0, 3, "xmm") == 0) return "v" + r.substr(3);
     if (r.size() > 3 && r.compare(0, 3, "ymm") == 0) return "v" + r.substr(3);
     if (r.size() > 3 && r.compare(0, 3, "zmm") == 0) return "v" + r.substr(3);
-    if (r == "eflags" || r == "flags" || r == "rflags") return "flags";
+    // DF is a BIT of RFLAGS, and LLVM models it as a register in its own
+    // right so that the string instructions can name the one flag they
+    // read without claiming to read the arithmetic flags too.  Capstone
+    // names the whole word, and the tracer has one REG_FLAGS slot that
+    // both land in, so the two decoders describe the same dependency in
+    // different vocabularies.
+    //
+    // Folding it here is what makes the comparison HAPPEN.  Left apart,
+    // `df` is a token the boundary can never produce: every string
+    // instruction reports a permanent `R-rd-missing <mnem> +df` that says
+    // only "the two decoders spell it differently", and — the part that
+    // matters — the boundary could LOSE its flags read entirely without
+    // changing that signature, because `df` would still be the LLVM-only
+    // token and the disappearance of `flags` from the Capstone side is not
+    // what the bucket is keyed on.  Folded, a lost flags read on a string
+    // instruction surfaces as `R-rd-missing <mnem> +flags`, which nothing
+    // allowlists.
+    if (r == "eflags" || r == "flags" || r == "rflags" || r == "df")
+        return "flags";
     // Any segment register is an address input via its base; which one it is
     // does not change the dependency, and the plugin folds them all onto the
     // same REG_SEG bank.  Capstone surfaces the override only as the MEM
@@ -1672,12 +1714,36 @@ static void sweep_mips(unsigned shard, unsigned nshard)
 // fill -- 1111 (the "no third operand" spelling that some forms require
 // and others reject), and two ordinary register values.
 //
-// Cost: 1,966,080 -> 171,048,960 encodings, 0.49 s -> 11.9 s at --jobs=16,
-// which is under what the aarch64 sweep already costs.  Measured against the
-// 47,512 distinct encodings a traced x86 population actually retires (mcf
-// and perlbench, user and system, 1.64 G dynamic instructions), the share
-// lying inside the swept space moves from 62.76% to 99.60% of distinct
-// encodings, and from 58.82% to 99.74% weighted by dynamic execution count.
+// THE SIB BYTE IS THE FOURTH, and it was the largest pin left after those
+// three closed.  It used to be whatever byte the tail happened to spell --
+// `8d` on the SIB tail, `00` / `4d` / `44` on the others -- so SIB.index and
+// SIB.base, the two registers a SIB address is computed from, were sampled
+// at four points out of sixty-four.  Measured against the traced population:
+// 4,240 distinct encodings (8.92%) and 201,289,233 dynamic (12.25%) carry a
+// SIB byte, and 99.13% of those distinct and 93.04% of that weight used a
+// SIB byte other than the two the sweep had dedicated tails for (`8d` and
+// `00`).  index x base is now enumerated
+// in full at every mod != 11 tail whenever the swept rm is 100, which is the
+// only place a SIB byte exists.  SIB.scale is taken one value per tail
+// (see tail_scale below) so that all four of its values are emitted without
+// quadrupling the population to measure a field that changes no register,
+// no memory direction and no branch class.
+//
+// Sweeping it is also what put `%riz` under the comparison.  Capstone
+// renders the no-index, no-base form as `(, %riz, 8)` and names `riz` in its
+// register set; a pseudo-register reaching the dependency model would be a
+// phantom edge in every trace.  It does not -- `--hex=8004e50000000011`
+// gives boundary RD{riz}, LLVM RD{riz} and fields SRC{-} -- but until this
+// dimension moved, nothing here could have said so either way.
+//
+// Cost: 1,966,080 -> 171,048,960 -> 1,248,657,408 encodings, 0.49 s ->
+// 11.9 s -> 85.6 s at --jobs=16.  Measured against the 47,512 distinct
+// encodings a traced x86 population actually retires (mcf and perlbench,
+// user and system, 1.64 G dynamic instructions), the share lying inside the
+// swept space moves from 62.76% to 99.60% of distinct encodings, and from
+// 58.82% to 99.74% weighted by dynamic execution count; the SIB dimension is
+// not counted in those figures, because the membership definition they
+// inherit constrains only the prefix and ModRM.mod.
 //
 // WHAT IS STILL PINNED.  A blind spot is not a smaller sweep, it is an
 // unmeasured one, so each of these carries its measurement against that
@@ -1693,14 +1759,13 @@ static void sweep_mips(unsigned shard, unsigned nshard)
 //     the fill does not name.  VEX2's second byte is enumerated whole, so
 //     no VEX2 encoding is outside for this reason.
 //
-//   - The SIB byte is pinned to two values (`8d` on the SIB tail, `00` on
-//     the mem tail), so SIB.scale and SIB.index are sampled, not swept.
-//     This is the largest remaining pin and it is NOT counted in the 98.07%
-//     above, because the membership definition that figure inherits
-//     constrains only the prefix and ModRM.mod.  Measured separately:
-//     4,240 distinct encodings (8.92%) and 201,289,233 dynamic (12.25%)
-//     carry a SIB byte, and of those 99.13% of distinct and 93.04% of
-//     dynamic weight use a SIB byte that is neither `8d` nor `00`.
+//   - SIB.scale is one value per tail rather than crossed with index and
+//     base: all four values are emitted, but never against every mod.  The
+//     residual is exactly the scale x mod cells that combination misses, and
+//     it carries no register, memory or branch content for the three
+//     comparisons this gate makes -- the argument for sweeping it at all is
+//     that a decoder's TABLES could gate on it, and one appearance of each
+//     value is what tests that.
 //
 //   - EVEX (`62`, AVX-512) and XOP (`8f`) are not emitted at all.  The
 //     reference population contains zero encodings of either, so this
@@ -1758,19 +1823,61 @@ static void sweep_x86(unsigned shard, unsigned nshard)
         {0x4d,0x20, 0x11,0x22,0x33,0x44},               /* mod=01 disp8    */
         {0x8d,0x44,0x33,0x22,0x11},                     /* mod=10 disp32   */
     };
+    /*
+     * SIB.scale, one value per tail.  Scale is the one SIB field that
+     * changes no register, no memory direction and no branch class -- it
+     * multiplies the index and nothing this gate compares can see the
+     * product -- so crossing it with the other 63 SIB bits would multiply
+     * the population by four to measure nothing.  What it CAN do is make
+     * an encoding invalid in one decoder's tables and not the other's, and
+     * that is what the per-tail assignment covers: every one of the four
+     * values is emitted, each crossed with the complete index x base
+     * square, and only the scale x mod cross is left out.
+     */
+    static const unsigned char tail_scale[5] = {
+        0x00,   /* mod=00        -> scale 1 */
+        0x00,   /* mod=11: no SIB exists, the value is never used */
+        0xc0,   /* mod=00 + SIB  -> scale 8 */
+        0x40,   /* mod=01 disp8  -> scale 2 */
+        0x80,   /* mod=10 disp32 -> scale 4 */
+    };
     unsigned idx = 0;
     uint8_t buf[32];
 
     /* Emit one encoding: @head is the already-built prefix/escape/opcode
-     * run, @t picks the tail, @reg and @rm replace the ModRM fields. */
+     * run, @t picks the tail, @reg and @rm replace the ModRM fields, and
+     * @sib -- when not negative -- replaces SIB.index and SIB.base in the
+     * byte that follows ModRM.  Only rm = 100 at mod != 11 puts a SIB
+     * there; at any other rm that byte is displacement or immediate and is
+     * left as the tail spells it. */
     auto emit = [&](const uint8_t *head, size_t nh, unsigned t,
-                    unsigned reg, unsigned rm) {
+                    unsigned reg, unsigned rm, int sib) {
         if ((idx++ % nshard) != shard) return;
         memcpy(buf, head, nh);
         memcpy(buf + nh, tails[t], 13);
         buf[nh] = (uint8_t)((buf[nh] & ~0x3fu) | (reg << 3) | rm);
+        if (sib >= 0) {
+            buf[nh + 1] = (uint8_t)(tail_scale[t] | (unsigned)sib);
+        }
         total_tried++;
         compare(buf, nh + 13);
+    };
+
+    /* Every tail x ModRM.reg x ModRM.rm for one head, with the SIB byte
+     * enumerated wherever the rm just written actually creates one. */
+    auto emit_tails = [&](const uint8_t *head, size_t nh) {
+        for (int t = 0; t < 5; t++) {
+            bool has_sib_form = (tails[t][0] & 0xc0) != 0xc0;
+            for (unsigned reg = 0; reg < 8; reg++)
+                for (unsigned rm = 0; rm < 8; rm++) {
+                    if (rm == 4 && has_sib_form) {
+                        for (unsigned s = 0; s < 64; s++)
+                            emit(head, nh, t, reg, rm, (int)s);
+                    } else {
+                        emit(head, nh, t, reg, rm, -1);
+                    }
+                }
+        }
     };
 
     /* Legacy x REX x escape x opcode x tail x ModRM.reg x ModRM.rm. */
@@ -1785,10 +1892,7 @@ static void sweep_x86(unsigned shard, unsigned nshard)
             if (esc == 2) head[nh++] = 0x38;
             if (esc == 3) head[nh++] = 0x3a;
             head[nh++] = (uint8_t)op;
-            for (int t = 0; t < 5; t++)
-              for (unsigned reg = 0; reg < 8; reg++)
-                for (unsigned rm = 0; rm < 8; rm++)
-                  emit(head, nh, t, reg, rm);
+            emit_tails(head, nh);
           }
 
     /* VEX 2-byte: c5 <R vvvv L pp> <opcode> <ModRM...>.  The second byte
@@ -1799,10 +1903,7 @@ static void sweep_x86(unsigned shard, unsigned nshard)
     for (unsigned b1 = 0; b1 < 256; b1++)
       for (unsigned op = 0; op < 256; op++) {
         uint8_t head[4] = {0xc5, (uint8_t)b1, (uint8_t)op};
-        for (int t = 0; t < 5; t++)
-          for (unsigned reg = 0; reg < 8; reg++)
-            for (unsigned rm = 0; rm < 8; rm++)
-              emit(head, 3, t, reg, rm);
+        emit_tails(head, 3);
       }
 
     /* VEX 3-byte: c4 <RXB mmmmm> <W vvvv L pp> <opcode> <ModRM...>.
@@ -1821,10 +1922,7 @@ static void sweep_x86(unsigned shard, unsigned nshard)
                       0xc4, (uint8_t)((rxb << 5) | mm),
                       (uint8_t)((w << 7) | (vvvv_fill[vi] << 3) | (l << 2) | pp),
                       (uint8_t)op };
-                  for (int t = 0; t < 5; t++)
-                    for (unsigned reg = 0; reg < 8; reg++)
-                      for (unsigned rm = 0; rm < 8; rm++)
-                        emit(head, 4, t, reg, rm);
+                  emit_tails(head, 4);
                 }
 }
 

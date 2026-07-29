@@ -109,6 +109,52 @@ bool StillBuggy_MoveStore(const cs_insn &insn)
     }
     return true;
 }
+bool StillBuggy_VexLaneExtractStore(const cs_insn &insn)
+{
+    /* vextractf128 $1,%ymm0,(%rax): MEM (operand 2) is the r/m
+     * DESTINATION and must be WRITE. Bug: READ. */
+    return !(OpAccess_x86(insn, 2) & CS_AC_WRITE);
+}
+bool StillBuggy_Cvtps2phStore(const cs_insn &insn)
+{
+    /* vcvtps2ph $0,%ymm0,(%rax): MEM (operand 2) is the r/m DESTINATION
+     * and must be WRITE. Bug: READ.  Its load counterpart VCVTPH2PS is
+     * reported correctly, which is why the workaround matches this
+     * spelling exactly rather than a `cvt` family. */
+    return !(OpAccess_x86(insn, 2) & CS_AC_WRITE);
+}
+bool StillBuggy_MaskMovStore(const cs_insn &insn)
+{
+    /* vmaskmovps %xmm0,%xmm0,(%rax) is the STORE form (0F38 2E); the
+     * load form (2C) prints identically.  Bug signature is the same as
+     * the MOV family's: no operand carries WRITE at all, where the load
+     * form leaves its destination register WRITE. */
+    for (uint8_t i = 0; i < insn.detail->x86.op_count; i++) {
+        if (OpAccess_x86(insn, i) & CS_AC_WRITE) {
+            return false;
+        }
+    }
+    return true;
+}
+bool StillBuggy_KmovStore(const cs_insn &insn)
+{
+    /* kmovw %k0,(%rax) is the STORE form (0F 91); the load form (0F 90)
+     * prints identically and does mark its %k destination WRITE. */
+    for (uint8_t i = 0; i < insn.detail->x86.op_count; i++) {
+        if (OpAccess_x86(insn, i) & CS_AC_WRITE) {
+            return false;
+        }
+    }
+    return true;
+}
+bool StillBuggy_BroadcastI128Erased(const cs_insn &insn)
+{
+    /* vbroadcasti128 (%rax),%ymm0: MEM (operand 0) must be READ and the
+     * register (operand 1) WRITE. Bug: both access == 0.  The f128 twin
+     * one opcode byte away is correct, so this checks the erasure, not
+     * a family convention. */
+    return OpAccess_x86(insn, 0) == 0 && OpAccess_x86(insn, 1) == 0;
+}
 bool StillBuggy_TestA9_32(const cs_insn &insn)
 {
     /* testl $0x200000,%eax: operand 1 (%eax) must be plain READ. Bug: RW. */
@@ -202,10 +248,42 @@ const std::vector<Case> &Cases()
          "PEXTRD store form: MEM destination reported READ, not WRITE",
          CS_ARCH_X86, CS_MODE_64, {0x66, 0x0f, 0x3a, 0x16, 0x00, 0x01},
          StillBuggy_PextrStore},
+        {"cap_x86_is_extract_store (VEXTRACTF128)", "cap_fill_x86_operands",
+         "6.0.0-Alpha7", "VEX lane extract to memory: MEM destination "
+         "reported READ, not WRITE",
+         CS_ARCH_X86, CS_MODE_64, {0xc4, 0xe3, 0x7d, 0x19, 0x00, 0x01},
+         StillBuggy_VexLaneExtractStore},
+        {"cap_x86_is_extract_store (VCVTPS2PH)", "cap_fill_x86_operands",
+         "6.0.0-Alpha7", "F16C down-convert to memory: r/m destination "
+         "reported READ, not WRITE (VCVTPH2PS load form is correct)",
+         CS_ARCH_X86, CS_MODE_64, {0xc4, 0xe3, 0x7d, 0x1d, 0x00, 0x00},
+         StillBuggy_Cvtps2phStore},
         {"cap_x86_is_move_family", "cap_fill_x86_operands", "6.0.0",
          "VMOVDQA store form: no operand carries WRITE at all",
          CS_ARCH_X86, CS_MODE_64, {0xc5, 0xfd, 0x7f, 0x00},
          StillBuggy_MoveStore},
+        {"cap_x86_is_move_family (VMASKMOVPS store)",
+         "cap_fill_x86_operands", "6.0.0-Alpha7",
+         "AVX masked store (0F38 2E): no operand carries WRITE at all, "
+         "where the identically-printed load form (2C) marks its "
+         "destination register WRITE",
+         CS_ARCH_X86, CS_MODE_64, {0xc4, 0xe2, 0x79, 0x2e, 0x00},
+         StillBuggy_MaskMovStore},
+        {"cap_x86_is_move_family (KMOVW store)", "cap_fill_x86_operands",
+         "6.0.0-Alpha7",
+         "AVX-512 mask store (0F 91): no operand carries WRITE at all, "
+         "where the identically-printed load form (0F 90) marks its %k "
+         "destination WRITE.  Decode-only: QEMU's i386 TCG front end "
+         "implements no EVEX, so this never reaches a trace",
+         CS_ARCH_X86, CS_MODE_64, {0xc5, 0xf8, 0x91, 0x00},
+         StillBuggy_KmovStore},
+        {"cap_x86_is_erased_mem_load", "cap_fill_x86_operands",
+         "6.0.0-Alpha7",
+         "VBROADCASTI128: access == 0 on BOTH operands, erasing the "
+         "memory source (VBROADCASTF128, one opcode byte away, is "
+         "reported correctly)",
+         CS_ARCH_X86, CS_MODE_64, {0xc4, 0xe2, 0x7d, 0x5a, 0x00},
+         StillBuggy_BroadcastI128Erased},
         {"cap_x86_is_test (phantom write)", "cap_fill_x86_operands",
          "6.0.0-Alpha7", "TEST opcode A9, 32-bit operand size: %eax "
          "reported READ|WRITE instead of plain READ",

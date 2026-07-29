@@ -245,6 +245,16 @@ ACCEPT = {
         "vxsat": {"vxsat", "fcsr"},
         "vcsr": {"vcsr", "fcsr"},
         "vlenb": {"vlenb", "sys"},
+        # `cycle` is the unprivileged cycle counter read by `rdcycle`, which
+        # is `csrrs rd, cycle, x0`.  It reaches the boundary the same way
+        # vlenb does -- as a system-register operand, not a member of the
+        # ISA's register file -- and lands in the same REG_SYS class, so the
+        # same class-vs-name rule applies.  Without this line the row reads
+        # as MISS-BOTH, which claims neither decoder reports the CSR: the
+        # boundary does (`--hex=732500c0` gives RD{sys}), it just reports the
+        # class rather than the name.  Its siblings `time` and `instret`
+        # join the same way if a probe for them is ever derived.
+        "cycle": {"cycle", "sys"},
         "fcsr": {"fcsr"},
         "fflags": {"fflags", "fcsr"},
         "frm": {"frm", "fcsr"},

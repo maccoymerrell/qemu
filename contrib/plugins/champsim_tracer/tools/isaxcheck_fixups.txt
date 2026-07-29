@@ -377,8 +377,8 @@ x86_64 W-flow-added repne stosw BRANCH_REP
 
 # 2. The operand walker recovering registers Capstone dropped.  Capstone
 # 6.0.0-Alpha7 reports access == 0 on the register operands of the AVX-512
-# mask ops (kadd*, ktest*, kunpck*) and of vpermil2pd/ps and vcvtpd2psx, so
-# the boundary's implicit read/write sets come back EMPTY --
+# mask ops (kadd*, ktest*, kunpck*) and of the vpermil2pd/ps VEX.L=1 forms,
+# so the boundary's implicit read/write sets come back EMPTY --
 # `--hex=c5c54ac0` (`kaddb %k0,%k7,%k0`) shows boundary RD{} WR{} against
 # fields RD{REG_PRED0,REG_PRED7} WR{REG_PRED0}.  The plugin's own operand
 # walker reads the operand list rather than the access flags and puts the
@@ -390,16 +390,23 @@ x86_64 W-flow-added repne stosw BRANCH_REP
 # defect is NOT recovered for these -- see the cause-4 block in
 # isaxcheck_allow.txt.
 #
-# vbroadcasti128 USED to be in that list and no longer is.  Its erasure hit
-# both operands, and repairing only the MEM half at the boundary made things
-# worse rather than better: the walker stopped synthesising the destination
-# once the insn looked like an ordinary load, trading loads=0/DST{REG_VEC0}
-# for loads=1/DST{-}.  Both halves are now repaired in
-# `cap_x86_is_erased_mem_load` (disas/capstone.c), the walker's recovery
-# became unnecessary, and its `W-wr-added vbroadcasti128 +REG_VEC#` line went
-# dead and was deleted with the change that retired it -- which is exactly
-# the lifecycle this file's header prescribes for a repair the boundary has
-# taken over.
+# vbroadcasti128 and vcvtpd2psx USED to be in that list and no longer are.
+# Each one's erasure hit both operands, and repairing only the MEM half at
+# the boundary made things worse rather than better: the walker stopped
+# synthesising the destination once the insn looked like an ordinary load,
+# trading loads=0/DST{REG_VEC0} for loads=1/DST{-}.  Both halves of both are
+# now repaired in `cap_x86_is_erased_mem_load` (disas/capstone.c), the
+# walker's recovery became unnecessary, and their `W-wr-added
+# vbroadcasti128 +REG_VEC#` and `W-wr-added vcvtpd2psx +REG_VEC#` lines went
+# dead and were deleted with the changes that retired them -- which is
+# exactly the lifecycle this file's header prescribes for a repair the
+# boundary has taken over.
+#
+# vpermil2pd/ps stays, and its entries are load-bearing for a different
+# reason than the mask ops': the walker is currently the ONLY thing
+# supplying its registers, because the boundary repair that would take them
+# over cannot be written against an access == 0 gate.  See the vpermil2
+# paragraph in isaxcheck_allow.txt's cause-4 block for the shape.
 x86_64 W-rd-added kaddb +REG_PRED#
 x86_64 W-rd-added kaddd +REG_PRED#
 x86_64 W-rd-added kaddq +REG_PRED#
@@ -422,7 +429,6 @@ x86_64 W-wr-added ktestq +REG_PRED#
 x86_64 W-wr-added ktestw +REG_PRED#
 x86_64 W-wr-added kunpckdq +REG_PRED#
 x86_64 W-wr-added kunpckwd +REG_PRED#
-x86_64 W-wr-added vcvtpd2psx +REG_VEC#
 x86_64 W-wr-added vpermil2pd +REG_VEC#
 x86_64 W-wr-added vpermil2ps +REG_VEC#
 

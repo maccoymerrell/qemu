@@ -427,6 +427,8 @@ static bool cap_x86_is_shadow_stack_store(const char *mnem);
 static bool cap_x86_mem_is_never_accessed(const char *mnem);
 static bool cap_x86_is_push(const char *mnem);
 static bool cap_x86_is_erased_mem_load(const char *mnem);
+static bool cap_x86_is_lost_mem_store(const char *mnem);
+static bool cap_x86_is_gather(const char *mnem);
 
 /*
  * Extract per-operand detail for x86 into the plugin operand struct.
@@ -499,10 +501,17 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
     /* Capstone-6.0.0-Alpha7 bug: PUSH of a segment register reports its
      * operand access == 0 — see cap_x86_is_push. */
     bool push_read = cap_x86_is_push(insn->mnemonic);
-    /* Capstone-6.0.0-Alpha7 bug: VBROADCASTI128 reports access == 0 on
-     * both operands, erasing its memory source rather than mis-pointing
-     * it — see cap_x86_is_erased_mem_load. */
+    /* Capstone-6.0.0-Alpha7 bug: VBROADCASTI128 and VCVTPD2PSX report
+     * access == 0 on both operands, erasing their memory source rather
+     * than mis-pointing it — see cap_x86_is_erased_mem_load. */
     bool erased_load = cap_x86_is_erased_mem_load(insn->mnemonic);
+    /* Capstone-6.0.0-Alpha7 bug: STMXCSR / VSTMXCSR and fourteen of the
+     * sixteen SETcc condition codes report their sole MEM operand READ
+     * when it is the destination — see cap_x86_is_lost_mem_store. */
+    bool lost_store = cap_x86_is_lost_mem_store(insn->mnemonic);
+    /* Capstone-6.0.0-Alpha7 bug: the AVX2 gathers lose the WRITE to the
+     * mask register they zero on completion — see cap_x86_is_gather. */
+    bool gather = cap_x86_is_gather(insn->mnemonic);
 
     for (uint8_t i = 0; i < n; i++) {
         const cs_x86_op *cop = &x86->operands[i];
@@ -538,11 +547,20 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
                 op->access == 0) {
                 op->access = QEMU_PLUGIN_OP_ACC_READ;
             }
-            /* VBROADCASTI128's sole register operand is its destination
-             * (the source is the memory operand); Capstone erases its
-             * WRITE along with the memory access. */
+            /* VBROADCASTI128's and VCVTPD2PSX's sole register operand is
+             * the destination (the source is the memory operand);
+             * Capstone erases its WRITE along with the memory access. */
             if (erased_load && op->access == 0) {
                 op->access = QEMU_PLUGIN_OP_ACC_WRITE;
+            }
+            /* A gather zeroes its mask register on completion, so the
+             * mask -- always operand 0 in AT&T order -- is read-modify-
+             * write, not the pure read Capstone reports.  ORing the WRITE
+             * in leaves the correctly-reported READ and the destination's
+             * own WRITE alone, and self-retires the moment Capstone marks
+             * the mask written. */
+            if (gather && i == 0) {
+                op->access |= QEMU_PLUGIN_OP_ACC_WRITE;
             }
             break;
         case X86_OP_IMM:
@@ -574,8 +592,10 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
              */
             op->segment_id = cop->mem.segment;
             /* Capstone-6.0.0-Alpha7 bugs: the r/m destination of a
-             * store-form extract is a write target, not a read. */
-            if (extract_store || move_store) {
+             * store-form extract is a write target, not a read; so is the
+             * sole memory operand of STMXCSR / VSTMXCSR and of a SETcc
+             * with a memory destination. */
+            if (extract_store || move_store || lost_store) {
                 op->access = QEMU_PLUGIN_OP_ACC_WRITE;
             }
             /* Capstone-6.0.0-Alpha7 bugs across the string family: STOS
@@ -735,6 +755,135 @@ static bool cap_x86_is_extract_store(const char *mnem)
 /*
  * Capstone 6.0.0-Alpha7 x86 access-flag bug workaround.
  *
+ * The same defect as the extract stores above -- a sole memory operand
+ * that is the instruction's DESTINATION reported READ -- on two families
+ * that have nothing else in common with them, and that are grouped here
+ * because the repair and its proof obligation are identical: the memory
+ * operand is unconditionally the write target, so forcing WRITE is
+ * architecturally exact and is a no-op wherever Capstone already says so.
+ *
+ * STMXCSR / VSTMXCSR.  Ground truth from QEMU's translator:
+ * target/i386/tcg/decode-new.c.inc gives 0F AE /3 as
+ * `X86_OP_ENTRYw(STMXCSR, E,d, ...)`.  The `w` is what settles it --
+ * X86_OP_ENTRYw expands to X86_OP_ENTRY3(op, op0, s0, None, None, None,
+ * None), so E (the r/m operand) is op0, the DESTINATION, and the
+ * instruction has no source operand at all.  gen_STMXCSR in emit.c.inc
+ * loads CPUX86State::mxcsr into s->T0 and leaves the generic writeback to
+ * store it through op0.
+ *
+ * MATCHED BY EXACT SPELLING, and the sibling that makes it necessary is
+ * one ModRM.reg value away: 0F AE /2 is `X86_OP_ENTRYr(LDMXCSR, E,d)` --
+ * `r`, so E is a SOURCE -- and Capstone reports ITS memory operand READ
+ * CORRECTLY.  ldmxcsr and stmxcsr share the `mxcsr` stem and the whole of
+ * their encoding but the ModRM.reg field, so a stem match would invert
+ * the one that is right in order to fix the one that is wrong.  vldmxcsr
+ * and vstmxcsr stand in the same relation to each other.
+ *
+ * SETcc TO MEMORY.  All sixteen condition codes are
+ * `X86_OP_ENTRYw(SETcc, E,b)` in decode-new.c.inc (0F 90 through 0F 9F,
+ * across the two tables at lines 1226 and 1363), so E is again op0 and
+ * again the destination; gen_SETcc emits gen_setcc() into s->T0 for the
+ * generic writeback.  Every one of the sixteen writes its byte operand.
+ *
+ * EACH CONDITION CODE WAS CHECKED SEPARATELY rather than by matching the
+ * `set` stem, because Capstone does not get them uniformly wrong:
+ * `sete` (0F 94) and `setne` (0F 95) report their MEM operand WRITE
+ * CORRECTLY and the other fourteen -- seta, setae, setb, setbe, setg,
+ * setge, setl, setle, setno, setnp, setns, seto, setp, sets -- report it
+ * READ.  A per-condition-code split is exactly the shape in which a
+ * benign convention difference and a real defect look alike, so the
+ * sixteen are listed out.  Listing all sixteen rather than only the
+ * fourteen is deliberate: forcing WRITE on sete/setne changes nothing
+ * (they already carry it), which keeps the predicate a statement about
+ * the architecture rather than about this Capstone's bug list, and makes
+ * the repair self-retiring in the same way the move-family one is.
+ * The register-destination forms of all sixteen are reported correctly
+ * and are untouched -- this branch only ever rewrites a MEM operand.
+ *
+ * `setssbsy` (F3 0F 01 E8) is the only other x86 mnemonic Capstone spells
+ * with a leading `set`; it carries no operand at all, so it could not be
+ * affected either way, and the exact match excludes it regardless.
+ *
+ * Revisit / remove when Capstone is bumped past 6.0.0-Alpha7; verify with
+ * `--hex=0fae1c24` (`stmxcsr (%rsp)`), `--hex=c5f8ae5dd8`
+ * (`vstmxcsr -0x28(%rbp)`) and `--hex=0f9200` (`setb (%rax)`) -- the MEM
+ * operand must show WRITE in all three, while `--hex=0fae1424`
+ * (`ldmxcsr (%rsp)`) must still show READ.  Use a `cstool` built from
+ * `subprojects/capstone`, or run `capstone_workaround_probe`; see
+ * docs/troubleshooting.rst.
+ */
+static bool cap_x86_is_lost_mem_store(const char *mnem)
+{
+    if (!mnem || !mnem[0]) return false;
+    if (g_str_equal(mnem, "stmxcsr") || g_str_equal(mnem, "vstmxcsr")) {
+        return true;
+    }
+    /* The sixteen SETcc spellings Capstone emits in AT&T syntax, listed
+     * individually -- see the note above on why this is not a stem
+     * match. */
+    return g_str_equal(mnem, "seta")   || g_str_equal(mnem, "setae") ||
+           g_str_equal(mnem, "setb")   || g_str_equal(mnem, "setbe") ||
+           g_str_equal(mnem, "sete")   || g_str_equal(mnem, "setg")  ||
+           g_str_equal(mnem, "setge")  || g_str_equal(mnem, "setl")  ||
+           g_str_equal(mnem, "setle")  || g_str_equal(mnem, "setne") ||
+           g_str_equal(mnem, "setno")  || g_str_equal(mnem, "setnp") ||
+           g_str_equal(mnem, "setns")  || g_str_equal(mnem, "seto")  ||
+           g_str_equal(mnem, "setp")   || g_str_equal(mnem, "sets");
+}
+
+/*
+ * Capstone 6.0.0-Alpha7 x86 access-flag bug workaround.
+ *
+ * The AVX2 gather family loses the WRITE to its mask register.  A gather
+ * has two destinations: it merges the loaded elements into the
+ * destination vector and it ZEROES the mask register on completion, so
+ * that a gather interrupted by a fault can be restarted from what the
+ * mask still holds.  Capstone reports the mask operand READ only, which
+ * drops that second write and with it every WAR and WAW edge that
+ * depends on the mask being dead after the gather.
+ *
+ * Ground truth from QEMU's translator, on both halves:
+ * target/i386/tcg/decode-new.c.inc gives 0F38 90..93 as
+ * `X86_OP_ENTRY3(VPGATHERD, V,x, H,x, M,d, ...)` and relatives -- op1 is
+ * H, the VEX.vvvv register, which is the mask.  `helper_vpgatherdd` in
+ * target/i386/ops_sse.h takes it as `Reg *v` and both READS it (`if
+ * (v->L(i) >> 31)` selects the element) and WRITES it (`v->L(i) = 0`,
+ * inside the loop and OUTSIDE the mask test, so it runs for every
+ * element).  gen_vsib_avx in emit.c.inc adds a second write for the
+ * VEX.128 case, zeroing OP_PTR1's high 128 bits explicitly under the
+ * comment "There are two output operands".  The mask is therefore
+ * READ-MODIFY-WRITE, and the repair ADDS write access rather than
+ * replacing the read.
+ *
+ * THE MASK IS OPERAND 0, uniformly.  QEMU drives Capstone in AT&T syntax,
+ * which prints the gather as `mask, vsib-memory, destination`; all
+ * sixteen forms of the family (four opcodes x VEX.W x VEX.L) were
+ * checked and every one yields exactly [0]REG [1]MEM [2]REG, mask first
+ * and destination last.  The destination's WRITE is reported correctly
+ * and is not touched.
+ *
+ * Revisit / remove when Capstone is bumped past 6.0.0-Alpha7; verify with
+ * `--hex=c4e269900c08` (`vpgatherdd %xmm2,(%rax,%xmm1),%xmm1`) -- the
+ * first operand must show READ | WRITE.  Use a `cstool` built from
+ * `subprojects/capstone`, or run `capstone_workaround_probe`; see
+ * docs/troubleshooting.rst.
+ */
+static bool cap_x86_is_gather(const char *mnem)
+{
+    if (!mnem || !mnem[0]) return false;
+    return g_str_equal(mnem, "vpgatherdd") ||
+           g_str_equal(mnem, "vpgatherdq") ||
+           g_str_equal(mnem, "vpgatherqd") ||
+           g_str_equal(mnem, "vpgatherqq") ||
+           g_str_equal(mnem, "vgatherdps") ||
+           g_str_equal(mnem, "vgatherdpd") ||
+           g_str_equal(mnem, "vgatherqps") ||
+           g_str_equal(mnem, "vgatherqpd");
+}
+
+/*
+ * Capstone 6.0.0-Alpha7 x86 access-flag bug workaround.
+ *
  * A stronger form of the flag defects above: VBROADCASTI128 comes back
  * with access == 0 on BOTH its operands, so the memory operand does not
  * point the wrong way — it vanishes.  The operand walker derives its
@@ -777,16 +926,44 @@ static bool cap_x86_is_extract_store(const char *mnem)
  * Both repairs are gated on `access == 0`, so an encoding Capstone
  * reports correctly is never touched.
  *
+ * VCVTPD2PSX HAS THE SAME ERASURE AND THE SAME SHAPE, so it is repaired
+ * here rather than given its own predicate: two operands, both back with
+ * access == 0, memory the source and the sole register the destination.
+ * Ground truth from QEMU's translator: decode-new.c.inc's decode_0F5A
+ * table gives `X86_OP_ENTRY2(VCVTPD2PS, V,x, W,x, vex2)`, which expands
+ * to X86_OP_ENTRY3(op, V,x, 2op,x, W,x) -- V is op0, the vector
+ * destination, and W is op2, the r/m source -- and gen_VCVTPD2PS in
+ * emit.c.inc calls gen_helper_cvtpd2ps_xmm(tcg_env, OP_PTR0, OP_PTR2),
+ * reading the memory operand and writing the register.
+ *
+ * MATCHED BY EXACT SPELLING for the same reason vbroadcasti128 is, and
+ * the collision here is even tighter than an opcode byte.  `vcvtpd2psx`
+ * and `vcvtpd2psy` are AT&T's two spellings of the SAME OPCODE -- the
+ * suffix disambiguates the memory operand's width, so they differ only in
+ * VEX.L -- and `vcvtpd2psy` is reported CORRECTLY (MEM READ, REG WRITE),
+ * as are the register-source forms of both and the legacy SSE
+ * `cvtpd2ps`.  The transposed twin `vcvtps2pd` is correct as well.  A
+ * stem match on `vcvtpd2ps` would take the healthy 256-bit spelling with
+ * the broken 128-bit one.
+ *
+ * Its walker recovery is retired by this change exactly as
+ * vbroadcasti128's was: `x86_64 W-wr-added vcvtpd2psx +REG_VEC#` in
+ * isaxcheck_fixups.txt goes dead once the boundary supplies the
+ * destination write, and is deleted with the change that retires it.
+ *
  * Revisit / remove when Capstone is bumped past 6.0.0-Alpha7; verify
- * with `cstool -d x64 c4e27d5a00` (`vbroadcasti128 (%rax),%ymm0`) --
- * the MEM operand must show READ and the REG operand WRITE.  Use a
- * `cstool` built from `subprojects/capstone`, or run
- * `capstone_workaround_probe`; see docs/troubleshooting.rst.
+ * with `cstool -d x64 c4e27d5a00` (`vbroadcasti128 (%rax),%ymm0`) and
+ * `--hex=c5f95a00` (`vcvtpd2psx (%rax),%xmm0`) -- the MEM operand must
+ * show READ and the REG operand WRITE, while `--hex=c5fd5a00`
+ * (`vcvtpd2psy`) must be unchanged.  Use a `cstool` built from
+ * `subprojects/capstone`, or run `capstone_workaround_probe`; see
+ * docs/troubleshooting.rst.
  */
 static bool cap_x86_is_erased_mem_load(const char *mnem)
 {
     if (!mnem || !mnem[0]) return false;
-    return g_str_equal(mnem, "vbroadcasti128");
+    return g_str_equal(mnem, "vbroadcasti128") ||
+           g_str_equal(mnem, "vcvtpd2psx");
 }
 
 /*

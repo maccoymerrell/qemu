@@ -938,20 +938,6 @@ x86_64 M-extra-load fisttpl
 x86_64 M-extra-load fisttpll
 x86_64 M-extra-load fisttps
 x86_64 M-extra-load movq
-x86_64 M-extra-load seta
-x86_64 M-extra-load setae
-x86_64 M-extra-load setb
-x86_64 M-extra-load setbe
-x86_64 M-extra-load setg
-x86_64 M-extra-load setge
-x86_64 M-extra-load setl
-x86_64 M-extra-load setle
-x86_64 M-extra-load setno
-x86_64 M-extra-load setnp
-x86_64 M-extra-load setns
-x86_64 M-extra-load seto
-x86_64 M-extra-load setp
-x86_64 M-extra-load sets
 x86_64 M-llvm-mem-cs-none emms load store
 x86_64 M-llvm-mem-cs-none femms load store
 x86_64 M-llvm-mem-cs-none int3 load store
@@ -1016,20 +1002,6 @@ x86_64 M-miss-store rorb
 x86_64 M-miss-store rorl
 x86_64 M-miss-store rorq
 x86_64 M-miss-store rorw
-x86_64 M-miss-store seta
-x86_64 M-miss-store setae
-x86_64 M-miss-store setb
-x86_64 M-miss-store setbe
-x86_64 M-miss-store setg
-x86_64 M-miss-store setge
-x86_64 M-miss-store setl
-x86_64 M-miss-store setle
-x86_64 M-miss-store setno
-x86_64 M-miss-store setnp
-x86_64 M-miss-store setns
-x86_64 M-miss-store seto
-x86_64 M-miss-store setp
-x86_64 M-miss-store sets
 x86_64 M-miss-store shldl
 x86_64 M-miss-store shldq
 x86_64 M-miss-store shldw
@@ -2002,7 +1974,6 @@ x86_64 M-extra-load fistl
 x86_64 M-extra-load fistpl
 x86_64 M-extra-load fistps
 x86_64 M-extra-load fists
-x86_64 M-extra-load stmxcsr
 x86_64 M-extra-store frstor
 x86_64 M-llvm-mem-cs-none incsspd load store
 x86_64 M-llvm-mem-cs-none incsspq load store
@@ -2061,7 +2032,6 @@ x86_64 M-miss-store shlq
 x86_64 M-miss-store shrb
 x86_64 M-miss-store shrl
 x86_64 M-miss-store shrq
-x86_64 M-miss-store stmxcsr
 x86_64 M-miss-store xrstor
 x86_64 M-miss-store xrstor64
 x86_64 M-miss-store xrstors
@@ -4555,24 +4525,63 @@ x86_64 R-wr-phantom xrelease lock xchgl +r#
 #   contains cpu_stl_data_ra() and nothing else -- the instruction only
 #   ever writes.  The boundary is right and LLVM is conservative.
 #
-#   access == 0 erasures that are NOT yet repaired: vcvtpd2psx and the
-#   vpermil2pd/ps five-operand forms still lose their MEM operand, and
-#   the gather family (vpgatherdd and relatives) still loses the write to
-#   the mask register the gather zeroes on completion.  The AVX-512 mask
-#   ops (kadd*, ktest*, kunpck*) have it on their register operands only,
-#   where the plugin's own operand walker recovers them, which is why
-#   those appear as fixups rather than as dropped state.  These are the
-#   same defect class and want the same treatment; they are left as x86
-#   work rather than folded in, because each needs its own direction
-#   proof and vpermil2 is an XOP form QEMU does not implement at all.
+#   THE STMXCSR AND SETcc MEMORY DIRECTIONS ARE NOW FIXED TOO, in
+#   `cap_x86_is_lost_mem_store`, and so is VCVTPD2PSX's erasure (folded
+#   into `cap_x86_is_erased_mem_load` beside VBROADCASTI128, whose shape
+#   it shares exactly) and the gather family's lost mask write (in
+#   `cap_x86_is_gather`).  Forty-four entries went dead in that change and
+#   were removed -- 28 SETcc rows (M-extra-load and M-miss-store on the
+#   fourteen condition codes Capstone got wrong), 4 on stmxcsr/vstmxcsr,
+#   4 on vcvtpd2psx and 8 R-wr-missing rows across the gathers -- and
+#   `x86_64 W-wr-added vcvtpd2psx +REG_VEC#` went dead in
+#   isaxcheck_fixups.txt with them.  Direction came from QEMU's translator
+#   in every case; see the per-family comments in disas/capstone.c.
 #
-#   `M-extra-load`/`M-miss-store vstmxcsr` and `M-miss-store vldmxcsr`
-#   are a REAL defect of exactly the kind just fixed -- STMXCSR stores
-#   MXCSR to m32 (`X86_OP_ENTRYw(STMXCSR, E,d)` in decode-new.c.inc) and
-#   Capstone reports its MEM operand READ.  It is left here deliberately:
-#   it is not a VEX/AVX memory-operand defect, it shares its predicate
-#   shape with the SETcc-to-memory defect below, and the two want one
-#   change with one validation pass rather than a rider on this one.
+#   `M-miss-store ldmxcsr` / `vldmxcsr` SURVIVED that change and are NOT
+#   the stmxcsr defect wearing a different name.  LDMXCSR is a LOAD --
+#   `X86_OP_ENTRYr(LDMXCSR, E,d)`, `r` for source -- and Capstone reports
+#   its MEM operand READ correctly.  What LLVM asserts is mayStore=1,
+#   because the instruction writes MXCSR, which is processor state and not
+#   memory; that is the same scheduling-property artifact as the masked
+#   moves above, not a direction disagreement.  The distinction is
+#   load-bearing: ldmxcsr and stmxcsr differ only in ModRM.reg (0F AE /2
+#   versus /3) and share the `mxcsr` stem, so a stem-matched repair would
+#   have inverted the healthy one, which is why the boundary matches both
+#   spellings exactly.
+#
+#   access == 0 erasures that are STILL not repaired: the vpermil2pd/ps
+#   VEX.L=1 forms.  The earlier text here said the "five-operand forms
+#   lose their MEM operand"; that was measured and is wrong on both
+#   counts.  Operand count is not the discriminator -- VEX.L is.  Every
+#   VEX.L=0 form is reported CORRECTLY (MEM READ, destination register
+#   WRITE) at both VEX.W values and with either a memory or a register
+#   source; every VEX.L=1 form comes back with access == 0 on all five
+#   operands, memory and registers alike.  The one exception is uglier
+#   than a plain erasure: the VEX.W=1, VEX.L=1 REGISTER form
+#   (`--hex=c4e3f549c81a`) gets a three-operand access pattern laid over
+#   its five-operand array, so the immediate is marked READ and a SOURCE
+#   register is marked WRITE -- that is what the `R-wr-phantom vpermil2*`
+#   rows record, and an `access == 0` gate cannot reach it because those
+#   operands' access is not zero.
+#
+#   Left unrepaired deliberately, and the residual is bounded: the
+#   plugin's own operand walker already recovers the whole register set
+#   (the `W-rd-added` / `W-wr-added vpermil2*` rows in
+#   isaxcheck_fixups.txt assert exactly that), so the only state actually
+#   dropped is the load lane and the address dependency on the L=1 memory
+#   forms.  Against that, a repair here would have to be positional --
+#   "the last operand is the destination, the rest are sources" -- rather
+#   than the access-flag rule every other repair in disas/capstone.c uses,
+#   because three of the five zero-access registers are sources and
+#   marking them all WRITE the way `cap_x86_is_erased_mem_load` does would
+#   fabricate three phantom writes; and it would still leave the
+#   misaligned form's phantom write standing, so it could not be a
+#   complete fix by construction.  QEMU implements no VPERMIL2 at all
+#   (there is no entry for VEX 0F3A 48/49 anywhere in decode-new.c.inc),
+#   which means there is no translator ground truth to take the direction
+#   from and, equally, that the instruction can never be translated and
+#   can never reach a trace -- the same standing as kmov*.  It is x86
+#   work with a written shape, not a gap nobody has looked at.
 #
 # MEASURED EXPOSURE of the families fixed above, against the four x86
 # reference traces (1.64 G dynamic correct-path instructions, 47,512
@@ -4582,8 +4591,31 @@ x86_64 R-wr-phantom xrelease lock xchgl +r#
 # encodings filling 28 template slots in the two perlbench traces, every
 # one of them the REGISTER-destination form that this fix does not touch,
 # and none of them ever retiring.  vextractf128, vcvtps2ph, vmaskmov*,
-# vpmaskmov*, kmov* and vbroadcasti128 do not appear at all.  vstmxcsr has 2,826 wrong-path executions and nothing
-# else.  For scale, VEX as a whole is 2.59% of dynamic weight there and
+# vpmaskmov*, kmov* and vbroadcasti128 do not appear at all.
+#
+# THE SAME MEASUREMENT for the four families fixed after them, taken the
+# same way and re-derived rather than inherited.  Every one is ZERO on the
+# correct path, so none of them moves a byte of any current reference
+# trace either; what they carry is wrong-path weight and correctness
+# banked for workloads not yet run.
+#
+#   stmxcsr / vstmxcsr   2 distinct encodings, both vstmxcsr (the
+#                        non-VEX spelling never appears), cp=0,
+#                        wp=2,826 -- all of it on `c5f8ae5dd8`.
+#   SETcc to memory      2 distinct encodings, both `setb` (`0f9245af`
+#                        and `0f9245b3`), cp=0, wp=427.  These are the
+#                        only memory-form SETcc in the population that
+#                        used one of the fourteen BROKEN condition
+#                        codes; the fourteen encodings that used sete
+#                        or setne (cp=120, wp=11,554) were already
+#                        correct and the fix leaves them bit-identical.
+#   vcvtpd2psx           absent -- 0 distinct encodings.
+#   gather family        absent -- 0 distinct encodings, all eight
+#                        mnemonics.
+#
+# vpermil2pd/ps, which is NOT fixed, is likewise absent.
+#
+# For scale, VEX as a whole is 2.59% of dynamic weight there and
 # is dominated by vzeroupper (20,661,182 executions, 1.26%) and the
 # vmovdq* moves, all of which were already correct.  The fix therefore
 # moves no byte of any current reference trace; its exposure is an
@@ -4658,9 +4690,7 @@ x86_64 D-llvm-only vsm3rnds2
 x86_64 D-llvm-only vsm4key4
 x86_64 D-llvm-only vsm4rnds4
 x86_64 D-llvm-only {vex}
-x86_64 M-extra-load vstmxcsr
 x86_64 M-llvm-mem-cs-none vmaskmovdqu load store
-x86_64 M-miss-load vcvtpd2psx
 x86_64 M-miss-load vmaskmovpd
 x86_64 M-miss-load vmaskmovps
 x86_64 M-miss-load vpermil2pd
@@ -4668,7 +4698,6 @@ x86_64 M-miss-load vpermil2ps
 x86_64 M-miss-load vpmaskmovd
 x86_64 M-miss-load vpmaskmovq
 x86_64 M-miss-store vldmxcsr
-x86_64 M-miss-store vstmxcsr
 x86_64 R-rd-missing kaddb +k#
 x86_64 R-rd-missing kaddd +k#
 x86_64 R-rd-missing kaddq +k#
@@ -4700,19 +4729,10 @@ x86_64 R-wr-missing ktestq +flags
 x86_64 R-wr-missing ktestw +flags
 x86_64 R-wr-missing kunpckdq +k#
 x86_64 R-wr-missing kunpckwd +k#
-x86_64 R-wr-missing vcvtpd2psx +v#
-x86_64 R-wr-missing vgatherdpd +v#
-x86_64 R-wr-missing vgatherdps +v#
-x86_64 R-wr-missing vgatherqpd +v#
-x86_64 R-wr-missing vgatherqps +v#
 x86_64 R-wr-missing vpcmpestrm +flags,v#
 x86_64 R-wr-missing vpcmpistrm +flags,v#
 x86_64 R-wr-missing vpermil2pd +v#
 x86_64 R-wr-missing vpermil2ps +v#
-x86_64 R-wr-missing vpgatherdd +v#
-x86_64 R-wr-missing vpgatherdq +v#
-x86_64 R-wr-missing vpgatherqd +v#
-x86_64 R-wr-missing vpgatherqq +v#
 x86_64 R-wr-phantom vpermil2pd +v#
 x86_64 R-wr-phantom vpermil2ps +v#
 x86_64 Z-access0 kaddb REG
@@ -4725,8 +4745,6 @@ x86_64 Z-access0 ktestq REG
 x86_64 Z-access0 ktestw REG
 x86_64 Z-access0 kunpckdq REG
 x86_64 Z-access0 kunpckwd REG
-x86_64 Z-access0 vcvtpd2psx MEM
-x86_64 Z-access0 vcvtpd2psx REG
 x86_64 Z-access0 vpermil2pd MEM
 x86_64 Z-access0 vpermil2pd REG
 x86_64 Z-access0 vpermil2ps MEM

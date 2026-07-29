@@ -155,6 +155,46 @@ bool StillBuggy_BroadcastI128Erased(const cs_insn &insn)
      * a family convention. */
     return OpAccess_x86(insn, 0) == 0 && OpAccess_x86(insn, 1) == 0;
 }
+bool StillBuggy_Cvtpd2psxErased(const cs_insn &insn)
+{
+    /* vcvtpd2psx (%rax),%xmm0: MEM (operand 0) must be READ and the
+     * register (operand 1) WRITE. Bug: both access == 0.  vcvtpd2psy is
+     * the SAME OPCODE at VEX.L=1 -- AT&T's suffix only disambiguates the
+     * memory width -- and is reported correctly, so this checks the
+     * erasure rather than a family convention. */
+    return OpAccess_x86(insn, 0) == 0 && OpAccess_x86(insn, 1) == 0;
+}
+bool StillBuggy_StmxcsrStore(const cs_insn &insn)
+{
+    /* stmxcsr (%rsp): the sole MEM operand is the DESTINATION
+     * (X86_OP_ENTRYw(STMXCSR, E,d)) and must be WRITE. Bug: READ.
+     * LDMXCSR, one ModRM.reg value away and sharing the `mxcsr` stem, is
+     * a genuine load and IS reported correctly, which is why the
+     * predicate matches exact spellings; verify that half by hand with
+     * `isaxcheck --hex=0fae1424`, which must still show the MEM operand
+     * READ.  It is deliberately not a case here: it would sit at
+     * RETIRE CANDIDATE forever and inflate that count. */
+    return !(OpAccess_x86(insn, 0) & CS_AC_WRITE);
+}
+bool StillBuggy_SetccMemStore(const cs_insn &insn)
+{
+    /* setb (%rax): the sole MEM operand is the DESTINATION
+     * (X86_OP_ENTRYw(SETcc, E,b)) and must be WRITE. Bug: READ, on
+     * fourteen of the sixteen condition codes.  `sete` and `setne` are
+     * the two Capstone already gets right, which is why the predicate
+     * enumerates all sixteen spellings instead of matching a `set` stem;
+     * verify that half by hand with `isaxcheck --hex=0f9400`, which must
+     * show the MEM operand WRITE already.  Neither is a case here: both
+     * would sit at RETIRE CANDIDATE forever and inflate that count. */
+    return !(OpAccess_x86(insn, 0) & CS_AC_WRITE);
+}
+bool StillBuggy_GatherMaskWrite(const cs_insn &insn)
+{
+    /* vpgatherdd %xmm2,(%rax,%xmm1),%xmm1: the mask register is operand 0
+     * in AT&T order and is READ-MODIFY-WRITE -- helper_vpgatherdd zeroes
+     * it with `v->L(i) = 0` outside the mask test.  Bug: READ only. */
+    return !(OpAccess_x86(insn, 0) & CS_AC_WRITE);
+}
 bool StillBuggy_TestA9_32(const cs_insn &insn)
 {
     /* testl $0x200000,%eax: operand 1 (%eax) must be plain READ. Bug: RW. */
@@ -284,6 +324,31 @@ const std::vector<Case> &Cases()
          "reported correctly)",
          CS_ARCH_X86, CS_MODE_64, {0xc4, 0xe2, 0x7d, 0x5a, 0x00},
          StillBuggy_BroadcastI128Erased},
+        {"cap_x86_is_erased_mem_load (VCVTPD2PSX)", "cap_fill_x86_operands",
+         "6.0.0-Alpha7",
+         "VCVTPD2PSX: access == 0 on BOTH operands, erasing the memory "
+         "source (vcvtpd2psy, the same opcode at VEX.L=1, is reported "
+         "correctly)",
+         CS_ARCH_X86, CS_MODE_64, {0xc5, 0xf9, 0x5a, 0x00},
+         StillBuggy_Cvtpd2psxErased},
+        {"cap_x86_is_lost_mem_store (STMXCSR)", "cap_fill_x86_operands",
+         "6.0.0-Alpha7",
+         "STMXCSR: sole MEM operand is the r/m DESTINATION but is "
+         "reported READ",
+         CS_ARCH_X86, CS_MODE_64, {0x0f, 0xae, 0x1c, 0x24},
+         StillBuggy_StmxcsrStore},
+        {"cap_x86_is_lost_mem_store (SETcc)", "cap_fill_x86_operands",
+         "6.0.0-Alpha7",
+         "SETB to memory: sole MEM operand is the r/m DESTINATION but is "
+         "reported READ, on fourteen of the sixteen condition codes",
+         CS_ARCH_X86, CS_MODE_64, {0x0f, 0x92, 0x00},
+         StillBuggy_SetccMemStore},
+        {"cap_x86_is_gather", "cap_fill_x86_operands", "6.0.0-Alpha7",
+         "VPGATHERDD: the mask register (operand 0) is zeroed on "
+         "completion and so is read-modify-write, but is reported READ "
+         "only",
+         CS_ARCH_X86, CS_MODE_64, {0xc4, 0xe2, 0x69, 0x90, 0x0c, 0x08},
+         StillBuggy_GatherMaskWrite},
         {"cap_x86_is_test (phantom write)", "cap_fill_x86_operands",
          "6.0.0-Alpha7", "TEST opcode A9, 32-bit operand size: %eax "
          "reported READ|WRITE instead of plain READ",

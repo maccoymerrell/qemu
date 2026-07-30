@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <utility>
 
 #include "champsim_tracer_path_builder.h"
@@ -64,6 +65,31 @@ static bool pb_depth_diag()
 {
     static const bool v = getenv("CST_DEPTH_DIAG") != nullptr;
     return v;
+}
+
+/* Kernel-excursion ownership diagnostics: the entry-ASID restore arrow and
+ * the kernel TBs an excursion admits or refuses after one.  Prints each
+ * distinct block PC once (the interesting population is the set of blocks,
+ * not the dynamic count, and a kernel excursion re-executes the same handler
+ * text millions of times). */
+static bool kexc_diag()
+{
+    static const bool v = getenv("CST_KEXC_DIAG") != nullptr;
+    return v;
+}
+
+/* First-sighting filter for the kexc PC dumps.  Written only under
+ * kexc_diag(), and every writer holds exec_lock (kexc runs inside the CP
+ * step), so one process-wide set records the true interleave.  Immortal,
+ * like the jump-diag rings: a teardown racing a late step must not touch
+ * freed storage. */
+static bool kexc_pc_first_sighting(const char *bucket, uint64_t pc)
+{
+    static std::set<std::pair<const char *, uint64_t>> *seen = nullptr;
+    if (!seen) {
+        seen = new std::set<std::pair<const char *, uint64_t>>();
+    }
+    return seen->insert({bucket, pc}).second;
 }
 
 /*
@@ -552,6 +578,7 @@ void PathBuilder::kexc_reset()
     kexc_have_overlay_ = false;
     kexc_overlay_ = 0;
     kexc_cut_ = false;
+    kexc_restored_after_cut_ = false;
     kexc_nvals_ = 0;
     kexc_stormed_ = false;
 }
@@ -604,6 +631,30 @@ void PathBuilder::kexc_apply_asid_write(uint64_t new_asid)
     }
 
     if (new_asid == kexc_exc_entry_) {
+        /* Restore: the address space the excursion was ENTERED from is
+         * loaded again, so the excursion's own kernel work resumes here —
+         * which means retiring a standing cut.  A cut records that the
+         * address space MOVED to a third distinct value; once the entry
+         * value is written back, that statement no longer describes the
+         * machine, and leaving the flag set would refuse the entering
+         * process's own post-switch-back kernel path all the way to its
+         * next user TB.  Only the cut clears: the overlay is kept, so a
+         * further third value cuts again, and kexc_entry_owned_ is not
+         * touched — it was latched from kexc_user_owned_, which cannot
+         * change while an excursion is open (kexc_user_tb closes one), so
+         * re-latching it here would provably be a no-op. */
+        g_stats.kexc_entry_restores++;
+        if (kexc_cut_) {
+            kexc_cut_ = false;
+            g_stats.kexc_cut_retired_by_restore++;
+            kexc_restored_after_cut_ = true;
+            if (kexc_diag()) {
+                fprintf(stderr, "[kexcdiag] RESTORE-AFTER-CUT entry=0x%"
+                        PRIx64 " overlay=0x%" PRIx64 " owned=%d\n",
+                        kexc_exc_entry_, kexc_overlay_,
+                        (int)kexc_entry_owned_);
+            }
+        }
         return;                     /* restore; ownership continues */
     }
     if (!kexc_have_overlay_) {
@@ -648,19 +699,83 @@ void PathBuilder::kexc_user_tb(uint64_t live_asid, bool owned)
  * excursion never re-fire it — the single-edge model), then answer the
  * ownership question.  Replaces the live-ASID foreign-drop test for
  * kernel TBs only. */
-bool PathBuilder::kexc_kernel_tb_keep(void)
+bool PathBuilder::kexc_kernel_tb_keep(const StepIn &in)
 {
+    uint64_t start_pc = in.cur ? in.cur->start_pc : 0;
+    uint32_t n_insns = in.cur ? in.cur->n_insns : 0;
     if (!kexc_in_kernel_) {
         kexc_reset();
         kexc_in_kernel_ = true;
         kexc_exc_entry_ = kexc_last_user_asid_;
         kexc_entry_owned_ = kexc_user_owned_;
     }
-    bool keep = kexc_have_user_ && kexc_entry_owned_ && !kexc_cut_;
+    /* @ours: the excursion was entered from a verified-owned user TB, so
+     * every block of it belongs to the pinned process unless a committed
+     * switch has since moved the address space elsewhere. */
+    bool ours = kexc_have_user_ && kexc_entry_owned_;
+    bool keep = ours && !kexc_cut_;
     if (keep) {
         g_stats.kexc_kernel_kept++;
+        /* Post-restore recovery census: the blocks the restore arrow puts
+         * back in the trace.  A cut is monotone within an excursion unless a
+         * restore retires it, so a block admitted after one is exactly a
+         * block a sticky cut would have refused.  Its own tripwire is the
+         * live address space: the arrow may only re-admit blocks running
+         * under the excursion's entry value, or under the kernel overlay the
+         * excursion already accepted as benign (an idle / kthread borrow) —
+         * anything else would be foreign work entering the trace. */
+        if (kexc_restored_after_cut_) {
+            g_stats.kexc_post_restore_kept_tbs++;
+            g_stats.kexc_post_restore_kept_insns += n_insns;
+            bool own_space = in.live_asid == kexc_exc_entry_ ||
+                             (kexc_have_overlay_ &&
+                              in.live_asid == kexc_overlay_);
+            if (!own_space) {
+                g_stats.kexc_post_restore_kept_foreign_live++;
+            }
+            if (kexc_diag() &&
+                (!own_space ||
+                 kexc_pc_first_sighting("recovered", start_pc))) {
+                fprintf(stderr, "[kexcdiag] RECOVERED%s pc=0x%" PRIx64
+                        " ninsns=%u entry=0x%" PRIx64 " overlay=0x%" PRIx64
+                        " live=0x%" PRIx64 " pin=0x%" PRIx64 "\n",
+                        own_space ? "" : "/OFF-SPACE", start_pc, n_insns,
+                        kexc_exc_entry_, kexc_overlay_, in.live_asid,
+                        in.pinned_asid);
+            }
+        }
     } else {
         g_stats.kexc_kernel_dropped++;
+        /* Decline-reason census.  Exactly one arm fires per refused block. */
+        if (!kexc_have_user_) {
+            g_stats.kexc_decl_no_user++;
+        } else if (!kexc_entry_owned_) {
+            g_stats.kexc_decl_not_owned++;
+            /* The excursion was latched to a foreign entry, yet the address
+             * space in force is the pinned one: a re-entry with no
+             * intervening user TB.  A separate attribution question from the
+             * cut; recorded, not adjudicated. */
+            if (in.live_asid == in.pinned_asid) {
+                g_stats.kexc_decl_not_owned_live_pinned++;
+            }
+        } else {
+            g_stats.kexc_decl_cut++;
+            /* THE TRIPWIRE.  A cut asserts the address space moved away; the
+             * live register says it is the excursion's own entry value.  Both
+             * cannot hold, so a non-zero count is a cut outliving the switch
+             * it describes — the sticky-cut defect. */
+            if (in.live_asid == kexc_exc_entry_) {
+                g_stats.kexc_cut_declined_at_entry_asid++;
+                if (kexc_diag() &&
+                    kexc_pc_first_sighting("stalecut", start_pc)) {
+                    fprintf(stderr, "[kexcdiag] STALE-CUT-DECLINE pc=0x%"
+                            PRIx64 " ninsns=%u entry=0x%" PRIx64
+                            " overlay=0x%" PRIx64 " restored=%d\n",
+                            start_pc, n_insns, kexc_exc_entry_,
+                            kexc_overlay_, (int)kexc_restored_after_cut_);
+                }
+            }
+        }
     }
     return keep;
 }
@@ -1228,7 +1343,7 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
             kexc_user_tb(in.live_asid, in.user_owned);
             drop = !in.user_owned;
         } else {
-            drop = !kexc_kernel_tb_keep();
+            drop = !kexc_kernel_tb_keep(in);
         }
         if (drop) {
             /* SUSPEND-OR-SEAL (plan §1.2).  Freeze the deferred prev + its

@@ -148,6 +148,47 @@ struct Stats {
     uint64_t kexc_kernel_kept = 0;
     uint64_t kexc_kernel_dropped = 0;
     uint64_t kexc_write_storm = 0;
+    /* Restore-to-entry accounting.  An ASID write whose new value is the
+     * excursion's ENTRY value puts the entering address space back in force,
+     * so the excursion's ownership continues: entry_restores counts every
+     * such write and cut_retired_by_restore the subset that found a
+     * committed-switch cut standing (the cut described an address space that
+     * is no longer loaded, so the restore retires it).
+     *
+     * cut_declined_at_entry_asid is the INVARIANT: a kernel TB refused for a
+     * committed switch while the live address-space register nonetheless
+     * holds the excursion's own entry value.  Nothing can be both switched
+     * away and switched back, so this must read 0 — it is the tripwire for
+     * the sticky-cut defect (a cut that outlives the switch it describes).
+     * It is stated in architectural terms on purpose: a flag-shaped version
+     * ("declined in an excursion that once restored") cannot tell the defect
+     * from a legitimate SECOND switch after the restore.
+     *
+     * post_restore_kept_* is the recovery census — kernel TBs admitted in an
+     * excursion whose cut a restore retired, i.e. exactly the population the
+     * defect refused; post_restore_kept_foreign_live is its own tripwire, the
+     * subset admitted while the live register held neither the entry value
+     * nor the kernel overlay (a genuine foreign leak would land here). */
+    uint64_t kexc_entry_restores = 0;
+    uint64_t kexc_cut_retired_by_restore = 0;
+    uint64_t kexc_cut_declined_at_entry_asid = 0;
+    uint64_t kexc_post_restore_kept_tbs = 0;
+    uint64_t kexc_post_restore_kept_insns = 0;
+    uint64_t kexc_post_restore_kept_foreign_live = 0;
+    /* Decline-reason census: every refused kernel TB lands in exactly one of
+     * no_user (the segment has not seen a user TB yet, so nothing owns the
+     * excursion), not_owned (it was entered from a foreign user TB — the
+     * dominant and CORRECT reason in a single-address-space trace) and cut (a
+     * committed switch moved the address space mid-excursion).
+     * not_owned_live_pinned narrows the middle one to the blocks whose live
+     * address space is nonetheless the pinned process's: an excursion the
+     * pinned process re-enters without an intervening user TB is latched to
+     * the foreign entry, which is a SEPARATE attribution question from the
+     * cut and is not adjudicated here. */
+    uint64_t kexc_decl_no_user = 0;
+    uint64_t kexc_decl_not_owned = 0;
+    uint64_t kexc_decl_cut = 0;
+    uint64_t kexc_decl_not_owned_live_pinned = 0;
     /* Kernel (priv!=0) TBs dropped because they executed at the target's
      * translation-bypassing privilege level (RISC-V M-mode firmware, which
      * satp does not govern; see g_xlate_bypass_priv).  Counted on both

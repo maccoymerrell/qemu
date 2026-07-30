@@ -362,7 +362,10 @@ private:
     void prime_from_live();
     void kexc_apply_asid_write(uint64_t new_asid);
     void kexc_user_tb(uint64_t live_asid, bool owned);
-    bool kexc_kernel_tb_keep(void);
+    /* @in supplies the executing fragment (block PC + instruction count) and
+     * the live / pinned ASIDs, all of which feed only the ownership-census
+     * instrumentation; the keep rule itself reads excursion state alone. */
+    bool kexc_kernel_tb_keep(const StepIn &in);
     void kexc_reset();
     /* @owner_tid is StepIn::walk_tid: a frame opened here is the deferred
      * prev's excursion, so the thread that ran that block owns it. */
@@ -586,8 +589,16 @@ private:
      *                       = user_owned_, overlay cleared, cut
      *                       cleared.
      *   ASID_WRITE (new V)  only meaningful while in kernel:
-     *                         V == exc_entry_   nothing (restore;
-     *                                           ownership continues)
+     *                         V == exc_entry_   restore: the entering
+     *                                           address space is loaded
+     *                                           again, so ownership
+     *                                           continues — which means
+     *                                           retiring any standing cut
+     *                                           (it described an address
+     *                                           space that is no longer in
+     *                                           force).  The overlay is
+     *                                           kept, so a further third
+     *                                           value cuts again.
      *                         no overlay yet    overlay_ = V (the
      *                                           excursion's kernel
      *                                           overlay — a PTI entry
@@ -627,6 +638,10 @@ private:
     bool     kexc_have_overlay_ = false;
     uint64_t kexc_overlay_ = 0;
     bool     kexc_cut_ = false;
+    /* This excursion has seen an entry-ASID restore that retired a standing
+     * cut.  Instrumentation only (it partitions the kernel TBs that the
+     * sticky-cut defect used to refuse); never consulted by the keep rule. */
+    bool     kexc_restored_after_cut_ = false;
     /* Distinct new-values this excursion (storm detection).  Bounded
      * scan is fine: the set never grows past the storm threshold. */
     static constexpr uint32_t KEXC_STORM_THRESHOLD = 16;

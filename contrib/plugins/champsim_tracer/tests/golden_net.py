@@ -839,21 +839,32 @@ SYS_TIMEOUT = 3600
 SYS_VMEM_KB = 25165824                            # ulimit -v (24 GiB)
 SYS_N_DET = 2                                     # GREEN-twice determinism gate
 
-# System cells.  A cell's optional `opts` replaces SYS_PLUGIN_OPTS for it.
+# System cells.  A cell's optional `opts` replaces SYS_PLUGIN_OPTS for it; an
+# optional `qemu_args` list is appended to the qemu invocation.
 #
 # The int1 cell exists because SYS_PLUGIN_OPTS does NOT set interrupts=1, so
 # without it nothing in the acceptance set boots the captured-async-window code
 # at all: the window's depth level, the fault trailer it rides and the
 # seal-successor substitution the window arms are all dark, and a change to any
-# of them lands unmeasured.  Whether the cell can carry a BYTE golden is
-# decided rather than assumed -- it goes through the same GREEN-twice
-# determinism gate as every other cell and is EXCLUDED with a reason if the
-# boot's interrupt arrival pattern makes the canon slice vary.  An excluded
-# cell is an honest negative, not a pass.
+# of them lands unmeasured.
+#
+# It boots under -icount, and the reason is measured, not assumed: on the
+# realtime clock the CP user slice depends on WHERE interrupt arrival lands --
+# a mid-BB IRQ splits the true BB, and observed indirect-branch target sets
+# shift -- at ~20% flap per boot with MULTIPLE flap modes (8/10 dominant plus
+# two distinct one-off slices in a 10-boot sweep).  That variance is real
+# execution structure, so masking it in the canon would falsify the wire; and
+# the GREEN-twice gate has only ~0.8^2 power against it, which false-passed
+# once (captured on two agreeing boots, flapped on the third).  A deterministic
+# virtual clock removes the variance at its source.  Maintainer ruling: icount
+# is NOT canonical for delivered captures and must never band-aid a defect,
+# but "for the sake of comparing against golden cells, it is fine to force
+# icount for determinism" -- this cell is exactly that sanctioned use.
 SYS_CELLS = [
     {"name": "devio_sys_x86_64", "isa": "x86_64"},
     {"name": "devio_sys_x86_64_int1", "isa": "x86_64",
-     "opts": SYS_PLUGIN_OPTS + ",interrupts=1,faults=1"},
+     "opts": SYS_PLUGIN_OPTS + ",interrupts=1,faults=1",
+     "qemu_args": ["-icount", "shift=0,sleep=off", "-rtc", "clock=vm"]},
 ]
 
 # Frozen system fixtures for the DECODER guard (reuse the SVG fixture files).
@@ -1051,7 +1062,8 @@ def sys_cpu_preflight() -> list[str]:
 
 
 def sys_trace_once(build: Path, kernel: Path, initrd: Path, out_dir: Path,
-                   label: str, opts: str = SYS_PLUGIN_OPTS) -> Path | None:
+                   label: str, opts: str = SYS_PLUGIN_OPTS,
+                   qemu_args: list[str] | None = None) -> Path | None:
     """Boot the canonical system recipe once with the plugin loaded, tracing
     to <out_dir>/<label>.cst.  Returns the .cst path, or None on failure."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1067,6 +1079,7 @@ def sys_trace_once(build: Path, kernel: Path, initrd: Path, out_dir: Path,
         "-append", SYS_APPEND,
         "-drive", f"file={scratch},format=raw,if=none,id=vblk0",
         "-device", "virtio-blk-pci,drive=vblk0,ioeventfd=off",
+        *(qemu_args or []),
         "-plugin", f"{plugin},outfile={out_base},{opts}",
     ]
     log = out_dir / f"{label}.run.log"
@@ -1139,6 +1152,8 @@ def sys_capture(build: Path, root: Path, waivers: dict) -> int:
             "plugin_opts": SYS_PLUGIN_OPTS, "mem": SYS_MEM,
             "cell_opts": {c["name"]: c.get("opts", SYS_PLUGIN_OPTS)
                           for c in SYS_CELLS},
+            "cell_qemu_args": {c["name"]: c.get("qemu_args", [])
+                               for c in SYS_CELLS},
         }
         for c in SYS_CELLS:
             name = c["name"]
@@ -1146,7 +1161,8 @@ def sys_capture(build: Path, root: Path, waivers: dict) -> int:
             hs = []
             for i in range(SYS_N_DET):
                 cst = sys_trace_once(build, kernel, initrd, root / name,
-                                     f"{name}_{i}", opts)
+                                     f"{name}_{i}", opts,
+                                     c.get("qemu_args"))
                 hs.append(sha(canon_user_slice(build, cst).encode())
                           if cst else None)
             if any(h is None for h in hs):
@@ -1226,7 +1242,8 @@ def sys_check(build: Path, root: Path, waivers: dict) -> int:
                     continue
                 cst = sys_trace_once(build, kernel, initrd, root / name,
                                      f"{name}_chk",
-                                     c.get("opts", SYS_PLUGIN_OPTS))
+                                     c.get("opts", SYS_PLUGIN_OPTS),
+                                     c.get("qemu_args"))
                 if cst is None:
                     fails.append(f"canon:{name}: trace not produced")
                     continue

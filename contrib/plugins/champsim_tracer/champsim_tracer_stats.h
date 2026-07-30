@@ -260,6 +260,20 @@ struct Stats {
     uint64_t kexc_decl_not_owned = 0;
     uint64_t kexc_decl_cut = 0;
     uint64_t kexc_decl_not_owned_live_pinned = 0;
+    /* Async re-latch (interrupts=1 + kexc=1): a captured window snapshots
+     * the excursion-ownership state at ASYNC_ENTER, and a genuine
+     * ASYNC_RETURN in the owner's context restores it — the producer fires
+     * only on a departure-PC re-fetch with the departure thread pointer, so
+     * the machine is provably back in the interrupted excursion, and
+     * whatever the window's foreign interleave did to the entry edge no
+     * longer describes it.  The census mirrors the cut-restore one: TBs
+     * kept after a re-latch are exactly the pinned excursion's post-window
+     * tail a foreign-latched edge would have refused. */
+    uint64_t kexc_async_snapshots = 0;
+    uint64_t kexc_async_relatches = 0;
+    uint64_t kexc_async_relatch_skipped = 0;
+    uint64_t kexc_post_relatch_kept_tbs = 0;
+    uint64_t kexc_post_relatch_kept_insns = 0;
     /* Kernel (priv!=0) TBs dropped because they executed at the target's
      * translation-bypassing privilege level (RISC-V M-mode firmware, which
      * satp does not govern; see g_xlate_bypass_priv).  Counted on both

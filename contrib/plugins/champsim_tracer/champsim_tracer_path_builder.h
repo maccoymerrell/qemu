@@ -716,6 +716,10 @@ private:
     bool     kexc_have_overlay_ = false;
     uint64_t kexc_overlay_ = 0;
     bool     kexc_cut_ = false;
+    /* Which decline-census arm refused the last dropped kernel TB
+     * (0 none, 1 no_user, 2 not_owned, 3 cut) — read by the CST_JUMP_DIAG
+     * gap-condition recorder only; no behavioral reader. */
+    uint8_t  kexc_last_decline_ = 0;
     /* This excursion has seen an entry-ASID restore that retired a standing
      * cut.  Instrumentation only (it partitions the kernel TBs that the
      * sticky-cut defect used to refuse); never consulted by the keep rule. */
@@ -726,6 +730,40 @@ private:
     uint64_t kexc_vals_[KEXC_STORM_THRESHOLD];
     uint32_t kexc_nvals_ = 0;
     bool     kexc_stormed_ = false;     /* this excursion already counted */
+
+    /* Async re-latch (interrupts=1 only).  A captured window's content —
+     * the handler and everything the guest scheduler runs before the
+     * departure PC is re-fetched — routinely includes foreign user TBs,
+     * which reset the excursion state above and re-latch the entry edge to
+     * a FOREIGN owner.  The interrupted excursion's own post-window kernel
+     * tail then refuses on not_owned all the way to user privilege, which
+     * silently deletes its depth level from the wire (the residual 2->0).
+     * The ASYNC_RETURN producer fires only when the departure PC is
+     * re-fetched with the departure thread pointer, so the return is proof
+     * the machine is back in the state the window interrupted: snapshot
+     * the ownership block at ASYNC_ENTER and restore it on the owner's
+     * genuine return.  A window that never returns (abandon, pre-prime,
+     * segment boundary) invalidates the snapshot instead. */
+    struct KexcSnap {
+        bool     valid = false;
+        bool     in_kernel;
+        bool     have_user, user_owned;
+        uint64_t last_user_asid;
+        uint64_t exc_entry;
+        bool     entry_owned;
+        bool     have_overlay;
+        uint64_t overlay;
+        bool     cut, restored_after_cut;
+        uint64_t vals[KEXC_STORM_THRESHOLD];
+        uint32_t nvals;
+        bool     stormed;
+    } kexc_snap_;
+    /* Census flag (mirrors kexc_restored_after_cut_): this excursion's
+     * ownership was re-latched from an async-return snapshot; cleared by
+     * kexc_reset.  Never consulted by the keep rule. */
+    bool kexc_relatched_ = false;
+    void kexc_async_snapshot();
+    void kexc_async_restore();
 
     bool evq_enabled_ = false;
     unsigned int cpu_index_ = 0;

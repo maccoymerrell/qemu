@@ -208,7 +208,189 @@ struct JumpStepRec {
 };
 constexpr size_t JD_RING = 32;
 
+/*
+ * ---- Gap condition (CST_JUMP_DIAG extension) ----
+ *
+ * The residual 2->0 signature is "an async-window close, then a fault
+ * return, with ZERO wire entries in between".  The wire cannot say whether
+ * depth-1 blocks were executed-and-refused (a drop bug) or never executed
+ * (an architectural adjacency).  This record captures the CONDITION from
+ * the plugin's step stream — every TB QEMU executed reaches step_events
+ * before any gate — between the most recent async-window close and the
+ * flagged emit: how many steps survived the gates, how many were refused
+ * and WHY (per gate / per kexc decline arm), and the first refused PCs.
+ * Dumped by the online jump detector alongside its rings.
+ */
+enum : uint8_t {
+    GAP_R_ASYNC = 0,        /* async mute bail (interrupts=0 only) */
+    GAP_R_MMODE,            /* translation-bypass privilege drop */
+    GAP_R_LEGACY_ASID,      /* kexc off: kernel live-ASID mismatch */
+    GAP_R_USER_UNOWNED,     /* user TB not owned by the pin */
+    GAP_R_KEXC_NO_USER,     /* kexc decline: no user context yet */
+    GAP_R_KEXC_NOT_OWNED,   /* kexc decline: entry edge not owned */
+    GAP_R_KEXC_CUT,         /* kexc decline: committed-switch cut */
+    GAP_R_N
+};
+static const char *const gap_reason_name[GAP_R_N] = {
+    "async-mute", "mmode", "legacy-asid", "user-unowned",
+    "kexc-no-user", "kexc-not-owned", "kexc-cut",
+};
+struct GapDropRec {
+    uint64_t pc, live_asid, exc_entry;
+    uint32_t n_insns;
+    uint8_t  priv, reason, kflags;   /* kflags: owned|cut<<1|have_user<<2|
+                                      * stormed<<3|restored<<4 */
+};
+constexpr size_t GAP_DROPS = 16;
+struct GapState {
+    bool     armed;
+    const char *close_kind;
+    uint64_t close_seq, close_pc, win_id;
+    uint64_t fr_seq, fr_pc;          /* first matched FAULT_RETURN after
+                                      * the close (0 = none yet) */
+    uint32_t steps_cont, steps_cont_kernel;
+    uint32_t cont_at_fr, drops_at_fr;
+    uint32_t drops_by[GAP_R_N];
+    GapDropRec drops[GAP_DROPS];
+    uint32_t n_drops;
+};
+
 }  /* namespace */
+
+/* Process-wide, heap-adjacent static (exec_lock serialises every writer);
+ * NOT thread_local — the tracer's static-TLS budget is enforced at build
+ * time and a diagnostic must not spend it. */
+static GapState g_gap;
+
+static uint32_t gap_total_drops(void)
+{
+    uint32_t t = 0;
+    for (uint32_t i = 0; i < GAP_R_N; i++) {
+        t += g_gap.drops_by[i];
+    }
+    return t;
+}
+
+static void gap_arm(const char *kind, uint64_t win_id)
+{
+    if (!cst_jump_diag()) {
+        return;
+    }
+    g_gap = GapState();
+    g_gap.armed = true;
+    g_gap.close_kind = kind;
+    g_gap.win_id = win_id;
+    g_gap.close_seq = g_dbg_last_emit_seq;
+}
+
+static void gap_disarm(void)
+{
+    g_gap.armed = false;
+}
+
+static void gap_record_drop(uint8_t reason, uint64_t pc, uint32_t n_insns,
+                            int priv, uint64_t live_asid, uint64_t exc_entry,
+                            uint8_t kflags)
+{
+    if (!cst_jump_diag() || !g_gap.armed) {
+        return;
+    }
+    g_gap.drops_by[reason]++;
+    if (g_gap.n_drops < GAP_DROPS) {
+        GapDropRec &d = g_gap.drops[g_gap.n_drops++];
+        d.pc = pc;
+        d.live_asid = live_asid;
+        d.exc_entry = exc_entry;
+        d.n_insns = n_insns;
+        d.priv = (uint8_t)priv;
+        d.reason = reason;
+        d.kflags = kflags;
+    }
+}
+
+static void gap_record_continue(int priv)
+{
+    if (!cst_jump_diag() || !g_gap.armed) {
+        return;
+    }
+    g_gap.steps_cont++;
+    if (priv > 0) {
+        g_gap.steps_cont_kernel++;
+    }
+}
+
+static void gap_record_fault_return(uint64_t pc)
+{
+    if (!cst_jump_diag() || !g_gap.armed || g_gap.fr_seq) {
+        return;
+    }
+    g_gap.fr_seq = g_dbg_last_emit_seq;
+    g_gap.fr_pc = pc;
+    g_gap.cont_at_fr = g_gap.steps_cont;
+    g_gap.drops_at_fr = gap_total_drops();
+}
+
+/* Two-direction observability probe: under CST_GAP_DIAG_ALL every merge
+ * completion prints a one-line gap summary, so the instrument's ZERO
+ * direction (no steps refused since the window close) is demonstrably
+ * reported as zero on ordinary merges — the alpha direction cannot be an
+ * artifact of only ever printing when drops exist. */
+static void gap_merge_probe(void)
+{
+    static const bool all = getenv("CST_GAP_DIAG_ALL") != nullptr;
+    if (!all) {
+        return;
+    }
+    if (!g_gap.armed) {
+        fprintf(stderr, "[gapdiag] MERGE emitseq=%" PRIu64
+                " (no window close on record)\n", g_dbg_last_emit_seq);
+        return;
+    }
+    fprintf(stderr, "[gapdiag] MERGE emitseq=%" PRIu64 " close=%s win=%"
+            PRIu64 "@%" PRIu64 " fr=%s cont=%u(kern=%u) dropped=%u\n",
+            g_dbg_last_emit_seq, g_gap.close_kind, g_gap.win_id,
+            g_gap.close_seq, g_gap.fr_seq ? "seen" : "none",
+            g_gap.steps_cont, g_gap.steps_cont_kernel, gap_total_drops());
+}
+
+static void gap_dump(uint64_t viol_seq)
+{
+    if (!g_gap.armed) {
+        fprintf(stderr, "[gapdiag] no async-window close on record before "
+                "this emit (gap instrument disarmed)\n");
+        return;
+    }
+    fprintf(stderr,
+            "[gapdiag] close kind=%s win=%" PRIu64 " at seq=%" PRIu64
+            " pc=0x%" PRIx64 " | fault-return %s pc=0x%" PRIx64 " at seq=%"
+            PRIu64 " | violation seq=%" PRIu64 "\n"
+            "[gapdiag] steps since close: continued=%u (kernel=%u) "
+            "dropped=%u | at fault-return: continued=%u dropped=%u\n",
+            g_gap.close_kind, g_gap.win_id, g_gap.close_seq, g_gap.close_pc,
+            g_gap.fr_seq ? "SEEN" : "none", g_gap.fr_pc, g_gap.fr_seq,
+            viol_seq, g_gap.steps_cont, g_gap.steps_cont_kernel,
+            gap_total_drops(), g_gap.cont_at_fr, g_gap.drops_at_fr);
+    for (uint32_t i = 0; i < GAP_R_N; i++) {
+        if (g_gap.drops_by[i]) {
+            fprintf(stderr, "[gapdiag]   dropped %-14s %u\n",
+                    gap_reason_name[i], g_gap.drops_by[i]);
+        }
+    }
+    for (uint32_t i = 0; i < g_gap.n_drops; i++) {
+        const GapDropRec &d = g_gap.drops[i];
+        fprintf(stderr, "[gapdiag]   drop[%02u] pc=0x%" PRIx64 " n=%u priv=%u"
+                " %s live=0x%" PRIx64 " entry=0x%" PRIx64
+                " owned=%u cut=%u have_user=%u storm=%u restored=%u\n",
+                i, d.pc, d.n_insns, d.priv, gap_reason_name[d.reason],
+                d.live_asid, d.exc_entry, d.kflags & 1, (d.kflags >> 1) & 1,
+                (d.kflags >> 2) & 1, (d.kflags >> 3) & 1, (d.kflags >> 4) & 1);
+    }
+    if (gap_total_drops() > g_gap.n_drops) {
+        fprintf(stderr, "[gapdiag]   (%u further drops not ringed)\n",
+                gap_total_drops() - g_gap.n_drops);
+    }
+    fflush(stderr);
+}
 
 /* Process-wide rings on the HEAP: the plugin is dlopen'd and the tracer's
  * TLS block already all but fills glibc's static-TLS surplus, so a
@@ -272,9 +454,13 @@ void cst_jump_diag_emit(uint64_t seq, uint32_t tid, uint64_t pc,
     uint32_t pd = 0;
     if (it != g_jd_last_by_tid->end()) {
         pd = it->second.first;
-        const bool same_priv = (it->second.second == is_sys);
-        if (same_priv &&
-            (depth > pd ? depth - pd : pd - depth) > 1) {
+        /* Diagnosis alignment (flake2): the offline oracle exempts a
+         * privilege-crossing step ONLY on multi-thread traces
+         * (validator.py _check_syscall_fault_nesting @guest_threads > 1);
+         * on the single-thread churn corpus it flags kernel->user 2->0 —
+         * the exact residual under study — which the previous same-priv
+         * guard here silently suppressed.  Mirror the offline rule. */
+        if ((depth > pd ? depth - pd : pd - depth) > 1) {
             viol = true;
             kind = "JUMP";
         }
@@ -329,6 +515,7 @@ void cst_jump_diag_emit(uint64_t seq, uint32_t tid, uint64_t pc,
                 r.depth_next, r.prev_depth, pdsrc_name(r.pdsrc),
                 r.walk_depth, pdsrc_name(r.wdsrc), r.frames, r.susp);
     }
+    gap_dump(seq);
     fflush(stderr);
 }
 
@@ -444,6 +631,8 @@ void PathBuilder::on_segment_open()
                 "at segment open\n", susp_stack_.size());
     }
     g_stats.susp_orphan_dropped += susp_stack_.size();
+    gap_disarm();
+    kexc_snap_.valid = false;
     susp_stack_.clear();
     frames_.clear();
     pending_evs_.clear();
@@ -672,6 +861,56 @@ void PathBuilder::kexc_reset()
     kexc_restored_after_cut_ = false;
     kexc_nvals_ = 0;
     kexc_stormed_ = false;
+    kexc_relatched_ = false;
+}
+
+/* Async re-latch pair (see the header comment at kexc_snap_).  Snapshot
+ * everything kexc_kernel_tb_keep consults plus the per-excursion
+ * instrumentation state, so a restored excursion behaves — and reports —
+ * exactly as if the window's interleave had not touched it. */
+void PathBuilder::kexc_async_snapshot()
+{
+    kexc_snap_.valid = true;
+    kexc_snap_.in_kernel = kexc_in_kernel_;
+    kexc_snap_.have_user = kexc_have_user_;
+    kexc_snap_.user_owned = kexc_user_owned_;
+    kexc_snap_.last_user_asid = kexc_last_user_asid_;
+    kexc_snap_.exc_entry = kexc_exc_entry_;
+    kexc_snap_.entry_owned = kexc_entry_owned_;
+    kexc_snap_.have_overlay = kexc_have_overlay_;
+    kexc_snap_.overlay = kexc_overlay_;
+    kexc_snap_.cut = kexc_cut_;
+    kexc_snap_.restored_after_cut = kexc_restored_after_cut_;
+    memcpy(kexc_snap_.vals, kexc_vals_, sizeof(kexc_vals_));
+    kexc_snap_.nvals = kexc_nvals_;
+    kexc_snap_.stormed = kexc_stormed_;
+    g_stats.kexc_async_snapshots++;
+}
+
+void PathBuilder::kexc_async_restore()
+{
+    kexc_in_kernel_ = kexc_snap_.in_kernel;
+    kexc_have_user_ = kexc_snap_.have_user;
+    kexc_user_owned_ = kexc_snap_.user_owned;
+    kexc_last_user_asid_ = kexc_snap_.last_user_asid;
+    kexc_exc_entry_ = kexc_snap_.exc_entry;
+    kexc_entry_owned_ = kexc_snap_.entry_owned;
+    kexc_have_overlay_ = kexc_snap_.have_overlay;
+    kexc_overlay_ = kexc_snap_.overlay;
+    kexc_cut_ = kexc_snap_.cut;
+    kexc_restored_after_cut_ = kexc_snap_.restored_after_cut;
+    memcpy(kexc_vals_, kexc_snap_.vals, sizeof(kexc_vals_));
+    kexc_nvals_ = kexc_snap_.nvals;
+    kexc_stormed_ = kexc_snap_.stormed;
+    kexc_snap_.valid = false;
+    kexc_relatched_ = true;
+    g_stats.kexc_async_relatches++;
+    if (kexc_diag()) {
+        fprintf(stderr, "[kexcdiag] ASYNC-RELATCH entry=0x%" PRIx64
+                " owned=%d in_kernel=%d cut=%d\n",
+                kexc_exc_entry_, (int)kexc_entry_owned_,
+                (int)kexc_in_kernel_, (int)kexc_cut_);
+    }
 }
 
 /* One ASID_WRITE path event (@new_asid = the committed NEW value).
@@ -807,6 +1046,14 @@ bool PathBuilder::kexc_kernel_tb_keep(const StepIn &in)
     bool keep = ours && !kexc_cut_;
     if (keep) {
         g_stats.kexc_kernel_kept++;
+        /* Post-re-latch census (mirrors the post-restore one below): blocks
+         * admitted while the excursion runs on an async-return re-latched
+         * edge are exactly the post-window tail a foreign-latched edge
+         * refused all the way to user privilege. */
+        if (kexc_relatched_) {
+            g_stats.kexc_post_relatch_kept_tbs++;
+            g_stats.kexc_post_relatch_kept_insns += n_insns;
+        }
         /* Post-restore recovery census: the blocks the restore arrow puts
          * back in the trace.  A cut is monotone within an excursion unless a
          * restore retires it, so a block admitted after one is exactly a
@@ -840,8 +1087,10 @@ bool PathBuilder::kexc_kernel_tb_keep(const StepIn &in)
         /* Decline-reason census.  Exactly one arm fires per refused block. */
         if (!kexc_have_user_) {
             g_stats.kexc_decl_no_user++;
+            kexc_last_decline_ = 1;
         } else if (!kexc_entry_owned_) {
             g_stats.kexc_decl_not_owned++;
+            kexc_last_decline_ = 2;
             /* The excursion was latched to a foreign entry, yet the address
              * space in force is the pinned one: a re-entry with no
              * intervening user TB.  A separate attribution question from the
@@ -851,6 +1100,7 @@ bool PathBuilder::kexc_kernel_tb_keep(const StepIn &in)
             }
         } else {
             g_stats.kexc_decl_cut++;
+            kexc_last_decline_ = 3;
             /* THE TRIPWIRE.  A cut asserts the address space moved away; the
              * live register says it is the excursion's own entry value.  Both
              * cannot hold, so a non-zero count is a cut outliving the switch
@@ -1204,6 +1454,7 @@ void PathBuilder::apply_fault_return(const struct qemu_plugin_cpu_event &ev)
     ptrdiff_t idx = frame_idx_for_resume(ev.pc, ev.asid);
     if (idx >= 0) {
         frames_[(size_t)idx].returned = true;
+        gap_record_fault_return(ev.pc);
     }
     cst_jump_diag_step(ev.pc, 0, (int)ev.priv, (int)(idx >= 0),
                        idx >= 0 ? "fault-return" : "fault-return/nomatch");
@@ -1288,8 +1539,37 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
      * byte-for-byte. */
     if (g_features.kexc && in.pinned) {
         for (size_t i = 0; i < in.n_evs; i++) {
-            if (in.evs[i].kind == QEMU_PLUGIN_CPU_EV_ASID_WRITE) {
-                kexc_apply_asid_write(in.evs[i].asid);
+            const struct qemu_plugin_cpu_event &kev = in.evs[i];
+            if (kev.kind == QEMU_PLUGIN_CPU_EV_ASID_WRITE) {
+                kexc_apply_asid_write(kev.asid);
+            } else if (!g_features.trace_interrupts) {
+                /* interrupts=0: windows are excluded content, ownership
+                 * tracks the writes alone — legacy byte-for-byte. */
+            } else if (kev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_ENTER) {
+                /* Async re-latch, snapshot arrow: pair the ownership state
+                 * with the departure this window will eventually re-fetch.
+                 * A REOPEN deliberately overwrites — the new departure
+                 * resumes into the state at ITS delivery, not the outer
+                 * one's.  Ordered with the ASID_WRITE applies above so a
+                 * write earlier in this drain is inside the snapshot and a
+                 * later one is window content. */
+                kexc_async_snapshot();
+            } else if (kev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_RETURN) {
+                /* Restore arrow: only for a window whose owner is proven —
+                 * the return context is the thread the level belongs to
+                 * (the producer's departure-tp check makes the two agree;
+                 * an unsighted or peer context leaves the state alone and
+                 * the edge keeps today's behavior). */
+                if (g_async_win_id && kexc_snap_.valid &&
+                    async_owner_tid_ != CST_TID_UNSEEN &&
+                    in.cur_tid == async_owner_tid_) {
+                    kexc_async_restore();
+                } else {
+                    if (g_async_win_id) {
+                        g_stats.kexc_async_relatch_skipped++;
+                    }
+                    kexc_snap_.valid = false;
+                }
             }
         }
     }
@@ -1321,6 +1601,7 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
                     g_stats.async_captures_reopened++;
                     async_win_close("REOPEN", in.cur_tid);
                 }
+                gap_disarm();       /* a window is open: no closed-gap now */
                 async_owner_tid_ = in.cur_tid;
                 g_async_win_id = ++g_async_win_seq;
                 g_async_win_enter_seq = g_dbg_last_emit_seq;
@@ -1353,7 +1634,10 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
                          * regression tripwire. */
                         g_stats.async_return_peer_ctx++;
                     }
+                    uint64_t closed_win = g_async_win_id;
                     async_win_close("RETURN", in.cur_tid);
+                    gap_arm("RETURN", closed_win);
+                    g_gap.close_pc = ev.pc;
                 }
                 async_owner_tid_ = CST_TID_UNSEEN;
                 if (pb_async_diag()) {
@@ -1405,7 +1689,9 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
         if (g_async_win_id) {
             async_owner_tid_ = CST_TID_UNSEEN;
             async_win_close("PREPRIME", in.cur_tid);
+            gap_disarm();       /* nothing owed pre-prime */
         }
+        kexc_snap_.valid = false;   /* pre-prime window: no owed re-latch */
     } else {
         for (const struct qemu_plugin_cpu_event &ev : pending_evs_) {
             if (ev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_ENTER) {
@@ -1525,6 +1811,9 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
              * routinely context-switches through OTHER address spaces,
              * and those TBs must take THIS bail (which preserves the
              * deferred prev for the resume), not the ASID drop. */
+            gap_record_drop(GAP_R_ASYNC, in.cur ? in.cur->start_pc : 0,
+                            in.cur ? in.cur->n_insns : 0, in.live_priv,
+                            in.live_asid, kexc_exc_entry_, 0);
             return StepStatus::SUSPENDED;
         }
     }
@@ -1564,6 +1853,30 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
             drop = !kexc_kernel_tb_keep(in);
         }
         if (drop) {
+            if (cst_jump_diag() && g_gap.armed) {
+                uint8_t r;
+                if (in.live_priv > 0 &&
+                    in.live_priv == g_xlate_bypass_priv) {
+                    r = GAP_R_MMODE;
+                } else if (!g_features.kexc) {
+                    r = in.live_priv == 0 ? GAP_R_USER_UNOWNED
+                                          : GAP_R_LEGACY_ASID;
+                } else if (in.live_priv == 0) {
+                    r = GAP_R_USER_UNOWNED;
+                } else {
+                    r = kexc_last_decline_ == 1 ? GAP_R_KEXC_NO_USER
+                      : kexc_last_decline_ == 2 ? GAP_R_KEXC_NOT_OWNED
+                                                : GAP_R_KEXC_CUT;
+                }
+                uint8_t kf = (uint8_t)((kexc_entry_owned_ ? 1 : 0) |
+                                       (kexc_cut_ ? 2 : 0) |
+                                       (kexc_have_user_ ? 4 : 0) |
+                                       (kexc_stormed_ ? 8 : 0) |
+                                       (kexc_restored_after_cut_ ? 16 : 0));
+                gap_record_drop(r, in.cur ? in.cur->start_pc : 0,
+                                in.cur ? in.cur->n_insns : 0, in.live_priv,
+                                in.live_asid, kexc_exc_entry_, kf);
+            }
             /* SUSPEND-OR-SEAL (plan §1.2).  Freeze the deferred prev + its
              * four sinks onto the suspension stack instead of dropping
              * them, so the pinned process's resume seals the interrupted
@@ -1631,6 +1944,7 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
      * shares its process's CR3, so live is the owning process there too. */
     prev_owner_asid_ = in.pinned_asid;
     prev_owner_live_ = in.live_asid;
+    gap_record_continue(in.live_priv);
     return StepStatus::CONTINUE;
 }
 
@@ -1650,6 +1964,7 @@ PathBuilder::complete_merge(size_t idx,
                             BodyStreamState *out_stream,
                             unsigned int cpu_index)
 {
+    gap_merge_probe();
     /* faults=0: the synchronous-fault handler excursion is excluded, but the
      * merge still runs so a fault-split interrupted block reassembles whole.
      * A frame at depth >= 1 is a NESTED fault's interrupted HANDLER block —
@@ -2468,7 +2783,17 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
                 async_departure_pc_ = 0;
                 async_owner_tid_ = CST_TID_UNSEEN;
                 g_stats.async_abandon_owner++;
-                async_win_close("ABANDON", in.cur_tid);
+                /* An abandoned window never re-fetches its departure, so
+                 * the snapshot's "machine is back where it left" premise is
+                 * void — the ownership state stays as the interleave left
+                 * it (this TB is user privilege: the very next step
+                 * re-latches fresh anyway). */
+                kexc_snap_.valid = false;
+                {
+                    uint64_t closed_win = g_async_win_id;
+                    async_win_close("ABANDON", in.cur_tid);
+                    gap_arm("ABANDON", closed_win);
+                }
                 if (pb_diag()) {
                     fprintf(stderr, "[pathbuilder] ASYNC-ABANDON reset at "
                             "pinned user tb=0x%" PRIx64 "\n",

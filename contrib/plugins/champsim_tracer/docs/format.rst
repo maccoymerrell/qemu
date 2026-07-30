@@ -304,23 +304,46 @@ sanity check.
    2.10 comment      : string
    2.11 target_name  : string
    2.12 encoding_maps_section : section    ; see Step 3 for inner shape
-   2.13 warmup_end_arch_insns : ULEB
-        Architectural CP-insn count, measured against the body's
-        own BB-template `n_insns` values, at which the segment
-        transitions from warmup to simulation phase.  A consumer
-        walking BODY_TAG_ENTRY records and summing the referenced
-        template's `n_insns` enters the simulation phase the moment
-        that sum reaches this value.
+   2.13 warmup_end_trace_insn_idx : ULEB
+        The TRACE-POSITION index of the warmup→simulation
+        boundary: the number of in-trace instructions (the sum of
+        each BODY_TAG_ENTRY's template `n_insns`, fan-out records
+        included) that precede the first simulation-phase record.
+        A consumer walking body records and summing template
+        `n_insns` enters the simulation phase the moment that sum
+        reaches this value.
 
-        Why a separate field, not just `warmup_insns`: the segment
-        boundaries (start, warmup, stop) are configured in
-        BBV-equivalent TB-execution count, matching the BBV plugin
-        and SimPoint clustering.  The body, by contrast, fans REP
-        out into one record per architectural iteration, so the
-        in-trace arch-insn count diverges from BBV count whenever
-        REP MOVSB/STOSB/etc. fires in warmup.  Counting
-        `warmup_insns` of body entries would put the consumer
-        somewhere in the *middle* of warmup on REP-heavy phases.
+        This is NOT an architectural warmup depth.  The segment
+        budgets (`warmup_insns`, `total_target_insns`) are
+        configured in the window clock's units — the per-TB
+        execution count the BBV plugin produces, which is what
+        SimPoint offsets are selected from.  The body, by
+        contrast, fans REP/MOPS out into one record per
+        iteration, so trace position runs AHEAD of the window
+        clock whenever a fan-out instruction fires in warmup:
+        counting `warmup_insns` body records would leave the
+        consumer somewhere in the *middle* of warmup.  This field
+        is the bridge: the trace instruction that aligns with the
+        bbv-counted architectural warmup boundary.
+
+        Boundary rule (fan-out atomicity): the boundary never
+        splits one architectural instruction's records across the
+        warmup/measure line.  An architectural instruction whose
+        first record precedes the boundary crossing completes
+        inside warmup — all its records, and any excursion
+        records emitted between its chunks (its own fault or
+        interrupt service), count toward this index — while an
+        instruction whose first record lands at or after the
+        crossing is measured — with one TB-granular refinement:
+        fan-out instructions translated into the SAME block as a
+        straddling one (an AArch64 SETP/SETM/SETE trio is three
+        mid-block fan-out terminators) are held to the same side
+        as that block, so a bulk-operation trio never straddles
+        the line piecewise.  Warmup records are executed but
+        not measured, so a consumer switching phases at this
+        index never measures a partially-warmed instruction.
+        The rule is generic over fan-out families (x86 REP today;
+        AArch64 MOPS when its architectural facts land).
 
         Sentinel ULEB-encoded `UINT64_MAX` = the warmup boundary
         was not crossed in this segment (the trace was cut short,
@@ -2206,14 +2229,24 @@ translation, and on the wrong path — always single-stepped — as on the
 correct path.  A zero-count REP is a retired instruction and emits its
 one entry, carrying no memops.
 
-The window clock follows the same rule: a window budget counts
-architectural instructions, and a REP is one tick however many
-executions QEMU splits it into.  A FEAT_MOPS bulk op likewise: an
-execution the emulator suspends mid-transfer to service an interrupt
-and then re-enters is the same instruction continuing, and does not
-tick again.  Because the fan-out writes one entry
-per iteration, a trace may contain more entries than the window budget
-asked for; that is by design.
+The window clock does NOT follow the fan-out: a window budget counts
+instructions in bbv-billed units — the per-TB-execution count the BBV
+plugin produces under QEMU's canonical translation, the regime SimPoint
+offsets are clustered in.  That is one tick per architectural
+instruction, plus one per REP_MAX chunk boundary for an x86 REP (a
+counter-terminated N-iteration REP is ``1 + floor((N-2)/65536)`` ticks;
+measured on the bbv plugin directly — its loop translation deliberately
+re-enters at those deterministic boundaries and bbv bills each entry).
+Re-entries that the canonical translation would not make never tick:
+a single-iteration REP pass (``-icount``, single-step, ``EFLAGS.TF``)
+off a chunk boundary withholds, and a FEAT_MOPS re-entry always
+withholds — a MOPS execution the emulator suspends mid-transfer and
+re-enters is the same instruction continuing, a timing artifact with no
+canonical-translation counterpart.  The clock is therefore identical
+under every translation AND aligned with bbv counts.  Because the
+fan-out writes one entry per iteration, a trace may contain more
+entries than the window budget asked for; that is by design (see header
+field 2.13 for the bridge between the two positions).
 
 ::
 

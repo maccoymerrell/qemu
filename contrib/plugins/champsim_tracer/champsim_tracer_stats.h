@@ -178,12 +178,21 @@ struct Stats {
     uint64_t mops_bytes_mismatch = 0;
     uint64_t mops_bytes_unchecked = 0;
     /* rep_clock_ticks_withheld — user-clock ticks withheld from counted REP
-     * executions that ended by re-entering the instruction (per-iteration
-     * translation passes, REP_MAX chunk boundaries).  The window clock
-     * counts architectural instructions: a REP is one tick regardless of
-     * how many executions QEMU split it into, so a marker window covers
-     * the same user instructions with and without -icount. */
+     * executions that ended by re-entering the instruction OFF a canonical
+     * chunk boundary (per-iteration translation passes under icount /
+     * single-step / TF).  Chunk-boundary re-entries keep their tick: the
+     * window clock counts what the bbv plugin counts in the simpoint-
+     * generation regime (canonical loop translation), which bills one
+     * count per TB entry — the completing execution plus each REP_MAX
+     * chunk — so the clock is translation-invariant AND bbv-coherent.
+     * Under canonical translation this counter stays 0 by construction. */
     uint64_t rep_clock_ticks_withheld = 0;
+    /* rep_ff_ticks_withheld — the same correction applied on the pinned-
+     * simpoint fast-forward positioning clock (the exact per-TB phase and
+     * the coarse countdown's REP add-back), where the traced-window fold
+     * above never runs.  Splitting the counter keeps "positioning moved"
+     * distinguishable from "window coverage moved". */
+    uint64_t rep_ff_ticks_withheld = 0;
 
     /* Binary writer byte-count breakdown. */
     uint64_t bin_total_bits = 0;

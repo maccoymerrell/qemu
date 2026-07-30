@@ -1383,6 +1383,46 @@ static void gen_rep_plugin_reenter(DisasContext *s, bool reenter)
 }
 
 /*
+ * Publish whether a re-enter exit sits on a canonical chunk boundary — the
+ * exit a looping translation itself takes (counter writeback 65536*m + 1,
+ * m >= 1; see the REP_MAX loop bound in do_gen_rep).  On the looping
+ * translation's re-enter path that is structurally always true.  A
+ * single-iteration translation (can_loop == false) re-enters after every
+ * iteration, so there the boundary must be computed from the written-back
+ * counter @cx_wb: the canonical translation would have left the block here
+ * iff (cx_wb - 1) is a non-zero multiple of REP_MAX + 1 under the
+ * instruction's address-size mask.
+ */
+static void gen_rep_plugin_chunk_const(DisasContext *s, bool chunk)
+{
+    if (!s->base.plugin_enabled) {
+        return;
+    }
+    tcg_gen_st8_tl(tcg_constant_tl(chunk), tcg_env,
+                   REP_PLUGIN_OFF(plugin_rep_chunk));
+}
+
+static void gen_rep_plugin_chunk_dynamic(DisasContext *s, TCGv cx_wb,
+                                         target_ulong cx_mask)
+{
+    if (!s->base.plugin_enabled) {
+        return;
+    }
+    TCGv t = tcg_temp_new();
+    TCGv low = tcg_temp_new();
+    TCGv nz = tcg_temp_new();
+    tcg_gen_subi_tl(t, cx_wb, 1);
+    /* (t & REP_MAX) == 0: t is a multiple of REP_MAX + 1. */
+    tcg_gen_andi_tl(low, t, REP_MAX);
+    tcg_gen_setcondi_tl(TCG_COND_EQ, low, low, 0);
+    /* (t & cx_mask) != 0: a NON-ZERO multiple within the address size. */
+    tcg_gen_andi_tl(nz, t, cx_mask);
+    tcg_gen_setcondi_tl(TCG_COND_NE, nz, nz, 0);
+    tcg_gen_and_tl(low, low, nz);
+    tcg_gen_st8_tl(low, tcg_env, REP_PLUGIN_OFF(plugin_rep_chunk));
+}
+
+/*
  * Publish retirement on the re-enter-the-same-instruction path, where it is
  * only knowable at run time: a REP translated as a single iteration
  * (can_loop == false) takes this path after its *final* iteration too, and
@@ -1476,6 +1516,7 @@ static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
     }
     gen_rep_plugin_complete(s, false);
     gen_rep_plugin_reenter(s, false);
+    gen_rep_plugin_chunk_const(s, false);
 #endif
 
     /* Any iteration at all?  */
@@ -1538,9 +1579,22 @@ static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
     /*
      * This path re-enters the same instruction, so retirement is decided by
      * the counter rather than by which label we left through.
+     *
+     * Chunk boundary: a looping translation only reaches this path when the
+     * loop bound expired — cx_next (already holding the NEXT iteration's
+     * writeback, one below the committed counter) passed both brcond tests
+     * above, i.e. it is a non-zero multiple of REP_MAX + 1 — so the flag is
+     * constant true.  A single-iteration translation reaches it after every
+     * iteration with cx_next still holding the committed writeback, so the
+     * boundary is computed from it.
      */
     gen_rep_plugin_complete_dynamic(s, cx_mask);
     gen_rep_plugin_reenter(s, true);
+    if (can_loop) {
+        gen_rep_plugin_chunk_const(s, true);
+    } else {
+        gen_rep_plugin_chunk_dynamic(s, cx_next, cx_mask);
+    }
 #endif
 
     /* Go to the main loop but reenter the same instruction.  */

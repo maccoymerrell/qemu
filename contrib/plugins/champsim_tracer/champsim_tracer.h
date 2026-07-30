@@ -1734,13 +1734,16 @@ void devio_set_map_active(bool on);
  * destination (the WriterCtx passed to body_stream_new) is closed
  * by the segment manager separately after this returns. */
 void body_stream_finish(BodyStreamState *st, GByteArray **header_bytes);
-/* Stash the in-trace architectural CP-insn count at which warmup
- * ends and the simulation phase begins, so finish writes it into
+/* Stash the trace-instruction index at which warmup ends and the
+ * simulation phase begins — a TRACE POSITION (in-trace insns before
+ * the boundary), NOT an architectural warmup depth: with REP/MOPS
+ * fan-out the trace runs ahead of the architectural (bbv-counted)
+ * clock the warmup budget is configured in.  Finish writes it into
  * the header (§2.13 in docs/format.rst).  Call before
- * body_stream_finish.  0 = no warmup configured / warmup never
- * elapsed (the entire trace is warmup). */
-void body_stream_set_warmup_end_arch_insns(BodyStreamState *st,
-                                           uint64_t value);
+ * body_stream_finish.  UINT64_MAX = boundary never crossed (the
+ * whole trace is warmup); 0 = no warmup configured. */
+void body_stream_set_warmup_end_trace_insn_idx(BodyStreamState *st,
+                                               uint64_t value);
 /* Free a BodyStreamState.  Required (not free()): it carries
  * std::vector members needing destructors, and the opaque forward
  * decl here doesn't let callers `delete` directly. */

@@ -471,10 +471,10 @@ void dump_header(FILE *out, MemberView hv, const Header &h)
     off = r.consumed();
     uint64_t warmup_end = r.uleb();
     if (warmup_end == UINT64_MAX) {
-        emit(out, r, off, 0, "warmup_end_arch_insns=UINT64_MAX (uncrossed)"
+        emit(out, r, off, 0, "warmup_end_trace_insn_idx=UINT64_MAX (uncrossed)"
              "  [Step 2.13]");
     } else {
-        emitf(out, r, off, 0, "warmup_end_arch_insns=%" PRIu64 "  [Step 2.13]",
+        emitf(out, r, off, 0, "warmup_end_trace_insn_idx=%" PRIu64 "  [Step 2.13]",
               warmup_end);
     }
 

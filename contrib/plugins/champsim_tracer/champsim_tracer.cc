@@ -485,6 +485,33 @@ static void vcpu_tb_ff_foreign(unsigned int cpu_index, void *udata)
     g_ff_foreign_insns += n;
 }
 
+/* REP compensation for the coarse countdown — the window-clock rule
+ * (count what the bbv plugin counts under the canonical loop translation)
+ * applied where no per-TB callback exists.  Registered during coarse
+ * fast-forward ONLY on user TBs whose first instruction is a fan-out
+ * instruction: every execution that must lose its count is a re-entering
+ * one, and a re-entering execution is by definition followed by an entry
+ * to this very TB, so this callback observes each of them exactly once,
+ * one entry later.  When the previous execution of this instruction left
+ * by re-entering OFF a canonical chunk boundary (a per-iteration
+ * translation pass under -icount — the canonical translation bbv counted
+ * makes no such entry), add its unconditional decrement back.  Ownership:
+ * a re-entry chain is synchronous within one process, so the live
+ * asid_match stands in for the previous execution's; a foreign process's
+ * REP (same shared-code TB) is skipped here because vcpu_tb_ff_foreign
+ * already added its whole decrement back.  udata = the REP's PC, keying
+ * the facts to this instruction.  Off the fast-forward hot path by
+ * construction: non-REP TBs never register it. */
+static void vcpu_tb_ff_rep(unsigned int cpu_index, void *udata)
+{
+    if (qemu_plugin_rep_pc() == (uint64_t)(uintptr_t)udata &&
+        qemu_plugin_rep_reenter() && !qemu_plugin_rep_chunk_boundary() &&
+        qemu_plugin_u64_get(g_scoreboard.asid_match, cpu_index) != 0) {
+        qemu_plugin_u64_add(g_scoreboard.budget, cpu_index, 1);
+        g_stats.rep_ff_ticks_withheld++;
+    }
+}
+
 /*
  * Pinned-ASID reuse detector (narrow-ASID targets; currently MIPS).
  *
@@ -2480,19 +2507,28 @@ static void reset_segment_local_state(void)
  * finish_trace_segment can diff and report per-segment fan-out. */
 static uint64_t g_seg_fanout_start = 0;
 
-/* Segment-local architectural CP-insn counter.  Bumped by parent
- * BB template n_insns (and +1 per REP sub-iteration) inside
+/* Segment-local TRACE-instruction counter (trace position).  Bumped by
+ * parent BB template n_insns (and +1 per REP sub-iteration) inside
  * emit_body_entry so it tracks exactly what cst_audit counts off
- * the body stream.  At the warmup→simulation transition (host
- * icount reaches window_start + warmup_insns) we snapshot this
- * into g_seg_warmup_end_arch_insns, which finish_trace_segment
- * then writes into the header (§2.13). */
+ * the body stream — which, through fan-out, runs AHEAD of the window
+ * clock (the bbv-equivalent count the budgets are configured in).  At
+ * the warmup→simulation transition (the window clock reaches the
+ * warmup budget) we snapshot this into g_seg_warmup_end_trace_insns,
+ * which finish_trace_segment writes into the header (§2.13): the
+ * trace-position index aligning to the bbv-counted warmup boundary. */
 static uint64_t g_seg_arch_insns = 0;
 /* UINT64_MAX sentinel = warmup boundary has not been crossed
  * (segment cut short, or warmup_insns==0 and no entry emitted
  * yet).  0 is a legitimate value (warmup_insns==0 → captured at
  * the very first entry). */
-static uint64_t g_seg_warmup_end_arch_insns = UINT64_MAX;
+static uint64_t g_seg_warmup_end_trace_insns = UINT64_MAX;
+/* Dispatch-time warmup crossing latch: set in tw_manage_window when the
+ * window clock (user clock in pinned modes, raw inline counter
+ * otherwise) reaches the warmup budget.  The §2.13 capture in
+ * emit_body_entry keys off this flag, never off a live clock read —
+ * emissions lag execution, and a live read would move the boundary
+ * with translation-dependent emission timing. */
+static bool g_seg_warmup_crossed = false;
 
 /* ============================================================
  * Opportunistic branch-alternate minting (static_templates=1, both modes).
@@ -2920,7 +2956,13 @@ static void start_trace_segment(const char *label,
     g_seg_fanout_start = g_rep_fanout_extra_insns.load(
         std::memory_order_relaxed);
     g_seg_arch_insns = 0;
-    g_seg_warmup_end_arch_insns = UINT64_MAX;
+    g_seg_warmup_end_trace_insns = UINT64_MAX;
+    g_seg_warmup_crossed = false;
+    /* A fan-out instruction left architecturally in flight by a previous
+     * segment must not hold the fresh segment's warmup boundary. */
+    for (int i = 0, n = qemu_plugin_num_vcpus(); i < n; i++) {
+        rep_state((unsigned)i).warmup_hold_reset();
+    }
 
     /* Capture the architectural register file so consumers can prime
      * register state without replaying a prior segment's dst-write
@@ -3173,18 +3215,45 @@ void emit_body_entry(BodyStreamState *out_stream,
                      uint64_t branch_successor_pc,
                      bool branch_successor_known)
 {
-    /* warmup→simulation boundary capture.  This BB is the first
-     * emitted at host_icount >= window_start + warmup_insns, so
-     * the consumer reads the simulation phase as "after this many
-     * in-trace architectural insns".  Snapshot g_seg_arch_insns
-     * BEFORE this entry's insns get added so the value points at
-     * the first sim-phase entry, not past it. */
-    if (g_seg_warmup_end_arch_insns == UINT64_MAX &&
-        g_trace_segments.is_active()) {
-        uint64_t simpoint_start =
-            g_trace_segments.window_start() + warmup_insns;
-        if (g_host_icount >= simpoint_start) {
-            g_seg_warmup_end_arch_insns = g_seg_arch_insns;
+    /* warmup→simulation boundary capture (header §2.13,
+     * warmup_end_trace_insn_idx): the trace-instruction index of the
+     * first simulation-phase record.  Snapshot g_seg_arch_insns BEFORE
+     * this entry's insns get added so the value points at the first
+     * sim-phase record, not past it.
+     *
+     * The crossing itself (g_seg_warmup_crossed) is latched at DISPATCH
+     * time on the window clock in tw_manage_window — not read live here
+     * — because emissions lag execution (pending seal, fault deferral),
+     * and a live read would move the boundary with emission timing:
+     * observably, per-iteration translation (-icount) emits mid-REP
+     * where chunk translation emits after the fault resolves, landing
+     * the boundary at different records for identical guest execution.
+     * The dispatch-time latch is on the corrected (translation-
+     * invariant, bbv-coherent) clock, so the crossing names the same
+     * architectural point in every arm.
+     *
+     * Boundary atomicity: the boundary never splits one architectural
+     * instruction's records across the warmup/measure line (a fan-out
+     * instruction — x86 REP, and MOPS when its facts land — renders one
+     * record per iteration, across several emissions when QEMU chunks
+     * or single-steps the loop, with fault/interrupt excursion records
+     * interleaved).  While a fan-out instruction is architecturally in
+     * flight on this vCPU (warmup_hold: begun, not retired — a
+     * predicate that survives mid-instruction faults, unlike reenter),
+     * the capture DEFERS past its remaining records and past excursion
+     * records emitted between its chunks; the boundary then points at
+     * the first record of the next architectural instruction.  A
+     * user-priv record at a different PC means the held instruction is
+     * architecturally past (or the hold is stale), bounding the
+     * deferral. */
+    if (g_seg_warmup_end_trace_insns == UINT64_MAX &&
+        g_seg_warmup_crossed && g_trace_segments.is_active()) {
+        const RepSelfLoopState &rs_wh = rep_state(cpu_index);
+        bool defer = rs_wh.warmup_hold_any() && bb_tmpl &&
+                     (rs_wh.warmup_hold_matches(bb_tmpl->start_pc) ||
+                      bb_tmpl->is_system);
+        if (!defer) {
+            g_seg_warmup_end_trace_insns = g_seg_arch_insns;
         }
     }
 
@@ -3472,6 +3541,22 @@ void emit_body_entry(BodyStreamState *out_stream,
                  * that retired the repetition, hence reenter rather than
                  * !complete.  A REP_MAX chunk boundary sets both. */
                 rs.cp_in_flight.in_progress = efacts.reenter;
+                /* Warmup-boundary hold release: the ARCHITECTURAL
+                 * predicate (a mid-instruction fault publishes
+                 * reenter=false while the instruction is unfinished, and
+                 * the §2.13 boundary must keep deferring across it) —
+                 * and only the emission stream of the instruction that
+                 * OWNS the hold.  The hold is armed at dispatch (see
+                 * events_path_step); a kernel REP running in the held
+                 * instruction's own fault service emits here too, and
+                 * without the pc/depth/system gate its retirement would
+                 * release the user instruction's hold mid-flight
+                 * (observed: clear_page's rep stosq between two chunks
+                 * landed the boundary inside the user REP's records). */
+                if (entry.fault_depth == 0 && !bb_tmpl->is_system) {
+                    rs.warmup_hold_update(bb_tmpl->insn_pcs[last],
+                                          !rep_retired);
+                }
             }
             if (arch_known && n_iter == 0 && continuation) {
                 g_stats.rep_trailing_pass_dropped++;
@@ -3752,8 +3837,8 @@ static void finish_trace_segment(bool prev_executed = true)
      * stream so body_stream_finish writes it into the header
      * (§2.13 in docs/format.rst). */
     if (BodyStreamState *bs = g_trace_segments.body_stream()) {
-        body_stream_set_warmup_end_arch_insns(
-            bs, g_seg_warmup_end_arch_insns);
+        body_stream_set_warmup_end_trace_insn_idx(
+            bs, g_seg_warmup_end_trace_insns);
     }
     /* Drain any chain still in flight.  This may call emit_body_entry
      * one or more times, which bumps g_seg_arch_insns — so we print
@@ -4547,6 +4632,24 @@ static void tw_manage_window(unsigned int cpu_index,
                              uint64_t icount_prev,
                              BBTemplate *cur_tb_tmpl)
 {
+    /* Warmup crossing (header §2.13), latched here at dispatch
+     * granularity on the same clock the window budget runs on: the
+     * pinned user clock when marker_user_clock(), the raw inline
+     * counter against window_start otherwise.  Runs before this step's
+     * seal-phase emissions, so the first record emitted at-or-after the
+     * crossing is capturable by emit_body_entry.  warmup_insns is 0
+     * outside simpoint windows, making the flag true from the first
+     * in-segment step there (boundary index 0 = no warmup, as before). */
+    if (g_trace_segments.is_active() && !g_seg_warmup_crossed) {
+        bool wm_crossed = marker_user_clock()
+            ? g_user_icount >= warmup_insns
+            : icount_prev >=
+                  g_trace_segments.window_start() + warmup_insns;
+        if (wm_crossed) {
+            g_seg_warmup_crossed = true;
+        }
+    }
+
     if (g_window_mode == PluginConfig::WIN_SYMBOL ||
         g_window_mode == PluginConfig::WIN_MARKER ||
         pinned_simpoint_mode()) {
@@ -5134,23 +5237,38 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
              * (user_owned) stays the marker process. */
             capture_owned = marker_trace_all() ? true : user_owned;
         }
-        /* Window-clock ruling (maintainer, 2026-07-29): the marker
-         * window's user-instruction clock counts ARCHITECTURAL
-         * instructions.  A REP split into per-iteration executions
-         * (icount / single-step / TF / interrupt shadow — and QEMU's own
-         * REP_MAX chunking) must tick ONCE, not once per execution: when
-         * the PREVIOUS counted TB ended with a REP and that execution
-         * left by re-entering the instruction (reenter=true), its tick is
-         * withheld here, one dispatch later — the instruction's single
-         * tick comes from the execution that leaves past it
-         * (reenter=false: the sole execution of a looping translation, a
-         * flag-break, a zero-count REP, or the trailing pass).  Keyed on
-         * the remembered REP pc so a foreign REP executed between two
-         * owned dispatches cannot trigger it.  The raw latch (cp_facts)
-         * describes exactly the TB that finished before this dispatch. */
+        /* Window-clock ruling (maintainer, 2026-07-29; refined 2026-07-30
+         * to the bbv rule): the window clock counts what the BBV plugin
+         * counts in the simpoint-generation regime — user mode, canonical
+         * loop translation — because SimPoint offsets are selected from
+         * bbv counts and any other rule misaligns every simpoint-anchored
+         * window.  Measured on bbv itself: a REP bills one count per TB
+         * entry the loop translation makes (1 + floor((N-2)/65536) for an
+         * N-iteration counter-terminated REP).  So when the PREVIOUS
+         * counted TB ended with a REP and that execution left by
+         * re-entering the instruction (reenter=true), its tick is
+         * withheld here, one dispatch later — UNLESS the re-entry sits on
+         * a canonical chunk boundary (chunk=true), which the reference
+         * regime also bills; the completing execution (reenter=false: the
+         * looping translation's final chunk, a flag-break, a zero-count
+         * REP, or the trailing pass) always ticks.  Under canonical
+         * translation the correction nets to zero; under icount /
+         * single-step / TF it reproduces the canonical count from
+         * architectural state.  The canonical-chunk carve-out is x86-REP-
+         * only BY CONSTRUCTION: chunk is published solely by do_gen_rep,
+         * so an AArch64 MOPS re-entry (a cpu_loop_exit_requested split or
+         * a mid-instruction fault — timing artifacts the user-mode bbv
+         * reference regime never bills, unlike REP_MAX chunks, which are
+         * deterministic in the count register) always withholds — the
+         * landed MOPS rule, unchanged.  Keyed on the remembered fan-out
+         * pcs (membership, one per fragment terminator) so a foreign REP
+         * executed between two owned dispatches cannot trigger it.  The
+         * raw latch (cp_facts) describes exactly the TB that finished
+         * before this dispatch. */
         {
             RepSelfLoopState &rs_clk = rep_state(cpu_index);
             if (rs_clk.prev_tb_counted && rs_clk.cp_facts.reenter &&
+                !rs_clk.cp_facts.chunk &&
                 rs_clk.prev_tb_rep_contains(rs_clk.cp_facts.pc)) {
                 if (g_user_icount > 0) {
                     g_user_icount--;
@@ -5201,6 +5319,35 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
         if (cur_tb_tmpl) {
             cur_tb_tmpl->is_system = live_priv != 0;
             cur_tb_tmpl->is_system_cp_confirmed = true;
+        }
+    }
+
+    /* §2.13 warmup-boundary hold, armed at DISPATCH: when a counted TB
+     * ending in a fan-out instruction executes, that instruction is
+     * architecturally in flight from now until the emission that retires
+     * it releases the hold (fan-out block in emit_body_entry).  Arming at
+     * dispatch — not at the instruction's first emission — is what keeps
+     * the boundary arm-invariant: a chunk translation's first record
+     * emits after the crossing (whole-BB fault deferral), when an
+     * emission-armed hold would not yet exist.  Only live while an
+     * active segment's boundary is still uncaptured, so the per-TB cost
+     * exists only during a simpoint window's warmup phase; in pinned
+     * modes only the owned (counted) user TBs arm it. */
+    if (g_trace_segments.is_active() &&
+        g_seg_warmup_end_trace_insns == UINT64_MAX && cur_tb_tmpl &&
+        (pinned_asid == CST_ASID_UNPINNED || user_owned)) {
+        /* One arm per fragment terminator — a MOPS trio is three mid-TB
+         * fan-out terminators, each independently able to straddle the
+         * crossing (same walk as the clock's prev_tb_rep_pcs collection). */
+        RepSelfLoopState &rs_wh = rep_state(cpu_index);
+        for (BBTemplate *lf_wh = cur_tb_tmpl; lf_wh;
+             lf_wh = lf_wh->next_tb_fragment) {
+            if (lf_wh->n_insns > 0 &&
+                lf_wh->insn_fields[lf_wh->n_insns - 1].rep_memops_per_iter
+                    > 0) {
+                rs_wh.warmup_hold_update(
+                    lf_wh->insn_pcs[lf_wh->n_insns - 1], true);
+            }
         }
     }
 
@@ -5543,11 +5690,55 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
          * without the map probe — a rollover during a long fast-forward
          * can drift the count until the process's next verified dwell;
          * the traced window itself is always probe-verified. */
-        if (qemu_plugin_get_addr_space_id() ==
+        bool ff_counted =
+            qemu_plugin_get_addr_space_id() ==
                 pin_effective_asid(cpu_index,
                                    g_pinned_asid.load(
                                        std::memory_order_relaxed)) &&
-            qemu_plugin_get_priv_level() == 0) {
+            qemu_plugin_get_priv_level() == 0;
+        /* The positioning clock follows the same window-clock rule as the
+         * traced fold in events_path_step (which this fast path bypasses):
+         * a counted REP execution that left by re-entering the
+         * instruction OFF a canonical chunk boundary would not exist
+         * under the canonical loop translation the SimPoint offsets were
+         * counted with (user-mode bbv), so its tick is withheld one
+         * dispatch later.  Same prev-TB protocol, same per-vCPU state;
+         * facts are only consulted when the previous counted TB actually
+         * ended in a fan-out instruction, keeping the common fast-forward
+         * TB at zero extra API calls.  Without this, an -icount
+         * fast-forward opens the window early by every REP's re-execution
+         * count. */
+        {
+            RepSelfLoopState &rs_ff = rep_state(cpu_index);
+            if (rs_ff.prev_tb_counted && rs_ff.prev_tb_rep_n != 0 &&
+                qemu_plugin_rep_reenter() &&
+                !qemu_plugin_rep_chunk_boundary() &&
+                rs_ff.prev_tb_rep_contains(qemu_plugin_rep_pc())) {
+                if (g_user_icount > 0) {
+                    g_user_icount--;
+                }
+                g_stats.rep_ff_ticks_withheld++;
+            }
+            rs_ff.prev_tb_counted = ff_counted;
+            rs_ff.prev_tb_rep_n = 0;
+            if (ff_counted && cur_tb_tmpl) {
+                /* Same membership collection as the traced fold: one pc
+                 * per fragment terminator (an AArch64 MOPS trio is three
+                 * mid-TB terminators; x86 ends the TB at the REP). */
+                for (BBTemplate *lf_ff = cur_tb_tmpl; lf_ff;
+                     lf_ff = lf_ff->next_tb_fragment) {
+                    if (lf_ff->n_insns > 0 &&
+                        lf_ff->insn_fields[lf_ff->n_insns - 1]
+                                .rep_memops_per_iter > 0 &&
+                        rs_ff.prev_tb_rep_n <
+                            RepSelfLoopState::REP_CLK_PCS) {
+                        rs_ff.prev_tb_rep_pcs[rs_ff.prev_tb_rep_n++] =
+                            lf_ff->insn_pcs[lf_ff->n_insns - 1];
+                    }
+                }
+            }
+        }
+        if (ff_counted) {
             g_user_icount += delta;
         }
         const SimPointEntry *sp = g_simpoints.current();
@@ -5594,6 +5785,7 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     rep_state(cpu_index).cp_facts.bytes    = qemu_plugin_rep_bytes();
     rep_state(cpu_index).cp_facts.complete = qemu_plugin_rep_complete();
     rep_state(cpu_index).cp_facts.reenter  = qemu_plugin_rep_reenter();
+    rep_state(cpu_index).cp_facts.chunk    = qemu_plugin_rep_chunk_boundary();
 
     /* Latch the async-exclusion decision for this TB's body callbacks
      * (see g_capture_mute) before any early return below — the dropped
@@ -7067,6 +7259,19 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             tb, vcpu_tb_ff_foreign, QEMU_PLUGIN_CB_NO_REGS,
             QEMU_PLUGIN_COND_EQ, g_scoreboard.asid_match, 0,
             (void *)(uintptr_t)raw_n_insns);
+        /* REP window-clock compensation (see vcpu_tb_ff_rep): only on TBs
+         * that BEGIN with a fan-out instruction — the TB every re-entering
+         * execution of that instruction is followed by — so the coarse
+         * countdown, like the traced window clock, counts REPs the way the
+         * bbv run behind the SimPoint offsets did.  Also ahead of the
+         * crossing detector, so a withheld tick nets out before the
+         * crossing is evaluated. */
+        if (head_fragment && head_fragment->n_insns > 0 &&
+            head_fragment->insn_fields[0].rep_memops_per_iter > 0) {
+            qemu_plugin_register_vcpu_tb_exec_cb(
+                tb, vcpu_tb_ff_rep, QEMU_PLUGIN_CB_NO_REGS,
+                (void *)(uintptr_t)head_fragment->insn_pcs[0]);
+        }
     }
 
     /* Threshold-crossing detector: fires once when the budget slot

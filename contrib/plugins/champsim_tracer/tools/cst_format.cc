@@ -1006,7 +1006,7 @@ Header parse_header(MemberView view,
      * warmup→simulation boundary.  Lets consumers skip warmup
      * without re-counting BBV-vs-architectural insns under REP
      * fan-out.  See docs/format.rst. */
-    h.warmup_end_arch_insns = r.uleb();
+    h.warmup_end_trace_insn_idx = r.uleb();
 
     /* Reverse-resolve every well-known name in the encoding maps to
      * its wire-format ID.  Tools dispatch off @h.ids from here on. */

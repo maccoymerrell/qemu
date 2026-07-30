@@ -242,7 +242,7 @@ The warmup marker
 -----------------
 
 When a trace records a warmup→simulation boundary (the header's
-``warmup_end_arch_insns``; see :doc:`format`), the instruction-window
+``warmup_end_trace_insn_idx``; see :doc:`format`), the instruction-window
 charts draw it as a dashed vertical rule labelled *end of warmup*, so the
 portion of the trace that precedes the SimPoint region of interest is
 visible at a glance.  Traces with no warmup configured, or whose warmup
@@ -280,7 +280,7 @@ drives; a swept option draws one chart line per value.
    Leading bins excluded from y-axis scaling (predictor / cache warm-up)
    and drawn under a faint overlay, so an untrained transient does not
    dominate the vertical range.  This is the model's warm-up, distinct from
-   the trace's own ``warmup_end_arch_insns`` boundary above.
+   the trace's own ``warmup_end_trace_insn_idx`` boundary above.
 
 Aggregate mode
 --------------

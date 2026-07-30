@@ -85,14 +85,23 @@ Plugin API additions
      when the pinned process is observed at user privilege, which is
      definitionally outside any handler.
    * ``qemu_plugin_rep_iterations`` / ``qemu_plugin_rep_complete`` /
-     ``qemu_plugin_rep_reenter`` / ``qemu_plugin_rep_pc`` — the
-     architectural self-loop accounting of the fan-out instruction
-     the executing vCPU most recently ran.  ``do_gen_rep``
-     (``target/i386/tcg/translate.c``) publishes the iteration count
-     from the count register's own decrement, whether the repetition
-     ended (the counter reached zero or a REPZ/REPNZ condition broke
-     it), whether QEMU is about to re-enter the same instruction, and
-     which instruction the three describe.
+     ``qemu_plugin_rep_reenter`` / ``qemu_plugin_rep_chunk_boundary`` /
+     ``qemu_plugin_rep_pc`` — the architectural self-loop accounting
+     of the fan-out instruction the executing vCPU most recently ran.
+     ``do_gen_rep`` (``target/i386/tcg/translate.c``) publishes the
+     iteration count from the count register's own decrement, whether
+     the repetition ended (the counter reached zero or a REPZ/REPNZ
+     condition broke it), whether QEMU is about to re-enter the same
+     instruction, whether that re-entry sits on a canonical chunk
+     boundary (the exit the looping translation itself takes every
+     65536 iterations — written-back counter ``65536*m + 1``; a
+     looping translation's re-entries always do, a single-iteration
+     translation computes it from the written-back counter), and
+     which instruction the facts describe.  The chunk-boundary flag
+     is what lets the window clock reproduce, under any translation,
+     the per-TB-execution count the BBV plugin observes under the
+     canonical translation: keep re-entries on a boundary, withhold
+     the rest.
 
      They exist because a REP is not always translated as a loop:
      ``can_loop`` is false whenever ``CF_USE_ICOUNT`` or

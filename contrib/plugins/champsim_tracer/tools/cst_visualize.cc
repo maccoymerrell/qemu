@@ -974,8 +974,8 @@ struct ChartPlan {
     std::string overflow_label;
 
     /* Trace-encoded warmup->simulation boundary (header §2.13
-     * warmup_end_arch_insns), in the SAME architectural CP-insn units
-     * as the x-axis.  Drawn as a single dashed vertical marker on
+     * warmup_end_trace_insn_idx), in the SAME trace-instruction units
+     * as the x-axis (in-trace insn position, fan-out included).  Drawn as a single dashed vertical marker on
      * instruction-window plots so the reader can see how much of the
      * trace is warmup.  Sentinels UINT64_MAX (uncrossed) and 0 (no
      * warmup configured) suppress the marker. */
@@ -4437,7 +4437,7 @@ static TraceResult finalize_metric(const char *path, WalkCtx &ctx,
     /* Trace-encoded warmup boundary (header §2.13, arch CP insns).
      * render_plan() draws it as a dashed marker on instruction-window
      * axes and ignores it on the bin-indexed / static-summary panes. */
-    plan.warmup_end_insns = h.warmup_end_arch_insns;
+    plan.warmup_end_insns = h.warmup_end_trace_insn_idx;
 
     auto pick_title = [&]{ return title_for(opts); };
     plan.title = pick_title();
@@ -5539,7 +5539,7 @@ static TraceResult finalize_metric(const char *path, WalkCtx &ctx,
         plan2.n_bins     = actual_bins;
         plan2.x_bin_size = bin_width;
         plan2.x_label    = "CP instruction window";
-        plan2.warmup_end_insns = h.warmup_end_arch_insns;
+        plan2.warmup_end_insns = h.warmup_end_trace_insn_idx;
     }
 
     TraceResult tr;
@@ -5547,7 +5547,7 @@ static TraceResult finalize_metric(const char *path, WalkCtx &ctx,
     tr.grid             = std::move(result_grid);
     tr.weight           = h.weight;
     tr.start_insn       = h.start_insn;
-    tr.warmup_end_insns = h.warmup_end_arch_insns;
+    tr.warmup_end_insns = h.warmup_end_trace_insn_idx;
     tr.total_insns      = total_cp_insns;
     tr.label            = short_trace_label(path);
     tr.plan             = std::move(plan);
@@ -6345,7 +6345,7 @@ static TraceMeta peek_trace_meta(const char *path)
     TraceMeta m;
     m.weight     = h.weight;
     m.start_insn = h.start_insn;
-    m.warmup_end = h.warmup_end_arch_insns;
+    m.warmup_end = h.warmup_end_trace_insn_idx;
     uint64_t total = h.total_target_insns;
     if (total == 0) {
         for (const auto &t : templates) {

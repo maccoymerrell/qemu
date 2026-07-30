@@ -657,7 +657,7 @@ struct Header {
      * warmup_insns (BBV-style, matches the inline_add budget) from
      * what the trace actually contains after REP fan-out.  Sentinel
      * UINT64_MAX = warmup boundary not crossed in this segment. */
-    uint64_t warmup_end_arch_insns = 0;
+    uint64_t warmup_end_trace_insn_idx = 0;
     /* SimPoint weight: fraction of whole-program execution this
      * segment represents (0.0 for non-simpoint segments). */
     double   weight = 0.0;

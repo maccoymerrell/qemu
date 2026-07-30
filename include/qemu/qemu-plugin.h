@@ -1941,6 +1941,30 @@ QEMU_PLUGIN_API
 uint64_t qemu_plugin_rep_bytes(void);
 
 /**
+ * qemu_plugin_rep_chunk_boundary() - did the re-enter sit on a canonical
+ * chunk boundary?
+ *
+ * Qualifies qemu_plugin_rep_reenter(): true when the execution left the
+ * instruction at the point where QEMU's canonical loop translation itself
+ * re-enters — its internal repetition bound, reached when the written-back
+ * counter is one above a non-zero multiple of the bound (65536), under the
+ * instruction's address-size mask.  A looping translation only ever
+ * re-enters there, so its re-entries always report true; a single-iteration
+ * translation (-icount, single-step, TF, the interrupt shadow) re-enters
+ * after every iteration and reports true only at those same counter values.
+ *
+ * This is what lets a consumer reproduce, from any translation, the
+ * per-TB-execution instruction count the canonical translation produces —
+ * the count a per-TB inline counter (the bbv plugin feeding SimPoint
+ * clustering, or this plugin's own scoreboard) observes when no
+ * single-iteration lever is engaged: count executions, keep re-entries
+ * that report true, discard re-entries that report false.  Meaningless
+ * unless qemu_plugin_rep_reenter() is true.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_rep_chunk_boundary(void);
+
+/**
  * qemu_plugin_spec_store_overflowed() - did the current wrong-path excursion's
  * speculative-store footprint cross the soft budget?
  *

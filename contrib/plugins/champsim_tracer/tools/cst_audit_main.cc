@@ -199,7 +199,7 @@ void account_header(cst::MemberView hv, const cst::ResolvedIds &ids,
     r.string(); r.string();           /* command / datetime          */
     r.string(); r.string();           /* comment / target_name       */
     { cst::Reader maps = r.sub(); (void)maps; }   /* encoding maps    */
-    r.uleb();                         /* warmup_end_arch_insns §2.13 */
+    r.uleb();                         /* warmup_end_trace_insn_idx §2.13 */
     b->preamble = r.pos();
     if (r.eof()) {
         return;

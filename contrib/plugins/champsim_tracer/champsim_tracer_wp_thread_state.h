@@ -107,6 +107,15 @@ struct RepArchFacts {
                                  * REP leaves it 0. */
     bool     complete = false;  /* repetition ended in that execution */
     bool     reenter  = false;  /* QEMU jumped back to the insn, not past */
+    bool     chunk    = false;  /* ...and did so at a canonical chunk
+                                 * boundary — the exit the looping
+                                 * translation itself takes (counter
+                                 * writeback 65536*m + 1, m >= 1).
+                                 * Qualifies reenter; meaningless without
+                                 * it.  Chunk re-entries keep their window
+                                 * tick (the bbv plugin bills them in the
+                                 * simpoint-generation regime); all other
+                                 * re-entries have theirs withheld. */
 };
 
 /*
@@ -121,6 +130,20 @@ struct RepArchFacts {
 struct RepInFlight {
     uint64_t pc          = 0;
     bool     in_progress = false;
+};
+
+/*
+ * Warmup-boundary hold: is a fan-out instruction ARCHITECTURALLY in
+ * flight (begun, not yet retired)?  Distinct from RepInFlight, whose
+ * predicate is reenter (what the trailing-pass suppression needs): a
+ * mid-instruction fault publishes reenter=false while the instruction
+ * is still unfinished, so reenter cannot anchor the warmup boundary's
+ * never-split-an-instruction rule.  active = last consumed emission of
+ * this pc had complete=false; cleared when the instruction retires.
+ */
+struct RepBoundaryHold {
+    uint64_t pc     = 0;
+    bool     active = false;
 };
 
 /*
@@ -165,21 +188,31 @@ struct RepSelfLoopState {
     uint64_t emit_pre_memops = 0;
 
     /*
-     * Window-clock ruling (maintainer, 2026-07-29): the marker window's
-     * user-instruction clock counts ARCHITECTURAL instructions — a REP is
-     * one tick however many executions QEMU splits it into.  A counted
-     * execution that ends by re-entering the instruction (reenter=true: a
-     * single-iteration translation's per-iteration pass, or a REP_MAX
-     * chunk boundary) has its REP tick withheld; the instruction ticks on
-     * the execution that leaves past it (reenter=false — the sole
-     * execution of a looping translation, a flag-break, a zero-count REP,
-     * or the trailing pass).  These remember, per vCPU, whether the
-     * previous counted TB is eligible: prev_tb_counted = it advanced the
-     * user clock; prev_tb_rep_pcs[] = the fan-out insns it contains, so
-     * a foreign REP executed between two owned dispatches cannot trigger
-     * the correction.
+     * Window-clock ruling (maintainer, 2026-07-29, refined 2026-07-30):
+     * the window clock counts instructions THE WAY THE BBV PLUGIN COUNTS
+     * THEM in the simpoint-generation regime (user mode, canonical loop
+     * translation) — SimPoint offsets are selected from bbv counts, so
+     * any other rule misaligns every simpoint-anchored window.  Measured
+     * on the bbv plugin itself: an x86 REP instance bills one count per
+     * TB entry the loop translation makes — 1 + floor((N-2)/65536) for
+     * an N-iteration counter-terminated REP.  So: a counted execution
+     * that ends by re-entering a fan-out instruction keeps its tick when
+     * the re-entry sits on a canonical chunk boundary (chunk=true; bbv
+     * bills that entry in the reference regime too) and has it withheld
+     * otherwise; the completing execution always ticks.  The carve-out
+     * is x86-REP-only by construction: only do_gen_rep publishes chunk.
+     * An AArch64 MOPS re-entry (cpu_loop_exit_requested split,
+     * mid-instruction fault) is a timing artifact the reference regime
+     * never bills — deterministic in nothing — so MOPS re-entries always
+     * withhold, the landed MOPS rule.  Under canonical translation the
+     * correction is exactly zero; under -icount / single-step / TF it
+     * reproduces the canonical count from architectural state.
      *
-     * A small set rather than one pc because AArch64 FEAT_MOPS bulk
+     * These remember, per vCPU, whether the previous counted TB is
+     * eligible: prev_tb_counted = it advanced the user clock;
+     * prev_tb_rep_pcs[] = the fan-out insns it contains, so a foreign
+     * REP executed between two owned dispatches cannot trigger the
+     * correction.  A small set rather than one pc because FEAT_MOPS bulk
      * instructions do not end their TB the way an x86 REP does: a
      * SETP/SETM/SETE trio translates into one TB as three mid-TB
      * fragment terminators, and the execution a cpu_loop_exit_requested
@@ -203,6 +236,67 @@ struct RepSelfLoopState {
             }
         }
         return false;
+    }
+
+    /*
+     * Header §2.13 warmup-boundary holds (CP): which fan-out instructions
+     * are architecturally in flight (begun, not retired) on this vCPU.
+     * One slot per fan-out insn for the same reason as prev_tb_rep_pcs[]:
+     * a MOPS trio is three mid-TB terminators, each independently able to
+     * straddle the warmup crossing through its own fault/split re-entry.
+     * Armed at dispatch (a counted TB containing the terminator), updated
+     * or released by the owning instruction's depth-0 user emission
+     * (in_flight = !retired — the architectural predicate, which survives
+     * mid-instruction faults where reenter reads false).  Slot overflow
+     * drops the arm: the boundary may then land one record early beside a
+     * >8-fan-out TB (never a wrong split-side value for held insns);
+     * eight exceeds any real TB's fan-out population.
+     */
+    RepBoundaryHold warmup_hold[REP_CLK_PCS];
+
+    void warmup_hold_update(uint64_t pc, bool in_flight)
+    {
+        int free_slot = -1;
+        for (unsigned i = 0; i < REP_CLK_PCS; i++) {
+            if (warmup_hold[i].active && warmup_hold[i].pc == pc) {
+                warmup_hold[i].active = in_flight;
+                return;
+            }
+            if (free_slot < 0 && !warmup_hold[i].active) {
+                free_slot = (int)i;
+            }
+        }
+        if (in_flight && free_slot >= 0) {
+            warmup_hold[free_slot].pc = pc;
+            warmup_hold[free_slot].active = true;
+        }
+    }
+
+    bool warmup_hold_any() const
+    {
+        for (unsigned i = 0; i < REP_CLK_PCS; i++) {
+            if (warmup_hold[i].active) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool warmup_hold_matches(uint64_t pc) const
+    {
+        for (unsigned i = 0; i < REP_CLK_PCS; i++) {
+            if (warmup_hold[i].active && warmup_hold[i].pc == pc) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void warmup_hold_reset()
+    {
+        for (unsigned i = 0; i < REP_CLK_PCS; i++) {
+            warmup_hold[i] = RepBoundaryHold{};
+        }
     }
 
     /*

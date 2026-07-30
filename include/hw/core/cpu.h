@@ -620,11 +620,24 @@ struct CPUState {
      * attribute another instruction's count.  Targets with no fan-out
      * instruction never write it, which is also how a consumer recognises
      * that no architectural count is available at all.
+     *
+     * plugin_rep_chunk qualifies plugin_rep_reenter: true when the re-enter
+     * happened at a canonical chunk boundary — the point where do_gen_rep's
+     * loop translation itself leaves the block every REP_MAX+1-and-change
+     * iterations (counter writeback of the form 65536*m + 1, m >= 1).  A
+     * loop translation only ever re-enters at such a boundary, so there the
+     * flag is a translation-time constant; a single-iteration translation
+     * computes it from the written-back counter.  It lets a consumer that
+     * counts instructions the way a per-TB-execution counter does (e.g. the
+     * bbv plugin feeding SimPoint) reproduce the canonical translation's
+     * TB-entry count from any translation: keep re-entries with the flag,
+     * discard re-entries without it.
      */
     uint64_t plugin_rep_iters;
     uint64_t plugin_rep_pc;
     bool plugin_rep_complete;
     bool plugin_rep_reenter;
+    bool plugin_rep_chunk;
 
     /*
      * AArch64 FEAT_MOPS publishes through the same four fields — a

@@ -28,6 +28,7 @@ never raise a false alarm).
 """
 
 import argparse
+import datetime
 import hashlib
 import json
 import os
@@ -38,12 +39,14 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from pathlib import Path
 
 # --- layout -----------------------------------------------------------------
 HERE = Path(__file__).resolve().parent                 # .../champsim_tracer/tests
 PLUGIN_DIR = HERE.parent                                # .../champsim_tracer
 VALIDATOR_DIR = PLUGIN_DIR / "validator"               # holds the importable pkg
+REPO_ROOT = PLUGIN_DIR.parents[2]                      # worktree root (.../qemu)
 GOLDEN_DIR = HERE / "golden"
 MANIFEST = GOLDEN_DIR / "manifest.json"
 # Frozen .cst traces kept as the renderer's golden inputs.  SVG goldens are
@@ -239,8 +242,306 @@ def svg_hash(build: Path, cst: Path, metric: str) -> str:
         return sha(out_svg.read_bytes())
 
 
+# ===========================================================================
+# Build freshness + provenance gate
+# ===========================================================================
+#
+# A golden manifest is only worth what the binaries that produced it were.
+# The failure this gate exists to stop was silent and cost a whole reference:
+# the plugin .so and qemu-x86_64 were built at 08:41, commit eb99d9ae72
+# ("disas/capstone: four more places the decoder named the wrong direction")
+# landed at 09:05, and the goldens were captured at 10:03 with the 08:41
+# binaries.  The manifest therefore froze the PRE-fix STMXCSR direction --
+# `deps: la=0x1` on a GEN_OP_STORE -- as the reference every later refactor
+# would be measured against, and nothing anywhere complained.  Nothing could:
+# capture's own GREEN-twice determinism gate re-ran the SAME stale binary
+# twice and got the same answer both times, which is exactly what a stale
+# build looks like from the inside.
+#
+# So this gate is deliberately about the INPUTS, never the output:
+#
+#   (1) every artifact the run will execute exists, and
+#   (2) the build system itself confirms every one of them was already
+#       current -- the gate runs a real `ninja` for the artifact targets and
+#       refuses if it had to rewrite any of them.  That covers both halves of
+#       the failure above (a commit landing between build and capture, and an
+#       edit that was never built at all) without either of the mtime
+#       heuristics this replaced, which shared baselines -- "oldest artifact",
+#       "HEAD's commit time" -- that do not track what feeds a given
+#       artifact.  See build_currency() for why the three cheaper tests are
+#       each unsound, with the measurement behind each.  Proven four ways:
+#       passes on a build whose goldens are byte-identical on both nets;
+#       refuses a touched disas/capstone.c, naming the four qemu-<target>
+#       binaries (the artifacts that actually carry a decoder repair, which
+#       the old clause did not name); refuses a header-only plugin edit,
+#       naming the .so, which the explicit input graph would have missed; and
+#       is idempotent, so an immediate re-run passes and still nets GREEN.
+#   (3) no tracked wire source is locally modified -- a manifest captured
+#       from unpublished source is not reproducible by anyone else, so it is
+#       not a reference.  (`check` tolerates this: verifying a work-in-
+#       progress tree against a published reference is the whole point.)
+#
+# and it records what it proved INTO the manifest, so a manifest can always
+# answer "which binaries, from which commit, with what uncommitted on top?"
+# without anyone having to reconstruct it from mtimes months later.
+#
+# Escape hatches are per-clause (--allow-stale / --allow-dirty) and both are
+# recorded in the manifest when used, because a waiver nobody can see later
+# is the same silent failure wearing different clothes.
+
+# Directories whose tracked C/C++ sources reach the wire.  disas/ is in the
+# list because disas/capstone.c is the Capstone boundary the tracer's operand
+# roles come from, and leaving it out is precisely how the STMXCSR repair went
+# unnoticed.
+#
+# It does NOT compile into the plugin .so, and believing it does is its own
+# trap.  Verified: `ninja -t inputs contrib/plugins/libchampsim_tracer.so`
+# lists no disas/ object, `nm` finds no cap_* symbol in the .so, and
+# champsim_tracer_decode.cc makes zero cs_open/cs_disasm calls -- it reads
+# qemu_plugin_operand structs handed to it by QEMU (see the operand API in
+# include/qemu/qemu-plugin.h, which documents itself as exposing the knowledge
+# that "already lives (see disas/capstone.c)").  The real path is
+#
+#     disas/capstone.c -> libcommon.a -> qemu-<target> -> plugin API -> plugin
+#
+# so a decoder repair reaches a trace only through the QEMU BINARY.  The
+# practical consequence, and the reason this is worth spelling out: `ninja
+# contrib-plugins` can never pick one up, while it DOES rebuild isaxcheck,
+# which links disas/capstone.c directly -- so the cross-checker you would
+# reach for to confirm the decoders agree sees the fix while the trace path
+# silently does not.
+WIRE_SOURCE_DIRS = [
+    "contrib/plugins",
+    "disas",
+    "plugins",
+    "accel",
+    "tcg",
+    "target",
+    "include",
+    # subprojects/ contributes only its tracked *.wrap files (the checked-out
+    # source trees are untracked, so `git ls-files` never reaches them).  That
+    # is exactly what we want: capstone.wrap pins the decoder revision, and
+    # bumping it changes operand roles across every ISA -- a wire change with
+    # no .c file behind it.
+    "subprojects",
+]
+WIRE_SOURCE_SUFFIXES = (".c", ".cc", ".cpp", ".h", ".hh", ".inc", ".h.inc",
+                        ".c.inc", ".build", ".wrap")
+
+
+def _git(*args: str) -> str | None:
+    """Run git in the repo; None when git or the repo is unavailable."""
+    try:
+        p = subprocess.run(("git", "-C", str(REPO_ROOT)) + args,
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           text=True)
+    except OSError:
+        return None
+    return p.stdout if p.returncode == 0 else None
+
+
+def built_artifacts(build: Path, system: bool) -> list[Path]:
+    """Every binary the requested net actually executes.  Anything not in
+    this list cannot be fingerprinted, so keep it in step with the modes."""
+    arts = [build / "contrib" / "plugins" / "libchampsim_tracer.so",
+            cst_decode_bin(build), cst_visualize_bin(build)]
+    if system:
+        arts.append(sys_qemu_system_bin(build))
+    else:
+        arts += [build / f"qemu-{isa}" for isa in ALL_ISAS]
+    return arts
+
+
+def wire_sources() -> list[Path] | None:
+    """Tracked sources under WIRE_SOURCE_DIRS whose changes reach the wire.
+    Uses `git ls-files` rather than a find(1) sweep so an untracked scratch
+    file can't fail the gate and a tracked one can't escape it.  None when
+    git is unavailable (the caller treats that as a gate failure)."""
+    out = _git("ls-files", "-z", "--", *WIRE_SOURCE_DIRS)
+    if out is None:
+        return None
+    return [REPO_ROOT / p for p in out.split("\0")
+            if p and p.endswith(WIRE_SOURCE_SUFFIXES)]
+
+
+def dirty_wire_sources() -> list[str] | None:
+    """Tracked wire sources with uncommitted modifications (staged or not).
+    Untracked files are deliberately NOT dirt: subprojects/capstone/ and the
+    golden fixtures live untracked by design."""
+    out = _git("status", "--porcelain", "--untracked-files=no",
+               "--", *WIRE_SOURCE_DIRS)
+    if out is None:
+        return None
+    return [l for l in out.splitlines()
+            if l.strip() and l[3:].endswith(WIRE_SOURCE_SUFFIXES)]
+
+
+def head_commit_time() -> tuple[str, int] | None:
+    """(short sha, committer epoch) of HEAD, or None if unavailable."""
+    out = _git("show", "-s", "--format=%h %ct", "HEAD")
+    if not out:
+        return None
+    short_sha, ct = out.split()[:2]
+    return short_sha, int(ct)
+
+
+def _iso(epoch: float) -> str:
+    return datetime.datetime.fromtimestamp(
+        epoch, datetime.timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def build_currency(build: Path, arts: list[Path]) -> tuple[list[str], str] | None:
+    """Ask the build system itself whether @arts are current.
+
+    Runs a real `ninja` for the artifact targets and returns the artifacts it
+    had to rewrite (empty == the build was already current), plus ninja's
+    output.  None when ninja is unavailable or the build fails.
+
+    A real run is the only sound test available here.  The three cheaper ones
+    are each blind in a way that matters, all three verified on this build:
+
+      * mtime-vs-HEAD's-commit-time FALSE-FLAGS every artifact whose inputs
+        genuinely did not change.  ninja correctly leaves those alone, so
+        their mtimes stay behind any later commit -- it refused a build whose
+        goldens were then proved byte-identical on both nets.
+      * `ninja -n` OVERSTATES the work: a dry run cannot apply restat.
+        qemu-version.h is regenerated unconditionally, so -n always reports
+        the downstream recompile+relink that a real run then prunes (12
+        pending targets that a real run resolves in one generator step).
+      * `ninja -t inputs` UNDERSTATES it: depfile-discovered headers are
+        absent from the explicit input graph (zero champsim_tracer *.h appear
+        under the plugin .so), so a header-only edit would slip past.
+
+    A real run has none of those blind spots, and it reaches header deps.  It
+    is idempotent -- consecutive runs converge to the one always-dirty
+    generator step -- so using it as a gate does not perturb what follows.
+    """
+    before = {a: a.stat().st_mtime for a in arts if a.exists()}
+    rels = [str(a.relative_to(build)) for a in arts]
+    try:
+        p = subprocess.run(("ninja", "-C", str(build), *rels),
+                           stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, text=True)
+    except OSError:
+        return None
+    if p.returncode != 0:
+        return None
+    rebuilt = [str(a.relative_to(build)) for a in arts
+               if not a.exists() or before.get(a) != a.stat().st_mtime]
+    return rebuilt, p.stdout
+
+
+def build_provenance(build: Path, system: bool,
+                     waivers: dict) -> tuple[dict, list[str]]:
+    """Fingerprint the artifacts + tree state and return (record, failures).
+
+    `failures` empty means the gate passed.  The record is written into the
+    manifest either way, so a waived capture still says so on the wire."""
+    fails: list[str] = []
+    head = head_commit_time()
+    arts = built_artifacts(build, system)
+
+    missing = [a for a in arts if not a.exists()]
+    for a in missing:
+        # An artifact that isn't there cannot be verified -- and a net that
+        # cannot find its subject must fail, never quietly skip it.
+        fails.append(f"artifact missing: {a}")
+    present = [a for a in arts if a.exists()]
+
+    art_rec = {}
+    for a in present:
+        st = a.stat()
+        art_rec[str(a.relative_to(build))] = {
+            "sha256": sha(a.read_bytes())[:16],
+            "size": st.st_size,
+            "mtime": _iso(st.st_mtime),
+        }
+
+    rec: dict = {
+        "captured_at": _iso(datetime.datetime.now().timestamp()),
+        "head": None if head is None else
+                {"sha": head[0], "commit_time": _iso(head[1])},
+        "artifacts": art_rec,
+        "waivers": {k: v for k, v in waivers.items() if v},
+    }
+
+    if head is None:
+        fails.append("cannot read HEAD (git unavailable or not a repo): "
+                     "build provenance is unverifiable")
+        return rec, fails
+
+    # (2) the build system's own verdict on whether these artifacts were
+    # current.  This replaces two mtime heuristics that shared a baseline
+    # ("oldest artifact", "HEAD's commit time") neither of which tracks what
+    # actually feeds a given artifact -- see build_currency() for the three
+    # blind spots and the measurements behind each.
+    cur = build_currency(build, arts)
+    if cur is None:
+        fails.append("cannot ask ninja whether the build is current "
+                     "(ninja unavailable, or the build does not build) -- "
+                     "freshness is unverifiable")
+    else:
+        rebuilt, _out = cur
+        rec["rebuilt_by_gate"] = rebuilt
+        srcs = wire_sources()
+        rec["wire_sources_checked"] = 0 if srcs is None else len(srcs)
+        if rebuilt and not waivers["allow_stale"]:
+            fails.append(
+                f"{len(rebuilt)} artifact(s) were STALE -- the gate had to "
+                f"rebuild them, so anything captured before now ran old code")
+            for r in rebuilt[:8]:
+                fails.append(f"    {r}")
+            fails.append("    re-run now that the build is current; the "
+                         "rebuild has already happened")
+
+    # (3) uncommitted wire sources make the manifest unreproducible.
+    dirty = dirty_wire_sources()
+    rec["dirty_wire_sources"] = dirty or []
+    if dirty is None:
+        fails.append("cannot read git status: tree cleanliness unverifiable")
+    elif dirty and not waivers["allow_dirty"]:
+        fails.append(f"{len(dirty)} tracked wire source(s) modified but not "
+                     f"committed -- a golden captured from unpublished "
+                     f"source is not a reference anyone can reproduce")
+        for l in dirty[:8]:
+            fails.append(f"    {l}")
+    return rec, fails
+
+
+def gate_build(build: Path, system: bool, waivers: dict,
+               mode: str) -> tuple[dict, int]:
+    """Enforce the freshness gate for @mode.  Returns (provenance, rc);
+    rc != 0 means refuse.  `check` waives the dirty-tree clause: verifying a
+    work-in-progress build against a published reference is its job."""
+    w = dict(waivers)
+    if mode == "check":
+        w["allow_dirty"] = True
+    rec, fails = build_provenance(build, system, w)
+    if not fails:
+        head = rec["head"]
+        print(f"build gate OK: HEAD {head['sha']} ({head['commit_time']}), "
+              f"{len(rec['artifacts'])} artifacts, ninja confirms all current "
+              f"against {rec.get('wire_sources_checked', 0)} tracked wire "
+              f"sources"
+              + ("" if not rec['dirty_wire_sources'] else
+                 f", {len(rec['dirty_wire_sources'])} uncommitted (waived)"))
+        return rec, 0
+    print(f"\n=== BUILD GATE REFUSED ({mode}) ===", file=sys.stderr)
+    for f in fails:
+        print(f"  {f}", file=sys.stderr)
+    print("  Rebuild (ninja -C <build> contrib-plugins qemu-x86_64 ...) and "
+          "re-run; override per clause with --allow-stale / --allow-dirty "
+          "(recorded in the manifest).", file=sys.stderr)
+    return rec, 2
+
+
 # --- modes ------------------------------------------------------------------
-def capture(build: Path, root: Path) -> int:
+def capture(build: Path, root: Path, waivers: dict) -> int:
+    # Prove the build BEFORE destroying the previous reference: a refusal
+    # must leave the old manifest and frozen traces exactly where they were.
+    prov, rc = gate_build(build, system=False, waivers=waivers, mode="capture")
+    if rc:
+        return rc
     if root.exists():
         shutil.rmtree(root)
     if GOLDEN_TRACES.exists():
@@ -249,8 +550,8 @@ def capture(build: Path, root: Path) -> int:
     # Record the capture-time work root: the path is a wire INPUT (guest
     # argv[0]/AT_EXECFN sizes set the stack base -> REG_SP), so a check
     # under any other root is structurally red.  check() enforces this.
-    manifest = {"work_root": str(root), "cells": {}, "svg": {},
-                "svg_fixtures": {}, "excluded": {}}
+    manifest = {"work_root": str(root), "provenance": prov, "cells": {},
+                "svg": {}, "svg_fixtures": {}, "excluded": {}}
     bad = 0
     # Determinism pre-check: trace each cell N_DET times to the SAME out-dir
     # (check uses the identical path) and only record a golden for cells
@@ -331,11 +632,17 @@ def capture(build: Path, root: Path) -> int:
     return 1 if bad else 0
 
 
-def check(build: Path, root: Path) -> int:
+def check(build: Path, root: Path, waivers: dict) -> int:
     if not MANIFEST.exists():
         print(f"no manifest at {MANIFEST}; run capture first", file=sys.stderr)
         return 2
     manifest = json.loads(MANIFEST.read_text())
+    # A check run against a stale build is a false green, not a pass: it
+    # compares the reference to binaries that predate the source.
+    prov, rc = gate_build(build, system=False, waivers=waivers, mode="check")
+    if rc:
+        return rc
+    _report_reference_provenance(manifest, prov)
     # The work root is a wire input (its length sets the guest stack base
     # via argv[0]/AT_EXECFN -> the REGFILE REG_SP): checking under a
     # different root than capture is a guaranteed all-cells hash red that
@@ -415,6 +722,30 @@ def check(build: Path, root: Path) -> int:
           f"{len(manifest.get('svg_fixtures', {}))} fixture svg goldens "
           f"byte-identical; validator errors=0")
     return 0
+
+
+def _report_reference_provenance(manifest: dict, now: dict) -> None:
+    """Say out loud which build the reference came from and which one is being
+    compared against it.  A hash mismatch is only interpretable next to that
+    pair, and a manifest with no provenance at all predates the gate -- which
+    is itself worth printing, because such a manifest may encode a stale
+    build and there is no way to tell from the hashes."""
+    ref = manifest.get("provenance")
+    if not ref:
+        print("WARNING: this manifest carries no build provenance (captured "
+              "before the gate existed).  It cannot be shown to come from a "
+              "current build; re-capture to make it verifiable.")
+        return
+    rh, nh = ref.get("head") or {}, now.get("head") or {}
+    print(f"reference: HEAD {rh.get('sha','?')} captured "
+          f"{ref.get('captured_at','?')}"
+          + (f", {len(ref['dirty_wire_sources'])} uncommitted wire source(s)"
+             if ref.get("dirty_wire_sources") else "")
+          + (f", WAIVERS {sorted(ref['waivers'])}" if ref.get("waivers")
+             else ""))
+    print(f"under test: HEAD {nh.get('sha','?')}"
+          + (f", {len(now['dirty_wire_sources'])} uncommitted wire source(s)"
+             if now.get("dirty_wire_sources") else ""))
 
 
 def _dump_legacy_diff(build: Path, cst: Path, cell: str) -> None:
@@ -610,6 +941,101 @@ def sys_qemu_system_bin(build: Path) -> Path:
     return build / "qemu-system-x86_64"
 
 
+def _cpu_busy(cpus: list[int], secs: float = 2.0) -> dict[int, float]:
+    """Busy percentage per CPU over @secs, straight from /proc/stat."""
+    def snap() -> dict[int, list[int]]:
+        d = {}
+        for line in open("/proc/stat"):
+            if line.startswith("cpu") and line[3:4].isdigit():
+                f = line.split()
+                d[int(f[0][3:])] = [int(x) for x in f[1:]]
+        return d
+    a = snap()
+    time.sleep(secs)
+    b = snap()
+    out = {}
+    for c in cpus:
+        if c not in a or c not in b:
+            continue
+        d = [y - x for x, y in zip(a[c], b[c])]
+        tot = sum(d)
+        out[c] = 100.0 * (tot - (d[3] + d[4])) / tot if tot else 0.0
+    return out
+
+
+def sys_cpu_preflight() -> list[str]:
+    """The system cells pin qemu to one host CPU.  On an SMT core the pinned
+    thread shares execution resources with its sibling, so a saturated
+    sibling does not merely slow the boot -- it wedges it: the canonical
+    devio boot runs in ~18 s on a quiet core and has been seen to blow a
+    3600 s timeout on a contended one, which capture then records as an
+    EXCLUDED cell, i.e. a net that verifies nothing.
+
+    Checking for a foreign qemu is not enough; the contending process is
+    usually not qemu at all.  Measure the sibling's ACTUAL utilisation and
+    refuse on a busy one, naming quiet alternatives.  Returns a list of
+    failure strings (empty == go).
+
+    WHAT THIS IS AND IS NOT.  This preflight is a cost tripwire: it stops a
+    run that would burn an hour and record nothing.  It is NOT a correctness
+    mechanism, and no trace may be called valid BECAUSE it passed here.  The
+    fact that this check has to exist is itself the defect: system-mode
+    capture ties the guest clock to host realtime, so host load reaches the
+    guest's own execution -- tick density per unit of guest work, scheduler
+    decisions, preemption points -- and therefore reaches the wire.  The
+    wedge is merely that defect's cliff.  A capture is only trustworthy when
+    its content is provably invariant to host load (a deterministic virtual
+    clock), at which point this preflight protects wall-clock time and
+    nothing else.  Until then, what a quiet-host golden certifies is
+    reproducibility UNDER THE RECORDED CONDITIONS, not load-invariance."""
+    if os.environ.get("CST_SYS_CPU_NOCHECK"):
+        return []
+    try:
+        cpu = int(SYS_CPU.split(",")[0])
+        sibs_raw = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/"
+                        f"thread_siblings_list").read_text().strip()
+    except (ValueError, OSError):
+        return []                      # no topology info: don't invent a gate
+    sibs = []
+    for part in sibs_raw.split(","):
+        if "-" in part:
+            lo, hi = part.split("-")
+            sibs += list(range(int(lo), int(hi) + 1))
+        else:
+            sibs.append(int(part))
+    busy = _cpu_busy(sorted(set(sibs)))
+    hot = {c: b for c, b in busy.items() if b > 20.0}
+    if not hot:
+        print(f"  sys cpu preflight: cpu{cpu} siblings {sibs_raw} quiet ("
+              + ", ".join(f"cpu{c}={b:.1f}%" for c, b in sorted(busy.items()))
+              + ")")
+        return []
+    # Offer somewhere to go, so the operator is not left guessing.
+    others = sorted(set(range(os.cpu_count() or 0)) - set(sibs))
+    quiet = []
+    if others:
+        ob = _cpu_busy(others, 1.0)
+        pairs: dict[str, list[int]] = {}
+        for c in others:
+            try:
+                key = Path(f"/sys/devices/system/cpu/cpu{c}/topology/"
+                           f"thread_siblings_list").read_text().strip()
+            except OSError:
+                continue
+            pairs.setdefault(key, []).append(c)
+        for key, members in pairs.items():
+            if len(members) > 1 and all(ob.get(m, 100.0) < 1.0 for m in members):
+                quiet.append(min(members))
+    return [f"sys cpu preflight: CST_SYS_CPU={SYS_CPU} shares an SMT core "
+            f"with " + ", ".join(f"cpu{c} ({b:.0f}% busy)"
+                                 for c, b in sorted(hot.items()))
+            + f" -- the boot will contend and can wedge past the "
+              f"{SYS_TIMEOUT}s timeout.  Re-run with CST_SYS_CPU set to a "
+              f"core whose sibling is idle"
+            + (f", e.g. {quiet[:6]}" if quiet else "")
+            + " (or set CST_SYS_CPU_NOCHECK=1 to proceed anyway)."]
+
+
 def sys_trace_once(build: Path, kernel: Path, initrd: Path, out_dir: Path,
                    label: str) -> Path | None:
     """Boot the canonical system recipe once with the plugin loaded, tracing
@@ -644,14 +1070,25 @@ def sys_trace_once(build: Path, kernel: Path, initrd: Path, out_dir: Path,
     return cst
 
 
-def sys_capture(build: Path, root: Path) -> int:
+def sys_capture(build: Path, root: Path, waivers: dict) -> int:
+    # Same discipline as the user net: prove the build before unlinking the
+    # manifest a refusal has to leave intact.
+    prov, rc = gate_build(build, system=True, waivers=waivers, mode="capture")
+    if rc:
+        return rc
+    pre = sys_cpu_preflight()
+    if pre:
+        print("\n=== SYSTEM CAPTURE REFUSED ===", file=sys.stderr)
+        for f in pre:
+            print(f"  {f}", file=sys.stderr)
+        return 2
     if SYS_MANIFEST.exists():
         SYS_MANIFEST.unlink()
     if root.exists():
         shutil.rmtree(root)
     GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
-    manifest = {"work_root": str(root), "recipe": {}, "canon_cells": {},
-                "fixture_decode": {}, "excluded": {}}
+    manifest = {"work_root": str(root), "provenance": prov, "recipe": {},
+                "canon_cells": {}, "fixture_decode": {}, "excluded": {}}
     bad = 0
 
     # (1) fixture-decode net: triple-hash the frozen system fixture's decode.
@@ -716,12 +1153,22 @@ def sys_capture(build: Path, root: Path) -> int:
     return 1 if bad else 0
 
 
-def sys_check(build: Path, root: Path) -> int:
+def sys_check(build: Path, root: Path, waivers: dict) -> int:
     if not SYS_MANIFEST.exists():
         print(f"no system manifest at {SYS_MANIFEST}; run "
               f"`capture --system` first", file=sys.stderr)
         return 2
     manifest = json.loads(SYS_MANIFEST.read_text())
+    prov, rc = gate_build(build, system=True, waivers=waivers, mode="check")
+    if rc:
+        return rc
+    _report_reference_provenance(manifest, prov)
+    pre = sys_cpu_preflight()
+    if pre:
+        print("\n=== SYSTEM CHECK REFUSED ===", file=sys.stderr)
+        for f in pre:
+            print(f"  {f}", file=sys.stderr)
+        return 2
     cap_root = manifest.get("work_root")
     if cap_root is not None and cap_root != str(root):
         print(f"work-root mismatch: manifest captured under {cap_root}, "
@@ -770,6 +1217,23 @@ def sys_check(build: Path, root: Path) -> int:
                     fails.append(f"canon:{name}: CP-user-slice mismatch "
                                  f"(plugin trace-generation changed)")
 
+    # A net with an empty guard is not a green net, it is an unverified one.
+    # The canon-retrace cell is the ONLY guard on the plugin's system-mode
+    # trace generation (the fixture-decode cell guards the decoder against
+    # frozen bytes and would pass with the plugin removed entirely), so a
+    # manifest that recorded zero canon cells -- because the boot timed out
+    # at capture, say -- must fail here rather than announce "GREEN: 1 decode
+    # + 0 canon" and let an excluded cell read as a pass.
+    if not canon_cells:
+        fails.append("canon: manifest records NO canon cells -- the system "
+                     "net's only guard on plugin trace generation is absent, "
+                     "so this net verifies nothing.  Re-capture (see the "
+                     "manifest's `excluded` map for why it was dropped; a "
+                     "wedged boot usually means the pinned host CPU's SMT "
+                     "sibling is busy -- override CST_SYS_CPU).")
+    if not manifest.get("fixture_decode"):
+        fails.append("decode: manifest records NO fixture-decode cells -- "
+                     "the decoder guard is absent.")
     if fails:
         print("\n=== SYSTEM GOLDEN NET FAILED ===")
         for f in fails:
@@ -805,8 +1269,20 @@ def main() -> int:
                     help="scratch dir for generated workloads/traces; MUST "
                          "be the same path at capture and check (recorded "
                          "in the manifest and enforced)")
+    ap.add_argument("--allow-stale", action="store_true",
+                    help="waive the build-freshness clauses (artifact older "
+                         "than HEAD's commit, or a tracked wire source newer "
+                         "than the oldest artifact).  Recorded in the "
+                         "manifest.")
+    ap.add_argument("--allow-dirty", action="store_true",
+                    help="waive the clean-tree clause on capture, permitting "
+                         "a reference captured from uncommitted wire sources. "
+                         "Recorded in the manifest.  `check` always waives "
+                         "it.")
     args = ap.parse_args()
     build = args.build_dir
+    waivers = {"allow_stale": args.allow_stale,
+               "allow_dirty": args.allow_dirty}
     if not cst_decode_bin(build).exists():
         print(f"cst_decode not found under {build}; build contrib-plugins first",
               file=sys.stderr)
@@ -824,11 +1300,11 @@ def main() -> int:
                   file=sys.stderr)
             return 2
         sys_root = args.work_root / "sys"
-        return sys_capture(build, sys_root) if args.mode == "capture" \
-            else sys_check(build, sys_root)
+        return sys_capture(build, sys_root, waivers) if args.mode == "capture" \
+            else sys_check(build, sys_root, waivers)
     if args.mode == "capture":
-        return capture(build, shared)
-    return check(build, shared)
+        return capture(build, shared, waivers)
+    return check(build, shared, waivers)
 
 
 if __name__ == "__main__":

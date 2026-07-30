@@ -2163,6 +2163,24 @@ Iterations are never aggregated onto a single entry with
 unbounded memop issuers in the supported ISAs — within
 ``CST_FID_SLOT_COUNT`` however much memory they move.
 
+For an x86 REP the iteration count on the wire is the instruction's own
+count-register decrement, read from QEMU through
+``qemu_plugin_rep_iterations`` — never a count of delivered memory-op
+callbacks, which varies with how QEMU translated the instruction
+(``-icount``, single-step, ``EFLAGS.TF``, the interrupt shadow, a
+mid-REP exception).  The trailing re-entry a single-iteration
+translation makes after the final iteration contributes no entry.  A
+REP therefore renders the same entries, edges and memops under every
+translation, and on the wrong path — always single-stepped — as on the
+correct path.  A zero-count REP is a retired instruction and emits its
+one entry, carrying no memops.
+
+The window clock follows the same rule: a window budget counts
+architectural instructions, and a REP is one tick however many
+executions QEMU splits it into.  Because the fan-out writes one entry
+per iteration, a trace may contain more entries than the window budget
+asked for; that is by design.
+
 ::
 
    current n_loads = state(template, insn, CST_FID_N_LOADS)

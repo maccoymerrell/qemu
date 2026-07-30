@@ -150,6 +150,7 @@ FEATURES: dict[str, str] = {
     "behavior:bulk_mem_visible": "aarch64 FEAT_MOPS bulk transfers (SETP/SETM/SETE, CPYP/CPYM/CPYE) reach the memory instrumentation on the correct path: their recorded accesses tile the transferred range exactly instead of vanishing into the helper's host memset/memmove",
     "behavior:dc_zva_visible": "aarch64 DC ZVA reaches the memory instrumentation on the correct path and is modelled as the block store it is: its recorded stores tile the DCZID_EL0-sized block exactly instead of vanishing into the helper's host memset, and the instruction declares the store lane that makes them attributable",
     "behavior:string_op_memops": "x86 REP string instructions fan out per architectural iteration with the right per-iteration memop count, and the operand model matches what each instruction really reads and writes (Capstone access-flag corrections in disas/capstone.c)",
+    "behavior:rep_fanout_invariance": "an x86 REP's fan-out is a function of architectural state only: the same guest execution renders the same number of entries, with the same rep_subtmpl/BRANCH_REP self-loop structure and the same per-iteration direction/target, whether do_gen_rep translated the whole repetition or one iteration per TB (CF_USE_ICOUNT / CF_SINGLE_STEP / EFLAGS.TF / interrupt shadow), and the wrong path — which is ALWAYS single-stepped through cpu_plugin_exec_tb — renders a REP exactly as the correct path does.  No external reference covers the wrong path, so this check is the only thing that can catch a CP/WP divergence there",
     "behavior:reg_snap_accounting": "the plugin's own dropped-slice completeness invariant for the positional reg-snap capture — CP reg-snap slice dropped == CP reg-snap leak trimmed (D4-class completeness oracle; the wire has no record of it, so this is read from the <outfile>.stats.log sidecar, offline via cst_audit --stats-log)",
     "behavior:mips_fragment_split_absence": "split_tb_into_fragments's mid-TB continuation path (a branch-classified insn QEMU's translator keeps decoding past) has no current MIPS instance — the T-family conditional trap was the only one and 5bf597d751 correctly reclassified it to BRANCH_NONE, leaving BRANCH_REP as the path's exerciser (x86 X86RepIterationFanout rep movsq, and the aarch64 FEAT_MOPS bulk copy/set triple); this pins that fact and fails if MIPS regains an un-covered instance",
     "behavior:memop_bimodality": "per-template memop bimodality: a memop-capable template's CP executions overwhelmingly nonzero with a small minority of zero-memop outliers is a completeness loss (D4-class oracle generalised past the segment-final-entry special case; cst_lint.h MemopBimodalityLint + validator.py's mirror, both gating)",
@@ -873,6 +874,27 @@ def _chk_string_memops(ctx: Ctx) -> Outcome:
     tail = "\n".join(out.splitlines()[-8:])
     # A missing native toolchain skips the whole class, which unittest
     # still reports as rc 0.  Surface that as a skip, not a silent pass.
+    if p.returncode == 0 and re.search(r"OK \(skipped=\d+\)", out):
+        return Outcome("skip", tail)
+    return Outcome("pass" if p.returncode == 0 else "fail",
+                   f"rc={p.returncode}\n{tail}")
+
+
+def _chk_rep_fanout_invariance(ctx: Ctx) -> Outcome:
+    t = (Path(__file__).resolve().parent / "tests"
+         / "test_rep_fanout_invariance.py")
+    if not t.is_file():
+        return Outcome("skip", f"test not found: {t}")
+    env = dict(os.environ, CST_BUILD_DIR=str(ctx.build_dir),
+               BUILD_DIR=str(ctx.build_dir),
+               CST_DECODE=str(ctx.build_dir / "contrib" / "plugins"
+                              / "cst_decode"))
+    p = subprocess.run([sys.executable, str(t)], text=True,
+                       capture_output=True, env=env)
+    out = (p.stdout or "") + (p.stderr or "")
+    tail = "\n".join(out.splitlines()[-12:])
+    # A missing native toolchain skips the whole class, which unittest still
+    # reports as rc 0.  Surface that as a skip, not a silent pass.
     if p.returncode == 0 and re.search(r"OK \(skipped=\d+\)", out):
         return Outcome("skip", tail)
     return Outcome("pass" if p.returncode == 0 else "fail",
@@ -1800,6 +1822,11 @@ def build_checks() -> list:
                    "memop count, and the operand model matches the ISA",
                    ["behavior:string_op_memops", "wire:FID_mem_addr",
                     "wire:FID_mem_size"], _chk_string_memops))
+    C.append(Check("features.rep_fanout_invariance", "features",
+                   "x86 REP fan-out is architectural: same shape under "
+                   "either do_gen_rep translation, and CP == WP",
+                   ["behavior:rep_fanout_invariance"],
+                   _chk_rep_fanout_invariance))
     C.append(Check("features.wp_fault", "features",
                    "WP execution-time fault continues to budget",
                    ["behavior:wp_fault_to_budget"], _chk_wp_fault))

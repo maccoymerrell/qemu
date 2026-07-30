@@ -1329,6 +1329,81 @@ static void gen_outs(DisasContext *s, MemOp ot, TCGv dshift)
 
 #define REP_MAX 65535
 
+#ifdef CONFIG_PLUGIN
+/*
+ * Offsets of the CPUState self-loop accounting fields relative to tcg_env,
+ * which points at CPUArchState.  Same relocation the icount and can_do_io
+ * accessors in accel/tcg/translator.c use.
+ */
+#define REP_PLUGIN_OFF(field)                                           \
+    (offsetof(ArchCPU, parent_obj.field) - offsetof(ArchCPU, env))
+
+/*
+ * Publish the architectural iteration count of the REP instance in flight.
+ * Called after each iteration's CX/ECX/RCX writeback, so a fault inside a
+ * later iteration leaves the field holding exactly the iterations that
+ * retired.  @iters is a TB-scoped temp holding the running count.
+ */
+static void gen_rep_plugin_count_iter(DisasContext *s, TCGv iters)
+{
+    if (!s->base.plugin_enabled) {
+        return;
+    }
+    tcg_gen_addi_tl(iters, iters, 1);
+    tcg_gen_st_tl(iters, tcg_env, REP_PLUGIN_OFF(plugin_rep_iters));
+}
+
+/*
+ * Publish whether the REP instance retired in this execution.  Constant
+ * @complete forms cover the paths where retirement is known at translation
+ * time (instruction entry: not yet; the done label: the counter hit zero or
+ * a REPZ/REPNZ condition broke it).
+ */
+static void gen_rep_plugin_complete(DisasContext *s, bool complete)
+{
+    if (!s->base.plugin_enabled) {
+        return;
+    }
+    tcg_gen_st8_tl(tcg_constant_tl(complete), tcg_env,
+                   REP_PLUGIN_OFF(plugin_rep_complete));
+}
+
+/*
+ * Publish which exit this execution took: the re-enter-the-same-instruction
+ * path, or past the instruction.  Both call sites are unconditional within
+ * their path, so the value is a translation-time constant.
+ */
+static void gen_rep_plugin_reenter(DisasContext *s, bool reenter)
+{
+    if (!s->base.plugin_enabled) {
+        return;
+    }
+    tcg_gen_st8_tl(tcg_constant_tl(reenter), tcg_env,
+                   REP_PLUGIN_OFF(plugin_rep_reenter));
+}
+
+/*
+ * Publish retirement on the re-enter-the-same-instruction path, where it is
+ * only knowable at run time: a REP translated as a single iteration
+ * (can_loop == false) takes this path after its *final* iteration too, and
+ * the instruction has retired exactly when the loop counter reached zero.
+ * When the REP did loop internally this path is only taken at a REP_MAX
+ * chunk boundary, where the counter is provably non-zero, so the test
+ * simply always yields false there.
+ */
+static void gen_rep_plugin_complete_dynamic(DisasContext *s,
+                                            target_ulong cx_mask)
+{
+    if (!s->base.plugin_enabled) {
+        return;
+    }
+    TCGv done_now = tcg_temp_new();
+    tcg_gen_andi_tl(done_now, cpu_regs[R_ECX], cx_mask);
+    tcg_gen_setcondi_tl(TCG_COND_EQ, done_now, done_now, 0);
+    tcg_gen_st8_tl(done_now, tcg_env, REP_PLUGIN_OFF(plugin_rep_complete));
+}
+#endif /* CONFIG_PLUGIN */
+
 static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
                        void (*fn)(DisasContext *s, MemOp ot, TCGv dshift),
                        bool is_repz_nz)
@@ -1339,6 +1414,13 @@ static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
 
     target_ulong cx_mask = MAKE_64BIT_MASK(0, 8 << s->aflag);
     TCGv cx_next = tcg_temp_new();
+#ifdef CONFIG_PLUGIN
+    /*
+     * Running architectural iteration count for this execution of the REP.
+     * TB-scoped so it survives the loop back-edge and the branch to @last.
+     */
+    TCGv rep_iters = tcg_temp_new();
+#endif
 
     /*
      * Check if we must translate a single iteration only.  Normally, HF_RF_MASK
@@ -1370,6 +1452,32 @@ static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
     gen_update_cc_op(s);
     tcg_set_insn_start_param(s->base.insn_start, 1, CC_OP_DYNAMIC);
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * Open this execution's self-loop accounting: no iterations retired
+     * yet, instruction not retired yet.  Ahead of the zero-count test, so
+     * a REP entered with CX/ECX/RCX already zero still publishes a count
+     * of 0 rather than leaving the previous REP's value behind.
+     */
+    if (s->base.plugin_enabled) {
+        tcg_gen_movi_tl(rep_iters, 0);
+        /*
+         * Zero the whole 64-bit counter here (the per-iteration updates below
+         * are target_ulong-wide, which would leave a 32-bit target's upper
+         * half stale) and name the instruction the accounting describes.
+         * s->base.pc_next is the current instruction's start address during
+         * translation, the same value plugin_gen_insn_start() publishes as
+         * the instruction's vaddr.
+         */
+        tcg_gen_st_i64(tcg_constant_i64(0), tcg_env,
+                       REP_PLUGIN_OFF(plugin_rep_iters));
+        tcg_gen_st_i64(tcg_constant_i64(s->base.pc_next), tcg_env,
+                       REP_PLUGIN_OFF(plugin_rep_pc));
+    }
+    gen_rep_plugin_complete(s, false);
+    gen_rep_plugin_reenter(s, false);
+#endif
+
     /* Any iteration at all?  */
     tcg_gen_brcondi_tl(TCG_COND_TSTEQ, cpu_regs[R_ECX], cx_mask, done);
 
@@ -1397,6 +1505,10 @@ static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
     gen_set_label(loop);
     fn(s, ot, dshift);
     tcg_gen_mov_tl(cpu_regs[R_ECX], cx_next);
+#ifdef CONFIG_PLUGIN
+    /* This iteration has retired (its writeback is committed above). */
+    gen_rep_plugin_count_iter(s, rep_iters);
+#endif
     gen_update_cc_op(s);
 
     /* Leave if REP condition fails.  */
@@ -1422,6 +1534,15 @@ static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
         gen_set_eflags(s, RF_MASK);
     }
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * This path re-enters the same instruction, so retirement is decided by
+     * the counter rather than by which label we left through.
+     */
+    gen_rep_plugin_complete_dynamic(s, cx_mask);
+    gen_rep_plugin_reenter(s, true);
+#endif
+
     /* Go to the main loop but reenter the same instruction.  */
     gen_jmp_rel_csize(s, -cur_insn_len(s), 0);
 
@@ -1434,12 +1555,20 @@ static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
         set_cc_op(s, CC_OP_DYNAMIC);
         fn(s, ot, dshift);
         tcg_gen_mov_tl(cpu_regs[R_ECX], cx_next);
+#ifdef CONFIG_PLUGIN
+        gen_rep_plugin_count_iter(s, rep_iters);
+#endif
         gen_update_cc_op(s);
     }
 
     /* CX/ECX/RCX is zero, or REPZ/REPNZ broke the repetition.  */
     gen_set_label(done);
     set_cc_op(s, CC_OP_DYNAMIC);
+#ifdef CONFIG_PLUGIN
+    /* Every path into @done retires the instruction and advances past it. */
+    gen_rep_plugin_complete(s, true);
+    gen_rep_plugin_reenter(s, false);
+#endif
     if (had_rf) {
         gen_reset_eflags(s, RF_MASK);
     }

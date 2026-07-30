@@ -409,6 +409,10 @@ static inline void user_count_reset(unsigned int cpu_index,
         qemu_plugin_u64_set(g_scoreboard.user_seen, (unsigned)i,
                             (unsigned)i == cpu_index
                                 ? insn_count_now : USER_SEEN_UNPRIMED);
+        /* A pre-reset REP continuation must not withhold a tick from the
+         * fresh clock. */
+        rep_state((unsigned)i).prev_tb_counted = false;
+        rep_state((unsigned)i).prev_tb_rep_pc = 0;
     }
 }
 
@@ -810,6 +814,16 @@ static bool g_system_mode;
 static std::unordered_map<uint64_t, uint32_t> *g_thread_tid_map;
 static uint32_t g_thread_tid_next = 0;
 static uint32_t g_vcpu_cur_tid[CST_PIN_MAX_VCPUS];
+
+/* Per-vCPU self-loop accounting (see RepSelfLoopState).  The clamp mirrors
+ * the rest of this family: an implausibly high vCPU index folds onto the last
+ * slot rather than running off the array. */
+RepSelfLoopState g_rep_state[CST_PIN_MAX_VCPUS];
+RepSelfLoopState &rep_state(unsigned int cpu_index)
+{
+    return g_rep_state[cpu_index < CST_PIN_MAX_VCPUS
+                       ? cpu_index : CST_PIN_MAX_VCPUS - 1];
+}
 
 /* g_vcpu_cur_asid_index[c] is the address-space sibling of g_vcpu_cur_tid:
  * the compact asid index of the most recent USER TB on vCPU c.  A kernel
@@ -1974,6 +1988,7 @@ thread_local uint64_t g_host_icount CST_TLS_HOT = 0;
  * here off a single instruction, which is what the trace genuinely
  * contains and what any icount-derived quantity must be read against. */
 std::atomic<uint64_t> g_rep_fanout_extra_insns{0};
+
 
 /* Sum of per-segment `covered` (icount[finish] - icount[start])
  * accumulated at finish_trace_segment.  Matches the BBV-equivalent
@@ -3370,7 +3385,114 @@ void emit_body_entry(BodyStreamState *out_stream,
                     other_dps.push_back(dp);
                 }
             }
-            size_t n_iter = rep_dps.size() / mpi;
+            /*
+             * Iteration count.  Prefer QEMU's architectural number, which
+             * comes from the instruction's own loop-counter decrement and is
+             * therefore the same whether do_gen_rep translated the whole
+             * loop or a single iteration, and whether or not an exception
+             * split the repetition.  The memop stream only says how many
+             * callbacks were delivered, which the translation shape and a
+             * mid-iteration fault both move.
+             *
+             * The fallback (memops / mpi) still covers the families QEMU has
+             * no architectural iteration for: the AArch64 FEAT_MOPS bulk
+             * copy/set, whose fan-out unit is one memory access rather than
+             * an architectural element, never publishes a count, so its PC
+             * never matches and it keeps the delivery-derived number.
+             */
+            RepSelfLoopState &rs = rep_state(cpu_index);
+            /* Consume the emission handoff (see RepSelfLoopState::
+             * emit_facts): the PathBuilder froze these facts WITH the
+             * block being emitted, so a fault-deferred or suspended
+             * emission reads the execution it describes, not whatever
+             * the per-callback latch holds by now.  Consume-once: clear
+             * before use so a path that failed to set it falls back and
+             * is counted rather than silently reading a stale value. */
+            RepArchFacts efacts = rs.emit_facts;
+            bool evalid = rs.emit_facts_valid;
+            uint64_t pre_iters  = rs.emit_pre_iters;
+            uint64_t pre_memops = rs.emit_pre_memops;
+            rs.emit_facts_valid = false;
+            rs.emit_pre_iters = 0;
+            rs.emit_pre_memops = 0;
+
+            bool     arch_known = (evalid && efacts.pc != 0 &&
+                                   efacts.pc == bb_tmpl->insn_pcs[last]);
+            size_t   n_iter;
+            bool     rep_retired;
+            /* Fault-split prefix (whole-BB merge): iterations retired and
+             * REP memops delivered before the fault.  pre_i partitions the
+             * merged memop stream; the surplus beyond pre_i*mpi is the
+             * faulted iteration's aborted attempt, paired onto the
+             * iteration that re-executed it. */
+            size_t pre_i = 0, pre_m = 0;
+            if (arch_known) {
+                pre_i = (size_t)pre_iters;
+                pre_m = (size_t)pre_memops;
+                if (pre_m < pre_i * mpi) {
+                    /* Degenerate prefix (suppressed capture): keep the
+                     * count, drop the pairing offset. */
+                    pre_m = pre_i * mpi;
+                }
+                n_iter      = pre_i + (size_t)efacts.iters;
+                rep_retired = efacts.complete;
+                g_stats.rep_iters_architectural++;
+                size_t expected = n_iter * mpi + (pre_m - pre_i * mpi);
+                if (rep_dps.size() != expected) {
+                    /* Delivered memops disagree with the architectural
+                     * count.  Expected when capture is suppressed or a
+                     * multi-piece fault split interleaves partial
+                     * deliveries; recorded rather than silently absorbed
+                     * by the old integer division. */
+                    g_stats.rep_iters_memop_mismatch++;
+                }
+            } else {
+                n_iter      = rep_dps.size() / mpi;
+                rep_retired = true;
+                g_stats.rep_iters_inferred++;
+            }
+
+            /*
+             * Trailing pass over an instruction QEMU has already finished.
+             * A single-iteration translation re-enters the REP once more
+             * after its last iteration and takes the zero-count exit, doing
+             * no architectural work.  Emitting it would add an instruction
+             * the guest never executed — and add it only under the settings
+             * that clear can_loop, which is exactly the setting-dependent
+             * trace shape this accounting exists to remove.  A REP entered
+             * with a zero counter is a different thing entirely: nothing was
+             * in flight, so it falls through and emits its one entry below.
+             */
+            bool continuation = rs.cp_in_flight.in_progress &&
+                                rs.cp_in_flight.pc == bb_tmpl->insn_pcs[last];
+            if (arch_known) {
+                rs.cp_in_flight.pc = bb_tmpl->insn_pcs[last];
+                /* In flight for as long as QEMU keeps coming back to the
+                 * instruction — which it does once more after the iteration
+                 * that retired the repetition, hence reenter rather than
+                 * !complete.  A REP_MAX chunk boundary sets both. */
+                rs.cp_in_flight.in_progress = efacts.reenter;
+            }
+            if (arch_known && n_iter == 0 && continuation) {
+                g_stats.rep_trailing_pass_dropped++;
+                return;
+            }
+
+            /*
+             * Terminal successor.  When a single-iteration translation
+             * retires the instruction it still jumps back to the REP's own
+             * PC before taking the zero-count exit, so the observed
+             * successor is the self-loop even though architecturally the
+             * instruction fell through.  Recover the architectural edge, so
+             * the emitted direction/target sequence matches the one a
+             * looping translation produces.
+             */
+            if (arch_known && rep_retired && n_iter >= 1 &&
+                entry.branch_successor_pc == bb_tmpl->insn_pcs[last]) {
+                entry.branch_successor_pc = bb_tmpl->fall_through_pc;
+                g_stats.rep_exit_edge_recovered++;
+            }
+
             if (n_iter > 1) {
                 /* Track sub-entries (iters 2..N) that this fan-out
                  * will emit beyond the single TB-exec icount bump.
@@ -3394,11 +3516,39 @@ void emit_body_entry(BodyStreamState *out_stream,
                 bool     rep_exit_known  = entry.branch_successor_known;
                 uint64_t rep_loop_pc     = rep_sub->start_pc;
 
-                /* Iter 1: parent BB template + non-REP memops +
-                 * first mpi REP memops. */
+                /* Iteration k's slice of the REP memop stream.  Plain
+                 * k*mpi normally; across a fault-split whole-BB merge the
+                 * stream is [pre_i retired iterations][the faulted
+                 * iteration's aborted attempt][the re-delivered rest], so
+                 * the iteration at pre_i carries its aborted attempt's
+                 * memops (the surplus) plus its re-executed mpi — the same
+                 * rendering the single-iteration translation's merge gives
+                 * the same fault.  Bounded by what was actually delivered:
+                 * with an architectural count the two can differ, and the
+                 * iteration count stays architectural while the memops
+                 * stay whatever really happened. */
+                auto rep_slice = [&](size_t k, size_t &lo, size_t &hi) {
+                    if (pre_m == 0 || k < pre_i) {
+                        lo = k * mpi;
+                        hi = lo + mpi;
+                    } else if (k == pre_i) {
+                        lo = pre_i * mpi;
+                        hi = pre_m + mpi;
+                    } else {
+                        lo = pre_m + (k - pre_i) * mpi;
+                        hi = lo + mpi;
+                    }
+                    lo = std::min(lo, rep_dps.size());
+                    hi = std::min(hi, rep_dps.size());
+                };
+
+                /* Iter 1: parent BB template + non-REP memops + iteration
+                 * 0's slice. */
                 entry.dyn_params = std::move(other_dps);
-                entry.dyn_params.reserve(entry.dyn_params.size() + mpi);
-                for (unsigned j = 0; j < mpi; j++) {
+                size_t s0, e0;
+                rep_slice(0, s0, e0);
+                entry.dyn_params.reserve(entry.dyn_params.size() + (e0 - s0));
+                for (size_t j = s0; j < e0; j++) {
                     entry.dyn_params.push_back(rep_dps[j]);
                 }
                 /* n_iter > 1 here, so iter 1 always loops. */
@@ -3467,8 +3617,10 @@ void emit_body_entry(BodyStreamState *out_stream,
                 for (size_t k = 1; k < n_iter; k++) {
                     sub_e.seq_num = g_trace_segments.next_seq_num();
                     sub_e.dyn_params.clear();
-                    for (unsigned j = 0; j < mpi; j++) {
-                        DynParam dp = rep_dps[k * mpi + j];
+                    size_t sk, ek;
+                    rep_slice(k, sk, ek);
+                    for (size_t j = sk; j < ek; j++) {
+                        DynParam dp = rep_dps[j];
                         dp.insn_index = 0;
                         sub_e.dyn_params.push_back(dp);
                     }
@@ -4915,6 +5067,51 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
              * (user_owned) stays the marker process. */
             capture_owned = marker_trace_all() ? true : user_owned;
         }
+        /* Window-clock ruling (maintainer, 2026-07-29): the marker
+         * window's user-instruction clock counts ARCHITECTURAL
+         * instructions.  A REP split into per-iteration executions
+         * (icount / single-step / TF / interrupt shadow — and QEMU's own
+         * REP_MAX chunking) must tick ONCE, not once per execution: when
+         * the PREVIOUS counted TB ended with a REP and that execution
+         * left by re-entering the instruction (reenter=true), its tick is
+         * withheld here, one dispatch later — the instruction's single
+         * tick comes from the execution that leaves past it
+         * (reenter=false: the sole execution of a looping translation, a
+         * flag-break, a zero-count REP, or the trailing pass).  Keyed on
+         * the remembered REP pc so a foreign REP executed between two
+         * owned dispatches cannot trigger it.  The raw latch (cp_facts)
+         * describes exactly the TB that finished before this dispatch. */
+        {
+            RepSelfLoopState &rs_clk = rep_state(cpu_index);
+            if (rs_clk.prev_tb_counted && rs_clk.prev_tb_rep_pc != 0 &&
+                rs_clk.cp_facts.pc == rs_clk.prev_tb_rep_pc &&
+                rs_clk.cp_facts.reenter) {
+                if (g_user_icount > 0) {
+                    g_user_icount--;
+                    if (g_deadlatch_checked_uic > g_user_icount) {
+                        g_deadlatch_checked_uic = g_user_icount;
+                    }
+                }
+                g_stats.rep_clock_ticks_withheld++;
+            }
+            rs_clk.prev_tb_counted = user_owned;
+            rs_clk.prev_tb_rep_pc = 0;
+            if (user_owned && cur_tb_tmpl) {
+                /* The executing TB's LAST fragment's last insn: a fan-out
+                 * terminator there makes the next dispatch's correction
+                 * eligible.  x86 ends the TB at a REP, so the walk is one
+                 * hop in practice. */
+                BBTemplate *lf = cur_tb_tmpl;
+                while (lf->next_tb_fragment) {
+                    lf = lf->next_tb_fragment;
+                }
+                if (lf->n_insns > 0 &&
+                    lf->insn_fields[lf->n_insns - 1].rep_memops_per_iter
+                        > 0) {
+                    rs_clk.prev_tb_rep_pc = lf->insn_pcs[lf->n_insns - 1];
+                }
+            }
+        }
         if (user_owned) {
             g_user_icount += delta;
             /* Progress-driven dead-latch peer sweep (throttled).  A live
@@ -5311,6 +5508,20 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         g_template_store.promote(cur_tb_tmpl);
         g_mutex_unlock(&data_lock);
     }
+
+    /* Latch the just-finished TB's architectural self-loop accounting.
+     * Must happen here, before the correct-path step: QEMU's fields are
+     * overwritten by any later REP — a wrong-path excursion's, a kernel
+     * fault path's — so this dispatch's raw copy is the only valid source.
+     * Consumers: the PathBuilder absorbs it into the pending-seal prev's
+     * travelling facts at step_events (deferral-safe; see
+     * RepSelfLoopState::emit_facts), and the window-clock correction in
+     * events_path_step reads it directly (it acts exactly one dispatch
+     * behind, which is where the latch points). */
+    rep_state(cpu_index).cp_facts.pc       = qemu_plugin_rep_pc();
+    rep_state(cpu_index).cp_facts.iters    = qemu_plugin_rep_iterations();
+    rep_state(cpu_index).cp_facts.complete = qemu_plugin_rep_complete();
+    rep_state(cpu_index).cp_facts.reenter  = qemu_plugin_rep_reenter();
 
     /* Latch the async-exclusion decision for this TB's body callbacks
      * (see g_capture_mute) before any early return below — the dropped

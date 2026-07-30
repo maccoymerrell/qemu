@@ -966,6 +966,35 @@ uint32_t qemu_plugin_fault_depth(void)
 #endif
 }
 
+/*
+ * Self-loop accounting for the fan-out instruction most recently executed on
+ * this vCPU.  Both fields are written by target-generated TCG from the
+ * instruction's architectural state; targets with no fan-out instruction
+ * never write them, so the pair reads {0, false} there.  Unlike the fault
+ * stack these are meaningful in *-linux-user too, which is where the
+ * single-iteration REP translation is reachable through EFLAGS.TF and the
+ * interrupt shadow.
+ */
+uint64_t qemu_plugin_rep_iterations(void)
+{
+    return current_cpu ? current_cpu->plugin_rep_iters : 0;
+}
+
+bool qemu_plugin_rep_complete(void)
+{
+    return current_cpu ? current_cpu->plugin_rep_complete : false;
+}
+
+uint64_t qemu_plugin_rep_pc(void)
+{
+    return current_cpu ? current_cpu->plugin_rep_pc : 0;
+}
+
+bool qemu_plugin_rep_reenter(void)
+{
+    return current_cpu ? current_cpu->plugin_rep_reenter : false;
+}
+
 bool qemu_plugin_spec_store_overflowed(void)
 {
 #ifdef CONFIG_USER_ONLY

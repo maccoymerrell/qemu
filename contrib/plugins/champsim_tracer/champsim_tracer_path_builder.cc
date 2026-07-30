@@ -453,6 +453,9 @@ void PathBuilder::on_segment_open()
     prev_depth_ = 0;
     prev_owner_asid_ = 0;
     prev_owner_live_ = 0;
+    rep_state(cpu_index_).pb_prev_facts = RepArchFacts();
+    rep_state(cpu_index_).pb_prev_facts_armed = false;
+    rep_state(cpu_index_).pb_walk_facts = RepArchFacts();
     /* Reg-snap hygiene at the window-mode segment boundary (Case C): drop any
      * pre-segment / opener snaps now, sync the generation stamp so the
      * step_events check doesn't redundantly re-clear, and arm the one-shot
@@ -508,6 +511,24 @@ void PathBuilder::on_segment_open()
  * TB about to dispatch rather than one that has run (see the
  * declaration); the in-flight chain is finalized either way.
  */
+/*
+ * Hand the block-being-emitted's self-loop facts to emit_body_entry
+ * (consume-once; see RepSelfLoopState::emit_facts).  Every emission the
+ * PathBuilder performs passes through here with the facts frozen for that
+ * block — the raw per-callback latch is stale for anything deferred.
+ */
+static inline void rep_emit_handoff(unsigned int cpu_index,
+                                    const RepArchFacts &facts,
+                                    uint64_t pre_iters = 0,
+                                    uint64_t pre_memops = 0)
+{
+    RepSelfLoopState &rs = rep_state(cpu_index);
+    rs.emit_facts = facts;
+    rs.emit_facts_valid = true;
+    rs.emit_pre_iters = pre_iters;
+    rs.emit_pre_memops = pre_memops;
+}
+
 void PathBuilder::flush_final(bool walk_prev)
 {
     BodyStreamState *out_stream = g_trace_segments.body_stream();
@@ -594,6 +615,7 @@ void PathBuilder::flush_final(bool walk_prev)
     }
 
     for (BBTemplate *bb_tmpl : finalized) {
+        rep_emit_handoff(cpu_index, rep_state(cpu_index).pb_prev_facts);
         emit_body_entry(out_stream, bb_tmpl, cpu_index, {});
     }
 
@@ -989,6 +1011,24 @@ void PathBuilder::collect_piece(CtxFrame &f, uint64_t resume_pc)
 {
     std::vector<WPMemAccess> piece_mem;
     g_mem_recorder.take_cp(piece_mem);
+    /* Fault-split self-loop prefix: when the faulting instruction IS the
+     * REP (its partial execution's facts carry its own pc — the entry
+     * publish runs before any iteration, so the latch can never be a
+     * previous execution's), accumulate the retired iterations and the
+     * REP's delivered memops.  The folding block is walk_prev_, whose
+     * facts are this step's walk snapshot. */
+    const RepArchFacts &walk_facts = rep_state(cpu_index_).pb_walk_facts;
+    if (walk_facts.pc != 0 && walk_facts.pc == resume_pc) {
+        uint64_t piece_rep = 0;
+        for (const WPMemAccess &m : piece_mem) {
+            if (m.insn_pc == resume_pc) {
+                piece_rep++;
+            }
+        }
+        f.rep_pre_pc = resume_pc;
+        f.rep_pre_iters += walk_facts.iters;
+        f.rep_pre_memops += piece_rep;
+    }
     f.mem.insert(f.mem.end(), piece_mem.begin(), piece_mem.end());
     if (!pending_reg_snaps.empty()) {
         f.snaps.insert(f.snaps.end(), pending_reg_snaps.begin(),
@@ -1175,6 +1215,19 @@ void PathBuilder::apply_fault_return(const struct qemu_plugin_cpu_event &ev)
 
 PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
 {
+    /* The pending-seal prev promoted last step is the TB that finished
+     * immediately before THIS dispatch, so this dispatch's raw latch is
+     * its self-loop accounting — absorb exactly once.  Steps that do not
+     * promote never re-arm, so a latch describing a dropped async/foreign
+     * TB can never overwrite a deferred prev's facts. */
+    {
+        RepSelfLoopState &rs = rep_state(in.cpu_index);
+        if (rs.pb_prev_facts_armed) {
+            rs.pb_prev_facts = rs.cp_facts;
+            rs.pb_prev_facts_armed = false;
+        }
+    }
+
     /* The seal-successor override is strictly one-step state: a
      * recovery step always survives to its own seal (recovery implies
      * pinned-user, which passes the foreign-ASID gate), and any
@@ -1559,10 +1612,15 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
      * next surviving seal). */
     walk_prev_ = prev_tb_;
     walk_depth_ = prev_depth_;
+    rep_state(in.cpu_index).pb_walk_facts =
+        rep_state(in.cpu_index).pb_prev_facts;
     g_dbg_walk_depth = walk_depth_;
     g_dbg_walk_depth_src = g_dbg_prev_depth_src;
     walk_in_sync_ = prev_in_sync_;
     set_prev(in.cur);
+    /* cur's own facts are only readable at the next dispatch. */
+    rep_state(in.cpu_index).pb_prev_facts = RepArchFacts();
+    rep_state(in.cpu_index).pb_prev_facts_armed = true;
     /* Record cur's owning (thread,asid) so a later foreign span that
      * suspends this now-deferred prev freezes the RIGHT owner (Stage 3): the
      * pinned effective asid is the frame-identity key, the live asid the
@@ -1639,11 +1697,22 @@ PathBuilder::complete_merge(size_t idx,
         g_emit_fault_anchors.clear();
         BBTemplate *merged0 = f0.full_tmpl;
         uint64_t merge_wrong0 = pb_no_fault_wp() ? 0 : pe0.wrong_target;
+        /* The resume suffix is this step's walked prev, so its facts are
+         * the walk snapshot; the frame carries the pre-fault prefix.  Read
+         * before the erase invalidates f0. */
+        const RepArchFacts walk0 = rep_state(cpu_index).pb_walk_facts;
+        uint64_t pre_i0 = 0, pre_m0 = 0;
+        if (f0.rep_pre_pc != 0 && f0.rep_pre_pc == walk0.pc) {
+            pre_i0 = f0.rep_pre_iters;
+            pre_m0 = f0.rep_pre_memops;
+        }
         frames_.erase(frames_.begin() + (ptrdiff_t)idx);
+        rep_emit_handoff(cpu_index, walk0, pre_i0, pre_m0);
         emit_finalized_bb(out_stream, merged0, pe0.branch_pc,
                           pe0.emit_current_pc, merge_wrong0, cpu_index);
         for (size_t i = 1; i < pending_emits.size(); i++) {
             const PendingEmit &pe2 = pending_emits[i];
+            rep_emit_handoff(cpu_index, rep_state(cpu_index).pb_walk_facts);
             emit_finalized_bb(out_stream, pe2.bb_tmpl, pe2.branch_pc,
                               pe2.emit_current_pc, pe2.wrong_target, cpu_index);
         }
@@ -1802,12 +1871,23 @@ PathBuilder::complete_merge(size_t idx,
     }
     BBTemplate *merged = f.full_tmpl;
     uint64_t merge_wrong = pb_no_fault_wp() ? 0 : pe.wrong_target;
+    /* Self-loop facts for the merged entry: the resume suffix (this step's
+     * walked prev) supplies the completing execution, the frame supplies
+     * the pre-fault prefix.  Read before the erase invalidates f. */
+    const RepArchFacts walkf = rep_state(cpu_index).pb_walk_facts;
+    uint64_t pre_i = 0, pre_m = 0;
+    if (f.rep_pre_pc != 0 && f.rep_pre_pc == walkf.pc) {
+        pre_i = f.rep_pre_iters;
+        pre_m = f.rep_pre_memops;
+    }
     frames_.erase(frames_.begin() + idx);
+    rep_emit_handoff(cpu_index, walkf, pre_i, pre_m);
     emit_finalized_bb(out_stream, merged, pe.branch_pc,
                       pe.emit_current_pc, merge_wrong, cpu_index);
     g_emit_fault_anchors.clear();
     for (size_t i = 1; i < pending_emits.size(); i++) {
         const PendingEmit &pe2 = pending_emits[i];
+        rep_emit_handoff(cpu_index, rep_state(cpu_index).pb_walk_facts);
         emit_finalized_bb(out_stream, pe2.bb_tmpl, pe2.branch_pc,
                           pe2.emit_current_pc, pe2.wrong_target, cpu_index);
     }
@@ -1874,6 +1954,10 @@ void PathBuilder::flush_frame_unwound(size_t idx, BodyStreamState *out_stream,
                 f.mem.size(), g_last_emit_fault_depth, frames_.size());
     }
 
+    RepArchFacts unwound_facts;
+    unwound_facts.pc = f.rep_pre_pc;
+    unwound_facts.iters = f.rep_pre_iters;
+    rep_emit_handoff(cpu_index, unwound_facts);
     emit_body_entry(out_stream, f.full_tmpl, cpu_index, {});
 
     g_emit_fault_anchors.clear();
@@ -1947,6 +2031,7 @@ void PathBuilder::suspend_prev(uint64_t owner_asid, uint64_t owner_live,
     s.snaps = std::move(pending_reg_snaps);
     pending_reg_snaps.clear();
     s.chain = g_cp_chain.detach_state();
+    s.rep_facts = rep_state(cpu_index).pb_prev_facts;
     g_stats.susp_pushed++;
     g_dbg_susp = susp_stack_.size();
     cst_jump_diag_step(0, s.prev ? s.prev->start_pc : 0, -1, 1, "SUSPEND");
@@ -1987,6 +2072,8 @@ bool PathBuilder::resume_suspension(uint64_t resume_asid, uint64_t resume_live)
         }
         prev_tb_ = s.prev;                       /* re-arm the pending seal */
         prev_depth_ = s.depth;
+        rep_state(cpu_index_).pb_prev_facts = s.rep_facts;
+        rep_state(cpu_index_).pb_prev_facts_armed = false;
         g_dbg_prev_depth_src = CST_PDSRC_RESUME;
         g_dbg_prev_depth = prev_depth_;
         prev_owner_asid_ = s.asid;
@@ -2546,6 +2633,7 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
     }
 
     for (const PendingEmit &pe : pending_emits) {
+        rep_emit_handoff(in.cpu_index, rep_state(in.cpu_index).pb_walk_facts);
         emit_finalized_bb(out_stream, pe.bb_tmpl, pe.branch_pc,
                           pe.emit_current_pc, pe.wrong_target, in.cpu_index);
     }

@@ -1833,6 +1833,98 @@ QEMU_PLUGIN_API
 uint32_t qemu_plugin_fault_depth(void);
 
 /**
+ * qemu_plugin_rep_iterations() - architectural iteration count of the
+ * self-loop instruction the executing vCPU just ran
+ *
+ * Returns how many iterations the most recently executed fan-out
+ * instruction — today an x86 REP-prefixed string operation — actually
+ * retired during that one execution.  The value is produced by the target
+ * translation from the loop counter's own decrement (CX/ECX/RCX selected by
+ * the address size), so it is architectural truth and not a count of
+ * delivered instrumentation callbacks.
+ *
+ * This distinction is load-bearing because a REP is not always translated as
+ * a loop: exactly one iteration is generated whenever CF_USE_ICOUNT or
+ * CF_SINGLE_STEP is in the TB's cflags, or EFLAGS.TF or the interrupt shadow
+ * is set, and an exception or interrupt taken between iterations splits an
+ * already-looping REP the same way.  A tracer that inferred the iteration
+ * count from how many memory-op callbacks arrived in one execution would
+ * therefore report a different count — and a different trace shape — for
+ * identical guest execution.  Reading it here does not.
+ *
+ * Zero has two meanings, separated by qemu_plugin_rep_complete(): a REP
+ * entered with a zero counter (complete, and a real retired instruction),
+ * or the trailing pass QEMU makes over an instruction it has already
+ * finished when it translated only a single iteration (also complete, but
+ * not a new instruction — the caller should recognise it as a continuation
+ * of the instruction whose iterations it has already seen).
+ *
+ * Valid for the instruction most recently executed on this vCPU, so read it
+ * before running any further guest code (a wrong-path excursion included).
+ * Reads zero on targets with no fan-out instruction.  Must be called from a
+ * vCPU context (e.g. an exec callback).
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_rep_iterations(void);
+
+/**
+ * qemu_plugin_rep_complete() - did the self-loop instruction retire?
+ *
+ * True when the fan-out instruction reported by
+ * qemu_plugin_rep_iterations() finished during that execution: its loop
+ * counter reached zero, or a REPZ/REPNZ flag condition broke the
+ * repetition.  False means QEMU will re-enter the same instruction to
+ * continue it — because it translated a single iteration, because it hit an
+ * internal chunk bound, or because an exception intervened — so more
+ * iterations of the same instruction are still to come.
+ *
+ * A tracer that models each iteration as its own control-flow event uses
+ * this to decide the last iteration's successor: an execution that did not
+ * retire loops back to the instruction, one that did falls through past it.
+ * That makes the emitted shape independent of how many iterations QEMU
+ * happened to pack into one execution.
+ *
+ * Must be called from a vCPU context, before any further guest code runs.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_rep_complete(void);
+
+/**
+ * qemu_plugin_rep_pc() - which instruction the self-loop accounting describes
+ *
+ * Returns the virtual address of the fan-out instruction whose counts
+ * qemu_plugin_rep_iterations() and qemu_plugin_rep_complete() report — the
+ * same address qemu_plugin_insn_vaddr() gives for that instruction.  A
+ * consumer that reads the accounting later than the execution it belongs to,
+ * or on a target with no fan-out instruction at all (where the value stays
+ * zero), compares this against the instruction it is attributing and falls
+ * back instead of crediting another instruction's count.
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_rep_pc(void);
+
+/**
+ * qemu_plugin_rep_reenter() - will QEMU re-enter the self-loop instruction?
+ *
+ * True when the execution reported by qemu_plugin_rep_iterations() left by
+ * jumping back to the instruction's own address instead of past it, so the
+ * same instruction is about to be executed again.  Unlike
+ * qemu_plugin_rep_complete() this is an implementation fact rather than an
+ * architectural one, and it exists to make one artefact identifiable: a REP
+ * that QEMU translated as a single iteration re-enters itself even after the
+ * iteration that exhausted the counter, and that final re-entry performs zero
+ * iterations.  A consumer that models every iteration as an instruction uses
+ * this to recognise that zero-iteration execution as the same instruction
+ * finishing — not a new one — and so keep its instruction count independent
+ * of how QEMU translated the REP.
+ *
+ * True is also reported at QEMU's internal repetition bound, where a long
+ * REP is deliberately split into several executions to let the main loop run.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_rep_reenter(void);
+
+/**
  * qemu_plugin_spec_store_overflowed() - did the current wrong-path excursion's
  * speculative-store footprint cross the soft budget?
  *

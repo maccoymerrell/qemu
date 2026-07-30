@@ -40,6 +40,7 @@
 #include <cstddef>
 #include <vector>
 
+#include "champsim_tracer_wp_thread_state.h"
 #include "champsim_tracer.h"
 #include "champsim_tracer_bb_chain_assembler.h"
 
@@ -199,6 +200,10 @@ struct SuspendedPrev {
     std::vector<WPMemAccess> mem;       /* prev's committed CP memops */
     std::vector<RegSnap> snaps;         /* prev's per-insn dst snaps */
     BBChainAssembler::ChainState chain; /* in-flight chain prefix (page-split BB) */
+    RepArchFacts rep_facts;             /* prev's self-loop facts, frozen with
+                                         * it: the per-callback latch will
+                                         * describe other TBs by the time this
+                                         * suspension seals */
 };
 
 struct CtxFrame {
@@ -223,6 +228,16 @@ struct CtxFrame {
     std::vector<WPMemAccess> mem;      /* accumulated memops (insn_pc-keyed) */
     std::vector<RegSnap> snaps;        /* accumulated reg snaps (insn order) */
     std::vector<uint32_t> anchors;     /* faulting-insn indices in full_tmpl */
+    /* Fault-split self-loop prefix: when the faulting instruction IS a REP
+     * (resume_pc == its pc), the iterations its partial execution retired
+     * and the REP memops it delivered before the fault, accumulated across
+     * pieces (a movsb spanning two never-touched pages faults twice).  The
+     * merge adds the resume suffix's iterations for the architectural total
+     * and uses the memop count to pair the re-delivered partial iteration
+     * onto the iteration that faulted. */
+    uint64_t rep_pre_pc = 0;
+    uint64_t rep_pre_iters = 0;
+    uint64_t rep_pre_memops = 0;
 };
 
 class PathBuilder {

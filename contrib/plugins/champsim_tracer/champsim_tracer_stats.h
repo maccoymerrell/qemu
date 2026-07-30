@@ -123,6 +123,44 @@ struct Stats {
      * dropped, which is only the unrecoverable shortfall. */
     uint64_t reg_snap_leak_trimmed = 0;
 
+    /* Self-loop fan-out: where the iteration count came from.
+     *
+     * rep_iters_architectural — QEMU published an iteration count for this
+     *   instruction (x86 REP: the loop counter's own decrement) and it was
+     *   used.  The count is then independent of how QEMU translated the REP,
+     *   so a run under -icount / single-step and one under neither produce
+     *   the same number of entries.
+     * rep_iters_inferred — no architectural count was available and the
+     *   count came from delivered memops / the fan-out unit.  Expected for
+     *   the AArch64 FEAT_MOPS family, whose fan-out unit is one memory
+     *   access rather than an architectural element; on x86 it means the
+     *   accounting did not reach the emission (a deferred or merged
+     *   emission) and should be rare.
+     * rep_iters_memop_mismatch — the two disagreed.  Expected when a fault
+     *   landed inside an iteration: the completed part of that iteration was
+     *   delivered but the iteration never retired.  Recorded because the old
+     *   integer division absorbed exactly this case silently.
+     * rep_trailing_pass_dropped — a zero-iteration re-entry of a REP already
+     *   in flight, i.e. the extra pass a single-iteration translation makes
+     *   after the final iteration.  Not a retired instruction; suppressed so
+     *   the trace's instruction count does not depend on the translation.
+     * rep_exit_edge_recovered — a retiring REP whose observed successor was
+     *   its own PC (the same single-iteration translation jumps back before
+     *   taking the zero-count exit); the emitted terminal edge was restored
+     *   to the architectural fall-through. */
+    uint64_t rep_iters_architectural = 0;
+    uint64_t rep_iters_inferred = 0;
+    uint64_t rep_iters_memop_mismatch = 0;
+    uint64_t rep_trailing_pass_dropped = 0;
+    uint64_t rep_exit_edge_recovered = 0;
+    /* rep_clock_ticks_withheld — user-clock ticks withheld from counted REP
+     * executions that ended by re-entering the instruction (per-iteration
+     * translation passes, REP_MAX chunk boundaries).  The window clock
+     * counts architectural instructions: a REP is one tick regardless of
+     * how many executions QEMU split it into, so a marker window covers
+     * the same user instructions with and without -icount. */
+    uint64_t rep_clock_ticks_withheld = 0;
+
     /* Binary writer byte-count breakdown. */
     uint64_t bin_total_bits = 0;
     uint64_t bin_header_bits = 0;

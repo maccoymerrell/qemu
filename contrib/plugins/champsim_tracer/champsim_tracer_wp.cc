@@ -175,6 +175,13 @@ static void wp_enter_spec_session(unsigned int cpu_index, uint64_t wrong_target,
     g_wp_state.cur_insn_pc = 0;
     g_wp_state.cur_insn_count = 0;
 
+    /* Each excursion is an independent speculative walk: nothing is mid-flight
+     * in it yet.  Without this reset a stale latch from a previous excursion
+     * that ended inside a REP would make this excursion's first block at that
+     * PC look like a continuation and drop it. */
+    rep_state(cpu_index).wp_in_flight = RepInFlight();
+    rep_state(cpu_index).wp_facts     = RepArchFacts();
+
     g_wp_state.saved_cpu_index = cpu_index;
     g_wp_state.saved_insn_count = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
     g_wp_state.saved_prev_start_pc = qemu_plugin_u64_get(g_scoreboard.prev_start_pc, cpu_index);
@@ -542,6 +549,24 @@ static WpStep wp_exec_one_tb(WpWalkState &st)
             g_tb_flush_count.load(std::memory_order_acquire);
         tb_ok = qemu_plugin_exec_tb();
         tmpl = g_wp_state.last_executed_tb;
+        /*
+         * Latch the architectural self-loop accounting of the TB just
+         * speculated.  The wrong path executes every TB through
+         * cpu_plugin_exec_tb, which sets CF_SINGLE_STEP, so do_gen_rep
+         * always translates a single iteration there: a REP that the
+         * correct path renders as one execution of N iterations arrives
+         * here as N executions of one iteration, plus one trailing
+         * execution of zero iterations once the counter is exhausted.
+         * Reading the same numbers the correct path reads is what lets
+         * wp_commit_bb produce the same structure from them — the wrong
+         * path may be operating on deterministic garbage in ECX, but
+         * whatever ECX holds must yield the shape the correct path would
+         * yield from that same ECX.
+         */
+        rep_state(g_wp_state.saved_cpu_index).wp_facts.pc       = qemu_plugin_rep_pc();
+        rep_state(g_wp_state.saved_cpu_index).wp_facts.iters    = qemu_plugin_rep_iterations();
+        rep_state(g_wp_state.saved_cpu_index).wp_facts.complete = qemu_plugin_rep_complete();
+        rep_state(g_wp_state.saved_cpu_index).wp_facts.reenter  = qemu_plugin_rep_reenter();
 
         if (!tmpl) {
             /* A tb_flush during this exec_tb unwound it (via cpu_loop_exit,
@@ -845,12 +870,54 @@ static void wp_commit_bb(WpWalkState &st, BBTemplate *cur,
              * and delta-encode through the per-chain WP overlay (correction:
              * WP now carries these, delta'd against the last WP emission, not
              * a fresh baseline). */
-            WPBBEntry wp_entry = acc.make_entry(bb_tmpl,
-                                                bb_has_fault,
-                                                bb_first_fault_idx);
-            wp_entry.branch_successor_pc    = commit_post_pc;
-            wp_entry.branch_successor_known = true;
-            wp_chain.push_back(std::move(wp_entry));
+            /*
+             * Self-loop accounting on the wrong path.  The correct path's
+             * fan-out already renders one entry per architectural iteration
+             * of a REP; the wrong path gets the same shape for free, because
+             * CF_SINGLE_STEP makes each iteration its own speculated TB and
+             * therefore its own block.  The one place the two diverge is
+             * QEMU's trailing pass: after the iteration that exhausts the
+             * counter it re-enters the instruction once more and takes the
+             * zero-count exit, doing no architectural work.  That block is
+             * the same instruction finishing, not a new one, so dropping it
+             * here is what makes the wrong-path rendering of a REP identical
+             * to the correct-path rendering of the same REP — and the
+             * divergence is invisible to every external reference check,
+             * which validates the correct path only.
+             *
+             * The exit edge gets the same treatment: the retiring iteration's
+             * observed successor is the instruction's own PC (QEMU jumps back
+             * before taking that exit), while architecturally it fell through.
+             */
+            bool rep_drop = false;
+            if (bb_tmpl && bb_tmpl->n_insns > 0) {
+                uint32_t rlast = bb_tmpl->n_insns - 1;
+                uint64_t rpc   = bb_tmpl->insn_pcs[rlast];
+                if (bb_tmpl->insn_fields[rlast].rep_memops_per_iter > 0 &&
+                    rep_state(g_wp_state.saved_cpu_index).wp_facts.pc != 0 && rep_state(g_wp_state.saved_cpu_index).wp_facts.pc == rpc) {
+                    bool cont = rep_state(g_wp_state.saved_cpu_index).wp_in_flight.in_progress &&
+                                rep_state(g_wp_state.saved_cpu_index).wp_in_flight.pc == rpc;
+                    rep_state(g_wp_state.saved_cpu_index).wp_in_flight.pc          = rpc;
+                    rep_state(g_wp_state.saved_cpu_index).wp_in_flight.in_progress = rep_state(g_wp_state.saved_cpu_index).wp_facts.reenter;
+                    if (rep_state(g_wp_state.saved_cpu_index).wp_facts.iters == 0 && cont) {
+                        rep_drop = true;
+                        g_stats.rep_trailing_pass_dropped++;
+                    } else if (rep_state(g_wp_state.saved_cpu_index).wp_facts.complete &&
+                               rep_state(g_wp_state.saved_cpu_index).wp_facts.iters >= 1 &&
+                               commit_post_pc == rpc) {
+                        commit_post_pc = bb_tmpl->fall_through_pc;
+                        g_stats.rep_exit_edge_recovered++;
+                    }
+                }
+            }
+            if (!rep_drop) {
+                WPBBEntry wp_entry = acc.make_entry(bb_tmpl,
+                                                    bb_has_fault,
+                                                    bb_first_fault_idx);
+                wp_entry.branch_successor_pc    = commit_post_pc;
+                wp_entry.branch_successor_known = true;
+                wp_chain.push_back(std::move(wp_entry));
+            }
 
             /*
              * Opportunistic branch-alternate minting (static_templates=1).

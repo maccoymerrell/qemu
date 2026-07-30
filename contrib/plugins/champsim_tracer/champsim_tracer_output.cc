@@ -765,10 +765,27 @@ static std::vector<ProfTgt> build_prof_targets(const BBTemplate *tmpl)
                 }
             }
         } else {
-            /* Non-indirect: one taken edge; its split IS the
-             * terminal branch's aggregate outcome. */
+            /*
+             * Non-indirect: one taken edge; its split IS the
+             * terminal branch's aggregate outcome.
+             *
+             * A self-loop prefix's taken edge is the instruction's own
+             * address — a property of the encoding, not something an
+             * execution has to be observed taking.  Declaring it structurally
+             * is what keeps it right in the two cases observation cannot
+             * supply it: the 1-insn self-loop sub-template, which is
+             * synthesised rather than executed as a TB and would otherwise
+             * serialise a taken target of zero, and a parent BB whose only
+             * observable successor was the architectural fall-through past
+             * the whole repetition.  Reading it from observation instead made
+             * this field depend on whether QEMU translated the entire
+             * repetition or a single iteration — the same setting-dependence
+             * the iteration count itself carried.
+             */
+            uint64_t rep_taken_pc = last->branch_type == BRANCH_REP
+                ? tmpl->insn_pcs[bidx] : tmpl->taken_pc;
             prof_tgts.push_back({
-                tmpl->taken_pc,
+                rep_taken_pc,
                 bt_cp, bnt_cp, bt_wp, bnt_wp,
             });
         }

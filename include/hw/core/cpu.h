@@ -579,6 +579,53 @@ struct CPUState {
 #ifdef CONFIG_PLUGIN
     CPUPluginState *plugin_state;
 
+    /*
+     * Architectural self-loop accounting for the fan-out instruction (an
+     * x86 REP-prefixed string operation) most recently executed on this
+     * vCPU.  Both fields are written by target-generated TCG from the
+     * instruction's own architectural state, never from how many
+     * instrumentation callbacks a translation happened to deliver:
+     *
+     *   plugin_rep_iters     iterations this execution completed, taken
+     *                        from the loop counter's own decrement
+     *                        (CX/ECX/RCX per the address size).  A fault
+     *                        inside an iteration leaves the count at the
+     *                        iterations that actually retired.
+     *   plugin_rep_complete  true when the repetition ended in this
+     *                        execution: the loop counter reached zero, or
+     *                        a REPZ/REPNZ flag condition broke it.  This is
+     *                        the instruction's architectural retirement.
+     *   plugin_rep_reenter   true when QEMU left this execution by jumping
+     *                        back to the instruction's own address rather
+     *                        than past it.  Unlike the two above this is an
+     *                        implementation fact, and it is the one that
+     *                        makes the artefact identifiable: a REP
+     *                        translated as a single iteration re-enters
+     *                        itself even after the iteration that retired
+     *                        it, so the next execution performs zero
+     *                        iterations and is the same instruction
+     *                        finishing rather than a new one.
+     *
+     * These exist because a REP is not always translated as a loop.
+     * do_gen_rep() emits exactly one iteration whenever CF_USE_ICOUNT,
+     * CF_SINGLE_STEP, EFLAGS.TF or the interrupt shadow is in effect, and
+     * a mid-instruction exception splits an already-looping REP the same
+     * way.  A count inferred from delivered memory-op callbacks therefore
+     * changes with the setting; these do not.  Read through
+     * qemu_plugin_rep_iterations() / qemu_plugin_rep_complete().
+     *
+     * plugin_rep_pc names the instruction the pair describes, so a consumer
+     * that reaches the accounting later than the execution it belongs to
+     * (a deferred or merged emission) can tell and fall back rather than
+     * attribute another instruction's count.  Targets with no fan-out
+     * instruction never write it, which is also how a consumer recognises
+     * that no architectural count is available at all.
+     */
+    uint64_t plugin_rep_iters;
+    uint64_t plugin_rep_pc;
+    bool plugin_rep_complete;
+    bool plugin_rep_reenter;
+
     /* Wrong-path speculative execution state.  Sandbox is indexed by
      * cache-line address (64-byte aligned) — an 8-byte store costs
      * one hash op instead of eight, and a vector store within a line

@@ -84,6 +84,36 @@ Plugin API additions
      departure PC is never fetched again); the plugin invokes it only
      when the pinned process is observed at user privilege, which is
      definitionally outside any handler.
+   * ``qemu_plugin_rep_iterations`` / ``qemu_plugin_rep_complete`` /
+     ``qemu_plugin_rep_reenter`` / ``qemu_plugin_rep_pc`` — the
+     architectural self-loop accounting of the fan-out instruction
+     the executing vCPU most recently ran.  ``do_gen_rep``
+     (``target/i386/tcg/translate.c``) publishes the iteration count
+     from the count register's own decrement, whether the repetition
+     ended (the counter reached zero or a REPZ/REPNZ condition broke
+     it), whether QEMU is about to re-enter the same instruction, and
+     which instruction the three describe.
+
+     They exist because a REP is not always translated as a loop:
+     ``can_loop`` is false whenever ``CF_USE_ICOUNT`` or
+     ``CF_SINGLE_STEP`` is set on the block or ``EFLAGS.TF`` or the
+     interrupt shadow is live, and QEMU then generates one iteration
+     and jumps back to the instruction's own address — including once
+     after the iteration that exhausted the counter, a pass that does
+     no architectural work.  An iteration count inferred from
+     delivered memory-op callbacks inherits all of that, so the fan-out
+     would gain an entry, and lose its architectural exit edge, purely
+     because of a setting.  Reading the count register instead makes
+     the emitted shape identical under ``-icount`` and without it, and
+     on the wrong path — which ``cpu_plugin_exec_tb`` always
+     single-steps — as on the correct path.  The accounting is written
+     only when the block carries plugin instrumentation
+     (``DisasContextBase::plugin_enabled``), so an uninstrumented QEMU
+     pays nothing; targets with no fan-out instruction never write it,
+     which is also how the plugin recognises that no architectural
+     count is available and keeps its memop-derived fallback for the
+     AArch64 FEAT_MOPS family (whose fan-out unit is one memory access
+     rather than an architectural element).
    * ``qemu_plugin_in_spec_mode`` — the executing vCPU's speculative
      (wrong-path) mode flag, read from the vCPU itself.  The marker
      open/close callbacks gate on it so an invocation fired by a

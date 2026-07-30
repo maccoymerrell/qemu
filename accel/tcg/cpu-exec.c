@@ -2279,18 +2279,62 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
             /*
              * End an asynchronous-interrupt excursion when execution returns
              * to the departure PC recorded on async entry (the interrupted
-             * instruction).  This generic resume point is target-independent
-             * and robust to the scheduler context-switching away during the
-             * handler and to nested exceptions: the departure PC is not
-             * executed inside the handler, only when its exception return
-             * lands back there.  Entry is flagged per-target in each
-             * <arch>_cpu_do_interrupt; see cpu.h.
+             * instruction) IN THE DEPARTED CONTEXT.  This generic resume
+             * point is target-independent and robust to the scheduler
+             * context-switching away during the handler and to nested
+             * exceptions: the departure PC is not executed inside the
+             * handler, only when its exception return lands back there.
+             * Entry is flagged per-target in each <arch>_cpu_do_interrupt
+             * via cpu_plugin_async_enter(); see cpu.h.
+             *
+             * The context test is the guest thread-pointer register, the
+             * same register a tracer derives guest-thread identity from
+             * (format.rst §4.2a keys the window's level on the delivering
+             * THREAD).  Under SMP a PEER thread scheduled onto this vCPU
+             * inside the window can execute the same VA; a bare PC equality
+             * closed the window early then (measured: async_return_peer_ctx
+             * = 2 in 1,919 windows).  A genuine resume cannot mismatch: the
+             * departed thread executes NOTHING between departure and its
+             * resume (the resume IS its next instruction), so its thread
+             * pointer — context-switched state the kernel restores before
+             * the exception return — compares equal exactly there.  When
+             * the hook is absent both sides read 0 and this is the
+             * historical bare PC equality.  A mismatch leaves the window
+             * open for the owner's later return; if the owner never
+             * returns, the tracer's abandoned-window recovery reaps the
+             * flag at the next pinned user TB (both mute and capture
+             * modes), exactly as it already does for a window whose
+             * departure PC is never re-fetched at all.
              */
             if (unlikely(cpu->plugin_in_async_int) &&
                 pc == cpu->plugin_async_departure_pc) {
-                cpu->plugin_in_async_int = false;
-                cpu_plugin_evq_push(cpu, QEMU_PLUGIN_CPU_EVENT_ASYNC_RETURN,
-                                    pc, cpu->plugin_fault_depth);
+                const TCGCPUOps *aret_ops = cpu->cc->tcg_ops;
+                uint64_t cur_tp =
+                    (aret_ops && aret_ops->get_plugin_thread_ptr)
+                    ? aret_ops->get_plugin_thread_ptr(cpu)
+                    : cpu->plugin_async_departure_tp;
+
+                if (cur_tp == cpu->plugin_async_departure_tp) {
+                    cpu->plugin_in_async_int = false;
+                    cpu_plugin_evq_push(cpu,
+                                        QEMU_PLUGIN_CPU_EVENT_ASYNC_RETURN,
+                                        pc, cpu->plugin_fault_depth);
+                } else {
+                    /* Condition instrument (CST_ASYNCRET_DIAG): a peer
+                     * context hit the departure PC and the close was
+                     * withheld — the case the discriminator exists for. */
+                    static int aret_diag = -1;
+                    if (aret_diag < 0) {
+                        aret_diag = getenv("CST_ASYNCRET_DIAG") != NULL;
+                    }
+                    if (aret_diag) {
+                        fprintf(stderr, "[asyncret] peer-context hit "
+                                "suppressed pc=0x%" PRIx64 " dep_tp=0x%"
+                                PRIx64 " cur_tp=0x%" PRIx64 "\n",
+                                (uint64_t)pc,
+                                cpu->plugin_async_departure_tp, cur_tp);
+                    }
+                }
             }
 #endif
 

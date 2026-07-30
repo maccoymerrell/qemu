@@ -687,9 +687,21 @@ struct CPUState {
      * kept).  A tracer reads the flag (qemu_plugin_in_async_int) to drop the
      * async handler — non-representative OS noise — while keeping synchronous
      * syscalls/faults.  Set only on the correct path (never wrong-path).
+     *
+     * The departure CONTEXT is recorded alongside the departure PC: the
+     * guest thread-pointer register (TCGCPUOps::get_plugin_thread_ptr — the
+     * same register a tracer derives guest-thread identity from).  The
+     * return check compares it at the departure-PC re-fetch, because under
+     * SMP a PEER thread executing the same VA must not close another
+     * thread's window: a genuine resume restores the departed thread's
+     * whole context (the thread pointer included) before landing on the
+     * departure PC, so equality is exact there, while a peer at the same VA
+     * carries its own thread pointer and is skipped.  Targets without the
+     * hook record 0 and the check degrades to the bare PC equality.
      */
     bool plugin_in_async_int;
     uint64_t plugin_async_departure_pc;
+    uint64_t plugin_async_departure_tp;
     /*
      * Synchronous-fault excursion reporting for system-mode tracing.  Unlike
      * the async path above, sync faults are KEPT (the handler is real,
@@ -848,6 +860,14 @@ QEMU_BUILD_BUG_ON(offsetof(CPUState, neg) !=
  * (asid, priv) at the event instant. */
 void cpu_plugin_evq_push(CPUState *cpu, int kind, uint64_t pc,
                          uint32_t depth_after);
+
+/* Open an asynchronous-interrupt window: set plugin_in_async_int, record
+ * the departure context (@departure_pc = where the handler's exception
+ * return resumes, plus the thread-pointer register naming the departing
+ * thread) and append the ordered ASYNC_ENTER event.  Callers gate on the
+ * edge (!plugin_in_async_int) and on the correct path (!plugin_spec_mode);
+ * defined in plugins/core.c, where the per-target hooks are reachable. */
+void cpu_plugin_async_enter(CPUState *cpu, uint64_t departure_pc);
 
 static inline void cpu_plugin_fault_push(CPUState *cpu, uint64_t resume_pc)
 {

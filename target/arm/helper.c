@@ -11123,21 +11123,14 @@ void arm_cpu_do_interrupt(CPUState *cs)
                          idx == EXCP_VSERR || idx == EXCP_NMI ||
                          idx == EXCP_VINMI || idx == EXCP_VFNMI);
         if (is_async) {
-            /* Enter the async excursion; record the departure PC (interrupted
-             * instruction) so the exception return that lands back there ends
-             * it.  Outermost edge only: the enclosing !plugin_in_async_int
-             * guard keeps a nested async interrupt from re-entering this
-             * block, so the departure PC is stamped once per window and the
-             * ASYNC_ENTER event fires once per window (the inner guard is
-             * redundant with the enclosing one; it keeps the event push
-             * edge-gated on its own terms). */
-            if (!cs->plugin_in_async_int) {
-                cpu_plugin_evq_push(cs, QEMU_PLUGIN_CPU_EVENT_ASYNC_ENTER,
-                                    cs->cc->get_pc(cs),
-                                    cs->plugin_fault_depth);
-            }
-            cs->plugin_in_async_int = true;
-            cs->plugin_async_departure_pc = cs->cc->get_pc(cs);
+            /* Enter the async excursion; record the departure context
+             * (interrupted PC + thread pointer) so the exception return
+             * that lands back there, in the departed thread, ends it.
+             * Outermost edge only: the enclosing !plugin_in_async_int guard
+             * keeps a nested async interrupt from re-entering this block,
+             * so the departure context is stamped once per window and the
+             * ASYNC_ENTER event fires once per window. */
+            cpu_plugin_async_enter(cs, cs->cc->get_pc(cs));
         } else if (idx != EXCP_SWI && idx != EXCP_HVC && idx != EXCP_SMC) {
             /* Synchronous FAULT (data/prefetch abort, undef, alignment, …):
              * the handler's exception return re-executes the faulting

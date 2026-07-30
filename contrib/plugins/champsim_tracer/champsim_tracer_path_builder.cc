@@ -1340,14 +1340,17 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
                 if (g_async_win_id) {
                     g_stats.async_closed_by_return++;
                     if (in.cur_tid != async_owner_tid_) {
-                        /* The producer's test is a bare PC equality on a
-                         * per-vCPU departure PC (accel/tcg/cpu-exec.c), with
-                         * no thread and no address-space check, so a peer
-                         * executing the same VA can close the window early.
+                        /* The producer (accel/tcg/cpu-exec.c) fires a RETURN
+                         * only when the departure PC is re-fetched with the
+                         * departure thread-pointer value, so a peer executing
+                         * the same VA no longer closes the window early.
                          * Counted, not suppressed: the window's LIFETIME is
                          * QEMU's per-vCPU state and the plugin must not
-                         * desynchronise from it — a nonzero count here is an
-                         * upstream defect to report, not one to paper over. */
+                         * desynchronise from it.  Thread-pointer collisions
+                         * (no-ASLR twins, MIPS !ULRI zero) pass the producer
+                         * but also collapse to ONE tid here, so they cannot
+                         * bump this counter — a nonzero count is a producer
+                         * regression tripwire. */
                         g_stats.async_return_peer_ctx++;
                     }
                     async_win_close("RETURN", in.cur_tid);

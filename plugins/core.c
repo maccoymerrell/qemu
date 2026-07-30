@@ -152,6 +152,28 @@ void cpu_plugin_evq_push(CPUState *cpu, int kind, uint64_t pc,
     };
 }
 
+void cpu_plugin_async_enter(CPUState *cpu, uint64_t departure_pc)
+{
+    const TCGCPUOps *ops = cpu->cc->tcg_ops;
+
+    cpu->plugin_in_async_int = true;
+    cpu->plugin_async_departure_pc = departure_pc;
+    /*
+     * The departure context, for the return check in cpu_exec_loop: the
+     * guest thread-pointer register still names the INTERRUPTED thread here
+     * (exception delivery does not touch it; only the guest kernel's
+     * context switch does), and a genuine resume restores exactly this
+     * value before the exception return lands on @departure_pc.  Targets
+     * without the hook record 0 on both sides — the return check then
+     * degrades to the historical bare PC equality.
+     */
+    cpu->plugin_async_departure_tp =
+        (ops && ops->get_plugin_thread_ptr) ? ops->get_plugin_thread_ptr(cpu)
+                                            : 0;
+    cpu_plugin_evq_push(cpu, QEMU_PLUGIN_CPU_EVENT_ASYNC_ENTER, departure_pc,
+                        cpu->plugin_fault_depth);
+}
+
 struct qemu_plugin_cb {
     struct qemu_plugin_ctx *ctx;
     union qemu_plugin_cb_sig f;

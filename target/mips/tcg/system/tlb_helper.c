@@ -1135,12 +1135,8 @@ void mips_cpu_do_interrupt(CPUState *cs)
      */
     if (cs->exception_index == EXCP_EXT_INTERRUPT &&
         !cs->plugin_spec_mode && !cs->plugin_in_async_int) {
-        cs->plugin_in_async_int = true;
-        cs->plugin_async_departure_pc =
-            exception_resume_pc(env) & ~(target_ulong)1;
-        cpu_plugin_evq_push(cs, QEMU_PLUGIN_CPU_EVENT_ASYNC_ENTER,
-                            cs->plugin_async_departure_pc,
-                            cs->plugin_fault_depth);
+        cpu_plugin_async_enter(cs,
+                               exception_resume_pc(env) & ~(target_ulong)1);
     } else if (mips_fault_reexecutes(cs->exception_index) &&
                !cs->plugin_spec_mode && !cs->plugin_in_async_int) {
         /*

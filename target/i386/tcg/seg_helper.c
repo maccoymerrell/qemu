@@ -1180,11 +1180,7 @@ void do_interrupt_all(X86CPU *cpu, int intno, int is_int,
     if (is_hw) {
         CPUState *cs_ = CPU(cpu);
         if (!cs_->plugin_spec_mode && !cs_->plugin_in_async_int) {
-            cs_->plugin_in_async_int = true;
-            cs_->plugin_async_departure_pc = cs_->cc->get_pc(cs_);
-            cpu_plugin_evq_push(cs_, QEMU_PLUGIN_CPU_EVENT_ASYNC_ENTER,
-                                cs_->plugin_async_departure_pc,
-                                cs_->plugin_fault_depth);
+            cpu_plugin_async_enter(cs_, cs_->cc->get_pc(cs_));
         }
     } else if (!is_int) {
         /*

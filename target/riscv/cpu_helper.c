@@ -2387,11 +2387,7 @@ void riscv_cpu_do_interrupt(CPUState *cs)
      * returns there.  Outermost only; never on the wrong path.  See cpu.h.
      */
     if (async && !cs->plugin_spec_mode && !cs->plugin_in_async_int) {
-        cs->plugin_in_async_int = true;
-        cs->plugin_async_departure_pc = cs->cc->get_pc(cs);
-        cpu_plugin_evq_push(cs, QEMU_PLUGIN_CPU_EVENT_ASYNC_ENTER,
-                            cs->plugin_async_departure_pc,
-                            cs->plugin_fault_depth);
+        cpu_plugin_async_enter(cs, cs->cc->get_pc(cs));
     } else if (!async && !cs->plugin_spec_mode && !cs->plugin_in_async_int) {
         /*
          * Synchronous FAULT (page/access fault, illegal insn, misaligned, …):

@@ -90,7 +90,21 @@ extern thread_local bool g_capture_mute CST_TLS_HOT;
  */
 struct RepArchFacts {
     uint64_t pc       = 0;      /* REP insn this describes; 0 = none */
-    uint64_t iters    = 0;      /* iterations retired in that execution */
+    uint64_t iters    = 0;      /* iterations retired in that execution.
+                                 * For an AArch64 FEAT_MOPS bulk op — whose
+                                 * fan-out unit is one memory access, not an
+                                 * architectural element — this is the number
+                                 * of accesses that execution reported, each
+                                 * derived from the helper's own byte
+                                 * progress (see arm_plugin_emit_pieces). */
+    uint64_t bytes    = 0;      /* FEAT_MOPS only: architectural bytes that
+                                 * execution moved, from the instruction's
+                                 * own size-register decrement
+                                 * (qemu_plugin_rep_bytes).  The delivered
+                                 * access sizes must sum to it — the
+                                 * register-derived truth the access-unit
+                                 * fan-out count is verified against.  x86
+                                 * REP leaves it 0. */
     bool     complete = false;  /* repetition ended in that execution */
     bool     reenter  = false;  /* QEMU jumped back to the insn, not past */
 };
@@ -161,12 +175,35 @@ struct RepSelfLoopState {
      * execution of a looping translation, a flag-break, a zero-count REP,
      * or the trailing pass).  These remember, per vCPU, whether the
      * previous counted TB is eligible: prev_tb_counted = it advanced the
-     * user clock; prev_tb_rep_pc = the fan-out insn terminating it (0 for
-     * none), so a foreign REP executed between two owned dispatches
-     * cannot trigger the correction.
+     * user clock; prev_tb_rep_pcs[] = the fan-out insns it contains, so
+     * a foreign REP executed between two owned dispatches cannot trigger
+     * the correction.
+     *
+     * A small set rather than one pc because AArch64 FEAT_MOPS bulk
+     * instructions do not end their TB the way an x86 REP does: a
+     * SETP/SETM/SETE trio translates into one TB as three mid-TB
+     * fragment terminators, and the execution a cpu_loop_exit_requested
+     * split re-enters resumes at the SPLIT instruction's own pc, not a
+     * TB-terminating one.  The splitter seals a fragment at every
+     * self-loop insn, so the collection walk is one pc per fragment.
+     * Overflow past the fixed capacity loses the withhold for the
+     * surplus insns — an overcount, never an undercount — and eight
+     * exceeds any real TB's fan-out population.
      */
+    static constexpr unsigned REP_CLK_PCS = 8;
     bool     prev_tb_counted = false;
-    uint64_t prev_tb_rep_pc = 0;
+    uint8_t  prev_tb_rep_n = 0;
+    uint64_t prev_tb_rep_pcs[REP_CLK_PCS] = {};
+
+    bool prev_tb_rep_contains(uint64_t pc) const
+    {
+        for (unsigned i = 0; i < prev_tb_rep_n; i++) {
+            if (prev_tb_rep_pcs[i] == pc) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     /*
      * Self-loop facts travelling with the PathBuilder's pending-seal prev,

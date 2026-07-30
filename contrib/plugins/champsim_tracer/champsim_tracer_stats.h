@@ -153,6 +153,30 @@ struct Stats {
     uint64_t rep_iters_memop_mismatch = 0;
     uint64_t rep_trailing_pass_dropped = 0;
     uint64_t rep_exit_edge_recovered = 0;
+
+    /*
+     * rep_unretired_pass_dropped — an empty leading pass of a fan-out
+     * instruction (nothing retired, nothing delivered — a FEAT_MOPS bulk
+     * op whose first byte faulted) was suppressed; its re-execution
+     * carries the instruction's single rendering.
+     *
+     * rep_unretired_pass_kept — the same facts arrived on a shape the
+     * drop does not cover (multi-insn block or with deliveries); kept on
+     * the wire and counted for visibility.
+     *
+     * mops_bytes_checked / _mismatch / _unchecked — FEAT_MOPS anchor:
+     * on a cleanly completed single-execution bulk op the delivered
+     * access sizes must sum to the architectural byte progress QEMU
+     * published from the size register's own decrement.  _mismatch is a
+     * reporting defect (or a dropped stale run after an abandoned bulk
+     * op) and the MOPS probes gate on it staying 0; _unchecked counts
+     * instances whose access sizes were not captured (memdata off).
+     */
+    uint64_t rep_unretired_pass_dropped = 0;
+    uint64_t rep_unretired_pass_kept = 0;
+    uint64_t mops_bytes_checked = 0;
+    uint64_t mops_bytes_mismatch = 0;
+    uint64_t mops_bytes_unchecked = 0;
     /* rep_clock_ticks_withheld — user-clock ticks withheld from counted REP
      * executions that ended by re-entering the instruction (per-iteration
      * translation passes, REP_MAX chunk boundaries).  The window clock

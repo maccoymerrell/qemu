@@ -843,10 +843,52 @@ illegal_return:
  * is tagged MO_LE to match.  A bulk block transfer moves bytes, not
  * scalars, so it has no endianness of its own; memory order is the
  * only meaningful reading of the payload.
+ *
+ * REPORTING NORMALIZATION (the FEAT_MOPS fan-out contract).  The
+ * byte-at-a-time fallbacks used to report through their per-byte
+ * cpu_ld/st ops, so the *same* guest execution changed its reported
+ * shape with every emulation artifact that forces the fallback: a
+ * watchpoint anywhere on the page, a TLB_NOTDIRTY page (whose first
+ * byte re-dirties it, resuming the fast path misaligned: 256 pieces
+ * became 259), plugin speculative execution, and the host-page-sized
+ * chunking of the helpers themselves.  A 4 KiB SETM billed 256, 259
+ * or 4096 accesses for identical architectural work.  Now every path
+ * reports through this one reporter: the fallbacks accumulate their
+ * per-byte work into contiguous runs (mops_acc_append) and flush them
+ * through the same <=16-byte naturally-aligned decomposition the fast
+ * path uses, at the same page-bounded chunk boundaries the fast path
+ * reports at.  Because no naturally aligned power-of-two piece of at
+ * most 16 bytes can cross a 16-byte-aligned boundary, the tiling of a
+ * byte range is compositional across any page/chunk split — so the
+ * reported sequence is identical whether QEMU moved the bytes with one
+ * host memset, per-byte stores, or any interleaving of the two, and
+ * identical across cpu_loop_exit_requested / fault splits of the
+ * instruction (the pending run survives the longjmp in the per-vCPU
+ * accumulator and the resumed execution completes it).
+ *
+ * The one deliberate exception is genuine device memory (ruling:
+ * "report true MMIO, don't force tiling").  On MMIO the device really
+ * does see the fallback's byte accesses, so those keep their per-byte
+ * reports, delivered as they happen.  Only genuine memory-type
+ * differences may change the reported shape: watchpoints, clean
+ * pages, unmapped-then-faulted pages and speculative execution are
+ * emulation artifacts and normalize; MMIO is not and does not.
+ *
+ * How the bytes are MOVED is untouched everywhere: the fallbacks
+ * still issue the same one-byte (or 16-byte, for tags) operations in
+ * the same order with the same fault semantics.  Only the plugin
+ * report is normalized.
+ *
+ * @count: this transfer belongs to a FEAT_MOPS SET/CPY step helper,
+ * whose do_setX/do_cpyX caller publishes per-execution architectural
+ * facts (see mops_plugin_entry): each emitted piece increments
+ * cpu->plugin_rep_iters so the published count is exactly the number
+ * of accesses reported.  DC ZVA publishes nothing and passes false.
  */
-static void arm_plugin_bulk_mem_cb(CPUARMState *env, uint64_t addr,
+static void arm_plugin_emit_pieces(CPUARMState *env, uint64_t addr,
                                    uint64_t size, const void *host,
-                                   int memidx, enum qemu_plugin_mem_rw rw)
+                                   int memidx, enum qemu_plugin_mem_rw rw,
+                                   bool count)
 {
 #ifdef CONFIG_PLUGIN
     CPUState *cs = env_cpu(env);
@@ -894,13 +936,297 @@ static void arm_plugin_bulk_mem_cb(CPUARMState *env, uint64_t addr,
 
         qemu_plugin_vcpu_mem_cb(cs, addr, low, high,
                                 make_memop_idx(MO_LE | sz, memidx), rw);
+        if (count) {
+            cs->plugin_rep_iters++;
+        }
         addr += bytes;
         size -= bytes;
     }
 #else
     (void)env; (void)addr; (void)size; (void)host; (void)memidx; (void)rw;
+    (void)count;
 #endif
 }
+
+#ifdef CONFIG_PLUGIN
+/*
+ * Per-vCPU run accumulator for the byte-at-a-time MOPS fallbacks (see
+ * the reporter comment above).  One run per direction; the wrong path
+ * gets its own context so a speculative MOPS inside a wrong-path
+ * excursion cannot corrupt a correct-path run held pending across a
+ * fault or cpu_loop_exit split of the same instruction.
+ *
+ * A run holds the byte VALUES as they were actually transferred (the
+ * source may be gone by flush time: an overlapping copy has already
+ * overwritten it, a speculative store only exists in the sandbox), in
+ * a TARGET_PAGE_SIZE buffer — a run never exceeds one page-bounded
+ * chunk, which is also the fast path's report granularity.
+ */
+typedef struct MopsRun {
+    bool     active;
+    bool     descending;      /* bytes arrive in descending order (CPY rev) */
+    uint64_t lo, hi;          /* accumulated guest range [lo, hi) */
+    uint64_t buf_base;        /* guest address of buf[0] */
+    int      memidx;
+    uint8_t *buf;             /* TARGET_PAGE_SIZE, lazily allocated */
+    /* Fallback-classification cache: is the page this run walks device
+     * memory?  One nonfault TLB-flag probe per page, not per byte. */
+    uint64_t mmio_page;
+    bool     mmio_valid;
+    bool     mmio;
+} MopsRun;
+
+typedef struct MopsAccCtx {
+    MopsRun r;                /* load side (CPY source) */
+    MopsRun w;                /* store side (SET / CPY destination) */
+} MopsAccCtx;
+
+typedef struct MopsReportAcc {
+    MopsAccCtx cp;            /* correct path */
+    MopsAccCtx spec;          /* wrong path (plugin_spec_mode) */
+} MopsReportAcc;
+
+static MopsAccCtx *mops_acc_ctx(CPUARMState *env)
+{
+    CPUState *cs = env_cpu(env);
+    MopsReportAcc *acc = cs->plugin_mops_report;
+
+    if (unlikely(!acc)) {
+        acc = g_new0(MopsReportAcc, 1);
+        cs->plugin_mops_report = acc;
+    }
+    return cs->plugin_spec_mode ? &acc->spec : &acc->cp;
+}
+
+/* Emit a run's accumulated range through the shared decomposition and
+ * deactivate it.  MOPS runs always count toward plugin_rep_iters. */
+static void mops_run_flush(CPUARMState *env, MopsRun *run,
+                           enum qemu_plugin_mem_rw rw)
+{
+    if (run->active && run->hi > run->lo) {
+        arm_plugin_emit_pieces(env, run->lo, run->hi - run->lo,
+                               run->buf + (run->lo - run->buf_base),
+                               run->memidx, rw, true);
+    }
+    run->active = false;
+}
+
+/* Chunk complete: emit both directions, load side first — the order the
+ * fast path reports a copy chunk in. */
+static void mops_ctx_flush(CPUARMState *env, MopsAccCtx *ctx)
+{
+    mops_run_flush(env, &ctx->r, QEMU_PLUGIN_MEM_R);
+    mops_run_flush(env, &ctx->w, QEMU_PLUGIN_MEM_W);
+}
+
+/*
+ * A pending run whose continuation never arrived: the guest abandoned a
+ * faulted MOPS (its handler resumed somewhere else), or capture ended
+ * mid-instruction.  The bytes were really transferred but their
+ * instruction's execution window is gone — reporting them now would
+ * attribute them to whatever instruction is live, so they are dropped
+ * and the loss is made visible: here in the log, and plugin-side as a
+ * delivered-vs-architectural byte mismatch (the published byte count
+ * includes them; the delivered pieces do not).
+ */
+static void mops_run_drop_stale(MopsRun *run)
+{
+    if (run->active) {
+        qemu_log_mask(LOG_UNIMP,
+                      "MOPS plugin report: dropped %" PRIu64
+                      " stale pending byte(s) at 0x%" PRIx64
+                      " (abandoned bulk op)\n",
+                      run->hi - run->lo, run->lo);
+        run->active = false;
+    }
+}
+
+/*
+ * Is @addr device memory?  Cached per page on the run.  Raw TLB flags,
+ * no side effects (no notdirty transition, no watchpoint fire), and no
+ * plugin-forced TLB_MMIO — this asks about the machine, not about the
+ * instrumentation.  Never called in spec mode (spec normalizes always;
+ * its accesses are sandboxed and cannot reach a device).
+ */
+static bool mops_fallback_mmio(CPUARMState *env, MopsRun *run, uint64_t addr,
+                               MMUAccessType access_type, int memidx)
+{
+#ifdef CONFIG_USER_ONLY
+    return false;
+#else
+    uint64_t page = addr & TARGET_PAGE_MASK;
+
+    if (!run->mmio_valid || run->mmio_page != page) {
+        int flags = tlb_vaddr_lookup_flags(env, addr, access_type, memidx);
+
+        run->mmio = !(flags & TLB_INVALID_MASK) && (flags & TLB_MMIO);
+        run->mmio_page = page;
+        run->mmio_valid = true;
+    }
+    return run->mmio;
+#endif
+}
+
+/*
+ * Accumulate one fallback byte.  @remaining is the chunk-local bound the
+ * caller's step was invoked with (already MIN'd against the page limit
+ * and any MTE bound), so remaining == 1 marks the last byte of exactly
+ * the extent the fast path would have reported as one chunk: that is
+ * the flush point.  For a copy the two directions advance in lockstep
+ * and flush together, store side triggering (or the load side when the
+ * store side reports per-byte MMIO and holds no run).
+ */
+static void mops_acc_append(CPUARMState *env, MopsAccCtx *ctx, bool is_store,
+                            uint64_t addr, uint8_t byte, int memidx,
+                            bool descending, uint64_t remaining)
+{
+    MopsRun *run = is_store ? &ctx->w : &ctx->r;
+
+    if (run->active &&
+        (run->memidx != memidx || run->descending != descending ||
+         (descending ? run->lo != addr + 1 : run->hi != addr))) {
+        mops_run_drop_stale(run);
+    }
+    if (!run->active) {
+        if (!run->buf) {
+            run->buf = g_malloc(TARGET_PAGE_SIZE);
+        }
+        run->active = true;
+        run->descending = descending;
+        run->memidx = memidx;
+        /* The chunk never crosses a page, so anchoring the buffer at the
+         * lowest address the chunk can reach keeps indexing in-bounds in
+         * both directions. */
+        run->buf_base = descending ? addr - (remaining - 1) : addr;
+        run->lo = descending ? addr + 1 : addr;
+        run->hi = descending ? addr + 1 : addr;
+    }
+    run->buf[addr - run->buf_base] = byte;
+    if (descending) {
+        run->lo = addr;
+    } else {
+        run->hi = addr + 1;
+    }
+    if (remaining == 1 && (is_store || !ctx->w.active)) {
+        mops_ctx_flush(env, ctx);
+    }
+}
+#endif /* CONFIG_PLUGIN */
+
+/*
+ * Report a bulk transfer chunk from a host-pointer fast path.  When a
+ * fallback run for the same direction is pending and contiguous (the
+ * canonical case: a TLB_NOTDIRTY page whose first fallback byte
+ * re-dirtied it, handing the rest of the chunk back to the fast path),
+ * the chunk completes that run so the flushed tiling is the one an
+ * uninterrupted fast path would have reported.  Otherwise the chunk is
+ * emitted directly — the pure fast path stays allocation-free.
+ */
+static void arm_plugin_bulk_mem_cb(CPUARMState *env, uint64_t addr,
+                                   uint64_t size, const void *host,
+                                   int memidx, enum qemu_plugin_mem_rw rw,
+                                   bool count)
+{
+#ifdef CONFIG_PLUGIN
+    CPUState *cs = env_cpu(env);
+    MopsReportAcc *acc;
+    MopsRun *run;
+
+    if (likely(!cs->neg.plugin_mem_cbs)) {
+        return;
+    }
+    acc = cs->plugin_mops_report;
+    /* Only the MOPS step helpers (@count) own runs; DC ZVA must neither
+     * complete nor invalidate one — the kernel's clear_page() runs inside
+     * the very fault handlers a split MOPS holds its pending run across. */
+    if (unlikely(acc != NULL) && count) {
+        MopsAccCtx *ctx = cs->plugin_spec_mode ? &acc->spec : &acc->cp;
+
+        run = (rw == QEMU_PLUGIN_MEM_W) ? &ctx->w : &ctx->r;
+        if (unlikely(run->active)) {
+            bool contig = host && run->memidx == memidx &&
+                (run->descending ? run->lo == addr + size : run->hi == addr) &&
+                (addr - run->buf_base) + size <= TARGET_PAGE_SIZE;
+
+            if (contig) {
+                memcpy(run->buf + (addr - run->buf_base), host, size);
+                if (run->descending) {
+                    run->lo = addr;
+                } else {
+                    run->hi = addr + size;
+                }
+                /* The fast path reports a chunk whole, so this run now
+                 * extends to the chunk boundary: flush it. */
+                mops_run_flush(env, run, rw);
+                return;
+            }
+            mops_run_drop_stale(run);
+        }
+    }
+    arm_plugin_emit_pieces(env, addr, size, host, memidx, rw, count);
+#else
+    (void)env; (void)addr; (void)size; (void)host; (void)memidx; (void)rw;
+    (void)count;
+#endif
+}
+
+/*
+ * Per-execution architectural facts for the FEAT_MOPS SET/CPY helpers,
+ * published through the same CPUState fields x86's do_gen_rep() uses
+ * (the plugin consumes both through one accounting path):
+ *
+ *   entry     — zero the per-execution counters.  Runs after the
+ *               enable/consistency checks (whose exceptions mean the
+ *               operation never began; the stale fields then name some
+ *               other instruction and the consumer's pc guard refuses
+ *               them) and before the first step, so a fault on the very
+ *               first byte leaves fresh facts: 0 accesses, 0 bytes, not
+ *               complete.  The instruction's address itself is stored at
+ *               translation time (see gen_mops_plugin_pc()).
+ *   bytes     — architectural progress, accumulated from the step
+ *               returns, i.e. the same quantity the helper writes back
+ *               into the size register.  Survives the fault longjmp the
+ *               way do_gen_rep's per-iteration writeback does.
+ *   complete  — the instruction retired in this execution (including
+ *               the size==0 NOP-outs, which retire having moved
+ *               nothing).
+ *   reenter   — this execution ends by re-entering the instruction:
+ *               set only at the cpu_loop_exit_requested splits, QEMU's
+ *               implementation artifact.  A guest-architectural fault
+ *               (which real hardware also restarts the instruction for)
+ *               leaves it false, exactly as x86 REP's fault path does.
+ */
+#ifdef CONFIG_PLUGIN
+static inline void mops_plugin_entry(CPUARMState *env)
+{
+    CPUState *cs = env_cpu(env);
+
+    cs->plugin_rep_iters = 0;
+    cs->plugin_rep_bytes = 0;
+    cs->plugin_rep_complete = false;
+    cs->plugin_rep_reenter = false;
+}
+
+static inline void mops_plugin_bytes(CPUARMState *env, uint64_t step)
+{
+    env_cpu(env)->plugin_rep_bytes += step;
+}
+
+static inline void mops_plugin_complete(CPUARMState *env)
+{
+    env_cpu(env)->plugin_rep_complete = true;
+}
+
+static inline void mops_plugin_reenter(CPUARMState *env)
+{
+    env_cpu(env)->plugin_rep_reenter = true;
+}
+#else
+static inline void mops_plugin_entry(CPUARMState *env) {}
+static inline void mops_plugin_bytes(CPUARMState *env, uint64_t step) {}
+static inline void mops_plugin_complete(CPUARMState *env) {}
+static inline void mops_plugin_reenter(CPUARMState *env) {}
+#endif
 
 void HELPER(dc_zva)(CPUARMState *env, uint64_t vaddr_in)
 {
@@ -938,20 +1264,61 @@ void HELPER(dc_zva)(CPUARMState *env, uint64_t vaddr_in)
 
         if (unlikely(!mem)) {
             /*
-             * The only remaining reason for mem == NULL is I/O.
-             * Just do a series of byte writes as the architecture demands.
+             * mem == NULL here means I/O — or, with a plugin attached,
+             * speculative (wrong-path) execution, whose probes refuse
+             * host pointers.  Just do a series of byte writes as the
+             * architecture demands.
+             *
+             * On true I/O the device genuinely sees byte writes, so they
+             * are reported as they happen (the per-byte cpu_stb reports).
+             * Speculation is an emulation artifact, not a memory type:
+             * its report is normalized to the same decomposition the
+             * host-pointer path emits, values zero as DC ZVA stores.
              */
+#ifdef CONFIG_PLUGIN
+            void *saved_cbs = NULL;
+            bool spec = env_cpu(env)->plugin_spec_mode;
+
+            if (spec) {
+                saved_cbs = env_cpu(env)->neg.plugin_mem_cbs;
+                env_cpu(env)->neg.plugin_mem_cbs = NULL;
+            }
+#endif
             for (int i = 0; i < blocklen; i++) {
                 cpu_stb_mmuidx_ra(env, vaddr + i, 0, mmu_idx, ra);
             }
+#ifdef CONFIG_PLUGIN
+            if (spec) {
+                env_cpu(env)->neg.plugin_mem_cbs = saved_cbs;
+                arm_plugin_emit_pieces(env, vaddr, blocklen, NULL, mmu_idx,
+                                       QEMU_PLUGIN_MEM_W, false);
+            }
+#endif
             return;
         }
     }
 #else
     if (unlikely(!mem)) {
+        /*
+         * In user mode the trapless lookup only fails during plugin
+         * speculative execution (an unmapped page faults from inside the
+         * byte loop instead).  The byte stores land in the spec sandbox;
+         * the report is normalized to the host-pointer decomposition,
+         * values zero as DC ZVA stores.
+         */
+#ifdef CONFIG_PLUGIN
+        void *saved_cbs = env_cpu(env)->neg.plugin_mem_cbs;
+
+        env_cpu(env)->neg.plugin_mem_cbs = NULL;
+#endif
         for (int i = 0; i < blocklen; i++) {
             cpu_stb_mmuidx_ra(env, vaddr + i, 0, mmu_idx, ra);
         }
+#ifdef CONFIG_PLUGIN
+        env_cpu(env)->neg.plugin_mem_cbs = saved_cbs;
+        arm_plugin_emit_pieces(env, vaddr, blocklen, NULL, mmu_idx,
+                               QEMU_PLUGIN_MEM_W, false);
+#endif
         return;
     }
 #endif
@@ -976,7 +1343,7 @@ void HELPER(dc_zva)(CPUARMState *env, uint64_t vaddr_in)
     memset(mem, 0, blocklen);
     clear_helper_retaddr();
     arm_plugin_bulk_mem_cb(env, vaddr, blocklen, mem, mmu_idx,
-                           QEMU_PLUGIN_MEM_W);
+                           QEMU_PLUGIN_MEM_W, false);
 }
 
 void HELPER(unaligned_access)(CPUARMState *env, uint64_t addr,
@@ -1118,7 +1485,36 @@ static uint64_t set_step(CPUARMState *env, uint64_t toaddr,
          * watchpoint, invalid page, etc handling correctly.
          * In user-mode, this path is taken during plugin speculative
          * execution so stores route through the per-vCPU store buffer.
+         *
+         * Reporting: normalized through the run accumulator (fast-path
+         * decomposition) unless the page is genuine device memory, whose
+         * byte writes are reported as they happen.  The store itself is
+         * byte-at-a-time either way.
          */
+#ifdef CONFIG_PLUGIN
+        CPUState *cs = env_cpu(env);
+
+        if (cs->neg.plugin_mem_cbs) {
+            MopsAccCtx *ctx = mops_acc_ctx(env);
+            bool mmio = !cs->plugin_spec_mode &&
+                mops_fallback_mmio(env, &ctx->w, toaddr,
+                                   MMU_DATA_STORE, memidx);
+
+            if (mmio) {
+                cpu_stb_mmuidx_ra(env, toaddr, data, memidx, ra);
+                cs->plugin_rep_iters++;   /* one per-byte piece delivered */
+                return 1;
+            }
+            void *saved_cbs = cs->neg.plugin_mem_cbs;
+
+            cs->neg.plugin_mem_cbs = NULL;
+            cpu_stb_mmuidx_ra(env, toaddr, data, memidx, ra);
+            cs->neg.plugin_mem_cbs = saved_cbs;
+            mops_acc_append(env, ctx, true, toaddr, data, memidx,
+                            false, setsize);
+            return 1;
+        }
+#endif
         cpu_stb_mmuidx_ra(env, toaddr, data, memidx, ra);
         return 1;
     }
@@ -1127,7 +1523,7 @@ static uint64_t set_step(CPUARMState *env, uint64_t toaddr,
     memset(mem, data, setsize);
     clear_helper_retaddr();
     arm_plugin_bulk_mem_cb(env, toaddr, setsize, mem, memidx,
-                           QEMU_PLUGIN_MEM_W);
+                           QEMU_PLUGIN_MEM_W, true);
     return setsize;
 }
 
@@ -1165,6 +1561,15 @@ static uint64_t set_step_tags(CPUARMState *env, uint64_t toaddr,
         MemOpIdx oi16 = make_memop_idx(MO_TE | MO_128, memidx);
         cpu_st16_mmu(env, toaddr, int128_make128(repldata, repldata), oi16, ra);
         mte_mops_set_tags(env, toaddr, 16, *mtedesc);
+#ifdef CONFIG_PLUGIN
+        /* The 16-byte store above reports itself as one MO_128 piece —
+         * already the fast-path shape (SETG addresses and sizes are
+         * 16-aligned), so no normalization is needed; only the published
+         * access count must include it. */
+        if (env_cpu(env)->neg.plugin_mem_cbs) {
+            env_cpu(env)->plugin_rep_iters++;
+        }
+#endif
         return 16;
     }
     /* Easy case: just memset the host memory */
@@ -1172,7 +1577,7 @@ static uint64_t set_step_tags(CPUARMState *env, uint64_t toaddr,
     memset(mem, data, setsize);
     clear_helper_retaddr();
     arm_plugin_bulk_mem_cb(env, cleanaddr, setsize, mem, memidx,
-                           QEMU_PLUGIN_MEM_W);
+                           QEMU_PLUGIN_MEM_W, true);
     mte_mops_set_tags(env, toaddr, setsize, *mtedesc);
     return setsize;
 }
@@ -1312,11 +1717,13 @@ static void do_setp(CPUARMState *env, uint32_t syndrome, uint32_t mtedesc,
         mtedesc = 0;
     }
 
+    mops_plugin_entry(env);
     stagesetsize = MIN(setsize, page_limit(toaddr));
     while (stagesetsize) {
         env->xregs[rd] = toaddr;
         env->xregs[rn] = setsize;
         step = stepfn(env, toaddr, stagesetsize, data, memidx, &mtedesc, ra);
+        mops_plugin_bytes(env, step);
         toaddr += step;
         setsize -= step;
         stagesetsize -= step;
@@ -1324,6 +1731,7 @@ static void do_setp(CPUARMState *env, uint32_t syndrome, uint32_t mtedesc,
     /* Insn completed, so update registers to the Option A format */
     env->xregs[rd] = toaddr + setsize;
     env->xregs[rn] = -setsize;
+    mops_plugin_complete(env);
 
     /* Set NZCV = 0000 to indicate we are an Option A implementation */
     env->NF = 0;
@@ -1364,6 +1772,9 @@ static void do_setm(CPUARMState *env, uint32_t syndrome, uint32_t mtedesc,
      * checks; we choose to do so.
      */
     if (env->xregs[rn] == 0) {
+        /* A retired execution that moved nothing. */
+        mops_plugin_entry(env);
+        mops_plugin_complete(env);
         return;
     }
 
@@ -1386,17 +1797,23 @@ static void do_setm(CPUARMState *env, uint32_t syndrome, uint32_t mtedesc,
     }
 
     /* Do the actual memset: we leave the last partial page to SETE */
+    mops_plugin_entry(env);
     stagesetsize = setsize & TARGET_PAGE_MASK;
     while (stagesetsize > 0) {
         step = stepfn(env, toaddr, stagesetsize, data, memidx, &mtedesc, ra);
+        mops_plugin_bytes(env, step);
         toaddr += step;
         setsize -= step;
         stagesetsize -= step;
         env->xregs[rn] = -setsize;
         if (stagesetsize > 0 && unlikely(cpu_loop_exit_requested(cs))) {
+            /* QEMU's own re-entry of this instruction, not the guest's:
+             * the next execution continues it rather than beginning it. */
+            mops_plugin_reenter(env);
             cpu_loop_exit_restore(cs, ra);
         }
     }
+    mops_plugin_complete(env);
 }
 
 void HELPER(setm)(CPUARMState *env, uint32_t syndrome, uint32_t mtedesc)
@@ -1429,6 +1846,9 @@ static void do_sete(CPUARMState *env, uint32_t syndrome, uint32_t mtedesc,
      * checks; we choose to do so.
      */
     if (setsize == 0) {
+        /* A retired execution that moved nothing. */
+        mops_plugin_entry(env);
+        mops_plugin_complete(env);
         return;
     }
 
@@ -1453,12 +1873,15 @@ static void do_sete(CPUARMState *env, uint32_t syndrome, uint32_t mtedesc,
     }
 
     /* Do the actual memset */
+    mops_plugin_entry(env);
     while (setsize > 0) {
         step = stepfn(env, toaddr, setsize, data, memidx, &mtedesc, ra);
+        mops_plugin_bytes(env, step);
         toaddr += step;
         setsize -= step;
         env->xregs[rn] = -setsize;
     }
+    mops_plugin_complete(env);
 }
 
 void HELPER(sete)(CPUARMState *env, uint32_t syndrome, uint32_t mtedesc)
@@ -1530,18 +1953,66 @@ static uint64_t copy_step(CPUARMState *env, uint64_t toaddr, uint64_t fromaddr,
      */
     if (unlikely(!rmem || !wmem)) {
         uint8_t byte;
+        /*
+         * Reporting: each side is normalized through its run accumulator
+         * (fast-path decomposition, load run flushed before store run at
+         * the chunk boundary) unless that side is genuine device memory,
+         * which keeps its per-byte reports as they happen.  The copy
+         * itself stays byte-at-a-time either way.
+         */
+#ifdef CONFIG_PLUGIN
+        CPUState *cs = env_cpu(env);
+
+        if (cs->neg.plugin_mem_cbs) {
+            MopsAccCtx *ctx = mops_acc_ctx(env);
+            bool r_mmio = !rmem && !cs->plugin_spec_mode &&
+                mops_fallback_mmio(env, &ctx->r, fromaddr,
+                                   MMU_DATA_LOAD, rmemidx);
+            bool w_mmio = !wmem && !cs->plugin_spec_mode &&
+                mops_fallback_mmio(env, &ctx->w, toaddr,
+                                   MMU_DATA_STORE, wmemidx);
+            void *saved_cbs;
+
+            if (rmem) {
+                byte = *(uint8_t *)rmem;
+            } else if (r_mmio) {
+                byte = cpu_ldub_mmuidx_ra(env, fromaddr, rmemidx, ra);
+                cs->plugin_rep_iters++;
+            } else {
+                saved_cbs = cs->neg.plugin_mem_cbs;
+                cs->neg.plugin_mem_cbs = NULL;
+                byte = cpu_ldub_mmuidx_ra(env, fromaddr, rmemidx, ra);
+                cs->neg.plugin_mem_cbs = saved_cbs;
+            }
+            if (!r_mmio) {
+                mops_acc_append(env, ctx, false, fromaddr, byte, rmemidx,
+                                false, copysize);
+            }
+            if (wmem) {
+                *(uint8_t *)wmem = byte;
+            } else if (w_mmio) {
+                cpu_stb_mmuidx_ra(env, toaddr, byte, wmemidx, ra);
+                cs->plugin_rep_iters++;
+            } else {
+                saved_cbs = cs->neg.plugin_mem_cbs;
+                cs->neg.plugin_mem_cbs = NULL;
+                cpu_stb_mmuidx_ra(env, toaddr, byte, wmemidx, ra);
+                cs->neg.plugin_mem_cbs = saved_cbs;
+            }
+            if (!w_mmio) {
+                mops_acc_append(env, ctx, true, toaddr, byte, wmemidx,
+                                false, copysize);
+            }
+            return 1;
+        }
+#endif
         if (rmem) {
             byte = *(uint8_t *)rmem;
-            /* Bare host read: report it, the cpu_ldub path would not be. */
-            arm_plugin_bulk_mem_cb(env, fromaddr, 1, rmem, rmemidx,
-                                   QEMU_PLUGIN_MEM_R);
         } else {
             byte = cpu_ldub_mmuidx_ra(env, fromaddr, rmemidx, ra);
         }
         if (wmem) {
             *(uint8_t *)wmem = byte;
-            arm_plugin_bulk_mem_cb(env, toaddr, 1, wmem, wmemidx,
-                                   QEMU_PLUGIN_MEM_W);
         } else {
             cpu_stb_mmuidx_ra(env, toaddr, byte, wmemidx, ra);
         }
@@ -1553,12 +2024,12 @@ static uint64_t copy_step(CPUARMState *env, uint64_t toaddr, uint64_t fromaddr,
      * reports the value each access actually saw.
      */
     arm_plugin_bulk_mem_cb(env, fromaddr, copysize, rmem, rmemidx,
-                           QEMU_PLUGIN_MEM_R);
+                           QEMU_PLUGIN_MEM_R, true);
     set_helper_retaddr(ra);
     memmove(wmem, rmem, copysize);
     clear_helper_retaddr();
     arm_plugin_bulk_mem_cb(env, toaddr, copysize, wmem, wmemidx,
-                           QEMU_PLUGIN_MEM_W);
+                           QEMU_PLUGIN_MEM_W, true);
     return copysize;
 }
 
@@ -1615,18 +2086,66 @@ static uint64_t copy_step_rev(CPUARMState *env, uint64_t toaddr,
      */
     if (unlikely(!rmem || !wmem)) {
         uint8_t byte;
+        /*
+         * Reporting: as copy_step(), normalized per side unless genuine
+         * device memory.  Bytes arrive in descending order here; the
+         * accumulator anchors the run at the chunk's lowest possible
+         * address and flushes it ascending, matching the fast path's
+         * ascending-base report of a reverse chunk.
+         */
+#ifdef CONFIG_PLUGIN
+        CPUState *cs = env_cpu(env);
+
+        if (cs->neg.plugin_mem_cbs) {
+            MopsAccCtx *ctx = mops_acc_ctx(env);
+            bool r_mmio = !rmem && !cs->plugin_spec_mode &&
+                mops_fallback_mmio(env, &ctx->r, fromaddr,
+                                   MMU_DATA_LOAD, rmemidx);
+            bool w_mmio = !wmem && !cs->plugin_spec_mode &&
+                mops_fallback_mmio(env, &ctx->w, toaddr,
+                                   MMU_DATA_STORE, wmemidx);
+            void *saved_cbs;
+
+            if (rmem) {
+                byte = *(uint8_t *)rmem;
+            } else if (r_mmio) {
+                byte = cpu_ldub_mmuidx_ra(env, fromaddr, rmemidx, ra);
+                cs->plugin_rep_iters++;
+            } else {
+                saved_cbs = cs->neg.plugin_mem_cbs;
+                cs->neg.plugin_mem_cbs = NULL;
+                byte = cpu_ldub_mmuidx_ra(env, fromaddr, rmemidx, ra);
+                cs->neg.plugin_mem_cbs = saved_cbs;
+            }
+            if (!r_mmio) {
+                mops_acc_append(env, ctx, false, fromaddr, byte, rmemidx,
+                                true, copysize);
+            }
+            if (wmem) {
+                *(uint8_t *)wmem = byte;
+            } else if (w_mmio) {
+                cpu_stb_mmuidx_ra(env, toaddr, byte, wmemidx, ra);
+                cs->plugin_rep_iters++;
+            } else {
+                saved_cbs = cs->neg.plugin_mem_cbs;
+                cs->neg.plugin_mem_cbs = NULL;
+                cpu_stb_mmuidx_ra(env, toaddr, byte, wmemidx, ra);
+                cs->neg.plugin_mem_cbs = saved_cbs;
+            }
+            if (!w_mmio) {
+                mops_acc_append(env, ctx, true, toaddr, byte, wmemidx,
+                                true, copysize);
+            }
+            return 1;
+        }
+#endif
         if (rmem) {
             byte = *(uint8_t *)rmem;
-            /* Bare host read: report it, the cpu_ldub path would not be. */
-            arm_plugin_bulk_mem_cb(env, fromaddr, 1, rmem, rmemidx,
-                                   QEMU_PLUGIN_MEM_R);
         } else {
             byte = cpu_ldub_mmuidx_ra(env, fromaddr, rmemidx, ra);
         }
         if (wmem) {
             *(uint8_t *)wmem = byte;
-            arm_plugin_bulk_mem_cb(env, toaddr, 1, wmem, wmemidx,
-                                   QEMU_PLUGIN_MEM_W);
         } else {
             cpu_stb_mmuidx_ra(env, toaddr, byte, wmemidx, ra);
         }
@@ -1640,13 +2159,13 @@ static uint64_t copy_step_rev(CPUARMState *env, uint64_t toaddr,
      */
     arm_plugin_bulk_mem_cb(env, fromaddr - (copysize - 1), copysize,
                            rmem - (copysize - 1), rmemidx,
-                           QEMU_PLUGIN_MEM_R);
+                           QEMU_PLUGIN_MEM_R, true);
     set_helper_retaddr(ra);
     memmove(wmem - (copysize - 1), rmem - (copysize - 1), copysize);
     clear_helper_retaddr();
     arm_plugin_bulk_mem_cb(env, toaddr - (copysize - 1), copysize,
                            wmem - (copysize - 1), wmemidx,
-                           QEMU_PLUGIN_MEM_W);
+                           QEMU_PLUGIN_MEM_W, true);
     return copysize;
 }
 
@@ -1708,6 +2227,7 @@ static void do_cpyp(CPUARMState *env, uint32_t syndrome, uint32_t wdesc,
         wdesc = 0;
     }
 
+    mops_plugin_entry(env);
     if (forwards) {
         stagecopysize = MIN(copysize, page_limit(toaddr));
         stagecopysize = MIN(stagecopysize, page_limit(fromaddr));
@@ -1717,6 +2237,7 @@ static void do_cpyp(CPUARMState *env, uint32_t syndrome, uint32_t wdesc,
             env->xregs[rn] = copysize;
             step = copy_step(env, toaddr, fromaddr, stagecopysize,
                              wmemidx, rmemidx, &wdesc, &rdesc, ra);
+            mops_plugin_bytes(env, step);
             toaddr += step;
             fromaddr += step;
             copysize -= step;
@@ -1740,6 +2261,7 @@ static void do_cpyp(CPUARMState *env, uint32_t syndrome, uint32_t wdesc,
             env->xregs[rn] = copysize;
             step = copy_step_rev(env, toaddr, fromaddr, stagecopysize,
                                  wmemidx, rmemidx, &wdesc, &rdesc, ra);
+            mops_plugin_bytes(env, step);
             copysize -= step;
             stagecopysize -= step;
             toaddr -= step;
@@ -1751,6 +2273,7 @@ static void do_cpyp(CPUARMState *env, uint32_t syndrome, uint32_t wdesc,
          */
         env->xregs[rn] = copysize;
     }
+    mops_plugin_complete(env);
 
     /* Set NZCV = 0000 to indicate we are an Option A implementation */
     env->NF = 0;
@@ -1789,6 +2312,9 @@ static void do_cpym(CPUARMState *env, uint32_t syndrome, uint32_t wdesc,
 
     /* We choose to NOP out "no data to copy" before consistency checks */
     if (env->xregs[rn] == 0) {
+        /* A retired execution that moved nothing. */
+        mops_plugin_entry(env);
+        mops_plugin_complete(env);
         return;
     }
 
@@ -1820,16 +2346,19 @@ static void do_cpym(CPUARMState *env, uint32_t syndrome, uint32_t wdesc,
     copysize = mops_spec_clamp(env, copysize);
 
     /* Do the actual memmove */
+    mops_plugin_entry(env);
     if (forwards) {
         while (copysize >= TARGET_PAGE_SIZE) {
             step = copy_step(env, toaddr, fromaddr, copysize,
                              wmemidx, rmemidx, &wdesc, &rdesc, ra);
+            mops_plugin_bytes(env, step);
             toaddr += step;
             fromaddr += step;
             copysize -= step;
             env->xregs[rn] = -copysize;
             if (copysize >= TARGET_PAGE_SIZE &&
                 unlikely(cpu_loop_exit_requested(cs))) {
+                mops_plugin_reenter(env);
                 cpu_loop_exit_restore(cs, ra);
             }
         }
@@ -1837,16 +2366,19 @@ static void do_cpym(CPUARMState *env, uint32_t syndrome, uint32_t wdesc,
         while (copysize >= TARGET_PAGE_SIZE) {
             step = copy_step_rev(env, toaddr, fromaddr, copysize,
                                  wmemidx, rmemidx, &wdesc, &rdesc, ra);
+            mops_plugin_bytes(env, step);
             toaddr -= step;
             fromaddr -= step;
             copysize -= step;
             env->xregs[rn] = copysize;
             if (copysize >= TARGET_PAGE_SIZE &&
                 unlikely(cpu_loop_exit_requested(cs))) {
+                mops_plugin_reenter(env);
                 cpu_loop_exit_restore(cs, ra);
             }
         }
     }
+    mops_plugin_complete(env);
 }
 
 void HELPER(cpym)(CPUARMState *env, uint32_t syndrome, uint32_t wdesc,
@@ -1877,6 +2409,9 @@ static void do_cpye(CPUARMState *env, uint32_t syndrome, uint32_t wdesc,
 
     /* We choose to NOP out "no data to copy" before consistency checks */
     if (env->xregs[rn] == 0) {
+        /* A retired execution that moved nothing. */
+        mops_plugin_entry(env);
+        mops_plugin_complete(env);
         return;
     }
 
@@ -1913,10 +2448,12 @@ static void do_cpye(CPUARMState *env, uint32_t syndrome, uint32_t wdesc,
     }
 
     /* Do the actual memmove */
+    mops_plugin_entry(env);
     if (forwards) {
         while (copysize > 0) {
             step = copy_step(env, toaddr, fromaddr, copysize,
                              wmemidx, rmemidx, &wdesc, &rdesc, ra);
+            mops_plugin_bytes(env, step);
             toaddr += step;
             fromaddr += step;
             copysize -= step;
@@ -1926,12 +2463,14 @@ static void do_cpye(CPUARMState *env, uint32_t syndrome, uint32_t wdesc,
         while (copysize > 0) {
             step = copy_step_rev(env, toaddr, fromaddr, copysize,
                                  wmemidx, rmemidx, &wdesc, &rdesc, ra);
+            mops_plugin_bytes(env, step);
             toaddr -= step;
             fromaddr -= step;
             copysize -= step;
             env->xregs[rn] = copysize;
         }
     }
+    mops_plugin_complete(env);
 }
 
 void HELPER(cpye)(CPUARMState *env, uint32_t syndrome, uint32_t wdesc,

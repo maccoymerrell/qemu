@@ -1925,6 +1925,22 @@ QEMU_PLUGIN_API
 bool qemu_plugin_rep_reenter(void);
 
 /**
+ * qemu_plugin_rep_bytes() - bulk bytes the reported execution moved
+ *
+ * The architectural byte progress of the execution described by
+ * qemu_plugin_rep_pc(): for an AArch64 FEAT_MOPS SET/CPY execution this
+ * is the amount the instruction's own size register was decremented by,
+ * accumulated step by step so a fault mid-instruction leaves exactly the
+ * bytes that were transferred.  A consumer whose fan-out unit is one
+ * memory access (rather than an architectural iteration) uses this as
+ * the register-derived truth to verify the delivered access stream
+ * against: the sizes of the reported accesses must sum to it.  Targets
+ * that publish an iteration count instead (x86 REP) leave it 0.
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_rep_bytes(void);
+
+/**
  * qemu_plugin_spec_store_overflowed() - did the current wrong-path excursion's
  * speculative-store footprint cross the soft budget?
  *

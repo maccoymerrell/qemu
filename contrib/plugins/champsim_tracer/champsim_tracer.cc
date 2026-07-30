@@ -412,7 +412,7 @@ static inline void user_count_reset(unsigned int cpu_index,
         /* A pre-reset REP continuation must not withhold a tick from the
          * fresh clock. */
         rep_state((unsigned)i).prev_tb_counted = false;
-        rep_state((unsigned)i).prev_tb_rep_pc = 0;
+        rep_state((unsigned)i).prev_tb_rep_n = 0;
     }
 }
 
@@ -3479,6 +3479,73 @@ void emit_body_entry(BodyStreamState *out_stream,
             }
 
             /*
+             * Leading pass of an instruction that has not yet done
+             * anything.  A FEAT_MOPS bulk op whose very first byte
+             * faults executes once for zero accesses and zero bytes,
+             * takes the fault, and re-executes after the handler; the
+             * re-execution delivers the whole instruction.  Emitting the
+             * empty first pass would bill an extra architectural
+             * instruction exactly when a demand fault (a clean
+             * destination page) happens to land on the op — the
+             * measured 256-vs-257 split.  Same principle as the
+             * trailing pass, mirrored: nothing retired, nothing was
+             * delivered, and the instruction's single wire rendering
+             * comes from the execution that does the work.  Guarded to
+             * the 1-insn re-entry shape so a multi-insn block's other
+             * instructions can never lose their memops or accounting;
+             * any other shape is kept and counted for visibility.
+             */
+            if (arch_known && n_iter == 0 && !rep_retired && !continuation) {
+                if (bb_tmpl->n_insns == 1 && rep_dps.empty() &&
+                    other_dps.empty()) {
+                    g_stats.rep_unretired_pass_dropped++;
+                    return;
+                }
+                g_stats.rep_unretired_pass_kept++;
+            }
+
+            /*
+             * FEAT_MOPS byte anchor (counts from architectural state):
+             * the fan-out unit for a bulk op is one memory access, so
+             * the entry count is the delivered access count — but the
+             * helpers publish the instruction's own size-register
+             * progress (qemu_plugin_rep_bytes), and on a cleanly
+             * completed single-execution instance the delivered access
+             * sizes must sum to exactly that.  Checked here, where both
+             * sides describe the same execution; fault-split and
+             * continuation renderings are excluded (their bytes and
+             * their deliveries legitimately land in different
+             * executions of the same instruction).  x86 REP publishes
+             * no bytes and is never checked.
+             */
+            if (arch_known && efacts.bytes != 0 && rep_retired &&
+                !continuation && pre_i == 0 && pre_m == 0) {
+                /* Per direction: a SET delivers one store per byte moved;
+                 * a CPY delivers one load AND one store per byte moved. */
+                uint64_t ld_bytes = 0, st_bytes = 0;
+                bool sizes_known = true;
+                for (const DynParam &dp : rep_dps) {
+                    if (dp.data_size == 0) {
+                        sizes_known = false;
+                        break;
+                    }
+                    if (dp.type == DYN_LOAD_ADDR) {
+                        ld_bytes += dp.data_size;
+                    } else {
+                        st_bytes += dp.data_size;
+                    }
+                }
+                if (!sizes_known) {
+                    g_stats.mops_bytes_unchecked++;
+                } else if (st_bytes == efacts.bytes &&
+                           (ld_bytes == 0 || ld_bytes == efacts.bytes)) {
+                    g_stats.mops_bytes_checked++;
+                } else {
+                    g_stats.mops_bytes_mismatch++;
+                }
+            }
+
+            /*
              * Terminal successor.  When a single-iteration translation
              * retires the instruction it still jumps back to the REP's own
              * PC before taking the zero-count exit, so the observed
@@ -5083,9 +5150,8 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
          * describes exactly the TB that finished before this dispatch. */
         {
             RepSelfLoopState &rs_clk = rep_state(cpu_index);
-            if (rs_clk.prev_tb_counted && rs_clk.prev_tb_rep_pc != 0 &&
-                rs_clk.cp_facts.pc == rs_clk.prev_tb_rep_pc &&
-                rs_clk.cp_facts.reenter) {
+            if (rs_clk.prev_tb_counted && rs_clk.cp_facts.reenter &&
+                rs_clk.prev_tb_rep_contains(rs_clk.cp_facts.pc)) {
                 if (g_user_icount > 0) {
                     g_user_icount--;
                     if (g_deadlatch_checked_uic > g_user_icount) {
@@ -5095,20 +5161,25 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
                 g_stats.rep_clock_ticks_withheld++;
             }
             rs_clk.prev_tb_counted = user_owned;
-            rs_clk.prev_tb_rep_pc = 0;
+            rs_clk.prev_tb_rep_n = 0;
             if (user_owned && cur_tb_tmpl) {
-                /* The executing TB's LAST fragment's last insn: a fan-out
-                 * terminator there makes the next dispatch's correction
-                 * eligible.  x86 ends the TB at a REP, so the walk is one
-                 * hop in practice. */
-                BBTemplate *lf = cur_tb_tmpl;
-                while (lf->next_tb_fragment) {
-                    lf = lf->next_tb_fragment;
-                }
-                if (lf->n_insns > 0 &&
-                    lf->insn_fields[lf->n_insns - 1].rep_memops_per_iter
-                        > 0) {
-                    rs_clk.prev_tb_rep_pc = lf->insn_pcs[lf->n_insns - 1];
+                /* Every fragment's last insn: the splitter seals a
+                 * fragment at each self-loop terminator, so this collects
+                 * each fan-out insn in the TB.  x86 ends the TB at a REP
+                 * (one hop); an AArch64 SETP/SETM/SETE trio contributes
+                 * three, and a cpu_loop_exit_requested split re-enters at
+                 * the SPLIT insn's own pc — which is why membership, not
+                 * the TB-terminating pc, keys the withhold. */
+                for (BBTemplate *lf = cur_tb_tmpl; lf;
+                     lf = lf->next_tb_fragment) {
+                    if (lf->n_insns > 0 &&
+                        lf->insn_fields[lf->n_insns - 1].rep_memops_per_iter
+                            > 0 &&
+                        rs_clk.prev_tb_rep_n <
+                            RepSelfLoopState::REP_CLK_PCS) {
+                        rs_clk.prev_tb_rep_pcs[rs_clk.prev_tb_rep_n++] =
+                            lf->insn_pcs[lf->n_insns - 1];
+                    }
                 }
             }
         }
@@ -5520,6 +5591,7 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
      * behind, which is where the latch points). */
     rep_state(cpu_index).cp_facts.pc       = qemu_plugin_rep_pc();
     rep_state(cpu_index).cp_facts.iters    = qemu_plugin_rep_iterations();
+    rep_state(cpu_index).cp_facts.bytes    = qemu_plugin_rep_bytes();
     rep_state(cpu_index).cp_facts.complete = qemu_plugin_rep_complete();
     rep_state(cpu_index).cp_facts.reenter  = qemu_plugin_rep_reenter();
 

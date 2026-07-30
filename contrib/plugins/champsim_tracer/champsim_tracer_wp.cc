@@ -565,6 +565,7 @@ static WpStep wp_exec_one_tb(WpWalkState &st)
          */
         rep_state(g_wp_state.saved_cpu_index).wp_facts.pc       = qemu_plugin_rep_pc();
         rep_state(g_wp_state.saved_cpu_index).wp_facts.iters    = qemu_plugin_rep_iterations();
+        rep_state(g_wp_state.saved_cpu_index).wp_facts.bytes    = qemu_plugin_rep_bytes();
         rep_state(g_wp_state.saved_cpu_index).wp_facts.complete = qemu_plugin_rep_complete();
         rep_state(g_wp_state.saved_cpu_index).wp_facts.reenter  = qemu_plugin_rep_reenter();
 

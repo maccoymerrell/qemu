@@ -1762,6 +1762,29 @@ void *tlb_vaddr_to_host(CPUArchState *env, vaddr addr,
 }
 
 /*
+ * Raw, side-effect-free TLB flags for a page: no fault, no
+ * notdirty_write transition, no watchpoint fire, and no plugin-forced
+ * TLB_MMIO — this asks what the MACHINE has at @addr, independent of
+ * any instrumentation.  Exists for the FEAT_MOPS reporting
+ * normalization (target/arm/tcg/helper-a64.c), whose byte-fallback
+ * classifier must distinguish "fallback because the page is genuine
+ * device memory" (whose per-byte accesses are reported as they happen)
+ * from "fallback because of a watchpoint / clean page / speculation"
+ * (emulation artifacts, normalized to the host-pointer decomposition).
+ * Returns TLB_INVALID_MASK when no translation can be established
+ * without faulting.
+ */
+int tlb_vaddr_lookup_flags(CPUArchState *env, vaddr addr,
+                           MMUAccessType access_type, int mmu_idx)
+{
+    CPUTLBEntryFull *full;
+    void *host;
+
+    return probe_access_internal(env_cpu(env), addr, 0, access_type,
+                                 mmu_idx, true, &host, &full, 0, false);
+}
+
+/*
  * Return a ram_addr_t for the virtual address for execution.
  *
  * Return -1 if we can't translate and execute from an entire page

@@ -111,9 +111,36 @@ Plugin API additions
      (``DisasContextBase::plugin_enabled``), so an uninstrumented QEMU
      pays nothing; targets with no fan-out instruction never write it,
      which is also how the plugin recognises that no architectural
-     count is available and keeps its memop-derived fallback for the
-     AArch64 FEAT_MOPS family (whose fan-out unit is one memory access
-     rather than an architectural element).
+     count is available.
+
+     The AArch64 FEAT_MOPS bulk copy/set family publishes through the
+     same four fields — ``do_SET``/``do_CPY``
+     (``target/arm/tcg/translate-a64.c``) store the instruction's
+     address at translation time, and the ``do_setX``/``do_cpyX``
+     helpers (``target/arm/tcg/helper-a64.c``) publish per execution —
+     with one semantic shift: MOPS has no architectural iteration, its
+     fan-out unit is one memory access, so ``qemu_plugin_rep_iterations``
+     counts the accesses that execution reported and
+     ``qemu_plugin_rep_bytes`` anchors them in architectural state (the
+     bytes moved, accumulated from the step helpers' returns — the size
+     register's own decrement — so the delivered access sizes must sum
+     to it).  ``reenter`` is true only at the helpers'
+     ``cpu_loop_exit_requested`` splits, QEMU's implementation artifact;
+     a guest-architectural fault leaves it false, as on x86.
+
+     The MOPS helpers' byte-at-a-time fallbacks (watchpoints, clean
+     pages, speculation) no longer report per byte: they accumulate
+     into per-vCPU runs (``CPUState::plugin_mops_report``) and flush
+     through the same naturally-aligned <=16-byte decomposition the
+     host-pointer fast path reports, at the same page-bounded chunk
+     boundaries — pending runs surviving fault and interrupt splits of
+     the instruction, so the reported shape is split-invariant.
+     Genuine device memory is the deliberate exception: a device
+     observes byte accesses individually, so MMIO operands keep their
+     per-byte reports (classified with ``tlb_vaddr_lookup_flags``, a
+     side-effect-free raw-TLB-flag probe added to ``accel/tcg/cputlb.c``
+     for exactly this distinction).  How the bytes are moved is
+     unchanged everywhere; only the report is normalized.
    * ``qemu_plugin_in_spec_mode`` — the executing vCPU's speculative
      (wrong-path) mode flag, read from the vCPU itself.  The marker
      open/close callbacks gate on it so an invocation fired by a

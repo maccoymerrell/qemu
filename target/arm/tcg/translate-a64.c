@@ -4410,6 +4410,57 @@ TRANS_FEAT(STZ2G, aa64_mte_insn_reg, do_STG, a, true, true)
 
 typedef void SetFn(TCGv_env, TCGv_i32, TCGv_i32);
 
+#ifdef CONFIG_PLUGIN
+/*
+ * Offset of a CPUState plugin field relative to tcg_env (which points at
+ * CPUArchState) -- same relocation target/i386's REP_PLUGIN_OFF and the
+ * icount/can_do_io accessors in accel/tcg/translator.c use.
+ */
+#define MOPS_PLUGIN_OFF(field)                                          \
+    (offsetof(ArchCPU, parent_obj.field) - offsetof(ArchCPU, env))
+#endif
+
+/*
+ * Publish which instruction the FEAT_MOPS per-execution facts describe
+ * (see mops_plugin_entry() in helper-a64.c).  Stored at translation time
+ * from the instruction's own address, before the helper call, so a
+ * consumer reading the facts later can refuse ones that belong to a
+ * different instruction.  Nothing is generated without a plugin, exactly
+ * like x86's do_gen_rep publications.
+ */
+static void gen_mops_plugin_pc(DisasContext *s)
+{
+#ifdef CONFIG_PLUGIN
+    if (!s->base.plugin_enabled) {
+        return;
+    }
+    tcg_gen_st_i64(tcg_constant_i64(s->pc_curr), tcg_env,
+                   MOPS_PLUGIN_OFF(plugin_rep_pc));
+#endif
+}
+
+/*
+ * Under a plugin, end the TB after a FEAT_MOPS bulk instruction — the
+ * shape x86 already gives a REP.  It is what keeps the published facts
+ * unambiguous (one bulk op per TB, so the per-vCPU fields always
+ * describe the block being attributed), lets a consumer's fault
+ * machinery find a faulting bulk op in the block it interrupted (the
+ * op is its TB's terminator, not buried mid-block — a SETP/SETM/SETE
+ * trio no longer shares one TB), and makes a split execution's
+ * instruction accounting exact (the re-entered TB contains only the
+ * bulk op itself, never a tail of never-executed successors).  The
+ * guest-visible semantics are unchanged; without a plugin nothing
+ * changes at all.
+ */
+static void gen_mops_plugin_tb_end(DisasContext *s)
+{
+#ifdef CONFIG_PLUGIN
+    if (s->base.plugin_enabled) {
+        s->base.is_jmp = DISAS_TOO_MANY;
+    }
+#endif
+}
+
 static bool do_SET(DisasContext *s, arg_set *a, bool is_epilogue,
                    bool is_setg, SetFn fn)
 {
@@ -4454,7 +4505,9 @@ static bool do_SET(DisasContext *s, arg_set *a, bool is_epilogue,
      * the syndrome anyway, we let it extract them from there rather
      * than passing in an extra three integer arguments.
      */
+    gen_mops_plugin_pc(s);
     fn(tcg_env, tcg_constant_i32(syndrome), tcg_constant_i32(desc));
+    gen_mops_plugin_tb_end(s);
     return true;
 }
 
@@ -4513,8 +4566,10 @@ static bool do_CPY(DisasContext *s, arg_cpy *a, bool is_epilogue, CpyFn fn)
      * the syndrome anyway, we let it extract them from there rather
      * than passing in an extra three integer arguments.
      */
+    gen_mops_plugin_pc(s);
     fn(tcg_env, tcg_constant_i32(syndrome), tcg_constant_i32(wdesc),
        tcg_constant_i32(rdesc));
+    gen_mops_plugin_tb_end(s);
     return true;
 }
 

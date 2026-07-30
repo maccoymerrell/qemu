@@ -2152,6 +2152,37 @@ count of a MOPS self-loop as a count of memory accesses, not of
 architectural instructions: a single ``CPYM`` covering a megabyte
 appears as roughly 65,000 entries.
 
+How the span divides into accesses is nevertheless **stable**: the
+reported decomposition is the transfer's page-bounded chunking into
+naturally aligned power-of-two pieces of at most 16 bytes, greedy from
+each chunk's base, whatever mechanism the emulation happened to move
+the bytes with.  A watchpoint on the page, the first touch of a clean
+page, wrong-path speculation, and an interrupt or fault splitting the
+instruction mid-transfer never change the pieces: a page-aligned 4 KiB
+``SETM`` span is 256 sixteen-byte stores under every one of them, and
+the entries emitted before and after a split concatenate to the
+unsplit sequence.  The single exception is device (MMIO) memory,
+where the per-byte accesses are architecturally real — the device
+observes each one — so they are reported as they happen, per byte.
+For a copy, one page-bounded chunk's load run is reported before its
+store run; a device-memory operand's per-byte reports instead
+interleave at the point they occur.
+
+The access count is anchored in architectural state: the SET/CPY
+helpers publish each execution's byte progress from the size
+register's own decrement (``qemu_plugin_rep_bytes``), and the sizes
+of the delivered accesses must sum to it.  The writer verifies this
+on every cleanly completed bulk op and reports the outcome in
+``<outfile>.stats.log`` (``MOPS bytes checked`` / ``MOPS bytes
+mismatch``).
+
+An execution that faults before moving anything — the first store of
+a ``SET`` landing on a not-yet-mapped destination page — contributes
+no entry: the instruction re-executes after the fault, and that
+re-execution carries the instruction's single rendering.  A demand
+fault therefore does not add an instruction to the trace, exactly as
+an x86 REP's trailing pass does not.
+
 An execution that moves nothing still executed the instruction and
 still emits exactly one entry, carrying zero memops.  That is routine
 rather than exceptional: ``memset(d, c, 0)`` does it, and so does every
@@ -2177,7 +2208,10 @@ one entry, carrying no memops.
 
 The window clock follows the same rule: a window budget counts
 architectural instructions, and a REP is one tick however many
-executions QEMU splits it into.  Because the fan-out writes one entry
+executions QEMU splits it into.  A FEAT_MOPS bulk op likewise: an
+execution the emulator suspends mid-transfer to service an interrupt
+and then re-enters is the same instruction continuing, and does not
+tick again.  Because the fan-out writes one entry
 per iteration, a trace may contain more entries than the window budget
 asked for; that is by design.
 

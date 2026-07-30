@@ -995,6 +995,11 @@ bool qemu_plugin_rep_reenter(void)
     return current_cpu ? current_cpu->plugin_rep_reenter : false;
 }
 
+uint64_t qemu_plugin_rep_bytes(void)
+{
+    return current_cpu ? current_cpu->plugin_rep_bytes : 0;
+}
+
 bool qemu_plugin_spec_store_overflowed(void)
 {
 #ifdef CONFIG_USER_ONLY

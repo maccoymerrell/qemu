@@ -626,6 +626,29 @@ struct CPUState {
     bool plugin_rep_complete;
     bool plugin_rep_reenter;
 
+    /*
+     * AArch64 FEAT_MOPS publishes through the same four fields — a
+     * translate-time store of the instruction's address into
+     * plugin_rep_pc plus the SET/CPY helpers' per-execution facts — but
+     * its fan-out unit is one memory access, not an architectural
+     * iteration, so plugin_rep_iters counts the accesses this execution
+     * reported (each derived from the helper's own byte progress; see
+     * arm_plugin_emit_pieces()).  plugin_rep_bytes is the architectural
+     * anchor for that count: the bytes this execution moved, accumulated
+     * from the step helpers' returns — the instruction's own
+     * size-register decrement — so a consumer can verify the delivered
+     * access stream against register-derived truth.  x86 REP leaves it 0.
+     *
+     * plugin_mops_report is the per-vCPU reporting-normalization
+     * accumulator the FEAT_MOPS byte fallbacks use (owned by
+     * target/arm/tcg/helper-a64.c; lazily allocated, vCPU lifetime).  It
+     * carries a pending partially-reported run across the cpu_loop_exit
+     * and fault splits of one bulk instruction, which is what keeps the
+     * reported decomposition identical however the execution was split.
+     */
+    uint64_t plugin_rep_bytes;
+    void *plugin_mops_report;
+
     /* Wrong-path speculative execution state.  Sandbox is indexed by
      * cache-line address (64-byte aligned) — an 8-byte store costs
      * one hash op instead of eight, and a vector store within a line

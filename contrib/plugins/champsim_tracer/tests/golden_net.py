@@ -839,8 +839,22 @@ SYS_TIMEOUT = 3600
 SYS_VMEM_KB = 25165824                            # ulimit -v (24 GiB)
 SYS_N_DET = 2                                     # GREEN-twice determinism gate
 
-# One canonical system cell (extend as more system fixtures are added).
-SYS_CELLS = [{"name": "devio_sys_x86_64", "isa": "x86_64"}]
+# System cells.  A cell's optional `opts` replaces SYS_PLUGIN_OPTS for it.
+#
+# The int1 cell exists because SYS_PLUGIN_OPTS does NOT set interrupts=1, so
+# without it nothing in the acceptance set boots the captured-async-window code
+# at all: the window's depth level, the fault trailer it rides and the
+# seal-successor substitution the window arms are all dark, and a change to any
+# of them lands unmeasured.  Whether the cell can carry a BYTE golden is
+# decided rather than assumed -- it goes through the same GREEN-twice
+# determinism gate as every other cell and is EXCLUDED with a reason if the
+# boot's interrupt arrival pattern makes the canon slice vary.  An excluded
+# cell is an honest negative, not a pass.
+SYS_CELLS = [
+    {"name": "devio_sys_x86_64", "isa": "x86_64"},
+    {"name": "devio_sys_x86_64_int1", "isa": "x86_64",
+     "opts": SYS_PLUGIN_OPTS + ",interrupts=1,faults=1"},
+]
 
 # Frozen system fixtures for the DECODER guard (reuse the SVG fixture files).
 SYS_DECODE_FIXTURES = [
@@ -1037,7 +1051,7 @@ def sys_cpu_preflight() -> list[str]:
 
 
 def sys_trace_once(build: Path, kernel: Path, initrd: Path, out_dir: Path,
-                   label: str) -> Path | None:
+                   label: str, opts: str = SYS_PLUGIN_OPTS) -> Path | None:
     """Boot the canonical system recipe once with the plugin loaded, tracing
     to <out_dir>/<label>.cst.  Returns the .cst path, or None on failure."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1053,7 +1067,7 @@ def sys_trace_once(build: Path, kernel: Path, initrd: Path, out_dir: Path,
         "-append", SYS_APPEND,
         "-drive", f"file={scratch},format=raw,if=none,id=vblk0",
         "-device", "virtio-blk-pci,drive=vblk0,ioeventfd=off",
-        "-plugin", f"{plugin},outfile={out_base},{SYS_PLUGIN_OPTS}",
+        "-plugin", f"{plugin},outfile={out_base},{opts}",
     ]
     log = out_dir / f"{label}.run.log"
     with open(log, "w") as f:
@@ -1123,13 +1137,16 @@ def sys_capture(build: Path, root: Path, waivers: dict) -> int:
             "initrd_sha": sha(initrd.read_bytes()),
             "cpu": SYS_CPU_MODEL, "append": SYS_APPEND,
             "plugin_opts": SYS_PLUGIN_OPTS, "mem": SYS_MEM,
+            "cell_opts": {c["name"]: c.get("opts", SYS_PLUGIN_OPTS)
+                          for c in SYS_CELLS},
         }
         for c in SYS_CELLS:
             name = c["name"]
+            opts = c.get("opts", SYS_PLUGIN_OPTS)
             hs = []
             for i in range(SYS_N_DET):
                 cst = sys_trace_once(build, kernel, initrd, root / name,
-                                     f"{name}_{i}")
+                                     f"{name}_{i}", opts)
                 hs.append(sha(canon_user_slice(build, cst).encode())
                           if cst else None)
             if any(h is None for h in hs):
@@ -1208,7 +1225,8 @@ def sys_check(build: Path, root: Path, waivers: dict) -> int:
                 if want is None:
                     continue
                 cst = sys_trace_once(build, kernel, initrd, root / name,
-                                     f"{name}_chk")
+                                     f"{name}_chk",
+                                     c.get("opts", SYS_PLUGIN_OPTS))
                 if cst is None:
                     fails.append(f"canon:{name}: trace not produced")
                     continue

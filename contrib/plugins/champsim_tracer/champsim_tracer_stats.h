@@ -310,6 +310,55 @@ struct Stats {
     uint64_t depth_tid_sweep_spared = 0;
     uint64_t depth_tid_deeper_spared = 0;
 
+    /* interrupts=1 captured-async-window ledger.  Every rate here has its
+     * denominator in the same block, and every counter is bumped ONCE per
+     * event (on the fresh drain) or ONCE per surviving depth stamp — never in
+     * the retained-event rescan, which replays the same events on every
+     * suspended dispatch and would inflate a per-event count by the length of
+     * the foreign span.
+     *
+     *   async_captures            windows opened (the denominator)
+     *   async_captures_reopened   ... opened while one was already open
+     *   async_capture_owner_unseen ... whose delivering thread had not been
+     *                             minted an id yet, so the level stays dormant
+     *   async_closed_by_return    windows closed by an ASYNC_RETURN
+     *   async_return_peer_ctx     ... where the closing context was NOT the
+     *                             delivering thread.  The producer's test is a
+     *                             bare per-vCPU PC equality, so a peer at the
+     *                             same VA can close a window early: an
+     *                             UPSTREAM defect, measured here, not masked.
+     *   async_abandon_owner       windows closed by their owner reaching user
+     *   async_abandon_peer_spared pinned user TBs of a PEER that left an
+     *                             owner's window alone (a latch would have
+     *                             destroyed the level here)
+     *   async_level_own_stamps    depth stamps the open window contributed to
+     *   async_level_peer_stamps   depth stamps it was dormant for -- each one
+     *                             a level a thread-blind rule would have
+     *                             borrowed
+     *   async_asid_write_in_window address-space switches committed inside an
+     *                             open window (the condition an
+     *                             address-space-keyed rule would fire on)
+     *   async_win_peer_with_asidw windows that served a peer stamp AND saw an
+     *                             ASID write
+     *   async_win_peer_no_asidw   windows that served a peer stamp with NO
+     *                             ASID write at all -- context changes no
+     *                             address-space rule can see (same-mm thread
+     *                             switch, borrowed-mm kernel thread, recycled
+     *                             narrow ASID).  Zero only means the condition
+     *                             did not arise in this run. */
+    uint64_t async_captures = 0;
+    uint64_t async_captures_reopened = 0;
+    uint64_t async_capture_owner_unseen = 0;
+    uint64_t async_closed_by_return = 0;
+    uint64_t async_return_peer_ctx = 0;
+    uint64_t async_abandon_owner = 0;
+    uint64_t async_abandon_peer_spared = 0;
+    uint64_t async_level_own_stamps = 0;
+    uint64_t async_level_peer_stamps = 0;
+    uint64_t async_asid_write_in_window = 0;
+    uint64_t async_win_peer_with_asidw = 0;
+    uint64_t async_win_peer_no_asidw = 0;
+
     /* Per-execution attribution.  cp_* bumped at vcpu_tb_exec walking
      * the prev TB's template; wp_* inside the WP per-iteration loop.
      * Sized by the generic enum sentinels to stay in lockstep. */

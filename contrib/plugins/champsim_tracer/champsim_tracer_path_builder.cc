@@ -92,6 +92,65 @@ static bool kexc_pc_first_sighting(const char *bucket, uint64_t pc)
     return seen->insert({bucket, pc}).second;
 }
 
+/* Captured-async-window edge log (ENTER / RETURN / in-window ASID write /
+ * close) with the window's identity, the guest thread at each edge and the
+ * per-window ownership condition counters.  Measurement instrument only —
+ * nothing in the tracer's logic reads it. */
+static bool pb_async_diag()
+{
+    static const bool v = getenv("CST_ASYNC_DIAG") != nullptr;
+    return v;
+}
+
+/*
+ * Per-window measurement of the ownership CONDITION (not of its outcome): the
+ * open window's id, where it opened in the body stream, how many depth stamps
+ * it served for its OWNER vs for a PEER thread, and how many address-space
+ * switches committed inside it.  A window with peer stamps and NO ASID write
+ * is a context change no address-space-keyed rule could ever have seen.
+ *
+ * Process-wide, deliberately NOT members of the thread_local PathBuilder: the
+ * plugin's static TLS block has almost no head room (see async_owner_tid_),
+ * and a measurement instrument must not be the thing that pushes the .so past
+ * dlopen.  Every writer runs under exec_lock, so the counters are race-free
+ * and the ids globally monotonic; on a multi-vCPU guest they describe the
+ * interleaved stream of windows rather than one vCPU's, which is a diagnostic
+ * caveat only — the LEVEL's ownership (async_owner_tid_) stays per-vCPU.
+ */
+static uint64_t g_async_win_seq = 0;
+static uint64_t g_async_win_id = 0;
+static uint64_t g_async_win_enter_seq = 0;
+static uint32_t g_async_win_asidw = 0;
+static uint32_t g_async_win_own_stamps = 0;
+static uint32_t g_async_win_peer_stamps = 0;
+
+void PathBuilder::async_win_close(const char *kind, uint32_t tid)
+{
+    /* Tallied once per window, against the async_captures denominator. */
+    if (g_async_win_peer_stamps) {
+        if (g_async_win_asidw) {
+            g_stats.async_win_peer_with_asidw++;
+        } else {
+            g_stats.async_win_peer_no_asidw++;
+        }
+    }
+    if (pb_async_diag()) {
+        fprintf(stderr, "[asyncdiag] CLOSE win=%" PRIu64 " kind=%s tid=%u "
+                "owner=%u seq=%" PRIu64 " spanned=%" PRId64 " asidw=%u "
+                "own_stamps=%u peer_stamps=%u\n",
+                g_async_win_id, kind, tid, async_owner_tid_,
+                g_dbg_last_emit_seq,
+                (int64_t)(g_dbg_last_emit_seq - g_async_win_enter_seq),
+                g_async_win_asidw, g_async_win_own_stamps,
+                g_async_win_peer_stamps);
+    }
+    g_async_win_id = 0;
+    g_async_win_enter_seq = 0;
+    g_async_win_asidw = 0;
+    g_async_win_own_stamps = 0;
+    g_async_win_peer_stamps = 0;
+}
+
 /*
  * ---- CST_JUMP_DIAG: the syscall_fault_nesting oracle, raised ONLINE ----
  *
@@ -408,6 +467,12 @@ void PathBuilder::on_segment_open()
     async_excluding_ = false;
     async_departure_pc_ = 0;
     async_captured_ = 0;
+    async_owner_tid_ = CST_TID_UNSEEN;
+    g_async_win_id = 0;
+    g_async_win_enter_seq = 0;
+    g_async_win_asidw = 0;
+    g_async_win_own_stamps = 0;
+    g_async_win_peer_stamps = 0;
     prev_in_sync_ = false;
     walk_in_sync_ = false;
     seal_pc_override_ = 0;
@@ -1176,6 +1241,92 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
         }
     }
 
+    /* Captured-async OWNERSHIP, from this step's FRESH drain — each event seen
+     * exactly once, like the kexc pass above and unlike the retained-event
+     * rescan below, which deliberately replays.  The level a window
+     * contributes belongs to the thread the interrupt was DELIVERED in
+     * (format.rst §4.2a), and only this pass runs in that thread's step: the
+     * rescan would re-derive the owner from whatever context is running when
+     * the step finally survives a gate, which in the foreign-delivery case is
+     * the pinned process — precisely the misattribution being fixed.
+     *
+     * Recording ownership here rather than at the first seal is load-bearing
+     * for the same reason.  An interrupt delivered in a foreign address space
+     * runs its handler on dropped/suspended TBs; no seal happens until the
+     * handler reschedules the pinned process, so a seal-time capture would
+     * name the pinned thread as the owner and reproduce the bug verbatim.
+     *
+     * in.cur_tid is the glue's read-only PEEK here (see StepIn): a thread
+     * whose pointer the identity map has not minted yet resolves to
+     * CST_TID_UNSEEN, which async_level() can never match, so an
+     * unattributable level stays dormant instead of being borrowed. */
+    if (g_features.trace_interrupts) {
+        for (size_t i = 0; i < in.n_evs; i++) {
+            const struct qemu_plugin_cpu_event &ev = in.evs[i];
+            if (ev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_ENTER) {
+                if (g_async_win_id) {
+                    g_stats.async_captures_reopened++;
+                    async_win_close("REOPEN", in.cur_tid);
+                }
+                async_owner_tid_ = in.cur_tid;
+                g_async_win_id = ++g_async_win_seq;
+                g_async_win_enter_seq = g_dbg_last_emit_seq;
+                g_stats.async_captures++;
+                if (in.cur_tid == CST_TID_UNSEEN) {
+                    g_stats.async_capture_owner_unseen++;
+                }
+                if (pb_async_diag()) {
+                    fprintf(stderr, "[asyncdiag] ENTER win=%" PRIu64
+                            " pc=0x%" PRIx64 " tid=%u priv=%d asid=0x%" PRIx64
+                            " seq=%" PRIu64 " pinned=%d primed=%d\n",
+                            g_async_win_id, ev.pc, in.cur_tid, (int)ev.priv,
+                            ev.asid, g_dbg_last_emit_seq, (int)in.pinned,
+                            (int)primed_);
+                }
+            } else if (ev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_RETURN) {
+                if (g_async_win_id) {
+                    g_stats.async_closed_by_return++;
+                    if (in.cur_tid != async_owner_tid_) {
+                        /* The producer's test is a bare PC equality on a
+                         * per-vCPU departure PC (accel/tcg/cpu-exec.c), with
+                         * no thread and no address-space check, so a peer
+                         * executing the same VA can close the window early.
+                         * Counted, not suppressed: the window's LIFETIME is
+                         * QEMU's per-vCPU state and the plugin must not
+                         * desynchronise from it — a nonzero count here is an
+                         * upstream defect to report, not one to paper over. */
+                        g_stats.async_return_peer_ctx++;
+                    }
+                    async_win_close("RETURN", in.cur_tid);
+                }
+                async_owner_tid_ = CST_TID_UNSEEN;
+                if (pb_async_diag()) {
+                    fprintf(stderr, "[asyncdiag] RETURN pc=0x%" PRIx64
+                            " tid=%u priv=%d seq=%" PRIu64 "\n",
+                            ev.pc, in.cur_tid, (int)ev.priv,
+                            g_dbg_last_emit_seq);
+                }
+            } else if (ev.kind == QEMU_PLUGIN_CPU_EV_ASID_WRITE &&
+                       g_async_win_id) {
+                /* Measurement only.  An address-space switch inside an open
+                 * window says nothing about the level's ownership: the
+                 * capture context routinely leaves and comes back before the
+                 * window closes, and a same-mm thread switch commits no such
+                 * event at all. */
+                g_async_win_asidw++;
+                g_stats.async_asid_write_in_window++;
+                if (pb_async_diag()) {
+                    fprintf(stderr, "[asyncdiag] ASIDW win=%" PRIu64
+                            " new_asid=0x%" PRIx64 " priv=%d seq=%" PRIu64
+                            " owner=%u cur_tid=%u\n",
+                            g_async_win_id, ev.asid, (int)ev.priv,
+                            g_dbg_last_emit_seq, async_owner_tid_,
+                            in.cur_tid);
+                }
+            }
+        }
+    }
+
     /* Async mute window.  Until the first seal-phase prime the live flag
      * is authoritative (it already reflects every retained event); after
      * that the ordered edges drive it.  Assignment semantics make the
@@ -1192,6 +1343,13 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
                            !g_features.trace_interrupts;
         async_departure_pc_ = 0;    /* pre-prime windows carry no pc */
         async_captured_ = 0;
+        /* Nothing is owed before the prime, so no owner is owed either (the
+         * fresh pass above may have just recorded one for a pre-prime ENTER
+         * that step_seal's priming swallow will discard). */
+        if (g_async_win_id) {
+            async_owner_tid_ = CST_TID_UNSEEN;
+            async_win_close("PREPRIME", in.cur_tid);
+        }
     } else {
         for (const struct qemu_plugin_cpu_event &ev : pending_evs_) {
             if (ev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_ENTER) {
@@ -1946,7 +2104,13 @@ void PathBuilder::stamp_cur_depth(const StepIn &in, bool post_merge)
                     pinned_inflight, foreign_inflight, frames_.size());
         }
     }
-    depth_next_ = pinned_inflight + async_captured_;
+    /* The captured async level is ownership-filtered exactly as the frame
+     * count above is: format.rst §4.2a's nesting is a property of the entry's
+     * own thread, and an interrupt delivered in one thread is not the next
+     * thread's nesting.  Dormant off-context, live again on return — a
+     * predicate, not a latch. */
+    const uint32_t async_lvl = async_level(in);
+    depth_next_ = pinned_inflight + async_lvl;
     /* User-privilege TBs stamp depth 0 regardless of the vCPU's raw
      * fault-stack depth: user code is never fault-handler content, but a
      * preemptible kernel can context-switch INSIDE a blocking fault handler
@@ -1968,7 +2132,7 @@ void PathBuilder::stamp_cur_depth(const StepIn &in, bool post_merge)
      * mirroring the depth clamp above. */
     prev_in_sync_ = (in.pinned && in.live_priv == 0)
                         ? false
-                        : (depth_next_ - async_captured_) > 0;
+                        : (depth_next_ - async_lvl) > 0;
     g_dbg_prev_depth_src = CST_PDSRC_SEAL;
     g_dbg_prev_depth = prev_depth_;
     g_dbg_inflight = pinned_inflight;
@@ -2190,13 +2354,44 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
          * SUSPENDS at step_events instead), so this is capture-only. */
         if (g_features.trace_interrupts && in.pinned && in.live_priv == 0 &&
             async_captured_) {
-            async_captured_ = 0;
-            async_departure_pc_ = 0;
+            /* QEMU's window flag is a per-vCPU fact and a pinned USER TB
+             * disproves it for the whole vCPU: reaching user privilege means
+             * every exception level has been returned from.  Reset it
+             * unconditionally — every producer is edge-gated on
+             * !plugin_in_async_int, so a stale flag would black out every
+             * later capture on this vCPU. */
             qemu_plugin_async_int_reset();
-            if (pb_diag()) {
-                fprintf(stderr, "[pathbuilder] ASYNC-ABANDON reset at pinned "
-                        "user tb=0x%" PRIx64 "\n",
-                        in.cur ? in.cur->start_pc : 0);
+            /* The LEVEL is per thread, so its release is per thread too.
+             * This TB proves THIS thread is at async-nesting depth 0; it
+             * proves nothing about a peer descheduled inside its own handler,
+             * which is the same distinction the stale-frame sweep above draws
+             * (`f.tid != in.cur_tid` -> spared, not retired).  Releasing a
+             * peer's level here would destroy it while its owner is still
+             * inside the handler and it can never be restored; holding it
+             * costs nothing, because async_level() already keeps it off every
+             * entry that is not the owner's.  It is released when the owner
+             * itself reaches user privilege, or replaced by the next
+             * ASYNC_ENTER. */
+            if (in.cur_tid == async_owner_tid_ ||
+                async_owner_tid_ == CST_TID_UNSEEN) {
+                async_captured_ = 0;
+                async_departure_pc_ = 0;
+                async_owner_tid_ = CST_TID_UNSEEN;
+                g_stats.async_abandon_owner++;
+                async_win_close("ABANDON", in.cur_tid);
+                if (pb_diag()) {
+                    fprintf(stderr, "[pathbuilder] ASYNC-ABANDON reset at "
+                            "pinned user tb=0x%" PRIx64 "\n",
+                            in.cur ? in.cur->start_pc : 0);
+                }
+            } else {
+                g_stats.async_abandon_peer_spared++;
+                if (pb_diag()) {
+                    fprintf(stderr, "[pathbuilder] ASYNC-ABANDON spared "
+                            "(peer tid=%u, owner=%u) tb=0x%" PRIx64 "\n",
+                            in.cur_tid, async_owner_tid_,
+                            in.cur ? in.cur->start_pc : 0);
+                }
             }
         }
         uint32_t pinned_inflight = 0;
@@ -2206,12 +2401,25 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
             }
         }
         /* Emitted fault-trailer depth = synchronous-fault frame nesting +
-         * captured async level.  async_captured_ is 0 with interrupts=0, so
-         * the trailer is byte-identical to today there. */
-        depth_next_ = pinned_inflight + async_captured_;
+         * the OWNER's captured async level.  async_level() is 0 with
+         * interrupts=0 (the window is never captured), so the trailer is
+         * byte-identical to today there. */
+        const uint32_t seal_async_lvl = async_level(in);
+        depth_next_ = pinned_inflight + seal_async_lvl;
+        /* Ownership condition, once per surviving step: whose stamp did the
+         * open window just serve?  Denominator for every rate below. */
+        if (async_captured_) {
+            if (seal_async_lvl) {
+                g_async_win_own_stamps++;
+                g_stats.async_level_own_stamps++;
+            } else {
+                g_async_win_peer_stamps++;
+                g_stats.async_level_peer_stamps++;
+            }
+        }
         g_dbg_raw_depth = raw_depth_;
         g_dbg_inflight = pinned_inflight;
-        g_dbg_async_captured = async_captured_;
+        g_dbg_async_captured = seal_async_lvl;
         g_dbg_depth_next = depth_next_;
         g_dbg_frames = frames_.size();
         g_dbg_susp = susp_stack_.size();
@@ -2247,7 +2455,7 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
      * (walk_in_sync_).  The merge is untouched, so the interrupted block still
      * reassembles whole from its pre-fault prefix and its post-return suffix.
      * Never fires with faults=1 (byte-identical). */
-    if (!g_features.trace_faults && (depth_next_ - async_captured_) > 0) {
+    if (!g_features.trace_faults && (depth_next_ - async_level(in)) > 0) {
         g_capture_mute = true;
     }
     if (fault_on) {

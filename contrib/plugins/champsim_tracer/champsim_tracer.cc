@@ -1108,6 +1108,46 @@ static uint32_t thread_identity_sample(unsigned int cpu_index, int live_priv)
     return g_vcpu_cur_tid[cpu_index];
 }
 
+/*
+ * Read-only twin of thread_identity_sample: the guest-thread identity of the
+ * TB executing NOW, resolved WITHOUT minting a map entry and WITHOUT touching
+ * the pending slot.
+ *
+ * The PRE-WINDOW phase needs a usable thread id.  PathBuilder::step_events
+ * applies the async-window arrows there, and the depth level a captured
+ * window contributes belongs to the thread the interrupt was delivered in
+ * (format.rst §4.2a) — a fact only that step knows, because the step carrying
+ * the ASYNC_ENTER is routinely dropped or suspended long before any seal runs.
+ *
+ * thread_identity_sample cannot be moved that early.  It MINTS: thread_ptr_to_
+ * tid bumps g_thread_tid_next on a first sighting, and the pre-window phase
+ * runs on steps that bail (foreign ASID, async suspension, segment open), so
+ * minting there would allocate ids for threads the trace never emits and
+ * renumber every thread_id on the wire.  This twin only LOOKS UP, so it is
+ * byte-inert; an unsighted thread pointer resolves to CST_TID_UNSEEN rather
+ * than to a fresh id, which keeps an unattributable async level dormant
+ * instead of letting the next thread borrow it.  Every other case returns
+ * exactly what thread_identity_sample would.  Caller holds exec_lock.
+ */
+static uint32_t thread_identity_peek(unsigned int cpu_index, int live_priv)
+{
+    if (!g_system_mode || cpu_index >= CST_PIN_MAX_VCPUS) {
+        return (uint32_t)cpu_index;
+    }
+    uint64_t tp;
+    if (!thread_ptr_sample(live_priv, &tp) ||
+        tp == g_vcpu_last_tp[cpu_index]) {
+        return g_vcpu_cur_tid[cpu_index];
+    }
+    if (g_thread_tid_map) {
+        auto it = g_thread_tid_map->find(tp);
+        if (it != g_thread_tid_map->end()) {
+            return it->second;
+        }
+    }
+    return PathBuilder::CST_TID_UNSEEN;
+}
+
 /* Apply the pending sample: this vCPU's identity advances AFTER the deferred
  * prev has been sealed, so the just-emitted BB is attributed to the thread
  * that executed it and the refresh takes effect for the NEXT emit.  Caller
@@ -4925,6 +4965,15 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
     in.n_evs = qemu_plugin_drain_cpu_events(cpu_index, &in.evs);
     in.cpu_index = cpu_index;
     in.watch_pc = watch_pc;
+    /* Guest thread of the TB executing NOW, for the PRE-WINDOW phase: the
+     * async-window arrows record which thread an interrupt was delivered in,
+     * and that is knowable only on the ENTER's own step.  The read-only peek
+     * is used here because this phase runs on steps that bail and the minting
+     * sample would renumber the wire (see thread_identity_peek);
+     * in.cur_tid is overwritten with the minting sample below, before the
+     * seal phase, which is what frame ownership and the depth stamp count
+     * against. */
+    in.cur_tid = thread_identity_peek(cpu_index, live_priv);
 
     /* Pre-window phase: async-window arrows, foreign-ASID boundary, prev
      * swap — in that order, before any window decision. */

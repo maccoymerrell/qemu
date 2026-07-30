@@ -264,8 +264,24 @@ public:
          * except on the step where the guest scheduler switched tasks on
          * this vCPU; in user mode both are cpu_index. */
         uint32_t walk_tid = 0;
+        /* @cur_tid is filled TWICE.  Before step_events the glue writes the
+         * read-only peek (thread_identity_peek): the pre-window phase applies
+         * the async-window arrows and must know whose context the interrupt
+         * was delivered in, but it also runs on steps that later bail, so it
+         * cannot mint a fresh id there without renumbering the wire.  Before
+         * step_seal the glue overwrites it with the minting sample
+         * (thread_identity_sample), which is what the frame ownership and the
+         * depth stamp count against.  The two agree except for a thread whose
+         * pointer has never been sighted, where the peek yields
+         * CST_TID_UNSEEN. */
         uint32_t cur_tid = 0;
     };
+
+    /* A guest thread the identity map has not minted an id for yet.  Never
+     * equal to any real tid (those are minted from 0 upwards), so an async
+     * level whose owner resolves to this is dormant everywhere rather than
+     * borrowed by whoever runs next. */
+    static constexpr uint32_t CST_TID_UNSEEN = UINT32_MAX;
 
     /* What the step did, so the glue can pick the right continuation:
      * after step_events, only CONTINUE proceeds to window management;
@@ -505,6 +521,53 @@ private:
      * Always 0 with interrupts=0 (the window is muted, never captured), so the
      * depth trailer stays byte-identical to today. */
     uint32_t async_captured_ = 0;
+
+    /* OWNER of the captured level.  format.rst §4.2a defines fault_depth as
+     * the nesting THIS basic block executed at and makes the nesting a
+     * property of the entry's own thread_id, so the level a window
+     * contributes belongs to the context the interrupt was DELIVERED in and
+     * to no other.  async_captured_ alone is the vCPU's window lifetime (QEMU
+     * owns it: one flag, opened at the outermost delivery, closed when the
+     * departure PC is re-executed); this pair is the attribution.  Recorded
+     * from the ASYNC_ENTER's own step, on the FRESH drain, because the
+     * retained-event rescan replays that ENTER in whatever context happens to
+     * be running later.
+     *
+     * Read only through async_level(), which makes the contribution a
+     * PREDICATE re-evaluated per entry — dormant while a peer thread runs,
+     * live again when the owner is rescheduled — exactly as
+     * stamp_cur_depth's `f.tid == in.cur_tid` already does for synchronous
+     * frames.  A latch on "something changed since the capture" cannot come
+     * back, and the address space is the wrong key besides: a same-mm thread
+     * switch, a kernel thread on a borrowed mm and a recycled narrow ASID all
+     * change context while committing no ASID write at all.
+     *
+     * async_captured_ IS the validity flag: it is only ever set by the
+     * ASYNC_ENTER arm, and the same fresh drain that sets it records the owner
+     * here, so "a level is owed" and "an owner is known" are the same
+     * condition.  CST_TID_UNSEEN means the delivering thread had not been
+     * sighted, which makes the level dormant everywhere.
+     *
+     * Deliberately ONE uint32 and nothing else.  `PathBuilder builder` is
+     * `static thread_local`, and at ff0a4a74cb the plugin's static TLS block
+     * is 0x668 bytes against a glibc surplus that leaves ~24 bytes of head
+     * room: growing it by a few words makes the .so fail to dlopen outright
+     * ("cannot allocate memory in static TLS block") in whole-system x86_64.
+     * Everything that is only measured lives in the process-wide window
+     * counters in the .cc instead. */
+    uint32_t async_owner_tid_ = CST_TID_UNSEEN;
+
+    /* Publish the closing window's condition counters and clear them. */
+    void async_win_close(const char *kind, uint32_t tid);
+
+    /* The +1 an open capture window contributes to the depth of the block
+     * described by @in: present iff the window is open AND @in names the
+     * thread the interrupt was delivered in.  The single point where the
+     * async level is read. */
+    uint32_t async_level(const StepIn &in) const
+    {
+        return (async_captured_ && in.cur_tid == async_owner_tid_) ? 1u : 0u;
+    }
 
     /* Synchronous-fault-span markers for faults=0 handler suppression.  A
      * block that executed while this thread had an un-returned synchronous

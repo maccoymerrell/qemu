@@ -1749,6 +1749,52 @@ at a pinned user TB, which proves depth 0); the resume TB re-executing
 the departure PC then seals normally.  The depth rides the existing
 fault trailer, so a captured async handler needs no new wire records.
 
+**The window's lifetime and the level's ownership are different
+questions,** and the tracer answers them separately.  The *lifetime* is a
+per-vCPU fact owned by QEMU: one flag, raised at the outermost delivery
+and lowered when the departure PC is re-executed.  The *level* is a per
+guest-thread fact, because ``fault_depth`` is the nesting the emitting
+block executed at and that nesting belongs to the block's own
+``thread_id`` (:doc:`format` §4.2a) — so the level belongs to the context
+the interrupt was *delivered in*, and to no other.  The tracer therefore
+records that context's thread at the ``ASYNC_ENTER``, and every read of
+the level is a predicate against the executing block's thread: present for
+the owner, absent for a peer.  That is the same rule the synchronous side
+applies to its frames (a frame counts only for the thread that entered
+it), and it has the same shape — a level goes **dormant** while a peer
+thread is scheduled onto the vCPU and becomes **live again** when its
+owner is rescheduled, for as long as the window is open.  A context change
+is not evidence that a handler finished, so it destroys nothing; only the
+window closing is.
+
+Keying the release on the *address space* instead would be both wrong and
+insufficient.  Wrong, because an address space that leaves the capture
+context routinely returns to it before the window closes, and a rule that
+fires on the departure cannot un-fire on the return.  Insufficient,
+because a switch between two threads of one process, a kernel thread on a
+borrowed mm, and a switch between two live processes holding the same
+recycled narrow ASID are all context changes that commit no
+address-space-write event at all; the per-thread predicate covers them
+without needing any event.
+
+The abandoned-window recovery splits along the same seam.  A pinned user
+TB proves the *vCPU* is not inside an async handler — user privilege means
+every exception level has been returned from — so QEMU's flag is lowered
+there unconditionally; leaving it raised would suppress every later
+capture on that vCPU, because each producer is edge-gated on the flag.  It
+proves only that *this thread* is at async-nesting depth 0, so the level is
+released only when the thread reaching user is the level's owner,
+mirroring the stale-frame sweep that spares a peer thread's frames.  When
+the delivering thread's identity was never sighted the level is
+unattributable, stays dormant everywhere, and is released at the first
+opportunity rather than held.
+
+The ``async capture windows …`` counters report the ledger: windows
+opened, how each one closed, how many depth stamps each served for its
+owner versus for a peer, and how many of the windows that served a peer
+stamp saw no address-space write at all — the last being the measure of
+how much of the condition an address-space rule cannot see.
+
 **Excluding the synchronous handler (``faults=0``).**  The mirror case
 reuses the async mute.  While a synchronous-fault frame is in flight
 the handler's capture is suspended and its basic blocks are dropped at

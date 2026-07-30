@@ -54,7 +54,7 @@ if get_option('plugins')
                               '-Wno-missing-field-initializers',
                               '-Wno-pedantic']
   if host_os == 'windows'
-    t += shared_module('champsim_tracer',
+    champsim_tracer_so = shared_module('champsim_tracer',
                        champsim_tracer_sources + files('win32_linker.c'),
                        include_directories: ['../../include/qemu', '../../include'],
                        cpp_args: champsim_tracer_cpp_args,
@@ -62,11 +62,33 @@ if get_option('plugins')
                        link_args: win32_qemu_plugin_api_link_flags,
                        dependencies: [glib, capstone])
   else
-    t += shared_module('champsim_tracer',
+    champsim_tracer_so = shared_module('champsim_tracer',
                        champsim_tracer_sources,
                        include_directories: ['../../include/qemu', '../../include'],
                        cpp_args: champsim_tracer_cpp_args,
                        dependencies: [glib, capstone])
+  endif
+  t += champsim_tracer_so
+
+  # Static-TLS budget tripwire: fail the BUILD if the plugin's PT_TLS memsz
+  # grows past the ceiling, instead of failing system-mode dlopen at RUNTIME
+  # with glibc's "cannot allocate memory in static TLS block" (an error that
+  # names neither the plugin nor the offending thread_local).  The ceiling is
+  # a tripwire against growth, not a model of glibc: the real budget is
+  # glibc-version- and binary-dependent (surplus 1664 bytes observed on the
+  # reference host); 1280 = the current PT_TLS memsz (0x4f8 = 1272) + 8 bytes
+  # of slack, so any new TLS variable trips it at build time.  Raise it only
+  # together with a re-measured system-mode load test.  ELF/glibc concern, so
+  # skipped on Windows; readelf is required (a check that cannot find its
+  # subject must fail, not skip) -- llvm-readelf is an accepted stand-in.
+  if host_os != 'windows'
+    readelf = find_program('readelf', 'llvm-readelf')
+    t += custom_target('champsim-tracer-tls-guard',
+                       input: champsim_tracer_so,
+                       output: 'champsim_tracer_tls_guard.ok',
+                       command: [files('champsim_tracer/check_static_tls.sh'),
+                                 readelf, '@INPUT@', '@OUTPUT@', '1280'],
+                       build_by_default: true)
   endif
 
   # Offline trace tools.  cst_decode and cst_audit consume .cst files

@@ -275,8 +275,12 @@ void cst_jump_diag_emit(uint64_t seq, uint32_t tid, uint64_t pc,
 
 PathBuilder &path_builder_tls()
 {
-    static thread_local PathBuilder builder;
-    return builder;
+    /* Heap-allocated and deliberately never freed: keeps the thread_local
+     * itself an 8-byte pointer instead of a 400-byte object, so the
+     * plugin's initial-exec TLS block stays well inside glibc's dlopen
+     * static-TLS surplus (1664 B in qemu-system-x86_64). */
+    static thread_local PathBuilder *builder = new PathBuilder();
+    return *builder;
 }
 
 /* Does @t's instruction list contain @pc?  The frame invariant is

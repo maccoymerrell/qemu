@@ -429,6 +429,7 @@ static bool cap_x86_is_push(const char *mnem);
 static bool cap_x86_is_erased_mem_load(const char *mnem);
 static bool cap_x86_is_lost_mem_store(const char *mnem);
 static bool cap_x86_is_gather(const char *mnem);
+static uint8_t cap_x86_x87_mem_access(const char *mnem);
 
 /*
  * Extract per-operand detail for x86 into the plugin operand struct.
@@ -512,6 +513,11 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
     /* Capstone-6.0.0-Alpha7 bug: the AVX2 gathers lose the WRITE to the
      * mask register they zero on completion — see cap_x86_is_gather. */
     bool gather = cap_x86_is_gather(insn->mnemonic);
+    /* Capstone-6.0.0-Alpha7 bugs across the x87 escape space: twelve of
+     * the eighteen forms whose memory operand is their DESTINATION report
+     * it READ, and FRSTOR reports its memory SOURCE written — see
+     * cap_x86_x87_mem_access. */
+    uint8_t x87_mem = cap_x86_x87_mem_access(insn->mnemonic);
 
     for (uint8_t i = 0; i < n; i++) {
         const cs_x86_op *cop = &x86->operands[i];
@@ -597,6 +603,15 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
              * with a memory destination. */
             if (extract_store || move_store || lost_store) {
                 op->access = QEMU_PLUGIN_OP_ACC_WRITE;
+            }
+            /* Capstone-6.0.0-Alpha7 bugs across the x87 escape space: no
+             * x87 memory operand is read-modify-write, so its direction
+             * follows from the mnemonic alone, and the escape space is
+             * small enough to state in full.  Twelve of the eighteen
+             * memory-destination forms are reported READ and FRSTOR's
+             * memory source is reported WRITE. */
+            if (x87_mem) {
+                op->access = x87_mem;
             }
             /* Capstone-6.0.0-Alpha7 bugs across the string family: STOS
              * reports its (%rdi) destination READ, the 32-bit CMPS
@@ -879,6 +894,130 @@ static bool cap_x86_is_gather(const char *mnem)
            g_str_equal(mnem, "vgatherdpd") ||
            g_str_equal(mnem, "vgatherqps") ||
            g_str_equal(mnem, "vgatherqpd");
+}
+
+/*
+ * Capstone 6.0.0-Alpha7 x86 access-flag bug workaround: the x87 escape
+ * space.
+ *
+ * The same defect as STMXCSR above -- a memory operand that is the
+ * instruction's DESTINATION reported READ -- on TWELVE x87 forms, plus
+ * FRSTOR, which is the inverse: a memory SOURCE reported WRITE.  What
+ * makes the x87 space worth stating in full rather than one spelling at a
+ * time is that its memory operand's direction is decided ENTIRELY by the
+ * opcode.  NO x87 instruction read-modify-writes memory: within the
+ * escape opcodes 0xD8-0xDF every memory operand is either a pure load or
+ * a pure store, and which one it is follows from the mnemonic alone.
+ * That makes the repair a statement about the architecture -- and a no-op
+ * on the six memory-destination forms and every memory-source form this
+ * Capstone already reports correctly -- so it self-retires when the
+ * decoder is fixed, in the same way the SETcc one does.
+ *
+ * Ground truth is QEMU's own translator, gen_x87() in
+ * target/i386/tcg/translate.c.  Its `if (mod != 3)` arm is the memory
+ * form, keyed by `op = ((b & 7) << 3) | ModRM.reg` exactly as the table
+ * below is, and every store arm ends in a `tcg_gen_qemu_st_*` or in a
+ * helper whose access_prepare() names MMU_DATA_STORE:
+ *
+ *   D9 /2 fsts     D9 /3 fstps    op 0x0a 0x0b  st_i32
+ *   D9 /6 fnstenv                 op 0x0e       helper_fstenv, DATA_STORE
+ *   D9 /7 fnstcw                  op 0x0f       st_i32
+ *   DB /1 fisttpl  DB /2 fistl    op 0x19 0x1a  st_i32
+ *   DB /3 fistpl                  op 0x1b       st_i32
+ *   DB /7 fstpt                   op 0x1f       helper_fstt_ST0, DATA_STORE
+ *   DD /1 fisttpll                op 0x29       st_i64
+ *   DD /2 fstl     DD /3 fstpl    op 0x2a 0x2b  st_i64
+ *   DD /6 fnsave                  op 0x2e       helper_fsave, DATA_STORE
+ *   DD /7 fnstsw                  op 0x2f       st_i32
+ *   DF /1 fisttps  DF /2 fists    op 0x39 0x3a  st_i32
+ *   DF /3 fistps                  op 0x3b       st_i32
+ *   DF /6 fbstp                   op 0x3e       helper_fbst_ST0, DATA_STORE
+ *   DF /7 fistpll                 op 0x3f       st_i64
+ *
+ * WHICH OF THE EIGHTEEN CAPSTONE GETS WRONG IS NOT A FAMILY, WHICH IS WHY
+ * ALL EIGHTEEN ARE LISTED.  The twelve reported READ are fsts, fstps,
+ * fnstcw, fisttpl, fistl, fistpl, fisttpll, fstl, fstpl, fisttps, fists
+ * and fistps; the six already reported WRITE are fnstenv, fstpt, fnsave,
+ * fnstsw, fbstp and fistpll.  The split follows nothing architectural --
+ * D9 /6 (fnstenv) is right and D9 /7 (fnstcw) is wrong, DB /7 (fstpt) is
+ * right and DB /3 (fistpl) is wrong -- so a list of the broken twelve
+ * would be a list of this Capstone's bugs rather than a description of
+ * the instruction set, and would not go quiet when they are fixed.
+ *
+ * FRSTOR (DD /4, op 0x2c) IS THE OPPOSITE INVERSION and is repaired here
+ * with its own direction rather than left alone: Capstone reports its
+ * memory operand WRITE, and it only ever reads.  Intel SDM: "FRSTOR
+ * m94/108byte -- Load FPU state from m94byte or m108byte".  QEMU's
+ * helper_frstor() prepares its access MMU_DATA_LOAD and reaches memory
+ * only through access_ldw() and do_fldt().  Left uncorrected the tracer
+ * emits a phantom 108-byte store and loses the load, which is the same
+ * damage as the fnstcw case with the sign flipped.
+ *
+ * FLDENV (D9 /4, op 0x0c) rides along for the reason the six
+ * already-correct stores do: it is FNSTENV's twin, one ModRM.reg value
+ * from FRSTOR's, and naming the environment quartet with its true
+ * direction keeps this a rule about the group.  Capstone reports it
+ * correctly today, so forcing READ changes nothing.  Note that QEMU's
+ * helper_fldenv() passes MMU_DATA_STORE to access_prepare(), which reads
+ * like a contradiction: it is a probe-permission argument, do_fldenv()
+ * only calls access_ldw(), and FLDENV loads.  (That mismatch is a
+ * separate, real QEMU bug -- FLDENV against a read-only mapping would
+ * raise a spurious #PF -- not evidence about direction.)
+ *
+ * THE SPELLINGS ARE AT&T'S, WITH THE OPERAND-WIDTH SUFFIX THE PRINTER
+ * APPENDS, because QEMU drives Capstone in AT&T syntax.  All eighteen
+ * were read off cs_insn::mnemonic for the encodings above rather than
+ * from Capstone's instruction-id table, which carries the unsuffixed
+ * `fst` / `fist` / `fisttp` stems and would not match.
+ *
+ * THE FWAIT-PREFIXED SPELLINGS ARE DELIBERATELY ABSENT.  `fstcw`,
+ * `fstsw`, `fstenv` and `fsave` (9B D9 /7, 9B DD /7, 9B D9 /6, 9B DD /6)
+ * are the checked forms of four of the entries above, but this Capstone
+ * never emits them: it decodes 9B as a standalone `wait` and the escape
+ * as the following instruction (verify with `--hex=9bd938`, which
+ * disassembles as `wait`, not `fstcw`).  Listing them would add a rule
+ * that matches nothing, which is the shape a stale justification takes.
+ *
+ * THE REGISTER FORMS ARE UNREACHABLE FROM HERE.  `fnstsw %ax` (DF E0),
+ * `fstp %st(i)` and the rest take the mod == 3 arm and carry no MEM
+ * operand; this branch only ever rewrites a MEM operand's access.
+ *
+ * Revisit / remove when Capstone is bumped past 6.0.0-Alpha7; verify with
+ * `--hex=d93c24` (`fnstcw (%rsp)`), `--hex=dd5c2420` (`fstpl 0x20(%rsp)`)
+ * and `--hex=db4c2450` (`fisttpl 0x50(%rsp)`) -- the MEM operand must
+ * show WRITE in all three -- and with `--hex=dd20` (`frstor (%rax)`),
+ * whose MEM operand must show READ.  `--hex=d9742470` (`fnstenv`) and
+ * `--hex=d9642470` (`fldenv`) must be unchanged.  Use a `cstool` built
+ * from `subprojects/capstone`, or run `capstone_workaround_probe`; see
+ * docs/troubleshooting.rst.
+ */
+static uint8_t cap_x86_x87_mem_access(const char *mnem)
+{
+    /* Every x87 mnemonic starts with `f`; the test keeps the whole table
+     * off the path of every other x86 instruction. */
+    if (!mnem || mnem[0] != 'f') {
+        return 0;
+    }
+    /* The eighteen forms whose memory operand is the destination. */
+    if (g_str_equal(mnem, "fsts")     || g_str_equal(mnem, "fstl")     ||
+        g_str_equal(mnem, "fstps")    || g_str_equal(mnem, "fstpl")    ||
+        g_str_equal(mnem, "fstpt")    ||
+        g_str_equal(mnem, "fists")    || g_str_equal(mnem, "fistl")    ||
+        g_str_equal(mnem, "fistps")   || g_str_equal(mnem, "fistpl")   ||
+        g_str_equal(mnem, "fistpll")  ||
+        g_str_equal(mnem, "fisttps")  || g_str_equal(mnem, "fisttpl")  ||
+        g_str_equal(mnem, "fisttpll") ||
+        g_str_equal(mnem, "fbstp")    ||
+        g_str_equal(mnem, "fnstcw")   || g_str_equal(mnem, "fnstsw")   ||
+        g_str_equal(mnem, "fnstenv")  || g_str_equal(mnem, "fnsave")) {
+        return QEMU_PLUGIN_OP_ACC_WRITE;
+    }
+    /* The FPU-environment loads: FRSTOR is the inversion this repairs,
+     * FLDENV its correctly-reported twin. */
+    if (g_str_equal(mnem, "frstor") || g_str_equal(mnem, "fldenv")) {
+        return QEMU_PLUGIN_OP_ACC_READ;
+    }
+    return 0;
 }
 
 /*

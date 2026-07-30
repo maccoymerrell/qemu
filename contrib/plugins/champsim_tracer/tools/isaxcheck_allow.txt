@@ -558,6 +558,26 @@ mipsel R-wr-phantom ctc1 +cop#
 # losing mayStore, `cldemote`); they are tracked as x86 work, not as part of
 # the non-x86 decode-metadata arc this gate was built for.
 #
+# "RECORDED WHOLESALE" IS WHAT MAKES THIS BLOCK DANGEROUS, and two of its
+# rows have already had to be pulled back out of it.  `M-extra-load` and
+# `M-miss-store` on fisttpl, fisttpll and fisttps sat here as residual and
+# were a Capstone access-flag defect -- the truncating x87 integer stores
+# reported as loads -- now repaired at the boundary
+# (cap_x86_x87_mem_access in disas/capstone.c) and deleted.  A wholesale
+# block cannot be read as evidence that its members were examined; the
+# only rows in it that HAVE been examined are the ones this comment names.
+#
+# `M-extra-load movq` and `M-miss-store movq` stay, with the justification
+# they actually have.  Their sample is `f3480f7e00`, where Capstone says
+# `movq (%rax), %xmm0` and LLVM says `movq %mm0, (%rax)`: the two decoders
+# have decoded DIFFERENT INSTRUCTIONS from one byte string.  F3 0F 7E is
+# MOVQ xmm1, xmm2/m64 and REX.W is ignored on it; LLVM lets the REX.W pick
+# the MMX form 0F 7E and drops the mandatory F3.  GNU binutils reads it
+# Capstone's way (`rex.W movq (%rax),%xmm0`), so it is two-to-one against
+# LLVM and there is nothing at this boundary to repair.  Not the same
+# thing as the x87 rows that used to sit beside them, despite the
+# identical signature shape.
+#
 # What this block still buys: a Capstone bump that changes ANY x86 signature
 # shows up as a gate failure rather than as silent trace corruption.
 x86_64 B-flow-presence iretl cs-no llvm-yes
@@ -934,9 +954,6 @@ x86_64 M-cs-mem-llvm-none xchgb
 x86_64 M-cs-mem-llvm-none xchgw
 x86_64 M-cs-mem-llvm-none xrelease xchgb
 x86_64 M-cs-mem-llvm-none xrelease xchgl
-x86_64 M-extra-load fisttpl
-x86_64 M-extra-load fisttpll
-x86_64 M-extra-load fisttps
 x86_64 M-extra-load movq
 x86_64 M-llvm-mem-cs-none emms load store
 x86_64 M-llvm-mem-cs-none femms load store
@@ -980,9 +997,6 @@ x86_64 M-miss-store cmpxchgb
 x86_64 M-miss-store cmpxchgl
 x86_64 M-miss-store cmpxchgq
 x86_64 M-miss-store cmpxchgw
-x86_64 M-miss-store fisttpl
-x86_64 M-miss-store fisttpll
-x86_64 M-miss-store fisttps
 x86_64 M-miss-store fxrstor
 x86_64 M-miss-store fxrstor64
 x86_64 M-miss-store movq
@@ -1600,6 +1614,58 @@ x86_64 D-cs-only xorq
 # the difference is a length disagreement wearing a metadata disagreement's
 # clothes.  This is the family that already dominates the x86 residual;
 # the wider sweep reaches more of it, not a new kind of it.
+#
+# THE TEST FOR MEMBERSHIP IS THE SAMPLE ENCODING, NOT THE SHAPE OF THE
+# SIGNATURE, and it was applied to every row below one at a time: the tool
+# prints `cs{...}  llvm{...}` beside each bucket, and a member of this
+# family has an LLVM side that is a bare prefix (`es`, `gs`, `lock`,
+# `repne`, `data16`, `rex64`) or `<cs-reject>`.  A row whose two sides
+# print the SAME instruction is not in this family whatever it looks like,
+# and eleven such rows were standing on this justification.
+#
+# Ten of them were x87 -- `M-extra-load` and `M-miss-store` on fnstcw,
+# fsts, fstps, fstl and fstpl, every one sampled as
+# `cs{fnstcw (%rbx, %rcx)} llvm{fnstcw (%rbx,%rcx)}`, the two decoders
+# naming one instruction and disagreeing about which way its memory
+# operand points.  That was a Capstone access-flag defect, is repaired at
+# the boundary now (cap_x86_x87_mem_access in disas/capstone.c), and the
+# ten rows are deleted.  The rest are recorded here with what they
+# actually are.  They are NOT prefix-length disagreements and must not be
+# re-justified as such:
+#
+#   M-miss-store sarb / sarl / sarw / shlw / shrw  (`d23c0b` =
+#     `sarb %cl, (%rbx, %rcx)` on both sides).  Capstone reports the
+#     memory operand of the %cl-COUNT shift-to-memory forms (D2 /r,
+#     D3 /r) READ-only; they are read-modify-write.  The count-1 (D1) and
+#     imm8 (C0 / C1) forms of the same instructions ARE reported
+#     READ|WRITE, so this is a defect in specific encodings, not a
+#     convention.  OPEN: the tracer records these as pure loads.
+#
+#   M-miss-store rclb / rcrb  (`c01200` = `rclb $0, (%rdx)` on both
+#     sides).  The same lost WRITE, and for the rotates it is EVERY count
+#     form -- rol, ror, rcl and rcr to memory come back READ-only at
+#     D0/D1/D2/D3 and C0/C1 alike.  OPEN, same consequence.
+#
+#   R-rd-missing rcrl +flags  (`c11c0700`, one instruction on both
+#     sides).  Capstone omits the carry-flag READ that makes RCL / RCR
+#     what they are.  Described correctly in section (e) below; this copy
+#     of it was mis-filed here.
+#
+#   M-miss-store pushw  (`66ff3402` = `pushw (%rdx, %rax)` on both
+#     sides).  Not a defect: Capstone gives PUSH one MEM operand, its
+#     source, and models the stack write through the implicit RSP update,
+#     where LLVM's mayStore covers it.  The tracer's GEN_OP_PUSH walker
+#     supplies the store -- the fields layer reports loads=1 stores=1 for
+#     this encoding -- so nothing is lost.
+#
+#   M-miss-load lcallq, and with it Z-access0 lcallq MEM, R-wr-phantom
+#     lcallq / lcallw / bnd lcalll +r#  (`48ff1c07` =
+#     `lcallq *(%rdi, %rax)` on both sides).  Two things, neither about
+#     prefixes.  Capstone returns access == 0 on the far pointer an
+#     indirect far call READS, so the fields layer records loads=0 for it;
+#     and LLVM's far-call descriptions carry no defs at all, which is what
+#     the R-wr-phantom rows are -- Capstone naming the RSP write is the
+#     correct half.  OPEN (the lost far-pointer load).
 x86_64 B-flow-presence bnd jmp cs-yes llvm-no
 x86_64 B-flow-presence bnd notrack jmp cs-yes llvm-no
 x86_64 B-flow-presence jmp cs-yes llvm-no
@@ -1670,17 +1736,7 @@ x86_64 M-cs-mem-llvm-none lock negb
 x86_64 M-cs-mem-llvm-none lock negl
 x86_64 M-cs-mem-llvm-none lock notb
 x86_64 M-cs-mem-llvm-none lock notl
-x86_64 M-extra-load fnstcw
-x86_64 M-extra-load fstl
-x86_64 M-extra-load fstpl
-x86_64 M-extra-load fstps
-x86_64 M-extra-load fsts
 x86_64 M-miss-load lcallq
-x86_64 M-miss-store fnstcw
-x86_64 M-miss-store fstl
-x86_64 M-miss-store fstpl
-x86_64 M-miss-store fstps
-x86_64 M-miss-store fsts
 x86_64 M-miss-store pushw
 x86_64 M-miss-store rclb
 x86_64 M-miss-store rcrb
@@ -1956,12 +2012,23 @@ x86_64 R-wr-phantom fcmovu +st(#)
 x86_64 R-wr-phantom fstp +st(#)
 x86_64 R-wr-phantom fsts +fpsw
 
-# (d) Memory presence and direction on the newly reached members.  Three
+# (d) Memory presence and direction on the newly reached members.  Two
 # shapes: the system-descriptor ops (LGDT / LIDT / INVLPG / the VMX
 # pointers) where LLVM models no memory operand for an instruction that
-# plainly has one; the x87 integer load/store forms where the two disagree
-# about direction; and the cache-maintenance ops (CLFLUSH / CLFLUSHOPT /
+# plainly has one; and the cache-maintenance ops (CLFLUSH / CLFLUSHOPT /
 # CLWB) LLVM marks mayStore although they write no architectural data.
+#
+# A THIRD SHAPE USED TO BE LISTED HERE and it was a defect, not a
+# disagreement.  The sentence said "the x87 integer load/store forms where
+# the two disagree about direction", which named the symptom and stopped:
+# `M-extra-load` / `M-miss-store` on fistl, fistpl, fistps and fists, and
+# `M-extra-store` / `M-miss-load` on frstor, were Capstone reporting the
+# wrong direction for a memory operand whose direction is fixed by the
+# opcode.  QEMU's gen_x87() settles every one of them.  Repaired at the
+# boundary (cap_x86_x87_mem_access in disas/capstone.c) and the ten rows
+# deleted; frstor is the inverse of the other four, a pure 108-byte LOAD
+# reported WRITE.  "The two disagree" is a description of a bucket, never
+# a justification for keeping one.
 x86_64 M-cs-mem-llvm-none invlpg
 x86_64 M-cs-mem-llvm-none lgdtq
 x86_64 M-cs-mem-llvm-none lidtq
@@ -1970,11 +2037,6 @@ x86_64 M-cs-mem-llvm-none vmclear
 x86_64 M-cs-mem-llvm-none vmptrld
 x86_64 M-cs-mem-llvm-none vmptrst
 x86_64 M-cs-mem-llvm-none vmxon
-x86_64 M-extra-load fistl
-x86_64 M-extra-load fistpl
-x86_64 M-extra-load fistps
-x86_64 M-extra-load fists
-x86_64 M-extra-store frstor
 x86_64 M-llvm-mem-cs-none incsspd load store
 x86_64 M-llvm-mem-cs-none incsspq load store
 x86_64 M-llvm-mem-cs-none mwait load store
@@ -1992,7 +2054,6 @@ x86_64 M-llvm-mem-cs-none wrgsbasel load store
 x86_64 M-llvm-mem-cs-none wrgsbaseq load store
 x86_64 M-llvm-mem-cs-none xsetbv load store
 x86_64 M-miss-load clrssbsy
-x86_64 M-miss-load frstor
 x86_64 M-miss-load ljmpq
 x86_64 M-miss-load nopl
 x86_64 M-miss-load prefetchwt1
@@ -2009,10 +2070,6 @@ x86_64 M-miss-store clflush
 x86_64 M-miss-store clflushopt
 x86_64 M-miss-store clrssbsy
 x86_64 M-miss-store clwb
-x86_64 M-miss-store fistl
-x86_64 M-miss-store fistpl
-x86_64 M-miss-store fistps
-x86_64 M-miss-store fists
 x86_64 M-miss-store ldmxcsr
 x86_64 M-miss-store nopl
 x86_64 M-miss-store prefetcht1
@@ -4536,6 +4593,27 @@ x86_64 R-wr-phantom xrelease lock xchgl +r#
 #   `x86_64 W-wr-added vcvtpd2psx +REG_VEC#` went dead in
 #   isaxcheck_fixups.txt with them.  Direction came from QEMU's translator
 #   in every case; see the per-family comments in disas/capstone.c.
+#
+#   THE WHOLE x87 ESCAPE SPACE IS NOW FIXED, in `cap_x86_x87_mem_access`,
+#   and it is the case that shows how far a justification will travel on
+#   its own.  Twelve of the eighteen x87 memory-DESTINATION forms were
+#   reported READ -- fnstcw, fsts, fstps, fstl, fstpl, fists, fistl,
+#   fistps, fistpl, fisttps, fisttpl, fisttpll -- and FRSTOR, whose
+#   108-byte memory operand it only ever reads, was reported WRITE.
+#   Twenty-six entries went dead and were removed.  They had been sitting
+#   in THREE different places under THREE justifications, none of which
+#   described them: five pairs under "the two decoders cut a prefix-heavy
+#   byte string into different instructions" (section 6(b)) where both
+#   decoders in fact printed the same instruction; four pairs plus the two
+#   frstor rows under "the x87 integer load/store forms where the two
+#   disagree about direction" (section 6(d)), which names the bucket and
+#   asserts nothing; and three pairs inside the x86_64 baseline block,
+#   which triages nothing by construction.  No x87 memory operand is
+#   read-modify-write, so all eighteen store spellings and the FPU-
+#   environment loads are named at the boundary and the repair is a no-op
+#   on the six Capstone already gets right.  Ground truth is gen_x87() in
+#   target/i386/tcg/translate.c, keyed by the same
+#   `op = ((b & 7) << 3) | ModRM.reg` the boundary comment tabulates.
 #
 #   `M-miss-store ldmxcsr` / `vldmxcsr` SURVIVED that change and are NOT
 #   the stmxcsr defect wearing a different name.  LDMXCSR is a LOAD --

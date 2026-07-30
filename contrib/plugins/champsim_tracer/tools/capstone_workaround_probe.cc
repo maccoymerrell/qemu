@@ -188,6 +188,30 @@ bool StillBuggy_SetccMemStore(const cs_insn &insn)
      * would sit at RETIRE CANDIDATE forever and inflate that count. */
     return !(OpAccess_x86(insn, 0) & CS_AC_WRITE);
 }
+bool StillBuggy_X87StoreRead(const cs_insn &insn)
+{
+    /* fnstcw (%rsp): the sole MEM operand is the DESTINATION -- QEMU's
+     * gen_x87() reaches D9 /7 as op 0x0f and ends it in
+     * tcg_gen_qemu_st_i32 -- and must be WRITE. Bug: READ, on twelve of
+     * the eighteen x87 memory-destination forms.  The other six (fnstenv,
+     * fstpt, fnsave, fnstsw, fbstp, fistpll) are already right, which is
+     * why the predicate enumerates all eighteen instead of matching an
+     * `fst` / `fist` stem; verify that half by hand with
+     * `isaxcheck --hex=d9742470` (`fnstenv 0x70(%rsp)`), which must show
+     * the MEM operand WRITE already. */
+    return !(OpAccess_x86(insn, 0) & CS_AC_WRITE);
+}
+bool StillBuggy_FrstorMemWrite(const cs_insn &insn)
+{
+    /* frstor (%rax): the sole MEM operand is the SOURCE -- helper_frstor
+     * prepares its access MMU_DATA_LOAD and reaches memory only through
+     * access_ldw() and do_fldt() -- and must be READ, not WRITE.  This is
+     * the x87 direction inversion with the sign flipped.  Its twin
+     * fldenv (D9 /4) is reported correctly; verify with
+     * `isaxcheck --hex=d9642470`, which must show the MEM operand READ
+     * already. */
+    return !(OpAccess_x86(insn, 0) & CS_AC_READ);
+}
 bool StillBuggy_GatherMaskWrite(const cs_insn &insn)
 {
     /* vpgatherdd %xmm2,(%rax,%xmm1),%xmm1: the mask register is operand 0
@@ -349,6 +373,27 @@ const std::vector<Case> &Cases()
          "only",
          CS_ARCH_X86, CS_MODE_64, {0xc4, 0xe2, 0x69, 0x90, 0x0c, 0x08},
          StillBuggy_GatherMaskWrite},
+        {"cap_x86_x87_mem_access (FNSTCW)", "cap_fill_x86_operands",
+         "6.0.0-Alpha7",
+         "FNSTCW and eleven more of the eighteen x87 memory-DESTINATION "
+         "forms: the sole MEM operand is the destination but is reported "
+         "READ",
+         CS_ARCH_X86, CS_MODE_64, {0xd9, 0x3c, 0x24},
+         StillBuggy_X87StoreRead},
+        {"cap_x86_x87_mem_access (FSTPL)", "cap_fill_x86_operands",
+         "6.0.0-Alpha7",
+         "FSTPL: second escape opcode of the same defect (DD /3, where "
+         "DD /6 and DD /7 are reported correctly), so the family is not "
+         "one opcode's mistake",
+         CS_ARCH_X86, CS_MODE_64, {0xdd, 0x5c, 0x24, 0x20},
+         StillBuggy_X87StoreRead},
+        {"cap_x86_x87_mem_access (FRSTOR)", "cap_fill_x86_operands",
+         "6.0.0-Alpha7",
+         "FRSTOR: the inverse inversion -- its MEM operand is a pure "
+         "SOURCE (helper_frstor prepares MMU_DATA_LOAD) but is reported "
+         "WRITE, minting a phantom 108-byte store",
+         CS_ARCH_X86, CS_MODE_64, {0xdd, 0x20},
+         StillBuggy_FrstorMemWrite},
         {"cap_x86_is_test (phantom write)", "cap_fill_x86_operands",
          "6.0.0-Alpha7", "TEST opcode A9, 32-bit operand size: %eax "
          "reported READ|WRITE instead of plain READ",

@@ -866,6 +866,20 @@ SYS_CELLS = [
     {"name": "devio_sys_x86_64_int1", "isa": "x86_64",
      "opts": SYS_PLUGIN_OPTS + ",interrupts=1,faults=1",
      "qemu_args": ["-icount", "shift=0,sleep=off", "-rtc", "clock=vm"]},
+    # The SMP cell exists because until it did, nothing byte-guarded the
+    # multi-vCPU paths at all: the SMP window latch, per-vCPU state keying,
+    # cross-vCPU thread identity and the round-robin scheduler interleave
+    # every landed without a golden watching them.  It became possible when
+    # the round-robin constant-index miscompile and the rr thread_local
+    # aliasing were fixed (icount forces thread=single): with the virtual
+    # clock and RTC pinned, two independent -icount --smp 2 boots produce
+    # byte-identical bodies, so the canon slice is deterministic a fortiori.
+    # Maintainer-approved 2026-07-30 ("sure, queue it up") under the
+    # icount-for-goldens ruling.
+    {"name": "devio_sys_x86_64_smp2", "isa": "x86_64",
+     "opts": SYS_PLUGIN_OPTS + ",interrupts=1,faults=1",
+     "qemu_args": ["-icount", "shift=0,sleep=off", "-rtc", "clock=vm",
+                   "-smp", "2"]},
 ]
 
 # Frozen system fixtures for the DECODER guard (reuse the SVG fixture files).

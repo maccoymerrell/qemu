@@ -195,6 +195,10 @@ CLOCK_STALL_TIMEOUT_S = 180
 # that was already moving; measured worst case for the churn guest is ~200s.
 CLOCK_STALL_STARTUP_FACTOR = 4
 
+# Exit status the plugin uses when its own architectural progress detector
+# abandons a wedged capture (CST_RT_GATE_EXIT in champsim_tracer.h).
+RT_GATE_EXIT = 88
+
 _PROGRESS_RE = re.compile(r"champsim_tracer: progress (\d+)/(\d+) user insns")
 _SEG_START_RE = re.compile(r"champsim_tracer: starting segment ")
 
@@ -274,14 +278,42 @@ def run_with_clock_watchdog(cmd: list[str], log_path,
     Returns (rc, stall_reason); stall_reason is "" when the watchdog did not
     fire.  The process group is killed so a qemu that ignores SIGTERM in the
     TCG loop still dies."""
+    # The plugin's own #61 progress detector (CST_RT_GATE) watches
+    # architectural counts -- instructions retired by the guest against the
+    # traced process's user-space instruction clock -- so it returns the same
+    # verdict on an idle host and a saturated one, unlike the wall-clock
+    # watchdog below, which is a cost tripwire.
+    #
+    # It is NOT armed here, and the reason is a measured false positive.  Its
+    # budget (instructions retired with no workload progress) is calibrated on
+    # the canonical devio cell, where 42 healthy cells under SMT-sibling
+    # saturation peaked at 403 k against a budget of 8 M.  The CHURN cell is a
+    # different animal: the marked workload runs concurrently with a stream of
+    # short-lived processes, so the traced process is legitimately off-CPU
+    # while the guest retires millions of instructions in other address
+    # spaces.  Armed globally, the detector calls that a wedge -- it did, on
+    # system.churn_x86.  A single budget cannot serve both workloads; the
+    # budget has to be recorded per workload the way golden_net.py records the
+    # escaped-wedge ratio, and until it is, this harness passes through only
+    # what the operator set.  golden_net.py arms it for the canonical system
+    # cells, where the calibration exists.
+    env = dict(os.environ)
     with open(log_path, "w") as f:
         p = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT,
-                             start_new_session=True)
+                             start_new_session=True, env=env)
         last_progress, last_change = None, time.monotonic()
         try:
             while True:
                 try:
-                    return p.wait(timeout=poll_s), ""
+                    rc = p.wait(timeout=poll_s)
+                    if rc == RT_GATE_EXIT:
+                        return rc, ("the plugin's #61 progress detector "
+                                    "abandoned the capture: the guest "
+                                    "retired millions of instructions "
+                                    "without the traced process executing a "
+                                    "single user-space instruction (see the "
+                                    "run log for the exact counts)")
+                    return rc, ""
                 except subprocess.TimeoutExpired:
                     pass
                 try:

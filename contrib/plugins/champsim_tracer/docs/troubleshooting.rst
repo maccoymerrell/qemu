@@ -494,6 +494,57 @@ hand-maintained and independent of LLVM's, so the shared-blind-spot
 argument that motivates a third opinion does not apply, and x86
 already has Intel PIN cross-validation.
 
+The guest stops making progress under system-mode tracing
+--------------------------------------------------------
+
+A system-mode capture can enter a state where the guest keeps executing
+but never finishes its workload: it services its periodic timer tick,
+schedules, and comes straight back to the next tick.  Two out of every
+three instructions a healthy capture window retires are already tick and
+scheduler service on an idle host, so the margin to that state is thin,
+and host contention — most sharply an SMT sibling under load — can spend
+it.  A capture that enters it and is left alone writes a trace that
+passes every content check while carrying tens of times the healthy
+architectural instruction count.
+
+The tracer reports the relevant quantities at exit, unconditionally::
+
+  champsim_tracer: guest_realtime factor=0.087 worst_sample=0.038 samples=9
+    in_segment_host_s=2.49 guest_s=0.217 insn_per_guest_s=2.679M
+    ticktax=0.6747 worst_user_stall=44582 stall_detector=live
+
+``ticktax`` is the fraction of retired guest instructions spent inside
+asynchronous interrupts; at 1.0 the guest can make no progress at all.
+``worst_user_stall`` is the largest number of instructions the guest
+retired without the traced process executing a single user-space
+instruction — the healthy value on the canonical cell is tens of
+thousands.  ``stall_detector=INERT`` means the user-instruction clock
+never moved inside the segment, so nothing was watching.
+
+Environment knobs (all detection only; none changes what is traced):
+
+``CST_RT_GATE``
+   Arm the progress detector.  Any value arms it; a non-zero value
+   additionally arms a guest-realtime-factor floor.  On a trip the
+   tracer prints the counts and the reason and exits with status 88.
+
+``CST_RT_STALL``
+   Retired-instruction budget for the stall detector (default
+   8 000 000, about 100x the healthy worst case).
+
+``CST_RT_GATE_STREAK`` / ``CST_RT_GATE_WINDOW_MS``
+   Consecutive sub-floor sample windows required to trip the factor
+   floor, and the host span of one sample window (default 8 x 250 ms).
+
+``CST_RT_TRACE``
+   Print every sample (``[rtsample] t=... f=... insn=... ticktax=...
+   stall=...``) for offline distributions.
+
+``golden_net.py`` and the validator arm the detector for their system
+cells, and ``golden_net.py`` additionally re-checks the ratio of
+architectural instructions to workload instructions against the value
+recorded at capture, which is what catches a wedge that finished anyway.
+
 Where to look next
 ------------------
 

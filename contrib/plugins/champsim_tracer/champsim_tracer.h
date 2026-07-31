@@ -330,6 +330,14 @@ inline constexpr unsigned CST_PIN_MAX_VCPUS = 1024;
  * alongside the hot singletons (slot 0..24 → 1 byte, 25..63 → 2).
  * See docs/format.rst §5.1.
  */
+/*
+ * Process exit status the guest-realtime gate (#61) uses when it abandons a
+ * wedged capture.  Distinct from anything QEMU or the guest workload produces,
+ * so a harness can tell "the guest stopped making forward progress" apart from
+ * a guest panic, an OOM kill, or a non-zero workload exit.
+ */
+#define CST_RT_GATE_EXIT         88
+
 #define CST_FID_SLOT_COUNT       (cst_wire::FID_SLOT_COUNT)  /* slots per slotted family */
 #define CST_FID_SLOT_STRIDE      8    /* family IDs per slot (== family count) */
 #define CST_MAX_WIDE_BYTES       (cst_wire::WIDE_BYTES_MAX)  /* 512-bit data/reg scalar cap */
@@ -561,7 +569,7 @@ typedef struct {
 /*
  * Per-thread wrong-path scratch buffer for per-insn destination-
  * register snapshots captured during a single qemu_plugin_exec_tb()
- * call.  Populated by vcpu_insn_reg_snap_cb when g_wp_state.in_progress
+ * call.  Populated by vcpu_insn_reg_snap_cb when g_wp_in_progress
  * is true; drained by the WP fragment-walk loop in
  * champsim_tracer_wp.cc to attribute each insn its per-insn-accurate
  * post-write snapshot (the snap captured at the next canonical

@@ -2200,6 +2200,328 @@ std::atomic<uint64_t> g_traced_icount{0};
  * BB-end-deferral drain. */
 std::atomic<uint64_t> g_total_arch_insns{0};
 
+/* ================== Guest realtime factor: instrument + gate ==============
+ *
+ * WHAT IT MEASURES.  qemu_plugin_vclock_ns() reads the clock the GUEST reads:
+ * host wall time minus every interval the tracer had it frozen.  Two ratios
+ * come out of it, answering different questions:
+ *
+ *   factor = d(guest ns) / d(host ns)
+ *       how much guest time the guest is charged per second of host time.
+ *
+ *   R_g    = d(arch insns) / d(guest seconds)
+ *       how many instructions the guest gets to retire per guest-second.
+ *       This is the one that decides whether the guest can survive its own
+ *       periodic tick: servicing a tick costs a roughly fixed number of guest
+ *       INSTRUCTIONS, so the guest-time price of one tick is N_tick / R_g and
+ *       the fraction of guest time spent in tick service is HZ * N_tick / R_g.
+ *       At 1 the guest does nothing but service ticks and forward progress
+ *       stops — the wedge.  R_g falls as UNPAUSED tracer overhead rises,
+ *       which is precisely why the wedge is load-dependent.
+ *
+ * WHY THIS IS NOT A CORRECTNESS KNOB.  Measurement is unconditional and
+ * changes nothing the tracer emits.  The GATE is opt-in (CST_RT_GATE) and its
+ * only power is to abort loudly — it can turn a silent multi-hour wedge into
+ * an immediate diagnosable failure, and it can never quietly capture less.
+ */
+struct RtFactorGate {
+    /* Config, read once at install. */
+    double   floor       = 0.0;   /* CST_RT_GATE; 0 disables the abort */
+    unsigned streak_need = 8;     /* consecutive sub-floor sample windows */
+    int64_t  sample_ns   = 250 * 1000 * 1000;  /* host span per sample */
+
+    /* State. */
+    bool     supported   = true;  /* vclock readable: system mode, no icount */
+    bool     armed       = false; /* inside a capture segment */
+    int64_t  seg_host0   = 0, seg_vc0 = 0;
+    uint64_t seg_icnt0   = 0;
+    int64_t  win_host0   = 0, win_vc0 = 0;
+    uint32_t divider     = 0;
+    unsigned streak      = 0;
+    int64_t  last_host   = 0, last_vc = 0;   /* most recent sampled pair */
+
+    /* Accumulated across segments, for the exit report. */
+    int64_t  tot_host_ns = 0, tot_vc_ns = 0;
+    uint64_t tot_icnt    = 0;
+    uint32_t samples     = 0;
+    double   worst_factor = 0.0;
+    bool     have_worst  = false;
+    bool     trace_samples = false;   /* CST_RT_TRACE: dump every sample */
+
+    static int64_t host_ns(void)
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    }
+
+    /*
+     * TICK TAX.  Instructions retired inside an asynchronous interrupt (the
+     * periodic timer tick, and everything the scheduler does on the way out
+     * of it) versus instructions retired in total.  That ratio IS the
+     * fraction of its own time the guest spends servicing its tick, and the
+     * livelock condition is the ratio reaching 1: the guest returns from a
+     * tick with the next one already pending and never gets back to the
+     * workload.  Attributed per TB from the already-latched async decision,
+     * so it costs one compare and one add.
+     */
+    uint64_t async_insns = 0;
+    uint64_t last_icnt   = 0;
+    uint64_t seg_async0  = 0;
+    uint64_t tot_async   = 0;
+
+    /*
+     * WORKLOAD-PROGRESS STALL — the load-invariant half of the detector.
+     * Both terms are architectural counts: instructions retired by the guest,
+     * and g_user_icount, the pinned process's user-space instruction clock.
+     * Neither contains host time, so this fires identically on an idle
+     * machine and on a saturated one; contention cannot manufacture it and
+     * cannot mask it.  A healthy capture never lets the guest retire more
+     * than a few hundred thousand instructions between two workload
+     * instructions; a wedge retires tens of millions and never comes back.
+     *
+     * The detector refuses to trust a subject it has not seen move: it arms
+     * only after g_user_icount has advanced at least once inside this
+     * segment, and reports itself INERT otherwise rather than passing
+     * silently on a counter that a future mode leaves frozen.
+     */
+    uint64_t stall_limit   = 8ull * 1000 * 1000;
+    uint64_t last_user     = 0;
+    uint64_t stall_icnt0   = 0;
+    uint64_t worst_stall   = 0;
+    bool     user_moved    = false;
+    bool     armed_stall   = false;
+
+    void note_tb(bool async, uint64_t icount_now)
+    {
+        if (icount_now > last_icnt) {
+            if (async) {
+                async_insns += icount_now - last_icnt;
+            }
+            last_icnt = icount_now;
+        }
+    }
+
+    /*
+     * Retired-instruction clock for the R_g denominator.  g_host_icount is
+     * thread_local (one per vCPU), so take a high-water mark across vCPUs:
+     * for a detector whose subject is "no vCPU is making forward progress",
+     * the leading vCPU is the correct and conservative reading.
+     */
+    static uint64_t icount_hwm(void)
+    {
+        static uint64_t hwm;          /* only ever read/written under exec_lock */
+        if (g_host_icount > hwm) {
+            hwm = g_host_icount;
+        }
+        return hwm;
+    }
+
+    void install(void)
+    {
+        const char *e = getenv("CST_RT_GATE");
+        if (e && *e) {
+            floor = strtod(e, nullptr);
+        }
+        const char *s = getenv("CST_RT_GATE_STREAK");
+        if (s && *s) {
+            unsigned long v = strtoul(s, nullptr, 0);
+            if (v) {
+                streak_need = (unsigned)v;
+            }
+        }
+        armed_stall = getenv("CST_RT_GATE") != nullptr;
+        const char *st = getenv("CST_RT_STALL");
+        if (st && *st) {
+            unsigned long long v = strtoull(st, nullptr, 0);
+            if (v) {
+                stall_limit = (uint64_t)v;
+            }
+        }
+        trace_samples = getenv("CST_RT_TRACE") != nullptr;
+        const char *w = getenv("CST_RT_GATE_WINDOW_MS");
+        if (w && *w) {
+            unsigned long v = strtoul(w, nullptr, 0);
+            if (v) {
+                sample_ns = (int64_t)v * 1000000LL;
+            }
+        }
+    }
+
+    /*
+     * Close out the open segment using the LAST SAMPLED clock pair, never a
+     * fresh read.  close_segment() is reachable from plugin_exit, where the
+     * vCPU thread is gone and the timer subsystem may already be torn down;
+     * reading the guest clock there loses the whole exit report (the report
+     * is one GString emitted after every contributor has appended to it) and
+     * can take the process with it.  Observed once as a system-golden cell
+     * that finished its segment, exited 1, and wrote no summary at all.
+     * The cost of using the last sample is at most one sample window of
+     * unattributed time at the very end of a segment.
+     */
+    void close_segment(void)
+    {
+        if (!armed) {
+            return;
+        }
+        armed = false;
+        int64_t h = last_host - seg_host0;
+        int64_t v = last_vc - seg_vc0;
+        if (h > 0 && v >= 0) {
+            tot_host_ns += h;
+            tot_vc_ns   += v;
+            tot_icnt    += icount_hwm() - seg_icnt0;
+            tot_async   += async_insns - seg_async0;
+        }
+    }
+
+    /*
+     * Called from the per-TB correct-path step, inside the vclock-paused
+     * region.  The clock reads are amortised 1-in-1024 TBs, so the instrument
+     * costs well under a microsecond per sample window.
+     */
+    void tick(bool seg_active)
+    {
+        if (!supported) {
+            return;
+        }
+        if (!seg_active) {
+            close_segment();
+            return;
+        }
+        if ((++divider & 1023u) != 0) {
+            return;
+        }
+        int64_t vc = qemu_plugin_vclock_ns();
+        if (vc == 0) {
+            /* User mode, or icount owns the clock: nothing to measure. */
+            supported = false;
+            return;
+        }
+        int64_t h = host_ns();
+        if (!armed) {
+            armed = true;
+            seg_host0 = win_host0 = last_host = h;
+            seg_vc0   = win_vc0   = last_vc  = vc;
+            seg_icnt0 = icount_hwm();
+            seg_async0 = async_insns;
+            last_user = g_user_icount;
+            stall_icnt0 = seg_icnt0;
+            user_moved = false;
+            streak = 0;
+            return;
+        }
+        last_host = h;
+        last_vc   = vc;
+        int64_t dh = h - win_host0;
+        if (dh < sample_ns) {
+            return;
+        }
+        double f = (double)(vc - win_vc0) / (double)dh;
+        uint64_t ic = icount_hwm();
+        win_host0 = h;
+        win_vc0   = vc;
+        samples++;
+        uint64_t di = ic - seg_icnt0;
+        uint64_t da = async_insns - seg_async0;
+        if (trace_samples) {
+            fprintf(stderr, "[rtsample] t=%.3f f=%.4f insn=%" PRIu64
+                    " ticktax=%.3f stall=%" PRIu64 "\n",
+                    (double)(h - seg_host0) / 1e9, f, di,
+                    di ? (double)da / (double)di : 0.0,
+                    ic - stall_icnt0);
+        }
+        if (!have_worst || f < worst_factor) {
+            worst_factor = f;
+            have_worst = true;
+        }
+        /* Workload-progress stall: architectural, load-invariant. */
+        uint64_t u = g_user_icount;
+        if (u != last_user) {
+            last_user = u;
+            stall_icnt0 = ic;
+            user_moved = true;
+        }
+        uint64_t stall = ic - stall_icnt0;
+        if (stall > worst_stall) {
+            worst_stall = stall;
+        }
+        if (armed_stall && user_moved && stall > stall_limit) {
+            fprintf(stderr,
+                "\nchampsim_tracer: *** WORKLOAD PROGRESS STALLED ***\n"
+                "  the guest retired %" PRIu64 " instructions without the "
+                "traced process\n"
+                "  executing a single user-space instruction (limit %"
+                PRIu64 ").  Tick tax %.3f.\n"
+                "  Both terms are architectural counts, so this verdict does "
+                "not depend on\n"
+                "  host load: the guest is WEDGED, not slow.  Abandoning the "
+                "capture now (#61)\n"
+                "  rather than letting it finish a trace that passes every "
+                "content check while\n"
+                "  carrying tens of times the healthy instruction count.\n\n",
+                stall, stall_limit,
+                di ? (double)da / (double)di : 0.0);
+            fflush(stderr);
+            _exit(CST_RT_GATE_EXIT);
+        }
+
+        if (floor <= 0.0) {
+            return;
+        }
+        if (f >= floor) {
+            streak = 0;
+            return;
+        }
+        if (++streak < streak_need) {
+            return;
+        }
+        double secs = (double)(h - seg_host0) / 1e9;
+        fprintf(stderr,
+            "\nchampsim_tracer: *** GUEST REALTIME GATE TRIPPED ***\n"
+            "  guest realtime factor %.4f < floor %.4f for %u consecutive "
+            "%.0f ms windows\n"
+            "  (segment open %.1f host-seconds).  The guest is being charged "
+            "more timer-tick\n"
+            "  work than it can retire: it is WEDGED, not merely slow.\n"
+            "  This is the #61 detector, not a timeout — the capture is "
+            "abandoned now so the\n"
+            "  run fails loudly instead of finishing a trace that passes "
+            "every content check\n"
+            "  while carrying tens of times the healthy architectural insn "
+            "count.\n\n",
+            f, floor, streak, (double)sample_ns / 1e6, secs);
+        fflush(stderr);
+        _exit(CST_RT_GATE_EXIT);
+    }
+
+    void report(GString *out)
+    {
+        close_segment();
+        if (!supported || tot_host_ns <= 0) {
+            g_string_append_printf(out,
+                "champsim_tracer: guest_realtime factor=n/a "
+                "(no guest clock: user mode, icount, or no segment opened)\n");
+            return;
+        }
+        double f = (double)tot_vc_ns / (double)tot_host_ns;
+        double gsec = (double)tot_vc_ns / 1e9;
+        double rg = gsec > 0 ? (double)tot_icnt / gsec : 0.0;
+        g_string_append_printf(out,
+            "champsim_tracer: guest_realtime factor=%.4f worst_sample=%.4f "
+            "samples=%u in_segment_host_s=%.2f guest_s=%.3f "
+            "insn_per_guest_s=%.3fM ticktax=%.4f "
+            "worst_user_stall=%" PRIu64 " stall_detector=%s\n",
+            f, have_worst ? worst_factor : f, samples,
+            (double)tot_host_ns / 1e9, gsec, rg / 1e6,
+            tot_icnt ? (double)tot_async / (double)tot_icnt : 0.0,
+            worst_stall,
+            user_moved ? (armed_stall ? "live" : "live-unarmed") : "INERT");
+    }
+};
+
+static RtFactorGate g_rt_gate;
+
 /* Defined later after g_window_mode / warmup_insns are in scope. */
 static void recompute_next_threshold(void);
 /* Set the per-vCPU `budget` scoreboard slot so the JIT-emitted
@@ -2260,9 +2582,35 @@ static void recompute_next_threshold(void)
         g_next_threshold.store(UINT64_MAX, std::memory_order_relaxed);
         return;
     }
-    /* Symbol / marker open on an executed instruction (symbol name, or
-     * the marker that arms the window), not on an icount threshold;
-     * every TB must take the slow path. */
+    if (g_window_mode == PluginConfig::WIN_MARKER) {
+        /* Marker mode opens on an executed instruction, and that
+         * instruction has its own exec callback: the marker bytes are
+         * detected at translation time and vcpu_marker_cb is armed on
+         * them directly, so no per-TB polling can ever be what opens
+         * the window.  Everything the budget slow path does between
+         * segments here is a no-op — tw_manage_window's marker branch
+         * only acts when a segment is active, and the segment open
+         * itself runs under exec_lock in vcpu_marker_cb — so park the
+         * threshold and let the whole boot/fast-forward take the same
+         * lock-free inline path the inter-segment icount gap takes.
+         * (Measured on the canonical system devio cell: the per-TB
+         * slow path — exec_lock pair, scoreboard u64 get/set, the
+         * no-op tw_manage_window walk — was ~24% of all host cycles.)
+         * The g_host_icount mirror this path refreshed is re-anchored
+         * at every segment open (marker_open_trace_window) and
+         * maintained in-segment by the heavy step, so the printed
+         * "last seen" icount stays truthful at every segment
+         * boundary; between the final close and process exit it no
+         * longer advances, which is the documented "last per-vCPU
+         * TB-exec icount seen" contract. */
+        g_next_threshold.store(UINT64_MAX, std::memory_order_relaxed);
+        return;
+    }
+    /* Symbol mode opens on an executed instruction too, but the symbol
+     * is matched by TEMPLATE NAME, not by an armed insn callback: the
+     * pre-segment occurrence counter advances inside tw_manage_window
+     * off the budget slow path (see the WIN_SYMBOL branch there), so
+     * every TB must keep taking it. */
     g_next_threshold.store(0, std::memory_order_relaxed);
 }
 
@@ -2426,7 +2774,7 @@ typedef struct {
  * Routes by execution context:
  *  - CP: append to pending_reg_snaps; drained by the next
  *    vcpu_tb_exec.
- *  - WP (g_wp_state.in_progress): append to wp_pending_reg_snaps;
+ *  - WP (g_wp_in_progress): append to wp_pending_reg_snaps;
  *    drained by the fragment walk after the in-flight exec_tb
  *    returns.  Skipped when g_features.wp_reg_data is off.
  */
@@ -2448,7 +2796,7 @@ static void vcpu_insn_reg_snap_cb(unsigned int cpu_index, void *udata)
         return;
     }
     std::vector<RegSnap> *sink;
-    if (g_wp_state.in_progress) {
+    if (g_wp_in_progress) {
         if (!g_features.wp_reg_data) {
             return;
         }
@@ -2527,7 +2875,7 @@ static inline uint64_t read_reg_u64(unsigned int cpu_index,
 
 static void vcpu_insn_synth_ea_cb(unsigned int cpu_index, void *udata)
 {
-    if (g_wp_state.in_progress) {
+    if (g_wp_in_progress) {
         return;
     }
     if (!g_trace_segments.is_active_atomic()) {
@@ -4427,7 +4775,7 @@ static void deadlatch_on_asid_write(unsigned int vcpu_index, uint64_t new_asid)
     /* Wrong-path fence: never mutate the owned set or close a window from a
      * speculative context (asid writes are wrong-path-suppressed upstream;
      * this hard-enforces it, mirroring the marker callbacks). */
-    if (qemu_plugin_in_spec_mode() || g_wp_state.in_progress) {
+    if (qemu_plugin_in_spec_mode() || g_wp_in_progress) {
         return;
     }
     g_rec_mutex_lock(&exec_lock);
@@ -4644,10 +4992,10 @@ static uint64_t resolve_wrong_target(const BBTemplate *bb_tmpl,
          * it MUST stay correct-path-only: folding a speculative target
          * back in would poison the very decision that picks the next
          * speculative target.  vcpu_tb_exec already early-returns when
-         * g_wp_state.in_progress; the explicit guard hard-enforces the
+         * g_wp_in_progress; the explicit guard hard-enforces the
          * invariant for any future caller.
          */
-        if (branch_taken && !g_wp_state.in_progress) {
+        if (branch_taken && !g_wp_in_progress) {
             BranchHistory::note_target(br, current_pc);
         }
         /* Indirect/return: CP transferred to current_pc — that IS
@@ -5149,7 +5497,7 @@ static void tw_manage_window(unsigned int cpu_index,
  * which re-triggers this cb cleanly post-WP. */
 static void vcpu_tb_check_budget(unsigned int cpu_index, void *udata)
 {
-    if (g_wp_state.in_progress) {
+    if (g_wp_in_progress) {
         /* No-op inside WP; spec-mode TB inline_adds will keep firing
          * this cb on every spec TB until WP restores the saved
          * budget.  The cost is one C call + return per spec TB. */
@@ -5633,6 +5981,17 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
 
     g_rec_mutex_lock(&exec_lock);
 
+    /* Guest-realtime instrument (#61).  Sampled here — one point that runs
+     * once per correct-path TB, with the guest clock already frozen (the
+     * caller's VClockPauseGuard is in scope) and UNDER exec_lock: the gate
+     * is one process-wide aggregate, and on an SMP guest every vCPU thread
+     * walks this step, so pre-lock sampling would race its counters (the
+     * same cross-vCPU class the cpu_index-array conversion just retired).
+     * Amortised 1-in-1024 internally; g_user_icount, which the stall
+     * detector reads, is likewise exec_lock-owned. */
+    g_rt_gate.note_tb(g_capture_mute, icount_prev);
+    g_rt_gate.tick(g_trace_segments.is_active_atomic());
+
     /* Address-space pin + count set (marker mode only — pinned !=
      * UNPINNED).  The inline-add counts every TB; here we fold this TB's
      * instruction count (the delta of consecutive insn_count reads) into
@@ -6071,7 +6430,7 @@ static void vcpu_pin_probe(unsigned int cpu_index, void *udata)
 {
     /* Wrong-path simulation re-dispatches the TB's callbacks on the same
      * thread that already owns the CP step; it touches no pin state. */
-    if (g_wp_state.in_progress) {
+    if (g_wp_in_progress) {
         return;
     }
     BBTemplate *cur_tb_tmpl = (BBTemplate *)udata;
@@ -6179,7 +6538,7 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
      * nested step would then run the full CP machinery against WP
      * state).  The WP-mode branch only touches thread-local state, so
      * it skips the lock cleanly. */
-    if (g_wp_state.in_progress) {
+    if (g_wp_in_progress) {
         g_wp_state.last_executed_tb = cur_tb_tmpl;
         return;
     }
@@ -6764,7 +7123,7 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
      * fence opens/closes windows from wrong-path execution (observed:
      * a 2 M-insn SMP window closed "END" after 385 k user insns,
      * mid-loop, end-marker template exec_cp=0 / exec_wp=98722). */
-    if (qemu_plugin_in_spec_mode() || g_wp_state.in_progress) {
+    if (qemu_plugin_in_spec_mode() || g_wp_in_progress) {
         tls_mkdiag_start_wp_gated++;
         return;
     }
@@ -7068,7 +7427,7 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
 static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
 {
     /* Wrong-path fence — see vcpu_marker_cb. */
-    if (qemu_plugin_in_spec_mode() || g_wp_state.in_progress) {
+    if (qemu_plugin_in_spec_mode() || g_wp_in_progress) {
         tls_mkdiag_end_wp_gated++;
         return;
     }
@@ -7274,7 +7633,7 @@ static TbPoison detect_tb_poison(uint64_t pc, const uint64_t *insn_pcs,
      * from CP tracing forever.  Spec mode therefore only READS this state (so
      * a genuinely-bad spec TB still yields poisoned=true and gets no fragment);
      * the WP walker tracks its own transient poison in a local set. */
-    const bool spec = g_wp_state.in_progress;
+    const bool spec = g_wp_in_progress;
 
     g_mutex_lock(&data_lock);
     uint64_t bytes_hash = tb_bytes_hash(insn_bytes, canonical_n_insns);
@@ -7549,7 +7908,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     /* Lifetime-class selection (#91): templates built for a wrong-path
      * translation are born SPEC — reclaimable at tb_flush unless the
      * correct path executes them first (see TmplLife). */
-    g_template_store.set_creating_spec(g_wp_state.in_progress);
+    g_template_store.set_creating_spec(g_wp_in_progress);
 
     /*
      * Every TB gets the full heavy translation, regardless of segment
@@ -7871,7 +8230,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             const char *e = getenv("CST_SPEC_FLUSH_BUDGET");
             budget = (e && *e) ? strtoull(e, nullptr, 0) : (256ull << 20);
         }
-        if (g_wp_state.in_progress &&
+        if (g_wp_in_progress &&
             g_template_store.spec_pending_bytes() > budget) {
             if (getenv("CST_MEMSTATS")) {
                 fprintf(stderr, "[memstats] spec budget tripped: pending=%"
@@ -8004,6 +8363,11 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
         " trace_arch_insns=%" PRIu64 "\n",
         g_host_icount, traced, fanout, arch);
 
+    /* Guest-realtime summary (#61): factor and the guest instruction rate the
+     * cliff model is expressed in.  Always reported, never gating unless
+     * CST_RT_GATE armed it. */
+    g_rt_gate.report(report);
+
     g_mutex_lock(&data_lock);
     append_stats_summary(report, "Cumulative", stats_snapshot());
     if (g_simpoints.is_active()) {
@@ -8085,6 +8449,8 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     if (getenv("CST_MEMSTATS")) {
         std::set_new_handler(memstats_new_failure_handler);
     }
+
+    g_rt_gate.install();
 
     /* Resolve ISA from target_name via the per-ISA prefix tables. */
     trace_isa = TRACE_ISA_UNKNOWN;

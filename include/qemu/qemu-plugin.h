@@ -1719,6 +1719,24 @@ QEMU_PLUGIN_API
 void qemu_plugin_vclock_resume(void);
 
 /**
+ * qemu_plugin_vclock_ns() - read the guest virtual clock
+ *
+ * Returns QEMU_CLOCK_VIRTUAL in nanoseconds: the time the GUEST believes has
+ * elapsed, i.e. host wall-clock time minus every interval a
+ * qemu_plugin_vclock_pause() or qemu_plugin_spec_vtime_pause() freeze was in
+ * effect.  Ratioed against host wall time it yields the guest realtime factor,
+ * and ratioed against executed instructions it yields the guest's instruction
+ * rate per guest-second — the quantity that decides how much timer-interrupt
+ * work the guest is charged per unit of forward progress, and hence the only
+ * load-independent way to tell a slow capture from a wedged one.  Returns 0 in
+ * user-mode emulation, which has no guest clock.
+ *
+ * Read-only and side-effect free; callable from any plugin callback.
+ */
+QEMU_PLUGIN_API
+int64_t qemu_plugin_vclock_ns(void);
+
+/**
  * qemu_plugin_in_async_int() - is the vCPU inside an async-interrupt handler?
  *
  * Returns true while the executing vCPU is handling an asynchronous interrupt

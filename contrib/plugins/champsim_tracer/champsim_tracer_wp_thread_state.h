@@ -2,11 +2,11 @@
  * Wrong-Path Tracing Plugin — per-thread wrong-path simulator state.
  *
  * Each QEMU vCPU thread carries one WPThreadState.  Set during
- * simulate_wrong_path_ext(): the in_progress flag gates plugin
- * callbacks (mem callback routes to mem_accesses, reg-snap callback
- * suppresses, vcpu_tb_exec early-outs), and saved_* hold a snapshot
- * of the per-vCPU scoreboard fields the WP simulator clobbers and
- * later restores.
+ * simulate_wrong_path_ext(): the g_wp_in_progress flag (a separate POD
+ * __thread bool, below) gates plugin callbacks (mem callback routes to
+ * mem_accesses, reg-snap callback suppresses, vcpu_tb_exec early-outs),
+ * and saved_* hold a snapshot of the per-vCPU scoreboard fields the WP
+ * simulator clobbers and later restores.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -19,14 +19,9 @@
 #include "champsim_tracer.h"
 
 struct WPThreadState {
-    /* Set by simulate_wrong_path_ext while a WP simulation is running.
-     * Read by the mem/insn-snap callbacks and the tb-exec orchestrator
-     * to gate CP-only logic. */
-    bool in_progress = false;
-
     /* Memops captured during the in-flight WP simulation.  Filled by
-     * MemAccessRecorder::record while in_progress is true; cleared by
-     * simulate_wrong_path_ext at end-of-sim. */
+     * MemAccessRecorder::record while g_wp_in_progress is true; cleared
+     * by simulate_wrong_path_ext at end-of-sim. */
     std::vector<WPMemAccess> mem_accesses;
 
     /* WP-side per-insn memop cap (MemAccessRecorder::record).
@@ -58,6 +53,25 @@ struct WPThreadState {
 extern thread_local WPThreadState g_wp_state CST_TLS_HOT;
 
 /*
+ * The WP-simulation-in-progress flag, split OUT of WPThreadState and out
+ * of C++ `thread_local` deliberately.  Set by simulate_wrong_path_ext
+ * while a WP simulation is running; read by the mem/insn-snap callbacks
+ * and the tb-exec orchestrator to gate CP-only logic — i.e. read on
+ * EVERY per-TB / per-insn / per-memop callback for the whole run.
+ *
+ * WPThreadState has a std::vector member, so the `thread_local` object
+ * carries a dynamic-init guard: every cross-TU access calls the TLS
+ * wrapper and re-checks the guard (measured at ~3.3% of host cycles on
+ * the canonical system cell, top-five whole-run symbol).  A GNU
+ * `__thread` POD demands constant initialization, so it compiles to one
+ * %fs-relative load with no wrapper and no guard — the same access the
+ * hot paths were already paying for the initial-exec model, minus the
+ * call.  The two flags stay in lockstep by construction: this bool IS
+ * the flag; the struct no longer carries one.
+ */
+extern __thread bool g_wp_in_progress CST_TLS_HOT;
+
+/*
  * Capture sink (rearchitecture M3): the per-TB async-exclusion decision,
  * latched ONCE at the top of the CP step in vcpu_tb_exec from
  * qemu_plugin_in_async_int() and cleared at both async_int_reset sites.
@@ -67,7 +81,7 @@ extern thread_local WPThreadState g_wp_state CST_TLS_HOT;
  * instead of each making a cross-DSO call — one exclusion decision, one
  * owner, identical semantics.  true = mute (drop async-handler capture).
  */
-extern thread_local bool g_capture_mute CST_TLS_HOT;
+extern __thread bool g_capture_mute CST_TLS_HOT;
 
 /*
  * Architectural self-loop accounting for the TB that just finished, latched

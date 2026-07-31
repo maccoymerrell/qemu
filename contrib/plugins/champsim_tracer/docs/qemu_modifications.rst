@@ -158,6 +158,17 @@ Plugin API additions
    * ``qemu_plugin_vclock_pause`` / ``qemu_plugin_vclock_resume`` —
      nestable guest-virtual-clock freeze for plugin instrumentation
      windows (see *Guest-time transparency*, below).
+   * ``qemu_plugin_vclock_ns`` — the read side of that clock, in
+     nanoseconds: host wall time minus every interval a freeze was in
+     effect, i.e. the time the *guest* believes has elapsed.  Ratioed
+     against host wall time it is the guest realtime factor; ratioed
+     against retired instructions it is the guest's instruction rate
+     per guest-second, which is what decides how much periodic-tick
+     work the guest is charged per unit of forward progress.  Returns
+     0 in user mode (no guest clock) and under ``-icount`` (icount owns
+     the virtual clock, and reading it from a vCPU callback with
+     ``cpu->running && !can_do_io`` aborts with *Bad icount read*).
+     Read-only, no BQL.
    * ``qemu_plugin_icount_enabled`` — whether ``-icount`` drives the
      virtual clock; the plugin warns at install that wrong-path
      instructions advance instruction-count time (the vclock freeze
@@ -456,6 +467,17 @@ tick/scheduler storm.
    decoding).  Composes with the wrong-path excursion freeze below:
    ticks re-enable only when both say so.  No-op in user mode, and
    never re-enables a clock that ``vm_stop`` owns.
+
+``qemu_plugin_vclock_ns`` (``plugins/api.c``)
+
+   Read side of the freeze above, so a plugin that excludes its own
+   cost from guest time can also observe what it left the guest
+   believing.  The two ratios it supports are the guest realtime
+   factor (guest ns per host ns) and the guest instruction rate per
+   guest-second; the second is the denominator of the tick-tax
+   relation ``HZ * N_tick / R_g``, whose value at 1 is the
+   tick/scheduler storm described above.  The ChampSim Tracer's
+   guest-progress detector is built on it.
 
 ``CPUState::plugin_spec_vtime_paused`` +
 ``cpu_plugin_spec_vtime_pause`` / ``_resume``

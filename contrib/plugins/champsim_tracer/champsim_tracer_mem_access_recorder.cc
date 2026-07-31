@@ -137,22 +137,17 @@ void MemAccessRecorder::record(unsigned int cpu_index,
      * constraint (CST_FID_SLOT_COUNT slots/insn) and a loop bound for
      * spec-mode REP iterations that don't advance PC.
      *
-     * Cache g_wp_state once: the dlopen'd .so puts the thread_local in
-     * the general-dynamic TLS model, so each access otherwise goes
-     * through __tls_get_addr (~3% of runtime, mostly this per-memop
-     * callback). */
-    WPThreadState &wp = g_wp_state;
-    if (wp.in_progress) {
-        if (insn_pc == wp.cur_insn_pc) {
-            wp.cur_insn_count++;
-        } else {
-            wp.cur_insn_pc = insn_pc;
-            wp.cur_insn_count = 1;
-        }
-        if (wp.cur_insn_count > CST_FID_SLOT_COUNT) {
-            return;
-        }
-    } else if (!g_trace_segments.is_active_atomic() || g_capture_mute) {
+     * EARLY-OUT ORDER MATTERS: this callback fires for every guest
+     * memop of the whole run, and outside a segment it must cost as
+     * close to nothing as possible.  g_wp_in_progress and
+     * g_capture_mute are POD __thread flags (one %fs load each; see
+     * champsim_tracer_wp_thread_state.h), and is_active is one atomic
+     * load — so the boot-long path is three loads and a return,
+     * touching neither g_wp_state (whose thread_local wrapper +
+     * dynamic-init guard measured ~3% of host cycles when it sat
+     * first in this function) nor any other guarded TLS object. */
+    bool wp_mode = g_wp_in_progress;
+    if (!wp_mode && (!g_trace_segments.is_active_atomic() || g_capture_mute)) {
         /* CP path.  Drop memops issued inside an asynchronous interrupt
          * (timer / device IRQ / scheduler tick): the async excursion is
          * excluded from the trace entirely — vcpu_tb_exec bails at the
@@ -165,6 +160,18 @@ void MemAccessRecorder::record(unsigned int cpu_index,
          * faults stay traced (qemu_plugin_in_async_int() is false for
          * them), so their memops are recorded and attributed normally. */
         return;
+    }
+    if (wp_mode) {
+        WPThreadState &wp = g_wp_state;
+        if (insn_pc == wp.cur_insn_pc) {
+            wp.cur_insn_count++;
+        } else {
+            wp.cur_insn_pc = insn_pc;
+            wp.cur_insn_count = 1;
+        }
+        if (wp.cur_insn_count > CST_FID_SLOT_COUNT) {
+            return;
+        }
     }
 
     WPMemAccess acc = {
@@ -186,7 +193,7 @@ void MemAccessRecorder::record(unsigned int cpu_index,
 
     /* CP path uses g_features.mem_data; WP path uses g_features.wp_mem_data
      * (already gated above to true if we reach here). */
-    bool capture_data = wp.in_progress
+    bool capture_data = wp_mode
         ? g_features.wp_mem_data : g_features.mem_data;
     if (capture_data) {
         capture_mem_value(info, vaddr, &acc);
@@ -201,7 +208,7 @@ void MemAccessRecorder::record(unsigned int cpu_index,
      * served a placeholder) has no real translation, so its ppage is
      * likewise omitted — the FID simply does not appear for that memop and
      * the delta stream keeps the last real translation as the baseline. */
-    if (g_features.physaddr && !(wp.in_progress && mem_faulted)) {
+    if (g_features.physaddr && !(wp_mode && mem_faulted)) {
         struct qemu_plugin_hwaddr *h = qemu_plugin_get_hwaddr(info, vaddr);
         if (h && !qemu_plugin_hwaddr_is_io(h)) {
             uint64_t pa = qemu_plugin_hwaddr_phys_addr(h);
@@ -210,9 +217,9 @@ void MemAccessRecorder::record(unsigned int cpu_index,
         }
     }
 
-    if (wp.in_progress) {
+    if (wp_mode) {
         acc.faulted = mem_faulted;
-        wp.mem_accesses.push_back(acc);
+        g_wp_state.mem_accesses.push_back(acc);
     } else {
         cp_mem(cpu_index).push_back(acc);
         Stats &s = thread_stats_get();
@@ -227,9 +234,15 @@ void MemAccessRecorder::record_synthetic_load(unsigned int cpu_index,
                                               uint64_t vaddr,
                                               uint64_t insn_pc)
 {
-    /* TLS-cache rationale: see record() above. */
-    WPThreadState &wp = g_wp_state;
-    if (wp.in_progress) {
+    /* Early-out order rationale: see record() above. */
+    bool wp_mode = g_wp_in_progress;
+    if (!wp_mode && (!g_trace_segments.is_active_atomic() || g_capture_mute)) {
+        /* Drop synthetic-EA loads issued inside an async interrupt — see
+         * the rationale in record(). */
+        return;
+    }
+    if (wp_mode) {
+        WPThreadState &wp = g_wp_state;
         if (insn_pc == wp.cur_insn_pc) {
             wp.cur_insn_count++;
         } else {
@@ -239,10 +252,6 @@ void MemAccessRecorder::record_synthetic_load(unsigned int cpu_index,
         if (wp.cur_insn_count > CST_FID_SLOT_COUNT) {
             return;
         }
-    } else if (!g_trace_segments.is_active_atomic() || g_capture_mute) {
-        /* Drop synthetic-EA loads issued inside an async interrupt — see
-         * the rationale in record(). */
-        return;
     }
 
     WPMemAccess acc = {
@@ -253,8 +262,8 @@ void MemAccessRecorder::record_synthetic_load(unsigned int cpu_index,
     };
     cst_wide_zero(&acc.data);
 
-    if (wp.in_progress) {
-        wp.mem_accesses.push_back(acc);
+    if (wp_mode) {
+        g_wp_state.mem_accesses.push_back(acc);
     } else {
         cp_mem(cpu_index).push_back(acc);
         Stats &s = thread_stats_get();

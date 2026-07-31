@@ -836,7 +836,32 @@ SYS_SCRATCH_BYTES = 16 * 1024 * 1024
 # Host CPU to pin the boot to (quiet-host isolation only; the canon slice is
 # CPU-independent).  Override with CST_SYS_CPU.
 SYS_CPU = os.environ.get("CST_SYS_CPU", "100")
-SYS_TIMEOUT = 3600
+# The plugin's own #61 detector is the primary wedge gate for system cells:
+# it watches ARCHITECTURAL counts (instructions retired by the guest vs the
+# traced process's user-space instruction clock), so it reaches a verdict in
+# tens of seconds and reaches the SAME verdict on an idle machine and a
+# saturated one.  CST_RT_GATE arms it; it exits CST_RT_GATE_EXIT and says why.
+# The wall-clock timeout stays only as a backstop for failure modes the
+# detector cannot see (a QEMU hang with no guest execution at all), which is
+# why it can now be minutes instead of an hour: nothing healthy takes 30 s.
+SYS_RT_GATE = os.environ.get("CST_SYS_RT_GATE", "0")
+SYS_RT_GATE_EXIT = 88
+SYS_TIMEOUT = int(os.environ.get("CST_SYS_TIMEOUT", "900"))
+
+# Post-hoc escaped-wedge check.  A wedge that finishes anyway writes a trace
+# that passes every content check while carrying tens of times the healthy
+# architectural instruction count, so the ratio of architectural instructions
+# to the workload's own user-space instructions is recorded per cell at
+# capture and re-checked at check time.  Both terms come off the wire, so the
+# check is load-invariant.
+#
+# The tolerance is set from a measured healthy population, not from taste: over
+# 46 healthy canonical cells run with the pinned CPU's SMT sibling saturated,
+# the ratio ranged 250-498 around a quiet-cell mean near 290 -- so a healthy
+# but heavily contended capture reaches 2x the quiet baseline on its own.  The
+# documented escaped wedge carries ~53x.  5x sits an order of magnitude clear
+# of both edges.
+SYS_ARCH_PER_USER_TOL = float(os.environ.get("CST_SYS_ARCH_TOL", "5.0"))
 SYS_VMEM_KB = 25165824                            # ulimit -v (24 GiB)
 SYS_N_DET = 2                                     # GREEN-twice determinism gate
 
@@ -1076,6 +1101,40 @@ def sys_cpu_preflight() -> list[str]:
             + " (or set CST_SYS_CPU_NOCHECK=1 to proceed anyway)."]
 
 
+def sys_health(out_base: Path) -> dict | None:
+    """Pull the plugin's end-of-run accounting out of <base>.stats.log.
+
+    Returns None when the numbers are not there.  Callers must treat that as a
+    FAILURE, never as a pass: a check that cannot find its subject has not
+    checked anything.
+    """
+    stats = Path(f"{out_base}.stats.log")
+    if not stats.is_file():
+        return None
+    try:
+        text = stats.read_text(errors="replace")
+    except OSError:
+        return None
+    m = re.search(r"host_icount=(\d+)\s+traced_icount=(\d+)\s+"
+                  r"rep_fanout=(\d+)\s+trace_arch_insns=(\d+)", text)
+    if not m:
+        return None
+    traced = int(m.group(2))
+    arch = int(m.group(4))
+    if traced <= 0:
+        return None
+    out = {"host_icount": int(m.group(1)), "traced_icount": traced,
+           "rep_fanout": int(m.group(3)), "trace_arch_insns": arch,
+           "arch_per_user": arch / traced}
+    r = re.search(r"guest_realtime factor=([\d.]+).*?ticktax=([\d.]+)"
+                  r"\s+worst_user_stall=(\d+)\s+stall_detector=(\S+)", text)
+    if r:
+        out.update({"factor": float(r.group(1)), "ticktax": float(r.group(2)),
+                    "worst_user_stall": int(r.group(3)),
+                    "stall_detector": r.group(4)})
+    return out
+
+
 def sys_trace_once(build: Path, kernel: Path, initrd: Path, out_dir: Path,
                    label: str, opts: str = SYS_PLUGIN_OPTS,
                    qemu_args: list[str] | None = None) -> Path | None:
@@ -1098,13 +1157,23 @@ def sys_trace_once(build: Path, kernel: Path, initrd: Path, out_dir: Path,
         "-plugin", f"{plugin},outfile={out_base},{opts}",
     ]
     log = out_dir / f"{label}.run.log"
+    env = dict(os.environ)
+    env["CST_RT_GATE"] = SYS_RT_GATE
     with open(log, "w") as f:
         try:
             rc = subprocess.call(cmd, stdout=f, stderr=subprocess.STDOUT,
-                                 timeout=SYS_TIMEOUT, preexec_fn=_set_vmem)
+                                 timeout=SYS_TIMEOUT, preexec_fn=_set_vmem,
+                                 env=env)
         except subprocess.TimeoutExpired:
             print(f"  sys trace {label}: TIMEOUT after {SYS_TIMEOUT}s")
             return None
+    if rc == SYS_RT_GATE_EXIT:
+        print(f"  sys trace {label}: WEDGE -- the guest stopped making "
+              f"forward progress and the plugin's #61 detector abandoned the "
+              f"capture (see {log}).  This is a real defect report, not a "
+              f"flaky timeout: re-running it on a quieter CPU hides it, it "
+              f"does not fix it.")
+        return None
     cst = Path(f"{out_base}.cst")
     if rc != 0 or not cst.is_file():
         print(f"  sys trace {label}: FAIL rc={rc} (see {log})")
@@ -1174,12 +1243,22 @@ def sys_capture(build: Path, root: Path, waivers: dict) -> int:
             name = c["name"]
             opts = c.get("opts", SYS_PLUGIN_OPTS)
             hs = []
+            apu = []
             for i in range(SYS_N_DET):
                 cst = sys_trace_once(build, kernel, initrd, root / name,
                                      f"{name}_{i}", opts,
                                      c.get("qemu_args"))
                 hs.append(sha(canon_user_slice(build, cst).encode())
                           if cst else None)
+                if cst is not None:
+                    h = sys_health(root / name / f"{name}_{i}")
+                    if h is None:
+                        hs[-1] = None      # unmeasurable == not captured
+                        print(f"  canon:{name}: run {i} produced no plugin "
+                              f"accounting -- cannot record the "
+                              f"escaped-wedge baseline")
+                    else:
+                        apu.append(h["arch_per_user"])
             if any(h is None for h in hs):
                 manifest["excluded"][f"canon:{name}"] = "trace not produced"
                 print(f"  EXCLUDE canon:{name}: trace missing")
@@ -1191,8 +1270,13 @@ def sys_capture(build: Path, root: Path, waivers: dict) -> int:
                 print(f"  EXCLUDE canon:{name}: NONDETERMINISTIC user-slice")
                 bad += 1
                 continue
-            manifest["canon_cells"][name] = {"canon": hs[0]}
-            print(f"  canon:{name}: deterministic CP-user-slice")
+            manifest["canon_cells"][name] = {
+                "canon": hs[0],
+                "arch_per_user": sum(apu) / len(apu),
+                "arch_per_user_runs": apu,
+            }
+            print(f"  canon:{name}: deterministic CP-user-slice, "
+                  f"arch/user={sum(apu) / len(apu):.1f}")
 
     SYS_MANIFEST.write_text(json.dumps(manifest, indent=2, sort_keys=True))
     print(f"\ncaptured {len(manifest['fixture_decode'])} decode + "
@@ -1266,6 +1350,57 @@ def sys_check(build: Path, root: Path, waivers: dict) -> int:
                 if got != want["canon"]:
                     fails.append(f"canon:{name}: CP-user-slice mismatch "
                                  f"(plugin trace-generation changed)")
+
+                # Escaped-wedge check.  A capture that wedged and then
+                # finished anyway still reproduces the user slice -- that is
+                # exactly why the byte nets miss it -- but it drags tens of
+                # times the healthy architectural instruction count along
+                # with it.  Both terms are wire counts, so this verdict does
+                # not depend on how busy the machine was.
+                base_apu = want.get("arch_per_user")
+                h = sys_health(root / name / f"{name}_chk")
+                if h is None:
+                    fails.append(
+                        f"canon:{name}: no plugin accounting in "
+                        f"{name}_chk.stats.log -- the escaped-wedge check "
+                        f"could not run, which is a failure, not a pass")
+                elif base_apu is None:
+                    # A manifest captured before this check existed has no
+                    # baseline.  That is a missing subject, so it fails --
+                    # unless an operator explicitly waives it to run the
+                    # byte-identity half of the net against a pre-existing
+                    # reference, in which case it says so at the top of its
+                    # voice and the net's coverage is on the record.
+                    if os.environ.get("CST_SYS_ARCH_WAIVE"):
+                        print(f"  !! canon:{name}: ESCAPED-WEDGE CHECK "
+                              f"WAIVED -- the reference manifest predates the "
+                              f"arch/user baseline, so this run verifies byte "
+                              f"identity ONLY and would not notice a capture "
+                              f"that wedged and finished anyway "
+                              f"(observed here: {h['arch_per_user']:.0f} "
+                              f"arch insns per workload insn)")
+                    else:
+                        fails.append(
+                            f"canon:{name}: manifest predates the "
+                            f"escaped-wedge baseline -- re-capture so the "
+                            f"check has a subject, or set CST_SYS_ARCH_WAIVE "
+                            f"to run byte identity only")
+                elif h["arch_per_user"] > base_apu * SYS_ARCH_PER_USER_TOL:
+                    fails.append(
+                        f"canon:{name}: ESCAPED WEDGE -- "
+                        f"{h['arch_per_user']:.0f} architectural insns per "
+                        f"workload insn against a baseline of "
+                        f"{base_apu:.0f} (tolerance x"
+                        f"{SYS_ARCH_PER_USER_TOL:g}).  The trace finished and "
+                        f"matches byte-for-byte on the user slice, and is "
+                        f"still the product of a guest that spent the window "
+                        f"in a tick/scheduler storm.")
+                elif h.get("stall_detector") == "INERT":
+                    fails.append(
+                        f"canon:{name}: the #61 progress detector reported "
+                        f"itself INERT (the user-instruction clock never "
+                        f"advanced inside the segment), so nothing watched "
+                        f"this capture for a wedge")
 
     # A net with an empty guard is not a green net, it is an unverified one.
     # The canon-retrace cell is the ONLY guard on the plugin's system-mode

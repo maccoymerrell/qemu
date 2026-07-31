@@ -19,6 +19,7 @@
 #include <cstring>
 #include <map>
 #include <set>
+#include <unordered_map>
 #include <utility>
 
 #include "champsim_tracer_path_builder.h"
@@ -100,6 +101,198 @@ static bool pb_async_diag()
 {
     static const bool v = getenv("CST_ASYNC_DIAG") != nullptr;
     return v;
+}
+
+/* Measurement-arm kill switch for this arc's behavioural arrows (the
+ * emission-time async-level re-derivation, the abandon-release re-stamp and
+ * the task-identity kernel ownership rule), mirroring CST_NO_FAULT_MERGE's
+ * pattern: the condition census runs on BOTH arms, only the behaviour is
+ * gated, so a paired wave measures the same condition under the old and the
+ * new rendering. */
+static bool depth3_off()
+{
+    static const bool v = getenv("CST_DEPTH3_OFF") != nullptr;
+    return v;
+}
+/* Per-defect switches under the master.  The kexc verdict decides how much
+ * kernel code is captured and therefore how often the two rendering
+ * conditions can be observed at all, so a wave that varies both at once
+ * cannot attribute a change to either; these let one be held fixed. */
+static bool depth3_render_off()
+{
+    static const bool v = getenv("CST_DEPTH3_NO_RENDER") != nullptr;
+    return v || depth3_off();
+}
+static bool depth3_kexc_off()
+{
+    static const bool v = getenv("CST_DEPTH3_NO_KEXC") != nullptr;
+    return v || depth3_off();
+}
+static bool depth3_gen_off()
+{
+    static const bool v = getenv("CST_DEPTH3_NO_GEN") != nullptr;
+    return v || depth3_off();
+}
+
+/*
+ * ---- Per-vCPU seal-pipeline sidecars ----
+ *
+ * PathBuilder is `static thread_local` and the plugin's static-TLS block is
+ * at the meson tripwire's ceiling (see contrib/plugins/meson.build), so
+ * per-vCPU state new to this arc lives in process-wide arrays indexed by the
+ * step's cpu_index — written and read only inside the CP step under
+ * exec_lock, which orders them exactly like the TLS members they sit beside.
+ */
+static constexpr unsigned PB_MAX_VCPUS = 1024;
+static inline unsigned pb_vcpu_slot(unsigned cpu_index)
+{
+    return cpu_index < PB_MAX_VCPUS ? cpu_index : PB_MAX_VCPUS - 1;
+}
+/* The captured-async component (0/1) INCLUDED in prev_depth_ / walk_depth_.
+ * The frozen pipeline stamps are sync+async sums; re-deriving the async
+ * component at an emission (the merge formula, the abandon-release re-stamp)
+ * needs the decomposition to ride beside the sum. */
+static uint8_t g_pb_prev_async[PB_MAX_VCPUS];
+static uint8_t g_pb_walk_async[PB_MAX_VCPUS];
+/* Whether the LAST TB this vCPU stepped through the foreign-ASID gate was a
+ * kexc-KEPT kernel TB — the kept-span misattribution witness latch (see
+ * kexc_kept_span_foreign_user in the stats). */
+static uint8_t g_pb_last_kernel_kept[PB_MAX_VCPUS];
+/* Whether the kernel span this vCPU is currently in contains at least one TB
+ * the task-identity rule RECOVERED (the entry edge refused it).  Read at the
+ * next user TB: a recovered span must return to an OWNED user TB, because a
+ * kernel excursion ends by returning to the user context that owns it.  That
+ * return is the wire-level corroboration that the recovered blocks are the
+ * pinned process's own kernel work and not a foreign task's. */
+static uint8_t g_pb_last_kernel_recovered[PB_MAX_VCPUS];
+
+/*
+ * ---- Owned-thread identity map (kexc task-identity ownership) ----
+ *
+ * thread-pointer value -> the live asid recorded at that thread's most
+ * recent OWNED user TB.  An entry is proof "this (tp, asid) pair named a
+ * thread of the pinned process" — the seed the kernel keep rule checks the
+ * executing task against.  Process-wide (a pinned thread migrating across
+ * vCPUs stays owned) and guarded by exec_lock like every kexc arrow;
+ * immortal, per the plugin-lifetime rule for process-wide aggregates.
+ * Lazily cleared at each segment generation; invalidated wholesale on
+ * rollover-scale evidence (kexc_owned_tp_invalidate).
+ */
+struct KexcTpMap {
+    std::unordered_map<uint64_t, uint64_t> map;
+    uint32_t seg_gen = UINT32_MAX;
+    /* Sticky for the segment: at least one owned user TB has produced a
+     * usable identity, so the rule APPLIES on this target/guest.  It has to
+     * be sticky rather than "map is non-empty", because an invalidation
+     * empties the map and must not silently hand the decision back to the
+     * entry-edge rule the identity rule exists to replace: after a rollover
+     * the edge state is exactly as suspect as the values were.  Armed with
+     * an empty map refuses every kernel TB until the owner's next user TB
+     * re-seeds it — the conservative direction. */
+    bool armed = false;
+};
+static KexcTpMap *g_kexc_tp;
+
+static void kexc_tp_fresh()
+{
+    if (!g_kexc_tp) {
+        g_kexc_tp = new KexcTpMap();
+    }
+    uint32_t gen = g_segment_generation.load(std::memory_order_relaxed);
+    if (g_kexc_tp->seg_gen != gen) {
+        g_kexc_tp->map.clear();
+        g_kexc_tp->armed = false;
+        g_kexc_tp->seg_gen = gen;
+    }
+}
+
+/* Does the task-identity rule apply on this guest at all?  False on a
+ * target that does not track the thread pointer at kernel privilege, and on
+ * one whose thread pointer is architecturally absent (a MIPS model without
+ * Config3.ULRI reads CP0 UserLocal as 0 for every task, including the
+ * pinned process's own user TBs) — there the entry-edge rule stands
+ * unchanged. */
+static bool kexc_tp_armed()
+{
+    kexc_tp_fresh();
+    return g_kexc_tp->armed;
+}
+
+/* A zero thread pointer is the architectural "no identity" value, not an
+ * identity: MIPS CP0 UserLocal reads 0 on a model without Config3.ULRI (and
+ * on every task of a kernel that does not write it), aarch64 TPIDR_EL0 and
+ * x86 FS.base are 0 for a task with no TLS.  Admitting it would make every
+ * such task indistinguishable — on a non-ULRI MIPS guest, ONE owned user TB
+ * would hand the whole kernel to every process on the machine.  Treat it as
+ * unknown on both sides: never seeded, never matched, so the target degrades
+ * to the entry-edge rule exactly as a non-tracking target does. */
+static inline bool kexc_tp_usable(uint64_t tp)
+{
+    return tp != 0;
+}
+
+static void kexc_tp_record(uint64_t tp, uint64_t live_asid)
+{
+    if (!kexc_tp_usable(tp)) {
+        g_stats.kexc_tp_null_samples++;
+        return;
+    }
+    kexc_tp_fresh();
+    auto it = g_kexc_tp->map.find(tp);
+    if (it == g_kexc_tp->map.end()) {
+        g_kexc_tp->map.emplace(tp, live_asid);
+        g_stats.kexc_tp_map_inserts++;
+        g_kexc_tp->armed = true;
+    } else {
+        it->second = live_asid;
+    }
+}
+
+static bool kexc_tp_owned(uint64_t tp, uint64_t live_asid)
+{
+    kexc_tp_fresh();
+    auto it = g_kexc_tp->map.find(tp);
+    return it != g_kexc_tp->map.end() && it->second == live_asid;
+}
+
+/* Is @tp a thread the map has EVER seen owned, whatever address space is
+ * live now?  Partitions the excluded population: a known thread under a
+ * different live ASID is the context-switch window (the kernel has already
+ * installed the next task's page tables but not yet switched the register
+ * state), while an unknown thread is unambiguously another task's work. */
+static bool kexc_tp_known_thread(uint64_t tp)
+{
+    kexc_tp_fresh();
+    return g_kexc_tp->map.find(tp) != g_kexc_tp->map.end();
+}
+
+std::atomic<uint32_t> g_asid_identity_gen{1};
+
+/* One observation that the raw ASID-value namespace recycled.  Bumping the
+ * generation is what makes every value stamped before it stop being an
+ * identity; the owned-thread map is keyed on a raw value too, so it goes
+ * with it.  Caller holds exec_lock (the ASID-write hook and the dwell
+ * re-pin both run inside it). */
+void asid_identity_gen_bump(const char *why)
+{
+    uint32_t g = g_asid_identity_gen.fetch_add(1, std::memory_order_relaxed);
+    g_stats.asid_identity_gen_bumps++;
+    if (kexc_diag()) {
+        fprintf(stderr, "[kexcdiag] ASID-GEN bump %u -> %u (%s)\n",
+                g, g + 1, why);
+    }
+    kexc_owned_tp_invalidate(why);
+}
+
+void kexc_owned_tp_invalidate(const char *why)
+{
+    if (g_kexc_tp && !g_kexc_tp->map.empty()) {
+        g_kexc_tp->map.clear();
+        g_stats.kexc_tp_map_invalidations++;
+        if (kexc_diag()) {
+            fprintf(stderr, "[kexcdiag] TP-MAP invalidate (%s)\n", why);
+        }
+    }
 }
 
 /*
@@ -225,11 +418,12 @@ enum : uint8_t {
     GAP_R_KEXC_NO_USER,     /* kexc decline: no user context yet */
     GAP_R_KEXC_NOT_OWNED,   /* kexc decline: entry edge not owned */
     GAP_R_KEXC_CUT,         /* kexc decline: committed-switch cut */
+    GAP_R_KEXC_TP,          /* kexc decline: executing task not owned */
     GAP_R_N
 };
 static const char *const gap_reason_name[GAP_R_N] = {
     "async-mute", "mmode", "legacy-asid", "user-unowned",
-    "kexc-no-user", "kexc-not-owned", "kexc-cut",
+    "kexc-no-user", "kexc-not-owned", "kexc-cut", "kexc-tp-refused",
 };
 struct GapDropRec {
     uint64_t pc, live_asid, exc_entry;
@@ -682,6 +876,13 @@ void PathBuilder::on_segment_open()
     prev_in_sync_ = false;
     walk_in_sync_ = false;
     seal_pc_override_ = 0;
+    /* Per-vCPU sidecars follow their TLS siblings across the boundary.  The
+     * owned-thread identity map clears itself lazily on the generation key
+     * (kexc_tp_fresh). */
+    g_pb_prev_async[pb_vcpu_slot(cpu_index_)] = 0;
+    g_pb_walk_async[pb_vcpu_slot(cpu_index_)] = 0;
+    g_pb_last_kernel_kept[pb_vcpu_slot(cpu_index_)] = 0;
+    g_pb_last_kernel_recovered[pb_vcpu_slot(cpu_index_)] = 0;
     /* Kernel-excursion ownership starts the segment unowned: the pin was
      * just captured at user privilege, so the first user TB re-seeds
      * last_user_asid_; kernel TBs before it have no owner and drop
@@ -895,6 +1096,7 @@ void PathBuilder::kexc_async_snapshot()
     kexc_snap_.user_owned = kexc_user_owned_;
     kexc_snap_.last_user_asid = kexc_last_user_asid_;
     kexc_snap_.exc_entry = kexc_exc_entry_;
+    kexc_snap_.exc_entry_gen = kexc_exc_entry_gen_;
     kexc_snap_.entry_owned = kexc_entry_owned_;
     kexc_snap_.have_overlay = kexc_have_overlay_;
     kexc_snap_.overlay = kexc_overlay_;
@@ -913,6 +1115,7 @@ void PathBuilder::kexc_async_restore()
     kexc_user_owned_ = kexc_snap_.user_owned;
     kexc_last_user_asid_ = kexc_snap_.last_user_asid;
     kexc_exc_entry_ = kexc_snap_.exc_entry;
+    kexc_exc_entry_gen_ = kexc_snap_.exc_entry_gen;
     kexc_entry_owned_ = kexc_snap_.entry_owned;
     kexc_have_overlay_ = kexc_snap_.have_overlay;
     kexc_overlay_ = kexc_snap_.overlay;
@@ -930,6 +1133,18 @@ void PathBuilder::kexc_async_restore()
                 kexc_exc_entry_, (int)kexc_entry_owned_,
                 (int)kexc_in_kernel_, (int)kexc_cut_);
     }
+}
+
+/* Are this excursion's STORED raw ASID values (@kexc_exc_entry_, and the
+ * overlay derived inside the same excursion) still in the namespace
+ * generation they were recorded in?  Every comparison of a stored value
+ * against a live one goes through this: a narrow-ASID space recycles, and
+ * once it has, equal bits are a coincidence, not an identity.  Always true
+ * on a wide-register target, whose generation never moves. */
+bool PathBuilder::kexc_values_current() const
+{
+    return kexc_exc_entry_gen_ ==
+           g_asid_identity_gen.load(std::memory_order_relaxed);
 }
 
 /* One ASID_WRITE path event (@new_asid = the committed NEW value).
@@ -961,6 +1176,11 @@ void PathBuilder::kexc_apply_asid_write(uint64_t new_asid)
             if (kexc_nvals_ >= KEXC_STORM_THRESHOLD) {
                 kexc_stormed_ = true;
                 g_stats.kexc_write_storm++;
+                /* Rollover-scale churn inside one excursion: any recorded
+                 * (tp, asid) ownership pair may now name a foreign process.
+                 * Conservative wholesale invalidation — the owner's next
+                 * user TB re-seeds. */
+                kexc_owned_tp_invalidate("asid-write storm");
                 /* One stderr warning per segment (any thread). */
                 static std::atomic<uint32_t> warned_gen{UINT32_MAX};
                 uint32_t gen = g_segment_generation.load(
@@ -979,6 +1199,49 @@ void PathBuilder::kexc_apply_asid_write(uint64_t new_asid)
         }
     }
 
+    /* Raw-value equality is identity only within one namespace generation.
+     * Once the ASID space is known to have recycled, the entry VALUE coming
+     * back proves nothing — it may now be a foreign process's — so the
+     * restore arrow stands down and the write is classified as any other
+     * foreign value would be (overlay, then cut).  This is the narrow-ASID
+     * rollover collision: without the guard the arrow retires the cut and
+     * hands the excursion's remaining kernel work to the wrong process. */
+    if (!kexc_values_current()) {
+        /* The space recycled while this excursion was open.  Census first,
+         * on BOTH arms: a write of the excursion's own stored entry VALUE
+         * in a later namespace generation is the narrow-ASID collision
+         * itself — the OS handed those bits to somebody else and the
+         * unguarded arrow would read them as "our address space is back",
+         * retire the standing cut and hand the rest of the excursion to
+         * whoever now holds the value. */
+        g_stats.kexc_stale_gen_writes++;
+        const bool collision = new_asid == kexc_exc_entry_;
+        if (collision) {
+            g_stats.kexc_entry_value_collisions++;
+            if (kexc_diag()) {
+                fprintf(stderr, "[kexcdiag] ENTRY-VALUE-COLLISION new=0x%"
+                        PRIx64 " entry=0x%" PRIx64 " gen %u != %u cut=%d\n",
+                        new_asid, kexc_exc_entry_, kexc_exc_entry_gen_,
+                        g_asid_identity_gen.load(std::memory_order_relaxed),
+                        (int)kexc_cut_);
+            }
+        }
+        if (!depth3_gen_off()) {
+            /* No stored-value comparison may fire in a stale generation:
+             * the write is classified as a foreign value would be, which
+             * for an excursion already carrying an overlay means a cut. */
+            if (collision) {
+                g_stats.kexc_entry_restore_refused_stale_gen++;
+            }
+            if (!kexc_cut_) {
+                kexc_cut_ = true;
+                g_stats.kexc_cuts++;
+            }
+            return;
+        }
+        /* Measurement arm: fall through to the raw-value arrows below,
+         * which is the defect. */
+    }
     if (new_asid == kexc_exc_entry_) {
         /* Restore: the address space the excursion was ENTERED from is
          * loaded again, so the excursion's own kernel work resumes here —
@@ -1035,12 +1298,23 @@ void PathBuilder::kexc_apply_asid_write(uint64_t new_asid)
  * is not proof of identity (a rollover can hand the pinned value to a
  * foreign process), so the ownership seed carries the verified bit
  * rather than re-deriving it from ASID equality. */
-void PathBuilder::kexc_user_tb(uint64_t live_asid, bool owned)
+void PathBuilder::kexc_user_tb(uint64_t live_asid, bool owned,
+                               uint64_t tp, bool tp_valid)
 {
     kexc_reset();
     kexc_last_user_asid_ = live_asid;
     kexc_have_user_ = true;
     kexc_user_owned_ = owned;
+    /* Task-identity seed: an OWNED user TB proves the executing (thread
+     * pointer, live asid) pair names a thread of the pinned process — the
+     * ownership witness the kernel keep rule checks the executing task
+     * against.  A user-privilege sample is always trustworthy, but the pair
+     * is only USEFUL where the register also tracks the current task at
+     * kernel privilege; recording unconditionally is harmless (the kernel
+     * rule only consults the map when its own sample is valid there). */
+    if (owned && tp_valid) {
+        kexc_tp_record(tp, live_asid);
+    }
 }
 
 /* Every non-suspended priv!=0 TB: latch the entry edge once at the
@@ -1056,13 +1330,143 @@ bool PathBuilder::kexc_kernel_tb_keep(const StepIn &in)
         kexc_reset();
         kexc_in_kernel_ = true;
         kexc_exc_entry_ = kexc_last_user_asid_;
+        kexc_exc_entry_gen_ =
+            g_asid_identity_gen.load(std::memory_order_relaxed);
         kexc_entry_owned_ = kexc_user_owned_;
     }
     /* @ours: the excursion was entered from a verified-owned user TB, so
      * every block of it belongs to the pinned process unless a committed
      * switch has since moved the address space elsewhere. */
     bool ours = kexc_have_user_ && kexc_entry_owned_;
-    bool keep = ours && !kexc_cut_;
+    bool edge_keep = ours && !kexc_cut_;
+
+    /* Task-identity rule.  A kernel TB is the work of the task EXECUTING it,
+     * and on a target whose thread-pointer register tracks the current task
+     * at kernel privilege that identity is directly readable: keep iff the
+     * executing (tp, live asid) pair is a recorded owned thread.  This is
+     * what the entry-edge inference above approximates from vCPU history —
+     * and mis-latches whenever the pinned process re-enters the kernel with
+     * no intervening own user TB (a wake-up switch tail, a sync block
+     * resumed after foreign user code), refusing the whole excursion; it is
+     * also what the edge cannot revoke when the scheduler hands the kernel
+     * to a task it has no address-space evidence for (a borrowed-mm kthread,
+     * a same-mm switch).  in.cur_tp_strict is true at kernel privilege
+     * exactly on tracking targets, so non-tracking targets (RISC-V, whose
+     * trap entry repurposes tp) keep the edge rule byte-for-byte. */
+    /* The rule APPLIES iff the target tracks the thread pointer here and the
+     * pinned process has produced at least one usable identity this segment.
+     * Once it applies, a sample of 0 is a verdict, not an abstention: the
+     * pinned process demonstrably has a non-zero thread pointer (that is
+     * what armed the rule), so a task executing with none — a kernel thread
+     * — is not it. */
+    bool tp_known = in.cur_tp_strict && kexc_tp_armed();
+    if (in.cur_tp_strict && !kexc_tp_usable(in.cur_tp)) {
+        g_stats.kexc_tp_null_samples++;
+    }
+    bool tp_ok = tp_known && kexc_tp_usable(in.cur_tp) &&
+                 kexc_tp_owned(in.cur_tp, in.live_asid);
+
+    /*
+     * Live-root recovery — the non-async entry-edge foreign latch.
+     *
+     * The edge rule asks "was the last user TB this vCPU ran ours?", which
+     * is a proxy for "is this the pinned process's kernel work".  The proxy
+     * fails in one direction the guest produces constantly: the pinned
+     * process re-enters the kernel with no intervening user TB of its own —
+     * the scheduler picks it up inside a blocking syscall, a wake-up tail
+     * runs after another task's user code, a fault handler resumes after a
+     * preemption — and the edge, latched at the outermost transition, still
+     * names whoever ran last.  The whole excursion then declines, which is
+     * where the depth levels and the handler tails go missing.
+     *
+     * On a wide-register target the question has a direct answer: the live
+     * address-space root IS the process.  A kernel TB executing with the
+     * pinned root installed is the pinned process's kernel work, whatever
+     * the vCPU's user-TB history says, so the root re-latches the edge.
+     * This is not a heuristic on those targets — CR3 / TTBR0_EL1 / SATP is a
+     * page-table base, unique per live process — and it is deliberately
+     * inert on the narrow-ASID target, where the same equality is a
+     * coincidence of recycled bits (in.asid_is_identity).
+     */
+    const bool root_owned = in.asid_is_identity && in.pinned &&
+                            in.live_asid == in.pinned_asid;
+    if (in.asid_is_identity && !root_owned) {
+        /* The address space has left the pinned root.  Whatever the
+         * excursion does from here is outside the evidence the recovery
+         * rests on, so the span-return witness stops describing it --
+         * otherwise a recovered span that later context-switches away would
+         * be blamed for the foreign user TB the switch leads to. */
+        g_pb_last_kernel_recovered[pb_vcpu_slot(in.cpu_index)] = 0;
+    }
+    if (root_owned && !edge_keep) {
+        g_stats.kexc_root_recovered_tbs++;
+        g_stats.kexc_root_recovered_insns += n_insns;
+        /* Arm the span-return witness: a recovered span must end at an
+         * OWNED user TB, because a kernel excursion returns to the user
+         * context that owns it (see kexc_recovered_span_*). */
+        g_pb_last_kernel_recovered[pb_vcpu_slot(in.cpu_index)] = 1;
+        if (kexc_cut_) {
+            g_stats.kexc_root_recovered_over_cut++;
+        }
+        if (kexc_diag() && kexc_pc_first_sighting("rootrec", start_pc)) {
+            fprintf(stderr, "[kexcdiag] ROOT-RECOVERED pc=0x%" PRIx64
+                    " ninsns=%u live=0x%" PRIx64 " entry=0x%" PRIx64
+                    " owned=%d cut=%d\n", start_pc, n_insns, in.live_asid,
+                    kexc_exc_entry_, (int)kexc_entry_owned_, (int)kexc_cut_);
+        }
+    }
+
+    if (tp_known) {
+        if (tp_ok) {
+            g_stats.kexc_tp_kept_tbs++;
+        } else {
+            g_stats.kexc_tp_dropped_tbs++;
+        }
+        if (tp_ok && !edge_keep) {
+            g_stats.kexc_tp_recovered_tbs++;
+            g_stats.kexc_tp_recovered_insns += n_insns;
+            g_pb_last_kernel_recovered[pb_vcpu_slot(in.cpu_index)] = 1;
+        } else if (!tp_ok && edge_keep) {
+            g_stats.kexc_tp_excluded_tbs++;
+            g_stats.kexc_tp_excluded_insns += n_insns;
+            /* Partition the excluded population by WHY the pair missed. */
+            if (kexc_tp_known_thread(in.cur_tp)) {
+                g_stats.kexc_tp_excluded_known_thread++;
+            } else {
+                g_stats.kexc_tp_excluded_unknown_thread++;
+            }
+            if (kexc_diag() && kexc_pc_first_sighting("tpexcl", start_pc)) {
+                fprintf(stderr, "[kexcdiag] TP-EXCLUDED pc=0x%" PRIx64
+                        " ninsns=%u live=0x%" PRIx64 " tp=0x%" PRIx64
+                        " entry=0x%" PRIx64 " (edge kept, task foreign)\n",
+                        start_pc, n_insns, in.live_asid, in.cur_tp,
+                        kexc_exc_entry_);
+            }
+        }
+        /* Condition census (both arms): the entry-edge foreign latch —
+         * refused as not-owned while the executing task IS an owned
+         * thread. */
+        if (kexc_have_user_ && !kexc_entry_owned_ && tp_ok) {
+            g_stats.kexc_decl_not_owned_tp_owned++;
+        }
+    }
+
+    /*
+     * The layered verdict.  The edge rule and the live-root rule each
+     * ADMIT (they answer "is this ours?" from different evidence, and a
+     * yes from either is a yes); the task-identity rule only REFUSES.  It
+     * is exclusion-only by construction: a thread pointer proves which task
+     * is executing, so it can veto a block the address-space evidence would
+     * have admitted — the borrowed-mm kernel thread, the post-switch tail
+     * still running on our page tables — but it cannot admit a block on its
+     * own, because a thread-pointer VALUE can repeat across processes
+     * (identical binaries lay their TLS at identical addresses) while a
+     * page-table root cannot.
+     */
+    const bool tp_foreign = tp_known && !tp_ok;
+    bool keep = depth3_kexc_off()
+                    ? edge_keep
+                    : ((edge_keep || root_owned) && !tp_foreign);
     if (keep) {
         g_stats.kexc_kernel_kept++;
         /* Post-re-latch census (mirrors the post-restore one below): blocks
@@ -1084,9 +1488,10 @@ bool PathBuilder::kexc_kernel_tb_keep(const StepIn &in)
         if (kexc_restored_after_cut_) {
             g_stats.kexc_post_restore_kept_tbs++;
             g_stats.kexc_post_restore_kept_insns += n_insns;
-            bool own_space = in.live_asid == kexc_exc_entry_ ||
-                             (kexc_have_overlay_ &&
-                              in.live_asid == kexc_overlay_);
+            bool own_space = (kexc_values_current() || depth3_gen_off()) &&
+                             (in.live_asid == kexc_exc_entry_ ||
+                              (kexc_have_overlay_ &&
+                               in.live_asid == kexc_overlay_));
             if (!own_space) {
                 g_stats.kexc_post_restore_kept_foreign_live++;
             }
@@ -1103,8 +1508,14 @@ bool PathBuilder::kexc_kernel_tb_keep(const StepIn &in)
         }
     } else {
         g_stats.kexc_kernel_dropped++;
-        /* Decline-reason census.  Exactly one arm fires per refused block. */
-        if (!kexc_have_user_) {
+        /* Decline-reason census.  Exactly one arm fires per refused block.
+         * A block the task-identity rule refused that the edge rule would
+         * have kept has no edge-state reason — it is the executing task
+         * itself that is foreign (the borrowed-mm kthread / post-switch
+         * tail class); everything else reports the edge state as before. */
+        if (!depth3_kexc_off() && tp_foreign && (edge_keep || root_owned)) {
+            kexc_last_decline_ = 4;
+        } else if (!kexc_have_user_) {
             g_stats.kexc_decl_no_user++;
             kexc_last_decline_ = 1;
         } else if (!kexc_entry_owned_) {
@@ -1120,11 +1531,15 @@ bool PathBuilder::kexc_kernel_tb_keep(const StepIn &in)
         } else {
             g_stats.kexc_decl_cut++;
             kexc_last_decline_ = 3;
+            if (in.pinned && in.live_asid == in.pinned_asid) {
+                g_stats.kexc_decl_cut_live_pinned++;
+            }
             /* THE TRIPWIRE.  A cut asserts the address space moved away; the
              * live register says it is the excursion's own entry value.  Both
              * cannot hold, so a non-zero count is a cut outliving the switch
              * it describes — the sticky-cut defect. */
-            if (in.live_asid == kexc_exc_entry_) {
+            if ((kexc_values_current() || depth3_gen_off()) &&
+                in.live_asid == kexc_exc_entry_) {
                 g_stats.kexc_cut_declined_at_entry_asid++;
                 if (kexc_diag() &&
                     kexc_pc_first_sighting("stalecut", start_pc)) {
@@ -1137,6 +1552,10 @@ bool PathBuilder::kexc_kernel_tb_keep(const StepIn &in)
             }
         }
     }
+    /* Kept-span witness latch: the misattribution census at the next user
+     * TB reads whether this vCPU's kernel flow was being TRACED when it
+     * returned to user code (see kexc_kept_span_foreign_user). */
+    g_pb_last_kernel_kept[pb_vcpu_slot(in.cpu_index)] = keep ? 1 : 0;
     return keep;
 }
 
@@ -1451,8 +1870,13 @@ void PathBuilder::classify_fault_enter(const struct qemu_plugin_cpu_event &ev,
         f.full_tmpl = full_bb;
         f.asid = ev.asid;
         /* The depth the faulting BB ran at: prev's promote-time stamp
-         * (NOT this event's depth_after, which is post-entry). */
+         * (NOT this event's depth_after, which is post-entry), plus the
+         * decomposition sidecar — the async component frozen inside it —
+         * so the merge can re-derive the level at completion. */
         f.depth = walk_depth_;
+        f.async_in_depth = g_pb_walk_async[pb_vcpu_slot(cpu_index_)];
+        f.owner_tp = ev.tp;
+        f.owner_tp_ok = ev.tp_ok != 0;
         /* The excursion belongs to the thread that ran the faulting BB —
          * @owner_tid is exactly the identity that block is emitted with, so
          * the frame and its interrupted block agree by construction.  This is
@@ -1584,7 +2008,32 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
                  * (the producer's departure-tp check makes the two agree;
                  * an unsighted or peer context leaves the state alone and
                  * the edge keeps today's behavior). */
-                if (win_id_ && kexc_snap_.valid &&
+                /* The snapshot stores RAW ASID values.  If the namespace
+                 * generation moved while the window was open, the space
+                 * recycled and those bits no longer name the processes they
+                 * did at ASYNC_ENTER — restoring them would re-latch the
+                 * excursion to whoever now holds the value.  A proven return
+                 * with a stale snapshot is refused, not repaired: the edge
+                 * simply keeps whatever the interleave left. */
+                const bool snap_gen_ok =
+                    kexc_snap_.exc_entry_gen ==
+                    g_asid_identity_gen.load(std::memory_order_relaxed);
+                if (win_id_ && kexc_snap_.valid && !snap_gen_ok) {
+                    g_stats.kexc_async_snap_stale_gen++;   /* both arms */
+                }
+                if (win_id_ && kexc_snap_.valid && !snap_gen_ok &&
+                    !depth3_gen_off()) {
+                    g_stats.kexc_async_relatch_refused_stale_gen++;
+                    if (kexc_diag()) {
+                        fprintf(stderr, "[kexcdiag] ASYNC-RELATCH-STALE "
+                                "entry=0x%" PRIx64 " snap gen %u != %u\n",
+                                kexc_snap_.exc_entry,
+                                kexc_snap_.exc_entry_gen,
+                                g_asid_identity_gen.load(
+                                    std::memory_order_relaxed));
+                    }
+                    kexc_snap_.valid = false;
+                } else if (win_id_ && kexc_snap_.valid &&
                     async_owner_ok_ && in.cur_tp_ok &&
                     in.cur_tp == async_owner_tp_) {
                     kexc_async_restore();
@@ -1874,12 +2323,64 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
              * S-mode excursion interrupted by a sync SBI call resumes
              * with its ownership intact. */
             g_stats.kexc_mmode_dropped++;
+            g_pb_last_kernel_kept[pb_vcpu_slot(in.cpu_index)] = 0;
+            g_pb_last_kernel_recovered[pb_vcpu_slot(in.cpu_index)] = 0;
             drop = true;
         } else if (!g_features.kexc) {
             drop = in.live_priv == 0 ? !in.user_owned
                                      : in.live_asid != in.pinned_asid;
         } else if (in.live_priv == 0) {
-            kexc_user_tb(in.live_asid, in.user_owned);
+            /* Kept-span misattribution witness (both arms): the kernel span
+             * this vCPU just finished tracing flowed directly into a user TB
+             * the ownership verdict calls FOREIGN — so its tail was that
+             * foreign task's kernel work.  The pinned-value flavour is the
+             * narrow-ASID raw-value collision (a rollover handed the pinned
+             * value to another process), which also invalidates the
+             * owned-thread identity map: a recycled value must not satisfy a
+             * stale (tp, asid) pair. */
+            unsigned wslot = pb_vcpu_slot(in.cpu_index);
+            /* Recovered-span return witness.  A kernel excursion ends by
+             * returning to the user context that owns it, so a span the
+             * task-identity rule recovered must land on an OWNED user TB.
+             * The foreign flavour MUST be 0: it would mean the rule admitted
+             * blocks the edge refused and they turned out to be a foreign
+             * task's after all.  This is the recovery's proof of correctness
+             * on the wire itself, independent of the (tp, asid) pair that
+             * made the decision. */
+            if (g_pb_last_kernel_recovered[wslot]) {
+                if (in.user_owned) {
+                    g_stats.kexc_recovered_span_owned_user++;
+                } else {
+                    g_stats.kexc_recovered_span_foreign_user++;
+                    if (kexc_diag()) {
+                        fprintf(stderr, "[kexcdiag] RECOVERED-SPAN-FOREIGN "
+                                "pc=0x%" PRIx64 " live=0x%" PRIx64 " pin=0x%"
+                                PRIx64 " tp=0x%" PRIx64 "\n",
+                                in.cur ? in.cur->start_pc : 0, in.live_asid,
+                                in.pinned_asid, in.cur_tp);
+                    }
+                }
+            }
+            g_pb_last_kernel_recovered[wslot] = 0;
+            if (g_pb_last_kernel_kept[wslot] && !in.user_owned) {
+                g_stats.kexc_kept_span_foreign_user++;
+                if (in.live_asid == in.pinned_asid) {
+                    g_stats.kexc_kept_span_foreign_user_pinned_val++;
+                }
+                if (kexc_diag()) {
+                    fprintf(stderr, "[kexcdiag] KEPT-SPAN-FOREIGN-USER "
+                            "pc=0x%" PRIx64 " live=0x%" PRIx64 " pin=0x%"
+                            PRIx64 " tp=0x%" PRIx64 "\n",
+                            in.cur ? in.cur->start_pc : 0, in.live_asid,
+                            in.pinned_asid, in.cur_tp);
+                }
+            }
+            g_pb_last_kernel_kept[wslot] = 0;
+            if (!in.user_owned && in.live_asid == in.pinned_asid) {
+                kexc_owned_tp_invalidate("pinned-value foreign user");
+            }
+            kexc_user_tb(in.live_asid, in.user_owned, in.cur_tp,
+                         in.cur_tp_strict);
             drop = !in.user_owned;
         } else {
             drop = !kexc_kernel_tb_keep(in);
@@ -1898,6 +2399,7 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
                 } else {
                     r = kexc_last_decline_ == 1 ? GAP_R_KEXC_NO_USER
                       : kexc_last_decline_ == 2 ? GAP_R_KEXC_NOT_OWNED
+                      : kexc_last_decline_ == 4 ? GAP_R_KEXC_TP
                                                 : GAP_R_KEXC_CUT;
                 }
                 uint8_t kf = (uint8_t)((kexc_entry_owned_ ? 1 : 0) |
@@ -1960,6 +2462,8 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
      * next surviving seal). */
     walk_prev_ = prev_tb_;
     walk_depth_ = prev_depth_;
+    g_pb_walk_async[pb_vcpu_slot(in.cpu_index)] =
+        g_pb_prev_async[pb_vcpu_slot(in.cpu_index)];
     rep_state(in.cpu_index).pb_walk_facts =
         rep_state(in.cpu_index).pb_prev_facts;
     g_dbg_walk_depth = walk_depth_;
@@ -2206,8 +2710,56 @@ PathBuilder::complete_merge(size_t idx,
      * emits deeper first, so the guard never triggers (g_last_emit > f.depth).
      * The deeper-frame flush above may have just emitted the true deeper
      * predecessor, in which case g_last_emit is deep and the anchor stays. */
-    if (last_emit_fault_depth(cpu_index_) > f.depth) {
-        g_emit_fault_depth = f.depth;
+    /* Emission-time depth.  f.depth froze the captured-async level in force
+     * when the faulting block EXECUTED; the completing execution (the resume
+     * suffix that just sealed) ran under the level in force NOW, and this
+     * emission's wire position is here — so the merged entry carries the
+     * frame's SYNCHRONOUS component plus the owner's async level at
+     * completion.  A window that opened across the excursion (level 0 at the
+     * fault, 1 at the merge) otherwise emits the merge BELOW the depth-1
+     * tail that follows it — the merge-before-tail 2->0 jump; a window that
+     * closed across it otherwise emits ABOVE the tail.  Byte-identical
+     * whenever the two levels agree, which is every excursion no captured
+     * window edge crosses. */
+    uint32_t f_async_create = f.async_in_depth ? 1u : 0u;
+    if (f_async_create > f.depth) {
+        /* Unreachable by construction — every writer of the stamp writes the
+         * sidecar with it (segment open, the walk promotion, suspend/resume,
+         * the abandon release) — but a silent unsigned wrap here would put a
+         * garbage depth on the wire, so the impossible case is counted
+         * rather than assumed away. */
+        g_stats.merge_async_decomp_invalid++;
+        f_async_create = f.depth;
+    }
+    const uint32_t f_async_now =
+        (async_captured_ && async_owner_ok_ && f.owner_tp_ok &&
+         f.owner_tp == async_owner_tp_) ? 1u : 0u;
+    uint32_t eff_depth = f.depth - f_async_create + f_async_now;
+    if (f_async_now > f_async_create) {
+        g_stats.merge_async_level_gained++;
+    } else if (f_async_now < f_async_create) {
+        g_stats.merge_async_level_dropped++;
+    }
+    /* User-content clamp, mirroring stamp_cur_depth's: a user block is never
+     * handler content, so a merged USER frame emits at 0 exactly as its
+     * pipeline neighbours do.  (Unreachable with the level addition in
+     * practice — a user resume suffix's own step abandons or return-closes
+     * the window one step before its merge completes — but the clamp makes
+     * the wire convention provable rather than argued.) */
+    if (f.full_tmpl && !f.full_tmpl->is_system) {
+        eff_depth = 0;
+    }
+    if (depth3_render_off()) {
+        eff_depth = f.depth;            /* measurement arm: frozen stamp */
+    }
+    if ((pb_diag() || pb_depth_diag()) && eff_depth != f.depth) {
+        fprintf(stderr, "[pathbuilder] MERGE-LEVEL-MOVED full=0x%" PRIx64
+                " f.depth=%u (async_in=%u) -> eff=%u (async_now=%u)\n",
+                f.full_tmpl ? f.full_tmpl->start_pc : 0, f.depth,
+                f_async_create, eff_depth, f_async_now);
+    }
+    if (last_emit_fault_depth(cpu_index_) > eff_depth) {
+        g_emit_fault_depth = eff_depth;
         g_dbg_depth_src = CST_DSRC_MERGE;
         g_emit_fault_anchors = f.anchors;
     } else {
@@ -2216,10 +2768,10 @@ PathBuilder::complete_merge(size_t idx,
         g_emit_fault_anchors.clear();
         if (pb_diag() || pb_susp_diag()) {
             fprintf(stderr, "[pathbuilder] MERGE-DEANCHOR full=0x%" PRIx64
-                    " f.depth=%u last_emit=%u nanchor=%zu (no deeper "
+                    " f.depth=%u eff=%u last_emit=%u nanchor=%zu (no deeper "
                     "predecessor; emit plain)\n",
                     f.full_tmpl ? f.full_tmpl->start_pc : 0, f.depth,
-                    last_emit_fault_depth(cpu_index_), f.anchors.size());
+                    eff_depth, last_emit_fault_depth(cpu_index_), f.anchors.size());
         }
     }
     BBTemplate *merged = f.full_tmpl;
@@ -2281,11 +2833,38 @@ void PathBuilder::flush_frame_unwound(size_t idx, BodyStreamState *out_stream,
     if (!out_stream || !f.full_tmpl) {
         return;
     }
-    if (!(last_emit_fault_depth(cpu_index_) > f.depth)) {
+    /* Emission-time depth, same re-derivation as the merge (see
+     * complete_merge): the frame's synchronous component plus the owner's
+     * async level at THIS emission's position. */
+    uint32_t uf_async_create = f.async_in_depth ? 1u : 0u;
+    if (uf_async_create > f.depth) {
+        g_stats.merge_async_decomp_invalid++;   /* see complete_merge */
+        uf_async_create = f.depth;
+    }
+    const uint32_t uf_async_now =
+        (async_captured_ && async_owner_ok_ && f.owner_tp_ok &&
+         f.owner_tp == async_owner_tp_) ? 1u : 0u;
+    uint32_t eff_depth = f.depth - uf_async_create + uf_async_now;
+    if (uf_async_now > uf_async_create) {
+        g_stats.merge_async_level_gained++;
+    } else if (uf_async_now < uf_async_create) {
+        g_stats.merge_async_level_dropped++;
+    }
+    /* User-content clamp, exactly as complete_merge applies it: a user block
+     * is never handler content, and format.rst 4.2a makes that absolute, so
+     * the level re-derivation may never raise a user frame off zero. */
+    if (f.full_tmpl && !f.full_tmpl->is_system) {
+        eff_depth = 0;
+    }
+    if (depth3_render_off()) {
+        eff_depth = f.depth;            /* measurement arm: frozen stamp */
+    }
+    if (!(last_emit_fault_depth(cpu_index_) > eff_depth)) {
         if (pb_diag()) {
             fprintf(stderr, "[pathbuilder] UNWIND-FLUSH-SKIP full=0x%" PRIx64
-                    " depth=%u last_emit_depth=%u (anchor guard)\n",
-                    f.full_tmpl->start_pc, f.depth, last_emit_fault_depth(cpu_index_));
+                    " depth=%u eff=%u last_emit_depth=%u (anchor guard)\n",
+                    f.full_tmpl->start_pc, f.depth, eff_depth,
+                    last_emit_fault_depth(cpu_index_));
         }
         return;
     }
@@ -2298,14 +2877,14 @@ void PathBuilder::flush_frame_unwound(size_t idx, BodyStreamState *out_stream,
 
     g_mem_recorder.prepend_cp(cpu_index_, f.mem);
     pending_reg_snaps(cpu_index_) = f.snaps;
-    g_emit_fault_depth = f.depth;
+    g_emit_fault_depth = eff_depth;
     g_dbg_depth_src = CST_DSRC_UNWIND;
     g_emit_fault_anchors = f.anchors;
 
     if (pb_diag() || pb_depth_diag()) {
         fprintf(stderr, "[pathbuilder] UNWIND-FLUSH full=0x%" PRIx64 " depth=%u "
-                "nanchor=%zu nmem=%zu pred_depth=%u frames_left=%zu\n",
-                f.full_tmpl->start_pc, f.depth, f.anchors.size(),
+                "eff=%u nanchor=%zu nmem=%zu pred_depth=%u frames_left=%zu\n",
+                f.full_tmpl->start_pc, f.depth, eff_depth, f.anchors.size(),
                 f.mem.size(), last_emit_fault_depth(cpu_index_), frames_.size());
     }
 
@@ -2388,6 +2967,7 @@ void PathBuilder::suspend_prev(uint64_t owner_asid, uint64_t owner_live,
     SuspendedPrev &s = susp_stack_.back();
     s.prev = prev_tb_;
     s.depth = prev_depth_;
+    s.async_in_depth = g_pb_prev_async[pb_vcpu_slot(cpu_index)];
     s.asid = owner_asid;
     s.owner_live = owner_live;
     g_mem_recorder.take_cp(cpu_index_, s.mem);              /* drains the CP buffer */
@@ -2435,6 +3015,7 @@ bool PathBuilder::resume_suspension(uint64_t resume_asid, uint64_t resume_live)
         }
         prev_tb_ = s.prev;                       /* re-arm the pending seal */
         prev_depth_ = s.depth;
+        g_pb_prev_async[pb_vcpu_slot(cpu_index_)] = s.async_in_depth;
         rep_state(cpu_index_).pb_prev_facts = s.rep_facts;
         rep_state(cpu_index_).pb_prev_facts_armed = false;
         g_dbg_prev_depth_src = CST_PDSRC_RESUME;
@@ -2561,6 +3142,11 @@ void PathBuilder::stamp_cur_depth(const StepIn &in, bool post_merge)
      * predicate, not a latch. */
     const uint32_t async_lvl = async_level(in);
     depth_next_ = pinned_inflight + async_lvl;
+    /* Decomposition sidecar: the async component actually INCLUDED in the
+     * stamp below (0 when the user clamp zeroes the whole stamp), so an
+     * emission can re-derive the level in force at ITS position. */
+    g_pb_prev_async[pb_vcpu_slot(in.cpu_index)] =
+        (in.pinned && in.live_priv == 0) ? 0 : (uint8_t)async_lvl;
     /* User-privilege TBs stamp depth 0 regardless of the vCPU's raw
      * fault-stack depth: user code is never fault-handler content, but a
      * preemptible kernel can context-switch INSIDE a blocking fault handler
@@ -2824,10 +3410,73 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
              * ASYNC_ENTER. */
             if (!async_owner_ok_ ||
                 (in.cur_tp_ok && in.cur_tp == async_owner_tp_)) {
+                /* Condition census before the release: what still pends with
+                 * the level frozen in?  (A returned frame of this thread
+                 * still awaiting its merge will re-derive at emission; the
+                 * walked stamp is re-stamped below.) */
+                for (const CtxFrame &cf : frames_) {
+                    if (cf.returned && cf.tid == in.cur_tid) {
+                        g_stats.async_abandon_merge_pending++;
+                        break;
+                    }
+                }
                 async_captured_ = 0;
                 async_departure_pc_ = 0;
                 async_owner_ok_ = false;
                 g_stats.async_abandon_owner++;
+                /* Release rendering.  Reaching this pinned user TB proves
+                 * every exception level has returned — the abandoned
+                 * window's level ended at or before the END of the last
+                 * kernel block still in hand (the walked prev, whose seal
+                 * this very step emits).  Rendering the release ON that
+                 * block steps the wire down through the level at its last
+                 * possible carrier; leaving the frozen stamp would emit it
+                 * one level high directly against the depth-0 user entry —
+                 * the abandon-collapse >1 jump.  prev's stamp needs only
+                 * its decomposition bit cleared (stamp_cur_depth recomputes
+                 * it below, with the level now released). */
+                {
+                    unsigned aslot = pb_vcpu_slot(in.cpu_index);
+                    const uint32_t release =
+                        (g_pb_walk_async[aslot] && walk_depth_ > 0) ? 1u : 0u;
+                    /* Condition census, arm-invariant: what the wire steps
+                     * from at this abandon.  @residual is the level the
+                     * in-hand block still carries once the async level is
+                     * released — the step the coming depth-0 user entry
+                     * makes.  residual >= 2 is a jump this release cannot
+                     * close: those levels are SYNCHRONOUS frames whose
+                     * returns were never observed (the strict-LIFO
+                     * suppression class), and there is exactly one block in
+                     * hand to carry a release, so rendering them as single
+                     * steps would mean inventing entries.  no_carrier counts
+                     * abandons with nothing in hand at all. */
+                    if (!walk_prev_) {
+                        g_stats.async_abandon_no_carrier++;
+                    } else {
+                        const uint32_t residual = walk_depth_ - release;
+                        if (residual >= 2) {
+                            g_stats.async_abandon_residual_ge2++;
+                        }
+                        if (residual > g_stats.async_abandon_residual_max) {
+                            g_stats.async_abandon_residual_max = residual;
+                        }
+                    }
+                    if (release) {
+                        g_stats.async_abandon_stamp_stripped++;
+                        if (!depth3_render_off()) {
+                            walk_depth_ -= 1;
+                            g_dbg_walk_depth = walk_depth_;
+                            if (pb_diag() || pb_depth_diag()) {
+                                fprintf(stderr, "[pathbuilder] ABANDON-STRIP "
+                                        "walk=0x%" PRIx64 " -> depth %u\n",
+                                        walk_prev_ ? walk_prev_->start_pc : 0,
+                                        walk_depth_);
+                            }
+                        }
+                    }
+                    g_pb_walk_async[aslot] = 0;
+                    g_pb_prev_async[aslot] = 0;
+                }
                 /* An abandoned window never re-fetches its departure, so
                  * the snapshot's "machine is back where it left" premise is
                  * void — the ownership state stays as the interleave left

@@ -558,10 +558,19 @@ static void pin_reuse_reset(void)
 
 static void pin_reuse_track(uint64_t new_asid, uint64_t pinned_asid)
 {
+    bool bump_gen = false;
     g_mutex_lock(&pin_reuse_lock);
     if (new_asid == pinned_asid) {
         if (g_pin_reuse_nvals >= PIN_REUSE_THRESHOLD) {
             g_stats.pin_asid_reuse_suspected++;
+            /* Take the policy decision this detector used to defer: the
+             * space demonstrably wrapped, so every raw ASID value the
+             * tracer is holding stops being an identity from here.  The
+             * pin itself is already safe (a committed write drops the
+             * vCPU's dwell, and re-confirmation is by physical-page
+             * signature, not by value); what needed the generation is the
+             * kexc excursion state, which compares stored values. */
+            bump_gen = true;
             if (!g_pin_reuse_warned) {
                 g_pin_reuse_warned = true;
                 fprintf(stderr, "champsim_tracer: pinned ASID value 0x%"
@@ -585,6 +594,15 @@ static void pin_reuse_track(uint64_t new_asid, uint64_t pinned_asid)
         }
     }
     g_mutex_unlock(&pin_reuse_lock);
+    if (bump_gen) {
+        /* The bump clears the owned-thread identity map, which the CP step
+         * reads; this hook runs on a vCPU thread outside the step window,
+         * so take the same lock the step holds.  exec_lock is recursive, so
+         * the dwell-re-pin caller (already inside it) is unaffected. */
+        g_rec_mutex_lock(&exec_lock);
+        asid_identity_gen_bump("pinned-value reuse after rollover");
+        g_rec_mutex_unlock(&exec_lock);
+    }
 }
 
 /*
@@ -913,6 +931,40 @@ static uint64_t g_vcpu_pending_tp[CST_PIN_MAX_VCPUS];
 static uint32_t g_vcpu_pending_tid[CST_PIN_MAX_VCPUS];
 static bool     g_vcpu_pending_tid_valid[CST_PIN_MAX_VCPUS];
 
+/*
+ * Kernel-entry identity alias (the thread-identity ruling, part a).
+ *
+ * The maintainer's model: a context is a THREAD — kernel code running on a
+ * separate task (kswapd, ksoftirqd, a per-CPU idle) is a separate thread
+ * with its own id, and kernel code that takes over a thread keeps that
+ * thread's id.  The identity registers deliver the first half directly on
+ * targets whose kernel keeps a per-task pointer readable in kernel mode
+ * (RISC-V tp/sscratch, arm64 SP_EL0, MIPS $28): distinct tasks yield
+ * distinct values, so kernel threads mint distinct tids.  The second half
+ * needs this arrow for the one identity the registers CANNOT join: a
+ * TLS-less user thread reads thread-pointer 0 at user privilege but its
+ * task pointer in the kernel, two different raw values for ONE program
+ * path.  The join is provable exactly at the exception edge: a
+ * user->kernel transition on one vCPU can only be an exception taken by
+ * the running thread, so the first task value the kernel run resolves
+ * names the ENTERING thread — alias it to that thread's tid instead of
+ * minting, and the thread's kernel excursions keep its id.
+ *
+ * pending is armed at every user-privilege sample and consumed by the
+ * first RESOLVED kernel sample; unresolvable kernel samples (the
+ * entry-window TBs before the kernel installs its task pointer) pass
+ * through with a bounded budget, so on a target with no kernel task
+ * source at all (x86-64, which reaches `current` only through a
+ * link-time percpu offset) the arm expires instead of aliasing some
+ * later excursion's first value.  Hazard, documented: the guest
+ * recycling a task_struct/stack does not re-key the per-segment map, so
+ * a recycled task address inherits the dead thread's tid until the next
+ * segment or its own re-alias (last-writer-wins).
+ */
+static bool     g_vcpu_alias_pending[CST_PIN_MAX_VCPUS];
+static uint8_t  g_vcpu_alias_budget[CST_PIN_MAX_VCPUS];
+static constexpr uint8_t CST_ALIAS_KSAMPLE_BUDGET = 8;
+
 /* CST_TIDDIAG accounting for the kernel-privilege sample's effect on the
  * wire.  g_vcpu_user_tid[c] is what vCPU c's identity WOULD be if only
  * user-privilege samples were trusted — the attribution rule before the
@@ -1098,6 +1150,8 @@ static void thread_identity_reset(void)
         g_vcpu_cur_asid_index[i] = 0;
         g_vcpu_last_tp[i] = CST_TP_UNSEEN;
         g_vcpu_pending_tid_valid[i] = false;
+        g_vcpu_alias_pending[i] = false;
+        g_vcpu_alias_budget[i] = 0;
     }
     g_pin_user_vcpu_mask = 0;
     g_pin_multivcpu_warned = false;
@@ -1154,21 +1208,77 @@ static uint32_t thread_identity_sample(unsigned int cpu_index, int live_priv)
     }
     g_vcpu_pending_tid_valid[cpu_index] = false;
     uint64_t tp;
-    if (thread_ptr_sample(live_priv, &tp) && tp != g_vcpu_last_tp[cpu_index]) {
+    bool resolved = thread_ptr_sample(live_priv, &tp);
+    /* Kernel-entry alias arming (see the declaration): every user sample
+     * (re)arms; the first resolved kernel sample consumes; an unresolvable
+     * kernel sample burns budget so a target with no kernel task source
+     * expires the arm instead of aliasing a later excursion's first
+     * value. */
+    if (live_priv == 0 && resolved) {
+        g_vcpu_alias_pending[cpu_index] = true;
+        g_vcpu_alias_budget[cpu_index] = CST_ALIAS_KSAMPLE_BUDGET;
+    } else if (live_priv != 0 && !resolved &&
+               g_vcpu_alias_pending[cpu_index]) {
+        if (g_vcpu_alias_budget[cpu_index] == 0 ||
+            --g_vcpu_alias_budget[cpu_index] == 0) {
+            g_vcpu_alias_pending[cpu_index] = false;
+            g_stats.tid_alias_expired++;
+        }
+    }
+    if (resolved && tp != g_vcpu_last_tp[cpu_index]) {
+        uint32_t tid;
         uint32_t next_before = g_thread_tid_next;
-        uint32_t tid = thread_ptr_to_tid(tp);
+        if (live_priv != 0 && g_vcpu_alias_pending[cpu_index] &&
+            (!g_thread_tid_map || g_thread_tid_map->count(tp) == 0)) {
+            /* First task value resolved by a user-entered kernel run, never
+             * seen before: it names the ENTERING thread (the exception was
+             * taken by the thread that was running), so it aliases to that
+             * thread's tid rather than minting — kernel-on-behalf keeps the
+             * thread's id even where the raw register value changes at the
+             * privilege boundary (a TLS-less thread: 0 in user, the task
+             * pointer in kernel). */
+            if (!g_thread_tid_map) {
+                g_thread_tid_map =
+                    new std::unordered_map<uint64_t, uint32_t>();
+            }
+            tid = g_vcpu_cur_tid[cpu_index];
+            g_thread_tid_map->emplace(tp, tid);
+            g_stats.tid_task_aliased++;
+            if (tiddiag_on() || tid2diag_on()) {
+                fprintf(stderr, "champsim_tracer: [tiddiag] entry-alias: "
+                        "task=0x%" PRIx64 " -> tid=%u (vcpu=%u)\n",
+                        tp, tid, cpu_index);
+            }
+        } else {
+            tid = thread_ptr_to_tid(tp);
+            if (live_priv != 0 && g_thread_tid_next != next_before) {
+                /* A kernel-resolved task value minting fresh: a task with
+                 * no user identity to join — a kernel thread's own strand. */
+                g_stats.tid_kernel_task_minted++;
+            }
+        }
         if (tid2diag_on() && g_thread_tid_next != next_before) {
             fprintf(stderr, "champsim_tracer: [tid2] MINT vcpu=%u priv=%d "
                     "tp=0x%" PRIx64 " tid=%u\n",
                     cpu_index, live_priv, tp, tid);
+        }
+        if (live_priv != 0) {
+            g_vcpu_alias_pending[cpu_index] = false;   /* consumed */
         }
         g_vcpu_pending_tp[cpu_index] = tp;
         g_vcpu_pending_tid[cpu_index] = tid;
         g_vcpu_pending_tid_valid[cpu_index] = true;
         return tid;
     }
+    if (resolved && live_priv != 0) {
+        /* Resolved and unchanged (a TLS-ful thread whose kernel identity is
+         * its user value): the join is already the identity map's, and the
+         * arm is consumed. */
+        g_vcpu_alias_pending[cpu_index] = false;
+    }
     /* Unchanged, or a privilege where the register does not name the current
-     * task (RISC-V kernel): the strand keeps the entering thread. */
+     * task (RISC-V M-mode, an unresolvable entry window): the strand keeps
+     * the entering thread. */
     return g_vcpu_cur_tid[cpu_index];
 }
 
@@ -1708,6 +1818,15 @@ static bool pin_user_tb_owned(unsigned int cpu_index, uint64_t live_asid,
             ps.asid.store(live_asid, std::memory_order_relaxed);
             qemu_plugin_u64_set(g_scoreboard.asid_match, cpu_index, 1);
             g_stats.pin_repins++;
+            /* The pinned process's value MOVED while the process did not
+             * — the OS handed it a fresh ASID, which on a narrow space is
+             * exactly what a rollover does to every live process.  Bump the
+             * raw-value namespace generation: any value the tracer is
+             * holding (an open excursion's entry value, an async snapshot,
+             * a recorded (thread-pointer, asid) pair) may now name whoever
+             * inherited the old one.  This very TB re-seeds the owner under
+             * the new value. */
+            asid_identity_gen_bump("narrow-ASID dwell re-pin");
         }
         ps.confirmed.store(true, std::memory_order_relaxed);
         return true;
@@ -5663,17 +5782,24 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
      * StepIn::cur_tp).  Where the register cannot be trusted at this
      * privilege the step inherits the vCPU's last COMMITTED pointer — the
      * entering thread — mirroring cur_tid's inheritance; before any commit
-     * on this vCPU nothing is known and the flag stays false. */
+     * on this vCPU nothing is known and the flag stays false.  cur_tp_strict
+     * records which branch ran: only a FRESH sample feeds the kexc
+     * task-identity rule (an inherited value is exactly the stale evidence
+     * that rule overrules). */
     if (g_system_mode && cpu_index < CST_PIN_MAX_VCPUS) {
         uint64_t step_tp;
         if (thread_ptr_sample(live_priv, &step_tp)) {
             in.cur_tp = step_tp;
             in.cur_tp_ok = true;
+            in.cur_tp_strict = true;
         } else if (g_vcpu_last_tp[cpu_index] != CST_TP_UNSEEN) {
             in.cur_tp = g_vcpu_last_tp[cpu_index];
             in.cur_tp_ok = true;
         }
     }
+    /* Wide-register roots are per-process identities; the narrow-ASID (MIPS)
+     * pin's reuse guard is armed exactly when they are not. */
+    in.asid_is_identity = !g_pin_reuse_guard;
 
     /* CST_TID2_DIAG: the delivery-condition instrument for the SMP async
      * ownership work.  For every async edge drained this step, print the

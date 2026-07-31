@@ -317,6 +317,118 @@ struct Stats {
     uint64_t kexc_async_relatch_skipped = 0;
     uint64_t kexc_post_relatch_kept_tbs = 0;
     uint64_t kexc_post_relatch_kept_insns = 0;
+    /* Task-identity kernel ownership (kexc=1, thread-pointer-tracking
+     * targets).  A kernel TB is the work of the task EXECUTING it, and on a
+     * target whose thread-pointer register still names the current task at
+     * kernel privilege that identity is directly readable — where the
+     * entry-edge inference (ownership of the last user TB this vCPU ran)
+     * mis-latches whenever the pinned process re-enters the kernel with no
+     * intervening own user TB, the register does not.  kept/dropped
+     * partition every kernel keep decision the identity rule made; the
+     * disagreement pair measures exactly where it and the entry-edge rule
+     * differ (recovered = edge refused / identity kept: the foreign-latch
+     * refusals; excluded = edge kept / identity refused: the borrowed-mm
+     * kthread and post-switch foreign tails the edge rule leaked). */
+    uint64_t kexc_tp_kept_tbs = 0;
+    uint64_t kexc_tp_dropped_tbs = 0;
+    uint64_t kexc_tp_recovered_tbs = 0;
+    uint64_t kexc_tp_recovered_insns = 0;
+    uint64_t kexc_tp_excluded_tbs = 0;
+    uint64_t kexc_tp_excluded_insns = 0;
+    /* The excluded population partitioned by WHY the (tp, asid) pair missed.
+     * known_thread: the executing thread pointer IS a recorded owned thread
+     * but the live address space is not the one it was recorded under — the
+     * context-switch window, where the kernel has installed the next task's
+     * page tables and not yet switched register state.  unknown_thread: the
+     * executing thread pointer was never an owned thread at all, so the
+     * block is unambiguously another task's kernel work that the entry-edge
+     * rule admitted. */
+    uint64_t kexc_tp_excluded_known_thread = 0;
+    uint64_t kexc_tp_excluded_unknown_thread = 0;
+    /* Recovered-span RETURN witness (both rules).  A kernel excursion ends
+     * by returning to the user context that owns it, so a span containing a
+     * task-identity recovery must land on an OWNED user TB.  The foreign
+     * flavour MUST be 0 — a non-zero count would mean the recovery admitted
+     * a foreign task's blocks.  This corroborates the recovery on the wire,
+     * independently of the (tp, asid) pair that decided it. */
+    uint64_t kexc_recovered_span_owned_user = 0;
+    uint64_t kexc_recovered_span_foreign_user = 0;
+    /* Thread-identity ruling census (system mode).  aliased: kernel task
+     * values joined to the ENTERING thread's tid at a user->kernel
+     * exception edge — kernel-on-behalf keeping the thread's id where the
+     * raw register value changes at the privilege boundary (a TLS-less
+     * thread).  kernel_task_minted: task values first resolved in kernel
+     * mode with no user identity to join — kernel threads' own strands,
+     * each a distinct id.  alias_expired: arms that ran out of budget on a
+     * target with no kernel task source (x86-64) — the honest no-alias
+     * outcome, never a wrong join. */
+    uint64_t tid_task_aliased = 0;
+    uint64_t tid_kernel_task_minted = 0;
+    uint64_t tid_alias_expired = 0;
+    /* Condition census for the entry-edge foreign latch, measured on both
+     * rules: kernel TBs the edge rule refuses as not-owned while the
+     * executing task's (thread-pointer, live asid) identity is a recorded
+     * owned thread — i.e. the latch refusing the pinned process's own
+     * kernel work. */
+    uint64_t kexc_decl_not_owned_tp_owned = 0;
+    /* Live-root recovery (the non-async entry-edge foreign latch).  Kernel
+     * TBs the entry-edge rule refused while the PINNED address-space root
+     * was installed — the pinned process re-entering the kernel with no
+     * intervening user TB of its own.  On a wide-register target the root
+     * is a per-process identity, so these are recovered, not guessed; the
+     * _over_cut flavour counts the ones whose excursion also carried a
+     * standing committed-switch cut (the switch moved the space away and
+     * back, and the root says the process is running again). */
+    uint64_t kexc_root_recovered_tbs = 0;
+    uint64_t kexc_root_recovered_insns = 0;
+    uint64_t kexc_root_recovered_over_cut = 0;
+    /* The cut-side twin of kexc_decl_not_owned_live_pinned: kernel TBs a
+     * standing cut refused while the pinned root was live.  Same false
+     * refusal, reached through the other decline arm. */
+    uint64_t kexc_decl_cut_live_pinned = 0;
+    /* Owned-thread identity map churn.  Invalidations are the rollover
+     * defence: ASID-write storm, narrow-ASID dwell re-pin, or a foreign
+     * user TB carrying the pinned ASID value each clear the map, so a
+     * recycled raw value can never satisfy a stale (tp, asid) pair. */
+    uint64_t kexc_tp_map_inserts = 0;
+    uint64_t kexc_tp_map_invalidations = 0;
+    /* Thread-pointer samples that read back 0 — the architectural "no
+     * identity" value (MIPS CP0 UserLocal on a model without Config3.ULRI,
+     * a TLS-less task's aarch64 TPIDR_EL0 or x86 FS.base).  Never seeded
+     * into the map and never matched against it, so those TBs stand down to
+     * the entry-edge rule exactly as a non-tracking target does; a guest
+     * reporting 0 on the PINNED process's own user TBs is one where the
+     * identity rule cannot apply at all, and this counter says so. */
+    uint64_t kexc_tp_null_samples = 0;
+    /* Misattribution WITNESS, measured on both rules: a kexc-KEPT kernel
+     * span flowed directly (no intervening owned user TB on this vCPU) into
+     * a user TB whose ownership verdict is FOREIGN — the kept span was then
+     * at least partly that foreign task's kernel work.  The _pinned_val
+     * flavour counts the narrow-ASID collision: the foreign user TB carries
+     * the pinned ASID VALUE (a rollover handed it over), the raw-value
+     * compare defect's smoking gun. */
+    uint64_t kexc_kept_span_foreign_user = 0;
+    uint64_t kexc_kept_span_foreign_user_pinned_val = 0;
+    /* Narrow-ASID identity generation (see g_asid_identity_gen).  bumps
+     * counts observations that the raw-value namespace recycled; the two
+     * refusals count the raw-value comparisons that stood down because of
+     * one — an excursion's entry value coming back in a later generation
+     * (which would otherwise retire a cut and hand the rest of the
+     * excursion to whoever now holds the value), and an async re-latch
+     * whose snapshot of raw values aged out while its window was open. */
+    uint64_t asid_identity_gen_bumps = 0;
+    /* Committed ASID writes seen while an excursion's stored values were
+     * already a generation behind (the exposure window), and — the sharp
+     * one — writes of the excursion's OWN stored entry VALUE inside that
+     * window.  The latter IS the narrow-ASID collision: those bits were
+     * handed to another process, and the unguarded arrow reads them as the
+     * excursion's address space returning.  Both are measured on BOTH arms;
+     * the two "refused" counters below fire only where the guard acts. */
+    uint64_t kexc_stale_gen_writes = 0;
+    uint64_t kexc_entry_value_collisions = 0;
+    uint64_t kexc_async_snap_stale_gen = 0;
+    uint64_t kexc_entry_restore_refused_stale_gen = 0;
+    uint64_t kexc_async_relatch_refused_stale_gen = 0;
     /* Kernel (priv!=0) TBs dropped because they executed at the target's
      * translation-bypassing privilege level (RISC-V M-mode firmware, which
      * satp does not govern; see g_xlate_bypass_priv).  Counted on both
@@ -419,6 +531,46 @@ struct Stats {
     uint64_t depth_restamp_corrections = 0;
     uint64_t depth_restamp_jumps = 0;
     uint32_t depth_restamp_max_delta = 0;
+
+    /* Async-level decomposition at frame emission (interrupts=1).  A fault
+     * frame's depth stamp freezes the captured-async level in force when the
+     * faulting block EXECUTED; its merge emits when the resume suffix seals,
+     * and a captured window can open or close in between.  The emission
+     * re-derives the level (the frame's synchronous component plus the
+     * owner's level at completion) so the merged entry lands on the depth
+     * staircase the wire is walking at ITS position.  gained counts merges
+     * where a window opened across the excursion (the merge-before-tail
+     * condition: creation level 0, completion level 1), dropped the reverse.
+     * Both are the CONDITION census — they fire whether or not the
+     * re-derivation is enabled. */
+    uint64_t merge_async_level_gained = 0;
+    uint64_t merge_async_level_dropped = 0;
+    /* Must be 0: a frame whose recorded async component exceeds the stamp
+     * it was decomposed from.  Structurally impossible (the stamp and its
+     * sidecar are written together at every writer), counted so that an
+     * unsigned wrap onto the wire could never be silent. */
+    uint64_t merge_async_decomp_invalid = 0;
+    /* Abandon-release rendering (interrupts=1): a window abandoned at the
+     * owner's pinned user TB releases the captured level while the walked
+     * (pending-emission) stamp still carries it frozen.  The release
+     * re-stamps that in-hand block down one level, so the wire steps through
+     * the level at the last position still in hand instead of jumping across
+     * it at the user boundary.  stripped counts abandons that found such a
+     * stamp (the abandon-collapse condition); merge_pending counts abandons
+     * with a returned frame of the owner still awaiting its merge. */
+    uint64_t async_abandon_stamp_stripped = 0;
+    uint64_t async_abandon_merge_pending = 0;
+    /* Residual census for the same abandon, arm-invariant: the level the
+     * in-hand block still carries AFTER the async release — i.e. the step
+     * the following depth-0 user entry makes.  >= 2 means synchronous frames
+     * whose exception-returns were never observed (the strict-LIFO
+     * suppression class) are still stacked on a single carrier block, which
+     * no release rendering can step through without inventing entries;
+     * no_carrier counts abandons with no block in hand to carry a release
+     * at all. */
+    uint64_t async_abandon_residual_ge2 = 0;
+    uint32_t async_abandon_residual_max = 0;
+    uint64_t async_abandon_no_carrier = 0;
 
     /* Per-guest-thread frame ownership, measured at the condition rather
      * than at the oracle failure it produces.  foreign_inflight counts, per

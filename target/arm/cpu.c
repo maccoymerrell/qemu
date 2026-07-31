@@ -2679,19 +2679,70 @@ static void arm_get_plugin_state(CPUState *cs, int *priv, uint64_t *asid,
     *mmu_on = (arm_sctlr(env, arm_current_el(env)) & SCTLR_M) != 0;
 }
 
+static bool arm_vaddr_is_kernel(CPUState *cs, uint64_t vaddr);
+
 static uint64_t arm_get_plugin_thread_ptr(CPUState *cs)
 {
-    /* TPIDR_EL0 — the EL0 thread pointer (AArch32 TPIDRURW aliases the
-     * same state), context-switched per thread by the kernel. */
-    return cpu_env(cs)->cp15.tpidr_el[0];
+    CPUARMState *env = cpu_env(cs);
+    /*
+     * At EL0, and for any thread that has a TLS base at all: TPIDR_EL0 —
+     * the EL0 thread pointer (AArch32 TPIDRURW aliases the same state),
+     * reloaded from the incoming task at every switch
+     * (tls_thread_switch()) and never touched in between, so it names the
+     * current task at any EL.  Keeping it at EL1 whenever it is non-zero
+     * is what keeps a thread's kernel excursions on the SAME identity its
+     * user code carries: kernel code running on behalf of a thread is that
+     * thread.
+     *
+     * TPIDR_EL0 == 0 at EL1 is a task with no TLS identity — a kernel
+     * thread (kswapd, ksoftirqd, a per-CPU idle task; fork gives them
+     * tp_value 0 and nothing ever sets it), or a TLS-less user task's
+     * kernel excursion.  Those are distinct program paths that would
+     * otherwise all collapse onto the one identity 0, so fall through to
+     * the kernel's own per-task contract: arm64 keeps `current` in SP_EL0
+     * while in the kernel (arch/arm64/include/asm/current.h get_current()
+     * reads sp_el0; kernel_entry from EL0 installs it and cpu_switch_to()
+     * re-points it at every switch).  task_struct lives in the kernel map,
+     * so a kernel VA is the signature that the install already happened —
+     * during early entry from EL0, SP_EL0 still holds the interrupted
+     * user's stack pointer (a user VA), and this hook must not mint that
+     * as an identity: the tracks-current hook reports false for exactly
+     * that window and the consumer inherits the entering thread, which is
+     * the interrupted thread itself.
+     *
+     * env->sp_el[0] is authoritative while the banked SP_EL1 is active
+     * (Linux runs EL1h); on the EL1t corner the live SP_EL0 is xregs[31].
+     * AArch32 guests keep the historical TPIDRURW-only behaviour.
+     */
+    uint64_t tp = env->cp15.tpidr_el[0];
+    if (!is_a64(env) || arm_current_el(env) == 0 || tp != 0) {
+        return tp;
+    }
+    uint64_t sp0 = (env->pstate & PSTATE_SP) ? env->sp_el[0] : env->xregs[31];
+    if (arm_vaddr_is_kernel(cs, sp0)) {
+        return sp0;
+    }
+    return tp;
 }
 
 static bool arm_plugin_thread_ptr_tracks_current(CPUState *cs)
 {
+    CPUARMState *env = cpu_env(cs);
     /* TPIDR_EL0 is architecturally separate from the kernel's own
      * thread pointers (TPIDR_EL1, SP_EL0-as-current), so Linux reloads
      * it from the incoming task at every switch and never touches it in
-     * between — the sample names the current task at any EL. */
+     * between — the sample names the current task at any EL.  The one
+     * state it cannot vouch for is a TLS-less task early in an
+     * entry-from-EL0 window: TPIDR_EL0 is 0 there and SP_EL0 still holds
+     * the interrupted user stack pointer (kernel_entry has not yet
+     * installed `current`), so neither register names the task and the
+     * consumer must inherit the entering thread instead. */
+    if (is_a64(env) && arm_current_el(env) != 0 &&
+        env->cp15.tpidr_el[0] == 0) {
+        uint64_t sp0 = (env->pstate & PSTATE_SP) ? env->sp_el[0]
+                                                 : env->xregs[31];
+        return arm_vaddr_is_kernel(cs, sp0);
+    }
     return true;
 }
 

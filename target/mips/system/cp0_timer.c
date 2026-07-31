@@ -45,6 +45,29 @@ static void cpu_mips_timer_update(CPUMIPSState *env)
     /* Clamp interval to overflow if virtual time had not progressed */
     if (!wait) {
         wait = UINT32_MAX;
+    } else if (wait > INT32_MAX) {
+        /*
+         * The target is BEHIND Count: architectural equality-match
+         * semantics say "fire at the wrap", a full ~2^32 ticks away.  Real
+         * silicon only ever gets here transiently (a guest's next-event
+         * write races Count by nanoseconds and its -ETIME readback
+         * recovers); under TCG the guest's read-Count -> write-Compare
+         * window costs wall (= virtual) time that can exceed small deltas
+         * entirely — most of all while boot code is still being
+         * translated — so the OS's bounded retries can ALL land behind
+         * Count, its clockevent dies, and the CPU parks in idle until the
+         * wrap fires or a cross-CPU rescue arrives (observed on Malta SMP,
+         * Linux 6.6: a ~21 s RCU-stall-and-NMI tick outage on every boot,
+         * and a permanent-at-timescale guest wedge when both CPUs are
+         * caught at once).  Re-arm such a deadline at 2^24 ticks (~0.1 s
+         * at Malta rates) instead: every parked state — a missed program,
+         * an acknowledge rewrite awaiting its follow-up program, a stale
+         * Compare after a Count write — self-heals at a bounded, far-sub-
+         * tick-storm cadence, while every legitimate future program (OS
+         * contract: delta <= 2^31 - 1) is untouched.  A real reprogram
+         * replaces this deadline long before it fires.
+         */
+        wait = 1 << 24;
     }
     next_ns = now_ns + clock_ticks_to_ns(env->count_clock, wait);
     timer_mod(env->timer, next_ns);

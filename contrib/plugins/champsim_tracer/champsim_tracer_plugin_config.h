@@ -104,6 +104,15 @@ struct PluginConfig {
     uint32_t  smc_revisions       = 1024;
     /* Per-template IFRAME trigger interval.  0 disables. */
     uint32_t  iframe_rate         = 100000;
+    /* Per-image byte offset of the guest kernel's current-task pointer
+     * within its per-CPU region (curtask_off=0x...; system mode,
+     * consumed by the x86-64 target).  Declared to QEMU at install so
+     * kernel-privilege thread identity resolves for tasks with no TLS
+     * base.  @curtask_off_set distinguishes "not given" (legacy
+     * collapse-onto-0 behaviour, byte-identical) from any given value
+     * — 0 is a legal offset, not a sentinel. */
+    uint64_t  curtask_off       = 0;
+    bool      curtask_off_set   = false;
     uint64_t  simpoint_interval = 100000000ULL;
     uint64_t  trace_start_insn  = 0;
     uint64_t  trace_stop_insn   = UINT64_MAX;

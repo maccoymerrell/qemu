@@ -647,6 +647,22 @@ there), and records a page's mapping only on first touch, so a
 physaddr-free or user-mode trace is byte-identical regardless.  See the
 ``physaddr`` option in :doc:`reference`.
 
+**x86-64 kernel-thread identity (optional).**  ``curtask_off=0x<off>``
+declares the traced kernel build's per-CPU offset of ``current_task``,
+letting the x86-64 target name the running task at kernel privilege
+for tasks with no TLS base — kernel threads, the per-CPU idle tasks, a
+TLS-less workload's kernel excursions — so those split into per-task
+strands instead of collapsing onto the id minted for the value 0.  The
+offset is decided at kernel link time and **differs per build**:
+derive it from the image you boot (percpu symbol ``current_task``, or
+``pcpu_hot`` — ``current_task`` is its first member — on
+``6.2 <= v < 6.14``) via the kernel's ``System.map``, ``nm`` on an
+unstripped ``vmlinux``, or the guest's own ``/proc/kallsyms``; the
+validator's ``derive_curtask`` module automates all three.  Without
+the option kernel identity is unchanged (the collapse is the
+documented degraded contract — see :ref:`limits-kernel-strand`);
+x86-64 system mode only, ignored elsewhere with a warning.
+
 **Determinism.**  The reproducibility flags in
 :ref:`reproducibility-flags` (host CPU pin, host-ASLR disable,
 environment scrub) apply to the ``qemu-system`` process itself the same

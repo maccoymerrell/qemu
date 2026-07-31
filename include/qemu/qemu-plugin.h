@@ -129,11 +129,19 @@ typedef uint64_t qemu_plugin_id_t;
  *   kernel's current-task pointer (sscratch/tp per the S-mode trap-entry
  *   swap) and answers true at U/S privilege, false in M-mode firmware
  *   and under H-extension virtualization.
+ *
+ * version 15:
+ * - added qemu_plugin_set_current_task_offset (declare the guest
+ *   kernel's per-image current-task location so a target whose kernel
+ *   keeps no per-task pointer in a register — x86-64, where ``current``
+ *   is a per-CPU variable behind the kernel GS base at a link-time
+ *   offset — can resolve kernel-privilege thread identity by reading
+ *   it, instead of collapsing every TLS-less task onto the value 0).
  */
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 14
+#define QEMU_PLUGIN_VERSION 15
 
 /**
  * struct qemu_info_t - system information for plugins
@@ -2218,6 +2226,40 @@ uint64_t qemu_plugin_get_thread_ptr(void);
  */
 QEMU_PLUGIN_API
 bool qemu_plugin_thread_ptr_tracks_current(void);
+
+/**
+ * qemu_plugin_set_current_task_offset() - declare where the guest kernel
+ *                                         keeps its current-task pointer
+ * @offset: byte offset of the kernel's current-task pointer within the
+ *          per-CPU region its kernel per-CPU base register addresses
+ *
+ * Some kernels keep no per-task pointer in a *register* at kernel
+ * privilege: Linux/x86-64 reaches ``current`` through the swapped-in
+ * kernel GS base at the per-CPU offset of ``current_task``
+ * (``pcpu_hot`` + 0 on 6.2 <= v < 6.14), a value decided at kernel
+ * link time and not recoverable from architectural state.  A plugin
+ * that has derived that
+ * offset for the guest image it is tracing (from the image's symbol
+ * table, System.map, or the guest's own /proc/kallsyms — per-CPU
+ * symbol values are 0-based offsets) declares it here; the target may
+ * then resolve kernel-privilege thread identity by reading the pointer
+ * through the live per-CPU base.
+ *
+ * The offset is BUILD-dependent.  Declaring a value from a different
+ * kernel image than the one running reads unrelated per-CPU state and
+ * mints wrong identities; when the offset for the running image is not
+ * known, do not call this — the target then keeps its register-only
+ * contract (qemu_plugin_thread_ptr_tracks_current() reports what that
+ * contract can honour, and samples it cannot vouch for are inherited
+ * rather than fabricated).
+ *
+ * Consumed today by x86-64 only; other targets ignore the declaration
+ * (their kernels keep the task pointer in a register).  Process-global
+ * (one guest kernel per emulation); callable at install time, before
+ * any vCPU exists.  No-op in ``*-linux-user``.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_set_current_task_offset(uint64_t offset);
 
 /**
  * qemu_plugin_icount_enabled() - whether QEMU is running with -icount

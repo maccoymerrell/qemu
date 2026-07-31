@@ -1223,6 +1223,21 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
      - ``100000``
      - Emit a validation IFRAME after every Nth observation of a CP
        template; ``0`` disables IFRAMEs.
+   * - ``curtask_off=<0xoff|N>``
+     - unset
+     - Per-image byte offset of the guest kernel's current-task pointer
+       within its per-CPU region (Linux/x86-64: percpu symbol
+       ``current_task``, or ``pcpu_hot + 0`` on ``6.2 <= v < 6.14``).
+       Declared to QEMU so the x86-64 target can name the running task
+       at kernel privilege for tasks with no TLS base — kernel threads
+       then split into per-task strands instead of sharing the id
+       minted for 0.  **Build-dependent**: derive it from the running
+       kernel image (the validator's ``derive_curtask`` module, or
+       ``System.map`` / ``nm`` / guest ``/proc/kallsyms`` by hand);
+       never reuse an offset across kernel builds.  Unset keeps the
+       register-only contract byte-for-byte (see
+       :ref:`limits-kernel-strand`).  x86-64 system mode only; a
+       malformed value refuses install.
    * - ``latch_timeout=<ms>``
      - ``0`` (disabled)
      - Dead-latch detector for marker *latch* mode (see

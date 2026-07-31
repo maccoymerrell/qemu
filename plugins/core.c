@@ -45,6 +45,29 @@ void qemu_plugin_register_asid_write_cb(qemu_plugin_id_t id,
 }
 
 /*
+ * Guest-kernel current-task location hint
+ * (qemu_plugin_set_current_task_offset).  Process-global: one guest
+ * kernel per emulation, and the declaring plugin runs before any vCPU
+ * exists, so no per-CPU state is needed.  Written once at plugin
+ * install (vCPUs are not running yet); read from vCPU threads through
+ * the target's plugin-state hooks.
+ */
+static uint64_t current_task_off;
+static bool current_task_off_set;
+
+void qemu_plugin_current_task_offset_store(uint64_t offset)
+{
+    current_task_off = offset;
+    current_task_off_set = true;
+}
+
+uint64_t qemu_plugin_current_task_offset(bool *set)
+{
+    *set = current_task_off_set;
+    return current_task_off;
+}
+
+/*
  * Block-device I/O hooks (qemu_plugin_register_devio_cb).  Like the
  * ASID-write hook, a single slot per stage suffices: the block backend
  * has one issue and one completion chokepoint, the virtqueue has one

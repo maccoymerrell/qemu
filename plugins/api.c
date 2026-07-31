@@ -716,6 +716,18 @@ bool qemu_plugin_thread_ptr_tracks_current(void)
            ops->plugin_thread_ptr_tracks_current(current_cpu);
 }
 
+void qemu_plugin_set_current_task_offset(uint64_t offset)
+{
+    /* Stored process-globally (see plugins/core.c); consumed by targets
+     * whose kernels keep no per-task pointer in a register at kernel
+     * privilege — today x86-64's thread-pointer hooks.  Deliberately
+     * accepted on every target and in user mode: the declaration is
+     * inert where nothing consumes it, and the declaring plugin — which
+     * knows the target it runs on — is the right place to tell its user
+     * the hint has no consumer here. */
+    qemu_plugin_current_task_offset_store(offset);
+}
+
 bool qemu_plugin_vaddr_is_kernel(uint64_t vaddr)
 {
     /* Defensive: the classification needs the live vCPU's paging config, but

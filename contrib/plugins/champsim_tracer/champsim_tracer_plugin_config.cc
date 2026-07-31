@@ -170,6 +170,31 @@ bool set_iframe_rate(PluginConfig *cfg, const char *v)
     return true;
 }
 
+bool set_curtask_off(PluginConfig *cfg, const char *v)
+{
+    /* Per-image byte offset of the guest kernel's current-task pointer
+     * inside its per-CPU region (Linux/x86-64: percpu symbol
+     * current_task, or pcpu_hot + 0 on 6.2 <= v < 6.14).  Declared to
+     * QEMU so kernel-privilege thread identity resolves for tasks with
+     * no TLS base instead of collapsing onto the value 0.
+     * BUILD-dependent — derive it from the running kernel image
+     * (validator's derive_curtask), never hardcode: a wrong offset
+     * reads unrelated per-CPU state and mints wrong identities.
+     * Accepts 0x-prefixed hex or decimal; a malformed value refuses
+     * install rather than degrading silently. */
+    if (!v || !*v) {
+        return false;
+    }
+    char *end = nullptr;
+    uint64_t n = g_ascii_strtoull(v, &end, 0);
+    if (!end || *end != '\0') {
+        return false;
+    }
+    cfg->curtask_off = n;
+    cfg->curtask_off_set = true;
+    return true;
+}
+
 /*
  * trace_window=PREFIX:KEY=VALUE+KEY=VALUE+...
  *
@@ -366,6 +391,7 @@ const struct {
     { "smc_revisions", set_smc_revisions },
     { "histogram",  set_histogram  },
     { "iframe_rate", set_iframe_rate },
+    { "curtask_off", set_curtask_off },
     { "latch_timeout", set_latch_timeout },
     { "trace_window", set_trace_window },
     { nullptr, nullptr },

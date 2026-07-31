@@ -217,7 +217,16 @@ Plugin API additions
      ``FS.base``, AArch64 ``TPIDR_EL0``, MIPS CP0 ``UserLocal``, and on
      RISC-V the kernel's current-task pointer (whichever of ``tp`` /
      ``sscratch`` holds a kernel address — the trap entry swaps them, so
-     neither register alone spans both privileges).  The plugin keys
+     neither register alone spans both privileges).  A TLS-less task
+     leaves the TLS register 0, so at kernel privilege each target falls
+     back to the guest kernel's own per-task contract for ``current``:
+     AArch64 reports ``SP_EL0`` and MIPS ``$28`` **iff the value is a
+     kernel VA** (the registers Linux keeps ``current`` /
+     ``current_thread_info`` in while in-kernel), and x86-64 — whose
+     kernel keeps no per-task pointer in a register — reads the per-CPU
+     ``current_task`` pointer through the kernel GS base at the
+     plugin-declared per-image offset (see
+     ``qemu_plugin_set_current_task_offset`` below).  The plugin keys
      ``thread_id`` off it rather than the vCPU index.
    * ``qemu_plugin_thread_ptr_tracks_current`` — whether the value the
      hook above reports still names the executing software thread when
@@ -225,15 +234,35 @@ Plugin API additions
      **context**, not a flat per-target answer, and the plugin re-asks it
      at every privileged sample rather than latching one verdict per run.
      MIPS ``UserLocal``, AArch64 ``TPIDR_EL0`` and x86-64 ``FS.base`` are
-     the kernel's to reload and nobody else's, so they answer yes at any
-     privilege.  RISC-V answers yes at U and S privilege — where the
-     reported value is the kernel's current-task pointer, selected from
-     the ``tp``/``sscratch`` pair by which one holds a kernel address —
-     and no in M-mode firmware and under H-extension virtualization.
-     Where the answer is yes the plugin samples at that privilege level,
+     the kernel's to reload and nobody else's, so a non-zero read answers
+     yes at any privilege.  RISC-V answers yes at U and S privilege —
+     where the reported value is the kernel's current-task pointer,
+     selected from the ``tp``/``sscratch`` pair by which one holds a
+     kernel address — and no in M-mode firmware and under H-extension
+     virtualization.  The kernel-privilege fallbacks answer for
+     themselves per sample: an AArch64/MIPS early-entry window (the
+     interrupted user's value still in the register, not yet a kernel
+     VA) and an x86-64 SWAPGS window (user GS base still live) or failed
+     per-CPU read all answer no, and the consumer inherits the entering
+     thread — which in every such window *is* the current task.  Where
+     the answer is yes the plugin samples at that privilege level,
      which is what lets a guest context switch performed entirely inside
      the kernel retag the strand instead of leaving the work credited to
      whichever thread last returned to user on that vCPU.
+   * ``qemu_plugin_set_current_task_offset`` — declares the per-image
+     byte offset of the guest kernel's current-task pointer within its
+     per-CPU region, for targets whose kernels keep no per-task pointer
+     in a register at kernel privilege.  Linux/x86-64 reaches
+     ``current`` through the swapped-in kernel GS base at the per-CPU
+     offset of ``current_task`` (``pcpu_hot + 0`` on
+     ``6.2 <= v < 6.14``) — a link-time constant unrecoverable from
+     architectural state, so the tracer derives it per kernel build
+     (symbol table, ``System.map``, or the guest's own
+     ``/proc/kallsyms``; the validator's ``derive_curtask`` module
+     automates all three) and passes it as the ``curtask_off=`` plugin
+     option.  Undeclared, the target keeps its register-only contract
+     unchanged: TLS-less tasks share the identity minted for 0 — honest
+     indistinctness rather than a fabricated identity.
    * ``qemu_plugin_vaddr_is_kernel`` — classifies a code virtual
      address's privilege domain through the target's own MMU / segment
      logic: a kernel-vs-user split that needs no page-table walk and is

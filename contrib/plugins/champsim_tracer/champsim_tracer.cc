@@ -3520,6 +3520,23 @@ static void start_trace_segment(const char *label,
             if (tiddiag_on()) {
                 tiddiag_note_binding(cpu_index, seed_thread_id);
             }
+            if (seed_priv == 0) {
+                /* The seed IS a user sample of the opener (the marker's
+                 * own user context), so it must arm the kernel-entry
+                 * alias exactly as a user thread_identity_sample does:
+                 * a segment whose FIRST body steps are already inside a
+                 * kernel excursion of the opener (marker directly
+                 * followed by a syscall/interrupt) otherwise MINTS a
+                 * fresh strand for the opener's own task value — the
+                 * opener's kernel work then splits from its user id,
+                 * violating rule (a) from the first exit edge.  The
+                 * alias arm makes that first resolved kernel value join
+                 * the opener's tid, on the same exception-edge evidence
+                 * as every later entry (the excursion the window opened
+                 * into was entered by the thread that ran the marker). */
+                g_vcpu_alias_pending[cpu_index] = true;
+                g_vcpu_alias_budget[cpu_index] = CST_ALIAS_KSAMPLE_BUDGET;
+            }
         }
         g_vcpu_cur_tid[cpu_index] = seed_thread_id;
     }
@@ -8635,6 +8652,33 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     if (cfg.interrupts != 0 && !g_system_mode) {
         fprintf(stderr, "champsim_tracer: interrupts=1 ignored in user mode "
                 "(no asynchronous-interrupt delivery exists)\n");
+    }
+
+    /* Per-image current-task offset (curtask_off=0x...).  Declared to
+     * QEMU, whose x86-64 target resolves kernel-privilege thread
+     * identity by reading the kernel's per-CPU current-task pointer at
+     * this offset through the live kernel GS base — the same
+     * "current, iff the identity register holds a kernel VA" contract
+     * AArch64 (SP_EL0) and MIPS ($28) answer from a register, which
+     * x86-64 architecturally cannot (the offset is decided at kernel
+     * link time).  Absent, kernel identity keeps the register-only
+     * contract byte-for-byte: every TLS-less task shares the identity
+     * minted for 0.  The declaration itself is target-agnostic; warn
+     * where nothing consumes it so a mis-aimed option is loud. */
+    if (cfg.curtask_off_set) {
+        qemu_plugin_set_current_task_offset(cfg.curtask_off);
+        if (!g_system_mode) {
+            fprintf(stderr, "champsim_tracer: curtask_off ignored in user "
+                    "mode (no guest kernel runs)\n");
+        } else if (trace_isa != TRACE_ISA_X86) {
+            fprintf(stderr, "champsim_tracer: curtask_off declared but only "
+                    "the x86-64 target consumes it (this target's kernel "
+                    "keeps its task pointer in a register)\n");
+        } else {
+            fprintf(stderr, "champsim_tracer: kernel current-task pointer at "
+                    "per-CPU offset 0x%" PRIx64 " (per-image; derive from "
+                    "the running kernel build)\n", cfg.curtask_off);
+        }
     }
 
     /* Physical-page capture is SYSTEM-MODE ONLY: qemu_plugin_get_hwaddr

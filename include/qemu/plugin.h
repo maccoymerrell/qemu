@@ -213,6 +213,19 @@ void qemu_plugin_devio_stop(uint64_t request_id);
 
 void qemu_plugin_atexit_cb(void);
 
+/*
+ * Guest-kernel current-task location hint, declared by a plugin via
+ * qemu_plugin_set_current_task_offset() and consumed by a target's
+ * plugin-state hooks (today: x86-64's get_plugin_thread_ptr /
+ * plugin_thread_ptr_tracks_current, which dereference the kernel
+ * per-CPU base at this offset to name the running task at CPL0).
+ * Returns the declared offset; *@set reports whether one was declared
+ * at all — an undeclared hint MUST leave the target's legacy
+ * register-only behaviour untouched.
+ */
+uint64_t qemu_plugin_current_task_offset(bool *set);
+void qemu_plugin_current_task_offset_store(uint64_t offset);
+
 void qemu_plugin_add_dyn_cb_arr(GArray *arr);
 
 static inline void qemu_plugin_disable_mem_helpers(CPUState *cpu)

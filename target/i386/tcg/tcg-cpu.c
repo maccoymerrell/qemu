@@ -26,6 +26,8 @@
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
 #include "qemu/timer.h"
 #include "system/cpu-timers.h"
+#include "qemu/plugin.h"
+#include "qemu/bswap.h"
 #endif
 
 #include "tcg-cpu.h"
@@ -145,6 +147,78 @@ static void x86_get_plugin_state(CPUState *cs, int *priv, uint64_t *asid,
     *mmu_on = (env->cr[0] & CR0_PG_MASK) != 0;
 }
 
+static bool x86_vaddr_is_kernel(CPUState *cs, uint64_t vaddr);
+
+/*
+ * Resolve the guest kernel's `current` at CPL0 through the per-CPU
+ * area, for a task with no TLS identity (FS.base == 0).  Engaged only
+ * when a plugin has declared the per-image current_task per-CPU offset
+ * (qemu_plugin_set_current_task_offset); undeclared, the legacy
+ * register-only contract is untouched byte-for-byte.
+ *
+ * The contract, as the kernel source states it (Linux 6.6/6.12,
+ * arch/x86/entry/entry_64.S paranoid_entry): "the kernel enforces that
+ * negative GSBASE values indicate kernel GSBASE" — in-kernel, GS.base
+ * is the per-CPU base (a kernel VA), swapped in by SWAPGS at every
+ * entry from user; the user GS base is 0 or a user VA
+ * (do_arch_prctl_64 refuses ARCH_SET_GS >= TASK_SIZE_MAX, and the
+ * 32-bit GDT TLS descriptors cannot reach the kernel half).  `current`
+ * is the per-CPU variable current_task (pcpu_hot + 0 on
+ * 6.2 <= v < 6.14), so at CPL0 with kernel GS the task is one load:
+ * *(GS.base + offset).
+ *
+ * The states this helper refuses, each resolving to "cannot vouch"
+ * (tracks_current false -> the consumer inherits the entering thread,
+ * which in every refused window IS the current task):
+ *
+ *  - SWAPGS windows: entry_SYSCALL_64 before its first-instruction
+ *    swapgs; the idtentry push sequence up to error_entry's swapgs;
+ *    paranoid_entry (NMI/#DB/#MC/#DF) delivered before an entry path's
+ *    swapgs ran, until SAVE_AND_SET_GSBASE / the conditional swapgs;
+ *    the exit twins (paranoid_exit's wrgsbase/swapgs .. iret,
+ *    swapgs_restore_regs_and_return_to_usermode's tail); and
+ *    asm_load_gs_index's deliberate user-GS bracket.  GS.base holds a
+ *    user value there, fails the kernel-VA test, and no context switch
+ *    can occur inside such a window — inheritance is exact, the same
+ *    treatment the AArch64/MIPS early-entry windows get.
+ *  - A failed or unmapped load (a PTI user page table in the entry
+ *    window — canonical runs are nopti — or pre-paging early boot).
+ *  - A loaded value that is not a kernel VA (per-CPU area not yet
+ *    initialised at early boot).
+ *
+ * Known residual, named not hidden: TCG advertises FSGSBASE, and "with
+ * FSGSBASE no assumptions can be made about the GSBASE value when
+ * entering from user space" (paranoid_entry comment) — a guest thread
+ * that deliberately WRGSBASEs a kernel-half VA forges the kernel-GS
+ * signature for its own entry windows.  The value gate above bounds it
+ * (the forged base must ALSO hold a kernel-VA-shaped word at the
+ * offset); the class is the same accepted one as an AArch64 user
+ * setting SP to a kernel-shaped value before trapping.
+ */
+static bool x86_kernel_current_task(CPUState *cs, uint64_t *task)
+{
+    CPUX86State *env = cpu_env(cs);
+    bool declared;
+    uint64_t off = qemu_plugin_current_task_offset(&declared);
+    if (!declared) {
+        return false;
+    }
+    uint64_t gsbase = env->segs[R_GS].base;
+    if (!x86_vaddr_is_kernel(cs, gsbase)) {
+        return false;                        /* swapgs window / early boot */
+    }
+    uint8_t buf[8];
+    if (cpu_memory_rw_debug(cs, gsbase + off, buf, sizeof(buf), false) < 0) {
+        return false;
+    }
+    uint64_t t = ldq_le_p(buf);
+    if (!x86_vaddr_is_kernel(cs, t)) {
+        return false;
+    }
+    *task = t;
+    return true;
+}
+
 static uint64_t x86_get_plugin_thread_ptr(CPUState *cs)
 {
     CPUX86State *env = cpu_env(cs);
@@ -155,19 +229,61 @@ static uint64_t x86_get_plugin_thread_ptr(CPUState *cs)
      * base the segment cache carries.  Selected by the current CS.L, so
      * sample at user privilege (in-kernel the bases are mid-switch and
      * GS is swapped onto the kernel's per-CPU base).
+     *
+     * FS.base == 0 at CPL0 is a task with no TLS identity — a kernel
+     * thread, a per-CPU idle task, or a TLS-less user task's kernel
+     * excursion: distinct program paths that would otherwise all
+     * collapse onto the one identity 0.  Fall through to the kernel's
+     * own per-task contract — `current` through the kernel GS base at
+     * the plugin-declared per-image offset (x86_kernel_current_task) —
+     * exactly as AArch64 falls back to SP_EL0-as-current and MIPS to
+     * $28-as-current_thread_info.  The kernel CS is long-mode, so CPL0
+     * always takes the CS64 arm; a compat task's kernel excursion
+     * resolves its task pointer here and the plugin's kernel-entry
+     * alias joins it to the thread's user (GS.base) identity.
      */
     if (env->hflags & HF_CS64_MASK) {
-        return env->segs[R_FS].base;
+        uint64_t tp = env->segs[R_FS].base;
+        if (tp == 0 && (env->hflags & HF_CPL_MASK) == 0) {
+            uint64_t task;
+            if (x86_kernel_current_task(cs, &task)) {
+                return task;
+            }
+        }
+        return tp;
     }
     return env->segs[R_GS].base;
 }
 
 static bool x86_plugin_thread_ptr_tracks_current(CPUState *cs)
 {
+    CPUX86State *env = cpu_env(cs);
     /* FS.base (GS.base for a compat task) is user TLS state; the kernel's
      * own per-CPU base lives in the swapped GS, so the user register is
      * reloaded from the incoming task at every switch and untouched in
-     * between, at any CPL. */
+     * between, at any CPL.  A non-zero read therefore names the current
+     * task wherever it is taken.
+     *
+     * The one state that cannot vouch for itself is CPL0 with
+     * FS.base == 0: the register names nothing there, and whether the
+     * per-CPU fallback can answer instead is a property of THIS sample
+     * (kernel GS in, mapping readable, value task-shaped — see
+     * x86_kernel_current_task).  Mirror the get-hook exactly: true iff
+     * the value the get-hook would return actually names the task.
+     * With no declared offset this reports true and the get-hook
+     * returns 0 — the pre-hint contract, byte-for-byte, in which every
+     * TLS-less task shares the one identity 0 (honest indistinctness
+     * for lack of a per-image offset, not a fabricated identity). */
+    if ((env->hflags & HF_CS64_MASK) &&
+        (env->hflags & HF_CPL_MASK) == 0 &&
+        env->segs[R_FS].base == 0) {
+        bool declared;
+        uint64_t task;
+        qemu_plugin_current_task_offset(&declared);
+        if (declared) {
+            return x86_kernel_current_task(cs, &task);
+        }
+    }
     return true;
 }
 

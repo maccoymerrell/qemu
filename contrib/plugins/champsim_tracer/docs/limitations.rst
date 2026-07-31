@@ -325,14 +325,43 @@ slot detail in the interior of transfers larger than 8 KiB.
 
 .. _limits-kernel-strand:
 
-**Kernel-strand identity depends on the target's thread-pointer
-register.**  ``thread_id`` on a kernel block names the task that is
-current while it runs, and the producer learns that from the same
-per-thread pointer register it uses for user code (x86-64 ``FS.base``,
-AArch64 ``TPIDR_EL0``, MIPS CP0 ``UserLocal``).  Those three are
-architecturally the kernel's to reload and nothing else's, so Linux
-writes them from the incoming task at every context switch and a read
-inside the kernel is exact.  **RISC-V reaches the same guarantee by a
+**Kernel-strand identity follows the guest kernel's own ``current``
+contract.**  ``thread_id`` on a kernel block names the task that is
+current while it runs.  For a task with a TLS base the producer learns
+that from the same per-thread pointer register it uses for user code
+(x86-64 ``FS.base``, AArch64 ``TPIDR_EL0``, MIPS CP0 ``UserLocal``):
+those three are architecturally the kernel's to reload and nothing
+else's, so Linux writes them from the incoming task at every context
+switch and a non-zero read inside the kernel is exact.  A task with
+*no* TLS base — every kernel thread, every per-CPU idle task, a
+TLS-less user program — leaves that register 0, and for those the
+producer falls back, at kernel privilege only, to where the kernel
+itself keeps ``current``: AArch64 reports ``SP_EL0`` and MIPS ``$28``
+iff the value is a kernel virtual address (the in-kernel homes of
+``current`` and ``current_thread_info``; a user-shaped value means an
+early entry window whose install has not run yet, and the sample
+honestly declines so the strand inherits the entering thread — which
+is the interrupted thread itself).  x86-64 keeps no per-task pointer
+in a register at CPL0 — ``current`` is the per-CPU variable
+``current_task`` behind the swapped-in kernel GS base at a link-time
+offset — so its fallback is a read: given the per-image offset
+(``curtask_off=``, derived from the kernel build's symbol table,
+``System.map``, or the guest's ``/proc/kallsyms`` — the validator's
+``derive_curtask`` module automates this), the producer dereferences
+the kernel GS base at that offset, refusing the SWAPGS windows where
+the user GS base is still live (entry before ``swapgs``, exit after
+it, the paranoid NMI/#DB/#MC paths' brackets) exactly as the
+AArch64/MIPS entry windows are refused.  Without ``curtask_off`` the
+x86-64 fallback does not exist and every TLS-less task shares the id
+minted for 0 — the offset is decided at kernel link time, differs per
+build, and reading a guessed one would mint *wrong* identities rather
+than merged ones, so absence degrades to honest indistinctness.
+Kernel threads therefore split into per-task strands (the per-CPU
+idle tasks included) wherever the fallback can answer, and the
+kernel-entry alias joins a TLS-less thread's two raw identities (0 in
+user, its task pointer in kernel) at the exception edge so kernel
+work done on a thread's behalf keeps that thread's id.
+**RISC-V reaches the kernel-privilege guarantee by a
 different route.**  No single RISC-V register names the task at every
 privilege: the S-mode trap entry swaps ``tp`` with ``sscratch``, so the
 task pointer moves between the two registers four times per trap and
@@ -356,11 +385,16 @@ Wherever a kernel block does carry the thread that merely *entered* the
 kernel on that vCPU rather than the one running — the two RISC-V
 contexts above, or work left behind on a vCPU the traced thread has
 migrated off — the block is credited to the wrong thread, and two such
-strands can braid inside one ``(thread_id, asid)`` context.  Where the register is
-never written at all (a MIPS model without ``Config3.ULRI``, a guest
-that sets no TLS) every thread reports 0 and they collapse to one id:
-honest indistinctness, not fabricated identity.  Kernel threads, which
-carry no TLS pointer, likewise share the id minted for 0.
+strands can braid inside one ``(thread_id, asid)`` context.  At *user*
+privilege no fallback exists — there is nothing but the TLS register to
+read — so where it is never written (a MIPS model without
+``Config3.ULRI``, a guest that sets no TLS) every user thread reports 0
+and user-privilege entries collapse to one id: honest indistinctness,
+not fabricated identity.  Their kernel excursions still resolve
+per-task through the kernel-privilege fallback, and the entry alias
+keeps each excursion on the id of the thread that entered; only
+distinct *user* bodies remain unseparated.  On x86-64 without
+``curtask_off`` the kernel side collapses too, as described above.
 
 On the targets where the sample *is* trusted at kernel privilege, the
 handoff lands where the guest kernel declares the incoming task — the

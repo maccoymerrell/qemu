@@ -808,9 +808,10 @@ static bool g_system_mode;
  *
  * SYSTEM mode has to derive the identity, because one vCPU hosts every
  * thread the guest scheduler puts on it.  The kernel-maintained per-thread
- * pointer register (x86-64 FS.base, AArch64 TPIDR_EL0, RISC-V tp, MIPS CP0
- * UserLocal — qemu_plugin_get_thread_ptr) is that identity: every
- * mainstream kernel reloads it from the incoming task at each context
+ * pointer register (x86-64 FS.base, AArch64 TPIDR_EL0, MIPS CP0
+ * UserLocal, and on RISC-V the kernel's current-task pointer, sscratch/tp
+ * per the trap-entry swap — qemu_plugin_get_thread_ptr) is that identity:
+ * every mainstream kernel reloads it from the incoming task at each context
  * switch.  A per-SEGMENT map assigns each distinct value a compact tid in
  * first-sighting order (0, 1, 2, …), so a single-threaded traced process is
  * always tid 0 regardless of vCPU, and the field width (small ints) is
@@ -825,10 +826,12 @@ static bool g_system_mode;
  * inside the kernel be followed: a freshly cloned child finishing its
  * ret_from_fork before it has ever run a user instruction, a kernel thread
  * scheduled in on a borrowed mm, or a handler running after the scheduler
- * moved on.  Where it does not (RISC-V, whose trap entry repurposes tp),
- * only user-privilege samples are trusted and kernel code inherits the
- * thread that entered the kernel on that vCPU — see the KERNEL-STRAND
- * degradation note in docs/limitations.rst.  Both structures are guarded by
+ * moved on.  Since plugin API v14 that includes RISC-V at S privilege (the
+ * target reports the current-task pointer, one value space across U/S);
+ * the answer is per-STATE, so it is re-asked at each privileged sample —
+ * M-mode firmware and H-extension virtualization stay untrusted, and
+ * kernel code there inherits the thread that entered on that vCPU — see
+ * the KERNEL-STRAND note in docs/limitations.rst.  Both structures are guarded by
  * exec_lock (every sample and every emit runs under it) and reset per
  * segment.
  *
@@ -948,6 +951,15 @@ static bool tiddiag_on(void)
     return tiddiag_level() > 0;
 }
 
+/* CST_TID2_DIAG: stderr-only condition instrument for the SMP async-owner
+ * work — which vCPU mints identities when, and which vCPU receives async
+ * interrupts in whose context.  Never wire content. */
+static bool tid2diag_on(void)
+{
+    static const bool v = getenv("CST_TID2_DIAG") != nullptr;
+    return v;
+}
+
 /* CST_TIDDIAG=2: trace every transition of the thread-pointer register as
  * sampled on THIS vCPU, at whatever privilege the TB runs at, so an offline
  * check can answer whether the register discriminates KERNEL strands (a
@@ -992,17 +1004,16 @@ static void tiddiag_note_binding(unsigned int cpu_index, uint32_t tid)
     }
 }
 
-/* Whether this target's thread-pointer register still names the executing
- * software thread when sampled above user privilege.  Latched once (the
- * answer is a property of the target, not of the run); first call is from a
- * vCPU context, which the plugin API requires. */
+/* Whether the thread pointer still names the executing software thread in
+ * the vCPU's CURRENT state.  Deliberately NOT latched: since plugin API v14
+ * the answer is a property of the sampling context, not of the target —
+ * RISC-V reports true at U/S privilege (where the reported value is the
+ * kernel's current-task pointer) but false in M-mode firmware and under
+ * H-extension virtualization.  Called only on privileged samples (user
+ * privilege short-circuits in thread_ptr_sample), from a vCPU context. */
 static bool thread_ptr_tracks_current(void)
 {
-    static int cap = -1;
-    if (cap < 0) {
-        cap = qemu_plugin_thread_ptr_tracks_current() ? 1 : 0;
-    }
-    return cap != 0;
+    return qemu_plugin_thread_ptr_tracks_current();
 }
 
 /* Read the guest-thread pointer for the vCPU running at @live_priv, into
@@ -1052,6 +1063,10 @@ static void pin_user_vcpu_observe(unsigned int cpu_index)
     }
     uint64_t before = g_pin_user_vcpu_mask;
     g_pin_user_vcpu_mask |= (uint64_t)1 << cpu_index;
+    if (tid2diag_on() && g_pin_user_vcpu_mask != before) {
+        fprintf(stderr, "champsim_tracer: [tid2] PINUSER vcpu=%u\n",
+                cpu_index);
+    }
     if (before != 0 && g_pin_user_vcpu_mask != before &&
         !g_pin_multivcpu_warned) {
         g_pin_multivcpu_warned = true;
@@ -1138,7 +1153,13 @@ static uint32_t thread_identity_sample(unsigned int cpu_index, int live_priv)
     g_vcpu_pending_tid_valid[cpu_index] = false;
     uint64_t tp;
     if (thread_ptr_sample(live_priv, &tp) && tp != g_vcpu_last_tp[cpu_index]) {
+        uint32_t next_before = g_thread_tid_next;
         uint32_t tid = thread_ptr_to_tid(tp);
+        if (tid2diag_on() && g_thread_tid_next != next_before) {
+            fprintf(stderr, "champsim_tracer: [tid2] MINT vcpu=%u priv=%d "
+                    "tp=0x%" PRIx64 " tid=%u\n",
+                    cpu_index, live_priv, tp, tid);
+        }
         g_vcpu_pending_tp[cpu_index] = tp;
         g_vcpu_pending_tid[cpu_index] = tid;
         g_vcpu_pending_tid_valid[cpu_index] = true;
@@ -5389,6 +5410,55 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
      * seal phase, which is what frame ownership and the depth stamp count
      * against. */
     in.cur_tid = thread_identity_peek(cpu_index, live_priv);
+    /* The step's RAW thread pointer, for the async-owner predicate (see
+     * StepIn::cur_tp).  Where the register cannot be trusted at this
+     * privilege the step inherits the vCPU's last COMMITTED pointer — the
+     * entering thread — mirroring cur_tid's inheritance; before any commit
+     * on this vCPU nothing is known and the flag stays false. */
+    if (g_system_mode && cpu_index < CST_PIN_MAX_VCPUS) {
+        uint64_t step_tp;
+        if (thread_ptr_sample(live_priv, &step_tp)) {
+            in.cur_tp = step_tp;
+            in.cur_tp_ok = true;
+        } else if (g_vcpu_last_tp[cpu_index] != CST_TP_UNSEEN) {
+            in.cur_tp = g_vcpu_last_tp[cpu_index];
+            in.cur_tp_ok = true;
+        }
+    }
+
+    /* CST_TID2_DIAG: the delivery-condition instrument for the SMP async
+     * ownership work.  For every async edge drained this step, print the
+     * step's vCPU, the event's own privilege/pc/asid, the LIVE thread
+     * pointer at the drain step (raw, plus whether the current privilege
+     * makes it trustworthy), the identity map's verdict on it, and the
+     * step's gates — which vCPU mints when, and which vCPU receives
+     * interrupts in whose context, in one joinable stream.  stderr only;
+     * no behavioural change. */
+    if (tid2diag_on() && g_system_mode) {
+        for (size_t di = 0; di < in.n_evs; di++) {
+            const struct qemu_plugin_cpu_event &dev = in.evs[di];
+            if (dev.kind != QEMU_PLUGIN_CPU_EV_ASYNC_ENTER &&
+                dev.kind != QEMU_PLUGIN_CPU_EV_ASYNC_RETURN) {
+                continue;
+            }
+            uint64_t dtp = qemu_plugin_get_thread_ptr();
+            bool dtrust = live_priv == 0 || thread_ptr_tracks_current();
+            bool dhit = g_thread_tid_map &&
+                        g_thread_tid_map->count(dtp) != 0;
+            fprintf(stderr, "champsim_tracer: [tid2] %s vcpu=%u evpriv=%d "
+                    "evpc=0x%" PRIx64 " evasid=0x%" PRIx64
+                    " evtp=0x%" PRIx64 " evtpok=%d live_priv=%d "
+                    "tp=0x%" PRIx64 " trust=%d maphit=%d peek=%u uown=%d "
+                    "mapsz=%zu\n",
+                    dev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_ENTER ? "ENTER"
+                                                               : "RETURN",
+                    cpu_index, (int)dev.priv, dev.pc, dev.asid,
+                    dev.tp, (int)dev.tp_ok, live_priv,
+                    dtp, (int)dtrust, (int)dhit, in.cur_tid,
+                    (int)in.user_owned,
+                    g_thread_tid_map ? g_thread_tid_map->size() : 0);
+        }
+    }
 
     /* Pre-window phase: async-window arrows, foreign-ASID boundary, prev
      * swap — in that order, before any window decision. */

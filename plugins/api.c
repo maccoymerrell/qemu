@@ -711,7 +711,8 @@ bool qemu_plugin_thread_ptr_tracks_current(void)
     g_assert(current_cpu);
     const TCGCPUOps *ops = current_cpu->cc->tcg_ops;
     return ops && ops->get_plugin_thread_ptr &&
-           ops->plugin_thread_ptr_tracks_current;
+           ops->plugin_thread_ptr_tracks_current &&
+           ops->plugin_thread_ptr_tracks_current(current_cpu);
 }
 
 bool qemu_plugin_vaddr_is_kernel(uint64_t vaddr)
@@ -926,6 +927,9 @@ void qemu_plugin_cpu_events_set(unsigned int vcpu_index, bool enabled)
     if (!cpu) {
         return;
     }
+    if (cpu->plugin_evq.enabled != enabled) {
+        cpu_plugin_async_probe(cpu, enabled ? "QON" : "QOFF", 0, false);
+    }
     cpu->plugin_evq.enabled = enabled;
     cpu->plugin_evq.len = 0;
 }
@@ -952,6 +956,7 @@ void qemu_plugin_async_int_reset(void)
 {
 #ifndef CONFIG_USER_ONLY
     if (current_cpu) {
+        cpu_plugin_async_probe(current_cpu, "RESET", 0, false);
         current_cpu->plugin_in_async_int = false;
     }
 #endif

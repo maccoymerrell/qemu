@@ -11116,13 +11116,19 @@ void arm_cpu_do_interrupt(CPUState *cs)
      * vector entry); skipped during wrong-path so a speculative path never
      * sets it.
      */
-    if (!cs->plugin_spec_mode && !cs->plugin_in_async_int) {
+    {
         int idx = cs->exception_index;
         bool is_async = (idx == EXCP_IRQ || idx == EXCP_FIQ ||
                          idx == EXCP_VIRQ || idx == EXCP_VFIQ ||
                          idx == EXCP_VSERR || idx == EXCP_NMI ||
                          idx == EXCP_VINMI || idx == EXCP_VFNMI);
-        if (is_async) {
+        /* Instrument every delivery, including the ones the gates below
+         * discard, so "no window opened" and "no interrupt arrived" are
+         * distinguishable. */
+        cpu_plugin_async_probe(cs, is_async ? "IRQ" : "EXC", idx, is_async);
+        if (cs->plugin_spec_mode || cs->plugin_in_async_int) {
+            /* wrong path, or a delivery nested inside an open window */
+        } else if (is_async) {
             /* Enter the async excursion; record the departure context
              * (interrupted PC + thread pointer) so the exception return
              * that lands back there, in the departed thread, ends it.

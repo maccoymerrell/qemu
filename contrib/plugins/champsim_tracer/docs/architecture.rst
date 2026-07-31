@@ -970,10 +970,13 @@ fault events exactly once, then runs the shared seal walk:
   ``0`` on the new one — the documented single-core-pin scope boundary,
   the same one the migration warning names; ownership prevents a thread
   from inheriting a stranger's depth, it does not move an excursion
-  between ledgers.  Where the target cannot sample the thread pointer at
-  kernel privilege (RISC-V), kernel code inherits the entering thread's
-  identity and its frames with it — the KERNEL-STRAND degradation
-  described in :doc:`limitations`, unchanged here.
+  between ledgers.  Where the target cannot vouch for the thread pointer
+  in the context at hand — RISC-V M-mode firmware and H-extension
+  virtualization, the two states the per-sample
+  ``qemu_plugin_thread_ptr_tracks_current`` still answers no in — kernel
+  code inherits the entering thread's identity and its frames with it:
+  the KERNEL-STRAND degradation described in :doc:`limitations`,
+  unchanged here.
 
   The stamp is taken **twice per seal**, because the seal moves
   ``frames_`` twice: the event drain at its head pushes new frames and

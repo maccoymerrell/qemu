@@ -602,6 +602,14 @@ static uint64_t mips_get_plugin_thread_ptr(CPUState *cs)
     return cpu_env(cs)->active_tc.CP0_UserLocal;
 }
 
+static bool mips_plugin_thread_ptr_tracks_current(CPUState *cs)
+{
+    /* UserLocal is user-TLS-only state the kernel has no use of its own
+     * for; it is reloaded from the incoming task at every switch and
+     * untouched in between, at any privilege. */
+    return true;
+}
+
 static bool mips_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
 {
     /*
@@ -668,7 +676,7 @@ static const TCGCPUOps mips_tcg_ops = {
      * own for: Linux/MIPS writes it from the incoming task in switch_to()
      * and never touches it in between, so a kernel-privilege read names
      * the current task (0 for a kernel thread). */
-    .plugin_thread_ptr_tracks_current = true,
+    .plugin_thread_ptr_tracks_current = mips_plugin_thread_ptr_tracks_current,
     .vaddr_is_kernel = mips_vaddr_is_kernel,
     .spec_clock_resync = mips_spec_clock_resync,
 #endif

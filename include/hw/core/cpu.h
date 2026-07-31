@@ -486,10 +486,19 @@ typedef enum QemuPluginCpuEventKind {
 typedef struct QemuPluginCpuEvent {
     uint8_t  kind;          /* QemuPluginCpuEventKind */
     uint8_t  priv;          /* privilege level at the event instant */
+    uint8_t  tp_ok;         /* @tp named the executing thread at the event
+                             * instant (user privilege, or the target's
+                             * tracks-current hook held in that state) */
     uint32_t depth_after;   /* plugin_fault_depth after applying the event */
     uint64_t pc;            /* resume PC (fault) / departure PC (async) */
     uint64_t asid;          /* address-space id at the event instant */
+    uint64_t tp;            /* thread pointer at the event instant; for an
+                             * ASYNC_ENTER, the DELIVERING thread's (pushed
+                             * before any handler state switches) */
 } QemuPluginCpuEvent;
+
+/* The drain hands the buffer to plugins as struct qemu_plugin_cpu_event;
+ * the two layouts must stay identical (checked in plugins/api.c). */
 
 typedef struct QemuPluginCpuEventQueue {
     QemuPluginCpuEvent *buf;    /* grow-only; owned by the vCPU */
@@ -904,6 +913,15 @@ void cpu_plugin_evq_push(CPUState *cpu, int kind, uint64_t pc,
  * edge (!plugin_in_async_int) and on the correct path (!plugin_spec_mode);
  * defined in plugins/core.c, where the per-target hooks are reachable. */
 void cpu_plugin_async_enter(CPUState *cpu, uint64_t departure_pc);
+
+/* Condition instrument (CST_ASYNCPROD_DIAG), called by each target's
+ * do_interrupt for EVERY delivery it classifies, before the correct-path /
+ * outermost-edge gates: reports which vCPU received which exception in what
+ * state (spec mode, an async window already open, event queue enabled), so a
+ * window that never opens can be told apart from one that opens and is never
+ * consumed.  A no-op unless the variable is set; never changes behaviour. */
+void cpu_plugin_async_probe(CPUState *cpu, const char *tag, int exc_index,
+                            bool is_async);
 
 static inline void cpu_plugin_fault_push(CPUState *cpu, uint64_t resume_pc)
 {

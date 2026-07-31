@@ -143,18 +143,67 @@ void cpu_plugin_evq_push(CPUState *cpu, int kind, uint64_t pc,
         ops->get_plugin_state(cpu, &priv, &asid, &mmu_on);
     }
 
+    /*
+     * The thread pointer at the event instant, with whether it names the
+     * executing thread here (user privilege always does; above it the
+     * target's tracks-current hook answers for this exact state).  For an
+     * ASYNC_ENTER this is the DELIVERING thread — the do_interrupt hooks
+     * push before any guest state switches — which the consumer cannot
+     * recover at drain time: by then the vCPU is inside the handler, and
+     * on an SMP guest the delivered-into context may never be sampled
+     * again.
+     */
+    uint64_t tp = 0;
+    bool tp_ok = false;
+    if (ops && ops->get_plugin_thread_ptr) {
+        tp = ops->get_plugin_thread_ptr(cpu);
+        tp_ok = priv == 0 ||
+                (ops->plugin_thread_ptr_tracks_current &&
+                 ops->plugin_thread_ptr_tracks_current(cpu));
+    }
+
     q->buf[q->len++] = (QemuPluginCpuEvent) {
         .kind = (uint8_t)kind,
         .priv = (uint8_t)priv,
+        .tp_ok = tp_ok,
         .depth_after = depth_after,
         .pc = pc,
         .asid = asid,
+        .tp = tp,
     };
 }
 
 void cpu_plugin_async_enter(CPUState *cpu, uint64_t departure_pc)
 {
     const TCGCPUOps *ops = cpu->cc->tcg_ops;
+
+    /*
+     * The flag and the ASYNC_ENTER event are ONE latch: never open a window
+     * no consumer can be told about.  plugin_in_async_int gates every
+     * producer on the outermost edge (!plugin_in_async_int), and the only
+     * thing that clears it is the departure PC being re-fetched, in the
+     * departure thread, ON THIS vCPU.  Latching it while the event queue is
+     * disabled — the whole pre-marker boot, and any inter-segment gap —
+     * therefore arms a window the plugin never learns of and cannot reap: if
+     * that departure context never resumes here (a boot/idle/kthread context
+     * on a vCPU the guest later parks, the common case once there is more
+     * than one vCPU), the flag stays true for the rest of the run and every
+     * later interrupt is swallowed by the edge gate.  Measured on aarch64
+     * --smp 2: both vCPUs entered the traced segment already latched, and 135
+     * of 135 in-segment deliveries were swallowed — the async-window feature
+     * silently inert on every SMP trace.
+     *
+     * With no consumer there is nothing for the window to mean: the tracer's
+     * own readers (qemu_plugin_in_async_int) only act while it is emitting,
+     * which is exactly when the queue is enabled.
+     */
+    static int nogate = -1;      /* CST_ASYNC_NOGATE: A/B the latch gate */
+    if (nogate < 0) {
+        nogate = getenv("CST_ASYNC_NOGATE") != NULL;
+    }
+    if (!cpu->plugin_evq.enabled && !nogate) {
+        return;
+    }
 
     cpu->plugin_in_async_int = true;
     cpu->plugin_async_departure_pc = departure_pc;
@@ -172,6 +221,27 @@ void cpu_plugin_async_enter(CPUState *cpu, uint64_t departure_pc)
                                             : 0;
     cpu_plugin_evq_push(cpu, QEMU_PLUGIN_CPU_EVENT_ASYNC_ENTER, departure_pc,
                         cpu->plugin_fault_depth);
+}
+
+void cpu_plugin_async_probe(CPUState *cpu, const char *tag, int exc_index,
+                            bool is_async)
+{
+    static int on = -1;
+    static uint64_t n;
+
+    if (on < 0) {
+        on = getenv("CST_ASYNCPROD_DIAG") != NULL;
+    }
+    if (!on || n >= 40000) {
+        return;
+    }
+    n++;
+    fprintf(stderr, "[asyncprod] %-6s vcpu=%d exc=%d async=%d spec=%d "
+            "inasync=%d evq=%d fdepth=%u pc=0x%" PRIx64 "\n",
+            tag, cpu->cpu_index, exc_index, (int)is_async,
+            (int)cpu->plugin_spec_mode, (int)cpu->plugin_in_async_int,
+            (int)cpu->plugin_evq.enabled, cpu->plugin_fault_depth,
+            (uint64_t)cpu->cc->get_pc(cpu));
 }
 
 struct qemu_plugin_cb {

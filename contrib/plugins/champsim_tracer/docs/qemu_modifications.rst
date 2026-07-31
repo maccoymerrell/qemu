@@ -201,20 +201,27 @@ Plugin API additions
      pages — and backs the ``physaddr=1`` per-memop physical-page
      records.
    * ``qemu_plugin_get_thread_ptr`` — the kernel-maintained per-thread
-     pointer register for the running thread, giving guest-thread
-     identity independent of the vCPU a thread happens to be scheduled
-     on.  The plugin keys ``thread_id`` off it rather than the vCPU
-     index.
-   * ``qemu_plugin_thread_ptr_tracks_current`` — whether that register
-     still names the executing software thread when sampled *above* user
-     privilege.  It is a per-target property: MIPS ``UserLocal``,
-     AArch64 ``TPIDR_EL0`` and x86-64 ``FS.base`` are the kernel's to
-     reload and nobody else's, so a kernel-privilege read names the
-     current task; RISC-V swaps ``tp`` with ``sscratch`` on trap entry,
-     so its in-kernel value is a different quantity entirely.  Where the
-     answer is yes the plugin samples at every privilege level, which is
-     what lets a guest context switch performed entirely inside the
-     kernel retag the strand instead of leaving the work credited to
+     pointer state for the running thread, giving guest-thread identity
+     independent of the vCPU a thread happens to be scheduled on: x86-64
+     ``FS.base``, AArch64 ``TPIDR_EL0``, MIPS CP0 ``UserLocal``, and on
+     RISC-V the kernel's current-task pointer (whichever of ``tp`` /
+     ``sscratch`` holds a kernel address — the trap entry swaps them, so
+     neither register alone spans both privileges).  The plugin keys
+     ``thread_id`` off it rather than the vCPU index.
+   * ``qemu_plugin_thread_ptr_tracks_current`` — whether the value the
+     hook above reports still names the executing software thread when
+     sampled *above* user privilege.  It is a property of the sampling
+     **context**, not a flat per-target answer, and the plugin re-asks it
+     at every privileged sample rather than latching one verdict per run.
+     MIPS ``UserLocal``, AArch64 ``TPIDR_EL0`` and x86-64 ``FS.base`` are
+     the kernel's to reload and nobody else's, so they answer yes at any
+     privilege.  RISC-V answers yes at U and S privilege — where the
+     reported value is the kernel's current-task pointer, selected from
+     the ``tp``/``sscratch`` pair by which one holds a kernel address —
+     and no in M-mode firmware and under H-extension virtualization.
+     Where the answer is yes the plugin samples at that privilege level,
+     which is what lets a guest context switch performed entirely inside
+     the kernel retag the strand instead of leaving the work credited to
      whichever thread last returned to user on that vCPU.
    * ``qemu_plugin_vaddr_is_kernel`` — classifies a code virtual
      address's privilege domain through the target's own MMU / segment

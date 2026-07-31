@@ -1133,6 +1133,10 @@ void mips_cpu_do_interrupt(CPUState *cs)
      * branch, not the slot), dropping the faulting BB from the trace.
      * Mask the mips16 ISA-mode bit so the value compares against TB PCs.
      */
+    cpu_plugin_async_probe(cs,
+                           cs->exception_index == EXCP_EXT_INTERRUPT
+                           ? "IRQ" : "EXC", cs->exception_index,
+                           cs->exception_index == EXCP_EXT_INTERRUPT);
     if (cs->exception_index == EXCP_EXT_INTERRUPT &&
         !cs->plugin_spec_mode && !cs->plugin_in_async_int) {
         cpu_plugin_async_enter(cs,

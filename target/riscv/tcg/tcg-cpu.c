@@ -145,12 +145,70 @@ static void riscv_get_plugin_state(CPUState *cs, int *priv, uint64_t *asid,
     *mmu_on = (env->priv != PRV_M) && (env->satp != 0);
 }
 
+static bool riscv_vaddr_is_kernel(CPUState *cs, uint64_t vaddr);
+
 static uint64_t riscv_get_plugin_thread_ptr(CPUState *cs)
 {
-    /* tp (x4) — the ABI thread pointer, restored per thread by the
-     * kernel's user-return path.  Only meaningful at U-mode: inside
-     * the kernel tp holds the kernel's own per-CPU/task pointer. */
-    return cpu_env(cs)->gpr[4];
+    CPURISCVState *env = cpu_env(cs);
+    /*
+     * The current-task pointer, not the raw tp register.  RISC-V is the one
+     * target where the raw register cannot serve as a cross-privilege thread
+     * identity: the S-mode trap entry contract (Linux
+     * arch/riscv/kernel/entry.S, handle_exception) swaps tp with sscratch
+     * (csrrw tp, CSR_SCRATCH, tp) and later writes sscratch to 0, and the
+     * return path (csrw CSR_SCRATCH, tp, then the register restore) reverses
+     * it.  The task pointer is therefore always in ONE of the two registers,
+     * but WHICH one changes four times per trap:
+     *
+     *   in user:            tp = user TLS,   sscratch = task
+     *   trap entry, pre-swap (the first kernel TB, at stvec):
+     *                       tp = user TLS,   sscratch = task
+     *   entry, post-swap, before `csrw sscratch, x0` (.Lsave_context is a
+     *   BRANCH TARGET, so a TB starts inside this window on every trap from
+     *   user — it is not a single-step-only sliver):
+     *                       tp = task,       sscratch = user TLS
+     *   in kernel, steady:  tp = task,       sscratch = 0
+     *   kernel->kernel trap, between the swap and `csrr tp, CSR_SCRATCH`:
+     *                       tp = 0,          sscratch = task
+     *
+     * What is invariant across all five is that the task pointer is the one
+     * of the pair that is a KERNEL virtual address (task_struct lives in the
+     * kernel's direct map; a user TLS base and the 0 sentinel are not), and
+     * that is what this hook selects.  In S mode tp holds it except in the
+     * pre-swap window, so tp wins the tie; in U mode sscratch holds it.  One
+     * identity value space at every privilege, which is what a per-thread
+     * identity needs, and no window in which the two disagree silently.
+     *
+     * A guest that does not follow the convention (no S-mode OS below,
+     * sscratch never armed, paging Bare) leaves neither register looking like
+     * a kernel address and degrades to the raw tp — the historical value.
+     * M-mode firmware and H-extension virtualization are outside the
+     * contract: plugin_thread_ptr_tracks_current reports false there, and
+     * under virt the rule is not applied at all (vsscratch, not sscratch, is
+     * the swapped register).
+     */
+    if (env->virt_enabled) {
+        return env->gpr[4];
+    }
+    uint64_t tp = env->gpr[4];
+    uint64_t ss = env->sscratch;
+    if (env->priv == PRV_U) {
+        return riscv_vaddr_is_kernel(cs, ss) ? ss : tp;
+    }
+    if (riscv_vaddr_is_kernel(cs, tp)) {
+        return tp;
+    }
+    return riscv_vaddr_is_kernel(cs, ss) ? ss : tp;
+}
+
+static bool riscv_plugin_thread_ptr_tracks_current(CPUState *cs)
+{
+    CPURISCVState *env = cpu_env(cs);
+    /* The current-task rule above holds at U/S privilege outside
+     * H-extension virtualization.  M-mode firmware runs on its own tp
+     * (OpenSBI swaps it with mscratch) with the S-mode sscratch parked at
+     * 0, so a sample there names the firmware, not a guest task. */
+    return !env->virt_enabled && env->priv <= PRV_S;
 }
 
 static bool riscv_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
@@ -222,10 +280,7 @@ static const TCGCPUOps riscv_tcg_ops = {
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = riscv_get_plugin_state,
     .get_plugin_thread_ptr = riscv_get_plugin_thread_ptr,
-    /* Trap entry swaps tp with sscratch, so in-kernel tp is the kernel's
-     * own per-task pointer -- a different value space from the user
-     * thread pointer, not a continuation of it. */
-    .plugin_thread_ptr_tracks_current = false,
+    .plugin_thread_ptr_tracks_current = riscv_plugin_thread_ptr_tracks_current,
     .vaddr_is_kernel = riscv_vaddr_is_kernel,
     .spec_clock_resync = riscv_spec_clock_resync,
 #endif

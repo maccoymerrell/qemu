@@ -162,6 +162,15 @@ static uint64_t x86_get_plugin_thread_ptr(CPUState *cs)
     return env->segs[R_GS].base;
 }
 
+static bool x86_plugin_thread_ptr_tracks_current(CPUState *cs)
+{
+    /* FS.base (GS.base for a compat task) is user TLS state; the kernel's
+     * own per-CPU base lives in the swapped GS, so the user register is
+     * reloaded from the incoming task at every switch and untouched in
+     * between, at any CPL. */
+    return true;
+}
+
 static bool x86_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
 {
     CPUX86State *env = cpu_env(cs);
@@ -279,7 +288,7 @@ static const TCGCPUOps x86_tcg_ops = {
      * and reloads FS.base from the incoming task in __switch_to(), so the
      * FS.base this hook reads above user privilege names the current
      * task. */
-    .plugin_thread_ptr_tracks_current = true,
+    .plugin_thread_ptr_tracks_current = x86_plugin_thread_ptr_tracks_current,
     .vaddr_is_kernel = x86_vaddr_is_kernel,
     .spec_clock_resync = x86_spec_clock_resync,
 #endif

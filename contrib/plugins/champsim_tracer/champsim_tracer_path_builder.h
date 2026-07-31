@@ -290,6 +290,20 @@ public:
          * pointer has never been sighted, where the peek yields
          * CST_TID_UNSEEN. */
         uint32_t cur_tid = 0;
+        /* The RAW thread-pointer sample for this step, and whether it names
+         * the executing thread (user privilege, or a privileged context the
+         * target vouches for via qemu_plugin_thread_ptr_tracks_current —
+         * re-asked per step, since RISC-V's answer varies with privilege).
+         * When the register cannot be trusted here the glue substitutes the
+         * vCPU's last COMMITTED thread pointer — the entering thread —
+         * mirroring cur_tid's inheritance; cur_tp_ok=false means not even
+         * that is known.  The async-window ownership compares these raw
+         * values instead of minted tids: a raw value needs no identity-map
+         * entry, so ownership stays resolvable in contexts the trace never
+         * emits (an interrupt delivered into a foreign process on a peer
+         * vCPU), where the minted-tid peek could only say UNSEEN. */
+        uint64_t cur_tp = 0;
+        bool cur_tp_ok = false;
     };
 
     /* A guest thread the identity map has not minted an id for yet.  Never
@@ -543,10 +557,19 @@ private:
      * contributes belongs to the context the interrupt was DELIVERED in and
      * to no other.  async_captured_ alone is the vCPU's window lifetime (QEMU
      * owns it: one flag, opened at the outermost delivery, closed when the
-     * departure PC is re-executed); this pair is the attribution.  Recorded
-     * from the ASYNC_ENTER's own step, on the FRESH drain, because the
-     * retained-event rescan replays that ENTER in whatever context happens to
-     * be running later.
+     * departure PC is re-executed); this pair is the attribution.
+     *
+     * The owner is the DELIVERY-INSTANT thread pointer the ASYNC_ENTER event
+     * itself carries (ev.tp/ev.tp_ok, stamped by the producer before any
+     * handler instruction runs).  A raw register value, not a minted tid:
+     * the delivering context routinely belongs to a thread the trace never
+     * emits (a foreign process on a peer vCPU, a kernel thread), which the
+     * identity map has never minted and never will — a tid-keyed owner was
+     * unresolvable exactly where SMP interrupts land.  The event-carried
+     * value also survives the drain latency: the event is consumed at the
+     * next executed TB, by which point the vCPU is already inside the
+     * handler (today that TB is the handler's first, but nothing pins the
+     * drain that close — an inter-segment gap batches events for later).
      *
      * Read only through async_level(), which makes the contribution a
      * PREDICATE re-evaluated per entry — dormant while a peer thread runs,
@@ -557,20 +580,31 @@ private:
      * switch, a kernel thread on a borrowed mm and a recycled narrow ASID all
      * change context while committing no ASID write at all.
      *
-     * async_captured_ IS the validity flag: it is only ever set by the
-     * ASYNC_ENTER arm, and the same fresh drain that sets it records the owner
-     * here, so "a level is owed" and "an owner is known" are the same
-     * condition.  CST_TID_UNSEEN means the delivering thread had not been
-     * sighted, which makes the level dormant everywhere.
-     *
-     * Deliberately ONE uint32 and nothing else.  `PathBuilder builder` is
-     * `static thread_local`, and at ff0a4a74cb the plugin's static TLS block
-     * is 0x668 bytes against a glibc surplus that leaves ~24 bytes of head
-     * room: growing it by a few words makes the .so fail to dlopen outright
-     * ("cannot allocate memory in static TLS block") in whole-system x86_64.
-     * Everything that is only measured lives in the process-wide window
-     * counters in the .cc instead. */
-    uint32_t async_owner_tid_ = CST_TID_UNSEEN;
+     * async_owner_ok_ false (the producer could not vouch for the delivery
+     * context's register — e.g. an interrupt into M-mode firmware) leaves
+     * the level dormant everywhere rather than borrowed by whoever runs
+     * next.  Thread-pointer collisions (two threads whose register holds
+     * the same value — a no-TLS workload and a kernel thread both at 0)
+     * merge under this key exactly as they merged under the minted-tid key:
+     * the map was value-keyed too, so the predicate is no coarser than it
+     * was.  PathBuilder lives on the heap behind an 8-byte thread_local
+     * pointer (path_builder_tls), so these members cost no static TLS. */
+    uint64_t async_owner_tp_ = 0;
+    bool async_owner_ok_ = false;
+
+    /* Per-vCPU window measurement + id (formerly process-wide statics in
+     * the .cc).  Under SMP a peer vCPU's pre-prime step or fresh ENTER
+     * must not close or clobber THIS vCPU's open window record: the kexc
+     * async re-latch gate reads the id, so the cross-vCPU clobber was
+     * wire-visible (a skipped re-latch drops the post-window kernel tail),
+     * and the per-window own/peer/asidw tallies were interleaved noise.
+     * The id values stay globally unique via g_async_win_seq (exec_lock).
+     * Heap-resident like everything else here: no static-TLS cost. */
+    uint64_t win_id_ = 0;
+    uint64_t win_enter_seq_ = 0;
+    uint32_t win_asidw_ = 0;
+    uint32_t win_own_stamps_ = 0;
+    uint32_t win_peer_stamps_ = 0;
 
     /* Publish the closing window's condition counters and clear them. */
     void async_win_close(const char *kind, uint32_t tid);
@@ -581,7 +615,8 @@ private:
      * async level is read. */
     uint32_t async_level(const StepIn &in) const
     {
-        return (async_captured_ && in.cur_tid == async_owner_tid_) ? 1u : 0u;
+        return (async_captured_ && async_owner_ok_ && in.cur_tp_ok &&
+                in.cur_tp == async_owner_tp_) ? 1u : 0u;
     }
 
     /* Synchronous-fault-span markers for faults=0 handler suppression.  A

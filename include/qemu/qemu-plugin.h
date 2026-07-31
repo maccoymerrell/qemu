@@ -118,11 +118,22 @@ typedef uint64_t qemu_plugin_id_t;
  *   thread-pointer register still names the executing software thread
  *   when sampled inside the kernel, so a guest task switch that happens
  *   entirely in kernel code can be followed).
+ *
+ * version 14:
+ * - struct qemu_plugin_cpu_event gained @tp/@tp_ok: the thread pointer
+ *   sampled at the event instant, so an ASYNC_ENTER names the thread the
+ *   interrupt was DELIVERED in even when that context is gone (or was
+ *   never otherwise observable) by the time the event is drained.
+ * - qemu_plugin_thread_ptr_tracks_current() became a property of the
+ *   sampling context rather than of the target: RISC-V now reports the
+ *   kernel's current-task pointer (sscratch/tp per the S-mode trap-entry
+ *   swap) and answers true at U/S privilege, false in M-mode firmware
+ *   and under H-extension virtualization.
  */
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 13
+#define QEMU_PLUGIN_VERSION 14
 
 /**
  * struct qemu_info_t - system information for plugins
@@ -1771,9 +1782,28 @@ enum qemu_plugin_cpu_event_kind {
 struct qemu_plugin_cpu_event {
     uint8_t  kind;          /* enum qemu_plugin_cpu_event_kind */
     uint8_t  priv;          /* privilege level at the event instant */
+    /*
+     * Whether @tp below named the executing software thread at the event
+     * instant: set when the event fired at user privilege (every target's
+     * thread pointer names the thread there) or where the target reports
+     * qemu_plugin_thread_ptr_tracks_current() in the event's context.
+     * When clear, @tp is whatever the register held and identifies no
+     * guest thread (e.g. an interrupt delivered into M-mode firmware).
+     */
+    uint8_t  tp_ok;
     uint32_t depth_after;   /* fault-stack depth after this event */
     uint64_t pc;            /* resume PC (fault) / departure PC (async) */
     uint64_t asid;          /* address-space id at the event instant */
+    /*
+     * qemu_plugin_get_thread_ptr() sampled at the event instant — for an
+     * ASYNC_ENTER, the thread the interrupt was DELIVERED in, read before
+     * any handler instruction runs.  The delivery context is otherwise
+     * unrecoverable by the consumer: the event is drained at the next
+     * executed TB, by which point the vCPU is already inside the handler
+     * (or further), and on an SMP guest the delivering context may be one
+     * the plugin never gets another look at.
+     */
+    uint64_t tp;
 };
 
 /**
@@ -2123,22 +2153,23 @@ bool qemu_plugin_vaddr_is_kernel(uint64_t vaddr);
 /**
  * qemu_plugin_get_thread_ptr() - the guest's per-thread pointer register
  *
- * Returns the architectural thread-pointer state the guest kernel
- * maintains per software thread: x86_64 FS.base (GS.base for a 32-bit
- * compat task), AArch64 TPIDR_EL0, RISC-V tp (x4), MIPS CP0 UserLocal.
- * Every mainstream kernel context-switches this register per thread
- * (it is the TLS base the thread library hands out), so its value is a
- * stable per-guest-thread identity that survives vCPU migration —
- * unlike the vCPU index, which names a scheduling slot, not a thread.
+ * Returns the per-software-thread pointer state the guest kernel
+ * maintains: x86_64 FS.base (GS.base for a 32-bit compat task), AArch64
+ * TPIDR_EL0, MIPS CP0 UserLocal — the TLS base, context-switched per
+ * thread — and on RISC-V the kernel's current-task pointer (sscratch
+ * while in user, tp while in kernel: the S-mode trap entry swaps the
+ * two, so that pair is the one value space that names the task at every
+ * privilege; a guest that never arms sscratch degrades to the raw tp).
+ * In every case the value is a stable per-guest-thread identity that
+ * survives vCPU migration — unlike the vCPU index, which names a
+ * scheduling slot, not a thread.
  *
- * A sample taken above user privilege is meaningful only on targets for
- * which qemu_plugin_thread_ptr_tracks_current() reports true; elsewhere
- * the kernel repurposes the register on entry (RISC-V tp) and the value
- * names something other than a guest thread.  Returns 0 when the target
- * provides no hook or the register was never written (e.g. a CPU model
- * without the feature, or a guest that sets no TLS); threads without a
- * thread pointer are architecturally indistinguishable.  Must be called
- * from a vCPU context.
+ * A sample taken above user privilege is meaningful only where
+ * qemu_plugin_thread_ptr_tracks_current() reports true in that context.
+ * Returns 0 when the target provides no hook or the state was never
+ * written (e.g. a CPU model without the feature, or a guest that sets
+ * no TLS); threads without a thread pointer are architecturally
+ * indistinguishable.  Must be called from a vCPU context.
  */
 QEMU_PLUGIN_API
 uint64_t qemu_plugin_get_thread_ptr(void);
@@ -2157,13 +2188,15 @@ uint64_t qemu_plugin_get_thread_ptr(void);
  * after the scheduler moved on) instead of attributing that work to
  * whichever thread last entered the kernel on that vCPU.
  *
- * True for MIPS (CP0 UserLocal), AArch64 (TPIDR_EL0) and x86-64
- * (FS.base).  False for RISC-V, where the trap entry swaps tp with
- * sscratch so in-kernel tp holds the kernel's own per-task pointer — a
- * different value space from the user thread pointer, which would split a
- * single thread's user and kernel code across two identities.  False on
- * any target without the thread-pointer hook.  Must be called from a vCPU
- * context.
+ * The answer is a property of the SAMPLING CONTEXT, not a flat target
+ * property: re-ask it at each privileged sample rather than latching one
+ * answer per run.  True for MIPS (CP0 UserLocal), AArch64 (TPIDR_EL0)
+ * and x86-64 (FS.base) at every privilege.  True for RISC-V at U/S
+ * privilege — the reported value there is the kernel's current-task
+ * pointer (see qemu_plugin_get_thread_ptr()) — but false in M-mode
+ * firmware (which runs on its own tp with the S-mode sscratch parked)
+ * and under H-extension virtualization.  False on any target without
+ * the thread-pointer hook.  Must be called from a vCPU context.
  */
 QEMU_PLUGIN_API
 bool qemu_plugin_thread_ptr_tracks_current(void);

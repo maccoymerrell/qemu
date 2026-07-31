@@ -1177,6 +1177,7 @@ void do_interrupt_all(X86CPU *cpu, int intno, int is_int,
      * resume in cpu_exec_loop clears the flag on iret back to it.  Outermost
      * only; never on the wrong path.  See cpu.h.
      */
+    cpu_plugin_async_probe(CPU(cpu), is_hw ? "IRQ" : "EXC", intno, is_hw);
     if (is_hw) {
         CPUState *cs_ = CPU(cpu);
         if (!cs_->plugin_spec_mode && !cs_->plugin_in_async_int) {

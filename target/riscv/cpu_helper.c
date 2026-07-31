@@ -2386,6 +2386,10 @@ void riscv_cpu_do_interrupt(CPUState *cs)
      * the generic resume in cpu_exec_loop clears the flag when execution
      * returns there.  Outermost only; never on the wrong path.  See cpu.h.
      */
+    /* Instrument every delivery, including the ones the gates below discard,
+     * so "no window opened" and "no interrupt arrived" are distinguishable. */
+    cpu_plugin_async_probe(cs, async ? "IRQ" : "EXC", cs->exception_index,
+                           async);
     if (async && !cs->plugin_spec_mode && !cs->plugin_in_async_int) {
         cpu_plugin_async_enter(cs, cs->cc->get_pc(cs));
     } else if (!async && !cs->plugin_spec_mode && !cs->plugin_in_async_int) {

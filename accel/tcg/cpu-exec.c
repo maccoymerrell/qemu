@@ -2315,11 +2315,13 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                     : cpu->plugin_async_departure_tp;
 
                 if (cur_tp == cpu->plugin_async_departure_tp) {
+                    cpu_plugin_async_probe(cpu, "CLOSE", 0, false);
                     cpu->plugin_in_async_int = false;
                     cpu_plugin_evq_push(cpu,
                                         QEMU_PLUGIN_CPU_EVENT_ASYNC_RETURN,
                                         pc, cpu->plugin_fault_depth);
                 } else {
+                    cpu_plugin_async_probe(cpu, "PEERPC", 0, false);
                     /* Condition instrument (CST_ASYNCRET_DIAG): a peer
                      * context hit the departure PC and the close was
                      * withheld — the case the discriminator exists for. */

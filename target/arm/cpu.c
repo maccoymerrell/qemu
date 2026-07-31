@@ -2686,6 +2686,15 @@ static uint64_t arm_get_plugin_thread_ptr(CPUState *cs)
     return cpu_env(cs)->cp15.tpidr_el[0];
 }
 
+static bool arm_plugin_thread_ptr_tracks_current(CPUState *cs)
+{
+    /* TPIDR_EL0 is architecturally separate from the kernel's own
+     * thread pointers (TPIDR_EL1, SP_EL0-as-current), so Linux reloads
+     * it from the incoming task at every switch and never touches it in
+     * between — the sample names the current task at any EL. */
+    return true;
+}
+
 static bool arm_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
 {
     CPUARMState *env = cpu_env(cs);
@@ -2795,7 +2804,7 @@ static const TCGCPUOps arm_tcg_ops = {
      * per-CPU use, so the kernel only ever writes TPIDR_EL0 from the
      * incoming task (tls_thread_switch()) and a read at EL1 names the
      * current task. */
-    .plugin_thread_ptr_tracks_current = true,
+    .plugin_thread_ptr_tracks_current = arm_plugin_thread_ptr_tracks_current,
     .vaddr_is_kernel = arm_vaddr_is_kernel,
     .spec_clock_resync = arm_spec_clock_resync,
 #endif

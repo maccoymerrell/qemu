@@ -171,22 +171,36 @@ struct Stats {
      * per-piece prefix table it could not use, so the emission fell back to
      * the total-based split rather than mis-place slices.
      *
-     * The condition that can actually occur is a piece delivering fewer REP
-     * memops than its own retired iterations require: capture was suppressed
-     * part-way through that piece, so its recorded boundary is not where the
-     * stream's boundary is.  The accompanying sum check is a construction
-     * tripwire, not a second failure mode — collect_piece appends each pair
-     * in the same statement that adds it to the totals, so the two can only
-     * disagree if a later edit separates those seams. */
+     * The nominal condition is a piece delivering fewer REP memops than its
+     * own retired iterations require: capture suppressed part-way through
+     * that piece, so its recorded boundary is not where the stream's
+     * boundary is.  Audited unreachable-by-construction (x86s2 item E, and
+     * 0 across the whole adversarial corpus with the PRECONDITION counter
+     * rep_iters_memop_mismatch also 0): a piece table exists only for
+     * pinned faults=1 content, whose sync services never mute; interrupts=1
+     * never mutes; interrupts=0 mutes handler interiors only and the
+     * abandoned-window recovery force-unmutes the resume TB at its own
+     * dispatch, before its body callbacks; foreign and wrong-path capture
+     * never reaches the pinned CP recorder.  Every suppression mechanism is
+     * therefore disjoint from the retired iterations of a piece-carrying
+     * instruction.  Both this and the accompanying sum check (a seam
+     * tripwire — collect_piece appends each pair in the statement that adds
+     * it to the totals) guard FUTURE capture-gating edits; a firing is a
+     * mis-pairing emission and is reported to the unknown-warnings sidecar,
+     * never just counted. */
     uint64_t rep_piece_table_degenerate = 0;
     /* window_close_in_fanout — a deferred window close was taken while this
-     * vCPU still had a fan-out instruction latched in flight.  The close's
-     * fan-out hold is armed only from user-privilege, fault-depth-0
-     * emissions that carried an architectural iteration count, so it does
-     * not cover a kernel REP, a fan-out inside a fault service, or a family
-     * with no architectural count (AArch64 FEAT_MOPS).  This counts the
-     * closes those cases could have split; it is the measurement of whether
-     * that residue is exercised, not a proof that a split occurred. */
+     * vCPU still had a fan-out instruction architecturally in flight (any
+     * privilege, any fault depth — the hold table arms from every
+     * emission carrying an architectural iteration count, and holds
+     * through kernel services and peer-thread user TBs).  Reachable only
+     * through the hold's numeric ceiling, so a nonzero here always pairs
+     * with window_close_fanout_hold_capped and names a close that DID end
+     * the trace inside an instruction (bounded-overrun by design, never a
+     * hang).  Counted from the pc-keyed hold table, not the cp_in_flight
+     * scalar: that latch is last-writer-wins and an interleaved completing
+     * REP masks the in-flight one (measured reading 0 across a
+     * 651390-of-50000000 on-wire split — cst_runs/x86s2 item B). */
     uint64_t window_close_in_fanout = 0;
     /* window_close_fanout_hold_capped — the fan-out hold on a deferred window
      * close hit its consecutive-evaluation ceiling and was abandoned, so that
@@ -638,6 +652,30 @@ struct Stats {
     uint64_t async_asid_write_in_window = 0;
     uint64_t async_win_peer_with_asidw = 0;
     uint64_t async_win_peer_no_asidw = 0;
+
+    /* Window-interior synchronous faults.  The producers push FAULT_ENTER
+     * for every real synchronous fault, including one delivered while an
+     * async window is open (they historically suppressed those, which made
+     * a captured window's faulting block seal as a normal entry: a phantom
+     * branch edge into the handler, no fault anchors, and an execution on
+     * the wire with silently missing memops — the memop-bimodality lint's
+     * flag).  The seal classifies a drained FAULT_ENTER by its position in
+     * the batch relative to the async edges:
+     *
+     *   fault_enter_classified_in_win  classified normally while a captured
+     *                             window was open (interrupts=1 content is
+     *                             first-class, so its faults merge like any
+     *                             other) — the condition the old producer
+     *                             gate silently discarded
+     *   fault_enter_skipped_in_async   consumed with no action because the
+     *                             event sits between an ASYNC_ENTER and its
+     *                             RETURN inside the batch: excluded-window
+     *                             interior (interrupts=0), or content that
+     *                             interposed after the window edge — never
+     *                             prev's own fault.  Zero only means the
+     *                             condition did not arise in this run. */
+    uint64_t fault_enter_classified_in_win = 0;
+    uint64_t fault_enter_skipped_in_async = 0;
 
     /* Per-execution attribution.  cp_* bumped at vcpu_tb_exec walking
      * the prev TB's template; wp_* inside the WP per-iteration loop.

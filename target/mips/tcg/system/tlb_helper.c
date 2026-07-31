@@ -1142,7 +1142,14 @@ void mips_cpu_do_interrupt(CPUState *cs)
         cpu_plugin_async_enter(cs,
                                exception_resume_pc(env) & ~(target_ulong)1);
     } else if (mips_fault_reexecutes(cs->exception_index) &&
-               !cs->plugin_spec_mode && !cs->plugin_in_async_int) {
+               !cs->plugin_spec_mode) {
+        /*
+         * No !plugin_in_async_int gate here: a window-interior fault is a
+         * real fault whose ERET re-executes its instruction, so the push
+         * keeps the resume-PC stack exactly LIFO and the event stream
+         * complete.  The consumer decides per-mode what an in-window
+         * FAULT_ENTER means (see the x86 twin in seg_helper.c).
+         */
         /*
          * Re-executing synchronous FAULT (TLB refill/invalid/modified,
          * execute/read-inhibit, coprocessor-unusable lazy enable): the ERET

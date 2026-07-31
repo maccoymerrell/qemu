@@ -1191,11 +1191,20 @@ void do_interrupt_all(X86CPU *cpu, int intno, int is_int,
          * SYSCALL advance past the instruction and are left to the normal
          * branch-into-kernel representation.  Report the entry; the tracer
          * owns the resume-PC stack.
+         *
+         * Unconditionally: a fault delivered inside an open async window is
+         * still a real fault whose ERET re-executes its instruction — the
+         * stack stays exactly LIFO whether or not a window is open.  Gating
+         * this push on !plugin_in_async_int made the stack (and every event
+         * consumer) blind to window-interior faults; with captured-interrupt
+         * tracing the window's content is first-class trace content, and a
+         * faulting block sealed without its FAULT_ENTER records a phantom
+         * branch edge into the handler and an execution with silently
+         * missing memops.  The plugin decides per-mode what an in-window
+         * fault means; the producer's job is only to report every entry
+         * (see cpu.h).
          */
-        CPUState *cs_ = CPU(cpu);
-        if (!cs_->plugin_in_async_int) {
-            cpu_plugin_fault_push(cs_, cs_->cc->get_pc(cs_));
-        }
+        cpu_plugin_fault_push(CPU(cpu), CPU(cpu)->cc->get_pc(CPU(cpu)));
     }
 #endif
 

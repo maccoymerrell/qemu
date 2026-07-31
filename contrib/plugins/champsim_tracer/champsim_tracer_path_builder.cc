@@ -3265,11 +3265,41 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
                 }
                 if (pb_diag()) {
                     fprintf(stderr, "[pathbuilder] ENTRY resume=0x%" PRIx64
-                            " depth=%u asid=0x%" PRIx64 " priv=%u\n",
-                            ev.pc, ev.depth_after, ev.asid, ev.priv);
+                            " depth=%u asid=0x%" PRIx64 " priv=%u inw=%d\n",
+                            ev.pc, ev.depth_after, ev.asid, ev.priv,
+                            (int)ev_in_async);
                 }
+                /* The producers report EVERY synchronous fault, including
+                 * one delivered inside an open async window.  What such an
+                 * event means depends on where it sits in the batch:
+                 *
+                 *   !ev_in_async — the fault is prev's own edge (a mid-
+                 *   captured-window fault reaches here too: with
+                 *   interrupts=1 each in-window TB is its own surviving
+                 *   step, so its batch carries no window edges).  Classify
+                 *   normally; a captured window's faulting block stashes
+                 *   and merges like any other, closing the bare-seal hole
+                 *   (phantom edge into the handler + zero-memop execution
+                 *   + missing anchors) the old producer-side gate opened.
+                 *
+                 *   ev_in_async — the event sits between an ASYNC_ENTER
+                 *   and its RETURN inside this batch: the interior of an
+                 *   excluded window (interrupts=0 suspends those steps, so
+                 *   the whole sandwich drains at the next surviving seal),
+                 *   or content interposed after a window edge.  Either
+                 *   way it is not the deferred prev's fault — consume it
+                 *   with no action, exactly the pre-event-stream
+                 *   behaviour (same rule as the successor override
+                 *   above). */
                 if (fault_on && !pb_no_merge()) {
-                    classify_fault_enter(ev, &prev_stashed, in.walk_tid);
+                    if (!ev_in_async) {
+                        if (async_captured_) {
+                            g_stats.fault_enter_classified_in_win++;
+                        }
+                        classify_fault_enter(ev, &prev_stashed, in.walk_tid);
+                    } else {
+                        g_stats.fault_enter_skipped_in_async++;
+                    }
                 }
             } else if (ev.kind == QEMU_PLUGIN_CPU_EV_FAULT_RETURN) {
                 raw_depth_ = ev.depth_after;

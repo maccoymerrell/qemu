@@ -142,7 +142,18 @@ struct RepInFlight {
  * this pc had complete=false; cleared when the instruction retires.
  */
 struct RepBoundaryHold {
+    /* Guest thread that owns the in-flight instruction, stamped by its
+     * own emissions (CST_HOLD_TID_UNKNOWN until one lands: a dispatch
+     * arm precedes the first emission).  The deferred-close release keys
+     * on it — a PEER thread's user TB on this vCPU proves nothing about
+     * the holder's instruction, so only the holder's own thread at a
+     * different user pc releases (measured: a 50M-iteration REP on
+     * thread A split mid-instruction by a budget crossing detected on
+     * spinner thread B, 651390 of 50000000 iterations on the wire —
+     * cst_runs/x86s2, probes/threadrep.S). */
+    static const uint32_t CST_HOLD_TID_UNKNOWN = UINT32_MAX;
     uint64_t pc     = 0;
+    uint32_t tid    = CST_HOLD_TID_UNKNOWN;
     bool     active = false;
 };
 
@@ -261,12 +272,19 @@ struct RepSelfLoopState {
      */
     RepBoundaryHold warmup_hold[REP_CLK_PCS];
 
-    void warmup_hold_update(uint64_t pc, bool in_flight)
+    void warmup_hold_update(uint64_t pc, bool in_flight,
+                            uint32_t tid = RepBoundaryHold::
+                                           CST_HOLD_TID_UNKNOWN)
     {
         int free_slot = -1;
         for (unsigned i = 0; i < REP_CLK_PCS; i++) {
             if (warmup_hold[i].active && warmup_hold[i].pc == pc) {
                 warmup_hold[i].active = in_flight;
+                /* The emission stream stamps the owner; a dispatch arm
+                 * (unknown tid) must not erase a known one. */
+                if (tid != RepBoundaryHold::CST_HOLD_TID_UNKNOWN) {
+                    warmup_hold[i].tid = tid;
+                }
                 return;
             }
             if (free_slot < 0 && !warmup_hold[i].active) {
@@ -275,6 +293,7 @@ struct RepSelfLoopState {
         }
         if (in_flight && free_slot >= 0) {
             warmup_hold[free_slot].pc = pc;
+            warmup_hold[free_slot].tid = tid;
             warmup_hold[free_slot].active = true;
         }
     }

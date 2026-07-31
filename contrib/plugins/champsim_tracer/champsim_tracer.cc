@@ -3727,22 +3727,24 @@ void emit_body_entry(BodyStreamState *out_stream,
                  * that retired the repetition, hence reenter rather than
                  * !complete.  A REP_MAX chunk boundary sets both. */
                 rs.cp_in_flight.in_progress = efacts.reenter;
-                /* Warmup-boundary hold release: the ARCHITECTURAL
-                 * predicate (a mid-instruction fault publishes
-                 * reenter=false while the instruction is unfinished, and
-                 * the §2.13 boundary must keep deferring across it) —
-                 * and only the emission stream of the instruction that
-                 * OWNS the hold.  The hold is armed at dispatch (see
-                 * events_path_step); a kernel REP running in the held
-                 * instruction's own fault service emits here too, and
-                 * without the pc/depth/system gate its retirement would
-                 * release the user instruction's hold mid-flight
-                 * (observed: clear_page's rep stosq between two chunks
-                 * landed the boundary inside the user REP's records). */
-                if (entry.fault_depth == 0 && !bb_tmpl->is_system) {
-                    rs.warmup_hold_update(bb_tmpl->insn_pcs[last],
-                                          !rep_retired);
-                }
+                /* Warmup-boundary / deferred-close hold update: the
+                 * ARCHITECTURAL predicate (a mid-instruction fault
+                 * publishes reenter=false while the instruction is
+                 * unfinished, and both consumers must keep deferring
+                 * across it).  The table is pc-keyed, so an emission only
+                 * ever updates ITS OWN instruction's slot — the hazard
+                 * the old depth-0 user-only gate was added for
+                 * (clear_page's rep stosq retiring between two user
+                 * chunks releasing the USER hold) cannot recur, and the
+                 * gate itself was a hole: a KERNEL fan-out in flight
+                 * (chunked copy_to_user, a fault-split clear/copy) never
+                 * armed, so a deferred window close could take inside it
+                 * — the privilege gap the `window close in fan-out`
+                 * tripwire counts.  Privilege-agnostic now; the entry's
+                 * guest thread stamps the holder for the close's
+                 * thread-aware release. */
+                rs.warmup_hold_update(bb_tmpl->insn_pcs[last],
+                                      !rep_retired, entry.thread_id);
             }
             if (arch_known && n_iter == 0 && continuation) {
                 g_stats.rep_trailing_pass_dropped++;
@@ -3913,6 +3915,31 @@ void emit_body_entry(BodyStreamState *out_stream,
                     }
                     if (bad || sum_i != pre_iters || sum_m != pre_memops) {
                         g_stats.rep_piece_table_degenerate++;
+                        /* Never observed (see the counter's comment in
+                         * stats.h): every capture-suppression mechanism is
+                         * structurally disjoint from the retired
+                         * iterations of a piece-carrying instruction, so a
+                         * firing means a capture-gating edit broke that
+                         * disjointness and the totals split below is
+                         * MIS-PAIRING slices.  A trace shaped by this must
+                         * name itself — a counter alone is a silent
+                         * success. */
+                        if (unknown_warn_file) {
+                            g_mutex_lock(&unknown_warn_lock);
+                            fprintf(unknown_warn_file,
+                                    "rep_piece_table_degenerate: pc=0x%"
+                                    PRIx64 " pieces=%zu sum_i=%" PRIu64
+                                    "/%" PRIu64 " sum_m=%" PRIu64 "/%"
+                                    PRIu64 " bad_piece=%d — falling back "
+                                    "to the totals split; per-iteration "
+                                    "pairing of this emission is NOT "
+                                    "trustworthy\n",
+                                    bb_tmpl->insn_pcs[last],
+                                    pre_pieces.size(), sum_i, pre_iters,
+                                    sum_m, pre_memops, (int)bad);
+                            fflush(unknown_warn_file);
+                            g_mutex_unlock(&unknown_warn_lock);
+                        }
                     } else {
                         size_t cum = 0, off = 0, pend = 0;
                         for (const auto &p : pre_pieces) {
@@ -5407,19 +5434,55 @@ static void run_deferred_window_closes(PathBuilder &pb, unsigned int cpu_index,
         deferred_close(cpu_index).window_close_armed = false;
         return;
     }
-    const RepSelfLoopState &rs_cd = rep_state(cpu_index);
-    /* Same bounded predicate the §2.13 warmup boundary defers on: the hold
-     * only counts while execution is still AT the held instruction (a REP
-     * chunk re-enters at the instruction's own pc, so the resume BB's
-     * start_pc matches) or inside its kernel service.  Any other user BB
-     * means the held instruction is architecturally past — or the hold is
-     * stale — so the close proceeds.  Without that bound a hold that is
-     * never released would strand the close and the trace would never
-     * finish. */
-    const bool fanout_hold =
-        rs_cd.warmup_hold_any() && cur_tb_tmpl &&
-        (rs_cd.warmup_hold_matches(cur_tb_tmpl->start_pc) ||
-         cur_tb_tmpl->is_system);
+    RepSelfLoopState &rs_cd = rep_state(cpu_index);
+    /* Privilege-agnostic, thread-aware in-flight hold.  A slot holds the
+     * close while execution is still AT the held instruction (a REP chunk
+     * re-enters at the instruction's own pc, so the resume BB's start_pc
+     * matches), inside ANY kernel service (the holder's fault service, or
+     * the scheduler on its way to a peer), or on a user TB of a DIFFERENT
+     * guest thread — a peer's user code on this vCPU proves nothing about
+     * the holder's instruction (measured: a budget crossing detected on a
+     * spinner thread split the peer's 50M-iteration REP at 651390
+     * iterations, probes/threadrep.S).  Only the HOLDER's own thread at a
+     * different user pc proves the instruction architecturally past (or
+     * the hold stale, e.g. a signal diverted it) — that slot is then
+     * CLEARED, not just bypassed, so a stale hold cannot re-defer every
+     * later close.  An unknown-holder slot (armed at dispatch, no
+     * emission yet) keeps the historical pc-or-kernel release: with no
+     * owner to test, any user TB elsewhere releases it.  The numeric
+     * ceiling below still bounds the whole hold — a close that never
+     * fires is a trace that never finishes. */
+    bool fanout_hold = false;
+    if (cur_tb_tmpl) {
+        const uint32_t cur_tid = resolve_thread_id(cpu_index);
+        for (unsigned i = 0; i < RepSelfLoopState::REP_CLK_PCS; i++) {
+            RepBoundaryHold &h = rs_cd.warmup_hold[i];
+            if (!h.active) {
+                continue;
+            }
+            if (cur_tb_tmpl->start_pc == h.pc || cur_tb_tmpl->is_system ||
+                (h.tid != RepBoundaryHold::CST_HOLD_TID_UNKNOWN &&
+                 h.tid != cur_tid)) {
+                fanout_hold = true;
+            } else if (h.tid == RepBoundaryHold::CST_HOLD_TID_UNKNOWN) {
+                /* An ownerless dispatch arm (no emission yet) at a
+                 * different user BB: the old structural release. */
+                h.active = false;
+            } else {
+                /* The HOLDER's identity at a different user BB.  Either
+                 * the instruction is architecturally past without its
+                 * retirement emission (a signal diverted it), or this is
+                 * a peer thread the guest never gave its own thread
+                 * pointer — indistinguishable from the holder by the
+                 * wire's identity model (a no-SETTLS raw clone; measured:
+                 * with shared fs the spinner cleared the hold and the
+                 * split went unnamed).  Do NOT hold (no hang), but KEEP
+                 * the slot: if the close takes now, the tripwire below
+                 * still names the possible split instead of reading a
+                 * false zero. */
+            }
+        }
+    }
     if (close_diag()) {
         fprintf(stderr, "[closediag] eval clock=%" PRIu64
                 " chain=%d armed=%d fanout_hold=%d(any=%d) icount_pend=%d "
@@ -5458,14 +5521,19 @@ static void run_deferred_window_closes(PathBuilder &pb, unsigned int cpu_index,
      * unconstructed until a three-chunk probe.
      *
      * The hold is bounded twice over, because a close that never fires is a
-     * trace that never finishes.  Structurally: it only counts while
-     * execution is still at the held pc or inside the kernel, so any other
-     * user block releases it.  Numerically: a hold that outlives
+     * trace that never finishes.  Structurally: the HOLDER's own thread at
+     * a different user pc clears its slot (a peer's user TB does not — see
+     * the release loop above).  Numerically: a hold that outlives
      * CST_FANOUT_HOLD_MAX consecutive evaluations is abandoned and counted,
-     * which converts "the guest stayed in the kernel with a stale hold"
-     * from a hang into a bounded overrun with a number attached.  The
-     * legitimate span is the instruction's remaining chunks plus its own
-     * fault service — thousands of steps at the outside.
+     * which converts both "the guest stayed in the kernel with a stale
+     * hold" and "the holder never got rescheduled" (a peer spinning
+     * through the whole ceiling, probes/threadrep.S) from a hang into a
+     * bounded overrun with a number attached.  The legitimate
+     * single-thread span is the instruction's remaining chunks plus its
+     * own fault service — thousands of steps at the outside; the
+     * cross-thread span is a scheduling quantum and MAY exceed the
+     * ceiling, in which case the capped counter and the tripwire below
+     * both name the split.
      */
     static uint64_t held_steps;          /* exec_lock serialises this */
     if (fanout_hold) {
@@ -5480,16 +5548,17 @@ static void run_deferred_window_closes(PathBuilder &pb, unsigned int cpu_index,
         return;
     }
     deferred_close(cpu_index).window_close_armed = false;
-    /* Tripwire for what the hold above does NOT cover.  The pc-keyed hold is
-     * armed only from an emission that had an architectural iteration count,
-     * at fault depth 0, in user code — so a kernel fan-out (clear_page's rep
-     * stosq), a fan-out inside a fault service, and a family with no
-     * architectural count (AArch64 FEAT_MOPS) can still be in flight here.
-     * cp_in_flight is the privilege-agnostic latch for the same question.
-     * A nonzero count is a close that MAY have landed inside an
-     * instruction; it is not proof that it did, and it is the number that
-     * says whether the residue is exercised at all. */
-    if (rep_state(cpu_index).cp_in_flight.in_progress) {
+    /* Tripwire: a take with any hold slot still active is a close inside
+     * an architecturally in-flight fan-out instruction — reachable only
+     * through the numeric ceiling now that the hold is privilege-agnostic
+     * and thread-aware.  Counted from the hold TABLE (pc-keyed, one slot
+     * per in-flight instruction), NOT from cp_in_flight: that scalar is
+     * last-writer-wins, and any interleaved completing REP (a kernel
+     * clear_page between a user REP's chunks) overwrites it — measured
+     * reading 0 while the wire carried a 651390-of-50000000 split
+     * (probes/threadrep.S), which is why the original tripwire's
+     * ~12-opportunity zero was never evidence. */
+    if (rs_cd.warmup_hold_any()) {
         g_stats.window_close_in_fanout++;
     }
     if (close_diag()) {

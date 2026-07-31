@@ -228,11 +228,22 @@ void cpu_plugin_async_probe(CPUState *cpu, const char *tag, int exc_index,
 {
     static int on = -1;
     static uint64_t n;
+    static uint64_t cap = 40000;
 
     if (on < 0) {
-        on = getenv("CST_ASYNCPROD_DIAG") != NULL;
+        const char *v = getenv("CST_ASYNCPROD_DIAG");
+        on = v != NULL;
+        /*
+         * A numeric value raises the line cap ("1" keeps the historical
+         * 40000): a whole-boot delivery stream exhausts 40000 lines long
+         * before a marker window opens, silencing the probe exactly where
+         * the investigation needs it.
+         */
+        if (on && v[0] && strtoull(v, NULL, 0) > 1) {
+            cap = strtoull(v, NULL, 0);
+        }
     }
-    if (!on || n >= 40000) {
+    if (!on || n >= cap) {
         return;
     }
     n++;

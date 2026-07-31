@@ -11126,24 +11126,34 @@ void arm_cpu_do_interrupt(CPUState *cs)
          * discard, so "no window opened" and "no interrupt arrived" are
          * distinguishable. */
         cpu_plugin_async_probe(cs, is_async ? "IRQ" : "EXC", idx, is_async);
-        if (cs->plugin_spec_mode || cs->plugin_in_async_int) {
-            /* wrong path, or a delivery nested inside an open window */
+        if (cs->plugin_spec_mode) {
+            /* wrong path: no window edges, no fault events */
         } else if (is_async) {
             /* Enter the async excursion; record the departure context
              * (interrupted PC + thread pointer) so the exception return
              * that lands back there, in the departed thread, ends it.
-             * Outermost edge only: the enclosing !plugin_in_async_int guard
-             * keeps a nested async interrupt from re-entering this block,
-             * so the departure context is stamped once per window and the
+             * Outermost edge only: the !plugin_in_async_int guard keeps a
+             * nested async interrupt from re-entering this block, so the
+             * departure context is stamped once per window and the
              * ASYNC_ENTER event fires once per window. */
-            cpu_plugin_async_enter(cs, cs->cc->get_pc(cs));
+            if (!cs->plugin_in_async_int) {
+                cpu_plugin_async_enter(cs, cs->cc->get_pc(cs));
+            }
         } else if (idx != EXCP_SWI && idx != EXCP_HVC && idx != EXCP_SMC) {
             /* Synchronous FAULT (data/prefetch abort, undef, alignment, …):
              * the handler's exception return re-executes the faulting
              * instruction, so the resume PC is the current (trapping) PC.
              * Deliberate calls (SVC/HVC/SMC) advance past the instruction and
              * are left to the normal branch-into-kernel representation.
-             * Report the entry; the tracer owns the resume-PC stack. */
+             * Report the entry; the tracer owns the resume-PC stack.
+             *
+             * Unconditionally (no plugin_in_async_int gate): a fault
+             * delivered inside an open async window is still a real fault
+             * whose exception return re-executes its instruction, so the
+             * push keeps the resume-PC stack exactly LIFO and the event
+             * stream complete.  The consumer decides per-mode what an
+             * in-window FAULT_ENTER means (see the x86 twin in
+             * seg_helper.c). */
             cpu_plugin_fault_push(cs, cs->cc->get_pc(cs));
         }
     }

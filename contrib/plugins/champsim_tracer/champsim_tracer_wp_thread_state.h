@@ -14,6 +14,7 @@
 #ifndef CHAMPSIM_TRACER_WP_THREAD_STATE_H
 #define CHAMPSIM_TRACER_WP_THREAD_STATE_H
 
+#include <atomic>
 #include <vector>
 
 #include "champsim_tracer.h"
@@ -361,5 +362,25 @@ struct RepSelfLoopState {
 /* Defined in champsim_tracer.cc, sized CST_PIN_MAX_VCPUS like its siblings. */
 extern RepSelfLoopState g_rep_state[];
 RepSelfLoopState &rep_state(unsigned int cpu_index);
+
+/*
+ * Per-vCPU wrong-path session bracket, set/cleared by
+ * wp_enter_spec_session / wp_end_spec_session in lockstep with the
+ * thread-local g_wp_state.in_progress.  Exists as the third leg of the
+ * marker callbacks' wrong-path fence: the QEMU-side spec-mode flag has
+ * teardown windows (the fault-skip spec_mode_end -> restore ->
+ * spec_mode_begin, the longjmp cleanup) and the session flag is
+ * thread-local (a callback reading another thread's TLS reads false) —
+ * this array is keyed by the EXECUTING vCPU, which is the identity a
+ * speculative invocation cannot misreport.  Single writer per index
+ * (the vCPU's own walker); readers on the same vCPU's thread; relaxed
+ * atomics for the cross-thread diagnostic read.  Defined in
+ * champsim_tracer.cc, sized CST_PIN_MAX_VCPUS. */
+extern std::atomic<bool> g_wp_session_vcpu[];
+static inline bool wp_session_active(unsigned int cpu_index)
+{
+    return cpu_index < CST_PIN_MAX_VCPUS &&
+           g_wp_session_vcpu[cpu_index].load(std::memory_order_relaxed);
+}
 
 #endif /* CHAMPSIM_TRACER_WP_THREAD_STATE_H */

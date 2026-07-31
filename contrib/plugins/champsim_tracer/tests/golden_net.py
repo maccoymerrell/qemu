@@ -1176,7 +1176,13 @@ def sys_trace_once(build: Path, kernel: Path, initrd: Path, out_dir: Path,
         return None
     cst = Path(f"{out_base}.cst")
     if rc != 0 or not cst.is_file():
-        print(f"  sys trace {label}: FAIL rc={rc} (see {log})")
+        # Name WHICH clause failed: rc!=0 is a qemu/plugin failure, a
+        # missing file with rc==0 historically meant another session's
+        # capture/check removed the freshly-traced cell from the shared
+        # work root (the false RED the work-root flock now prevents; see
+        # main()).  Distinguishing them keeps that class diagnosable.
+        why = f"rc={rc}" if rc != 0 else f"rc=0 but {cst.name} MISSING"
+        print(f"  sys trace {label}: FAIL {why} (see {log})")
         return None
     return cst
 

@@ -189,6 +189,12 @@ static void wp_enter_spec_session(unsigned int cpu_index, uint64_t wrong_target,
                                                      cpu_index);
     g_wp_state.saved_budget = qemu_plugin_u64_get(g_scoreboard.budget, cpu_index);
     g_wp_in_progress = true;
+    /* Per-vCPU mirror of in_progress for consumers keyed by the EXECUTING
+     * vCPU rather than the walker's host thread (the marker callbacks'
+     * third fence leg — see champsim_tracer_wp_thread_state.h). */
+    if (cpu_index < CST_PIN_MAX_VCPUS) {
+        g_wp_session_vcpu[cpu_index].store(true, std::memory_order_relaxed);
+    }
 
     /* Freeze the guest virtual clock for the whole excursion (system mode):
      * the speculative run burns host wall-clock time but is outside guest
@@ -211,6 +217,9 @@ static void wp_end_spec_session(unsigned int cpu_index,
                                 struct qemu_plugin_cpu_state *saved_state)
 {
     g_wp_in_progress = false;
+    if (cpu_index < CST_PIN_MAX_VCPUS) {
+        g_wp_session_vcpu[cpu_index].store(false, std::memory_order_relaxed);
+    }
 
     qemu_plugin_u64_set(g_scoreboard.insn_count, cpu_index, g_wp_state.saved_insn_count);
     qemu_plugin_u64_set(g_scoreboard.prev_start_pc, cpu_index, g_wp_state.saved_prev_start_pc);

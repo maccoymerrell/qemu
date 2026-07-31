@@ -210,6 +210,52 @@ struct Stats {
      * ended where the hold was supposed to prevent, and the ceiling is what
      * kept it from ending never. */
     uint64_t window_close_fanout_hold_capped = 0;
+    /* warmup_boundary_hold_defers — a §2.13 warmup-boundary placement was
+     * deferred past one record because a fan-out instruction was
+     * architecturally in flight (the record was the held pc itself, a
+     * kernel service, or a PEER guest thread's user record — the same
+     * per-slot predicate as the deferred-close hold).  Condition counter:
+     * proves the hold engaged; one bump per record deferred past. */
+    uint64_t warmup_boundary_hold_defers = 0;
+    /* warmup_boundary_unplaced_at_finish — the segment closed with the
+     * §2.13 crossing latched, the boundary still deferred by the
+     * fan-out hold, and at least one record deferred past: the header
+     * keeps the sentinel (no placement provably avoids splitting an
+     * instruction whose end was never observed), and this counter plus
+     * a stderr line name it.  The boundary hold has NO numeric ceiling
+     * (unlike the close hold's CST_FANOUT_HOLD_MAX): it is a header
+     * field, not a liveness event, and a forced placement would
+     * re-introduce the split. */
+    uint64_t warmup_boundary_unplaced_at_finish = 0;
+    /* warmup_boundary_in_fanout — the §2.13 warmup boundary was placed
+     * while a hold slot was still active, i.e. every live slot was
+     * structurally released (an ownerless dispatch arm, or the holder's
+     * own thread at another user pc — which includes the
+     * identity-indistinguishable no-SETTLS peer).  Names a POSSIBLE
+     * split of one architectural instruction's records across the
+     * warmup/measure line; the cross-thread silent split this replaces
+     * was measured on probes/threadrep.S (cst_runs/x86s2 item B,
+     * ported here). */
+    uint64_t warmup_boundary_in_fanout = 0;
+    /* marker_wp_fenced_start / _end — invocations of the START/END
+     * marker exec callbacks dropped by the wrong-path fence
+     * (speculation routinely runs the marker bytes: the wrong path of a
+     * spin-wait branch falls straight into the END sequence).  Condition
+     * counters: a zero over a run with WP enabled means the workload's
+     * marker bytes were never speculatively executed, NOT that the
+     * fence is idle-safe. */
+    uint64_t marker_wp_fenced_start = 0;
+    uint64_t marker_wp_fenced_end = 0;
+    /* marker_fence_session_only — a marker callback was dropped where
+     * ONLY the per-vCPU WP-session gate fired: the QEMU-side spec-mode
+     * flag AND the walker thread's g_wp_state.in_progress both read
+     * false while this vCPU was inside a wrong-path session bracket.
+     * This is exactly the leak shape the pre-fence 385k-insn END close
+     * (matrix_prepush/tt_sys_x86b) implied and the two-flag fence could
+     * not name; MUST be 0 — nonzero means a speculative invocation
+     * reached the run-state machine's doorstep past both flags and was
+     * stopped only by the session gate. */
+    uint64_t marker_fence_session_only = 0;
 
     /*
      * rep_unretired_pass_dropped — an empty leading pass of a fan-out

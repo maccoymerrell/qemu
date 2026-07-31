@@ -875,6 +875,10 @@ RepSelfLoopState &rep_state(unsigned int cpu_index)
                        ? cpu_index : CST_PIN_MAX_VCPUS - 1];
 }
 
+/* Per-vCPU wrong-path session bracket (see champsim_tracer_wp_thread_state.h;
+ * written by wp_enter/wp_end_spec_session in champsim_tracer_wp.cc). */
+std::atomic<bool> g_wp_session_vcpu[CST_PIN_MAX_VCPUS];
+
 /* g_vcpu_cur_asid_index[c] is the address-space sibling of g_vcpu_cur_tid:
  * the compact asid index of the most recent USER TB on vCPU c.  A kernel
  * excursion of the pinned process inherits it unchanged, so the thread's
@@ -3050,6 +3054,16 @@ static uint64_t g_seg_arch_insns = 0;
  * yet).  0 is a legitimate value (warmup_insns==0 → captured at
  * the very first entry). */
 static uint64_t g_seg_warmup_end_trace_insns = UINT64_MAX;
+
+/* Ceiling on the deferred window close's fan-out hold, in consecutive
+ * close evaluations.  Large enough that no legitimate hold reaches it
+ * (an instruction's remaining REP_MAX chunks plus its own page-fault
+ * service), small enough that a hold that never releases costs a
+ * bounded overrun instead of a trace that never finishes.  The §2.13
+ * warmup-boundary hold deliberately does NOT share it: the boundary is
+ * a header field, not a liveness event, and a ceiling there would
+ * re-introduce the mid-instruction split (see emit_body_entry). */
+static const uint64_t CST_FANOUT_HOLD_MAX = 65536;
 /* Dispatch-time warmup crossing latch: set in tw_manage_window when the
  * window clock (user clock in pinned modes, raw inline counter
  * otherwise) reaches the warmup budget.  The §2.13 capture in
@@ -3057,6 +3071,13 @@ static uint64_t g_seg_warmup_end_trace_insns = UINT64_MAX;
  * emissions lag execution, and a live read would move the boundary
  * with translation-dependent emission timing. */
 static bool g_seg_warmup_crossed = false;
+/* Records this segment's §2.13 placement has deferred past under the
+ * fan-out hold.  Distinguishes, at segment finish, a boundary the hold
+ * was still deferring (crossed, sentinel, deferrals > 0 — counted as
+ * warmup_boundary_unplaced_at_finish) from the pre-existing sentinel
+ * meanings (segment cut short before the crossing, or no emission
+ * after it), whose header bytes stay untouched. */
+static uint64_t g_seg_wm_deferred_records = 0;
 
 /* ============================================================
  * Opportunistic branch-alternate minting (static_templates=1, both modes).
@@ -3486,6 +3507,7 @@ static void start_trace_segment(const char *label,
     g_seg_arch_insns = 0;
     g_seg_warmup_end_trace_insns = UINT64_MAX;
     g_seg_warmup_crossed = false;
+    g_seg_wm_deferred_records = 0;
     /* A fan-out instruction left architecturally in flight by a previous
      * segment must not hold the fresh segment's warmup boundary. */
     for (int i = 0, n = qemu_plugin_num_vcpus(); i < n; i++) {
@@ -3785,19 +3807,85 @@ void emit_body_entry(BodyStreamState *out_stream,
      * interleaved).  While a fan-out instruction is architecturally in
      * flight on this vCPU (warmup_hold: begun, not retired — a
      * predicate that survives mid-instruction faults, unlike reenter),
-     * the capture DEFERS past its remaining records and past excursion
-     * records emitted between its chunks; the boundary then points at
-     * the first record of the next architectural instruction.  A
-     * user-priv record at a different PC means the held instruction is
-     * architecturally past (or the hold is stale), bounding the
-     * deferral. */
+     * the capture DEFERS past its remaining records, past excursion
+     * records emitted between its chunks, and past PEER guest threads'
+     * user records interleaved on this vCPU; the boundary then points
+     * at the first record of the next architectural instruction.
+     *
+     * The release is per-slot and thread-aware, the same predicate as
+     * the deferred-close hold below (which this boundary predated): a
+     * peer thread's user record on this vCPU proves nothing about the
+     * holder's instruction — the historical pc-or-kernel release let a
+     * kernel REP completing between a user REP's chunks stand in for
+     * the user instruction's retirement, and a peer's user record
+     * placed the boundary mid-instruction (the cross-thread silent
+     * split measured on the close side, probes/threadrep.S,
+     * cst_runs/x86s2 item B).  Only a record from the HOLDER's own
+     * thread at a different user pc proves the instruction
+     * architecturally past (or the hold stale — a signal diverted it);
+     * an ownerless dispatch arm (no emission yet) keeps the historical
+     * structural release.
+     *
+     * Unlike the deferred window close, the boundary needs NO numeric
+     * ceiling: it is a header field chosen from the record stream, not
+     * a liveness event — deferring costs nothing but a later index,
+     * and a capped placement would re-introduce the very
+     * mid-instruction split the hold exists to prevent.  The one
+     * unbounded case is a holder that never emits again (a thread
+     * killed mid-instruction): its records have all been emitted, so
+     * no placement can split it, and the segment finish names the
+     * still-deferred boundary (warmup_boundary_unplaced_at_finish)
+     * instead of inventing one; a placement with a structurally
+     * released slot still active is counted too
+     * (warmup_boundary_in_fanout), never silent. */
     if (g_seg_warmup_end_trace_insns == UINT64_MAX &&
         g_seg_warmup_crossed && g_trace_segments.is_active()) {
+        /* CST_WMHOLD_OFF: measurement kill switch (the CST_NO_FAULT_MERGE
+         * pattern) — restores the historical thread-blind pc-or-kernel
+         * release so a paired probe wave measures the same condition
+         * under both behaviours.  The census counters and the placement
+         * tripwire run on both arms; only the peer-thread defer arrow is
+         * gated. */
+        static int wm_hold_off = -1;
+        if (wm_hold_off < 0) {
+            wm_hold_off = getenv("CST_WMHOLD_OFF") ? 1 : 0;
+        }
         const RepSelfLoopState &rs_wh = rep_state(cpu_index);
-        bool defer = rs_wh.warmup_hold_any() && bb_tmpl &&
-                     (rs_wh.warmup_hold_matches(bb_tmpl->start_pc) ||
-                      bb_tmpl->is_system);
-        if (!defer) {
+        bool wm_defer = false;
+        if (rs_wh.warmup_hold_any() && bb_tmpl) {
+            const uint32_t rec_tid = resolve_thread_id(cpu_index);
+            for (unsigned i = 0; i < RepSelfLoopState::REP_CLK_PCS; i++) {
+                const RepBoundaryHold &h = rs_wh.warmup_hold[i];
+                if (!h.active) {
+                    continue;
+                }
+                if (bb_tmpl->start_pc == h.pc || bb_tmpl->is_system ||
+                    (!wm_hold_off &&
+                     h.tid != RepBoundaryHold::CST_HOLD_TID_UNKNOWN &&
+                     h.tid != rec_tid)) {
+                    wm_defer = true;
+                }
+                /* Ownerless slot, or the holder's own thread at a
+                 * different user pc: the structural bound — this record
+                 * does not defer on that slot.  Slot lifecycle stays
+                 * with its owners (the emission-side update and the
+                 * close-eval release); the placement tripwire below
+                 * names any slot still active. */
+            }
+        }
+        if (wm_defer) {
+            g_stats.warmup_boundary_hold_defers++;
+            g_seg_wm_deferred_records++;
+        } else {
+            if (rs_wh.warmup_hold_any()) {
+                /* Placed with a hold slot still active: the ceiling
+                 * forced it, or every live slot was structurally
+                 * released (ownerless arm / holder-identity at another
+                 * pc, which includes the indistinguishable no-SETTLS
+                 * peer).  Names the possible split instead of reading
+                 * a false zero. */
+                g_stats.warmup_boundary_in_fanout++;
+            }
             g_seg_warmup_end_trace_insns = g_seg_arch_insns;
         }
     }
@@ -4497,6 +4585,20 @@ static void finish_trace_segment(bool prev_executed = true,
     if (BodyStreamState *bs = g_trace_segments.body_stream()) {
         body_stream_set_warmup_end_trace_insn_idx(
             bs, g_seg_warmup_end_trace_insns);
+    }
+    /* A crossed boundary the fan-out hold was still deferring when the
+     * segment closed goes to the header as the sentinel (the honest
+     * value: no placement exists that provably avoids splitting the
+     * held instruction the consumer cannot see the end of) — but never
+     * silently: the counter and the line below name it. */
+    if (g_seg_warmup_crossed &&
+        g_seg_warmup_end_trace_insns == UINT64_MAX &&
+        g_seg_wm_deferred_records > 0) {
+        g_stats.warmup_boundary_unplaced_at_finish++;
+        fprintf(stderr, "champsim_tracer: warmup boundary still held by an "
+                "in-flight fan-out instruction at segment finish (%" PRIu64
+                " records deferred) — header keeps the sentinel\n",
+                g_seg_wm_deferred_records);
     }
     /* Drain any chain still in flight.  This may call emit_body_entry
      * one or more times, which bumps g_seg_arch_insns — so we print
@@ -5785,13 +5887,6 @@ static inline bool close_diag(void)
     return x != 0;
 }
 
-/* Ceiling on the fan-out hold below, in consecutive close evaluations.  Large
- * enough that no legitimate hold reaches it (an instruction's remaining
- * REP_MAX chunks plus its own page-fault service), small enough that a hold
- * that never releases costs a bounded overrun instead of a trace that never
- * finishes. */
-static const uint64_t CST_FANOUT_HOLD_MAX = 65536;
-
 static void run_deferred_window_closes(PathBuilder &pb, unsigned int cpu_index,
                                        const BBTemplate *cur_tb_tmpl)
 {
@@ -7063,6 +7158,28 @@ static std::atomic<bool> g_marker_fired{false};
 static thread_local MarkerRunSet tls_marker_run;
 static thread_local MarkerRunSet tls_marker_end_run;
 
+/*
+ * END-run advance provenance (per vCPU, NOT thread-local — the plugin's
+ * static-TLS block is at its ceiling; see RepSelfLoopState's rationale).
+ * Every correct-path invocation of the END callback that reaches the
+ * adjacency run-state machine records itself here; when the run fires,
+ * the close prints the last CST_MARKER_SEQ_LEN records, so every
+ * END-marker close carries the evidence of the three executions that
+ * produced it (pc, user clock, run value after the step).  A future
+ * wrong-path leak past the fence would name itself in this line: the
+ * fence counters beside it say how many speculative invocations were
+ * dropped, and a fired run whose advances do not read as the marker
+ * sequence at consecutive user PCs is visibly corrupt.  Single writer
+ * per index (the vCPU's own exec callback). */
+struct MarkerAdvRec {
+    uint64_t pc = 0;
+    uint64_t uic = 0;       /* g_user_icount at the advance (diagnostic) */
+    uint8_t  run_after = 0;
+};
+static constexpr unsigned MK_ADV_RING = 4;
+static MarkerAdvRec g_marker_end_adv[CST_PIN_MAX_VCPUS][MK_ADV_RING];
+static uint8_t g_marker_end_adv_head[CST_PIN_MAX_VCPUS];
+
 /* Open the marker trace window on @cpu_index.  The three WIN_MARKER
  * first-open paths — wide-register, narrow-ASID, and legacy single-pin —
  * share this exact body: guard against a redundant open, then window +
@@ -7129,20 +7246,36 @@ static void marker_close_and_exit(bool last_window, unsigned int cpu_index)
 
 static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
 {
-    /* Wrong-path fence, two independent gates: the QEMU-side per-vCPU
+    /* Wrong-path fence, three independent gates: the QEMU-side per-vCPU
      * spec-mode flag is the ground truth for *this execution* (a
      * speculative invocation observes it regardless of which thread's
-     * TLS the callback happens to read), and the per-thread session
-     * flag covers the walker's bracketing on the owning thread.
-     * Marker detection is a correct-path fact — speculation routinely
-     * runs the marker bytes (the wrong path of a spin-wait branch
-     * falls straight into the END sequence), so a leak past this
-     * fence opens/closes windows from wrong-path execution (observed:
-     * a 2 M-insn SMP window closed "END" after 385 k user insns,
-     * mid-loop, end-marker template exec_cp=0 / exec_wp=98722). */
-    if (qemu_plugin_in_spec_mode() || g_wp_in_progress) {
-        tls_mkdiag_start_wp_gated++;
-        return;
+     * TLS the callback happens to read), the per-thread session flag
+     * covers the walker's bracketing on the owning thread, and the
+     * per-vCPU session bracket (g_wp_session_vcpu) covers the spec-mode
+     * flag's teardown windows (fault-skip end->restore->begin, longjmp
+     * cleanup) keyed by the one identity a speculative invocation
+     * cannot misreport — the executing vCPU.  Marker detection is a
+     * correct-path fact — speculation routinely runs the marker bytes
+     * (the wrong path of a spin-wait branch falls straight into the END
+     * sequence), so a leak past this fence opens/closes windows from
+     * wrong-path execution (observed pre-fence: a 2 M-insn SMP window
+     * closed "END" after 385 k user insns, mid-loop, end-marker
+     * template exec_cp=0 / exec_wp=98722).  A drop only the third gate
+     * catches is counted separately (must be 0): it would be a
+     * speculative invocation past BOTH original flags — the leak shape
+     * the pre-fence close implied but could not name. */
+    {
+        bool f_spec = qemu_plugin_in_spec_mode();
+        bool f_wp   = g_wp_in_progress;
+        bool f_sess = wp_session_active(cpu_index);
+        if (f_spec || f_wp || f_sess) {
+            tls_mkdiag_start_wp_gated++;
+            g_stats.marker_wp_fenced_start++;
+            if (f_sess && !f_spec && !f_wp) {
+                g_stats.marker_fence_session_only++;
+            }
+            return;
+        }
     }
     uint64_t pc;
     uint8_t size;
@@ -7443,10 +7576,19 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
  */
 static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
 {
-    /* Wrong-path fence — see vcpu_marker_cb. */
-    if (qemu_plugin_in_spec_mode() || g_wp_in_progress) {
-        tls_mkdiag_end_wp_gated++;
-        return;
+    /* Wrong-path fence, three gates — see vcpu_marker_cb. */
+    {
+        bool f_spec = qemu_plugin_in_spec_mode();
+        bool f_wp   = g_wp_in_progress;
+        bool f_sess = wp_session_active(cpu_index);
+        if (f_spec || f_wp || f_sess) {
+            tls_mkdiag_end_wp_gated++;
+            g_stats.marker_wp_fenced_end++;
+            if (f_sess && !f_spec && !f_wp) {
+                g_stats.marker_fence_session_only++;
+            }
+            return;
+        }
     }
     uint64_t pc;
     uint8_t size;
@@ -7467,8 +7609,48 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
                 g_user_icount, tls_mkdiag_end_wp_gated,
                 tls_mkdiag_susp_user, tls_mkdiag_foreign_user);
     }
-    if (!marker_exec_step(&tls_marker_end_run, pc, size)) {
+    bool end_fired = marker_exec_step(&tls_marker_end_run, pc, size);
+    /* Advance provenance: every invocation that reached the run-state
+     * machine at user privilege mutated it — record it (see
+     * g_marker_end_adv).  On fire the run resets to 0, so log the
+     * sequence length; otherwise peek the slot's live run value. */
+    if (cpu_index < CST_PIN_MAX_VCPUS &&
+        qemu_plugin_get_priv_level() == 0) {
+        const MarkerExecRun *er = end_fired ? nullptr :
+            marker_run_peek(&tls_marker_end_run,
+                            qemu_plugin_get_addr_space_id());
+        uint8_t h = g_marker_end_adv_head[cpu_index];
+        MarkerAdvRec &rec = g_marker_end_adv[cpu_index][h % MK_ADV_RING];
+        rec.pc = pc;
+        rec.uic = g_user_icount;
+        rec.run_after = end_fired ? (uint8_t)g_marker_seq.n_insns
+                                  : (uint8_t)(er ? er->run : 0);
+        g_marker_end_adv_head[cpu_index] = (uint8_t)(h + 1);
+    }
+    if (!end_fired) {
         return;
+    }
+    /* The END run completed on the correct path.  Print the advance
+     * provenance unconditionally: every END-marker close carries the
+     * evidence of the three executions that produced it, plus how many
+     * speculative invocations the fence dropped on this thread. */
+    if (cpu_index < CST_PIN_MAX_VCPUS) {
+        uint8_t h = g_marker_end_adv_head[cpu_index];
+        unsigned n = (unsigned)g_marker_seq.n_insns;
+        if (n > MK_ADV_RING) {
+            n = MK_ADV_RING;
+        }
+        fprintf(stderr, "champsim_tracer: end-marker run complete cpu=%u:",
+                cpu_index);
+        for (unsigned k = 0; k < n; k++) {
+            const MarkerAdvRec &rec =
+                g_marker_end_adv[cpu_index][(h + MK_ADV_RING - n + k) %
+                                            MK_ADV_RING];
+            fprintf(stderr, " [pc=0x%" PRIx64 " uic=%" PRIu64 " run=%u]",
+                    rec.pc, rec.uic, rec.run_after);
+        }
+        fprintf(stderr, " wp_fenced_end=%" PRIu64 "\n",
+                tls_mkdiag_end_wp_gated);
     }
     uint64_t asid = qemu_plugin_get_addr_space_id();
 

@@ -31,6 +31,7 @@ import argparse
 import datetime
 import hashlib
 import json
+import fcntl
 import os
 import re
 import resource
@@ -1318,6 +1319,26 @@ def main() -> int:
     build = args.build_dir
     waivers = {"allow_stale": args.allow_stale,
                "allow_dirty": args.allow_dirty}
+
+    # ONE net at a time per work root.  capture and check both create and
+    # delete cell directories under the root, and nothing else serialized
+    # them: a check running concurrently with another session's check had
+    # its freshly-traced cell rmtree'd from under it and failed with
+    # "trace not produced" -- a false RED, and the same race can in
+    # principle hand a check another run's bytes, a false GREEN.  (Both
+    # observed; the second only in principle.)  An exclusive flock on a
+    # sidecar of the root closes it: waiting is always correct here, and a
+    # crashed holder's lock dies with its fd, so there is nothing to clean
+    # up.  Announce the wait so a stuck-looking net names its blocker.
+    args.work_root.mkdir(parents=True, exist_ok=True)
+    _lock_path = args.work_root / ".golden_net.lock"
+    _lock_fd = os.open(str(_lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print(f"waiting for {_lock_path} (another golden_net run holds the "
+              f"work root)...", flush=True)
+        fcntl.flock(_lock_fd, fcntl.LOCK_EX)
     if not cst_decode_bin(build).exists():
         print(f"cst_decode not found under {build}; build contrib-plugins first",
               file=sys.stderr)

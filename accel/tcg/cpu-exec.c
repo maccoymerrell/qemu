@@ -884,6 +884,26 @@ bool cpu_plugin_exec_tb(CPUState *cpu)
                 return false;
             }
         }
+#if !defined(CONFIG_USER_ONLY)
+        /*
+         * Wrong-path kick deferral.  A cpu_exit() kick that lands during a
+         * speculative excursion (iothread IRQ raise, another vCPU's exclusive
+         * request, vm_stop) sets icount_decr.u16.high, which makes every TB —
+         * including this wrong-path TB — exit at its prologue without
+         * retiring an instruction.  The walker's no-forward-progress guard
+         * then truncates the excursion, so WRONG-PATH TRACE CONTENT would
+         * depend on host IRQ timing — a load-dependence the trace contract
+         * forbids.  Clear the exit-request half for the speculative exec (the
+         * .low half is icount budget and is not touched); every kick source
+         * first sets cpu->exit_request or cpu->interrupt_request, both of
+         * which survive, and cpu_plugin_spec_vtime_resume re-arms the kick at
+         * the true excursion exit, so the correct path observes delivery
+         * exactly as if the excursion had taken zero host time.
+         */
+        if (cpu->plugin_spec_mode) {
+            qatomic_set(&cpu->neg.icount_decr.u16.high, 0);
+        }
+#endif
         cpu_tb_exec(cpu, tb, &tb_exit);
         cpu->running = saved_running;
         memcpy(&cpu->jmp_env, &saved_jmp_env, sizeof(sigjmp_buf));
@@ -1701,6 +1721,23 @@ void cpu_plugin_spec_vtime_resume(CPUState *cpu)
     }
 #endif
 #endif
+    /*
+     * Kick re-arm — the other half of the wrong-path kick deferral in
+     * cpu_plugin_exec_tb.  The speculative exec clears icount_decr.u16.high
+     * so a mid-excursion cpu_exit() kick cannot truncate the wrong-path walk;
+     * here, at the true excursion exit (this function runs on BOTH the normal
+     * wp_end path and the abnormal longjmp-cleanup path), the kick is
+     * reconstructed from the request flags every kick source sets first.  Net
+     * effect: the correct path breaks out of its TB loop at the first
+     * boundary after the excursion — the same point it would have reached had
+     * the excursion taken zero host time.  Delivery latency added by an
+     * excursion is thereby bounded by that one excursion, by construction,
+     * and wrong-path content is independent of host IRQ timing.
+     */
+    if (qatomic_read(&cpu->exit_request) ||
+        qatomic_read(&cpu->interrupt_request)) {
+        qatomic_set(&cpu->neg.icount_decr.u16.high, -1);
+    }
     if (need_bql || we_hold_from_pause) {
         bql_unlock();
     }

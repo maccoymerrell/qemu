@@ -140,6 +140,21 @@ void cpu_plugin_pin_tsc(int64_t target_tsc)
     seqlock_write_lock(&timers_state.vm_clock_seqlock,
                        &timers_state.vm_clock_lock);
     if (timers_state.cpu_ticks_enabled) {
+        /*
+         * Guest-visible TSC monotonicity is an invariant here, not an
+         * observation.  Setting cpu_ticks_prev = target below deliberately
+         * carries the pin past cpu_get_ticks_locked()'s backwards-read clamp,
+         * so a target below the last value handed to any reader would step
+         * the guest's TSC backwards — TSC-derived sched_clock is marked
+         * stable on this class of guest and consumes such a step unclamped.
+         * Measured across ~25 M pins the target never was below prev
+         * (wpwedge lane), but nothing enforced it; clamp so nothing ever can.
+         * The residual is absorbed by the next pin, which recomputes the
+         * target from the reference point, not from prev.
+         */
+        if (target_tsc < timers_state.cpu_ticks_prev) {
+            target_tsc = timers_state.cpu_ticks_prev;
+        }
         /* Choose the offset so cpu_get_ticks_locked() == target_tsc now, and
          * keep the monotonicity clamp consistent so the next read does not
          * snap the value back forward. */

@@ -19,9 +19,9 @@ registry can never silently rot a feature out of validation).
 Reliability contract:
   * each check gets a UNIQUE output dir (no shared-work-root collisions);
   * each check self-cleans its qemu processes on the way out;
-  * before running (unless ``--no-wait``) ``full`` loop-waits for a QUIET
-    host — 0 foreign qemu processes — because goldens and system-mode
-    timing produce false REDs under concurrent load.
+  * the host load is RECORDED per run, never gated on: a cell that fails
+    under load is a bug to fix (maintainer rule -- validity and hang
+    prevention must never ride on the host's load).
 
 The legacy subcommands (all, thread_test, churn_test, simpoint_test, …)
 keep working unchanged; ``full`` composes them plus the folded-in
@@ -1914,25 +1914,6 @@ def _foreign_qemu() -> int:
         return 0
 
 
-def wait_for_quiet(max_wait_s: int = 3600, poll_s: int = 15) -> dict:
-    t0 = time.time()
-    waited = 0.0
-    first = _foreign_qemu()
-    while True:
-        n = _foreign_qemu()
-        if n == 0:
-            break
-        waited = time.time() - t0
-        if waited >= max_wait_s:
-            return {"quiet": False, "waited_s": round(waited, 1),
-                    "foreign_qemu": n, "initial": first}
-        print(f"[full] host not quiet: {n} qemu process(es); "
-              f"waited {waited:.0f}s/{max_wait_s}s ...", flush=True)
-        time.sleep(poll_s)
-    return {"quiet": True, "waited_s": round(time.time() - t0, 1),
-            "foreign_qemu": 0, "initial": first}
-
-
 # ===========================================================================
 # runner
 # ===========================================================================
@@ -1994,12 +1975,16 @@ def run_full(args) -> int:
         _emit_summary(summary, args)
         return summary["exit_code"]
 
-    # Quiet-host gate (baked-in reliability requirement).
-    if args.no_wait:
-        summary["host_quiet"] = {"quiet": None, "waited_s": 0,
-                                 "note": "wait skipped (--no-wait)"}
-    else:
-        summary["host_quiet"] = wait_for_quiet(max_wait_s=args.max_wait)
+    # The quiet-host WAIT gate is gone, by maintainer rule: "trace validity
+    # and hang prevention should NEVER ride on the host's load."  A cell that
+    # fails under load is a bug to fix, not a reason to wait for quiet -- and
+    # the wait manufactured false evidence in practice: two "pristine HEAD
+    # hangs" on record were this gate burning a 500 s cap in wait lines while
+    # the cell never ran, the timeout then read as a hang.  The load level is
+    # still RECORDED (a diagnostic, never a gate) so a failure under load can
+    # be correlated -- correlation is analysis; gating was the defect.
+    summary["host_load"] = {"foreign_qemu": _foreign_qemu(),
+                            "loadavg": open("/proc/loadavg").read().split()[0]}
 
     counts = {"pass": 0, "fail": 0, "skip": 0, "xfail": 0, "xpass": 0}
     for c in sel:
@@ -2069,9 +2054,8 @@ def _emit_summary(summary: dict, args) -> None:
     print("CHAMPSIM TRACER — full validation summary")
     print("=" * 72)
     cov = summary["coverage"]
-    if summary.get("host_quiet"):
-        hq = summary["host_quiet"]
-        print(f"host-quiet gate: {hq}")
+    if summary.get("host_load"):
+        print(f"host load (recorded, never gated): {summary['host_load']}")
     if "counts" in summary:
         c = summary["counts"]
         for t in TIERS:
@@ -2131,10 +2115,10 @@ def add_parser(sub) -> None:
     p.add_argument("--seed", type=lambda s: int(s, 0), default=0x1111,
                    help="Base seed for generated workloads.")
     p.add_argument("--no-wait", action="store_true",
-                   help="Skip the quiet-host wait (use only when you own "
-                        "the host).")
+                   help="Accepted for compatibility; the quiet-host wait "
+                        "no longer exists (load is recorded, never gated).")
     p.add_argument("--max-wait", type=int, default=3600,
-                   help="Max seconds to wait for a quiet host (default 3600).")
+                   help="Accepted for compatibility; no wait exists any more.")
     p.add_argument("--dry-run", action="store_true",
                    help="Build + print the coverage map and check table "
                         "WITHOUT running anything; still enforces the "

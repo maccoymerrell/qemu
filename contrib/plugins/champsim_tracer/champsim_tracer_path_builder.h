@@ -238,6 +238,16 @@ struct CtxFrame {
     uint64_t rep_pre_pc = 0;
     uint64_t rep_pre_iters = 0;
     uint64_t rep_pre_memops = 0;
+    /* Per-piece breakdown of the same prefix, in fault order: one
+     * (iterations retired, REP memops delivered) pair per collect_piece
+     * call.  The totals above are the sums; the emit-time partition needs
+     * the boundaries because each piece's aborted-attempt surplus belongs
+     * to the iteration that faulted at THAT piece's end, not to the last
+     * faulted iteration — with the totals alone a multi-piece split
+     * mis-pairs every iteration after the first fault (measured:
+     * cst_runs/x86close, pc_mf_movsb).  Size = number of mid-instruction
+     * faults this REP took (1 for the common demand fault). */
+    std::vector<std::pair<uint64_t, uint64_t>> rep_pieces;
 };
 
 class PathBuilder {

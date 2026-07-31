@@ -706,13 +706,17 @@ void PathBuilder::on_segment_open()
 static inline void rep_emit_handoff(unsigned int cpu_index,
                                     const RepArchFacts &facts,
                                     uint64_t pre_iters = 0,
-                                    uint64_t pre_memops = 0)
+                                    uint64_t pre_memops = 0,
+                                    std::vector<std::pair<uint64_t,
+                                                          uint64_t>>
+                                        pre_pieces = {})
 {
     RepSelfLoopState &rs = rep_state(cpu_index);
     rs.emit_facts = facts;
     rs.emit_facts_valid = true;
     rs.emit_pre_iters = pre_iters;
     rs.emit_pre_memops = pre_memops;
+    rs.emit_pre_pieces = std::move(pre_pieces);
 }
 
 void PathBuilder::flush_final(bool walk_prev)
@@ -1275,6 +1279,11 @@ void PathBuilder::collect_piece(CtxFrame &f, uint64_t resume_pc)
         f.rep_pre_pc = resume_pc;
         f.rep_pre_iters += walk_facts.iters;
         f.rep_pre_memops += piece_rep;
+        /* Piece boundary for the emit-time partition: this fault ends one
+         * piece, and its aborted-attempt surplus (piece_rep -
+         * iters*mpi) belongs to the iteration that faulted HERE.  The
+         * totals alone cannot place a middle piece's surplus. */
+        f.rep_pieces.emplace_back(walk_facts.iters, piece_rep);
     }
     f.mem.insert(f.mem.end(), piece_mem.begin(), piece_mem.end());
     if (!pending_reg_snaps.empty()) {
@@ -2025,12 +2034,15 @@ PathBuilder::complete_merge(size_t idx,
          * before the erase invalidates f0. */
         const RepArchFacts walk0 = rep_state(cpu_index).pb_walk_facts;
         uint64_t pre_i0 = 0, pre_m0 = 0;
+        std::vector<std::pair<uint64_t, uint64_t>> pieces0;
         if (f0.rep_pre_pc != 0 && f0.rep_pre_pc == walk0.pc) {
             pre_i0 = f0.rep_pre_iters;
             pre_m0 = f0.rep_pre_memops;
+            pieces0 = std::move(f0.rep_pieces);
         }
         frames_.erase(frames_.begin() + (ptrdiff_t)idx);
-        rep_emit_handoff(cpu_index, walk0, pre_i0, pre_m0);
+        rep_emit_handoff(cpu_index, walk0, pre_i0, pre_m0,
+                         std::move(pieces0));
         emit_finalized_bb(out_stream, merged0, pe0.branch_pc,
                           pe0.emit_current_pc, merge_wrong0, cpu_index);
         for (size_t i = 1; i < pending_emits.size(); i++) {
@@ -2199,12 +2211,14 @@ PathBuilder::complete_merge(size_t idx,
      * the pre-fault prefix.  Read before the erase invalidates f. */
     const RepArchFacts walkf = rep_state(cpu_index).pb_walk_facts;
     uint64_t pre_i = 0, pre_m = 0;
+    std::vector<std::pair<uint64_t, uint64_t>> pieces;
     if (f.rep_pre_pc != 0 && f.rep_pre_pc == walkf.pc) {
         pre_i = f.rep_pre_iters;
         pre_m = f.rep_pre_memops;
+        pieces = std::move(f.rep_pieces);
     }
     frames_.erase(frames_.begin() + idx);
-    rep_emit_handoff(cpu_index, walkf, pre_i, pre_m);
+    rep_emit_handoff(cpu_index, walkf, pre_i, pre_m, std::move(pieces));
     emit_finalized_bb(out_stream, merged, pe.branch_pc,
                       pe.emit_current_pc, merge_wrong, cpu_index);
     g_emit_fault_anchors.clear();
@@ -2277,10 +2291,18 @@ void PathBuilder::flush_frame_unwound(size_t idx, BodyStreamState *out_stream,
                 f.mem.size(), g_last_emit_fault_depth, frames_.size());
     }
 
+    /* Suffix-less emission: every retired iteration is prefix (the resume
+     * suffix is gone), so hand the whole prefix through the pre_* seam and
+     * publish zero suffix iterations.  The piece table pairs each middle
+     * piece's aborted-attempt surplus onto its own faulted iteration; the
+     * LAST piece's surplus has no re-execution on this wire and is
+     * (correctly) never rendered.  The delivered stream is complete for
+     * the n_iter it renders, so this is not a memop mismatch. */
     RepArchFacts unwound_facts;
     unwound_facts.pc = f.rep_pre_pc;
-    unwound_facts.iters = f.rep_pre_iters;
-    rep_emit_handoff(cpu_index, unwound_facts);
+    unwound_facts.iters = 0;
+    rep_emit_handoff(cpu_index, unwound_facts, f.rep_pre_iters,
+                     f.rep_pre_memops, std::move(f.rep_pieces));
     emit_body_entry(out_stream, f.full_tmpl, cpu_index, {});
 
     g_emit_fault_anchors.clear();

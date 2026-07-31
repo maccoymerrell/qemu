@@ -3502,9 +3502,12 @@ void emit_body_entry(BodyStreamState *out_stream,
             bool evalid = rs.emit_facts_valid;
             uint64_t pre_iters  = rs.emit_pre_iters;
             uint64_t pre_memops = rs.emit_pre_memops;
+            std::vector<std::pair<uint64_t, uint64_t>> pre_pieces =
+                std::move(rs.emit_pre_pieces);
             rs.emit_facts_valid = false;
             rs.emit_pre_iters = 0;
             rs.emit_pre_memops = 0;
+            rs.emit_pre_pieces.clear();
 
             bool     arch_known = (evalid && efacts.pc != 0 &&
                                    efacts.pc == bb_tmpl->insn_pcs[last]);
@@ -3530,10 +3533,13 @@ void emit_body_entry(BodyStreamState *out_stream,
                 size_t expected = n_iter * mpi + (pre_m - pre_i * mpi);
                 if (rep_dps.size() != expected) {
                     /* Delivered memops disagree with the architectural
-                     * count.  Expected when capture is suppressed or a
-                     * multi-piece fault split interleaves partial
-                     * deliveries; recorded rather than silently absorbed
-                     * by the old integer division. */
+                     * count — capture was suppressed for part of the
+                     * stream.  A COMPLETENESS check only: a multi-piece
+                     * fault split delivers exactly this total too (each
+                     * piece contributes iters*mpi + its aborted attempt),
+                     * so pairing is carried by the piece table, never by
+                     * this counter.  Recorded rather than silently
+                     * absorbed by the old integer division. */
                     g_stats.rep_iters_memop_mismatch++;
                 }
             } else {
@@ -3691,17 +3697,96 @@ void emit_body_entry(BodyStreamState *out_stream,
 
                 /* Iteration k's slice of the REP memop stream.  Plain
                  * k*mpi normally; across a fault-split whole-BB merge the
-                 * stream is [pre_i retired iterations][the faulted
-                 * iteration's aborted attempt][the re-delivered rest], so
-                 * the iteration at pre_i carries its aborted attempt's
-                 * memops (the surplus) plus its re-executed mpi — the same
-                 * rendering the single-iteration translation's merge gives
-                 * the same fault.  Bounded by what was actually delivered:
-                 * with an architectural count the two can differ, and the
+                 * stream is one run per fault PIECE — [piece j's retired
+                 * iterations][piece j's aborted attempt] — followed by the
+                 * re-delivered rest, and each piece's aborted-attempt
+                 * surplus belongs to the iteration that faulted at THAT
+                 * piece's end, rendered as [aborted memops][re-executed
+                 * mpi] — the same shape the single-iteration translation's
+                 * merge gives the same fault.  The piece table places every
+                 * middle surplus; the totals alone cannot (they shifted
+                 * every slice after the first fault of a multi-piece
+                 * split).  Bounded by what was actually delivered: with an
+                 * architectural count the two can differ, and the
                  * iteration count stays architectural while the memops
                  * stay whatever really happened. */
+                struct RepSeg {
+                    size_t start, n, off, sb;   /* iters [start,start+n) at
+                                                 * stream offset off; first
+                                                 * iteration re-executes sb
+                                                 * aborted memops */
+                };
+                std::vector<RepSeg> rep_segs;
+                bool segs_ok = false;
+                /* Only an architectural count partitions the stream by
+                 * piece: without it n_iter came from the delivered memops
+                 * themselves and pre_i/pre_m were never read, so the table
+                 * describes a prefix this emission is not rendering. */
+                if (arch_known && !pre_pieces.empty()) {
+                    /* Two tests, and they are not the same test.
+                     *
+                     * No piece may deliver fewer REP memops than its own
+                     * retired iterations require: that piece had capture
+                     * suppressed part-way, its boundary is not where the
+                     * table says, and every slice after it would shift.
+                     * This is the detector.
+                     *
+                     * The sums are a construction invariant — collect_piece
+                     * appends the pair in the same statement that adds it
+                     * to the totals, so they can only disagree if those two
+                     * seams drift apart in a later edit.  Kept as a
+                     * tripwire, compared against the RAW handoff scalars
+                     * because pre_m above may already have been clamped up
+                     * to pre_i*mpi by exactly the suppressed-capture case
+                     * the first test catches.
+                     *
+                     * A table failing either is unusable: fall back to the
+                     * total-based split and COUNT it rather than mis-place
+                     * slices. */
+                    uint64_t sum_i = 0, sum_m = 0;
+                    bool bad = false;
+                    for (const auto &p : pre_pieces) {
+                        if (p.second < p.first * mpi) {
+                            bad = true;
+                        }
+                        sum_i += p.first;
+                        sum_m += p.second;
+                    }
+                    if (bad || sum_i != pre_iters || sum_m != pre_memops) {
+                        g_stats.rep_piece_table_degenerate++;
+                    } else {
+                        size_t cum = 0, off = 0, pend = 0;
+                        for (const auto &p : pre_pieces) {
+                            if (p.first > 0) {
+                                rep_segs.push_back({cum, (size_t)p.first,
+                                                    off, pend});
+                                pend = 0;
+                            }
+                            cum += (size_t)p.first;
+                            off += (size_t)p.second;
+                            pend += (size_t)(p.second - p.first * mpi);
+                        }
+                        /* Resume-suffix segment (empty on a suffix-less
+                         * unwind flush: its start clamps the loop below
+                         * and the dangling last surplus is never read). */
+                        rep_segs.push_back({cum, n_iter - cum, off, pend});
+                        segs_ok = true;
+                    }
+                }
                 auto rep_slice = [&](size_t k, size_t &lo, size_t &hi) {
-                    if (pre_m == 0 || k < pre_i) {
+                    if (segs_ok) {
+                        lo = hi = rep_dps.size();
+                        for (const RepSeg &s : rep_segs) {
+                            if (k >= s.start && k < s.start + s.n) {
+                                lo = s.off + (k - s.start) * mpi;
+                                hi = lo + mpi;
+                                if (k == s.start) {
+                                    lo -= std::min(s.sb, lo);
+                                }
+                                break;
+                            }
+                        }
+                    } else if (pre_m == 0 || k < pre_i) {
                         lo = k * mpi;
                         hi = lo + mpi;
                     } else if (k == pre_i) {
@@ -5112,22 +5197,124 @@ static std::atomic<bool> g_spec_flush_latched{false};
  * before it has run (see g_window_close_armed).  The pending slot at the
  * close therefore holds a TB that has not executed, and the flush skips it.
  */
-static void run_deferred_window_closes(PathBuilder &pb)
+/* CST_CLOSE_DIAG: one line per deferred-close evaluation.  Reports the
+ * three predicates that decide whether this step takes the close, so a
+ * window that closed at the wrong point can be read back to the step that
+ * armed it.  Diagnostic only — no effect on the trace. */
+static inline bool close_diag(void)
+{
+    static std::atomic<int> v{-1};
+    int x = v.load(std::memory_order_relaxed);
+    if (x < 0) {
+        x = getenv("CST_CLOSE_DIAG") ? 1 : 0;
+        v.store(x, std::memory_order_relaxed);
+    }
+    return x != 0;
+}
+
+/* Ceiling on the fan-out hold below, in consecutive close evaluations.  Large
+ * enough that no legitimate hold reaches it (an instruction's remaining
+ * REP_MAX chunks plus its own page-fault service), small enough that a hold
+ * that never releases costs a bounded overrun instead of a trace that never
+ * finishes. */
+static const uint64_t CST_FANOUT_HOLD_MAX = 65536;
+
+static void run_deferred_window_closes(PathBuilder &pb, unsigned int cpu_index,
+                                       const BBTemplate *cur_tb_tmpl)
 {
     if (!g_icount_shutdown_pending && !g_simpoint_close_pending) {
         g_window_close_armed = false;
         return;
+    }
+    const RepSelfLoopState &rs_cd = rep_state(cpu_index);
+    /* Same bounded predicate the §2.13 warmup boundary defers on: the hold
+     * only counts while execution is still AT the held instruction (a REP
+     * chunk re-enters at the instruction's own pc, so the resume BB's
+     * start_pc matches) or inside its kernel service.  Any other user BB
+     * means the held instruction is architecturally past — or the hold is
+     * stale — so the close proceeds.  Without that bound a hold that is
+     * never released would strand the close and the trace would never
+     * finish. */
+    const bool fanout_hold =
+        rs_cd.warmup_hold_any() && cur_tb_tmpl &&
+        (rs_cd.warmup_hold_matches(cur_tb_tmpl->start_pc) ||
+         cur_tb_tmpl->is_system);
+    if (close_diag()) {
+        fprintf(stderr, "[closediag] eval clock=%" PRIu64
+                " chain=%d armed=%d fanout_hold=%d(any=%d) icount_pend=%d "
+                "sp_pend=%d pc=0x%" PRIx64 "\n",
+                g_user_icount, (int)g_cp_chain.has_active_chain(),
+                (int)g_window_close_armed, (int)fanout_hold,
+                (int)rs_cd.warmup_hold_any(),
+                (int)g_icount_shutdown_pending, (int)g_simpoint_close_pending,
+                cur_tb_tmpl ? cur_tb_tmpl->start_pc : 0);
     }
     /* Not at a BB boundary yet (or the segment already closed under us):
      * hold the arm and let a later step take the close. */
     if (g_cp_chain.has_active_chain() || !g_trace_segments.is_active()) {
         return;
     }
+    /*
+     * Fan-out atomicity.  A true BB seals at the REP itself — it is a
+     * branch terminator — so between two REP_MAX chunks of ONE
+     * architectural instruction the chain is empty and the two tests above
+     * both pass.  Taking the close there ends the trace in the middle of an
+     * instruction: the wire gets a partial iteration count and a self-loop
+     * terminal edge, and the iterations QEMU had already billed to the
+     * window clock are never emitted — the opposite of this function's
+     * contract that every counted insn is committed to an emitted BB.
+     *
+     * So hold the close while a fan-out instruction is architecturally in
+     * flight, the same predicate (begun, not retired) the §2.13
+     * warmup boundary already defers on.
+     *
+     * Measured (cst_runs/x86close, probes/bigrep3.S — a 140000-iteration
+     * REP STOSB, three REP_MAX chunks): without this, budgets 1..5 all
+     * closed between chunk 1 and chunk 2 and put 74463 of 140000
+     * iterations on the wire.  A two-chunk REP never showed it — the close
+     * needs one armed step and one taking step, and two chunks do not
+     * leave room between them, which is why the reasoned D3/D6 case went
+     * unconstructed until a three-chunk probe.
+     *
+     * The hold is bounded twice over, because a close that never fires is a
+     * trace that never finishes.  Structurally: it only counts while
+     * execution is still at the held pc or inside the kernel, so any other
+     * user block releases it.  Numerically: a hold that outlives
+     * CST_FANOUT_HOLD_MAX consecutive evaluations is abandoned and counted,
+     * which converts "the guest stayed in the kernel with a stale hold"
+     * from a hang into a bounded overrun with a number attached.  The
+     * legitimate span is the instruction's remaining chunks plus its own
+     * fault service — thousands of steps at the outside.
+     */
+    static uint64_t held_steps;          /* exec_lock serialises this */
+    if (fanout_hold) {
+        if (++held_steps <= CST_FANOUT_HOLD_MAX) {
+            return;
+        }
+        g_stats.window_close_fanout_hold_capped++;
+    }
+    held_steps = 0;
     if (!g_window_close_armed) {
         g_window_close_armed = true;
         return;
     }
     g_window_close_armed = false;
+    /* Tripwire for what the hold above does NOT cover.  The pc-keyed hold is
+     * armed only from an emission that had an architectural iteration count,
+     * at fault depth 0, in user code — so a kernel fan-out (clear_page's rep
+     * stosq), a fan-out inside a fault service, and a family with no
+     * architectural count (AArch64 FEAT_MOPS) can still be in flight here.
+     * cp_in_flight is the privilege-agnostic latch for the same question.
+     * A nonzero count is a close that MAY have landed inside an
+     * instruction; it is not proof that it did, and it is the number that
+     * says whether the residue is exercised at all. */
+    if (rep_state(cpu_index).cp_in_flight.in_progress) {
+        g_stats.window_close_in_fanout++;
+    }
+    if (close_diag()) {
+        fprintf(stderr, "[closediag] TAKE clock=%" PRIu64 "\n",
+                g_user_icount);
+    }
 
     /* Deferred-exit on icount window-stop.  The trigger was set in
      * tw_manage_window when icount first crossed window_stop. */
@@ -5600,7 +5787,7 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
         return;
     }
 
-    run_deferred_window_closes(pb);
+    run_deferred_window_closes(pb, cpu_index, cur_tb_tmpl);
     g_rec_mutex_unlock(&exec_lock);
 
     if (g_spec_flush_latched.exchange(false, std::memory_order_relaxed)) {

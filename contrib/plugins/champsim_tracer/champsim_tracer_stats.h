@@ -136,10 +136,24 @@ struct Stats {
      *   access rather than an architectural element; on x86 it means the
      *   accounting did not reach the emission (a deferred or merged
      *   emission) and should be rare.
-     * rep_iters_memop_mismatch — the two disagreed.  Expected when a fault
-     *   landed inside an iteration: the completed part of that iteration was
-     *   delivered but the iteration never retired.  Recorded because the old
-     *   integer division absorbed exactly this case silently.
+     * rep_iters_memop_mismatch — the delivered REP memop stream is not the
+     *   length the architectural count calls for, which is n_iter*mpi PLUS
+     *   the aborted-attempt surplus the fault-split prefix recorded.  It
+     *   means capture was suppressed for part of the stream, and nothing
+     *   else: a COMPLETENESS check.
+     *
+     *   It is specifically NOT a fault detector.  A fault landing inside an
+     *   iteration delivers that iteration's completed part and then
+     *   re-delivers the whole iteration on resume; both runs are inside the
+     *   prefix totals, so they cancel out of the expected length exactly.
+     *   The same holds per piece when several faults split one REP.
+     *   Measured (cst_runs/x86close, probes/multifault.S): a rep movsb
+     *   taking FOUR mid-iteration demand faults leaves this counter at 0 on
+     *   a build whose per-iteration memop pairing is wrong for 12289 of its
+     *   12800 iterations.  Pairing is carried by the piece table
+     *   (CtxFrame::rep_pieces), never by this counter, and a reader who
+     *   treats a zero here as evidence about fault handling is reading a
+     *   number that cannot answer the question.
      * rep_trailing_pass_dropped — a zero-iteration re-entry of a REP already
      *   in flight, i.e. the extra pass a single-iteration translation makes
      *   after the final iteration.  Not a retired instruction; suppressed so
@@ -153,6 +167,35 @@ struct Stats {
     uint64_t rep_iters_memop_mismatch = 0;
     uint64_t rep_trailing_pass_dropped = 0;
     uint64_t rep_exit_edge_recovered = 0;
+    /* rep_piece_table_degenerate — a fault-split REP emission arrived with a
+     * per-piece prefix table it could not use, so the emission fell back to
+     * the total-based split rather than mis-place slices.
+     *
+     * The condition that can actually occur is a piece delivering fewer REP
+     * memops than its own retired iterations require: capture was suppressed
+     * part-way through that piece, so its recorded boundary is not where the
+     * stream's boundary is.  The accompanying sum check is a construction
+     * tripwire, not a second failure mode — collect_piece appends each pair
+     * in the same statement that adds it to the totals, so the two can only
+     * disagree if a later edit separates those seams. */
+    uint64_t rep_piece_table_degenerate = 0;
+    /* window_close_in_fanout — a deferred window close was taken while this
+     * vCPU still had a fan-out instruction latched in flight.  The close's
+     * fan-out hold is armed only from user-privilege, fault-depth-0
+     * emissions that carried an architectural iteration count, so it does
+     * not cover a kernel REP, a fan-out inside a fault service, or a family
+     * with no architectural count (AArch64 FEAT_MOPS).  This counts the
+     * closes those cases could have split; it is the measurement of whether
+     * that residue is exercised, not a proof that a split occurred. */
+    uint64_t window_close_in_fanout = 0;
+    /* window_close_fanout_hold_capped — the fan-out hold on a deferred window
+     * close hit its consecutive-evaluation ceiling and was abandoned, so that
+     * close was taken with an instruction still latched in flight.  Nonzero
+     * means either a hold that never released (a fan-out the guest abandoned)
+     * or a legitimate span longer than the ceiling; either way the window
+     * ended where the hold was supposed to prevent, and the ceiling is what
+     * kept it from ending never. */
+    uint64_t window_close_fanout_hold_capped = 0;
 
     /*
      * rep_unretired_pass_dropped — an empty leading pass of a fan-out

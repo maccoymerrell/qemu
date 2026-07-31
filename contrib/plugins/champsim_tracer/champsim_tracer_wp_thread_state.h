@@ -186,6 +186,13 @@ struct RepSelfLoopState {
     bool     emit_facts_valid = false;
     uint64_t emit_pre_iters = 0;
     uint64_t emit_pre_memops = 0;
+    /* Per-piece (iterations, memops) breakdown of the pre-fault prefix, in
+     * fault order (CtxFrame::rep_pieces, moved here by the handoff).  The
+     * scalars above are its sums.  Needed because each piece's aborted-
+     * attempt surplus pairs onto the iteration that faulted at THAT
+     * piece's boundary: totals alone shift every slice after the first
+     * fault of a multi-piece split.  Consumed (cleared) with the facts. */
+    std::vector<std::pair<uint64_t, uint64_t>> emit_pre_pieces;
 
     /*
      * Window-clock ruling (maintainer, 2026-07-29, refined 2026-07-30):

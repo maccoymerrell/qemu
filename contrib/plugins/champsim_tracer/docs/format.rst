@@ -2229,6 +2229,14 @@ translation, and on the wrong path — always single-stepped — as on the
 correct path.  A zero-count REP is a retired instruction and emits its
 one entry, carrying no memops.
 
+A demand fault inside an iteration does not change the entry count
+either: the faulted iteration's entry renders the aborted attempt's
+delivered accesses followed by the re-executed iteration's own, and
+every other iteration renders exactly its architectural accesses.  This
+holds per fault — a REP whose destination crosses several never-touched
+pages faults once per page, and each faulting iteration carries its own
+aborted attempt, at its own position in the iteration sequence.
+
 The window clock does NOT follow the fan-out: a window budget counts
 instructions in bbv-billed units — the per-TB-execution count the BBV
 plugin produces under QEMU's canonical translation, the regime SimPoint
@@ -2247,6 +2255,27 @@ under every translation AND aligned with bbv counts.  Because the
 fan-out writes one entry per iteration, a trace may contain more
 entries than the window budget asked for; that is by design (see header
 field 2.13 for the bridge between the two positions).
+
+The window CLOSE is atomic with respect to a fan-out instruction, in the
+same sense the 2.13 warmup boundary is: a window never ends part-way
+through one architectural instruction's iterations.  A REP whose count
+exceeds ``REP_MAX`` runs as several chunk executions, and a budget that
+runs out between two of those chunks does not stop the trace there — the
+close waits for the instruction to retire, and the window overruns its
+budget by the remainder of that one instruction.  So a REP on the wire
+carries either all of its architectural iterations or none, and a reader
+may take a rendered REP's iteration count as the guest's own count-
+register delta without checking whether the window ended inside it.
+
+Two boundaries of that guarantee are worth stating.  It is carried by the
+correct path's architectural iteration count, so it covers the families
+that publish one — on the wrong path the question does not arise, because
+speculation single-steps and never chunks.  And the window clock reported
+at close (the ``covered=`` figure on the finishing line) is a clock
+reading, not a measure of what was written: it includes the block whose
+execution carried the clock past the budget, which the close then does
+not emit.  The trace's own instruction count is the authority for what
+the window contains.
 
 ::
 

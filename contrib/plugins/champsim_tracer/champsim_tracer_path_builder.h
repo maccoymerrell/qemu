@@ -96,18 +96,30 @@ void emit_body_entry(BodyStreamState *out_stream,
                      uint64_t branch_successor_pc = 0,
                      bool branch_successor_known = false);
 
-/* Thread-local CP-step accumulators owned by champsim_tracer.cc.
- * PathBuilder moves them into / out of its frames (the stash and the
- * merge re-injection) and stamps the emit-time fault trailer values
- * emit_body_entry reads. */
+/* CP-step accumulators owned by champsim_tracer.cc.  PathBuilder moves
+ * them into / out of its frames (the stash and the merge re-injection)
+ * and stamps the emit-time fault trailer values emit_body_entry reads.
+ *
+ * g_emit_fault_depth is a TRANSFER REGISTER: written by the seal phase
+ * and consumed by emit_body_entry within the same exec_lock'd CP step,
+ * never across steps — so thread_local is safe under BOTH threading
+ * models (MTTCG: one thread per vCPU; round-robin: one thread total,
+ * and a step cannot be preempted mid-dispatch). */
 extern thread_local uint32_t g_emit_fault_depth CST_TLS_HOT;
-/* Fault depth stamped on the MOST RECENTLY emitted body entry of this
- * thread (set by emit_body_entry).  Read by the unwind-flush anchor guard
- * so a leaked inner frame is only emitted at the unwind when its depth is
- * strictly shallower than its predecessor (an anchored entry must follow a
- * deeper one); never write it elsewhere. */
-extern thread_local uint32_t g_last_emit_fault_depth;
-extern thread_local uint64_t g_dbg_last_emit_seq;
+/* Fault depth stamped on the MOST RECENTLY emitted body entry of a
+ * vCPU's stream (set by emit_body_entry).  Read by the unwind-flush
+ * anchor guard so a leaked inner frame is only emitted at the unwind
+ * when its depth is strictly shallower than its predecessor (an
+ * anchored entry must follow a deeper one); never write it elsewhere.
+ * Per-vCPU (NOT thread-keyed): it carries meaning across CP steps, and
+ * under round-robin TCG consecutive steps on the one host thread
+ * belong to different vCPUs. */
+uint32_t &last_emit_fault_depth(unsigned int cpu_index);
+/* CST diag correlation: seq_num of the most recent body entry emitted
+ * process-wide.  A wire-position cursor for the gap/jump diagnostics;
+ * plain static like the g_dbg_* mirrors below (every writer runs under
+ * exec_lock). */
+extern uint64_t g_dbg_last_emit_seq;
 
 /* ---- CST_JUMP_DIAG: online depth-step violation detector (diagnostic) ----
  *
@@ -160,8 +172,15 @@ void cst_jump_diag_step(uint64_t cur_pc, uint64_t prev_pc, int priv,
 /* Raise the online assertion for an emit at @depth (no-op unless gated). */
 void cst_jump_diag_emit(uint64_t seq, uint32_t tid, uint64_t pc,
                         uint32_t depth, int is_sys, size_t n_anchors);
+/* Transfer register like g_emit_fault_depth (same one-step lifetime,
+ * same safety argument). */
 extern thread_local std::vector<uint32_t> g_emit_fault_anchors CST_TLS_HOT;
-extern thread_local std::vector<RegSnap> pending_reg_snaps CST_TLS_HOT;
+/* Tail-insn dst snaps awaiting their BB's emission.  Captured during a
+ * TB's body, drained at that vCPU's NEXT CP step — a lifetime that
+ * crosses dispatches, so it must be keyed by vCPU, not by host thread
+ * (under round-robin TCG the next dispatch on the thread may belong to
+ * the other vCPU). */
+std::vector<RegSnap> &pending_reg_snaps(unsigned int cpu_index);
 
 /*
  * ---- PathBuilder proper ----
@@ -393,8 +412,14 @@ public:
      * is finalized either way. */
     void flush_final(bool walk_prev = true);
 
-    /* Lazy per-vCPU event-queue enable, done by the glue on this thread's
-     * first CP exec (must run on the owning vCPU thread). */
+    /* Which vCPU this builder belongs to.  Stamped once by
+     * path_builder() at creation; every internal reference to the
+     * per-vCPU accumulators (pending_reg_snaps, cp_chain, the memory
+     * recorder's CP buffer, the anchor guard) keys off it. */
+    void set_cpu_index(unsigned int cpu_index) { cpu_index_ = cpu_index; }
+
+    /* Lazy per-vCPU event-queue enable, done by the glue on this vCPU's
+     * first CP exec (must run on the owning vCPU). */
     bool events_queue_enabled() const { return evq_enabled_; }
     void mark_events_queue_enabled(unsigned int cpu_index)
     {
@@ -597,8 +622,8 @@ private:
      * the same value — a no-TLS workload and a kernel thread both at 0)
      * merge under this key exactly as they merged under the minted-tid key:
      * the map was value-keyed too, so the predicate is no coarser than it
-     * was.  PathBuilder lives on the heap behind an 8-byte thread_local
-     * pointer (path_builder_tls), so these members cost no static TLS. */
+     * was.  PathBuilder lives on the heap behind per-vCPU pointers
+     * (path_builder(cpu_index)), so these members cost no static TLS. */
     uint64_t async_owner_tp_ = 0;
     bool async_owner_ok_ = false;
 
@@ -814,18 +839,21 @@ private:
     unsigned int cpu_index_ = 0;
 };
 
-/* The calling vCPU thread's PathBuilder (per-thread by construction:
- * frames, chain, recorder buffer and reg-snap accumulators are all
- * thread-local, and TLS cursors can only be reset from their own
- * thread). */
-PathBuilder &path_builder_tls();
+/* @cpu_index's PathBuilder (lazily heap-allocated, immortal).  One
+ * builder per vCPU: frames, chain, recorder buffer and reg-snap
+ * accumulators are per-vCPU streams.  Keyed by cpu_index rather than by
+ * host thread because round-robin TCG runs every vCPU on one thread;
+ * under MTTCG the two keyings coincide. */
+PathBuilder &path_builder(unsigned int cpu_index);
+/* @cpu_index's PathBuilder if it has ever been created, else nullptr —
+ * for teardown sweeps that must not mint builders. */
+PathBuilder *path_builder_if_created(unsigned int cpu_index);
 
-/* Free-function trampolines for the segment-finish flush hook
- * (TraceSegmentManager::finish takes a plain callback): flush the
- * calling thread's pending final body entry.  The _chain_only variant
- * is PathBuilder::flush_final(false) — the deferred window close, whose
- * pending-seal slot holds a TB that has not run yet. */
-void path_builder_flush_final();
-void path_builder_flush_final_chain_only();
+/* Segment-finish flush: flush @cpu_index's pending final body entry.
+ * The _chain_only variant is PathBuilder::flush_final(false) — the
+ * deferred window close, whose pending-seal slot holds a TB that has
+ * not run yet. */
+void path_builder_flush_final(unsigned int cpu_index);
+void path_builder_flush_final_chain_only(unsigned int cpu_index);
 
 #endif /* CHAMPSIM_TRACER_PATH_BUILDER_H */

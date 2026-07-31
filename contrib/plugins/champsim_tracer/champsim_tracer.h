@@ -51,6 +51,12 @@ extern "C" {
 #define CST_TLS_HOT __attribute__((tls_model("initial-exec")))
 
 /* ===== Constants ===== */
+/* Upper bound for every per-vCPU state array (g_rep_state, g_pin_vcpu,
+ * cp_chain(), path_builder(), the CP capture accumulators, ...).  All
+ * accessors clamp, so an out-of-range cpu_index degrades to sharing the
+ * last slot rather than indexing out of bounds. */
+inline constexpr unsigned CST_PIN_MAX_VCPUS = 1024;
+
 /* Wire-format invariants aliased from the shared spec (cst_wire_spec.h)
  * so the plugin and the offline tools can't diverge. */
 #define MAX_INSN_BYTES (cst_wire::INSN_BYTES_MAX)

@@ -12,9 +12,10 @@
  * fall-through is a control-flow discontinuity (interrupt, process
  * start) → reset and restart at the new pre_pc.
  *
- * Threading: one assembler per vCPU thread (thread_local g_cp_chain).
- * CP fragments chain only within one thread, so instance state needs no
- * lock; finalize() calls the shared cache, which the caller locks via
+ * Threading: one assembler per vCPU (cp_chain(cpu_index)).  CP
+ * fragments chain only within one vCPU's dispatch stream, which
+ * exec_lock serialises, so instance state needs no lock of its own;
+ * finalize() calls the shared cache, which the caller locks via
  * data_lock.
  *
  * Across segments clear_bb_map() invalidates cached BBTemplate*s.  Each
@@ -104,9 +105,14 @@ private:
     std::vector<BBTemplate *> fragments_;
 };
 
-/* Per-vCPU CP chain; a basic block doesn't span thread switches so
- * cross-vCPU fragment mixing would be incorrect anyway. */
-extern thread_local BBChainAssembler g_cp_chain CST_TLS_HOT;
+/* Per-vCPU CP chain, indexed by cpu_index (same pattern as g_rep_state);
+ * a basic block doesn't span vCPUs, so cross-vCPU fragment mixing would
+ * be incorrect.  Formerly thread_local, which is per-vCPU only under
+ * MTTCG; round-robin TCG (-accel tcg,thread=single, and therefore
+ * -icount) runs EVERY vCPU on one host thread, where a thread-keyed
+ * chain would fold the vCPUs' interleaved fragment streams into one
+ * bogus chain at each rr slice boundary. */
+BBChainAssembler &cp_chain(unsigned int cpu_index);
 
 /* Bumped by reset_segment_local_state() on segment switch.  Per-vCPU
  * chains compare against this on append_fragment() and self-reset

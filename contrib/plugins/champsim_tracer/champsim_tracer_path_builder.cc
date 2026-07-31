@@ -515,14 +515,31 @@ void cst_jump_diag_emit(uint64_t seq, uint32_t tid, uint64_t pc,
     fflush(stderr);
 }
 
-PathBuilder &path_builder_tls()
+/* Per-vCPU builders (see the header): lazily heap-allocated, immortal.
+ * Plain pointer array — costs no static TLS at all, and unlike the old
+ * thread_local pointer it keys the builder by vCPU, which round-robin
+ * TCG requires (one host thread runs every vCPU) and MTTCG is agnostic
+ * to.  Creation runs under exec_lock (all callers are CP-step / segment
+ * machinery), so no atomics are needed. */
+static PathBuilder *g_path_builders[CST_PIN_MAX_VCPUS];
+
+PathBuilder &path_builder(unsigned int cpu_index)
 {
-    /* Heap-allocated and deliberately never freed: keeps the thread_local
-     * itself an 8-byte pointer instead of a 400-byte object, so the
-     * plugin's initial-exec TLS block stays well inside glibc's dlopen
-     * static-TLS surplus (1664 B in qemu-system-x86_64). */
-    static thread_local PathBuilder *builder = new PathBuilder();
-    return *builder;
+    unsigned int idx = cpu_index < CST_PIN_MAX_VCPUS
+                       ? cpu_index : CST_PIN_MAX_VCPUS - 1;
+    if (!g_path_builders[idx]) {
+        PathBuilder *b = new PathBuilder();
+        b->set_cpu_index(idx);
+        g_path_builders[idx] = b;
+    }
+    return *g_path_builders[idx];
+}
+
+PathBuilder *path_builder_if_created(unsigned int cpu_index)
+{
+    unsigned int idx = cpu_index < CST_PIN_MAX_VCPUS
+                       ? cpu_index : CST_PIN_MAX_VCPUS - 1;
+    return g_path_builders[idx];
 }
 
 /* Does @t's instruction list contain @pc?  The frame invariant is
@@ -647,7 +664,7 @@ void PathBuilder::on_segment_open()
      * follow-up — the opening block's OWN per-insn snaps are captured AFTER
      * this reset (its insns run once this callback returns) and must be
      * dropped before the first real block seals. */
-    pending_reg_snaps.clear();
+    pending_reg_snaps(cpu_index_).clear();
     seg_gen_seen_ = g_segment_generation.load(std::memory_order_relaxed);
     drop_open_leak_pending_ = true;
     depth_next_ = 0;
@@ -683,7 +700,7 @@ void PathBuilder::on_segment_open()
      * unwind flush compares against a clean baseline, not a stale prior
      * segment's depth. */
     g_emit_fault_depth = 0;
-    g_last_emit_fault_depth = 0;
+    last_emit_fault_depth(cpu_index_) = 0;
     g_emit_fault_anchors.clear();
 }
 
@@ -762,7 +779,7 @@ void PathBuilder::flush_final(bool walk_prev)
                             RegSnap s;
                             g_reg_snaps.read_into_snap(
                                 cpu_index, nl->dst_qemu_reg_keys[i], &s);
-                            pending_reg_snaps.push_back(s);
+                            pending_reg_snaps(cpu_index_).push_back(s);
                         }
                     };
                     if (ds_tail) {
@@ -772,12 +789,12 @@ void PathBuilder::flush_final(bool walk_prev)
                 }
             }
 
-            g_cp_chain.append_fragment(frag->start_pc, frag,
+            cp_chain(cpu_index_).append_fragment(frag->start_pc, frag,
                                        frag->fall_through_pc,
                                        (TbTerminus)frag->terminus);
-            if (g_cp_chain.bb_complete() && g_cp_chain.has_active_chain()) {
-                BBTemplate *bb_tmpl = g_cp_chain.finalize();
-                g_cp_chain.reset();
+            if (cp_chain(cpu_index_).bb_complete() && cp_chain(cpu_index_).has_active_chain()) {
+                BBTemplate *bb_tmpl = cp_chain(cpu_index_).finalize();
+                cp_chain(cpu_index_).reset();
                 finalized.push_back(bb_tmpl);
             }
 
@@ -796,8 +813,8 @@ void PathBuilder::flush_final(bool walk_prev)
          * first sub-TB of a page-straddling exit block.  Finalize the
          * partial BB as-is; like every entry this flush emits, its
          * terminal branch is simply unresolved. */
-        if (g_cp_chain.has_active_chain()) {
-            if (BBTemplate *bb_tmpl = g_cp_chain.finalize()) {
+        if (cp_chain(cpu_index_).has_active_chain()) {
+            if (BBTemplate *bb_tmpl = cp_chain(cpu_index_).finalize()) {
                 finalized.push_back(bb_tmpl);
             }
         }
@@ -809,22 +826,23 @@ void PathBuilder::flush_final(bool walk_prev)
         emit_body_entry(out_stream, bb_tmpl, cpu_index, {});
     }
 
-    /* cp_chain and the CP memop buffer are thread_local; no lock. */
-    g_cp_chain.reset();
-    g_mem_recorder.clear_cp();
+    /* cp_chain and the CP memop buffer are per-vCPU; exec_lock (held)
+     * serialises them. */
+    cp_chain(cpu_index_).reset();
+    g_mem_recorder.clear_cp(cpu_index_);
 
     qemu_plugin_u64_set(g_scoreboard.prev_start_pc, cpu_index, 0);
     qemu_plugin_u64_set(g_scoreboard.prev_fall_through, cpu_index, 0);
 }
 
-void path_builder_flush_final()
+void path_builder_flush_final(unsigned int cpu_index)
 {
-    path_builder_tls().flush_final();
+    path_builder(cpu_index).flush_final();
 }
 
-void path_builder_flush_final_chain_only()
+void path_builder_flush_final_chain_only(unsigned int cpu_index)
 {
-    path_builder_tls().flush_final(/* walk_prev= */ false);
+    path_builder(cpu_index).flush_final(/* walk_prev= */ false);
 }
 
 /*
@@ -1261,7 +1279,7 @@ ptrdiff_t PathBuilder::frame_idx_for_completion(const BBTemplate *suffix,
 void PathBuilder::collect_piece(CtxFrame &f, uint64_t resume_pc)
 {
     std::vector<WPMemAccess> piece_mem;
-    g_mem_recorder.take_cp(piece_mem);
+    g_mem_recorder.take_cp(cpu_index_, piece_mem);
     /* Fault-split self-loop prefix: when the faulting instruction IS the
      * REP (its partial execution's facts carry its own pc — the entry
      * publish runs before any iteration, so the latch can never be a
@@ -1286,10 +1304,10 @@ void PathBuilder::collect_piece(CtxFrame &f, uint64_t resume_pc)
         f.rep_pieces.emplace_back(walk_facts.iters, piece_rep);
     }
     f.mem.insert(f.mem.end(), piece_mem.begin(), piece_mem.end());
-    if (!pending_reg_snaps.empty()) {
-        f.snaps.insert(f.snaps.end(), pending_reg_snaps.begin(),
-                       pending_reg_snaps.end());
-        pending_reg_snaps.clear();
+    if (!pending_reg_snaps(cpu_index_).empty()) {
+        f.snaps.insert(f.snaps.end(), pending_reg_snaps(cpu_index_).begin(),
+                       pending_reg_snaps(cpu_index_).end());
+        pending_reg_snaps(cpu_index_).clear();
     }
     if (f.full_tmpl && f.full_tmpl->insn_pcs) {
         for (uint32_t i = 0; i < f.full_tmpl->n_insns; i++) {
@@ -1324,23 +1342,23 @@ void PathBuilder::collect_piece(CtxFrame &f, uint64_t resume_pc)
 BBTemplate *PathBuilder::fold_prev_full_bb(BBTemplate *prev)
 {
     g_mutex_lock(&data_lock);
-    g_cp_chain.reset();
-    g_cp_chain.append_fragment(prev->start_pc, prev, prev->fall_through_pc,
+    cp_chain(cpu_index_).reset();
+    cp_chain(cpu_index_).append_fragment(prev->start_pc, prev, prev->fall_through_pc,
                                (TbTerminus)prev->terminus);
     BBTemplate *full_bb = nullptr;
-    if (g_cp_chain.bb_complete() && g_cp_chain.has_active_chain()) {
-        full_bb = g_cp_chain.finalize();
-        g_cp_chain.reset();
+    if (cp_chain(cpu_index_).bb_complete() && cp_chain(cpu_index_).has_active_chain()) {
+        full_bb = cp_chain(cpu_index_).finalize();
+        cp_chain(cpu_index_).reset();
     }
     bool fell_back = false;
     if (!full_bb) {
-        full_bb = g_cp_chain.finalize();   /* force-commit incomplete head */
+        full_bb = cp_chain(cpu_index_).finalize();   /* force-commit incomplete head */
         fell_back = true;
         if (!full_bb) {
             full_bb = prev;                /* empty-chain guard */
         }
     }
-    g_cp_chain.reset();
+    cp_chain(cpu_index_).reset();
     if (pb_diag()) {
         fprintf(stderr, "[pathbuilder] PUSH prev=0x%" PRIx64 " n=%u term=%d "
                 "-> full=0x%" PRIx64 " n=%u incomplete=%d tid=%u\n",
@@ -1417,7 +1435,7 @@ void PathBuilder::classify_fault_enter(const struct qemu_plugin_cpu_event &ev,
     }
     if (cont >= 0) {                                  /* case (a) / (a2) */
         g_mutex_lock(&data_lock);
-        g_cp_chain.reset();
+        cp_chain(cpu_index_).reset();
         g_mutex_unlock(&data_lock);
         cst_jump_diag_step(resume, walk_prev_->start_pc, (int)ev.priv, 1,
                            "fault-enter(a)");
@@ -1521,10 +1539,10 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
     if (seg_gen_seen_ != cur_gen) {
         seg_gen_seen_ = cur_gen;
         drop_open_leak_pending_ = false;
-        pending_reg_snaps.clear();
+        pending_reg_snaps(cpu_index_).clear();
     } else if (drop_open_leak_pending_) {
         drop_open_leak_pending_ = false;
-        pending_reg_snaps.clear();
+        pending_reg_snaps(cpu_index_).clear();
     }
 
     /* Retain this step's drain: the queue's internal buffer is only
@@ -1909,8 +1927,8 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
             if (prev_tb_) {
                 suspend_prev(prev_owner_asid_, prev_owner_live_, in.cpu_index);
             } else {
-                g_mem_recorder.clear_cp();
-                pending_reg_snaps.clear();
+                g_mem_recorder.clear_cp(cpu_index_);
+                pending_reg_snaps(cpu_index_).clear();
             }
             g_capture_mute = true;
             clear_prev();
@@ -1994,8 +2012,8 @@ PathBuilder::complete_merge(size_t idx,
         CtxFrame &f0 = frames_[idx];
         if (f0.depth >= 1) {
             frames_.erase(frames_.begin() + (ptrdiff_t)idx);
-            g_mem_recorder.clear_cp();
-            pending_reg_snaps.clear();
+            g_mem_recorder.clear_cp(cpu_index_);
+            pending_reg_snaps(cpu_index_).clear();
             return StepStatus::MERGED;
         }
         const PendingEmit &pe0 = pending_emits.front();
@@ -2004,19 +2022,19 @@ PathBuilder::complete_merge(size_t idx,
             for (uint32_t i = 0; i < f0.full_tmpl->n_insns; i++) {
                 expected += f0.full_tmpl->insn_fields[i].n_dst_regs;
             }
-            size_t have = f0.snaps.size() + pending_reg_snaps.size();
+            size_t have = f0.snaps.size() + pending_reg_snaps(cpu_index_).size();
             if (have > expected && f0.snaps.size() <= expected) {
                 size_t excess = have - expected;
-                if (excess <= pending_reg_snaps.size()) {
-                    pending_reg_snaps.erase(
-                        pending_reg_snaps.begin(),
-                        pending_reg_snaps.begin() + (ptrdiff_t)excess);
+                if (excess <= pending_reg_snaps(cpu_index_).size()) {
+                    pending_reg_snaps(cpu_index_).erase(
+                        pending_reg_snaps(cpu_index_).begin(),
+                        pending_reg_snaps(cpu_index_).begin() + (ptrdiff_t)excess);
                 }
             }
         }
-        g_mem_recorder.prepend_cp(f0.mem);
+        g_mem_recorder.prepend_cp(cpu_index_, f0.mem);
         if (!f0.snaps.empty()) {
-            pending_reg_snaps.insert(pending_reg_snaps.begin(),
+            pending_reg_snaps(cpu_index_).insert(pending_reg_snaps(cpu_index_).begin(),
                                      f0.snaps.begin(), f0.snaps.end());
         }
         if (pe0.bb_tmpl && f0.full_tmpl && pe0.bb_tmpl->taken_pc) {
@@ -2126,7 +2144,7 @@ PathBuilder::complete_merge(size_t idx,
                 "branch_pc=0x%" PRIx64 " cur=0x%" PRIx64 " wrong=0x%" PRIx64
                 " frames=%zu\n",
                 f.full_tmpl ? f.full_tmpl->start_pc : 0, f.snaps.size(),
-                pending_reg_snaps.size(), f.mem.size(),
+                pending_reg_snaps(cpu_index_).size(), f.mem.size(),
                 pe.branch_pc, pe.emit_current_pc, pe.wrong_target,
                 frames_.size());
     }
@@ -2147,19 +2165,19 @@ PathBuilder::complete_merge(size_t idx,
         for (uint32_t i = 0; i < f.full_tmpl->n_insns; i++) {
             expected += f.full_tmpl->insn_fields[i].n_dst_regs;
         }
-        size_t have = f.snaps.size() + pending_reg_snaps.size();
+        size_t have = f.snaps.size() + pending_reg_snaps(cpu_index_).size();
         if (have > expected && f.snaps.size() <= expected) {
             size_t excess = have - expected;
-            if (excess <= pending_reg_snaps.size()) {
-                pending_reg_snaps.erase(
-                    pending_reg_snaps.begin(),
-                    pending_reg_snaps.begin() + (ptrdiff_t)excess);
+            if (excess <= pending_reg_snaps(cpu_index_).size()) {
+                pending_reg_snaps(cpu_index_).erase(
+                    pending_reg_snaps(cpu_index_).begin(),
+                    pending_reg_snaps(cpu_index_).begin() + (ptrdiff_t)excess);
             }
         }
     }
-    g_mem_recorder.prepend_cp(f.mem);
+    g_mem_recorder.prepend_cp(cpu_index_, f.mem);
     if (!f.snaps.empty()) {
-        pending_reg_snaps.insert(pending_reg_snaps.begin(),
+        pending_reg_snaps(cpu_index_).insert(pending_reg_snaps(cpu_index_).begin(),
                                  f.snaps.begin(), f.snaps.end());
     }
     /* The faulting BB and its resuming suffix share the terminal branch,
@@ -2188,12 +2206,12 @@ PathBuilder::complete_merge(size_t idx,
      * emits deeper first, so the guard never triggers (g_last_emit > f.depth).
      * The deeper-frame flush above may have just emitted the true deeper
      * predecessor, in which case g_last_emit is deep and the anchor stays. */
-    if (g_last_emit_fault_depth > f.depth) {
+    if (last_emit_fault_depth(cpu_index_) > f.depth) {
         g_emit_fault_depth = f.depth;
         g_dbg_depth_src = CST_DSRC_MERGE;
         g_emit_fault_anchors = f.anchors;
     } else {
-        g_emit_fault_depth = g_last_emit_fault_depth;
+        g_emit_fault_depth = last_emit_fault_depth(cpu_index_);
         g_dbg_depth_src = CST_DSRC_MERGE_PLAIN;
         g_emit_fault_anchors.clear();
         if (pb_diag() || pb_susp_diag()) {
@@ -2201,7 +2219,7 @@ PathBuilder::complete_merge(size_t idx,
                     " f.depth=%u last_emit=%u nanchor=%zu (no deeper "
                     "predecessor; emit plain)\n",
                     f.full_tmpl ? f.full_tmpl->start_pc : 0, f.depth,
-                    g_last_emit_fault_depth, f.anchors.size());
+                    last_emit_fault_depth(cpu_index_), f.anchors.size());
         }
     }
     BBTemplate *merged = f.full_tmpl;
@@ -2263,23 +2281,23 @@ void PathBuilder::flush_frame_unwound(size_t idx, BodyStreamState *out_stream,
     if (!out_stream || !f.full_tmpl) {
         return;
     }
-    if (!(g_last_emit_fault_depth > f.depth)) {
+    if (!(last_emit_fault_depth(cpu_index_) > f.depth)) {
         if (pb_diag()) {
             fprintf(stderr, "[pathbuilder] UNWIND-FLUSH-SKIP full=0x%" PRIx64
                     " depth=%u last_emit_depth=%u (anchor guard)\n",
-                    f.full_tmpl->start_pc, f.depth, g_last_emit_fault_depth);
+                    f.full_tmpl->start_pc, f.depth, last_emit_fault_depth(cpu_index_));
         }
         return;
     }
 
     /* Set the current block's accumulators aside; emit from the frame's own. */
     std::vector<WPMemAccess> cur_mem;
-    g_mem_recorder.take_cp(cur_mem);
-    std::vector<RegSnap> cur_snaps = std::move(pending_reg_snaps);
-    pending_reg_snaps.clear();
+    g_mem_recorder.take_cp(cpu_index_, cur_mem);
+    std::vector<RegSnap> cur_snaps = std::move(pending_reg_snaps(cpu_index_));
+    pending_reg_snaps(cpu_index_).clear();
 
-    g_mem_recorder.prepend_cp(f.mem);
-    pending_reg_snaps = f.snaps;
+    g_mem_recorder.prepend_cp(cpu_index_, f.mem);
+    pending_reg_snaps(cpu_index_) = f.snaps;
     g_emit_fault_depth = f.depth;
     g_dbg_depth_src = CST_DSRC_UNWIND;
     g_emit_fault_anchors = f.anchors;
@@ -2288,7 +2306,7 @@ void PathBuilder::flush_frame_unwound(size_t idx, BodyStreamState *out_stream,
         fprintf(stderr, "[pathbuilder] UNWIND-FLUSH full=0x%" PRIx64 " depth=%u "
                 "nanchor=%zu nmem=%zu pred_depth=%u frames_left=%zu\n",
                 f.full_tmpl->start_pc, f.depth, f.anchors.size(),
-                f.mem.size(), g_last_emit_fault_depth, frames_.size());
+                f.mem.size(), last_emit_fault_depth(cpu_index_), frames_.size());
     }
 
     /* Suffix-less emission: every retired iteration is prefix (the resume
@@ -2309,9 +2327,9 @@ void PathBuilder::flush_frame_unwound(size_t idx, BodyStreamState *out_stream,
     g_emit_fault_depth = 0;
 
     /* Restore the current block's accumulators (emit drained them). */
-    g_mem_recorder.clear_cp();
-    g_mem_recorder.prepend_cp(cur_mem);
-    pending_reg_snaps = std::move(cur_snaps);
+    g_mem_recorder.clear_cp(cpu_index_);
+    g_mem_recorder.prepend_cp(cpu_index_, cur_mem);
+    pending_reg_snaps(cpu_index_) = std::move(cur_snaps);
 }
 
 /*
@@ -2372,10 +2390,10 @@ void PathBuilder::suspend_prev(uint64_t owner_asid, uint64_t owner_live,
     s.depth = prev_depth_;
     s.asid = owner_asid;
     s.owner_live = owner_live;
-    g_mem_recorder.take_cp(s.mem);              /* drains the CP buffer */
-    s.snaps = std::move(pending_reg_snaps);
-    pending_reg_snaps.clear();
-    s.chain = g_cp_chain.detach_state();
+    g_mem_recorder.take_cp(cpu_index_, s.mem);              /* drains the CP buffer */
+    s.snaps = std::move(pending_reg_snaps(cpu_index_));
+    pending_reg_snaps(cpu_index_).clear();
+    s.chain = cp_chain(cpu_index_).detach_state();
     s.rep_facts = rep_state(cpu_index).pb_prev_facts;
     g_stats.susp_pushed++;
     g_dbg_susp = susp_stack_.size();
@@ -2423,12 +2441,12 @@ bool PathBuilder::resume_suspension(uint64_t resume_asid, uint64_t resume_live)
         g_dbg_prev_depth = prev_depth_;
         prev_owner_asid_ = s.asid;
         prev_owner_live_ = s.owner_live;
-        g_mem_recorder.prepend_cp(s.mem);        /* restore committed memops */
+        g_mem_recorder.prepend_cp(cpu_index_, s.mem);        /* restore committed memops */
         if (!s.snaps.empty()) {                  /* restore per-insn snaps */
-            pending_reg_snaps.insert(pending_reg_snaps.begin(),
+            pending_reg_snaps(cpu_index_).insert(pending_reg_snaps(cpu_index_).begin(),
                                      s.snaps.begin(), s.snaps.end());
         }
-        g_cp_chain.attach_state(std::move(s.chain));
+        cp_chain(cpu_index_).attach_state(std::move(s.chain));
         cst_jump_diag_step(0, prev_tb_ ? prev_tb_->start_pc : 0, -1, 1,
                            "RESUME");
         if (pb_diag() || pb_susp_diag()) {
@@ -2983,8 +3001,8 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
      * standalone BBs.  The interrupted (depth-0) block still reassembles
      * whole via the merge. */
     if (!g_features.trace_faults && walk_in_sync_) {
-        g_mem_recorder.clear_cp();
-        pending_reg_snaps.clear();
+        g_mem_recorder.clear_cp(cpu_index_);
+        pending_reg_snaps(cpu_index_).clear();
         return StepStatus::NO_SEAL;
     }
 

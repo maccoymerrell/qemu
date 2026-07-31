@@ -2163,16 +2163,30 @@ reclaimee), and reclaims SPEC-class templates.
 
 *Segment-generation stale-fragment guard.*  Switching segments
 calls ``clear_bb_map()``, which drops the owning ``unique_ptr`` s
-so any ``BBTemplate*`` held in another thread's in-flight chain
+so any ``BBTemplate*`` held in another vCPU's in-flight chain
 dangles.  ``reset_segment_local_state`` bumps a monotonic
 ``g_segment_generation``; every chain stamps the generation on each
-``append_fragment`` and self-resets on mismatch, so one thread can
-reset segment-local state without reaching into other threads'
-``thread_local`` chains.  Each thread's PathBuilder likewise resets
-its own frames and pending-seal slot via ``on_segment_open`` as it
-observes the bumped generation (TLS cursors can only be reset from
-their own thread), and cross-segment references held by persistent
-templates are ``SegRef`` handles that read as null once stale.
+``append_fragment`` and self-resets on mismatch, so the opening vCPU
+can reset segment-local state without reaching into the other
+vCPUs' chains.  Each vCPU's PathBuilder likewise resets its own
+frames and pending-seal slot via ``on_segment_open`` as it observes
+the bumped generation, and cross-segment references held by
+persistent templates are ``SegRef`` handles that read as null once
+stale.
+
+*Per-vCPU stream state is keyed by* ``cpu_index``, *not by host
+thread.*  The chain assembler, the PathBuilder, the CP memop
+accumulator, the pending dst-register snaps and the deferred
+window-close arms all live in clamped per-vCPU array accessors (the
+``g_rep_state`` pattern).  Under MTTCG a vCPU and its host thread
+coincide, but under round-robin TCG (``-accel tcg,thread=single``,
+and therefore under ``-icount``) one host thread runs every vCPU,
+and thread-keyed state would fold the vCPUs' interleaved streams
+together at each scheduler slice.  The only per-vCPU values still
+in ``thread_local`` storage are those whose whole lifetime sits
+inside a single ``exec_lock``'d CP step (``g_wp_state``,
+``g_capture_mute``, the emit-time transfer registers), which no
+vCPU switch can interleave under either threading model.
 
 *The async writer exists to protect guest timing.*  Without it the
 ~64 KiB kernel pipe buffer is the only slack between the QEMU CPU

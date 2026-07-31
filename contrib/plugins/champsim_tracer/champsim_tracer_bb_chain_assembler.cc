@@ -7,7 +7,17 @@
 #include "champsim_tracer_bb_chain_assembler.h"
 #include "champsim_tracer_bb_template_cache.h"
 
-thread_local BBChainAssembler g_cp_chain CST_TLS_HOT;
+/* Per-vCPU assemblers, indexed by cpu_index (see the header comment on
+ * cp_chain()).  Plain static array, same lifetime discipline as
+ * g_rep_state: never destroyed before plugin_exit-ordered teardown. */
+static BBChainAssembler g_cp_chains[CST_PIN_MAX_VCPUS];
+
+BBChainAssembler &cp_chain(unsigned int cpu_index)
+{
+    return g_cp_chains[cpu_index < CST_PIN_MAX_VCPUS
+                       ? cpu_index : CST_PIN_MAX_VCPUS - 1];
+}
+
 std::atomic<uint32_t> g_segment_generation{1};
 
 void BBChainAssembler::append_fragment(uint64_t entry_pc,
@@ -19,8 +29,8 @@ void BBChainAssembler::append_fragment(uint64_t entry_pc,
      * On segment switch clear_bb_map() drops the unique_ptrs owning
      * fragments_'s BBTemplate*s, so a generation mismatch (bumped per
      * switch) means lazily drop the now-stale chain here — lets
-     * reset_segment_local_state run on one thread without touching
-     * other threads' thread_local chains.
+     * reset_segment_local_state run against one vCPU's chain without
+     * touching the other vCPUs'.
      */
     uint32_t cur_gen = g_segment_generation.load(std::memory_order_relaxed);
     if (my_gen_ != cur_gen) {

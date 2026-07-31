@@ -16,7 +16,14 @@ MemAccessRecorder g_mem_recorder;
 
 namespace {
 
-thread_local std::vector<WPMemAccess> tls_cp_mem_accesses CST_TLS_HOT;
+/* Per-vCPU CP memop accumulator, indexed by cpu_index.  The capture-to-
+ * drain lifetime crosses CP steps (a TB's memops are drained at that
+ * vCPU's NEXT dispatch), so this must key by vCPU, not host thread:
+ * round-robin TCG runs every vCPU on one thread, and the next dispatch
+ * on that thread may belong to a different vCPU.  Under MTTCG the two
+ * keyings coincide.  exec_lock (held around every producer's TB window
+ * and every consumer) serialises access. */
+std::vector<WPMemAccess> g_cp_mem_accesses[CST_PIN_MAX_VCPUS];
 /* Memops whose insn_pc missed a drain's template, held for a later
  * one.  The legitimate producers are entries that follow the recording
  * entry in execution order: a split BB (the MIPS page-split branch
@@ -36,9 +43,22 @@ thread_local std::vector<WPMemAccess> tls_cp_mem_accesses CST_TLS_HOT;
  * all is not that evidence and must not drop the carry — an
  * intermediate fan-out fragment legitimately moves no memory (a MOPS
  * main step with a sub-page transfer already finished by its prologue
- * is a routine case), and so does any memop-free BB. */
-thread_local std::vector<WPMemAccess> tls_cp_carry;
-thread_local GByteArray              *tls_mem_read_buf CST_TLS_HOT = nullptr;
+ * is a routine case), and so does any memop-free BB.  Per-vCPU for
+ * the same reason as the accumulator above. */
+std::vector<WPMemAccess> g_cp_carries[CST_PIN_MAX_VCPUS];
+thread_local GByteArray *tls_mem_read_buf CST_TLS_HOT = nullptr;
+
+std::vector<WPMemAccess> &cp_mem(unsigned int cpu_index)
+{
+    return g_cp_mem_accesses[cpu_index < CST_PIN_MAX_VCPUS
+                             ? cpu_index : CST_PIN_MAX_VCPUS - 1];
+}
+
+std::vector<WPMemAccess> &cp_carry(unsigned int cpu_index)
+{
+    return g_cp_carries[cpu_index < CST_PIN_MAX_VCPUS
+                        ? cpu_index : CST_PIN_MAX_VCPUS - 1];
+}
 
 GByteArray *read_scratch()
 {
@@ -105,7 +125,8 @@ void capture_mem_value(qemu_plugin_meminfo_t info,
 
 } /* namespace */
 
-void MemAccessRecorder::record(qemu_plugin_meminfo_t info,
+void MemAccessRecorder::record(unsigned int cpu_index,
+                               qemu_plugin_meminfo_t info,
                                uint64_t vaddr,
                                uint64_t insn_pc)
 {
@@ -193,7 +214,7 @@ void MemAccessRecorder::record(qemu_plugin_meminfo_t info,
         acc.faulted = mem_faulted;
         wp.mem_accesses.push_back(acc);
     } else {
-        tls_cp_mem_accesses.push_back(acc);
+        cp_mem(cpu_index).push_back(acc);
         Stats &s = thread_stats_get();
         s.cp_total_mem_accesses++;
         if (Stats *h = g_current_hist_bucket) {
@@ -202,7 +223,9 @@ void MemAccessRecorder::record(qemu_plugin_meminfo_t info,
     }
 }
 
-void MemAccessRecorder::record_synthetic_load(uint64_t vaddr, uint64_t insn_pc)
+void MemAccessRecorder::record_synthetic_load(unsigned int cpu_index,
+                                              uint64_t vaddr,
+                                              uint64_t insn_pc)
 {
     /* TLS-cache rationale: see record() above. */
     WPThreadState &wp = g_wp_state;
@@ -233,7 +256,7 @@ void MemAccessRecorder::record_synthetic_load(uint64_t vaddr, uint64_t insn_pc)
     if (wp.in_progress) {
         wp.mem_accesses.push_back(acc);
     } else {
-        tls_cp_mem_accesses.push_back(acc);
+        cp_mem(cpu_index).push_back(acc);
         Stats &s = thread_stats_get();
         s.cp_total_mem_accesses++;
         if (Stats *h = g_current_hist_bucket) {
@@ -242,32 +265,34 @@ void MemAccessRecorder::record_synthetic_load(uint64_t vaddr, uint64_t insn_pc)
     }
 }
 
-size_t MemAccessRecorder::cp_count() const
+size_t MemAccessRecorder::cp_count(unsigned int cpu_index) const
 {
-    return tls_cp_mem_accesses.size();
+    return cp_mem(cpu_index).size();
 }
 
-void MemAccessRecorder::clear_cp()
+void MemAccessRecorder::clear_cp(unsigned int cpu_index)
 {
-    tls_cp_mem_accesses.clear();
+    cp_mem(cpu_index).clear();
     /* Discard carried stragglers too: every clear_cp() caller is
      * abandoning the pending CP context (segment close, foreign-TB
      * drop), and a straggler must not outlive the path that would
      * have owned it. */
-    tls_cp_carry.clear();
+    cp_carry(cpu_index).clear();
 }
 
-void MemAccessRecorder::take_cp(std::vector<WPMemAccess> &out)
+void MemAccessRecorder::take_cp(unsigned int cpu_index,
+                                std::vector<WPMemAccess> &out)
 {
     /* Move the CP buffer out (leaving it empty) so a fault excursion can set
      * it aside while the handler records its own memops, then restore it on
      * resume — the faulting BB's memops accumulate across the detour exactly
      * as the WP walk accumulates past a spec fault. */
-    out = std::move(tls_cp_mem_accesses);
-    tls_cp_mem_accesses.clear();
+    out = std::move(cp_mem(cpu_index));
+    cp_mem(cpu_index).clear();
 }
 
-void MemAccessRecorder::prepend_cp(const std::vector<WPMemAccess> &front)
+void MemAccessRecorder::prepend_cp(unsigned int cpu_index,
+                                   const std::vector<WPMemAccess> &front)
 {
     /* Re-inject @front ahead of the current CP buffer.  Memops are keyed by
      * absolute insn_pc and drained by matching against the template's
@@ -276,11 +301,12 @@ void MemAccessRecorder::prepend_cp(const std::vector<WPMemAccess> &front)
     if (front.empty()) {
         return;
     }
-    tls_cp_mem_accesses.insert(tls_cp_mem_accesses.begin(),
-                               front.begin(), front.end());
+    cp_mem(cpu_index).insert(cp_mem(cpu_index).begin(),
+                             front.begin(), front.end());
 }
 
 void MemAccessRecorder::drain_cp_into_dyn_params(
+    unsigned int cpu_index,
     std::vector<DynParam> &dyn_params,
     const BBTemplate *bb_tmpl)
 {
@@ -385,53 +411,58 @@ void MemAccessRecorder::drain_cp_into_dyn_params(
      * Survivors compact to the front of the carry in place, so the
      * common case — nothing carried, or everything carried claimed —
      * allocates nothing. */
+    std::vector<WPMemAccess> &carry = cp_carry(cpu_index);
+    std::vector<WPMemAccess> &live = cp_mem(cpu_index);
     unsigned int idx = 0;
     bool claimed_carry = false;
     size_t n_stranded = 0;
-    for (size_t r = 0; r < tls_cp_carry.size(); r++) {
-        const WPMemAccess acc = tls_cp_carry[r];
+    for (size_t r = 0; r < carry.size(); r++) {
+        const WPMemAccess acc = carry[r];
         int slot = slot_for(acc, idx);
         if (slot < 0) {
-            tls_cp_carry[n_stranded++] = acc;
+            carry[n_stranded++] = acc;
             continue;
         }
         claimed_carry = true;
         push_dp(acc, slot);
     }
-    tls_cp_carry.resize(n_stranded);
+    carry.resize(n_stranded);
 
     idx = 0;
     bool claimed_live = false;
-    for (const WPMemAccess &acc : tls_cp_mem_accesses) {
+    for (const WPMemAccess &acc : live) {
         int slot = slot_for(acc, idx);
         if (slot < 0) {
-            tls_cp_carry.push_back(acc);
+            carry.push_back(acc);
             continue;
         }
         claimed_live = true;
         push_dp(acc, slot);
     }
-    tls_cp_mem_accesses.clear();
+    live.clear();
 
     /* This entry took memops, but none of the ones already waiting:
-     * the stream has passed them (see tls_cp_carry).  Drop exactly
+     * the stream has passed them (see cp_carry).  Drop exactly
      * those — the freshly-missed tail behind them is still in flight. */
     if (n_stranded && !claimed_carry && claimed_live) {
         thread_stats_get().cp_orphan_mem_accesses += n_stranded;
-        tls_cp_carry.erase(tls_cp_carry.begin(),
-                           tls_cp_carry.begin() + n_stranded);
+        carry.erase(carry.begin(), carry.begin() + n_stranded);
     }
 }
 
 void MemAccessRecorder::cleanup_current_thread()
 {
     /* clear() only — deliberately NOT shrink_to_fit().  Runs from
-     * plugin_exit (atexit) before TLS destructors fire.  The CP buffer
-     * can be MiB-sized (mmap-backed by glibc); forcing a free here has
-     * been seen to SIGSEGV in __libc_free during late teardown.  The
-     * TLS destructor frees it cleanly afterwards. */
-    tls_cp_mem_accesses.clear();
-    tls_cp_carry.clear();
+     * plugin_exit (atexit) before static/TLS destructors fire.  The CP
+     * buffers can be MiB-sized (mmap-backed by glibc); forcing a free
+     * here has been seen to SIGSEGV in __libc_free during late
+     * teardown.  The static-storage destructors free them cleanly
+     * afterwards.  Clears EVERY vCPU's buffers (they are per-vCPU
+     * statics now, reachable from any thread). */
+    for (unsigned int i = 0; i < CST_PIN_MAX_VCPUS; i++) {
+        g_cp_mem_accesses[i].clear();
+        g_cp_carries[i].clear();
+    }
     if (tls_mem_read_buf) {
         g_byte_array_unref(tls_mem_read_buf);
         tls_mem_read_buf = nullptr;

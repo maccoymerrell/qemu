@@ -654,7 +654,9 @@ static void pin_reuse_track(uint64_t new_asid, uint64_t pinned_asid)
  * would need private (written) page anchors, deliberately not spent
  * here.
  */
-static constexpr unsigned CST_PIN_MAX_VCPUS = 1024;
+/* CST_PIN_MAX_VCPUS moved to champsim_tracer.h: the per-vCPU state
+ * arrays now span several TUs (chain assembler, PathBuilder, memory
+ * recorder), all sized and clamped identically. */
 struct PinVcpuState {
     /* The ASID value the pinned process most recently held on this
      * vCPU (dwell tag), CST_ASID_UNPINNED until first acquisition. */
@@ -1915,14 +1917,25 @@ static void devio_stop_cb(uint64_t request_id)
  * >=1 = fault-handler code at that nesting. */
 thread_local uint32_t g_emit_fault_depth CST_TLS_HOT = 0;
 
-/* Fault depth of the LAST body entry emitted on this thread; the unwind-flush
- * anchor guard (PathBuilder::flush_frame_unwound) reads it to keep a merged
- * faulting BB from landing at a depth its predecessor doesn't strictly exceed. */
-thread_local uint32_t g_last_emit_fault_depth = 0;
+/* Fault depth of the LAST body entry emitted on each vCPU's stream; the
+ * unwind-flush anchor guard (PathBuilder::flush_frame_unwound) reads it to
+ * keep a merged faulting BB from landing at a depth its predecessor doesn't
+ * strictly exceed.  Per-vCPU, not per-thread: the value carries across CP
+ * steps, and under round-robin TCG one host thread interleaves every
+ * vCPU's steps. */
+static uint32_t g_last_emit_fault_depths[CST_PIN_MAX_VCPUS];
 
-/* CST diag correlation: the seq_num of the most recent body entry emitted on
- * this thread, so the per-step depth diag can be tied to a wire position. */
-thread_local uint64_t g_dbg_last_emit_seq = 0;
+uint32_t &last_emit_fault_depth(unsigned int cpu_index)
+{
+    return g_last_emit_fault_depths[cpu_index < CST_PIN_MAX_VCPUS
+                                    ? cpu_index : CST_PIN_MAX_VCPUS - 1];
+}
+
+/* CST diag correlation: the seq_num of the most recent body entry emitted
+ * process-wide, so the per-step depth diag can be tied to a wire position.
+ * Plain static like the other g_dbg_* mirrors: every writer runs under
+ * exec_lock, which orders it exactly as the body stream it describes. */
+uint64_t g_dbg_last_emit_seq = 0;
 
 /* CST_JUMP_DIAG mirrors (see champsim_tracer_path_builder.h): the depth
  * pipeline's provenance, published so the online step-discipline assertion
@@ -1958,8 +1971,27 @@ std::atomic<uint64_t> g_tb_flush_count{0};
  * the requested window," so on first crossing we set this flag and
  * defer the actual exit; vcpu_tb_exec checks it after the per-iter
  * chain commits and only finalizes once the chain assembler reports
- * no active in-flight chain. */
-thread_local bool g_icount_shutdown_pending = false;
+ * no active in-flight chain.
+ *
+ * The three deferred-close flags below are PER-vCPU (one struct array,
+ * accessor-clamped like every per-vCPU array here): the arm is raised
+ * by the vCPU whose budget crossed and must be consumed at that SAME
+ * vCPU's next steps — its chain, its pending-seal slot.  They were
+ * thread_local, which round-robin TCG breaks: the next dispatch on the
+ * one host thread may belong to a different vCPU, which would run the
+ * close against the wrong chain. */
+struct VcpuDeferredClose {
+    bool icount_shutdown_pending = false;
+    bool simpoint_close_pending = false;
+    bool window_close_armed = false;
+};
+static VcpuDeferredClose g_deferred_close[CST_PIN_MAX_VCPUS];
+
+static VcpuDeferredClose &deferred_close(unsigned int cpu_index)
+{
+    return g_deferred_close[cpu_index < CST_PIN_MAX_VCPUS
+                            ? cpu_index : CST_PIN_MAX_VCPUS - 1];
+}
 
 /* Simpoint analogue of g_icount_shutdown_pending: tw_manage_window
  * detects icount_prev >= window_stop optimistically (counter bumped
@@ -1970,7 +2002,6 @@ thread_local bool g_icount_shutdown_pending = false;
  * vcpu_tb_exec tail when has_active_chain() is false (= at a true-BB
  * boundary).  Each bumped insn then either makes it into the trace
  * or never triggered the bump in the first place. */
-thread_local bool g_simpoint_close_pending = false;
 
 /* One-step arm shared by both deferred window closes.  The crossing is
  * detected at TB-START with the dispatching TB's instructions already
@@ -1990,7 +2021,6 @@ thread_local bool g_simpoint_close_pending = false;
  * that point is the next dispatching TB, which flush_final must not walk
  * (path_builder_flush_final_chain_only).  Cleared at segment open and
  * whenever the pending condition lapses. */
-thread_local bool g_window_close_armed = false;
 
 /* Next icount threshold above which vcpu_tb_exec MUST take the slow
  * path (acquire exec_lock and call tw_manage_window).  Below this
@@ -2232,14 +2262,25 @@ GMutex data_lock;
  * hook).  Last canonical insn of a TB is captured at the NEXT TB's
  * vcpu_tb_exec ("Tail-insn dst snap").  Drained into
  * BodyEntry.reg_snaps at finalize, discarded on flush.  Active only
- * when g_features.reg_data.  Non-static (extern in
- * champsim_tracer_path_builder.h) so the PathBuilder's fault frames can
- * stash and re-inject it. */
-thread_local std::vector<RegSnap> pending_reg_snaps CST_TLS_HOT;
+ * when g_features.reg_data.  Accessor is declared in
+ * champsim_tracer_path_builder.h so the PathBuilder's fault frames can
+ * stash and re-inject it.  Per-vCPU because the capture-to-drain
+ * lifetime crosses CP steps (see the header comment). */
+static std::vector<RegSnap> g_pending_reg_snaps[CST_PIN_MAX_VCPUS];
+
+std::vector<RegSnap> &pending_reg_snaps(unsigned int cpu_index)
+{
+    return g_pending_reg_snaps[cpu_index < CST_PIN_MAX_VCPUS
+                               ? cpu_index : CST_PIN_MAX_VCPUS - 1];
+}
 
 /* WP-side counterpart to pending_reg_snaps.  See the docstring on the
  * extern declaration in champsim_tracer.h for the contract.  Non-static
- * so champsim_tracer_wp.cc can drain it after each WP exec_tb. */
+ * so champsim_tracer_wp.cc can drain it after each WP exec_tb.  Still
+ * thread_local (unlike the CP sink): its whole capture-to-drain
+ * lifetime sits inside one wrong-path walk, which runs synchronously
+ * within a single exec_lock'd CP step — no vCPU switch can interleave,
+ * under either threading model. */
 thread_local std::vector<RegSnap> wp_pending_reg_snaps CST_TLS_HOT;
 
 /* ========================= Reg-data snapshot capture =========================
@@ -2297,7 +2338,7 @@ static void vcpu_insn_reg_snap_cb(unsigned int cpu_index, void *udata)
         if (!g_features.reg_data) {
             return;
         }
-        sink = &pending_reg_snaps;
+        sink = &pending_reg_snaps(cpu_index);
     }
     const RegSnapInsnRef *ref = (const RegSnapInsnRef *)udata;
     if (!ref || !ref->tb_tmpl ||
@@ -2323,8 +2364,7 @@ static void vcpu_mem_cb(unsigned int cpu_index,
                         uint64_t vaddr,
                         void *udata)
 {
-    (void)cpu_index;
-    g_mem_recorder.record(info, vaddr, (uint64_t)(uintptr_t)udata);
+    g_mem_recorder.record(cpu_index, info, vaddr, (uint64_t)(uintptr_t)udata);
 }
 
 /* ========================= Synthetic-EA callback =========================
@@ -2409,7 +2449,7 @@ static void vcpu_insn_synth_ea_cb(unsigned int cpu_index, void *udata)
     }
 
     uint64_t ea = base + index + (uint64_t)sea->disp;
-    g_mem_recorder.record_synthetic_load(ea,
+    g_mem_recorder.record_synthetic_load(cpu_index, ea,
                                          ref->tb_tmpl->insn_pcs[ref->insn_index]);
 }
 
@@ -2469,7 +2509,7 @@ Stats *g_current_hist_bucket = nullptr;  /* extern in stats.h */
  * first-sighting order within each segment.  Persistent FieldStateTable
  * overlays are already fresh per segment (new BodyStreamState per open).
  */
-static void reset_segment_local_state(void)
+static void reset_segment_local_state(unsigned int cpu_index)
 {
     if (getenv("CST_SEGDIAG")) {
         fprintf(stderr, "champsim_tracer: [segdiag] reset_segment_local_state"
@@ -2496,26 +2536,26 @@ static void reset_segment_local_state(void)
     asid_identity_reset();
 
     /*
-     * Other threads' TLS state (cp_chain, tls_cp_mem_accesses,
-     * pending_reg_snaps) can't be touched directly.  Bumping
-     * g_segment_generation makes each thread self-drop its stale
-     * chain on its next append_fragment; the other two drain every
-     * BB / body emit, and each thread's PathBuilder runs its own
+     * Other vCPUs' accumulators (cp_chain, the CP memop buffer,
+     * pending_reg_snaps) are reset lazily: bumping
+     * g_segment_generation makes each vCPU self-drop its stale chain
+     * on its next append_fragment; the other two drain every BB /
+     * body emit, and each vCPU's PathBuilder runs its own
      * on_segment_open (frames, pending-seal slot, retained events)
      * as it observes the bumped generation in vcpu_tb_exec.
      */
     g_segment_generation.fetch_add(1, std::memory_order_release);
 
-    /* Our own thread's TLS state (we're called from vcpu_tb_exec).  The
-     * PathBuilder's frames and cursors are dropped by its own
-     * on_segment_open (each thread runs it as it crosses the segment
-     * generation, this one included). */
-    g_cp_chain.reset();
-    g_mem_recorder.clear_cp();
-    pending_reg_snaps.clear();
+    /* The opening vCPU's own accumulators (we're called from
+     * vcpu_tb_exec).  Its PathBuilder's frames and cursors are dropped
+     * by its own on_segment_open (each vCPU runs it as it crosses the
+     * segment generation, this one included). */
+    cp_chain(cpu_index).reset();
+    g_mem_recorder.clear_cp(cpu_index);
+    pending_reg_snaps(cpu_index).clear();
     /* A fresh window is never mid-close (the arm self-clears the moment
      * neither close is pending, so this is belt-and-braces). */
-    g_window_close_armed = false;
+    deferred_close(cpu_index).window_close_armed = false;
 
     /* Per-segment disk-I/O record state: request ids are compact and
      * monotonic WITHIN a segment, so the counter, the pending queues,
@@ -2973,7 +3013,7 @@ static void start_trace_segment(const char *label,
                                 unsigned int cpu_index,
                                 double simpoint_weight)
 {
-    reset_segment_local_state();
+    reset_segment_local_state(cpu_index);
     g_seg_fanout_start = g_rep_fanout_extra_insns.load(
         std::memory_order_relaxed);
     g_seg_arch_insns = 0;
@@ -3282,7 +3322,7 @@ void emit_body_entry(BodyStreamState *out_stream,
     entry.seq_num = g_trace_segments.next_seq_num();
     g_dbg_last_emit_seq = entry.seq_num;
     entry.template_id = bb_tmpl ? bb_tmpl->template_id : 0;
-    entry.dyn_params.reserve(g_mem_recorder.cp_count());
+    entry.dyn_params.reserve(g_mem_recorder.cp_count(cpu_index));
     entry.wp_entries = std::move(wp_entries);
     entry.wp_first_tb_unavail = wp_first_tb_unavail;
     entry.tmpl = bb_tmpl;
@@ -3291,7 +3331,7 @@ void emit_body_entry(BodyStreamState *out_stream,
      * guard.  A REP fan-out below emits its sub-entries at this same depth
      * (they inherit entry.fault_depth), so the parent stamp is the last
      * emitted level regardless. */
-    g_last_emit_fault_depth = g_emit_fault_depth;
+    last_emit_fault_depth(cpu_index) = g_emit_fault_depth;
     entry.fault_anchors = g_emit_fault_anchors;
     /* Guest-thread identity on the wire.  cpu_index is a lookup key for the
      * per-vCPU identity (and for live register reads — regfile capture, WP
@@ -3352,7 +3392,7 @@ void emit_body_entry(BodyStreamState *out_stream,
                        bb_tmpl && bb_tmpl->is_system ? 1 : 0,
                        entry.fault_anchors.size());
 
-    g_mem_recorder.drain_cp_into_dyn_params(entry.dyn_params, bb_tmpl);
+    g_mem_recorder.drain_cp_into_dyn_params(cpu_index, entry.dyn_params, bb_tmpl);
     /* Backstop for the positional reg-snap invariant.  The wire attributes
      * reg_snaps POSITIONALLY: build_entry_view prefix-sums each insn's
      * n_dst_regs, and the DST_REG / METAFLAGS stages index reg_snaps at that
@@ -3387,22 +3427,22 @@ void emit_body_entry(BodyStreamState *out_stream,
          * frame — drop it.  A plain seal (no fault anchors) has any leaked
          * prefix genuinely at the front. */
         bool is_merge_emit = !g_emit_fault_anchors.empty();
-        if (pending_reg_snaps.size() > expected_snaps && !is_merge_emit) {
-            size_t excess = pending_reg_snaps.size() - (size_t)expected_snaps;
+        if (pending_reg_snaps(cpu_index).size() > expected_snaps && !is_merge_emit) {
+            size_t excess = pending_reg_snaps(cpu_index).size() - (size_t)expected_snaps;
             if (getenv("CST_SNAP_DIAG")) {
                 fprintf(stderr, "champsim_tracer: [snapdiag] reg-snap SURPLUS "
                         "BB start=0x%" PRIx64 " n_insns=%u pending=%zu "
                         "expected=%" PRIu64 " fdepth=%u fanchors=%zu is_sys=%d "
                         "— trimming %zu leaked prefix\n",
                         bb_tmpl->start_pc, bb_tmpl->n_insns,
-                        pending_reg_snaps.size(), expected_snaps,
+                        pending_reg_snaps(cpu_index).size(), expected_snaps,
                         g_emit_fault_depth, g_emit_fault_anchors.size(),
                         (int)bb_tmpl->is_system, excess);
             }
-            pending_reg_snaps.erase(pending_reg_snaps.begin(),
-                                    pending_reg_snaps.begin() + (ptrdiff_t)excess);
+            pending_reg_snaps(cpu_index).erase(pending_reg_snaps(cpu_index).begin(),
+                                    pending_reg_snaps(cpu_index).begin() + (ptrdiff_t)excess);
             g_stats.reg_snap_leak_trimmed++;
-        } else if (pending_reg_snaps.size() != expected_snaps) {
+        } else if (pending_reg_snaps(cpu_index).size() != expected_snaps) {
             if (!g_seg_end_marker_close) {
                 g_stats.reg_snap_slice_dropped++;
             }
@@ -3411,27 +3451,27 @@ void emit_body_entry(BodyStreamState *out_stream,
                         "%s BB start=0x%" PRIx64 " n_insns=%u pending=%zu"
                         " expected=%" PRIu64 " end_marker=%d fdepth=%u "
                         "fanchors=%zu is_sys=%d — dropping reg_snaps\n",
-                        pending_reg_snaps.size() < expected_snaps
+                        pending_reg_snaps(cpu_index).size() < expected_snaps
                             ? "SHORTFALL" : "MERGE-SURPLUS",
                         bb_tmpl->start_pc, bb_tmpl->n_insns,
-                        pending_reg_snaps.size(), expected_snaps,
+                        pending_reg_snaps(cpu_index).size(), expected_snaps,
                         (int)g_seg_end_marker_close, g_emit_fault_depth,
                         g_emit_fault_anchors.size(),
                         (int)bb_tmpl->is_system);
             }
-            pending_reg_snaps.clear();
+            pending_reg_snaps(cpu_index).clear();
         }
     }
-    if (g_features.reg_data && !pending_reg_snaps.empty()) {
-        entry.reg_snaps = std::move(pending_reg_snaps);
-        pending_reg_snaps.clear();
+    if (g_features.reg_data && !pending_reg_snaps(cpu_index).empty()) {
+        entry.reg_snaps = std::move(pending_reg_snaps(cpu_index));
+        pending_reg_snaps(cpu_index).clear();
         /* Restore a typical-BB capacity after the move stole the
          * allocation.  Otherwise every BB starts at cap=0 and the
          * first few push_backs pay realloc overhead — perf showed
          * std::vector<RegSnap>::_M_realloc_insert at 0.84% of total
          * runtime on mcf with regdata=1.  64 slots = 16 insns × 4
          * dst regs, well above mcf's 5-insn/2-dst-reg per BB. */
-        pending_reg_snaps.reserve(64);
+        pending_reg_snaps(cpu_index).reserve(64);
     }
 
     /*
@@ -3902,11 +3942,11 @@ void emit_body_entry(BodyStreamState *out_stream,
 }
 
 /* Append a CP fragment to the true-BB chain (per-exec seal walk). */
-static inline void cp_chain_append(BBTemplate *frag)
+static inline void cp_chain_append(unsigned int cpu_index, BBTemplate *frag)
 {
-    g_cp_chain.append_fragment(frag->start_pc, frag,
-                               frag->fall_through_pc,
-                               (TbTerminus)frag->terminus);
+    cp_chain(cpu_index).append_fragment(frag->start_pc, frag,
+                                        frag->fall_through_pc,
+                                        (TbTerminus)frag->terminus);
 }
 
 /* Finalize and reset the CP chain if it now forms a complete true BB.
@@ -3914,11 +3954,11 @@ static inline void cp_chain_append(BBTemplate *frag)
  * nullptr if the BB is not yet complete.  Resetting immediately lets a
  * subsequent fragment in the same walk start a fresh chain at its own
  * entry_pc instead of being appended onto the just-committed BB. */
-static inline BBTemplate *cp_chain_finalize_if_complete(void)
+static inline BBTemplate *cp_chain_finalize_if_complete(unsigned int cpu_index)
 {
-    if (g_cp_chain.bb_complete() && g_cp_chain.has_active_chain()) {
-        BBTemplate *bb_tmpl = g_cp_chain.finalize();
-        g_cp_chain.reset();
+    if (cp_chain(cpu_index).bb_complete() && cp_chain(cpu_index).has_active_chain()) {
+        BBTemplate *bb_tmpl = cp_chain(cpu_index).finalize();
+        cp_chain(cpu_index).reset();
         return bb_tmpl;
     }
     return nullptr;
@@ -3934,7 +3974,8 @@ static inline BBTemplate *cp_chain_finalize_if_complete(void)
  * sweep — closes on a TB that executed; only the deferred icount /
  * simpoint window close fires on a freshly promoted, not-yet-run TB.
  */
-static void finish_trace_segment(bool prev_executed = true)
+static void finish_trace_segment(bool prev_executed = true,
+                                 unsigned int closing_cpu = UINT32_MAX)
 {
     uint64_t lo = g_trace_segments.window_start();
     uint64_t hi = g_trace_segments.window_stop();
@@ -3950,9 +3991,31 @@ static void finish_trace_segment(bool prev_executed = true)
      * one or more times, which bumps g_seg_arch_insns — so we print
      * the per-segment stats AFTER finish() returns so the counter
      * reflects the entire segment, including the trailing chain. */
-    g_trace_segments.finish(prev_executed
-                                ? path_builder_flush_final
-                                : path_builder_flush_final_chain_only);
+    g_trace_segments.finish([&]() {
+        if (closing_cpu != UINT32_MAX) {
+            /* Ordinary close: it happens ON a vCPU's dispatch, and only
+             * that vCPU's pending final entry is flushed (peers' pending
+             * slots drop, exactly as they always have — successor work
+             * if that tail is ever wanted). */
+            if (prev_executed) {
+                path_builder_flush_final(closing_cpu);
+            } else {
+                path_builder_flush_final_chain_only(closing_cpu);
+            }
+        } else {
+            /* plugin_exit with a segment still active (abnormal end: the
+             * guest died without a close).  No dispatch context exists,
+             * so flush every builder that ever ran, ascending order for
+             * determinism.  The old thread-keyed builder made this flush
+             * a silent no-op (plugin_exit runs on a thread that never
+             * dispatched, so its builder was empty). */
+            for (unsigned int i = 0; i < CST_PIN_MAX_VCPUS; i++) {
+                if (PathBuilder *b = path_builder_if_created(i)) {
+                    b->flush_final();
+                }
+            }
+        }
+    });
 
     /* Actual icount at finish — must be >= window_stop for the
      * trace to be at-least-budget.  Underrun means we stopped
@@ -4076,7 +4139,7 @@ static inline bool deadlatch_enabled(void)
  * whole-set backstop.  Mirrors the END marker's last-window close so the
  * trace finalises identically (audit rolls up to 100%).  Caller holds
  * exec_lock; returns true if the caller should exit(0). */
-static bool deadlatch_close_segment(uint64_t now)
+static bool deadlatch_close_segment(uint64_t now, unsigned int cpu_index)
 {
     if (!g_trace_segments.is_active() ||
         g_trace_segments.is_shutting_down()) {
@@ -4089,7 +4152,7 @@ static bool deadlatch_close_segment(uint64_t now)
     /* A dead process is a process that ended, so report a clean close
      * ("END") rather than an under-budget underrun. */
     g_seg_end_marker_close = true;
-    finish_trace_segment();
+    finish_trace_segment(/* prev_executed= */ true, cpu_index);
     g_trace_segments.set_shutting_down();
     return true;
 }
@@ -4101,7 +4164,7 @@ static bool deadlatch_close_segment(uint64_t now)
  * close the segment if that was the last one.  Caller holds exec_lock;
  * returns true if the caller should exit(0).
  */
-static bool deadlatch_sweep_wide(uint64_t now)
+static bool deadlatch_sweep_wide(uint64_t now, unsigned int cpu_index)
 {
     if (g_owned.empty()) {
         return false;
@@ -4141,7 +4204,7 @@ static bool deadlatch_sweep_wide(uint64_t now)
                 " dedup buckets)\n", root, d.second, g_owned.size(), dropped);
     }
     if (!dead.empty() && g_owned.empty()) {
-        return deadlatch_close_segment(now);
+        return deadlatch_close_segment(now, cpu_index);
     }
     return false;
 }
@@ -4154,7 +4217,7 @@ static bool deadlatch_sweep_wide(uint64_t now)
  * otherwise close it if its last dwell is older than the timeout.  Caller
  * holds exec_lock; returns true if the caller should exit(0).
  */
-static bool deadlatch_sweep_narrow(uint64_t now)
+static bool deadlatch_sweep_narrow(uint64_t now, unsigned int cpu_index)
 {
     if (!g_owned_procs || g_owned_procs_active <= 0) {
         return false;
@@ -4197,7 +4260,7 @@ static bool deadlatch_sweep_narrow(uint64_t now)
                 "tracing)\n", oi, op.root_phys, idle, g_owned_procs_active);
     }
     if (g_owned_procs_active == 0) {
-        return deadlatch_close_segment(now);
+        return deadlatch_close_segment(now, cpu_index);
     }
     return false;
 }
@@ -4212,7 +4275,6 @@ static bool deadlatch_sweep_narrow(uint64_t now)
  */
 static void deadlatch_on_asid_write(unsigned int vcpu_index, uint64_t new_asid)
 {
-    (void)vcpu_index;
     if (!deadlatch_enabled()) {
         return;
     }
@@ -4228,12 +4290,12 @@ static void deadlatch_on_asid_write(unsigned int vcpu_index, uint64_t new_asid)
         !g_trace_segments.is_shutting_down()) {
         uint64_t now = deadlatch_now_ms();
         if (g_pin_reuse_guard) {
-            do_exit = deadlatch_sweep_narrow(now);
+            do_exit = deadlatch_sweep_narrow(now, vcpu_index);
         } else {
             if (owned_contains_locked(new_asid)) {
                 g_owned_last_sched[new_asid] = now;   /* live: schedule-in */
             }
-            do_exit = deadlatch_sweep_wide(now);
+            do_exit = deadlatch_sweep_wide(now, vcpu_index);
         }
     }
     g_rec_mutex_unlock(&exec_lock);
@@ -4531,7 +4593,7 @@ void emit_finalized_bb(BodyStreamState *out_stream,
                        uint64_t wrong_target,
                        unsigned int cpu_index)
 {
-    g_cp_chain.reset();
+    cp_chain(cpu_index).reset();
 
     std::vector<WPBBEntry> wp_entries;
     /* Genuine first-fetch failure from the accepted (non-flush-
@@ -4659,7 +4721,7 @@ static void snap_prev_tail_dsts(unsigned int cpu_index,
                      * CF_NO_GOTO_TB so their eip is always synced.) */
                     s.value = cst_wide_from_u64(current_pc);
                 }
-                pending_reg_snaps.push_back(s);
+                pending_reg_snaps(cpu_index).push_back(s);
             }
         };
         if (delay_slot_tail) {
@@ -4799,7 +4861,7 @@ static void tw_manage_window(unsigned int cpu_index,
              * detects the crossing — executes and seals normally too,
              * carrying its memops and register deltas (see
              * g_window_close_armed). */
-            g_icount_shutdown_pending = true;
+            deferred_close(cpu_index).icount_shutdown_pending = true;
         }
         if (g_window_mode == PluginConfig::WIN_SYMBOL &&
             !g_trace_segments.is_active() && start_symbol) {
@@ -4845,7 +4907,7 @@ static void tw_manage_window(unsigned int cpu_index,
              * just above).  Until then we stay is_active so pending
              * fragments emit normally and the trace covers the full
              * simulation_insns window. */
-            g_simpoint_close_pending = true;
+            deferred_close(cpu_index).simpoint_close_pending = true;
             return;
         }
         if (!g_trace_segments.is_active()) {
@@ -4924,7 +4986,7 @@ static void tw_manage_window(unsigned int cpu_index,
              * every bumped insn either ends up committed to a BB in
              * the trace or never triggered the bump in the first
              * place. */
-            g_icount_shutdown_pending = true;
+            deferred_close(cpu_index).icount_shutdown_pending = true;
         }
     }
 }
@@ -5084,10 +5146,10 @@ bool collect_finalized_bbs(unsigned int cpu_index,
         if (is_last_executed) {
             snap_prev_tail_dsts(cpu_index, frag, frag_current_pc);
         }
-        cp_chain_append(frag);
+        cp_chain_append(cpu_index, frag);
         attribute_cp_insns(frag);
 
-        if (BBTemplate *bb_tmpl = cp_chain_finalize_if_complete()) {
+        if (BBTemplate *bb_tmpl = cp_chain_finalize_if_complete(cpu_index)) {
             PendingEmit pe = {bb_tmpl, 0, frag_current_pc, 0};
             int br_idx = TemplateStore::template_branch_index(bb_tmpl);
             if (br_idx >= 0) {
@@ -5222,8 +5284,8 @@ static const uint64_t CST_FANOUT_HOLD_MAX = 65536;
 static void run_deferred_window_closes(PathBuilder &pb, unsigned int cpu_index,
                                        const BBTemplate *cur_tb_tmpl)
 {
-    if (!g_icount_shutdown_pending && !g_simpoint_close_pending) {
-        g_window_close_armed = false;
+    if (!deferred_close(cpu_index).icount_shutdown_pending && !deferred_close(cpu_index).simpoint_close_pending) {
+        deferred_close(cpu_index).window_close_armed = false;
         return;
     }
     const RepSelfLoopState &rs_cd = rep_state(cpu_index);
@@ -5243,15 +5305,15 @@ static void run_deferred_window_closes(PathBuilder &pb, unsigned int cpu_index,
         fprintf(stderr, "[closediag] eval clock=%" PRIu64
                 " chain=%d armed=%d fanout_hold=%d(any=%d) icount_pend=%d "
                 "sp_pend=%d pc=0x%" PRIx64 "\n",
-                g_user_icount, (int)g_cp_chain.has_active_chain(),
-                (int)g_window_close_armed, (int)fanout_hold,
+                g_user_icount, (int)cp_chain(cpu_index).has_active_chain(),
+                (int)deferred_close(cpu_index).window_close_armed, (int)fanout_hold,
                 (int)rs_cd.warmup_hold_any(),
-                (int)g_icount_shutdown_pending, (int)g_simpoint_close_pending,
+                (int)deferred_close(cpu_index).icount_shutdown_pending, (int)deferred_close(cpu_index).simpoint_close_pending,
                 cur_tb_tmpl ? cur_tb_tmpl->start_pc : 0);
     }
     /* Not at a BB boundary yet (or the segment already closed under us):
      * hold the arm and let a later step take the close. */
-    if (g_cp_chain.has_active_chain() || !g_trace_segments.is_active()) {
+    if (cp_chain(cpu_index).has_active_chain() || !g_trace_segments.is_active()) {
         return;
     }
     /*
@@ -5294,11 +5356,11 @@ static void run_deferred_window_closes(PathBuilder &pb, unsigned int cpu_index,
         g_stats.window_close_fanout_hold_capped++;
     }
     held_steps = 0;
-    if (!g_window_close_armed) {
-        g_window_close_armed = true;
+    if (!deferred_close(cpu_index).window_close_armed) {
+        deferred_close(cpu_index).window_close_armed = true;
         return;
     }
-    g_window_close_armed = false;
+    deferred_close(cpu_index).window_close_armed = false;
     /* Tripwire for what the hold above does NOT cover.  The pc-keyed hold is
      * armed only from an emission that had an architectural iteration count,
      * at fault depth 0, in user code — so a kernel fan-out (clear_page's rep
@@ -5318,10 +5380,10 @@ static void run_deferred_window_closes(PathBuilder &pb, unsigned int cpu_index,
 
     /* Deferred-exit on icount window-stop.  The trigger was set in
      * tw_manage_window when icount first crossed window_stop. */
-    if (g_icount_shutdown_pending) {
-        finish_trace_segment(/* prev_executed= */ false);
+    if (deferred_close(cpu_index).icount_shutdown_pending) {
+        finish_trace_segment(/* prev_executed= */ false, cpu_index);
         g_trace_segments.set_shutting_down();
-        g_icount_shutdown_pending = false;
+        deferred_close(cpu_index).icount_shutdown_pending = false;
         /* No need to recompute_budget: we're exiting immediately and
          * the budget slot will be torn down with the scoreboard. */
         g_rec_mutex_unlock(&exec_lock);
@@ -5331,10 +5393,10 @@ static void run_deferred_window_closes(PathBuilder &pb, unsigned int cpu_index,
     /* Simpoint analogue: finalize only after the chain has drained to a
      * BB boundary so the trace covers AT LEAST eff_stop - eff_start
      * (warmup + simulation) insns. */
-    if (g_simpoint_close_pending) {
-        finish_trace_segment(/* prev_executed= */ false);
+    if (deferred_close(cpu_index).simpoint_close_pending) {
+        finish_trace_segment(/* prev_executed= */ false, cpu_index);
         g_simpoints.advance();
-        g_simpoint_close_pending = false;
+        deferred_close(cpu_index).simpoint_close_pending = false;
         pb.clear_prev();
         pb.events_queue_disable();
         if (!g_simpoints.current()) {
@@ -5371,7 +5433,7 @@ static void run_deferred_window_closes(PathBuilder &pb, unsigned int cpu_index,
 static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
                              uint64_t icount_prev, uint64_t watch_pc)
 {
-    PathBuilder &pb = path_builder_tls();
+    PathBuilder &pb = path_builder(cpu_index);
 
     /* Enable this vCPU's event queue lazily on its first CP exec (clears
      * any boot-time backlog).  Must run on the owning vCPU thread, which
@@ -5888,8 +5950,8 @@ static void vcpu_pin_probe(unsigned int cpu_index, void *udata)
      * against its real target). */
     g_capture_mute = true;
     if (!qemu_plugin_in_async_int() && qemu_plugin_get_priv_level() == 0) {
-        g_mem_recorder.clear_cp();
-        path_builder_tls().clear_prev();
+        g_mem_recorder.clear_cp(cpu_index);
+        path_builder(cpu_index).clear_prev();
     }
     /* User-clock cursor tick: advance this vCPU's seen cursor so the
      * foreign span's instructions never fold into the pinned process's
@@ -6056,7 +6118,7 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     static uint64_t watch_pc = getenv("CST_BLKWATCH")
         ? strtoull(getenv("CST_BLKWATCH"), nullptr, 16) : 0;
     if (watch_pc && cur_tb_tmpl && cur_tb_tmpl->start_pc == watch_pc) {
-        BBTemplate *watch_prev = path_builder_tls().prev();
+        BBTemplate *watch_prev = path_builder(cpu_index).prev();
         fprintf(stderr, "[blkwatch] exec pc=0x%" PRIx64 " async=%d fdepth=%u "
                 "prev=0x%" PRIx64 "\n",
                 cur_tb_tmpl->start_pc, (int)qemu_plugin_in_async_int(),
@@ -6082,9 +6144,14 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
      * SMP coverage triage (a vCPU missing from this set traced nothing). */
     static const bool smp_diag = getenv("CST_SMP_DIAG") != nullptr;
     if (smp_diag) {
-        static thread_local bool announced;
-        if (!announced) {
-            announced = true;
+        /* Per-vCPU, not per-thread: under round-robin TCG one thread
+         * dispatches every vCPU and a thread-keyed latch would announce
+         * only the first. */
+        static bool announced[CST_PIN_MAX_VCPUS];
+        bool &a = announced[cpu_index < CST_PIN_MAX_VCPUS
+                            ? cpu_index : CST_PIN_MAX_VCPUS - 1];
+        if (!a) {
+            a = true;
             fprintf(stderr, "champsim_tracer: [smpdiag] first exec dispatch "
                     "on cpu %u\n", cpu_index);
         }
@@ -6469,7 +6536,7 @@ static void marker_open_trace_window(unsigned int cpu_index, uint64_t asid,
  * it, and exit(0)s (never returns); otherwise it releases exec_lock and
  * returns.  @last_window selects the multi-process "(last window)" diagnostic
  * over the legacy single-pin one. */
-static void marker_close_and_exit(bool last_window)
+static void marker_close_and_exit(bool last_window, unsigned int cpu_index)
 {
     if (g_trace_segments.is_active() && !g_trace_segments.is_shutting_down()) {
         if (last_window) {
@@ -6481,7 +6548,7 @@ static void marker_close_and_exit(bool last_window)
                     PRIu64 " user insns\n", g_user_icount);
         }
         g_seg_end_marker_close = true;
-        finish_trace_segment();
+        finish_trace_segment(/* prev_executed= */ true, cpu_index);
         g_trace_segments.set_shutting_down();
         g_rec_mutex_unlock(&exec_lock);
         exit(0);
@@ -6890,7 +6957,7 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
         }
         /* Last window closed: all-windows-closed stop (peer of the
          * icount/budget stop — whichever fires first wins). */
-        marker_close_and_exit(/* last_window= */ true);
+        marker_close_and_exit(/* last_window= */ true, cpu_index);
         return;
     }
 
@@ -6946,7 +7013,7 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
             return;
         }
         /* Last window closed: all-windows-closed stop. */
-        marker_close_and_exit(/* last_window= */ true);
+        marker_close_and_exit(/* last_window= */ true, cpu_index);
         return;
     }
 
@@ -6963,7 +7030,7 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
         return;
     }
     g_rec_mutex_lock(&exec_lock);
-    marker_close_and_exit(/* last_window= */ false);
+    marker_close_and_exit(/* last_window= */ false, cpu_index);
 }
 
 /* Outcome of the pre-commit instruction-memory stability check. */

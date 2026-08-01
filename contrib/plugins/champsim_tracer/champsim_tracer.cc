@@ -386,14 +386,42 @@ static uint64_t g_stall_base[CST_PIN_MAX_VCPUS];
 static bool     g_stall_ceiling_fired = false;
 static bool     g_stall_warned = false;
 
+/*
+ * ANY-CONTEXT STALL CEILING (stall_ceiling_any=<arch insns>).
+ *
+ * The ceiling above only accumulates while the TRACED process is running,
+ * so it cannot bound the case where the traced process is not running at
+ * all: killed after its window opened, or blocked in a syscall it never
+ * leaves, while the rest of the guest stays busy.  There the user clock is
+ * frozen, the END marker can never execute, no owned instruction is ever
+ * retired — and nothing ends the run.  These counters bound THAT: guest
+ * instructions retired in ANY context since the pinned user clock last
+ * advanced.  Sampled at the top of the correct-path step, which every
+ * dispatched TB reaches while a segment is open — including the foreign
+ * and async ones that are dropped a few lines later, and which are all a
+ * guest with a dead traced process ever executes.
+ */
+static uint64_t g_stall_any_ceiling = CST_STALL_ANY_CEILING_DEFAULT;
+static uint64_t g_stall_any_last_uic = 0;
+static uint64_t g_stall_any_gen = 0;
+static uint64_t g_stall_any_seen_gen[CST_PIN_MAX_VCPUS];
+static uint64_t g_stall_any_base[CST_PIN_MAX_VCPUS];
+static bool     g_stall_any_fired = false;
+static bool     g_stall_any_warned = false;
+
 static inline void user_clock_stall_reset(void)
 {
     g_stall_last_uic = 0;
     g_stall_gen++;
     g_stall_ceiling_fired = false;
     g_stall_warned = false;
+    g_stall_any_last_uic = 0;
+    g_stall_any_gen++;
+    g_stall_any_fired = false;
+    g_stall_any_warned = false;
     for (unsigned i = 0; i < CST_PIN_MAX_VCPUS; i++) {
         g_stall_seen_gen[i] = 0;
+        g_stall_any_seen_gen[i] = 0;
     }
 }
 
@@ -401,6 +429,18 @@ static inline void user_clock_stall_reset(void)
  * finished under budget by design) so the finish printout reports END
  * rather than an UNDER underrun. */
 static bool g_seg_end_marker_close = false;
+
+/*
+ * A close the ordinary OK / END / UNDER rendering cannot name, because it
+ * was forced rather than reached: the any-context termination ceiling
+ * (CEILING) or the machine going down under an open window (SHUTDOWN).
+ * Both truncate the capture, and a truncation a reader cannot tell from a
+ * short-but-complete run is exactly the kind of quiet result this tracer
+ * must not produce — so the flag on the segment's own close line names it,
+ * the statistics report counts it, and the trace's own coverage numbers
+ * (covered vs budget) sit next to it.  nullptr = ordinary rendering.
+ */
+static const char *g_seg_close_reason = nullptr;
 
 /* CST_MARKER_DIAG: trace every correct-path invocation of the marker exec
  * callbacks (plus WP-gated / step-bail counters) to stderr.  Diagnostic
@@ -487,8 +527,12 @@ static uint64_t g_fdiag_end_cp = 0;            /* reached the run machine */
 static uint64_t g_fdiag_start_total = 0;
 static uint64_t g_fdiag_start_fenced = 0;
 static uint64_t g_fdiag_end_printed = 0;       /* ring entries already shown */
-static uint64_t g_fdiag_start_runs = 0;        /* completed CP START runs */
-static uint64_t g_fdiag_end_runs = 0;          /* completed CP END runs */
+/* Completed correct-path runs.  ATOMIC: the marker callbacks run on the
+ * executing vCPU's own thread with no lock held, and the marker stress
+ * judges the invariant by EXACT EQUALITY against a count the guest prints,
+ * so a lost increment on an SMP guest would read as a missed sequence. */
+static std::atomic<uint64_t> g_fdiag_start_runs{0};
+static std::atomic<uint64_t> g_fdiag_end_runs{0};
 
 static inline void fence_note_end(uint64_t pc, uint64_t asid, int priv,
                                   uint8_t flags, bool fenced,
@@ -3787,6 +3831,7 @@ static void start_trace_segment(const char *label,
     progress_step = span >= 10 ? span / 10 : 1;
     progress_next = start + progress_step;
     g_seg_end_marker_close = false;
+    g_seg_close_reason = nullptr;
 
     /* Snapshot cumulative stats for finish_trace_segment's diff.
      * stats_snapshot() folds every thread's slot plus the exited-
@@ -4806,8 +4851,9 @@ static void finish_trace_segment(bool prev_executed = true,
             : (g_host_icount > lo ? g_host_icount - lo : 0);
         /* An end-marker close is the workload finishing under budget by
          * design ("budget or program end"), not an underrun. */
-        const char *flag = covered >= budget ? "OK"
-            : (g_seg_end_marker_close ? "END" : "UNDER");
+        const char *flag = g_seg_close_reason ? g_seg_close_reason
+            : (covered >= budget ? "OK"
+               : (g_seg_end_marker_close ? "END" : "UNDER"));
         /* Per-segment rep_fanout: diff against the snapshot taken
          * at start_trace_segment.  Makes "architectural CP insns
          * in this trace > covered" visible (the trace fans REP
@@ -6336,6 +6382,77 @@ static void fence_diag_tick(unsigned int cpu_index, uint64_t icount_prev,
 }
 
 /*
+ * Any-context termination bound.  Runs at the top of every correct-path
+ * step while a marker window is open, before the gates that drop foreign
+ * and async TBs — because a guest whose traced process is dead or blocked
+ * executes nothing BUT those.  Caller holds exec_lock and never returns if
+ * the ceiling fires (the process exits, exactly as the END marker's close
+ * does).
+ */
+static void user_clock_stall_any_check(unsigned int cpu_index,
+                                       uint64_t icount_prev)
+{
+    if (!marker_user_clock() || !g_trace_segments.is_active() ||
+        g_trace_segments.is_shutting_down() ||
+        cpu_index >= CST_PIN_MAX_VCPUS) {
+        return;
+    }
+    uint64_t u = g_user_icount;
+    if (u != g_stall_any_last_uic) {
+        g_stall_any_last_uic = u;
+        g_stall_any_gen++;
+    }
+    if (g_stall_any_seen_gen[cpu_index] != g_stall_any_gen) {
+        g_stall_any_seen_gen[cpu_index] = g_stall_any_gen;
+        g_stall_any_base[cpu_index] = icount_prev;
+    }
+    uint64_t stall = icount_prev >= g_stall_any_base[cpu_index]
+        ? icount_prev - g_stall_any_base[cpu_index] : 0;
+    if (stall > g_stats.user_clock_worst_stall_any) {
+        g_stats.user_clock_worst_stall_any = stall;
+    }
+    if (stall >= CST_STALL_ANY_WARN_DEFAULT && !g_stall_any_warned &&
+        (!g_stall_any_ceiling || stall < g_stall_any_ceiling)) {
+        g_stall_any_warned = true;
+        fprintf(stderr,
+            "champsim_tracer: the traced process has not executed a "
+            "user-space instruction\n  for %" PRIu64 " instructions the "
+            "guest retired in ANY context — it may be blocked,\n  starved, "
+            "or gone.  Nothing but its END marker or a ceiling can close "
+            "this\n  window (any-context ceiling %" PRIu64 ").\n",
+            stall, g_stall_any_ceiling);
+        fflush(stderr);
+    }
+    if (!g_stall_any_ceiling || stall < g_stall_any_ceiling ||
+        g_stall_any_fired) {
+        return;
+    }
+    g_stall_any_fired = true;
+    g_stats.stall_any_closes++;
+    fprintf(stderr,
+        "\nchampsim_tracer: *** PINNED PROCESS NOT RUNNING ***\n"
+        "  the guest retired %" PRIu64 " instructions without the traced "
+        "process executing\n  ONE user-space instruction in ANY context "
+        "(ceiling %" PRIu64 ").  It is blocked,\n  starved or gone: its END "
+        "marker cannot execute and its user-clock budget\n  cannot advance, "
+        "so nothing would ever close this window.  Closing the\n  segment "
+        "here — the trace is finalised and TRUNCATED at %" PRIu64
+        " user instructions.\n"
+        "  (stall_ceiling_any=<insns> tunes this; 0 disables it.)\n\n",
+        stall, g_stall_any_ceiling, g_user_icount);
+    fflush(stderr);
+    /* The same close the END marker takes: the calling thread's pending
+     * seal slot holds the PREVIOUS TB, which has executed, so it is emitted
+     * normally and the segment is finalised (audit rolls up to 100%). */
+    g_seg_end_marker_close = false;
+    g_seg_close_reason = "CEILING";
+    finish_trace_segment(/* prev_executed= */ true, cpu_index);
+    g_trace_segments.set_shutting_down();
+    g_rec_mutex_unlock(&exec_lock);
+    exit(0);
+}
+
+/*
  * The CP step, driven by the ordered per-vCPU event queue.  The shared
  * prologue of vcpu_tb_exec — WP early-out, chain promotion,
  * capture-mute latch, blkwatch, vclock guard, icount read — has already
@@ -6390,6 +6507,15 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
     }
     fence_diag_tick(cpu_index, icount_prev, watch_pc,
                     g_trace_segments.is_active_atomic());
+
+    /* Termination bound of last resort — see g_stall_any_ceiling.  This
+     * point is BEFORE step_events, which is where a foreign or async TB
+     * leaves the step: a guest whose traced process has died or blocked
+     * executes nothing else, so any bound placed after that gate cannot
+     * see it.  Closing here is the END marker's own close (the pending
+     * seal slot holds the previous, fully executed TB), so the trace is
+     * finalised rather than abandoned. */
+    user_clock_stall_any_check(cpu_index, icount_prev);
 
     /* Address-space pin + count set (marker mode only — pinned !=
      * UNPINNED).  The inline-add counts every TB; here we fold this TB's
@@ -7574,10 +7700,10 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
     uint8_t size;
     marker_udata_unpack(udata, &pc, &size);
     if (!marker_exec_step(&tls_marker_run, pc, size,
-                          MARKER_WHICH_START)) {
+                          MARKER_WHICH_START, cpu_index)) {
         return;                              /* run not complete yet */
     }
-    g_fdiag_start_runs++;
+    g_fdiag_start_runs.fetch_add(1, std::memory_order_relaxed);
     /* The marker is one of the target's own instructions, so the current
      * ASID is the target's page-table root. */
     uint64_t asid = qemu_plugin_get_addr_space_id();
@@ -7923,7 +8049,7 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
                 tls_mkdiag_susp_user, tls_mkdiag_foreign_user);
     }
     bool end_fired = marker_exec_step(&tls_marker_end_run, pc, size,
-                                     MARKER_WHICH_END);
+                                     MARKER_WHICH_END, cpu_index);
     /* Advance provenance: every invocation that reached the run-state
      * machine at user privilege mutated it — record it (see
      * g_marker_end_adv).  On fire the run resets to 0, so log the
@@ -7953,7 +8079,7 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
     if (!end_fired) {
         return;
     }
-    g_fdiag_end_runs++;
+    g_fdiag_end_runs.fetch_add(1, std::memory_order_relaxed);
     /* The END run completed on the correct path.  Print the advance
      * provenance unconditionally: every END-marker close carries the
      * evidence of the three executions that produced it, plus how many
@@ -8832,6 +8958,86 @@ static void vcpu_tb_flush(qemu_plugin_id_t id)
     }
 }
 
+/* ================== Machine shutdown: close, don't abandon ==================
+ *
+ * THE TERMINATION PATH THAT NEEDS NO GUEST COOPERATION.
+ *
+ * A system-mode window is normally ended by the guest: the workload's END
+ * marker executes, or the user-instruction budget is met.  Both require the
+ * traced process to RUN.  When it does not — killed after its window opened,
+ * blocked in a syscall it never leaves, never scheduled — neither can
+ * happen, and the run has nothing to end it.  The operator's answer to that
+ * is a script that runs the workload and then shuts the guest down:
+ *
+ *     /workload ; poweroff
+ *
+ * and this callback is what makes that answer WORK.  It fires from the
+ * shutdown request itself (qemu_plugin_register_vm_shutdown_cb), before the
+ * main loop leaves and before qemu_cleanup() stops the vCPUs, on a vCPU
+ * thread — so an open segment is closed exactly the way the END marker
+ * closes one, with the machine still assembled and its state readable.
+ * Whatever the workload did or failed to do, the trace is finalised.
+ *
+ * It also removes a real crash.  Before it existed, a window still open at
+ * guest poweroff was closed from plugin_exit, which QEMU runs from atexit(3)
+ * on a thread that is not a vCPU thread: the emit path then asked for the
+ * privilege level / address space / paging state, every one of which
+ * resolves through current_cpu, and QEMU aborted
+ * (plugins/api.c: "plugin_cpu_state: assertion failed: (current_cpu)").
+ * Closing here means plugin_exit finds nothing left to close.
+ */
+static void vcpu_vm_shutdown_cb(qemu_plugin_id_t id, int vcpu_index)
+{
+    if (!g_system_mode) {
+        return;                      /* *-user exits on a guest thread */
+    }
+    g_rec_mutex_lock(&exec_lock);
+    if (!g_trace_segments.is_active() ||
+        g_trace_segments.is_shutting_down()) {
+        g_rec_mutex_unlock(&exec_lock);
+        return;                      /* nothing open — the normal case */
+    }
+    g_stats.vm_shutdown_closes++;
+    uint64_t covered = marker_user_clock() ? g_user_icount : g_host_icount;
+    fprintf(stderr,
+        "\nchampsim_tracer: *** MACHINE SHUTDOWN WITH THE WINDOW OPEN ***\n"
+        "  the guest is powering off while a capture is still running, so "
+        "no END\n  marker and no budget can ever close it.  Closing the "
+        "segment here — the\n  trace is finalised and TRUNCATED at %" PRIu64
+        " %sinstructions.\n"
+        "  (a workload that ends on its own closes at its END marker "
+        "instead; this\n   is the shutdown backstop, and it is always "
+        "armed.)\n\n",
+        covered, marker_user_clock() ? "user " : "");
+    fflush(stderr);
+    g_seg_end_marker_close = false;
+    g_seg_close_reason = "SHUTDOWN";
+    if (vcpu_index >= 0 && (unsigned)vcpu_index < CST_PIN_MAX_VCPUS) {
+        /*
+         * prev_executed = FALSE, and this is the one thing about this
+         * close that is not like the others.  The ceiling and the
+         * budget close from the TOP of a correct-path step, where the
+         * pending seal slot holds the PREVIOUS block — fully executed,
+         * so it is emitted.  This close arrives from a DEVICE WRITE, in
+         * the middle of the block that performs it: the pending slot
+         * holds a block that is still running, and emitting it writes an
+         * execution whose memory operations were only partly observed.
+         * Caught by cst_audit's memop-bimodality oracle — "1/841 CP
+         * executions realised zero memops" — on a first version of this
+         * that used true.  So the in-flight block is dropped and only
+         * the completed chain is flushed.
+         */
+        finish_trace_segment(/* prev_executed= */ false,
+                             (unsigned int)vcpu_index);
+    } else {
+        /* No vCPU could be named.  Flush every builder that ever ran;
+         * reachable only if the machine goes down without having run. */
+        finish_trace_segment();
+    }
+    g_trace_segments.set_shutting_down();
+    g_rec_mutex_unlock(&exec_lock);
+}
+
 /* ========================= Exit / statistics ========================= */
 
 static void plugin_exit(qemu_plugin_id_t id, void *p)
@@ -8903,15 +9109,39 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
      * cliff model is expressed in.  Always reported, never gating unless
      * CST_RT_GATE armed it. */
     fence_flush_end_ring();
-    /* Detector-side counters live in the marker-detect TU; fold them in
-     * before the report renders, then make any tripwire LOUD.  A silent
-     * nonzero in a table nobody reads is how a miss stays invisible. */
-    g_stats.marker_run_broken = marker_runs_broken();
-    g_stats.marker_run_adopted = marker_runs_adopted();
-    g_stats.marker_run_incomplete = marker_runs_incomplete();
-    if (g_stats.marker_run_broken || g_stats.marker_end_no_close ||
-        g_stats.wp_session_on_cp || g_stats.marker_fence_session_only ||
-        g_stats.marker_run_incomplete) {
+    /*
+     * THE INVARIANT REPORT, and why it does not go through `g_stats`.
+     *
+     * `g_stats` is a THREAD-LOCAL slot registered in a process-wide
+     * registry, and plugin_exit runs from inside exit(3) — which calls the
+     * calling thread's thread_local destructors BEFORE it runs atexit
+     * handlers.  By the time this code executes, that thread's Stats slot
+     * has already been folded into the graveyard, erased from the registry
+     * and freed: writing a counter here writes freed memory that no
+     * snapshot can see, and READING one here reads a dead slot that never
+     * accumulated what the vCPU threads counted.  Measured: a run with 87
+     * broken marker runs printed 87 in this banner (the dangling write read
+     * straight back) and 0 in the statistics table (the aggregate), while
+     * `WP session flag on CP step` — accumulated during the run by the vCPU
+     * threads — read 0 HERE and its true value in the table.  Either way a
+     * tripwire could report a clean run over a violated invariant.
+     *
+     * So the aggregate is snapshotted once, the process-wide detector
+     * counters are folded into that copy, and BOTH the banner and the table
+     * are rendered from it.  Nothing at exit touches the thread-local.
+     */
+    Stats final_stats = stats_snapshot();
+    final_stats.marker_run_broken = marker_runs_broken();
+    final_stats.marker_run_adopted = marker_runs_adopted();
+    final_stats.marker_run_incomplete = marker_runs_incomplete();
+    final_stats.marker_handoff_evicted = marker_handoff_evicted();
+    final_stats.marker_local_evicted = marker_local_evicted();
+    final_stats.marker_local_stale = marker_local_stale();
+    if (final_stats.marker_run_broken || final_stats.marker_end_no_close ||
+        final_stats.wp_session_on_cp ||
+        final_stats.marker_fence_session_only ||
+        final_stats.marker_run_incomplete ||
+        final_stats.marker_handoff_evicted) {
         fprintf(stderr,
             "\nchampsim_tracer: *** MARKER INVARIANT TRIPWIRE ***\n"
             "  marker run broken            %" PRIu64 " (must be 0)\n"
@@ -8919,18 +9149,31 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
             "  WP session flag on CP step   %" PRIu64 " (must be 0)\n"
             "  marker fence session-only    %" PRIu64 " (must be 0)\n"
             "  marker run incomplete at exit %" PRIu64 " (must be 0)\n"
+            "  marker handoff evicted       %" PRIu64 " (must be 0)\n"
             "  A correct-path marker sequence may have been missed: the "
             "window that\n  should have closed at it did not.\n\n",
-            g_stats.marker_run_broken, g_stats.marker_end_no_close,
-            g_stats.wp_session_on_cp, g_stats.marker_fence_session_only,
-            g_stats.marker_run_incomplete);
+            final_stats.marker_run_broken, final_stats.marker_end_no_close,
+            final_stats.wp_session_on_cp,
+            final_stats.marker_fence_session_only,
+            final_stats.marker_run_incomplete,
+            final_stats.marker_handoff_evicted);
+        fflush(stderr);
+    }
+    if (getenv("CST_STATSDBG")) {
+        /* Positive control for the paragraph above: the thread-local read
+         * and the aggregate, side by side, at the same instant. */
+        fprintf(stderr, "[statsdbg] tls.broken=%" PRIu64 " agg.broken=%" PRIu64
+                " tls.wp_sess=%" PRIu64 " agg.wp_sess=%" PRIu64 "\n",
+                g_stats.marker_run_broken, final_stats.marker_run_broken,
+                g_stats.wp_session_on_cp, final_stats.wp_session_on_cp);
         fflush(stderr);
     }
     if (fence_diag()) {
         fprintf(stderr, "[fence] FINAL start_runs=%" PRIu64 " end_runs=%" PRIu64
                 " start_cb=%" PRIu64 " start_fenced=%" PRIu64
                 " end_cb=%" PRIu64 " end_cp=%" PRIu64 " end_fenced=%" PRIu64
-                "\n", g_fdiag_start_runs, g_fdiag_end_runs,
+                "\n", g_fdiag_start_runs.load(std::memory_order_relaxed),
+                g_fdiag_end_runs.load(std::memory_order_relaxed),
                 g_fdiag_start_total, g_fdiag_start_fenced,
                 g_fdiag_end_total, g_fdiag_end_cp, g_fdiag_end_fenced);
         fflush(stderr);
@@ -8938,7 +9181,7 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     g_rt_gate.report(report);
 
     g_mutex_lock(&data_lock);
-    append_stats_summary(report, "Cumulative", stats_snapshot());
+    append_stats_summary(report, "Cumulative", final_stats);
     if (g_simpoints.is_active()) {
         g_string_append_printf(report,
             "SimPoints loaded/traced: %zu / %zu\n\n",
@@ -9159,6 +9402,55 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     g_marker_policy     = cfg.marker_policy;
     g_latch_timeout_ms  = cfg.latch_timeout_ms;
     g_stall_ceiling     = cfg.stall_ceiling;
+    g_stall_any_ceiling = cfg.stall_ceiling_any;
+
+    /*
+     * BOUNDED BY CONSTRUCTION, OR REFUSED.
+     *
+     * A system-mode capture on the USER-INSTRUCTION clock (marker windows,
+     * pinned simpoints) advances its budget only while the traced process
+     * runs, and is ended only by that process's own END marker.  A process
+     * that is killed, blocked forever, or never scheduled satisfies
+     * neither, and the run then has no terminator at all.  Three things can
+     * end it without the traced process's cooperation:
+     *
+     *   1. the machine going down (vcpu_vm_shutdown_cb) — always armed,
+     *      but it needs the guest, or the operator, to shut down;
+     *   2. the any-context instruction ceiling (stall_ceiling_any) — an
+     *      architectural bound that holds whatever the guest is doing, as
+     *      long as it executes ANYTHING;
+     *   3. the dead-latch wall-clock timeout (latch_timeout) — opt-in,
+     *      because its signal cannot tell a dead process from an idle one.
+     *
+     * Only (2) and (3) bound a guest that keeps running and never shuts
+     * down.  Turning (2) off with no (3) leaves the run unbounded, so it is
+     * not started at all: an operator who wants a capture with no bound
+     * must say so by giving latch_timeout, not by disabling the default.
+     * Refused here rather than warned about, because the failure it
+     * prevents is a run that never ends and a trace that is never written.
+     */
+    if (info->system_emulation && !cfg.stall_ceiling_any &&
+        !cfg.latch_timeout_ms &&
+        (cfg.window_mode == PluginConfig::WIN_MARKER ||
+         cfg.window_mode == PluginConfig::WIN_SIMPOINT)) {
+        fprintf(stderr,
+            "champsim_tracer: refusing to start — this capture has no way "
+            "to terminate.\n"
+            "  A system-mode %s window advances its budget only while the "
+            "traced\n  process runs, and closes only at that process's own "
+            "END marker.  If the\n  process is killed, blocks forever, or "
+            "is never scheduled, neither can\n  happen.  stall_ceiling_any="
+            "0 disables the architectural bound that\n  covers exactly "
+            "that case, and no latch_timeout was given, so nothing would\n"
+            "  end this run.\n"
+            "  Give stall_ceiling_any=<arch insns> (default %llu), or "
+            "latch_timeout=<ms>\n  if you want a wall-clock bound instead."
+            "\n",
+            cfg.window_mode == PluginConfig::WIN_MARKER ? "marker"
+                                                        : "simpoint",
+            (unsigned long long)CST_STALL_ANY_CEILING_DEFAULT);
+        return -1;
+    }
 
     /*
      * Two decoupled fault concerns, split from the former single flag:
@@ -9369,6 +9661,11 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     qemu_plugin_register_vcpu_init_cb(id, vcpu_init_cb);
     qemu_plugin_register_atexit_cb(id, plugin_exit, nullptr);
     if (g_system_mode) {
+        /* Close, don't abandon: the machine going down is the one
+         * termination path that needs no cooperation from the traced
+         * process (see vcpu_vm_shutdown_cb).  Always registered — a
+         * backstop that is opt-in is not a backstop. */
+        qemu_plugin_register_vm_shutdown_cb(id, vcpu_vm_shutdown_cb);
         /* Keep the per-vCPU asid_match flag current from the
          * architectural ASID-write commit points (fires even while the
          * path-event queue is disabled; wrong-path writes suppressed).

@@ -36,6 +36,35 @@
 #define CST_STALL_CEILING_DEFAULT 256000000ull
 #define CST_STALL_WARN_DEFAULT     32000000ull
 
+/*
+ * Default ANY-CONTEXT stall ceiling (see PluginConfig::stall_ceiling_any).
+ *
+ * The owned-context ceiling above only counts while the traced process is
+ * RUNNING.  It therefore cannot bound the case where the traced process is
+ * not running at all — killed after the window opened, or blocked forever
+ * in a syscall — while the rest of the guest stays busy.  In that state the
+ * user clock is frozen, the END marker can never execute, no owned
+ * instruction is ever retired, and nothing ends the run.
+ *
+ * This ceiling counts instructions the guest retires in ANY context since
+ * the pinned user clock last advanced, so it holds whether the traced
+ * process is spinning in the kernel, blocked, or gone.  It is a termination
+ * bound, not a health check: a healthy traced process may legitimately stop
+ * running for a long time, and the tighter owned-context ceiling above
+ * already covers the far more common "running and never returning" case.
+ *
+ * MEASURED, not guessed (cst_runs/certainty): with a busy guest and the
+ * traced process asleep, the counter advances 5.8-21.5 M instructions per
+ * SECOND of guest time (30 s of guest sleep = 1.75e8; 1 s = 2.15e7 in the
+ * densest configuration).  The longest idle any test in this suite creates
+ * on purpose is the system churn test's ~30 s, so the default clears the
+ * worst-case rate for that idle by 3x — about 93 seconds of guest time in
+ * which the traced process does not run at all.  A workload whose traced
+ * process idles longer should RAISE it, not disable it.
+ */
+#define CST_STALL_ANY_CEILING_DEFAULT 2000000000ull
+#define CST_STALL_ANY_WARN_DEFAULT     250000000ull
+
 struct PluginConfig {
     int       wp_depth          = 64;
     /* Wrong-path pruning level (wpprune=N): skip WP simulation for cold
@@ -241,6 +270,25 @@ struct PluginConfig {
      * budget would, loudly and with the trace finalised.
      */
     uint64_t stall_ceiling = CST_STALL_CEILING_DEFAULT;
+
+    /*
+     * Any-context stall ceiling (stall_ceiling_any=<arch insns>, 0
+     * disables).  The termination bound of last resort, and the one that
+     * holds when the traced process is NOT RUNNING: killed after its window
+     * opened, or blocked in a syscall it never leaves.  The owned-context
+     * ceiling cannot see that case — no owned instruction is retired at all
+     * — and the dead-latch is opt-in wall-clock idleness, so with both off
+     * the segment never ends and the run never terminates.  Measured, not
+     * hypothesised (cst_runs/certainty: a probe that arms its marker and
+     * then exits, or blocks in pause(), while the guest stays busy; the run
+     * is unbounded at HEAD).
+     *
+     * Counts instructions retired by the guest in ANY context since the
+     * pinned user clock last advanced.  Hang prevention is never opt-in, so
+     * this is ON by default; a workload whose traced process legitimately
+     * idles longer than the default should raise it rather than disable it.
+     */
+    uint64_t stall_ceiling_any = CST_STALL_ANY_CEILING_DEFAULT;
 };
 
 /* Parse plugin args.  Returns true on success; on failure prints to

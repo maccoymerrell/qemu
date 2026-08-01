@@ -138,7 +138,7 @@ enum MarkerWhich { MARKER_WHICH_START = 0, MARKER_WHICH_END = 1 };
  * nothing, which is exactly the migration case.
  */
 bool marker_exec_step(MarkerRunSet *set, uint64_t pc, uint8_t size,
-                      MarkerWhich which);
+                      MarkerWhich which, unsigned int cpu_index);
 
 /* Correct-path runs that were RESET mid-sequence (a marker word arrived
  * where a live run for the same address space expected a different pc).
@@ -151,5 +151,17 @@ uint64_t marker_runs_adopted(void);
 /* Partial runs still outstanding: a marker sequence that started and never
  * completed.  Read at plugin exit; must be 0. */
 uint64_t marker_runs_incomplete(void);
+/* A LIVE partial run displaced from the handoff bank.  Every advance
+ * republishes into the bank, so eviction is the ONE remaining way an
+ * in-flight marker sequence can be lost — hence a tripwire, must be 0. */
+uint64_t marker_handoff_evicted(void);
+/* A live per-vCPU run slot reused by another address space.  Recoverable
+ * (the bank still holds the partial run), so a condition counter. */
+uint64_t marker_local_evicted(void);
+/* A per-vCPU run left behind by a migration: the sequence continued on
+ * another vCPU, so this copy is residue.  Condition counter — it is what a
+ * healthy SMP capture produces, and counting it as a break made a tripwire
+ * that fires on correct behaviour. */
+uint64_t marker_local_stale(void);
 
 #endif /* CHAMPSIM_TRACER_MARKER_DETECT_H */

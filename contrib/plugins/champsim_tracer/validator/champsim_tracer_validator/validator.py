@@ -5317,17 +5317,55 @@ def _check_wp_events(body_stats: dict,
 
 
 def _check_thread_switch(body_stats: dict,
-                         expected_threads: int = 1) -> list[Issue]:
+                         expected_threads: int = 1,
+                         system: bool = False) -> list[Issue]:
     """Every segment body's first record is a mandatory
     BODY_TAG_THREAD_SWITCH stating the starting thread (an ordinary
-    delta from 0), so the count is never 0.  For a single-thread
-    trace that mandatory opener is the *only* switch per segment and
-    there is no interleaving, so the count matches the regfile
-    cadence exactly (REGFILE is likewise one-per-segment when
-    single-thread).  Multi-thread runs add real interleaving
-    switches, so the count must be at least ``expected_threads``
-    (otherwise the threads never interleaved and we aren't actually
-    exercising multi-thread tracing)."""
+    delta from 0), so the count is never 0.  Multi-thread runs add real
+    interleaving switches, so the count must be at least
+    ``expected_threads`` (otherwise the threads never interleaved and we
+    aren't actually exercising multi-thread tracing).
+
+    USER mode, single thread: the mandatory opener is the *only* switch
+    per segment and there is no interleaving, so the count matches the
+    regfile cadence exactly (REGFILE is likewise one-per-segment when
+    single-thread).  qemu-user gives every guest thread its own CPUState
+    and nothing else executes in the traced address space, so a second
+    strand cannot appear.
+
+    SYSTEM mode: that equality is a user-mode premise and does not hold.
+    A system-mode trace records whatever the GUEST executes inside the
+    window, and the guest's own scheduler may run another task there --
+    which is a genuinely different guest thread and carries its own
+    ``thread_id``.  Measured on ``system.attach_mipsel`` (a ~540
+    user-instruction window over a ``sysinfo`` syscall): in 16% of runs
+    the guest preempts inside the syscall, so the wire reads
+    ``thread_switch_count=3`` / ``regfile_count=2`` -- an opener plus
+    two transitions.  Both transitions were decoded to the basic block
+    at ``0x80111180``, which is ``resume`` in the guest's vmlinux: the
+    MIPS kernel's context-switch routine, the very instruction sequence
+    that reloads ``$28``/``current_thread_info``.  The strand it
+    switches to executes disjoint kernel code (``div_u64_rem``,
+    ``_raw_spin_lock_irqsave``) from the traced task's syscall path
+    (``sys_sysinfo``, ``clear_page``), and the trace switches back at
+    ``resume`` again.  The extra switches are the guest scheduler, not
+    the tracer: the same shape and the same rate appear on the build
+    WITHOUT the marker-detector rework that first exposed this (62/384
+    vs 61/384 -- see cst_runs/tsw/FINDINGS.md).
+
+    So in system mode the assertion here is only the one the wire
+    guarantees: at least one opener per contributing context.  What
+    would make an extra switch SYNTHETIC is asserted by the two checks
+    that own it and are always run alongside this one:
+    ``thread_records`` (a switch flag is set on an entry iff its tid
+    differs from the previous entry's, and every REGFILE'd thread
+    contributed entries -- so a switch to a phantom identity, or a
+    switch where nothing changed, is an error there), and
+    ``thread_distribution`` (at most ``expected_threads`` ids may carry
+    USER entries -- so an extra strand that claimed the traced
+    process's own user code is an error there).  Both pass on these
+    traces.
+    """
     actual = int(body_stats.get("thread_switch_count", 0))
     regfiles = int(body_stats.get("regfile_count", 0))
     if actual == 0:
@@ -5337,15 +5375,25 @@ def _check_thread_switch(body_stats: dict,
             "mandatory BODY_TAG_THREAD_SWITCH stating the start thread",
             {"actual": actual},
         )]
-    if expected_threads == 1:
+    if expected_threads == 1 and not system:
         if actual != regfiles:
             return [Issue(
                 "thread_switch", "error",
-                f"thread_switch_count={actual} on a single-thread trace; "
-                f"expected exactly one mandatory opener per segment "
-                f"(== regfile_count={regfiles}) with no interleaving "
-                f"switches",
+                f"thread_switch_count={actual} on a single-thread "
+                f"user-mode trace; expected exactly one mandatory opener "
+                f"per segment (== regfile_count={regfiles}) with no "
+                f"interleaving switches",
                 {"actual": actual, "expected": regfiles},
+            )]
+    elif expected_threads == 1 and system:
+        if actual < regfiles:
+            return [Issue(
+                "thread_switch", "error",
+                f"thread_switch_count={actual} < regfile_count="
+                f"{regfiles}: every context that contributed entries must "
+                f"have been announced by a BODY_TAG_THREAD_SWITCH before "
+                f"its first entry",
+                {"actual": actual, "expected_min": regfiles},
             )]
     elif actual < expected_threads:
         return [Issue(
@@ -7315,7 +7363,8 @@ def validate_structural(trace_path: Path,
     issues += _check_iframe_cadence(body_stats, entries, trace_meta)
     issues += _check_regfile_records(body_stats, expected_threads,
                                      entries)
-    issues += _check_thread_switch(body_stats, expected_threads)
+    issues += _check_thread_switch(body_stats, expected_threads,
+                                   system=bool(marker))
     if marker:
         # System-mode thread_ids are GUEST-THREAD identities, dense
         # 0..N-1 by first-sighting order — NOT vCPU indexes, and not
@@ -7754,7 +7803,8 @@ def validate(meta_path: Path, trace_path: Path,
                                          templates_by_id)
     issues += _check_regfile_records(body_stats, threads_effective,
                                      entries)
-    issues += _check_thread_switch(body_stats, threads_effective)
+    issues += _check_thread_switch(body_stats, threads_effective,
+                                   system=bool(marker))
     issues += _check_thread_record_cadence(
         entries, trace_meta.get("body_record_order") or [])
     # The generated workload is single-threaded, so its user-privilege

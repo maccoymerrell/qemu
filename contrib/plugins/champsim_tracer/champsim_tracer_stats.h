@@ -286,6 +286,25 @@ struct Stats {
      * segments the ceiling ended. */
     uint64_t user_clock_worst_stall = 0;
     uint64_t stall_ceiling_closes = 0;
+    /* The same quantity counted over EVERY context, so it keeps rising
+     * while the traced process is not running at all; and the closes the
+     * any-context ceiling raised. */
+    uint64_t user_clock_worst_stall_any = 0;
+    uint64_t stall_any_closes = 0;
+    /* Segments closed by the machine-shutdown backstop: the guest powered
+     * off (or QEMU was asked to exit) with a capture still open, so the
+     * window was closed and finalised there rather than abandoned.  A
+     * nonzero value means the trace is TRUNCATED at that point and the
+     * workload never reached its END marker. */
+    uint64_t vm_shutdown_closes = 0;
+    /* marker_handoff_evicted — a LIVE partial marker run displaced from the
+     * process-wide handoff bank.  Every advance republishes into the bank,
+     * so this is the one remaining way an in-flight sequence can be lost:
+     * a tripwire, must be 0.  marker_local_evicted is the recoverable
+     * per-vCPU analogue (the bank still holds the run). */
+    uint64_t marker_handoff_evicted = 0;
+    uint64_t marker_local_evicted = 0;
+    uint64_t marker_local_stale = 0;
 
     /*
      * rep_unretired_pass_dropped — an empty leading pass of a fan-out

@@ -156,6 +156,14 @@ bool set_stall_ceiling(PluginConfig *cfg, const char *v)
     return true;
 }
 
+bool set_stall_ceiling_any(PluginConfig *cfg, const char *v)
+{
+    /* Architectural instructions the guest may retire in an owned context
+     * with the pinned user clock frozen; 0 disables the ceiling. */
+    cfg->stall_ceiling_any = g_ascii_strtoull(v, nullptr, 10);
+    return true;
+}
+
 bool set_smc_revisions(PluginConfig *cfg, const char *v)
 {
     /* Per-PC SMC revision cap (bug detector; smc_plan.md §5-A).  Any
@@ -402,6 +410,7 @@ const struct {
     { "curtask_off", set_curtask_off },
     { "latch_timeout", set_latch_timeout },
     { "stall_ceiling", set_stall_ceiling },
+    { "stall_ceiling_any", set_stall_ceiling_any },
     { "trace_window", set_trace_window },
     { nullptr, nullptr },
 };

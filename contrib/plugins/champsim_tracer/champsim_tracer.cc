@@ -475,6 +475,15 @@ static thread_local uint64_t tls_mkdiag_foreign_user = 0;
  *   invocation down the fence's drop path while a segment is open — a leaked
  *   fence flag, reproduced on demand, so the signature of a suppressed
  *   correct-path END can be compared against the real non-closing cells.
+ *   It is also the POSITIVE CONTROL for `marker END with no close`: the
+ *   suppression it forces is a correct-path END that closes nothing, and
+ *   the tripwire is tested ahead of the drop precisely so it sees it (see
+ *   vcpu_marker_end_cb).
+ * CST_FENCE_FORCE_SESSION=<n>  the other leak shape: leave the per-vCPU
+ *   wrong-path session bracket SET when the n-th excursion ends, so the
+ *   correct path runs flagged as speculative.  Positive control for
+ *   `WP session flag on correct path` and `marker fence session-only`.
+ *   Implemented in champsim_tracer_wp.cc, where the bracket is closed.
  */
 static inline int64_t fence_diag_period_ns(void)
 {
@@ -2459,6 +2468,29 @@ static inline void refresh_ctx_gates(unsigned int cpu_index)
  * physical-page map. */
 static void asid_write_track_cb(unsigned int vcpu_index, uint64_t new_asid)
 {
+    /*
+     * Leaked-fence tripwire, SECOND test point — see the first in
+     * events_path_step.  That one runs on the correct-path STEP, which the
+     * JIT dispatches only for a context this trace owns while a segment is
+     * active (vcpu_tb_exec is a cond_cb gated on trace_this_ctx, and the
+     * pinned-simpoint fast-forward returns ahead of it).  A bracket leaked
+     * on a vCPU that then stops running owned code would therefore go
+     * unseen there while it silently fenced every marker callback on that
+     * vCPU — which is how a window stays open forever.
+     *
+     * A committed address-space write is the one correct-path event that
+     * fires REGARDLESS of ownership, of the window, and of the
+     * fast-forward, so testing it here makes the counter's claim — the
+     * session flag was set while this vCPU ran the correct path — true of
+     * the whole class rather than of the traced window only.  One relaxed
+     * load per context switch.  The wrong path is excluded by the same two
+     * gates the marker fence trusts: QEMU's own spec-mode flag, and this
+     * host thread's walker flag (the walker is synchronous).
+     */
+    if (!qemu_plugin_in_spec_mode() && !g_wp_in_progress &&
+        wp_session_active(vcpu_index)) {
+        g_stats.wp_session_on_cp++;
+    }
     uint64_t pinned = g_pinned_asid.load(std::memory_order_relaxed);
     uint64_t match;
     if (g_pin_reuse_guard) {
@@ -8414,6 +8446,35 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
 }
 
 /*
+ * An END marker executed on the correct path and closed no window — either
+ * because the fence suppressed its words, or because the run completed in an
+ * address space this trace does not own.  Loud ONCE, at the moment it
+ * happens, not only as a counter at exit: the window is still open, so the
+ * capture is about to record past the end of its workload, and that is worth
+ * interrupting the operator for while the run can still be stopped.
+ */
+static void marker_end_no_close_warn(unsigned int cpu_index, uint64_t pc,
+                                     const char *cause)
+{
+    static std::atomic<bool> said{false};
+    bool expected = false;
+    if (!said.compare_exchange_strong(expected, true,
+                                      std::memory_order_relaxed)) {
+        return;
+    }
+    fprintf(stderr,
+            "champsim_tracer: *** END MARKER CLOSED NO WINDOW ***\n"
+            "  cpu=%u pc=0x%" PRIx64 " asid=0x%" PRIx64
+            " user_insns=%" PRIu64 " cause=%s\n"
+            "  The window this END should have closed is still open; the "
+            "capture will run\n  past the end of its workload.  See "
+            "'marker END with no close' in the report.\n",
+            cpu_index, pc, qemu_plugin_get_addr_space_id(), g_user_icount,
+            cause);
+    fflush(stderr);
+}
+
+/*
  * End-of-program marker (WIN_MARKER).  The workload emits the END-marker
  * sequence just before it exits; when it executes in the pinned process's
  * address space, close the trace window here.  This is the "or the program
@@ -8445,6 +8506,43 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
                                (uint8_t)((f_spec ? 1 : 0) | (f_wp ? 2 : 0) |
                                          (f_sess ? 4 : 0) | (f_forced ? 8 : 0)),
                                /* fenced= */ true, 0);
+            }
+            /*
+             * INVARIANT 1's TEST POINT, and why it is HERE and not below.
+             *
+             * The claim "marker END with no close" makes is about an END
+             * marker that executed on the CORRECT PATH.  The owned-set test
+             * further down can only speak about a COMPLETED run — and a word
+             * the fence drops never reaches the run machine, so no run
+             * completes, so that test is structurally blind to the very case
+             * this counter exists to name.  Measured, before this moved: with
+             * CST_FENCE_FORCE_END a correct-path END was suppressed 54 times,
+             * the window never closed, and the counter still read 0.  A
+             * tripwire that cannot fire converts a violated invariant into a
+             * clean-looking run.
+             *
+             * "On the correct path" is decided by the two gates a speculative
+             * execution cannot be missing: QEMU's own per-vCPU spec-mode flag,
+             * and the walker's per-THREAD in-progress flag — the walker is
+             * synchronous, so every block it runs fires its callbacks on this
+             * host thread with g_wp_in_progress set.  What remains — the
+             * per-vCPU session bracket, and the forced control — can be set on
+             * a correct-path step only by a LEAK, which is the defect.  So
+             * this costs nothing on a healthy run (the 37.9 M speculative END
+             * invocations measured by the fence lane all carry f_spec) and
+             * cannot fire without the defect being present.
+             */
+            if (!f_spec && !f_wp && qemu_plugin_get_priv_level() == 0 &&
+                g_trace_segments.is_active_atomic()) {
+                uint64_t spc;
+                uint8_t ssz;
+                marker_udata_unpack(udata, &spc, &ssz);
+                g_stats.marker_end_no_close++;
+                marker_end_no_close_warn(cpu_index, spc,
+                        f_forced ? "suppressed by the fence, forced "
+                                   "(CST_FENCE_FORCE_END)"
+                                 : "suppressed by the fence — a leaked "
+                                   "wrong-path session bracket");
             }
             if (f_spec || f_wp || f_sess) {
                 tls_mkdiag_end_wp_gated++;
@@ -8550,6 +8648,9 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
              * drifted off its process would look. */
             if (g_trace_segments.is_active()) {
                 g_stats.marker_end_no_close++;
+                marker_end_no_close_warn(cpu_index, pc,
+                        "the run completed in an address space this trace "
+                        "does not own");
             }
             g_rec_mutex_unlock(&exec_lock);
             return;
@@ -8631,6 +8732,9 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
              * closed it): not ours to act on (counted — see above). */
             if (g_trace_segments.is_active()) {
                 g_stats.marker_end_no_close++;
+                marker_end_no_close_warn(cpu_index, pc,
+                        "the run completed in a narrow-ASID dwell with no "
+                        "active owner");
             }
             g_rec_mutex_unlock(&exec_lock);
             return;

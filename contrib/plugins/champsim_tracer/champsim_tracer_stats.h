@@ -269,11 +269,28 @@ struct Stats {
      *   than they started on (condition counter for the migration path;
      *   nonzero means the handoff did work that the per-vCPU run sets
      *   alone would have lost).
-     * marker_end_no_close     — an END run completed on the correct path
-     *   in an address space this trace OWNS, and the window did not close.
+     * marker_end_no_close     — an END MARKER EXECUTED ON THE CORRECT PATH
+     *   and no window closed at it.  Two members, because a correct-path END
+     *   can fail to close a window in two ways and a counter that covers only
+     *   the second is blind to the one that actually happens:
+     *     (a) SUPPRESSED — a word of the sequence was dropped by the
+     *         wrong-path fence while the execution was demonstrably not
+     *         speculative (QEMU's spec-mode flag clear AND this thread not
+     *         inside the walker), so the run could never complete.  Tested
+     *         ahead of the fence's return in vcpu_marker_end_cb, which is the
+     *         only place it CAN be tested: the drop is the violation.
+     *     (b) UNOWNED — the run did complete on the correct path, but in an
+     *         address space this trace does not own, so nothing closed.  That
+     *         is how a pin that drifted off its process looks.
      * wp_session_on_cp        — a wrong-path session bracket was still
-     *   flagged while the CORRECT path was stepping this vCPU: a leaked
-     *   fence flag, which would silently drop every subsequent marker.
+     *   flagged while this vCPU ran the CORRECT path: a leaked fence flag,
+     *   which would silently drop every subsequent marker callback on that
+     *   vCPU and leave its window open forever.  Tested at TWO points, and
+     *   it needs both: the correct-path step (which the JIT dispatches only
+     *   for an owned context inside a window, and not at all during the
+     *   pinned-simpoint fast-forward), and every committed address-space
+     *   write (which fires regardless of ownership, window and
+     *   fast-forward).  Positive control: CST_FENCE_FORCE_SESSION.
      */
     uint64_t marker_run_broken = 0;
     uint64_t marker_run_adopted = 0;

@@ -329,6 +329,76 @@ plugin sees its argv.
    (seconds, typically), trading detection latency against the risk of
    closing a slow-but-alive window early.
 
+``stall_ceiling_any=<arch insns>``
+   How a system-mode capture is guaranteed to END.
+
+   A marker window's budget is counted in the **traced process's own
+   user-space instructions**, and the window closes at that process's
+   **end marker**.  Both require the traced process to run.  A process
+   that is killed after its window opened, blocks in a syscall it never
+   leaves, or is never scheduled again satisfies neither: the user clock
+   is frozen, the end marker can never execute, and nothing would close
+   the segment.
+
+   This ceiling is the bound that holds in exactly that state.  It counts
+   the instructions the guest retires in **any** context since the pinned
+   user clock last advanced — kernel work, other processes, the idle task
+   — sampled before the gates that drop foreign and asynchronous blocks,
+   because a guest whose traced process is gone executes nothing else.
+   When it is crossed the segment is closed through the end marker's own
+   path: the trace is **finalised and truncated**, never abandoned, and
+   the close says so — the segment's own close line ends in ``CEILING``,
+   the statistics report carries ``any-context stall closes``, and a
+   banner names the ceiling and the option that changes it.
+
+   It counts **architectural instructions, never wall-clock time**, so
+   the bound does not move with host load.  The consequence is the other
+   way round: how long it takes in *wall-clock* is whatever the guest
+   makes of it.  Measured with a busy guest and the traced process
+   asleep, the counter advances 5.8-21.5 M instructions per second of
+   guest time (so the default is roughly a minute and a half of guest
+   time); on an otherwise **idle** guest the same default is hours.  A
+   capture on an idle guest should lower it, or use ``latch_timeout``,
+   or — best — end the run with a guest shutdown (below).
+
+   Default ``2000000000``.  ``0`` disables it, and a system-mode marker
+   or simpoint capture with the ceiling disabled **and** no
+   ``latch_timeout`` is *refused at startup*: that configuration has no
+   terminator at all, and a run that cannot end is not started.
+
+Ending a run without the workload's cooperation
+-----------------------------------------------
+
+Three things can end a system-mode capture that the traced process
+cannot end itself, and the first is the one to design a run around:
+
+1. **The guest shuts down.**  The tracer closes any open segment when the
+   machine goes down — a guest ``poweroff``, a reset under ``-no-reboot``,
+   a monitor/QMP request, or ``SIGINT``/``SIGTERM`` to QEMU.  The close
+   happens while the machine is still assembled and on a vCPU thread, so
+   the trace is finalised exactly as an end marker would finalise it; the
+   close line ends in ``SHUTDOWN`` and the statistics report carries
+   ``closed by machine shutdown``.  This is always armed and needs no
+   option.
+
+   It is what makes the ordinary real-world flow bounded by
+   construction.  Run the target inside the guest and follow it with a
+   shutdown::
+
+      # guest-side run script
+      /path/to/target ; poweroff -f
+
+   Whatever the target does — finishes, crashes, is killed, hangs — the
+   guest reaches ``poweroff`` and the trace closes there.
+
+2. **The any-context ceiling** (``stall_ceiling_any``, above) — the
+   architectural bound for a guest that keeps running and never shuts
+   down.
+
+3. **The dead-latch timeout** (``latch_timeout``, above) — opt-in,
+   wall-clock, and the only one of the three that can close a window
+   whose process is merely slow.
+
 Examples::
 
    trace_window=icount:start=0+stop=20000000

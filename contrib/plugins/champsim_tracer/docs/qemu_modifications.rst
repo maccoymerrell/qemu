@@ -1405,6 +1405,53 @@ program's bulk memory traffic.
    instruction; see :doc:`limitations` for what the trace carries past
    that point.
 
+Machine-shutdown notification
+-----------------------------
+
+``include/qemu/qemu-plugin.h``, ``plugins/core.c``, ``plugins/system.c``,
+``include/qemu/plugin.h``, ``system/runstate.c``
+
+   Adds ``qemu_plugin_register_vm_shutdown_cb()`` (plugin API version
+   16): the machine is going down, close what you have open.
+
+   The existing ``qemu_plugin_register_atexit_cb()`` cannot serve this
+   purpose in system emulation.  It fires from libc's ``atexit(3)``,
+   which runs *after* ``qemu_cleanup()`` has stopped every vCPU and torn
+   the machine down, on a thread that is not a vCPU thread — so
+   ``current_cpu`` is ``NULL`` and every plugin API that resolves through
+   it (guest memory, registers, privilege level, address space) is
+   unusable.  A plugin that must *close* something rather than merely
+   free it therefore cannot close it there.  Before this hook, a marker
+   window still open at guest poweroff took the tracer's emit path down
+   that road and QEMU aborted in
+   ``plugins/api.c: plugin_cpu_state: assertion failed: (current_cpu)``.
+
+   The dispatch is placed to be both EARLY and ON A vCPU:
+
+   * ``qemu_system_shutdown_request()`` — the guest poweroff / reset /
+     monitor / QMP path.  A guest poweroff is a device write the guest
+     itself executed, so this arrives on the writing vCPU's own thread
+     with its state live: the callback runs directly.
+   * ``qemu_system_shutdown()`` in the main loop — the only path a HOST
+     SIGNAL reaches, because ``qemu_system_killed()`` runs in a signal
+     handler and sets ``shutdown_requested`` directly.  Here there is no
+     ``current_cpu``, so the callback is marshalled onto a vCPU thread
+     with ``run_on_cpu()``: it releases the BQL while it waits, and the
+     work executes at a translation-block boundary — outside any plugin
+     callback, so the plugin's own locks are free.
+
+   Both run before ``qemu_cleanup()``, and the dispatch is idempotent:
+   whichever fires first wins.  The hook lives in ``plugins/core.c``
+   (registration + one-shot delivery) with the vCPU placement in
+   ``plugins/system.c``, because ``run_on_cpu()`` is system-only.  With
+   no plugin registered it is two predictable branches on a path taken
+   once per run.
+
+   The tracer uses it to close an open segment exactly the way an end
+   marker closes one, which makes ``run target ; poweroff`` a capture
+   that terminates by construction whatever the target does.  See
+   :doc:`quickstart`.
+
 Build wiring
 ------------
 

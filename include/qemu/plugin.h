@@ -214,6 +214,26 @@ void qemu_plugin_devio_stop(uint64_t request_id);
 void qemu_plugin_atexit_cb(void);
 
 /*
+ * The machine is going down.  Dispatched to a plugin's registered
+ * shutdown hook (qemu_plugin_register_vm_shutdown_cb) from the shutdown
+ * request and from the main loop's shutdown acknowledge — whichever
+ * happens first; the second is a no-op.  Both run before qemu_cleanup(),
+ * so the machine is still assembled and the vCPUs still exist, which is
+ * what makes this the last usable point for a plugin that must CLOSE
+ * something: guest memory, registers and the privilege/address-space
+ * APIs all resolve through current_cpu, which is NULL at atexit time.
+ */
+void qemu_plugin_vm_shutdown(void);
+
+/*
+ * The two halves of that dispatch.  _armed reports whether a plugin
+ * registered a hook that has not yet fired; _dispatch delivers it at most
+ * once per run and names the vCPU it is running on (-1 if none exists).
+ */
+bool qemu_plugin_vm_shutdown_dispatch(int vcpu_index);
+bool qemu_plugin_vm_shutdown_armed(void);
+
+/*
  * Guest-kernel current-task location hint, declared by a plugin via
  * qemu_plugin_set_current_task_offset() and consumed by a target's
  * plugin-state hooks (today: x86-64's get_plugin_thread_ptr /
@@ -327,6 +347,9 @@ static inline void qemu_plugin_devio_stop(uint64_t request_id)
 { }
 
 static inline void qemu_plugin_atexit_cb(void)
+{ }
+
+static inline void qemu_plugin_vm_shutdown(void)
 { }
 
 static inline

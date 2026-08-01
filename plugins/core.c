@@ -13,6 +13,7 @@
  */
 #include "qemu/osdep.h"
 #include "qemu/lockable.h"
+#include "qemu/main-loop.h"
 #include "qemu/option.h"
 #include "qemu/plugin.h"
 #include "qemu/queue.h"
@@ -42,6 +43,57 @@ void qemu_plugin_register_asid_write_cb(qemu_plugin_id_t id,
                                         qemu_plugin_asid_write_cb_t cb)
 {
     asid_write_hook = cb;
+}
+
+/*
+ * Machine-shutdown hook (qemu_plugin_register_vm_shutdown_cb).  One slot,
+ * for the same reason as the hooks above.
+ *
+ * The dispatch below is the whole point of the hook: it must reach the
+ * plugin while the machine is still ASSEMBLED and, wherever possible, on
+ * a vCPU thread, because everything a plugin needs to close a capture
+ * (guest memory, registers, privilege level, address space) resolves
+ * through current_cpu.  qemu_plugin_atexit_cb() cannot offer any of that
+ * — it runs from atexit(3), after qemu_cleanup() has stopped the vCPUs
+ * and torn the machine down, on a thread where current_cpu is NULL.
+ */
+static qemu_plugin_vm_shutdown_cb_t vm_shutdown_hook;
+static bool vm_shutdown_dispatched;
+
+void qemu_plugin_register_vm_shutdown_cb(qemu_plugin_id_t id,
+                                         qemu_plugin_vm_shutdown_cb_t cb)
+{
+    vm_shutdown_hook = cb;
+}
+
+/*
+ * Deliver the notification, at most once per run.  The two callers live in
+ * plugins/system.c because the placement they do (run_on_cpu) is
+ * system-only; this half is here so the hook slot has one owner.
+ *
+ * Idempotent because the shutdown REQUEST and the main loop's shutdown
+ * ACKNOWLEDGE are BOTH dispatch points, and neither alone covers every
+ * cause: a guest poweroff and a monitor/QMP request go through
+ * qemu_system_shutdown_request(), while a host signal does not — the
+ * signal handler cannot call it and sets shutdown_requested directly, so
+ * the main loop is the only place SIGINT/SIGTERM is seen.  Whichever
+ * arrives first wins; the other is a no-op.
+ */
+bool qemu_plugin_vm_shutdown_dispatch(int vcpu_index)
+{
+    qemu_plugin_vm_shutdown_cb_t cb = vm_shutdown_hook;
+
+    if (!cb || vm_shutdown_dispatched) {
+        return false;
+    }
+    vm_shutdown_dispatched = true;
+    cb(0, vcpu_index);
+    return true;
+}
+
+bool qemu_plugin_vm_shutdown_armed(void)
+{
+    return vm_shutdown_hook && !vm_shutdown_dispatched;
 }
 
 /*

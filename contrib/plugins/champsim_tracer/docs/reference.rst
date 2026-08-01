@@ -1247,6 +1247,21 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
        its end marker does not hold the segment open until the icount
        budget.  Off by default because the signal cannot distinguish a
        dead process from a merely long-idle live one.
+   * - ``stall_ceiling_any=<arch insns>``
+     - ``2000000000``
+     - Termination bound for a system-mode capture whose traced process
+       stops running (killed, blocked, never scheduled).  Counts guest
+       instructions retired in ANY context since the pinned user clock
+       last advanced; on crossing, the segment is closed through the end
+       marker's own path — finalised and truncated, close line
+       ``CEILING``, ``any-context stall closes`` in the statistics.
+       Architectural, so it is load-invariant; see :doc:`quickstart` for
+       what that means in wall-clock.  ``0`` disables it, and a marker or
+       simpoint system capture with it disabled and no ``latch_timeout``
+       is REFUSED at startup — that configuration cannot terminate.
+       Independent of the always-armed machine-shutdown close, which
+       ends a capture when the guest powers off (close line
+       ``SHUTDOWN``).
    * - ``trace_window=MODE:KEY=VALUE+...``
      - unset (trace whole run)
      - Segmentation.  Exactly one mode; each mode accepts only its

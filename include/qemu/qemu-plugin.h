@@ -137,11 +137,18 @@ typedef uint64_t qemu_plugin_id_t;
  *   is a per-CPU variable behind the kernel GS base at a link-time
  *   offset — can resolve kernel-privilege thread identity by reading
  *   it, instead of collapsing every TLS-less task onto the value 0).
+ *
+ * version 16:
+ * - added qemu_plugin_register_vm_shutdown_cb (the machine is going
+ *   down: the last point at which a plugin can still read guest and
+ *   vCPU state, so a capture in progress is closed and finalised
+ *   instead of abandoned).  System emulation only; under user-mode
+ *   emulation the exit callback already runs on a guest thread.
  */
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 15
+#define QEMU_PLUGIN_VERSION 16
 
 /**
  * struct qemu_info_t - system information for plugins
@@ -1298,6 +1305,51 @@ void qemu_plugin_register_devio_cb(qemu_plugin_id_t id,
                                    qemu_plugin_devio_doorbell_cb_t doorbell_cb,
                                    qemu_plugin_devio_start_cb_t start_cb,
                                    qemu_plugin_devio_stop_cb_t stop_cb);
+
+/**
+ * typedef qemu_plugin_vm_shutdown_cb_t - machine-shutdown hook
+ * @id: plugin ID
+ * @vcpu_index: the vCPU the callback is running on, or -1 if QEMU could
+ *              not place it on one (no vCPU has been created yet, or the
+ *              machine is going down without ever having run)
+ *
+ * Dispatched once, when the machine is going down for any reason: the
+ * guest powered itself off or reset with -no-reboot, the monitor or a
+ * QMP client asked for it, or QEMU took SIGINT/SIGTERM.
+ */
+typedef void (*qemu_plugin_vm_shutdown_cb_t)(qemu_plugin_id_t id,
+                                             int vcpu_index);
+
+/**
+ * qemu_plugin_register_vm_shutdown_cb() - register a machine-shutdown cb
+ * @id: plugin ID
+ * @cb: callback
+ *
+ * WHY THIS EXISTS AND WHY THE EXIT CALLBACK IS NOT ENOUGH.  In system
+ * emulation qemu_plugin_register_atexit_cb() fires from libc's atexit(3),
+ * i.e. AFTER qemu_cleanup() has stopped every vCPU and torn the machine
+ * down, on a thread that is not a vCPU thread.  A plugin that still has
+ * state to flush at that point cannot read guest memory, cannot read
+ * register state, and cannot ask for the current privilege level or
+ * address space: every one of those APIs resolves through current_cpu,
+ * which is NULL there.  A capture that has to be *closed* rather than
+ * merely freed therefore cannot be closed from the exit callback.
+ *
+ * This callback is dispatched from the shutdown request itself, before
+ * the main loop leaves and before qemu_cleanup() runs, and QEMU places
+ * it on a vCPU thread whenever one exists (directly when the request
+ * already came from vCPU context — the usual case, since a guest
+ * poweroff is a device write the guest itself executed — and via
+ * run_on_cpu() otherwise).  Guest memory, vCPU registers and the
+ * privilege/address-space APIs are all live and stable inside it.
+ *
+ * It is dispatched at most once per run.  System emulation only: under
+ * user-mode emulation the exit callback already runs on a guest thread
+ * and needs no equivalent.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_register_vm_shutdown_cb(qemu_plugin_id_t id,
+                                         qemu_plugin_vm_shutdown_cb_t cb);
 
 /**
  * qemu_plugin_register_atexit_cb() - register exit callback

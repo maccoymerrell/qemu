@@ -46,6 +46,7 @@
 #include "qemu/job.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/plugin.h"
 #include "qemu/sockets.h"
 #include "qemu/timer.h"
 #include "qemu/thread.h"
@@ -729,6 +730,15 @@ void qemu_system_shutdown_request(ShutdownCause reason)
 {
     trace_qemu_system_shutdown_request(reason);
     replay_shutdown_request(reason);
+    /*
+     * Tell any plugin holding an open capture, HERE rather than at exit.
+     * A guest poweroff arrives on the writing vCPU's own thread, so this
+     * is the one point where the plugin can still see the machine it has
+     * been recording (see qemu_plugin_vm_shutdown).  Before the flag is
+     * set, so a plugin that wants a last look at the guest gets one while
+     * the run state is still RUNNING.
+     */
+    qemu_plugin_vm_shutdown();
     shutdown_requested = reason;
     qemu_notify_event();
 }
@@ -741,6 +751,15 @@ static void qemu_system_powerdown(void)
 
 static void qemu_system_shutdown(ShutdownCause cause)
 {
+    /*
+     * Second dispatch point, and the only one a HOST SIGNAL reaches:
+     * qemu_system_killed() runs in a signal handler and sets
+     * shutdown_requested directly, so SIGINT/SIGTERM never pass through
+     * qemu_system_shutdown_request().  Idempotent — whichever fires
+     * first wins.  Still before qemu_cleanup(), so the vCPUs are alive
+     * and run_on_cpu() can place the callback on one.
+     */
+    qemu_plugin_vm_shutdown();
     qapi_event_send_shutdown(shutdown_caused_by_guest(cause), cause);
     notifier_list_notify(&shutdown_notifiers, &cause);
 }

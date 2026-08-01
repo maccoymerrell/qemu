@@ -1781,6 +1781,301 @@ static void pin_repr_seed(uint64_t pc)
     g_pin_repr_sig.store(sig, std::memory_order_relaxed);
 }
 
+/*
+ * ROOT-REUSE GUARD, wide-register targets (x86 CR3 / AArch64 TTBR /
+ * RISC-V SATP).
+ *
+ * A page-table root names a process only while that process is alive.  When
+ * it exits, the kernel frees the root page and hands it to whoever asks for
+ * one next — and address-space EQUALITY, which is all owned_contains_locked()
+ * tests, cannot tell the successor from the process the marker pinned.  The
+ * successor's user instructions were then counted on the traced process's
+ * clock and written into the trace under its identity.
+ *
+ * The identity that survives the reuse is the process's own USER CODE.  Each
+ * owned root carries a small set of code-page anchors — {virtual page,
+ * physical frame, content signature} — seeded from the marker's own page and
+ * grown from the first few owned user TBs, and every committed write of that
+ * root (a context-switch-rate event, never per TB) re-walks them in the LIVE
+ * address space:
+ *
+ *   frame still matches                     -> the same process   (decisive)
+ *   frame moved but the bytes match         -> the same process, page
+ *                                              re-faulted; refresh the frame
+ *   the page is mapped and the bytes differ -> a DIFFERENT process holds this
+ *                                              root                (decisive)
+ *   the page is not mapped at all           -> unresolvable this time
+ *
+ * A decisive foreign verdict retires the root exactly as its END marker would
+ * (see pin_root_reuse_close), so the successor's blocks never reach the trace.
+ * An unresolvable one changes nothing: a live process whose text was reclaimed
+ * must not lose its window, so the guard fails OPEN and says so
+ * (pin_root_anchor_unresolved).  What that costs is named in
+ * docs/limitations.rst: a successor that maps NONE of the anchors' virtual
+ * pages is invisible to the walk, and a successor running byte-identical code
+ * at the same virtual address — a second instance of the same binary, or a
+ * fork — is indistinguishable BY CONSTRUCTION, because its user code really is
+ * the same code.
+ *
+ * The narrow-ASID targets (MIPS, g_pin_reuse_guard) do not use this: an 8-bit
+ * EntryHi.ASID cannot name a process at all, so there the page map IS the
+ * identity and is consulted on every dwell (see OwnedProc / pin_map_probe_
+ * owners).  This is that machinery reduced to what a real per-process root
+ * needs — a check at the one moment the root can change hands.
+ */
+static constexpr uint32_t CST_PIN_ANCHORS = 16;
+struct OwnedAnchor {
+    uint64_t vpage[CST_PIN_ANCHORS];
+    uint64_t ppage[CST_PIN_ANCHORS];
+    uint64_t sig[CST_PIN_ANCHORS];
+    uint32_t n = 0;
+};
+/* root -> its anchors.  Guarded by exec_lock, like g_owned; immortal (see
+ * "Immortal process-wide aggregates" in docs/architecture.rst). */
+static std::unordered_map<uint64_t, OwnedAnchor> &g_owned_anchor =
+    *new std::unordered_map<uint64_t, OwnedAnchor>();
+/* Number of owned roots still short of CST_PIN_ANCHORS anchors.  The heavy
+ * step tests this ONE relaxed load per owned user TB and only takes the map
+ * while it is non-zero, so anchor growth costs nothing once each window has
+ * learned its pages. */
+static std::atomic<uint32_t> g_anchor_learn_want{0};
+
+/*
+ * Per-vCPU dwell verdict for the wide path.  A switch settles the question
+ * once; every TB of that dwell then costs two relaxed loads.  The dwell is
+ * reset by asid_write_track_cb — the same event that ends it — so a root
+ * that changes hands is always re-judged.
+ */
+enum { PIN_DWELL_UNKNOWN = 0, PIN_DWELL_SAME = 1, PIN_DWELL_FOREIGN = 2 };
+struct PinWideDwell {
+    std::atomic<uint64_t> root{CST_ASID_UNPINNED};
+    std::atomic<uint8_t>  state{PIN_DWELL_UNKNOWN};
+};
+static PinWideDwell g_pin_wide[CST_PIN_MAX_VCPUS];
+
+/* Roots the per-TB dwell check proved foreign.  Retiring a window is a
+ * segment-level act with an exit(0) contract, so it is performed by the
+ * ASID-write hook (which owns that contract) at the next switch; the TBs
+ * themselves are already excluded the moment the verdict is reached.
+ * Guarded by exec_lock. */
+static std::unordered_set<uint64_t> &g_pin_condemned =
+    *new std::unordered_set<uint64_t>();
+
+
+/* Directed control (diagnostic, off by default): CST_REUSE_NO_VERIFY=1
+ * refuses the walk, i.e. the pre-guard behaviour where a recycled root is
+ * indistinguishable from the original.  It is the negative arm of the
+ * reuse acceptance run, and the only thing that turns the guard off. */
+static bool pin_reuse_verify_disabled(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        v = getenv("CST_REUSE_NO_VERIFY") ? 1 : 0;
+    }
+    return v != 0;
+}
+
+/* CST_REUSEDIAG=<n>: log the first @n anchor verdicts.  Diagnostic only. */
+static int pin_reuse_diag(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("CST_REUSEDIAG");
+        v = e ? atoi(e) : 0;
+    }
+    return v;
+}
+static int g_reusediag_printed;          /* exec_lock */
+
+/* Record @pc's code page as an anchor of @root, if it is not one already and
+ * @root has room.  Only a page that is live-translated AND readable becomes
+ * an anchor — an anchor that cannot be evaluated is worse than none.  Caller
+ * holds exec_lock (pin_page_sig's scratch buffer). */
+static void pin_anchor_add(uint64_t root, uint64_t pc)
+{
+    if (root == 0) {
+        return;
+    }
+    OwnedAnchor &a = g_owned_anchor[root];
+    if (a.n >= CST_PIN_ANCHORS) {
+        return;
+    }
+    uint64_t vp = pc & PIN_PAGE_MASK;
+    for (uint32_t i = 0; i < a.n; i++) {
+        if (a.vpage[i] == vp) {
+            return;
+        }
+    }
+    uint64_t pa, sig;
+    if (!qemu_plugin_vaddr_to_paddr(vp, &pa) || !pin_page_sig(vp, &sig)) {
+        return;                 /* not resident now: learn on a later TB */
+    }
+    a.vpage[a.n] = vp;
+    a.ppage[a.n] = pa & PIN_PAGE_MASK;
+    a.sig[a.n]   = sig;
+    a.n++;
+    g_stats.pin_root_anchors++;
+    if (a.n >= CST_PIN_ANCHORS && g_anchor_learn_want.load(
+            std::memory_order_relaxed) > 0) {
+        g_anchor_learn_want.fetch_sub(1, std::memory_order_relaxed);
+    }
+}
+
+/* Drop @root's anchors (its window closed).  Caller holds exec_lock. */
+static void pin_anchor_forget(uint64_t root)
+{
+    auto it = g_owned_anchor.find(root);
+    if (it == g_owned_anchor.end()) {
+        return;
+    }
+    if (it->second.n < CST_PIN_ANCHORS &&
+        g_anchor_learn_want.load(std::memory_order_relaxed) > 0) {
+        g_anchor_learn_want.fetch_sub(1, std::memory_order_relaxed);
+    }
+    g_owned_anchor.erase(it);
+}
+
+/* Seed @root's anchor set from the marker's own code page and open its
+ * learning budget.  Caller holds exec_lock. */
+static void pin_anchor_seed(uint64_t root, uint64_t pc)
+{
+    if (root == 0) {
+        return;
+    }
+    /* A re-pin re-seeds from scratch.  Going through forget() keeps the
+     * learning budget balanced: seeding a root that was already learning
+     * would otherwise leave the counter permanently above zero and make the
+     * heavy step take the anchor map on every owned user TB forever. */
+    pin_anchor_forget(root);
+    g_anchor_learn_want.fetch_add(1, std::memory_order_relaxed);
+    pin_anchor_add(root, pc);
+    g_pin_condemned.erase(root);
+    for (unsigned i = 0; i < CST_PIN_MAX_VCPUS; i++) {
+        g_pin_wide[i].state.store(PIN_DWELL_UNKNOWN, std::memory_order_relaxed);
+    }
+}
+
+enum PinAnchorVerdict {
+    PIN_ANCHOR_SAME,        /* an anchor resolved to this process */
+    PIN_ANCHOR_FOREIGN,     /* an anchor is mapped here with other bytes */
+    PIN_ANCHOR_UNRESOLVED,  /* no anchor could be evaluated */
+};
+
+/* Walk @root's anchors in the CURRENT address space.  One match is enough
+ * (a foreign process would have to reproduce the pinned process's exact page
+ * at its exact virtual address), so the first decisive hit wins; a mismatch
+ * is only believed when NO anchor matched.  Caller holds exec_lock and is on
+ * a vCPU thread, so the guest read walks the live page tables. */
+static PinAnchorVerdict pin_anchor_walk(uint64_t root)
+{
+    auto it = g_owned_anchor.find(root);
+    if (it == g_owned_anchor.end() || it->second.n == 0) {
+        return PIN_ANCHOR_UNRESOLVED;
+    }
+    OwnedAnchor &a = it->second;
+    bool foreign = false;
+    for (uint32_t i = 0; i < a.n; i++) {
+        uint64_t pa;
+        if (!qemu_plugin_vaddr_to_paddr(a.vpage[i], &pa)) {
+            continue;                    /* not mapped here: says nothing */
+        }
+        pa &= PIN_PAGE_MASK;
+        if (pa == a.ppage[i]) {
+            return PIN_ANCHOR_SAME;      /* same frame: decisive */
+        }
+        uint64_t sig;
+        if (!pin_page_sig(a.vpage[i], &sig)) {
+            continue;                    /* mapped but unreadable */
+        }
+        if (sig == a.sig[i]) {
+            a.ppage[i] = pa;             /* re-faulted: refresh the frame */
+            g_stats.pin_refault_repaired++;
+            return PIN_ANCHOR_SAME;
+        }
+        foreign = true;                  /* other bytes here — keep looking */
+    }
+    return foreign ? PIN_ANCHOR_FOREIGN : PIN_ANCHOR_UNRESOLVED;
+}
+
+/* Judge @pc's own code page against @root's anchors.  The executing page is
+ * resident by construction, so this is the one probe that always resolves —
+ * when the page is an anchor at all.  Caller holds exec_lock. */
+static PinAnchorVerdict pin_anchor_probe_pc(uint64_t root, uint64_t pc)
+{
+    auto it = g_owned_anchor.find(root);
+    if (it == g_owned_anchor.end()) {
+        return PIN_ANCHOR_UNRESOLVED;
+    }
+    OwnedAnchor &a = it->second;
+    uint64_t vp = pc & PIN_PAGE_MASK;
+    for (uint32_t i = 0; i < a.n; i++) {
+        if (a.vpage[i] != vp) {
+            continue;
+        }
+        uint64_t pa;
+        if (!qemu_plugin_vaddr_to_paddr(vp, &pa)) {
+            return PIN_ANCHOR_UNRESOLVED;
+        }
+        pa &= PIN_PAGE_MASK;
+        if (pa == a.ppage[i]) {
+            return PIN_ANCHOR_SAME;
+        }
+        uint64_t sig;
+        if (!pin_page_sig(vp, &sig)) {
+            return PIN_ANCHOR_UNRESOLVED;
+        }
+        if (sig == a.sig[i]) {
+            a.ppage[i] = pa;
+            g_stats.pin_refault_repaired++;
+            return PIN_ANCHOR_SAME;
+        }
+        /* This process's code page, this virtual address, other bytes:
+         * a different program is running here. */
+        return PIN_ANCHOR_FOREIGN;
+    }
+    return PIN_ANCHOR_UNRESOLVED;   /* not an anchor page */
+}
+
+/* Retire a root whose process is provably gone, defined next to the
+ * dead-latch sweep it shares its close with.  Returns true if the caller
+ * should exit(0). */
+static bool pin_root_reuse_close(uint64_t root, unsigned int cpu_index);
+
+/* Re-verify @root at a committed address-space switch.  Caller holds
+ * exec_lock; returns true if the caller should exit(0). */
+static bool pin_root_reuse_check(unsigned int cpu_index, uint64_t root)
+{
+    PinAnchorVerdict v = pin_anchor_walk(root);
+    if (pin_reuse_diag() && g_reusediag_printed < pin_reuse_diag()) {
+        g_reusediag_printed++;
+        fprintf(stderr, "[reuse] vcpu=%u root=0x%" PRIx64 " verdict=%s\n",
+                cpu_index, root,
+                v == PIN_ANCHOR_SAME ? "SAME"
+                : v == PIN_ANCHOR_FOREIGN ? "FOREIGN" : "UNRESOLVED");
+        fflush(stderr);
+    }
+    switch (v) {
+    case PIN_ANCHOR_SAME:
+        if (cpu_index < CST_PIN_MAX_VCPUS) {
+            g_pin_wide[cpu_index].state.store(PIN_DWELL_SAME,
+                                              std::memory_order_relaxed);
+        }
+        g_stats.pin_root_verified++;
+        return false;
+    case PIN_ANCHOR_UNRESOLVED:
+        g_stats.pin_root_anchor_unresolved++;
+        return false;
+    case PIN_ANCHOR_FOREIGN:
+        break;
+    }
+    g_stats.pin_root_reuse_detected++;
+    fprintf(stderr,
+            "champsim_tracer: page-table root 0x%" PRIx64 " was recycled — "
+            "its user code is a different process's; closing that window\n",
+            root);
+    return pin_root_reuse_close(root, cpu_index);
+}
+
 /* Compute a marker firing's stable wire anchor: @root_phys = the marker
  * code page's PHYSICAL page (a real, stable physical anchor that virtual
  * aliasing cannot forge and an EntryHi.ASID rollover cannot move — MIPS has
@@ -1991,7 +2286,61 @@ static bool pin_user_tb_owned(unsigned int cpu_index, uint64_t live_asid,
          * every process whose window is open.  Caller holds exec_lock, which
          * every mutation of g_owned also holds. */
         (void)pinned_asid;
-        return owned_contains_locked(live_asid);
+        if (!owned_contains_locked(live_asid)) {
+            return false;
+        }
+        if (pin_reuse_verify_disabled() || cpu_index >= CST_PIN_MAX_VCPUS) {
+            return true;
+        }
+        /*
+         * ROOT-REUSE GUARD, per dwell.  The switch-time walk (see
+         * pin_root_reuse_check) can come back unresolved — the anchors were
+         * not mapped at that instant — and a successor handed this root
+         * would then run until the next switch.  The EXECUTING page always
+         * resolves, so the first TB of an unsettled dwell asks it, and the
+         * verdict is cached for the rest of the dwell: two relaxed loads per
+         * TB, no guest read.
+         */
+        PinWideDwell &d = g_pin_wide[cpu_index];
+        if (d.root.load(std::memory_order_relaxed) == live_asid) {
+            uint8_t st = d.state.load(std::memory_order_relaxed);
+            if (st == PIN_DWELL_SAME) {
+                return true;
+            }
+            if (st == PIN_DWELL_FOREIGN) {
+                g_stats.pin_root_foreign_dropped++;
+                return false;
+            }
+        }
+        /* Only the executing page is asked here — it is always resident, so
+         * this costs a scan of at most CST_PIN_ANCHORS virtual addresses and
+         * touches guest memory only when one of them matches.  The full walk
+         * belongs to the switch (pin_root_reuse_check), which runs once per
+         * schedule-in rather than once per TB. */
+        PinAnchorVerdict v = pin_anchor_probe_pc(live_asid, pc);
+        d.root.store(live_asid, std::memory_order_relaxed);
+        if (v == PIN_ANCHOR_SAME) {
+            d.state.store(PIN_DWELL_SAME, std::memory_order_relaxed);
+            g_stats.pin_root_verified++;
+            return true;
+        }
+        if (v == PIN_ANCHOR_FOREIGN) {
+            d.state.store(PIN_DWELL_FOREIGN, std::memory_order_relaxed);
+            g_stats.pin_root_reuse_detected++;
+            g_stats.pin_root_foreign_dropped++;
+            g_pin_condemned.insert(live_asid);
+            fprintf(stderr,
+                    "champsim_tracer: page-table root 0x%" PRIx64 " was "
+                    "recycled — user code at 0x%" PRIx64 " is a different "
+                    "process's; excluding it\n", live_asid, pc);
+            return false;
+        }
+        /* Unresolvable: a live process whose text was reclaimed must not
+         * lose its window, so the guard fails OPEN and says so.  Left
+         * UNKNOWN so the next TB asks again — the page it runs next may
+         * well be an anchor. */
+        g_stats.pin_root_anchor_unresolved++;
+        return true;
     }
     if (cpu_index >= CST_PIN_MAX_VCPUS) {
         return false;
@@ -2125,6 +2474,47 @@ static void asid_write_track_cb(unsigned int vcpu_index, uint64_t new_asid)
          * — the guard g_owned's mutations hold — is cheap and race-free. */
         g_rec_mutex_lock(&exec_lock);
         match = owned_contains_locked(new_asid) ? 1 : 0;
+        /*
+         * ROOT-REUSE GUARD.  This is the one moment a root can change hands:
+         * a switch INTO an owned address space is either the traced process
+         * being scheduled in, or the successor that inherited its freed root.
+         * Ask the process's own user code which (pin_anchor_walk).  Skipped
+         * on the wrong path exactly as the marker callbacks are — a
+         * speculative switch must never retire a window.
+         */
+        if (!pin_reuse_verify_disabled() && !qemu_plugin_in_spec_mode() &&
+            !g_wp_in_progress && g_trace_segments.is_active() &&
+            !g_trace_segments.is_shutting_down()) {
+            /* This switch ends whatever dwell this vCPU was in. */
+            if (vcpu_index < CST_PIN_MAX_VCPUS) {
+                g_pin_wide[vcpu_index].root.store(new_asid,
+                                                 std::memory_order_relaxed);
+                g_pin_wide[vcpu_index].state.store(PIN_DWELL_UNKNOWN,
+                                                  std::memory_order_relaxed);
+            }
+            bool quit = false;
+            /* Retire any root a per-TB dwell already proved foreign: the
+             * close has an exit(0) contract only this hook can honour. */
+            if (!g_pin_condemned.empty()) {
+                std::vector<uint64_t> cond(g_pin_condemned.begin(),
+                                           g_pin_condemned.end());
+                g_pin_condemned.clear();
+                for (uint64_t r : cond) {
+                    if (owned_contains_locked(r)) {
+                        quit |= pin_root_reuse_close(r, vcpu_index);
+                    }
+                }
+            }
+            if (!quit && match) {
+                quit = pin_root_reuse_check(vcpu_index, new_asid);
+            }
+            if (quit) {
+                g_rec_mutex_unlock(&exec_lock);
+                exit(0);
+            }
+            /* A retired root is no longer owned. */
+            match = owned_contains_locked(new_asid) ? 1 : 0;
+        }
         g_rec_mutex_unlock(&exec_lock);
     }
     qemu_plugin_u64_set(g_scoreboard.asid_match, vcpu_index, match);
@@ -4953,22 +5343,46 @@ static inline bool deadlatch_enabled(void)
  * whole-set backstop.  Mirrors the END marker's last-window close so the
  * trace finalises identically (audit rolls up to 100%).  Caller holds
  * exec_lock; returns true if the caller should exit(0). */
-static bool deadlatch_close_segment(uint64_t now, unsigned int cpu_index)
+static bool deadlatch_close_segment(uint64_t now, unsigned int cpu_index,
+                                    const char *why = "dead-latch")
 {
     if (!g_trace_segments.is_active() ||
         g_trace_segments.is_shutting_down()) {
         return false;
     }
     fprintf(stderr,
-            "champsim_tracer: dead-latch close — closing after %" PRIu64
+            "champsim_tracer: %s close — closing after %" PRIu64
             " user insns (last window; wall %" PRIu64 " ms)\n",
-            g_user_icount, now);
+            why, g_user_icount, now);
     /* A dead process is a process that ended, so report a clean close
      * ("END") rather than an under-budget underrun. */
     g_seg_end_marker_close = true;
     finish_trace_segment(/* prev_executed= */ true, cpu_index);
     g_trace_segments.set_shutting_down();
     return true;
+}
+
+/* Retire one owned root exactly as its END marker would: drop it from the
+ * owned set, drop its asid-keyed dedup-index footprint (its true-BB
+ * templates stay until the templates section is written), forget its
+ * anchors, and repoint the representative if this was it.  Returns the
+ * number of dedup buckets dropped.  Caller holds exec_lock. */
+static uint64_t owned_retire_root_locked(uint64_t root)
+{
+    g_owned.erase(root);
+    g_owned_last_sched.erase(root);
+    pin_anchor_forget(root);
+    g_mutex_lock(&data_lock);
+    uint64_t dropped = g_template_store.reclaim_asid(root);
+    g_mutex_unlock(&data_lock);
+    /* If the retired root was the representative, repoint it to a
+     * still-owned root so pin_effective_asid / cst_pinned_asid_root
+     * stay valid. */
+    if (g_pinned_asid.load(std::memory_order_relaxed) == root &&
+        !g_owned.empty()) {
+        g_pinned_asid.store(*g_owned.begin(), std::memory_order_relaxed);
+    }
+    return dropped;
 }
 
 /*
@@ -4997,21 +5411,7 @@ static bool deadlatch_sweep_wide(uint64_t now, unsigned int cpu_index)
     }
     for (const auto &d : dead) {
         uint64_t root = d.first;
-        g_owned.erase(root);
-        g_owned_last_sched.erase(root);
-        /* Drop the closed process's asid-keyed dedup-index footprint (its
-         * true-BB templates stay until the templates section is written),
-         * as the END handler does. */
-        g_mutex_lock(&data_lock);
-        uint64_t dropped = g_template_store.reclaim_asid(root);
-        g_mutex_unlock(&data_lock);
-        /* If the dead root was the representative, repoint it to a
-         * still-owned root so pin_effective_asid / cst_pinned_asid_root
-         * stay valid. */
-        if (g_pinned_asid.load(std::memory_order_relaxed) == root &&
-            !g_owned.empty()) {
-            g_pinned_asid.store(*g_owned.begin(), std::memory_order_relaxed);
-        }
+        uint64_t dropped = owned_retire_root_locked(root);
         fprintf(stderr,
                 "champsim_tracer: dead-latch close asid=0x%" PRIx64
                 " idle=%" PRIu64 " ms (%zu still tracing, dropped %" PRIu64
@@ -5021,6 +5421,27 @@ static bool deadlatch_sweep_wide(uint64_t now, unsigned int cpu_index)
         return deadlatch_close_segment(now, cpu_index);
     }
     return false;
+}
+
+/*
+ * Retire a root the reuse guard proved recycled (pin_root_reuse_check).  The
+ * process that owned it has ended — the address space now holds someone
+ * else's code — so this is a real END, closed by the same path the dead-latch
+ * sweep and the END marker use.  Caller holds exec_lock; returns true if the
+ * caller should exit(0).
+ */
+static bool pin_root_reuse_close(uint64_t root, unsigned int cpu_index)
+{
+    uint64_t dropped = owned_retire_root_locked(root);
+    fprintf(stderr,
+            "champsim_tracer: root-reuse close asid=0x%" PRIx64
+            " (%zu still tracing, dropped %" PRIu64 " dedup buckets)\n",
+            root, g_owned.size(), dropped);
+    if (!g_owned.empty()) {
+        return false;
+    }
+    return deadlatch_close_segment(deadlatch_now_ms(), cpu_index,
+                                  "root-reuse");
 }
 
 /*
@@ -5203,15 +5624,7 @@ static void deadlatch_clock_check(unsigned int cpu_index, uint64_t live_asid)
     }
     for (const auto &d : dead) {
         uint64_t root = d.first;
-        g_owned.erase(root);
-        g_owned_last_sched.erase(root);
-        g_mutex_lock(&data_lock);
-        uint64_t dropped = g_template_store.reclaim_asid(root);
-        g_mutex_unlock(&data_lock);
-        if (g_pinned_asid.load(std::memory_order_relaxed) == root &&
-            !g_owned.empty()) {
-            g_pinned_asid.store(*g_owned.begin(), std::memory_order_relaxed);
-        }
+        uint64_t dropped = owned_retire_root_locked(root);
         fprintf(stderr,
                 "champsim_tracer: dead-latch close asid=0x%" PRIx64
                 " idle=%" PRIu64 " ms (%zu still tracing, dropped %" PRIu64
@@ -6575,6 +6988,15 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
                     asid_set_user_sig(live_asid, usig);
                 }
             }
+            /* Root-reuse guard: widen this window's anchor set from the
+             * code it actually runs, so the walk does not rest on the
+             * marker page alone.  One relaxed load per owned user TB once
+             * every window has learned CST_PIN_ANCHORS pages — the map is
+             * touched only while some window is still short. */
+            if (user_owned && !g_pin_reuse_guard &&
+                g_anchor_learn_want.load(std::memory_order_relaxed) != 0) {
+                pin_anchor_add(live_asid, cur_tb_tmpl->start_pc);
+            }
             /* Capture widens to every user context in trace-all; the clock
              * (user_owned) stays the marker process. */
             capture_owned = marker_trace_all() ? true : user_owned;
@@ -7749,6 +8171,9 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
             g_pin_repr_sig.store(0, std::memory_order_relaxed);
             if (asid != 0) {
                 pin_repr_seed(pc);
+                /* Root-reuse guard: this process's own code page is the
+                 * identity that outlives its root value. */
+                pin_anchor_seed(asid, pc);
             }
             /* This is the whole-system open under policy=trace-all too: the
              * segment machinery is identical (pin the first process for the
@@ -7779,6 +8204,7 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
                 if (pin_page_sig(pc & PIN_PAGE_MASK, &s)) {
                     sig = s;
                 }
+                pin_anchor_seed(asid, pc);
             }
             /* Fingerprint this additional process from its own marker page
              * (Bug C), refreshing the identity if a hot-path first-sighter
@@ -7916,6 +8342,7 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
         g_pin_repr_vpage = UINT64_MAX;
         g_pin_repr_sig.store(0, std::memory_order_relaxed);
         pin_repr_seed(pc);
+        pin_anchor_seed(asid, pc);
         g_rec_mutex_unlock(&exec_lock);
     }
     /* Record the representative root in the owned set too, so the
@@ -8133,6 +8560,7 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
          * call site (see marker_end_no_close). */
         g_owned.erase(asid);
         g_owned_last_sched.erase(asid);
+        pin_anchor_forget(asid);
         if (!g_owned.empty()) {
             /* Other windows remain open — do NOT close the segment.  Drop
              * only this root: recompute the emitting vCPU's gates/flag so
@@ -9137,6 +9565,9 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     final_stats.marker_handoff_evicted = marker_handoff_evicted();
     final_stats.marker_local_evicted = marker_local_evicted();
     final_stats.marker_local_stale = marker_local_stale();
+    final_stats.marker_cand_restarts = marker_candidate_restarts();
+    final_stats.marker_cand_evicted = marker_candidate_evicted();
+    final_stats.marker_cand_outstanding = marker_candidates_outstanding();
     if (final_stats.marker_run_broken || final_stats.marker_end_no_close ||
         final_stats.wp_session_on_cp ||
         final_stats.marker_fence_session_only ||
@@ -9158,6 +9589,9 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
             final_stats.marker_run_incomplete,
             final_stats.marker_handoff_evicted);
         fflush(stderr);
+    }
+    if (getenv("CST_MKMIG_DIAG")) {
+        marker_handoff_census();
     }
     if (getenv("CST_STATSDBG")) {
         /* Positive control for the paragraph above: the thread-local read

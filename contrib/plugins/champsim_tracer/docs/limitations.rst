@@ -488,6 +488,55 @@ icount budget elapses.  ``latch_timeout=<ms>`` is the opt-in backstop
 interval — but it is off by default because idleness alone cannot
 distinguish a dead process from a merely long-blocked live one.
 
+**A recycled page-table root is recognised by the traced process's own
+code, and that recognition has a blind spot.**  On the wide-register
+targets (x86-64 CR3, AArch64 TTBR, RISC-V SATP) the address-space
+register names a process only while that process is alive; once it
+exits, the kernel is free to hand its freed page-table root to the next
+process that needs one.  The tracer therefore does not trust the root
+value alone: each owned window carries a set of *anchors* — code pages
+of the traced process, recorded as virtual page, physical frame and
+content signature, seeded from the marker's own page and grown from the
+first pages the window executes — and re-walks them in the live address
+space at every committed write of that root, and again on the first
+block of any dwell the walk left unsettled.  A page that still resolves
+to its frame, or whose bytes still match after a re-fault, identifies
+the process; a page mapped at the same virtual address with *different*
+bytes proves the root changed hands, and the window is then retired
+exactly as its END marker would retire it (``pin root reuse detected``
+in the statistics, with the successor's blocks excluded and counted as
+``pin root foreign user TBs dropped``).
+
+Two cases the walk cannot decide, both reported rather than assumed
+away:
+
+* **A successor that maps none of the anchors.**  The architectural
+  page walk cannot distinguish "this virtual address is not part of
+  this address space" from "it is, but the page is not resident", so a
+  successor whose early execution touches no anchor virtual page — and
+  whose page tables have none of them present — is unresolvable.  The
+  guard fails **open** there, because a live process whose text was
+  reclaimed must not lose its window, and counts the event as ``pin
+  root anchors unresolved``.  A successor is therefore excluded from
+  the first block it runs at an anchor's virtual address, not from its
+  first block outright: in the directed reproducer, 6–13 thousand of
+  the successor's user instructions were attributed to the traced
+  process before the walk resolved, against two million with the guard
+  absent.
+* **A successor running the same code at the same address.**  A second
+  instance of the same binary, or a fork of the traced process,
+  presents byte-identical pages at identical virtual addresses.  Page
+  equality is not process identity there, and no amount of hashing user
+  code will separate them — their user code really is the same code.
+  Telling those apart needs a private, written anchor, which the tracer
+  deliberately does not spend a guest write to obtain.
+
+The narrow-ASID target (32-bit MIPS) does not share this bound in the
+same shape: an 8-bit ``EntryHi.ASID`` cannot name a process at all, so
+there the learned page map *is* the identity and is consulted on every
+dwell (see ``pin content-mismatch user TBs dropped``).  Its residual is
+the second case above, unchanged.
+
 **Wrong-path excursions are time-transparent, but not free.**  An
 excursion consumes zero guest time — the guest virtual clock is frozen
 for its duration, the instruction counter is checkpointed under

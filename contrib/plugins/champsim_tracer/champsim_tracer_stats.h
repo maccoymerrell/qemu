@@ -305,6 +305,16 @@ struct Stats {
     uint64_t marker_handoff_evicted = 0;
     uint64_t marker_local_evicted = 0;
     uint64_t marker_local_stale = 0;
+    /* One-word marker candidates: the other sequence's shared word opening a
+     * run that cannot advance.  Every healthy capture on a fixed-width target
+     * produces three per marker (see MK_RUN_IN_FLIGHT in
+     * champsim_tracer_marker_detect.cc), so these are condition counters and
+     * never tripwires — restarts is one replaced by a later word, evicted is
+     * one displaced from the bank, outstanding is how many were still held at
+     * exit. */
+    uint64_t marker_cand_restarts = 0;
+    uint64_t marker_cand_evicted = 0;
+    uint64_t marker_cand_outstanding = 0;
 
     /*
      * rep_unretired_pass_dropped — an empty leading pass of a fan-out
@@ -573,6 +583,36 @@ struct Stats {
     uint64_t pin_refault_repaired = 0;
     uint64_t pin_unverified_dropped = 0;
     uint64_t pin_pages_mapped = 0;
+
+    /* Root-reuse guard, wide-register targets (x86 CR3 / AArch64 TTBR /
+     * RISC-V SATP -- see the ROOT-REUSE GUARD note in champsim_tracer.cc).
+     * Every committed write of an owned root re-walks that window's user
+     * code-page anchors in the live address space.
+     *
+     *   anchors    is how many anchor pages the owned windows learned --
+     *              zero means the walk had nothing to judge by, so a zero
+     *              in the rows below proves nothing;
+     *   verified   is a schedule-in the walk positively identified as the
+     *              same process -- the positive control for the guard;
+     *   unresolved is a schedule-in where no anchor page was mapped in the
+     *              live space, so the guard could say nothing and FAILED
+     *              OPEN (the window stays open; a live process whose text
+     *              was reclaimed must not lose it);
+     *   detected   is a root proven to hold a DIFFERENT process's code --
+     *              the defect this guard exists for.  Nonzero is not a
+     *              tracer fault: it means the traced process ended with its
+     *              window open and the kernel handed its page-table root to
+     *              a successor, whose blocks were excluded (and whose
+     *              window was closed) instead of being recorded as the
+     *              traced process's own. */
+    uint64_t pin_root_anchors = 0;
+    uint64_t pin_root_verified = 0;
+    uint64_t pin_root_anchor_unresolved = 0;
+    uint64_t pin_root_reuse_detected = 0;
+    /* User TBs excluded because the root running them was proven to belong
+     * to a successor process.  These are the instructions the tracer used to
+     * record as the traced process's own. */
+    uint64_t pin_root_foreign_dropped = 0;
 
     /* DEVIO exact-owner attribution (devio=1, system mode; zero otherwise).
      * A doorbell kick is queued on its kicking vCPU's bounded FIFO

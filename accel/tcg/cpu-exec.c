@@ -1843,10 +1843,7 @@ void cpu_plugin_spec_tlb_flush(CPUState *cpu)
     if (cpu->plugin_spec_tlb_log_overflow || getenv("CST_WP_FULLFLUSH")) {
         tlb_flush(cpu);
     } else {
-        for (uint16_t i = 0; i < cpu->plugin_spec_tlb_log_n; i++) {
-            tlb_flush_page_by_mmuidx(cpu, cpu->plugin_spec_tlb_log[i].page,
-                                     1 << cpu->plugin_spec_tlb_log[i].mmu_idx);
-        }
+        cpu_plugin_spec_tlb_flush_logged(cpu);
     }
     cpu->plugin_spec_tlb_log_n = 0;
     cpu->plugin_spec_tlb_log_overflow = false;
@@ -1881,6 +1878,9 @@ void cpu_plugin_spec_tlb_flush_enter(CPUState *cpu)
     tlb_flush(cpu);
 #else
     (void)cpu;
+#endif
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+    cpu_plugin_spec_tlb_note(cpu);
 #endif
 }
 

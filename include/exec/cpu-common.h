@@ -71,6 +71,15 @@ typedef enum SpecClockResyncReason {
 } SpecClockResyncReason;
 void cpu_plugin_spec_tlb_flush(CPUState *cpu);
 void cpu_plugin_spec_tlb_flush_enter(CPUState *cpu);
+#ifdef CONFIG_PLUGIN
+/*
+ * Excursion-scoped softmmu TLB bookkeeping: _note snapshots the per-mmu_idx
+ * large-page escalation region at entry; _flush_logged invalidates exactly the
+ * entries the wrong path installed and restores that region at exit.
+ */
+void cpu_plugin_spec_tlb_note(CPUState *cpu);
+void cpu_plugin_spec_tlb_flush_logged(CPUState *cpu);
+#endif
 bool cpu_plugin_spec_mode_supported(void);
 void cpu_plugin_vclock_pause(CPUState *cpu);
 void cpu_plugin_vclock_resume(CPUState *cpu);

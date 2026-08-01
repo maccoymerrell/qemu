@@ -1065,10 +1065,25 @@ static void plugin_spec_tlb_log_add(CPUState *cpu, int mmu_idx, vaddr page,
     if (cpu->plugin_spec_tlb_log_overflow) {
         return;
     }
-    if (large_page) {
-        cpu->plugin_spec_tlb_log_overflow = true;
-        return;
-    }
+    /*
+     * A large-page install used to force the overflow fallback: a full
+     * tlb_flush() of every mmu_idx plus the jump cache, on excursion exit.
+     * On x86-64 the kernel direct map and kernel text are 2 MiB mappings, so
+     * essentially every wrong-path walk touches one -- measured, 96% of
+     * excursions ended in the full flush this selective path exists to avoid.
+     *
+     * The escalation was never needed for the entries the walk INSTALLED.
+     * QEMU's softmmu TLB holds one entry per TARGET_PAGE whatever the guest's
+     * page size, so a large-page install still creates exactly one entry, at
+     * addr_page, and that is the only thing the excursion has to take back.
+     * What the large page really affects is the per-mmu_idx large_page_addr /
+     * large_page_mask bookkeeping that tlb_flush_page_locked consults to decide
+     * whether a page flush must escalate; that pair is snapshotted at excursion
+     * entry and restored at exit (cpu_plugin_spec_tlb_note /
+     * cpu_plugin_spec_tlb_flush_logged), so a wrong-path install cannot widen
+     * the correct path's escalation region either.
+     */
+    (void)large_page;
     for (uint16_t i = 0; i < cpu->plugin_spec_tlb_log_n; i++) {
         if (cpu->plugin_spec_tlb_log[i].page == page &&
             cpu->plugin_spec_tlb_log[i].mmu_idx == mmu_idx) {
@@ -1084,6 +1099,61 @@ static void plugin_spec_tlb_log_add(CPUState *cpu, int mmu_idx, vaddr page,
     cpu->plugin_spec_tlb_log_n++;
 }
 #endif
+
+static vaddr g_spec_lp_addr[NB_MMU_MODES];
+static vaddr g_spec_lp_mask[NB_MMU_MODES];
+static bool  g_spec_lp_saved;
+
+/*
+ * Snapshot the per-mmu_idx large-page escalation region at excursion entry.
+ * tlb_add_large_page() only ever WIDENS it, so a wrong-path install would
+ * widen it permanently and escalate unrelated correct-path page flushes into
+ * full flushes long after the walk was discarded.
+ */
+void cpu_plugin_spec_tlb_note(CPUState *cpu)
+{
+    for (int i = 0; i < NB_MMU_MODES; i++) {
+        g_spec_lp_addr[i] = cpu->neg.tlb.d[i].large_page_addr;
+        g_spec_lp_mask[i] = cpu->neg.tlb.d[i].large_page_mask;
+    }
+    g_spec_lp_saved = true;
+}
+
+/*
+ * Invalidate exactly the entries the excursion installed, and put the
+ * large-page bookkeeping back.  Deliberately does NOT route through
+ * tlb_flush_page_locked: that helper escalates to a full per-mmu_idx flush
+ * for any page inside the large-page region, which on x86 is most of the
+ * kernel.  Here the caller knows precisely which single entries exist to
+ * remove, so it removes them, with the same two primitives the helper's
+ * non-escalating branch uses.
+ */
+void cpu_plugin_spec_tlb_flush_logged(CPUState *cpu)
+{
+    CPUTLB *tlb = &cpu->neg.tlb;
+
+    qemu_spin_lock(&tlb->c.lock);
+    for (uint16_t i = 0; i < cpu->plugin_spec_tlb_log_n; i++) {
+        int midx = cpu->plugin_spec_tlb_log[i].mmu_idx;
+        vaddr page = cpu->plugin_spec_tlb_log[i].page;
+
+        if (midx < 0 || midx >= NB_MMU_MODES) {
+            continue;
+        }
+        if (tlb_flush_entry_locked(tlb_entry(cpu, midx, page), page)) {
+            tlb_n_used_entries_dec(cpu, midx);
+        }
+        tlb_flush_vtlb_page_locked(cpu, midx, page);
+    }
+    if (g_spec_lp_saved) {
+        for (int i = 0; i < NB_MMU_MODES; i++) {
+            tlb->d[i].large_page_addr = g_spec_lp_addr[i];
+            tlb->d[i].large_page_mask = g_spec_lp_mask[i];
+        }
+        g_spec_lp_saved = false;
+    }
+    qemu_spin_unlock(&tlb->c.lock);
+}
 
 /*
  * Add a new TLB entry. At most one entry for a given virtual address

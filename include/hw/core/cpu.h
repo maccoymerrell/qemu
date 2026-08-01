@@ -27,6 +27,7 @@
 #include "exec/vaddr.h"
 #include "exec/memattrs.h"
 #include "exec/mmu-access-type.h"
+#include "exec/plugin-spec.h"
 #include "exec/tlb-common.h"
 #include "qapi/qapi-types-machine.h"
 #include "qapi/qapi-types-run-state.h"
@@ -683,6 +684,22 @@ struct CPUState {
     void *plugin_spec_store_pool;             /* PluginSpecLine[] */
     size_t plugin_spec_store_pool_used;       /* high water in pool */
     size_t plugin_spec_store_pool_cap;        /* allocated slots */
+#ifdef CONFIG_PLUGIN
+    /*
+     * Discard target for a speculative atomic RMW that could not be given a
+     * sandbox line (the line pool is at PLUGIN_SPEC_STORE_LINE_MAX and this
+     * line is not already tracked).  The RMW needs somewhere real to operate
+     * — the host atomic primitives write through the pointer they are handed
+     * — and the one place it must never be is guest memory, so it is pointed
+     * at this scratch line instead and the result is dropped, which is how a
+     * capped speculative *store* already degrades.  Per-vCPU rather than
+     * thread-local: under round-robin TCG several vCPUs share one host
+     * thread, and a discard buffer that is shared across vCPUs is a fact a
+     * reader has to re-derive as harmless every time.  See
+     * spec_atomic_shadow() in accel/tcg/internal-common.h.
+     */
+    PluginSpecLine plugin_spec_atomic_scratch;
+#endif
     /* Set when a single wrong-path excursion's speculative-store footprint
      * crosses PLUGIN_SPEC_STORE_SOFT_BUDGET lines — a garbage-size memop the
      * wrong path executed without faulting (it is buffered, not real).  The WP

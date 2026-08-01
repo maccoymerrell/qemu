@@ -1562,21 +1562,14 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
      * into the speculative sandbox.
      */
     if (cpu_plugin_spec_active(cpu)) {
-        void *shadow = spec_atomic_shadow(cpu, addr, ret, size);
-        if (shadow) {
-            return shadow;
-        }
         /*
-         * Sandbox capped: NEVER fall through to the real host pointer (a
-         * wrong-path RMW must not mutate real guest memory).  Discard the
-         * RMW into a per-thread scratch line seeded from the real bytes,
-         * mirroring the softmmu twin in cputlb.c atomic_mmu_lookup.
+         * spec_atomic_shadow never hands @ret back: a capped sandbox discards
+         * the RMW into the per-vCPU scratch line rather than let it run on
+         * real guest memory.  There is nothing to fall through to — and here
+         * least of all, since user mode has no softmmu TLB and therefore no
+         * TLB_FORCE_SLOW backstop underneath this decision.
          */
-        static __thread PluginSpecLine spec_atomic_scratch;
-        unsigned soff = (unsigned)(addr & PLUGIN_SPEC_LINE_MASK);
-        memcpy(spec_atomic_scratch.bytes,
-               (const uint8_t *)ret - soff, PLUGIN_SPEC_LINE_SIZE);
-        return &spec_atomic_scratch.bytes[soff];
+        return spec_atomic_shadow(cpu, addr, ret, size);
     }
 #endif
 

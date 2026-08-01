@@ -771,15 +771,28 @@ spec store buffer
    the real-memory ``notdirty_write`` / watchpoint side effects.
 
    When the line pool is at ``PLUGIN_SPEC_STORE_LINE_MAX`` and no
-   shadow line can be allocated, both copies discard the RMW into a
-   per-thread scratch line seeded from the real bytes.  No path falls
-   back to the real host pointer: a wrong-path atomic cannot mutate
-   guest memory even under sandbox exhaustion.  The cost is
-   store-to-load forwarding for that one line — the same degradation
-   the plain store path takes when a capped pool drops a store.
+   shadow line can be allocated, ``spec_atomic_shadow`` points the RMW
+   at the per-vCPU scratch line
+   ``CPUState::plugin_spec_atomic_scratch``, seeded with the same
+   baseline bytes, and the result is discarded.  It never returns the
+   real host pointer and offers its callers no way to obtain one, so a
+   wrong-path atomic cannot mutate guest memory even under sandbox
+   exhaustion.  The cost is store-to-load forwarding for that one
+   access — the same degradation the plain store path takes when a
+   capped pool drops a store.
 
-   As with the store buffer this is ISA-generic and fixes user-mode
-   wrong-path atomics too.
+   The distinction is worth stating plainly, because the two
+   degradations sound interchangeable and are not.  A dropped
+   speculative *store* writes nothing.  An atomic handed the real
+   pointer would perform a real read-modify-write on real guest memory
+   from the wrong path — architectural mutation that no rollback
+   undoes.  "Drop the atomic" means discard it, never execute it
+   somewhere real.
+
+   As with the store buffer this is ISA-generic and covers user-mode
+   wrong-path atomics too — and matters most there, since user mode has
+   no softmmu TLB and therefore no ``TLB_FORCE_SLOW`` routing
+   underneath the decision.
 
 Bounding wrong-path: no speculation without paging
 --------------------------------------------------

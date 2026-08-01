@@ -2182,16 +2182,10 @@ static void *spec_atomic_absent(CPUState *cpu, vaddr addr, int size,
     }
     uint8_t garbage[16];
     plugin_spec_garbage_fill(garbage, size, addr);
-    void *shadow = spec_atomic_shadow(cpu, addr, garbage, size);
-    if (shadow) {
-        return shadow;
-    }
-    /* Sandbox capped: discard the RMW into a garbage-seeded scratch line, as
-     * the present-page capped path does with a real-memory seed. */
-    static __thread PluginSpecLine scratch;
-    unsigned soff = (unsigned)(addr & PLUGIN_SPEC_LINE_MASK);
-    plugin_spec_garbage_fill(&scratch.bytes[soff], size, addr);
-    return &scratch.bytes[soff];
+    /* A capped sandbox is handled inside spec_atomic_shadow (per-vCPU scratch
+     * line, seeded from the placeholder bytes passed here); there is no page
+     * to fall back to in any case. */
+    return spec_atomic_shadow(cpu, addr, garbage, size);
 }
 #endif
 
@@ -2302,24 +2296,12 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
      * watchpoint delivery) — none of which apply to a discarded write.
      */
     if (cpu_plugin_spec_active(cpu)) {
-        void *shadow = spec_atomic_shadow(cpu, addr, hostaddr, size);
-        if (shadow) {
-            return shadow;
-        }
         /*
-         * Sandbox capped: NEVER fall through to the real host pointer (a
-         * wrong-path RMW must not mutate real guest memory).  Discard the
-         * RMW into a per-thread scratch line, seeded from the real bytes so
-         * the compare/exchange still behaves; we lose store->load forwarding
-         * for this one line, exactly as the spec_store path drops a store on
-         * a capped pool.  This keeps the wrong-path side-effect-free even
-         * under sandbox exhaustion.
+         * spec_atomic_shadow never hands @hostaddr back: a capped sandbox
+         * discards the RMW into the per-vCPU scratch line rather than let it
+         * run on real guest memory.  There is nothing to fall through to.
          */
-        static __thread PluginSpecLine spec_atomic_scratch;
-        unsigned soff = (unsigned)(addr & PLUGIN_SPEC_LINE_MASK);
-        memcpy(spec_atomic_scratch.bytes,
-               (const uint8_t *)hostaddr - soff, PLUGIN_SPEC_LINE_SIZE);
-        return &spec_atomic_scratch.bytes[soff];
+        return spec_atomic_shadow(cpu, addr, hostaddr, size);
     }
 #endif
 

@@ -203,10 +203,25 @@ static inline void spec_store_bytes(CPUState *cpu, vaddr addr,
  * A naturally-aligned atomic of size <= 16 never crosses a 64-byte line,
  * so idx + size <= 64 and the returned pointer carries the same
  * alignment the guest access guaranteed (PluginSpecLine is 16-aligned
- * with bytes[] at offset 0 — see plugin-spec.h).  Returns NULL when the
- * sandbox line cap is reached; the caller falls back to the real
- * pointer, bounding a dropped speculative atomic exactly as a dropped
- * speculative store is bounded.
+ * with bytes[] at offset 0 — see plugin-spec.h).
+ *
+ * Never returns NULL, and deliberately offers no way for a caller to obtain
+ * the real pointer.  When the line pool is at PLUGIN_SPEC_STORE_LINE_MAX the
+ * RMW is pointed at a per-vCPU scratch line
+ * (CPUState::plugin_spec_atomic_scratch) seeded with the same @size baseline
+ * bytes, so the operation still computes and still compares against the value
+ * it would have seen — the result is simply discarded instead of being
+ * forwarded to later speculative loads.  That is a genuinely dropped atomic,
+ * degrading exactly as a store dropped by a capped pool does.
+ *
+ * Falling back to @real_host would NOT be that.  spec_store_byte and
+ * spec_store_bytes write nothing when the pool is capped; an atomic handed
+ * the real pointer performs a real read-modify-write on real guest memory
+ * from the wrong path — the precise mutation of architectural state this
+ * sandbox exists to prevent, and one no rollback undoes.  The two are not
+ * equivalent degradations, and both copies of atomic_mmu_lookup used to make
+ * that trade (fixed in 56b89345b2, which this consolidates so the choice is
+ * no longer at a caller's discretion).
  */
 static inline void *spec_atomic_shadow(CPUState *cpu, vaddr addr,
                                        const void *real_host, int size)
@@ -215,7 +230,26 @@ static inline void *spec_atomic_shadow(CPUState *cpu, vaddr addr,
     unsigned idx     = (unsigned)(addr & PLUGIN_SPEC_LINE_MASK);
     PluginSpecLine *line = spec_line_get_or_alloc(cpu, line_addr);
     if (!line) {
-        return NULL;
+        /*
+         * Capped: discard the RMW into the per-vCPU scratch line.  Only the
+         * @size accessed bytes matter — an atomic helper reads and writes
+         * exactly the object it was handed — so seed just those, at the same
+         * intra-line offset, which preserves the alignment the guest access
+         * guaranteed.  Store-to-load forwarding is lost for this one access:
+         * a later speculative load of these bytes reads real memory, the same
+         * baseline a dropped speculative store leaves behind.
+         */
+        line = &cpu->plugin_spec_atomic_scratch;
+        memcpy(&line->bytes[idx], real_host, size);
+        /*
+         * Every caller has already rejected a non-naturally-aligned @addr, so
+         * @idx is size-aligned and the result is aligned iff the scratch line
+         * is.  The 16-byte host primitives (cmpxchg16b, LDXP/STXP) fault on a
+         * misaligned operand: say so here rather than as a SIGSEGV inside the
+         * atomic helper.  Cold path — only reached with the pool capped.
+         */
+        g_assert(((uintptr_t)&line->bytes[idx] & (size - 1)) == 0);
+        return &line->bytes[idx];
     }
     const uint8_t *src = real_host;
     for (int k = 0; k < size; k++) {

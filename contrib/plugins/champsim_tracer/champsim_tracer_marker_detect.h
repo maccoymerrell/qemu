@@ -112,10 +112,44 @@ static inline void marker_udata_unpack(void *udata, uint64_t *pc,
 /* Read-only peek at @asid's current run (diagnostics only); null if none. */
 const MarkerExecRun *marker_run_peek(const MarkerRunSet *set, uint64_t asid);
 
-/* Advance the current address space's execution-time run with this marker-
+/*
+ * Which sequence a run set tracks.  The cross-vCPU handoff table (below)
+ * keeps one bank per sequence, so a START run can never adopt an END run's
+ * partial state.
+ */
+enum MarkerWhich { MARKER_WHICH_START = 0, MARKER_WHICH_END = 1 };
+
+/*
+ * Advance the current address space's execution-time run with this marker-
  * word execution; returns true when that run reaches full sequence length.
  * Runs are kept per address space (see MarkerRunSet) so a concurrently
- * injected marker in a different address space does not reset this one. */
-bool marker_exec_step(MarkerRunSet *set, uint64_t pc, uint8_t size);
+ * injected marker in a different address space does not reset this one.
+ *
+ * CROSS-vCPU HANDOFF.  A run set is per vCPU thread (thread_local), but a
+ * guest task is not: the kernel can preempt it between two marker
+ * instructions and resume it on ANOTHER vCPU, which owns a different run
+ * set.  The sequence would then be split — no set ever reaches full length
+ * and the marker is MISSED with no counter to show for it.  So every
+ * advance also publishes (asid, next_pc, run) into a small process-wide
+ * handoff bank, and a word that finds no live LOCAL run adopts a published
+ * partial run whose next_pc it matches exactly.  A local live run always
+ * wins, so single-vCPU behaviour — and every trace produced on it — is
+ * unchanged; the adoption path can only fire where the local set has
+ * nothing, which is exactly the migration case.
+ */
+bool marker_exec_step(MarkerRunSet *set, uint64_t pc, uint8_t size,
+                      MarkerWhich which);
+
+/* Correct-path runs that were RESET mid-sequence (a marker word arrived
+ * where a live run for the same address space expected a different pc).
+ * A healthy compiled-in marker never does this; nonzero means a sequence
+ * was broken between its instructions.  Read by the stats report. */
+uint64_t marker_runs_broken(void);
+/* Runs adopted from another vCPU's partial sequence (the handoff above).
+ * Condition counter for the migration case. */
+uint64_t marker_runs_adopted(void);
+/* Partial runs still outstanding: a marker sequence that started and never
+ * completed.  Read at plugin exit; must be 0. */
+uint64_t marker_runs_incomplete(void);
 
 #endif /* CHAMPSIM_TRACER_MARKER_DETECT_H */

@@ -91,11 +91,136 @@ const MarkerExecRun *marker_run_peek(const MarkerRunSet *set, uint64_t asid)
     return nullptr;
 }
 
-bool marker_exec_step(MarkerRunSet *set, uint64_t pc, uint8_t size)
+/*
+ * Process-wide handoff bank, one per sequence: the last published partial
+ * run per address space.  A guest task preempted between two marker
+ * instructions can resume on a different vCPU, whose thread_local run set
+ * knows nothing about the sequence in flight; without this, that sequence
+ * is silently lost.  Small, mutex-guarded, and touched only when a marker
+ * word actually executes (three per marker), so it is off every hot path.
+ */
+struct MarkerHandoff {
+    uint64_t asid = 0;
+    uint64_t next_pc = 0;
+    uint32_t run = 0;
+    uint32_t used = 0;
+};
+static constexpr int MK_HANDOFF_SLOTS = 8;
+static MarkerHandoff g_handoff[2][MK_HANDOFF_SLOTS];
+static uint32_t g_handoff_tick[2];
+static GMutex g_handoff_lock;
+static uint64_t g_marker_runs_broken;      /* CP run reset mid-sequence */
+static uint64_t g_marker_runs_adopted;     /* runs picked up across vCPUs */
+
+uint64_t marker_runs_broken(void)
+{
+    return g_marker_runs_broken;
+}
+
+uint64_t marker_runs_adopted(void)
+{
+    return g_marker_runs_adopted;
+}
+
+uint64_t marker_runs_incomplete(void)
+{
+    /* Sequences that advanced at least once and never completed: every
+     * advance publishes into the bank and a completion clears it, so a
+     * slot still holding a partial run is a sequence that started and was
+     * lost.  This is the tripwire for the silent miss — a marker whose
+     * instructions were split apart and never rejoined. */
+    uint64_t n = 0;
+    g_mutex_lock(&g_handoff_lock);
+    for (int b = 0; b < 2; b++) {
+        for (int i = 0; i < MK_HANDOFF_SLOTS; i++) {
+            if (g_handoff[b][i].run > 0) {
+                n++;
+            }
+        }
+    }
+    g_mutex_unlock(&g_handoff_lock);
+    return n;
+}
+
+/* Publish @asid's partial run; run == 0 clears the slot. */
+static void handoff_publish(int bank, uint64_t asid, uint64_t next_pc,
+                            uint32_t run)
+{
+    g_mutex_lock(&g_handoff_lock);
+    int victim = 0;
+    uint32_t victim_age = UINT32_MAX;
+    for (int i = 0; i < MK_HANDOFF_SLOTS; i++) {
+        MarkerHandoff &h = g_handoff[bank][i];
+        if (h.run > 0 && h.asid == asid) {
+            victim = i;
+            victim_age = 0;
+            break;
+        }
+        uint32_t age = (h.run == 0) ? 0 : h.used;
+        if (age < victim_age) {
+            victim_age = age;
+            victim = i;
+        }
+    }
+    MarkerHandoff &h = g_handoff[bank][victim];
+    h.asid = asid;
+    h.next_pc = next_pc;
+    h.run = run;
+    h.used = ++g_handoff_tick[bank];
+    g_mutex_unlock(&g_handoff_lock);
+}
+
+/* Adopt @asid's published partial run if it expects exactly @pc.  Returns
+ * the adopted run length (0 = nothing to adopt) and consumes the slot. */
+static uint32_t handoff_adopt(int bank, uint64_t asid, uint64_t pc)
+{
+    uint32_t got = 0;
+    g_mutex_lock(&g_handoff_lock);
+    for (int i = 0; i < MK_HANDOFF_SLOTS; i++) {
+        MarkerHandoff &h = g_handoff[bank][i];
+        if (h.run > 0 && h.asid == asid && h.next_pc == pc) {
+            got = h.run;
+            h.run = 0;
+            break;
+        }
+    }
+    g_mutex_unlock(&g_handoff_lock);
+    return got;
+}
+
+/*
+ * Directed controls for the cross-vCPU handoff (diagnostic, off by default).
+ *   CST_FENCE_FORCE_SPLIT — after every non-final advance, wipe the LOCAL
+ *     run, so the next word must be adopted from the handoff bank: the
+ *     migration case, forced on every sequence.
+ *   CST_FENCE_NO_HANDOFF  — refuse to adopt, i.e. the pre-handoff code.
+ * The pair is the positive control: FORCE_SPLIT alone must still detect
+ * every sequence; FORCE_SPLIT with NO_HANDOFF must lose them all.
+ */
+static bool handoff_force_split(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        v = getenv("CST_FENCE_FORCE_SPLIT") ? 1 : 0;
+    }
+    return v != 0;
+}
+static bool handoff_disabled(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        v = getenv("CST_FENCE_NO_HANDOFF") ? 1 : 0;
+    }
+    return v != 0;
+}
+
+bool marker_exec_step(MarkerRunSet *set, uint64_t pc, uint8_t size,
+                      MarkerWhich which)
 {
     if (qemu_plugin_get_priv_level() != 0) {
         return false;                       /* user-space stream only */
     }
+    int bank = (which == MARKER_WHICH_END) ? 1 : 0;
     uint64_t asid = qemu_plugin_get_addr_space_id();
     uint32_t now = ++set->tick;
     MarkerExecRun *r = marker_run_slot(set, asid);
@@ -103,13 +228,36 @@ bool marker_exec_step(MarkerRunSet *set, uint64_t pc, uint8_t size)
     if (r->run > 0 && pc == r->next_pc) {
         r->run++;
     } else {
-        r->run = 1;
+        if (r->run > 0) {
+            /* A live run for this address space expected a different pc:
+             * the sequence was broken between its instructions.  Named,
+             * never silent (see marker_runs_broken). */
+            g_marker_runs_broken++;
+            r->run = 1;
+        } else {
+            /* No local run.  A sequence that started on ANOTHER vCPU is
+             * resumed here after a migration; adopt it when its published
+             * continuation is exactly this pc. */
+            uint32_t adopted = handoff_disabled()
+                ? 0 : handoff_adopt(bank, asid, pc);
+            if (adopted) {
+                g_marker_runs_adopted++;
+                r->run = adopted + 1;
+            } else {
+                r->run = 1;
+            }
+        }
     }
     r->used = now;
     r->next_pc = pc + size;
     if (r->run >= g_marker_seq.n_insns) {
         r->run = 0;
+        handoff_publish(bank, asid, 0, 0);
         return true;
+    }
+    handoff_publish(bank, asid, r->next_pc, r->run);
+    if (handoff_force_split()) {
+        r->run = 0;                         /* forced migration (control) */
     }
     return false;
 }

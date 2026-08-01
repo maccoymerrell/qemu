@@ -16,6 +16,26 @@
 
 #include "champsim_tracer.h"
 
+/*
+ * Default user-clock stall ceiling (see PluginConfig::stall_ceiling), and
+ * the level at which the developing stall is first reported.
+ *
+ * Both numbers are measured, not guessed (cst_runs/fence, 304 contended
+ * marker cells on the devio fixture): a healthy capture's worst stall is
+ * 2.2e5 architectural instructions (the fsync path, measured by the
+ * user_clock_worst_stall counter this ceiling shares), while cells that hit
+ * the tick-saturation treadmill stall for tens of millions and STILL
+ * recover — the largest recovery observed was 1.25e8 instructions, while
+ * the cells that never recovered were still stalled at 1.6e8 when their
+ * 900-second cap ended them.  The ceiling is set at twice the largest
+ * recovery on record (~1200x anything healthy), so it does not truncate a
+ * capture that would have finished, and it ends the case that otherwise
+ * never would.  The warning level is where an operator wants to
+ * know a stall is developing, long before the ceiling acts.
+ */
+#define CST_STALL_CEILING_DEFAULT 256000000ull
+#define CST_STALL_WARN_DEFAULT     32000000ull
+
 struct PluginConfig {
     int       wp_depth          = 64;
     /* Wrong-path pruning level (wpprune=N): skip WP simulation for cold
@@ -198,6 +218,29 @@ struct PluginConfig {
      * their END marker and the icount budget is too coarse a fallback.
      */
     uint64_t latch_timeout_ms = 0;
+
+    /*
+     * User-clock stall ceiling (stall_ceiling=<arch insns>, 0 disables).
+     *
+     * A marker window's budget runs on the pinned process's USER
+     * instruction clock, and that clock only advances while the pinned
+     * process executes user-space code.  If the process stops returning to
+     * user space — it is alive, on-CPU and retiring kernel instructions,
+     * but never completes the syscall it is in — the budget can never be
+     * reached and the END marker can never execute, so NOTHING ends the
+     * segment: the run is unbounded.  Measured, not hypothesised
+     * (cst_runs/fence: the traced process alive, __state=0, on_rq=1,
+     * nvcsw=0, user clock frozen at 0 for the whole cap).
+     *
+     * The ceiling bounds it with an architectural, load-invariant count:
+     * how many instructions the guest may retire IN A CONTEXT THIS TRACE
+     * OWNS without the pinned process advancing its user clock.  Foreign
+     * processes do not count (the churn stress idles the pin by design),
+     * so the ceiling measures exactly "the traced process is running and
+     * not coming back".  On crossing, the segment closes the same way its
+     * budget would, loudly and with the trace finalised.
+     */
+    uint64_t stall_ceiling = CST_STALL_CEILING_DEFAULT;
 };
 
 /* Parse plugin args.  Returns true on success; on failure prints to

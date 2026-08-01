@@ -365,6 +365,38 @@ int g_xlate_bypass_priv = -1;
  */
 static uint64_t g_user_icount = 0;       /* counted user-space insns so far */
 
+/*
+ * USER-CLOCK STALL CEILING (stall_ceiling=<arch insns>; see PluginConfig).
+ * The marker window's budget runs on g_user_icount, which advances only
+ * while the pinned process executes user-space code.  A process that is
+ * alive and on-CPU but never returns to user space therefore freezes the
+ * budget AND can never execute its END marker: nothing closes the segment
+ * and the run is unbounded.  These counters bound it architecturally —
+ * instructions retired in an owned context since the pinned user clock
+ * last moved, per vCPU (a generation stamp reseats every vCPU's base when
+ * any of them advances the clock).  Owned contexts only: a foreign
+ * process running while the pin idles is not a stall.  All of it is
+ * touched under exec_lock, from the correct-path step.
+ */
+static uint64_t g_stall_ceiling = CST_STALL_CEILING_DEFAULT;
+static uint64_t g_stall_last_uic = 0;
+static uint64_t g_stall_gen = 0;
+static uint64_t g_stall_seen_gen[CST_PIN_MAX_VCPUS];
+static uint64_t g_stall_base[CST_PIN_MAX_VCPUS];
+static bool     g_stall_ceiling_fired = false;
+static bool     g_stall_warned = false;
+
+static inline void user_clock_stall_reset(void)
+{
+    g_stall_last_uic = 0;
+    g_stall_gen++;
+    g_stall_ceiling_fired = false;
+    g_stall_warned = false;
+    for (unsigned i = 0; i < CST_PIN_MAX_VCPUS; i++) {
+        g_stall_seen_gen[i] = 0;
+    }
+}
+
 /* Set when the segment is closed by the guest's end marker (the workload
  * finished under budget by design) so the finish printout reports END
  * rather than an UNDER underrun. */
@@ -391,6 +423,128 @@ static thread_local uint64_t tls_mkdiag_susp_user = 0;
 static thread_local uint64_t tls_mkdiag_foreign_user = 0;
 
 /*
+ * FENCE LANE INSTRUMENTATION (diagnostic only; every hook is off unless its
+ * environment variable is set, and none of them changes a byte of the trace).
+ *
+ * CST_FENCE_DIAG=<seconds>  heartbeat: print the window state, the pinned
+ *   process's user clock, the retired-instruction clock, the three wrong-path
+ *   fence flags and the END-marker callback census every <seconds> of host
+ *   time.  A window that never closes then leaves a durable record even when
+ *   the cell is killed at its cap.
+ * CST_FENCE_FORCE_END=1     defect simulator: force EVERY end-marker
+ *   invocation down the fence's drop path while a segment is open — a leaked
+ *   fence flag, reproduced on demand, so the signature of a suppressed
+ *   correct-path END can be compared against the real non-closing cells.
+ */
+static inline int64_t fence_diag_period_ns(void)
+{
+    static std::atomic<long long> v{-1};
+    long long x = v.load(std::memory_order_relaxed);
+    if (x < 0) {
+        const char *e = getenv("CST_FENCE_DIAG");
+        double s = (e && *e) ? strtod(e, nullptr) : 0.0;
+        x = (long long)(s * 1e9);
+        if (e && *e && x <= 0) {
+            x = 5000000000LL;                /* bare CST_FENCE_DIAG=1 -> 5 s */
+        }
+        v.store(x, std::memory_order_relaxed);
+    }
+    return (int64_t)x;
+}
+static inline bool fence_diag(void)
+{
+    return fence_diag_period_ns() > 0;
+}
+static inline bool fence_force_end(void)
+{
+    static std::atomic<int> v{-1};
+    int x = v.load(std::memory_order_relaxed);
+    if (x < 0) {
+        x = getenv("CST_FENCE_FORCE_END") ? 1 : 0;
+        v.store(x, std::memory_order_relaxed);
+    }
+    return x != 0;
+}
+
+/* One END-marker callback invocation, recorded BEFORE the fence decides. */
+struct FenceEndRec {
+    uint64_t pc = 0;
+    uint64_t asid = 0;
+    uint64_t uic = 0;             /* pinned user clock at the invocation */
+    uint64_t ms = 0;              /* monotonic host ms */
+    int      priv = -1;
+    uint8_t  flags = 0;           /* 1 spec | 2 wp | 4 sess | 8 forced */
+    uint8_t  run_after = 0;       /* adjacency run after the step (CP only) */
+    bool     fenced = false;
+};
+static constexpr unsigned FDIAG_RING = 256;
+static FenceEndRec g_fdiag_end_ring[FDIAG_RING];
+static unsigned g_fdiag_end_head = 0;
+static uint64_t g_fdiag_end_total = 0;
+static uint64_t g_fdiag_end_fenced = 0;
+static uint64_t g_fdiag_end_fenced_user = 0;   /* fenced at USER privilege */
+static uint64_t g_fdiag_end_cp = 0;            /* reached the run machine */
+static uint64_t g_fdiag_start_total = 0;
+static uint64_t g_fdiag_start_fenced = 0;
+static uint64_t g_fdiag_end_printed = 0;       /* ring entries already shown */
+static uint64_t g_fdiag_start_runs = 0;        /* completed CP START runs */
+static uint64_t g_fdiag_end_runs = 0;          /* completed CP END runs */
+
+static inline void fence_note_end(uint64_t pc, uint64_t asid, int priv,
+                                  uint8_t flags, bool fenced,
+                                  uint8_t run_after)
+{
+    g_fdiag_end_total++;
+    if (fenced) {
+        g_fdiag_end_fenced++;
+        if (priv == 0) {
+            g_fdiag_end_fenced_user++;
+        }
+    } else {
+        g_fdiag_end_cp++;
+    }
+    FenceEndRec &r = g_fdiag_end_ring[g_fdiag_end_head % FDIAG_RING];
+    r.pc = pc;
+    r.asid = asid;
+    r.uic = g_user_icount;
+    r.ms = deadlatch_now_ms();
+    r.priv = priv;
+    r.flags = flags;
+    r.fenced = fenced;
+    r.run_after = run_after;
+    g_fdiag_end_head++;
+}
+
+/* Print every END-marker invocation the census has not shown yet: the direct
+ * answer to "did the end marker execute, on which path, at what user clock,
+ * and did the fence drop it".  Flushed on the heartbeat, at the close, and
+ * at plugin exit. */
+static void fence_flush_end_ring(void)
+{
+    if (!fence_diag()) {
+        return;
+    }
+    uint64_t first = g_fdiag_end_head > FDIAG_RING
+                     ? g_fdiag_end_head - FDIAG_RING : 0;
+    if (g_fdiag_end_printed < first) {
+        fprintf(stderr, "[fence]   (%" PRIu64 " END records lost from the "
+                "ring)\n", first - g_fdiag_end_printed);
+        g_fdiag_end_printed = first;
+    }
+    while (g_fdiag_end_printed < g_fdiag_end_head) {
+        const FenceEndRec &r =
+            g_fdiag_end_ring[g_fdiag_end_printed % FDIAG_RING];
+        fprintf(stderr, "[fence]   END#%" PRIu64 " ms=%" PRIu64
+                " pc=0x%" PRIx64 " priv=%d asid=0x%" PRIx64 " uic=%" PRIu64
+                " %s flags=0x%x run_after=%u\n",
+                g_fdiag_end_printed, r.ms, r.pc, r.priv, r.asid, r.uic,
+                r.fenced ? "FENCED" : "CP", r.flags, r.run_after);
+        g_fdiag_end_printed++;
+    }
+    fflush(stderr);
+}
+
+/*
  * Reset the user clock at a pin/segment boundary.  The per-vCPU seen
  * cursors (scoreboard user_seen; each vCPU's fold computes its delta
  * against its OWN insn_count slot) start over: the calling vCPU's cursor
@@ -404,6 +558,7 @@ static inline void user_count_reset(unsigned int cpu_index,
                                     uint64_t insn_count_now)
 {
     g_user_icount = 0;
+    user_clock_stall_reset();
     g_deadlatch_checked_uic = 0;
     for (int i = 0, n = qemu_plugin_num_vcpus(); i < n; i++) {
         qemu_plugin_u64_set(g_scoreboard.user_seen, (unsigned)i,
@@ -5458,6 +5613,66 @@ static void tw_manage_window(unsigned int cpu_index,
         uint64_t budget_stop = marker_pinned
             ? g_trace_segments.window_stop() - g_trace_segments.window_start()
             : g_trace_segments.window_stop();
+        /*
+         * Termination bound.  While a marker window is open on the user
+         * clock, watch how far the guest gets in an owned context without
+         * the pinned process retiring a single user instruction.  Crossing
+         * the ceiling closes the segment exactly as the budget would (the
+         * same deferred, sealed-step path), so the trace is finalised and
+         * the run ends — instead of recording an alive-but-never-returning
+         * process forever.  Diagnostic max is kept even when the ceiling
+         * is disabled, so a capture can be judged after the fact.
+         */
+        if (marker_pinned && g_trace_segments.is_active() &&
+            cpu_index < CST_PIN_MAX_VCPUS) {
+            uint64_t u = g_user_icount;
+            if (u != g_stall_last_uic) {
+                g_stall_last_uic = u;
+                g_stall_gen++;
+            }
+            if (g_stall_seen_gen[cpu_index] != g_stall_gen) {
+                g_stall_seen_gen[cpu_index] = g_stall_gen;
+                g_stall_base[cpu_index] = icount_prev;
+            }
+            uint64_t stall = icount_prev >= g_stall_base[cpu_index]
+                ? icount_prev - g_stall_base[cpu_index] : 0;
+            if (stall > g_stats.user_clock_worst_stall) {
+                g_stats.user_clock_worst_stall = stall;
+            }
+            if (stall >= CST_STALL_WARN_DEFAULT && !g_stall_warned &&
+                (!g_stall_ceiling || stall < g_stall_ceiling)) {
+                g_stall_warned = true;
+                fprintf(stderr,
+                    "champsim_tracer: the traced process has not executed a "
+                    "user-space instruction\n  for %" PRIu64 " retired "
+                    "instructions of its own context — it is alive and in "
+                    "the\n  kernel, and its user-clock budget cannot "
+                    "advance while this lasts (ceiling %" PRIu64 ").\n",
+                    stall, g_stall_ceiling);
+                fflush(stderr);
+            }
+            if (g_stall_ceiling && stall >= g_stall_ceiling &&
+                !g_stall_ceiling_fired) {
+                g_stall_ceiling_fired = true;
+                g_stats.stall_ceiling_closes++;
+                fprintf(stderr,
+                    "\nchampsim_tracer: *** USER-CLOCK STALL CEILING ***\n"
+                    "  the guest retired %" PRIu64 " instructions in this "
+                    "trace's own context without\n"
+                    "  the traced process executing ONE user-space "
+                    "instruction (ceiling %" PRIu64 ").\n"
+                    "  Its END marker cannot execute and its user-clock "
+                    "budget cannot advance, so\n"
+                    "  nothing else would ever close this window.  Closing "
+                    "the segment here: the\n"
+                    "  trace is finalised and TRUNCATED at %" PRIu64
+                    " of %" PRIu64 " user instructions.\n"
+                    "  (stall_ceiling=<insns> tunes this; 0 disables it.)\n\n",
+                    stall, g_stall_ceiling, budget_now, budget_stop);
+                fflush(stderr);
+                deferred_close(cpu_index).icount_shutdown_pending = true;
+            }
+        }
         if (g_trace_segments.is_active() && budget_now >= budget_stop) {
             /* Budget reached — but this runs MID-STEP: step_events has
              * already promoted the current TB into the pending-seal slot,
@@ -6062,6 +6277,65 @@ static void run_deferred_window_closes(PathBuilder &pb, unsigned int cpu_index,
 }
 
 /*
+ * Fence-lane heartbeat (CST_FENCE_DIAG only).  Runs on the correct-path TB
+ * step, so it observes exactly the state a real END-marker execution would:
+ * the window, the pinned process's user clock, the retired-instruction
+ * clock, the three fence flags at rest, and the END-callback census.  All
+ * reads; the trace is untouched.
+ */
+static void fence_diag_tick(unsigned int cpu_index, uint64_t icount_prev,
+                            uint64_t watch_pc, bool seg_active)
+{
+    static uint64_t divider = 0;
+    static int64_t last_ms = 0;
+    static uint64_t last_icnt = 0;
+    static uint64_t last_uic = 0;
+    if (!fence_diag()) {
+        return;
+    }
+    if ((++divider & 255u) != 0) {
+        return;
+    }
+    int64_t ms = (int64_t)deadlatch_now_ms();
+    if (last_ms == 0) {
+        last_ms = ms;
+        return;
+    }
+    if ((ms - last_ms) * 1000000LL < fence_diag_period_ns()) {
+        return;
+    }
+    double dt = (double)(ms - last_ms) / 1000.0;
+    last_ms = ms;
+    bool f_spec = qemu_plugin_in_spec_mode();
+    bool f_wp   = g_wp_in_progress;
+    bool f_sess = wp_session_active(cpu_index);
+    uint64_t icnt = icount_prev;
+    uint64_t uic  = g_user_icount;
+    fprintf(stderr,
+            "[fence] ms=%" PRId64 " seg=%d uic=%" PRIu64 " d_uic=%" PRIu64
+            " icnt=%" PRIu64 " d_icnt=%" PRIu64 " rate=%.2fM/s pc=0x%" PRIx64
+            " priv=%d asid=0x%" PRIx64 " pin=0x%" PRIx64
+            " | end_cb=%" PRIu64 " cp=%" PRIu64 " fenced=%" PRIu64
+            " fenced_user=%" PRIu64 " start_cb=%" PRIu64 "/%" PRIu64
+            " | flags spec=%d wp=%d sess=%d"
+            " | susp_u=%" PRIu64 " foreign_u=%" PRIu64 "\n",
+            ms, seg_active ? 1 : 0, uic, uic - last_uic, icnt,
+            icnt - last_icnt,
+            dt > 0 ? (double)(icnt - last_icnt) / dt / 1e6 : 0.0,
+            watch_pc, qemu_plugin_get_priv_level(),
+            qemu_plugin_get_addr_space_id(),
+            g_pinned_asid.load(std::memory_order_relaxed),
+            g_fdiag_end_total, g_fdiag_end_cp, g_fdiag_end_fenced,
+            g_fdiag_end_fenced_user, g_fdiag_start_fenced,
+            g_fdiag_start_total,
+            f_spec ? 1 : 0, f_wp ? 1 : 0, f_sess ? 1 : 0,
+            tls_mkdiag_susp_user, tls_mkdiag_foreign_user);
+    fence_flush_end_ring();
+    last_icnt = icnt;
+    last_uic = uic;
+}
+
+/*
  * The CP step, driven by the ordered per-vCPU event queue.  The shared
  * prologue of vcpu_tb_exec — WP early-out, chain promotion,
  * capture-mute latch, blkwatch, vclock guard, icount read — has already
@@ -6103,6 +6377,19 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
      * detector reads, is likewise exec_lock-owned. */
     g_rt_gate.note_tb(g_capture_mute, icount_prev);
     g_rt_gate.tick(g_trace_segments.is_active_atomic());
+    /*
+     * Leaked-fence tripwire, always armed.  This step IS the correct path
+     * (the wrong-path early-out fires above it), so the wrong-path session
+     * bracket must be closed here.  If it is not, the bracket leaked — and
+     * a leaked bracket silently drops every marker callback on this vCPU,
+     * which is exactly how a window could stay open forever with no
+     * counter to show for it.  One relaxed load per step.
+     */
+    if (wp_session_active(cpu_index)) {
+        g_stats.wp_session_on_cp++;
+    }
+    fence_diag_tick(cpu_index, icount_prev, watch_pc,
+                    g_trace_segments.is_active_atomic());
 
     /* Address-space pin + count set (marker mode only — pinned !=
      * UNPINNED).  The inline-add counts every TB; here we fold this TB's
@@ -7268,6 +7555,12 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
         bool f_spec = qemu_plugin_in_spec_mode();
         bool f_wp   = g_wp_in_progress;
         bool f_sess = wp_session_active(cpu_index);
+        if (fence_diag()) {
+            g_fdiag_start_total++;
+            if (f_spec || f_wp || f_sess) {
+                g_fdiag_start_fenced++;
+            }
+        }
         if (f_spec || f_wp || f_sess) {
             tls_mkdiag_start_wp_gated++;
             g_stats.marker_wp_fenced_start++;
@@ -7280,9 +7573,11 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
     uint64_t pc;
     uint8_t size;
     marker_udata_unpack(udata, &pc, &size);
-    if (!marker_exec_step(&tls_marker_run, pc, size)) {
+    if (!marker_exec_step(&tls_marker_run, pc, size,
+                          MARKER_WHICH_START)) {
         return;                              /* run not complete yet */
     }
+    g_fdiag_start_runs++;
     /* The marker is one of the target's own instructions, so the current
      * ASID is the target's page-table root. */
     uint64_t asid = qemu_plugin_get_addr_space_id();
@@ -7581,11 +7876,29 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
         bool f_spec = qemu_plugin_in_spec_mode();
         bool f_wp   = g_wp_in_progress;
         bool f_sess = wp_session_active(cpu_index);
-        if (f_spec || f_wp || f_sess) {
-            tls_mkdiag_end_wp_gated++;
-            g_stats.marker_wp_fenced_end++;
-            if (f_sess && !f_spec && !f_wp) {
-                g_stats.marker_fence_session_only++;
+        /* Fence-lane instrumentation: every invocation is censused before
+         * the fence decides, so a suppressed CORRECT-PATH end marker is
+         * visible as a drop at user privilege in the pinned address space
+         * (see fence_note_end).  Off unless CST_FENCE_DIAG is set. */
+        bool f_forced = fence_force_end() &&
+                        g_trace_segments.is_active_atomic();
+        if (f_spec || f_wp || f_sess || f_forced) {
+            if (fence_diag()) {
+                uint64_t fpc;
+                uint8_t fsz;
+                marker_udata_unpack(udata, &fpc, &fsz);
+                fence_note_end(fpc, qemu_plugin_get_addr_space_id(),
+                               qemu_plugin_get_priv_level(),
+                               (uint8_t)((f_spec ? 1 : 0) | (f_wp ? 2 : 0) |
+                                         (f_sess ? 4 : 0) | (f_forced ? 8 : 0)),
+                               /* fenced= */ true, 0);
+            }
+            if (f_spec || f_wp || f_sess) {
+                tls_mkdiag_end_wp_gated++;
+                g_stats.marker_wp_fenced_end++;
+                if (f_sess && !f_spec && !f_wp) {
+                    g_stats.marker_fence_session_only++;
+                }
             }
             return;
         }
@@ -7609,7 +7922,8 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
                 g_user_icount, tls_mkdiag_end_wp_gated,
                 tls_mkdiag_susp_user, tls_mkdiag_foreign_user);
     }
-    bool end_fired = marker_exec_step(&tls_marker_end_run, pc, size);
+    bool end_fired = marker_exec_step(&tls_marker_end_run, pc, size,
+                                     MARKER_WHICH_END);
     /* Advance provenance: every invocation that reached the run-state
      * machine at user privilege mutated it — record it (see
      * g_marker_end_adv).  On fire the run resets to 0, so log the
@@ -7627,9 +7941,19 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
                                   : (uint8_t)(er ? er->run : 0);
         g_marker_end_adv_head[cpu_index] = (uint8_t)(h + 1);
     }
+    if (fence_diag()) {
+        const MarkerExecRun *er2 = end_fired ? nullptr :
+            marker_run_peek(&tls_marker_end_run,
+                            qemu_plugin_get_addr_space_id());
+        fence_note_end(pc, qemu_plugin_get_addr_space_id(),
+                       qemu_plugin_get_priv_level(), 0, /* fenced= */ false,
+                       end_fired ? (uint8_t)g_marker_seq.n_insns
+                                 : (uint8_t)(er2 ? er2->run : 0));
+    }
     if (!end_fired) {
         return;
     }
+    g_fdiag_end_runs++;
     /* The END run completed on the correct path.  Print the advance
      * provenance unconditionally: every END-marker close carries the
      * evidence of the three executions that produced it, plus how many
@@ -7652,6 +7976,7 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
         fprintf(stderr, " wp_fenced_end=%" PRIu64 "\n",
                 tls_mkdiag_end_wp_gated);
     }
+    fence_flush_end_ring();
     uint64_t asid = qemu_plugin_get_addr_space_id();
 
     /*
@@ -7667,10 +7992,19 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
         g_rec_mutex_lock(&exec_lock);
         if (!owned_contains_locked(asid)) {
             /* END from a process that never opened a window (or already
-             * closed it): not ours to act on. */
+             * closed it): not ours to act on.  Counted: a completed
+             * correct-path END that closes nothing is how a pin that
+             * drifted off its process would look. */
+            if (g_trace_segments.is_active()) {
+                g_stats.marker_end_no_close++;
+            }
             g_rec_mutex_unlock(&exec_lock);
             return;
         }
+        /* From here the close is unconditional: the run completed on the
+         * correct path in an address space this trace owns.  Anything that
+         * returned before this point without closing is counted at the
+         * call site (see marker_end_no_close). */
         g_owned.erase(asid);
         g_owned_last_sched.erase(asid);
         if (!g_owned.empty()) {
@@ -7740,7 +8074,10 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
         if (ow < 0 || !g_owned_procs || ow >= (int)g_owned_procs->size() ||
             !(*g_owned_procs)[ow].active) {
             /* END from a process that never opened a window (or already
-             * closed it): not ours to act on. */
+             * closed it): not ours to act on (counted — see above). */
+            if (g_trace_segments.is_active()) {
+                g_stats.marker_end_no_close++;
+            }
             g_rec_mutex_unlock(&exec_lock);
             return;
         }
@@ -8565,6 +8902,39 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     /* Guest-realtime summary (#61): factor and the guest instruction rate the
      * cliff model is expressed in.  Always reported, never gating unless
      * CST_RT_GATE armed it. */
+    fence_flush_end_ring();
+    /* Detector-side counters live in the marker-detect TU; fold them in
+     * before the report renders, then make any tripwire LOUD.  A silent
+     * nonzero in a table nobody reads is how a miss stays invisible. */
+    g_stats.marker_run_broken = marker_runs_broken();
+    g_stats.marker_run_adopted = marker_runs_adopted();
+    g_stats.marker_run_incomplete = marker_runs_incomplete();
+    if (g_stats.marker_run_broken || g_stats.marker_end_no_close ||
+        g_stats.wp_session_on_cp || g_stats.marker_fence_session_only ||
+        g_stats.marker_run_incomplete) {
+        fprintf(stderr,
+            "\nchampsim_tracer: *** MARKER INVARIANT TRIPWIRE ***\n"
+            "  marker run broken            %" PRIu64 " (must be 0)\n"
+            "  marker END with no close     %" PRIu64 " (must be 0)\n"
+            "  WP session flag on CP step   %" PRIu64 " (must be 0)\n"
+            "  marker fence session-only    %" PRIu64 " (must be 0)\n"
+            "  marker run incomplete at exit %" PRIu64 " (must be 0)\n"
+            "  A correct-path marker sequence may have been missed: the "
+            "window that\n  should have closed at it did not.\n\n",
+            g_stats.marker_run_broken, g_stats.marker_end_no_close,
+            g_stats.wp_session_on_cp, g_stats.marker_fence_session_only,
+            g_stats.marker_run_incomplete);
+        fflush(stderr);
+    }
+    if (fence_diag()) {
+        fprintf(stderr, "[fence] FINAL start_runs=%" PRIu64 " end_runs=%" PRIu64
+                " start_cb=%" PRIu64 " start_fenced=%" PRIu64
+                " end_cb=%" PRIu64 " end_cp=%" PRIu64 " end_fenced=%" PRIu64
+                "\n", g_fdiag_start_runs, g_fdiag_end_runs,
+                g_fdiag_start_total, g_fdiag_start_fenced,
+                g_fdiag_end_total, g_fdiag_end_cp, g_fdiag_end_fenced);
+        fflush(stderr);
+    }
     g_rt_gate.report(report);
 
     g_mutex_lock(&data_lock);
@@ -8788,6 +9158,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     g_window_mode       = cfg.window_mode;
     g_marker_policy     = cfg.marker_policy;
     g_latch_timeout_ms  = cfg.latch_timeout_ms;
+    g_stall_ceiling     = cfg.stall_ceiling;
 
     /*
      * Two decoupled fault concerns, split from the former single flag:

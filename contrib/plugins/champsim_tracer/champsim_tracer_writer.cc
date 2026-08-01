@@ -28,6 +28,7 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -192,7 +193,31 @@ WriterCtx *writer_start(FILE *f, bool is_pipe)
     /* Pull the first chunk for the producer. */
     w->current = cq_pop(&w->free_q);
 
+    /*
+     * Create the writer with EVERY signal blocked, and restore the
+     * caller's mask afterwards (the new thread inherits the mask in
+     * force at pthread_create).
+     *
+     * A guest signal in linux-user mode arrives as a host signal, and a
+     * process-directed one (the guest's own setitimer/alarm, or anything
+     * kill(2) sends to the process) may be delivered to ANY host thread
+     * whose mask allows it — including this one.  qemu-user's
+     * host_signal_handler then reads the executing thread's TaskState
+     * (linux-user/signal.c: `TaskState *ts = get_task_state(cpu)`),
+     * which does not exist on a thread that is not a guest vCPU: the
+     * process dies with SIGSEGV inside the handler.  Reproduced on
+     * pristine HEAD at 4 of 6 runs of a guest that arms a 1 ms
+     * ITIMER_REAL/ITIMER_VIRTUAL storm, and never without the plugin
+     * loaded (cst_runs/fence).  Blocking here removes this thread as a
+     * delivery target, which is what a helper thread should do anyway;
+     * the underlying qemu-user assumption that every signal-taking host
+     * thread is a guest thread is reported separately.
+     */
+    sigset_t all, saved;
+    sigfillset(&all);
+    pthread_sigmask(SIG_SETMASK, &all, &saved);
     int rc = pthread_create(&w->thr, nullptr, writer_thread_main, w);
+    pthread_sigmask(SIG_SETMASK, &saved, nullptr);
     if (rc != 0) {
         fprintf(stderr,
                 "champsim_tracer: pthread_create(writer): %d\n", rc);

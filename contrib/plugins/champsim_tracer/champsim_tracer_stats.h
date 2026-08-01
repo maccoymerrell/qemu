@@ -258,6 +258,36 @@ struct Stats {
     uint64_t marker_fence_session_only = 0;
 
     /*
+     * INVARIANT TRIPWIRES (all must be 0; each names a way a correct-path
+     * marker could be missed, so a miss can never be silent).
+     *
+     * marker_run_broken       — a correct-path marker word arrived where a
+     *   live run for the same address space expected a different pc: the
+     *   sequence was broken between its instructions (a fence drop of a
+     *   middle word, an evicted slot, a lost cross-vCPU handoff).
+     * marker_run_adopted      — partial runs resumed on a different vCPU
+     *   than they started on (condition counter for the migration path;
+     *   nonzero means the handoff did work that the per-vCPU run sets
+     *   alone would have lost).
+     * marker_end_no_close     — an END run completed on the correct path
+     *   in an address space this trace OWNS, and the window did not close.
+     * wp_session_on_cp        — a wrong-path session bracket was still
+     *   flagged while the CORRECT path was stepping this vCPU: a leaked
+     *   fence flag, which would silently drop every subsequent marker.
+     */
+    uint64_t marker_run_broken = 0;
+    uint64_t marker_run_adopted = 0;
+    uint64_t marker_run_incomplete = 0;
+    uint64_t marker_end_no_close = 0;
+    uint64_t wp_session_on_cp = 0;
+    /* Worst stall: architectural instructions retired in an owned context
+     * between two advances of the pinned user clock (diagnostic — the
+     * quantity the stall ceiling bounds).  stall_ceiling_closes counts
+     * segments the ceiling ended. */
+    uint64_t user_clock_worst_stall = 0;
+    uint64_t stall_ceiling_closes = 0;
+
+    /*
      * rep_unretired_pass_dropped — an empty leading pass of a fan-out
      * instruction (nothing retired, nothing delivered — a FEAT_MOPS bulk
      * op whose first byte faulted) was suppressed; its re-execution

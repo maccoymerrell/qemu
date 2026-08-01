@@ -29,6 +29,8 @@ static std::atomic<uint64_t> g_marker_runs_adopted{0};  /* picked up cross-vCPU 
 static std::atomic<uint64_t> g_marker_handoff_evicted{0}; /* live entry dropped */
 static std::atomic<uint64_t> g_marker_local_evicted{0}; /* live LOCAL slot reused */
 static std::atomic<uint64_t> g_marker_local_stale{0};  /* run left by a migration */
+static std::atomic<uint64_t> g_marker_cand_restarts{0}; /* one-word candidate replaced */
+static std::atomic<uint64_t> g_marker_cand_evicted{0};  /* one-word candidate dropped */
 
 
 /* The x86 marker is CST_MARKER_SEQ_LEN 5-byte movs; the fixed-width ISAs
@@ -36,6 +38,38 @@ static std::atomic<uint64_t> g_marker_local_stale{0};  /* run left by a migratio
  * the pair sequence, so every ISA's pattern fits. */
 static_assert(CST_MARKER_X86_SEQ_BYTES <= CST_MARKER_PAIR_SEQ_BYTES,
               "MarkerSeq buffers sized by the pair sequence");
+
+/*
+ * WHAT COUNTS AS A SEQUENCE IN FLIGHT.
+ *
+ * A single marker word is not a marker.  The collision guarantee this design
+ * rests on — three back-to-back loads of the same constant into the same
+ * register, which no compiler emits — is a property of the REPEATED run, not
+ * of one immediate-load instruction; one such load is ordinary code.
+ *
+ * And on every fixed-width target the START and END sequences SHARE one of
+ * their two words BY CONSTRUCTION.  The two magics differ only in their low
+ * byte (CST\x01 / CST\x02), so the half that carries the high 16 bits — MIPS
+ * `lui`, RISC-V `lui`, AArch64 `movk` — is byte-identical between them, and
+ * translation arms BOTH callbacks on it.  Executing one healthy START
+ * sequence therefore hands the END detector that word at every other
+ * position: three isolated words, 8 bytes apart, each opening a run that can
+ * never advance, because the word between them belongs to the other magic and
+ * never fires this callback.  The END sequence does the same to the START
+ * detector.
+ *
+ * Those runs are what a healthy capture produces.  Counting them made
+ * `marker run broken` and `marker run incomplete at exit` fire on correct
+ * behaviour — measured on the mipsel system workload as 5 and 6, every one of
+ * them a one-word run of the other sequence's shared word — which is how a
+ * tripwire teaches its readers to ignore it.  Two ADJACENT words is the
+ * shortest run only a real sequence can produce, so that is where a run
+ * starts being evidence.  Shorter runs are still tracked, still published for
+ * cross-vCPU adoption, and still counted (marker_cand_restarts /
+ * marker_cand_evicted) — they are simply not reported as a marker gone
+ * missing.
+ */
+static constexpr uint32_t MK_RUN_IN_FLIGHT = 2;
 
 void marker_seq_init(void)
 {
@@ -171,6 +205,16 @@ uint64_t marker_local_stale(void)
     return g_marker_local_stale.load(std::memory_order_relaxed);
 }
 
+uint64_t marker_candidate_restarts(void)
+{
+    return g_marker_cand_restarts.load(std::memory_order_relaxed);
+}
+
+uint64_t marker_candidate_evicted(void)
+{
+    return g_marker_cand_evicted.load(std::memory_order_relaxed);
+}
+
 /*
  * CST_MKMIG_DIAG=<n> — log the first @n interesting detector events (an
  * adoption, a break, an eviction) with the vCPU that produced them, so a
@@ -208,22 +252,61 @@ static void mkmig_note(const char *what, unsigned int cpu_index, int bank,
 
 uint64_t marker_runs_incomplete(void)
 {
-    /* Sequences that advanced at least once and never completed: every
-     * advance publishes into the bank and a completion clears it, so a
-     * slot still holding a partial run is a sequence that started and was
-     * lost.  This is the tripwire for the silent miss — a marker whose
-     * instructions were split apart and never rejoined. */
+    /* A sequence that got under way and never completed.  Every advance
+     * publishes into the bank and a completion clears it, so a slot still
+     * holding a run of MK_RUN_IN_FLIGHT or more words is a marker whose
+     * instructions were split apart and never rejoined.  One-word
+     * candidates are not sequences (see MK_RUN_IN_FLIGHT) and are reported
+     * separately by marker_candidates_outstanding(). */
     uint64_t n = 0;
     g_mutex_lock(&g_handoff_lock);
     for (int b = 0; b < 2; b++) {
         for (int i = 0; i < MK_HANDOFF_SLOTS; i++) {
-            if (g_handoff[b][i].run > 0) {
+            if (g_handoff[b][i].run >= MK_RUN_IN_FLIGHT) {
                 n++;
             }
         }
     }
     g_mutex_unlock(&g_handoff_lock);
     return n;
+}
+
+uint64_t marker_candidates_outstanding(void)
+{
+    uint64_t n = 0;
+    g_mutex_lock(&g_handoff_lock);
+    for (int b = 0; b < 2; b++) {
+        for (int i = 0; i < MK_HANDOFF_SLOTS; i++) {
+            if (g_handoff[b][i].run > 0 &&
+                g_handoff[b][i].run < MK_RUN_IN_FLIGHT) {
+                n++;
+            }
+        }
+    }
+    g_mutex_unlock(&g_handoff_lock);
+    return n;
+}
+
+void marker_handoff_census(void)
+{
+    /* Name every outstanding entry, so a nonzero tripwire says WHICH run it
+     * is talking about instead of leaving the reader to guess.  Diagnostic
+     * (CST_MKMIG_DIAG); nothing here changes a decision. */
+    g_mutex_lock(&g_handoff_lock);
+    for (int b = 0; b < 2; b++) {
+        for (int i = 0; i < MK_HANDOFF_SLOTS; i++) {
+            const MarkerHandoff &h = g_handoff[b][i];
+            if (h.run == 0) {
+                continue;
+            }
+            fprintf(stderr, "[mkmig] left    slot=%d seq=%s asid=0x%" PRIx64
+                    " waiting_pc=0x%" PRIx64 " run=%u %s\n",
+                    i, b ? "END" : "START", h.asid, h.next_pc, h.run,
+                    h.run >= MK_RUN_IN_FLIGHT ? "INCOMPLETE" : "candidate");
+        }
+    }
+    g_mutex_unlock(&g_handoff_lock);
+    fflush(stderr);
 }
 
 /*
@@ -238,6 +321,7 @@ static void handoff_update(int bank, uint64_t asid, uint64_t consumed_pc,
     g_mutex_lock(&g_handoff_lock);
     int free_slot = -1;
     int victim = 0;
+    uint32_t victim_run = UINT32_MAX;
     uint32_t victim_age = UINT32_MAX;
     for (int i = 0; i < MK_HANDOFF_SLOTS; i++) {
         MarkerHandoff &h = g_handoff[bank][i];
@@ -248,7 +332,15 @@ static void handoff_update(int bank, uint64_t asid, uint64_t consumed_pc,
             if (free_slot < 0) {
                 free_slot = i;
             }
-        } else if (h.used < victim_age) {
+            continue;
+        }
+        /* SHORTEST RUN FIRST, then least recently advanced.  The bank fills
+         * with one-word candidates — the other sequence's shared word opens
+         * three of them per marker (see MK_RUN_IN_FLIGHT) — and evicting a
+         * real partial sequence to make room for chaff is exactly the loss
+         * this bank exists to prevent. */
+        if (h.run < victim_run || (h.run == victim_run && h.used < victim_age)) {
+            victim_run = h.run;
             victim_age = h.used;
             victim = i;
         }
@@ -256,9 +348,16 @@ static void handoff_update(int bank, uint64_t asid, uint64_t consumed_pc,
     if (run > 0) {
         int slot = free_slot >= 0 ? free_slot : victim;
         if (free_slot < 0) {
-            /* A LIVE partial run is being dropped: the one remaining way a
-             * marker sequence can go missing.  Never silent. */
-            g_marker_handoff_evicted.fetch_add(1, std::memory_order_relaxed);
+            /* A live entry is being dropped.  For a sequence in flight that
+             * is the one remaining way a marker can go missing, so it is the
+             * tripwire; for a one-word candidate it is the bank doing its
+             * job under chaff pressure.  Neither is silent. */
+            if (g_handoff[bank][slot].run >= MK_RUN_IN_FLIGHT) {
+                g_marker_handoff_evicted.fetch_add(1,
+                                                   std::memory_order_relaxed);
+            } else {
+                g_marker_cand_evicted.fetch_add(1, std::memory_order_relaxed);
+            }
             mkmig_note("evict", cpu_index, bank, g_handoff[bank][slot].asid,
                        g_handoff[bank][slot].next_pc, next_pc,
                        g_handoff[bank][slot].run, 0);
@@ -373,17 +472,24 @@ bool marker_exec_step(MarkerRunSet *set, uint64_t pc, uint8_t size,
             }
             r->run = adopted + 1;
         } else if (r->run > 0) {
-            if (handoff_live(bank, asid, r->next_pc)) {
+            if (!handoff_live(bank, asid, r->next_pc)) {
+                /* Not published any more: this slot is the residue of a
+                 * sequence that migrated away and completed elsewhere. */
+                g_marker_local_stale.fetch_add(1, std::memory_order_relaxed);
+            } else if (r->run < MK_RUN_IN_FLIGHT) {
+                /* One word is not a sequence: this is the other magic's
+                 * shared word opening a candidate that the next one
+                 * replaces, which every healthy capture on a fixed-width
+                 * target does three times per marker (see MK_RUN_IN_FLIGHT).
+                 * Counted as the condition it is, not as a broken marker. */
+                g_marker_cand_restarts.fetch_add(1, std::memory_order_relaxed);
+            } else {
                 /* The bank corroborates this run: a marker word really did
                  * arrive where a live sequence expected a different pc.
                  * Named, never silent (see marker_runs_broken). */
                 g_marker_runs_broken.fetch_add(1, std::memory_order_relaxed);
                 mkmig_note("broken", cpu_index, bank, asid, pc, r->next_pc,
                            r->run, 1);
-            } else {
-                /* Not published any more: this slot is the residue of a
-                 * sequence that migrated away and completed elsewhere. */
-                g_marker_local_stale.fetch_add(1, std::memory_order_relaxed);
             }
             r->run = 1;
         } else {

@@ -140,20 +140,41 @@ enum MarkerWhich { MARKER_WHICH_START = 0, MARKER_WHICH_END = 1 };
 bool marker_exec_step(MarkerRunSet *set, uint64_t pc, uint8_t size,
                       MarkerWhich which, unsigned int cpu_index);
 
-/* Correct-path runs that were RESET mid-sequence (a marker word arrived
- * where a live run for the same address space expected a different pc).
- * A healthy compiled-in marker never does this; nonzero means a sequence
- * was broken between its instructions.  Read by the stats report. */
+/* Correct-path SEQUENCES IN FLIGHT (two or more adjacent words, see
+ * MK_RUN_IN_FLIGHT in the .cc) that were RESET mid-sequence: a marker word
+ * arrived where a live run for the same address space expected a different
+ * pc.  A healthy capture never does this; nonzero means a sequence was
+ * broken between its instructions.  A one-word candidate being replaced is
+ * NOT this — on every fixed-width target the START and END sequences share
+ * a word, so each healthy marker opens and replaces three of them in the
+ * other detector; those are marker_candidate_restarts().  Read by the stats
+ * report. */
 uint64_t marker_runs_broken(void);
 /* Runs adopted from another vCPU's partial sequence (the handoff above).
  * Condition counter for the migration case. */
 uint64_t marker_runs_adopted(void);
-/* Partial runs still outstanding: a marker sequence that started and never
- * completed.  Read at plugin exit; must be 0. */
+/* Partial runs still outstanding: a marker SEQUENCE (>= MK_RUN_IN_FLIGHT
+ * adjacent words) that started and never completed.  Read at plugin exit;
+ * must be 0. */
 uint64_t marker_runs_incomplete(void);
-/* A LIVE partial run displaced from the handoff bank.  Every advance
+/* One-word candidates still outstanding.  Every healthy marker leaves these
+ * behind in the other sequence's detector, so this is a condition counter,
+ * never a tripwire. */
+uint64_t marker_candidates_outstanding(void);
+/* One-word candidates replaced by a later word / dropped from the bank.
+ * Condition counters for the shared-word chaff described at
+ * MK_RUN_IN_FLIGHT. */
+uint64_t marker_candidate_restarts(void);
+uint64_t marker_candidate_evicted(void);
+/* Print every outstanding bank entry (CST_MKMIG_DIAG), so a nonzero
+ * tripwire names the run it is talking about. */
+void marker_handoff_census(void);
+/* A LIVE partial SEQUENCE displaced from the handoff bank.  Every advance
  * republishes into the bank, so eviction is the ONE remaining way an
- * in-flight marker sequence can be lost — hence a tripwire, must be 0. */
+ * in-flight marker sequence can be lost — hence a tripwire, must be 0.
+ * Victim selection drops the shortest run first, so a one-word candidate is
+ * always displaced before a sequence; that case is
+ * marker_candidate_evicted(). */
 uint64_t marker_handoff_evicted(void);
 /* A live per-vCPU run slot reused by another address space.  Recoverable
  * (the bank still holds the partial run), so a condition counter. */

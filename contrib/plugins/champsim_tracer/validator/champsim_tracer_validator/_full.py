@@ -1930,6 +1930,61 @@ def _cleanup_qemu(work_root: Path):
                    capture_output=True)
 
 
+# ---------------------------------------------------------------------------
+# The "(must be 0)" census — the gate the tripwires never had
+# ---------------------------------------------------------------------------
+#
+# Every counter the plugin labels "(must be 0)" is an invariant it asserts
+# about its own output.  Nothing read them: the kept-span misattribution
+# witness stood NONZERO in five cells of a corpus that reported OVERALL: PASS,
+# because no check ever opened a stats.log looking for it.  A "must be 0" row
+# nobody gates is decoration, and a corpus that routinely carries a nonzero
+# one teaches its readers to ignore every other one.
+#
+# This reads every per-cell stats.log the run produced and fails on any
+# nonzero row.  Two deliberate rules:
+#   * a census that finds NO stats.log at all, or a stats.log with no
+#     "(must be 0)" row in it, FAILS — a check that cannot find its subject
+#     must not report an empty success;
+#   * rows belonging to a NON-GATING (known_issue -> xfail) check are
+#     reported but do not flip the gate, exactly as that check's own failure
+#     does not.
+_MUST0_RE = re.compile(r"^(?P<label>.*\(must be 0\))\s+(?P<val>\d+)\s*$")
+
+
+def _tripwire_census(work_root: Path, nongating: set[str]) -> dict:
+    files = sorted(work_root.rglob("*.stats.log"))
+    rows: list[dict] = []
+    unparsed: list[str] = []
+    for f in files:
+        try:
+            text = f.read_text(errors="replace")
+        except OSError as e:
+            unparsed.append(f"{f}: {e}")
+            continue
+        seen = 0
+        for line in text.splitlines():
+            m = _MUST0_RE.match(line)
+            if not m:
+                continue
+            seen += 1
+            if int(m.group("val")):
+                try:
+                    cell = f.relative_to(work_root).parts[0]
+                except ValueError:
+                    cell = ""
+                rows.append({"file": str(f), "check": cell,
+                             "label": m.group("label").strip(),
+                             "value": int(m.group("val")),
+                             "gating": cell not in nongating})
+        if seen == 0:
+            unparsed.append(f"{f}: no '(must be 0)' row found")
+    gating = [r for r in rows if r["gating"]]
+    ok = bool(files) and not gating and not unparsed
+    return {"stats_files": len(files), "violations": rows,
+            "unreadable": unparsed, "status": "pass" if ok else "fail"}
+
+
 def run_full(args) -> int:
     # 24 GiB address-space cap (ulimit -v 25165824 KiB) — children inherit.
     try:
@@ -2034,9 +2089,15 @@ def run_full(args) -> int:
     summary["coverage"]["runtime_uncovered"] = runtime_uncovered
 
     summary["counts"] = counts
-    # Exit code: FAIL on any failed check OR a registration gap.
+    # Every "(must be 0)" row of every cell this run produced.  Cells of a
+    # non-gating check report but do not gate.
+    nongating = {c.id.replace(".", "_") for c in sel if c.known_issue}
+    summary["tripwire_census"] = _tripwire_census(work_root, nongating)
+    # Exit code: FAIL on any failed check, a registration gap, or a violated
+    # "must be 0" invariant.
     hard_fail = (counts["fail"] > 0 or bool(cov["static_gap"])
-                 or bool(cov["unknown"]))
+                 or bool(cov["unknown"])
+                 or summary["tripwire_census"]["status"] == "fail")
     summary["overall"] = "fail" if hard_fail else "pass"
     summary["exit_code"] = 1 if hard_fail else 0
     _emit_summary(summary, args)
@@ -2076,6 +2137,15 @@ def _emit_summary(summary: dict, args) -> None:
             print("\nnon-gating XFAILs (reported, do NOT gate the exit code):")
             for r in xf:
                 print(f"   XFAIL {r['id']}: {r['known_issue']}")
+    tw = summary.get("tripwire_census")
+    if tw:
+        print(f"\n\"must be 0\" census: {tw['stats_files']} stats.log files, "
+              f"{len(tw['violations'])} violated row(s) — {tw['status']}")
+        for r in tw["violations"]:
+            print(f"   {'!!' if r['gating'] else '~ '} {r['value']:>10}  "
+                  f"{r['label']}  [{r['check']}]")
+        for u in tw["unreadable"]:
+            print(f"   !! unreadable/empty: {u}")
     print(f"\ncoverage: {cov['registered']} features registered")
     if cov["static_gap"]:
         print(f"  !! STATIC GAP (features with no exercising check): "

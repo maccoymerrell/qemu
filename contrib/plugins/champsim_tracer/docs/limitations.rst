@@ -404,6 +404,33 @@ to the incoming task while the outgoing one is still architecturally
 executing.  The window is bounded by that fixed instruction distance and
 is entirely inside kernel scheduler code.
 
+.. _limits-kexc-foreign-root:
+
+**Kernel coverage ends where the address space does.**  A kernel block
+is attributed to the trace by the excursion that entered the kernel
+(``kexc=1``), but on a wide-register target — x86 ``CR3``, AArch64
+``TTBR0``, RISC-V ``satp`` — that inference is *bounded by the root the
+block actually executes under*: on those targets the root IS the
+process, so a block running under a root the trace does not capture is
+another task's kernel work and is refused however the excursion was
+entered.  What this bounds is not hypothetical: without it, a scheduler
+switch away from the pinned process while it sat in the kernel handed
+the trace the whole tail of the switch — the incoming task's kernel
+work, up to its return to its own user code.  Measured on one x86-64
+system cell, 34,402 basic blocks and 229,826 instructions, 77% of the
+kernel instructions in the delivered trace.
+
+Two consequences follow.  A guest that switches to a **private kernel
+page-table base** on entry — KPTI on — runs its whole excursion under a
+root the trace does not own, so its kernel coverage stands down to what
+executes on the pinned root; KPTI off is the configuration this tracer
+is characterised on, and the isolation is modelled downstream from the
+``SYSTEM`` flag instead.  And the blocks between a committed switch and
+the trace's decision to stop following it are *absent* rather than
+mis-credited: exclusion, not attribution, is what the rule guarantees.
+``kexc kernel TBs kept on a foreign root`` is the invariant's witness
+(must be 0); ``... refused on a foreign root`` counts what it removed.
+
 **A speculatively fetched syscall is never performed.**  The WP
 simulator walks *past* a syscall, software interrupt or trap at its
 architectural fall-through — an out-of-order frontend fetches around

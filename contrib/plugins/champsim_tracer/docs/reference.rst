@@ -1079,11 +1079,24 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
        kernel (privilege ``!= 0``) basic block is attributed to the
        trace by the *owning excursion* — the user address space the
        kernel was entered from, tracked through ASID-write path events —
-       rather than by the live ASID.  This keeps a kernel's synchronous
-       handler coverage even when the kernel switches to a private
-       address space on entry (a PTI-style page-table base).  ``kexc=0``
-       restores the strict live-ASID rule: kernel work whose live ASID
-       differs from the pinned value is dropped.  Ignored in user mode.
+       rather than by the live ASID.  That inference recovers the kernel
+       work the live ASID alone loses: an excursion resumed after another
+       task's user code, a handler tail after a preemption, a sticky cut.
+       It is **bounded by the executing address space**: on a
+       wide-register target (x86 ``CR3``, Arm ``TTBR0``, RISC-V ``satp``)
+       the root *is* the process, so a kernel block running under a root
+       the trace does not capture is refused however the excursion was
+       entered — the ``kexc kernel TBs kept on a foreign root`` statistic
+       is that rule's must-be-0 witness, and its complement
+       ``... refused on a foreign root`` counts the foreign kernel work
+       kept out.  The consequence, named: a guest that switches to a
+       *private kernel* page-table base on entry (KPTI on) executes its
+       whole kernel excursion under a root the trace does not own, so its
+       kernel coverage stands down to what runs on the pinned root.  KPTI
+       off is the configuration this tracer is characterised on.
+       ``kexc=0`` restores the strict live-ASID rule: kernel work whose
+       live ASID differs from the pinned value is dropped.  Ignored in
+       user mode.
    * - ``faults=0|1``
      - ``1``
      - Synchronous-fault handler tracing (**system mode only**).  When on,

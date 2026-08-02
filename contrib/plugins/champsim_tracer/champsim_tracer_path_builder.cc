@@ -133,6 +133,16 @@ static bool depth3_gen_off()
     static const bool v = getenv("CST_DEPTH3_NO_GEN") != nullptr;
     return v || depth3_off();
 }
+/* The foreign-root refusal (see kexc_kernel_tb_keep).  Turning it off
+ * restores the rule that admitted a kernel block executing under another
+ * process's page-table root, which is what makes the pre-fix behaviour
+ * available as a positive control for the two counters that name it —
+ * "kexc kernel TBs kept on a foreign root" and the kept-span witness. */
+static bool kexc_root_refuse_off()
+{
+    static const bool v = getenv("CST_KEXC_NO_ROOT_REFUSE") != nullptr;
+    return v || depth3_kexc_off();
+}
 
 /*
  * ---- Per-vCPU seal-pipeline sidecars ----
@@ -165,6 +175,151 @@ static uint8_t g_pb_last_kernel_kept[PB_MAX_VCPUS];
  * return is the wire-level corroboration that the recovered blocks are the
  * pinned process's own kernel work and not a foreign task's. */
 static uint8_t g_pb_last_kernel_recovered[PB_MAX_VCPUS];
+
+/*
+ * ---- Kept-span witness diagnostics (CST_KEXCWIT) ----
+ *
+ * The kept-span misattribution witness (kexc_kept_span_foreign_user) reports
+ * a VERDICT — a kept kernel span ended at a foreign user TB — without saying
+ * what the span was.  This records the span itself: every kernel TB of it
+ * with the evidence each keep/decline rested on, every committed ASID write
+ * that crossed it, and the user TBs at both ends.  Measurement only; nothing
+ * in the tracer's logic reads it, and with the variable unset it costs one
+ * cached-bool load per kernel TB.
+ */
+static bool kexcwit_diag()
+{
+    static const bool v = getenv("CST_KEXCWIT") != nullptr;
+    return v;
+}
+
+enum : uint8_t {
+    KW_KTB = 0,          /* a kernel TB stepped through the keep rule */
+    KW_ASIDW = 1,        /* a committed ASID write applied to the excursion */
+    KW_SUSP = 2,         /* a TB the async window suspended (never traced) */
+};
+enum : uint8_t {                        /* KW_KTB flag bits */
+    KWF_KEEP = 1u << 0, KWF_EDGE = 1u << 1, KWF_ROOT = 1u << 2,
+    KWF_CUT = 1u << 3, KWF_TPKNOWN = 1u << 4, KWF_TPOK = 1u << 5,
+    KWF_ENTRY_OWNED = 1u << 6, KWF_OVERLAY = 1u << 7,
+};
+enum : uint8_t {                        /* KW_ASIDW classification */
+    KWW_RESTORE = 1, KWW_OVERLAY = 2, KWW_OVERLAY_REPEAT = 3, KWW_CUT = 4,
+    KWW_STALE_CUT = 5, KWW_NOT_IN_KERNEL = 6,
+};
+struct KexcWitEvent {
+    uint64_t pc;                        /* KW_KTB/KW_SUSP: block pc.
+                                         * KW_ASIDW: the value written */
+    uint64_t live;                      /* live asid at the event */
+    uint64_t tp;                        /* the GUEST's own statement of which
+                                         * task is executing (x86 needs
+                                         * curtask_off= for this to be live
+                                         * at kernel privilege) */
+    uint32_t n_insns;
+    uint8_t  kind;
+    uint8_t  flags;                     /* KW_KTB: KWF_*  KW_ASIDW: KWW_* */
+    uint8_t  priv;
+    uint8_t  tp_strict;
+};
+static constexpr unsigned KEXCWIT_HEAD = 24;   /* the span's opening blocks */
+static constexpr unsigned KEXCWIT_RING = 96;   /* and its most recent ones */
+struct KexcWitSpan {
+    KexcWitEvent head[KEXCWIT_HEAD];
+    KexcWitEvent ev[KEXCWIT_RING];
+    uint32_t nhead;
+    uint32_t n;                         /* events recorded (ring-capped) */
+    uint32_t total;                     /* events this span */
+    uint32_t kept_tbs, kept_insns, kernel_tbs, susp_tbs;
+    uint32_t kept_foreign_root_tbs, kept_foreign_root_insns;
+    uint64_t open_user_pc, open_user_asid;
+    uint8_t  open_user_owned, have_open_user;
+};
+/* Heap-allocated on first use so the diag costs no static footprint (the
+ * plugin's static-TLS block is at the meson tripwire's ceiling).  Every
+ * access runs inside the CP step under exec_lock, exactly like the per-vCPU
+ * arrays above. */
+static KexcWitSpan *kexcwit_span(unsigned cpu_index)
+{
+    static KexcWitSpan *spans = nullptr;
+    if (!spans) {
+        spans = new KexcWitSpan[PB_MAX_VCPUS]();
+    }
+    return &spans[pb_vcpu_slot(cpu_index)];
+}
+static void kexcwit_push(unsigned cpu_index, const KexcWitEvent &e)
+{
+    KexcWitSpan *s = kexcwit_span(cpu_index);
+    s->total++;
+    if (s->nhead < KEXCWIT_HEAD) {
+        s->head[s->nhead++] = e;
+    }
+    if (s->n < KEXCWIT_RING) {
+        s->ev[s->n++] = e;
+    } else {                            /* keep the TAIL: the span's end is
+                                         * what the witness is about */
+        memmove(&s->ev[0], &s->ev[1], sizeof(s->ev[0]) * (KEXCWIT_RING - 1));
+        s->ev[KEXCWIT_RING - 1] = e;
+    }
+}
+static void kexcwit_open_span(unsigned cpu_index, uint64_t user_pc,
+                              uint64_t user_asid, bool owned)
+{
+    KexcWitSpan *s = kexcwit_span(cpu_index);
+    *s = KexcWitSpan();
+    s->open_user_pc = user_pc;
+    s->open_user_asid = user_asid;
+    s->open_user_owned = owned ? 1 : 0;
+    s->have_open_user = 1;
+}
+static void kexcwit_dump(unsigned cpu_index, const char *why, uint64_t pc,
+                         uint64_t live, uint64_t pinned, uint64_t tp)
+{
+    KexcWitSpan *s = kexcwit_span(cpu_index);
+    fprintf(stderr, "[kexcwit] %s cpu=%u user_pc=0x%" PRIx64 " live=0x%"
+            PRIx64 " pinned=0x%" PRIx64 " tp=0x%" PRIx64 "\n", why,
+            cpu_index, pc, live, pinned, tp);
+    fprintf(stderr, "[kexcwit]   span: opened_from user_pc=0x%" PRIx64
+            " asid=0x%" PRIx64 " owned=%u (have=%u); kernel_tbs=%u kept=%u "
+            "kept_insns=%u kept_on_foreign_root=%u/%u insns suspended=%u "
+            "events=%u (head %u + tail %u)\n",
+            s->open_user_pc, s->open_user_asid, s->open_user_owned,
+            s->have_open_user, s->kernel_tbs, s->kept_tbs, s->kept_insns,
+            s->kept_foreign_root_tbs, s->kept_foreign_root_insns,
+            s->susp_tbs, s->total, s->nhead, s->n);
+    for (uint32_t i = 0; i < s->nhead + s->n; i++) {
+        const bool in_head = i < s->nhead;
+        const KexcWitEvent &e = in_head ? s->head[i] : s->ev[i - s->nhead];
+        if (!in_head && i == s->nhead) {
+            fprintf(stderr, "[kexcwit]   ---- span head above, tail below "
+                    "----\n");
+        }
+        if (e.kind == KW_ASIDW) {
+            static const char *w[] = { "?", "restore", "overlay",
+                                       "overlay-repeat", "CUT", "stale-CUT",
+                                       "not-in-kernel" };
+            fprintf(stderr, "[kexcwit]   %3u ASIDW new=0x%" PRIx64
+                    " (%s) live_before=0x%" PRIx64 "\n", i, e.pc,
+                    e.flags < 7 ? w[e.flags] : "?", e.live);
+        } else if (e.kind == KW_SUSP) {
+            fprintf(stderr, "[kexcwit]   %3u SUSP  pc=0x%" PRIx64
+                    " live=0x%" PRIx64 " priv=%u n=%u task=0x%" PRIx64 "\n",
+                    i, e.pc, e.live, e.priv, e.n_insns, e.tp);
+        } else {
+            fprintf(stderr, "[kexcwit]   %3u KTB   pc=0x%" PRIx64
+                    " live=0x%" PRIx64 " priv=%u n=%u task=0x%" PRIx64
+                    "%s %s [edge=%u root=%u cut=%u overlay=%u entry_owned=%u "
+                    "tp_known=%u tp_ok=%u]\n",
+                    i, e.pc, e.live, e.priv, e.n_insns, e.tp,
+                    e.tp_strict ? "" : "(weak)",
+                    (e.flags & KWF_KEEP) ? "KEPT   " : "dropped",
+                    !!(e.flags & KWF_EDGE), !!(e.flags & KWF_ROOT),
+                    !!(e.flags & KWF_CUT), !!(e.flags & KWF_OVERLAY),
+                    !!(e.flags & KWF_ENTRY_OWNED), !!(e.flags & KWF_TPKNOWN),
+                    !!(e.flags & KWF_TPOK));
+        }
+    }
+    fflush(stderr);
+}
 
 /*
  * ---- Owned-thread identity map (kexc task-identity ownership) ----
@@ -419,11 +574,13 @@ enum : uint8_t {
     GAP_R_KEXC_NOT_OWNED,   /* kexc decline: entry edge not owned */
     GAP_R_KEXC_CUT,         /* kexc decline: committed-switch cut */
     GAP_R_KEXC_TP,          /* kexc decline: executing task not owned */
+    GAP_R_KEXC_ROOT,        /* kexc decline: foreign address-space root */
     GAP_R_N
 };
 static const char *const gap_reason_name[GAP_R_N] = {
     "async-mute", "mmode", "legacy-asid", "user-unowned",
     "kexc-no-user", "kexc-not-owned", "kexc-cut", "kexc-tp-refused",
+    "kexc-root-foreign",
 };
 struct GapDropRec {
     uint64_t pc, live_asid, exc_entry;
@@ -1464,9 +1621,57 @@ bool PathBuilder::kexc_kernel_tb_keep(const StepIn &in)
      * page-table root cannot.
      */
     const bool tp_foreign = tp_known && !tp_ok;
+    /*
+     * Foreign-root refusal — the live-root rule's OTHER direction.
+     *
+     * The recovery above admits a kernel TB because, on a wide-register
+     * target, the live address-space root IS the process.  That fact is
+     * symmetric and the rule was not: a block executing under a root the
+     * trace does not own is, by the same fact, another task's kernel work,
+     * whatever the vCPU's user-TB history says.  The entry edge admitted
+     * those blocks because the committed switch that installed the foreign
+     * root was spent on the excursion's OVERLAY slot — the first foreign
+     * value of an excursion is presumed to be a PTI-style entry switch or a
+     * TLB-maintenance save/probe, and only a THIRD distinct value cuts.
+     * With KPTI off (the canonical configuration) nothing else claims that
+     * slot, so a scheduler switch AWAY from the pinned process consumes it
+     * and the whole tail of the switch — the next task's kernel work, up to
+     * its return to its own user code — entered the trace as ours.
+     *
+     * Exclusion-only, exactly like the task-identity rule: it admits
+     * nothing, it removes the blocks whose executing address space says
+     * they are not ours.  Inert on the narrow-ASID target, where the same
+     * equality is a coincidence of recycled bits (in.asid_is_identity), and
+     * inert while unpinned.  The cost under KPTI ON is real and named in
+     * docs/limitations.rst: the kernel-side root is foreign by this test
+     * too, so kernel coverage stands down to what the pinned root executes.
+     */
+    const bool root_foreign = in.asid_is_identity && in.pinned &&
+                              !in.live_root_owned;
     bool keep = depth3_kexc_off()
                     ? edge_keep
-                    : ((edge_keep || root_owned) && !tp_foreign);
+                    : ((edge_keep || root_owned) && !tp_foreign &&
+                       (!root_foreign || kexc_root_refuse_off()));
+    if (root_foreign) {
+        /* Both arms of the invariant, at the block: what the rule let
+         * through (must be 0) and what it removed. */
+        if (keep) {
+            g_stats.kexc_kernel_kept_foreign_root++;
+            g_stats.kexc_kernel_kept_foreign_root_insns += n_insns;
+            if (kexc_diag() &&
+                kexc_pc_first_sighting("keptforeignroot", start_pc)) {
+                fprintf(stderr, "[kexcdiag] KEPT-ON-FOREIGN-ROOT pc=0x%"
+                        PRIx64 " ninsns=%u live=0x%" PRIx64 " pinned=0x%"
+                        PRIx64 " entry=0x%" PRIx64 " overlay=0x%" PRIx64
+                        " edge=%d cut=%d\n", start_pc, n_insns, in.live_asid,
+                        in.pinned_asid, kexc_exc_entry_, kexc_overlay_,
+                        (int)edge_keep, (int)kexc_cut_);
+            }
+        } else if (edge_keep && !tp_foreign) {
+            g_stats.kexc_kernel_refused_foreign_root++;
+            g_stats.kexc_kernel_refused_foreign_root_insns += n_insns;
+        }
+    }
     if (keep) {
         g_stats.kexc_kernel_kept++;
         /* Post-re-latch census (mirrors the post-restore one below): blocks
@@ -1515,6 +1720,11 @@ bool PathBuilder::kexc_kernel_tb_keep(const StepIn &in)
          * tail class); everything else reports the edge state as before. */
         if (!depth3_kexc_off() && tp_foreign && (edge_keep || root_owned)) {
             kexc_last_decline_ = 4;
+        } else if (!kexc_root_refuse_off() && root_foreign && edge_keep) {
+            /* The edge would have kept it; the executing address space is
+             * another process's.  Its own arm, so the cut census keeps
+             * meaning "the excursion saw a third distinct value". */
+            kexc_last_decline_ = 5;
         } else if (!kexc_have_user_) {
             g_stats.kexc_decl_no_user++;
             kexc_last_decline_ = 1;
@@ -1556,6 +1766,36 @@ bool PathBuilder::kexc_kernel_tb_keep(const StepIn &in)
      * TB reads whether this vCPU's kernel flow was being TRACED when it
      * returned to user code (see kexc_kept_span_foreign_user). */
     g_pb_last_kernel_kept[pb_vcpu_slot(in.cpu_index)] = keep ? 1 : 0;
+    if (kexcwit_diag()) {
+        KexcWitSpan *s = kexcwit_span(in.cpu_index);
+        s->kernel_tbs++;
+        if (keep) {
+            s->kept_tbs++;
+            s->kept_insns += n_insns;
+            if (in.asid_is_identity && in.pinned &&
+                in.live_asid != in.pinned_asid) {
+                s->kept_foreign_root_tbs++;
+                s->kept_foreign_root_insns += n_insns;
+            }
+        }
+        KexcWitEvent e{};
+        e.kind = KW_KTB;
+        e.pc = start_pc;
+        e.live = in.live_asid;
+        e.tp = in.cur_tp;
+        e.tp_strict = in.cur_tp_strict ? 1 : 0;
+        e.n_insns = n_insns;
+        e.priv = (uint8_t)in.live_priv;
+        e.flags = (uint8_t)((keep ? KWF_KEEP : 0) |
+                            (edge_keep ? KWF_EDGE : 0) |
+                            (root_owned ? KWF_ROOT : 0) |
+                            (kexc_cut_ ? KWF_CUT : 0) |
+                            (tp_known ? KWF_TPKNOWN : 0) |
+                            (tp_ok ? KWF_TPOK : 0) |
+                            (kexc_entry_owned_ ? KWF_ENTRY_OWNED : 0) |
+                            (kexc_have_overlay_ ? KWF_OVERLAY : 0));
+        kexcwit_push(in.cpu_index, e);
+    }
     return keep;
 }
 
@@ -1989,7 +2229,26 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
         for (size_t i = 0; i < in.n_evs; i++) {
             const struct qemu_plugin_cpu_event &kev = in.evs[i];
             if (kev.kind == QEMU_PLUGIN_CPU_EV_ASID_WRITE) {
-                kexc_apply_asid_write(kev.asid);
+                if (kexcwit_diag()) {
+                    /* Classify the write from the state delta it produces,
+                     * so the record can never disagree with the arrow that
+                     * actually ran. */
+                    const bool k0 = kexc_in_kernel_, c0 = kexc_cut_;
+                    const bool o0 = kexc_have_overlay_;
+                    kexc_apply_asid_write(kev.asid);
+                    KexcWitEvent e{};
+                    e.kind = KW_ASIDW;
+                    e.pc = kev.asid;
+                    e.live = in.live_asid;
+                    e.flags = !k0 ? KWW_NOT_IN_KERNEL
+                            : (!c0 && kexc_cut_) ? KWW_CUT
+                            : (!o0 && kexc_have_overlay_) ? KWW_OVERLAY
+                            : (kev.asid == kexc_exc_entry_) ? KWW_RESTORE
+                            : KWW_OVERLAY_REPEAT;
+                    kexcwit_push(in.cpu_index, e);
+                } else {
+                    kexc_apply_asid_write(kev.asid);
+                }
             } else if (!g_features.trace_interrupts) {
                 /* interrupts=0: windows are excluded content, ownership
                  * tracks the writes alone — legacy byte-for-byte. */
@@ -2295,6 +2554,19 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
             gap_record_drop(GAP_R_ASYNC, in.cur ? in.cur->start_pc : 0,
                             in.cur ? in.cur->n_insns : 0, in.live_priv,
                             in.live_asid, kexc_exc_entry_, 0);
+            if (kexcwit_diag()) {
+                KexcWitSpan *s = kexcwit_span(in.cpu_index);
+                s->susp_tbs++;
+                KexcWitEvent e{};
+                e.kind = KW_SUSP;
+                e.pc = in.cur ? in.cur->start_pc : 0;
+                e.live = in.live_asid;
+                e.tp = in.cur_tp;
+                e.tp_strict = in.cur_tp_strict ? 1 : 0;
+                e.n_insns = in.cur ? in.cur->n_insns : 0;
+                e.priv = (uint8_t)in.live_priv;
+                kexcwit_push(in.cpu_index, e);
+            }
             return StepStatus::SUSPENDED;
         }
     }
@@ -2363,6 +2635,11 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
             }
             g_pb_last_kernel_recovered[wslot] = 0;
             if (g_pb_last_kernel_kept[wslot] && !in.user_owned) {
+                if (kexcwit_diag()) {
+                    kexcwit_dump(in.cpu_index, "KEPT-SPAN-FOREIGN-USER",
+                                 in.cur ? in.cur->start_pc : 0, in.live_asid,
+                                 in.pinned_asid, in.cur_tp);
+                }
                 g_stats.kexc_kept_span_foreign_user++;
                 if (in.live_asid == in.pinned_asid) {
                     g_stats.kexc_kept_span_foreign_user_pinned_val++;
@@ -2381,6 +2658,11 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
             }
             kexc_user_tb(in.live_asid, in.user_owned, in.cur_tp,
                          in.cur_tp_strict);
+            if (kexcwit_diag()) {
+                kexcwit_open_span(in.cpu_index,
+                                  in.cur ? in.cur->start_pc : 0,
+                                  in.live_asid, in.user_owned);
+            }
             drop = !in.user_owned;
         } else {
             drop = !kexc_kernel_tb_keep(in);
@@ -2400,6 +2682,7 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
                     r = kexc_last_decline_ == 1 ? GAP_R_KEXC_NO_USER
                       : kexc_last_decline_ == 2 ? GAP_R_KEXC_NOT_OWNED
                       : kexc_last_decline_ == 4 ? GAP_R_KEXC_TP
+                      : kexc_last_decline_ == 5 ? GAP_R_KEXC_ROOT
                                                 : GAP_R_KEXC_CUT;
                 }
                 uint8_t kf = (uint8_t)((kexc_entry_owned_ ? 1 : 0) |

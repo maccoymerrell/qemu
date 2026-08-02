@@ -536,15 +536,43 @@ struct Stats {
      * reporting 0 on the PINNED process's own user TBs is one where the
      * identity rule cannot apply at all, and this counter says so. */
     uint64_t kexc_tp_null_samples = 0;
-    /* Misattribution WITNESS, measured on both rules: a kexc-KEPT kernel
-     * span flowed directly (no intervening owned user TB on this vCPU) into
-     * a user TB whose ownership verdict is FOREIGN — the kept span was then
-     * at least partly that foreign task's kernel work.  The _pinned_val
-     * flavour counts the narrow-ASID collision: the foreign user TB carries
-     * the pinned ASID VALUE (a rollover handed it over), the raw-value
-     * compare defect's smoking gun. */
+    /* Misattribution WITNESS, measured on both rules.  What it actually
+     * tests, stated as the code tests it: the LAST kernel TB this vCPU
+     * stepped was KEPT, and the next TB is a user TB whose ownership
+     * verdict is FOREIGN, with no user TB of any kind in between — so the
+     * kept span ran into another task's user code and its tail was that
+     * task's kernel work.  Two properties follow, and neither is a
+     * weakness of the invariant, only of its RESOLUTION: it speaks for the
+     * span's last block rather than for every block of the span, and it
+     * fires once per span however many blocks were misattributed.  It is
+     * therefore a lower bound on the phenomenon — measured on the x86
+     * system-clock cell, ONE count of this stood for 34,402 kernel TBs /
+     * 229,826 instructions kept under a foreign root.  The block-level
+     * measure is kexc_kernel_kept_foreign_root; this one remains because
+     * it is the wire-side statement (a span that ENDS foreign), and it is
+     * the only arm the narrow-ASID target has.  The _pinned_val flavour
+     * counts the narrow-ASID collision: the foreign user TB carries the
+     * pinned ASID VALUE (a rollover handed it over), the raw-value compare
+     * defect's smoking gun. */
     uint64_t kexc_kept_span_foreign_user = 0;
     uint64_t kexc_kept_span_foreign_user_pinned_val = 0;
+    /* The kept-span witness's CAUSE, measured at the block instead of at the
+     * span's end: kernel TBs KEPT on a wide-register target while the live
+     * address-space root was not the pinned one.  On such a target the root
+     * IS the process — the very argument the live-root recovery rests on to
+     * ADMIT — so a block executed under a foreign root is a foreign task's
+     * kernel work whatever the vCPU's user-TB history says.  It MUST be 0:
+     * the keep rule refuses those blocks, and this is what proves the
+     * refusal complete rather than typical.  The narrow-ASID target is
+     * deliberately absent — there a value match is a coincidence of recycled
+     * bits rather than identity, in BOTH directions. */
+    uint64_t kexc_kernel_kept_foreign_root = 0;
+    uint64_t kexc_kernel_kept_foreign_root_insns = 0;
+    /* Its complement, a condition counter: the kernel TBs that rule REFUSES,
+     * and the instructions in them — foreign kernel work the trace no longer
+     * carries.  Nonzero is health, not a defect. */
+    uint64_t kexc_kernel_refused_foreign_root = 0;
+    uint64_t kexc_kernel_refused_foreign_root_insns = 0;
     /* Narrow-ASID identity generation (see g_asid_identity_gen).  bumps
      * counts observations that the raw-value namespace recycled; the two
      * refusals count the raw-value comparisons that stood down because of

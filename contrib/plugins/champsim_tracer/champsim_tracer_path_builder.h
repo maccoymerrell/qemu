@@ -321,6 +321,16 @@ public:
                                    * physical-page verification on
                                    * narrow ones); false for kernel TBs
                                    * and when unpinned */
+        bool live_root_owned = true;
+                                  /* whether the LIVE address-space root is
+                                   * one the trace CAPTURES: the pin,
+                                   * another open window's root (Stage B1),
+                                   * or — under trace-all — any root at all.
+                                   * The glue fills it for kernel TBs on
+                                   * wide-register targets, where the root
+                                   * IS the process; everywhere else it
+                                   * stays true and the kernel keep rule's
+                                   * foreign-root refusal is inert */
         const struct qemu_plugin_cpu_event *evs;
         size_t n_evs;
         unsigned int cpu_index;

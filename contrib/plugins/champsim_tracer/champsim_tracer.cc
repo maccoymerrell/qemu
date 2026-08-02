@@ -7207,6 +7207,19 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
     /* Wide-register roots are per-process identities; the narrow-ASID (MIPS)
      * pin's reuse guard is armed exactly when they are not. */
     in.asid_is_identity = !g_pin_reuse_guard;
+    /* Does the trace CAPTURE the address space this block is executing in?
+     * The kernel keep rule refuses a block whose live root is nobody's the
+     * trace owns (see kexc_kernel_kept_foreign_root); asking here keeps the
+     * capture policy — the pin, Stage B1's owned set, trace-all's
+     * everything — in the one place that already knows it.  Kernel TBs on a
+     * wide-register target only, and the common case (the pin itself)
+     * short-circuits ahead of the set lookup; caller holds exec_lock, which
+     * every mutation of g_owned also holds. */
+    if (in.pinned && in.asid_is_identity && live_priv > 0) {
+        in.live_root_owned = live_asid == in.pinned_asid ||
+                             marker_trace_all() ||
+                             owned_contains_locked(live_asid);
+    }
 
     /* CST_TID2_DIAG: the delivery-condition instrument for the SMP async
      * ownership work.  For every async edge drained this step, print the

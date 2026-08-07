@@ -378,6 +378,52 @@ def parse_kexc_asid_writes(stats_text: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+# --------------------------------------------------------------------------
+# Guest health.
+#
+# A system-mode check measures the guest.  When the guest never reaches the
+# workload the check has no subject, and the ONE thing it must not do is
+# report the absence as a clean result.  That is not hypothetical: with
+# `panic=-1` and `-no-reboot`, a kernel that panics before init execs makes
+# qemu exit ZERO, so every gate downstream that reads only the process's
+# exit status sees success.  The signatures below are read out of the
+# guest's own console and each one fails the run BY NAME.
+# --------------------------------------------------------------------------
+GUEST_FATAL_SIGNATURES: list[tuple[str, str]] = [
+    ("Kernel panic - not syncing", "the guest kernel panicked"),
+    ("---[ end Kernel panic", "the guest kernel panicked"),
+    ("Attempted to kill init", "the guest kernel killed init"),
+    ("No working init found", "the guest kernel found no executable init"),
+    ("Failed to execute /init",
+     "the guest kernel could not exec /init (error -8 is ENOEXEC: the "
+     "staged userland's ABI does not match the -cpu model)"),
+    ("exists but couldn't execute it",
+     "the guest kernel found an init but could not exec it"),
+    ("Unable to handle kernel",
+     "an unhandled kernel memory fault in the guest"),
+    ("Internal error: Oops", "a guest kernel oops"),
+    ("Oops[#", "a guest kernel oops"),
+    ("kernel BUG at ", "a guest kernel BUG assertion"),
+    ("BUG: unable to handle", "a guest kernel BUG assertion"),
+    ("System halted", "the guest halted instead of running the workload"),
+]
+
+
+def scan_guest_console(console_text: str) -> list[str]:
+    """Every fatal guest-health signature present in @console_text, each
+    rendered as a sentence naming what happened.  Empty means the console
+    carries no evidence that the guest failed to reach the workload."""
+    out = []
+    for token, meaning in GUEST_FATAL_SIGNATURES:
+        idx = console_text.find(token)
+        if idx >= 0:
+            line = console_text[idx:console_text.find("\n", idx)
+                                if console_text.find("\n", idx) > 0
+                                else len(console_text)]
+            out.append(f"{meaning} — console says: {line.strip()[:160]!r}")
+    return out
+
+
 def default_kernel(isa: str) -> Path:
     b = _ISA_BOOT[isa]
     return SYSTEST_ROOT / b["dir"] / b["kernel"]

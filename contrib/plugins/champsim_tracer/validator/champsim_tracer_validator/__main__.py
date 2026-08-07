@@ -587,6 +587,28 @@ def _trace_system(args, isa: str, bin_path: Path, plugin: Path,
     if stall:
         print(f"trace[{isa}]: FAIL  clock stall: {stall}")
         return 1
+    # A GUEST THAT NEVER RAN THE WORKLOAD IS A FAILURE THAT MUST NAME
+    # ITSELF.  With `panic=-1` and `-no-reboot`, a kernel that panics before
+    # init execs makes qemu exit with status ZERO, so the return code alone
+    # reports success for a run that measured nothing; the checks below then
+    # fail on a downstream symptom ("no .cst") that says nothing about the
+    # cause.  The guest's own console is the only witness, and it is read
+    # here before any of it is believed.
+    try:
+        ctext = console.read_text(errors="replace")
+    except OSError as e:
+        print(f"trace[{isa}]: FAIL  the guest console log could not be read "
+              f"({e}) — a check that cannot find its subject fails")
+        return 1
+    fatal = SYS.scan_guest_console(ctext)
+    if fatal:
+        print(f"trace[{isa}]: FAIL  the guest did not run the workload "
+              f"(qemu exited rc={rc}):")
+        for why in fatal:
+            print(f"trace[{isa}]:       {why}")
+        for line in ctext.splitlines()[-15:]:
+            print(f"  {line}")
+        return 1
     cst = Path(f"{out_base}.cst")
     if sp_file:
         # Simpoint mode never writes <out_base>.cst: each scheduled cluster

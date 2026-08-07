@@ -217,11 +217,34 @@ void cpu_mips_stop_count(CPUMIPSState *env);
 
 static inline void mips_env_set_pc(CPUMIPSState *env, target_ulong value)
 {
-    env->active_tc.PC = value & ~(target_ulong)1;
-    if (value & 1) {
-        env->hflags |= MIPS_HFLAG_M16;
+    /*
+     * Bit 0 of a code address is the ISA-mode bit only on a CPU that
+     * implements MIPS16e or microMIPS.  The translator already applies
+     * exactly this test before it will let a register-indirect branch move
+     * the bit into MIPS_HFLAG_M16 (gen_branch(), MIPS_HFLAG_BR); a CPU
+     * model with neither ASE -- P5600, 20Kc, R4000, I6400, ... -- has no
+     * ISA mode to select, and there bit 0 is an ordinary address bit whose
+     * being set makes the fetch unaligned, which decode_opc() already
+     * reports as an address error (EXCP_AdEL).
+     *
+     * Setting MIPS_HFLAG_M16 on such a model instead puts the CPU into a
+     * mode it has no decoder for: mips_tr_translate_insn() falls through to
+     * its final else and returns WITHOUT advancing ctx->base.pc_next, so
+     * translator_loop() computes tb->size == 0 and setjmp_gen_code()'s
+     * assert(tb->size != 0) aborts the process.  Any caller of
+     * CPUClass::set_pc reaches it: gdb "continue at <odd addr>"
+     * (gdbstub.c), -device loader,addr=<odd>,cpu-num=N, or a TCG plugin
+     * using qemu_plugin_set_pc().
+     */
+    if (env->insn_flags & (ASE_MIPS16 | ASE_MICROMIPS)) {
+        env->active_tc.PC = value & ~(target_ulong)1;
+        if (value & 1) {
+            env->hflags |= MIPS_HFLAG_M16;
+        } else {
+            env->hflags &= ~(MIPS_HFLAG_M16);
+        }
     } else {
-        env->hflags &= ~(MIPS_HFLAG_M16);
+        env->active_tc.PC = value;
     }
 }
 

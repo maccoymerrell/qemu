@@ -15172,6 +15172,18 @@ static void mips_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     } else {
         gen_reserved_instruction(ctx);
         g_assert(ctx->base.is_jmp == DISAS_NORETURN);
+        /*
+         * MIPS_HFLAG_M16 is set on a CPU that implements neither MIPS16e
+         * nor microMIPS, so nothing was fetched and there is no instruction
+         * length to add.  The TB still needs one: translator_loop() derives
+         * tb->size from pc_next, and a zero-length TB trips
+         * assert(tb->size != 0) in setjmp_gen_code(), killing the process
+         * instead of delivering the Reserved Instruction exception just
+         * raised.  Two bytes is the shortest instruction any ISA mode of
+         * this architecture has, and no byte of it was consulted during
+         * translation, so it cannot under-cover the TB's invalidation range.
+         */
+        ctx->base.pc_next += 2;
         return;
     }
 

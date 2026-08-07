@@ -65,6 +65,14 @@ struct Stats {
      * genuinely unmapped in the current address space; a nonzero count on
      * a workload whose targets are resident indicates a bug. */
     uint64_t wp_first_tb_unavail = 0;
+    /* Wrong-path resume addresses the target refused to hold verbatim: a PC
+     * the walk computed (a faulting PC plus an instruction length, or a stuck
+     * PC nudged by one) that qemu_plugin_set_pc() re-interpreted instead of
+     * taking, so the walk would have resumed somewhere other than where it
+     * asked.  The live case is a MIPS code address with bit 0 set: that bit
+     * selects the MIPS16/microMIPS ISA mode rather than naming the address.
+     * Each one ends its excursion; the WP BBs already committed are kept. */
+    uint64_t wp_pc_not_representable = 0;
     /* Wrong-path BBs marked with a SYNTHETIC-DATA fault: a speculative memory
      * access to an absent/unreadable page served a deterministic placeholder
      * value, or a non-memory synchronous fault (arithmetic / illegal opcode)

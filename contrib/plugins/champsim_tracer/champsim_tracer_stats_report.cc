@@ -151,6 +151,7 @@ void append_stats_summary(GString *report, const char *label,
         { "WP synthetic faults",                 stats.wp_synthetic_faults },
         { "WP flush re-runs",                    stats.wp_flush_reruns },
         { "WP first-TB unavailable",             stats.wp_first_tb_unavail },
+        { "WP resume PC not representable",      stats.wp_pc_not_representable },
         /* Invariant, not a measurement: the wrong path walks past syscalls but
          * never performs one, so this must read 0.  See
          * qemu_plugin_spec_syscall_blocked_count(). */

@@ -216,6 +216,38 @@ static void wp_enter_spec_session(unsigned int cpu_index, uint64_t wrong_target,
 }
 
 /*
+ * Move the speculative PC and prove the target took the value verbatim.
+ *
+ * Every wrong-path resume address below is arithmetic — a faulting PC plus an
+ * instruction length, or a stuck PC nudged by one — so it can name a value the
+ * architecture does not represent as a program counter.  MIPS is the live
+ * case: bit 0 of a code address is the MIPS16/microMIPS ISA-mode bit, so
+ * set_pc(odd) does not resume at that address, it selects another instruction
+ * set at the even address below it.  The walk would then decode the guest in a
+ * mode it never entered — silently wrong wrong-path content on a
+ * MIPS16-capable model (24Kf/34Kf), and on a model that implements neither ASE
+ * (P5600) a mode with no decoder at all.
+ *
+ * The invariant needs no per-ISA knowledge here and holds on every target: the
+ * PC the walk resumes at must be the PC it asked for.  When it is not, the
+ * excursion cannot continue coherently and the caller ends it — the entry
+ * snapshot restores the architectural state and the WP BBs already committed
+ * are kept.  Counted, so "never happens" is a measurement rather than a claim.
+ */
+static bool wp_set_pc_checked(uint64_t pc)
+{
+    qemu_plugin_set_pc(pc);
+    if (qemu_plugin_get_pc() == pc) {
+        return true;
+    }
+    thread_stats_get().wp_pc_not_representable++;
+    if (Stats *h = g_current_hist_bucket) {
+        h->wp_pc_not_representable++;
+    }
+    return false;
+}
+
+/*
  * CST_FENCE_FORCE_SESSION=<n> — directed control (diagnostic, off by
  * default): when the n-th excursion ends (default 1), do NOT clear this
  * vCPU's wrong-path session bracket.  From then on the CORRECT path runs
@@ -499,7 +531,16 @@ static WpStep wp_check_forward_progress(WpWalkState &st)
             BBTemplate *stuck = g_wp_state.last_executed_tb;
             uint8_t isz = (stuck && stuck->n_insns > 0)
                 ? stuck->insn_sizes[0] : 1;
-            qemu_plugin_set_pc(pre_pc + isz);
+            if (!wp_set_pc_checked(pre_pc + isz)) {
+                /* The nudge landed on an address this target cannot hold as
+                 * a PC; there is no coherent place to resume.  Same shape as
+                 * the no-forward-progress bail above. */
+                poisoned_targets.insert(pre_pc);
+                acc.clear();
+                bb_reg_snaps.clear();
+                early_exit = true;
+                return WpStep::STUCK_BAIL;
+            }
             same_pre_pc_count = 0;
             prev_pre_pc = UINT64_MAX;
             return WpStep::NEXT_ITER;
@@ -1170,7 +1211,15 @@ static WpStep wp_handle_fault_fragment(WpWalkState &st, BBTemplate *cur,
                             walk_done = true;
                             return WpStep::BREAK_WALK;
                         }
-                        qemu_plugin_set_pc(fault_pc);
+                        if (!wp_set_pc_checked(fault_pc)) {
+                            /* @fault_pc came from the target's own get_pc, so
+                             * a refusal here means the value does not survive
+                             * the round trip; the accumulated BB would be
+                             * committed against a PC the guest is not at. */
+                            acc.clear();
+                            bb_reg_snaps.clear();
+                            early_exit = true;
+                        }
                         walk_done = true;
                         return WpStep::BREAK_WALK;
                     }
@@ -1214,7 +1263,20 @@ static WpStep wp_handle_fault_fragment(WpWalkState &st, BBTemplate *cur,
                      * survive the skip.
                      */
                     qemu_plugin_spec_clear_exception();
-                    qemu_plugin_set_pc(skip_pc);
+                    if (!wp_set_pc_checked(skip_pc)) {
+                        /* Stepping one instruction length past the faulting
+                         * PC produced an address this target does not
+                         * represent as a PC — the wrong path had already
+                         * reached an address the architecture cannot fetch
+                         * from (an unaligned MIPS target, the live case).
+                         * There is nothing to skip TO: end the excursion
+                         * rather than resume somewhere else. */
+                        acc.clear();
+                        bb_reg_snaps.clear();
+                        early_exit = true;
+                        walk_done = true;
+                        return WpStep::BREAK_WALK;
+                    }
 
                     /*
                      * Poison the faulting PC so a wrong path that circles back

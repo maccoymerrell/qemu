@@ -54,6 +54,24 @@ ISA_CFLAGS = {
     "mipsel":  [
         "-static", "-nostdlib", "-nostartfiles", "-e", "_start",
         "-mno-abicalls", "-fno-pic",
+        # The system-mode guest runs on -cpu P5600, whose FCR31 resets with
+        # ABS2008|NAN2008 set and read-only, so the CPU implements the IEEE
+        # 754-2008 NaN encoding and nothing else.  Linux reads that back
+        # from the FPU and rejects a legacy-NaN ELF with -ENOEXEC, so a
+        # workload built without this flag cannot execute in the system
+        # guest at all.  -mnan=2008 costs nothing here because these
+        # binaries are -nostdlib: there is no libc to find a matching
+        # multilib for (the mipsel-linux-gnu cross toolchain has none, and
+        # ld refuses to link the two NaN ABIs together).
+        #
+        # This also moves USER mode onto P5600: qemu-user picks the CPU
+        # model from the ELF, and linux-user/mips/target_elf.h maps
+        # EF_MIPS_NAN2008 to "P5600" (everything else o32 lands on 24Kf).
+        # That is deliberate -- one binary, one ABI, the same CPU under
+        # qemu-mipsel and qemu-system-mipsel -- but it is a CPU change, so
+        # P5600's wider feature set (MSA, EVA, XPA, the 2008 NaN encoding)
+        # is now what user-mode mipsel cells trace.
+        "-mnan=2008",
     ],
 }
 
@@ -658,7 +676,7 @@ def _run_and_log(cmd: list[str], log_path: Path) -> int:
 
 
 def _check_segment_coverage(console_log: Path, require_ok: bool = False,
-                            label: str = "") -> int:
+                            label: str = "", smp: int = 1) -> int:
     """Assert the plugin's per-segment coverage line from the captured
     console log: ``finished segment [...] user_covered=C user_budget=B
     ... FLAG``.  UNDER means the window closed before its budget for a
@@ -671,12 +689,20 @@ def _check_segment_coverage(console_log: Path, require_ok: bool = False,
     except OSError:
         print(f"coverage[{label}]: FAIL  console log missing: {console_log}")
         return 1
+    # Did the guest actually online the vCPUs this cell asked for?  Checked
+    # before the coverage lines because an smp>1 cell that came up with one
+    # CPU tests no concurrency at all, yet every downstream check still
+    # passes -- the reading this gate exists to prevent.
+    rc_cpus = 0
+    for msg in SYS.assess_online_cpus(text, smp, label=label):
+        print(f"smp: {msg}  FAIL")
+        rc_cpus = 1
     segs = SYS.parse_finished_segments(text)
     if not segs:
         print(f"coverage[{label}]: FAIL  no 'finished segment' line in "
               f"{console_log.name} (plugin never closed a window)")
         return 1
-    rc = 0
+    rc = rc_cpus
     for s in segs:
         ratio = (s["trace_arch_insns"] / s["covered"]) if s["covered"] else 0.0
         line = (f"coverage[{label}]: covered={s['covered']} "
@@ -814,7 +840,8 @@ def cmd_validate(args, isa: str | None = None) -> int:
         # System-mode runs capture the guest console; the plugin's
         # segment-close line must not report an under-budget close.
         console = Path(f"{_trace_base(args.out_dir, prog, isa)}.console.log")
-        if console.is_file() and _check_segment_coverage(console, label=isa):
+        if console.is_file() and _check_segment_coverage(
+                console, label=isa, smp=getattr(args, "smp", 1)):
             rc = 1
     return rc
 
@@ -890,8 +917,10 @@ _THREAD_TEST_CC = {
     "aarch64": ["aarch64-linux-gnu-g++"],
     "riscv64": ["riscv64-linux-gnu-g++", "-march=rv64gc",
                 "-mabi=lp64d", "-mno-relax", "-Wl,--no-relax"],
+    # -mnan=2008 for the same reason as ISA_CFLAGS: the system guest boots
+    # on a 2008-NaN-only CPU and will not exec a legacy-NaN ELF.
     "mipsel":  ["mipsel-linux-gnu-g++", "-mno-abicalls",
-                "-fno-pic", "-e", "_start"],
+                "-fno-pic", "-e", "_start", "-mnan=2008"],
 }
 
 
@@ -1008,7 +1037,8 @@ def cmd_thread_test(args) -> int:
                            if i.check == "thread_chain"
                            and i.severity == "info"), 0)
             run_ok = (not report.errors()) and chains == 2
-            if _check_segment_coverage(console, label=isa):
+            if _check_segment_coverage(console, label=isa,
+                                       smp=getattr(args, "smp", 1)):
                 run_ok = False
             # Decoupling evidence from the vCPU<->tid bindings (diag).
             # thread_id == vCPU index would force every binding to be
@@ -1135,7 +1165,8 @@ def cmd_churn_test(args) -> int:
         if report.errors():
             rc_total = 1
 
-        if _check_segment_coverage(console, require_ok=True, label=isa):
+        if _check_segment_coverage(console, require_ok=True, label=isa,
+                                   smp=getattr(args, "smp", 1)):
             rc_total = 1
 
         stats_log = Path(f"{out_base}.stats.log")

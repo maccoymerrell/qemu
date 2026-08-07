@@ -80,9 +80,12 @@ class MPResult:
 
 _CC = {
     "x86_64": ("g++", ["-static", "-nostdlib", "-nostartfiles"]),
+    # -mnan=2008: the mipsel system guest boots on a CPU whose FCR31 pins
+    # NAN2008 read-only, and Linux refuses a legacy-NaN ELF there.  See
+    # ISA_CFLAGS in __main__.py.
     "mipsel": ("mipsel-linux-gnu-g++",
                ["-static", "-nostdlib", "-nostartfiles", "-e", "_start",
-                "-mno-abicalls", "-fno-pic"]),
+                "-mno-abicalls", "-fno-pic", "-mnan=2008"]),
 }
 _COMMON_CFLAGS = ["-O1", "-fno-asynchronous-unwind-tables",
                   "-fno-stack-protector", "-fno-optimize-sibling-calls"]

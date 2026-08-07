@@ -79,6 +79,31 @@ _ISA_BOOT = {
                 # use.
                 "machine": ["-M", "virt", "-cpu", "max"],
                 "console": "ttyS0"},
+    # P5600 is the only MIPS model in QEMU that sets Config3.PW
+    # (target/mips/cpu-defs.c.inc), so it is the only one on which the guest
+    # kernel enables the hardware page-table walker and therefore the only
+    # one on which CP0_PWBase -- the page-table root Linux writes from
+    # htw_set_pwbase() at every switch_mm -- is a live register.  The
+    # ownership model keys on that root, so the mipsel system guest boots on
+    # P5600; "Hardware Page Table Walker enabled" on the console is the
+    # condition that says so, and it does not appear on the malta default
+    # (24Kc).
+    #
+    # ieee754=relaxed: P5600 resets FCR31 with ABS2008|NAN2008 set and its
+    # rw_bitmask (0xFF83FFFF) makes both bits read-only, so Linux probes the
+    # FPU as 2008-NaN-only and, under the default ieee754=strict, refuses
+    # every legacy-NaN ELF with -ENOEXEC -- including the base rootfs's
+    # busybox, which panics the guest at "No working init found".  The
+    # validator's own guest binaries are built -mnan=2008 (ISA_CFLAGS) and
+    # need no override; the imported busybox cannot be, because the
+    # mipsel-linux-gnu cross toolchain ships no 2008-NaN libc multilib and
+    # ld refuses to mix the two ABIs.  ieee754=relaxed is the upstream
+    # kernel parameter for exactly this ("accept any binaries regardless of
+    # whether supported by the FPU", arch/mips/kernel/fpu-probe.c); it
+    # changes admission only, never code generation, and on this CPU it
+    # cannot change FP semantics either, because FCSR.NAN2008 is read-only 1
+    # no matter which ELF is admitted.  Drop it once the base rootfs is
+    # rebuilt against a 2008-NaN libc.
     "mipsel":  {"dir": "mipsel",  "kernel": "vmlinux",
                 # -cpu P5600 is REQUIRED, not a tuning choice: it is the only
                 # QEMU MIPS model implementing Config3.PW / CP0 PWBase, the
@@ -91,8 +116,65 @@ _ISA_BOOT = {
                 # Config3.ULRI (thread ids keep working) and Config3.CMGCR
                 # (the malta CPS SMP path).
                 "machine": ["-M", "malta", "-cpu", "P5600"],
-                "console": "ttyS0"},
+                "console": "ttyS0",
+                # BLOCKER 3 (d9aa0e05ef): the shipped base rootfs is a
+                # legacy-NaN o32 userland and P5600 pins FCR31.NAN2008=1,
+                # so arch_check_elf() answers -ENOEXEC for every one of its
+                # binaries and the guest panics "No working init found".
+                # ieee754=relaxed changes ADMISSION only, never code
+                # generation, and on this CPU it cannot change FP semantics
+                # either.  Drop it once the base rootfs is rebuilt 2008-NaN.
+                "extra_append": "ieee754=relaxed"},
 }
+
+# Per-ISA CPU override used only when more than one vCPU is asked for.
+#
+# mipsel: P5600 cannot be brought up multi-vCPU under QEMU.  malta routes
+# -smp >1 on a Config3.CMGCR CPU through the CPS block, and QEMU's CPS
+# models N vCPUs as N VPs inside ONE core (hw/misc/mips_cmgcr.c returns 0
+# for GCR_CONFIG, so PCORES == 0), while Linux only counts more than one VP
+# per core when the CPU has the MT ASE or the Release 6 VP bit
+# (mips_cps_numvps(), arch/mips/include/asm/mips-cps.h).  P5600 is MIPS32r5
+# with neither, so the topology comes out {1} total 1 and the guest boots
+# single-CPU.  34Kf has the MT ASE and no CMGCR, so it takes malta's
+# non-CPS path and Linux's MT SMVP bring-up, which does online every vCPU.
+# The cost is that 34Kf has no Config3.PW: a multi-vCPU mipsel guest and a
+# guest with CP0_PWBase are, today, mutually exclusive.  ONLINE_CPUS_RE
+# below turns any silent fallback into a failure rather than a quiet
+# single-CPU run.
+_ISA_SMP_CPU = {
+    "mipsel": "34Kf",
+}
+
+# The kernel's own count of the vCPUs it actually onlined.  A cell that asks
+# for N vCPUs and silently gets one is not an SMP cell; every check that
+# depends on concurrency then passes for the wrong reason.
+_ONLINE_CPUS_RE = re.compile(r"smp: Brought up \d+ nodes?, (\d+) CPUs?")
+
+
+def parse_online_cpus(console_text: str) -> int | None:
+    """How many vCPUs the guest kernel reported onlining, or None when the
+    line is absent (a kernel built without SMP never prints it)."""
+    m = _ONLINE_CPUS_RE.search(console_text)
+    return int(m.group(1)) if m else None
+
+
+def assess_online_cpus(console_text: str, smp: int,
+                       label: str = "") -> list[str]:
+    """One message per way the guest failed to online the vCPUs the cell
+    asked for.  A check that cannot find its subject fails: an smp>1 cell
+    whose console has no "Brought up" line at all is reported, not passed."""
+    if not smp or int(smp) <= 1:
+        return []
+    got = parse_online_cpus(console_text)
+    if got is None:
+        return [f"{label}: asked for {int(smp)} vCPUs but the guest never "
+                f"printed an 'smp: Brought up ...' line -- the kernel is "
+                f"not an SMP kernel, or it never finished bringing CPUs up"]
+    if got != int(smp):
+        return [f"{label}: asked for {int(smp)} vCPUs but the guest onlined "
+                f"{got} -- this cell did not test concurrency"]
+    return []
 
 
 # The plugin's per-segment close line (stderr).  In marker mode the
@@ -524,7 +606,15 @@ def build_cst_attach(isa: str, out_dir: Path) -> Path | None:
     skips rather than staging an injector that cannot run).
 
     Static, because the guest rootfs it is staged into is a busybox tree
-    with no matching dynamic loader for a foreign toolchain's libc."""
+    with no matching dynamic loader for a foreign toolchain's libc.
+
+    Deliberately NOT built -mnan=2008 on mipsel even though the guest runs
+    on a 2008-NaN-only CPU: this one links against libc, and the
+    mipsel-linux-gnu cross toolchain has no 2008-NaN multilib -- the build
+    dies at <gnu/stubs-o32_hard_2008.h>, and forcing it through would hit
+    ld's refusal to merge the two NaN ABIs.  It is admitted by the
+    ieee754=relaxed on the mipsel kernel command line, alongside busybox,
+    until the base rootfs and its libc are rebuilt 2008-NaN."""
     cc = ISA_ATTACH_CC.get(isa)
     if cc is None or shutil.which(cc) is None:
         return None

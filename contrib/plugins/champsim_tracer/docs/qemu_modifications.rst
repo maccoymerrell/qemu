@@ -324,8 +324,9 @@ Plugin API additions
    current EL / ``TTBR0_EL1`` / ``SCTLR.M``
    (``target/arm/cpu.c``), RISC-V from ``priv`` / ``SATP`` /
    (``SATP != 0 && priv != M``) (``target/riscv/tcg/tcg-cpu.c``), and
-   MIPS from ``KSU`` / ``EntryHi.ASID`` / always-true (the MIPS TLB has
-   no global enable) (``target/mips/cpu.c``).  ``plugins/api.c`` calls
+   MIPS from ``KSU`` / ``CP0 PWBase`` (``EntryHi.ASID`` on a model
+   without ``Config3.PW``) / always-true (the MIPS TLB has no global
+   enable) (``target/mips/cpu.c``).  ``plugins/api.c`` calls
    the hook when present and otherwise returns the user-mode defaults.
    The hook is gated ``CONFIG_PLUGIN && !CONFIG_USER_ONLY``; porting a
    new ISA to system-mode tracing means implementing it (see
@@ -346,7 +347,7 @@ Plugin API additions
    point (beside the ``ASID_WRITE`` push) and on demand from the API.
    Plugins receive only the ids, through
    ``qemu_plugin_get_process_id()`` and ``qemu_plugin_get_thread_id()``
-   (``QEMU_PLUGIN_VERSION = 18``), so nothing a plugin does can come to
+   (``QEMU_PLUGIN_VERSION = 19``), so nothing a plugin does can come to
    depend on a target's register width, layout or reuse behaviour.
 
    Each target composes its keys only where the architecture itself
@@ -363,9 +364,20 @@ Plugin API additions
      ``TTBR1_EL1``; ``TPIDR_EL0``.
    * RISC-V — ``SATP`` (already ``{MODE, ASID, PPN}``), or ``VSATP``
      under H-extension virtualization; ``tp`` (``x4``).
-   * MIPS — ``EntryHi.ASID`` under the CPU's ASID mask, with
+   * MIPS — ``CP0 PWBase``, the hardware page-table walker's base
+     register, on a model implementing the walker (``Config3.PW``),
+     normalised to a physical address when the kernel names it through
+     kseg0/kseg1.  This makes MIPS the same kind of target as the other
+     three: the key is the root the hardware translates from, per-``mm``,
+     identical on every vCPU running that ``mm``, and distinct for a
+     ``fork`` child from its first instruction.  Zero is **not** a
+     fallback — a guest that never programmed the register (``nohtw``,
+     ``CONFIG_MIPS_HTW=n``) reports an absence, and substituting the
+     narrow tag there would silently restore the reuse hazard on exactly
+     the boots where it is invisible.  A model without ``Config3.PW``
+     reports ``EntryHi.ASID`` under the CPU's ASID mask, with
      ``CP0 MemoryMapID`` above it when ``Config5.MI`` makes MemoryMapID
-     the TLB tag; ``CP0 UserLocal``.
+     the TLB tag.  Thread key: ``CP0 UserLocal``.
 
    A key of 0 means "the architecture names nothing in this state" and
    is never interned, so id 0 is an *absence*, not an identity: a target
@@ -379,6 +391,67 @@ Plugin API additions
    registered ``QEMU_PLUGIN_CB_R_REGS`` or ``QEMU_PLUGIN_CB_RW_REGS``;
    the per-vCPU memo makes a sample taken elsewhere self-correcting at
    the next coherent one rather than sticky.
+
+``include/hw/core/cpu.h``, ``plugins/api-system.c`` and per-target
+``CPUClass::plugin_identity_caps``
+
+   A CLASS method — ``plugin_identity_caps(ObjectClass *oc)`` — reporting
+   which identity keys the RESOLVED CPU MODEL can supply, exported to
+   plugins as ``qemu_plugin_identity_caps()``.  It takes the class, not a
+   ``CPUState``, because the question it answers has to be answerable
+   from ``qemu_plugin_install()``: ``system/vl.c`` resolves
+   ``current_machine->cpu_type`` from the board default and then from
+   ``-cpu`` well before ``qmp_x_exit_preconfig()`` reaches
+   ``qemu_init_board()``, which loads plugins and only then calls
+   ``machine_run_board_init()``.  A plugin whose output would be invalid
+   without a page-table root can therefore refuse the run before the
+   first vCPU exists.
+
+   It is installed from each target's own ``class_init`` (i386 and
+   RISC-V in ``target/*/cpu.c``, not their ``tcg-cpu.c``): the
+   accelerator's ``init_accel_cpu`` hook runs from
+   ``accel_init_interfaces()``, which is called *inside*
+   ``machine_run_board_init()`` — a caps method installed there would
+   read NULL at exactly the moment it is asked for.
+
+   x86-64, AArch64 and RISC-V answer ``SPACE_IS_ROOT | NAMES_THREAD``
+   unconditionally.  MIPS reads its model definition's ``CP0_Config3``
+   for ``PW`` (bit 24) and ``ULRI`` (bit 13); today only ``P5600``
+   sets ``PW``.  ``-M none``, an unresolvable ``cpu_type`` and a target
+   without the method all report an empty mask, so the safe answer is
+   the default rather than an assumption.
+
+``include/accel/tcg/cpu-ops.h`` and
+``TCGCPUOps::get_plugin_narrow_asid``
+
+   ``get_plugin_narrow_asid(cpu)``, exported as
+   ``qemu_plugin_get_narrow_asid()``, reports the target's exhaustible
+   TLB TAG where that is a different value from the page-table root —
+   MIPS ``EntryHi.ASID`` (with ``MemoryMapID``).  NULL, hence 0, on
+   x86-64, AArch64 and RISC-V, whose TLB tag is a field of the root
+   register itself.
+
+   It is explicitly **not** an identity, and the API documentation says
+   so: an operating system re-points these tags at different live
+   address spaces.  It exists so that a consumer can WITNESS that
+   recycling with a value independent of the identity key it
+   corroborates — a rollover test that measured the guest's ASID sweep
+   through the ownership key would only be restating its own premise.
+
+``target/mips/tcg/translate.c``, ``target/mips/tcg/system_helper.h.inc``
+and ``target/mips/tcg/system/cp0_helper.c``
+
+   ``mtc0``/``dmtc0`` to ``CP0 PWBase`` were inline TCG stores; they are
+   now ``helper_mtc0_pwbase`` / ``helper_dmtc0_pwbase``.  The write is
+   the MIPS ADDRESS-SPACE COMMIT POINT — Linux reaches it from
+   ``htw_set_pwbase()`` inside ``TLBMISS_HANDLER_SETUP_PGD()``, i.e. at
+   every ``switch_mm``/``activate_mm`` — so the plugin identity has to be
+   resampled exactly there.  The helper stores the value and, only when
+   it changed, pushes ``QEMU_PLUGIN_CPU_EVENT_ASID_WRITE``; there is no
+   ``tlb_flush``, because PWBase says where the walker starts and
+   invalidates no existing translation.  ``cpu_plugin_evq_push`` is inert
+   on the wrong path and compiled out under ``--disable-plugins``,
+   leaving one helper call per context switch.
 
 ``plugins/api.c`` and ``disas/disas-target.c``
 

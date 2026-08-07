@@ -171,6 +171,29 @@ struct CPUClass {
 
     void (*disas_set_info)(CPUState *cpu, disassemble_info *info);
 
+    /**
+     * @plugin_identity_caps: what the RESOLVED CPU MODEL can name
+     *
+     * Optional.  Reports, as a bitmask of enum qemu_plugin_identity_cap,
+     * which of the two identity keys of TCGCPUOps::get_plugin_identity this
+     * particular model can actually supply.  The distinction is a property
+     * of the model, not of the target: on MIPS the page-table root lives in
+     * CP0 PWBase, which only a model with Config3.PW implements, and CP0
+     * UserLocal only exists with Config3.ULRI.  On the targets whose root
+     * and thread registers are architecturally mandatory (x86-64 CR3/FS.base,
+     * AArch64 TTBR0/TPIDR_EL0, RISC-V SATP/tp) every model answers with both
+     * bits set.
+     *
+     * A CLASS method taking the ObjectClass deliberately: a plugin has to be
+     * able to decide whether a capture is possible AT INSTALL TIME, which is
+     * before machine_run_board_init() and therefore before the first
+     * CPUState exists.  See qemu_plugin_identity_caps().
+     *
+     * NULL means "names nothing" — the caller must treat a missing method
+     * exactly as a zero mask, never as "assume it works".
+     */
+    uint64_t (*plugin_identity_caps)(ObjectClass *oc);
+
     const char *deprecation_note;
     struct AccelCPUClass *accel_cpu;
 

@@ -520,7 +520,7 @@ under a live process is the one thing that can move it.**  The tracer
 asks QEMU which address space a vCPU is executing in
 (``qemu_plugin_get_process_id()``: an opaque id QEMU mints per distinct
 architectural value — x86-64 CR3 with PCID, AArch64 TTBR0_EL1 with the
-ASID ``TCR_EL1.A1`` selects, RISC-V SATP, MIPS ``EntryHi.ASID``) and
+ASID ``TCR_EL1.A1`` selects, RISC-V SATP, MIPS CP0 ``PWBase``) and
 traces a block exactly when that space is one a marker opened.  Every
 thread inside an owned address space is traced, including one the trace
 has never seen; the thread id only labels strands on the wire.  Nothing
@@ -540,42 +540,63 @@ rather than assumed away:
   this, so the mitigations are the window-closing ones —
   ``latch_timeout=<ms>`` and ``latch_idle_insns=<N>`` — not an identity
   test.
-* **A narrow address-space name reassigned to a LIVE process** (32-bit
-  MIPS: ``EntryHi.ASID`` is 8 bits over a 16-entry TLB, so rollover is
-  the normal state).  The name says which address space is executing
-  now, so ownership follows it; what survives the renaming is the
-  thread.  One rule handles it: if a thread already seen inside an owned
-  space reappears under a name the trace does not own, **the pin
-  re-binds** — the old name stops being owned that instant, and the
-  window's wire identity, liveness stamps and thread set move across, so
-  nothing of the traced process is dropped (``pin re-bound to a new
-  address-space name``).
+* **A narrow address-space TAG reassigned to a LIVE process** (MIPS
+  ``EntryHi.ASID`` is 8 bits over a 16-entry TLB, so rollover is the
+  normal state on a busy guest).  This is **not** an exposure, because
+  the tag is not the identity: on any MIPS model implementing the
+  hardware page-table walker the reported address space is **CP0
+  PWBase**, the base the walker itself translates from, which Linux
+  writes at every ``switch_mm``.  Two live address spaces cannot share
+  a page-table root, so a rollover renames nothing the tracer looks at
+  — there is no re-bind rule, no claim, no deferred verdict, and no
+  instruction of the traced process is ever withheld or dropped waiting
+  for one.  A ``fork()`` child is distinguished by construction: it gets
+  a new ``mm``, hence a new pgd, hence a different address space from
+  its first instruction, and no thread pointer is consulted so none can
+  be forged.  The same root is reported on every vCPU running that
+  ``mm``, so an SMP migration is not a rename either.
 
-  **That rule is implemented but off by default** (``CST_PIN_REBIND=1``
-  arms it), because the identity it rests on is forged by ``fork()``:
-  Linux copies a thread's TLS pointer verbatim into the child, so a
-  forked child's first thread carries the parent's value and presents as
-  "a thread of an owned space under a name the trace does not own".
-  Armed, the pin follows it — the same trace-invalidating outcome the
-  address-space key exists to prevent.  A second reason it cannot carry
-  SMP: on MIPS the ASID is allocated *per CPU*, so one address space has
-  up to one name per vCPU and a migration is a legitimate change of name;
-  joining the new name needs evidence of sameness, and the thread pointer
-  is exactly the evidence ``fork`` forges.  Until that evidence exists, a
-  MIPS address space that is renamed — by rollover or by migration —
-  leaves the window rather than moving it, and the window closes.
+  Two counters witness the guest's behaviour without participating in
+  any decision: ``distinct raw ASID names committed since the pin``
+  (how much of the tag space the guest burned) and ``distinct raw ASID
+  names the OWNED space executed under`` (greater than one exactly when
+  the guest renamed a live address space and the trace kept following
+  it).
 
-  The rule needs a thread the architecture names.  A MIPS CPU model with
-  ``Config3.ULRI`` clear implements no ``UserLocal`` register — this
-  includes the 24K class, the canonical Malta default — and there is
-  then nothing to re-bind against.  The tracer says so once at pin time
-  and counts it (``no architectural thread name on this CPU model``);
-  if the pinned name is then demonstrably handed out again, the window
-  is **retired** (``windows retired on an unbindable name
-  reassignment``) rather than followed, because an unmarked process
-  contributing any instruction invalidates the trace outright while a
-  short window merely truncates it.  A model that implements UserLocal
-  (34Kf, 74Kf, P5600, …) has no such gap.
+**A system-mode capture requires a CPU model that supplies a page-table
+root, and a guest that programmed it.**  This is a refusal, not a
+degradation.  x86-64 (CR3), AArch64 (TTBR0_EL1) and RISC-V (SATP)
+supply one on every model.  On MIPS the register is **CP0 PWBase**, and
+only a model advertising ``Config3.PW`` implements it — in QEMU today
+that is **P5600** alone.  ``hw/mips/malta.c`` defaults to 24Kf on
+MIPS32 and 20Kc on MIPS64, so ``-cpu P5600`` is **required** for a
+mipsel system capture::
+
+    qemu-system-mipsel -M malta -cpu P5600 ...
+
+Two refusals enforce it, both before any byte is written:
+
+* the CPU model implements no root — refused at ``qemu_plugin_install``,
+  so QEMU exits non-zero before the first vCPU exists, before any block
+  is translated and before any marker byte can be read;
+* the model implements one but the guest never programmed it (``nohtw``
+  on the kernel command line, ``CONFIG_MIPS_HTW=n``, or a kernel that
+  declined the walker) — the live value is 0, which is an absence and
+  not a name, so the window refuses to **open** at the START marker and
+  the process exits ``89``.  A window that has already emitted bytes is
+  never retired by this path.
+
+The guest kernel must therefore print ``Hardware Page Table Walker
+enabled``.  For ``-smp > 1`` it also needs ``CONFIG_MIPS_CPS=y``: P5600
+has no MT ASE and brings secondaries up through CPS, so a kernel built
+only with ``CONFIG_MIPS_MT_SMP`` silently comes up with one vCPU.
+
+**PWBase is guest-writable, so a guest that repurposed it would be
+misread.**  Unlike a thread pointer this is self-enforcing — the
+hardware walker translates from the value, so a guest that put
+something else there would fault rather than merely be mislabelled —
+but it is an assumption about guest behaviour and is stated here as
+one.
 
 **Wrong-path excursions are time-transparent, but not free.**  An
 excursion consumes zero guest time — the guest virtual clock is frozen

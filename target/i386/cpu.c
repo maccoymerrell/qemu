@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/qemu-plugin.h"
 #include "qemu/units.h"
 #include "qemu/cutils.h"
 #include "qemu/qemu-print.h"
@@ -8940,6 +8941,28 @@ static const struct SysemuCPUOps i386_sysemu_ops = {
 };
 #endif
 
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+/*
+ * Which identity keys this MODEL can supply (CPUClass::plugin_identity_caps).
+ * Both, unconditionally: CR3 is the page-table root on every x86 CPU that
+ * pages and the FS/GS bases are architectural, so no model names an address
+ * space by anything narrower.  Answering the query at all is what lets a
+ * plugin state its precondition once, ISA-agnostically, instead of
+ * special-casing the one target whose models differ.
+ *
+ * Set from the CPU type's own class_init rather than from the accelerator's
+ * init_accel_cpu hook: the query has to be answerable from
+ * qemu_plugin_install(), which QEMU runs immediately before
+ * machine_run_board_init(), and accel_init_interfaces() — the only thing
+ * that calls init_accel_cpu — runs INSIDE machine_run_board_init().  A caps
+ * method installed there would read NULL at exactly the moment it is asked.
+ */
+static uint64_t x86_plugin_identity_caps(ObjectClass *oc)
+{
+    return QEMU_PLUGIN_IDENT_SPACE_IS_ROOT | QEMU_PLUGIN_IDENT_NAMES_THREAD;
+}
+#endif
+
 static void x86_cpu_common_class_init(ObjectClass *oc, void *data)
 {
     X86CPUClass *xcc = X86_CPU_CLASS(oc);
@@ -8971,6 +8994,9 @@ static void x86_cpu_common_class_init(ObjectClass *oc, void *data)
 #ifndef CONFIG_USER_ONLY
     cc->sysemu_ops = &i386_sysemu_ops;
 #endif /* !CONFIG_USER_ONLY */
+#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+    cc->plugin_identity_caps = x86_plugin_identity_caps;
+#endif
 
     cc->gdb_arch_name = x86_gdb_arch_name;
 #ifdef TARGET_X86_64

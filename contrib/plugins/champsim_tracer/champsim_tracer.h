@@ -348,7 +348,18 @@ inline constexpr size_t CST_EVQ_TB_EVENT_MAX = 512 + 4;
  */
 #define CST_RT_GATE_EXIT         88
 
-#define CST_FID_SLOT_COUNT       (cst_wire::FID_SLOT_COUNT)  /* slots per slotted family */
+/*
+ * Process exit status when the tracer REFUSES TO OPEN a window because the
+ * guest never programmed the page-table-root register the capture would be
+ * identified by (a MIPS guest booted with "nohtw", or built
+ * CONFIG_MIPS_HTW=n, so CP0 PWBase reads 0 and names no address space).
+ * Deliberately distinct from CST_RT_GATE_EXIT: nothing was captured and
+ * nothing was abandoned -- the window never opened and no trace file exists,
+ * so a harness must not read this as a truncated capture.
+ */
+#define CST_NO_ROOT_EXIT         89
+
+#define CST_FID_SLOT_COUNT      (cst_wire::FID_SLOT_COUNT)  /* slots per slotted family */
 #define CST_FID_SLOT_STRIDE      8    /* family IDs per slot (== family count) */
 #define CST_MAX_WIDE_BYTES       (cst_wire::WIDE_BYTES_MAX)  /* 512-bit data/reg scalar cap */
 

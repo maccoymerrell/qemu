@@ -6064,7 +6064,7 @@ static void gen_mtc0(DisasContext *ctx, TCGv arg, int reg, int sel)
             break;
         case CP0_REG05__PWBASE:
             check_pw(ctx);
-            gen_mtc0_store32(arg, offsetof(CPUMIPSState, CP0_PWBase));
+            gen_helper_mtc0_pwbase(tcg_env, arg);
             register_name = "PWBase";
             break;
         case CP0_REG05__PWFIELD:
@@ -7530,7 +7530,7 @@ static void gen_dmtc0(DisasContext *ctx, TCGv arg, int reg, int sel)
             break;
         case CP0_REG05__PWBASE:
             check_pw(ctx);
-            tcg_gen_st_tl(arg, tcg_env, offsetof(CPUMIPSState, CP0_PWBase));
+            gen_helper_dmtc0_pwbase(tcg_env, arg);
             register_name = "PWBase";
             break;
         case CP0_REG05__PWFIELD:

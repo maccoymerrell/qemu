@@ -697,11 +697,13 @@ asids is two different physical memories, and a consumer that models a cache
 or memory hierarchy must qualify every address by the current asid.  The wire
 carries a **compact asid index** assigned on first sighting (0, 1, 2, …); each
 index's identity — the page-table root physical address (``root_phys``: CR3 /
-TTBR0/1 base / SATP PPN / MIPS pgd) plus a content ``sig`` disambiguating a
-reused root — rides that index's first ``BODY_TAG_ASID_SWITCH``, mirroring how a
-thread's register file rides its first ENTRY.  The root-physical is used
-rather than the architectural ASID field because the latter (8/16-bit on ARM
-and MIPS) rolls over and is reused across a long trace.
+TTBR0/1 base / SATP PPN / MIPS ``CP0 PWBase``, normalised to a physical
+address when the kernel names it through kseg0/kseg1) plus a content ``sig``
+disambiguating a reused root — rides that index's first
+``BODY_TAG_ASID_SWITCH``, mirroring how a thread's register file rides its
+first ENTRY.  The root-physical is used rather than the architectural ASID
+field because the latter (8/16-bit on ARM and MIPS) rolls over and is reused
+across a long trace.
 
 A single-address-space (marker/pin) trace declares asid index 0 in the opening
 context record and never switches the asid dimension again: every virtual
@@ -1335,7 +1337,8 @@ memory.
 
 ``previous_asid_index`` starts at 0.  The **compact asid index** is
 assigned on first sighting (0, 1, 2, …); its identity — ``root_phys``
-(the page-table root physical: CR3, TTBR0/1 base, SATP PPN, or MIPS pgd)
+(the page-table root physical: CR3, TTBR0/1 base, SATP PPN, or MIPS
+``CP0 PWBase``)
 plus a content ``sig`` that distinguishes a root-physical reused by a new
 address space after the original process died — rides that index's first
 switch record only.  A decoder tracks which indices it has already seen;

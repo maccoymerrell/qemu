@@ -1246,6 +1246,71 @@ void helper_mtc0_entryhi(CPUMIPSState *env, target_ulong arg1)
     }
 }
 
+/*
+ * CP0 PWBase — the hardware page-table walker's base register, and (on a
+ * model with Config3.PW) the value mips_get_plugin_identity() reports as
+ * the name of the address space.  Linux writes it from htw_set_pwbase(),
+ * reached through TLBMISS_HANDLER_SETUP_PGD(), i.e. at every
+ * switch_mm/activate_mm.
+ *
+ * A HELPER rather than the inline TCG store it replaces, for one reason:
+ * the write is the ADDRESS-SPACE COMMIT POINT, and the plugin identity has
+ * to be resampled exactly there.  Sampling per TB instead would let the
+ * identity drift for an unbounded stretch of kernel code, and would make a
+ * generation rollover — where two different mms can hold the same
+ * EntryHi.ASID — indistinguishable from no switch at all.
+ *
+ * No tlb_flush(): PWBase says where the walker starts, not how any existing
+ * translation was formed, so writing it invalidates no cached translation.
+ * (EntryHi.ASID does flush, and does so in its own helper above.)
+ *
+ * cpu_plugin_evq_push() is inert on the wrong path and while the queue is
+ * disabled, so a speculative excursion cannot manufacture a switch; a
+ * --disable-plugins build compiles the push out entirely, leaving one
+ * helper call per context switch and nothing else.
+ */
+static void mips_pwbase_write(CPUMIPSState *env, target_ulong val)
+{
+    target_ulong old = env->CP0_PWBase;
+
+    env->CP0_PWBase = val;
+    if (old == val) {
+        return;                 /* re-arming the same root is not a switch */
+    }
+#ifdef CONFIG_PLUGIN
+    /*
+     * The event's pc slot carries the OLD root; the push stamps the
+     * just-committed NEW one as the event's asid.
+     */
+    cpu_plugin_evq_push(env_cpu(env), QEMU_PLUGIN_CPU_EVENT_ASID_WRITE,
+                        old, env_cpu(env)->plugin_fault_depth);
+#endif
+    if (cst_cp0_audit()) {
+        fprintf(stderr, "[cp0audit] cpu=%d PWBase old=0x%08lx new=0x%08lx\n",
+                env_cpu(env)->cpu_index,
+                (unsigned long)old, (unsigned long)val);
+    }
+}
+
+void helper_mtc0_pwbase(CPUMIPSState *env, target_ulong arg1)
+{
+    /*
+     * MTC0 moves a 32-bit GPR half, and the inline store this replaced
+     * (gen_mtc0_store32) truncated to 32 bits too, so the written value is
+     * unchanged on every target that can execute the instruction: the only
+     * QEMU MIPS model with Config3.PW is P5600, a MIPS32r5 core, and
+     * check_pw() turns the access into a Reserved Instruction on every
+     * model without the bit — which is all of MIPS64.
+     */
+    mips_pwbase_write(env, (target_ulong)(uint32_t)arg1);
+}
+
+void helper_dmtc0_pwbase(CPUMIPSState *env, target_ulong arg1)
+{
+    /* DMTC0 writes the register's full width. */
+    mips_pwbase_write(env, arg1);
+}
+
 void helper_mttc0_entryhi(CPUMIPSState *env, target_ulong arg1)
 {
     int other_tc = env->CP0_VPEControl & (0xff << CP0VPECo_TargTC);

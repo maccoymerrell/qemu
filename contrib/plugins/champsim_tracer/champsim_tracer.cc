@@ -263,9 +263,10 @@ static std::atomic<uint64_t> g_pinned_pid{0};
  * pin_user_tb_owned (the caller holds it) and, off the per-TB path, in the
  * ASID-write hook (which takes exec_lock for the read).  Kept consistent
  * with the Stage-A index map: every root added here is also assigned a
- * compact asid index + stored identity {root_phys, sig}.  The narrow-ASID
- * (MIPS, g_pin_reuse_guard) path does NOT use this set — it keeps its
- * dwell/verify machinery (Stage B3), so g_owned stays empty there.
+ * compact asid index + stored identity {root_phys, sig}.  Every supported
+ * target populates it, MIPS included: the key is the page-table root the
+ * hardware walks from, so there is no target left that needs a dwell/verify
+ * substitute for one.
  */
 static std::unordered_set<uint64_t> &g_owned =
     *new std::unordered_set<uint64_t>();
@@ -417,12 +418,10 @@ static void deadlatch_clock_check(unsigned int cpu_index, uint64_t live_pid);
  * rule cannot fire, which matters on exactly the targets whose
  * address-space NAME is recycled under live processes.
  */
-static bool g_pin_thread_named = true;
 
 /* Retire the pinned window because its architectural address-space NAME was
  * handed out again and this CPU model gives nothing to re-bind against.
  * Defined beside the dead-latch closes, which it reuses. */
-static void pin_unbindable_rollover_close(unsigned int vcpu_index);
 
 /*
  * Translation-bypassing privilege level (see champsim_tracer.h).  The pin
@@ -813,107 +812,116 @@ static void vcpu_tb_ff_rep(unsigned int cpu_index, void *udata)
 }
 
 /*
- * Pinned-ASID reuse detector (narrow-ASID targets; currently MIPS).
- *
- * The MIPS pin is a bare EntryHi.ASID value from an architecturally
- * 8-bit field (10 bits with Config4.AE) — a space small enough that the
- * OS must recycle values.  Linux does so by generations: on rollover
- * every live process is silently handed a fresh ASID, so the pinned
- * VALUE can be re-assigned to a different process and the raw-equality
- * pin follows the wrong one from then on.  The rollover itself is
- * invisible in the register stream, but its footprint is not: the
- * committed ASID-write stream (this hook) shows the pinned value going
- * absent while a large share of the whole space is written with OTHER
- * values.  Seeing >= PIN_REUSE_THRESHOLD distinct other values between
- * two writes of the pinned value implies the space wrapped, so the
- * pinned value's return is suspect.  Detection only — one stderr
- * warning per pin plus the pin_asid_reuse_suspected stat; whether to
- * unpin is a policy decision deliberately not taken here.
- *
- * Not armed on the wide-register targets (CR3 / TTBR0 / SATP carry a
- * page-table base): distinct-value counts there measure how many
- * processes ran, not how much of an exhaustible ID space burned, so the
- * same signal would false-fire on any busy guest.
- *
- * Cost: one bounded scan per committed ASID change (a context-switch-
- * rate event), only while pinned.  Fixed POD state — no ctor/dtor
- * ordering against plugin_exit to manage.
+ * The `-cpu` argument this QEMU was started with, for the install refusal's
+ * diagnosis only.  QEMU does not expose the RESOLVED model name to a plugin,
+ * so this reports what the operator typed; a model that was defaulted by the
+ * board says so instead of naming a value that might be wrong.  Never used
+ * for a decision — the decision is qemu_plugin_identity_caps(), which asks
+ * the resolved class itself.
  */
-static bool g_pin_reuse_guard = false;   /* armed at install (narrow space) */
-static constexpr uint32_t PIN_REUSE_THRESHOLD = 200;
-static GMutex pin_reuse_lock;
-static uint64_t g_pin_reuse_vals[PIN_REUSE_THRESHOLD];
-static uint32_t g_pin_reuse_nvals = 0;   /* distinct non-pinned values since
-                                          * the pinned value's last write;
-                                          * saturates at the threshold */
-static bool g_pin_reuse_warned = false;  /* one warning per pin */
-
-static void pin_reuse_reset(void)
+static const char *cmdline_cpu_option(void)
 {
-    g_mutex_lock(&pin_reuse_lock);
-    g_pin_reuse_nvals = 0;
-    g_pin_reuse_warned = false;
-    g_mutex_unlock(&pin_reuse_lock);
-}
-
-static void pin_reuse_track(unsigned int vcpu_index, uint64_t new_asid,
-                            uint64_t pinned_asid)
-{
-    bool bump_gen = false;
-    g_mutex_lock(&pin_reuse_lock);
-    if (new_asid == pinned_asid) {
-        if (g_pin_reuse_nvals >= PIN_REUSE_THRESHOLD) {
-            g_stats.pin_asid_reuse_suspected++;
-            /* Take the policy decision this detector used to defer: the
-             * space demonstrably wrapped, so every raw ASID value the
-             * tracer is holding stops being an identity from here.  The
-             * pin itself is already safe (a committed write drops the
-             * vCPU's dwell, and re-confirmation is by physical-page
-             * signature, not by value); what needed the generation is the
-             * kexc excursion state, which compares stored values. */
-            bump_gen = true;
-            if (!g_pin_reuse_warned) {
-                g_pin_reuse_warned = true;
-                fprintf(stderr, "champsim_tracer: pinned ASID value 0x%"
-                        PRIx64 " re-assigned after apparent rollover (%u "
-                        "distinct other ASID values since its last write) "
-                        "— trace may follow a different process\n",
-                        pinned_asid, g_pin_reuse_nvals);
-            }
-        }
-        g_pin_reuse_nvals = 0;          /* a fresh absence window opens */
-    } else if (g_pin_reuse_nvals < PIN_REUSE_THRESHOLD) {
-        bool seen = false;
-        for (uint32_t i = 0; i < g_pin_reuse_nvals; i++) {
-            if (g_pin_reuse_vals[i] == new_asid) {
-                seen = true;
+    static char model[64];
+    static bool done = false;
+    if (done) {
+        return model[0] ? model : "(defaulted by the machine)";
+    }
+    done = true;
+    FILE *f = fopen("/proc/self/cmdline", "r");
+    if (f) {
+        char buf[4096];
+        size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+        for (size_t i = 0; i + 1 < n; i++) {
+            if (buf[i] != '\0' && (i == 0 || buf[i - 1] == '\0') &&
+                strcmp(&buf[i], "-cpu") == 0) {
+                const char *v = &buf[i + 5];
+                if (v < buf + n && *v) {
+                    snprintf(model, sizeof(model), "%s", v);
+                }
                 break;
             }
         }
-        if (!seen) {
-            g_pin_reuse_vals[g_pin_reuse_nvals++] = new_asid;
-        }
     }
-    g_mutex_unlock(&pin_reuse_lock);
-    if (bump_gen) {
-        /* The bump clears the owned-thread identity map, which the CP step
-         * reads; this hook runs on a vCPU thread outside the step window,
-         * so take the same lock the step holds.  exec_lock is recursive, so
-         * the dwell-re-pin caller (already inside it) is unaffected. */
-        g_rec_mutex_lock(&exec_lock);
-        asid_identity_gen_bump("pinned-value reuse after rollover");
-        g_rec_mutex_unlock(&exec_lock);
-        if (!g_pin_thread_named) {
-            /* The name was reassigned and this CPU model names no thread, so
-             * the pin CANNOT be re-bound to the process that moved — and
-             * whoever now holds the value would otherwise be traced under
-             * the marker's identity, which is the one thing that
-             * invalidates a trace outright.  Retire the window instead: a
-             * truncated capture that says so is the only correct outcome,
-             * and it is loud and counted, never silent. */
-            pin_unbindable_rollover_close(vcpu_index);
-        }
+    return model[0] ? model : "(defaulted by the machine)";
+}
+
+/*
+ * NARROW-ASID PATH: DEAD, PENDING ITS REMOVAL.
+ *
+ * This flag armed the physical-page dwell/verify machinery that stood in
+ * for a page-table root on MIPS.  MIPS now HAS a root -- CP0 PWBase, on any
+ * model with Config3.PW -- and the tracer refuses to install in system mode
+ * on a model that has none (see the install refusal in
+ * qemu_plugin_install), so no supported configuration can reach the narrow
+ * path.  Nothing sets the flag any more; every `if (g_pin_reuse_guard)`
+ * below is unreachable.
+ *
+ * Left in place for exactly one commit, so that the identity change and the
+ * excision of the machinery it obsoletes are separately reviewable and
+ * separately bisectable.  An unreachable branch is untrustable surface: the
+ * follow-up commit deletes the flag, pin_page_sig(), the per-owner page
+ * maps, vcpu_pin_probe() and every branch listed here.
+ */
+static constexpr bool g_pin_reuse_guard = false;
+
+/*
+ * ASID-SWEEP WITNESS (the guest side of the rollover question).
+ *
+ * Ownership does NOT depend on this and never reads it.  A window is owned
+ * by its PAGE-TABLE ROOT (x86 CR3, AArch64 TTBR0, RISC-V SATP, MIPS CP0
+ * PWBase), which an operating system cannot re-point at a second LIVE
+ * address space, so a narrow-ASID rollover is a non-event for attribution:
+ * nothing re-binds, nothing is quarantined, nothing is dropped pending a
+ * witness, and no instruction of the traced process is ever refused.
+ *
+ * What remains worth counting is whether a test that CLAIMS to have driven
+ * the guest through an ASID rollover actually did.  That is a property of
+ * the guest, not of the tracer, so it is measured on the guest's own
+ * committed EntryHi.ASID write stream -- deliberately the RAW architectural
+ * value and NOT the ownership key, so the witness stays independent of the
+ * thing it corroborates.  Seeing every value of the space means the kernel
+ * reissued every name; a cell that cannot show that has not exercised a
+ * rollover and must FAIL as vacuous rather than pass quietly.
+ *
+ * A 1024-bit set (16 words, 128 bytes) covers the whole 10-bit Config4.AE
+ * ASID space exactly, so the result is a true distinct-value count with no
+ * threshold, no absence window and no saturation.  Maintained from the
+ * committed-write hook, a context-switch-rate event off the per-TB path.
+ */
+static constexpr uint32_t ASID_SWEEP_BITS = 1024;
+static std::atomic<uint64_t> g_asid_sweep_bits[ASID_SWEEP_BITS / 64];
+static std::atomic<uint32_t> g_asid_sweep_count{0};
+
+static void asid_sweep_reset(void)
+{
+    for (auto &w : g_asid_sweep_bits) {
+        w.store(0, std::memory_order_relaxed);
     }
+    g_asid_sweep_count.store(0, std::memory_order_relaxed);
+    g_stats.asid_names_committed_since_pin = 0;
+}
+
+/* Note that the guest committed raw EntryHi.ASID value @raw.  A value wider
+ * than the bitmap (which the architecture does not produce) folds, so the
+ * count can only ever UNDER-report: a witness that cannot inflate.
+ *
+ * Relaxed atomics rather than a lock, because every vCPU's committed-write
+ * hook reaches here and none of them holds exec_lock: the set-once
+ * fetch_or/increment pair needs no ordering against anything else, and the
+ * counter is only ever read for a report.  No new lock, and no race that
+ * could double-count -- the bit decides. */
+static void asid_sweep_note(uint64_t raw)
+{
+    uint32_t idx = (uint32_t)(raw % ASID_SWEEP_BITS);
+    uint64_t bit = 1ULL << (idx & 63);
+    uint64_t prev = g_asid_sweep_bits[idx >> 6].fetch_or(
+        bit, std::memory_order_relaxed);
+    if (prev & bit) {
+        return;
+    }
+    g_stats.asid_names_committed_since_pin =
+        g_asid_sweep_count.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
 /*
@@ -1021,8 +1029,19 @@ static constexpr uint64_t PIN_PAGE_MASK = ~(uint64_t)0xFFF;
  *   @raw_asid        the architectural address-space value the window was
  *                    opened under — what the asid-keyed dedup index is
  *                    reclaimed by, and what stderr reports.
- *   @tids            thread ids observed executing in this space.  Used for
- *                    exactly one rule, pin_rebind_locked.
+ *   @raw_asid_last   the last raw EntryHi.ASID value this space was seen
+ *                    executing user code under, and @raw_asid_names how many
+ *                    DISTINCT such values there have been.  Pure
+ *                    instrumentation: an anti-vacuity witness for the
+ *                    rollover tests, measured on the owned execution path,
+ *                    consulted by no decision anywhere (see
+ *                    owned_asid_names_seen).
+ *
+ * NO THREAD SET.  Ownership keys on the address space and nothing else, so
+ * no ownership decision anywhere in the tracer reads a thread name.  That is
+ * what closes the fork-forgery class by construction: fork() copies the
+ * thread pointer verbatim, so a thread id can be forged by a child, but a
+ * child gets a new mm and therefore a new page-table root, which cannot be.
  *
  * Guarded by exec_lock, like g_owned; immortal (see "Immortal process-wide
  * aggregates" in docs/architecture.rst).
@@ -1031,15 +1050,11 @@ struct OwnedSpace {
     uint64_t root_phys = 0;
     uint64_t sig = 0;
     uint64_t raw_asid = 0;
-    std::unordered_set<uint64_t> tids;
+    uint64_t raw_asid_last = 0;
+    uint32_t raw_asid_names = 0;
 };
 static std::unordered_map<uint64_t, OwnedSpace> &g_owned_info =
     *new std::unordered_map<uint64_t, OwnedSpace>();
-
-/* A process cannot have unboundedly many threads inside the trace window;
- * the cap keeps a pathological guest from growing the set without bound.
- * Reaching it costs only the re-bind rule's reach for threads past it. */
-static constexpr size_t CST_OWNED_TID_CAP = 4096;
 
 /* Record whether this target names a thread architecturally, once a real
  * address space has been pinned; see the definition below. */
@@ -1058,23 +1073,30 @@ static inline uint64_t live_thread_id(void)
 }
 
 /* A zero thread id for a REAL address space means the CPU model implements
- * no thread-pointer register, so the one re-bind rule has nothing to compare
- * and an address-space name reassignment cannot be followed.  Say so once,
- * loudly: the alternative failure is silent.  Caller holds exec_lock. */
+ * no thread-pointer register, so strands inside the window cannot be told
+ * apart by name.  Say so once, loudly, because a silently coarse strand
+ * label is worse than a stated one.
+ *
+ * IT IS NOT AN OWNERSHIP PROBLEM AND NOTHING IS RETIRED.  Ownership is the
+ * page-table root and never consults a thread name, so a window on a
+ * thread-nameless model traces exactly the same instructions as one on a
+ * model that names threads; only the per-strand labelling is coarser.
+ * Caller holds exec_lock. */
 static void pin_note_thread_naming(uint64_t asid, uint64_t tid)
 {
+    static bool warned = false;
     if (asid == 0 || tid != 0) {
         return;                 /* user mode, or a real thread identity */
     }
-    if (g_pin_thread_named) {
-        g_pin_thread_named = false;
+    if (!warned) {
+        warned = true;
         g_stats.pin_thread_identity_absent++;
         fprintf(stderr,
                 "champsim_tracer: this CPU model names no thread "
                 "architecturally (no thread-pointer register — a MIPS model "
-                "with Config3.ULRI clear), so the pin cannot follow a "
-                "reassignment of its address-space name; the window is "
-                "retired if that happens rather than followed silently\n");
+                "with Config3.ULRI clear), so strands inside the window "
+                "share one label; ownership is unaffected — it keys on the "
+                "page-table root, not on a thread\n");
     }
 }
 
@@ -1094,117 +1116,54 @@ static inline const OwnedSpace *owned_info_locked(uint64_t pid)
     return it == g_owned_info.end() ? nullptr : &it->second;
 }
 
-/* Note that @tid was seen executing inside owned space @pid.  Thread id 0
- * means the architecture names no thread here (a CPU model with no
- * thread-pointer register) and is not an identity, so it is not recorded.
- * Caller holds exec_lock. */
-static inline void owned_note_thread(uint64_t pid, uint64_t tid)
+/* Note the raw architectural ASID value @raw the owned space @pid is
+ * executing under.  INSTRUMENTATION ONLY — no ownership decision reads it.
+ * A second distinct value means the guest renamed a live address space and
+ * the trace kept following it, which is the independent witness the
+ * rollover cells assert on.  Caller holds exec_lock. */
+static inline void owned_note_raw_asid(uint64_t pid, uint64_t raw)
 {
-    if (!pid || !tid) {
+    auto it = g_owned_info.find(pid);
+    if (it == g_owned_info.end() || it->second.raw_asid_last == raw) {
         return;
     }
-    auto it = g_owned_info.find(pid);
-    if (it != g_owned_info.end() &&
-        it->second.tids.size() < CST_OWNED_TID_CAP) {
-        it->second.tids.insert(tid);
+    it->second.raw_asid_last = raw;
+    if (++it->second.raw_asid_names >= 2 &&
+        it->second.raw_asid_names > g_stats.owned_asid_names_seen) {
+        g_stats.owned_asid_names_seen = it->second.raw_asid_names;
     }
 }
 
 /*
- * THE ONE RE-BIND RULE.
+ * THERE IS NO RE-BIND RULE.
  *
- * A narrow address-space name is reassigned to a LIVE process when it rolls
- * over: MIPS EntryHi.ASID is 8 bits over a 16-entry TLB, so wrap is the
- * normal state, not an exception.  The name says which address space is
- * executing NOW, so ownership must follow it — and what survives the
- * renaming is the thread, which the rename does not touch.
+ * The rule that used to live here followed the pin when a thread of an
+ * owned address space reappeared under a name the trace did not own.  It
+ * existed only because MIPS named an address space by an 8-bit
+ * EntryHi.ASID, which Linux re-points at a DIFFERENT LIVE process on
+ * rollover, so ownership had to be transferable.  It was measured unsound
+ * and is now unnecessary, in that order:
  *
- * So: if a thread this trace has already seen inside an owned space
- * reappears under a name the trace does not own, THE PIN RE-BINDS.  The old
- * name stops being owned that instant (whoever inherits it is foreign from
- * its first instruction), and the space's wire identity, liveness stamps and
- * thread set move across unchanged, so nothing of the traced process is
- * dropped and its wire asid index does not move.
+ *   unsound   — it rested on a thread pointer naming one thread of one
+ *               address space, and fork() copies that pointer verbatim, so
+ *               a forked child presents as "a thread of an owned space
+ *               under an unowned name" and the pin walks onto it.  Caught
+ *               in the act on the mipsel smp=4 migfault cell: the window
+ *               crossed four address-space names and the owned user clock
+ *               reached 146 M instructions for a 34 k workload.
+ *   unnecessary — ownership now keys on the PAGE-TABLE ROOT (CP0 PWBase on
+ *               MIPS, as CR3/TTBR0/SATP elsewhere), which an operating
+ *               system cannot hand to a second live address space.  A
+ *               rollover renames nothing the tracer looks at, so there is
+ *               nothing to follow, nothing to transfer, and no evidence to
+ *               forge.
  *
- * MEASURED UNSOUND, THEREFORE OFF BY DEFAULT (CST_PIN_REBIND=1 to arm it).
- * The rule rests on a thread pointer naming ONE thread of ONE address
- * space, and on Linux it does not: fork() copies the thread's TLS pointer
- * verbatim, so the child's first thread carries the parent's value -- the
- * same inheritance that made a shared COW code page useless as an identity.
- * A forked child therefore presents "a thread of an owned space under a
- * name the trace does not own" and the pin follows it, which is precisely
- * the trace-invalidating defect this arc removes.  Caught on the mipsel
- * adversarial wave's smp=4 migfault cell: with the rule armed the window
- * walked across four address-space names (0x13, 0x10, 0xf, ...) and the
- * owned user clock reached 146 M instructions for a process whose whole
- * workload is 34 k; with it disarmed the same cell keeps the pin.
- *
- * A second, independent reason it cannot carry SMP: on MIPS the ASID is
- * allocated PER CPU (Linux keeps mm->context.asid[cpu]), so one address
- * space has up to one name per vCPU and a migration is a legitimate change
- * of name.  Joining the new name to the window needs evidence that the
- * space is the same, and the thread pointer is exactly the evidence fork
- * forges.  That is an open design question, not something this rule
- * settles -- see the report.
- *
- * Left implemented and armable so the wrap case can be exercised
- * deliberately, but never on by default: a mechanism that can bind the pin
- * to an unmarked process must not run unasked.  Returns true if a re-bind
- * happened; caller holds exec_lock.
+ * Everything it needed is gone with it: the thread set on OwnedSpace, the
+ * claim/conviction machinery, the deferred verdicts and the quarantine.
+ * Because no verdict is ever deferred, no TB of the traced process is ever
+ * held back or dropped waiting for a witness, and an END marker can never
+ * be swallowed by a suspended span.
  */
-static bool pin_rebind_enabled(void)
-{
-    static int v = -1;
-    if (v < 0) {
-        const char *e = getenv("CST_PIN_REBIND");
-        v = (e && *e && *e != '0') ? 1 : 0;
-    }
-    return v != 0;
-}
-
-static bool pin_rebind_locked(uint64_t new_pid, uint64_t tid)
-{
-    if (!pin_rebind_enabled() || !new_pid || !tid || g_owned.count(new_pid)) {
-        return false;
-    }
-    uint64_t old_pid = 0;
-    for (uint64_t cand : g_owned) {
-        auto it = g_owned_info.find(cand);
-        if (it != g_owned_info.end() && it->second.tids.count(tid)) {
-            old_pid = cand;
-            break;
-        }
-    }
-    if (!old_pid) {
-        return false;
-    }
-    OwnedSpace moved = std::move(g_owned_info[old_pid]);
-    g_owned_info.erase(old_pid);
-    g_owned.erase(old_pid);
-    g_owned.insert(new_pid);
-    g_owned_info.emplace(new_pid, std::move(moved));
-    auto ms = g_owned_last_sched.find(old_pid);
-    if (ms != g_owned_last_sched.end()) {
-        g_owned_last_sched[new_pid] = ms->second;
-        g_owned_last_sched.erase(ms);
-    }
-    auto ic = g_owned_last_sched_insns.find(old_pid);
-    if (ic != g_owned_last_sched_insns.end()) {
-        g_owned_last_sched_insns[new_pid] = ic->second;
-        g_owned_last_sched_insns.erase(ic);
-    }
-    if (g_pinned_pid.load(std::memory_order_relaxed) == old_pid) {
-        g_pinned_pid.store(new_pid, std::memory_order_relaxed);
-    }
-    g_stats.pin_repins++;
-    /* Any raw address-space value the tracer is holding (an open
-     * excursion's entry value, an async snapshot, a recorded
-     * (thread-pointer, asid) pair) may now name whoever inherited the old
-     * one, so retire the raw-value namespace generation. */
-    asid_identity_gen_bump("address-space name reassigned; pin re-bound");
-    return true;
-}
-
 
 /* Bytes hashed for a page's content signature.  Page-bounded (< 4 KiB)
  * so the read never straddles into an unmapped successor page; 256
@@ -2056,29 +2015,61 @@ static void marker_anchor(uint64_t pc, uint64_t asid,
 }
 
 /*
+ * DYNAMIC PRECONDITION: the guest must have PROGRAMMED the root register.
+ *
+ * The install refusal proved the CPU MODEL implements a page-table-root
+ * register; this proves the GUEST filled it in.  A MIPS kernel booted with
+ * "nohtw", built CONFIG_MIPS_HTW=n, or one that declined the walker after
+ * checking PTEI (dmesg: "Unsupported PTEI field value ... HTW will not be
+ * enabled") leaves CP0 PWBase at 0, and QEMU's identity layer refuses to
+ * intern 0 into an id — 0 is an ABSENCE, not a name.  Opening a window on it
+ * would silently pool every address space in the guest under one id.
+ *
+ * This REFUSES TO OPEN.  It runs at the first START marker, before the space
+ * joins the owned set and before a segment exists, so no byte has been
+ * written and no window is being retired mid-capture.  Terminates non-zero
+ * through _exit() so nothing half-written is flushed behind it.
+ * Caller holds exec_lock.
+ */
+static void marker_refuse_no_root(void)
+{
+    fprintf(stderr,
+        "champsim_tracer: refusing to open the trace window — the guest has "
+        "not\nprogrammed CP0 PWBase.  The hardware page-table walker is off "
+        "(\"nohtw\" on\nthe kernel command line, CONFIG_MIPS_HTW=n, or the "
+        "kernel declined it;\ncheck dmesg for \"Hardware Page Table Walker "
+        "enabled\").  Without it there\nis no architectural name for this "
+        "address space.  No trace is written.\n");
+    fflush(stderr);
+    _exit(CST_NO_ROOT_EXIT);
+}
+
+/*
  * Ownership of a user-privilege TB under an armed pin — the ONE rule every
  * consumer (user clock, foreign gate, kexc ownership seed, stuck-window
  * recovery, end marker) shares.
  *
  * WE PIN ON A MARKER WITHIN AN ADDRESS SPACE, NOT A THREAD.  @live_pid is
- * QEMU's opaque id for the address space this vCPU is translating through,
- * and the TB is ours exactly when that space is in the owned set — so
- * EVERY THREAD INSIDE AN OWNED ADDRESS SPACE IS TRACED, including one the
- * trace has never seen before.  @live_tid only labels the strand and feeds
- * the one re-bind rule.  Caller holds exec_lock.
+ * QEMU's opaque id for the address space this vCPU is translating through —
+ * interned from the PAGE-TABLE ROOT the hardware walks — and the TB is ours
+ * exactly when that space is in the owned set.  So EVERY THREAD INSIDE AN
+ * OWNED ADDRESS SPACE IS TRACED, including one the trace has never seen
+ * before, and NOTHING ELSE IS.  @live_tid only labels the strand; no
+ * ownership decision reads it, which is what makes the rule immune to
+ * fork()'s verbatim copy of the thread pointer.
+ *
+ * The verdict is final at the instant it is taken: there is no re-bind, no
+ * deferral, no quarantine and no pending witness, so an owned TB is never
+ * withheld and a foreign TB is never provisionally admitted.  That is why
+ * pin_unverified_dropped can be quoted as-is — every count is a genuinely
+ * foreign user TB, not the traced process's own work awaiting confirmation.
+ * Caller holds exec_lock.
  */
 static bool pin_user_tb_owned(unsigned int cpu_index, uint64_t live_pid,
                               uint64_t live_tid)
 {
+    (void)live_tid;
     bool owned = owned_contains_locked(live_pid);
-    if (!owned) {
-        owned = pin_rebind_locked(live_pid, live_tid);
-        if (owned && cpu_index < CST_PIN_MAX_VCPUS) {
-            qemu_plugin_u64_set(g_scoreboard.asid_match, cpu_index, 1);
-            g_pin_vcpu[cpu_index].confirmed.store(true,
-                                                  std::memory_order_relaxed);
-        }
-    }
     if (cpu_index < CST_PIN_MAX_VCPUS) {
         g_pin_vcpu[cpu_index].pid.store(owned ? live_pid : 0,
                                         std::memory_order_relaxed);
@@ -2090,7 +2081,12 @@ static bool pin_user_tb_owned(unsigned int cpu_index, uint64_t live_pid,
         g_stats.pin_unverified_dropped++;
         return false;
     }
-    owned_note_thread(live_pid, live_tid);
+    /* Anti-vacuity witness, instrumentation only (see owned_note_raw_asid):
+     * the exhaustible TLB tag the owned space is executing under RIGHT NOW.
+     * Read here, on the owned execution path, and after the verdict, so it
+     * depends on no ownership decision and cannot be a sub-event of the
+     * thing it is claimed to witness. */
+    owned_note_raw_asid(live_pid, qemu_plugin_get_narrow_asid());
     return true;
 }
 
@@ -2205,8 +2201,7 @@ static void asid_write_track_cb(unsigned int vcpu_index, uint64_t new_asid)
          * change, so the per-vCPU verdict (and the JIT-visible context
          * gate it drives) is settled HERE, off the per-TB path.  A vCPU
          * that switched into an unowned space stops dispatching the heavy
-         * callback and runs the light probe instead, which is where the
-         * re-bind rule gets its chance. */
+         * callback and stops tracing until it switches back into one. */
         g_pin_vcpu[vcpu_index].pid.store(match ? pid : 0,
                                          std::memory_order_relaxed);
         g_pin_vcpu[vcpu_index].confirmed.store(match != 0,
@@ -2216,12 +2211,14 @@ static void asid_write_track_cb(unsigned int vcpu_index, uint64_t new_asid)
                                               std::memory_order_relaxed);
         }
         refresh_ctx_gates(vcpu_index);
-        if (g_pin_reuse_guard) {
-            /* Narrow-ASID rollover heuristic (stderr + a counter only; the
-             * ownership decision above does not consult it). */
-            pin_reuse_track(vcpu_index, new_asid, pinned);
-        }
     }
+
+    /* Guest-side sweep witness, instrumentation only.  Deliberately the RAW
+     * exhaustible TLB tag, NOT @new_asid (which is the page-table root the
+     * ownership key is interned from): the witness has to be independent of
+     * the key it corroborates, or a test that "proves" a rollover is only
+     * restating its own premise.  Nothing here can change what is traced. */
+    asid_sweep_note(qemu_plugin_get_narrow_asid());
 
     /* Dead-latch detector: this hook is the one place every committed root
      * write is visible, so a live process's root passes through here at each
@@ -5214,41 +5211,6 @@ static bool deadlatch_sweep_wide(uint64_t now, uint64_t now_insns,
     return false;
 }
 
-/*
- * Retire the pinned window when the architectural address-space NAME it was
- * pinned to has demonstrably been handed out again (pin_reuse_track) and the
- * CPU model names no thread to re-bind the pin against.  Closed exactly as a
- * dead-latch close does, so the trace is finalised rather than abandoned.
- * Called from the ASID-write hook, off the per-TB path and without
- * exec_lock.
- */
-static void pin_unbindable_rollover_close(unsigned int vcpu_index)
-{
-    if (qemu_plugin_in_spec_mode() || g_wp_in_progress) {
-        return;
-    }
-    g_rec_mutex_lock(&exec_lock);
-    bool do_exit = false;
-    if (g_trace_segments.is_active() && !g_trace_segments.is_shutting_down() &&
-        !g_owned.empty()) {
-        std::vector<uint64_t> all(g_owned.begin(), g_owned.end());
-        for (uint64_t pid : all) {
-            uint64_t dropped = owned_retire_root_locked(pid);
-            fprintf(stderr,
-                    "champsim_tracer: address-space name reassigned and this "
-                    "CPU model names no thread to re-bind against — retiring "
-                    "the window (space id %" PRIu64 ", dropped %" PRIu64
-                    " dedup buckets)\n", pid, dropped);
-        }
-        g_stats.pin_unbindable_rollover_closes++;
-        do_exit = deadlatch_close_segment(deadlatch_now_ms(), vcpu_index,
-                                          "address-space name reassigned");
-    }
-    g_rec_mutex_unlock(&exec_lock);
-    if (do_exit) {
-        exit(0);
-    }
-}
 
 /*
  * Dead-latch entry point, called from the synchronous ASID-write hook on
@@ -7186,16 +7148,13 @@ static void vcpu_pin_probe(unsigned int cpu_index, void *udata)
         qemu_plugin_get_priv_level() == 0) {
         uint64_t live_asid = qemu_plugin_get_addr_space_id();
         uint64_t live_pid = live_process_id();
-        uint64_t live_tid = live_thread_id();
         g_rec_mutex_lock(&exec_lock);
         PinVcpuState &ps = g_pin_vcpu[cpu_index];
+        /* Plain owned-set membership, and nothing else: there is no
+         * re-bind rule for an unowned space to be admitted by. */
         bool owned = owned_contains_locked(live_pid);
-        if (!owned) {
-            /* The one re-bind rule (see pin_rebind_locked). */
-            owned = pin_rebind_locked(live_pid, live_tid);
-        }
         if (owned) {
-            owned_note_thread(live_pid, live_tid);
+            owned_note_raw_asid(live_pid, qemu_plugin_get_narrow_asid());
             ps.pid.store(live_pid, std::memory_order_relaxed);
             ps.asid.store(live_asid, std::memory_order_relaxed);
             ps.confirmed.store(true, std::memory_order_relaxed);
@@ -8430,6 +8389,14 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
             g_rec_mutex_unlock(&exec_lock);
             return;
         }
+        if (!pid && g_system_mode) {
+            /* No architectural name for this address space (see
+             * marker_refuse_no_root).  Refuse to OPEN — never retire.
+             * System mode only: qemu-user reports 0 because a QEMU process
+             * IS the one address space, which is an answer, not an
+             * absence. */
+            marker_refuse_no_root();
+        }
         bool first_open = g_owned.empty();
         /* The window's STABLE WIRE NAME, from the marker's own code page.
          * Separate from the ownership key by design — see the legacy path
@@ -8442,12 +8409,13 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
         g_owned_last_sched[pid] = deadlatch_now_ms();
         g_owned_last_sched_insns[pid] = deadlatch_now_insns();
         OwnedSpace &os = g_owned_info[pid];
-        os.root_phys = g_pin_reuse_guard ? root_phys : asid;
+        /* The wire's stable name for this window IS the page-table root
+         * (QEMU reports it on every supported target), so the anchor and
+         * the ownership key agree by construction. */
+        os.root_phys = asid;
         os.sig = sig;
         os.raw_asid = asid;
-        if (tid) {
-            os.tids.insert(tid);
-        }
+        os.raw_asid_last = qemu_plugin_get_narrow_asid();
         if (cpu_index < CST_PIN_MAX_VCPUS) {
             g_pin_vcpu[cpu_index].asid.store(asid, std::memory_order_relaxed);
             g_pin_vcpu[cpu_index].pid.store(pid, std::memory_order_relaxed);
@@ -8461,7 +8429,7 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
              * segment exactly as the single-process path did. */
             g_pinned_asid.store(asid, std::memory_order_relaxed);
             g_pinned_pid.store(pid, std::memory_order_relaxed);
-            pin_reuse_reset();
+            asid_sweep_reset();
             g_pin_repr_sig.store(sig, std::memory_order_relaxed);
             marker_open_trace_window(cpu_index, asid,
                                      /* have_root_phys= */ g_pin_reuse_guard,
@@ -8507,7 +8475,7 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
      * target's own instructions, so the current ASID is the target's; every
      * later TB in a different address space is filtered in vcpu_tb_exec. */
     g_pinned_asid.store(asid, std::memory_order_relaxed);
-    pin_reuse_reset();
+    asid_sweep_reset();
     /* Snapshot this pin's ASID identity (Phase 2): the root physical
      * address is @asid itself (cached above); the representative content
      * signature is seeded from the marker's own code page.  @pc is this
@@ -8531,18 +8499,22 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
         uint64_t root_phys, sig, vpage;
         marker_anchor(pc, asid, &root_phys, &sig, &vpage);
         (void)vpage;
+        if (!pid && g_system_mode) {
+            marker_refuse_no_root();
+        }
         g_pin_repr_sig.store(sig, std::memory_order_relaxed);
         g_pinned_pid.store(pid, std::memory_order_relaxed);
         g_owned.insert(pid);
         g_owned_last_sched[pid] = deadlatch_now_ms();
         g_owned_last_sched_insns[pid] = deadlatch_now_insns();
         OwnedSpace &os = g_owned_info[pid];
-        os.root_phys = g_pin_reuse_guard ? root_phys : asid;
+        /* The wire's stable name for this window IS the page-table root
+         * (QEMU reports it on every supported target), so the anchor and
+         * the ownership key agree by construction. */
+        os.root_phys = asid;
         os.sig = sig;
         os.raw_asid = asid;
-        if (tid) {
-            os.tids.insert(tid);
-        }
+        os.raw_asid_last = qemu_plugin_get_narrow_asid();
         if (cpu_index < CST_PIN_MAX_VCPUS) {
             g_pin_vcpu[cpu_index].asid.store(asid, std::memory_order_relaxed);
             g_pin_vcpu[cpu_index].pid.store(pid, std::memory_order_relaxed);
@@ -10070,18 +10042,85 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
      *   - xlate_bypass_priv: the privilege level that runs with the
      *     paging register bypassed, excluded from pinned attribution
      *     (RISC-V M-mode is priv 3; -1 = none) — see the pin machinery.
-     *   - pin_reuse_asid: arm the ASID-reuse detector for a narrow ASID
-     *     space the OS recycles (MIPS 8-bit EntryHi.ASID) — see
-     *     pin_reuse_track.
      *   - has_be_variant: the ISA ships a big-endian QEMU target, taken
      *     unless the target_name carries the little-endian "el" suffix
      *     (qemu-mips / qemu-mips64 are BE; mipsel / mips64el are LE).
      */
     const IsaProperties *ip = &isa_properties[trace_isa];
     g_xlate_bypass_priv = ip->xlate_bypass_priv;
-    g_pin_reuse_guard   = ip->pin_reuse_asid;
     target_big_endian   = ip->has_be_variant &&
                           !g_str_has_suffix(target_name, "el");
+
+    /*
+     * A SYSTEM CAPTURE NAMES ITS PROCESS BY THE PAGE-TABLE ROOT, OR IT DOES
+     * NOT RUN.
+     *
+     * Every supported target identifies an address space by the root its own
+     * hardware translates from — x86-64 CR3, AArch64 TTBR0, RISC-V SATP,
+     * MIPS CP0 PWBase — and two LIVE address spaces can never share one.
+     * A CPU model that supplies no root leaves only a narrow tag over the
+     * TLB, and on MIPS that is an 8-bit EntryHi.ASID over a 16-entry TLB
+     * which a Linux guest re-points at a DIFFERENT LIVE PROCESS whenever the
+     * space wraps.  That is the normal case on a busy guest, not an edge
+     * case, and following the traced process across it would mean guessing
+     * from a thread pointer that fork() copies verbatim — forgeable
+     * evidence, so it is not done.
+     *
+     * Refused UNCONDITIONALLY in system mode, on every ISA: there is no
+     * plugin argument that makes a rootless model safe, and a refusal that
+     * could be argued away is exactly the mid-capture window death it exists
+     * to prevent.  QEMU exits non-zero from here, before
+     * machine_run_board_init(), so no vCPU is created, no TB is translated,
+     * no marker byte is read and no trace file is opened.
+     *
+     * User mode is exempt by construction: qemu-user is one address space
+     * per process and the pin is not used.
+     */
+    if (info->system_emulation &&
+        !(qemu_plugin_identity_caps() & QEMU_PLUGIN_IDENT_SPACE_IS_ROOT)) {
+        if (!(qemu_plugin_identity_caps() &
+              QEMU_PLUGIN_IDENT_MODEL_KNOWN)) {
+            fprintf(stderr,
+                "champsim_tracer: refusing to install — no CPU model.\n"
+                "  The machine has no cpu_type (-M none), so the capture "
+                "cannot be validated\n  before the first vCPU exists, and "
+                "there is no address space to name.\n");
+            return -1;
+        }
+        fprintf(stderr,
+            "champsim_tracer: refusing to install — this CPU model names no "
+            "address space.\n"
+            "  target : %s\n"
+            "  -cpu   : %s              <- resolved model, whether given or "
+            "defaulted\n"
+            "  missing: Config3.PW / CP0 PWBase, the hardware page-table "
+            "walker's\n           page-table base register\n"
+            "\n"
+            "  A system-mode capture identifies its process by the page-table "
+            "root the\n  architecture itself walks from: x86 CR3, AArch64 "
+            "TTBR0, RISC-V SATP,\n  MIPS CP0 PWBase.  With no such register "
+            "MIPS names an address space only\n  by an 8-bit EntryHi.ASID "
+            "over the TLB, and a Linux guest reassigns that\n  value to a "
+            "DIFFERENT live process on rollover -- the normal case, not an\n"
+            "  edge case.  Following the traced process across that "
+            "reassignment would\n  mean guessing from CP0 UserLocal, which "
+            "fork() copies verbatim; that is\n  forgeable, so it is not "
+            "done.  The capture is refused now rather than\n  "
+            "mis-attributed, or retired in the middle of a window.\n"
+            "\n"
+            "  Re-run with the MIPS model that implements the walker:\n"
+            "      -cpu P5600            (MIPS32r5, malta; Config3.PW and "
+            "Config3.ULRI)\n"
+            "  and a guest kernel that enables it: CONFIG_MIPS_HTW=y, no "
+            "\"nohtw\" on the\n  kernel command line -- dmesg must print "
+            "\"Hardware Page Table Walker\n  enabled\".  For -smp > 1 the "
+            "kernel also needs CONFIG_MIPS_CPS=y; P5600\n  has no MT ASE.\n"
+            "  (hw/mips/malta.c defaults to 24Kf on MIPS32 and 20Kc on "
+            "MIPS64; neither\n   implements the walker, so -cpu is REQUIRED "
+            "for a system-mode capture.)\n",
+            target_name, cmdline_cpu_option());
+        return -1;
+    }
 
     /* Build the per-ISA marker byte sequences (WIN_MARKER detection).
      * The MIPS encoding is little-endian — mipsel only, matching the

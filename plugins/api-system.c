@@ -44,6 +44,42 @@ uint64_t qemu_plugin_entry_code(void)
 }
 
 /*
+ * What the resolved CPU MODEL can name.
+ *
+ * Answered from the machine's cpu_type — the class, not an instance —
+ * because the one caller that matters asks from qemu_plugin_install(),
+ * which QEMU runs in qemu_init_board() immediately BEFORE
+ * machine_run_board_init() and therefore before the first CPUState is
+ * created.  The value is reliable there: system/vl.c sets
+ * current_machine->cpu_type from the board default and then from -cpu,
+ * both inside qemu_init() ahead of the qmp_x_exit_preconfig() call that
+ * reaches qemu_init_board().
+ *
+ * Two ways to have nothing to say, both reported as an empty mask rather
+ * than as an assumption: a machine with no CPU type at all (-M none leaves
+ * cpu_type NULL), and a cpu_type whose class will not resolve.  A target
+ * that does not implement the query is the third.  "Names nothing" is the
+ * safe answer in every case — a plugin that requires a capability refuses,
+ * which is the outcome that cannot ship a wrong trace.
+ */
+uint64_t qemu_plugin_identity_caps(void)
+{
+    if (!current_machine || !current_machine->cpu_type) {
+        return 0;
+    }
+    ObjectClass *oc = object_class_by_name(current_machine->cpu_type);
+    if (!oc) {
+        return 0;
+    }
+    CPUClass *cc = CPU_CLASS(oc);
+    uint64_t caps = QEMU_PLUGIN_IDENT_MODEL_KNOWN;
+    if (cc && cc->plugin_identity_caps) {
+        caps |= cc->plugin_identity_caps(oc);
+    }
+    return caps;
+}
+
+/*
  * Virtual Memory queries
  */
 

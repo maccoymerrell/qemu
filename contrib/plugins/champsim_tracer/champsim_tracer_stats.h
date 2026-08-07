@@ -642,12 +642,17 @@ struct Stats {
      * attribution rules (kexc on and off), separately from
      * kexc_kernel_dropped — these TBs never consult the ownership rule. */
     uint64_t kexc_mmode_dropped = 0;
-    /* Rewrites of the pinned ASID value observed after enough DISTINCT
-     * other values to imply the target's narrow ASID space wrapped (a
-     * generation rollover recycled the pinned value).  Detection stat;
-     * the physical-page identity below is what actually adjudicates
-     * ownership — see pin_reuse_track in champsim_tracer.cc. */
-    uint64_t pin_asid_reuse_suspected = 0;
+    /* DISTINCT raw EntryHi.ASID values committed since the pin, counted
+     * unconditionally over the whole owned-window lifetime (see
+     * asid_sweep_note in champsim_tracer.cc).  This is a WITNESS, not a
+     * detector: it says how much of the guest's narrow ASID space burned
+     * while the window was open, so a test that claims to have exercised a
+     * rollover has to show >= the space's size here or FAIL as vacuous.  It
+     * cannot be reset by the traced process being scheduled, and no
+     * ownership decision reads it -- ownership keys on the page-table root.
+     * Reaching the space's size means the guest reissued every name; it
+     * does NOT mean anything went wrong. */
+    uint64_t asid_names_committed_since_pin = 0;
 
     /* Physical-page process identity (narrow-ASID targets; all zero on
      * the wide-register targets and in user mode).  The pin's authority
@@ -666,21 +671,25 @@ struct Stats {
      * dropped while a dwell awaited its first map hit (a foreign
      * process that never touches mapped pages parks here forever,
      * traced never); pages is the map's final size. */
-    /* The one re-bind rule fired: a thread of an owned address space
-     * reappeared under a name the trace did not own, so the pin followed
-     * it (see pin_rebind_locked). */
-    uint64_t pin_repins = 0;
+    /* DISTINCT raw EntryHi.ASID values the OWNED address space was observed
+     * executing user code under, when it exceeded one.  The second, and
+     * independent, anti-vacuity witness: it is measured on the owned
+     * execution path and depends on no ownership decision (there is no
+     * re-bind rule to be a sub-event of), so >= 2 is direct evidence that
+     * the guest renamed a live address space while the trace kept following
+     * it -- which is exactly what keying on the page-table root buys. */
+    uint64_t owned_asid_names_seen = 0;
     /* User TBs dropped because the address space they executed in is not
      * one this trace owns -- THE foreign-drop path.  A zero over a run
      * that contained foreign execution means the check never ran. */
     uint64_t pin_unverified_dropped = 0;
     /* This CPU model implements no architectural thread-pointer register, so
-     * the re-bind rule cannot fire (see pin_note_thread_naming). */
+     * strands inside the window carry no thread name (see
+     * pin_note_thread_naming).  Cross-ISA, and NOT an ownership problem:
+     * ownership is the page-table root and never consults a thread name.
+     * The window is not retired, nothing is dropped; only the per-strand
+     * labelling is coarser. */
     uint64_t pin_thread_identity_absent = 0;
-    /* Windows retired because the pinned address-space NAME was handed out
-     * again and nothing could re-bind the pin (must be 0 on a target whose
-     * name is not recycled). */
-    uint64_t pin_unbindable_rollover_closes = 0;
 
     /* Root-reuse guard, wide-register targets (x86 CR3 / AArch64 TTBR /
      * RISC-V SATP -- see the ROOT-REUSE GUARD note in champsim_tracer.cc).

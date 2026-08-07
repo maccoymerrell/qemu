@@ -623,13 +623,6 @@ typedef struct {
      */
     int                   xlate_bypass_priv;
     /*
-     * pin_reuse_asid — arm the ASID-reuse detector.  Set on ISAs whose
-     * architectural ASID space is narrow enough that the OS recycles a
-     * value within one trace (MIPS pins a bare 8-bit EntryHi.ASID); the
-     * wide-register targets leave it clear.
-     */
-    bool                  pin_reuse_asid;
-    /*
      * has_be_variant — the ISA ships a big-endian QEMU target.  The run
      * is big-endian when set unless the target_name carries the
      * little-endian "el" suffix (MIPS mips/mips64 vs mipsel/mips64el);
@@ -724,8 +717,6 @@ const IsaProperties isa_properties[] = {
         .cap_mode_for_target = cap_mode_mips,
         .canonicalize_addr = mips_canonicalize_addr,
         .xlate_bypass_priv = -1,
-        /* Bare 8-bit EntryHi.ASID; the OS recycles values within a run. */
-        .pin_reuse_asid = true,
         /* mips/mips64 are big-endian; mipsel/mips64el carry the "el" suffix. */
         .has_be_variant = true,
         .marker_encode_seq = cst_marker_mips_encode_seq_imm,

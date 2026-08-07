@@ -19,6 +19,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/qemu-plugin.h"
 #include "qemu/qemu-print.h"
 #include "qemu/timer.h"
 #include "qemu/log.h"
@@ -2749,6 +2750,19 @@ static void arm_get_plugin_identity(CPUState *cs, uint64_t *space_key,
     *thread_key = env->cp15.tpidr_el[0];
 }
 
+/*
+ * Which identity keys this MODEL can supply (CPUClass::plugin_identity_caps).
+ * Both, unconditionally: TTBR0_EL1 and TPIDR_EL0 are architecturally
+ * mandatory, so no AArch64 model names an address space by anything
+ * narrower than its translation-table base.  Answering the query at all is
+ * what lets a plugin state its precondition once, ISA-agnostically, instead
+ * of special-casing the one target whose models differ.
+ */
+static uint64_t arm_plugin_identity_caps(ObjectClass *oc)
+{
+    return QEMU_PLUGIN_IDENT_SPACE_IS_ROOT | QEMU_PLUGIN_IDENT_NAMES_THREAD;
+}
+
 static bool arm_plugin_thread_ptr_tracks_current(CPUState *cs)
 {
     CPUARMState *env = cpu_env(cs);
@@ -2931,6 +2945,9 @@ static void arm_cpu_class_init(ObjectClass *oc, void *data)
     cc->gdb_stop_before_watchpoint = true;
     cc->disas_set_info = arm_disas_set_info;
 
+#if defined(CONFIG_TCG) && defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+    cc->plugin_identity_caps = arm_plugin_identity_caps;
+#endif
 #ifdef CONFIG_TCG
     cc->tcg_ops = &arm_tcg_ops;
 #endif /* CONFIG_TCG */

@@ -673,6 +673,31 @@ attribution depend on.  The knobs are collected here.  Every one is a
 no-op for a user-mode (``qemu-<isa>``) run, so nothing in this section
 changes a user-mode trace.
 
+**Choose a CPU model that supplies a page-table root.**  A system
+capture identifies its process by the root the architecture itself
+translates from, so the model must implement one.  x86-64 (CR3),
+AArch64 (TTBR0_EL1) and RISC-V (SATP) do on every model.  On MIPS the
+register is **CP0 PWBase**, implemented only by models advertising
+``Config3.PW`` — in QEMU today that is **P5600** alone, while
+``-M malta`` defaults to 24Kf.  ``-cpu P5600`` is therefore required::
+
+   qemu-system-mipsel -M malta -cpu P5600 -kernel vmlinux \
+       -initrd rootfs.cpio.gz -append "console=ttyS0 panic=-1" \
+       -plugin ./libchampsim_tracer.so,outfile=run,\
+       trace_window=marker:simulation=20000000 ...
+
+The guest kernel must also enable the walker: ``CONFIG_MIPS_HTW=y``
+and no ``nohtw`` on the kernel command line, so that ``dmesg`` prints
+``Hardware Page Table Walker enabled``.  For ``-smp > 1`` add
+``CONFIG_MIPS_CPS=y``; P5600 has no MT ASE and brings secondaries up
+through CPS, so a kernel built only with ``CONFIG_MIPS_MT_SMP`` comes
+up with a single vCPU.
+
+Neither condition is silently tolerated.  A model with no root is
+refused at plugin install, before the machine is built, and a guest
+that never programmed one is refused at the START marker, before the
+window opens — see :doc:`limitations`.
+
 **Pin the traced process to one vCPU.**  A trace is scoped to a single
 guest address space, and kernel-code per-thread attribution stays
 clean only while the traced process remains on one vCPU.  A

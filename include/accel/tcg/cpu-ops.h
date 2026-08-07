@@ -166,6 +166,30 @@ struct TCGCPUOps {
                                 uint64_t *thread_key);
 
     /**
+     * @get_plugin_narrow_asid: the target's exhaustible address-space TAG
+     *
+     * Optional.  Reports the narrow, operating-system-recycled tag the
+     * target's TLB carries, when it has one that is distinct from the
+     * page-table root @get_plugin_identity reports — on MIPS, EntryHi.ASID
+     * (with MemoryMapID where Config5.MI makes it the tag).  NULL, and
+     * therefore 0, on every target whose only address-space name IS the
+     * root: x86-64, AArch64 and RISC-V tag their TLBs from a field of the
+     * root register itself, so there is no second value to report.
+     *
+     * It is NOT an identity and must never be used as one: an operating
+     * system re-points these values at different live address spaces as the
+     * space is exhausted, which is the whole reason identity keys on the
+     * root instead.  It exists so a consumer can WITNESS that recycling —
+     * count how much of the tag space a guest burned during a run — using a
+     * value that is independent of, and cannot be inferred from, the
+     * ownership key it is meant to corroborate.  Verbatim architectural
+     * state; no guest memory is read.
+     *
+     * See qemu_plugin_get_narrow_asid().
+     */
+    uint64_t (*get_plugin_narrow_asid)(CPUState *cpu);
+
+    /**
      * @vaddr_is_kernel: classify a code virtual address's privilege domain
      *
      * Optional.  Returns true when @vaddr lies in the guest's KERNEL

@@ -33,6 +33,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/qdev-clock.h"
 #include "semihosting/semihost.h"
+#include "qemu/qemu-plugin.h"
 #include "fpu_helper.h"
 
 const char regnames[32][3] = {
@@ -549,6 +550,37 @@ static const Property mips_cpu_properties[] = {
 #ifdef CONFIG_TCG
 #include "accel/tcg/cpu-ops.h"
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+/*
+ * The MIPS page-table root, as an address a consumer can compare.
+ *
+ * CP0 PWBase (Config3.PW) is the base the HARDWARE page-table walker walks
+ * from, so it is the same kind of register as x86 CR3, AArch64 TTBR0 and
+ * RISC-V SATP: the value the architecture itself translates through, not a
+ * tag an operating system hands out.  Linux writes it in
+ * htw_set_pwbase(), reached from TLBMISS_HANDLER_SETUP_PGD(), i.e. from
+ * every switch_mm()/activate_mm() — so it holds the current mm's pgd for
+ * exactly as long as that mm is current.
+ *
+ * The kernel programs it with a KSEG0/KSEG1 virtual address (the pgd is
+ * allocated from lowmem and used unmapped).  Normalise those to the
+ * physical address they name so the reported key is the page-table root
+ * itself: kseg0 and kseg1 are two virtual names for one physical page, and
+ * an address space must not acquire a second identity because the kernel
+ * chose the uncached window.  Anything else — an XKPHYS or mapped address
+ * on a 64-bit kernel — is passed through verbatim; it is still a stable
+ * per-mm value, and inventing a translation for it would be guesswork.
+ */
+static uint64_t mips_pwbase_key(CPUMIPSState *env)
+{
+    uint64_t pw = (uint64_t)env->CP0_PWBase;
+    uint64_t seg = pw & 0xE0000000ULL;
+
+    if (seg == 0x80000000ULL || seg == 0xA0000000ULL) {
+        return pw & 0x1FFFFFFFULL;
+    }
+    return pw;
+}
+
 static void mips_get_plugin_state(CPUState *cs, int *priv, uint64_t *asid,
                                   bool *mmu_on)
 {
@@ -558,33 +590,36 @@ static void mips_get_plugin_state(CPUState *cs, int *priv, uint64_t *asid,
     int ksu = env->hflags & MIPS_HFLAG_KSU;
     *priv = MIPS_HFLAG_UM - ksu;
     /*
-     * EntryHi.ASID is the only per-process identity MIPS exposes
-     * architecturally, and it is a weak one: 8 bits (10 with
-     * Config4.AE), allocated per CPU, recycled by generation rollover.
-     * The obvious upgrades were audited empirically and do not exist
-     * on real guests (Linux 6.6, Malta, 24Kf UP / 34Kf SMP):
+     * The reported address-space value is the page-table ROOT wherever the
+     * model has one, exactly as on the wide-register targets, so a consumer
+     * that stores it stores a real root: CP0 PWBase under Config3.PW (see
+     * mips_pwbase_key), which the hardware walker itself translates from
+     * and which Linux repoints at each switch_mm.  It is per-mm, so both
+     * vCPUs of an SMP guest report the same value for one address space and
+     * a migration is not a rename; it is unforgeable, because a wrong value
+     * faults the guest rather than mislabelling it; and a fork() child gets
+     * a new pgd, hence a different value, from its first instruction.
      *
-     *  - CP0 Context.PTEBase never holds a page-table base.  A 32-bit
-     *    kernel keeps the pgd in the pgd_current[] array in RAM and
-     *    writes Context exactly once per CPU at bring-up with
-     *    (cpu_id << 25) so the TLB-refill handler can index that
-     *    array (observed: one committed write per secondary CPU,
-     *    value 0x02000000 on CPU 1, none after; the low 23 bits churn
-     *    with hardware-set BadVPN2).  Reporting Context or a
-     *    (Context | ASID) compound would make equality WORSE: the
-     *    per-CPU constant breaks cross-vCPU equality for one process.
-     *  - CP0 XContext exists only on MIPS64 kernels
-     *    (CONFIG_MIPS_PGD_C0_CONTEXT).
-     *  - A KScratch-resident pgd needs Config4.KScrExist and
-     *    MemoryMapID needs Config5.MI; the 24K/34K-class models
-     *    implement neither, so the kernel programs neither.
-     *
-     * So the bare ASID stays the reported id, and disambiguating its
-     * reuse (rollover, per-CPU allocation) is the plugin's job — done
-     * by physical-page identity via qemu_plugin_vaddr_to_paddr(),
-     * which virtual aliasing cannot forge.
+     * Config3.PW clear (24Kf, 34Kf, 20Kc — every non-P5600 MIPS model in
+     * QEMU) leaves only EntryHi.ASID: 8 bits, 10 with Config4.AE, over a
+     * 16-entry TLB, allocated per CPU and re-pointed at a DIFFERENT LIVE
+     * process on generation rollover.  It is reported because it is what
+     * the architecture says now, but it does not distinguish two live
+     * processes and a consumer that needs that must check
+     * qemu_plugin_identity_caps() and refuse.  Deliberately NOT composed
+     * with anything on such a model: CP0 Context holds
+     * smp_processor_id() << SMP_CPUID_REGSHIFT on 32-bit MIPS Linux, not a
+     * pgd (a per-CPU constant would make cross-vCPU equality strictly
+     * worse), XContext exists only on MIPS64 CONFIG_MIPS_PGD_C0_CONTEXT
+     * kernels, and a KScratch-resident pgd needs Config4.KScrExist which
+     * those models do not implement.  Reading any of them as a root would
+     * be an OS convention, not an architectural fact.
      */
-    *asid = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
+    if (env->CP0_Config3 & (1 << CP0C3_PW)) {
+        *asid = mips_pwbase_key(env);
+    } else {
+        *asid = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
+    }
     /* MIPS always translates through the TLB (mapped segments fault on a
      * TLB miss); there is no global paging-disable, so report on. */
     *mmu_on = true;
@@ -636,14 +671,29 @@ static uint64_t mips_get_plugin_thread_ptr(CPUState *cs)
 /*
  * Raw architectural identity keys (see TCGCPUOps::get_plugin_identity).
  *
- * Address space: EntryHi.ASID under the CPU's own ASID mask, with CP0
- * MemoryMapID above it when Config5.MI makes MemoryMapID (not ASID) the
- * TLB's tag.  That is the whole of what MIPS names an address space with:
- * there is no readable page-table root, and the field is 8 bits over a
- * 16-entry TLB, so an operating system re-points the value at a different
- * address space on rollover.  This hook reports the name the architecture
- * gives NOW; following one address space across a rollover is the
- * consumer's job, composed with the thread key.
+ * Address space: CP0 PWBase, the hardware page-table walker's base
+ * register, on any model that implements the walker (Config3.PW).  That
+ * makes MIPS the same kind of target as x86-64 (CR3), AArch64 (TTBR0) and
+ * RISC-V (SATP) — the key is the root the hardware translates from, which
+ * is per-mm, identical on every vCPU running that mm, distinct for a fork
+ * child from its first instruction, and self-enforcing (a guest that put
+ * the wrong value there would fault, not merely be mislabelled).
+ *
+ * Zero is NOT a narrow fallback.  A model with Config3.PW whose guest has
+ * not programmed PWBase ("nohtw", CONFIG_MIPS_HTW=n, or a kernel that
+ * declined the walker after checking PTEI) reports 0, which the interning
+ * layer already refuses to turn into an id.  Substituting EntryHi.ASID
+ * there would silently reintroduce the whole reuse hazard on exactly the
+ * boots where it is invisible, so it is not done: PW set means PWBase, and
+ * 0 means no identity.
+ *
+ * Config3.PW clear leaves EntryHi.ASID under the CPU's own ASID mask, with
+ * CP0 MemoryMapID above it when Config5.MI makes MemoryMapID (not ASID)
+ * the TLB's tag.  That is a NAME, not an identity — 8 bits over a 16-entry
+ * TLB, re-pointed at a different live address space on rollover — and
+ * qemu_plugin_identity_caps() reports the difference so a consumer that
+ * cannot tolerate it refuses the run rather than following the wrong
+ * process.
  *
  * Thread: CP0 UserLocal.  A model that does not implement it (Config3.ULRI
  * clear — the 24K class, including the canonical Malta default) leaves it
@@ -654,13 +704,67 @@ static void mips_get_plugin_identity(CPUState *cs, uint64_t *space_key,
                                      uint64_t *thread_key)
 {
     CPUMIPSState *env = cpu_env(cs);
-    uint64_t key = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
+    uint64_t key;
 
-    if (env->CP0_Config5 & (1 << CP0C5_MI)) {
-        key |= ((uint64_t)(uint32_t)env->CP0_MemoryMapID) << 32;
+    if (env->CP0_Config3 & (1 << CP0C3_PW)) {
+        key = mips_pwbase_key(env);
+    } else {
+        key = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
+        if (env->CP0_Config5 & (1 << CP0C5_MI)) {
+            key |= ((uint64_t)(uint32_t)env->CP0_MemoryMapID) << 32;
+        }
     }
     *space_key = key;
     *thread_key = env->active_tc.CP0_UserLocal;
+}
+
+/*
+ * The exhaustible tag, reported for WITNESSING only (see
+ * TCGCPUOps::get_plugin_narrow_asid).  This is the value the identity hook
+ * above stopped using on a walker-capable model, and it is deliberately
+ * still readable: a consumer has to be able to observe the guest recycling
+ * it WITHOUT that observation being derived from the ownership key it is
+ * meant to corroborate.  Reported at every model, walker or not.
+ */
+static uint64_t mips_get_plugin_narrow_asid(CPUState *cs)
+{
+    CPUMIPSState *env = cpu_env(cs);
+    uint64_t tag = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
+
+    if (env->CP0_Config5 & (1 << CP0C5_MI)) {
+        tag |= ((uint64_t)(uint32_t)env->CP0_MemoryMapID) << 32;
+    }
+    return tag;
+}
+
+/*
+ * Which identity keys this MIPS MODEL can supply (see
+ * CPUClass::plugin_identity_caps).  Read from the model definition, not
+ * from a live CPU: the answer has to be available at plugin-install time,
+ * which is before any CPUState exists.  Same shape as
+ * cpu_type_supports_cps_smp() below.
+ *
+ * Today exactly one QEMU MIPS model implements the walker — P5600
+ * (cpu-defs.c.inc sets CP0C3_PW there and nowhere else) — and it also sets
+ * CP0C3_ULRI and CP0C3_CMGCR, so it names a thread and can boot an SMP
+ * malta through the CPS path.  The test is on the bits, not on the model
+ * name, so a model that gains the walker later is picked up for free.
+ */
+static uint64_t mips_plugin_identity_caps(ObjectClass *oc)
+{
+    const MIPSCPUClass *mcc = MIPS_CPU_CLASS(oc);
+    uint64_t caps = 0;
+
+    if (!mcc->cpu_def) {
+        return 0;
+    }
+    if (mcc->cpu_def->CP0_Config3 & (1 << CP0C3_PW)) {
+        caps |= QEMU_PLUGIN_IDENT_SPACE_IS_ROOT;
+    }
+    if (mcc->cpu_def->CP0_Config3 & (1 << CP0C3_ULRI)) {
+        caps |= QEMU_PLUGIN_IDENT_NAMES_THREAD;
+    }
+    return caps;
 }
 
 static bool mips_plugin_thread_ptr_tracks_current(CPUState *cs)
@@ -742,6 +846,7 @@ static const TCGCPUOps mips_tcg_ops = {
     .get_plugin_state = mips_get_plugin_state,
     .get_plugin_thread_ptr = mips_get_plugin_thread_ptr,
     .get_plugin_identity = mips_get_plugin_identity,
+    .get_plugin_narrow_asid = mips_get_plugin_narrow_asid,
     /* CP0 UserLocal is a dedicated TLS slot the kernel has no use of its
      * own for: Linux/MIPS writes it from the incoming task in switch_to()
      * and never touches it in between, so a kernel-privilege read names
@@ -794,6 +899,9 @@ static void mips_cpu_class_init(ObjectClass *c, void *data)
     cc->disas_set_info = mips_cpu_disas_set_info;
     cc->gdb_num_core_regs = 73;
     cc->gdb_stop_before_watchpoint = true;
+#if defined(CONFIG_TCG) && defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+    cc->plugin_identity_caps = mips_plugin_identity_caps;
+#endif
 #ifdef CONFIG_TCG
     cc->tcg_ops = &mips_tcg_ops;
 #endif /* CONFIG_TCG */

@@ -80,7 +80,17 @@ _ISA_BOOT = {
                 "machine": ["-M", "virt", "-cpu", "max"],
                 "console": "ttyS0"},
     "mipsel":  {"dir": "mipsel",  "kernel": "vmlinux",
-                "machine": ["-M", "malta"],
+                # -cpu P5600 is REQUIRED, not a tuning choice: it is the only
+                # QEMU MIPS model implementing Config3.PW / CP0 PWBase, the
+                # hardware page-table walker's base register, which is what a
+                # system capture names its process by.  malta defaults to
+                # 24Kf, which supplies no page-table root, and the plugin
+                # REFUSES TO INSTALL on it rather than name an address space
+                # by an 8-bit EntryHi.ASID a Linux guest reassigns to a
+                # different live process on rollover.  P5600 also sets
+                # Config3.ULRI (thread ids keep working) and Config3.CMGCR
+                # (the malta CPS SMP path).
+                "machine": ["-M", "malta", "-cpu", "P5600"],
                 "console": "ttyS0"},
 }
 
@@ -562,12 +572,13 @@ def system_qemu_cmd(qemu_system: Path, kernel: Path, initrd: Path,
     ]
     if smp and int(smp) > 1:
         cmd += ["-smp", str(int(smp))]
-        if isa == "mipsel":
-            # Malta SMP needs the MT ASE: the guest's CONFIG_MIPS_MT_SMP
-            # secondary bring-up runs VPE probes that corrupt the stack
-            # and panic on the default 24Kc ("stack-protector: Kernel
-            # stack is corrupted in: vsnprintf"), leaving CPU 1 offline
-            # for the whole run.  34Kf onlines both CPUs.
-            cmd += ["-cpu", "34Kf"]
+        # No per-cell -cpu override anywhere: the model comes from the boot
+        # shape above and nothing may quietly replace it.  mipsel SMP used to
+        # switch to 34Kf for the MT ASE; P5600 has no MT ASE and brings up
+        # secondaries through CPS (Config3.CMGCR) instead, so the guest
+        # kernel needs CONFIG_MIPS_CPS=y.  Substituting 34Kf back would
+        # silently restore a model with no page-table root -- which the
+        # plugin now refuses outright, so the failure would at least be
+        # loud, but the harness must not create it in the first place.
     cmd += os.environ.get("CST_QEMU_EXTRA_ARGS", "").split()
     return cmd

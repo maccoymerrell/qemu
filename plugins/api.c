@@ -721,6 +721,16 @@ uint64_t qemu_plugin_get_thread_id(void)
     return current_cpu->plugin_thread_id;
 }
 
+uint64_t qemu_plugin_get_narrow_asid(void)
+{
+    g_assert(current_cpu);
+    const TCGCPUOps *ops = current_cpu->cc->tcg_ops;
+    if (ops && ops->get_plugin_narrow_asid) {
+        return ops->get_plugin_narrow_asid(current_cpu);
+    }
+    return 0;
+}
+
 bool qemu_plugin_thread_ptr_tracks_current(void)
 {
     g_assert(current_cpu);

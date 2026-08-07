@@ -217,6 +217,15 @@ def _parse_args() -> argparse.Namespace:
     al.add_argument("--wpprune", type=int, default=0, choices=(0, 1, 2),
                     help="wrong-path pruning level (plugin wpprune=N).")
     al.add_argument("--stop", type=int, default=200_000)
+    al.add_argument("--simpoints", default=None,
+                    help="SimPoint selections file.  In --system mode this "
+                         "composes with the marker pin: the START marker "
+                         "pins the address space, the schedule chooses the "
+                         "intervals captured inside it.")
+    al.add_argument("--sp-interval", type=int, default=100_000,
+                    help="SimPoint interval length in user instructions.")
+    al.add_argument("--sp-warmup", type=int, default=0,
+                    help="User instructions of warmup before each simpoint.")
     al.add_argument("--tb-size", type=int, default=0,
                     help="QEMU code-cache size in MiB (passes -tb-size; "
                          "0 = QEMU default). Small values force tb_flush "
@@ -475,6 +484,22 @@ def _optional_plugin_opts(args) -> str:
     return opts
 
 
+# Exit code meaning "this run could not be performed, and that is a property
+# of the HOST, not of the thing under test" -- an absent cross-compiler, a
+# guest kernel/rootfs fixture that was never staged.  It is distinct from 0
+# because a run that did not happen must never read as a run that passed:
+# ``_full._cli_outcome`` maps it to SKIP, which the suite reports loudly.
+#
+# A missing BUILD PRODUCT is deliberately NOT this code.  If the build dir
+# under test has no qemu-system-<isa>, the check cannot find its subject and
+# fails -- that is the whole point of pointing it at that build dir.  This
+# distinction is load-bearing: every one of these sites used to ``return 0``,
+# so a system-tier check against a build that lacked its emulator traced
+# nothing, validated nothing, and reported PASS in one second while still
+# claiming its feature-coverage tags.
+RC_SKIP = 77
+
+
 def _trace_system(args, isa: str, bin_path: Path, plugin: Path,
                   out_base) -> int:
     """System-mode trace: boot qemu-system-<isa> with @bin_path staged into
@@ -484,21 +509,42 @@ def _trace_system(args, isa: str, bin_path: Path, plugin: Path,
     entry point over ptrace, which is how an unmodified binary is traced."""
     if isa not in SYS.ISA_QEMU_SYSTEM:
         print(f"trace[{isa}]: SKIP  no system-mode boot shape for this ISA")
-        return 0
+        return RC_SKIP
     qemu_sys = args.build_dir / SYS.ISA_QEMU_SYSTEM[isa]
     kernel = Path(getattr(args, "kernel", None) or SYS.default_kernel(isa))
     base_root = Path(getattr(args, "rootfs", None) or SYS.default_root(isa))
-    for p, what in ((qemu_sys, "qemu-system"), (kernel, "kernel"),
-                    (base_root, "rootfs base")):
+    # The emulator is a product of the build dir we were pointed at; its
+    # absence means that build cannot answer the question this check asks.
+    if not qemu_sys.exists():
+        print(f"trace[{isa}]: FAIL  qemu-system not found: {qemu_sys}\n"
+              f"trace[{isa}]:       the build dir under test does not provide "
+              f"this ISA's system emulator, so this check has no subject; "
+              f"rebuild with {isa}-softmmu in --target-list")
+        return 1
+    # Guest kernel/rootfs are staged host fixtures, not build products.
+    for p, what in ((kernel, "kernel"), (base_root, "rootfs base")):
         if not p.exists():
             print(f"trace[{isa}]: SKIP  {what} not found: {p}")
-            return 0
+            return RC_SKIP
 
     # The marker (at the workload's _start) opens + ASID-pins the window.
-    # TODO(count-set): once the window counter excludes kernel/wrong-ASID
-    # insns, compose the marker pin with trace_window=icount/simpoint
-    # instead of this standalone marker mode.
-    window_opt = f"trace_window=marker:simulation={args.stop}"
+    #
+    # With --simpoints, the window is the COMPOSITION the TODO here used to
+    # defer: system-mode trace_window=simpoint IS a marker window with a
+    # SimPoint schedule inside it (pinned_simpoint_mode).  The START marker
+    # pins the address space and zeroes the user clock; the SimPoint offsets
+    # then position the capture on that clock.  The count-set precondition
+    # the TODO named is met -- the window counter excludes kernel and
+    # wrong-ASID instructions, which is exactly what makes offsets derived
+    # from a user-mode bbv run valid inside a full-system guest.
+    sp_file = getattr(args, "simpoints", None)
+    if sp_file:
+        window_opt = (f"trace_window=simpoint:file={sp_file}"
+                      f"+interval={getattr(args, 'sp_interval', 100000)}"
+                      f"+warmup={getattr(args, 'sp_warmup', 0)}"
+                      f"+simulation={args.stop}")
+    else:
+        window_opt = f"trace_window=marker:simulation={args.stop}"
     plugin_opts = (f"outfile={out_base},wpdepth={args.depth},"
                    f"{window_opt},memdata=1") + _optional_plugin_opts(args)
 
@@ -509,16 +555,18 @@ def _trace_system(args, isa: str, bin_path: Path, plugin: Path,
     attach_bin = None
     if getattr(args, "attach", False):
         if init_text is not None:
-            print(f"trace[{isa}]: SKIP  --attach and a custom guest init are "
+            # Not an environment gap -- the caller asked for two things that
+            # cannot both hold, which is a bug in the invocation.
+            print(f"trace[{isa}]: FAIL  --attach and a custom guest init are "
                   f"mutually exclusive (the injector owns the workload's "
                   f"exec)")
-            return 0
+            return 1
         attach_bin = SYS.build_cst_attach(isa, stage_dir)
         if attach_bin is None:
             print(f"trace[{isa}]: SKIP  --attach needs "
                   f"{SYS.ISA_ATTACH_CC.get(isa)} to cross-build the guest-side "
                   f"injector")
-            return 0
+            return RC_SKIP
         init_text = SYS.default_init(attach=True)
         print(f"trace[{isa}] (system): injecting marker via "
               f"{attach_bin.name} -> /{SYS.ATTACH_GUEST_PATH}")
@@ -540,6 +588,23 @@ def _trace_system(args, isa: str, bin_path: Path, plugin: Path,
         print(f"trace[{isa}]: FAIL  clock stall: {stall}")
         return 1
     cst = Path(f"{out_base}.cst")
+    if sp_file:
+        # Simpoint mode never writes <out_base>.cst: each scheduled cluster
+        # lands in <out_base>-simpoint_<N>.cst.  The user-mode simpoint path
+        # below already checks the per-segment files; this is its system
+        # twin.  Requiring the single-segment name here reported every
+        # successful composition run as a failure.
+        sp_csts = sorted(cst.parent.glob(f"{cst.stem}-simpoint_*.cst"))
+        if rc != 0 or not sp_csts:
+            print(f"trace[{isa}]: FAIL rc={rc}")
+            try:
+                for line in console.read_text().splitlines()[-15:]:
+                    print(f"  {line}")
+            except OSError:
+                pass
+            return rc or 1
+        print(f"trace[{isa}]: wrote {' '.join(p.name for p in sp_csts)}")
+        return 0
     if rc != 0 or not cst.is_file():
         print(f"trace[{isa}]: FAIL rc={rc}")
         try:
@@ -619,13 +684,16 @@ def cmd_trace(args, isa: str | None = None) -> int:
     isa = isa or args.isa
     prog = _prog_base(args.out_dir, args.prog)
     bin_path = _bin_path(args.out_dir, prog, isa)
+    # The workload binary and the plugin are both products of steps that
+    # already reported success (cmd_build, and the build dir under test).
+    # Their absence here is a broken run, not an unavailable environment.
     if not bin_path.is_file():
-        print(f"trace[{isa}]: SKIP  binary not found: {bin_path}")
-        return 0
+        print(f"trace[{isa}]: FAIL  binary not found: {bin_path}")
+        return 1
     plugin = args.build_dir / "contrib" / "plugins" / "libchampsim_tracer.so"
     if not plugin.is_file():
-        print(f"trace[{isa}]: SKIP  plugin not found: {plugin}")
-        return 0
+        print(f"trace[{isa}]: FAIL  plugin not found: {plugin}")
+        return 1
 
     out_base = _trace_base(args.out_dir, prog, isa)
 
@@ -634,8 +702,11 @@ def cmd_trace(args, isa: str | None = None) -> int:
 
     qemu = args.build_dir / ISA_QEMU[isa]
     if not qemu.is_file():
-        print(f"trace[{isa}]: SKIP  qemu not found: {qemu}")
-        return 0
+        print(f"trace[{isa}]: FAIL  qemu not found: {qemu}\n"
+              f"trace[{isa}]:       the build dir under test does not provide "
+              f"this ISA's user-mode emulator, so this check has no subject; "
+              f"rebuild with {isa}-linux-user in --target-list")
+        return 1
 
     # Plugin args (current ChampSim Tracer flag names, v1.11):
     #   - wpdepth=N            (was: depth=N)
@@ -695,9 +766,11 @@ def cmd_validate(args, isa: str | None = None) -> int:
     meta = _meta_path(args.out_dir, prog, isa)
     trace = Path(f"{_trace_base(args.out_dir, prog, isa)}.cst")
     if not trace.is_file() or not meta.is_file():
-        print(f"validate[{isa}]: SKIP  missing inputs "
+        # Reached only when tracing reported success, so the inputs are
+        # supposed to exist.  Validating nothing is not validating.
+        print(f"validate[{isa}]: FAIL  missing inputs "
               f"(trace={trace.is_file()}, meta={meta.is_file()})")
-        return 0
+        return 1
     # Symbol-based start, or system-mode marker: validator can't know the
     # exact icount the trigger resolves to, so disable the strict
     # header_window start check (the window's total budget is in user
@@ -726,13 +799,22 @@ def cmd_validate(args, isa: str | None = None) -> int:
 
 def cmd_all(args) -> int:
     rc_total = 0
+    skipped = False
     for isa in args.isa:
         print(f"\n==== {isa} ====")
         cmd_generate(args, isa)
         if cmd_build(args, isa) != 0:
             rc_total = 1
             continue
-        if cmd_trace(args, isa) != 0:
+        rc_trace = cmd_trace(args, isa)
+        # RC_SKIP means the host could not host this run at all.  Carry it
+        # through as a skip rather than letting the downstream analyze/
+        # validate steps "succeed" on absent inputs -- that laundering is
+        # exactly how a check with no trace reported PASS.
+        if rc_trace == RC_SKIP:
+            skipped = True
+            continue
+        if rc_trace != 0:
             rc_total = 1
             continue
         # System-mode traces interleave the pinned process's kernel calls,
@@ -744,7 +826,10 @@ def cmd_all(args) -> int:
         cmd_analyze(args, isa)
         if cmd_validate(args, isa) != 0:
             rc_total = 1
-    return rc_total
+    # A real failure outranks a skip; a skip outranks silent success.
+    if rc_total:
+        return rc_total
+    return RC_SKIP if skipped else 0
 
 
 import re as _re

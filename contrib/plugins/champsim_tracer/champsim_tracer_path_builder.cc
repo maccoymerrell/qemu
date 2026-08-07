@@ -68,6 +68,66 @@ static bool pb_depth_diag()
     return v;
 }
 
+/*
+ * ----------------------------------------------------------------------
+ * Retention A/B switches (experiment only; the shipping default is off).
+ *
+ * Each flips EXACTLY ONE thing, so an arm isolates one variable:
+ *
+ *   CST_RETAIN_ALL   bypasses the ownership guard on the retention append
+ *                    and nothing else — same drain, same O(1) async fold,
+ *                    same in_async stamps, same seal derivation.  This is
+ *                    the unbounded arm, and the only difference between it
+ *                    and the default is WHICH EVENTS ARE KEPT.
+ *   CST_SLOW_FOLD    replaces the O(1) drain-time async fold with the old
+ *                    rescan of the whole retention, and nothing else.  Only
+ *                    meaningful together with CST_RETAIN_ALL (the rescan
+ *                    needs the async events present); the plugin refuses
+ *                    the invalid pairing rather than measure a silently
+ *                    different thing.
+ *   CST_RETAIN_CHECK maintains BOTH the old and the new seal derivations
+ *                    every step and compares them at every seal, bucketing
+ *                    the compared events so a zero-population cell fails
+ *                    instead of reporting a vacuous zero mismatch.
+ * ----------------------------------------------------------------------
+ */
+static bool retain_all()
+{
+    static const bool v = getenv("CST_RETAIN_ALL") != nullptr;
+    return v;
+}
+
+static bool slow_fold()
+{
+    static const bool v = getenv("CST_SLOW_FOLD") != nullptr;
+    return v;
+}
+
+static bool retain_check()
+{
+    static const bool v = getenv("CST_RETAIN_CHECK") != nullptr;
+    return v;
+}
+
+/* CST_SLOW_FOLD rescans the retention for async edges, so it measures the
+ * intended thing only when the retention still contains them.  Refuse the
+ * invalid pairing instead of silently measuring a third, unnamed arm. */
+static void retain_arms_check_once()
+{
+    static bool done = false;
+    if (done) {
+        return;
+    }
+    done = true;
+    if (slow_fold() && !retain_all()) {
+        fprintf(stderr, "champsim_tracer: FATAL CST_SLOW_FOLD requires "
+                "CST_RETAIN_ALL (the reference fold rescans the retention, "
+                "which the bounded arm does not populate with async edges)\n");
+        fflush(stderr);
+        abort();
+    }
+}
+
 /* Kernel-excursion ownership diagnostics: the entry-ASID restore arrow and
  * the kernel TBs an excursion admits or refuses after one.  Prints each
  * distinct block PC once (the interesting population is the set of blocks,
@@ -1000,6 +1060,10 @@ void PathBuilder::on_segment_open()
     susp_stack_.clear();
     frames_.clear();
     pending_evs_.clear();
+    ref_evs_.clear();
+    retained_first_enter_pc_ = 0;
+    absorbed_opened_window_ = false;
+    drain_async_open_ = qemu_plugin_in_async_int();
     clear_prev();
     walk_prev_ = nullptr;
     walk_depth_ = 0;
@@ -2103,7 +2167,21 @@ void PathBuilder::classify_fault_enter(const struct qemu_plugin_cpu_event &ev,
         *prev_stashed = true;
         return;
     }
-    if (!*prev_stashed && tmpl_contains_pc(walk_prev_, resume)) { /* (b) */
+    /* Case (b) needs the SAME address-space identity check its sibling
+     * lookups make.  frame_idx_for_resume and frame_idx_for_block both
+     * compare asid; tmpl_contains_pc does not, so an event from another
+     * address space whose resume PC happens to fall inside the pinned
+     * walk_prev_ (identical text at identical addresses is the norm — the
+     * same binary, the same shared library, the same kernel) would mint a
+     * CtxFrame stamped with the FOREIGN asid inside the pinned process's
+     * fault depth.  The retention gate now keeps such an event out of the
+     * seal entirely; this enforces the invariant at the consumer too. */
+    if (!*prev_stashed && tmpl_contains_pc(walk_prev_, resume) &&
+        ctx_asid_foreign(ev.asid)) {
+        g_stats.case_b_frame_asid_mismatch++;
+    }
+    if (!*prev_stashed && tmpl_contains_pc(walk_prev_, resume) &&
+        !ctx_asid_foreign(ev.asid)) {                             /* (b) */
         BBTemplate *full_bb = fold_prev_full_bb(walk_prev_);
         frames_.emplace_back();
         CtxFrame &f = frames_.back();
@@ -2152,69 +2230,258 @@ void PathBuilder::apply_fault_return(const struct qemu_plugin_cpu_event &ev)
     }
 }
 
-PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
+/*
+ * The retention bound, as a tripwire — never a cap.
+ *
+ * An event is retained only for a context the trace ADMITS, and every
+ * dispatch of an admitted context reaches step_seal, which empties the
+ * retention.  So entries can only stack while the traced context is not
+ * running, and the traced context cannot raise another synchronous fault
+ * without executing: the stack height is its own architectural trap nesting,
+ * enter plus return per level.  QEMU's own per-vCPU resume-PC stack is 64
+ * deep (CPU_PLUGIN_FAULT_STACK_MAX), which is the deepest nesting the
+ * producer can even represent, so 2*64+2 is a hard ceiling on a correct run.
+ * Crossing it means the argument above is false somewhere — a real defect —
+ * so the tracer refuses the run instead of silently dropping events.
+ */
+static size_t retention_tripwire()
 {
-    /* The pending-seal prev promoted last step is the TB that finished
-     * immediately before THIS dispatch, so this dispatch's raw latch is
-     * its self-loop accounting — absorb exactly once.  Steps that do not
-     * promote never re-arm, so a latch describing a dropped async/foreign
-     * TB can never overwrite a deferred prev's facts. */
-    {
-        RepSelfLoopState &rs = rep_state(in.cpu_index);
-        if (rs.pb_prev_facts_armed) {
-            rs.pb_prev_facts = rs.cp_facts;
-            rs.pb_prev_facts_armed = false;
+    /* CST_RETENTION_TRIPWIRE lowers the threshold so the abort path itself
+     * can be fired on demand and shown to work — an instrument that has
+     * never been observed to fire is not evidence.  Test-only; it can only
+     * make the check STRICTER, never disable it. */
+    static const size_t v = [] {
+        const char *e = getenv("CST_RETENTION_TRIPWIRE");
+        size_t d = 2 * 64 + 2;
+        return e ? strtoul(e, nullptr, 0) : d;
+    }();
+    return v;
+}
+
+/*
+ * Is this event the traced context's own?
+ *
+ * NOT a new rule: the EXISTING attribution gate, re-evaluated on the event's
+ * own recorded state (ev.asid / ev.priv / ev.tp / ev.tp_ok, stamped by the
+ * producer at the event instant) instead of on the TB that happens to be
+ * dispatching.  That is what makes retention an attribution decision taken
+ * in the same place, from the same inputs, as CONTINUE/SUSPEND.
+ *
+ * The stamping instant is what makes it sound: a synchronous fault is pushed
+ * from the target's do_interrupt BEFORE the privilege/address-space switch
+ * (RISC-V: target/riscv/cpu_helper.c, the push precedes riscv_cpu_set_mode),
+ * so the event names the FAULTING context, not the handler it is about to
+ * enter.  A foreign process page-faulting therefore carries the foreign
+ * asid, fails here, and contributes nothing.
+ *
+ * @idx is the event's position in this drain, used to read the excursion-
+ * ownership snapshot taken at that position.
+ */
+bool PathBuilder::event_is_ours(const struct qemu_plugin_cpu_event &ev,
+                                const StepIn &in, bool in_async,
+                                size_t idx) const
+{
+    /* (a) Unpinned (trace-all / user mode): everything is ours, verbatim
+     * legacy behaviour. */
+    if (!in.pinned) {
+        return true;
+    }
+
+    /* (b) Excluded async-window content.  Subsumes the seal's old
+     * fault_enter_skipped_in_async arm and is strictly stronger: the window
+     * cursor is persistent, so it also covers a window opened on an EARLIER
+     * bailed step, which a batch-local scan cannot see. */
+    if (in_async && !g_features.trace_interrupts) {
+        return false;
+    }
+
+    /* (c) Translation-bypassing privilege (RISC-V M-mode): firmware above
+     * the OS kernel drops on BOTH attribution rules — the same refusal the
+     * TB gate makes.  g_xlate_bypass_priv is -1 until the target's ident is
+     * read, and ev.priv is unsigned, so the comparison is inert before
+     * then. */
+    if (ev.priv > 0 && g_xlate_bypass_priv > 0 &&
+        (int)ev.priv == g_xlate_bypass_priv) {
+        return false;
+    }
+
+    /* (d) User privilege: the live-ASID equality the user TB rule uses.
+     * in.pinned_asid is already the EFFECTIVE pin (the dwell tag on
+     * narrow-ASID targets).
+     *
+     * KNOWN GAP, narrow-ASID targets (MIPS, in.asid_is_identity false).
+     * There the raw value is 8 bits and recycles, so equality is a
+     * COINCIDENCE, not identity — the TB gate answers this question with
+     * physical-page verification (pin_user_tb_owned), which an event cannot
+     * be asked.  Admitting on raw equality therefore lets a colliding
+     * foreign process's events in, and the bound below does not hold: the
+     * validator's mipsel churn cells trip the retention tripwire.  The
+     * tripwire refuses the run rather than accumulate silently, but this is
+     * an incomplete fix on that target, not a closed one; it needs the same
+     * page-identity evidence the block gate uses, keyed off ev.pc. */
+    if (ev.priv == 0) {
+        return ev.asid == in.pinned_asid;
+    }
+
+    /* (e/f) Kernel privilege. */
+    if (!g_features.kexc) {
+        /* Legacy rule: the live ASID, exactly as the TB gate applies it
+         * when kexc is off.  See the startup refusal in
+         * champsim_tracer.cc: system mode + a pin requires kexc, because
+         * this read is the untrustworthy one inside the kernel and a
+         * conservative "retain anyway" would preserve the unboundedness. */
+        return ev.asid == in.pinned_asid;
+    }
+
+    /* The event-level mirror of kexc_kernel_tb_keep, from the event's own
+     * state.  The edge rule and the live-root rule each ADMIT; the
+     * task-identity rule and the foreign-root rule only REFUSE. */
+    const bool edge_own = idx < drain_kexc_own_.size()
+                              ? drain_kexc_own_[idx] != 0
+                              : (kexc_in_kernel_ && kexc_have_user_ &&
+                                 kexc_entry_owned_ && !kexc_cut_);
+    const bool root_owned = in.asid_is_identity && ev.asid == in.pinned_asid;
+    const bool root_foreign = in.asid_is_identity && ev.asid != in.pinned_asid;
+    /* ev.tp_ok is the producer's answer to "does this register name the
+     * executing thread HERE" — the same question in.cur_tp_strict answers
+     * for a TB.  A borrowed-mm kernel thread running on our page tables is
+     * refused by this arm, which is what keeps the root rule from admitting
+     * an unbounded stream of a context we do not trace. */
+    const bool tp_known = ev.tp_ok && kexc_tp_armed();
+    const bool tp_foreign = tp_known &&
+                            !(kexc_tp_usable(ev.tp) &&
+                              kexc_tp_owned(ev.tp, ev.asid));
+
+    return (edge_own || root_owned) && !tp_foreign && !root_foreign;
+}
+
+/*
+ * CST_RETAIN_CHECK: compare the OLD seal-time derivation (run here over
+ * ref_evs_, the unconditional retention, verbatim) against the NEW one, and
+ * record the CELL POPULATIONS of everything compared.
+ *
+ * The populations are the point.  A previous version of this comparison
+ * reported "0 mismatches" over ~1500 events while its own log showed zero
+ * events with in_async true — every compared event sat where the answer is
+ * constant, so the transformation under test was never exercised.  Here the
+ * cells are counted, and a required cell reading 0 is a FAILED check.
+ */
+void PathBuilder::retain_check_compare(uint64_t new_resume_pc)
+{
+    g_stats.rcheck_seals++;
+
+    /* OLD derivation: the batch-shape prologue, then the ordered scan. */
+    bool old_in_async = false;
+    for (const RetainedEv &r : ref_evs_) {
+        if (r.ev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_RETURN) {
+            old_in_async = true;
+            break;
+        }
+        if (r.ev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_ENTER) {
+            break;
+        }
+    }
+    uint64_t old_resume_pc = 0;
+    for (const RetainedEv &r : ref_evs_) {
+        const struct qemu_plugin_cpu_event &ev = r.ev;
+        if (ev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_ENTER) {
+            old_in_async = true;
+        } else if (ev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_RETURN) {
+            old_in_async = false;
+        }
+        if (ev.kind != QEMU_PLUGIN_CPU_EV_FAULT_ENTER &&
+            ev.kind != QEMU_PLUGIN_CPU_EV_FAULT_RETURN) {
+            continue;
+        }
+        if (ev.kind == QEMU_PLUGIN_CPU_EV_FAULT_ENTER &&
+            !old_in_async && old_resume_pc == 0) {
+            old_resume_pc = ev.pc;
+        }
+        /* Cell census over every compared fault event. */
+        if (ev.kind == QEMU_PLUGIN_CPU_EV_FAULT_ENTER) {
+            if (r.in_async) {
+                g_stats.rcheck_cmp_enter_in_async++;
+            } else {
+                g_stats.rcheck_cmp_enter_not_async++;
+            }
+        } else {
+            if (r.in_async) {
+                g_stats.rcheck_cmp_return_in_async++;
+            } else {
+                g_stats.rcheck_cmp_return_not_async++;
+            }
+        }
+        if (r.ours) {
+            g_stats.rcheck_cmp_ours++;
+        } else {
+            g_stats.rcheck_cmp_foreign++;
+        }
+        if (r.in_async != old_in_async) {
+            g_stats.rcheck_mismatch_in_async++;
+            if (pb_diag()) {
+                fprintf(stderr, "[rcheck] IN_ASYNC new=%d old=%d kind=%u "
+                        "pc=0x%" PRIx64 " asid=0x%" PRIx64 "\n",
+                        (int)r.in_async, (int)old_in_async, ev.kind, ev.pc,
+                        ev.asid);
+            }
         }
     }
 
-    /* The seal-successor override is strictly one-step state: a
-     * recovery step always survives to its own seal (recovery implies
-     * pinned-user, which passes the foreign-ASID gate), and any
-     * harder bail between the phases also drops the walk prev the
-     * override was meant for. */
-    seal_pc_override_ = 0;
-
-    /* One-step hold-off for the resume arrow (Stage 4).  The abandoned-async
-     * no-departure arm suspends the deferred prev and then FALLS THROUGH to
-     * the promote (unlike the foreign-ASID arrow, which returns early).  If
-     * the resume arrow ran on this same step it would immediately re-arm and
-     * seal that just-suspended prev against cur — but the abandoned window
-     * means cur is the OTHER guest thread the scheduler handed this vCPU
-     * (a proper resume would have refetched the departure PC), not prev's
-     * successor, so that seal is the cross-thread taken-edge poisoning the
-     * departure-PC override exists to prevent.  Holding the resume off this
-     * one step lets cur promote fresh and defers the suspended prev to its
-     * TRUE successor's later resume (or the retire-at-return backstop).  Only
-     * the abandoned arm sets it; off the async-recovery path it stays false
-     * and the resume arrow is unchanged (byte-identical). */
-    bool hold_resume_this_step = false;
-
-    /* Segment-boundary reg-snap hygiene (Case C).  A change in the segment
-     * generation since this thread's last step means the segment just opened
-     * under it.  In marker mode the opener's own vcpu_tb_exec is JIT-gated
-     * off before the START marker fires, so on_segment_open never runs and
-     * THIS is the first dispatch after the open — with the marker block's
-     * post-open per-insn snaps (the 0x43535401 magic write among them) still
-     * pooled in pending_reg_snaps.  Drop them so the segment's first real
-     * block starts positionally clean.  In window mode on_segment_open ran
-     * last step and armed the one-shot follow-up so the opener block's own
-     * post-open leak is dropped the step after. */
-    uint32_t cur_gen = g_segment_generation.load(std::memory_order_relaxed);
-    if (seg_gen_seen_ != cur_gen) {
-        seg_gen_seen_ = cur_gen;
-        drop_open_leak_pending_ = false;
-        pending_reg_snaps(cpu_index_).clear();
-    } else if (drop_open_leak_pending_) {
-        drop_open_leak_pending_ = false;
-        pending_reg_snaps(cpu_index_).clear();
+    /* The successor override.  Under the default (owned-only) retention the
+     * two legitimately differ exactly when the old one picked a foreign
+     * event; that is the corruption being removed, and it is counted
+     * separately, so only an unexplained difference is a mismatch. */
+    if (old_resume_pc != new_resume_pc && !retain_all()) {
+        bool explained = false;
+        for (const RetainedEv &r : ref_evs_) {
+            if (r.ev.kind == QEMU_PLUGIN_CPU_EV_FAULT_ENTER &&
+                r.ev.pc == old_resume_pc && !r.ours) {
+                explained = true;
+                break;
+            }
+        }
+        if (!explained) {
+            g_stats.rcheck_mismatch_resume_pc++;
+            if (pb_diag()) {
+                fprintf(stderr, "[rcheck] RESUME_PC new=0x%" PRIx64
+                        " old=0x%" PRIx64 " (unexplained)\n",
+                        new_resume_pc, old_resume_pc);
+            }
+        }
     }
+}
 
-    /* Retain this step's drain: the queue's internal buffer is only
-     * valid until the next push, and fault events may have to survive
-     * bailed steps until a seal consumes them. */
-    if (in.n_evs) {
-        pending_evs_.insert(pending_evs_.end(), in.evs, in.evs + in.n_evs);
-    }
+/*
+ * Fold ONE drained batch of ordered path events into this builder's
+ * persistent state.  Three ordered passes, in event order: the kernel-
+ * excursion ownership pass, the retention pass (which also moves the
+ * async window cursor), and the captured-async ownership pass.
+ *
+ * THIS FUNCTION NEVER EMITS.  Everything it touches is builder state; the
+ * seal walk, the merge completions and every write to the body stream stay
+ * in step_seal, which only an owned, dispatching correct-path step reaches.
+ * That is what makes it safe to call from the light per-TB absorber
+ * (vcpu_evq_absorb), which fires in contexts the heavy callback is
+ * deliberately not dispatched for: no record can originate from a context
+ * the trace refuses.
+ *
+ * It is also the ONLY implementation of these passes.  step_events calls it
+ * with the full StepIn; the absorber calls it with the subset those passes
+ * actually read (pinned / pinned_asid / asid_is_identity / cur_tp /
+ * cur_tid / cpu_index).  A batch consumed off the dispatch path and a batch
+ * consumed on it therefore fold identically, in the same order, into the
+ * same members -- there is no second copy of this logic to drift.
+ */
+void PathBuilder::absorb_events(const StepIn &in)
+{
+    /* Per-event snapshot of the kernel-excursion ownership edge, taken at
+     * each event's OWN position in the fresh drain below.  The retention
+     * decision for a kernel-privilege event asks the excursion-ownership
+     * question exactly where the event sits, so an ASID_WRITE earlier in the
+     * same batch is inside the answer and a later one is not — the same
+     * interleaving the kexc pass itself relies on.  Sized by the batch, which
+     * is this dispatch's own events; empty off the kexc path. */
+    drain_kexc_own_.clear();
 
     /* Kernel-excursion ownership: apply this step's FRESH drain of
      * ASID_WRITE events exactly once, before any gate — the retained-
@@ -2226,8 +2493,15 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
      * skip kind 4 by construction), keeping legacy behavior
      * byte-for-byte. */
     if (g_features.kexc && in.pinned) {
+        drain_kexc_own_.reserve(in.n_evs);
         for (size_t i = 0; i < in.n_evs; i++) {
             const struct qemu_plugin_cpu_event &kev = in.evs[i];
+            /* BEFORE this event's own apply: the excursion-ownership verdict
+             * that held when the event fired. */
+            drain_kexc_own_.push_back((uint8_t)(kexc_in_kernel_ &&
+                                                kexc_have_user_ &&
+                                                kexc_entry_owned_ &&
+                                                !kexc_cut_));
             if (kev.kind == QEMU_PLUGIN_CPU_EV_ASID_WRITE) {
                 if (kexcwit_diag()) {
                     /* Classify the write from the state delta it produces,
@@ -2304,6 +2578,144 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
                 }
             }
         }
+    }
+
+    /*
+     * ------------------------------------------------------------------
+     * RETENTION, decided in the same place and from the same inputs as the
+     * CONTINUE/SUSPEND decision.
+     *
+     * One ordered pass over this dispatch's OWN events, so the cost is
+     * charged to the guest instructions that just ran (O(1) amortised per
+     * guest instruction).  Per event, in order:
+     *
+     *   ASYNC_ENTER/RETURN  move the persistent window cursor and are
+     *                       DISCARDED — their entire effect is assignment
+     *                       into persistent members (done here, O(1),
+     *                       replacing the whole-retention rescan) plus
+     *                       serving as in_async delimiters (done here as a
+     *                       per-event stamp).  Both effects survive; only
+     *                       the redundant copy is gone.
+     *   ASID_WRITE          consumed by the kexc pass above and read by no
+     *                       later consumer — never retained.
+     *   FAULT_ENTER/RETURN  stamped with the window state AT THIS POSITION
+     *                       and retained IFF the event is the traced
+     *                       context's own (event_is_ours).
+     *
+     * The append is textually inside the ownership guard, so execution the
+     * trace refuses contributes exactly zero entries: d|pending_evs_| /
+     * d(untraced instructions) == 0 identically, which is what makes this a
+     * bound rather than a measurement.
+     * ------------------------------------------------------------------
+     */
+    retain_arms_check_once();
+    const bool keep_all = retain_all();
+    const bool fold_now = !slow_fold();
+    pin_armed_cur_ = in.pinned;
+    pin_asid_cur_ = in.pinned_asid;
+    pin_identity_cur_ = in.asid_is_identity;
+    for (size_t i = 0; i < in.n_evs; i++) {
+        const struct qemu_plugin_cpu_event &ev = in.evs[i];
+        const bool ev_in_async = drain_async_open_;
+        bool keep = keep_all;
+        bool ev_ours = true;
+
+        switch (ev.kind) {
+        case QEMU_PLUGIN_CPU_EV_ASYNC_ENTER:
+            drain_async_open_ = true;
+            if (primed_ && fold_now) {
+                if (g_features.trace_interrupts) {
+                    async_captured_ = 1;
+                    absorbed_opened_window_ = true;
+                } else {
+                    async_excluding_ = true;
+                }
+                async_departure_pc_ = ev.pc;
+            }
+            break;
+        case QEMU_PLUGIN_CPU_EV_ASYNC_RETURN:
+            drain_async_open_ = false;
+            if (primed_ && fold_now) {
+                if (g_features.trace_interrupts) {
+                    async_captured_ = 0;
+                } else {
+                    async_excluding_ = false;
+                }
+                async_departure_pc_ = 0;
+            }
+            break;
+        case QEMU_PLUGIN_CPU_EV_FAULT_ENTER:
+        case QEMU_PLUGIN_CPU_EV_FAULT_RETURN: {
+            const bool ours = event_is_ours(ev, in, ev_in_async, i);
+            ev_ours = ours;
+            if (ours) {
+                g_stats.retention_events_owned++;
+                keep = true;
+            } else {
+                g_stats.retention_events_refused++;
+                if (keep_all) {
+                    /* Only reachable in the unbounded experiment arm.  In
+                     * the shipping default this counter must read exactly
+                     * 0; a nonzero value is a failure, not a warning. */
+                    g_stats.retention_appends_from_untraced_events++;
+                }
+            }
+            /* The seal's architectural-successor override.  Taken from the
+             * first retained non-in-async FAULT_ENTER, exactly as the old
+             * seal-time scan did — but the retention now contains only OUR
+             * events, so it can no longer be a foreign process's fault PC
+             * standing in for the pinned block's branch target.  In the
+             * unbounded arm it still can, and the counter records it: that
+             * is the corruption instrument, and it must fire there and read
+             * zero here. */
+            if (keep && ev.kind == QEMU_PLUGIN_CPU_EV_FAULT_ENTER &&
+                !ev_in_async && retained_first_enter_pc_ == 0) {
+                retained_first_enter_pc_ = ev.pc;
+                if (!ours) {
+                    g_stats.seal_successor_from_foreign_fault++;
+                }
+            }
+            break;
+        }
+        default:
+            break;                      /* ASID_WRITE: consumed above */
+        }
+
+        if (keep) {
+            pending_evs_.push_back(RetainedEv{ev, ev_in_async, ev_ours});
+        }
+        if (retain_check()) {
+            ref_evs_.push_back(RetainedEv{ev, ev_in_async, ev_ours});
+        }
+    }
+
+    /* Retention tripwire.  |pending_evs_| is bounded by the traced context's
+     * own architectural trap-nesting depth (an event can only be retained
+     * for a context whose next dispatch seals, and that context cannot raise
+     * another fault without executing), so it cannot exceed the target's own
+     * fault-stack limit's worth of enter/return pairs.  Exceeding it means
+     * that argument is false and there is a real defect — refuse loudly
+     * rather than cap, truncate or drop anything. */
+    if (!keep_all && pending_evs_.size() > retention_tripwire()) {
+        fprintf(stderr, "champsim_tracer: FATAL retention tripwire: %zu "
+                "retained events exceeds the %zu bound (traced trap nesting "
+                "cannot reach this; this is a tracer bug, not a workload)\n",
+                pending_evs_.size(), retention_tripwire());
+        fflush(stderr);
+        abort();
+    }
+    if (pending_evs_.size() > g_stats.retention_peak) {
+        g_stats.retention_peak = pending_evs_.size();
+    }
+    g_stats.retention_scan_events += pending_evs_.size();
+    /* The other two per-vCPU structures a long untraced span could grow.
+     * Sampled here, at every dispatch including the refused ones, so a span
+     * that never seals is still observed. */
+    if (frames_.size() > g_stats.frames_peak) {
+        g_stats.frames_peak = frames_.size();
+    }
+    if (susp_stack_.size() > g_stats.susp_stack_peak) {
+        g_stats.susp_stack_peak = susp_stack_.size();
     }
 
     /* Captured-async OWNERSHIP, from this step's FRESH drain — each event seen
@@ -2406,6 +2818,74 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
             }
         }
     }
+}
+
+PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
+{
+    /* The pending-seal prev promoted last step is the TB that finished
+     * immediately before THIS dispatch, so this dispatch's raw latch is
+     * its self-loop accounting — absorb exactly once.  Steps that do not
+     * promote never re-arm, so a latch describing a dropped async/foreign
+     * TB can never overwrite a deferred prev's facts. */
+    {
+        RepSelfLoopState &rs = rep_state(in.cpu_index);
+        if (rs.pb_prev_facts_armed) {
+            rs.pb_prev_facts = rs.cp_facts;
+            rs.pb_prev_facts_armed = false;
+        }
+    }
+
+    /* The seal-successor override is strictly one-step state: a
+     * recovery step always survives to its own seal (recovery implies
+     * pinned-user, which passes the foreign-ASID gate), and any
+     * harder bail between the phases also drops the walk prev the
+     * override was meant for. */
+    seal_pc_override_ = 0;
+
+    /* One-step hold-off for the resume arrow (Stage 4).  The abandoned-async
+     * no-departure arm suspends the deferred prev and then FALLS THROUGH to
+     * the promote (unlike the foreign-ASID arrow, which returns early).  If
+     * the resume arrow ran on this same step it would immediately re-arm and
+     * seal that just-suspended prev against cur — but the abandoned window
+     * means cur is the OTHER guest thread the scheduler handed this vCPU
+     * (a proper resume would have refetched the departure PC), not prev's
+     * successor, so that seal is the cross-thread taken-edge poisoning the
+     * departure-PC override exists to prevent.  Holding the resume off this
+     * one step lets cur promote fresh and defers the suspended prev to its
+     * TRUE successor's later resume (or the retire-at-return backstop).  Only
+     * the abandoned arm sets it; off the async-recovery path it stays false
+     * and the resume arrow is unchanged (byte-identical). */
+    bool hold_resume_this_step = false;
+
+    /* Segment-boundary reg-snap hygiene (Case C).  A change in the segment
+     * generation since this thread's last step means the segment just opened
+     * under it.  In marker mode the opener's own vcpu_tb_exec is JIT-gated
+     * off before the START marker fires, so on_segment_open never runs and
+     * THIS is the first dispatch after the open — with the marker block's
+     * post-open per-insn snaps (the 0x43535401 magic write among them) still
+     * pooled in pending_reg_snaps.  Drop them so the segment's first real
+     * block starts positionally clean.  In window mode on_segment_open ran
+     * last step and armed the one-shot follow-up so the opener block's own
+     * post-open leak is dropped the step after. */
+    uint32_t cur_gen = g_segment_generation.load(std::memory_order_relaxed);
+    if (seg_gen_seen_ != cur_gen) {
+        seg_gen_seen_ = cur_gen;
+        drop_open_leak_pending_ = false;
+        pending_reg_snaps(cpu_index_).clear();
+    } else if (drop_open_leak_pending_) {
+        drop_open_leak_pending_ = false;
+        pending_reg_snaps(cpu_index_).clear();
+    }
+
+    /* The three ordered event passes.  Shared verbatim with the light
+     * per-TB absorber (vcpu_evq_absorb) so a batch consumed there and a
+     * batch consumed here fold identically; see absorb_events.  Whether a
+     * window opened somewhere in the folded history is carried out in a
+     * member, because the seal below needs that one batch-local fact and
+     * the batch may have been absorbed one or more TBs ago. */
+    absorb_events(in);
+    const bool drain_opened_window = absorbed_opened_window_;
+    absorbed_opened_window_ = false;
 
     /* Async mute window.  Until the first seal-phase prime the live flag
      * is authoritative (it already reflects every retained event); after
@@ -2432,8 +2912,14 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
             gap_disarm();       /* nothing owed pre-prime */
         }
         kexc_snap_.valid = false;   /* pre-prime window: no owed re-latch */
+    } else if (!slow_fold()) {
+        /* Folded at drain, O(1) per event, into these same members with the
+         * same assignment semantics.  The rescan below is the reference form
+         * kept only for the CST_SLOW_FOLD arm. */
+        async_enter_this_batch = drain_opened_window;
     } else {
-        for (const struct qemu_plugin_cpu_event &ev : pending_evs_) {
+        for (const RetainedEv &rev : pending_evs_) {
+            const struct qemu_plugin_cpu_event &ev = rev.ev;
             if (ev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_ENTER) {
                 if (g_features.trace_interrupts) {
                     /* Capture: contribute one depth level and remember the
@@ -3519,33 +4005,26 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
     if (!primed_) {
         prime_from_live();
         pending_evs_.clear();   /* priming swallow */
+        ref_evs_.clear();
+        retained_first_enter_pc_ = 0;
+        /* The window cursor starts from the live truth at the prime; every
+         * pre-prime edge was just discarded with the swallow. */
+        drain_async_open_ = qemu_plugin_in_async_int();
     } else {
-        /* Async-window state at the head of the retained batch: the
-         * step survived to the seal phase, so any window the batch
-         * opened is closed again by its end; a batch whose FIRST async
-         * edge is a RETURN was inside a window from the start (its
-         * earlier events are in-window). */
-        bool ev_in_async = false;
-        for (const struct qemu_plugin_cpu_event &ev : pending_evs_) {
-            if (ev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_RETURN) {
-                ev_in_async = true;
-                break;
-            }
-            if (ev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_ENTER) {
-                break;
-            }
+        /* The successor override, derived at drain from the persistent
+         * window cursor instead of reconstructed here from the retained
+         * batch's shape.  The old reconstruction could not see a window
+         * opened on an EARLIER bailed step (it guessed "in a window" from
+         * the batch's first async edge being a RETURN); the cursor knows. */
+        fault_resume_pc = fault_on ? retained_first_enter_pc_ : 0;
+        if (retain_check()) {
+            retain_check_compare(fault_resume_pc);
         }
-        for (const struct qemu_plugin_cpu_event &ev : pending_evs_) {
-            if (ev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_ENTER) {
-                ev_in_async = true;
-            } else if (ev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_RETURN) {
-                ev_in_async = false;
-            }
+        for (const RetainedEv &rev : pending_evs_) {
+            const struct qemu_plugin_cpu_event &ev = rev.ev;
+            const bool ev_in_async = rev.in_async;
             if (ev.kind == QEMU_PLUGIN_CPU_EV_FAULT_ENTER) {
                 raw_depth_ = ev.depth_after;
-                if (fault_on && !ev_in_async && fault_resume_pc == 0) {
-                    fault_resume_pc = ev.pc;
-                }
                 if (pb_diag()) {
                     fprintf(stderr, "[pathbuilder] ENTRY resume=0x%" PRIx64
                             " depth=%u asid=0x%" PRIx64 " priv=%u inw=%d\n",
@@ -3597,6 +4076,8 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
              * context switch an ASID_WRITE marks cannot perturb. */
         }
         pending_evs_.clear();
+        ref_evs_.clear();
+        retained_first_enter_pc_ = 0;
         /*
          * Fault-trailer depth = the pinned process's OWN synchronous-fault
          * nesting: the number of its un-returned merge frames.  It is

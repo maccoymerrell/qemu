@@ -2725,6 +2725,30 @@ static uint64_t arm_get_plugin_thread_ptr(CPUState *cs)
     return tp;
 }
 
+/*
+ * Raw architectural identity keys (see TCGCPUOps::get_plugin_identity).
+ *
+ * Address space: TTBR0_EL1's translation-table base together with the
+ * architectural ASID, which TCR_EL1.A1 places in TTBR0_EL1 (A1=0) or
+ * TTBR1_EL1 (A1=1).  The two are recombined into one word by putting the
+ * selected ASID back in the register's own ASID field, so equality of the
+ * key is equality of (base, ASID) with no interpretation of either.
+ *
+ * Thread: TPIDR_EL0, the EL0 thread pointer, architecturally separate from
+ * anything the kernel needs for itself.
+ */
+static void arm_get_plugin_identity(CPUState *cs, uint64_t *space_key,
+                                    uint64_t *thread_key)
+{
+    CPUARMState *env = cpu_env(cs);
+    uint64_t ttbr0 = env->cp15.ttbr0_el[1];
+    bool a1 = (env->cp15.tcr_el[1] & (1ULL << 22)) != 0;   /* TCR_EL1.A1 */
+    uint64_t asid = extract64(a1 ? env->cp15.ttbr1_el[1] : ttbr0, 48, 16);
+
+    *space_key = (ttbr0 & MAKE_64BIT_MASK(0, 48)) | (asid << 48);
+    *thread_key = env->cp15.tpidr_el[0];
+}
+
 static bool arm_plugin_thread_ptr_tracks_current(CPUState *cs)
 {
     CPUARMState *env = cpu_env(cs);
@@ -2851,6 +2875,7 @@ static const TCGCPUOps arm_tcg_ops = {
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = arm_get_plugin_state,
     .get_plugin_thread_ptr = arm_get_plugin_thread_ptr,
+    .get_plugin_identity = arm_get_plugin_identity,
     /* TPIDR_EL0 is the EL0 thread pointer; EL1 has TPIDR_EL1 for its own
      * per-CPU use, so the kernel only ever writes TPIDR_EL0 from the
      * incoming task (tls_thread_switch()) and a read at EL1 names the

@@ -633,6 +633,36 @@ static uint64_t mips_get_plugin_thread_ptr(CPUState *cs)
     return tp;
 }
 
+/*
+ * Raw architectural identity keys (see TCGCPUOps::get_plugin_identity).
+ *
+ * Address space: EntryHi.ASID under the CPU's own ASID mask, with CP0
+ * MemoryMapID above it when Config5.MI makes MemoryMapID (not ASID) the
+ * TLB's tag.  That is the whole of what MIPS names an address space with:
+ * there is no readable page-table root, and the field is 8 bits over a
+ * 16-entry TLB, so an operating system re-points the value at a different
+ * address space on rollover.  This hook reports the name the architecture
+ * gives NOW; following one address space across a rollover is the
+ * consumer's job, composed with the thread key.
+ *
+ * Thread: CP0 UserLocal.  A model that does not implement it (Config3.ULRI
+ * clear — the 24K class, including the canonical Malta default) leaves it
+ * 0, which is reported as "no thread identity" rather than being replaced
+ * by a general-purpose register the architecture does not designate.
+ */
+static void mips_get_plugin_identity(CPUState *cs, uint64_t *space_key,
+                                     uint64_t *thread_key)
+{
+    CPUMIPSState *env = cpu_env(cs);
+    uint64_t key = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
+
+    if (env->CP0_Config5 & (1 << CP0C5_MI)) {
+        key |= ((uint64_t)(uint32_t)env->CP0_MemoryMapID) << 32;
+    }
+    *space_key = key;
+    *thread_key = env->active_tc.CP0_UserLocal;
+}
+
 static bool mips_plugin_thread_ptr_tracks_current(CPUState *cs)
 {
     CPUMIPSState *env = cpu_env(cs);
@@ -711,6 +741,7 @@ static const TCGCPUOps mips_tcg_ops = {
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = mips_get_plugin_state,
     .get_plugin_thread_ptr = mips_get_plugin_thread_ptr,
+    .get_plugin_identity = mips_get_plugin_identity,
     /* CP0 UserLocal is a dedicated TLS slot the kernel has no use of its
      * own for: Linux/MIPS writes it from the incoming task in switch_to()
      * and never touches it in between, so a kernel-privilege read names

@@ -42,6 +42,9 @@ public:
      * champsim_tracer.h. */
     qemu_plugin_u64 trace_this_ctx;
     qemu_plugin_u64 pin_probe;
+    /* QEMU-written "drain owed" flag; see the field comment in
+     * champsim_tracer.h and qemu_plugin_cpu_events_pending_slot(). */
+    qemu_plugin_u64 evq_pending;
     /* Signed budget that counts down by n_insns per TB exec (via
      * INLINE_ADD_U64 with imm = (uint64_t)(-n_insns)).  When it drops
      * below 1, a cond_cb fires (vcpu_tb_check_budget) to handle the

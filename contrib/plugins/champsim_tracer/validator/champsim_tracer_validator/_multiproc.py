@@ -693,11 +693,13 @@ def run_x86_dead_latch_kill(cfg: MPConfig, latch_timeout: int = 750,
     "marker opened additional window for asid ... (2 owned)" is the
     plugin's OWN host-stderr line (unbuffered, never routed through
     the guest UART) and is what proves B was genuinely alive and under
-    active tracing before it died.  Subcheck 2 then cross-checks that
-    THE SAME asid is the one the dead-latch detector later closes --
-    causal proof, not just "a trace exists" (which is all the old
-    version checked, so it could pass without ever proving its own
-    headline claim)."""
+    active tracing before it died.  Subcheck 2 then pins WHICH root the
+    detector took, without encoding which peer marked first: the dead
+    latch must close exactly one of the two owned roots AND the
+    remaining window must close on its own END marker.  Only progA can
+    produce that END (progB is killed mid-sleep and never reaches its
+    own), so the pair of mechanisms identifies the roots even though the
+    marking order is the guest scheduler's choice."""
     isa = "x86_64"
     skip = _preconditions(cfg, isa)
     if skip:
@@ -750,18 +752,63 @@ def run_x86_dead_latch_kill(cfg: MPConfig, latch_timeout: int = 750,
         f"opened: {open_m.group(0)}" if open_m
         else "no second owned window ever opened"))
 
+    # Subcheck 2 is ORDER-INDEPENDENT, and that is load-bearing.
+    #
+    # Which of the two peers reaches its START marker first is the guest
+    # scheduler's choice, not an invariant of anything.  Asserting that the
+    # SECOND opener -- the one named by "opened additional window" -- is the
+    # one the dead-latch closes therefore encodes a scheduling order, and
+    # fails on a correct capture whenever B happens to mark first: the line
+    # then names A, the detector still ages out B exactly as it should, and
+    # the comparison reports a mismatch of two adjacent CR3 values.
+    #
+    # "Exactly one of the two closed" is NOT enough on its own, and settling
+    # for it would retire the claim this check exists to make.  It is
+    # satisfied just as happily by the INVERSION -- the detector aging out
+    # the live survivor and leaving the dead peer's window open -- which is
+    # the worst outcome this scenario can produce, not an acceptable one.
+    #
+    # The identity is recoverable without encoding a scheduling order,
+    # because the two windows close by DIFFERENT MECHANISMS and only one
+    # assignment of those mechanisms is physically possible:
+    #
+    #   progB is killed mid-sleep and never executes its END marker, so its
+    #   window can ONLY be closed by the dead latch;
+    #   progA runs to completion, so its window is closed by its own END
+    #   marker ("end marker -- closing ... (last window)").
+    #
+    # A killed process cannot execute an END marker.  So if the detector had
+    # inverted the two -- aged out progA and left progB open -- no END marker
+    # could ever arrive for the remaining window and the segment could not
+    # close this way.  Requiring dead-latch-closes-one AND end-marker-closes-
+    # the-last therefore pins WHICH root the detector took, while staying
+    # true whichever peer reached its marker first.
+    fired_re = re.compile(r"marker fired at icount \d+, asid "
+                          r"(0x[0-9a-fA-F]+)")
+    fired_m = fired_re.search(ctext)
+    owned = {m.group(1) for m in (fired_m, open_m) if m}
     dl_lines = [ln for ln in ctext.splitlines() if "dead-latch close" in ln]
     dl_re = re.compile(r"dead-latch close asid=(0x[0-9a-fA-F]+)")
     dl_asids = {m.group(1) for ln in dl_lines
                for m in [dl_re.search(ln)] if m}
-    same_asid = bool(open_m) and open_m.group(1) in dl_asids
+    survivors = owned - dl_asids
+    # The survivor's own END marker closing the LAST window is what proves
+    # the dead latch took the dead peer and not the live one.
+    end_closed = bool(re.search(r"end marker — closing after \d+ user insns "
+                                r"\(last window\)", ctext)
+                      or re.search(r"end marker -- closing after \d+ user "
+                                   r"insns \(last window\)", ctext))
+    ok2 = (rc == 0 and cst.exists() and len(owned) == 2
+           and len(dl_asids) == 1 and dl_asids <= owned
+           and len(survivors) == 1 and end_closed)
     subs.append(SubCheck(
-        "2. dead-latch detector itself closed THAT SAME peer's window "
-        "(causal, not just 'a trace exists')",
-        rc == 0 and cst.exists() and same_asid,
+        "2. the dead-latch detector closed the DEAD peer's window and the "
+        "survivor closed its own with an END marker (causal identity, "
+        "independent of which peer reached its marker first)",
+        ok2,
         f"qemu_rc={rc} cst={'exists' if cst.exists() else 'MISSING'} "
-        f"opened_asid={open_m.group(1) if open_m else None} "
-        f"dead_latch_asids={sorted(dl_asids)}"))
+        f"owned_asids={sorted(owned)} dead_latch_asids={sorted(dl_asids)} "
+        f"survivor={sorted(survivors)} survivor_closed_by_end={end_closed}"))
 
     if cst.exists():
         idents = _raw_identities(cfg, cst)

@@ -199,9 +199,17 @@ static void wp_enter_spec_session(unsigned int cpu_index, uint64_t wrong_target,
     /* Freeze the guest virtual clock for the whole excursion (system mode):
      * the speculative run burns host wall-clock time but is outside guest
      * time, so it must not advance the guest's architected timer counters.
-     * Paused here at the outer boundary — not in spec_mode_begin — so a
+     * Paused at the outer boundary — not in spec_mode_begin — so a
      * fault-skip's spec_mode teardown/re-entry does not leak ticks.  No-op
-     * in user mode. */
+     * in user mode.
+     *
+     * The caller already issued this immediately BEFORE taking the register
+     * snapshot, because the pause is also what opens the excursion window a
+     * target uses to record externally-raised interrupts for replay across the
+     * snapshot's rollback (see the comment at the snapshot site).  The call is
+     * idempotent on the per-CPU paused flag, so this one keeps the invariant
+     * "wp_enter_spec_session leaves the excursion window open" true on its own
+     * terms and costs a flag test when the caller has already paused. */
     qemu_plugin_spec_vtime_pause();
     qemu_plugin_spec_mode_begin(saved_state);
     qemu_plugin_set_pc(wrong_target);
@@ -1638,8 +1646,37 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
     /* last_fault_pc / repeated_fault_pc / awaiting_delay_slot live in st,
      * owned by the fault / walk phases. */
 
+    /*
+     * OPEN THE EXCURSION WINDOW BEFORE TAKING THE SNAPSHOT.  The order of
+     * these two calls is load-bearing, not stylistic.
+     *
+     * The register snapshot is what the excursion is rolled back to, and
+     * env-resident pending-interrupt state rides inside it (riscv env->mip is
+     * the whole storage for a pending machine software interrupt — the ACLINT
+     * keeps no latch of its own).  A device raise that lands inside the
+     * excursion is NOT speculative and must survive the rollback, so the
+     * target records externally-caused raises for replay; the record is gated
+     * on the excursion being open, and vtime_pause is what opens it (it sets
+     * plugin_spec_vtime_paused, under the BQL that the raiser also holds).
+     *
+     * Taking the snapshot first leaves a window between the snapshot and that
+     * flag in which a raise is captured by NEITHER: not by the snapshot (it
+     * was already taken) and not by the record (the window is not open yet).
+     * The restore then erases it.  For MIP_MSIP that is unrecoverable — OpenSBI
+     * writes the ACLINT MSIP only right after a successful rfence enqueue and
+     * never re-raises, so the target hart sleeps in wfi forever with the
+     * request queued and the sender spins on `outstanding` — a guest deadlock.
+     *
+     * Pausing first closes the window with nothing left over: the replay is a
+     * bitmask OR, so a raise landing between the flag and the snapshot lands in
+     * BOTH, and applying it twice is idempotent.
+     */
+    qemu_plugin_spec_vtime_pause();
+
     struct qemu_plugin_cpu_state *saved_state = qemu_plugin_cpu_state_save();
     if (!saved_state) {
+        /* Close the window again: no excursion is going to run. */
+        qemu_plugin_spec_vtime_resume();
         stats.wp_early_exits++;
         stats.wp_simulations++;
         if (hist) {

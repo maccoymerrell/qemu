@@ -683,24 +683,42 @@ shared prologue, then the PathBuilder step.
 ownership question is trivial — user mode, an unpinned system trace,
 and the wide-register system pins (CR3 / TTBR0 / SATP) whose ASID is
 a reliable per-process id, foreign-dropped inside the step as before.
-It diverges only for a **narrow-ASID (MIPS) system pin**, where a
-recycled ``EntryHi.ASID`` cannot distinguish processes: there only a
-physical-page-confirmed dwell traces, and a separate light callback,
-``vcpu_pin_probe`` (gated on the companion ``pin_probe`` slot,
-registered ahead of ``vcpu_tb_exec``), runs for every other in-segment
-TB.  The light probe carries the whole per-foreign-TB budget — a
-user-clock cursor tick, the physical-page content probe on user TBs,
-and the capture mute the heavy drop path used to set — with no
-``VClockPauseGuard`` and no PathBuilder step; on the TB that
-re-acquires the pinned process it flips ``trace_this_ctx`` to 1 so the
-heavy callback's re-loaded brcond fires for that same TB.  Both slots
-are maintained event-driven (``refresh_ctx_gates``): at every
-``is_active`` edge, at each committed ASID write, and on a re-acquiring
-probe — never on the per-TB path.  This is what keeps a churning
-guest, where a rollover hands the pinned ASID value to a stream of
-foreign processes, from paying the guest-clock freeze on millions of
-dropped foreign TBs (the throttle that otherwise collapses the guest
-virtual clock to a fraction of realtime).
+It diverges only for a **narrow-ASID (MIPS) system pin**, where the
+architectural address-space name is 8 bits wide and an operating system
+reassigns it under live processes: there only a vCPU whose live address
+space is owned traces, and a separate light callback, ``vcpu_pin_probe``
+(gated on the companion ``pin_probe`` slot, registered ahead of
+``vcpu_tb_exec``), runs for every other in-segment TB.  The light probe
+carries the whole per-foreign-TB budget — a user-clock cursor tick, one
+owned-set lookup on user TBs, and the capture mute the heavy drop path
+used to set — with no ``VClockPauseGuard`` and no PathBuilder step; on
+the TB that re-acquires an owned address space it flips
+``trace_this_ctx`` to 1 so the heavy callback's re-loaded brcond fires
+for that same TB.
+
+Ownership itself is one set lookup.  ``qemu_plugin_get_process_id()``
+returns an opaque monotonic id QEMU mints per distinct architectural
+address-space value (see :doc:`qemu_modifications`), ``g_owned`` holds
+the ids of the address spaces whose windows are open, and a block is
+ours exactly when its live id is in that set — so **every thread inside
+an owned address space is traced**, and the thread id only labels
+strands on the wire.  The one thing an opaque id cannot carry is a
+lifetime, and on a narrow name that matters: if a thread already seen
+inside an owned space reappears under an id the trace does not own, the
+pin **re-binds** to the new id (``pin_rebind_locked``), the old one stops
+being owned that instant, and the window's wire identity, liveness
+stamps and thread set move across unchanged.  That is the whole rule.
+
+The wire's address-space naming is deliberately a separate thing from
+the ownership key: each owned window records ``{root_phys, sig}`` from
+its marker's own code page (``marker_anchor``) and the compact wire asid
+index is derived from that, so an ``EntryHi.ASID`` rollover cannot churn
+the index of a process that never moved.  Both slots are maintained
+event-driven (``refresh_ctx_gates``): at every ``is_active`` edge, at
+each committed address-space write, and on a re-acquiring probe — never
+on the per-TB path.  This is what keeps a churning guest from paying the
+guest-clock freeze on millions of dropped foreign TBs (the throttle that
+otherwise collapses the guest virtual clock to a fraction of realtime).
 
 **Shared prologue** (before any lock):
 

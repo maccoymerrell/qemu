@@ -296,6 +296,22 @@ void helper_wrmsr(CPUX86State *env)
     case MSR_MTRRphysBase(5):
     case MSR_MTRRphysBase(6):
     case MSR_MTRRphysBase(7):
+#ifdef CONFIG_PLUGIN
+        /*
+         * Wrong-path: the MTRRs live PAST end_reset_fields, and the plugin's
+         * speculative snapshot is only CPUArchState[0..end_reset_fields] (see
+         * cpu_plugin_arch_state_size()).  A write here is therefore never
+         * rolled back at excursion end: a discarded ring-0 wrmsr would
+         * permanently rewrite the guest's memory-type registers, which the
+         * correct path then keeps.  Unlike the cr8 case above there is no
+         * snapshot-covered shadow to apply, so the whole write is dropped.
+         * The same reasoning covers every MTRR case below and the MCE state
+         * further down.
+         */
+        if (cs->plugin_spec_mode) {
+            break;
+        }
+#endif
         env->mtrr_var[((uint32_t)env->regs[R_ECX] -
                        MSR_MTRRphysBase(0)) / 2].base = val;
         break;
@@ -307,15 +323,33 @@ void helper_wrmsr(CPUX86State *env)
     case MSR_MTRRphysMask(5):
     case MSR_MTRRphysMask(6):
     case MSR_MTRRphysMask(7):
+#ifdef CONFIG_PLUGIN
+        /* Wrong-path: past end_reset_fields, never restored — see above. */
+        if (cs->plugin_spec_mode) {
+            break;
+        }
+#endif
         env->mtrr_var[((uint32_t)env->regs[R_ECX] -
                        MSR_MTRRphysMask(0)) / 2].mask = val;
         break;
     case MSR_MTRRfix64K_00000:
+#ifdef CONFIG_PLUGIN
+        /* Wrong-path: past end_reset_fields, never restored — see above. */
+        if (cs->plugin_spec_mode) {
+            break;
+        }
+#endif
         env->mtrr_fixed[(uint32_t)env->regs[R_ECX] -
                         MSR_MTRRfix64K_00000] = val;
         break;
     case MSR_MTRRfix16K_80000:
     case MSR_MTRRfix16K_A0000:
+#ifdef CONFIG_PLUGIN
+        /* Wrong-path: past end_reset_fields, never restored — see above. */
+        if (cs->plugin_spec_mode) {
+            break;
+        }
+#endif
         env->mtrr_fixed[(uint32_t)env->regs[R_ECX] -
                         MSR_MTRRfix16K_80000 + 1] = val;
         break;
@@ -327,16 +361,41 @@ void helper_wrmsr(CPUX86State *env)
     case MSR_MTRRfix4K_E8000:
     case MSR_MTRRfix4K_F0000:
     case MSR_MTRRfix4K_F8000:
+#ifdef CONFIG_PLUGIN
+        /* Wrong-path: past end_reset_fields, never restored — see above. */
+        if (cs->plugin_spec_mode) {
+            break;
+        }
+#endif
         env->mtrr_fixed[(uint32_t)env->regs[R_ECX] -
                         MSR_MTRRfix4K_C0000 + 3] = val;
         break;
     case MSR_MTRRdefType:
+#ifdef CONFIG_PLUGIN
+        /* Wrong-path: past end_reset_fields, never restored — see above. */
+        if (cs->plugin_spec_mode) {
+            break;
+        }
+#endif
         env->mtrr_deftype = val;
         break;
     case MSR_MCG_STATUS:
+        /*
+         * mcg_status is INSIDE the speculative snapshot (it precedes
+         * end_reset_fields) and is rolled back with the rest of the
+         * register file, so the wrong path may write it: doing so keeps the
+         * discarded path self-consistent with its own rdmsr.  Its siblings
+         * mcg_ctl and mce_banks[] are NOT, and are gated below.
+         */
         env->mcg_status = val;
         break;
     case MSR_MCG_CTL:
+#ifdef CONFIG_PLUGIN
+        /* Wrong-path: past end_reset_fields, never restored — see above. */
+        if (cs->plugin_spec_mode) {
+            break;
+        }
+#endif
         if ((env->mcg_cap & MCG_CTL_P)
             && (val == 0 || val == ~(uint64_t)0)) {
             env->mcg_ctl = val;
@@ -382,6 +441,17 @@ void helper_wrmsr(CPUX86State *env)
             && (uint32_t)env->regs[R_ECX] < MSR_MC0_CTL +
             (4 * env->mcg_cap & 0xff)) {
             uint32_t offset = (uint32_t)env->regs[R_ECX] - MSR_MC0_CTL;
+#ifdef CONFIG_PLUGIN
+            /*
+             * Wrong-path: mce_banks[] is past end_reset_fields, never
+             * restored — see the MTRR gate above.  Leaving this ungated
+             * additionally desynchronises the banks from mcg_status, which
+             * IS rolled back.
+             */
+            if (cs->plugin_spec_mode) {
+                break;
+            }
+#endif
             if ((offset & 0x3) != 0
                 || (val == 0 || val == ~(uint64_t)0)) {
                 env->mce_banks[offset] = val;

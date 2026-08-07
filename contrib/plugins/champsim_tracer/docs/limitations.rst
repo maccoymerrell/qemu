@@ -515,54 +515,67 @@ icount budget elapses.  ``latch_timeout=<ms>`` is the opt-in backstop
 interval — but it is off by default because idleness alone cannot
 distinguish a dead process from a merely long-blocked live one.
 
-**A recycled page-table root is recognised by the traced process's own
-code, and that recognition has a blind spot.**  On the wide-register
-targets (x86-64 CR3, AArch64 TTBR, RISC-V SATP) the address-space
-register names a process only while that process is alive; once it
-exits, the kernel is free to hand its freed page-table root to the next
-process that needs one.  The tracer therefore does not trust the root
-value alone: each owned window carries a set of *anchors* — code pages
-of the traced process, recorded as virtual page, physical frame and
-content signature, seeded from the marker's own page and grown from the
-first pages the window executes — and re-walks them in the live address
-space at every committed write of that root, and again on the first
-block of any dwell the walk left unsettled.  A page that still resolves
-to its frame, or whose bytes still match after a re-fault, identifies
-the process; a page mapped at the same virtual address with *different*
-bytes proves the root changed hands, and the window is then retired
-exactly as its END marker would retire it (``pin root reuse detected``
-in the statistics, with the successor's blocks excluded and counted as
-``pin root foreign user TBs dropped``).
+**Ownership is address-space equality, so an address-space NAME reused
+under a live process is the one thing that can move it.**  The tracer
+asks QEMU which address space a vCPU is executing in
+(``qemu_plugin_get_process_id()``: an opaque id QEMU mints per distinct
+architectural value — x86-64 CR3 with PCID, AArch64 TTBR0_EL1 with the
+ASID ``TCR_EL1.A1`` selects, RISC-V SATP, MIPS ``EntryHi.ASID``) and
+traces a block exactly when that space is one a marker opened.  Every
+thread inside an owned address space is traced, including one the trace
+has never seen; the thread id only labels strands on the wire.  Nothing
+in the decision looks at what code a process is running, so a fork, a
+second instance of the same binary and a byte-identical page at the same
+virtual address are all simply *not this address space*.
 
-Two cases the walk cannot decide, both reported rather than assumed
-away:
+What the identity does not carry is a lifetime.  Two cases, both named
+rather than assumed away:
 
-* **A successor that maps none of the anchors.**  The architectural
-  page walk cannot distinguish "this virtual address is not part of
-  this address space" from "it is, but the page is not resident", so a
-  successor whose early execution touches no anchor virtual page — and
-  whose page tables have none of them present — is unresolvable.  The
-  guard fails **open** there, because a live process whose text was
-  reclaimed must not lose its window, and counts the event as ``pin
-  root anchors unresolved``.  A successor is therefore excluded from
-  the first block it runs at an anchor's virtual address, not from its
-  first block outright: in the directed reproducer, 6–13 thousand of
-  the successor's user instructions were attributed to the traced
-  process before the walk resolved, against two million with the guard
-  absent.
-* **A successor running the same code at the same address.**  A second
-  instance of the same binary, or a fork of the traced process,
-  presents byte-identical pages at identical virtual addresses.  Page
-  equality is not process identity there, and no amount of hashing user
-  code will separate them — their user code really is the same code.
-  Telling those apart needs a private, written anchor, which the tracer
-  deliberately does not spend a guest write to obtain.
+* **A page-table root freed and handed to a successor** (the
+  wide-register targets).  Once the traced process exits, the kernel may
+  give its root page to the next process that asks, and the
+  architecture then says that value *is* the new process's address
+  space.  Equality cannot separate them.  A window left open by a
+  process that exited without running its END marker is what exposes
+  this, so the mitigations are the window-closing ones —
+  ``latch_timeout=<ms>`` and ``latch_idle_insns=<N>`` — not an identity
+  test.
+* **A narrow address-space name reassigned to a LIVE process** (32-bit
+  MIPS: ``EntryHi.ASID`` is 8 bits over a 16-entry TLB, so rollover is
+  the normal state).  The name says which address space is executing
+  now, so ownership follows it; what survives the renaming is the
+  thread.  One rule handles it: if a thread already seen inside an owned
+  space reappears under a name the trace does not own, **the pin
+  re-binds** — the old name stops being owned that instant, and the
+  window's wire identity, liveness stamps and thread set move across, so
+  nothing of the traced process is dropped (``pin re-bound to a new
+  address-space name``).
 
-The narrow-ASID target (32-bit MIPS) does not share this bound in the
-same shape: an 8-bit ``EntryHi.ASID`` cannot name a process at all, so
-there the learned page map *is* the identity and is consulted on every
-dwell (see ``pin content-mismatch user TBs dropped``).  Its residual is
-the second case above, unchanged.
+  **That rule is implemented but off by default** (``CST_PIN_REBIND=1``
+  arms it), because the identity it rests on is forged by ``fork()``:
+  Linux copies a thread's TLS pointer verbatim into the child, so a
+  forked child's first thread carries the parent's value and presents as
+  "a thread of an owned space under a name the trace does not own".
+  Armed, the pin follows it — the same trace-invalidating outcome the
+  address-space key exists to prevent.  A second reason it cannot carry
+  SMP: on MIPS the ASID is allocated *per CPU*, so one address space has
+  up to one name per vCPU and a migration is a legitimate change of name;
+  joining the new name needs evidence of sameness, and the thread pointer
+  is exactly the evidence ``fork`` forges.  Until that evidence exists, a
+  MIPS address space that is renamed — by rollover or by migration —
+  leaves the window rather than moving it, and the window closes.
+
+  The rule needs a thread the architecture names.  A MIPS CPU model with
+  ``Config3.ULRI`` clear implements no ``UserLocal`` register — this
+  includes the 24K class, the canonical Malta default — and there is
+  then nothing to re-bind against.  The tracer says so once at pin time
+  and counts it (``no architectural thread name on this CPU model``);
+  if the pinned name is then demonstrably handed out again, the window
+  is **retired** (``windows retired on an unbindable name
+  reassignment``) rather than followed, because an unmarked process
+  contributing any instruction invalidates the trace outright while a
+  short window merely truncates it.  A model that implements UserLocal
+  (34Kf, 74Kf, P5600, …) has no such gap.
 
 **Wrong-path excursions are time-transparent, but not free.**  An
 excursion consumes zero guest time — the guest virtual clock is frozen

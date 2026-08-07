@@ -255,6 +255,36 @@ static uint64_t x86_get_plugin_thread_ptr(CPUState *cs)
     return env->segs[R_GS].base;
 }
 
+/*
+ * Raw architectural identity keys (see TCGCPUOps::get_plugin_identity).
+ *
+ * Address space: CR3.  Bit 63 is the PCID NOFLUSH command bit, which is
+ * architecturally not stored (MOV from CR3 reads it 0), so it can never
+ * distinguish address spaces.  Bits [11:0] are the PCID and are a genuine
+ * part of the name ONLY when CR4.PCIDE is set; with paging tagging
+ * disabled the processor ignores them, so a guest toggling CR3.PWT/PCD
+ * must not read as an address-space change.
+ *
+ * Thread: FS.base, the per-thread TLS base the kernel switches per thread
+ * and which SWAPGS does not touch, so it names the same thread at CPL0 as
+ * at CPL3.  A non-long-mode (compat/legacy) task's TLS base is in GS.base
+ * instead; CS.L selects, exactly as the segment cache reports it.  No
+ * guest memory is read and no value is tested for shape.
+ */
+static void x86_get_plugin_identity(CPUState *cs, uint64_t *space_key,
+                                    uint64_t *thread_key)
+{
+    CPUX86State *env = cpu_env(cs);
+    uint64_t cr3 = env->cr[3] & ~CR3_NOFLUSH_MASK;
+
+    if (!(env->cr[4] & CR4_PCIDE_MASK)) {
+        cr3 &= ~0xfffULL;
+    }
+    *space_key = cr3;
+    *thread_key = (env->hflags & HF_CS64_MASK) ? env->segs[R_FS].base
+                                               : env->segs[R_GS].base;
+}
+
 static bool x86_plugin_thread_ptr_tracks_current(CPUState *cs)
 {
     CPUX86State *env = cpu_env(cs);
@@ -400,6 +430,7 @@ static const TCGCPUOps x86_tcg_ops = {
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = x86_get_plugin_state,
     .get_plugin_thread_ptr = x86_get_plugin_thread_ptr,
+    .get_plugin_identity = x86_get_plugin_identity,
     /* A 64-bit kernel keeps its own per-CPU base in GS (swapgs on entry)
      * and reloads FS.base from the incoming task in __switch_to(), so the
      * FS.base this hook reads above user privilege names the current

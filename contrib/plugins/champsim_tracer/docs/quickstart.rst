@@ -329,6 +329,43 @@ plugin sees its argv.
    (seconds, typically), trading detection latency against the risk of
    closing a slow-but-alive window early.
 
+``latch_idle_insns=<arch insns>``
+   The same dead-latch detector as ``latch_timeout``, measured on the
+   guest's own instruction stream instead of the host's wall clock.  An
+   owned window is closed once the guest as a whole has retired this many
+   architectural instructions — in any context, on any vCPU — since that
+   window's process was last scheduled in.
+
+   Prefer this denominator.  Wall-clock idleness rides on host load, so
+   the same guest running the same workload ages a window out at two
+   different points of *its own execution* on a quiet host and on a
+   loaded one; where a trace ends must not depend on what else the host
+   happens to be doing.  An architectural count is state the host
+   scheduler cannot move, so the close point is reproducible across an
+   idle and a loaded host.
+
+   Default ``0`` disables it, for the reason ``latch_timeout`` is
+   disabled: idleness alone cannot tell a dead process from a merely
+   long-idle live one, only how much of it there is can, and only the
+   operator knows how much their workload legitimately exhibits.  The two
+   detectors are independent — give either alone or both together, and a
+   window is closed as soon as **either** threshold is crossed.  A window
+   closed on this denominator says so: the ``dead-latch close`` line
+   reports ``idle=<N> insns`` with the threshold that fired, the segment
+   close line ends in ``IDLE`` rather than ``END``, and the statistics
+   report carries ``dead-latch windows closed (idle insns)``.
+
+   It is **not** a duplicate of ``stall_ceiling`` (:doc:`reference`),
+   which covers the opposite shape: there the pinned process is alive and
+   retiring kernel instructions in an owned context but never returns to
+   user space, so its user clock is frozen and *owned* instructions are
+   what advance.  Here the process is killed or never scheduled again, so
+   no owned instruction retires at all and ``stall_ceiling`` can never
+   advance.  ``stall_ceiling_any`` (below) bounds the same not-running
+   shape, but at whole-segment granularity and by truncating the capture;
+   ``latch_idle_insns`` is the per-window close that leaves surviving
+   windows tracing.
+
 ``stall_ceiling_any=<arch insns>``
    How a system-mode capture is guaranteed to END.
 
@@ -362,9 +399,10 @@ plugin sees its argv.
    or — best — end the run with a guest shutdown (below).
 
    Default ``2000000000``.  ``0`` disables it, and a system-mode marker
-   or simpoint capture with the ceiling disabled **and** no
-   ``latch_timeout`` is *refused at startup*: that configuration has no
-   terminator at all, and a run that cannot end is not started.
+   or simpoint capture with the ceiling disabled **and** neither dead
+   latch (``latch_idle_insns``, ``latch_timeout``) given is *refused at
+   startup*: that configuration has no terminator at all, and a run that
+   cannot end is not started.
 
 Ending a run without the workload's cooperation
 -----------------------------------------------

@@ -62,6 +62,27 @@ Plugin API additions
      before the consuming ``tb_exec`` callback returns — and resets
      its length; both producer and consumer are the owning vCPU
      thread, so the API is lock-free by construction.
+   * ``qemu_plugin_cpu_events_pending_slot`` — publish a per-vCPU
+     scoreboard entry QEMU sets to 1 on every queue push and clears to
+     0 on every drain.  It makes "is a drain owed on this vCPU"
+     JIT-testable, which is what lets the tracer put a drain point at
+     **every** translation-block entry for the price of one load and
+     one brcond.  That is what bounds the queue: without it the queue's
+     only consumer is the heavy ``vcpu_tb_exec`` callback, which is
+     conditional on ownership and on a segment being active, so any
+     window where those are false — a foreign address space, between
+     segments, after the marker window closes — is a window where the
+     grow-only queue has no consumer at all and its length becomes a
+     function of untraced execution.  ``qemu_plugin_cpu_events_set``
+     correspondingly no longer discards a pending backlog: a non-empty
+     queue at that call is reported and aborts, because a silent
+     discard there is a dropped event by another name.
+   * ``qemu_plugin_cpu_events_stats`` — the queue's own high-water
+     length and push/drain counts.  Produced by the producer, upstream
+     of every plugin attribution decision, so a plugin gate that
+     refuses a context cannot suppress it; ``CPU_PLUGIN_EVQ_STRUCTURAL_
+     MAX`` in ``include/hw/core/cpu.h`` documents the ceiling the
+     producer asserts (it aborts, it never caps or drops).
    * ``qemu_plugin_register_asid_write_cb`` — synchronous
      notification each time the guest commits a changed value to the
      register ``qemu_plugin_get_addr_space_id()`` reports, fired from
@@ -309,6 +330,55 @@ Plugin API additions
    The hook is gated ``CONFIG_PLUGIN && !CONFIG_USER_ONLY``; porting a
    new ISA to system-mode tracing means implementing it (see
    :doc:`extending`).
+
+``include/accel/tcg/cpu-ops.h``, ``plugins/core.c`` and per-target
+``TCGCPUOps::get_plugin_identity``
+
+   Base QEMU keys its TLB on the translation regime (``mmu_idx``) and
+   maintains no notion of WHICH address space a vCPU is in, so this is a
+   new primitive rather than a re-export of an existing one.  A second
+   optional ``TCGCPUOps`` callback,
+   ``get_plugin_identity(cpu, *space_key, *thread_key)``, reports the
+   RAW architectural identity keys; ``plugins/core.c`` interns each
+   distinct key into a monotonically increasing id and caches the pair
+   per vCPU (``CPUState::plugin_process_id`` /
+   ``plugin_thread_id``), refreshing it at the address-space commit
+   point (beside the ``ASID_WRITE`` push) and on demand from the API.
+   Plugins receive only the ids, through
+   ``qemu_plugin_get_process_id()`` and ``qemu_plugin_get_thread_id()``
+   (``QEMU_PLUGIN_VERSION = 18``), so nothing a plugin does can come to
+   depend on a target's register width, layout or reuse behaviour.
+
+   Each target composes its keys only where the architecture itself
+   splits the name across fields, and reads nothing but registers — no
+   guest memory, no test of a value's *content*, no operating-system
+   layout:
+
+   * x86-64 — ``CR3``, with the PCID kept when ``CR4.PCIDE`` is set and
+     the architecturally-ignored low 12 bits masked when it is not, and
+     the NOFLUSH command bit (never stored state) always masked;
+     ``FS.base``, or ``GS.base`` for a non-long-mode task.
+   * AArch64 — ``TTBR0_EL1``'s table base recombined with the
+     architectural ASID, which ``TCR_EL1.A1`` places in ``TTBR0_EL1`` or
+     ``TTBR1_EL1``; ``TPIDR_EL0``.
+   * RISC-V — ``SATP`` (already ``{MODE, ASID, PPN}``), or ``VSATP``
+     under H-extension virtualization; ``tp`` (``x4``).
+   * MIPS — ``EntryHi.ASID`` under the CPU's ASID mask, with
+     ``CP0 MemoryMapID`` above it when ``Config5.MI`` makes MemoryMapID
+     the TLB tag; ``CP0 UserLocal``.
+
+   A key of 0 means "the architecture names nothing in this state" and
+   is never interned, so id 0 is an *absence*, not an identity: a target
+   with no hook (user-mode emulation, where a QEMU process is one
+   address space) and a CPU model that implements no thread-pointer
+   register (a MIPS model with ``Config3.ULRI`` clear) both report it,
+   and a consumer must treat it as unknown rather than as a match.
+
+   Registers that live in TCG globals (the x86 segment bases, RISC-V
+   ``tp``) are only guaranteed spilled to the CPU state in a callback
+   registered ``QEMU_PLUGIN_CB_R_REGS`` or ``QEMU_PLUGIN_CB_RW_REGS``;
+   the per-vCPU memo makes a sample taken elsewhere self-correcting at
+   the next coherent one rather than sticky.
 
 ``plugins/api.c`` and ``disas/disas-target.c``
 

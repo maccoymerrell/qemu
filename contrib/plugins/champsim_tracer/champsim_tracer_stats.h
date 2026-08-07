@@ -258,44 +258,95 @@ struct Stats {
     uint64_t marker_fence_session_only = 0;
 
     /*
-     * INVARIANT TRIPWIRES (all must be 0; each names a way a correct-path
-     * marker could be missed, so a miss can never be silent).
+     * INVARIANT TRIPWIRES and CONDITION COUNTERS.
      *
-     * marker_run_broken       — a correct-path marker word arrived where a
-     *   live run for the same address space expected a different pc: the
-     *   sequence was broken between its instructions (a fence drop of a
-     *   middle word, an evicted slot, a lost cross-vCPU handoff).
-     * marker_run_adopted      — partial runs resumed on a different vCPU
-     *   than they started on (condition counter for the migration path;
-     *   nonzero means the handoff did work that the per-vCPU run sets
-     *   alone would have lost).
-     * marker_end_no_close     — an END MARKER EXECUTED ON THE CORRECT PATH
-     *   and no window closed at it.  Two members, because a correct-path END
-     *   can fail to close a window in two ways and a counter that covers only
-     *   the second is blind to the one that actually happens:
-     *     (a) SUPPRESSED — a word of the sequence was dropped by the
-     *         wrong-path fence while the execution was demonstrably not
-     *         speculative (QEMU's spec-mode flag clear AND this thread not
-     *         inside the walker), so the run could never complete.  Tested
-     *         ahead of the fence's return in vcpu_marker_end_cb, which is the
-     *         only place it CAN be tested: the drop is the violation.
-     *     (b) UNOWNED — the run did complete on the correct path, but in an
-     *         address space this trace does not own, so nothing closed.  That
-     *         is how a pin that drifted off its process looks.
-     * wp_session_on_cp        — a wrong-path session bracket was still
-     *   flagged while this vCPU ran the CORRECT path: a leaked fence flag,
-     *   which would silently drop every subsequent marker callback on that
-     *   vCPU and leave its window open forever.  Tested at TWO points, and
-     *   it needs both: the correct-path step (which the JIT dispatches only
-     *   for an owned context inside a window, and not at all during the
+     * The marker is decided in the bytes at translation time and fires from
+     * one instruction (see champsim_tracer_marker_detect.h), so there is no
+     * run to break, hand off or leave outstanding.  What remains are the
+     * ways a correct-path marker can still be LOST, which are about the
+     * wrong-path fence, not about detection.
+     *
+     * marker_prefix_unreadable — CONDITION, not a tripwire.  An instruction
+     *   that IS the terminating instruction of a marker sequence, whose
+     *   preceding slots could not be read from guest memory when it
+     *   executed.  It does NOT mean those slots did not execute: on a
+     *   software-managed TLB (mipsel) the read fails for a page that is
+     *   still mapped, once its TLB entry has been evicted by the kernel code
+     *   that ran between the two halves of the sequence.  This counter is
+     *   therefore how often the exact source could not be consulted, and
+     *   nothing more; a straddling sequence is decided from its physical
+     *   page pair instead (marker_straddle_*).  See
+     *   champsim_tracer_marker_detect.h for the measurement that falsified
+     *   the older reading of this counter.
+     * marker_straddle_pair_resolved — CONDITION.  Reads that could not be
+     *   serviced and were answered by the sequence's physical page pair.
+     *   Every one of these is a marker that the read alone would have lost.
+     * marker_straddle_conflicts — MUST BE 0 in a single-binary capture.  Two
+     *   DIFFERENT predecessor physical pages recorded behind the same tail
+     *   physical page: the address-space reuse case.  Nonzero is not a bug —
+     *   it is the guard firing — but it means the tail no longer determines
+     *   the pair and those sequences fall back to the read alone.
+     * marker_straddle_undecided — CONDITION, and the sharp one.  A
+     *   marker-shaped instruction whose sequence spans two pages, whose read
+     *   could not be serviced, AND for which no physical page pair was ever
+     *   witnessed.  Nonzero has exactly one benign shape: a LONE
+     *   marker-terminating instruction at the start of a page whose
+     *   predecessor page was never executed as marker prefix — the bytes
+     *   before it are not a sequence and nothing should be claimed.  The
+     *   adversarial `chaff` cell builds that on purpose and reads 2 per
+     *   execution of it (one per armed callback).  What it can NOT be is a
+     *   sequence that really ran: the predecessor page's own translation
+     *   witnesses it while that page is resident, and the witness is what
+     *   the pair is built from.  So on any cell WITHOUT a deliberate lone
+     *   tail this is 0, and a nonzero there is the missed-marker defect
+     *   coming back.
+     * marker_end_suppressed  — MUST BE 0.  An END marker executed on the
+     *   CORRECT PATH and the wrong-path fence dropped it anyway: the
+     *   execution was demonstrably not speculative (QEMU's spec-mode flag
+     *   clear AND this thread not inside the walker), so only a LEAKED
+     *   session bracket can have suppressed it, and the window it should
+     *   have closed is still open.  Tested ahead of the fence's return in
+     *   vcpu_marker_end_cb, which is the only place it CAN be tested: the
+     *   drop is the violation, and a counter placed after it is
+     *   structurally blind to the case it exists to name.  Positive
+     *   control: CST_FENCE_FORCE_END.
+     * marker_end_no_close    — CONDITION, not a tripwire.  An END marker
+     *   completed on the correct path in an address space this trace does
+     *   not own, so nothing closed.  Expected whenever a process this trace
+     *   does not own runs an END sequence, which byte-decided detection
+     *   sees and the old adjacency run usually did not.  Split from
+     *   marker_end_suppressed for exactly that reason: fusing an expected
+     *   condition with a violated invariant makes the invariant
+     *   unenforceable.
+     * wp_session_on_cp       — MUST BE 0.  A wrong-path session bracket was
+     *   still flagged while this vCPU ran the CORRECT path: a leaked fence
+     *   flag, which would silently drop every subsequent marker callback on
+     *   that vCPU and leave its window open forever.  Tested at TWO points,
+     *   and it needs both: the correct-path step (which the JIT dispatches
+     *   only for an owned context inside a window, and not at all during the
      *   pinned-simpoint fast-forward), and every committed address-space
      *   write (which fires regardless of ownership, window and
      *   fast-forward).  Positive control: CST_FENCE_FORCE_SESSION.
      */
-    uint64_t marker_run_broken = 0;
-    uint64_t marker_run_adopted = 0;
-    uint64_t marker_run_incomplete = 0;
+    uint64_t marker_prefix_unreadable = 0;
+    uint64_t marker_straddle_pair_resolved = 0;
+    uint64_t marker_straddle_conflicts = 0;
+    uint64_t marker_straddle_undecided = 0;
+    uint64_t marker_end_suppressed = 0;
     uint64_t marker_end_no_close = 0;
+    /* An END that executed on the correct path, could not be attributed to
+     * any owner, and closed the capture anyway.  MAINTAINER RULING
+     * (2026-08-02): "END kills the tracer, regardless of simpoints, just
+     * like a program ending in user mode would do."  Nonzero means the
+     * ownership machinery could not name the ender — worth investigating —
+     * but the trace still ends where its workload does, which is the
+     * invariant that cannot be traded. */
+    uint64_t marker_end_forced_close = 0;
+    /* An END whose owner the learned-code-page probe could not name, and
+     * which the SOLE open window claimed instead.  Narrow-ASID (MIPS) only:
+     * an END running out of a page mapped after the START — a JIT stub, a
+     * run-time-built sequence — is invisible to a page map.  Nonzero is
+     * ordinary; it is what keeps marker_end_forced_close at 0. */
     uint64_t wp_session_on_cp = 0;
     /* Worst stall: architectural instructions retired in an owned context
      * between two advances of the pinned user clock (diagnostic — the
@@ -308,30 +359,22 @@ struct Stats {
      * any-context ceiling raised. */
     uint64_t user_clock_worst_stall_any = 0;
     uint64_t stall_any_closes = 0;
+    /* Owned marker windows retired by the dead-latch detector, split by
+     * which denominator crossed: the wall-clock timeout (latch_timeout) or
+     * the guest-instruction idle (latch_idle_insns).  Both are per-window,
+     * not per-segment: several may be counted before the set empties and
+     * the segment closes.  Nonzero on either means at least one traced
+     * process was judged dead WITHOUT having run its END marker, so its
+     * strand of the trace stops where the detector fired rather than where
+     * the workload finished. */
+    uint64_t dead_latch_closes_ms = 0;
+    uint64_t dead_latch_closes_insns = 0;
     /* Segments closed by the machine-shutdown backstop: the guest powered
      * off (or QEMU was asked to exit) with a capture still open, so the
      * window was closed and finalised there rather than abandoned.  A
      * nonzero value means the trace is TRUNCATED at that point and the
      * workload never reached its END marker. */
     uint64_t vm_shutdown_closes = 0;
-    /* marker_handoff_evicted — a LIVE partial marker run displaced from the
-     * process-wide handoff bank.  Every advance republishes into the bank,
-     * so this is the one remaining way an in-flight sequence can be lost:
-     * a tripwire, must be 0.  marker_local_evicted is the recoverable
-     * per-vCPU analogue (the bank still holds the run). */
-    uint64_t marker_handoff_evicted = 0;
-    uint64_t marker_local_evicted = 0;
-    uint64_t marker_local_stale = 0;
-    /* One-word marker candidates: the other sequence's shared word opening a
-     * run that cannot advance.  Every healthy capture on a fixed-width target
-     * produces three per marker (see MK_RUN_IN_FLIGHT in
-     * champsim_tracer_marker_detect.cc), so these are condition counters and
-     * never tripwires — restarts is one replaced by a later word, evicted is
-     * one displaced from the bank, outstanding is how many were still held at
-     * exit. */
-    uint64_t marker_cand_restarts = 0;
-    uint64_t marker_cand_evicted = 0;
-    uint64_t marker_cand_outstanding = 0;
 
     /*
      * rep_unretired_pass_dropped — an empty leading pass of a fan-out
@@ -623,11 +666,21 @@ struct Stats {
      * dropped while a dwell awaited its first map hit (a foreign
      * process that never touches mapped pages parks here forever,
      * traced never); pages is the map's final size. */
+    /* The one re-bind rule fired: a thread of an owned address space
+     * reappeared under a name the trace did not own, so the pin followed
+     * it (see pin_rebind_locked). */
     uint64_t pin_repins = 0;
-    uint64_t pin_phys_mismatch_dropped = 0;
-    uint64_t pin_refault_repaired = 0;
+    /* User TBs dropped because the address space they executed in is not
+     * one this trace owns -- THE foreign-drop path.  A zero over a run
+     * that contained foreign execution means the check never ran. */
     uint64_t pin_unverified_dropped = 0;
-    uint64_t pin_pages_mapped = 0;
+    /* This CPU model implements no architectural thread-pointer register, so
+     * the re-bind rule cannot fire (see pin_note_thread_naming). */
+    uint64_t pin_thread_identity_absent = 0;
+    /* Windows retired because the pinned address-space NAME was handed out
+     * again and nothing could re-bind the pin (must be 0 on a target whose
+     * name is not recycled). */
+    uint64_t pin_unbindable_rollover_closes = 0;
 
     /* Root-reuse guard, wide-register targets (x86 CR3 / AArch64 TTBR /
      * RISC-V SATP -- see the ROOT-REUSE GUARD note in champsim_tracer.cc).
@@ -650,14 +703,9 @@ struct Stats {
      *              a successor, whose blocks were excluded (and whose
      *              window was closed) instead of being recorded as the
      *              traced process's own. */
-    uint64_t pin_root_anchors = 0;
-    uint64_t pin_root_verified = 0;
-    uint64_t pin_root_anchor_unresolved = 0;
-    uint64_t pin_root_reuse_detected = 0;
     /* User TBs excluded because the root running them was proven to belong
      * to a successor process.  These are the instructions the tracer used to
      * record as the traced process's own. */
-    uint64_t pin_root_foreign_dropped = 0;
 
     /* DEVIO exact-owner attribution (devio=1, system mode; zero otherwise).
      * A doorbell kick is queued on its kicking vCPU's bounded FIFO
@@ -856,6 +904,103 @@ struct Stats {
      *                             condition did not arise in this run. */
     uint64_t fault_enter_classified_in_win = 0;
     uint64_t fault_enter_skipped_in_async = 0;
+
+    /* ---- Event retention (attribution-gated) ----------------------------
+     *
+     * retention_peak            largest |pending_evs_| this run.  Bounded by
+     *                           the traced context's OWN trap nesting; it
+     *                           must not grow with untraced execution.
+     * retention_scan_events     total retained entries walked (the cost the
+     *                           per-dispatch rescan used to charge).
+     * retention_events_owned    fault events the attribution gate admitted.
+     * retention_events_refused  fault events it refused (untraced context,
+     *                           firmware, excluded-window interior).
+     * retention_appends_from_untraced_events
+     *                           refused events that were retained ANYWAY.
+     *                           Reachable only in the CST_RETAIN_ALL
+     *                           experiment arm; on a shipping run this is
+     *                           exactly 0, and any other value is a failure.
+     * seal_successor_from_foreign_fault
+     *                           the seal's architectural-successor override
+     *                           was taken from an event of another address
+     *                           space — a foreign process's fault standing in
+     *                           for the pinned block's branch target.  The
+     *                           corruption the gate removes; must be 0.
+     * case_b_frame_asid_mismatch
+     *                           a fault-entry classification matched the
+     *                           deferred prev by PC while naming a foreign
+     *                           address space (identical text at identical
+     *                           addresses).  Must be 0.
+     */
+    /* The OTHER per-vCPU structures a long untraced span could grow, peaked
+     * so the claim "no retained structure grows with untraced execution" is
+     * measured rather than asserted.  frames_ holds the traced process's own
+     * in-flight fault excursions; susp_stack_ its suspended deferred-prev
+     * blocks.  Both are fed only from downstream of the attribution gates. */
+    uint64_t frames_peak = 0;
+    uint64_t susp_stack_peak = 0;
+
+    /* ---- Event-queue drain instrument (the BIGDRAIN condition) --------
+     * The queue is QEMU-side, grow-only and never drops; its length between
+     * drains is exactly "events produced since the last drain".  These are
+     * the numbers that showed the defect and are the numbers that show it
+     * gone.
+     *
+     * evq_drain_calls / evq_drain_events   both drain sites (the heavy CP
+     *                            step and the light per-TB absorber).
+     * evq_batch_peak             largest single drain.  THIS is the
+     *                            work-per-guest-instruction violation: one
+     *                            guest instruction was charged 83,532
+     *                            events' worth of O(n) passes on a mipsel
+     *                            churn cell.  With a drain point at every
+     *                            TB entry it cannot exceed one TB's worth
+     *                            of pushes.
+     * evq_gap_peak               largest guest-instruction distance between
+     *                            two consecutive drain CALLS on one vCPU
+     *                            (119,835,488 on that same cell).
+     * evq_bigdrains              drains larger than TCG_MAX_INSNS; must be 0.
+     * evq_absorb_*               the light path's own share.
+     * evq_qmax_len / evq_q_pushes / evq_q_drains
+     *                            read back from QEMU at exit
+     *                            (qemu_plugin_cpu_events_stats): produced by
+     *                            the producer, upstream of every plugin
+     *                            attribution decision, so no plugin gate can
+     *                            suppress them.  evq_qmax_len is the direct
+     *                            measurement of the bound. */
+    uint64_t evq_drain_calls = 0;
+    uint64_t evq_drain_events = 0;
+    uint64_t evq_batch_peak = 0;
+    uint64_t evq_gap_peak = 0;
+    uint64_t evq_bigdrains = 0;
+    uint64_t evq_absorb_calls = 0;
+    uint64_t evq_absorb_events = 0;
+    uint64_t evq_absorb_batch_peak = 0;
+    uint64_t evq_qmax_len = 0;
+    uint64_t evq_q_pushes = 0;
+    uint64_t evq_q_drains = 0;
+
+    uint64_t retention_peak = 0;
+    uint64_t retention_scan_events = 0;
+    uint64_t retention_events_owned = 0;
+    uint64_t retention_events_refused = 0;
+    uint64_t retention_appends_from_untraced_events = 0;
+    uint64_t seal_successor_from_foreign_fault = 0;
+    uint64_t case_b_frame_asid_mismatch = 0;
+
+    /* ---- CST_RETAIN_CHECK equivalence harness (test-only) ---------------
+     * Cell populations of the compared events, so a zero mismatch count can
+     * no longer be reported from a region where the answer is constant: a
+     * cell that must be exercised and reads 0 is a FAILED check, not a pass.
+     */
+    uint64_t rcheck_seals = 0;
+    uint64_t rcheck_cmp_enter_in_async = 0;
+    uint64_t rcheck_cmp_enter_not_async = 0;
+    uint64_t rcheck_cmp_return_in_async = 0;
+    uint64_t rcheck_cmp_return_not_async = 0;
+    uint64_t rcheck_cmp_ours = 0;
+    uint64_t rcheck_cmp_foreign = 0;
+    uint64_t rcheck_mismatch_resume_pc = 0;
+    uint64_t rcheck_mismatch_in_async = 0;
 
     /* Per-execution attribution.  cp_* bumped at vcpu_tb_exec walking
      * the prev TB's template; wp_* inside the WP per-iteration loop.

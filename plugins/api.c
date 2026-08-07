@@ -707,6 +707,20 @@ uint64_t qemu_plugin_get_thread_ptr(void)
     return 0;
 }
 
+uint64_t qemu_plugin_get_process_id(void)
+{
+    g_assert(current_cpu);
+    plugin_identity_sample(current_cpu);
+    return current_cpu->plugin_process_id;
+}
+
+uint64_t qemu_plugin_get_thread_id(void)
+{
+    g_assert(current_cpu);
+    plugin_identity_sample(current_cpu);
+    return current_cpu->plugin_thread_id;
+}
+
 bool qemu_plugin_thread_ptr_tracks_current(void)
 {
     g_assert(current_cpu);
@@ -969,8 +983,50 @@ void qemu_plugin_cpu_events_set(unsigned int vcpu_index, bool enabled)
     if (cpu->plugin_evq.enabled != enabled) {
         cpu_plugin_async_probe(cpu, enabled ? "QON" : "QOFF", 0, false);
     }
+    /*
+     * This function used to zero @len on BOTH arms -- a silent discard of
+     * however many events were pending.  Nothing may be dropped here: a
+     * non-empty queue at this point is a consumer that stopped consuming
+     * while events were still owed, i.e. the unbounded-growth defect this
+     * plumbing exists to make impossible.  Report it as the bug it is.
+     *
+     * The obligation this places on the caller is exact and cheap to meet:
+     * disable (or re-enable) only where the queue is provably empty, which
+     * with a per-TB absorber registered means anywhere at all -- the
+     * preceding TB drained it, and no guest instruction has run since.
+     */
+    if (cpu->plugin_evq.len != 0) {
+        fprintf(stderr,
+                "qemu: FATAL qemu_plugin_cpu_events_set(%d) with %u undrained "
+                "events on cpu %u -- this call would silently discard them\n",
+                (int)enabled, cpu->plugin_evq.len, vcpu_index);
+        fflush(stderr);
+        abort();
+    }
     cpu->plugin_evq.enabled = enabled;
     cpu->plugin_evq.len = 0;
+    plugin_evq_note_drained(cpu);
+}
+
+void qemu_plugin_cpu_events_pending_slot(qemu_plugin_u64 slot)
+{
+    plugin_set_evq_pending_slot(slot, true);
+}
+
+void qemu_plugin_cpu_events_stats(unsigned int vcpu_index,
+                                  uint64_t *max_len, uint64_t *pushes,
+                                  uint64_t *drains)
+{
+    CPUState *cpu = qemu_get_cpu(vcpu_index);
+    if (max_len) {
+        *max_len = cpu ? cpu->plugin_evq.max_len : 0;
+    }
+    if (pushes) {
+        *pushes = cpu ? cpu->plugin_evq.n_push : 0;
+    }
+    if (drains) {
+        *drains = cpu ? cpu->plugin_evq.n_drain : 0;
+    }
 }
 
 size_t qemu_plugin_drain_cpu_events(unsigned int vcpu_index,
@@ -988,6 +1044,10 @@ size_t qemu_plugin_drain_cpu_events(unsigned int vcpu_index,
      * happen before the consumer's tb_exec callback returns. */
     *evs = (const struct qemu_plugin_cpu_event *)q->buf;
     q->len = 0;
+    q->n_drain++;
+    /* The queue is empty: retract the drain-owed flag so the consumer's
+     * per-TB conditional callback stops dispatching until the next push. */
+    plugin_evq_note_drained(cpu);
     return n;
 }
 

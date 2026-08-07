@@ -27,6 +27,8 @@ VCPUScoreboard::VCPUScoreboard()
         sb_, VCPUScoreBoard, trace_this_ctx);
     pin_probe = qemu_plugin_scoreboard_u64_in_struct(
         sb_, VCPUScoreBoard, pin_probe);
+    evq_pending = qemu_plugin_scoreboard_u64_in_struct(
+        sb_, VCPUScoreBoard, evq_pending);
     budget = qemu_plugin_scoreboard_u64_in_struct(
         sb_, VCPUScoreBoard, budget);
     user_seen = qemu_plugin_scoreboard_u64_in_struct(

@@ -1,10 +1,8 @@
 /*
- * Wrong-Path Tracing Plugin — marker byte-sequence detection.
+ * ChampSim Tracer — marker detection.
  *
- * Extracted verbatim from champsim_tracer.cc: the per-ISA START/END marker
- * sequence build and the execution-time PC-adjacency runs that recognise a
- * marker in the user-space instruction stream.  The marker callbacks and the
- * per-thread run sets they own stay in champsim_tracer.cc.
+ * The whole marker is decided in the bytes; see the header for why that is
+ * the mechanism and not an optimisation of one.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -13,25 +11,18 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <unordered_map>
+
 #include "champsim_tracer.h"            /* trace_isa, TRACE_ISA_*, qemu-plugin */
 #include "champsim_tracer_marker_detect.h"
 
 MarkerSeq g_marker_seq;
 
-/*
- * Detector counters are ATOMIC: every one of them is bumped from a marker
- * callback, which runs on the executing vCPU's own thread with no lock
- * held, so on an SMP guest plain increments lose updates and the numbers
- * these invariants are judged by would be wrong.
- */
-static std::atomic<uint64_t> g_marker_runs_broken{0};   /* run reset mid-seq */
-static std::atomic<uint64_t> g_marker_runs_adopted{0};  /* picked up cross-vCPU */
-static std::atomic<uint64_t> g_marker_handoff_evicted{0}; /* live entry dropped */
-static std::atomic<uint64_t> g_marker_local_evicted{0}; /* live LOCAL slot reused */
-static std::atomic<uint64_t> g_marker_local_stale{0};  /* run left by a migration */
-static std::atomic<uint64_t> g_marker_cand_restarts{0}; /* one-word candidate replaced */
-static std::atomic<uint64_t> g_marker_cand_evicted{0};  /* one-word candidate dropped */
-
+/* The one case the byte match cannot decide for itself (header). */
+static std::atomic<uint64_t> g_marker_prefix_unreadable{0};
+static std::atomic<uint64_t> g_marker_straddle_resolved{0};
+static std::atomic<uint64_t> g_marker_straddle_conflicts{0};
+static std::atomic<uint64_t> g_marker_straddle_undecided{0};
 
 /* The x86 marker is CST_MARKER_SEQ_LEN 5-byte movs; the fixed-width ISAs
  * use the longer two-insn pair sequence.  MarkerSeq's buffers are sized by
@@ -39,473 +30,242 @@ static std::atomic<uint64_t> g_marker_cand_evicted{0};  /* one-word candidate dr
 static_assert(CST_MARKER_X86_SEQ_BYTES <= CST_MARKER_PAIR_SEQ_BYTES,
               "MarkerSeq buffers sized by the pair sequence");
 
-/*
- * WHAT COUNTS AS A SEQUENCE IN FLIGHT.
- *
- * A single marker word is not a marker.  The collision guarantee this design
- * rests on — three back-to-back loads of the same constant into the same
- * register, which no compiler emits — is a property of the REPEATED run, not
- * of one immediate-load instruction; one such load is ordinary code.
- *
- * And on every fixed-width target the START and END sequences SHARE one of
- * their two words BY CONSTRUCTION.  The two magics differ only in their low
- * byte (CST\x01 / CST\x02), so the half that carries the high 16 bits — MIPS
- * `lui`, RISC-V `lui`, AArch64 `movk` — is byte-identical between them, and
- * translation arms BOTH callbacks on it.  Executing one healthy START
- * sequence therefore hands the END detector that word at every other
- * position: three isolated words, 8 bytes apart, each opening a run that can
- * never advance, because the word between them belongs to the other magic and
- * never fires this callback.  The END sequence does the same to the START
- * detector.
- *
- * Those runs are what a healthy capture produces.  Counting them made
- * `marker run broken` and `marker run incomplete at exit` fire on correct
- * behaviour — measured on the mipsel system workload as 5 and 6, every one of
- * them a one-word run of the other sequence's shared word — which is how a
- * tripwire teaches its readers to ignore it.  Two ADJACENT words is the
- * shortest run only a real sequence can produce, so that is where a run
- * starts being evidence.  Shorter runs are still tracked, still published for
- * cross-vCPU adoption, and still counted (marker_cand_restarts /
- * marker_cand_evicted) — they are simply not reported as a marker gone
- * missing.
- */
-static constexpr uint32_t MK_RUN_IN_FLIGHT = 2;
-
 void marker_seq_init(void)
 {
     MarkerSeq &m = g_marker_seq;
     /* The per-ISA marker sequence is a declarative isa_properties[] row:
-     * the encoder plus the fixed insn width and count the adjacency
-     * detector needs.  A NULL encoder (the unknown ISA) leaves it invalid. */
+     * the encoder plus the fixed insn width and count.  A NULL encoder
+     * (the unknown ISA) leaves it invalid. */
     const IsaProperties &p = isa_properties[trace_isa];
     if (p.marker_encode_seq) {
         p.marker_encode_seq(m.start, CST_MARKER_MAGIC);
         p.marker_encode_seq(m.end, CST_MARKER_END_MAGIC);
-        m.insn_bytes = p.marker_insn_bytes;
-        m.n_insns    = p.marker_seq_insns;
-        m.valid      = true;
+        m.insn_bytes    = p.marker_insn_bytes;
+        m.n_insns       = p.marker_seq_insns;
+        m.seq_bytes     = (uint16_t)(m.insn_bytes * m.n_insns);
+        m.prefix_bytes  = (uint16_t)(m.seq_bytes - m.insn_bytes);
+        m.valid         = true;
     } else {
+        m.valid = false;
+    }
+    /* The backward look reads prefix_bytes before the terminating
+     * instruction; the whole sequence must fit the buffers above and the
+     * scratch the callers stack-allocate. */
+    if (m.valid && (m.seq_bytes > CST_MARKER_PAIR_SEQ_BYTES ||
+                    m.insn_bytes == 0 || m.n_insns < 2)) {
         m.valid = false;
     }
 }
 
-bool marker_word_match(const uint8_t *seq,
-                       const uint8_t *bytes, uint8_t size)
+/* The terminating instruction of @seq. */
+static inline const uint8_t *marker_tail(const uint8_t *seq)
+{
+    return seq + g_marker_seq.prefix_bytes;
+}
+
+bool marker_tail_word_match(const uint8_t *bytes, uint8_t size)
 {
     const MarkerSeq &m = g_marker_seq;
-    if (size != m.insn_bytes) {
+    if (!m.valid || size != m.insn_bytes) {
         return false;
     }
-    for (uint32_t i = 0; i < m.n_insns; i++) {
-        if (memcmp(bytes, seq + (size_t)i * m.insn_bytes, m.insn_bytes) == 0) {
-            return true;
-        }
-    }
-    return false;
+    return memcmp(bytes, marker_tail(m.start), m.insn_bytes) == 0 ||
+           memcmp(bytes, marker_tail(m.end),   m.insn_bytes) == 0;
 }
 
-/* Locate @asid's run slot in @set; when it has none, claim a slot — a free
- * one (run == 0) if any, else the least-recently-advanced — and reset it for
- * a fresh run.  The returned slot's asid always equals @asid. */
-static inline MarkerExecRun *marker_run_slot(MarkerRunSet *set, uint64_t asid)
+MarkerWhich marker_whole_match(const uint8_t *bytes, uint8_t size,
+                               const uint8_t *prefix)
 {
-    int victim = 0;
-    uint32_t victim_age = UINT32_MAX;
-    for (int i = 0; i < MarkerRunSet::SLOTS; i++) {
-        MarkerExecRun &r = set->runs[i];
-        if (r.run > 0 && r.asid == asid) {
-            return &r;                      /* this asid's live run */
-        }
-        /* A free slot is the ideal victim (age 0); otherwise the oldest. */
-        uint32_t age = (r.run == 0) ? 0 : r.used;
-        if (age < victim_age) {
-            victim_age = age;
-            victim = i;
-        }
+    const MarkerSeq &m = g_marker_seq;
+    if (!m.valid || size != m.insn_bytes) {
+        return MARKER_WHICH_NONE;
     }
-    MarkerExecRun *r = &set->runs[victim];
-    if (r->run > 0) {
-        /* A live run for another address space is being displaced.  The
-         * bank still holds its partial state, so the sequence is
-         * recoverable by adoption — a condition counter, not a loss. */
-        g_marker_local_evicted.fetch_add(1, std::memory_order_relaxed);
+    /* Whole-sequence equality, immediates included: the terminating
+     * instruction AND every slot before it.  The two magics differ inside
+     * the prefix on every target, so at most one of these can match. */
+    if (memcmp(bytes, marker_tail(m.start), m.insn_bytes) == 0 &&
+        memcmp(prefix, m.start, m.prefix_bytes) == 0) {
+        return MARKER_WHICH_START;
     }
-    r->run = 0;                             /* fresh run for a new asid */
-    r->asid = asid;
-    r->next_pc = 0;
-    return r;
+    if (memcmp(bytes, marker_tail(m.end), m.insn_bytes) == 0 &&
+        memcmp(prefix, m.end, m.prefix_bytes) == 0) {
+        return MARKER_WHICH_END;
+    }
+    return MARKER_WHICH_NONE;
 }
 
-const MarkerExecRun *marker_run_peek(const MarkerRunSet *set, uint64_t asid)
+uint64_t marker_prefix_unreadable(void)
 {
-    for (int i = 0; i < MarkerRunSet::SLOTS; i++) {
-        if (set->runs[i].run > 0 && set->runs[i].asid == asid) {
-            return &set->runs[i];
-        }
-    }
-    return nullptr;
+    return g_marker_prefix_unreadable.load(std::memory_order_relaxed);
 }
 
-/*
- * Process-wide handoff bank, one per sequence: every partial run in flight,
- * keyed by the address space AND the pc that run is waiting for.
+void marker_prefix_unreadable_note(void)
+{
+    g_marker_prefix_unreadable.fetch_add(1, std::memory_order_relaxed);
+}
+
+/* ---------------------------------------------------------------------------
+ * Straddle: the physical page pair (see the header for why it is the key).
  *
- * A guest task preempted between two marker instructions can resume on a
- * different vCPU, whose thread_local run set knows nothing about the
- * sequence in flight; without this, that sequence is silently lost.  Small,
- * mutex-guarded, and touched only when a marker word actually executes
- * (three per marker), so it is off every hot path.
- *
- * WHY (asid, next_pc) AND NOT asid ALONE.  Two threads of the SAME process
- * running marker sequences concurrently share one address space.  Keyed by
- * asid alone, each publish overwrote the other's entry, so a thread that
- * then migrated found its continuation gone and its sequence was lost with
- * nothing to say so.  Keyed by the position as well, concurrent threads
- * occupy separate entries; two threads at the SAME position hold identical
- * state (the sequence is linear, so the same pc implies the same run
- * length), which makes sharing one entry sound.
- *
- * THE ONLY WAY A PARTIAL RUN CAN NOW BE LOST is eviction from this bank —
- * every advance republishes immediately, including the advance that adopts.
- * So eviction of a LIVE entry is counted and tripwired (must be 0): after
- * that, no path drops an in-flight marker sequence silently.
- */
-struct MarkerHandoff {
-    uint64_t asid = 0;
-    uint64_t next_pc = 0;
-    uint32_t run = 0;
-    uint32_t used = 0;
+ * Both tables are written at TRANSLATION time and read at translation and
+ * execution time, on vCPU threads, with no plugin lock asserted — so they
+ * carry their own.  A plain GMutex: it is POD, zero-initialised, and has no
+ * destructor to race a plugin_exit (see docs/architecture.rst, "Immortal
+ * process-wide aggregates"); the maps behind it are immortal for the same
+ * reason.
+ * ------------------------------------------------------------------------- */
+
+static GMutex g_straddle_lock;
+
+/* The decided verdict, keyed by the TAIL's physical address. */
+struct MarkerStraddlePair {
+    uint64_t    prefix_paddr = 0;
+    MarkerWhich which = MARKER_WHICH_NONE;
+    bool        conflicting = false;   /* a second, different prefix page */
 };
-static constexpr int MK_HANDOFF_SLOTS = 64;
-static MarkerHandoff g_handoff[2][MK_HANDOFF_SLOTS];
-static uint32_t g_handoff_tick[2];
-static GMutex g_handoff_lock;
-uint64_t marker_runs_broken(void)
-{
-    return g_marker_runs_broken.load(std::memory_order_relaxed);
-}
 
-uint64_t marker_runs_adopted(void)
-{
-    return g_marker_runs_adopted.load(std::memory_order_relaxed);
-}
+static std::unordered_map<uint64_t, MarkerStraddleWitness> *g_straddle_witness;
+static std::unordered_map<uint64_t, MarkerStraddlePair>    *g_straddle_pair;
 
-uint64_t marker_handoff_evicted(void)
-{
-    return g_marker_handoff_evicted.load(std::memory_order_relaxed);
-}
+/* Both tables are translation-derived caches of a handful of code sites, so
+ * they are tiny in every real workload.  The cap is a memory bound, not a
+ * policy: a table at its cap stops LEARNING (it never evicts a live entry
+ * out from under a decision), and a straddle it therefore could not witness
+ * shows up in marker_straddle_undecided(), which must be 0. */
+static constexpr size_t STRADDLE_MAX = 4096;
 
-uint64_t marker_local_evicted(void)
+void marker_straddle_witness_note(uint64_t tail_vaddr,
+                                  const MarkerStraddleWitness &w)
 {
-    return g_marker_local_evicted.load(std::memory_order_relaxed);
-}
-
-uint64_t marker_local_stale(void)
-{
-    return g_marker_local_stale.load(std::memory_order_relaxed);
-}
-
-uint64_t marker_candidate_restarts(void)
-{
-    return g_marker_cand_restarts.load(std::memory_order_relaxed);
-}
-
-uint64_t marker_candidate_evicted(void)
-{
-    return g_marker_cand_evicted.load(std::memory_order_relaxed);
-}
-
-/*
- * CST_MKMIG_DIAG=<n> — log the first @n interesting detector events (an
- * adoption, a break, an eviction) with the vCPU that produced them, so a
- * cross-vCPU handoff can be read back to the migration that caused it.
- * Diagnostic only; nothing here changes a decision.
- */
-static int mkmig_diag(void)
-{
-    static int v = -1;
-    if (v < 0) {
-        const char *e = getenv("CST_MKMIG_DIAG");
-        v = e ? atoi(e) : 0;
-    }
-    return v;
-}
-static std::atomic<int> g_mkmig_printed{0};
-
-static void mkmig_note(const char *what, unsigned int cpu_index, int bank,
-                       uint64_t asid, uint64_t pc, uint64_t expect,
-                       uint32_t run_before, uint32_t run_after)
-{
-    int lim = mkmig_diag();
-    if (!lim) {
+    if ((!w.match_start && !w.match_end) || w.head_slots == 0) {
         return;
     }
-    if (g_mkmig_printed.fetch_add(1, std::memory_order_relaxed) >= lim) {
-        return;
+    g_mutex_lock(&g_straddle_lock);
+    if (!g_straddle_witness) {
+        g_straddle_witness =
+            new std::unordered_map<uint64_t, MarkerStraddleWitness>();
     }
-    fprintf(stderr, "[mkmig] %-7s vcpu=%u seq=%s asid=0x%" PRIx64
-            " pc=0x%" PRIx64 " expected=0x%" PRIx64 " run %u->%u\n",
-            what, cpu_index, bank ? "END" : "START", asid, pc, expect,
-            run_before, run_after);
-    fflush(stderr);
+    auto it = g_straddle_witness->find(tail_vaddr);
+    if (it != g_straddle_witness->end()) {
+        it->second = w;                       /* freshest translation wins */
+    } else if (g_straddle_witness->size() < STRADDLE_MAX) {
+        g_straddle_witness->emplace(tail_vaddr, w);
+    }
+    g_mutex_unlock(&g_straddle_lock);
 }
 
-uint64_t marker_runs_incomplete(void)
+bool marker_straddle_witness_get(uint64_t tail_vaddr,
+                                 MarkerStraddleWitness *out)
 {
-    /* A sequence that got under way and never completed.  Every advance
-     * publishes into the bank and a completion clears it, so a slot still
-     * holding a run of MK_RUN_IN_FLIGHT or more words is a marker whose
-     * instructions were split apart and never rejoined.  One-word
-     * candidates are not sequences (see MK_RUN_IN_FLIGHT) and are reported
-     * separately by marker_candidates_outstanding(). */
-    uint64_t n = 0;
-    g_mutex_lock(&g_handoff_lock);
-    for (int b = 0; b < 2; b++) {
-        for (int i = 0; i < MK_HANDOFF_SLOTS; i++) {
-            if (g_handoff[b][i].run >= MK_RUN_IN_FLIGHT) {
-                n++;
-            }
+    bool got = false;
+    g_mutex_lock(&g_straddle_lock);
+    if (g_straddle_witness) {
+        auto it = g_straddle_witness->find(tail_vaddr);
+        if (it != g_straddle_witness->end()) {
+            *out = it->second;
+            got = true;
         }
     }
-    g_mutex_unlock(&g_handoff_lock);
-    return n;
-}
-
-uint64_t marker_candidates_outstanding(void)
-{
-    uint64_t n = 0;
-    g_mutex_lock(&g_handoff_lock);
-    for (int b = 0; b < 2; b++) {
-        for (int i = 0; i < MK_HANDOFF_SLOTS; i++) {
-            if (g_handoff[b][i].run > 0 &&
-                g_handoff[b][i].run < MK_RUN_IN_FLIGHT) {
-                n++;
-            }
-        }
-    }
-    g_mutex_unlock(&g_handoff_lock);
-    return n;
-}
-
-void marker_handoff_census(void)
-{
-    /* Name every outstanding entry, so a nonzero tripwire says WHICH run it
-     * is talking about instead of leaving the reader to guess.  Diagnostic
-     * (CST_MKMIG_DIAG); nothing here changes a decision. */
-    g_mutex_lock(&g_handoff_lock);
-    for (int b = 0; b < 2; b++) {
-        for (int i = 0; i < MK_HANDOFF_SLOTS; i++) {
-            const MarkerHandoff &h = g_handoff[b][i];
-            if (h.run == 0) {
-                continue;
-            }
-            fprintf(stderr, "[mkmig] left    slot=%d seq=%s asid=0x%" PRIx64
-                    " waiting_pc=0x%" PRIx64 " run=%u %s\n",
-                    i, b ? "END" : "START", h.asid, h.next_pc, h.run,
-                    h.run >= MK_RUN_IN_FLIGHT ? "INCOMPLETE" : "candidate");
-        }
-    }
-    g_mutex_unlock(&g_handoff_lock);
-    fflush(stderr);
-}
-
-/*
- * Move @asid's partial run from @consumed_pc (the position it was waiting
- * at, which this word just satisfied) to @next_pc with length @run.  A
- * @run of 0 only retires the old entry — the sequence completed or died.
- */
-static void handoff_update(int bank, uint64_t asid, uint64_t consumed_pc,
-                           uint64_t next_pc, uint32_t run,
-                           unsigned int cpu_index)
-{
-    g_mutex_lock(&g_handoff_lock);
-    int free_slot = -1;
-    int victim = 0;
-    uint32_t victim_run = UINT32_MAX;
-    uint32_t victim_age = UINT32_MAX;
-    for (int i = 0; i < MK_HANDOFF_SLOTS; i++) {
-        MarkerHandoff &h = g_handoff[bank][i];
-        if (h.run > 0 && h.asid == asid && h.next_pc == consumed_pc) {
-            h.run = 0;                      /* our own previous position */
-        }
-        if (h.run == 0) {
-            if (free_slot < 0) {
-                free_slot = i;
-            }
-            continue;
-        }
-        /* SHORTEST RUN FIRST, then least recently advanced.  The bank fills
-         * with one-word candidates — the other sequence's shared word opens
-         * three of them per marker (see MK_RUN_IN_FLIGHT) — and evicting a
-         * real partial sequence to make room for chaff is exactly the loss
-         * this bank exists to prevent. */
-        if (h.run < victim_run || (h.run == victim_run && h.used < victim_age)) {
-            victim_run = h.run;
-            victim_age = h.used;
-            victim = i;
-        }
-    }
-    if (run > 0) {
-        int slot = free_slot >= 0 ? free_slot : victim;
-        if (free_slot < 0) {
-            /* A live entry is being dropped.  For a sequence in flight that
-             * is the one remaining way a marker can go missing, so it is the
-             * tripwire; for a one-word candidate it is the bank doing its
-             * job under chaff pressure.  Neither is silent. */
-            if (g_handoff[bank][slot].run >= MK_RUN_IN_FLIGHT) {
-                g_marker_handoff_evicted.fetch_add(1,
-                                                   std::memory_order_relaxed);
-            } else {
-                g_marker_cand_evicted.fetch_add(1, std::memory_order_relaxed);
-            }
-            mkmig_note("evict", cpu_index, bank, g_handoff[bank][slot].asid,
-                       g_handoff[bank][slot].next_pc, next_pc,
-                       g_handoff[bank][slot].run, 0);
-        }
-        MarkerHandoff &h = g_handoff[bank][slot];
-        h.asid = asid;
-        h.next_pc = next_pc;
-        h.run = run;
-        h.used = ++g_handoff_tick[bank];
-    }
-    g_mutex_unlock(&g_handoff_lock);
-}
-
-/* Is @asid's run at @next_pc still in the bank?  The bank is authoritative:
- * a per-vCPU run whose position is NO LONGER published was adopted by
- * another vCPU (the task migrated), so this vCPU's copy is a leftover, not
- * a broken sequence. */
-static bool handoff_live(int bank, uint64_t asid, uint64_t next_pc)
-{
-    bool live = false;
-    g_mutex_lock(&g_handoff_lock);
-    for (int i = 0; i < MK_HANDOFF_SLOTS; i++) {
-        const MarkerHandoff &h = g_handoff[bank][i];
-        if (h.run > 0 && h.asid == asid && h.next_pc == next_pc) {
-            live = true;
-            break;
-        }
-    }
-    g_mutex_unlock(&g_handoff_lock);
-    return live;
-}
-
-/* Adopt @asid's published partial run if it expects exactly @pc.  Returns
- * the adopted run length (0 = nothing to adopt) and consumes the slot. */
-static uint32_t handoff_adopt(int bank, uint64_t asid, uint64_t pc)
-{
-    uint32_t got = 0;
-    g_mutex_lock(&g_handoff_lock);
-    for (int i = 0; i < MK_HANDOFF_SLOTS; i++) {
-        MarkerHandoff &h = g_handoff[bank][i];
-        if (h.run > 0 && h.asid == asid && h.next_pc == pc) {
-            got = h.run;
-            h.run = 0;
-            break;
-        }
-    }
-    g_mutex_unlock(&g_handoff_lock);
+    g_mutex_unlock(&g_straddle_lock);
     return got;
 }
 
-/*
- * Directed controls for the cross-vCPU handoff (diagnostic, off by default).
- *   CST_FENCE_FORCE_SPLIT — after every non-final advance, wipe the LOCAL
- *     run, so the next word must be adopted from the handoff bank: the
- *     migration case, forced on every sequence.
- *   CST_FENCE_NO_HANDOFF  — refuse to adopt, i.e. the pre-handoff code.
- * The pair is the positive control: FORCE_SPLIT alone must still detect
- * every sequence; FORCE_SPLIT with NO_HANDOFF must lose them all.
- */
-static bool handoff_force_split(void)
+void marker_straddle_pair_note(uint64_t tail_paddr, uint64_t prefix_paddr,
+                               MarkerWhich which)
 {
-    static int v = -1;
-    if (v < 0) {
-        v = getenv("CST_FENCE_FORCE_SPLIT") ? 1 : 0;
+    if (which == MARKER_WHICH_NONE) {
+        return;
     }
-    return v != 0;
-}
-static bool handoff_disabled(void)
-{
-    static int v = -1;
-    if (v < 0) {
-        v = getenv("CST_FENCE_NO_HANDOFF") ? 1 : 0;
+    g_mutex_lock(&g_straddle_lock);
+    if (!g_straddle_pair) {
+        g_straddle_pair = new std::unordered_map<uint64_t, MarkerStraddlePair>();
     }
-    return v != 0;
+    auto it = g_straddle_pair->find(tail_paddr);
+    if (it == g_straddle_pair->end()) {
+        if (g_straddle_pair->size() < STRADDLE_MAX) {
+            MarkerStraddlePair p;
+            p.prefix_paddr = prefix_paddr;
+            p.which = which;
+            g_straddle_pair->emplace(tail_paddr, p);
+        }
+        g_mutex_unlock(&g_straddle_lock);
+        return;
+    }
+    if (it->second.prefix_paddr == prefix_paddr && it->second.which == which) {
+        g_mutex_unlock(&g_straddle_lock);
+        return;                               /* the same pair again */
+    }
+    /* A DIFFERENT predecessor page behind this same tail page: the very
+     * reuse the execution-time recheck existed to catch.  The tail no longer
+     * determines the pair, so it must not be allowed to decide one. */
+    it->second.conflicting = true;
+    g_marker_straddle_conflicts.fetch_add(1, std::memory_order_relaxed);
+    g_mutex_unlock(&g_straddle_lock);
 }
 
-bool marker_exec_step(MarkerRunSet *set, uint64_t pc, uint8_t size,
-                      MarkerWhich which, unsigned int cpu_index)
+/*
+ * @live_prefix_paddr is the predecessor page's physical address AS THE
+ * RUNNING ADDRESS SPACE MAPS IT, or 0 when that could not be resolved —
+ * which is the ordinary case here, since a page whose bytes cannot be read
+ * usually cannot be translated either.  When it CAN be resolved the pair is
+ * checked in full and a mismatch refuses: that is the reuse case caught
+ * outright rather than merely guarded against.
+ */
+MarkerWhich marker_straddle_pair_lookup(uint64_t tail_paddr,
+                                        uint64_t live_prefix_paddr)
 {
-    if (qemu_plugin_get_priv_level() != 0) {
-        return false;                       /* user-space stream only */
-    }
-    int bank = (which == MARKER_WHICH_END) ? 1 : 0;
-    uint64_t asid = qemu_plugin_get_addr_space_id();
-    uint32_t now = ++set->tick;
-    MarkerExecRun *r = marker_run_slot(set, asid);
-    /* The slot is keyed by asid, so adjacency is the only remaining test. */
-    if (r->run > 0 && pc == r->next_pc) {
-        r->run++;
-    } else {
-        /*
-         * This vCPU's run cannot take this word.  ADOPTION IS TRIED FIRST,
-         * whether or not a local run exists.
-         *
-         * A migration leaves the losing vCPU's local slot holding a run
-         * that continued elsewhere.  When the task later migrates BACK
-         * mid-sequence, that leftover is what the slot holds — at a
-         * different position than the word now arriving — and treating it
-         * as authoritative both reports a spurious break and, worse, drops
-         * the live sequence on the floor: it restarts at 1 and the two or
-         * three words remaining can never reach full length.  The bank
-         * holds the live run, so ask the bank before believing the slot.
-         */
-        uint32_t adopted = handoff_disabled()
-            ? 0 : handoff_adopt(bank, asid, pc);
-        if (adopted) {
-            g_marker_runs_adopted.fetch_add(1, std::memory_order_relaxed);
-            mkmig_note("adopt", cpu_index, bank, asid, pc, pc,
-                       adopted, adopted + 1);
-            if (r->run > 0) {
-                g_marker_local_stale.fetch_add(1, std::memory_order_relaxed);
-            }
-            r->run = adopted + 1;
-        } else if (r->run > 0) {
-            if (!handoff_live(bank, asid, r->next_pc)) {
-                /* Not published any more: this slot is the residue of a
-                 * sequence that migrated away and completed elsewhere. */
-                g_marker_local_stale.fetch_add(1, std::memory_order_relaxed);
-            } else if (r->run < MK_RUN_IN_FLIGHT) {
-                /* One word is not a sequence: this is the other magic's
-                 * shared word opening a candidate that the next one
-                 * replaces, which every healthy capture on a fixed-width
-                 * target does three times per marker (see MK_RUN_IN_FLIGHT).
-                 * Counted as the condition it is, not as a broken marker. */
-                g_marker_cand_restarts.fetch_add(1, std::memory_order_relaxed);
+    MarkerWhich which = MARKER_WHICH_NONE;
+    bool mismatched = false;
+    g_mutex_lock(&g_straddle_lock);
+    if (g_straddle_pair) {
+        auto it = g_straddle_pair->find(tail_paddr);
+        if (it != g_straddle_pair->end() && !it->second.conflicting) {
+            if (live_prefix_paddr &&
+                live_prefix_paddr != it->second.prefix_paddr) {
+                mismatched = true;
             } else {
-                /* The bank corroborates this run: a marker word really did
-                 * arrive where a live sequence expected a different pc.
-                 * Named, never silent (see marker_runs_broken). */
-                g_marker_runs_broken.fetch_add(1, std::memory_order_relaxed);
-                mkmig_note("broken", cpu_index, bank, asid, pc, r->next_pc,
-                           r->run, 1);
+                which = it->second.which;
             }
-            r->run = 1;
-        } else {
-            r->run = 1;
         }
     }
-    r->used = now;
-    r->next_pc = pc + size;
-    if (r->run >= g_marker_seq.n_insns) {
-        r->run = 0;
-        handoff_update(bank, asid, pc, 0, 0, cpu_index);
-        return true;
+    g_mutex_unlock(&g_straddle_lock);
+    if (mismatched) {
+        g_marker_straddle_conflicts.fetch_add(1, std::memory_order_relaxed);
     }
-    handoff_update(bank, asid, pc, r->next_pc, r->run, cpu_index);
-    if (handoff_force_split()) {
-        r->run = 0;                         /* forced migration (control) */
+    if (which != MARKER_WHICH_NONE) {
+        g_marker_straddle_resolved.fetch_add(1, std::memory_order_relaxed);
     }
-    return false;
+    return which;
+}
+
+void marker_straddle_reset(void)
+{
+    g_mutex_lock(&g_straddle_lock);
+    if (g_straddle_witness) {
+        g_straddle_witness->clear();
+    }
+    if (g_straddle_pair) {
+        g_straddle_pair->clear();
+    }
+    g_mutex_unlock(&g_straddle_lock);
+}
+
+uint64_t marker_straddle_pair_resolved(void)
+{
+    return g_marker_straddle_resolved.load(std::memory_order_relaxed);
+}
+
+uint64_t marker_straddle_conflicts(void)
+{
+    return g_marker_straddle_conflicts.load(std::memory_order_relaxed);
+}
+
+uint64_t marker_straddle_undecided(void)
+{
+    return g_marker_straddle_undecided.load(std::memory_order_relaxed);
+}
+
+void marker_straddle_undecided_note(void)
+{
+    g_marker_straddle_undecided.fetch_add(1, std::memory_order_relaxed);
 }

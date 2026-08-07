@@ -420,6 +420,21 @@ public:
      * unapplied, until the seal phase — or across the whole step when a
      * gate bails, so events during bailed steps accumulate to the next
      * surviving step.  Caller holds exec_lock. */
+    /* Fold one drained batch of ordered path events into the persistent
+     * builder state: the kexc ownership pass, the retention pass (which
+     * moves the async window cursor) and the captured-async ownership
+     * pass, in event order.  NEVER emits — every write to the body stream
+     * lives in step_seal — so it is safe to run on a TB the heavy capture
+     * callback was deliberately not dispatched for.
+     *
+     * step_events calls this; so does the light per-TB absorber
+     * (vcpu_evq_absorb), which is what gives the event queue a consumer in
+     * the windows where every attribution gate is closed.  Only these
+     * StepIn fields are read: pinned, pinned_asid, asid_is_identity,
+     * live_asid (diagnostics), cur_tp/cur_tp_ok, cur_tid, cpu_index,
+     * evs/n_evs. */
+    void absorb_events(const StepIn &in);
+
     StepStatus step_events(const StepIn &in);
 
     /* Post-window phase: initial-block gate, depth pipeline + per-event
@@ -585,12 +600,87 @@ private:
     std::vector<SuspendedPrev> susp_stack_;
     static constexpr size_t SUSP_STACK_CAP = 8;
 
-    /* Drained-but-unapplied events.  Copied out of the queue's internal
-     * buffer at drain time (that buffer is only valid until the next
-     * push); async edges are applied by step_events each step (assignment
-     * semantics, so re-scanning retained events is idempotent), fault
-     * events exactly once by the first step_seal that consumes them. */
-    std::vector<struct qemu_plugin_cpu_event> pending_evs_;
+    /* A retained event, with the async-window state that held AT ITS OWN
+     * POSITION in the drain.  The stamp is taken once, in event order, from
+     * the persistent window flag — never reconstructed later from a batch's
+     * shape, which cannot see a window opened on an earlier bailed step. */
+    struct RetainedEv {
+        struct qemu_plugin_cpu_event ev;
+        bool in_async;
+        bool ours;          /* the attribution verdict at drain */
+    };
+
+    /* Drained-but-unapplied events.  RETENTION IS AN ATTRIBUTION DECISION:
+     * an event is kept only when the SAME ownership predicate that admits a
+     * TB admits the event (event_is_ours), evaluated on the event's own
+     * recorded (asid, priv, tp) at its own position in the drain.  So this
+     * holds exactly the traced context's own FAULT_ENTER/FAULT_RETURN,
+     * surviving its bailed steps until a seal consumes them; execution the
+     * trace refuses contributes nothing, and the structure cannot grow with
+     * untraced execution.
+     *
+     * Async edges are NOT retained: their whole effect is assignment into
+     * persistent members, done once at drain (O(1)), plus the per-event
+     * in_async stamp above.  ASID_WRITE is consumed once at drain by the
+     * kexc ownership pass and read by nobody afterwards.
+     *
+     * Under CST_RETAIN_ALL=1 the ownership guard on the append is bypassed
+     * (and nothing else changes) so the discriminating experiment can run
+     * the unbounded arm in the same binary. */
+    std::vector<RetainedEv> pending_evs_;
+
+    /* One batch-local fact the seal needs but cannot recompute: a capture
+     * window OPENED somewhere in the events folded since the last step.
+     * Set by absorb_events, read-and-cleared by step_events.  Carried in a
+     * member rather than returned, because the batch that opened the window
+     * may have been absorbed one or more TBs before the step that seals
+     * against its departure PC — which is exactly the case the light
+     * absorber creates and the old lump-at-next-dispatch behaviour hid. */
+    bool absorbed_opened_window_ = false;
+
+    /* Async-window state AT THE DRAIN CURSOR: persistent across dispatches,
+     * so a window opened on a step that later bailed is still open when the
+     * next step's events are stamped.  Distinct from async_excluding_ /
+     * async_captured_, which are the mode-dependent consequences. */
+    bool drain_async_open_ = false;
+
+    /* The architectural-successor override derived at drain instead of by a
+     * seal-time rescan: the resume PC of the first retained non-in-async
+     * FAULT_ENTER since the last seal. */
+    uint64_t retained_first_enter_pc_ = 0;
+
+    /* Ownership predicate for ONE event, from the event's own recorded
+     * state — the same rule the TB gates apply, re-asked at the event's
+     * position in the drain.  See champsim_tracer_path_builder.cc. */
+    bool event_is_ours(const struct qemu_plugin_cpu_event &ev,
+                       const StepIn &in, bool in_async, size_t idx) const;
+
+    /* Per-event snapshot of the kernel-excursion ownership edge, indexed by
+     * position in the current drain (filled by the kexc pass, read by
+     * event_is_ours). */
+    std::vector<uint8_t> drain_kexc_own_;
+
+    /* The pin, sampled at the last drain, so a consumer that does not
+     * receive the StepIn (classify_fault_enter) can still ask the
+     * address-space identity question. */
+    uint64_t pin_asid_cur_ = 0;
+    bool     pin_armed_cur_ = false;
+    bool     pin_identity_cur_ = false;
+
+    /* True when @asid demonstrably names an address space other than the
+     * traced one.  Conservative: false whenever the question cannot be
+     * answered (unpinned, or a narrow-ASID target where equality of the raw
+     * bits is not identity). */
+    bool ctx_asid_foreign(uint64_t asid) const
+    {
+        return pin_armed_cur_ && pin_identity_cur_ && asid != pin_asid_cur_;
+    }
+
+    /* CST_RETAIN_CHECK only: the OLD unconditional retention, kept verbatim
+     * alongside the new one so every seal can compare the two derivations.
+     * Unbounded by construction — never a default, never a shipping path. */
+    std::vector<RetainedEv> ref_evs_;
+    void retain_check_compare(uint64_t new_resume_pc);
 
     /* The single pending-seal slot: the deferred prev TB, plus the fault
      * depth stamped when it EXECUTED.  Stamping at promote time (not at

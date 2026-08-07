@@ -39,6 +39,103 @@
  * to whichever plugin asks). */
 static qemu_plugin_asid_write_cb_t asid_write_hook;
 
+/*
+ * ADDRESS-SPACE AND THREAD IDENTITY (opaque monotonic ids).
+ *
+ * Base QEMU keys its TLB on the translation regime (mmu_idx) and maintains
+ * no notion of WHICH address space a vCPU is in, so this is a new primitive
+ * rather than a re-export of an existing one.  It is deliberately the whole
+ * mechanism: the target hook reports the RAW architectural key
+ * (TCGCPUOps::get_plugin_identity) and this layer maps each distinct key to
+ * a monotonically increasing id.  Plugins never see the key, so nothing
+ * they do can depend on interpreting it.
+ *
+ * The map is process-wide, not per-vCPU: the same address space seen on two
+ * vCPUs must produce the SAME id, which a per-vCPU table could not do.  It
+ * is written only when a vCPU's architectural key changes (a context
+ * switch, not a TB), so the mutex is uncontended in practice; every hot-path
+ * read is served by the per-vCPU memo in CPUState.
+ *
+ * Key 0 is reserved for "no identity" and is never interned: a target with
+ * no hook, and a CPU model with no thread-pointer register, both land on it
+ * and must report id 0 so a consumer can see the architecture named nothing.
+ */
+static GMutex plugin_identity_lock;
+static GHashTable *plugin_space_id_map;     /* raw key -> id */
+static GHashTable *plugin_thread_id_map;    /* raw key -> id */
+static uint64_t plugin_space_id_next = 1;
+static uint64_t plugin_thread_id_next = 1;
+
+static uint64_t plugin_intern_locked(GHashTable **map, uint64_t *next,
+                                     uint64_t key)
+{
+    if (key == 0) {
+        return 0;
+    }
+    if (!*map) {
+        *map = g_hash_table_new(g_int64_hash, g_int64_equal);
+    }
+    gpointer v = g_hash_table_lookup(*map, &key);
+    if (v) {
+        return *(uint64_t *)v;
+    }
+    uint64_t *k = g_new(uint64_t, 1);
+    uint64_t *id = g_new(uint64_t, 1);
+    *k = key;
+    *id = (*next)++;
+    g_hash_table_insert(*map, k, id);
+    return *id;
+}
+
+/*
+ * Re-read this vCPU's architectural identity keys and refresh its interned
+ * ids.  Cheap and idempotent: the common case is two loads out of the CPU
+ * state, two comparisons against the memo, and no lock at all.
+ *
+ * Call sites must be places where the target's architectural state is
+ * coherent for the executing vCPU — the address-space commit points (which
+ * run in a helper, after the store) and the plugin API (called from
+ * callbacks whose registration decides whether TCG globals have been
+ * spilled).  Registers that live in TCG globals (x86 segment bases, RISC-V
+ * tp) are only guaranteed current in a CB_RW_REGS callback; the memo makes
+ * a stale read self-correcting at the next coherent sample rather than
+ * sticky.
+ */
+void plugin_identity_sample(CPUState *cpu)
+{
+    const TCGCPUOps *ops = cpu->cc->tcg_ops;
+    uint64_t space_key = 0, thread_key = 0;
+
+    if (ops && ops->get_plugin_identity) {
+        ops->get_plugin_identity(cpu, &space_key, &thread_key);
+    }
+    if (cpu->plugin_identity_valid &&
+        cpu->plugin_space_key == space_key &&
+        cpu->plugin_thread_key == thread_key) {
+        return;
+    }
+    bool space_changed = !cpu->plugin_identity_valid ||
+                         cpu->plugin_space_key != space_key;
+    bool thread_changed = !cpu->plugin_identity_valid ||
+                          cpu->plugin_thread_key != thread_key;
+
+    g_mutex_lock(&plugin_identity_lock);
+    if (space_changed) {
+        cpu->plugin_process_id = plugin_intern_locked(&plugin_space_id_map,
+                                                      &plugin_space_id_next,
+                                                      space_key);
+    }
+    if (thread_changed) {
+        cpu->plugin_thread_id = plugin_intern_locked(&plugin_thread_id_map,
+                                                     &plugin_thread_id_next,
+                                                     thread_key);
+    }
+    g_mutex_unlock(&plugin_identity_lock);
+    cpu->plugin_space_key = space_key;
+    cpu->plugin_thread_key = thread_key;
+    cpu->plugin_identity_valid = true;
+}
+
 void qemu_plugin_register_asid_write_cb(qemu_plugin_id_t id,
                                         qemu_plugin_asid_write_cb_t cb)
 {
@@ -175,6 +272,42 @@ void qemu_plugin_devio_stop(uint64_t request_id)
     }
 }
 
+/*
+ * "Queue non-empty" scoreboard slot.  The queue's single consumer is a
+ * plugin, and its ONLY JIT-testable way to know whether a drain is owed is
+ * a per-vCPU scoreboard entry the producer maintains: 1 the instant an
+ * event is appended, 0 the instant the queue is drained.  With it, a plugin
+ * can register a per-TB conditional callback that costs one load and one
+ * brcond when the queue is empty -- which makes EVERY TB entry a drain
+ * point and turns the queue length into a bounded quantity (see
+ * CPU_PLUGIN_EVQ_STRUCTURAL_MAX).
+ *
+ * One slot process-wide, like the queue's own enable and like
+ * asid_write_hook: the queue already assumes a single consuming plugin.
+ * Stored by value; the scoreboard's backing GArray may be reallocated on
+ * vCPU hotplug, so the address is resolved per access rather than cached.
+ */
+static qemu_plugin_u64 evq_pending_slot;
+static bool evq_pending_slot_set;
+
+void plugin_set_evq_pending_slot(qemu_plugin_u64 slot, bool set)
+{
+    evq_pending_slot = slot;
+    evq_pending_slot_set = set;
+}
+
+bool plugin_evq_pending_slot_armed(void)
+{
+    return evq_pending_slot_set;
+}
+
+void plugin_evq_note_drained(CPUState *cpu)
+{
+    if (evq_pending_slot_set) {
+        qemu_plugin_u64_set(evq_pending_slot, cpu->cpu_index, 0);
+    }
+}
+
 void cpu_plugin_evq_push(CPUState *cpu, int kind, uint64_t pc,
                          uint32_t depth_after)
 {
@@ -192,6 +325,16 @@ void cpu_plugin_evq_push(CPUState *cpu, int kind, uint64_t pc,
      * queued event; the value passed is the just-committed one the
      * per-target state hook reports.
      */
+    if (kind == QEMU_PLUGIN_CPU_EVENT_ASID_WRITE) {
+        /*
+         * The architectural commit point for the address space: the store
+         * has retired and the TLB flush decision has been made, so this is
+         * where the vCPU's process identity changes.  Sampling here (not
+         * only from the API) means a consumer reading the id inside this
+         * very hook already sees the NEW address space.
+         */
+        plugin_identity_sample(cpu);
+    }
     if (kind == QEMU_PLUGIN_CPU_EVENT_ASID_WRITE && asid_write_hook) {
         int hpriv = 0;
         uint64_t hasid = 0;
@@ -246,6 +389,48 @@ void cpu_plugin_evq_push(CPUState *cpu, int kind, uint64_t pc,
         .asid = asid,
         .tp = tp,
     };
+    q->n_push++;
+    if (q->len > q->max_len) {
+        q->max_len = q->len;
+    }
+
+    /*
+     * Tell the consumer a drain is owed.  One store per push; the consumer
+     * is the same vCPU thread, so no ordering beyond program order is
+     * needed (documented single-producer/single-consumer, cpu.h).
+     *
+     * A consumer that never published a slot gets the historical behaviour
+     * -- and, deliberately, NOT the tripwire below: the ceiling is a claim
+     * about what the per-TB drain point makes impossible, so it is only
+     * asserted where that drain point exists.
+     */
+    if (evq_pending_slot_set) {
+        qemu_plugin_u64_set(evq_pending_slot, cpu->cpu_index, 1);
+    }
+
+    /*
+     * STRUCTURAL TRIPWIRE.  Never a cap: nothing is dropped, truncated or
+     * rate-limited here.  Reaching this length means the per-TB drain point
+     * argued for at CPU_PLUGIN_EVQ_STRUCTURAL_MAX did not happen, which is a
+     * broken invariant in the tracer, so the run dies loudly rather than
+     * silently accumulating (and silently costing one guest instruction the
+     * whole backlog's worth of work).  Everything needed to diagnose it in
+     * one shot is printed.
+     */
+    if (unlikely(evq_pending_slot_set &&
+                 q->len > CPU_PLUGIN_EVQ_STRUCTURAL_MAX)) {
+        fprintf(stderr,
+                "qemu: FATAL plugin event-queue invariant broken: cpu=%d "
+                "len=%u > %u cap=%u pushes=%" PRIu64 " drains=%" PRIu64
+                " kind=%d pc=0x%" PRIx64 " slot_armed=%d\n"
+                "  (the consumer's per-TB drain point did not run; this is a "
+                "tracer bug, not a workload)\n",
+                cpu->cpu_index, q->len, (unsigned)CPU_PLUGIN_EVQ_STRUCTURAL_MAX,
+                q->cap, q->n_push, q->n_drain, kind, pc,
+                (int)evq_pending_slot_set);
+        fflush(stderr);
+        abort();
+    }
 }
 
 void cpu_plugin_async_enter(CPUState *cpu, uint64_t departure_pc)

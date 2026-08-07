@@ -119,6 +119,12 @@ struct qemu_plugin_scoreboard *plugin_scoreboard_new(size_t element_size);
 
 void plugin_scoreboard_free(struct qemu_plugin_scoreboard *score);
 
+
+/* Queue-non-empty scoreboard slot plumbing (see plugins/core.c). */
+void plugin_set_evq_pending_slot(qemu_plugin_u64 slot, bool set);
+bool plugin_evq_pending_slot_armed(void);
+void plugin_evq_note_drained(CPUState *cpu);
+
 /**
  * qemu_plugin_fillin_mode_info() - populate mode specific info
  * info: pointer to qemu_info_t structure

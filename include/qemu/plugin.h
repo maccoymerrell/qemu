@@ -246,6 +246,13 @@ bool qemu_plugin_vm_shutdown_armed(void);
 uint64_t qemu_plugin_current_task_offset(bool *set);
 void qemu_plugin_current_task_offset_store(uint64_t offset);
 
+/*
+ * Refresh @cpu's (process, thread) identity from the target's raw
+ * architectural keys, interning each distinct key into a monotonic opaque
+ * id.  See CPUState::plugin_process_id.
+ */
+void plugin_identity_sample(CPUState *cpu);
+
 void qemu_plugin_add_dyn_cb_arr(GArray *arr);
 
 static inline void qemu_plugin_disable_mem_helpers(CPUState *cpu)

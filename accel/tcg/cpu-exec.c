@@ -941,6 +941,142 @@ bool cpu_plugin_exec_tb(CPUState *cpu)
     }
 }
 
+#if defined(TARGET_RISCV) && defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
+/*
+ * The mip bits a DEVICE owns outright: absent from csr.c's delegable_ints, so
+ * no guest write can reach them, and their only writer is an interrupt
+ * controller going through riscv_cpu_update_mip.  A speculative excursion has
+ * nothing to roll back in them.  MTIP is deliberately not here -- see the
+ * restore below.
+ */
+#define CST_MIP_DEVICE_OWNED ((uint64_t)(MIP_MSIP | MIP_MEIP | MIP_SGEIP))
+
+/*
+ * Render @bits into the CALLER's buffer.  Not a shared static: the one line
+ * below names two different masks, and a single buffer makes both names show
+ * whichever call the compiler happened to evaluate last -- a diagnostic that
+ * quietly reports the wrong thing is worse than none.
+ */
+static const char *cst_mip_bit_names(uint64_t bits, char *buf, size_t buflen)
+{
+    static const struct { uint64_t bit; const char *name; } tab[] = {
+        { MIP_MSIP,   " MIP_MSIP"   }, { MIP_SSIP,   " MIP_SSIP"   },
+        { MIP_MEIP,   " MIP_MEIP"   }, { MIP_SEIP,   " MIP_SEIP"   },
+        { MIP_SGEIP,  " MIP_SGEIP"  }, { MIP_LCOFIP, " MIP_LCOFIP" },
+        { MIP_VSSIP,  " MIP_VSSIP"  }, { MIP_VSEIP,  " MIP_VSEIP"  },
+    };
+    size_t n = 0;
+    buf[0] = '\0';
+    for (size_t i = 0; i < ARRAY_SIZE(tab); i++) {
+        if (bits & tab[i].bit) {
+            n += snprintf(buf + n, buflen - n, "%s", tab[i].name);
+            if (n >= buflen) {
+                break;
+            }
+        }
+    }
+    return buf;
+}
+
+/*
+ * CST_MIPERASE=<n> -- pending-interrupt erasure detector (diagnostic, off by
+ * default; <n> caps the printed detail lines, default 64.  The counters keep
+ * running past the cap and a TOTALS line is printed at every power-of-two
+ * event, so a run killed by a watchdog while wedged still reports its totals).
+ *
+ * Runs immediately before the wrong-path restore's memcpy and reports two
+ * different things, because the condition and the outcome can be closed
+ * separately and only measuring the outcome would hide a regression:
+ *
+ *   UNRECORDED -- a bit that is live-set in env->mip, absent from the
+ *      snapshot, and absent from the replay record.  That is the RACE
+ *      signature: a device raise the excursion neither snapshotted nor logged,
+ *      i.e. one that landed in a window where the excursion was not yet (or no
+ *      longer) recording.  It is what the entry/exit ordering fixes close, and
+ *      it is measurable independently of what the restore then decides to do
+ *      with the bit.
+ *
+ *   ERASED -- a bit that is live-set now and will be zero after the restore
+ *      writes env->mip.  That is the outcome the guest actually suffers.
+ *      Computed from the same expression the restore uses, device carry-forward
+ *      included, so it stays honest as that expression changes.
+ *
+ * Timer bits are excluded from both: the excursion-exit reconcile re-derives
+ * them from the architected compare registers.  Every other bit in mip is
+ * parked there by a device (the ACLINT's MSIP/SSIP, the PLIC's MEIP/SEIP,
+ * hgeip's SGEIP, the PMU's LCOFIP) with no second source to recover from -- an
+ * erasure there is an interrupt the guest never sees and a device that waits
+ * forever for an acknowledgement.
+ */
+static void cst_miperase_check(const CPURISCVState *env,
+                               const CPURISCVState *saved,
+                               uint64_t replay_set, uint64_t replay_clear)
+{
+    static int lim = -1;
+    static uint64_t n_events, n_unrec, n_lost, n_msip_unrec, n_msip_lost;
+    const uint64_t timer = MIP_MTIP | MIP_STIP | MIP_VSTIP;
+    uint64_t post, lost, unrec, ev;
+    char unrec_names[96], lost_names[96];
+
+    if (unlikely(lim < 0)) {
+        const char *e = getenv("CST_MIPERASE");
+        int v = e ? atoi(e) : 0;
+        qatomic_set(&lim, e ? (v > 0 ? v : 64) : 0);
+    }
+    if (likely(!lim)) {
+        return;
+    }
+
+    /* Exactly the value the restore is about to write. */
+    post = (((saved->mip | replay_set) & ~replay_clear)
+            & ~CST_MIP_DEVICE_OWNED) | (env->mip & CST_MIP_DEVICE_OWNED);
+
+    lost  = (env->mip & ~post) & ~timer;
+    unrec = (env->mip & ~saved->mip & ~replay_set) & ~timer;
+    if (likely(!lost && !unrec)) {
+        return;
+    }
+
+    ev = qatomic_fetch_inc(&n_events) + 1;
+    if (unrec) {
+        qatomic_inc(&n_unrec);
+        if (unrec & MIP_MSIP) {
+            qatomic_inc(&n_msip_unrec);
+        }
+    }
+    if (lost) {
+        qatomic_inc(&n_lost);
+        if (lost & MIP_MSIP) {
+            qatomic_inc(&n_msip_lost);
+        }
+    }
+
+    if (ev <= (uint64_t)lim) {
+        fprintf(stderr, "[miperase] cpu%d unrecorded=0x%" PRIx64 "%s"
+                " erased=0x%" PRIx64 "%s live=0x%" PRIx64 " saved=0x%" PRIx64
+                " set=0x%" PRIx64 " clr=0x%" PRIx64 " pc=0x%" PRIx64
+                " spec=%d vtp=%d gw=%d\n",
+                current_cpu->cpu_index,
+                unrec, cst_mip_bit_names(unrec, unrec_names,
+                                         sizeof(unrec_names)),
+                lost, cst_mip_bit_names(lost, lost_names,
+                                        sizeof(lost_names)),
+                env->mip, saved->mip, replay_set, replay_clear,
+                (uint64_t)env->pc,
+                (int)current_cpu->plugin_spec_mode,
+                (int)current_cpu->plugin_spec_vtime_paused,
+                (int)env->plugin_mip_guest_write);
+    }
+    if ((ev & (ev - 1)) == 0) {
+        fprintf(stderr, "[miperase] TOTALS events=%" PRIu64
+                " unrecorded=%" PRIu64 " (msip=%" PRIu64 ")"
+                " erased=%" PRIu64 " (msip=%" PRIu64 ")\n",
+                ev, qatomic_read(&n_unrec), qatomic_read(&n_msip_unrec),
+                qatomic_read(&n_lost), qatomic_read(&n_msip_lost));
+    }
+}
+#endif
+
 size_t cpu_plugin_arch_state_size(void)
 {
     /*
@@ -1060,13 +1196,59 @@ void cpu_plugin_arch_state_restore(void *saved, size_t size)
      * across the merge, #77).
      */
     {
-        uint64_t replay_set = env->plugin_spec_mip_set;
-        uint64_t replay_clear = env->plugin_spec_mip_clear;
+        /*
+         * Rewind, read the record and re-apply it as ONE step with respect to
+         * riscv_cpu_update_mip.  That function is the record's only writer and
+         * env->mip's only external writer, and it holds the BQL for both, so
+         * taking the BQL here is what makes the replay exact.  Without it a
+         * raise landing between the read and the memcpy is written into a
+         * record that the trailing reset then zeroes unread -- the bit is
+         * neither kept in env->mip (the memcpy rewound it) nor replayed, and a
+         * lost MIP_MSIP deadlocks the guest, since the ACLINT holds no latch of
+         * its own to re-assert from.
+         *
+         * The lock is taken once per excursion (the two callers are the normal
+         * wp_end restore and the abnormal longjmp cleanup, both excursion
+         * exits), and the ordering -- plugin walk lock, then BQL -- is the one
+         * cpu_plugin_spec_vtime_pause already establishes on the same thread.
+         */
+        bool need_bql = !bql_locked();
+        uint64_t replay_set, replay_clear, live_dev;
 
+        if (need_bql) {
+            bql_lock();
+        }
+        replay_set = env->plugin_spec_mip_set;
+        replay_clear = env->plugin_spec_mip_clear;
+        /*
+         * MSIP, MEIP and SGEIP are device state that merely lives in an
+         * architectural register: they are absent from csr.c's delegable_ints,
+         * so rmw_mip64 masks every guest write to them out and no instruction
+         * -- speculative or not -- can change them.  A speculative excursion
+         * therefore has nothing to roll back there, and carrying the live
+         * value forward makes the erasure structurally impossible rather than
+         * merely raced-free.  This is the same treatment ARM's irq_line_state
+         * gets above, and it agrees with the replay whenever the replay is
+         * right, so it perturbs nothing.
+         *
+         * MTIP is guest-unwritable too but stays out of this: the
+         * excursion-exit reconcile re-derives it from the architected compare
+         * registers, and holding a second opinion here perturbed
+         * interrupt-delivery timing across the wrong-path merge (#77).  It is
+         * excluded from the replay mask for exactly that reason.
+         */
+        live_dev = env->mip & CST_MIP_DEVICE_OWNED;
+
+        cst_miperase_check(env, (const CPURISCVState *)saved,
+                           replay_set, replay_clear);
         memcpy(env, saved, size);
-        env->mip = (env->mip | replay_set) & ~replay_clear;
+        env->mip = (((env->mip | replay_set) & ~replay_clear)
+                    & ~(uint64_t)CST_MIP_DEVICE_OWNED) | live_dev;
         env->plugin_spec_mip_set = 0;
         env->plugin_spec_mip_clear = 0;
+        if (need_bql) {
+            bql_unlock();
+        }
     }
     /*
      * Timer resync is deferred to cpu_plugin_spec_vtime_resume (the true
@@ -1596,6 +1778,28 @@ void cpu_plugin_spec_vtime_pause(CPUState *cpu)
         icount_plugin_freeze(cpu, &g_spec_icount_freeze);
 #endif
     }
+#if defined(TARGET_RISCV) && defined(CONFIG_PLUGIN)
+    /*
+     * Start the excursion's pending-interrupt record empty, and do it under
+     * the same BQL hold that opens the window, so riscv_cpu_update_mip (which
+     * takes the BQL for its update) cannot have a raise recorded and then
+     * wiped by this reset.
+     *
+     * The record is only consumed by cpu_plugin_arch_state_restore, which
+     * fires at excursion exit while the window is still open: a raise landing
+     * after that consume and before cpu_plugin_spec_vtime_resume closes the
+     * window is recorded but never replayed -- correctly, because nothing
+     * rewinds env->mip after the restore, so the bit is already live.  Left in
+     * place it would be replayed by the NEXT excursion's restore, resurrecting
+     * an interrupt the guest may have acknowledged in between.  Clearing here
+     * makes each excursion's replay describe only that excursion.
+     */
+    {
+        CPURISCVState *renv = cpu_env(cpu);
+        renv->plugin_spec_mip_set = 0;
+        renv->plugin_spec_mip_clear = 0;
+    }
+#endif
     cpu->plugin_spec_vtime_paused = true;
 #ifdef CONFIG_PLUGIN
     if (wprot_ready()) {           /* #77: write-protect guest RAM for the WP */

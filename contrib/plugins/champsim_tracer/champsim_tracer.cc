@@ -233,6 +233,17 @@ static const uint64_t CST_ASID_UNPINNED = UINT64_MAX;
 static std::atomic<uint64_t> g_pinned_asid{CST_ASID_UNPINNED};
 
 /*
+ * The REPRESENTATIVE owned address space, as QEMU's opaque process id
+ * (qemu_plugin_get_process_id).  g_pinned_asid above is the raw
+ * architectural value the marker fired under and stays that: it names the
+ * window on the WIRE and arms the "marker mode" predicate.  This is the
+ * OWNERSHIP key — the thing set membership is tested on — and the two are
+ * kept apart because on a narrow-ASID target the raw value is recycled
+ * under live processes while the identity is not.  0 when unpinned.
+ */
+static std::atomic<uint64_t> g_pinned_pid{0};
+
+/*
  * Owned-ASID set (multi-ASID Stage B, wide-register targets).  The set of
  * page-table roots (x86 CR3 / AArch64 TTBR / RISC-V SATP values, as
  * reported by qemu_plugin_get_addr_space_id) currently INSIDE tracer
@@ -305,6 +316,37 @@ static uint64_t g_latch_timeout_ms = 0;
 static std::unordered_map<uint64_t, uint64_t> &g_owned_last_sched =
     *new std::unordered_map<uint64_t, uint64_t>();
 
+/*
+ * Instruction-denominated dead latch (latch_idle_insns=<N>): the same
+ * detector as g_latch_timeout_ms, on a denominator the host cannot move.
+ * Wall-clock idleness rides on host load, so a wall-clock latch closes the
+ * same window at two different points of the guest's own execution on a
+ * quiet host and a loaded one; trace validity and hang prevention must
+ * never depend on host load.  Counted in GLOBAL guest architectural
+ * instructions (every context, every vCPU) so it keeps advancing exactly
+ * when the wall clock's advantage matters — while the owned process is not
+ * running at all.  0 (default) disables it; the two detectors are
+ * independent and a root is dead when EITHER threshold is crossed.  See
+ * PluginConfig::latch_idle_insns for how this differs from stall_ceiling.
+ */
+static uint64_t g_latch_idle_insns = 0;
+
+/* Per-owned-root global architectural instruction count at last
+ * schedule-in — the instruction-clock twin of g_owned_last_sched, kept in
+ * lockstep with it at every stamp and every erase (the narrow-ASID path
+ * carries the equivalent as OwnedProc.last_sched_insns).  Guarded by
+ * exec_lock; immortal. */
+static std::unordered_map<uint64_t, uint64_t> &g_owned_last_sched_insns =
+    *new std::unordered_map<uint64_t, uint64_t>();
+
+/* Either denominator configured.  The cheap pre-check the detector's call
+ * sites use before entering it; the mode/policy gate lives inside
+ * deadlatch_enabled(). */
+static inline bool deadlatch_configured(void)
+{
+    return g_latch_timeout_ms != 0 || g_latch_idle_insns != 0;
+}
+
 /* Monotonic wall-clock milliseconds.  Unlike g_user_icount (which freezes
  * when no owned process runs, so an all-died set could never age out), this
  * keeps advancing regardless of guest scheduling.  Read only off the hot
@@ -314,6 +356,41 @@ static inline uint64_t deadlatch_now_ms(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+/*
+ * Global guest architectural instruction count: the sum of every vCPU's
+ * insn_count slot, which the unconditional per-TB inline add maintains from
+ * the TB's own instruction count.  This is architectural state — it counts
+ * what the guest retired, in any context, and nothing the host scheduler
+ * does can move it — which is the entire point of the instruction latch.
+ *
+ * NOT g_total_arch_insns: that accumulator is fetch_add'ed only inside
+ * finish_trace_segment, so it holds 0 for the whole life of the segment a
+ * live detector has to run in and an idle computed against it would be
+ * identically zero.  Read only off the hot path, like deadlatch_now_ms().
+ */
+static inline uint64_t deadlatch_now_insns(void)
+{
+    return qemu_plugin_u64_sum(g_scoreboard.insn_count);
+}
+
+/*
+ * Was this root idle long enough to be dead?  Each denominator is
+ * independently opt-in, and either alone is sufficient.  @by_insns reports
+ * that the INSTRUCTION denominator is what crossed (and the wall clock did
+ * not), so the close can name which detector fired.  With latch_idle_insns
+ * unset the second term is dead: the set of roots a sweep reaps is exactly
+ * what the wall-clock detector alone reaps today.
+ */
+static inline bool deadlatch_root_is_dead(uint64_t idle_ms,
+                                          uint64_t idle_insns,
+                                          bool *by_insns)
+{
+    bool ms_crossed  = g_latch_timeout_ms && idle_ms    >= g_latch_timeout_ms;
+    bool ins_crossed = g_latch_idle_insns && idle_insns >= g_latch_idle_insns;
+    *by_insns = ins_crossed && !ms_crossed;
+    return ms_crossed || ins_crossed;
 }
 
 /* Off-hot-path staleness sweep, driven from the synchronous ASID-write
@@ -330,7 +407,22 @@ static void deadlatch_on_asid_write(unsigned int vcpu_index,
  * itself false-aged.  Reset per segment (user_count_reset). */
 static constexpr uint64_t DEADLATCH_UIC_STRIDE = 8192;
 static uint64_t g_deadlatch_checked_uic = 0;
-static void deadlatch_clock_check(unsigned int cpu_index, uint64_t live_asid);
+static void deadlatch_clock_check(unsigned int cpu_index, uint64_t live_pid);
+
+/*
+ * Does this CPU model name a thread architecturally at all?  Set false at
+ * pin time when the target reports thread id 0 for a real address space —
+ * a MIPS model with Config3.ULRI clear implements no UserLocal register,
+ * so there is no per-thread value to compare.  Without one the ONE re-bind
+ * rule cannot fire, which matters on exactly the targets whose
+ * address-space NAME is recycled under live processes.
+ */
+static bool g_pin_thread_named = true;
+
+/* Retire the pinned window because its architectural address-space NAME was
+ * handed out again and this CPU model gives nothing to re-bind against.
+ * Defined beside the dead-latch closes, which it reuses. */
+static void pin_unbindable_rollover_close(unsigned int vcpu_index);
 
 /*
  * Translation-bypassing privilege level (see champsim_tracer.h).  The pin
@@ -764,7 +856,8 @@ static void pin_reuse_reset(void)
     g_mutex_unlock(&pin_reuse_lock);
 }
 
-static void pin_reuse_track(uint64_t new_asid, uint64_t pinned_asid)
+static void pin_reuse_track(unsigned int vcpu_index, uint64_t new_asid,
+                            uint64_t pinned_asid)
 {
     bool bump_gen = false;
     g_mutex_lock(&pin_reuse_lock);
@@ -810,6 +903,16 @@ static void pin_reuse_track(uint64_t new_asid, uint64_t pinned_asid)
         g_rec_mutex_lock(&exec_lock);
         asid_identity_gen_bump("pinned-value reuse after rollover");
         g_rec_mutex_unlock(&exec_lock);
+        if (!g_pin_thread_named) {
+            /* The name was reassigned and this CPU model names no thread, so
+             * the pin CANNOT be re-bound to the process that moved — and
+             * whoever now holds the value would otherwise be traced under
+             * the marker's identity, which is the one thing that
+             * invalidates a trace outright.  Retire the window instead: a
+             * truncated capture that says so is the only correct outcome,
+             * and it is loud and counted, never silent. */
+            pin_unbindable_rollover_close(vcpu_index);
+        }
     }
 }
 
@@ -884,73 +987,225 @@ static void pin_reuse_track(uint64_t new_asid, uint64_t pinned_asid)
  * arrays now span several TUs (chain assembler, PathBuilder, memory
  * recorder), all sized and clamped identically. */
 struct PinVcpuState {
-    /* The ASID value the pinned process most recently held on this
-     * vCPU (dwell tag), CST_ASID_UNPINNED until first acquisition. */
+    /* The RAW architectural address-space value this vCPU last ran owned
+     * code under (x86 CR3, MIPS EntryHi.ASID, ...).  Wire naming and the
+     * effective-pin compare read it; it is NEVER the ownership key. */
     std::atomic<uint64_t> asid{CST_ASID_UNPINNED};
-    /* Current dwell verified by a map hit.  Cleared by every committed
-     * ASID write on this vCPU; set by the step glue's probe. */
+    /* The OWNED address space (QEMU process id) this vCPU is executing in,
+     * 0 when it is executing something the trace does not own.  THIS is the
+     * ownership key. */
+    std::atomic<uint64_t> pid{0};
+    /* Mirror of (pid != 0), read by refresh_ctx_gates to drive the
+     * JIT-visible context gate.  Settled at every committed address-space
+     * write and by the light probe's re-acquisition. */
     std::atomic<bool> confirmed{false};
-    /* Which owned process this vCPU's confirmed dwell belongs to — an
-     * index into g_owned_procs (multi-ASID Stage B3, narrow-ASID targets).
-     * -1 until first acquisition; also retained across an unconfirmed span
-     * as the O(1) re-probe hint (the value recycled but the process usually
-     * resumes as the same owner).  Single-owner (legacy / wide) leaves it
-     * 0 / unused. */
-    std::atomic<int> owner{-1};
 };
 static PinVcpuState g_pin_vcpu[CST_PIN_MAX_VCPUS];
-/* One learned code page.  @ppage is the fast-path frame identity (last
- * seen); @sig is the content signature, the authority that survives a
- * re-fault to a new frame. */
-struct PinPage {
-    uint64_t ppage;
-    uint64_t sig;
-};
 static constexpr uint64_t PIN_PAGE_MASK = ~(uint64_t)0xFFF;
 
 /*
- * One owned process on a narrow-ASID target (MIPS), multi-ASID Stage B3.
+ * PER-OWNED-ADDRESS-SPACE RECORD.
  *
- * Generalizes the single g_pin_page_map: each process that ran a START
- * marker (and has not run its END marker) is one OwnedProc with its OWN
- * learned-code-page map — because an 8-bit EntryHi.ASID cannot name a
- * process by value, the page map itself IS the process's identity.  A
- * vCPU's dwell confirms against WHICHEVER owned process's map matches the
- * executing user code (pin_map_probe_owners), and capture attributes to
- * that owner.
+ * Ownership keys on the ADDRESS SPACE — never on a thread, and never on the
+ * code a process happens to be running.  g_owned holds QEMU process ids
+ * (qemu_plugin_get_process_id), and this side table carries what an owned
+ * space needs beyond bare membership:
  *
- * The stable wire handle is @root_phys — the marker code page's PHYSICAL
- * address (a real, stable physical anchor; MIPS exposes no readable pgd
- * root, so this deviates from multiasid_plan §2's "pgd root", see
- * marker_anchor()).  @root_phys + @marker_sig ride the BODY_TAG_ASID_SWITCH
- * first-sighting identity and, mapped through asid_root_to_index, give the
- * owner a compact wire asid_index that is STABLE across an EntryHi.ASID
- * rollover (the raw value is never the wire key).  A single owner reduces to
- * the former single-pin behaviour; user mode (asid 0) uses root_phys/sig
- * (0,0) so user traces stay byte-identical.
+ *   @root_phys/@sig  the STABLE WIRE NAME of the space, kept deliberately
+ *                    separate from the ownership key.  The wire names an
+ *                    address space by a physical anchor plus a content
+ *                    signature (marker_anchor / asid_root_to_index) so a
+ *                    target whose architectural address-space value is 8
+ *                    bits wide cannot churn the wire's asid index when the
+ *                    OS renumbers it.
+ *   @raw_asid        the architectural address-space value the window was
+ *                    opened under — what the asid-keyed dedup index is
+ *                    reclaimed by, and what stderr reports.
+ *   @tids            thread ids observed executing in this space.  Used for
+ *                    exactly one rule, pin_rebind_locked.
  *
- * @active is cleared (not erased) when the process runs its END marker, so
- * PinVcpuState.owner indices stay valid for the segment; the vector is
- * reset only at a marker-driven re-seed (pin_owned_reset_single).  Immortal
- * (see docs/architecture.rst "Immortal process-wide aggregates"); guarded
- * by exec_lock, like the map it replaces.
+ * Guarded by exec_lock, like g_owned; immortal (see "Immortal process-wide
+ * aggregates" in docs/architecture.rst).
  */
-struct OwnedProc {
-    std::unordered_map<uint64_t, PinPage> pages;   /* vpage -> {ppage, sig} */
-    uint64_t root_phys = 0;          /* stable wire anchor (marker page phys) */
-    uint64_t marker_sig = 0;         /* content signature companioning it */
-    uint64_t repr_vpage = UINT64_MAX;/* lowest learned code vpage (text start) */
-    bool     active = false;         /* false after this process's END marker */
-    uint64_t last_sched_ms = 0;      /* wall time of last confirmed dwell —
-                                      * dead-latch liveness (see deadlatch_*) */
+struct OwnedSpace {
+    uint64_t root_phys = 0;
+    uint64_t sig = 0;
+    uint64_t raw_asid = 0;
+    std::unordered_set<uint64_t> tids;
 };
-/* The owned-process set (narrow-ASID Stage B3).  Immortal; guarded by
- * exec_lock.  Empty on wide-register targets (they use g_owned + the
- * live-root equality gate); populated only on g_pin_reuse_guard targets. */
-static std::vector<OwnedProc> *g_owned_procs;
-/* Count of ACTIVE owners (windows currently open) — the narrow-ASID sibling
- * of g_owned.size(); drives the last-window-close decision at END. */
-static int g_owned_procs_active = 0;
+static std::unordered_map<uint64_t, OwnedSpace> &g_owned_info =
+    *new std::unordered_map<uint64_t, OwnedSpace>();
+
+/* A process cannot have unboundedly many threads inside the trace window;
+ * the cap keeps a pathological guest from growing the set without bound.
+ * Reaching it costs only the re-bind rule's reach for threads past it. */
+static constexpr size_t CST_OWNED_TID_CAP = 4096;
+
+/* Record whether this target names a thread architecturally, once a real
+ * address space has been pinned; see the definition below. */
+static void pin_note_thread_naming(uint64_t asid, uint64_t tid);
+
+/* The live ownership key and strand label for the executing vCPU.  Both are
+ * opaque monotonic integers QEMU mints from the target's own architectural
+ * registers; the plugin only ever compares them. */
+static inline uint64_t live_process_id(void)
+{
+    return qemu_plugin_get_process_id();
+}
+static inline uint64_t live_thread_id(void)
+{
+    return qemu_plugin_get_thread_id();
+}
+
+/* A zero thread id for a REAL address space means the CPU model implements
+ * no thread-pointer register, so the one re-bind rule has nothing to compare
+ * and an address-space name reassignment cannot be followed.  Say so once,
+ * loudly: the alternative failure is silent.  Caller holds exec_lock. */
+static void pin_note_thread_naming(uint64_t asid, uint64_t tid)
+{
+    if (asid == 0 || tid != 0) {
+        return;                 /* user mode, or a real thread identity */
+    }
+    if (g_pin_thread_named) {
+        g_pin_thread_named = false;
+        g_stats.pin_thread_identity_absent++;
+        fprintf(stderr,
+                "champsim_tracer: this CPU model names no thread "
+                "architecturally (no thread-pointer register — a MIPS model "
+                "with Config3.ULRI clear), so the pin cannot follow a "
+                "reassignment of its address-space name; the window is "
+                "retired if that happens rather than followed silently\n");
+    }
+}
+
+/* The raw architectural address-space value @pid was opened under, for
+ * human- and validator-readable reporting; 0 if unknown.  Caller holds
+ * exec_lock. */
+static inline uint64_t owned_raw_asid_locked(uint64_t pid)
+{
+    auto it = g_owned_info.find(pid);
+    return it == g_owned_info.end() ? 0 : it->second.raw_asid;
+}
+
+/* @pid's record, or nullptr when it is not owned.  Caller holds exec_lock. */
+static inline const OwnedSpace *owned_info_locked(uint64_t pid)
+{
+    auto it = g_owned_info.find(pid);
+    return it == g_owned_info.end() ? nullptr : &it->second;
+}
+
+/* Note that @tid was seen executing inside owned space @pid.  Thread id 0
+ * means the architecture names no thread here (a CPU model with no
+ * thread-pointer register) and is not an identity, so it is not recorded.
+ * Caller holds exec_lock. */
+static inline void owned_note_thread(uint64_t pid, uint64_t tid)
+{
+    if (!pid || !tid) {
+        return;
+    }
+    auto it = g_owned_info.find(pid);
+    if (it != g_owned_info.end() &&
+        it->second.tids.size() < CST_OWNED_TID_CAP) {
+        it->second.tids.insert(tid);
+    }
+}
+
+/*
+ * THE ONE RE-BIND RULE.
+ *
+ * A narrow address-space name is reassigned to a LIVE process when it rolls
+ * over: MIPS EntryHi.ASID is 8 bits over a 16-entry TLB, so wrap is the
+ * normal state, not an exception.  The name says which address space is
+ * executing NOW, so ownership must follow it — and what survives the
+ * renaming is the thread, which the rename does not touch.
+ *
+ * So: if a thread this trace has already seen inside an owned space
+ * reappears under a name the trace does not own, THE PIN RE-BINDS.  The old
+ * name stops being owned that instant (whoever inherits it is foreign from
+ * its first instruction), and the space's wire identity, liveness stamps and
+ * thread set move across unchanged, so nothing of the traced process is
+ * dropped and its wire asid index does not move.
+ *
+ * MEASURED UNSOUND, THEREFORE OFF BY DEFAULT (CST_PIN_REBIND=1 to arm it).
+ * The rule rests on a thread pointer naming ONE thread of ONE address
+ * space, and on Linux it does not: fork() copies the thread's TLS pointer
+ * verbatim, so the child's first thread carries the parent's value -- the
+ * same inheritance that made a shared COW code page useless as an identity.
+ * A forked child therefore presents "a thread of an owned space under a
+ * name the trace does not own" and the pin follows it, which is precisely
+ * the trace-invalidating defect this arc removes.  Caught on the mipsel
+ * adversarial wave's smp=4 migfault cell: with the rule armed the window
+ * walked across four address-space names (0x13, 0x10, 0xf, ...) and the
+ * owned user clock reached 146 M instructions for a process whose whole
+ * workload is 34 k; with it disarmed the same cell keeps the pin.
+ *
+ * A second, independent reason it cannot carry SMP: on MIPS the ASID is
+ * allocated PER CPU (Linux keeps mm->context.asid[cpu]), so one address
+ * space has up to one name per vCPU and a migration is a legitimate change
+ * of name.  Joining the new name to the window needs evidence that the
+ * space is the same, and the thread pointer is exactly the evidence fork
+ * forges.  That is an open design question, not something this rule
+ * settles -- see the report.
+ *
+ * Left implemented and armable so the wrap case can be exercised
+ * deliberately, but never on by default: a mechanism that can bind the pin
+ * to an unmarked process must not run unasked.  Returns true if a re-bind
+ * happened; caller holds exec_lock.
+ */
+static bool pin_rebind_enabled(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("CST_PIN_REBIND");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v != 0;
+}
+
+static bool pin_rebind_locked(uint64_t new_pid, uint64_t tid)
+{
+    if (!pin_rebind_enabled() || !new_pid || !tid || g_owned.count(new_pid)) {
+        return false;
+    }
+    uint64_t old_pid = 0;
+    for (uint64_t cand : g_owned) {
+        auto it = g_owned_info.find(cand);
+        if (it != g_owned_info.end() && it->second.tids.count(tid)) {
+            old_pid = cand;
+            break;
+        }
+    }
+    if (!old_pid) {
+        return false;
+    }
+    OwnedSpace moved = std::move(g_owned_info[old_pid]);
+    g_owned_info.erase(old_pid);
+    g_owned.erase(old_pid);
+    g_owned.insert(new_pid);
+    g_owned_info.emplace(new_pid, std::move(moved));
+    auto ms = g_owned_last_sched.find(old_pid);
+    if (ms != g_owned_last_sched.end()) {
+        g_owned_last_sched[new_pid] = ms->second;
+        g_owned_last_sched.erase(ms);
+    }
+    auto ic = g_owned_last_sched_insns.find(old_pid);
+    if (ic != g_owned_last_sched_insns.end()) {
+        g_owned_last_sched_insns[new_pid] = ic->second;
+        g_owned_last_sched_insns.erase(ic);
+    }
+    if (g_pinned_pid.load(std::memory_order_relaxed) == old_pid) {
+        g_pinned_pid.store(new_pid, std::memory_order_relaxed);
+    }
+    g_stats.pin_repins++;
+    /* Any raw address-space value the tracer is holding (an open
+     * excursion's entry value, an async snapshot, a recorded
+     * (thread-pointer, asid) pair) may now name whoever inherited the old
+     * one, so retire the raw-value namespace generation. */
+    asid_identity_gen_bump("address-space name reassigned; pin re-bound");
+    return true;
+}
+
+
 /* Bytes hashed for a page's content signature.  Page-bounded (< 4 KiB)
  * so the read never straddles into an unmapped successor page; 256
  * bytes of code discriminates any two distinct binaries at a shared
@@ -981,7 +1236,6 @@ static constexpr size_t PIN_SIG_BYTES = 256;
  * the lock.  0 when unpinned (user mode / no marker) — keeping user
  * traces byte-identical. */
 static std::atomic<uint64_t> g_pin_repr_sig{0};
-static uint64_t g_pin_repr_vpage = UINT64_MAX;   /* lowest learned code vpage */
 
 /*
  * Phase-2 ASID identity accessors for the body-stream emit path
@@ -1769,322 +2023,6 @@ static bool pin_page_sig(uint64_t vpage, uint64_t *sig_out)
 }
 
 
-/* Seed/refine the pinned space's representative content signature from the
- * code page based at @pc in the CURRENT address space, adopting it only
- * when its vpage is the lowest seen so far (so the representative converges
- * on the text-segment start page — deterministic and stable).  Used for
- * the wide-register pins that learn no per-owner page map; the narrow-ASID
- * path seeds each OwnedProc's own signature at its marker instead.
- * Caller holds exec_lock (pin_page_sig's scratch buffer needs it). */
-static void pin_repr_seed(uint64_t pc)
-{
-    uint64_t vp = pc & PIN_PAGE_MASK;
-    if (vp >= g_pin_repr_vpage) {
-        return;
-    }
-    uint64_t sig;
-    if (!pin_page_sig(vp, &sig)) {
-        return;                 /* page unreadable now: seed on a later TB */
-    }
-    g_pin_repr_vpage = vp;
-    g_pin_repr_sig.store(sig, std::memory_order_relaxed);
-}
-
-/*
- * ROOT-REUSE GUARD, wide-register targets (x86 CR3 / AArch64 TTBR /
- * RISC-V SATP).
- *
- * A page-table root names a process only while that process is alive.  When
- * it exits, the kernel frees the root page and hands it to whoever asks for
- * one next — and address-space EQUALITY, which is all owned_contains_locked()
- * tests, cannot tell the successor from the process the marker pinned.  The
- * successor's user instructions were then counted on the traced process's
- * clock and written into the trace under its identity.
- *
- * The identity that survives the reuse is the process's own USER CODE.  Each
- * owned root carries a small set of code-page anchors — {virtual page,
- * physical frame, content signature} — seeded from the marker's own page and
- * grown from the first few owned user TBs, and every committed write of that
- * root (a context-switch-rate event, never per TB) re-walks them in the LIVE
- * address space:
- *
- *   frame still matches                     -> the same process   (decisive)
- *   frame moved but the bytes match         -> the same process, page
- *                                              re-faulted; refresh the frame
- *   the page is mapped and the bytes differ -> a DIFFERENT process holds this
- *                                              root                (decisive)
- *   the page is not mapped at all           -> unresolvable this time
- *
- * A decisive foreign verdict retires the root exactly as its END marker would
- * (see pin_root_reuse_close), so the successor's blocks never reach the trace.
- * An unresolvable one changes nothing: a live process whose text was reclaimed
- * must not lose its window, so the guard fails OPEN and says so
- * (pin_root_anchor_unresolved).  What that costs is named in
- * docs/limitations.rst: a successor that maps NONE of the anchors' virtual
- * pages is invisible to the walk, and a successor running byte-identical code
- * at the same virtual address — a second instance of the same binary, or a
- * fork — is indistinguishable BY CONSTRUCTION, because its user code really is
- * the same code.
- *
- * The narrow-ASID targets (MIPS, g_pin_reuse_guard) do not use this: an 8-bit
- * EntryHi.ASID cannot name a process at all, so there the page map IS the
- * identity and is consulted on every dwell (see OwnedProc / pin_map_probe_
- * owners).  This is that machinery reduced to what a real per-process root
- * needs — a check at the one moment the root can change hands.
- */
-static constexpr uint32_t CST_PIN_ANCHORS = 16;
-struct OwnedAnchor {
-    uint64_t vpage[CST_PIN_ANCHORS];
-    uint64_t ppage[CST_PIN_ANCHORS];
-    uint64_t sig[CST_PIN_ANCHORS];
-    uint32_t n = 0;
-};
-/* root -> its anchors.  Guarded by exec_lock, like g_owned; immortal (see
- * "Immortal process-wide aggregates" in docs/architecture.rst). */
-static std::unordered_map<uint64_t, OwnedAnchor> &g_owned_anchor =
-    *new std::unordered_map<uint64_t, OwnedAnchor>();
-/* Number of owned roots still short of CST_PIN_ANCHORS anchors.  The heavy
- * step tests this ONE relaxed load per owned user TB and only takes the map
- * while it is non-zero, so anchor growth costs nothing once each window has
- * learned its pages. */
-static std::atomic<uint32_t> g_anchor_learn_want{0};
-
-/*
- * Per-vCPU dwell verdict for the wide path.  A switch settles the question
- * once; every TB of that dwell then costs two relaxed loads.  The dwell is
- * reset by asid_write_track_cb — the same event that ends it — so a root
- * that changes hands is always re-judged.
- */
-enum { PIN_DWELL_UNKNOWN = 0, PIN_DWELL_SAME = 1, PIN_DWELL_FOREIGN = 2 };
-struct PinWideDwell {
-    std::atomic<uint64_t> root{CST_ASID_UNPINNED};
-    std::atomic<uint8_t>  state{PIN_DWELL_UNKNOWN};
-};
-static PinWideDwell g_pin_wide[CST_PIN_MAX_VCPUS];
-
-/* Roots the per-TB dwell check proved foreign.  Retiring a window is a
- * segment-level act with an exit(0) contract, so it is performed by the
- * ASID-write hook (which owns that contract) at the next switch; the TBs
- * themselves are already excluded the moment the verdict is reached.
- * Guarded by exec_lock. */
-static std::unordered_set<uint64_t> &g_pin_condemned =
-    *new std::unordered_set<uint64_t>();
-
-
-/* Directed control (diagnostic, off by default): CST_REUSE_NO_VERIFY=1
- * refuses the walk, i.e. the pre-guard behaviour where a recycled root is
- * indistinguishable from the original.  It is the negative arm of the
- * reuse acceptance run, and the only thing that turns the guard off. */
-static bool pin_reuse_verify_disabled(void)
-{
-    static int v = -1;
-    if (v < 0) {
-        v = getenv("CST_REUSE_NO_VERIFY") ? 1 : 0;
-    }
-    return v != 0;
-}
-
-/* CST_REUSEDIAG=<n>: log the first @n anchor verdicts.  Diagnostic only. */
-static int pin_reuse_diag(void)
-{
-    static int v = -1;
-    if (v < 0) {
-        const char *e = getenv("CST_REUSEDIAG");
-        v = e ? atoi(e) : 0;
-    }
-    return v;
-}
-static int g_reusediag_printed;          /* exec_lock */
-
-/* Record @pc's code page as an anchor of @root, if it is not one already and
- * @root has room.  Only a page that is live-translated AND readable becomes
- * an anchor — an anchor that cannot be evaluated is worse than none.  Caller
- * holds exec_lock (pin_page_sig's scratch buffer). */
-static void pin_anchor_add(uint64_t root, uint64_t pc)
-{
-    if (root == 0) {
-        return;
-    }
-    OwnedAnchor &a = g_owned_anchor[root];
-    if (a.n >= CST_PIN_ANCHORS) {
-        return;
-    }
-    uint64_t vp = pc & PIN_PAGE_MASK;
-    for (uint32_t i = 0; i < a.n; i++) {
-        if (a.vpage[i] == vp) {
-            return;
-        }
-    }
-    uint64_t pa, sig;
-    if (!qemu_plugin_vaddr_to_paddr(vp, &pa) || !pin_page_sig(vp, &sig)) {
-        return;                 /* not resident now: learn on a later TB */
-    }
-    a.vpage[a.n] = vp;
-    a.ppage[a.n] = pa & PIN_PAGE_MASK;
-    a.sig[a.n]   = sig;
-    a.n++;
-    g_stats.pin_root_anchors++;
-    if (a.n >= CST_PIN_ANCHORS && g_anchor_learn_want.load(
-            std::memory_order_relaxed) > 0) {
-        g_anchor_learn_want.fetch_sub(1, std::memory_order_relaxed);
-    }
-}
-
-/* Drop @root's anchors (its window closed).  Caller holds exec_lock. */
-static void pin_anchor_forget(uint64_t root)
-{
-    auto it = g_owned_anchor.find(root);
-    if (it == g_owned_anchor.end()) {
-        return;
-    }
-    if (it->second.n < CST_PIN_ANCHORS &&
-        g_anchor_learn_want.load(std::memory_order_relaxed) > 0) {
-        g_anchor_learn_want.fetch_sub(1, std::memory_order_relaxed);
-    }
-    g_owned_anchor.erase(it);
-}
-
-/* Seed @root's anchor set from the marker's own code page and open its
- * learning budget.  Caller holds exec_lock. */
-static void pin_anchor_seed(uint64_t root, uint64_t pc)
-{
-    if (root == 0) {
-        return;
-    }
-    /* A re-pin re-seeds from scratch.  Going through forget() keeps the
-     * learning budget balanced: seeding a root that was already learning
-     * would otherwise leave the counter permanently above zero and make the
-     * heavy step take the anchor map on every owned user TB forever. */
-    pin_anchor_forget(root);
-    g_anchor_learn_want.fetch_add(1, std::memory_order_relaxed);
-    pin_anchor_add(root, pc);
-    g_pin_condemned.erase(root);
-    for (unsigned i = 0; i < CST_PIN_MAX_VCPUS; i++) {
-        g_pin_wide[i].state.store(PIN_DWELL_UNKNOWN, std::memory_order_relaxed);
-    }
-}
-
-enum PinAnchorVerdict {
-    PIN_ANCHOR_SAME,        /* an anchor resolved to this process */
-    PIN_ANCHOR_FOREIGN,     /* an anchor is mapped here with other bytes */
-    PIN_ANCHOR_UNRESOLVED,  /* no anchor could be evaluated */
-};
-
-/* Walk @root's anchors in the CURRENT address space.  One match is enough
- * (a foreign process would have to reproduce the pinned process's exact page
- * at its exact virtual address), so the first decisive hit wins; a mismatch
- * is only believed when NO anchor matched.  Caller holds exec_lock and is on
- * a vCPU thread, so the guest read walks the live page tables. */
-static PinAnchorVerdict pin_anchor_walk(uint64_t root)
-{
-    auto it = g_owned_anchor.find(root);
-    if (it == g_owned_anchor.end() || it->second.n == 0) {
-        return PIN_ANCHOR_UNRESOLVED;
-    }
-    OwnedAnchor &a = it->second;
-    bool foreign = false;
-    for (uint32_t i = 0; i < a.n; i++) {
-        uint64_t pa;
-        if (!qemu_plugin_vaddr_to_paddr(a.vpage[i], &pa)) {
-            continue;                    /* not mapped here: says nothing */
-        }
-        pa &= PIN_PAGE_MASK;
-        if (pa == a.ppage[i]) {
-            return PIN_ANCHOR_SAME;      /* same frame: decisive */
-        }
-        uint64_t sig;
-        if (!pin_page_sig(a.vpage[i], &sig)) {
-            continue;                    /* mapped but unreadable */
-        }
-        if (sig == a.sig[i]) {
-            a.ppage[i] = pa;             /* re-faulted: refresh the frame */
-            g_stats.pin_refault_repaired++;
-            return PIN_ANCHOR_SAME;
-        }
-        foreign = true;                  /* other bytes here — keep looking */
-    }
-    return foreign ? PIN_ANCHOR_FOREIGN : PIN_ANCHOR_UNRESOLVED;
-}
-
-/* Judge @pc's own code page against @root's anchors.  The executing page is
- * resident by construction, so this is the one probe that always resolves —
- * when the page is an anchor at all.  Caller holds exec_lock. */
-static PinAnchorVerdict pin_anchor_probe_pc(uint64_t root, uint64_t pc)
-{
-    auto it = g_owned_anchor.find(root);
-    if (it == g_owned_anchor.end()) {
-        return PIN_ANCHOR_UNRESOLVED;
-    }
-    OwnedAnchor &a = it->second;
-    uint64_t vp = pc & PIN_PAGE_MASK;
-    for (uint32_t i = 0; i < a.n; i++) {
-        if (a.vpage[i] != vp) {
-            continue;
-        }
-        uint64_t pa;
-        if (!qemu_plugin_vaddr_to_paddr(vp, &pa)) {
-            return PIN_ANCHOR_UNRESOLVED;
-        }
-        pa &= PIN_PAGE_MASK;
-        if (pa == a.ppage[i]) {
-            return PIN_ANCHOR_SAME;
-        }
-        uint64_t sig;
-        if (!pin_page_sig(vp, &sig)) {
-            return PIN_ANCHOR_UNRESOLVED;
-        }
-        if (sig == a.sig[i]) {
-            a.ppage[i] = pa;
-            g_stats.pin_refault_repaired++;
-            return PIN_ANCHOR_SAME;
-        }
-        /* This process's code page, this virtual address, other bytes:
-         * a different program is running here. */
-        return PIN_ANCHOR_FOREIGN;
-    }
-    return PIN_ANCHOR_UNRESOLVED;   /* not an anchor page */
-}
-
-/* Retire a root whose process is provably gone, defined next to the
- * dead-latch sweep it shares its close with.  Returns true if the caller
- * should exit(0). */
-static bool pin_root_reuse_close(uint64_t root, unsigned int cpu_index);
-
-/* Re-verify @root at a committed address-space switch.  Caller holds
- * exec_lock; returns true if the caller should exit(0). */
-static bool pin_root_reuse_check(unsigned int cpu_index, uint64_t root)
-{
-    PinAnchorVerdict v = pin_anchor_walk(root);
-    if (pin_reuse_diag() && g_reusediag_printed < pin_reuse_diag()) {
-        g_reusediag_printed++;
-        fprintf(stderr, "[reuse] vcpu=%u root=0x%" PRIx64 " verdict=%s\n",
-                cpu_index, root,
-                v == PIN_ANCHOR_SAME ? "SAME"
-                : v == PIN_ANCHOR_FOREIGN ? "FOREIGN" : "UNRESOLVED");
-        fflush(stderr);
-    }
-    switch (v) {
-    case PIN_ANCHOR_SAME:
-        if (cpu_index < CST_PIN_MAX_VCPUS) {
-            g_pin_wide[cpu_index].state.store(PIN_DWELL_SAME,
-                                              std::memory_order_relaxed);
-        }
-        g_stats.pin_root_verified++;
-        return false;
-    case PIN_ANCHOR_UNRESOLVED:
-        g_stats.pin_root_anchor_unresolved++;
-        return false;
-    case PIN_ANCHOR_FOREIGN:
-        break;
-    }
-    g_stats.pin_root_reuse_detected++;
-    fprintf(stderr,
-            "champsim_tracer: page-table root 0x%" PRIx64 " was recycled — "
-            "its user code is a different process's; closing that window\n",
-            root);
-    return pin_root_reuse_close(root, cpu_index);
-}
-
 /* Compute a marker firing's stable wire anchor: @root_phys = the marker
  * code page's PHYSICAL page (a real, stable physical anchor that virtual
  * aliasing cannot forge and an EntryHi.ASID rollover cannot move — MIPS has
@@ -2117,288 +2055,45 @@ static void marker_anchor(uint64_t pc, uint64_t asid,
     }
 }
 
-/* Reset the owned-process set to a SINGLE owner and seat @cpu_index's dwell
- * onto it (the legacy single-pin re-seed: simpoint, user-mode marker, and
- * the FIRST system marker).  Every vCPU's dwell is cleared; the marker vCPU
- * is confirmed as owner 0.  @root_phys/@sig/@vpage are the owner's anchor
- * (marker_anchor()).  Caller holds exec_lock. */
-static void pin_owned_reset_single(uint64_t marker_asid, unsigned int cpu_index,
-                                   uint64_t root_phys, uint64_t sig,
-                                   uint64_t vpage)
-{
-    if (!g_owned_procs) {
-        g_owned_procs = new std::vector<OwnedProc>();
-    }
-    g_owned_procs->clear();
-    OwnedProc op;
-    op.root_phys = root_phys;
-    op.marker_sig = sig;
-    op.repr_vpage = vpage;
-    op.active = true;
-    op.last_sched_ms = deadlatch_now_ms();
-    g_owned_procs->push_back(std::move(op));
-    g_owned_procs_active = 1;
-    for (unsigned i = 0; i < CST_PIN_MAX_VCPUS; i++) {
-        g_pin_vcpu[i].asid.store(CST_ASID_UNPINNED, std::memory_order_relaxed);
-        g_pin_vcpu[i].confirmed.store(false, std::memory_order_relaxed);
-        g_pin_vcpu[i].owner.store(-1, std::memory_order_relaxed);
-    }
-    if (cpu_index < CST_PIN_MAX_VCPUS) {
-        g_pin_vcpu[cpu_index].asid.store(marker_asid,
-                                         std::memory_order_relaxed);
-        g_pin_vcpu[cpu_index].owner.store(0, std::memory_order_relaxed);
-        g_pin_vcpu[cpu_index].confirmed.store(true, std::memory_order_relaxed);
-    }
-}
-
-/* Append a NEW owned process (an additional system marker while the segment
- * is already open) and seat @cpu_index's dwell onto it.  Returns the new
- * owner index.  Caller holds exec_lock. */
-static int pin_owned_append(uint64_t marker_asid, unsigned int cpu_index,
-                            uint64_t root_phys, uint64_t sig, uint64_t vpage)
-{
-    if (!g_owned_procs) {
-        g_owned_procs = new std::vector<OwnedProc>();
-    }
-    OwnedProc op;
-    op.root_phys = root_phys;
-    op.marker_sig = sig;
-    op.repr_vpage = vpage;
-    op.active = true;
-    op.last_sched_ms = deadlatch_now_ms();
-    int idx = (int)g_owned_procs->size();
-    g_owned_procs->push_back(std::move(op));
-    g_owned_procs_active++;
-    if (cpu_index < CST_PIN_MAX_VCPUS) {
-        g_pin_vcpu[cpu_index].asid.store(marker_asid,
-                                         std::memory_order_relaxed);
-        g_pin_vcpu[cpu_index].owner.store(idx, std::memory_order_relaxed);
-        g_pin_vcpu[cpu_index].confirmed.store(true, std::memory_order_relaxed);
-    }
-    return idx;
-}
-
-/* Learn the current translation of @pc into owner @oi's page map (no-op when
- * already mapped, so the confirmed-dwell hot path is one hash lookup; the
- * translation and content signature are taken only on insert).  Caller holds
- * exec_lock and has established the executing context is owner @oi at user
- * privilege. */
-static void pin_map_learn(int oi, uint64_t pc)
-{
-    if (!g_owned_procs || oi < 0 || oi >= (int)g_owned_procs->size()) {
-        return;
-    }
-    OwnedProc &op = (*g_owned_procs)[oi];
-    uint64_t vp = pc & PIN_PAGE_MASK;
-    auto it = op.pages.find(vp);
-    if (it != op.pages.end()) {
-        return;
-    }
-    uint64_t pa;
-    if (!qemu_plugin_vaddr_to_paddr(pc, &pa)) {
-        return;                 /* no live translation: learn later */
-    }
-    uint64_t sig;
-    if (!pin_page_sig(vp, &sig)) {
-        return;                 /* page unreadable right now: learn later */
-    }
-    op.pages.emplace(vp, PinPage{pa & PIN_PAGE_MASK, sig});
-    op.repr_vpage = vp < op.repr_vpage ? vp : op.repr_vpage;
-    g_stats.pin_pages_mapped++;
-}
-
-/* Probe @pc against EVERY active owned process's page map (multi-ASID
- * Stage B3).  Returns the matching owner index on a hit, or -1.  @hint (a
- * vCPU's last-confirmed owner) is tried first for the O(1) common case.  On
- * no hit, *@mismatch is set when SOME owner had this vpage mapped with
- * differing bytes (a foreign process at a shared VA), cleared when the vpage
- * was simply unmapped in every owner (unknown).  Physical frame is the fast
- * path; on a frame mismatch the page's byte signature is the authority — a
- * re-faulted page (identical bytes, new frame) reads as a hit and its frame
- * is refreshed.  Caller holds exec_lock. */
-static int pin_map_probe_owners(uint64_t pc, int hint, bool *mismatch)
-{
-    *mismatch = false;
-    if (!g_owned_procs || g_owned_procs->empty()) {
-        return -1;
-    }
-    uint64_t vp = pc & PIN_PAGE_MASK;
-    uint64_t pa;
-    if (!qemu_plugin_vaddr_to_paddr(pc, &pa)) {
-        return -1;              /* no live translation: unknown */
-    }
-    pa &= PIN_PAGE_MASK;
-    uint64_t sig = 0;
-    bool have_sig = false;
-    bool any_mapped = false;
-    auto test = [&](int oi) -> bool {
-        OwnedProc &op = (*g_owned_procs)[oi];
-        if (!op.active) {
-            return false;
-        }
-        auto it = op.pages.find(vp);
-        if (it == op.pages.end()) {
-            return false;       /* not this owner's code page */
-        }
-        if (pa == it->second.ppage) {
-            return true;        /* frame fast-path: no re-fault */
-        }
-        any_mapped = true;      /* mapped here but a different frame */
-        if (!have_sig) {
-            if (!pin_page_sig(vp, &sig)) {
-                return false;   /* cannot read to adjudicate */
-            }
-            have_sig = true;
-        }
-        if (sig == it->second.sig) {
-            it->second.ppage = pa;      /* re-faulted: refresh */
-            g_stats.pin_refault_repaired++;
-            return true;
-        }
-        return false;           /* different bytes here — try other owners */
-    };
-    int n = (int)g_owned_procs->size();
-    if (hint >= 0 && hint < n && test(hint)) {
-        return hint;
-    }
-    for (int oi = 0; oi < n; oi++) {
-        if (oi == hint) {
-            continue;
-        }
-        if (test(oi)) {
-            return oi;
-        }
-    }
-    /* No owner claimed this page.  A mapped-but-mismatched vpage means a
-     * foreign process is running different code at a shared VA; an unmapped
-     * vpage everywhere is merely unknown (not yet learned). */
-    *mismatch = any_mapped && have_sig;
-    return -1;
-}
-
 /*
- * Ownership of a user-privilege TB under an armed pin — the ONE rule
- * every consumer (user clock, foreign gate, kexc ownership seed,
- * stuck-window recovery, end marker) shares.  Wide-register targets:
- * the exact legacy equality against the marker-time value.  Narrow
- * targets: the dwell/verify/re-pin machinery above.  Caller holds
- * exec_lock; @pc is the executing TB's start.
+ * Ownership of a user-privilege TB under an armed pin — the ONE rule every
+ * consumer (user clock, foreign gate, kexc ownership seed, stuck-window
+ * recovery, end marker) shares.
+ *
+ * WE PIN ON A MARKER WITHIN AN ADDRESS SPACE, NOT A THREAD.  @live_pid is
+ * QEMU's opaque id for the address space this vCPU is translating through,
+ * and the TB is ours exactly when that space is in the owned set — so
+ * EVERY THREAD INSIDE AN OWNED ADDRESS SPACE IS TRACED, including one the
+ * trace has never seen before.  @live_tid only labels the strand and feeds
+ * the one re-bind rule.  Caller holds exec_lock.
  */
-static bool pin_user_tb_owned(unsigned int cpu_index, uint64_t live_asid,
-                              uint64_t pinned_asid, uint64_t pc)
+static bool pin_user_tb_owned(unsigned int cpu_index, uint64_t live_pid,
+                              uint64_t live_tid)
 {
-    if (!g_pin_reuse_guard) {
-        /* Wide-register (x86 CR3 / AArch64 TTBR / RISC-V SATP): owned iff
-         * the live root is a member of the owned set.  Single-process is a
-         * set of one { pinned_asid }, so this is byte-identical to the
-         * former `live_asid == pinned_asid`; multi-process (Stage B1) traces
-         * every process whose window is open.  Caller holds exec_lock, which
-         * every mutation of g_owned also holds. */
-        (void)pinned_asid;
-        if (!owned_contains_locked(live_asid)) {
-            return false;
+    bool owned = owned_contains_locked(live_pid);
+    if (!owned) {
+        owned = pin_rebind_locked(live_pid, live_tid);
+        if (owned && cpu_index < CST_PIN_MAX_VCPUS) {
+            qemu_plugin_u64_set(g_scoreboard.asid_match, cpu_index, 1);
+            g_pin_vcpu[cpu_index].confirmed.store(true,
+                                                  std::memory_order_relaxed);
         }
-        if (pin_reuse_verify_disabled() || cpu_index >= CST_PIN_MAX_VCPUS) {
-            return true;
-        }
-        /*
-         * ROOT-REUSE GUARD, per dwell.  The switch-time walk (see
-         * pin_root_reuse_check) can come back unresolved — the anchors were
-         * not mapped at that instant — and a successor handed this root
-         * would then run until the next switch.  The EXECUTING page always
-         * resolves, so the first TB of an unsettled dwell asks it, and the
-         * verdict is cached for the rest of the dwell: two relaxed loads per
-         * TB, no guest read.
-         */
-        PinWideDwell &d = g_pin_wide[cpu_index];
-        if (d.root.load(std::memory_order_relaxed) == live_asid) {
-            uint8_t st = d.state.load(std::memory_order_relaxed);
-            if (st == PIN_DWELL_SAME) {
-                return true;
-            }
-            if (st == PIN_DWELL_FOREIGN) {
-                g_stats.pin_root_foreign_dropped++;
-                return false;
-            }
-        }
-        /* Only the executing page is asked here — it is always resident, so
-         * this costs a scan of at most CST_PIN_ANCHORS virtual addresses and
-         * touches guest memory only when one of them matches.  The full walk
-         * belongs to the switch (pin_root_reuse_check), which runs once per
-         * schedule-in rather than once per TB. */
-        PinAnchorVerdict v = pin_anchor_probe_pc(live_asid, pc);
-        d.root.store(live_asid, std::memory_order_relaxed);
-        if (v == PIN_ANCHOR_SAME) {
-            d.state.store(PIN_DWELL_SAME, std::memory_order_relaxed);
-            g_stats.pin_root_verified++;
-            return true;
-        }
-        if (v == PIN_ANCHOR_FOREIGN) {
-            d.state.store(PIN_DWELL_FOREIGN, std::memory_order_relaxed);
-            g_stats.pin_root_reuse_detected++;
-            g_stats.pin_root_foreign_dropped++;
-            g_pin_condemned.insert(live_asid);
-            fprintf(stderr,
-                    "champsim_tracer: page-table root 0x%" PRIx64 " was "
-                    "recycled — user code at 0x%" PRIx64 " is a different "
-                    "process's; excluding it\n", live_asid, pc);
-            return false;
-        }
-        /* Unresolvable: a live process whose text was reclaimed must not
-         * lose its window, so the guard fails OPEN and says so.  Left
-         * UNKNOWN so the next TB asks again — the page it runs next may
-         * well be an anchor. */
-        g_stats.pin_root_anchor_unresolved++;
-        return true;
     }
-    if (cpu_index >= CST_PIN_MAX_VCPUS) {
+    if (cpu_index < CST_PIN_MAX_VCPUS) {
+        g_pin_vcpu[cpu_index].pid.store(owned ? live_pid : 0,
+                                        std::memory_order_relaxed);
+    }
+    if (!owned) {
+        /* Not an address space this trace owns.  This counter IS the drop
+         * path: a zero over a run with foreign execution in it means the
+         * check never ran. */
+        g_stats.pin_unverified_dropped++;
         return false;
     }
-    PinVcpuState &ps = g_pin_vcpu[cpu_index];
-    int ow = ps.owner.load(std::memory_order_relaxed);
-    if (ps.confirmed.load(std::memory_order_relaxed) && ow >= 0 &&
-        live_asid == ps.asid.load(std::memory_order_relaxed)) {
-        pin_map_learn(ow, pc);          /* grow the CONFIRMED owner's map */
-        return true;
-    }
-    /* Unconfirmed dwell: probe the executing code against EVERY owned
-     * process's map (last-confirmed owner first).  A hit confirms the dwell
-     * for THAT owner and attributes capture to it (Stage B3). */
-    bool mismatch = false;
-    int hit = pin_map_probe_owners(pc, ow, &mismatch);
-    if (hit >= 0) {
-        ps.owner.store(hit, std::memory_order_relaxed);
-        /* Dead-latch liveness: a re-confirmed dwell is this owner being
-         * scheduled in.  Stamped here (off the per-TB fast path, which
-         * short-circuits above on an already-confirmed dwell) so a live
-         * owner stays fresh while a dead one ages out. */
-        if (g_latch_timeout_ms && hit < (int)g_owned_procs->size()) {
-            (*g_owned_procs)[hit].last_sched_ms = deadlatch_now_ms();
-        }
-        if (live_asid != ps.asid.load(std::memory_order_relaxed)) {
-            ps.asid.store(live_asid, std::memory_order_relaxed);
-            qemu_plugin_u64_set(g_scoreboard.asid_match, cpu_index, 1);
-            g_stats.pin_repins++;
-            /* The pinned process's value MOVED while the process did not
-             * — the OS handed it a fresh ASID, which on a narrow space is
-             * exactly what a rollover does to every live process.  Bump the
-             * raw-value namespace generation: any value the tracer is
-             * holding (an open excursion's entry value, an async snapshot,
-             * a recorded (thread-pointer, asid) pair) may now name whoever
-             * inherited the old one.  This very TB re-seeds the owner under
-             * the new value. */
-            asid_identity_gen_bump("narrow-ASID dwell re-pin");
-        }
-        ps.confirmed.store(true, std::memory_order_relaxed);
-        return true;
-    }
-    if (mismatch) {
-        g_stats.pin_phys_mismatch_dropped++;
-    } else {
-        g_stats.pin_unverified_dropped++;
-    }
-    return false;
+    owned_note_thread(live_pid, live_tid);
+    return true;
 }
+
 
 /* The per-vCPU effective pin value: what kernel-TB attribution and the
  * asid_match flag compare against.  Narrow targets follow the vCPU's
@@ -2492,84 +2187,48 @@ static void asid_write_track_cb(unsigned int vcpu_index, uint64_t new_asid)
         g_stats.wp_session_on_cp++;
     }
     uint64_t pinned = g_pinned_asid.load(std::memory_order_relaxed);
-    uint64_t match;
-    if (g_pin_reuse_guard) {
-        /* Narrow-ASID (MIPS): the recycled EntryHi.ASID is compared against
-         * the vCPU's effective dwell tag, exactly as before (Stage B3 owns
-         * the narrow-ASID set generalization). */
-        match = new_asid == pin_effective_asid(vcpu_index, pinned) ? 1 : 0;
-    } else {
-        /* Wide-register: membership in the owned-ASID set.  Single-process
-         * is a set of one, so this is byte-identical to the former
-         * representative compare.  Off the per-TB hot path (fires per
-         * page-table-root write = per context switch), so taking exec_lock
-         * — the guard g_owned's mutations hold — is cheap and race-free. */
-        g_rec_mutex_lock(&exec_lock);
-        match = owned_contains_locked(new_asid) ? 1 : 0;
-        /*
-         * ROOT-REUSE GUARD.  This is the one moment a root can change hands:
-         * a switch INTO an owned address space is either the traced process
-         * being scheduled in, or the successor that inherited its freed root.
-         * Ask the process's own user code which (pin_anchor_walk).  Skipped
-         * on the wrong path exactly as the marker callbacks are — a
-         * speculative switch must never retire a window.
-         */
-        if (!pin_reuse_verify_disabled() && !qemu_plugin_in_spec_mode() &&
-            !g_wp_in_progress && g_trace_segments.is_active() &&
-            !g_trace_segments.is_shutting_down()) {
-            /* This switch ends whatever dwell this vCPU was in. */
-            if (vcpu_index < CST_PIN_MAX_VCPUS) {
-                g_pin_wide[vcpu_index].root.store(new_asid,
-                                                 std::memory_order_relaxed);
-                g_pin_wide[vcpu_index].state.store(PIN_DWELL_UNKNOWN,
-                                                  std::memory_order_relaxed);
-            }
-            bool quit = false;
-            /* Retire any root a per-TB dwell already proved foreign: the
-             * close has an exit(0) contract only this hook can honour. */
-            if (!g_pin_condemned.empty()) {
-                std::vector<uint64_t> cond(g_pin_condemned.begin(),
-                                           g_pin_condemned.end());
-                g_pin_condemned.clear();
-                for (uint64_t r : cond) {
-                    if (owned_contains_locked(r)) {
-                        quit |= pin_root_reuse_close(r, vcpu_index);
-                    }
-                }
-            }
-            if (!quit && match) {
-                quit = pin_root_reuse_check(vcpu_index, new_asid);
-            }
-            if (quit) {
-                g_rec_mutex_unlock(&exec_lock);
-                exit(0);
-            }
-            /* A retired root is no longer owned. */
-            match = owned_contains_locked(new_asid) ? 1 : 0;
-        }
-        g_rec_mutex_unlock(&exec_lock);
-    }
+    /*
+     * The address space this vCPU has just switched into, as QEMU's opaque
+     * process id.  The core samples the identity at this same commit point
+     * before calling us, so the id is already the NEW space.  Ownership is
+     * set membership and nothing else: off the per-TB hot path (this fires
+     * once per context switch), so taking exec_lock — the guard every
+     * mutation of g_owned holds — is cheap and race-free.
+     */
+    g_rec_mutex_lock(&exec_lock);
+    uint64_t pid = live_process_id();
+    uint64_t match = owned_contains_locked(pid) ? 1 : 0;
+    g_rec_mutex_unlock(&exec_lock);
     qemu_plugin_u64_set(g_scoreboard.asid_match, vcpu_index, match);
-    if (g_pin_reuse_guard && pinned != CST_ASID_UNPINNED) {
-        if (vcpu_index < CST_PIN_MAX_VCPUS) {
-            /* A committed ASID write ends the vCPU's verified dwell: the
-             * written value may have been handed to anyone, so the next
-             * user TB must re-probe the physical-page map before this
-             * context is traced again.  Dropping trace_this_ctx (and
-             * arming the probe) HERE, off the per-TB path, is exactly
-             * how the foreign span stops dispatching the heavy callback. */
-            g_pin_vcpu[vcpu_index].confirmed.store(
-                false, std::memory_order_relaxed);
-            refresh_ctx_gates(vcpu_index);
+    if (pinned != CST_ASID_UNPINNED && vcpu_index < CST_PIN_MAX_VCPUS) {
+        /* A committed address-space write is exactly when ownership can
+         * change, so the per-vCPU verdict (and the JIT-visible context
+         * gate it drives) is settled HERE, off the per-TB path.  A vCPU
+         * that switched into an unowned space stops dispatching the heavy
+         * callback and runs the light probe instead, which is where the
+         * re-bind rule gets its chance. */
+        g_pin_vcpu[vcpu_index].pid.store(match ? pid : 0,
+                                         std::memory_order_relaxed);
+        g_pin_vcpu[vcpu_index].confirmed.store(match != 0,
+                                               std::memory_order_relaxed);
+        if (match) {
+            g_pin_vcpu[vcpu_index].asid.store(new_asid,
+                                              std::memory_order_relaxed);
         }
-        pin_reuse_track(new_asid, pinned);
+        refresh_ctx_gates(vcpu_index);
+        if (g_pin_reuse_guard) {
+            /* Narrow-ASID rollover heuristic (stderr + a counter only; the
+             * ownership decision above does not consult it). */
+            pin_reuse_track(vcpu_index, new_asid, pinned);
+        }
     }
+
     /* Dead-latch detector: this hook is the one place every committed root
      * write is visible, so a live process's root passes through here at each
      * schedule-in.  Sweep the owned roots for one that has gone stale (its
      * process died without an END marker).  Off the per-TB hot path.  The
      * mode/policy gate lives inside (g_window_mode is declared below). */
-    if (g_latch_timeout_ms) {
+    if (deadlatch_configured()) {
         deadlatch_on_asid_write(vcpu_index, new_asid);
     }
 }
@@ -4201,13 +3860,12 @@ static void start_trace_segment(const char *label,
              * anchor (marker_anchor, not the recycled EntryHi.ASID) is the
              * process key; derive index 0 from it so the seed matches every
              * later user-TB attribution (seal path below). */
-            int ow = g_pin_reuse_guard ? g_pin_vcpu[cpu_index].owner.load(
-                                             std::memory_order_relaxed) : -1;
-            if (ow >= 0 && g_owned_procs && ow < (int)g_owned_procs->size() &&
-                (*g_owned_procs)[ow].active) {
-                const OwnedProc &op = (*g_owned_procs)[ow];
-                seed_asid_index = asid_root_to_index(op.root_phys,
-                                                     op.marker_sig);
+            const OwnedSpace *os = g_pin_reuse_guard
+                ? owned_info_locked(
+                      g_pin_vcpu[cpu_index].pid.load(std::memory_order_relaxed))
+                : nullptr;
+            if (os) {
+                seed_asid_index = asid_root_to_index(os->root_phys, os->sig);
             } else {
                 uint64_t seed_root = qemu_plugin_get_addr_space_id();
                 seed_asid_index = asid_root_to_index(
@@ -5362,21 +5020,36 @@ static void finish_trace_segment(bool prev_executed = true,
 }
 
 /* True when the dead-latch detector is armed: marker mode, per-process
- * latch policy (trace-all pins a single clock process by design), and a
- * non-zero timeout. */
+ * latch policy (trace-all pins a single clock process by design), and at
+ * least one of the two denominators (wall-clock timeout, idle instructions)
+ * given a non-zero threshold. */
 static inline bool deadlatch_enabled(void)
 {
-    return g_latch_timeout_ms != 0 &&
+    return deadlatch_configured() &&
            g_window_mode == PluginConfig::WIN_MARKER &&
            !marker_trace_all();
 }
 
-/* Close the segment when a dead-latch sweep empties the owned set — the
+/*
+ * Close the segment when a dead-latch sweep empties the owned set — the
  * whole-set backstop.  Mirrors the END marker's last-window close so the
- * trace finalises identically (audit rolls up to 100%).  Caller holds
- * exec_lock; returns true if the caller should exit(0). */
+ * trace finalises identically (audit rolls up to 100%).
+ *
+ * @by_insns says the closing sweep reaped at least one window on the
+ * INSTRUCTION denominator.  That close is then flagged IDLE rather than
+ * rendered as END: an idle close is a guess that a process is gone, and a
+ * reader must never mistake it for the process's own END marker actually
+ * having run.  "At least one", not "the last one", deliberately: g_owned is
+ * unordered, so which reap is last is arbitrary, and a close's reported
+ * reason must not depend on a container's iteration order.  (END always
+ * wins: this path is only ever reached with the owned set already empty,
+ * and the END handler drops its root before the sweep can see it.)
+ *
+ * Caller holds exec_lock; returns true if the caller should exit(0).
+ */
 static bool deadlatch_close_segment(uint64_t now, unsigned int cpu_index,
-                                    const char *why = "dead-latch")
+                                    const char *why = "dead-latch",
+                                    bool by_insns = false)
 {
     if (!g_trace_segments.is_active() ||
         g_trace_segments.is_shutting_down()) {
@@ -5389,9 +5062,76 @@ static bool deadlatch_close_segment(uint64_t now, unsigned int cpu_index,
     /* A dead process is a process that ended, so report a clean close
      * ("END") rather than an under-budget underrun. */
     g_seg_end_marker_close = true;
+    if (by_insns) {
+        g_seg_close_reason = "IDLE";
+    }
     finish_trace_segment(/* prev_executed= */ true, cpu_index);
     g_trace_segments.set_shutting_down();
     return true;
+}
+
+/* One root a sweep decided is dead, with both idle readings and which
+ * denominator crossed — carried out of the scan loop so the reaping
+ * (which mutates g_owned) does not run while g_owned is being iterated. */
+struct DeadRoot {
+    uint64_t root;
+    uint64_t idle_ms;
+    uint64_t idle_insns;
+    bool     by_insns;
+};
+
+/* Instructions the guest has retired globally since @root was last
+ * scheduled in.  A root with no instruction stamp yet (only reachable if
+ * the two maps ever fell out of lockstep) reads as zero idle — never as
+ * dead, which is the safe direction: a missing stamp must not reap a
+ * window.  Caller holds exec_lock. */
+static inline uint64_t deadlatch_idle_insns(uint64_t root, uint64_t now_insns)
+{
+    auto it = g_owned_last_sched_insns.find(root);
+    if (it == g_owned_last_sched_insns.end()) {
+        g_owned_last_sched_insns[root] = now_insns;
+        return 0;
+    }
+    return now_insns >= it->second ? now_insns - it->second : 0;
+}
+/* Count a reaped window against the denominator that reaped it, so the
+ * statistics report distinguishes a wall-clock close from an idle-insn
+ * one without anyone having to read stderr. */
+static inline void deadlatch_count_close(bool by_insns)
+{
+    if (by_insns) {
+        g_stats.dead_latch_closes_insns++;
+    } else {
+        g_stats.dead_latch_closes_ms++;
+    }
+}
+
+/*
+ * One reaped root's report line.  The "dead-latch close asid=0x..." prefix
+ * is the detector's public signature (the validator's causal subcheck
+ * matches on it and nothing else); what follows names WHICH denominator
+ * crossed and by how much, so an idle close is never mistaken for an END.
+ * The wall-clock rendering is byte-for-byte what it has always been.
+ */
+static void deadlatch_report_root(uint64_t root, uint64_t idle_ms,
+                                  uint64_t idle_insns, bool by_insns,
+                                  size_t still_tracing, uint64_t dropped)
+{
+    if (by_insns) {
+        fprintf(stderr,
+                "champsim_tracer: dead-latch close asid=0x%" PRIx64
+                " idle=%" PRIu64 " insns (latch_idle_insns=%" PRIu64
+                ", at arch_insns=%" PRIu64 ", wall idle %" PRIu64 " ms)"
+                " (%zu still tracing, dropped %" PRIu64 " dedup buckets)\n",
+                root, idle_insns, g_latch_idle_insns,
+                deadlatch_now_insns(), idle_ms, still_tracing, dropped);
+    } else {
+        fprintf(stderr,
+                "champsim_tracer: dead-latch close asid=0x%" PRIx64
+                " idle=%" PRIu64 " ms (%zu still tracing, dropped %" PRIu64
+                " dedup buckets)\n",
+                root, idle_ms, still_tracing, dropped);
+    }
 }
 
 /* Retire one owned root exactly as its END marker would: drop it from the
@@ -5403,16 +5143,28 @@ static uint64_t owned_retire_root_locked(uint64_t root)
 {
     g_owned.erase(root);
     g_owned_last_sched.erase(root);
-    pin_anchor_forget(root);
+    g_owned_last_sched_insns.erase(root);
+    uint64_t raw = root;
+    auto oit = g_owned_info.find(root);
+    if (oit != g_owned_info.end()) {
+        raw = oit->second.raw_asid;
+        g_owned_info.erase(oit);
+    }
     g_mutex_lock(&data_lock);
-    uint64_t dropped = g_template_store.reclaim_asid(root);
+    uint64_t dropped = g_template_store.reclaim_asid(raw);
     g_mutex_unlock(&data_lock);
-    /* If the retired root was the representative, repoint it to a
-     * still-owned root so pin_effective_asid / cst_pinned_asid_root
-     * stay valid. */
-    if (g_pinned_asid.load(std::memory_order_relaxed) == root &&
+    /* If the retired space was the representative, repoint it to a
+     * still-owned one so cst_pinned_asid_root and the effective-pin
+     * compare stay valid. */
+    if (g_pinned_pid.load(std::memory_order_relaxed) == root &&
         !g_owned.empty()) {
-        g_pinned_asid.store(*g_owned.begin(), std::memory_order_relaxed);
+        uint64_t heir = *g_owned.begin();
+        g_pinned_pid.store(heir, std::memory_order_relaxed);
+        auto hit = g_owned_info.find(heir);
+        if (hit != g_owned_info.end()) {
+            g_pinned_asid.store(hit->second.raw_asid,
+                                std::memory_order_relaxed);
+        }
     }
     return dropped;
 }
@@ -5424,112 +5176,78 @@ static uint64_t owned_retire_root_locked(uint64_t root)
  * close the segment if that was the last one.  Caller holds exec_lock;
  * returns true if the caller should exit(0).
  */
-static bool deadlatch_sweep_wide(uint64_t now, unsigned int cpu_index)
+static bool deadlatch_sweep_wide(uint64_t now, uint64_t now_insns,
+                                 unsigned int cpu_index)
 {
     if (g_owned.empty()) {
         return false;
     }
-    std::vector<std::pair<uint64_t, uint64_t>> dead;   /* {root, idle_ms} */
+    /* {root, idle_ms, idle_insns, crossed on the instruction denominator} */
+    std::vector<DeadRoot> dead;
     for (uint64_t root : g_owned) {
         auto it = g_owned_last_sched.find(root);
         if (it == g_owned_last_sched.end()) {
             g_owned_last_sched[root] = now;     /* first sighting: not stale */
+            g_owned_last_sched_insns[root] = now_insns;
             continue;
         }
         uint64_t idle = now - it->second;
-        if (idle >= g_latch_timeout_ms) {
-            dead.emplace_back(root, idle);
+        uint64_t idle_insns = deadlatch_idle_insns(root, now_insns);
+        bool by_insns = false;
+        if (deadlatch_root_is_dead(idle, idle_insns, &by_insns)) {
+            dead.push_back({root, idle, idle_insns, by_insns});
         }
     }
+    bool any_by_insns = false;
     for (const auto &d : dead) {
-        uint64_t root = d.first;
-        uint64_t dropped = owned_retire_root_locked(root);
-        fprintf(stderr,
-                "champsim_tracer: dead-latch close asid=0x%" PRIx64
-                " idle=%" PRIu64 " ms (%zu still tracing, dropped %" PRIu64
-                " dedup buckets)\n", root, d.second, g_owned.size(), dropped);
+        uint64_t raw = owned_raw_asid_locked(d.root);
+        uint64_t dropped = owned_retire_root_locked(d.root);
+        deadlatch_report_root(raw, d.idle_ms, d.idle_insns, d.by_insns,
+                              g_owned.size(), dropped);
+        deadlatch_count_close(d.by_insns);
+        any_by_insns |= d.by_insns;
     }
     if (!dead.empty() && g_owned.empty()) {
-        return deadlatch_close_segment(now, cpu_index);
+        return deadlatch_close_segment(now, cpu_index, "dead-latch",
+                                       any_by_insns);
     }
     return false;
 }
 
 /*
- * Retire a root the reuse guard proved recycled (pin_root_reuse_check).  The
- * process that owned it has ended — the address space now holds someone
- * else's code — so this is a real END, closed by the same path the dead-latch
- * sweep and the END marker use.  Caller holds exec_lock; returns true if the
- * caller should exit(0).
+ * Retire the pinned window when the architectural address-space NAME it was
+ * pinned to has demonstrably been handed out again (pin_reuse_track) and the
+ * CPU model names no thread to re-bind the pin against.  Closed exactly as a
+ * dead-latch close does, so the trace is finalised rather than abandoned.
+ * Called from the ASID-write hook, off the per-TB path and without
+ * exec_lock.
  */
-static bool pin_root_reuse_close(uint64_t root, unsigned int cpu_index)
+static void pin_unbindable_rollover_close(unsigned int vcpu_index)
 {
-    uint64_t dropped = owned_retire_root_locked(root);
-    fprintf(stderr,
-            "champsim_tracer: root-reuse close asid=0x%" PRIx64
-            " (%zu still tracing, dropped %" PRIu64 " dedup buckets)\n",
-            root, g_owned.size(), dropped);
-    if (!g_owned.empty()) {
-        return false;
+    if (qemu_plugin_in_spec_mode() || g_wp_in_progress) {
+        return;
     }
-    return deadlatch_close_segment(deadlatch_now_ms(), cpu_index,
-                                  "root-reuse");
-}
-
-/*
- * Narrow-ASID staleness sweep (MIPS system mode).  An owner's liveness is
- * its last confirmed physical-page dwell (stamped in pin_user_tb_owned) —
- * an EntryHi.ASID value cannot name a process.  An owner currently
- * confirmed on some vCPU is running now, so refresh it and never close it;
- * otherwise close it if its last dwell is older than the timeout.  Caller
- * holds exec_lock; returns true if the caller should exit(0).
- */
-static bool deadlatch_sweep_narrow(uint64_t now, unsigned int cpu_index)
-{
-    if (!g_owned_procs || g_owned_procs_active <= 0) {
-        return false;
+    g_rec_mutex_lock(&exec_lock);
+    bool do_exit = false;
+    if (g_trace_segments.is_active() && !g_trace_segments.is_shutting_down() &&
+        !g_owned.empty()) {
+        std::vector<uint64_t> all(g_owned.begin(), g_owned.end());
+        for (uint64_t pid : all) {
+            uint64_t dropped = owned_retire_root_locked(pid);
+            fprintf(stderr,
+                    "champsim_tracer: address-space name reassigned and this "
+                    "CPU model names no thread to re-bind against — retiring "
+                    "the window (space id %" PRIu64 ", dropped %" PRIu64
+                    " dedup buckets)\n", pid, dropped);
+        }
+        g_stats.pin_unbindable_rollover_closes++;
+        do_exit = deadlatch_close_segment(deadlatch_now_ms(), vcpu_index,
+                                          "address-space name reassigned");
     }
-    int n = (int)g_owned_procs->size();
-    for (int oi = 0; oi < n; oi++) {
-        OwnedProc &op = (*g_owned_procs)[oi];
-        if (!op.active) {
-            continue;
-        }
-        /* A vCPU whose confirmed dwell is this owner is executing it right
-         * now (covers a long-running owner on an SMP peer while another
-         * vCPU's writes drive this sweep). */
-        bool live_now = false;
-        unsigned nv = (unsigned)qemu_plugin_num_vcpus();
-        if (nv > CST_PIN_MAX_VCPUS) {
-            nv = CST_PIN_MAX_VCPUS;
-        }
-        for (unsigned v = 0; v < nv; v++) {
-            if (g_pin_vcpu[v].confirmed.load(std::memory_order_relaxed) &&
-                g_pin_vcpu[v].owner.load(std::memory_order_relaxed) == oi) {
-                live_now = true;
-                break;
-            }
-        }
-        if (live_now) {
-            op.last_sched_ms = now;
-            continue;
-        }
-        uint64_t idle = now - op.last_sched_ms;
-        if (idle < g_latch_timeout_ms) {
-            continue;
-        }
-        op.active = false;
-        op.pages.clear();               /* free — never probed again */
-        g_owned_procs_active--;
-        fprintf(stderr,
-                "champsim_tracer: dead-latch close narrow owner %d "
-                "root_phys=0x%" PRIx64 " idle=%" PRIu64 " ms (%d still "
-                "tracing)\n", oi, op.root_phys, idle, g_owned_procs_active);
+    g_rec_mutex_unlock(&exec_lock);
+    if (do_exit) {
+        exit(0);
     }
-    if (g_owned_procs_active == 0) {
-        return deadlatch_close_segment(now, cpu_index);
-    }
-    return false;
 }
 
 /*
@@ -5556,14 +5274,13 @@ static void deadlatch_on_asid_write(unsigned int vcpu_index, uint64_t new_asid)
     if (g_trace_segments.is_active() &&
         !g_trace_segments.is_shutting_down()) {
         uint64_t now = deadlatch_now_ms();
-        if (g_pin_reuse_guard) {
-            do_exit = deadlatch_sweep_narrow(now, vcpu_index);
-        } else {
-            if (owned_contains_locked(new_asid)) {
-                g_owned_last_sched[new_asid] = now;   /* live: schedule-in */
-            }
-            do_exit = deadlatch_sweep_wide(now, vcpu_index);
+        uint64_t now_insns = deadlatch_now_insns();
+        uint64_t pid = live_process_id();
+        if (owned_contains_locked(pid)) {
+            g_owned_last_sched[pid] = now;            /* live: schedule-in */
+            g_owned_last_sched_insns[pid] = now_insns;
         }
+        do_exit = deadlatch_sweep_wide(now, now_insns, vcpu_index);
     }
     g_rec_mutex_unlock(&exec_lock);
     if (do_exit) {
@@ -5579,90 +5296,47 @@ static void deadlatch_on_asid_write(unsigned int vcpu_index, uint64_t new_asid)
  * whose process died mid-window without an END marker).  The running window
  * is never closed here, so the owned set cannot empty on this path — the
  * whole-set/last-window backstop lives on the ASID-write path.  Caller
- * holds exec_lock; @live_asid is the executing root (wide targets),
- * @cpu_index identifies the confirmed owner (narrow targets).
+ * holds exec_lock; @live_pid is the owned address space executing now.
  */
-static void deadlatch_clock_check(unsigned int cpu_index, uint64_t live_asid)
+static void deadlatch_clock_check(unsigned int cpu_index, uint64_t live_pid)
 {
+    (void)cpu_index;
     if (!deadlatch_enabled()) {
         return;
     }
     uint64_t now = deadlatch_now_ms();
-    if (g_pin_reuse_guard) {
-        if (!g_owned_procs) {
-            return;
-        }
-        int cur = (cpu_index < CST_PIN_MAX_VCPUS)
-            ? g_pin_vcpu[cpu_index].owner.load(std::memory_order_relaxed) : -1;
-        int n = (int)g_owned_procs->size();
-        if (cur >= 0 && cur < n) {
-            (*g_owned_procs)[cur].last_sched_ms = now;   /* running: fresh */
-        }
-        unsigned nv = (unsigned)qemu_plugin_num_vcpus();
-        if (nv > CST_PIN_MAX_VCPUS) {
-            nv = CST_PIN_MAX_VCPUS;
-        }
-        for (int oi = 0; oi < n; oi++) {
-            if (oi == cur) {
-                continue;
-            }
-            OwnedProc &op = (*g_owned_procs)[oi];
-            if (!op.active) {
-                continue;
-            }
-            bool live_now = false;
-            for (unsigned v = 0; v < nv; v++) {
-                if (g_pin_vcpu[v].confirmed.load(std::memory_order_relaxed) &&
-                    g_pin_vcpu[v].owner.load(std::memory_order_relaxed) == oi) {
-                    live_now = true;
-                    break;
-                }
-            }
-            if (live_now) {
-                op.last_sched_ms = now;
-                continue;
-            }
-            uint64_t idle = now - op.last_sched_ms;
-            if (idle < g_latch_timeout_ms) {
-                continue;
-            }
-            op.active = false;
-            op.pages.clear();
-            g_owned_procs_active--;
-            fprintf(stderr,
-                    "champsim_tracer: dead-latch close narrow owner %d "
-                    "root_phys=0x%" PRIx64 " idle=%" PRIu64 " ms (%d still "
-                    "tracing)\n", oi, op.root_phys, idle, g_owned_procs_active);
-        }
-        return;
+    uint64_t now_insns = deadlatch_now_insns();
+    if (owned_contains_locked(live_pid)) {
+        g_owned_last_sched[live_pid] = now;               /* running: fresh */
+        g_owned_last_sched_insns[live_pid] = now_insns;
     }
-    if (owned_contains_locked(live_asid)) {
-        g_owned_last_sched[live_asid] = now;             /* running: fresh */
-    }
-    std::vector<std::pair<uint64_t, uint64_t>> dead;
+    std::vector<DeadRoot> dead;
     for (uint64_t root : g_owned) {
-        if (root == live_asid) {
+        if (root == live_pid) {
             continue;
         }
         auto it = g_owned_last_sched.find(root);
         if (it == g_owned_last_sched.end()) {
             g_owned_last_sched[root] = now;
+            g_owned_last_sched_insns[root] = now_insns;
             continue;
         }
         uint64_t idle = now - it->second;
-        if (idle >= g_latch_timeout_ms) {
-            dead.emplace_back(root, idle);
+        uint64_t idle_insns = deadlatch_idle_insns(root, now_insns);
+        bool by_insns = false;
+        if (deadlatch_root_is_dead(idle, idle_insns, &by_insns)) {
+            dead.push_back({root, idle, idle_insns, by_insns});
         }
     }
     for (const auto &d : dead) {
-        uint64_t root = d.first;
-        uint64_t dropped = owned_retire_root_locked(root);
-        fprintf(stderr,
-                "champsim_tracer: dead-latch close asid=0x%" PRIx64
-                " idle=%" PRIu64 " ms (%zu still tracing, dropped %" PRIu64
-                " dedup buckets)\n", root, d.second, g_owned.size(), dropped);
+        uint64_t raw = owned_raw_asid_locked(d.root);
+        uint64_t dropped = owned_retire_root_locked(d.root);
+        deadlatch_report_root(raw, d.idle_ms, d.idle_insns, d.by_insns,
+                              g_owned.size(), dropped);
+        deadlatch_count_close(d.by_insns);
     }
 }
+
 
 /* ========================= Execution callback ========================= */
 
@@ -6767,6 +6441,23 @@ static void run_deferred_window_closes(PathBuilder &pb, unsigned int cpu_index,
     }
 }
 
+/* Live queue-length high-water across every vCPU, read from QEMU.  Used by
+ * the heartbeat so the bound is observable DURING a run — a cell killed by a
+ * timeout never reaches plugin_exit, and an invariant that can only be read
+ * from a clean shutdown is unobservable exactly where it matters. */
+static inline uint64_t fence_evq_qmax(void)
+{
+    uint64_t peak = 0;
+    for (int i = 0, n = qemu_plugin_num_vcpus(); i < n; i++) {
+        uint64_t ml = 0;
+        qemu_plugin_cpu_events_stats((unsigned)i, &ml, nullptr, nullptr);
+        if (ml > peak) {
+            peak = ml;
+        }
+    }
+    return peak;
+}
+
 /*
  * Fence-lane heartbeat (CST_FENCE_DIAG only).  Runs on the correct-path TB
  * step, so it observes exactly the state a real END-marker execution would:
@@ -6809,7 +6500,10 @@ static void fence_diag_tick(unsigned int cpu_index, uint64_t icount_prev,
             " | end_cb=%" PRIu64 " cp=%" PRIu64 " fenced=%" PRIu64
             " fenced_user=%" PRIu64 " start_cb=%" PRIu64 "/%" PRIu64
             " | flags spec=%d wp=%d sess=%d"
-            " | susp_u=%" PRIu64 " foreign_u=%" PRIu64 "\n",
+            " | susp_u=%" PRIu64 " foreign_u=%" PRIu64
+            " | evq qmax=%" PRIu64 " batch=%" PRIu64 " gap=%" PRIu64
+            " big=%" PRIu64 " absorb=%" PRIu64 "/%" PRIu64
+            " drains=%" PRIu64 "\n",
             ms, seg_active ? 1 : 0, uic, uic - last_uic, icnt,
             icnt - last_icnt,
             dt > 0 ? (double)(icnt - last_icnt) / dt / 1e6 : 0.0,
@@ -6820,7 +6514,10 @@ static void fence_diag_tick(unsigned int cpu_index, uint64_t icount_prev,
             g_fdiag_end_fenced_user, g_fdiag_start_fenced,
             g_fdiag_start_total,
             f_spec ? 1 : 0, f_wp ? 1 : 0, f_sess ? 1 : 0,
-            tls_mkdiag_susp_user, tls_mkdiag_foreign_user);
+            tls_mkdiag_susp_user, tls_mkdiag_foreign_user,
+            fence_evq_qmax(), g_stats.evq_batch_peak, g_stats.evq_gap_peak,
+            g_stats.evq_bigdrains, g_stats.evq_absorb_calls,
+            g_stats.evq_absorb_events, g_stats.evq_drain_calls);
     fence_flush_end_ring();
     last_icnt = icnt;
     last_uic = uic;
@@ -6895,6 +6592,66 @@ static void user_clock_stall_any_check(unsigned int cpu_index,
     g_trace_segments.set_shutting_down();
     g_rec_mutex_unlock(&exec_lock);
     exit(0);
+}
+
+/*
+ * Drain instrument, shared by BOTH drain sites.  Records the batch size and
+ * the guest-instruction distance from the previous drain call on this vCPU,
+ * and shouts if a single drain ever exceeds one translation block's worth of
+ * events -- the "BIGDRAIN" condition, which is the work-per-guest-instruction
+ * invariant being violated: every event in an oversized batch is O(n) work
+ * charged to the one guest instruction whose TB happened to dispatch.
+ *
+ * Caller holds no lock; the arrays are per-vCPU and touched only by their own
+ * vCPU thread, and the g_stats fields are monotone maxima whose worst case
+ * under a benign SMP race is a lost update of a smaller value.
+ */
+static inline void evq_note_drain(unsigned int cpu_index, size_t n_evs,
+                                  uint64_t icount)
+{
+    static uint64_t last_ic[CST_PIN_MAX_VCPUS];
+    unsigned sl = cpu_index < CST_PIN_MAX_VCPUS ? cpu_index : 0;
+    uint64_t gap = icount - last_ic[sl];
+    last_ic[sl] = icount;
+
+    g_stats.evq_drain_calls++;
+    g_stats.evq_drain_events += n_evs;
+    if (n_evs) {
+        /* Latch the QUEUE-SIDE high-water mark here, and only here.
+         *
+         * Reading it once at plugin_exit is not good enough and silently
+         * reads ZERO in system mode: the exit callback runs from atexit(3),
+         * after qemu_cleanup() has torn the machine down, where
+         * qemu_get_cpu() no longer resolves — a witness that reports 0
+         * because it could not find its subject is a false success, not a
+         * bound.  A SIGKILLed run never reaches an exit hook at all.
+         *
+         * Sampling on every NON-EMPTY drain is exact, and it is exact
+         * because of the fix itself: q->max_len can only rise at a push,
+         * every push sets the pending flag, and the pending flag makes the
+         * very next TB entry drain a non-empty queue.  So no increase can
+         * escape between two consecutive samples.  Empty drains — the
+         * overwhelming majority — pay nothing. */
+        uint64_t ml = 0, np = 0, nd = 0;
+        qemu_plugin_cpu_events_stats(cpu_index, &ml, &np, &nd);
+        if (ml > g_stats.evq_qmax_len) {
+            g_stats.evq_qmax_len = ml;
+        }
+    }
+    if (n_evs > g_stats.evq_batch_peak) {
+        g_stats.evq_batch_peak = n_evs;
+    }
+    if (gap > g_stats.evq_gap_peak) {
+        g_stats.evq_gap_peak = gap;
+    }
+    if (n_evs > CST_EVQ_TB_EVENT_MAX) {
+        g_stats.evq_bigdrains++;
+        fprintf(stderr, "champsim_tracer: [evq] BIGDRAIN cpu=%u n=%zu "
+                "icount=%" PRIu64 " (+%" PRIu64 ") -- a single drain larger "
+                "than one TB can produce means a TB entry did not drain; the "
+                "work-per-instruction bound is broken\n",
+                cpu_index, n_evs, icount, gap);
+    }
 }
 
 /*
@@ -6996,15 +6753,16 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
         uint64_t delta = user_seen_advance(cpu_index, icount_prev);
         live_asid = qemu_plugin_get_addr_space_id();
         live_priv = qemu_plugin_get_priv_level();
-        /* Ownership of a user TB: legacy ASID equality on the
-         * wide-register targets, the physical-page identity machinery
-         * on narrow-ASID ones (see pin_user_tb_owned).  Counted and
-         * traced are the same set by construction — an unverified TB
-         * neither advances the user clock nor reaches the trace. */
+        /* Ownership of a user TB: is the ADDRESS SPACE it is executing in
+         * one this trace owns?  That is the whole rule — every thread
+         * inside an owned space is traced (see pin_user_tb_owned).
+         * Counted and traced are the same set by construction: a TB the
+         * trace does not own neither advances the user clock nor reaches
+         * the trace. */
         if (live_priv == 0 && cur_tb_tmpl) {
-            user_owned = pin_user_tb_owned(cpu_index, live_asid,
-                                           pinned_asid,
-                                           cur_tb_tmpl->start_pc);
+            uint64_t live_pid = live_process_id();
+            user_owned = pin_user_tb_owned(cpu_index, live_pid,
+                                           live_thread_id());
             /* Fingerprint this process from its OWN user code (Bug C):
              * the identity that reaches the wire must be a real per-process
              * content hash, not the global representative one.  Capture the
@@ -7019,15 +6777,6 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
                                  &usig)) {
                     asid_set_user_sig(live_asid, usig);
                 }
-            }
-            /* Root-reuse guard: widen this window's anchor set from the
-             * code it actually runs, so the walk does not rest on the
-             * marker page alone.  One relaxed load per owned user TB once
-             * every window has learned CST_PIN_ANCHORS pages — the map is
-             * touched only while some window is still short. */
-            if (user_owned && !g_pin_reuse_guard &&
-                g_anchor_learn_want.load(std::memory_order_relaxed) != 0) {
-                pin_anchor_add(live_asid, cur_tb_tmpl->start_pc);
             }
             /* Capture widens to every user context in trace-all; the clock
              * (user_owned) stays the marker process. */
@@ -7105,11 +6854,11 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
              * not context-switching (the ASID-write trigger's blind spot).
              * Off the hot path: one compare per owned TB, the sweep only at
              * a stride crossing. */
-            if (g_latch_timeout_ms &&
+            if (deadlatch_configured() &&
                 g_user_icount - g_deadlatch_checked_uic >=
                     DEADLATCH_UIC_STRIDE) {
                 g_deadlatch_checked_uic = g_user_icount;
-                deadlatch_clock_check(cpu_index, live_asid);
+                deadlatch_clock_check(cpu_index, live_process_id());
             }
         }
         if (cur_tb_tmpl) {
@@ -7174,6 +6923,7 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
     in.user_owned = capture_owned;
     in.evs = nullptr;
     in.n_evs = qemu_plugin_drain_cpu_events(cpu_index, &in.evs);
+    evq_note_drain(cpu_index, in.n_evs, icount_prev);
     in.cpu_index = cpu_index;
     in.watch_pc = watch_pc;
     /* Guest thread of the TB executing NOW, for the PRE-WINDOW phase: the
@@ -7216,9 +6966,8 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
      * short-circuits ahead of the set lookup; caller holds exec_lock, which
      * every mutation of g_owned also holds. */
     if (in.pinned && in.asid_is_identity && live_priv > 0) {
-        in.live_root_owned = live_asid == in.pinned_asid ||
-                             marker_trace_all() ||
-                             owned_contains_locked(live_asid);
+        in.live_root_owned = marker_trace_all() ||
+                             owned_contains_locked(live_process_id());
     }
 
     /* CST_TID2_DIAG: the delivery-condition instrument for the SMP async
@@ -7368,13 +7117,13 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
          * the memory/context asid stays pinned to the owning process across
          * its whole run.  Trace-all keeps the live-root mapping (Stage B2:
          * every context by its own root). */
-        int ow = (g_pin_reuse_guard && !marker_trace_all())
-            ? g_pin_vcpu[cpu_index].owner.load(std::memory_order_relaxed) : -1;
-        if (ow >= 0 && g_owned_procs && ow < (int)g_owned_procs->size() &&
-            (*g_owned_procs)[ow].active) {
-            const OwnedProc &op = (*g_owned_procs)[ow];
+        const OwnedSpace *os = (g_pin_reuse_guard && !marker_trace_all())
+            ? owned_info_locked(
+                  g_pin_vcpu[cpu_index].pid.load(std::memory_order_relaxed))
+            : nullptr;
+        if (os) {
             g_vcpu_cur_asid_index[cpu_index] =
-                asid_root_to_index(op.root_phys, op.marker_sig);
+                asid_root_to_index(os->root_phys, os->sig);
         } else {
             uint64_t live_root = qemu_plugin_get_addr_space_id();
             g_vcpu_cur_asid_index[cpu_index] =
@@ -7428,32 +7177,29 @@ static void vcpu_pin_probe(unsigned int cpu_index, void *udata)
     BBTemplate *cur_tb_tmpl = (BBTemplate *)udata;
     uint64_t icount = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
 
-    /* Physical-page re-acquisition (user TBs only; a kernel TB carries no
-     * user-code PC to match against the map, and the switch-return kernel
-     * path is charged to the excursion owner by kexc regardless).  One
-     * probe per unconfirmed user TB — the exact per-TB semantics the
-     * heavy path had, minus its cost — until a hit confirms the dwell. */
+    /* Ownership re-acquisition (user TBs only; a kernel TB's ownership is
+     * decided by the kexc machinery in the heavy path).  One O(1) owned-set
+     * lookup per unconfirmed user TB until the vCPU is back in an address
+     * space this trace owns. */
     if (cur_tb_tmpl && cpu_index < CST_PIN_MAX_VCPUS &&
         !g_pin_vcpu[cpu_index].confirmed.load(std::memory_order_relaxed) &&
         qemu_plugin_get_priv_level() == 0) {
         uint64_t live_asid = qemu_plugin_get_addr_space_id();
+        uint64_t live_pid = live_process_id();
+        uint64_t live_tid = live_thread_id();
         g_rec_mutex_lock(&exec_lock);
         PinVcpuState &ps = g_pin_vcpu[cpu_index];
-        bool mismatch = false;
-        int hit = pin_map_probe_owners(cur_tb_tmpl->start_pc,
-                                       ps.owner.load(std::memory_order_relaxed),
-                                       &mismatch);
-        if (hit >= 0) {
-            ps.owner.store(hit, std::memory_order_relaxed);
-            if (live_asid != ps.asid.load(std::memory_order_relaxed)) {
-                /* Re-acquired under a different ASID value — a generation
-                 * rollover re-numbered the process or it migrated onto a
-                 * vCPU whose per-CPU ASID differs.  Re-pin the dwell tag. */
-                ps.asid.store(live_asid, std::memory_order_relaxed);
-                qemu_plugin_u64_set(g_scoreboard.asid_match, cpu_index, 1);
-                g_stats.pin_repins++;
-            }
+        bool owned = owned_contains_locked(live_pid);
+        if (!owned) {
+            /* The one re-bind rule (see pin_rebind_locked). */
+            owned = pin_rebind_locked(live_pid, live_tid);
+        }
+        if (owned) {
+            owned_note_thread(live_pid, live_tid);
+            ps.pid.store(live_pid, std::memory_order_relaxed);
+            ps.asid.store(live_asid, std::memory_order_relaxed);
             ps.confirmed.store(true, std::memory_order_relaxed);
+            qemu_plugin_u64_set(g_scoreboard.asid_match, cpu_index, 1);
             refresh_ctx_gates(cpu_index);   /* trace_this_ctx=1, pin_probe=0 */
             g_rec_mutex_unlock(&exec_lock);
             /* Do NOT advance the user cursor here: the heavy callback
@@ -7461,11 +7207,9 @@ static void vcpu_pin_probe(unsigned int cpu_index, void *udata)
              * and folds this TB's delta into the user clock itself. */
             return;
         }
-        if (mismatch) {
-            g_stats.pin_phys_mismatch_dropped++;
-        } else {
-            g_stats.pin_unverified_dropped++;
-        }
+        /* An address space this trace does not own — the drop this gate
+         * exists for.  Counted, so a zero proves the check never ran. */
+        g_stats.pin_unverified_dropped++;
         g_rec_mutex_unlock(&exec_lock);
     }
 
@@ -7503,6 +7247,128 @@ static void vcpu_pin_probe(unsigned int cpu_index, void *udata)
      * foreign span's instructions never fold into the pinned process's
      * user clock when it resumes (the delta is measured from HERE). */
     user_seen_advance(cpu_index, icount);
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * The event-queue absorber: the per-TB drain point.
+ * ---------------------------------------------------------------------------
+ *
+ * QEMU's per-vCPU path-event queue is grow-only and never drops.  Its only
+ * consumer used to be events_path_step, reached only from the heavy
+ * vcpu_tb_exec, which the JIT dispatches only when trace_this_ctx says this
+ * context is both in-segment AND owned.  Every window where that gate is
+ * shut is a window where the queue has NO consumer at all:
+ *
+ *   W1 a foreign / unconfirmed context (narrow-ASID pins: trace_this_ctx
+ *      diverges from is_active only there, so this is where it was caught);
+ *   W2 inter-segment (is_active == 0 zeroes trace_this_ctx AND pin_probe on
+ *      every ISA, so neither existing callback dispatches);
+ *   W3 after the marker window closes -- W2's code path, mirrored to every
+ *      vCPU;
+ *   W4 pre-first-segment once the queue has been enabled, between simpoint
+ *      clusters, and the coarse fast-forward stretch;
+ *   W6 an SMP peer vCPU that dispatched once and never again.
+ *
+ * In all of them the queue's length was exactly "events produced by untraced
+ * execution", i.e. unbounded, and the whole backlog then landed in ONE
+ * tb_exec callback -- 83,532 events after 119.8 million guest instructions,
+ * measured on a mipsel churn cell, three O(n) passes charged to a single
+ * guest instruction.
+ *
+ * This callback closes all of them the same way.  It is registered for EVERY
+ * translated TB with no ownership, privilege or segment condition, and gated
+ * on the ONE scoreboard slot no attribution decision feeds: evq_pending,
+ * which QEMU sets on push and clears on drain.  So every TB entry is a drain
+ * point, and the queue can only ever hold what one in-flight TB plus the
+ * exception edges around it produced.
+ *
+ * REGISTERED LAST, after vcpu_tb_exec.  Each cond_cb re-loads its slot when
+ * it runs (the same ordering the budget cb and pin_probe already rely on), so
+ * on a TB where the heavy callback dispatched, its own drain has already
+ * zeroed evq_pending and this callback's brcond is false: the light path runs
+ * on exactly the TBs where nothing else drained, and the traced path pays one
+ * load and one brcond.
+ *
+ * It NEVER EMITS.  It folds state (absorb_events) and nothing else; the seal,
+ * the merges and every byte written to the body stream stay in step_seal,
+ * which only an owned, dispatching step reaches.  A record therefore cannot
+ * originate from a context the heavy callback would not have dispatched for.
+ */
+static void vcpu_evq_absorb(unsigned int cpu_index, void *udata)
+{
+    (void)udata;
+    /* Wrong-path simulation: pushes are spec-suppressed at source, so the
+     * queue cannot grow during an excursion.  The flag survives to the next
+     * correct-path TB, which absorbs -- bounded by wpdepth.  Also keeps this
+     * off the nested WP dispatch path entirely, exactly as the heavy
+     * callback and the pin probe do. */
+    if (g_wp_in_progress) {
+        return;
+    }
+
+    /* Drain first, unlocked: the queue is single-producer/single-consumer
+     * and both are this vCPU thread.  A zero-length drain means the heavy
+     * callback beat us to it on this TB (a stale slot), and costs nothing
+     * further. */
+    const struct qemu_plugin_cpu_event *evs = nullptr;
+    size_t n_evs = qemu_plugin_drain_cpu_events(cpu_index, &evs);
+    evq_note_drain(cpu_index, n_evs,
+                   qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index));
+    if (n_evs == 0) {
+        return;
+    }
+
+    /* Absorbing is instrumentation, not guest execution.  Unpaused, its
+     * host cost on a long foreign span is charged to guest time -- the exact
+     * mechanism behind the x86 tick/scheduler storm.  The guard is nestable
+     * and composes with the heavy path's. */
+    VClockPauseGuard vclock_guard;
+
+    g_rec_mutex_lock(&exec_lock);
+
+    PathBuilder &pb = path_builder(cpu_index);
+    PathBuilder::StepIn in;
+    in.cpu_index = cpu_index;
+    in.evs = evs;
+    in.n_evs = n_evs;
+
+    /* Exactly the fields absorb_events reads.  Every one of them is a
+     * plugin-side or event-side datum -- no TB, no template, no successor:
+     * the absorber has no block to attribute and never asks for one. */
+    uint64_t pinned = g_pinned_asid.load(std::memory_order_relaxed);
+    in.pinned = pinned != CST_ASID_UNPINNED;
+    in.pinned_asid = pin_effective_asid(cpu_index, pinned);
+    in.asid_is_identity = !g_pin_reuse_guard;
+    in.live_priv = qemu_plugin_get_priv_level();
+    in.live_asid = qemu_plugin_get_addr_space_id();
+    /* Read-only peek, never the minting sample: minting a thread id here
+     * would renumber the wire from a context the trace does not emit. */
+    in.cur_tid = thread_identity_peek(cpu_index, in.live_priv);
+    /* The async-owner predicate's raw thread pointer, sampled the same way
+     * the step samples it (fresh where the privilege allows, otherwise this
+     * vCPU's last committed value). */
+    if (g_system_mode && cpu_index < CST_PIN_MAX_VCPUS) {
+        uint64_t step_tp;
+        if (thread_ptr_sample(in.live_priv, &step_tp)) {
+            in.cur_tp = step_tp;
+            in.cur_tp_ok = true;
+            in.cur_tp_strict = true;
+        } else if (g_vcpu_last_tp[cpu_index] != CST_TP_UNSEEN) {
+            in.cur_tp = g_vcpu_last_tp[cpu_index];
+            in.cur_tp_ok = true;
+        }
+    }
+
+    pb.absorb_events(in);
+
+    g_stats.evq_absorb_calls++;
+    g_stats.evq_absorb_events += n_evs;
+    if (n_evs > g_stats.evq_absorb_batch_peak) {
+        g_stats.evq_absorb_batch_peak = n_evs;
+    }
+
+    g_rec_mutex_unlock(&exec_lock);
 }
 
 static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
@@ -8029,36 +7895,349 @@ static void split_tb_into_fragments(const qemu_plugin_insn_info *insn_info,
  * (the contract shared with the cst_attach injector). */
 static std::atomic<bool> g_marker_fired{false};
 
-/* Per-thread execution-time marker runs (START / END).  The MarkerRunSet
- * type and the detection primitives (marker_seq_init / marker_word_match /
- * marker_exec_step / marker_run_peek / the udata pack-unpack) live in
- * champsim_tracer_marker_detect.{h,cc}; these per-thread run sets and the
- * one-shot fired flag above are touched only by the marker callbacks, so
- * they stay here. */
-static thread_local MarkerRunSet tls_marker_run;
-static thread_local MarkerRunSet tls_marker_end_run;
+/*
+ * MARKER DETECTION IS A BYTE MATCH, MADE AT TRANSLATION TIME.
+ *
+ * A marker is CST_MARKER_SEQ_LEN identical immediate-loads in a row, and
+ * that is a property of the bytes, not of an execution order.  The
+ * translator finds every instruction that IS the terminating instruction of
+ * a marker sequence, compares the CST_MARKER_SEQ_LEN-1 instruction slots
+ * immediately before it against the rest of that sequence, and — when they
+ * match — arms ONE execution callback on it.  That callback firing is the
+ * marker.  See champsim_tracer_marker_detect.h for why this is the
+ * mechanism: a fault, an interrupt, a migration, a page straddle,
+ * single-stepping, -icount or any TB slicing between the marker's
+ * instructions cannot change bytes, so none of them can lose a marker.
+ *
+ * The helpers below are the whole of it: read the preceding slots, and
+ * decide.  All run on a vCPU thread with current_cpu set (translation and
+ * execution both do), so the guest read walks the live address space — the
+ * one whose instruction stream this is.
+ */
+
+/* Read @len guest bytes at @addr into @out.  Thread-local scratch: called
+ * from translation and from marker callbacks, both on vCPU threads, with no
+ * lock held. */
+static bool marker_read_guest(uint64_t addr, uint8_t *out, size_t len)
+{
+    static thread_local GByteArray *buf;
+    if (!buf) {
+        buf = g_byte_array_new();
+    }
+    if (!qemu_plugin_read_memory_vaddr(addr, buf, len)) {
+        return false;
+    }
+    if (buf->len < len) {
+        return false;
+    }
+    memcpy(out, buf->data, len);
+    return true;
+}
 
 /*
- * END-run advance provenance (per vCPU, NOT thread-local — the plugin's
- * static-TLS block is at its ceiling; see RepSelfLoopState's rationale).
- * Every correct-path invocation of the END callback that reaches the
- * adjacency run-state machine records itself here; when the run fires,
- * the close prints the last CST_MARKER_SEQ_LEN records, so every
- * END-marker close carries the evidence of the three executions that
- * produced it (pc, user clock, run value after the step).  A future
- * wrong-path leak past the fence would name itself in this line: the
- * fence counters beside it say how many speculative invocations were
- * dropped, and a fired run whose advances do not read as the marker
- * sequence at consecutive user PCs is visibly corrupt.  Single writer
- * per index (the vCPU's own exec callback). */
-struct MarkerAdvRec {
-    uint64_t pc = 0;
-    uint64_t uic = 0;       /* g_user_icount at the advance (diagnostic) */
-    uint8_t  run_after = 0;
-};
-static constexpr unsigned MK_ADV_RING = 4;
-static MarkerAdvRec g_marker_end_adv[CST_PIN_MAX_VCPUS][MK_ADV_RING];
-static uint8_t g_marker_end_adv_head[CST_PIN_MAX_VCPUS];
+ * Fill @prefix with the g_marker_seq.prefix_bytes guest bytes immediately
+ * before @pc — the CST_MARKER_SEQ_LEN-1 instruction slots preceding the
+ * instruction at @pc, at known fixed-width offsets.
+ *
+ * Preferred source is THIS TB's own translated instruction stream when it
+ * reaches back far enough (@i is @pc's index in it): those are exactly the
+ * bytes QEMU translated, and no guest read is needed.  A TB that starts
+ * mid-sequence — a page split, a branch landing inside it, one-insn-per-TB
+ * under -icount or a single-stepping injector — falls back to reading guest
+ * memory.  Returns false only when neither source can produce the bytes.
+ */
+static bool marker_gather_prefix_tb(struct qemu_plugin_tb *tb, size_t i,
+                                    uint64_t pc, uint8_t *prefix)
+{
+    const MarkerSeq &m = g_marker_seq;
+    uint32_t need = (uint32_t)m.n_insns - 1u;
+    uint64_t base = pc - m.prefix_bytes;
+
+    if (i < need) {
+        return false;
+    }
+    for (uint32_t k = 0; k < need; k++) {
+        struct qemu_plugin_insn *p = qemu_plugin_tb_get_insn(tb, i - need + k);
+        if (!p ||
+            qemu_plugin_insn_vaddr(p) != base + (uint64_t)k * m.insn_bytes ||
+            qemu_plugin_insn_size(p) != m.insn_bytes) {
+            return false;
+        }
+        qemu_plugin_insn_data(p, prefix + (size_t)k * m.insn_bytes,
+                              m.insn_bytes);
+    }
+    return true;
+}
+
+static bool marker_gather_prefix(struct qemu_plugin_tb *tb, size_t i,
+                                 uint64_t pc, uint8_t *prefix)
+{
+    const MarkerSeq &m = g_marker_seq;
+    if (marker_gather_prefix_tb(tb, i, pc, prefix)) {
+        return true;
+    }
+    return marker_read_guest(pc - m.prefix_bytes, prefix, m.prefix_bytes);
+}
+
+/* The physical page an instruction's page-aligned base sits at, or false. */
+static bool marker_page_paddr(uint64_t vaddr, uint64_t *paddr)
+{
+    uint64_t pa;
+    if (!qemu_plugin_vaddr_to_paddr(vaddr, &pa)) {
+        return false;
+    }
+    *paddr = pa;
+    return true;
+}
+
+/*
+ * The PREDECESSOR side of a straddling sequence.
+ *
+ * If this TB's TRAILING instructions are the LEADING slots of a marker
+ * sequence whose remaining slots lie past the end of the page it ends on,
+ * remember them: this is the only moment they are knowable.  The page is
+ * resident right now — QEMU has just translated code out of it — and on a
+ * software-managed TLB it need not still be when the sequence's terminating
+ * instruction executes, one or two instructions later, on the far side of a
+ * fault or a preemption (see champsim_tracer_marker_detect.h).
+ *
+ * What is recorded is the verdict-so-far (which sequence the leading slots
+ * belong to, and how many of them there were) together with the PHYSICAL
+ * address those slots sat at — the first half of the pair the tail's own
+ * translation completes.  Nothing here arms a callback: the terminating
+ * instruction is still the one and only instruction that fires.
+ */
+/* Straddle tracing: names every witness taken and every straddle decision,
+ * so a sequence that goes undecided can be attributed to the source that was
+ * missing rather than guessed at.  Off unless CST_STRADDLE_DIAG is set. */
+static inline bool marker_straddle_diag(void)
+{
+    static const bool on = getenv("CST_STRADDLE_DIAG") != nullptr;
+    return on;
+}
+
+static void marker_witness_straddle(struct qemu_plugin_tb *tb,
+                                    size_t raw_n_insns)
+{
+    const MarkerSeq &m = g_marker_seq;
+    if (!m.valid || raw_n_insns == 0 || m.n_insns < 2) {
+        return;
+    }
+    const uint64_t page = 4096;
+    struct qemu_plugin_insn *last =
+        qemu_plugin_tb_get_insn(tb, raw_n_insns - 1);
+    if (!last || qemu_plugin_insn_size(last) != m.insn_bytes) {
+        return;
+    }
+    uint64_t last_pc = qemu_plugin_insn_vaddr(last);
+
+    /* @j leading slots end at the TB's last instruction.  Longest first: the
+     * more slots seen on this side, the less is left to the other. */
+    uint32_t jmax = (uint32_t)m.n_insns - 1u;
+    if ((uint64_t)jmax > raw_n_insns) {
+        jmax = (uint32_t)raw_n_insns;
+    }
+    uint8_t head[CST_MARKER_PAIR_SEQ_BYTES];
+    for (uint32_t j = jmax; j >= 1; j--) {
+        uint64_t base = last_pc - (uint64_t)(j - 1) * m.insn_bytes;
+        uint64_t tail_vaddr = base + m.prefix_bytes;
+        /* Straddling means the terminating instruction is on a LATER page
+         * than the last slot seen here. */
+        if ((tail_vaddr / page) == (last_pc / page)) {
+            continue;
+        }
+        size_t at = raw_n_insns - j;
+        bool ok = true;
+        for (uint32_t k = 0; k < j; k++) {
+            struct qemu_plugin_insn *p = qemu_plugin_tb_get_insn(tb, at + k);
+            if (!p ||
+                qemu_plugin_insn_vaddr(p) !=
+                    base + (uint64_t)k * m.insn_bytes ||
+                qemu_plugin_insn_size(p) != m.insn_bytes) {
+                ok = false;
+                break;
+            }
+            qemu_plugin_insn_data(p, head + (size_t)k * m.insn_bytes,
+                                  m.insn_bytes);
+        }
+        if (!ok) {
+            continue;
+        }
+        size_t nb = (size_t)j * m.insn_bytes;
+        MarkerStraddleWitness w;
+        w.match_start = memcmp(head, m.start, nb) == 0;
+        w.match_end   = memcmp(head, m.end,   nb) == 0;
+        if (!w.match_start && !w.match_end) {
+            continue;
+        }
+        w.head_slots = (uint8_t)j;
+        if (!marker_page_paddr(base, &w.prefix_paddr)) {
+            continue;       /* resident enough to translate, not to resolve */
+        }
+        /* Every head length that matches gets its own witness: each names a
+         * DIFFERENT terminating instruction, so they cannot displace one
+         * another, and taking only the longest would drop the real one where
+         * two sequences sit back to back (cell adjacent). */
+        marker_straddle_witness_note(tail_vaddr, w);
+        if (marker_straddle_diag()) {
+            fprintf(stderr, "[straddle] witness tail=0x%" PRIx64 " head=%u "
+                    "start=%d end=%d prefix_pa=0x%" PRIx64 " last_pc=0x%"
+                    PRIx64 " n=%zu\n", tail_vaddr, (unsigned)j,
+                    (int)w.match_start, (int)w.match_end, w.prefix_paddr,
+                    last_pc, raw_n_insns);
+        }
+    }
+}
+
+/*
+ * The TAIL side of a straddling sequence: rebuild the slots before @pc from
+ * the predecessor page's WITNESS plus the tail page's own bytes.
+ *
+ * The witness says which sequence the leading @head_slots slots were and
+ * that they matched it, so those bytes are the sequence's own; the slots
+ * between them and the terminating instruction are on the tail's page,
+ * which this translation is reading out of.  The assembled prefix is still
+ * put through marker_whole_match by the caller, so a witness that does not
+ * agree with what is actually on this page decides nothing.
+ *
+ * @prefix_paddr comes back with the PHYSICAL address the witness recorded
+ * for the predecessor page.  It has to: by the time this side runs, that
+ * page's translation can be gone — that is the whole reason the witness
+ * exists — so re-resolving it HERE is exactly the read that fails, and the
+ * pair would go unrecorded on precisely the runs that need it.
+ */
+static bool marker_straddle_prefix_from_witness(uint64_t pc, uint8_t *prefix,
+                                                uint64_t *prefix_paddr)
+{
+    const MarkerSeq &m = g_marker_seq;
+    MarkerStraddleWitness w;
+    if (!marker_straddle_witness_get(pc, &w) ||
+        (!w.match_start && !w.match_end) || w.head_slots == 0 ||
+        w.head_slots >= m.n_insns) {
+        return false;
+    }
+    /* When the head matched BOTH, the two sequences' bytes are equal over
+     * it — that is what "both" means — so either is the same source. */
+    const uint8_t *seq = w.match_start ? m.start : m.end;
+    size_t head = (size_t)w.head_slots * m.insn_bytes;
+    memcpy(prefix, seq, head);
+    if (head < m.prefix_bytes &&
+        !marker_read_guest(pc - m.prefix_bytes + head, prefix + head,
+                           m.prefix_bytes - head)) {
+        return false;
+    }
+    *prefix_paddr = w.prefix_paddr;
+    return true;
+}
+
+/*
+ * Re-decide the marker from guest memory when the instruction EXECUTES.
+ *
+ * Reached only for an instruction whose terminating-word match was made at
+ * translation time but whose preceding slots could not be read then (the
+ * page before it was not resident at that moment), or whose sequence
+ * straddles a page boundary and this TB does not cover both of its pages.
+ *
+ * The guest read is the PREFERRED source and is asked first: it is the
+ * address space that is actually running the instruction, so its answer is
+ * exact, and it needs no table.  It is NOT a reliable one.  On a target with
+ * a software-managed TLB the page holding the preceding slots can have lost
+ * its TLB entry between the two halves of the sequence — a fault handler or
+ * a preemption is enough — and QEMU's debug read has no hardware walker to
+ * fall back on, so it fails for a page that is still perfectly mapped.  That
+ * is not a proof that the slots did not execute; treating it as one lost 4
+ * of 200,000 START sequences and a whole END marker (see
+ * champsim_tracer_marker_detect.h).
+ *
+ * So when the read cannot be serviced, the straddle's verdict is taken from
+ * its PHYSICAL PAGE PAIR, decided at translation time while both pages were
+ * resident.  The tail's own physical address always resolves — this CPU is
+ * executing out of that page — and it is allowed to decide only while it
+ * DETERMINES the pair: a second, different predecessor page recorded behind
+ * it marks the entry conflicting and the shortcut refuses.  A straddle with
+ * no witnessed pair and no serviceable read is neither claimed nor guessed:
+ * it is counted in marker_straddle_undecided(), whose one benign shape is a
+ * LONE marker-shaped instruction at a page start — no sequence ran, no
+ * witness was ever taken, and claiming nothing is the right answer.
+ */
+static MarkerWhich marker_verify_at_exec(uint64_t pc)
+{
+    const MarkerSeq &m = g_marker_seq;
+    uint8_t seq[CST_MARKER_PAIR_SEQ_BYTES];
+    if (!m.valid) {
+        return MARKER_WHICH_NONE;
+    }
+    const uint64_t page = 4096;
+    bool straddles = ((pc - m.prefix_bytes) / page) != (pc / page);
+    /*
+     * POSITIVE CONTROL (CST_STRADDLE_FORCE_UNREADABLE).  Whether the
+     * backward read can be serviced is a property of the guest's TLB at one
+     * instant, so on a lucky run the fallback below never runs and a suite
+     * that only ever saw lucky runs would prove nothing about it.  With this
+     * set, every STRADDLING sequence's read is treated as unserviceable and
+     * the physical page pair has to carry the whole suite on its own.  It
+     * makes the rare case the only case; it cannot make a marker appear.
+     */
+    static const bool force_unreadable =
+        getenv("CST_STRADDLE_FORCE_UNREADABLE") != nullptr;
+    if (!(straddles && force_unreadable) &&
+        marker_read_guest(pc - m.prefix_bytes, seq, m.seq_bytes)) {
+        return marker_whole_match(seq + m.prefix_bytes, m.insn_bytes, seq);
+    }
+    marker_prefix_unreadable_note();
+    if (!straddles) {
+        /* Not a straddle: the slots are on the tail's own page, which this
+         * CPU is executing out of.  A read that fails there is the
+         * execute-only case, not a lost translation, and there is no
+         * second page and so no pair to consult. */
+        return MARKER_WHICH_NONE;
+    }
+    uint64_t tail_paddr;
+    MarkerWhich which = MARKER_WHICH_NONE;
+    if (marker_page_paddr(pc, &tail_paddr)) {
+        /* Ask the RUNNING address space for the predecessor page too.  It
+         * usually cannot answer — a page whose bytes will not read is
+         * normally a page with no translation to consult, which is the whole
+         * reason this fallback exists — but when it CAN, the recorded pair
+         * is checked in full and a different predecessor page refuses
+         * outright.  Cheap, and it turns part of the reuse hazard from
+         * "guarded against" into "detected". */
+        uint64_t live_prefix = 0;
+        uint64_t lp;
+        if (marker_page_paddr(pc - m.prefix_bytes, &lp)) {
+            live_prefix = lp & ~(page - 1);
+        }
+        which = marker_straddle_pair_lookup(tail_paddr, live_prefix);
+    }
+    if (which == MARKER_WHICH_NONE) {
+        marker_straddle_undecided_note();
+    }
+    return which;
+}
+
+/*
+ * The marker callback's own gate, shared by START and END.  Returns true
+ * when this invocation is a real, correct-path marker of @which.
+ *
+ * A marker is a USER-SPACE event: the sequence is the target's own code.
+ * The wrong-path fence is applied by the callers before this (a speculative
+ * execution routinely runs the marker bytes).
+ */
+static bool marker_claim(void *udata, MarkerWhich which, uint64_t *pc_out)
+{
+    uint64_t pc;
+    uint8_t  size;
+    bool     recheck;
+    marker_udata_unpack(udata, &pc, &size, &recheck);
+    *pc_out = pc;
+    if (qemu_plugin_get_priv_level() != 0) {
+        return false;
+    }
+    if (recheck && marker_verify_at_exec(pc) != which) {
+        return false;
+    }
+    return true;
+}
 
 /* Open the marker trace window on @cpu_index.  The three WIN_MARKER
  * first-open paths — wide-register, narrow-ASID, and legacy single-pin —
@@ -8124,6 +8303,53 @@ static void marker_close_and_exit(bool last_window, unsigned int cpu_index)
     g_rec_mutex_unlock(&exec_lock);
 }
 
+/*
+ * A correct-path END marker that could not be attributed to any owner.
+ *
+ * MAINTAINER RULING (2026-08-02): "END kills the tracer, regardless of
+ * simpoints, just like a program ending in user mode would do."  So this is
+ * not a condition to note and walk past.  A detected correct-path END
+ * FINALISES AND TERMINATES: it never advances a simpoint iterator, never
+ * waits for a budget, and never leaves the window open.
+ *
+ * The case it exists for is the narrow-ASID (MIPS) pin, whose owner identity
+ * is a set of LEARNED PHYSICAL CODE PAGES seeded from the START marker's own
+ * page — MIPS exposes no readable page-table root, so the wide-register root
+ * identity is unavailable (see marker_anchor / OwnedProc).  An END executed
+ * on a page the process mmap'd after its START is a page no owner's map
+ * contains, so ownership cannot name the ender.  What ownership CANNOT do is
+ * make the workload still be running: the END executed, at user privilege,
+ * on the correct path, out of the traced binary's own bytes.  Closing here
+ * is the only outcome that keeps the trace ending where its workload does.
+ *
+ * Counted separately (marker_end_forced_close) precisely so that "ownership
+ * could not name the ender" stays visible as its own defect rather than
+ * being absorbed by the close.  Caller holds exec_lock; does not return when
+ * a segment is live.
+ */
+static void marker_end_no_close_warn(unsigned int cpu_index, uint64_t pc,
+                                     const char *cause);
+
+static void marker_end_force_close(unsigned int cpu_index, uint64_t pc,
+                                   const char *cause)
+{
+    if (!g_trace_segments.is_active() || g_trace_segments.is_shutting_down()) {
+        g_rec_mutex_unlock(&exec_lock);
+        return;
+    }
+    g_stats.marker_end_no_close++;
+    g_stats.marker_end_forced_close++;
+    marker_end_no_close_warn(cpu_index, pc, cause);
+    fprintf(stderr,
+            "champsim_tracer: the END marker owns the stop — closing the "
+            "capture here.\n  An END that closed nothing would run the "
+            "capture past the end of its workload,\n  which is a trace that "
+            "cannot be used.  Ownership could not name the ender;\n  the "
+            "workload ended all the same.\n");
+    fflush(stderr);
+    marker_close_and_exit(/* last_window= */ true, cpu_index);
+}
+
 static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
 {
     /* Wrong-path fence, three independent gates: the QEMU-side per-vCPU
@@ -8164,29 +8390,32 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
         }
     }
     uint64_t pc;
-    uint8_t size;
-    marker_udata_unpack(udata, &pc, &size);
-    if (!marker_exec_step(&tls_marker_run, pc, size,
-                          MARKER_WHICH_START, cpu_index)) {
-        return;                              /* run not complete yet */
+    if (!marker_claim(udata, MARKER_WHICH_START, &pc)) {
+        return;
     }
     g_fdiag_start_runs.fetch_add(1, std::memory_order_relaxed);
     /* The marker is one of the target's own instructions, so the current
      * ASID is the target's page-table root. */
     uint64_t asid = qemu_plugin_get_addr_space_id();
+    /* The ownership key and the strand label: QEMU's opaque ids for this
+     * vCPU's address space and thread.  The marker is one of the target's
+     * own instructions, so both are the target's. */
+    uint64_t pid = live_process_id();
+    uint64_t tid = live_thread_id();
 
     /*
-     * Multi-process latch (Stage B1): wide-register WIN_MARKER.  Each
-     * process that runs the START marker OPENS ITS WINDOW — joins the
-     * owned set — and is traced concurrently; the first open starts the
-     * segment, later opens just widen the set.  Excludes the narrow-ASID
-     * (MIPS) path — its single-process dwell machinery is retained
-     * verbatim (Stage B3) — and the simpoint positioning path (single
-     * program by design); both keep the legacy one-shot below.
+     * Marker window open, every target.  Each process that runs the START
+     * marker OPENS ITS WINDOW — its ADDRESS SPACE joins the owned set — and
+     * is traced concurrently with the others; the first open starts the
+     * segment, later opens just widen the set.  Ownership keys on the
+     * address space, so EVERY THREAD INSIDE AN OWNED SPACE IS TRACED and
+     * nothing here depends on what code a process happens to run.  Excludes
+     * the simpoint positioning path (single program by design), which keeps
+     * the legacy one-shot below.
      */
-    if (g_window_mode == PluginConfig::WIN_MARKER && !g_pin_reuse_guard) {
+    if (g_window_mode == PluginConfig::WIN_MARKER) {
         g_rec_mutex_lock(&exec_lock);
-        if (owned_contains_locked(asid)) {
+        if (owned_contains_locked(pid)) {
             /* This process already has an open window: the START marker is
              * idempotent per address space (a re-run does not re-open). */
             g_rec_mutex_unlock(&exec_lock);
@@ -8202,137 +8431,64 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
             return;
         }
         bool first_open = g_owned.empty();
-        g_owned.insert(asid);
-        g_owned_last_sched[asid] = deadlatch_now_ms();
+        /* The window's STABLE WIRE NAME, from the marker's own code page.
+         * Separate from the ownership key by design — see the legacy path
+         * below for why the wire cannot be named by the architectural
+         * address-space value on a narrow-ASID target. */
+        uint64_t root_phys, sig, vpage;
+        marker_anchor(pc, asid, &root_phys, &sig, &vpage);
+        (void)vpage;
+        g_owned.insert(pid);
+        g_owned_last_sched[pid] = deadlatch_now_ms();
+        g_owned_last_sched_insns[pid] = deadlatch_now_insns();
+        OwnedSpace &os = g_owned_info[pid];
+        os.root_phys = g_pin_reuse_guard ? root_phys : asid;
+        os.sig = sig;
+        os.raw_asid = asid;
+        if (tid) {
+            os.tids.insert(tid);
+        }
+        if (cpu_index < CST_PIN_MAX_VCPUS) {
+            g_pin_vcpu[cpu_index].asid.store(asid, std::memory_order_relaxed);
+            g_pin_vcpu[cpu_index].pid.store(pid, std::memory_order_relaxed);
+            g_pin_vcpu[cpu_index].confirmed.store(true,
+                                                  std::memory_order_relaxed);
+        }
+        pin_note_thread_naming(asid, tid);
         if (first_open) {
-            /* First window: pin the representative root, seed its identity
-             * signature from the marker's own code page (@pc is this
-             * callback's own instruction address from udata, NOT
-             * qemu_plugin_get_pc() — the env PC is stale mid-TB), and open
-             * the segment exactly as the single-process path did. */
+            /* First window: pin the representative, seed its identity
+             * signature from the marker's own code page, and open the
+             * segment exactly as the single-process path did. */
             g_pinned_asid.store(asid, std::memory_order_relaxed);
+            g_pinned_pid.store(pid, std::memory_order_relaxed);
             pin_reuse_reset();
-            g_pin_repr_vpage = UINT64_MAX;
-            g_pin_repr_sig.store(0, std::memory_order_relaxed);
-            if (asid != 0) {
-                pin_repr_seed(pc);
-                /* Root-reuse guard: this process's own code page is the
-                 * identity that outlives its root value. */
-                pin_anchor_seed(asid, pc);
-            }
-            /* This is the whole-system open under policy=trace-all too: the
-             * segment machinery is identical (pin the first process for the
-             * clock + END), and the widened CAPTURE gate lives in the heavy
-             * step (marker_trace_all() in events_path_step / refresh_ctx_gates),
-             * so every context is traced from here without touching the owned
-             * set — which stays this single clock pin (see the guard above). */
+            g_pin_repr_sig.store(sig, std::memory_order_relaxed);
             marker_open_trace_window(cpu_index, asid,
-                                     /* have_root_phys= */ false, 0);
-            /* Assign this root's compact asid index (index 0) with its own
+                                     /* have_root_phys= */ g_pin_reuse_guard,
+                                     root_phys);
+            /* Assign this window's compact asid index (index 0) with its own
              * marker-page signature.  Runs AFTER start_trace_segment (which
              * resets the per-segment identity map) so the pre-registration
-             * survives; cst_pinned_asid_sig() is the repr sig just seeded
-             * from THIS process's marker page, so this is byte-identical to
-             * letting the first emit assign it. */
-            asid_root_to_index(asid, cst_pinned_asid_sig());
+             * survives. */
+            asid_root_to_index(os.root_phys, sig);
         } else {
             /* Additional window while the segment is already open: no new
-             * segment.  Register this root's identity with ITS OWN
+             * segment.  Register this window's identity with ITS OWN
              * marker-page signature (a per-process sig, not the
              * representative's), and recompute this vCPU's gates so its TBs
-             * begin dispatching the heavy callback (pin_user_tb_owned now
-             * sees the live root as owned).  Other vCPUs running this root
-             * pick it up at their next ASID write via asid_write_track_cb. */
-            uint64_t sig = 0;
-            if (asid != 0) {
-                uint64_t s;
-                if (pin_page_sig(pc & PIN_PAGE_MASK, &s)) {
-                    sig = s;
-                }
-                pin_anchor_seed(asid, pc);
-            }
-            /* Fingerprint this additional process from its own marker page
-             * (Bug C), refreshing the identity if a hot-path first-sighter
-             * already provisionally stamped the representative signature.
-             * The per-user-TB capture usually beats the marker to it; this
-             * covers a process whose first user TB has not run yet. */
-            if (sig) {
+             * begin dispatching the heavy callback.  Other vCPUs running
+             * this space pick it up at their next address-space write. */
+            if (!g_pin_reuse_guard && sig) {
                 asid_set_user_sig(asid, sig);
             }
-            asid_root_to_index(asid, asid_first_sight_sig(asid));
+            asid_root_to_index(os.root_phys,
+                               g_pin_reuse_guard ? sig
+                                                 : asid_first_sight_sig(asid));
             qemu_plugin_u64_set(g_scoreboard.asid_match, cpu_index, 1);
             refresh_ctx_gates(cpu_index);
             fprintf(stderr,
                     "champsim_tracer: marker opened additional window for "
                     "asid 0x%" PRIx64 " (%zu owned)\n", asid, g_owned.size());
-        }
-        g_rec_mutex_unlock(&exec_lock);
-        return;
-    }
-
-    /*
-     * Multi-process latch (Stage B3): narrow-ASID WIN_MARKER (MIPS system
-     * mode).  An 8-bit EntryHi.ASID cannot name a process by value, so each
-     * owned process is an OwnedProc keyed by physical-page identity: the
-     * first START marker seeds owner 0 and opens the segment, later START
-     * markers append owners and widen the traced set, each with its own
-     * marker-seeded page map and stable (marker-page-phys, sig) wire anchor.
-     * Excludes trace-all (Stage B2: the first marker opens a whole-system
-     * window; the legacy single-pin path below serves its clock/END) and
-     * user mode (asid 0, single address space — also the legacy path, kept
-     * byte-identical).
-     */
-    if (g_window_mode == PluginConfig::WIN_MARKER && g_pin_reuse_guard &&
-        asid != 0 && !marker_trace_all()) {
-        g_rec_mutex_lock(&exec_lock);
-        PinVcpuState &ps = g_pin_vcpu[cpu_index];
-        /* Idempotent per process: a re-run of the START marker whose code
-         * already belongs to an active owner just re-seats the dwell. */
-        bool mm = false;
-        int existing = pin_map_probe_owners(
-            pc, ps.owner.load(std::memory_order_relaxed), &mm);
-        if (existing >= 0 && g_owned_procs &&
-            (*g_owned_procs)[existing].active) {
-            ps.owner.store(existing, std::memory_order_relaxed);
-            ps.asid.store(asid, std::memory_order_relaxed);
-            ps.confirmed.store(true, std::memory_order_relaxed);
-            qemu_plugin_u64_set(g_scoreboard.asid_match, cpu_index, 1);
-            refresh_ctx_gates(cpu_index);
-            g_rec_mutex_unlock(&exec_lock);
-            return;
-        }
-        uint64_t root_phys, sig, vpage;
-        marker_anchor(pc, asid, &root_phys, &sig, &vpage);
-        bool first_open = !g_owned_procs || g_owned_procs->empty();
-        if (first_open) {
-            /* First window: pin the representative (owner 0), seed its
-             * page map + identity from the marker's own code page, and open
-             * the segment exactly as the single-process narrow path did. */
-            g_pinned_asid.store(asid, std::memory_order_relaxed);
-            pin_reuse_reset();
-            g_pin_repr_vpage = vpage;
-            g_pin_repr_sig.store(sig, std::memory_order_relaxed);
-            pin_owned_reset_single(asid, cpu_index, root_phys, sig, vpage);
-            pin_map_learn(0, pc);
-            marker_open_trace_window(cpu_index, asid,
-                                     /* have_root_phys= */ true, root_phys);
-            /* Pre-register owner 0's compact index (index 0) with its own
-             * marker-page anchor, AFTER start_trace_segment reset the
-             * per-segment identity map (mirrors the wide path). */
-            asid_root_to_index(root_phys, sig);
-        } else {
-            /* Additional window: append owner k, seed its map, register its
-             * identity, and recompute this vCPU's gates so its confirmed
-             * dwell begins dispatching the heavy callback. */
-            int idx = pin_owned_append(asid, cpu_index, root_phys, sig, vpage);
-            pin_map_learn(idx, pc);
-            asid_root_to_index(root_phys, sig);
-            qemu_plugin_u64_set(g_scoreboard.asid_match, cpu_index, 1);
-            refresh_ctx_gates(cpu_index);
-            fprintf(stderr,
-                    "champsim_tracer: marker opened additional window for "
-                    "narrow owner %d root_phys=0x%" PRIx64 " (%d owned)\n",
-                    idx, root_phys, g_owned_procs_active);
         }
         g_rec_mutex_unlock(&exec_lock);
         return;
@@ -8360,46 +8516,42 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
      * boundaries/exceptions, so a mid-TB read is stale and would hash a
      * bogus page.  exec_lock guards the shared scratch buffer / page map
      * against concurrent step-glue probes on other vCPUs. */
-    if (g_pin_reuse_guard) {
-        /* Narrow-ASID (MIPS) single owner: user-mode marker (asid 0, one
-         * address space), pinned-simpoint positioning, and MIPS trace-all
-         * (whose clock/END ride this single pin while capture widens in the
-         * heavy step).  Seat owner 0's dwell and seed its page map from the
-         * marker's own live-translated page; the stable anchor is (0,0) in
-         * user mode so those traces stay byte-identical, the marker-page
-         * physical address in system mode. */
-        g_rec_mutex_lock(&exec_lock);
+    g_rec_mutex_lock(&exec_lock);
+    {
+        /* The window's STABLE WIRE NAME (marker_anchor) and its OWNERSHIP
+         * KEY (@pid) are separate things, deliberately: the wire names an
+         * address space by a physical anchor plus a content signature so a
+         * narrow architectural ASID value cannot churn the wire's asid
+         * index, while ownership compares QEMU's opaque process id.  @pc is
+         * this callback's own instruction address (from its udata), NOT
+         * qemu_plugin_get_pc(): the env PC is only synced at TB
+         * boundaries/exceptions, so a mid-TB read would hash a bogus page.
+         * User mode / no real address space anchors at (0,0), keeping those
+         * traces byte-identical. */
         uint64_t root_phys, sig, vpage;
         marker_anchor(pc, asid, &root_phys, &sig, &vpage);
-        g_pin_repr_vpage = vpage;
+        (void)vpage;
         g_pin_repr_sig.store(sig, std::memory_order_relaxed);
-        pin_owned_reset_single(asid, cpu_index, root_phys, sig, vpage);
-        pin_map_learn(0, pc);
-        g_rec_mutex_unlock(&exec_lock);
-    } else if (asid != 0) {
-        /* Wide-register SYSTEM pin (x86 CR3 / AArch64 TTBR / RISC-V SATP):
-         * no page map is learned, so seed the representative directly from
-         * the marker's own code page.  Gated on a real (non-zero) root:
-         * user-mode pins report asid 0 and need no signature, so this path
-         * — and its lock / guest read — never runs in user mode, leaving
-         * user traces byte-identical. */
-        g_rec_mutex_lock(&exec_lock);
-        g_pin_repr_vpage = UINT64_MAX;
-        g_pin_repr_sig.store(0, std::memory_order_relaxed);
-        pin_repr_seed(pc);
-        pin_anchor_seed(asid, pc);
-        g_rec_mutex_unlock(&exec_lock);
+        g_pinned_pid.store(pid, std::memory_order_relaxed);
+        g_owned.insert(pid);
+        g_owned_last_sched[pid] = deadlatch_now_ms();
+        g_owned_last_sched_insns[pid] = deadlatch_now_insns();
+        OwnedSpace &os = g_owned_info[pid];
+        os.root_phys = g_pin_reuse_guard ? root_phys : asid;
+        os.sig = sig;
+        os.raw_asid = asid;
+        if (tid) {
+            os.tids.insert(tid);
+        }
+        if (cpu_index < CST_PIN_MAX_VCPUS) {
+            g_pin_vcpu[cpu_index].asid.store(asid, std::memory_order_relaxed);
+            g_pin_vcpu[cpu_index].pid.store(pid, std::memory_order_relaxed);
+            g_pin_vcpu[cpu_index].confirmed.store(true,
+                                                  std::memory_order_relaxed);
+        }
+        pin_note_thread_naming(asid, tid);
     }
-    /* Record the representative root in the owned set too, so the
-     * wide-register asid_match set-membership (asid_write_track_cb) is
-     * correct for a wide-register pinned simpoint (single-owned).  MIPS
-     * keeps its own dwell path and never reads the set. */
-    if (!g_pin_reuse_guard) {
-        g_rec_mutex_lock(&exec_lock);
-        g_owned.insert(asid);
-        g_owned_last_sched[asid] = deadlatch_now_ms();
-        g_rec_mutex_unlock(&exec_lock);
-    }
+    g_rec_mutex_unlock(&exec_lock);
 
     if (pinned_simpoint_mode()) {
         /* Pin only: zero the user clock at the target's first instruction
@@ -8462,9 +8614,7 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
  * An END marker executed on the correct path and closed no window — either
  * because the fence suppressed its words, or because the run completed in an
  * address space this trace does not own.  Loud ONCE, at the moment it
- * happens, not only as a counter at exit: the window is still open, so the
- * capture is about to record past the end of its workload, and that is worth
- * interrupting the operator for while the run can still be stopped.
+ * happens, not only as a counter at exit.
  */
 static void marker_end_no_close_warn(unsigned int cpu_index, uint64_t pc,
                                      const char *cause)
@@ -8479,9 +8629,7 @@ static void marker_end_no_close_warn(unsigned int cpu_index, uint64_t pc,
             "champsim_tracer: *** END MARKER CLOSED NO WINDOW ***\n"
             "  cpu=%u pc=0x%" PRIx64 " asid=0x%" PRIx64
             " user_insns=%" PRIu64 " cause=%s\n"
-            "  The window this END should have closed is still open; the "
-            "capture will run\n  past the end of its workload.  See "
-            "'marker END with no close' in the report.\n",
+            "  See 'marker END in an unowned address space' in the report.\n",
             cpu_index, pc, qemu_plugin_get_addr_space_id(), g_user_icount,
             cause);
     fflush(stderr);
@@ -8513,7 +8661,8 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
             if (fence_diag()) {
                 uint64_t fpc;
                 uint8_t fsz;
-                marker_udata_unpack(udata, &fpc, &fsz);
+                bool frc;
+                marker_udata_unpack(udata, &fpc, &fsz, &frc);
                 fence_note_end(fpc, qemu_plugin_get_addr_space_id(),
                                qemu_plugin_get_priv_level(),
                                (uint8_t)((f_spec ? 1 : 0) | (f_wp ? 2 : 0) |
@@ -8549,8 +8698,9 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
                 g_trace_segments.is_active_atomic()) {
                 uint64_t spc;
                 uint8_t ssz;
-                marker_udata_unpack(udata, &spc, &ssz);
-                g_stats.marker_end_no_close++;
+                bool src;
+                marker_udata_unpack(udata, &spc, &ssz, &src);
+                g_stats.marker_end_suppressed++;
                 marker_end_no_close_warn(cpu_index, spc,
                         f_forced ? "suppressed by the fence, forced "
                                    "(CST_FENCE_FORCE_END)"
@@ -8568,124 +8718,88 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
         }
     }
     uint64_t pc;
-    uint8_t size;
-    marker_udata_unpack(udata, &pc, &size);
+    if (!marker_claim(udata, MARKER_WHICH_END, &pc)) {
+        return;
+    }
     if (marker_diag()) {
-        const MarkerExecRun *er =
-            marker_run_peek(&tls_marker_end_run,
-                            qemu_plugin_get_addr_space_id());
         fprintf(stderr, "[mkdiag] end-cb CP cpu=%u pc=0x%" PRIx64
-                " sz=%u priv=%d asid=0x%" PRIx64 " pinned=0x%" PRIx64
-                " run=%u next=0x%" PRIx64 " user=%" PRIu64
-                " wp_gated=%" PRIu64 " susp_u=%" PRIu64
+                " priv=%d asid=0x%" PRIx64 " pinned=0x%" PRIx64
+                " user=%" PRIu64 " wp_gated=%" PRIu64 " susp_u=%" PRIu64
                 " foreign_u=%" PRIu64 "\n",
-                cpu_index, pc, size, qemu_plugin_get_priv_level(),
+                cpu_index, pc, qemu_plugin_get_priv_level(),
                 qemu_plugin_get_addr_space_id(),
                 g_pinned_asid.load(std::memory_order_relaxed),
-                er ? er->run : 0, er ? er->next_pc : 0,
                 g_user_icount, tls_mkdiag_end_wp_gated,
                 tls_mkdiag_susp_user, tls_mkdiag_foreign_user);
     }
-    bool end_fired = marker_exec_step(&tls_marker_end_run, pc, size,
-                                     MARKER_WHICH_END, cpu_index);
-    /* Advance provenance: every invocation that reached the run-state
-     * machine at user privilege mutated it — record it (see
-     * g_marker_end_adv).  On fire the run resets to 0, so log the
-     * sequence length; otherwise peek the slot's live run value. */
-    if (cpu_index < CST_PIN_MAX_VCPUS &&
-        qemu_plugin_get_priv_level() == 0) {
-        const MarkerExecRun *er = end_fired ? nullptr :
-            marker_run_peek(&tls_marker_end_run,
-                            qemu_plugin_get_addr_space_id());
-        uint8_t h = g_marker_end_adv_head[cpu_index];
-        MarkerAdvRec &rec = g_marker_end_adv[cpu_index][h % MK_ADV_RING];
-        rec.pc = pc;
-        rec.uic = g_user_icount;
-        rec.run_after = end_fired ? (uint8_t)g_marker_seq.n_insns
-                                  : (uint8_t)(er ? er->run : 0);
-        g_marker_end_adv_head[cpu_index] = (uint8_t)(h + 1);
-    }
     if (fence_diag()) {
-        const MarkerExecRun *er2 = end_fired ? nullptr :
-            marker_run_peek(&tls_marker_end_run,
-                            qemu_plugin_get_addr_space_id());
         fence_note_end(pc, qemu_plugin_get_addr_space_id(),
                        qemu_plugin_get_priv_level(), 0, /* fenced= */ false,
-                       end_fired ? (uint8_t)g_marker_seq.n_insns
-                                 : (uint8_t)(er2 ? er2->run : 0));
-    }
-    if (!end_fired) {
-        return;
+                       (uint8_t)g_marker_seq.n_insns);
     }
     g_fdiag_end_runs.fetch_add(1, std::memory_order_relaxed);
-    /* The END run completed on the correct path.  Print the advance
-     * provenance unconditionally: every END-marker close carries the
-     * evidence of the three executions that produced it, plus how many
-     * speculative invocations the fence dropped on this thread. */
-    if (cpu_index < CST_PIN_MAX_VCPUS) {
-        uint8_t h = g_marker_end_adv_head[cpu_index];
-        unsigned n = (unsigned)g_marker_seq.n_insns;
-        if (n > MK_ADV_RING) {
-            n = MK_ADV_RING;
-        }
-        fprintf(stderr, "champsim_tracer: end-marker run complete cpu=%u:",
-                cpu_index);
-        for (unsigned k = 0; k < n; k++) {
-            const MarkerAdvRec &rec =
-                g_marker_end_adv[cpu_index][(h + MK_ADV_RING - n + k) %
-                                            MK_ADV_RING];
-            fprintf(stderr, " [pc=0x%" PRIx64 " uic=%" PRIu64 " run=%u]",
-                    rec.pc, rec.uic, rec.run_after);
-        }
-        fprintf(stderr, " wp_fenced_end=%" PRIu64 "\n",
-                tls_mkdiag_end_wp_gated);
-    }
     fence_flush_end_ring();
     uint64_t asid = qemu_plugin_get_addr_space_id();
+    /* The ownership key: QEMU's opaque id for the address space this
+     * marker executed in (the marker is one of the target's own
+     * instructions, so it is the target's). */
+    uint64_t pid = live_process_id();
 
     /*
-     * Multi-process latch (Stage B1): wide-register WIN_MARKER.  The END
-     * marker CLOSES the emitting process's window (leaves the owned set).
-     * The segment closes only when the LAST window closes (the owned set
-     * empties); while other processes are still tracing, the ending
-     * process is dropped and the segment keeps running.  Symmetric with
-     * the START handler; excludes the narrow-ASID (MIPS) and simpoint
-     * paths, which keep the single-process exit below.
+     * Marker window close, every target.  The END marker CLOSES the
+     * emitting process's window: its ADDRESS SPACE leaves the owned set.
+     * The segment closes only when the LAST window closes; while other
+     * processes are still tracing, the ending one is dropped and the
+     * segment keeps running.  Symmetric with the START handler; the
+     * simpoint positioning path keeps the single-process exit below.
      */
-    if (g_window_mode == PluginConfig::WIN_MARKER && !g_pin_reuse_guard) {
+    if (g_window_mode == PluginConfig::WIN_MARKER) {
         g_rec_mutex_lock(&exec_lock);
-        if (!owned_contains_locked(asid)) {
+        if (!owned_contains_locked(pid)) {
             /* END from a process that never opened a window (or already
-             * closed it): not ours to act on.  Counted: a completed
-             * correct-path END that closes nothing is how a pin that
-             * drifted off its process would look. */
-            if (g_trace_segments.is_active()) {
-                g_stats.marker_end_no_close++;
-                marker_end_no_close_warn(cpu_index, pc,
-                        "the run completed in an address space this trace "
-                        "does not own");
-            }
-            g_rec_mutex_unlock(&exec_lock);
+             * closed it).  A completed correct-path END that closes nothing
+             * is how a pin that drifted off its process looks — and it is
+             * still an END, so it stops the capture (see
+             * marker_end_force_close; does not return under a live
+             * segment). */
+            marker_end_force_close(cpu_index, pc,
+                    "the run completed in an address space this trace "
+                    "does not own");
             return;
         }
         /* From here the close is unconditional: the run completed on the
          * correct path in an address space this trace owns.  Anything that
          * returned before this point without closing is counted at the
          * call site (see marker_end_no_close). */
-        g_owned.erase(asid);
-        g_owned_last_sched.erase(asid);
-        pin_anchor_forget(asid);
+        uint64_t raw = asid;
+        auto oit = g_owned_info.find(pid);
+        if (oit != g_owned_info.end()) {
+            raw = oit->second.raw_asid;
+            g_owned_info.erase(oit);
+        }
+        g_owned.erase(pid);
+        g_owned_last_sched.erase(pid);
+        g_owned_last_sched_insns.erase(pid);
+        if (cpu_index < CST_PIN_MAX_VCPUS) {
+            g_pin_vcpu[cpu_index].pid.store(0, std::memory_order_relaxed);
+            g_pin_vcpu[cpu_index].confirmed.store(false,
+                                                  std::memory_order_relaxed);
+        }
         if (!g_owned.empty()) {
             /* Other windows remain open — do NOT close the segment.  Drop
-             * only this root: recompute the emitting vCPU's gates/flag so
-             * its TBs stop being owned (pin_user_tb_owned now sees the live
-             * root as foreign); other vCPUs that were running this root
-             * self-correct at their next ASID write.  If this root was the
-             * representative, repoint it to a still-owned root so
-             * pin_effective_asid / cst_pinned_asid_root stay valid. */
-            if (g_pinned_asid.load(std::memory_order_relaxed) == asid) {
-                g_pinned_asid.store(*g_owned.begin(),
-                                    std::memory_order_relaxed);
+             * only this space: recompute the emitting vCPU's gates/flag so
+             * its TBs stop being owned; other vCPUs that were running it
+             * self-correct at their next address-space write.  If this was
+             * the representative, repoint so cst_pinned_asid_root and the
+             * effective-pin compare stay valid. */
+            if (g_pinned_pid.load(std::memory_order_relaxed) == pid) {
+                uint64_t heir = *g_owned.begin();
+                g_pinned_pid.store(heir, std::memory_order_relaxed);
+                auto hit = g_owned_info.find(heir);
+                if (hit != g_owned_info.end()) {
+                    g_pinned_asid.store(hit->second.raw_asid,
+                                        std::memory_order_relaxed);
+                }
             }
             /* Drop the closed process's asid-keyed dedup-index footprint so
              * it does not accumulate across disparate ASIDs (single shared
@@ -8694,86 +8808,24 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
              * section is written (see reclaim_asid).  data_lock guards the
              * store against a concurrent translation on another vCPU. */
             g_mutex_lock(&data_lock);
-            uint64_t dropped = g_template_store.reclaim_asid(asid);
+            uint64_t dropped = g_template_store.reclaim_asid(raw);
             g_mutex_unlock(&data_lock);
             if (dropped) {
                 fprintf(stderr, "champsim_tracer: dropped %" PRIu64
                         " dedup buckets for closed asid 0x%" PRIx64 "\n",
-                        dropped, asid);
+                        dropped, raw);
             }
             qemu_plugin_u64_set(g_scoreboard.asid_match, cpu_index, 0);
             refresh_ctx_gates(cpu_index);
             fprintf(stderr,
                     "champsim_tracer: end marker — closed window for asid "
                     "0x%" PRIx64 " (%zu still tracing)\n",
-                    asid, g_owned.size());
+                    raw, g_owned.size());
             g_rec_mutex_unlock(&exec_lock);
             return;
         }
         /* Last window closed: all-windows-closed stop (peer of the
          * icount/budget stop — whichever fires first wins). */
-        marker_close_and_exit(/* last_window= */ true, cpu_index);
-        return;
-    }
-
-    /*
-     * Multi-process latch (Stage B3): narrow-ASID WIN_MARKER (MIPS system).
-     * The END marker executes as the ending process's OWN user code, so the
-     * emitting vCPU's confirmed dwell owner IS the ender.  Close that owner's
-     * window (mark it inactive, free its page map); the segment closes only
-     * when the LAST active owner ends.  Symmetric with the narrow-ASID START
-     * handler; excludes trace-all / user / simpoint (the legacy exit below).
-     */
-    if (g_window_mode == PluginConfig::WIN_MARKER && g_pin_reuse_guard &&
-        asid != 0 && !marker_trace_all()) {
-        g_rec_mutex_lock(&exec_lock);
-        PinVcpuState &ps = g_pin_vcpu[cpu_index];
-        int ow = ps.owner.load(std::memory_order_relaxed);
-        bool ok = ps.confirmed.load(std::memory_order_relaxed) && ow >= 0 &&
-                  g_owned_procs && ow < (int)g_owned_procs->size() &&
-                  (*g_owned_procs)[ow].active;
-        if (!ok) {
-            /* Dwell not currently confirmed (a kernel overlay may have
-             * un-confirmed it an instant before this insn): identify the
-             * ender by probing its own code against the owned maps. */
-            bool mm = false;
-            ow = pin_map_probe_owners(pc, ow, &mm);
-        }
-        if (ow < 0 || !g_owned_procs || ow >= (int)g_owned_procs->size() ||
-            !(*g_owned_procs)[ow].active) {
-            /* END from a process that never opened a window (or already
-             * closed it): not ours to act on (counted — see above). */
-            if (g_trace_segments.is_active()) {
-                g_stats.marker_end_no_close++;
-                marker_end_no_close_warn(cpu_index, pc,
-                        "the run completed in a narrow-ASID dwell with no "
-                        "active owner");
-            }
-            g_rec_mutex_unlock(&exec_lock);
-            return;
-        }
-        (*g_owned_procs)[ow].active = false;
-        (*g_owned_procs)[ow].pages.clear();   /* free — never probed again */
-        g_owned_procs_active--;
-        /* The ending vCPU has left the owned set: un-confirm its dwell so its
-         * remaining TBs re-probe (and, finding no active owner, drop). */
-        ps.confirmed.store(false, std::memory_order_relaxed);
-        qemu_plugin_u64_set(g_scoreboard.asid_match, cpu_index, 0);
-        refresh_ctx_gates(cpu_index);
-        if (g_owned_procs_active > 0) {
-            /* Other windows remain open — do NOT close the segment.  The
-             * closed owner's true-BB templates stay until the segment's
-             * templates section is written; its live-ASID-keyed dedup index
-             * is byte-checked and bounded, so no cross-process reclaim is
-             * needed (a concurrently-owned process holds a distinct ASID
-             * value). */
-            fprintf(stderr,
-                    "champsim_tracer: end marker — closed narrow owner %d "
-                    "(%d still tracing)\n", ow, g_owned_procs_active);
-            g_rec_mutex_unlock(&exec_lock);
-            return;
-        }
-        /* Last window closed: all-windows-closed stop. */
         marker_close_and_exit(/* last_window= */ true, cpu_index);
         return;
     }
@@ -8786,11 +8838,17 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
     /* The end marker must be the pinned process's own: compare against
      * the executing vCPU's effective pin (on a narrow-ASID target the
      * process may hold a re-pinned value by now; its dwell was verified
-     * by the step glue before this insn callback fired). */
-    if (asid != pin_effective_asid(cpu_index, pinned)) {
+     * by the step glue before this insn callback fired).  A mismatch is
+     * still a correct-path END while a window is open, so it closes — the
+     * pinned-simpoint iterator does not outrank a workload that ended
+     * (maintainer ruling, see marker_end_force_close). */
+    g_rec_mutex_lock(&exec_lock);
+    if (!owned_contains_locked(pid)) {
+        marker_end_force_close(cpu_index, pc,
+                "the run completed under an address space value that is not "
+                "this vCPU's effective pin");
         return;
     }
-    g_rec_mutex_lock(&exec_lock);
     marker_close_and_exit(/* last_window= */ false, cpu_index);
 }
 
@@ -8983,6 +9041,12 @@ static uint32_t build_canonical_insns(struct qemu_plugin_tb *tb,
     bool *canonical_first              = scratch.canonical_first.get();
     uint32_t canonical_n_insns = 0;
 
+    /* WIN_MARKER: the predecessor half of a straddling sequence, taken while
+     * the page it sits on is still resident (see marker_witness_straddle). */
+    if (marker_scan_enabled() && g_marker_seq.valid) {
+        marker_witness_straddle(tb, raw_n_insns);
+    }
+
     for (size_t i = 0; i < raw_n_insns; i++) {
         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
         uint64_t raw_pc = qemu_plugin_insn_vaddr(insn);
@@ -9010,20 +9074,133 @@ static uint32_t build_canonical_insns(struct qemu_plugin_tb *tb,
          * below every plugin callback) while this registration-
          * preserving build completes — a QEMU-base interaction
          * preserved under mkclose_bug1/ab for follow-up. */
-        if (marker_scan_enabled() && g_marker_seq.valid) {
-            /* Arm the exec callback on every insn whose bytes belong to a
-             * marker sequence; the callback judges consecutivity in the
-             * user-space stream by PC adjacency, so detection is
-             * independent of TB slicing (see marker_exec_step). */
-            if (marker_word_match(g_marker_seq.start, raw_bytes, raw_size)) {
+        if (marker_scan_enabled() && g_marker_seq.valid &&
+            marker_tail_word_match(raw_bytes, raw_size)) {
+            /*
+             * Decided here, in the bytes, on ONE instruction.  The cheap
+             * filter above is "is this instruction, byte for byte, the
+             * TERMINATING instruction of a marker sequence".  When it is,
+             * the CST_MARKER_SEQ_LEN-1 instruction slots immediately before
+             * it are compared against the rest of the sequence — from this
+             * TB's own translated stream when it reaches back that far,
+             * otherwise from guest memory.  A whole-sequence match arms
+             * exactly one execution callback, and that callback firing IS
+             * the marker: no run to advance, nothing to hand off between
+             * vCPUs, and nothing a fault, a migration, a page straddle,
+             * single-stepping or -icount can interrupt.  START and END are
+             * compared whole, immediates included, so the word the two
+             * magics share on every fixed-width target cannot confuse them.
+             */
+            uint8_t prefix[CST_MARKER_PAIR_SEQ_BYTES];
+            /*
+             * A sequence that STRADDLES A PAGE BOUNDARY needs more than
+             * "read the bytes before it", because the bytes before it are
+             * another page's and QEMU keys a translation block by the
+             * physical pages it covers: a block may legitimately be reused
+             * by another address space that maps the SAME tail page behind
+             * a DIFFERENT predecessor page, and the slots before the
+             * sequence would then be that other program's.  So a straddle
+             * is decided by its PHYSICAL PAGE PAIR, never by its tail
+             * alone.  Three sources, in order of how strongly they key it:
+             *
+             *   1. THIS TB covers the whole sequence.  Then QEMU's own key
+             *      IS the pair — tb_lookup_cmp compares tb_page_addr0 AND
+             *      tb_page_addr1 — so the decision is final here and needs
+             *      no execution-time recheck at all.
+             *   2. The predecessor page was witnessed at ITS translation
+             *      (marker_witness_straddle), which is the only moment a
+             *      software-walked target can be relied on to produce those
+             *      bytes.  The remaining slots are on the tail's own page,
+             *      which this translation is reading out of.
+             *   3. A plain guest read reaches back over the boundary.
+             *
+             * 2 and 3 record the pair and still arm the execution-time
+             * recheck, which prefers the running address space's own read
+             * and falls back to the pair only when that read cannot be
+             * serviced.  CST_MARKER_PAIR_SEQ_BYTES is far below a page, so
+             * a straddle is the rare case, and the smallest page any
+             * supported target uses is the conservative boundary.
+             */
+            const uint64_t page = 4096;
+            uint64_t seq_base = raw_pc - g_marker_seq.prefix_bytes;
+            bool straddles = (seq_base / page) != (raw_pc / page);
+            bool have = false;
+            bool pair_keyed = false;      /* source 1: QEMU's own TB key */
+            bool from_witness = false;
+            uint64_t witness_pa = 0;
+            if (!straddles) {
+                have = marker_gather_prefix(tb, i, raw_pc, prefix);
+                pair_keyed = have;        /* one page: the tail page IS the key */
+            } else {
+                have = marker_gather_prefix_tb(tb, i, raw_pc, prefix);
+                pair_keyed = have;
+                if (!have) {
+                    from_witness = marker_straddle_prefix_from_witness(
+                        raw_pc, prefix, &witness_pa);
+                    have = from_witness ||
+                           marker_read_guest(seq_base, prefix,
+                                             g_marker_seq.prefix_bytes);
+                }
+            }
+            MarkerWhich which = have
+                ? marker_whole_match(raw_bytes, raw_size, prefix)
+                : MARKER_WHICH_NONE;
+            if (straddles && which != MARKER_WHICH_NONE) {
+                /* Record the pair whatever the source: even source 1's
+                 * entry is worth having, because a later TB that starts on
+                 * the tail's page will need it.  The predecessor's physical
+                 * address comes from the WITNESS when the witness is what
+                 * decided this — re-resolving it here is the very read that
+                 * is not serviceable on the runs this exists for. */
+                uint64_t pp = 0, tp = 0;
+                bool have_pp = from_witness
+                    ? (witness_pa != 0 && (pp = witness_pa, true))
+                    : marker_page_paddr(seq_base, &pp);
+                if (have_pp && marker_page_paddr(raw_pc, &tp)) {
+                    marker_straddle_pair_note(tp, pp & ~(page - 1), which);
+                } else {
+                    pair_keyed = false;     /* unrecorded: keep the recheck */
+                }
+            }
+            if (straddles && marker_straddle_diag()) {
+                fprintf(stderr, "[straddle] tail=0x%" PRIx64 " i=%zu have=%d "
+                        "pair_keyed=%d which=%d\n", raw_pc, i, (int)have,
+                        (int)pair_keyed, (int)which);
+            }
+            if (straddles && !pair_keyed) {
+                /* Decided, but by a source QEMU's TB key does not carry.
+                 * Arm the recheck so the running address space answers for
+                 * itself whenever it can, and the pair only when it cannot. */
+                have = false;
+                which = MARKER_WHICH_NONE;
+            }
+            if (have) {
+                if (which == MARKER_WHICH_START) {
+                    qemu_plugin_register_vcpu_insn_exec_cb(
+                        insn, vcpu_marker_cb, QEMU_PLUGIN_CB_NO_REGS,
+                        marker_udata_pack(raw_pc, raw_size,
+                                          /* recheck= */ false));
+                } else if (which == MARKER_WHICH_END) {
+                    qemu_plugin_register_vcpu_insn_exec_cb(
+                        insn, vcpu_marker_end_cb, QEMU_PLUGIN_CB_NO_REGS,
+                        marker_udata_pack(raw_pc, raw_size,
+                                          /* recheck= */ false));
+                }
+            } else {
+                /* Undecided here: either the sequence straddles a page
+                 * (above), or the slots before this instruction are not
+                 * readable at THIS moment because the page holding them is
+                 * not resident while we translate.  Either way, arm both
+                 * and re-read when the instruction executes: by then this
+                 * same CPU has fetched and retired those slots one or two
+                 * instructions ago, in the address space whose answer
+                 * counts.  See marker_verify_at_exec. */
                 qemu_plugin_register_vcpu_insn_exec_cb(
                     insn, vcpu_marker_cb, QEMU_PLUGIN_CB_NO_REGS,
-                    marker_udata_pack(raw_pc, raw_size));
-            }
-            if (marker_word_match(g_marker_seq.end, raw_bytes, raw_size)) {
+                    marker_udata_pack(raw_pc, raw_size, /* recheck= */ true));
                 qemu_plugin_register_vcpu_insn_exec_cb(
                     insn, vcpu_marker_end_cb, QEMU_PLUGIN_CB_NO_REGS,
-                    marker_udata_pack(raw_pc, raw_size));
+                    marker_udata_pack(raw_pc, raw_size, /* recheck= */ true));
             }
         }
 
@@ -9417,6 +9594,25 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         QEMU_PLUGIN_COND_GE, g_scoreboard.trace_this_ctx, 1,
         (void *)head_fragment);
 
+    /* Event-queue absorber: the per-TB drain point (see vcpu_evq_absorb).
+     * UNCONDITIONAL — every translated TB on every target carries it, with
+     * no ownership, privilege or segment condition — because the windows it
+     * exists for are precisely the ones where every such condition is
+     * false.  Registering it under `if (g_pin_reuse_guard)` the way the pin
+     * probe is registered would cover one target and one of the five
+     * windows; that was round 3's mistake and it is not repeated here.
+     *
+     * REGISTERED LAST.  Per-TB callbacks run in registration order and each
+     * cond_cb re-loads its slot, so on any TB where the heavy vcpu_tb_exec
+     * above dispatched, its drain has already stored 0 into evq_pending and
+     * this brcond is false.  The light path runs on exactly the TBs where
+     * nothing else drained.  Getting the order wrong silently converts every
+     * owned dispatch into the absorb path and changes the traced wire. */
+    qemu_plugin_register_vcpu_tb_exec_cond_cb(
+        tb, vcpu_evq_absorb, QEMU_PLUGIN_CB_RW_REGS,
+        QEMU_PLUGIN_COND_GE, g_scoreboard.evq_pending, 1,
+        (void *)head_fragment);
+
     /* Proactive spec-template reclaim (#91): when the wrong path has minted
      * more than a budget of reclaimable templates since the last flush —
      * speculative fetch wandering mutable data that happens to decode —
@@ -9491,6 +9687,13 @@ static void vcpu_tb_flush(qemu_plugin_id_t id)
      * insn ran. */
     g_tb_flush_count.fetch_add(1, std::memory_order_acq_rel);
     g_wp_state.last_executed_tb = nullptr;   /* may point at a reclaimee */
+    /* The straddle tables ARE translation-derived: every entry is a fact
+     * about code QEMU is about to re-translate, and every one of them is
+     * re-established by that re-translation before the sequence can run
+     * again.  Dropping them here bounds how stale a recorded physical page
+     * pair can be — the one thing a physical key cannot notice on its own is
+     * the guest rewriting the predecessor page underneath it. */
+    marker_straddle_reset();
     g_mutex_lock(&data_lock);
     uint64_t freed = g_template_store.reclaim_spec_templates();
     g_mutex_unlock(&data_lock);
@@ -9589,6 +9792,26 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
 {
     g_trace_segments.set_shutting_down();
 
+    /* Totals from the QUEUE SIDE, produced by the event producer upstream
+     * of every plugin attribution gate.  Best-effort HERE and nowhere else
+     * critical: in system mode this hook runs from atexit(3), after
+     * qemu_cleanup() has stopped the vCPUs and torn the machine down, so
+     * qemu_get_cpu() may resolve nothing and these read 0.  The number that
+     * matters — the queue-length high-water mark — is therefore latched
+     * continuously at every non-empty drain (evq_note_drain) and is already
+     * correct before this runs; only the push/drain totals depend on the
+     * machine still being assembled, and evq_note_drain's own counts stand
+     * in for them when it is not. */
+    for (int i = 0, n = qemu_plugin_num_vcpus(); i < n; i++) {
+        uint64_t ml = 0, np = 0, nd = 0;
+        qemu_plugin_cpu_events_stats((unsigned)i, &ml, &np, &nd);
+        if (ml > g_stats.evq_qmax_len) {
+            g_stats.evq_qmax_len = ml;
+        }
+        g_stats.evq_q_pushes += np;
+        g_stats.evq_q_drains += nd;
+    }
+
     g_rec_mutex_lock(&exec_lock);
 
     if (g_trace_segments.is_active()) {
@@ -9676,46 +9899,46 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
      * are rendered from it.  Nothing at exit touches the thread-local.
      */
     Stats final_stats = stats_snapshot();
-    final_stats.marker_run_broken = marker_runs_broken();
-    final_stats.marker_run_adopted = marker_runs_adopted();
-    final_stats.marker_run_incomplete = marker_runs_incomplete();
-    final_stats.marker_handoff_evicted = marker_handoff_evicted();
-    final_stats.marker_local_evicted = marker_local_evicted();
-    final_stats.marker_local_stale = marker_local_stale();
-    final_stats.marker_cand_restarts = marker_candidate_restarts();
-    final_stats.marker_cand_evicted = marker_candidate_evicted();
-    final_stats.marker_cand_outstanding = marker_candidates_outstanding();
-    if (final_stats.marker_run_broken || final_stats.marker_end_no_close ||
+    /* The marker is decided in the bytes, so there is no run state to leave
+     * behind and nothing to report at exit about a sequence that
+     * half-happened.  The one count worth carrying is how often a
+     * marker-shaped instruction was ruled out because the slots before it
+     * were unreadable — see Stats::marker_prefix_unreadable. */
+    final_stats.marker_prefix_unreadable = marker_prefix_unreadable();
+    /* ... and, for every one of those, whether the sequence's physical page
+     * pair could still answer.  marker_straddle_undecided is the number that
+     * must be 0: a straddling sequence with neither source. */
+    final_stats.marker_straddle_pair_resolved = marker_straddle_pair_resolved();
+    final_stats.marker_straddle_conflicts = marker_straddle_conflicts();
+    final_stats.marker_straddle_undecided = marker_straddle_undecided();
+    /* The tripwires that SURVIVE byte-decided detection.  Each still names
+     * a way a correct-path marker can be lost, and none of them depends on
+     * a run: a leaked wrong-path session bracket silently drops every
+     * marker callback on its vCPU, and an END suppressed by the fence on a
+     * demonstrably non-speculative execution is a window that should have
+     * closed and did not. */
+    if (final_stats.marker_end_suppressed ||
         final_stats.wp_session_on_cp ||
-        final_stats.marker_fence_session_only ||
-        final_stats.marker_run_incomplete ||
-        final_stats.marker_handoff_evicted) {
+        final_stats.marker_fence_session_only) {
         fprintf(stderr,
             "\nchampsim_tracer: *** MARKER INVARIANT TRIPWIRE ***\n"
-            "  marker run broken            %" PRIu64 " (must be 0)\n"
-            "  marker END with no close     %" PRIu64 " (must be 0)\n"
+            "  marker END suppressed by fence %" PRIu64 " (must be 0)\n"
             "  WP session flag on CP step   %" PRIu64 " (must be 0)\n"
             "  marker fence session-only    %" PRIu64 " (must be 0)\n"
-            "  marker run incomplete at exit %" PRIu64 " (must be 0)\n"
-            "  marker handoff evicted       %" PRIu64 " (must be 0)\n"
-            "  A correct-path marker sequence may have been missed: the "
-            "window that\n  should have closed at it did not.\n\n",
-            final_stats.marker_run_broken, final_stats.marker_end_no_close,
+            "  A correct-path marker may have been dropped: the window that "
+            "should have\n  closed at it did not.\n\n",
+            final_stats.marker_end_suppressed,
             final_stats.wp_session_on_cp,
-            final_stats.marker_fence_session_only,
-            final_stats.marker_run_incomplete,
-            final_stats.marker_handoff_evicted);
+            final_stats.marker_fence_session_only);
         fflush(stderr);
-    }
-    if (getenv("CST_MKMIG_DIAG")) {
-        marker_handoff_census();
     }
     if (getenv("CST_STATSDBG")) {
         /* Positive control for the paragraph above: the thread-local read
          * and the aggregate, side by side, at the same instant. */
-        fprintf(stderr, "[statsdbg] tls.broken=%" PRIu64 " agg.broken=%" PRIu64
+        fprintf(stderr, "[statsdbg] tls.end_supp=%" PRIu64
+                " agg.end_supp=%" PRIu64
                 " tls.wp_sess=%" PRIu64 " agg.wp_sess=%" PRIu64 "\n",
-                g_stats.marker_run_broken, final_stats.marker_run_broken,
+                g_stats.marker_end_suppressed, final_stats.marker_end_suppressed,
                 g_stats.wp_session_on_cp, final_stats.wp_session_on_cp);
         fflush(stderr);
     }
@@ -9952,8 +10175,66 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     g_window_mode       = cfg.window_mode;
     g_marker_policy     = cfg.marker_policy;
     g_latch_timeout_ms  = cfg.latch_timeout_ms;
+    g_latch_idle_insns  = cfg.latch_idle_insns;
     g_stall_ceiling     = cfg.stall_ceiling;
     g_stall_any_ceiling = cfg.stall_ceiling_any;
+    /* marker_scan_enabled() below reads g_system_mode; seat it before the
+     * admission test rather than at its later assignment. */
+    g_system_mode = info->system_emulation;
+
+    /*
+     * IN SYSTEM MODE, THE WINDOW MUST LATCH TO A PROCESS VIA A MARKER.
+     *
+     * A full-system guest runs many processes through one instruction
+     * stream.  A trace of a program is only a trace of that program if every
+     * instruction in it belongs to that program, and the ONLY thing that
+     * states which address space that is, is the START marker the program
+     * itself executes.  A window that merely names a position on a clock
+     * cannot say WHOSE instructions it is counting, so what it captures in
+     * system mode is not a trace of anything.
+     *
+     * THE TEST IS THE PROPERTY, NOT A LIST OF MODE NAMES.  marker_scan_
+     * enabled() is exactly "this window arms marker detection and therefore
+     * latches to the address space that ran the START marker".  It is true
+     * for trace_window=marker AND for a system-mode trace_window=simpoint,
+     * which is a MARKER window with a simpoint schedule inside it: the
+     * marker pins the process and zeroes the user clock, and the SimPoint
+     * offsets then position the capture on that clock (see
+     * pinned_simpoint_mode).  Naming modes here instead would refuse the
+     * canonical marker+simpoint configuration, and a hand-listed set is
+     * exactly how that mistake gets made.
+     *
+     * User mode is unaffected — qemu-user emulates one program, so the
+     * window modes that only position a clock are exactly as meaningful
+     * there as they have always been.
+     */
+    if (info->system_emulation && !marker_scan_enabled()) {
+        const char *named =
+            cfg.window_mode == PluginConfig::WIN_ICOUNT ? "icount" :
+            cfg.window_mode == PluginConfig::WIN_SYMBOL ? "symbol" :
+                                                          "the default";
+        fprintf(stderr,
+            "champsim_tracer: refusing to start — %s is not a valid window "
+            "in system mode.\n"
+            "  A full-system guest runs many processes through one "
+            "instruction stream, and\n  a %s window is a position on a "
+            "clock: it cannot say whose instructions\n  it is counting, so "
+            "what it captures is not a trace of any one program.\n"
+            "  A system-mode window must LATCH to a process, which means the "
+            "program must\n  execute a START marker in its own address "
+            "space.  Use either\n"
+            "      trace_window=marker:simulation=<insns>+policy="
+            "latch|trace-all\n"
+            "  or, to capture SimPoint intervals inside that marked region,\n"
+            "      trace_window=simpoint:file=<f>+interval=<n>+warmup=<n>"
+            "+simulation=<n>\n"
+            "  (the marker pins the process; the simpoint schedule chooses "
+            "the intervals).\n"
+            "  Give the workload its markers — compile them in, or inject "
+            "them with\n  cst_attach.\n",
+            named, named);
+        return -1;
+    }
 
     /*
      * BOUNDED BY CONSTRUCTION, OR REFUSED.
@@ -9970,18 +10251,44 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
      *   2. the any-context instruction ceiling (stall_ceiling_any) — an
      *      architectural bound that holds whatever the guest is doing, as
      *      long as it executes ANYTHING;
-     *   3. the dead-latch wall-clock timeout (latch_timeout) — opt-in,
-     *      because its signal cannot tell a dead process from an idle one.
+     *   3. the dead latch (latch_timeout on the host's wall clock, or
+     *      latch_idle_insns on the guest's own instruction stream) —
+     *      opt-in, because its signal cannot tell a dead process from an
+     *      idle one.  Either denominator alone bounds the run.
      *
      * Only (2) and (3) bound a guest that keeps running and never shuts
      * down.  Turning (2) off with no (3) leaves the run unbounded, so it is
      * not started at all: an operator who wants a capture with no bound
-     * must say so by giving latch_timeout, not by disabling the default.
+     * must say so by giving a dead latch, not by disabling the default.
      * Refused here rather than warned about, because the failure it
      * prevents is a run that never ends and a trace that is never written.
      */
+    /*
+     * A pinned system-mode capture needs the kernel-excursion ownership
+     * model.  Without it there is no trustworthy answer to "whose work is
+     * this?" at kernel privilege — the live address-space register is
+     * exactly the read the excursion model exists to replace — and the
+     * event-retention gate would have to fall back to retaining every
+     * kernel-privilege fault event, i.e. precisely the unbounded behaviour
+     * it removes.  Refused rather than run in a partial form.
+     */
+    if (info->system_emulation && !cfg.kexc &&
+        (cfg.window_mode == PluginConfig::WIN_MARKER ||
+         cfg.window_mode == PluginConfig::WIN_SIMPOINT)) {
+        fprintf(stderr,
+            "champsim_tracer: refusing to start — kexc=0 with a pinned "
+            "system-mode window.\n"
+            "  Kernel-privilege attribution then rests on the live "
+            "address-space register,\n  which the kernel itself rewrites "
+            "(entry switches, TLB-maintenance probes), so\n  neither the "
+            "block gate nor the event-retention gate can say whose work a "
+            "kernel\n  fault is.  Use kexc=1 (the default), or a non-pinned "
+            "window.\n");
+        return -1;
+    }
+
     if (info->system_emulation && !cfg.stall_ceiling_any &&
-        !cfg.latch_timeout_ms &&
+        !cfg.latch_timeout_ms && !cfg.latch_idle_insns &&
         (cfg.window_mode == PluginConfig::WIN_MARKER ||
          cfg.window_mode == PluginConfig::WIN_SIMPOINT)) {
         fprintf(stderr,
@@ -9992,11 +10299,12 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
             "END marker.  If the\n  process is killed, blocks forever, or "
             "is never scheduled, neither can\n  happen.  stall_ceiling_any="
             "0 disables the architectural bound that\n  covers exactly "
-            "that case, and no latch_timeout was given, so nothing would\n"
+            "that case, and no dead latch was given, so nothing would\n"
             "  end this run.\n"
             "  Give stall_ceiling_any=<arch insns> (default %llu), or "
-            "latch_timeout=<ms>\n  if you want a wall-clock bound instead."
-            "\n",
+            "latch_idle_insns=<arch insns>\n  for a per-window bound on the "
+            "same architectural clock, or latch_timeout=<ms>\n  if you want "
+            "a wall-clock bound instead.\n",
             cfg.window_mode == PluginConfig::WIN_MARKER ? "marker"
                                                         : "simpoint",
             (unsigned long long)CST_STALL_ANY_CEILING_DEFAULT);
@@ -10206,6 +10514,29 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
      * pre-segment TBs lockless-bail until they get close. */
     recompute_next_threshold();
 
+
+    /* Publish the "a path-event drain is owed" slot BEFORE any TB is
+     * translated.  QEMU writes it on every queue push and clears it on
+     * every drain; the per-TB absorber registered in vcpu_tb_trans is
+     * conditional on it.  Without it the absorber's brcond is never true
+     * and the queue reverts to growing with untraced execution.
+     *
+     * CST_EVQ_NOABSORB=1 withholds the registration.  It is the A/B arm —
+     * the SAME binary, the same instrument, the same everything, minus the
+     * mechanism — so the before/after numbers are not confounded by a
+     * different build.  It is a diagnostic, never a supported mode: QEMU's
+     * structural tripwire is likewise only armed when the slot is
+     * published, because the ceiling is a claim about what a per-TB drain
+     * point makes impossible.  Announced on stderr so a run that has it set
+     * can never be mistaken for a shipping one. */
+    if (getenv("CST_EVQ_NOABSORB")) {
+        fprintf(stderr, "champsim_tracer: *** CST_EVQ_NOABSORB: the per-TB "
+                "event-queue drain point is DISABLED (A/B arm).  The queue "
+                "is unbounded in this run and the producer tripwire is not "
+                "armed.  Never a shipping configuration. ***\n");
+    } else {
+        qemu_plugin_cpu_events_pending_slot(g_scoreboard.evq_pending);
+    }
 
     qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
     qemu_plugin_register_flush_cb(id, vcpu_tb_flush);

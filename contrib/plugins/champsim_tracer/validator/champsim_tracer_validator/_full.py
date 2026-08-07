@@ -45,6 +45,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from . import _multiproc as MP
+from . import _marker as MK
 
 
 # ===========================================================================
@@ -79,6 +80,12 @@ FEATURES: dict[str, str] = {
     "opt:window_marker":         "trace_window=marker:simulation",
     "opt:window_marker_latch":   "trace_window=marker:policy=latch",
     "opt:window_marker_traceall": "trace_window=marker:policy=trace-all",
+    "opt:window_system_marker_only": "system mode accepts ONLY "
+                                  "trace_window=marker — icount, symbol, "
+                                  "simpoint and the default window are "
+                                  "refused at plugin install, because a "
+                                  "position on a clock cannot say whose "
+                                  "instructions it is counting",
     # ---- wire: body tags -------------------------------------------------
     "wire:BODY_TAG_ENTRY":       "correct-path BB invocation record",
     "wire:BODY_TAG_REGFILE":     "per-(segment,thread) register-file snapshot",
@@ -130,6 +137,8 @@ FEATURES: dict[str, str] = {
     "behavior:syscall_fault_nesting": "system-mode syscall/fault nesting discipline",
     "behavior:user_code_identity": "ASID-pin: user templates byte-match binary",
     "behavior:marker_injection": "cst_attach ptrace-injects the marker into an unmarked target's entry point",
+    "behavior:marker_detection_exact": "a COMPLETE marker sequence is never missed: the whole-sequence byte match made at translation time fires exactly once, on the sequence's last instruction, and still fires when that instruction is a branch target — the translation block then starts mid-sequence and the preceding instruction slots have to be read out of guest memory rather than out of the block",
+    "behavior:marker_no_false_claim": "an INCOMPLETE marker sequence is never claimed: CST_MARKER_SEQ_LEN-1 adjacent units, a lone START unit, a lone END unit, and the chimera (the START sequence's leading units followed by the END sequence's last unit — the two share their terminating instruction on the fixed-width ISAs) all open no window and write no segment",
     "behavior:guest_thread_identity": "thread_id is guest thread, not vCPU",
     "behavior:thread_strand_sequential": "every (thread_id, asid) context reads as one sequential strand: concurrent guest threads never share an id, so a kernel strand is never braided with another vCPU's",
     "behavior:asid_recycle":     "narrow-ASID recycle-no-cross-attribution",
@@ -297,6 +306,13 @@ def _classify_cli_failure(tail: str) -> str:
 def _cli_outcome(rc: int, tail: str, timeout: int) -> Outcome:
     if rc == 124:
         return Outcome("fail", f"TIMEOUT after {timeout}s\n{tail}")
+    # __main__.RC_SKIP: the run could not be hosted (absent cross-compiler,
+    # unstaged guest kernel/rootfs).  It is NOT a pass -- a check that never
+    # ran must never report as one, or its feature-coverage tags claim
+    # exercise that did not happen.
+    from . import __main__ as M      # lazy: __main__ imports this module
+    if rc == M.RC_SKIP:
+        return Outcome("skip", f"did not run (rc={rc})\n{tail}")
     if rc == 0:
         return Outcome("pass", f"rc={rc}\n{tail}")
     return Outcome("fail", f"{_classify_cli_failure(tail)} (rc={rc})\n{tail}")
@@ -501,6 +517,143 @@ def _chk_system_user(ctx: Ctx) -> Outcome:
         timeout=900, log_path=d / "run.log",
         extra_env={"CST_QEMU_EXTRA_ARGS": "-cpu max"})
     return _cli_outcome(rc, tail, 900)
+
+
+def _chk_system_simpoint(ctx: Ctx) -> Outcome:
+    """SYSTEM-mode marker+simpoint composition, judged FROM THE TRACE.
+
+    A system-mode ``trace_window=simpoint`` is not an alternative to a marker
+    window -- it IS one, with a SimPoint schedule inside it.  The START
+    marker pins the address space and zeroes the user clock
+    (``pinned_simpoint_mode`` turns marker scanning on for exactly this
+    reason), and the SimPoint offsets then position the capture on that
+    clock.  Kernel work is traced but never advances the clock, which is what
+    makes offsets derived from a user-mode bbv run valid here.
+
+    THIS CHECK EXISTS BECAUSE DELETING THAT COMPOSITION ENTIRELY LEFT
+    ``validator full`` GREEN.  ``features.simpoint`` is user-mode and
+    x86_64-only, so nothing in the suite ever executed the marker-pinned
+    path; the whole capability could be removed without a red run.
+
+    Judged from the WIRE, never from a log line: the emitted segment must be
+    the scheduled cluster, and the header it carries must state the warmup
+    and total-target the schedule asked for.
+    """
+    import json
+    d = ctx.dir("system_simpoint_x86")
+    d.mkdir(parents=True, exist_ok=True)
+    # Sized to the workload, which is the direction that works: at
+    # --hot-iters 400 this generator's program retires 45,160 USER
+    # instructions in total (measured; the marker window closes on its END
+    # at user_covered=45160).  The schedule must fit inside that.  The
+    # version this check was first written with asked for a first simpoint
+    # at 200,000 user insns -- more than 4x the entire workload -- so it
+    # captured nothing and could not have passed on any build.  Raising
+    # --hot-iters instead is not the fix: the generator's ground-truth CP
+    # walk is bounded at max_steps=100_000 blocks and 8000 iterations
+    # overruns it ("CP walk did not terminate").
+    interval, warmup, sim = 5_000, 1_000, 5_000
+    # TWO clusters at different offsets, captured in ONE boot.
+    #
+    # Reading a single segment's header proves only that a capture happened
+    # carrying the numbers the schedule asked for.  It cannot distinguish a
+    # correctly POSITIONED capture from one that opened wherever it liked
+    # and stamped the right header on the way out -- and positioning is the
+    # entire claim of a simpoint window.  The clock it positions on is the
+    # LATCHED process's user clock: zeroed at the START marker and advanced
+    # only by that process's user-privilege instructions.  Two scheduled
+    # offsets must therefore come out ORDERED THE SAME WAY on that clock,
+    # which is what the strict-inequality leg below asserts -- the shape
+    # quick.symbol_start already uses for occurrence=1 vs occurrence=2.
+    #
+    # This leg is what a fast-forward/positioning optimisation has to stay
+    # green against; without it, a mis-positioned segment still carries a
+    # perfectly correct header.
+    cluster, cluster2 = 7, 9
+    idx, idx2 = 2, 5                          # start_insn = idx * interval
+    spf = d / "sp.simpoints"
+    spf.write_text(f"{idx} {cluster}\n{idx2} {cluster2}\n")
+    # Last scheduled offset plus its window must fit the 45,160 user insns
+    # the workload retires: 5*5000 + 1000 + 5000 = 31,000, ~31% margin.
+    need_user_insns = idx2 * interval + warmup + sim
+    rc, tail = _run_cli(
+        ["all", "--isa", "x86_64", "--seed", _seedhex(ctx),
+         "--build-dir", str(ctx.build_dir), "-o", str(d), "--system",
+         "--marker", "--regdata", "--hot-iters", "400",
+         "--stop", str(sim), "--simpoints", str(spf),
+         "--sp-interval", str(interval), "--sp-warmup", str(warmup)],
+        timeout=900, log_path=d / "run.log",
+        extra_env={"CST_QEMU_EXTRA_ARGS": "-cpu max"})
+    if rc != 0:
+        # Distinguish "the workload was too short to reach the schedule" from
+        # a real composition failure -- they need opposite responses, and the
+        # raw tail is kernel console noise that says neither.
+        log = (d / "run.log").read_text(errors="replace") \
+            if (d / "run.log").exists() else ""
+        if ("positioning to simpoint start" in log
+                and "reached (user clock" not in log):
+            return Outcome("fail",
+                           f"the workload exited before reaching the first "
+                           f"scheduled offset ({idx * interval} user insns); "
+                           f"it must retire at least {need_user_insns} for "
+                           f"this schedule, so raise --hot-iters. The "
+                           f"composition itself was never exercised. "
+                           f"(cli rc={rc})")
+        return Outcome("fail", f"cli rc={rc}: {tail}")
+
+    dec = ctx.build_dir / "contrib" / "plugins" / "cst_decode"
+
+    def header_of(cl):
+        """(decoded stdout, path) for scheduled cluster @cl, or (None, None)."""
+        hits = sorted(d.rglob(f"*simpoint_{cl}.cst"))
+        if not hits:
+            return None, None
+        q = subprocess.run([str(dec), "--format=legacy", str(hits[0])],
+                           capture_output=True, text=True)
+        return (q.stdout if q.returncode == 0 else None), hits[0]
+
+    out1, cst1 = header_of(cluster)
+    out2, cst2 = header_of(cluster2)
+    if cst1 is None or cst2 is None:
+        return Outcome("fail",
+                       f"scheduled clusters {cluster}@{idx} and "
+                       f"{cluster2}@{idx2}: only "
+                       f"{[c for c in (cst1, cst2) if c]} was written -- the "
+                       "marker+simpoint composition did not capture both")
+    if out1 is None or out2 is None:
+        return Outcome("fail", "cst_decode failed on a scheduled segment")
+    p = SimpleNamespace(stdout=out1)
+
+    def field(name, text=None):
+        m = re.search(rf"^{name} (\d+)$", text if text is not None else p.stdout,
+                      re.M)
+        return int(m.group(1)) if m else None
+
+    # POSITIONING: the later scheduled offset must open strictly later.  A
+    # capture that ignored the schedule and opened at the latch would put
+    # both segments at the same START_INSN.
+    s1, s2 = field("START_INSN", out1), field("START_INSN", out2)
+    if s1 is None or s2 is None or not (s2 > s1):
+        return Outcome("fail",
+                       f"positioning: cluster {cluster} (offset {idx}) opened "
+                       f"at START_INSN={s1} and cluster {cluster2} (offset "
+                       f"{idx2}) at {s2}; the later scheduled offset did not "
+                       f"open strictly later on the latched user clock")
+
+    got_w, got_tot = field("WARMUP_INSNS"), field("TOTAL_TARGET_INSNS")
+    want_tot = warmup + sim
+    if got_w != warmup or got_tot != want_tot:
+        return Outcome("fail",
+                       f"wire header says WARMUP_INSNS={got_w} "
+                       f"TOTAL_TARGET_INSNS={got_tot}; the schedule asked "
+                       f"for {warmup} and {want_tot}")
+    return Outcome("pass",
+                   f"both scheduled clusters captured inside the marked "
+                   f"region and correctly ORDERED on the latched user clock: "
+                   f"cluster {cluster}@{idx} START_INSN={s1} < cluster "
+                   f"{cluster2}@{idx2} START_INSN={s2}; "
+                   f"WARMUP_INSNS={got_w} TOTAL_TARGET_INSNS={got_tot} "
+                   f"(read from the wire, not the log)")
 
 
 def _chk_churn(isa: str):
@@ -1691,6 +1844,10 @@ def build_checks() -> list:
                     "wire:BODY_TAG_ASID_SWITCH",
                     "behavior:syscall_fault_nesting",
                     "behavior:user_code_identity"], _chk_system_user))
+    C.append(Check("system.simpoint_x86", "system",
+                   "system-mode marker+simpoint composition (x86)",
+                   ["opt:window_simpoint", "opt:window_marker"],
+                   _chk_system_simpoint))
     C.append(Check("system.churn_x86", "system",
                    "multi-process ASID-churn pin (x86)",
                    ["tool:cst_decode_strict", "tool:cst_audit",
@@ -1765,6 +1922,26 @@ def build_checks() -> list:
                    ["opt:latch_timeout", "behavior:dead_latch"],
                    _chk_dead_latch))
 
+    # The marker's one invariant, in both of its directions.  Neither is
+    # visible in the wire: a MISS produces no trace at all, and a FALSE CLAIM
+    # produces a perfectly well-formed trace of the wrong process.  x86_64 and
+    # aarch64 both run because the fixed-width targets are where the two
+    # sequences share their terminating instruction, which is the shape a
+    # per-word detector mistook for a marker.
+    C.append(Check("features.marker_detection", "features",
+                   "a complete marker sequence is never missed (plain, and "
+                   "entered mid-sequence through a branch) and an incomplete "
+                   "one is never claimed (x86_64 + aarch64)",
+                   ["behavior:marker_detection_exact",
+                    "behavior:marker_no_false_claim",
+                    "opt:window_marker", "opt:window_marker_latch"],
+                   MK.chk_marker_detection))
+    C.append(Check("features.system_window_modes", "features",
+                   "system mode accepts only trace_window=marker; icount / "
+                   "symbol / simpoint / the default are refused at plugin "
+                   "install (both directions proven)",
+                   ["opt:window_system_marker_only"],
+                   MK.chk_system_window_modes))
     C.append(Check("features.simpoint", "features",
                    "per-simpoint segment independence + consistency",
                    ["opt:window_simpoint",
@@ -2088,6 +2265,16 @@ def run_full(args) -> int:
     summary["coverage"]["runtime_covered"] = runtime_covered
     summary["coverage"]["runtime_uncovered"] = runtime_uncovered
 
+    # In an UNFILTERED full run every registered feature must have an
+    # exerciser that actually PASSED.  A check that skipped still declares
+    # its feature tags, so without this a missing guest fixture silently
+    # retires a feature from the suite while the gate stays green -- the
+    # same laundering as an rc=0 skip reading as a pass.  Gated only when
+    # unfiltered, because --tier/--only deliberately runs a subset.
+    unfiltered = not args.tier and not args.only
+    coverage_gap = bool(runtime_uncovered) and unfiltered
+    summary["coverage"]["runtime_gap_gates"] = coverage_gap
+
     summary["counts"] = counts
     # Every "(must be 0)" row of every cell this run produced.  Cells of a
     # non-gating check report but do not gate.
@@ -2096,7 +2283,7 @@ def run_full(args) -> int:
     # Exit code: FAIL on any failed check, a registration gap, or a violated
     # "must be 0" invariant.
     hard_fail = (counts["fail"] > 0 or bool(cov["static_gap"])
-                 or bool(cov["unknown"])
+                 or bool(cov["unknown"]) or coverage_gap
                  or summary["tripwire_census"]["status"] == "fail")
     summary["overall"] = "fail" if hard_fail else "pass"
     summary["exit_code"] = 1 if hard_fail else 0
@@ -2154,8 +2341,10 @@ def _emit_summary(summary: dict, args) -> None:
         print(f"  !! UNKNOWN features claimed by checks: "
               f"{cov['unknown_features']}")
     if "runtime_uncovered" in cov and cov["runtime_uncovered"]:
-        print(f"  ~  runtime-uncovered (no PASSED exerciser this run): "
-              f"{cov['runtime_uncovered']}")
+        gates = cov.get("runtime_gap_gates")
+        print(f"  {'!!' if gates else '~ '} runtime-uncovered (no PASSED "
+              f"exerciser this run): {cov['runtime_uncovered']}"
+              f"{'' if gates else '  [subset run — advisory]'}")
     print(f"\nsummary json: {default}")
     print(f"OVERALL: {summary['overall'].upper()}  "
           f"(exit {summary['exit_code']})")

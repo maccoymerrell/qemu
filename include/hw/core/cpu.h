@@ -501,11 +501,48 @@ typedef struct QemuPluginCpuEvent {
 /* The drain hands the buffer to plugins as struct qemu_plugin_cpu_event;
  * the two layouts must stay identical (checked in plugins/api.c). */
 
+/*
+ * STRUCTURAL ceiling on the queue length -- not a cap, not a threshold, and
+ * nothing is ever dropped at it.  It is the value the length CANNOT reach
+ * while the consumer contract below holds, so exceeding it is a broken
+ * invariant and the producer says so loudly (cpu_plugin_evq_push).
+ *
+ * The consumer contract: the plugin registers a per-vCPU "queue non-empty"
+ * scoreboard slot (qemu_plugin_cpu_events_pending_slot) and a per-TB
+ * conditional callback on it, so EVERY translation block entry on that vCPU
+ * is a drain point.  Between two consecutive drain points the producers are:
+ *
+ *   - the guest instructions of the ONE translation block in flight, each of
+ *     which can commit at most one address-space-root write, and QEMU caps a
+ *     TB at TCG_MAX_INSNS (512) instructions;
+ *   - the exception edges that can be delivered without executing a TB in
+ *     between: a fault entry, a fault return, an async entry and an async
+ *     return.  A fault taken while delivering a fault nests, and that nesting
+ *     is architecturally bounded -- the target resets long before it could
+ *     exceed CPU_PLUGIN_FAULT_STACK_MAX (64) levels -- so at most
+ *     2 * CPU_PLUGIN_FAULT_STACK_MAX edges can pile up unexecuted.
+ *
+ * 512 + 2*64 = 640; 1024 is that rounded up to the allocator's doubling
+ * quantum, so the buffer reaches at most 1024 entries (32 KiB) per vCPU ONCE
+ * and never grows again, independently of how long the vCPU runs untraced.
+ */
+#define CPU_PLUGIN_EVQ_STRUCTURAL_MAX 1024
+
 typedef struct QemuPluginCpuEventQueue {
     QemuPluginCpuEvent *buf;    /* grow-only; owned by the vCPU */
     uint32_t len;
     uint32_t cap;
     bool enabled;
+    /*
+     * QUEUE-SIDE WITNESS.  Produced by the producer, upstream of every
+     * plugin attribution decision, so a plugin gate that refuses a context
+     * cannot suppress it.  max_len is the high-water length ever reached;
+     * n_push / n_drain count the two ends.  Reported through
+     * qemu_plugin_cpu_events_stats().
+     */
+    uint32_t max_len;
+    uint64_t n_push;
+    uint64_t n_drain;
 } QemuPluginCpuEventQueue;
 
 struct CPUState {
@@ -588,6 +625,29 @@ struct CPUState {
 
 #ifdef CONFIG_PLUGIN
     CPUPluginState *plugin_state;
+
+    /*
+     * Current (process, thread) identity of this vCPU — QEMU-maintained,
+     * per-vCPU, handed to plugins as OPAQUE monotonic integers.
+     *
+     * @plugin_space_key / @plugin_thread_key are the RAW architectural keys
+     * the target's TCGCPUOps::get_plugin_identity hook last reported; they
+     * are a one-entry memo, so a re-sample that finds the same architectural
+     * state costs one comparison and never touches the intern table.
+     * @plugin_process_id / @plugin_thread_id are the interned ids.  0 means
+     * "no identity": a target with no hook (user mode) and a CPU model that
+     * implements no thread-pointer register both report it.
+     *
+     * Refreshed by plugin_identity_sample() at the architectural commit
+     * point for the address space (the same site that flushes the TLB and
+     * pushes the ASID_WRITE event) and on demand from the plugin API, whose
+     * callers sample in a context where the architectural state is coherent.
+     */
+    uint64_t plugin_space_key;
+    uint64_t plugin_thread_key;
+    uint64_t plugin_process_id;
+    uint64_t plugin_thread_id;
+    bool plugin_identity_valid;
 
     /*
      * Architectural self-loop accounting for the fan-out instruction (an

@@ -201,6 +201,27 @@ static uint64_t riscv_get_plugin_thread_ptr(CPUState *cs)
     return riscv_vaddr_is_kernel(cs, ss) ? ss : tp;
 }
 
+/*
+ * Raw architectural identity keys (see TCGCPUOps::get_plugin_identity).
+ *
+ * Address space: SATP, which is already the composite {MODE, ASID, PPN}
+ * the architecture uses to name a translation.  Under H-extension
+ * virtualization the address space in effect is VSATP, not SATP.
+ *
+ * Thread: tp (x4), the ABI's thread pointer.  The raw register, not the
+ * trap-entry sscratch swap the S-mode software convention performs — that
+ * convention is an operating system's, and reading it would mean deciding
+ * which of two registers "looks like" a kernel address.
+ */
+static void riscv_get_plugin_identity(CPUState *cs, uint64_t *space_key,
+                                      uint64_t *thread_key)
+{
+    CPURISCVState *env = cpu_env(cs);
+
+    *space_key = env->virt_enabled ? env->vsatp : env->satp;
+    *thread_key = env->gpr[4];
+}
+
 static bool riscv_plugin_thread_ptr_tracks_current(CPUState *cs)
 {
     CPURISCVState *env = cpu_env(cs);
@@ -280,6 +301,7 @@ static const TCGCPUOps riscv_tcg_ops = {
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     .get_plugin_state = riscv_get_plugin_state,
     .get_plugin_thread_ptr = riscv_get_plugin_thread_ptr,
+    .get_plugin_identity = riscv_get_plugin_identity,
     .plugin_thread_ptr_tracks_current = riscv_plugin_thread_ptr_tracks_current,
     .vaddr_is_kernel = riscv_vaddr_is_kernel,
     .spec_clock_resync = riscv_spec_clock_resync,

@@ -1096,7 +1096,16 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
        off is the configuration this tracer is characterised on.
        ``kexc=0`` restores the strict live-ASID rule: kernel work whose
        live ASID differs from the pinned value is dropped.  Ignored in
-       user mode.
+       user mode.  In system mode ``kexc=0`` is **refused at startup**
+       when the window is pinned (``trace_window=marker`` or
+       ``simpoint``): with the excursion model off there is no
+       trustworthy answer to *whose work is this* at kernel privilege —
+       the live register is the very read the model exists to replace —
+       so neither the block gate nor the path-event retention gate can
+       attribute a kernel fault, and retention would have to fall back to
+       keeping every kernel-privilege event, unbounded in the length of
+       untraced execution.  Refused rather than run in a partial form;
+       use ``kexc=1`` or an unpinned window.
    * - ``faults=0|1``
      - ``1``
      - Synchronous-fault handler tracing (**system mode only**).  When on,
@@ -1260,6 +1269,20 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
        its end marker does not hold the segment open until the icount
        budget.  Off by default because the signal cannot distinguish a
        dead process from a merely long-idle live one.
+   * - ``latch_idle_insns=<arch insns>``
+     - ``0`` (disabled)
+     - The same dead-latch detector as ``latch_timeout``, on the guest's
+       own instruction clock.  Closes a marked process's window once the
+       guest has retired this many architectural instructions, in ANY
+       context, since that process was last scheduled in.  Architectural,
+       so unlike ``latch_timeout`` the close point does not move with
+       host load — prefer this denominator.  The two are independent:
+       either alone or both, and a window closes as soon as either
+       crosses.  Reported as ``idle=<N> insns`` on the ``dead-latch
+       close`` line, close line ``IDLE``, and ``dead-latch windows closed
+       (idle insns)`` in the statistics.  Covers the shape where the
+       traced process is killed or never scheduled again — the opposite
+       of ``stall_ceiling``, which needs it to be running.
    * - ``stall_ceiling_any=<arch insns>``
      - ``2000000000``
      - Termination bound for a system-mode capture whose traced process
@@ -1270,8 +1293,9 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
        ``CEILING``, ``any-context stall closes`` in the statistics.
        Architectural, so it is load-invariant; see :doc:`quickstart` for
        what that means in wall-clock.  ``0`` disables it, and a marker or
-       simpoint system capture with it disabled and no ``latch_timeout``
-       is REFUSED at startup — that configuration cannot terminate.
+       simpoint system capture with it disabled and neither dead latch
+       (``latch_idle_insns``, ``latch_timeout``) given is REFUSED at
+       startup — that configuration cannot terminate.
        Independent of the always-armed machine-shutdown close, which
        ends a capture when the guest powers off (close line
        ``SHUTDOWN``).
@@ -1357,6 +1381,19 @@ trace run.
      - Decompressor thread count for the offline tools' ``xz``
        pipeline (``0`` = one per core; ``1`` forces serial for
        lowest memory; unset = a bounded auto of min(cores, 8)).
+   * - ``CST_STRADDLE_DIAG``
+     - *Diagnostic.*  One line per straddle witness taken and per
+       straddling marker decision — the tail, the head length, which
+       sequence matched, and the predecessor page's physical address
+       — so a sequence that goes undecided names the source that was
+       missing rather than only its count.
+   * - ``CST_STRADDLE_FORCE_UNREADABLE``
+     - *Positive control.*  Treats every straddling sequence's
+       backward read as unserviceable, so the sequence's physical
+       page pair has to decide the whole run on its own.  Whether
+       that read can be serviced is a property of the guest's TLB at
+       one instant, so without this a suite can pass without ever
+       exercising the pair.  It cannot make a marker appear.
 
 The modified QEMU base carries its own ``CST_*`` diagnostic
 switches (clock-skew probes, wrong-path state-diff snapshots,

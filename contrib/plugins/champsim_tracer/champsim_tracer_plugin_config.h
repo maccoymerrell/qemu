@@ -249,6 +249,55 @@ struct PluginConfig {
     uint64_t latch_timeout_ms = 0;
 
     /*
+     * Instruction-denominated dead latch (latch_idle_insns=<N>).
+     *
+     * The same detector as latch_timeout above — the same stamp at each
+     * owned root's schedule-in, the same off-hot-path sweep, the same
+     * per-window close, the same all-died segment shutdown — measured on a
+     * different denominator.  An owned root is dead here when the GUEST as
+     * a whole has retired N architectural instructions since that root was
+     * last scheduled in.
+     *
+     * WHY INSTRUCTIONS AND NOT MILLISECONDS.  latch_timeout's idleness is
+     * host wall-clock idleness, so where it closes a window rides on host
+     * load: the same guest running the same workload ages a window out at
+     * two different points in its own execution on a quiet box and on a
+     * loaded one.  This project's standing rule is that trace validity and
+     * hang prevention must NEVER depend on host load.  A guest-instruction
+     * denominator is architectural state the host scheduler cannot move, so
+     * the close point is reproducible across an idle and a loaded host.
+     *
+     * DEFAULT 0 = DISABLED (opt-in), for latch_timeout's reason: idleness
+     * alone cannot tell a dead process from a merely long-idle live one,
+     * only how much of it there is can, and only the operator knows how
+     * much their workload legitimately exhibits.  The two detectors are
+     * INDEPENDENT — either may be given alone or both together, and a root
+     * is dead as soon as EITHER threshold is crossed.
+     *
+     * HOW IT RELATES TO ITS NEIGHBOURS.  Three bounds, three different
+     * shapes; none subsumes another, so do not build a fourth:
+     *
+     *   stall_ceiling (ON by default, 256M arch insns) covers the shape
+     *     where the pinned process is ALIVE and retiring kernel
+     *     instructions in an owned context but never returns to user space,
+     *     so its user clock is frozen.  Its denominator is OWNED-context
+     *     instructions, which advance only because the process is running.
+     *
+     *   latch_idle_insns (this option) covers the DIFFERENT shape where the
+     *     process is killed or never scheduled again, so NO owned-context
+     *     instruction retires at all and stall_ceiling can never advance.
+     *     Its denominator is every instruction the guest retires, in any
+     *     context, and it is per-root: it closes one dead window and leaves
+     *     live peers tracing.
+     *
+     *   stall_ceiling_any (ON by default) bounds the same not-running shape
+     *     but at SEGMENT granularity — it is the termination bound of last
+     *     resort and truncates the capture; this one is the per-window
+     *     close that keeps the surviving windows.
+     */
+    uint64_t latch_idle_insns = 0;
+
+    /*
      * User-clock stall ceiling (stall_ceiling=<arch insns>, 0 disables).
      *
      * A marker window's budget runs on the pinned process's USER

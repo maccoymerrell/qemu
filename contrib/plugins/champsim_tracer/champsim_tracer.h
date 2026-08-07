@@ -57,6 +57,16 @@ extern "C" {
  * last slot rather than indexing out of bounds. */
 inline constexpr unsigned CST_PIN_MAX_VCPUS = 1024;
 
+/* Largest path-event batch one translation block can produce: TCG caps a TB
+ * at TCG_MAX_INSNS instructions, each of which can commit at most one
+ * address-space-root write, plus the fault/async entry and return edges
+ * around it.  A single drain larger than this means a TB entry did not act
+ * as a drain point, i.e. the per-TB absorber is not doing its job.  It is a
+ * DETECTION threshold only -- nothing is ever capped or dropped at it (see
+ * CPU_PLUGIN_EVQ_STRUCTURAL_MAX in QEMU's include/hw/core/cpu.h, which is
+ * the producer-side ceiling that aborts). */
+inline constexpr size_t CST_EVQ_TB_EVENT_MAX = 512 + 4;
+
 /* Wire-format invariants aliased from the shared spec (cst_wire_spec.h)
  * so the plugin and the offline tools can't diverge. */
 #define MAX_INSN_BYTES (cst_wire::INSN_BYTES_MAX)
@@ -1220,6 +1230,15 @@ typedef struct {
      * on the TB that re-acquires the process.  0 (probe never fires) for
      * user mode, unpinned system, and wide-register pins. */
     uint64_t pin_probe;
+    /* "A path-event drain is owed on this vCPU".  Written by QEMU, not by
+     * the plugin: 1 on every cpu_plugin_evq_push, 0 on every
+     * qemu_plugin_drain_cpu_events (see qemu_plugin_cpu_events_pending_slot).
+     * It is deliberately the ONE gate in this struct that no attribution
+     * decision feeds -- ownership, privilege, segment state and the pin all
+     * sit downstream of the producer -- which is what lets the light
+     * absorber callback (vcpu_evq_absorb) run in exactly the windows where
+     * every other gate is closed and nothing else would consume the queue. */
+    uint64_t evq_pending;
     /* Signed budget tracking insns until the next window event
      * (segment open in inter-segment, or sentinel "far future" while
      * in-segment).  Bumped by INLINE_ADD_U64(-n_insns) per TB exec

@@ -144,11 +144,30 @@ typedef uint64_t qemu_plugin_id_t;
  *   vCPU state, so a capture in progress is closed and finalised
  *   instead of abandoned).  System emulation only; under user-mode
  *   emulation the exit callback already runs on a guest thread.
+ *
+ * version 17:
+ * - added qemu_plugin_cpu_events_pending_slot: QEMU maintains a per-vCPU
+ *   "a drain is owed" scoreboard flag for the path-event queue, so a
+ *   plugin can test it from the JIT and drain at every TB entry.  This is
+ *   what makes the queue length bounded rather than a function of how long
+ *   the vCPU has run without dispatching the consuming callback.
+ * - added qemu_plugin_cpu_events_stats: queue-side max length / push /
+ *   drain counts, produced upstream of any plugin attribution decision.
+ * - qemu_plugin_cpu_events_set() no longer discards a pending backlog; a
+ *   non-empty queue at that call is a bug and QEMU says so.
+ *
+ * version 18:
+ * - added qemu_plugin_get_process_id / qemu_plugin_get_thread_id: QEMU
+ *   maintains a per-vCPU (address space, thread) identity from the
+ *   architecturally-designated registers of each target and hands the
+ *   plugin OPAQUE monotonic integers.  The plugin can compare them and
+ *   nothing else; the raw register value, its width, its reuse
+ *   behaviour and its per-target composition all stay inside QEMU.
  */
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 16
+#define QEMU_PLUGIN_VERSION 18
 
 /**
  * struct qemu_info_t - system information for plugins
@@ -1887,13 +1906,57 @@ struct qemu_plugin_cpu_event {
 /**
  * qemu_plugin_cpu_events_set() - enable/disable the vCPU path-event queue
  * @vcpu_index: which vCPU
- * @enabled: true to start collecting events (clears any prior backlog)
+ * @enabled: true to start collecting events
  *
  * Must be called from the vCPU's own thread (e.g. a tb_exec callback) or
- * before the vCPU runs.
+ * before the vCPU runs.  The queue must be EMPTY at the call: this does not
+ * discard a backlog, it refuses to run with one (QEMU aborts), because a
+ * disable with events still owed is precisely the silent drop it used to
+ * hide.
  */
 QEMU_PLUGIN_API
 void qemu_plugin_cpu_events_set(unsigned int vcpu_index, bool enabled);
+
+/**
+ * qemu_plugin_cpu_events_pending_slot() - publish a "drain owed" flag
+ * @slot: a per-vCPU scoreboard entry QEMU may write
+ *
+ * QEMU stores 1 into the @slot entry for that vCPU the instant an event is appended to that
+ * vCPU's path-event queue, and 0 the instant the queue is drained.  This
+ * makes "is a drain owed on this vCPU" JIT-testable, so a plugin can gate a
+ * per-TB conditional callback on it and thereby have a drain point at EVERY
+ * translation-block entry, for one load and one brcond when there is
+ * nothing to do.
+ *
+ * That is what BOUNDS the queue.  With a drain point at every TB entry the
+ * length can only hold what one in-flight TB, plus the exception edges
+ * around it, produced -- see CPU_PLUGIN_EVQ_STRUCTURAL_MAX in
+ * include/hw/core/cpu.h.  Without it, the length grows with the number of
+ * guest instructions executed since the last drain, and a plugin whose
+ * consuming callback is gated on anything at all (an ownership test, a
+ * segment-active flag) cannot bound that at all.
+ *
+ * One slot process-wide; the queue already assumes a single consuming
+ * plugin.  Call once, before the vCPUs run.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_cpu_events_pending_slot(qemu_plugin_u64 slot);
+
+/**
+ * qemu_plugin_cpu_events_stats() - queue-side accounting for a vCPU
+ * @vcpu_index: which vCPU
+ * @max_len: out, may be NULL -- high-water queue length ever reached
+ * @pushes: out, may be NULL -- events appended
+ * @drains: out, may be NULL -- drain calls made
+ *
+ * Produced by QEMU, upstream of every plugin-side attribution decision, so
+ * a plugin gate that refuses a context cannot suppress these numbers.  That
+ * is the point: @max_len is a witness the plugin's own counters cannot be.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_cpu_events_stats(unsigned int vcpu_index,
+                                  uint64_t *max_len, uint64_t *pushes,
+                                  uint64_t *drains);
 
 /**
  * qemu_plugin_drain_cpu_events() - consume the vCPU's pending path events
@@ -2251,6 +2314,56 @@ bool qemu_plugin_vaddr_is_kernel(uint64_t vaddr);
  */
 QEMU_PLUGIN_API
 uint64_t qemu_plugin_get_thread_ptr(void);
+
+/**
+ * qemu_plugin_get_process_id() - opaque id of the vCPU's current address space
+ *
+ * Returns a monotonically-assigned integer naming the address space this
+ * vCPU is translating through right now.  Two samples carry the same id
+ * exactly when the architecture names the same address space: x86-64 CR3
+ * (with PCID when CR4.PCIDE), AArch64 TTBR0_EL1 with the ASID TCR_EL1.A1
+ * selects, RISC-V SATP (VSATP under virtualization), MIPS EntryHi.ASID
+ * (with MemoryMapID where Config5.MI makes it the TLB tag).  QEMU composes
+ * and compares those registers; the plugin never sees them, so it cannot
+ * come to depend on a target's register width, layout or reuse behaviour.
+ *
+ * The id is a NAME, not a lifetime: an architecture that lets an operating
+ * system re-point the same register value at a different address space
+ * (a MIPS EntryHi.ASID rollover, a page-table root freed and handed to a
+ * successor) will report the same id for both, because the architecture
+ * itself says they are the same address space now.  A consumer that needs
+ * to follow ONE address space across such a renaming must compose this
+ * with qemu_plugin_get_thread_id().
+ *
+ * Returns 0 when the target maintains no address-space register the
+ * plugin interface can name — user-mode emulation, where a QEMU process
+ * IS one address space.  Must be called from a vCPU context.
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_get_process_id(void);
+
+/**
+ * qemu_plugin_get_thread_id() - opaque id of the vCPU's current thread
+ *
+ * Returns a monotonically-assigned integer naming the software thread the
+ * architecture's per-thread pointer register currently identifies:
+ * x86-64 FS.base (GS.base for a non-long-mode task), AArch64 TPIDR_EL0,
+ * RISC-V tp, MIPS CP0 UserLocal.  As with qemu_plugin_get_process_id()
+ * the raw value never leaves QEMU and only equality is meaningful.
+ *
+ * Returns 0 for "the architecture names no thread here": a CPU model that
+ * implements no thread-pointer register (a MIPS model with Config3.ULRI
+ * clear), a task that has never been given one, or user-mode emulation.
+ * 0 is NOT an identity — two zeros are not the same thread, they are two
+ * absences — and a consumer must treat it as unknown, never as a match.
+ *
+ * Sample it where the register is coherent: registers that live in TCG
+ * globals are only guaranteed spilled to the CPU state in a callback
+ * registered with QEMU_PLUGIN_CB_R_REGS or QEMU_PLUGIN_CB_RW_REGS.
+ * Must be called from a vCPU context.
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_get_thread_id(void);
 
 /**
  * qemu_plugin_thread_ptr_tracks_current() - is the thread pointer valid

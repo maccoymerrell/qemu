@@ -148,6 +148,14 @@ bool set_latch_timeout(PluginConfig *cfg, const char *v)
     return true;
 }
 
+bool set_latch_idle_insns(PluginConfig *cfg, const char *v)
+{
+    /* Dead-latch idleness measured in GLOBAL GUEST ARCHITECTURAL
+     * INSTRUCTIONS — latch_timeout's load-invariant sibling; 0 disables. */
+    cfg->latch_idle_insns = g_ascii_strtoull(v, nullptr, 10);
+    return true;
+}
+
 bool set_stall_ceiling(PluginConfig *cfg, const char *v)
 {
     /* Architectural instructions the guest may retire in an owned context
@@ -409,6 +417,7 @@ const struct {
     { "iframe_rate", set_iframe_rate },
     { "curtask_off", set_curtask_off },
     { "latch_timeout", set_latch_timeout },
+    { "latch_idle_insns", set_latch_idle_insns },
     { "stall_ceiling", set_stall_ceiling },
     { "stall_ceiling_any", set_stall_ceiling_any },
     { "trace_window", set_trace_window },

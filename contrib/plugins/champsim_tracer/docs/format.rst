@@ -1664,12 +1664,40 @@ excursion **continues** on that placeholder to the ``wpdepth`` budget.
 Everything downstream of the marked instruction is therefore synthetic;
 a consumer treats the marked instruction's result — and any value
 derived from it — as speculative filler that never architecturally
-retires.  Only a **front-end** fault (translation-unavailable, below)
-stops the excursion.  A non-memory synchronous fault (arithmetic /
-illegal-opcode) is also marked here, but — pending a value model for its
-result — it currently ends the chain cleanly at its marked block rather
-than continuing; such a block is the chain's last, distinguished from a
-memory fault only by being terminal.
+retires.
+
+A non-memory synchronous fault carries the same event with the same
+meaning.  An execution-time exception (arithmetic overflow or
+divide-by-zero, illegal opcode, alignment, a conditional trap) or a
+syscall-class kernel entry (``syscall`` / ``int`` / ``svc`` /
+``ecall`` / ``break``) leaves speculative execution the only way it
+can, by raising — but nothing retires on a wrong path, so a real core
+never takes it either.  The tracer marks the block, skips the raising
+instruction, and re-dispatches at that instruction's architectural
+fall-through, taking the unfollowable kernel edge as the taken side of
+an ordinary branch and continuing on the not-taken side to the
+``wpdepth`` budget, exactly as the memory case continues.  The skipped
+instruction's destinations are left stale — the same deterministic
+placeholder — so its dependents still execute.
+
+``CST_WP_EVENT_FAULT`` is therefore an **attribute** of a block —
+"this block consumed synthetic data" — and never a terminator.  A
+reader MUST NOT infer termination from it, including when it lands on
+the chain's last block, where it is a coincidence rather than the
+cause.  Only a **front-end** fault (translation-unavailable, below)
+stops an excursion, and it is the sole stop the wire names.
+
+An excursion can nonetheless end short of its ``wpdepth`` budget with
+nothing on the wire to say so.  Alongside the skip-and-continue path
+the tracer keeps containment bails — a delay-slot branch whose slot
+never landed, a fall-through that is itself an already-poisoned
+target, and a forward-progress guard that trips when the same PC
+re-faults sixteen times — each of which ends the excursion at the last
+sealed block.  None of them is signalled.  A consumer cannot
+distinguish a chain that spent its full ``wpdepth`` budget from one
+that hit a bail, except by comparing the chain's instruction count
+against the ``wpdepth`` recorded in the header's ``command`` string
+(§3).
 
 Bit 2 of ``ev_flags`` is **free** — unassigned, available for a future
 event flag.  Writers write it 0 and readers ignore it, per the

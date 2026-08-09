@@ -1187,14 +1187,23 @@ operation):
         true).  The memop drain marks ``bb_has_fault`` /
         ``bb_first_fault_idx`` at the placeholder-served instruction
         (first fault wins) and the excursion continues.  A **non-memory**
-        synchronous fault (arithmetic / illegal-opcode) still longjmps
-        out of spec mode; the walk marks that BB the same way, runs it
-        out to its natural branch (avoiding a partial, template-polluting
-        commit), and then ends the excursion cleanly at that block —
-        the interim graceful stop, pending a value model for the
-        faulting result.  Faults on a ``BARE_BRANCH`` fragment do *not*
-        force-commit (the delay slot is in a different TB and never
-        landed) — they drop the in-flight accumulator and end.
+        synchronous fault (arithmetic / illegal-opcode, or a
+        syscall-class kernel entry) still longjmps out of spec mode;
+        ``wp_handle_fault_fragment`` marks that BB the same way, clears
+        the pending exception, skips the faulting instruction and
+        re-dispatches at its architectural fall-through, so the
+        excursion runs on to the ``wpdepth`` budget.  When the faulting
+        instruction is the BB's terminator the block is sealed there and
+        the walk lands at the fall-through; mid-BB it runs the BB out to
+        its natural branch first (avoiding a partial, template-polluting
+        commit) and resumes the outer iteration from the skip PC.  The
+        skipped instruction's destinations stay stale — the same
+        deterministic placeholder the memory case uses — so its
+        dependents still execute.  Faults on a ``BARE_BRANCH`` fragment
+        do *not* force-commit (the delay slot is in a different TB and
+        never landed) — they drop the in-flight accumulator and end, as
+        does a fall-through that is an already-poisoned target or a PC
+        that re-faults sixteen times.
 
 3.  ``qemu_plugin_spec_mode_end`` + ``qemu_plugin_cpu_state_restore``
     +  scoreboard restore.
@@ -1284,7 +1293,13 @@ its own wire semantics.  Consumers should treat them differently:
   nop-slide cap on an unsealed BB growing far past any real block,
   and the poison early-out all drop the *in-flight accumulator* and
   end the chain; WP BBs already committed are preserved.  These
-  chains look like early budget ends on the wire.
+  chains look like early budget ends on the wire: no event names the
+  bail, so a consumer separates them from chains that spent the whole
+  budget only by summing the chain's instructions and comparing that
+  against the ``wpdepth`` recorded in the header's ``command`` string.
+  That comparison is what the visualizer reports as its ``stuck bail``
+  class — an inference rather than a reading, and one a trace whose
+  header records no ``wpdepth`` cannot make at all.
 * **Flush re-run.**  A ``tb_flush`` that unwinds a spec-mode
   ``exec_tb`` before its guest instruction ran never reaches the
   wire: the walker signals the caller, which discards the truncated
@@ -1389,12 +1404,45 @@ ISAs, a minimal two-instruction immediate-load pair repeated the
 same number of times.  Rewriting the same register with a value it
 already holds is work no compiler emits, so the sequence cannot
 occur in real code by accident; and it needs no ELF symbols, no
-host icount, and no guest-kernel modification.  ``vcpu_tb_trans``
-arms an exec callback on every instruction whose bytes match a
-marker word; the callbacks judge consecutivity at execution time by
-user-space PC adjacency (same address space, user privilege, each
-insn at the PC immediately after the previous one), so detection is
-independent of how translation slices the sequence into TBs.
+host icount, and no guest-kernel modification.
+
+That a run of bytes is a marker is a property of the **bytes**, so
+it is decided in the bytes, at translation time, and fires from
+**one** instruction.  For every instruction it translates,
+``vcpu_tb_trans`` asks whether that instruction is, byte for byte,
+the *terminating* instruction of a marker sequence.  When it is, the
+translator compares the ``CST_MARKER_SEQ_LEN``\ -1 instruction slots
+immediately before it — a fixed run of fixed-width slots at known
+offsets — against the rest of that sequence, reading them from the
+TB's own translated instruction stream when the TB reaches back that
+far and from guest memory otherwise.  A whole-sequence match arms
+exactly one execution callback, on that one instruction, and that
+callback firing *is* the marker.
+
+The mechanism is chosen for what it makes impossible.  Nothing that
+happens *between* a marker's instructions can change their bytes, so
+nothing that happens between them can lose the marker: a fault, an
+interrupt or a single-step trap taken mid-sequence changes nothing;
+a task migrating to another vCPU mid-sequence changes nothing, since
+the callback is on one instruction and fires on whichever vCPU runs
+it; a page straddle or any TB slicing changes nothing, since the
+match is over guest memory rather than over a TB; and ``-icount``,
+one-instruction-per-TB translation and a single-stepping
+``cst_attach`` injector change nothing, for the same reason.  START
+and END are compared as *whole* sequences, immediates included, so
+the word the two magics share on every fixed-width target — where
+the sequences differ only in a low byte — cannot make one look like
+the other.
+
+The one case the translation-time look cannot settle is a sequence
+whose preceding slots are not resident when the terminating
+instruction is translated.  The callback is armed anyway, flagged to
+re-read guest memory when the instruction executes, where those
+slots are necessarily present: the same CPU fetched and retired them
+one or two instructions earlier, and nothing has run since that
+could have unmapped them.  A read that fails even then does not
+claim the marker, and the attempt is published as ``marker prefix
+unreadable`` rather than guessed at in either direction.
 
 Marker detection is a correct-path fact, and the wrong path is
 fenced out of it at the callback level by two independent gates:
@@ -1405,8 +1453,8 @@ which thread's TLS the callback reads) and the per-thread
 ``g_wp_state.in_progress`` session flag.  Speculation routinely runs
 the marker bytes — the wrong path of a spin-wait branch falls
 straight into the END sequence on every excursion — so an invocation
-that leaked past the fence could advance the adjacency run, or
-complete it, from wrong-path execution.  The callbacks stay
+that leaked past the fence would open or close a window from
+wrong-path execution.  The callbacks stay
 *registered* on every translation, spec-born ones included: the
 fence is in the callback, not the registration, because suppressing
 registration on wrong-path translations changes their
@@ -1491,8 +1539,13 @@ per-vCPU (each vCPU's fold reads its own ``insn_count`` cursor;
 every other vCPU's unprimed, so its first fold contributes zero
 rather than its pre-pin backlog).
 
-In every non-marker window mode the pin holds ``UNPINNED`` and the
-whole machinery costs one relaxed atomic load per TB.
+A marker window is the only window a system-mode capture has:
+``icount``, ``simpoint`` and ``symbol`` position a clock, and a clock
+cannot say whose instructions it is counting, so they are refused at
+startup under ``*-softmmu`` (see :doc:`quickstart`).  They remain
+user-mode windows, where qemu-user emulates one program and the
+question does not arise — and there the pin holds ``UNPINNED``, so
+the whole machinery costs one relaxed atomic load per TB.
 
 .. _fault-excursions:
 

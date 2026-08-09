@@ -507,13 +507,21 @@ than injecting bytes that would decode as something else.  A workload
 that can be rebuilt does not need the injector at all — a compiled-in
 marker works on every ISA the tracer targets.
 
-**A marker window held open by a dead process closes only at the
-icount budget.**  Under ``policy=latch`` a process that exits without
-running its END marker leaves its window open until the segment's
-icount budget elapses.  ``latch_timeout=<ms>`` is the opt-in backstop
-— it closes a window idle for longer than the given wall-clock
-interval — but it is off by default because idleness alone cannot
-distinguish a dead process from a merely long-blocked live one.
+**A marker window ends at its END marker, so a process that dies
+without executing one leaves its window open.**  A marker-bookended
+region ends where the workload says it ends; that is the terminator,
+and there is no second one.  Under ``policy=latch`` a process that
+exits — killed, crashed, or simply never reaching its END marker —
+therefore leaves its window open, and the capture is finalised when
+the machine goes down: the machine-shutdown close writes the file out
+on a vCPU thread with the guest still assembled, marks the segment
+``SHUTDOWN``, and counts it as ``closed by machine shutdown``.  Ending
+a system run with ``/workload ; poweroff -f`` is what that looks like
+in practice.  ``latch_timeout=<ms>`` closes a window idle for longer
+than a given wall-clock interval, for runs where waiting for the
+shutdown is inconvenient; it is opt-in and off by default, because
+idleness alone cannot distinguish a dead process from a merely
+long-blocked live one.
 
 **Ownership is address-space equality, so an address-space NAME reused
 under a live process is the one thing that can move it.**  The tracer

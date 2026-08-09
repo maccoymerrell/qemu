@@ -1155,7 +1155,10 @@ def cmd_churn_test(args) -> int:
 
         print(f"validate[{isa}] {cst.name}:")
         dec = V._load_decoder()
-        _meta, _templates, entries = dec.decode_champsim_tracer(cst)
+        # Streaming: one pass keeping only a small set of thread ids.
+        # Materialising every entry to build that set is what exhausts
+        # memory on a large trace.
+        _meta, _templates, entries = dec.iter_decode_champsim_tracer(cst)
         observed = sorted({int(e.get("thread_id", 0)) for e in entries})
         report = V.validate_structural(
             cst, expected_threads=max(1, len(observed)),

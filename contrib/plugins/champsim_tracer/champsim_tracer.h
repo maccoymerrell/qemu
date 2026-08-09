@@ -1216,9 +1216,10 @@ typedef struct {
      * Maintained by the synchronous ASID-write hook (see
      * asid_write_track_cb): the value only changes at the architectural
      * address-space-register commit points, so a per-write update keeps
-     * the flag exact with zero per-TB cost.  Backs the cond_cb that
-     * compensates the coarse fast-forward countdown for foreign-process
-     * user instructions. */
+     * the flag exact with zero per-TB cost.  It is what lets the context
+     * gates below, and the wide-register owned-set membership test, answer
+     * "is the live address space one this trace owns?" with no per-TB
+     * probe. */
     uint64_t asid_match;
     /* Context gate for the heavy per-TB capture callback (vcpu_tb_exec).
      * Folds is_active AND pinned-context-ownership into ONE JIT-testable
@@ -1479,8 +1480,9 @@ struct TraceFeatures {
      * the per-entry fault trailer (CST_FLAG_FAULT) so handler code is tagged
      * with its exception-nesting depth and faulting BBs carry the detour
      * anchor, and the PathBuilder runs the kernel-handler whole-BB fault
-     * merge.  Enabled only in marker (system) mode or a pinned simpoint;
-     * off in user mode, so user-mode traces carry no trailer.  This is the
+     * merge.  Enabled only in marker mode — which is the only window a
+     * system capture has — and off in every user-mode window, so user-mode
+     * traces carry no trailer.  This is the
      * kernel-privilege depth machinery — decoupled from the wrong-path
      * fault-poisoning policy below, which runs in BOTH modes. */
     bool     fault_depth_trailer = false;

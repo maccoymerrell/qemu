@@ -5189,6 +5189,7 @@ static void finish_trace_segment(bool prev_executed = true,
             tail = cap;
         }
         g_stats.user_clock_retired_insns += tail;
+        g_user_icount += tail;
     }
 
     uint64_t lo = g_trace_segments.window_start();
@@ -7161,13 +7162,6 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
     bool capture_owned = false;
     if (pinned_asid != CST_ASID_UNPINNED) {
         uint64_t delta = user_seen_advance(cpu_index, icount_prev);
-        /* Architectural twin of @delta: what really ran since the last
-         * dispatch (see retired_advance).  It belongs to the PREVIOUS
-         * dispatch, so it is folded against that dispatch's ownership, not
-         * against this TB's. */
-        if (prev_dispatch_owned) {
-            g_stats.user_clock_retired_insns += delta_retired;
-        }
         live_asid = qemu_plugin_get_addr_space_id();
         live_priv = qemu_plugin_get_priv_level();
         /* Ownership of a user TB: is the ADDRESS SPACE it is executing in
@@ -7263,8 +7257,46 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
                 }
             }
         }
+        /*
+         * THE WINDOW CLOCK COUNTS WHAT EXECUTED.
+         *
+         * It used to count @delta — the advance of insn_count, whose per-TB
+         * inline add credits a TB's whole instruction count at TB ENTRY.  A
+         * block the guest entered and did not run to the end was therefore
+         * billed in full: the marker window's clock read above the trace's
+         * own instruction count on every run with a fault in it, and by
+         * exactly the same amount at zero doses, where the END block's
+         * unexecuted tail was billed by the clock AND claimed by the wire so
+         * the two agreed while both were wrong.
+         *
+         * @delta_retired is the instruction's own count (see
+         * retired_advance).  It is LAGGED: the instructions observed at this
+         * dispatch are the ones the PREVIOUS dispatch's TB executed, so it
+         * folds against that dispatch's ownership.  The segment close folds
+         * the in-flight block's own executed prefix, so nothing is left
+         * uncounted at the end.
+         *
+         * @delta and the bill-site counters below are KEPT, as the
+         * instrument they became: user_clock_billed_insns minus
+         * user_clock_retired_insns is the phantom bill this replaces, and it
+         * stays visible instead of disappearing with the defect.
+         */
+        if (prev_dispatch_owned) {
+            g_user_icount += delta_retired;
+            g_stats.user_clock_retired_insns += delta_retired;
+            /* The retired delta has the same exposure @delta has: anything
+             * that executes between two dispatches WITHOUT being dispatched
+             * itself (a context the trace_this_ctx gate skips) lands in it.
+             * Bound it by the TB it is attributed to and name the excess. */
+            uint32_t prev_cap =
+                tb_head_insns(g_retired_prev_head[retired_slot(cpu_index)]);
+            if (delta_retired > prev_cap) {
+                g_stats.user_clock_retired_over_tb++;
+                g_stats.user_clock_retired_over_insns +=
+                    delta_retired - prev_cap;
+            }
+        }
         if (user_owned) {
-            g_user_icount += delta;
             /*
              * BILL-SITE ACCOUNTING (see the Stats block on
              * user_clock_billed_insns).  What the window clock bills is a

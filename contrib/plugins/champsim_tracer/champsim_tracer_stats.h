@@ -274,6 +274,14 @@ struct Stats {
      * ever executed.  It is not a rounding term; it is exactly the tail of
      * every TB the guest entered and did not run to the end. */
     uint64_t user_clock_retired_insns = 0;
+    /* Retired folds whose delta exceeded the TB they were attributed to, and
+     * by how much: instructions that executed between two dispatches without
+     * being dispatched themselves (a context the trace_this_ctx gate skips)
+     * and so were charged to the owned process.  The retired clock has
+     * exactly the exposure the TB-entry bill had; this is what keeps it
+     * measured rather than assumed.  Must be 0. */
+    uint64_t user_clock_retired_over_tb = 0;
+    uint64_t user_clock_retired_over_insns = 0;
     /* Templates minted for blocks the guest ENTERED AND DID NOT FINISH (see
      * TemplateStore::commit_partial_bb).  Keyed by extent, so repeated cuts
      * at the same point share one; a run where nothing is ever cut short

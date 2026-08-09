@@ -1511,6 +1511,23 @@ The pin defines both the trace filter and the window clock:
   finish report all run on this user-instruction clock, so a
   marker-mode window covers the same user-space instructions a
   user-mode run of the workload would.
+
+  The clock counts what **executed**.  It reads the per-instruction
+  architectural slot (``VCPUScoreBoard::insn_started``), not the per-TB
+  ``insn_count`` add fired at TB *entry* — that add credits a
+  dispatched TB's whole instruction count before the TB has run, so a
+  block the guest entered and did not finish was billed in full, and a
+  block cut short by a fault was billed once in full and then again
+  from its resume point.  The bill is lagged by one dispatch (the
+  instructions observed at a dispatch are the ones the previous
+  dispatch's TB executed) and the segment close folds the in-flight
+  block's own executed prefix, so nothing is left uncounted at the
+  end.  ``insn_count`` itself is unchanged: it is the BBV-identical
+  positioning clock that SimPoint offsets are selected against, and it
+  stays what it is.  The old TB-entry arithmetic is retained as an
+  instrument — ``user_clock_billed_insns`` minus
+  ``user_clock_retired_insns`` is the phantom bill, visible instead of
+  silently gone.
 * **Kernel execution at the pinned ASID** (syscalls, fault
   handlers) is traced but *not counted*.  Its templates carry
   ``is_system``, stamped from the live correct-path privilege at

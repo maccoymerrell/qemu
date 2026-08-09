@@ -98,10 +98,18 @@ names.
    A new ISA adds its magic-immediate instruction sequence there, then
    names it from its ``isa_properties[]`` row: ``marker_encode_seq``
    points at the encoder and ``marker_insn_bytes`` / ``marker_seq_insns``
-   give the fixed insn width and count the execution-time adjacency
-   detector reads.  ``marker_seq_init`` builds the pattern from the row,
-   so a traced process can open and close its own window from inside the
-   guest with no new special case in the detector.
+   give the fixed insn width and count that the translation-time
+   whole-sequence matcher reads.  ``marker_seq_init`` builds the pattern
+   from the row, so a traced process can open and close its own window
+   from inside the guest with no new special case in the detector.
+   The matcher imposes one requirement on the encoding: the sequence must
+   be a **fixed run of fixed-width instruction slots**.  Detection looks
+   backward from the sequence's terminating instruction by
+   ``marker_seq_insns``\ -1 slots of ``marker_insn_bytes`` each and
+   compares them whole, and that backward look is exact only because
+   every slot's width and offset is known in advance.  An encoder that
+   emitted mixed-width instructions would leave nothing to look back
+   from.
    *Verify:* run a workload that emits the marker sequence and confirm
    the window opens where the marker runs.
 

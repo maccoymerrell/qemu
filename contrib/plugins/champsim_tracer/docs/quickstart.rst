@@ -264,6 +264,21 @@ plugin sees its argv.
 
       cst_attach ./workload arg1 arg2
 
+   .. _attach-after-execve:
+
+   .. note::
+
+      **The injection happens after** ``execve``\ **, and that is the
+      point of using** ``ptrace`` **rather than a launcher.**
+      :program:`cst_attach` forks, the child calls ``PTRACE_TRACEME``
+      and then ``execvp``, and the parent waits for the *exec-stop* —
+      at which the target is already mapped and halted on its first
+      userspace instruction — before poking the marker sequence into
+      the entry point.  The alternative shape, a launcher that runs the
+      marker and then ``exec``\ s the target, cannot work: ``execve``
+      replaces the address space, so the window would be pinned to an
+      address space that ceases to exist.
+
    :program:`cst_attach` runs *inside the guest*, on the guest's own
    binary, so it is a guest-architecture program: the copy built by
    ``ninja -C build contrib-plugins`` is a host binary and only serves a

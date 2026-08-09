@@ -53,10 +53,14 @@ Every run follows a five-stage pipeline:
 #. **build** — assemble and statically link the program with
    ``-nostdlib -nostartfiles`` so the trace contains only generated
    code (no libc / dynamic loader noise).
-#. **trace** — run the binary under ``qemu-<isa>`` with the plugin
-   loaded, supplying ``trace_window=icount:start=0+stop=N`` (or
-   ``trace_window=symbol:...`` / ``trace_window=simpoint:...``) and
-   ``memdata=1[,regdata=1]``.
+#. **trace** — run the binary with the plugin loaded and
+   ``memdata=1[,regdata=1]``.  A user-mode run under ``qemu-<isa>``
+   drives the window from a clock:
+   ``trace_window=icount:start=0+stop=N``, or
+   ``trace_window=symbol:...`` / ``trace_window=simpoint:...``.  A
+   system-mode run under ``qemu-system-<isa>`` is a marker window —
+   the only window system mode accepts — opened by the workload's own
+   marker sequence.
 #. **analyze** — post-process the binary to extract PC spans per
    block, the helper-leaf instruction count, and stable
    ``ground_truth`` records; annotate ``meta.json`` in place.
@@ -139,8 +143,10 @@ Flags worth knowing:
 ``--system`` (with ``--kernel`` / ``--rootfs`` / ``--sys-mem`` / ``--smp``)
    Trace under ``qemu-system-<isa>`` instead of qemu-user: the
    workload is staged into an initramfs and its compiled-in marker
-   opens + ASID-pins the window (``trace_window=marker``).  Implies
-   ``--marker`` at generation, which also injects the close(-1)
+   opens + ASID-pins the window (``trace_window=marker``, which is the
+   only window system mode accepts — the clock-driven ``icount`` /
+   ``symbol`` / ``simpoint`` drives above are user-mode windows).
+   Implies ``--marker`` at generation, which also injects the close(-1)
    syscall probe and the sysinfo fault probe right after the marker.
    ``--smp N`` boots N vCPUs; body entries carry the GUEST-THREAD
    identity as ``thread_id`` (resolved from the kernel per-thread

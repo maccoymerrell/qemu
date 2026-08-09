@@ -300,6 +300,13 @@ public:
     struct WpEventsSummary {
         uint32_t seq_num       = 0;   /* owning CP entry's seq        */
         uint32_t chain_len     = 0;   /* WP BBs in the chain          */
+        /* Architectural instructions across the chain's WP BBs — the
+         * unit the tracer's wpdepth budget is spent in (the walk loop
+         * tests `sim_insns < max_wrong_path_depth`).  Derived from the
+         * chain section's per-block templates, so it is populated only
+         * when the chain is actually walked: under WpDecode::Skip the
+         * chain bytes are skipped wholesale and this stays 0. */
+        uint32_t wp_insns      = 0;
         uint32_t fault_count   = 0;   /* per-block FAULT events       */
         uint32_t unavail_count = 0;   /* per-block TRANSLATION events */
         /* Chain-level: the excursion's FIRST target was never
@@ -355,7 +362,8 @@ private:
     uint64_t stream_wp_chain_bb(Reader &wpb, FieldStateTable &wp_state,
                                 FieldStateTable &cp_state, WpDecode wp,
                                 uint32_t seq, uint32_t thread, uint32_t asid,
-                                const BBCallback &cb, bool *has_events);
+                                const BBCallback &cb, bool *has_events,
+                                uint64_t *insns = nullptr);
     void handle_entry_bb(WalkState &ws, bool cp_fields, WpDecode wp,
                          const BBCallback &cb);
     void skip_iframe_bb();

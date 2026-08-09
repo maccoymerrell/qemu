@@ -746,7 +746,7 @@ def mutation_substrate(build_dir: Path, work_root: Path, compilers: dict,
     cst = trace_program(binp, plugin, qemu, d / "smc_sub", family)
     if cst is None:
         return None
-    _m, templates, _e = V._load_decoder().decode_champsim_tracer(cst)
+    _m, templates = V._load_decoder().decode_champsim_tracer_header(cst)
     pc, tmpls = smc_templates(isa, family, templates)
     if pc is None or len(tmpls) < 2:
         return None
@@ -887,7 +887,7 @@ def run_system_family(build_dir: Path, work_root: Path, plugin: Path,
                      "detail": f"boot rc={rc} / no trace"})
         return False, subs
 
-    _m, templates, _e = V._load_decoder().decode_champsim_tracer(cst)
+    _m, templates = V._load_decoder().decode_champsim_tracer_header(cst)
     # The marker program rewrites shape A into shape B at one pc: the `grow`
     # family's structure (2 revisions, the second one instruction longer).
     ok, detail = check_family(isa, "grow", templates)

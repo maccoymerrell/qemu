@@ -168,8 +168,9 @@ CP entry's WP chain and rendered with the same per-instruction format
 under a separate
 ``; ..... wp[k] BB <id> n_insns=<n> [status=...] -----``
 separator (the ``status=FAULT@insn<n>`` suffix appears when the
-WP simulator hit a synthetic-data fault on a non-terminating
-instruction inside that chain entry).
+WP simulator marked a synthetic-data fault at that index of the
+chain entry; the fault does not end the chain, and the marked
+instruction may be the block's terminator).
 
 A system-mode trace interleaves two out-of-band records with the
 entries in stream order.  A block-device request (``devio=1``) prints

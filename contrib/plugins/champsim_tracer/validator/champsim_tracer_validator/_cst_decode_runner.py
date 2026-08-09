@@ -32,10 +32,13 @@ this file (the canonical in-tree build location).
 from __future__ import annotations
 
 import dataclasses
+import mmap
 import os
 import re
 import shutil
 import subprocess
+import tempfile
+from array import array
 from pathlib import Path
 from typing import Iterator
 
@@ -661,20 +664,174 @@ def _iter_body(lines: list[str], i: int,
 # Public API
 # ---------------------------------------------------------------------------
 
-def _run_cst_decode(path: str | os.PathLike) -> str:
+class _LineFile:
+    """A positionally-indexable sequence of lines backed by a file on disk.
+
+    Drop-in for the ``list[str]`` the parsers below expect: it supports
+    ``len()``, scalar ``[i]``, negative indices, the one bounded slice
+    (``lines[-8:]``), iteration and ``enumerate``.  Nothing else is used.
+
+    WHY THIS EXISTS.  ``cst_decode --format=legacy`` emits roughly 27 lines
+    per guest instruction, so a 20 M-instruction trace is ~540 M lines and
+    tens of gigabytes of text.  Reading that with ``capture_output=True``
+    held the whole thing as one ``str``, and ``text.splitlines()`` then made
+    a second copy as hundreds of millions of ``str`` objects (each carrying
+    ~49 bytes of object overhead on top of its payload), and three later
+    passes re-scanned it.  That pattern exhausted 487 GiB of host RAM and
+    took the machine down for two days.
+
+    Here the text stays on disk, mmapped, and the only resident structure is
+    an 8-bytes-per-line offset index -- ~4 GB for that same 540 M-line trace
+    instead of 60+ GB, with no change to how the parsers address it.
+    Sequential access (the overwhelmingly common pattern) costs a slice of
+    the mapping; random access costs the same.
+    """
+
+    __slots__ = ("_path", "_fh", "_mm", "_off", "_n", "_own")
+
+    def __init__(self, path: str | os.PathLike, *, own: bool = False):
+        self._path = str(path)
+        self._own = own
+        self._fh = open(self._path, "rb")
+        size = os.fstat(self._fh.fileno()).st_size
+        if size == 0:
+            self._mm = None
+            self._off = array("q")
+            self._n = 0
+            return
+        self._mm = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_READ)
+        off = array("q")
+        append = off.append
+        pos = 0
+        find = self._mm.find
+        while pos < size:
+            append(pos)
+            nl = find(b"\n", pos)
+            if nl < 0:
+                break
+            pos = nl + 1
+        self._off = off
+        self._n = len(off)
+
+    def __len__(self) -> int:
+        return self._n
+
+    def _line(self, i: int) -> str:
+        start = self._off[i]
+        end = self._off[i + 1] if i + 1 < self._n else self._mm.size()
+        raw = self._mm[start:end]
+        if raw.endswith(b"\n"):
+            raw = raw[:-1]
+        if raw.endswith(b"\r"):
+            raw = raw[:-1]
+        return raw.decode("utf-8", "replace")
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            # Only a small tail slice is used (`lines[-8:]`); materialising a
+            # bounded window is fine, materialising an unbounded one is not.
+            idx = range(*key.indices(self._n))
+            if len(idx) > 4096:
+                raise MemoryError(
+                    "_LineFile: refusing to materialise a slice of "
+                    f"{len(idx)} lines; iterate instead")
+            return [self._line(i) for i in idx]
+        if key < 0:
+            key += self._n
+        if not 0 <= key < self._n:
+            raise IndexError(key)
+        return self._line(key)
+
+    def __iter__(self) -> Iterator[str]:
+        for i in range(self._n):
+            yield self._line(i)
+
+    def close(self) -> None:
+        if self._mm is not None:
+            self._mm.close()
+            self._mm = None
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+        if self._own:
+            try:
+                os.unlink(self._path)
+            except OSError:
+                pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+def _decode_scratch_dir(path: str | os.PathLike) -> str:
+    """Where to spill the decode.  Never /tmp -- that is the OS SSD on this
+    host and a large decode would fill it.  Sit next to the trace, which is
+    on the array, unless the caller overrides."""
+    env = os.environ.get("CST_DECODE_SCRATCH")
+    if env:
+        return env
+    parent = Path(path).resolve().parent
+    return str(parent if os.access(parent, os.W_OK) else Path.cwd())
+
+
+def _run_cst_decode_to_file(path: str | os.PathLike) -> str:
+    """Run cst_decode with its stdout going straight to disk.
+
+    Returns the scratch file path; the caller owns it.  stdout is NEVER
+    buffered in this process -- see _LineFile for why.
+    """
     binary = _find_cst_decode()
-    proc = subprocess.run(
-        [str(binary), "--format=legacy", str(path)],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return proc.stdout
+    fd, out = tempfile.mkstemp(prefix=".cstdecode-", suffix=".legacy",
+                               dir=_decode_scratch_dir(path))
+    try:
+        with os.fdopen(fd, "wb") as sink:
+            proc = subprocess.run(
+                [str(binary), "--format=legacy", str(path)],
+                check=False, stdout=sink, stderr=subprocess.PIPE)
+        if proc.returncode != 0:
+            err = (proc.stderr or b"").decode("utf-8", "replace")
+            tail = " | ".join(err.strip().splitlines()[-6:])
+            raise subprocess.CalledProcessError(
+                proc.returncode, [str(binary), "--format=legacy", str(path)],
+                stderr=tail)
+    except BaseException:
+        try:
+            os.unlink(out)
+        except OSError:
+            pass
+        raise
+    return out
 
 
-def _parse_full(text: str) -> tuple[dict, list[dict], list[dict]]:
-    lines = text.splitlines()
+def _run_cst_decode(path: str | os.PathLike) -> str:
+    """Back-compat: return the decode as one string.
 
+    DEPRECATED and dangerous on anything but a small trace -- it is the
+    pattern that took the host down.  Kept only for callers that predate
+    _LineFile; new code must use _run_cst_decode_to_file + _LineFile.
+    """
+    out = _run_cst_decode_to_file(path)
+    try:
+        with open(out, "r", errors="replace") as fh:
+            return fh.read()
+    finally:
+        try:
+            os.unlink(out)
+        except OSError:
+            pass
+
+
+def _parse_header(lines) -> tuple[dict, list[dict], int, dict]:
+    """Parse everything before the body: meta, encoding maps, templates.
+
+    All of it is bounded by the trace's template count rather than by its
+    length, so this is safe to do eagerly on any size of trace.  Returns
+    (meta, templates, body_start_index, rid_by_name).
+    """
     meta, i = _parse_meta_section(lines)
     encoding_maps, i = _parse_encodings(lines, i, meta)
     meta["encoding_maps"] = encoding_maps
@@ -695,6 +852,16 @@ def _parse_full(text: str) -> tuple[dict, list[dict], list[dict]]:
 
     templates, i = _parse_templates(
         lines, i, rid_by_name, op_to_id, br_to_id)
+    return meta, templates, i, rid_by_name
+
+
+def _parse_full(text) -> tuple[dict, list[dict], list[dict]]:
+    # Accepts either a str (small inputs, tests) or an already-open
+    # _LineFile / list[str].  A str is split here exactly as before; a
+    # _LineFile is addressed in place so the text never enters RAM.
+    lines = text.splitlines() if isinstance(text, str) else text
+
+    meta, templates, i, rid_by_name = _parse_header(lines)
     entries = list(_iter_body(lines, i, rid_by_name))
     # Trailing BODY_STATS section.  Emitted unconditionally by the
     # legacy renderer; we scan the full output for it rather than
@@ -790,16 +957,74 @@ def _parse_body_stats(lines: list[str]) -> dict:
 
 
 def decode_champsim_tracer(bin_path):
-    """Eager decoder.  Returns (meta, templates, entries)."""
-    text = _run_cst_decode(bin_path)
-    return _parse_full(text)
+    """Eager decoder.  Returns (meta, templates, entries).
 
-
-def iter_decode_champsim_tracer(bin_path):
-    """Streaming form.  cst_decode buffers the legacy output to stdout in
-    full so this implementation eagerly collects entries; callers that
-    require true streaming should iterate the C++ binary's stdout
-    directly via subprocess.Popen and the line-grammar above.
+    The decode is spilled to disk and addressed through _LineFile, so the
+    legacy text is never resident.  `entries` still scales with the trace --
+    that is inherent to an eager API -- but the multi-copy text blow-up that
+    took the host down is gone.
     """
-    meta, templates, entries = decode_champsim_tracer(bin_path)
-    return meta, templates, iter(entries)
+    out = _run_cst_decode_to_file(bin_path)
+    with _LineFile(out, own=True) as lines:
+        return _parse_full(lines)
+
+
+def decode_champsim_tracer_header(bin_path):
+    """Return (meta, templates) only, holding nothing else.
+
+    For the several callers that want templates and throw the body away
+    (`_m, templates, _e = decode_champsim_tracer(...)`).  Materialising
+    millions of entry dicts to discard them is pure waste, and on a large
+    trace it is the difference between working and exhausting the host.
+    Everything is released before returning -- no iterator to forget to
+    consume, no scratch file left behind.
+    """
+    out = _run_cst_decode_to_file(bin_path)
+    with _LineFile(out, own=True) as lines:
+        meta, templates, _i, _rid = _parse_header(lines)
+        meta["body_stats"] = _parse_body_stats(lines)
+        meta["impossible_attributions"] = _parse_impossible_attributions(lines)
+        return meta, templates
+
+
+def iter_decode_champsim_tracer(bin_path, *, body_record_order: bool = False):
+    """Streaming decoder.  Returns (meta, templates, entries_iterator).
+
+    Genuinely lazy, unlike the eager :func:`decode_champsim_tracer`: the
+    header, the encoding maps and the templates are parsed up front (all
+    bounded by the trace's template count, not its length), and body entries
+    are then YIELDED one at a time.  Resident cost is the _LineFile offset
+    index plus one entry, so a 20 M-instruction trace costs a few GB instead
+    of tens of GB.
+
+    Use this for anything large.  `decode_champsim_tracer` materialises every
+    entry into a list and its peak grows without bound with trace length --
+    measured at 25.6 GB and still climbing on a 20 M-instruction trace before
+    it was cut short.
+
+    `meta["body_stats"]` and `meta["impossible_attributions"]` are computed
+    (both are bounded summaries).  `meta["body_record_order"]` is NOT, by
+    default: it returns one tuple per body record, so it grows with the trace
+    and would defeat the point.  Pass body_record_order=True if you need it
+    and know the trace is small; otherwise the key is absent, and absent is
+    honest -- it is not silently empty.
+    """
+    out = _run_cst_decode_to_file(bin_path)
+    lines = _LineFile(out, own=True)
+    try:
+        meta, templates, i, rid_by_name = _parse_header(lines)
+        meta["body_stats"] = _parse_body_stats(lines)
+        meta["impossible_attributions"] = _parse_impossible_attributions(lines)
+        if body_record_order:
+            meta["body_record_order"] = _scan_body_order(lines)
+    except BaseException:
+        lines.close()
+        raise
+
+    def _entries():
+        try:
+            yield from _iter_body(lines, i, rid_by_name)
+        finally:
+            lines.close()
+
+    return meta, templates, _entries()

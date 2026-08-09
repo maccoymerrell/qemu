@@ -1460,13 +1460,16 @@ uint64_t BodyWalker::stream_wp_chain_bb(Reader &wpb, FieldStateTable &wp_state,
                                         FieldStateTable &cp_state, WpDecode wp,
                                         uint32_t seq, uint32_t thread,
                                         uint32_t asid, const BBCallback &cb,
-                                        bool *has_events)
+                                        bool *has_events, uint64_t *insns)
 {
     const bool fields = (wp == WpDecode::Fields);
     uint64_t chain_hdr = wpb.uleb();
     uint64_t num_wp = chain_hdr >> 1;
     if (has_events) {
         *has_events = (chain_hdr & header_.ids.wp_chain_has_events) != 0;
+    }
+    if (insns) {
+        *insns = 0;
     }
     int32_t prev_wp_tmpl = 0;
     for (uint64_t w = 0; w < num_wp; w++) {
@@ -1498,6 +1501,9 @@ uint64_t BodyWalker::stream_wp_chain_bb(Reader &wpb, FieldStateTable &wp_state,
         bb.wp_chain_start = (w == 0);
         bb.wp_chain_last  = (w + 1 == num_wp);
         bb.n_insns        = wtmpl ? (uint32_t)wtmpl->insns.size() : 0;
+        if (insns) {
+            *insns += bb.n_insns;
+        }
         if (fields) {
             bb.blk_       = table_get_block(wp_state, (uint32_t)wt);
             bb.state_gen_ = wp_state.generation;
@@ -1573,6 +1579,7 @@ void BodyWalker::handle_entry_bb(WalkState &ws, bool cp_fields, WpDecode wp,
      * whether a second SectionScope even has bytes to open. */
     if (flags_ & header_.ids.flag_wp) {
         uint64_t chain_len = 0;
+        uint64_t chain_insns = 0;
         bool has_events = false;
         { SectionScope s(body_); Reader &wpb = s;
           if (wp != WpDecode::Skip) {
@@ -1582,7 +1589,7 @@ void BodyWalker::handle_entry_bb(WalkState &ws, bool cp_fields, WpDecode wp,
               chain_len = stream_wp_chain_bb(wpb, wp_state, cp_state, wp,
                                              seq, ws.current_thread,
                                              ws.current_asid, cb,
-                                             &has_events);
+                                             &has_events, &chain_insns);
           } else {
               /* Chain walking skipped, but num_wp (chain length, used to
                * resolve past-chain / chain-level event indices) and the
@@ -1607,6 +1614,7 @@ void BodyWalker::handle_entry_bb(WalkState &ws, bool cp_fields, WpDecode wp,
               WpEventsSummary sum;
               sum.seq_num   = seq;
               sum.chain_len = (uint32_t)chain_len;
+              sum.wp_insns  = (uint32_t)chain_insns;
               uint64_t num_events = evb.uleb();
               int64_t prev_idx = -1;
               for (uint64_t k = 0; k < num_events; k++) {

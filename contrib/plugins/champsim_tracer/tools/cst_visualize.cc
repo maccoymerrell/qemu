@@ -38,6 +38,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cinttypes>
 #include <cmath>
 #include <cstdint>
@@ -210,6 +211,13 @@ struct Options {
      * to stderr, and at end-of-walk prints per-PC aggregates so we
      * can verify whether the outcome derivation is sane. */
     int                 debug_branches   = 0;
+
+    /* Diagnostic.  With metric wp_termination, dumps the whole-trace
+     * joint counts the classifier is built from — including how many
+     * privilege decisions the template map could actually decide — so
+     * the privilege/unfetchable split can be audited against the wire
+     * instead of read back off the plot.  See wp_term_probe_report. */
+    bool                wp_term_probe    = false;
 };
 
 [[noreturn]] static void usage(int rc)
@@ -259,8 +267,8 @@ struct Options {
 "  -m devio_queue      Disk-I/O queue depth (top) + bytes issued (bottom)\n"
 "  -m devio_latency    Histogram: disk-request STOP-START distance (CP insns)\n"
 "  -m devio_lba        2D grid: disk block (LBA) touched over the run, by r/w\n"
-"  -m wp_termination   WP chain termination mix (completed / fault /\n"
-"                      translation / no-fetch) per window\n"
+"  -m wp_termination   WP chain termination mix (complete / privilege-stop /\n"
+"                      unfetchable / stuck-bail) per window\n"
 "  -m ws_divergence    Virtual vs physical page working set (sliding window)\n"
 "  -m translation_churn  vpage->ppage remaps + first translations /1k\n"
 "  -m pagemap          2D grid: virtual pages touched over the run, colored\n"
@@ -303,6 +311,11 @@ struct Options {
 "      --weights=W,W,...   Per-trace weights (CLI order; default = header\n"
 "                          simpoint_weight; all-zero -> even split)\n"
 "      --name=STR          Program label used in aggregate titles\n"
+"      --wp-term-probe     With -m wp_termination, dump the whole-trace\n"
+"                          counts behind the classification to stderr —\n"
+"                          including how many privilege decisions the\n"
+"                          template map could decide, and how many it had\n"
+"                          to default (no resolvable successor).\n"
 "      --help              Show this help and exit\n");
     std::exit(rc);
 }
@@ -588,6 +601,8 @@ static Options parse_args(int argc, char **argv)
             o.warmup_bins = parse_int(a + 14, "--warmup-bins");
         } else if (!std::strncmp(a, "--debug-branches=", 17)) {
             o.debug_branches = parse_int(a + 17, "--debug-branches");
+        } else if (!std::strcmp(a, "--wp-term-probe")) {
+            o.wp_term_probe = true;
         } else if (!std::strncmp(a, "--ws-window=", 12)) {
             o.ws_window = (uint64_t)parse_int(a + 12, "--ws-window");
         } else if (!std::strncmp(a, "--rob-size=", 11)) {
@@ -1181,10 +1196,10 @@ static const char *categorical_color(Metric m, const std::string &label)
             if (label == "kernel") return "#d62728";     /* red  */
             return color_for_label(label);
         case Metric::WpTermination:
-            if (label == "completed")        return "#2ca02c"; /* green  */
-            if (label == "fault stop")       return "#d62728"; /* red    */
-            if (label == "translation stop") return "#ff7f0e"; /* orange */
-            if (label == "no fetch")         return "#7f7f7f"; /* gray   */
+            if (label == "complete")       return "#2ca02c"; /* green  */
+            if (label == "privilege stop") return "#d62728"; /* red    */
+            if (label == "unfetchable")    return "#ff7f0e"; /* orange */
+            if (label == "stuck bail")     return "#9467bd"; /* purple */
             return color_for_label(label);
         default:                return color_for_label(label);
     }
@@ -2063,6 +2078,89 @@ struct WalkCtx {
         std::string class_name;
     };
     std::vector<TermBranch> term;
+
+    /* ---- wp_termination ---------------------------------------------
+     *
+     * The tracer's wrong-path instruction budget, recovered from
+     * `wpdepth=N` in the header's command string (the budget itself is
+     * not a wire field).  0 = the run's wpdepth could not be recovered,
+     * and the classifier degrades accordingly (see handle_wp_events). */
+    uint64_t wp_budget = 0;
+
+    /* Per-template privilege facts, used to split the ONE front-end
+     * stop marker the wire carries into its two causes.  The walker
+     * terminates on `cst_va_is_kernel_code(next_pc) != excursion_is_
+     * kernel` and on a null template, and BOTH write the same
+     * translation_unavailable mark (champsim_tracer_wp.cc:521-535 and
+     * :639-662), so the wire cannot tell them apart.  Re-making the
+     * walker's comparison over the templates the trace already carries
+     * is the only way back, and it is an INFERENCE, not a read. */
+    struct WpTermTmpl {
+        /* Privilege at this block's FIRST insn — the domain a fetch of
+         * this block would land in, i.e. what the walker tests when
+         * this block is a successor. */
+        bool     dom_entry     = false;
+        /* Privilege at this block's LAST insn — the domain of the
+         * branch that launches an excursion from here, i.e. the
+         * walker's `excursion_is_kernel`. */
+        bool     dom_term      = false;
+        /* Successor edges (target_pcs + fall_through_pc) that resolve
+         * to a template, split by the domain they enter.  A crossing
+         * is a DIFFERENCE against the chain's own domain, so which of
+         * these two counts means "cross" is decided per chain. */
+        uint32_t succ_kernel   = 0;
+        uint32_t succ_user     = 0;
+        /* Successor edges the template names but that resolve to no
+         * template — the population the split is blind to. */
+        uint32_t succ_unknown  = 0;
+    };
+    std::vector<WpTermTmpl> wpterm;        /* by template index         */
+
+    /* The wrong-path chain currently being accumulated.  handle_wp_term_bb
+     * resets this on the CP entry that launches a chain and appends each
+     * WP block, so by the time the events sink fires (after the chain)
+     * these describe the chain it is about to classify. */
+    struct WpChain {
+        uint32_t last_tid = 0xFFFFFFFFu;   /* terminating WP block      */
+        uint32_t cp_tid   = 0xFFFFFFFFu;   /* the launching CP entry    */
+    };
+    WpChain wpchain;
+
+    /* Whole-trace joint counts behind the classification, dumped by
+     * --wp-term-probe.  The privilege split is an inference; these are
+     * the numbers that say how much of it the data actually carries. */
+    struct WpTermProbe {
+        uint64_t chains = 0;
+        uint64_t cls[4] = {0, 0, 0, 0};      /* the four final classes  */
+        /* The shipped 4-class taxonomy this classifier supersedes
+         * (completed / translation stop / no fetch / stuck bail), run
+         * on the same chains in the same pass so the two are
+         * comparable without a second walk. */
+        uint64_t prev[4] = {0, 0, 0, 0};
+        uint64_t migrate[4][4] = {};         /* [prev class][new class] */
+        /* Budget arithmetic. */
+        uint64_t budget_reached = 0, short_chains = 0;
+        uint64_t marker_and_budget = 0;      /* front-end stop AND budget */
+        /* Front-end stops by shape. */
+        uint64_t fe_zero_marked = 0;         /* chain_len==0, marker set  */
+        uint64_t fe_zero_unmarked = 0;       /* chain_len==0, no marker   */
+        uint64_t fe_block = 0;               /* last_unavail on a block   */
+        /* The privilege decision, per front-end stop.  unambiguous =
+         * every resolvable successor agrees (all cross, or none);
+         * ambiguous = they disagree and "any crossing" decided it;
+         * defaulted = NO successor resolved, so nothing was decided and
+         * the stop fell to unfetchable by default. */
+        uint64_t priv_unambig_cross = 0, priv_unambig_same = 0;
+        uint64_t priv_ambiguous = 0;
+        uint64_t priv_defaulted = 0;
+        /* Successor-edge coverage over those same front-end stops:
+         * how many named edges resolved to a template at all. */
+        uint64_t fe_succ_edges = 0, fe_succ_edges_known = 0;
+        /* Fault is an ATTRIBUTE, never a class — carried here only so
+         * the probe can show it does not track the classes. */
+        uint64_t any_fault = 0, last_fault = 0;
+    };
+    WpTermProbe wpprobe;
 
     /* Per-template precomputed accumulator updates for non-gshare
      * metrics (avoids re-classifying every visit). */
@@ -3455,22 +3553,324 @@ static void handle_devio_event(WalkCtx &ctx, const cst::DecodedDevio &d)
     ctx.devio_evs.push_back(ev);
 }
 
+/* Recover the tracer's wrong-path instruction budget from the header's
+ * recorded command line — `...,wpdepth=N,...` among the plugin's
+ * comma-separated arguments.  wpdepth is not carried as a wire field, so
+ * this string is the only place a decoded trace remembers it.  Returns 0
+ * when no well-formed `wpdepth=` argument is present (older or
+ * hand-assembled traces, or a run that took the built-in default without
+ * naming it), which callers read as "unknown". */
+static uint64_t parse_wpdepth(const std::string &command)
+{
+    const std::string key = "wpdepth=";
+    for (size_t p = command.find(key); p != std::string::npos;
+         p = command.find(key, p + 1)) {
+        /* Must start an argument, not end an unrelated word: the
+         * preceding character has to be an option/argument separator. */
+        if (p > 0) {
+            char prev = command[p - 1];
+            if (std::isalnum((unsigned char)prev) || prev == '_' ||
+                prev == '-') {
+                continue;
+            }
+        }
+        size_t d = p + key.size();
+        uint64_t v = 0;
+        size_t n = 0;
+        for (; d + n < command.size() &&
+               std::isdigit((unsigned char)command[d + n]); n++) {
+            v = v * 10 + (uint64_t)(command[d + n] - '0');
+        }
+        if (n > 0) {
+            return v;
+        }
+    }
+    return 0;
+}
+
+/* wp_termination class indices.  Hard-wired here, in
+ * build_metric_state's label registration order and in
+ * categorical_color; the three are one table split across three sites. */
+enum {
+    WPT_COMPLETE    = 0,
+    WPT_PRIVILEGE   = 1,
+    WPT_UNFETCHABLE = 2,
+    WPT_STUCK_BAIL  = 3,
+};
+
+/* Positional walker for wp_termination.  Identical to
+ * handle_position_bb on the correct path (CP-insn clock + current bin);
+ * additionally records which template launched the chain and which
+ * wrong-path block it stopped at, because the privilege split needs a
+ * block to ask about its successors.  Chain state is reset on the CP
+ * entry that launches the chain, so a chain is always measured against
+ * its own entry. */
+static void handle_wp_term_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
+{
+    if (!bb.is_wp) {
+        int bin = bin_of(ctx, ctx.cp_insns_so_far);
+        ctx.pending_bin = (uint64_t)bin;
+        ctx_bump_bin(ctx, bin, bb.n_insns);
+        ctx.wpchain = WalkCtx::WpChain{};
+        ctx.wpchain.cp_tid = bb.template_index;
+        return;
+    }
+    ctx.wpchain.last_tid = bb.template_index;
+}
+
 /* WP-events summary sink (wp_termination): classify how each CP
- * entry's wrong-path chain ended. */
+ * entry's wrong-path chain ended.  Four classes, in this order:
+ *
+ *   0 complete       — the chain spent its whole wpdepth budget.
+ *   1 privilege stop — a front-end stop whose failing successor is
+ *                      resolvable and lies in the OTHER privilege
+ *                      domain: the SMEP/PXN terminate.
+ *   2 unfetchable    — any other front-end stop.
+ *   3 stuck bail     — short of budget with nothing on the wire.
+ *
+ * WHY THIS SHAPE:
+ *
+ * (1) A fault does NOT terminate an excursion, so it is not a class.  A
+ * speculative access to an absent page is served a deterministic
+ * placeholder and the walk carries on to the budget (champsim_tracer_wp.cc,
+ * "NO synchronous exception truncates the excursion"); the same holds for
+ * an arithmetic or illegal-opcode fault and for a syscall-class entry,
+ * which resumes at the architectural fall-through.  `last_fault` therefore
+ * says only that the final block happened to fault, never that the fault
+ * ended the chain.  Classifying on it turns a coincidence into a cause,
+ * and because garbage-filled speculative loads are common it does so at
+ * scale.  Fault is carried as a per-block ATTRIBUTE (reported by
+ * --wp-term-probe) and must never reach this ladder.
+ *
+ * (2) Only the front end stops a walk, and it reports through ONE flag at
+ * two positions: `chain_unavailable` when the excursion's FIRST target was
+ * never realized (there is no block to carry a mark), `last_unavail` when a
+ * later one was not.  "No fetch" is therefore NOT a sibling class — it is a
+ * front-end stop at index 0 — so it is folded into unfetchable rather than
+ * bucketed separately.  A zero-length chain is the same event whether or
+ * not the chain-level marker rode along: no wrong-path block was ever
+ * realized, which is what "the front end refused at index 0" means.
+ *
+ * (3) That single flag stands for TWO walker terminates.  A null template
+ * (target unfetchable/untranslatable) and a privilege-domain crossing
+ * (`cst_va_is_kernel_code(next_pc) != excursion_is_kernel`, the faithful
+ * SMEP/PXN model) both set exactly the same mark — see
+ * champsim_tracer_wp.cc:521-535 versus :639-662.  They are separated here
+ * by re-making the walker's own comparison over the templates the trace
+ * carries: the chain's launching domain against the domains of the
+ * terminating block's successors.  A DIFFERENCE is the privilege stop;
+ * anything else is a fetch failure.  Only a difference counts — a
+ * successor merely being kernel code says nothing when the excursion
+ * launched from kernel code too.
+ *
+ * This split is an INFERENCE and it is biased toward under-reporting: a
+ * domain-crossing target is by construction one the walker refused to
+ * fetch, so it is the successor LEAST likely to have a template in the
+ * trace, and with no template it defaults to unfetchable.  --wp-term-probe
+ * reports how many privilege decisions were unambiguous, how many were
+ * ambiguous (successors disagreed and "any crossing" decided it) and how
+ * many were defaulted for want of any resolvable successor at all, so the
+ * split can be audited rather than trusted.
+ *
+ * (4) The walker's containment valves (repeated_fault_pc >= 16,
+ * poisoned_targets, bare_branch_pending, wild-store overflow) end an
+ * excursion with NOTHING on the wire.  "Stuck bail" is therefore inferred
+ * from arithmetic, not read: a chain the front end never stopped that
+ * nonetheless fell short of the wpdepth budget can only have been cut by
+ * one of them.  It is a lower bound — a valve that trips after the budget
+ * is already spent is indistinguishable from a clean end, which is why the
+ * budget test is evaluated FIRST.  When the run did not record a wpdepth
+ * (ctx.wp_budget == 0) there is nothing to fall short of, so stuck bail
+ * COLLAPSES INTO complete; the front-end classes are unaffected, since
+ * they are read from the wire and need no budget.  Do not instead infer
+ * bails from fault correlation: the valves live inside the fault handler,
+ * so every bail carries a fault by construction, and reading that
+ * correlation as causation is bug (1) wearing a new label.
+ *
+ * (5) SCOPE.  The events section is absent from the wire when a chain
+ * raised no event at all, and BodyWalker fires this callback only when it
+ * is present, so the population classified here is "chains that carried at
+ * least one wrong-path event" — not every excursion.  A chain that ran its
+ * whole budget without a single speculative fault never reaches this
+ * function and is in no class.  That is a property of the wire, not of the
+ * ladder; --wp-term-probe labels its chain count accordingly so the plot's
+ * denominator is not mistaken for the excursion count. */
 static void handle_wp_events(WalkCtx &ctx,
                              const cst::BodyWalker::WpEventsSummary &s)
 {
+    /* A front-end stop at any position: index 0 (no block to mark, so
+     * the marker is chain-level, and a zero-length chain means the same
+     * thing whether or not it rode along) or a later index. */
+    const bool front_end = s.chain_unavailable || s.chain_len == 0 ||
+                           s.last_unavail;
+    const bool budget_known   = ctx.wp_budget > 0;
+    const bool reached_budget = budget_known && s.wp_insns >= ctx.wp_budget;
+
+    /* The block whose successors the walker was about to fetch when it
+     * stopped: the last wrong-path block, or — for a chain that never
+     * realized a block — the CP entry that launched the excursion, whose
+     * own edges include the wrong-path target. */
+    const uint32_t tid = (s.chain_len == 0) ? ctx.wpchain.cp_tid
+                                            : ctx.wpchain.last_tid;
+    const WalkCtx::WpTermTmpl *t =
+        tid < ctx.wpterm.size() ? &ctx.wpterm[tid] : nullptr;
+
+    /* The excursion's domain is fixed at launch (`excursion_is_kernel =
+     * cst_va_is_kernel_code(branch_pc)`), so it is the LAUNCHING entry's
+     * terminating-branch domain — not the stopping block's. */
+    bool chain_kernel = false;
+    if (ctx.wpchain.cp_tid < ctx.wpterm.size()) {
+        chain_kernel = ctx.wpterm[ctx.wpchain.cp_tid].dom_term;
+    } else if (t) {
+        chain_kernel = t->dom_term;
+    }
+
+    /* Resolvable successors of the stopping block, split by whether they
+     * enter the other domain. */
+    const uint32_t n_cross = !t ? 0
+                                : (chain_kernel ? t->succ_user
+                                                : t->succ_kernel);
+    const uint32_t n_same  = !t ? 0
+                                : (chain_kernel ? t->succ_kernel
+                                                : t->succ_user);
+    const bool     cross   = n_cross > 0;
+
     int cls;
-    if (s.chain_len == 0) {
-        cls = 3;                     /* no fetch */
-    } else if (s.last_fault) {
-        cls = 1;                     /* fault stop */
-    } else if (s.last_unavail) {
-        cls = 2;                     /* translation stop */
+    if (reached_budget) {
+        cls = WPT_COMPLETE;
+    } else if (front_end) {
+        cls = cross ? WPT_PRIVILEGE : WPT_UNFETCHABLE;
+    } else if (!budget_known) {
+        cls = WPT_COMPLETE;          /* no budget: stuck bail collapses  */
     } else {
-        cls = 0;                     /* completed (budget / natural) */
+        cls = WPT_STUCK_BAIL;
     }
     ctx.bins.at(cls, (int)ctx.pending_bin) += 1.0;
+
+    if (!ctx.opts.wp_term_probe) return;
+    WalkCtx::WpTermProbe &p = ctx.wpprobe;
+    p.chains++;
+    p.cls[cls]++;
+    /* The shipped 4-class taxonomy this one supersedes, evaluated on the
+     * same chain in the same pass (completed / translation stop / no
+     * fetch / stuck bail) so conservation and movement are measured, not
+     * asserted. */
+    int prev;
+    if (s.chain_unavailable || s.chain_len == 0) prev = 2;       /* no fetch */
+    else if (s.last_unavail)                     prev = 1;       /* transl. */
+    else if (!budget_known || reached_budget)    prev = 0;       /* complete */
+    else                                         prev = 3;       /* bail    */
+    p.prev[prev]++;
+    p.migrate[prev][cls]++;
+
+    if (reached_budget) p.budget_reached++; else p.short_chains++;
+    if (front_end && reached_budget) p.marker_and_budget++;
+    if (s.chain_len == 0) {
+        if (s.chain_unavailable) p.fe_zero_marked++;
+        else                     p.fe_zero_unmarked++;
+    } else if (s.last_unavail) {
+        p.fe_block++;
+    }
+    if (front_end) {
+        uint32_t known = n_cross + n_same;
+        p.fe_succ_edges       += known + (t ? t->succ_unknown : 0);
+        p.fe_succ_edges_known += known;
+        if (known == 0)          p.priv_defaulted++;
+        else if (n_cross && n_same) p.priv_ambiguous++;
+        else if (n_cross)        p.priv_unambig_cross++;
+        else                     p.priv_unambig_same++;
+    }
+    if (s.fault_count > 0) p.any_fault++;
+    if (s.chain_len > 0 && s.last_fault) p.last_fault++;
+}
+
+/* --wp-term-probe: dump the whole-trace counts the wp_termination
+ * classification is built from.  The point is the privilege split's
+ * evidence — a decision is only carried by the data when the stopping
+ * block has a resolvable successor at all, and the default is biased
+ * (a domain-crossing target is one that was never fetched, so it is the
+ * least likely to own a template).  Also prints the shipped taxonomy's
+ * counts from the same chains, so a re-classification can be checked for
+ * conservation instead of taken on faith. */
+static void wp_term_probe_report(const WalkCtx &ctx, const char *path)
+{
+    if (!ctx.opts.wp_term_probe ||
+        ctx.opts.metric != Metric::WpTermination) {
+        return;
+    }
+    const WalkCtx::WpTermProbe &p = ctx.wpprobe;
+    uint64_t prev_tot = p.prev[0] + p.prev[1] + p.prev[2] + p.prev[3];
+    uint64_t new_tot  = p.cls[0] + p.cls[1] + p.cls[2] + p.cls[3];
+    uint64_t fe_tot   = p.priv_unambig_cross + p.priv_unambig_same +
+                        p.priv_ambiguous + p.priv_defaulted;
+    std::fprintf(stderr,
+        "[wpterm] %s\n"
+        "[wpterm]   chains=%llu (chains carrying >=1 WP event; a chain that\n"
+        "[wpterm]           raised none has no events section on the wire and\n"
+        "[wpterm]           is never surfaced, so it is in no class)\n"
+        "[wpterm]   wpdepth=%llu%s\n"
+        "[wpterm]   PREV completed=%llu translation=%llu no_fetch=%llu "
+        "stuck_bail=%llu total=%llu\n"
+        "[wpterm]   NEW  complete=%llu privilege=%llu unfetchable=%llu "
+        "stuck_bail=%llu total=%llu\n"
+        "[wpterm]   budget reached=%llu short=%llu "
+        "front_end_stop_after_budget=%llu\n"
+        "[wpterm]   front-end stops: at_index0_marked=%llu "
+        "at_index0_unmarked=%llu on_block=%llu total=%llu\n"
+        "[wpterm]   privilege decisions: unambiguous=%llu "
+        "(cross=%llu same=%llu) ambiguous=%llu defaulted=%llu\n"
+        "[wpterm]   successor coverage over those stops: "
+        "edges=%llu resolvable=%llu (%.1f%%)\n"
+        "[wpterm]   fault ATTRIBUTE (never a class): any=%llu last=%llu\n",
+        path,
+        (unsigned long long)p.chains,
+        (unsigned long long)ctx.wp_budget,
+        ctx.wp_budget == 0
+            ? "  (ABSENT from the header command: 'stuck bail' collapses "
+              "into 'complete')"
+            : "",
+        (unsigned long long)p.prev[0], (unsigned long long)p.prev[1],
+        (unsigned long long)p.prev[2], (unsigned long long)p.prev[3],
+        (unsigned long long)prev_tot,
+        (unsigned long long)p.cls[0], (unsigned long long)p.cls[1],
+        (unsigned long long)p.cls[2], (unsigned long long)p.cls[3],
+        (unsigned long long)new_tot,
+        (unsigned long long)p.budget_reached,
+        (unsigned long long)p.short_chains,
+        (unsigned long long)p.marker_and_budget,
+        (unsigned long long)p.fe_zero_marked,
+        (unsigned long long)p.fe_zero_unmarked,
+        (unsigned long long)p.fe_block,
+        (unsigned long long)fe_tot,
+        (unsigned long long)(p.priv_unambig_cross + p.priv_unambig_same),
+        (unsigned long long)p.priv_unambig_cross,
+        (unsigned long long)p.priv_unambig_same,
+        (unsigned long long)p.priv_ambiguous,
+        (unsigned long long)p.priv_defaulted,
+        (unsigned long long)p.fe_succ_edges,
+        (unsigned long long)p.fe_succ_edges_known,
+        p.fe_succ_edges ? 100.0 * (double)p.fe_succ_edges_known /
+                                  (double)p.fe_succ_edges : 0.0,
+        (unsigned long long)p.any_fault,
+        (unsigned long long)p.last_fault);
+    static const char *prev_names[4] = { "completed", "translation",
+                                         "no_fetch", "stuck_bail" };
+    for (int o = 0; o < 4; o++) {
+        std::fprintf(stderr,
+            "[wpterm]   migrate %-12s -> complete=%llu privilege=%llu "
+            "unfetchable=%llu stuck_bail=%llu\n",
+            prev_names[o],
+            (unsigned long long)p.migrate[o][0],
+            (unsigned long long)p.migrate[o][1],
+            (unsigned long long)p.migrate[o][2],
+            (unsigned long long)p.migrate[o][3]);
+    }
+    if (prev_tot != new_tot || new_tot != p.chains) {
+        std::fprintf(stderr,
+            "[wpterm]   *** NOT CONSERVED: chains=%llu prev=%llu new=%llu\n",
+            (unsigned long long)p.chains,
+            (unsigned long long)prev_tot, (unsigned long long)new_tot);
+    }
 }
 
 /* Iterate one CP BB's memops with both the virtual address and the
@@ -4281,13 +4681,57 @@ static void build_metric_state(WalkCtx &ctx,
             ctx.tmpl_kernel_insns[i] = k;
         }
     }
-    /* wp_termination: fixed class order (indices are hard-wired in
-     * handle_wp_events). */
+    /* wp_termination: fixed class order (the WPT_* indices are
+     * hard-wired in handle_wp_events), plus the two pieces of per-trace
+     * state the classification needs.
+     *
+     *  - the wrong-path instruction budget.  wpdepth is not a wire
+     *    field; it survives only inside the header's recorded command
+     *    line, so parse it back out of there and leave the budget at 0
+     *    (= unknown) when the run did not record one.  A 0 budget is
+     *    NOT silently replaced with the plugin's default: guessing a
+     *    number would manufacture "stuck bail" chains out of a trace
+     *    that cannot say.  handle_wp_events collapses that class into
+     *    "complete" instead.
+     *
+     *  - each template's privilege domain and the domains its successor
+     *    edges enter.  The walker's domain terminate fires on a
+     *    DIFFERENCE between the excursion's launching domain and the
+     *    domain of the code it is about to fetch, so the classifier
+     *    compares the same two things.  Only successors the trace has a
+     *    template for can be compared; the rest are counted as unknown
+     *    and never invented. */
     if (opts.metric == Metric::WpTermination) {
-        ctx.add_label("completed");
-        ctx.add_label("fault stop");
-        ctx.add_label("translation stop");
-        ctx.add_label("no fetch");
+        ctx.add_label("complete");
+        ctx.add_label("privilege stop");
+        ctx.add_label("unfetchable");
+        ctx.add_label("stuck bail");
+        ctx.wp_budget = parse_wpdepth(h.command);
+
+        std::unordered_map<uint64_t, size_t> by_start;
+        by_start.reserve(templates.size() * 2);
+        for (size_t i = 0; i < templates.size(); i++) {
+            by_start.emplace(templates[i].start_pc, i);
+        }
+        ctx.wpterm.assign(templates.size(), WalkCtx::WpTermTmpl{});
+        for (size_t i = 0; i < templates.size(); i++) {
+            const cst::Template &t = templates[i];
+            WalkCtx::WpTermTmpl &w = ctx.wpterm[i];
+            if (!t.insns.empty()) {
+                w.dom_entry = t.insns.front().is_system;
+                w.dom_term  = t.insns.back().is_system;
+            }
+            auto consider = [&](uint64_t pc) {
+                if (pc == 0) return;
+                auto it = by_start.find(pc);
+                if (it == by_start.end()) { w.succ_unknown++; return; }
+                const cst::Template &n = templates[it->second];
+                bool k = !n.insns.empty() && n.insns.front().is_system;
+                if (k) w.succ_kernel++; else w.succ_user++;
+            };
+            for (uint64_t pc : t.target_pcs) consider(pc);
+            consider(t.fall_through_pc);
+        }
     }
     /* translation_churn: fixed two-series order. */
     if (opts.metric == Metric::TranslationChurn) {
@@ -5586,7 +6030,17 @@ static MetricWalkSpec metric_walk_spec(Metric m)
         case Metric::DevioLba:
             s.bb_fn = handle_position_bb; s.wants_devio = true; break;
         case Metric::WpTermination:
-            s.bb_fn = handle_position_bb; s.wants_wp_events = true; break;
+            /* Structure (not Skip): the classifier needs each chain's
+             * wrong-path instruction count to tell a chain that spent
+             * its wpdepth budget from one a stuck-bail valve cut short,
+             * and the identity of the block it stopped at to decide
+             * whether the front end refused on a privilege crossing.
+             * Both live only in the chain section's per-block
+             * templates.  handle_wp_term_bb bins on the correct path
+             * exactly as handle_position_bb does, so walking the
+             * wrong-path blocks changes no binning. */
+            s.bb_fn = handle_wp_term_bb; s.wants_wp_events = true;
+            s.wp_mode = Wp::Structure; break;
         case Metric::WsDivergence:
             s.bb_fn = handle_ws_divergence_bb; s.cp_fields = true; break;
         case Metric::TranslationChurn:
@@ -5903,6 +6357,8 @@ static TraceResult process_trace(const char *path, const Options &opts)
         }
     }
 
+    wp_term_probe_report(ctx, path);
+
     return finalize_metric(path, ctx, templates, h, total_cp_insns);
 }
 
@@ -6037,6 +6493,7 @@ process_trace_multi(const char *path, const Options &opts,
     std::vector<MultiResult> out;
     out.reserve(ctxs.size());
     for (size_t i = 0; i < ctxs.size(); i++) {
+        wp_term_probe_report(*ctxs[i], path);
         out.push_back({ chosen[i],
                         finalize_metric(path, *ctxs[i], templates, h,
                                         total_cp_insns) });

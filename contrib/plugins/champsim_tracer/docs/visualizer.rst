@@ -186,8 +186,14 @@ when the trace lacks the capability entirely.
 
 ``wp_termination``
    Why each wrong-path chain ended, stacked per window: ``completed``
-   (ran to the recorded end), ``fault stop``, ``translation stop``, and
-   ``no fetch`` (the excursion's first target was never realizable).
+   (spent its whole ``wpdepth`` budget), ``translation stop`` (a later
+   target could not be fetched), ``no fetch`` (the excursion's first
+   target was never realizable), and ``stuck bail`` (short of the
+   budget with nothing on the wire to say why — one of the walker's
+   containment valves).  A fault does not end a chain, so it is not a
+   class here; the budget is read from the header's command line, and a
+   trace that records no ``wpdepth`` reports every unstopped chain as
+   ``completed``.
 
 ``ws_divergence``
    Distinct virtual pages vs distinct physical pages live within a

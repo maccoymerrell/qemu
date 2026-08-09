@@ -457,6 +457,41 @@ int g_xlate_bypass_priv = -1;
 static uint64_t g_user_icount = 0;       /* counted user-space insns so far */
 
 /*
+ * THE PIN-ABSOLUTE USER CLOCK.
+ *
+ * g_user_icount is an EPOCH counter: user_count_reset zeroes it at the pin
+ * and again at every segment open, so a window's budget reads "user insns
+ * since this window opened".  A pinned-simpoint SCHEDULE positions on a
+ * different clock.  Its cluster offsets are absolute from the pin — they
+ * come from a user-mode SimPoint run that counted the same user-space
+ * instruction stream from the program's start — and they stay meaningful
+ * only against a clock that never restarts.  Comparing them against the
+ * epoch counter places the first cluster correctly and mis-places every
+ * cluster after it, silently: the capture is a valid region, just not the
+ * region the schedule named.
+ *
+ * g_user_icount_pin_base carries the user instructions retired by all
+ * CLOSED epochs, so pin_user_clock() == base + epoch is monotone from the
+ * pin across any number of segments.  Positioning reads pin_user_clock();
+ * window budgets keep reading g_user_icount.  The base is zeroed at the
+ * pin and advanced by exactly the epoch it retires at each segment open,
+ * so the two clocks agree at every boundary.
+ *
+ * User mode never touches it.  There is no pin and no schedule there, the
+ * base is therefore never assigned anything but its 0 initialiser, and
+ * pin_user_clock() reduces to g_user_icount identically.
+ */
+static uint64_t g_user_icount_pin_base = 0;
+
+/* Trace segments finalised to a file so far (see finish_trace_segment). */
+static size_t g_segments_written = 0;
+
+static inline uint64_t pin_user_clock(void)
+{
+    return g_user_icount_pin_base + g_user_icount;
+}
+
+/*
  * USER-CLOCK STALL CEILING (stall_ceiling=<arch insns>; see PluginConfig).
  * The marker window's budget runs on g_user_icount, which advances only
  * while the pinned process executes user-space code.  A process that is
@@ -4853,6 +4888,14 @@ static inline BBTemplate *cp_chain_finalize_if_complete(unsigned int cpu_index)
 static void finish_trace_segment(bool prev_executed = true,
                                  unsigned int closing_cpu = UINT32_MAX)
 {
+    /* Segments actually finalised to a file.  The SimPoint report counts
+     * captures with THIS, not with the schedule iterator's index: the
+     * iterator only advances on a budget close, so a schedule ended by an
+     * END marker — which terminates without advancing, by ruling — would
+     * otherwise report the segment it DID write as untraced, which reads
+     * exactly like the schedule never having run at all. */
+    g_segments_written++;
+
     uint64_t lo = g_trace_segments.window_start();
     uint64_t hi = g_trace_segments.window_stop();
 
@@ -5680,8 +5723,14 @@ static void open_pinned_simpoint_window(unsigned int cpu_index,
     uint64_t span = warmup_insns + sim;
     uint64_t lo = icount_prev;
     uint64_t hi = lo + span;
-    uint64_t reached_at = g_user_icount;
+    uint64_t reached_at = pin_user_clock();
     g_trace_segments.set_window(lo, hi);
+    /* Retire this positioning epoch into the pin-absolute clock BEFORE
+     * user_count_reset zeroes it: the window budget restarts at 0, the
+     * schedule's clock does not.  On the first cluster the base is still
+     * 0, so this is exactly what the single-cluster path always
+     * computed. */
+    g_user_icount_pin_base = reached_at;
     user_count_reset(cpu_index, lo);
     g_autofree char *label = g_strdup_printf("simpoint_%d", sp->cluster_id);
     fprintf(stderr, "champsim_tracer: pinned simpoint %d reached (user clock %"
@@ -5816,7 +5865,29 @@ static void tw_manage_window(unsigned int cpu_index,
              * detects the crossing — executes and seals normally too,
              * carrying its memops and register deltas (see
              * g_window_close_armed). */
-            deferred_close(cpu_index).icount_shutdown_pending = true;
+            /*
+             * WHICH close.  A budget-reached close in pinned-simpoint mode
+             * is the end of ONE CLUSTER, not the end of the run: the
+             * schedule may still name regions the caller asked for, and
+             * tracing several regions over a single run is the contract in
+             * both modes.  Route it to the SAME simpoint close the
+             * user-mode schedule uses, which finalises the segment,
+             * advances the iterator, and exits only once the schedule is
+             * exhausted.
+             *
+             * This is the BUDGET close only.  Every other close reachable
+             * here stays terminal by design: the END marker
+             * (marker_close_and_exit), the user-clock stall ceiling just
+             * above, and the dead-latch close all end the run with
+             * clusters possibly outstanding — an END in particular kills
+             * the tracer regardless of simpoints, exactly as a program
+             * ending does in user mode.
+             */
+            if (pinned_simpoint_mode() && g_simpoints.is_active()) {
+                deferred_close(cpu_index).simpoint_close_pending = true;
+            } else {
+                deferred_close(cpu_index).icount_shutdown_pending = true;
+            }
         }
         if (g_window_mode == PluginConfig::WIN_SYMBOL &&
             !g_trace_segments.is_active() && start_symbol) {
@@ -6395,10 +6466,61 @@ static void run_deferred_window_closes(PathBuilder &pb, unsigned int cpu_index,
             exit(0);
         }
         recompute_next_threshold();
-        /* Re-arm budget so the per-TB inline_add countdown lands at
-         * zero when icount reaches the now-current eff_start. */
-        for (int i = 0, n = qemu_plugin_num_vcpus(); i < n; i++) {
-            recompute_budget((unsigned)i);
+        if (pinned_simpoint_mode()) {
+            /*
+             * Re-enter pinned positioning for the next cluster.  The pin
+             * survives the segment close (the marker fired once and owns
+             * the address space for the whole run) and pin_user_clock()
+             * is monotone across the close, so the next cluster's
+             * start_insn — an offset from the pin — needs no rebasing.
+             *
+             * What DOES have to be restored is the per-TB dispatch the
+             * fast-forward fast-path rides on: finish_trace_segment
+             * mirrored is_active=0 into every vCPU slot to stop the
+             * in-segment callbacks.  Put it back and park the budget slot
+             * at the sentinel, exactly as the pin-time path does — in
+             * pinned mode the budget countdown positions nothing
+             * (recompute_next_threshold parks the threshold at the
+             * sentinel); the user clock does.
+             */
+            for (int i = 0, n = qemu_plugin_num_vcpus(); i < n; i++) {
+                qemu_plugin_u64_set(g_scoreboard.is_active, (unsigned)i, 1);
+                qemu_plugin_u64_set(g_scoreboard.budget, (unsigned)i,
+                                    (uint64_t)BUDGET_INACTIVE_SENTINEL);
+                refresh_ctx_gates((unsigned)i);
+            }
+            const SimPointEntry *nsp = g_simpoints.current();
+            uint64_t neff = (nsp->start_insn > warmup_insns)
+                ? nsp->start_insn - warmup_insns : 0;
+            fprintf(stderr,
+                    "champsim_tracer: simpoint segment closed at user clock %"
+                    PRIu64 " — positioning to simpoint %d start %" PRIu64
+                    " user insns (warmup %" PRIu64 ")\n",
+                    pin_user_clock(), nsp->cluster_id, nsp->start_insn,
+                    warmup_insns);
+            if (pin_user_clock() >= neff) {
+                /* The schedule asked for a region the run has already
+                 * passed (overlapping clusters, or a warmup wide enough
+                 * to reach back before the previous window's end).  The
+                 * window opens on the very next TB, so the capture is a
+                 * valid region — but it is NOT the region requested, and
+                 * a silently mispositioned segment is worse than a loud
+                 * one. */
+                fprintf(stderr,
+                        "champsim_tracer: WARNING simpoint %d effective "
+                        "start %" PRIu64 " is already behind the pinned "
+                        "user clock %" PRIu64 " — its window opens "
+                        "immediately and the segment is NOT positioned "
+                        "where the schedule asked\n",
+                        nsp->cluster_id, neff, pin_user_clock());
+            }
+            fflush(stderr);
+        } else {
+            /* Re-arm budget so the per-TB inline_add countdown lands at
+             * zero when icount reaches the now-current eff_start. */
+            for (int i = 0, n = qemu_plugin_num_vcpus(); i < n; i++) {
+                recompute_budget((unsigned)i);
+            }
         }
     }
 }
@@ -7434,7 +7556,12 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         const SimPointEntry *sp = g_simpoints.current();
         uint64_t eff_start = (sp && sp->start_insn > warmup_insns)
             ? sp->start_insn - warmup_insns : 0;
-        if (sp && g_user_icount >= eff_start) {
+        /* Positioning is against the PIN-ABSOLUTE clock: the schedule's
+         * offsets are all measured from the pin, and once cluster N's
+         * window has closed the epoch counter has restarted while the
+         * schedule has not.  On the first cluster the base is 0 and this
+         * is the g_user_icount comparison it replaces. */
+        if (sp && pin_user_clock() >= eff_start) {
             g_rec_mutex_lock(&exec_lock);
             if (!g_trace_segments.is_active() &&
                 !g_trace_segments.is_shutting_down()) {
@@ -8259,6 +8386,38 @@ static void marker_close_and_exit(bool last_window, unsigned int cpu_index)
         g_rec_mutex_unlock(&exec_lock);
         exit(0);
     }
+    /*
+     * END with NO window open.  In a pinned-simpoint run this is the
+     * schedule POSITIONING between clusters (or before the first one):
+     * the workload just ended, so every remaining cluster is an offset on
+     * a clock that will never advance again, and continuing would leave
+     * the tracer positioning forever toward a region that cannot arrive.
+     *
+     * The ruling that an END kills the tracer regardless of simpoints is
+     * about the END, not about whether a window happened to be open when
+     * it fired.  Terminate here: the segments already written are
+     * complete and finalised, and the outstanding clusters are
+     * unreachable BY DESIGN, named on the way out rather than waited on.
+     *
+     * Scoped to pinned-simpoint mode — plain WIN_MARKER has no schedule
+     * to strand, and its no-window END keeps the historical return (the
+     * unowned-END diagnostics own that case).
+     */
+    if (pinned_simpoint_mode() && !g_trace_segments.is_shutting_down()) {
+        size_t left = g_simpoints.size() > g_simpoints.current_index()
+            ? g_simpoints.size() - g_simpoints.current_index() : 0;
+        fprintf(stderr,
+                "champsim_tracer: end marker between simpoint windows at "
+                "user clock %" PRIu64 " — the workload ended, so the run "
+                "ends here with %zu of %zu scheduled simpoint(s) never "
+                "reached (%zu segment(s) written)\n",
+                pin_user_clock(), left, g_simpoints.size(),
+                g_segments_written);
+        fflush(stderr);
+        g_trace_segments.set_shutting_down();
+        g_rec_mutex_unlock(&exec_lock);
+        exit(0);
+    }
     g_rec_mutex_unlock(&exec_lock);
 }
 
@@ -8527,8 +8686,12 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
 
     if (pinned_simpoint_mode()) {
         /* Pin only: zero the user clock at the target's first instruction
-         * and start positioning toward the simpoint's effective start. */
+         * and start positioning toward the simpoint's effective start.
+         * The pin is the schedule's ORIGIN, so the pin-absolute clock
+         * starts here too — base 0, i.e. the first epoch IS the absolute
+         * clock. */
         uint64_t lo = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
+        g_user_icount_pin_base = 0;
         user_count_reset(cpu_index, lo);
         const SimPointEntry *sp = g_simpoints.current();
         uint64_t eff_start = (sp && sp->start_insn > warmup_insns)
@@ -9931,7 +10094,7 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     if (g_simpoints.is_active()) {
         g_string_append_printf(report,
             "SimPoints loaded/traced: %zu / %zu\n\n",
-            g_simpoints.size(), g_simpoints.current_index());
+            g_simpoints.size(), g_segments_written);
     }
     g_mutex_unlock(&data_lock);
 

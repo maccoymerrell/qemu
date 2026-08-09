@@ -65,10 +65,26 @@ struct PendingEmit {
 /* The fragment walk over the deferred prev TB: folds executed fragments
  * into the CP true-BB chain and collects every completed BB as a
  * PendingEmit.  Caller holds exec_lock; takes data_lock internally. */
+/*
+ * A block SEALED BECAUSE CONTROL LEFT IT: the walk found the next fragment
+ * does not continue the in-flight chain, so that chain will never reach a
+ * terminating branch.  Its instructions executed, so it is emitted at the
+ * extent that ran instead of being discarded.  @snap_lo / @snap_hi are the
+ * half-open range of the positional reg-snap sink that belongs to it — the
+ * sink is a FIFO shared with the blocks this walk goes on to emit, so the
+ * cut block takes its own prefix and leaves the rest.
+ */
+struct CutEmit {
+    BBTemplate *bb_tmpl;
+    size_t      snap_lo;
+    size_t      snap_hi;
+};
+
 bool collect_finalized_bbs(unsigned int cpu_index,
                            BBTemplate *prev_tb_head,
                            uint64_t prev_start, uint64_t current_pc,
-                           std::vector<PendingEmit> &pending_emits);
+                           std::vector<PendingEmit> &pending_emits,
+                           std::vector<CutEmit> &cut_emits);
 
 /* Run the WP simulator (if armed) and emit one finalized BB's BodyEntry.
  * Caller holds exec_lock; must NOT hold data_lock. */

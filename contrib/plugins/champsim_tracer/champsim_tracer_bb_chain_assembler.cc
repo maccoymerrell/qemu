@@ -6,6 +6,7 @@
 
 #include "champsim_tracer_bb_chain_assembler.h"
 #include "champsim_tracer_bb_template_cache.h"
+#include <inttypes.h>
 
 #include "champsim_tracer_stats.h"
 
@@ -127,6 +128,49 @@ BBTemplate *BBChainAssembler::finalize()
 uint32_t BBChainAssembler::in_flight_insns() const
 {
     return chain_insns(fragments_);
+}
+
+bool BBChainAssembler::would_discard(uint64_t entry_pc) const
+{
+    if (fragments_.empty()) {
+        return false;
+    }
+    if (my_gen_ != g_segment_generation.load(std::memory_order_relaxed)) {
+        return true;
+    }
+    return entry_pc_ == 0 || last_ft_ != entry_pc;
+}
+
+bool BBChainAssembler::in_flight_is_system() const
+{
+    return !fragments_.empty() && fragments_.front() &&
+           fragments_.front()->is_system;
+}
+
+void BBChainAssembler::describe_in_flight(std::FILE *out,
+                                          uint64_t breaking_pc) const
+{
+    if (fragments_.empty()) {
+        return;
+    }
+    std::fprintf(out,
+        "champsim_tracer: [chaindrop] entry=0x%" PRIx64 " frags=%zu insns=%u "
+        "last_ft=0x%" PRIx64 " breaking_pc=0x%" PRIx64 " is_sys=%d "
+        "await_ds=%d gen=%s\n",
+        entry_pc_, fragments_.size(), chain_insns(fragments_), last_ft_,
+        breaking_pc, (int)in_flight_is_system(), (int)awaiting_delay_slot_,
+        my_gen_ == g_segment_generation.load(std::memory_order_relaxed)
+            ? "same" : "stale");
+    for (const BBTemplate *f : fragments_) {
+        if (!f) {
+            continue;
+        }
+        std::fprintf(out,
+            "champsim_tracer: [chaindrop]   frag pc=0x%" PRIx64 " n=%u "
+            "ft=0x%" PRIx64 " terminus=%u\n",
+            f->start_pc, f->n_insns, f->fall_through_pc,
+            (unsigned)f->terminus);
+    }
 }
 
 BBTemplate *BBChainAssembler::finalize_truncated(BBTemplate *tail_frag,

@@ -4571,9 +4571,59 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
                                                 : in.current_pc;
     seal_pc_override_ = 0;
     std::vector<PendingEmit> pending_emits;
+    std::vector<CutEmit> cut_emits;
     bool any_finalize = collect_finalized_bbs(in.cpu_index, walk_prev_,
                                               in.prev_start, seal_current_pc,
-                                              pending_emits);
+                                              pending_emits, cut_emits);
+
+    /*
+     * Blocks the walk sealed because control left them (see CutEmit).  They
+     * precede everything this step goes on to emit, so they are emitted
+     * FIRST — and before the merge, whose front-of-pending_emits contract
+     * they must not disturb.
+     *
+     * The positional reg-snap sink is a FIFO: each cut block takes its own
+     * [lo, hi) slice and the remainder is put back for the walk's blocks.
+     * The faults=0 exclusion applies to them exactly as it does to any other
+     * block from a synchronous handler's context — dropped WITH their snaps,
+     * because a block that is not emitted must not leave a prefix behind.
+     */
+    if (!cut_emits.empty()) {
+        /* At most one per walk BY CONSTRUCTION: fragments within one TB are
+         * contiguous, so only the walk's FIRST fragment can fail to continue
+         * the chain.  If that ever stops holding, the cut blocks would be
+         * emitted as a group ahead of blocks that ran between them, and the
+         * body stream would be out of program order — so it is checked, not
+         * assumed. */
+        if (cut_emits.size() > 1) {
+            g_stats.cut_blocks_multi_per_walk++;
+        }
+        const bool excluded = !g_features.trace_faults && walk_in_sync_;
+        std::vector<RegSnap> &sink = pending_reg_snaps(in.cpu_index);
+        std::vector<RegSnap> all = std::move(sink);
+        sink.clear();
+        size_t pos = 0;
+        for (const CutEmit &c : cut_emits) {
+            size_t lo = c.snap_lo < all.size() ? c.snap_lo : all.size();
+            size_t hi = c.snap_hi < all.size() ? c.snap_hi : all.size();
+            if (hi < lo) {
+                hi = lo;
+            }
+            pos = hi;
+            if (excluded) {
+                g_stats.cut_blocks_excluded++;
+                continue;
+            }
+            sink.assign(all.begin() + (ptrdiff_t)lo,
+                        all.begin() + (ptrdiff_t)hi);
+            rep_emit_handoff(in.cpu_index, rep_state(in.cpu_index).pb_walk_facts);
+            emit_body_entry(out_stream, c.bb_tmpl, in.cpu_index, {});
+            sink.clear();
+        }
+        sink.assign(all.begin() + (ptrdiff_t)pos, all.end());
+        size_t &mark = cp_chain_snap_mark(in.cpu_index);
+        mark = mark >= pos ? mark - pos : 0;
+    }
 
     if (in.watch_pc && walk_prev_ && walk_prev_->start_pc == in.watch_pc) {
         fprintf(stderr, "[blkwatch] seal prev=0x%" PRIx64 " prev_start_sb=0x%"

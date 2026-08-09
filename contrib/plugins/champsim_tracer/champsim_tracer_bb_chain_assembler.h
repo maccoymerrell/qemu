@@ -30,6 +30,7 @@
 #define CHAMPSIM_TRACER_BB_CHAIN_ASSEMBLER_H
 
 #include <atomic>
+#include <cstdio>
 #include <vector>
 
 #include "champsim_tracer.h"
@@ -98,6 +99,20 @@ public:
 
     /* Architectural instructions currently held in the in-flight chain. */
     uint32_t in_flight_insns() const;
+
+    /* Would append_fragment(@entry_pc, ...) DISCARD the live chain?  Same
+     * predicate append_fragment applies, asked before the fact so the caller
+     * can act on the chain while it still exists. */
+    bool would_discard(uint64_t entry_pc) const;
+
+    /* Privilege of the in-flight chain (its first fragment's stamp).  False
+     * when there is no chain. */
+    bool in_flight_is_system() const;
+
+    /* Name the in-flight chain on @out: entry pc, fragment count,
+     * instruction count, privilege, and the entry pc that is about to break
+     * it.  Diagnostic (CST_CHAINDROP_DIAG). */
+    void describe_in_flight(std::FILE *out, uint64_t breaking_pc) const;
 
     /* Drop the in-flight chain.
      *

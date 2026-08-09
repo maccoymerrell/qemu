@@ -447,6 +447,24 @@ true-BB boundaries per-TB — "this TB ends in a branch, therefore
 seal" — is unsound for exactly this reason; ``TbTerminus`` plus the
 assembler's pending-delay-slot state is the sound replacement.
 
+A chain does not always reach its terminating branch.  Control can
+leave the block part-way — an async window swallows the rest of a true
+BB and execution resumes somewhere unrelated, a foreign address space
+intervenes, a segment boundary bumps the generation — and the next
+fragment then does not continue the chain.  Those fragments **executed**,
+so the walk seals the chain at the extent that ran and emits it, ahead
+of its own blocks, in program order; it does not discard it.  The
+sealed block goes through the same cut-short store the segment close
+uses (``commit_partial_bb``), so it can never be confused with the
+complete block at the same address, and it carries its own slice of the
+positional register-snapshot sink: the sink is a FIFO shared with the
+blocks that follow, and a chain dropped without its snaps left them
+behind as the next block's "leaked prefix", which the emit-time
+backstop then "recovered" by trimming — a misattribution dressed as a
+repair.  On a migration/fault workload this is not a corner: one cell
+sealed 1033 such blocks carrying 4118 instructions that used to reach
+nothing.
+
 The user-visible difference: ``tb_count`` is the number of fragments
 the splitter produced across all QEMU translations, while
 ``bb_count`` (the ``BB templates created`` line in the exit-time

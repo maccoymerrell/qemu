@@ -177,6 +177,28 @@ struct Stats {
      * instructions on their own dispatch and the wire never received
      * them. */
     uint64_t reg_snap_chain_drop_insns = 0;
+    /* The same instructions split by the privilege of the block that
+     * lost them.  Only the user half is inside the window clock's
+     * quantity, so a single total cannot say whether a clock-vs-wire
+     * residual is these drops or a second mechanism. */
+    uint64_t reg_snap_chain_drop_user_insns = 0;
+    uint64_t reg_snap_chain_drop_sys_insns = 0;
+    /* Chains the seal walk SEALED instead of discarding, because control
+     * left the block before its terminating branch: the instructions ran, so
+     * the block is emitted at the extent that ran.  reg_snap_chain_drops
+     * above is what this replaces and must now be 0 at the seal site.
+     * cut_blocks_excluded are the ones the faults=0 policy drops with every
+     * other block from a synchronous handler's context — a policy exclusion,
+     * not a loss of something the trace was meant to carry. */
+    uint64_t cut_blocks_sealed = 0;
+    uint64_t cut_block_insns = 0;
+    uint64_t cut_block_user_insns = 0;
+    uint64_t cut_block_sys_insns = 0;
+    uint64_t cut_blocks_excluded = 0;
+    /* Seal walks that sealed MORE THAN ONE cut block.  Impossible while
+     * fragments inside a TB stay contiguous; if it fires, the body stream is
+     * out of program order.  Must be 0. */
+    uint64_t cut_blocks_multi_per_walk = 0;
     /* In-flight chains dropped by the append inside PathBuilder::flush_final
      * — the SEGMENT-CLOSE walk, which calls BBChainAssembler::append_fragment
      * directly and discarded the drop verdict.  That is the walk every

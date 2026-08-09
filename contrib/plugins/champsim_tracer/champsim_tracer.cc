@@ -5105,6 +5105,13 @@ size_t &cp_chain_snap_mark(unsigned int cpu_index)
 static inline void cp_chain_append(unsigned int cpu_index, BBTemplate *frag)
 {
     uint32_t dropped_insns = 0;
+    /* What is about to be discarded, named before it is gone. */
+    const bool will_discard = cp_chain(cpu_index).would_discard(frag->start_pc);
+    const bool dropped_system = will_discard &&
+                                cp_chain(cpu_index).in_flight_is_system();
+    if (will_discard && getenv("CST_CHAINDROP_DIAG")) {
+        cp_chain(cpu_index).describe_in_flight(stderr, frag->start_pc);
+    }
     const bool dropped_chain =
         cp_chain(cpu_index).append_fragment(frag->start_pc, frag,
                                             frag->fall_through_pc,
@@ -5117,6 +5124,16 @@ static inline void cp_chain_append(unsigned int cpu_index, BBTemplate *frag)
     if (dropped_chain) {
         g_stats.reg_snap_chain_drops++;
         g_stats.reg_snap_chain_drop_insns += dropped_insns;
+        /* Split by privilege.  A kernel block lost here and a USER block
+         * lost here are the same defect but not the same number: only the
+         * user one is inside the quantity the window clock counts, so a
+         * single total cannot say whether a clock-vs-wire residual is
+         * explained by these drops or is a second mechanism. */
+        if (dropped_system) {
+            g_stats.reg_snap_chain_drop_sys_insns += dropped_insns;
+        } else {
+            g_stats.reg_snap_chain_drop_user_insns += dropped_insns;
+        }
     }
     if (!g_features.reg_data) {
         return;
@@ -6428,7 +6445,8 @@ static void vcpu_tb_check_budget(unsigned int cpu_index, void *udata)
 bool collect_finalized_bbs(unsigned int cpu_index,
                            BBTemplate *prev_tb_head,
                            uint64_t prev_start, uint64_t current_pc,
-                           std::vector<PendingEmit> &pending_emits)
+                           std::vector<PendingEmit> &pending_emits,
+                           std::vector<CutEmit> &cut_emits)
 {
     g_mutex_lock(&data_lock);
     bool any_finalize = false;
@@ -6486,6 +6504,41 @@ bool collect_finalized_bbs(unsigned int cpu_index,
 
         if (is_last_executed) {
             snap_prev_tail_dsts(cpu_index, frag, frag_current_pc);
+        }
+        /*
+         * CONTROL LEFT THE IN-FLIGHT BLOCK.  This fragment does not continue
+         * the chain (an async window swallowed the rest of a true BB and
+         * control came back somewhere else, a segment generation bumped, a
+         * foreign span intervened), so that chain will never reach a
+         * terminating branch and append_fragment is about to throw it away —
+         * along with the per-instruction destination snaps it already
+         * captured, which the sink's positional discipline then forces out
+         * too.  Those instructions EXECUTED.  Seal the chain at the extent
+         * that ran and hand it to the caller to emit ahead of this walk's
+         * own blocks, in program order.
+         *
+         * The snaps go with it: [snap_lo, snap_hi) of the sink is exactly
+         * this chain's, and leaving them behind is what made them the next
+         * block's "leaked prefix".
+         */
+        if (cp_chain(cpu_index).would_discard(frag->start_pc)) {
+            size_t lo = cut_emits.empty() ? 0 : cut_emits.back().snap_hi;
+            size_t hi = cp_chain_snap_mark(cpu_index);
+            if (hi < lo) {
+                hi = lo;
+            }
+            if (BBTemplate *cut =
+                    cp_chain(cpu_index).finalize_truncated(nullptr, 0)) {
+                cut_emits.push_back(CutEmit{cut, lo, hi});
+                g_stats.cut_blocks_sealed++;
+                g_stats.cut_block_insns += cut->n_insns;
+                if (cut->is_system) {
+                    g_stats.cut_block_sys_insns += cut->n_insns;
+                } else {
+                    g_stats.cut_block_user_insns += cut->n_insns;
+                }
+            }
+            cp_chain(cpu_index).reset();
         }
         cp_chain_append(cpu_index, frag);
         attribute_cp_insns(frag);

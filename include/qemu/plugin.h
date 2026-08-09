@@ -46,6 +46,15 @@ get_plugin_meminfo_rw(qemu_plugin_meminfo_t i)
 #ifdef CONFIG_PLUGIN
 extern QemuOptsList qemu_plugin_opts;
 
+/**
+ * qemu_plugin_any_loaded() - true once at least one plugin has been loaded
+ *
+ * Valid from qemu_plugin_load_list() onwards, i.e. for every device realize
+ * function.  Machine/device code uses it where a plugin changes a contract the
+ * device depends on (see the RTC's guest-time-transparency note).
+ */
+bool qemu_plugin_any_loaded(void);
+
 static inline void qemu_plugin_add_opts(void)
 {
     qemu_add_opts(&qemu_plugin_opts);

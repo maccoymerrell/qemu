@@ -42,6 +42,8 @@
 #include "migration/vmstate.h"
 #include "qapi/error.h"
 #include "qapi/qapi-events-misc.h"
+#include "qemu/error-report.h"
+#include "qemu/plugin.h"
 #include "qapi/visitor.h"
 
 //#define DEBUG_CMOS
@@ -897,6 +899,40 @@ static void rtc_realizefn(DeviceState *dev, Error **errp)
         error_setg(errp, "Maximum value for \"irq\" is: %u", ISA_NUM_IRQS - 1);
         return;
     }
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * Guest-time transparency: a TCG plugin that freezes guest time for its own
+     * instrumentation or for speculative execution does so with
+     * cpu_disable_ticks(), which stops every clock gated on
+     * timers_state.cpu_ticks_enabled -- the TSC, the LAPIC timer and its
+     * current-count read, the PIT, the HPET and the ACPI PM timer.  It does NOT
+     * stop QEMU_CLOCK_HOST, which is raw host wall time by contract
+     * (util/qemu-timer.c, get_clock_realtime) and must stay that way.
+     *
+     * rtc_clock defaults to QEMU_CLOCK_HOST (system/rtc.c), so with a freezing
+     * plugin loaded the mc146818 becomes the ONE guest-visible timebase that
+     * keeps running through a freeze: the CMOS time-of-day advances at host
+     * rate while every other guest clock stands still, and the periodic /
+     * update / alarm timers keep firing on host time.  A guest that reads the
+     * CMOS clock or uses /dev/rtc inside an instrumented window therefore sees
+     * a timebase inconsistent with all the others, and Linux's clocksource
+     * watchdog compares exactly such pairs.
+     *
+     * QEMU_CLOCK_VIRTUAL is gated by cpu_ticks_enabled and is already a
+     * supported RTC base (-rtc clock=vm), so adopt it when a plugin is present
+     * and the user did not ask for a specific clock.  Announced rather than
+     * silent: it changes what the guest reads from the CMOS clock.
+     */
+    if (rtc_clock == QEMU_CLOCK_HOST && qemu_plugin_any_loaded()) {
+        warn_report("mc146818rtc: a TCG plugin is loaded; moving the RTC from "
+                    "QEMU_CLOCK_HOST to QEMU_CLOCK_VIRTUAL so it is frozen "
+                    "with every other guest clock. Pass -rtc clock=host to "
+                    "keep the old behaviour (the guest will then see the CMOS "
+                    "clock run through plugin time freezes).");
+        rtc_clock = QEMU_CLOCK_VIRTUAL;
+    }
+#endif
 
     rtc_set_date_from_host(isadev);
 

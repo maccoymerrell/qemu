@@ -524,6 +524,17 @@ struct qemu_plugin_cb {
 
 struct qemu_plugin_state plugin;
 
+/*
+ * Whether any plugin was loaded.  Machine models need this to decide whether
+ * the guest-time-transparency contract a freezing plugin relies on applies to
+ * them; qemu_plugin_load_list() runs before machine_run_board_init(), so a
+ * device realize function sees the final answer.
+ */
+bool qemu_plugin_any_loaded(void)
+{
+    return !QTAILQ_EMPTY(&plugin.ctxs);
+}
+
 struct qemu_plugin_ctx *plugin_id_to_ctx_locked(qemu_plugin_id_t id)
 {
     struct qemu_plugin_ctx *ctx;

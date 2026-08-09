@@ -12,6 +12,9 @@
 #include "qemu/error-report.h"
 #include "exec/exec-all.h"
 #include "exec/translator.h"
+#ifdef CONFIG_PLUGIN
+#include "exec/insn-dataflow.h"
+#endif
 #include "exec/cpu_ldst.h"
 #include "exec/plugin-gen.h"
 #include "exec/oracle.h"
@@ -241,6 +244,13 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     tb->icount = db->num_insns;
 
     if (plugin_enabled) {
+        /*
+         * Read each instruction's register accesses off the ops the target
+         * just emitted, before the plugin's translate callback asks for them
+         * and long before tcg_optimize() is entitled to delete a write that
+         * nothing downstream consumes.
+         */
+        insn_dataflow_extract(db->num_insns);
         plugin_gen_tb_end(cpu, db->num_insns);
     }
 

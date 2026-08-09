@@ -15,9 +15,11 @@
 import argparse
 import re
 
-def extract_symbols(plugin_header):
-    with open(plugin_header) as file:
-        content = file.read()
+def extract_symbols(plugin_headers):
+    content = ""
+    for header in plugin_headers:
+        with open(header) as file:
+            content += file.read()
     # Remove QEMU_PLUGIN_API macro definition.
     content = content.replace('#define QEMU_PLUGIN_API', '')
     expected = content.count('QEMU_PLUGIN_API')
@@ -31,7 +33,8 @@ def extract_symbols(plugin_header):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description='Extract QEMU plugin symbols')
-    parser.add_argument('plugin_header', help='Path to QEMU plugin header.')
+    parser.add_argument('plugin_header', nargs='+',
+                        help='Path to a QEMU plugin header.')
     args = parser.parse_args()
 
     syms = extract_symbols(args.plugin_header)

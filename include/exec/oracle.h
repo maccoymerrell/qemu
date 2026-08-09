@@ -74,5 +74,13 @@ bool oracle_gen_helper_probe_wanted(const TCGHelperInfo *info);
 void oracle_gen_helper_probe(const TCGHelperInfo *info, bool pre,
                              struct TCGTemp *ret);
 
+/*
+ * Choke point 4: the IR the target's translator emitted.  Called from the top
+ * of tcg_gen_code(), before tcg_optimize() has had a chance to delete an
+ * architecturally real write that nothing downstream consumes.  Takes the
+ * TranslationBlock as void so a caller does not need the oracle's headers.
+ */
+void oracle_ir_translate(const void *tb);
+
 #endif /* CONFIG_ORACLE */
 #endif /* EXEC_ORACLE_H */

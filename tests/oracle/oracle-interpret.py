@@ -230,8 +230,31 @@ def arch_name(target, layout, field, off, size, opts):
                 "sticky FP exception accumulator"
 
     if target.startswith("x86"):
-        if "fpus" in path or "mxcsr" in path:
-            return path.split(".")[-1].upper(), "FP status word"
+        # x86 registers almost none of its vector or FP state as TCG globals,
+        # so nearly everything interesting here arrives as a bare offset.
+        # xmm_regs[] is a flat array of ZMMReg, which makes the offset carry
+        # the register number outright -- the same affine-and-therefore-
+        # invertible property that makes a RISC-V vreg offset usable.
+        m = re.match(r"xmm_regs\[(\d+)\]", path)
+        if m:
+            return "xmm%s" % m.group(1), \
+                "xmm_regs[] is ZMMReg-strided; the offset carries the number"
+        m = re.match(r"fpregs\[(\d+)\]", path)
+        if m:
+            return "st%s" % m.group(1), \
+                "x87 stack slot; which architectural ST(n) it is depends on " \
+                "fpstt, which is state and not layout"
+        m = re.match(r"segs\[(\d+)\]", path)
+        if m:
+            return "seg%s" % m.group(1), "segment descriptor cache"
+        root = path.split(".")[0].split("[")[0]
+        if root in ("fpus", "fpuc", "fpstt", "fptags"):
+            return "x87ctl", "x87 control/status"
+        if root == "mxcsr":
+            return "mxcsr", "SSE control/status"
+        if "float_exception_flags" in path:
+            return "mxcsr.flags (softfloat side)", \
+                "sticky FP exception accumulator"
 
     return None, None
 

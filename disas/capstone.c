@@ -4037,6 +4037,224 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
  * Disassemble a single instruction with Capstone CS_OPT_DETAIL enabled
  * and fill a qemu_plugin_insn_info struct with the structured results.
  */
+/*
+ * What the operand half of the decode costs.
+ *
+ * The plan is to stop asking Capstone for operands at all once the dataflow
+ * comes from the TCG capture points, which makes the operand walk, the
+ * access-flag reads and every boundary repair that exists to correct a
+ * register fact dead code rather than merely unused input.  Whether that is
+ * also a speed-up is a question with an answer, not an assumption, so the
+ * boundary can be asked to time itself:
+ *
+ *   QEMU_CAP_PROFILE=1     count calls and split the time between the whole
+ *                          decode and the operand half of it
+ *   QEMU_CAP_NODETAIL=1    run Capstone with CS_OPT_DETAIL off, which is the
+ *                          floor an identification-only decode could reach
+ *
+ * Both are read once and both are off by default.
+ */
+static bool cap_prof_on;
+static bool cap_prof_read;
+static bool cap_nodetail_on;
+static bool cap_nodetail_read;
+static int64_t cap_prof_calls;
+static int64_t cap_prof_ns_total;
+static int64_t cap_prof_ns_operands;
+
+static int64_t cap_prof_now(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
+/*
+ * linux-user services the guest's exit syscall with _exit(), so an atexit
+ * handler is not reached; the reading is taken every cap_prof_every calls
+ * instead, which also makes two configurations comparable at the same call
+ * count rather than at whatever count each happened to reach.
+ */
+static int64_t cap_prof_every = 10000;
+
+static void cap_prof_dump(void)
+{
+    if (!cap_prof_calls) {
+        return;
+    }
+    fprintf(stderr,
+            "cap_profile: calls=%" PRId64 " total_ns=%" PRId64
+            " operands_ns=%" PRId64 " total_per_call=%.0f"
+            " operands_per_call=%.0f operands_share=%.1f%%\n",
+            cap_prof_calls, cap_prof_ns_total, cap_prof_ns_operands,
+            (double)cap_prof_ns_total / cap_prof_calls,
+            (double)cap_prof_ns_operands / cap_prof_calls,
+            100.0 * cap_prof_ns_operands / cap_prof_ns_total);
+}
+
+static bool cap_profiling(void)
+{
+    if (!cap_prof_read) {
+        const char *s = getenv("QEMU_CAP_PROFILE");
+
+        cap_prof_on = s && atoi(s) != 0;
+        cap_prof_read = true;
+        if (cap_prof_on) {
+            const char *e = getenv("QEMU_CAP_PROFILE_EVERY");
+
+            if (e) {
+                cap_prof_every = strtoll(e, NULL, 0);
+            }
+            atexit(cap_prof_dump);
+        }
+    }
+    return cap_prof_on;
+}
+
+/*
+ * Identification needs insn->id and insn->mnemonic, and both come out of the
+ * base decode.  Everything under insn->detail -- operands, implicit register
+ * lists, and the instruction groups the branch class is cross-checked against
+ * -- is the second pass this turns off.
+ */
+static bool cap_nodetail(void)
+{
+    if (!cap_nodetail_read) {
+        const char *s = getenv("QEMU_CAP_NODETAIL");
+
+        cap_nodetail_on = s && atoi(s) != 0;
+        cap_nodetail_read = true;
+    }
+    return cap_nodetail_on;
+}
+
+/*
+ * Deliberate corruption of what Capstone says, for testing that a consumer
+ * does not depend on it.
+ *
+ * The tracer's dependency model is meant to take its dataflow -- which
+ * registers are read, which are written, which memory operand is a load --
+ * from QEMU's own translation, and to take only the instruction's identity
+ * from Capstone.  That is a claim about the absence of a path, and the only
+ * honest way to test the absence of a path is to break the input and check
+ * that the output does not move.
+ *
+ * Both of the boundary's exits call it -- cap_disas_plugin_detail(), which is
+ * what a plugin running live under qemu-* goes through, and
+ * cap_disas_raw_detail(), which is what the offline tools and
+ * qemu_plugin_cap_decode() use.  Corrupting one and not the other would leave
+ * the live tracer untouched while the test reported a pass.  It is driven by
+ * QEMU_CAP_MUTATE and reads it once; with the variable unset the whole thing
+ * is one predictable branch and the boundary behaves exactly as before.
+ *
+ * The modes are the failure classes Capstone has actually produced here:
+ *
+ *   access    every operand's read/write bits inverted
+ *   drop      the last operand removed
+ *   addreg    a register operand appended that the instruction has not got
+ *   implicit  the implicit read and write lists exchanged
+ *   memdir    every memory operand's direction inverted
+ *   mnem      the mnemonic replaced -- the one thing a consumer IS allowed
+ *             to depend on, so this is the control that must move
+ *   all       every mode above except mnem
+ */
+static void cap_mutate_detail(struct qemu_plugin_insn_info *out)
+{
+    static int mode = -1;
+
+    if (mode < 0) {
+        const char *s = getenv("QEMU_CAP_MUTATE");
+
+        mode = 0;
+        if (s && *s) {
+            if (!strcmp(s, "access")) {
+                mode = 1;
+            } else if (!strcmp(s, "drop")) {
+                mode = 2;
+            } else if (!strcmp(s, "addreg")) {
+                mode = 3;
+            } else if (!strcmp(s, "implicit")) {
+                mode = 4;
+            } else if (!strcmp(s, "memdir")) {
+                mode = 5;
+            } else if (!strcmp(s, "mnem")) {
+                mode = 6;
+            } else if (!strcmp(s, "all")) {
+                mode = 7;
+            }
+        }
+    }
+    if (mode == 0) {
+        return;
+    }
+
+    if (mode == 1 || mode == 7) {
+        for (uint8_t i = 0; i < out->n_operands; i++) {
+            uint8_t a = out->operands[i].access;
+
+            out->operands[i].access =
+                (uint8_t)(((a & QEMU_PLUGIN_OP_ACC_READ)
+                           ? QEMU_PLUGIN_OP_ACC_WRITE : 0) |
+                          ((a & QEMU_PLUGIN_OP_ACC_WRITE)
+                           ? QEMU_PLUGIN_OP_ACC_READ : 0));
+        }
+    }
+    if ((mode == 5 || mode == 7)) {
+        for (uint8_t i = 0; i < out->n_operands; i++) {
+            if (out->operands[i].type != QEMU_PLUGIN_OP_MEM) {
+                continue;
+            }
+            out->operands[i].access ^= (QEMU_PLUGIN_OP_ACC_READ |
+                                        QEMU_PLUGIN_OP_ACC_WRITE);
+        }
+    }
+    if (mode == 4 || mode == 7) {
+        char nm[QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS]
+               [QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ];
+        uint16_t id[QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS];
+        uint8_t n = out->n_regs_read;
+
+        memcpy(nm, out->regs_read, sizeof(nm));
+        memcpy(id, out->regs_read_id, sizeof(id));
+        memcpy(out->regs_read, out->regs_write, sizeof(nm));
+        memcpy(out->regs_read_id, out->regs_write_id, sizeof(id));
+        memcpy(out->regs_write, nm, sizeof(nm));
+        memcpy(out->regs_write_id, id, sizeof(id));
+        out->n_regs_read = out->n_regs_write;
+        out->n_regs_write = n;
+    }
+    if ((mode == 3 || mode == 7) &&
+        out->n_operands < QEMU_PLUGIN_INSN_DETAIL_MAX_OPS) {
+        struct qemu_plugin_operand *op = &out->operands[out->n_operands++];
+
+        memset(op, 0, sizeof(*op));
+        op->type = QEMU_PLUGIN_OP_REG;
+        op->access = QEMU_PLUGIN_OP_ACC_READ | QEMU_PLUGIN_OP_ACC_WRITE;
+        op->size = 8;
+        /* A register id every ISA in the table has, so it always lands. */
+        /*
+         * A register id the ISA's table has a row for, so the operand lands
+         * somewhere rather than being dropped as unknown -- a mutation that
+         * is quietly discarded proves nothing.  x86 X86_REG_R15 = 113.
+         */
+        op->reg_id = 113;
+        g_strlcpy(op->reg_name, "r15", sizeof(op->reg_name));
+    }
+    if ((mode == 2 || mode == 7) && out->n_operands > 0) {
+        out->n_operands--;
+    }
+    if (mode == 6) {
+        /*
+         * Identity, which is the one thing a consumer is allowed to take from
+         * here.  Both halves of it move: the printed mnemonic and the numeric
+         * insn_id the opcode taxonomy is actually keyed on.
+         */
+        g_strlcpy(out->mnemonic, "mutant", QEMU_PLUGIN_INSN_DETAIL_MNEMSZ);
+        out->insn_id = 0;
+    }
+}
+
 bool cap_disas_plugin_detail(disassemble_info *info, uint64_t pc, size_t size,
                              struct qemu_plugin_insn_info *out)
 {
@@ -4044,6 +4262,8 @@ bool cap_disas_plugin_detail(disassemble_info *info, uint64_t pc, size_t size,
     const uint8_t *cbuf = cap_buf;
     csh handle;
     cs_insn *insn;
+    bool prof = cap_profiling();
+    int64_t t0 = prof ? cap_prof_now() : 0;
 
     memset(out, 0, sizeof(*out));
 
@@ -4051,7 +4271,8 @@ bool cap_disas_plugin_detail(disassemble_info *info, uint64_t pc, size_t size,
         return false;
     }
 
-    cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+    cs_option(handle, CS_OPT_DETAIL,
+              cap_nodetail() ? CS_OPT_OFF : CS_OPT_ON);
 
     /*
      * Allocate a fresh cs_insn AFTER enabling detail mode.
@@ -4089,6 +4310,7 @@ bool cap_disas_plugin_detail(disassemble_info *info, uint64_t pc, size_t size,
 
     if (insn->detail) {
         const cs_detail *detail = insn->detail;
+        int64_t t_op = prof ? cap_prof_now() : 0;
 
         /* Groups → bitmask */
         for (uint8_t i = 0; i < detail->groups_count; i++) {
@@ -4130,10 +4352,22 @@ bool cap_disas_plugin_detail(disassemble_info *info, uint64_t pc, size_t size,
                                       info->cap_arch);
             break;
         }
+        if (prof) {
+            cap_prof_ns_operands += cap_prof_now() - t_op;
+        }
     }
+
+    cap_mutate_detail(out);
 
     cs_free(insn, 1);
     cs_close(&handle);
+    if (prof) {
+        cap_prof_calls++;
+        cap_prof_ns_total += cap_prof_now() - t0;
+        if (cap_prof_calls % cap_prof_every == 0) {
+            cap_prof_dump();
+        }
+    }
     return true;
 }
 
@@ -4168,6 +4402,8 @@ bool cap_disas_raw_detail(int cap_arch, unsigned int cap_mode,
 
     csh handle;
     cs_insn *insn;
+    bool prof = cap_profiling();
+    int64_t t0 = prof ? cap_prof_now() : 0;
 
     memset(out, 0, sizeof(*out));
 
@@ -4187,7 +4423,8 @@ bool cap_disas_raw_detail(int cap_arch, unsigned int cap_mode,
         if (cap_arch == CS_ARCH_X86) {
             cs_option(handle, CS_OPT_SYNTAX, CS_OPT_SYNTAX_ATT);
         }
-        cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+        cs_option(handle, CS_OPT_DETAIL,
+                  cap_nodetail() ? CS_OPT_OFF : CS_OPT_ON);
         insn = cs_malloc(handle);
         if (!insn) {
             cs_close(&handle);
@@ -4222,6 +4459,7 @@ bool cap_disas_raw_detail(int cap_arch, unsigned int cap_mode,
 
     if (insn->detail) {
         const cs_detail *detail = insn->detail;
+        int64_t t_op = prof ? cap_prof_now() : 0;
 
         /* Groups → bitmask */
         for (uint8_t i = 0; i < detail->groups_count; i++) {
@@ -4260,8 +4498,20 @@ bool cap_disas_raw_detail(int cap_arch, unsigned int cap_mode,
             cap_fill_generic_operands(handle, insn, out, cap_arch);
             break;
         }
+        if (prof) {
+            cap_prof_ns_operands += cap_prof_now() - t_op;
+        }
     }
 
+    cap_mutate_detail(out);
+
+    if (prof) {
+        cap_prof_calls++;
+        cap_prof_ns_total += cap_prof_now() - t0;
+        if (cap_prof_calls % cap_prof_every == 0) {
+            cap_prof_dump();
+        }
+    }
     /* handle / insn stay cached in the thread-local slots for reuse */
     return true;
 }

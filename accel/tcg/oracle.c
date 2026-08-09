@@ -97,6 +97,7 @@
 #include "cpu.h"
 #include "tcg/tcg.h"
 #include "tcg/tcg-op-common.h"
+#include "tcg/tcg-internal.h"
 #include "tcg/helper-info.h"
 #include "exec/helper-head.h.inc"
 #include "exec/translation-block.h"
@@ -195,6 +196,9 @@ typedef struct OracleThread {
 } OracleThread;
 
 static __thread OracleThread *oracle_tls;
+
+/* CP5, below: take down a protection window a helper left armed. */
+static void oracle_hr_reset(void);
 
 /* ------------------------------------------------------------------ */
 /* Output                                                              */
@@ -696,6 +700,13 @@ static void oracle_flush(OracleThread *t, const uint8_t *env)
 void oracle_insn_boundary(void *envp, uint64_t pc);
 void oracle_insn_boundary(void *envp, uint64_t pc)
 {
+    /*
+     * A helper that leaves through cpu_loop_exit() never reaches its post
+     * probe, so the protection it armed is still up.  Execution only gets
+     * back here by faulting its way through, which is correct but ruinous,
+     * so the boundary is where it gets taken down.
+     */
+    oracle_hr_reset();
     OracleThread *t = oracle_thread();
     uint8_t *env = envp;
     bool want = pc >= oracle_pc_lo && pc <= oracle_pc_hi;
@@ -759,6 +770,229 @@ void oracle_tb_exit(void *envp)
     t->snapped = false;
 }
 
+/* ------------------------------------------------------------------ */
+/* CP5: inside the helper                                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A helper call is one TCG op, so the IR walk can say who was handed what and
+ * nothing about what was done with it.  The differ closes half of that: it can
+ * see what the helper changed.  It cannot see what the helper *read*, and a
+ * dependency model needs both.
+ *
+ * The declared flags are not an answer.  TCG_CALL_NO_READ_GLOBALS is a
+ * promise a helper makes to the register allocator, and most helpers make no
+ * promise at all -- helper_divq_EAX is declared flags=0x0, which says only
+ * that it may touch anything.  A superset that large is the thing this phase
+ * exists to stop relying on.
+ *
+ * So: go inside.  Not by interposing a frame -- Phase 1 established that a
+ * DEF_HELPER_FLAGS_N wrapper breaks GETPC(), and silently -- but by making
+ * the state itself untouchable for the duration of the call.  Before the
+ * helper runs, the pages CPUArchState lives in go PROT_NONE; each access the
+ * helper makes then traps, and the handler records the offset and the
+ * direction, unprotects, single-steps the one instruction, and protects
+ * again.  The helper's own frame is never disturbed, so GETPC() is exactly as
+ * valid as it was.
+ *
+ * What it costs is two signals per access, which is roughly four orders of
+ * magnitude.  That is why it is off unless asked for.
+ *
+ * What it cannot do:
+ *   - It sees the first byte of an access, not its width: after the unprotect
+ *     the whole access completes.  Naming the register is the layout map's
+ *     job and a byte is enough for that; the width is not recovered.
+ *   - CPUArchState does not begin on a page boundary, so the protected range
+ *     covers some of its neighbours in ArchCPU.  A fault outside env is
+ *     stepped like any other and recorded as nothing: it costs time, not
+ *     accuracy.
+ *   - Host x86-64 Linux only.  Reading the direction out of the fault and
+ *     setting the trap flag are both host ABI.
+ */
+
+#if defined(__x86_64__) && defined(__linux__)
+#define ORACLE_HELPER_READS 1
+#endif
+
+#ifdef ORACLE_HELPER_READS
+#include <ucontext.h>
+
+static bool oracle_hr_on;
+static uintptr_t oracle_hr_lo, oracle_hr_hi;    /* page-aligned protection */
+static uintptr_t oracle_hr_env;                 /* env base, for offsets */
+static struct sigaction oracle_hr_old_segv, oracle_hr_old_trap;
+static bool oracle_hr_installed;
+/* Per pc, what has already been reported; keeps a hot loop from flooding. */
+static GHashTable *oracle_hr_seen;
+
+static __thread bool oracle_hr_armed;
+static __thread bool oracle_hr_stepping;
+static __thread unsigned long *oracle_hr_rd;
+static __thread unsigned long *oracle_hr_wr;
+static __thread uint64_t oracle_hr_faults;
+
+static void oracle_hr_protect(int prot)
+{
+    mprotect((void *)oracle_hr_lo, oracle_hr_hi - oracle_hr_lo, prot);
+}
+
+static void oracle_hr_chain(struct sigaction *old, int sig, siginfo_t *si,
+                            void *uc)
+{
+    if (old->sa_flags & SA_SIGINFO) {
+        old->sa_sigaction(sig, si, uc);
+    } else if (old->sa_handler != SIG_IGN && old->sa_handler != SIG_DFL) {
+        old->sa_handler(sig);
+    } else {
+        signal(sig, SIG_DFL);
+        raise(sig);
+    }
+}
+
+static void oracle_hr_segv(int sig, siginfo_t *si, void *ucp)
+{
+    ucontext_t *uc = ucp;
+    uintptr_t a = (uintptr_t)si->si_addr;
+    bool write;
+
+    if (!oracle_hr_armed || a < oracle_hr_lo || a >= oracle_hr_hi) {
+        oracle_hr_chain(&oracle_hr_old_segv, sig, si, ucp);
+        return;
+    }
+    /* Bit 1 of the page-fault error code is set for a write. */
+    write = (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0;
+    oracle_hr_faults++;
+    if (a >= oracle_hr_env && a - oracle_hr_env < oracle_env_size) {
+        set_bit(a - oracle_hr_env, write ? oracle_hr_wr : oracle_hr_rd);
+    }
+    oracle_hr_protect(PROT_READ | PROT_WRITE);
+    oracle_hr_stepping = true;
+    uc->uc_mcontext.gregs[REG_EFL] |= 0x100;            /* TF */
+}
+
+static void oracle_hr_trap(int sig, siginfo_t *si, void *ucp)
+{
+    ucontext_t *uc = ucp;
+
+    if (!oracle_hr_stepping) {
+        oracle_hr_chain(&oracle_hr_old_trap, sig, si, ucp);
+        return;
+    }
+    uc->uc_mcontext.gregs[REG_EFL] &= ~0x100L;
+    oracle_hr_stepping = false;
+    if (oracle_hr_armed) {
+        oracle_hr_protect(PROT_NONE);
+    }
+}
+
+static void oracle_hr_init(void)
+{
+    struct sigaction sa;
+    size_t ps = qemu_real_host_page_size();
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_sigaction = oracle_hr_segv;
+    sigaction(SIGSEGV, &sa, &oracle_hr_old_segv);
+    sa.sa_sigaction = oracle_hr_trap;
+    sigaction(SIGTRAP, &sa, &oracle_hr_old_trap);
+
+    oracle_hr_lo = oracle_hr_env & ~(uintptr_t)(ps - 1);
+    oracle_hr_hi = (oracle_hr_env + oracle_env_size + ps - 1) &
+                   ~(uintptr_t)(ps - 1);
+    oracle_hr_seen = g_hash_table_new_full(g_int64_hash, g_int64_equal,
+                                           g_free, g_free);
+    oracle_hr_installed = true;
+    fprintf(oracle_out, "T helper_reads=1 env=0x%zx protect=[0x%zx,0x%zx)\n",
+            (size_t)oracle_hr_env, (size_t)oracle_hr_lo, (size_t)oracle_hr_hi);
+}
+
+/*
+ * Arm for one helper call, at the outermost depth only: a nested call would
+ * have to save and restore the protection, and the outer window already
+ * covers everything the inner one does.
+ */
+static void oracle_hr_arm(void *envp, int depth)
+{
+    if (!oracle_hr_on || depth != 0) {
+        return;
+    }
+    if (!oracle_hr_installed) {
+        oracle_hr_env = (uintptr_t)envp;
+        oracle_hr_init();
+    }
+    if ((uintptr_t)envp != oracle_hr_env) {
+        return;                     /* another vCPU: one window is enough */
+    }
+    if (oracle_hr_rd == NULL) {
+        oracle_hr_rd = bitmap_new(oracle_env_size);
+        oracle_hr_wr = bitmap_new(oracle_env_size);
+    }
+    bitmap_zero(oracle_hr_rd, oracle_env_size);
+    bitmap_zero(oracle_hr_wr, oracle_env_size);
+    oracle_hr_faults = 0;
+    oracle_hr_armed = true;
+    oracle_hr_protect(PROT_NONE);
+}
+
+static void oracle_hr_reset(void)
+{
+    if (oracle_hr_armed) {
+        oracle_hr_armed = false;
+        oracle_hr_stepping = false;
+        oracle_hr_protect(PROT_READ | PROT_WRITE);
+    }
+}
+
+/*
+ * Report the bytes this helper touched that no earlier execution of the same
+ * pc reported already.  A data-dependent helper touches different fields on
+ * different executions, so the union grows; one that does the same thing
+ * every time reports once.
+ */
+static void oracle_hr_disarm(uint64_t pc, const TCGHelperInfo *info, int depth)
+{
+    unsigned long *seen;
+    uint64_t key = pc;
+
+    if (!oracle_hr_armed || depth != 0) {
+        return;
+    }
+    oracle_hr_armed = false;
+    oracle_hr_stepping = false;
+    oracle_hr_protect(PROT_READ | PROT_WRITE);
+
+    qemu_mutex_lock(&oracle_lock);
+    seen = g_hash_table_lookup(oracle_hr_seen, &key);
+    if (seen == NULL) {
+        seen = bitmap_new(2 * oracle_env_size);
+        g_hash_table_insert(oracle_hr_seen, g_memdup2(&key, 8), seen);
+    }
+    for (int w = 0; w < 2; w++) {
+        const unsigned long *bm = w ? oracle_hr_wr : oracle_hr_rd;
+
+        for (size_t i = 0; i < oracle_env_size; i++) {
+            if (!test_bit(i, bm) || test_bit(w * oracle_env_size + i, seen)) {
+                continue;
+            }
+            set_bit(w * oracle_env_size + i, seen);
+            if (!oracle_budget()) {
+                break;
+            }
+            fprintf(oracle_out, "Y 0x%" PRIx64 " %c off=%zu size=1 helper=%s "
+                    "faults=%" PRIu64 "\n", pc, w ? 'w' : 'r', i,
+                    info && info->name ? info->name : "?", oracle_hr_faults);
+        }
+    }
+    qemu_mutex_unlock(&oracle_lock);
+}
+#else
+static void oracle_hr_arm(void *envp, int depth) { }
+static void oracle_hr_disarm(uint64_t pc, const TCGHelperInfo *i, int d) { }
+static void oracle_hr_reset(void) { }
+#endif /* ORACLE_HELPER_READS */
+
 void oracle_helper_pre(void *envp, void *infop);
 void oracle_helper_pre(void *envp, void *infop)
 {
@@ -774,6 +1008,8 @@ void oracle_helper_pre(void *envp, void *infop)
     }
     t->hinfo[t->hdepth] = infop;
     memcpy(t->hsnap[t->hdepth], envp, oracle_env_size);
+    /* After the snapshot: taking it is not one of the helper's accesses. */
+    oracle_hr_arm(envp, t->hdepth);
     t->hdepth++;
 }
 
@@ -787,6 +1023,8 @@ void oracle_helper_post(void *envp, void *infop, int64_t retoff)
         return;
     }
     d = --t->hdepth;
+    /* Before anything else reads env, and before the early returns. */
+    oracle_hr_disarm(t->cur_pc, infop, d);
     if (d >= ORACLE_HELPER_DEPTH || t->hinfo[d] == NULL) {
         return;
     }
@@ -874,6 +1112,9 @@ static __thread bool oracle_in_gen;
 static __thread bool oracle_gen_prev_in_window;
 /* Translation-scoped: is the instruction being translated now in the window? */
 static __thread bool oracle_gen_insn_in_window;
+
+/* CP4, below: the IR walk needs the pc of every instruction of an armed TB. */
+static void oracle_ir_note_insn(uint64_t pc, bool first_insn, bool in_window);
 
 /* Is the TB currently being translated one the oracle asked to be armed? */
 static bool oracle_gen_armed(void)
@@ -1010,6 +1251,12 @@ void oracle_gen_insn_boundary(uint64_t pc, bool first_insn)
 
     in = pc >= oracle_pc_lo && pc <= oracle_pc_hi;
     oracle_gen_insn_in_window = in;
+    /*
+     * The IR walk needs a pc for every instruction of an armed TB, not just
+     * the ones that carry a runtime probe, because it matches them
+     * positionally against the insn_start ops in the stream.
+     */
+    oracle_ir_note_insn(pc, first_insn, in);
     if (!in && !first_insn && !oracle_gen_prev_in_window) {
         oracle_gen_prev_in_window = false;
         return;
@@ -1025,6 +1272,671 @@ void oracle_gen_insn_boundary(uint64_t pc, bool first_insn)
                       tcgv_i64_temp(tcg_constant_i64(pc)));
     }
     oracle_in_gen = false;
+}
+
+/* ------------------------------------------------------------------ */
+/* CP4: read and write sets from the IR, before it has been optimised  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The differ answers "what changed".  It cannot answer "what was read", and
+ * it cannot see a write whose value was already there.  Both of those are
+ * answered exactly one level up, in the IR the target's translator emitted:
+ * every TCG op declares how many of its arguments are outputs and how many
+ * are inputs, and a temp that is TEMP_GLOBAL based on tcg_env is a guest
+ * register at a known offset.  So the read and write sets are readable
+ * straight off the machine's own translation of the instruction.
+ *
+ * Three properties this has and the differ does not:
+ *
+ *   - Reads.  An input argument is a read whether or not it changes anything.
+ *
+ *   - Inert writes.  tcg_gen_movcond_* names its destination as a plain
+ *     output, so a conditional write is in the IR whether or not the
+ *     condition made it a no-op.  A consumer modelling speculative register
+ *     release needs to know the write happened; a differ structurally cannot
+ *     tell it.
+ *
+ *   - Value independence.  Nothing here looks at a value, so an instruction
+ *     that writes what was already there is indistinguishable from one that
+ *     did not -- which is the correct answer, and the one poisoning had to
+ *     be invented to approximate.
+ *
+ * Why before tcg_optimize()
+ * -------------------------
+ * Dead-store elimination removes architecturally real writes that nothing
+ * downstream consumes.  x86 is the extreme case: the whole lazy-flags scheme
+ * exists so that flag writes can be dropped when the next instruction does
+ * not look at them.  The translator's raw output is the truth, so the walk
+ * runs at the top of tcg_gen_code(), before any pass has touched the ops.
+ *
+ * What the walk cannot see
+ * ------------------------
+ * A helper call is one op.  Its argument list is what crosses the boundary,
+ * not what the helper does inside, so a call is reported as a call, with the
+ * env regions its pointer arguments name (see below) -- the interior is the
+ * runtime probes' job.
+ *
+ * Env accessed by pointer rather than by global is recoverable: gvec goes
+ * through tcg_gen_addi_ptr(tmp, tcg_env, offset_of_a_vector_register), so a
+ * temp whose value is tcg_env plus a constant carries a register number.  The
+ * walk tracks those temps and reports the offset a call was handed, which the
+ * layout map turns back into the field it names.
+ */
+
+#define ORACLE_IR_MAX_INSNS 1024
+
+typedef struct OracleIRInsn {
+    uint64_t pc;
+    bool in_window;
+} OracleIRInsn;
+
+/*
+ * Translation-scoped.  translator_loop() is not re-entrant on a thread, so
+ * one buffer per thread is enough and none of it needs the lock.
+ */
+static __thread OracleIRInsn oracle_ir_insns[ORACLE_IR_MAX_INSNS];
+static __thread unsigned oracle_ir_ninsns;
+static __thread int64_t oracle_ir_envoff[TCG_MAX_TEMPS];
+
+/*
+ * Where each temp's value came from.
+ *
+ * A bit per TCG global, propagated forward through the ops: a temp carries
+ * the set of guest registers its value was computed from.  Reporting that set
+ * alongside a write is what makes the difference between a redefinition and
+ * an update, and on x86 it is what separates a flag write from a change of
+ * flag representation.  gen_compute_eflags() stores into cc_src a value it
+ * computed *from* cc_op/cc_src/cc_dst, so a conditional branch looks exactly
+ * like a flag write unless the provenance is there to say the value came from
+ * the flags themselves and nowhere else.
+ */
+#define ORACLE_IR_PROV_WORDS 4                  /* up to 256 globals */
+static __thread uint64_t oracle_ir_prov[TCG_MAX_TEMPS][ORACLE_IR_PROV_WORDS];
+
+static bool oracle_do_ir = true;
+/* pc -> hash of the set last reported for it; see the divergence check. */
+static GHashTable *oracle_ir_seen;
+static uint64_t oracle_ir_ninsn_reported;
+static uint64_t oracle_ir_ndiverged;
+static uint64_t oracle_ir_nchurned;
+
+#define ORACLE_IR_NOT_ENV INT64_MIN
+
+/* Record the pc of each instruction of an armed TB, in translation order. */
+static void oracle_ir_note_insn(uint64_t pc, bool first_insn, bool in_window)
+{
+    if (first_insn) {
+        oracle_ir_ninsns = 0;
+    }
+    if (oracle_ir_ninsns < ORACLE_IR_MAX_INSNS) {
+        oracle_ir_insns[oracle_ir_ninsns].pc = pc;
+        oracle_ir_insns[oracle_ir_ninsns].in_window = in_window;
+    }
+    oracle_ir_ninsns++;
+}
+
+/*
+ * Name an env byte range.  An exact hit on a global is the common case; a
+ * range inside one is a sub-register access.  Anything else is unnamed here
+ * and left as an offset for the layout map to resolve, which is the same
+ * contract the differ's raw runs have.
+ */
+static const char *oracle_ir_name_off(int64_t off, uint32_t size,
+                                      int64_t *base)
+{
+    for (unsigned i = 0; i < oracle_nglobals; i++) {
+        const OracleGlobal *g = &oracle_globals[i];
+
+        if (g->off == off && g->size == size) {
+            *base = g->off;
+            return g->name;
+        }
+    }
+    for (unsigned i = 0; i < oracle_nglobals; i++) {
+        const OracleGlobal *g = &oracle_globals[i];
+
+        if (off >= g->off && off + (int64_t)size <= g->off + (int64_t)g->size) {
+            *base = g->off;
+            return g->name;
+        }
+    }
+    return NULL;
+}
+
+/* Index of the global covering @off, or -1.  The provenance bit number. */
+static int oracle_ir_gidx(int64_t off)
+{
+    for (unsigned i = 0; i < oracle_nglobals; i++) {
+        const OracleGlobal *g = &oracle_globals[i];
+
+        if (off >= g->off && off < g->off + (int64_t)g->size) {
+            return i < ORACLE_IR_PROV_WORDS * 64 ? (int)i : -1;
+        }
+    }
+    return -1;
+}
+
+static void oracle_ir_prov_or(uint64_t *dst, const uint64_t *src)
+{
+    for (int i = 0; i < ORACLE_IR_PROV_WORDS; i++) {
+        dst[i] |= src[i];
+    }
+}
+
+static void oracle_ir_prov_set(uint64_t *p, int bit)
+{
+    if (bit >= 0) {
+        p[bit / 64] |= 1ULL << (bit % 64);
+    }
+}
+
+/* Render a provenance set as the register names it names. */
+static void oracle_ir_prov_str(GString *out, const uint64_t *p)
+{
+    unsigned n = 0;
+
+    for (unsigned i = 0; i < oracle_nglobals &&
+         i < ORACLE_IR_PROV_WORDS * 64; i++) {
+        if (!(p[i / 64] & (1ULL << (i % 64)))) {
+            continue;
+        }
+        if (n == 8) {
+            g_string_append(out, ",+");
+            break;
+        }
+        g_string_append_printf(out, "%s%s", n ? "," : "",
+                               oracle_globals[i].name);
+        n++;
+    }
+    if (n == 0) {
+        g_string_append_c(out, '-');
+    }
+}
+
+/* Is @ts a guest register: a TCG global living at a fixed offset in env? */
+static bool oracle_ir_global(const TCGTemp *ts, int64_t *off, uint32_t *size)
+{
+    if (ts->kind != TEMP_GLOBAL) {
+        return false;
+    }
+    if (ts->mem_base != tcgv_ptr_temp(tcg_env)) {
+        return false;
+    }
+    if (ts->mem_offset < 0 ||
+        (size_t)ts->mem_offset + tcg_type_size(ts->base_type) >
+        oracle_env_size) {
+        return false;
+    }
+    *off = ts->mem_offset;
+    *size = tcg_type_size(ts->base_type);
+    return true;
+}
+
+/*
+ * Direct env access: is @c a load or a store, and of how many bytes?  These
+ * are how a target reaches the state it did not register as a global -- x86's
+ * vector file and x87 stack, ARM's V registers, every FP status word.
+ */
+static bool oracle_ir_ldst(const TCGOp *op, bool *store, uint32_t *size)
+{
+    switch (op->opc) {
+    case INDEX_op_ld8u_i32: case INDEX_op_ld8s_i32:
+    case INDEX_op_ld8u_i64: case INDEX_op_ld8s_i64:
+        *store = false; *size = 1; return true;
+    case INDEX_op_ld16u_i32: case INDEX_op_ld16s_i32:
+    case INDEX_op_ld16u_i64: case INDEX_op_ld16s_i64:
+        *store = false; *size = 2; return true;
+    case INDEX_op_ld_i32:
+    case INDEX_op_ld32u_i64: case INDEX_op_ld32s_i64:
+        *store = false; *size = 4; return true;
+    case INDEX_op_ld_i64:
+        *store = false; *size = 8; return true;
+    case INDEX_op_ld_vec:
+        *store = false; *size = tcg_type_size(TCGOP_TYPE(op)); return true;
+    case INDEX_op_st8_i32: case INDEX_op_st8_i64:
+        *store = true; *size = 1; return true;
+    case INDEX_op_st16_i32: case INDEX_op_st16_i64:
+        *store = true; *size = 2; return true;
+    case INDEX_op_st_i32: case INDEX_op_st32_i64:
+        *store = true; *size = 4; return true;
+    case INDEX_op_st_i64:
+        *store = true; *size = 8; return true;
+    case INDEX_op_st_vec:
+        *store = true; *size = tcg_type_size(TCGOP_TYPE(op)); return true;
+    default:
+        return false;
+    }
+}
+
+/*
+ * A call the walk cannot see inside is still worth a line: the helper's name,
+ * the flags TCG believes about it, and how many arguments crossed.
+ */
+static bool oracle_ir_own_probe(const TCGHelperInfo *info)
+{
+    return info == &oracle_info_boundary || info == &oracle_info_boundary_rw ||
+           info == &oracle_info_pre || info == &oracle_info_post;
+}
+
+/*
+ * Report one access.  @buf gets the full record; @set gets a reduced form
+ * naming only the direction and the bytes, which is what the retranslation
+ * check compares -- an op that moved without the access moving is not a
+ * change in the instruction's set.  A killed value is not an access and is
+ * deliberately absent from @set.
+ */
+static void oracle_ir_arg(GString *buf, GString *set, uint64_t pc, char rw,
+                          TCGTemp *ts, const char *opname, unsigned argno,
+                          const uint64_t *prov)
+{
+    int64_t off, base;
+    uint32_t size;
+    const char *name;
+
+    if (!oracle_ir_global(ts, &off, &size)) {
+        return;
+    }
+    name = oracle_ir_name_off(off, size, &base);
+    g_string_append_printf(buf, "D 0x%" PRIx64 " %c reg=%s off=%" PRId64
+                           " size=%u via=arg op=%s argno=%u",
+                           pc, rw, name ? name : "?", off, size, opname, argno);
+    if (rw == 'w' && prov != NULL) {
+        g_string_append(buf, " from=");
+        oracle_ir_prov_str(buf, prov);
+    }
+    g_string_append_c(buf, '\n');
+    if (rw != 'k') {
+        g_string_append_printf(set, "%c%" PRId64 ".%u;", rw, off, size);
+    }
+}
+
+/*
+ * Commit one instruction's derived set.
+ *
+ * One pc has one instruction, so it has one read/write set, and the second
+ * translation of a pc must produce the same one.  That is not free: the x86
+ * translator elides a store to cc_op when the preceding instruction already
+ * left it right, so the raw op stream for one pc genuinely depends on its
+ * neighbour.  Reporting a pc once and checking every later translation
+ * against it is what turns that from an unnoticed inconsistency into a
+ * measurement -- and, once the lazy-flag fields are mapped onto the
+ * architectural register they stand for, into a demonstration that the
+ * mapped set does not depend on context even though the ops do.
+ */
+static void oracle_ir_commit(uint64_t pc, GString *buf, guint hset)
+{
+    /*
+     * Two hashes, because there are two questions.  hraw covers everything
+     * reported, including the ops that named each access and the ones that
+     * killed a value; hset covers only the reads and writes.  A pc whose raw
+     * stream moves but whose set does not is the expected case on x86 and
+     * exactly what the lazy-flag mapping is there to absorb; a pc whose set
+     * moves is a problem, and the two must not be reported as one thing.
+     */
+    guint hraw = g_str_hash(buf->str);
+    uint64_t key = pc;
+    gpointer old;
+
+    qemu_mutex_lock(&oracle_lock);
+    if (oracle_ir_seen == NULL) {
+        oracle_ir_seen = g_hash_table_new_full(g_int64_hash, g_int64_equal,
+                                               g_free, NULL);
+    }
+    if (g_hash_table_lookup_extended(oracle_ir_seen, &key, NULL, &old)) {
+        guint prev_raw = GPOINTER_TO_UINT(old) >> 16;
+        guint prev_set = GPOINTER_TO_UINT(old) & 0xffff;
+
+        if (prev_raw != (hraw & 0xffff) || prev_set != (hset & 0xffff)) {
+            bool set_changed = prev_set != (hset & 0xffff);
+
+            oracle_ir_nchurned++;
+            if (set_changed) {
+                oracle_ir_ndiverged++;
+            }
+            g_hash_table_insert(oracle_ir_seen, g_memdup2(&key, 8),
+                                GUINT_TO_POINTER(((hraw & 0xffff) << 16) |
+                                                 (hset & 0xffff)));
+            if (oracle_budget()) {
+                fprintf(oracle_out, "Z 0x%" PRIx64 " ir-retranslated "
+                        "set_changed=%d oldraw=0x%x newraw=0x%x oldset=0x%x "
+                        "newset=0x%x\n", pc, set_changed, prev_raw,
+                        hraw & 0xffff, prev_set, hset & 0xffff);
+                fputs(buf->str, oracle_out);
+            }
+        }
+    } else {
+        g_hash_table_insert(oracle_ir_seen, g_memdup2(&key, 8),
+                            GUINT_TO_POINTER(((hraw & 0xffff) << 16) |
+                                             (hset & 0xffff)));
+        oracle_ir_ninsn_reported++;
+        if (oracle_budget()) {
+            fputs(buf->str, oracle_out);
+        }
+    }
+    qemu_mutex_unlock(&oracle_lock);
+}
+
+/*
+ * Walk one instruction's ops.  @first is the op after its insn_start, @end is
+ * the op that terminates it (the next insn_start, or NULL at the end of the
+ * TB).
+ */
+static void oracle_ir_insn(GString *buf, GString *set, uint64_t pc,
+                           TCGOp *first, TCGOp *end)
+{
+    unsigned nops = 0, ncalls = 0, nopaque = 0;
+    uint64_t prov[ORACLE_IR_PROV_WORDS];
+
+    g_string_truncate(buf, 0);
+    g_string_truncate(set, 0);
+
+    for (TCGOp *op = first; op != end; op = QTAILQ_NEXT(op, link)) {
+        const TCGOpDef *def = &tcg_op_defs[op->opc];
+        const char *opname = def->name;
+        unsigned nb_oargs, nb_iargs;
+        bool store;
+        uint32_t size;
+
+        if (op->opc == INDEX_op_call) {
+            const TCGHelperInfo *info = tcg_call_info(op);
+
+            if (oracle_ir_own_probe(info)) {
+                continue;
+            }
+            nb_oargs = TCGOP_CALLO(op);
+            nb_iargs = TCGOP_CALLI(op);
+            nops++;
+            ncalls++;
+
+            /*
+             * A helper's outputs derive from everything handed to it, and
+             * from whatever it read out of env on its own.  The union of the
+             * arguments is the most that can be said from here; the interior
+             * probes are what narrow it.
+             */
+            memset(prov, 0, sizeof(prov));
+            for (unsigned i = 0; i < nb_iargs; i++) {
+                TCGTemp *its = arg_temp(op->args[nb_oargs + i]);
+                int64_t ioff;
+                uint32_t isz;
+
+                oracle_ir_prov_or(prov,
+                                  oracle_ir_prov[its - tcg_ctx->temps]);
+                if (oracle_ir_global(its, &ioff, &isz)) {
+                    oracle_ir_prov_set(prov, oracle_ir_gidx(ioff));
+                }
+            }
+            for (unsigned i = 0; i < nb_oargs; i++) {
+                TCGTemp *ots = arg_temp(op->args[i]);
+
+                oracle_ir_arg(buf, set, pc, 'w', ots, "call", i, prov);
+                oracle_ir_prov_or(oracle_ir_prov[ots - tcg_ctx->temps], prov);
+            }
+            for (unsigned i = 0; i < nb_iargs; i++) {
+                TCGArg a = op->args[nb_oargs + i];
+                TCGTemp *ts = arg_temp(a);
+                int64_t eo;
+
+                oracle_ir_arg(buf, set, pc, 'r', ts, "call", i, NULL);
+                /*
+                 * A pointer into env: the argument does not say whether the
+                 * helper reads or writes through it, so it is reported as a
+                 * reference and left for the interior probes to split.  This
+                 * is how a vector register reaches a gvec helper.
+                 *
+                 * tcg_env itself does not count.  It is the first argument of
+                 * nearly every helper there is, and reporting it as a
+                 * reference to whatever register happens to sit at offset
+                 * zero would put a register on almost every helper call --
+                 * a number that would look plausible and mean nothing.
+                 */
+                eo = ts == tcgv_ptr_temp(tcg_env)
+                     ? ORACLE_IR_NOT_ENV
+                     : oracle_ir_envoff[ts - tcg_ctx->temps];
+                if (eo != ORACLE_IR_NOT_ENV && eo >= 0 &&
+                    (uint64_t)eo < oracle_env_size) {
+                    int64_t base;
+                    const char *name = oracle_ir_name_off(eo, 1, &base);
+
+                    g_string_append_printf(buf,
+                            "D 0x%" PRIx64 " p reg=%s off=%" PRId64
+                            " size=0 via=envptr op=call helper=%s argno=%u\n",
+                            pc, name ? name : "?", eo,
+                            info->name ? info->name : "?", i);
+                    g_string_append_printf(set, "p%" PRId64 ";", eo);
+                }
+            }
+            g_string_append_printf(buf,
+                    "C 0x%" PRIx64 " helper=%s flags=0x%x callo=%u calli=%u\n",
+                    pc, info->name ? info->name : "?", info->flags,
+                    nb_oargs, nb_iargs);
+            g_string_append_printf(set, "h%s;", info->name ? info->name : "?");
+            nopaque++;
+            continue;
+        }
+
+        if (op->opc == INDEX_op_insn_start) {
+            continue;
+        }
+
+        nb_oargs = def->nb_oargs;
+        nb_iargs = def->nb_iargs;
+        nops++;
+
+        /* Direct env access by base + constant offset. */
+        if (oracle_ir_ldst(op, &store, &size)) {
+            TCGTemp *bts = arg_temp(op->args[1]);
+            int64_t bo = oracle_ir_envoff[bts - tcg_ctx->temps];
+            int64_t off = (int64_t)op->args[2];
+
+            if (bo != ORACLE_IR_NOT_ENV) {
+                int64_t eo = bo + off;
+
+                if (eo >= 0 && (uint64_t)eo + size <= oracle_env_size) {
+                    int64_t base;
+                    const char *name = oracle_ir_name_off(eo, size, &base);
+
+                    g_string_append_printf(buf,
+                            "D 0x%" PRIx64 " %c reg=%s off=%" PRId64
+                            " size=%u via=%s op=%s argno=0",
+                            pc, store ? 'w' : 'r', name ? name : "?", eo,
+                            size, store ? "st" : "ld", opname);
+                    if (store) {
+                        TCGTemp *vts = arg_temp(op->args[0]);
+
+                        g_string_append(buf, " from=");
+                        oracle_ir_prov_str(buf,
+                                oracle_ir_prov[vts - tcg_ctx->temps]);
+                    } else {
+                        TCGTemp *dts = arg_temp(op->args[0]);
+
+                        memset(oracle_ir_prov[dts - tcg_ctx->temps], 0,
+                               sizeof(prov));
+                        oracle_ir_prov_set(
+                                oracle_ir_prov[dts - tcg_ctx->temps],
+                                oracle_ir_gidx(eo));
+                    }
+                    g_string_append_c(buf, '\n');
+                    g_string_append_printf(set, "%c%" PRId64 ".%u;",
+                                           store ? 'w' : 'r', eo, size);
+                }
+            }
+            /* The value moved and the base pointer are still plain args. */
+        }
+
+        /* Guest memory, for completeness: the tracer models this already. */
+        if (op->opc == INDEX_op_qemu_ld_i32 || op->opc == INDEX_op_qemu_ld_i64 ||
+            op->opc == INDEX_op_qemu_ld_i128) {
+            g_string_append_printf(buf, "D 0x%" PRIx64 " r mem op=%s\n",
+                                   pc, opname);
+            g_string_append(set, "mr;");
+        } else if (op->opc == INDEX_op_qemu_st_i32 ||
+                   op->opc == INDEX_op_qemu_st_i64 ||
+                   op->opc == INDEX_op_qemu_st8_i32 ||
+                   op->opc == INDEX_op_qemu_st_i128) {
+            g_string_append_printf(buf, "D 0x%" PRIx64 " w mem op=%s\n",
+                                   pc, opname);
+            g_string_append(set, "mw;");
+        }
+
+        /*
+         * discard names its argument as an output but is not a write: it is
+         * TCG being told the temp's value is dead, which on x86 is how the
+         * flag fields an instruction does not define are retired.  Counting
+         * it as a write would put cc_src2 in the write set of every add.  It
+         * is still worth a line of its own -- a value that has been killed is
+         * a fact a consumer can use -- so it is reported as 'k'.
+         */
+        if (op->opc == INDEX_op_discard) {
+            TCGTemp *dts = arg_temp(op->args[0]);
+
+            oracle_ir_arg(buf, set, pc, 'k', dts, opname, 0, NULL);
+            oracle_ir_envoff[dts - tcg_ctx->temps] = ORACLE_IR_NOT_ENV;
+            continue;
+        }
+
+        memset(prov, 0, sizeof(prov));
+        for (unsigned i = 0; i < nb_iargs; i++) {
+            TCGTemp *its = arg_temp(op->args[nb_oargs + i]);
+            int64_t ioff;
+            uint32_t isz;
+
+            oracle_ir_prov_or(prov, oracle_ir_prov[its - tcg_ctx->temps]);
+            if (oracle_ir_global(its, &ioff, &isz)) {
+                oracle_ir_prov_set(prov, oracle_ir_gidx(ioff));
+            }
+        }
+        for (unsigned i = 0; i < nb_oargs; i++) {
+            TCGTemp *ots = arg_temp(op->args[i]);
+
+            oracle_ir_arg(buf, set, pc, 'w', ots, opname, i, prov);
+            memcpy(oracle_ir_prov[ots - tcg_ctx->temps], prov, sizeof(prov));
+        }
+        for (unsigned i = 0; i < nb_iargs; i++) {
+            oracle_ir_arg(buf, set, pc, 'r', arg_temp(op->args[nb_oargs + i]),
+                          opname, i, NULL);
+        }
+
+        /*
+         * Track temps whose value is tcg_env plus a constant.  Only mov and
+         * add-of-a-constant can produce one; anything else that writes a
+         * tracked temp stops tracking it, so the map never outlives the fact.
+         */
+        if (nb_oargs == 1) {
+            TCGTemp *dts = arg_temp(op->args[0]);
+            size_t di = dts - tcg_ctx->temps;
+            int64_t v = ORACLE_IR_NOT_ENV;
+
+            if (op->opc == INDEX_op_mov_i64 || op->opc == INDEX_op_mov_i32) {
+                v = oracle_ir_envoff[arg_temp(op->args[1]) - tcg_ctx->temps];
+            } else if (op->opc == INDEX_op_add_i64 ||
+                       op->opc == INDEX_op_add_i32) {
+                TCGTemp *a = arg_temp(op->args[1]);
+                TCGTemp *b = arg_temp(op->args[2]);
+                int64_t ao = oracle_ir_envoff[a - tcg_ctx->temps];
+                int64_t bo = oracle_ir_envoff[b - tcg_ctx->temps];
+
+                if (ao != ORACLE_IR_NOT_ENV && b->kind == TEMP_CONST) {
+                    v = ao + b->val;
+                } else if (bo != ORACLE_IR_NOT_ENV && a->kind == TEMP_CONST) {
+                    v = bo + a->val;
+                }
+            }
+            if (di < TCG_MAX_TEMPS) {
+                oracle_ir_envoff[di] = v;
+            }
+        }
+    }
+
+    g_string_append_printf(buf, "A 0x%" PRIx64 " ops=%u calls=%u opaque=%u\n",
+                           pc, nops, ncalls, nopaque);
+    oracle_ir_commit(pc, buf, g_str_hash(set->str));
+}
+
+/*
+ * Walk the whole TB.  Called at the top of tcg_gen_code(), so the ops are
+ * exactly what the target's translator emitted.
+ */
+void oracle_ir_translate(const void *tbp)
+{
+    const TranslationBlock *tb = tbp;
+    TCGContext *s = tcg_ctx;
+    TCGOp *op, *insn_first = NULL;
+    unsigned idx = 0, nstart = 0, resync = 0, unmatched = 0;
+    uint64_t pc = 0;
+    bool want = false;
+    GString *buf, *set;
+
+    if (!oracle_on || !oracle_do_ir || tb == NULL ||
+        !(tb->cflags & CF_ORACLE)) {
+        return;
+    }
+
+    for (size_t i = 0; i < TCG_MAX_TEMPS; i++) {
+        oracle_ir_envoff[i] = ORACLE_IR_NOT_ENV;
+    }
+    memset(oracle_ir_prov, 0, sizeof(oracle_ir_prov));
+    oracle_ir_envoff[tcgv_ptr_temp(tcg_env) - s->temps] = 0;
+
+    buf = g_string_new(NULL);
+    set = g_string_new(NULL);
+
+    QTAILQ_FOREACH(op, &s->ops, link) {
+        uint64_t opc_pc;
+
+        if (op->opc != INDEX_op_insn_start) {
+            continue;
+        }
+        if (want && insn_first != NULL) {
+            oracle_ir_insn(buf, set, pc, insn_first, op);
+        }
+        want = false;
+
+        /*
+         * Match this insn_start to the pc the boundary hook recorded for it.
+         *
+         * Position alone is not enough to go on.  x86 rolls an instruction
+         * back when decoding it runs off the end of a page --
+         * i386_tr_translate_insn()'s tcg_remove_ops_after(prev_insn_end) --
+         * which deletes the instruction's ops *including its insn_start*, so
+         * the op stream can hold fewer instructions than the hook saw.  The
+         * insn_start op carries the pc itself, so the two can be checked
+         * against each other rather than assumed to line up, and a stream
+         * that has lost an instruction is resynchronised instead of
+         * silently shifting every attribution after it.
+         */
+        opc_pc = tcg_get_insn_start_param(op, 0);
+        while (idx < oracle_ir_ninsns && idx < ORACLE_IR_MAX_INSNS &&
+               oracle_ir_insns[idx].pc != opc_pc) {
+            idx++;
+            resync++;
+        }
+        if (idx < oracle_ir_ninsns && idx < ORACLE_IR_MAX_INSNS) {
+            pc = oracle_ir_insns[idx].pc;
+            want = oracle_ir_insns[idx].in_window;
+            idx++;
+        } else {
+            unmatched++;
+        }
+        nstart++;
+        insn_first = QTAILQ_NEXT(op, link);
+    }
+    if (want && insn_first != NULL) {
+        oracle_ir_insn(buf, set, pc, insn_first, NULL);
+    }
+
+    if (unmatched || resync) {
+        qemu_mutex_lock(&oracle_lock);
+        if (oracle_budget()) {
+            fprintf(oracle_out, "V 0x%" PRIx64 " ir insn_start=%u "
+                    "boundaries=%u resync=%u unmatched=%u\n",
+                    tb->pc, nstart, oracle_ir_ninsns, resync, unmatched);
+        }
+        qemu_mutex_unlock(&oracle_lock);
+    }
+    g_string_free(buf, TRUE);
+    g_string_free(set, TRUE);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1132,7 +2044,10 @@ static void oracle_parse_poison(const char *spec)
 static void oracle_close(void)
 {
     if (oracle_out) {
-        fprintf(oracle_out, "E lines=%" PRIu64 "%s\n", oracle_lines,
+        fprintf(oracle_out, "E lines=%" PRIu64 " ir_pcs=%" PRIu64
+                " ir_diverged=%" PRIu64 " ir_churn=%" PRIu64 "%s\n", oracle_lines,
+                oracle_ir_ninsn_reported, oracle_ir_ndiverged,
+                oracle_ir_nchurned,
                 oracle_lines >= oracle_max_lines ? " truncated=1" : "");
         fflush(oracle_out);
     }
@@ -1197,6 +2112,16 @@ void oracle_init(size_t env_size, const char *target_name)
     if (s) {
         oracle_do_insn_marks = atoi(s) != 0;
     }
+    s = getenv("QEMU_ORACLE_IR");
+    if (s) {
+        oracle_do_ir = atoi(s) != 0;
+    }
+#ifdef ORACLE_HELPER_READS
+    s = getenv("QEMU_ORACLE_HELPER_READS");
+    if (s) {
+        oracle_hr_on = atoi(s) != 0;
+    }
+#endif
 
     /* A TB spans at most two guest pages, so two pages is an exact bound. */
     oracle_tb_slack = 2 * qemu_target_page_size();

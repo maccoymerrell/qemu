@@ -6370,6 +6370,16 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     /* Do not reuse any EBB that may be allocated within the TB. */
     tcg_temp_ebb_reset_freed(s);
 
+#ifdef CONFIG_ORACLE
+    /*
+     * Read the instruction's register accesses off the raw op stream.  It has
+     * to happen before tcg_optimize(), which is entitled to delete a write
+     * nothing downstream consumes -- and on x86 the whole lazy-flags scheme
+     * exists so that it can.
+     */
+    oracle_ir_translate(tb);
+#endif
+
     tcg_optimize(s);
 
     reachable_code_pass(s);

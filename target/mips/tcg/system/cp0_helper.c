@@ -1243,6 +1243,8 @@ void helper_mtc0_entryhi(CPUMIPSState *env, target_ulong arg1)
                     (unsigned long)(val & env->CP0_EntryHi_ASID_mask),
                     (unsigned long)env->CP0_Context);
         }
+        cst_wit_asidw(env, old & env->CP0_EntryHi_ASID_mask,
+                      val & env->CP0_EntryHi_ASID_mask);
     }
 }
 
@@ -1290,6 +1292,7 @@ static void mips_pwbase_write(CPUMIPSState *env, target_ulong val)
                 env_cpu(env)->cpu_index,
                 (unsigned long)old, (unsigned long)val);
     }
+    cst_wit_pwbw(env, old, val);
 }
 
 void helper_mtc0_pwbase(CPUMIPSState *env, target_ulong arg1)

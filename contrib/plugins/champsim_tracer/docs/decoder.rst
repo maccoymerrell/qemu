@@ -553,10 +553,15 @@ drop count carries two companions: ``  of which at end-marker close``,
 the subset taken while the segment was closing on the guest's END
 marker, and ``  reg deltas discarded by those drops``, how much
 register data actually went with them.  The end-marker-close subset is
-broken out because an END-truncated block loses the dst snaps of the
-instructions the marker's exit prevented from running — a real loss
-from an entry the trace still emits at its full instruction count, and
-the case a marker-window run takes on *every* run.
+broken out because it was, historically, the case a marker-window run
+took on *every* run: the END block reached the wire at its full
+translated instruction count while the marker's exit stopped its last
+instructions from running, so the captured slice was always short
+against that inflated expectation and was discarded whole.  The close
+walk now truncates the block to what executed
+(:doc:`architecture`, *the segment-finish flush*) and the subset reads
+0 — but it stays broken out, because a reading of 0 there is a claim
+about the dominant case and has to be visible as one.
 
 Because the two counters live only in the plugin's own
 ``<outfile>.stats.log`` sidecar (:doc:`quickstart`, *Output files and

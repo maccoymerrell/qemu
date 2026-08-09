@@ -86,10 +86,14 @@ struct PartialKey {
     uint64_t asid_root;
     uint64_t start_pc;
     uint32_t n_insns;
+    /* Content signature, so a pc whose BYTES changed under a truncation of
+     * the same length gets its own template instead of silently adopting
+     * the earlier state's. */
+    uint64_t sig;
     bool operator==(const PartialKey &o) const
     {
         return asid_root == o.asid_root && start_pc == o.start_pc &&
-               n_insns == o.n_insns;
+               n_insns == o.n_insns && sig == o.sig;
     }
 };
 
@@ -99,6 +103,7 @@ struct PartialKeyHash {
         uint64_t h = k.asid_root + 0x9e3779b97f4a7c15ULL;
         h ^= k.start_pc + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
         h ^= (uint64_t)k.n_insns + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= k.sig + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
         h ^= h >> 30;
         h *= 0xbf58476d1ce4e5b9ULL;
         h ^= h >> 27;
@@ -250,7 +255,8 @@ public:
                                     const InsnRegNames *const *insn_reg_names,
                                     const char *symbol_name,
                                     uint64_t fall_through_pc,
-                                    bool cp_confirmed);
+                                    bool cp_confirmed,
+                                    bool *out_extent_only = nullptr);
     BBTemplate *get_or_create_bb_template(uint64_t entry_pc,
                                           BBTemplate *const *fragments,
                                           unsigned int n_fragments);
@@ -276,6 +282,18 @@ public:
                                   uint32_t last_frag_insns);
     /* Templates in partial_bb_map_ — serialised alongside bb_map_. */
     size_t partial_bb_count() const { return partial_bb_map_.size(); }
+
+    /* Install a block at the extent that ran; see the definition.  Reuses
+     * the complete block when the extents agree.  Caller holds data_lock. */
+    BBTemplate *install_own_extent(uint64_t entry_pc, uint32_t n_insns,
+                                   const uint64_t *insn_pcs,
+                                   const InsnFields *insn_fields,
+                                   const uint8_t *insn_sizes,
+                                   const uint8_t *insn_bytes,
+                                   const InsnRegNames *insn_reg_names,
+                                   const char *symbol_name,
+                                   uint64_t fall_through_pc,
+                                   bool is_system, bool stamp_system);
 
     /* Opportunistic branch-alternate minting (static_templates=1, both
      * modes).  Mint a never-executed true-BB template into the
@@ -534,7 +552,8 @@ private:
                                 const uint64_t *insn_pcs,
                                 const uint8_t *insn_sizes,
                                 const uint8_t *insn_bytes,
-                                bool cp_confirmed, uint64_t *out_sig);
+                                bool cp_confirmed, uint64_t *out_sig,
+                                bool *out_extent_only = nullptr);
     /* Insert @tmpl as the live revision of @key and index it by @sig for a
      * future A/B/A return.  Bumps the slot's distinct-state count. */
     void install_live_revision(const BBKey &key, BBTemplatePtr tmpl,

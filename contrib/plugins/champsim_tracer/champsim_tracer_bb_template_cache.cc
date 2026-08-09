@@ -948,8 +948,11 @@ void TemplateStore::note_revision_overflow(const BBKey &key, RevisionSlot &slot)
 BBTemplate *TemplateStore::resolve_true_bb(
     const BBKey &key, uint32_t n_insns, const uint64_t *insn_pcs,
     const uint8_t *insn_sizes, const uint8_t *insn_bytes,
-    bool cp_confirmed, uint64_t *out_sig)
+    bool cp_confirmed, uint64_t *out_sig, bool *out_extent_only)
 {
+    if (out_extent_only) {
+        *out_extent_only = false;
+    }
     BBTemplate *existing = find_bb_template(key.asid_root, key.start_pc);
     if (!existing) {
         /* First sighting of this slot: build and install as revision 0. */
@@ -963,15 +966,34 @@ BBTemplate *TemplateStore::resolve_true_bb(
         return existing;   /* non-SMC reuse — byte-identical to the old path */
     }
     if (m == BBMatch::EXTENT_ONLY) {
-        /* Extent-only divergence — the overlapping instructions are byte-
-         * identical, so no code changed; the chain was just finalised over a
-         * different run of it.  Preserve the historical "keep original"
-         * behavior and its one-shot warning (via find_existing_true_bb
-         * below).  No revision is minted, so output for this case stays
-         * byte-identical to the pre-SMC tracer. */
+        /*
+         * Extent-only divergence — the overlapping instructions are byte-
+         * identical, so no code changed; this run of the block covered a
+         * DIFFERENT NUMBER OF INSTRUCTIONS than the one already committed
+         * at this pc (a chain restarted mid-block after a discontinuity, a
+         * fault-interrupted assembly, a page-split fragment).
+         *
+         * "Keep the original" was wrong, and not by a little.  It emitted
+         * the block at the OTHER run's length: instructions on the wire
+         * that this execution never ran when the stored copy is longer, and
+         * instructions missing when it is shorter.  It also broke the
+         * positional register-snapshot invariant — the captured slice
+         * belongs to the extent that ran, the expectation comes from the
+         * returned template, and when they disagree the emit-time backstop
+         * throws the whole slice away.  That is the mid-run
+         * "dropped=N trimmed=0" the audit reports with no fork in sight; on
+         * a migration/fault workload this path fired over a thousand times
+         * in one cell.
+         *
+         * Tell the caller instead, and let it commit the block at the
+         * extent that actually ran.  Still counted as an extent artifact:
+         * the condition is worth seeing even now that it is handled.
+         */
         g_stats.smc_extent_artifacts++;
-        return find_existing_true_bb(key.asid_root, key.start_pc,
-                                     n_insns, insn_pcs);
+        if (out_extent_only) {
+            *out_extent_only = true;
+        }
+        return nullptr;
     }
 
     /* BBMatch::SMC — genuine self-modification, of any shape: an in-place
@@ -1086,10 +1108,23 @@ BBTemplate *TemplateStore::commit_true_bb(uint64_t start_pc,
 {
     BBKey key{store_asid_root(start_pc), start_pc};
     uint64_t sig = 0;
+    bool extent_only = false;
     if (BBTemplate *reuse = resolve_true_bb(key, n_insns, insn_pcs,
                                             insn_sizes, insn_bytes,
-                                            cp_confirmed, &sig)) {
+                                            cp_confirmed, &sig,
+                                            &extent_only)) {
         return reuse;
+    }
+    if (extent_only) {
+        /* A run of this block over a different number of instructions than
+         * the one committed at this pc.  Emit THIS extent (see the
+         * EXTENT_ONLY arm of resolve_true_bb); the array form has no
+         * fragment list, so it installs directly. */
+        return install_own_extent(start_pc, n_insns, insn_pcs, insn_fields,
+                                  insn_sizes, insn_bytes, insn_reg_names,
+                                  symbol_name, fall_through_pc,
+                                  /* is_system= */ false,
+                                  /* stamp_system= */ false);
     }
 
     BBTemplatePtr tmpl = build_bb_template(next_template_id_++,
@@ -1111,7 +1146,7 @@ BBTemplate *TemplateStore::commit_true_bb_refs(
     const uint8_t *insn_sizes, const uint8_t *insn_bytes,
     const InsnRegNames *const *insn_reg_names,
     const char *symbol_name, uint64_t fall_through_pc,
-    bool cp_confirmed)
+    bool cp_confirmed, bool *out_extent_only)
 {
     /* Already-templated BB (byte-identical): return the cached record without
      * touching the field/regnames payload at all.  On a CP-confirmed re-run
@@ -1119,10 +1154,21 @@ BBTemplate *TemplateStore::commit_true_bb_refs(
      * a wrong-path/spec commit never versions (§1.4). */
     BBKey key{store_asid_root(start_pc), start_pc};
     uint64_t sig = 0;
+    bool extent_only = false;
     if (BBTemplate *reuse = resolve_true_bb(key, n_insns, insn_pcs,
                                             insn_sizes, insn_bytes,
-                                            cp_confirmed, &sig)) {
+                                            cp_confirmed, &sig,
+                                            &extent_only)) {
         return reuse;
+    }
+    if (extent_only) {
+        /* This run of the block is a different length from the committed
+         * one.  The caller owns the fragment list and commits it at its own
+         * extent; nothing is installed here. */
+        if (out_extent_only) {
+            *out_extent_only = true;
+        }
+        return nullptr;
     }
 
     /* Cold path (first sighting of this BB only): gather the
@@ -1193,7 +1239,17 @@ BBTemplate *TemplateStore::get_or_create_bb_template(
                     break;
                 }
             }
-            if (all_match) {
+            /*
+             * The back-edge says these fragments folded into @cand once.  It
+             * does NOT say this chain holds the same fragments: a chain
+             * restarted mid-block after a discontinuity carries a SUBSET,
+             * and every one of them still points at the block they folded
+             * into last time.  Returning @cand there emits the block at the
+             * OTHER run's length.  Require the extent to agree; when it does
+             * not, fall through to the slow path, which commits this run at
+             * its own extent.
+             */
+            if (all_match && cand->n_insns == max_insns) {
                 /* Refresh the privilege stamp from this correct-path
                  * execution: the cached true-BB may have been first
                  * committed with a wrong-path seed (a WP session that
@@ -1298,12 +1354,24 @@ BBTemplate *TemplateStore::get_or_create_bb_template(
      * is_system stamp below still records the block's REAL execution
      * privilege (this is the CP finalize, so fragments[0]->is_system is
      * authoritative) and latches is_system_cp_confirmed for the wire bit. */
+    bool extent_only = false;
     BBTemplate *tmpl = commit_true_bb_refs(entry_pc, off,
                                            insn_pcs, field_ptrs,
                                            insn_sizes, insn_bytes,
                                            regname_ptrs,
                                            symbol_name, final_ft,
-                                           /* cp_confirmed= */ true);
+                                           /* cp_confirmed= */ true,
+                                           &extent_only);
+    if (!tmpl && extent_only) {
+        /* A run of this block over a different number of instructions than
+         * the one already committed at this pc.  Commit THIS extent — see
+         * the EXTENT_ONLY arm of resolve_true_bb for why keeping the other
+         * one is not an option — and stop here: the fragment back-edges
+         * below must keep naming the COMPLETE block, or the next full
+         * assembly of the same fragments would take the fast path straight
+         * back to this shorter one. */
+        return commit_partial_bb(entry_pc, fragments, n_fragments, 0);
+    }
     /* Privilege context rides from the translation-time stamp on the
      * fragments onto the assembled true-BB.  Fragments of one BB share
      * one privilege level (the transition instruction seals the BB).
@@ -1429,38 +1497,8 @@ BBTemplate *TemplateStore::commit_partial_bb(
         return nullptr;
     }
 
-    /* Not actually a truncation: the complete block already committed at
-     * this pc has exactly this extent (a chain that simply ended at a TB
-     * edge, or a block cut at its own last instruction).  Reuse it rather
-     * than minting a duplicate template — that keeps a trace where nothing
-     * is really cut short byte-identical. */
-    uint64_t asid_root = store_asid_root(entry_pc);
-    if (BBTemplate *ex = find_bb_template(asid_root, entry_pc)) {
-        if (ex->n_insns == off) {
-            bool same = true;
-            for (uint32_t i = 0; i < off; i++) {
-                if (ex->insn_pcs[i] != insn_pcs[i]) {
-                    same = false;
-                    break;
-                }
-            }
-            if (same) {
-                ex->is_system = fragments[0]->is_system;
-                ex->is_system_cp_confirmed = true;
-                return ex;
-            }
-        }
-    }
-
-    PartialKey key{asid_root, entry_pc, off};
-    auto it = partial_bb_map_.find(key);
-    if (it != partial_bb_map_.end()) {
-        BBTemplate *reuse = it->second.get();
-        reuse->is_system = fragments[0]->is_system;
-        reuse->is_system_cp_confirmed = true;
-        return reuse;
-    }
-
+    /* Materialise the pointed-to per-insn records; install_own_extent takes
+     * contiguous arrays, like the array form of the complete-block commit. */
     std::vector<InsnFields> gather_fields(off);
     for (uint32_t i = 0; i < off; i++) {
         gather_fields[i] = *field_ptrs[i];
@@ -1474,18 +1512,83 @@ BBTemplate *TemplateStore::commit_partial_bb(
         }
         reg_src = gather_regs.data();
     }
+    return install_own_extent(entry_pc, off, insn_pcs.data(),
+                              gather_fields.data(),
+                              insn_sizes.data(), insn_bytes.data(),
+                              reg_src, symbol_name, final_ft,
+                              fragments[0]->is_system,
+                              /* stamp_system= */ true);
+}
+
+/*
+ * Install a block AT THE EXTENT THAT RAN.
+ *
+ * bb_map_ is keyed by address alone, so it can hold exactly one extent per
+ * pc; a second, different extent of the same code has nowhere to go there
+ * and resolve_true_bb's EXTENT_ONLY arm used to answer with whichever one
+ * arrived first.  partial_bb_map_ is keyed by (asid_root, start_pc,
+ * n_insns, content signature), so every distinct extent — and every
+ * distinct program text at one extent — has its own slot and its own
+ * template_id.  Reuses the complete block when the extents in fact agree,
+ * so a run where nothing is cut short installs nothing here and its bytes
+ * do not move.  Caller holds data_lock.
+ */
+BBTemplate *TemplateStore::install_own_extent(
+    uint64_t entry_pc, uint32_t n_insns,
+    const uint64_t *insn_pcs, const InsnFields *insn_fields,
+    const uint8_t *insn_sizes, const uint8_t *insn_bytes,
+    const InsnRegNames *insn_reg_names,
+    const char *symbol_name, uint64_t fall_through_pc,
+    bool is_system, bool stamp_system)
+{
+    if (n_insns == 0) {
+        return nullptr;
+    }
+    uint64_t asid_root = store_asid_root(entry_pc);
+    /* Not actually a different extent: the complete block already committed
+     * at this pc has exactly this one. */
+    if (BBTemplate *ex = find_bb_template(asid_root, entry_pc)) {
+        if (ex->n_insns == n_insns) {
+            bool same = true;
+            for (uint32_t i = 0; i < n_insns; i++) {
+                if (ex->insn_pcs[i] != insn_pcs[i]) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) {
+                if (stamp_system) {
+                    ex->is_system = is_system;
+                    ex->is_system_cp_confirmed = true;
+                }
+                return ex;
+            }
+        }
+    }
+
+    PartialKey key{asid_root, entry_pc, n_insns,
+                   bb_content_sig(n_insns, insn_sizes, insn_bytes)};
+    auto it = partial_bb_map_.find(key);
+    if (it != partial_bb_map_.end()) {
+        BBTemplate *reuse = it->second.get();
+        if (stamp_system) {
+            reuse->is_system = is_system;
+            reuse->is_system_cp_confirmed = true;
+        }
+        return reuse;
+    }
 
     BBTemplatePtr tmpl = build_bb_template(next_template_id_++,
-                                           entry_pc, off,
-                                           insn_pcs.data(),
-                                           gather_fields.data(),
-                                           insn_sizes.data(),
-                                           insn_bytes.data(),
-                                           reg_src,
-                                           symbol_name, final_ft);
+                                           entry_pc, n_insns,
+                                           insn_pcs, insn_fields,
+                                           insn_sizes, insn_bytes,
+                                           insn_reg_names,
+                                           symbol_name, fall_through_pc);
     BBTemplate *raw = tmpl.get();
-    raw->is_system = fragments[0]->is_system;
-    raw->is_system_cp_confirmed = true;
+    if (stamp_system) {
+        raw->is_system = is_system;
+        raw->is_system_cp_confirmed = true;
+    }
     partial_bb_map_[key] = std::move(tmpl);
     g_stats.bb_templates_created++;
     g_stats.partial_bb_templates_created++;

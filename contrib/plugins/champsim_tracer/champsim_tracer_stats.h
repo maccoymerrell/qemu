@@ -121,8 +121,31 @@ struct Stats {
      * reg_snaps are DROPPED rather than mis-sliced (a code address landing
      * on an ALU dst, metaflags read from the wrong slot).  A backstop for
      * the eager-tail / foreign-drop / segment-boundary capture fixes; must
-     * be 0 on a correct run. */
+     * be 0 on a correct run.
+     *
+     * THIS IS THE TOTAL.  It counts EVERY dropped slice, including the ones
+     * taken during an end-marker close.  It did not always: the bump used to
+     * sit behind `if (!g_seg_end_marker_close)` while the drop itself ran
+     * unconditionally, so on a marker-window trace — where the segment
+     * ALWAYS closes on the END marker — the counter was structurally unable
+     * to observe the one drop that happens on every single run.  A reader
+     * who saw 0 concluded "nothing was dropped" and was wrong.  The
+     * end-marker-close subset is still separable, below, but it is no longer
+     * separable from the total by being invisible. */
     uint64_t reg_snap_slice_dropped = 0;
+    /* Subset of reg_snap_slice_dropped taken while the segment was closing
+     * on the guest's END marker.  Attribution only — an END-truncated block
+     * loses its tail dst snaps because the marker exits the process before
+     * the block's later instructions run, which is a real loss of register
+     * deltas from an entry the trace still emits at full n_insns.  Counted
+     * apart so the "expected" case can be told from a capture bug without
+     * either of them being silent. */
+    uint64_t reg_snap_slice_dropped_end_close = 0;
+    /* How many RegSnap values those drops actually threw away.  The event
+     * count above says a slice was lost; this says how much register delta
+     * went with it.  One drop of four snaps and four drops of one snap are
+     * the same number in the event counter and are not the same loss. */
+    uint64_t reg_snap_slice_drop_discarded = 0;
     /* Emitted entries whose surplus reg-snaps (a leaked prefix from a chain
      * the assembler abandoned on a sync-fault-storm TB discontinuity) were
      * TRIMMED at the front to recover this block's own correct positional
@@ -137,9 +160,108 @@ struct Stats {
      * positional sink they became the next block's leaked prefix, which
      * the emit-time backstop then "recovered" by trimming.  These two are
      * the condition; reg_snap_leak_trimmed is what the condition used to
-     * turn into. */
+     * turn into.
+     *
+     * SCOPE.  These two count the per-exec seal walk's append site
+     * (cp_chain_append) only, and they now count the chain event even when
+     * regdata is off — the chain IS dropped either way, and a counter that
+     * reports 0 because a feature is disabled reports the wrong thing.  The
+     * other two ways an in-flight chain dies have their own counters below,
+     * because this one cannot see them. */
     uint64_t reg_snap_chain_drops = 0;
     uint64_t reg_snap_chain_drop_discarded = 0;
+    /* ARCHITECTURAL INSTRUCTIONS in the fragments those drops threw away.
+     * The event count says a chain died; this says how much of the
+     * instruction stream died with it — which is the quantity that has to
+     * reconcile against the window clock, since the clock billed those
+     * instructions on their own dispatch and the wire never received
+     * them. */
+    uint64_t reg_snap_chain_drop_insns = 0;
+    /* In-flight chains dropped by the append inside PathBuilder::flush_final
+     * — the SEGMENT-CLOSE walk, which calls BBChainAssembler::append_fragment
+     * directly and discarded the drop verdict.  That is the walk every
+     * marker-window run finishes through, so this site was invisible to
+     * reg_snap_chain_drops by construction.  Counted here; the snaps such a
+     * drop orphans in the positional sink are counted beside it — the sink's
+     * whole depth at the drop, an UPPER BOUND, because that walk keeps no
+     * per-chain snap mark.  Counting only: the sink is deliberately left
+     * alone so this instrument does not also change what reaches the
+     * wire. */
+    uint64_t reg_snap_chain_drops_flush = 0;
+    uint64_t reg_snap_chain_flush_orphaned = 0;
+    uint64_t reg_snap_chain_flush_insns = 0;
+    /* In-flight chains destroyed by BBChainAssembler::reset() rather than by
+     * an append discontinuity — the fault-fold path (fold_prev_full_bb
+     * explicitly resets a live chain), the segment resets, and the seal
+     * walk's own post-emit resets.  reset() returns nothing, so every one of
+     * these was silent.  Fragments already appended to such a chain never
+     * reach the wire. */
+    uint64_t reg_snap_chain_reset_drops = 0;
+    uint64_t reg_snap_chain_reset_frags = 0;
+    uint64_t reg_snap_chain_reset_insns = 0;
+
+    /*
+     * WINDOW-CLOCK vs WIRE accounting.
+     *
+     * The comparison this arc has been quoting is OWNED_CP (Σ over the
+     * trace's non-system templates of exec_cp × n_insns, read back out of
+     * the wire by cst_decode --templates-only) against user_covered
+     * (g_user_icount at the segment's close, scraped from the finish line).
+     * Read as "everything the window billed reached the wire", that
+     * comparison is weaker than it looks in two ways, and neither is visible
+     * from either number:
+     *
+     *   - Both sides are TB-entry arithmetic over the same template
+     *     n_insns.  The window clock bills a dispatched TB's whole
+     *     instruction count from the unconditional inline-add; the wire
+     *     records the emitted entry's whole template n_insns.  A block that
+     *     is entered and does NOT run to its end — the END-marker block is
+     *     one on every marker run — is over-counted by exactly the same
+     *     amount on both sides, so the two agree precisely because they are
+     *     wrong together.  Agreement is not evidence of retirement.
+     *
+     *   - The clock's bill is a DELTA of consecutive insn_count reads, not
+     *     the dispatched TB's own instruction count.  Anything that retires
+     *     instructions between two owned dispatches without being billed on
+     *     its own dispatch lands inside the next owned TB's delta and is
+     *     billed to the owned process.  Subtracting OWNED_CP from
+     *     user_covered shows a residual but names nothing.
+     *
+     * These count both sides at their source so the residual is measured
+     * rather than inferred, and so the second effect is caught where it
+     * happens instead of at the end.
+     */
+    /* User (non-system) architectural instructions actually EMITTED to the
+     * body stream this segment — the plugin-side twin of OWNED_CP, with no
+     * decoder in the loop. */
+    uint64_t wire_user_arch_insns = 0;
+    /* User architectural instructions ATTRIBUTED BY THE PER-EXEC SEAL WALK,
+     * counted per TB fragment before chain folding.
+     *
+     * What it cannot count: the segment-close walk (PathBuilder::flush_final)
+     * and the fault-fold emissions do not run attribute_cp_insns, so their
+     * blocks reach the wire without passing through here.  It is therefore a
+     * LOWER bound on what was emitted and can read BELOW wire_user_arch_insns
+     * — on a marker cell by exactly the END block's instruction count.  Read
+     * it as "the per-exec walk's own view", not as a checkpoint every
+     * emission passes. */
+    uint64_t cp_user_seal_insns = 0;
+    /* TBs whose delta was folded into g_user_icount, and the instructions
+     * folded.  wire_user_arch_insns minus this is the residual OWNED_CP vs
+     * user_covered was standing in for. */
+    uint64_t user_clock_billed_tbs = 0;
+    uint64_t user_clock_billed_insns = 0;
+    /* Bills whose delta did NOT equal the dispatched TB's own architectural
+     * instruction count, and the excess instructions in them.  This is the
+     * clock billing the owned process for work that was not the owned TB —
+     * a foreign process's user instructions retired since the last owned
+     * dispatch, most visibly a fork child's. */
+    uint64_t user_clock_bill_mismatch_tbs = 0;
+    uint64_t user_clock_bill_excess_insns = 0;
+    /* Bills taken with no template for the dispatched TB.  Such a TB cannot
+     * reach the wire, so every instruction billed here is billed-not-traced
+     * by construction. */
+    uint64_t user_clock_bill_no_template = 0;
 
     /* Self-loop fan-out: where the iteration count came from.
      *

@@ -57,11 +57,18 @@ public:
      * and a silently orphaned prefix slides every later value onto the
      * wrong instruction.  Ignoring the return value is what made the
      * emit-time backstop see a SURPLUS and "recover" by trimming — a
-     * misattribution dressed as a repair. */
+     * misattribution dressed as a repair.
+     *
+     * @dropped_insns (optional) receives the ARCHITECTURAL INSTRUCTION
+     * COUNT of the fragments this call discarded.  The chain-event counter
+     * alone cannot answer the question a reader actually has — how much of
+     * the instruction stream the window clock billed never reached the wire
+     * — because one dropped chain can be one fragment or five. */
     bool append_fragment(uint64_t entry_pc,
                          BBTemplate *frag,
                          uint64_t fall_through,
-                         TbTerminus terminus);
+                         TbTerminus terminus,
+                         uint32_t *dropped_insns = nullptr);
 
     /* True once the accumulated chain forms a complete true BB — i.e.
      * the last appended TB completed the BB's terminating branch (and,
@@ -74,7 +81,17 @@ public:
      * must call reset()).  Caller must hold data_lock. */
     BBTemplate *finalize();
 
-    /* Drop the in-flight chain. */
+    /* Drop the in-flight chain.
+     *
+     * Two callers mean two different things by this.  After finalize() it
+     * is a COMMIT: the fragments became a true-BB template and the chain is
+     * cleared for the next one.  Everywhere else it DESTROYS a live chain —
+     * the fault fold (fold_prev_full_bb resets before re-appending prev),
+     * the segment resets, the suspend arrows — and those fragments never
+     * reach the wire.  reset() returns nothing, so every destroying reset
+     * used to be silent.  It now counts them (Stats::reg_snap_chain_reset_
+     * drops / _frags), telling the two apart by whether finalize() ran on
+     * this chain since the last append. */
     void reset();
 
     bool has_active_chain() const {
@@ -96,6 +113,7 @@ public:
         uint32_t my_gen   = 0;
         bool     awaiting_delay_slot = false;
         bool     bb_complete = false;
+        bool     finalized = false;
         std::vector<BBTemplate *> fragments;
     };
     ChainState detach_state();
@@ -111,6 +129,9 @@ private:
     bool     awaiting_delay_slot_ = false;
     /* True once the chain forms a complete true BB; see bb_complete(). */
     bool     bb_complete_ = false;
+    /* Set by a successful finalize(), cleared by append_fragment().  Lets
+     * reset() tell a commit from a destroy without changing any caller. */
+    bool     finalized_ = false;
     std::vector<BBTemplate *> fragments_;
 };
 

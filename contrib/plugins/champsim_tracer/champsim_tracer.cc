@@ -3362,6 +3362,11 @@ static uint64_t g_seg_fanout_start = 0;
  * which finish_trace_segment writes into the header (§2.13): the
  * trace-position index aligning to the bbv-counted warmup boundary. */
 static uint64_t g_seg_arch_insns = 0;
+/* The USER (non-system) part of g_seg_arch_insns — the plugin-side twin of
+ * the OWNED_CP figure this arc reconstructs from the wire.  Printed on the
+ * segment's finish line beside user_covered so the clock-vs-wire residual is
+ * a number the run reports, not one a reader has to subtract. */
+static uint64_t g_seg_arch_user_insns = 0;
 /* UINT64_MAX sentinel = warmup boundary has not been crossed
  * (segment cut short, or warmup_insns==0 and no entry emitted
  * yet).  0 is a legitimate value (warmup_insns==0 → captured at
@@ -3818,6 +3823,7 @@ static void start_trace_segment(const char *label,
     g_seg_fanout_start = g_rep_fanout_extra_insns.load(
         std::memory_order_relaxed);
     g_seg_arch_insns = 0;
+    g_seg_arch_user_insns = 0;
     g_seg_warmup_end_trace_insns = UINT64_MAX;
     g_seg_warmup_crossed = false;
     g_seg_wm_deferred_records = 0;
@@ -4298,9 +4304,11 @@ void emit_body_entry(BodyStreamState *out_stream,
      *
      *   SHORTFALL — a tail snap the capture could not reach (the END-marker
      *     exit block whose later insns never ran).  Nothing to recover; drop
-     *     this entry's reg-data rather than emit a mis-sliced stream.  The
-     *     END-marker terminator is expected and not counted; any other
-     *     shortfall is a real capture bug, counted loudly. */
+     *     this entry's reg-data rather than emit a mis-sliced stream.  Every
+     *     shortfall is counted, END-marker close included, with the
+     *     end-close ones also bucketed separately — the drop is real
+     *     wherever it comes from, and a run that always closes on the END
+     *     marker is exactly the run that must not report zero. */
     if (g_features.reg_data && bb_tmpl) {
         uint64_t expected_snaps = 0;
         for (uint32_t i = 0; i < bb_tmpl->n_insns; i++) {
@@ -4328,9 +4336,33 @@ void emit_body_entry(BodyStreamState *out_stream,
                                     pending_reg_snaps(cpu_index).begin() + (ptrdiff_t)excess);
             g_stats.reg_snap_leak_trimmed++;
         } else if (pending_reg_snaps(cpu_index).size() != expected_snaps) {
-            if (!g_seg_end_marker_close) {
-                g_stats.reg_snap_slice_dropped++;
+            /*
+             * COUNT IT ALWAYS.
+             *
+             * The bump used to sit behind `if (!g_seg_end_marker_close)`
+             * while the clear() below ran unconditionally.  On a
+             * marker-window trace the segment ALWAYS closes on the END
+             * marker, so the flag was set for every entry emitted by the
+             * closing flush and the counter could not observe the drop that
+             * happens on every run — it reported 0 while a slice was
+             * destroyed each time.  The carve-out also silenced two cases it
+             * was never argued for: the MERGE-SURPLUS arm (a surplus on a
+             * merged fault entry, which has nothing to do with an
+             * END-truncated tail) and any unrelated shortfall that happens
+             * to land in the same closing flush.  A global segment-close
+             * flag cannot say whether THIS entry is the truncated block.
+             *
+             * The end-marker-close case is still separable — it goes in its
+             * own bucket below — but it is no longer separable by being
+             * invisible, and the magnitude of what was thrown away is
+             * recorded next to the event.
+             */
+            const size_t n_discarded = pending_reg_snaps(cpu_index).size();
+            g_stats.reg_snap_slice_dropped++;
+            if (g_seg_end_marker_close) {
+                g_stats.reg_snap_slice_dropped_end_close++;
             }
+            g_stats.reg_snap_slice_drop_discarded += n_discarded;
             if (getenv("CST_SNAP_DIAG")) {
                 fprintf(stderr, "champsim_tracer: [snapdiag] reg-snap "
                         "%s BB start=0x%" PRIx64 " n_insns=%u pending=%zu"
@@ -4343,6 +4375,46 @@ void emit_body_entry(BodyStreamState *out_stream,
                         (int)g_seg_end_marker_close, g_emit_fault_depth,
                         g_emit_fault_anchors.size(),
                         (int)bb_tmpl->is_system);
+                /*
+                 * Name what is being thrown away.  The sink is POSITIONAL,
+                 * so the k-th pending snap belongs to the k-th dst slot in
+                 * the template's prefix-sum order — the same walk
+                 * build_entry_view does.  Printing insn pc + register name +
+                 * value turns "4 register deltas were discarded" from a
+                 * count into an identified loss.
+                 */
+                const std::vector<RegSnap> &pv = pending_reg_snaps(cpu_index);
+                size_t slot = 0;
+                for (uint32_t i = 0; i < bb_tmpl->n_insns && slot < pv.size();
+                     i++) {
+                    const InsnFields *fi = &bb_tmpl->insn_fields[i];
+                    for (uint8_t d = 0; d < fi->n_dst_regs &&
+                                        slot < pv.size(); d++, slot++) {
+                        const char *rn = "?";
+                        if (bb_tmpl->insn_reg_names &&
+                            bb_tmpl->insn_reg_names[i].dst_qemu_reg_keys &&
+                            bb_tmpl->insn_reg_names[i].dst_qemu_reg_keys[d] &&
+                            bb_tmpl->insn_reg_names[i]
+                                .dst_qemu_reg_keys[d]->name) {
+                            rn = bb_tmpl->insn_reg_names[i]
+                                     .dst_qemu_reg_keys[d]->name;
+                        }
+                        fprintf(stderr, "champsim_tracer: [snapdiag]   "
+                                "discarded slot %zu: insn[%u] pc=0x%" PRIx64
+                                " dst[%u]=%s width=%u value=0x%016" PRIx64
+                                "\n", slot, i,
+                                bb_tmpl->insn_pcs ? bb_tmpl->insn_pcs[i] : 0,
+                                d, rn, (unsigned)pv[slot].width_bytes,
+                                pv[slot].value.limb[0]);
+                    }
+                }
+                for (; slot < pv.size(); slot++) {
+                    fprintf(stderr, "champsim_tracer: [snapdiag]   "
+                            "discarded slot %zu: BEYOND the template's dst "
+                            "slots width=%u value=0x%016" PRIx64 "\n",
+                            slot, (unsigned)pv[slot].width_bytes,
+                            pv[slot].value.limb[0]);
+                }
             }
             pending_reg_snaps(cpu_index).clear();
         }
@@ -4773,6 +4845,15 @@ void emit_body_entry(BodyStreamState *out_stream,
                 g_seg_arch_insns +=
                     (bb_tmpl ? bb_tmpl->n_insns : 0)
                     + (uint64_t)(n_iter - 1);
+                /* Wire-side twin of OWNED_CP: the same sum a reader
+                 * reconstructs with cst_decode --templates-only, computed
+                 * here so the clock-vs-wire residual needs no decoder. */
+                if (bb_tmpl && !bb_tmpl->is_system) {
+                    g_stats.wire_user_arch_insns +=
+                        (uint64_t)bb_tmpl->n_insns + (uint64_t)(n_iter - 1);
+                    g_seg_arch_user_insns +=
+                        (uint64_t)bb_tmpl->n_insns + (uint64_t)(n_iter - 1);
+                }
                 /* Iter 2..N: rep_subtmpl, mpi memops each, insn_index
                  * remapped to 0 (sub has exactly one insn).  One reused
                  * BodyEntry across iterations keeps the per-sub dyn_params /
@@ -4851,6 +4932,10 @@ void emit_body_entry(BodyStreamState *out_stream,
         body_stream_write_entry(out_stream, &entry);
     }
     g_seg_arch_insns += bb_tmpl ? bb_tmpl->n_insns : 0;
+    if (bb_tmpl && !bb_tmpl->is_system) {
+        g_stats.wire_user_arch_insns += bb_tmpl->n_insns;
+        g_seg_arch_user_insns += bb_tmpl->n_insns;
+    }
 }
 
 /*
@@ -4884,10 +4969,20 @@ size_t &cp_chain_snap_mark(unsigned int cpu_index)
  */
 static inline void cp_chain_append(unsigned int cpu_index, BBTemplate *frag)
 {
+    uint32_t dropped_insns = 0;
     const bool dropped_chain =
         cp_chain(cpu_index).append_fragment(frag->start_pc, frag,
                                             frag->fall_through_pc,
-                                            (TbTerminus)frag->terminus);
+                                            (TbTerminus)frag->terminus,
+                                            &dropped_insns);
+    /* The chain is dropped whether or not reg-data capture is on, so the
+     * chain counter is bumped before the reg-data early-out.  Behind it,
+     * "CP chains dropped on discontinuity" read 0 on every regdata=0 run
+     * and meant "not measured", not "did not happen". */
+    if (dropped_chain) {
+        g_stats.reg_snap_chain_drops++;
+        g_stats.reg_snap_chain_drop_insns += dropped_insns;
+    }
     if (!g_features.reg_data) {
         return;
     }
@@ -4902,7 +4997,6 @@ static inline void cp_chain_append(unsigned int cpu_index, BBTemplate *frag)
             pend.erase(pend.begin(), pend.begin() + (ptrdiff_t)n);
             g_stats.reg_snap_chain_drop_discarded += n;
         }
-        g_stats.reg_snap_chain_drops++;
     }
     /* Everything now pending belongs to the chain this fragment is in:
      * earlier entries are earlier fragments of the same chain, and the
@@ -5038,16 +5132,26 @@ static void finish_trace_segment(bool prev_executed = true,
          * what cst_audit will report as "CP insns (total)".  We
          * still print rep_fanout for visibility into where the
          * arch-vs-BBV divergence comes from. */
+        /* wire_user_insns / clock_minus_wire: the OWNED_CP-vs-user_covered
+         * comparison, computed by the run that produced both numbers.  A
+         * nonzero residual is instructions the window clock billed to the
+         * owned process that no user template carries — the clock's bill is
+         * a delta of insn_count reads, so anything retired between two owned
+         * dispatches lands in the next owned TB's bill.  The per-bill split
+         * is in the stats report (user_clock_bill_*). */
         fprintf(stderr,
                 "champsim_tracer: finished segment [icount %"
                 PRIu64 " .. %" PRIu64 "]  actual_icount=%"
                 PRIu64 "  %scovered=%" PRIu64
                 "  %sbudget=%" PRIu64 "  rep_fanout=%" PRIu64
-                "  trace_arch_insns=%" PRIu64 "  %s\n",
+                "  trace_arch_insns=%" PRIu64
+                "  wire_user_insns=%" PRIu64
+                "  clock_minus_wire=%" PRId64 "  %s\n",
                 lo, hi, g_host_icount,
                 user_clock ? "user_" : "", covered,
                 user_clock ? "user_" : "", budget,
-                seg_fanout, g_seg_arch_insns, flag);
+                seg_fanout, g_seg_arch_insns, g_seg_arch_user_insns,
+                (int64_t)covered - (int64_t)g_seg_arch_user_insns, flag);
         g_traced_icount.fetch_add(covered,
                                   std::memory_order_relaxed);
         g_total_arch_insns.fetch_add(g_seg_arch_insns,
@@ -5729,6 +5833,15 @@ static void attribute_cp_insns(const BBTemplate *tmpl)
 {
     Stats &s = thread_stats_get();
     Stats *h = g_current_hist_bucket;
+    /* Third point in the window-clock accounting chain (see the Stats block
+     * on user_clock_billed_insns): what the SEAL WALK saw, between what the
+     * clock billed at dispatch and what emission put on the wire.  Two gaps
+     * instead of one residual — a fragment lost before the seal walk and an
+     * assembled block lost between the seal and the emit are different
+     * defects and were previously indistinguishable. */
+    if (!tmpl->is_system) {
+        s.cp_user_seal_insns += tmpl->n_insns;
+    }
     for (uint32_t i = 0; i < tmpl->n_insns; i++) {
         const InsnFields *f = &tmpl->insn_fields[i];
         s.cp_insns_by_opcode[f->opcode]++;
@@ -6982,6 +7095,38 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
         }
         if (user_owned) {
             g_user_icount += delta;
+            /*
+             * BILL-SITE ACCOUNTING (see the Stats block on
+             * user_clock_billed_insns).  What the window clock bills is a
+             * DELTA of consecutive insn_count reads, not this TB's own
+             * instruction count.  Whenever those differ, the owned process
+             * is being billed for instructions that some other dispatch
+             * retired — a fork child's user code, most visibly — and the
+             * only previous way to see it was to decode the trace back out
+             * and subtract OWNED_CP from user_covered, which shows a
+             * residual and names nothing.  Compare the two here, where both
+             * are in hand.
+             */
+            g_stats.user_clock_billed_tbs++;
+            g_stats.user_clock_billed_insns += delta;
+            if (!cur_tb_tmpl) {
+                /* No template: this TB cannot reach the wire at all, so
+                 * everything billed on it is billed-but-never-traced. */
+                g_stats.user_clock_bill_no_template++;
+            } else {
+                uint64_t tb_insns = 0;
+                for (BBTemplate *bf = cur_tb_tmpl; bf;
+                     bf = bf->next_tb_fragment) {
+                    tb_insns += bf->n_insns;
+                }
+                if (delta != tb_insns) {
+                    g_stats.user_clock_bill_mismatch_tbs++;
+                    if (delta > tb_insns) {
+                        g_stats.user_clock_bill_excess_insns +=
+                            delta - tb_insns;
+                    }
+                }
+            }
             /* Progress-driven dead-latch peer sweep (throttled).  A live
              * owned process ages out a dead peer through its own user-clock
              * progress, so a straggler window closes even when the guest is

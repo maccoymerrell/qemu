@@ -542,14 +542,21 @@ the plugin's own per-segment and cumulative summaries.  A positional
 reg-snap shortfall the seal walk cannot recover drops that entry's
 whole register-data section rather than mis-slicing it onto the wrong
 instruction (counted as *dropped*); a leaked prefix the walk CAN
-recover by trimming is counted separately as *trimmed*.  On a
-conformant run these two counters are equal — every genuine shortfall
-is either a recoverable leak or an unrecoverable drop the counter
-itself accounts for.  The invariant is ``dropped == trimmed``, not
-"both zero": a busy fault-storm trace can legitimately trim many
-leaked prefixes while dropping none of them, so requiring zero would
-false-positive on exactly the traces most likely to exercise the
-recovery path.
+recover by trimming is counted separately as *trimmed*.
+
+The invariant is that **nothing was dropped**.  A drop is register
+deltas that were captured and then thrown away, leaving the entry on
+the wire with no register data at all; a trim is a recovery.  Nothing
+relates the count of recoveries to the count of losses, so the two are
+reported side by side rather than balanced against each other, and the
+drop count carries two companions: ``  of which at end-marker close``,
+the subset taken while the segment was closing on the guest's END
+marker, and ``  reg deltas discarded by those drops``, how much
+register data actually went with them.  The end-marker-close subset is
+broken out because an END-truncated block loses the dst snaps of the
+instructions the marker's exit prevented from running — a real loss
+from an entry the trace still emits at its full instruction count, and
+the case a marker-window run takes on *every* run.
 
 Because the two counters live only in the plugin's own
 ``<outfile>.stats.log`` sidecar (:doc:`quickstart`, *Output files and
@@ -565,12 +572,21 @@ an explicit path:
 
    $ build/contrib/plugins/cst_audit --stats-log=run.stats.log run.cst
    === COMPLETENESS (Oracle 1; run.stats.log) ===
-     CP reg-snap slice dropped               0
-     CP reg-snap leak trimmed                0
-     invariant dropped == trimmed: OK
+     CP reg-snap slice dropped                0
+       at end-marker close                    0
+       reg deltas discarded                   0
+     CP reg-snap leak trimmed                 0
+     CP chain drops (seal/close)              0 / 0
+     invariant no slice dropped: OK
 
-When no sidecar is found (auto-detected path missing) the section is
-silently omitted — this is the offline half of a check the validator
+A sidecar written by a plugin old enough to lack the breakdown rows
+prints ``NOT REPORTED`` for them rather than ``0``: an absent counter
+is an unobserved quantity, not a satisfied one.
+
+When no sidecar is found (auto-detected path missing) the section
+still prints, saying ``NOT CHECKED`` and naming the path it looked
+for — a check whose subject is missing must not read as a check that
+passed.  This is the offline half of a check the validator
 also runs at trace-generation time as a registered, gating feature
 (``features.reg_snap_accounting``, :doc:`validator`); passing an
 explicit ``--stats-log`` that turns out unreadable or missing either

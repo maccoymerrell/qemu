@@ -160,7 +160,7 @@ FEATURES: dict[str, str] = {
     "behavior:dc_zva_visible": "aarch64 DC ZVA reaches the memory instrumentation on the correct path and is modelled as the block store it is: its recorded stores tile the DCZID_EL0-sized block exactly instead of vanishing into the helper's host memset, and the instruction declares the store lane that makes them attributable",
     "behavior:string_op_memops": "x86 REP string instructions fan out per architectural iteration with the right per-iteration memop count, and the operand model matches what each instruction really reads and writes (Capstone access-flag corrections in disas/capstone.c)",
     "behavior:rep_fanout_invariance": "an x86 REP's fan-out is a function of architectural state only: the same guest execution renders the same number of entries, with the same rep_subtmpl/BRANCH_REP self-loop structure and the same per-iteration direction/target, whether do_gen_rep translated the whole repetition or one iteration per TB (CF_USE_ICOUNT / CF_SINGLE_STEP / EFLAGS.TF / interrupt shadow), and the wrong path — which is ALWAYS single-stepped through cpu_plugin_exec_tb — renders a REP exactly as the correct path does.  No external reference covers the wrong path, so this check is the only thing that can catch a CP/WP divergence there",
-    "behavior:reg_snap_accounting": "the plugin's own dropped-slice completeness invariant for the positional reg-snap capture — CP reg-snap slice dropped == CP reg-snap leak trimmed (D4-class completeness oracle; the wire has no record of it, so this is read from the <outfile>.stats.log sidecar, offline via cst_audit --stats-log)",
+    "behavior:reg_snap_accounting": "the plugin's own dropped-slice completeness invariant for the positional reg-snap capture — CP reg-snap slice dropped == 0, end-marker-close drops included (D4-class completeness oracle; the wire has no record of it, so this is read from the <outfile>.stats.log sidecar, offline via cst_audit --stats-log)",
     "behavior:mips_fragment_split_absence": "split_tb_into_fragments's mid-TB continuation path (a branch-classified insn QEMU's translator keeps decoding past) has no current MIPS instance — the T-family conditional trap was the only one and 5bf597d751 correctly reclassified it to BRANCH_NONE, leaving BRANCH_REP as the path's exerciser (x86 X86RepIterationFanout rep movsq, and the aarch64 FEAT_MOPS bulk copy/set triple); this pins that fact and fails if MIPS regains an un-covered instance",
     "behavior:memop_bimodality": "per-template memop bimodality: a memop-capable template's CP executions overwhelmingly nonzero with a small minority of zero-memop outliers is a completeness loss (D4-class oracle generalised past the segment-final-entry special case; cst_lint.h MemopBimodalityLint + validator.py's mirror, both gating)",
 }
@@ -1235,13 +1235,22 @@ def _chk_reg_snap_accounting(ctx: Ctx) -> Outcome:
     record that was never written contributes to neither side of a byte
     partition.
 
-    The invariant this check reads is ``dropped == trimmed``, NOT "both
-    zero": a busy fault-storm trace can legitimately trim many leaked
-    prefixes while dropping none of them (mcf_user_mipsel's sample trace
-    shows 188,726 leak trims from the separate mipsel `teq`-as-syscall
-    issue, with dropped==trimmed still holding), so requiring zero would
-    false-positive on exactly the traces most likely to exercise the
-    recovery path.  Runs its own short trace per ISA — deliberately not
+    The invariant this check reads is that NOTHING WAS DROPPED.  It used
+    to be ``dropped == trimmed``, justified as "not both zero, because a
+    busy fault-storm trace can legitimately trim many leaked prefixes
+    while dropping none of them".  That justification refutes the rule it
+    defends: a trace that trims many and drops none has dropped != trimmed
+    and the equality rejects it.  Read the other way — trimmed == dropped
+    == 188,726, the sample figure the old text cited — the rule certifies
+    188,726 destroyed register-delta slices as conformant.  Nothing ties
+    the count of recoveries to the count of losses in either direction.
+    A drop is register deltas that were captured and thrown away, so the
+    entry reaches the wire with no reg-data at all; a trim is a recovery.
+    Drops must be zero, including the ones taken while the segment closes
+    on a guest END marker (``  of which at end-marker close``), which the
+    plugin counter was structurally unable to observe until the counting
+    was moved out from behind ``if (!g_seg_end_marker_close)``.  Trims are
+    reported for context.  Runs its own short trace per ISA — deliberately not
     reusing another check's output directory — so it exercises the
     invariant in the ordinary course of tracing, not a manufactured
     scenario."""
@@ -1276,10 +1285,14 @@ def _chk_reg_snap_accounting(ctx: Ctx) -> Outcome:
                         "detail": f"trace rc={rc} stats_present={stats.is_file()}"})
             all_ok = False
             continue
-        dropped = trimmed = None
+        dropped = trimmed = end_close = discarded = None
         for line in stats.read_text(errors="replace").splitlines():
             if line.startswith("CP reg-snap slice dropped"):
                 dropped = int(line.rsplit(None, 1)[-1])
+            elif line.startswith("  of which at end-marker close"):
+                end_close = int(line.rsplit(None, 1)[-1])
+            elif line.startswith("  reg deltas discarded by those drops"):
+                discarded = int(line.rsplit(None, 1)[-1])
             elif line.startswith("CP reg-snap leak trimmed"):
                 trimmed = int(line.rsplit(None, 1)[-1])
         if dropped is None or trimmed is None:
@@ -1287,14 +1300,25 @@ def _chk_reg_snap_accounting(ctx: Ctx) -> Outcome:
                         "detail": f"counters not found in {stats.name}"})
             all_ok = False
             continue
-        ok = dropped == trimmed
+        # A sidecar without the breakdown rows came from a plugin that did
+        # not count them.  Say so; do not read the absence as zero.
+        if end_close is None or discarded is None:
+            subs.append({"name": isa, "ok": False,
+                        "detail": f"{stats.name} carries no end-marker-close "
+                                  f"or discarded-delta breakdown (stale "
+                                  f"plugin?); dropped={dropped}"})
+            all_ok = False
+            continue
+        ok = dropped == 0 and discarded == 0
         all_ok = all_ok and ok
         subs.append({"name": isa, "ok": ok,
-                    "detail": f"dropped={dropped} trimmed={trimmed}"})
+                    "detail": f"dropped={dropped} (end_close={end_close}) "
+                              f"reg_deltas_discarded={discarded} "
+                              f"trimmed={trimmed}"})
     return Outcome("pass" if all_ok else "fail",
                    "plugin's own dropped-slice accounting invariant "
-                   "(dropped == trimmed), read from <outfile>.stats.log "
-                   "(4 ISAs)", subs)
+                   "(no slice dropped, end-marker close included), read "
+                   "from <outfile>.stats.log (4 ISAs)", subs)
 
 
 def _chk_final_entry_memops(ctx: Ctx) -> Outcome:
@@ -2042,9 +2066,9 @@ def build_checks() -> list:
                     "wire:BODY_TAG_ENTRY"], _chk_final_entry_memops))
     C.append(Check("features.reg_snap_accounting", "features",
                    "plugin's own dropped-slice completeness invariant "
-                   "(dropped == trimmed) for the positional reg-snap "
-                   "capture — the D4-class completeness oracle no "
-                   "byte-level wire check can see (4-ISA)",
+                   "(no slice dropped, end-marker close included) for the "
+                   "positional reg-snap capture — the D4-class completeness "
+                   "oracle no byte-level wire check can see (4-ISA)",
                    ["behavior:reg_snap_accounting", "tool:cst_audit"],
                    _chk_reg_snap_accounting))
     C.append(Check("features.smc", "features",

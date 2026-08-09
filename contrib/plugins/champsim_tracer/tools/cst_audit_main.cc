@@ -779,16 +779,21 @@ std::string row(const std::string &label, uint64_t b, uint64_t total,
  * seal walk could not recover is counted as "dropped" (its entry's whole
  * reg-data section is discarded rather than mis-sliced onto the wrong
  * insn); a leaked prefix the walk COULD recover by trimming is counted as
- * "trimmed", separately.  On a conformant run these two counters are
- * equal — every genuine shortfall is either a recoverable leak (trimmed)
- * or an unrecoverable drop the counter itself accounts for; the invariant
- * this audit checks is `dropped == trimmed`, not "both zero" (a busy
- * fault-storm trace can legitimately trim many leaked prefixes while
- * dropping none of them, and vice versa on a run with an upstream bug
- * feeding it bad data — the shape that matters is that the two counters
- * reconcile, mirroring how the byte-budget rollup above reconciles what
- * IS on the wire; this is the same reconciliation applied to what the
- * plugin observed but chose not to serialise).
+ * "trimmed", separately.
+ *
+ * The invariant checked here is that NOTHING WAS DROPPED.  It used to be
+ * `dropped == trimmed`, argued as a reconciliation between recoveries and
+ * losses.  That argument does not hold: no mechanism ties the number of
+ * recoverable leaks to the number of unrecoverable shortfalls, and the
+ * same justification conceded as much ("a busy fault-storm trace can
+ * legitimately trim many leaked prefixes while dropping none of them") —
+ * a run the equality rejects.  It passed in practice only because both
+ * counters read zero, and "dropped" read zero partly because it was
+ * structurally unable to count the end-marker-close case, which is the
+ * case every marker-window trace ends on.  A drop is lost register
+ * deltas; a trim is a recovery.  The drop count and the number of deltas
+ * it discarded must both be zero; the trim count is reported for context,
+ * beside the chain drops that produce the leaks it recovers.
  *
  * The counters live only in the plugin's own `<outfile>.stats.log`
  * sidecar (or the equivalent stderr report) — never on the wire, so a
@@ -803,6 +808,17 @@ struct CompletenessStats {
     bool     present  = false;
     uint64_t dropped  = 0;
     uint64_t trimmed  = 0;
+    /* Subset of @dropped taken while the segment closed on the guest's END
+     * marker, and the number of register deltas all the drops threw away.
+     * Absent from an older sidecar (the plugin did not emit them), which is
+     * itself worth saying out loud rather than defaulting to zero. */
+    uint64_t dropped_end_close = 0;
+    uint64_t discarded         = 0;
+    bool     have_breakdown    = false;
+    /* Chain-drop context: the condition a trim recovers from. */
+    uint64_t chain_drops       = 0;
+    uint64_t chain_drops_flush = 0;
+    bool     have_chain        = false;
 };
 
 CompletenessStats read_completeness_stats(const std::string &path)
@@ -811,20 +827,33 @@ CompletenessStats read_completeness_stats(const std::string &path)
     FILE *f = std::fopen(path.c_str(), "r");
     if (!f) return out;
     char line[512];
-    static const char *kDropped = "CP reg-snap slice dropped";
-    static const char *kTrimmed = "CP reg-snap leak trimmed";
+    static const char *kDropped  = "CP reg-snap slice dropped";
+    static const char *kTrimmed  = "CP reg-snap leak trimmed";
+    static const char *kEndClose = "  of which at end-marker close";
+    static const char *kDiscard  = "  reg deltas discarded by those drops";
+    static const char *kChain    = "CP chains dropped on discontinuity";
+    static const char *kChainFl  = "CP chains dropped in the close walk";
     bool saw_dropped = false, saw_trimmed = false;
+    bool saw_end = false, saw_disc = false;
+    bool saw_chain = false, saw_chain_fl = false;
     while (std::fgets(line, sizeof(line), f)) {
         unsigned long long v;
-        size_t dn = std::strlen(kDropped), tn = std::strlen(kTrimmed);
-        if (std::strncmp(line, kDropped, dn) == 0 &&
-            std::sscanf(line + dn, "%llu", &v) == 1) {
-            out.dropped = v;
-            saw_dropped = true;
-        } else if (std::strncmp(line, kTrimmed, tn) == 0 &&
-                   std::sscanf(line + tn, "%llu", &v) == 1) {
-            out.trimmed = v;
-            saw_trimmed = true;
+        struct { const char *k; uint64_t *dst; bool *seen; } row[] = {
+            { kDropped,  &out.dropped,           &saw_dropped  },
+            { kTrimmed,  &out.trimmed,           &saw_trimmed  },
+            { kEndClose, &out.dropped_end_close, &saw_end      },
+            { kDiscard,  &out.discarded,         &saw_disc     },
+            { kChain,    &out.chain_drops,       &saw_chain    },
+            { kChainFl,  &out.chain_drops_flush, &saw_chain_fl },
+        };
+        for (auto &r : row) {
+            size_t n = std::strlen(r.k);
+            if (std::strncmp(line, r.k, n) == 0 &&
+                std::sscanf(line + n, "%llu", &v) == 1) {
+                *r.dst = v;
+                *r.seen = true;
+                break;
+            }
         }
     }
     std::fclose(f);
@@ -836,6 +865,8 @@ CompletenessStats read_completeness_stats(const std::string &path)
      * overwriting @out with each match, so it naturally lands on the
      * last (cumulative) one. */
     out.present = saw_dropped && saw_trimmed;
+    out.have_breakdown = saw_end && saw_disc;
+    out.have_chain = saw_chain && saw_chain_fl;
     return out;
 }
 
@@ -1318,21 +1349,65 @@ int main(int argc, char **argv)
         if (!no_stats_log && !stats_log_path.empty()) {
             CompletenessStats cs = read_completeness_stats(stats_log_path);
             if (cs.present) {
-                bool ok = cs.dropped == cs.trimmed;
                 std::printf("\n=== COMPLETENESS (Oracle 1; %s) ===\n",
                             stats_log_path.c_str());
                 std::printf("  CP reg-snap slice dropped   %14s\n",
                             fmt_n(cs.dropped).c_str());
+                if (cs.have_breakdown) {
+                    std::printf("    at end-marker close       %14s\n",
+                                fmt_n(cs.dropped_end_close).c_str());
+                    std::printf("    reg deltas discarded      %14s\n",
+                                fmt_n(cs.discarded).c_str());
+                } else {
+                    std::printf("    at end-marker close       %14s\n",
+                                "NOT REPORTED");
+                    std::printf("    reg deltas discarded      %14s\n",
+                                "NOT REPORTED");
+                }
                 std::printf("  CP reg-snap leak trimmed    %14s\n",
                             fmt_n(cs.trimmed).c_str());
-                std::printf("  invariant dropped == trimmed: %s\n",
-                            ok ? "OK" : "MISMATCH");
+                if (cs.have_chain) {
+                    std::printf("  CP chain drops (seal/close) %14s / %s\n",
+                                fmt_n(cs.chain_drops).c_str(),
+                                fmt_n(cs.chain_drops_flush).c_str());
+                }
+                /*
+                 * THE INVARIANT IS "NO SLICE WAS DROPPED", not
+                 * "dropped == trimmed".
+                 *
+                 * The equality this used to check was justified as a
+                 * reconciliation — "every genuine shortfall is either a
+                 * recoverable leak (trimmed) or an unrecoverable drop" —
+                 * but nothing makes the COUNT of recoveries equal the COUNT
+                 * of losses, and the same comment said so two sentences
+                 * later ("a busy fault-storm trace can legitimately trim
+                 * many leaked prefixes while dropping none of them"), which
+                 * is a run the equality FAILS.  The rule only ever held
+                 * because both counters were zero on the traces it was run
+                 * against, and one of them was zero because it could not
+                 * count the end-marker-close case at all.
+                 *
+                 * A dropped slice is register deltas that were captured and
+                 * then thrown away, so the entry reaches the wire with no
+                 * reg-data at all.  That is a completeness loss whatever the
+                 * trim count is.  A trim is a recovery, reported for
+                 * context and cross-referenced against the chain drops that
+                 * cause it, not required to balance anything.
+                 */
+                bool ok = cs.dropped == 0 &&
+                          (!cs.have_breakdown || cs.discarded == 0);
+                std::printf("  invariant no slice dropped: %s\n",
+                            ok ? "OK" : "VIOLATED");
                 if (!ok) {
                     std::fprintf(stderr,
-                        "cst_audit: FAIL: dropped-slice accounting "
-                        "mismatch: dropped=%llu trimmed=%llu (%s)\n",
+                        "cst_audit: FAIL: dropped-slice accounting: "
+                        "dropped=%llu (end_close=%llu) discarded_reg_deltas="
+                        "%llu trimmed=%llu (%s)\n",
                         (unsigned long long)cs.dropped,
-                        (unsigned long long)cs.trimmed, stats_log_path.c_str());
+                        (unsigned long long)cs.dropped_end_close,
+                        (unsigned long long)cs.discarded,
+                        (unsigned long long)cs.trimmed,
+                        stats_log_path.c_str());
                     fail = true;
                 }
             } else if (stats_log_explicit) {
@@ -1340,9 +1415,19 @@ int main(int argc, char **argv)
                     "cst_audit: FAIL: --stats-log=%s did not carry both "
                     "completeness counters\n", stats_log_path.c_str());
                 fail = true;
+            } else {
+                /* Auto-detect found nothing.  Say so.  A check whose
+                 * subject is missing produced no verdict, and printing
+                 * nothing lets a reader of a clean audit believe Oracle 1
+                 * passed when it never ran. */
+                std::printf("\n=== COMPLETENESS (Oracle 1) ===\n"
+                            "  NOT CHECKED: no stats-log sidecar at %s\n"
+                            "  (pass --stats-log=PATH to require it)\n",
+                            stats_log_path.c_str());
             }
-            /* Auto-detected path that doesn't exist: silent, matching
-             * the auto-detection's best-effort contract. */
+        } else if (no_stats_log) {
+            std::printf("\n=== COMPLETENESS (Oracle 1) ===\n"
+                        "  NOT CHECKED: disabled on the command line\n");
         }
 
         if (fail) {

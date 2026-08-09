@@ -574,13 +574,14 @@ outside the repo as standalone scripts):
    neither counter ever reaches the wire; they exist only in the
    plugin's stderr summary and its ``<outfile>.stats.log`` sidecar, so
    no byte-level check on the trace file can see them.  This check
-   traces a short workload per ISA, reads the two counters back out of
-   the sidecar, and asserts ``dropped == trimmed`` — the invariant, not
-   "both zero": a fault-storm trace can legitimately trim many leaked
-   prefixes while dropping none, so requiring zero would false-positive
-   on exactly the traces most likely to exercise the recovery path (the
-   ``mcf_user_mipsel`` sample trace's 188,726 leak trims from the
-   mipsel ``teq``-as-syscall issue are exactly that shape).  The same
+   traces a short workload per ISA, reads the counters back out of the
+   sidecar, and asserts that **no slice was dropped** — the drop count
+   and the number of register deltas it discarded must both be zero,
+   with the end-marker-close subset included in the total rather than
+   excused from it.  A trim is a recovery and is reported for context,
+   not balanced against the drops; a sidecar that carries no
+   end-marker-close or discarded-delta breakdown fails the check rather
+   than being read as zero.  The same
    two counters, and the same verdict, are available offline to a
    consumer holding both files via ``cst_audit --stats-log=...`` (see
    :doc:`decoder`, *COMPLETENESS (Oracle 1)*).

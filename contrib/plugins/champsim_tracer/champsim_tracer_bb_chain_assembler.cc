@@ -6,6 +6,7 @@
 
 #include "champsim_tracer_bb_chain_assembler.h"
 #include "champsim_tracer_bb_template_cache.h"
+#include "champsim_tracer_stats.h"
 
 /* Per-vCPU assemblers, indexed by cpu_index (see the header comment on
  * cp_chain()).  Plain static array, same lifetime discipline as
@@ -20,12 +21,26 @@ BBChainAssembler &cp_chain(unsigned int cpu_index)
 
 std::atomic<uint32_t> g_segment_generation{1};
 
+/* Architectural instruction count currently held in flight. */
+static inline uint32_t chain_insns(const std::vector<BBTemplate *> &frags)
+{
+    uint32_t n = 0;
+    for (const BBTemplate *f : frags) {
+        n += f ? f->n_insns : 0;
+    }
+    return n;
+}
+
 bool BBChainAssembler::append_fragment(uint64_t entry_pc,
                                        BBTemplate *frag,
                                        uint64_t fall_through,
-                                       TbTerminus terminus)
+                                       TbTerminus terminus,
+                                       uint32_t *dropped_insns)
 {
     bool dropped_in_flight = false;
+    if (dropped_insns) {
+        *dropped_insns = 0;
+    }
     /*
      * On segment switch clear_bb_map() drops the unique_ptrs owning
      * fragments_'s BBTemplate*s, so a generation mismatch (bumped per
@@ -36,6 +51,9 @@ bool BBChainAssembler::append_fragment(uint64_t entry_pc,
     uint32_t cur_gen = g_segment_generation.load(std::memory_order_relaxed);
     if (my_gen_ != cur_gen) {
         dropped_in_flight = dropped_in_flight || !fragments_.empty();
+        if (dropped_insns) {
+            *dropped_insns += chain_insns(fragments_);
+        }
         fragments_.clear();
         entry_pc_ = 0;
         last_ft_ = 0;
@@ -48,12 +66,18 @@ bool BBChainAssembler::append_fragment(uint64_t entry_pc,
          * means the delay slot never contiguously followed (abnormal:
          * interrupt / segment edge). */
         dropped_in_flight = dropped_in_flight || !fragments_.empty();
+        if (dropped_insns) {
+            *dropped_insns += chain_insns(fragments_);
+        }
         fragments_.clear();
         entry_pc_ = entry_pc;
         awaiting_delay_slot_ = false;
     }
     fragments_.push_back(frag);
     last_ft_ = fall_through;
+    /* A fragment appended after a finalize() belongs to the NEXT true BB;
+     * the commit credit does not carry over to it (see reset()). */
+    finalized_ = false;
 
     /*
      * Decide whether the chain now forms a complete true BB.
@@ -89,16 +113,32 @@ BBTemplate *BBChainAssembler::finalize()
     if (entry_pc_ == 0 || fragments_.empty()) {
         return nullptr;
     }
-    return g_template_store.get_or_create_bb_template(
+    BBTemplate *bb = g_template_store.get_or_create_bb_template(
         entry_pc_, fragments_.data(), (unsigned int)fragments_.size());
+    if (bb) {
+        /* This chain's fragments became a template; the reset that follows
+         * is a commit, not a loss.  See reset(). */
+        finalized_ = true;
+    }
+    return bb;
 }
 
 void BBChainAssembler::reset()
 {
+    /* A reset that has not been preceded by a successful finalize() throws
+     * live fragments away — they will never be emitted.  Count it; the
+     * commit case (finalize() then reset()) is not a loss and is not
+     * counted. */
+    if (!finalized_ && !fragments_.empty()) {
+        g_stats.reg_snap_chain_reset_drops++;
+        g_stats.reg_snap_chain_reset_frags += fragments_.size();
+        g_stats.reg_snap_chain_reset_insns += chain_insns(fragments_);
+    }
     entry_pc_ = 0;
     last_ft_ = 0;
     awaiting_delay_slot_ = false;
     bb_complete_ = false;
+    finalized_ = false;
     fragments_.clear();
 }
 
@@ -110,6 +150,7 @@ BBChainAssembler::ChainState BBChainAssembler::detach_state()
     s.my_gen = my_gen_;
     s.awaiting_delay_slot = awaiting_delay_slot_;
     s.bb_complete = bb_complete_;
+    s.finalized = finalized_;
     s.fragments = std::move(fragments_);
     /* Leave *this in the reset state (fragments_ is moved-from -> cleared
      * below to be definite); a fresh chain starts cleanly after a detach. */
@@ -118,6 +159,7 @@ BBChainAssembler::ChainState BBChainAssembler::detach_state()
     last_ft_ = 0;
     awaiting_delay_slot_ = false;
     bb_complete_ = false;
+    finalized_ = false;
     return s;
 }
 
@@ -128,5 +170,6 @@ void BBChainAssembler::attach_state(ChainState &&s)
     my_gen_ = s.my_gen;
     awaiting_delay_slot_ = s.awaiting_delay_slot;
     bb_complete_ = s.bb_complete;
+    finalized_ = s.finalized;
     fragments_ = std::move(s.fragments);
 }

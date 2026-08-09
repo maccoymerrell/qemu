@@ -1211,9 +1211,25 @@ void PathBuilder::flush_final(bool walk_prev)
                 }
             }
 
-            cp_chain(cpu_index_).append_fragment(frag->start_pc, frag,
-                                       frag->fall_through_pc,
-                                       (TbTerminus)frag->terminus);
+            /* This walk is the SEGMENT-CLOSE walk — the one every
+             * marker-window run finishes through — and it discarded
+             * append_fragment's drop verdict, so "CP chains dropped on
+             * discontinuity" (bumped only at the per-exec seal's
+             * cp_chain_append) could not see a drop here however often it
+             * happened.  Record it.  Counting only: the positional sink is
+             * deliberately left untouched, so this instrument does not also
+             * change what reaches the wire.  The orphan figure is the sink's
+             * whole depth at the drop — an upper bound on what the dropped
+             * fragments left behind, since this walk keeps no snap mark. */
+            uint32_t flush_dropped_insns = 0;
+            if (cp_chain(cpu_index_).append_fragment(
+                    frag->start_pc, frag, frag->fall_through_pc,
+                    (TbTerminus)frag->terminus, &flush_dropped_insns)) {
+                g_stats.reg_snap_chain_drops_flush++;
+                g_stats.reg_snap_chain_flush_orphaned +=
+                    pending_reg_snaps(cpu_index_).size();
+                g_stats.reg_snap_chain_flush_insns += flush_dropped_insns;
+            }
             if (cp_chain(cpu_index_).bb_complete() && cp_chain(cpu_index_).has_active_chain()) {
                 BBTemplate *bb_tmpl = cp_chain(cpu_index_).finalize();
                 cp_chain(cpu_index_).reset();

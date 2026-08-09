@@ -175,3 +175,36 @@ Read `docs/architecture.rst` for the full picture; the key load-bearing pieces:
 
 Active dev branch: **`champsim-trace`** (PRs against `master`, which is the QEMU base). The user's fork
 lives at `github.com/maccoymerrell/qemu`.
+
+### The branch is the only source of truth — work ratchets onto it
+
+This is not a style preference. Work once spread across ~130 checkouts and a dozen branches, passed
+worktree-to-worktree instead of landing, until nobody could say which tree was current. Fixes were
+"done" in three places and on the branch in none, and several were nearly lost. The rules below exist
+so that cannot recur.
+
+1. **Base every piece of work on `champsim-trace`.** Not on another worktree, not on `origin`
+   (`origin` is upstream QEMU and does not contain the plugin at all — an agent worktree branched
+   from it silently gets a tree with no `contrib/plugins/champsim_tracer`). `.claude/settings.local.json`
+   sets `worktree.baseRef: head` so agent worktrees branch from the local HEAD; verify anyway.
+
+2. **Prefer working directly in `/mnt/md0/QEMU/qemu`.** Use a worktree only when parallel agents would
+   otherwise collide on the same files, and create it explicitly from `champsim-trace`, naming the base
+   sha in the report.
+
+3. **Land it or lose it.** A worktree is scratch space, never a holding pen. When a change builds and
+   its check passes, commit it to `champsim-trace` in that session. Never hand uncommitted work to the
+   next worktree — that is exactly how the mess formed.
+
+4. **State the base sha when starting, and re-sync before landing.** An agent that began hours ago is
+   working against a stale tree; rebase onto the current tip before committing rather than merging a
+   diff that silently reverts someone else's landed fix.
+
+5. **Every agent brief must say which tree to use and how to prove it.** A verification the agent runs
+   itself, e.g.:
+   `test -d contrib/plugins/champsim_tracer && git rev-parse --abbrev-ref HEAD` — and it must STOP and
+   report if the tree is wrong rather than working around it.
+
+6. **Before deleting any checkout, prove nothing unique is in it.** `git patch-id --stable` against the
+   merged equivalent for commits, and archive the working diff. Subjects and commit messages are not
+   proof — rebased copies share both.

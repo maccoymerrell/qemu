@@ -646,6 +646,21 @@ struct CPUState {
     /* Use by accel-block: CPU is executing an ioctl() */
     QemuLockCnt in_ioctl_lock;
 
+    /*
+     * True while this vCPU is executing a plugin-driven wrong-path
+     * (speculative) excursion.  Declared unconditionally, outside
+     * CONFIG_PLUGIN, because the target and accelerator side effects it
+     * suppresses are spread across ~20 translation units that read it from
+     * plain architectural code paths (IRQ-line raises, timer re-arms, FERR#
+     * assertion, TLB fills, ...).  Guarding each of those reads would put a
+     * preprocessor conditional in the middle of otherwise ordinary target
+     * logic; one always-present bool that is only ever set by the plugin
+     * layer keeps those sites readable and keeps --disable-plugins building.
+     * With CONFIG_PLUGIN undefined nothing can set it, so every such site
+     * folds to its normal behaviour.
+     */
+    bool plugin_spec_mode;
+
 #ifdef CONFIG_PLUGIN
     CPUPluginState *plugin_state;
 
@@ -761,8 +776,8 @@ struct CPUState {
      * collapses to a memcpy + mask update.  Lines are bump-allocated
      * from plugin_spec_store_pool so spec_mode_end can release
      * entries by truncating the pool without per-line g_free traffic.
-     * Hash value type is PluginSpecLine* (see plugin-spec.h). */
-    bool plugin_spec_mode;
+     * Hash value type is PluginSpecLine* (see plugin-spec.h).
+     * plugin_spec_mode itself lives outside CONFIG_PLUGIN (see above). */
     GHashTable *plugin_spec_store_buf;        /* line_addr -> PluginSpecLine* */
     void *plugin_spec_store_pool;             /* PluginSpecLine[] */
     size_t plugin_spec_store_pool_used;       /* high water in pool */

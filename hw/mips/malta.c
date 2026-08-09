@@ -1039,6 +1039,32 @@ static void create_cpu_without_cps(MachineState *ms, MaltaState *s,
         cpu = mips_cpu_create_with_clock(ms->cpu_type, s->cpuclk,
                                          TARGET_BIG_ENDIAN);
 
+        /*
+         * malta_mips_config() advertises these vCPUs to the guest as the VPEs
+         * of ONE processor (MVPConf0.PVPE = smp_cpus - 1, PTC likewise), and
+         * MIPS MT defines MVPControl as a single per-processor register that
+         * every VPE of that processor shares.  Each MIPSCPU allocates its own
+         * CPUMIPSMVPContext (mvp_init()), so hand every VPE after the first a
+         * pointer to VPE 0's.
+         *
+         * With private copies the guest's dvpe()/evpe(prev) nesting protocol
+         * breaks: helper_dvpe() clears MVPControl.EVP in every OTHER vCPU's
+         * copy but not its own, and mips_vpe_sleep() only sets ->halted, which
+         * a vCPU already inside a TB does not observe until the top of
+         * cpu_exec().  Two overlapping critical sections therefore destroy
+         * `prev` -- the second VPE reads its own EVP as already 0, so Linux
+         * skips its evpe(), and nothing ever restores the first VPE's bit.
+         * A VPE left with EVP clear fails mips_vpe_active(), which makes
+         * mips_cpu_has_work() force has_work = false, so it never wakes out of
+         * WAIT again even with CPU_INTERRUPT_HARD set and an enabled timer
+         * interrupt pending.  Observed as a ~2-in-3 early-boot wedge on
+         * `-M malta -cpu 34Kf -smp 4` with a Linux 6.6 vsmp (MIPS MT) guest.
+         */
+        if (i > 0) {
+            g_free(cpu->env.mvp);
+            cpu->env.mvp = MIPS_CPU(first_cpu)->env.mvp;
+        }
+
         /* Init internal devices */
         cpu_mips_irq_init_cpu(cpu);
         cpu_mips_clock_init(cpu);

@@ -37,8 +37,10 @@ void cpu_plugin_arch_state_restore(void *saved, size_t size);
  * no-ops in user-mode emulation.  Called from the common plugins/api.c, which
  * itself must not reference softmmu-only symbols directly.
  */
+#ifdef CONFIG_PLUGIN
 void cpu_plugin_spec_vtime_pause(CPUState *cpu);
 void cpu_plugin_spec_vtime_resume(CPUState *cpu);
+#endif
 
 /**
  * SpecClockResyncReason: which plugin clock freeze just ended
@@ -69,9 +71,9 @@ typedef enum SpecClockResyncReason {
      */
     SPEC_CLOCK_THAW,
 } SpecClockResyncReason;
+#ifdef CONFIG_PLUGIN
 void cpu_plugin_spec_tlb_flush(CPUState *cpu);
 void cpu_plugin_spec_tlb_flush_enter(CPUState *cpu);
-#ifdef CONFIG_PLUGIN
 /*
  * Excursion-scoped softmmu TLB bookkeeping: _note snapshots the per-mmu_idx
  * large-page escalation region at entry; _flush_logged invalidates exactly the
@@ -79,10 +81,10 @@ void cpu_plugin_spec_tlb_flush_enter(CPUState *cpu);
  */
 void cpu_plugin_spec_tlb_note(CPUState *cpu);
 void cpu_plugin_spec_tlb_flush_logged(CPUState *cpu);
-#endif
 bool cpu_plugin_spec_mode_supported(void);
 void cpu_plugin_vclock_pause(CPUState *cpu);
 void cpu_plugin_vclock_resume(CPUState *cpu);
+#endif /* CONFIG_PLUGIN */
 
 #define REAL_HOST_PAGE_ALIGN(addr) ROUND_UP((addr), qemu_real_host_page_size())
 

@@ -265,6 +265,26 @@ static inline void *spec_atomic_shadow(CPUState *cpu, vaddr addr,
     line->valid_mask |= span;
     return &line->bytes[idx];
 }
+
+#else /* !CONFIG_PLUGIN */
+
+/*
+ * Without plugin support there is no speculative mode, so the two predicates
+ * the accelerator's memory paths consult are compile-time false.  Defining
+ * them here rather than guarding each call site keeps cputlb.c / user-exec.c
+ * free of preprocessor conditionals in otherwise ordinary softmmu logic, and
+ * lets the compiler delete the guarded branches outright.
+ */
+static inline bool cpu_plugin_spec_active(CPUState *cpu)
+{
+    return false;
+}
+
+static inline bool cpu_plugin_spec_redirect_probe(CPUState *cpu)
+{
+    return false;
+}
+
 #endif /* CONFIG_PLUGIN */
 
 #endif

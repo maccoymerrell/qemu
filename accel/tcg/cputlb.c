@@ -1100,6 +1100,7 @@ static void plugin_spec_tlb_log_add(CPUState *cpu, int mmu_idx, vaddr page,
 }
 #endif
 
+#ifdef CONFIG_PLUGIN
 static vaddr g_spec_lp_addr[NB_MMU_MODES];
 static vaddr g_spec_lp_mask[NB_MMU_MODES];
 static bool  g_spec_lp_saved;
@@ -1154,6 +1155,7 @@ void cpu_plugin_spec_tlb_flush_logged(CPUState *cpu)
     }
     qemu_spin_unlock(&tlb->c.lock);
 }
+#endif /* CONFIG_PLUGIN */
 
 /*
  * Add a new TLB entry. At most one entry for a given virtual address

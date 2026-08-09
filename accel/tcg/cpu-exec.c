@@ -1735,7 +1735,11 @@ static void cpu_plugin_clock_resync(CPUState *cpu, SpecClockResyncReason why)
  * per-target so CONFIG_USER_ONLY selects the no-op forms; the common
  * plugins/api.c calls these rather than referencing tlb_flush /
  * cpu_disable_ticks directly (which are not linked into user-mode binaries).
+ *
+ * The whole family is CONFIG_PLUGIN-only: plugins/api.c is its sole caller,
+ * and the CPUState fields it manipulates live inside the same guard.
  */
+#ifdef CONFIG_PLUGIN
 void cpu_plugin_spec_vtime_pause(CPUState *cpu)
 {
 #ifndef CONFIG_USER_ONLY
@@ -2111,6 +2115,7 @@ bool cpu_plugin_spec_mode_supported(void)
     return false;
 #endif
 }
+#endif /* CONFIG_PLUGIN */
 
 void tb_set_jmp_target(TranslationBlock *tb, int n, uintptr_t addr)
 {

@@ -2088,6 +2088,40 @@ ptrdiff_t PathBuilder::frame_idx_for_completion(const BBTemplate *suffix,
  * (TLB refill then demand fault is ONE faulting instruction). */
 void PathBuilder::collect_piece(CtxFrame &f, uint64_t resume_pc)
 {
+    /*
+     * THE ABORTED ATTEMPT THIS PIECE ENDS IS NOT RETIRED WORK.
+     *
+     * A pushed fault always re-executes its faulting instruction, so the
+     * attempt just stashed started instructions that will run again: the
+     * per-instruction insn_started slot counted them, the window clock
+     * folded them at the top of this very dispatch, and the merge will put
+     * the block on the wire exactly ONCE.  Take back precisely the
+     * re-attempted span — (instructions started in the attempt) minus (the
+     * index the handler resumes at inside that same attempt).  It is 1 for
+     * an ordinary data fault and 2 on a MIPS branch-delay-slot fault, where
+     * EPC names the branch and the delay slot re-executes with it; nothing
+     * here assumes either number.
+     *
+     * @walk_prev_ IS the aborted attempt (the deferred prev this piece is
+     * being taken from), and it is the TB the retired cursor just measured,
+     * so both operands are exact.  A seal deferred past its own dispatch has
+     * no delta of its own; retired_executed_prev says so and the correction
+     * is skipped rather than guessed.
+     */
+    if (walk_prev_) {
+        uint64_t started = 0;
+        if (retired_executed_prev(cpu_index_, walk_prev_, &started)) {
+            uint32_t k = tb_head_insn_index(walk_prev_, resume_pc);
+            if (k != UINT32_MAX && started > k) {
+                user_clock_fault_recredit(cpu_index_, started - k);
+            } else {
+                g_stats.user_clock_fault_recredit_unplaced++;
+            }
+        } else {
+            g_stats.user_clock_fault_recredit_unmeasured++;
+        }
+    }
+
     std::vector<WPMemAccess> piece_mem;
     g_mem_recorder.take_cp(cpu_index_, piece_mem);
     /* Fault-split self-loop prefix: when the faulting instruction IS the

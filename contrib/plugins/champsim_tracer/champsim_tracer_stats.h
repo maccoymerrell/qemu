@@ -304,7 +304,36 @@ struct Stats {
      * measured rather than assumed.  Must be 0. */
     uint64_t user_clock_retired_over_tb = 0;
     uint64_t user_clock_retired_over_insns = 0;
-/* Templates minted for blocks the guest ENTERED AND DID NOT FINISH (see
+    /*
+     * THE RE-CREDIT insn_started's contract promises.
+     *
+     * The slot counts instructions BEGUN.  Every mid-flight abandonment the
+     * guest takes re-runs the instruction it abandoned, so that instruction
+     * is counted twice while it retires once:
+     *
+     *   user_clock_fault_recredit* — a re-executing FAULT.  QEMU pushes a
+     *     FAULT_ENTER only for those, and the merge emits the faulting block
+     *     whole exactly once, so the bill is over by (instructions started
+     *     in the aborted attempt) - (the index the handler resumes at): 1
+     *     for an ordinary data fault, 2 on a MIPS branch-delay-slot fault.
+     *   user_clock_abort_recredit* — an abandonment with NO exception
+     *     (cpu_io_recompile, cpu_loop_exit_atomic, a MOPS / REP re-entry),
+     *     recognised at the fold by the guest standing on the abandoned
+     *     instruction for its re-execution.  Always exactly 1.
+     *
+     * The two *unplaced / *unmeasured counters are the correction's own
+     * blind spots, named rather than absorbed: a resume PC that is not an
+     * instruction of the attempt, and a seal deferred past its own dispatch
+     * (no retired delta of its own to read).  Both leave the clock reading
+     * high by the amount they could not place.
+     */
+    uint64_t user_clock_fault_recredits = 0;
+    uint64_t user_clock_fault_recredit_insns = 0;
+    uint64_t user_clock_fault_recredit_unplaced = 0;
+    uint64_t user_clock_fault_recredit_unmeasured = 0;
+    uint64_t user_clock_abort_recredits = 0;
+    uint64_t user_clock_abort_recredit_insns = 0;
+    /* Templates minted for blocks the guest ENTERED AND DID NOT FINISH (see
      * TemplateStore::commit_partial_bb).  Keyed by extent, so repeated cuts
      * at the same point share one; a run where nothing is ever cut short
      * mints none. */

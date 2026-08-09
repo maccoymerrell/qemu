@@ -751,6 +751,10 @@ static uint64_t g_retired_tb_base[CST_PIN_MAX_VCPUS];
 static const BBTemplate *g_retired_tb_head[CST_PIN_MAX_VCPUS];
 static const BBTemplate *g_retired_prev_head[CST_PIN_MAX_VCPUS];
 static uint64_t g_retired_prev_executed[CST_PIN_MAX_VCPUS];
+/* Was the delta folded at THIS dispatch actually billed to the window
+ * clock?  Read by the fault re-credit, which runs later in the same step,
+ * after g_retired_owner_owned has been re-armed for the current dispatch. */
+static bool     g_retired_prev_billed[CST_PIN_MAX_VCPUS];
 
 static inline unsigned retired_slot(unsigned int cpu_index)
 {
@@ -790,6 +794,22 @@ static inline uint64_t tb_head_insn_pc_at(const BBTemplate *head, uint32_t idx)
         idx -= f->n_insns;
     }
     return 0;
+}
+
+/* Index of @pc among the instructions of the dispatched TB @head, or
+ * UINT32_MAX when @pc is not one of them. */
+uint32_t tb_head_insn_index(const BBTemplate *head, uint64_t pc)
+{
+    uint32_t base = 0;
+    for (const BBTemplate *f = head; f; f = f->next_tb_fragment) {
+        for (uint32_t i = 0; i < f->n_insns; i++) {
+            if (f->insn_pcs && f->insn_pcs[i] == pc) {
+                return base + i;
+            }
+        }
+        base += f->n_insns;
+    }
+    return UINT32_MAX;
 }
 
 /* Instructions this vCPU has completed, live. */
@@ -905,6 +925,49 @@ bool retired_executed_prev(unsigned int cpu_index, const BBTemplate *head,
     uint32_t cap = tb_head_insns(head);
     *out = n > cap ? cap : n;
     return true;
+}
+
+/*
+ * THE WINDOW CLOCK MUST NOT BILL A FAULT'S ABORTED ATTEMPT.
+ *
+ * QEMU pushes a FAULT_ENTER only for a RE-EXECUTING fault (see
+ * cpu_plugin_fault_push, include/hw/core/cpu.h: "Every pushed fault
+ * re-executes its faulting instruction").  insn_started counts instructions
+ * BEGUN, so the aborted attempt's instructions are already in the delta the
+ * previous dispatch folded, and they are counted AGAIN when the handler
+ * returns and they re-execute — while the merge puts the faulting block on
+ * the wire exactly once, whole.  The clock therefore over-reads by exactly
+ * the instructions RE-ATTEMPTED: one for an ordinary data fault, and two on
+ * a MIPS branch-delay-slot fault (EPC names the branch, Cause.BD=1, so the
+ * branch AND its delay slot re-execute).
+ *
+ * This is the correction VCPUScoreBoard::insn_started's own contract has
+ * named since the slot was minted and that was never written.  It is applied
+ * where the fault is OBSERVED — the amount is (instructions started in the
+ * aborted attempt) minus (the index the handler resumes at), and both
+ * operands are only in hand there.
+ *
+ * @insns is that amount.  It is subtracted from the clock only when the
+ * aborted attempt was actually billed; a saturating subtract keeps a clock
+ * that a reset has already zeroed from wrapping.
+ */
+void user_clock_fault_recredit(unsigned int cpu_index, uint64_t insns)
+{
+    if (insns == 0 || !g_retired_prev_billed[retired_slot(cpu_index)]) {
+        return;
+    }
+    if (insns > g_user_icount) {
+        insns = g_user_icount;
+    }
+    g_user_icount -= insns;
+    if (g_deadlatch_checked_uic > g_user_icount) {
+        g_deadlatch_checked_uic = g_user_icount;
+    }
+    if (g_stats.user_clock_retired_insns >= insns) {
+        g_stats.user_clock_retired_insns -= insns;
+    }
+    g_stats.user_clock_fault_recredits++;
+    g_stats.user_clock_fault_recredit_insns += insns;
 }
 
 /*
@@ -7374,6 +7437,44 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
     const bool prev_dispatch_owned =
         g_retired_owner_owned[retired_slot(cpu_index)];
 
+    /*
+     * AN ABORTED ATTEMPT IS NOT A RETIREMENT.
+     *
+     * insn_started is a per-instruction add emitted at the TOP of the
+     * instruction's translated code, so it counts instructions BEGUN.  Every
+     * mid-TB abandonment QEMU takes without an exception rewinds to the
+     * abandoned instruction and RE-EXECUTES it — cpu_loop_exit_atomic's
+     * serial re-run, a MOPS / REP re-entry — so its add fires twice while
+     * the instruction retires once.  The guest says so by where it is
+     * standing: control on insn[delta-1] of the TB just abandoned means that
+     * instruction did not retire here.  Take it back before the fold, not
+     * after, so the window clock counts retirements and nothing downstream
+     * has to know the slot is approximate.
+     *
+     * The device-MMIO rewind is deliberately NOT in this set: its re-run is
+     * a CF_MEMI_ONLY TB whose non-memory instrumentation plugins/api.c
+     * suppresses, so the add fires once, current_pc never names the rewound
+     * instruction, and the predicate below correctly stays silent.
+     */
+    {
+        const BBTemplate *prev_head =
+            g_retired_prev_head[retired_slot(cpu_index)];
+        uint32_t prev_total = tb_head_insns(prev_head);
+        if (delta_retired > 0 && delta_retired < prev_total && cur_tb_tmpl &&
+            tb_head_insn_pc_at(prev_head, (uint32_t)(delta_retired - 1)) ==
+                cur_tb_tmpl->start_pc) {
+            delta_retired--;
+            g_stats.user_clock_abort_recredits++;
+            g_stats.user_clock_abort_recredit_insns++;
+        }
+    }
+    /* Whether the delta folded at THIS dispatch was billed to the window
+     * clock.  The fault observation, which runs later in this same step,
+     * needs it: g_retired_owner_owned is re-armed for the CURRENT dispatch
+     * below, and a re-credit against a bill that was never taken would run
+     * the clock backwards. */
+    g_retired_prev_billed[retired_slot(cpu_index)] = false;
+
     /* Address-space pin + count set (marker mode only — pinned !=
      * UNPINNED).  The inline-add counts every TB; here we fold this TB's
      * instruction count (the delta of consecutive insn_count reads) into
@@ -7528,6 +7629,7 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
         if (prev_dispatch_owned) {
             g_user_icount += delta_retired;
             g_stats.user_clock_retired_insns += delta_retired;
+            g_retired_prev_billed[retired_slot(cpu_index)] = true;
             /* The retired delta has the same exposure @delta has: anything
              * that executes between two dispatches WITHOUT being dispatched
              * itself (a context the trace_this_ctx gate skips) lands in it.

@@ -216,6 +216,15 @@ bool retired_executed_of(unsigned int cpu_index, const BBTemplate *head,
 bool retired_executed_prev(unsigned int cpu_index, const BBTemplate *head,
                            uint64_t *out);
 
+/* Index of @pc among the instructions of the dispatched TB whose head is
+ * @head (fragments walked in execution order), or UINT32_MAX. */
+uint32_t tb_head_insn_index(const BBTemplate *head, uint64_t pc);
+
+/* Take @insns back off the window clock: a re-executing fault's aborted
+ * attempt was billed by insn_started and the instructions it aborted are
+ * about to run again.  See the definition in champsim_tracer.cc. */
+void user_clock_fault_recredit(unsigned int cpu_index, uint64_t insns);
+
 /*
  * ---- PathBuilder proper ----
  */

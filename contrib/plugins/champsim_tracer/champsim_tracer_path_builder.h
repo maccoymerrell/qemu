@@ -210,6 +210,12 @@ size_t &cp_chain_snap_mark(unsigned int cpu_index);
 bool retired_executed_of(unsigned int cpu_index, const BBTemplate *head,
                          uint64_t *out);
 
+/* The same, asked specifically of the PREVIOUS dispatch — the only sound
+ * question for a per-execution reader, because a self-branching TB occupies
+ * both dispatch slots at once.  See the definition in champsim_tracer.cc. */
+bool retired_executed_prev(unsigned int cpu_index, const BBTemplate *head,
+                           uint64_t *out);
+
 /*
  * ---- PathBuilder proper ----
  */

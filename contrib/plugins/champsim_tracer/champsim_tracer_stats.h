@@ -304,7 +304,7 @@ struct Stats {
      * measured rather than assumed.  Must be 0. */
     uint64_t user_clock_retired_over_tb = 0;
     uint64_t user_clock_retired_over_insns = 0;
-    /* Templates minted for blocks the guest ENTERED AND DID NOT FINISH (see
+/* Templates minted for blocks the guest ENTERED AND DID NOT FINISH (see
      * TemplateStore::commit_partial_bb).  Keyed by extent, so repeated cuts
      * at the same point share one; a run where nothing is ever cut short
      * mints none. */
@@ -322,6 +322,36 @@ struct Stats {
      * land on; anything else is an unmeasured close and this is the only
      * thing standing between it and a silent over-claim.  Must be 0. */
     uint64_t close_walk_extent_unknown = 0;
+    /* The same three quantities for the PER-EXECUTION seal walk
+     * (collect_finalized_bbs).  A guest instruction that touches device
+     * MMIO from anywhere but its TB's last slot, an atomic that needs
+     * serial execution, a MOPS / REP re-entry — each abandons the TB with
+     * NO exception (cpu_io_recompile -> cpu_loop_exit_noexc and friends), so
+     * no fault or async event exists and the seal used to fold the fragment
+     * at its full translated length: instructions the dispatch never ran
+     * reached the wire, the next block re-covered them, and the short
+     * reg-snap slice was thrown away wholesale by the emit-time backstop.
+     *
+     * seal_walk_aborted_tails is the subset where the abandoned instruction
+     * had already STARTED (its insn_started add fired) and the guest is
+     * standing on it for the re-execution — i.e. where the retired cursor
+     * had to be read one short.  Unlike the close walk's, these do NOT have
+     * to be zero: they are the condition being handled, and a run through
+     * kernel device code has them.  What must be zero is what they used to
+     * cost — reg_snap_slice_dropped and the wire's duplicate instructions.
+     *
+     * seal_walk_extent_unknown is not a defect either: a seal DEFERRED past
+     * its own dispatch (a foreign or async span bailed the step before the
+     * promote) has no retired delta of its own to read, and the walk then
+     * behaves exactly as it did before — full extent, no truncation.  Full
+     * extent is also the RIGHT answer there, by the same argument the
+     * prev_start fallback rests on: an interrupt or a foreign span is taken
+     * at a TB boundary, so a prev that is still pending at a later dispatch
+     * ran to its end. */
+    uint64_t seal_walk_blocks_truncated = 0;
+    uint64_t seal_walk_insns_not_executed = 0;
+    uint64_t seal_walk_aborted_tails = 0;
+    uint64_t seal_walk_extent_unknown = 0;
 
     /* Self-loop fan-out: where the iteration count came from.
      *

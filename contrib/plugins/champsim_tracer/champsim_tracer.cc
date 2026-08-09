@@ -767,6 +767,31 @@ static inline uint32_t tb_head_insns(const BBTemplate *head)
     return n;
 }
 
+/*
+ * The PC of the @idx'th instruction of a whole dispatched TB, walking its
+ * fragment list in execution order.  0 when @idx is past the TB's end.
+ *
+ * Used to ask the one question the retired cursor cannot answer on its own:
+ * insn_started counts instructions BEGUN, so a TB the guest abandoned
+ * part-way has already counted the instruction it abandoned.  Control
+ * standing on insn[started-1] means QEMU rewound to that instruction and is
+ * re-running it in an ORDINARY instrumented TB, whose own add is about to
+ * count it a second time — so it did not retire in this dispatch.  (The
+ * device-MMIO re-run is the exception and needs no correction: it happens in
+ * a CF_MEMI_ONLY TB, whose non-memory instrumentation plugins/api.c
+ * suppresses, so it neither re-adds nor moves current_pc.)
+ */
+static inline uint64_t tb_head_insn_pc_at(const BBTemplate *head, uint32_t idx)
+{
+    for (const BBTemplate *f = head; f; f = f->next_tb_fragment) {
+        if (idx < f->n_insns) {
+            return f->insn_pcs ? f->insn_pcs[idx] : 0;
+        }
+        idx -= f->n_insns;
+    }
+    return 0;
+}
+
 /* Instructions this vCPU has completed, live. */
 static inline uint64_t retired_now(unsigned int cpu_index)
 {
@@ -851,6 +876,32 @@ bool retired_executed_of(unsigned int cpu_index, const BBTemplate *head,
     } else {
         return false;
     }
+    uint32_t cap = tb_head_insns(head);
+    *out = n > cap ? cap : n;
+    return true;
+}
+
+/*
+ * The same question asked SPECIFICALLY of the previous dispatch.
+ *
+ * retired_executed_of accepts either dispatch position because a segment
+ * close can land on either side of the promote.  A per-execution reader
+ * cannot: a TB that BRANCHES TO ITSELF — every tight single-block loop — is
+ * the previous dispatch AND the current one, the same BBTemplate pointer in
+ * both slots, and the "current" arm answers with the in-flight count of the
+ * dispatch that has only just begun, which is zero.  A seal walk that
+ * believed that would emit nothing for the loop body and leave its captured
+ * dst snaps in the positional sink as the next block's leaked prefix.
+ * Returns false unless @head really is the previous dispatch's TB.
+ */
+bool retired_executed_prev(unsigned int cpu_index, const BBTemplate *head,
+                           uint64_t *out)
+{
+    unsigned s = retired_slot(cpu_index);
+    if (!head || head != g_retired_prev_head[s]) {
+        return false;
+    }
+    uint64_t n = g_retired_prev_executed[s];
     uint32_t cap = tb_head_insns(head);
     *out = n > cap ? cap : n;
     return true;
@@ -5941,11 +5992,25 @@ void emit_finalized_bb(BodyStreamState *out_stream,
  * run yet).  The one exception is the branch's PC dst, which a goto_tb
  * chain leaves stale in env->eip; it is taken from @current_pc (the
  * known successor) instead of the live read — see the loop body.
+ *
+ * @ran is how many of the fragment's instructions RETIRED (its whole
+ * n_insns on the ordinary path).  @aborted_tail says the instruction
+ * AFTER the cut started — its own pre-exec callback already captured
+ * insn[ran-1], so nothing is missing and this must capture nothing.  The
+ * capture is always one behind: with S instructions started, the per-insn
+ * hooks have covered insn[0..S-2], so the range still owed is
+ * [S-1, ran-1] — a single instruction when the tail retired, and empty
+ * when it was abandoned mid-flight and will be re-executed.
  */
 static void snap_prev_tail_dsts(unsigned int cpu_index,
                                 const BBTemplate *tmpl,
-                                uint64_t current_pc)
+                                uint64_t current_pc,
+                                uint32_t ran,
+                                bool aborted_tail)
 {
+    if (aborted_tail || ran == 0) {
+        return;
+    }
     if (g_features.reg_data && tmpl->insn_reg_names &&
         tmpl->n_insns > 0 &&
         g_trace_segments.is_active_atomic()) {
@@ -5959,9 +6024,14 @@ static void snap_prev_tail_dsts(unsigned int cpu_index,
          * goto_tb successor override.  Capture the branch (n-2) first,
          * then the delay slot (n-1) — matching execution and template
          * order.  The override fires only on the branch's REG_IP dst,
-         * so applying it in both passes is correct on every ISA. */
-        uint32_t last = tmpl->n_insns - 1;
-        bool delay_slot_tail = tmpl->n_insns >= 2 &&
+         * so applying it in both passes is correct on every ISA.
+         *
+         * A TRUNCATED fragment stops before that tail, so the deferred
+         * branch snap cannot be owed here: every instruction below the cut
+         * had its snap taken by its successor's callback and only
+         * insn[ran-1] is missing. */
+        uint32_t last = ran - 1;
+        bool delay_slot_tail = ran == tmpl->n_insns && ran >= 2 &&
             tmpl->insn_fields[last - 1].branch_type != BRANCH_NONE &&
             tmpl->insn_fields[last].branch_type == BRANCH_NONE;
         auto capture_tail = [&](uint32_t idx) {
@@ -5998,20 +6068,25 @@ static void snap_prev_tail_dsts(unsigned int cpu_index,
  * once — the g_stats macro re-resolves the TLS slot via __tls_get_addr
  * each expansion, and this loop bumps it up to 4×n_insns.
  */
-static void attribute_cp_insns(const BBTemplate *tmpl)
+static void attribute_cp_insns(const BBTemplate *tmpl, uint32_t ran)
 {
     Stats &s = thread_stats_get();
     Stats *h = g_current_hist_bucket;
+    if (ran > tmpl->n_insns) {
+        ran = tmpl->n_insns;
+    }
     /* Third point in the window-clock accounting chain (see the Stats block
      * on user_clock_billed_insns): what the SEAL WALK saw, between what the
      * clock billed at dispatch and what emission put on the wire.  Two gaps
      * instead of one residual — a fragment lost before the seal walk and an
      * assembled block lost between the seal and the emit are different
-     * defects and were previously indistinguishable. */
+     * defects and were previously indistinguishable.  @ran is the extent
+     * that RETIRED, so a fragment the guest abandoned part-way attributes
+     * only the instructions it ran. */
     if (!tmpl->is_system) {
-        s.cp_user_seal_insns += tmpl->n_insns;
+        s.cp_user_seal_insns += ran;
     }
-    for (uint32_t i = 0; i < tmpl->n_insns; i++) {
+    for (uint32_t i = 0; i < ran; i++) {
         const InsnFields *f = &tmpl->insn_fields[i];
         s.cp_insns_by_opcode[f->opcode]++;
         if (h) h->cp_insns_by_opcode[f->opcode]++;
@@ -6456,6 +6531,72 @@ bool collect_finalized_bbs(unsigned int cpu_index,
      * takes data_lock itself, so it cannot run inside this region. */
     std::vector<uint64_t> alt_pcs;
 
+    /*
+     * HOW MUCH OF THE DISPATCHED TB ACTUALLY RAN.
+     *
+     * A dispatched TB is not a promise that its instructions execute.  QEMU
+     * abandons one mid-flight with NO exception whenever an instruction that
+     * is not the TB's last needs to be re-run on its own: a device-MMIO
+     * access (translator.c clears can_do_io for every instruction of a
+     * multi-instruction TB except the last, so io_prepare() takes
+     * cpu_io_recompile() -> cpu_restore_state_from_tb() +
+     * cpu_loop_exit_noexc()), an atomic that needs serial execution
+     * (cpu_loop_exit_atomic), a MOPS / REP re-entry.  The already-executed
+     * prefix is architecturally retired, the abandoned instruction is
+     * rewound and re-executed, and control continues in a fresh TB.  There
+     * is no exception, so no fault or async event exists and the fault
+     * machinery cannot see it.
+     *
+     * @prev_start resolves the last-executed FRAGMENT and says NOTHING about
+     * how far into it the guest got, so this walk used to fold the fragment
+     * at its full TRANSLATED length.  Two losses followed from the one
+     * omission: the entry claimed instructions this dispatch never ran (and
+     * the following block re-covered them, so the wire DUPLICATED them), and
+     * the positional reg-snap sink held only the prefix that ran plus one or
+     * two BOGUS tail snaps read for instructions that never executed —
+     * pending != Sum(n_dst_regs), which made the emit-time backstop discard
+     * the entry's WHOLE register slice.
+     *
+     * The segment-close walk already asks this question
+     * (PathBuilder::flush_final); the per-execution seal never did.  It is
+     * the same instrument and the same answer.
+     *
+     * insn_started counts instructions BEGUN, so the abandoned instruction
+     * is already in @started.  Whether it RETIRED depends on how QEMU re-runs
+     * it, and the guest itself says which case this is.
+     *
+     *   DEVICE MMIO.  The re-run is a one-instruction CF_MEMI_ONLY TB, and
+     *   plugins/api.c refuses every non-memory instrumentation request on
+     *   such a TB (tb_is_mem_only): no tb-exec callback, no current_pc
+     *   store, no insn_started add — only the memory callback, which is
+     *   always planted.  So the add fired exactly once, for an instruction
+     *   that really does complete, and @started is already the retired
+     *   count.  @current_pc is the TB after the re-run, i.e. the
+     *   instruction's true successor, and the block is exact at @started.
+     *
+     *   EVERY OTHER MID-FLIGHT ABANDON (cpu_loop_exit_atomic's serial
+     *   re-run, a MOPS / REP re-entry, a case-(c) fault whose resume PC
+     *   substitutes for the successor).  The re-run is an ordinary
+     *   instrumented TB entered AT the abandoned instruction, so the guest
+     *   is standing on insn[started-1] and its add is about to fire a second
+     *   time.  That instruction did NOT retire here: drop it, and let the
+     *   re-run's own block carry it.
+     */
+    uint64_t started = 0;
+    const bool have_extent =
+        retired_executed_prev(cpu_index, prev_tb_head, &started);
+    const uint32_t tb_total = tb_head_insns(prev_tb_head);
+    uint64_t executed = started;
+    bool aborted_tail = false;
+    if (!have_extent) {
+        g_stats.seal_walk_extent_unknown++;
+    } else if (started > 0 && started < tb_total &&
+               tb_head_insn_pc_at(prev_tb_head,
+                                  (uint32_t)(started - 1)) == current_pc) {
+        aborted_tail = true;
+        executed = started - 1;
+    }
+
     /* Identify the last-executed fragment.  The scoreboard's @prev_start
      * normally pinpoints it (a mid-TB trap prevents later fragments' first-
      * insn stores from firing).  But an async interrupt or a foreign-ASID
@@ -6483,11 +6624,26 @@ bool collect_finalized_bbs(unsigned int cpu_index,
         }
     }
 
+    uint32_t walked = 0;
     for (BBTemplate *frag = prev_tb_head; frag != nullptr;
          frag = frag->next_tb_fragment) {
-        bool is_last_executed = prev_start_matches
-            ? (frag->start_pc == prev_start)
-            : (frag == last_frag);
+        /* Instructions of THIS fragment that retired. */
+        uint32_t ran = frag->n_insns;
+        if (have_extent) {
+            if (walked >= executed) {
+                break;                 /* fragment never entered */
+            }
+            uint64_t left = executed - walked;
+            if (left < frag->n_insns) {
+                ran = (uint32_t)left;
+            }
+        }
+        const bool truncated = ran < frag->n_insns;
+        /* A truncated fragment IS the last one that executed, whatever
+         * @prev_start says. */
+        bool is_last_executed = truncated ||
+            (prev_start_matches ? (frag->start_pc == prev_start)
+                                : (frag == last_frag));
 
         uint64_t frag_current_pc;
         uint64_t frag_prev_ft = frag->fall_through_pc;
@@ -6503,7 +6659,8 @@ bool collect_finalized_bbs(unsigned int cpu_index,
         bool frag_branch_taken = (frag_current_pc != frag_prev_ft);
 
         if (is_last_executed) {
-            snap_prev_tail_dsts(cpu_index, frag, frag_current_pc);
+            snap_prev_tail_dsts(cpu_index, frag, frag_current_pc, ran,
+                                truncated && aborted_tail);
         }
         /*
          * CONTROL LEFT THE IN-FLIGHT BLOCK.  This fragment does not continue
@@ -6540,8 +6697,42 @@ bool collect_finalized_bbs(unsigned int cpu_index,
             }
             cp_chain(cpu_index).reset();
         }
+
+        /*
+         * THE GUEST DID NOT FINISH THIS FRAGMENT.  Seal the block at the
+         * extent that RAN.  The clipped fragment is NOT appended to the
+         * chain: the chain's fragment list feeds the complete-block cache,
+         * and a clipped fragment must never become part of a cached complete
+         * block (commit_partial_bb mints its own extent-keyed template and
+         * leaves parent_true_bb alone for exactly that reason).
+         *
+         * It goes on @pending_emits, not @cut_emits, so it keeps its
+         * position in program order behind any block an earlier fragment of
+         * this same TB completed; cut blocks are emitted ahead of the walk.
+         * The successor is @frag_current_pc — where the guest actually is —
+         * and there is no terminating branch to resolve, so no wrong path is
+         * forked from a block that never reached one.
+         */
+        if (truncated) {
+            attribute_cp_insns(frag, ran);
+            if (BBTemplate *bb_tmpl =
+                    cp_chain(cpu_index).finalize_truncated(frag, ran)) {
+                pending_emits.push_back(
+                    PendingEmit{bb_tmpl, 0, frag_current_pc, 0});
+                any_finalize = true;
+            }
+            cp_chain(cpu_index).reset();
+            g_stats.seal_walk_blocks_truncated++;
+            g_stats.seal_walk_insns_not_executed += frag->n_insns - ran;
+            if (aborted_tail) {
+                g_stats.seal_walk_aborted_tails++;
+            }
+            break;
+        }
+
         cp_chain_append(cpu_index, frag);
-        attribute_cp_insns(frag);
+        attribute_cp_insns(frag, ran);
+        walked += ran;
 
         if (BBTemplate *bb_tmpl = cp_chain_finalize_if_complete(cpu_index)) {
             PendingEmit pe = {bb_tmpl, 0, frag_current_pc, 0};

@@ -224,7 +224,15 @@ header member (Step 1):
   in shape**: they may carry different ``num_insns`` and different
   per-instruction PCs and sizes, because the guest may re-cut the block
   into different instructions (kernel alternatives and static-key
-  patching, JIT re-emission) and not merely patch bytes in place.  Size
+  patching, JIT re-emission) and not merely patch bytes in place.
+  Self-modification is not the only reason two templates share a
+  ``start_pc``: a block whose EXECUTION was cut short — the guest
+  entered it and the trace window closed, or control left it, before
+  its last instruction — is emitted at the extent that actually ran, so
+  a trace can hold both the whole block and a shorter prefix of it at
+  one address.  The prefix is an ordinary template carrying no special
+  flag, because there is nothing special about it to a consumer: it
+  describes exactly the instructions that executed.  Size
   every per-block structure from the ``template_id`` actually
   referenced, never from another revision at the same address.  A
   decoder that also wants a per-pc view builds

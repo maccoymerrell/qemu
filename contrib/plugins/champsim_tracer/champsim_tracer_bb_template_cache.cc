@@ -222,6 +222,9 @@ void TemplateStore::clear_bb_map()
      * bb_map_ (re-minted at the next branch evaluation) and referenced by
      * nothing — drop on the same boundary. */
     alt_map_.clear();
+    /* Cut-short blocks are segment-scoped too: only this segment's body
+     * entries reference them, and they are flushed at the boundary. */
+    partial_bb_map_.clear();
     /* SMC revision state is segment-scoped too: retired revisions are pinned
      * only by THIS segment's body entries (which are flushed at the boundary),
      * and the content-signature / distinct-count bookkeeping restarts with the
@@ -386,9 +389,17 @@ void TemplateStore::for_each_bb(const std::function<void(BBTemplate &)> &fn)
      * and the serialized bytes match the old start_pc sort exactly.  Called
      * once at end-of-trace; sort cost amortized over the run. */
     std::vector<std::pair<BBKey, BBTemplate *>> all;
-    all.reserve(bb_map_.size() + retired_revision_count());
+    all.reserve(bb_map_.size() + retired_revision_count() +
+                partial_bb_map_.size());
     for (const auto &kv : bb_map_) {
         all.emplace_back(kv.first, kv.second.get());
+    }
+    /* Blocks the guest entered and did not finish.  They share a slot key
+     * with the complete block at the same pc when there is one, so the
+     * template_id tiebreak below is what keeps the order deterministic. */
+    for (const auto &kv : partial_bb_map_) {
+        all.emplace_back(BBKey{kv.first.asid_root, kv.first.start_pc},
+                         kv.second.get());
     }
     for (const auto &kv : retired_revisions_) {
         for (const auto &up : kv.second) {
@@ -1332,6 +1343,153 @@ BBTemplate *TemplateStore::get_or_create_bb_template(
         }
     }
     return tmpl;
+}
+
+BBTemplate *TemplateStore::commit_partial_bb(
+    uint64_t entry_pc,
+    BBTemplate *const *fragments,
+    unsigned int n_fragments,
+    uint32_t last_frag_insns)
+{
+    if (n_fragments == 0) {
+        return nullptr;
+    }
+    /* Extent of the last fragment that actually ran. */
+    uint32_t tail_n = fragments[n_fragments - 1]->n_insns;
+    if (last_frag_insns != 0 && last_frag_insns < tail_n) {
+        tail_n = last_frag_insns;
+    }
+    if (tail_n == 0 && n_fragments == 1) {
+        return nullptr;             /* nothing executed */
+    }
+
+    uint32_t max_insns = tail_n;
+    for (unsigned int i = 0; i + 1 < n_fragments; i++) {
+        max_insns += fragments[i]->n_insns;
+    }
+    if (max_insns == 0) {
+        return nullptr;
+    }
+
+    /* Same gather the full-BB path does, with the last fragment clipped.
+     * No fast path and no parent_true_bb back-edge: a fragment's back-edge
+     * names the COMPLETE block it folds into, and pointing it at a
+     * truncation would make the next complete assembly of the same
+     * fragments return the short template. */
+    std::vector<uint64_t> insn_pcs(max_insns, 0);
+    std::vector<uint8_t>  insn_sizes(max_insns, 0);
+    std::vector<uint8_t>  insn_bytes((size_t)max_insns * MAX_INSN_BYTES, 0);
+    std::vector<const InsnFields *>   field_ptrs(max_insns, nullptr);
+    std::vector<const InsnRegNames *> regname_ptrs(
+        g_features.reg_data ? max_insns : 0, nullptr);
+
+    const char *symbol_name = fragments[0]->symbol_name;
+    uint64_t final_ft = 0;
+    uint32_t off = 0;
+    for (unsigned int f = 0; f < n_fragments; f++) {
+        BBTemplate *frag = fragments[f];
+        uint32_t n = (f + 1 == n_fragments) ? tail_n : frag->n_insns;
+        for (uint32_t i = 0; i < n; i++) {
+            bool duplicate = false;
+            if (off > 0) {
+                duplicate = insn_pcs[off - 1] == frag->insn_pcs[i] &&
+                            insn_sizes[off - 1] == frag->insn_sizes[i] &&
+                            memcmp(&insn_bytes[(size_t)(off - 1) *
+                                               MAX_INSN_BYTES],
+                                   &frag->insn_bytes[(size_t)i *
+                                                     MAX_INSN_BYTES],
+                                   MAX_INSN_BYTES) == 0;
+            }
+            if (duplicate) {
+                continue;
+            }
+            insn_pcs[off] = frag->insn_pcs[i];
+            insn_sizes[off] = frag->insn_sizes[i];
+            memcpy(&insn_bytes[(size_t)off * MAX_INSN_BYTES],
+                   &frag->insn_bytes[(size_t)i * MAX_INSN_BYTES],
+                   MAX_INSN_BYTES);
+            field_ptrs[off] = &frag->insn_fields[i];
+            if (!regname_ptrs.empty()) {
+                regname_ptrs[off] = frag->insn_reg_names
+                    ? &frag->insn_reg_names[i]
+                    : &kCacheEmptyRegNames;
+            }
+            off++;
+        }
+        if (f + 1 == n_fragments) {
+            /* The block's successor is the instruction that would have run
+             * next: the one execution stopped before when the fragment was
+             * clipped, the fragment's own fall-through when it was not. */
+            final_ft = (tail_n < frag->n_insns)
+                ? frag->insn_pcs[tail_n]
+                : frag->fall_through_pc;
+        }
+    }
+    if (off == 0) {
+        return nullptr;
+    }
+
+    /* Not actually a truncation: the complete block already committed at
+     * this pc has exactly this extent (a chain that simply ended at a TB
+     * edge, or a block cut at its own last instruction).  Reuse it rather
+     * than minting a duplicate template — that keeps a trace where nothing
+     * is really cut short byte-identical. */
+    uint64_t asid_root = store_asid_root(entry_pc);
+    if (BBTemplate *ex = find_bb_template(asid_root, entry_pc)) {
+        if (ex->n_insns == off) {
+            bool same = true;
+            for (uint32_t i = 0; i < off; i++) {
+                if (ex->insn_pcs[i] != insn_pcs[i]) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) {
+                ex->is_system = fragments[0]->is_system;
+                ex->is_system_cp_confirmed = true;
+                return ex;
+            }
+        }
+    }
+
+    PartialKey key{asid_root, entry_pc, off};
+    auto it = partial_bb_map_.find(key);
+    if (it != partial_bb_map_.end()) {
+        BBTemplate *reuse = it->second.get();
+        reuse->is_system = fragments[0]->is_system;
+        reuse->is_system_cp_confirmed = true;
+        return reuse;
+    }
+
+    std::vector<InsnFields> gather_fields(off);
+    for (uint32_t i = 0; i < off; i++) {
+        gather_fields[i] = *field_ptrs[i];
+    }
+    std::vector<InsnRegNames> gather_regs;
+    const InsnRegNames *reg_src = nullptr;
+    if (!regname_ptrs.empty()) {
+        gather_regs.resize(off);
+        for (uint32_t i = 0; i < off; i++) {
+            gather_regs[i] = *regname_ptrs[i];
+        }
+        reg_src = gather_regs.data();
+    }
+
+    BBTemplatePtr tmpl = build_bb_template(next_template_id_++,
+                                           entry_pc, off,
+                                           insn_pcs.data(),
+                                           gather_fields.data(),
+                                           insn_sizes.data(),
+                                           insn_bytes.data(),
+                                           reg_src,
+                                           symbol_name, final_ft);
+    BBTemplate *raw = tmpl.get();
+    raw->is_system = fragments[0]->is_system;
+    raw->is_system_cp_confirmed = true;
+    partial_bb_map_[key] = std::move(tmpl);
+    g_stats.bb_templates_created++;
+    g_stats.partial_bb_templates_created++;
+    return raw;
 }
 
 BBTemplate *TemplateStore::create_tb_template(

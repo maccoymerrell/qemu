@@ -79,6 +79,33 @@ struct BBKey {
     }
 };
 
+/* Key for a block whose execution was cut short: the slot it belongs to plus
+ * the extent that actually ran.  Two truncations of one block at different
+ * points are two different blocks and must not share a template. */
+struct PartialKey {
+    uint64_t asid_root;
+    uint64_t start_pc;
+    uint32_t n_insns;
+    bool operator==(const PartialKey &o) const
+    {
+        return asid_root == o.asid_root && start_pc == o.start_pc &&
+               n_insns == o.n_insns;
+    }
+};
+
+struct PartialKeyHash {
+    size_t operator()(const PartialKey &k) const
+    {
+        uint64_t h = k.asid_root + 0x9e3779b97f4a7c15ULL;
+        h ^= k.start_pc + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= (uint64_t)k.n_insns + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= h >> 30;
+        h *= 0xbf58476d1ce4e5b9ULL;
+        h ^= h >> 27;
+        return (size_t)h;
+    }
+};
+
 struct BBKeyHash {
     size_t operator()(const BBKey &k) const
     {
@@ -227,6 +254,28 @@ public:
     BBTemplate *get_or_create_bb_template(uint64_t entry_pc,
                                           BBTemplate *const *fragments,
                                           unsigned int n_fragments);
+
+    /*
+     * Assemble a block the guest ENTERED AND DID NOT FINISH: @fragments as
+     * usual, except the last one contributes only its first
+     * @last_frag_insns instructions.  @last_frag_insns == 0 means the whole
+     * last fragment ran and only the BB itself is partial (no terminating
+     * branch was reached).
+     *
+     * This is the alternative to the two things the tracer used to do with
+     * such a block, both of them wrong: emit it at its full TRANSLATED
+     * length (instructions on the wire that never executed) or throw the
+     * whole chain away (instructions that executed and never reached the
+     * wire).  The template goes to partial_bb_map_, keyed by extent, so it
+     * can never be confused with — or displaced by — the complete block at
+     * the same pc.  Caller holds data_lock.  nullptr if nothing ran.
+     */
+    BBTemplate *commit_partial_bb(uint64_t entry_pc,
+                                  BBTemplate *const *fragments,
+                                  unsigned int n_fragments,
+                                  uint32_t last_frag_insns);
+    /* Templates in partial_bb_map_ — serialised alongside bb_map_. */
+    size_t partial_bb_count() const { return partial_bb_map_.size(); }
 
     /* Opportunistic branch-alternate minting (static_templates=1, both
      * modes).  Mint a never-executed true-BB template into the
@@ -544,6 +593,27 @@ private:
      * Empty (and inert) unless the feature runs, so a trace without it is
      * byte-identical. */
     std::unordered_map<BBKey, BBTemplatePtr, BBKeyHash> alt_map_;
+    /*
+     * Blocks whose EXECUTION was cut short — the guest entered the block and
+     * something ended it before its last instruction: the END marker closing
+     * the window, a ceiling, a control-flow discontinuity that abandoned the
+     * chain mid-BB.
+     *
+     * They cannot live in bb_map_.  That map is keyed by (asid_root,
+     * start_pc) only, and resolve_true_bb classifies a shorter run of the
+     * same byte-identical code as EXTENT_ONLY and deliberately returns the
+     * LONGER committed template — so a block that ran five instructions
+     * would be emitted claiming eight, which is precisely the over-claim
+     * this store exists to stop.  Keyed here by extent as well, so the same
+     * pc truncated at the same point reuses one template (a fork storm's
+     * repeated cut at one pc mints one entry, not one per occurrence) and a
+     * different extent gets its own.  Serialised by for_each_bb alongside
+     * bb_map_ and the retired revisions; dropped wholesale by clear_bb_map.
+     * Empty — and every dependent path inert — on a run where nothing is
+     * ever cut short.
+     */
+    std::unordered_map<PartialKey, BBTemplatePtr, PartialKeyHash>
+        partial_bb_map_;
     /* Retired SMC revisions, per (asid_root, start_pc): templates a newer
      * correct-path revision displaced from bb_map_.  They keep their run-
      * assigned template_id and serialise alongside their successors (body

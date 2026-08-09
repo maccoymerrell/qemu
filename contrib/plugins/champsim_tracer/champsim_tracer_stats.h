@@ -262,6 +262,36 @@ struct Stats {
      * reach the wire, so every instruction billed here is billed-not-traced
      * by construction. */
     uint64_t user_clock_bill_no_template = 0;
+    /* What the owned process's dispatches ACTUALLY EXECUTED, from the
+     * per-instruction insn_started slot rather than the per-TB inline add
+     * (see VCPUScoreBoard::insn_started).  Lagged one dispatch — the
+     * instructions observed at dispatch N belong to the TB dispatched at
+     * N-1 — and completed by the segment close, which folds the in-flight
+     * block's own executed prefix.
+     *
+     * user_clock_billed_insns minus this is the phantom bill: instructions
+     * the window clock charged the owned process for that no instruction
+     * ever executed.  It is not a rounding term; it is exactly the tail of
+     * every TB the guest entered and did not run to the end. */
+    uint64_t user_clock_retired_insns = 0;
+    /* Templates minted for blocks the guest ENTERED AND DID NOT FINISH (see
+     * TemplateStore::commit_partial_bb).  Keyed by extent, so repeated cuts
+     * at the same point share one; a run where nothing is ever cut short
+     * mints none. */
+    uint64_t partial_bb_templates_created = 0;
+    /* Blocks emitted at a TRUNCATED extent by the segment-close walk, and
+     * the instructions the truncation kept off the wire because they never
+     * executed.  A marker-window run has exactly one such block — the END
+     * block — on every single run; a reading of zero here on a marker cell
+     * means the close stopped truncating, not that nothing was cut. */
+    uint64_t close_walk_blocks_truncated = 0;
+    uint64_t close_walk_insns_not_executed = 0;
+    /* Segment-close walks that could not learn how much of the in-flight
+     * block executed, and so emitted it at its full translated extent.  The
+     * retired cursor answers for the two dispatch positions a close can
+     * land on; anything else is an unmeasured close and this is the only
+     * thing standing between it and a silent over-claim.  Must be 0. */
+    uint64_t close_walk_extent_unknown = 0;
 
     /* Self-loop fan-out: where the iteration count came from.
      *

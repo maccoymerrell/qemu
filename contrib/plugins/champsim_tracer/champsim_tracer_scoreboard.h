@@ -31,6 +31,9 @@ public:
     qemu_plugin_u64 prev_start_pc;
     qemu_plugin_u64 prev_fall_through;
     qemu_plugin_u64 insn_count;
+    /* Per-instruction architectural twin of insn_count; see the field
+     * comment in champsim_tracer.h. */
+    qemu_plugin_u64 insn_started;
     /* is_active mirror (per-vCPU 0/1) for cond_cb gating of per-insn
      * heavy callbacks. */
     qemu_plugin_u64 is_active;

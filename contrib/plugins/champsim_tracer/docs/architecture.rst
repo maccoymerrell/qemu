@@ -1038,6 +1038,36 @@ of its own execution; that close waits a step precisely so the
 budget-crossing TB seals normally first (step 6 above).  Either way
 the in-flight chain is finalized.
 
+The close does not land on a block boundary.  The END marker fires from
+inside an instruction callback part-way through its own block, and a
+ceiling or a guest death can stop execution anywhere.  The scoreboard's
+``prev_start_pc`` resolves the last-executed *fragment* and says nothing
+about how far into it the guest got, so the walk asks the
+per-instruction architectural clock (``VCPUScoreBoard::insn_started``,
+one JIT-inlined ``ADD`` per instruction, registered after every other
+per-instruction callback so a pre-instruction reader sees only
+*completed* instructions) how much of the in-flight TB actually ran, and
+**truncates the block to that extent**.  The truncated block is
+assembled by ``TemplateStore::commit_partial_bb`` into a store keyed by
+``(asid_root, start_pc, n_insns)`` rather than into ``bb_map_``: the
+complete-block cache is keyed by address alone and treats a shorter run
+of the same bytes as an extent artifact, handing back the *longer*
+committed template, which is exactly the over-claim the truncation
+exists to prevent.  A chain that runs out with no terminating branch
+goes the same way; when its extent turns out to match the complete block
+already committed at that pc, that template is reused, so a trace where
+nothing is really cut short mints nothing extra.
+
+Truncating is also what keeps the final block's register deltas.  A
+destination snapshot is captured one instruction late (the *next*
+instruction's callback reads the registers the previous one wrote), so
+the last executed instruction's snapshot is taken by a callback that
+never fires; measured against a block claiming its full translated
+length, the captured slice is always short, and the emit-time positional
+backstop then discarded the whole slice rather than mis-slice it.
+Truncated to what ran, the walk snaps the last *executed* instruction
+and the count matches exactly.
+
 .. _template-lifetimes:
 
 Template store lifetimes

@@ -188,6 +188,12 @@ std::vector<RegSnap> &pending_reg_snaps(unsigned int cpu_index);
  * snaps themselves, since they move the whole sink. */
 size_t &cp_chain_snap_mark(unsigned int cpu_index);
 
+/* How many instructions of the dispatched TB whose head is @head actually
+ * executed on @cpu_index.  False when the retired cursor cannot answer for
+ * that TB — see the definition in champsim_tracer.cc. */
+bool retired_executed_of(unsigned int cpu_index, const BBTemplate *head,
+                         uint64_t *out);
+
 /*
  * ---- PathBuilder proper ----
  */

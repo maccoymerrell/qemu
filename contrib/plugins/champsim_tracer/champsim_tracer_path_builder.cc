@@ -1171,25 +1171,69 @@ void PathBuilder::flush_final(bool walk_prev)
     uint64_t prev_start =
         qemu_plugin_u64_get(g_scoreboard.prev_start_pc, cpu_index);
 
+    /*
+     * HOW MUCH OF THE IN-FLIGHT BLOCK ACTUALLY RAN.
+     *
+     * The close does not happen at a block boundary.  The END marker fires
+     * from inside an instruction callback part-way through its own block,
+     * and every other close (ceiling, dead latch, guest death) can land
+     * anywhere.  prev_start resolves the last-executed FRAGMENT and says
+     * nothing about how far into it execution got, so this walk used to
+     * append the fragment at its full TRANSLATED length: the final entry
+     * reached the wire claiming instructions the guest never executed, and
+     * its tail dst snaps — captured one instruction behind, so the last
+     * executed instruction's snap is taken by the NEXT instruction's
+     * callback, which never fires — came up short against that inflated
+     * expectation.  The emit-time backstop then threw the whole captured
+     * slice away.  Both are the same defect: the block was never truncated
+     * to what ran.
+     */
+    uint64_t executed = 0;
+    bool have_extent = false;
+    if (walk_prev && prev_tb_) {
+        have_extent = retired_executed_of(cpu_index, prev_tb_, &executed);
+        if (!have_extent) {
+            g_stats.close_walk_extent_unknown++;
+        }
+    }
+
     std::vector<BBTemplate *> finalized;
     if (out_stream && prev_start != 0) {
         g_mutex_lock(&data_lock);
+        uint32_t walked = 0;
         for (BBTemplate *frag = walk_prev ? prev_tb_ : nullptr;
              frag != nullptr;
              frag = frag->next_tb_fragment) {
-            bool is_last_executed = (frag->start_pc == prev_start);
+            /* Instructions of THIS fragment that ran. */
+            uint32_t ran = frag->n_insns;
+            if (have_extent) {
+                if (walked >= executed) {
+                    break;             /* fragment never entered */
+                }
+                uint64_t left = executed - walked;
+                if (left < frag->n_insns) {
+                    ran = (uint32_t)left;
+                }
+            }
+            bool truncated = ran < frag->n_insns;
+            bool is_last_executed = truncated ||
+                                    (frag->start_pc == prev_start);
 
-            if (is_last_executed) {
+            if (is_last_executed && ran > 0) {
                 /* Tail-insn dst snap (see snap_prev_tail_dsts): the
-                 * last-executed fragment's tail registers still hold
-                 * post-exec values.  On a delay-slot tail [branch@n-2,
-                 * delay@n-1] the branch's snap was deferred and there is
-                 * no next TB to catch it (segment end), so capture both
-                 * the branch (n-2) and the delay slot (n-1) here. */
-                if (g_features.reg_data && frag->insn_reg_names &&
-                    frag->n_insns > 0) {
-                    uint32_t last = frag->n_insns - 1;
-                    bool ds_tail = frag->n_insns >= 2 &&
+                 * last-executed instruction's registers still hold its
+                 * post-exec values.  On an UNTRUNCATED delay-slot tail
+                 * [branch@n-2, delay@n-1] the branch's snap was deferred
+                 * (arm_reg_snap_cbs skips the delay slot's callback so the
+                 * branch's REG_IP dst can take the successor override) and
+                 * there is no next TB to catch it, so both are captured
+                 * here.  A TRUNCATED fragment stops before that tail, so
+                 * every instruction below the cut already had its snap
+                 * taken by its successor's callback and only the last
+                 * executed one is missing. */
+                if (g_features.reg_data && frag->insn_reg_names) {
+                    uint32_t last = ran - 1;
+                    bool ds_tail = !truncated && ran >= 2 &&
                         frag->insn_fields[last - 1].branch_type
                             != BRANCH_NONE &&
                         frag->insn_fields[last].branch_type
@@ -1210,6 +1254,22 @@ void PathBuilder::flush_final(bool walk_prev)
                     snap_tail(last);          /* delay slot, or branch */
                 }
             }
+
+            if (truncated) {
+                /* Seal the block at the cut.  The clipped fragment is NOT
+                 * appended to the chain: the chain's fragment list feeds
+                 * the complete-block cache, and a clipped fragment must
+                 * never become part of a cached complete block. */
+                if (BBTemplate *bb_tmpl =
+                        cp_chain(cpu_index_).finalize_truncated(frag, ran)) {
+                    finalized.push_back(bb_tmpl);
+                }
+                cp_chain(cpu_index_).reset();
+                g_stats.close_walk_blocks_truncated++;
+                g_stats.close_walk_insns_not_executed += frag->n_insns - ran;
+                break;
+            }
+            walked += ran;
 
             /* This walk is the SEGMENT-CLOSE walk — the one every
              * marker-window run finishes through — and it discarded
@@ -1250,9 +1310,20 @@ void PathBuilder::flush_final(bool walk_prev)
          * final block whenever the END sequence completed inside the
          * first sub-TB of a page-straddling exit block.  Finalize the
          * partial BB as-is; like every entry this flush emits, its
-         * terminal branch is simply unresolved. */
+         * terminal branch is simply unresolved.
+         *
+         * Committed through the CUT-SHORT path, not through finalize():
+         * this block reached no terminating branch, so its extent is
+         * whatever ran, and the complete-block cache would happily hand
+         * back a LONGER template committed at the same start_pc on an
+         * earlier, uninterrupted execution (resolve_true_bb calls that
+         * EXTENT_ONLY and keeps the original).  commit_partial_bb still
+         * returns the cached complete block when the extents are in fact
+         * identical, so a chain that merely ends at a TB edge is
+         * unaffected. */
         if (cp_chain(cpu_index_).has_active_chain()) {
-            if (BBTemplate *bb_tmpl = cp_chain(cpu_index_).finalize()) {
+            if (BBTemplate *bb_tmpl =
+                    cp_chain(cpu_index_).finalize_truncated(nullptr, 0)) {
                 finalized.push_back(bb_tmpl);
             }
         }

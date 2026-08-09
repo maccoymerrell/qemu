@@ -973,9 +973,12 @@ static void write_bin_templates(BitWriter *bw)
      * opportunistic branch alternates that survive the shadow filter.
      * retired_revision_count() and alt_serialisable_count() are both 0 (and
      * their emit paths no-ops) unless the respective feature ran, so a trace
-     * without SMC or alternates is byte-identical. */
+     * without SMC or alternates is byte-identical.  partial_bb_count() adds
+     * the blocks the guest entered and did not finish; it is 0 on a run
+     * where nothing was ever cut short. */
     bw_write_uleb128(bw, g_template_store.bb_count() +
                          g_template_store.retired_revision_count() +
+                         g_template_store.partial_bb_count() +
                          g_template_store.alt_serialisable_count());
 
     auto write_one = [bw](BBTemplate &tmpl_ref) {

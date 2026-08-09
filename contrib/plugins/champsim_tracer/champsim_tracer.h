@@ -1204,6 +1204,30 @@ typedef struct {
     uint64_t prev_start_pc;
     uint64_t prev_fall_through;
     uint64_t insn_count;
+    /*
+     * Instructions this vCPU has actually BEGUN executing.
+     *
+     * insn_count above is a per-TB INLINE_ADD of the TB's whole
+     * raw_n_insns fired at TB ENTRY — the count BBV bills, and therefore
+     * the count SimPoint offsets are selected against, which is why it
+     * must not change.  It credits every instruction of a TB the moment
+     * the TB is entered, so a TB abandoned part-way (a mid-TB branch
+     * QEMU translated past, a synchronous fault, an interrupt) is billed
+     * for instructions that never ran.  That is not a rounding error: it
+     * is the whole reason the marker window's user clock read above what
+     * the wire carried.
+     *
+     * This slot is the architectural twin: one INLINE_ADD(+1) per
+     * instruction, registered LAST among an instruction's plugin ops, so
+     * at any pre-instruction callback it holds the number of
+     * instructions that have already COMPLETED on this vCPU.  A fault
+     * aborts the instruction it hits AFTER that instruction's own add has
+     * fired, so a faulted attempt is counted once here and once again
+     * when the handler returns and the instruction re-executes; the
+     * correction is applied where the fault is observed
+     * (user_clock_fault_recredit), not by pretending the slot is exact.
+     */
+    uint64_t insn_started;
     /* Mirror of g_trace_segments.is_active() as a per-vCPU scoreboard
      * slot (1 in-segment, 0 inter-segment).  Backs the cond_cb gate
      * on the per-insn heavy callbacks (reg_snap_cb, synth_ea_cb): a

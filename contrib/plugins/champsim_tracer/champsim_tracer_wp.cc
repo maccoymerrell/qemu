@@ -184,6 +184,8 @@ static void wp_enter_spec_session(unsigned int cpu_index, uint64_t wrong_target,
 
     g_wp_state.saved_cpu_index = cpu_index;
     g_wp_state.saved_insn_count = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
+    g_wp_state.saved_insn_started =
+        qemu_plugin_u64_get(g_scoreboard.insn_started, cpu_index);
     g_wp_state.saved_prev_start_pc = qemu_plugin_u64_get(g_scoreboard.prev_start_pc, cpu_index);
     g_wp_state.saved_prev_fall_through = qemu_plugin_u64_get(g_scoreboard.prev_fall_through,
                                                      cpu_index);
@@ -293,6 +295,8 @@ static void wp_end_spec_session(unsigned int cpu_index,
     }
 
     qemu_plugin_u64_set(g_scoreboard.insn_count, cpu_index, g_wp_state.saved_insn_count);
+    qemu_plugin_u64_set(g_scoreboard.insn_started, cpu_index,
+                        g_wp_state.saved_insn_started);
     qemu_plugin_u64_set(g_scoreboard.prev_start_pc, cpu_index, g_wp_state.saved_prev_start_pc);
     qemu_plugin_u64_set(g_scoreboard.prev_fall_through, cpu_index,
                         g_wp_state.saved_prev_fall_through);

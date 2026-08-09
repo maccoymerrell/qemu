@@ -6,6 +6,7 @@
 
 #include "champsim_tracer_bb_chain_assembler.h"
 #include "champsim_tracer_bb_template_cache.h"
+
 #include "champsim_tracer_stats.h"
 
 /* Per-vCPU assemblers, indexed by cpu_index (see the header comment on
@@ -118,6 +119,35 @@ BBTemplate *BBChainAssembler::finalize()
     if (bb) {
         /* This chain's fragments became a template; the reset that follows
          * is a commit, not a loss.  See reset(). */
+        finalized_ = true;
+    }
+    return bb;
+}
+
+uint32_t BBChainAssembler::in_flight_insns() const
+{
+    return chain_insns(fragments_);
+}
+
+BBTemplate *BBChainAssembler::finalize_truncated(BBTemplate *tail_frag,
+                                                 uint32_t tail_insns)
+{
+    uint64_t entry = entry_pc_;
+    std::vector<BBTemplate *> frags = fragments_;
+    if (tail_frag) {
+        if (frags.empty()) {
+            entry = tail_frag->start_pc;
+        }
+        frags.push_back(tail_frag);
+    }
+    if (frags.empty() || entry == 0) {
+        return nullptr;
+    }
+    BBTemplate *bb = g_template_store.commit_partial_bb(
+        entry, frags.data(), (unsigned int)frags.size(),
+        tail_frag ? tail_insns : 0);
+    if (bb) {
+        /* Committed, so the reset that follows is not a loss (see reset()). */
         finalized_ = true;
     }
     return bb;

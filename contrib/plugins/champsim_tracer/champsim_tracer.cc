@@ -724,6 +724,139 @@ static void fence_flush_end_ring(void)
 }
 
 /*
+ * RETIRED-INSTRUCTION CURSOR — the architectural twin of user_seen.
+ *
+ * user_seen advances against insn_count, whose per-TB inline add credits a
+ * TB's whole instruction count the moment the TB is ENTERED.  These
+ * advance against insn_started, whose add is the instruction's own, so the
+ * delta between two dispatches is the number of instructions that really
+ * ran between them — not the number the dispatched TBs would have run had
+ * nothing interrupted them.
+ *
+ * The attribution is LAGGED BY ONE DISPATCH and it has to be: the
+ * instructions counted at dispatch N are the ones the TB dispatched at N-1
+ * executed.  @g_retired_owner_owned remembers whether that earlier
+ * dispatch was the owned process's, and @g_retired_tb_base is the cursor
+ * value at the CURRENT dispatch, which the segment close uses to learn how
+ * far into the in-flight block execution actually got.
+ */
+static uint64_t g_retired_seen[CST_PIN_MAX_VCPUS];
+static bool     g_retired_seen_primed[CST_PIN_MAX_VCPUS];
+static bool     g_retired_owner_owned[CST_PIN_MAX_VCPUS];
+static uint64_t g_retired_tb_base[CST_PIN_MAX_VCPUS];
+/* Which TB head @g_retired_tb_base belongs to, and the same pair for the
+ * dispatch before it.  A close can land on either side of the promote that
+ * makes the current TB the pending seal (PathBuilder::set_prev), so the
+ * closing walk asks by TB head rather than assuming which one it holds. */
+static const BBTemplate *g_retired_tb_head[CST_PIN_MAX_VCPUS];
+static const BBTemplate *g_retired_prev_head[CST_PIN_MAX_VCPUS];
+static uint64_t g_retired_prev_executed[CST_PIN_MAX_VCPUS];
+
+static inline unsigned retired_slot(unsigned int cpu_index)
+{
+    return cpu_index < CST_PIN_MAX_VCPUS ? cpu_index : CST_PIN_MAX_VCPUS - 1;
+}
+
+/* Architectural instruction count of a whole dispatched TB (all fragments). */
+static inline uint32_t tb_head_insns(const BBTemplate *head)
+{
+    uint32_t n = 0;
+    for (const BBTemplate *f = head; f; f = f->next_tb_fragment) {
+        n += f->n_insns;
+    }
+    return n;
+}
+
+/* Instructions this vCPU has completed, live. */
+static inline uint64_t retired_now(unsigned int cpu_index)
+{
+    return qemu_plugin_u64_get(g_scoreboard.insn_started, cpu_index);
+}
+
+/* Instructions completed inside the TB currently in flight on @cpu_index.
+ * Read from a pre-instruction callback (the marker close) it is exactly
+ * the number of the in-flight block's instructions that executed. */
+static inline uint64_t retired_in_flight(unsigned int cpu_index)
+{
+    unsigned s = retired_slot(cpu_index);
+    uint64_t now = retired_now(cpu_index);
+    return now >= g_retired_tb_base[s] ? now - g_retired_tb_base[s] : 0;
+}
+
+static inline uint64_t retired_advance(unsigned int cpu_index,
+                                       const BBTemplate *cur)
+{
+    unsigned s = retired_slot(cpu_index);
+    uint64_t now = retired_now(cpu_index);
+    uint64_t delta = g_retired_seen_primed[s] && now >= g_retired_seen[s]
+        ? now - g_retired_seen[s] : 0;
+    g_retired_prev_head[s] = g_retired_tb_head[s];
+    g_retired_prev_executed[s] = delta;
+    g_retired_tb_head[s] = cur;
+    g_retired_seen[s] = now;
+    g_retired_tb_base[s] = now;
+    g_retired_seen_primed[s] = true;
+    return delta;
+}
+
+static inline void retired_reset(unsigned int cpu_index)
+{
+    for (int i = 0, n = qemu_plugin_num_vcpus(); i < n; i++) {
+        unsigned s = retired_slot((unsigned)i);
+        g_retired_owner_owned[s] = false;
+        g_retired_tb_head[s] = nullptr;
+        g_retired_prev_head[s] = nullptr;
+        g_retired_prev_executed[s] = 0;
+        if ((unsigned)i == cpu_index) {
+            g_retired_seen[s] = retired_now((unsigned)i);
+            g_retired_tb_base[s] = g_retired_seen[s];
+            g_retired_seen_primed[s] = true;
+        } else {
+            g_retired_seen_primed[s] = false;
+        }
+    }
+}
+
+/*
+ * How many instructions of the dispatched TB @head actually executed.
+ *
+ * The segment-close walk needs this and cannot infer it: the scoreboard's
+ * prev_start_pc resolves to the last-executed FRAGMENT, which says nothing
+ * about how far into that fragment the guest got before the END marker,
+ * the ceiling or the guest's own death stopped it.  Two dispatch positions
+ * can hold @head — the one whose base is live (a close from inside an
+ * instruction callback, which is where the END marker fires) and the one
+ * before it (a close taken at the top of a dispatch, before the promote) —
+ * and both answers are exact, so the caller does not have to know which
+ * side of the promote it is on.  Clamped to the TB's own extent: the
+ * lagged delta counts everything that ran between two dispatches, and a
+ * TB whose successor was never dispatched (a foreign context the gate
+ * skips) would otherwise read above its own length.
+ *
+ * Returns false when @head is neither — no answer is better than a wrong
+ * truncation, and the caller counts the case (see close_walk_extent_unknown).
+ */
+bool retired_executed_of(unsigned int cpu_index, const BBTemplate *head,
+                         uint64_t *out)
+{
+    if (!head) {
+        return false;
+    }
+    unsigned s = retired_slot(cpu_index);
+    uint64_t n;
+    if (head == g_retired_tb_head[s]) {
+        n = retired_in_flight(cpu_index);
+    } else if (head == g_retired_prev_head[s]) {
+        n = g_retired_prev_executed[s];
+    } else {
+        return false;
+    }
+    uint32_t cap = tb_head_insns(head);
+    *out = n > cap ? cap : n;
+    return true;
+}
+
+/*
  * Reset the user clock at a pin/segment boundary.  The per-vCPU seen
  * cursors (scoreboard user_seen; each vCPU's fold computes its delta
  * against its OWN insn_count slot) start over: the calling vCPU's cursor
@@ -748,6 +881,7 @@ static inline void user_count_reset(unsigned int cpu_index,
         rep_state((unsigned)i).prev_tb_counted = false;
         rep_state((unsigned)i).prev_tb_rep_n = 0;
     }
+    retired_reset(cpu_index);
 }
 
 /* One vCPU-local tick of the user clock's delta source: this vCPU's
@@ -761,6 +895,7 @@ static inline uint64_t user_seen_advance(unsigned int cpu_index,
     qemu_plugin_u64_set(g_scoreboard.user_seen, cpu_index, insn_count_now);
     return seen == USER_SEEN_UNPRIMED ? 0 : insn_count_now - seen;
 }
+
 
 /*
  * Coarse fast-forward (pinned-simpoint positioning).  The exact
@@ -5040,6 +5175,22 @@ static void finish_trace_segment(bool prev_executed = true,
      * exactly like the schedule never having run at all. */
     g_segments_written++;
 
+    /* Close out the lagged retired attribution (see retired_advance): the
+     * block in flight on the closing vCPU has executed a prefix that no
+     * later dispatch will ever report, because there is no later dispatch.
+     * Without this the segment's last owned block is missing from the
+     * executed count and the close would manufacture a shortfall of its
+     * own. */
+    if (closing_cpu != UINT32_MAX &&
+        g_retired_owner_owned[retired_slot(closing_cpu)]) {
+        uint64_t tail = retired_in_flight(closing_cpu);
+        uint32_t cap = tb_head_insns(g_retired_tb_head[retired_slot(closing_cpu)]);
+        if (tail > cap) {
+            tail = cap;
+        }
+        g_stats.user_clock_retired_insns += tail;
+    }
+
     uint64_t lo = g_trace_segments.window_start();
     uint64_t hi = g_trace_segments.window_stop();
 
@@ -6966,6 +7117,18 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
      * finalised rather than abandoned. */
     user_clock_stall_any_check(cpu_index, icount_prev);
 
+    /*
+     * Architectural retired-instruction cursor.  Advanced on EVERY dispatch
+     * in EVERY mode, not only under a pin: the segment-close walk uses it to
+     * learn how much of the in-flight block actually executed, and a block
+     * the guest entered and did not finish is emitted at its full translated
+     * length in user mode exactly as it is in system mode.  The lagged
+     * delta belongs to the PREVIOUS dispatch (see retired_advance).
+     */
+    uint64_t delta_retired = retired_advance(cpu_index, cur_tb_tmpl);
+    const bool prev_dispatch_owned =
+        g_retired_owner_owned[retired_slot(cpu_index)];
+
     /* Address-space pin + count set (marker mode only — pinned !=
      * UNPINNED).  The inline-add counts every TB; here we fold this TB's
      * instruction count (the delta of consecutive insn_count reads) into
@@ -6998,6 +7161,13 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
     bool capture_owned = false;
     if (pinned_asid != CST_ASID_UNPINNED) {
         uint64_t delta = user_seen_advance(cpu_index, icount_prev);
+        /* Architectural twin of @delta: what really ran since the last
+         * dispatch (see retired_advance).  It belongs to the PREVIOUS
+         * dispatch, so it is folded against that dispatch's ownership, not
+         * against this TB's. */
+        if (prev_dispatch_owned) {
+            g_stats.user_clock_retired_insns += delta_retired;
+        }
         live_asid = qemu_plugin_get_addr_space_id();
         live_priv = qemu_plugin_get_priv_level();
         /* Ownership of a user TB: is the ADDRESS SPACE it is executing in
@@ -7144,6 +7314,9 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
             cur_tb_tmpl->is_system = live_priv != 0;
             cur_tb_tmpl->is_system_cp_confirmed = true;
         }
+        /* Arm the lagged attribution for the NEXT dispatch: the
+         * instructions counted there are the ones this TB executes. */
+        g_retired_owner_owned[retired_slot(cpu_index)] = user_owned;
     }
 
     /* §2.13 warmup-boundary hold, armed at DISPATCH: when a counted TB
@@ -9822,6 +9995,26 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu(
         tb, QEMU_PLUGIN_INLINE_ADD_U64,
         g_scoreboard.insn_count, raw_n_insns);
+    /*
+     * Architectural instruction clock: one ADD(+1) per instruction (see
+     * VCPUScoreBoard::insn_started).  The TB-entry add above credits a TB
+     * that is abandoned part-way for instructions that never ran; this one
+     * cannot, because it is the instruction's own op.
+     *
+     * REGISTERED HERE, after the per-insn marker / reg-snap / synth-EA
+     * callbacks armed earlier in this function, ON PURPOSE.  Plugin ops on
+     * one instruction fire in registration order, so being last makes the
+     * slot read "instructions COMPLETED" from inside any pre-instruction
+     * callback — which is what lets the segment close truncate the
+     * in-flight block to the instructions that actually executed.  Move it
+     * earlier and every such reader silently gains one phantom
+     * instruction.
+     */
+    for (size_t i = 0; i < raw_n_insns; i++) {
+        qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
+            qemu_plugin_tb_get_insn(tb, i), QEMU_PLUGIN_INLINE_ADD_U64,
+            g_scoreboard.insn_started, 1);
+    }
     /* Mirror the bump into the budget slot but negated — it counts
      * DOWN by n_insns per TB exec.  When budget < 1 the cond_cb
      * below fires once, handles the threshold crossing, and resets

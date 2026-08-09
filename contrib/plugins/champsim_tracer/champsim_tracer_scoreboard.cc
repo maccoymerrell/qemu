@@ -19,6 +19,8 @@ VCPUScoreboard::VCPUScoreboard()
         sb_, VCPUScoreBoard, prev_fall_through);
     insn_count = qemu_plugin_scoreboard_u64_in_struct(
         sb_, VCPUScoreBoard, insn_count);
+    insn_started = qemu_plugin_scoreboard_u64_in_struct(
+        sb_, VCPUScoreBoard, insn_started);
     is_active = qemu_plugin_scoreboard_u64_in_struct(
         sb_, VCPUScoreBoard, is_active);
     asid_match = qemu_plugin_scoreboard_u64_in_struct(

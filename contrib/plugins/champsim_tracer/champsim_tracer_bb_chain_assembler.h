@@ -81,6 +81,24 @@ public:
      * must call reset()).  Caller must hold data_lock. */
     BBTemplate *finalize();
 
+    /*
+     * Finalize the in-flight chain PLUS the first @tail_insns instructions
+     * of @tail_frag as a block whose EXECUTION was cut short.
+     *
+     * @tail_frag is a fragment execution entered and did not run to the end
+     * of; it is deliberately NOT appended through append_fragment, because
+     * the chain's fragment list is the input to the complete-block cache and
+     * a clipped fragment must never become part of a cached complete block.
+     * Pass tail_frag == nullptr to finalize just the chain (every appended
+     * fragment ran in full, but no terminating branch was ever reached).
+     *
+     * Like finalize(), does NOT reset, and the caller must hold data_lock.
+     */
+    BBTemplate *finalize_truncated(BBTemplate *tail_frag, uint32_t tail_insns);
+
+    /* Architectural instructions currently held in the in-flight chain. */
+    uint32_t in_flight_insns() const;
+
     /* Drop the in-flight chain.
      *
      * Two callers mean two different things by this.  After finalize() it

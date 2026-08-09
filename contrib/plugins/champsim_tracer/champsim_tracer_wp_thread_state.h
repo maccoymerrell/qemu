@@ -35,6 +35,11 @@ struct WPThreadState {
     /* Snapshot of scoreboard state at WP-sim entry, restored at exit. */
     unsigned int saved_cpu_index = 0;
     uint64_t saved_insn_count = 0;
+    /* The per-instruction architectural clock is snapshot/restored with
+     * insn_count for the same reason: a speculative excursion's
+     * instructions are not the guest's, and leaving them in the slot would
+     * charge them to the correct path's retired count. */
+    uint64_t saved_insn_started = 0;
     uint64_t saved_prev_start_pc = 0;
     uint64_t saved_prev_fall_through = 0;
     /* Budget slot is decremented per spec-mode TB via the inline_add;

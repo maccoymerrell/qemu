@@ -20,11 +20,12 @@ BBChainAssembler &cp_chain(unsigned int cpu_index)
 
 std::atomic<uint32_t> g_segment_generation{1};
 
-void BBChainAssembler::append_fragment(uint64_t entry_pc,
+bool BBChainAssembler::append_fragment(uint64_t entry_pc,
                                        BBTemplate *frag,
                                        uint64_t fall_through,
                                        TbTerminus terminus)
 {
+    bool dropped_in_flight = false;
     /*
      * On segment switch clear_bb_map() drops the unique_ptrs owning
      * fragments_'s BBTemplate*s, so a generation mismatch (bumped per
@@ -34,6 +35,7 @@ void BBChainAssembler::append_fragment(uint64_t entry_pc,
      */
     uint32_t cur_gen = g_segment_generation.load(std::memory_order_relaxed);
     if (my_gen_ != cur_gen) {
+        dropped_in_flight = dropped_in_flight || !fragments_.empty();
         fragments_.clear();
         entry_pc_ = 0;
         last_ft_ = 0;
@@ -45,6 +47,7 @@ void BBChainAssembler::append_fragment(uint64_t entry_pc,
          * A pending delay slot is abandoned with it — a discontinuity
          * means the delay slot never contiguously followed (abnormal:
          * interrupt / segment edge). */
+        dropped_in_flight = dropped_in_flight || !fragments_.empty();
         fragments_.clear();
         entry_pc_ = entry_pc;
         awaiting_delay_slot_ = false;
@@ -78,6 +81,7 @@ void BBChainAssembler::append_fragment(uint64_t entry_pc,
     } else {
         bb_complete_ = false;
     }
+    return dropped_in_flight;
 }
 
 BBTemplate *BBChainAssembler::finalize()

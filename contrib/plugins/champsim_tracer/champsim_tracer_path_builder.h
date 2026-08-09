@@ -182,6 +182,12 @@ extern thread_local std::vector<uint32_t> g_emit_fault_anchors CST_TLS_HOT;
  * the other vCPU). */
 std::vector<RegSnap> &pending_reg_snaps(unsigned int cpu_index);
 
+/* How many of those, counted from the front, belong to the CP chain still
+ * in flight (fragments appended, true BB not yet finalized).  Owned by
+ * cp_chain_append; the suspend/resume arrows freeze and restore it with the
+ * snaps themselves, since they move the whole sink. */
+size_t &cp_chain_snap_mark(unsigned int cpu_index);
+
 /*
  * ---- PathBuilder proper ----
  */
@@ -224,6 +230,11 @@ struct SuspendedPrev {
     uint64_t owner_live = 0;            /* owning live asid (wide discriminator) */
     std::vector<WPMemAccess> mem;       /* prev's committed CP memops */
     std::vector<RegSnap> snaps;         /* prev's per-insn dst snaps */
+    size_t snap_mark = 0;               /* how many of @snaps, from the front,
+                                         * belong to @chain's fragments — the
+                                         * sink and the chain are frozen
+                                         * together, so their correspondence
+                                         * must be frozen with them */
     BBChainAssembler::ChainState chain; /* in-flight chain prefix (page-split BB) */
     RepArchFacts rep_facts;             /* prev's self-loop facts, frozen with
                                          * it: the per-callback latch will
@@ -654,6 +665,15 @@ private:
      * position in the drain.  See champsim_tracer_path_builder.cc. */
     bool event_is_ours(const struct qemu_plugin_cpu_event &ev,
                        const StepIn &in, bool in_async, size_t idx) const;
+
+    /* Is @ev INTERIOR to the outstanding async window, as opposed to merely
+     * concurrent with it?  The single spelling of that question — the
+     * retention gate, the seal's fault classifier and the seal's successor
+     * override all ask it here, so they cannot drift apart.  Static: it
+     * reads only the event and the cursor stamp.  See the .cc for why user
+     * privilege settles it. */
+    static bool async_window_interior(const struct qemu_plugin_cpu_event &ev,
+                                      bool in_async);
 
     /* Per-event snapshot of the kernel-excursion ownership edge, indexed by
      * position in the current drain (filled by the kexc pass, read by

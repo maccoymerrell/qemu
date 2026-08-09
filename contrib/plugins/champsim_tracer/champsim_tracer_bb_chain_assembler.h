@@ -48,8 +48,17 @@ public:
      * @terminus is how this TB contributes to true-BB assembly (see
      * TbTerminus): it drives whether bb_complete() now reports true.
      * Self-resets on a bumped segment generation so stale fragment
-     * pointers are never followed. */
-    void append_fragment(uint64_t entry_pc,
+     * pointers are never followed.
+     *
+     * RETURNS true when this call DISCARDED a non-empty in-flight chain
+     * (discontinuity, or a bumped segment generation).  Those fragments
+     * will never be emitted, so the caller owes their already-captured
+     * per-insn state the same fate: the reg-snap sink is a positional FIFO
+     * and a silently orphaned prefix slides every later value onto the
+     * wrong instruction.  Ignoring the return value is what made the
+     * emit-time backstop see a SURPLUS and "recover" by trimming — a
+     * misattribution dressed as a repair. */
+    bool append_fragment(uint64_t entry_pc,
                          BBTemplate *frag,
                          uint64_t fall_through,
                          TbTerminus terminus);

@@ -2259,6 +2259,47 @@ static size_t retention_tripwire()
 }
 
 /*
+ * Is this event INTERIOR to the async-interrupt window the drain cursor
+ * says is open?
+ *
+ * The distinction this function exists to draw: @in_async is not "the code
+ * that raised this event is inside an interrupt handler", it is "an async
+ * window is OUTSTANDING on this vCPU".  QEMU's flag deliberately spans the
+ * scheduler (include/hw/core/cpu.h: the window closes only when the
+ * DEPARTED thread re-fetches its departure PC, "robust to the scheduler
+ * context-switching away"), so between the interrupt of process A and A's
+ * eventual resume the flag stays set while process B — the pinned one —
+ * runs its own code.  Reading the flag as interiority therefore vetoes B's
+ * own synchronous faults, which is what discarded the pinned process's
+ * post-fork COW fault and destroyed the interrupted block's whole reg-delta
+ * slice (one per fork, exactly).
+ *
+ * The sound test needs a fact about the EVENT, and there is one that holds
+ * on every target: an exception handler runs at kernel privilege.  A
+ * synchronous fault stamped at USER privilege therefore cannot be interior
+ * to any window — not to a foreign process's outstanding one (that context
+ * is descheduled), and not even to the window's OWN thread's (a signal
+ * delivered from the handler returns to user code at the signal handler,
+ * not at the departure PC, so the window stays open while the same thread
+ * runs user instructions; a fault there is user-code content, not handler
+ * content).  ev.priv is stamped by the producer at the event instant,
+ * BEFORE the privilege switch the delivery is about to make, so it names
+ * the faulting context and not the handler.
+ *
+ * A kernel-privilege event while a window is outstanding is left refused:
+ * discriminating our kernel entry from the window owner's handler needs the
+ * window's owning thread, which is only tracked when interrupts are
+ * CAPTURED (trace_interrupts=1).  That residue is named in the commit
+ * message and counted here (async_interior_kernel_refused) rather than
+ * guessed at.
+ */
+bool PathBuilder::async_window_interior(const struct qemu_plugin_cpu_event &ev,
+                                        bool in_async)
+{
+    return in_async && ev.priv > 0;
+}
+
+/*
  * Is this event the traced context's own?
  *
  * NOT a new rule: the EXISTING attribution gate, re-evaluated on the event's
@@ -2290,9 +2331,23 @@ bool PathBuilder::event_is_ours(const struct qemu_plugin_cpu_event &ev,
     /* (b) Excluded async-window content.  Subsumes the seal's old
      * fault_enter_skipped_in_async arm and is strictly stronger: the window
      * cursor is persistent, so it also covers a window opened on an EARLIER
-     * bailed step, which a batch-local scan cannot see. */
-    if (in_async && !g_features.trace_interrupts) {
-        return false;
+     * bailed step, which a batch-local scan cannot see.
+     *
+     * INTERIORITY, not window liveness — see async_window_interior().
+     *
+     * The two condition instruments are bumped HERE, at the one gate that
+     * sees every event exactly once (the seal replays only what this gate
+     * already admitted), so neither can double-count. */
+    if (!g_features.trace_interrupts && in_async) {
+        if (async_window_interior(ev, in_async)) {
+            g_stats.async_interior_kernel_refused++;
+            return false;
+        }
+        /* The rescued population: the pinned process's own user-privilege
+         * synchronous faults, raised while some context's async window was
+         * still outstanding.  Nonzero here is the defect condition having
+         * arisen and been handled; 0 means it did not arise this run. */
+        g_stats.async_interior_user_priv_kept++;
     }
 
     /* (c) Translation-bypassing privilege (RISC-V M-mode): firmware above
@@ -2669,7 +2724,8 @@ void PathBuilder::absorb_events(const StepIn &in)
              * is the corruption instrument, and it must fire there and read
              * zero here. */
             if (keep && ev.kind == QEMU_PLUGIN_CPU_EV_FAULT_ENTER &&
-                !ev_in_async && retained_first_enter_pc_ == 0) {
+                !async_window_interior(ev, ev_in_async) &&
+                retained_first_enter_pc_ == 0) {
                 retained_first_enter_pc_ = ev.pc;
                 if (!ours) {
                     g_stats.seal_successor_from_foreign_fault++;
@@ -2989,6 +3045,20 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
             qemu_plugin_async_int_reset();
             async_excluding_ = false;
             g_capture_mute = false;
+            /* ...AND the retention cursor.  drain_async_open_ is the THIRD
+             * representation of "a window is open" (QEMU's per-vCPU flag,
+             * async_excluding_, and this) and it is the one the event
+             * attribution gate reads.  Closing the other two and leaving
+             * this one set desynchronises them permanently: an abandoned
+             * window emits no ASYNC_RETURN by construction, so nothing else
+             * can ever lower the cursor, and from the first abandoned
+             * window onwards every synchronous fault event on this vCPU is
+             * stamped in-async and refused.  Measured on the fork ladder
+             * before this line existed: retention events owned = 0,
+             * refused = 268/2160/4256 at 8/64/128 forks — i.e. every fault
+             * event in the run, not a transient overlap. */
+            drain_async_open_ = false;
+            g_stats.async_abandon_cursor_closed++;
             if (async_departure_pc_) {
                 seal_pc_override_ = async_departure_pc_;
                 async_departure_pc_ = 0;
@@ -3742,6 +3812,8 @@ void PathBuilder::suspend_prev(uint64_t owner_asid, uint64_t owner_live,
     g_mem_recorder.take_cp(cpu_index_, s.mem);              /* drains the CP buffer */
     s.snaps = std::move(pending_reg_snaps(cpu_index_));
     pending_reg_snaps(cpu_index_).clear();
+    s.snap_mark = cp_chain_snap_mark(cpu_index_);
+    cp_chain_snap_mark(cpu_index_) = 0;     /* the sink is empty again */
     s.chain = cp_chain(cpu_index_).detach_state();
     s.rep_facts = rep_state(cpu_index).pb_prev_facts;
     g_stats.susp_pushed++;
@@ -3796,6 +3868,10 @@ bool PathBuilder::resume_suspension(uint64_t resume_asid, uint64_t resume_live)
             pending_reg_snaps(cpu_index_).insert(pending_reg_snaps(cpu_index_).begin(),
                                      s.snaps.begin(), s.snaps.end());
         }
+        /* The restored snaps go to the FRONT, so the chain's share of them
+         * is still the leading @snap_mark — whatever the sink had picked up
+         * meanwhile now sits behind them and belongs to no chain yet. */
+        cp_chain_snap_mark(cpu_index_) = s.snap_mark;
         cp_chain(cpu_index_).attach_state(std::move(s.chain));
         cst_jump_diag_step(0, prev_tb_ ? prev_tb_->start_pc : 0, -1, 1,
                            "RESUME");
@@ -4054,7 +4130,16 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
                  *   behaviour (same rule as the successor override
                  *   above). */
                 if (fault_on && !pb_no_merge()) {
-                    if (!ev_in_async) {
+                    /* Same predicate object as the retention gate's arm
+                     * (b) — async_window_interior(), not a second copy of
+                     * the rule.  Two independent spellings of "is this
+                     * window interior" is how the fix for one of them left
+                     * the other refusing the pinned process's own user
+                     * faults (the positive control: restricting arm (b)
+                     * alone moved 20 events past the gate and this arm
+                     * then skipped 10 of them, leaving the slice drops
+                     * exactly where they were). */
+                    if (!async_window_interior(ev, ev_in_async)) {
                         if (async_captured_) {
                             g_stats.fault_enter_classified_in_win++;
                         }
@@ -4191,6 +4276,12 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
              * !plugin_in_async_int, so a stale flag would black out every
              * later capture on this vCPU. */
             qemu_plugin_async_int_reset();
+            /* The retention cursor is the same per-vCPU fact and is
+             * disproved by the same TB; see the interrupts=0 arrow.  Left
+             * set it would outlive every producer edge (no ASYNC_RETURN is
+             * coming) and stamp every later fault event in-async. */
+            drain_async_open_ = false;
+            g_stats.async_abandon_cursor_closed++;
             /* The LEVEL is per thread, so its release is per thread too.
              * This TB proves THIS thread is at async-nesting depth 0; it
              * proves nothing about a peer descheduled inside its own handler,

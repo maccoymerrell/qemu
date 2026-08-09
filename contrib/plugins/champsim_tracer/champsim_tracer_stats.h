@@ -130,6 +130,16 @@ struct Stats {
      * recovered leak, not a dropped slice; distinct from reg_snap_slice_
      * dropped, which is only the unrecoverable shortfall. */
     uint64_t reg_snap_leak_trimmed = 0;
+    /* In-flight CP chains the assembler discarded on a discontinuity (a
+     * true BB whose remainder ran inside content the trace excludes), and
+     * the per-insn dst snaps discarded WITH them.  Those fragments never
+     * reach the wire, so their snaps must not either: left in the
+     * positional sink they became the next block's leaked prefix, which
+     * the emit-time backstop then "recovered" by trimming.  These two are
+     * the condition; reg_snap_leak_trimmed is what the condition used to
+     * turn into. */
+    uint64_t reg_snap_chain_drops = 0;
+    uint64_t reg_snap_chain_drop_discarded = 0;
 
     /* Self-loop fan-out: where the iteration count came from.
      *
@@ -897,6 +907,37 @@ struct Stats {
     uint64_t async_asid_write_in_window = 0;
     uint64_t async_win_peer_with_asidw = 0;
     uint64_t async_win_peer_no_asidw = 0;
+
+    /* Async-window LIVENESS vs INTERIORITY (both interrupt modes).
+     *
+     * QEMU's window flag spans the scheduler by design, so "a window is
+     * outstanding on this vCPU" and "this event came from inside the
+     * handler" are different propositions.  Conflating them vetoed the
+     * pinned process's own synchronous faults whenever another context's
+     * interrupt was still outstanding, which discarded the interrupted
+     * block's entire reg-delta slice.
+     *
+     *   async_interior_user_priv_kept   fault events admitted BECAUSE user
+     *                             privilege disproves interiority (an
+     *                             exception handler never runs there).  The
+     *                             rescued population; 0 means the condition
+     *                             did not arise, never that it cannot.
+     *   async_interior_kernel_refused   fault events still refused as
+     *                             window interior — kernel privilege, where
+     *                             telling our own kernel entry from the
+     *                             window owner's handler needs the owner's
+     *                             thread, which is only tracked with
+     *                             interrupts=1.  A KNOWN residue, measured
+     *                             rather than assumed away.
+     *   async_abandon_cursor_closed  abandoned-window recoveries that
+     *                             lowered the retention cursor.  An
+     *                             abandoned window emits no ASYNC_RETURN,
+     *                             so without this the cursor could never
+     *                             fall again and every later fault event on
+     *                             the vCPU was stamped in-async. */
+    uint64_t async_interior_user_priv_kept = 0;
+    uint64_t async_interior_kernel_refused = 0;
+    uint64_t async_abandon_cursor_closed = 0;
 
     /* Window-interior synchronous faults.  The producers push FAULT_ENTER
      * for every real synchronous fault, including one delivered while an

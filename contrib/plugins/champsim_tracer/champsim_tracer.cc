@@ -3336,6 +3336,7 @@ static void reset_segment_local_state(unsigned int cpu_index)
     cp_chain(cpu_index).reset();
     g_mem_recorder.clear_cp(cpu_index);
     pending_reg_snaps(cpu_index).clear();
+    cp_chain_snap_mark(cpu_index) = 0;
     /* A fresh window is never mid-close (the arm self-clears the moment
      * neither close is pending, so this is belt-and-braces). */
     deferred_close(cpu_index).window_close_armed = false;
@@ -4852,12 +4853,61 @@ void emit_body_entry(BodyStreamState *out_stream,
     g_seg_arch_insns += bb_tmpl ? bb_tmpl->n_insns : 0;
 }
 
-/* Append a CP fragment to the true-BB chain (per-exec seal walk). */
+/*
+ * Snaps at the FRONT of pending_reg_snaps that belong to the in-flight CP
+ * chain — i.e. to fragments already appended but not yet finalized into an
+ * emitted true BB.  Maintained only here and by the suspend/resume arrows;
+ * see cp_chain_append for why it exists.
+ */
+static size_t g_cp_chain_snap_mark[CST_PIN_MAX_VCPUS];
+
+size_t &cp_chain_snap_mark(unsigned int cpu_index)
+{
+    return g_cp_chain_snap_mark[cpu_index < CST_PIN_MAX_VCPUS
+                                ? cpu_index : CST_PIN_MAX_VCPUS - 1];
+}
+
+/*
+ * Append a CP fragment to the true-BB chain (per-exec seal walk).
+ *
+ * The reg-snap sink is POSITIONAL, so it has to follow the chain exactly.
+ * When append_fragment discards an in-flight chain — the interrupted-BB
+ * case: our kernel block runs half a true BB, an async window swallows the
+ * rest, and control comes back at an unrelated PC — those fragments will
+ * never be emitted, but their per-insn dst snaps were already captured and
+ * sit at the front of the sink.  Left there they become the next block's
+ * "leaked prefix": the emit-time backstop saw pending=3 against expected=1
+ * and trimmed 2, which recovers the COUNT while silently attributing the
+ * wrong values (the recovered stream passes the dataflow oracle only
+ * because the trim happens to leave this block's own snaps intact).  Drop
+ * them with the fragments that own them, and count the condition.
+ */
 static inline void cp_chain_append(unsigned int cpu_index, BBTemplate *frag)
 {
-    cp_chain(cpu_index).append_fragment(frag->start_pc, frag,
-                                        frag->fall_through_pc,
-                                        (TbTerminus)frag->terminus);
+    const bool dropped_chain =
+        cp_chain(cpu_index).append_fragment(frag->start_pc, frag,
+                                            frag->fall_through_pc,
+                                            (TbTerminus)frag->terminus);
+    if (!g_features.reg_data) {
+        return;
+    }
+    std::vector<RegSnap> &pend = pending_reg_snaps(cpu_index);
+    size_t &mark = cp_chain_snap_mark(cpu_index);
+    if (dropped_chain) {
+        /* min(): the mark can outlive its snaps (an emit or a segment
+         * reset empties the sink without a chain event), and an
+         * over-erase would corrupt the very stream this protects. */
+        const size_t n = mark < pend.size() ? mark : pend.size();
+        if (n) {
+            pend.erase(pend.begin(), pend.begin() + (ptrdiff_t)n);
+            g_stats.reg_snap_chain_drop_discarded += n;
+        }
+        g_stats.reg_snap_chain_drops++;
+    }
+    /* Everything now pending belongs to the chain this fragment is in:
+     * earlier entries are earlier fragments of the same chain, and the
+     * fragment just appended pushed the rest. */
+    mark = pend.size();
 }
 
 /* Finalize and reset the CP chain if it now forms a complete true BB.

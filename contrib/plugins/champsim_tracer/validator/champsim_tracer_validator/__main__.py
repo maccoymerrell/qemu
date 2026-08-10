@@ -721,8 +721,9 @@ def _check_segment_coverage(console_log: Path, require_ok: bool = False,
         line = (f"coverage[{label}]: covered={s['covered']} "
                 f"budget={s['budget']} flag={s['flag']} "
                 f"arch/user={ratio:.2f} (user_clock={s['user_clock']})")
-        if s["flag"] == "UNDER":
-            print(f"{line}  FAIL (window closed under budget)")
+        if s["flag"] in SYS.TRUNCATING_CLOSE_FLAGS:
+            print(f"{line}  FAIL (window closed {s['flag']}: "
+                  f"{SYS.TRUNCATING_CLOSE_FLAGS[s['flag']]})")
             rc = 1
         elif require_ok and s["flag"] != "OK":
             print(f"{line}  FAIL (expected the window to close at "

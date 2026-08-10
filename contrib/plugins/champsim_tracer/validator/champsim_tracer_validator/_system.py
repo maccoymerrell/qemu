@@ -179,9 +179,25 @@ def assess_online_cpus(console_text: str, smp: int,
 
 # The plugin's per-segment close line (stderr).  In marker mode the
 # coverage and budget run on the user-instruction clock and carry the
-# "user_" prefix; OK = covered >= budget, END = closed by the end
-# marker / workload exit under budget, UNDER = closed early for any
-# other reason (always a failure).
+# "user_" prefix.  SIX close flags exist, and every one of them has to be
+# admitted here:
+#
+#   OK        covered >= budget
+#   END       the end marker executed -- the workload finished under budget
+#   UNDER     closed early for any other reason (always a failure)
+#   IDLE      a dead latch: the window was open on a process that stopped
+#   CEILING   an architectural stall ceiling terminated an unbounded run
+#   SHUTDOWN  the machine went down with the window still open
+#
+# The last three are FORCED, TRUNCATING closes -- exactly the ones a
+# progress gate exists to judge -- and until this pattern named them, a
+# segment that closed for any of them matched nothing, parse_finished_segments
+# returned an empty list, and the caller reported "the plugin never closed a
+# window".  That is the same failure 7c2144b89c fixed one layer up: a gate
+# that cannot find its subject.  It fails loudly rather than passing
+# vacuously, but it fails with the wrong diagnosis and it takes the whole
+# guest-clock progress gate down with it on precisely the cells that were
+# terminated for lack of progress.
 #
 # Written as a fixed prefix plus a KEY=VALUE scan of the tail, because the
 # tail grows: `wire_user_insns` / `clock_minus_wire` were appended to this
@@ -192,7 +208,22 @@ def assess_online_cpus(console_text: str, smp: int,
 # fields this module reads means a future field cannot do that again.
 _FINISHED_SEG_RE = re.compile(
     r"champsim_tracer: finished segment \[icount (\d+) \.\. (\d+)\]"
-    r"((?:\s+\w+=-?\d+)+)\s+(OK|END|UNDER)")
+    r"((?:\s+\w+=-?\d+)+)\s+(OK|END|UNDER|IDLE|CEILING|SHUTDOWN)")
+
+# The flags that mean the capture was cut short by something other than its
+# own budget or the workload's own end.  Each is a failure, and each names
+# itself rather than being folded into UNDER: which one fired says whether
+# the process stopped running (IDLE), the guest stopped making progress at
+# all (CEILING), or the machine went down under an open window (SHUTDOWN).
+TRUNCATING_CLOSE_FLAGS = {
+    "UNDER":    "the guest stopped making user-space progress",
+    "IDLE":     "the pinned process went idle and the dead-latch close "
+                "fired -- the window was open on a process that stopped",
+    "CEILING":  "an architectural stall ceiling terminated the run -- the "
+                "guest retired instructions without the traced process "
+                "executing one user-space instruction",
+    "SHUTDOWN": "the machine shut down with the window still open",
+}
 # clock_minus_wire is signed: a residual can go either way, and a pattern
 # that only admits digits would truncate the field scan before the flag.
 _SEG_FIELD_RE = re.compile(r"(\w+)=(-?\d+)")
@@ -356,10 +387,11 @@ def assess_clock_progress(segments: list[dict], label: str = "") -> list[str]:
                 f"(the plugin never closed a window)"]
     bad = []
     for s in segments:
-        if s["flag"] == "UNDER":
-            bad.append(f"{label}: window closed UNDER budget "
+        why = TRUNCATING_CLOSE_FLAGS.get(s["flag"])
+        if why:
+            bad.append(f"{label}: window closed {s['flag']} short of budget "
                        f"(covered={s['covered']} budget={s['budget']}) -- "
-                       f"the guest stopped making user-space progress")
+                       f"{why}")
         cov, arch = s["covered"], s["trace_arch_insns"]
         if cov >= CLOCK_INFLATION_MIN_COVERED and arch / cov > CLOCK_INFLATION_MAX:
             bad.append(

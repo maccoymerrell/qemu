@@ -5467,10 +5467,47 @@ static void finish_trace_segment(bool prev_executed = true,
                 if (!b || !b->prev()) {
                     continue;
                 }
-                uint32_t held = tb_head_insns(b->prev());
-                g_stats.close_peer_slots_flushed++;
-                g_stats.close_peer_insns_recovered += held;
+                /*
+                 * COUNT WHAT THE FLUSH EMITTED, NOT WHAT THE SLOT HELD.
+                 *
+                 * This used to add tb_head_insns(prev) BEFORE calling
+                 * flush_final and never look at whether the flush emitted
+                 * anything — a number that reports success without
+                 * verifying it.  It read "1 peer slot flushed / 3 insns
+                 * recovered" in 24 of 24 single-core cells where nothing
+                 * was at risk and nothing reached the wire, and it counted
+                 * the slot's FULL translated length even where the flush
+                 * correctly truncated to what ran.  Measure the wire
+                 * instead: the delta in emitted arch instructions across
+                 * the flush is exactly what was recovered.
+                 *
+                 * The flush also drains this peer's open fault frames (see
+                 * flush_frames_at_close), which have their own counter, so
+                 * their share is subtracted rather than double-counted.
+                 */
+                const uint64_t arch_before = g_seg_arch_insns;
+                const uint64_t user_before = g_stats.wire_user_arch_insns;
+                const uint64_t frame_before =
+                    g_stats.close_frame_insns_recovered;
                 b->flush_final();
+                const uint64_t from_frames =
+                    g_stats.close_frame_insns_recovered - frame_before;
+                uint64_t got = g_seg_arch_insns - arch_before;
+                uint64_t got_user = g_stats.wire_user_arch_insns - user_before;
+                got = got >= from_frames ? got - from_frames : 0;
+                if (got_user > got) {
+                    got_user = got;
+                }
+                g_stats.close_peer_slots_flushed++;
+                if (got == 0) {
+                    /* The slot held a block but the flush put nothing on the
+                     * wire — nothing was recovered, and saying so is the
+                     * whole point of measuring instead of asserting. */
+                    g_stats.close_peer_slots_emitted_nothing++;
+                } else {
+                    g_stats.close_peer_insns_recovered += got;
+                    g_stats.close_peer_user_insns_recovered += got_user;
+                }
             }
         } else {
             /* plugin_exit with a segment still active (abnormal end: the

@@ -385,11 +385,28 @@ struct Stats {
      * block at its full translated length on no evidence. */
     uint64_t close_walk_extent_from_stash = 0;
     /* Pending-seal slots flushed at a segment close from a vCPU OTHER than
-     * the closing one, and the architectural instructions they carried.
-     * Each is a TB the pinned process executed on a vCPU it then left; they
-     * used to be dropped.  Non-zero exactly when the process migrated. */
+     * the closing one.  Each is a TB the pinned process executed on a vCPU
+     * it then left; they used to be dropped.  Non-zero exactly when the
+     * process migrated.
+     *
+     * close_peer_insns_recovered is the DELTA IN EMITTED ARCH INSTRUCTIONS
+     * across the flush, minus the share the frame drain claims — what
+     * reached the wire, not what the slot held.  It used to be
+     * tb_head_insns(prev) added BEFORE the flush and never checked against
+     * it, which reported "1 peer slot flushed / 3 insns recovered" in 24 of
+     * 24 single-core cells where nothing was at risk and nothing was
+     * emitted, and quoted the slot's FULL translated length even where the
+     * flush correctly truncated to what ran.
+     *
+     * close_peer_slots_emitted_nothing is that case named: a slot held a
+     * block and the flush emitted none of it.  Non-zero is not by itself a
+     * defect (a peer slot whose block the walk truncates to zero has nothing
+     * to emit, and the clock never billed it either), but it is the number
+     * the old instrument was silently reporting as a recovery. */
     uint64_t close_peer_slots_flushed = 0;
     uint64_t close_peer_insns_recovered = 0;
+    uint64_t close_peer_user_insns_recovered = 0;
+    uint64_t close_peer_slots_emitted_nothing = 0;
     /* The same three quantities for the PER-EXECUTION seal walk
      * (collect_finalized_bbs).  A guest instruction that touches device
      * MMIO from anywhere but its TB's last slot, an atomic that needs

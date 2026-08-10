@@ -1356,16 +1356,25 @@ static inline uint64_t live_thread_id(void)
     return qemu_plugin_get_thread_id();
 }
 
-/* A zero thread id for a REAL address space means the CPU model implements
- * no thread-pointer register, so strands inside the window cannot be told
- * apart by name.  Say so once, loudly, because a silently coarse strand
- * label is worse than a stated one.
+/* A zero thread id for a REAL address space means strands inside the window
+ * cannot be told apart by name.  Say so once, loudly, because a silently
+ * coarse strand label is worse than a stated one.
  *
- * IT IS NOT AN OWNERSHIP PROBLEM AND NOTHING IS RETIRED.  Ownership is the
- * page-table root and never consults a thread name, so a window on a
- * thread-nameless model traces exactly the same instructions as one on a
- * model that names threads; only the per-strand labelling is coarser.
- * Caller holds exec_lock. */
+ * TWO DIFFERENT CAUSES, AND THE MESSAGE MUST NOT CONFLATE THEM.  A zero can
+ * mean the CPU MODEL implements no thread-pointer register at all (a MIPS
+ * model with Config3.ULRI clear), in which case no process on this guest will
+ * ever be named; or it can mean THIS PROCESS has no TLS base installed —
+ * every -nostdlib guest binary the validator generates is in that state, on
+ * targets (arm, riscv, i386) whose models do implement the register.  Only
+ * qemu_plugin_identity_caps() can tell them apart, and printing the model
+ * diagnosis for the process case names a MIPS condition on an ARM guest and
+ * sends a reader looking for a -cpu they cannot change.
+ *
+ * IT IS NOT AN OWNERSHIP PROBLEM AND NOTHING IS RETIRED, either way.
+ * Ownership is the page-table root and never consults a thread name, so a
+ * window with no thread identity traces exactly the same instructions as one
+ * with it; only the per-strand labelling is coarser.  Caller holds
+ * exec_lock. */
 static void pin_note_thread_naming(uint64_t asid, uint64_t tid)
 {
     static bool warned = false;
@@ -1375,12 +1384,22 @@ static void pin_note_thread_naming(uint64_t asid, uint64_t tid)
     if (!warned) {
         warned = true;
         g_stats.pin_thread_identity_absent++;
-        fprintf(stderr,
-                "champsim_tracer: this CPU model names no thread "
-                "architecturally (no thread-pointer register — a MIPS model "
-                "with Config3.ULRI clear), so strands inside the window "
-                "share one label; ownership is unaffected — it keys on the "
-                "page-table root, not on a thread\n");
+        if (qemu_plugin_identity_caps() & QEMU_PLUGIN_IDENT_NAMES_THREAD) {
+            fprintf(stderr,
+                    "champsim_tracer: the pinned process has no thread "
+                    "pointer installed (the CPU model implements one; this "
+                    "process left it zero — a -nostdlib binary with no TLS, "
+                    "or a kernel thread), so strands inside the window share "
+                    "one label; ownership is unaffected — it keys on the "
+                    "page-table root, not on a thread\n");
+        } else {
+            fprintf(stderr,
+                    "champsim_tracer: this CPU model names no thread "
+                    "architecturally (no thread-pointer register — a MIPS "
+                    "model with Config3.ULRI clear), so strands inside the "
+                    "window share one label; ownership is unaffected — it "
+                    "keys on the page-table root, not on a thread\n");
+        }
     }
 }
 

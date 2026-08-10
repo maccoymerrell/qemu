@@ -721,6 +721,32 @@ def _check_segment_coverage(console_log: Path, require_ok: bool = False,
         line = (f"coverage[{label}]: covered={s['covered']} "
                 f"budget={s['budget']} flag={s['flag']} "
                 f"arch/user={ratio:.2f} (user_clock={s['user_clock']})")
+        # THE CLOCK AND THE WIRE MUST AGREE, EXACTLY.
+        #
+        # clock_minus_wire is (user instructions the window clock billed) -
+        # (user instructions emitted).  Positive means the trace is SHORT of
+        # what the guest ran -- instructions were dropped.  Negative means
+        # the wire claims instructions the guest never executed.  Neither is
+        # ever acceptable, at any rate, and the plugin has published the
+        # number on every segment line since 5e5d963255 while nothing read
+        # it.  Checked here so every system cell carries the check for free
+        # rather than each harness recomputing it.
+        #
+        # Only asserted when the field is present: a trace captured by a
+        # plugin that predates the field is not a cell that silently passes,
+        # it is a cell this leg has no subject in, and it says so.
+        if "clock_minus_wire" in s:
+            if s["clock_minus_wire"] != 0:
+                print(f"coverage[{label}]: FAIL  clock_minus_wire="
+                      f"{s['clock_minus_wire']} -- the window clock and the "
+                      f"wire disagree by "
+                      f"{abs(s['clock_minus_wire'])} user instruction(s) "
+                      f"({'the trace is short of what ran' if s['clock_minus_wire'] > 0 else 'the wire claims instructions that never ran'})")
+                rc = 1
+        else:
+            print(f"coverage[{label}]: note  no clock_minus_wire= on the "
+                  f"segment line -- the clock-vs-wire leg has no subject in "
+                  f"this trace and did not run")
         if s["flag"] in SYS.TRUNCATING_CLOSE_FLAGS:
             print(f"{line}  FAIL (window closed {s['flag']}: "
                   f"{SYS.TRUNCATING_CLOSE_FLAGS[s['flag']]})")

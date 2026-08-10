@@ -26,6 +26,7 @@
 #include "qemu/main-loop.h"
 #include "qemu/timer.h"
 #include "qemu/lockable.h"
+#include "qemu/error-report.h"
 #include "system/cpu-timers.h"
 #include "system/replay.h"
 #include "system/cpus.h"
@@ -563,6 +564,43 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
         qemu_mutex_lock(&timer_list->active_timers_lock);
 
         progress = true;
+
+        /*
+         * A callback that re-arms its OWN timer at a time this pass already
+         * counts as expired turns the loop above into an unbounded one:
+         * @current_time is sampled ONCE, before the loop, so the timer is
+         * popped straight back out and the callback runs again forever.  The
+         * iothread runs this loop holding the BQL, so the whole machine stops
+         * -- every vCPU starves and the guest makes no architectural progress
+         * while the process burns 100% of a core.
+         *
+         * A running clock used to hide it (@now moves a nanosecond and the
+         * loop ends), which is why such a device could sit in the tree
+         * unnoticed.  A clock that does NOT run -- a TCG plugin freezing
+         * QEMU_CLOCK_VIRTUAL to keep its own instrumentation cost out of
+         * guest time -- removes that accident and the wedge is permanent.
+         * Measured, not hypothesised: hw/timer/mips_gictimer.c re-armed at
+         * exactly @now whenever the guest programmed compare == count.
+         *
+         * Leave it for the NEXT pass instead of running it again here.  That
+         * costs nothing: main_loop_wait comes straight back round, so the
+         * timer is late by at most one poll -- and the BQL is dropped in
+         * between, so the vCPUs run and whatever was freezing the clock gets
+         * to unfreeze it.  Say so once, and name the callback: a device with
+         * this defect must be reported, not silently papered over.
+         *
+         * @ts is only dereferenced after it is shown to be back on the list,
+         * so a callback that deleted its own timer is not touched.
+         */
+        if (timer_list->active_timers == ts &&
+            timer_expired_ns(ts, current_time)) {
+            warn_report_once("timer callback %p re-armed its own timer at or "
+                             "before the time it fired at; deferring it to the "
+                             "next pass rather than looping on it (this is a "
+                             "bug in that device model)", cb);
+            qemu_mutex_unlock(&timer_list->active_timers_lock);
+            goto out;
+        }
     }
     qemu_mutex_unlock(&timer_list->active_timers_lock);
 

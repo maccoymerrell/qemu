@@ -743,6 +743,22 @@ A device timer may not re-arm itself at the current time
    is required to reach it beyond a virtual clock that stops.  Any
    other device model with the same shape has the same obligation.
 
+``timerlist_run_timers`` defers a self-re-arming timer (``util/qemu-timer.c``)
+
+   The backstop for the rule above, because a rule enforced only in the
+   one device known to have broken it is not enforced.  After each
+   callback the loop checks whether the timer it just ran is back at the
+   head of the list and still expired against the pass's sampled
+   ``current_time``; if so it warns once, naming the callback, and
+   leaves it for the next pass.  ``main_loop_wait`` comes straight back
+   round, so the timer is late by at most one poll — and the BQL is
+   dropped in between, so the vCPUs run and whatever froze the clock
+   gets to unfreeze it.
+
+   It bounds ONE shape, a callback re-arming its OWN timer.  Two devices
+   re-arming each other would still loop; that shape has not been
+   observed and is not guessed at here.
+
 Interrupt replay across the wrong-path rollback
 
    Arm's ``env->irq_line_state`` and RISC-V's ``env->mip`` are inside

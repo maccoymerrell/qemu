@@ -6646,12 +6646,19 @@ bool collect_finalized_bbs(unsigned int cpu_index,
      *   re-run's own block carry it.
      */
     uint64_t started = 0;
+    const bool falsify = trunc_falsifier_seal();
     const bool have_extent =
-        retired_executed_prev(cpu_index, prev_tb_head, &started);
+        !falsify && retired_executed_prev(cpu_index, prev_tb_head, &started);
     const uint32_t tb_total = tb_head_insns(prev_tb_head);
     uint64_t executed = started;
     bool aborted_tail = false;
-    if (!have_extent) {
+    if (falsify) {
+        /* The extent question was never asked, so this is not an unknown
+         * extent — it is the pre-a07df2d053 walk, which had no such
+         * question.  Leaving the counter alone keeps the falsified arm
+         * comparable to the healthy one everywhere the switch is not the
+         * variable. */
+    } else if (!have_extent) {
         g_stats.seal_walk_extent_unknown++;
     } else if (started > 0 && started < tb_total &&
                tb_head_insn_pc_at(prev_tb_head,

@@ -109,6 +109,73 @@ static bool retain_check()
     return v;
 }
 
+/* ----------------------------------------------------------------------
+ * CST_NO_TRUNC — the truncation falsifier.
+ *
+ * Six instruments read zero on a healthy capture: the two walks' truncation
+ * counts, the reg-snap slice drops they used to cause, and the wire's
+ * duplicate instructions.  A zero is worth nothing unless the instrument can
+ * be shown able to FIRE on the target it is quoted for, and "the fix is in
+ * ISA-independent code" is an argument, not a measurement.
+ *
+ * This switch restores the pre-fix behaviour of the walk it names: the extent
+ * question is not asked, so the last fragment is appended at its full
+ * TRANSLATED length exactly as it was before 32863f0430 (close walk) and
+ * a07df2d053 (seal walk).  Run the same cell twice, once with it, and the
+ * zero becomes a measurement on THIS target.
+ *
+ *   CST_NO_TRUNC=close   segment-close walk only
+ *   CST_NO_TRUNC=seal    per-execution seal walk only
+ *   CST_NO_TRUNC=both    both (also: 1, or any value naming neither)
+ *
+ * NEVER set this on a capture run.  It deliberately puts instructions on the
+ * wire that the guest did not execute, and duplicates them in the block that
+ * follows.  It announces itself on stderr for exactly that reason: a trace
+ * produced under it has to be identifiable as one afterwards.
+ *
+ * It does NOT suppress the *_extent_unknown counters' subject, because it
+ * never asks the extent question at all — those stay at their healthy value
+ * so the falsified arm is still comparable everywhere else.
+ * ----------------------------------------------------------------------
+ */
+static unsigned truncation_falsifier_mask()
+{
+    static const unsigned m = []() -> unsigned {
+        const char *e = getenv("CST_NO_TRUNC");
+        if (e == nullptr) {
+            return 0u;
+        }
+        unsigned v = 0;
+        if (strstr(e, "close") != nullptr) {
+            v |= 1u;
+        }
+        if (strstr(e, "seal") != nullptr) {
+            v |= 2u;
+        }
+        if (v == 0u) {
+            v = 3u;                    /* "", "1", "both", anything else */
+        }
+        fprintf(stderr,
+                "champsim_tracer: CST_NO_TRUNC=%s — %s%s%s walk truncation "
+                "DISABLED.  This trace claims instructions the guest did not "
+                "execute; it is a falsifier arm, not a capture.\n",
+                e, (v & 1u) ? "close" : "", (v == 3u) ? "+" : "",
+                (v & 2u) ? "seal" : "");
+        return v;
+    }();
+    return m;
+}
+
+bool trunc_falsifier_close(void)
+{
+    return (truncation_falsifier_mask() & 1u) != 0u;
+}
+
+bool trunc_falsifier_seal(void)
+{
+    return (truncation_falsifier_mask() & 2u) != 0u;
+}
+
 /* CST_SLOW_FOLD rescans the retention for async edges, so it measures the
  * intended thing only when the retention still contains them.  Refuse the
  * invalid pairing instead of silently measuring a third, unnamed arm. */
@@ -1190,7 +1257,7 @@ void PathBuilder::flush_final(bool walk_prev)
      */
     uint64_t executed = 0;
     bool have_extent = false;
-    if (walk_prev && prev_tb_) {
+    if (walk_prev && prev_tb_ && !trunc_falsifier_close()) {
         have_extent = retired_executed_of(cpu_index, prev_tb_, &executed);
         if (!have_extent) {
             g_stats.close_walk_extent_unknown++;

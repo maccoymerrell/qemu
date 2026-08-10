@@ -216,6 +216,12 @@ bool retired_executed_of(unsigned int cpu_index, const BBTemplate *head,
 bool retired_executed_prev(unsigned int cpu_index, const BBTemplate *head,
                            uint64_t *out);
 
+/* CST_NO_TRUNC falsifier: is the named walk's truncation disabled?  See
+ * truncation_falsifier_mask() in champsim_tracer_path_builder.cc.  True only
+ * in a deliberately falsified arm — never in a capture run. */
+bool trunc_falsifier_close(void);
+bool trunc_falsifier_seal(void);
+
 /* Index of @pc among the instructions of the dispatched TB whose head is
  * @head (fragments walked in execution order), or UINT32_MAX. */
 uint32_t tb_head_insn_index(const BBTemplate *head, uint64_t pc);

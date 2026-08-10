@@ -5436,8 +5436,16 @@ static void finish_trace_segment(bool prev_executed = true,
      * empty, and none of them could show it.
      */
     static const bool census_print = getenv("CST_CLOSEDROP") != nullptr;
-    const char *census_why = g_seg_close_reason ? g_seg_close_reason
-        : (prev_executed ? "exec" : "deferred");
+    /* Name the close ROUTE, not just the flush mode: "exec"/"deferred"
+     * lumped the END marker, the dead latch and the plugin_exit teardown
+     * into one string, and a census whose rows cannot be grouped by close
+     * reason cannot answer "which holders are occupied at which kind of
+     * close". */
+    const char *census_why =
+        g_seg_close_reason ? g_seg_close_reason
+        : (closing_cpu == UINT32_MAX ? "EXIT"
+           : (g_seg_end_marker_close ? "END"
+              : (prev_executed ? "exec" : "BUDGET")));
     g_stats.census_closes++;
     /*
      * MIRRORED TO THE STATS FILE, NOT ONLY TO stderr.  In user mode the
@@ -5573,7 +5581,19 @@ static void finish_trace_segment(bool prev_executed = true,
      * the instrument's job is to say what happened.
      */
     {
-        const Stats &s = g_stats;
+        /*
+         * OVER THE AGGREGATE, NOT THE CLOSING THREAD'S SLICE.
+         *
+         * Stats is per-thread (g_stats is thread_stats_get()) and under
+         * MTTCG a holder is FILLED on its own vCPU's thread while the
+         * close runs on whichever vCPU crossed the budget.  Reading
+         * g_stats here made a suspension pushed on vCPU 1 and held at a
+         * close taken on vCPU 3 report "pushed=0 fated=0 held=1" — the
+         * identity broken by the instrument's own bookkeeping rather than
+         * by the tracer.  The occupancy delta below is still this thread's
+         * (the post pass ran on it, and only on it).
+         */
+        const Stats s = stats_snapshot();
         const uint64_t frames_fated =
             s.census_frames_merged + s.census_frames_unwound_emitted +
             s.census_frames_unwound_dropped + s.census_frames_faults0_dropped +

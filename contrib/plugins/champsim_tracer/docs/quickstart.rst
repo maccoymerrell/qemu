@@ -808,7 +808,8 @@ derive it from the image you boot (percpu symbol ``current_task``, or
 unstripped ``vmlinux``, or the guest's own ``/proc/kallsyms``; the
 validator's ``derive_curtask`` module automates all three.  Without
 the option kernel identity is unchanged (the collapse is the
-documented degraded contract — see :ref:`limits-kernel-strand`);
+documented degraded contract — see :ref:`the kernel-strand
+contract <limits-kernel-strand>`);
 x86-64 system mode only, ignored elsewhere with a warning.
 
 **Determinism.**  The reproducibility flags in

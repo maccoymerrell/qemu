@@ -1258,7 +1258,8 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
        ``System.map`` / ``nm`` / guest ``/proc/kallsyms`` by hand);
        never reuse an offset across kernel builds.  Unset keeps the
        register-only contract byte-for-byte (see
-       :ref:`limits-kernel-strand`).  x86-64 system mode only; a
+       :ref:`the kernel-strand contract
+       <limits-kernel-strand>`).  x86-64 system mode only; a
        malformed value refuses install.
    * - ``latch_timeout=<ms>``
      - ``0`` (disabled)

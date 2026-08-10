@@ -710,6 +710,39 @@ tick/scheduler storm.
    deferred expiry has to be re-delivered, not as the gate on whether
    to reconcile.
 
+A device timer may not re-arm itself at the current time
+(``gic_vptimer_update``, ``hw/timer/mips_gictimer.c``)
+
+   The freeze above makes ``QEMU_CLOCK_VIRTUAL`` stand still, and that
+   turns a latent rule about ``QEMUTimer`` callbacks into a hard one:
+   *a callback must never re-arm its own timer at a time that is not
+   strictly later than the time it fired at.*
+
+   ``timerlist_run_timers`` samples ``current_time`` **once**, before
+   its callback loop, and ``timer_expired_ns`` counts
+   ``expire_time <= current_time`` as expired.  A callback that re-arms
+   at exactly ``now`` therefore has its timer popped straight back out
+   of the list, and the loop — which the iothread runs holding the BQL
+   — never ends.  Every vCPU starves behind the BQL and the guest stops
+   dead while the process burns 100% of a core.
+
+   With the clock running the hazard self-limits: ``now`` advances a
+   nanosecond and the loop exits.  With the clock frozen it does not.
+
+   The MIPS GIC per-VP timer computed ``wait = compare - count`` and
+   re-armed at ``now + wait * TIMER_PERIOD`` with no clamp, so a guest
+   that programs ``compare`` equal to the current count wedges the
+   machine.  It is now clamped to a full counter wrap, which is also
+   the architectural meaning of the equality match, and which is what
+   the R4K CP0 timer next door (``cpu_mips_timer_update``,
+   ``target/mips/system/cp0_timer.c``) already did for the identical
+   arithmetic.
+
+   This is an upstream QEMU defect, not a tracer limitation: the guest
+   programming that triggers it is legal, and nothing about the tracer
+   is required to reach it beyond a virtual clock that stops.  Any
+   other device model with the same shape has the same obligation.
+
 Interrupt replay across the wrong-path rollback
 
    Arm's ``env->irq_line_state`` and RISC-V's ``env->mip`` are inside

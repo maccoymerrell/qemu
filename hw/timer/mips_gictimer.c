@@ -25,6 +25,33 @@ static void gic_vptimer_update(MIPSGICTimerState *gictimer,
 
     wait = gictimer->vptimers[vp_index].comparelo - gictimer->sh_counterlo -
            (uint32_t)(now / TIMER_PERIOD);
+    /*
+     * Clamp interval to a full wrap if the compare register already equals
+     * the count, i.e. virtual time has not progressed since the guest
+     * programmed it.  Without this, @next == @now, and timer_expired_ns()
+     * counts expire_time <= current_time as ALREADY EXPIRED -- so
+     * timerlist_run_timers(), which samples current_time ONCE before its
+     * callback loop, pops this timer straight back out, calls in here again,
+     * computes the same zero, and never leaves the loop.  It runs that loop
+     * holding the BQL, so every vCPU starves behind it and the guest stops
+     * dead with the iothread at 100% CPU.
+     *
+     * A running virtual clock hides it: @now moves a nanosecond and the loop
+     * ends.  A clock that is not running does not, which is why a TCG plugin
+     * that freezes QEMU_CLOCK_VIRTUAL to keep its own instrumentation cost
+     * out of guest time (cpu_plugin_vclock_pause / the wrong-path excursion
+     * freeze) turns this into a permanent wedge -- reproduced on
+     * malta -cpu P5600 -smp 4, where vptimers[0].comparelo == sh_counterlo +
+     * now/TIMER_PERIOD exactly and cpu_ticks_enabled == 0.
+     *
+     * A full wrap is also what the equality-match semantics mean: the next
+     * time count matches compare is 2^32 ticks away.  The R4K CP0 timer next
+     * door already does exactly this for the identical arithmetic
+     * (cpu_mips_timer_update, target/mips/system/cp0_timer.c).
+     */
+    if (!wait) {
+        wait = UINT32_MAX;
+    }
     next = now + (uint64_t)wait * TIMER_PERIOD;
 
     timer_mod(gictimer->vptimers[vp_index].qtimer, next);

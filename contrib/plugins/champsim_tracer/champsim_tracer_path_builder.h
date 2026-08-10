@@ -511,6 +511,13 @@ public:
     void set_prev(BBTemplate *tb)
     {
         if (tb != prev_tb_) {
+            /* The outgoing prev is what the seal walk in THIS step is about
+             * to fold, and the measurement recorded for it is the only
+             * answer that survives the swap.  Carry it across; see
+             * seal_prev_extent(). */
+            seal_prev_ = prev_tb_;
+            seal_prev_extent_ = prev_extent_;
+            seal_prev_extent_valid_ = prev_extent_valid_;
             prev_extent_valid_ = false;
         }
         prev_tb_ = tb;
@@ -549,6 +556,36 @@ public:
             return false;
         }
         *out = prev_extent_;
+        return true;
+    }
+
+    /*
+     * THE SAME MEASUREMENT, FOR THE SEAL WALK.
+     *
+     * A seal DEFERRED past its own dispatch cannot ask the retired cursor
+     * how much of prev ran — the cursor has moved on — and the walk then
+     * folds prev at its FULL translated length, on the argument that a
+     * prev still pending at a later dispatch was left at a TB boundary and
+     * therefore ran to its end.  a07df2d053's own comment names the door
+     * that argument leaves open, and seal_walk_extent_unknown_interior is
+     * the instrument that watches it: measured firing on aarch64, one
+     * latch cell in 33, folding 21 instructions the dispatch never ran
+     * (the block resuming at current_pc then re-covers them, so the wire
+     * DUPLICATES them).
+     *
+     * The extent is not actually unknown.  It was measured at the first
+     * dispatch after prev (note_prev_extent), which is exactly the step
+     * whose seal was deferred, and set_prev carries it here as prev is
+     * swapped out.  @head guards it: the answer is only offered for the
+     * very block it was measured for.
+     */
+    bool seal_prev_extent(const BBTemplate *head, uint64_t *out) const
+    {
+        if (!seal_prev_extent_valid_ || head == nullptr ||
+            head != seal_prev_) {
+            return false;
+        }
+        *out = seal_prev_extent_;
         return true;
     }
 
@@ -797,6 +834,11 @@ private:
      * dispatch after it, for the close walk on a vCPU the process left. */
     uint64_t prev_extent_ = 0;
     bool     prev_extent_valid_ = false;
+    /* The outgoing prev and its measurement, carried across the swap for
+     * the seal walk of the same step (see seal_prev_extent). */
+    const BBTemplate *seal_prev_ = nullptr;
+    uint64_t seal_prev_extent_ = 0;
+    bool     seal_prev_extent_valid_ = false;
     uint32_t prev_depth_ = 0;
 
     /* Owner identity of the current pending-seal prev, sampled at its promote

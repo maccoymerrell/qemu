@@ -420,6 +420,12 @@ struct Stats {
     uint64_t seal_walk_insns_not_executed = 0;
     uint64_t seal_walk_aborted_tails = 0;
     uint64_t seal_walk_extent_unknown = 0;
+    /* Deferred seals whose extent came from the measurement taken at the
+     * first dispatch after prev (PathBuilder::seal_prev_extent) instead of
+     * from the retired cursor, which cannot answer for them.  Non-zero is
+     * ordinary; it is what keeps seal_walk_extent_unknown_interior at 0
+     * rather than folding a deferred prev at its full translated length. */
+    uint64_t seal_walk_extent_from_stash = 0;
     /* The unknown-extent argument's own falsifier, and the proof that the
      * probe which states it can fire.
      *

@@ -6724,8 +6724,28 @@ bool collect_finalized_bbs(unsigned int cpu_index,
      */
     uint64_t started = 0;
     const bool falsify = trunc_falsifier_seal();
-    const bool have_extent =
+    bool have_extent =
         !falsify && retired_executed_prev(cpu_index, prev_tb_head, &started);
+    /*
+     * A DEFERRED SEAL'S EXTENT IS NOT ACTUALLY UNKNOWN.
+     *
+     * The retired cursor answers only for the previous dispatch, so a seal
+     * deferred past its own dispatch used to get no answer and fold prev at
+     * its FULL translated length -- on the argument that a prev still
+     * pending later was left at a TB boundary and ran to its end.
+     * a07df2d053's comment names the door that leaves open, and
+     * seal_walk_extent_unknown_interior watches it: on aarch64 it fired,
+     * one latch cell in 33, folding 21 instructions the dispatch never ran
+     * so the block resuming at current_pc re-covered them and the wire
+     * DUPLICATED them.  The number was measured at the first dispatch after
+     * prev -- the very step whose seal was deferred -- and set_prev carries
+     * it across the swap.  Ask for it before declaring the extent unknown.
+     */
+    if (!falsify && !have_extent &&
+        path_builder(cpu_index).seal_prev_extent(prev_tb_head, &started)) {
+        have_extent = true;
+        g_stats.seal_walk_extent_from_stash++;
+    }
     const uint32_t tb_total = tb_head_insns(prev_tb_head);
     uint64_t executed = started;
     bool aborted_tail = false;

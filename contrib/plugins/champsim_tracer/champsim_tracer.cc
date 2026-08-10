@@ -6774,7 +6774,7 @@ bool collect_finalized_bbs(unsigned int cpu_index,
      * prev -- the very step whose seal was deferred -- and set_prev carries
      * it across the swap.  Ask for it before declaring the extent unknown.
      */
-    if (!falsify && !have_extent &&
+    if (!falsify && !seal_stash_falsifier() && !have_extent &&
         path_builder(cpu_index).seal_prev_extent(prev_tb_head, &started)) {
         have_extent = true;
         g_stats.seal_walk_extent_from_stash++;
@@ -6782,13 +6782,27 @@ bool collect_finalized_bbs(unsigned int cpu_index,
     const uint32_t tb_total = tb_head_insns(prev_tb_head);
     uint64_t executed = started;
     bool aborted_tail = false;
+    if (!falsify && !have_extent && prev_tb_head != nullptr &&
+        seal_extent_diag()) {
+        PathBuilder &pbd = path_builder(cpu_index);
+        unsigned miss = pbd.seal_extent_miss(prev_tb_head);
+        fprintf(stderr, "[sealext] UNANSWERED prev=0x%" PRIx64 " n=%u "
+                "cur=0x%" PRIx64 " at=%u miss=%u(%s%s) seal_prev=0x%" PRIx64
+                " live_valid=%d susp=%zu\n",
+                prev_tb_head ? prev_tb_head->start_pc : 0, tb_total,
+                current_pc, tb_head_insn_index(prev_tb_head, current_pc),
+                miss, (miss & 1u) ? "no-measurement " : "",
+                (miss & 2u) ? "other-block" : "",
+                pbd.seal_prev_block() ? pbd.seal_prev_block()->start_pc : 0,
+                (int)pbd.live_prev_extent_valid(), pbd.susp_depth());
+    }
     if (falsify) {
         /* The extent question was never asked, so this is not an unknown
          * extent — it is the pre-a07df2d053 walk, which had no such
          * question.  Leaving the counter alone keeps the falsified arm
          * comparable to the healthy one everywhere the switch is not the
          * variable. */
-    } else if (!have_extent) {
+    } else if (!have_extent && prev_tb_head != nullptr) {
         g_stats.seal_walk_extent_unknown++;
         /*
          * ASK THE JUSTIFICATION'S OWN QUESTION.

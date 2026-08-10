@@ -408,14 +408,28 @@ struct Stats {
      * kernel device code has them.  What must be zero is what they used to
      * cost — reg_snap_slice_dropped and the wire's duplicate instructions.
      *
-     * seal_walk_extent_unknown is not a defect either: a seal DEFERRED past
-     * its own dispatch (a foreign or async span bailed the step before the
-     * promote) has no retired delta of its own to read, and the walk then
-     * behaves exactly as it did before — full extent, no truncation.  Full
-     * extent is also the RIGHT answer there, by the same argument the
-     * prev_start fallback rests on: an interrupt or a foreign span is taken
-     * at a TB boundary, so a prev that is still pending at a later dispatch
-     * ran to its end. */
+     * seal_walk_extent_unknown MUST be 0.  It used to be excused — a seal
+     * DEFERRED past its own dispatch has no retired delta of its own to
+     * read, so the walk folded prev at its FULL translated length on the
+     * argument that an interrupt or a foreign span is taken at a TB
+     * boundary.  That argument is unfalsifiable from inside the walk: the
+     * successor PC being interior to the folded block is ambiguous (a block
+     * abandoned mid-flight and a block that ran whole and branched into its
+     * own middle look identical), so the only sound answer is to never be
+     * without a measurement.  There always is one — it is taken at the first
+     * dispatch after prev (PathBuilder::note_prev_extent), which is exactly
+     * the step whose seal was deferred — and every reading of this counter
+     * has turned out to be a path that THREW THAT MEASUREMENT AWAY rather
+     * than a genuinely unanswerable question:
+     *   - a seal with no prev at all (the segment's first walk) asked the
+     *     question about a null block and counted the non-answer;
+     *   - a SELF-BRANCHING TB (cur == prev) skipped set_prev's carry
+     *     entirely, so the walk asked about the block it was folding while
+     *     the answer sat filed under the previous block's name.
+     * Both are closed.  CST_NO_SEAL_STASH is the falsifier arm that shows
+     * this counter can still fire: with the stash refused it reads 16-19 per
+     * riscv64 system cell and drags seal_walk_extent_unknown_interior with
+     * it. */
     uint64_t seal_walk_blocks_truncated = 0;
     uint64_t seal_walk_insns_not_executed = 0;
     uint64_t seal_walk_aborted_tails = 0;

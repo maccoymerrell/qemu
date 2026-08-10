@@ -178,6 +178,40 @@ bool trunc_falsifier_seal(void)
 }
 
 /*
+ * CST_NO_SEAL_STASH: the falsifier arm for the deferred-seal extent stash.
+ *
+ * With it set the seal walk may not consult the measurement taken at the
+ * first dispatch after prev, which is the whole of 81144d7401's fix — so a
+ * run pair with and without it MEASURES what the stash recovers instead of
+ * asserting it, and gives the "seal walks with an unknown extent" invariant
+ * an arm in which it demonstrably fires.  A falsifier arm, not a capture:
+ * the extent then really is unasked, and the fold claims instructions the
+ * dispatch may never have run.
+ */
+bool seal_stash_falsifier(void)
+{
+    static const bool v = []() {
+        if (getenv("CST_NO_SEAL_STASH") == nullptr) {
+            return false;
+        }
+        fprintf(stderr, "champsim_tracer: CST_NO_SEAL_STASH — the deferred "
+                "seal's extent measurement is NOT consulted.  This trace may "
+                "claim instructions the guest did not execute; it is a "
+                "falsifier arm, not a capture.\n");
+        return true;
+    }();
+    return v;
+}
+
+/* CST_SEALEXT: per-seal report of every extent question the walk could not
+ * answer from the retired cursor.  Diagnostic only, inert unless set. */
+bool seal_extent_diag(void)
+{
+    static const bool v = getenv("CST_SEALEXT") != nullptr;
+    return v;
+}
+
+/*
  * CST_NO_CLOSE_FRAMES: the falsifier arm for the close-time fault-frame
  * flush (PathBuilder::flush_frames_at_close).  With it set a segment close
  * leaves every open fault frame exactly where it used to leave it — for the

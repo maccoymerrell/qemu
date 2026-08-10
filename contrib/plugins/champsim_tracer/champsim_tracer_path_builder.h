@@ -222,6 +222,11 @@ bool retired_executed_prev(unsigned int cpu_index, const BBTemplate *head,
 bool trunc_falsifier_close(void);
 bool trunc_falsifier_seal(void);
 
+/* CST_NO_SEAL_STASH falsifier: is the deferred-seal extent stash disabled?
+ * True only in a deliberately falsified arm — never in a capture run. */
+bool seal_stash_falsifier(void);
+/* CST_SEALEXT: per-seal diagnostic print for unanswered extent questions. */
+bool seal_extent_diag(void);
 /* CST_NO_CLOSE_FRAMES falsifier: is the close-time fault-frame flush
  * disabled?  True only in a deliberately falsified arm. */
 bool close_frames_falsifier(void);
@@ -514,7 +519,27 @@ public:
      * extent recorded for the old one. */
     void set_prev(BBTemplate *tb)
     {
-        if (tb != prev_tb_) {
+        /*
+         * A SELF-BRANCHING TB STILL SWAPS.
+         *
+         * The carry used to be conditional on tb != prev_tb_, which is
+         * false for every tight single-block loop: cur IS prev, nothing was
+         * carried, and the seal walk then asked seal_prev_extent() about the
+         * block it was folding while the answer sat under the PREVIOUS
+         * block's name — @head rejected it and the walk declared the extent
+         * unknown and folded at full translated length on no evidence.
+         * Measured on riscv64 as the one surviving "seal walks with an
+         * unknown extent" per cell (prev=0x...bc44 seal_prev=0x...bc40,
+         * miss=other-block, with the live measurement valid).
+         *
+         * Carrying on the equal case also re-arms prev_extent_valid_, so the
+         * next dispatch measures the loop's NEXT iteration instead of the
+         * walk reading a measurement taken several iterations earlier.
+         * Only a null-to-null write is skipped: a repeated clear_prev() has
+         * nothing to carry and must not overwrite a live carry with a stale
+         * one.
+         */
+        if (tb != nullptr || prev_tb_ != nullptr) {
             /* The outgoing prev is what the seal walk in THIS step is about
              * to fold, and the measurement recorded for it is the only
              * answer that survives the swap.  Carry it across; see
@@ -592,6 +617,19 @@ public:
         *out = seal_prev_extent_;
         return true;
     }
+
+    /* Diagnostic only (CST_SEALEXT): WHY seal_prev_extent could not answer
+     * for @head.  Bit 0 — no measurement was carried across the swap at all;
+     * bit 1 — one was carried but it belongs to a DIFFERENT block.  The two
+     * misses have different causes and only the report distinguishes them. */
+    unsigned seal_extent_miss(const BBTemplate *head) const
+    {
+        return (seal_prev_extent_valid_ ? 0u : 1u) |
+               (head == seal_prev_ ? 0u : 2u);
+    }
+    const BBTemplate *seal_prev_block() const { return seal_prev_; }
+    bool live_prev_extent_valid() const { return prev_extent_valid_; }
+    size_t susp_depth() const { return susp_stack_.size(); }
 
     /* The pending-seal slot (the deferred prev TB); read by the blkwatch
      * exec print in vcpu_tb_exec's shared prologue. */

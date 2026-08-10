@@ -467,15 +467,28 @@ def run_with_clock_watchdog(cmd: list[str], log_path,
                 p.wait()
 
 
-_PIN_REUSE_RE = re.compile(r"pin ASID reuse suspected\s+(\d+)")
+# f2b6e2f4e7 replaced the single `pin ASID reuse suspected` heuristic with
+# the two counts the ownership model actually reasons from: how many raw ASID
+# names the guest committed anywhere since the pin (the allocator pressure the
+# churn test is manufacturing) and how many of them the OWNED address space
+# itself executed under (a pinned process that stays put reads 0).  The
+# validator kept asking for the old name and had been failing every churn
+# cell, on every ISA, ever since.
+_PIN_NAMES_RE = re.compile(
+    r"distinct raw ASID names committed since the pin\s+(\d+)")
+_OWNED_NAMES_RE = re.compile(
+    r"distinct raw ASID names the OWNED space executed under\s+(\d+)")
 _KEXC_ASID_RE = re.compile(r"kexc ASID-write events\s+(\d+)")
 
 
-def parse_pin_asid_reuse(stats_text: str) -> int | None:
-    """The `pin ASID reuse suspected` counter from a <out>.stats.log
-    (None when the stats file carries no summary)."""
-    m = _PIN_REUSE_RE.search(stats_text)
-    return int(m.group(1)) if m else None
+def parse_pin_asid_names(stats_text: str) -> tuple[int | None, int | None]:
+    """(names committed since the pin, names the owned space ran under)
+    from a <out>.stats.log.  Either is None when its row is absent, which
+    the caller must treat as a check that could not find its subject."""
+    m = _PIN_NAMES_RE.search(stats_text)
+    o = _OWNED_NAMES_RE.search(stats_text)
+    return (int(m.group(1)) if m else None,
+            int(o.group(1)) if o else None)
 
 
 def parse_kexc_asid_writes(stats_text: str) -> int | None:

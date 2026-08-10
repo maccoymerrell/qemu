@@ -1109,8 +1109,9 @@ def cmd_churn_test(args) -> int:
       * the window closes AT its budget on the user clock
         (user_covered == budget, OK flag) — the workload outlives the
         budget by construction (--hot-iters),
-      * ``pin_asid_reuse_suspected`` is reported (the detector may
-        legitimately fire; what must hold is the trace content above),
+      * the ASID-name census is readable and the guest actually switched
+        contexts inside the open window (``kexc ASID-write events`` > 0) —
+        without that the pin was never under test and a pass is vacuous,
       * cst_audit and cst_decode --strict stay clean.
     """
     args.system = True
@@ -1174,16 +1175,28 @@ def cmd_churn_test(args) -> int:
 
         stats_log = Path(f"{out_base}.stats.log")
         stats_text = stats_log.read_text() if stats_log.is_file() else ""
-        reuse = SYS.parse_pin_asid_reuse(stats_text)
+        names, owned_names = SYS.parse_pin_asid_names(stats_text)
         kexc_writes = SYS.parse_kexc_asid_writes(stats_text)
-        if reuse is None:
-            print(f"churn_test[{isa}]: FAIL  no 'pin ASID reuse suspected' "
-                  f"counter in {stats_log.name}")
+        if names is None or owned_names is None or kexc_writes is None:
+            print(f"churn_test[{isa}]: FAIL  {stats_log.name} carries no "
+                  f"ASID-name census ('distinct raw ASID names ...' / "
+                  f"'kexc ASID-write events') -- the churn evidence cannot "
+                  f"be read, so this cell is not adjudicated")
             rc_total = 1
         else:
-            print(f"churn_test[{isa}]: pin_asid_reuse_suspected={reuse} "
+            print(f"churn_test[{isa}]: asid_names_since_pin={names} "
+                  f"owned_space_names={owned_names} "
                   f"kexc_asid_writes={kexc_writes} "
                   f"(detector report; content checks above are the gate)")
+            # The churn must have reached the kernel while the window was
+            # open.  Every guest context switch writes the ASID register,
+            # so zero of them means no other process was scheduled and the
+            # cell tested nothing -- a pass here would be vacuous.
+            if kexc_writes == 0:
+                print(f"churn_test[{isa}]: FAIL  no ASID writes while the "
+                      f"pinned window was open -- no foreign process was "
+                      f"scheduled, so the pin was never under test")
+                rc_total = 1
 
         for tool, extra in (("cst_audit", []), ("cst_decode", ["--strict"])):
             tool_path = args.build_dir / "contrib" / "plugins" / tool

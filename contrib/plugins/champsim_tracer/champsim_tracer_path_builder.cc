@@ -4337,6 +4337,10 @@ void PathBuilder::suspend_prev(uint64_t owner_asid, uint64_t owner_live,
     SuspendedPrev &s = susp_stack_.back();
     s.prev = prev_tb_;
     s.depth = prev_depth_;
+    /* Freeze prev's extent measurement with it (see SuspendedPrev::extent);
+     * the suspending dispatch's own prologue is what recorded it. */
+    s.extent = prev_extent_;
+    s.extent_valid = prev_extent_valid_;
     s.async_in_depth = g_pb_prev_async[pb_vcpu_slot(cpu_index)];
     s.asid = owner_asid;
     s.owner_live = owner_live;
@@ -4387,6 +4391,11 @@ bool PathBuilder::resume_suspension(uint64_t resume_asid, uint64_t resume_live)
         }
         prev_tb_ = s.prev;                       /* re-arm the pending seal */
         prev_depth_ = s.depth;
+        /* ...and the answer to "how much of it ran", which the promote
+         * below carries to the seal walk.  Without this the walk had no
+         * measurement for a resumed prev and folded it whole. */
+        prev_extent_ = s.extent;
+        prev_extent_valid_ = s.extent_valid;
         g_pb_prev_async[pb_vcpu_slot(cpu_index_)] = s.async_in_depth;
         rep_state(cpu_index_).pb_prev_facts = s.rep_facts;
         rep_state(cpu_index_).pb_prev_facts_armed = false;

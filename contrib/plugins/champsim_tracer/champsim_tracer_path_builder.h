@@ -292,6 +292,21 @@ struct SuspendedPrev {
                                          * it: the per-callback latch will
                                          * describe other TBs by the time this
                                          * suspension seals */
+    /* HOW MUCH OF @prev RAN, frozen with it.
+     *
+     * The measurement is taken at the first dispatch after prev — which IS
+     * the foreign/async dispatch that suspends it, whose prologue runs
+     * before any gate can bail the step — and it lives in the live
+     * prev_extent_ slot.  clear_prev() then files it under seal_prev_ and
+     * invalidates the live one, and resume_suspension used to restore
+     * prev_tb_ WITHOUT it: the promote that followed carried an invalid
+     * measurement, the seal walk declared the extent unknown, and the fold
+     * claimed prev's full translated length on no evidence.  Measured on
+     * x86_64 -smp 2 as "seal walks with an unknown extent" tracking
+     * suspend-or-seal prev resumed one for one across 12 cells, and as a
+     * clock_minus_wire of -3 (the wire OVER-claiming) in one of them. */
+    uint64_t extent = 0;
+    bool extent_valid = false;
 };
 
 struct CtxFrame {

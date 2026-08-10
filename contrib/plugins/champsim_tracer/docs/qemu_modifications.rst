@@ -1632,6 +1632,22 @@ Machine-shutdown notification
      work executes at a translation-block boundary — outside any plugin
      callback, so the plugin's own locks are free.
 
+   The callback is told WHICH of the two it is, because the difference is
+   not derivable on the plugin side and it decides what the plugin may
+   emit.  ``in_guest_insn`` is true only on the first route: a guest
+   poweroff is a device write, so the request arrives part-way through
+   the store that performs it and that instruction has BEGUN and has not
+   retired -- its memory operations are only partly observed.  On the
+   marshalled route the work runs at a translation-block boundary and the
+   last dispatched block completed.  Both present the same vCPU index and
+   the same dispatch position, so a plugin closing a capture here would
+   otherwise have to guess, and either guess costs it: claiming the
+   in-flight instruction publishes a block whose memops are incomplete
+   (cst_audit's memop-bimodality oracle catches it), while discarding an
+   instruction that did retire is a dropped instruction.  The tracer
+   walks the slot's retired prefix and subtracts exactly the in-flight
+   instruction when this flag says there is one.
+
    Both run before ``qemu_cleanup()``, and the dispatch is idempotent:
    whichever fires first wins.  The hook lives in ``plugins/core.c``
    (registration + one-shot delivery) with the vCPU placement in

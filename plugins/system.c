@@ -39,7 +39,9 @@ void qemu_plugin_fillin_mode_info(qemu_info_t *info)
  */
 static void plugin_vm_shutdown_on_cpu(CPUState *cpu, run_on_cpu_data arg)
 {
-    qemu_plugin_vm_shutdown_dispatch(cpu->cpu_index);
+    /* Marshalled work runs at a TB BOUNDARY: no guest instruction is in
+     * flight, so the last dispatched block completed. */
+    qemu_plugin_vm_shutdown_dispatch(cpu->cpu_index, false);
 }
 
 void qemu_plugin_vm_shutdown(void)
@@ -53,7 +55,7 @@ void qemu_plugin_vm_shutdown(void)
          * write the guest itself executed, so the request arrives on the
          * writing vCPU's own thread with its state live and coherent.
          */
-        qemu_plugin_vm_shutdown_dispatch(current_cpu->cpu_index);
+        qemu_plugin_vm_shutdown_dispatch(current_cpu->cpu_index, true);
         return;
     }
     if (first_cpu && bql_locked()) {
@@ -68,5 +70,5 @@ void qemu_plugin_vm_shutdown(void)
         return;
     }
     /* No vCPU exists: shutdown before the machine ever ran. */
-    qemu_plugin_vm_shutdown_dispatch(-1);
+    qemu_plugin_vm_shutdown_dispatch(-1, false);
 }

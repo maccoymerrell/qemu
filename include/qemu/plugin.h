@@ -239,7 +239,8 @@ void qemu_plugin_vm_shutdown(void);
  * registered a hook that has not yet fired; _dispatch delivers it at most
  * once per run and names the vCPU it is running on (-1 if none exists).
  */
-bool qemu_plugin_vm_shutdown_dispatch(int vcpu_index);
+bool qemu_plugin_vm_shutdown_dispatch(int vcpu_index,
+                                     bool in_guest_insn);
 bool qemu_plugin_vm_shutdown_armed(void);
 
 /*

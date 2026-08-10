@@ -1345,13 +1345,28 @@ void qemu_plugin_register_devio_cb(qemu_plugin_id_t id,
  * @vcpu_index: the vCPU the callback is running on, or -1 if QEMU could
  *              not place it on one (no vCPU has been created yet, or the
  *              machine is going down without ever having run)
+ * @in_guest_insn: the callback is running INSIDE the guest instruction
+ *              that caused the shutdown -- a guest poweroff is a device
+ *              write, and the request arrives part-way through the store
+ *              that performs it, so that instruction has BEGUN and has
+ *              NOT retired.  False on every other route: the monitor,
+ *              QMP and SIGINT/SIGTERM are marshalled onto a vCPU at a TB
+ *              BOUNDARY, where the last dispatched block completed.
+ *
+ *              A plugin that closes a capture here needs the difference
+ *              and cannot derive it: both routes present the same vCPU
+ *              index and the same dispatch position, while one of them
+ *              has an instruction in flight whose memory operations are
+ *              only partly observed.  Guessing costs an instruction in
+ *              one direction and a partial block in the other.
  *
  * Dispatched once, when the machine is going down for any reason: the
  * guest powered itself off or reset with -no-reboot, the monitor or a
  * QMP client asked for it, or QEMU took SIGINT/SIGTERM.
  */
 typedef void (*qemu_plugin_vm_shutdown_cb_t)(qemu_plugin_id_t id,
-                                             int vcpu_index);
+                                             int vcpu_index,
+                                             bool in_guest_insn);
 
 /**
  * qemu_plugin_register_vm_shutdown_cb() - register a machine-shutdown cb

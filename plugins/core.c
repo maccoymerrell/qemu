@@ -176,7 +176,7 @@ void qemu_plugin_register_vm_shutdown_cb(qemu_plugin_id_t id,
  * the main loop is the only place SIGINT/SIGTERM is seen.  Whichever
  * arrives first wins; the other is a no-op.
  */
-bool qemu_plugin_vm_shutdown_dispatch(int vcpu_index)
+bool qemu_plugin_vm_shutdown_dispatch(int vcpu_index, bool in_guest_insn)
 {
     qemu_plugin_vm_shutdown_cb_t cb = vm_shutdown_hook;
 
@@ -184,7 +184,7 @@ bool qemu_plugin_vm_shutdown_dispatch(int vcpu_index)
         return false;
     }
     vm_shutdown_dispatched = true;
-    cb(0, vcpu_index);
+    cb(0, vcpu_index, in_guest_insn);
     return true;
 }
 

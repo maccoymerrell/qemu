@@ -530,7 +530,10 @@ Environment knobs (all detection only; none changes what is traced):
 
 ``CST_RT_STALL``
    Retired-instruction budget for the stall detector (default
-   8 000 000, about 100x the healthy worst case).
+   8 000 000, about 100x the healthy worst case).  Setting it also
+   ARMS the stall detector, so it is usable on its own; a knob whose
+   only effect is on a tripwire it does not arm reads as protection
+   and is not.
 
 ``CST_RT_GATE_STREAK`` / ``CST_RT_GATE_WINDOW_MS``
    Consecutive sub-floor sample windows required to trip the factor
@@ -540,10 +543,20 @@ Environment knobs (all detection only; none changes what is traced):
    Print every sample (``[rtsample] t=... f=... insn=... ticktax=...
    stall=...``) for offline distributions.
 
-``golden_net.py`` and the validator arm the detector for their system
-cells, and ``golden_net.py`` additionally re-checks the ratio of
-architectural instructions to workload instructions against the value
-recorded at capture, which is what catches a wedge that finished anyway.
+``golden_net.py`` arms the detector for the canonical system cells and
+additionally re-checks the ratio of architectural instructions to
+workload instructions against the value recorded at capture, which is
+what catches a wedge that finished anyway.
+
+The **validator deliberately does not arm it**, and this page used to
+claim it did.  The reason is written where the decision is made
+(``_system.py``, ``run_with_clock_watchdog``): the budget is calibrated
+on the canonical devio cell, and the churn cell runs the marked workload
+alongside a stream of short-lived processes, so the traced process is
+legitimately off-CPU while the guest retires millions of instructions in
+other address spaces.  Armed globally the detector called that a wedge —
+it did, on ``system.churn_x86``.  Until the budget is recorded per
+workload, the validator passes through only what the operator set.
 
 .. _trunc-falsifier:
 

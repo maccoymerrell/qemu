@@ -2914,8 +2914,22 @@ struct RtFactorGate {
                 streak_need = (unsigned)v;
             }
         }
-        armed_stall = getenv("CST_RT_GATE") != nullptr;
+        /*
+         * CST_RT_STALL ARMS THE ARM IT CONFIGURES.
+         *
+         * It used to only set the budget while CST_RT_GATE alone did the
+         * arming, so an operator who set CST_RT_STALL=<n> and nothing else
+         * configured a detector that could not fire and got no word of it
+         * beyond a "live-unarmed" token in the exit report.  A knob whose
+         * only effect is on a tripwire it does not arm is the same defect
+         * as the tripwire that cannot fire: it reads as protection and is
+         * not.  Either variable now arms the workload-progress stall; the
+         * guest-realtime FLOOR arm stays separately gated on a non-zero
+         * CST_RT_GATE (floor <= 0 disables it), so CST_RT_GATE=0 still
+         * means "the architectural arm only".
+         */
         const char *st = getenv("CST_RT_STALL");
+        armed_stall = getenv("CST_RT_GATE") != nullptr || st != nullptr;
         if (st && *st) {
             unsigned long long v = strtoull(st, nullptr, 0);
             if (v) {

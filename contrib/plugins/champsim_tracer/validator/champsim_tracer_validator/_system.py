@@ -182,29 +182,56 @@ def assess_online_cpus(console_text: str, smp: int,
 # "user_" prefix; OK = covered >= budget, END = closed by the end
 # marker / workload exit under budget, UNDER = closed early for any
 # other reason (always a failure).
+#
+# Written as a fixed prefix plus a KEY=VALUE scan of the tail, because the
+# tail grows: `wire_user_insns` / `clock_minus_wire` were appended to this
+# line by 5e5d963255 and the previous fully-positional pattern stopped
+# matching, which silently turned the coverage gate -- and with it the whole
+# guest-clock progress gate, whose UNDER leg is the stall detector -- into a
+# check that could not find its subject on ANY ISA.  Anchoring only on the
+# fields this module reads means a future field cannot do that again.
 _FINISHED_SEG_RE = re.compile(
-    r"champsim_tracer: finished segment \[icount (\d+) \.\. (\d+)\]\s+"
-    r"actual_icount=(\d+)\s+(user_)?covered=(\d+)\s+(?:user_)?budget=(\d+)"
-    r"\s+rep_fanout=(\d+)\s+trace_arch_insns=(\d+)\s+(OK|END|UNDER)")
+    r"champsim_tracer: finished segment \[icount (\d+) \.\. (\d+)\]"
+    r"((?:\s+\w+=-?\d+)+)\s+(OK|END|UNDER)")
+# clock_minus_wire is signed: a residual can go either way, and a pattern
+# that only admits digits would truncate the field scan before the flag.
+_SEG_FIELD_RE = re.compile(r"(\w+)=(-?\d+)")
 
 
 def parse_finished_segments(console_text: str) -> list[dict]:
     """Parse every per-segment coverage line the plugin printed into the
     captured console log.  Returns one dict per closed segment with
-    covered / budget / flag / user_clock keys."""
+    covered / budget / flag / user_clock keys.
+
+    A line that matches the shape but is missing a field this function
+    promises raises: a segment whose coverage cannot be read is not a
+    segment that covered nothing."""
     out = []
     for m in _FINISHED_SEG_RE.finditer(console_text):
-        out.append({
-            "lo": int(m.group(1)),
-            "hi": int(m.group(2)),
-            "actual_icount": int(m.group(3)),
-            "user_clock": m.group(4) is not None,
-            "covered": int(m.group(5)),
-            "budget": int(m.group(6)),
-            "rep_fanout": int(m.group(7)),
-            "trace_arch_insns": int(m.group(8)),
-            "flag": m.group(9),
-        })
+        fields = {k: int(v) for k, v in _SEG_FIELD_RE.findall(m.group(3))}
+        user_clock = "user_covered" in fields
+        try:
+            rec = {
+                "lo": int(m.group(1)),
+                "hi": int(m.group(2)),
+                "actual_icount": fields["actual_icount"],
+                "user_clock": user_clock,
+                "covered": fields["user_covered" if user_clock else "covered"],
+                "budget": fields["user_budget" if user_clock else "budget"],
+                "rep_fanout": fields["rep_fanout"],
+                "trace_arch_insns": fields["trace_arch_insns"],
+                "flag": m.group(4),
+            }
+        except KeyError as e:
+            raise RuntimeError(
+                f"'finished segment' line is missing {e.args[0]}= -- the "
+                f"plugin's close line changed shape and this parser has to "
+                f"be updated, not silently skipped: {m.group(0)!r}") from None
+        # Optional, present since 5e5d963255.
+        for opt in ("wire_user_insns", "clock_minus_wire"):
+            if opt in fields:
+                rec[opt] = fields[opt]
+        out.append(rec)
     return out
 
 

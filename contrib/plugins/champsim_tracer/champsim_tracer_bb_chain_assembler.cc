@@ -7,6 +7,7 @@
 #include "champsim_tracer_bb_chain_assembler.h"
 #include "champsim_tracer_bb_template_cache.h"
 #include <inttypes.h>
+#include <dlfcn.h>
 
 #include "champsim_tracer_stats.h"
 
@@ -207,6 +208,34 @@ void BBChainAssembler::reset()
         g_stats.reg_snap_chain_reset_drops++;
         g_stats.reg_snap_chain_reset_frags += fragments_.size();
         g_stats.reg_snap_chain_reset_insns += chain_insns(fragments_);
+        for (const BBTemplate *f : fragments_) {
+            if (!f) {
+                continue;
+            }
+            if (f->is_system) {
+                g_stats.reg_snap_chain_reset_sys_insns += f->n_insns;
+            } else {
+                g_stats.reg_snap_chain_reset_user_insns += f->n_insns;
+            }
+        }
+        if (g_stats.reg_snap_chain_reset_first_pc == 0) {
+            g_stats.reg_snap_chain_reset_first_pc =
+                entry_pc_ ? entry_pc_ : fragments_.front()->start_pc;
+        }
+        if (getenv("CST_CHAIN_RESET_TRACE")) {
+            void *ra = __builtin_return_address(0);
+            Dl_info di;
+            unsigned long off = 0;
+            if (dladdr(ra, &di) && di.dli_fbase) {
+                off = (unsigned long)((char *)ra - (char *)di.dli_fbase);
+            }
+            fprintf(stderr, "[chainreset] entry=0x%" PRIx64 " first=0x%"
+                    PRIx64 " frags=%zu insns=%u sys=%d raoff=0x%lx\n",
+                    entry_pc_, fragments_.front()->start_pc,
+                    fragments_.size(), chain_insns(fragments_),
+                    (int)fragments_.front()->is_system, off);
+            fflush(stderr);
+        }
     }
     entry_pc_ = 0;
     last_ft_ = 0;

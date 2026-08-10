@@ -348,6 +348,79 @@ def emit_trace_fault_probe(isa: str) -> list[str]:
     ]
 
 
+def emit_trace_devio_probe(isa: str, repeats: int = 1) -> list[str]:
+    """Emit ``write(1, msg, len)`` @repeats times: the traced process drives
+    a real DEVICE from inside its own kernel path.
+
+    Why a probe exists for this at all.  QEMU's ``translator.c`` clears
+    ``can_do_io`` for every instruction of a multi-instruction TB except the
+    last, so an MMIO access anywhere else takes ``io_prepare() ->
+    cpu_io_recompile() -> cpu_loop_exit_noexc()``: the TB is abandoned
+    mid-flight with NO exception, and the tracer's per-execution seal walk
+    has to notice that the abandoned tail never ran (``seal-walk blocks
+    truncated to what ran``).  That condition arises tens of thousands of
+    times per guest boot on every target, but a marker window only captures
+    the PINNED process, and a generated workload that never leaves its own
+    arena never enters a driver.  So on some targets the seal-walk
+    instrument reads zero for the whole life of a capture -- not because the
+    handling is unnecessary, but because the window never contained the
+    case, which is a zero from an instrument that could not fire.
+
+    ``write(1, ...)`` reaches the guest console driver (a 16550 UART on
+    riscv64/x86_64 ``virt``/``pc``, a PL011 on aarch64 ``virt``), whose
+    character loop is exactly such an access, inside the traced process's
+    own syscall.  fd 1 is the guest console under the validator's init, and
+    the message is short and fixed so a run stays comparable.
+
+    Deliberately opt-in (``--devio-probe``): it changes the generated image,
+    and every existing golden was captured without it."""
+    n = max(1, int(repeats))
+    data = [
+        "  .pushsection .rodata",
+        "  .balign 8",
+        "cst_devio_msg:",
+        '  .ascii "cst devio probe\\n"',
+        "  .set cst_devio_len, . - cst_devio_msg",
+        "  .popsection",
+    ]
+    if isa == "x86_64":
+        body = [
+            "  mov $1, %edi",
+            "  leaq cst_devio_msg(%rip), %rsi",
+            "  mov $cst_devio_len, %edx",
+            "  mov $1, %eax",      # __NR_write
+            "  syscall",
+        ]
+    elif isa == "aarch64":
+        body = [
+            "  mov x0, #1",
+            "  adrp x1, cst_devio_msg",
+            "  add x1, x1, :lo12:cst_devio_msg",
+            "  mov x2, #cst_devio_len",
+            "  mov w8, #64",       # __NR_write (asm-generic)
+            "  svc #0",
+        ]
+    elif isa == "riscv64":
+        body = [
+            "  li a0, 1",
+            "  la a1, cst_devio_msg",
+            "  li a2, cst_devio_len",
+            "  li a7, 64",         # __NR_write (asm-generic)
+            "  ecall",
+        ]
+    else:
+        # mipsel (o32): __NR_write = 4000 + 4.
+        body = [
+            "  li $a0, 1",
+            "  lui $a1, %hi(cst_devio_msg)",
+            "  addiu $a1, $a1, %lo(cst_devio_msg)",
+            "  li $a2, cst_devio_len",
+            "  li $v0, 4004",
+            "  syscall",
+        ]
+    return data + body * n
+
+
 def emit_trace_sleep_probe(isa: str, seconds: int) -> list[str]:
     """Emit one ``nanosleep(@seconds)`` right after the start marker.
 

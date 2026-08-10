@@ -127,6 +127,13 @@ public:
      * this chain since the last append. */
     void reset();
 
+    /* Exactly the predicate reset() charges a loss on: live fragments that
+     * no finalize() has committed.  Asked before the fact so a caller that
+     * can keep them does not have to learn it from the counter afterwards. */
+    bool reset_would_lose() const {
+        return !finalized_ && !fragments_.empty();
+    }
+
     bool has_active_chain() const {
         return entry_pc_ != 0 && !fragments_.empty();
     }

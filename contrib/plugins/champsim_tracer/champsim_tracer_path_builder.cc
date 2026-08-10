@@ -2253,7 +2253,40 @@ void PathBuilder::collect_piece(CtxFrame &f, uint64_t resume_pc)
 BBTemplate *PathBuilder::fold_prev_full_bb(BBTemplate *prev)
 {
     g_mutex_lock(&data_lock);
-    cp_chain(cpu_index_).reset();
+    /*
+     * A PREFIX OF THE SAME TRUE BB IS NOT SOMEONE ELSE'S CHAIN.
+     *
+     * A true BB split across TBs by a page boundary reaches this fold with
+     * its earlier TBs already appended and @prev — the TB that faulted — as
+     * its continuation.  Destroying the chain here threw those fragments
+     * away: their instructions never reached the wire, and the merged
+     * template started at @prev instead of at the block the guest entered.
+     * The stash keeps their memops and their register snaps, so the frame
+     * then carried a slice for instructions its own template did not
+     * contain, which is what the emit-time backstop answers by discarding
+     * the whole slice.  One page-split kernel BB per boot is enough to make
+     * that a standing loss, and it is a loss of instructions that ran.
+     *
+     * The chain is kept when it CONTINUES into @prev — the same predicate
+     * append_fragment would apply — so the fold commits the whole true BB.
+     * A chain that does not continue is a different block and is still
+     * destroyed here; that case is counted on its own so it is a named work
+     * item rather than a residue inside the general reset counter.
+     */
+    const bool lossy = cp_chain(cpu_index_).reset_would_lose();
+    const bool continues = !cp_chain(cpu_index_).would_discard(prev->start_pc);
+    if (lossy && continues) {
+        g_stats.fold_prev_prefix_kept++;
+        g_stats.fold_prev_prefix_kept_insns +=
+            cp_chain(cpu_index_).in_flight_insns();
+    } else {
+        if (lossy) {
+            g_stats.fold_prev_prefix_discontinuous++;
+            g_stats.fold_prev_prefix_discontinuous_insns +=
+                cp_chain(cpu_index_).in_flight_insns();
+        }
+        cp_chain(cpu_index_).reset();
+    }
     cp_chain(cpu_index_).append_fragment(prev->start_pc, prev, prev->fall_through_pc,
                                (TbTerminus)prev->terminus);
     BBTemplate *full_bb = nullptr;

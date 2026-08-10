@@ -221,6 +221,27 @@ struct Stats {
     uint64_t reg_snap_chain_reset_drops = 0;
     uint64_t reg_snap_chain_reset_frags = 0;
     uint64_t reg_snap_chain_reset_insns = 0;
+    /* The same loss split by privilege, and the entry PC of the FIRST chain
+     * lost this way.  "One instruction lost" is a different finding
+     * depending on whose instruction it was: a user instruction of the
+     * pinned process is a hole in the trace's own subject, a kernel one is
+     * a hole in its context.  A single aggregate could not tell them apart,
+     * and the PC is what turns "somewhere" into an address to look at. */
+    uint64_t reg_snap_chain_reset_user_insns = 0;
+    uint64_t reg_snap_chain_reset_sys_insns = 0;
+    uint64_t reg_snap_chain_reset_first_pc = 0;
+    /* The case-(b) fault fold's own arms.  _kept is the in-flight prefix the
+     * fold now folds INTO the merged true BB because it continues into the
+     * faulting TB — the instructions the old unconditional reset dropped.
+     * _discontinuous is the arm that is still destroyed: a live chain that
+     * does not continue into @prev is a different block, and sealing it
+     * needs an emission path the event context does not have.  It is
+     * counted separately so it is a named work item with a tripwire rather
+     * than a residue folded into the general reset counter. */
+    uint64_t fold_prev_prefix_kept = 0;
+    uint64_t fold_prev_prefix_kept_insns = 0;
+    uint64_t fold_prev_prefix_discontinuous = 0;
+    uint64_t fold_prev_prefix_discontinuous_insns = 0;
 
     /*
      * WINDOW-CLOCK vs WIRE accounting.

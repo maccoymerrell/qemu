@@ -166,6 +166,16 @@ def _parse_args() -> argparse.Namespace:
                         "that exercises varying load/store ADDRESSES across "
                         "executions of the same template; intended for "
                         "stressing the per-execution memop encoder.")
+    g.add_argument("--devio-probe", type=int, default=0,
+                   help="Emit N write(1, ...) console writes right after the "
+                        "in-window probes, so the traced process drives a "
+                        "real device from inside its OWN kernel path.  The "
+                        "seal walk's mid-flight-abandon case (an MMIO access "
+                        "that is not its TB's last instruction) cannot occur "
+                        "inside a marker window without it, and its counter "
+                        "then reads zero from an instrument that never saw "
+                        "its subject.  Off by default: it changes the "
+                        "generated image.")
     g.add_argument("--marker", action="store_true",
                    help="Emit the trace marker at _start (x86_64) so the "
                         "plugin's trace_window=marker opens + ASID-pins the "
@@ -263,6 +273,8 @@ def _parse_args() -> argparse.Namespace:
                     help="See `generate --hot-iters`.")
     al.add_argument("--stride-loops", action="store_true",
                     help="See `generate --stride-loops`.")
+    al.add_argument("--devio-probe", type=int, default=0,
+                    help="See `generate --devio-probe`.")
     al.add_argument("--marker", action="store_true",
                     help="See `generate --marker`.")
     al.add_argument("--compress", choices=("none", "xz", "zstd", "gzip"),
@@ -442,6 +454,7 @@ def cmd_generate(args, isa: str | None = None) -> None:
         # produced a trace anyway would prove nothing about the injector.
         start_marker=not getattr(args, "attach", False),
         sleep_probe=getattr(args, "sleep_probe", 0),
+        devio_probe=getattr(args, "devio_probe", 0),
     )
     # Emit per-ISA metadata and a per-ISA assembly source.
     args.out_dir.mkdir(parents=True, exist_ok=True)

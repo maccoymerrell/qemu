@@ -46,6 +46,7 @@ from types import SimpleNamespace
 
 from . import _multiproc as MP
 from . import _marker as MK
+from . import _must0
 
 
 # ===========================================================================
@@ -2150,9 +2151,12 @@ def _cleanup_qemu(work_root: Path):
 #   * rows belonging to a NON-GATING (known_issue -> xfail) check are
 #     reported but do not flip the gate, exactly as that check's own failure
 #     does not.
-_MUST0_RE = re.compile(r"^(?P<label>.*\(must be 0\))\s+(?P<val>\d+)\s*$")
-
-
+#
+# The row scanner itself lives in _must0, so `full` and `all` gate on ONE
+# implementation.  They used to differ by having only one of them at all: the
+# riscv64 fold over-claim stood non-zero in 9 cells scored PASS because the
+# waves ran `all`, which had no census.  A second copy of the regex would be
+# the same failure waiting on a second entrypoint.
 def _tripwire_census(work_root: Path, nongating: set[str]) -> dict:
     files = sorted(work_root.rglob("*.stats.log"))
     rows: list[dict] = []
@@ -2163,21 +2167,15 @@ def _tripwire_census(work_root: Path, nongating: set[str]) -> dict:
         except OSError as e:
             unparsed.append(f"{f}: {e}")
             continue
-        seen = 0
-        for line in text.splitlines():
-            m = _MUST0_RE.match(line)
-            if not m:
-                continue
-            seen += 1
-            if int(m.group("val")):
-                try:
-                    cell = f.relative_to(work_root).parts[0]
-                except ValueError:
-                    cell = ""
-                rows.append({"file": str(f), "check": cell,
-                             "label": m.group("label").strip(),
-                             "value": int(m.group("val")),
-                             "gating": cell not in nongating})
+        bad, seen = _must0.scan_text(text)
+        for label, value in bad:
+            try:
+                cell = f.relative_to(work_root).parts[0]
+            except ValueError:
+                cell = ""
+            rows.append({"file": str(f), "check": cell,
+                         "label": label, "value": value,
+                         "gating": cell not in nongating})
         if seen == 0:
             unparsed.append(f"{f}: no '(must be 0)' row found")
     gating = [r for r in rows if r["gating"]]

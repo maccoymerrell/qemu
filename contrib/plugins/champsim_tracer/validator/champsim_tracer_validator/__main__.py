@@ -27,6 +27,7 @@ from . import analyzer as A
 from . import validator as V
 from . import _system as SYS
 from . import _full as FULL
+from . import _must0
 
 
 ISA_CHOICES = ("x86_64", "aarch64", "riscv64", "mipsel")
@@ -889,6 +890,10 @@ def cmd_validate(args, isa: str | None = None) -> int:
 def cmd_all(args) -> int:
     rc_total = 0
     skipped = False
+    # Every trace base this run produced, for the "(must be 0)" census below.
+    # Collected even for an ISA whose validate failed: a broken cell's
+    # invariants are exactly the ones worth reading.
+    traced_bases: list[Path] = []
     for isa in args.isa:
         print(f"\n==== {isa} ====")
         cmd_generate(args, isa)
@@ -906,6 +911,9 @@ def cmd_all(args) -> int:
         if rc_trace != 0:
             rc_total = 1
             continue
+        traced_bases.append(_trace_base(args.out_dir,
+                                        _prog_base(args.out_dir, args.prog),
+                                        isa))
         # System-mode traces interleave the pinned process's kernel calls,
         # which carry CST_INSN_FLAG_SYSTEM and have no workload ground truth.
         # analyze maps only the user blocks (kernel PCs aren't in the binary,
@@ -915,6 +923,16 @@ def cmd_all(args) -> int:
         cmd_analyze(args, isa)
         if cmd_validate(args, isa) != 0:
             rc_total = 1
+    # THE "(must be 0)" CENSUS.  Every counter the plugin labels "(must be 0)"
+    # is an invariant it asserts about the very trace this run just produced,
+    # and until now nothing on this path read one: the riscv64 seal-walk fold
+    # over-claim sat at 1 (41 instructions) in 9 system cells that were all
+    # scored PASS, because the only census in the suite lived in run_full and
+    # the waves ran `all`.  It gates here, generically, on whatever rows the
+    # plugin emits — never on a hand-kept list, which would go stale the next
+    # time a counter is added.
+    if traced_bases and _must0.gate_out_bases(traced_bases, "all"):
+        rc_total = 1
     # A real failure outranks a skip; a skip outranks silent success.
     if rc_total:
         return rc_total

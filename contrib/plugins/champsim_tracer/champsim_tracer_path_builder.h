@@ -506,9 +506,51 @@ public:
      * queue-side backlog that straddles the boundary. */
     void on_segment_open();
 
-    /* Pending-seal slot writes. */
-    void set_prev(BBTemplate *tb) { prev_tb_ = tb; }
+    /* Pending-seal slot writes.  A new prev invalidates the stranded
+     * extent recorded for the old one. */
+    void set_prev(BBTemplate *tb)
+    {
+        if (tb != prev_tb_) {
+            prev_extent_valid_ = false;
+        }
+        prev_tb_ = tb;
+    }
     void clear_prev() { set_prev(nullptr); }
+
+    /*
+     * THE EXTENT OF A PREV THIS vCPU WILL NEVER SEAL.
+     *
+     * The pending-seal slot is normally consumed by the NEXT owned
+     * dispatch on the same vCPU, which is where the retired cursor still
+     * answers "how much of prev ran".  A vCPU the pinned process LEAVES
+     * has no next owned dispatch: it goes on dispatching foreign and
+     * kernel TBs, the cursor rolls forward past prev, and by the time the
+     * segment closes retired_executed_of can no longer name it.  Its
+     * instructions are then either dropped (they were, until this) or
+     * folded at full translated length on no evidence.
+     *
+     * So the extent is recorded at the ONE dispatch that can still measure
+     * it: the first dispatch after prev on that vCPU, owned or not.  Its
+     * lagged delta IS prev's executed count, and events_path_step computes
+     * it before any gate can bail the step.  Recorded once per prev — the
+     * guard is set_prev's invalidation above, so a later dispatch cannot
+     * overwrite a measurement with its own unrelated delta.
+     */
+    void note_prev_extent(uint64_t executed)
+    {
+        if (!prev_extent_valid_) {
+            prev_extent_ = executed;
+            prev_extent_valid_ = true;
+        }
+    }
+    bool prev_extent(uint64_t *out) const
+    {
+        if (!prev_extent_valid_) {
+            return false;
+        }
+        *out = prev_extent_;
+        return true;
+    }
 
     /* The pending-seal slot (the deferred prev TB); read by the blkwatch
      * exec print in vcpu_tb_exec's shared prologue. */
@@ -751,6 +793,10 @@ private:
      * execution and its BBs' emission one step later, and reading depth
      * at seal would lose the handler's level. */
     BBTemplate *prev_tb_ = nullptr;
+    /* See note_prev_extent: prev's executed count, measured at the first
+     * dispatch after it, for the close walk on a vCPU the process left. */
+    uint64_t prev_extent_ = 0;
+    bool     prev_extent_valid_ = false;
     uint32_t prev_depth_ = 0;
 
     /* Owner identity of the current pending-seal prev, sampled at its promote

@@ -5394,6 +5394,37 @@ static void finish_trace_segment(bool prev_executed = true,
             } else {
                 path_builder_flush_final_chain_only(closing_cpu);
             }
+            /*
+             * PEERS.  A close happens on ONE vCPU's dispatch, but on an SMP
+             * guest the pinned process may have run on others and left each
+             * of them holding a pending-seal slot: a TB that EXECUTED and
+             * whose emission was waiting for a next owned dispatch that
+             * never came, because the process migrated away.  Those slots
+             * used to be dropped, and the instructions in them with it --
+             * measured on aarch64 -smp 4 as clock_minus_wire = +6..+16 in
+             * exactly the runs where the migration guard fired, and zero in
+             * every run where it did not.  Retired-but-never-emitted is a
+             * DROP, so the peers are flushed here too.
+             *
+             * Ascending vCPU order for determinism, and after the closing
+             * vCPU so the segment's own final entry keeps its position.
+             * Each peer's extent comes from the measurement taken at the
+             * first dispatch after its prev (note_prev_extent), because the
+             * retired cursor on a vacated vCPU has long since rolled past.
+             */
+            for (unsigned int i = 0; i < CST_PIN_MAX_VCPUS; i++) {
+                if (i == closing_cpu) {
+                    continue;
+                }
+                PathBuilder *b = path_builder_if_created(i);
+                if (!b || !b->prev()) {
+                    continue;
+                }
+                uint32_t held = tb_head_insns(b->prev());
+                g_stats.close_peer_slots_flushed++;
+                g_stats.close_peer_insns_recovered += held;
+                b->flush_final();
+            }
         } else {
             /* plugin_exit with a segment still active (abnormal end: the
              * guest died without a close).  No dispatch context exists,
@@ -7514,6 +7545,25 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
     uint64_t delta_retired = retired_advance(cpu_index, cur_tb_tmpl);
     const bool prev_dispatch_owned =
         g_retired_owner_owned[retired_slot(cpu_index)];
+
+    /*
+     * Record the pending prev's extent while it is still measurable.
+     *
+     * This dispatch's lagged delta belongs to the dispatch before it.  When
+     * that earlier dispatch is the TB still sitting in the pending-seal
+     * slot, the delta IS how much of it ran, and this is the last moment
+     * anyone can say so on this vCPU: if the pinned process is migrating
+     * away, every later dispatch here belongs to somebody else and rolls
+     * the cursor past prev for good.  Placed before every gate that can
+     * bail the step, because a bailed step is exactly the case this exists
+     * for.  Recorded once per prev (see PathBuilder::note_prev_extent).
+     */
+    if (BBTemplate *pending = pb.prev()) {
+        if (pending == g_retired_prev_head[retired_slot(cpu_index)]) {
+            uint32_t cap = tb_head_insns(pending);
+            pb.note_prev_extent(delta_retired > cap ? cap : delta_retired);
+        }
+    }
 
     /*
      * AN ABORTED ATTEMPT IS NOT A RETIREMENT.

@@ -377,6 +377,19 @@ struct Stats {
      * land on; anything else is an unmeasured close and this is the only
      * thing standing between it and a silent over-claim.  Must be 0. */
     uint64_t close_walk_extent_unknown = 0;
+    /* Close walks whose extent came from the measurement taken at the first
+     * dispatch after prev, because the retired cursor had rolled past it
+     * (see PathBuilder::note_prev_extent).  Non-zero is ordinary on an SMP
+     * guest whose pinned process migrated; it is what keeps
+     * close_walk_extent_unknown at 0 there instead of folding a peer's
+     * block at its full translated length on no evidence. */
+    uint64_t close_walk_extent_from_stash = 0;
+    /* Pending-seal slots flushed at a segment close from a vCPU OTHER than
+     * the closing one, and the architectural instructions they carried.
+     * Each is a TB the pinned process executed on a vCPU it then left; they
+     * used to be dropped.  Non-zero exactly when the process migrated. */
+    uint64_t close_peer_slots_flushed = 0;
+    uint64_t close_peer_insns_recovered = 0;
     /* The same three quantities for the PER-EXECUTION seal walk
      * (collect_finalized_bbs).  A guest instruction that touches device
      * MMIO from anywhere but its TB's last slot, an atomic that needs

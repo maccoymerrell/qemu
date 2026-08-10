@@ -1260,7 +1260,17 @@ void PathBuilder::flush_final(bool walk_prev)
     if (walk_prev && prev_tb_ && !trunc_falsifier_close()) {
         have_extent = retired_executed_of(cpu_index, prev_tb_, &executed);
         if (!have_extent) {
-            g_stats.close_walk_extent_unknown++;
+            /* The cursor has rolled past prev — the vCPU went on dispatching
+             * for somebody else after the pinned process left it.  The
+             * measurement taken at the first dispatch after prev still
+             * stands (see PathBuilder::note_prev_extent) and is the same
+             * number the cursor would have given had it been asked then. */
+            have_extent = prev_extent(&executed);
+            if (have_extent) {
+                g_stats.close_walk_extent_from_stash++;
+            } else {
+                g_stats.close_walk_extent_unknown++;
+            }
         }
     }
 

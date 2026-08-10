@@ -74,6 +74,13 @@ struct QEMUTimerList {
 
     /* lightweight method to mark the end of timerlist's running */
     QemuEvent timers_done_ev;
+
+    /*
+     * Generation counter for timerlist_run_timers(): bumped once per pass,
+     * stamped into every timer whose callback that pass runs.  Only ever
+     * compared for equality, so wrap is irrelevant.
+     */
+    uint64_t run_pass;
 };
 
 /**
@@ -361,6 +368,9 @@ void timer_init_full(QEMUTimer *ts,
     ts->scale = scale;
     ts->attributes = attributes;
     ts->expire_time = -1;
+    /* Never ran, so it cannot match any pass; see timerlist_run_timers(). */
+    ts->last_run_pass = 0;
+    ts->last_run_expire = -1;
 }
 
 void timer_deinit(QEMUTimer *ts)
@@ -485,10 +495,53 @@ bool timer_expired(QEMUTimer *timer_head, int64_t current_time)
     return timer_expired_ns(timer_head, current_time * timer_head->scale);
 }
 
+/*
+ * Report a device whose timer callback made no progress (see the bound in
+ * timerlist_run_timers()).  Once PER CALLBACK, not once per process: the
+ * whole point is that a second offender must still be heard, and a
+ * warn_report_once() here would be silenced by whichever device happened to
+ * be first.  The table is tiny and never grows -- past its end the report
+ * degrades to once-per-process, which is still louder than nothing.  Called
+ * with the list lock held, so the table needs no lock of its own beyond the
+ * fact that different lists can race: a duplicate line is harmless.
+ */
+static void timer_warn_no_progress(QEMUTimerCB *cb, int64_t expire)
+{
+    static QEMUTimerCB *warned[8];
+    static unsigned n_warned;
+    unsigned i, n = qatomic_read(&n_warned);
+
+    for (i = 0; i < n && i < ARRAY_SIZE(warned); i++) {
+        if (warned[i] == cb) {
+            return;
+        }
+    }
+    if (n < ARRAY_SIZE(warned)) {
+        warned[n] = cb;
+        qatomic_set(&n_warned, n + 1);
+        warn_report("timer callback %p re-armed its own timer for a deadline "
+                    "it had already been run for (%" PRId64 "); deferring it "
+                    "to the next pass rather than looping on it -- this is a "
+                    "bug in that device model", cb, expire);
+    } else {
+        warn_report_once("timer callback %p made no progress; deferring "
+                         "(and the report table is full)", cb);
+    }
+}
+
+/*
+ * Ceiling on callbacks run in a single timerlist_run_timers() pass.  See the
+ * total bound in the loop; sized far above any legitimate backlog.
+ */
+#define TIMERLIST_MAX_CB_PER_PASS 100000
+
 bool timerlist_run_timers(QEMUTimerList *timer_list)
 {
-    QEMUTimer *ts;
+    QEMUTimer *ts, *head;
     int64_t current_time;
+    int64_t ran_expire;
+    uint64_t pass;
+    unsigned n_run = 0;
     bool progress = false;
     QEMUTimerCB *cb;
     void *opaque;
@@ -532,12 +585,35 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
      */
     current_time = qemu_clock_get_ns(timer_list->clock->type);
     qemu_mutex_lock(&timer_list->active_timers_lock);
+    pass = ++timer_list->run_pass;
     while ((ts = timer_list->active_timers)) {
         if (!timer_expired_ns(ts, current_time)) {
             /* No expired timers left.  The checkpoint can be skipped
              * if no timers fired or they were all external.
              */
             break;
+        }
+        /*
+         * TOTAL bound, above the per-timer no-progress bound below.  That
+         * one rests on a property of the device -- "the deadline moved
+         * forward" -- and a device that advances its deadline by a
+         * nanosecond against a backlog of seconds satisfies it while still
+         * running for hours inside one pass, holding the BQL.  This bound
+         * rests on nothing but arithmetic: however pathological the
+         * devices, the iothread leaves this loop.  Deferring the rest costs
+         * one main_loop_wait poll and drops the BQL in between, and a
+         * legitimate backlog (a long vm_stop, a clock warp) is a few
+         * hundred ticks, not a hundred thousand -- so nothing real is
+         * throttled and the ceiling is still low enough to be a ceiling.
+         */
+        if (++n_run > TIMERLIST_MAX_CB_PER_PASS) {
+            warn_report_once("timer list for clock %d ran %d callbacks in one "
+                             "pass without draining; deferring the rest to "
+                             "the next pass",
+                             timer_list->clock->type,
+                             TIMERLIST_MAX_CB_PER_PASS);
+            qemu_mutex_unlock(&timer_list->active_timers_lock);
+            goto out;
         }
         /* Checkpoint for virtual clock is redundant in cases where
          * it's being triggered with only non-EXTERNAL timers, because
@@ -554,7 +630,10 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
         /* remove timer from the list before calling the callback */
         timer_list->active_timers = ts->next;
         ts->next = NULL;
+        ran_expire = ts->expire_time;
         ts->expire_time = -1;
+        ts->last_run_pass = pass;
+        ts->last_run_expire = ran_expire;
         cb = ts->cb;
         opaque = ts->opaque;
 
@@ -566,13 +645,14 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
         progress = true;
 
         /*
-         * A callback that re-arms its OWN timer at a time this pass already
-         * counts as expired turns the loop above into an unbounded one:
-         * @current_time is sampled ONCE, before the loop, so the timer is
-         * popped straight back out and the callback runs again forever.  The
-         * iothread runs this loop holding the BQL, so the whole machine stops
-         * -- every vCPU starves and the guest makes no architectural progress
-         * while the process burns 100% of a core.
+         * NO-PROGRESS BOUND.  @current_time is sampled ONCE, before the loop,
+         * and timer_expired_ns() counts expire_time <= current_time as
+         * expired -- so a timer that is re-armed during this pass to a
+         * deadline it has ALREADY BEEN RUN FOR is popped straight back out
+         * and its callback runs again on identical inputs, forever.  The
+         * iothread runs this loop holding the BQL, so the whole machine
+         * stops: every vCPU starves and the guest makes no architectural
+         * progress while the process burns 100% of a core.
          *
          * A running clock used to hide it (@now moves a nanosecond and the
          * loop ends), which is why such a device could sit in the tree
@@ -582,22 +662,39 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
          * Measured, not hypothesised: hw/timer/mips_gictimer.c re-armed at
          * exactly @now whenever the guest programmed compare == count.
          *
-         * Leave it for the NEXT pass instead of running it again here.  That
-         * costs nothing: main_loop_wait comes straight back round, so the
-         * timer is late by at most one poll -- and the BQL is dropped in
-         * between, so the vCPUs run and whatever was freezing the clock gets
-         * to unfreeze it.  Say so once, and name the callback: a device with
-         * this defect must be reported, not silently papered over.
+         * The test is whether the DEADLINE MOVED FORWARD, not whether the
+         * timer came back.  A timer coming back is the normal, terminating
+         * shape: a periodic device that fell behind re-arms at
+         * fired-for + period, which is strictly greater every time, so it
+         * catches up to @current_time in a bounded number of iterations and
+         * the loop ends by itself.  hw/timer/i8254.c's pit_irq_timer does
+         * exactly that on every x86 boot -- an earlier version of this bound
+         * tested only "is it back at the head and expired", so the PIT ate
+         * the one warning the process ever prints and a device with the real
+         * defect would then have wedged the machine in silence.  A bound
+         * whose alarm is consumed by a healthy device is not a bound.
          *
-         * @ts is only dereferenced after it is shown to be back on the list,
-         * so a callback that deleted its own timer is not touched.
+         * Testing the deadline rather than the identity also covers timers
+         * that arm EACH OTHER: whichever of them comes round first inside a
+         * cycle is being re-run for a deadline it already ran for, which is
+         * the condition below.
+         *
+         * On a hit, leave it for the NEXT pass instead of running it again
+         * here.  That costs nothing: main_loop_wait comes straight back
+         * round, so the timer is late by at most one poll -- and the BQL is
+         * dropped in between, so the vCPUs run and whatever was freezing the
+         * clock gets to unfreeze it.  Say so, and say it once per callback
+         * rather than once per process, so a second offending device is
+         * still reported.
+         *
+         * @head is only dereferenced after it is read back off the list, so
+         * a callback that deleted its own timer is never touched.
          */
-        if (timer_list->active_timers == ts &&
-            timer_expired_ns(ts, current_time)) {
-            warn_report_once("timer callback %p re-armed its own timer at or "
-                             "before the time it fired at; deferring it to the "
-                             "next pass rather than looping on it (this is a "
-                             "bug in that device model)", cb);
+        head = timer_list->active_timers;
+        if (head && head->last_run_pass == pass &&
+            timer_expired_ns(head, current_time) &&
+            head->expire_time <= head->last_run_expire) {
+            timer_warn_no_progress(head->cb, head->expire_time);
             qemu_mutex_unlock(&timer_list->active_timers_lock);
             goto out;
         }

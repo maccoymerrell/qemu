@@ -89,6 +89,16 @@ struct QEMUTimer {
     QEMUTimer *next;
     int attributes;
     int scale;
+    /*
+     * Bookkeeping for timerlist_run_timers()'s no-progress bound, written
+     * only by that function under the list lock.  @last_run_pass is the
+     * run_pass generation this timer's callback last ran in and
+     * @last_run_expire is the deadline it ran FOR, so a timer that comes
+     * back round inside the same pass can be asked whether its new deadline
+     * moved forward.  See the bound in timerlist_run_timers().
+     */
+    uint64_t last_run_pass;
+    int64_t last_run_expire;
 };
 
 extern QEMUTimerListGroup main_loop_tlg;

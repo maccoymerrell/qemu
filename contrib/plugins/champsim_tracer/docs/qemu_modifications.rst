@@ -743,21 +743,46 @@ A device timer may not re-arm itself at the current time
    is required to reach it beyond a virtual clock that stops.  Any
    other device model with the same shape has the same obligation.
 
-``timerlist_run_timers`` defers a self-re-arming timer (``util/qemu-timer.c``)
+``timerlist_run_timers`` cannot loop on a timer callback (``util/qemu-timer.c``)
 
    The backstop for the rule above, because a rule enforced only in the
-   one device known to have broken it is not enforced.  After each
-   callback the loop checks whether the timer it just ran is back at the
-   head of the list and still expired against the pass's sampled
-   ``current_time``; if so it warns once, naming the callback, and
-   leaves it for the next pass.  ``main_loop_wait`` comes straight back
-   round, so the timer is late by at most one poll — and the BQL is
-   dropped in between, so the vCPUs run and whatever froze the clock
-   gets to unfreeze it.
+   one device known to have broken it is not enforced.  Two bounds sit
+   in the callback loop.
 
-   It bounds ONE shape, a callback re-arming its OWN timer.  Two devices
-   re-arming each other would still loop; that shape has not been
-   observed and is not guessed at here.
+   The first asks whether the DEADLINE MOVED FORWARD.  Every timer the
+   pass runs is stamped with the pass number and the deadline it ran
+   for; if the head of the list is a timer this pass already ran, is
+   expired against the pass's sampled ``current_time``, and is now armed
+   at a deadline no later than the one it ran for, it is deferred to the
+   next pass and the callback is named — once per callback, so a second
+   offending device is still heard.
+
+   Testing the deadline rather than the timer's identity is what makes
+   the bound both sound and quiet.  Quiet, because a timer coming back
+   is the NORMAL terminating shape: a periodic device that fell behind
+   re-arms at *fired-for + period*, strictly greater every time, so it
+   catches up in a bounded number of iterations and the loop ends by
+   itself.  ``pit_irq_timer`` (``hw/timer/i8254.c``) does exactly that on
+   every x86 and malta boot, and an earlier version of this bound, which
+   tested only "back at the head and expired", stopped it and consumed
+   the one warning the process printed — so a device with the real
+   defect would then have wedged the machine in silence.  Sound, because
+   a cycle of devices arming EACH OTHER hits the same test: whichever
+   one comes round first is being re-run for a deadline it already ran
+   for.
+
+   The second bound is a ceiling on callbacks per pass.  The first rests
+   on a property of the device — "the deadline moved forward" — and a
+   device that advances its deadline by a nanosecond against a backlog
+   of seconds satisfies it while still running for hours inside one
+   pass, holding the BQL.  The ceiling rests on nothing but arithmetic.
+
+   Deferring costs one ``main_loop_wait`` poll and drops the BQL in
+   between, so nothing is lost and the vCPUs run.
+   ``tests/unit/test-timer-rearm-bound.c`` exercises all four shapes —
+   self re-arm, mutual re-arm, a creeping deadline, and a healthy
+   catch-up that must NOT be throttled — and the first three hang
+   without these bounds.
 
 Interrupt replay across the wrong-path rollback
 

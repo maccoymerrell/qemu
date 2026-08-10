@@ -5121,6 +5121,19 @@ void emit_body_entry(BodyStreamState *out_stream,
                         (uint64_t)bb_tmpl->n_insns + (uint64_t)(n_iter - 1);
                     g_seg_arch_user_insns +=
                         (uint64_t)bb_tmpl->n_insns + (uint64_t)(n_iter - 1);
+                    /* THE ONE LEGITIMATE WAY THE WIRE OUTRUNS THE RETIRED
+                     * CURSOR.  A self-looping instruction is fanned out to
+                     * one entry per iteration on purpose, but the guest
+                     * BEGAN it once, so insn_started — and therefore
+                     * user_clock_retired_insns — counts 1 where the wire
+                     * carries n_iter.  Counting the surplus at its source
+                     * turns the retired-vs-wire falsifier from "these two
+                     * numbers differ" into an identity that has to hold
+                     * exactly: retired + this == wire.  Anything the fan-out
+                     * does not account for is then a real over-claim and
+                     * says so, instead of hiding inside a slack term. */
+                    g_stats.wire_user_rep_extra_insns +=
+                        (uint64_t)(n_iter - 1);
                 }
                 /* Iter 2..N: rep_subtmpl, mpi memops each, insn_index
                  * remapped to 0 (sub has exactly one insn).  One reused
@@ -6679,11 +6692,50 @@ bool collect_finalized_bbs(unsigned int cpu_index,
          * variable. */
     } else if (!have_extent) {
         g_stats.seal_walk_extent_unknown++;
+        /*
+         * ASK THE JUSTIFICATION'S OWN QUESTION.
+         *
+         * An unknown extent is not by itself a defect: a seal DEFERRED past
+         * its own dispatch has no retired delta to read, and the walk then
+         * folds prev at its FULL translated length on the argument that an
+         * interrupt or a foreign span is taken at a TB boundary, so a prev
+         * still pending at a later dispatch ran to its end.
+         *
+         * That argument has a falsifier and, until now, no instrument that
+         * could state it: if prev really was abandoned mid-flight, the guest
+         * is standing INSIDE prev, and @current_pc is one of prev's own
+         * instructions at a position past its first.  Then the full-extent
+         * fold claims instructions this dispatch never ran and the block
+         * that resumes at @current_pc re-covers them — defect B's signature,
+         * arriving through the one door a07df2d053 left open.
+         *
+         * Index 0 is deliberately NOT counted: a TB that branches to itself
+         * legitimately leaves the guest standing on its first instruction
+         * having run the whole block, so that reading proves nothing either
+         * way.  What is counted is unambiguous.
+         */
+        uint32_t at = tb_head_insn_index(prev_tb_head, current_pc);
+        if (at != UINT32_MAX && at > 0 && at < tb_total) {
+            g_stats.seal_walk_extent_unknown_interior++;
+            g_stats.seal_walk_extent_unknown_interior_insns += tb_total - at;
+        }
     } else if (started > 0 && started < tb_total &&
                tb_head_insn_pc_at(prev_tb_head,
                                   (uint32_t)(started - 1)) == current_pc) {
         aborted_tail = true;
         executed = started - 1;
+        /*
+         * PROOF-OF-FIRE for the probe above.  This arm is the same question
+         * asked where the answer is already known: the retired cursor says
+         * the guest abandoned prev at @started, and the probe is asked to
+         * find the very instruction it is standing on.  A non-zero reading
+         * here is what makes the unknown-extent arm's zero worth quoting —
+         * the same lookup, on the same kind of TB, demonstrably firing.
+         */
+        if (tb_head_insn_index(prev_tb_head, current_pc)
+                == (uint32_t)(started - 1) && started >= 2) {
+            g_stats.seal_walk_interior_probe_hits++;
+        }
     }
 
     /* Identify the last-executed fragment.  The scoreboard's @prev_start

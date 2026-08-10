@@ -278,6 +278,11 @@ struct Stats {
      * body stream this segment — the plugin-side twin of OWNED_CP, with no
      * decoder in the loop. */
     uint64_t wire_user_arch_insns = 0;
+    /* Of wire_user_arch_insns, the entries produced by SELF-LOOP FAN-OUT
+     * beyond the instruction's single architectural start: Σ(n_iter - 1)
+     * over user blocks whose terminal instruction was fanned out.  See the
+     * increment site for why the retired cursor cannot see these. */
+    uint64_t wire_user_rep_extra_insns = 0;
     /* User architectural instructions ATTRIBUTED BY THE PER-EXEC SEAL WALK,
      * counted per TB fragment before chain folding.
      *
@@ -402,6 +407,23 @@ struct Stats {
     uint64_t seal_walk_insns_not_executed = 0;
     uint64_t seal_walk_aborted_tails = 0;
     uint64_t seal_walk_extent_unknown = 0;
+    /* The unknown-extent argument's own falsifier, and the proof that the
+     * probe which states it can fire.
+     *
+     * seal_walk_extent_unknown_interior counts unknown-extent seals whose
+     * successor PC is one of the folded block's OWN instructions past its
+     * first — i.e. the guest was standing inside the block the walk had just
+     * claimed ran to completion.  That is an over-claim on the wire and a
+     * duplicate in the block that resumes there, so this one MUST be 0;
+     * _insns is what it would have cost.
+     *
+     * seal_walk_interior_probe_hits is the same lookup performed where the
+     * retired cursor already knows the answer (the aborted-tail arm).  It is
+     * there so the zero above is a zero from an instrument shown able to
+     * fire, not a zero from one that never looked. */
+    uint64_t seal_walk_extent_unknown_interior = 0;
+    uint64_t seal_walk_extent_unknown_interior_insns = 0;
+    uint64_t seal_walk_interior_probe_hits = 0;
 
     /* Self-loop fan-out: where the iteration count came from.
      *

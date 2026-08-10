@@ -1421,6 +1421,69 @@ void PathBuilder::flush_final(bool walk_prev)
     qemu_plugin_u64_set(g_scoreboard.prev_fall_through, cpu_index, 0);
 }
 
+static uint32_t closedrop_tb_insns(const BBTemplate *head)
+{
+    uint32_t n = 0;
+    for (const BBTemplate *t = head; t; t = t->next_tb_fragment) {
+        n += t->n_insns;
+    }
+    return n;
+}
+
+void PathBuilder::close_state_report(FILE *f, const char *why,
+                                     unsigned int closing_cpu) const
+{
+    if (frames_.empty() && susp_stack_.empty() && prev_tb_ == nullptr &&
+        !cp_chain(cpu_index_).has_active_chain()) {
+        return;
+    }
+    fprintf(f, "[closedrop] why=%s vcpu=%u%s prev=0x%" PRIx64
+            "(n=%u,sys=%d) chain=%d frames=%zu susp=%zu\n",
+            why, cpu_index_, cpu_index_ == closing_cpu ? "*" : "",
+            prev_tb_ ? prev_tb_->start_pc : 0,
+            prev_tb_ ? closedrop_tb_insns(prev_tb_) : 0,
+            prev_tb_ ? (int)prev_tb_->is_system : -1,
+            (int)cp_chain(cpu_index_).has_active_chain(),
+            frames_.size(), susp_stack_.size());
+    for (const CtxFrame &fr : frames_) {
+        fprintf(f, "[closedrop]   FRAME full=0x%" PRIx64 " n=%u sys=%d "
+                "resume=0x%" PRIx64 " depth=%u tid=%u returned=%d "
+                "anchors=%zu mem=%zu snaps=%zu\n",
+                fr.full_tmpl ? fr.full_tmpl->start_pc : 0,
+                fr.full_tmpl ? fr.full_tmpl->n_insns : 0,
+                fr.full_tmpl ? (int)fr.full_tmpl->is_system : -1,
+                fr.resume_pc, fr.depth, fr.tid, (int)fr.returned,
+                fr.anchors.size(), fr.mem.size(), fr.snaps.size());
+        if (fr.full_tmpl) {
+            for (uint32_t i = 0; i < fr.full_tmpl->n_insns; i++) {
+                fprintf(f, "[closedrop]     insn[%u] pc=0x%" PRIx64 "%s\n",
+                        i, fr.full_tmpl->insn_pcs[i],
+                        fr.full_tmpl->insn_pcs[i] == fr.resume_pc
+                            ? "  <- resume/fault" : "");
+            }
+        }
+    }
+    for (const SuspendedPrev &sp : susp_stack_) {
+        fprintf(f, "[closedrop]   SUSP prev=0x%" PRIx64 " n=%u sys=%d\n",
+                sp.prev ? sp.prev->start_pc : 0,
+                sp.prev ? closedrop_tb_insns(sp.prev) : 0,
+                sp.prev ? (int)sp.prev->is_system : -1);
+    }
+    if (cp_chain(cpu_index_).has_active_chain()) {
+        cp_chain(cpu_index_).describe_in_flight(f, 0);
+    }
+}
+
+void path_builder_close_state_report(FILE *f, const char *why,
+                                     unsigned int closing_cpu)
+{
+    for (unsigned int i = 0; i < CST_PIN_MAX_VCPUS; i++) {
+        if (PathBuilder *b = path_builder_if_created(i)) {
+            b->close_state_report(f, why, closing_cpu);
+        }
+    }
+}
+
 void path_builder_flush_final(unsigned int cpu_index)
 {
     path_builder(cpu_index).flush_final();

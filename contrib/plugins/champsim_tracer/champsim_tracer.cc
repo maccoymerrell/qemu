@@ -5332,6 +5332,28 @@ static inline BBTemplate *cp_chain_finalize_if_complete(unsigned int cpu_index)
 }
 
 /*
+ * CST_NO_PEER_FLUSH: the falsifier arm for the peer pending-seal flush.
+ * With it set the close reverts to flushing only the closing vCPU's slot,
+ * which is what the peer flush exists to fix -- so a run pair with and
+ * without it measures the drop the fix removes, instead of asserting it.
+ * A falsifier arm, not a capture.
+ */
+static bool peer_flush_falsifier(void)
+{
+    static const bool v = []() {
+        if (getenv("CST_NO_PEER_FLUSH") == nullptr) {
+            return false;
+        }
+        fprintf(stderr, "champsim_tracer: CST_NO_PEER_FLUSH — peer vCPU "
+                "pending-seal slots are DROPPED at the close.  This trace "
+                "is missing instructions the guest executed; it is a "
+                "falsifier arm, not a capture.\n");
+        return true;
+    }();
+    return v;
+}
+
+/*
  * Finalize and write the current trace segment.  Must be called with
  * exec_lock held.
  *
@@ -5393,6 +5415,16 @@ static void finish_trace_segment(bool prev_executed = true,
                 " records deferred) — header keeps the sentinel\n",
                 g_seg_wm_deferred_records);
     }
+    /* CST_CLOSEDROP: what every builder is still holding, BEFORE the
+     * close flushes anything.  Diagnostic only. */
+    if (getenv("CST_CLOSEDROP")) {
+        path_builder_close_state_report(
+            stderr,
+            g_seg_close_reason ? g_seg_close_reason
+                               : (prev_executed ? "exec" : "deferred"),
+            closing_cpu);
+    }
+
     /* Drain any chain still in flight.  This may call emit_body_entry
      * one or more times, which bumps g_seg_arch_insns — so we print
      * the per-segment stats AFTER finish() returns so the counter
@@ -5426,7 +5458,8 @@ static void finish_trace_segment(bool prev_executed = true,
              * first dispatch after its prev (note_prev_extent), because the
              * retired cursor on a vacated vCPU has long since rolled past.
              */
-            for (unsigned int i = 0; i < CST_PIN_MAX_VCPUS; i++) {
+            const bool no_peers = peer_flush_falsifier();
+            for (unsigned int i = 0; !no_peers && i < CST_PIN_MAX_VCPUS; i++) {
                 if (i == closing_cpu) {
                     continue;
                 }

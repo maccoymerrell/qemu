@@ -640,6 +640,18 @@ public:
         }
     }
 
+    /* WHAT THIS BUILDER IS STILL HOLDING WHEN THE SEGMENT CLOSES.
+     *
+     * The close flushes exactly one thing — the pending-seal slot (and,
+     * on a peer, its own).  Everything else this builder can be holding
+     * at that instant (an open fault frame's collected prefix, a
+     * suspended prev, an in-flight chain) is dropped with no counter,
+     * so a clock-vs-wire residual at a close has no site to name.  This
+     * prints every holder, once per close, behind CST_CLOSEDROP.
+     * Diagnostic only. */
+    void close_state_report(FILE *f, const char *why,
+                            unsigned int closing_cpu) const;
+
 private:
     void prime_from_live();
     void kexc_apply_asid_write(uint64_t new_asid);
@@ -1165,6 +1177,12 @@ PathBuilder *path_builder_if_created(unsigned int cpu_index);
  * not run yet. */
 void path_builder_flush_final(unsigned int cpu_index);
 void path_builder_flush_final_chain_only(unsigned int cpu_index);
+
+/* CST_CLOSEDROP: one report per segment close, over every builder that
+ * ever ran, naming everything still held at the close (see
+ * PathBuilder::close_state_report).  Diagnostic only. */
+void path_builder_close_state_report(FILE *f, const char *why,
+                                     unsigned int closing_cpu);
 
 /*
  * ---- Narrow-ASID identity generation ----

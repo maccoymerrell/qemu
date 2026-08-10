@@ -1301,6 +1301,37 @@ struct Stats {
     uint64_t frames_peak = 0;
     uint64_t susp_stack_peak = 0;
 
+    /* ---- What a segment close was still holding in frames_ -------------
+     * A fault frame open at the close holds the EXECUTED pre-fault prefix of
+     * its block: the merge that would have put the block on the wire whole
+     * is waiting for a FAULT_RETURN that the close makes impossible.  Until
+     * PathBuilder::flush_frames_at_close those instructions were dropped —
+     * visible on the user side as clock_minus_wire > 0, and INVISIBLE for a
+     * kernel frame, which the user-only residual cannot see.
+     *
+     * close_frames_flushed / _insns_recovered is what the close emitted;
+     * the sys / user split is there because the user-only residual is not a
+     * complete detector for this class.  Non-zero is ordinary: it means a
+     * segment ended inside a fault handler, which any workload can do.
+     *
+     * close_frames_empty_prefix is the frame whose fault landed on its
+     * block's FIRST instruction: nothing of it retired, so emitting nothing
+     * is correct and no instruction is lost.
+     *
+     * close_frame_prefix_unplaced MUST be 0: it is a frame whose executed
+     * extent could not be named (its resume PC is not one of its own block's
+     * instructions) or whose truncated template would not commit — the one
+     * shape in which this flush still drops what it is holding. */
+    uint64_t close_frames_flushed = 0;
+    uint64_t close_frame_insns_recovered = 0;
+    uint64_t close_frame_user_insns_recovered = 0;
+    uint64_t close_frame_sys_insns_recovered = 0;
+    uint64_t close_frames_empty_prefix = 0;
+    uint64_t close_frame_prefix_unplaced = 0;
+    /* No body stream existed at the close, so the frames could not be
+     * emitted anywhere.  MUST be 0 for the same reason. */
+    uint64_t close_frames_unflushable = 0;
+
     /* ---- Event-queue drain instrument (the BIGDRAIN condition) --------
      * The queue is QEMU-side, grow-only and never drops; its length between
      * drains is exactly "events produced since the last drain".  These are

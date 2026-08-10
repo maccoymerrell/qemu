@@ -222,6 +222,10 @@ bool retired_executed_prev(unsigned int cpu_index, const BBTemplate *head,
 bool trunc_falsifier_close(void);
 bool trunc_falsifier_seal(void);
 
+/* CST_NO_CLOSE_FRAMES falsifier: is the close-time fault-frame flush
+ * disabled?  True only in a deliberately falsified arm. */
+bool close_frames_falsifier(void);
+
 /* Index of @pc among the instructions of the dispatched TB whose head is
  * @head (fragments walked in execution order), or UINT32_MAX. */
 uint32_t tb_head_insn_index(const BBTemplate *head, uint64_t pc);
@@ -709,6 +713,15 @@ private:
      * Caller holds exec_lock; data_lock is NOT held. */
     void flush_frame_unwound(size_t idx, BodyStreamState *out_stream,
                              unsigned int cpu_index);
+    /* Segment close: emit the EXECUTED PREFIX of every fault frame still in
+     * flight, deepest frame first, and erase them.  Unlike
+     * flush_frame_unwound this truncates the frame's full template at the
+     * faulting instruction — at a close the suffix has not run, so emitting
+     * the whole block would claim instructions the guest never executed.
+     * Called from flush_final on every close route; see the definition.
+     * Caller holds exec_lock; data_lock is NOT held. */
+    void flush_frames_at_close(BodyStreamState *out_stream,
+                               unsigned int cpu_index);
     /* Retire-at-return on the block @prev (the pinned process's own deferred
      * prev, matched within its (thread,asid)): if @prev is an inner fault
      * frame's resume suffix, flush that frame at its depth via

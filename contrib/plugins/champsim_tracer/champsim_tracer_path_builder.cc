@@ -24,6 +24,7 @@
 
 #include "champsim_tracer_path_builder.h"
 #include "champsim_tracer_bb_chain_assembler.h"
+#include "champsim_tracer_bb_template_cache.h"
 #include "champsim_tracer_mem_access_recorder.h"
 #include "champsim_tracer_reg_snap_collector.h"
 #include "champsim_tracer_scoreboard.h"
@@ -174,6 +175,30 @@ bool trunc_falsifier_close(void)
 bool trunc_falsifier_seal(void)
 {
     return (truncation_falsifier_mask() & 2u) != 0u;
+}
+
+/*
+ * CST_NO_CLOSE_FRAMES: the falsifier arm for the close-time fault-frame
+ * flush (PathBuilder::flush_frames_at_close).  With it set a segment close
+ * leaves every open fault frame exactly where it used to leave it — for the
+ * next on_segment_open to orphan-drop — so a run pair with and without it
+ * MEASURES the instructions the flush recovers instead of asserting them.
+ * A falsifier arm, not a capture: the trace it produces is missing
+ * instructions the guest executed.
+ */
+bool close_frames_falsifier(void)
+{
+    static const bool v = []() {
+        if (getenv("CST_NO_CLOSE_FRAMES") == nullptr) {
+            return false;
+        }
+        fprintf(stderr, "champsim_tracer: CST_NO_CLOSE_FRAMES — fault frames "
+                "open at a segment close are DROPPED with their executed "
+                "prefixes.  This trace is missing instructions the guest "
+                "executed; it is a falsifier arm, not a capture.\n");
+        return true;
+    }();
+    return v;
 }
 
 /* CST_SLOW_FOLD rescans the retention for async edges, so it measures the
@@ -1411,6 +1436,11 @@ void PathBuilder::flush_final(bool walk_prev)
         rep_emit_handoff(cpu_index, rep_state(cpu_index).pb_prev_facts);
         emit_body_entry(out_stream, bb_tmpl, cpu_index, {});
     }
+
+    /* Every fault frame still open is holding an executed prefix that no
+     * FAULT_RETURN will ever come to merge.  Emit it here — this is the
+     * last moment anything can (see flush_frames_at_close). */
+    flush_frames_at_close(out_stream, cpu_index);
 
     /* cp_chain and the CP memop buffer are per-vCPU; exec_lock (held)
      * serialises them. */
@@ -4039,6 +4069,179 @@ void PathBuilder::flush_frame_unwound(size_t idx, BodyStreamState *out_stream,
     g_emit_fault_depth = 0;
 
     /* Restore the current block's accumulators (emit drained them). */
+    g_mem_recorder.clear_cp(cpu_index_);
+    g_mem_recorder.prepend_cp(cpu_index_, cur_mem);
+    pending_reg_snaps(cpu_index_) = std::move(cur_snaps);
+}
+
+/*
+ * AN OPEN FAULT FRAME IS HOLDING INSTRUCTIONS THE GUEST RAN.
+ *
+ * A FAULT_ENTER stashes the faulting block whole into frames_ and waits for
+ * its FAULT_RETURN: the merge then puts the block on the wire exactly once,
+ * prefix and resume suffix reassembled.  user_clock_fault_recredit's comment
+ * states that premise in as many words — "the merge puts the faulting block
+ * on the wire exactly once, whole".  When the SEGMENT CLOSES before the
+ * return, the merge never runs, the premise is simply false, and the frame
+ * dies at the next on_segment_open's orphan drop taking its executed
+ * pre-fault prefix with it.  The window clock billed that prefix at the very
+ * next dispatch, so the loss surfaces as clock_minus_wire > 0 — measured
+ * deterministically on aarch64 (3 instructions of a 9-instruction user block,
+ * 10/10 budgets) and on riscv64 (1 and 5, by where the demand fault lands),
+ * and NOT visible at all for a kernel frame, which the user-only residual
+ * cannot see.  Neither needs SMP, and neither needs the stall ceiling: any
+ * close route reaches this.
+ *
+ * The prefix is emitted here, at the close, from the frame's OWN accumulated
+ * memop / reg-snap buffers, and the frame is erased.
+ *
+ * TRUNCATED, which is what separates this from flush_frame_unwound.  That
+ * flush emits the frame's template WHOLE, and is right to: it fires when a
+ * frame's resume suffix was DROPPED, so the guest did execute the rest and
+ * the whole block is the honest record.  At a close the suffix has not run
+ * at all — the segment ended inside the handler — so the block is emitted at
+ * exactly the extent that retired: up to the instruction the handler would
+ * have resumed on, which is by construction the first one that did NOT
+ * retire.  (The single exception is a self-loop that faulted MID-INSTRUCTION:
+ * its own retired iterations are real, so it is kept and published through
+ * the pre-iteration seam, the same way the unwind flush does.)
+ *
+ * DEEPEST FRAME FIRST, mirroring complete_merge's deeper-frame flush: the
+ * entries then step down one fault level at a time from the handler blocks
+ * already on the wire (2 -> 1 -> 0) instead of collapsing to the outermost
+ * frame's depth.  No anchors are published: an anchor marks a faulting
+ * instruction INSIDE a reassembled block, and a prefix that stops before its
+ * faulting instruction contains none.  The terminal branch is unresolved and
+ * no wrong path is forked, like every other close-time emission.
+ */
+void PathBuilder::flush_frames_at_close(BodyStreamState *out_stream,
+                                        unsigned int cpu_index)
+{
+    if (frames_.empty() || close_frames_falsifier()) {
+        return;
+    }
+    if (!out_stream) {
+        /* Nowhere to put them: the segment has no body stream, so this IS a
+         * drop and nothing here can undo it.  Say so rather than returning
+         * a quiet zero. */
+        g_stats.close_frames_unflushable += frames_.size();
+        frames_.clear();
+        return;
+    }
+
+    /* The block being sealed by the close's own walk owns the live
+     * accumulators; the frames emit from theirs. */
+    std::vector<WPMemAccess> cur_mem;
+    g_mem_recorder.take_cp(cpu_index_, cur_mem);
+    std::vector<RegSnap> cur_snaps = std::move(pending_reg_snaps(cpu_index_));
+    pending_reg_snaps(cpu_index_).clear();
+
+    while (!frames_.empty()) {
+        CtxFrame f = std::move(frames_.back());
+        frames_.pop_back();
+        if (!f.full_tmpl || !f.full_tmpl->insn_pcs) {
+            g_stats.close_frame_prefix_unplaced++;
+            continue;
+        }
+        /* Where the handler would have resumed IS the extent: a pushed
+         * fault always re-executes its faulting instruction, so that
+         * instruction and everything after it did not retire. */
+        uint32_t ran = UINT32_MAX;
+        for (uint32_t k = 0; k < f.full_tmpl->n_insns; k++) {
+            if (f.full_tmpl->insn_pcs[k] == f.resume_pc) {
+                ran = k;
+                break;
+            }
+        }
+        if (ran == UINT32_MAX) {
+            /* The resume PC is not one of the block's instructions, so no
+             * extent can be named and emitting any of it would be a guess.
+             * This must not happen; it has its own must-be-0 row. */
+            g_stats.close_frame_prefix_unplaced++;
+            continue;
+        }
+        /* A self-loop that faulted part-way through its OWN iterations
+         * retired those iterations, so the faulting instruction is kept and
+         * its retired count published through the pre-iteration seam. */
+        const bool rep_split = f.rep_pre_iters > 0 &&
+                               f.rep_pre_pc == f.resume_pc;
+        uint32_t take = rep_split ? ran + 1 : ran;
+        if (take == 0) {
+            /* The fault landed on the block's first instruction: nothing of
+             * it retired, so there is nothing to emit and nothing is lost. */
+            g_stats.close_frames_empty_prefix++;
+            continue;
+        }
+        BBTemplate *pfx = nullptr;
+        g_mutex_lock(&data_lock);
+        BBTemplate *frag = f.full_tmpl;
+        pfx = g_template_store.commit_partial_bb(frag->start_pc, &frag, 1,
+                                                 take);
+        g_mutex_unlock(&data_lock);
+        if (!pfx) {
+            g_stats.close_frame_prefix_unplaced++;
+            continue;
+        }
+
+        /* Emission depth: the frame's own, with the same async-component
+         * re-derivation the merge and the unwind flush apply, and the same
+         * absolute user-content clamp (format.rst §4.2a — a user block is
+         * never handler content). */
+        uint32_t cf_async_create = f.async_in_depth ? 1u : 0u;
+        if (cf_async_create > f.depth) {
+            g_stats.merge_async_decomp_invalid++;
+            cf_async_create = f.depth;
+        }
+        const uint32_t cf_async_now =
+            (async_captured_ && async_owner_ok_ && f.owner_tp_ok &&
+             f.owner_tp == async_owner_tp_) ? 1u : 0u;
+        uint32_t eff_depth = f.depth - cf_async_create + cf_async_now;
+        if (!pfx->is_system) {
+            eff_depth = 0;
+        }
+        if (depth3_render_off()) {
+            eff_depth = f.depth;
+        }
+
+        g_mem_recorder.prepend_cp(cpu_index_, f.mem);
+        pending_reg_snaps(cpu_index_) = f.snaps;
+        g_emit_fault_depth = eff_depth;
+        g_dbg_depth_src = CST_DSRC_UNWIND;
+        g_emit_fault_anchors.clear();
+
+        if (pb_diag() || pb_depth_diag()) {
+            fprintf(stderr, "[pathbuilder] CLOSE-FRAME-FLUSH full=0x%" PRIx64
+                    " n=%u ran=%u take=%u depth=%u eff=%u sys=%d "
+                    "frames_left=%zu\n",
+                    f.full_tmpl->start_pc, f.full_tmpl->n_insns, ran, take,
+                    f.depth, eff_depth, (int)pfx->is_system, frames_.size());
+        }
+
+        RepArchFacts close_facts;
+        if (rep_split) {
+            close_facts.pc = f.rep_pre_pc;
+            close_facts.iters = 0;
+            rep_emit_handoff(cpu_index, close_facts, f.rep_pre_iters,
+                             f.rep_pre_memops, std::move(f.rep_pieces));
+        } else {
+            rep_emit_handoff(cpu_index, close_facts);
+        }
+        emit_body_entry(out_stream, pfx, cpu_index, {});
+
+        g_emit_fault_depth = 0;
+        g_mem_recorder.clear_cp(cpu_index_);
+        pending_reg_snaps(cpu_index_).clear();
+
+        g_stats.close_frames_flushed++;
+        g_stats.close_frame_insns_recovered += take;
+        if (pfx->is_system) {
+            g_stats.close_frame_sys_insns_recovered += take;
+        } else {
+            g_stats.close_frame_user_insns_recovered += take;
+        }
+    }
+
+    /* Put the closing walk's own accumulators back. */
     g_mem_recorder.clear_cp(cpu_index_);
     g_mem_recorder.prepend_cp(cpu_index_, cur_mem);
     pending_reg_snaps(cpu_index_) = std::move(cur_snaps);

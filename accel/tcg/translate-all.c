@@ -286,6 +286,12 @@ static int setjmp_gen_code(CPUArchState *env, TranslationBlock *tb,
     return tcg_gen_code(tcg_ctx, tb, pc);
 }
 
+#ifdef CONFIG_PLUGIN
+/* See the declarations in exec/cpu-common.h. */
+unsigned long plugin_spec_reserve_opens;
+unsigned long plugin_spec_reserve_exhausted;
+#endif
+
 /* Called with mmap_lock held for user mode emulation.  */
 TranslationBlock *tb_gen_code(CPUState *cpu,
                               vaddr pc, uint64_t cs_base,
@@ -339,6 +345,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
             if (!cpu->plugin_flush_pending) {
                 cpu->plugin_flush_pending = true;
                 tcg_region_open_spec_reserve(tcg_ctx);
+                qatomic_inc(&plugin_spec_reserve_opens);
                 goto buffer_overflow;          /* retry alloc into the reserve */
             }
             /*
@@ -349,6 +356,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
              * Return NULL with mmap held: the plugin exec callers unlock
              * after tb_gen_code and handle NULL (no double-unlock).
              */
+            qatomic_inc(&plugin_spec_reserve_exhausted);
             qemu_log_mask(CPU_LOG_TB_OP,
                           "plugin spec reserve exhausted; wrong-path walk "
                           "truncated (consider a larger code buffer)\n");

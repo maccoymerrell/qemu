@@ -244,7 +244,22 @@ void append_stats_summary(GString *report, const char *label,
         { "WP early exits (fault)",              stats.wp_early_exits },
         { "WP synthetic faults",                 stats.wp_synthetic_faults },
         { "WP flush re-runs",                    stats.wp_flush_reruns },
+        /* Host-side, process-wide: how hard the wrong path leaned on the
+         * shared translation buffer.  An OPEN is a walk that filled the
+         * buffer and had to be handed the reserve, which costs a full
+         * tb_flush the moment it unwinds — the whole correct-path code
+         * cache, retranslated, for one excursion.  An EXHAUSTION is a walk
+         * the reserve could not hold either: the chain was cut at a depth
+         * set by buffer occupancy rather than by anything architectural,
+         * and the walker cannot tell that cut from an unfetchable target.
+         * The second is an invariant, not a measurement. */
+        { "WP spec-reserve opens (cache evicted)",
+          qemu_plugin_spec_reserve_opens() },
+        { "WP spec-reserve exhausted (must be 0)",
+          qemu_plugin_spec_reserve_exhausted() },
         { "WP first-TB unavailable",             stats.wp_first_tb_unavail },
+        { "WP chain cut by code-buffer (must be 0)",
+                                            stats.wp_xlat_buffer_truncations },
         { "WP resume PC not representable",      stats.wp_pc_not_representable },
         /* Invariant, not a measurement: the wrong path walks past syscalls but
          * never performs one, so this must read 0.  See

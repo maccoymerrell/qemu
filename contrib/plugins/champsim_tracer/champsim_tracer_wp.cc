@@ -640,6 +640,18 @@ static WpStep wp_exec_one_tb(WpWalkState &st)
         g_last_spec_refusal = SpecRefusal::FETCH;   /* refined by translation */
         uint64_t flush_before =
             g_tb_flush_count.load(std::memory_order_acquire);
+        /*
+         * The OTHER reason a speculative exec can come back with no
+         * translation, and the one the walker used to file under
+         * "unfetchable target": a wrong-path walk may not tb_flush (the
+         * flush would reset the code buffer under the correct-path TB the
+         * walk is nested inside), so TCG hands it a finite reserve instead
+         * and returns NULL from tb_gen_code once even that is full.  That
+         * cut is a property of how full the host's code buffer happened to
+         * be, not of the guest's address space, and it is invisible at this
+         * seam unless the counter is read across the call.
+         */
+        uint64_t xlat_exhausted_before = qemu_plugin_spec_reserve_exhausted();
         tb_ok = qemu_plugin_exec_tb();
         tmpl = g_wp_state.last_executed_tb;
         /*
@@ -678,7 +690,32 @@ static WpStep wp_exec_one_tb(WpWalkState &st)
              * indistinguishable from a clean depth-budget end.  The
              * validator reads the marker to tell an honest boundary from a
              * silently short chain. */
-            if (g_tb_flush_count.load(std::memory_order_acquire) !=
+            bool xlat_exhausted =
+                qemu_plugin_spec_reserve_exhausted() != xlat_exhausted_before;
+            if (xlat_exhausted) {
+                /*
+                 * NOT an unfetchable target: the host's code buffer ran out
+                 * mid-walk.  The chain still has to say it stops here — a
+                 * silently short chain is worse than an explicit boundary —
+                 * so the wire marker is the same one.  What must NOT be the
+                 * same is the accounting: wp_first_tb_unavail is a bug
+                 * counter about the GUEST's address space, and charging a
+                 * host-side buffer limit to it makes a code-buffer squeeze
+                 * read as absent guest code.  Count it as itself, and as an
+                 * invariant: a capture whose wrong-path content is meant to
+                 * be reproducible cannot have any, because the cut point
+                 * moves with buffer occupancy.
+                 */
+                thread_stats_get().wp_xlat_buffer_truncations++;
+                if (Stats *h = g_current_hist_bucket) {
+                    h->wp_xlat_buffer_truncations++;
+                }
+                if (!wp_chain.empty()) {
+                    wp_chain.back().translation_unavailable = true;
+                } else {
+                    *first_tb_unavail = true;
+                }
+            } else if (g_tb_flush_count.load(std::memory_order_acquire) !=
                     flush_before) {
                 *flush_interrupted = true;
             } else if (!wp_chain.empty()) {

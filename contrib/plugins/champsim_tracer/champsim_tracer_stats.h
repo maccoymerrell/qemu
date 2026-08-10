@@ -65,6 +65,15 @@ struct Stats {
      * genuinely unmapped in the current address space; a nonzero count on
      * a workload whose targets are resident indicates a bug. */
     uint64_t wp_first_tb_unavail = 0;
+    /* Wrong-path steps whose speculative translation was refused because the
+     * HOST's TCG code buffer had no room left, not because the guest could
+     * not supply the code.  A walk may not tb_flush (see
+     * qemu_plugin_spec_reserve_exhausted), so TCG hands it a bounded reserve
+     * and then declines; the chain is cut at whatever depth the buffer
+     * happened to allow.  MUST BE 0 in any capture whose wrong-path content
+     * is expected to be reproducible: the cut point is host state, so the
+     * same guest run traced twice can produce different chains. */
+    uint64_t wp_xlat_buffer_truncations = 0;
     /* Wrong-path resume addresses the target refused to hold verbatim: a PC
      * the walk computed (a faulting PC plus an instruction length, or a stuck
      * PC nudged by one) that qemu_plugin_set_pc() re-interpreted instead of

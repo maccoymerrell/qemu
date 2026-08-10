@@ -1323,6 +1323,16 @@ bool qemu_plugin_spec_store_overflowed(void)
 #endif
 }
 
+uint64_t qemu_plugin_spec_reserve_opens(void)
+{
+    return qatomic_read(&plugin_spec_reserve_opens);
+}
+
+uint64_t qemu_plugin_spec_reserve_exhausted(void)
+{
+    return qatomic_read(&plugin_spec_reserve_exhausted);
+}
+
 bool qemu_plugin_spec_mem_faulted_take(void)
 {
     if (!current_cpu || !current_cpu->plugin_spec_mem_faulted) {

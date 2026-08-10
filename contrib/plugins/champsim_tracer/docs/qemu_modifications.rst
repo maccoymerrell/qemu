@@ -849,10 +849,33 @@ speculative path.
    ``cpu_exec_loop`` honors that flag with the real ``tb_flush`` at its
    next safe point, after the walk has unwound and the correct-path TB
    has finished, so the flush recycles the whole buffer (reserve
-   included) with no TB in flight.  At the default buffer size the
-   reserve is never reached and neither path runs; it is a
-   wrong-path-only safety valve, and the correct path is byte-for-byte
-   and speed-for-speed unaffected.
+   included) with no TB in flight.
+
+   The reserve is finite, and both of its limits are reachable, so both
+   are counted rather than described.
+   ``qemu_plugin_spec_reserve_opens()`` is how many walks filled the
+   buffer and were handed the reserve; each of those costs a full
+   ``tb_flush`` the moment it unwinds, so the whole correct-path cache
+   is retranslated for one excursion.
+   ``qemu_plugin_spec_reserve_exhausted()`` is how many walks the
+   reserve could not hold either: ``tb_gen_code`` returns ``NULL`` and
+   the chain is cut at a depth set by how full the buffer happened to
+   be.  That cut is HOST state, not guest state, so a wrong-path chain
+   is only flush-invariant while this counter is zero — which is why
+   the tracer reports it as ``WP chain cut by code-buffer (must be 0)``
+   and does not charge it to ``WP first-TB unavailable``, the counter
+   that means the guest could not supply the code.
+
+   Measured, on a workload built so the wrong path (and only the wrong
+   path) walks 20,000 never-executed basic blocks: at the default
+   buffer size neither limit is reached at any ``wpdepth`` up to 65536.
+   At ``-accel tcg,tb-size=8`` and ``wpdepth`` 16384 the reserve opens
+   (21-26 times per run, no exhaustion).  At ``tb-size=4`` and
+   ``wpdepth`` 65536 it opens 122 times and is exhausted 103 times in a
+   single x86_64 run, which before the split showed up as 107 "first-TB
+   unavailable" — a host code-buffer squeeze reported as absent guest
+   code.  No configuration wedged; the cost is a translation storm
+   (about 17x wall time), and cost is not the same thing as a hang.
 
 ``accel/tcg/cputlb.c`` and ``accel/tcg/user-exec.c`` —
 ``probe_access``

@@ -177,11 +177,20 @@ typedef uint64_t qemu_plugin_id_t;
  *   implements it (Config3.PW).  MIPS thereby joins x86-64/AArch64/
  *   RISC-V in naming an address space by the root the architecture
  *   itself walks from, instead of by a recycled 8-bit EntryHi.ASID.
+ *
+ * version 20:
+ * - added qemu_plugin_spec_reserve_opens / _exhausted: how hard a
+ *   plugin's wrong-path (speculative) walking is leaning on the shared
+ *   TCG code buffer.  A walk may not tb_flush, so TCG hands it a reserve
+ *   and owes a flush; when even the reserve runs out, tb_gen_code
+ *   declines and the walk is cut at a depth set by host buffer occupancy.
+ *   Without these the cut is indistinguishable, at the plugin, from the
+ *   guest simply not having the code.
  */
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 19
+#define QEMU_PLUGIN_VERSION 20
 
 /**
  * struct qemu_info_t - system information for plugins
@@ -2178,6 +2187,37 @@ bool qemu_plugin_rep_chunk_boundary(void);
  */
 QEMU_PLUGIN_API
 bool qemu_plugin_spec_store_overflowed(void);
+
+/**
+ * qemu_plugin_spec_reserve_opens() - wrong-path walks that overflowed the
+ * translation buffer and had to open the speculative reserve
+ *
+ * A wrong-path walk cannot tb_flush: the flush would reset the code buffer
+ * under the correct-path TB the walk is nested inside.  When such a walk fills
+ * the buffer, TCG instead opens a reserve held back for exactly this case and
+ * owes a real tb_flush at the next safe point — so every count here is one
+ * walk that evicted the ENTIRE correct-path code cache.  A workload that does
+ * it on every excursion retranslates the world between guest instructions.
+ * Process-wide monotonic total across vCPUs; zero for a run whose wrong path
+ * never filled the buffer.
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_spec_reserve_opens(void);
+
+/**
+ * qemu_plugin_spec_reserve_exhausted() - wrong-path walks truncated because the
+ * speculative reserve ran out
+ *
+ * The reserve is finite.  When a single walk's translation footprint exceeds
+ * it, tb_gen_code returns NULL and the walk ends there — at a point determined
+ * by how full the buffer happened to be, which is not architectural state.  A
+ * tracer must not report that truncation as an architectural one (an
+ * unfetchable target): the two are indistinguishable at the walker, and only
+ * this counter separates them.  MUST BE 0 in any capture whose wrong-path
+ * content is expected to be reproducible.  Process-wide monotonic total.
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_spec_reserve_exhausted(void);
 
 /**
  * qemu_plugin_spec_mem_faulted_take() - did the just-executed wrong-path memory

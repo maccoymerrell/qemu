@@ -84,6 +84,20 @@ void cpu_plugin_spec_tlb_flush_logged(CPUState *cpu);
 bool cpu_plugin_spec_mode_supported(void);
 void cpu_plugin_vclock_pause(CPUState *cpu);
 void cpu_plugin_vclock_resume(CPUState *cpu);
+/*
+ * Code-buffer pressure a wrong-path (speculative) walk put on the shared
+ * translation cache.  _opens counts walks that overflowed the normal
+ * highwater and had to open the spec reserve — each of those owes a full
+ * tb_flush the moment the walk unwinds, so a nonzero count is a walk that
+ * evicted the whole correct-path cache.  _exhausted counts walks the
+ * reserve itself could not hold: tb_gen_code returned NULL and the chain
+ * was truncated at a point that depends on how full the buffer happened to
+ * be, not on anything architectural.  Both are host-side, cross-vCPU
+ * process-wide totals; the plugin reads them through
+ * qemu_plugin_spec_reserve_opens()/_exhausted().
+ */
+extern unsigned long plugin_spec_reserve_opens;
+extern unsigned long plugin_spec_reserve_exhausted;
 #endif /* CONFIG_PLUGIN */
 
 #define REAL_HOST_PAGE_ALIGN(addr) ROUND_UP((addr), qemu_real_host_page_size())

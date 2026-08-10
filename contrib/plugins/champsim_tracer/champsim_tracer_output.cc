@@ -4396,6 +4396,18 @@ void devio_note_stop(uint64_t request_id)
     g_mutex_unlock(&g_devio.mtx);
 }
 
+void devio_pending_counts(size_t *starts, size_t *stops)
+{
+    g_mutex_lock(&g_devio.mtx);
+    if (starts) {
+        *starts = g_devio.pending_starts.size();
+    }
+    if (stops) {
+        *stops = g_devio.pending_stops.size();
+    }
+    g_mutex_unlock(&g_devio.mtx);
+}
+
 void devio_reset_segment(void)
 {
     g_mutex_lock(&g_devio.mtx);

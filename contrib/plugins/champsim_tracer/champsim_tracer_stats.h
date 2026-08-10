@@ -407,6 +407,83 @@ struct Stats {
     uint64_t close_peer_insns_recovered = 0;
     uint64_t close_peer_user_insns_recovered = 0;
     uint64_t close_peer_slots_emitted_nothing = 0;
+
+    /* ---- CLOSE CENSUS (CST_CLOSEDROP) --------------------------------
+     *
+     * THE WHOLE CLASS, NOT ONE HOLDER AT A TIME.  Five rounds each fixed a
+     * single structure that was holding retired-but-unemitted work at a
+     * segment close, and each time the next verifier found another one.
+     * These are the ledger side of the census that enumerates them: for
+     * every holder, how many occupants ENTERED it and how each one LEFT,
+     * so "entered == fated + held_at_close" is an arithmetic identity a
+     * run either satisfies or visibly breaks.  A holder whose occupants
+     * are still in it at the close is a DROP unless a drain named below
+     * emitted them.
+     *
+     * The occupancy half is printed per close by
+     * PathBuilder::close_state_report (pre-flush and post-flush lines);
+     * these counters are what make the two halves add up across a run.
+     *
+     * Frames (PathBuilder::frames_):
+     *   opened               classify_fault_enter pushed a CtxFrame
+     *   merged               complete_merge emitted the reassembled BB
+     *   unwound_emitted      flush_frame_unwound put its prefix on the wire
+     *   unwound_dropped      flush_frame_unwound had no stream / no
+     *                        template and erased it silently — an
+     *                        UNCOUNTED drop before this census
+     *   faults0_dropped      faults=0 nested-handler frame discarded
+     *   orphan_dropped       on_segment_open cleared it (its full_tmpl
+     *                        dangles into the cleared bb_map_) — likewise
+     *                        uncounted before this census, and the
+     *                        susp_stack_ twin HAS had a counter since
+     *                        Stage 3
+     *   held_at_close        still in frames_ at a close, summed over the
+     *                        POST-flush census (so the close-flush's own
+     *                        recoveries are already subtracted)
+     *
+     * Pending-seal slot (PathBuilder::prev_tb_):
+     *   prev_promoted        set_prev installed a block
+     *   prev_close_walked    a close's flush_final walked it
+     *   prev_close_dropped   a close did NOT walk it although it held a
+     *                        block (the prev_executed=false routes), with
+     *                        the RETIRED extent that went with it
+     *
+     * The remaining holders have no lifecycle counter of their own because
+     * they are sinks, not queues: what matters is the depth left in them
+     * when the last drain has run, which is exactly what the post-flush
+     * census records here. */
+    uint64_t census_closes = 0;
+    uint64_t census_frames_opened = 0;
+    uint64_t census_frames_merged = 0;
+    uint64_t census_frames_unwound_emitted = 0;
+    uint64_t census_frames_unwound_dropped = 0;
+    uint64_t census_frames_faults0_dropped = 0;
+    uint64_t census_frames_orphan_dropped = 0;
+    uint64_t census_frames_held_at_close = 0;
+    uint64_t census_frames_held_insns = 0;
+    uint64_t census_prev_promoted = 0;
+    uint64_t census_prev_close_walked = 0;
+    uint64_t census_prev_close_dropped = 0;
+    uint64_t census_prev_close_dropped_insns = 0;
+    uint64_t census_walkprev_held_at_close = 0;
+    uint64_t census_susp_held_at_close = 0;
+    uint64_t census_susp_held_insns = 0;
+    uint64_t census_chain_held_at_close = 0;
+    uint64_t census_chain_held_insns = 0;
+    uint64_t census_snaps_held_at_close = 0;
+    uint64_t census_snapmark_held_at_close = 0;
+    uint64_t census_cpmem_held_at_close = 0;
+    uint64_t census_cpcarry_held_at_close = 0;
+    uint64_t census_evs_held_at_close = 0;
+    uint64_t census_repfacts_held_at_close = 0;
+    uint64_t census_wmhold_held_at_close = 0;
+    uint64_t census_devio_held_at_close = 0;
+    uint64_t census_wpmem_held_at_close = 0;
+    /* Closes at which the fate identity above did NOT hold for some
+     * holder.  Must be 0; any other value means a fate exists that this
+     * census cannot name, which is the exact failure mode of every
+     * previous one-holder-at-a-time round. */
+    uint64_t census_balance_broken = 0;
     /* The same three quantities for the PER-EXECUTION seal walk
      * (collect_finalized_bbs).  A guest instruction that touches device
      * MMIO from anywhere but its TB's last slot, an atomic that needs

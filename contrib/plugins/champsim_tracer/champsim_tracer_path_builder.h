@@ -216,6 +216,11 @@ bool retired_executed_of(unsigned int cpu_index, const BBTemplate *head,
 bool retired_executed_prev(unsigned int cpu_index, const BBTemplate *head,
                            uint64_t *out);
 
+/* Close census: one pending-seal slot promote.  Out of line because the
+ * g_stats macro is not in scope in this header (stats.h is included after
+ * it in every TU). */
+void census_note_prev_promote(void);
+
 /* CST_NO_TRUNC falsifier: is the named walk's truncation disabled?  See
  * truncation_falsifier_mask() in champsim_tracer_path_builder.cc.  True only
  * in a deliberately falsified arm — never in a capture run. */
@@ -564,6 +569,9 @@ public:
             seal_prev_extent_valid_ = prev_extent_valid_;
             prev_extent_valid_ = false;
         }
+        if (tb != nullptr) {
+            census_note_prev_promote();
+        }
         prev_tb_ = tb;
     }
     void clear_prev() { set_prev(nullptr); }
@@ -697,17 +705,30 @@ public:
         }
     }
 
-    /* WHAT THIS BUILDER IS STILL HOLDING WHEN THE SEGMENT CLOSES.
+    /* THE CLOSE CENSUS: EVERY HOLDER, EVERY CLOSE.
      *
-     * The close flushes exactly one thing — the pending-seal slot (and,
-     * on a peer, its own).  Everything else this builder can be holding
-     * at that instant (an open fault frame's collected prefix, a
-     * suspended prev, an in-flight chain) is dropped with no counter,
-     * so a clock-vs-wire residual at a close has no site to name.  This
-     * prints every holder, once per close, behind CST_CLOSEDROP.
-     * Diagnostic only. */
+     * The close flushes the pending-seal slot (and, on a peer, its own)
+     * plus the open fault frames.  Everything else this builder can be
+     * holding at that instant — a suspended prev and its four frozen
+     * sinks, the in-flight chain, the positional reg-snap sink, the CP
+     * memop buffer and its straggler carry, the retained fault events,
+     * the pending self-loop facts — leaves with no drain and no counter,
+     * so a clock-vs-wire residual at a close has no site to name.
+     *
+     * This walks all of them and prints one [census] line per builder,
+     * TWICE per close: @phase "pre" before anything is flushed (what the
+     * close inherited) and "post" after the flush hook has run (what
+     * survived it, which is the drop).  The post pass is also where the
+     * held_at_close ledger rows in Stats are accumulated, so the fate
+     * identity "entered == fated + held" is checkable over a whole run.
+     *
+     * Printing is behind CST_CLOSEDROP; the ledger accumulation is not
+     * (a counter that only exists when a diagnostic is enabled cannot be
+     * quoted as evidence for a run that did not enable it). */
     void close_state_report(FILE *f, const char *why,
-                            unsigned int closing_cpu) const;
+                            unsigned int closing_cpu,
+                            const char *phase, bool print,
+                            bool ledger) const;
 
 private:
     void prime_from_live();
@@ -1225,6 +1246,16 @@ private:
 
     bool evq_enabled_ = false;
     unsigned int cpu_index_ = 0;
+
+    /* CLOSE CENSUS ONLY.  flush_final consumes the pending-seal slot but
+     * does not null prev_tb_, so the post-flush census cannot tell a slot
+     * the close EMITTED from one it dropped by reading the slot alone.
+     * This stamps the close (Stats::census_closes) whose flush walked this
+     * builder and how: 1 = walked prev, 2 = chain-only (prev dropped).
+     * Written by flush_final, read by close_state_report, consulted by
+     * nothing else. */
+    mutable uint64_t census_flush_seq_ = 0;
+    mutable uint8_t  census_flush_kind_ = 0;
 };
 
 /* @cpu_index's PathBuilder (lazily heap-allocated, immortal).  One
@@ -1244,11 +1275,16 @@ PathBuilder *path_builder_if_created(unsigned int cpu_index);
 void path_builder_flush_final(unsigned int cpu_index);
 void path_builder_flush_final_chain_only(unsigned int cpu_index);
 
-/* CST_CLOSEDROP: one report per segment close, over every builder that
- * ever ran, naming everything still held at the close (see
- * PathBuilder::close_state_report).  Diagnostic only. */
+/* The close census: one pass per segment close over every builder that
+ * ever ran, naming everything still held (see
+ * PathBuilder::close_state_report).  Called twice per close — @phase
+ * "pre" before the flush hook, "post" after it.  @print is the
+ * CST_CLOSEDROP gate; the ledger accumulation in the "post" pass runs
+ * regardless. */
 void path_builder_close_state_report(FILE *f, const char *why,
-                                     unsigned int closing_cpu);
+                                     unsigned int closing_cpu,
+                                     const char *phase, bool print,
+                                     bool ledger);
 
 /*
  * ---- Narrow-ASID identity generation ----

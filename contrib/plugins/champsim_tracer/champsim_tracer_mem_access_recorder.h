@@ -43,6 +43,12 @@ public:
      * because the record-to-drain lifetime crosses CP steps, and under
      * round-robin TCG one host thread interleaves every vCPU's steps. */
     size_t cp_count(unsigned int cpu_index) const;
+    /* Memops of ALREADY-RETIRED instructions carried past a drain that
+     * could not place them (a split BB's straggler awaiting the
+     * neighbouring entry).  A second holder, distinct from cp_count and
+     * invisible to it, and clear_cp discards it: the close census reads
+     * both. */
+    size_t cp_carry_count(unsigned int cpu_index) const;
     void clear_cp(unsigned int cpu_index);
 
     /* Set the CP buffer aside (move out, leaving it empty) across a

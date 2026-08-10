@@ -5415,14 +5415,43 @@ static void finish_trace_segment(bool prev_executed = true,
                 " records deferred) — header keeps the sentinel\n",
                 g_seg_wm_deferred_records);
     }
-    /* CST_CLOSEDROP: what every builder is still holding, BEFORE the
-     * close flushes anything.  Diagnostic only. */
-    if (getenv("CST_CLOSEDROP")) {
-        path_builder_close_state_report(
-            stderr,
-            g_seg_close_reason ? g_seg_close_reason
-                               : (prev_executed ? "exec" : "deferred"),
-            closing_cpu);
+    /*
+     * ---- THE CLOSE CENSUS ----
+     *
+     * Every structure that can hold instructions the guest RETIRED and the
+     * tracer has not put on the wire, read at this close: the pending-seal
+     * slots (this vCPU's and every peer's), the cross-phase walk snapshot,
+     * the in-flight true-BB chains, the open fault frames, the suspended
+     * prevs and their four frozen sinks, the positional reg-snap sink and
+     * its chain mark, the CP memop buffer and its straggler carry, the
+     * retained fault events, the self-loop fan-out facts, the warmup hold,
+     * an open wrong-path session, and the queued device-I/O records.
+     *
+     * Taken TWICE.  "pre" is what the close inherited; "post" is what
+     * survived the flush hook, and the post pass is the one that feeds the
+     * held_at_close ledger — so a holder with a working drain reads
+     * non-zero pre and zero post, and a holder with no drain reads the
+     * same both times.  That difference is the whole instrument: five
+     * previous rounds each closed one holder and asserted the rest were
+     * empty, and none of them could show it.
+     */
+    static const bool census_print = getenv("CST_CLOSEDROP") != nullptr;
+    const char *census_why = g_seg_close_reason ? g_seg_close_reason
+        : (prev_executed ? "exec" : "deferred");
+    g_stats.census_closes++;
+    /*
+     * MIRRORED TO THE STATS FILE, NOT ONLY TO stderr.  In user mode the
+     * guest's exit syscall reaches plugin_exit through preexit_cleanup
+     * AFTER QEMU has torn its log fd down (see the note beside
+     * qemu_plugin_outs in plugin_exit), so a close taken there writes its
+     * census into a closed stderr and the run reports nothing.  A census
+     * whose output can silently vanish on one whole mode is not evidence.
+     */
+    path_builder_close_state_report(stderr, census_why, closing_cpu,
+                                    "pre", census_print, /* ledger= */ false);
+    if (census_print && stats_file) {
+        path_builder_close_state_report(stats_file, census_why, closing_cpu,
+                                        "pre", true, /* ledger= */ false);
     }
 
     /* Drain any chain still in flight.  This may call emit_body_entry
@@ -5523,6 +5552,66 @@ static void finish_trace_segment(bool prev_executed = true,
             }
         }
     });
+
+    /* POST pass: what survived every drain the close performs.  This is
+     * the drop, and it is where the held_at_close ledger is taken. */
+    const uint64_t held_frames_before = g_stats.census_frames_held_at_close;
+    const uint64_t held_susp_before   = g_stats.census_susp_held_at_close;
+    path_builder_close_state_report(stderr, census_why, closing_cpu,
+                                    "post", census_print, /* ledger= */ true);
+    if (census_print && stats_file) {
+        path_builder_close_state_report(stats_file, census_why, closing_cpu,
+                                        "post", true, /* ledger= */ false);
+    }
+    /*
+     * THE FATE IDENTITY.
+     *
+     * Every occupant of a holder either left it through a named fate or is
+     * still in it.  Checked cumulatively at each close, so a fate this
+     * census cannot name shows up as a broken identity rather than as a
+     * verifier's discovery three rounds later.  Reported, never enforced —
+     * the instrument's job is to say what happened.
+     */
+    {
+        const Stats &s = g_stats;
+        const uint64_t frames_fated =
+            s.census_frames_merged + s.census_frames_unwound_emitted +
+            s.census_frames_unwound_dropped + s.census_frames_faults0_dropped +
+            s.census_frames_orphan_dropped + s.close_frames_flushed +
+            s.close_frames_empty_prefix + s.close_frame_prefix_unplaced +
+            s.close_frames_unflushable;
+        const uint64_t susp_fated =
+            s.susp_resumed + s.susp_displaced + s.susp_stale_retired +
+            s.susp_orphan_dropped;
+        const uint64_t frames_live =
+            g_stats.census_frames_held_at_close - held_frames_before;
+        const uint64_t susp_live =
+            g_stats.census_susp_held_at_close - held_susp_before;
+        const bool frames_ok =
+            s.census_frames_opened == frames_fated + frames_live;
+        const bool susp_ok = s.susp_pushed == susp_fated + susp_live;
+        if (!frames_ok || !susp_ok) {
+            g_stats.census_balance_broken++;
+        }
+        for (FILE *cf : { stderr, stats_file }) {
+            if (!census_print || !cf) {
+                continue;
+            }
+            fprintf(cf,
+                    "[censusfate] why=%s frames: opened=%" PRIu64
+                    " fated=%" PRIu64 " held=%" PRIu64 " %s | susp: "
+                    "pushed=%" PRIu64 " fated=%" PRIu64 " held=%" PRIu64
+                    " %s | prev: promoted=%" PRIu64 " close_walked=%" PRIu64
+                    " close_dropped=%" PRIu64 "(insns=%" PRIu64 ")\n",
+                    census_why, s.census_frames_opened, frames_fated,
+                    frames_live, frames_ok ? "BALANCE-ok" : "BALANCE-BROKEN",
+                    s.susp_pushed, susp_fated, susp_live,
+                    susp_ok ? "BALANCE-ok" : "BALANCE-BROKEN",
+                    s.census_prev_promoted, s.census_prev_close_walked,
+                    s.census_prev_close_dropped,
+                    s.census_prev_close_dropped_insns);
+        }
+    }
 
     /* Actual icount at finish — must be >= window_stop for the
      * trace to be at-least-budget.  Underrun means we stopped

@@ -1157,6 +1157,11 @@ static bool merge_suffix_matches(const BBTemplate *full,
     return tmpl_subrun_pos(full, suffix) != UINT32_MAX;
 }
 
+void census_note_prev_promote(void)
+{
+    g_stats.census_prev_promoted++;
+}
+
 void PathBuilder::on_segment_open()
 {
     /* Orphan drop: every frame's full_tmpl points into the bb_map_ the
@@ -1181,6 +1186,11 @@ void PathBuilder::on_segment_open()
                 "at segment open\n", susp_stack_.size());
     }
     g_stats.susp_orphan_dropped += susp_stack_.size();
+    /* The frames_ twin of susp_orphan_dropped.  This clear() has always
+     * been an orphan DROP of executed prefixes and has never had a
+     * counter, so "no frames were lost at a segment boundary" was never a
+     * claim any run could make. */
+    g_stats.census_frames_orphan_dropped += frames_.size();
     gap_disarm();
     kexc_snap_.valid = false;
     susp_stack_.clear();
@@ -1316,6 +1326,31 @@ void PathBuilder::flush_final(bool walk_prev)
      */
     uint64_t executed = 0;
     bool have_extent = false;
+    /*
+     * CENSUS: WHICH WAY THIS CLOSE TREATS THE PENDING-SEAL SLOT.
+     *
+     * walk_prev=false is the deferred route (budget / simpoint / the
+     * device-write shutdown).  On the first two the slot holds a TB that
+     * has not run and dropping it costs nothing; on the shutdown close it
+     * holds the block the device write interrupted, whose retired prefix
+     * goes with it.  The two are indistinguishable in the counter alone,
+     * so the RETIRED extent is recorded next to the drop.
+     */
+    census_flush_seq_ = g_stats.census_closes;
+    census_flush_kind_ = walk_prev ? 1 : 2;
+    if (prev_tb_) {
+        if (walk_prev) {
+            g_stats.census_prev_close_walked++;
+        } else {
+            uint64_t dropped_ran = 0;
+            if (!retired_executed_of(cpu_index, prev_tb_, &dropped_ran) &&
+                !prev_extent(&dropped_ran)) {
+                dropped_ran = 0;
+            }
+            g_stats.census_prev_close_dropped++;
+            g_stats.census_prev_close_dropped_insns += dropped_ran;
+        }
+    }
     if (walk_prev && prev_tb_ && !trunc_falsifier_close()) {
         have_extent = retired_executed_of(cpu_index, prev_tb_, &executed);
         if (!have_extent) {
@@ -1494,23 +1529,162 @@ static uint32_t closedrop_tb_insns(const BBTemplate *head)
     return n;
 }
 
-void PathBuilder::close_state_report(FILE *f, const char *why,
-                                     unsigned int closing_cpu) const
+/* Instructions of @f that RETIRED before its fault: everything strictly
+ * ahead of the resume PC (a pushed fault always re-executes its faulting
+ * instruction), plus that instruction itself when it is a self-loop that
+ * retired iterations before faulting.  Exactly the extent
+ * flush_frames_at_close emits, computed here so the census can say how
+ * much a frame is holding without emitting it. */
+static uint32_t census_frame_prefix_insns(const CtxFrame &f)
 {
-    if (frames_.empty() && susp_stack_.empty() && prev_tb_ == nullptr &&
-        !cp_chain(cpu_index_).has_active_chain()) {
+    if (!f.full_tmpl || !f.full_tmpl->insn_pcs) {
+        return 0;
+    }
+    for (uint32_t k = 0; k < f.full_tmpl->n_insns; k++) {
+        if (f.full_tmpl->insn_pcs[k] == f.resume_pc) {
+            return (f.rep_pre_iters > 0 && f.rep_pre_pc == f.resume_pc)
+                ? k + 1 : k;
+        }
+    }
+    return 0;                   /* extent unnameable; the flush refuses too */
+}
+
+static uint32_t census_chain_insns(const BBChainAssembler::ChainState &s)
+{
+    uint32_t n = 0;
+    for (const BBTemplate *t : s.fragments) {
+        n += t ? t->n_insns : 0;
+    }
+    return n;
+}
+
+void PathBuilder::close_state_report(FILE *f, const char *why,
+                                     unsigned int closing_cpu,
+                                     const char *phase, bool print,
+                                     bool ledger) const
+{
+
+    /*
+     * ---- OCCUPANCY OF EVERY HOLDER ----
+     *
+     * Read, not inferred.  Each of these can contain work the guest
+     * RETIRED that has not reached the wire; the ones without a drain in
+     * the close path are the standing drop.
+     */
+    /* 1. the pending-seal slot, and how much of it actually ran */
+    uint64_t prev_ran = 0;
+    int prev_ran_known = 0;
+    if (prev_tb_) {
+        if (retired_executed_of(cpu_index_, prev_tb_, &prev_ran)) {
+            prev_ran_known = 1;
+        } else if (prev_extent(&prev_ran)) {
+            prev_ran_known = 2;         /* from the note_prev_extent stash */
+        }
+    }
+    /* 2. the cross-phase snapshot the seal walk folds.  Stale (already
+     *    sealed) on every close that lands between two steps; LIVE on a
+     *    close taken between step_events and step_seal. */
+    const uint32_t walkprev_n = walk_prev_ ? closedrop_tb_insns(walk_prev_) : 0;
+    /* 3. the in-flight true-BB chain */
+    const uint32_t chain_n = cp_chain(cpu_index_).in_flight_insns();
+    /* 4. open fault frames: count and total executed prefix */
+    uint64_t frames_insns = 0;
+    for (const CtxFrame &fr : frames_) {
+        frames_insns += census_frame_prefix_insns(fr);
+    }
+    /* 5. suspensions: their prev, their frozen chain, and their frozen
+     *    sinks — four holders in one entry */
+    uint64_t susp_insns = 0, susp_chain_insns = 0;
+    uint64_t susp_snaps = 0, susp_mem = 0;
+    for (const SuspendedPrev &sp : susp_stack_) {
+        susp_insns += sp.extent_valid
+            ? sp.extent
+            : (sp.prev ? closedrop_tb_insns(sp.prev) : 0);
+        susp_chain_insns += census_chain_insns(sp.chain);
+        susp_snaps += sp.snaps.size();
+        susp_mem += sp.mem.size();
+    }
+    /* 6-9. the per-vCPU sinks and the retained-event queue */
+    const size_t n_snaps = pending_reg_snaps(cpu_index_).size();
+    const size_t snap_mark = cp_chain_snap_mark(cpu_index_);
+    const size_t n_cpmem = g_mem_recorder.cp_count(cpu_index_);
+    const size_t n_carry = g_mem_recorder.cp_carry_count(cpu_index_);
+    const size_t n_evs = pending_evs_.size();
+    /* 10. the self-loop fan-out facts riding with the pending prev: a
+     *     retired ITERATION COUNT, lost as a fallback to the memop-derived
+     *     estimate if the block they describe is emitted without them */
+    const RepSelfLoopState &rs = rep_state(cpu_index_);
+    const int rep_held = (rs.pb_prev_facts.pc != 0) +
+                         (rs.pb_walk_facts.pc != 0) +
+                         (rs.emit_facts_valid ? 1 : 0);
+    const int wm_held = rs.warmup_hold_any() ? 1 : 0;
+    /* 11. a wrong-path session still open on this vCPU: while it is, the
+     *     memop router sends CORRECT-path memops to the WP buffer */
+    const int wp_open = wp_session_active(cpu_index_) ? 1 : 0;
+    /* Did THIS close's flush hook consume this builder's slot, and how?
+     * 0 = never reached (the peer loop skipped it, or no flush ran),
+     * 1 = walked prev, 2 = chain-only, so prev's retired prefix went
+     * unemitted. */
+    const int flushed = (census_flush_seq_ == g_stats.census_closes)
+        ? (int)census_flush_kind_ : 0;
+
+    const bool anything = prev_tb_ || walk_prev_ || chain_n ||
+                          !frames_.empty() || !susp_stack_.empty() ||
+                          n_snaps || n_cpmem || n_carry || n_evs ||
+                          rep_held || wm_held || wp_open;
+
+    if (ledger) {
+        /* The LEDGER is taken from the post-flush pass only: whatever is
+         * still here once every drain the close performs has run is what
+         * the close drops. */
+        g_stats.census_frames_held_at_close += frames_.size();
+        g_stats.census_frames_held_insns += frames_insns;
+        g_stats.census_walkprev_held_at_close += walk_prev_ ? 1 : 0;
+        g_stats.census_susp_held_at_close += susp_stack_.size();
+        g_stats.census_susp_held_insns += susp_insns + susp_chain_insns;
+        g_stats.census_chain_held_at_close += chain_n ? 1 : 0;
+        g_stats.census_chain_held_insns += chain_n;
+        g_stats.census_snaps_held_at_close += n_snaps;
+        g_stats.census_snapmark_held_at_close += snap_mark;
+        g_stats.census_cpmem_held_at_close += n_cpmem;
+        g_stats.census_cpcarry_held_at_close += n_carry;
+        g_stats.census_evs_held_at_close += n_evs;
+        g_stats.census_repfacts_held_at_close += (uint64_t)rep_held;
+        g_stats.census_wmhold_held_at_close += (uint64_t)wm_held;
+        g_stats.census_wpmem_held_at_close += (uint64_t)wp_open;
+    }
+
+    if (!print) {
         return;
     }
-    fprintf(f, "[closedrop] why=%s vcpu=%u%s prev=0x%" PRIx64
-            "(n=%u,sys=%d) chain=%d frames=%zu susp=%zu\n",
-            why, cpu_index_, cpu_index_ == closing_cpu ? "*" : "",
+
+    /* One line per builder per phase, printed even when empty: a census
+     * that only speaks when it has something to say cannot be shown to
+     * have looked. */
+    fprintf(f, "[census] %s why=%s vcpu=%u%s prev=0x%" PRIx64
+            "(n=%u,ran=%" PRIu64 ",rk=%d,sys=%d,flushed=%d) walkprev=0x%" PRIx64
+            "(n=%u) chain=%u frames=%zu(insns=%" PRIu64 ") "
+            "susp=%zu(insns=%" PRIu64 ",chain=%" PRIu64 ",snaps=%" PRIu64
+            ",mem=%" PRIu64 ") snaps=%zu(mark=%zu) cpmem=%zu carry=%zu "
+            "evs=%zu rep=%d wmhold=%d wpsess=%d\n",
+            phase, why, cpu_index_, cpu_index_ == closing_cpu ? "*" : "",
             prev_tb_ ? prev_tb_->start_pc : 0,
             prev_tb_ ? closedrop_tb_insns(prev_tb_) : 0,
+            prev_ran, prev_ran_known,
             prev_tb_ ? (int)prev_tb_->is_system : -1,
-            (int)cp_chain(cpu_index_).has_active_chain(),
-            frames_.size(), susp_stack_.size());
+            flushed,
+            walk_prev_ ? walk_prev_->start_pc : 0, walkprev_n,
+            chain_n, frames_.size(), frames_insns,
+            susp_stack_.size(), susp_insns, susp_chain_insns,
+            susp_snaps, susp_mem,
+            n_snaps, snap_mark, n_cpmem, n_carry, n_evs,
+            rep_held, wm_held, wp_open);
+
+    if (!anything) {
+        return;
+    }
     for (const CtxFrame &fr : frames_) {
-        fprintf(f, "[closedrop]   FRAME full=0x%" PRIx64 " n=%u sys=%d "
+        fprintf(f, "[census]   FRAME full=0x%" PRIx64 " n=%u sys=%d "
                 "resume=0x%" PRIx64 " depth=%u tid=%u returned=%d "
                 "anchors=%zu mem=%zu snaps=%zu\n",
                 fr.full_tmpl ? fr.full_tmpl->start_pc : 0,
@@ -1520,7 +1694,7 @@ void PathBuilder::close_state_report(FILE *f, const char *why,
                 fr.anchors.size(), fr.mem.size(), fr.snaps.size());
         if (fr.full_tmpl) {
             for (uint32_t i = 0; i < fr.full_tmpl->n_insns; i++) {
-                fprintf(f, "[closedrop]     insn[%u] pc=0x%" PRIx64 "%s\n",
+                fprintf(f, "[census]     insn[%u] pc=0x%" PRIx64 "%s\n",
                         i, fr.full_tmpl->insn_pcs[i],
                         fr.full_tmpl->insn_pcs[i] == fr.resume_pc
                             ? "  <- resume/fault" : "");
@@ -1528,10 +1702,15 @@ void PathBuilder::close_state_report(FILE *f, const char *why,
         }
     }
     for (const SuspendedPrev &sp : susp_stack_) {
-        fprintf(f, "[closedrop]   SUSP prev=0x%" PRIx64 " n=%u sys=%d\n",
+        fprintf(f, "[census]   SUSP prev=0x%" PRIx64 " n=%u ran=%" PRIu64
+                "(v=%d) sys=%d asid=0x%" PRIx64 " depth=%u chain=%u "
+                "snaps=%zu mem=%zu\n",
                 sp.prev ? sp.prev->start_pc : 0,
                 sp.prev ? closedrop_tb_insns(sp.prev) : 0,
-                sp.prev ? (int)sp.prev->is_system : -1);
+                sp.extent, (int)sp.extent_valid,
+                sp.prev ? (int)sp.prev->is_system : -1,
+                sp.asid, sp.depth, census_chain_insns(sp.chain),
+                sp.snaps.size(), sp.mem.size());
     }
     if (cp_chain(cpu_index_).has_active_chain()) {
         cp_chain(cpu_index_).describe_in_flight(f, 0);
@@ -1539,11 +1718,28 @@ void PathBuilder::close_state_report(FILE *f, const char *why,
 }
 
 void path_builder_close_state_report(FILE *f, const char *why,
-                                     unsigned int closing_cpu)
+                                     unsigned int closing_cpu,
+                                     const char *phase, bool print,
+                                     bool ledger)
 {
     for (unsigned int i = 0; i < CST_PIN_MAX_VCPUS; i++) {
         if (PathBuilder *b = path_builder_if_created(i)) {
-            b->close_state_report(f, why, closing_cpu);
+            b->close_state_report(f, why, closing_cpu, phase, print, ledger);
+        }
+    }
+    /* Process-wide holders, once per phase.  The DEVIO queues hold
+     * completed records waiting for the next body entry to carry them; a
+     * close that emits no further entry drops them. */
+    const bool post = phase && phase[0] == 'p' && phase[1] == 'o';
+    if (post) {
+        size_t ds = 0, dt = 0;
+        devio_pending_counts(&ds, &dt);
+        if (ledger) {
+            g_stats.census_devio_held_at_close += ds + dt;
+        }
+        if (print && (ds || dt)) {
+            fprintf(f, "[census] post GLOBAL devio_starts=%zu devio_stops=%zu\n",
+                    ds, dt);
         }
     }
 }
@@ -2541,6 +2737,7 @@ void PathBuilder::classify_fault_enter(const struct qemu_plugin_cpu_event &ev,
     if (!*prev_stashed && tmpl_contains_pc(walk_prev_, resume) &&
         !ctx_asid_foreign(ev.asid)) {                             /* (b) */
         BBTemplate *full_bb = fold_prev_full_bb(walk_prev_);
+        g_stats.census_frames_opened++;
         frames_.emplace_back();
         CtxFrame &f = frames_.back();
         f.full_tmpl = full_bb;
@@ -3712,6 +3909,7 @@ PathBuilder::complete_merge(size_t idx,
     if (!g_features.trace_faults) {
         CtxFrame &f0 = frames_[idx];
         if (f0.depth >= 1) {
+            g_stats.census_frames_faults0_dropped++;
             frames_.erase(frames_.begin() + (ptrdiff_t)idx);
             g_mem_recorder.clear_cp(cpu_index_);
             pending_reg_snaps(cpu_index_).clear();
@@ -3759,6 +3957,7 @@ PathBuilder::complete_merge(size_t idx,
             pre_m0 = f0.rep_pre_memops;
             pieces0 = std::move(f0.rep_pieces);
         }
+        g_stats.census_frames_merged++;
         frames_.erase(frames_.begin() + (ptrdiff_t)idx);
         rep_emit_handoff(cpu_index, walk0, pre_i0, pre_m0,
                          std::move(pieces0));
@@ -3984,6 +4183,7 @@ PathBuilder::complete_merge(size_t idx,
         pre_m = f.rep_pre_memops;
         pieces = std::move(f.rep_pieces);
     }
+    g_stats.census_frames_merged++;
     frames_.erase(frames_.begin() + idx);
     rep_emit_handoff(cpu_index, walkf, pre_i, pre_m, std::move(pieces));
     emit_finalized_bb(out_stream, merged, pe.branch_pc,
@@ -4028,8 +4228,12 @@ void PathBuilder::flush_frame_unwound(size_t idx, BodyStreamState *out_stream,
     frames_.erase(frames_.begin() + (ptrdiff_t)idx);
 
     if (!out_stream || !f.full_tmpl) {
+        /* Erased with nothing emitted.  Silent before this census: the
+         * frame's executed prefix goes with it and no row said so. */
+        g_stats.census_frames_unwound_dropped++;
         return;
     }
+    g_stats.census_frames_unwound_emitted++;
     /* Emission-time depth, same re-derivation as the merge (see
      * complete_merge): the frame's synchronous component plus the owner's
      * async level at THIS emission's position. */

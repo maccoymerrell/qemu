@@ -279,6 +279,11 @@ size_t MemAccessRecorder::cp_count(unsigned int cpu_index) const
     return cp_mem(cpu_index).size();
 }
 
+size_t MemAccessRecorder::cp_carry_count(unsigned int cpu_index) const
+{
+    return cp_carry(cpu_index).size();
+}
+
 void MemAccessRecorder::clear_cp(unsigned int cpu_index)
 {
     cp_mem(cpu_index).clear();

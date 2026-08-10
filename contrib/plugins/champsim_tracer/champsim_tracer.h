@@ -1793,6 +1793,10 @@ void devio_note_stop(uint64_t request_id);
 /* Segment-open reset: clear pending records, the live-id set, the
  * per-vCPU kick FIFOs, and the per-segment id / sequence counters. */
 void devio_reset_segment(void);
+/* Close census: how many START / STOP records are queued and waiting for
+ * the next body entry to carry them.  A close that emits no further entry
+ * drops them, so the census has to be able to see them. */
+void devio_pending_counts(size_t *starts, size_t *stops);
 /* Advertise the DEVIO_* body-tag names in the header encoding map only
  * when the disk-I/O hook is active (system mode + devio enabled), so a
  * device-free trace keeps the historical body_tag vocabulary and stays

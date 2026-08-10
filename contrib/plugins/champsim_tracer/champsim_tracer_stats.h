@@ -484,6 +484,112 @@ struct Stats {
      * census cannot name, which is the exact failure mode of every
      * previous one-holder-at-a-time round. */
     uint64_t census_balance_broken = 0;
+
+    /* ---- THE CLOSE DRAINS (one per holder the census enumerated) ------
+     *
+     * The census's job was to name every structure that can hold work the
+     * guest RETIRED and the tracer has not put on the wire at a segment
+     * close.  These are the drains: each empties one holder onto the wire,
+     * each has a falsifier env var that turns it off so the defect it
+     * removes can be made to reappear, and each has a row below that MUST
+     * BE 0 for "held something at the close and could not emit it".
+     *
+     * SUSPENSIONS (PathBuilder::susp_stack_).  A suspension freezes five
+     * things at once: the deferred prev block and its retired extent, its
+     * committed CP memops, its per-insn dst snaps and their chain mark, the
+     * in-flight chain prefix, and its self-loop facts.  No close route read
+     * it; its only exits were a resume, an over-cap displacement, a stale
+     * sweep and the next segment open's orphan drop -- and the two middle
+     * ones emit the FRAME whose resume suffix the prev is, never the
+     * suspension's own contents.  flush_suspensions_at_close walks each one
+     * at its frozen extent, from its own frozen sinks, at its own depth. */
+    uint64_t close_susp_flushed = 0;
+    uint64_t close_susp_insns_recovered = 0;
+    uint64_t close_susp_user_insns_recovered = 0;
+    uint64_t close_susp_sys_insns_recovered = 0;
+    uint64_t close_susp_empty = 0;          /* held a block that ran 0 insns */
+    /* A suspension whose frozen extent measurement was invalid: the walk
+     * cannot name what retired, so it folds the block whole.  Must be 0 --
+     * a non-zero row means the wire may claim instructions the guest did
+     * not execute (the suspend-side twin of close_walk_extent_unknown). */
+    uint64_t close_susp_extent_unknown = 0;
+    /* A suspension held at a close with no body stream to emit into.  This
+     * IS the drop and nothing can undo it; must be 0. */
+    uint64_t close_susp_unflushable = 0;
+
+    /* PEER BUILDERS.  The peer loop gated on the pending-seal slot alone
+     * (`if (!b || !b->prev()) continue;`), so a peer vCPU holding open
+     * fault frames, a suspension, an in-flight chain or a reg-snap sink
+     * with an EMPTY slot was skipped whole -- and with it
+     * flush_frames_at_close, which is reachable only through flush_final.
+     * Measured: sd_smp4 vCPUs 2 and 3, ceil2 vCPUs 1 and 2, each holding a
+     * frame and a suspension behind prev=0x0.  The gate now asks whether
+     * the builder holds ANYTHING. */
+    uint64_t close_peer_holder_flushes = 0;
+    uint64_t close_peer_holder_insns_recovered = 0;
+    /* A peer builder that held work at the close and was NOT flushed.
+     * Reachable only through CST_NO_PEER_FLUSH / CST_NO_PEER_HOLDERS; must
+     * be 0 on any capture. */
+    uint64_t close_peer_holders_skipped = 0;
+
+    /* THE DEFERRED ROUTE'S PENDING-SEAL SLOT.  flush_final(walk_prev=false)
+     * did not walk the slot at all.  For the budget / simpoint close that
+     * is right -- the slot holds the TB about to dispatch, measured ran=0.
+     * For the SHUTDOWN close it is a drop: the slot holds the block the
+     * device write interrupted, and its retired prefix goes with it.
+     *
+     * The prefix is exactly what retired and nothing more.  insn_started is
+     * added at the TOP of an instruction, so a close taken from a MID-
+     * INSTRUCTION callback (the device write) reads the in-flight
+     * instruction as already begun; the drain subtracts it, because an
+     * instruction that has not completed has not delivered all its memops
+     * (the bimodality oracle that vetoed emitting this slot whole). */
+    uint64_t close_deferred_prev_walked = 0;
+    uint64_t close_deferred_prev_insns = 0;
+    uint64_t close_deferred_prev_inflight_trimmed = 0;
+    /* The deferred route held a block and no extent could be measured for
+     * it, so nothing could be emitted without guessing.  Must be 0. */
+    uint64_t close_deferred_prev_extent_unknown = 0;
+
+    /* THE SINKS, after every drain above has run.  These are residues, not
+     * queues: whatever is left once the last block is emitted belonged to
+     * an instruction that did not reach the wire.  Counted at the tail of
+     * flush_final, where they used to be discarded silently.
+     *
+     * cpmem/cpcarry are NOT must-be-0: a close taken mid-instruction leaves
+     * the in-flight instruction's partial memops behind by design, and they
+     * are correctly discarded (the instruction did not retire). */
+    uint64_t close_snaps_dropped = 0;
+    uint64_t close_cpmem_dropped = 0;
+    uint64_t close_cpcarry_dropped = 0;
+    uint64_t close_evs_dropped = 0;
+    uint64_t close_repfacts_dropped = 0;
+
+    /* THE WHOLE-CLASS GATE.  Read on the POST-flush census pass, per
+     * builder: after every drain this close performs, is any structure
+     * that can contain RETIRED instructions still occupied?  A pending-seal
+     * slot with a measured retired extent, an open fault frame with an
+     * executed prefix, any suspension, an in-flight chain with
+     * instructions.  Must be 0 -- this is the row that fails the cell when
+     * a holder is added, or when a falsifier turns a drain off, and it does
+     * not depend on remembering to add a row per new holder. */
+    uint64_t close_holder_undrained = 0;
+    uint64_t close_holder_undrained_insns = 0;
+
+    /* THE LATENT HOLDER (PathBuilder::walk_prev_).  The cross-phase
+     * snapshot the seal walk folds is undrained and non-zero at nearly
+     * every close, but in every close route that exists today it is
+     * POST-SEAL: already emitted.  It becomes a live drop the instant a
+     * close is taken between step_events and step_seal -- the window
+     * tw_manage_window occupies.  Nothing asserted that ordering; this
+     * does.  Must be 0. */
+    uint64_t close_in_mid_step = 0;
+
+    /* A wrong-path session still open on a vCPU at a close.  While one is,
+     * MemAccessRecorder::record routes CORRECT-path memops into the WP
+     * buffer, so this is a correct-path holder wearing a speculative hat.
+     * Must be 0. */
+    uint64_t close_wp_session_open = 0;
     /* The same three quantities for the PER-EXECUTION seal walk
      * (collect_finalized_bbs).  A guest instruction that touches device
      * MMIO from anywhere but its TB's last slot, an atomic that needs

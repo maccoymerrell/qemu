@@ -676,8 +676,31 @@ public:
      * just promoted the *currently dispatching* TB into the slot: walking
      * it there emits instructions before they execute, against empty
      * accumulators (see run_deferred_window_closes).  The in-flight chain
-     * is finalized either way. */
-    void flush_final(bool walk_prev = true);
+     * is finalized either way.
+     *
+     * @prev_in_flight says the slot holds a block the guest is STANDING IN
+     * — the machine-shutdown close arrives from a device write part-way
+     * through the block that performs it.  The retired prefix of such a
+     * block is real and is emitted; the instruction the close interrupted
+     * is not, because insn_started is added at the top of an instruction
+     * and an instruction that has not completed has not delivered all its
+     * memory operations.  Only meaningful with @walk_prev false (the
+     * deferred route); ignored otherwise. */
+    void flush_final(bool walk_prev = true, bool prev_in_flight = false);
+
+    /* Does this builder hold ANYTHING a close would have to drain?  The
+     * peer-flush loop used to ask only about the pending-seal slot, so a
+     * peer holding open fault frames, a suspension, an in-flight chain or a
+     * captured reg-snap sink behind an EMPTY slot was skipped whole — and
+     * with it flush_frames_at_close, which no other path reaches. */
+    bool holds_close_work() const;
+
+    /* Is a close landing BETWEEN step_events and step_seal, i.e. with the
+     * cross-phase walk snapshot (walk_prev_) still live rather than already
+     * sealed?  Every close route that exists today lands outside that
+     * window; nothing asserted it, and inside it walk_prev_ is a holder of
+     * retired work with no drain.  Read by the close census. */
+    bool mid_step() const { return mid_step_; }
 
     /* Which vCPU this builder belongs to.  Stamped once by
      * path_builder() at creation; every internal reference to the
@@ -796,6 +819,48 @@ private:
      * Caller holds exec_lock; data_lock is NOT held. */
     void flush_frames_at_close(BodyStreamState *out_stream,
                                unsigned int cpu_index);
+    /* Segment close: emit every SUSPENDED deferred prev — the block, its
+     * frozen CP memops, its frozen per-insn dst snaps and chain mark, its
+     * frozen in-flight chain and its frozen self-loop facts — at the extent
+     * frozen with it, most-recent (deepest) first, and empty the stack.
+     * No close route touched susp_stack_ before this; its only exits were a
+     * resume, an over-cap displacement, a stale sweep and the next segment
+     * open's orphan drop, and the two middle ones emit the FRAME whose
+     * resume suffix the prev is, never the suspension's own contents.
+     * Caller holds exec_lock; data_lock is NOT held. */
+    void flush_suspensions_at_close(BodyStreamState *out_stream,
+                                    unsigned int cpu_index);
+
+    /* The one close-time walk-and-emit.  Folds @a.head's fragment list into
+     * the in-flight chain up to the retired extent, finalizes whatever
+     * seals (including a chain the close leaves mid-BB), and emits each
+     * block from the accumulators the caller has installed.  Shared by the
+     * pending-seal slot's own walk and by the suspension drain so the two
+     * cannot drift: a second copy of a truncation rule is the same
+     * over-claim waiting on a second call site. */
+    struct CloseWalk {
+        BBTemplate *head = nullptr;     /* fragment list to walk (may be null:
+                                         * the chain is still finalized) */
+        bool have_extent = false;       /* is @executed a measurement? */
+        uint64_t executed = 0;          /* instructions of @head that RETIRED */
+        uint64_t prev_start = 0;        /* scoreboard's last-executed fragment,
+                                         * 0 when the caller has no such
+                                         * marker (a frozen suspension) */
+        bool snap_tail = true;          /* capture the last executed insn's dst
+                                         * snaps (taken one insn late, so its
+                                         * own successor never fired) */
+        bool set_depth = false;         /* stamp g_emit_fault_depth per block */
+        uint32_t depth = 0;
+        uint8_t async_in_depth = 0;
+        const RepArchFacts *facts = nullptr;
+        /* Filled by the walk: the template extent that reached the wire,
+         * split by privilege.  Measured from the blocks emitted, not from
+         * what the slot held — the difference is the whole of 81239d89cd. */
+        uint64_t insns_emitted = 0;
+        uint64_t user_insns_emitted = 0;
+    };
+    uint32_t close_walk_emit(BodyStreamState *out_stream,
+                             unsigned int cpu_index, CloseWalk &a);
     /* Retire-at-return on the block @prev (the pinned process's own deferred
      * prev, matched within its (thread,asid)): if @prev is an inner fault
      * frame's resume suffix, flush that frame at its depth via
@@ -869,6 +934,13 @@ private:
      * against its departure PC — which is exactly the case the light
      * absorber creates and the old lump-at-next-dispatch behaviour hid. */
     bool absorbed_opened_window_ = false;
+
+    /* True between step_events returning CONTINUE and step_seal running:
+     * the window tw_manage_window occupies, and the ONE window in which
+     * walk_prev_ holds a block that has executed and has not been sealed.
+     * Set and cleared by the two step phases; read only by the census, so
+     * nothing in the tracer's logic depends on it. */
+    bool mid_step_ = false;
 
     /* Async-window state AT THE DRAIN CURSOR: persistent across dispatches,
      * so a window opened on a step that later bailed is still open when the
@@ -1251,11 +1323,18 @@ private:
      * does not null prev_tb_, so the post-flush census cannot tell a slot
      * the close EMITTED from one it dropped by reading the slot alone.
      * This stamps the close (Stats::census_closes) whose flush walked this
-     * builder and how: 1 = walked prev, 2 = chain-only (prev dropped).
-     * Written by flush_final, read by close_state_report, consulted by
-     * nothing else. */
+     * builder and how: 1 = walked prev, 2 = chain-only (prev dropped),
+     * 3 = chain-only but the slot's RETIRED PREFIX was walked (the
+     * machine-shutdown drain).  Written by flush_final, read by
+     * close_state_report, consulted by nothing else. */
     mutable uint64_t census_flush_seq_ = 0;
     mutable uint8_t  census_flush_kind_ = 0;
+    /* And how much RETIRED work of the slot that flush left unemitted.
+     * The census cannot recompute it after the fact: the retired cursor is
+     * read the same way by both, but only the flush knows whether the close
+     * landed mid-instruction (the device-write shutdown), where the
+     * in-flight instruction has BEGUN and has not retired. */
+    mutable uint64_t census_prev_undrained_ = 0;
 };
 
 /* @cpu_index's PathBuilder (lazily heap-allocated, immortal).  One
@@ -1273,7 +1352,8 @@ PathBuilder *path_builder_if_created(unsigned int cpu_index);
  * deferred window close, whose pending-seal slot holds a TB that has
  * not run yet. */
 void path_builder_flush_final(unsigned int cpu_index);
-void path_builder_flush_final_chain_only(unsigned int cpu_index);
+void path_builder_flush_final_chain_only(unsigned int cpu_index,
+                                         bool prev_in_flight = false);
 
 /* The close census: one pass per segment close over every builder that
  * ever ran, naming everything still held (see

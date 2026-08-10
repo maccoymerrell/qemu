@@ -5338,6 +5338,32 @@ static inline BBTemplate *cp_chain_finalize_if_complete(unsigned int cpu_index)
  * without it measures the drop the fix removes, instead of asserting it.
  * A falsifier arm, not a capture.
  */
+/*
+ * CST_NO_PEER_HOLDERS: the falsifier arm for the peer gate itself.  The loop
+ * used to ask `if (!b || !b->prev()) continue;` -- the pending-seal SLOT and
+ * nothing else -- so a peer vCPU holding open fault frames, a suspension, an
+ * in-flight chain or a captured reg-snap sink behind an EMPTY slot was
+ * skipped whole, and with it flush_frames_at_close, which no other path
+ * reaches.  With this set the gate reverts to the slot-only question, so a
+ * run pair measures what the wider gate recovers.  A falsifier arm, not a
+ * capture.
+ */
+static bool peer_holders_falsifier(void)
+{
+    static const bool v = []() {
+        if (getenv("CST_NO_PEER_HOLDERS") == nullptr) {
+            return false;
+        }
+        fprintf(stderr, "champsim_tracer: CST_NO_PEER_HOLDERS — a peer vCPU "
+                "whose pending-seal slot is empty is skipped at the close "
+                "even when it holds fault frames, suspensions or a chain.  "
+                "This trace is missing instructions the guest executed; it "
+                "is a falsifier arm, not a capture.\n");
+        return true;
+    }();
+    return v;
+}
+
 static bool peer_flush_falsifier(void)
 {
     static const bool v = []() {
@@ -5364,7 +5390,8 @@ static bool peer_flush_falsifier(void)
  * simpoint window close fires on a freshly promoted, not-yet-run TB.
  */
 static void finish_trace_segment(bool prev_executed = true,
-                                 unsigned int closing_cpu = UINT32_MAX)
+                                 unsigned int closing_cpu = UINT32_MAX,
+                                 bool prev_in_flight = false)
 {
     /* Segments actually finalised to a file.  The SimPoint report counts
      * captures with THIS, not with the schedule iterator's index: the
@@ -5475,7 +5502,8 @@ static void finish_trace_segment(bool prev_executed = true,
             if (prev_executed) {
                 path_builder_flush_final(closing_cpu);
             } else {
-                path_builder_flush_final_chain_only(closing_cpu);
+                path_builder_flush_final_chain_only(closing_cpu,
+                                                    prev_in_flight);
             }
             /*
              * PEERS.  A close happens on ONE vCPU's dispatch, but on an SMP
@@ -5496,14 +5524,37 @@ static void finish_trace_segment(bool prev_executed = true,
              * retired cursor on a vacated vCPU has long since rolled past.
              */
             const bool no_peers = peer_flush_falsifier();
-            for (unsigned int i = 0; !no_peers && i < CST_PIN_MAX_VCPUS; i++) {
+            const bool slot_only_gate = peer_holders_falsifier();
+            for (unsigned int i = 0; i < CST_PIN_MAX_VCPUS; i++) {
                 if (i == closing_cpu) {
                     continue;
                 }
                 PathBuilder *b = path_builder_if_created(i);
-                if (!b || !b->prev()) {
+                /*
+                 * THE GATE IS "DOES IT HOLD ANYTHING", NOT "DOES IT HOLD A
+                 * SLOT".  Asking only about prev() skipped a peer whose
+                 * pending-seal slot was empty while it still held open fault
+                 * frames, a suspended prev with its four frozen sinks, an
+                 * in-flight chain, or a captured reg-snap sink -- and
+                 * flush_frames_at_close / flush_suspensions_at_close are
+                 * reachable ONLY through flush_final, so the skip took those
+                 * drains with it.  Measured at HEAD: sd_smp4 vCPUs 2 and 3
+                 * and ceil2 vCPUs 1 and 2 each held a frame and a suspension
+                 * behind prev=0x0, and read flushed=0 in the post-flush
+                 * census while vCPU 0's identical frame drained in the same
+                 * close.
+                 */
+                if (!b || !b->holds_close_work()) {
                     continue;
                 }
+                if (no_peers || (slot_only_gate && !b->prev())) {
+                    /* Held work and was not flushed: the drop the falsifier
+                     * arm exists to produce, counted so the arm is visible
+                     * in the run's own stats rather than asserted. */
+                    g_stats.close_peer_holders_skipped++;
+                    continue;
+                }
+                const bool had_slot = b->prev() != nullptr;
                 /*
                  * COUNT WHAT THE FLUSH EMITTED, NOT WHAT THE SLOT HELD.
                  *
@@ -5519,31 +5570,47 @@ static void finish_trace_segment(bool prev_executed = true,
                  * the flush is exactly what was recovered.
                  *
                  * The flush also drains this peer's open fault frames (see
-                 * flush_frames_at_close), which have their own counter, so
-                 * their share is subtracted rather than double-counted.
+                 * flush_frames_at_close) and its suspensions (see
+                 * flush_suspensions_at_close), which have their own
+                 * counters, so their share is subtracted rather than
+                 * double-counted.
                  */
                 const uint64_t arch_before = g_seg_arch_insns;
                 const uint64_t user_before = g_stats.wire_user_arch_insns;
                 const uint64_t frame_before =
                     g_stats.close_frame_insns_recovered;
+                const uint64_t susp_before =
+                    g_stats.close_susp_insns_recovered;
                 b->flush_final();
-                const uint64_t from_frames =
-                    g_stats.close_frame_insns_recovered - frame_before;
-                uint64_t got = g_seg_arch_insns - arch_before;
+                const uint64_t from_drains =
+                    (g_stats.close_frame_insns_recovered - frame_before) +
+                    (g_stats.close_susp_insns_recovered - susp_before);
+                const uint64_t got_all = g_seg_arch_insns - arch_before;
+                uint64_t got = got_all;
                 uint64_t got_user = g_stats.wire_user_arch_insns - user_before;
-                got = got >= from_frames ? got - from_frames : 0;
+                got = got >= from_drains ? got - from_drains : 0;
                 if (got_user > got) {
                     got_user = got;
                 }
-                g_stats.close_peer_slots_flushed++;
-                if (got == 0) {
-                    /* The slot held a block but the flush put nothing on the
-                     * wire — nothing was recovered, and saying so is the
-                     * whole point of measuring instead of asserting. */
-                    g_stats.close_peer_slots_emitted_nothing++;
+                if (had_slot) {
+                    g_stats.close_peer_slots_flushed++;
+                    if (got == 0) {
+                        /* The slot held a block but the flush put nothing on
+                         * the wire — nothing was recovered, and saying so is
+                         * the whole point of measuring instead of
+                         * asserting. */
+                        g_stats.close_peer_slots_emitted_nothing++;
+                    } else {
+                        g_stats.close_peer_insns_recovered += got;
+                        g_stats.close_peer_user_insns_recovered += got_user;
+                    }
                 } else {
-                    g_stats.close_peer_insns_recovered += got;
-                    g_stats.close_peer_user_insns_recovered += got_user;
+                    /* A peer with an EMPTY slot that held work anyway — the
+                     * population the old gate skipped.  Its recovery is
+                     * whatever the flush put on the wire, drains included:
+                     * there was no slot to attribute it to. */
+                    g_stats.close_peer_holder_flushes++;
+                    g_stats.close_peer_holder_insns_recovered += got_all;
                 }
             }
         } else {
@@ -5602,7 +5669,12 @@ static void finish_trace_segment(bool prev_executed = true,
             s.close_frames_unflushable;
         const uint64_t susp_fated =
             s.susp_resumed + s.susp_displaced + s.susp_stale_retired +
-            s.susp_orphan_dropped;
+            s.susp_orphan_dropped +
+            /* ...and the close drain, which is the fate that did not exist
+             * when this identity was written: every entry it pops leaves
+             * through exactly one of these three. */
+            s.close_susp_flushed + s.close_susp_empty +
+            s.close_susp_unflushable;
         const uint64_t frames_live =
             g_stats.census_frames_held_at_close - held_frames_before;
         const uint64_t susp_live =
@@ -10990,7 +11062,8 @@ static void vcpu_tb_flush(qemu_plugin_id_t id)
  * (plugins/api.c: "plugin_cpu_state: assertion failed: (current_cpu)").
  * Closing here means plugin_exit finds nothing left to close.
  */
-static void vcpu_vm_shutdown_cb(qemu_plugin_id_t id, int vcpu_index)
+static void vcpu_vm_shutdown_cb(qemu_plugin_id_t id, int vcpu_index,
+                                bool in_guest_insn)
 {
     if (!g_system_mode) {
         return;                      /* *-user exits on a guest thread */
@@ -11031,8 +11104,18 @@ static void vcpu_vm_shutdown_cb(qemu_plugin_id_t id, int vcpu_index)
          * that used true.  So the in-flight block is dropped and only
          * the completed chain is flushed.
          */
+        /*
+         * DROPPED WHOLE, THOUGH, IS TOO MUCH.  Everything AHEAD of the
+         * instruction performing the device write retired, memory
+         * operations and all; only that instruction is incomplete.
+         * prev_in_flight says so, and the drain walks the slot's retired
+         * prefix and subtracts exactly the one begun-but-unretired
+         * instruction (insn_started is added at the TOP of an instruction,
+         * so it is already counted).
+         */
         finish_trace_segment(/* prev_executed= */ false,
-                             (unsigned int)vcpu_index);
+                             (unsigned int)vcpu_index,
+                             /* prev_in_flight= */ in_guest_insn);
     } else {
         /* No vCPU could be named.  Flush every builder that ever ran;
          * reachable only if the machine goes down without having run. */

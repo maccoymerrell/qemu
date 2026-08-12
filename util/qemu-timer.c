@@ -749,12 +749,34 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
          * the condition below.
          *
          * On a hit, leave it for the NEXT pass instead of running it again
-         * here.  That costs nothing: main_loop_wait comes straight back
-         * round, so the timer is late by at most one poll -- and the BQL is
-         * dropped in between, so the vCPUs run and whatever was freezing the
-         * clock gets to unfreeze it.  Say so, and say it once per pair
-         * rather than once per process, so a second offending device is
-         * still reported.
+         * here, and drop the BQL in between.  Nothing is dropped and the
+         * rest of the process runs: the iothread, the monitor, and -- where
+         * the vCPU is not budget-gated -- the vCPUs, which is what lets
+         * whatever was freezing the clock unfreeze it and the deadline come
+         * good.  Say so, and say it once per pair rather than once per
+         * process, so a second offending device is still reported.
+         *
+         * WHAT DEFERRAL CANNOT DO is make a device ask for a later
+         * deadline.  A callback that re-arms at an ABSOLUTE time already
+         * behind the clock asks for the same past deadline on every pass,
+         * and under -icount the guest then stops for good:
+         * qemu_clock_deadline_ns_all() clamps an expired deadline to 0,
+         * icount_get_limit() rounds that to a budget of 0, and
+         * rr_cpu_thread_fn answers a zero deadline through
+         * icount_handle_deadline() by calling qemu_clock_run_timers()
+         * itself -- so the pass this bound ends is re-entered from the vCPU
+         * thread with the vCPU having retired nothing in between.  What is
+         * bounded is the pass, not the machine.  Measured on
+         * target/riscv/debug.c as it stood before 346910c7c5, which armed
+         * this timer with a raw instruction count: with the bound in, the
+         * offender is named and the monitor still answers, and the guest is
+         * parked all the same -- icount_get_raw() reads 19 after five
+         * thousand callbacks and the PC never leaves the instruction after
+         * the arming csrw.  With both bounds compiled out the same build
+         * prints no warning and the monitor cannot be reached at all,
+         * because this loop never returns and so never drops the BQL.
+         * Deferral buys the diagnosis and the management plane; only
+         * repairing the device buys the guest.
          *
          * The report names the head's ARMER as well as the head's callback.
          * In the mutual case those are DIFFERENT devices, and the deferred

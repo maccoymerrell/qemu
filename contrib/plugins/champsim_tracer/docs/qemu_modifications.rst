@@ -806,8 +806,32 @@ A device timer may not re-arm itself at the current time
    of seconds satisfies it while still running for hours inside one
    pass, holding the BQL.  The ceiling rests on nothing but arithmetic.
 
-   Deferring costs one ``main_loop_wait`` poll and drops the BQL in
-   between, so nothing is lost and the vCPUs run.
+   Deferring drops nothing and drops the BQL in between, so the rest of
+   the process runs: the iothread, the monitor, and — where the vCPU is
+   not budget-gated — the vCPUs, which is how a frozen clock gets
+   unfrozen and the deadline comes good.
+
+   What deferral cannot do is make a device ask for a later deadline.
+   A callback that re-arms at an ABSOLUTE time already behind the clock
+   asks for the same past deadline on every pass, and under ``-icount``
+   the guest then stops for good: ``qemu_clock_deadline_ns_all`` clamps
+   an expired deadline to 0, ``icount_get_limit`` rounds that to a
+   budget of 0, and ``rr_cpu_thread_fn`` answers a zero deadline
+   through ``icount_handle_deadline`` by calling
+   ``qemu_clock_run_timers`` itself — so the pass the bound ends is
+   re-entered from the vCPU thread with the vCPU having retired nothing
+   in between.  **What is bounded is the pass, not the machine.**  On
+   the RISC-V trigger below as it stood before its repair, with the
+   bound in, the offender is named and the monitor still answers while
+   the guest is parked: ``icount_get_raw()`` reads 19 after five
+   thousand callbacks and the PC never leaves the instruction after the
+   arming ``csrw``.  With both bounds compiled out the same build
+   prints no warning at all and the monitor cannot be reached, because
+   the callback loop never returns and so never drops the BQL.
+   Deferral buys the diagnosis and the management plane; only repairing
+   the device buys the guest, which is why the entry below is a device
+   fix and not a note about a backstop that covers it.
+
    ``tests/unit/test-timer-rearm-bound.c`` exercises all four shapes —
    self re-arm, mutual re-arm, a creeping deadline, and a healthy
    catch-up that must NOT be throttled — and the first three hang

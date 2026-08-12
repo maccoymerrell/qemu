@@ -393,6 +393,17 @@ struct Stats {
      * close_walk_extent_unknown at 0 there instead of folding a peer's
      * block at its full translated length on no evidence. */
     uint64_t close_walk_extent_from_stash = 0;
+    /* USER entries emitted while a FOREIGN address space was live on the
+     * vCPU — the emitting context is not the one the block executed in.
+     * Emissions lag execution (deferred seal, close flush), so the live
+     * page-table root at the emit is not the block's; each of these is an
+     * entry whose wire asid the carry (g_vcpu_cur_asid_index, the index of
+     * the most recent USER TB on this vCPU) had to supply.  Non-zero
+     * exactly where a close ran while the traced process was off-vCPU — a
+     * shutdown performed by another process — so it is NOT must-be-0: it
+     * is the size of the set a live read would have mis-stamped, and it
+     * reads the same on both arms of CST_ASID_LIVE. */
+    uint64_t emit_asid_foreign_context = 0;
     /* Branch-TERMINATED blocks emitted with their terminal outcome
      * unresolved: no successor was ever observed for them, so
      * emit_field_delta_section stages neither CST_FID_BRANCH_TAKEN nor

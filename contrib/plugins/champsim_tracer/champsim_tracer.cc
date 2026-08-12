@@ -4546,11 +4546,25 @@ void emit_body_entry(BodyStreamState *out_stream,
      * held stable across a kernel excursion.  Equals asid_index in user
      * mode / unpinned, so the key is unchanged there. */
     entry.ctx_asid_index = resolve_ctx_asid_index(cpu_index);
-    /* Address-space identity on the wire: the compact index of the live
-     * page-table root (index 0 in user mode / a single address space, so
-     * those traces stay byte-identical).  Resolved here alongside
-     * thread_id and frozen onto the entry, so a deferred emit carries the
-     * index captured at execution time.
+    /* Address-space identity on the wire: the compact index of the address
+     * space THE BLOCK EXECUTED IN (index 0 in user mode / a single address
+     * space, so those traces stay byte-identical).
+     *
+     * Not the live page-table root at the emit.  Emissions lag execution —
+     * the deferred seal emits a block one TB later, and every close flush
+     * emits blocks that ran arbitrarily earlier — so a live read names
+     * whatever address space happens to be current when the writer runs.
+     * At a SHUTDOWN close that is the process performing the poweroff: the
+     * traced process's last block was stamped with a freshly minted index
+     * for an address space that never executed a traced instruction, in a
+     * pinned trace that format.rst says never switches the asid dimension
+     * at all (measured: x86_64 poweroff cell, one entry of 9850863 carrying
+     * asid=1, the closing walk's).  g_vcpu_cur_asid_index — the index of
+     * the most recent USER TB on this vCPU, advanced AFTER the seal step —
+     * names the block being emitted rather than the TB running now, and is
+     * what resolve_ctx_asid_index returns under a pin.  Trace-all keeps the
+     * live-root mapping (Stage B2: every context is emitted by its own
+     * root, and no ctx latch is maintained there).
      *
      * Bug 3 (non-compact wire indices): a KERNEL block is TAGGED on the wire
      * with the owning process (ctx_asid_index), never the live page-table
@@ -4569,10 +4583,29 @@ void emit_body_entry(BodyStreamState *out_stream,
      * order must not change).  User mode / a single address space:
      * is_system is 0 and ctx == live == 0, so those traces stay
      * byte-identical. */
-    if (bb_tmpl && bb_tmpl->is_system && !marker_trace_all()) {
+    if (marker_trace_all()) {
+        entry.asid_index = resolve_asid_index(cpu_index);
+    } else if (bb_tmpl && bb_tmpl->is_system) {
         entry.asid_index = entry.ctx_asid_index;
     } else {
-        entry.asid_index = resolve_asid_index(cpu_index);
+        /* CST_ASID_LIVE: measurement kill switch (the CST_WMHOLD_OFF
+         * pattern) — restores the historical live-root read so a paired
+         * run measures the same close under both behaviours.  The
+         * mismatch counter runs on both arms. */
+        static int asid_live = -1;
+        if (asid_live < 0) {
+            asid_live = getenv("CST_ASID_LIVE") ? 1 : 0;
+        }
+        const uint32_t live_idx = resolve_asid_index(cpu_index);
+        if (live_idx != entry.ctx_asid_index) {
+            /* A USER block emitted while a foreign address space is live:
+             * the emitting context is not the one the block ran in.  This
+             * is also the exact set of entries whose wire tag the carry
+             * changes, so a zero here proves a trace is byte-identical to
+             * what the live read produced. */
+            g_stats.emit_asid_foreign_context++;
+        }
+        entry.asid_index = asid_live ? live_idx : entry.ctx_asid_index;
     }
     entry.cpu_index = cpu_index;
     /* Terminal-branch outcome for the CST_FID_BRANCH_* singletons.  The

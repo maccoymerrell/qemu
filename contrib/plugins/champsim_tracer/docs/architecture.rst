@@ -1832,6 +1832,32 @@ restores the parked behaviour as a falsifier arm.  A thread that never
 changes vCPU — every user-mode trace, every ``-smp 1`` system trace —
 never takes the arrow and its output is byte-identical.
 
+**Falsifier arms of the SMP rows.**  The SMP condition rows include
+several that must read 0, and a row that has only ever been observed at
+0 is equally consistent with a correct tracer and with a detector wired
+to nothing.  Each therefore has an arm that makes it fire on demand, in
+one of two kinds.  *Synthetic* arms exercise the predicate, the counter
+and the report on the run's own data while leaving the wire
+byte-identical: ``CST_SMP_DUP_FALSIFY`` replays one claim through the
+duplicate ledger, and ``CST_SMP_STAMP_FALSIFY`` inverts the copy of the
+close's emission prediction that the mispredict comparison reads —
+never the copy that decides the ``THREAD_END`` stamp.  Their
+wire-neutrality is measured rather than asserted, and measuring it takes
+care: a user-mode trace is reproducible only when both arms share one
+output path and an environment block of identical size (argv and environ
+are on the guest stack, and the trace records it), and one register field
+carrying a guest stack pointer varies between two runs of the *same* arm
+and must be masked.  Under those controls the armed and unarmed traces
+hash alike while the row moves.  *Severing* arms
+genuinely remove the mechanism, because the row's whole meaning is that
+something went unpublished and no synthetic fire could honestly stand
+for it: ``CST_NO_MIGRATE_DRAIN`` parks the migrated holder again, and
+``CST_SMP_DRAIN_UNK_FALSIFY`` forces one drain's extent lookup to fail,
+so ``migrate drain extent unknown`` is proven reachable.  A severing arm
+drops a block, and the validator's content checks are expected to refuse
+the resulting trace — that refusal is the arm working.  None of these is
+on by default and none is consulted by tracer logic.
+
 On the wire (``CST_FLAG_FAULT``, set in marker mode; user-mode traces
 advertise no fault machinery): every CP entry carries ``fault_depth``
 (0 = normal code, ≥1 = handler code at that nesting level,

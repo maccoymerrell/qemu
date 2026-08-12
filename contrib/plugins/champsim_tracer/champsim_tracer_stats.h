@@ -557,7 +557,9 @@ struct Stats {
      * first promote on another vCPU, the instructions they published,
      * and the drain finding no answerable extent (must be 0 — the stash
      * or the vacated vCPU's parked cursor answers for every observed
-     * shape; an unanswerable one is a dropped block and must be seen). */
+     * shape; an unanswerable one is a dropped block and must be seen).
+     * CST_SMP_DRAIN_UNK_FALSIFY severs one drain's extent lookup so the
+     * must-be-0 row is proven reachable rather than merely quiet. */
     uint64_t smp_migrated_holders_drained = 0;
     uint64_t smp_migrated_holder_insns = 0;
     uint64_t smp_migrate_drain_extent_unknown = 0;
@@ -565,7 +567,10 @@ struct Stats {
      * LAST emitting flush stamps) predicted a flush's emission wrongly —
      * the stamp may sit one flush early or the context's close-final may
      * be unstamped; the validator's thread_end oracle is the enforcement
-     * and this row makes the prediction's misses visible in the run. */
+     * and this row makes the prediction's misses visible in the run.
+     * CST_SMP_STAMP_FALSIFY inverts the COMPARISON's copy of the
+     * prediction once per run — the stamping decision and therefore the
+     * wire are unchanged — so the row is proven able to fire. */
     uint64_t smp_close_stamp_mispredict = 0;
 
     /* ---- CLOSE CENSUS (CST_CLOSEDROP) --------------------------------

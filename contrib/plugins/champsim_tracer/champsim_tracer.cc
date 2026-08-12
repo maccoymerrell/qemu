@@ -4755,6 +4755,63 @@ static void smp_claim_check(uint32_t tid, const BBTemplate *t,
 }
 
 /*
+ * The close's THREAD_END pre-pass predicted whether a flush would emit;
+ * @emitted is what it actually did.  A disagreement means the stamp may
+ * sit one flush early or a context's close-final may be unstamped, so it
+ * is counted (Stats::smp_close_stamp_mispredict) rather than left silent
+ * — the validator's thread_end oracle remains the enforcement.
+ *
+ * A must-be-0 row that has never been SEEN to fire is not evidence of
+ * anything: of the 70 instrumented SMP cells that reported this row
+ * before the arm below existed, all 70 read 0 — equally consistent with
+ * a correct prediction and with a detector wired to nothing.  CST_SMP_
+ * STAMP_FALSIFY resolves that ambiguity by inverting the prediction once
+ * per run at a flush that really ran, so the comparison, the counter and
+ * the report are exercised on the run's own data.  It perturbs the copy
+ * the COMPARISON reads — @predicted is taken by value, after the flush
+ * has already run, and is read nowhere else — never the smp_last_emitter
+ * map that decides the stamp, so no emission changes, exactly as CST_SMP_
+ * DUP_FALSIFY's synthetic re-claim is never written to the wire.
+ *
+ * That is measured, not merely argued: a fixed user-mode program traced
+ * armed and unarmed produces a byte-identical .cst while this row moves
+ * 0 -> 1.  Reaching that measurement took three corrections worth
+ * recording, because each first produced a confident wrong answer.  The
+ * comparison needs a same-arm control (two unarmed runs differed, so the
+ * first "the wire changed" verdict was measuring nothing); the outfile
+ * path and the environment block both sit on the guest stack, so the arms
+ * must share one output path and the control must set a DECOY variable of
+ * equal length that the plugin never reads; and one 8-byte register field
+ * holding a guest stack pointer varies between two runs of the SAME arm
+ * and has to be masked before any cross-arm claim.  Under those controls
+ * every arm hashes alike.  See validator-side ab_stamp.sh in the arc's
+ * run directory.
+ */
+static void smp_stamp_mispredict_note(bool emitted, bool predicted)
+{
+    static const bool falsify = getenv("CST_SMP_STAMP_FALSIFY") != nullptr;
+    static bool falsified = false;
+    if (falsify && !falsified) {
+        falsified = true;
+        predicted = !predicted;
+        if (cst_smp_diag()) {
+            fprintf(stderr, "champsim_tracer: [smpdiag] FALSIFIER stamp "
+                    "prediction inverted at a flush that %s\n",
+                    emitted ? "emitted" : "emitted nothing");
+        }
+    }
+    if (emitted != predicted) {
+        g_stats.smp_close_stamp_mispredict++;
+        if (cst_smp_diag()) {
+            fprintf(stderr, "champsim_tracer: [smpdiag] close stamp "
+                    "MISPREDICT: predicted %s, flush %s\n",
+                    predicted ? "emit" : "no-emit",
+                    emitted ? "emitted" : "emitted nothing");
+        }
+    }
+}
+
+/*
  * Build a BodyEntry from the calling thread's CP memop/reg-snap
  * accumulators (draining them) and write it to @out_stream.
  * @wp_entries is moved in.  Caller holds exec_lock; data_lock is NOT
@@ -6293,9 +6350,8 @@ static void finish_trace_segment(bool prev_executed = true,
                                                             prev_in_flight,
                                                             smp_stamp_here(fi));
                     }
-                    if ((g_seg_arch_insns != cb) != (smp_will_emit[fi] != 0)) {
-                        g_stats.smp_close_stamp_mispredict++;
-                    }
+                    smp_stamp_mispredict_note(g_seg_arch_insns != cb,
+                                              smp_will_emit[fi] != 0);
                     continue;
                 }
                 unsigned int i = cf.cpu;
@@ -6330,9 +6386,8 @@ static void finish_trace_segment(bool prev_executed = true,
                 const uint64_t got_all = g_seg_arch_insns - arch_before;
                 uint64_t got = got_all;
                 uint64_t got_user = g_stats.wire_user_arch_insns - user_before;
-                if ((got_all != 0) != (smp_will_emit[fi] != 0)) {
-                    g_stats.smp_close_stamp_mispredict++;
-                }
+                smp_stamp_mispredict_note(got_all != 0,
+                                          smp_will_emit[fi] != 0);
                 if (had_slot) {
                     g_stats.close_peer_slots_flushed++;
                     if (got == 0) {
@@ -6398,10 +6453,8 @@ static void finish_trace_segment(bool prev_executed = true,
                                    /* prev_in_flight= */ false,
                                    it != smp_last_emitter.end() &&
                                    it->second == fi);
-                    if ((g_seg_arch_insns != cb) !=
-                        (smp_will_emit[fi] != 0)) {
-                        g_stats.smp_close_stamp_mispredict++;
-                    }
+                    smp_stamp_mispredict_note(g_seg_arch_insns != cb,
+                                              smp_will_emit[fi] != 0);
                 }
             }
         }

@@ -3614,6 +3614,41 @@ void PathBuilder::drain_migrated_holder(void)
                                      : nullptr;
     uint64_t executed = 0;
     bool have = prev_extent(&executed);
+    /* CST_SMP_DRAIN_UNK_FALSIFY is the falsifier arm of the drain's
+     * must-be-0 row: it forces the extent lookup to fail once per run so
+     * smp_migrate_drain_extent_unknown is PROVEN reachable.  The row read
+     * 0 in all 169 instrumented cells that reported it before this arm
+     * existed, which on its own cannot distinguish "the stash or the
+     * parked cursor always answers" from "the branch is unreachable and
+     * the row means nothing".  Unlike
+     * the claim-ledger and stamp falsifiers this one cannot be synthetic
+     * — the counter's whole meaning is that a block went unpublished — so
+     * it genuinely severs one drain, and is a severing arm of the same
+     * family as CST_NO_MIGRATE_DRAIN, never on by default. */
+    {
+        static const bool falsify =
+            getenv("CST_SMP_DRAIN_UNK_FALSIFY") != nullptr;
+        static bool falsified = false;
+        if (falsify && !falsified) {
+            falsified = true;
+            have = false;
+            executed = 0;
+            if (cst_smp_diag()) {
+                fprintf(stderr, "champsim_tracer: [smpdiag] FALSIFIER drain "
+                        "extent forced unknown at pc=0x%" PRIx64 "\n",
+                        prev_tb_ ? prev_tb_->start_pc : 0);
+            }
+            g_stats.smp_migrate_drain_extent_unknown++;
+            g_mem_recorder.clear_cp(cpu_index_);
+            pending_reg_snaps(cpu_index_).clear();
+            cp_chain_snap_mark(cpu_index_) = 0;
+            g_mutex_lock(&data_lock);
+            cp_chain(cpu_index_).reset();
+            g_mutex_unlock(&data_lock);
+            clear_prev();
+            return;
+        }
+    }
     if (!have && retired_executed_of(cpu_index_, prev_tb_, &executed)) {
         /* The vacated vCPU's cursor is PARKED: nothing has dispatched on
          * it since the held block (that absence is why the drain exists),

@@ -1152,7 +1152,9 @@ BBTemplate *TemplateStore::commit_true_bb(uint64_t start_pc,
         /* A run of this block over a different number of instructions than
          * the one committed at this pc.  Emit THIS extent (see the
          * EXTENT_ONLY arm of resolve_true_bb); the array form has no
-         * fragment list, so it installs directly. */
+         * fragment list, so it installs directly.  Same population as the
+         * fragment-list form below: sealed block, mid-run, no close. */
+        g_stats.extent_only_mints++;
         return install_own_extent(start_pc, n_insns, insn_pcs, insn_fields,
                                   insn_sizes, insn_bytes, insn_reg_names,
                                   symbol_name, fall_through_pc,
@@ -1402,7 +1404,15 @@ BBTemplate *TemplateStore::get_or_create_bb_template(
          * one is not an option — and stop here: the fragment back-edges
          * below must keep naming the COMPLETE block, or the next full
          * assembly of the same fragments would take the fast path straight
-         * back to this shorter one. */
+         * back to this shorter one.
+         *
+         * Counted separately from the close-walk seals: this block DID
+         * reach its terminating branch and no close is involved, so it is
+         * not an unsealed-at-close block.  The two used to be visible only
+         * as one cumulative shape count (partial_bb_templates_created),
+         * which is why the unsealed-at-close bound had never been
+         * measured. */
+        g_stats.extent_only_mints++;
         return commit_partial_bb(entry_pc, fragments, n_fragments, 0);
     }
     /* Privilege context rides from the translation-time stamp on the

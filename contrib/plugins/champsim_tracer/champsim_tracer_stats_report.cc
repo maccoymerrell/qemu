@@ -49,6 +49,64 @@ static void append_branch_breakdown(GString *report, const Stats &stats)
     }
 }
 
+/*
+ * THE UNSEALED-AT-CLOSE BOUND, as measured by this run.
+ *
+ * The peak is per CLOSE, so it cannot come from the summed Stats
+ * aggregate (see the ledger in champsim_tracer_stats.h); it is read from
+ * the ledger's own record, together with the bounded sample of individual
+ * blocks.  The sample is what turns a number into an account: each row
+ * names the vCPU and guest thread that was standing inside the block, the
+ * block itself, and the close ROUTE that stopped it — which is the only
+ * thing that distinguishes a terminal event the guest cannot run past
+ * (SHUTDOWN, RESET, the process exiting) from a stopping point where the
+ * policy says keep dispatching until the block seals (END, BUDGET,
+ * CEILING).
+ *
+ * Printed whenever anything was recorded, or whenever the falsifier arm
+ * was on, so a run that legitimately leaves nothing unsealed prints
+ * nothing here and its zero is read off the counter rows above.
+ */
+static void append_unsealed_at_close(GString *report)
+{
+    const CloseUnsealedSummary s = close_unsealed_summary();
+    const std::vector<CloseUnsealedRow> &rows = close_unsealed_rows();
+    if (s.blocks == 0 && !s.falsified) {
+        return;
+    }
+    g_string_append_printf(report,
+        "Unsealed true-BBs at a close%s:\n"
+        "  closes observed              %14" PRIu64 "\n"
+        "  closes leaving one unsealed  %14" PRIu64 "\n"
+        "  unsealed blocks (all closes) %14" PRIu64 "\n"
+        "  PEAK blocks at one close     %14" PRIu64 "\n"
+        "  PEAK contexts at one close   %14" PRIu64 "  (close #%" PRIu64
+        ", %s)\n",
+        s.falsified ? "  [CST_UNSEALED_FALSIFY — NOT A MEASUREMENT]" : "",
+        s.closes, s.closes_with, s.blocks, s.peak_blocks, s.peak_contexts,
+        s.peak_close_seq, s.peak_reason ? s.peak_reason : "-");
+    if (s.rows_dropped) {
+        g_string_append_printf(report,
+            "  sample rows past the cap     %14" PRIu64 "\n",
+            s.rows_dropped);
+    }
+    if (rows.empty()) {
+        return;
+    }
+    g_string_append_printf(report,
+        "  %-6s %-10s %5s %8s %-18s %6s %-8s %s\n",
+        "close", "route", "vcpu", "thread", "entry_pc", "insns", "priv",
+        "shape");
+    for (const CloseUnsealedRow &r : rows) {
+        g_string_append_printf(report,
+            "  %-6" PRIu64 " %-10s %5u %8u 0x%-16" PRIx64 " %6u %-8s %s\n",
+            r.close_seq, r.reason ? r.reason : "-", r.cpu_index,
+            r.thread_id, r.entry_pc, r.n_insns,
+            r.is_system ? "system" : "user",
+            r.shape == CST_UNSEALED_CUT_FRAG ? "cut-mid-TB" : "tb-edge");
+    }
+}
+
 /* Generic opcode breakdown, CP and WP side-by-side.  Sorted by
  * (CP+WP) total so the busiest opcodes come first regardless of
  * which path drives them. */
@@ -235,6 +293,17 @@ void append_stats_summary(GString *report, const char *label,
         { "  interior-PC probe hits where the extent WAS known",
                                                  stats.seal_walk_interior_probe_hits },
         { "cut-short block templates minted",    stats.partial_bb_templates_created },
+        { "  mid-run extent-only mints (block WAS sealed)",
+                                                 stats.extent_only_mints },
+        { "  mid-run fault-cut head prefixes",   stats.fault_cut_head_prefixes },
+        { "unsealed true-BBs sealed at a close",  stats.close_unsealed_blocks },
+        { "  the extent cut a fragment mid-TB",  stats.close_unsealed_cut_frag },
+        { "  the chain was open at a TB edge",   stats.close_unsealed_tb_edge },
+        { "unsealed blocks sealed at a DEPARTURE (not a close)",
+                                                 stats.departure_unsealed_blocks },
+        { "closes that left a true-BB unsealed", stats.close_unsealed_closes },
+        { "  contributing (vCPU,thread) contexts, summed",
+                                                 stats.close_unsealed_contexts },
         { "user insns attributed at the seal",   stats.cp_user_seal_insns },
         { "user insns emitted to the wire",      stats.wire_user_arch_insns },
         { "  of them self-loop fan-out surplus", stats.wire_user_rep_extra_insns },
@@ -653,6 +722,7 @@ void append_stats_summary(GString *report, const char *label,
                     stats.cp_src_reg_uses, stats.wp_src_reg_uses);
     print_reg_table("Dst register attribution",
                     stats.cp_dst_reg_writes, stats.wp_dst_reg_writes);
+    append_unsealed_at_close(report);
 
     g_string_append_printf(report,
         "==========================================\n");

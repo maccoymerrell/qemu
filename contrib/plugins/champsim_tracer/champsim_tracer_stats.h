@@ -15,6 +15,8 @@
 #include <inttypes.h>
 #include <stdint.h>
 
+#include <vector>
+
 #include "champsim_tracer_generic_ids.h"  /* GEN_OP_COUNT, BRANCH_TYPE_COUNT, REG_ID_COUNT */
 
 struct Stats {
@@ -456,6 +458,93 @@ struct Stats {
      * at the same point share one; a run where nothing is ever cut short
      * mints none. */
     uint64_t partial_bb_templates_created = 0;
+    /*
+     * WHAT partial_bb_templates_created ACTUALLY SUMS.
+     *
+     * That row counts DISTINCT (asid_root, entry_pc, extent, content)
+     * shapes inserted into partial_bb_map_, cumulatively, and SEVEN
+     * unrelated producers insert there:
+     *
+     *   1. a close-walk seal that cut a fragment mid-TB
+     *   2. a close-walk seal of a chain left open at a TB edge
+     *   3. a DEPARTURE / migration-drain seal (same walk, guest runs on)
+     *   4. the mid-run seal walk truncating to what ran
+     *      (seal_walk_blocks_truncated)
+     *   5. the mid-run cut where control left the block
+     *      (cut_blocks_sealed)
+     *   6. an extent-only mint — a block that DID reach its branch
+     *   7. a fault-cut head prefix
+     *
+     * A single cumulative shape count over all seven cannot answer "how
+     * many true-BBs did this close have to seal itself", which is the
+     * quantity the unsealed-at-close bound is stated in.  The rows below
+     * complete the decomposition (1-3, 6, 7; 4 and 5 already had rows),
+     * counted per EVENT rather than per distinct shape — so the events
+     * are an upper bound on the shapes, and a run whose events sum to
+     * zero while the shape row is non-zero has a producer nobody named,
+     * which is exactly how producer 3 was found.
+     *
+     * MID-RUN EXTENT-ONLY MINTS.  TemplateStore::commit_true_bb_refs
+     * assembled a complete chain at a pc where bb_map_ already holds a
+     * template of a DIFFERENT length (resolve_true_bb's EXTENT_ONLY
+     * verdict), so this execution's extent is minted into
+     * partial_bb_map_ instead.  The block IS sealed — it reached its
+     * terminating branch — and no close is involved; the mint exists
+     * because bb_map_ is keyed by address alone and holds one extent per
+     * pc.  Counted per COMMIT, not per distinct shape, so a run that
+     * re-enters the same short extent a million times reads a million
+     * here and one in partial_bb_templates_created. */
+    uint64_t extent_only_mints = 0;
+    /* FAULT-CUT HEAD PREFIXES.  A fault landed in a block whose head
+     * template was itself cut by a translation boundary and no cached
+     * whole block covers it, so the executed prefix is published as a
+     * complete block of its own extent (PathBuilder::classify_fault_enter,
+     * the cut_frame arm).  Mid-run, not a close; the guest resumes and the
+     * frame's completion publishes the sealed suffix. */
+    uint64_t fault_cut_head_prefixes = 0;
+    /*
+     * UNSEALED TRUE-BBs AT A CLOSE — the close-side population, counted
+     * per BLOCK and per CLOSE rather than per template shape.
+     *
+     * A true BB is sealed by its terminating branch.  A close that lands
+     * while a thread is standing inside one has no branch to seal with,
+     * so PathBuilder::close_walk_emit finalizes the block at the extent
+     * that ran (BBChainAssembler::finalize_truncated).  Two shapes reach
+     * that call, and they are different situations:
+     *
+     *   _cut_frag   the close's measured extent cut a fragment part-way
+     *               through — the guest was mid-TB
+     *   _tb_edge    the walk consumed whole fragments and the chain was
+     *               still open at a TB boundary, so the true BB was
+     *               split across TBs (a page-straddling block) and its
+     *               continuation never came
+     *
+     * _cut_frag has real occupants on every terminal-route cell measured
+     * so far.  _tb_edge has so far only been driven by the falsifier arm
+     * (CST_UNSEALED_FALSIFY): the counter is proven able to fire, but no
+     * genuine occupant has appeared yet, so a 0 in it says "the close did
+     * not land on a cross-TB block", not "this cannot happen".
+     *
+     * _blocks is their sum.  _closes counts closes that produced at
+     * least one, _contexts sums the distinct (vCPU, thread) identities
+     * that contributed one, summed over closes — the per-close PEAK of
+     * that same quantity is the bound's actual subject and cannot live
+     * in Stats (every field here is summed across threads), so it is
+     * kept beside the identity ledger; see close_unsealed_summary().
+     *
+     * Departure-time and migration-drain walks share close_walk_emit and
+     * are NOT counted here: the guest keeps running past them, so they
+     * are neither a close nor a stopping point. */
+    uint64_t close_unsealed_blocks = 0;
+    uint64_t close_unsealed_cut_frag = 0;
+    uint64_t close_unsealed_tb_edge = 0;
+    uint64_t close_unsealed_closes = 0;
+    uint64_t close_unsealed_contexts = 0;
+    /* The same walk run at a DEPARTURE (foreign-ASID dispatch, abandoned
+     * async window) or a migration drain: the block is sealed at what ran
+     * and published immediately, but the guest keeps executing, so it is
+     * not a stopping point and not part of the bound above. */
+    uint64_t departure_unsealed_blocks = 0;
     /* Blocks emitted at a TRUNCATED extent by the segment-close walk, and
      * the instructions the truncation kept off the wire because they never
      * executed.  A marker-window run has exactly one such block — the END
@@ -1767,6 +1856,71 @@ struct Stats {
     uint64_t wp_src_reg_uses[REG_ID_COUNT] = {};
     uint64_t wp_dst_reg_writes[REG_ID_COUNT] = {};
 };
+
+/*
+ * ---- THE UNSEALED-AT-CLOSE LEDGER (peak + identities) ---------------
+ *
+ * The bound this measures is stated per CLOSE, not per run: N threads in
+ * the traced window can leave at most N-1 true-BBs unsealed, because the
+ * thread that reaches the stopping event keeps executing until its block
+ * seals and only the OTHERS can be caught standing inside one.  A single
+ * traced thread therefore reads zero.
+ *
+ * A per-close maximum cannot be a Stats field — stats_snapshot() sums
+ * every field across threads, and a close taken on one vCPU while peers
+ * were filled on theirs would add the peaks together.  So the peak, and
+ * the identities behind it, live here: a process-wide record with its own
+ * lock, written once per close (closes are rare) by the same code that
+ * bumps the Stats rows.
+ *
+ * The ledger keeps a bounded sample of the individual unsealed blocks so
+ * a run that exceeds the bound says WHICH contexts and WHICH blocks did
+ * it, and names the close route that stopped them — the difference
+ * between a legitimate terminal event and a policy gap is exactly that
+ * route, and a bare count cannot tell them apart.
+ */
+enum CstUnsealedShape : uint8_t {
+    CST_UNSEALED_CUT_FRAG = 0,   /* extent cut a fragment part-way */
+    CST_UNSEALED_TB_EDGE  = 1,   /* chain still open at a TB boundary */
+};
+
+struct CloseUnsealedRow {
+    uint64_t close_seq;      /* census_closes ordinal of the close */
+    uint64_t entry_pc;       /* the unsealed true BB's entry */
+    const char *reason;      /* close route ("END", "BUDGET", ...) */
+    uint32_t n_insns;        /* extent the close sealed it at */
+    uint32_t cpu_index;      /* builder that held it */
+    uint32_t thread_id;      /* guest thread it is attributed to */
+    uint8_t  shape;          /* CstUnsealedShape */
+    uint8_t  is_system;
+};
+
+struct CloseUnsealedSummary {
+    uint64_t closes;             /* closes observed by this instrument */
+    uint64_t closes_with;        /* ... that left >= 1 block unsealed */
+    uint64_t blocks;             /* unsealed blocks, all closes */
+    uint64_t peak_blocks;        /* most blocks at any one close */
+    uint64_t peak_contexts;      /* most distinct contexts at any one close */
+    uint64_t peak_close_seq;     /* which close set peak_contexts */
+    const char *peak_reason;     /* its route; nullptr when never set */
+    uint64_t rows_dropped;       /* sample rows past the ledger's cap */
+    bool falsified;              /* CST_UNSEALED_FALSIFY was on */
+};
+
+/* Open a close's accumulation window.  @reason is the close route
+ * string, which must outlive the run (a literal). */
+void close_unsealed_begin(const char *reason);
+/* Record one true BB a close had to seal itself. */
+void close_unsealed_note(unsigned int cpu_index, uint32_t thread_id,
+                         uint64_t entry_pc, uint32_t n_insns,
+                         bool is_system, uint8_t shape);
+/* Fold the window into the summary and the Stats rows. */
+void close_unsealed_end(void);
+/* Is a close's accumulation window open right now? */
+bool close_unsealed_window_open(void);
+CloseUnsealedSummary close_unsealed_summary(void);
+/* Bounded sample of the individual rows, oldest first. */
+const std::vector<CloseUnsealedRow> &close_unsealed_rows(void);
 
 /* Field-wise subtraction (a - b) into @out, iterating Stats as a
  * uint64_t array.  Used at finish-segment to compute the segment's

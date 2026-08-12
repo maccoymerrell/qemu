@@ -6255,6 +6255,17 @@ static void finish_trace_segment(bool prev_executed = true,
               : (prev_executed ? "exec" : "BUDGET")));
     g_stats.census_closes++;
     /*
+     * OPEN THE UNSEALED-AT-CLOSE WINDOW.
+     *
+     * Everything the close's flush hook seals without a terminating branch
+     * is attributed to THIS close and to the route named above, so the
+     * per-close peak has a close to be per, and every unsealed block can
+     * name what stopped it.  Closed after the flush hook returns; the
+     * ledger ignores any seal taken outside the window (the departure and
+     * migration drains, which are not stopping points).
+     */
+    close_unsealed_begin(census_why);
+    /*
      * MIRRORED TO THE STATS FILE, NOT ONLY TO stderr.  In user mode the
      * guest's exit syscall reaches plugin_exit through preexit_cleanup
      * AFTER QEMU has torn its log fd down (see the note beside
@@ -6548,6 +6559,10 @@ static void finish_trace_segment(bool prev_executed = true,
             }
         }
     });
+
+    /* The flush hook has run: fold this close's unsealed-block tally into
+     * the peak and the run totals before anything else reads them. */
+    close_unsealed_end();
 
     /* POST pass: what survived every drain the close performs.  This is
      * the drop, and it is where the held_at_close ledger is taken. */

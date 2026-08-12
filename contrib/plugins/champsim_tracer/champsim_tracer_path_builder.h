@@ -862,6 +862,17 @@ private:
         /* Emit-site provenance for the SMP claim ledger (g_cst_emit_site):
          * which drain this walk is. */
         const char *site = "close-walk";
+        /* Is this walk a CLOSE, i.e. a stopping point past which the
+         * traced window does not continue?  Set only by flush_final.  The
+         * departure and migration drains share this walk but the guest
+         * runs on past them, so a block they seal short is not an
+         * unsealed-at-close block and is not counted as one. */
+        bool at_close = false;
+        /* Guest-thread identity of the block this walk is draining
+         * (prev_tid_, or walk_tid_ for the mid-step arm).  Recorded with
+         * any unsealed block so the per-close context count is keyed by
+         * thread, which is what the bound is stated in. */
+        uint32_t tid = CST_TID_UNSEEN;
         /* Filled by the walk: the template extent that reached the wire,
          * split by privilege.  Measured from the blocks emitted, not from
          * what the slot held — the difference is the whole of 81239d89cd. */
@@ -1024,6 +1035,11 @@ private:
      * Diagnostic provenance only — read by the migration condition census
      * (Stats::smp_migrated_holder_pending), never by tracer logic. */
     uint32_t prev_tid_ = CST_TID_UNSEEN;
+    /* prev_tid_ as it stood when the promote moved prev_tb_ into
+     * walk_prev_, i.e. the thread that ran the block a mid-step close
+     * drains.  prev_tid_ itself is immediately re-stamped with the
+     * newly-promoted TB's thread, so it cannot answer for walk_prev_. */
+    uint32_t walk_tid_ = CST_TID_UNSEEN;
     /* See note_prev_extent: prev's executed count, measured at the first
      * dispatch after it, for the close walk on a vCPU the process left. */
     uint64_t prev_extent_ = 0;

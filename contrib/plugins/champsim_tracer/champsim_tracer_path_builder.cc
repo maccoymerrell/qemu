@@ -32,6 +32,158 @@
 #include "champsim_tracer_trace_segment_manager.h"
 #include "champsim_tracer_wp_thread_state.h"
 
+/*
+ * ======================================================================
+ * THE UNSEALED-AT-CLOSE LEDGER.  See champsim_tracer_stats.h for what the
+ * quantity is and why the peak cannot be a Stats field.
+ *
+ * Written once per close, from the close's own thread, under its own
+ * mutex.  Everything here is process-lifetime ("immortal", the same
+ * lifetime discipline the stats registry uses): a close can be taken from
+ * the machine-shutdown handler and from plugin_exit, both after ordinary
+ * static destructors may have run.
+ * ======================================================================
+ */
+namespace {
+
+GMutex unsealed_lock;
+
+struct UnsealedLedger {
+    /* Accumulation window for the close in progress. */
+    bool open = false;
+    const char *reason = nullptr;
+    uint64_t seq = 0;
+    uint64_t blocks = 0;
+    /* Contributing identities, deduplicated by (cpu, thread). */
+    std::set<std::pair<unsigned int, uint32_t>> ctxs;
+
+    /* Run totals. */
+    CloseUnsealedSummary sum{};
+    std::vector<CloseUnsealedRow> rows;
+};
+
+UnsealedLedger &unsealed = *new UnsealedLedger();
+std::vector<CloseUnsealedRow> &unsealed_rows_store = unsealed.rows;
+
+/* Sample cap.  The bound is a per-close maximum, so a handful of rows per
+ * close over a few hundred closes names every offender; past that the
+ * count keeps going and rows_dropped says the sample stopped. */
+constexpr size_t kUnsealedRowCap = 256;
+
+/*
+ * FALSIFIER.  The bound's whole content is a run of zeros on the
+ * single-thread cells, and a zero from an instrument that cannot fire is
+ * worth nothing.  CST_UNSEALED_FALSIFY makes every close record one
+ * synthetic row on each builder the close drains, exercising the whole
+ * path — window open, note, dedup, peak, ledger row, report line — with
+ * no effect on what any walk emits.  The summary carries `falsified` so a
+ * falsifier run can never be quoted as a measurement.
+ */
+bool unsealed_falsify()
+{
+    static const bool v = getenv("CST_UNSEALED_FALSIFY") != nullptr;
+    return v;
+}
+
+}  /* namespace */
+
+void close_unsealed_begin(const char *reason)
+{
+    g_mutex_lock(&unsealed_lock);
+    unsealed.open = true;
+    unsealed.reason = reason ? reason : "?";
+    unsealed.seq = unsealed.sum.closes;
+    unsealed.blocks = 0;
+    unsealed.ctxs.clear();
+    unsealed.sum.falsified = unsealed_falsify();
+    g_mutex_unlock(&unsealed_lock);
+}
+
+bool close_unsealed_window_open(void)
+{
+    g_mutex_lock(&unsealed_lock);
+    const bool v = unsealed.open;
+    g_mutex_unlock(&unsealed_lock);
+    return v;
+}
+
+void close_unsealed_note(unsigned int cpu_index, uint32_t thread_id,
+                         uint64_t entry_pc, uint32_t n_insns,
+                         bool is_system, uint8_t shape)
+{
+    g_mutex_lock(&unsealed_lock);
+    if (!unsealed.open) {
+        /* A departure or migration drain, not a close.  Those walks share
+         * close_walk_emit and are deliberately outside this population. */
+        g_mutex_unlock(&unsealed_lock);
+        return;
+    }
+    unsealed.blocks++;
+    unsealed.ctxs.insert({ cpu_index, thread_id });
+    if (unsealed_rows_store.size() < kUnsealedRowCap) {
+        unsealed_rows_store.push_back(CloseUnsealedRow{
+            unsealed.seq, entry_pc, unsealed.reason, n_insns,
+            cpu_index, thread_id, shape, (uint8_t)(is_system ? 1 : 0) });
+    } else {
+        unsealed.sum.rows_dropped++;
+    }
+    g_mutex_unlock(&unsealed_lock);
+
+    g_stats.close_unsealed_blocks++;
+    if (shape == CST_UNSEALED_CUT_FRAG) {
+        g_stats.close_unsealed_cut_frag++;
+    } else {
+        g_stats.close_unsealed_tb_edge++;
+    }
+}
+
+void close_unsealed_end(void)
+{
+    uint64_t ctxs = 0;
+    uint64_t blocks = 0;
+    g_mutex_lock(&unsealed_lock);
+    if (unsealed.open) {
+        blocks = unsealed.blocks;
+        ctxs = unsealed.ctxs.size();
+        unsealed.sum.closes++;
+        unsealed.sum.blocks += blocks;
+        if (blocks > 0) {
+            unsealed.sum.closes_with++;
+        }
+        if (blocks > unsealed.sum.peak_blocks) {
+            unsealed.sum.peak_blocks = blocks;
+        }
+        if (ctxs > unsealed.sum.peak_contexts) {
+            unsealed.sum.peak_contexts = ctxs;
+            unsealed.sum.peak_close_seq = unsealed.seq;
+            unsealed.sum.peak_reason = unsealed.reason;
+        }
+        unsealed.open = false;
+        unsealed.reason = nullptr;
+        unsealed.blocks = 0;
+        unsealed.ctxs.clear();
+    }
+    g_mutex_unlock(&unsealed_lock);
+
+    if (blocks > 0) {
+        g_stats.close_unsealed_closes++;
+        g_stats.close_unsealed_contexts += ctxs;
+    }
+}
+
+CloseUnsealedSummary close_unsealed_summary(void)
+{
+    g_mutex_lock(&unsealed_lock);
+    CloseUnsealedSummary s = unsealed.sum;
+    g_mutex_unlock(&unsealed_lock);
+    return s;
+}
+
+const std::vector<CloseUnsealedRow> &close_unsealed_rows(void)
+{
+    return unsealed_rows_store;
+}
+
 /* A/B env toggles for the fault machinery: CST_NO_FAULT kills the
  * feature upstream (g_features.fault_depth_trailer and wp_synthetic_marking);
  * CST_NO_FAULT_WP zeroes only a continuation emit's wrong-path target. */
@@ -1213,6 +1365,16 @@ uint32_t PathBuilder::close_walk_emit(BodyStreamState *out_stream,
             if (BBTemplate *bb_tmpl =
                     cp_chain(cpu_index_).finalize_truncated(frag, ran)) {
                 finalized.push_back(bb_tmpl);
+                if (a.at_close) {
+                    /* No terminating branch reached: the close sealed this
+                     * true BB itself, at the extent that ran. */
+                    close_unsealed_note(cpu_index_, a.tid,
+                                        bb_tmpl->start_pc, bb_tmpl->n_insns,
+                                        bb_tmpl->is_system,
+                                        CST_UNSEALED_CUT_FRAG);
+                } else {
+                    g_stats.departure_unsealed_blocks++;
+                }
             }
             cp_chain(cpu_index_).reset();
             g_stats.close_walk_blocks_truncated++;
@@ -1276,7 +1438,33 @@ uint32_t PathBuilder::close_walk_emit(BodyStreamState *out_stream,
         if (BBTemplate *bb_tmpl =
                 cp_chain(cpu_index_).finalize_truncated(nullptr, 0)) {
             finalized.push_back(bb_tmpl);
+            if (a.at_close) {
+                close_unsealed_note(cpu_index_, a.tid,
+                                    bb_tmpl->start_pc, bb_tmpl->n_insns,
+                                    bb_tmpl->is_system,
+                                    CST_UNSEALED_TB_EDGE);
+            } else {
+                /* THE DEPARTURE TWIN.  The traced flow is leaving this
+                 * vCPU (foreign-ASID dispatch, abandoned async window,
+                 * thread migration), so the block is sealed at what ran
+                 * and published now — but the guest runs on, so this is
+                 * not a close and not part of the unsealed-at-close
+                 * population.  It mints a cut-short template all the
+                 * same, and until this row existed it was the one
+                 * producer of that row nothing named: a two-thread
+                 * -smp 2 system cell read one minted template with every
+                 * other producer at zero. */
+                g_stats.departure_unsealed_blocks++;
+            }
         }
+    }
+    if (a.at_close && unsealed_falsify()) {
+        /* The falsifier arm (see the ledger): record one synthetic row per
+         * close-walk so the whole instrument — window, dedup, peak, sample
+         * row, report line — is exercised on a cell that legitimately
+         * leaves nothing unsealed.  Emission is untouched. */
+        close_unsealed_note(cpu_index_, a.tid, 0, 0, false,
+                            CST_UNSEALED_TB_EDGE);
     }
     g_mutex_unlock(&data_lock);
 
@@ -1398,6 +1586,8 @@ void PathBuilder::flush_final(bool walk_prev, bool prev_in_flight,
         mw.facts = &rep_state(cpu_index).pb_walk_facts;
         mw.thread_end_last = stamp_thread_end;
         mw.site = "flush-midstep";
+        mw.at_close = true;
+        mw.tid = walk_tid_;
         close_walk_emit(out_stream, cpu_index, mw);
     }
     walk_prev_ = nullptr;
@@ -1509,6 +1699,8 @@ void PathBuilder::flush_final(bool walk_prev, bool prev_in_flight,
         cw.facts = &rep_state(cpu_index).pb_prev_facts;
         cw.thread_end_last = stamp_thread_end;
         cw.site = smp_peer_close ? "flush-peer-slot" : "flush-slot";
+        cw.at_close = true;
+        cw.tid = prev_tid_;
         close_walk_emit(out_stream, cpu_index, cw);
     } else if (cp_chain(cpu_index_).has_active_chain()) {
         /* No walkable slot, but the chain still holds fragments that ran
@@ -1524,6 +1716,8 @@ void PathBuilder::flush_final(bool walk_prev, bool prev_in_flight,
         cw.facts = &rep_state(cpu_index).pb_prev_facts;
         cw.thread_end_last = stamp_thread_end;
         cw.site = "flush-chain";
+        cw.at_close = true;
+        cw.tid = prev_tid_;
         close_walk_emit(out_stream, cpu_index, cw);
     }
 
@@ -2849,6 +3043,12 @@ void PathBuilder::classify_fault_enter(const struct qemu_plugin_cpu_event &ev,
             if (K > 0) {
                 BBTemplate *pref = nullptr;
                 g_mutex_lock(&data_lock);
+                /* Fifth producer of an own-extent template, and the only
+                 * one that is neither a close nor an extent-only mint: the
+                 * fault's executed prefix of a translation-cut head.
+                 * Counted so the cut-short template row decomposes with
+                 * nothing left over. */
+                g_stats.fault_cut_head_prefixes++;
                 pref = g_template_store.install_own_extent(
                     full_bb->start_pc, K, full_bb->insn_pcs,
                     full_bb->insn_fields, full_bb->insn_sizes,
@@ -4080,6 +4280,7 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
      * next surviving seal). */
     walk_prev_ = prev_tb_;
     walk_depth_ = prev_depth_;
+    walk_tid_ = prev_tid_;
     g_pb_walk_async[pb_vcpu_slot(in.cpu_index)] =
         g_pb_prev_async[pb_vcpu_slot(in.cpu_index)];
     rep_state(in.cpu_index).pb_walk_facts =

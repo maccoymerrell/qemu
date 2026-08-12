@@ -1108,6 +1108,77 @@ goes the same way; when its extent turns out to match the complete block
 already committed at that pc, that template is reused, so a trace where
 nothing is really cut short mints nothing extra.
 
+.. _unsealed-at-close:
+
+How many blocks a close can leave unsealed
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A true BB is sealed by its terminating branch.  A close that lands while
+a thread is standing *inside* one has no branch to seal with, so the walk
+finalizes the block at the extent that ran.  Two shapes reach that seal —
+the close's measured extent cut a fragment part-way (``cut-mid-TB``), or
+the walk consumed whole fragments and the chain was still open at a TB
+boundary (``tb-edge``, a page-straddling block whose continuation never
+came).  Both are reported per close, with the contributing
+``(vCPU, thread)`` identities and the close route, in the exit summary's
+*Unsealed true-BBs at a close* table.
+
+The quantity is stated **per close**, and the reason it is not
+``cut-short block templates minted`` is that that row counts distinct
+*template shapes* inserted into the cut-short store, cumulatively, and
+**seven** unrelated producers insert there: the two close-walk seals
+above; the same walk run at a *departure* or a migration drain, where the
+block is published at once and the guest runs on; the mid-run seal-walk
+truncation and the mid-run cut where control left the block; the
+extent-only mint (a block that *did* reach its branch, at a pc where the
+complete-block cache already holds a different length); and the fault-cut
+head prefix.  Each has its own row now, counted per *event* rather than
+per distinct shape, so the events bound the shapes from above and a run
+whose event rows sum to zero against a non-zero shape row has a producer
+nobody named — which is how the departure producer was found (a two-thread
+``-smp 2`` system cell minted one template with every other producer at
+zero).
+
+Two close regimes, and only one of them can leave work unsealed:
+
+*Target-reached closes* — an icount or simpoint budget, and the SMP
+peer flushes that ride with them.  These defer by a whole dispatch
+(step 6 of the CP step above) precisely so the budget-crossing block
+seals normally first, and the deferred close's own slot then holds a TB
+that has not run.  Nothing is unsealed at such a close: measured 0 over
+an ``-smp 2`` two-thread system cell and an ``-smp 4`` multi-process
+churn cell, both closing ``OK`` at budget with ``clock_minus_wire=0``.
+
+*Terminal closes* — the guest ending (user mode) and the END marker
+(system mode).  The stopping instruction is *inside* a block by
+construction, and the block containing it has no continuation to seal
+with, so each context stopped that way contributes exactly one unsealed
+block.  Measured 1 on every single-thread cell — user ``all`` and system
+marker, all four ISAs.  The block each one names is the stopping
+instruction's own: in user mode ``mov $60, %rax; xor %rdi, %rdi;
+syscall`` and its per-ISA equivalents — the exit syscall, whose
+``syscall`` begins and never returns; in system mode the first
+instruction of the END sequence, where the END ruling terminates the
+tracer.
+
+A two-thread user cell reads **2**, one per thread, and the trace names
+both: the child's block is ``mov $60, %rax`` (``exit``) and the parent's
+is ``mov $231, %rax`` (``exit_group``), each cut before its own
+``syscall``.  That is not N-1: the N-1 shape assumes one thread reaches
+the stopping target and keeps executing until its block seals, and on
+this route no thread does — every thread ends inside its own exit
+syscall.
+
+So the bound is: **one unsealed block per context the close stops
+mid-block, and zero for a close whose stopping point was deferred to a
+block boundary.**  A count above that on a target-reached route is a
+defect, not a corner: it means a thread was cut off at a stopping point
+the tracer could have deferred past.  On the terminal routes the
+question is not the count but the policy — whether the END marker
+should, like a budget, defer its close until the block it fired inside
+seals.  The instrument answers "how many, whose, and stopped by what";
+that ruling is elsewhere.
+
 The stop rule is also what keeps the final block's register deltas
 complete.  A destination snapshot is captured one instruction late
 (the *next* instruction's callback reads the registers the previous

@@ -240,6 +240,33 @@ uint32_t cpu_mips_get_random(CPUMIPSState *env)
         return env->tlb->nb_tlb - 1;
     }
 
+#ifdef CONFIG_PLUGIN
+    /*
+     * Wrong-path (speculative): answer without advancing the generator.
+     *
+     * seed and prev_idx are file-scope statics, so they are not in
+     * CPUArchState at all and cannot be in the region the plugin's
+     * speculative snapshot copies -- that region is
+     * CPUArchState[0 .. end_reset_fields).  A discarded `mfc0 $Random` would
+     * therefore leave the sequence permanently advanced, and the sequence is
+     * not decorative: it chooses which entry the correct path's next TLBWR
+     * replaces, so a wrong path would change the correct path's TLB
+     * replacement pattern and with it the miss stream a trace exists to
+     * record.  Tracing a program must not alter the program it traces.
+     *
+     * nb_tlb - 1 is the value the single-random-entry case above already
+     * returns, so it is a legal index by construction; the architecture
+     * leaves which one Random reports unspecified, and the wrong path is not
+     * entitled to a particular answer -- only to an answer that costs the
+     * correct path nothing.  TLBWR itself never arrives here speculatively:
+     * helper_tlbwr is gated in tcg/system/tlb_helper.c, so the only
+     * speculative caller is the mfc0 read.
+     */
+    if (env_cpu(env)->plugin_spec_mode) {
+        return env->tlb->nb_tlb - 1;
+    }
+#endif
+
     /* Don't return same value twice, so get another value */
     do {
         /*

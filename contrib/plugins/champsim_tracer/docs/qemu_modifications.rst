@@ -1252,7 +1252,20 @@ Suppressing device and global side effects
      reprogram.
    * **MIPS** (``target/mips/tcg/system/cp0_helper.c``):
      ``mtc0 Count`` / ``Compare`` skip the timer reprogram; the
-     VPE wake/sleep paths skip ``cpu_interrupt`` / ``halted``.
+     VPE wake/sleep paths skip ``cpu_interrupt`` / ``halted``;
+     ``mtc0 MVPControl`` and the ``DVPE`` / ``EVPE`` pair skip the
+     shared ``env->mvp`` context, which every VPE points at and no
+     single vCPU's snapshot covers.  ``cpu_mips_get_random`` answers a
+     speculative ``mfc0 $Random`` without advancing its generator: the
+     LCG's ``seed`` and ``prev_idx`` are file-scope statics, so they
+     cannot be in the snapshot at all, and the sequence is not
+     decorative — it chooses which entry the correct path's next
+     ``TLBWR`` replaces, so an advance charged to the wrong path would
+     change the correct path's TLB replacement pattern and with it the
+     miss stream the trace exists to record.  ``TLBWR`` itself never
+     arrives speculatively (``tcg/system/tlb_helper.c`` gates the whole
+     TLB-write family, whose array likewise sits past the marker), so
+     the ``mfc0`` read is the only speculative caller.
 
    Guest-memory device escapes (MMIO) need no separate gate: an MMIO
    store is unreachable because the softmmu store helpers route to the

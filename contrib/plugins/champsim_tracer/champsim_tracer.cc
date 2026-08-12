@@ -5616,11 +5616,22 @@ static void finish_trace_segment(bool prev_executed = true,
                                      return ac != bc ? ac : a.cpu < b.cpu;
                                  });
             }
-            /* Did the guest's own execution order differ from the order the
-             * close used to emit in?  Counted so a run says for itself
-             * whether this close was one where the ordering mattered. */
-            if (!flush_order.empty() && flush_order.back().cpu != closing_cpu) {
-                g_stats.close_flush_out_of_dispatch_order++;
+            /* How many builders the dispatch clock moved AHEAD of the
+             * closing vCPU -- precisely the blocks the old order appended
+             * behind it.  Counted so a run says for itself whether its
+             * close was one where the ordering mattered: a close that found
+             * no peer holding work reads zero and is evidence of nothing.
+             * Zero by construction under CST_NO_CLOSE_ORDER. */
+            unsigned int moved_ahead = 0;
+            for (const CloseFlush &cf : flush_order) {
+                if (cf.cpu == closing_cpu) {
+                    break;
+                }
+                moved_ahead++;
+            }
+            if (moved_ahead) {
+                g_stats.close_flush_reordered++;
+                g_stats.close_flush_reordered_builders += moved_ahead;
             }
 
             for (const CloseFlush &cf : flush_order) {

@@ -546,13 +546,19 @@ struct Stats {
      * EARLIER behind blocks it ran later -- and docs/format.rst promises a
      * consumer that one (asid, thread_id) context reads as a single
      * instruction stream in order, breaking only at nesting boundaries the
-     * format makes visible.  The flushes are now ordered by the shared
-     * dispatch clock (g_promote_seq).  This counts the closes where that
-     * clock puts some builder AFTER the closing vCPU -- i.e. the closes
-     * where the old order would have produced an out-of-order tail.  Not a
-     * must-be-0 row: it is the population the ordering exists for, and a
-     * zero only means this run's close had nothing to reorder. */
-    uint64_t close_flush_out_of_dispatch_order = 0;
+     * format makes visible.  The flushes are ordered by the shared dispatch
+     * clock (g_promote_seq) instead.
+     *
+     * This is the CONDITION instrument for that ordering, not an outcome:
+     * it counts the closes where the clock moved at least one builder AHEAD
+     * of the closing vCPU, which is exactly the population whose wire order
+     * the fix changes.  A run whose close found no peer holding work reads
+     * zero here and is evidence of nothing either way -- which is the whole
+     * reason it is reported.  Under CST_NO_CLOSE_ORDER it is zero by
+     * construction, so the pair also shows the arm really turns the
+     * ordering off. */
+    uint64_t close_flush_reordered = 0;
+    uint64_t close_flush_reordered_builders = 0;
 
     /* THE DEFERRED ROUTE'S PENDING-SEAL SLOT.  flush_final(walk_prev=false)
      * did not walk the slot at all.  For the budget / simpoint close that

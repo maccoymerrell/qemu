@@ -45,7 +45,8 @@ namespace cst {
  *   slot-major slotted cells (families: load_addr/store_addr/load_data/
  *   store_data/dst_reg/load_size/store_size/dst_reg_width + the 4
  *   lane-mask families + the 2 physical-page families) + 7
- *   insn-metadata singletons + the 2 branch-outcome singletons.
+ *   insn-metadata singletons + the 2 branch-outcome singletons + the 5
+ *   block-level singletons (CST_FID_BB_*, live only at BLOCK_POS).
  *   EXTENDED has no persistent cell.  Bump alongside the writer when
  *   new families are added.  (Kept in step with FS_N_FAMILIES /
  *   FS_SLOTTED_END in cst_decode.cc, which own the same layout.)
@@ -57,7 +58,7 @@ namespace cst {
  * decomposed on access; a slot >= max_slots reads as a miss and grows
  * the block on write. */
 inline constexpr size_t  FIELD_STATE_SLOT_COUNT   =
-    3 + 14 * FID_SLOT_COUNT + 9;
+    3 + 14 * FID_SLOT_COUNT + 14;
 inline constexpr uint16_t FIELD_STATE_SLOT_INVALID = 0xFFFFu;
 /* FID_LUT_SIZE (the reverse index's span over the field-id space) is
  * defined once in cst_common.h and shared by every tool. */
@@ -68,6 +69,9 @@ static_assert(FIELD_STATE_SLOT_COUNT < FIELD_STATE_SLOT_INVALID,
               "invalid sentinel");
 
 struct FieldStateBlock {
+    /* POSITION capacity: template num_insns + 1 — the extra row is the
+     * block's own (BLOCK_POS = num_insns, §5.7), one index past the
+     * instruction array the block also spans. */
     uint32_t              n_insns = 0;
     /* Slot occupancy high-water mark, mirroring the writer's
      * FieldStateBlock::max_slots: the physical row holds only
@@ -215,10 +219,11 @@ public:
      *                           field deltas are parse-skipped.
      *               Fields    => WP BBs are emitted with field deltas
      *                           applied and accessors live.
-     * The WP events section (fault / translation flags, Step 6.9) is
-     * always parse-skipped here — it is not surfaced on BB.  Consumers
-     * that need it must use the batch walk().  IFRAME records are
-     * parse-skipped (no field-content validation on this path). */
+     * A WP block's events (fault / translation flags) are block-level
+     * field records in its own wp_delta_section (§4.4), surfaced on
+     * BB::bb_flags at Fields level like every other cell.  IFRAME
+     * records are parse-skipped (no field-content validation on this
+     * path). */
     enum class WpDecode { Skip, Structure, Fields };
 
     /* One basic-block execution surfaced by walk_bb().  The scalar
@@ -250,12 +255,36 @@ public:
         bool            wp_chain_start = false;
         bool            wp_chain_last  = false;
         uint32_t        n_insns        = 0;   /* template insn count */
-        /* Exception-nesting depth (CST_FLAG_FAULT traces): 0 = normal code,
-         * >=1 = synchronous-fault handler code at that nesting level.  CP
-         * only; WP BBs inherit their parent CP entry's depth. */
+        /* Exception-nesting depth (CST_FID_BB_FAULT_DEPTH block cell):
+         * 0 = normal code, >=1 = synchronous-fault handler code at that
+         * nesting level.  CP only; populated only when this BB's field
+         * deltas were applied (cp_fields / WpDecode::Fields — the cell
+         * is delta-persistent, so a parse-skipped section cannot read
+         * it honestly). */
         uint32_t        fault_depth    = 0;
+        /* Executed range [bb_start, bb_stop) (§4.2a) and the raw
+         * CST_FID_BB_FLAGS cell.  Same caveat as fault_depth: honest
+         * only when this BB's deltas were applied; a parse-skipped BB
+         * reports the whole-block defaults [0, n_insns) and flags 0. */
+        uint32_t        bb_start       = 0;
+        uint32_t        bb_stop        = 0;
+        uint64_t        bb_flags       = 0;
 
         bool     has_fields() const { return blk_ != nullptr; }
+        /* bb_flags bits resolved through the trace's bb_flag map.
+         * False when this BB's fields were not decoded (ids_ unset). */
+        bool flag_synthetic_fault() const {
+            return ids_ && (bb_flags & ids_->bb_flag_synthetic_fault);
+        }
+        bool flag_translation_unavail() const {
+            return ids_ && (bb_flags & ids_->bb_flag_translation_unavail);
+        }
+        bool flag_wp_first_target_unavail() const {
+            return ids_ && (bb_flags & ids_->bb_flag_wp_first_target_unavail);
+        }
+        bool flag_thread_end() const {
+            return ids_ && (bb_flags & ids_->bb_flag_thread_end);
+        }
         uint64_t load_count(uint32_t insn) const;
         uint64_t store_count(uint32_t insn) const;
         uint64_t load_addr(uint32_t insn, uint32_t slot) const;
@@ -289,38 +318,11 @@ public:
     };
     using BBCallback = std::function<void(const BB &)>;
 
-    /* Per-entry wrong-path chain event summary (Step 6.9), surfaced by
-     * walk_bb() when a callback is registered — the batch walk()
-     * surfaces the same information on the WPEntry records themselves.
-     * Fired once per CP entry (after its chain), only on CST_FLAG_WP
-     * traces.  Registering the callback changes no byte consumption:
-     * the events section is parsed instead of parse-skipped, and under
-     * WpDecode::Skip only the chain-length prefix of the (already
-     * skipped) chain section is additionally read. */
-    struct WpEventsSummary {
-        uint32_t seq_num       = 0;   /* owning CP entry's seq        */
-        uint32_t chain_len     = 0;   /* WP BBs in the chain          */
-        /* Architectural instructions across the chain's WP BBs — the
-         * unit the tracer's wpdepth budget is spent in (the walk loop
-         * tests `sim_insns < max_wrong_path_depth`).  Derived from the
-         * chain section's per-block templates, so it is populated only
-         * when the chain is actually walked: under WpDecode::Skip the
-         * chain bytes are skipped wholesale and this stays 0. */
-        uint32_t wp_insns      = 0;
-        uint32_t fault_count   = 0;   /* per-block FAULT events       */
-        uint32_t unavail_count = 0;   /* per-block TRANSLATION events */
-        /* Chain-level: the excursion's FIRST target was never
-         * realized (fetch/translation failed before any block). */
-        bool     chain_unavailable = false;
-        /* Event on the final chain block — the terminating condition
-         * when the chain stopped short of the budget. */
-        bool     last_fault    = false;
-        bool     last_unavail  = false;
-    };
-    using WpEventsCallback = std::function<void(const WpEventsSummary &)>;
-    void set_wp_events_callback(WpEventsCallback cb) {
-        wp_events_cb_ = std::move(cb);
-    }
+    /* There is no side wp_events channel in this epoch: a wrong-path
+     * block's events are block-level facts riding its own
+     * wp_delta_section (CST_FID_BB_FLAGS / CST_FID_BB_FAULT_INSN at its
+     * BLOCK_POS, §4.4), surfaced on BB::bb_flags at WpDecode::Fields
+     * and on WPEntry by the batch walk. */
 
     void walk_bb(bool cp_fields, WpDecode wp,
                  const BBCallback &cb,
@@ -355,14 +357,27 @@ private:
      * @state (or parse-skips it when @state is null) with no pass-2
      * materialisation.  stream_wp_chain_bb walks one WP chain,
      * emitting a BB per entry. */
+    /* Block-level cells read back from a section's BLOCK_POS row after
+     * pass 1, with baseline defaults resolved (bb_start 0, bb_stop
+     * num_insns, everything else 0).  §5.7's range/position validation
+     * happens where these are read. */
+    struct BlockCells {
+        uint32_t bb_start    = 0;
+        uint32_t bb_stop     = 0;
+        uint64_t bb_flags    = 0;
+        uint32_t fault_depth = 0;
+        uint32_t fault_insn  = 0;
+    };
+
     void consume_field_section(Reader &outer, uint32_t template_id,
                                const Template *tmpl,
                                FieldStateTable *state,
-                               const FieldStateTable *base_state);
+                               const FieldStateTable *base_state,
+                               BlockCells *bc = nullptr);
     uint64_t stream_wp_chain_bb(Reader &wpb, FieldStateTable &wp_state,
                                 FieldStateTable &cp_state, WpDecode wp,
                                 uint32_t seq, uint32_t thread, uint32_t asid,
-                                const BBCallback &cb, bool *has_events,
+                                const BBCallback &cb,
                                 uint64_t *insns = nullptr);
     void handle_entry_bb(WalkState &ws, bool cp_fields, WpDecode wp,
                          const BBCallback &cb);
@@ -372,22 +387,12 @@ private:
      * entries.  Used by both handle_entry and handle_iframe.  @state
      * is the per-thread WP overlay; @base_state is the corresponding
      * CP overlay that WP cells fall back into.  The section's leading
-     * ULEB packs num_wp with the CST_WP_CHAIN_HAS_EVENTS bit (format.rst
-     * Step 6.8); *@has_events reports that bit so the caller knows
-     * whether a wp_events_section follows on the wire. */
+     * ULEB is the bare block count (Step 6.8) — nothing is packed into
+     * it.  Each block's events arrive as its own CST_FID_BB_FLAGS /
+     * CST_FID_BB_FAULT_INSN block records (§4.4). */
     std::vector<WPEntry> decode_wp_chain(Reader &wpb,
                                          FieldStateTable &state,
-                                         const FieldStateTable *base_state,
-                                         bool *has_events);
-    /* Read one WP events sub-section, attaching fault /
-     * translation_unavailable flags to entries in @wp_entries by
-     * index.  An event whose resolved index is past the chain length
-     * is chain-level (§4.4): it carries no per-block flags and instead
-     * sets *@chain_unavail when it bears the TRANSLATION_UNAVAIL bit
-     * (the excursion's first target was never realized). */
-    void decode_wp_events(Reader &evb,
-                          std::vector<WPEntry> *wp_entries,
-                          bool *chain_unavail);
+                                         const FieldStateTable *base_state);
 
     /* Field-delta record decoder.  Splits into two passes: pass 1
      * applies record deltas to the per-template state block and
@@ -405,13 +410,15 @@ private:
                             std::vector<MetaFlagsEntry> *metaflags,
                             std::vector<LaneMaskEntry>  *lane_masks,
                             AttributionLint             *lint,
-                            BranchOutcome               *branch = nullptr);
+                            BranchOutcome               *branch = nullptr,
+                            BlockCells                  *bc_out = nullptr);
 
     /* Compute the template-default for FID_INSN_* fields (those whose
-     * baseline is the template's static value).  Returns Wide{} for
-     * fields that default to zero. */
+     * baseline is the template's static value) and for CST_FID_BB_STOP
+     * (whose baseline is the template's num_insns, §5.7).  Returns
+     * Wide{} for fields that default to zero. */
     Wide template_default(const Template *tmpl,
-                          uint32_t ipos, uint8_t fid) const;
+                          uint32_t ipos, uint16_t fid) const;
 
     const Header                                       &header_;
     const std::vector<Template>                        &templates_;
@@ -433,9 +440,6 @@ private:
     AttributionLint lint_;
     /* Optional positional sink for disk-I/O records (set_devio_callback). */
     DevioCallback devio_cb_;
-    /* Optional per-entry WP-events summary sink (set_wp_events_callback);
-     * walk_bb only. */
-    WpEventsCallback wp_events_cb_;
     /* request_id -> (thread_id, asid) captured from an EXACT DEVIO_START,
      * so its paired DEVIO_STOP can be surfaced with the same owner. */
     std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> devio_owner_;

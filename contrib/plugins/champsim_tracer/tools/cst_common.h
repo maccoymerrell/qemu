@@ -81,7 +81,7 @@ using FidSlotArray = std::array<uint16_t, FID_SLOT_COUNT>;
  * escape; rounded up to a power of two for a single-load lookup.  ONE
  * definition, shared by every tool, so raising the slot ceiling can
  * never leave one index behind. */
-inline constexpr size_t FID_SPACE_SIZE = 3 + 14 * (size_t)FID_SLOT_COUNT + 10;
+inline constexpr size_t FID_SPACE_SIZE = 3 + 14 * (size_t)FID_SLOT_COUNT + 15;
 inline constexpr size_t FID_LUT_SIZE   =
     FID_SPACE_SIZE <= 1024 ? 1024 : (FID_SPACE_SIZE <= 8192 ? 8192 : 65536);
 static_assert(FID_LUT_SIZE > FID_SPACE_SIZE,
@@ -151,6 +151,18 @@ struct ResolvedIds {
      * consumer then falls back to successor look-ahead. */
     uint16_t fid_branch_taken     = 0;
     uint16_t fid_branch_target    = 0;
+    /* Block-level field-IDs, addressed at the reserved position
+     * BLOCK_POS = template.num_insns (format.rst §5.7).  The five names
+     * are the complete block-level family of this epoch and are
+     * STRUCTURALLY REQUIRED: a trace that does not name them cannot
+     * declare an executed range, so a reader could not tell a partial
+     * entry from a whole one and would silently over-claim
+     * instructions.  parse_header fails at map resolution. */
+    uint16_t fid_bb_start         = 0;
+    uint16_t fid_bb_stop          = 0;
+    uint16_t fid_bb_flags         = 0;
+    uint16_t fid_bb_fault_depth   = 0;
+    uint16_t fid_bb_fault_insn    = 0;
 
     /* insn_flag map: bit masks inside the per-insn flags byte */
     uint8_t insn_flag_branch_cond   = 0;
@@ -177,22 +189,25 @@ struct ResolvedIds {
     /* Bit mask within Header::flags marking the per-entry
      * wrong-path chain + events sections present. */
     uint8_t flag_wp = 0;
-    /* Bit mask within Header::flags marking the per-entry synchronous-fault
-     * trailer (exception-nesting depth, + anchor on a faulting BB) present. */
+    /* Bit mask within Header::flags advising that fault-handler content
+     * (CST_FID_BB_FAULT_DEPTH records at BLOCK_POS) can appear.  Advisory
+     * only — nothing on the wire is gated by it. */
     uint8_t flag_fault = 0;
     /* Bit mask within Header::flags marking the physical-page families
      * (CST_FID_LOAD_PPAGE / STORE_PPAGE) present.  Optional: 0 (never set)
      * on user-mode / non-physaddr traces. */
     uint8_t flag_physaddr = 0;
 
-    /* wp_event_flag map: bit masks inside the per-WP-event flags byte */
-    uint8_t wp_event_translation_unavail = 0;
-    uint8_t wp_event_fault               = 0;
-
-    /* wp_chain_flag map: bit mask inside the WP chain section's leading
-     * ULEB (packed alongside num_wp; see CST_WP_CHAIN_HAS_EVENTS).
-     * Announces whether a wp_events_section follows this entry's chain. */
-    uint8_t wp_chain_has_events = 0;
+    /* bb_flag map: bit masks inside the CST_FID_BB_FLAGS block cell
+     * (§5.7 / §4.4).  The five names are this epoch's complete
+     * vocabulary and all structurally required — each one's absence
+     * would make some block state unreadable (an unresolved branch, a
+     * thread's end, a wrong-path event). */
+    uint64_t bb_flag_synthetic_fault         = 0;
+    uint64_t bb_flag_translation_unavail     = 0;
+    uint64_t bb_flag_wp_first_target_unavail = 0;
+    uint64_t bb_flag_thread_end              = 0;
+    uint64_t bb_flag_branch_unresolved       = 0;
 
     /* metaflags map: bit positions inside the FID_METAFLAGS byte */
     uint8_t metaflags_z = 0;
@@ -354,12 +369,20 @@ struct WPEntry {
     std::vector<RegSnap>        reg_snaps;
     std::vector<MetaFlagsEntry> metaflags;
     std::vector<LaneMaskEntry>  lane_masks;
+    /* Decoded from this block's own CST_FID_BB_FLAGS record at its
+     * BLOCK_POS (§4.4): SYNTHETIC_FAULT / TRANSLATION_UNAVAIL. */
     bool                        fault = false;
     bool                        translation_unavailable = false;
-    /* Only meaningful when fault. */
+    /* CST_FID_BB_FAULT_INSN; only meaningful when fault. */
     uint32_t                    fault_insn_index = 0;
     bool                        has_fault_idx = false;
     uint32_t                    n_insns = 0;
+    /* Executed range [bb_start, bb_stop) in template insn indices
+     * (§4.2a); [0, n_insns) unless the block declared otherwise. */
+    uint32_t                    bb_start = 0;
+    uint32_t                    bb_stop = 0;
+    /* Raw CST_FID_BB_FLAGS cell value (bits resolve via bb_flag map). */
+    uint64_t                    bb_flags = 0;
     /* Terminal-branch direction/target (CST_FID_BRANCH_*) for this WP block,
      * decoded directly (displacement reconstructed to an absolute successor
      * PC).  valid iff the block's template ends in a branch; the successor is
@@ -383,17 +406,26 @@ struct DecodedEntry {
     std::vector<MetaFlagsEntry> metaflags;
     std::vector<LaneMaskEntry>  lane_masks;
     std::vector<WPEntry>        wp_entries;
-    /* Chain-level TRANSLATION_UNAVAIL event (wp_events index >= num_wp,
-     * §4.4): the wrong-path excursion was kicked but its first target
-     * could not be fetched/translated, so wp_entries is empty and the
-     * event applies to the chain as a whole. */
+    /* CST_BB_FLAG_WP_FIRST_TARGET_UNAVAIL on this CP entry (§4.4): the
+     * wrong-path excursion was kicked but its first target could not be
+     * fetched/translated, so wp_entries is empty and the event applies
+     * to the chain as a whole. */
     bool                        wp_first_fetch_unavailable = false;
-    /* Exception-nesting depth (CST_FLAG_FAULT traces): 0 = normal code,
-     * >=1 = synchronous-fault handler code at that nesting level. */
+    /* CST_FID_BB_FAULT_DEPTH block cell: 0 = normal code, >=1 =
+     * synchronous-fault handler code at that nesting level (§4.2a). */
     uint32_t                    fault_depth = 0;
-    /* Faulting-instruction indices for a whole-BB-merged faulting BB (one
-     * per fault excursion, in order); empty for ordinary entries. */
-    std::vector<uint32_t>       fault_anchors;
+    /* Executed range [bb_start, bb_stop) in template insn indices
+     * (§4.2a).  [0, num_insns) — the whole block — unless the entry
+     * declared otherwise via its BLOCK_POS records.  dyn_params /
+     * reg_snaps / metaflags / lane_masks cover exactly this range; the
+     * entry asserts nothing about instructions outside it. */
+    uint32_t                    bb_start = 0;
+    uint32_t                    bb_stop = 0;
+    /* Raw CST_FID_BB_FLAGS cell (bits resolve via the bb_flag map). */
+    uint64_t                    bb_flags = 0;
+    /* CST_BB_FLAG_THREAD_END: this is the last entry of its
+     * (thread_id, asid) context in the segment (§4.2a). */
+    bool                        thread_end = false;
     /* Terminal-branch direction/target (CST_FID_BRANCH_*), materialised
      * directly so a consumer need not decode the successor entry.  valid iff
      * the template ends in a branch; target == the architectural successor
@@ -630,10 +662,9 @@ struct EncodingMaps {
     std::unordered_map<uint64_t, std::string> header_flag;
     std::unordered_map<uint64_t, std::string> insn_flag;
     std::unordered_map<uint64_t, std::string> body_tag;
-    std::unordered_map<uint64_t, std::string> wp_event_flag;
-    /* Bit mask inside the WP chain section's leading ULEB (packed
-     * alongside num_wp; see CST_WP_CHAIN_HAS_EVENTS, format.rst §4.3). */
-    std::unordered_map<uint64_t, std::string> wp_chain_flag;
+    /* Bit masks inside the CST_FID_BB_FLAGS block-level cell
+     * (format.rst §5.7 / §4.4). */
+    std::unordered_map<uint64_t, std::string> bb_flag;
     std::unordered_map<uint64_t, std::string> metaflags;
     std::unordered_map<uint64_t, std::string> dep_block_flag;
     /* Template-profile self-description (format §6). */

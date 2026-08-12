@@ -2084,7 +2084,7 @@ struct WalkCtx {
      * The tracer's wrong-path instruction budget, recovered from
      * `wpdepth=N` in the header's command string (the budget itself is
      * not a wire field).  0 = the run's wpdepth could not be recovered,
-     * and the classifier degrades accordingly (see handle_wp_events). */
+     * and the classifier degrades accordingly (see classify_wp_chain). */
     uint64_t wp_budget = 0;
 
     /* Per-template privilege facts, used to split the ONE front-end
@@ -2123,6 +2123,21 @@ struct WalkCtx {
     struct WpChain {
         uint32_t last_tid = 0xFFFFFFFFu;   /* terminating WP block      */
         uint32_t cp_tid   = 0xFFFFFFFFu;   /* the launching CP entry    */
+        /* Accumulated from each WP block's own CST_FID_BB_FLAGS /
+         * range (§4.4) as the chain streams — the facts the old side
+         * wp_events section used to summarise. */
+        uint32_t len          = 0;
+        uint64_t insns        = 0;      /* realised WP arch insns      */
+        uint32_t fault_count  = 0;
+        bool     last_fault   = false;
+        bool     last_unavail = false;
+        /* CST_BB_FLAG_WP_FIRST_TARGET_UNAVAIL on the launching CP
+         * entry: the excursion realised no block at all. */
+        bool     chain_unavailable = false;
+        /* Population gate: classify only chains that carried at least
+         * one wrong-path event, matching the old wire's "events
+         * section present" population. */
+        bool     any_event    = false;
     };
     WpChain wpchain;
 
@@ -2542,7 +2557,7 @@ static inline void wp_chain_push(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
 {
     ctx.wp_chain.push_back({bb.template_index,
                             bb.tmpl ? bb.tmpl->start_pc : 0,
-                            bb.n_insns});
+                            bb.bb_stop - bb.bb_start});
 }
 
 /* Accumulate one streaming WP BB into the current chain projection +
@@ -2552,9 +2567,9 @@ static inline void wp_chain_push(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
 static inline void handle_gshare_wp(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
 {
     wp_chain_push(ctx, bb);
-    ctx.pending_wp_insns += bb.n_insns;
+    ctx.pending_wp_insns += bb.bb_stop - bb.bb_start;
     if (bb.has_fields()) {
-        for (uint32_t i = 0; i < bb.n_insns; i++) {
+        for (uint32_t i = bb.bb_start; i < bb.bb_stop; i++) {
             uint64_t nl = bb.load_count(i);
             if (nl > cst::FID_SLOT_COUNT) nl = cst::FID_SLOT_COUNT;
             uint64_t ns = bb.store_count(i);
@@ -2568,7 +2583,7 @@ static void handle_gshare_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
 {
     if (bb.is_wp) { handle_gshare_wp(ctx, bb); return; }
     const cst::Template &t = *bb.tmpl;
-    uint32_t n_insns = bb.n_insns;
+    uint32_t n_insns = bb.bb_stop - bb.bb_start;
     int bin = bin_of(ctx, ctx.cp_insns_so_far);
 
     /* Resolve the PREVIOUS entry's branch outcome now that we know
@@ -2754,7 +2769,7 @@ static void handle_btb_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
 {
     if (bb.is_wp) { wp_chain_push(ctx, bb); return; }
     const cst::Template &t = *bb.tmpl;
-    uint32_t n_insns = bb.n_insns;
+    uint32_t n_insns = bb.bb_stop - bb.bb_start;
     int bin = bin_of(ctx, ctx.cp_insns_so_far);
 
     /* BP gate: decide whether the PREVIOUS entry's WP chain should
@@ -2849,7 +2864,7 @@ static void handle_btb_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
 template <class F>
 static inline void for_each_cp_memop(const cst::BodyWalker::BB &bb, F &&f)
 {
-    for (uint32_t i = 0; i < bb.n_insns; i++) {
+    for (uint32_t i = bb.bb_start; i < bb.bb_stop; i++) {
         uint64_t nl = bb.load_count(i);
         if (nl > cst::FID_SLOT_COUNT) nl = cst::FID_SLOT_COUNT;
         for (uint32_t k = 0; k < nl; k++) f(i, bb.load_addr(i, k));
@@ -2912,7 +2927,7 @@ static void handle_cache_miss_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
     ctx.pending_is_branch = tb.is_branch;
     ctx.pending_is_conditional = tb.is_conditional;
 
-    ctx.cp_insns_so_far += bb.n_insns;
+    ctx.cp_insns_so_far += bb.bb_stop - bb.bb_start;
 }
 
 /* Accumulate one streaming WP BB's per-pattern memop counts into the
@@ -2969,7 +2984,7 @@ static void handle_mem_pat_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
     ctx.pending_is_branch = tb.is_branch;
     ctx.pending_is_conditional = tb.is_conditional;
 
-    ctx.cp_insns_so_far += bb.n_insns;
+    ctx.cp_insns_so_far += bb.bb_stop - bb.bb_start;
 }
 
 static void handle_branch_dir_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
@@ -3038,7 +3053,7 @@ static void handle_branch_dir_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
     /* Reset the chain projection; THIS entry's WP BBs stream next. */
     ctx.wp_chain.clear();
 
-    ctx.cp_insns_so_far += bb.n_insns;
+    ctx.cp_insns_so_far += bb.bb_stop - bb.bb_start;
 }
 
 /* working_set: SLIDING-WINDOW unique cache lines and 4 KiB pages
@@ -3090,7 +3105,7 @@ static void handle_working_set_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
     }
     ws.lines_per_bin[bin] = ws.line_count.size();
     ws.pages_per_bin[bin] = ws.page_count.size();
-    ctx.cp_insns_so_far += bb.n_insns;
+    ctx.cp_insns_so_far += bb.bb_stop - bb.bb_start;
 }
 
 /* Shared between dep_depth and ilp: build the special-reg lookup
@@ -3223,14 +3238,14 @@ static void handle_dep_depth_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
         bin_hist.assign((size_t)window + 1, 0);
     }
     uint64_t la[cst::FID_SLOT_COUNT], sa[cst::FID_SLOT_COUNT];
-    for (uint32_t i = 0; i < bb.n_insns; i++) {
+    for (uint32_t i = bb.bb_start; i < bb.bb_stop; i++) {
         uint32_t nl, ns;
         df_gather_addrs(bb, i, la, &nl, sa, &ns);
         uint32_t d = df_step_insn(ctx, t.insns[i], la, nl, sa, ns,
                                   window, bin, /*record_ipc_samples=*/false);
         bin_hist[d]++;
     }
-    ctx.cp_insns_so_far += bb.n_insns;
+    ctx.cp_insns_so_far += bb.bb_stop - bb.bb_start;
 }
 
 /* ilp: ideal IPC under perfect rename.  Drives the same Wall
@@ -3250,7 +3265,7 @@ static void handle_ilp_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
         ctx.df.ilp_cycle_hist.assign((size_t)window + 1, 0);
     }
     uint64_t la[cst::FID_SLOT_COUNT], sa[cst::FID_SLOT_COUNT];
-    for (uint32_t i = 0; i < bb.n_insns; i++) {
+    for (uint32_t i = bb.bb_start; i < bb.bb_stop; i++) {
         uint32_t nl, ns;
         df_gather_addrs(bb, i, la, &nl, sa, &ns);
         uint32_t complete = df_step_insn(ctx, t.insns[i], la, nl, sa, ns,
@@ -3265,7 +3280,7 @@ static void handle_ilp_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
         }
         ctx.df.ilp_cycle_hist[issue_cycle]++;
     }
-    ctx.cp_insns_so_far += bb.n_insns;
+    ctx.cp_insns_so_far += bb.bb_stop - bb.bb_start;
 }
 
 /* reuse_distance: for each CP memop's cache line, count how many
@@ -3317,7 +3332,7 @@ static void handle_reuse_distance_bb(WalkCtx &ctx,
         }
         ru.tree.insert(t_new);
     });
-    ctx.cp_insns_so_far += bb.n_insns;
+    ctx.cp_insns_so_far += bb.bb_stop - bb.bb_start;
 }
 
 static void handle_genop_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
@@ -3327,7 +3342,7 @@ static void handle_genop_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
     for (const auto &p : precomp.series_increments) {
         ctx.bins.at(p.first, bin) += p.second;
     }
-    ctx.cp_insns_so_far += bb.n_insns;
+    ctx.cp_insns_so_far += bb.bb_stop - bb.bb_start;
 }
 
 /* wp_divergence: for each CP branch's WP chain, how many WP
@@ -3422,7 +3437,7 @@ static void handle_wp_divergence_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
      * are processed at the chain's last BB. */
     ctx.wp_chain.clear();
 
-    ctx.cp_insns_so_far += bb.n_insns;
+    ctx.cp_insns_so_far += bb.bb_stop - bb.bb_start;
 }
 
 /* gen_reg uses the same shape as genop — precomputed per-template
@@ -3453,12 +3468,17 @@ static void handle_user_kernel_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
 {
     if (bb.is_wp) return;
     int bin = bin_of(ctx, ctx.cp_insns_so_far);
+    uint32_t realised = bb.bb_stop - bb.bb_start;
     uint32_t k = (bb.template_index < ctx.tmpl_kernel_insns.size())
                      ? ctx.tmpl_kernel_insns[bb.template_index] : 0;
-    if (k > bb.n_insns) k = bb.n_insns;
-    ctx.bins.at(0, bin) += (double)(bb.n_insns - k);   /* user   */
-    ctx.bins.at(1, bin) += (double)k;                  /* kernel */
-    ctx_bump_bin(ctx, bin, bb.n_insns);
+    /* Clamp the template's kernel-insn count to the entry's realised
+     * range (is_system is uniform across a template, so a partial
+     * entry of a kernel template is wholly kernel). */
+    uint32_t kr = (k >= bb.n_insns) ? realised
+                                    : (k < realised ? k : realised);
+    ctx.bins.at(0, bin) += (double)(realised - kr);    /* user   */
+    ctx.bins.at(1, bin) += (double)kr;                 /* kernel */
+    ctx_bump_bin(ctx, bin, bb.bb_stop - bb.bb_start);
 }
 
 /* fault_rate: excursion starts (fault_depth increases) per bin, plus
@@ -3487,7 +3507,7 @@ static void handle_fault_rate_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
         }
     }
     ctx.prev_fault_depth = bb.fault_depth;
-    ctx_bump_bin(ctx, bin, bb.n_insns);
+    ctx_bump_bin(ctx, bin, bb.bb_stop - bb.bb_start);
 }
 
 /* thread_switch: switch records + distinct active threads per bin. */
@@ -3504,7 +3524,7 @@ static void handle_thread_switch_bb(WalkCtx &ctx,
         ctx.bins.at(1, bin) += 1.0;      /* thread active in this bin */
         ctx.thread_last_bin[bb.thread_id] = bin;
     }
-    ctx_bump_bin(ctx, bin, bb.n_insns);
+    ctx_bump_bin(ctx, bin, bb.bb_stop - bb.bb_start);
 }
 
 /* asid_timeline: per-ASID instruction share, stacked.  Labels are
@@ -3515,8 +3535,8 @@ static void handle_asid_timeline_bb(WalkCtx &ctx,
     if (bb.is_wp) return;
     int bin = bin_of(ctx, ctx.cp_insns_so_far);
     int sid = ctx.add_label("asid " + std::to_string(bb.asid));
-    ctx.bins.at(sid, bin) += (double)bb.n_insns;
-    ctx_bump_bin(ctx, bin, bb.n_insns);
+    ctx.bins.at(sid, bin) += (double)(bb.bb_stop - bb.bb_start);
+    ctx_bump_bin(ctx, bin, bb.bb_stop - bb.bb_start);
 }
 
 /* Positional walker for the metrics whose data arrives on the DEVIO /
@@ -3526,7 +3546,7 @@ static void handle_position_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
     if (bb.is_wp) return;
     int bin = bin_of(ctx, ctx.cp_insns_so_far);
     ctx.pending_bin = (uint64_t)bin;
-    ctx_bump_bin(ctx, bin, bb.n_insns);
+    ctx_bump_bin(ctx, bin, bb.bb_stop - bb.bb_start);
 }
 
 /* DEVIO record sink (devio_queue / devio_latency / devio_lba): retain
@@ -3605,17 +3625,43 @@ enum {
  * block to ask about its successors.  Chain state is reset on the CP
  * entry that launches the chain, so a chain is always measured against
  * its own entry. */
+static void classify_wp_chain(WalkCtx &ctx);
+
 static void handle_wp_term_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
 {
     if (!bb.is_wp) {
         int bin = bin_of(ctx, ctx.cp_insns_so_far);
         ctx.pending_bin = (uint64_t)bin;
-        ctx_bump_bin(ctx, bin, bb.n_insns);
+        ctx_bump_bin(ctx, bin, bb.bb_stop - bb.bb_start);
         ctx.wpchain = WalkCtx::WpChain{};
         ctx.wpchain.cp_tid = bb.template_index;
+        /* CST_BB_FLAG_WP_FIRST_TARGET_UNAVAIL on the CP entry (§4.4):
+         * the excursion was kicked but realised no block, so no WP BB
+         * will stream for it — classify the zero-length chain now. */
+        if (bb.flag_wp_first_target_unavail()) {
+            ctx.wpchain.chain_unavailable = true;
+            ctx.wpchain.any_event = true;
+            classify_wp_chain(ctx);
+        }
         return;
     }
     ctx.wpchain.last_tid = bb.template_index;
+    ctx.wpchain.len++;
+    ctx.wpchain.insns += bb.bb_stop - bb.bb_start;
+    /* Per-block events ride the block's own CST_FID_BB_FLAGS (§4.4). */
+    const bool f = bb.flag_synthetic_fault();
+    const bool u = bb.flag_translation_unavail();
+    if (f) ctx.wpchain.fault_count++;
+    ctx.wpchain.last_fault   = f;
+    ctx.wpchain.last_unavail = u;
+    if (f || u) ctx.wpchain.any_event = true;
+    /* The chain's facts are complete at its last block; classify there,
+     * against the launching entry's bin (still in pending_bin).  Only
+     * chains that carried at least one event are classified, matching
+     * the old side-section's population. */
+    if (bb.wp_chain_last && ctx.wpchain.any_event) {
+        classify_wp_chain(ctx);
+    }
 }
 
 /* WP-events summary sink (wp_termination): classify how each CP
@@ -3695,23 +3741,23 @@ static void handle_wp_term_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
  * function and is in no class.  That is a property of the wire, not of the
  * ladder; --wp-term-probe labels its chain count accordingly so the plot's
  * denominator is not mistaken for the excursion count. */
-static void handle_wp_events(WalkCtx &ctx,
-                             const cst::BodyWalker::WpEventsSummary &s)
+static void classify_wp_chain(WalkCtx &ctx)
 {
-    /* A front-end stop at any position: index 0 (no block to mark, so
-     * the marker is chain-level, and a zero-length chain means the same
-     * thing whether or not it rode along) or a later index. */
-    const bool front_end = s.chain_unavailable || s.chain_len == 0 ||
+    const WalkCtx::WpChain &s = ctx.wpchain;
+    /* A front-end stop at any position: the chain-level unrealized
+     * first target (zero-length chain), or the last block marked
+     * untranslatable. */
+    const bool front_end = s.chain_unavailable || s.len == 0 ||
                            s.last_unavail;
     const bool budget_known   = ctx.wp_budget > 0;
-    const bool reached_budget = budget_known && s.wp_insns >= ctx.wp_budget;
+    const bool reached_budget = budget_known && s.insns >= ctx.wp_budget;
 
     /* The block whose successors the walker was about to fetch when it
      * stopped: the last wrong-path block, or — for a chain that never
      * realized a block — the CP entry that launched the excursion, whose
      * own edges include the wrong-path target. */
-    const uint32_t tid = (s.chain_len == 0) ? ctx.wpchain.cp_tid
-                                            : ctx.wpchain.last_tid;
+    const uint32_t tid = (s.len == 0) ? ctx.wpchain.cp_tid
+                                      : ctx.wpchain.last_tid;
     const WalkCtx::WpTermTmpl *t =
         tid < ctx.wpterm.size() ? &ctx.wpterm[tid] : nullptr;
 
@@ -3756,7 +3802,7 @@ static void handle_wp_events(WalkCtx &ctx,
      * fetch / stuck bail) so conservation and movement are measured, not
      * asserted. */
     int prev;
-    if (s.chain_unavailable || s.chain_len == 0) prev = 2;       /* no fetch */
+    if (s.chain_unavailable || s.len == 0) prev = 2;       /* no fetch */
     else if (s.last_unavail)                     prev = 1;       /* transl. */
     else if (!budget_known || reached_budget)    prev = 0;       /* complete */
     else                                         prev = 3;       /* bail    */
@@ -3765,7 +3811,7 @@ static void handle_wp_events(WalkCtx &ctx,
 
     if (reached_budget) p.budget_reached++; else p.short_chains++;
     if (front_end && reached_budget) p.marker_and_budget++;
-    if (s.chain_len == 0) {
+    if (s.len == 0) {
         if (s.chain_unavailable) p.fe_zero_marked++;
         else                     p.fe_zero_unmarked++;
     } else if (s.last_unavail) {
@@ -3781,7 +3827,7 @@ static void handle_wp_events(WalkCtx &ctx,
         else                     p.priv_unambig_same++;
     }
     if (s.fault_count > 0) p.any_fault++;
-    if (s.chain_len > 0 && s.last_fault) p.last_fault++;
+    if (s.len > 0 && s.last_fault) p.last_fault++;
 }
 
 /* --wp-term-probe: dump the whole-trace counts the wp_termination
@@ -3879,7 +3925,7 @@ static void wp_term_probe_report(const WalkCtx &ctx, const char *path)
 template <typename F>
 static inline void for_each_cp_memop_pp(const cst::BodyWalker::BB &bb, F &&f)
 {
-    for (uint32_t i = 0; i < bb.n_insns; i++) {
+    for (uint32_t i = bb.bb_start; i < bb.bb_stop; i++) {
         uint64_t nl = bb.load_count(i);
         if (nl > cst::FID_SLOT_COUNT) nl = cst::FID_SLOT_COUNT;
         for (uint32_t k = 0; k < nl; k++) {
@@ -3933,7 +3979,7 @@ static void handle_ws_divergence_bb(WalkCtx &ctx,
     }
     w.vpages_per_bin[bin] = w.v_count.size();
     w.ppages_per_bin[bin] = w.p_count.size();
-    ctx_bump_bin(ctx, bin, bb.n_insns);
+    ctx_bump_bin(ctx, bin, bb.bb_stop - bb.bb_start);
 }
 
 /* translation_churn: vpage->ppage remaps (an already-translated page
@@ -3955,7 +4001,7 @@ static void handle_translation_churn_bb(WalkCtx &ctx,
             it->second = ppage;
         }
     });
-    ctx_bump_bin(ctx, bin, bb.n_insns);
+    ctx_bump_bin(ctx, bin, bb.bb_stop - bb.bb_start);
 }
 
 /* pagemap: 2D occupancy raster.  Rows = virtual pages in first-touch
@@ -4019,7 +4065,7 @@ static void handle_pagemap_bb(WalkCtx &ctx, const cst::BodyWalker::BB &bb)
             }
         }
     });
-    ctx_bump_bin(ctx, bin, bb.n_insns);
+    ctx_bump_bin(ctx, bin, bb.bb_stop - bb.bb_start);
 }
 
 /* ===================================================================
@@ -4682,7 +4728,7 @@ static void build_metric_state(WalkCtx &ctx,
         }
     }
     /* wp_termination: fixed class order (the WPT_* indices are
-     * hard-wired in handle_wp_events), plus the two pieces of per-trace
+     * hard-wired in classify_wp_chain), plus the two pieces of per-trace
      * state the classification needs.
      *
      *  - the wrong-path instruction budget.  wpdepth is not a wire
@@ -4691,7 +4737,7 @@ static void build_metric_state(WalkCtx &ctx,
      *    (= unknown) when the run did not record one.  A 0 budget is
      *    NOT silently replaced with the plugin's default: guessing a
      *    number would manufacture "stuck bail" chains out of a trace
-     *    that cannot say.  handle_wp_events collapses that class into
+     *    that cannot say.  classify_wp_chain collapses that class into
      *    "complete" instead.
      *
      *  - each template's privilege domain and the domains its successor
@@ -6010,7 +6056,6 @@ struct MetricWalkSpec {
     cst::BodyWalker::WpDecode wp_mode = cst::BodyWalker::WpDecode::Skip;
     bool header_only = false;   /* computed from templates; no body walk */
     bool wants_devio = false;   /* register the DEVIO record callback   */
-    bool wants_wp_events = false; /* register the WP-events summary sink */
 };
 static MetricWalkSpec metric_walk_spec(Metric m)
 {
@@ -6020,7 +6065,9 @@ static MetricWalkSpec metric_walk_spec(Metric m)
         case Metric::UserKernel:
             s.bb_fn = handle_user_kernel_bb; break;
         case Metric::FaultRate:
-            s.bb_fn = handle_fault_rate_bb; break;
+            /* fault_depth is the CST_FID_BB_FAULT_DEPTH block cell:
+             * readable only when the CP deltas are applied. */
+            s.bb_fn = handle_fault_rate_bb; s.cp_fields = true; break;
         case Metric::ThreadSwitch:
             s.bb_fn = handle_thread_switch_bb; break;
         case Metric::AsidTimeline:
@@ -6030,17 +6077,18 @@ static MetricWalkSpec metric_walk_spec(Metric m)
         case Metric::DevioLba:
             s.bb_fn = handle_position_bb; s.wants_devio = true; break;
         case Metric::WpTermination:
-            /* Structure (not Skip): the classifier needs each chain's
-             * wrong-path instruction count to tell a chain that spent
-             * its wpdepth budget from one a stuck-bail valve cut short,
-             * and the identity of the block it stopped at to decide
-             * whether the front end refused on a privilege crossing.
-             * Both live only in the chain section's per-block
-             * templates.  handle_wp_term_bb bins on the correct path
-             * exactly as handle_position_bb does, so walking the
-             * wrong-path blocks changes no binning. */
-            s.bb_fn = handle_wp_term_bb; s.wants_wp_events = true;
-            s.wp_mode = Wp::Structure; break;
+            /* Fields (not Structure): the chain's events now ride each
+             * wrong-path block's own CST_FID_BB_FLAGS records, which
+             * are readable only when the WP field deltas are applied.
+             * The classifier also needs each chain's realised
+             * instruction count (the per-block executed ranges) to
+             * tell a chain that spent its wpdepth budget from one a
+             * stuck-bail valve cut short.  handle_wp_term_bb bins on
+             * the correct path exactly as handle_position_bb does, so
+             * walking the wrong-path blocks changes no binning. */
+            s.bb_fn = handle_wp_term_bb;
+            s.cp_fields = true;
+            s.wp_mode = Wp::Fields; break;
         case Metric::WsDivergence:
             s.bb_fn = handle_ws_divergence_bb; s.cp_fields = true; break;
         case Metric::TranslationChurn:
@@ -6274,12 +6322,6 @@ static TraceResult process_trace(const char *path, const Options &opts)
                 handle_devio_event(ctx, d);
             });
         }
-        if (spec.wants_wp_events) {
-            walker.set_wp_events_callback(
-                [&](const cst::BodyWalker::WpEventsSummary &es) {
-                    handle_wp_events(ctx, es);
-                });
-        }
         walker.walk_bb(cp_fields, wp_mode,
                        [&](const cst::BodyWalker::BB &bb) {
                            bb_fn(ctx, bb);
@@ -6443,10 +6485,9 @@ process_trace_multi(const char *path, const Options &opts,
     if (any_body) {
         auto body_stream = cst::body_stream_open(*cf);
         cst::BodyWalker walker(h, templates, by_id, body_stream->reader());
-        bool any_devio = false, any_wp_events = false;
+        bool any_devio = false;
         for (const auto &sp : specs) {
-            any_devio     = any_devio     || sp.wants_devio;
-            any_wp_events = any_wp_events || sp.wants_wp_events;
+            any_devio = any_devio || sp.wants_devio;
         }
         if (any_devio) {
             walker.set_devio_callback([&](const cst::DecodedDevio &d) {
@@ -6456,16 +6497,6 @@ process_trace_multi(const char *path, const Options &opts,
                     }
                 }
             });
-        }
-        if (any_wp_events) {
-            walker.set_wp_events_callback(
-                [&](const cst::BodyWalker::WpEventsSummary &es) {
-                    for (size_t i = 0; i < ctxs.size(); i++) {
-                        if (specs[i].wants_wp_events) {
-                            handle_wp_events(*ctxs[i], es);
-                        }
-                    }
-                });
         }
         walker.walk_bb(cp_fields, wp_mode,
                        [&](const cst::BodyWalker::BB &bb) {

@@ -77,8 +77,7 @@ void parse_encoding_maps(Reader &r, EncodingMaps *out)
         else if (name == "header_flag")    target = &out->header_flag;
         else if (name == "insn_flag")      target = &out->insn_flag;
         else if (name == "body_tag")       target = &out->body_tag;
-        else if (name == "wp_event_flag")  target = &out->wp_event_flag;
-        else if (name == "wp_chain_flag")  target = &out->wp_chain_flag;
+        else if (name == "bb_flag")        target = &out->bb_flag;
         else if (name == "metaflags")      target = &out->metaflags;
         else if (name == "dep_block_flag") target = &out->dep_block_flag;
         else if (name == "mem_access_pattern")
@@ -266,6 +265,42 @@ static void resolve_optional(const std::unordered_map<uint64_t,
     *out = 0xFFFFu;   /* absent: out-of-range sentinel */
 }
 
+/* Required field_id resolution (uint16_t): the five CST_FID_BB_* names
+ * are structurally required in this epoch — without them a reader
+ * cannot decode an entry's executed range and would silently over-claim
+ * instructions on every partial entry.  Fail at map resolution. */
+static void resolve_required_fid(const std::unordered_map<uint64_t,
+                                                          std::string> &m,
+                                 const char *want, uint16_t *out)
+{
+    for (const auto &kv : m) {
+        if (kv.second == want) {
+            *out = (uint16_t)kv.first;
+            return;
+        }
+    }
+    throw std::runtime_error(std::string("encoding map 'field_id' missing "
+                                         "structurally-required name '")
+                             + want + "' (block-level family, format §5.7)");
+}
+
+/* Required bit-mask resolution into a u64 (bb_flag map: the five
+ * CST_BB_FLAG_* names are this epoch's complete, required vocabulary). */
+static void resolve_required_mask64(const std::unordered_map<uint64_t,
+                                                             std::string> &m,
+                                    const char *map_name, const char *want,
+                                    uint64_t *out)
+{
+    for (const auto &kv : m) {
+        if (kv.second == want) {
+            *out = kv.first;
+            return;
+        }
+    }
+    throw std::runtime_error(std::string("encoding map '") + map_name
+                             + "' missing well-known name '" + want + "'");
+}
+
 /* Optional bit-mask resolution: a flag bit added after a trace was
  * written is simply absent from that trace's map, and resolves to 0 so
  * the bit never tests set.  (resolve_optional's 0xFFFF sentinel is for
@@ -367,6 +402,21 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
                      &ids->fid_branch_taken);
     resolve_optional(maps.field_id, "CST_FID_BRANCH_TARGET",
                      &ids->fid_branch_target);
+    /* Block-level family (BLOCK_POS records, §5.7): the one exception to
+     * Step 3.3's "no field_id name is structurally required".  Every
+     * entry's executed range decodes through these cells, so a trace
+     * that cannot name them cannot be decoded honestly — reject here,
+     * at map resolution, not deep in the body walk. */
+    resolve_required_fid(maps.field_id, "CST_FID_BB_START",
+                         &ids->fid_bb_start);
+    resolve_required_fid(maps.field_id, "CST_FID_BB_STOP",
+                         &ids->fid_bb_stop);
+    resolve_required_fid(maps.field_id, "CST_FID_BB_FLAGS",
+                         &ids->fid_bb_flags);
+    resolve_required_fid(maps.field_id, "CST_FID_BB_FAULT_DEPTH",
+                         &ids->fid_bb_fault_depth);
+    resolve_required_fid(maps.field_id, "CST_FID_BB_FAULT_INSN",
+                         &ids->fid_bb_fault_insn);
 
     /* insn_flag (bit masks) */
     resolve_one(maps.insn_flag, "insn_flag", "CST_INSN_FLAG_BRANCH_COND",
@@ -409,16 +459,23 @@ static void resolve_ids(const EncodingMaps &maps, ResolvedIds *ids)
     resolve_optional_mask(maps.header_flag, "CST_FLAG_PHYSADDR",
                           &ids->flag_physaddr);
 
-    /* wp_event_flag (bit masks) */
-    resolve_one(maps.wp_event_flag, "wp_event_flag",
-                "CST_WP_EVENT_TRANSLATION_UNAVAIL",
-                &ids->wp_event_translation_unavail);
-    resolve_one(maps.wp_event_flag, "wp_event_flag", "CST_WP_EVENT_FAULT",
-                &ids->wp_event_fault);
-
-    /* wp_chain_flag (bit mask inside the WP chain section's leading ULEB) */
-    resolve_one(maps.wp_chain_flag, "wp_chain_flag", "CST_WP_CHAIN_HAS_EVENTS",
-                &ids->wp_chain_has_events);
+    /* bb_flag (bit masks inside the CST_FID_BB_FLAGS block cell): the
+     * five names are this epoch's complete vocabulary, all required. */
+    resolve_required_mask64(maps.bb_flag, "bb_flag",
+                            "CST_BB_FLAG_SYNTHETIC_FAULT",
+                            &ids->bb_flag_synthetic_fault);
+    resolve_required_mask64(maps.bb_flag, "bb_flag",
+                            "CST_BB_FLAG_TRANSLATION_UNAVAIL",
+                            &ids->bb_flag_translation_unavail);
+    resolve_required_mask64(maps.bb_flag, "bb_flag",
+                            "CST_BB_FLAG_WP_FIRST_TARGET_UNAVAIL",
+                            &ids->bb_flag_wp_first_target_unavail);
+    resolve_required_mask64(maps.bb_flag, "bb_flag",
+                            "CST_BB_FLAG_THREAD_END",
+                            &ids->bb_flag_thread_end);
+    resolve_required_mask64(maps.bb_flag, "bb_flag",
+                            "CST_BB_FLAG_BRANCH_UNRESOLVED",
+                            &ids->bb_flag_branch_unresolved);
 
     /* metaflags (bit positions inside the FID_METAFLAGS byte) */
     resolve_one(maps.metaflags, "metaflags", "CST_METAFLAGS_Z",
@@ -934,9 +991,19 @@ std::unique_ptr<BodyStream> body_stream_open(const CstFile &cf)
     Reader reader(std::move(src));
 
     /* Verify leading magic and strip it from the consumer-visible
-     * record stream. */
+     * record stream.  A different-epoch CST magic ("CST" + epoch byte)
+     * is named explicitly: the magic is the format-epoch identifier and
+     * this reader implements exactly one epoch. */
     uint32_t lead = reader.u32_le();
     if (lead != CST_MAGIC) {
+        if ((lead & 0x00FFFFFFu) == (CST_MAGIC & 0x00FFFFFFu)) {
+            char msg[96];
+            std::snprintf(msg, sizeof(msg),
+                          "body member: epoch 0x%02X trace; this decoder "
+                          "reads epoch 0x%02X only",
+                          (unsigned)(lead >> 24), (unsigned)(CST_MAGIC >> 24));
+            throw std::runtime_error(msg);
+        }
         throw std::runtime_error("body member: bad leading magic");
     }
     bs->reader_ = std::move(reader);
@@ -978,6 +1045,15 @@ Header parse_header(MemberView view,
     Reader r(view.data, 0, view.size);
     h.magic = r.u32_le();
     if (h.magic != CST_MAGIC) {
+        if ((h.magic & 0x00FFFFFFu) == (CST_MAGIC & 0x00FFFFFFu)) {
+            char msg[96];
+            std::snprintf(msg, sizeof(msg),
+                          "header: epoch 0x%02X trace; this decoder reads "
+                          "epoch 0x%02X only",
+                          (unsigned)(h.magic >> 24),
+                          (unsigned)(CST_MAGIC >> 24));
+            throw std::runtime_error(msg);
+        }
         throw std::runtime_error("Bad header magic");
     }
     h.format_version = (uint8_t)((h.magic >> 24) & 0xFF);

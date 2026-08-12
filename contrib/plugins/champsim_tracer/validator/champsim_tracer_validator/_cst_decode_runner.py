@@ -181,18 +181,24 @@ _INSN_RE = re.compile(
 )
 _ENTRY_HEAD_RE = re.compile(
     r"^ENTRY (\d+) thread=(\d+)(?: asid=(\d+))?(?: switch=(\d))?"
-    r"(?: fault_depth=(\d+))?(?: fault_at=([\d,]+))? template=BB(\d+)"
+    # Executed range (epoch 0x1E, format spec 4.2a): present only on a
+    # PARTIAL entry; the whole-block common line stays byte-identical.
+    r"(?: fault_depth=(\d+))?(?: range=(\d+)\.\.(\d+))? template=BB(\d+)"
     # Terminal-branch direction/target (CST_FID_BRANCH_*), decoded directly
-    # per branch-terminated entry.  The strand-sequentiality check reads the
-    # RESOLVED successor from here rather than re-deriving the possible
-    # successor set from the template, which is what lets it tell a genuine
-    # resumption from a coincidental fall-through match.
-    r"(?: branch=(taken|not-taken) target=0x([0-9a-f]+))?$"
+    # per branch-terminated entry.  ABSENT when the entry's range does not
+    # reach the branch, when the writer flagged CST_BB_FLAG_BRANCH_UNRESOLVED,
+    # or when the slot was never observed — absence IS "no outcome", never a
+    # value to be defaulted.
+    r"(?: branch=(taken|not-taken) target=0x([0-9a-f]+))?"
+    r"(?: thread_end=1)?$"
 )
 _WP_HEAD_RE = re.compile(
     r"^  wp\[(\d+)\] template=BB(\d+) n_insns=(\d+)"
-    # Terminal-branch direction/target (CST_FID_BRANCH_*), now carried on WP
-    # blocks too.  Non-capturing so group indices 1..3 are unchanged.
+    # Executed range of the speculative block itself (spec 4.3): present
+    # only when partial; groups 4/5.
+    r"(?: range=(\d+)\.\.(\d+))?"
+    # Terminal-branch direction/target (CST_FID_BRANCH_*), carried on WP
+    # blocks too.  Non-capturing so group indices 1..5 are unchanged.
     r"(?: branch=(?:taken|not-taken) target=0x[0-9a-f]+)?$"
 )
 _LOAD_RE  = re.compile(
@@ -571,13 +577,16 @@ def _iter_body(lines: list[str], i: int,
         asid_index = int(m.group(3)) if m.group(3) is not None else 0
         thread_switched = m.group(4) == "1"
         fault_depth = int(m.group(5)) if m.group(5) is not None else 0
-        fault_anchors = ([int(x) for x in m.group(6).split(",")]
-                         if m.group(6) else [])
-        template_id = int(m.group(7))
-        branch_taken = (None if m.group(8) is None
-                        else m.group(8) == "taken")
-        branch_target = (None if m.group(9) is None
-                         else int(m.group(9), 16))
+        # Executed range [bb_start, bb_stop) — printed only when partial,
+        # so None here means "whole block" (resolved after the template
+        # is known by consumers that need the absolute stop).
+        bb_start = int(m.group(6)) if m.group(6) is not None else 0
+        bb_stop = int(m.group(7)) if m.group(7) is not None else None
+        template_id = int(m.group(8))
+        branch_taken = (None if m.group(9) is None
+                        else m.group(9) == "taken")
+        branch_target = (None if m.group(10) is None
+                         else int(m.group(10), 16))
         i += 1
         # CP block: indented "cp:" header followed by observations.
         cp_dyn: list[DynParam] = []
@@ -605,6 +614,10 @@ def _iter_body(lines: list[str], i: int,
                 "index": int(mw.group(1)),
                 "template_id": int(mw.group(2)),
                 "n_insns": int(mw.group(3)),
+                "bb_start": (int(mw.group(4))
+                             if mw.group(4) is not None else 0),
+                "bb_stop": (int(mw.group(5))
+                            if mw.group(5) is not None else None),
                 "dyn_params": [],
                 "reg_snaps": [],
                 "metaflags": [],
@@ -650,7 +663,8 @@ def _iter_body(lines: list[str], i: int,
             "branch_taken": branch_taken,
             "branch_target": branch_target,
             "fault_depth": fault_depth,
-            "fault_anchors": fault_anchors,
+            "bb_start": bb_start,
+            "bb_stop": bb_stop,
             "dyn_params": cp_dyn,
             "reg_snaps": cp_snaps,
             "metaflags": cp_mflags,

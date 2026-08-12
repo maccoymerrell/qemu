@@ -1582,10 +1582,18 @@ void emit_disasm_file_header(FILE *out, const cst::Header &h,
 void emit_bb_header(FILE *out, const cst::DecodedEntry &e,
                     const cst::Template &t)
 {
-    char fd[40];
+    char fd[72];
+    int fdn = 0;
     fd[0] = '\0';
     if (e.fault_depth > 0) {
-        std::snprintf(fd, sizeof(fd), " fault_depth=%u", e.fault_depth);
+        fdn += std::snprintf(fd + fdn, sizeof(fd) - fdn,
+                             " fault_depth=%u", e.fault_depth);
+    }
+    /* Executed range (§4.2a): annotated only when partial, so the
+     * whole-block common header stays unchanged. */
+    if (e.bb_start > 0 || e.bb_stop < t.insns.size()) {
+        fdn += std::snprintf(fd + fdn, sizeof(fd) - fdn,
+                             " range=[%u,%u)", e.bb_start, e.bb_stop);
     }
     /* Terminal-branch direction/target, decoded directly from the
      * CST_FID_BRANCH_* singletons (no successor look-ahead). */
@@ -2104,7 +2112,7 @@ void emit_legacy_encodings(FILE *out, const cst::Header &h)
         {"opcode",        &h.maps.opcode},
         {"profile_flag",  &h.maps.profile_flag},
         {"reg",           &h.maps.reg},
-        {"wp_event_flag", &h.maps.wp_event_flag},
+        {"bb_flag",       &h.maps.bb_flag},
     };
     for (auto &mr : refs) emit_legacy_encoding_map(out, mr.name, *mr.m);
 
@@ -2360,14 +2368,16 @@ std::string compute_legacy_wp_status(const cst::WPEntry &wp)
     return out;
 }
 
-/* One BODY ENTRY block. */
+/* One BODY ENTRY block.  @cp_n_insns is the entry template's insn
+ * count (0 when the template is unknown), used to keep the whole-block
+ * common line byte-identical: `range=` appears only on a partial entry
+ * (§4.2a). */
 void emit_legacy_entry(FILE *out, const cst::Header &h,
-                       const cst::DecodedEntry &e)
+                       const cst::DecodedEntry &e, uint32_t cp_n_insns)
 {
     const char *sw = e.thread_switched ? " switch=1" : "";
-    /* Exception-nesting depth + faulting-insn anchors (CST_FLAG_FAULT traces),
-     * emitted only when present so normal/user-mode entries stay
-     * byte-identical. */
+    /* Exception-nesting depth + executed range, emitted only when
+     * present / partial so ordinary entries stay byte-identical. */
     char fd[160];
     int n = 0;
     fd[0] = '\0';
@@ -2375,25 +2385,27 @@ void emit_legacy_entry(FILE *out, const cst::Header &h,
         n += std::snprintf(fd + n, sizeof(fd) - n, " fault_depth=%u",
                            e.fault_depth);
     }
-    if (!e.fault_anchors.empty()) {
-        n += std::snprintf(fd + n, sizeof(fd) - n, " fault_at=");
-        for (size_t i = 0; i < e.fault_anchors.size() &&
-                           n < (int)sizeof(fd) - 12; i++) {
-            n += std::snprintf(fd + n, sizeof(fd) - n, "%s%u",
-                               i ? "," : "", e.fault_anchors[i]);
-        }
+    if (cp_n_insns && (e.bb_start > 0 || e.bb_stop < cp_n_insns)) {
+        n += std::snprintf(fd + n, sizeof(fd) - n, " range=%u..%u",
+                           e.bb_start, e.bb_stop);
     }
     /* Terminal-branch direction/target (CST_FID_BRANCH_*), decoded directly
-     * per entry.  Suffix, so a non-branch entry keeps the historical line. */
-    char br[48];
+     * per entry.  Suffix, so a non-branch entry keeps the historical line.
+     * branch.valid is false when the entry's range does not reach the
+     * branch, when the writer flagged the outcome unresolved, or when
+     * the slot was never observed — the legacy text then simply carries
+     * no branch=, which IS the statement "no outcome on this entry". */
+    char br[64];
     br[0] = '\0';
     if (e.branch.valid) {
         std::snprintf(br, sizeof(br), " branch=%s target=0x%" PRIx64,
                       e.branch.taken ? "taken" : "not-taken",
                       e.branch.target);
     }
-    std::fprintf(out, "ENTRY %04u thread=%u asid=%u%s%s template=BB%u%s\n",
-                 e.seq_num, e.thread_id, e.asid, sw, fd, e.template_id, br);
+    const char *te = e.thread_end ? " thread_end=1" : "";
+    std::fprintf(out, "ENTRY %04u thread=%u asid=%u%s%s template=BB%u%s%s\n",
+                 e.seq_num, e.thread_id, e.asid, sw, fd, e.template_id, br,
+                 te);
     std::fprintf(out, "  cp:\n");
     emit_legacy_observations(out, "    ", h, e.dyn_params, e.reg_snaps,
                              e.metaflags, e.lane_masks);
@@ -2409,8 +2421,14 @@ void emit_legacy_entry(FILE *out, const cst::Header &h,
                           wp.branch.taken ? "taken" : "not-taken",
                           wp.branch.target);
         }
-        std::fprintf(out, "  wp[%u] template=BB%u n_insns=%u%s\n",
-                     wp.index, wp.template_id, wp.n_insns, wbr);
+        char wrange[32];
+        wrange[0] = '\0';
+        if (wp.n_insns && (wp.bb_start > 0 || wp.bb_stop < wp.n_insns)) {
+            std::snprintf(wrange, sizeof(wrange), " range=%u..%u",
+                          wp.bb_start, wp.bb_stop);
+        }
+        std::fprintf(out, "  wp[%u] template=BB%u n_insns=%u%s%s\n",
+                     wp.index, wp.template_id, wp.n_insns, wrange, wbr);
         std::string status = compute_legacy_wp_status(wp);
         if (!status.empty()) {
             std::fprintf(out, "    status: %s\n", status.c_str());
@@ -2465,14 +2483,18 @@ void render_legacy(FILE *out, const cst::Header &h,
                    const std::unordered_map<uint32_t, size_t> &by_id,
                    cst::BodyWalker &body)
 {
-    (void)by_id;
     emit_legacy_meta(out, h);
     emit_legacy_encodings(out, h);
     emit_legacy_templates(out, h, templates);
 
     std::fprintf(out, "BODY\n----\n");
     body.walk(
-        [&](const cst::DecodedEntry &e)   { emit_legacy_entry(out, h, e); },
+        [&](const cst::DecodedEntry &e)   {
+            auto it = by_id.find(e.template_id);
+            uint32_t n = (it != by_id.end())
+                ? (uint32_t)templates[it->second].insns.size() : 0;
+            emit_legacy_entry(out, h, e, n);
+        },
         [&](const cst::DecodedRegfile &rf){ emit_legacy_regfile(out, h, rf); });
 
     emit_legacy_body_stats(out, body.stats());
@@ -2684,25 +2706,29 @@ int run_body_render(const Options &opts, const cst::Header &h,
  * (a fault-depth step, the successor's fault anchors, a thread switch, a
  * privilege-domain gap, or both endpoints being inside a kernel excursion) —
  * and the deferred target must then be matched by a later entry of the same
- * context, at its start_pc or at one of its fault anchors.  That resumption
- * match is a STRONGER statement than successor adjacency: it verifies the
- * encoded target against the instruction the interrupted context actually
- * re-entered.  A mismatch with NO diversion signal is an error, and every
- * deferral is tallied by signal with its resumed / corroborated /
- * never-resumed split, so a regression cannot hide inside the diversion
- * accounting.
+ * context, at its SINGULAR resume PC — insn_pcs[bb_start], which is start_pc
+ * on an entry that began its block (§5.6).  That resumption match is a
+ * STRONGER statement than successor adjacency: it verifies the encoded
+ * target against the one instruction the interrupted context actually
+ * re-entered, an equality against one PC rather than a membership test.  A
+ * mismatch with NO diversion signal is an error, and every deferral is
+ * tallied by signal with its resumed / corroborated / never-resumed split,
+ * so a regression cannot hide inside the diversion accounting.
  *
- * A fault-merged entry is checked from the other side too, which is what
- * keeps the deferral path honest: control entered such a block once at its
- * start_pc and re-entered it once per anchor, so every one of those PCs must
- * be the encoded target of some branch of that context.  A target moved on
- * the wire leaves one of them unnamed and fails, deferred or not.
+ * A continuation entry (bb_start > 0, §4.2a) is checked from the other side
+ * too, which is what keeps the deferral path honest: unless its prefix
+ * stretch was its immediate predecessor in the context, the excursion
+ * returned through a branch, and that branch must have encoded this entry's
+ * resume PC.  A target moved on the wire leaves it unnamed and fails,
+ * deferred or not.  The continuation must also continue its OWN invocation:
+ * its bb_start must equal the open stretch's bb_stop — a non-contiguous
+ * continuation is a wire defect (§4.2a) and fails the check.
  *
  * WP chain blocks are cross-checked in-chain: a block's decoded target/
  * direction must match the NEXT chain block's start_pc (the whole excursion
  * is one CP entry's payload, so the successor is in-chain with no lookahead).
  * The chain's last block has no in-chain successor and is left unchecked; a
- * block the wp_events section marks as faulting or untranslatable ends its
+ * block whose CST_FID_BB_FLAGS mark it faulting or untranslatable ends its
  * strand, so a mismatch there is tallied as a diversion rather than an error.
  *
  * A syscall-class block is the one exception to that diversion licence, and is
@@ -2723,7 +2749,7 @@ namespace {
 enum DivCat {
     DIV_EXC_ENTRY = 0,   /* fault_depth rose: handler entry               */
     DIV_EXC_RETURN,      /* fault_depth fell: excursion exit              */
-    DIV_MERGED_RESUME,   /* successor is a fault-merged BB (has anchors)  */
+    DIV_RANGE_RESUME,    /* successor entry has bb_start > 0 (§4.2a)      */
     DIV_THREAD_HANDOFF,  /* successor is marked thread_switched           */
     DIV_PRIV_GAP,        /* privilege domain changed: gated-out work      */
     DIV_KERNEL_EXC,      /* both endpoints inside a kernel excursion      */
@@ -2734,7 +2760,7 @@ enum DivCat {
 const char *const kDivName[DIV_N] = {
     "excursion entry (fault_depth rose)",
     "excursion return (fault_depth fell)",
-    "merged faulting BB (successor carries fault anchors)",
+    "range continuation (successor entry has bb_start > 0)",
     "guest-thread handoff (successor is a thread switch)",
     "privilege-domain gap (kernel/user work not in the trace)",
     "interleaved kernel-excursion strand",
@@ -2761,12 +2787,18 @@ struct PrevBr {
     uint32_t template_id  = 0;
     uint32_t seq          = 0;
     uint32_t fault_depth  = 0;
+    uint32_t bb_stop      = 0;   /* declared range's exclusive stop */
     bool     is_system    = false;
 };
 
 struct CtxState {
     PrevBr                      prev;
     std::vector<DeferredBranch> open;
+    /* Open partial invocations (§4.2a): template -> the bb_start its
+     * continuation MUST declare (the predecessor's bb_stop).  A
+     * continuation whose bb_start is neither 0 nor this value is a wire
+     * defect, not a licensed shorthand. */
+    std::unordered_map<uint32_t, uint32_t> open_range;
 };
 
 /* Ceiling on a context's outstanding deferrals.  A well-formed trace keeps
@@ -2805,6 +2837,10 @@ int run_verify_branch(const Options &opts, const cst::Header &h,
     uint64_t n_wp_syscall_fallthrough_mism = 0;
     uint64_t n_wp_diverted = 0;
     uint64_t n_resume_unnamed = 0;
+    /* Non-contiguous continuation (§4.2a): an entry whose bb_start is
+     * neither 0 nor its predecessor stretch's bb_stop.  A wire defect,
+     * not a licensed shorthand. */
+    uint64_t n_range_break = 0;
     std::string examples;
     int ex_count = 0;
 
@@ -2819,18 +2855,16 @@ int run_verify_branch(const Options &opts, const cst::Header &h,
         uint64_t ctx = ((uint64_t)e.thread_id << 32) | e.asid;
         CtxState &cs = ctx_by_key[ctx];
 
-        /* The PCs at which this entry picks an instruction stream up: its
-         * architectural start, plus — when it is a fault-merged BB — the PC
-         * of every instruction an excursion returned to (format.rst §4.2a's
-         * fault anchors).  A branch that aimed at any of them was realised
-         * by this entry. */
+        /* Every entry has exactly ONE resume PC (§5.6):
+         * insn_pcs[bb_start], which is start_pc on an entry that began
+         * its block.  The match is an equality against one PC, not a
+         * membership test against a set of alternatives. */
+        uint64_t resume_pc = start_pc;
+        if (t && e.bb_start > 0 && e.bb_start < t->insns.size()) {
+            resume_pc = t->insns[e.bb_start].pc;
+        }
         auto is_resume_pc = [&](uint64_t pc) {
-            if (!t) return false;
-            if (pc == t->start_pc) return true;
-            for (uint32_t a : e.fault_anchors) {
-                if (a < t->insns.size() && t->insns[a].pc == pc) return true;
-            }
-            return false;
+            return t && pc == resume_pc;
         };
 
         /* (1) Resumption pass: every deferred branch of this context whose
@@ -2883,8 +2917,8 @@ int run_verify_branch(const Options &opts, const cst::Header &h,
                 cat = DIV_EXC_ENTRY;
             } else if (e.fault_depth < p.fault_depth) {
                 cat = DIV_EXC_RETURN;
-            } else if (!e.fault_anchors.empty()) {
-                cat = DIV_MERGED_RESUME;
+            } else if (e.bb_start > 0) {
+                cat = DIV_RANGE_RESUME;
             } else if (e.thread_switched) {
                 cat = DIV_THREAD_HANDOFF;
             } else if (t && !t->insns.empty() &&
@@ -2929,49 +2963,68 @@ int run_verify_branch(const Options &opts, const cst::Header &h,
             }
         }
 
-        /* (3) Merged-BB resumption invariant.  A fault-merged entry
-         * (format.rst §4.2a) is emitted whole, keyed on its architectural
-         * start, with one anchor per excursion it took: control entered it
-         * once at start_pc and re-entered it once at each anchor.  Every one
-         * of those PCs must therefore be NAMED by a branch of this context —
-         * the immediate predecessor, or one of the branches deferred across
-         * the excursions.  An unnamed resume PC means some branch that
-         * reached this BB encoded a target that is not where it arrived, so
-         * it is a hard error, not a diversion. */
-        if (!e.fault_anchors.empty() && t) {
-            auto was_named = [&](uint64_t pc) {
-                for (uint64_t n : named) if (n == pc) return true;
-                return false;
-            };
-            for (size_t k = 0; k <= e.fault_anchors.size(); k++) {
-                uint64_t pc;
-                if (k == 0) {
-                    /* start_pc can only be required of a context that has
-                     * already shown a branch outcome: the context's first
-                     * entry has no predecessor, and a page-split
-                     * continuation carries no branch FIDs, so neither can
-                     * name where this block was entered. */
-                    if (!cs.prev.seen || !cs.prev.valid) continue;
-                    pc = t->start_pc;
-                } else {
-                    uint32_t a = e.fault_anchors[k - 1];
-                    if (a >= t->insns.size()) continue;
-                    pc = t->insns[a].pc;
+        /* (3) Range-continuation invariants (§4.2a).  An entry with
+         * bb_start > 0 continues its OWN invocation: within this
+         * context, an earlier stretch of the same template must have
+         * declared bb_stop == this entry's bb_start — one index, named
+         * twice, from the two sides.  Anything else is a wire defect.
+         *
+         * A continuation is also checked from the other side (§5.6):
+         * unless the prefix stretch was its immediate predecessor in
+         * this context (the faults=0 shape, nothing between the two
+         * ranges), the excursion returned through a branch, and that
+         * branch's encoded target must have NAMED this entry's resume
+         * PC — directly (settled a deferral) or as the immediate
+         * predecessor's target. */
+        if (t && e.bb_start > 0) {
+            auto oit = cs.open_range.find(e.template_id);
+            if (oit == cs.open_range.end() || oit->second != e.bb_start) {
+                n_range_break++;
+                if (ex_count < 20) {
+                    char buf[320];
+                    std::snprintf(buf, sizeof(buf),
+                        "  tid=%u asid=%u seq=%u BB%u: continuation declares"
+                        " bb_start=%u but the open stretch %s"
+                        " [RANGE BREAK]\n",
+                        e.thread_id, e.asid, e.seq_num, e.template_id,
+                        e.bb_start,
+                        oit == cs.open_range.end()
+                            ? "does not exist"
+                            : ("stopped at a different index"));
+                    examples += buf;
+                    ex_count++;
                 }
-                if (was_named(pc)) continue;
+            }
+            bool prefix_adjacent = cs.prev.seen &&
+                cs.prev.template_id == e.template_id &&
+                cs.prev.bb_stop == e.bb_start;
+            bool was_named = false;
+            for (uint64_t nm : named) {
+                if (nm == resume_pc) { was_named = true; break; }
+            }
+            if (!prefix_adjacent && cs.prev.seen && cs.prev.valid &&
+                !was_named && e.bb_start < t->insns.size()) {
                 n_resume_unnamed++;
                 if (ex_count < 20) {
                     char buf[320];
                     std::snprintf(buf, sizeof(buf),
-                        "  tid=%u asid=%u seq=%u BB%u: merged-BB resume pc="
-                        "0x%llx (%s) is not the encoded target of any branch"
-                        " in this context [UNNAMED RESUME]\n",
+                        "  tid=%u asid=%u seq=%u BB%u: continuation resume"
+                        " pc=0x%llx (insn_pcs[%u]) is not the encoded target"
+                        " of any branch in this context [UNNAMED RESUME]\n",
                         e.thread_id, e.asid, e.seq_num, e.template_id,
-                        (unsigned long long)pc,
-                        k == 0 ? "start_pc" : "fault anchor");
+                        (unsigned long long)resume_pc, e.bb_start);
                     examples += buf;
                     ex_count++;
                 }
+            }
+        }
+        /* Track the open stretch: a partial stop leaves the invocation
+         * open at bb_stop; reaching num_insns closes it. */
+        if (t) {
+            if (e.bb_stop < t->insns.size()) {
+                cs.open_range[e.template_id] = e.bb_stop;
+            } else {
+                cs.open_range.erase(e.template_id);
             }
         }
 
@@ -2984,6 +3037,7 @@ int run_verify_branch(const Options &opts, const cst::Header &h,
         np.template_id  = e.template_id;
         np.seq          = e.seq_num;
         np.fault_depth  = e.fault_depth;
+        np.bb_stop      = e.bb_stop;
         np.is_system    = (t && !t->insns.empty()) ? t->insns[0].is_system
                                                    : false;
         if (t) {
@@ -3078,18 +3132,20 @@ int run_verify_branch(const Options &opts, const cst::Header &h,
         "%llu non-branch; cross-checked %llu against the architectural "
         "continuation\n"
         "  next entry carried the target: %llu"
-        " (at a merged BB's fault anchor: %llu)\n"
+        " (at a continuation's mid-block resume PC: %llu)\n"
         "  deferred across a diversion:   %llu\n"
         "  target mismatches: %llu\n"
         "  taken  mismatches: %llu\n"
-        "  unnamed merged-BB resume points: %llu\n",
+        "  unnamed continuation resume points: %llu\n"
+        "  non-contiguous continuations (range breaks): %llu\n",
         (unsigned long long)n_branch, (unsigned long long)n_nonbranch,
         (unsigned long long)n_checked,
         (unsigned long long)n_immediate, (unsigned long long)n_at_anchor,
         (unsigned long long)n_div,
         (unsigned long long)n_target_mism,
         (unsigned long long)n_taken_mism,
-        (unsigned long long)n_resume_unnamed);
+        (unsigned long long)n_resume_unnamed,
+        (unsigned long long)n_range_break);
     if (n_div) {
         /* Per-signal accounting for every deferral, so a suppression can
          * never hide a regression: each line names the signal the trace
@@ -3132,7 +3188,7 @@ int run_verify_branch(const Options &opts, const cst::Header &h,
         std::fprintf(stdout, "first mismatches:\n%s", examples.c_str());
     }
     bool branch_ok = (n_target_mism == 0 && n_taken_mism == 0 &&
-                      n_resume_unnamed == 0 &&
+                      n_resume_unnamed == 0 && n_range_break == 0 &&
                       n_wp_target_mism == 0 && n_wp_taken_mism == 0 &&
                       n_wp_syscall_fallthrough_mism == 0);
     /*

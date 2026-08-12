@@ -534,27 +534,21 @@ void dump_field_delta_section(FILE *out, const Header &h, Reader &b,
     }
 }
 
-/* WP chain (Step 6.8) + WP events (Step 6.9) sections, present only
- * under CST_FLAG_WP.  wp_events_section is itself conditional on the
- * chain header's CST_WP_CHAIN_HAS_EVENTS bit — entirely absent from the
- * wire (no length prefix) when the chain produced no event. */
+/* WP chain section (Step 6.8), present only under CST_FLAG_WP.  The
+ * leading ULEB is the bare block count — nothing is packed into it —
+ * and each block's events ride its own wp_delta_section as block-level
+ * records at its BLOCK_POS (§4.4), printed by
+ * dump_field_delta_section like every other record. */
 void dump_wp_sections(FILE *out, const Header &h, Reader &b, int depth)
 {
-    const ResolvedIds &ids = h.ids;
-
     size_t coff = b.consumed();
     uint64_t chain_payload = b.uleb();
     size_t chain_end = b.consumed() + chain_payload;
     emitf(out, b, coff, depth, "wp_chain_section  len=%" PRIu64 "  [Step 6.8]",
           chain_payload);
     size_t noff = b.consumed();
-    uint64_t chain_hdr = b.uleb();
-    uint64_t num_wp = chain_hdr >> 1;
-    bool has_wp_events = (chain_hdr & ids.wp_chain_has_events) != 0;
-    emitf(out, b, noff, depth + 1,
-          "chain_hdr=%" PRIu64 " ->num_wp=%" PRIu64 " (%s)",
-          chain_hdr, num_wp,
-          flag_bits(h.maps.wp_chain_flag, chain_hdr & 1).c_str());
+    uint64_t num_wp = b.uleb();
+    emitf(out, b, noff, depth + 1, "num_wp=%" PRIu64, num_wp);
     int32_t wp_tid = 0;
     for (uint64_t w = 0; w < num_wp; w++) {
         size_t woff = b.consumed();
@@ -568,75 +562,12 @@ void dump_wp_sections(FILE *out, const Header &h, Reader &b, int depth)
     if (b.consumed() != chain_end) {
         b.skip_to_consumed(chain_end);
     }
-
-    if (!has_wp_events) {
-        emit_note(out, b.consumed(), depth,
-                  "wp_events_section  absent (CST_WP_CHAIN_HAS_EVENTS clear)"
-                  "  [Step 6.9]");
-        return;
-    }
-
-    size_t eoff = b.consumed();
-    uint64_t ev_payload = b.uleb();
-    size_t ev_end = b.consumed() + ev_payload;
-    emitf(out, b, eoff, depth, "wp_events_section  len=%" PRIu64 "  [Step 6.9]",
-          ev_payload);
-    size_t enoff = b.consumed();
-    uint64_t num_events = b.uleb();
-    emitf(out, b, enoff, depth + 1, "num_events=%" PRIu64, num_events);
-    int32_t prev_idx = -1;
-    for (uint64_t e = 0; e < num_events; e++) {
-        size_t off = b.consumed();
-        uint64_t gap = b.uleb();
-        int32_t wp_index = prev_idx + 1 + (int32_t)gap;
-        prev_idx = wp_index;
-        uint8_t ev_flags = b.u8();
-        std::string extra;
-        if (ev_flags & ids.wp_event_fault) {
-            uint64_t fi = b.uleb();
-            extra = "  fault_insn_index=" + std::to_string(fi);
-        }
-        /* Resolved index past the chain = chain-level event (§4.4):
-         * describes the excursion's unrealized first target. */
-        if (wp_index >= 0 && (uint64_t)wp_index >= num_wp) {
-            extra += "  (chain-level: first fetch unavailable)";
-        }
-        emitf(out, b, off, depth + 1,
-              "event[%" PRIu64 "] pos_gap=%" PRIu64 " ->wp_index=%d"
-              "  ev_flags=0x%02x (%s)%s",
-              e, gap, wp_index, ev_flags,
-              flag_bits(h.maps.wp_event_flag, ev_flags).c_str(),
-              extra.c_str());
-    }
-    if (b.consumed() != ev_end) {
-        b.skip_to_consumed(ev_end);
-    }
-}
-
-/* The optional per-entry synchronous-fault trailer (CST_FLAG_FAULT):
- * exception-nesting depth + faulting-insn anchors, between the CP delta
- * and the WP sections. */
-void dump_fault_trailer(FILE *out, Reader &b, int depth)
-{
-    size_t off = b.consumed();
-    uint64_t depth_val = b.uleb();
-    uint64_t n_anchors = b.uleb();
-    std::string anchors;
-    for (uint64_t a = 0; a < n_anchors; a++) {
-        if (a) anchors += ",";
-        anchors += std::to_string(b.uleb());
-    }
-    emitf(out, b, off, depth,
-          "fault_trailer  fault_depth=%" PRIu64 "  anchors=[%s]"
-          "  [CST_FLAG_FAULT]", depth_val, anchors.c_str());
 }
 
 void dump_body(FILE *out, BodyStream &bs, const Header &h, uint64_t max_entries)
 {
     const ResolvedIds &ids = h.ids;
     const bool have_wp = (h.flags & ids.flag_wp) != 0;
-    const bool have_fault =
-        (ids.flag_fault != 0) && (h.flags & ids.flag_fault) != 0;
     Reader &b = bs.reader();
 
     std::fprintf(out, "\n=== BODY member ===\n");
@@ -702,9 +633,6 @@ void dump_body(FILE *out, BodyStream &bs, const Header &h, uint64_t max_entries)
                   "template_id_delta=%" PRId64 " ->template_id=%d  [Step 6.4]",
                   d, cp_tid);
             dump_field_delta_section(out, h, b, 1, "cp_delta_section");
-            if (have_fault) {
-                dump_fault_trailer(out, b, 1);
-            }
             if (have_wp) {
                 dump_wp_sections(out, h, b, 1);
             }
@@ -721,9 +649,6 @@ void dump_body(FILE *out, BodyStream &bs, const Header &h, uint64_t max_entries)
         if (tag == ids.body_tag_iframe) {
             emitf(out, b, off, 0, "IFRAME  tag=%u  [Step 6.5]", (unsigned)tag);
             dump_field_delta_section(out, h, b, 1, "cp_delta_section");
-            if (have_fault) {
-                dump_fault_trailer(out, b, 1);
-            }
             if (have_wp) {
                 dump_wp_sections(out, h, b, 1);
             }

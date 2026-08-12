@@ -77,19 +77,21 @@ void slot_lut_build(const ResolvedIds &ids,
         }
     }
 
-    /* Cold insn-metadata singletons + the 2 branch-outcome singletons.
-     * Each FID is resolved by name in ResolvedIds; map each into its own
-     * dense slot after the slotted region (fs_phys_offset lands them at
-     * fixed cells 3..11).  The branch pair (fixed cells 10..11) is a purely
-     * internal storage choice; it is simply never written on a trace that
-     * predates the feature (fid_branch_* == 0), so older traces decode
-     * unchanged. */
+    /* Cold insn-metadata singletons + the 2 branch-outcome singletons +
+     * the 5 block-level singletons (CST_FID_BB_*, valid only at
+     * BLOCK_POS but stored like any singleton — the position row they
+     * occupy is the block's own).  Each FID is resolved by name in
+     * ResolvedIds; map each into its own dense slot after the slotted
+     * region (fs_phys_offset lands them at fixed cells 3..16). */
     const uint16_t cold_fids[] = {
         ids.fid_insn_bytes_lo, ids.fid_insn_bytes_hi,
         ids.fid_insn_opcode,   ids.fid_insn_branch_type,
         ids.fid_insn_flags,    ids.fid_insn_immediate,
         ids.fid_insn_size,
         ids.fid_branch_taken,  ids.fid_branch_target,
+        ids.fid_bb_start,      ids.fid_bb_stop,
+        ids.fid_bb_flags,      ids.fid_bb_fault_depth,
+        ids.fid_bb_fault_insn,
     };
     for (size_t i = 0; i < sizeof(cold_fids) / sizeof(cold_fids[0]); i++) {
         if (cold_fids[i] < FID_LUT_SIZE) {
@@ -103,11 +105,12 @@ void slot_lut_build(const ResolvedIds &ids,
  * see the FieldStateBlock comment in cst_decode.h).  Logical slot
  * indices from slot_lut_build decompose as:
  *   [0, 3)                       hot singletons  -> fixed offset 0..2
- *   [3, 3 + FID_SLOT_COUNT*12)   slot-major slotted: k=(L-3)/12,
- *                                f=(L-3)%12 -> family-major physical
+ *   [3, 3 + FID_SLOT_COUNT*14)   slot-major slotted: k=(L-3)/14,
+ *                                f=(L-3)%14 -> family-major physical
  *                                cell FS_FIXED_CELLS + f*max_slots + k
- *   [.., +9)                     cold metadata (7) + branch pair (2)
- *                                -> fixed offsets 3..11
+ *   [.., +14)                    cold metadata (7) + branch pair (2)
+ *                                + block-level family (5)
+ *                                -> fixed offsets 3..16
  */
 /* Slotted families tracked in the decoder's family-major block: the 8 wire
  * slotted families + 4 lane-mask families + 2 physical-page families.  Must
@@ -115,7 +118,8 @@ void slot_lut_build(const ResolvedIds &ids,
  * internal storage layout; the ppage families are simply never written on a
  * non-physaddr trace, so decode of older traces is unaffected). */
 inline constexpr uint32_t FS_N_FAMILIES  = 14;
-inline constexpr uint32_t FS_FIXED_CELLS = 12;   /* 3 hot + 7 cold + 2 branch */
+inline constexpr uint32_t FS_FIXED_CELLS = 17;   /* 3 hot + 7 cold + 2 branch
+                                                  * + 5 block-level (BB_*) */
 inline constexpr uint32_t FS_SLOTTED_BASE = 3;
 inline constexpr uint32_t FS_SLOTTED_END  =
     FS_SLOTTED_BASE + FID_SLOT_COUNT * FS_N_FAMILIES;
@@ -388,6 +392,26 @@ void validate_iframe(const DecodedEntry &prev, const DecodedEntry &iframe)
              " IFRAME=" + std::to_string(iframe.template_id));
     }
 
+    /* Block-level cells (§5.7): the BLOCK_POS row is part of what an
+     * IFRAME reproduces — range, flags and fault depth must all
+     * re-encode to the same values. */
+    if (prev.bb_start != iframe.bb_start || prev.bb_stop != iframe.bb_stop) {
+        fail("executed-range mismatch: ENTRY=[" +
+             std::to_string(prev.bb_start) + ", " +
+             std::to_string(prev.bb_stop) + ") IFRAME=[" +
+             std::to_string(iframe.bb_start) + ", " +
+             std::to_string(iframe.bb_stop) + ")");
+    }
+    if (prev.bb_flags != iframe.bb_flags) {
+        fail("bb_flags mismatch: ENTRY=" + std::to_string(prev.bb_flags) +
+             " IFRAME=" + std::to_string(iframe.bb_flags));
+    }
+    if (prev.fault_depth != iframe.fault_depth) {
+        fail("fault_depth mismatch: ENTRY=" +
+             std::to_string(prev.fault_depth) +
+             " IFRAME=" + std::to_string(iframe.fault_depth));
+    }
+
     compare_observation_triple("cp",
         prev.dyn_params, iframe.dyn_params,
         prev.reg_snaps,  iframe.reg_snaps,
@@ -418,6 +442,13 @@ void validate_iframe(const DecodedEntry &prev, const DecodedEntry &iframe)
             pe.reg_snaps,  ie.reg_snaps,
             pe.metaflags,  ie.metaflags,
             prev.seq_num);
+        if (pe.bb_start != ie.bb_start || pe.bb_stop != ie.bb_stop) {
+            fail(ws + " executed-range mismatch: ENTRY=[" +
+                 std::to_string(pe.bb_start) + ", " +
+                 std::to_string(pe.bb_stop) + ") IFRAME=[" +
+                 std::to_string(ie.bb_start) + ", " +
+                 std::to_string(ie.bb_stop) + ")");
+        }
         if (pe.fault != ie.fault) {
             fail(ws + " fault flag mismatch");
         }
@@ -439,7 +470,7 @@ void validate_iframe(const DecodedEntry &prev, const DecodedEntry &iframe)
 /* Template-default Wide for the FID_INSN_* range: the baseline is the
  * template's static value (so emit-equal-to-template writes no
  * record).  Other ranges default to zero via the caller's Wide{}. */
-Wide insn_field_default(const InsnTemplate &I, uint8_t fid,
+Wide insn_field_default(const InsnTemplate &I, uint16_t fid,
                         const ResolvedIds &ids)
 {
     Wide w;
@@ -471,10 +502,17 @@ Wide insn_field_default(const InsnTemplate &I, uint8_t fid,
 }  /* namespace */
 
 Wide BodyWalker::template_default(const Template *tmpl,
-                                  uint32_t ipos, uint8_t fid) const
+                                  uint32_t ipos, uint16_t fid) const
 {
-    if (!tmpl || ipos >= tmpl->insns.size()) return Wide{};
+    if (!tmpl) return Wide{};
     const ResolvedIds &ids = header_.ids;
+    /* CST_FID_BB_STOP's baseline default is the template's own
+     * num_insns (§5.7) — the whole-block case is the free one, so the
+     * first shortened range deltas against num_insns, not 0. */
+    if (fid == ids.fid_bb_stop) {
+        return Wide::from_u64((uint64_t)tmpl->insns.size());
+    }
+    if (ipos >= tmpl->insns.size()) return Wide{};
     if (fid >= ids.fid_insn_bytes_lo && fid <= ids.fid_insn_size) {
         return insn_field_default(tmpl->insns[ipos], fid, ids);
     }
@@ -672,14 +710,12 @@ void BodyWalker::handle_regfile(const RegfileCallback &rb)
 
 std::vector<WPEntry> BodyWalker::decode_wp_chain(
     Reader &wpb, FieldStateTable &state,
-    const FieldStateTable *base_state, bool *has_events)
+    const FieldStateTable *base_state)
 {
     std::vector<WPEntry> out;
-    uint64_t chain_hdr = wpb.uleb();
-    uint64_t num_wp = chain_hdr >> 1;
-    if (has_events) {
-        *has_events = (chain_hdr & header_.ids.wp_chain_has_events) != 0;
-    }
+    /* Bare block count (Step 6.8) — nothing is packed into it. */
+    uint64_t num_wp = wpb.uleb();
+    const ResolvedIds &ids = header_.ids;
     out.reserve(num_wp);
     int32_t prev_wp_tmpl = 0;
     for (uint64_t w = 0; w < num_wp; w++) {
@@ -697,68 +733,46 @@ std::vector<WPEntry> BodyWalker::decode_wp_chain(
         if (!wtmpl && wp_tmpl != 0) {
             lint_.note_dangling((uint32_t)wp_tmpl, /*is_wp=*/true);
         }
-        /* WP blocks now carry the CST_FID_BRANCH_* singletons too, decoded
-         * into we.branch (displacement reconstructed against the template
-         * insn PC, same as CP).  The successor is the next chain block's
-         * start_pc, so --verify-branch can cross-check it in-chain. */
+        /* Each block's own block-level records ride its wp_delta_section
+         * (§4.3/§4.4): its executed range, and its events as
+         * CST_FID_BB_FLAGS / CST_FID_BB_FAULT_INSN.  The branch
+         * singletons decode into we.branch as on CP; the successor is
+         * the next chain block's start_pc, so --verify-branch can
+         * cross-check it in-chain. */
+        BlockCells bc;
         decode_field_delta(wpb, (uint32_t)wp_tmpl, wtmpl,
                            state, base_state,
                            &we.dyn_params, &we.reg_snaps, &we.metaflags,
-                           &we.lane_masks, /*lint=*/nullptr, &we.branch);
+                           &we.lane_masks, /*lint=*/nullptr, &we.branch,
+                           &bc);
+        we.bb_start = bc.bb_start;
+        we.bb_stop  = bc.bb_stop;
+        we.bb_flags = bc.bb_flags;
+        we.fault = (bc.bb_flags & ids.bb_flag_synthetic_fault) != 0;
+        we.translation_unavailable =
+            (bc.bb_flags & ids.bb_flag_translation_unavail) != 0;
+        if (we.fault) {
+            /* CST_FID_BB_FAULT_INSN is meaningful only under
+             * SYNTHETIC_FAULT — and it is NOT the block's bb_stop; the
+             * excursion continues past it (§4.4). */
+            we.fault_insn_index = bc.fault_insn;
+            we.has_fault_idx = true;
+        }
         out.push_back(std::move(we));
     }
     return out;
 }
 
-void BodyWalker::decode_wp_events(Reader &evb,
-                                  std::vector<WPEntry> *wp_entries,
-                                  bool *chain_unavail)
-{
-    const ResolvedIds &ids = header_.ids;
-    uint64_t num_events = evb.uleb();
-    int64_t prev_idx = -1;
-    for (uint64_t k = 0; k < num_events; k++) {
-        uint64_t gap = evb.uleb();
-        int64_t idx = prev_idx + 1 + (int64_t)gap;
-        if (idx < 0) {
-            throw std::runtime_error("wp event index out of range");
-        }
-        uint8_t evf = evb.u8();
-        bool is_fault = (evf & ids.wp_event_fault) != 0;
-        if ((size_t)idx >= wp_entries->size()) {
-            /* Chain-level event (§4.4): the resolved index lies past
-             * the encoded chain, so it describes the excursion's
-             * unrealized first target rather than any block.  The
-             * FAULT payload, if present, is consumed for wire
-             * consistency but carries no per-block anchor. */
-            if ((evf & ids.wp_event_translation_unavail) && chain_unavail) {
-                *chain_unavail = true;
-            }
-            if (is_fault) {
-                (void)evb.uleb();
-            }
-            prev_idx = idx;
-            continue;
-        }
-        WPEntry &we = (*wp_entries)[idx];
-        we.translation_unavailable = (evf & ids.wp_event_translation_unavail) != 0;
-        we.fault = is_fault;
-        if (is_fault) {
-            we.fault_insn_index = (uint32_t)evb.uleb();
-            we.has_fault_idx = true;
-        }
-        prev_idx = idx;
-    }
-}
-
-/* Tally is_atomic per (entry × insn) — counts observations, not
- * deduped templates. */
+/* Tally is_atomic per (entry × insn), over the entry's executed range
+ * only — counts observations, not deduped templates. */
 namespace {
-void tally_atomic_count(const Template *tmpl, uint64_t &out)
+void tally_atomic_count(const Template *tmpl, uint32_t start, uint32_t stop,
+                        uint64_t &out)
 {
     if (!tmpl) return;
-    for (const auto &I : tmpl->insns) {
-        if (I.is_atomic) out++;
+    if (stop > tmpl->insns.size()) stop = (uint32_t)tmpl->insns.size();
+    for (uint32_t i = start; i < stop; i++) {
+        if (tmpl->insns[i].is_atomic) out++;
     }
 }
 }  /* namespace */
@@ -786,38 +800,29 @@ void BodyWalker::handle_entry(WalkState &ws, const Callback &cb)
     if (!cp_tmpl) {
         lint_.note_dangling((uint32_t)entry_tmpl, /*is_wp=*/false);
     }
+    BlockCells bc;
     decode_field_delta(body_, (uint32_t)entry_tmpl, cp_tmpl,
                        cp_state, nullptr,
                        &entry.dyn_params, &entry.reg_snaps, &entry.metaflags,
-                       &entry.lane_masks, &lint_, &entry.branch);
+                       &entry.lane_masks, &lint_, &entry.branch, &bc);
 
-    /* Per-entry synchronous-fault trailer (docs/format.rst §4.2a), present
-     * only when the CST_FLAG_FAULT header bit is set; sits between the CP
-     * delta and the WP sections.  Exception-nesting depth at which this
-     * BB executed. */
-    if (flags_ & header_.ids.flag_fault) {
-        entry.fault_depth = (uint32_t)body_.uleb();
-        uint64_t n_anchors = body_.uleb();
-        for (uint64_t a = 0; a < n_anchors; a++) {
-            entry.fault_anchors.push_back((uint32_t)body_.uleb());
-        }
-    }
+    /* Everything block-level rode the cp_delta_section as records at
+     * BLOCK_POS (§5.7): the executed range, the flags, the fault
+     * depth.  There is no other per-entry payload. */
+    entry.bb_start    = bc.bb_start;
+    entry.bb_stop     = bc.bb_stop;
+    entry.bb_flags    = bc.bb_flags;
+    entry.fault_depth = bc.fault_depth;
+    entry.thread_end =
+        (bc.bb_flags & header_.ids.bb_flag_thread_end) != 0;
+    entry.wp_first_fetch_unavailable =
+        (bc.bb_flags & header_.ids.bb_flag_wp_first_target_unavail) != 0;
 
-    /* WP chain + events, present only when the CST_FLAG_WP header bit
-     * is set; otherwise the entry is just its CP delta.  wp_chain is
-     * its own length-prefixed sub-section; wp_events is conditional on
-     * that chain's CST_WP_CHAIN_HAS_EVENTS bit — entirely absent from
-     * the wire (no length prefix) when the chain produced no event. */
+    /* WP chain, present only when the CST_FLAG_WP header bit is set;
+     * otherwise the entry is just its CP delta section. */
     if (flags_ & header_.ids.flag_wp) {
-        bool has_events = false;
-        { SectionScope s(body_); Reader &wpb = s;
-          entry.wp_entries = decode_wp_chain(wpb, wp_state, &cp_state,
-                                             &has_events); }
-        if (has_events) {
-            SectionScope s(body_); Reader &evb = s;
-            decode_wp_events(evb, &entry.wp_entries,
-                             &entry.wp_first_fetch_unavailable);
-        }
+        SectionScope s(body_); Reader &wpb = s;
+        entry.wp_entries = decode_wp_chain(wpb, wp_state, &cp_state);
     }
 
     entry.thread_id       = ws.current_thread;
@@ -835,12 +840,15 @@ void BodyWalker::handle_entry(WalkState &ws, const Callback &cb)
         if (we.translation_unavailable) stats_.translation_unavail_count++;
     }
     if (auto it = by_id_.find(entry.template_id); it != by_id_.end()) {
-        tally_atomic_count(&templates_[it->second], stats_.atomic_count);
+        tally_atomic_count(&templates_[it->second],
+                           entry.bb_start, entry.bb_stop,
+                           stats_.atomic_count);
     }
     for (const auto &we : entry.wp_entries) {
         auto wit = by_id_.find(we.template_id);
         if (wit != by_id_.end()) {
             tally_atomic_count(&templates_[wit->second],
+                               we.bb_start, we.bb_stop,
                                stats_.atomic_count);
         }
     }
@@ -868,40 +876,29 @@ void BodyWalker::handle_iframe(WalkState &ws)
         by_id_.count(ws.prev_entry->template_id)
             ? &templates_[by_id_.at(ws.prev_entry->template_id)]
             : nullptr;
+    BlockCells bc;
     decode_field_delta(body_, ws.prev_entry->template_id, prev_tmpl,
                        iframe_cp, nullptr,
                        &iframe_entry.dyn_params,
                        &iframe_entry.reg_snaps,
                        &iframe_entry.metaflags,
                        &iframe_entry.lane_masks,
-                       /*lint=*/nullptr);   /* re-encodes the prev ENTRY;
+                       /*lint=*/nullptr,    /* re-encodes the prev ENTRY;
                                              * counting would double-report */
+                       /*branch=*/nullptr, &bc);
+    iframe_entry.bb_start    = bc.bb_start;
+    iframe_entry.bb_stop     = bc.bb_stop;
+    iframe_entry.bb_flags    = bc.bb_flags;
+    iframe_entry.fault_depth = bc.fault_depth;
 
-    /* Fault trailer, mirroring the ENTRY path (writer emits the same payload
-     * for an IFRAME).  Consume to stay in sync. */
-    if (flags_ & header_.ids.flag_fault) {
-        iframe_entry.fault_depth = (uint32_t)body_.uleb();
-        uint64_t n_anchors = body_.uleb();
-        for (uint64_t a = 0; a < n_anchors; a++) {
-            iframe_entry.fault_anchors.push_back((uint32_t)body_.uleb());
-        }
-    }
-
-    /* WP chain + events, gated by CST_FLAG_WP exactly as the ENTRY
-     * path.  Mirror the writer's IFRAME emission: the iframe_wp
-     * overlay falls back to iframe_cp as base, matching
-     * st->iframe_cp_scratch shared between wp_state and wp_base. */
+    /* WP chain, gated by CST_FLAG_WP exactly as the ENTRY path.
+     * Mirror the writer's IFRAME emission: the iframe_wp overlay falls
+     * back to iframe_cp as base, matching st->iframe_cp_scratch shared
+     * between wp_state and wp_base. */
     if (flags_ & header_.ids.flag_wp) {
-        bool has_events = false;
-        { SectionScope s(body_); Reader &wpb = s;
-          iframe_entry.wp_entries = decode_wp_chain(wpb, iframe_wp,
-                                                    &iframe_cp,
-                                                    &has_events); }
-        if (has_events) {
-            SectionScope s(body_); Reader &evb = s;
-            decode_wp_events(evb, &iframe_entry.wp_entries,
-                             &iframe_entry.wp_first_fetch_unavailable);
-        }
+        SectionScope s(body_); Reader &wpb = s;
+        iframe_entry.wp_entries = decode_wp_chain(wpb, iframe_wp,
+                                                  &iframe_cp);
     }
 
     validate_iframe(*ws.prev_entry, iframe_entry);
@@ -978,13 +975,37 @@ void BodyWalker::walk(const Callback &cb, const RegfileCallback &rb)
 
 namespace {
 
+/* Span of the instruction positions (ipos < N only) a section's records
+ * touched.  The executed range arrives with the section's tail (block
+ * records are always last, §5.7), so the range check runs after the
+ * loop; the range is contiguous, so min/max suffice. */
+struct RecordSpan {
+    uint32_t min_ipos = UINT32_MAX;
+    uint32_t max_ipos = 0;
+    bool     any      = false;
+};
+
+/* True iff @fid names a member of the block-level family (§5.7). */
+static inline bool is_block_fid(uint16_t fid, const ResolvedIds &ids)
+{
+    return fid == ids.fid_bb_start || fid == ids.fid_bb_stop ||
+           fid == ids.fid_bb_flags || fid == ids.fid_bb_fault_depth ||
+           fid == ids.fid_bb_fault_insn;
+}
+
 /* Pass-1 record loop: apply each non-EXTENDED delta to its
- * (state_blk, ipos, slot) cell.  Format 0x1D: fid is ULEB128, no
- * EXTRA_* overflow path.  @lint (with @lint_row, the template's
- * per-insn capability row) is non-null only for CP ENTRY sections:
- * a dst-reg VALUE record naming an operand slot the template does
- * not carry — or an insn position past the template — is an
- * impossible attribution (the writer never emits such records). */
+ * (state_blk, ipos, slot) cell, dispatching on position per Step 6.7's
+ * CLOSED rule when the template is known (N = its num_insns):
+ *   ipos <  N  instruction record;
+ *   ipos == N  block record (BLOCK_POS);
+ *   ipos >  N  malformed — reject the trace, never skip.
+ * A recognised name at the wrong kind of position is likewise rejected
+ * (Step 6.9); an unrecognised name is consumed and skipped at either.
+ * @lint (with @lint_row, the template's per-insn capability row) is
+ * non-null only for CP ENTRY sections: a dst-reg VALUE record naming an
+ * operand slot the template does not carry — or an insn position past
+ * the template — is an impossible attribution (the writer never emits
+ * such records). */
 void apply_record_deltas(BodyWalker &walker, Reader &sec, uint64_t n_records,
                          uint32_t template_id, const Template *tmpl,
                          const ResolvedIds &ids,
@@ -992,14 +1013,55 @@ void apply_record_deltas(BodyWalker &walker, Reader &sec, uint64_t n_records,
                          FieldStateBlock *state_blk, uint32_t state_gen,
                          const FieldStateBlock *base_blk, uint32_t base_gen,
                          int scalar_bits,
-                         Wide (BodyWalker::*tmpl_default)(const Template*, uint32_t, uint8_t) const,
+                         Wide (BodyWalker::*tmpl_default)(const Template*, uint32_t, uint16_t) const,
                          AttributionLint *lint,
-                         const std::vector<uint8_t> *lint_row)
+                         const std::vector<uint8_t> *lint_row,
+                         RecordSpan *span)
 {
+    const uint32_t N = tmpl ? (uint32_t)tmpl->insns.size() : 0;
     uint32_t pos = 0;
     for (uint64_t i = 0; i < n_records; i++) {
         pos += (uint32_t)sec.uleb();
         uint16_t fid = (uint16_t)sec.uleb();
+
+        if (tmpl) {
+            if (pos > N) {
+                throw std::runtime_error(
+                    "field-delta record at ipos " + std::to_string(pos) +
+                    " past BLOCK_POS " + std::to_string(N) +
+                    " (template " + std::to_string(template_id) +
+                    "): no position above BLOCK_POS exists in this epoch"
+                    " — reject");
+            }
+            const bool bb_name = is_block_fid(fid, ids);
+            if (pos == N) {
+                /* Block position: a recognised per-instruction name here
+                 * is malformed (Step 6.9).  Unrecognised names are
+                 * skipped; EXTENDED is the reserved escape. */
+                bool known_insn_name = !bb_name && fid != ids.fid_extended &&
+                    fid < FID_LUT_SIZE &&
+                    slot_lut[fid] != FIELD_STATE_SLOT_INVALID;
+                if (known_insn_name) {
+                    throw std::runtime_error(
+                        "per-instruction field (fid " + std::to_string(fid) +
+                        ") at BLOCK_POS of template " +
+                        std::to_string(template_id) + " — reject");
+                }
+            } else {
+                if (bb_name) {
+                    throw std::runtime_error(
+                        "block-level field (fid " + std::to_string(fid) +
+                        ") at instruction position " + std::to_string(pos) +
+                        " of template " + std::to_string(template_id) +
+                        " — reject");
+                }
+                if (span) {
+                    span->any = true;
+                    if (pos < span->min_ipos) span->min_ipos = pos;
+                    if (pos > span->max_ipos) span->max_ipos = pos;
+                }
+            }
+        }
 
         if (lint && lint_row && lint->reg_check_enabled()) {
             int slot = lint->dst_slot_for_fid(fid);
@@ -1021,7 +1083,7 @@ void apply_record_deltas(BodyWalker &walker, Reader &sec, uint64_t n_records,
         Wide base;
         if (!cell_read(state_blk, state_gen, pos, slot, &base) &&
             !cell_read(base_blk,  base_gen,  pos, slot, &base)) {
-            base = (walker.*tmpl_default)(tmpl, pos, (uint8_t)fid);
+            base = (walker.*tmpl_default)(tmpl, pos, fid);
         }
         base.add_signed_mod_wide(wd, scalar_bits);
         cell_write(state_blk, state_gen, pos, slot, base);
@@ -1161,7 +1223,8 @@ void BodyWalker::decode_field_delta(Reader &outer,
                                     std::vector<MetaFlagsEntry> *metaflags,
                                     std::vector<LaneMaskEntry>  *lane_masks,
                                     AttributionLint             *lint,
-                                    BranchOutcome               *branch)
+                                    BranchOutcome               *branch,
+                                    BlockCells                  *bc_out)
 {
     SectionScope scope(outer);
     Reader &sec = scope;
@@ -1174,32 +1237,87 @@ void BodyWalker::decode_field_delta(Reader &outer,
         lint ? lint->row(template_id) : nullptr;
 
     /* Resolve the per-(state,base) blocks once; the record loop
-     * indexes directly rather than hashing per record. */
+     * indexes directly rather than hashing per record.  Capacity is
+     * POSITIONS: num_insns + 1, the last row being the block's own
+     * (BLOCK_POS, §5.7). */
     uint32_t need_insns = tmpl ? (uint32_t)tmpl->insns.size() : 0;
     FieldStateBlock *state_blk =
         table_get_or_create_block(state, template_id,
-                                  std::max<uint32_t>(need_insns, 1));
+                                  std::max<uint32_t>(need_insns + 1, 1));
     const FieldStateBlock *base_blk =
         base_state ? table_get_block(*base_state, template_id) : nullptr;
     uint32_t state_gen = state.generation;
     uint32_t base_gen  = base_state ? base_state->generation : 0;
 
-    /* Pass 1: apply record deltas. */
+    /* Pass 1: apply record deltas (with Step 6.7's closed position
+     * dispatch), tracking the span of instruction positions touched. */
+    RecordSpan span;
     apply_record_deltas(*this, sec, n_records,
                         template_id, tmpl, ids, slot_lut_,
                         state_blk, state_gen, base_blk, base_gen,
                         scalar_bits_,
                         &BodyWalker::template_default,
-                        lint, lint_row);
+                        lint, lint_row, &span);
 
-    /* Pass 2: materialise per-insn outputs.  Skipped entirely when
-     * we don't have a template (decoder doesn't know the insn count). */
-    if (!tmpl) return;
+    /* The whole section defines the entry (§5.7): only now — after
+     * every record is applied — are the block's own cells readable.
+     * Skipped entirely when we don't have a template (the decoder
+     * knows neither the insn count nor BLOCK_POS; dangling refs are
+     * already flagged by the lint). */
+    if (!tmpl) {
+        if (bc_out) *bc_out = BlockCells{};
+        return;
+    }
+    const uint32_t N = (uint32_t)tmpl->insns.size();
+    auto block_cell = [&](uint16_t fid, uint64_t dflt) -> uint64_t {
+        uint16_t slot = (fid < FID_LUT_SIZE) ? slot_lut_[fid]
+                                             : FIELD_STATE_SLOT_INVALID;
+        Wide out;
+        if (cell_read(state_blk, state_gen, N, slot, &out)) return out.low64();
+        if (cell_read(base_blk,  base_gen,  N, slot, &out)) return out.low64();
+        return dflt;
+    };
+    BlockCells bc;
+    bc.bb_start    = (uint32_t)block_cell(ids.fid_bb_start, 0);
+    bc.bb_stop     = (uint32_t)block_cell(ids.fid_bb_stop, N);
+    bc.bb_flags    = block_cell(ids.fid_bb_flags, 0);
+    bc.fault_depth = (uint32_t)block_cell(ids.fid_bb_fault_depth, 0);
+    bc.fault_insn  = (uint32_t)block_cell(ids.fid_bb_fault_insn, 0);
+
+    /* Reject the entry unless 0 <= bb_start < bb_stop <= num_insns
+     * (Step 6.4) — the empty range is never emitted. */
+    if (!(bc.bb_start < bc.bb_stop && bc.bb_stop <= N)) {
+        throw std::runtime_error(
+            "entry declares malformed executed range [" +
+            std::to_string(bc.bb_start) + ", " +
+            std::to_string(bc.bb_stop) + ") of " + std::to_string(N) +
+            "-insn template " + std::to_string(template_id) + " — reject");
+    }
+    /* A per-instruction record at an in-template position OUTSIDE the
+     * declared range claims an observation of an instruction the entry
+     * itself declares did not complete — reject (§4.2a / §5.7).  The
+     * range is contiguous, so the span's min/max decide. */
+    if (span.any &&
+        (span.min_ipos < bc.bb_start || span.max_ipos >= bc.bb_stop)) {
+        uint32_t bad = span.min_ipos < bc.bb_start ? span.min_ipos
+                                                   : span.max_ipos;
+        throw std::runtime_error(
+            "per-instruction record at position " + std::to_string(bad) +
+            " outside declared range [" + std::to_string(bc.bb_start) +
+            ", " + std::to_string(bc.bb_stop) + ") of template " +
+            std::to_string(template_id) + " — reject");
+    }
+    if (bc_out) *bc_out = bc;
+
+    /* Pass 2: materialise per-insn outputs, CLAMPED to the declared
+     * range — the entry asserts nothing about instructions outside it,
+     * and synthesising state for them is the mistake this record shape
+     * exists to prevent (§4.2a). */
     const bool has_mem = (flags_ & ids.flag_mem_data) != 0;
     const bool has_reg = (flags_ & ids.flag_reg_data) != 0;
     const bool has_ppage = (flags_ & ids.flag_physaddr) != 0;
 
-    for (size_t i = 0; i < tmpl->insns.size(); i++) {
+    for (size_t i = bc.bb_start; i < bc.bb_stop; i++) {
         uint32_t idx = (uint32_t)i;
         uint64_t n_loads = lookup_cell(state_blk, state_gen,
                                         base_blk,  base_gen,
@@ -1306,16 +1424,39 @@ void BodyWalker::decode_field_delta(Reader &outer,
         for (int j = (int)tmpl->insns.size() - 1; j >= 0; j--) {
             if (tmpl->insns[j].branch_type != 0) { bidx = j; break; }
         }
-        if (bidx >= 0) {
+        /* NO FABRICATION.  The cells delta-persist, so an entry that
+         * carries no branch records reads back whatever last occupied
+         * the slot; whether that is THIS entry's outcome is decided by
+         * the range and the flag, never by record presence (§5.6):
+         *  - the entry's range must contain the terminating branch —
+         *    an entry that stopped at or before it ran no branch and a
+         *    decoder MUST NOT read the two cells for it;
+         *  - CST_BB_FLAG_BRANCH_UNRESOLVED marks a block whose range
+         *    contains the branch but whose successor the writer could
+         *    not observe: the cells are stale by construction and no
+         *    outcome is taken from them;
+         *  - a slot never observed in this context (neither cell ever
+         *    written, state or base) has no outcome to read at all. */
+        if (bidx >= 0 &&
+            bc.bb_start <= (uint32_t)bidx && (uint32_t)bidx < bc.bb_stop &&
+            !(bc.bb_flags & ids.bb_flag_branch_unresolved)) {
             uint32_t bi = (uint32_t)bidx;
-            branch->valid  = true;
-            branch->taken  = lookup_cell(state_blk, state_gen,
-                                         base_blk, base_gen, slot_lut_,
-                                         bi, ids.fid_branch_taken).low64() != 0;
-            uint64_t disp  = lookup_cell(state_blk, state_gen,
-                                         base_blk, base_gen, slot_lut_,
-                                         bi, ids.fid_branch_target).low64();
-            branch->target = tmpl->insns[bi].pc + disp;
+            uint16_t tk_slot = (ids.fid_branch_taken < FID_LUT_SIZE)
+                ? slot_lut_[ids.fid_branch_taken] : FIELD_STATE_SLOT_INVALID;
+            uint16_t tg_slot = (ids.fid_branch_target < FID_LUT_SIZE)
+                ? slot_lut_[ids.fid_branch_target] : FIELD_STATE_SLOT_INVALID;
+            Wide tk{}, tg{};
+            bool tk_hit =
+                cell_read(state_blk, state_gen, bi, tk_slot, &tk) ||
+                cell_read(base_blk,  base_gen,  bi, tk_slot, &tk);
+            bool tg_hit =
+                cell_read(state_blk, state_gen, bi, tg_slot, &tg) ||
+                cell_read(base_blk,  base_gen,  bi, tg_slot, &tg);
+            if (tk_hit || tg_hit) {
+                branch->valid  = true;
+                branch->taken  = tk.low64() != 0;
+                branch->target = tmpl->insns[bi].pc + tg.low64();
+            }
         }
     }
 }
@@ -1418,7 +1559,8 @@ uint64_t BodyWalker::BB::dst_reg_width(uint32_t insn, uint32_t op) const
 void BodyWalker::consume_field_section(Reader &outer, uint32_t template_id,
                                        const Template *tmpl,
                                        FieldStateTable *state,
-                                       const FieldStateTable *base_state)
+                                       const FieldStateTable *base_state,
+                                       BlockCells *bc)
 {
     /* Decode the length-prefixed section IN PLACE — no sub-reader, no copy.
      * Records are consumed strictly sequentially into the per-template state
@@ -1431,11 +1573,24 @@ void BodyWalker::consume_field_section(Reader &outer, uint32_t template_id,
     const ResolvedIds &ids = header_.ids;
 
     /* Parse-skip: advance past every record's bytes without touching
-     * the state table.  No accessor at this level reads these cells,
-     * so applying them would be pure waste (Step 6.10 byte shape). */
+     * the state table.  Position dispatch is still enforced where it
+     * detects desync (ipos > BLOCK_POS, Step 6.7); the cell-dependent
+     * checks (range vs records) need the applied state and are the
+     * applying path's job.  @bc is not populated on this path — the
+     * cells are delta-persistent and cannot be read honestly without
+     * applying. */
     if (!state) {
+        const uint32_t N = tmpl ? (uint32_t)tmpl->insns.size() : 0;
+        uint32_t pos = 0;
         for (uint64_t i = 0; i < n_records; i++) {
-            sec.uleb();                              /* ipos delta */
+            pos += (uint32_t)sec.uleb();             /* ipos delta */
+            if (tmpl && pos > N) {
+                throw std::runtime_error(
+                    "field-delta record at ipos " + std::to_string(pos) +
+                    " past BLOCK_POS " + std::to_string(N) +
+                    " (template " + std::to_string(template_id) +
+                    ") — reject");
+            }
             uint16_t fid = (uint16_t)sec.uleb();
             sec.sleb_wide();                         /* value delta */
             if (fid == ids.fid_extended) sec.uleb(); /* ext payload */
@@ -1446,28 +1601,75 @@ void BodyWalker::consume_field_section(Reader &outer, uint32_t template_id,
     uint32_t need_insns = tmpl ? (uint32_t)tmpl->insns.size() : 0;
     FieldStateBlock *state_blk =
         table_get_or_create_block(*state, template_id,
-                                  std::max<uint32_t>(need_insns, 1));
+                                  std::max<uint32_t>(need_insns + 1, 1));
     const FieldStateBlock *base_blk =
         base_state ? table_get_block(*base_state, template_id) : nullptr;
+    uint32_t state_gen = state->generation;
+    uint32_t base_gen  = base_state ? base_state->generation : 0;
+    RecordSpan span;
     apply_record_deltas(*this, sec, n_records, template_id, tmpl, ids,
-                        slot_lut_, state_blk, state->generation,
-                        base_blk, base_state ? base_state->generation : 0,
+                        slot_lut_, state_blk, state_gen,
+                        base_blk, base_gen,
                         scalar_bits_, &BodyWalker::template_default,
-                        /*lint=*/nullptr, /*lint_row=*/nullptr);
+                        /*lint=*/nullptr, /*lint_row=*/nullptr, &span);
+
+    /* Same §5.7 tail-read + validation as the batch path: apply the
+     * whole section, then resolve the block cells and reject a
+     * malformed range or an out-of-range instruction record. */
+    if (tmpl) {
+        const uint32_t N = (uint32_t)tmpl->insns.size();
+        auto block_cell = [&](uint16_t fid, uint64_t dflt) -> uint64_t {
+            uint16_t slot = (fid < FID_LUT_SIZE) ? slot_lut_[fid]
+                                                 : FIELD_STATE_SLOT_INVALID;
+            Wide out;
+            if (cell_read(state_blk, state_gen, N, slot, &out)) {
+                return out.low64();
+            }
+            if (cell_read(base_blk, base_gen, N, slot, &out)) {
+                return out.low64();
+            }
+            return dflt;
+        };
+        BlockCells cells;
+        cells.bb_start    = (uint32_t)block_cell(ids.fid_bb_start, 0);
+        cells.bb_stop     = (uint32_t)block_cell(ids.fid_bb_stop, N);
+        cells.bb_flags    = block_cell(ids.fid_bb_flags, 0);
+        cells.fault_depth = (uint32_t)block_cell(ids.fid_bb_fault_depth, 0);
+        cells.fault_insn  = (uint32_t)block_cell(ids.fid_bb_fault_insn, 0);
+        if (!(cells.bb_start < cells.bb_stop && cells.bb_stop <= N)) {
+            throw std::runtime_error(
+                "entry declares malformed executed range [" +
+                std::to_string(cells.bb_start) + ", " +
+                std::to_string(cells.bb_stop) + ") of " +
+                std::to_string(N) + "-insn template " +
+                std::to_string(template_id) + " — reject");
+        }
+        if (span.any && (span.min_ipos < cells.bb_start ||
+                         span.max_ipos >= cells.bb_stop)) {
+            uint32_t bad = span.min_ipos < cells.bb_start ? span.min_ipos
+                                                          : span.max_ipos;
+            throw std::runtime_error(
+                "per-instruction record at position " + std::to_string(bad) +
+                " outside declared range [" +
+                std::to_string(cells.bb_start) + ", " +
+                std::to_string(cells.bb_stop) + ") of template " +
+                std::to_string(template_id) + " — reject");
+        }
+        if (bc) *bc = cells;
+    } else if (bc) {
+        *bc = BlockCells{};
+    }
 }
 
 uint64_t BodyWalker::stream_wp_chain_bb(Reader &wpb, FieldStateTable &wp_state,
                                         FieldStateTable &cp_state, WpDecode wp,
                                         uint32_t seq, uint32_t thread,
                                         uint32_t asid, const BBCallback &cb,
-                                        bool *has_events, uint64_t *insns)
+                                        uint64_t *insns)
 {
     const bool fields = (wp == WpDecode::Fields);
-    uint64_t chain_hdr = wpb.uleb();
-    uint64_t num_wp = chain_hdr >> 1;
-    if (has_events) {
-        *has_events = (chain_hdr & header_.ids.wp_chain_has_events) != 0;
-    }
+    /* Bare block count (Step 6.8) — nothing is packed into it. */
+    uint64_t num_wp = wpb.uleb();
     if (insns) {
         *insns = 0;
     }
@@ -1483,9 +1685,12 @@ uint64_t BodyWalker::stream_wp_chain_bb(Reader &wpb, FieldStateTable &wp_state,
          * before reading it — Step 6.8 makes each pair self-contained,
          * so reading now is correct even if a later BB in the chain
          * reuses this template and overwrites the cells. */
+        BlockCells bc;
+        bc.bb_stop = wtmpl ? (uint32_t)wtmpl->insns.size() : 0;
         consume_field_section(wpb, (uint32_t)wt, wtmpl,
                               fields ? &wp_state : nullptr,
-                              fields ? &cp_state : nullptr);
+                              fields ? &cp_state : nullptr,
+                              fields ? &bc : nullptr);
 
         stats_.wp_entries++;
         BB bb;
@@ -1501,8 +1706,17 @@ uint64_t BodyWalker::stream_wp_chain_bb(Reader &wpb, FieldStateTable &wp_state,
         bb.wp_chain_start = (w == 0);
         bb.wp_chain_last  = (w + 1 == num_wp);
         bb.n_insns        = wtmpl ? (uint32_t)wtmpl->insns.size() : 0;
+        bb.bb_start       = bc.bb_start;
+        bb.bb_stop        = bc.bb_stop;
+        bb.bb_flags       = bc.bb_flags;
+        if (bb.bb_flags & header_.ids.bb_flag_synthetic_fault) {
+            stats_.fault_count++;
+        }
+        if (bb.bb_flags & header_.ids.bb_flag_translation_unavail) {
+            stats_.translation_unavail_count++;
+        }
         if (insns) {
-            *insns += bb.n_insns;
+            *insns += bb.bb_stop - bb.bb_start;
         }
         if (fields) {
             bb.blk_       = table_get_block(wp_state, (uint32_t)wt);
@@ -1531,19 +1745,11 @@ void BodyWalker::handle_entry_bb(WalkState &ws, bool cp_fields, WpDecode wp,
     const Template *cp_tmpl = (cp_it != by_id_.end())
         ? &templates_[cp_it->second] : nullptr;
 
+    BlockCells bc;
+    bc.bb_stop = cp_tmpl ? (uint32_t)cp_tmpl->insns.size() : 0;
     consume_field_section(body_, (uint32_t)entry_tmpl, cp_tmpl,
-                          cp_fields ? &cp_state : nullptr, nullptr);
-
-    /* Fault trailer (docs/format.rst §4.2a), between the CP delta and the
-     * WP sections. */
-    uint32_t fault_depth = 0;
-    if (flags_ & header_.ids.flag_fault) {
-        fault_depth = (uint32_t)body_.uleb();
-        uint64_t n_anchors = body_.uleb();   /* anchors: parse-skipped here */
-        for (uint64_t a = 0; a < n_anchors; a++) {
-            (void)body_.uleb();
-        }
-    }
+                          cp_fields ? &cp_state : nullptr, nullptr,
+                          cp_fields ? &bc : nullptr);
 
     uint32_t seq = ++ws.seq;
     stats_.cp_entries++;
@@ -1558,7 +1764,12 @@ void BodyWalker::handle_entry_bb(WalkState &ws, bool cp_fields, WpDecode wp,
     bb.seq_num         = seq;
     bb.thread_switched = ws.pending_thread_switch;
     bb.n_insns         = cp_tmpl ? (uint32_t)cp_tmpl->insns.size() : 0;
-    bb.fault_depth     = fault_depth;
+    /* Block-level cells (§5.7): honest only when the deltas were
+     * applied; a parse-skipped section reports whole-block defaults. */
+    bb.fault_depth     = bc.fault_depth;
+    bb.bb_start        = bc.bb_start;
+    bb.bb_stop         = bc.bb_stop;
+    bb.bb_flags        = bc.bb_flags;
     if (cp_fields) {
         bb.blk_       = table_get_block(cp_state, (uint32_t)entry_tmpl);
         bb.state_gen_ = cp_state.generation;
@@ -1569,113 +1780,32 @@ void BodyWalker::handle_entry_bb(WalkState &ws, bool cp_fields, WpDecode wp,
     ws.pending_asid_switch = false;
     cb(bb);
 
-    /* WP chain + events (Steps 6.8 / 6.9), present only under
-     * CST_FLAG_WP.  sub() consumes each section regardless of whether
-     * we walk it, so Skip / event parse-skip are one line each.  The
-     * events section is conditional on the chain header's
-     * CST_WP_CHAIN_HAS_EVENTS bit (unpacked below as @has_events) —
-     * absent entirely from the wire when clear, so it must be read
-     * unconditionally (not just when wp_events_cb_ is set) to know
-     * whether a second SectionScope even has bytes to open. */
+    /* WP chain (Step 6.8), present only under CST_FLAG_WP.  There is
+     * no side events section: each chain block carries its own
+     * block-level records inside its wp_delta_section (§4.4).
+     * SectionScope consumes the whole chain regardless of the dial. */
     if (flags_ & header_.ids.flag_wp) {
-        uint64_t chain_len = 0;
-        uint64_t chain_insns = 0;
-        bool has_events = false;
-        { SectionScope s(body_); Reader &wpb = s;
-          if (wp != WpDecode::Skip) {
-              FieldStateTable &wp_state =
-                  ws.state_at(ws.wp_states, ws.current_asid,
-                              ws.current_thread);
-              chain_len = stream_wp_chain_bb(wpb, wp_state, cp_state, wp,
-                                             seq, ws.current_thread,
-                                             ws.current_asid, cb,
-                                             &has_events, &chain_insns);
-          } else {
-              /* Chain walking skipped, but num_wp (chain length, used to
-               * resolve past-chain / chain-level event indices) and the
-               * HAS_EVENTS bit both live in the header's leading ULEB —
-               * SectionScope skips the remaining chain bytes either
-               * way. */
-              uint64_t chain_hdr = wpb.uleb();
-              chain_len = chain_hdr >> 1;
-              has_events = (chain_hdr & header_.ids.wp_chain_has_events) != 0;
-          }
-        }
-        if (!has_events) {
-            return;
-        }
-        { SectionScope s(body_);
-          if (wp_events_cb_) {
-              /* Parse the events section (identical byte consumption to
-               * the skip; see decode_wp_events for the batch-path twin)
-               * and fire the per-entry summary. */
-              Reader &evb = s;
-              const ResolvedIds &ids = header_.ids;
-              WpEventsSummary sum;
-              sum.seq_num   = seq;
-              sum.chain_len = (uint32_t)chain_len;
-              sum.wp_insns  = (uint32_t)chain_insns;
-              uint64_t num_events = evb.uleb();
-              int64_t prev_idx = -1;
-              for (uint64_t k = 0; k < num_events; k++) {
-                  uint64_t gap = evb.uleb();
-                  int64_t idx = prev_idx + 1 + (int64_t)gap;
-                  uint8_t evf = evb.u8();
-                  bool is_fault = (evf & ids.wp_event_fault) != 0;
-                  bool is_unavail =
-                      (evf & ids.wp_event_translation_unavail) != 0;
-                  if (idx < 0 || (uint64_t)idx >= chain_len) {
-                      /* Chain-level event (§4.4): the unrealized first
-                       * target.  FAULT payload consumed for wire
-                       * consistency. */
-                      if (is_unavail) sum.chain_unavailable = true;
-                      if (is_fault)   (void)evb.uleb();
-                  } else {
-                      if (is_fault) {
-                          sum.fault_count++;
-                          (void)evb.uleb();     /* fault insn index */
-                          if ((uint64_t)idx + 1 == chain_len) {
-                              sum.last_fault = true;
-                          }
-                      }
-                      if (is_unavail) {
-                          sum.unavail_count++;
-                          if ((uint64_t)idx + 1 == chain_len) {
-                              sum.last_unavail = true;
-                          }
-                      }
-                  }
-                  prev_idx = idx;
-              }
-              wp_events_cb_(sum);
-          }
+        SectionScope s(body_); Reader &wpb = s;
+        if (wp != WpDecode::Skip) {
+            FieldStateTable &wp_state =
+                ws.state_at(ws.wp_states, ws.current_asid,
+                            ws.current_thread);
+            stream_wp_chain_bb(wpb, wp_state, cp_state, wp,
+                               seq, ws.current_thread,
+                               ws.current_asid, cb, nullptr);
         }
     }
 }
 
 void BodyWalker::skip_iframe_bb()
 {
-    /* IFRAME (Step 6.5): cp_delta_section [+ wp_chain + wp_events
-     * under CST_FLAG_WP], no leading template delta.  Consume the
-     * sections to stay byte-aligned; the streaming path does not
+    /* IFRAME (Step 6.5): cp_delta_section [+ wp_chain under
+     * CST_FLAG_WP], no leading template delta.  Consume the sections
+     * to stay byte-aligned; the streaming path does not
      * field-validate. */
     { SectionScope s(body_); (void)s; }
-    if (flags_ & header_.ids.flag_fault) {
-        (void)body_.uleb();    /* fault depth */
-        uint64_t n_anchors = body_.uleb();
-        for (uint64_t a = 0; a < n_anchors; a++) {
-            (void)body_.uleb();
-        }
-    }
     if (flags_ & header_.ids.flag_wp) {
-        bool has_events = false;
-        { SectionScope s(body_); Reader &wpb = s;
-          uint64_t chain_hdr = wpb.uleb();
-          has_events = (chain_hdr & header_.ids.wp_chain_has_events) != 0;
-        }
-        if (has_events) {
-            SectionScope s(body_); (void)s;
-        }
+        SectionScope s(body_); (void)s;
     }
     stats_.iframe_count++;
 }
@@ -1880,25 +2010,30 @@ std::vector<Instruction> instructions_from_entry(
     out.reserve(cp_tmpl.insns.size() +
                 entry.wp_entries.size() * 4);  /* rough; growth fine */
 
-    /* CP insns first, in template order. */
-    for (size_t i = 0; i < cp_tmpl.insns.size(); i++) {
-        out.push_back(build_one(cp_tmpl, (uint32_t)i, entry, h, templates,
+    /* CP insns, in template order, CLAMPED to the entry's declared
+     * executed range (§4.2a) — the entry observed exactly
+     * [bb_start, bb_stop) and asserts nothing outside it. */
+    uint32_t cp_stop = entry.bb_stop <= cp_tmpl.insns.size()
+                           ? entry.bb_stop
+                           : (uint32_t)cp_tmpl.insns.size();
+    for (uint32_t i = entry.bb_start; i < cp_stop; i++) {
+        out.push_back(build_one(cp_tmpl, i, entry, h, templates,
                                 entry.dyn_params, entry.reg_snaps,
                                 entry.metaflags, entry.lane_masks));
     }
 
-    /* WP chain: every WP entry's insns in chain order.  A WP entry
-     * may execute only a prefix of its template (wp.n_insns) before
-     * being cut off by a fault or translation gap — honour the wire
-     * value rather than the template's full insn count. */
+    /* WP chain: every WP entry's insns in chain order, each clamped to
+     * its own declared range — a speculative block's partial execution
+     * rides CST_FID_BB_START/STOP exactly as a correct-path one's
+     * (§4.3). */
     for (const WPEntry &wp : entry.wp_entries) {
         auto wp_it = template_by_id.find(wp.template_id);
         if (wp_it == template_by_id.end()) continue;
         const Template &wp_tmpl = templates[wp_it->second];
-        uint32_t wp_n = wp.n_insns < wp_tmpl.insns.size()
-                            ? wp.n_insns
+        uint32_t wp_n = wp.bb_stop < wp_tmpl.insns.size()
+                            ? wp.bb_stop
                             : (uint32_t)wp_tmpl.insns.size();
-        for (uint32_t i = 0; i < wp_n; i++) {
+        for (uint32_t i = wp.bb_start; i < wp_n; i++) {
             Instruction insn = build_one(wp_tmpl, i, entry, h, templates,
                                          wp.dyn_params, wp.reg_snaps,
                                          wp.metaflags, wp.lane_masks);

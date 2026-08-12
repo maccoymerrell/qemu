@@ -42,8 +42,10 @@ enum : int {
     BIDX_LANE_MASK  = 9,
     BIDX_PHYS_PAGE  = 10,   /* CST_FID_LOAD_PPAGE / STORE_PPAGE (physaddr) */
     BIDX_BRANCH     = 11,   /* CST_FID_BRANCH_TAKEN / _TARGET (always on)  */
-    BIDX_OTHER      = 12,
-    NUM_BUCKETS     = 13,
+    BIDX_BLOCK      = 12,   /* CST_FID_BB_* block-level records (BLOCK_POS,
+                             * §5.7): range / flags / fault depth+insn     */
+    BIDX_OTHER      = 13,
+    NUM_BUCKETS     = 14,
 };
 
 /* FID -> bucket lookup over the ULEB FID space.  Slotted families
@@ -108,6 +110,16 @@ struct FidTables {
          * direction/target cost is visible separately from "other". */
         if (ids.fid_branch_taken  < LUT_SIZE) bucket[ids.fid_branch_taken]  = BIDX_BRANCH;
         if (ids.fid_branch_target < LUT_SIZE) bucket[ids.fid_branch_target] = BIDX_BRANCH;
+        /* Block-level family (BLOCK_POS records): its own bucket so the
+         * epoch's biggest new cost class is visible in the tool built
+         * to see cost, folded into the field-delta breakdown it rides. */
+        const uint16_t bb_fids[] = {
+            ids.fid_bb_start, ids.fid_bb_stop, ids.fid_bb_flags,
+            ids.fid_bb_fault_depth, ids.fid_bb_fault_insn,
+        };
+        for (uint16_t f : bb_fids) {
+            if (f < LUT_SIZE) bucket[f] = BIDX_BLOCK;
+        }
     }
 
     uint8_t bucket_for(unsigned fid) const {
@@ -144,7 +156,6 @@ struct Stats {
     Bucket wp_chain_envelope;
     Bucket wp_entry_framing;
     Bucket wp_field_delta;
-    Bucket wp_events;
     uint64_t iframe_count = 0;
     Bucket   iframe_bytes;
     /* BODY_TAG_REGFILE: per-thread initial regfile snapshot,
@@ -292,11 +303,51 @@ struct LintCtx {
 /* Tally one field-delta record's bytes into @fd_b.  Format 0x1D:
  * fid is ULEB128, every record carries a single SLEB_WIDE delta (up
  * to 512 bits) walked by skip_varint (no overflow guard). */
+/* Persistent executed-range cells for one (context, template): the
+ * CST_FID_BB_START / _STOP block cells, mirrored so the audit can sum
+ * each entry's REALISED instruction count (bb_stop - bb_start, §4.2a)
+ * instead of the template's num_insns.  The WP overlay resolves
+ * WP -> CP -> default exactly like the decoder's field state. */
+struct RangeCells {
+    bool    cp_set[2] = { false, false };   /* [0]=bb_start, [1]=bb_stop */
+    int64_t cp[2]     = { 0, 0 };
+    bool    wp_set[2] = { false, false };
+    int64_t wp[2]     = { 0, 0 };
+
+    void apply(bool is_wp, int which, int64_t delta, int64_t stop_dflt) {
+        int64_t dflt = which ? stop_dflt : 0;
+        int64_t base;
+        if (is_wp) {
+            base = wp_set[which] ? wp[which]
+                                 : (cp_set[which] ? cp[which] : dflt);
+        } else {
+            base = cp_set[which] ? cp[which] : dflt;
+        }
+        int64_t v = base + delta;
+        if (is_wp) { wp[which] = v; wp_set[which] = true; }
+        else       { cp[which] = v; cp_set[which] = true; }
+    }
+    /* Resolved [start, stop) for one overlay, defaults applied. */
+    void resolve(bool is_wp, uint32_t n_insns,
+                 uint32_t *start, uint32_t *stop) const {
+        int64_t st, en;
+        if (is_wp) {
+            st = wp_set[0] ? wp[0] : (cp_set[0] ? cp[0] : 0);
+            en = wp_set[1] ? wp[1] : (cp_set[1] ? cp[1] : (int64_t)n_insns);
+        } else {
+            st = cp_set[0] ? cp[0] : 0;
+            en = cp_set[1] ? cp[1] : (int64_t)n_insns;
+        }
+        *start = (st > 0 && st <= (int64_t)n_insns) ? (uint32_t)st : 0;
+        *stop  = (en > 0 && en <= (int64_t)n_insns) ? (uint32_t)en : n_insns;
+    }
+};
+
 static inline void tally_fd_record(
     cst::Reader &sec, const FidTables &fid, const cst::ResolvedIds &ids,
     std::array<Bucket, NUM_BUCKETS> *fd_b,
     uint32_t *ipos, const cst::Template *tmpl, bool is_wp, Stats *s,
-    const LintCtx *lctx)
+    const LintCtx *lctx, RangeCells *rc)
 {
     size_t before = sec.consumed();
     *ipos += (uint32_t)sec.uleb();           /* ipos delta (accumulates) */
@@ -331,7 +382,11 @@ static inline void tally_fd_record(
         ((*lctx->row)[*ipos] & cst::AttributionLint::MEM_IMPOSSIBLE);
     bool want_bimodal = lctx && lctx->bimodal && is_count_fid &&
         lctx->bimodal->tracks(lctx->template_id);
-    if (want_impossible || want_bimodal) {
+    /* Executed-range cells (BB_START/BB_STOP at BLOCK_POS): mirrored so
+     * instruction accounting sums realised ranges, not num_insns. */
+    bool is_range_fid = rc && tmpl &&
+        (f == ids.fid_bb_start || f == ids.fid_bb_stop);
+    if (want_impossible || want_bimodal || is_range_fid) {
         std::array<uint64_t, 8> wd = sec.sleb_wide();  /* same bytes */
         if (want_impossible) {
             lctx->tracker->on_count_delta(lctx->thread, lctx->template_id,
@@ -341,6 +396,10 @@ static inline void tally_fd_record(
         if (want_bimodal) {
             lctx->bimodal->on_count_delta(lctx->thread, lctx->template_id,
                                           *ipos, wd[0]);
+        }
+        if (is_range_fid) {
+            rc->apply(is_wp, f == ids.fid_bb_stop ? 1 : 0,
+                      (int64_t)wd[0], (int64_t)tmpl->insns.size());
         }
     } else {
         sec.skip_varint();                   /* sleb_wide delta */
@@ -378,8 +437,6 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
                cst::MemopBimodalityLint *bimodal /* nullptr disables it */)
 {
     const bool have_wp = (header_flags & ids.flag_wp) != 0;
-    const bool have_fault = (ids.flag_fault != 0) &&
-                            (header_flags & ids.flag_fault) != 0;
     const FidTables fid(ids);
     auto tmpl_for = [&](int32_t tid) -> const cst::Template * {
         auto it = by_id.find((uint32_t)tid);
@@ -399,6 +456,17 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
     int32_t current_asid = 0;
     std::vector<bool> seen_asids;
 
+    /* Executed-range cell state, keyed (asid, thread) -> template_id,
+     * mirroring the writer's per-context overlays so instruction
+     * accounting can sum each entry's realised [bb_start, bb_stop). */
+    std::unordered_map<uint64_t,
+                       std::unordered_map<uint32_t, RangeCells>> range_state;
+    auto range_cells_for = [&](int32_t tid) -> RangeCells * {
+        uint64_t ck = ((uint64_t)(uint32_t)current_asid << 32) |
+                      (uint32_t)current_thread;
+        return &range_state[ck][(uint32_t)tid];
+    };
+
     while (!body.eof()) {
         size_t tag_start = body.consumed();
         uint8_t tag = body.u8();
@@ -408,12 +476,9 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
             prev_cp_tid += (int32_t)tdelta;
             s->cp_entry_framing.bytes += body.consumed() - tag_start;
             s->cp_entries++;
-            if (prev_cp_tid >= 0) {
-                auto it = insns_by_tid.find((uint32_t)prev_cp_tid);
-                if (it != insns_by_tid.end()) {
-                    s->cp_total_insns += it->second;
-                }
-            }
+            /* cp_total_insns is summed AFTER the section: the entry
+             * contributes its realised range (§4.2a), whose cells ride
+             * the section's tail. */
 
             /* CP field-delta section.  Account the length prefix by
              * subtracting payload size (captured via remaining()
@@ -451,11 +516,12 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
                 (uint32_t)current_thread, (uint32_t)prev_cp_tid,
                 s->cp_entries, bimodal,
             };
+            RangeCells *cp_rc = range_cells_for(prev_cp_tid);
             uint32_t cp_ipos = 0;
             for (uint64_t r = 0; r < n_records; r++) {
                 tally_fd_record(sec, fid, ids, &cpfd_b,
                                 &cp_ipos, cp_tmpl, /*is_wp=*/false, s,
-                                &lctx);
+                                &lctx, cp_rc);
             }
             if (sec.consumed() != sec_end) {
                 throw std::runtime_error("CP field-delta had trailing bytes");
@@ -467,31 +533,23 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
             tracker.on_cp_entry_end((uint32_t)current_thread,
                                     (uint32_t)prev_cp_tid);
 
-            /* Per-entry sync-fault trailer (CST_FLAG_FAULT): exception-nesting
-             * depth ULEB, between the CP delta and the WP sections.  Charge
-             * its bytes to CP-field-delta overhead so the budget rolls to
-             * 100%. */
-            uint64_t cp_fault_anchors = 0;
-            if (have_fault) {
-                size_t ft_st = body.consumed();
-                (void)body.uleb();                  /* fault depth */
-                uint64_t n_anchors = body.uleb();   /* anchor count */
-                cp_fault_anchors = n_anchors;
-                for (uint64_t a = 0; a < n_anchors; a++) {
-                    (void)body.uleb();
-                }
-                size_t ft_bytes = body.consumed() - ft_st;
-                s->cp_field_delta.bytes += ft_bytes;
-                cpfd_b[BIDX_OVERHEAD].bytes += ft_bytes;
-                cpfd_b[BIDX_OVERHEAD].count += 1;
+            /* Instruction accounting sums the entry's realised range
+             * (§4.2a): bb_stop - bb_start, resolved from the persistent
+             * block cells after the whole section applied. */
+            uint32_t cp_rs = 0, cp_re = 0;
+            uint32_t cp_n = cp_tmpl ? (uint32_t)cp_tmpl->insns.size() : 0;
+            cp_rc->resolve(/*is_wp=*/false, cp_n, &cp_rs, &cp_re);
+            if (cp_re > cp_rs) {
+                s->cp_total_insns += cp_re - cp_rs;
             }
+            const bool cp_partial = cp_tmpl && (cp_rs > 0 || cp_re < cp_n);
 
             /* Bimodality histogram: this execution's realised-memop
              * verdict (its running total, after this entry's own deltas)
-             * folds into the template's zero/nonzero tally.  Folded only
-             * AFTER the fault trailer is read, because an entry carrying
-             * fault anchors was truncated mid-template and is excluded
-             * from the population — see MemopBimodalityLint. */
+             * folds into the template's zero/nonzero tally.  An entry
+             * whose declared range is partial ran a strict subset of the
+             * block and is excluded from the population — the range
+             * predicate replaces the old fault-anchor one (§4.2a). */
             if (bimodal) {
                 /* CST_BIMODAL_DIAG=<tid>: one line per zero-memop CP
                  * execution of that template — investigation aid, off
@@ -505,15 +563,14 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
                                            (uint32_t)prev_cp_tid) == 0) {
                     std::fprintf(stderr,
                         "BIMODAL_DIAG entry=%llu thread=%d tid=%d "
-                        "n_records=%llu fault_anchors=%llu\n",
+                        "n_records=%llu range=[%u,%u)\n",
                         (unsigned long long)s->cp_entries, current_thread,
                         prev_cp_tid, (unsigned long long)n_records,
-                        (unsigned long long)cp_fault_anchors);
+                        cp_rs, cp_re);
                 }
                 bimodal->on_cp_entry_end((uint32_t)current_thread,
                                          (uint32_t)prev_cp_tid,
-                                         /*fault_truncated=*/
-                                         cp_fault_anchors > 0);
+                                         /*fault_truncated=*/cp_partial);
             }
 
             /* WP chain + events present only under CST_FLAG_WP. */
@@ -529,12 +586,9 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
             s->wp_chain_envelope.bytes +=
                 (wpb.consumed() - wp_in_start) + wp_env_payload;
 
-            /* Chain header (format.rst Step 6.8): num_wp packed with the
-             * CST_WP_CHAIN_HAS_EVENTS bit that announces whether a
-             * wp_events_section follows this entry on the wire. */
-            uint64_t chain_hdr = wpb.uleb();
-            uint64_t num_wp = chain_hdr >> 1;
-            bool has_wp_events = (chain_hdr & ids.wp_chain_has_events) != 0;
+            /* Chain header (format.rst Step 6.8): the bare block count,
+             * nothing packed into it. */
+            uint64_t num_wp = wpb.uleb();
             int32_t prev_wp_tid = 0;
             for (uint64_t w = 0; w < num_wp; w++) {
                 size_t wfs = wpb.consumed();
@@ -542,12 +596,6 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
                 prev_wp_tid += (int32_t)wd;
                 s->wp_entry_framing.bytes += wpb.consumed() - wfs;
                 s->wp_entry_framing.count += 1;
-                if (prev_wp_tid >= 0) {
-                    auto it = insns_by_tid.find((uint32_t)prev_wp_tid);
-                    if (it != insns_by_tid.end()) {
-                        s->wp_total_insns += it->second;
-                    }
-                }
 
                 size_t wp_sec_in = wpb.consumed();
                 uint64_t wp_sec_payload = wpb.uleb();
@@ -570,30 +618,28 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
                     lint->note_dangling((uint32_t)prev_wp_tid,
                                         /*is_wp=*/true);
                 }
+                RangeCells *wp_rc = range_cells_for(prev_wp_tid);
                 uint32_t wp_ipos = 0;
                 for (uint64_t r = 0; r < wp_nrec; r++) {
                     tally_fd_record(wpsec, fid, ids, &wpfd_b,
                                     &wp_ipos, wp_tmpl, /*is_wp=*/true, s,
-                                    /*lctx=*/nullptr);
+                                    /*lctx=*/nullptr, wp_rc);
                 }
                 if (wpsec.consumed() != wp_sec_end) {
                     throw std::runtime_error("WP field-delta had trailing bytes");
+                }
+                /* WP instruction accounting: the block's realised range
+                 * (its own BLOCK_POS cells, WP -> CP -> default). */
+                uint32_t wp_rs = 0, wp_re = 0;
+                uint32_t wp_n = wp_tmpl ? (uint32_t)wp_tmpl->insns.size() : 0;
+                wp_rc->resolve(/*is_wp=*/true, wp_n, &wp_rs, &wp_re);
+                if (wp_re > wp_rs) {
+                    s->wp_total_insns += wp_re - wp_rs;
                 }
             }
             s->wp_entries_total += num_wp;
             if (wpb.consumed() != wp_env_end) {
                 throw std::runtime_error("WP chain had trailing bytes");
-            }
-
-            /* WP events sub-section: opaque to audit — skip in place.
-             * Entirely absent from the wire (no length prefix) unless
-             * the chain header's HAS_EVENTS bit, just decoded above,
-             * announced one. */
-            if (has_wp_events) {
-                size_t ev_in = body.consumed();
-                uint64_t ev_payload = body.uleb();
-                body.skip(ev_payload);
-                s->wp_events.bytes += body.consumed() - ev_in;
             }
             continue;
         }
@@ -624,29 +670,8 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
 
         if (tag == ids.body_tag_iframe) {
             { uint64_t n = body.uleb(); body.skip(n); }   /* cp delta section */
-            if (have_fault) {
-                (void)body.uleb();                        /* fault depth      */
-                uint64_t na = body.uleb();                /* anchor count     */
-                for (uint64_t a = 0; a < na; a++) {
-                    (void)body.uleb();
-                }
-            }
             if (have_wp) {
-                /* wp chain: peek the leading chain_hdr ULEB (packs
-                 * num_wp with CST_WP_CHAIN_HAS_EVENTS) before skipping
-                 * the rest of the section's payload. */
-                bool has_wp_events = false;
-                {
-                    uint64_t n = body.uleb();
-                    size_t chain_end = body.consumed() + n;
-                    uint64_t chain_hdr = body.uleb();
-                    has_wp_events = (chain_hdr & ids.wp_chain_has_events) != 0;
-                    body.skip_to_consumed(chain_end);
-                }
-                /* wp events: entirely absent unless has_wp_events. */
-                if (has_wp_events) {
-                    uint64_t n = body.uleb(); body.skip(n);
-                }
+                uint64_t n = body.uleb(); body.skip(n);   /* wp chain section */
             }
             s->iframe_count++;
             s->iframe_bytes.bytes += body.consumed() - tag_start;
@@ -706,7 +731,6 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
     s->cp_field_delta.count = s->cp_entries;
     s->wp_chain_envelope.count = s->cp_entries;
     s->wp_field_delta.count = s->wp_entries_total;
-    s->wp_events.count = s->cp_entries;
     s->iframe_bytes.count = s->iframe_count;
     s->regfile_bytes.count = s->regfile_count;
 }
@@ -992,8 +1016,6 @@ void print_report(const Stats &s, const cst::Header &h)
     std::printf("%s\n", row("    WP field-delta section",
                              s.wp_field_delta.bytes, body,
                              s.wp_entries_total, "WP").c_str());
-    std::printf("%s\n", row("WP events", s.wp_events.bytes, body,
-                             s.cp_entries, "entry").c_str());
     std::printf("%s\n", row("IFRAME records (validation redundancy)",
                              s.iframe_bytes.bytes, body,
                              s.iframe_count, "iframe").c_str());
@@ -1024,6 +1046,7 @@ void print_report(const Stats &s, const cst::Header &h)
         {"lane masks",           BIDX_LANE_MASK},
         {"physical pages",       BIDX_PHYS_PAGE},
         {"branch outcome",       BIDX_BRANCH},
+        {"block-level (range/flags/depth)", BIDX_BLOCK},
         {"other",                BIDX_OTHER},
     };
     for (auto &r : rows) {
@@ -1268,7 +1291,6 @@ int main(int argc, char **argv)
                      + s.thread_switch.bytes
                      + s.asid_switch.bytes
                      + s.wp_chain_envelope.bytes
-                     + s.wp_events.bytes
                      + s.iframe_bytes.bytes
                      + s.regfile_bytes.bytes
                      + s.devio_start.bytes

@@ -496,36 +496,59 @@ bool timer_expired(QEMUTimer *timer_head, int64_t current_time)
 }
 
 /*
- * Report a device whose timer callback made no progress (see the bound in
- * timerlist_run_timers()).  Once PER CALLBACK, not once per process: the
- * whole point is that a second offender must still be heard, and a
- * warn_report_once() here would be silenced by whichever device happened to
- * be first.  The table is tiny and never grows -- past its end the report
- * degrades to once-per-process, which is still louder than nothing.  Called
- * with the list lock held, so the table needs no lock of its own beyond the
- * fact that different lists can race: a duplicate line is harmless.
+ * Report a timer whose deadline did not move forward (see the bound in
+ * timerlist_run_timers()).
+ *
+ * TWO callbacks are named because two are involved and they are not always
+ * the same one.  @armer is the callback the pass had just finished running
+ * when the deferred timer turned up at the head of the list -- the one that
+ * did the arming.  @deferred is the callback of the timer being put off.
+ * They coincide for a device re-arming its OWN timer, and they do not for a
+ * cycle of devices arming EACH OTHER, where naming only the deferred timer
+ * points at the victim and leaves the device that armed it unnamed.
+ *
+ * Once PER PAIR, not once per process: a warn_report_once() here would be
+ * silenced by whichever device happened to be first, and keying on the
+ * deferred callback alone would let one victim consume the report for every
+ * offender that arms it.  The table is tiny and never grows -- past its end
+ * the report degrades to once-per-process, which is still louder than
+ * nothing.  Called with a list lock held, and different lists run
+ * concurrently, so the slot is published with a release store and read with
+ * an acquire load; the worst a race can then do is print a duplicate line.
  */
-static void timer_warn_no_progress(QEMUTimerCB *cb, int64_t expire)
+static void timer_warn_no_progress(QEMUTimerCB *armer, QEMUTimerCB *deferred,
+                                   int64_t expire)
 {
-    static QEMUTimerCB *warned[8];
+    static struct { QEMUTimerCB *armer, *deferred; } warned[8];
     static unsigned n_warned;
-    unsigned i, n = qatomic_read(&n_warned);
+    unsigned i, n = qatomic_load_acquire(&n_warned);
 
     for (i = 0; i < n && i < ARRAY_SIZE(warned); i++) {
-        if (warned[i] == cb) {
+        if (warned[i].armer == armer && warned[i].deferred == deferred) {
             return;
         }
     }
     if (n < ARRAY_SIZE(warned)) {
-        warned[n] = cb;
-        qatomic_set(&n_warned, n + 1);
-        warn_report("timer callback %p re-armed its own timer for a deadline "
-                    "it had already been run for (%" PRId64 "); deferring it "
-                    "to the next pass rather than looping on it -- this is a "
-                    "bug in that device model", cb, expire);
+        warned[n].armer = armer;
+        warned[n].deferred = deferred;
+        qatomic_store_release(&n_warned, n + 1);
+        if (armer == deferred) {
+            warn_report("timer callback %p re-armed its own timer for a "
+                        "deadline it had already been run for (%" PRId64 "); "
+                        "deferring it to the next pass rather than looping on "
+                        "it -- this is a bug in that device model", deferred,
+                        expire);
+        } else {
+            warn_report("timer callback %p armed the timer of callback %p for "
+                        "a deadline that timer had already been run for "
+                        "(%" PRId64 "); deferring it to the next pass rather "
+                        "than looping on it -- these two device models are "
+                        "arming each other and neither is making progress",
+                        armer, deferred, expire);
+        }
     } else {
         warn_report_once("timer callback %p made no progress; deferring "
-                         "(and the report table is full)", cb);
+                         "(and the report table is full)", deferred);
     }
 }
 
@@ -683,9 +706,16 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
          * here.  That costs nothing: main_loop_wait comes straight back
          * round, so the timer is late by at most one poll -- and the BQL is
          * dropped in between, so the vCPUs run and whatever was freezing the
-         * clock gets to unfreeze it.  Say so, and say it once per callback
+         * clock gets to unfreeze it.  Say so, and say it once per pair
          * rather than once per process, so a second offending device is
          * still reported.
+         *
+         * The report names @cb as well as the head's callback.  In the
+         * mutual case those are DIFFERENT devices, and the deferred timer
+         * belongs to the one that did not arm it: reporting the head alone
+         * names the victim, tells the operator it "re-armed its own timer"
+         * when it did not, and spends the pair's single report on it while
+         * the device that actually armed it is never mentioned.
          *
          * @head is only dereferenced after it is read back off the list, so
          * a callback that deleted its own timer is never touched.
@@ -694,7 +724,7 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
         if (head && head->last_run_pass == pass &&
             timer_expired_ns(head, current_time) &&
             head->expire_time <= head->last_run_expire) {
-            timer_warn_no_progress(head->cb, head->expire_time);
+            timer_warn_no_progress(cb, head->cb, head->expire_time);
             qemu_mutex_unlock(&timer_list->active_timers_lock);
             goto out;
         }

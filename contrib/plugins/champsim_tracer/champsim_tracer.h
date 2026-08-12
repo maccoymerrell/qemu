@@ -256,45 +256,44 @@ inline constexpr size_t CST_EVQ_TB_EVENT_MAX = 512 + 4;
 #define CST_DEP_BLOCK_HAS_REG       (1u << 0)
 #define CST_DEP_BLOCK_HAS_ADDR      (1u << 1)
 
-/* WP event flags byte */
-#define CST_WP_EVENT_TRANSLATION_UNAVAIL (1u << 0)
-/* This wrong-path BB contains a SYNTHETIC-DATA FAULT at fault_insn_index: a
- * speculative memory access to an absent/unreadable page was served a
- * deterministic placeholder value (plugin_spec_garbage_fill), or a
- * mid-block execution-time exception (arithmetic overflow, illegal opcode,
- * alignment, a conditional trap) was skipped, its stale destination left as
- * a deterministic placeholder.  On a mispredicted path no instruction
- * retires, so neither kind is ever taken by a real core; the excursion
- * CONTINUES past it to the wpdepth budget.  Only a fault AT the BB's
- * terminator that is itself a syscall-type control transfer (a real
- * privilege escalation the single-address-space spec model cannot follow)
- * TERMINATES the excursion here instead, sealing this block as the chain's
- * last.  See docs/format.rst §4.4. */
-#define CST_WP_EVENT_FAULT               (1u << 1)
-/* Bit 2 is free — unassigned, reserved for a future event flag.  Writers
- * write it 0; readers ignore it (reserved-bits rule, docs/format.rst). */
-
 /*
- * WP chain header flag: packed into the low bit of the wp_chain_section's
- * leading ULEB (docs/format.rst Step 6.8), alongside num_wp in the
- * remaining high bits (num_wp = chain_hdr >> 1).  Set when a
- * wp_events_section (Step 6.9) follows the chain on the wire; when clear,
- * the events section is entirely absent from this entry — no length
- * prefix, no payload — rather than present-but-empty.
- *
- * Event density is workload-dependent — measured traces range from ~1%
- * of CP entries carrying any wrong-path event (see docs/format.rst §4.4)
- * up to ~22% on a fault-heavy user-mode workload — but the no-event
- * majority always paid the unconditional wp_events_section's two-byte
- * empty-section framing (outer length prefix + num_events=0) for no
- * informational content.  Packing the presence bit
- * into the chain header's existing leading ULEB — rather than adding a
- * dedicated per-entry flag byte — keeps the common (no-event) case at
- * zero added bytes: the chain header is already unconditionally present
- * once CST_FLAG_WP is set, so this reinterprets an existing field instead
- * of introducing a new one.
+ * Block-level flag bits — the value of CST_FID_BB_FLAGS, a block-level
+ * field-delta record addressed at the reserved position BLOCK_POS
+ * (docs/format.rst §5.7).  Resolved through the `bb_flag` encoding map.
+ * They replace the 0x1D wp_events side-section: each condition rides the
+ * block it describes as an ordinary sparse field record, so a block with
+ * nothing to report emits no record and no side framing exists.
  */
-#define CST_WP_CHAIN_HAS_EVENTS           (1u << 0)
+/* This wrong-path BB contains a SYNTHETIC-DATA FAULT at the instruction
+ * index its sibling CST_FID_BB_FAULT_INSN record names: a speculative
+ * memory access to an absent/unreadable page was served a deterministic
+ * placeholder value (plugin_spec_garbage_fill), or a mid-block
+ * execution-time exception (arithmetic overflow, illegal opcode,
+ * alignment, a conditional trap) was skipped, its stale destination left
+ * as a deterministic placeholder.  On a mispredicted path no instruction
+ * retires, so neither kind is ever taken by a real core; the excursion
+ * CONTINUES past it to the wpdepth budget.  An attribute, never a
+ * terminator (docs/format.rst §4.4). */
+#define CST_BB_FLAG_SYNTHETIC_FAULT        (1u << 0)
+/* This wrong-path BB is its excursion's LAST: the next speculative
+ * fetch's target could not be translated (docs/format.rst §4.4).  The
+ * sole excursion stop the wire names. */
+#define CST_BB_FLAG_TRANSLATION_UNAVAIL    (1u << 1)
+/* Set on a CORRECT-PATH entry whose wrong-path excursion was kicked but
+ * whose FIRST target could not be fetched/translated, so the chain is
+ * empty (num_wp == 0) and there is no chain block to carry the marker
+ * (docs/format.rst §4.4). */
+#define CST_BB_FLAG_WP_FIRST_TARGET_UNAVAIL (1u << 2)
+/* This entry is the last one its (thread_id, asid) context contributes
+ * to the segment (docs/format.rst §4.2a). */
+#define CST_BB_FLAG_THREAD_END             (1u << 3)
+/* This entry's range contains its terminating branch, but the successor
+ * was never observed: the CST_FID_BRANCH_TAKEN / _TARGET cells were NOT
+ * re-staged and their decoded values are a stale repeat, not this
+ * block's outcome.  Absence of the two records plus this flag is the
+ * wire's way of saying "unresolved" — the writer never publishes a
+ * fabricated outcome as if observed (docs/format.rst §5.6). */
+#define CST_BB_FLAG_BRANCH_UNRESOLVED      (1u << 4)
 
 /* Header feature flags.  MEM_DATA / REG_DATA advise which optional
  * field-ID families may appear (the field IDs still determine actual
@@ -305,12 +304,13 @@ inline constexpr size_t CST_EVQ_TB_EVENT_MAX = 512 + 4;
 #define CST_FLAG_MEM_DATA      (1 << 0)  /* CST_FID_LOAD_DATA / STORE_DATA */
 #define CST_FLAG_REG_DATA      (1 << 1)  /* CST_FID_DST_REG values        */
 #define CST_FLAG_PROFILE       (1 << 2)  /* §6 profile block per template  */
-#define CST_FLAG_WP            (1 << 3)  /* per-entry WP chain + events    */
-#define CST_FLAG_FAULT         (1 << 4)  /* per-entry sync-fault trailer
-                                          * (exception-nesting depth, +
-                                          * anchor on a faulting BB); set in
-                                          * system mode so user-mode traces
-                                          * carry no trailer */
+#define CST_FLAG_WP            (1 << 3)  /* per-entry WP chain section     */
+#define CST_FLAG_FAULT         (1 << 4)  /* advisory: CST_FID_BB_FAULT_DEPTH
+                                          * records may carry depth > 0 (set
+                                          * in system mode).  No structural
+                                          * bytes hang off it — the depth is
+                                          * an ordinary block-level field
+                                          * record at BLOCK_POS (§5.7) */
 #define CST_FLAG_PHYSADDR      (1 << 5)  /* CST_FID_LOAD_PPAGE / STORE_PPAGE
                                           * families present: per-memop
                                           * physical PAGE bases for paddr
@@ -468,8 +468,37 @@ inline constexpr size_t CST_EVQ_TB_EVENT_MAX = 512 + 4;
 #define CST_FID_BRANCH_TAKEN      (CST_FID_BRANCH_BLOCK_BASE + 0)
 #define CST_FID_BRANCH_TARGET     (CST_FID_BRANCH_BLOCK_BASE + 1)
 
+/* Block-level singletons (always present).  Five per-BLOCK fields
+ * addressed at the reserved position BLOCK_POS = template.num_insns —
+ * one past the template's instruction array — inside the same
+ * cp_delta_section / wp_delta_section as the per-instruction records
+ * (docs/format.rst §5.7).  They state facts about the block execution
+ * itself:
+ *   CST_FID_BB_START / CST_FID_BB_STOP — the executed range
+ *     [bb_start, bb_stop), template instruction indices, stop
+ *     EXCLUSIVE.  Baseline defaults 0 and the template's own num_insns
+ *     (the only per-template baseline outside the insn-metadata
+ *     family), so a whole-block run carries neither record.
+ *   CST_FID_BB_FLAGS — CST_BB_FLAG_* bitmask (bb_flag map), default 0.
+ *   CST_FID_BB_FAULT_DEPTH — exception-nesting depth this CP block
+ *     executed at (§4.2a), default 0; advisorily gated on
+ *     CST_FLAG_FAULT.  CP blocks only.
+ *   CST_FID_BB_FAULT_INSN — instruction index of a WP block's
+ *     synthetic-data fault (§4.4), default 0, meaningful only under
+ *     CST_BB_FLAG_SYNTHETIC_FAULT.  WP blocks only.
+ * All delta-persist per (template_id, BLOCK_POS, fid) like every other
+ * cell: omission means "unchanged", never "absent", so the writer MUST
+ * re-stage a value whenever it differs from the cell — including the
+ * return to a default. */
+#define CST_FID_BB_BLOCK_BASE     (CST_FID_BRANCH_TARGET + 1)
+#define CST_FID_BB_START          (CST_FID_BB_BLOCK_BASE + 0)
+#define CST_FID_BB_STOP           (CST_FID_BB_BLOCK_BASE + 1)
+#define CST_FID_BB_FLAGS          (CST_FID_BB_BLOCK_BASE + 2)
+#define CST_FID_BB_FAULT_DEPTH    (CST_FID_BB_BLOCK_BASE + 3)
+#define CST_FID_BB_FAULT_INSN     (CST_FID_BB_BLOCK_BASE + 4)
+
 /* Total well-known field-id count, for sanity / encoding-map size. */
-#define CST_FID_COUNT            (CST_FID_BRANCH_TARGET + 1)
+#define CST_FID_COUNT            (CST_FID_BB_FAULT_INSN + 1)
 
 /*
  * Field-ID map disjointness.  Every block above derives its base and
@@ -496,6 +525,12 @@ static_assert(CST_FID_PPAGE_BLOCK_BASE > CST_FID_EXTENDED,
               "ppage block overlaps the EXTENDED escape");
 static_assert(CST_FID_BRANCH_BLOCK_BASE > CST_FID_PPAGE_BLOCK_END,
               "branch block overlaps the ppage block");
+static_assert(CST_FID_BB_BLOCK_BASE > CST_FID_BRANCH_TARGET,
+              "block-level block overlaps the branch block");
+/* The whole well-known space must stay within the 2-byte ULEB128 band
+ * (< 2^14) so no field-id record ever pays a third id byte. */
+static_assert(CST_FID_COUNT <= (1 << 14),
+              "field-id space exceeds the 2-byte ULEB128 band");
 /* Slot 0 of every slotted family, plus the hot singletons, must stay in
  * the 1-byte ULEB range so the common per-memop record costs one byte. */
 static_assert(CST_FID_DST_REG_WIDTH_BASE < 128,
@@ -1115,20 +1150,33 @@ struct BodyEntry {
     /* The wrong-path excursion was kicked but its FIRST target could
      * not be fetched/translated (wp_entries is empty, so there is no
      * WPBBEntry to carry translation_unavailable).  The body writer
-     * emits it as a chain-level CST_WP_EVENT_TRANSLATION_UNAVAIL event
-     * (resolved index >= num_wp; see docs/format.rst §4.4).
+     * emits it as CST_BB_FLAG_WP_FIRST_TARGET_UNAVAIL on this CP
+     * entry's own block record (docs/format.rst §4.4).
      * Set from simulate_wrong_path_ext's first_tb_unavail out-param;
      * always false in user mode and on REP fan-out sub-entries. */
     bool wp_first_tb_unavail = false;
     BBTemplate *tmpl;  /* Non-owning; for per-insn schema access */
+    /* Executed range [bb_start, bb_stop) of tmpl's instructions this
+     * entry fully observed — template instruction indices, bb_stop
+     * EXCLUSIVE (docs/format.rst §4.2a).  Stamped alongside tmpl at
+     * every construction site; a whole-block run is [0, n_insns).
+     * Emitted as CST_FID_BB_START / CST_FID_BB_STOP block records at
+     * BLOCK_POS, against baseline defaults 0 / num_insns, so the
+     * whole-block case costs zero bytes. */
+    uint32_t bb_start = 0;
+    uint32_t bb_stop = 0;
     /* Exception-nesting depth at which this BB executed: 0 = normal code,
      * >=1 = synchronous-fault handler code that detoured execution at that
-     * nesting level (system-mode).  Emitted as a metaflag-gated per-entry
-     * trailer; absent/0 on a normal entry so user-mode output is unchanged. */
+     * nesting level (system-mode).  Emitted as a CST_FID_BB_FAULT_DEPTH
+     * block record at BLOCK_POS; delta-persistent, so a depth repeated by
+     * the same template costs zero bytes and user-mode stays all-default. */
     uint32_t fault_depth = 0;
     /* For a faulting BB reassembled across its fault excursions (whole-BB
      * merge): the indices of the instructions that faulted, one per
-     * excursion, in order.  Empty for ordinary entries. */
+     * excursion, in order.  Empty for ordinary entries.  NOT on the wire
+     * as of epoch 0x1E — the executed range replaces the anchor list (a
+     * continuation entry's bb_start IS the resume index); the field
+     * survives only until the merge machinery itself is removed. */
     std::vector<uint32_t> fault_anchors;
     /* Wire thread identity: always a GUEST-THREAD id, stable across vCPU
      * migration and distinct for threads that time-slice one vCPU.  System
@@ -1173,13 +1221,11 @@ struct BodyEntry {
      * the cut-short walk all call emit_body_entry on this default, so it is
      * not confined to a segment's last entry and a close that flushes a peer
      * vCPU's held slot plants one in the middle of the guest's execution.
-     * The FIDs are then omitted, which is NOT the same as blank: they
-     * delta-persist per (ins_pos, fid), so the decoder reads the slot's
-     * previous occupant and marks it valid, publishing a direction and target
-     * this block never took.  Direction and target are derived at emit time
-     * from the successor and the template's fall-through, and the unresolved
-     * emissions are counted (branch_outcome_unresolved_cp / _wp) — see
-     * emit_field_delta_section. */
+     * The FIDs are then omitted AND the entry's block record carries
+     * CST_BB_FLAG_BRANCH_UNRESOLVED (when its range contains the branch),
+     * so a consumer reads the stale cells as explicitly unresolved instead
+     * of as a repeat outcome — see emit_field_delta_section and
+     * docs/format.rst §5.6. */
     uint64_t branch_successor_pc = 0;
     bool     branch_successor_known = false;
 };
@@ -1539,8 +1585,9 @@ struct TraceFeatures {
     /* Wrong-path SYNTHETIC-FAULT marking policy: when set, a speculative
      * memory access to an absent/unreadable page — served a deterministic
      * placeholder value instead of real memory (accel/tcg garbage-fill seam) —
-     * marks its owning WP BB entry with CST_WP_EVENT_FAULT at the faulting
-     * insn.  The excursion CONTINUES on the placeholder (no truncation, no
+     * marks its owning WP BB entry with CST_BB_FLAG_SYNTHETIC_FAULT at the
+     * faulting insn (CST_FID_BB_FAULT_INSN).  The excursion CONTINUES on the
+     * placeholder (no truncation, no
      * poison): on a mispredicted path no instruction retires, so the fault is
      * never taken by a real core.  A non-memory synchronous fault (arithmetic
      * / illegal opcode) still stops the excursion cleanly at its marked BB
@@ -1700,9 +1747,9 @@ typedef struct _WideRegSnap WideRegSnap;
  * @first_tb_unavail is set when the excursion's FIRST wrong-path
  * target could not be fetched/translated (genuine null, no flush): the
  * returned chain is empty and carries no WPBBEntry to mark, so the
- * condition rides this out-param instead.  The emitter records it as a
- * chain-level CST_WP_EVENT_TRANSLATION_UNAVAIL event (§4.4 of
- * docs/format.rst). */
+ * condition rides this out-param instead.  The emitter records it as
+ * CST_BB_FLAG_WP_FIRST_TARGET_UNAVAIL on the owning CP entry's block
+ * record (§4.4 of docs/format.rst). */
 #ifdef __cplusplus
 std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
                                                uint64_t correct_target,

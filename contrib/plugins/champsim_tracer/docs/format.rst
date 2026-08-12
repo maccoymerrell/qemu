@@ -1169,6 +1169,10 @@ correct-path and wrong-path block can carry:
   could not be fetched, so the chain is empty (§4.4)
 - ``CST_BB_FLAG_THREAD_END`` — this entry is the last one this
   ``(thread_id, asid)`` context contributes to the segment (§4.2a)
+- ``CST_BB_FLAG_BRANCH_UNRESOLVED`` — this entry's range contains its
+  terminating branch, but the successor was never observed; the
+  branch-outcome cells were not re-staged and hold a stale repeat, not
+  this block's outcome (§5.6)
 
 The vocabulary is open like every other map: a bit whose name the
 trace does not carry is not set anywhere in that trace, and a reader
@@ -2770,12 +2774,15 @@ Coverage and gating:
      pass the terminating branch has no outcome, whatever the cells hold —
      and never by whether records were present.
      A block whose range *does* contain the branch, but whose successor the
-     writer could not resolve, would publish a **direction and target it
-     never took**, indistinguishable on the wire from a block that genuinely
-     repeated its last outcome; the wire cannot say "unresolved".  The writer
-     counts any such emission in ``branch_outcome_unresolved_cp`` /
-     ``branch_outcome_unresolved_wp``, and a consumer that trusts branch
-     outcomes must read those before trusting them.
+     writer could not resolve, is the third population, and it is named
+     explicitly: the writer MUST NOT publish an unresolved outcome as if
+     observed.  It stages neither FID and sets
+     ``CST_BB_FLAG_BRANCH_UNRESOLVED`` on that entry's block record
+     (§5.7) — absence of the two records plus the flag *is* the wire's
+     "unresolved".  A consumer reads such an entry's branch cells as
+     stale by construction and takes no outcome from them; the flag,
+     like every block flag, delta-persists and is re-cleared by the
+     writer on the template's next resolved execution.
 * **REP string operations** fan out into one entry per iteration, all at the
   REP PC; the self-looping REP "branch" is reported taken to its own PC for
   every iteration but the last, which exits to the real successor — so the

@@ -353,14 +353,13 @@ static void write_field_id_encoding_map(BitWriter *bw)
 {
     /* Count: 3 hot singletons + 8 slotted families × CST_FID_SLOT_COUNT
      * + 4 lane-mask families × CST_FID_SLOT_COUNT + 7 insn-metadata
-     * + 1 EXTENDED + 2 branch-outcome singletons (always present), plus
-     * (physaddr only) 2 ppage families × slot count.  The ppage families are
-     * advertised only when physical-page capture is active, so a
-     * non-physaddr trace's map differs from a pre-branch writer's only by the
-     * two always-on branch entries. */
+     * + 1 EXTENDED + 2 branch-outcome singletons + 5 block-level
+     * singletons (always present), plus (physaddr only) 2 ppage
+     * families × slot count.  The ppage families are advertised only
+     * when physical-page capture is active. */
     uint64_t n_entries =
         3 + (uint64_t)8 * CST_FID_SLOT_COUNT
-          + (uint64_t)4 * CST_FID_SLOT_COUNT + 7 + 1 + 2;
+          + (uint64_t)4 * CST_FID_SLOT_COUNT + 7 + 1 + 2 + 5;
     if (g_features.physaddr) {
         n_entries += (uint64_t)G_N_ELEMENTS(kPpageFamilies) * CST_FID_SLOT_COUNT;
     }
@@ -428,6 +427,15 @@ static void write_field_id_encoding_map(BitWriter *bw)
          * pre-existing id moves. */
         { CST_FID_BRANCH_TAKEN,     "CST_FID_BRANCH_TAKEN" },
         { CST_FID_BRANCH_TARGET,    "CST_FID_BRANCH_TARGET" },
+        /* Block-level singletons (format.rst §5.7): addressed at the
+         * reserved BLOCK_POS rather than at an instruction.  BB_START /
+         * BB_STOP are structurally required names — a reader that cannot
+         * resolve them must reject the trace (Step 3.3a). */
+        { CST_FID_BB_START,         "CST_FID_BB_START" },
+        { CST_FID_BB_STOP,          "CST_FID_BB_STOP" },
+        { CST_FID_BB_FLAGS,         "CST_FID_BB_FLAGS" },
+        { CST_FID_BB_FAULT_DEPTH,   "CST_FID_BB_FAULT_DEPTH" },
+        { CST_FID_BB_FAULT_INSN,    "CST_FID_BB_FAULT_INSN" },
     };
     for (size_t i = 0; i < G_N_ELEMENTS(insn_fields); i++) {
         write_encoding_entry(bw, insn_fields[i].value, insn_fields[i].name);
@@ -519,16 +527,16 @@ static void write_header_encoding_maps(BitWriter *main_bw)
         { BODY_TAG_DEVIO_START, "BODY_TAG_DEVIO_START" },
         { BODY_TAG_DEVIO_STOP, "BODY_TAG_DEVIO_STOP" },
     };
-    static const EncodingMapEntry wp_event_flag_entries[] = {
-        { CST_WP_EVENT_TRANSLATION_UNAVAIL,
-          "CST_WP_EVENT_TRANSLATION_UNAVAIL" },
-        { CST_WP_EVENT_FAULT, "CST_WP_EVENT_FAULT" },
-    };
-    /* WP chain section header self-description (format.rst Step 6.8):
-     * the bit packed into wp_chain_section's leading ULEB alongside
-     * num_wp. */
-    static const EncodingMapEntry wp_chain_flag_entries[] = {
-        { CST_WP_CHAIN_HAS_EVENTS, "CST_WP_CHAIN_HAS_EVENTS" },
+    /* Block-level flag bits (CST_FID_BB_FLAGS values, format.rst §5.7):
+     * the complete bb_flag vocabulary of this epoch. */
+    static const EncodingMapEntry bb_flag_entries[] = {
+        { CST_BB_FLAG_SYNTHETIC_FAULT, "CST_BB_FLAG_SYNTHETIC_FAULT" },
+        { CST_BB_FLAG_TRANSLATION_UNAVAIL,
+          "CST_BB_FLAG_TRANSLATION_UNAVAIL" },
+        { CST_BB_FLAG_WP_FIRST_TARGET_UNAVAIL,
+          "CST_BB_FLAG_WP_FIRST_TARGET_UNAVAIL" },
+        { CST_BB_FLAG_THREAD_END, "CST_BB_FLAG_THREAD_END" },
+        { CST_BB_FLAG_BRANCH_UNRESOLVED, "CST_BB_FLAG_BRANCH_UNRESOLVED" },
     };
     static const EncodingMapEntry metaflags_entries[] = {
         { CST_METAFLAGS_Z, "CST_METAFLAGS_Z" },
@@ -540,7 +548,7 @@ static void write_header_encoding_maps(BitWriter *main_bw)
 
     BitWriter sub;
     bw_init_buf(&sub);
-    bw_write_uleb128(&sub, 13);
+    bw_write_uleb128(&sub, 12);
     write_named_enum_map(&sub, "opcode", GEN_OP_COUNT, generic_opcode_name);
     write_named_enum_map(&sub, "branch_type", BRANCH_TYPE_COUNT,
                          branch_type_name);
@@ -559,10 +567,8 @@ static void write_header_encoding_maps(BitWriter *main_bw)
         n_body_tags -= 2;   /* omit the trailing DEVIO_START / _STOP names */
     }
     write_encoding_map(&sub, "body_tag", body_tag_entries, n_body_tags);
-    write_encoding_map(&sub, "wp_event_flag", wp_event_flag_entries,
-                       G_N_ELEMENTS(wp_event_flag_entries));
-    write_encoding_map(&sub, "wp_chain_flag", wp_chain_flag_entries,
-                       G_N_ELEMENTS(wp_chain_flag_entries));
+    write_encoding_map(&sub, "bb_flag", bb_flag_entries,
+                       G_N_ELEMENTS(bb_flag_entries));
     write_encoding_map(&sub, "metaflags", metaflags_entries,
                        G_N_ELEMENTS(metaflags_entries));
     write_encoding_map(&sub, "dep_block_flag", dep_block_flag_entries,
@@ -678,7 +684,7 @@ struct BodyStreamState {
      * reused StageRec[] the descriptor walk fills; raw pointer because
      * StageRec is defined further down this TU. */
     RawBuf rec_scratch;
-    /* Reused scratch for the per-record WP chain / events sub-sections
+    /* Reused scratch for the per-record WP chain sub-section
      * (emit_body_record_payload).  Distinct from rec_scratch, which the
      * inner per-BB delta emit uses while this one accumulates the
      * enclosing section — both are live at once during WP-chain build.
@@ -1193,8 +1199,11 @@ static void bw_write_sleb128_u512(BitWriter *bw, U512 v)
  *
  *   - scalar plane (u64 cells): the 3 singletons (N_LOADS / N_STORES /
  *     METAFLAGS) + 7 insn-metadata cells + 2 branch-outcome singletons
- *     in a fixed [0..11] prefix, then 11 scalar slotted families ×
- *     max_slots.
+ *     + 5 block-level singletons in a fixed [0..16] prefix, then 11
+ *     scalar slotted families × max_slots.  The plane spans
+ *     n_positions = n_insns + 1 rows: the last row is the block's
+ *     (BLOCK_POS, §5.7), where only the 5 block-level cells are ever
+ *     addressed.
  *   - wide plane (U512 cells): the 3 genuinely-wide families
  *     (LOAD_DATA / STORE_DATA / DST_REG) × max_slots.
  *
@@ -1207,11 +1216,14 @@ static void bw_write_sleb128_u512(BitWriter *bw, U512 v)
 enum {
     FIELD_STATE_SLOT_INVALID = 0xFFFFu,
     /* Scalar fixed prefix: N_LOADS, N_STORES, METAFLAGS, the 7
-     * insn-metadata cells (BYTES_LO..SIZE), then the 2 branch-outcome
-     * singletons (BRANCH_TAKEN, BRANCH_TARGET) at offsets 10..11.
+     * insn-metadata cells (BYTES_LO..SIZE), the 2 branch-outcome
+     * singletons (BRANCH_TAKEN, BRANCH_TARGET) at offsets 10..11, then
+     * the 5 block-level singletons (BB_START, BB_STOP, BB_FLAGS,
+     * BB_FAULT_DEPTH, BB_FAULT_INSN) at offsets 12..16 — those five are
+     * only ever addressed at the block row (position n_insns).
      * N_SCALAR_SLOTTED scalar slotted families and N_WIDE_SLOTTED wide
      * families follow. */
-    FIELD_STATE_SCALAR_FIXED = 12,
+    FIELD_STATE_SCALAR_FIXED = 17,
     FIELD_STATE_N_SCALAR_FAM = 11,  /* load/store addr, load/store size,
                                      * dst_reg_width, 4 lane masks,
                                      * load/store ppage */
@@ -1239,17 +1251,22 @@ static inline uint32_t fs_wide_stride(uint32_t ms)
 
 typedef struct FieldStateBlock {
     uint32_t  n_insns;
+    /* n_insns + 1: one row per instruction plus the block row at
+     * position n_insns (BLOCK_POS, format.rst §5.7).  Sizes both
+     * planes and bounds every position check; n_insns itself keeps
+     * feeding per-insn stride math and template walks. */
+    uint32_t  n_positions;
     uint32_t  max_slots;       /* high-water slot occupancy (>=1 once live) */
-    uint64_t *scalar_values;   /* [n_insns * fs_scalar_stride(max_slots)] */
+    uint64_t *scalar_values;   /* [n_positions * fs_scalar_stride(max_slots)] */
     uint32_t *scalar_gen;
-    U512     *wide_values;     /* [n_insns * fs_wide_stride(max_slots)]   */
+    U512     *wide_values;     /* [n_positions * fs_wide_stride(max_slots)]   */
     uint32_t *wide_gen;
 } FieldStateBlock;
 
 /*
  * Resolved location of a field-id within the two-plane block.  Built
  * once into g_fid_loc[].  cls picks the plane/kind; for fixed scalar
- * fields `a` is the [0..9] prefix offset; for slotted families `a` is
+ * fields `a` is the [0..16] prefix offset; for slotted families `a` is
  * the family ordinal within its plane and `slot` the slot index.
  */
 /* FS_LOC_* enum lifted up next to kSlottedFamilies (see above). */
@@ -1278,8 +1295,9 @@ struct FieldStateTable {
  * plane/family/slot in the two-plane block.  Replaces an eight-branch
  * chain that was 2.6% of runtime (~80M calls on a 5M-insn mcf trace).
  *
- * Scalar fixed prefix (offsets 0..9):
+ * Scalar fixed prefix (offsets 0..16):
  *   0 N_LOADS  1 N_STORES  2 METAFLAGS  3..9 INSN_BYTES_LO..INSN_SIZE
+ *   10 BRANCH_TAKEN  11 BRANCH_TARGET  12..16 BB_START..BB_FAULT_INSN
  * Scalar slotted families (ordinals 0..8):
  *   0 LOAD_ADDR  1 STORE_ADDR  2 LOAD_SIZE  3 STORE_SIZE  4 DST_REG_WIDTH
  *   5 SRC_LANE  6 DST_LANE  7 LOAD_DATA_LANE  8 STORE_DATA_LANE
@@ -1307,6 +1325,14 @@ static void field_state_slot_lut_build(void)
      * METAFLAGS; prefix offsets 10..11 (see FIELD_STATE_SCALAR_FIXED). */
     set_fixed(CST_FID_BRANCH_TAKEN,  10);
     set_fixed(CST_FID_BRANCH_TARGET, 11);
+    /* Block-level singletons ride the reserved block row (position
+     * n_insns, §5.7); prefix offsets 12..16.  Same scalar plane, same
+     * stride — only the position differs. */
+    set_fixed(CST_FID_BB_START,       12);
+    set_fixed(CST_FID_BB_STOP,        13);
+    set_fixed(CST_FID_BB_FLAGS,       14);
+    set_fixed(CST_FID_BB_FAULT_DEPTH, 15);
+    set_fixed(CST_FID_BB_FAULT_INSN,  16);
 
     /* The 8 stride-CST_FID_SLOT_STRIDE slotted families (shared
      * kSlottedFamilies): cls + family ordinal within plane. */
@@ -1402,11 +1428,12 @@ static FieldStateBlock *field_state_table_get_block(FieldStateTable *table,
 
     FieldStateBlock *block = g_new0(FieldStateBlock, 1);
     block->n_insns = tmpl->n_insns;
+    block->n_positions = tmpl->n_insns + 1;   /* + the block row (§5.7) */
     /* Start at one slot per family — covers the overwhelmingly common
      * scalar BB (≤1 load/store/dst per insn) with no growth.  Variable
      * memop / vector insns grow the block lazily (see ..._ensure_slots). */
     block->max_slots = 1;
-    uint32_t n = block->n_insns;
+    uint32_t n = block->n_positions;
     size_t ss = (size_t)n * fs_scalar_stride(block->max_slots);
     size_t ws = (size_t)n * fs_wide_stride(block->max_slots);
     block->scalar_values = g_new0(uint64_t, ss ? ss : 1);
@@ -1430,7 +1457,7 @@ static void field_state_block_ensure_slots(FieldStateBlock *b, uint32_t need)
     if (need <= b->max_slots) {
         return;
     }
-    uint32_t n = b->n_insns;
+    uint32_t n = b->n_positions;   /* instruction rows + the block row */
     uint32_t old_ms = b->max_slots, new_ms = need;
     uint32_t old_ss = fs_scalar_stride(old_ms), new_ss = fs_scalar_stride(new_ms);
     uint32_t old_ws = fs_wide_stride(old_ms),   new_ws = fs_wide_stride(new_ms);
@@ -1504,7 +1531,7 @@ static inline bool field_state_get_scalar(FieldStateBlock *block,
                                            uint64_t *out)
 {
     size_t index;
-    if (!block || ins_pos >= block->n_insns ||
+    if (!block || ins_pos >= block->n_positions ||
         !fs_scalar_index(block, ins_pos, loc, &index) ||
         block->scalar_gen[index] != table_generation) {
         return false;
@@ -1519,7 +1546,7 @@ static inline bool field_state_get_wide(FieldStateBlock *block,
                                          U512 *out)
 {
     size_t index;
-    if (!block || ins_pos >= block->n_insns ||
+    if (!block || ins_pos >= block->n_positions ||
         !fs_wide_index(block, ins_pos, loc, &index) ||
         block->wide_gen[index] != table_generation) {
         return false;
@@ -1567,9 +1594,25 @@ struct EntryView {
     /* Terminal-branch outcome for the CST_FID_BRANCH_* singletons.
      * branch_known gates emission; branch_successor_pc is the architectural
      * landing PC (== next entry's start_pc).  Direction/target are derived
-     * from it and the template's fall-through at staging time. */
+     * from it and the template's fall-through at staging time.  Staged only
+     * when the entry's range contains the terminating branch; a
+     * branch-containing range with branch_known == false raises
+     * CST_BB_FLAG_BRANCH_UNRESOLVED instead (§5.6). */
     bool     branch_known;
     uint64_t branch_successor_pc;
+    /* Executed range [bb_start, bb_stop) — the ONLY instruction positions
+     * this entry may stage records at (§4.2a).  Staged as block records
+     * at BLOCK_POS against defaults 0 / tmpl->n_insns. */
+    uint32_t bb_start;
+    uint32_t bb_stop;
+    /* Block-level facts staged at BLOCK_POS (§5.7).  bb_flags is the
+     * CST_BB_FLAG_* set the CALLER resolved (WP_FIRST_TARGET_UNAVAIL /
+     * SYNTHETIC_FAULT / TRANSLATION_UNAVAIL / THREAD_END);
+     * BRANCH_UNRESOLVED is OR-ed in by the staging itself, the one
+     * place that knows.  fault_depth is CP-only; fault_insn WP-only. */
+    uint32_t bb_flags;
+    uint32_t fault_depth;
+    uint32_t fault_insn;
 };
 
 typedef struct EntryView EntryView;
@@ -2548,6 +2591,7 @@ static void dyn_params_sort_template_order(std::vector<DynParam> &dyn_params)
 static uint32_t build_entry_view(EntryView *ev, const BBTemplate *tmpl,
                                  const std::vector<DynParam> *dyn_params,
                                  const std::vector<RegSnap> *reg_snaps,
+                                 uint32_t bb_start, uint32_t bb_stop,
                                  uint32_t *actual_n_loads,
                                  uint32_t *actual_n_stores,
                                  uint32_t *insn_dp_off,
@@ -2559,6 +2603,8 @@ static uint32_t build_entry_view(EntryView *ev, const BBTemplate *tmpl,
     ev->tmpl = tmpl;
     ev->dyn_params = dyn_params;
     ev->reg_snaps = reg_snaps;
+    ev->bb_start = bb_start;
+    ev->bb_stop = bb_stop;
     ev->actual_n_loads = actual_n_loads;
     ev->actual_n_stores = actual_n_stores;
     ev->insn_dp_off = insn_dp_off;
@@ -2610,12 +2656,18 @@ static uint32_t build_entry_view(EntryView *ev, const BBTemplate *tmpl,
 
     /* Reg_snaps: per-insn destination operands only, in template-walk
      * order.  Each entry's reg_snaps array is sized n_dst_regs per
-     * insn (post-exec destination values). */
+     * insn (post-exec destination values) — for the instructions INSIDE
+     * the declared range only.  A continuation entry ([k, n)) carries
+     * snaps for [k, n) alone, so the prefix-sum lays out from bb_start:
+     * positions outside the range accumulate nothing, and the staging
+     * loop (clamped to the range) never reads their offsets. */
     uint32_t r = 0;
     for (uint32_t i = 0; i < n; i++) {
         insn_rs_off[i] = r;
-        const InsnFields *f = &tmpl->insn_fields[i];
-        r += f->n_dst_regs;
+        if (i >= bb_start && i < bb_stop) {
+            const InsnFields *f = &tmpl->insn_fields[i];
+            r += f->n_dst_regs;
+        }
     }
     insn_rs_off[n] = r;
     return high_water;
@@ -2737,7 +2789,7 @@ static void field_state_put(FieldStateBlock *state_block,
 {
     size_t index;
     FidLoc loc = field_state_loc(field_id);
-    if (!state_block || ins_pos >= state_block->n_insns ||
+    if (!state_block || ins_pos >= state_block->n_positions ||
         !fs_wide_index(state_block, ins_pos, loc, &index)) {
         return;
     }
@@ -2830,7 +2882,7 @@ stage_u64_delta(StageRec **stage_p, unsigned int *stage_len,
     rec->fid = fid;
     rec->delta = u512_from_u64_diff(cur, base);
     size_t idx;
-    if (state_block && i < state_block->n_insns &&
+    if (state_block && i < state_block->n_positions &&
         fs_scalar_index(state_block, i, loc, &idx)) {
         state_block->scalar_values[idx] = cur;
         state_block->scalar_gen[idx] = state_generation;
@@ -2982,7 +3034,7 @@ static void emit_field_delta_section(BitWriter *main_bw,
          * never grown — an unobserved high slot there misses to default. */
         {
             uint32_t needed = 1;
-            for (uint32_t i = 0; i < ev->tmpl->n_insns; i++) {
+            for (uint32_t i = ev->bb_start; i < ev->bb_stop; i++) {
                 const InsnFields *f = &ev->tmpl->insn_fields[i];
                 uint32_t m = ev->actual_n_loads ? cap_min(ev->actual_n_loads[i]) : 0;
                 uint32_t s = ev->actual_n_stores ? cap_min(ev->actual_n_stores[i]) : 0;
@@ -3002,7 +3054,13 @@ static void emit_field_delta_section(BitWriter *main_bw,
             }
         }
 
-        for (uint32_t i = 0; i < ev->tmpl->n_insns; i++) {
+        /* Per-insn staging, clamped HARD to the declared range: a writer
+         * MUST NOT emit a per-instruction record at a position outside
+         * [bb_start, bb_stop) (§4.2a).  Unclamped, every position of the
+         * template would stage its N_LOADS / N_STORES delta — a
+         * delta-to-0 record OUTSIDE the range on any partial entry,
+         * which a conformant reader rejects as malformed. */
+        for (uint32_t i = ev->bb_start; i < ev->bb_stop; i++) {
             const InsnFields *f = &ev->tmpl->insn_fields[i];
             uint32_t raw_n_loads  = ev->actual_n_loads
                 ? ev->actual_n_loads[i]  : 0;
@@ -3184,25 +3242,20 @@ static void emit_field_delta_section(BitWriter *main_bw,
 
         /* Branch-outcome singletons (CST_FID_BRANCH_TAKEN / _TARGET).  Once
          * per entry, on the terminating branch of a branch-terminated BB —
-         * on BOTH the correct path and every wrong-path chain block — when
-         * the successor is known (see BodyEntry / WPBBEntry
-         * branch_successor_*).  A page-split continuation carries no
-         * terminating branch at all, so a decoder surfaces no outcome for it
-         * and staging neither field is exact.
+         * on BOTH the correct path and every wrong-path chain block — and
+         * ONLY when the entry's declared range contains that branch (§5.6):
+         * an entry that stopped at or before the branch did not run it, has
+         * no outcome, and a decoder reads none for it BY THE RANGE, so
+         * staging neither field is exact for that population.  A page-split
+         * continuation carries no terminating branch at all — same result.
          *
-         * A BRANCH-TERMINATED block whose successor was never observed is a
-         * different case, and staging neither field does NOT leave it blank:
-         * these two FIDs are delta-persistent per (ins_pos, fid), so an entry
-         * that stages neither reads back as a REPEAT of whatever last
-         * occupied that slot, and the decoder marks the outcome valid either
-         * way (tools/cst_decode.cc, "a static direct branch simply keeps its
-         * last value").  The wire has no way to say "unresolved", so such an
-         * entry publishes a fabricated direction and target.  Every flush
-         * emission that cannot resolve a successor -- the segment-close walk,
-         * the fault-frame unwind, the close-frame prefix, the cut-short walk
-         * (all four call emit_body_entry with branch_successor_known left
-         * false) -- lands here, so this is counted rather than assumed
-         * harmless: see branch_outcome_unresolved_cp / _wp.
+         * A range-containing entry whose successor was never observed is
+         * the third case: the cells delta-persist, so staging nothing
+         * would read back as a repeat of the slot's previous occupant.
+         * The writer NEVER publishes that as an outcome — it stages
+         * nothing AND raises CST_BB_FLAG_BRANCH_UNRESOLVED on this
+         * entry's block record, which is the wire's explicit "unresolved"
+         * (absence + flag; §5.6).
          *
          * TAKEN  = the successor diverged from the template's fall-through,
          *          with unconditional terminators always "taken" — identical
@@ -3221,9 +3274,12 @@ static void emit_field_delta_section(BitWriter *main_bw,
          * wp_state -> wp_base(CP) -> default, exactly like LOAD_ADDR, so a WP
          * branch repeating a CP or earlier-WP displacement costs zero record
          * bytes and WP overhead tracks CP overhead. */
-        if (ev->branch_known && ev->tmpl) {
+        uint32_t bb_flags = ev->bb_flags;
+        {
             int bidx = TemplateStore::template_branch_index(ev->tmpl);
-            if (bidx >= 0) {
+            bool branch_in_range = bidx >= 0 &&
+                (uint32_t)bidx >= ev->bb_start && (uint32_t)bidx < ev->bb_stop;
+            if (branch_in_range && ev->branch_known) {
                 const InsnFields *bf = &ev->tmpl->insn_fields[bidx];
                 uint64_t target = ev->branch_successor_pc;
                 bool taken = (target != ev->tmpl->fall_through_pc);
@@ -3236,19 +3292,43 @@ static void emit_field_delta_section(BitWriter *main_bw,
                 STAGE_U64((uint32_t)bidx, CST_FID_BRANCH_TAKEN,
                           (uint64_t)(taken ? 1 : 0), 0);
                 STAGE_U64((uint32_t)bidx, CST_FID_BRANCH_TARGET, disp, 0);
+            } else if (branch_in_range) {
+                /* Ran the branch, never observed where it went.  Absence
+                 * of the two records + this flag is the contract (§5.6);
+                 * no fabricated direction or target ever reaches a
+                 * consumer as observed. */
+                bb_flags |= CST_BB_FLAG_BRANCH_UNRESOLVED;
             }
-        } else if (ev->tmpl &&
-                   TemplateStore::template_branch_index(ev->tmpl) >= 0) {
-            /* Branch-terminated, successor never observed: the two FIDs go
-             * unstaged and the slot's previous occupant is what a decoder
-             * will read as this block's outcome.  Counted at the one place
-             * that knows, so a trace carrying fabricated outcomes says so in
-             * its own statistics instead of looking identical to a trace
-             * whose every branch resolved. */
-            if (is_wp) {
-                g_stats.branch_outcome_unresolved_wp++;
+        }
+
+        /* Block-level records at BLOCK_POS = tmpl->n_insns (§5.7): the
+         * executed range, the flags, and the CP depth / WP fault-insn.
+         * Same delta-persistent staging as every per-insn cell — the
+         * whole-block / all-default case emits nothing — with BB_STOP's
+         * baseline the template's OWN num_insns, the one per-template
+         * baseline outside the insn-metadata family.  The (pos, fid)
+         * sort below keeps them the section's last records, as the
+         * non-descending order requires. */
+        {
+            uint32_t block_pos = ev->tmpl->n_insns;
+            STAGE_U64(block_pos, CST_FID_BB_START,
+                      (uint64_t)ev->bb_start, 0);
+            STAGE_U64(block_pos, CST_FID_BB_STOP,
+                      (uint64_t)ev->bb_stop, (uint64_t)ev->tmpl->n_insns);
+            STAGE_U64(block_pos, CST_FID_BB_FLAGS, (uint64_t)bb_flags, 0);
+            if (!is_wp) {
+                /* CP-only per the §5.7 table; WP blocks never carry a
+                 * depth (an excursion is not traced across a privilege
+                 * crossing). */
+                STAGE_U64(block_pos, CST_FID_BB_FAULT_DEPTH,
+                          (uint64_t)ev->fault_depth, 0);
             } else {
-                g_stats.branch_outcome_unresolved_cp++;
+                /* WP-only: the synthetic-fault instruction index,
+                 * meaningful under CST_BB_FLAG_SYNTHETIC_FAULT; staged
+                 * back to 0 on a clean execution so the cell never
+                 * sticks. */
+                STAGE_U64(block_pos, CST_FID_BB_FAULT_INSN,
+                          (uint64_t)ev->fault_insn, 0);
             }
         }
 #undef STAGE_PPAGE
@@ -3468,6 +3548,17 @@ struct BBDeltaInput {
     /* Terminal-branch outcome, threaded to the CST_FID_BRANCH_* staging. */
     bool                         branch_known = false;
     uint64_t                     branch_successor_pc = 0;
+    /* Executed range [bb_start, bb_stop) — REQUIRED, every caller states
+     * it explicitly ([0, tmpl->n_insns) for a whole-block run).  Clamps
+     * the per-insn staging and rides the wire as the BB_START / BB_STOP
+     * block records (§4.2a). */
+    uint32_t                     bb_start = 0;
+    uint32_t                     bb_stop = 0;
+    /* Block-level facts for the BLOCK_POS records (§5.7): the resolved
+     * CST_BB_FLAG_* set, the CP fault depth, the WP fault-insn index. */
+    uint32_t                     bb_flags = 0;
+    uint32_t                     fault_depth = 0;
+    uint32_t                     fault_insn = 0;
 };
 
 static void emit_one_bb_delta_with_base(BitWriter *bw, BodyStreamState *st,
@@ -3489,6 +3580,7 @@ static void emit_one_bb_delta_with_base(BitWriter *bw, BodyStreamState *st,
     entry_view_scratch_ensure(scratch, n, scratch->slot_stride);
     uint32_t high_water =
         build_entry_view(&ev, rec.tmpl, rec.dyn_params, rec.reg_snaps,
+                         rec.bb_start, rec.bb_stop,
                          scratch->actual_n_loads,
                          scratch->actual_n_stores,
                          scratch->insn_dp_off,
@@ -3499,6 +3591,7 @@ static void emit_one_bb_delta_with_base(BitWriter *bw, BodyStreamState *st,
     if (high_water > scratch->slot_stride) {
         entry_view_scratch_ensure(scratch, n, high_water);
         build_entry_view(&ev, rec.tmpl, rec.dyn_params, rec.reg_snaps,
+                         rec.bb_start, rec.bb_stop,
                          scratch->actual_n_loads,
                          scratch->actual_n_stores,
                          scratch->insn_dp_off,
@@ -3510,6 +3603,9 @@ static void emit_one_bb_delta_with_base(BitWriter *bw, BodyStreamState *st,
     ev.cpu_index = cpu_index;
     ev.branch_known         = rec.branch_known;
     ev.branch_successor_pc  = rec.branch_successor_pc;
+    ev.bb_flags             = rec.bb_flags;
+    ev.fault_depth          = rec.fault_depth;
+    ev.fault_insn           = rec.fault_insn;
     emit_field_delta_section(bw, st, state, base_state, rec.template_id,
                              &ev, is_wp, st->header_flags);
 }
@@ -3522,16 +3618,18 @@ static void emit_one_bb_delta(BitWriter *bw, BodyStreamState *st,
 }
 
 /*
- * Emit one body-record payload (CP section + WP chain + WP events)
+ * Emit one body-record payload (CP delta section + WP chain section)
  * using the supplied overlays.  The header tag and any tmpl_delta are
  * the caller's responsibility (ENTRY has a tmpl_delta; IFRAME omits
  * it, inheriting the preceding ENTRY's template).
  *
- * The WP events sub-section is conditional: it is written only when
- * this entry's chain produced at least one event, and its presence is
- * announced by CST_WP_CHAIN_HAS_EVENTS packed into the WP chain
- * header (see that macro's comment in champsim_tracer.h).  An entry
- * with no event costs nothing beyond the chain header itself.
+ * Everything that is a fact about a BLOCK rather than about one of its
+ * instructions — the executed range, the fault depth, the block flags,
+ * a WP block's synthetic-fault index — rides the block's own delta
+ * section as ordinary field records at BLOCK_POS (§5.7).  There is no
+ * per-entry fault trailer and no wp_events side-section: a block with
+ * nothing to declare emits no record, which is what a sparse field
+ * does natively.
  *
  * ENTRY passes the persistent overlays (deltas compress, post-record
  * state reflects the observation).  IFRAME passes generation-bumped
@@ -3544,126 +3642,80 @@ static void emit_body_record_payload(
     FieldStateTable *cp_state, FieldStateTable *wp_state,
     FieldStateTable *wp_base)
 {
-    emit_one_bb_delta(bw, st, cp_state,
-                      {entry->template_id, entry->tmpl,
-                       &entry->dyn_params, &entry->reg_snaps,
-                       entry->branch_successor_known,
-                       entry->branch_successor_pc},
-                      false, entry->cpu_index);
-
-    /* Per-entry synchronous-fault trailer (CST_FLAG_FAULT, system mode):
-     * the exception-nesting depth at which this BB executed.  0 = normal
-     * (non-handler) code; >=1 = synchronous-fault handler code that detoured
-     * execution at that nesting level.  Written before the WP sections so it
-     * is present whether or not CST_FLAG_WP is set. */
-    if (st->header_flags & CST_FLAG_FAULT) {
-        bw_write_uleb128(bw, (uint64_t)entry->fault_depth);
-        /* Faulting-instruction anchors for a whole-BB-merged faulting BB
-         * (one index per fault excursion, in order).  n=0 on ordinary
-         * entries and on handler entries. */
-        bw_write_uleb128(bw, (uint64_t)entry->fault_anchors.size());
-        for (uint32_t a : entry->fault_anchors) {
-            bw_write_uleb128(bw, (uint64_t)a);
-        }
+    /* CP block flags (§4.4): the excursion was kicked but its FIRST
+     * wrong-path target could not be fetched/translated — the chain is
+     * empty and no chain block exists to carry the marker, so it rides
+     * the owning CP entry's own block record. */
+    uint32_t cp_flags = 0;
+    if (num_wp == 0 && entry->wp_first_tb_unavail) {
+        cp_flags |= CST_BB_FLAG_WP_FIRST_TARGET_UNAVAIL;
     }
 
-    /* The wrong-path chain + events sections follow only when
-     * CST_FLAG_WP is set.  With wrong-path simulation off the entry
-     * is just its CP delta — no per-entry WP framing. */
+    BBDeltaInput cp_rec;
+    cp_rec.template_id  = entry->template_id;
+    cp_rec.tmpl         = entry->tmpl;
+    cp_rec.dyn_params   = &entry->dyn_params;
+    cp_rec.reg_snaps    = &entry->reg_snaps;
+    cp_rec.branch_known = entry->branch_successor_known;
+    cp_rec.branch_successor_pc = entry->branch_successor_pc;
+    cp_rec.bb_start     = entry->bb_start;
+    cp_rec.bb_stop      = entry->bb_stop;
+    cp_rec.bb_flags     = cp_flags;
+    cp_rec.fault_depth  = entry->fault_depth;
+    emit_one_bb_delta(bw, st, cp_state, cp_rec, false, entry->cpu_index);
+
+    /* The wrong-path chain section follows only when CST_FLAG_WP is
+     * set.  With wrong-path simulation off the entry is just its CP
+     * delta — no per-entry WP framing. */
     if (!(st->header_flags & CST_FLAG_WP)) {
         return;
     }
 
-    /* Whether any wrong-path event will be emitted for this entry,
-     * decided up front so the WP chain header (written next) can
-     * announce it via CST_WP_CHAIN_HAS_EVENTS — see that macro's
-     * comment in champsim_tracer.h for the framing-cost rationale.
-     *
-     * Chain-level event (§4.4): the excursion was kicked but its FIRST
-     * wrong-path target could not be fetched/translated, so the chain
-     * is empty and no per-block event can carry the marker.  Encoded as
-     * a single event whose resolved index (0) is >= num_wp (0) — the
-     * index-past-the-chain convention that addresses the unrealized
-     * first target itself. */
-    bool chain_unavail = (num_wp == 0) && entry->wp_first_tb_unavail;
-
-    uint32_t num_events = chain_unavail ? 1 : 0;
-    for (uint32_t w = 0; w < num_wp; w++) {
-        const WPBBEntry *wp = &entry->wp_entries[w];
-        if (wp->fault || wp->translation_unavailable) {
-            num_events++;
-        }
-    }
-    bool has_wp_events = (num_events != 0);
-
-    /* WP chain sub-section.  The leading ULEB packs num_wp in its high
-     * bits and CST_WP_CHAIN_HAS_EVENTS in bit 0 (format.rst Step 6.8);
-     * a reader that only wants num_wp shifts right by one. */
+    /* WP chain sub-section.  The leading ULEB is the bare block count —
+     * nothing is packed into it (format.rst Step 6.8).  Each chain
+     * block's own delta section carries its block-level records at its
+     * own BLOCK_POS: its range, and — where there is something to say —
+     * CST_BB_FLAG_SYNTHETIC_FAULT with its sibling CST_FID_BB_FAULT_INSN,
+     * or CST_BB_FLAG_TRANSLATION_UNAVAIL (§4.4). */
     {
         BitWriter sub;
         bw_section_begin_rb(&sub, &st->sub_scratch);
-        bw_write_uleb128(&sub, ((uint64_t)num_wp << 1) |
-                              (has_wp_events ? CST_WP_CHAIN_HAS_EVENTS : 0));
+        bw_write_uleb128(&sub, (uint64_t)num_wp);
         int64_t prev_wp_template = 0;
         for (uint32_t w = 0; w < num_wp; w++) {
             const WPBBEntry *wp = &entry->wp_entries[w];
             uint32_t wp_tmpl = wp->template_id;
             bw_write_sleb128(&sub, (int64_t)wp_tmpl - prev_wp_template);
             prev_wp_template = wp_tmpl;
+            uint32_t wp_flags = 0;
+            if (wp->fault) {
+                wp_flags |= CST_BB_FLAG_SYNTHETIC_FAULT;
+            }
+            if (wp->translation_unavailable) {
+                wp_flags |= CST_BB_FLAG_TRANSLATION_UNAVAIL;
+            }
             /* WP branch-outcome singletons ride here too: the WP block's
              * successor (walker's commit_post_pc) is threaded through so the
              * CST_FID_BRANCH_* deltas resolve against wp_state -> wp_base(CP)
              * -> default — the same overlay LOAD_ADDR uses — instead of a
              * fresh baseline per chain. */
+            BBDeltaInput wp_rec;
+            wp_rec.template_id  = wp_tmpl;
+            wp_rec.tmpl         = wp->tmpl;
+            wp_rec.dyn_params   = &wp->dyn_params;
+            wp_rec.reg_snaps    = &wp->reg_snaps;
+            wp_rec.branch_known = wp->branch_successor_known;
+            wp_rec.branch_successor_pc = wp->branch_successor_pc;
+            /* The emission model feeds whole speculative blocks; a WP
+             * block's range is its full template until the model itself
+             * carries partial WP extents. */
+            wp_rec.bb_start     = 0;
+            wp_rec.bb_stop      = wp->tmpl ? wp->tmpl->n_insns : 0;
+            wp_rec.bb_flags     = wp_flags;
+            wp_rec.fault_insn   = wp->fault ? wp->fault_insn_index : 0;
             emit_one_bb_delta_with_base(&sub, st, wp_state, wp_base,
-                                        {wp_tmpl, wp->tmpl,
-                                         &wp->dyn_params, &wp->reg_snaps,
-                                         wp->branch_successor_known,
-                                         wp->branch_successor_pc},
-                                        true, entry->cpu_index);
+                                        wp_rec, true, entry->cpu_index);
         }
-        bw_byte_align(&sub);
-        bw_section_end_rb(bw, &st->sub_scratch);
-    }
-
-    /* WP events sub-section — entirely absent (no length prefix, no
-     * payload) when this entry's chain produced no event, rather than
-     * an empty section.  The chain header's CST_WP_CHAIN_HAS_EVENTS bit,
-     * already written above, is what tells the reader whether to expect
-     * it. */
-    if (has_wp_events) {
-        BitWriter sub;
-        bw_section_begin_rb(&sub, &st->sub_scratch);
-        bw_write_uleb128(&sub, num_events);
-
-        int64_t prev_event_idx = -1;
-        uint64_t ev_start = bw_tell_bytes(&sub);
-        for (uint32_t w = 0; w < num_wp; w++) {
-            const WPBBEntry *wp = &entry->wp_entries[w];
-            if (!wp->fault && !wp->translation_unavailable) {
-                continue;
-            }
-            bw_write_uleb128(&sub,
-                (uint64_t)(w - (uint32_t)(prev_event_idx + 1)));
-            uint8_t evf = 0;
-            if (wp->translation_unavailable) {
-                evf |= CST_WP_EVENT_TRANSLATION_UNAVAIL;
-            }
-            if (wp->fault) {
-                evf |= CST_WP_EVENT_FAULT;
-            }
-            bw_write_u8(&sub, evf);
-            if (wp->fault) {
-                bw_write_uleb128(&sub, (uint64_t)wp->fault_insn_index);
-            }
-            prev_event_idx = w;
-        }
-        if (chain_unavail) {
-            bw_write_uleb128(&sub, 0);   /* pos_gap: index 0 == num_wp */
-            bw_write_u8(&sub, CST_WP_EVENT_TRANSLATION_UNAVAIL);
-        }
-        g_stats.bin_wp_exception_bits += (bw_tell_bytes(&sub) - ev_start) * 8;
-
         bw_byte_align(&sub);
         bw_section_end_rb(bw, &st->sub_scratch);
     }
@@ -4156,7 +4208,11 @@ static void emit_iframe_if_due(BodyStreamState *st, BodyEntry *entry,
      * persistent CP overlay (see the function comment).  Missing cells
      * read as the template default (zero value / zero width), matching
      * the decoder's miss-to-default lookup, so the synthesised vector is
-     * the decoder's ENTRY materialisation verbatim. */
+     * the decoder's ENTRY materialisation verbatim.  Clamped to the
+     * entry's declared range: the decoder materialises per-insn state
+     * for [bb_start, bb_stop) ONLY (§4.2a), so a partial entry's IFRAME
+     * must synthesise exactly that walk — Sum(n_dst_regs) over the
+     * range, laid out from bb_start like build_entry_view's prefix-sum. */
     std::vector<RegSnap> synth_snaps;
     bool swapped = false;
     if ((st->header_flags & CST_FLAG_REG_DATA) && cp_persist) {
@@ -4165,11 +4221,11 @@ static void emit_iframe_if_due(BodyStreamState *st, BodyEntry *entry,
         uint32_t gen = cp_persist->generation;
         const BBTemplate *t = entry->tmpl;
         uint32_t total = 0;
-        for (uint32_t i = 0; i < t->n_insns; i++) {
+        for (uint32_t i = entry->bb_start; i < entry->bb_stop; i++) {
             total += t->insn_fields[i].n_dst_regs;
         }
         synth_snaps.reserve(total);
-        for (uint32_t i = 0; i < t->n_insns; i++) {
+        for (uint32_t i = entry->bb_start; i < entry->bb_stop; i++) {
             uint8_t n_dsts = t->insn_fields[i].n_dst_regs;
             for (uint8_t s = 0; s < n_dsts; s++) {
                 uint16_t vfid = (uint16_t)(CST_FID_DST_REG_BASE +

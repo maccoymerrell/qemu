@@ -4524,6 +4524,12 @@ void emit_body_entry(BodyStreamState *out_stream,
     entry.wp_entries = std::move(wp_entries);
     entry.wp_first_tb_unavail = wp_first_tb_unavail;
     entry.tmpl = bb_tmpl;
+    /* Executed range: the emission model feeds whole blocks, so every
+     * entry declares [0, n_insns) until partial extents are threaded
+     * through from the path builder.  Stamped alongside tmpl — the range
+     * is not optional wire state and no site may leave it unset. */
+    entry.bb_start = 0;
+    entry.bb_stop = bb_tmpl ? bb_tmpl->n_insns : 0;
     entry.fault_depth = g_emit_fault_depth;
     /* Record this thread's last-emitted depth for the unwind-flush anchor
      * guard.  A REP fan-out below emits its sub-entries at this same depth
@@ -4650,8 +4656,13 @@ void emit_body_entry(BodyStreamState *out_stream,
      *     wherever it comes from, and a run that always closes on the END
      *     marker is exactly the run that must not report zero. */
     if (g_features.reg_data && bb_tmpl) {
+        /* Sum over the entry's DECLARED range, not the whole template: a
+         * partial entry ([bb_start, bb_stop)) observes destination snaps
+         * for exactly the instructions inside its range (§4.2a), and the
+         * wire attributes positionally from bb_start.  Whole-block
+         * entries make the two sums identical. */
         uint64_t expected_snaps = 0;
-        for (uint32_t i = 0; i < bb_tmpl->n_insns; i++) {
+        for (uint32_t i = entry.bb_start; i < entry.bb_stop; i++) {
             expected_snaps += bb_tmpl->insn_fields[i].n_dst_regs;
         }
         /* A merged fault entry carries its verified frame prefix at the FRONT
@@ -5215,6 +5226,8 @@ void emit_body_entry(BodyStreamState *out_stream,
                 BodyEntry sub_e;
                 sub_e.template_id = rep_sub->template_id;
                 sub_e.tmpl        = rep_sub;
+                sub_e.bb_start    = 0;
+                sub_e.bb_stop     = rep_sub->n_insns;
                 sub_e.thread_id   = entry.thread_id;
                 sub_e.asid_index  = entry.asid_index;
                 sub_e.ctx_asid_index = entry.ctx_asid_index;
@@ -6478,8 +6491,8 @@ void emit_finalized_bb(BodyStreamState *out_stream,
     /* Genuine first-fetch failure from the accepted (non-flush-
      * interrupted) walker run: the excursion was kicked but its first
      * wrong-path target could not be fetched/translated, so wp_entries
-     * is empty.  Carried onto the BodyEntry so the writer emits the
-     * chain-level CST_WP_EVENT_TRANSLATION_UNAVAIL event (§4.4). */
+     * is empty.  Carried onto the BodyEntry so the writer raises
+     * CST_BB_FLAG_WP_FIRST_TARGET_UNAVAIL on the CP block record (§4.4). */
     bool wp_first_tb_unavail = false;
     /*
      * Wrong-path speculation relies on the guest MMU to fault on fetches
@@ -11896,18 +11909,19 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     /*
      * Two decoupled fault concerns, split from the former single flag:
      *
-     *  (a) The system-only sync-fault DEPTH TRAILER + kernel-handler merge.
-     *      Marker mode is the system-mode entrypoint (the validator's
-     *      --system implies --marker, pinning a real guest ASID); a pinned
-     *      simpoint qualifies too.  The per-entry trailer depth-tags handler
-     *      code there; user-mode windows leave it off and emit no trailer.
+     *  (a) The system-only sync-fault DEPTH (CST_FID_BB_FAULT_DEPTH block
+     *      records) + kernel-handler merge.  Marker mode is the system-mode
+     *      entrypoint (the validator's --system implies --marker, pinning a
+     *      real guest ASID); a pinned simpoint qualifies too.  The block-level
+     *      depth record tags handler code there; user-mode windows leave the
+     *      feature off and every depth cell stays at its default 0.
      *
      *  (b) The wrong-path SYNTHETIC-FAULT marking policy.  A speculative
      *      memory access to an absent/unreadable page runs on a deterministic
      *      placeholder value and CONTINUES (a mispredicted-path fault is never
      *      taken by a real core); when set, the faulting insn's WP BB entry is
-     *      marked CST_WP_EVENT_FAULT.  It must run whenever wrong-path
-     *      simulation runs — system AND user mode alike.
+     *      marked CST_BB_FLAG_SYNTHETIC_FAULT.  It must run whenever
+     *      wrong-path simulation runs — system AND user mode alike.
      *
      * CST_NO_FAULT disables BOTH for A/B measurement (accesses still run on
      * garbage, but the synthetic fault is not marked).

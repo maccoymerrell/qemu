@@ -22,8 +22,10 @@
 namespace cst_wire {
 
 /* Format-epoch identifier, written at the start of each .cst member and
- * as a trailing sentinel after BODY_TAG_END.  Frozen pre-release. */
-inline constexpr uint32_t MAGIC          = 0x1D545343u;
+ * as a trailing sentinel after BODY_TAG_END.  Epoch 0x1E: executed-range /
+ * block-level fields at the reserved BLOCK_POS, bare wp-chain header, no
+ * per-entry fault trailer or wp_events section.  Frozen pre-release. */
+inline constexpr uint32_t MAGIC          = 0x1E545343u;
 
 /* Maximum raw bytes captured per instruction (fixed-stride insn_bytes). */
 inline constexpr int      INSN_BYTES_MAX = 16;

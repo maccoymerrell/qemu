@@ -86,7 +86,7 @@ struct Stats {
      * access to an absent/unreadable page served a deterministic placeholder
      * value, or a non-memory synchronous fault (arithmetic / illegal opcode)
      * skipped the faulting insn and let the excursion continue to the depth
-     * budget.  Emitted as CST_WP_EVENT_FAULT. */
+     * budget.  Emitted as CST_BB_FLAG_SYNTHETIC_FAULT on the block. */
     uint64_t wp_synthetic_faults = 0;
     uint64_t wp_total_mem_accesses = 0;
 
@@ -404,22 +404,6 @@ struct Stats {
      * is the size of the set a live read would have mis-stamped, and it
      * reads the same on both arms of CST_ASID_LIVE. */
     uint64_t emit_asid_foreign_context = 0;
-    /* Branch-TERMINATED blocks emitted with their terminal outcome
-     * unresolved: no successor was ever observed for them, so
-     * emit_field_delta_section stages neither CST_FID_BRANCH_TAKEN nor
-     * CST_FID_BRANCH_TARGET.  Those two FIDs are delta-persistent per
-     * (ins_pos, fid), so omitting them does not blank the outcome -- the
-     * slot's previous occupant is what a decoder reads back, and it reads it
-     * as valid.  Every such entry therefore publishes a DIRECTION AND TARGET
-     * IT NEVER OBSERVED, and nothing on the wire distinguishes it from a
-     * block that genuinely repeated its last outcome.  Produced by the four
-     * emit_body_entry flush paths that pass branch_successor_known false: the
-     * segment-close walk, the fault-frame unwind, the close-frame prefix, and
-     * the cut-short walk.  Not "must be 0" while those paths exist -- it is
-     * the size of the fabricated set, and a consumer that trusts branch
-     * outcomes needs to know it is not zero. */
-    uint64_t branch_outcome_unresolved_cp = 0;
-    uint64_t branch_outcome_unresolved_wp = 0;
     /* Pending-seal slots flushed at a segment close from a vCPU OTHER than
      * the closing one.  Each is a TB the pinned process executed on a vCPU
      * it then left; they used to be dropped.  Non-zero exactly when the
@@ -1054,7 +1038,6 @@ struct Stats {
     uint64_t bin_body_bits = 0;
     uint64_t bin_dyn_cp_bits = 0;
     uint64_t bin_dyn_wp_bits = 0;
-    uint64_t bin_wp_exception_bits = 0;
 
     /* Decode-side warning count. */
     uint64_t unknown_insn_warnings = 0;

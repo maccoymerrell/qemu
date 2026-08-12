@@ -2585,13 +2585,30 @@ Coverage and gating:
   a consumer then falls back to successor look-ahead.
 * **Branch-terminated blocks only.**  A page-split continuation (no
   terminating branch) carries neither FID; a decoder surfaces the outcome
-  only when the template ends in a branch.  A segment can also end on an
-  entry the segment-final flush emitted with no observed successor — the
-  guest stopped there (process exit, END marker, dead-latch sweep), so no
-  later block resolves the edge — and that lone entry likewise carries
-  neither.  A segment closed by its icount or simpoint budget does not
-  produce one: that close waits for the budget-crossing block to execute
-  and seal normally, so its final entry is branch-resolved like any other.
+  only when the template ends in a branch.
+
+  .. warning::
+
+     A **branch-terminated** block whose successor the writer never observed
+     is not covered by that sentence, and omitting the two FIDs does not make
+     its outcome blank.  Both delta-persist per ``(ins_pos, fid)``: an entry
+     that carries neither record reads back as a repeat of whatever last
+     occupied that slot — for ``BRANCH_TAKEN`` that can be a different
+     template's branch at the same index — and the decoder marks the outcome
+     valid.  Such an entry therefore publishes a **direction and target it
+     never took**, indistinguishable on the wire from a block that genuinely
+     repeated its last outcome.  A writer produces them wherever a flush
+     emits without resolving a successor: the segment-close walk, the
+     fault-frame unwind, the close-frame prefix and the cut-short walk.  This
+     is **not** confined to a segment's last entry — a close that flushes a
+     peer vCPU's held slot emits a block that executed much earlier, so the
+     fabricated outcome can land mid-history.  Nor is a budget close exempt:
+     an ``x86_64 -smp 4`` marker cell closed on ``why=BUDGET`` produced one on
+     a block whose own ``STORE_DATA0`` payload (``0x601``, feeding
+     ``test``/``je``) proves the recorded "taken" impossible.  The writer
+     counts these emissions in ``branch_outcome_unresolved_cp`` /
+     ``branch_outcome_unresolved_wp``; a consumer that trusts branch outcomes
+     must read those before trusting them.
 * **REP string operations** fan out into one entry per iteration, all at the
   REP PC; the self-looping REP "branch" is reported taken to its own PC for
   every iteration but the last, which exits to the real successor — so the

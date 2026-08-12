@@ -1167,12 +1167,19 @@ struct BodyEntry {
      * singletons.  branch_successor_pc is the architectural PC reached after
      * this BB's terminating branch — the deferred-seal successor passed to
      * emit_finalized_bb (collect_finalized_bbs' frag_current_pc), which is
-     * the next emitted entry's start_pc.  branch_successor_known is false only
-     * for a segment's final BB flushed with no observed successor
-     * (PathBuilder::flush_final): the FIDs are then omitted and a consumer
-     * decoding that lone entry sees no direction/target.  Direction and target
-     * are derived at emit time from the successor and the template's
-     * fall-through (see emit_field_delta_section). */
+     * the next emitted entry's start_pc.  branch_successor_known is false on
+     * every block a flush emits without resolving its successor — the
+     * segment-close walk, the fault-frame unwind, the close-frame prefix and
+     * the cut-short walk all call emit_body_entry on this default, so it is
+     * not confined to a segment's last entry and a close that flushes a peer
+     * vCPU's held slot plants one in the middle of the guest's execution.
+     * The FIDs are then omitted, which is NOT the same as blank: they
+     * delta-persist per (ins_pos, fid), so the decoder reads the slot's
+     * previous occupant and marks it valid, publishing a direction and target
+     * this block never took.  Direction and target are derived at emit time
+     * from the successor and the template's fall-through, and the unresolved
+     * emissions are counted (branch_outcome_unresolved_cp / _wp) — see
+     * emit_field_delta_section. */
     uint64_t branch_successor_pc = 0;
     bool     branch_successor_known = false;
 };

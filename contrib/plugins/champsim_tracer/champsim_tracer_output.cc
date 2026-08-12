@@ -3186,9 +3186,23 @@ static void emit_field_delta_section(BitWriter *main_bw,
          * per entry, on the terminating branch of a branch-terminated BB —
          * on BOTH the correct path and every wrong-path chain block — when
          * the successor is known (see BodyEntry / WPBBEntry
-         * branch_successor_*).  A page-split continuation (no branch) or the
-         * segment-final flush stages neither, so those entries carry no
-         * direction/target.
+         * branch_successor_*).  A page-split continuation carries no
+         * terminating branch at all, so a decoder surfaces no outcome for it
+         * and staging neither field is exact.
+         *
+         * A BRANCH-TERMINATED block whose successor was never observed is a
+         * different case, and staging neither field does NOT leave it blank:
+         * these two FIDs are delta-persistent per (ins_pos, fid), so an entry
+         * that stages neither reads back as a REPEAT of whatever last
+         * occupied that slot, and the decoder marks the outcome valid either
+         * way (tools/cst_decode.cc, "a static direct branch simply keeps its
+         * last value").  The wire has no way to say "unresolved", so such an
+         * entry publishes a fabricated direction and target.  Every flush
+         * emission that cannot resolve a successor -- the segment-close walk,
+         * the fault-frame unwind, the close-frame prefix, the cut-short walk
+         * (all four call emit_body_entry with branch_successor_known left
+         * false) -- lands here, so this is counted rather than assumed
+         * harmless: see branch_outcome_unresolved_cp / _wp.
          *
          * TAKEN  = the successor diverged from the template's fall-through,
          *          with unconditional terminators always "taken" — identical
@@ -3222,6 +3236,19 @@ static void emit_field_delta_section(BitWriter *main_bw,
                 STAGE_U64((uint32_t)bidx, CST_FID_BRANCH_TAKEN,
                           (uint64_t)(taken ? 1 : 0), 0);
                 STAGE_U64((uint32_t)bidx, CST_FID_BRANCH_TARGET, disp, 0);
+            }
+        } else if (ev->tmpl &&
+                   TemplateStore::template_branch_index(ev->tmpl) >= 0) {
+            /* Branch-terminated, successor never observed: the two FIDs go
+             * unstaged and the slot's previous occupant is what a decoder
+             * will read as this block's outcome.  Counted at the one place
+             * that knows, so a trace carrying fabricated outcomes says so in
+             * its own statistics instead of looking identical to a trace
+             * whose every branch resolved. */
+            if (is_wp) {
+                g_stats.branch_outcome_unresolved_wp++;
+            } else {
+                g_stats.branch_outcome_unresolved_cp++;
             }
         }
 #undef STAGE_PPAGE

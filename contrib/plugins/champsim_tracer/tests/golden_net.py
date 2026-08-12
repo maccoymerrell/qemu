@@ -135,13 +135,17 @@ SYS_METRICS = [
 # Frozen system-mode fixture traces: renderer-golden inputs captured
 # OUTSIDE the validator.  A system boot is not byte-deterministic
 # across runs (boot timing moves the marker icount), so a single trace
-# is frozen once and SVG goldens only ever render that frozen file.
-# Fixtures live in FIXTURES_DIR permanently: `capture` clears
-# GOLDEN_TRACES but never this directory, and fails loudly when a
-# listed fixture is missing.  devio_sys_x86_64: qemu-system-x86_64 +
-# virtio-blk guest doing O_DIRECT disk I/O inside a marker window,
-# physaddr=1 wpdepth=64 regdata=1 memdata=1 (provenance:
-# cst_runs/vis44/devio_sys_x86_64/run_devio.sh).
+# is frozen per format epoch (the in-tree readers read one epoch only,
+# so an epoch bump forces a re-freeze) and SVG goldens only ever render
+# that frozen file.  Fixtures live in FIXTURES_DIR permanently:
+# `capture` clears GOLDEN_TRACES but never this directory, and fails
+# loudly when a listed fixture is missing.  devio_sys_x86_64:
+# qemu-system-x86_64 + virtio-blk guest doing O_DIRECT disk I/O inside
+# a marker window, physaddr=1 wpdepth=64 regdata=1 memdata=1.  Current
+# freeze is epoch 0x1E, booted by sys_trace_once's canonical recipe
+# (provenance: cst_runs/e1e/goldens/fixture_refreeze/); the original
+# 0x1D freeze (cst_runs/vis44/devio_sys_x86_64/run_devio.sh) is
+# archived at cst_runs/e1e/goldens/archive_0x1D/.
 FIXTURES_DIR = GOLDEN_DIR / "fixtures"
 FIXTURES = [
     {"name": "devio_sys_x86_64", "file": "devio_sys_x86_64.cst",

@@ -94,9 +94,22 @@ static void plugin_vm_shutdown_on_cpu(CPUState *cpu, run_on_cpu_data arg)
      * plugin lock then BQL, and arriving here holding the BQL and then
      * blocking on the plugin lock runs it the other way: the lock's holder is
      * waiting for the BQL this thread owns, and the machine stops dead --
-     * every thread in futex_wait, zero CPU, no close, no trace.  Measured on
-     * the ChampSim Tracer at -smp 4 with the wrong path enabled: four of nine
-     * aarch64 and riscv64 SIGTERM cells.
+     * every thread in futex_wait, zero CPU, no close, no trace.
+     *
+     * Measured on the ChampSim Tracer at -smp 4 with the wrong path enabled
+     * and a marker window open, taken to a close by SIGTERM.  Every
+     * reproduction so far is RISC-V: four of eight riscv64 cells stopped
+     * dead, and the two aarch64 cells run with the same arms both closed.
+     * That is a difference in exposure, not in kind -- the pause and the
+     * resume take the BQL on every target, and RISC-V merely has a third
+     * acquisition (the pending-interrupt replay in
+     * cpu_plugin_arch_state_restore) and so a wider window -- so aarch64 is
+     * unproven here rather than exempt.  Confirmed against this code by an
+     * A/B of two binaries differing only in the ten bytes of the two calls
+     * below: with the drop removed, two of sixteen cells deadlocked, each
+     * with the shutdown callback on the plugin's lock beneath
+     * process_queued_cpu_work and a peer's excursion on the BQL, no shutdown
+     * banner and no assembled trace; with it in place, none of eight.
      *
      * Dropping it is the same treatment process_queued_cpu_work() already
      * gives an exclusive item, and for the same reason.  It costs nothing:

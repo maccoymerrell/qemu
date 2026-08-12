@@ -1844,12 +1844,16 @@ void cpu_plugin_spec_vtime_pause(CPUState *cpu)
      * on that same plugin lock runs the order the other way and closes an
      * AB/BA cycle.  process_queued_cpu_work() is such a seam — it runs a
      * non-exclusive work item with the BQL held — and the machine-shutdown
-     * callback is placed through it.  Measured on aarch64 and riscv64,
-     * -smp 4, wp=1, a marker window open, SIGTERM: 4 cells of 9 stopped dead
-     * with the shutdown callback waiting on the plugin's lock, that lock's
-     * holder waiting here for the BQL the callback's own vCPU holds, and
-     * every thread in futex_wait at zero CPU.  The cure belongs at the
-     * dispatching seam, which must not hold the BQL across a plugin
+     * callback is placed through it.  Measured on riscv64, -smp 4, wp=1, a
+     * marker window open, SIGTERM: four cells of eight stopped dead with the
+     * shutdown callback waiting on the plugin's lock, that lock's holder
+     * waiting here for the BQL the callback's own vCPU holds, and every
+     * thread in futex_wait at zero CPU.  aarch64 with the same arms closed
+     * in both cells it was run in, which bounds how often it happens there
+     * and not whether it can: the pause and the resume block on the BQL on
+     * every target, and only the third acquisition — the RISC-V replay in
+     * cpu_plugin_arch_state_restore — is target-specific.  The cure belongs
+     * at the dispatching seam, which must not hold the BQL across a plugin
      * callback; nothing about the hold below makes an excursion safe.
      */
 #if defined(TARGET_I386)

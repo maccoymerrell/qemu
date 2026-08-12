@@ -222,6 +222,14 @@ static int plugin_load(struct qemu_plugin_desc *desc, const qemu_info_t *info, E
                        desc->path, version, QEMU_PLUGIN_VERSION);
             goto err_symbol;
         }
+        /*
+         * Keep the number.  The range check above admits everything from
+         * QEMU_PLUGIN_MIN_VERSION up, so an entry point whose signature
+         * changed since the plugin was built is reached with no complaint
+         * unless someone can still ask what the plugin was built against.
+         */
+        ctx->version = version;
+        plugin_note_declared_version(version);
     }
 
     qemu_rec_mutex_lock(&plugin.lock);

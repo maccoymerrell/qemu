@@ -1651,17 +1651,31 @@ Machine-shutdown notification
    Adds ``qemu_plugin_register_vm_shutdown_cb()`` (plugin API version
    16): the machine is going down, close what you have open.
 
-   The callback's SIGNATURE changed at version 20, when
-   ``in_guest_insn`` was added below.  That is an incompatible change to
-   a type QEMU calls through, and ``QEMU_PLUGIN_MIN_VERSION`` is still
-   2, so a plugin built against versions 16-19 continues to load and
-   continues to have its two-argument callback called with three
-   arguments.  Every mainstream calling convention discards the extra
-   one, so it works and both arguments such a plugin reads are correct;
-   it is undefined behaviour all the same, and a
-   ``-fsanitize=cfi-icall`` build traps on it.  Rebuilding the plugin is
-   the whole of the fix, and the version history in
-   ``include/qemu/qemu-plugin.h`` says so at version 20.
+   The callback's SIGNATURE changed when ``in_guest_insn`` was added
+   below, and it changed while the version constant still read 19 — so
+   19 names both the two-argument and the three-argument callback and
+   cannot be honoured either way.  ``QEMU_PLUGIN_MIN_VERSION`` is 2 and
+   deliberately stays there, since raising it to cover one API would
+   reject every unrelated old plugin as well.  The gate is instead at
+   the entry point: ``qemu_plugin_register_vm_shutdown_cb()`` refuses a
+   plugin declaring below version 20 and says to rebuild, rather than
+   calling through a function pointer whose type no longer matches its
+   definition.
+
+   Two earlier entry points changed signature the same silent way and
+   are gated the same way: ``qemu_plugin_spec_mode_begin()`` gained
+   ``saved_state`` inside version 5 and requires 6, and
+   ``qemu_plugin_register_devio_cb()`` gained ``doorbell_cb`` inside
+   version 12 and requires 13.  The devio one is the dangerous shape —
+   the argument was INSERTED, not appended, so a version-12 caller's
+   callbacks land one slot over and the stop slot is filled from a
+   register that caller never wrote.
+
+   Control-flow integrity is not the instrument that catches any of
+   this.  Under ``-fsanitize=cfi-icall`` an indirect call into a plugin
+   traps because the target is in a module the CFI type tables do not
+   cover, matching signature or not; that is why every dispatch site
+   into a plugin carries ``QEMU_DISABLE_CFI``.
 
    The existing ``qemu_plugin_register_atexit_cb()`` cannot serve this
    purpose in system emulation.  It fires from libc's ``atexit(3)``,

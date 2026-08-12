@@ -157,9 +157,48 @@ void qemu_plugin_register_asid_write_cb(qemu_plugin_id_t id,
 static qemu_plugin_vm_shutdown_cb_t vm_shutdown_hook;
 static bool vm_shutdown_dispatched;
 
+static int plugin_version_floor = QEMU_PLUGIN_VERSION;
+
+void plugin_note_declared_version(int version)
+{
+    if (version < plugin_version_floor) {
+        plugin_version_floor = version;
+    }
+}
+
+int plugin_declared_version_floor(void)
+{
+    return plugin_version_floor;
+}
+
+/*
+ * Refuse an entry point whose SIGNATURE changed after the API version the
+ * calling plugin was built against.
+ *
+ * The loader accepts every declared version in [QEMU_PLUGIN_MIN_VERSION,
+ * QEMU_PLUGIN_VERSION], and a signature change leaves no other trace: the
+ * symbol still resolves, the call still links, and the argument the caller
+ * never passed is read from whatever the calling convention left in that
+ * register.  For an argument APPENDED to a callback type the result is
+ * benign on every mainstream ABI, because the callee ignores what it does
+ * not declare.  For an argument INSERTED into a registrar the arguments
+ * MISALIGN, and QEMU stores a hook it was never given.
+ *
+ * @since is the first version that both carries the current signature and
+ * is distinguishable from the previous one.  Where the change itself went
+ * in without moving QEMU_PLUGIN_VERSION, the version in force at the time
+ * names two incompatible ABIs and cannot be honoured either way, so @since
+ * is the NEXT version — the ambiguous one is refused with the rest.
+ *
+ * Defined below, next to the plugin registry it reads.
+ */
+static void plugin_require_abi(qemu_plugin_id_t id, const char *api, int since);
+
 void qemu_plugin_register_vm_shutdown_cb(qemu_plugin_id_t id,
                                          qemu_plugin_vm_shutdown_cb_t cb)
 {
+    /* @in_guest_insn appended inside version 19; 20 is the first that says so */
+    plugin_require_abi(id, "qemu_plugin_vm_shutdown_cb_t", 20);
     vm_shutdown_hook = cb;
 }
 
@@ -176,6 +215,7 @@ void qemu_plugin_register_vm_shutdown_cb(qemu_plugin_id_t id,
  * the main loop is the only place SIGINT/SIGTERM is seen.  Whichever
  * arrives first wins; the other is a no-op.
  */
+QEMU_DISABLE_CFI
 bool qemu_plugin_vm_shutdown_dispatch(int vcpu_index, bool in_guest_insn)
 {
     qemu_plugin_vm_shutdown_cb_t cb = vm_shutdown_hook;
@@ -234,11 +274,20 @@ void qemu_plugin_register_devio_cb(qemu_plugin_id_t id,
                                    qemu_plugin_devio_start_cb_t start_cb,
                                    qemu_plugin_devio_stop_cb_t stop_cb)
 {
+    /*
+     * @doorbell_cb INSERTED, and @dev_token appended to the start callback,
+     * inside version 12; 13 is the first version that says so.  A version-12
+     * caller passes three arguments, so start_cb would land in the doorbell
+     * slot, stop_cb in the start slot, and the stop slot would take whatever
+     * the fourth argument register happened to hold.
+     */
+    plugin_require_abi(id, "qemu_plugin_register_devio_cb", 13);
     devio_doorbell_hook = doorbell_cb;
     devio_start_hook = start_cb;
     devio_stop_hook = stop_cb;
 }
 
+QEMU_DISABLE_CFI
 void qemu_plugin_devio_doorbell(uint64_t dev_token)
 {
     if (devio_doorbell_hook) {
@@ -251,6 +300,7 @@ void qemu_plugin_devio_doorbell(uint64_t dev_token)
     }
 }
 
+QEMU_DISABLE_CFI
 uint64_t qemu_plugin_devio_start(int dir, uint64_t offset, uint64_t bytes,
                                  uint64_t dev_token)
 {
@@ -265,6 +315,7 @@ uint64_t qemu_plugin_devio_start(int dir, uint64_t offset, uint64_t bytes,
     return 0;
 }
 
+QEMU_DISABLE_CFI
 void qemu_plugin_devio_stop(uint64_t request_id)
 {
     if (devio_stop_hook) {
@@ -308,6 +359,7 @@ void plugin_evq_note_drained(CPUState *cpu)
     }
 }
 
+QEMU_DISABLE_CFI
 void cpu_plugin_evq_push(CPUState *cpu, int kind, uint64_t pc,
                          uint32_t depth_after)
 {
@@ -523,6 +575,26 @@ struct qemu_plugin_cb {
 };
 
 struct qemu_plugin_state plugin;
+
+static void plugin_require_abi(qemu_plugin_id_t id, const char *api, int since)
+{
+    struct qemu_plugin_ctx *ctx;
+    int version;
+
+    qemu_rec_mutex_lock(&plugin.lock);
+    ctx = plugin_id_to_ctx_locked(id);
+    version = ctx->version;
+    qemu_rec_mutex_unlock(&plugin.lock);
+
+    if (version < since) {
+        error_report("plugin: %s changed signature at plugin API version %d; "
+                     "this plugin declares version %d, so QEMU would call "
+                     "through a function type that no longer matches its "
+                     "definition.  Rebuild the plugin against this "
+                     "qemu-plugin.h.", api, since, version);
+        exit(1);
+    }
+}
 
 /*
  * Whether any plugin was loaded.  Machine models need this to decide whether

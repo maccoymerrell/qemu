@@ -1024,6 +1024,25 @@ void qemu_plugin_spec_mode_begin(struct qemu_plugin_cpu_state *saved_state)
     g_assert(!current_cpu->plugin_spec_mode);
 
     /*
+     * @saved_state was added inside version 5, which therefore names both a
+     * no-argument and a one-argument spelling of this function; version 6 is
+     * the first that distinguishes them.  A caller built before the change
+     * passes nothing and QEMU reads the first argument register, so
+     * plugin_spec_saved_state below would be an arbitrary pointer that
+     * qemu_plugin_spec_mode_end() later restores the vCPU from.  This entry
+     * point carries no plugin id, so ask the floor across loaded plugins.
+     */
+    if (plugin_declared_version_floor() < 6) {
+        error_report("plugin: qemu_plugin_spec_mode_begin() gained its "
+                     "saved_state argument at plugin API version 6, and a "
+                     "loaded plugin declares version %d.  QEMU would restore "
+                     "vCPU state from an argument that plugin never passed.  "
+                     "Rebuild the plugin against this qemu-plugin.h.",
+                     plugin_declared_version_floor());
+        _exit(1);
+    }
+
+    /*
      * Fail-safe containment guard.  Wrong-path tracing routes speculative
      * stores through the slow-path do_st helpers so they land in the spec
      * store sandbox instead of real guest RAM.  Two mechanisms provide that

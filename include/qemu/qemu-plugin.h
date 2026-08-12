@@ -187,15 +187,45 @@ typedef uint64_t qemu_plugin_id_t;
  *   Without these the cut is indistinguishable, at the plugin, from the
  *   guest simply not having the code.
  * - INCOMPATIBLE: qemu_plugin_vm_shutdown_cb_t gained a third argument,
- *   @in_guest_insn.  A plugin built against versions 16-19 declares a
- *   two-argument callback, and QEMU_PLUGIN_MIN_VERSION does not reject
- *   it, so such a plugin is still loaded and its callback is still
- *   called -- through a function pointer whose type no longer matches
- *   its definition.  Every mainstream calling convention ignores the
- *   extra argument, so this works in practice and the two arguments it
- *   does read are correct; it is undefined behaviour all the same, and
- *   a control-flow-integrity build (-fsanitize=cfi-icall) traps on it.
- *   Rebuild the plugin against this header.
+ *   @in_guest_insn.  The change itself went in while the version
+ *   constant still read 19, so 19 names two incompatible callback
+ *   types and cannot be honoured either way; 20 is the first version
+ *   that distinguishes them, and a plugin declaring 16 through 19 is
+ *   now refused at qemu_plugin_register_vm_shutdown_cb() rather than
+ *   called through a function pointer whose type no longer matches its
+ *   definition.  Rebuild the plugin against this header.
+ *
+ * ABI changes that predate this notice
+ * ------------------------------------
+ *
+ * Three entry points changed signature WITHOUT the version constant
+ * moving, so the version in force at the time names two incompatible
+ * spellings of the same symbol.  QEMU now refuses the ambiguous version
+ * along with everything below it, at the entry point itself, because
+ * QEMU_PLUGIN_MIN_VERSION cannot express "this one API changed" without
+ * also rejecting plugins that never touch it:
+ *
+ * - qemu_plugin_spec_mode_begin() gained @saved_state inside version 5.
+ *   Requires version 6.  A caller built before the change passes no
+ *   argument at all, and the vCPU state qemu_plugin_spec_mode_end()
+ *   later restores from would be whatever the first argument register
+ *   happened to hold.
+ * - qemu_plugin_register_devio_cb() gained @doorbell_cb, and
+ *   qemu_plugin_devio_start_cb_t gained @dev_token, inside version 12.
+ *   Requires version 13.  This one MISALIGNS rather than appends: a
+ *   three-argument caller has its start callback installed in the
+ *   doorbell slot, its stop callback in the start slot, and the stop
+ *   slot filled from an argument register it never wrote.
+ * - qemu_plugin_vm_shutdown_cb_t gained @in_guest_insn inside version
+ *   19, as above.  Requires version 20.
+ *
+ * Note on control-flow integrity: a --enable-cfi build cannot check any
+ * of this.  Under -fsanitize=cfi-icall an indirect call into a plugin
+ * traps because the target lives in a module the CFI type tables do not
+ * cover, whether or not the signatures agree -- which is why every
+ * dispatch site that calls into a plugin carries QEMU_DISABLE_CFI.  A
+ * signature mismatch is undefined behaviour on its own terms; CFI is
+ * not the instrument that finds it.
  */
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;

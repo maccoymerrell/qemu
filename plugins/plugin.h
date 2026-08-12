@@ -62,12 +62,27 @@ struct qemu_plugin_ctx {
      * to strdup plugin args.
      */
     struct qemu_plugin_desc *desc;
+    /*
+     * The API version the plugin exported through qemu_plugin_version, kept
+     * past the load-time range check.  The loader admits every version in
+     * [QEMU_PLUGIN_MIN_VERSION, QEMU_PLUGIN_VERSION], so this number is the
+     * only thing that distinguishes two incompatible spellings of the same
+     * entry point; discarding it is what makes an ABI change undetectable.
+     */
+    int version;
     bool installing;
     bool uninstalling;
     bool resetting;
 };
 
 struct qemu_plugin_ctx *plugin_id_to_ctx_locked(qemu_plugin_id_t id);
+
+/*
+ * The lowest API version any loaded plugin declared, for entry points that
+ * carry no plugin id and so cannot ask about their own caller.
+ */
+void plugin_note_declared_version(int version);
+int plugin_declared_version_floor(void);
 
 void plugin_register_inline_op_on_entry(GArray **arr,
                                         enum qemu_plugin_mem_rw rw,

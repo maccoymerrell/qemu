@@ -31,7 +31,11 @@ synthetic decoded stream shaped like the pre-range world (merged whole
 blocks, overshooting tails).  ``--selftest`` runs conforming + falsifier
 fixtures for all five and requires every falsifier to FAIL — an
 assertion that cannot reject the old shape has no teeth and must not
-gate.
+gate.  The selftest also proves the ``thread_end`` oracle
+(validator._check_thread_end_flags: CST_BB_FLAG_THREAD_END on each
+context's final entry at EVERY close route) rejects both its
+falsifiers — a final entry missing the stamp, and a stamp that lies
+mid-stream.
 
 The live cells state the CONTRACT.  A writer that still merges or
 overshoots (the pre-split-emission writer) fails them — that is the
@@ -269,11 +273,24 @@ def _fx_tmpl(tid, n, sys=False, pcs=None, mem_at=()):
             "is_system": sys}
 
 
-def _fx_e(tid, start=0, stop=None, depth=0, thread=0, wp=None, seq=0):
+def _fx_e(tid, start=0, stop=None, depth=0, thread=0, wp=None, seq=0,
+          thread_end=False):
     return {"template_id": tid, "thread_id": thread, "asid_index": 0,
             "seq_num": seq, "fault_depth": depth, "bb_start": start,
             "bb_stop": stop, "wp_entries": wp or [], "dyn_params": [],
-            "reg_snaps": [], "branch_taken": None, "branch_target": None}
+            "reg_snaps": [], "branch_taken": None, "branch_target": None,
+            "thread_end": thread_end}
+
+
+def assert_thread_end(entries: list[dict]) -> tuple[bool, str]:
+    """Adapter over validator._check_thread_end_flags (the F6 oracle:
+    CST_BB_FLAG_THREAD_END on each context's final entry at EVERY close
+    route) so the selftest proves the check rejects its falsifier."""
+    iss = V._check_thread_end_flags(entries)
+    errs = [i for i in iss if i.severity == "error"]
+    if errs:
+        return False, errs[0].message
+    return True, iss[0].message if iss else "no issues"
 
 
 def run_selftest() -> int:
@@ -329,6 +346,25 @@ def run_selftest() -> int:
     check("wp_own_range", assert_wp_own_range,
           ([_fx_e(6, wp=wp_cut)], tby5, 12),
           ([_fx_e(6, wp=wp_over)], tby5, 12))
+
+    # 6. thread_end (the F6 oracle): two contexts, each final entry
+    # flagged — vs. one context's close route forgetting the stamp
+    # (the budget/simpoint-close shape).
+    check("thread_end", assert_thread_end,
+          ([_fx_e(1, thread=0, seq=1), _fx_e(1, thread=1, seq=2),
+            _fx_e(1, thread=0, seq=3, thread_end=True),
+            _fx_e(1, thread=1, seq=4, thread_end=True)],),
+          ([_fx_e(1, thread=0, seq=1), _fx_e(1, thread=1, seq=2),
+            _fx_e(1, thread=0, seq=3, thread_end=True),
+            _fx_e(1, thread=1, seq=4)],))
+
+    # 6b. thread_end converse: a flag mid-stream lies (the context
+    # continues) — the conforming stream is the same as 6's.
+    check("thread_end_final_only", assert_thread_end,
+          ([_fx_e(1, thread=0, seq=1),
+            _fx_e(1, thread=0, seq=2, thread_end=True)],),
+          ([_fx_e(1, thread=0, seq=1, thread_end=True),
+            _fx_e(1, thread=0, seq=2, thread_end=True)],))
 
     if fails:
         print("SELFTEST FAIL:")

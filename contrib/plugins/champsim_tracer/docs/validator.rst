@@ -231,9 +231,11 @@ Sub-commands
    a wrong-path chain cutting its last block at the wpdepth
    remainder.  ``--selftest`` proves each assertion rejects its
    falsifier (the pre-range merged/overshooting shape) on synthetic
-   fixtures; the live cells run against existing ``all`` run
-   directories and are the acceptance harness for split emission — a
-   writer that still merges or overshoots fails them by design.
+   fixtures — including both ``thread_end`` falsifiers (a context's
+   final entry missing the stamp; a stamp lying mid-stream); the live
+   cells run against existing ``all`` run directories and are the
+   acceptance harness for split emission — a writer that still merges
+   or overshoots fails them by design.
 
 .. _validator-full:
 
@@ -1324,6 +1326,25 @@ These don't need a generator ``meta.json`` and run on any ``.cst``.
    latching past the entry it described, or a forged chain.  Runs in
    ``validate_structural`` and ``validate``.
 
+``thread_end``
+   ``CST_BB_FLAG_THREAD_END`` marks each ``(thread_id, asid)``
+   context's final entry, at every close route — thread exit, END
+   marker, icount/simpoint budget, idle ceiling, machine shutdown
+   (:doc:`format` §4.2a/§5.6).  A consumer learns a context is over
+   from the flag, never by inferring it from the context not
+   reappearing.  The check asserts the wire-observable contract in
+   both directions: the entries the close emits as each context's
+   final — the stream's trailing run of context-final entries — must
+   all carry the flag, whichever route closed the window; and an
+   entry carrying the flag anywhere must be its context's last.  A
+   context that merely scheduled away mid-window is exempt from the
+   first direction (its final entry predates the close and the frozen
+   wire cannot stamp it retroactively; the thread-switch record
+   explains the departure).  Its falsifiers run in
+   ``range_cells --selftest`` (fixture level, always) and in the
+   mutation battery (``thread_end_dropped``, trace level).  Runs in
+   ``validate_structural`` and ``validate``.
+
 ``syscall_fault_nesting``
    Nested-excursion discipline (system-mode marker runs).  The
    generated marker workload issues one syscall whose kernel path is
@@ -1416,7 +1437,17 @@ to anchor expectations.
 ``cp_memops``
    Every block's expected memop multiset (``kind``,
    ``arena_u64_index``, ``data``) is observed in the trace,
-   including ``data`` values for ``memdata=1`` runs.
+   including ``data`` values for ``memdata=1`` runs.  The
+   representative is an execution *group*, never a single entry: one
+   dynamic execution can arrive as several ranged entries
+   (:doc:`format` §4.2a) — the ``[0, k)`` prefix carries the memops
+   it observed, the ``[k, n)`` continuation the rest — so the check
+   joins the first execution whose stretches tile ``[0, n)`` and
+   compares the joined ``dyn_params``.  When no complete execution
+   exists (a close cut the only invocation mid-block), the expected
+   multiset is scoped to the instructions the declared ranges
+   observed: an unobserved tail is not a missing memop, the wire says
+   it was cut.
 
 ``memop_insn_attribution``
    Every observed ``dyn_param`` is attributed to an insn whose
@@ -1543,7 +1574,12 @@ expected memop sub-list, and the per-insn (loads, stores) shape is
 stable across executions), and — in system-mode runs —
 ``syscall_transitions`` and ``fault_excursions`` (user→kernel→return
 privilege transitions off the ``SYSTEM`` bit, and the fault-depth
-invariants).  The ``devio`` and ``physaddr`` record families have their
+invariants).  ``syscall_transitions`` is range-aware: a syscall is
+armed as pending only when the entry's declared range includes the
+template's final (syscall) instruction — a stretch a demand fault cut
+before the syscall must not arm — and every position it compares is
+the range-resolved PC (``insns[bb_start]``), never the template's
+``start_pc``.  The ``devio`` and ``physaddr`` record families have their
 own dedicated structural assertions too, but as ``features`` tier
 checks (``features.devio`` / ``features.devio_attrib`` /
 ``features.physaddr``) run through the unified ``full`` runner rather

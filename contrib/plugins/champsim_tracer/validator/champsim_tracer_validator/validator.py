@@ -698,6 +698,13 @@ def _check_profile_consistency(templates: list[dict],
     """
     issues: list[Issue] = []
 
+    # Range note (format spec §4.2a): the writer's profile counters are
+    # PER-STRETCH — a split execution's [0, k) and [k, n) entries each
+    # bump exec_cp, and its one resolved branch is attributed to both
+    # stretches (verified on the wire: a once-split, once-executed BB
+    # reads exec_cp=2 taken_cp=2).  Entry-count comparisons below are
+    # therefore already in the writer's own units; folding stretches
+    # here would put the two sides in different units and false-fail.
     cp_count: dict[int, int] = {}
     wp_count: dict[int, int] = {}
     total_wp = 0
@@ -876,14 +883,29 @@ def _check_cp_memops(entries: list[dict],
     wrong instruction no longer passes.  A memop with no insn_seq
     (identity not statically derivable) falls back to value-only
     matching; the check itself is never loosened.
+
+    RANGE-AWARENESS (format spec §4.2a).  One dynamic execution of a
+    template can arrive as SEVERAL ranged entries — the ``[0, k)``
+    prefix carries the memops it observed, the ``[k, n)`` continuation
+    the rest — so the representative is an execution GROUP, never a
+    single entry: the first execution whose stretches tile ``[0, n)``,
+    its dyn_params joined across the group's entries.  When no
+    complete execution exists (the window closed mid-block on the only
+    invocation), the group is the first opened one and the expected
+    multiset is scoped to the instructions the group's declared ranges
+    actually observed — an unobserved tail at a close is not a missing
+    memop, the wire says explicitly it was cut (identity-less
+    expecteds, which cannot be scoped, demote to optional there).
     """
     issues: list[Issue] = []
     templates_by_id = templates_by_id or {}
 
     # ---- 1. Build bipartite adjacency restricted to CP. ----
-    # @first_entry maps tid -> single representative entry (default
-    # for normal blocks: avoids counting the same memop pattern N
-    # times when a block sits inside a loop).
+    # @rep_group maps tid -> the entries of the representative dynamic
+    # execution (default for normal blocks: one execution, avoiding
+    # counting the same memop pattern N times when a block sits inside
+    # a loop).  Preference order: the first COMPLETE execution (ranges
+    # tiling [0, n)); if none ever completes, the first opened group.
     # @all_entries maps tid -> list of every CP entry on that
     # template, used when at least one block in the bipartite
     # component opts into aggregate_fanout — true today for the REP-
@@ -891,8 +913,11 @@ def _check_cp_memops(entries: list[dict],
     # subsequent executions of the 1-insn self-loop sub-template.
     tmpl_to_blocks: dict[int, set[int]] = {}
     block_to_tmpls: dict[int, set[int]] = {}
-    first_entry: dict[int, dict] = {}
+    rep_group: dict[int, list[dict]] = {}
+    rep_complete: dict[int, bool] = {}
     all_entries: dict[int, list[dict]] = {}
+    # (tid, (thread, asid)) -> [entries-so-far, next expected start]
+    open_group: dict[tuple[int, tuple], list] = {}
 
     for e in entries:
         tid = e["template_id"]
@@ -901,12 +926,32 @@ def _check_cp_memops(entries: list[dict],
         if not cp_blocks:
             continue
         all_entries.setdefault(tid, []).append(e)
-        if tid in first_entry:
+        if tid not in tmpl_to_blocks:
+            tmpl_to_blocks[tid] = cp_blocks
+            for bid in cp_blocks:
+                block_to_tmpls.setdefault(bid, set()).add(tid)
+        if rep_complete.get(tid):
             continue
-        first_entry[tid] = e
-        tmpl_to_blocks[tid] = cp_blocks
-        for bid in cp_blocks:
-            block_to_tmpls.setdefault(bid, set()).add(tid)
+        start, stop, n = _entry_range(e, templates_by_id.get(tid))
+        ctx = (int(e.get("thread_id", 0) or 0),
+               int(e.get("asid_index", 0) or 0))
+        key = (tid, ctx)
+        if start == 0:
+            grp = [e]
+            open_group[key] = [grp, stop]
+            if tid not in rep_group:
+                rep_group[tid] = grp        # alias; grows with the group
+        else:
+            og = open_group.get(key)
+            if og is None or og[1] != start:
+                continue                    # not a stretch of a tracked group
+            og[0].append(e)
+            og[1] = stop
+            grp = og[0]
+        if stop >= n:
+            rep_group[tid] = grp
+            rep_complete[tid] = True
+            open_group.pop(key, None)
 
     # ---- 2. Connected-component traversal. ----
     visited_tmpls: set[int] = set()
@@ -986,20 +1031,66 @@ def _check_cp_memops(entries: list[dict],
         is_32bit_isa = isa in ("mipsel", "mips", "riscv32", "armhf", "i386")
         # If any block in the component opts into fan-out aggregation
         # (REP-iteration test blocks), walk every CP entry on every
-        # template in the component instead of just the first.  The
-        # REP sub-template is executed N-1 times per source REP,
-        # each execution carrying one iteration's memops on a
-        # distinct body entry; the default first-entry-only mode
-        # would see iter 2 only and miss iter 3..N.
+        # template in the component instead of just the representative
+        # execution group.  The REP sub-template is executed N-1 times
+        # per source REP, each execution carrying one iteration's
+        # memops on a distinct body entry; the default
+        # one-execution-group mode would see iter 2 only and miss
+        # iter 3..N.
         fanout = any(blocks_by_id[bid].get("aggregate_fanout")
                      for bid in comp_blocks)
         def _dps_for(tid: int) -> list:
-            if fanout:
-                out: list = []
-                for e in all_entries.get(tid, []):
-                    out.extend(e.get("dyn_params", []) or [])
-                return out
-            return list(first_entry[tid].get("dyn_params", []))
+            out: list = []
+            src = (all_entries.get(tid, []) if fanout
+                   else rep_group.get(tid, []))
+            for e in src:
+                out.extend(e.get("dyn_params", []) or [])
+            return out
+
+        # ---- 4a. Scope the expecteds to what the representative ----
+        # groups observed.  With every template's representative
+        # execution complete (the overwhelmingly common case) this is a
+        # no-op and the check is exactly as strict as ever.  Otherwise
+        # (window closed mid-block on the only invocation) the wire
+        # declares the cut, and expecting a memop from an instruction
+        # the declared ranges exclude would manufacture a failure out
+        # of an honest partial range: identity-carrying requireds whose
+        # instruction was never observed are dropped, identity-less
+        # requireds demote to optional (they cannot be attributed).
+        comp_fully = fanout or all(rep_complete.get(t, False)
+                                   for t in comp_tmpls)
+        if not comp_fully:
+            observed_pcs: set[int] = set()
+            for t in comp_tmpls:
+                t_insns = templates_by_id.get(t, {}).get("insns", [])
+                for e in rep_group.get(t, []):
+                    s, st, _n = _entry_range(e, templates_by_id.get(t))
+                    for i in range(s, min(st, len(t_insns))):
+                        observed_pcs.add(int(t_insns[i]["pc"]))
+            scoped: list[tuple[str, int, int, bool, tuple | None]] = []
+            n_dropped = n_demoted = 0
+            for kind, off, data, optional, ident in expected:
+                if optional:
+                    scoped.append((kind, off, data, True, ident))
+                elif ident is not None:
+                    if all(p in observed_pcs for p in ident):
+                        scoped.append((kind, off, data, False, ident))
+                    else:
+                        n_dropped += 1      # instruction never observed
+                else:
+                    scoped.append((kind, off, data, True, None))
+                    n_demoted += 1
+            expected = scoped
+            if n_dropped or n_demoted:
+                issues.append(Issue(
+                    "cp_memops", "info",
+                    f"templates {{{'+'.join(f't{t}' for t in sorted(comp_tmpls))}}}: "
+                    f"representative execution is range-partial (close cut "
+                    f"the block); {n_dropped} expected memop(s) outside the "
+                    f"observed range excluded, {n_demoted} identity-less "
+                    f"expected(s) demoted to optional",
+                    {"template_ids": sorted(comp_tmpls),
+                     "dropped": n_dropped, "demoted": n_demoted}))
 
         for tid in sorted(comp_tmpls):
             raw_dps = _dps_for(tid)
@@ -1336,31 +1427,49 @@ def _check_segment_final_memops(
     template's invariant and the final execution must satisfy it too.
     Self-calibrating (no per-workload expectation to keep in sync) and
     silent when the final template is a one-shot or genuinely variable.
+
+    RANGE-AWARENESS (format spec §4.2a).  The invariant is calibrated
+    from WHOLE-block peer executions only (a split stretch carries just
+    its own range's memops and would poison the baseline), and when the
+    final entry itself declares a partial range — a close cut the block
+    mid-flight — the comparison is scoped to the instructions inside
+    that range: the unobserved tail's memops are not "dropped", the
+    wire says they were never observed.
     """
     if len(cp_entries) < 3:
         return [Issue("segment_final_memops", "info",
                       "fewer than 3 CP entries; no final-entry oracle")]
     final = cp_entries[-1]
     tid = final.get("template_id")
-    peers = [e for e in cp_entries[:-1] if e.get("template_id") == tid]
     tmpl = templates_by_id.get(tid) or {}
+    peers = [e for e in cp_entries[:-1]
+             if e.get("template_id") == tid
+             and not _entry_is_partial(e, tmpl)]
     tmpl_insns = tmpl.get("insns") or []
     static_memop_slots = sum(
         1 for i in tmpl_insns
         if int(i.get("n_loads", 0)) or int(i.get("n_stores", 0)))
+    f_start, f_stop, f_n = _entry_range(final, tmpl)
 
-    def shape(e: dict) -> tuple:
+    def shape(e: dict, lo: int = 0, hi: int | None = None) -> tuple:
         """(count, sorted per-instruction load/store tally) — the part of
         an execution's memop set that a template repeats verbatim.  The
         ADDRESSES legitimately move between executions (a striding loop);
-        which instruction accesses memory, and how often, does not."""
+        which instruction accesses memory, and how often, does not.
+        @lo/@hi restrict the tally to insn indices in [lo, hi) so a
+        partial final entry is compared against the same stretch of its
+        whole-block peers."""
         dps = e.get("dyn_params") or []
         tally: dict[tuple, int] = {}
+        count = 0
         for dp in dps:
-            key = (int(getattr(dp, "insn_index", -1)),
-                   str(getattr(dp, "type_name", "")))
+            idx = int(getattr(dp, "insn_index", -1))
+            if idx < lo or (hi is not None and idx >= hi):
+                continue
+            count += 1
+            key = (idx, str(getattr(dp, "type_name", "")))
             tally[key] = tally.get(key, 0) + 1
-        return (len(dps), tuple(sorted(tally.items())))
+        return (count, tuple(sorted(tally.items())))
 
     if len(peers) < 2:
         return [Issue("segment_final_memops", "info",
@@ -1378,7 +1487,19 @@ def _check_segment_final_memops(
         return [Issue("segment_final_memops", "info",
                       f"final entry's template {tid} performs no memops "
                       f"(static memop slots={static_memop_slots})")]
-    got = shape(final)
+    if f_start > 0 or f_stop < f_n:
+        # Partial final entry: scope the invariant to its declared
+        # range (peer tallies re-derived over the same [start, stop)).
+        want = {shape(p, f_start, f_stop) for p in peers}.pop()
+        if want[0] == 0:
+            return [Issue(
+                "segment_final_memops", "info",
+                f"final entry's template {tid} declares range "
+                f"[{f_start},{f_stop}) of {f_n} with no memop-capable "
+                f"peer activity inside it; nothing to assert")]
+        got = shape(final, f_start, f_stop)
+    else:
+        got = shape(final)
     if got != want:
         return [Issue(
             "segment_final_memops", "error",
@@ -1678,6 +1799,10 @@ def _check_per_execution_memop_data(
         # starts iter 1, the second appearance of any tid bumps us into
         # iter 2, etc.  Within an iter, aggregate dyn_params across all
         # templates (the jmp fragment carries zero memops).
+        # A CONTINUATION entry (bb_start > 0, format spec §4.2a) is a
+        # further stretch of the SAME dynamic execution — an excursion
+        # split the block — so it stays in the current iteration and
+        # its template_id does not count as a repeat.
         cov_tids = set(tids)
         # Walk trace entries (already filtered to CP) in order; group
         # by iter when a template_id repeats.
@@ -1687,7 +1812,8 @@ def _check_per_execution_memop_data(
             tid = int(e["template_id"])
             if tid not in cov_tids:
                 continue
-            if tid in seen_in_iter:
+            is_continuation = int(e.get("bb_start", 0) or 0) > 0
+            if tid in seen_in_iter and not is_continuation:
                 iter_entries.append([])
                 seen_in_iter = set()
             iter_entries[-1].append(e)
@@ -4896,6 +5022,16 @@ def _check_syscall_transitions(entries: list[dict],
     trace.  The terminal process-exit syscall never returns, so its
     fall-through staying outstanding is expected.  No user syscalls at
     all -> info (e.g. a fault-only workload).
+
+    RANGE-AWARENESS (format spec §4.2a).  A syscall is pending only
+    when the entry's declared range actually includes the template's
+    final (syscall) instruction: a ``[0, k)`` stretch of a
+    syscall-terminated block — a demand fault split it before the
+    syscall ever ran — must not arm, its continuation ``[k, n)`` does.
+    And an entry's position is its range-resolved PC (the PC of
+    ``insns[bb_start]``), never the template's start_pc: a
+    continuation resumes mid-block, and comparing the block's start
+    against a resume expectation would mis-report the wire.
     """
     branch_names = trace_meta.get("branch_names") or {}
     # The branch_type id naming a syscall (self-describing map; the name
@@ -4936,7 +5072,15 @@ def _check_syscall_transitions(entries: list[dict],
             if pending_by_tid.get(tid) is not None:
                 saw_kernel_by_tid[tid] = True
             continue
+        start, stop, n = _entry_range(e, t)
+        # Range-resolved position: a continuation entry (bb_start > 0)
+        # resumes mid-block at insns[bb_start], not at the template's
+        # start_pc.
         pc = int(t.get("start_pc", 0))
+        if start > 0:
+            ins = t.get("insns") or []
+            if start < len(ins):
+                pc = int(ins[start]["pc"])
         pend = pending_by_tid.pop(tid, None)
         if pend is not None:
             sy_pc, sy_ft = pend
@@ -4977,7 +5121,11 @@ def _check_syscall_transitions(entries: list[dict],
             if not outstanding[pc]:
                 del outstanding[pc]
             verified += 1
-        if ends_in_syscall(t):
+        # Arm only when this entry's range includes the final (syscall)
+        # instruction: a prefix stretch cut before the syscall must not
+        # arm — the syscall has not executed yet; the continuation that
+        # carries it does.
+        if ends_in_syscall(t) and stop >= n:
             pending_by_tid[tid] = (pc, int(t.get("fall_through_pc", 0)))
             saw_kernel_by_tid[tid] = False
 
@@ -5098,11 +5246,12 @@ def _check_call_return_balance(entries: list[dict],
         return [Issue("call_return_balance", "info",
                       "trace declares no call/return branch types")]
 
-    def terminal_bt(t: dict) -> int | None:
-        for ins in reversed(t.get("insns") or []):
-            bt = int(ins.get("branch_type", 0))
+    def terminal_bt(t: dict) -> tuple[int, int] | None:
+        ins_list = t.get("insns") or []
+        for i in range(len(ins_list) - 1, -1, -1):
+            bt = int(ins_list[i].get("branch_type", 0))
             if bn.get(bt, "BRANCH_NONE") not in ("", "BRANCH_NONE"):
-                return bt
+                return bt, i
         return None
 
     calls = rets = 0
@@ -5110,7 +5259,18 @@ def _check_call_return_balance(entries: list[dict],
         t = templates_by_id.get(e["template_id"])
         if t is None:
             continue
-        bt = terminal_bt(t)
+        found = terminal_bt(t)
+        if found is None:
+            continue
+        bt, term_idx = found
+        # Range-awareness (§4.2a): a stretch that never reached the
+        # terminal executed no call/return this entry; and counting
+        # each stretch of a split invocation would double-count one
+        # dynamic transfer.  Only the stretch containing the terminal
+        # counts.
+        start, stop, _n = _entry_range(e, t)
+        if not (start <= term_idx < stop):
+            continue
         if bt in call_ids:
             calls += 1
         elif bt in ret_ids:
@@ -5222,6 +5382,13 @@ def _check_unconditional_direction(templates: list[dict],
         term = uncond_term(pt)
         if term is None:
             continue
+        # Range-awareness (§4.2a): a partial prev entry whose declared
+        # range never reached the terminal observed no branch — its
+        # successor is the excursion or its own continuation, not the
+        # branch outcome; the pair asserts nothing.
+        _ps, p_stop, p_n = _entry_range(prev, pt)
+        if p_stop < p_n:
+            continue
         ft = pt.get("fall_through_pc")
         if not ft:
             continue
@@ -5230,7 +5397,15 @@ def _check_unconditional_direction(templates: list[dict],
         if ft in tgt_pcs:
             continue            # jump-to-next degenerate: taking == falling
         seen_pairs += 1
-        if ct.get("start_pc") == ft:
+        # The successor's position is its range-resolved PC: a
+        # continuation entry resumes at insns[bb_start], not at its
+        # template's start_pc.
+        c_start = int(e.get("bb_start", 0) or 0)
+        c_pc = ct.get("start_pc")
+        if c_start > 0:
+            ci = ct.get("insns") or []
+            c_pc = int(ci[c_start]["pc"]) if c_start < len(ci) else None
+        if c_pc == ft:
             fell_through += 1
             k = pt.get("template_id")
             if len(example_tmpls) < 3 and k not in example_tmpls:
@@ -5834,6 +6009,91 @@ def _check_wp_fork_resolved(entries: list[dict]) -> list[Issue]:
         "wp_fork_resolved", "info",
         f"{n_forked} WP-forking entries all carry a resolved branch "
         f"outcome", {"forked": n_forked})]
+
+
+def _check_thread_end_flags(entries: list[dict]) -> list[Issue]:
+    """CST_BB_FLAG_THREAD_END marks each context's final entry at EVERY
+    close route (thread exit, END marker, icount/simpoint budget, idle
+    ceiling, machine shutdown), format spec §4.2a/§5.6.  A consumer
+    learns a context is over from the flag, never by inferring it from
+    the context not reappearing, so a close route that forgets the
+    stamp silently breaks the consumer contract.  Two directions:
+
+      * **the close's finals are stamped** — the F6 oracle.  Whichever
+        route closes the window, the entries it emits as each context's
+        final form the stream's trailing run of context-final entries
+        (walking back from the end, one entry per context until a
+        context repeats); every entry in that run must carry the flag.
+        This FAILS when a budget/simpoint/END/shutdown close forgets
+        the stamp.  It deliberately does NOT demand a stamp on a
+        context that merely scheduled away mid-window (its final entry
+        is already on the wire when the window closes, and the frozen
+        wire has no way to stamp it retroactively — the thread-switch
+        record explains that departure);
+      * **the stamp never lies** — an entry carrying the flag anywhere
+        in the stream must be its context's last; a flagged context
+        that keeps executing declared an end that wasn't.
+
+    An empty body has no contexts and nothing to assert (info)."""
+    issues: list[Issue] = []
+    last_by_ctx: dict[tuple, dict] = {}
+    lied: list[dict] = []
+
+    def _ctx_of(e: dict) -> tuple:
+        return (int(e.get("thread_id", 0) or 0),
+                int(e.get("asid_index", 0) or 0))
+
+    for e in entries:
+        ctx = _ctx_of(e)
+        prev = last_by_ctx.get(ctx)
+        if prev is not None and prev.get("thread_end"):
+            lied.append(prev)
+        last_by_ctx[ctx] = e
+    if not last_by_ctx:
+        return [Issue("thread_end", "info",
+                      "no body entries; no contexts to close")]
+    # Trailing run of context-final entries: what the close route
+    # emitted as finals, one entry per context, ending at the stream's
+    # last entry.
+    tail_finals: list[dict] = []
+    seen_back: set[tuple] = set()
+    for e in reversed(entries):
+        ctx = _ctx_of(e)
+        if ctx in seen_back:
+            break
+        seen_back.add(ctx)
+        tail_finals.append(e)
+    missing = [e for e in tail_finals if not e.get("thread_end")]
+    for e in missing[:5]:
+        issues.append(Issue(
+            "thread_end", "error",
+            f"context {_ctx_of(e)} closes at seq={e.get('seq_num')} "
+            f"(BB{e.get('template_id')}) without CST_BB_FLAG_THREAD_END — "
+            f"the close route that emitted this final entry did not stamp "
+            f"the context's end",
+            {"ctx": list(_ctx_of(e)), "seq_num": e.get("seq_num")}))
+    if len(missing) > 5:
+        issues.append(Issue(
+            "thread_end", "error",
+            f"...and {len(missing) - 5} more close-final entr(ies) "
+            f"lacking THREAD_END"))
+    for e in lied[:5]:
+        issues.append(Issue(
+            "thread_end", "error",
+            f"entry seq={e.get('seq_num')} (BB{e.get('template_id')}) "
+            f"carries CST_BB_FLAG_THREAD_END but its context continues "
+            f"afterwards — the flag declared an end that wasn't",
+            {"seq_num": e.get("seq_num")}))
+    if issues:
+        return issues
+    n_stamped = sum(1 for e in last_by_ctx.values() if e.get("thread_end"))
+    return [Issue(
+        "thread_end", "info",
+        f"all {len(tail_finals)} close-final entr(ies) stamped with "
+        f"CST_BB_FLAG_THREAD_END, no stamp lies mid-stream "
+        f"({n_stamped}/{len(last_by_ctx)} context finals stamped overall)",
+        {"close_finals": len(tail_finals),
+         "contexts": len(last_by_ctx), "stamped_finals": n_stamped})]
 
 
 def _check_thread_chain(entries: list[dict],
@@ -7636,6 +7896,7 @@ def validate_structural(trace_path: Path,
         entries, trace_meta.get("body_record_order") or [])
     issues += _check_range_invocations(entries, templates_by_id, trace_meta)
     issues += _check_wp_fork_resolved(entries)
+    issues += _check_thread_end_flags(entries)
     issues += _check_thread_chain(entries, templates_by_id,
                                   expected_guest_threads, trace_meta)
     issues += _check_thread_strand_sequential(entries, templates_by_id)
@@ -8085,6 +8346,7 @@ def validate(meta_path: Path, trace_path: Path,
                                   trace_meta=trace_meta)
     issues += _check_range_invocations(entries, templates_by_id, trace_meta)
     issues += _check_wp_fork_resolved(entries)
+    issues += _check_thread_end_flags(entries)
     issues += _check_thread_strand_sequential(entries, templates_by_id)
     # WP-event tallies are global (the writer counts every WP fault,
     # including those in the pre-window prologue — which in system mode

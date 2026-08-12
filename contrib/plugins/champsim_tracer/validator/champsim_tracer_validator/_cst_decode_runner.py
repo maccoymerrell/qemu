@@ -190,7 +190,9 @@ _ENTRY_HEAD_RE = re.compile(
     # or when the slot was never observed — absence IS "no outcome", never a
     # value to be defaulted.
     r"(?: branch=(taken|not-taken) target=0x([0-9a-f]+))?"
-    r"(?: thread_end=1)?$"
+    # CST_BB_FLAG_THREAD_END: this entry is its (thread, asid) context's
+    # final one — stamped by every close route (spec §4.2a/§5.6).
+    r"( thread_end=1)?$"
 )
 _WP_HEAD_RE = re.compile(
     r"^  wp\[(\d+)\] template=BB(\d+) n_insns=(\d+)"
@@ -587,6 +589,7 @@ def _iter_body(lines: list[str], i: int,
                         else m.group(9) == "taken")
         branch_target = (None if m.group(10) is None
                          else int(m.group(10), 16))
+        thread_end = m.group(11) is not None
         i += 1
         # CP block: indented "cp:" header followed by observations.
         cp_dyn: list[DynParam] = []
@@ -662,6 +665,7 @@ def _iter_body(lines: list[str], i: int,
             "thread_switched": thread_switched,
             "branch_taken": branch_taken,
             "branch_target": branch_target,
+            "thread_end": thread_end,
             "fault_depth": fault_depth,
             "bb_start": bb_start,
             "bb_stop": bb_stop,

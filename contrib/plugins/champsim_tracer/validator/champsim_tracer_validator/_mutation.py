@@ -767,6 +767,21 @@ def _m_thread_id_forge(triple, gen_meta) -> Optional[str]:
     return f"entry seq={e.get('seq_num')} thread_id {old}->{e['thread_id']}"
 
 
+def _m_thread_end_dropped(triple, gen_meta) -> Optional[str]:
+    """Strip CST_BB_FLAG_THREAD_END from the close's final entry (the
+    stream tail) — the close route that forgets the stamp (the F6
+    defect class).  The thread_end oracle must fail: a consumer would
+    otherwise have to infer the context's end from it not reappearing,
+    which the format forbids."""
+    _meta, _tmpl, entries = triple
+    if entries and entries[-1].get("thread_end"):
+        e = entries[-1]
+        e["thread_end"] = False
+        return (f"entry seq={e.get('seq_num')} "
+                f"(thread={e.get('thread_id')}) thread_end 1->0")
+    return None            # substrate carries no stamped close-final
+
+
 # ---- wire mutations --------------------------------------------------------
 
 def _tar_members(cst_bytes: bytes) -> dict:
@@ -1384,6 +1399,13 @@ CATALOGUE: list = [
              _m_thread_id_forge,
              expect=("thread_distribution", "thread_chain",
                      "thread_record_cadence")),
+    Mutation("thread_end_dropped", "oracle",
+             "strip CST_BB_FLAG_THREAD_END from a context's final entry "
+             "(a close route forgetting the stamp)",
+             _m_thread_end_dropped,
+             expect=("thread_end",),
+             covered_by="range_cells --selftest (thread_end falsifier "
+                        "fixtures, always run)"),
     Mutation("ppage_corrupt", "oracle",
              "corrupt a per-memop physical-page value",
              _m_ppage_corrupt,

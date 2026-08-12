@@ -1501,14 +1501,14 @@ typedef void (*qemu_plugin_vm_shutdown_cb_t)(qemu_plugin_id_t id,
  * translation-block boundary first.  Guest memory, vCPU registers and
  * the privilege/address-space APIs are all live and stable inside it.
  *
- * That offer is BOUNDED.  A vCPU that has stopped making progress — a
- * plugin lock held across a stall, a guest wedged in an MMIO access,
- * anything that keeps it out of its work queue — would otherwise hold
- * the shutdown open for as long as it lasts, and the request that
- * carries it is the one the operator sent to make QEMU exit.  When the
- * bound expires QEMU says so on stderr and dispatches with
- * QEMU_PLUGIN_VCPU_NONE: a plugin gets a degraded close rather than the
- * machine getting a hang.
+ * QEMU waits for that placement without bound.  The offer goes to every
+ * live vCPU, so the callback runs as soon as ANY of them drains its work
+ * queue, and the dispatch drops the BQL around the callback so a plugin
+ * lock held by a peer vCPU cannot deadlock against it.  A wait that does
+ * not end is therefore a vCPU that is genuinely not making progress —
+ * a defect to fix at its source, not a condition QEMU times and steps
+ * around.  QEMU_PLUGIN_VCPU_NONE is dispatched only on the routes where
+ * no vCPU can be reached at all (none exists, or none is live).
  *
  * It is dispatched at most once per run.  System emulation only: under
  * user-mode emulation the exit callback already runs on a guest thread

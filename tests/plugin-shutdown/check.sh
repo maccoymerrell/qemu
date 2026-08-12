@@ -10,8 +10,9 @@
 #             still runs in vCPU context
 #   wedge0    the first vCPU in the list is not the only candidate: with it
 #             stalled, some other vCPU carries the callback promptly
-#   wedgeall  with EVERY vCPU stalled the wait is bounded, QEMU says so,
-#             and the machine shuts down anyway
+#   wedgeall  with EVERY vCPU stalled the shutdown WAITS -- no expiry, no
+#             vCPU-less fallback -- and delivers in vCPU context the
+#             moment the stall ends
 #
 # Usage: check.sh [outdir]
 #   BUILD=<dir>    QEMU build directory (default <src>/build)
@@ -93,6 +94,7 @@ run_cell() {
         fi
         sleep 1; waited=$((waited + 1))
     done
+    echo "$waited" > "$dir/elapsed"
     if [ -z "$rc" ]; then
         kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
         echo "TIMEOUT" > "$dir/rc"
@@ -181,33 +183,30 @@ if ! run_cell wedge0 8 40 \
 else
     check    "origin"        "$(field "$d" origin)" -2
     check_ge "current"       "$(field "$d" current)" 0
-    if grep -q "no vCPU reached a translation-block boundary" "$d/qemu.err"; then
-        say "    BAD  fell back to the bounded path although a vCPU was idle"
-        fails=$((fails + 1))
-    else
-        say "    ok   delivered on a live vCPU, no fallback"
-    fi
+    say "    ok   delivered on a live vCPU"
 fi
 
 # ========================================================= cell: wedgeall ===
-# The only vCPU stalls, so nothing can ever drain a work queue.  The wait
-# must end, say so, and let the machine go down.
-say "cell wedgeall: with every vCPU stalled the wait is bounded and loud"
+# The only vCPU stalls, so nothing can drain a work queue until the stall
+# ends.  The shutdown WAITS -- there is no expiry and no vCPU-less
+# fallback; a fixed deadlock needs no chaperone -- and the callback is
+# delivered in vCPU context the moment the stall ends (the probe releases
+# its wedge after wedgecap seconds).  Under the removed bounded wait this
+# cell exited at ten seconds with origin=-1; now it must outlive that
+# bound and close with origin=-2 on the unwedged vCPU.
+say "cell wedgeall: with every vCPU stalled the shutdown waits out the stall"
 d="$OUT/wedgeall"; mkdir -p "$d"
-if ! run_cell wedgeall 8 45 \
+if ! run_cell wedgeall 8 90 \
         "$QBIN" -nographic -m 256 -smp 1 -cpu Haswell \
-        -plugin "$PROBE,out=$d/probe.txt,wedge=on,wedgeafter=1,wedgecap=120"; then
-    say "    BAD  qemu never exited: the shutdown wait is unbounded"
+        -plugin "$PROBE,out=$d/probe.txt,wedge=on,wedgeafter=1,wedgecap=30"; then
+    say "    BAD  qemu never exited although the stall ended (wedgecap=30)"
     fails=$((fails + 1))
 else
-    check "origin"        "$(field "$d" origin)" -1
-    check "in_guest_insn" "$(field "$d" in_guest_insn)" 0
-    if grep -q "no vCPU reached a translation-block boundary" "$d/qemu.err"; then
-        say "    ok   QEMU reported the degraded close"
-    else
-        say "    BAD  bounded path taken with no diagnostic"
-        fails=$((fails + 1))
-    fi
+    check    "origin"        "$(field "$d" origin)" -2
+    check    "in_guest_insn" "$(field "$d" in_guest_insn)" 0
+    check_ge "current"       "$(field "$d" current)" 0
+    check_ge "held past the retired 10s bound (s after SIGTERM)" \
+             "$(cat "$d/elapsed" 2>/dev/null)" 15
 fi
 
 say ""

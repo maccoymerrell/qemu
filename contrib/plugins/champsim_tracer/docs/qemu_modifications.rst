@@ -1983,18 +1983,24 @@ Machine-shutdown notification
    better claim than any other to be reachable; it may be halted, it may
    be stopped, and — the case that matters for this tracer — it may be
    the vCPU parked behind a plugin lock that another vCPU is holding.
-   Waiting on that one vCPU meant waiting for the stall to clear, and a
-   stall that does not clear held the shutdown open forever, on the
-   request the operator sent precisely to make QEMU exit.
+   The offer to every vCPU means the callback runs as soon as ANY of
+   them drains its work queue, and the lock-order inversion that could
+   park the callback itself — arriving with the BQL held and then
+   blocking on a plugin lock whose holder needs the BQL — is fixed at
+   its source: the dispatch drops the BQL around the callback.
 
-   The offer is bounded at ten seconds.  When it expires QEMU reports
-   the degraded close on stderr and dispatches with
-   ``QEMU_PLUGIN_VCPU_NONE``: the plugin is told plainly that no guest
-   state is readable, which is a worse close than it wanted and a far
-   better outcome than a machine that will not go down.  The queued work
-   items stay queued; a vCPU that frees up afterwards finds the hook
-   already fired, which is why the one-shot claim is an atomic exchange
-   rather than a plain flag.
+   The requester then waits, without bound, until some vCPU has
+   delivered the callback.  Nothing times the wait and nothing steps
+   around it: with the placement offered to every vCPU and the
+   lock-order fixed, a wait that does not end is a vCPU that is
+   genuinely not making progress, and that is a defect to be fixed
+   where it lives rather than detected here.  The offer goes to every
+   vCPU, so more than one can arrive; the one-shot claim is an atomic
+   exchange rather than a plain flag, and a late arrival finds the hook
+   already fired and does nothing.  ``QEMU_PLUGIN_VCPU_NONE`` is
+   dispatched immediately — no wait — on the routes where no vCPU can
+   be reached at all: none exists, none is live, or the requester does
+   not hold the BQL that placing work requires.
 
    ``in_guest_insn`` reports POSITION, and it is a separate statement
    from ``vcpu_index``'s statement of ORIGIN.  It is true on the route

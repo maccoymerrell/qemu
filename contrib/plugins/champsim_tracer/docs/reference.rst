@@ -1040,7 +1040,9 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
    * - ``compress=<shell command>``
      - unset
      - Per-member compressor command (``popen``'d once per archive
-       member).
+       member).  Writes to the command block: a sink that reads
+       slowly delays the tracer, and one that stops reading stops
+       it (see :doc:`quickstart`).
    * - ``wp=0|1``
      - ``1``
      - Enable wrong-path simulation.
@@ -1322,8 +1324,7 @@ Environment knobs
 -----------------
 
 Environment variables the plugin and its tools consult.  All except
-``CST_SPEC_FLUSH_BUDGET``, ``CST_DECODE_THREADS``,
-``CST_SINK_STALL_SECS`` and ``CST_SINK_STALL_ABORT_SECS`` are
+``CST_SPEC_FLUSH_BUDGET`` and ``CST_DECODE_THREADS`` are
 **diagnostics**: they exist for debugging and A/B isolation, perturb
 either output or performance, and have no place in a production
 trace run.
@@ -1339,33 +1340,6 @@ trace run.
        triggers a proactive ``tb_flush`` + reclaim; default 256 MiB.
        Also the reclaim live-fire test knob.  See
        :ref:`template-lifetimes`.
-   * - ``CST_SINK_STALL_SECS``
-     - Interval, in seconds, at which a wait on the ``compress=``
-       sink that has taken **no further bytes** for the whole
-       interval is reported on stderr; default ``60``, ``0``
-       disables the report.  Four waits are covered: a vCPU thread
-       waiting for a free output chunk (the guest is frozen
-       between instructions), the close draining the writer
-       thread, the close writing the header member to its sink,
-       and the close waiting for the compression pipe to exit.
-       What is tested is the sink's byte count, not elapsed time,
-       and the count moves every 64 KiB, so a compressor that is
-       reading at all — however slowly — never trips it.  A full
-       output *filesystem* is a different failure and does not
-       reach here: it fails the write outright and is reported as
-       ``writer fwrite short``.
-   * - ``CST_SINK_STALL_ABORT_SECS``
-     - No-progress deadline, in seconds, after which such a wait
-       ends the run (exit status ``97``) with the trace
-       **incomplete**, instead of continuing to wait.  Off unless
-       set: a compressor that is still taking bytes is still
-       writing the trace, and only the operator knows whether an
-       unfinishable run should end or hold.  It applies only to
-       the three waits that have a byte counter behind them.  The
-       wait for the compression pipe to *exit* has none — nothing
-       measures a compressor finalising its last block — so that
-       one is reported and never aborted; ending a run there would
-       destroy a trace the sink had already taken in full.
    * - ``CST_WRITER_NO_THREAD``
      - *Diagnostic.*  Makes the output writer thread fail to start,
        so the synchronous write-through path the plugin falls back

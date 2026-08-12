@@ -13,7 +13,6 @@
 #include "qemu/plugin.h"
 #include "hw/boards.h"
 #include "qemu/main-loop.h"
-#include "qemu/error-report.h"
 #include "hw/core/cpu.h"
 
 #include "plugin.h"
@@ -38,24 +37,6 @@ void qemu_plugin_fillin_mode_info(qemu_info_t *info)
  * qemu_plugin_atexit_cb() fires — current_cpu is NULL and the machine is
  * already down.
  */
-
-/*
- * How long the marshalled route holds the shutdown open while it waits for
- * some vCPU to reach its work queue.
- *
- * The wait is what makes the vCPU-context guarantee real, and it is also
- * the one place where a plugin's own scheduling can stall QEMU's exit: the
- * work runs when a vCPU next drains its queue, which it does between
- * translation blocks, and a vCPU that is not making progress between
- * translation blocks never gets there.  A plugin lock held across a stall,
- * a guest wedged in an MMIO access and a vCPU spinning inside an
- * instrumentation callback all read the same from here.  The request that
- * carries this dispatch is the operator's SIGTERM or `quit`, so an
- * unbounded wait converts a plugin's problem into a machine that does not
- * shut down.  Ten seconds is orders of magnitude above the microseconds a
- * healthy vCPU needs, and finite.
- */
-#define PLUGIN_SHUTDOWN_PLACE_TIMEOUT_MS 10000
 
 static QemuCond plugin_shutdown_placed_cond;
 static bool plugin_shutdown_placed_cond_ready;
@@ -141,7 +122,6 @@ void qemu_plugin_vm_shutdown(void)
 {
     CPUState *cpu;
     bool offered = false;
-    int64_t deadline;
 
     if (!qemu_plugin_vm_shutdown_armed()) {
         return;
@@ -198,33 +178,20 @@ void qemu_plugin_vm_shutdown(void)
         return;
     }
 
-    deadline = g_get_monotonic_time() +
-               (int64_t)PLUGIN_SHUTDOWN_PLACE_TIMEOUT_MS * 1000;
-    while (!qatomic_read(&plugin_shutdown_placed)) {
-        int64_t left_ms = (deadline - g_get_monotonic_time()) / 1000;
-
-        if (left_ms <= 0) {
-            break;
-        }
-        /* Releases the BQL while it waits, so the vCPUs can run. */
-        qemu_cond_timedwait_bql(&plugin_shutdown_placed_cond, (int)left_ms);
-    }
-    if (qatomic_read(&plugin_shutdown_placed)) {
-        return;
-    }
-
     /*
-     * Nothing reached its work queue in ten seconds.  Say so -- a
-     * degraded close is a thing the operator has to know about, and the
-     * alternative reading of the same silence is a machine that hangs on
-     * shutdown -- and then dispatch from here, without vCPU context.  The
-     * queued work items stay queued; if a vCPU frees up later its dispatch
-     * finds the hook already fired and does nothing.
+     * Wait until some vCPU has delivered the callback.  The wait is
+     * unbounded, deliberately: the work is offered to every live vCPU, so
+     * it runs as soon as ANY of them drains its work queue, and the
+     * lock-order inversion that could park the callback itself -- the BQL
+     * held into a plugin lock a peer vCPU holds across a wrong-path
+     * excursion -- is fixed at its source in plugin_vm_shutdown_on_cpu,
+     * which drops the BQL around the dispatch.  What remains is a plugin
+     * or a guest that is genuinely not making progress, and that is its
+     * own defect to be fixed where it lives, not a condition to be
+     * detected and stepped around from here.
      */
-    warn_report("plugin: no vCPU reached a translation-block boundary within "
-                "%d ms of the shutdown request; delivering the machine-"
-                "shutdown callback without vCPU context, so a plugin holding "
-                "an open capture cannot read guest state to close it",
-                PLUGIN_SHUTDOWN_PLACE_TIMEOUT_MS);
-    qemu_plugin_vm_shutdown_dispatch(QEMU_PLUGIN_VCPU_NONE, false);
+    while (!qatomic_read(&plugin_shutdown_placed)) {
+        /* Releases the BQL while it waits, so the vCPUs can run. */
+        qemu_cond_wait_bql(&plugin_shutdown_placed_cond);
+    }
 }

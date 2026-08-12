@@ -119,6 +119,17 @@ Output destination
    -c"``, ``compress="gzip -c"``.  The member suffix is inferred from
    the first word of the command.
 
+   Writes to the command are blocking.  An asynchronous writer thread
+   absorbs up to 64 MiB of backlog; beyond that the producing vCPU
+   thread waits for the sink, so a compressor that reads slowly slows
+   the run rather than losing bytes, and a command that never reads
+   its stdin stops the tracer for as long as it never reads.  At
+   segment close the tracer likewise waits for the command to take
+   every byte and exit.  A full output *filesystem* is a different
+   failure and does not block: the compressor's own write fails, it
+   exits, and the tracer reports the short write on stderr
+   (``writer fwrite short``).
+
 Segmentation
 ~~~~~~~~~~~~
 

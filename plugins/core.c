@@ -234,10 +234,9 @@ bool qemu_plugin_vm_shutdown_dispatch(int vcpu_index, bool in_guest_insn)
     }
     /*
      * Claimed with an atomic exchange because the callers are no longer
-     * serialised.  The marshalled route offers the work to every vCPU and
-     * stops waiting after a bounded interval, so a vCPU that frees up late
-     * can be inside this function at the same moment as the thread that
-     * gave up on it, and a plugin must see this callback once.
+     * serialised.  The marshalled route offers the work to every vCPU, so
+     * under MTTCG two of them can be inside this function at the same
+     * moment, and a plugin must see this callback once.
      */
     if (qatomic_xchg(&vm_shutdown_dispatched, true)) {
         return false;

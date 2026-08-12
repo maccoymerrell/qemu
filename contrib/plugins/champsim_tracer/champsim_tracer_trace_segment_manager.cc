@@ -122,14 +122,10 @@ static bool close_member_file(FILE *f, bool is_pipe, const char *label)
         return true;
     }
     if (is_pipe) {
-        /* pclose waits for the compressor to EXIT.  A compressor that has
-         * taken every byte and then never finishes parks the close here,
-         * after the writer drain has already returned -- the same silence,
-         * one step further on.  Watched, for the same reason. */
-        void *watch = sink_stall_watch_begin(
-            "the close waiting for the compression pipe to exit");
+        /* pclose waits for the compressor to exit; a compressor still
+         * finalising its last block is waited for, because what it is
+         * finishing is the trace. */
         int rc = pclose(f);
-        sink_stall_watch_end(watch);
         if (rc != 0) {
             fprintf(stderr,
                     "champsim_tracer: %s compression pipe exited with status %d\n",
@@ -340,15 +336,8 @@ void TraceSegmentManager::finish(const std::function<void()> &flush_hook)
                              &current_->header_is_pipe, "header");
         if (current_->header_file) {
             size_t n = header_bytes->len;
-            /* The header goes down its own pipe with no writer thread behind
-             * it, so a header sink that stops reading parks the close right
-             * here -- the body having already drained perfectly.  Same watch,
-             * same progress rule; it used to be the one wait on the sink that
-             * said nothing at all. */
-            if (n && sink_write_watched(
-                        current_->header_file, header_bytes->data, n,
-                        "the close writing the header member to its sink")
-                     != n) {
+            if (n && fwrite(header_bytes->data, 1, n,
+                            current_->header_file) != n) {
                 fprintf(stderr,
                         "champsim_tracer: header write failed: %s\n",
                         current_->header_temp_path);

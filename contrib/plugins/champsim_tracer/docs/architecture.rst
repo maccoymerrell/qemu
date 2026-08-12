@@ -1937,17 +1937,32 @@ vCPU's live retired cursor (a thread that may still be executing), and
 whether the slot is that vCPU's current in-flight head — a block the
 close is reading mid-flight.  Because the stash is written by that
 first dispatch whether it was owned or foreign, a peer still holding a
-slot at a close has almost always dispatched again since, and the two
-narrower rows had never been observed above 0.  They are reachable —
-a ``riscv64 --smp 2`` system cell classifies a peer slot as the live
-cursor's in-flight head with no arm at all — but reaching them takes a
-window a scheduling draw rarely lands in, so
-``CST_SMP_PEER_LIVE_FALSIFY`` and ``CST_SMP_PEER_INFLIGHT_FALSIFY``
-drive one real peer close down each arm on demand.  They perturb only
-the copies the classification reads and print the machine's real
-answer beside the forced one; the three counters are written in exactly
-one place and read in exactly one (the stats report), so no arm here
-can reach the wire at all.
+slot at a close has almost always dispatched again since, and on
+x86_64 and mipsel the two narrower rows had never been observed above
+0 — 400 instrumented cells, 76 of them firing the stash row and none
+firing either other.  That zero was an artefact of which ISAs had been
+run, not a fact about the tracer.  Measured on a 160-cell aarch64 and
+riscv64 system wave (``--smp 2`` and ``--smp 4``, no arm anywhere): of
+98 peer-slot classifications, 77 came from the stash and **21 from the
+live cursor**, spread over 21 cells, 11 aarch64 and 10 riscv64.
+
+Every one of those 21 was also the in-flight head, and that identity is
+structural rather than lucky: the stash is missing exactly when no
+dispatch has followed the promote on that vCPU, and in that case the
+held slot still *is* the vCPU's current dispatch.  The two rows
+therefore name one window, from two sides.  What the arms —
+``CST_SMP_PEER_LIVE_FALSIFY`` and ``CST_SMP_PEER_INFLIGHT_FALSIFY`` —
+buy is reaching that window on demand, on any ISA, instead of by
+scheduling draw.  They perturb only the copies the classification reads
+and print the machine's real answer beside the forced one; the three
+counters are written in exactly one place and read in exactly one (the
+stats report), so no arm here can reach the wire at all.
+
+Peers are **not** quiesced at a close: ``exec_lock`` serialises the
+per-TB callbacks, and a peer executing translated guest code is in
+none of them.  A slot classified as the in-flight head is therefore
+read from a vCPU that may still be running, off an ``insn_started``
+slot that vCPU's own inline adds are still advancing.
 
 On the wire (``CST_FLAG_FAULT``, set in marker mode; user-mode traces
 advertise no fault machinery): every CP entry carries ``fault_depth``

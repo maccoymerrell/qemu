@@ -4826,12 +4826,15 @@ static void smp_stamp_mispredict_note(bool emitted, bool predicted)
  * here is read by tracer logic, and flush_final re-derives the extent it
  * actually publishes from its own lookups.
  *
- * THE TWO ARMS.  Of the 400 instrumented cells that have reported these
- * rows, 76 saw the stash arm fire and NOT ONE ever saw the live-cursor arm
- * or the in-flight arm at anything but 0.  A row seen only at 0 cannot
- * distinguish "the stash answers for every slot a close finds" from "the
- * branch is unreachable and the row means nothing", which is the same
- * silent-false-success cad149f5be named for this pair's two siblings.
+ * THE TWO ARMS.  Of the 400 instrumented x86_64 and mipsel cells that had
+ * reported these rows, 76 saw the stash arm fire and NOT ONE ever saw the
+ * live-cursor arm or the in-flight arm at anything but 0.  A row seen only
+ * at 0 cannot distinguish "the stash answers for every slot a close finds"
+ * from "the branch is unreachable and the row means nothing", which is the
+ * same silent-false-success cad149f5be named for this pair's two siblings.
+ * It turned out to be neither: a 160-cell aarch64+riscv64 system wave with
+ * no arm anywhere classified 98 peer slots as 77 stash and 21 live cursor,
+ * over 21 cells.  The old zero was an ISA blind spot.
  *
  * Both rows are classification outcomes rather than claims that work went
  * unpublished, so both arms are SYNTHETIC, in the CST_SMP_STAMP_FALSIFY

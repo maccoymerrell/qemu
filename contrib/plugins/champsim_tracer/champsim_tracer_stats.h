@@ -639,20 +639,25 @@ struct Stats {
      * cursor of a vCPU that may still be executing, and the slot being
      * that vCPU's CURRENT in-flight head at the close.
      *
-     * The three are a strict priority, not independent tallies, and only
-     * the stash row has ever been observed above 0: across the 400
-     * instrumented cells that reported them, 76 saw the stash arm and none
-     * saw either of the other two.  Because the stash is written by the
-     * FIRST dispatch after a promote — owned or foreign — a peer still
-     * holding a slot at a close has almost always dispatched again since,
-     * which is precisely why the cursor can no longer name it.  The two
-     * quiet rows are therefore reachable only in the narrow window where a
-     * peer's last plugin-visible dispatch IS the promote, and until they
-     * had an arm a 0 could not be told apart from a detector wired to
-     * nothing.  CST_SMP_PEER_LIVE_FALSIFY and CST_SMP_PEER_INFLIGHT_FALSIFY
-     * (smp_close_peer_extent_note, champsim_tracer.cc) drive one real peer
-     * close down each arm; being synthetic they perturb only the copies the
-     * classification reads, and the counters reach no wire. */
+     * The three are a strict priority, not independent tallies.  Because
+     * the stash is written by the FIRST dispatch after a promote — owned or
+     * foreign — a peer still holding a slot at a close has usually
+     * dispatched again since, which is precisely why the cursor can no
+     * longer name it, and on x86_64 and mipsel only the stash row had ever
+     * been seen above 0 (400 cells, 76 firing the stash, 0 firing either
+     * other).  That was an ISA blind spot, not a reachability fact: a
+     * 160-cell aarch64+riscv64 system wave with no arm anywhere classified
+     * 98 peer slots as 77 stash and 21 LIVE CURSOR, over 21 cells (11
+     * aarch64, 10 riscv64).  All 21 were also the in-flight head — the
+     * stash is missing exactly when no dispatch followed the promote, and
+     * then the slot still IS that vCPU's current dispatch, so the two rows
+     * name one window from two sides.  CST_SMP_PEER_LIVE_FALSIFY and
+     * CST_SMP_PEER_INFLIGHT_FALSIFY (smp_close_peer_extent_note,
+     * champsim_tracer.cc) reach that window on demand on any ISA; being
+     * synthetic they perturb only the copies the classification reads, and
+     * the counters reach no wire.  What the in-flight case MEANS for the
+     * extent the flush then publishes is a live question: peers are not
+     * quiesced at a close. */
     uint64_t smp_close_peer_stash_extent = 0;
     uint64_t smp_close_peer_live_cursor = 0;
     uint64_t smp_close_peer_inflight_head = 0;

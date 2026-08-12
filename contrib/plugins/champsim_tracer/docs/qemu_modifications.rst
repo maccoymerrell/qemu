@@ -1955,15 +1955,27 @@ Machine-shutdown notification
    * ``qemu_system_shutdown_request()`` — the guest poweroff / reset /
      monitor / QMP path.  A guest that powers itself off reaches this
      from its own instruction stream, so it arrives on that vCPU's own
-     thread with its state live: the callback runs directly.  The
-     CONDUIT belongs to the machine and not to this interface.  An
-     x86-64 guest writes the ACPI sleep register and the request comes
-     out of the store; an ``-M virt`` aarch64 guest executes ``hvc #0``
-     and QEMU answers it itself as PSCI ``SYSTEM_OFF``
-     (``target/arm/tcg/psci.c``, reached from ``arm_cpu_do_interrupt()``
-     — exception delivery, with no device write anywhere in it).  Both
-     are the guest's own execution asking for the shutdown, and both
-     arrive here the same way.
+     thread with its state live — and with the BQL held, because the
+     CONDUIT belongs to the machine and not to this interface: an x86-64
+     guest writes the ACPI sleep register and the request comes out of
+     the store (``do_st_mmio_leN`` took the lock); an ``-M virt``
+     aarch64 guest executes ``hvc #0`` and QEMU answers it itself as
+     PSCI ``SYSTEM_OFF`` (``target/arm/tcg/psci.c``, reached from
+     ``arm_cpu_do_interrupt()`` — exception delivery, with no device
+     write anywhere in it, and the lock held just the same).  The
+     dispatch therefore does not run inside the write: a synchronous
+     callback here would hold the BQL against a plugin lock a peer vCPU
+     can hold across a wrong-path excursion that needs the BQL — the
+     same AB/BA the marshalled route below cures by dropping the lock,
+     measured live on this route as a riscv64 -smp 4 guest poweroff
+     standing in the shutdown callback beneath the syscon store while a
+     peer's excursion waited on the BQL.  This lock is the device
+     write's own and cannot be dropped mid-handler, so the work is
+     QUEUED on the requesting vCPU instead and delivered at its next
+     translation-block boundary, where the runner drops the BQL around
+     the callback and forwards the origin index.  The request path does
+     not wait; the second dispatch point below runs before teardown and
+     waits for the delivery.
    * ``qemu_system_shutdown()`` in the main loop — the only path a HOST
      SIGNAL reaches, because ``qemu_system_killed()`` runs in a signal
      handler and sets ``shutdown_requested`` directly.  Here there is no
@@ -2010,62 +2022,62 @@ Machine-shutdown notification
    not hold the BQL that placing work requires.
 
    ``in_guest_insn`` reports POSITION, and it is a separate statement
-   from ``vcpu_index``'s statement of ORIGIN.  It is true on the route
-   the guest's own execution took to the shutdown request, where the
-   instruction that caused it has BEGUN and has not been observed to
-   complete.  On the marshalled route the work runs at a
-   translation-block boundary and the last dispatched block completed.
-   A plugin closing a capture would otherwise have to guess, and either
-   guess costs it: claiming the in-flight instruction publishes a block
-   whose memops are incomplete (cst_audit's memop-bimodality oracle
-   catches it), while discarding an instruction that did retire is a
-   dropped instruction.  The tracer walks the slot's retired prefix and
+   from ``vcpu_index``'s statement of ORIGIN.  It is true only where the
+   callback really runs inside the instruction that caused the shutdown
+   — a vCPU-context request that arrives without the BQL, which no
+   ordinary route produces.  Everywhere a delivery runs at a
+   translation-block boundary — the marshalled routes, and the
+   guest-poweroff route whose dispatch is queued past the BQL-holding
+   write — the last dispatched block completed and the flag is false; on
+   the poweroff route the instruction that asked has retired by the time
+   the callback runs, which is exactly what false reports.  A plugin
+   closing a capture would otherwise have to guess, and either guess
+   costs it: claiming an in-flight instruction publishes a block whose
+   memops are incomplete (cst_audit's memop-bimodality oracle catches
+   it), while discarding an instruction that did retire is a dropped
+   instruction.  The tracer walks the slot's retired prefix and
    subtracts exactly the in-flight instruction when this flag says there
-   is one.
+   is one, and the machinery keys off the flag rather than the route.
 
-   WHICH instruction that is follows the conduit.  A probe plugin that
-   records the last instruction to reach an execution callback reads
-   ``outw %ax, %dx`` on x86-64 — the ACPI store, whose memory operations
-   are only partly observed at the dispatch — and ``hvc #0`` on aarch64
-   ``-M virt``.  The aarch64 one is the stronger case, not the weaker:
-   the PSCI handler powers the CPU off inside the call, so the guest
-   never leaves that instruction and no instruction after it ever
-   begins; the probe's execution count is unchanged between the
-   shutdown callback and ``plugin_exit``, where on x86-64 the guest goes
-   on to execute 94 more.  Either way the instruction's result snapshot
-   — captured one instruction behind, by the NEXT instruction's callback
-   — does not exist at the close, which is what makes subtracting it
-   right rather than merely cautious.  With the pinned process powering
-   the machine off itself, so that the slot the drain reads IS the block
-   the guest stands in, both ISAs subtract exactly one:
-   ``close_deferred_prev_inflight_trimmed`` reads 1 and the final entry
-   is the two-instruction PSCI stub ``bti c ; hvc #0`` published as one
-   instruction.  With the poweroff run from a process the window is not
-   pinned to, both instead read ``close_deferred_prev_inflight_stale``
-   = 1: the fact is about the vCPU's current instruction and the slot
-   holds somebody else's block, so the subtraction is refused.
+   WHICH instruction asked follows the conduit — ``outw %ax, %dx`` on
+   x86-64 (the ACPI store), ``hvc #0`` on aarch64 ``-M virt`` — and the
+   queued delivery is why the callback no longer stands inside it.  When
+   the dispatch still ran inside the write, a probe plugin recording the
+   last instruction to reach an execution callback read exactly those
+   instructions at the callback, their memory operations only partly
+   observed, and the tracer's drain subtracted the in-flight one on each
+   ISA (``close_deferred_prev_inflight_trimmed`` read 1, and an aarch64
+   final entry was the two-instruction PSCI stub ``bti c ; hvc #0``
+   published as one instruction — measurements of the synchronous
+   dispatch this seam has since replaced).  At the queued delivery the
+   asking instruction has retired and its block is complete, so nothing
+   is subtracted and the block is published whole; the trim machinery
+   stays, driven by the flag, for any delivery that really is
+   mid-instruction.
 
-   The flag is INFERRED from ``current_cpu`` being set at the request,
-   which is a fact about the thread rather than about the guest.  The
+   The flag is INFERRED from ``current_cpu`` and the BQL at the request,
+   which are facts about the thread rather than about the guest.  The
    two coincide wherever a shutdown request reaches
    ``qemu_system_shutdown_request()`` from inside ``cpu_exec()``, which
    is every route the guest itself can take to it — a device write and a
-   trapped instruction alike.  They come apart in one place, and it is
-   worth naming because it is not visible from the plugin side: under
-   ``-icount`` with round-robin TCG, ``icount_handle_deadline()`` runs
+   trapped instruction alike, and every one of them holds the BQL, so
+   every one of them takes the queued delivery and reports false.  The
+   inference hazard this paragraph used to name — under ``-icount`` with
+   round-robin TCG, ``icount_handle_deadline()`` runs
    ``QEMU_CLOCK_VIRTUAL`` timer callbacks on the vCPU thread with
    ``current_cpu`` still pointing at the vCPU of the previous loop
    iteration (``accel/tcg/tcg-accel-ops-icount.c``,
-   ``accel/tcg/tcg-accel-ops-rr.c``), so a timer that requested a
-   shutdown from there would be reported as in-guest while the last
-   dispatched block was in fact complete, and the drain would subtract
-   an instruction that retired.  The discriminator that would make the
-   flag a fact rather than an inference is ``cpu_exec()``'s own
-   ``CPUState::running``, which a stale ``current_cpu`` always reads
-   false.  It is not applied here because no configuration this tracer
-   runs uses ``-icount`` and no such timer has been exercised: a
-   predicate whose failing arm cannot be made to fire is not a fix that
-   can be shown to work.
+   ``accel/tcg/tcg-accel-ops-rr.c``), which the synchronous dispatch
+   would have reported as in-guest while the last dispatched block was
+   in fact complete — is confined by the same queueing: those timer
+   callbacks run under the BQL, so a shutdown requested from one is
+   queued and delivered at a boundary, false and correct.  What remains
+   of the inference is only the no-BQL vCPU-context branch, which no
+   route in this tree produces; the discriminator that would make the
+   flag a fact rather than an inference there is ``cpu_exec()``'s own
+   ``CPUState::running``, and it is still not applied, for the standing
+   reason: a predicate whose failing arm cannot be made to fire is not
+   a fix that can be shown to work.
 
    The contract is exercised by ``tests/plugin-shutdown/check.sh``,
    which builds a probe plugin and takes an x86-64 guest to a shutdown

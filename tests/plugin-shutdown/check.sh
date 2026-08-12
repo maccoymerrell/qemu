@@ -5,7 +5,11 @@
 # Four cells, each asserting one clause of qemu_plugin_vm_shutdown_cb_t:
 #
 #   origin    a guest poweroff NAMES the vCPU that executed the device
-#             write, and that vCPU is the one whose state is live
+#             write, and that vCPU is the one whose state is live.  The
+#             delivery is queued to that vCPU's next TB boundary (the
+#             request arrives under the BQL, which must not be held into
+#             a plugin lock), so the write has RETIRED: in_guest_insn is
+#             false and the origin index is the surviving fact
 #   unnamed   a shutdown nobody in the guest asked for names NO vCPU, and
 #             still runs in vCPU context
 #   wedge0    the first vCPU in the list is not the only candidate: with it
@@ -145,7 +149,7 @@ elif ! run_cell origin - 120 \
     fails=$((fails + 1))
 else
     o=$(field "$d" origin); check_ge "origin"        "$o" 0
-    check    "in_guest_insn" "$(field "$d" in_guest_insn)" 1
+    check    "in_guest_insn" "$(field "$d" in_guest_insn)" 0
     check    "current"       "$(field "$d" current)" "$o"
 fi
 

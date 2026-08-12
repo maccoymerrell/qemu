@@ -1716,12 +1716,12 @@ not populate the normal-mode TLB they bypass.
 Bulk-memory instrumentation
 ---------------------------
 
-A handful of AArch64 instructions move memory in bulk from inside a TCG
-helper rather than through ``qemu_ld`` / ``qemu_st`` ops: the ARMv8.8
-FEAT_MOPS families ``SETP`` / ``SETM`` / ``SETE`` and ``CPYP`` /
-``CPYM`` / ``CPYE``, whose three-instruction triples implement a whole
-``memset`` or ``memcpy``, and ``DC ZVA``, which zeroes a
-cache-block-sized run.
+A handful of instructions move memory in bulk from inside a TCG helper
+rather than through ``qemu_ld`` / ``qemu_st`` ops.  On AArch64 these are
+the ARMv8.8 FEAT_MOPS families ``SETP`` / ``SETM`` / ``SETE`` and
+``CPYP`` / ``CPYM`` / ``CPYE``, whose three-instruction triples
+implement a whole ``memset`` or ``memcpy``, and ``DC ZVA``, which zeroes
+a cache-block-sized run; on PowerPC it is ``DCBZ``.
 Each helper takes a trapless ``tlb_vaddr_to_host()`` lookup and, on
 success, transfers the page-bounded chunk with a host ``memset()`` or
 ``memmove()``.  Plugin memory instrumentation is emitted by ``accel/tcg``
@@ -1811,6 +1811,37 @@ program's bulk memory traffic.
    wire addresses at most ``CST_FID_SLOT_COUNT`` = 512 per direction per
    instruction; see :doc:`limitations` for what the trace carries past
    that point.
+
+``target/ppc/mem_helper.c`` — ``ppc_plugin_block_zero_cb``
+
+   PowerPC's ``DCBZ`` is the same instruction shape and had the same
+   defect.  ``dcbz_common()`` clears a whole d-cache block, and in user
+   mode its ``tlb_vaddr_to_host()`` lookup is a bare ``g2h()`` that
+   always succeeds on a mapped page, so the host ``memset()`` behind it
+   is the *only* path a correct-path ``DCBZ`` ever takes and the whole
+   block clear is invisible to a plugin.  System mode was already
+   correct by accident of using ``probe_write()``, which passes
+   ``check_mem_cbs=true`` and so hands back NULL while a plugin has
+   memory callbacks registered, sending the clear down the instrumented
+   quadword loop.
+
+   The reporter is the ppc twin of the AArch64 one: same 16-byte
+   naturally aligned decomposition, same ``cpu->neg.plugin_mem_cbs``
+   gate, and the stored value is zero by construction.  ``@addr`` is
+   already aligned down to the block and the size is the CPU's own
+   ``dcache_line_size``, so the decomposition is exact.  The slow path
+   above it needs no such call — its ``cpu_stq_mmuidx_ra()`` stores are
+   instrumented already.  The rest of the file's bulk helpers
+   (``lmw`` / ``stmw`` / ``lsw`` / ``stsw``) reach their host pointer
+   through ``probe_access()`` and therefore fall back correctly on their
+   own.
+
+   ``tests/tcg/ppc64/dcbz-instrumentation.c`` holds the invariant.  Every
+   access it makes to its test region is a ``DCBZ``; it prints the region
+   bounds and the number of accesses that amounts to, and the existing
+   ``validate-memory-counts.py`` compares that against what the ``mem``
+   plugin saw.  Against a target that does not report, the plugin sees no
+   accesses to the region at all and the check fails.
 
 Machine-shutdown notification
 -----------------------------

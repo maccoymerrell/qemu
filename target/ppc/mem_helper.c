@@ -26,6 +26,8 @@
 #include "exec/cpu_ldst.h"
 #include "internal.h"
 #include "qemu/atomic128.h"
+#include "qemu/plugin.h"
+#include "exec/memopidx.h"
 
 /* #define DEBUG_OP */
 
@@ -270,6 +272,68 @@ void helper_stsw(CPUPPCState *env, target_ulong addr, uint32_t nb,
     }
 }
 
+/*
+ * Report a block-zeroing store to the TCG plugin layer.
+ *
+ * dcbz_common() below takes a trapless host-pointer lookup and then zeroes
+ * the whole cache line with a host memset().  That bulk write never goes
+ * through a qemu_st TCG op, so the plugin memory instrumentation accel/tcg
+ * emits around those ops never fires: to a plugin, a DCBZ that hits the
+ * host-pointer fast path performs no memory access at all, and the whole of
+ * a program's block-clearing traffic disappears.  Only the byte-at-a-time
+ * fallbacks -- taken for I/O, watchpoints, unmapped pages and, in this tree,
+ * plugin speculative execution -- are instrumented, so the accesses are
+ * visible exactly on the paths a plugin is least interested in and invisible
+ * on the common one.
+ *
+ * The fallback is not the answer.  Making the lookup honour
+ * cpu_plugin_mem_cbs_enabled() the way probe_access_flags() does would route
+ * every DCBZ through a per-quadword softmmu loop, so a plugin would pay for
+ * every block clear in the program to learn something the fast path can
+ * simply state.  (That is the same reasoning target/arm records for the
+ * AArch64 bulk helpers, which had this defect in the same place.)
+ *
+ * @addr is already aligned down to the block and @size is the block length,
+ * so the decomposition into naturally aligned power-of-two pieces is exact.
+ * 16 bytes is the ceiling because MO_128 is the widest access the plugin
+ * memory API can describe (qemu_plugin_mem_get_value() asserts above it),
+ * and PowerPC already issues 16-byte accesses for the VMX/VSX quadword
+ * loads and stores -- a plugin sees no shape it could not see already.  The
+ * stored value is zero by construction, which is what the callback carries.
+ */
+static void ppc_plugin_block_zero_cb(CPUPPCState *env, target_ulong addr,
+                                     int size, int mmu_idx)
+{
+#ifdef CONFIG_PLUGIN
+    CPUState *cs = env_cpu(env);
+
+    if (likely(!cs->neg.plugin_mem_cbs)) {
+        return;
+    }
+
+    while (size != 0) {
+        unsigned bytes;
+        int sz;
+
+        /* Widest naturally aligned power-of-two piece, at most MO_128. */
+        for (sz = MO_128; sz > MO_8; sz--) {
+            if ((1 << sz) <= size && (addr & ((1 << sz) - 1)) == 0) {
+                break;
+            }
+        }
+        bytes = 1u << sz;
+
+        qemu_plugin_vcpu_mem_cb(cs, addr, 0, 0,
+                                make_memop_idx(MO_LE | sz, mmu_idx),
+                                QEMU_PLUGIN_MEM_W);
+        addr += bytes;
+        size -= bytes;
+    }
+#else
+    (void)env; (void)addr; (void)size; (void)mmu_idx;
+#endif
+}
+
 static void dcbz_common(CPUPPCState *env, target_ulong addr,
                         int mmu_idx, int dcbz_size, uintptr_t retaddr)
 {
@@ -305,6 +369,13 @@ static void dcbz_common(CPUPPCState *env, target_ulong addr,
     set_helper_retaddr(retaddr);
     memset(haddr, 0, dcbz_size);
     clear_helper_retaddr();
+
+    /*
+     * The bulk write above bypassed the memory instrumentation; state it
+     * explicitly.  The slow path taken above needs no such call -- its
+     * cpu_stq_mmuidx_ra() stores are instrumented already.
+     */
+    ppc_plugin_block_zero_cb(env, addr, dcbz_size, mmu_idx);
 }
 
 void helper_dcbz(CPUPPCState *env, target_ulong addr, int mmu_idx)

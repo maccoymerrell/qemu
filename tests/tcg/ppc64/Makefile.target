@@ -60,4 +60,16 @@ PPC64_TESTS += test-aes
 run-plugin-test-plugin-mem-access-with-libmem.so: \
  CHECK_PLUGIN_OUTPUT_COMMAND=
 
+# DCBZ clears its block with a host memset() over a pointer the target
+# obtains without emitting a qemu_st, so the accesses reach a plugin only
+# because target/ppc reports them.  Every access this test makes to its
+# region is a DCBZ, so the count the program prints and the count the mem
+# plugin saw must agree exactly; they do not when the reporting is missing.
+PPC64_TESTS += dcbz-instrumentation
+run-plugin-dcbz-instrumentation-with-libmem.so: \
+ PLUGIN_ARGS=$(COMMA)region-summary=true
+run-plugin-dcbz-instrumentation-with-libmem.so: \
+ CHECK_PLUGIN_OUTPUT_COMMAND= \
+ $(SRC_PATH)/tests/tcg/multiarch/system/validate-memory-counts.py $@.out
+
 TESTS += $(PPC64_TESTS)

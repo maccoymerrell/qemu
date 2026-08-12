@@ -815,9 +815,8 @@ illegal_return:
  * are instrumented, so the accesses are visible exactly on the paths a
  * plugin is least interested in and invisible on the common one.
  *
- * The callers are the four FEAT_MOPS step helpers.  DC ZVA has the same
- * defect but is deliberately not reported yet; see the comment at its
- * host memset() in HELPER(dc_zva).
+ * The callers are the four FEAT_MOPS step helpers and HELPER(dc_zva), which
+ * has the same defect on the same host-pointer fast path.
  *
  * @addr / @size describe the guest range in ascending order, @host
  * points at the host mapping of @addr (NULL if the data value is not

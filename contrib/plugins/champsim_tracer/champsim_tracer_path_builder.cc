@@ -1410,6 +1410,15 @@ void PathBuilder::flush_final(bool walk_prev, bool prev_in_flight)
         } else {
             g_stats.census_prev_close_dropped++;
         }
+        /* BILLED == PUBLISHED: bill the window clock exactly the extent
+         * this flush publishes for the slot, and only when no dispatch
+         * fold ever billed it (the credit refuses a folded slot
+         * positionally).  The excluded boundary instructions — the
+         * mid-callback END-firing insn, the un-snapped tail — are outside
+         * @executed here, therefore outside the bill. */
+        if (have_extent && executed > 0) {
+            user_clock_close_credit(cpu_index, prev_tb_, executed);
+        }
     }
 
     if (prev_tb_ && have_extent && executed > 0) {
@@ -3379,6 +3388,10 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
     /* Only a CONTINUE reaches window management and then step_seal; every
      * other exit returns to the glue with no seal pending (see mid_step_). */
     mid_step_ = false;
+    /* One-step state: a stale stamp verdict from an earlier step must not
+     * tell this step's deferred-close take that ITS final entry carries
+     * THREAD_END. */
+    seal_stamped_thread_end_ = false;
     /* The pending-seal prev promoted last step is the TB that finished
      * immediately before THIS dispatch, so this dispatch's raw latch is
      * its self-loop accounting — absorb exactly once.  Steps that do not
@@ -4542,10 +4555,60 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
         return StepStatus::NO_SEAL;
     }
 
+    /*
+     * THREAD_END AT A DEFERRED CLOSE RIDES THE SEAL.  A budget/simpoint
+     * close taken at this step's end emits nothing for the closing vCPU
+     * (the slot holds the TB dispatching now, extent 0; the take is held
+     * while the chain is open), so the closing context's segment-final
+     * entry is the LAST entry this loop writes.  Stamp it — but only when
+     * the take at this step's end is provably going to fire and provably
+     * going to emit nothing after us:
+     *   - take pending + armed (settled before the seal; only the take
+     *     mutates armed),
+     *   - chain empty after the walk (an open chain holds the take, and
+     *     the close's own chain drain would emit — and flag — after us),
+     *   - no fan-out hold slot active and no fan-out terminator among
+     *     this walk's emissions (the only arm sites for a hold that
+     *     could defer the take after we stamped; a fanned-out final
+     *     entry would also put sub-iterations after the flag),
+     *   - no peer builder holding SAME-CONTEXT close work (folded into
+     *     deferred_close_take_pending: a same-context peer flush would
+     *     emit this context's true final after us and stamp it itself;
+     *     a different context's later entries change nothing).
+     * A take that fires without a stamp is counted by the take itself
+     * (close_thread_end_missed), never silent.
+     */
+    bool stamp_thread_end = false;
+    if (!pending_emits.empty() &&
+        deferred_close_take_pending(in.cpu_index) &&
+        !cp_chain(cpu_index_).has_active_chain() &&
+        !rep_state(in.cpu_index).warmup_hold_any()) {
+        auto tmpl_has_fanout = [](const BBTemplate *t) {
+            for (uint32_t i = 0; t && i < t->n_insns; i++) {
+                if (t->insn_fields[i].rep_memops_per_iter > 0) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        bool fanout = false;
+        for (const PendingEmit &pe : pending_emits) {
+            fanout = fanout || tmpl_has_fanout(pe.bb_tmpl);
+        }
+        stamp_thread_end = !fanout;
+    }
+
     for (const PendingEmit &pe : pending_emits) {
         rep_emit_handoff(in.cpu_index, rep_state(in.cpu_index).pb_walk_facts);
+        const bool last = &pe == &pending_emits.back();
         emit_finalized_bb(out_stream, pe.bb_tmpl, pe.branch_pc,
-                          pe.emit_current_pc, pe.wrong_target, in.cpu_index);
+                          pe.emit_current_pc, pe.wrong_target, in.cpu_index,
+                          /*bb_start=*/0,
+                          /*thread_end=*/stamp_thread_end && last);
+    }
+    if (stamp_thread_end) {
+        seal_stamped_thread_end_ = true;
+        g_stats.close_thread_end_stamped_at_seal++;
     }
     return StepStatus::SEALED;
 }

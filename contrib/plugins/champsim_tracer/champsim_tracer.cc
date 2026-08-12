@@ -995,6 +995,45 @@ void user_clock_fault_recredit(unsigned int cpu_index, uint64_t insns)
 }
 
 /*
+ * BILLING AT EMIT, AT THE CLOSE: the clock advances by exactly the
+ * PUBLISHED user range of the one holder whose dispatch-time fold never
+ * came — the pending-seal slot of a vCPU with no dispatch after it.
+ *
+ * Every other close emission is already billed: the mid-step walk snapshot
+ * and the in-flight chain were folded at their following dispatches, and a
+ * slot that HAS seen a later dispatch was folded by it (retired_advance
+ * runs on every dispatch, owned or not).  Only the never-dispatched-after
+ * slot — the closing vCPU's own block at an END/ceiling close, and a peer
+ * slot the pinned thread migrated off and nothing ran on since — carries
+ * retired work no fold has billed.  Crediting it with the extent the flush
+ * PUBLISHES (not the extent the retired cursor measured) is what makes
+ * BILLED == PUBLISHED an identity at every close: the boundary instruction
+ * a close leaves unobserved — the END-firing instruction mid-callback, the
+ * un-snapped tail — is outside the published range, therefore unbilled.
+ *
+ * Called by PathBuilder::flush_final with the stop it is about to emit.
+ * The two gates are positional: @head still standing at the CURRENT
+ * dispatch cursor slot means no fold has run for it, and the ownership
+ * flag armed at that same dispatch says whether its fold WOULD have
+ * billed (kernel and foreign blocks never bill).
+ */
+void user_clock_close_credit(unsigned int cpu_index, const BBTemplate *head,
+                             uint64_t published)
+{
+    if (published == 0 || head == nullptr || head->is_system) {
+        return;
+    }
+    unsigned s = retired_slot(cpu_index);
+    if (head != g_retired_tb_head[s] || !g_retired_owner_owned[s]) {
+        return;      /* folded at a later dispatch, or not clock-owned */
+    }
+    g_user_icount += published;
+    g_stats.user_clock_retired_insns += published;
+    g_stats.user_clock_close_credits++;
+    g_stats.user_clock_close_credit_insns += published;
+}
+
+/*
  * Reset the user clock at a pin/segment boundary.  The per-vCPU seen
  * cursors (scoreboard user_seen; each vCPU's fold computes its delta
  * against its OWN insn_count slot) start over: the calling vCPU's cursor
@@ -5215,8 +5254,6 @@ void emit_body_entry(BodyStreamState *out_stream,
                     g_seg_arch_user_insns +=
                         (uint64_t)(entry.bb_stop - entry.bb_start) +
                         (uint64_t)(n_iter - 1);
-                    g_seg_arch_user_insns +=
-                        (uint64_t)bb_tmpl->n_insns + (uint64_t)(n_iter - 1);
                     /* THE ONE LEGITIMATE WAY THE WIRE OUTRUNS THE RETIRED
                      * CURSOR.  A self-looping instruction is fanned out to
                      * one entry per iteration on purpose, but the guest
@@ -5512,22 +5549,16 @@ static void finish_trace_segment(bool prev_executed = true,
      * exactly like the schedule never having run at all. */
     g_segments_written++;
 
-    /* Close out the lagged retired attribution (see retired_advance): the
-     * block in flight on the closing vCPU has executed a prefix that no
-     * later dispatch will ever report, because there is no later dispatch.
-     * Without this the segment's last owned block is missing from the
-     * executed count and the close would manufacture a shortfall of its
-     * own. */
-    if (closing_cpu != UINT32_MAX &&
-        g_retired_owner_owned[retired_slot(closing_cpu)]) {
-        uint64_t tail = retired_in_flight(closing_cpu);
-        uint32_t cap = tb_head_insns(g_retired_tb_head[retired_slot(closing_cpu)]);
-        if (tail > cap) {
-            tail = cap;
-        }
-        g_stats.user_clock_retired_insns += tail;
-        g_user_icount += tail;
-    }
+    /* The lagged retired attribution of the in-flight block is closed out
+     * by user_clock_close_credit, called from each builder's flush_final
+     * with the extent that flush PUBLISHES.  It used to be folded here
+     * from the retired cursor directly — which counts the END-firing
+     * instruction (begun, mid-callback, unobserved) and the un-snapped
+     * tail that the flush's stop rule excludes, so every END/ceiling
+     * close billed exactly the boundary instructions the wire honestly
+     * refused to claim (clock_minus_wire=+1 on every marker cell), and
+     * it covered only the closing vCPU, so a peer slot flushed at an SMP
+     * close was published but never billed (clock_minus_wire=-N). */
 
     uint64_t lo = g_trace_segments.window_start();
     uint64_t hi = g_trace_segments.window_stop();
@@ -6467,7 +6498,8 @@ void emit_finalized_bb(BodyStreamState *out_stream,
                        uint64_t current_pc,
                        uint64_t wrong_target,
                        unsigned int cpu_index,
-                       uint32_t bb_start)
+                       uint32_t bb_start,
+                       bool thread_end)
 {
     cp_chain(cpu_index).reset();
 
@@ -6545,7 +6577,7 @@ void emit_finalized_bb(BodyStreamState *out_stream,
     emit_body_entry(out_stream, bb_tmpl, cpu_index, std::move(wp_entries),
                     wp_first_tb_unavail, current_pc, /*known=*/true,
                     bb_start, bb_tmpl ? bb_tmpl->n_insns : 0,
-                    /*thread_end=*/false);
+                    thread_end);
 }
 
 /*
@@ -7563,6 +7595,51 @@ static inline bool close_diag(void)
     return x != 0;
 }
 
+/*
+ * Will the deferred window close try to take at this step's end, with this
+ * seal's final emission standing as the closing context's segment-final
+ * entry?  Read by PathBuilder::step_seal so that entry can carry
+ * CST_BB_FLAG_THREAD_END — a budget/simpoint close itself emits nothing
+ * for the closing vCPU (the slot holds the TB dispatching now, extent 0),
+ * so the flag has to ride the seal.  Pending and armed are both settled
+ * before step_seal runs (tw_manage_window sets pending between step_events
+ * and the seal; only the take mutates armed), so this read is stable
+ * across the seal-to-take window.
+ *
+ * A peer builder holding close work will have its flush emit AFTER the
+ * seal's entry — which un-finals it only when the peer's emissions carry
+ * the SAME (thread, asid) context; that peer's own flush then stamps the
+ * context's true final (thread_end_last), and a seal stamp here would be
+ * the lie the oracle rejects.  A different context's later entries leave
+ * the closing context's final exactly where the seal put it, so only the
+ * same-context peer suppresses.  Identity read from the same per-vCPU
+ * carries the flush's own emission resolves against, under the same
+ * exec_lock, so the comparison and the eventual emission cannot disagree.
+ */
+bool deferred_close_take_pending(unsigned int cpu_index)
+{
+    if (!((deferred_close(cpu_index).icount_shutdown_pending ||
+           deferred_close(cpu_index).simpoint_close_pending) &&
+          deferred_close(cpu_index).window_close_armed &&
+          g_trace_segments.is_active())) {
+        return false;
+    }
+    const uint32_t tid = resolve_thread_id(cpu_index);
+    const uint32_t asid = resolve_ctx_asid_index(cpu_index);
+    for (unsigned int i = 0; i < CST_PIN_MAX_VCPUS; i++) {
+        if (i == cpu_index) {
+            continue;
+        }
+        PathBuilder *b = path_builder_if_created(i);
+        if (b && b->holds_close_work() &&
+            resolve_thread_id(i) == tid &&
+            resolve_ctx_asid_index(i) == asid) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void run_deferred_window_closes(PathBuilder &pb, unsigned int cpu_index,
                                        const BBTemplate *cur_tb_tmpl)
 {
@@ -7705,6 +7782,13 @@ static void run_deferred_window_closes(PathBuilder &pb, unsigned int cpu_index,
     /* Deferred-exit on icount window-stop.  The trigger was set in
      * tw_manage_window when icount first crossed window_stop. */
     if (deferred_close(cpu_index).icount_shutdown_pending) {
+        if (!pb.seal_stamped_thread_end()) {
+            /* This close emits nothing for the closing context, and the
+             * seal that produced its final entry did not stamp THREAD_END
+             * (merge-path seal, fan-out template, or a peer holding close
+             * work).  Named, never silent. */
+            g_stats.close_thread_end_missed++;
+        }
         finish_trace_segment(/* prev_executed= */ false, cpu_index);
         g_trace_segments.set_shutting_down();
         deferred_close(cpu_index).icount_shutdown_pending = false;
@@ -7718,6 +7802,9 @@ static void run_deferred_window_closes(PathBuilder &pb, unsigned int cpu_index,
      * BB boundary so the trace covers AT LEAST eff_stop - eff_start
      * (warmup + simulation) insns. */
     if (deferred_close(cpu_index).simpoint_close_pending) {
+        if (!pb.seal_stamped_thread_end()) {
+            g_stats.close_thread_end_missed++;   /* see the icount take */
+        }
         finish_trace_segment(/* prev_executed= */ false, cpu_index);
         g_simpoints.advance();
         deferred_close(cpu_index).simpoint_close_pending = false;

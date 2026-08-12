@@ -98,7 +98,8 @@ void emit_finalized_bb(BodyStreamState *out_stream,
                        uint64_t current_pc,
                        uint64_t wrong_target,
                        unsigned int cpu_index,
-                       uint32_t bb_start = 0);
+                       uint32_t bb_start = 0,
+                       bool thread_end = false);
 
 /* Build a BodyEntry from the calling thread's CP memop/reg-snap
  * accumulators (draining them FOR THE DECLARED RANGE) and write it to
@@ -267,6 +268,21 @@ uint32_t tb_head_insn_index(const BBTemplate *head, uint64_t pc);
  * attempt was billed by insn_started and the instructions it aborted are
  * about to run again.  See the definition in champsim_tracer.cc. */
 void user_clock_fault_recredit(unsigned int cpu_index, uint64_t insns);
+
+/* BILLING AT EMIT, AT THE CLOSE (see the definition): credit the window
+ * clock with the PUBLISHED extent of a pending-seal slot whose dispatch
+ * fold never came.  Called by flush_final with the stop it emits; a slot
+ * any later dispatch already folded is refused positionally. */
+void user_clock_close_credit(unsigned int cpu_index, const BBTemplate *head,
+                             uint64_t published);
+
+/* True when the deferred budget/simpoint close will try to take at this
+ * step's end (pending + armed + segment active) AND no peer builder holds
+ * same-context close work whose flush would emit this context's true
+ * final after the seal.  Read by step_seal to decide whether its final
+ * emission is the closing context's segment-final entry
+ * (CST_BB_FLAG_THREAD_END).  See the definition. */
+bool deferred_close_take_pending(unsigned int cpu_index);
 
 /*
  * ---- PathBuilder proper ----
@@ -643,6 +659,13 @@ public:
      * retired work with no drain.  Read by the close census. */
     bool mid_step() const { return mid_step_; }
 
+    /* Did this step's seal stamp CST_BB_FLAG_THREAD_END on its final
+     * emission?  Set by step_seal when the deferred budget/simpoint close
+     * will take at this step's end and the seal's last entry is provably
+     * the closing context's segment-final one; read by the take so a close
+     * whose final entry went out unflagged is counted, never silent. */
+    bool seal_stamped_thread_end() const { return seal_stamped_thread_end_; }
+
     /* Which vCPU this builder belongs to.  Stamped once by
      * path_builder() at creation; every internal reference to the
      * per-vCPU accumulators (pending_reg_snaps, cp_chain, the memory
@@ -835,6 +858,12 @@ private:
      * Set and cleared by the two step phases; read only by the census, so
      * nothing in the tracer's logic depends on it. */
     bool mid_step_ = false;
+
+    /* Did this step's seal stamp THREAD_END on its final emission?  Reset
+     * at every step_events entry, set only by step_seal's plain emission
+     * path when the deferred close will take at this step's end.  See the
+     * public accessor. */
+    bool seal_stamped_thread_end_ = false;
 
     /* Async-window state AT THE DRAIN CURSOR: persistent across dispatches,
      * so a window opened on a step that later bailed is still open when the

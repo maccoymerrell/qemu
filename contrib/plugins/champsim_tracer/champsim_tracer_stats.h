@@ -368,6 +368,15 @@ struct Stats {
     uint64_t user_clock_fault_recredit_unmeasured = 0;
     uint64_t user_clock_abort_recredits = 0;
     uint64_t user_clock_abort_recredit_insns = 0;
+    /* BILLING AT EMIT, AT THE CLOSE (user_clock_close_credit): the
+     * pending-seal slots whose dispatch fold never came, billed at close
+     * with exactly the extent the flush PUBLISHED for them — the closing
+     * vCPU's own block at an END/ceiling close, and any peer slot with no
+     * dispatch after it.  The boundary instructions the flush's stop rule
+     * excludes (the mid-callback END-firing insn, the un-snapped tail) are
+     * outside this credit, which is what holds clock_minus_wire at 0. */
+    uint64_t user_clock_close_credits = 0;
+    uint64_t user_clock_close_credit_insns = 0;
     /* Templates minted for blocks the guest ENTERED AND DID NOT FINISH (see
      * TemplateStore::commit_partial_bb).  Keyed by extent, so repeated cuts
      * at the same point share one; a run where nothing is ever cut short
@@ -542,6 +551,13 @@ struct Stats {
     /* The slot held a block and no extent could be measured for it, so
      * nothing could be emitted without guessing.  Must be 0. */
     uint64_t close_deferred_prev_extent_unknown = 0;
+    /* THREAD_END at a deferred budget/simpoint close.  The close itself
+     * emits nothing for the closing vCPU, so the flag rides the last seal
+     * before the take (stamped_at_seal); a take that fired without one —
+     * merge-path seal, fan-out at the boundary, a peer holding close work
+     * — is counted, never silent (missed). */
+    uint64_t close_thread_end_stamped_at_seal = 0;
+    uint64_t close_thread_end_missed = 0;
 
     /* THE SINKS, after every drain above has run.  These are residues, not
      * queues: whatever is left once the last block is emitted belonged to

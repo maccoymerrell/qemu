@@ -818,6 +818,86 @@ A device timer may not re-arm itself at the current time
    timer of callback".  They read opposite values out of the same
    assertion, so neither is an unfalsifiable pass.
 
+The RISC-V instruction-count trigger (``target/riscv/debug.c``)
+
+   The first device the bound above named, and the reason this base
+   carries the RISC-V trigger module in a working state rather than the
+   state upstream ships it in.  A ``tdata1`` of type 3 arms a counter
+   that falls by one for every instruction the guest retires at a
+   privilege level the trigger is enabled for; the guest reads what is
+   left of it back out of ``tdata1``.  Four properties make that true
+   here, and each was false before.
+
+   *Its deadline is a time.*  ``env->itrigger_timer[]`` is a
+   ``timer_new_ns(QEMU_CLOCK_VIRTUAL)`` timer, and that clock reads
+   ``qemu_icount_bias + icount_to_ns(icount)``.  Both arming sites —
+   ``riscv_itrigger_update_count`` and ``itrigger_reg_write`` — arm at
+   ``qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + icount_to_ns(count)``.  A
+   raw instruction count is neither the bias nor the shifted count, so
+   passing one directly is a deadline already in the past, and the
+   callback's re-arming branch then asks for that same past deadline
+   from inside its own callback: the vCPU never runs again.  That is the
+   shape the no-progress bound catches, and catching it is how the
+   deadline was identified.
+
+   *A privilege level selects a bit.*  ``tdata1`` holds one enable bit
+   per level, laid out so that the level's own encoding indexes them —
+   ``ITRIGGER_U`` at bit 6 for ``PRV_U`` = 0, ``ITRIGGER_S`` at bit 7 for
+   ``PRV_S`` = 1, ``ITRIGGER_M`` at bit 9 for ``PRV_M`` = 3, and the same
+   shape one field along under virtualisation with ``ITRIGGER_VU`` at bit
+   25 and ``ITRIGGER_VS`` at bit 26.  ``check_itrigger_priv`` selects the
+   bit the current level names.  Comparing a one-bit field against a
+   two-bit level instead is not a near miss but a different function
+   entirely: it can never be true in M mode, and in U mode it is true of
+   a level whose bit is CLEAR, so an M-only trigger counts the guest's
+   user code and counts none of its own.  This is the same selection
+   ``trigger_priv_match`` makes for the same trigger type, and the two
+   have to agree — that one decides whether the trigger fires, this one
+   decides which instructions it counted on the way there.
+
+   *The count that is stored falls.*  When ``-icount`` is off the count
+   is kept by ``helper_itrigger_match``, one decrement per instruction,
+   and what it writes back is the decremented value.  Storing the value
+   it already had leaves the whole non-icount path inert: the trigger
+   counts for ever and never reaches zero.
+
+   *The count that is read falls too.*  Under ``-icount`` the stored
+   count is only brought up to date at a privilege change or a timer
+   expiry, so a read has to account for the instructions retired since
+   ``env->last_icount``.  Those instructions have been counted, so they
+   come off — ``itrigger_get_adjust_count`` subtracts them.  Adding them
+   makes the remaining count rise as the guest runs, which no reader can
+   interpret.
+
+   ``riscv_itrigger_enabled`` answers only whether any instruction-count
+   trigger is armed, with no privilege test of its own.  Its answer gates
+   ``gen_helper_itrigger_match`` and is cached in
+   ``env->itrigger_enabled``, recomputed when ``tdata1`` is written and
+   when a trigger reaches zero but never on a privilege change — so a
+   privilege-dependent answer would be stale from the first ``mret``, and
+   a trigger armed for U mode is always armed from M mode, where
+   ``tdata1`` is writable.  The helper is what filters by level, in
+   ``trigger_common_match``.
+
+   ``tests/tcg/riscv64/itrigger-priv.S`` is the bare-metal proof, run
+   both ways — ``run-itrigger-priv`` without ``-icount`` and
+   ``run-itrigger-priv-icount`` with it, since the two paths keep the
+   count by different means.  It arms one enable bit at a time, executes
+   a loop of known length at M, S, U, VS and VU in turn, and reads the
+   remaining count back: eighteen cells assert that the count falls by
+   the loop's length at an enabled level and does not move at any other,
+   including that a virtualised level consults only VS and VU and a
+   non-virtualised one only U, S and M.  Five further cells repeat the
+   measurement at two loop lengths and assert the difference, which
+   cancels the fixed cost of arming, switching privilege and reading
+   back, so what is asserted is the loop's instructions and nothing else.
+
+   These are upstream QEMU defects rather than tracer limitations.  The
+   programming that reaches them is a legal use of an architected
+   debug facility, no part of the tracer is required to get there, and
+   the hang the first one causes is reachable by any guest that arms an
+   instruction-count trigger under ``-icount``.
+
 Interrupt replay across the wrong-path rollback
 
    Arm's ``env->irq_line_state`` and RISC-V's ``env->mip`` are inside

@@ -20,5 +20,16 @@ EXTRA_RUNS += run-issue1060
 run-issue1060: issue1060
 	$(call run-test, $<, $(QEMU) $(QEMU_OPTS)$<)
 
+# The icount trigger keeps its count two ways -- by icount arithmetic across
+# privilege changes when -icount is on, and by a per-instruction helper when it
+# is off -- so the same program is run both ways.  h=true is needed for the
+# cells that measure VS and VU.
+ITRIGGER_OPTS = -cpu rv64,h=true
+EXTRA_RUNS += run-itrigger-priv run-itrigger-priv-icount
+run-itrigger-priv: itrigger-priv
+	$(call run-test, $<, $(QEMU) $(QEMU_OPTS)$< $(ITRIGGER_OPTS))
+run-itrigger-priv-icount: itrigger-priv
+	$(call run-test, $<, $(QEMU) $(QEMU_OPTS)$< $(ITRIGGER_OPTS) -icount shift=0)
+
 # We don't currently support the multiarch system tests
 undefine MULTIARCH_TESTS

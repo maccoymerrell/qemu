@@ -1687,13 +1687,16 @@ handler-tracing flags", for the capture-side mechanics behind both options.
 
 **Thread end.**  ``CST_BB_FLAG_THREAD_END`` on an entry states that this
 is the last entry its ``(thread_id, asid)`` context contributes to the
-segment: the guest thread ended, or the trace window closed on it.
-Combined with the range it says exactly where that context's
-instruction stream stops, so a consumer neither waits for a
-continuation that will not come nor has to infer the end from a
-context simply not reappearing.  In a user-mode trace, where a
-thread index is released on exit and may be reissued to a thread
-created later (§4.1), the flag is also what separates the two
+segment.  The segment close stamps it on the final entry it emits for a
+context — the pending block the close put on the wire at its measured
+extent.  Combined with the range it says exactly where that context's
+instruction stream stops.  It is a positive marker, not an exhaustive
+one: a context whose last entry was already on the wire when the close
+arrived (nothing of it was pending) ends with the segment itself and
+carries no flag, so a consumer treats the segment boundary as the end
+of every context the flag did not already end.  In a user-mode trace,
+where a thread index is released on exit and may be reissued to a
+thread created later (§4.1), a flagged entry also separates the two
 occupants of one index.
 
 4.3 Wrong-Path Chain Section

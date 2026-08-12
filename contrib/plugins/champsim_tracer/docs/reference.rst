@@ -1113,14 +1113,15 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
      - Synchronous-fault handler tracing (**system mode only**).  When on,
        a synchronous fault (page fault, coprocessor lazy-enable) detours
        execution into a handler that is traced as first-class code carrying
-       its exception-nesting depth, and the interrupted basic block
-       reassembles whole after the handler, its faulting instructions
-       marked by the fault trailer's anchor list.  ``faults=0`` **excludes**
-       the handler excursion: capture is suspended across the handler
-       exactly as an asynchronous interrupt's is, the interrupted block
-       still emits whole (the reassembly is kept), but it carries no anchors
-       and every entry's depth trailer stays ``0``.  Independent of
-       ``interrupts``.  Ignored in user mode (no fault stack).
+       its exception-nesting depth, and the interrupted basic block emits
+       in pieces: the executed prefix at the fault, the remainder as a
+       continuation entry of the same template after the handler returns,
+       each declaring the executed range it is complete for.  ``faults=0``
+       **excludes** the handler excursion: capture is suspended across the
+       handler exactly as an asynchronous interrupt's is, the interrupted
+       block still emits whole, and every entry's fault depth stays ``0``.
+       Independent of ``interrupts``.  Ignored in user mode (no fault
+       stack).
    * - ``interrupts=0|1``
      - ``0``
      - Asynchronous-interrupt handler tracing (**system mode only**).  Off
@@ -1134,9 +1135,9 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
        kernel-excursion ownership (``kexc``) machinery a synchronous fault
        uses, and the interrupted block seals against the interrupt's
        departure PC so no phantom edge runs through the handler entry.  The
-       depth rides the existing fault trailer — no new wire records.
-       Independent of ``faults``.  Ignored in user mode (no asynchronous
-       delivery).
+       depth rides the existing block-level fault-depth record — no new
+       wire families.  Independent of ``faults``.  Ignored in user mode
+       (no asynchronous delivery).
    * - ``devio=0|1``
      - ``1``
      - Block-device (disk) I/O records (**system mode only**).  When on,
@@ -1362,26 +1363,23 @@ trace run.
        TB starting at the watched PC, with the gate states that
        could suppress its emission.
    * - ``CST_FAULT_DIAG``
-     - *Diagnostic.*  PathBuilder fault-machinery event log (stash /
-       return / merge-emit / orphan lines).
+     - *Diagnostic.*  PathBuilder fault-machinery event log (split
+       prefix / continuation / return / orphan lines).
    * - ``CST_JUMP_DIAG``
      - *Diagnostic.*  Raises the ``syscall_fault_nesting`` step and
        anchor rules ONLINE, at the emit rather than offline over the
        finished trace.  A violation prints the depth pipeline's live
-       state (frame ledger, suspension stack, the provenance of each
-       pipeline stage) plus a ring of the preceding 32 emits and 32
-       seal steps, each tagged with the code path that stamped its
-       depth — so a depth-JUMP names its losing path instead of only
-       a sequence number.
+       state (frame ledger, the provenance of each pipeline stage)
+       plus a ring of the preceding 32 emits and 32 seal steps, each
+       tagged with the code path that stamped its depth — so a
+       depth-JUMP names its losing path instead of only a sequence
+       number.
    * - ``CST_NO_FAULT``
      - *Diagnostic.*  Marker-mode runs without the fault-excursion
-       feature (no per-entry fault trailer).
-   * - ``CST_NO_FAULT_MERGE``
-     - *Diagnostic.*  Keep fault-depth stamping but disable
-       fault-frame classification / stash / merge completion.
+       feature (no fault-depth stamping) for A/B measurement.
    * - ``CST_NO_FAULT_WP``
-     - *Diagnostic.*  Merged (whole-BB) emits carry no wrong-path
-       chain.
+     - *Diagnostic.*  A fault continuation's emit carries no
+       wrong-path chain.
    * - ``CST_RING``
      - *Diagnostic.*  In-memory ring of recent CP BB starts and WP
        instruction PCs, dumped periodically to ``/tmp``.

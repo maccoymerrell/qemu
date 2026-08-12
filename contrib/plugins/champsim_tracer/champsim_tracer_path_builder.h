@@ -194,7 +194,6 @@ extern uint32_t g_dbg_depth_next;
 extern uint32_t g_dbg_prev_depth;
 extern uint32_t g_dbg_walk_depth;
 extern size_t   g_dbg_frames;
-extern size_t   g_dbg_susp;
 
 bool cst_jump_diag(void);
 /* Record one seal-phase step into the ring (no-op unless gated). */
@@ -212,8 +211,7 @@ std::vector<RegSnap> &pending_reg_snaps(unsigned int cpu_index);
 
 /* How many of those, counted from the front, belong to the CP chain still
  * in flight (fragments appended, true BB not yet finalized).  Owned by
- * cp_chain_append; the suspend/resume arrows freeze and restore it with the
- * snaps themselves, since they move the whole sink. */
+ * cp_chain_append; a departure emit resets it with the sink it clears. */
 size_t &cp_chain_snap_mark(unsigned int cpu_index);
 
 /* How many instructions of the dispatched TB whose head is @head actually
@@ -415,9 +413,9 @@ public:
     /* What the step did, so the glue can pick the right continuation:
      * after step_events, only CONTINUE proceeds to window management;
      * after step_seal, only SEALED runs the deferred window closes and
-     * consumes the spec-flush latch (the suspend / drop / stash / merge /
-     * no-seal outcomes all skip them — a pending close waits for the
-     * next normally-sealed step). */
+     * consumes the spec-flush latch (the suspended / no-seal outcomes
+     * skip them — a pending close waits for the next normally-sealed
+     * step). */
     enum class StepStatus {
         CONTINUE,         /* step_events: proceed to window mgmt + seal */
         SUSPENDED,        /* async mute window open / foreign ASID: the
@@ -673,13 +671,13 @@ public:
 
     /* THE CLOSE CENSUS: EVERY HOLDER, EVERY CLOSE.
      *
-     * The close flushes the pending-seal slot (and, on a peer, its own)
-     * plus the open fault frames.  Everything else this builder can be
-     * holding at that instant — a suspended prev and its four frozen
-     * sinks, the in-flight chain, the positional reg-snap sink, the CP
-     * memop buffer and its straggler carry, the retained fault events,
-     * the pending self-loop facts — leaves with no drain and no counter,
-     * so a clock-vs-wire residual at a close has no site to name.
+     * The close flushes the pending-seal slot (and, on a peer, its own);
+     * fault frames are ledger entries whose prefixes are already on the
+     * wire.  Everything else this builder can be holding at that instant
+     * — the in-flight chain, the positional reg-snap sink, the CP memop
+     * buffer and its straggler carry, the retained fault events, the
+     * pending self-loop facts — leaves with no drain and no counter, so
+     * a clock-vs-wire residual at a close has no site to name.
      *
      * This walks all of them and prints one [census] line per builder,
      * TWICE per close: @phase "pre" before anything is flushed (what the

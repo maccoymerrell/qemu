@@ -2678,7 +2678,6 @@ uint32_t g_dbg_depth_next = 0;
 uint32_t g_dbg_prev_depth = 0;
 uint32_t g_dbg_walk_depth = 0;
 size_t   g_dbg_frames = 0;
-size_t   g_dbg_susp = 0;
 
 /* Anchors (faulting-insn indices) for the whole-BB merge emit currently in
  * flight; read by emit_body_entry into the entry's fault trailer. */
@@ -4468,8 +4467,9 @@ void emit_body_entry(BodyStreamState *out_stream,
      * (warmup_boundary_in_fanout), never silent. */
     if (g_seg_warmup_end_trace_insns == UINT64_MAX &&
         g_seg_warmup_crossed && g_trace_segments.is_active()) {
-        /* CST_WMHOLD_OFF: measurement kill switch (the CST_NO_FAULT_MERGE
-         * pattern) — restores the historical thread-blind pc-or-kernel
+        /* CST_WMHOLD_OFF: measurement kill switch (behaviour gated,
+         * condition census on both arms)
+         * — restores the historical thread-blind pc-or-kernel
          * release so a paired probe wave measures the same condition
          * under both behaviours.  The census counters and the placement
          * tripwire run on both arms; only the peer-thread defer arrow is
@@ -5666,13 +5666,12 @@ static void finish_trace_segment(bool prev_executed = true,
                 /*
                  * THE GATE IS "DOES IT HOLD ANYTHING", NOT "DOES IT HOLD A
                  * SLOT".  Asking only about prev() skipped a peer whose
-                 * pending-seal slot was empty while it still held open fault
-                 * frames, a suspended prev with its four frozen sinks, an
-                 * in-flight chain, or a captured reg-snap sink -- and
-                 * flush_frames_at_close / flush_suspensions_at_close are
-                 * reachable ONLY through flush_final, so the skip took those
-                 * drains with it.  Measured at HEAD: sd_smp4 vCPUs 2 and 3
-                 * and ceil2 vCPUs 1 and 2 each held a frame and a suspension
+                 * pending-seal slot was empty while it still held work (in
+                 * the pre-0x1E model: open fault frames and suspensions;
+                 * today: an in-flight chain or a captured reg-snap sink) --
+                 * and those drains are reachable ONLY through flush_final,
+                 * so the skip took them with it.  Measured then: sd_smp4
+                 * vCPUs 2 and 3 and ceil2 vCPUs 1 and 2 each held work
                  * behind prev=0x0, and read flushed=0 in the post-flush
                  * census while vCPU 0's identical frame drained in the same
                  * close.
@@ -5758,31 +5757,18 @@ static void finish_trace_segment(bool prev_executed = true,
                  * the slot's FULL translated length even where the flush
                  * correctly truncated to what ran.  Measure the wire
                  * instead: the delta in emitted arch instructions across
-                 * the flush is exactly what was recovered.
-                 *
-                 * The flush also drains this peer's open fault frames (see
-                 * flush_frames_at_close) and its suspensions (see
-                 * flush_suspensions_at_close), which have their own
-                 * counters, so their share is subtracted rather than
-                 * double-counted.
+                 * the flush is exactly what was recovered.  (The pre-0x1E
+                 * frame and suspension drains, whose shares this once
+                 * subtracted, are gone: fault frames are ledger entries
+                 * whose prefixes are already on the wire, and the flush's
+                 * emissions are all the flush emits.)
                  */
                 const uint64_t arch_before = g_seg_arch_insns;
                 const uint64_t user_before = g_stats.wire_user_arch_insns;
-                const uint64_t frame_before =
-                    g_stats.close_frame_insns_recovered;
-                const uint64_t susp_before =
-                    g_stats.close_susp_insns_recovered;
                 b->flush_final();
-                const uint64_t from_drains =
-                    (g_stats.close_frame_insns_recovered - frame_before) +
-                    (g_stats.close_susp_insns_recovered - susp_before);
                 const uint64_t got_all = g_seg_arch_insns - arch_before;
                 uint64_t got = got_all;
                 uint64_t got_user = g_stats.wire_user_arch_insns - user_before;
-                got = got >= from_drains ? got - from_drains : 0;
-                if (got_user > got) {
-                    got_user = got;
-                }
                 if (had_slot) {
                     g_stats.close_peer_slots_flushed++;
                     if (got == 0) {
@@ -5836,7 +5822,6 @@ static void finish_trace_segment(bool prev_executed = true,
     /* POST pass: what survived every drain the close performs.  This is
      * the drop, and it is where the held_at_close ledger is taken. */
     const uint64_t held_frames_before = g_stats.census_frames_held_at_close;
-    const uint64_t held_susp_before   = g_stats.census_susp_held_at_close;
     path_builder_close_state_report(stderr, census_why, closing_cpu,
                                     "post", census_print, /* ledger= */ true);
     if (census_print && stats_file) {
@@ -5867,28 +5852,13 @@ static void finish_trace_segment(bool prev_executed = true,
          */
         const Stats s = stats_snapshot();
         const uint64_t frames_fated =
-            s.census_frames_merged + s.census_frames_unwound_emitted +
-            s.census_frames_unwound_guard_dropped +
-            s.census_frames_unwound_dropped + s.census_frames_faults0_dropped +
-            s.census_frames_orphan_dropped + s.close_frames_flushed +
-            s.close_frames_empty_prefix + s.close_frame_prefix_unplaced +
-            s.close_frames_unflushable;
-        const uint64_t susp_fated =
-            s.susp_resumed + s.susp_displaced + s.susp_stale_retired +
-            s.susp_orphan_dropped +
-            /* ...and the close drain, which is the fate that did not exist
-             * when this identity was written: every entry it pops leaves
-             * through exactly one of these three. */
-            s.close_susp_flushed + s.close_susp_empty +
-            s.close_susp_unflushable;
+            s.census_frames_merged + s.census_frames_unwound_dropped +
+            s.census_frames_orphan_dropped;
         const uint64_t frames_live =
             g_stats.census_frames_held_at_close - held_frames_before;
-        const uint64_t susp_live =
-            g_stats.census_susp_held_at_close - held_susp_before;
         const bool frames_ok =
             s.census_frames_opened == frames_fated + frames_live;
-        const bool susp_ok = s.susp_pushed == susp_fated + susp_live;
-        if (!frames_ok || !susp_ok) {
+        if (!frames_ok) {
             g_stats.census_balance_broken++;
         }
         for (FILE *cf : { stderr, stats_file }) {
@@ -5897,14 +5867,11 @@ static void finish_trace_segment(bool prev_executed = true,
             }
             fprintf(cf,
                     "[censusfate] why=%s frames: opened=%" PRIu64
-                    " fated=%" PRIu64 " held=%" PRIu64 " %s | susp: "
-                    "pushed=%" PRIu64 " fated=%" PRIu64 " held=%" PRIu64
-                    " %s | prev: promoted=%" PRIu64 " close_walked=%" PRIu64
+                    " fated=%" PRIu64 " held=%" PRIu64 " %s"
+                    " | prev: promoted=%" PRIu64 " close_walked=%" PRIu64
                     " close_dropped=%" PRIu64 "(insns=%" PRIu64 ")\n",
                     census_why, s.census_frames_opened, frames_fated,
                     frames_live, frames_ok ? "BALANCE-ok" : "BALANCE-BROKEN",
-                    s.susp_pushed, susp_fated, susp_live,
-                    susp_ok ? "BALANCE-ok" : "BALANCE-BROKEN",
                     s.census_prev_promoted, s.census_prev_close_walked,
                     s.census_prev_close_dropped,
                     s.census_prev_close_dropped_insns);

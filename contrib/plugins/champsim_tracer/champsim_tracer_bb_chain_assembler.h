@@ -120,7 +120,7 @@ public:
      * is a COMMIT: the fragments became a true-BB template and the chain is
      * cleared for the next one.  Everywhere else it DESTROYS a live chain —
      * the fault fold (fold_prev_full_bb resets before re-appending prev),
-     * the segment resets, the suspend arrows — and those fragments never
+     * the segment resets, the departure emits — and those fragments never
      * reach the wire.  reset() returns nothing, so every destroying reset
      * used to be silent.  It now counts them (Stats::reg_snap_chain_reset_
      * drops / _frags), telling the two apart by whether finalize() ran on

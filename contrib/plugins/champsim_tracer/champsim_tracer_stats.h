@@ -483,11 +483,7 @@ struct Stats {
     uint64_t census_closes = 0;
     uint64_t census_frames_opened = 0;
     uint64_t census_frames_merged = 0;
-    uint64_t census_frames_unwound_emitted = 0;
     uint64_t census_frames_unwound_dropped = 0;
-    uint64_t census_frames_unwound_guard_dropped = 0;
-    uint64_t census_frames_unwound_guard_insns = 0;
-    uint64_t census_frames_faults0_dropped = 0;
     uint64_t census_frames_orphan_dropped = 0;
     uint64_t census_frames_held_at_close = 0;
     uint64_t census_frames_held_insns = 0;
@@ -496,8 +492,6 @@ struct Stats {
     uint64_t census_prev_close_dropped = 0;
     uint64_t census_prev_close_dropped_insns = 0;
     uint64_t census_walkprev_held_at_close = 0;
-    uint64_t census_susp_held_at_close = 0;
-    uint64_t census_susp_held_insns = 0;
     uint64_t census_chain_held_at_close = 0;
     uint64_t census_chain_held_insns = 0;
     uint64_t census_snaps_held_at_close = 0;
@@ -515,46 +509,14 @@ struct Stats {
      * previous one-holder-at-a-time round. */
     uint64_t census_balance_broken = 0;
 
-    /* ---- THE CLOSE DRAINS (one per holder the census enumerated) ------
-     *
-     * The census's job was to name every structure that can hold work the
-     * guest RETIRED and the tracer has not put on the wire at a segment
-     * close.  These are the drains: each empties one holder onto the wire,
-     * each has a falsifier env var that turns it off so the defect it
-     * removes can be made to reappear, and each has a row below that MUST
-     * BE 0 for "held something at the close and could not emit it".
-     *
-     * SUSPENSIONS (PathBuilder::susp_stack_).  A suspension freezes five
-     * things at once: the deferred prev block and its retired extent, its
-     * committed CP memops, its per-insn dst snaps and their chain mark, the
-     * in-flight chain prefix, and its self-loop facts.  No close route read
-     * it; its only exits were a resume, an over-cap displacement, a stale
-     * sweep and the next segment open's orphan drop -- and the two middle
-     * ones emit the FRAME whose resume suffix the prev is, never the
-     * suspension's own contents.  flush_suspensions_at_close walks each one
-     * at its frozen extent, from its own frozen sinks, at its own depth. */
-    uint64_t close_susp_flushed = 0;
-    uint64_t close_susp_insns_recovered = 0;
-    uint64_t close_susp_user_insns_recovered = 0;
-    uint64_t close_susp_sys_insns_recovered = 0;
-    uint64_t close_susp_empty = 0;          /* held a block that ran 0 insns */
-    /* A suspension whose frozen extent measurement was invalid: the walk
-     * cannot name what retired, so it folds the block whole.  Must be 0 --
-     * a non-zero row means the wire may claim instructions the guest did
-     * not execute (the suspend-side twin of close_walk_extent_unknown). */
-    uint64_t close_susp_extent_unknown = 0;
-    /* A suspension held at a close with no body stream to emit into.  This
-     * IS the drop and nothing can undo it; must be 0. */
-    uint64_t close_susp_unflushable = 0;
+    /* ---- THE CLOSE DRAINS (one per holder the census enumerated) ---- */
 
-    /* PEER BUILDERS.  The peer loop gated on the pending-seal slot alone
-     * (`if (!b || !b->prev()) continue;`), so a peer vCPU holding open
-     * fault frames, a suspension, an in-flight chain or a reg-snap sink
-     * with an EMPTY slot was skipped whole -- and with it
-     * flush_frames_at_close, which is reachable only through flush_final.
-     * Measured: sd_smp4 vCPUs 2 and 3, ceil2 vCPUs 1 and 2, each holding a
-     * frame and a suspension behind prev=0x0.  The gate now asks whether
-     * the builder holds ANYTHING. */
+    /* PEER BUILDERS.  The peer loop once gated on the pending-seal slot
+     * alone (`if (!b || !b->prev()) continue;`), so a peer vCPU holding
+     * work (then: frames and suspensions; now: an in-flight chain or a
+     * reg-snap sink) behind an EMPTY slot was skipped whole.  Measured:
+     * sd_smp4 vCPUs 2 and 3, ceil2 vCPUs 1 and 2, each holding work behind
+     * prev=0x0.  The gate now asks whether the builder holds ANYTHING. */
     uint64_t close_peer_holder_flushes = 0;
     uint64_t close_peer_holder_insns_recovered = 0;
     /* A peer builder that held work at the close and was NOT flushed.
@@ -628,8 +590,7 @@ struct Stats {
     /* THE WHOLE-CLASS GATE.  Read on the POST-flush census pass, per
      * builder: after every drain this close performs, is any structure
      * that can contain RETIRED instructions still occupied?  A pending-seal
-     * slot with a measured retired extent, an open fault frame with an
-     * executed prefix, any suspension, an in-flight chain with
+     * slot with a measured retired extent, an in-flight chain with
      * instructions.  Must be 0 -- this is the row that fails the cell when
      * a holder is added, or when a falsifier turns a drain off, and it does
      * not depend on remembering to add a row per new holder. */
@@ -640,10 +601,9 @@ struct Stats {
      *
      * close_holder_undrained is read on the POST-flush census pass, and
      * every drain flush_final performs EMPTIES its holder unconditionally —
-     * including on its own no-emit exits (no body stream, an unnameable
-     * frame extent, a suspension whose walk produced no block, a
-     * pending-seal slot the close-walk gate skipped, the unwind flush's
-     * anchor guard).  So the post-pass occupancy answers "did the drain
+     * including on its own no-emit exits (no body stream, an unmeasurable
+     * pending-seal extent, a pending-seal slot the close-walk gate
+     * skipped).  So the post-pass occupancy answers "did the drain
      * RUN", not "did the work reach the WIRE": a holder the drain cleared
      * without emitting reads zero, exactly like one it emitted.  The
      * falsifier arms that make the gate fire all work the other way round
@@ -707,10 +667,10 @@ struct Stats {
      *   - a SELF-BRANCHING TB (cur == prev) skipped set_prev's carry
      *     entirely, so the walk asked about the block it was folding while
      *     the answer sat filed under the previous block's name.
-     * Both are closed.  CST_NO_SEAL_STASH is the falsifier arm that shows
-     * this counter can still fire: with the stash refused it reads 16-19 per
-     * riscv64 system cell and drags seal_walk_extent_unknown_interior with
-     * it. */
+     * Both are closed.  The since-deleted CST_NO_SEAL_STASH falsifier arm
+     * proved this counter able to fire (16-19 per riscv64 system cell with
+     * the stash refused, dragging seal_walk_extent_unknown_interior with
+     * it). */
     uint64_t seal_walk_blocks_truncated = 0;
     uint64_t seal_walk_insns_not_executed = 0;
     uint64_t seal_walk_aborted_tails = 0;
@@ -767,7 +727,8 @@ struct Stats {
      *   taking FOUR mid-iteration demand faults leaves this counter at 0 on
      *   a build whose per-iteration memop pairing is wrong for 12289 of its
      *   12800 iterations.  Pairing is carried by the piece table
-     *   (CtxFrame::rep_pieces), never by this counter, and a reader who
+     *   (RepSelfLoopState::emit_pre_pieces), never by this counter, and a
+     *   reader who
      *   treats a zero here as evidence about fault handling is reading a
      *   number that cannot answer the question.
      * rep_trailing_pass_dropped — a zero-iteration re-entry of a REP already
@@ -1353,17 +1314,6 @@ struct Stats {
      * mode, and on any unpinned run. */
     uint64_t pin_multivcpu_observed = 0;
 
-    /* Suspend-or-seal, foreign-ASID arrow (Stage 3).  A foreign span
-     * suspends the deferred prev onto a bounded per-thread stack instead
-     * of dropping it, so the pinned process's resume seals the interrupted
-     * (fault-handler) block at its own depth.  pushed/resumed count the
-     * suspend and matching-resume arrows; displaced counts an over-cap
-     * eviction retired at return (the oldest suspension flushed at its
-     * depth to free the slot); stale_retired counts a suspension the
-     * pinned context reached user privilege past without resuming, flushed
-     * at its depth by the sweep; orphan_dropped counts entries discarded
-     * (no emit) at a segment-open boundary.  All zero off the contention
-     * path (no foreign drops -> no suspensions). */
     /* Emit-at-departure (epoch 0x1E model): blocks the foreign-ASID /
      * abandoned-async arrows emitted at their measured extent the moment
      * they left the traced flow, and the instructions those emissions
@@ -1372,22 +1322,12 @@ struct Stats {
     uint64_t departure_emits = 0;
     uint64_t departure_emit_insns = 0;
     uint64_t departure_extent_unknown = 0;
-    uint64_t susp_pushed = 0;
-    uint64_t susp_resumed = 0;
-    uint64_t susp_displaced = 0;
-    uint64_t susp_stale_retired = 0;
-    uint64_t susp_orphan_dropped = 0;
-    /* Suspend-or-seal, abandoned-async arrow (Stage 4).  The stuck-window
-     * recovery's no-departure-PC arm suspends the deferred prev instead of
-     * dropping it, so the interrupted block seals at its own depth when the
-     * pinned context resumes (rather than the block's fault level being lost
-     * to a drop).  A subset of susp_pushed, tagged separately because it is a
-     * distinct drop site with its own (async-storm) contention signature; the
-     * abandoned arm falls through to the promote, so its suspension defers to
-     * a LATER resume (the same step's resume arrow is held off — cur is the
-     * force-closed window's OTHER thread, not this prev's successor).  Zero
-     * off the async-recovery path. */
-    uint64_t susp_abandoned = 0;
+    /* Of departure_emits, the abandoned-async arrow's share: the stuck-
+     * window recovery closed a window with no departure PC, so the pending
+     * block's successor could never be resolved and it was emitted on the
+     * spot.  A distinct site with its own (async-storm) contention
+     * signature; zero off the async-recovery path. */
+    uint64_t departure_emits_abandoned_async = 0;
 
     /* Post-merge depth re-stamp (the seal takes the depth stamp again after
      * its merge completions retire frames).  corrections counts the steps
@@ -1595,44 +1535,13 @@ struct Stats {
      *                           address space (identical text at identical
      *                           addresses).  Must be 0.
      */
-    /* The OTHER per-vCPU structures a long untraced span could grow, peaked
+    /* The OTHER per-vCPU structure a long untraced span could grow, peaked
      * so the claim "no retained structure grows with untraced execution" is
-     * measured rather than asserted.  frames_ holds the traced process's own
-     * in-flight fault excursions; susp_stack_ its suspended deferred-prev
-     * blocks.  Both are fed only from downstream of the attribution gates. */
+     * measured rather than asserted.  frames_ holds the traced process's
+     * own in-flight fault excursions (identity-and-depth ledger entries;
+     * their executed prefixes are already on the wire).  Fed only from
+     * downstream of the attribution gates. */
     uint64_t frames_peak = 0;
-    uint64_t susp_stack_peak = 0;
-
-    /* ---- What a segment close was still holding in frames_ -------------
-     * A fault frame open at the close holds the EXECUTED pre-fault prefix of
-     * its block: the merge that would have put the block on the wire whole
-     * is waiting for a FAULT_RETURN that the close makes impossible.  Until
-     * PathBuilder::flush_frames_at_close those instructions were dropped —
-     * visible on the user side as clock_minus_wire > 0, and INVISIBLE for a
-     * kernel frame, which the user-only residual cannot see.
-     *
-     * close_frames_flushed / _insns_recovered is what the close emitted;
-     * the sys / user split is there because the user-only residual is not a
-     * complete detector for this class.  Non-zero is ordinary: it means a
-     * segment ended inside a fault handler, which any workload can do.
-     *
-     * close_frames_empty_prefix is the frame whose fault landed on its
-     * block's FIRST instruction: nothing of it retired, so emitting nothing
-     * is correct and no instruction is lost.
-     *
-     * close_frame_prefix_unplaced MUST be 0: it is a frame whose executed
-     * extent could not be named (its resume PC is not one of its own block's
-     * instructions) or whose truncated template would not commit — the one
-     * shape in which this flush still drops what it is holding. */
-    uint64_t close_frames_flushed = 0;
-    uint64_t close_frame_insns_recovered = 0;
-    uint64_t close_frame_user_insns_recovered = 0;
-    uint64_t close_frame_sys_insns_recovered = 0;
-    uint64_t close_frames_empty_prefix = 0;
-    uint64_t close_frame_prefix_unplaced = 0;
-    /* No body stream existed at the close, so the frames could not be
-     * emitted anywhere.  MUST be 0 for the same reason. */
-    uint64_t close_frames_unflushable = 0;
 
     /* ---- Event-queue drain instrument (the BIGDRAIN condition) --------
      * The queue is QEMU-side, grow-only and never drops; its length between

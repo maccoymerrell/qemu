@@ -230,13 +230,15 @@ of the picture:
   TLB refills) are traced as ordinary basic blocks.  Kernel-context
   instructions carry the ``SYSTEM`` flag bit, so a consumer can
   model or filter them; entries executed inside a fault handler
-  additionally carry the handler's nesting depth, and a faulting
-  basic block appears once, whole, with its faulting instructions
-  marked.  (See :doc:`format` for the flag bit and the per-entry
-  fault trailer.)  Setting ``faults=0`` excludes the synchronous
-  handler instead — the interrupted block still appears whole, but
-  the handler excursion is suspended and the trace carries no anchors
-  or nesting depth.
+  additionally carry the handler's nesting depth, and a basic block
+  a fault interrupts emits its executed prefix at the fault and the
+  remainder as a continuation entry of the same template after the
+  handler returns, each entry declaring the executed range it is
+  complete for.  (See :doc:`format` for the flag bit and the
+  block-level executed-range and fault-depth records.)  Setting
+  ``faults=0`` excludes the synchronous handler instead — the
+  handler excursion is suspended and every entry's fault depth
+  stays ``0``.
 * **Asynchronous interrupts are excluded by default.**  Timer ticks,
   device IRQs, and the scheduling they trigger are OS noise
   uncorrelated with the traced workload, so the whole

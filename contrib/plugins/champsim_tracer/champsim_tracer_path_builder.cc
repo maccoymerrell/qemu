@@ -162,10 +162,9 @@ static bool pb_async_diag()
 
 /* Measurement-arm kill switch for this arc's behavioural arrows (the
  * emission-time async-level re-derivation, the abandon-release re-stamp and
- * the task-identity kernel ownership rule), mirroring CST_NO_FAULT_MERGE's
- * pattern: the condition census runs on BOTH arms, only the behaviour is
- * gated, so a paired wave measures the same condition under the old and the
- * new rendering. */
+ * the task-identity kernel ownership rule): the condition census runs on
+ * BOTH arms, only the behaviour is gated, so a paired wave measures the
+ * same condition under the old and the new rendering. */
 static bool depth3_off()
 {
     static const bool v = getenv("CST_DEPTH3_OFF") != nullptr;
@@ -602,7 +601,7 @@ struct JumpEmitRec {
 struct JumpStepRec {
     uint64_t cur_pc, prev_pc;
     uint32_t raw, inflight, async_cap, depth_next, prev_depth, walk_depth;
-    uint16_t frames, susp;
+    uint16_t frames;
     uint8_t  priv, pinned, pdsrc, wdsrc;
     const char *tag;
 };
@@ -831,7 +830,6 @@ void cst_jump_diag_step(uint64_t cur_pc, uint64_t prev_pc, int priv,
     r.prev_depth = g_dbg_prev_depth;
     r.walk_depth = g_dbg_walk_depth;
     r.frames = (uint16_t)g_dbg_frames;
-    r.susp = (uint16_t)g_dbg_susp;
     r.priv = (uint8_t)priv;
     r.pinned = (uint8_t)pinned;
     r.pdsrc = g_dbg_prev_depth_src;
@@ -890,13 +888,13 @@ void cst_jump_diag_emit(uint64_t seq, uint32_t tid, uint64_t pc,
             "\n[jumpdiag] *** %s seq=%" PRIu64 " tid=%u pc=0x%" PRIx64
             " sys=%d depth %u -> %u src=%s nanchor=%zu\n"
             "[jumpdiag]     live: raw=%u inflight=%u async=%u depth_next=%u"
-            " prev_depth=%u(%s) walk_depth=%u(%s) frames=%zu susp=%zu\n",
+            " prev_depth=%u(%s) walk_depth=%u(%s) frames=%zu\n",
             kind, seq, tid, pc, is_sys, pd, depth,
             dsrc_name(g_dbg_depth_src), n_anchors,
             g_dbg_raw_depth, g_dbg_inflight, g_dbg_async_captured,
             g_dbg_depth_next, g_dbg_prev_depth,
             pdsrc_name(g_dbg_prev_depth_src), g_dbg_walk_depth,
-            pdsrc_name(g_dbg_walk_depth_src), g_dbg_frames, g_dbg_susp);
+            pdsrc_name(g_dbg_walk_depth_src), g_dbg_frames);
     size_t n = g_jd_emit_n < JD_RING ? g_jd_emit_n : JD_RING;
     for (size_t i = 0; i < n; i++) {
         const JumpEmitRec &r =
@@ -912,11 +910,11 @@ void cst_jump_diag_emit(uint64_t seq, uint32_t tid, uint64_t pc,
             g_jd_steps[(g_jd_step_n - m + i) % JD_RING];
         fprintf(stderr, "[jumpdiag]   step[-%02zu] %-16s cur=0x%" PRIx64
                 " prev=0x%" PRIx64 " priv=%u pin=%u raw=%u infl=%u async=%u "
-                "next=%u prev_d=%u(%s) walk_d=%u(%s) frames=%u susp=%u\n",
+                "next=%u prev_d=%u(%s) walk_d=%u(%s) frames=%u\n",
                 m - 1 - i, r.tag ? r.tag : "?", r.cur_pc, r.prev_pc,
                 r.priv, r.pinned, r.raw, r.inflight, r.async_cap,
                 r.depth_next, r.prev_depth, pdsrc_name(r.pdsrc),
-                r.walk_depth, pdsrc_name(r.wdsrc), r.frames, r.susp);
+                r.walk_depth, pdsrc_name(r.wdsrc), r.frames);
     }
     gap_dump(seq);
     fflush(stderr);
@@ -3557,7 +3555,7 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
                  * block executed at its measured extent — emit it now with
                  * the branch honestly unresolved; nothing is held. */
                 emit_prev_at_departure(in);
-                g_stats.susp_abandoned++;
+                g_stats.departure_emits_abandoned_async++;
                 clear_prev();
                 if (pb_diag()) {
                     fprintf(stderr, "[pathbuilder] ABANDONED-DEPARTURE-EMIT "

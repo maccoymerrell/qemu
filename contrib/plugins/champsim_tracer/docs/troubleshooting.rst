@@ -558,52 +558,6 @@ other address spaces.  Armed globally the detector called that a wedge —
 it did, on ``system.churn_x86``.  Until the budget is recorded per
 workload, the validator passes through only what the operator set.
 
-.. _trunc-falsifier:
-
-Showing that a zero could have been something else
---------------------------------------------------
-
-Several of the statistics report's most load-bearing rows are zero on a
-healthy capture: ``CP reg-snap slice dropped``, the two
-``... blocks truncated to what ran`` counts, and the equality between
-``user insns actually executed`` and ``user insns emitted to the wire``.
-A zero from a counter that cannot move on the target being measured is
-not evidence of anything, and "the code is ISA-independent" is an
-argument rather than a measurement.
-
-``CST_NO_TRUNC`` removes the truncation from the walk it names, restoring
-the behaviour that preceded the fix — the last fragment of an abandoned
-dispatch is appended at its full *translated* length instead of the
-extent that ran:
-
-``CST_NO_TRUNC=close``
-   Segment-close walk (``PathBuilder::flush_final``) only.
-
-``CST_NO_TRUNC=seal``
-   Per-execution seal walk only.
-
-``CST_NO_TRUNC=both``
-   Both.  ``1``, an empty value, or any value naming neither walk means
-   this.
-
-Run the cell twice, changing only this, and the zeros become readings.
-On the validator's system-mode marker cell the paired arms read:
-
-.. code-block:: text
-
-                              x86_64    aarch64   riscv64    mipsel
-   CP reg-snap slice dropped   1 -> 0    1 -> 0    1 -> 0    1 -> 0
-     of which at END close     1 -> 0    1 -> 0    1 -> 0    1 -> 0
-     reg deltas discarded      5 -> 0    4 -> 0    4 -> 0    4 -> 0
-   close-walk truncations      0 -> 1    0 -> 1    0 -> 1    0 -> 1
-   wire minus retired         +4 -> 0   +4 -> 0   +4 -> 0   +4 -> 0
-
-**Never set this on a capture run.**  It deliberately puts instructions
-on the wire that the guest did not execute, and the block that follows
-re-covers them, so the wire duplicates them.  It prints a line naming
-itself on stderr for exactly that reason: a trace produced under it has
-to be identifiable as one afterwards.
-
 Where to look next
 ------------------
 

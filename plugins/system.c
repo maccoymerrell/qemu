@@ -62,8 +62,9 @@ static bool plugin_shutdown_placed_cond_ready;
 static bool plugin_shutdown_placed;
 
 /*
- * Marshalled work: runs on a vCPU thread, at a TB BOUNDARY, with the BQL
- * held.  Two facts go out from here and they are separate facts.
+ * Marshalled work: runs on a vCPU thread, at a TB BOUNDARY, and is entered
+ * with the BQL held -- which it drops around the callback, see below.  Two
+ * facts go out from here and they are separate facts.
  *
  * No guest instruction is in flight, so the last dispatched block
  * completed -- @in_guest_insn is false.
@@ -80,15 +81,45 @@ static bool plugin_shutdown_placed;
 static void plugin_vm_shutdown_on_cpu(CPUState *cpu, run_on_cpu_data arg)
 {
     /*
+     * The BQL must not be held across the callback.
+     *
+     * process_queued_cpu_work() runs a non-exclusive work item with the BQL
+     * held, and this vCPU reaching a translation-block boundary says nothing
+     * about the others: they are free-running inside plugin callbacks the
+     * whole time.  A plugin that closes a capture here takes its own callback
+     * lock, and a plugin that instruments speculatively holds that same lock
+     * across a wrong-path excursion -- which acquires the BQL from inside it,
+     * at cpu_plugin_spec_vtime_pause, at cpu_plugin_spec_vtime_resume, and at
+     * cpu_plugin_arch_state_restore on RISC-V.  So the excursion's order is
+     * plugin lock then BQL, and arriving here holding the BQL and then
+     * blocking on the plugin lock runs it the other way: the lock's holder is
+     * waiting for the BQL this thread owns, and the machine stops dead --
+     * every thread in futex_wait, zero CPU, no close, no trace.  Measured on
+     * the ChampSim Tracer at -smp 4 with the wrong path enabled: four of nine
+     * aarch64 and riscv64 SIGTERM cells.
+     *
+     * Dropping it is the same treatment process_queued_cpu_work() already
+     * gives an exclusive item, and for the same reason.  It costs nothing:
+     * the requester is parked on the placement condition with the BQL
+     * released, so no thread is waiting on this one to hold it.
+     *
      * Under round-robin TCG the work for one vCPU is drained without
      * current_cpu being pointed at it, so the vCPU whose state is live is
      * not necessarily @cpu.  The plugin is told which one it is by
      * qemu_plugin_current_vcpu_index(); all that is promised here is that
      * there IS one.
      */
+    bool had_bql = bql_locked();
+
+    if (had_bql) {
+        bql_unlock();
+    }
     qemu_plugin_vm_shutdown_dispatch(current_cpu ? QEMU_PLUGIN_VCPU_UNNAMED
                                                  : QEMU_PLUGIN_VCPU_NONE,
                                      false);
+    if (had_bql) {
+        bql_lock();
+    }
     qatomic_set(&plugin_shutdown_placed, true);
     qemu_cond_broadcast(&plugin_shutdown_placed_cond);
 }
@@ -109,6 +140,16 @@ void qemu_plugin_vm_shutdown(void)
          * writing vCPU's own thread with its state live and coherent.
          * This is the only route on which a vCPU is named, because it is
          * the only route on which one is responsible.
+         *
+         * This route can also arrive with the BQL held -- a TCG guest's
+         * device write takes it in do_st_mmio_leN -- so it has the same
+         * shape as the marshalled one and the same AB/BA exposure against a
+         * plugin lock a peer vCPU holds across a wrong-path excursion.  It
+         * is NOT given the same drop, because here the BQL is the device
+         * write's own and releasing it mid-handler would publish a
+         * half-updated device.  UNMEASURED: the marshalled route is the one
+         * that has been reproduced; this one is reasoned only, and closing
+         * it needs a dispatch that does not run inside the write.
          */
         qemu_plugin_vm_shutdown_dispatch(current_cpu->cpu_index, true);
         return;

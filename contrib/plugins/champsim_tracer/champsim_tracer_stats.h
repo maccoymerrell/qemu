@@ -541,6 +541,19 @@ struct Stats {
      * be 0 on any capture. */
     uint64_t close_peer_holders_skipped = 0;
 
+    /* THE ORDER THE CLOSE EMITS IN.  A close used to flush its own vCPU
+     * first and the peers after it, which appends blocks the guest ran
+     * EARLIER behind blocks it ran later -- and docs/format.rst promises a
+     * consumer that one (asid, thread_id) context reads as a single
+     * instruction stream in order, breaking only at nesting boundaries the
+     * format makes visible.  The flushes are now ordered by the shared
+     * dispatch clock (g_promote_seq).  This counts the closes where that
+     * clock puts some builder AFTER the closing vCPU -- i.e. the closes
+     * where the old order would have produced an out-of-order tail.  Not a
+     * must-be-0 row: it is the population the ordering exists for, and a
+     * zero only means this run's close had nothing to reorder. */
+    uint64_t close_flush_out_of_dispatch_order = 0;
+
     /* THE DEFERRED ROUTE'S PENDING-SEAL SLOT.  flush_final(walk_prev=false)
      * did not walk the slot at all.  For the budget / simpoint close that
      * is right -- the slot holds the TB about to dispatch, measured ran=0.

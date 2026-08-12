@@ -221,6 +221,26 @@ bool retired_executed_prev(unsigned int cpu_index, const BBTemplate *head,
  * it in every TU). */
 void census_note_prev_promote(void);
 
+/*
+ * THE DISPATCH CLOCK EVERY BUILDER SHARES.
+ *
+ * Bumped once per pending-seal promote, in PathBuilder::set_prev, which
+ * runs only inside step_events under exec_lock — so it is a total order
+ * over the dispatches of every vCPU, and comparing two builders' stamps
+ * answers "which of these blocks ran first" across vCPUs.  Nothing else
+ * on the tracer can: the retired cursor is per-vCPU and the window clock
+ * counts instructions, not order.
+ *
+ * The close needs exactly that.  A close happens on ONE vCPU while peers
+ * may each be holding a block that EXECUTED and was waiting for a next
+ * owned dispatch that never came; emitting them after the closing vCPU's
+ * own final block appends work the guest ran EARLIER behind work it ran
+ * later, and a consumer reading one (asid, thread_id) context as a single
+ * instruction stream — the guarantee docs/format.rst calls strand
+ * sequentiality — sees a break the format does not document.
+ */
+extern uint64_t g_promote_seq;
+
 /* CST_NO_TRUNC falsifier: is the named walk's truncation disabled?  See
  * truncation_falsifier_mask() in champsim_tracer_path_builder.cc.  True only
  * in a deliberately falsified arm — never in a capture run. */
@@ -571,9 +591,21 @@ public:
         }
         if (tb != nullptr) {
             census_note_prev_promote();
+            /* WHEN THIS BUILDER LAST RAN, on a clock every builder shares.
+             * Promotes happen only in step_events, under exec_lock, so the
+             * counter is a total order over dispatches across every vCPU —
+             * which is exactly what a close needs to put the builders'
+             * held blocks on the wire in the order the guest executed
+             * them (see the flush order in finish_trace_segment). */
+            prev_seq_ = ++g_promote_seq;
         }
         prev_tb_ = tb;
     }
+
+    /* The shared-clock stamp of this builder's most recent promote; 0 for a
+     * builder that has never held a block.  A vCPU the pinned thread left
+     * earlier reads a SMALLER stamp than the vCPU it is running on now. */
+    uint64_t prev_seq() const { return prev_seq_; }
     void clear_prev() { set_prev(nullptr); }
 
     /*
@@ -1005,6 +1037,9 @@ private:
      * dispatch after it, for the close walk on a vCPU the process left. */
     uint64_t prev_extent_ = 0;
     bool     prev_extent_valid_ = false;
+    /* The shared dispatch clock at this builder's most recent promote (see
+     * g_promote_seq).  The close orders the builders' flushes by it. */
+    uint64_t prev_seq_ = 0;
     /* The outgoing prev and its measurement, carried across the swap for
      * the seal walk of the same step (see seal_prev_extent). */
     const BBTemplate *seal_prev_ = nullptr;

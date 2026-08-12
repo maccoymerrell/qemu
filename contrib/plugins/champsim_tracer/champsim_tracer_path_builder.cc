@@ -1162,6 +1162,11 @@ void census_note_prev_promote(void)
     g_stats.census_prev_promoted++;
 }
 
+/* See the declaration.  Written only from PathBuilder::set_prev, which runs
+ * inside step_events with exec_lock held, so the increment is serialised by
+ * the same lock that serialises the dispatches it is numbering. */
+uint64_t g_promote_seq = 0;
+
 void PathBuilder::on_segment_open()
 {
     /* Orphan drop: every frame's full_tmpl points into the bb_map_ the

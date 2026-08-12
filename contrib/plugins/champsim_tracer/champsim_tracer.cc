@@ -5380,6 +5380,30 @@ static bool peer_flush_falsifier(void)
 }
 
 /*
+ * CST_NO_CLOSE_ORDER: the falsifier arm for the close's flush ORDER.  With
+ * it set the close reverts to flushing its own vCPU first and the peers
+ * after it in ascending vCPU order — appending blocks the guest ran EARLIER
+ * behind blocks it ran later, which is what breaks strand sequentiality on
+ * the wire.  A falsifier arm, not a capture.
+ */
+static bool close_order_falsifier(void)
+{
+    static const bool v = []() {
+        if (getenv("CST_NO_CLOSE_ORDER") == nullptr) {
+            return false;
+        }
+        fprintf(stderr, "champsim_tracer: CST_NO_CLOSE_ORDER — the close "
+                "flushes its own vCPU before every peer regardless of when "
+                "their blocks ran, so a (thread_id, asid) context can carry "
+                "an earlier block behind a later one.  This trace's body is "
+                "out of program order; it is a falsifier arm, not a "
+                "capture.\n");
+        return true;
+    }();
+    return v;
+}
+
+/*
  * Finalize and write the current trace segment.  Must be called with
  * exec_lock held.
  *
@@ -5495,20 +5519,12 @@ static void finish_trace_segment(bool prev_executed = true,
      * reflects the entire segment, including the trailing chain. */
     g_trace_segments.finish([&]() {
         if (closing_cpu != UINT32_MAX) {
-            /* Ordinary close: it happens ON a vCPU's dispatch, and only
-             * that vCPU's pending final entry is flushed (peers' pending
-             * slots drop, exactly as they always have — successor work
-             * if that tail is ever wanted). */
-            if (prev_executed) {
-                path_builder_flush_final(closing_cpu);
-            } else {
-                path_builder_flush_final_chain_only(closing_cpu,
-                                                    prev_in_flight);
-            }
             /*
-             * PEERS.  A close happens on ONE vCPU's dispatch, but on an SMP
-             * guest the pinned process may have run on others and left each
-             * of them holding a pending-seal slot: a TB that EXECUTED and
+             * PEERS, AND THE ORDER THEY GO ON THE WIRE IN.
+             *
+             * A close happens on ONE vCPU's dispatch, but on an SMP guest
+             * the pinned process may have run on others and left each of
+             * them holding a pending-seal slot: a TB that EXECUTED and
              * whose emission was waiting for a next owned dispatch that
              * never came, because the process migrated away.  Those slots
              * used to be dropped, and the instructions in them with it --
@@ -5517,19 +5533,48 @@ static void finish_trace_segment(bool prev_executed = true,
              * every run where it did not.  Retired-but-never-emitted is a
              * DROP, so the peers are flushed here too.
              *
-             * Ascending vCPU order for determinism, and after the closing
-             * vCPU so the segment's own final entry keeps its position.
-             * Each peer's extent comes from the measurement taken at the
-             * first dispatch after its prev (note_prev_extent), because the
-             * retired cursor on a vacated vCPU has long since rolled past.
+             * They cannot be flushed in ANY order, though, and flushing the
+             * closing vCPU first was the wrong one.  A block a peer is still
+             * holding is by construction one the pinned thread ran BEFORE it
+             * left that vCPU, so appending it behind the closing vCPU's own
+             * final block puts earlier work behind later work in the same
+             * (asid, thread_id) context -- and docs/format.rst promises a
+             * consumer strand sequentiality: filtered to one context the
+             * entries read as a single instruction stream in order, with
+             * breaks only at nesting boundaries the format makes visible
+             * (fault_depth changes, privilege-domain gaps).  A tail append
+             * at the same depth and the same privilege is none of those.
+             * Measured on an x86_64 -smp 4 churn cell: the segment's last
+             * user entry was vCPU 1's held block at 0x401478, which does not
+             * continue the block vCPU 0 emitted before it, and the
+             * validator's thread_chain check reports it as an orphan.
+             *
+             * So the flushes are ordered by the shared dispatch clock
+             * (g_promote_seq), ascending: the vCPU the thread left earliest
+             * empties first and the closing vCPU -- which promoted at this
+             * very dispatch -- empties last.  Ties (a builder that never
+             * promoted) fall back to vCPU index, so the order is
+             * deterministic.  Each peer's extent still comes from the
+             * measurement taken at the first dispatch after its prev
+             * (note_prev_extent), because the retired cursor on a vacated
+             * vCPU has long since rolled past.
              */
             const bool no_peers = peer_flush_falsifier();
             const bool slot_only_gate = peer_holders_falsifier();
+            const bool no_order = close_order_falsifier();
+
+            struct CloseFlush { uint64_t seq; unsigned int cpu; };
+            std::vector<CloseFlush> flush_order;
             for (unsigned int i = 0; i < CST_PIN_MAX_VCPUS; i++) {
+                PathBuilder *b = path_builder_if_created(i);
                 if (i == closing_cpu) {
+                    /* Always flushed, builder or not: flush_final on a
+                     * builder that does not exist yet creates an empty one
+                     * and emits nothing, which is what it did before. */
+                    flush_order.push_back({ b ? b->prev_seq() : UINT64_MAX,
+                                            i });
                     continue;
                 }
-                PathBuilder *b = path_builder_if_created(i);
                 /*
                  * THE GATE IS "DOES IT HOLD ANYTHING", NOT "DOES IT HOLD A
                  * SLOT".  Asking only about prev() skipped a peer whose
@@ -5552,6 +5597,46 @@ static void finish_trace_segment(bool prev_executed = true,
                      * arm exists to produce, counted so the arm is visible
                      * in the run's own stats rather than asserted. */
                     g_stats.close_peer_holders_skipped++;
+                    continue;
+                }
+                flush_order.push_back({ b->prev_seq(), i });
+            }
+            std::stable_sort(flush_order.begin(), flush_order.end(),
+                             [](const CloseFlush &a, const CloseFlush &b) {
+                                 return a.seq != b.seq ? a.seq < b.seq
+                                                       : a.cpu < b.cpu;
+                             });
+            if (no_order) {
+                /* The falsifier arm: the pre-fix order, closing vCPU first
+                 * and peers after it in ascending vCPU index. */
+                std::stable_sort(flush_order.begin(), flush_order.end(),
+                                 [&](const CloseFlush &a, const CloseFlush &b) {
+                                     bool ac = a.cpu == closing_cpu;
+                                     bool bc = b.cpu == closing_cpu;
+                                     return ac != bc ? ac : a.cpu < b.cpu;
+                                 });
+            }
+            /* Did the guest's own execution order differ from the order the
+             * close used to emit in?  Counted so a run says for itself
+             * whether this close was one where the ordering mattered. */
+            if (!flush_order.empty() && flush_order.back().cpu != closing_cpu) {
+                g_stats.close_flush_out_of_dispatch_order++;
+            }
+
+            for (const CloseFlush &cf : flush_order) {
+                if (cf.cpu == closing_cpu) {
+                    /* The closing vCPU's own pending final entry. */
+                    if (prev_executed) {
+                        path_builder_flush_final(closing_cpu);
+                    } else {
+                        path_builder_flush_final_chain_only(closing_cpu,
+                                                            prev_in_flight);
+                    }
+                    continue;
+                }
+                unsigned int i = cf.cpu;
+                PathBuilder *b = path_builder_if_created(i);
+                if (!b) {
                     continue;
                 }
                 const bool had_slot = b->prev() != nullptr;
@@ -5616,12 +5701,26 @@ static void finish_trace_segment(bool prev_executed = true,
         } else {
             /* plugin_exit with a segment still active (abnormal end: the
              * guest died without a close).  No dispatch context exists,
-             * so flush every builder that ever ran, ascending order for
-             * determinism.  The old thread-keyed builder made this flush
-             * a silent no-op (plugin_exit runs on a thread that never
-             * dispatched, so its builder was empty). */
+             * so flush every builder that ever ran -- in the order the
+             * guest dispatched on them (g_promote_seq, ascending), for the
+             * same strand-sequentiality reason the ordinary close route
+             * has, and deterministically.  The old thread-keyed builder
+             * made this flush a silent no-op (plugin_exit runs on a thread
+             * that never dispatched, so its builder was empty). */
+            struct CloseFlush { uint64_t seq; unsigned int cpu; };
+            std::vector<CloseFlush> exit_order;
             for (unsigned int i = 0; i < CST_PIN_MAX_VCPUS; i++) {
                 if (PathBuilder *b = path_builder_if_created(i)) {
+                    exit_order.push_back({ b->prev_seq(), i });
+                }
+            }
+            std::stable_sort(exit_order.begin(), exit_order.end(),
+                             [](const CloseFlush &a, const CloseFlush &b) {
+                                 return a.seq != b.seq ? a.seq < b.seq
+                                                       : a.cpu < b.cpu;
+                             });
+            for (const CloseFlush &cf : exit_order) {
+                if (PathBuilder *b = path_builder_if_created(cf.cpu)) {
                     b->flush_final();
                 }
             }

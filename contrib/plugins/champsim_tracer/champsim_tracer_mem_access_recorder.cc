@@ -284,6 +284,18 @@ size_t MemAccessRecorder::cp_carry_count(unsigned int cpu_index) const
     return cp_carry(cpu_index).size();
 }
 
+size_t MemAccessRecorder::cp_count_at_pc(unsigned int cpu_index,
+                                         uint64_t insn_pc) const
+{
+    size_t n = 0;
+    for (const WPMemAccess &acc : cp_mem(cpu_index)) {
+        if (acc.insn_pc == insn_pc) {
+            n++;
+        }
+    }
+    return n;
+}
+
 void MemAccessRecorder::clear_cp(unsigned int cpu_index)
 {
     cp_mem(cpu_index).clear();

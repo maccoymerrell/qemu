@@ -2565,15 +2565,57 @@ void PathBuilder::classify_fault_enter(const struct qemu_plugin_cpu_event &ev,
                 pf = rep_state(cpu_index_).pb_walk_facts;
             }
             rep_emit_handoff(cpu_index_, pf);
+            /* A rep-split piece's terminal outcome is architectural
+             * truth, not a guess: every iteration it renders was
+             * followed by another attempt of the same instruction (the
+             * one the fault interrupted), so each took the self-loop
+             * edge — including the piece's last, whose successor is the
+             * faulting attempt itself.  Publish it; a piece cut before
+             * its terminating branch stays honestly unresolved. */
+            const bool rep_edge = rep_split && tmpl->insn_pcs;
             emit_body_entry(out_stream, tmpl, cpu_index_, {},
                             /*wp_first_tb_unavail=*/false,
-                            /*branch_successor_pc=*/0,
-                            /*branch_successor_known=*/false,
+                            rep_edge ? tmpl->insn_pcs[hi - 1] : 0,
+                            /*branch_successor_known=*/rep_edge,
                             lo, hi, /*thread_end=*/false);
         }
         g_mem_recorder.clear_cp(cpu_index_);
         pending_reg_snaps(cpu_index_).clear();
         cp_chain_snap_mark(cpu_index_) = 0;
+    };
+
+    /* "(must be 0)" tripwire for the rep-split loss class.  A piece that
+     * publishes a faulting self-loop's retired iterations exists exactly
+     * when the facts channel names them (@rep_split below); this probe
+     * counts the COMPLETE iterations whose delivered memops sit in the CP
+     * accumulator at the faulting instruction when the channel names none
+     * — those observations are about to be discarded with no piece
+     * claiming them, which is the silent wire loss the severed facts arm
+     * produced (32 of 96 REP STOSB iterations absent).  A partial
+     * iteration's memops (a MOVS load whose paired store faulted) are the
+     * aborted attempt, legitimately re-delivered by the re-execution:
+     * fewer than one iteration's worth never fires. */
+    auto rep_loss_probe = [&](const BBTemplate *head, uint64_t pc) {
+        for (const BBTemplate *fr = head; fr; fr = fr->next_tb_fragment) {
+            if (!fr->insn_pcs || !fr->insn_fields) {
+                continue;
+            }
+            for (uint32_t x = 0; x < fr->n_insns; x++) {
+                if (fr->insn_pcs[x] != pc) {
+                    continue;
+                }
+                unsigned mpi = fr->insn_fields[x].rep_memops_per_iter;
+                if (mpi > 0) {
+                    size_t iters =
+                        g_mem_recorder.cp_count_at_pc(cpu_index_, pc) / mpi;
+                    if (iters > 0) {
+                        g_stats.rep_split_retired_drops++;
+                        g_stats.rep_split_retired_iters_dropped += iters;
+                    }
+                }
+                return;
+            }
+        }
     };
 
     ptrdiff_t cont = frame_idx_for_resume(resume, ev.asid);
@@ -2605,6 +2647,9 @@ void PathBuilder::classify_fault_enter(const struct qemu_plugin_cpu_event &ev,
         const RepArchFacts &wfa = rep_state(cpu_index_).pb_walk_facts;
         const bool rep_split = wfa.pc != 0 && wfa.pc == resume &&
                                wfa.iters > 0;
+        if (!rep_split) {
+            rep_loss_probe(walk_prev_, resume);
+        }
         if (k1 != UINT32_MAX && k1 > f.emitted_to) {
             /* (a2): the suffix retired [emitted_to, k1) before the new
              * fault — a mid-excursion continuation of the SAME template.
@@ -2642,6 +2687,12 @@ void PathBuilder::classify_fault_enter(const struct qemu_plugin_cpu_event &ev,
         cst_jump_diag_step(resume, walk_prev_->start_pc, (int)ev.priv, 1,
                            "fault-enter(b)");
         recredit(walk_prev_, resume);
+        {
+            const RepArchFacts &wfp = rep_state(cpu_index_).pb_walk_facts;
+            if (!(wfp.pc != 0 && wfp.pc == resume && wfp.iters > 0)) {
+                rep_loss_probe(walk_prev_, resume);
+            }
+        }
         uint32_t K = UINT32_MAX;
         if (full_bb && full_bb->insn_pcs) {
             for (uint32_t x = 0; x < full_bb->n_insns; x++) {
@@ -3787,6 +3838,26 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
     g_dbg_walk_depth_src = g_dbg_prev_depth_src;
     walk_in_sync_ = prev_in_sync_;
     set_prev(in.cur);
+    /* cur's own self-loop facts are only readable at the NEXT dispatch
+     * (QEMU's plugin_rep_* fields describe the TB that finished before a
+     * dispatch), so promoting arms the consume-once absorb at the head of
+     * step_events.  This arm is the whole architectural REP channel's
+     * lifeline: without it pb_prev_facts / pb_walk_facts stay empty, every
+     * fan-out falls back to the memop-derived count, and a mid-REP fault
+     * discards its retired iterations instead of publishing them as the
+     * rep-split piece (the classify rep_split predicate reads these facts)
+     * — the measured 32-of-96 REP STOSB wire loss.  CST_REP_FACTS_OFF is
+     * the falsifier lever: it reproduces exactly that severed-wire shape
+     * so the "(must be 0)" retired-iteration drop counter is provable on
+     * demand. */
+    {
+        static const bool rep_facts_off =
+            getenv("CST_REP_FACTS_OFF") != nullptr;
+        if (!rep_facts_off) {
+            rep_state(in.cpu_index).pb_prev_facts = RepArchFacts();
+            rep_state(in.cpu_index).pb_prev_facts_armed = true;
+        }
+    }
         gap_record_continue(in.live_priv);
     /* CONTINUE hands control to the glue's window management (the shutdown
      * gate, tw_manage_window) before step_seal runs, and that is the ONE

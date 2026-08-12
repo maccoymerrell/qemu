@@ -294,9 +294,15 @@ struct Stats {
      * decoder in the loop. */
     uint64_t wire_user_arch_insns = 0;
     /* Of wire_user_arch_insns, the entries produced by SELF-LOOP FAN-OUT
-     * beyond the instruction's single architectural start: Σ(n_iter - 1)
-     * over user blocks whose terminal instruction was fanned out.  See the
-     * increment site for why the retired cursor cannot see these. */
+     * beyond what the clock bills for the instruction: Σ(n_iter - 1) over
+     * user blocks whose terminal instruction was fanned out, plus 1 for
+     * each fault-cut rep-split piece (§4.2a overlap) — the cut piece's
+     * parent range is wire whose execution's bill was re-credited at the
+     * fault, the instruction's one kept count landing on the completing
+     * piece.  See the increment sites for why the retired cursor cannot
+     * see these.  finish_trace_segment folds the per-segment delta into
+     * the printed clock_minus_wire; the term stays named here, never
+     * slack. */
     uint64_t wire_user_rep_extra_insns = 0;
     /* User architectural instructions ATTRIBUTED BY THE PER-EXEC SEAL WALK,
      * counted per TB fragment before chain folding.
@@ -964,6 +970,23 @@ struct Stats {
      */
     uint64_t rep_unretired_pass_dropped = 0;
     uint64_t rep_unretired_pass_kept = 0;
+    /*
+     * rep_split_retired_iters_dropped / _drops — the rep-split LOSS
+     * tripwire (must be 0).  A fan-out instruction that faults mid-loop
+     * publishes its pre-fault retired iterations as the overlap-licensed
+     * rep-split piece (format spec §4.2a); the piece exists exactly when
+     * the architectural facts channel names those iterations.  These count
+     * the COMPLETE iterations whose delivered memops sat in the CP
+     * accumulator at the faulting instruction while the channel named
+     * none — observations discarded with no piece claiming them, i.e.
+     * retired guest work silently absent from the wire.  The measured
+     * instance was the severed pb_prev_facts arm: 32 of 96 REP STOSB
+     * iterations between two demand faults never reached the wire while
+     * every other gate stayed green.  CST_REP_FACTS_OFF reproduces that
+     * shape on demand, which is how this tripwire's firing is proven.
+     */
+    uint64_t rep_split_retired_iters_dropped = 0;
+    uint64_t rep_split_retired_drops = 0;
     uint64_t mops_bytes_checked = 0;
     uint64_t mops_bytes_mismatch = 0;
     uint64_t mops_bytes_unchecked = 0;

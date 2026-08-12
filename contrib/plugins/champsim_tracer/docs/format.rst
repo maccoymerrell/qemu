@@ -2510,7 +2510,13 @@ a fan-out instruction the close cuts the crossing entry's range and
 bills exactly the budget, and the ``covered=`` figure on the finishing
 line is settled to the published count (instructions the clock counted
 that no emitted range claims are un-billed at the close), so
-``clock_minus_wire`` reads zero there too.  The trace's own instruction
+``clock_minus_wire`` reads zero there too.  On the wire side of that
+comparison the fan-out surplus — the entries the fan-out writes beyond
+the one count each clock keeps for the instruction, including the parent
+entry of a fault-cut rep-split piece whose bill the fault re-credited —
+is a named per-segment term the finishing line folds in, so a segment
+containing fan-out instructions reads zero exactly when the identity
+``covered + surplus = wire`` holds.  The trace's own instruction
 count remains the authority for what the window contains.
 
 ::

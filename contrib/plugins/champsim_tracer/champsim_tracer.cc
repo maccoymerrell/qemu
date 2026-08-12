@@ -3695,6 +3695,16 @@ static void reset_segment_local_state(unsigned int cpu_index)
  * finish_trace_segment can diff and report per-segment fan-out. */
 static uint64_t g_seg_fanout_start = 0;
 
+/* Snapshot of wire_user_rep_extra_insns at segment open.  The diff is the
+ * segment's USER self-loop fan-out surplus — the one legitimate way the
+ * wire outruns the clock (see the counter's increment sites) — and
+ * finish_trace_segment folds it into the printed clock_minus_wire, so a
+ * fan-out-bearing segment whose accounting is exact reads 0 there instead
+ * of -(surplus).  The surplus stays a NAMED term (its own stats row), and
+ * folding it at the print never touches `covered` or the un-bill
+ * machinery. */
+static uint64_t g_seg_rep_surplus_start = 0;
+
 /* Segment-local TRACE-instruction counter (trace position).  Bumped by
  * parent BB template n_insns (and +1 per REP sub-iteration) inside
  * emit_body_entry so it tracks exactly what cst_audit counts off
@@ -4198,6 +4208,7 @@ static void start_trace_segment(const char *label,
     reset_segment_local_state(cpu_index);
     g_seg_fanout_start = g_rep_fanout_extra_insns.load(
         std::memory_order_relaxed);
+    g_seg_rep_surplus_start = g_stats.wire_user_rep_extra_insns;
     g_seg_arch_insns = 0;
     g_seg_arch_user_insns = 0;
     g_seg_user_unbilled = 0;
@@ -5402,9 +5413,32 @@ void emit_body_entry(BodyStreamState *out_stream,
                      * numbers differ" into an identity that has to hold
                      * exactly: retired + this == wire.  Anything the fan-out
                      * does not account for is then a real over-claim and
-                     * says so, instead of hiding inside a slack term. */
-                    g_stats.wire_user_rep_extra_insns +=
-                        (uint64_t)(n_iter - 1);
+                     * says so, instead of hiding inside a slack term.
+                     *
+                     * A FAULT-CUT PIECE'S PARENT ENTRY IS SURPLUS TOO.  A
+                     * rep-split piece (§4.2a overlap) renders the retired
+                     * iterations of an execution neither clock keeps a
+                     * count for: the piece ends in the fault
+                     * (reenter=false, complete=false), so its start was
+                     * re-credited (raw clock) / its retirement fold never
+                     * happened (window clock), and the one count the
+                     * instruction keeps lands on the completing
+                     * execution's piece.  The cut piece's parent range
+                     * therefore adds wire with nothing billed behind it —
+                     * one more surplus, on exactly the fault-ended shape.
+                     * Re-enter exits stay at n_iter - 1: a chunk boundary
+                     * is billed on both clocks, and the off-boundary
+                     * single-iteration pass is billed on the raw clock
+                     * (its window-clock withhold is a pre-existing
+                     * comparator residual of the -icount regime, named by
+                     * rep_clock_ticks_withheld, not folded here). */
+                    {
+                        uint64_t fan_surplus = (uint64_t)(n_iter - 1);
+                        if (arch_known && !rep_retired && !efacts.reenter) {
+                            fan_surplus += 1;
+                        }
+                        g_stats.wire_user_rep_extra_insns += fan_surplus;
+                    }
                     /* Exact-budget tripwire: a fan-out parent is exempt
                      * from the S18 budget cut (its iterations are
                      * indivisible on the wire), so a finite user window
@@ -5492,6 +5526,16 @@ void emit_body_entry(BodyStreamState *out_stream,
                     }
                 }
                 return;
+            }
+            /* n_iter <= 1 falls through to the single-entry emission
+             * below.  A fault-cut piece that retired exactly ONE
+             * iteration is the degenerate fan-out: its parent range
+             * still adds the instruction's width with nothing billed
+             * behind it (the count lands on the completing execution),
+             * so it carries the same one-entry surplus. */
+            if (bb_tmpl && !bb_tmpl->is_system && arch_known &&
+                n_iter == 1 && !rep_retired && !efacts.reenter) {
+                g_stats.wire_user_rep_extra_insns += 1;
             }
         }
     }
@@ -6118,7 +6162,18 @@ static void finish_trace_segment(bool prev_executed = true,
          * owned process that no user template carries — the clock's bill is
          * a delta of insn_count reads, so anything retired between two owned
          * dispatches lands in the next owned TB's bill.  The per-bill split
-         * is in the stats report (user_clock_bill_*). */
+         * is in the stats report (user_clock_bill_*).
+         *
+         * The segment's user self-loop fan-out surplus is folded into the
+         * comparison on the clock side: the fan-out writes one entry per
+         * iteration where every clock counts the instruction once, and the
+         * surplus is measured at its source as exactly that difference
+         * (wire_user_rep_extra_insns — a named term, never slack), so
+         * covered + surplus == wire is the identity an exact segment
+         * satisfies and 0 here is what it prints.  On a segment with no
+         * user fan-out the term is 0 and the line is unchanged. */
+        uint64_t seg_rep_surplus = g_stats.wire_user_rep_extra_insns -
+                                   g_seg_rep_surplus_start;
         fprintf(stderr,
                 "champsim_tracer: finished segment [icount %"
                 PRIu64 " .. %" PRIu64 "]  actual_icount=%"
@@ -6131,7 +6186,8 @@ static void finish_trace_segment(bool prev_executed = true,
                 user_clock ? "user_" : "", covered,
                 user_clock ? "user_" : "", budget,
                 seg_fanout, g_seg_arch_insns, g_seg_arch_user_insns,
-                (int64_t)covered - (int64_t)g_seg_arch_user_insns, flag);
+                (int64_t)(covered + seg_rep_surplus) -
+                    (int64_t)g_seg_arch_user_insns, flag);
         g_traced_icount.fetch_add(covered,
                                   std::memory_order_relaxed);
         g_total_arch_insns.fetch_add(g_seg_arch_insns,

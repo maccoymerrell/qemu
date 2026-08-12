@@ -43,6 +43,12 @@ public:
      * because the record-to-drain lifetime crosses CP steps, and under
      * round-robin TCG one host thread interleaves every vCPU's steps. */
     size_t cp_count(unsigned int cpu_index) const;
+    /* Delivered CP memops attributed to one instruction (by its PC) still
+     * sitting in the accumulator.  Read by the rep-split loss tripwire in
+     * classify_fault_enter: complete iterations of a faulting self-loop
+     * found here while the facts channel claims none retired are
+     * observations about to be discarded unpublished. */
+    size_t cp_count_at_pc(unsigned int cpu_index, uint64_t insn_pc) const;
     /* Memops of ALREADY-RETIRED instructions carried past a drain that
      * could not place them (a split BB's straggler awaiting the
      * neighbouring entry).  A second holder, distinct from cp_count and

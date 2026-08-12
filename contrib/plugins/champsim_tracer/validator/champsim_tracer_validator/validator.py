@@ -6151,6 +6151,17 @@ def _check_thread_chain(entries: list[dict],
     # its only legitimate user-side successor is its own continuation.
     partial_by_tid: dict[int, tuple[int, int]] = {}
 
+    # tid -> (template_id, rep_index, rep_pc): the §4.2a rep-split
+    # license, the format's ONE sanctioned range overlap.  A template
+    # whose terminal instruction is a self-loop (BRANCH_REP) and whose
+    # entry ran to its end may be continued at ``bb_start == n - 1`` —
+    # the self-loop faulted mid-loop, the piece published the iterations
+    # it observed, and the continuation re-enters AT the shared
+    # instruction.  The license survives the instruction's own 1-insn
+    # fan-out sub-entries and the kernel excursion (the fault is the
+    # excursion); any other user entry retires it.
+    rep_split_lic: dict[int, tuple[int, int, int]] = {}
+
     for e in entries:
         t = templates_by_id.get(e["template_id"])
         if t is None:
@@ -6172,8 +6183,17 @@ def _check_thread_chain(entries: list[dict],
             # precisely the case the old excursion-restart laxity could
             # not check.  A continuation with no open partial, or at the
             # wrong index, does not continue this thread's control flow.
+            # The one other admissible start is §4.2a's licensed overlap:
+            # ``bb_start == n - 1`` of the same template whose terminal
+            # self-loop the thread's previous piece rendered whole — the
+            # rep-split continuation re-entering AT the shared
+            # instruction.
             tid_pairs += 1
+            lic = rep_split_lic.get(tid)
             if partial_by_tid.get(tid) == (int(e["template_id"]), start):
+                tid_connected += 1
+            elif lic is not None and lic[0] == int(e["template_id"]) \
+                    and lic[1] == start:
                 tid_connected += 1
             else:
                 orphans.append((e.get("seq_num"), pc, tid))
@@ -6201,6 +6221,27 @@ def _check_thread_chain(entries: list[dict],
         else:
             partial_by_tid.pop(tid, None)
             chain_by_tid[tid] = _template_successor_pcs(t, rep_branch_id)
+
+        # Maintain the rep-split license.  A full-extent entry whose
+        # terminal instruction is the self-loop grants it (the piece may
+        # be cut there by a fault, the continuation re-entering at the
+        # shared instruction); the instruction's own 1-insn fan-out
+        # sub-entries carry an existing grant forward; any other user
+        # entry retires it.  (Kernel entries never reach here, so the
+        # excursion between the pieces preserves the grant.)
+        ins = t.get("insns") or []
+        terminal_rep = (rep_branch_id is not None and stop == n and
+                        bool(ins) and
+                        int(ins[-1].get("branch_type", 0)) == rep_branch_id)
+        lic = rep_split_lic.get(tid)
+        if terminal_rep and n > 1:
+            rep_split_lic[tid] = (int(e["template_id"]), n - 1,
+                                  int(ins[-1].get("pc", 0)))
+        elif terminal_rep and n == 1 and lic is not None \
+                and int(ins[-1].get("pc", 0)) == lic[2]:
+            pass
+        else:
+            rep_split_lic.pop(tid, None)
 
     for seq, pc, tid in orphans[:5]:
         issues.append(Issue(

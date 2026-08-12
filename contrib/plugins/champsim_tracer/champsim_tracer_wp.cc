@@ -76,6 +76,9 @@ struct WpAccum {
         e.start_pc = bb_start_pc;
         e.dyn_params = std::move(bb_dyn_params);
         e.n_insns_executed = (uint32_t)bb_pcs.size();
+        /* Whole-block attribution by default; the commit site cuts the
+         * chain's budget-crossing last block (see WPBBEntry). */
+        e.n_insns_attributed = e.n_insns_executed;
         e.fault = fault;
         e.translation_unavailable = false;
         e.fault_insn_index = fault_insn_index;
@@ -117,6 +120,13 @@ struct WpWalkState {
 
     /* --- loop-carried scalars --- */
     uint64_t     sim_insns           = 0;
+    /* sim_insns at the moment the in-flight BB opened (bb_start_pc was
+     * assigned to an empty accumulator).  The commit site derives the
+     * budget-crossing block's attributed range from it: the block's room
+     * inside the wpdepth budget is depth - sim_at_block_start.  A block
+     * only ever OPENS with sim_insns < depth (the driver loop's guard),
+     * so the crossing block's room is at least 1. */
+    uint64_t     sim_at_block_start  = 0;
     bool         early_exit          = false;
     uint64_t     last_fault_pc       = UINT64_MAX;
     unsigned int repeated_fault_pc   = 0;
@@ -1049,6 +1059,45 @@ static void wp_commit_bb(WpWalkState &st, BBTemplate *cur,
                                                     bb_first_fault_idx);
                 wp_entry.branch_successor_pc    = commit_post_pc;
                 wp_entry.branch_successor_known = true;
+                /*
+                 * THE CHAIN NEVER ATTRIBUTES PAST THE wpdepth BUDGET.
+                 *
+                 * The driver deliberately finishes the in-flight block past
+                 * the budget (block atomicity: the loop runs while
+                 * sim_insns < depth OR the accumulator is non-empty), so
+                 * exactly one committed block — the last — can cross it.
+                 * Its published range is cut at the room the budget left
+                 * when the block opened: [0, depth - sim_at_block_start).
+                 * The wire's range-clamped staging then keeps every
+                 * per-instruction record, the terminal-branch singletons
+                 * included, off the excluded tail.  A block only opens with
+                 * sim_insns < depth, so the cut range is never empty.
+                 *
+                 * Fault blocks are exempt (§4.4: the excursion continues
+                 * past the fault insn and CST_FID_BB_FAULT_INSN must stay
+                 * addressable inside the range); a fault-bearing chain's
+                 * overshoot is the fault carve-out, and the acceptance
+                 * harness skips those chains.
+                 */
+                if (!wp_entry.fault &&
+                    st.sim_insns > (uint64_t)max_wrong_path_depth) {
+                    uint64_t room =
+                        (uint64_t)max_wrong_path_depth > st.sim_at_block_start
+                        ? (uint64_t)max_wrong_path_depth -
+                              st.sim_at_block_start
+                        : 0;
+                    if (room < wp_entry.n_insns_attributed) {
+                        uint32_t cut_off =
+                            wp_entry.n_insns_attributed - (uint32_t)room;
+                        wp_entry.n_insns_attributed = (uint32_t)room;
+                        /* The terminating branch sits outside the cut
+                         * range: its outcome is not this entry's to
+                         * publish. */
+                        wp_entry.branch_successor_known = false;
+                        g_stats.wp_budget_cut_blocks++;
+                        g_stats.wp_budget_cut_insns += cut_off;
+                    }
+                }
                 wp_chain.push_back(std::move(wp_entry));
             }
 
@@ -1523,6 +1572,7 @@ static void wp_walk_fragments(WpWalkState &st)
                  * fragment entry, instead of mis-attributing the
                  * second fragment's BB to the outer iter's pre_pc. */
                 bb_start_pc = cur->start_pc;
+                st.sim_at_block_start = st.sim_insns;
                 if (cur->symbol_name) {
                     bb_symbol_name = cur->symbol_name;
                 }
@@ -1875,6 +1925,7 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
 
         if (bb_pcs.empty()) {
             bb_start_pc = pre_pc;
+            st.sim_at_block_start = sim_insns;
         }
 
         WpStep ex = wp_exec_one_tb(st);

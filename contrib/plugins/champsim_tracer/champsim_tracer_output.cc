@@ -3710,11 +3710,19 @@ static void emit_body_record_payload(
             wp_rec.reg_snaps    = &wp->reg_snaps;
             wp_rec.branch_known = wp->branch_successor_known;
             wp_rec.branch_successor_pc = wp->branch_successor_pc;
-            /* The emission model feeds whole speculative blocks; a WP
-             * block's range is its full template until the model itself
-             * carries partial WP extents. */
+            /* A speculative block carries its OWN range.  Whole for every
+             * block the walker ran whole; cut at the wpdepth remainder for
+             * the chain's budget-crossing last block (WPBBEntry
+             * .n_insns_attributed — the walker stops attributing at the
+             * budget).  The range-clamped staging below keeps every
+             * per-instruction record, branch singletons included, off the
+             * excluded tail. */
             wp_rec.bb_start     = 0;
-            wp_rec.bb_stop      = wp->tmpl ? wp->tmpl->n_insns : 0;
+            {
+                uint32_t wp_n = wp->tmpl ? wp->tmpl->n_insns : 0;
+                wp_rec.bb_stop  = wp->n_insns_attributed < wp_n
+                    ? wp->n_insns_attributed : wp_n;
+            }
             wp_rec.bb_flags     = wp_flags;
             wp_rec.fault_insn   = wp->fault ? wp->fault_insn_index : 0;
             emit_one_bb_delta_with_base(&sub, st, wp_state, wp_base,

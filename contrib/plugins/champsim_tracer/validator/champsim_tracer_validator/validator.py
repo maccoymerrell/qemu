@@ -6689,25 +6689,39 @@ def _check_atomic_count(body_stats: dict,
     entry in the body stream (including prologue — body_stats
     aggregates everything, not just post-cp_start).
 
+    RANGE-SCOPED (§4.2a): the tally counts OBSERVATIONS, so each entry
+    contributes the atomics inside its declared [bb_start, bb_stop)
+    only.  An atomic outside an entry's range was not executed by that
+    stretch — a fault-split prefix stops before it (the continuation
+    carries it exactly once), and a budget-cut WP last block never
+    simulated it.  A full-template walk double-counts every split visit
+    of an atomic-bearing template and over-counts every cut that
+    excludes one (measured: riscv64 thread_test --system --smp 2,
+    static_walk = writer + 1 from one [0,3)-of-12 fault-split prefix
+    whose AMO sits at index 9).
+
     Any divergence means the writer's runtime aggregation disagrees
-    with what its own templates declare, which would be a tracer bug
-    (template_id flag-byte vs entry-time stats counter).
+    with what its own templates and ranges declare, which would be a
+    tracer bug (template_id flag-byte vs entry-time stats counter).
     """
     expected = 0
-    # Match the writer's BodyStats aggregation: walk *every* insn in
-    # every template touched by CP+WP entries (writer iterates the
-    # full template even when WP truncates after a fault).
-    def _count(tmpl_id: int) -> int:
+
+    def _count(tmpl_id: int, start, stop) -> int:
         t = templates_by_id.get(int(tmpl_id))
         if t is None:
             return 0
-        return sum(1 for ins in (t.get("insns") or [])
-                   if ins.get("is_atomic"))
+        ins = t.get("insns") or []
+        n = len(ins)
+        lo = 0 if start is None else max(0, int(start))
+        hi = n if stop is None else min(int(stop), n)
+        return sum(1 for i in range(lo, hi) if ins[i].get("is_atomic"))
 
     for e in all_entries:
-        expected += _count(int(e["template_id"]))
+        expected += _count(int(e["template_id"]),
+                           e.get("bb_start"), e.get("bb_stop"))
         for wp in e.get("wp_entries") or []:
-            expected += _count(int(wp["template_id"]))
+            expected += _count(int(wp["template_id"]),
+                               wp.get("bb_start"), wp.get("bb_stop"))
 
     actual = int(body_stats.get("atomic_count") or 0)
 

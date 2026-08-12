@@ -1419,6 +1419,21 @@ void PathBuilder::flush_final(bool walk_prev, bool prev_in_flight)
         if (have_extent && executed > 0) {
             user_clock_close_credit(cpu_index, prev_tb_, executed);
         }
+        /* The user-mode raw clock has the opposite problem: the inline
+         * per-TB add counted this slot's FULL translated length at its
+         * dispatch, while the flush publishes only @executed of it (0 for
+         * a slot with no walkable extent — the not-yet-run TB a deferred
+         * budget close skips, and the whole-TB unknown-extent drop).  The
+         * unpublished tail is billed-but-never-published; un-bill it so
+         * the segment's covered == wire identity holds at the user exit
+         * and budget closes too.  No-op in system mode. */
+        if (!prev_tb_->is_system) {
+            uint64_t published = (have_extent && executed > 0) ? executed : 0;
+            uint64_t billed = closedrop_tb_insns(prev_tb_);
+            if (billed > published) {
+                user_raw_clock_unbilled(billed - published);
+            }
+        }
     }
 
     if (prev_tb_ && have_extent && executed > 0) {

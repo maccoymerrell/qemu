@@ -1113,6 +1113,19 @@ struct WPBBEntry {
     uint64_t start_pc;
     std::vector<DynParam> dyn_params;  /* memops captured during this WP BB */
     uint32_t n_insns_executed;  /* BB length when complete; partial on fault */
+    /*
+     * Instructions of this block INSIDE the excursion's wpdepth budget —
+     * the block's published range is [0, n_insns_attributed).  Equal to
+     * n_insns_executed everywhere except the chain's LAST block when the
+     * walker ran it to its branch terminator past the budget (block
+     * atomicity keeps the simulation whole; the wire must not attribute
+     * past wpdepth, so the last block carries its own cut range).  Fault
+     * blocks keep their full extent (§4.4: the excursion continues past
+     * the fault insn, and CST_FID_BB_FAULT_INSN must stay addressable).
+     * The default (UINT32_MAX) reads as "whole block" at the staging
+     * site's clamp, so a construction site that never considers the
+     * budget publishes the full template extent, as before. */
+    uint32_t n_insns_attributed = UINT32_MAX;
     bool fault;
     bool translation_unavailable;
     /*

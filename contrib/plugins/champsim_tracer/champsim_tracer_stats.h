@@ -89,6 +89,12 @@ struct Stats {
      * budget.  Emitted as CST_BB_FLAG_SYNTHETIC_FAULT on the block. */
     uint64_t wp_synthetic_faults = 0;
     uint64_t wp_total_mem_accesses = 0;
+    /* Chains whose LAST block ran past the wpdepth budget (block
+     * atomicity finishes the in-flight block) and was published with its
+     * own cut range [0, remainder) so the chain attributes EXACTLY the
+     * budget; the insns row is what the cut kept off the wire. */
+    uint64_t wp_budget_cut_blocks = 0;
+    uint64_t wp_budget_cut_insns = 0;
 
     /* Correct-path memops observed by the per-thread mem callback.
      * Counted before the loads-vs-stores split, so it covers both. */
@@ -377,6 +383,34 @@ struct Stats {
      * outside this credit, which is what holds clock_minus_wire at 0. */
     uint64_t user_clock_close_credits = 0;
     uint64_t user_clock_close_credit_insns = 0;
+    /*
+     * USER-MODE EXACT-BUDGET WINDOW (billing at emit, §4.2a).  A finite
+     * user-mode icount/simpoint window bills EXACTLY its budget: the
+     * emission that crosses the remaining budget is published as the
+     * partial range [start, start + remainder) — the S18 clean break, the
+     * same stop rule the END-marker close applies — and anything after it
+     * is outside the window and not emitted.  The *_cut_insns /
+     * *_suppressed rows are instructions that RAN past the budget point
+     * and are therefore outside every published range; the raw user clock
+     * counted them at dispatch, so the segment-finish coverage subtracts
+     * them (user_raw_unbilled_insns) and BILLED == PUBLISHED holds at the
+     * user budget close too.  A REP fan-out parent is exempt from the cut
+     * (its iterations are indivisible on the wire); the overrun row makes
+     * that visible instead of silent.
+     */
+    uint64_t user_budget_final_partial = 0;
+    uint64_t user_budget_final_cut_insns = 0;
+    uint64_t user_budget_entries_suppressed = 0;
+    uint64_t user_budget_insns_suppressed = 0;
+    uint64_t user_budget_rep_overrun_insns = 0;
+    /* User-mode raw-clock instructions excluded from billing because no
+     * published range claims them: the exact-budget cut/suppression above,
+     * plus each close-flushed pending-seal slot's unpublished tail (the
+     * exit syscall dying mid-callback, the not-yet-run TB a deferred
+     * budget close skips).  Subtracted from `covered` at segment finish in
+     * user (raw-clock) mode — the user-mode twin of
+     * user_clock_close_credit's identity. */
+    uint64_t user_raw_unbilled_insns = 0;
     /* Templates minted for blocks the guest ENTERED AND DID NOT FINISH (see
      * TemplateStore::commit_partial_bb).  Keyed by extent, so repeated cuts
      * at the same point share one; a run where nothing is ever cut short

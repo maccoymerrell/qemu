@@ -1410,7 +1410,12 @@ These don't need a generator ``meta.json`` and run on any ``.cst``.
 
 ``atomic_count``
    The writer's aggregate ``atomic_count`` matches a static walk
-   of every CP+WP template's per-insn ``is_atomic`` field.
+   of every CP+WP entry's per-insn ``is_atomic`` field, scoped to
+   each entry's declared executed range (:doc:`format` §4.2a): the
+   tally counts observations, so a fault-split prefix that stops
+   before an atomic contributes nothing for it (the continuation
+   carries it exactly once) and a budget-cut WP last block never
+   counts the atomics past its cut.
 
 ``profile_consistency``
    Cross-validates the run-aggregated template profile block

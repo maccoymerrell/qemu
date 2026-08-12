@@ -3710,6 +3710,39 @@ static uint64_t g_seg_arch_insns = 0;
  * segment's finish line beside user_covered so the clock-vs-wire residual is
  * a number the run reports, not one a reader has to subtract. */
 static uint64_t g_seg_arch_user_insns = 0;
+/* User-mode (raw-clock) instructions of THIS segment that the inline
+ * icount counted at dispatch but that no published range claims — the
+ * exact-budget cut/suppression past a finite user window's stop, and each
+ * close-flushed pending-seal slot's unpublished tail (S18: the boundary
+ * instruction dies mid-callback / never ran; outside the range, therefore
+ * unbilled).  finish_trace_segment subtracts it from the raw `covered` so
+ * BILLED == PUBLISHED holds at the user exit and budget closes exactly as
+ * user_clock_close_credit makes it hold on the marker clock.  Mutated
+ * under exec_lock (emissions and closes both hold it). */
+static uint64_t g_seg_user_unbilled = 0;
+
+/*
+ * The user-mode (raw-clock) twin of user_clock_close_credit, with the
+ * opposite sign.  In user mode the window clock is the inline per-TB
+ * icount, which counts a TB's full translated length the moment the TB is
+ * ENTERED — so an instruction the close leaves unpublished (the exit
+ * syscall dying mid-callback, the un-run TB a deferred budget close
+ * skips, the exact-budget cut/suppression past a finite window's stop)
+ * has already been counted and must be UN-billed for BILLED == PUBLISHED
+ * to hold at the close.  Accumulated per segment; finish_trace_segment
+ * subtracts it from the raw `covered`.  A no-op in system mode, whose
+ * window clocks bill by retirement folds and settle through
+ * user_clock_close_credit.
+ */
+void user_raw_clock_unbilled(uint64_t insns)
+{
+    if (g_system_mode || insns == 0) {
+        return;
+    }
+    g_seg_user_unbilled += insns;
+    g_stats.user_raw_unbilled_insns += insns;
+}
+
 /* UINT64_MAX sentinel = warmup boundary has not been crossed
  * (segment cut short, or warmup_insns==0 and no entry emitted
  * yet).  0 is a legitimate value (warmup_insns==0 → captured at
@@ -4167,6 +4200,7 @@ static void start_trace_segment(const char *label,
         std::memory_order_relaxed);
     g_seg_arch_insns = 0;
     g_seg_arch_user_insns = 0;
+    g_seg_user_unbilled = 0;
     g_seg_warmup_end_trace_insns = UINT64_MAX;
     g_seg_warmup_crossed = false;
     g_seg_wm_deferred_records = 0;
@@ -4447,6 +4481,110 @@ void emit_body_entry(BodyStreamState *out_stream,
                      uint32_t bb_stop,
                      bool thread_end)
 {
+    /*
+     * USER-MODE EXACT-BUDGET WINDOW (S18 clean break at the budget).
+     *
+     * A finite user-mode icount/simpoint window bills EXACTLY its
+     * budget: billing advances at emit by each entry's range width, so
+     * the emission that would carry the wire past the remaining budget
+     * is published as the partial range [start, start + remainder) — the
+     * same stop rule the END-marker close applies — and any emission
+     * after the budget is exhausted is outside the window and not
+     * emitted at all.  The excluded instructions RAN (the deferred close
+     * lets the crossing block execute and seal so the published prefix
+     * is fully observed); they are outside every published range, so
+     * they are un-billed from the raw clock (user_raw_clock_unbilled)
+     * and the covered == wire identity holds at the budget close.
+     *
+     * The cut entry's terminating branch sits outside its range: the
+     * successor is not this entry's to publish (branch_successor_known
+     * false — the fault-split prefix precedent), and a wrong-path chain
+     * hangs off a resolved branch, so it is dropped with it.  The entry
+     * that exhausts the budget is by construction the segment's last
+     * published entry of its context and carries CST_BB_FLAG_THREAD_END
+     * whether or not the seal-stamp choreography saw the close coming.
+     *
+     * A REP fan-out parent is exempt (its iterations are indivisible on
+     * the wire; the fan-out site counts the overrun instead), and the
+     * whole block is skipped in system mode, where the marker clock
+     * bills by retirement folds and budget closes may overshoot by
+     * design.
+     */
+    if (!g_system_mode && bb_tmpl && !bb_tmpl->is_system &&
+        g_trace_segments.is_active() &&
+        g_trace_segments.window_stop() != UINT64_MAX) {
+        const uint64_t budget = g_trace_segments.window_stop() -
+                                g_trace_segments.window_start();
+        const uint64_t done = g_seg_arch_user_insns;
+        const uint64_t remaining = budget > done ? budget - done : 0;
+        const uint32_t n = bb_tmpl->n_insns;
+        uint32_t stop_c = bb_stop > n ? n : bb_stop;
+        uint32_t start_c = bb_start > stop_c ? stop_c : bb_start;
+        const uint32_t width = stop_c - start_c;
+        const bool rep_parent = n > 0 && stop_c == n &&
+            bb_tmpl->insn_fields[n - 1].rep_memops_per_iter > 0 &&
+            g_template_store.seg_deref(bb_tmpl->rep_subtmpl) != nullptr;
+        if (width > 0) {
+            if (remaining == 0) {
+                /* Past the budget: outside the window, not emitted (a
+                 * REP parent too — suppressing it WHOLE splits no
+                 * iteration, so the fan-out exemption does not apply
+                 * here).  The block's observations are of instructions
+                 * no published range claims — discard them so they
+                 * cannot leak onto a later emission's positional
+                 * sinks. */
+                g_stats.user_budget_entries_suppressed++;
+                g_stats.user_budget_insns_suppressed += width;
+                user_raw_clock_unbilled(width);
+                g_mem_recorder.clear_cp(cpu_index);
+                pending_reg_snaps(cpu_index).clear();
+                cp_chain_snap_mark(cpu_index) = 0;
+                return;
+            }
+            if (width > remaining && !rep_parent) {
+                const uint32_t new_stop = start_c + (uint32_t)remaining;
+                /* Drop the tail's dst snaps BEFORE the positional
+                 * backstop below sizes against the cut range — the
+                 * surplus is provably the excluded tail's, at the BACK
+                 * of the sink, so trim there (the backstop's front-trim
+                 * arm exists for leaked prefixes, a different shape).
+                 * Only when the sink holds exactly the full range's
+                 * snaps; any other occupancy is left for the backstop to
+                 * name. */
+                if (g_features.reg_data) {
+                    uint64_t exp_full = 0, exp_cut = 0;
+                    for (uint32_t i = start_c; i < stop_c; i++) {
+                        exp_full += bb_tmpl->insn_fields[i].n_dst_regs;
+                        if (i < new_stop) {
+                            exp_cut += bb_tmpl->insn_fields[i].n_dst_regs;
+                        }
+                    }
+                    std::vector<RegSnap> &pend = pending_reg_snaps(cpu_index);
+                    if (pend.size() == exp_full && exp_cut < exp_full) {
+                        pend.resize(exp_cut);
+                    }
+                }
+                g_stats.user_budget_final_partial++;
+                g_stats.user_budget_final_cut_insns += width - remaining;
+                user_raw_clock_unbilled(width - remaining);
+                wp_entries.clear();
+                wp_first_tb_unavail = false;
+                branch_successor_known = false;
+                bb_stop = new_stop;
+                bb_start = start_c;
+                thread_end = true;
+            } else if (width == remaining && !rep_parent) {
+                /* This entry exhausts the budget exactly at a block
+                 * boundary: it is the last published entry.  (A REP
+                 * parent is not stamped — its fan-out sub-entries follow
+                 * in the same context, and a THREAD_END that is not the
+                 * context's last entry is the lie the oracle rejects;
+                 * the fan-out site's overrun row names the excess.) */
+                thread_end = true;
+            }
+        }
+    }
+
     /* warmup→simulation boundary capture (header §2.13,
      * warmup_end_trace_insn_idx): the trace-instruction index of the
      * first simulation-phase record.  Snapshot g_seg_arch_insns BEFORE
@@ -5267,6 +5405,22 @@ void emit_body_entry(BodyStreamState *out_stream,
                      * says so, instead of hiding inside a slack term. */
                     g_stats.wire_user_rep_extra_insns +=
                         (uint64_t)(n_iter - 1);
+                    /* Exact-budget tripwire: a fan-out parent is exempt
+                     * from the S18 budget cut (its iterations are
+                     * indivisible on the wire), so a finite user window
+                     * whose budget lands inside a REP overruns here.
+                     * Named, never silent. */
+                    if (!g_system_mode &&
+                        g_trace_segments.window_stop() != UINT64_MAX) {
+                        uint64_t bud = g_trace_segments.window_stop() -
+                                       g_trace_segments.window_start();
+                        if (g_seg_arch_user_insns > bud) {
+                            uint64_t over = g_seg_arch_user_insns - bud;
+                            if (over > g_stats.user_budget_rep_overrun_insns) {
+                                g_stats.user_budget_rep_overrun_insns = over;
+                            }
+                        }
+                    }
                 }
                 /* Iter 2..N: rep_subtmpl, mpi memops each, insn_index
                  * remapped to 0 (sub has exactly one insn).  One reused
@@ -5927,6 +6081,18 @@ static void finish_trace_segment(bool prev_executed = true,
         bool user_clock = marker_user_clock();
         uint64_t covered = user_clock ? g_user_icount
             : (g_host_icount > lo ? g_host_icount - lo : 0);
+        /* User (raw-clock) mode: BILLED == PUBLISHED at the close.  The
+         * inline per-TB add counts instructions at dispatch, including
+         * ones no published range claims — the exit syscall dying
+         * mid-callback in this very close, the not-yet-run TB a deferred
+         * budget close skips, the exact-budget cut past a finite
+         * window's stop.  Those were un-billed where the exclusion
+         * happened (user_raw_clock_unbilled); settle the bill here so
+         * clock_minus_wire reads the identity, not the S18 exclusions. */
+        if (!user_clock) {
+            covered = covered > g_seg_user_unbilled
+                ? covered - g_seg_user_unbilled : 0;
+        }
         /* An end-marker close is the workload finishing under budget by
          * design ("budget or program end"), not an underrun. */
         const char *flag = g_seg_close_reason ? g_seg_close_reason

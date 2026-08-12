@@ -1218,8 +1218,12 @@ segments, or ``stop - start`` for non-simpoint runs with an explicit
 stop.  A value of zero means "unbounded" (non-simpoint runs with no
 explicit stop trace until the program exits, so the targeted total is
 not known at header-write time).  These three values describe the
-*targeted* window; the actually-emitted record count may overshoot by
-a single TB due to translation-block granularity.  ``simpoint_weight``
+*targeted* window.  A user-mode segment with an explicit stop bills at
+emit and cuts its final entry's range so the emitted user instruction
+count equals the target exactly (the one carve-out is a self-loop
+fan-out instruction, whose iterations are indivisible on the wire —
+§4.2a); a system-mode budget close may overshoot by the remainder of
+the block that carried the clock across the stop.  ``simpoint_weight``
 is the fraction of whole-program execution this segment represents
 (``0.0`` for a non-simpoint segment); a consumer rebuilds a
 whole-program metric as the weighted sum over the per-simpoint
@@ -1833,17 +1837,27 @@ so; folding the marked index into ``bb_stop`` would assert a
 termination the format explicitly denies.  The two indices are
 independent and a block routinely carries both.
 
+A chain never *attributes* past its ``wpdepth`` budget.  The walker
+finishes the block in flight when the budget runs out — a speculative
+block is simulated whole to its branch terminator — but the last
+block's record then carries its own executed range, cut at exactly the
+instructions that fit: the chain's ranges sum to precisely ``wpdepth``,
+and the cut block's terminating branch sits outside its range, so no
+branch-outcome records ride it.  A fault-marked block is exempt from
+the cut (``CST_FID_BB_FAULT_INSN`` must stay addressable inside the
+range, and the fault carve-out already excludes such chains from
+exactness claims).
+
 An excursion can nonetheless end short of its ``wpdepth`` budget with
 nothing on the wire to say so.  Alongside the skip-and-continue path
 the tracer keeps containment bails — a delay-slot branch whose slot
 never landed, a fall-through that is itself an already-poisoned
 target, and a forward-progress guard that trips when the same PC
 re-faults sixteen times — each of which ends the excursion at the last
-sealed block.  None of them is signalled.  A consumer cannot
-distinguish a chain that spent its full ``wpdepth`` budget from one
-that hit a bail, except by comparing the chain's instruction count
-against the ``wpdepth`` recorded in the header's ``command`` string
-(§3).
+sealed block.  None of them is signalled.  A chain whose ranges sum to
+exactly the ``wpdepth`` recorded in the header's ``command`` string
+(§3) spent its budget; a shorter fault-free chain hit a bail, and that
+comparison is the only way to tell.
 
 The unfetchable first target that
 ``CST_BB_FLAG_WP_FIRST_TARGET_UNAVAIL`` names arises for the same
@@ -2490,12 +2504,14 @@ register delta without checking whether the window ended inside it.
 Two boundaries of that guarantee are worth stating.  It is carried by the
 correct path's architectural iteration count, so it covers the families
 that publish one — on the wrong path the question does not arise, because
-speculation single-steps and never chunks.  And the window clock reported
-at close (the ``covered=`` figure on the finishing line) is a clock
-reading, not a measure of what was written: it includes the block whose
-execution carried the clock past the budget, which the close then does
-not emit.  The trace's own instruction count is the authority for what
-the window contains.
+speculation single-steps and never chunks.  And it is the one licensed
+way a user-mode window with an explicit stop exceeds its budget: outside
+a fan-out instruction the close cuts the crossing entry's range and
+bills exactly the budget, and the ``covered=`` figure on the finishing
+line is settled to the published count (instructions the clock counted
+that no emitted range claims are un-billed at the close), so
+``clock_minus_wire`` reads zero there too.  The trace's own instruction
+count remains the authority for what the window contains.
 
 ::
 

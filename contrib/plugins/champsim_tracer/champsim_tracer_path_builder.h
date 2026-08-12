@@ -276,6 +276,14 @@ void user_clock_fault_recredit(unsigned int cpu_index, uint64_t insns);
 void user_clock_close_credit(unsigned int cpu_index, const BBTemplate *head,
                              uint64_t published);
 
+/* The user-mode (raw-clock) twin of the credit above, opposite sign:
+ * un-bill instructions the inline per-TB icount counted at dispatch that
+ * no published range claims (a close-flushed slot's unpublished tail, the
+ * exact-budget cut past a finite user window's stop).  Subtracted from
+ * the raw `covered` at segment finish; a no-op in system mode.  See the
+ * definition in champsim_tracer.cc. */
+void user_raw_clock_unbilled(uint64_t insns);
+
 /* True when the deferred budget/simpoint close will try to take at this
  * step's end (pending + armed + segment active) AND no peer builder holds
  * same-context close work whose flush would emit this context's true

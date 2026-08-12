@@ -6688,6 +6688,12 @@ static abi_long do_prctl(CPUArchState *env, abi_long option, abi_long arg2,
 
 #define NEW_STACK_SIZE 0x40000
 
+/*
+ * Set once the host C library has told us NEW_STACK_SIZE is too small for it
+ * to place a thread in; from then on guest threads take the library's own
+ * default stack.  Read and written under clone_lock.
+ */
+static bool clone_stack_default;
 
 static pthread_mutex_t clone_lock = PTHREAD_MUTEX_INITIALIZER;
 typedef struct {
@@ -6826,7 +6832,9 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
         }
 
         ret = pthread_attr_init(&attr);
-        ret = pthread_attr_setstacksize(&attr, NEW_STACK_SIZE);
+        if (!clone_stack_default) {
+            ret = pthread_attr_setstacksize(&attr, NEW_STACK_SIZE);
+        }
         ret = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
         /* It is not safe to deliver signals until the child has finished
            initializing, so temporarily block all signals.  */
@@ -6835,6 +6843,26 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
         cpu->random_seed = qemu_guest_random_seed_thread_part1();
 
         ret = pthread_create(&info.thread, &attr, clone_func, &info);
+        if (ret == EINVAL && !clone_stack_default) {
+            /*
+             * The host C library carves the thread's static TLS block out of
+             * the stack the attribute names, so NEW_STACK_SIZE is only ever
+             * large enough by luck: a QEMU binary whose own static TLS
+             * exceeds it is refused here, and refused again for every guest
+             * thread the program will ever create.  The library's default
+             * stack is sized by the library that has to fit inside it, so
+             * give up the economy rather than the thread -- once, for the
+             * process, since nothing about the answer is per-thread.
+             */
+            warn_report_once("host C library refused a %d byte guest thread "
+                             "stack; using its default stack size instead",
+                             NEW_STACK_SIZE);
+            clone_stack_default = true;
+            pthread_attr_destroy(&attr);
+            pthread_attr_init(&attr);
+            pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+            ret = pthread_create(&info.thread, &attr, clone_func, &info);
+        }
         /* TODO: Free new CPU state if thread creation failed.  */
 
         sigprocmask(SIG_SETMASK, &info.sigmask, NULL);

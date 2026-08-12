@@ -1978,6 +1978,40 @@ Machine-shutdown notification
    that terminates by construction whatever the target does.  See
    :doc:`quickstart`.
 
+Guest threads in user mode
+--------------------------
+
+``do_fork`` (``linux-user/syscall.c``)
+
+   A guest thread is a host thread, and ``do_fork()`` asks for it with
+   an explicit ``NEW_STACK_SIZE`` of 256 KiB rather than the host C
+   library's default, because a guest thread's host stack holds only
+   QEMU's own interpreter frames.  That economy is conditional on
+   something QEMU does not control: glibc places a thread's **static
+   TLS block inside the stack allocation the attribute names**, and
+   refuses ``pthread_create`` with ``EINVAL`` when what is left over
+   falls below its minimum.  A QEMU binary whose static TLS approaches
+   256 KiB therefore fails to create *any* guest thread, and fails the
+   same way for every thread the guest will ever ask for — the guest
+   sees a ``clone`` that cannot succeed.
+
+   This QEMU's static TLS is 0x63bc8 bytes, most of it the
+   per-translation dataflow scratch in ``accel/tcg/insn-dataflow.c``
+   (``df_out`` alone is 0x5e000), so the condition is not hypothetical
+   here: it is the normal state of the tree.
+
+   The size is therefore a preference, not a requirement.  A refusal
+   with ``EINVAL`` — the only error the two attributes QEMU sets can
+   produce — drops the explicit size, warns once naming the reason, and
+   creates the thread on the library's default stack, which is sized by
+   the library that has to fit inside it.  The latch is process-wide
+   and read under ``clone_lock``: nothing about the answer is
+   per-thread, so the failed attempt is paid once.
+
+   Sizing the request instead would mean knowing the static TLS
+   requirement, which glibc exposes only as a ``GLIBC_PRIVATE`` symbol,
+   so asking and being told no is the portable form of the question.
+
 Build wiring
 ------------
 

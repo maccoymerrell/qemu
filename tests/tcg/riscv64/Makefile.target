@@ -18,3 +18,25 @@ TESTS += test-fcvtmod
 test-fcvtmod: CFLAGS += -march=rv64imafdc
 test-fcvtmod: LDFLAGS += -static
 run-test-fcvtmod: QEMU_OPTS += -cpu rv64,d=true,zfa=true
+
+# A host fault on a guest code read is a guest signal.  Zcmt's cm.jalt is
+# the code read whose address the guest chooses; D is off because
+# trans_c_fsd() otherwise claims the same encoding, and that rules out a
+# lp64d libc, so the tests are freestanding.
+SIGBUS_CODE_FETCH_CFLAGS = -march=rv64imac_zicsr -mabi=lp64
+
+TESTS += test-sigbus-code-fetch
+test-sigbus-code-fetch: CFLAGS += $(SIGBUS_CODE_FETCH_CFLAGS)
+test-sigbus-code-fetch: LDFLAGS = -nostdlib -static
+run-test-sigbus-code-fetch: QEMU_OPTS += -cpu rv64,d=false,zcmt=true
+
+# The wrong-path half of the same rule needs a plugin driving a
+# speculative excursion, which is what the ChampSim Tracer does.
+ifeq ($(CONFIG_PLUGIN),y)
+CHAMPSIM_TRACER = ../../../contrib/plugins/libchampsim_tracer.so
+TESTS += test-sigbus-code-fetch-wp
+test-sigbus-code-fetch-wp: CFLAGS += $(SIGBUS_CODE_FETCH_CFLAGS)
+test-sigbus-code-fetch-wp: LDFLAGS = -nostdlib -static
+run-test-sigbus-code-fetch-wp: QEMU_OPTS += -cpu rv64,d=false,zcmt=true \
+	-plugin $(CHAMPSIM_TRACER)$(COMMA)outfile=sigbus-code-fetch-wp$(COMMA)wpdepth=64
+endif

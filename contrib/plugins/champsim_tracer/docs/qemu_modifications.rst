@@ -1008,6 +1008,38 @@ speculative path.
    plugin observes the speculative fault via the ``tb_ok=false``
    return from ``cpu_plugin_exec_tb`` instead.
 
+``linux-user/signal.c`` — ``host_sigbus_handler``
+
+   A host ``SIGBUS`` raised while QEMU is reading guest *code* is a
+   fault the guest is entitled to take, not a QEMU bug.
+   ``adjust_signal_pc()`` reports ``MMU_INST_FETCH`` for the
+   ``cpu_ld*_code()`` case, ``helper_retaddr == 1``, and clears the pc,
+   which is how it says the unwinder must not run because the guest pc
+   already names the right instruction.  A cleared pc is never inside
+   the code gen buffer, so the "not on behalf of the guest, therefore a
+   host bug" test that guards ``die_from_signal()`` is asked only for
+   the other access types — the exemption ``host_sigsegv_handler`` next
+   door already carries.  The code read whose address a guest chooses
+   outright is RISC-V Zcmt's ``cm.jalt``, which fetches its
+   jump-vector-table entry through ``cpu_ldq_code()`` at an address the
+   unprivileged ``jvt`` CSR names: aimed at a page of a file mapping
+   lying past the end of that file, it raises ``BUS_ADRERR`` on the
+   host, and the guest's own ``SIGBUS`` handler is what must run.
+   ``tests/tcg/riscv64/test-sigbus-code-fetch.c`` is that guest.
+
+   Every ``si_code`` other than ``BUS_ADRALN`` returns to
+   ``host_signal_handler``, which queues a guest signal, and a
+   wrong-path excursion may not leave one queued: the excursion is
+   discarded, the signal is not, and it is delivered afterwards on the
+   correct path, where nothing ever faulted.  Under
+   ``plugin_spec_mode`` the handler therefore leaves by the route
+   ``cpu_loop_exit_sigbus()`` takes for ``BUS_ADRALN``, and the
+   wrong-path simulator sees an excursion that ended rather than a
+   fault the guest took.
+   ``tests/tcg/riscv64/test-sigbus-code-fetch-wp.c`` puts the same
+   ``cm.jalt`` on the not-taken side of a taken branch, where only the
+   wrong path reaches it.
+
 ``target/arm/tcg/helper-a64.c``, ``target/i386/tcg/access.c``,
 ``target/ppc/mem_helper.c``
 

@@ -13,7 +13,8 @@ Wire format
    single: BODY_TAG_REGFILE
    single: FieldStateTable
    single: encoding map
-   single: trailer
+   single: BLOCK_POS
+   single: block-level fields
    single: header
    single: templates section
 
@@ -136,13 +137,17 @@ Forward compatibility (normative)
   bits they recognise; an unrecognised bit being set is not by
   itself an error.
 * **Field-delta records are self-delimiting and skippable.**  Each
-  body field-delta record is `ipos_delta:ULEB, fid:ULEB,
-  delta:SLEB_WIDE`` (plus, only for ``CST_FID_EXTENDED`, a trailing
+  body field-delta record is ``ipos_delta:ULEB, fid:ULEB,
+  delta:SLEB_WIDE`` (plus, only for ``CST_FID_EXTENDED``, a trailing
   ``ext_payload:ULEB``).  A reader that does not recognise ``fid`` MUST
   still consume the whole record — the LEB framing fixes its length
   unambiguously — and continue.  This is the format's per-record
-  extension point: new per-instruction observations are added as
-  new field-IDs that older readers skip.
+  extension point: new observations, per-instruction or block-level
+  (§5.7), are added as new field-IDs that older readers skip.  The
+  *position* space is not open the same way: a section defines only
+  the positions its referenced template has — its instructions plus
+  the one block position above them — and a record addressed past
+  those is malformed however unrecognised its ``fid`` (Step 6.7).
 * **The body-tag space is closed.**  Top-level ``BODY_TAG_*`` records
   are not self-delimiting without knowing the tag, so a reader MUST
   reject an unknown ``body_tag``.  A new record *kind* is therefore
@@ -462,7 +467,7 @@ self-describing.  Decode it into a fresh ``encoding_maps`` table.
 Step 4: Parse the templates section
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The templates payload from Step 2.13 runs to end-of-member.
+The templates payload from Step 2.14 runs to end-of-member.
 Decode by repeated outer-section unwrapping.
 
 ::
@@ -867,24 +872,39 @@ Loop until a ``BODY_TAG_END`` is seen:
         ; len:ULEB; the steps below decode payload[len].  `len` (bytes)
         ; and `n_records` (count) are independent — an empty section is
         ; len=1 / n_records=0 (the single byte IS the n_records=0 ULEB).
+          N = num_insns of the template THIS section describes:
+              the ENTRY's cur_template_id (Step 6.4), the chain
+              block's wp template (Step 6.8), or the preceding
+              ENTRY's template for an IFRAME (Step 6.5).  Never any
+              other template's num_insns — revisions at one start_pc
+              need not agree in shape (Step 0), so N is a per-section
+              quantity, resolved from the referenced template_id.
           n_records : ULEB
           ipos : u32 = 0                  ; reset at section start; not
                                           ; carried across sections
-          repeat n_records times: one field-delta record per Step 6.9.
+          repeat n_records times: one field-delta record per Step 6.9;
+            after the record's ipos_delta is applied, branch on ipos:
+              ipos <  N   → the record addresses instruction ipos of
+                            the referenced template
+              ipos == N   → the record addresses the BLOCK itself (the
+                            reserved position, BLOCK_POS)
+              ipos >  N   → malformed; reject the trace.  Do NOT skip
+                            the record and continue: no position above
+                            BLOCK_POS exists in this epoch, and a
+                            cursor past it means the decode has
+                            desynchronised or the writer is defective.
         After all records are consumed the section payload must be
         empty.
-        ; A record's ipos addresses an instruction of the section's
-        ; template when ipos < num_insns, and addresses the BLOCK
-        ; itself at the one reserved position ipos == num_insns
-        ; (BLOCK_POS).  Block-level field-IDs are numerically above
-        ; every per-instruction field-ID and BLOCK_POS is above every
-        ; instruction position, so the block's records sort last within
-        ; the section for free and a decoder needs no separate pass to
-        ; find them — only to have applied the whole section before it
-        ; materialises anything (§5.7).  Reject a record whose
-        ; ipos > num_insns, or whose ipos == num_insns carries a
-        ; per-instruction field-ID, or whose ipos < num_insns carries a
-        ; block-level one.
+        ; The dispatch above is closed — every record addresses either
+        ; one instruction or the block, decided by ipos alone.  A
+        ; decoder looping "per instruction" must route ipos == N to
+        ; the block, never treat it as an out-of-range instruction
+        ; index.  Records arrive in non-descending (ipos, fid) order
+        ; (§5), and BLOCK_POS is the section's highest position, so
+        ; the block's records are always the section's last: apply the
+        ; WHOLE section before interpreting the entry (§5.7) — the
+        ; executed range a block record declares arrives after the
+        ; per-instruction records it scopes.
    6.8  WP chain section payload:
           num_wp : ULEB
           repeat num_wp times:
@@ -908,6 +928,17 @@ Loop until a ``BODY_TAG_END`` is seen:
           Update the per-template field-state cell at (template_id,
           ipos, fid) by adding the decoded delta modulo 2^512.  See
           Reference §5 for the field-state semantics.
+          Then check the resolved field name against the record's
+          position (Step 6.7's dispatch):
+            a block-level name (the CST_FID_BB_* family, §5.7) at an
+            instruction position (ipos < N), or a per-instruction
+            name at BLOCK_POS (ipos == N), is malformed — reject.
+            A name the decoder does not implement is exempt: the
+            record was already consumed whole (the LEB framing fixes
+            its length), so skip it and continue at either position —
+            that is the additive-evolution path (Forward
+            compatibility, above).  The reject applies to names the
+            decoder KNOWS, found where they cannot occur.
 
 All memops are addressed through the slotted families
 (``LOAD_ADDR[0..511]`` / ``STORE_ADDR[0..511]`` and their ``DATA``
@@ -1586,7 +1617,15 @@ guest ran them in.  Nothing is deferred, reassembled, or placed
 retrospectively, and a consumer needs no rule to detect or undo a
 reordering.
 
-Normative consequences of a declared range:
+Normative consequences of a declared range.  The general rule is that
+an entry observes exactly the instructions inside its range: a writer
+MUST NOT emit a per-instruction record — of any field family — at a
+position outside ``[bb_start, bb_stop)``, and a consumer materialises
+nothing for such a position (§5.7 gives the decode mechanics for a
+defective record that carries one anyway).  The block's own records at
+``BLOCK_POS`` are outside every instruction range by construction and
+are always legal; the range scopes instruction positions only.  The
+consequences family by family:
 
 * A memop record MUST NOT appear at an ``ins_pos`` outside
   ``[bb_start, bb_stop)``, and a consumer MUST NOT materialise memops
@@ -1804,9 +1843,11 @@ The IFRAME inherits the ``template_id`` of the preceding ENTRY (no
 ``template_id_delta`` is encoded). Inside, every field-delta record is
 encoded against ``template_default`` rather than against the persistent
 overlay state, so the decoded value is absolute — block-level records
-included, so a partial ENTRY's IFRAME states ``bb_start`` and
-``bb_stop`` absolutely and an ENTRY that ran its block whole emits
-neither (both already equal their defaults).  The reconstructed range
+included: the whole ``BLOCK_POS`` row is part of what an IFRAME
+reproduces, so a partial ENTRY's IFRAME states ``bb_start`` and
+``bb_stop`` absolutely, a flagged one re-states its flags and depth,
+and an ENTRY that ran its block whole emits neither range record (both
+already equal their defaults).  The reconstructed range
 is part of what must match, and it bounds what the IFRAME's own
 register and memop reconstruction covers, exactly as it bounds the
 ENTRY's.  When the CP-side
@@ -1881,16 +1922,26 @@ carries the block-level fields of §5.7 and nothing else.  No
 instruction occupies it, so ``(template_id, BLOCK_POS, field_id)`` is
 an ordinary cell in the same key space with the same lifetime and the
 same overlay rules — the block dictionary is the instruction
-dictionary, addressed one position further along.
+dictionary, addressed one position further along.  ``num_insns`` here
+is always the *referenced template's own*: ``BLOCK_POS`` is a
+per-template position, not a constant of the format, and a section is
+sized from the template the owning record names — never from another
+revision at the same ``start_pc`` (§5.7, Step 0).
 
-Records are emitted in non-descending ``(ipos, fid)`` order. When two
-records describe the same instruction, the later record has
-``ipos_delta = 0``.  Because ``BLOCK_POS`` is above every instruction
-position, a section's block-level records are its last, which costs
-one ``ipos_delta`` and requires no ordering rule of its own; a decoder
-that applies the whole section before materialising anything (the
-two-pass shape the delta model already requires) has the range in hand
-before it needs it.
+Writers MUST emit records in non-descending ``(ipos, fid)`` order.
+When two records describe the same position, the later record has
+``ipos_delta = 0``.  Half of the rule is enforced by the encoding
+itself — ``ipos_delta`` is unsigned, so a descending position cannot
+be expressed — while the ``fid`` order within one position is the
+writer's duty alone.  Because ``BLOCK_POS`` is the highest position a
+section has, the sort places a section's block-level records last,
+after every per-instruction record, at the cost of one ``ipos_delta``
+and with no ordering rule of their own.  The consumer rule that
+follows is stated in §5.7: an entry's meaning is defined by the whole
+section, so a consumer MUST apply every record of a delta section
+before interpreting the entry — the executed range arrives last, after
+the per-instruction records it scopes, and the two-pass shape the
+delta model already requires has it in hand before it is needed.
 
 Every record is a scalar delta record:
 
@@ -1921,6 +1972,16 @@ Scalar delta records update persistent field state. State is keyed by
 
    decode:
      current = (baseline + delta) mod 2**512
+
+``template_default`` is a function of all three key components, and it
+is not always a constant.  For most families it is zero; for the
+``INSN_*`` metadata family it is the referenced template's own per-insn
+descriptor value; and for ``CST_FID_BB_STOP`` at ``BLOCK_POS`` it is
+the referenced template's own ``num_insns`` (§5.7) — a baseline that
+differs from template to template exactly as the metadata family's
+does.  A decoder that implements ``template_default`` as a lookup
+against the referenced template, rather than as a table of constants,
+covers all three cases with one rule.
 
 CP and WP each have their own overlay of ``(template_id, ins_pos, field_id)``
 → value, both persisting for the whole body stream. WP records lookup
@@ -2134,9 +2195,11 @@ IDs so the hot fields — slot counts, metaflags, and low-slot
 memops + destination snapshots — collectively occupy IDs ``< 128``
 and therefore emit as a single ULEB byte.  High-slot families,
 the cold instruction-metadata singletons and the block-level
-singletons fall into the 2-byte ULEB range (IDs 128..16383);
-the block-level ones sit above every per-instruction ID, which
-is what makes a section's block records sort last for free.  A future writer may
+singletons fall into the 2-byte ULEB range (IDs 128..16383).
+The block-level names' numeric placement is purely a byte-cost
+choice: a section's block records sort last because ``BLOCK_POS``
+is its highest *position* (§5), a structural fact that no ID
+assignment could change.  A future writer may
 re-shuffle within these constraints (e.g., promote a different
 hot field into the 1-byte range based on observed frequency)
 without bumping ``CST_MAGIC``; readers consume the per-trace
@@ -2776,8 +2839,8 @@ its successor is exactly predictable, and the fault marker it always
 carries (raising is how a syscall leaves speculative execution) does not
 excuse a mismatch.
 
-5.7 Block-Level Fields
-^^^^^^^^^^^^^^^^^^^^^^
+5.7 Block-Level Fields (BLOCK_POS)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 Some facts belong to the basic-block execution rather than to any one
 of its instructions: how much of the block ran, at what exception
@@ -2790,22 +2853,95 @@ of their own: a block with nothing to declare emits no record and pays
 no bytes, and a block with something to declare pays one record for
 it.
 
+**The position is the referenced template's own.**  ``BLOCK_POS`` is
+not a constant of the format; it is ``num_insns`` *of the template the
+section's owning record names*, so two templates of different lengths
+place their block cells at different positions, and the same numeric
+``ipos`` that is an instruction of one template is the block of
+another.  A reader therefore resolves ``BLOCK_POS`` per section, from
+the ``template_id`` actually referenced — the same rule that already
+governs every per-block structure, because revisions at one
+``start_pc`` need not agree in ``num_insns`` (Step 0, §6).  Sizing the
+position from any other template — a sibling revision, a hard-coded
+length, the previous entry's template — misreads a block record as an
+instruction record or the reverse.
+
+**The dispatch is closed.**  Within a section whose template has ``N``
+instructions, a record's position decides what it addresses, and the
+decision has exactly three outcomes: ``ipos < N`` addresses
+instruction ``ipos``; ``ipos == N`` addresses the block; ``ipos > N``
+is malformed, and a reader MUST reject the trace rather than skip the
+record — skipping is the licence for *unrecognised field names*
+(Forward compatibility), never for impossible positions, of which this
+epoch defines none above ``BLOCK_POS``.  A decoder built as a loop
+"over the instructions" must route ``ipos == N`` to the block rather
+than treat it as an out-of-range instruction index: ``BLOCK_POS`` is a
+position of the *section*, one past the end of the instruction array
+it also spans.
+
+**Names belong to positions.**  The five ``CST_FID_BB_*`` names in the
+table below are the complete block-level family of this epoch, and
+they are valid *only* at ``BLOCK_POS``.  Every other field family —
+the slotted memop and register families, ``N_LOADS`` / ``N_STORES``,
+``METAFLAGS``, the lane masks, the widths, the ``INSN_*`` metadata
+singletons, and the branch-outcome singletons — is per-instruction and
+valid *only* at instruction positions.  A recognised name found at the
+wrong kind of position is malformed and rejected (Step 6.9); an
+unrecognised name is consumed and skipped at either kind, which is how
+future observations — block-level as much as per-instruction — are
+added without a new epoch.  Note that membership follows the field's
+*family*, not the scope of the fact it states:
+``CST_FID_BRANCH_TAKEN`` / ``CST_FID_BRANCH_TARGET`` describe how the
+block exited, but they are per-instruction fields riding the
+terminating branch's own ``ins_pos`` (§5.6), and their appearance at
+``BLOCK_POS`` is exactly as malformed as a load address there.
+
 Every rule of §5 applies unchanged.  State is keyed
-``(template_id, BLOCK_POS, field_id)``; it **persists across entries**
-for the whole body stream, so a value repeated by the next execution
-of the same template costs zero bytes.  CP and WP keep separate
-overlays: a CP record writes the CP overlay, a WP record writes the WP
-overlay and resolves its baseline ``WP → CP → template default``, so a
-speculative block whose range or flags match the correct path's costs
-nothing to say so.  IFRAMEs encode block-level records against fresh
-overlays like every other field, making them absolute (§4.5).
+``(template_id, BLOCK_POS, field_id)``: a template's field-state table
+has ``num_insns + 1`` positions, and the last row is the block's.  The
+row **persists across entries** for the whole body stream exactly like
+the instruction rows, so a value repeated by the next execution of the
+same template costs zero bytes.  CP and WP keep separate overlays with
+the block row present in both: a CP record writes the CP overlay, a WP
+record writes the WP overlay and resolves its baseline
+``WP → CP → template default``, so a speculative block whose range or
+flags match the correct path's costs nothing to say so.  IFRAMEs
+encode block-level records against fresh overlays like every other
+field, making them absolute — the ``BLOCK_POS`` row is part of what an
+IFRAME reproduces (§4.5).
 
 Because state persists, **omission means "unchanged", never
 "absent"**.  A writer MUST emit a record whenever a block's value for
 one of these fields differs from that cell's current value — including
 the return to a default, such as a template that ran partially once
 and runs whole thereafter, or a wrong-path block that reported a
-synthetic fault last time and does not this time.
+synthetic fault last time and does not this time.  The duty is
+absolute because the failure is invisible: a cell the writer lets
+stick misreports every later execution of that template, and a reader
+has no way to tell a stuck value from a genuine repeat.
+
+**The whole section defines the entry.**  Records arrive in
+non-descending ``(ipos, fid)`` order (§5), and ``BLOCK_POS`` is the
+highest position a section has, so a block's records are always the
+section's last — the executed range arrives *after* the
+per-instruction records it scopes.  A consumer therefore MUST apply
+every record of a delta section before interpreting the entry: what a
+per-instruction record means — whether its position was executed at
+all — is not knowable until the section's tail has been read.  This
+costs nothing beyond the two-pass shape the delta model already
+requires (apply deltas, then materialise).
+
+**The range scopes instruction records.**  A writer emits
+per-instruction records only at positions inside the entry's declared
+``[bb_start, bb_stop)`` (§4.2a); the block's own records at
+``BLOCK_POS`` sit outside every instruction range by construction and
+are always legal.  A per-instruction record at an in-template position
+*outside* the declared range is a writer defect.  Its decode is
+nevertheless deterministic: Step 6.9 applies every record to its
+persistent cell uniformly — nothing about the cell update is
+conditioned on the range, which the decoder may not even hold yet —
+but the entry materialises nothing at that position, so the defective
+record contributes no observation.
 
 ::
 
@@ -2850,11 +2986,125 @@ block's synthetic-data fault, meaningful only when the same block's
 ``CST_FID_BB_FLAGS`` carries ``CST_BB_FLAG_SYNTHETIC_FAULT``.  It is
 deliberately not ``bb_stop``: the excursion continues past it (§4.4).
 
+Wrong-path blocks use the identical convention.  Each chain block's
+``wp_delta_section`` (Step 6.8) carries that block's own block-level
+records at *its own* ``BLOCK_POS`` — resolved from the chain block's
+``wp_template_id``, not the CP entry's — through the WP overlay's
+block row.  This is how a speculative block's partial execution
+reaches the wire at all: its range rides ``CST_FID_BB_START`` /
+``CST_FID_BB_STOP`` exactly as a correct-path block's does (§4.3), and
+its events ride ``CST_FID_BB_FLAGS`` / ``CST_FID_BB_FAULT_INSN``
+(§4.4).
+
 Two positions, one dictionary.  A decoder needs no second state table,
-no second record shape and no second pass — the block's cells sit one
-index past the block's instructions in the table it already keeps, and
-the only new obligation is to read the range before it materialises
-anything and to clamp what it materialises to that range.
+no second record shape and no second pass — the block's cells sit in
+the last of the ``num_insns + 1`` rows of the table it already keeps,
+one index past the block's instructions, and the only new obligations
+are to apply the whole section before it materialises anything and to
+clamp what it materialises to the declared range.
+
+Worked example: four emissions of one template
+""""""""""""""""""""""""""""""""""""""""""""""
+
+The bytes below follow §4.2a's running example — template ``T`` with
+``num_insns = 7``, so ``BLOCK_POS = 7`` — through four consecutive
+correct-path emissions: a run interrupted by a fault at instruction 3,
+its continuation, and two whole runs.  The template is warm (every
+cell shown has a prior observation), and instruction 1 performs one
+load whose address moved by 8 bytes before entry A and then holds
+still.  This trace's
+``field_id`` map assigns ``CST_FID_LOAD_ADDR0 = 8``,
+``CST_FID_BB_START = 300`` and ``CST_FID_BB_STOP = 301`` — illustrative
+values; a reader resolves the names through the map, never through
+these numbers.
+
+Entry A — the run before the fault, ``[0, 3)``.  One instruction
+record, then one block record:
+
+::
+
+   08                len = 8 (section framing, Step 6.4)
+   02                n_records = 2
+   01 08 08          ipos_delta=1 → ipos 1 (< 7: instruction record)
+                     fid  = 8      CST_FID_LOAD_ADDR0
+                     delta = SLEB(+8): the load moved 8 bytes
+   06 AD 02 7C       ipos_delta=6 → ipos 7 (== 7: BLOCK record)
+                     fid  = AD 02  ULEB(301) = CST_FID_BB_STOP
+                     delta = SLEB(-4): cell 7 (default) → 3
+
+   cells after:  bb_start = 0 (default, no record)   bb_stop = 3
+   declared range [0, 3)
+
+The interruption itself costs nothing further: no flag, no depth
+record — the shortened range *is* the statement.  ``BB_START`` needs
+no record because the run began at 0, the cell's value already.  The
+handler's blocks follow as ordinary entries of their own templates
+(each carrying its own ``CST_FID_BB_FAULT_DEPTH`` record at its own
+``BLOCK_POS`` when its depth first differs from its cell).
+
+Entry B — the continuation, ``[3, 7)``.  Nothing changed for
+instructions 3..6 (their cells all repeat), so the section is two
+block records and nothing else:
+
+::
+
+   09                len = 9
+   02                n_records = 2
+   07 AC 02 03       ipos_delta=7 → ipos 7 (BLOCK record)
+                     fid  = AC 02  ULEB(300) = CST_FID_BB_START
+                     delta = SLEB(+3): cell 0 → 3
+   00 AD 02 04       ipos_delta=0 → still ipos 7; fid 301 ≥ 300
+                     keeps the (ipos, fid) sort non-descending
+                     fid  = AD 02  ULEB(301) = CST_FID_BB_STOP
+                     delta = SLEB(+4): cell 3 → 7
+
+   cells after:  bb_start = 3   bb_stop = 7
+   declared range [3, 7)
+
+``BB_STOP``'s delta is ``+4``, not ``0``: the baseline is the *cell*
+(3, persisted from entry A), not the template default (7).  Entry B
+carries no record for the instruction-1 load — position 1 is outside
+``[3, 7)``, and an entry never emits observations outside its range
+(§4.2a).
+
+Entry C — the next invocation runs whole, ``[0, 7)``.  Returning to a
+default is a change like any other, but only for the cell that moved:
+
+::
+
+   05                len = 5
+   01                n_records = 1
+   07 AC 02 7D       ipos_delta=7 → ipos 7 (BLOCK record)
+                     fid  = AC 02  CST_FID_BB_START
+                     delta = SLEB(-3): cell 3 → 0
+
+   cells after:  bb_start = 0   bb_stop = 7
+   declared range [0, 7)
+
+``BB_STOP`` emits nothing — its cell already reads 7, which is this
+run's value.  Omitting the ``BB_START`` record instead would be the
+stuck-cell writer defect described above: the entry would decode as
+``[3, 7)``, a partial run that never happened.
+
+Entry D — another whole run, and this time nothing anywhere changed
+(the load repeated its held address, every cell reads this run's
+value).  The whole-block execution emits zero block records — and
+here, zero records at all:
+
+::
+
+   01                len = 1
+   00                n_records = 0
+
+   cells after:  bb_start = 0   bb_stop = 7   (both untouched)
+   declared range [0, 7)
+
+This is the empty case the design prices at nothing: a block with
+nothing to declare pays one byte of section framing, exactly what it
+paid before block-level fields existed.  In all four entries the range
+was read *after* the whole section was applied — in entry A the
+per-instruction record preceded the ``BB_STOP`` record that scoped it,
+which is the normal order, block records being always last.
 
 6. Templates Section
 ~~~~~~~~~~~~~~~~~~~~

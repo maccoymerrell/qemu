@@ -186,6 +186,16 @@ typedef uint64_t qemu_plugin_id_t;
  *   declines and the walk is cut at a depth set by host buffer occupancy.
  *   Without these the cut is indistinguishable, at the plugin, from the
  *   guest simply not having the code.
+ * - INCOMPATIBLE: qemu_plugin_vm_shutdown_cb_t gained a third argument,
+ *   @in_guest_insn.  A plugin built against versions 16-19 declares a
+ *   two-argument callback, and QEMU_PLUGIN_MIN_VERSION does not reject
+ *   it, so such a plugin is still loaded and its callback is still
+ *   called -- through a function pointer whose type no longer matches
+ *   its definition.  Every mainstream calling convention ignores the
+ *   extra argument, so this works in practice and the two arguments it
+ *   does read are correct; it is undefined behaviour all the same, and
+ *   a control-flow-integrity build (-fsanitize=cfi-icall) traps on it.
+ *   Rebuild the plugin against this header.
  */
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;

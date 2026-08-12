@@ -1651,6 +1651,18 @@ Machine-shutdown notification
    Adds ``qemu_plugin_register_vm_shutdown_cb()`` (plugin API version
    16): the machine is going down, close what you have open.
 
+   The callback's SIGNATURE changed at version 20, when
+   ``in_guest_insn`` was added below.  That is an incompatible change to
+   a type QEMU calls through, and ``QEMU_PLUGIN_MIN_VERSION`` is still
+   2, so a plugin built against versions 16-19 continues to load and
+   continues to have its two-argument callback called with three
+   arguments.  Every mainstream calling convention discards the extra
+   one, so it works and both arguments such a plugin reads are correct;
+   it is undefined behaviour all the same, and a
+   ``-fsanitize=cfi-icall`` build traps on it.  Rebuilding the plugin is
+   the whole of the fix, and the version history in
+   ``include/qemu/qemu-plugin.h`` says so at version 20.
+
    The existing ``qemu_plugin_register_atexit_cb()`` cannot serve this
    purpose in system emulation.  It fires from libc's ``atexit(3)``,
    which runs *after* ``qemu_cleanup()`` has stopped every vCPU and torn

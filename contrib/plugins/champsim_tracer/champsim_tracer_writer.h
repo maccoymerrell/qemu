@@ -53,4 +53,13 @@ void writer_finish(WriterCtx *w);
 void *sink_stall_watch_begin(const char *phase);
 void  sink_stall_watch_end(void *handle);
 
+/*
+ * Write @len bytes to a sink with no writer thread behind it -- the header
+ * member -- under the same stall watch and the same progress rule as the
+ * writer thread's own writes.  Returns the bytes written; a short return is
+ * the sink failing, not stalling.
+ */
+size_t sink_write_watched(FILE *f, const void *data, size_t len,
+                          const char *phase);
+
 #endif /* CHAMPSIM_TRACER_WRITER_H */

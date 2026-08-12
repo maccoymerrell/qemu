@@ -30,22 +30,35 @@
  * writer thread parks in fwrite() on a full pipe, the 64 MiB of chunks fill,
  * and the producer -- a vCPU thread -- parks in cq_pop() waiting for a free
  * chunk with the guest frozen mid-instruction.  At the close the same stall
- * parks writer_finish() in pthread_join().  None of that needs a broken
- * compressor to happen: a full output filesystem, a stopped process, or a
- * command that never reads its stdin all produce it, and it used to produce
- * it in total silence, with no bound and nothing on stderr, for as long as
- * the operator was willing to wait.
+ * parks writer_finish() in pthread_join().  A process that stops reading its
+ * stdin -- stopped, descheduled, deadlocked, or simply a command that never
+ * reads -- produces all of it, and it used to produce it in total silence,
+ * with no bound and nothing on stderr, for as long as the operator was
+ * willing to wait.  (A full output FILESYSTEM does NOT: write returns ENOSPC
+ * rather than blocking, the compressor exits with an error, and the writer
+ * takes a short write on the broken pipe.  Measured: zstd exits 70 on the
+ * first full write.  The two failures do not look alike and the report must
+ * not say they do.)
  *
- * So every wait on the sink is now watched, and what is watched is
- * PROGRESS, not elapsed time: bytes_out counts what the sink has actually
- * taken, and a wait is only called stalled when that number has not moved
- * for the whole interval.  A slow compressor is never accused of anything,
- * however long it takes.  A stalled one is named on stderr, with the phase,
- * the seconds, and the byte count, and named again every interval so the
- * message cannot be lost in scrollback.  CST_SINK_STALL_SECS sets the
- * interval (default 60, 0 disables the report); CST_SINK_STALL_ABORT_SECS
- * is off unless set and turns the report into a termination for operators
- * who need the run to end rather than wait.
+ * So every wait on the sink is watched, and what is watched is PROGRESS, not
+ * elapsed time: bytes_out counts what the sink has actually taken, and a wait
+ * is only called stalled when that number has not moved for the whole
+ * interval.  For that test to mean what it says, progress has to be measured
+ * at a grain a working sink clears inside one interval -- WRITER_WRITE_GRAIN,
+ * one pipe buffer -- and not at the 4 MiB chunk, which is a quantum a
+ * genuinely slow reader can take minutes to cross.  A sink that has taken so
+ * much as a grain is making progress and is accused of nothing.
+ *
+ * A stalled one is named on stderr, with the phase, the seconds and the byte
+ * count, and named again every interval so the message cannot be lost in
+ * scrollback.  CST_SINK_STALL_SECS sets the interval (default 60, 0 disables
+ * the report); CST_SINK_STALL_ABORT_SECS is off unless set and turns the
+ * report into a termination for operators who need the run to end rather than
+ * wait.  The deadline applies only where there IS a progress counter to
+ * justify it: pclose() waits for the compressor to EXIT, nothing measures
+ * that wait, and killing a compressor that is finalising its last block
+ * destroys a trace that was already fully handed over.  That wait is reported
+ * and never aborted.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -67,7 +80,17 @@
 /* Total in-flight: 16 * 4 MiB = 64 MiB per active segment. */
 #define WRITER_CHUNK_BYTES (4u * 1024u * 1024u)
 #define WRITER_NUM_CHUNKS  16u
-#define WRITER_FILE_BUFSZ  (4u * 1024u * 1024u)
+
+/*
+ * The grain at which the writer hands bytes to the sink, and so the grain at
+ * which bytes_out -- the progress the stall watch tests -- can move.  One
+ * default pipe buffer: a sink that is reading at all clears a grain, and a
+ * chunk-sized write would instead hold the counter still for the whole 4 MiB.
+ * The stdio buffer is the same size so each grain is one write() rather than
+ * a copy into a buffer that reports progress the sink has not made.
+ */
+#define WRITER_WRITE_GRAIN (64u * 1024u)
+#define WRITER_FILE_BUFSZ  WRITER_WRITE_GRAIN
 
 /* Queue capacity must hold every chunk plus the EOF sentinel.  +2 gives
  * one slack slot so push never has to wait on a non-full queue path. */
@@ -145,29 +168,36 @@ static unsigned sink_stall_abort_secs(void)
 }
 
 /*
- * Report one stalled interval, and end the run when the operator asked for
- * a deadline.  @waited is the whole time this wait has been making no
- * progress, not the time since the last report.
+ * Report one stalled interval, and end the run when the operator asked for a
+ * deadline AND this wait has a progress counter that earns one.  @waited is
+ * the whole time this wait has been making no progress, not the time since
+ * the last report.  @have_bytes false means nothing measures this wait: it is
+ * reported and never aborted, because elapsed time alone cannot tell a
+ * compressor that will never exit from one finalising its last block, and
+ * getting that wrong destroys a trace the sink has already taken in full.
  */
 static void sink_stall_report(const char *phase, unsigned long long waited,
                               unsigned long long bytes, bool have_bytes)
 {
-    char taken[64];
+    char taken[96];
     if (have_bytes) {
         snprintf(taken, sizeof taken, " (%llu bytes taken by the sink so far)",
                  bytes);
     } else {
-        taken[0] = '\0';
+        snprintf(taken, sizeof taken,
+                 " (no progress counter exists for this wait)");
     }
     fprintf(stderr,
             "champsim_tracer: *** OUTPUT SINK STALLED *** %s has made no "
             "progress for %llu s%s.  The compression command is not "
-            "finishing; a full output filesystem, a stopped compressor, or a "
-            "command that never reads stdin all look like this.  The guest is "
-            "frozen until it resumes.\n",
+            "finishing; a stopped or descheduled compressor, or a command "
+            "that never reads stdin, look like this.  (A full output "
+            "filesystem does not: that fails the write outright and shows up "
+            "as 'writer fwrite short'.)  The guest is frozen until it "
+            "resumes.\n",
             phase, waited, taken);
     unsigned deadline = sink_stall_abort_secs();
-    if (deadline && waited >= deadline) {
+    if (have_bytes && deadline && waited >= deadline) {
         fprintf(stderr,
                 "champsim_tracer: CST_SINK_STALL_ABORT_SECS=%u reached; "
                 "ending the run with the trace INCOMPLETE.\n", deadline);
@@ -183,13 +213,18 @@ static unsigned long long mono_secs(void)
     return (unsigned long long)ts.tv_sec;
 }
 
-/* ===== Stall watch for a wait with no queue of its own =====
+/* ===== Stall watch for a wait that blocks in a call of its own =====
  *
- * pclose() waits for the compressor to EXIT, which is a third way the same
- * failure lands: the writer has drained, the join has returned, and the
- * child still never finishes.  There is no timed pclose, so the watch is a
- * thread that reports until the wait it is watching ends.  Only ever armed
- * at a close, so its cost is irrelevant.
+ * Two waits cannot be written as a timed loop because the blocking call has
+ * no timed form: pclose(), which waits for the compressor to EXIT, and a
+ * plain fwrite() of a whole member (the header) straight down the pipe.  For
+ * those the watch is a thread that reports until the wait it is watching
+ * ends.  Only ever armed at a close, so its cost is irrelevant.
+ *
+ * @bytes, when given, is the progress the watched wait publishes as it goes;
+ * the watch then tests progress exactly as the queue waits do, and a stall it
+ * reports is eligible for the operator's deadline.  With no counter the watch
+ * can only time, and a report is all it may ever do.
  */
 struct SinkStallWatch {
     pthread_t       thr;
@@ -199,27 +234,43 @@ struct SinkStallWatch {
     bool            done;
     const char     *phase;
     unsigned long long t0;
+    const std::atomic<unsigned long long> *bytes;
 };
 
 static void *sink_stall_watch_main(void *arg)
 {
     SinkStallWatch *sw = (SinkStallWatch *)arg;
     const unsigned interval = sink_stall_secs();
+    unsigned long long last_bytes =
+        sw->bytes ? sw->bytes->load(std::memory_order_relaxed) : 0;
+    unsigned long long stalled_since = sw->t0;
     pthread_mutex_lock(&sw->m);
     while (!sw->done) {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_sec += (time_t)interval;
-        if (pthread_cond_timedwait(&sw->c, &sw->m, &ts) == ETIMEDOUT &&
-            !sw->done) {
+        if (pthread_cond_timedwait(&sw->c, &sw->m, &ts) != ETIMEDOUT ||
+            sw->done) {
+            continue;
+        }
+        if (!sw->bytes) {
             sink_stall_report(sw->phase, mono_secs() - sw->t0, 0, false);
+            continue;
+        }
+        unsigned long long b = sw->bytes->load(std::memory_order_relaxed);
+        if (b != last_bytes) {
+            last_bytes = b;                        /* the sink is moving */
+            stalled_since = mono_secs();
+        } else {
+            sink_stall_report(sw->phase, mono_secs() - stalled_since, b, true);
         }
     }
     pthread_mutex_unlock(&sw->m);
     return nullptr;
 }
 
-void *sink_stall_watch_begin(const char *phase)
+static void *sink_stall_watch_begin_counted(
+    const char *phase, const std::atomic<unsigned long long> *bytes)
 {
     if (!sink_stall_secs()) {
         return nullptr;
@@ -232,6 +283,7 @@ void *sink_stall_watch_begin(const char *phase)
     pthread_cond_init(&sw->c, nullptr);
     sw->phase = phase;
     sw->t0 = mono_secs();
+    sw->bytes = bytes;
     /* Blocked signal mask, for the reason writer_start documents. */
     sigset_t all, saved;
     sigfillset(&all);
@@ -248,6 +300,11 @@ void *sink_stall_watch_begin(const char *phase)
     return sw;
 }
 
+void *sink_stall_watch_begin(const char *phase)
+{
+    return sink_stall_watch_begin_counted(phase, nullptr);
+}
+
 void sink_stall_watch_end(void *handle)
 {
     SinkStallWatch *sw = (SinkStallWatch *)handle;
@@ -262,6 +319,37 @@ void sink_stall_watch_end(void *handle)
     pthread_cond_destroy(&sw->c);
     pthread_mutex_destroy(&sw->m);
     free(sw);
+}
+
+/*
+ * Write a whole buffer to a sink that has no writer thread behind it -- the
+ * header member, which is handed over in one go at the close.  Same grain and
+ * same progress rule as the writer thread, so the same stall watch applies:
+ * a header sink that stops reading parks this call exactly as a body sink
+ * parks the writer, and before this it did so with nothing on stderr at all.
+ * Returns the bytes written; short means the sink failed, not that it stalled.
+ */
+size_t sink_write_watched(FILE *f, const void *data, size_t len,
+                          const char *phase)
+{
+    if (!f || !data || len == 0) {
+        return 0;
+    }
+    std::atomic<unsigned long long> written{0};
+    void *watch = sink_stall_watch_begin_counted(phase, &written);
+    const uint8_t *p = (const uint8_t *)data;
+    size_t off = 0;
+    while (off < len) {
+        size_t want = MIN((size_t)WRITER_WRITE_GRAIN, len - off);
+        size_t n = fwrite(p + off, 1, want, f);
+        off += n;
+        written.store(off, std::memory_order_relaxed);
+        if (n != want) {
+            break;
+        }
+    }
+    sink_stall_watch_end(watch);
+    return off;
 }
 
 /* ===== Queue primitives ===== */
@@ -356,15 +444,29 @@ static void *writer_thread_main(void *arg)
             break;
         }
         if (c->len) {
-            size_t n = fwrite(c->data, 1, c->len, w->f);
-            w->bytes_out.fetch_add(n, std::memory_order_relaxed);
-            if (n != c->len) {
-                /* Disk-full or broken pipe.  Best we can do is keep
-                 * draining so the producer doesn't deadlock; bytes
-                 * are dropped.  Stderr message keeps it visible. */
-                fprintf(stderr,
-                        "champsim_tracer: writer fwrite short (%zu/%zu)\n",
-                        n, c->len);
+            /*
+             * One grain at a time, publishing bytes_out after each, so the
+             * stall watch sees a sink that is taking bytes slowly as what it
+             * is.  A single chunk-sized write would hold the counter still
+             * for 4 MiB, which on a slow reader is minutes of "no progress"
+             * that the watch would report and, with a deadline set, kill the
+             * run over.
+             */
+            size_t done = 0;
+            while (done < c->len) {
+                size_t want = MIN((size_t)WRITER_WRITE_GRAIN, c->len - done);
+                size_t n = fwrite(c->data + done, 1, want, w->f);
+                done += n;
+                w->bytes_out.fetch_add(n, std::memory_order_relaxed);
+                if (n != want) {
+                    /* Disk-full or broken pipe.  Best we can do is keep
+                     * draining so the producer doesn't deadlock; bytes
+                     * are dropped.  Stderr message keeps it visible. */
+                    fprintf(stderr,
+                            "champsim_tracer: writer fwrite short (%zu/%zu)\n",
+                            done, c->len);
+                    break;
+                }
             }
         }
         c->len = 0;
@@ -430,13 +532,28 @@ WriterCtx *writer_start(FILE *f, bool is_pipe)
     sigset_t all, saved;
     sigfillset(&all);
     pthread_sigmask(SIG_SETMASK, &all, &saved);
-    int rc = pthread_create(&w->thr, nullptr, writer_thread_main, w);
+    /* CST_WRITER_NO_THREAD is the falsifier arm for the no-writer path
+     * below: without a way to make pthread_create fail on demand, that path
+     * is a claim nobody has ever run. */
+    const char *no_thr = getenv("CST_WRITER_NO_THREAD");
+    int rc = (no_thr && *no_thr && *no_thr != '0')
+             ? EAGAIN
+             : pthread_create(&w->thr, nullptr, writer_thread_main, w);
     pthread_sigmask(SIG_SETMASK, &saved, nullptr);
     if (rc != 0) {
         fprintf(stderr,
-                "champsim_tracer: pthread_create(writer): %d\n", rc);
-        /* Fall through with thr_started=false; writer_submit will
-         * still memcpy and writer_finish will drop bytes safely. */
+                "champsim_tracer: pthread_create(writer): %d — writing the "
+                "trace synchronously from the vCPU thread\n", rc);
+        /*
+         * thr_started stays false and writer_submit writes through.  It must:
+         * the chunk queue only works because the writer recycles chunks onto
+         * the free list, so with no writer the producer fills sixteen of them
+         * and then waits forever for a seventeenth that nobody will ever
+         * feed.  (The comment that used to sit here said writer_submit would
+         * "still memcpy and writer_finish would drop bytes safely", which was
+         * not true of either: the run deadlocks in cq_pop before it ever
+         * reaches writer_finish.)
+         */
     } else {
         w->thr_started = true;
     }
@@ -445,7 +562,18 @@ WriterCtx *writer_start(FILE *f, bool is_pipe)
 
 void writer_submit(WriterCtx *w, const uint8_t *buf, size_t len)
 {
-    if (!w || !w->current || len == 0) {
+    if (!w || len == 0) {
+        return;
+    }
+    if (!w->thr_started) {
+        /* No writer thread: write through, which is what the producer did
+         * before the writer thread existed.  Slow and it deforms the guest's
+         * timing, and both are better than a queue that cannot drain. */
+        size_t n = fwrite(buf, 1, len, w->f);
+        w->bytes_out.fetch_add(n, std::memory_order_relaxed);
+        return;
+    }
+    if (!w->current) {
         return;
     }
     size_t off = 0;

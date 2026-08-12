@@ -340,8 +340,15 @@ void TraceSegmentManager::finish(const std::function<void()> &flush_hook)
                              &current_->header_is_pipe, "header");
         if (current_->header_file) {
             size_t n = header_bytes->len;
-            if (n && fwrite(header_bytes->data, 1, n,
-                             current_->header_file) != n) {
+            /* The header goes down its own pipe with no writer thread behind
+             * it, so a header sink that stops reading parks the close right
+             * here -- the body having already drained perfectly.  Same watch,
+             * same progress rule; it used to be the one wait on the sink that
+             * said nothing at all. */
+            if (n && sink_write_watched(
+                        current_->header_file, header_bytes->data, n,
+                        "the close writing the header member to its sink")
+                     != n) {
                 fprintf(stderr,
                         "champsim_tracer: header write failed: %s\n",
                         current_->header_temp_path);

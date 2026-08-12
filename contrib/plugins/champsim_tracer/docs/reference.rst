@@ -1343,19 +1343,34 @@ trace run.
      - Interval, in seconds, at which a wait on the ``compress=``
        sink that has taken **no further bytes** for the whole
        interval is reported on stderr; default ``60``, ``0``
-       disables the report.  Three waits are covered: a vCPU
-       thread waiting for a free output chunk (the guest is frozen
+       disables the report.  Four waits are covered: a vCPU thread
+       waiting for a free output chunk (the guest is frozen
        between instructions), the close draining the writer
-       thread, and the close waiting for the compression pipe to
-       exit.  What is tested is the sink's byte count, not elapsed
-       time, so a merely slow compressor never trips it.
+       thread, the close writing the header member to its sink,
+       and the close waiting for the compression pipe to exit.
+       What is tested is the sink's byte count, not elapsed time,
+       and the count moves every 64 KiB, so a compressor that is
+       reading at all — however slowly — never trips it.  A full
+       output *filesystem* is a different failure and does not
+       reach here: it fails the write outright and is reported as
+       ``writer fwrite short``.
    * - ``CST_SINK_STALL_ABORT_SECS``
      - No-progress deadline, in seconds, after which such a wait
        ends the run (exit status ``97``) with the trace
        **incomplete**, instead of continuing to wait.  Off unless
        set: a compressor that is still taking bytes is still
        writing the trace, and only the operator knows whether an
-       unfinishable run should end or hold.
+       unfinishable run should end or hold.  It applies only to
+       the three waits that have a byte counter behind them.  The
+       wait for the compression pipe to *exit* has none — nothing
+       measures a compressor finalising its last block — so that
+       one is reported and never aborted; ending a run there would
+       destroy a trace the sink had already taken in full.
+   * - ``CST_WRITER_NO_THREAD``
+     - *Diagnostic.*  Makes the output writer thread fail to start,
+       so the synchronous write-through path the plugin falls back
+       to when ``pthread_create`` fails can actually be run.  The
+       trace is still complete; the guest's timing is not.
    * - ``CST_MEMSTATS``
      - *Diagnostic.*  Template-store footprint breakdowns (per-array
        byte totals, duplicate-chain histogram) at segment close and

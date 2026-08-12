@@ -2413,7 +2413,17 @@ ptrdiff_t PathBuilder::frame_idx_for_completion(const BBTemplate *suffix,
  * the incomplete chain so the emit references a template the decoder
  * will actually see.
  */
-BBTemplate *PathBuilder::fold_prev_full_bb(BBTemplate *prev)
+/* Falsifier lever for the translation-cut repair (Stats::fold_prev_*):
+ * refuse the cached-whole substitution so the cut-frame fallback arm and
+ * its instruments provably fire on the deterministic mipsel cell. */
+static bool pb_fold_no_whole()
+{
+    static const bool v = getenv("CST_FOLD_NO_WHOLE") != nullptr;
+    return v;
+}
+
+BBTemplate *PathBuilder::fold_prev_full_bb(BBTemplate *prev,
+                                           bool *out_head_cut)
 {
     g_mutex_lock(&data_lock);
     /*
@@ -2466,6 +2476,40 @@ BBTemplate *PathBuilder::fold_prev_full_bb(BBTemplate *prev)
         }
     }
     cp_chain(cpu_index_).reset();
+    /*
+     * A FORCE-COMMITTED HEAD ENDS AT THE FAULTING INSTRUCTION, NOT AT THE
+     * BLOCK'S TERMINAL BRANCH.  A translator that stops at an instruction
+     * it knows will raise (a MIPS coprocessor-unusable FPU store, an x86
+     * #NM shape) hands this fold a prev with no terminating branch, so the
+     * committed template is a translation-cut prefix of the real block.
+     * The frame continuation is bounded by full_tmpl->n_insns (the wire
+     * chain contract: prefix and continuation name ONE template and the
+     * chain ends at num_insns — docs/format.rst), so a cut template
+     * swallows every resumed instruction past the cut: billed to the
+     * window clock, never published (the deterministic mipsel
+     * clock_minus_wire=+20).  Complete the head from the cached whole
+     * block when one exists — prefix and continuation then share the true
+     * template and the merge covers the whole resumed suffix.  When none
+     * exists the caller opens a cut frame instead (@out_head_cut).
+     */
+    if (fell_back && full_bb) {
+        g_stats.fold_prev_head_incomplete++;
+        BBTemplate *whole = pb_fold_no_whole()
+            ? nullptr : g_template_store.whole_block_covering(full_bb);
+        if (whole) {
+            /* CP-authoritative privilege stamp, as install_own_extent's
+             * stamp arm: this block is being adopted for a CP emission at
+             * prev's CP-translated privilege. */
+            whole->is_system = prev->is_system;
+            whole->is_system_cp_confirmed = true;
+            full_bb = whole;
+            fell_back = false;
+            g_stats.fold_prev_whole_substituted++;
+        }
+    }
+    if (out_head_cut) {
+        *out_head_cut = fell_back;
+    }
     if (pb_diag()) {
         fprintf(stderr, "[pathbuilder] PUSH prev=0x%" PRIx64 " n=%u term=%d "
                 "-> full=0x%" PRIx64 " n=%u incomplete=%d tid=%u\n",
@@ -2683,7 +2727,8 @@ void PathBuilder::classify_fault_enter(const struct qemu_plugin_cpu_event &ev,
     }
     if (!*prev_emitted && tmpl_contains_pc(walk_prev_, resume) &&
         !ctx_asid_foreign(ev.asid)) {                             /* (b) */
-        BBTemplate *full_bb = fold_prev_full_bb(walk_prev_);
+        bool head_cut = false;
+        BBTemplate *full_bb = fold_prev_full_bb(walk_prev_, &head_cut);
         cst_jump_diag_step(resume, walk_prev_->start_pc, (int)ev.priv, 1,
                            "fault-enter(b)");
         recredit(walk_prev_, resume);
@@ -2716,11 +2761,52 @@ void PathBuilder::classify_fault_enter(const struct qemu_plugin_cpu_event &ev,
         const RepArchFacts &wfb = rep_state(cpu_index_).pb_walk_facts;
         const bool rep_split = wfb.pc != 0 && wfb.pc == resume &&
                                wfb.iters > 0;
-        emit_piece(full_bb, 0, rep_split ? K + 1 : K, rep_split);
+        const bool cut_frame = head_cut && !rep_split;
+        if (cut_frame) {
+            /*
+             * TRANSLATION-CUT HEAD, NO CACHED WHOLE (see fold_prev_full_bb):
+             * a continuation of the cut template cannot cover the resumed
+             * suffix, and the wire cannot express the overhang later (a
+             * continuation must name the prefix's template and a fresh
+             * chain must start at 0).  Publish the executed prefix as a
+             * COMPLETE block of its own extent — the same at-the-extent-
+             * that-ran template the other cut emissions use — and mark the
+             * frame cut: its completion publishes the sealed resumed
+             * suffix whole.  Every retired instruction reaches the wire
+             * exactly once; only the block-identity split differs from the
+             * canonical shape.
+             */
+            if (K > 0) {
+                BBTemplate *pref = nullptr;
+                g_mutex_lock(&data_lock);
+                pref = g_template_store.install_own_extent(
+                    full_bb->start_pc, K, full_bb->insn_pcs,
+                    full_bb->insn_fields, full_bb->insn_sizes,
+                    full_bb->insn_bytes, full_bb->insn_reg_names,
+                    full_bb->symbol_name, full_bb->insn_pcs[K],
+                    full_bb->is_system, /* stamp_system= */ true);
+                g_mutex_unlock(&data_lock);
+                if (pref) {
+                    emit_piece(pref, 0, K, false);
+                } else {
+                    emit_piece(full_bb, 0, K, false);
+                }
+            } else {
+                /* Nothing ran before the fault: no piece, and the
+                 * accumulators hold only the aborted attempt. */
+                g_mem_recorder.clear_cp(cpu_index_);
+                pending_reg_snaps(cpu_index_).clear();
+                cp_chain_snap_mark(cpu_index_) = 0;
+            }
+            g_stats.fold_prev_cut_frames++;
+        } else {
+            emit_piece(full_bb, 0, rep_split ? K + 1 : K, rep_split);
+        }
         g_stats.census_frames_opened++;
         frames_.emplace_back();
         CtxFrame &f = frames_.back();
         f.full_tmpl = full_bb;
+        f.full_cut = cut_frame;
         f.asid = ev.asid;
         f.depth = walk_depth_;
         f.async_in_depth = g_pb_walk_async[pb_vcpu_slot(cpu_index_)];
@@ -3919,8 +4005,10 @@ PathBuilder::complete_continuation(size_t idx,
                 frames_.size());
     }
     /* The faulting BB and its resuming suffix share the terminal branch,
-     * so they share its resolved static target. */
-    if (pe.bb_tmpl && f.full_tmpl && pe.bb_tmpl->taken_pc) {
+     * so they share its resolved static target.  Not on a cut frame: the
+     * cut template ends at the faulting instruction, which is not the
+     * branch this target belongs to. */
+    if (pe.bb_tmpl && f.full_tmpl && pe.bb_tmpl->taken_pc && !f.full_cut) {
         g_mutex_lock(&data_lock);
         f.full_tmpl->taken_pc = pe.bb_tmpl->taken_pc;
         g_mutex_unlock(&data_lock);
@@ -3958,11 +4046,34 @@ PathBuilder::complete_continuation(size_t idx,
     uint32_t cont_start = f.emitted_to < full->n_insns ? f.emitted_to
                                                        : full->n_insns;
     uint64_t cont_wrong = pb_no_fault_wp() ? 0 : pe.wrong_target;
+    /*
+     * A RESUMED SUFFIX THE FRAME'S TEMPLATE CANNOT BOUND IS PUBLISHED
+     * WHOLE.  A cut frame (translation-cut head, prefix already published
+     * as its own complete block) planned this; any OTHER completion whose
+     * suffix extends past the continuation's coverage is the same swallow
+     * arriving by an unplanned route — counted as a must-be-0 tripwire
+     * and self-healed through the same suffix-whole emission, because the
+     * alternative is retired instructions billed to the window clock that
+     * no entry publishes (the M20 class).
+     */
+    bool suffix_whole = f.full_cut;
+    if (!suffix_whole && pe.bb_tmpl &&
+        pe.bb_tmpl->n_insns > full->n_insns - cont_start) {
+        g_stats.merge_suffix_overhang++;
+        suffix_whole = true;
+    }
     g_stats.census_frames_merged++;
     frames_.erase(frames_.begin() + (ptrdiff_t)idx);
     rep_emit_handoff(cpu_index, rep_state(cpu_index).pb_walk_facts);
-    emit_finalized_bb(out_stream, full, pe.branch_pc,
-                      pe.emit_current_pc, cont_wrong, cpu_index, cont_start);
+    if (suffix_whole && pe.bb_tmpl) {
+        g_stats.merge_cut_frame_suffix_insns += pe.bb_tmpl->n_insns;
+        emit_finalized_bb(out_stream, pe.bb_tmpl, pe.branch_pc,
+                          pe.emit_current_pc, cont_wrong, cpu_index, 0);
+    } else {
+        emit_finalized_bb(out_stream, full, pe.branch_pc,
+                          pe.emit_current_pc, cont_wrong, cpu_index,
+                          cont_start);
+    }
     for (size_t i = 1; i < pending_emits.size(); i++) {
         const PendingEmit &pe2 = pending_emits[i];
         rep_emit_handoff(cpu_index, rep_state(cpu_index).pb_walk_facts);

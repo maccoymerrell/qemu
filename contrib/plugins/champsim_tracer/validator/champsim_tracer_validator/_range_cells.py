@@ -35,6 +35,15 @@ wire contract requires at a specific capture boundary:
                     simulated instructions sum to the budget, never past
                     it.
 
+A sixth assertion, ``cut_head_fault``, is a universal invariant rather
+than a staged cell: no chain may complete at a non-branch instruction
+unless execution provably continued at its fall-through.  It is the
+wire signature of a TRANSLATION-CUT faulting head (a MIPS
+coprocessor-unusable FPU store ends its TB at the faulting instruction,
+so the fault fold's template ends where no block can end) bounding its
+merge continuation — the deterministic mipsel ``clock_minus_wire=+20``,
+twenty resumed instructions billed to the window clock and on no entry.
+
 Each cell has a FALSIFIER twin: the same assertion run against a
 synthetic decoded stream shaped like the pre-range world (merged whole
 blocks, overshooting tails).  ``--selftest`` runs conforming + falsifier
@@ -123,6 +132,68 @@ def assert_fault_split(entries: list[dict], tby: dict) -> tuple[bool, str]:
     return False, ("no user-block invocation was split across a kernel "
                    "excursion (writer still merges, or the workload's "
                    "demand fault never hit a user block)")
+
+
+def _branch_terminated(t: dict) -> bool:
+    """Whether template @t ends at its terminal branch.  The branch is the
+    last instruction, or — on a delay-slot ISA — the one before it (the
+    template is in true execution order [branch, delay slot]).  A
+    translation-cut head (the M20 shape: the translator stopped at an
+    instruction it knew would raise, e.g. a MIPS coprocessor-unusable FPU
+    store) ends at a non-branch instruction and returns False."""
+    ins = t.get("insns") or []
+    n = len(ins)
+    for i in (n - 1, n - 2):
+        if i >= 0 and int(ins[i].get("branch_type", 0) or 0) != 0:
+            return True
+    return False
+
+
+def assert_cut_head_continuity(entries: list[dict],
+                               tby: dict) -> tuple[bool, str]:
+    """No chain completes at a lie: a mid-start continuation (``start > 0``,
+    ``stop == n``) whose template ends at a NON-BRANCH instruction claims
+    the block is over where no block can end, so the instructions the
+    resume actually executed past that point are on no entry — the
+    deterministic mipsel ``clock_minus_wire=+20`` (a translation-cut
+    faulting head bounding its merge continuation).  The one honest way
+    such a completion can sit in a stream is with the next same-context
+    depth-0 user entry starting at the template's fall-through pc —
+    execution really did continue there under another template.  Any
+    other successor means instructions were swallowed.  Universal: passes
+    vacuously on a stream with no such completion (the repaired canonical
+    shape completes at a branch), and the falsifier fixture proves the
+    rejection fires."""
+    pending: dict[tuple, tuple[int, int]] = {}   # ctx -> (tmpl_id, ft_pc)
+    checked = 0
+    for e in entries:
+        t = tby.get(e["template_id"])
+        if t is None:
+            continue
+        c = _ctx(e)
+        depth = int(e.get("fault_depth", 0) or 0)
+        if _is_sys(e, tby) or depth >= 1:
+            continue                       # excursion interior: not the successor
+        p = pending.pop(c, None)
+        if p is not None:
+            tmpl_id, ft = p
+            if int(t.get("start_pc", -1)) != ft:
+                return False, (f"BB{tmpl_id} completed at a non-branch "
+                               f"instruction and the next entry starts at "
+                               f"0x{int(t.get('start_pc', 0)):x}, not its "
+                               f"fall-through 0x{ft:x} — the resumed "
+                               f"instructions between them are on no entry")
+            checked += 1
+        start, stop, n = _rng(e, tby)
+        if (start > 0 and stop == n and not _branch_terminated(t)
+                and t.get("fall_through_pc") is not None):
+            pending[c] = (int(e["template_id"]), int(t["fall_through_pc"]))
+    return True, (f"{checked} non-branch-terminal completion(s) continued "
+                  f"at their fall-through; none swallowed a resume"
+                  if checked else
+                  "no mid-start completion ends at a non-branch instruction "
+                  "(every merge continuation completes at its block's "
+                  "terminal branch)")
 
 
 def assert_budget_close(entries: list[dict], tby: dict,
@@ -541,6 +612,37 @@ def run_selftest() -> int:
           ([_fx_e(4, 0, 3), _fx_e(9, depth=1), _fx_e(4, 3, None)], tby),
           ([_fx_e(9, depth=1), _fx_e(4, 0, None)], tby))
 
+    # 1b. cut_head_fault: the M20 translation-cut shape.  Conforming
+    # stream carries all three honest faces: a delay-slot-terminated
+    # merge continuation (branch at n-2: the canonical whole-template
+    # repair, exempt), a cut prefix completed as its own block whose
+    # successor starts at its fall-through (the fallback repair), and
+    # the excursion interior between them.  The falsifier is the exact
+    # pre-fix wire: a 4-insn cut template claiming completion [3,4) at
+    # its non-branch store, with the next entry at an unrelated pc —
+    # the 20 resumed instructions between them on no entry.
+    tby1b = {
+        # arm-1 face: 6-insn block, branch at index 4, delay slot at 5
+        11: _fx_tmpl(11, 6, pcs=[0x900 + 4 * i for i in range(6)]),
+        # arm-2 face: 3-insn cut prefix completed at its own extent,
+        # falling through to the suffix block
+        12: _fx_tmpl(12, 3, pcs=[0xa00, 0xa04, 0xa08], fall_through=0xa0c),
+        13: _fx_tmpl(13, 4, pcs=[0xa0c, 0xa10, 0xa14, 0xa18]),
+        # the kernel handler
+        19: _fx_tmpl(19, 2, sys=True),
+        # falsifier: the pre-fix cut template and the unrelated successor
+        14: _fx_tmpl(14, 4, pcs=[0xb00, 0xb04, 0xb08, 0xb0c],
+                     mem_at=(3,), fall_through=0xb10),
+        15: _fx_tmpl(15, 2, pcs=[0xc00, 0xc04]),
+    }
+    tby1b[11]["insns"][4]["branch_type"] = 2
+    check("cut_head_fault", assert_cut_head_continuity,
+          ([_fx_e(11, 0, 3), _fx_e(19, depth=1), _fx_e(11, 3, None),
+            _fx_e(12, 0, None), _fx_e(19, depth=1), _fx_e(13, 0, None)],
+           tby1b),
+          ([_fx_e(14, 0, 3), _fx_e(19, depth=1), _fx_e(14, 3, None),
+            _fx_e(15, 0, None)], tby1b))
+
     # 2. budget_close: 3 whole 5-insn blocks + [0,2) of a fourth = 17 —
     # vs. the fourth emitted whole (overshoot 20).
     tby2 = {i: _fx_tmpl(i, 5) for i in (1, 2, 3, 4)}
@@ -899,6 +1001,8 @@ def run_cells(user_dir: Path, sys_dir: Path, build_dir: Path,
         meta_s, tby_s, entries_s = _decode(s_trace)
         verdicts.append(("fault_split",
                          *assert_fault_split(entries_s, tby_s)))
+        verdicts.append(("cut_head_fault",
+                         *assert_cut_head_continuity(entries_s, tby_s)))
         isa = meta_s.get("target_name") or "x86_64"
         seq_pcs, why = end_marker_pcs(meta_s, tby_s, isa)
         if seq_pcs is None:

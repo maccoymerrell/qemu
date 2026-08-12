@@ -219,6 +219,24 @@ public:
      * supplies the live translation address-space id so a shared code VA
      * in two owned processes resolves to each process's own template. */
     BBTemplate *find_bb_template(uint64_t asid_root, uint64_t entry_pc);
+    /*
+     * The COMPLETE cached block that begins with exactly @cut's
+     * instructions and extends beyond them, or nullptr.
+     *
+     * @cut is a force-committed translation-cut head: a TB whose
+     * translator stopped at an instruction it knew would raise (a MIPS
+     * coprocessor-unusable store, an x86 #NM shape), so the committed
+     * template ends AT the faulting instruction instead of at the
+     * block's terminal branch.  The fault fold substitutes the cached
+     * whole block when one exists so the frame's continuation can cover
+     * the resumed suffix (docs/format.rst: prefix and continuation must
+     * name one template, and the chain must end at num_insns).  Guards:
+     * strictly longer, byte-identical over @cut's extent, and carrying a
+     * terminal branch AT or PAST the cut boundary — a cached template
+     * that is itself a shorter-lived cut fails the last guard rather
+     * than substituting a second lie.  Caller holds data_lock.
+     */
+    BBTemplate *whole_block_covering(const BBTemplate *cut);
     /* The cache key's asid_root is selected from @start_pc by the
      * architectural VA classifier (kernel-VA code → the shared kernel
      * sentinel bucket, user-VA code → the live process root; see BBKey /

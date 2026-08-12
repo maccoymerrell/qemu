@@ -134,6 +134,39 @@ BBTemplate *TemplateStore::find_bb_template(uint64_t asid_root,
     return it == bb_map_.end() ? nullptr : it->second.get();
 }
 
+/* See the header: the complete cached block a translation-cut head is a
+ * strict byte-prefix of.  The terminal-branch guard rejects a cached
+ * template that is itself a cut (bb_map_ can hold a force-committed head
+ * when the cut is the block's first-ever commit), and its AT-or-past-the-
+ * boundary form keeps a delay-slot block whose slot never committed from
+ * passing as whole. */
+BBTemplate *TemplateStore::whole_block_covering(const BBTemplate *cut)
+{
+    if (!cut || cut->n_insns == 0 || !cut->insn_pcs || !cut->insn_bytes) {
+        return nullptr;
+    }
+    BBTemplate *whole = find_bb_template(store_asid_root(cut->start_pc),
+                                         cut->start_pc);
+    if (!whole || whole == cut || whole->n_insns <= cut->n_insns ||
+        !whole->insn_pcs || !whole->insn_bytes) {
+        return nullptr;
+    }
+    int bidx = template_branch_index(whole);
+    if (bidx < 0 || (uint32_t)bidx < cut->n_insns - 1) {
+        return nullptr;
+    }
+    for (uint32_t i = 0; i < cut->n_insns; i++) {
+        if (whole->insn_pcs[i] != cut->insn_pcs[i] ||
+            whole->insn_sizes[i] != cut->insn_sizes[i] ||
+            memcmp(&whole->insn_bytes[(size_t)i * MAX_INSN_BYTES],
+                   &cut->insn_bytes[(size_t)i * MAX_INSN_BYTES],
+                   MAX_INSN_BYTES) != 0) {
+            return nullptr;
+        }
+    }
+    return whole;
+}
+
 size_t TemplateStore::tb_count() const
 {
     return tb_templates_.size();

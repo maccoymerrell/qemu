@@ -257,6 +257,28 @@ struct Stats {
     uint64_t fold_prev_prefix_kept_insns = 0;
     uint64_t fold_prev_prefix_discontinuous = 0;
     uint64_t fold_prev_prefix_discontinuous_insns = 0;
+    /* TRANSLATION-CUT FAULTING HEADS (the M20 class).  A translator that
+     * stops at an instruction it knows will raise (a MIPS coprocessor-
+     * unusable FPU store, an x86 #NM shape) hands the fault fold a prev
+     * whose committed template ends AT the faulting instruction, not at
+     * the block's terminal branch.  A frame continuation bounded by that
+     * template can never cover the resumed suffix, so every resumed
+     * instruction past the cut was billed to the window clock and never
+     * published — the deterministic mipsel clock_minus_wire=+20.
+     * _head_incomplete counts the condition (fires on every such fault);
+     * _whole_substituted is the canonical repair (the cached complete
+     * block replaces the cut, prefix and continuation share one
+     * template); _cut_frames is the fallback (no cached whole: the
+     * prefix completes as its own block and the completion publishes the
+     * sealed suffix whole, counted in _cut_frame_suffix_insns).
+     * merge_suffix_overhang is the tripwire on every OTHER completion:
+     * a resumed suffix extending past its frame's coverage self-heals
+     * through the suffix-whole path and must never happen. */
+    uint64_t fold_prev_head_incomplete = 0;
+    uint64_t fold_prev_whole_substituted = 0;
+    uint64_t fold_prev_cut_frames = 0;
+    uint64_t merge_cut_frame_suffix_insns = 0;
+    uint64_t merge_suffix_overhang = 0;
 
     /*
      * WINDOW-CLOCK vs WIRE accounting.

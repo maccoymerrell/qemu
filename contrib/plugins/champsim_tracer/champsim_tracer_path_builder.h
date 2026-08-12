@@ -332,6 +332,13 @@ struct CtxFrame {
      * first fault's prefix length; a case-(a2) later fault advances it
      * past the mid-suffix continuation it emits. */
     uint32_t emitted_to = 0;
+    /* @full_tmpl is a TRANSLATION-CUT head (ends at the faulting
+     * instruction, not the block's terminal branch) and no cached whole
+     * block could replace it.  The prefix was published as its own
+     * complete block, so the completion publishes the sealed resumed
+     * suffix whole instead of a continuation this template cannot
+     * bound (Stats::fold_prev_cut_frames). */
+    bool full_cut = false;
 };
 
 class PathBuilder {
@@ -769,7 +776,12 @@ private:
                                          uint64_t seal_asid);
     ptrdiff_t frame_idx_for_completion(const BBTemplate *suffix,
                                        uint64_t seal_asid) const;
-    BBTemplate *fold_prev_full_bb(BBTemplate *prev);
+    /* @out_head_cut reports that the fold force-committed a
+     * TRANSLATION-CUT head it could not complete from the cache: the
+     * returned template ends at the faulting instruction, and a frame
+     * continuation bounded by it would swallow the resumed suffix (the
+     * caller opens a full_cut frame instead). */
+    BBTemplate *fold_prev_full_bb(BBTemplate *prev, bool *out_head_cut);
     /* Completion: the just-sealed suffix matched frames_[idx].  Emit it as
      * a CONTINUATION of the frame's full template — SAME template_id,
      * bb_start = the frame's emitted_to cursor — with the seal's resolved

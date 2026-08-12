@@ -230,6 +230,17 @@ Sub-commands
    close mid-block, a REP invocation interrupted mid-flight, and a
    wrong-path chain cutting its last block at the wpdepth remainder.
 
+   A sixth assertion, ``cut_head_fault``, is a universal invariant
+   over the system stream rather than a staged cell: no chain may
+   complete at a non-branch instruction unless the next entry in its
+   context starts at that template's fall-through pc.  It is the wire
+   signature of a *translation-cut* faulting head — a translator that
+   stops at an instruction it knows will raise (a MIPS
+   coprocessor-unusable FPU store) hands the fault fold a template
+   ending at the faulting instruction, and a merge continuation
+   bounded by it silently swallows the resumed instructions past the
+   cut.  The falsifier fixture is that exact pre-repair stream shape.
+
    Two cells stage their own subjects rather than depending on the
    supplied run directories to happen to contain one.
    ``budget_close`` re-traces the user workload under a window sized,

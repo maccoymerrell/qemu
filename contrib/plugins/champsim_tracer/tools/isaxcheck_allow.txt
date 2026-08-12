@@ -101,11 +101,22 @@ riscv64 R-rd-phantom vfmerge.v*m +v#
 # pointer-authenticated alike.  The suppression happens where the use
 # enters now, and none of them disagree.)
 
-# LLVM gives AArch64 MRS/MSR an NZCV def that the architecture does not.
-# The def is attached to the whole MSR-immediate-to-PSTATE-field form,
-# because one of the fields it can name IS NZCV — so every alias of that
-# form inherits it, including the SME streaming-mode switches, which write
-# PSTATE.SM and PSTATE.ZA and leave the condition flags alone.
+# LLVM gives AArch64 MRS/MSR an NZCV def that the architecture does not —
+# for MOST members.  The def is attached to the whole
+# MSR-immediate-to-PSTATE-field form, because one of the fields it can name
+# IS NZCV — so every alias of that form inherits it, including the SME
+# streaming-mode switches, which write PSTATE.SM and PSTATE.ZA and leave
+# the condition flags alone.
+#
+# ONE alias under the `mrs` key is the other way around, and this comment
+# used to paper over it: `mrs xN, RNDR` / `RNDRRS` really does set NZCV
+# (Z reports entropy failure), LLVM is RIGHT to def it there, and Capstone
+# reports no flags write — a real Capstone gap riding the same collapsed
+# signature as the phantoms (verified --hex=02243bd5, 2026-08-12: llvm
+# WR{nzcv,r2}, boundary WR{r2}).  Work item filed; the fields-layer twin in
+# isaxcheck_fields_allow.txt carries the same carve-out.  Weight today is
+# nil (no traced workload reads RNDR), which is why carrying it is
+# tolerable, not why it is right.
 aarch64 R-wr-missing mrs +nzcv
 aarch64 R-wr-missing msr +nzcv
 aarch64 R-wr-missing smstart +nzcv

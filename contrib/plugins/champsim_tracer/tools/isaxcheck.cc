@@ -1180,6 +1180,25 @@ static bool want_decode = true, want_mem = true, want_branch = true,
 enum Layer { LAYER_BOUNDARY, LAYER_FIELDS, LAYER_FIXUPS };
 static Layer layer = LAYER_BOUNDARY;
 
+/*
+ * THE GATE'S OWN FALSIFIER.  `--falsify=drop-src:MNEM` erases the source
+ * set the dependency model recorded for MNEM; `--falsify=add-dst:MNEM`
+ * plants one of its sources into its destination set.  Both are injected
+ * AFTER isax_fields_decode(), i.e. at exactly the point where a real
+ * dependency-model defect would sit, so a run with `--falsify` proves the
+ * fields layer can turn a wrong register attribution into a red gate —
+ * FR-rd-missing for the erased reads, FR-wr-phantom for the planted write.
+ *
+ * This exists because the fields layer spent its first months with zero
+ * allowlist rows and zero invocations: a gate nobody had ever seen fail,
+ * vouching for nothing.  An instrument quoted for a zero must be proven
+ * able to fire, so the validator's decode_fields check runs the falsifier
+ * first and refuses to trust the green sweep unless the damaged run went
+ * red naming the damaged mnemonic.  Fields layer only; never for
+ * production comparisons.
+ */
+static std::string falsify_mode, falsify_mnem;
+
 /* BranchType values from champsim_tracer_generic_ids.h.  Restated rather
  * than included: pulling that header in would drag the plugin's include
  * world into the translation unit that owns LLVM's.  The names are
@@ -1195,6 +1214,14 @@ static void compare(const uint8_t *b, size_t n)
     cs_decode(b, n, c, &info);
     ll_decode(b, n, l);
     if (c.ok && layer != LAYER_BOUNDARY) isax_fields_decode(&info, &f);
+    if (layer == LAYER_FIELDS && c.ok && f.ok && !falsify_mnem.empty() &&
+        c.mnem == falsify_mnem) {
+        if (falsify_mode == "drop-src") {
+            f.src.clear();
+        } else if (falsify_mode == "add-dst" && !f.src.empty()) {
+            f.dst.push_back(f.src[0]);
+        }
+    }
 
     if (!c.ok && !l.ok) return;
 
@@ -2050,7 +2077,13 @@ static void usage(void)
         "  --jobs=N        fork N sweep shards and merge (default 1)\n"
         "  --shard=I --nshard=N   run one shard only (used internally)\n"
         "  --classes=DZMBR        comparison classes to enable\n"
-        "  --hex=BYTES     decode one encoding with both decoders and exit\n"
+        "  --hex=BYTES     decode one encoding with both decoders and exit;\n"
+        "                  with --check the encoding also runs through the\n"
+        "                  sweep's compare / allowlist / exit-code machinery\n"
+        "  --falsify=MODE:MNEM   (fields layer only) damage the dependency\n"
+        "                  model's view of MNEM before comparing: drop-src\n"
+        "                  erases its reads, add-dst plants a phantom write.\n"
+        "                  Proves the gate can fire; never for real runs\n"
         "  --batch         read hex encodings on stdin; write one TSV row\n"
         "                  per encoding carrying both decoders' views\n"
         "  --layer=boundary|fields   compare LLVM against the decode\n"
@@ -2092,6 +2125,18 @@ int main(int argc, char **argv)
         else if (!strncmp(argv[i], "--mattr=", 8)) mattr = argv[i] + 8;
         else if (!strncmp(argv[i], "--mcpu=", 7)) mcpu = argv[i] + 7;
         else if (!strncmp(argv[i], "--allow=", 8)) allow = argv[i] + 8;
+        else if (!strncmp(argv[i], "--falsify=", 10)) {
+            const char *spec = argv[i] + 10;
+            const char *colon = strchr(spec, ':');
+            if (!colon || colon == spec || !colon[1]) { usage(); return 2; }
+            falsify_mode.assign(spec, colon - spec);
+            falsify_mnem = colon + 1;
+            if (falsify_mode != "drop-src" && falsify_mode != "add-dst") {
+                fprintf(stderr, "isaxcheck: --falsify mode must be "
+                        "drop-src or add-dst\n");
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "--check")) check = true;
         else if (!strcmp(argv[i], "--emit-raw")) emit_raw = true;
         else if (!strcmp(argv[i], "--keep-zero")) drop_zero = false;
@@ -2174,7 +2219,17 @@ int main(int argc, char **argv)
             printf("boundary-in-generic\n   RD{%s}\n   WR{%s}\n",
                    gensetstr(c.grd).c_str(), gensetstr(c.gwr).c_str());
         }
-        return 0;
+        /*
+         * With --check, the same bytes also go through compare() and fall
+         * through to the report and exit-code machinery below, exactly as
+         * one sweep iteration would.  That is what lets a single encoding
+         * prove the gate end to end — signature minting, allowlisting and
+         * the exit code — which is how the falsifier is asserted without
+         * paying for a full sweep.
+         */
+        if (!check) return 0;
+        total_tried++;
+        compare(b, n);
     }
 
     /*
@@ -2233,7 +2288,9 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    if (jobs > 1) {
+    if (hexone) {
+        /* The single-encoding compare already ran above; skip the sweep. */
+    } else if (jobs > 1) {
         /*
          * Fork one child per shard.  Each child sweeps its stripe and writes
          * its bucket map to a pipe; the parent drains the pipes in order and

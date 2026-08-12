@@ -1,0 +1,617 @@
+# isaxcheck fields-layer allowlist — the justified residual of
+# `isaxcheck --layer=fields --classes=MBR`, which compares the InsnFields
+# the dependency model records (what the trace is BUILT from) against
+# LLVM MC.  Same file format and matching rules as isaxcheck_allow.txt;
+# a separate file because the allowlist loader is layer-blind: an F row
+# in the boundary file would go dead in every boundary run and fail that
+# gate, exactly as W rows needed isaxcheck_fixups.txt.
+#
+# Author: Maccoy Merrell
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# WHY ONLY mipsel AND aarch64.  This layer is the static-decode oracle the
+# owner named for the two ISAs with no external ground truth (no PIN, no
+# Spike): it is what must alert when the QEMU-execution-derived register
+# capture of the behavioural-oracle arc disagrees with what the trace
+# records today.  x86_64 and riscv64 close that loop through PIN and Spike
+# instead; their fields residual is not yet triaged and is NOT vouched for
+# by this file.
+#
+# THE ROWS ARE THE OBSERVED RESIDUAL, EXACTLY.  Every row was produced by
+# a full sweep (151.0 M mipsel / 163.6 M aarch64 encodings, Capstone
+# 6.0.0-Alpha7, LLVM per the gate's summary line) and triaged into the
+# family comments below; the D (decode-agreement / subtarget-gap) class is
+# absent because the fields gate runs --classes=MBR — decode agreement is
+# the boundary gate's property, gated there.  No wildcards: an exact row
+# goes DEAD the moment either decoder or the dependency model moves, and
+# the gate fails on dead rows, which is the tripwire that keeps this file
+# maintained.  Do not edit a line to make the gate green.
+#
+# MOST OF THIS RESIDUAL IS THE BOUNDARY RESIDUAL SEEN ONE LAYER DOWN.
+# The fields are the boundary plus the plugin's repairs, so where the
+# plugin repairs nothing, a boundary disagreement passes straight
+# through; those families cross-reference the boundary family in
+# isaxcheck_allow.txt, whose comments carry the verification.  What is
+# genuinely NEW at this layer is the plugin's own classification: the
+# trap / MOPS / return branch taxonomy, prefetch-as-load memop modeling,
+# and the system-register writes the tracer records that LLVM's
+# instruction descriptions structurally cannot name.
+
+# =====================================================================
+# mipsel
+# =====================================================================
+
+# Control-flow the ISA table classifies and LLVM's per-opcode flags do
+# not.  Traps and exception returns (break / syscall / sdbbp / eret /
+# deret) are BRANCH_SYSCALL_TYPE-class on the fields side because the BB
+# chain must seal a true BB at a trap — the same deliberate
+# classification the fixups file asserts for the aarch64 trap space, and
+# the same reason.  jalr.hb is a genuine jump-and-link (hazard-barrier
+# form) whose LLVM description carries no branch flag at all.  The two
+# `jr` rows are the operand-dependent cases per-opcode flags cannot
+# express: `jr $ra` IS a return (fields say so, LLVM's JR cannot), and
+# the jalr-with-rd=$zero alias links nothing (LLVM's JALR says call,
+# fields correctly say plain indirect branch).  Boundary twin:
+# `mipsel B-ret-mismatch jr cs-ret`.  Verified by --hex probes of
+# 0c000000 (syscall) and 0800e003 (jr $ra), 2026-08-12.
+mipsel FB-call-mismatch jr cs-nocall
+mipsel FB-flow-presence break cs-yes llvm-no
+mipsel FB-flow-presence deret cs-yes llvm-no
+mipsel FB-flow-presence eret cs-yes llvm-no
+mipsel FB-flow-presence jalr.hb cs-yes llvm-no
+mipsel FB-flow-presence sdbbp cs-yes llvm-no
+mipsel FB-flow-presence syscall cs-yes llvm-no
+mipsel FB-ret-mismatch jr cs-ret
+
+# LLVM's LUXC1 / SUXC1 descriptions carry neither mayLoad nor mayStore;
+# the instructions are the unaligned-indexed FP load and store, and the
+# fields side records exactly one load / one store slot for them.  LLVM
+# description gap, same class as the boundary twins
+# `mipsel M-cs-mem-llvm-none luxc1 / suxc1`.  Verified --hex=0500004c:
+# llvm mayLoad=0 mayStore=0 on a load.
+mipsel FM-cs-mem-llvm-none luxc1
+mipsel FM-cs-mem-llvm-none suxc1
+
+# mayLoad / mayStore are LLVM SCHEDULING properties, not semantics, and
+# LLVM sets both across the MIPS DSP-ASE arithmetic space to pin
+# instruction order around DSPControl.  None of these instructions
+# touches memory and the fields side reserves no memop slot for any of
+# them.  Identical artifact and identical row set to the boundary's
+# `mipsel M-llvm-mem-cs-none` block.  Verified --hex=521a007c
+# (absq_s.ph): llvm mayLoad=1 mayStore=1 on a register-only op.
+mipsel FM-llvm-mem-cs-none absq_s.ph load store
+mipsel FM-llvm-mem-cs-none absq_s.qb load store
+mipsel FM-llvm-mem-cs-none absq_s.w load store
+mipsel FM-llvm-mem-cs-none addq_s.w load store
+mipsel FM-llvm-mem-cs-none addsc load store
+mipsel FM-llvm-mem-cs-none addu.ph load store
+mipsel FM-llvm-mem-cs-none addu_s.ph load store
+mipsel FM-llvm-mem-cs-none addwc load store
+mipsel FM-llvm-mem-cs-none cmpgdu.eq.qb load store
+mipsel FM-llvm-mem-cs-none cmpgdu.le.qb load store
+mipsel FM-llvm-mem-cs-none cmpgdu.lt.qb load store
+mipsel FM-llvm-mem-cs-none cmpgu.eq.qb load store
+mipsel FM-llvm-mem-cs-none cmpgu.le.qb load store
+mipsel FM-llvm-mem-cs-none cmpgu.lt.qb load store
+mipsel FM-llvm-mem-cs-none cmpu.eq.qb load store
+mipsel FM-llvm-mem-cs-none insv load
+mipsel FM-llvm-mem-cs-none mul.ph load store
+mipsel FM-llvm-mem-cs-none mul_s.ph load store
+mipsel FM-llvm-mem-cs-none muleq_s.w.phl load store
+mipsel FM-llvm-mem-cs-none muleq_s.w.phr load store
+mipsel FM-llvm-mem-cs-none muleu_s.ph.qbl load store
+mipsel FM-llvm-mem-cs-none muleu_s.ph.qbr load store
+mipsel FM-llvm-mem-cs-none mulq_rs.ph load store
+mipsel FM-llvm-mem-cs-none mulq_rs.w load store
+mipsel FM-llvm-mem-cs-none mulq_s.ph load store
+mipsel FM-llvm-mem-cs-none mulq_s.w load store
+mipsel FM-llvm-mem-cs-none pick.ph load
+mipsel FM-llvm-mem-cs-none pick.qb load
+mipsel FM-llvm-mem-cs-none precr.qb.ph load store
+mipsel FM-llvm-mem-cs-none precrq_rs.ph.w load store
+mipsel FM-llvm-mem-cs-none precrqu_s.qb.ph load store
+mipsel FM-llvm-mem-cs-none rddsp load
+mipsel FM-llvm-mem-cs-none shll_s.ph load store
+mipsel FM-llvm-mem-cs-none shll_s.w load store
+mipsel FM-llvm-mem-cs-none shllv.ph load store
+mipsel FM-llvm-mem-cs-none shllv.qb load store
+mipsel FM-llvm-mem-cs-none shllv_s.ph load store
+mipsel FM-llvm-mem-cs-none shllv_s.w load store
+mipsel FM-llvm-mem-cs-none subq_s.w load store
+mipsel FM-llvm-mem-cs-none subu.ph load store
+mipsel FM-llvm-mem-cs-none subu_s.ph load store
+mipsel FM-llvm-mem-cs-none wrdsp load store
+
+# LWL / LWR read their own destination: the register keeps its unwritten
+# bytes, so the old value is a true source.  The boundary's partial-merge
+# workaround supplies the read (see the lwl/lwr entries in
+# isaxcheck_allow.txt and the ambiguity-probe arc that added it); LLVM
+# models the merge as a tied operand only on its store side, so its read
+# set stays empty here.  The fields side is the CORRECT one.  Verified
+# --hex=00000188: fields SRC{REG_GPR1,...} on lwl $at.
+mipsel FR-rd-phantom lwl +REG_FP_REG
+mipsel FR-rd-phantom lwl +REG_GPR#
+mipsel FR-rd-phantom lwl +REG_LR
+mipsel FR-rd-phantom lwl +REG_SP
+mipsel FR-rd-phantom lwr +REG_FP_REG
+mipsel FR-rd-phantom lwr +REG_GPR#
+mipsel FR-rd-phantom lwr +REG_LR
+mipsel FR-rd-phantom lwr +REG_SP
+
+# DSPControl, which the tracer folds onto REG_FLAGS: bposge32 branches
+# on its pos field (read), rddsp copies fields out of it (read), wrdsp
+# writes fields into it (write), and mthlip both reads and increments
+# pos (the read is the row; the write both sides agree on).  LLVM models
+# no DSPControl use for any of them beyond mthlip's def.  The fields
+# side is correct throughout.  Boundary twins: the `+dsp` rows.
+mipsel FR-rd-phantom bposge32 +REG_FLAGS
+mipsel FR-rd-phantom mthlip +REG_FLAGS
+mipsel FR-rd-phantom rddsp +REG_FLAGS
+mipsel FR-wr-phantom wrdsp +REG_FLAGS
+
+# LLVM gives the FP condition branches (bc1t / bc1f and the -likely
+# forms) an implicit def of $at, modelling its own long-branch assembler
+# macro expansion rather than the architecture; the instruction writes
+# no GPR.  Keeping the def would fabricate a WAW hazard on $at across
+# every FP branch.  Boundary twin family: `mipsel R-wr-missing bc1* +r#`
+# (whose comment carries the full story).  Verified --hex=00000145:
+# llvm WR{r1} on bc1t.
+mipsel FR-wr-missing bc1f +REG_GPR#
+mipsel FR-wr-missing bc1fl +REG_GPR#
+mipsel FR-wr-missing bc1t +REG_GPR#
+mipsel FR-wr-missing bc1tl +REG_GPR#
+
+# CTCMSA — copy TO an MSA control register — is one disagreement seen
+# from two sides: LLVM's MCInstrDesc carries the control register as a
+# USE (so it sits in LLVM's read set, mapped through the register table
+# to REG_SYS), while Capstone and the tracer make it the DEF a
+# copy-to-control-register instruction plainly writes (the tracer's MSA
+# control id folds onto REG_FCSR).  Capstone and the tracer are correct.
+# Boundary twins: `mipsel R-rd-missing ctcmsa +cop#` /
+# `R-wr-phantom ctcmsa +cop#`, same single difference in the boundary
+# vocabulary.
+mipsel FR-rd-missing ctcmsa +REG_SYS
+mipsel FR-wr-phantom ctcmsa +REG_FCSR
+
+# =====================================================================
+# aarch64
+# =====================================================================
+
+# The exception-generation space — svc / hvc / smc / brk / hlt / udf /
+# dcps<n> — classified BRANCH_SYSCALL_TYPE by the ISA table so the BB
+# chain seals a true BB at the trap; none of them carries a control-flow
+# flag in LLVM.  SVC is the load-bearing member: every system call in an
+# AArch64 trace is one.  DRPS is the deliberate reversal — LLVM calls
+# the debug-state exception return a branch and the table does not,
+# because it is not an edge any consumer can follow.  This is the same
+# classification isaxcheck_fixups.txt asserts (its aarch64 trap section
+# carries the full story); boundary twins:
+# `aarch64 B-flow-presence hvc / smc / svc`.
+aarch64 FB-flow-presence brk cs-yes llvm-no
+aarch64 FB-flow-presence dcps1 cs-yes llvm-no
+aarch64 FB-flow-presence dcps2 cs-yes llvm-no
+aarch64 FB-flow-presence dcps3 cs-yes llvm-no
+aarch64 FB-flow-presence drps cs-no llvm-yes
+aarch64 FB-flow-presence hlt cs-yes llvm-no
+aarch64 FB-flow-presence hvc cs-yes llvm-no
+aarch64 FB-flow-presence smc cs-yes llvm-no
+aarch64 FB-flow-presence svc cs-yes llvm-no
+aarch64 FB-flow-presence udf cs-yes llvm-no
+
+# FEAT_MOPS bulk copy / set (cpyp / cpym / cpye / cpyfp / cpyfm / cpyfe
+# and the set* family, times their read/write x temporal option
+# suffixes).  BRANCH_REP is the tracer's own wire model, not an
+# architectural claim: these are the ISA's only instructions whose
+# memory fan-out is bounded by nothing but a register, so the ISA table
+# hands them to the same self-loop fan-out the x86 REP-prefixed string
+# ops use — the instruction becomes its own true BB and each execution
+# emits one body entry per memory access (see the FEAT_MOPS comment in
+# champsim_tracer_mnemonic_audit.py).  LLVM correctly reports no branch;
+# the disagreement IS the design.  Verified --hex=2204801d (cpye):
+# fields BRANCH_REP cond, register/flags dataflow agreeing with LLVM.
+aarch64 FB-flow-presence cpye cs-yes llvm-no
+aarch64 FB-flow-presence cpyen cs-yes llvm-no
+aarch64 FB-flow-presence cpyern cs-yes llvm-no
+aarch64 FB-flow-presence cpyert cs-yes llvm-no
+aarch64 FB-flow-presence cpyertn cs-yes llvm-no
+aarch64 FB-flow-presence cpyertrn cs-yes llvm-no
+aarch64 FB-flow-presence cpyertwn cs-yes llvm-no
+aarch64 FB-flow-presence cpyet cs-yes llvm-no
+aarch64 FB-flow-presence cpyetn cs-yes llvm-no
+aarch64 FB-flow-presence cpyetrn cs-yes llvm-no
+aarch64 FB-flow-presence cpyetwn cs-yes llvm-no
+aarch64 FB-flow-presence cpyewn cs-yes llvm-no
+aarch64 FB-flow-presence cpyewt cs-yes llvm-no
+aarch64 FB-flow-presence cpyewtn cs-yes llvm-no
+aarch64 FB-flow-presence cpyewtrn cs-yes llvm-no
+aarch64 FB-flow-presence cpyewtwn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfe cs-yes llvm-no
+aarch64 FB-flow-presence cpyfen cs-yes llvm-no
+aarch64 FB-flow-presence cpyfern cs-yes llvm-no
+aarch64 FB-flow-presence cpyfert cs-yes llvm-no
+aarch64 FB-flow-presence cpyfertn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfertrn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfertwn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfet cs-yes llvm-no
+aarch64 FB-flow-presence cpyfetn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfetrn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfetwn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfewn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfewt cs-yes llvm-no
+aarch64 FB-flow-presence cpyfewtn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfewtrn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfewtwn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfm cs-yes llvm-no
+aarch64 FB-flow-presence cpyfmn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfmrn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfmrt cs-yes llvm-no
+aarch64 FB-flow-presence cpyfmrtn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfmrtrn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfmrtwn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfmt cs-yes llvm-no
+aarch64 FB-flow-presence cpyfmtn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfmtrn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfmtwn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfmwn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfmwt cs-yes llvm-no
+aarch64 FB-flow-presence cpyfmwtn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfmwtrn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfmwtwn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfp cs-yes llvm-no
+aarch64 FB-flow-presence cpyfpn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfprn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfprt cs-yes llvm-no
+aarch64 FB-flow-presence cpyfprtn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfprtrn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfprtwn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfpt cs-yes llvm-no
+aarch64 FB-flow-presence cpyfptn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfptrn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfptwn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfpwn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfpwt cs-yes llvm-no
+aarch64 FB-flow-presence cpyfpwtn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfpwtrn cs-yes llvm-no
+aarch64 FB-flow-presence cpyfpwtwn cs-yes llvm-no
+aarch64 FB-flow-presence cpym cs-yes llvm-no
+aarch64 FB-flow-presence cpymn cs-yes llvm-no
+aarch64 FB-flow-presence cpymrn cs-yes llvm-no
+aarch64 FB-flow-presence cpymrt cs-yes llvm-no
+aarch64 FB-flow-presence cpymrtn cs-yes llvm-no
+aarch64 FB-flow-presence cpymrtrn cs-yes llvm-no
+aarch64 FB-flow-presence cpymrtwn cs-yes llvm-no
+aarch64 FB-flow-presence cpymt cs-yes llvm-no
+aarch64 FB-flow-presence cpymtn cs-yes llvm-no
+aarch64 FB-flow-presence cpymtrn cs-yes llvm-no
+aarch64 FB-flow-presence cpymtwn cs-yes llvm-no
+aarch64 FB-flow-presence cpymwn cs-yes llvm-no
+aarch64 FB-flow-presence cpymwt cs-yes llvm-no
+aarch64 FB-flow-presence cpymwtn cs-yes llvm-no
+aarch64 FB-flow-presence cpymwtrn cs-yes llvm-no
+aarch64 FB-flow-presence cpymwtwn cs-yes llvm-no
+aarch64 FB-flow-presence cpyp cs-yes llvm-no
+aarch64 FB-flow-presence cpypn cs-yes llvm-no
+aarch64 FB-flow-presence cpyprn cs-yes llvm-no
+aarch64 FB-flow-presence cpyprt cs-yes llvm-no
+aarch64 FB-flow-presence cpyprtn cs-yes llvm-no
+aarch64 FB-flow-presence cpyprtrn cs-yes llvm-no
+aarch64 FB-flow-presence cpyprtwn cs-yes llvm-no
+aarch64 FB-flow-presence cpypt cs-yes llvm-no
+aarch64 FB-flow-presence cpyptn cs-yes llvm-no
+aarch64 FB-flow-presence cpyptrn cs-yes llvm-no
+aarch64 FB-flow-presence cpyptwn cs-yes llvm-no
+aarch64 FB-flow-presence cpypwn cs-yes llvm-no
+aarch64 FB-flow-presence cpypwt cs-yes llvm-no
+aarch64 FB-flow-presence cpypwtn cs-yes llvm-no
+aarch64 FB-flow-presence cpypwtrn cs-yes llvm-no
+aarch64 FB-flow-presence cpypwtwn cs-yes llvm-no
+aarch64 FB-flow-presence sete cs-yes llvm-no
+aarch64 FB-flow-presence seten cs-yes llvm-no
+aarch64 FB-flow-presence setet cs-yes llvm-no
+aarch64 FB-flow-presence setetn cs-yes llvm-no
+aarch64 FB-flow-presence setge cs-yes llvm-no
+aarch64 FB-flow-presence setgen cs-yes llvm-no
+aarch64 FB-flow-presence setget cs-yes llvm-no
+aarch64 FB-flow-presence setgetn cs-yes llvm-no
+aarch64 FB-flow-presence setgm cs-yes llvm-no
+aarch64 FB-flow-presence setgmn cs-yes llvm-no
+aarch64 FB-flow-presence setgmt cs-yes llvm-no
+aarch64 FB-flow-presence setgmtn cs-yes llvm-no
+aarch64 FB-flow-presence setgp cs-yes llvm-no
+aarch64 FB-flow-presence setgpn cs-yes llvm-no
+aarch64 FB-flow-presence setgpt cs-yes llvm-no
+aarch64 FB-flow-presence setgptn cs-yes llvm-no
+aarch64 FB-flow-presence setm cs-yes llvm-no
+aarch64 FB-flow-presence setmn cs-yes llvm-no
+aarch64 FB-flow-presence setmt cs-yes llvm-no
+aarch64 FB-flow-presence setmtn cs-yes llvm-no
+aarch64 FB-flow-presence setp cs-yes llvm-no
+aarch64 FB-flow-presence setpn cs-yes llvm-no
+aarch64 FB-flow-presence setpt cs-yes llvm-no
+aarch64 FB-flow-presence setptn cs-yes llvm-no
+
+# The FPCR rounding-mode read Capstone reports on every scalar-FP and
+# SVE operation and LLVM does not model, folded to REG_FCSR by the
+# register table.  Inherited unchanged from the boundary residual —
+# the `+fpcr` family in isaxcheck_allow.txt, whose comment is the
+# verification.  (mrs / mrrs / msr / msrr rows live in the
+# system-register sections below, not here, whichever register they
+# name.)
+aarch64 FR-rd-phantom fabs +REG_FCSR
+aarch64 FR-rd-phantom fadda +REG_FCSR
+aarch64 FR-rd-phantom fccmp +REG_FCSR
+aarch64 FR-rd-phantom fccmpe +REG_FCSR
+aarch64 FR-rd-phantom fneg +REG_FCSR
+aarch64 FR-rd-phantom sqabs +REG_FCSR
+aarch64 FR-rd-phantom sqadd +REG_FCSR
+aarch64 FR-rd-phantom sqcadd +REG_FCSR
+aarch64 FR-rd-phantom sqcvt +REG_FCSR
+aarch64 FR-rd-phantom sqcvtn +REG_FCSR
+aarch64 FR-rd-phantom sqcvtu +REG_FCSR
+aarch64 FR-rd-phantom sqcvtun +REG_FCSR
+aarch64 FR-rd-phantom sqdecb +REG_FCSR
+aarch64 FR-rd-phantom sqdecd +REG_FCSR
+aarch64 FR-rd-phantom sqdech +REG_FCSR
+aarch64 FR-rd-phantom sqdecp +REG_FCSR
+aarch64 FR-rd-phantom sqdecw +REG_FCSR
+aarch64 FR-rd-phantom sqdmlal +REG_FCSR
+aarch64 FR-rd-phantom sqdmlal2 +REG_FCSR
+aarch64 FR-rd-phantom sqdmlalb +REG_FCSR
+aarch64 FR-rd-phantom sqdmlalbt +REG_FCSR
+aarch64 FR-rd-phantom sqdmlalt +REG_FCSR
+aarch64 FR-rd-phantom sqdmlsl +REG_FCSR
+aarch64 FR-rd-phantom sqdmlsl2 +REG_FCSR
+aarch64 FR-rd-phantom sqdmlslb +REG_FCSR
+aarch64 FR-rd-phantom sqdmlslbt +REG_FCSR
+aarch64 FR-rd-phantom sqdmlslt +REG_FCSR
+aarch64 FR-rd-phantom sqdmulh +REG_FCSR
+aarch64 FR-rd-phantom sqdmull +REG_FCSR
+aarch64 FR-rd-phantom sqdmull2 +REG_FCSR
+aarch64 FR-rd-phantom sqdmullb +REG_FCSR
+aarch64 FR-rd-phantom sqdmullt +REG_FCSR
+aarch64 FR-rd-phantom sqincb +REG_FCSR
+aarch64 FR-rd-phantom sqincd +REG_FCSR
+aarch64 FR-rd-phantom sqinch +REG_FCSR
+aarch64 FR-rd-phantom sqincp +REG_FCSR
+aarch64 FR-rd-phantom sqincw +REG_FCSR
+aarch64 FR-rd-phantom sqneg +REG_FCSR
+aarch64 FR-rd-phantom sqrdcmlah +REG_FCSR
+aarch64 FR-rd-phantom sqrdmlah +REG_FCSR
+aarch64 FR-rd-phantom sqrdmlsh +REG_FCSR
+aarch64 FR-rd-phantom sqrdmulh +REG_FCSR
+aarch64 FR-rd-phantom sqrshl +REG_FCSR
+aarch64 FR-rd-phantom sqrshlr +REG_FCSR
+aarch64 FR-rd-phantom sqrshr +REG_FCSR
+aarch64 FR-rd-phantom sqrshrn +REG_FCSR
+aarch64 FR-rd-phantom sqrshrn2 +REG_FCSR
+aarch64 FR-rd-phantom sqrshrnb +REG_FCSR
+aarch64 FR-rd-phantom sqrshrnt +REG_FCSR
+aarch64 FR-rd-phantom sqrshru +REG_FCSR
+aarch64 FR-rd-phantom sqrshrun +REG_FCSR
+aarch64 FR-rd-phantom sqrshrun2 +REG_FCSR
+aarch64 FR-rd-phantom sqrshrunb +REG_FCSR
+aarch64 FR-rd-phantom sqrshrunt +REG_FCSR
+aarch64 FR-rd-phantom sqshl +REG_FCSR
+aarch64 FR-rd-phantom sqshlr +REG_FCSR
+aarch64 FR-rd-phantom sqshlu +REG_FCSR
+aarch64 FR-rd-phantom sqshrn +REG_FCSR
+aarch64 FR-rd-phantom sqshrn2 +REG_FCSR
+aarch64 FR-rd-phantom sqshrnb +REG_FCSR
+aarch64 FR-rd-phantom sqshrnt +REG_FCSR
+aarch64 FR-rd-phantom sqshrun +REG_FCSR
+aarch64 FR-rd-phantom sqshrun2 +REG_FCSR
+aarch64 FR-rd-phantom sqshrunb +REG_FCSR
+aarch64 FR-rd-phantom sqshrunt +REG_FCSR
+aarch64 FR-rd-phantom sqsub +REG_FCSR
+aarch64 FR-rd-phantom sqsubr +REG_FCSR
+aarch64 FR-rd-phantom sqxtn +REG_FCSR
+aarch64 FR-rd-phantom sqxtn2 +REG_FCSR
+aarch64 FR-rd-phantom sqxtnb +REG_FCSR
+aarch64 FR-rd-phantom sqxtnt +REG_FCSR
+aarch64 FR-rd-phantom sqxtun +REG_FCSR
+aarch64 FR-rd-phantom sqxtun2 +REG_FCSR
+aarch64 FR-rd-phantom sqxtunb +REG_FCSR
+aarch64 FR-rd-phantom sqxtunt +REG_FCSR
+aarch64 FR-rd-phantom uqadd +REG_FCSR
+aarch64 FR-rd-phantom uqcvt +REG_FCSR
+aarch64 FR-rd-phantom uqcvtn +REG_FCSR
+aarch64 FR-rd-phantom uqdecb +REG_FCSR
+aarch64 FR-rd-phantom uqdecd +REG_FCSR
+aarch64 FR-rd-phantom uqdech +REG_FCSR
+aarch64 FR-rd-phantom uqdecp +REG_FCSR
+aarch64 FR-rd-phantom uqdecw +REG_FCSR
+aarch64 FR-rd-phantom uqincb +REG_FCSR
+aarch64 FR-rd-phantom uqincd +REG_FCSR
+aarch64 FR-rd-phantom uqinch +REG_FCSR
+aarch64 FR-rd-phantom uqincp +REG_FCSR
+aarch64 FR-rd-phantom uqincw +REG_FCSR
+aarch64 FR-rd-phantom uqrshl +REG_FCSR
+aarch64 FR-rd-phantom uqrshlr +REG_FCSR
+aarch64 FR-rd-phantom uqrshr +REG_FCSR
+aarch64 FR-rd-phantom uqrshrn +REG_FCSR
+aarch64 FR-rd-phantom uqrshrn2 +REG_FCSR
+aarch64 FR-rd-phantom uqrshrnb +REG_FCSR
+aarch64 FR-rd-phantom uqrshrnt +REG_FCSR
+aarch64 FR-rd-phantom uqshl +REG_FCSR
+aarch64 FR-rd-phantom uqshlr +REG_FCSR
+aarch64 FR-rd-phantom uqshrn +REG_FCSR
+aarch64 FR-rd-phantom uqshrn2 +REG_FCSR
+aarch64 FR-rd-phantom uqshrnb +REG_FCSR
+aarch64 FR-rd-phantom uqshrnt +REG_FCSR
+aarch64 FR-rd-phantom uqsub +REG_FCSR
+aarch64 FR-rd-phantom uqsubr +REG_FCSR
+aarch64 FR-rd-phantom uqxtn +REG_FCSR
+aarch64 FR-rd-phantom uqxtn2 +REG_FCSR
+aarch64 FR-rd-phantom uqxtnb +REG_FCSR
+aarch64 FR-rd-phantom uqxtnt +REG_FCSR
+
+# The system-register space reached through MRS / MRRS / MSR / MSRR.
+# LLVM's descriptions carry the system register as an IMMEDIATE — the
+# 15-bit encoding, unexpanded — so no register the tracer records for
+# these instructions can EVER appear on LLVM's side: the read the tracer
+# takes for MRS (REG_SYS / REG_FCSR / REG_TLS / REG_FLAGS by selector)
+# is a phantom here, and the write it takes for MSR is missing-in-LLVM,
+# structurally.  This is the documented Zicsr shape from the isaxcheck.cc
+# header; what actually vouches for these dependencies is
+# implicit_audit.py, not this gate.  REG_TLS is tpidr_el0 — every
+# thread-local access begins there, the member with real dynamic
+# weight.  REG_FLAGS via `msr nzcv` folds onto the same id ordinary
+# flag-writing arithmetic uses, which is what makes `msr nzcv, x0`
+# define what a later b.eq tests.  Boundary twins: the mrs/msr
+# `+sys/+fcsr/+tls/+flags` blocks.
+aarch64 FR-rd-phantom mrrs +REG_FCSR
+aarch64 FR-rd-phantom mrrs +REG_SYS
+aarch64 FR-rd-phantom mrs +REG_FCSR
+aarch64 FR-rd-phantom mrs +REG_FLAGS
+aarch64 FR-rd-phantom mrs +REG_SYS
+aarch64 FR-rd-phantom mrs +REG_TLS
+aarch64 FR-wr-phantom msr +REG_FCSR
+aarch64 FR-wr-phantom msr +REG_FLAGS
+aarch64 FR-wr-phantom msr +REG_SYS
+aarch64 FR-wr-phantom msr +REG_TLS
+aarch64 FR-wr-phantom msrr +REG_FCSR
+aarch64 FR-wr-phantom msrr +REG_SYS
+
+# LLVM gives the whole MSR-immediate-to-PSTATE form (and MRS) an NZCV
+# def because one PSTATE field it can name IS NZCV; every alias inherits
+# it, including the SME streaming-mode switches, which write PSTATE.SM /
+# PSTATE.ZA and leave the condition flags alone.  For those members the
+# def is LLVM's phantom and the fields side is right.  ONE member is the
+# other way around: `mrs xN, RNDR` / `RNDRRS` really does set NZCV
+# (Z flags entropy failure) and Capstone reports no flags write, so for
+# that alias the missing write is REAL — a Capstone gap the boundary
+# comment now names, carried by this same signature because keys collapse
+# to the mnemonic.  Work item filed; the execution-derived capture of the
+# behavioural-oracle arc closes it, and when it does this row goes DEAD
+# and the gate demands its removal.  Verified --hex=02243bd5 (mrs x2,
+# RNDR): llvm WR{nzcv,r2}, boundary and fields WR{r2} only.
+aarch64 FR-wr-missing mrs +REG_FLAGS
+aarch64 FR-wr-missing msr +REG_FLAGS
+aarch64 FR-wr-missing smstart +REG_FLAGS
+aarch64 FR-wr-missing smstop +REG_FLAGS
+
+# SME ZA, which LLVM models as immediates rather than registers where
+# the tracer records REG_MATRIX: `zero {za1.s}` names its tile list as
+# an immediate mask on LLVM's side (boundary twins: the `zero +za`
+# rows).
+aarch64 FR-rd-phantom zero +REG_MATRIX
+aarch64 FR-wr-phantom zero +REG_MATRIX
+
+# mayLoad / mayStore as LLVM SCHEDULING properties again (see the
+# mipsel DSP block and the boundary's aarch64 barrier/hint comment): the
+# barrier and hint space, WFE/WFI/yield, and the SVE/SME members whose
+# ordered state (FFR, ZA) LLVM pins by claiming memory.  None of them
+# touches memory; the fields side reserves no memop slot.  Identical row
+# set to the boundary's `aarch64 M-llvm-mem-cs-none` block.
+aarch64 FM-llvm-mem-cs-none bti load store
+aarch64 FM-llvm-mem-cs-none clrbhb load store
+aarch64 FM-llvm-mem-cs-none clrex load store
+aarch64 FM-llvm-mem-cs-none csdb load store
+aarch64 FM-llvm-mem-cs-none dfb load store
+aarch64 FM-llvm-mem-cs-none dgh load store
+aarch64 FM-llvm-mem-cs-none dmb load store
+aarch64 FM-llvm-mem-cs-none dsb load store
+aarch64 FM-llvm-mem-cs-none esb load store
+aarch64 FM-llvm-mem-cs-none gcsb load store
+aarch64 FM-llvm-mem-cs-none hint load store
+aarch64 FM-llvm-mem-cs-none isb load store
+aarch64 FM-llvm-mem-cs-none luti2 load
+aarch64 FM-llvm-mem-cs-none luti4 load
+aarch64 FM-llvm-mem-cs-none mov load store
+aarch64 FM-llvm-mem-cs-none nop load store
+aarch64 FM-llvm-mem-cs-none prfb load store
+aarch64 FM-llvm-mem-cs-none prfd load store
+aarch64 FM-llvm-mem-cs-none prfh load store
+aarch64 FM-llvm-mem-cs-none prfw load store
+aarch64 FM-llvm-mem-cs-none psb load store
+aarch64 FM-llvm-mem-cs-none pssbb load store
+aarch64 FM-llvm-mem-cs-none setffr store
+aarch64 FM-llvm-mem-cs-none sev load store
+aarch64 FM-llvm-mem-cs-none sevl load store
+aarch64 FM-llvm-mem-cs-none ssbb load store
+aarch64 FM-llvm-mem-cs-none tcancel load store
+aarch64 FM-llvm-mem-cs-none tcommit load store
+aarch64 FM-llvm-mem-cs-none tstart load store
+aarch64 FM-llvm-mem-cs-none wfe load store
+aarch64 FM-llvm-mem-cs-none wfi load store
+aarch64 FM-llvm-mem-cs-none wrffr store
+aarch64 FM-llvm-mem-cs-none yield load store
+
+# Prefetches: the fields side deliberately carries the address of
+# PRFM / PRFUM / RPRFM as a load-class memop (GEN_OP_PREFETCH) — a
+# prefetch with no address would be useless to a cache model — while
+# LLVM's descriptions say no memory, which is architecturally true (a
+# hint) and useless on the wire.  The disagreement is the tracer's
+# design.  Verified --hex=220000d8 (prfm): fields loads=1, llvm
+# mayLoad=0.
+aarch64 FM-cs-mem-llvm-none prfm
+aarch64 FM-cs-mem-llvm-none prfum
+aarch64 FM-cs-mem-llvm-none rprfm
+
+# LLVM description gaps in the other direction: instructions that DO
+# access memory with neither mayLoad nor mayStore set — DC ZVA (an
+# architectural store of zeros), the LRCPC2 unscaled-offset loads
+# (ldapursb/sh/sw), the FEAT_LS64 64-byte forms and the MTE bulk-tag
+# stores (stgm / stzgm).  The fields side records the slots.  Boundary
+# twins: the `aarch64 M-cs-mem-llvm-none` rows for the same mnemonics.
+aarch64 FM-cs-mem-llvm-none dc
+aarch64 FM-cs-mem-llvm-none ld64b
+aarch64 FM-cs-mem-llvm-none ldapursb
+aarch64 FM-cs-mem-llvm-none ldapursh
+aarch64 FM-cs-mem-llvm-none ldapursw
+aarch64 FM-cs-mem-llvm-none st64b
+aarch64 FM-cs-mem-llvm-none st64bv
+aarch64 FM-cs-mem-llvm-none st64bv0
+aarch64 FM-cs-mem-llvm-none stgm
+aarch64 FM-cs-mem-llvm-none stzgm
+
+# SME ZA-slice stores (st1b/h/w/d/q {zaNh...}): LLVM marks them mayLoad
+# as well as mayStore — modelling the ZA tile read as memory — but no
+# architectural load exists and the fields side reserves store slots
+# only.  Boundary twins: `aarch64 M-miss-load st1b..st1w`.
+aarch64 FM-miss-load st1b
+aarch64 FM-miss-load st1d
+aarch64 FM-miss-load st1h
+aarch64 FM-miss-load st1q
+aarch64 FM-miss-load st1w
+
+# REAL DEPENDENCY-MODEL GAPS, inherited from Capstone operand reporting
+# and allowlisted at the boundary — named here as defects, not vouched
+# for.  These are exactly the rows the behavioural-oracle arc's
+# execution-derived register capture exists to close; each goes DEAD
+# when that lands, and the gate then demands its removal.
+#
+#   - FEAT_LS64: LD64B writes and ST64B/ST64BV/ST64BV0 read a GROUP of
+#     eight consecutive registers; Capstone names only the first, so the
+#     fields record one of eight.  Verified --hex=22903ff8: llvm
+#     RD{r1..r9}, fields RD{r1,r2}.  Zero dynamic weight in current
+#     workloads (no guest uses FEAT_LS64), which is why it is tolerable
+#     to carry, not why it is right.
+#   - PSEL's vector-select index read (the W register in p1.b[w12, 0])
+#     is absent from Capstone's detail.  Boundary twin:
+#     `aarch64 R-rd-missing psel +r#`.
+aarch64 FR-rd-missing psel +REG_GPR#
+aarch64 FR-rd-missing st64b +REG_GPR#
+aarch64 FR-rd-missing st64bv +REG_GPR#
+aarch64 FR-rd-missing st64bv0 +REG_GPR#
+aarch64 FR-wr-missing ld64b +REG_GPR#
+
+# LDG marks its address base register written in Capstone's detail; the
+# instruction has no writeback and only Xt is written.  Capstone
+# access-flag defect, inherited; fabricates a WAW on the base register
+# wherever MTE LDG appears (kernel MTE paths only today).  Boundary
+# twins: `aarch64 R-wr-phantom ldg +r# / +sp`, same defect one layer up.
+# Verified --hex=224060d9: boundary WR{r1,r2}, llvm WR{r2}.
+aarch64 FR-wr-phantom ldg +REG_FP_REG
+aarch64 FR-wr-phantom ldg +REG_GPR#
+aarch64 FR-wr-phantom ldg +REG_LR
+aarch64 FR-wr-phantom ldg +REG_SP
+
+# The TLBI operations that take no Xt argument are encoded in the SYS
+# format whose Rt the architecture requires to be 0b11111; LLVM keeps
+# the syntactic operand and reports it read whatever the field holds, so
+# only reserved encodings no assembler emits (Rt != 31) disagree.
+# Capstone and the fields are right.  Boundary twin:
+# `aarch64 R-rd-missing tlbi +r#`, whose comment is the verification.
+aarch64 FR-rd-missing tlbi +REG_GPR#
+

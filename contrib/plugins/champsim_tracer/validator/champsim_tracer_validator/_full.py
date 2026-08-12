@@ -154,6 +154,7 @@ FEATURES: dict[str, str] = {
     "behavior:wrong_path_coverage": "static_templates=1: minted-alternate never-executed fall-through + BTB target coverage, deepened by static_depth (4-ISA)",
     "behavior:isa_crosscheck": "the decode metadata the tracer consumes (Capstone + the disas/capstone.c correction boundary) agrees with an independently maintained decoder (LLVM MC) across an exhaustive sweep of the opcode-bearing encoding space, on all four ISAs, outside a justified allowlist",
     "behavior:decode_fixups": "the repairs the plugin makes to the decode boundary -- the register edges apply_isa_branch_fixups() restores, the register groups the operand walker expands, the branch taxonomy the ISA tables supply -- still happen, asserted per signature in both directions so a repair that silently stops fails as surely as one nobody wrote down; the boundary comparison cannot see this, because a regressed repair reintroduces exactly the disagreement its allowlist already expects",
+    "behavior:decode_fields": "the InsnFields the dependency model records -- the layer the trace is BUILT from -- agree with LLVM MC across an exhaustive fields-layer sweep on mipsel and aarch64, the two ISAs whose only register-capture ground truth is static decode (no PIN, no Spike); the check first PROVES the oracle can fire by injecting a wrong register attribution (--falsify) and requiring the gate to go red naming the damaged mnemonic, then requires the undamaged sweep to be green outside tools/isaxcheck_fields_allow.txt with zero dead rules",
     "behavior:implicit_operands": "the implicit operands — architectural state an instruction touches that its encoding does not name — that the decode boundary reports today are still reported, asserted per encoding against expectations derived from BEHAVIOUR rather than from any decoder (Arm's Machine Readable Architecture, the Sail RISC-V model, QEMU's MIPS TCG translator), so the class of defect where Capstone and LLVM agree and are both wrong is visible at all; each row carries a disposition and the dynamic weight of its instruction form",
     "behavior:segment_final_memops": "the segment's last body entry carries its memory operands, matching the earlier executions of the same true BB (the deferred icount/simpoint window close emits it after it has run, not before)",
     "behavior:smc_revisions": "self-modifying code: correct-path template-revision minting for rewrites that preserve OR change the block's instruction boundaries, content-signature id reuse, and the per-pc revision cap (4-ISA)",
@@ -1680,6 +1681,114 @@ def _chk_decode_fixups(ctx: Ctx) -> Outcome:
                    "(4 ISAs, both directions)", subs)
 
 
+def _chk_decode_fields(ctx: Ctx) -> Outcome:
+    """The static-decode oracle for the dependency model itself, armed.
+
+    features.isa_crosscheck gates the decode BOUNDARY and
+    features.decode_fixups asserts the plugin's repairs on top of it, but
+    neither compares what the trace is actually built from -- the
+    InsnFields decode_detail_to_generic() records -- against anything
+    independent.  ``isaxcheck --layer=fields`` does exactly that, and it
+    spent its first months with zero allowlist rows and zero invocations:
+    a gate that could not fail, vouching for nothing, sitting underneath
+    the very oracle the behavioural-oracle arc names for MIPS and aarch64
+    (the two ISAs with no PIN and no Spike -- static decode is their ONLY
+    independent register-capture ground truth).
+
+    So this check refuses to trust green without seeing red first:
+
+      1. FALSIFIER.  For a known-good encoding, injects a wrong register
+         attribution at exactly the layer a real defect would sit
+         (``--falsify=drop-src`` erases the reads; ``--falsify=add-dst``
+         plants a phantom write) and REQUIRES the gate to exit non-zero
+         naming the damaged mnemonic in the expected signature class
+         (FR-rd-missing / FR-wr-phantom).  A falsifier that does not fire
+         fails the check outright -- a green sweep from an instrument that
+         cannot alert is not evidence.
+      2. SWEEP.  The full fields-layer sweep (--classes=MBR; the D class
+         is the boundary gate's property), gated against
+         tools/isaxcheck_fields_allow.txt with the same NEW-and-DEAD
+         semantics as the boundary gate: an untriaged disagreement fails,
+         and an allowlist row that no longer matches fails as a dead rule
+         -- which is what will demand row removals when the
+         execution-derived register capture lands and starts closing the
+         inherited Capstone gaps that file names as open defects.
+
+    GATING, mipsel + aarch64.  x86_64 and riscv64 close the same loop
+    through PIN and Spike (owner ruling 2026-08-09); their fields residual
+    is not yet triaged and is deliberately not run here.
+    """
+    tool = ctx.build_dir / "contrib/plugins/isaxcheck"
+    allow = (Path(__file__).resolve().parents[2]
+             / "tools" / "isaxcheck_fields_allow.txt")
+    if not tool.is_file():
+        return Outcome("fail",
+                       f"isaxcheck not built at {tool}.  It needs LLVM MC "
+                       "(llvm-18-dev or newer supplying llvm-config); the "
+                       "fields layer links the plugin's own decode "
+                       "translation unit into that same binary.")
+    if not allow.is_file():
+        return Outcome("fail", f"fields allowlist missing at {allow}")
+
+    # One known-good encoding per ISA, chosen to compare clean when
+    # healthy (asserted below) so the falsified runs are a strict A/B.
+    probes = {"mipsel": ("2120a600", "addu"),     # addu $a0, $a1, $a2
+              "aarch64": ("4100038b", "add")}     # add x1, x2, x3
+    subs: list = []
+    all_ok = True
+    for isa in ("mipsel", "aarch64"):
+        hexenc, mnem = probes[isa]
+        base = [str(tool), f"--isa={isa}", "--layer=fields", "--classes=MBR"]
+        ok = True
+        details: list = []
+
+        p = subprocess.run(base + [f"--hex={hexenc}", "--check"],
+                           text=True, capture_output=True, timeout=120)
+        if p.returncode != 0:
+            ok = False
+            details.append(
+                f"healthy probe {mnem} not clean (rc={p.returncode}): "
+                + (p.stdout or p.stderr).strip()[:200])
+        for mode, want in (("drop-src", "FR-rd-missing"),
+                           ("add-dst", "FR-wr-phantom")):
+            p = subprocess.run(base + [f"--hex={hexenc}", "--check",
+                                       f"--falsify={mode}:{mnem}"],
+                               text=True, capture_output=True, timeout=120)
+            fired = (p.returncode == 1 and
+                     any(ln.startswith("NEW") and want in ln and mnem in ln
+                         for ln in (p.stdout or "").splitlines()))
+            if not fired:
+                ok = False
+                details.append(
+                    f"falsifier {mode}:{mnem} did NOT fire "
+                    f"(rc={p.returncode}) -- the oracle cannot alert, so a "
+                    "green sweep proves nothing: "
+                    + (p.stdout or p.stderr).strip()[:200])
+
+        if ok:
+            p = subprocess.run(base + ["--jobs=8", f"--allow={allow}",
+                                       "--check"],
+                               text=True, capture_output=True, timeout=1800)
+            head = (p.stdout or "").splitlines()
+            summary = head[0] if head else (p.stderr or "").strip()[:200]
+            if p.returncode != 0:
+                ok = False
+                bad = [ln for ln in head[1:]
+                       if ln.startswith("NEW") or ln.startswith("DEAD")]
+                details.append(summary)
+                details.extend(ln[:160] for ln in bad[:8])
+                if len(bad) > 8:
+                    details.append(f"... and {len(bad) - 8} more")
+            else:
+                details.append("falsifier fired both directions; " + summary)
+        all_ok = all_ok and ok
+        subs.append({"name": isa, "ok": ok, "detail": "\n".join(details)})
+    return Outcome("pass" if all_ok else "fail",
+                   "dependency-model fields vs LLVM MC, falsifier-armed "
+                   "(mipsel + aarch64, the ISAs whose register-capture "
+                   "oracle is static decode)", subs)
+
+
 def _chk_implicit_operands(ctx: Ctx) -> Outcome:
     """Ground truth that never passed through a decoder at all.
 
@@ -2055,6 +2164,11 @@ def build_checks() -> list:
                    "the plugin's own repairs to the decode boundary, "
                    "asserted in both directions (4-ISA)",
                    ["behavior:decode_fixups"], _chk_decode_fixups))
+    C.append(Check("features.decode_fields", "features",
+                   "dependency-model fields vs LLVM MC, falsifier-armed "
+                   "(mipsel + aarch64: static decode is their register-"
+                   "capture oracle)",
+                   ["behavior:decode_fields"], _chk_decode_fields))
     C.append(Check("features.implicit_operands", "features",
                    "implicit-operand assertion table: expectations derived "
                    "from behaviour (MRA / Sail / TCG translators), not from "

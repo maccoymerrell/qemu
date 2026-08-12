@@ -867,10 +867,51 @@ outside the repo as standalone scripts):
    ``REG_GPR30``.  The count is reported as ``ambiguous_reg_tokens`` on
    the summary line.
 
-   ``--layer=fields`` itself is a diagnostic view rather than a gate: its
-   residual against LLVM has not been triaged to the depth the boundary
-   layer's allowlist has, and a derived baseline in its place would assert
-   only that nothing changed, not that anything is right.
+   On x86_64 and riscv64, ``--layer=fields`` remains a diagnostic view
+   rather than a gate: its residual against LLVM has not been triaged
+   there, and a derived baseline in its place would assert only that
+   nothing changed, not that anything is right.  On mipsel and aarch64 it
+   **is** a gate — ``features.decode_fields``, below.
+``features.decode_fields``
+   The fields layer, gated, on the two ISAs where it is the only
+   independent witness.  x86_64 has Intel PIN and riscv64 has Spike to
+   confirm the register dependencies a trace records; mipsel and aarch64
+   have neither, so an independent *static decode* of the same encodings
+   is their sole external check on the dependency model — including the
+   day the execution-derived register capture replaces Capstone as the
+   source of that model, which is the change this gate exists to referee.
+
+   The check runs ``isaxcheck --layer=fields --classes=MBR`` over the full
+   encoding sweep on mipsel and aarch64 and gates against
+   ``tools/isaxcheck_fields_allow.txt`` with the same semantics as the
+   boundary gate: an untriaged disagreement fails as a new signature, and
+   an allowlist row matching nothing fails as a dead rule.  The ``D``
+   class is excluded because decode agreement and the subtarget gap are
+   the boundary gate's property; gating them twice would double-count one
+   hole.  The allowlist is not a derived baseline: every row was triaged
+   into a family whose comment carries its verification (most families
+   are the boundary residual seen one layer down and cross-reference the
+   boundary allowlist; the genuinely fields-level families — the trap and
+   MOPS branch classifications, prefetch-as-load memop modeling, the
+   system-register writes LLVM's descriptions structurally cannot name —
+   cite the design they assert).  Rows that record *defects* say so:
+   the FEAT_LS64 register-group truncation, the ``psel`` index read and
+   the LDG base-write phantom are inherited Capstone gaps named as open
+   work, and they are expected to go **dead** — and demand removal — when
+   the execution-derived capture lands.
+
+   Before trusting any of that, the check proves the instrument can fire.
+   ``isaxcheck --falsify=drop-src:MNEM`` erases the source set the
+   dependency model recorded for one known-good mnemonic, and
+   ``--falsify=add-dst:MNEM`` plants a phantom write, both injected after
+   ``isax_fields_decode()`` — the exact layer a real defect would occupy.
+   The check requires the healthy encoding to compare clean, and each
+   falsified run to exit non-zero naming the damaged mnemonic in the
+   expected class (``FR-rd-missing``, ``FR-wr-phantom``); a falsifier
+   that does not fire fails the check outright, because a green sweep
+   from an oracle that cannot alert is not evidence.  The single-encoding
+   arms ride ``--hex`` with ``--check``, which routes the bytes through
+   the same signature, allowlist and exit-code machinery as the sweep.
 ``features.implicit_operands``
    An *implicit* operand is architectural state an instruction touches
    that its encoding does not name: AArch64 ``ret`` reading ``x30``,

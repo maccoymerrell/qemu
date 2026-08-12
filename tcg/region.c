@@ -364,10 +364,16 @@ static void tcg_region_assign(TCGContext *s, size_t curr_region)
      * mid-walk (that would reset the buffer under the TB we still have to
      * return into).  When such a walk overflows the normal highwater,
      * tb_gen_code opens this reserve (tcg_region_open_spec_reserve) so the
-     * walk runs to completion — the wrong-path chain is then identical with
-     * or without the flush (flush-invariant), never truncated — and defers
-     * the real flush to the next safe point in cpu_exec_loop().  The whole
-     * region (reserve included) is recycled by that deferred flush.
+     * walk keeps translating, and defers the real flush to the next safe
+     * point in cpu_exec_loop().  The whole region (reserve included) is
+     * recycled by that deferred flush.
+     *
+     * The reserve below is finite, so it buys the walk room, not a
+     * guarantee: a walk whose footprint exceeds it is cut short by
+     * tb_gen_code returning NULL, at a depth set by how full the buffer
+     * happened to be.  The wrong-path chain is therefore flush-invariant
+     * only while plugin_spec_reserve_exhausted stays zero, which is why
+     * that counter is exported rather than described.
      */
     {
         size_t reserve = s->code_gen_buffer_size / 4;
@@ -383,8 +389,10 @@ static void tcg_region_assign(TCGContext *s, size_t curr_region)
 /*
  * Expose the spec reserve held back by tcg_region_assign so an in-flight
  * plugin wrong-path walk that just overflowed the normal highwater can keep
- * translating to its natural end.  Single-threaded: the plugin serializes
- * wrong-path execution, and the next tb_flush restores the reserve.
+ * translating.  The reserve is bounded, so this raises the ceiling once; a
+ * walk that overflows again is cut short (plugin_spec_reserve_exhausted).
+ * Single-threaded: the plugin serializes wrong-path execution, and the next
+ * tb_flush restores the reserve.
  */
 void tcg_region_open_spec_reserve(TCGContext *s)
 {

@@ -2297,6 +2297,17 @@ point after the walk unwinds (see :doc:`qemu_modifications`).  The
 nulls ``g_wp_state.last_executed_tb`` (which may point at a
 reclaimee), and reclaims SPEC-class templates.
 
+The third mechanism has a measured limit, and it is the one place
+the invariant can fail.  The deferral is paid for out of a finite
+reserve; a wrong-path walk whose translation footprint exceeds it is
+cut short at a depth set by host buffer occupancy rather than by
+anything architectural, so the same guest run traced twice can
+produce different wrong-path chains.  That is counted, not assumed:
+the trace is flush-invariant only while ``WP chain cut by
+code-buffer`` reads zero, which is why the tracer publishes it as a
+must-be-0 row rather than describing the property as unconditional
+(see :doc:`qemu_modifications`).
+
 *Segment-generation stale-fragment guard.*  Switching segments
 calls ``clear_bb_map()``, which drops the owning ``unique_ptr`` s
 so any ``BBTemplate*`` held in another vCPU's in-flight chain

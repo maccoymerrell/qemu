@@ -754,8 +754,27 @@ A device timer may not re-arm itself at the current time
    for; if the head of the list is a timer this pass already ran, is
    expired against the pass's sampled ``current_time``, and is now armed
    at a deadline no later than the one it ran for, it is deferred to the
-   next pass and the callback is named — once per callback, so a second
-   offending device is still heard.
+   next pass and the devices involved are named — once per
+   (armer, deferred) pair, so a second offending device is still heard
+   and no one victim can consume the report for every device that arms
+   it.
+
+   The report names two callbacks, because two are involved and they are
+   not always the same one: the callback of the timer being deferred,
+   and the callback that ARMED that timer.  They coincide for a device
+   re-arming its own timer and differ for a cycle of devices arming each
+   other, where naming only the deferred timer points at the victim and
+   leaves the offender unnamed.  The armer is read from the timer's own
+   ``armed_by`` stamp, written by the arming itself, and not inferred
+   from where the run loop happens to be standing.  The loop reaches the
+   no-progress test once per callback and only sees an armed timer when
+   it surfaces at the HEAD of the list, so any other timer due in the
+   same pass is popped in between — two timers on one list sharing a
+   deadline are enough, since a re-armed timer sorts behind the one
+   already there.  "Whatever ran last" is therefore a bystander as often
+   as it is the offender.  ``armed_by`` is ``NULL`` when the timer was
+   armed from outside any timer callback, and the report says so rather
+   than naming a device model it cannot identify.
 
    Testing the deadline rather than the timer's identity is what makes
    the bound both sound and quiet.  Quiet, because a timer coming back
@@ -782,7 +801,12 @@ A device timer may not re-arm itself at the current time
    ``tests/unit/test-timer-rearm-bound.c`` exercises all four shapes —
    self re-arm, mutual re-arm, a creeping deadline, and a healthy
    catch-up that must NOT be throttled — and the first three hang
-   without these bounds.
+   without these bounds.  Two further cases assert WHO the report names,
+   in a subprocess, off the warning text: a self re-armer with an
+   unrelated bystander timer due in the same pass must still read
+   "re-armed its own timer", and a mutual pair must read "armed the
+   timer of callback".  They read opposite values out of the same
+   assertion, so neither is an unfalsifiable pass.
 
 Interrupt replay across the wrong-path rollback
 

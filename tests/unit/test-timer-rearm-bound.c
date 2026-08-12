@@ -28,12 +28,21 @@
 #define PAST_NS  1000
 
 static QEMUTimerListGroup tlg;
-static QEMUTimer ta, tb;
-static unsigned n_a, n_b;
+static QEMUTimer ta, tb, tc;
+static unsigned n_a, n_b, n_bystander;
 static int64_t creep_a;
 
 static void notify_nop(void *opaque, QEMUClockType type)
 {
+}
+
+/*
+ * Arms nothing at all, so it can never be anybody's offender.  It exists to
+ * be due in the same pass as a device that IS offending.
+ */
+static void cb_bystander(void *opaque)
+{
+    n_bystander++;
 }
 
 /* The mips_gictimer shape: re-arm MYSELF at a deadline already passed. */
@@ -111,6 +120,65 @@ static void test_mutual_rearm(void)
     timer_del(&tb);
 }
 
+/*
+ * WHO the report names.  The bound fires when a timer this pass already ran
+ * turns up at the head still expired, and by then any number of unrelated
+ * timers due in the same pass have been popped in between -- so the callback
+ * that ran LAST is not the callback that armed the head.  Two timers on one
+ * list with the same deadline are enough: the offender re-arms itself, which
+ * sorts it BEHIND the timer that was already there, that timer runs next, and
+ * only then does the offender's timer reach the head.
+ *
+ * The report must still name the offender.  Naming the bystander repeats, one
+ * level down, the failure the whole bound was rewritten for: an alarm spent on
+ * a device that is behaving.
+ *
+ * Asserted in a subprocess because the evidence is the warning on stderr.  The
+ * two cases below read OPPOSITE values out of the same assertion, so neither
+ * is an unfalsifiable pass: the bystander shape must read "re-armed its own
+ * timer" and the mutual shape must read "armed the timer of callback".
+ */
+static void test_bystander_subprocess(void)
+{
+    n_a = n_bystander = 0;
+    timer_init_full(&ta, &tlg, QEMU_CLOCK_REALTIME, SCALE_NS, 0,
+                    cb_self, NULL);
+    timer_init_full(&tc, &tlg, QEMU_CLOCK_REALTIME, SCALE_NS, 0,
+                    cb_bystander, NULL);
+    timer_mod_ns(&ta, PAST_NS);
+    timer_mod_ns(&tc, PAST_NS);
+
+    run_once();
+
+    /* The bystander really did run between the arming and the trip. */
+    g_assert_cmpuint(n_a, >, 0);
+    g_assert_cmpuint(n_bystander, >, 0);
+    timer_del(&ta);
+    timer_del(&tc);
+}
+
+static void test_bystander(void)
+{
+    g_test_trap_subprocess("/timer/rearm-bound/bystander/subprocess", 0, 0);
+    g_test_trap_assert_passed();
+    g_test_trap_assert_stderr("*re-armed its own timer*");
+    g_test_trap_assert_stderr_unmatched("*arming each other*");
+}
+
+static void test_mutual_report_subprocess(void)
+{
+    test_mutual_rearm();
+}
+
+static void test_mutual_report(void)
+{
+    g_test_trap_subprocess("/timer/rearm-bound/mutual-report/subprocess",
+                           0, 0);
+    g_test_trap_assert_passed();
+    g_test_trap_assert_stderr("*armed the timer of callback*");
+    g_test_trap_assert_stderr_unmatched("*re-armed its own timer*");
+}
+
 static void test_creeping_rearm(void)
 {
     n_a = 0;
@@ -169,6 +237,12 @@ int main(int argc, char **argv)
 
     g_test_add_func("/timer/rearm-bound/self", test_self_rearm);
     g_test_add_func("/timer/rearm-bound/mutual", test_mutual_rearm);
+    g_test_add_func("/timer/rearm-bound/bystander", test_bystander);
+    g_test_add_func("/timer/rearm-bound/bystander/subprocess",
+                    test_bystander_subprocess);
+    g_test_add_func("/timer/rearm-bound/mutual-report", test_mutual_report);
+    g_test_add_func("/timer/rearm-bound/mutual-report/subprocess",
+                    test_mutual_report_subprocess);
     g_test_add_func("/timer/rearm-bound/creeping", test_creeping_rearm);
     g_test_add_func("/timer/rearm-bound/catchup", test_catchup_not_penalised);
 

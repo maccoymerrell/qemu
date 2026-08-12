@@ -99,6 +99,16 @@ struct QEMUTimer {
      */
     uint64_t last_run_pass;
     int64_t last_run_expire;
+    /*
+     * The callback that was running on the arming thread when this timer was
+     * last armed, or NULL if it was armed from outside any timer callback.
+     * The no-progress report needs the device that DID the arming, and that
+     * is not deducible from the run loop: the loop only notices an armed
+     * timer once it reaches the head of the list, by which point any number
+     * of unrelated timers due in the same pass have been popped in between.
+     * Written under the list lock in timer_mod_ns_locked().
+     */
+    QEMUTimerCB *armed_by;
 };
 
 extern QEMUTimerListGroup main_loop_tlg;

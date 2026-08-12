@@ -371,6 +371,7 @@ void timer_init_full(QEMUTimer *ts,
     /* Never ran, so it cannot match any pass; see timerlist_run_timers(). */
     ts->last_run_pass = 0;
     ts->last_run_expire = -1;
+    ts->armed_by = NULL;
 }
 
 void timer_deinit(QEMUTimer *ts)
@@ -397,6 +398,18 @@ static void timer_del_locked(QEMUTimerList *timer_list, QEMUTimer *ts)
     }
 }
 
+/*
+ * The timer callback this thread is currently running out of
+ * timerlist_run_timers(), or NULL when no timer callback is on its stack.
+ * A timer armed while this is set was armed BY that callback, which is the
+ * fact the no-progress report needs and the only place it can be observed:
+ * once the arming returns, the run loop can no longer tell which callback
+ * put a timer back on the list.  Thread-local because timer lists belonging
+ * to different AioContexts run concurrently, and saved and restored around
+ * the call so a callback that runs a nested pass gets its identity back.
+ */
+static __thread QEMUTimerCB *timer_running_cb;
+
 static bool timer_mod_ns_locked(QEMUTimerList *timer_list,
                                 QEMUTimer *ts, int64_t expire_time)
 {
@@ -412,6 +425,7 @@ static bool timer_mod_ns_locked(QEMUTimerList *timer_list,
         pt = &t->next;
     }
     ts->expire_time = MAX(expire_time, 0);
+    ts->armed_by = timer_running_cb;
     ts->next = *pt;
     qatomic_set(pt, ts);
 
@@ -500,12 +514,22 @@ bool timer_expired(QEMUTimer *timer_head, int64_t current_time)
  * timerlist_run_timers()).
  *
  * TWO callbacks are named because two are involved and they are not always
- * the same one.  @armer is the callback the pass had just finished running
- * when the deferred timer turned up at the head of the list -- the one that
- * did the arming.  @deferred is the callback of the timer being put off.
- * They coincide for a device re-arming its OWN timer, and they do not for a
- * cycle of devices arming EACH OTHER, where naming only the deferred timer
- * points at the victim and leaves the device that armed it unnamed.
+ * the same one.  @deferred is the callback of the timer being put off.
+ * @armer is the callback that ARMED that timer, taken from the timer's own
+ * @armed_by stamp rather than guessed from the run loop's position: they
+ * coincide for a device re-arming its OWN timer, they differ for a cycle of
+ * devices arming EACH OTHER, and naming only the deferred timer points at
+ * the victim and leaves the device that armed it unnamed.
+ *
+ * The stamp is what makes the two cases distinguishable at all.  The run
+ * loop only sees an armed timer once it reaches the head of the list, and
+ * ANY other timer due in the same pass is popped in between -- so "the
+ * callback that just finished running" is a bystander as often as it is the
+ * offender, and using it accuses whichever unrelated device happened to be
+ * due alongside the broken one.  @armed_by is recorded by the arming itself
+ * and cannot be confused by what ran in between.  NULL means the timer was
+ * armed from outside any timer callback, which names no device model and
+ * must not be dressed up as one.
  *
  * Once PER PAIR, not once per process: a warn_report_once() here would be
  * silenced by whichever device happened to be first, and keying on the
@@ -514,7 +538,13 @@ bool timer_expired(QEMUTimer *timer_head, int64_t current_time)
  * the report degrades to once-per-process, which is still louder than
  * nothing.  Called with a list lock held, and different lists run
  * concurrently, so the slot is published with a release store and read with
- * an acquire load; the worst a race can then do is print a duplicate line.
+ * an acquire load.  That orders the slot against the count but does not make
+ * claiming a slot exclusive: two lists tripping at once can write the same
+ * index, so a duplicate line can print and, if their writes interleave, one
+ * slot can end up holding one pair's armer beside the other's deferred --
+ * which would silence a later report for exactly that crossed pair.  Both
+ * outcomes are diagnostic-only and neither can silence the first report of
+ * anything, but the exclusion is not there and should not be claimed.
  */
 static void timer_warn_no_progress(QEMUTimerCB *armer, QEMUTimerCB *deferred,
                                    int64_t expire)
@@ -538,6 +568,12 @@ static void timer_warn_no_progress(QEMUTimerCB *armer, QEMUTimerCB *deferred,
                         "deferring it to the next pass rather than looping on "
                         "it -- this is a bug in that device model", deferred,
                         expire);
+        } else if (!armer) {
+            warn_report("the timer of callback %p was armed for a deadline it "
+                        "had already been run for (%" PRId64 ") from outside "
+                        "any timer callback, so no device model is named; "
+                        "deferring it to the next pass rather than looping on "
+                        "it", deferred, expire);
         } else {
             warn_report("timer callback %p armed the timer of callback %p for "
                         "a deadline that timer had already been run for "
@@ -561,6 +597,7 @@ static void timer_warn_no_progress(QEMUTimerCB *armer, QEMUTimerCB *deferred,
 bool timerlist_run_timers(QEMUTimerList *timer_list)
 {
     QEMUTimer *ts, *head;
+    QEMUTimerCB *outer_cb;
     int64_t current_time;
     int64_t ran_expire;
     uint64_t pass;
@@ -660,9 +697,18 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
         cb = ts->cb;
         opaque = ts->opaque;
 
-        /* run the callback (the timer list can be modified) */
+        /*
+         * Run the callback (the timer list can be modified).  Publish which
+         * callback is running first: anything it arms is stamped with it, so
+         * the no-progress report below can name the device that did the
+         * arming instead of guessing.  Restored rather than cleared, because
+         * a callback is free to run a nested pass of its own.
+         */
         qemu_mutex_unlock(&timer_list->active_timers_lock);
+        outer_cb = timer_running_cb;
+        timer_running_cb = cb;
         cb(opaque);
+        timer_running_cb = outer_cb;
         qemu_mutex_lock(&timer_list->active_timers_lock);
 
         progress = true;
@@ -710,12 +756,21 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
          * rather than once per process, so a second offending device is
          * still reported.
          *
-         * The report names @cb as well as the head's callback.  In the
-         * mutual case those are DIFFERENT devices, and the deferred timer
-         * belongs to the one that did not arm it: reporting the head alone
-         * names the victim, tells the operator it "re-armed its own timer"
-         * when it did not, and spends the pair's single report on it while
-         * the device that actually armed it is never mentioned.
+         * The report names the head's ARMER as well as the head's callback.
+         * In the mutual case those are DIFFERENT devices, and the deferred
+         * timer belongs to the one that did not arm it: reporting the head
+         * alone names the victim, tells the operator it "re-armed its own
+         * timer" when it did not, and spends the pair's single report on it
+         * while the device that actually armed it is never mentioned.
+         *
+         * The armer is @head->armed_by, recorded by the arming itself, NOT
+         * @cb.  @cb is merely whatever ran last, and the loop reaches this
+         * test once per callback: any other timer due in the same pass is
+         * popped between the arming and the moment the armed timer surfaces
+         * at the head, so @cb is a bystander as often as it is the offender.
+         * Two timers on one list with the same deadline are enough -- the
+         * re-armed one sorts behind the other, the other runs in between,
+         * and @cb accuses a device that armed nothing at all.
          *
          * @head is only dereferenced after it is read back off the list, so
          * a callback that deleted its own timer is never touched.
@@ -724,7 +779,8 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
         if (head && head->last_run_pass == pass &&
             timer_expired_ns(head, current_time) &&
             head->expire_time <= head->last_run_expire) {
-            timer_warn_no_progress(cb, head->cb, head->expire_time);
+            timer_warn_no_progress(head->armed_by, head->cb,
+                                   head->expire_time);
             qemu_mutex_unlock(&timer_list->active_timers_lock);
             goto out;
         }

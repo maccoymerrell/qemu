@@ -1858,6 +1858,26 @@ drops a block, and the validator's content checks are expected to refuse
 the resulting trace — that refusal is the arm working.  None of these is
 on by default and none is consulted by tracer logic.
 
+The peer-slot extent **provenance** rows take synthetic arms for the
+same reason and of the same kind.  At a close, a peer vCPU's held slot
+is classified by which lookup can still answer for it: the stash the
+first dispatch after the promote recorded (definitively past), the
+vCPU's live retired cursor (a thread that may still be executing), and
+whether the slot is that vCPU's current in-flight head — a block the
+close is reading mid-flight.  Because the stash is written by that
+first dispatch whether it was owned or foreign, a peer still holding a
+slot at a close has almost always dispatched again since, and the two
+narrower rows had never been observed above 0.  They are reachable —
+a ``riscv64 --smp 2`` system cell classifies a peer slot as the live
+cursor's in-flight head with no arm at all — but reaching them takes a
+window a scheduling draw rarely lands in, so
+``CST_SMP_PEER_LIVE_FALSIFY`` and ``CST_SMP_PEER_INFLIGHT_FALSIFY``
+drive one real peer close down each arm on demand.  They perturb only
+the copies the classification reads and print the machine's real
+answer beside the forced one; the three counters are written in exactly
+one place and read in exactly one (the stats report), so no arm here
+can reach the wire at all.
+
 On the wire (``CST_FLAG_FAULT``, set in marker mode; user-mode traces
 advertise no fault machinery): every CP entry carries ``fault_depth``
 (0 = normal code, ≥1 = handler code at that nesting level,

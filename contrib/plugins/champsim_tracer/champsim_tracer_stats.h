@@ -548,7 +548,22 @@ struct Stats {
     /* Close-time peer-slot extent provenance: the stash (measured at the
      * first dispatch after prev — definitively past) vs the LIVE retired
      * cursor of a vCPU that may still be executing, and the slot being
-     * that vCPU's CURRENT in-flight head at the close. */
+     * that vCPU's CURRENT in-flight head at the close.
+     *
+     * The three are a strict priority, not independent tallies, and only
+     * the stash row has ever been observed above 0: across the 400
+     * instrumented cells that reported them, 76 saw the stash arm and none
+     * saw either of the other two.  Because the stash is written by the
+     * FIRST dispatch after a promote — owned or foreign — a peer still
+     * holding a slot at a close has almost always dispatched again since,
+     * which is precisely why the cursor can no longer name it.  The two
+     * quiet rows are therefore reachable only in the narrow window where a
+     * peer's last plugin-visible dispatch IS the promote, and until they
+     * had an arm a 0 could not be told apart from a detector wired to
+     * nothing.  CST_SMP_PEER_LIVE_FALSIFY and CST_SMP_PEER_INFLIGHT_FALSIFY
+     * (smp_close_peer_extent_note, champsim_tracer.cc) drive one real peer
+     * close down each arm; being synthetic they perturb only the copies the
+     * classification reads, and the counters reach no wire. */
     uint64_t smp_close_peer_stash_extent = 0;
     uint64_t smp_close_peer_live_cursor = 0;
     uint64_t smp_close_peer_inflight_head = 0;

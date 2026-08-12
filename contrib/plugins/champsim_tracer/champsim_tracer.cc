@@ -4812,6 +4812,95 @@ static void smp_stamp_mispredict_note(bool emitted, bool predicted)
 }
 
 /*
+ * WHERE A PEER vCPU'S HELD SLOT GOT ITS EXTENT AT A CLOSE.
+ *
+ * Called once per peer-slot flush (PathBuilder::flush_final), with the
+ * three facts already read off the machine: whether the note_prev_extent
+ * STASH holds a measurement for the slot, whether the vCPU's retired
+ * CURSOR can still name it, and whether the slot is that vCPU's CURRENT
+ * in-flight head.  The classification is a strict priority — the stash was
+ * taken at the first dispatch after prev and is therefore definitively
+ * past, so it wins whenever it exists; the cursor belongs to a vCPU whose
+ * thread may still be executing, and a slot that is the cursor's in-flight
+ * head is a block the close is reading MID-FLIGHT.  Counters only: nothing
+ * here is read by tracer logic, and flush_final re-derives the extent it
+ * actually publishes from its own lookups.
+ *
+ * THE TWO ARMS.  Of the 400 instrumented cells that have reported these
+ * rows, 76 saw the stash arm fire and NOT ONE ever saw the live-cursor arm
+ * or the in-flight arm at anything but 0.  A row seen only at 0 cannot
+ * distinguish "the stash answers for every slot a close finds" from "the
+ * branch is unreachable and the row means nothing", which is the same
+ * silent-false-success cad149f5be named for this pair's two siblings.
+ *
+ * Both rows are classification outcomes rather than claims that work went
+ * unpublished, so both arms are SYNTHETIC, in the CST_SMP_STAMP_FALSIFY
+ * family: they perturb the copies of the three facts that the
+ * CLASSIFICATION reads, once per run, and never the machine state those
+ * facts were read from.  CST_SMP_PEER_LIVE_FALSIFY drives one real peer
+ * close down the live-cursor arm; CST_SMP_PEER_INFLIGHT_FALSIFY drives one
+ * down the in-flight arm inside it.  Each still requires a genuine peer
+ * close with a genuine held slot to reach this function at all, so the arm
+ * proves the predicate chain, the counters and the report lines are wired
+ * to a reachable site rather than merely quiet.
+ *
+ * What the arm fabricates it also PRINTS: the diagnostic names the real
+ * (stash, cursor, in-flight) triple beside the forced one, so an armed
+ * run's record says what the machine actually reported.  Neither arm is on
+ * by default and neither is read by tracer logic; being counters-only,
+ * neither can change a byte of the wire.
+ */
+void smp_close_peer_extent_note(unsigned int cpu_index,
+                                const BBTemplate *slot,
+                                bool from_stash, bool from_cursor,
+                                bool in_flight, uint64_t extent)
+{
+    static const bool falsify_live =
+        getenv("CST_SMP_PEER_LIVE_FALSIFY") != nullptr;
+    static const bool falsify_inflight =
+        getenv("CST_SMP_PEER_INFLIGHT_FALSIFY") != nullptr;
+    static bool falsified = false;
+
+    if ((falsify_live || falsify_inflight) && !falsified) {
+        falsified = true;
+        if (cst_smp_diag()) {
+            fprintf(stderr, "champsim_tracer: [smpdiag] FALSIFIER peer-slot "
+                    "extent classification forced to %s at pc=0x%" PRIx64
+                    " (real: stash=%d cursor=%d inflight=%d ran=%" PRIu64
+                    ")\n",
+                    falsify_inflight ? "IN-FLIGHT head" : "LIVE cursor",
+                    slot ? slot->start_pc : 0,
+                    (int)from_stash, (int)from_cursor, (int)in_flight,
+                    extent);
+        }
+        from_stash = false;
+        from_cursor = true;
+        if (falsify_inflight) {
+            in_flight = true;
+        }
+    }
+
+    if (from_stash) {
+        g_stats.smp_close_peer_stash_extent++;
+        return;
+    }
+    if (!from_cursor) {
+        return;
+    }
+    g_stats.smp_close_peer_live_cursor++;
+    if (!in_flight) {
+        return;
+    }
+    g_stats.smp_close_peer_inflight_head++;
+    if (cst_smp_diag()) {
+        fprintf(stderr, "[smpdiag] close peer slot is vCPU %u's IN-FLIGHT "
+                "head: pc=0x%" PRIx64 " ran=%" PRIu64 " closing_cpu=%u\n",
+                cpu_index, slot ? slot->start_pc : 0, extent,
+                g_cst_closing_cpu);
+    }
+}
+
+/*
  * Build a BodyEntry from the calling thread's CP memop/reg-snap
  * accumulators (draining them) and write it to @out_stream.
  * @wp_entries is moved in.  Caller holds exec_lock; data_lock is NOT

@@ -1426,25 +1426,28 @@ void PathBuilder::flush_final(bool walk_prev, bool prev_in_flight,
      * definitively past — while the live retired cursor belongs to a vCPU
      * whose thread may still be executing, and a slot that is that vCPU's
      * CURRENT in-flight head is a block whose execution the close is
-     * reading mid-flight.  Counters only; the drain below is unchanged. */
+     * reading mid-flight.
+     *
+     * All three facts are read here, unconditionally, and the priority
+     * between them is applied by smp_close_peer_extent_note (which also
+     * carries the two synthetic falsifier arms that prove the live-cursor
+     * and in-flight rows can fire).  Asking the cursor even when the stash
+     * answered costs two pointer compares and no side effects —
+     * retired_executed_of and retired_is_in_flight are pure reads — and it
+     * is what lets an armed run print the machine's REAL answer beside the
+     * forced one.  Counters only; the drain below is unchanged. */
     const bool smp_peer_close = g_cst_closing_cpu != UINT32_MAX &&
                                 cpu_index_ != g_cst_closing_cpu;
     if (prev_tb_ && smp_peer_close) {
-        uint64_t smp_e = 0;
-        if (prev_extent(&smp_e)) {
-            g_stats.smp_close_peer_stash_extent++;
-        } else if (retired_executed_of(cpu_index, prev_tb_, &smp_e)) {
-            g_stats.smp_close_peer_live_cursor++;
-            if (retired_is_in_flight(cpu_index, prev_tb_)) {
-                g_stats.smp_close_peer_inflight_head++;
-                if (cst_smp_diag()) {
-                    fprintf(stderr, "[smpdiag] close peer slot is vCPU %u's "
-                            "IN-FLIGHT head: pc=0x%" PRIx64 " ran=%" PRIu64
-                            " closing_cpu=%u\n", cpu_index_,
-                            prev_tb_->start_pc, smp_e, g_cst_closing_cpu);
-                }
-            }
-        }
+        uint64_t smp_stash = 0;
+        uint64_t smp_cursor = 0;
+        const bool have_stash = prev_extent(&smp_stash);
+        const bool have_cursor =
+            retired_executed_of(cpu_index, prev_tb_, &smp_cursor);
+        smp_close_peer_extent_note(cpu_index_, prev_tb_,
+                                   have_stash, have_cursor,
+                                   retired_is_in_flight(cpu_index, prev_tb_),
+                                   have_stash ? smp_stash : smp_cursor);
     }
     if (prev_tb_) {
         if (prev_extent(&executed)) {

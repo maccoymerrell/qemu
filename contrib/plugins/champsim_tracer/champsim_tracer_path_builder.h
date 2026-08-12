@@ -254,6 +254,18 @@ bool retired_is_in_flight(unsigned int cpu_index, const BBTemplate *head);
  * it in every TU). */
 void census_note_prev_promote(void);
 
+/* SMP condition census: classify ONE peer vCPU's held slot at a close by
+ * where its extent could have come from — the note_prev_extent stash, the
+ * vCPU's live retired cursor, or neither — and whether the slot is that
+ * vCPU's current in-flight head.  The three facts are read by the caller
+ * and passed BY VALUE; the classification, its counters and its report
+ * live in champsim_tracer.cc beside the census's other falsifier arms.
+ * Counters only — the flush re-derives the extent it publishes itself. */
+void smp_close_peer_extent_note(unsigned int cpu_index,
+                                const BBTemplate *slot,
+                                bool from_stash, bool from_cursor,
+                                bool in_flight, uint64_t extent);
+
 /*
  * THE DISPATCH CLOCK EVERY BUILDER SHARES.
  *

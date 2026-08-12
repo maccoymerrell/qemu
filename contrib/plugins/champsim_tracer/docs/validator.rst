@@ -1653,6 +1653,15 @@ What it does:
    instructions (e.g. ``mcf_x86_64-0B.cst``,
    ``mcf_x86_64-0_000025B.cst``); the validator collects them with a
    ``<prog>_<isa>-*.cst`` glob.
+#. Asserts the per-segment coverage from the captured console: every
+   ``finished segment`` line — one per scheduled cluster, not just the
+   first — must read ``clock_minus_wire=0`` and close ``OK`` at its
+   budget.  This is the same comparator the system cells run, applied
+   to a *multi-segment* console; a mid-stream reopen whose accounting
+   drifts (the open-boundary crossing block is published whole while
+   the raw clock bills the segment from the window start) fails the
+   cell here rather than riding through on the segment files alone.
+   A console with no parsable line is a failure, never a skip.
 #. Validates each segment file *in reverse order* — explicitly
    touches segment 1 before segment 0 — to prove segment N is
    fully self-decodable without any prior knowledge of segment N-1.
@@ -1661,6 +1670,7 @@ The validation is structural (no ``correct_path`` cross-check —
 simpoints intentionally start mid-program where the CFG anchor
 isn't available).  Asserted invariants:
 
+* every segment close line reads ``clock_minus_wire=0`` and ``OK``,
 * segment is internally consistent (encoding-map completeness,
   iframe-cadence, atomic_count / wp_events writer-vs-walk),
 * exactly one REGFILE record (single-thread),

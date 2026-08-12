@@ -2510,7 +2510,17 @@ a fan-out instruction the close cuts the crossing entry's range and
 bills exactly the budget, and the ``covered=`` figure on the finishing
 line is settled to the published count (instructions the clock counted
 that no emitted range claims are un-billed at the close), so
-``clock_minus_wire`` reads zero there too.  On the wire side of that
+``clock_minus_wire`` reads zero there too.  The settle covers both
+edges of the window: a mid-run open — a later SimPoint cluster, or any
+explicit start the run reaches while executing — lands on a
+translation-block boundary, and the crossing block whose dispatch
+carried the
+clock past the start is traced whole, keeping the wire aligned with the
+BBV-style count that positioned the window; the head instructions it
+dispatched below the start are published, so they are billed to the
+segment as a named open-boundary credit and ``covered=`` reads the
+budget exactly on every cluster of a schedule, not just the first.  On
+the wire side of that
 comparison the fan-out surplus — the entries the fan-out writes beyond
 the one count each clock keeps for the instruction, including the parent
 entry of a fault-cut rep-split piece whose bill the fault re-credited —

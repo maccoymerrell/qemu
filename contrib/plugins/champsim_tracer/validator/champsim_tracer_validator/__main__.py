@@ -1350,9 +1350,25 @@ def cmd_simpoint_test(args) -> int:
         print(f"trace[{isa}]: {' '.join(cmd)}")
         # The program runs to exit after the scheduled intervals close, so
         # there is no stated total budget; the per-mode ceiling applies.
-        rc = LLDET.call_watched(
-            cmd, isa=isa, mode="user", wpdepth=args.depth, budget=None,
-            growth_prefix=str(out_base), label=f"simpoint_test {isa}")
+        # The console (plugin stderr) is captured to a file rather than
+        # inherited: the per-segment coverage gate below reads every
+        # `finished segment` line back out of it.  It is echoed into the
+        # harness output afterwards so the cell log keeps showing the run.
+        console = Path(f"{out_base}.console.log")
+        with open(console, "w") as cf:
+            if LLDET.enabled():
+                watch = LLDET.watch_for(
+                    isa=isa, mode="user", wpdepth=args.depth, budget=None,
+                    growth_prefix=str(out_base),
+                    label=f"simpoint_test {isa}")
+                rc, _verdict = LLDET.run_watched(cmd, watch,
+                                                 stdout=cf, stderr=cf)
+            else:
+                rc = subprocess.call(cmd, stdout=cf, stderr=cf)
+        try:
+            sys.stdout.write(console.read_text(errors="replace"))
+        except OSError:
+            pass
         if rc != 0:
             print(f"trace[{isa}]: FAIL rc={rc}")
             rc_total = 1
@@ -1371,6 +1387,19 @@ def cmd_simpoint_test(args) -> int:
                   f"interval={interval}; try --hot-iters)")
             rc_total = 1
             continue
+
+        # THE CLOCK AND THE WIRE MUST AGREE ON EVERY SEGMENT.  A
+        # multi-segment run closes one window per cluster, and each close
+        # line carries its own clock_minus_wire; the single-segment cells
+        # were gated while a mid-stream reopen's residual rode through
+        # rc=0 here.  _check_segment_coverage walks every parsed line:
+        # any nonzero clock_minus_wire, any truncating close flag, or
+        # (require_ok) a window that did not close at its budget fails
+        # the cell, and a console with no parsable line fails as a check
+        # that cannot find its subject.
+        if _check_segment_coverage(console, require_ok=True,
+                                   label=f"{isa} simpoint"):
+            rc_total = 1
 
         # Decode the segments standalone, in reverse order, deliberately
         # not in trace order — proves segment N is independently

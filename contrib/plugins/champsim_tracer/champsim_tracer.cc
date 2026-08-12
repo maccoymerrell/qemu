@@ -3730,6 +3730,17 @@ static uint64_t g_seg_arch_user_insns = 0;
  * user_clock_close_credit makes it hold on the marker clock.  Mutated
  * under exec_lock (emissions and closes both hold it). */
 static uint64_t g_seg_user_unbilled = 0;
+/* User-mode (raw-clock) instructions of THIS segment that are PUBLISHED
+ * but whose inline-add bill landed BEFORE window_start: a mid-run window
+ * open fires at the dispatch whose per-TB add carried the clock past the
+ * start, and that crossing TB is deliberately traced whole (the budget
+ * cond_cb opens the segment, the vcpu_tb_exec brcond re-loads is_active
+ * and fires for the same TB — see the registration-order comment in
+ * vcpu_tb_trans), so its head insns are on the wire while
+ * `g_host_icount - lo` never bills them.  finish_trace_segment adds this
+ * to the raw `covered` — the open-boundary twin of g_seg_user_unbilled,
+ * with the opposite sign.  Mutated under exec_lock. */
+static uint64_t g_seg_user_prebilled = 0;
 
 /*
  * The user-mode (raw-clock) twin of user_clock_close_credit, with the
@@ -3751,6 +3762,57 @@ void user_raw_clock_unbilled(uint64_t insns)
     }
     g_seg_user_unbilled += insns;
     g_stats.user_raw_unbilled_insns += insns;
+}
+
+/*
+ * The OPEN-boundary correction the close-side un-bill above cannot see.
+ * A mid-run window open lands on a TB boundary: the crossing TB — the one
+ * whose inline per-TB add carried the raw clock from below window_start
+ * to at-or-past it — executes fully traced (its body entry lands in the
+ * trace by design, keeping the wire aligned with the BBV count that
+ * positioned the window; see the budget-cb registration-order comment in
+ * vcpu_tb_trans), but the coverage settle bills the segment from
+ * window_start, so the head insns of that TB dispatched below the start
+ * are published-but-never-billed and every such open reads
+ * clock_minus_wire = -(head) while the accounting is in fact exact.
+ * Called at each raw-clock segment-open site with the opening dispatch's
+ * post-add clock and the crossing TB's head fragment; credits exactly the
+ * straddle.  A boundary-aligned open (dispatch began at-or-past the
+ * start, e.g. the very first TB of a lo=0 window) credits nothing and
+ * leaves single-segment runs byte-identical.  No-op in system mode, whose
+ * window clocks bill by retirement folds.
+ *
+ * CST_SEG_OPEN_CREDIT_OFF=1 severs the credit (falsifier lever, the
+ * CST_REP_FACTS_OFF precedent): it reproduces the published-but-unbilled
+ * open-boundary shape on demand so the validator's per-segment
+ * clock_minus_wire gate can be proven able to fire.  Never set it on a
+ * production run.
+ */
+static void user_raw_clock_open_credit(uint64_t lo, uint64_t icount_now,
+                                       const BBTemplate *cross_head)
+{
+    if (g_system_mode || !cross_head) {
+        return;
+    }
+    static const bool credit_off =
+        getenv("CST_SEG_OPEN_CREDIT_OFF") != nullptr;
+    if (credit_off) {
+        return;
+    }
+    uint64_t tb_len = 0;
+    for (const BBTemplate *f = cross_head; f; f = f->next_tb_fragment) {
+        tb_len += f->n_insns;
+    }
+    uint64_t dispatch_start = icount_now > tb_len ? icount_now - tb_len : 0;
+    if (dispatch_start >= lo) {
+        return;             /* opened on a TB boundary: nothing straddles */
+    }
+    uint64_t credit = lo - dispatch_start;
+    if (credit > tb_len) {
+        credit = tb_len;    /* whole TB billed below the start (symbol open) */
+    }
+    g_seg_user_prebilled += credit;
+    g_stats.user_raw_open_prebilled_insns += credit;
 }
 
 /* UINT64_MAX sentinel = warmup boundary has not been crossed
@@ -4212,6 +4274,7 @@ static void start_trace_segment(const char *label,
     g_seg_arch_insns = 0;
     g_seg_arch_user_insns = 0;
     g_seg_user_unbilled = 0;
+    g_seg_user_prebilled = 0;
     g_seg_warmup_end_trace_insns = UINT64_MAX;
     g_seg_warmup_crossed = false;
     g_seg_wm_deferred_records = 0;
@@ -6132,8 +6195,15 @@ static void finish_trace_segment(bool prev_executed = true,
          * budget close skips, the exact-budget cut past a finite
          * window's stop.  Those were un-billed where the exclusion
          * happened (user_raw_clock_unbilled); settle the bill here so
-         * clock_minus_wire reads the identity, not the S18 exclusions. */
+         * clock_minus_wire reads the identity, not the S18 exclusions.
+         * The OPEN boundary has the opposite face: a mid-run open's
+         * crossing TB is published whole while its pre-start head was
+         * billed below `lo`, outside `covered` — that head is credited
+         * where the open happened (user_raw_clock_open_credit) and
+         * folded in here, so the identity holds at both edges of the
+         * window. */
         if (!user_clock) {
+            covered += g_seg_user_prebilled;
             covered = covered > g_seg_user_unbilled
                 ? covered - g_seg_user_unbilled : 0;
         }
@@ -7198,6 +7268,10 @@ static void tw_manage_window(unsigned int cpu_index,
                                         /* warmup= */ 0, total_target,
                                         cpu_index,
                                         /* simpoint_weight= */ 0.0);
+                    /* The matching TB is traced whole while `lo` sits at
+                     * its post-add clock: its full length is the
+                     * published-below-the-start head. */
+                    user_raw_clock_open_credit(lo, icount_prev, cur_tmpl);
                 }
             }
         }
@@ -7261,6 +7335,11 @@ static void tw_manage_window(unsigned int cpu_index,
                                         hdr_warmup,
                                         /* total_target= */ eff_stop - eff_start,
                                         cpu_index, sp->weight);
+                    /* A non-first cluster opens mid-run: the crossing
+                     * TB's head insns were billed below eff_start but
+                     * are published — credit the straddle. */
+                    user_raw_clock_open_credit(eff_start, icount_prev,
+                                               cur_tb_tmpl);
                 }
             } else {
                 g_trace_segments.set_shutting_down();
@@ -7280,6 +7359,10 @@ static void tw_manage_window(unsigned int cpu_index,
             start_trace_segment("trace", lo, hi,
                                 /* warmup= */ 0, total_target, cpu_index,
                                 /* simpoint_weight= */ 0.0);
+            /* An icount window with start > 0 opens mid-run exactly like
+             * a non-first simpoint cluster; a lo=0 window's first TB
+             * begins at clock 0 and the credit computes to nothing. */
+            user_raw_clock_open_credit(lo, icount_prev, cur_tb_tmpl);
         }
         if (g_trace_segments.is_active() &&
             icount_prev >= g_trace_segments.window_stop()) {

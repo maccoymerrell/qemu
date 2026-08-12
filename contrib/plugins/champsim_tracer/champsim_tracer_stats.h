@@ -417,6 +417,18 @@ struct Stats {
      * user (raw-clock) mode — the user-mode twin of
      * user_clock_close_credit's identity. */
     uint64_t user_raw_unbilled_insns = 0;
+    /* The open-boundary twin of user_raw_unbilled_insns, opposite sign: a
+     * mid-run window open's crossing TB is traced whole (its body entry
+     * keeps the wire aligned with the BBV count that positioned the
+     * window) while the head insns it dispatched below window_start were
+     * billed outside the segment.  Credited at the open
+     * (user_raw_clock_open_credit) and added to `covered` at segment
+     * finish, so BILLED == PUBLISHED holds at the open edge exactly as
+     * the un-bill holds it at the close.  A named term, never slack: it
+     * reads the measured straddle of each mid-run open, and 0 on every
+     * boundary-aligned open (lo=0 first segments, marker/user-clock
+     * modes). */
+    uint64_t user_raw_open_prebilled_insns = 0;
     /* Templates minted for blocks the guest ENTERED AND DID NOT FINISH (see
      * TemplateStore::commit_partial_bb).  Keyed by extent, so repeated cuts
      * at the same point share one; a run where nothing is ever cut short

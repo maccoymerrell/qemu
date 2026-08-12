@@ -1612,6 +1612,22 @@ the predecessor's ``bb_stop`` is a wire defect, not a licensed
 shorthand — the format has no way to skip instructions in the middle
 of a block.
 
+One overlap is licensed, at a self-loop.  A bulk-memory self-loop
+instruction (``BRANCH_REP`` — :ref:`fanout-self-loop-bbs`) that faults
+mid-loop has retired real iterations before the excursion, so the
+piece that observed them *includes* the instruction — a prefix
+declares ``[0, K+1)`` where ``K`` is the self-loop's index — while the
+continuation re-enters the loop at that same instruction and declares
+``[K, num_insns)``: the two ranges overlap at exactly the self-loop
+instruction, each piece publishing the iterations *it* observed of the
+one instruction (the pieces' iteration sequences concatenate to the
+unsplit loop).  A loop that faults repeatedly produces one such piece
+per excursion that retired iterations, every consecutive pair
+overlapping at ``K``.  This is the only licensed overlap: a chaining
+consumer reads a successor whose ``bb_start`` is the predecessor's
+``bb_stop - 1`` as this rep-split continuation exactly when the shared
+instruction is a self-loop terminator, and rejects it anywhere else.
+
 **Order is unconditional.**  Within one ``(thread_id, asid)`` context
 the entries are in strict program order with no exceptions.  A block
 is emitted when execution leaves it, at the extent that ran, so the
@@ -1715,8 +1731,13 @@ the CP block. Template IDs are delta-coded within the chain.
        wp_template_id_delta : SLEB
        wp_delta_section     : section
 
-Wrong-path field state is forked from the current correct-path state at
-the start of the chain and discarded at the end of the entry.
+Wrong-path field state is its own persistent overlay, not a per-chain
+fork: WP records decode by reading the WP overlay first, the CP
+overlay on miss, then the template default, and their updates land in
+the WP overlay only, which persists for the whole body stream (§5).  A
+chain therefore never modifies correct-path state, and a template's
+speculative observations carry across chains rather than being re-paid
+per entry.
 
 ``num_wp`` is a plain block count with nothing packed into it.  Each
 chain block's ``wp_delta_section`` is an ordinary field-delta section

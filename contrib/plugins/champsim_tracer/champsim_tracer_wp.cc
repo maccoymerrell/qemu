@@ -576,8 +576,9 @@ static WpStep wp_check_forward_progress(WpWalkState &st)
                 wp_chain.back().translation_unavailable = true;
             } else {
                 /* Crossing on the very first target (e.g. an indirect branch
-                 * mispredicted across the boundary): no entry to mark, so the
-                 * emitter writes a chain-level CST_WP_EVENT_TRANSLATION_UNAVAIL.
+                 * mispredicted across the boundary): no chain block to mark,
+                 * so the emitter stamps CST_BB_FLAG_WP_FIRST_TARGET_UNAVAIL
+                 * on the owning CP entry (§4.4).
                  * Not the wp_first_tb_unavail "bug" counter — this is an
                  * expected architectural terminate, not an unfetchable target. */
                 *first_tb_unavail = true;
@@ -686,7 +687,7 @@ static WpStep wp_exec_one_tb(WpWalkState &st)
              * un-resident code under demand paging, or a refused garbage
              * region — and truncates the chain: mark the last completed WP
              * BB translation_unavailable so the truncation is explicit on
-             * the wire (CST_WP_EVENT_TRANSLATION_UNAVAIL) instead of
+             * the wire (CST_BB_FLAG_TRANSLATION_UNAVAIL) instead of
              * indistinguishable from a clean depth-budget end.  The
              * validator reads the marker to tell an honest boundary from a
              * silently short chain. */
@@ -725,8 +726,9 @@ static WpStep wp_exec_one_tb(WpWalkState &st)
                  * point itself could not be fetched/translated and there
                  * is no chain to carry the truncation marker.  Hand the
                  * condition to the caller via @first_tb_unavail so the
-                 * emitter makes it explicit on the wire as a chain-level
-                 * CST_WP_EVENT_TRANSLATION_UNAVAIL event (§4.4) instead
+                 * emitter makes it explicit on the wire as
+                 * CST_BB_FLAG_WP_FIRST_TARGET_UNAVAIL on the owning CP
+                 * entry (§4.4) instead
                  * of leaving an indistinguishable silent 0-block chain.
                  * Also count it (a nonzero count against resident
                  * targets is a bug) and expose the instance under
@@ -1650,8 +1652,9 @@ static void wp_walk_fragments(WpWalkState &st)
              * run on a deterministic placeholder; execution-time arithmetic,
              * illegal-instruction and trap faults skip the faulting insn; and
              * a syscall-class kernel entry continues at its architectural
-             * fall-through.  All three carry CST_WP_EVENT_FAULT at
-             * fault_insn_index so the consumer knows where speculation would
+             * fall-through.  All three carry CST_BB_FLAG_SYNTHETIC_FAULT
+             * with CST_FID_BB_FAULT_INSN naming the instruction, so the
+             * consumer knows where speculation would
              * have squashed, and all three run on to the depth budget.
              */
             if (poisoned_targets.count(commit_post_pc)) {
@@ -1718,8 +1721,9 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
      * that bumps wp_first_tb_unavail): the wrong path's FIRST target
      * could not be fetched/translated, so the returned chain is empty
      * and there is no WPBBEntry to carry the truncation marker.  The
-     * emitter reads this and writes the chain-level
-     * CST_WP_EVENT_TRANSLATION_UNAVAIL event instead.  Saved-state
+     * emitter reads this and stamps
+     * CST_BB_FLAG_WP_FIRST_TARGET_UNAVAIL on the owning CP entry
+     * instead.  Saved-state
      * failure, fault-loop exits, and flush interruption do NOT set it. */
     *first_tb_unavail = false;
 

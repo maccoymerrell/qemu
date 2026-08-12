@@ -439,7 +439,8 @@ its result registers hold the deterministic placeholder rather than a
 real return value.  Dependents of a wrong-path syscall therefore
 execute on synthetic data, which is the same contract every other
 wrong-path fault carries and is marked the same way
-(``CST_WP_EVENT_FAULT`` at the syscall).  What is *not* modelled is the
+(``CST_BB_FLAG_SYNTHETIC_FAULT`` with ``CST_FID_BB_FAULT_INSN`` naming
+the syscall).  What is *not* modelled is the
 kernel side: the trace never contains the handler a wrong-path syscall
 would have entered, because the correct resolution is a privilege
 escalation and no real core commits one on a mispredicted path.

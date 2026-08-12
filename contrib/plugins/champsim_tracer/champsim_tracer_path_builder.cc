@@ -3763,9 +3763,10 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
     /* CONTINUE hands control to the glue's window management (the shutdown
      * gate, tw_manage_window) before step_seal runs, and that is the ONE
      * window in which walk_prev_ holds a block that has executed and has
-     * not been sealed.  Every close route that exists today lands outside
-     * it; nothing asserted so, and inside it walk_prev_ is a holder with no
-     * drain.  The census reads this (close_in_mid_step, must be 0). */
+     * not been sealed.  The END-marker close and the deferred budget /
+     * simpoint close land exactly here, and flush_final reads this flag to
+     * emit walk_prev_ at its measured extent with the branch declared
+     * unresolved (see the mid-step arm at the top of flush_final). */
     mid_step_ = true;
     return StepStatus::CONTINUE;
 }

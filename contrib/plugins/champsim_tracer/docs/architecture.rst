@@ -503,8 +503,8 @@ order they're touched on a hot path:
        ordered per-vCPU path-event queue and owns everything
        path-shaped: the async-exclusion mute window, the foreign-ASID
        boundary, the pending-seal slot (the deferred previous TB),
-       the fault-excursion context frames, and the seal / merge /
-       emit decision.  See :ref:`path-builder`.
+       the fault-excursion identity ledger, and the seal /
+       continuation / emit decision.  See :ref:`path-builder`.
    * - ``champsim_tracer_wp_thread_state.{h,cc}``
      - Per-thread wrong-path session state (``g_wp_state``: the
        in-progress flag, the ``last_executed_tb`` handshake, saved
@@ -798,7 +798,7 @@ load-bearing — under ``exec_lock``:
     scoreboard always describes the executed tail.
 5.  ``PathBuilder::step_seal`` — the post-window phase: depth
     stamping, fault-entry classification against the deferred prev,
-    the shared seal walk, merge completion, emission.  See
+    the shared seal walk, continuation completion, emission.  See
     :ref:`path-builder`.
 6.  Only a normally ``SEALED`` step runs the deferred window closes
     (the icount stop, the simpoint advance, and the marker / symbol
@@ -836,7 +836,7 @@ load-bearing — under ``exec_lock``:
     fire on a TB that has run, and walk the slot as usual.
 
 **The seal walk** (``collect_finalized_bbs``; shared by the per-step
-seal, the fault-merge fold, and the segment-final flush) walks the
+seal, the fault-continuation seal, and the segment-final flush) walks the
 deferred previous TB's fragment list up to the last-executed
 fragment.  Per fragment: capture the tail instruction's
 destination-register snaps (``snap_prev_tail_dsts`` — the one capture
@@ -936,14 +936,13 @@ events must survive bailed steps until a seal consumes them), then:
   that produces no event).
 * **Foreign-ASID boundary.**  A pinned run executing under another
   address space cannot bridge its fragments across the gap, so the
-  deferred prev is set aside — *suspended* onto a bounded per-thread
-  stack keyed on the pinned effective ASID, so the interrupted block
-  seals at its own fault depth when the pinned context returns, rather
-  than being dropped (see :ref:`suspend-or-seal <suspend-or-seal>`).  The async mute suspend runs
-  *first*: an async excursion routinely context-switches through
-  foreign address spaces, and those TBs must take the mute suspend
-  (which leaves the pending seal untouched for the resume), not the
-  ASID-boundary suspension.
+  deferred prev *departs the traced flow* there and is emitted at that
+  moment, at its measured extent, with its terminating branch honestly
+  unresolved (see :ref:`emit-at-departure <emit-at-departure>`).  The
+  async mute suspend runs *first*: an async excursion routinely
+  context-switches through foreign address spaces, and those TBs must
+  take the mute suspend (which leaves the pending seal untouched for
+  the resume), not the ASID-boundary departure.
 * **The pending-seal swap.**  On ``CONTINUE`` the current TB is
   promoted into the pending-seal slot and the old occupant becomes
   the TB the seal phase walks, together with the fault depth stamped
@@ -955,8 +954,8 @@ events must survive bailed steps until a seal consumes them), then:
 shutdown / active / segment-boundary gates) applies the retained
 fault events exactly once, then runs the shared seal walk:
 
-* **Depth pipeline.**  The fault-trailer depth the current TB runs at
-  is the count of un-returned merge frames — the live entries in
+* **Depth pipeline.**  The fault depth the current TB runs at
+  is the count of un-returned fault-ledger entries — the live entries in
   ``frames_`` — that the *executing guest thread itself* entered.  It is
   deliberately **not** derived from the per-vCPU ``plugin_fault_depth``.  That stack is a
   single object shared by every guest process, and under multi-process
@@ -969,21 +968,22 @@ fault events exactly once, then runs the shared seal walk:
   drags a subtractive baseline down and a later foreign push then
   over-counts the pinned depth, while a context switch *through* the
   pinned handler and back under-counts it — the two churn signatures a
-  raw-minus-baseline scheme produced (a merged faulting BB stamped at
+  raw-minus-baseline scheme produced (a faulting BB stamped at
   its own handler's depth, and a handler depth jumping ``0 <-> 2``
   across a kernel spin loop).  ``frames_`` holds exactly the pinned
   process's in-flight faults: foreign TBs are excluded and async
-  excursions mute-suspended *before* they reach the merge, so neither
-  ever seeds a frame (a foreign span suspends only the pinned process's
-  own deferred prev, never a foreign excursion — see
-  :ref:`suspend-or-seal <suspend-or-seal>`), and the boot's leaked frames predate
+  excursions mute-suspended *before* they reach the classification, so
+  neither ever seeds a ledger entry (a foreign span's departure emits
+  only the pinned process's own deferred prev, never a foreign
+  excursion — see :ref:`emit-at-departure <emit-at-departure>`), and
+  the boot's leaked frames predate
   ``frames_``,
   which ``on_segment_open`` clears.  Counting its un-returned frames
   therefore yields the pinned nesting depth directly — ISA-agnostic,
   immune to the shared stack's pollution, and ``0`` on the fault-free
   user path (``frames_`` empty).  A returned frame's handler has
   already unwound (its ``FAULT_RETURN`` was observed), so it drops out
-  of the count immediately even though its merge completion (the resume
+  of the count immediately even though its continuation (the resume
   suffix's seal) is still pending.  ``raw_depth_`` tracks the last
   event's ``depth_after`` for the ``CST_DEPTH_DIAG`` log only.
 
@@ -998,9 +998,9 @@ fault events exactly once, then runs the shared seal walk:
   block itself is emitted with), and three places consult it: the depth
   stamp counts only the executing thread's own frames, the pinned-user
   leak sweep retires only the frames of the thread whose user code proves
-  it is at depth ``0``, and a merge completion's deeper-frame unwind
-  skips frames a peer put above it on the ledger — those nest
-  concurrently, not inside.  This is what ``fault_depth`` is defined to
+  it is at depth ``0``, and a completion's leaked-deeper sweep retires
+  only same-thread ledger entries, sparing frames a peer put above it
+  on the ledger — those nest concurrently, not inside.  This is what ``fault_depth`` is defined to
   mean (:doc:`format` §4.2a): the depth *this* basic block executed at.  A thread that *migrates* across vCPUs mid-excursion
   leaves its frames behind on the vacated vCPU and is counted at depth
   ``0`` on the new one — the documented single-core-pin scope boundary,
@@ -1016,45 +1016,76 @@ fault events exactly once, then runs the shared seal walk:
 
   The stamp is taken **twice per seal**, because the seal moves
   ``frames_`` twice: the event drain at its head pushes new frames and
-  marks returns, and the seal walk at its tail *retires* frames (a merge
-  completion erases the completing frame and flushes any deeper ones).
+  marks returns, and the seal walk at its tail *retires* frames (a
+  completion erases the completing frame and retires any leaked
+  same-thread deeper entries).
   The current TB is promoted between those two movements, so a single
-  head-only stamp gives the block that follows a reassembled faulting BB
+  head-only stamp gives the block that follows a completed faulting BB
   the *pre*-completion count.  That is invisible while every
   ``FAULT_RETURN`` is observed — a returned frame is already out of the
   count — but a guest exception return that the host's strict-LIFO fault
   pop suppresses leaves its frame flagged in-flight right through its own
-  merge, and the following block then carries one excess level per
+  completion, and the following block then carries one excess level per
   suppressed frame.  Re-taking the stamp after the walk gives that block
   the post-unwind depth a completion proves it runs at: the resume suffix
   only executes after the exception return.
 * **Fault-entry classification.**  Each ``FAULT_ENTER`` is handled
   individually against the deferred prev — see
-  :ref:`fault-excursions` for the three cases and the context-frame
-  (whole-BB merge) machinery.
-* **Seal, merge, emit.**  The seal walk collects finalized BBs; if
-  the first seal completes a fault frame, the merge emits the frame's
-  full template with its accumulated pieces; otherwise every
-  finalized BB emits normally.
+  :ref:`fault-excursions` for the three cases, the split emission each
+  performs, and the identity ledger (``CtxFrame``) it maintains.
+* **Seal, continuation, emit.**  The seal walk collects finalized BBs;
+  if the first sealed BB is some ledger entry's resumed suffix, it is
+  emitted as a *continuation* of that entry's template — the same
+  ``template_id``, ``bb_start`` at the entry's cursor, the seal's
+  resolved branch and wrong path — and the entry is erased; otherwise
+  every finalized BB emits normally.
 
-Segment opens reset the builder (``on_segment_open``): frames are
-dropped (their templates point into the just-cleared ``bb_map_``),
-the pending-seal slot and retained events clear, the depth pipeline
-zeroes and re-primes lazily, and the mute window closes.
-``flush_final`` is the segment-finish counterpart: it drains the
-pending-seal slot through the same fragment walk (including the
-delay-slot tail snaps) so the segment's last TB is not lost to the
-one-step deferral.  The walk applies only when the slot holds a TB
-that has *run* — which is every close raised by the guest's own
-progress, the case the flush exists for, since the slot's TB executed
-up to the scoreboard's last-executed fragment and its memops and dst
-snaps are waiting in the thread's accumulators for a successor step
-that will never come.  The deferred icount / simpoint window close
-instead fires at a step tail, where the slot holds the TB about to
-dispatch, and passes ``walk_prev=false`` so nothing is emitted ahead
-of its own execution; that close waits a step precisely so the
-budget-crossing TB seals normally first (step 6 above).  Either way
-the in-flight chain is finalized.
+Segment opens reset the builder (``on_segment_open``): fault-ledger
+entries are dropped (each is an identity record whose executed prefix
+already reached the wire at its fault, so the drop loses no
+instructions — and their templates point into the just-cleared
+``bb_map_``), the pending-seal slot and retained events clear, the
+depth pipeline zeroes and re-primes lazily, and the mute window
+closes.  ``flush_final`` is the segment-finish counterpart: it puts
+every block the builder still holds on the wire at the extent whose
+observations are complete, and discards only per-instruction state
+that no emitted range claims.  Its pieces:
+
+* **A close landing mid-step** (between ``step_events``' promote and
+  ``step_seal`` — where the END-marker close and the deferred icount /
+  simpoint close both land) holds a block that has just finished
+  executing: its extent was measured and its tail destination snaps
+  captured by that very dispatch's prologue.  It is emitted at that
+  extent; the seal that would have resolved its terminating branch
+  never ran, so the branch is declared unresolved
+  (``CST_BB_FLAG_BRANCH_UNRESOLVED``, no branch-outcome records)
+  rather than fabricated.
+* **The pending-seal slot** emits at the last instruction whose
+  observations are *complete*.  When a later dispatch measured the
+  block (its prologue also captured the tail instruction's destination
+  snaps), the stop is the measured extent.  When only the retired
+  cursor answers (no later dispatch ran), the tail instruction retired
+  but its snapshot was never taken — its successor never began — so
+  the stop excludes it; the machine-shutdown close additionally
+  excludes the instruction in flight at the close, which began and did
+  not retire.  The deferred icount / simpoint close's slot holds the
+  TB dispatching *now* — extent zero, so nothing is emitted; that
+  close waits a step precisely so the budget-crossing TB seals
+  normally first (step 6 above).
+* **Fault-ledger entries** are forgotten: their prefixes are already
+  on the wire, so a close loses only the pending continuations'
+  identities, never instructions.
+* **The sinks that remain** — the excluded tail's snaps, a
+  mid-instruction's partial memops, retained events — are discarded as
+  the honest complement of the stop rule: they are observations of
+  instructions outside every emitted range.
+
+The final entry a close emits for a context carries
+``CST_BB_FLAG_THREAD_END``, and the user-instruction clock advances at
+emission by exactly the published range, so what a segment bills
+equals what it publishes at every close — an instruction the close
+could not fully observe is outside the range, off the wire, and off
+the clock alike.
 
 The close does not land on a block boundary.  The END marker fires from
 inside an instruction callback part-way through its own block, and a
@@ -1065,7 +1096,8 @@ per-instruction architectural clock (``VCPUScoreBoard::insn_started``,
 one JIT-inlined ``ADD`` per instruction, registered after every other
 per-instruction callback so a pre-instruction reader sees only
 *completed* instructions) how much of the in-flight TB actually ran, and
-**truncates the block to that extent**.  The truncated block is
+**truncates the block to the fully-observed extent**.  The truncated
+block is
 assembled by ``TemplateStore::commit_partial_bb`` into a store keyed by
 ``(asid_root, start_pc, n_insns)`` rather than into ``bb_map_``: the
 complete-block cache is keyed by address alone and treats a shorter run
@@ -1076,15 +1108,15 @@ goes the same way; when its extent turns out to match the complete block
 already committed at that pc, that template is reused, so a trace where
 nothing is really cut short mints nothing extra.
 
-Truncating is also what keeps the final block's register deltas.  A
-destination snapshot is captured one instruction late (the *next*
-instruction's callback reads the registers the previous one wrote), so
-the last executed instruction's snapshot is taken by a callback that
-never fires; measured against a block claiming its full translated
-length, the captured slice is always short, and the emit-time positional
-backstop then discarded the whole slice rather than mis-slice it.
-Truncated to what ran, the walk snaps the last *executed* instruction
-and the count matches exactly.
+The stop rule is also what keeps the final block's register deltas
+complete.  A destination snapshot is captured one instruction late
+(the *next* instruction's callback reads the registers the previous
+one wrote), so an instruction whose successor never began has no
+snapshot to give.  Stopping at the last fully-observed instruction
+means every instruction inside the emitted range has its complete
+memops and its complete post-execution register state — the range is
+short of what retired by at most the one unobservable boundary
+instruction, and it asserts nothing about it.
 
 .. _template-lifetimes:
 
@@ -1281,8 +1313,9 @@ its own wire semantics.  Consumers should treat them differently:
   placeholder value (keyed on the guest address, so the same bad
   address always reads the same bytes and adjacent bytes are
   decorrelated), the sealed :class:`WPBBEntry` is marked ``fault`` plus
-  ``fault_insn_index`` at that instruction (``CST_WP_EVENT_FAULT`` on
-  the wire), and the excursion **continues** on the placeholder to the
+  ``fault_insn_index`` at that instruction (``CST_BB_FLAG_SYNTHETIC_FAULT``
+  with ``CST_FID_BB_FAULT_INSN`` on the wire), and the excursion
+  **continues** on the placeholder to the
   depth budget.  Everything downstream of the marked instruction is
   synthetic; the **consumer contract** is that the marked instruction's
   result — and anything derived from it — is speculative filler that
@@ -1316,7 +1349,7 @@ its own wire semantics.  Consumers should treat them differently:
   target could not be fetched or translated — un-resident code under
   demand paging is the architectural case.  The last completed
   :class:`WPBBEntry` carries the ``translation_unavailable`` marker
-  (``CST_WP_EVENT_TRANSLATION_UNAVAIL`` on the wire), making the
+  (``CST_BB_FLAG_TRANSLATION_UNAVAIL`` on the wire), making the
   honest fetch boundary distinguishable from a clean budget end.  A
   real frontend's fetch stalls at exactly that translation fault, so
   the consumer should treat the chain as complete-but-bounded, not
@@ -1324,8 +1357,8 @@ its own wire semantics.  Consumers should treat them differently:
 * **Translation unavailable, first fetch.**  The excursion's *first*
   target cannot be fetched or translated, so the chain is empty and
   there is no :class:`WPBBEntry` to carry the marker; the condition
-  rides the body entry itself and is emitted as a *chain-level*
-  ``CST_WP_EVENT_TRANSLATION_UNAVAIL`` event.  An empty or truncated
+  rides the owning CP body entry itself as
+  ``CST_BB_FLAG_WP_FIRST_TARGET_UNAVAIL``.  An empty or truncated
   chain whose target is genuinely unmapped in the current address
   space is *correct output*, not a defect: a wrong-path fetch goes
   through the MMU, and a real frontend fetches nothing past a
@@ -1555,10 +1588,11 @@ The pin defines both the trace filter and the window clock:
   descriptor as the ``SYSTEM`` flag bit.
 * **Foreign address spaces** are neither traced nor counted: the
   PathBuilder's foreign-ASID boundary excludes their TBs.  The pinned
-  process's own deferred prev is *suspended* across the span, not lost
-  with it, so an interrupted handler level still seals on return (see
-  :ref:`suspend-or-seal <suspend-or-seal>`); async excursions take the mute suspend
-  instead — see :ref:`async-exclusion`.
+  process's own deferred prev is not lost with the span — it is
+  emitted at the boundary, at its measured extent, with its
+  terminating branch honestly unresolved (see
+  :ref:`emit-at-departure <emit-at-departure>`); async excursions take
+  the mute suspend instead — see :ref:`async-exclusion`.
 
 Two per-target refinements keep the pin honest about what the
 address-space register can actually attest.  On RISC-V the highest
@@ -1621,7 +1655,12 @@ Synchronous faults — page faults, TLB refills, lazy-enable traps —
 are *kept*: the handler is real, workload-induced kernel code.  The
 tracer's contract for them has two halves: handler code is emitted
 first-class at its exception-nesting depth, and the faulting BB is
-emitted **whole**, exactly once, after its excursions resolve.
+emitted in **split pieces, in program order** — its executed prefix
+goes on the wire *at the fault*, ahead of the handler that
+interrupted it, and its resumption is emitted after the excursion as
+a *continuation* of the same template, each piece declaring the
+executed range it is complete for (:doc:`format` §4.2a).  Nothing is
+deferred, reassembled, or placed retrospectively.
 
 QEMU owns the ground truth.  Each target's ``do_interrupt`` calls
 ``cpu_plugin_fault_push`` for a *re-executing* fault only (the
@@ -1635,31 +1674,53 @@ Both chokepoints append the corresponding ordered event, and both
 are no-ops on the wrong path.  ``plugin_fault_depth`` is the live
 nesting depth.
 
-On the plugin side, each drained ``FAULT_ENTER`` is classified
-against the deferred prev (see :ref:`path-builder`):
+On the plugin side, each drained ``FAULT_ENTER`` first takes the
+aborted attempt back off the window clock (a pushed fault re-executes
+its faulting instruction, so the started instructions at and past the
+resume index will run — and be billed — again), then is classified
+against the deferred prev (see :ref:`path-builder`).  Every emission
+below is a *split-emission piece*: the range ``[lo, hi)`` of the
+faulting BB's template, at the fault depth the block ran at, with the
+terminating branch unresolved (the range never reaches it) and no
+wrong path.  Whatever the range does not claim — the aborted
+attempt's memops, the excluded tail's snaps — is dropped afterwards:
+it is not an observation of a retired instruction, and the
+re-execution delivers it again.
 
 * **Case (a) — re-fault.**  The resume PC matches an in-flight
-  frame ``{resume_pc, asid}``: the same instruction faulted again
-  (a TLB refill followed by the demand fault is *one* faulting
-  instruction).  The deferred prev's accumulated pieces join that
-  frame; the anchor is recorded once.
+  ledger entry ``{resume_pc, asid}``: the same instruction faulted
+  again (a TLB refill followed by the demand fault is *one* faulting
+  instruction).  Nothing new retired, so nothing new is emitted; the
+  entry is marked back in flight.  One refinement: a bulk-memory
+  self-loop that re-faults having retired further *iterations*
+  mid-piece publishes them as a one-instruction piece at the loop —
+  real retirements are never held — with the continuation cursor
+  staying on the instruction.
 * **Case (a2) — second fault, same block.**  The resume PC is new,
   but the faulting TB is a byte-identical subrun of an in-flight
-  frame's template and the new resume PC lies inside that template:
+  entry's template and the new resume PC lies inside that template:
   a *later* instruction of the same pending block faulted (the
   archetype is a load's demand-zero fault followed by a store's CoW
   fault in one BB — the resume suffix re-executing after the first
-  fault is a subrun of the frame's own template by construction).
-  The piece joins that frame — anchors and accumulators extend —
-  and the frame re-keys to the new resume PC so the eventual
-  completion matches the final suffix.  Minting a second frame
-  keyed at the first resume PC instead would drop every instruction
-  ahead of it from the merged emission and leak the original frame.
+  fault is a subrun of the entry's own template by construction).
+  The suffix retired ``[cursor, k)`` before the new fault, and that
+  mid-excursion continuation of the same template is emitted *now*;
+  the entry's cursor and resume key advance to the new faulting
+  instruction, so the eventual completion continues from the final
+  suffix.  Minting a second ledger entry keyed at the first resume
+  PC instead would leak the original entry.
 * **Case (b) — new fault.**  The resume PC lies inside the deferred
   prev: prev *is* the faulting BB and its terminating branch never
   ran.  It is folded into a serializable template (force-committing
-  an incomplete head if needed) and a fresh context frame absorbs
-  its memops, register snaps, and the faulting-instruction anchor.
+  an incomplete head if needed), its executed prefix ``[0, K)`` — up
+  to the faulting instruction — is emitted at the fault, and a fresh
+  ledger entry records the block's identity: the full template, the
+  resume PC, the event-stamped address space, the owning thread, the
+  depth the block ran at, and the emission cursor ``K``.  When the
+  resume PC is not an instruction of the folded template (a
+  force-committed incomplete head), no prefix can be named: nothing
+  is emitted, no entry opens, and the accumulators drop with the
+  unnameable block.
 * **Case (c) — successor substitution.**  The resume PC is in
   neither: the fault hit a block whose exec callback never ran (an
   instruction-fetch miss on prev's successor, or a resume suffix
@@ -1677,110 +1738,79 @@ against the deferred prev (see :ref:`path-builder`):
   is excluded handler content, and the async machinery already seals
   prev against the window's departure PC.
 
-A ``FAULT_RETURN`` marks its frame returnable, but emission rides
-the resume suffix's *seal*, one or more steps later: when a sealed
-BB starts at a frame's resume PC, the merge re-injects the frame's
-accumulated pieces ahead of the suffix's own, emits the **full**
-template once with the suffix's resolved branch, and retires the
-frame.  Completion is keyed on the sealing context's ``(thread,
+A ``FAULT_RETURN`` marks its ledger entry returnable, but the
+continuation rides the resume suffix's *seal*, one or more steps
+later: when a sealed BB starts at an entry's resume PC, the
+**completion** emits the suffix as a continuation of the entry's
+template — the *same* ``template_id``, ``bb_start`` at the entry's
+cursor (the faulting instruction's index; the resume re-executes it),
+the seal's resolved terminal branch and its wrong path — and erases
+the entry.  Any leaked same-thread entry sitting *deeper* on the
+ledger (strict LIFO says an inner excursion unwinds first, so a
+survivor lost its own continuation) is simply retired with it: it
+holds nothing emittable — its prefix reached the wire at its fault —
+and retiring it keeps the depth count honest.  Completion is keyed on
+the sealing context's ``(thread,
 asid)``: the thread dimension is implicit (the PathBuilder is
 per-vCPU-thread state), and the seal's effective pin asid is the
-second half of the key.  A *user* frame completes only when its
+second half of the key.  A *user* entry completes only when its
 event-stamped asid equals the seal's — which makes the same-VA
-swallow (a frame from *another* address space, reachable through
+swallow (an entry from *another* address space, reachable through
 ASID reuse since every process maps code at the same low VAs,
 consuming an innocent block's seal) impossible by construction, so
 the byte-content comparison on that arm is a diagnostic, not a
-gate.  A *kernel-code* frame additionally completes on the
+gate.  A *kernel-code* entry additionally completes on the
 byte-content path when the asid key misses: a kernel fault's event
 stamp is whatever mm is loaded at the fault instant — under
 multi-process churn routinely another task's, for the same reason
-kernel-excursion ownership exists — while the frame stack only ever
+kernel-excursion ownership exists — while the ledger only ever
 holds the pinned process's own excursions, so content identity over
 the one shared kernel image is the reliable key there.  A returned
-frame is preferred by event identity; a frame whose return was
+entry is preferred by event identity; an entry whose return was
 never observed (a non-LIFO guest return — a context switch inside a
 blocking fault resuming the outer task first) completes on the same
 keys at its suffix's seal.
 
-.. _suspend-or-seal:
+.. _emit-at-departure:
 
-**Suspend-or-seal across a foreign or abandoned span.**  A foreign-ASID
-span (or an abandoned async window) can preempt the pinned process
-*exactly* at a handler's return — the block whose seal would complete a
-fault merge is the deferred prev the boundary would otherwise discard.
-Discarding it silently leaks the inner frame: its ``FAULT_RETURN`` was
-suppressed on the shared per-vCPU stack (non-LIFO), so it lingers
-un-returned, inflating every later fault's depth until the coarse
-user-privilege stale-frame sweep collapses the whole stack to 0 at once —
-and the frame's own depth level, its merged BB, never reaches the wire, so
-``fault_depth`` steps from the deepest handler straight to the resumed
-level (a ``2 -> 0`` jump the ``syscall_fault_nesting`` oracle flags;
-symmetrically ``0 -> 2`` on the re-nest).  So the boundary does not
-discard the deferred prev — it **suspends** it.  The prev and the four
-thread-local sinks its seal consumes — the committed CP memops, the
-per-instruction destination snaps, the in-flight chain-assembler prefix,
-and the promote-time depth stamp — freeze atomically onto a bounded
-per-thread suspension stack, tagged with the owning pinned effective ASID.
-When the pinned process next reaches an owned, non-excluded TB, the resume
-arrow pops the suspension whose ASID matches and re-arms those four sinks,
-so the promote walks the restored prev and the seal emits the interrupted
-handler block at its own depth: the wire steps ``2 -> 1 -> 0`` (or
-``0 -> 1 -> 2`` on a re-nest) across the span rather than losing the
-intermediate level.  The resume match keys on the pinned *effective* ASID
-alone, never the live ASID — a kept kernel block's live address-space
-register is whatever mm is loaded at that instant (a PTI entry overlay, a
-TLB-maintenance scratch), not ownership, so a live-ASID gate would strand
-the pinned process's own kernel-handler suspensions un-resumable; cross-
-process safety is the completion key's job (below), not the resume re-arm's.
-The **abandoned-async** arm suspends the same way but, unlike the foreign
-boundary, falls through to promote the current TB (kept — the pinned
-process at user privilege is real traced content).  That TB is the *other*
-guest thread the abandoned window hid, not the suspended prev's successor,
-so the resume arrow is held off for that one step: the suspension waits for
-its true successor's later resume rather than sealing against the wrong
-thread (the cross-thread taken edge the departure-PC seal exists to avoid).
+**Emit-at-departure across a foreign or abandoned span.**  A
+foreign-ASID dispatch (or an abandoned async window whose departure PC
+was never learned) can preempt the pinned process while the
+pending-seal slot still holds its previous block — including *exactly*
+at a handler's return, where the departing block is an inner handler
+level whose seal has not yet run.  The block executed; holding it for
+a resume that may never come is a deferral the trace's program order
+cannot absorb, and dropping it would lose an emitted level (a
+``2 -> 0`` depth jump the ``syscall_fault_nesting`` oracle flags).  So
+the block **departs the traced flow and is emitted at that moment**
+(``emit_prev_at_departure``): at the extent measured by the first
+dispatch after it — whose prologue also captured the tail
+instruction's destination snaps, so every instruction in the range is
+fully observed — at the depth it executed at, with its terminating
+branch declared unresolved (``CST_BB_FLAG_BRANCH_UNRESOLVED``, no
+branch-outcome records): the resolving successor is on the far side of
+an excluded span, and the format forbids fabricating one.  Anything
+past the measured extent was never observed and is dropped with the
+departure.  An interrupted handler level therefore reaches the wire at
+its own depth *before* the span, in program order — the wire steps
+``2 -> 1 -> 0`` (or ``0 -> 1 -> 2`` on a re-nest) across the span
+rather than losing the intermediate level.  The **abandoned-async**
+arm emits the same way but falls through to promote the current TB
+(kept — the pinned process at user privilege is real traced content):
+that TB is the *other* guest thread the abandoned window hid, not the
+departed block's successor, and emitting the departed block with its
+branch unresolved is what avoids sealing it against the wrong thread
+(the cross-thread taken edge the departure-PC seal exists to avoid).
+A pending continuation whose resume suffix departs this way keeps its
+ledger entry; if the continuation never seals, the entry is retired —
+by the completion's leaked-deeper sweep or the segment close — losing
+no instructions, since a ledger entry holds nothing emittable.  Off
+the contention path — user mode and a deterministic single-process
+system trace cross no foreign or abandoned boundary — no departure
+fires and the output is byte-identical.
 
-**Retire-at-return: the backstop suspend-or-seal cannot cover.**  A
-suspension normally resumes and reseals.  A residual set cannot: one
-displaced when the stack overflows its bound, one orphaned at a segment
-open, one the stale-frame sweep reaches while the pinned process runs past
-without resuming, or a foreign span that never returns to the pinned
-context at all.  There, retire-at-return emits the level directly — when
-the deferred prev (or the un-resumable suspension) is an inner
-(``depth >= 1``) frame's resume suffix, ``flush_frame_unwound`` emits the
-frame's full template at its own depth and anchors, from its own
-accumulated pieces, with no wrong-path and an unresolved terminal branch
-(the resolving suffix is gone), exactly like the segment-finish flush.
-When a frame *does* complete, ``complete_merge`` runs the same flush over
-any inner (depth ≥ 1) frame still in flight that nests **deeper** than the
-one it is completing — strict LIFO makes a surviving deeper frame a leak —
-deepest-first, so the unwind steps down a level at a time (``2 -> 1 -> 0``)
-rather than collapsing straight to the completing frame's depth.  What
-makes the deeper-frame flush safe is the ``(thread, asid)`` completion key
-on the *completing* frame: the frame stack only ever holds the pinned
-process's own excursions (a foreign TB seeds none — its deferred prev is
-suspended before classification could stash one), so once the completing
-frame is process-unambiguous, every deeper frame unwound with it is the
-pinned process's own.  The deeper
-frames' own event-stamped asids are deliberately *not* an equality gate — a
-kernel fault is stamped with whatever mm is loaded at the fault instant,
-which under multi-process churn is routinely another task's (the same
-reason kernel-excursion ownership exists: a live ASID is not ownership for
-kernel code); a stamp mismatch is reported as a diagnostic only.  Because
-both flushes emit an *anchored* (merged) entry, and an anchored entry must
-follow a strictly deeper one, a guard (``g_last_emit_fault_depth``) fires
-when the last entry on the wire is not deeper than the frame: a level it
-cannot place is never emitted out of order — the retire drops it, while the
-merge emits it instead as a plain, unanchored block clamped to the
-predecessor's depth — so neither can trade the depth jump for an
-anchor-at-unwind violation.  Off the contention path — user mode and a
-deterministic single-process system trace take no foreign or abandoned
-drops and leak no frames — no suspension forms, no flush fires, and the
-output is byte-identical.
-
-On the wire (``CST_FLAG_FAULT``, set in marker mode; user-mode
-traces carry no trailer): every CP entry carries ``fault_depth``
+On the wire (``CST_FLAG_FAULT``, set in marker mode; user-mode traces
+advertise no fault machinery): every CP entry carries ``fault_depth``
 (0 = normal code, ≥1 = handler code at that nesting level,
 baselined per segment).  User-privilege entries always stamp 0:
 user code is never handler content, but a preemptible kernel can
@@ -1789,14 +1819,13 @@ guest thread's user code while the interrupted task's frames are
 still live on the vCPU's per-CPU fault stack — the clamp keeps
 that depth from leaking onto the resumed thread (its *kernel* work
 keeps the raw-baselined depth, an accepted approximation of the
-per-vCPU stack).  A merged faulting BB carries
-``fault_anchors`` — the faulting-instruction indices, one per
-excursion, in order.  Consumers replay the handler at its depth and
-see the faulting block once, whole, with its detour points marked.
-Three environment toggles support A/B diagnosis: ``CST_NO_FAULT``
-(marker mode runs without the fault feature), ``CST_NO_FAULT_MERGE``
-(depth stamping without classification/stash/completion), and
-``CST_NO_FAULT_WP`` (merged emits carry no wrong path).
+per-vCPU stack).  A faulting BB appears as its split pieces, the
+excursion's entries between them at their depth: each piece declares
+the executed range it is complete for, and a consumer rejoins the
+invocation from the ranges (:doc:`format` §4.2a).  Two environment
+toggles support A/B diagnosis: ``CST_NO_FAULT`` (marker mode runs
+without the fault feature) and ``CST_NO_FAULT_WP`` (a fault
+continuation's emit carries no wrong-path chain).
 
 .. _async-exclusion:
 
@@ -1805,8 +1834,9 @@ Asynchronous interrupts and the two handler-tracing flags
 
 Two independent flags choose whether each kind of handler excursion is
 traced.  ``faults=1`` (default) traces synchronous-fault handlers at
-their nesting depth and reassembles the interrupted block whole (the
-merge machinery below); ``interrupts=0`` (default) excludes asynchronous
+their nesting depth, the interrupted block emitting in split pieces
+around them (:ref:`fault-excursions`); ``interrupts=0`` (default)
+excludes asynchronous
 handlers whole.  Setting ``faults=0`` excludes the synchronous handler
 instead, and ``interrupts=1`` traces the asynchronous handler instead —
 each reusing the other's mechanism, because the two are mirror images:
@@ -1864,11 +1894,11 @@ outermost ``ASYNC_ENTER`` event — making the abandoned-window seal
 identical to the one a proper resume would have produced.  When no
 departure PC is known (a window latched from live state before the
 segment's first prime), that seal target is unavailable, so the
-deferred prev is *suspended* like the foreign-ASID boundary suspends
-it (see :ref:`suspend-or-seal <suspend-or-seal>`), to seal at its own depth when the
-pinned context truly resumes — with its same-step resume held off, so
-the current (other-thread) TB promotes fresh instead of taking the
-suspended prev's seal.
+deferred prev is emitted at that moment instead, at its measured
+extent with its terminating branch unresolved (see
+:ref:`emit-at-departure <emit-at-departure>`) — the current
+(other-thread) TB then promotes fresh, taking no seal from a block
+that was never its predecessor.
 
 **Tracing the asynchronous handler (``interrupts=1``).**  When the
 handler is worth tracing — asynchronous kernel work is real
@@ -1878,8 +1908,9 @@ any live synchronous-fault nesting, so the handler's kernel blocks
 appear at depth ``>= 1`` between the interrupted context's entries; the
 same kernel-excursion ownership that attributes a synchronous handler
 attributes this one, keyed to the address space the interrupt was
-delivered from.  No merge is needed — an asynchronous interrupt is taken
-at a basic-block boundary, so the interrupted block is complete — but the
+delivered from.  No split is needed — an asynchronous interrupt is taken
+at a basic-block boundary, so the interrupted block is complete and no
+range divides — but the
 seal must still target the **departure PC** (the same substitution the
 abandoned-window recovery makes), because the block executing after the
 interrupted one is the handler entry, not its architectural successor.
@@ -1935,14 +1966,16 @@ stamp saw no address-space write at all — the last being the measure of
 how much of the condition an address-space rule cannot see.
 
 **Excluding the synchronous handler (``faults=0``).**  The mirror case
-reuses the async mute.  While a synchronous-fault frame is in flight
-the handler's capture is suspended and its basic blocks are dropped at
-the seal, exactly as an excluded async window's are — but the
-fault-reassembly merge is kept, so the interrupted block still emits
-whole from its pre-fault prefix and its post-return suffix.  The
-reassembled block is de-anchored and clamped to depth 0, so a
-``faults=0`` trace advertises the fault trailer yet carries no anchors
-and no depth ``> 0`` entry.
+reuses the async mute.  While a synchronous-fault excursion is in
+flight the handler's capture is suspended and its basic blocks are
+dropped at the seal, exactly as an excluded async window's are — but
+the interrupted block still emits its split pieces: the executed
+prefix at the fault, the continuation at the resume suffix's seal,
+with nothing between them and depth ``0`` throughout (a nested
+handler's own faulting block is handler content and is excluded with
+the handler).  A ``faults=0`` trace therefore advertises
+``CST_FLAG_FAULT`` yet never carries a depth ``> 0`` entry
+(:doc:`format` §4.2a).
 
 .. _time-transparency:
 

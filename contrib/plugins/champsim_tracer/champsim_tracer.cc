@@ -583,10 +583,9 @@ static inline bool marker_diag(void)
 }
 static thread_local uint64_t tls_mkdiag_end_wp_gated = 0;
 static thread_local uint64_t tls_mkdiag_start_wp_gated = 0;
-/* Step-bail counters for pinned user-privilege TBs (diag): a stall of the
+/* Step-bail counter for pinned user-privilege TBs (diag): a stall of the
  * user clock while the guest keeps running shows up here. */
 static thread_local uint64_t tls_mkdiag_susp_user = 0;
-static thread_local uint64_t tls_mkdiag_foreign_user = 0;
 
 /*
  * FENCE LANE INSTRUMENTATION (diagnostic only; every hook is off unless its
@@ -7848,7 +7847,7 @@ static void fence_diag_tick(unsigned int cpu_index, uint64_t icount_prev,
             " | end_cb=%" PRIu64 " cp=%" PRIu64 " fenced=%" PRIu64
             " fenced_user=%" PRIu64 " start_cb=%" PRIu64 "/%" PRIu64
             " | flags spec=%d wp=%d sess=%d"
-            " | susp_u=%" PRIu64 " foreign_u=%" PRIu64
+            " | susp_u=%" PRIu64
             " | evq qmax=%" PRIu64 " batch=%" PRIu64 " gap=%" PRIu64
             " big=%" PRIu64 " absorb=%" PRIu64 "/%" PRIu64
             " drains=%" PRIu64 "\n",
@@ -7862,7 +7861,7 @@ static void fence_diag_tick(unsigned int cpu_index, uint64_t icount_prev,
             g_fdiag_end_fenced_user, g_fdiag_start_fenced,
             g_fdiag_start_total,
             f_spec ? 1 : 0, f_wp ? 1 : 0, f_sess ? 1 : 0,
-            tls_mkdiag_susp_user, tls_mkdiag_foreign_user,
+            tls_mkdiag_susp_user,
             fence_evq_qmax(), g_stats.evq_batch_peak, g_stats.evq_gap_peak,
             g_stats.evq_bigdrains, g_stats.evq_absorb_calls,
             g_stats.evq_absorb_events, g_stats.evq_drain_calls);
@@ -10293,12 +10292,12 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
         fprintf(stderr, "[mkdiag] end-cb CP cpu=%u pc=0x%" PRIx64
                 " priv=%d asid=0x%" PRIx64 " pinned=0x%" PRIx64
                 " user=%" PRIu64 " wp_gated=%" PRIu64 " susp_u=%" PRIu64
-                " foreign_u=%" PRIu64 "\n",
+                "\n",
                 cpu_index, pc, qemu_plugin_get_priv_level(),
                 qemu_plugin_get_addr_space_id(),
                 g_pinned_asid.load(std::memory_order_relaxed),
                 g_user_icount, tls_mkdiag_end_wp_gated,
-                tls_mkdiag_susp_user, tls_mkdiag_foreign_user);
+                tls_mkdiag_susp_user);
     }
     if (fence_diag()) {
         fence_note_end(pc, qemu_plugin_get_addr_space_id(),

@@ -420,7 +420,8 @@ Branch types (``BranchType``)
        sealed there and the excursion continues on the NOT-taken side,
        the architectural fall-through, exactly as for any other branch.
        The instruction raises (that is how it leaves speculative
-       execution) so the block carries ``CST_WP_EVENT_FAULT`` at it, and
+       execution) so the block carries ``CST_BB_FLAG_SYNTHETIC_FAULT``
+       with ``CST_FID_BB_FAULT_INSN`` at it, and
        the call is never performed — the syscall's result registers hold
        the deterministic placeholder.  A *conditional* trap has no
        target and does not belong here; see ``GEN_OP_CMP``.
@@ -488,8 +489,8 @@ always the next record: a fault, a syscall, an interrupt, an interleaved
 kernel strand or a gated-out address space can stand between a branch and
 its target's first retired instruction.  ``cst_decode --verify-branch``
 cross-checks each CP entry's stored outcome against the entry where its
-context resumes the target's instruction stream (its ``start_pc`` or one of
-its fault anchors), and each non-final WP block against the next chain
+context resumes the target's instruction stream (its singular resume PC,
+``insn_pcs[bb_start]``), and each non-final WP block against the next chain
 block's ``start_pc``.  See :doc:`format` §5.6 for the wire contract and the
 diversion semantics.
 
@@ -1119,7 +1120,8 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
        each declaring the executed range it is complete for.  ``faults=0``
        **excludes** the handler excursion: capture is suspended across the
        handler exactly as an asynchronous interrupt's is, the interrupted
-       block still emits whole, and every entry's fault depth stays ``0``.
+       block still emits its ranges with nothing between them, and every
+       entry's fault depth stays ``0``.
        Independent of ``interrupts``.  Ignored in user mode (no fault
        stack).
    * - ``interrupts=0|1``

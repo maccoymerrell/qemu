@@ -386,13 +386,6 @@ struct Stats {
      * land on; anything else is an unmeasured close and this is the only
      * thing standing between it and a silent over-claim.  Must be 0. */
     uint64_t close_walk_extent_unknown = 0;
-    /* Close walks whose extent came from the measurement taken at the first
-     * dispatch after prev, because the retired cursor had rolled past it
-     * (see PathBuilder::note_prev_extent).  Non-zero is ordinary on an SMP
-     * guest whose pinned process migrated; it is what keeps
-     * close_walk_extent_unknown at 0 there instead of folding a peer's
-     * block at its full translated length on no evidence. */
-    uint64_t close_walk_extent_from_stash = 0;
     /* USER entries emitted while a FOREIGN address space was live on the
      * vCPU — the emitting context is not the one the block executed in.
      * Emissions lag execution (deferred seal, close flush), so the live
@@ -444,37 +437,32 @@ struct Stats {
      * PathBuilder::close_state_report (pre-flush and post-flush lines);
      * these counters are what make the two halves add up across a run.
      *
+     * Under split emission a CtxFrame is an identity-and-depth ledger
+     * entry — its block's executed prefix reached the wire at the fault —
+     * so every frame fate below moves bookkeeping, never instructions:
+     *
      * Frames (PathBuilder::frames_):
-     *   opened               classify_fault_enter pushed a CtxFrame
-     *   merged               complete_merge emitted the reassembled BB
-     *   unwound_emitted      flush_frame_unwound put its prefix on the wire
-     *   unwound_dropped      flush_frame_unwound had no stream / no
-     *                        template and erased it silently — an
-     *                        UNCOUNTED drop before this census
-     *   unwound_guard_dropped
-     *                        flush_frame_unwound's anchor guard erased the
-     *                        frame WITHOUT emitting (no strictly deeper
-     *                        predecessor to anchor against).  Counted as
-     *                        unwound_EMITTED until this row existed, so the
-     *                        ledger asserted a wire emission that never
-     *                        happened and the fate identity balanced over a
-     *                        drop
-     *   faults0_dropped      faults=0 nested-handler frame discarded
-     *   orphan_dropped       on_segment_open cleared it (its full_tmpl
-     *                        dangles into the cleared bb_map_) — likewise
-     *                        uncounted before this census, and the
-     *                        susp_stack_ twin HAS had a counter since
-     *                        Stage 3
+     *   opened               classify_fault_enter case (b) pushed a
+     *                        CtxFrame after emitting the prefix
+     *   merged               complete_continuation emitted the resumed
+     *                        suffix as a continuation and erased the frame
+     *   unwound_dropped      a completion retired a leaked same-thread
+     *                        DEEPER entry (strict LIFO says it lost its
+     *                        own continuation; nothing was emittable)
+     *   orphan_dropped       on_segment_open or flush_final cleared it
+     *                        (its full_tmpl dangles into the cleared
+     *                        bb_map_ / the segment is over)
      *   held_at_close        still in frames_ at a close, summed over the
      *                        POST-flush census (so the close-flush's own
      *                        recoveries are already subtracted)
      *
      * Pending-seal slot (PathBuilder::prev_tb_):
      *   prev_promoted        set_prev installed a block
-     *   prev_close_walked    a close's flush_final walked it
-     *   prev_close_dropped   a close did NOT walk it although it held a
-     *                        block (the prev_executed=false routes), with
-     *                        the RETIRED extent that went with it
+     *   prev_close_walked    a close's flush_final emitted it at a
+     *                        measured nonzero extent
+     *   prev_close_dropped   a close emitted nothing for it (extent zero
+     *                        or unmeasurable), with the RETIRED extent
+     *                        that went with it
      *
      * The remaining holders have no lifecycle counter of their own because
      * they are sinks, not queues: what matters is the depth left in them
@@ -486,7 +474,6 @@ struct Stats {
     uint64_t census_frames_unwound_dropped = 0;
     uint64_t census_frames_orphan_dropped = 0;
     uint64_t census_frames_held_at_close = 0;
-    uint64_t census_frames_held_insns = 0;
     uint64_t census_prev_promoted = 0;
     uint64_t census_prev_close_walked = 0;
     uint64_t census_prev_close_dropped = 0;
@@ -543,34 +530,17 @@ struct Stats {
     uint64_t close_flush_reordered = 0;
     uint64_t close_flush_reordered_builders = 0;
 
-    /* THE DEFERRED ROUTE'S PENDING-SEAL SLOT.  flush_final(walk_prev=false)
-     * did not walk the slot at all.  For the budget / simpoint close that
-     * is right -- the slot holds the TB about to dispatch, measured ran=0.
-     * For the SHUTDOWN close it is a drop: the slot holds the block the
-     * device write interrupted, and its retired prefix goes with it.
-     *
-     * The prefix is exactly what retired and nothing more.  insn_started is
-     * added at the TOP of an instruction, so a close taken from a MID-
-     * INSTRUCTION callback (the device write) reads the in-flight
-     * instruction as already begun; the drain subtracts it, because an
-     * instruction that has not completed has not delivered all its memops
-     * (the bimodality oracle that vetoed emitting this slot whole). */
-    uint64_t close_deferred_prev_walked = 0;
-    uint64_t close_deferred_prev_insns = 0;
+    /* THE PENDING-SEAL SLOT'S STOP RULE AT A CLOSE (see
+     * PathBuilder::flush_final).  A machine-shutdown close is taken from a
+     * MID-INSTRUCTION callback (the device write), and insn_started is
+     * added at the TOP of an instruction, so the retired cursor reads the
+     * in-flight instruction as already begun; the close subtracts it,
+     * because an instruction that has not completed has not delivered all
+     * its memops — it is outside the fully-observed range by the stop
+     * rule. */
     uint64_t close_deferred_prev_inflight_trimmed = 0;
-    /* ...and the closes where QEMU said an instruction was in flight and the
-     * slot was NOT the block it was in flight in.  The pending-seal slot
-     * holds the last block of the PINNED process; a guest poweroff is
-     * performed by whichever process ran it, so on a system guest this is
-     * the common case, not the exception.  The subtraction is declined here
-     * -- both remaining extent sources (retired_executed_of's previous-
-     * dispatch arm, and the note_prev_extent stash) are measured only once a
-     * successor has dispatched, which is proof the block ran to its end.
-     * Descriptive, not a must-be-0: a close landing outside the traced
-     * process is normal. */
-    uint64_t close_deferred_prev_inflight_stale = 0;
-    /* The deferred route held a block and no extent could be measured for
-     * it, so nothing could be emitted without guessing.  Must be 0. */
+    /* The slot held a block and no extent could be measured for it, so
+     * nothing could be emitted without guessing.  Must be 0. */
     uint64_t close_deferred_prev_extent_unknown = 0;
 
     /* THE SINKS, after every drain above has run.  These are residues, not
@@ -596,35 +566,6 @@ struct Stats {
      * not depend on remembering to add a row per new holder. */
     uint64_t close_holder_undrained = 0;
     uint64_t close_holder_undrained_insns = 0;
-
-    /* THE OTHER HALF OF THE WHOLE-CLASS GATE.
-     *
-     * close_holder_undrained is read on the POST-flush census pass, and
-     * every drain flush_final performs EMPTIES its holder unconditionally —
-     * including on its own no-emit exits (no body stream, an unmeasurable
-     * pending-seal extent, a pending-seal slot the close-walk gate
-     * skipped).  So the post-pass occupancy answers "did the drain
-     * RUN", not "did the work reach the WIRE": a holder the drain cleared
-     * without emitting reads zero, exactly like one it emitted.  The
-     * falsifier arms that make the gate fire all work the other way round
-     * (they skip the drain and LEAVE the holder occupied), so the one
-     * failure shape the gate was demonstrated on is the one it can see.
-     *
-     * This is the discard half: every close-time site that empties a holder
-     * WITHOUT putting its contents on the wire, with the retired extent
-     * that went with it.  Must be 0, and it is the row that fails a cell
-     * when a drain silently eats its occupant. */
-    uint64_t close_holder_discarded = 0;
-    uint64_t close_holder_discarded_insns = 0;
-
-    /* THE LATENT HOLDER (PathBuilder::walk_prev_).  The cross-phase
-     * snapshot the seal walk folds is undrained and non-zero at nearly
-     * every close, but in every close route that exists today it is
-     * POST-SEAL: already emitted.  It becomes a live drop the instant a
-     * close is taken between step_events and step_seal -- the window
-     * tw_manage_window occupies.  Nothing asserted that ordering; this
-     * does.  Must be 0. */
-    uint64_t close_in_mid_step = 0;
 
     /* A wrong-path session still open on a vCPU at a close.  While one is,
      * MemAccessRecorder::record routes CORRECT-path memops into the WP

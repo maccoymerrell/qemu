@@ -483,16 +483,18 @@ unambiguous.  A template that is legitimately bimodal AT SCALE (heavy
 predication, a REP loop empty as often as not) has a zero-rate the
 default threshold does not consider an outlier, so it is not flagged.
 
-A fault-truncated execution is excluded from the population outright.
-An entry carrying fault anchors (``fault_at``, format.rst §6.7) stopped
-part-way through its template — in the limit at instruction 0, before
-any memop-capable instruction retired — so it never had the opportunity
-to realise the template's memops, and the wire records precisely that.
+A partial-range execution is excluded from the population outright.
+An entry declaring a partial executed range (``bb_start`` /
+``bb_stop``, format.rst §4.2a) covers only part of its template — in
+the limit a prefix cut before any memop-capable instruction retired —
+so it never had the opportunity to realise the template's full memops,
+and the wire records precisely that.
 The canonical case is a kernel copy loop taking a page fault on its
-first store: one truncated execution against fifty complete ones is the
+first store: one split execution against fifty complete ones is the
 D4 *shape* without being a D4 *loss*.  Excluding them costs the oracle
-no strictness, because the loss it exists to catch is a silent one and a
-silently dropped memop section carries no anchor.  The report prints the
+no strictness, because the loss it exists to catch is a silent one and
+a silently dropped memop section leaves the entry's range claiming the
+whole block.  The report prints the
 excluded count so the exclusion is never invisible.
 
 The lint is implemented in ``tools/cst_lint.h``
@@ -642,11 +644,13 @@ collectively check every one:
    each branch-terminated CP entry's ``CST_FID_BRANCH_TAKEN`` /
    ``CST_FID_BRANCH_TARGET`` against the *architectural continuation*
    — the entry where its ``(thread, asid)`` context resumes the
-   encoded target, at that entry's ``start_pc`` or at one of a
-   fault-merged entry's anchors — rather than against the next entry
+   encoded target, at that entry's singular resume PC
+   (``insn_pcs[bb_start]``, which is ``start_pc`` on an entry that
+   began its block) — rather than against the next entry
    in stream order; a pair the next entry does not resolve is deferred
    only on a positive diversion signal (a ``fault_depth`` step, the
-   successor's fault anchors, a thread switch, a privilege-domain gap,
+   successor resuming mid-block (``bb_start > 0``), a thread switch, a
+   privilege-domain gap,
    or both endpoints inside a kernel excursion) and must then be
    resumed or corroborated by a later entry of the same context.  WP
    chain blocks are checked in-chain against the next block's

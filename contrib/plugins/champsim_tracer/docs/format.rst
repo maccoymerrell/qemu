@@ -1620,16 +1620,18 @@ reordering.
 Normative consequences of a declared range.  The general rule is that
 an entry observes exactly the instructions inside its range: a writer
 MUST NOT emit a per-instruction record — of any field family — at a
-position outside ``[bb_start, bb_stop)``, and a consumer materialises
-nothing for such a position (§5.7 gives the decode mechanics for a
-defective record that carries one anyway).  The block's own records at
-``BLOCK_POS`` are outside every instruction range by construction and
-are always legal; the range scopes instruction positions only.  The
-consequences family by family:
+position outside ``[bb_start, bb_stop)``, and a reader MUST reject a
+trace that carries one — the record claims an observation of an
+instruction the entry itself declares did not complete, and there is
+no honest reading of that (§5.7 gives the check's mechanics).  The
+block's own records at ``BLOCK_POS`` are outside every instruction
+range by construction and are always legal; the range scopes
+instruction positions only.  The consequences family by family:
 
 * A memop record MUST NOT appear at an ``ins_pos`` outside
-  ``[bb_start, bb_stop)``, and a consumer MUST NOT materialise memops
-  for such a position.  A memop an instruction delivered before losing
+  ``[bb_start, bb_stop)`` — a trace carrying one is rejected — and a
+  consumer MUST NOT materialise memops
+  for a rangeless position.  A memop an instruction delivered before losing
   the machine — the aborted attempt of a faulted bulk operation, §5.2 —
   belongs to the entry whose range contains that instruction, which is
   the entry that re-executes it, never the entry that stopped before
@@ -2936,12 +2938,14 @@ per-instruction records only at positions inside the entry's declared
 ``[bb_start, bb_stop)`` (§4.2a); the block's own records at
 ``BLOCK_POS`` sit outside every instruction range by construction and
 are always legal.  A per-instruction record at an in-template position
-*outside* the declared range is a writer defect.  Its decode is
-nevertheless deterministic: Step 6.9 applies every record to its
-persistent cell uniformly — nothing about the cell update is
-conditioned on the range, which the decoder may not even hold yet —
-but the entry materialises nothing at that position, so the defective
-record contributes no observation.
+*outside* the declared range is malformed, and a reader MUST reject
+the trace.  Because the range rides the section's tail (records are
+ordered by position and ``BLOCK_POS`` is the highest), the check runs
+once the section has been parsed — the same two-pass shape the delta
+model already requires (apply deltas, then materialise) — with each
+record's position tested against the range the section's own block
+records resolve to.  A rejected trace's cell updates are moot; no
+overlay state escapes a rejection.
 
 ::
 

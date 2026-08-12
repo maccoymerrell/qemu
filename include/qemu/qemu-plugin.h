@@ -239,6 +239,18 @@ typedef uint64_t qemu_plugin_id_t;
  *   A plugin declaring 16 through 20 is refused at
  *   qemu_plugin_register_vm_shutdown_cb().
  *
+ * version 22:
+ * - added qemu_plugin_register_vm_reset_cb: a guest-initiated (or
+ *   monitor/QMP/watchdog) machine RESET tears the machine down and
+ *   boots it again inside the same QEMU process, so it never reaches
+ *   the shutdown callback or atexit — yet everything a plugin has been
+ *   recording about the running machine (open captures, address-space
+ *   pins, guest-derived state) stops being true at that boundary.
+ *   Dispatched from the reset request, before the machine is torn
+ *   down, with the same vCPU-placement and argument discipline as the
+ *   shutdown callback.  Resets converted to shutdowns by -no-reboot
+ *   arrive on the shutdown callback instead, never on both.
+ *
  * Where an entry above says a signature changed WITHOUT the version
  * constant moving, the version in force at the time names two
  * incompatible spellings of the same symbol and cannot be honoured
@@ -250,7 +262,7 @@ typedef uint64_t qemu_plugin_id_t;
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 21
+#define QEMU_PLUGIN_VERSION 22
 
 /*
  * The two values a signed vCPU index takes when it is not an index.
@@ -1449,12 +1461,18 @@ void qemu_plugin_register_devio_cb(qemu_plugin_id_t id,
  *              A plugin holding an open capture can free it here but
  *              cannot close it against the machine.
  * @in_guest_insn: the callback is running INSIDE the guest instruction
- *              that caused the shutdown -- a guest poweroff is a device
- *              write, and the request arrives part-way through the store
- *              that performs it, so that instruction has BEGUN and has
- *              NOT retired.  False on every other route: the monitor,
- *              QMP and SIGINT/SIGTERM are marshalled onto a vCPU at a TB
- *              BOUNDARY, where the last dispatched block completed.
+ *              that caused the shutdown, which has BEGUN and has NOT
+ *              retired.  False whenever the callback runs at a TB
+ *              BOUNDARY instead, where the last dispatched block
+ *              completed — which is now every ordinary route: the
+ *              monitor, QMP and SIGINT/SIGTERM are marshalled onto a
+ *              vCPU, and a guest poweroff (a device write or hypercall
+ *              executed under the BQL) is queued on the writing vCPU and
+ *              delivered once its store has retired, because dispatching
+ *              inside the write would hold the BQL against a plugin lock
+ *              (see qemu_plugin_register_vm_shutdown_cb).  True is left
+ *              for a vCPU-context request that arrives without the BQL
+ *              and so really does run mid-instruction.
  *
  *              A plugin that closes a capture needs this, because
  *              claiming the in-flight instruction publishes a block whose
@@ -1462,11 +1480,10 @@ void qemu_plugin_register_devio_cb(qemu_plugin_id_t id,
  *              it throws away instructions the guest retired.  It is a
  *              statement about POSITION in the instruction stream and
  *              @vcpu_index is a statement about ORIGIN; QEMU makes both
- *              rather than leaving either to be read off the other.  As
- *              it happens the only route that names a vCPU today is also
- *              the only one with an instruction in flight, but that is a
- *              property of where QEMU's shutdown requests come from, not
- *              a promise of this interface.
+ *              rather than leaving either to be read off the other — a
+ *              guest poweroff names the writing vCPU while reporting no
+ *              instruction in flight, and neither fact can be read off
+ *              the other.
  *
  * Dispatched once, when the machine is going down for any reason: the
  * guest powered itself off or reset with -no-reboot, the monitor or a
@@ -1493,12 +1510,15 @@ typedef void (*qemu_plugin_vm_shutdown_cb_t)(qemu_plugin_id_t id,
  *
  * This callback is dispatched from the shutdown request itself, before
  * the main loop leaves and before qemu_cleanup() runs, and QEMU places
- * it on a vCPU thread whenever one can be reached — directly when the
- * request already came from vCPU context (the usual case, since a guest
- * poweroff is a device write the guest itself executed), otherwise by
- * offering the work to every live vCPU and taking whichever reaches a
- * translation-block boundary first.  Guest memory, vCPU registers and
- * the privilege/address-space APIs are all live and stable inside it.
+ * it on a vCPU thread whenever one can be reached — on the requesting
+ * vCPU when the request came from vCPU context (the usual case, since a
+ * guest poweroff is a device write or hypercall the guest itself
+ * executed; the delivery is queued to that vCPU's next translation-block
+ * boundary, because the request arrives under the BQL and the dispatch
+ * must not run under it, see below), otherwise by offering the work to
+ * every live vCPU and taking whichever reaches a translation-block
+ * boundary first.  Guest memory, vCPU registers and the
+ * privilege/address-space APIs are all live and stable inside it.
  *
  * QEMU waits for that placement without bound.  The offer goes to every
  * live vCPU, so the callback runs as soon as ANY of them drains its work
@@ -1516,6 +1536,53 @@ typedef void (*qemu_plugin_vm_shutdown_cb_t)(qemu_plugin_id_t id,
 QEMU_PLUGIN_API
 void qemu_plugin_register_vm_shutdown_cb(qemu_plugin_id_t id,
                                          qemu_plugin_vm_shutdown_cb_t cb);
+
+/**
+ * typedef qemu_plugin_vm_reset_cb_t - machine-reset hook
+ * @id: plugin ID
+ * @vcpu_index: the vCPU the reset CAME FROM, with the same two
+ *              non-indices and the same meaning as
+ *              qemu_plugin_vm_shutdown_cb_t's @vcpu_index.
+ * @in_guest_insn: same statement as qemu_plugin_vm_shutdown_cb_t's:
+ *              a guest-initiated reset is a device write (or, on x86, a
+ *              triple fault raised mid-instruction), so the request
+ *              arrives with that instruction begun and not retired;
+ *              false on the marshalled routes (monitor, QMP, watchdog),
+ *              which run at a translation-block boundary.
+ *
+ * Dispatched when the machine is about to be RESET rather than shut
+ * down: the guest wrote a reset register (x86 port 92h / PIIX RCR /
+ * i8042 pulse, Arm PSCI SYSTEM_RESET, the sifive_test finisher, the
+ * Malta SOFTRES register), tripped a triple fault, a watchdog's reset
+ * action fired, or a monitor/QMP system_reset was issued.  All of those
+ * funnel through the one reset request, which is where this dispatches.
+ *
+ * The machine that comes back is a fresh world — new kernel, new
+ * address spaces, every guest-derived identity recycled — running in
+ * the same QEMU process.  A plugin recording the old world must treat
+ * the reset as that recording's end; nothing it holds names anything
+ * in the new one.  Unlike the shutdown callback this can dispatch more
+ * than once per run: each teardown is its own event.  A reset that
+ * -no-reboot converts into a shutdown is dispatched as the shutdown it
+ * became, never as both.  System emulation only.
+ */
+typedef void (*qemu_plugin_vm_reset_cb_t)(qemu_plugin_id_t id,
+                                          int vcpu_index,
+                                          bool in_guest_insn);
+
+/**
+ * qemu_plugin_register_vm_reset_cb() - register a machine-reset cb
+ * @id: plugin ID
+ * @cb: callback
+ *
+ * Placement and lifetime guarantees are those of
+ * qemu_plugin_register_vm_shutdown_cb(): dispatched from the reset
+ * request, before the machine is torn down, on a vCPU thread whenever
+ * one can be reached, with the BQL dropped around the marshalled form.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_register_vm_reset_cb(qemu_plugin_id_t id,
+                                      qemu_plugin_vm_reset_cb_t cb);
 
 /**
  * qemu_plugin_register_atexit_cb() - register exit callback

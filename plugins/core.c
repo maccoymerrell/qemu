@@ -251,6 +251,46 @@ bool qemu_plugin_vm_shutdown_armed(void)
 }
 
 /*
+ * Machine-reset hook (qemu_plugin_register_vm_reset_cb).  Same seam as the
+ * shutdown hook — the plugin must see the machine while it is still
+ * assembled — but a reset is NOT terminal: the machine boots again in the
+ * same process, and a guest can do that more than once.  So delivery is
+ * per-event rather than once-per-run: the in-flight exchange folds only
+ * CONCURRENT duplicates of the same teardown (two vCPUs racing their reset
+ * writes, or the marshalled offer landing on several vCPUs), and re-arms
+ * as soon as the callback returns so the next teardown is seen too.
+ */
+static qemu_plugin_vm_reset_cb_t vm_reset_hook;
+static bool vm_reset_dispatch_in_flight;
+
+void qemu_plugin_register_vm_reset_cb(qemu_plugin_id_t id,
+                                      qemu_plugin_vm_reset_cb_t cb)
+{
+    vm_reset_hook = cb;
+}
+
+QEMU_DISABLE_CFI
+bool qemu_plugin_vm_reset_dispatch(int vcpu_index, bool in_guest_insn)
+{
+    qemu_plugin_vm_reset_cb_t cb = vm_reset_hook;
+
+    if (!cb) {
+        return false;
+    }
+    if (qatomic_xchg(&vm_reset_dispatch_in_flight, true)) {
+        return false;
+    }
+    cb(0, vcpu_index, in_guest_insn);
+    qatomic_set(&vm_reset_dispatch_in_flight, false);
+    return true;
+}
+
+bool qemu_plugin_vm_reset_armed(void)
+{
+    return vm_reset_hook && !qatomic_read(&vm_reset_dispatch_in_flight);
+}
+
+/*
  * Guest-kernel current-task location hint
  * (qemu_plugin_set_current_task_offset).  Process-global: one guest
  * kernel per emulation, and the declaring plugin runs before any vCPU

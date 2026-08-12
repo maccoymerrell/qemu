@@ -250,6 +250,36 @@ bool qemu_plugin_vm_shutdown_dispatch(int vcpu_index,
 bool qemu_plugin_vm_shutdown_armed(void);
 
 /*
+ * The machine is about to RESET: torn down and booted again inside the
+ * same process.  Dispatched to a plugin's registered reset hook
+ * (qemu_plugin_register_vm_reset_cb) from the reset request — the one
+ * funnel every delivery path (guest reset device writes, x86 triple
+ * fault, watchdog reset action, monitor/QMP system_reset) passes
+ * through — before the main loop pauses the vCPUs and resets the
+ * machine.  A request that -no-reboot converts into a shutdown takes
+ * the shutdown dispatch instead and never reaches this one.  Unlike
+ * the shutdown dispatch this can fire more than once per run: each
+ * teardown is its own event, and only concurrent duplicates of the
+ * SAME event are folded.
+ */
+void qemu_plugin_vm_reset(void);
+bool qemu_plugin_vm_reset_dispatch(int vcpu_index, bool in_guest_insn);
+bool qemu_plugin_vm_reset_armed(void);
+
+/*
+ * Wait for a guest-route reset dispatch to be DELIVERED before the reset
+ * is performed.  A guest-initiated reset arrives on the writing vCPU with
+ * the BQL held, so qemu_plugin_vm_reset() queues the callback on that
+ * vCPU rather than run it under the write's own lock (the AB/BA against a
+ * plugin lock a peer holds across a wrong-path excursion) — and the
+ * pause that precedes the reset does not wait for work queues.  Called
+ * from the reset performance, under the BQL, before the machine the
+ * callback must report on is torn down; a no-op when nothing was
+ * deferred.
+ */
+void qemu_plugin_vm_reset_wait_placed(void);
+
+/*
  * Guest-kernel current-task location hint, declared by a plugin via
  * qemu_plugin_set_current_task_offset() and consumed by a target's
  * plugin-state hooks (today: x86-64's get_plugin_thread_ptr /
@@ -373,6 +403,12 @@ static inline void qemu_plugin_atexit_cb(void)
 { }
 
 static inline void qemu_plugin_vm_shutdown(void)
+{ }
+
+static inline void qemu_plugin_vm_reset(void)
+{ }
+
+static inline void qemu_plugin_vm_reset_wait_placed(void)
 { }
 
 static inline

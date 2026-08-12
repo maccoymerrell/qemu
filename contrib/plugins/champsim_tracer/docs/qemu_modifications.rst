@@ -836,15 +836,12 @@ speculative path.
    the walk is nested inside, clobbering the host code control returns
    into (a JIT ``SIGSEGV``).
 
-   Two cooperating mechanisms keep wrong-path translation
-   flush-invariant instead.  Each region holds back a small reserve at
-   the top: ``tcg_region_assign`` lowers ``code_gen_highwater`` by up
-   to 2 MiB.  When ``tb_gen_code`` overflows while
-   ``cpu->plugin_spec_mode`` is set, it opens that reserve
-   (``tcg_region_open_spec_reserve``) so the in-flight walk translates
-   to its natural end — wrong-path is a series of independent true BBs,
-   and the emitted chain is identical with or without the flush, never
-   truncated — and records the owed flush in
+   Two cooperating mechanisms hold the flush off until the walk has
+   unwound.  Each region holds back a small reserve at the top:
+   ``tcg_region_assign`` lowers ``code_gen_highwater`` by up to 2 MiB.
+   When ``tb_gen_code`` overflows while ``cpu->plugin_spec_mode`` is
+   set, it opens that reserve (``tcg_region_open_spec_reserve``) so the
+   in-flight walk keeps translating, and records the owed flush in
    ``cpu->plugin_flush_pending`` rather than flushing in place.
    ``cpu_exec_loop`` honors that flag with the real ``tb_flush`` at its
    next safe point, after the walk has unwound and the correct-path TB

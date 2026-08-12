@@ -336,11 +336,17 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
              * overwrite the host code we still have to return into -> SIGSEGV.
              *
              * Instead, on the first overflow of this walk, open the spec
-             * reserve held back by tcg_region_assign so the walk runs to its
-             * natural end (the wrong-path chain is then identical with or
-             * without the flush — flush-invariant, never truncated), and flag
-             * the flush so cpu_exec_loop() performs it at the next safe point,
-             * once the walk has unwound and the correct-path TB has finished.
+             * reserve held back by tcg_region_assign so the walk runs on, and
+             * flag the flush so cpu_exec_loop() performs it at the next safe
+             * point, once the walk has unwound and the correct-path TB has
+             * finished.
+             *
+             * The reserve is finite, so "runs on" is not "runs to its natural
+             * end": a walk whose footprint exceeds the reserve is cut below,
+             * at a depth set by how full the buffer happened to be.  The
+             * wrong-path chain is therefore flush-invariant only while
+             * plugin_spec_reserve_exhausted stays zero, which is why that
+             * counter is exported rather than described.
              */
             if (!cpu->plugin_flush_pending) {
                 cpu->plugin_flush_pending = true;

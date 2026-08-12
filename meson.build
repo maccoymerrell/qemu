@@ -4137,6 +4137,11 @@ if host_os == 'darwin'
   entitlement = find_program('scripts/entitlement.sh')
 endif
 
+# See the static-TLS guard attached to each emulator below.
+if host_os != 'windows' and host_os != 'darwin'
+  static_tls_readelf = find_program('readelf', 'llvm-readelf')
+endif
+
 traceable = []
 emulators = {}
 foreach target : target_dirs
@@ -4334,6 +4339,25 @@ foreach target : target_dirs
                                install_input)
     else
       emulators += {exe['name']: emulator}
+    endif
+
+    # Static-TLS budget tripwire.  glibc places a thread's static TLS block
+    # inside the stack allocation pthread_create is given, and linux-user's
+    # do_fork() asks for a 256 KiB guest-thread stack, so an emulator that
+    # accumulates large __thread storage stops being able to create guest
+    # threads at all; every thread the process creates also pays for it.
+    # The ceiling leaves the great majority of that stack for the stack.
+    # ELF/glibc concern, so skipped on Windows and Darwin; readelf is
+    # required (a check that cannot find its subject must fail, not skip) --
+    # llvm-readelf is an accepted stand-in.
+    if host_os != 'windows' and host_os != 'darwin'
+      custom_target(exe_name + '-tls-guard',
+                    input: emulator,
+                    output: exe_name + '_tls_guard.ok',
+                    command: [files('tests/check-emulator-static-tls.sh'),
+                              static_tls_readelf, '@INPUT@', '@OUTPUT@',
+                              '65536'],
+                    build_by_default: true)
     endif
 
     traceable += [{

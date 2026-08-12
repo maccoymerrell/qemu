@@ -2019,10 +2019,17 @@ Guest threads in user mode
    same way for every thread the guest will ever ask for — the guest
    sees a ``clone`` that cannot succeed.
 
-   This QEMU's static TLS is 0x63bc8 bytes, most of it the
-   per-translation dataflow scratch in ``accel/tcg/insn-dataflow.c``
-   (``df_out`` alone is 0x5e000), so the condition is not hypothetical
-   here: it is the normal state of the tree.
+   The condition is not hypothetical here: it was for a time the normal
+   state of this tree, whose static TLS reached 0x63bc8 bytes when the
+   per-translation dataflow scratch of ``accel/tcg/insn-dataflow.c``
+   lived there (``df_out`` alone was 0x5e000), and every multithreaded
+   guest program in ``*-linux-user`` failed on its first ``clone``.  That
+   storage has since moved off static TLS — see the
+   ``TCGContext::insn_df`` entry below, and the guard that keeps it off —
+   and the emulators' static TLS is now 0x2c0 bytes.  The fallback here
+   is not thereby redundant: it is what makes QEMU correct for whatever
+   the number becomes, in a place where the failure is otherwise total
+   and silent.
 
    The size is therefore a preference, not a requirement.  A refusal
    with ``EINVAL`` — the only error the two attributes QEMU sets can
@@ -2035,6 +2042,48 @@ Guest threads in user mode
    Sizing the request instead would mean knowing the static TLS
    requirement, which glibc exposes only as a ``GLIBC_PRIVATE`` symbol,
    so asking and being told no is the portable form of the question.
+
+``insn_df`` (``include/tcg/tcg.h``, ``accel/tcg/insn-dataflow.c``)
+
+   The dataflow extractor's per-translation scratch — the provenance
+   table, the env-offset table, the interned field slots and the
+   ``InsnDataflow`` result array, 376 KiB in total — hangs off the
+   ``TCGContext``, allocated on that context's first translation and
+   reused for every later one.  It sits beside ``plugin_tb`` in the same
+   struct and on the same terms: allocated lazily, cleared but not freed
+   per translation, never returned.
+
+   The translation context is the object whose lifetime and exclusion
+   this scratch actually needs.  In system mode there is one per
+   translating vCPU, so the arrays are per-vCPU exactly as the
+   extractor's non-reentrancy requires, and the total is bounded by
+   ``tcg_max_ctxs`` rather than by how many threads the process happens
+   to create.  In user mode every guest thread shares ``tcg_init_ctx``
+   and translates only while holding the translation lock
+   (``tb_gen_code()`` asserts it), so one scratch for all of them is
+   both correct and cheaper than one apiece.  Keying on the context also
+   agrees with the accessor guard in ``plugins/api.c``, which decides
+   whether a result is still readable by comparing a plugin's ``tb``
+   against ``tcg_ctx->plugin_tb``: guard and data are now fields of the
+   same object.
+
+   What it must not be is a thread-local.  Static TLS is allocated for
+   every thread the process creates — vCPU, iothread, RCU, each guest
+   thread — whether or not that thread ever translates anything, and
+   glibc places it inside the stack allocation ``pthread_create`` is
+   given, which is what broke guest-thread creation outright (see
+   ``do_fork`` above).  A file-scope ``__thread`` pointer caches the
+   binding so the per-op accessors cost a load; ``insn_dataflow_get()``
+   and its two siblings treat a null one as "nothing extracted", which
+   is the answer a caller arriving before any translation must get.
+
+   ``tests/check-emulator-static-tls.sh``, attached by ``meson.build`` to
+   every emulator as a build step, holds the invariant: a ``PT_TLS``
+   MemSiz over 64 KiB fails the build and prints the offending TLS
+   symbols.  The ceiling is a tripwire against growth tied to the failure
+   it prevents — it leaves the great majority of a 256 KiB guest-thread
+   stack for the stack — and raising it is a deliberate act that belongs
+   with a re-measured multithreaded guest run.
 
 Build wiring
 ------------

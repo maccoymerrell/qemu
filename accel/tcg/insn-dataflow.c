@@ -56,8 +56,24 @@
 #define INSN_DF_NOT_ENV     INT64_MIN
 
 /*
- * Per-translation scratch.  translator_loop() is not re-entrant on a thread,
- * so one set per thread is enough and none of it needs a lock.
+ * Per-translation scratch.
+ *
+ * It belongs to the TCGContext, which is the object whose lifetime and
+ * exclusion it needs: one context per translating vCPU in system mode, and
+ * in user mode the single tcg_init_ctx every guest thread shares while
+ * holding the translation lock.  translator_loop() is not re-entrant on a
+ * context, so one set per context is enough and none of it needs a lock of
+ * its own.  Keying on the context rather than the thread also makes this
+ * agree with the accessor guard in plugins/api.c, which decides whether a
+ * result is still readable by comparing against tcg_ctx->plugin_tb.
+ *
+ * It is emphatically NOT a thread-local.  At 376 KiB it is far too large for
+ * static TLS, which is charged to every thread the process creates -- vCPU,
+ * iothread, RCU, and every guest thread -- whether or not that thread ever
+ * translates anything, and which glibc places INSIDE the stack allocation
+ * pthread_create is handed, so a static TLS block approaching a guest
+ * thread's stack size makes clone(2) fail outright (see do_fork() in
+ * linux-user/syscall.c).
  *
  * The generation counter is what keeps this cheap.  Clearing a provenance
  * table of TCG_MAX_TEMPS entries at the top of every TB is kilobytes of memset
@@ -65,24 +81,67 @@
  * entry with the translation it belongs to and treating a stale stamp as empty
  * costs one comparison on first touch and nothing at all for a temp the TB
  * never uses.
+ *
+ * slot_off interns env byte ranges no TCG global names, for the duration of
+ * one translation block, so they can carry provenance bits alongside the
+ * globals.  A TB touches very few distinct ones; overflow stops interning,
+ * which is the safe direction -- see df_intern().
  */
-static __thread uint32_t df_gen = 1;
-static __thread uint32_t df_stamp[TCG_MAX_TEMPS];
-static __thread uint64_t df_prov[TCG_MAX_TEMPS][INSN_DF_REG_WORDS];
-static __thread int64_t df_envoff[TCG_MAX_TEMPS];
+struct InsnDataflowScratch {
+    uint32_t gen;
+    uint32_t stamp[TCG_MAX_TEMPS];
+    uint64_t prov[TCG_MAX_TEMPS][INSN_DF_REG_WORDS];
+    int64_t envoff[TCG_MAX_TEMPS];
 
-static __thread InsnDataflow df_out[INSN_DF_MAX_INSNS];
-static __thread unsigned df_ninsns;
+    InsnDataflow out[INSN_DF_MAX_INSNS];
+    unsigned ninsns;
+
+    uint32_t slot_off[INSN_DF_MAX_FIELD_SLOTS];
+    unsigned nslots;
+    bool slots_overflow;
+};
 
 /*
- * Env byte ranges no TCG global names, interned for the duration of one
- * translation block so they can carry provenance bits alongside the globals.
- * A TB touches very few distinct ones; overflow stops interning, which is the
- * safe direction -- see df_intern().
+ * The scratch for the translation in progress.
+ *
+ * Cached in a (pointer-sized) thread-local so the per-op accessors below cost
+ * a load rather than a dereference chain.  insn_dataflow_extract() refreshes
+ * it from tcg_ctx before anything reads it, allocating on the first
+ * translation this context performs; the read-side entry points at the bottom
+ * of the file are the ones a plugin can reach, and they treat a NULL scratch
+ * as "nothing extracted", which is what a caller that arrives before any
+ * translation must be told.
  */
-static __thread uint32_t df_slot_off[INSN_DF_MAX_FIELD_SLOTS];
-static __thread unsigned df_nslots;
-static __thread bool df_slots_overflow;
+static __thread struct InsnDataflowScratch *df;
+
+#define df_gen              (df->gen)
+#define df_stamp            (df->stamp)
+#define df_prov             (df->prov)
+#define df_envoff           (df->envoff)
+#define df_out              (df->out)
+#define df_ninsns           (df->ninsns)
+#define df_slot_off         (df->slot_off)
+#define df_nslots           (df->nslots)
+#define df_slots_overflow   (df->slots_overflow)
+
+/*
+ * Bind @df to the current translation context, allocating on first use.
+ *
+ * The generation starts at 1 and the stamps start at 0, so every entry reads
+ * as stale until the translation that touches it says otherwise -- the same
+ * initial state the static allocation this replaced was given.
+ */
+static void df_bind(void)
+{
+    struct InsnDataflowScratch *s = tcg_ctx->insn_df;
+
+    if (unlikely(s == NULL)) {
+        s = g_malloc0(sizeof(*s));
+        s->gen = 1;
+        tcg_ctx->insn_df = s;
+    }
+    df = s;
+}
 
 /*
  * Give @off a provenance bit, above the globals.
@@ -712,9 +771,12 @@ void insn_dataflow_extract(unsigned num_insns)
     int64_t t0;
 
     if (df_disabled()) {
-        df_ninsns = 0;
+        if (df) {
+            df_ninsns = 0;
+        }
         return;
     }
+    df_bind();
     prof = df_profiling();
     t0 = prof ? df_now() : 0;
 
@@ -771,9 +833,16 @@ void insn_dataflow_extract(unsigned num_insns)
     }
 }
 
+/*
+ * The three read-side entry points below are the ones a plugin can reach.  A
+ * NULL scratch means this context has never run an extraction -- extraction
+ * disabled, or a caller arriving before the first translation -- and each
+ * answers as it would for an extraction that recorded nothing, which is the
+ * pessimistic direction the rest of this file also takes.
+ */
 const InsnDataflow *insn_dataflow_get(unsigned i)
 {
-    return i < df_ninsns ? &df_out[i] : NULL;
+    return df && i < df_ninsns ? &df_out[i] : NULL;
 }
 
 /* Map a provenance bit at or above nregs back to the env offset it interned. */
@@ -781,7 +850,7 @@ uint32_t insn_dataflow_prov_field(unsigned bit, bool *valid)
 {
     unsigned base = tcg_ctx->nb_globals;
 
-    if (bit < base || bit - base >= df_nslots) {
+    if (!df || bit < base || bit - base >= df_nslots) {
         *valid = false;
         return 0;
     }
@@ -799,7 +868,7 @@ uint32_t insn_dataflow_prov_field(unsigned bit, bool *valid)
  */
 bool insn_dataflow_prov_truncated(void)
 {
-    return df_slots_overflow;
+    return df && df_slots_overflow;
 }
 
 unsigned insn_dataflow_nregs(void)

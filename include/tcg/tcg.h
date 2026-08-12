@@ -437,6 +437,20 @@ struct TCGContext {
     struct qemu_plugin_insn *plugin_insn;
 #endif
 
+    /*
+     * Per-translation dataflow scratch (accel/tcg/insn-dataflow.c), on the
+     * same terms as plugin_tb above: allocated on first use, reused for
+     * every later translation, never freed.  It belongs to the translation
+     * context rather than to the thread because that is the object whose
+     * lifetime and exclusion it actually needs -- one per translating vCPU
+     * in system mode, and in user mode the single context every guest
+     * thread shares under the translation lock.  Its size (hundreds of KiB)
+     * is why it must not be a thread-local: static TLS is charged to every
+     * thread the process creates, and glibc places it inside the stack
+     * allocation pthread_create is given.
+     */
+    struct InsnDataflowScratch *insn_df;
+
     /* For host-specific values. */
 #ifdef __riscv
     MemOp riscv_cur_vsew;

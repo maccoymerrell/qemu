@@ -138,26 +138,6 @@ public:
         return entry_pc_ != 0 && !fragments_.empty();
     }
 
-    /* Full snapshot of the in-flight chain state, for the suspend-or-seal
-     * arrow (Stage 3): when a foreign-ASID span suspends the deferred prev
-     * mid-true-BB (a page-split BB spanning TBs), the pre-prev fragments
-     * live here and must survive the span so a resume continues that BB
-     * rather than restarting it.  detach_state() moves the whole state out
-     * (leaving *this reset/empty); attach_state() moves it back.  Between
-     * most steps the chain is empty (the seal finalizes+resets), so this is
-     * usually a no-op snapshot — it is byte-inert on every path that does
-     * not suspend. */
-    struct ChainState {
-        uint64_t entry_pc = 0;
-        uint64_t last_ft  = 0;
-        uint32_t my_gen   = 0;
-        bool     awaiting_delay_slot = false;
-        bool     bb_complete = false;
-        bool     finalized = false;
-        std::vector<BBTemplate *> fragments;
-    };
-    ChainState detach_state();
-    void attach_state(ChainState &&s);
 
 private:
     uint64_t entry_pc_ = 0;

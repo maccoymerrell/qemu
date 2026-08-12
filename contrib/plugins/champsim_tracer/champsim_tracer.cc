@@ -2682,7 +2682,6 @@ size_t   g_dbg_susp = 0;
 
 /* Anchors (faulting-insn indices) for the whole-BB merge emit currently in
  * flight; read by emit_body_entry into the entry's fault trailer. */
-thread_local std::vector<uint32_t> g_emit_fault_anchors CST_TLS_HOT;
 
 /* See champsim_tracer.h: threads holding cross-flush BBTemplate*
  * references (in-flight wrong-path simulation).  Gates drain_pending_flush
@@ -4406,7 +4405,10 @@ void emit_body_entry(BodyStreamState *out_stream,
                      std::vector<WPBBEntry> wp_entries,
                      bool wp_first_tb_unavail,
                      uint64_t branch_successor_pc,
-                     bool branch_successor_known)
+                     bool branch_successor_known,
+                     uint32_t bb_start,
+                     uint32_t bb_stop,
+                     bool thread_end)
 {
     /* warmup→simulation boundary capture (header §2.13,
      * warmup_end_trace_insn_idx): the trace-instruction index of the
@@ -4524,19 +4526,27 @@ void emit_body_entry(BodyStreamState *out_stream,
     entry.wp_entries = std::move(wp_entries);
     entry.wp_first_tb_unavail = wp_first_tb_unavail;
     entry.tmpl = bb_tmpl;
-    /* Executed range: the emission model feeds whole blocks, so every
-     * entry declares [0, n_insns) until partial extents are threaded
-     * through from the path builder.  Stamped alongside tmpl — the range
-     * is not optional wire state and no site may leave it unset. */
-    entry.bb_start = 0;
-    entry.bb_stop = bb_tmpl ? bb_tmpl->n_insns : 0;
+    /* Executed range: caller-declared [bb_start, bb_stop), clamped to the
+     * template (§4.2a).  Every call site states its range explicitly; the
+     * range is not optional wire state and no site may leave it unset. */
+    {
+        uint32_t n = bb_tmpl ? bb_tmpl->n_insns : 0;
+        if (bb_stop > n) {
+            bb_stop = n;
+        }
+        if (bb_start > bb_stop) {
+            bb_start = bb_stop;
+        }
+        entry.bb_start = bb_start;
+        entry.bb_stop = bb_stop;
+    }
+    entry.thread_end = thread_end;
     entry.fault_depth = g_emit_fault_depth;
     /* Record this thread's last-emitted depth for the unwind-flush anchor
      * guard.  A REP fan-out below emits its sub-entries at this same depth
      * (they inherit entry.fault_depth), so the parent stamp is the last
      * emitted level regardless. */
     last_emit_fault_depth(cpu_index) = g_emit_fault_depth;
-    entry.fault_anchors = g_emit_fault_anchors;
     /* Guest-thread identity on the wire.  cpu_index is a lookup key for the
      * per-vCPU identity (and for live register reads — regfile capture, WP
      * lane gates); the index itself never reaches the stream. */
@@ -4626,10 +4636,11 @@ void emit_body_entry(BodyStreamState *out_stream,
      * ONLINE, at the emit, with the depth pipeline's live state attached. */
     cst_jump_diag_emit(entry.seq_num, entry.thread_id,
                        bb_tmpl ? bb_tmpl->start_pc : 0, entry.fault_depth,
-                       bb_tmpl && bb_tmpl->is_system ? 1 : 0,
-                       entry.fault_anchors.size());
+                       bb_tmpl && bb_tmpl->is_system ? 1 : 0, 0);
 
-    g_mem_recorder.drain_cp_into_dyn_params(cpu_index, entry.dyn_params, bb_tmpl);
+    g_mem_recorder.drain_cp_into_dyn_params(cpu_index, entry.dyn_params,
+                                            bb_tmpl, entry.bb_start,
+                                            entry.bb_stop);
     /* Backstop for the positional reg-snap invariant.  The wire attributes
      * reg_snaps POSITIONALLY: build_entry_view prefix-sums each insn's
      * n_dst_regs, and the DST_REG / METAFLAGS stages index reg_snaps at that
@@ -4665,22 +4676,16 @@ void emit_body_entry(BodyStreamState *out_stream,
         for (uint32_t i = entry.bb_start; i < entry.bb_stop; i++) {
             expected_snaps += bb_tmpl->insn_fields[i].n_dst_regs;
         }
-        /* A merged fault entry carries its verified frame prefix at the FRONT
-         * of pending (complete_merge already trimmed its suffix's leak before
-         * prepending), so a residual surplus there must NOT front-trim the
-         * frame — drop it.  A plain seal (no fault anchors) has any leaked
-         * prefix genuinely at the front. */
-        bool is_merge_emit = !g_emit_fault_anchors.empty();
-        if (pending_reg_snaps(cpu_index).size() > expected_snaps && !is_merge_emit) {
+        if (pending_reg_snaps(cpu_index).size() > expected_snaps) {
             size_t excess = pending_reg_snaps(cpu_index).size() - (size_t)expected_snaps;
             if (getenv("CST_SNAP_DIAG")) {
                 fprintf(stderr, "champsim_tracer: [snapdiag] reg-snap SURPLUS "
                         "BB start=0x%" PRIx64 " n_insns=%u pending=%zu "
-                        "expected=%" PRIu64 " fdepth=%u fanchors=%zu is_sys=%d "
+                        "expected=%" PRIu64 " fdepth=%u is_sys=%d "
                         "— trimming %zu leaked prefix\n",
                         bb_tmpl->start_pc, bb_tmpl->n_insns,
                         pending_reg_snaps(cpu_index).size(), expected_snaps,
-                        g_emit_fault_depth, g_emit_fault_anchors.size(),
+                        g_emit_fault_depth,
                         (int)bb_tmpl->is_system, excess);
             }
             pending_reg_snaps(cpu_index).erase(pending_reg_snaps(cpu_index).begin(),
@@ -4718,13 +4723,12 @@ void emit_body_entry(BodyStreamState *out_stream,
                 fprintf(stderr, "champsim_tracer: [snapdiag] reg-snap "
                         "%s BB start=0x%" PRIx64 " n_insns=%u pending=%zu"
                         " expected=%" PRIu64 " end_marker=%d fdepth=%u "
-                        "fanchors=%zu is_sys=%d — dropping reg_snaps\n",
+                        "is_sys=%d — dropping reg_snaps\n",
                         pending_reg_snaps(cpu_index).size() < expected_snaps
-                            ? "SHORTFALL" : "MERGE-SURPLUS",
+                            ? "SHORTFALL" : "SURPLUS",
                         bb_tmpl->start_pc, bb_tmpl->n_insns,
                         pending_reg_snaps(cpu_index).size(), expected_snaps,
                         (int)g_seg_end_marker_close, g_emit_fault_depth,
-                        g_emit_fault_anchors.size(),
                         (int)bb_tmpl->is_system);
                 /*
                  * Name what is being thrown away.  The sink is POSITIONAL,
@@ -4806,7 +4810,13 @@ void emit_body_entry(BodyStreamState *out_stream,
     BBTemplate *rep_sub = bb_tmpl
         ? g_template_store.seg_deref(bb_tmpl->rep_subtmpl)
         : nullptr;
-    if (rep_sub && bb_tmpl->n_insns > 0) {
+    /* The fan-out renders the template's LAST insn; a declared range that
+     * excludes it (a split-emission prefix cut before the self-loop) has
+     * nothing to fan.  A range that INCLUDES it (whole block, a fault
+     * continuation, a rep-split piece [K, K+1)) fans normally. */
+    if (rep_sub && bb_tmpl->n_insns > 0 &&
+        entry.bb_stop == bb_tmpl->n_insns &&
+        entry.bb_start < entry.bb_stop) {
         uint32_t last = bb_tmpl->n_insns - 1;
         const InsnFields *lf = &bb_tmpl->insn_fields[last];
         unsigned mpi = (unsigned)lf->rep_memops_per_iter;
@@ -5194,14 +5204,18 @@ void emit_body_entry(BodyStreamState *out_stream,
                  * counted as 1 arch insn for the warmup boundary
                  * tracker. */
                 g_seg_arch_insns +=
-                    (bb_tmpl ? bb_tmpl->n_insns : 0)
+                    (uint64_t)(entry.bb_stop - entry.bb_start)
                     + (uint64_t)(n_iter - 1);
                 /* Wire-side twin of OWNED_CP: the same sum a reader
                  * reconstructs with cst_decode --templates-only, computed
                  * here so the clock-vs-wire residual needs no decoder. */
                 if (bb_tmpl && !bb_tmpl->is_system) {
                     g_stats.wire_user_arch_insns +=
-                        (uint64_t)bb_tmpl->n_insns + (uint64_t)(n_iter - 1);
+                        (uint64_t)(entry.bb_stop - entry.bb_start) +
+                        (uint64_t)(n_iter - 1);
+                    g_seg_arch_user_insns +=
+                        (uint64_t)(entry.bb_stop - entry.bb_start) +
+                        (uint64_t)(n_iter - 1);
                     g_seg_arch_user_insns +=
                         (uint64_t)bb_tmpl->n_insns + (uint64_t)(n_iter - 1);
                     /* THE ONE LEGITIMATE WAY THE WIRE OUTRUNS THE RETIRED
@@ -5242,9 +5256,7 @@ void emit_body_entry(BodyStreamState *out_stream,
                  * oracle flags whenever D>1 (the residual 2->0/0->2 kernel
                  * "spin loop" — actually a rep stosq — under churn, where a
                  * leaked handler frame has inflated the excursion to depth 2).
-                 * fault_anchors stay iter-1 only (they mark the faulting insn
-                 * indices of the merged faulting BB, not a per-iteration
-                 * property). */
+                 */
                 sub_e.fault_depth = entry.fault_depth;
                 sub_e.branch_successor_known = rep_exit_known;
                 sub_e.dyn_params.reserve(mpi);
@@ -5297,10 +5309,15 @@ void emit_body_entry(BodyStreamState *out_stream,
     if (out_stream) {
         body_stream_write_entry(out_stream, &entry);
     }
-    g_seg_arch_insns += bb_tmpl ? bb_tmpl->n_insns : 0;
+    /* BILLING AT EMIT: covered advances by the EMITTED RANGE's width, never
+     * the template's — an entry that declares [start, stop) claims exactly
+     * that many architectural instructions (§4.2a). */
+    g_seg_arch_insns += (uint64_t)(entry.bb_stop - entry.bb_start);
     if (bb_tmpl && !bb_tmpl->is_system) {
-        g_stats.wire_user_arch_insns += bb_tmpl->n_insns;
-        g_seg_arch_user_insns += bb_tmpl->n_insns;
+        g_stats.wire_user_arch_insns +=
+            (uint64_t)(entry.bb_stop - entry.bb_start);
+        g_seg_arch_user_insns +=
+            (uint64_t)(entry.bb_stop - entry.bb_start);
     }
 }
 
@@ -6483,7 +6500,8 @@ void emit_finalized_bb(BodyStreamState *out_stream,
                        uint64_t prev_last,
                        uint64_t current_pc,
                        uint64_t wrong_target,
-                       unsigned int cpu_index)
+                       unsigned int cpu_index,
+                       uint32_t bb_start)
 {
     cp_chain(cpu_index).reset();
 
@@ -6559,7 +6577,9 @@ void emit_finalized_bb(BodyStreamState *out_stream,
      * CST_FID_BRANCH_* singletons record the true direction/target.  Marked
      * known: every emit_finalized_bb caller resolved a successor. */
     emit_body_entry(out_stream, bb_tmpl, cpu_index, std::move(wp_entries),
-                    wp_first_tb_unavail, current_pc, /*known=*/true);
+                    wp_first_tb_unavail, current_pc, /*known=*/true,
+                    bb_start, bb_tmpl ? bb_tmpl->n_insns : 0,
+                    /*thread_end=*/false);
 }
 
 /*
@@ -6639,6 +6659,58 @@ static void snap_prev_tail_dsts(unsigned int cpu_index,
             capture_tail(last - 1);   /* branch (deferred) */
         }
         capture_tail(last);           /* delay slot, or branch on non-delay ISAs */
+    }
+}
+
+/*
+ * Rewrite the REG_IP destination values among the tail dst snaps the glue
+ * prologue captured for @tmpl (see snap_prev_tail_dsts): the prologue
+ * stamps the DISPATCHED next PC, and a seal that resolves a different
+ * architectural successor (fault case (c) resume PC, async departure PC)
+ * corrects it here, before the emit publishes the value.  The captured
+ * tail snaps are the sink's LAST entries; their per-insn layout is
+ * deterministic from the template, so the positions are recomputed rather
+ * than stored.  Mirrors snap_prev_tail_dsts' selection exactly.
+ */
+static void patch_tail_ip_snaps(unsigned int cpu_index,
+                                const BBTemplate *tmpl,
+                                uint64_t current_pc,
+                                uint32_t ran,
+                                bool aborted_tail)
+{
+    if (aborted_tail || ran == 0) {
+        return;
+    }
+    if (!g_features.reg_data || !tmpl->insn_reg_names || tmpl->n_insns == 0) {
+        return;
+    }
+    uint32_t last = ran - 1;
+    bool delay_slot_tail = ran == tmpl->n_insns && ran >= 2 &&
+        tmpl->insn_fields[last - 1].branch_type != BRANCH_NONE &&
+        tmpl->insn_fields[last].branch_type == BRANCH_NONE;
+    uint32_t idxs[2];
+    unsigned n_idx = 0;
+    if (delay_slot_tail) {
+        idxs[n_idx++] = last - 1;
+    }
+    idxs[n_idx++] = last;
+    unsigned total = 0;
+    for (unsigned k = 0; k < n_idx; k++) {
+        total += tmpl->insn_fields[idxs[k]].n_dst_regs;
+    }
+    std::vector<RegSnap> &sink = pending_reg_snaps(cpu_index);
+    if (total == 0 || sink.size() < total) {
+        return;                 /* prologue capture did not run / was reset */
+    }
+    size_t base = sink.size() - total;
+    size_t pos = 0;
+    for (unsigned k = 0; k < n_idx; k++) {
+        const InsnFields *fl = &tmpl->insn_fields[idxs[k]];
+        for (uint8_t i = 0; i < fl->n_dst_regs; i++, pos++) {
+            if (fl->dst_regs[i] == REG_IP) {
+                sink[base + pos].value = cst_wide_from_u64(current_pc);
+            }
+        }
     }
 }
 
@@ -7163,9 +7235,9 @@ bool collect_finalized_bbs(unsigned int cpu_index,
      *   re-run's own block carry it.
      */
     uint64_t started = 0;
-    const bool falsify = trunc_falsifier_seal();
+    const bool falsify = false;     /* falsifier arms retired with the model */
     bool have_extent =
-        !falsify && retired_executed_prev(cpu_index, prev_tb_head, &started);
+        retired_executed_prev(cpu_index, prev_tb_head, &started);
     /*
      * A DEFERRED SEAL'S EXTENT IS NOT ACTUALLY UNKNOWN.
      *
@@ -7181,7 +7253,7 @@ bool collect_finalized_bbs(unsigned int cpu_index,
      * prev -- the very step whose seal was deferred -- and set_prev carries
      * it across the swap.  Ask for it before declaring the extent unknown.
      */
-    if (!falsify && !seal_stash_falsifier() && !have_extent &&
+    if (!have_extent &&
         path_builder(cpu_index).seal_prev_extent(prev_tb_head, &started)) {
         have_extent = true;
         g_stats.seal_walk_extent_from_stash++;
@@ -7201,7 +7273,7 @@ bool collect_finalized_bbs(unsigned int cpu_index,
                 miss, (miss & 1u) ? "no-measurement " : "",
                 (miss & 2u) ? "other-block" : "",
                 pbd.seal_prev_block() ? pbd.seal_prev_block()->start_pc : 0,
-                (int)pbd.live_prev_extent_valid(), pbd.susp_depth());
+                (int)pbd.live_prev_extent_valid(), (size_t)0);
     }
     if (falsify) {
         /* The extent question was never asked, so this is not an unknown
@@ -7319,7 +7391,13 @@ bool collect_finalized_bbs(unsigned int cpu_index,
         bool frag_branch_taken = (frag_current_pc != frag_prev_ft);
 
         if (is_last_executed) {
-            snap_prev_tail_dsts(cpu_index, frag, frag_current_pc, ran,
+            /* The tail insn's dst snaps were captured by this dispatch's
+             * glue prologue (the note_prev_extent site), which stamped the
+             * DISPATCHED next PC into the branch's REG_IP dst.  A seal
+             * override (a case-(c) fault's resume PC, an async departure)
+             * resolves a different architectural successor — patch those
+             * positions with the resolved value. */
+            patch_tail_ip_snaps(cpu_index, frag, frag_current_pc, ran,
                                 truncated && aborted_tail);
         }
         /*
@@ -8035,25 +8113,6 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
         g_retired_owner_owned[retired_slot(cpu_index)];
 
     /*
-     * Record the pending prev's extent while it is still measurable.
-     *
-     * This dispatch's lagged delta belongs to the dispatch before it.  When
-     * that earlier dispatch is the TB still sitting in the pending-seal
-     * slot, the delta IS how much of it ran, and this is the last moment
-     * anyone can say so on this vCPU: if the pinned process is migrating
-     * away, every later dispatch here belongs to somebody else and rolls
-     * the cursor past prev for good.  Placed before every gate that can
-     * bail the step, because a bailed step is exactly the case this exists
-     * for.  Recorded once per prev (see PathBuilder::note_prev_extent).
-     */
-    if (BBTemplate *pending = pb.prev()) {
-        if (pending == g_retired_prev_head[retired_slot(cpu_index)]) {
-            uint32_t cap = tb_head_insns(pending);
-            pb.note_prev_extent(delta_retired > cap ? cap : delta_retired);
-        }
-    }
-
-    /*
      * AN ABORTED ATTEMPT IS NOT A RETIREMENT.
      *
      * insn_started is a per-instruction add emitted at the TOP of the
@@ -8072,6 +8131,7 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
      * suppresses, so the add fires once, current_pc never names the rewound
      * instruction, and the predicate below correctly stays silent.
      */
+    bool prev_tail_aborted = false;
     {
         const BBTemplate *prev_head =
             g_retired_prev_head[retired_slot(cpu_index)];
@@ -8080,10 +8140,56 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
             tb_head_insn_pc_at(prev_head, (uint32_t)(delta_retired - 1)) ==
                 cur_tb_tmpl->start_pc) {
             delta_retired--;
+            prev_tail_aborted = true;
             g_stats.user_clock_abort_recredits++;
             g_stats.user_clock_abort_recredit_insns++;
         }
     }
+    /*
+     * Record the pending prev's extent while it is still measurable — and
+     * CAPTURE ITS TAIL INSN'S DST SNAPS (T5).
+     *
+     * This dispatch's lagged delta belongs to the dispatch before it.  When
+     * that earlier dispatch is the TB still sitting in the pending-seal
+     * slot, the delta IS how much of it ran, and this is the last moment
+     * anyone can say so on this vCPU: if the pinned process is migrating
+     * away, every later dispatch here belongs to somebody else and rolls
+     * the cursor past prev for good.  Placed before every gate that can
+     * bail the step (a bailed step is exactly the case this exists for) and
+     * AFTER the abort re-credit above, so the recorded extent counts only
+     * retirements.  Recorded once per prev (note_prev_extent's guard).
+     *
+     * The tail capture rides the same site, OWNED OR NOT: the registers
+     * still hold prev's last retired instruction's post-exec values (this
+     * TB's body has not run), and this may be the only dispatch that can
+     * still observe them — which is precisely what makes a measured extent
+     * FULLY OBSERVED (§4.2a).  The branch's REG_IP dst is stamped with the
+     * dispatched next PC; a seal that resolves a different successor
+     * patches it (patch_tail_ip_snaps).
+     */
+    if (BBTemplate *pending = pb.prev()) {
+        if (pending == g_retired_prev_head[retired_slot(cpu_index)] &&
+            !pb.live_prev_extent_valid()) {
+            uint32_t cap = tb_head_insns(pending);
+            uint64_t ext = delta_retired > cap ? cap : delta_retired;
+            pb.note_prev_extent(ext);
+            /* Locate the last-executed fragment and its executed count. */
+            uint64_t left = ext;
+            const bool tail_aborted = prev_tail_aborted;
+            for (BBTemplate *pf = pending; pf && left > 0;
+                 pf = pf->next_tb_fragment) {
+                if (left <= pf->n_insns) {
+                    snap_prev_tail_dsts(cpu_index, pf,
+                                        cur_tb_tmpl ? cur_tb_tmpl->start_pc
+                                                    : 0,
+                                        (uint32_t)left, tail_aborted);
+                    break;
+                }
+                left -= pf->n_insns;
+            }
+        }
+    }
+
     /* Whether the delta folded at THIS dispatch was billed to the window
      * clock.  The fault observation, which runs later in this same step,
      * needs it: g_retired_owner_owned is re-armed for the CURRENT dispatch
@@ -8459,8 +8565,6 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
              * here means the user clock advances but nothing traces. */
             if (st == PathBuilder::StepStatus::SUSPENDED) {
                 tls_mkdiag_susp_user++;
-            } else if (st == PathBuilder::StepStatus::SUSPENDED_FOREIGN) {
-                tls_mkdiag_foreign_user++;
             }
         }
         g_rec_mutex_unlock(&exec_lock);

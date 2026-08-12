@@ -322,7 +322,9 @@ void MemAccessRecorder::prepend_cp(unsigned int cpu_index,
 void MemAccessRecorder::drain_cp_into_dyn_params(
     unsigned int cpu_index,
     std::vector<DynParam> &dyn_params,
-    const BBTemplate *bb_tmpl)
+    const BBTemplate *bb_tmpl,
+    uint32_t range_lo,
+    uint32_t range_hi)
 {
     /* memops are in execution order and insn_pc is monotonically
      * non-decreasing across an entry's memops, so walk the template's
@@ -444,16 +446,25 @@ void MemAccessRecorder::drain_cp_into_dyn_params(
 
     idx = 0;
     bool claimed_live = false;
-    for (const WPMemAccess &acc : live) {
+    size_t n_left = 0;
+    for (size_t r = 0; r < live.size(); r++) {
+        const WPMemAccess acc = live[r];
         int slot = slot_for(acc, idx);
         if (slot < 0) {
             carry.push_back(acc);
             continue;
         }
+        /* Range-aware drain (§4.2a): a memop attributed OUTSIDE the
+         * entry's declared range belongs to the continuation entry of the
+         * same template — leave it in the live buffer, in order. */
+        if ((uint32_t)slot < range_lo || (uint32_t)slot >= range_hi) {
+            live[n_left++] = acc;
+            continue;
+        }
         claimed_live = true;
         push_dp(acc, slot);
     }
-    live.clear();
+    live.resize(n_left);
 
     /* This entry took memops, but none of the ones already waiting:
      * the stream has passed them (see cp_carry).  Drop exactly

@@ -33,16 +33,8 @@
 #include "champsim_tracer_wp_thread_state.h"
 
 /* A/B env toggles for the fault machinery: CST_NO_FAULT kills the
- * feature upstream (g_features.fault_depth_trailer and wp_synthetic_marking),
- * CST_NO_FAULT_MERGE keeps depth stamping but disables classification/
- * stash/completion, and CST_NO_FAULT_WP zeroes only the merged emit's
- * wrong-path target. */
-static bool pb_no_merge()
-{
-    static const bool v = getenv("CST_NO_FAULT_MERGE") != nullptr;
-    return v;
-}
-
+ * feature upstream (g_features.fault_depth_trailer and wp_synthetic_marking);
+ * CST_NO_FAULT_WP zeroes only a continuation emit's wrong-path target. */
 static bool pb_no_fault_wp()
 {
     static const bool v = getenv("CST_NO_FAULT_WP") != nullptr;
@@ -52,14 +44,6 @@ static bool pb_no_fault_wp()
 static bool pb_diag()
 {
     static const bool v = getenv("CST_FAULT_DIAG") != nullptr;
-    return v;
-}
-
-/* Suspend-stack push/pop/displacement diagnostics (env-gated), for the
- * contention-run evidence the acceptance gate asks for. */
-static bool pb_susp_diag()
-{
-    static const bool v = getenv("CST_SUSP_DIAG") != nullptr;
     return v;
 }
 
@@ -110,124 +94,8 @@ static bool retain_check()
     return v;
 }
 
-/* ----------------------------------------------------------------------
- * CST_NO_TRUNC — the truncation falsifier.
- *
- * Six instruments read zero on a healthy capture: the two walks' truncation
- * counts, the reg-snap slice drops they used to cause, and the wire's
- * duplicate instructions.  A zero is worth nothing unless the instrument can
- * be shown able to FIRE on the target it is quoted for, and "the fix is in
- * ISA-independent code" is an argument, not a measurement.
- *
- * This switch restores the pre-fix behaviour of the walk it names: the extent
- * question is not asked, so the last fragment is appended at its full
- * TRANSLATED length exactly as it was before 32863f0430 (close walk) and
- * a07df2d053 (seal walk).  Run the same cell twice, once with it, and the
- * zero becomes a measurement on THIS target.
- *
- *   CST_NO_TRUNC=close   segment-close walk only
- *   CST_NO_TRUNC=seal    per-execution seal walk only
- *   CST_NO_TRUNC=both    both (also: 1, or any value naming neither)
- *
- * NEVER set this on a capture run.  It deliberately puts instructions on the
- * wire that the guest did not execute, and duplicates them in the block that
- * follows.  It announces itself on stderr for exactly that reason: a trace
- * produced under it has to be identifiable as one afterwards.
- *
- * It does NOT suppress the *_extent_unknown counters' subject, because it
- * never asks the extent question at all — those stay at their healthy value
- * so the falsified arm is still comparable everywhere else.
- * ----------------------------------------------------------------------
- */
-static unsigned truncation_falsifier_mask()
-{
-    static const unsigned m = []() -> unsigned {
-        const char *e = getenv("CST_NO_TRUNC");
-        if (e == nullptr) {
-            return 0u;
-        }
-        unsigned v = 0;
-        if (strstr(e, "close") != nullptr) {
-            v |= 1u;
-        }
-        if (strstr(e, "seal") != nullptr) {
-            v |= 2u;
-        }
-        if (v == 0u) {
-            v = 3u;                    /* "", "1", "both", anything else */
-        }
-        fprintf(stderr,
-                "champsim_tracer: CST_NO_TRUNC=%s — %s%s%s walk truncation "
-                "DISABLED.  This trace claims instructions the guest did not "
-                "execute; it is a falsifier arm, not a capture.\n",
-                e, (v & 1u) ? "close" : "", (v == 3u) ? "+" : "",
-                (v & 2u) ? "seal" : "");
-        return v;
-    }();
-    return m;
-}
 
-bool trunc_falsifier_close(void)
-{
-    return (truncation_falsifier_mask() & 1u) != 0u;
-}
 
-bool trunc_falsifier_seal(void)
-{
-    return (truncation_falsifier_mask() & 2u) != 0u;
-}
-
-/*
- * CST_NO_SEAL_STASH: the falsifier arm for the deferred-seal extent stash.
- *
- * With it set the seal walk may not consult the measurement taken at the
- * first dispatch after prev, which is the whole of 81144d7401's fix — so a
- * run pair with and without it MEASURES what the stash recovers instead of
- * asserting it, and gives the "seal walks with an unknown extent" invariant
- * an arm in which it demonstrably fires.  A falsifier arm, not a capture:
- * the extent then really is unasked, and the fold claims instructions the
- * dispatch may never have run.
- */
-bool seal_stash_falsifier(void)
-{
-    static const bool v = []() {
-        if (getenv("CST_NO_SEAL_STASH") == nullptr) {
-            return false;
-        }
-        fprintf(stderr, "champsim_tracer: CST_NO_SEAL_STASH — the deferred "
-                "seal's extent measurement is NOT consulted.  This trace may "
-                "claim instructions the guest did not execute; it is a "
-                "falsifier arm, not a capture.\n");
-        return true;
-    }();
-    return v;
-}
-
-/*
- * CST_NO_CLOSE_STREAM: the falsifier arm for the DISCARD half of the
- * whole-class gate.  Every other arm here turns a drain OFF and leaves its
- * holder occupied, which the post-flush occupancy census sees; this one
- * makes the two close drains take their own no-stream exit, where they
- * EMPTY the holder and emit nothing.  That is the failure shape
- * close_holder_undrained cannot see by construction, and the arm exists so
- * close_holder_discarded can be shown to fire rather than asserted to work.
- * A falsifier arm, not a capture.
- */
-static bool close_nostream_falsifier(void)
-{
-    static const bool v = []() {
-        if (getenv("CST_NO_CLOSE_STREAM") == nullptr) {
-            return false;
-        }
-        fprintf(stderr, "champsim_tracer: CST_NO_CLOSE_STREAM — the close's "
-                "fault-frame and suspension drains are handed no body "
-                "stream, so they DISCARD their occupants instead of "
-                "emitting them.  This trace is missing instructions the "
-                "guest executed; it is a falsifier arm, not a capture.\n");
-        return true;
-    }();
-    return v;
-}
 
 /* CST_SEALEXT: per-seal report of every extent question the walk could not
  * answer from the retired cursor.  Diagnostic only, inert unless set. */
@@ -237,29 +105,6 @@ bool seal_extent_diag(void)
     return v;
 }
 
-/*
- * CST_NO_CLOSE_FRAMES: the falsifier arm for the close-time fault-frame
- * flush (PathBuilder::flush_frames_at_close).  With it set a segment close
- * leaves every open fault frame exactly where it used to leave it — for the
- * next on_segment_open to orphan-drop — so a run pair with and without it
- * MEASURES the instructions the flush recovers instead of asserting them.
- * A falsifier arm, not a capture: the trace it produces is missing
- * instructions the guest executed.
- */
-bool close_frames_falsifier(void)
-{
-    static const bool v = []() {
-        if (getenv("CST_NO_CLOSE_FRAMES") == nullptr) {
-            return false;
-        }
-        fprintf(stderr, "champsim_tracer: CST_NO_CLOSE_FRAMES — fault frames "
-                "open at a segment close are DROPPED with their executed "
-                "prefixes.  This trace is missing instructions the guest "
-                "executed; it is a falsifier arm, not a capture.\n");
-        return true;
-    }();
-    return v;
-}
 
 /* CST_SLOW_FOLD rescans the retention for async edges, so it measures the
  * intended thing only when the retention still contains them.  Refuse the
@@ -742,7 +587,6 @@ static const char *pdsrc_name(uint8_t s)
 {
     switch (s) {
     case CST_PDSRC_SEAL:   return "seal";
-    case CST_PDSRC_RESUME: return "resume";
     default:               return "none";
     }
 }
@@ -1196,35 +1040,21 @@ uint64_t g_promote_seq = 0;
 void PathBuilder::on_segment_open()
 {
     /* Orphan drop: every frame's full_tmpl points into the bb_map_ the
-     * opener just cleared, so an excursion straddling the boundary loses
-     * its accumulated prefix by design (acceptable; the segment is a
-     * fresh trace).  The accumulators the frames absorbed are gone with
-     * them. */
+     * opener just cleared.  A frame is only a ledger entry now — its
+     * executed prefix already reached the wire at the fault — so the drop
+     * loses no instructions, only the identity of a pending continuation
+     * (the segment is a fresh trace). */
     if (pb_diag() && !frames_.empty()) {
         for (const CtxFrame &f : frames_) {
             fprintf(stderr, "[pathbuilder] ORPHAN frame full=0x%" PRIx64
-                    " resume=0x%" PRIx64 " depth=%u nmem=%zu\n",
+                    " resume=0x%" PRIx64 " depth=%u\n",
                     f.full_tmpl ? f.full_tmpl->start_pc : 0,
-                    f.resume_pc, f.depth, f.mem.size());
+                    f.resume_pc, f.depth);
         }
     }
-    /* Orphan-drop the suspension stack too (Stage 3, Decision A): each
-     * entry's prev + frozen chain point into the bb_map_ the opener cleared,
-     * so a suspension straddling the boundary is discarded with no emit — the
-     * same rule frames_ follows (the segment is a fresh trace). */
-    if ((pb_diag() || pb_susp_diag()) && !susp_stack_.empty()) {
-        fprintf(stderr, "[pathbuilder] SUSP-ORPHAN dropping %zu suspension(s) "
-                "at segment open\n", susp_stack_.size());
-    }
-    g_stats.susp_orphan_dropped += susp_stack_.size();
-    /* The frames_ twin of susp_orphan_dropped.  This clear() has always
-     * been an orphan DROP of executed prefixes and has never had a
-     * counter, so "no frames were lost at a segment boundary" was never a
-     * claim any run could make. */
     g_stats.census_frames_orphan_dropped += frames_.size();
     gap_disarm();
     kexc_snap_.valid = false;
-    susp_stack_.clear();
     frames_.clear();
     pending_evs_.clear();
     ref_evs_.clear();
@@ -1235,8 +1065,6 @@ void PathBuilder::on_segment_open()
     walk_prev_ = nullptr;
     walk_depth_ = 0;
     prev_depth_ = 0;
-    prev_owner_asid_ = 0;
-    prev_owner_live_ = 0;
     rep_state(cpu_index_).pb_prev_facts = RepArchFacts();
     rep_state(cpu_index_).pb_prev_facts_armed = false;
     rep_state(cpu_index_).pb_walk_facts = RepArchFacts();
@@ -1290,19 +1118,8 @@ void PathBuilder::on_segment_open()
      * segment's depth. */
     g_emit_fault_depth = 0;
     last_emit_fault_depth(cpu_index_) = 0;
-    g_emit_fault_anchors.clear();
 }
 
-/*
- * Flush the pending final-TB body entry before a segment finishes (see
- * the declaration).  Walks the pending-seal slot's fragment list up to
- * the last-executed fragment (matched by the scoreboard's @prev_start),
- * same as the per-exec seal walk; no later CP step will fire after
- * shutdown, so this is the only chance to flush the trailing chain.
- * @walk_prev is false on the deferred window close, whose slot holds the
- * TB about to dispatch rather than one that has run (see the
- * declaration); the in-flight chain is finalized either way.
- */
 /*
  * Hand the block-being-emitted's self-loop facts to emit_body_entry
  * (consume-once; see RepSelfLoopState::emit_facts).  Every emission the
@@ -1325,64 +1142,15 @@ static inline void rep_emit_handoff(unsigned int cpu_index,
     rs.emit_pre_pieces = std::move(pre_pieces);
 }
 
-/*
- * CST_NO_CLOSE_SUSP: the falsifier arm for the close-time suspension drain
- * (PathBuilder::flush_suspensions_at_close).  With it set a segment close
- * leaves susp_stack_ exactly where five rounds of one-holder-at-a-time
- * fixes left it — for the next segment open to orphan-drop, taking the
- * suspended prev, its frozen CP memops, its frozen dst snaps, its frozen
- * in-flight chain and its frozen self-loop facts with it.  A falsifier arm,
- * not a capture.
- */
-static bool close_susp_falsifier(void)
-{
-    static const bool v = []() {
-        if (getenv("CST_NO_CLOSE_SUSP") == nullptr) {
-            return false;
-        }
-        fprintf(stderr, "champsim_tracer: CST_NO_CLOSE_SUSP — suspended "
-                "deferred-prev blocks held at a segment close are DROPPED "
-                "with their frozen memops, register snaps and chains.  This "
-                "trace is missing instructions the guest executed; it is a "
-                "falsifier arm, not a capture.\n");
-        return true;
-    }();
-    return v;
-}
+
 
 /*
- * CST_NO_CLOSE_RANPREV: the falsifier arm for the deferred route's
- * pending-seal walk.  With it set flush_final(walk_prev=false) refuses the
- * slot even when the block in it has RETIRED instructions — the shutdown
- * close's behaviour before this drain, where the block the device write
- * interrupted went out with its executed prefix.  A falsifier arm, not a
- * capture.
- */
-static bool close_ranprev_falsifier(void)
-{
-    static const bool v = []() {
-        if (getenv("CST_NO_CLOSE_RANPREV") == nullptr) {
-            return false;
-        }
-        fprintf(stderr, "champsim_tracer: CST_NO_CLOSE_RANPREV — the deferred "
-                "close route DROPS its pending-seal slot even when the block "
-                "in it retired instructions.  This trace is missing "
-                "instructions the guest executed; it is a falsifier arm, not "
-                "a capture.\n");
-        return true;
-    }();
-    return v;
-}
-
-/*
- * THE ONE CLOSE-TIME WALK.  See the declaration.
- *
- * Two callers reach it: the pending-seal slot's own walk (live sinks, the
- * scoreboard's last-executed fragment as the stop marker) and the suspension
- * drain (frozen sinks, no scoreboard marker — the frozen extent is the only
- * measurement, which is why the last-executed fragment falls back to the
- * fragment list's tail).  Both must truncate at exactly what retired, and a
- * second copy of that rule is the same over-claim waiting on a second site.
+ * THE ONE CLOSE-TIME / DEPARTURE-TIME WALK.  See the declaration.  Every
+ * caller must truncate at exactly what retired, and a second copy of that
+ * rule is the same over-claim waiting on a second site.  The tail insn's
+ * dst snaps were captured by the measuring dispatch's prologue (or the
+ * caller excluded the tail insn from its extent), so the walk itself
+ * captures nothing.
  */
 uint32_t PathBuilder::close_walk_emit(BodyStreamState *out_stream,
                                       unsigned int cpu_index,
@@ -1431,40 +1199,6 @@ uint32_t PathBuilder::close_walk_emit(BodyStreamState *out_stream,
         bool is_last_executed = truncated ||
             (prev_start_matches ? (frag->start_pc == a.prev_start)
                                 : (frag == last_frag));
-
-        if (is_last_executed && ran > 0 && a.snap_tail) {
-            /* Tail-insn dst snap (see snap_prev_tail_dsts): the
-             * last-executed instruction's registers still hold its
-             * post-exec values.  On an UNTRUNCATED delay-slot tail
-             * [branch@n-2, delay@n-1] the branch's snap was deferred
-             * (arm_reg_snap_cbs skips the delay slot's callback so the
-             * branch's REG_IP dst can take the successor override) and
-             * there is no next TB to catch it, so both are captured
-             * here.  A TRUNCATED fragment stops before that tail, so
-             * every instruction below the cut already had its snap
-             * taken by its successor's callback and only the last
-             * executed one is missing. */
-            if (g_features.reg_data && frag->insn_reg_names) {
-                uint32_t last = ran - 1;
-                bool ds_tail = !truncated && ran >= 2 &&
-                    frag->insn_fields[last - 1].branch_type != BRANCH_NONE &&
-                    frag->insn_fields[last].branch_type == BRANCH_NONE;
-                auto snap_tail = [&](uint32_t idx) {
-                    const InsnFields *fl = &frag->insn_fields[idx];
-                    const InsnRegNames *nl = &frag->insn_reg_names[idx];
-                    for (uint8_t i = 0; i < fl->n_dst_regs; i++) {
-                        RegSnap s;
-                        g_reg_snaps.read_into_snap(
-                            cpu_index, nl->dst_qemu_reg_keys[i], &s);
-                        pending_reg_snaps(cpu_index_).push_back(s);
-                    }
-                };
-                if (ds_tail) {
-                    snap_tail(last - 1);  /* branch */
-                }
-                snap_tail(last);          /* delay slot, or branch */
-            }
-        }
 
         if (truncated) {
             /* Seal the block at the cut.  The clipped fragment is NOT
@@ -1564,10 +1298,16 @@ uint32_t PathBuilder::close_walk_emit(BodyStreamState *out_stream,
             }
             g_emit_fault_depth = eff;
             g_dbg_depth_src = CST_DSRC_UNWIND;
-            g_emit_fault_anchors.clear();
         }
         rep_emit_handoff(cpu_index, facts);
-        emit_body_entry(out_stream, bb_tmpl, cpu_index, {});
+        const bool is_final = a.thread_end_last &&
+                              (bb_tmpl == finalized.back());
+        emit_body_entry(out_stream, bb_tmpl, cpu_index, {},
+                        /*wp_first_tb_unavail=*/false,
+                        /*branch_successor_pc=*/0,
+                        /*branch_successor_known=*/false,
+                        /*bb_start=*/0, /*bb_stop=*/bb_tmpl->n_insns,
+                        /*thread_end=*/is_final);
         a.insns_emitted += bb_tmpl->n_insns;
         if (!bb_tmpl->is_system) {
             a.user_insns_emitted += bb_tmpl->n_insns;
@@ -1583,204 +1323,138 @@ uint32_t PathBuilder::close_walk_emit(BodyStreamState *out_stream,
  * beside the census; declared here because both close drains need it. */
 static uint32_t closedrop_tb_insns(const BBTemplate *head);
 
+/*
+ * Flush the calling builder's pending work before a segment finishes.
+ * ONE range arithmetic (see the declaration): every holder is emitted at
+ * the range [start, stop) whose observations are complete, and stop is
+ * never "instructions retired" — a retired tail whose destination snaps
+ * were never captured is excluded rather than published from close-time
+ * vCPU state.  The final entry this flush emits for the context carries
+ * CST_BB_FLAG_THREAD_END.
+ */
 void PathBuilder::flush_final(bool walk_prev, bool prev_in_flight)
 {
     BodyStreamState *out_stream = g_trace_segments.body_stream();
-    /* This builder's own vCPU (recorded at the lazy event-queue enable;
-     * a builder that never stepped holds 0 and has no pending prev
-     * anyway).  The scoreboard slots and the emitted entry's thread_id
-     * must be THIS vCPU's — a hardcoded slot 0 read the wrong cursor
-     * and mislabeled the segment's final entry whenever the closing
-     * thread wasn't vCPU 0. */
     unsigned int cpu_index = cpu_index_;
     uint64_t prev_start =
         qemu_plugin_u64_get(g_scoreboard.prev_start_pc, cpu_index);
 
-    /*
-     * HOW MUCH OF THE IN-FLIGHT BLOCK ACTUALLY RAN.
-     *
-     * The close does not happen at a block boundary.  The END marker fires
-     * from inside an instruction callback part-way through its own block,
-     * and every other close (ceiling, dead latch, guest death) can land
-     * anywhere.  prev_start resolves the last-executed FRAGMENT and says
-     * nothing about how far into it execution got, so this walk used to
-     * append the fragment at its full TRANSLATED length: the final entry
-     * reached the wire claiming instructions the guest never executed, and
-     * its tail dst snaps — captured one instruction behind, so the last
-     * executed instruction's snap is taken by the NEXT instruction's
-     * callback, which never fires — came up short against that inflated
-     * expectation.  The emit-time backstop then threw the whole captured
-     * slice away.  Both are the same defect: the block was never truncated
-     * to what ran.
-     */
-    uint64_t executed = 0;
-    bool have_extent = false;
-    /*
-     * CENSUS: WHICH WAY THIS CLOSE TREATS THE PENDING-SEAL SLOT.
-     *
-     * walk_prev=false is the deferred route (budget / simpoint / the
-     * device-write shutdown).  On the first two the slot holds a TB that
-     * has not run and dropping it costs nothing; on the shutdown close it
-     * holds the block the device write interrupted, whose retired prefix
-     * goes with it.  The two are indistinguishable in the counter alone,
-     * so the RETIRED extent is recorded next to the drop.
-     */
     census_flush_seq_ = g_stats.census_closes;
     census_flush_kind_ = walk_prev ? 1 : 2;
     census_prev_undrained_ = 0;
+
     /*
-     * THE DEFERRED ROUTE'S SLOT IS NOT ALWAYS EMPTY OF RETIRED WORK.
+     * A CLOSE LANDING MID-STEP HOLDS A RETIRED, UNSEALED BLOCK.
      *
-     * On the budget / simpoint close the slot holds the TB about to
-     * dispatch: measured ran=0, and dropping it costs nothing.  On the
-     * machine-shutdown close it holds the block the DEVICE WRITE
-     * interrupted, and everything ahead of the interrupted instruction
-     * retired.  Emitting the slot WHOLE there was vetoed for a good reason
-     * (a block whose memory operations were only partly observed — caught
-     * by cst_audit's memop bimodality oracle), but the veto took the
-     * retired prefix with it.  Walk that prefix, and nothing else:
-     * insn_started is added at the TOP of an instruction, so the
-     * interrupted instruction reads as begun and is subtracted.
+     * Between step_events' promote and step_seal, walk_prev_ is the block
+     * that just finished executing — its extent was measured and its tail
+     * dst snaps captured by this very dispatch's prologue — and the slot
+     * holds the TB dispatching NOW (ran = 0).  The END-marker close and
+     * the deferred budget/simpoint close both land here.  Emit walk_prev_
+     * at its measured extent; the seal that would have resolved its
+     * terminating branch never ran, so the branch is declared unresolved
+     * (no records + CST_BB_FLAG_BRANCH_UNRESOLVED) rather than fabricated.
      */
-    bool deferred_walk = false;
-    uint64_t deferred_ran = 0;
-    if (prev_tb_ && !walk_prev) {
-        bool known = retired_executed_of(cpu_index, prev_tb_, &deferred_ran) ||
-                     prev_extent(&deferred_ran);
-        if (known && prev_in_flight) {
-            /*
-             * THE MID-INSTRUCTION FACT BELONGS TO ONE BLOCK, NOT TO THE SLOT.
-             *
-             * prev_in_flight is QEMU's statement about the vCPU's CURRENT
-             * instruction (qemu_plugin_vm_shutdown_cb's in_guest_insn): the
-             * guest is standing inside the store that performs the poweroff,
-             * so that instruction has begun and has not retired.  It is only
-             * a statement about THIS slot when the slot holds the block the
-             * guest is standing in.
-             *
-             * On a system guest it usually does not.  The pending-seal slot
-             * holds the last block of the PINNED process, and the poweroff is
-             * executed by whatever process ran `poweroff` — a different
-             * address space, dispatches later, on a cursor that has long
-             * since rolled past.  Subtracting there removes an instruction
-             * the guest retired: measured on all four ISAs at HEAD as a
-             * final wire entry of insns=1 for the 2-instruction block
-             * 0x401014 whose census line read ran=2, against insns=2 for the
-             * same block on the marshalled (in_guest_insn=false) route.
-             *
-             * So the subtraction is gated on the ONE dispatch position that
-             * can hold an in-flight block.  The other two answers —
-             * retired_executed_of's previous-dispatch arm and the
-             * note_prev_extent stash — are both measured AFTER a successor
-             * dispatched, which is proof the block ran to its end.
-             */
-            if (!retired_is_in_flight(cpu_index, prev_tb_)) {
-                g_stats.close_deferred_prev_inflight_stale++;
-            } else if (deferred_ran > 0) {
-                deferred_ran--;
-                g_stats.close_deferred_prev_inflight_trimmed++;
-            }
-        }
-        if (!known) {
-            g_stats.close_deferred_prev_extent_unknown++;
-            deferred_ran = 0;
-        }
-        deferred_walk = known && deferred_ran > 0 &&
-                        !close_ranprev_falsifier() && !trunc_falsifier_close();
-        if (deferred_walk) {
-            g_stats.close_deferred_prev_walked++;
-            g_stats.close_deferred_prev_insns += deferred_ran;
-            census_flush_kind_ = 3;
-        }
+    if (mid_step_ && walk_prev_) {
+        uint64_t we = 0;
+        CloseWalk mw;
+        mw.head = walk_prev_;
+        mw.have_extent = seal_prev_extent(walk_prev_, &we);
+        mw.executed = we;
+        mw.prev_start = prev_start;
+        mw.set_depth = true;
+        mw.depth = walk_depth_;
+        mw.async_in_depth = g_pb_walk_async[pb_vcpu_slot(cpu_index_)];
+        mw.facts = &rep_state(cpu_index).pb_walk_facts;
+        mw.thread_end_last = true;
+        close_walk_emit(out_stream, cpu_index, mw);
     }
+    walk_prev_ = nullptr;
+    mid_step_ = false;
+
+    /*
+     * THE PENDING-SEAL SLOT.  stop = the last instruction whose
+     * observations are COMPLETE:
+     *
+     *   - stash path (a later dispatch measured the extent): that same
+     *     dispatch's prologue also captured the tail insn's dst snaps, so
+     *     stop = extent.
+     *   - direct-cursor path (no later dispatch): the tail insn retired
+     *     but its snap was never taken — its successor never began — so
+     *     stop = extent - 1.  The machine-shutdown close additionally
+     *     subtracts the in-flight instruction, which has BEGUN and not
+     *     retired (insn_started counts beginnings).
+     *
+     * The deferred budget/simpoint close's slot holds the TB dispatching
+     * now: extent 0, stop == start, nothing is emitted — no flag needed.
+     */
+    uint64_t executed = 0;
+    bool have_extent = false;
     if (prev_tb_) {
-        if (walk_prev || deferred_walk) {
+        if (prev_extent(&executed)) {
+            have_extent = true;
+        } else if (retired_executed_of(cpu_index, prev_tb_, &executed)) {
+            have_extent = true;
+            if (prev_in_flight && retired_is_in_flight(cpu_index, prev_tb_)) {
+                if (executed > 0) {
+                    executed--;               /* mid-instruction: not retired */
+                    g_stats.close_deferred_prev_inflight_trimmed++;
+                }
+            }
+            if (executed > 0) {
+                executed--;                   /* tail snap never captured */
+            }
+        } else {
+            g_stats.close_deferred_prev_extent_unknown++;
+        }
+        if (have_extent && executed > 0) {
             g_stats.census_prev_close_walked++;
         } else {
             g_stats.census_prev_close_dropped++;
-            g_stats.census_prev_close_dropped_insns += deferred_ran;
-            census_prev_undrained_ = deferred_ran;
-        }
-    }
-    if (deferred_walk) {
-        have_extent = true;
-        executed = deferred_ran;
-    }
-    if (walk_prev && prev_tb_ && !trunc_falsifier_close()) {
-        have_extent = retired_executed_of(cpu_index, prev_tb_, &executed);
-        if (!have_extent) {
-            /* The cursor has rolled past prev — the vCPU went on dispatching
-             * for somebody else after the pinned process left it.  The
-             * measurement taken at the first dispatch after prev still
-             * stands (see PathBuilder::note_prev_extent) and is the same
-             * number the cursor would have given had it been asked then. */
-            have_extent = prev_extent(&executed);
-            if (have_extent) {
-                g_stats.close_walk_extent_from_stash++;
-            } else {
-                g_stats.close_walk_extent_unknown++;
-            }
         }
     }
 
-    /*
-     * THE SUSPENSIONS FIRST.  A suspension froze a block that executed
-     * BEFORE anything still live in this builder, so it goes on the wire
-     * ahead of the closing walk's own blocks (deepest / most recent first
-     * within the stack, mirroring the fault-frame flush).
-     */
-    flush_suspensions_at_close(close_nostream_falsifier() ? nullptr
-                                                          : out_stream,
-                               cpu_index);
-
-    CloseWalk cw;
-    cw.head = (walk_prev || deferred_walk) ? prev_tb_ : nullptr;
-    cw.have_extent = have_extent;
-    cw.executed = executed;
-    cw.prev_start = prev_start;
-    cw.snap_tail = true;
-    cw.facts = &rep_state(cpu_index).pb_prev_facts;
-    if (prev_start != 0 || deferred_walk) {
+    if (prev_tb_ && have_extent && executed > 0) {
+        CloseWalk cw;
+        cw.head = prev_tb_;
+        cw.have_extent = true;
+        cw.executed = executed;
+        cw.prev_start = prev_start;
+        cw.set_depth = true;
+        cw.depth = prev_depth_;
+        cw.async_in_depth = g_pb_prev_async[pb_vcpu_slot(cpu_index_)];
+        cw.facts = &rep_state(cpu_index).pb_prev_facts;
+        cw.thread_end_last = true;
         close_walk_emit(out_stream, cpu_index, cw);
-    } else {
-        /*
-         * THE CLOSE WALK IS SKIPPED ENTIRELY, AND IT TAKES THE CHAIN WITH
-         * IT.  prev_start is this vCPU's last-executed-fragment marker,
-         * zeroed by the previous flush_final and re-armed by the next
-         * dispatch's inline store; when it reads 0 the walk is not called
-         * at all, so neither the slot's retired prefix nor the IN-FLIGHT
-         * CHAIN is finalized — and the unconditional cp_chain.reset() at
-         * the tail of this function then empties the chain anyway, which is
-         * precisely why the post-flush occupancy census reads zero over it.
-         */
-        uint64_t skipped = cp_chain(cpu_index_).in_flight_insns();
-        if (cw.head && have_extent) {
-            skipped += executed;
-        }
-        if (skipped) {
-            g_stats.close_holder_discarded++;
-            g_stats.close_holder_discarded_insns += skipped;
-        }
+    } else if (cp_chain(cpu_index_).has_active_chain()) {
+        /* No walkable slot, but the chain still holds fragments that ran
+         * (a page-split BB the close interrupted).  Finalize and emit them
+         * through the same walk (head = nullptr finalizes just the
+         * chain). */
+        CloseWalk cw;
+        cw.head = nullptr;
+        cw.prev_start = 0;
+        cw.set_depth = true;
+        cw.depth = prev_depth_;
+        cw.async_in_depth = g_pb_prev_async[pb_vcpu_slot(cpu_index_)];
+        cw.facts = &rep_state(cpu_index).pb_prev_facts;
+        cw.thread_end_last = true;
+        close_walk_emit(out_stream, cpu_index, cw);
     }
 
-    /* Every fault frame still open is holding an executed prefix that no
-     * FAULT_RETURN will ever come to merge.  Emit it here — this is the
-     * last moment anything can (see flush_frames_at_close). */
-    flush_frames_at_close(close_nostream_falsifier() ? nullptr : out_stream,
-                          cpu_index);
+    /* Fault frames are ledger entries only — their executed prefixes went
+     * on the wire at the fault — so a close simply forgets the pending
+     * continuations.  Nothing retired is lost; the fate ledger records
+     * them as boundary-dropped. */
+    g_stats.census_frames_orphan_dropped += frames_.size();
+    frames_.clear();
 
     /*
-     * THE SINKS THAT ARE LEFT.  Everything above emits blocks; these four
-     * hold per-instruction state that only a block can carry, so once the
-     * last block is out whatever remains in them belonged to an instruction
-     * that did not reach the wire.  They were discarded here silently — the
-     * reg-snap sink was not even cleared, so its residue survived into the
-     * NEXT segment as a leaked positional prefix, or leaked at exit.
-     *
-     * The CP memop residue is NOT a must-be-0 row: a close taken from
-     * inside an instruction (the device-write shutdown) leaves that
-     * instruction's partial memops behind by construction, and discarding
-     * them is right — it did not retire.
+     * THE SINKS THAT ARE LEFT hold per-instruction state of instructions
+     * outside every emitted range: the excluded tail's snaps, a
+     * mid-instruction's partial memops, retained events.  Discarding them
+     * is the honest complement of the stop rule — they are observations
+     * of instructions no emitted range claims.
      */
     g_stats.close_snaps_dropped += pending_reg_snaps(cpu_index_).size();
     g_stats.close_cpmem_dropped += g_mem_recorder.cp_count(cpu_index_);
@@ -1791,10 +1465,6 @@ void PathBuilder::flush_final(bool walk_prev, bool prev_in_flight)
         g_stats.close_repfacts_dropped +=
             (rs.pb_prev_facts.pc != 0) + (rs.pb_walk_facts.pc != 0) +
             (rs.emit_facts_valid ? 1 : 0);
-        /* The self-loop facts describe a RETIRED iteration count of a block
-         * that has now been emitted (or dropped); either way the latch is
-         * stale for anything the next segment executes, and a stale latch
-         * hands one block's fan-out count to another. */
         rs.pb_prev_facts = RepArchFacts();
         rs.pb_prev_facts_armed = false;
         rs.pb_walk_facts = RepArchFacts();
@@ -1807,25 +1477,7 @@ void PathBuilder::flush_final(bool walk_prev, bool prev_in_flight)
     pending_reg_snaps(cpu_index_).clear();
     cp_chain_snap_mark(cpu_index_) = 0;
     pending_evs_.clear();
-    /* The cross-phase walk snapshot is consumed by the seal this close
-     * stands in for; leaving it set makes the next census read a holder
-     * that no longer exists.
-     *
-     * Unless no seal ever ran on it.  mid_step_ says this builder is
-     * parked between step_events' promote and step_seal — the three glue
-     * bails after a CONTINUE leave it that way across callback boundaries —
-     * and in that state walk_prev_ is a block that EXECUTED and was never
-     * sealed.  Nulling it here is a discard, and it is invisible to the
-     * post-flush occupancy gate twice over: walk_prev_ is not in that
-     * gate's predicate at all, and this assignment empties it anyway. */
-    if (mid_step_ && walk_prev_) {
-        g_stats.close_holder_discarded++;
-        g_stats.close_holder_discarded_insns += closedrop_tb_insns(walk_prev_);
-    }
-    walk_prev_ = nullptr;
 
-    /* cp_chain and the CP memop buffer are per-vCPU; exec_lock (held)
-     * serialises them. */
     cp_chain(cpu_index_).reset();
     g_mem_recorder.clear_cp(cpu_index_);
 
@@ -1833,145 +1485,6 @@ void PathBuilder::flush_final(bool walk_prev, bool prev_in_flight)
     qemu_plugin_u64_set(g_scoreboard.prev_fall_through, cpu_index, 0);
 }
 
-/*
- * THE SUSPENSION DRAIN.  See the declaration.
- *
- * A suspension is FIVE holders in one entry — the deferred prev block with
- * its frozen retired extent, its committed CP memops, its per-insn dst snaps
- * and their chain mark, its in-flight chain prefix, and its self-loop facts —
- * and no close route read any of them.  The two fates that did exist
- * (over-cap displacement, stale sweep) call retire_prev_frame, which emits
- * the FRAME whose resume suffix the prev is; the suspension's own contents
- * went out with the next segment open's orphan drop.
- *
- * The emission reproduces what the RESUME would have done, on the frozen
- * state rather than a reconstruction: the frozen chain is re-attached, the
- * frozen memops and snaps are re-installed with their frozen mark, and the
- * walk folds the block at the extent frozen with it (SuspendedPrev::extent,
- * measured by the suspending dispatch's own prologue).  The tail dst snap is
- * taken here for the same reason the resume seal takes it — the last
- * executed instruction's snap is captured one instruction late and its
- * successor never dispatched — and without it the emit-time backstop
- * discards the entry's WHOLE register slice on the positional shortfall.
- *
- * Most recent (deepest) first, mirroring flush_frames_at_close, so the
- * depths the entries carry step down rather than up.
- */
-void PathBuilder::flush_suspensions_at_close(BodyStreamState *out_stream,
-                                             unsigned int cpu_index)
-{
-    if (susp_stack_.empty() || close_susp_falsifier()) {
-        return;
-    }
-    if (!out_stream) {
-        /* Nowhere to put them.  This IS the drop and nothing here can undo
-         * it; say so rather than returning a quiet zero — and charge it to
-         * the discard gate, since the clear() is what makes the post-flush
-         * occupancy census read a satisfied zero over it. */
-        g_stats.close_susp_unflushable += susp_stack_.size();
-        g_stats.close_holder_discarded += susp_stack_.size();
-        for (const SuspendedPrev &sp : susp_stack_) {
-            g_stats.close_holder_discarded_insns += sp.extent_valid
-                ? sp.extent
-                : (sp.prev ? closedrop_tb_insns(sp.prev) : 0);
-        }
-        susp_stack_.clear();
-        return;
-    }
-
-    /* The live accumulators belong to the block the close's own walk is
-     * about to seal; the suspensions emit from theirs. */
-    std::vector<WPMemAccess> cur_mem;
-    g_mem_recorder.take_cp(cpu_index_, cur_mem);
-    std::vector<RegSnap> cur_snaps = std::move(pending_reg_snaps(cpu_index_));
-    pending_reg_snaps(cpu_index_).clear();
-    const size_t cur_mark = cp_chain_snap_mark(cpu_index_);
-    BBChainAssembler::ChainState cur_chain = cp_chain(cpu_index_).detach_state();
-
-    while (!susp_stack_.empty()) {
-        SuspendedPrev s = std::move(susp_stack_.back());
-        susp_stack_.pop_back();
-        if (!s.prev) {
-            g_stats.close_susp_empty++;
-            continue;
-        }
-        if (!s.extent_valid) {
-            /* No measurement was frozen with it, so the walk cannot name
-             * what retired and folds the block whole.  Its own must-be-0
-             * row: this is the suspend-side twin of an unknown close-walk
-             * extent, and the wire may over-claim. */
-            g_stats.close_susp_extent_unknown++;
-        } else if (s.extent == 0) {
-            /* Nothing of it ran.  The frozen sinks belong to instructions
-             * that never retired; there is nothing to emit and nothing is
-             * lost. */
-            g_stats.close_susp_empty++;
-            continue;
-        }
-
-        /* Re-arm the four sinks exactly as resume_suspension would. */
-        g_mem_recorder.clear_cp(cpu_index_);
-        g_mem_recorder.prepend_cp(cpu_index_, s.mem);
-        pending_reg_snaps(cpu_index_) = s.snaps;
-        cp_chain_snap_mark(cpu_index_) = s.snap_mark;
-        cp_chain(cpu_index_).attach_state(std::move(s.chain));
-
-        CloseWalk cw;
-        cw.head = s.prev;
-        cw.have_extent = s.extent_valid;
-        cw.executed = s.extent;
-        cw.prev_start = 0;          /* the scoreboard slot is the LIVE
-                                     * block's; a frozen suspension has no
-                                     * marker, so the walk falls back to the
-                                     * fragment list's tail */
-        cw.snap_tail = true;
-        cw.set_depth = true;
-        cw.depth = s.depth;
-        cw.async_in_depth = s.async_in_depth;
-        cw.facts = &s.rep_facts;
-        const uint32_t n = close_walk_emit(out_stream, cpu_index, cw);
-
-        const uint64_t got = cw.insns_emitted;
-        const uint64_t got_user = cw.user_insns_emitted;
-        if (n == 0 || got == 0) {
-            /* The entry reached here with a retired extent (extent == 0
-             * took the `continue` above) and its walk put no block on the
-             * wire, so the frozen prefix is gone.  The pop has already
-             * emptied the holder, so the post-flush occupancy census sees
-             * nothing — this row is the only place it is visible. */
-            g_stats.close_susp_empty++;
-            g_stats.close_holder_discarded++;
-            g_stats.close_holder_discarded_insns += s.extent_valid
-                ? s.extent : closedrop_tb_insns(s.prev);
-        } else {
-            g_stats.close_susp_flushed++;
-            g_stats.close_susp_insns_recovered += got;
-            g_stats.close_susp_user_insns_recovered += got_user;
-            g_stats.close_susp_sys_insns_recovered +=
-                got >= got_user ? got - got_user : 0;
-        }
-        if (pb_diag() || pb_susp_diag()) {
-            fprintf(stderr, "[pathbuilder] CLOSE-SUSP-FLUSH prev=0x%" PRIx64
-                    " depth=%u extent=%" PRIu64 "(v=%d) blocks=%u insns=%"
-                    PRIu64 " left=%zu\n",
-                    s.prev->start_pc, s.depth, s.extent, (int)s.extent_valid,
-                    n, got, susp_stack_.size());
-        }
-        /* Whatever the emits did not claim belonged to instructions this
-         * block did not retire; it must not follow the next suspension. */
-        g_mem_recorder.clear_cp(cpu_index_);
-        pending_reg_snaps(cpu_index_).clear();
-        cp_chain_snap_mark(cpu_index_) = 0;
-        cp_chain(cpu_index_).reset();
-    }
-
-    /* Put the closing walk's own accumulators back. */
-    g_mem_recorder.clear_cp(cpu_index_);
-    g_mem_recorder.prepend_cp(cpu_index_, cur_mem);
-    pending_reg_snaps(cpu_index_) = std::move(cur_snaps);
-    cp_chain_snap_mark(cpu_index_) = cur_mark;
-    cp_chain(cpu_index_).attach_state(std::move(cur_chain));
-}
 
 /*
  * Does this builder hold anything a close would have to drain?  See the
@@ -1979,7 +1492,7 @@ void PathBuilder::flush_suspensions_at_close(BodyStreamState *out_stream,
  */
 bool PathBuilder::holds_close_work() const
 {
-    return prev_tb_ != nullptr || !frames_.empty() || !susp_stack_.empty() ||
+    return prev_tb_ != nullptr ||
            cp_chain(cpu_index_).in_flight_insns() != 0 ||
            !pending_reg_snaps(cpu_index_).empty() ||
            g_mem_recorder.cp_count(cpu_index_) != 0 ||
@@ -1995,49 +1508,19 @@ static uint32_t closedrop_tb_insns(const BBTemplate *head)
     return n;
 }
 
-/* Instructions of @f that RETIRED before its fault: everything strictly
- * ahead of the resume PC (a pushed fault always re-executes its faulting
- * instruction), plus that instruction itself when it is a self-loop that
- * retired iterations before faulting.  Exactly the extent
- * flush_frames_at_close emits, computed here so the census can say how
- * much a frame is holding without emitting it. */
-static uint32_t census_frame_prefix_insns(const CtxFrame &f)
-{
-    if (!f.full_tmpl || !f.full_tmpl->insn_pcs) {
-        return 0;
-    }
-    for (uint32_t k = 0; k < f.full_tmpl->n_insns; k++) {
-        if (f.full_tmpl->insn_pcs[k] == f.resume_pc) {
-            return (f.rep_pre_iters > 0 && f.rep_pre_pc == f.resume_pc)
-                ? k + 1 : k;
-        }
-    }
-    return 0;                   /* extent unnameable; the flush refuses too */
-}
-
-static uint32_t census_chain_insns(const BBChainAssembler::ChainState &s)
-{
-    uint32_t n = 0;
-    for (const BBTemplate *t : s.fragments) {
-        n += t ? t->n_insns : 0;
-    }
-    return n;
-}
 
 void PathBuilder::close_state_report(FILE *f, const char *why,
                                      unsigned int closing_cpu,
                                      const char *phase, bool print,
                                      bool ledger) const
 {
-
     /*
-     * ---- OCCUPANCY OF EVERY HOLDER ----
-     *
-     * Read, not inferred.  Each of these can contain work the guest
-     * RETIRED that has not reached the wire; the ones without a drain in
-     * the close path are the standing drop.
+     * OCCUPANCY OF EVERY HOLDER — read, not inferred.  Under split
+     * emission the holders capable of containing RETIRED-but-unemitted
+     * instructions are the pending-seal slot, the mid-step walk snapshot
+     * and the in-flight chain; fault frames are identity ledger entries
+     * whose prefixes already reached the wire.
      */
-    /* 1. the pending-seal slot, and how much of it actually ran */
     uint64_t prev_ran = 0;
     int prev_ran_known = 0;
     if (prev_tb_) {
@@ -2047,94 +1530,33 @@ void PathBuilder::close_state_report(FILE *f, const char *why,
             prev_ran_known = 2;         /* from the note_prev_extent stash */
         }
     }
-    /* 2. the cross-phase snapshot the seal walk folds.  Stale (already
-     *    sealed) on every close that lands between two steps; LIVE on a
-     *    close taken between step_events and step_seal. */
     const uint32_t walkprev_n = walk_prev_ ? closedrop_tb_insns(walk_prev_) : 0;
-    /* 3. the in-flight true-BB chain */
     const uint32_t chain_n = cp_chain(cpu_index_).in_flight_insns();
-    /* 4. open fault frames: count and total executed prefix */
-    uint64_t frames_insns = 0;
-    for (const CtxFrame &fr : frames_) {
-        frames_insns += census_frame_prefix_insns(fr);
-    }
-    /* 5. suspensions: their prev, their frozen chain, and their frozen
-     *    sinks — four holders in one entry */
-    uint64_t susp_insns = 0, susp_chain_insns = 0;
-    uint64_t susp_snaps = 0, susp_mem = 0;
-    for (const SuspendedPrev &sp : susp_stack_) {
-        susp_insns += sp.extent_valid
-            ? sp.extent
-            : (sp.prev ? closedrop_tb_insns(sp.prev) : 0);
-        susp_chain_insns += census_chain_insns(sp.chain);
-        susp_snaps += sp.snaps.size();
-        susp_mem += sp.mem.size();
-    }
-    /* 6-9. the per-vCPU sinks and the retained-event queue */
     const size_t n_snaps = pending_reg_snaps(cpu_index_).size();
     const size_t snap_mark = cp_chain_snap_mark(cpu_index_);
     const size_t n_cpmem = g_mem_recorder.cp_count(cpu_index_);
     const size_t n_carry = g_mem_recorder.cp_carry_count(cpu_index_);
     const size_t n_evs = pending_evs_.size();
-    /* 10. the self-loop fan-out facts riding with the pending prev: a
-     *     retired ITERATION COUNT, lost as a fallback to the memop-derived
-     *     estimate if the block they describe is emitted without them */
     const RepSelfLoopState &rs = rep_state(cpu_index_);
     const int rep_held = (rs.pb_prev_facts.pc != 0) +
                          (rs.pb_walk_facts.pc != 0) +
                          (rs.emit_facts_valid ? 1 : 0);
     const int wm_held = rs.warmup_hold_any() ? 1 : 0;
-    /* 11. a wrong-path session still open on this vCPU: while it is, the
-     *     memop router sends CORRECT-path memops to the WP buffer */
     const int wp_open = wp_session_active(cpu_index_) ? 1 : 0;
-    /* Did THIS close's flush hook consume this builder's slot, and how?
-     * 0 = never reached (the peer loop skipped it, or no flush ran),
-     * 1 = walked prev, 2 = chain-only, so prev's retired prefix went
-     * unemitted. */
     const int flushed = (census_flush_seq_ == g_stats.census_closes)
         ? (int)census_flush_kind_ : 0;
 
-    const bool anything = prev_tb_ || walk_prev_ || chain_n ||
-                          !frames_.empty() || !susp_stack_.empty() ||
-                          n_snaps || n_cpmem || n_carry || n_evs ||
-                          rep_held || wm_held || wp_open;
-
-    /*
-     * THE WHOLE-CLASS GATE.
-     *
-     * Not a row per holder — a row per BUILDER that still holds any
-     * structure capable of containing RETIRED instructions after every
-     * drain this close performs.  A per-holder list is the same
-     * survivorship bias in a different costume: it goes stale the moment a
-     * sixth holder is added, which is exactly how five rounds of this ran.
-     * The predicate is "can this contain instructions the guest executed",
-     * so the pure-bookkeeping holders (the chain snap mark, the retained
-     * events, the warmup placement hold) are deliberately outside it and
-     * keep their own descriptive rows.
-     *
-     * The slot's own contribution: a builder the flush REACHED reports what
-     * that flush knowingly left behind (it, and only it, knows whether the
-     * close landed mid-instruction, where the interrupted instruction has
-     * BEGUN and has not retired); a builder the flush never reached reports
-     * the whole measured retired extent.
-     */
     const uint64_t prev_undrained = flushed != 0
         ? census_prev_undrained_
         : (prev_tb_ && prev_ran_known ? prev_ran : 0);
-    const uint64_t undrained_insns = prev_undrained + frames_insns +
-        susp_insns + susp_chain_insns + chain_n;
-    const bool undrained = prev_undrained > 0 || !frames_.empty() ||
-        !susp_stack_.empty() || chain_n != 0;
+    const uint64_t undrained_insns = prev_undrained + chain_n +
+        (mid_step_ ? walkprev_n : 0);
+    const bool undrained = prev_undrained > 0 || chain_n != 0 ||
+        (mid_step_ && walk_prev_ != nullptr);
 
     if (ledger) {
-        /* The LEDGER is taken from the post-flush pass only: whatever is
-         * still here once every drain the close performs has run is what
-         * the close drops. */
         g_stats.census_frames_held_at_close += frames_.size();
-        g_stats.census_frames_held_insns += frames_insns;
         g_stats.census_walkprev_held_at_close += walk_prev_ ? 1 : 0;
-        g_stats.census_susp_held_at_close += susp_stack_.size();
-        g_stats.census_susp_held_insns += susp_insns + susp_chain_insns;
         g_stats.census_chain_held_at_close += chain_n ? 1 : 0;
         g_stats.census_chain_held_insns += chain_n;
         g_stats.census_snaps_held_at_close += n_snaps;
@@ -2145,15 +1567,9 @@ void PathBuilder::close_state_report(FILE *f, const char *why,
         g_stats.census_repfacts_held_at_close += (uint64_t)rep_held;
         g_stats.census_wmhold_held_at_close += (uint64_t)wm_held;
         g_stats.census_wpmem_held_at_close += (uint64_t)wp_open;
-
         if (undrained) {
             g_stats.close_holder_undrained++;
             g_stats.close_holder_undrained_insns += undrained_insns;
-        }
-        /* The latent holder: walk_prev_ is only a drop if the close landed
-         * inside the one window in which it has not been sealed. */
-        if (mid_step_) {
-            g_stats.close_in_mid_step++;
         }
         if (wp_open) {
             g_stats.close_wp_session_open++;
@@ -2164,15 +1580,11 @@ void PathBuilder::close_state_report(FILE *f, const char *why,
         return;
     }
 
-    /* One line per builder per phase, printed even when empty: a census
-     * that only speaks when it has something to say cannot be shown to
-     * have looked. */
     fprintf(f, "[census] %s why=%s vcpu=%u%s prev=0x%" PRIx64
             "(n=%u,ran=%" PRIu64 ",rk=%d,sys=%d,flushed=%d) walkprev=0x%" PRIx64
-            "(n=%u) chain=%u frames=%zu(insns=%" PRIu64 ") "
-            "susp=%zu(insns=%" PRIu64 ",chain=%" PRIu64 ",snaps=%" PRIu64
-            ",mem=%" PRIu64 ") snaps=%zu(mark=%zu) cpmem=%zu carry=%zu "
-            "evs=%zu rep=%d wmhold=%d wpsess=%d midstep=%d undrained=%" PRIu64
+            "(n=%u,mid=%d) chain=%u frames=%zu "
+            "snaps=%zu(mark=%zu) cpmem=%zu carry=%zu "
+            "evs=%zu rep=%d wmhold=%d wpsess=%d undrained=%" PRIu64
             "\n",
             phase, why, cpu_index_, cpu_index_ == closing_cpu ? "*" : "",
             prev_tb_ ? prev_tb_->start_pc : 0,
@@ -2181,44 +1593,21 @@ void PathBuilder::close_state_report(FILE *f, const char *why,
             prev_tb_ ? (int)prev_tb_->is_system : -1,
             flushed,
             walk_prev_ ? walk_prev_->start_pc : 0, walkprev_n,
-            chain_n, frames_.size(), frames_insns,
-            susp_stack_.size(), susp_insns, susp_chain_insns,
-            susp_snaps, susp_mem,
+            mid_step_ ? 1 : 0,
+            chain_n, frames_.size(),
             n_snaps, snap_mark, n_cpmem, n_carry, n_evs,
-            rep_held, wm_held, wp_open, mid_step_ ? 1 : 0,
+            rep_held, wm_held, wp_open,
             undrained ? undrained_insns : 0);
 
-    if (!anything) {
-        return;
-    }
     for (const CtxFrame &fr : frames_) {
         fprintf(f, "[census]   FRAME full=0x%" PRIx64 " n=%u sys=%d "
                 "resume=0x%" PRIx64 " depth=%u tid=%u returned=%d "
-                "anchors=%zu mem=%zu snaps=%zu\n",
+                "emitted_to=%u\n",
                 fr.full_tmpl ? fr.full_tmpl->start_pc : 0,
                 fr.full_tmpl ? fr.full_tmpl->n_insns : 0,
                 fr.full_tmpl ? (int)fr.full_tmpl->is_system : -1,
                 fr.resume_pc, fr.depth, fr.tid, (int)fr.returned,
-                fr.anchors.size(), fr.mem.size(), fr.snaps.size());
-        if (fr.full_tmpl) {
-            for (uint32_t i = 0; i < fr.full_tmpl->n_insns; i++) {
-                fprintf(f, "[census]     insn[%u] pc=0x%" PRIx64 "%s\n",
-                        i, fr.full_tmpl->insn_pcs[i],
-                        fr.full_tmpl->insn_pcs[i] == fr.resume_pc
-                            ? "  <- resume/fault" : "");
-            }
-        }
-    }
-    for (const SuspendedPrev &sp : susp_stack_) {
-        fprintf(f, "[census]   SUSP prev=0x%" PRIx64 " n=%u ran=%" PRIu64
-                "(v=%d) sys=%d asid=0x%" PRIx64 " depth=%u chain=%u "
-                "snaps=%zu mem=%zu\n",
-                sp.prev ? sp.prev->start_pc : 0,
-                sp.prev ? closedrop_tb_insns(sp.prev) : 0,
-                sp.extent, (int)sp.extent_valid,
-                sp.prev ? (int)sp.prev->is_system : -1,
-                sp.asid, sp.depth, census_chain_insns(sp.chain),
-                sp.snaps.size(), sp.mem.size());
+                fr.emitted_to);
     }
     if (cp_chain(cpu_index_).has_active_chain()) {
         cp_chain(cpu_index_).describe_in_flight(f, 0);
@@ -2992,97 +2381,6 @@ ptrdiff_t PathBuilder::frame_idx_for_completion(const BBTemplate *suffix,
     return -1;
 }
 
-/* Move the deferred prev's committed accumulators into @f (the handler's
- * subsequent memops then land in fresh buffers), and record the faulting
- * instruction's index — once, even when the same insn faults repeatedly
- * (TLB refill then demand fault is ONE faulting instruction). */
-void PathBuilder::collect_piece(CtxFrame &f, uint64_t resume_pc)
-{
-    /*
-     * THE ABORTED ATTEMPT THIS PIECE ENDS IS NOT RETIRED WORK.
-     *
-     * A pushed fault always re-executes its faulting instruction, so the
-     * attempt just stashed started instructions that will run again: the
-     * per-instruction insn_started slot counted them, the window clock
-     * folded them at the top of this very dispatch, and the merge will put
-     * the block on the wire exactly ONCE.  Take back precisely the
-     * re-attempted span — (instructions started in the attempt) minus (the
-     * index the handler resumes at inside that same attempt).  It is 1 for
-     * an ordinary data fault and 2 on a MIPS branch-delay-slot fault, where
-     * EPC names the branch and the delay slot re-executes with it; nothing
-     * here assumes either number.
-     *
-     * @walk_prev_ IS the aborted attempt (the deferred prev this piece is
-     * being taken from), and it is the TB the retired cursor just measured,
-     * so both operands are exact.  A seal deferred past its own dispatch has
-     * no delta of its own; retired_executed_prev says so and the correction
-     * is skipped rather than guessed.
-     */
-    if (walk_prev_) {
-        uint64_t started = 0;
-        if (retired_executed_prev(cpu_index_, walk_prev_, &started)) {
-            uint32_t k = tb_head_insn_index(walk_prev_, resume_pc);
-            if (k != UINT32_MAX && started > k) {
-                user_clock_fault_recredit(cpu_index_, started - k);
-            } else {
-                g_stats.user_clock_fault_recredit_unplaced++;
-            }
-        } else {
-            g_stats.user_clock_fault_recredit_unmeasured++;
-        }
-    }
-
-    std::vector<WPMemAccess> piece_mem;
-    g_mem_recorder.take_cp(cpu_index_, piece_mem);
-    /* Fault-split self-loop prefix: when the faulting instruction IS the
-     * REP (its partial execution's facts carry its own pc — the entry
-     * publish runs before any iteration, so the latch can never be a
-     * previous execution's), accumulate the retired iterations and the
-     * REP's delivered memops.  The folding block is walk_prev_, whose
-     * facts are this step's walk snapshot. */
-    const RepArchFacts &walk_facts = rep_state(cpu_index_).pb_walk_facts;
-    if (walk_facts.pc != 0 && walk_facts.pc == resume_pc) {
-        uint64_t piece_rep = 0;
-        for (const WPMemAccess &m : piece_mem) {
-            if (m.insn_pc == resume_pc) {
-                piece_rep++;
-            }
-        }
-        f.rep_pre_pc = resume_pc;
-        f.rep_pre_iters += walk_facts.iters;
-        f.rep_pre_memops += piece_rep;
-        /* Piece boundary for the emit-time partition: this fault ends one
-         * piece, and its aborted-attempt surplus (piece_rep -
-         * iters*mpi) belongs to the iteration that faulted HERE.  The
-         * totals alone cannot place a middle piece's surplus. */
-        f.rep_pieces.emplace_back(walk_facts.iters, piece_rep);
-    }
-    f.mem.insert(f.mem.end(), piece_mem.begin(), piece_mem.end());
-    if (!pending_reg_snaps(cpu_index_).empty()) {
-        f.snaps.insert(f.snaps.end(), pending_reg_snaps(cpu_index_).begin(),
-                       pending_reg_snaps(cpu_index_).end());
-        pending_reg_snaps(cpu_index_).clear();
-    }
-    if (f.full_tmpl && f.full_tmpl->insn_pcs) {
-        for (uint32_t i = 0; i < f.full_tmpl->n_insns; i++) {
-            if (f.full_tmpl->insn_pcs[i] == resume_pc) {
-                if (std::find(f.anchors.begin(), f.anchors.end(), i) ==
-                    f.anchors.end()) {
-                    f.anchors.push_back(i);
-                }
-                break;
-            }
-        }
-    }
-    f.resume_pc = resume_pc;
-    if (pb_diag()) {
-        fprintf(stderr, "[pathbuilder] STASH full=0x%" PRIx64 " resume=0x%"
-                PRIx64 " depth=%u nsnaps=%zu nmem=%zu nanchor=%zu frames=%zu\n",
-                f.full_tmpl ? f.full_tmpl->start_pc : 0, resume_pc, f.depth,
-                f.snaps.size(),
-                f.mem.size(), f.anchors.size(), frames_.size());
-    }
-}
 
 /*
  * Case (b) fold: serialise the faulting prev into a decoder-visible
@@ -3197,14 +2495,65 @@ BBTemplate *PathBuilder::fold_prev_full_bb(BBTemplate *prev)
  * stash is no longer lost behind a nested handler fault's entry.
  */
 void PathBuilder::classify_fault_enter(const struct qemu_plugin_cpu_event &ev,
-                                       bool *prev_stashed, uint32_t owner_tid)
+                                       bool *prev_emitted, uint32_t owner_tid,
+                                       BodyStreamState *out_stream,
+                                       const StepIn &in)
 {
+    (void)in;
     /* Gated on a non-null deferred prev: post-drop or post-boundary
      * entries are consumed with no action. */
     if (!walk_prev_) {
         return;
     }
     const uint64_t resume = ev.pc;
+
+    /* Take back the aborted attempt's clock bill: a pushed fault always
+     * re-executes its faulting instruction, so the started instructions
+     * at and past the resume index will run (and be billed) again. */
+    auto recredit = [&](const BBTemplate *head, uint64_t resume_pc) {
+        uint64_t started = 0;
+        if (retired_executed_prev(cpu_index_, head, &started)) {
+            uint32_t k = tb_head_insn_index(head, resume_pc);
+            if (k != UINT32_MAX && started > k) {
+                user_clock_fault_recredit(cpu_index_, started - k);
+            } else {
+                g_stats.user_clock_fault_recredit_unplaced++;
+            }
+        } else {
+            g_stats.user_clock_fault_recredit_unmeasured++;
+        }
+    };
+
+    /* Emit [lo, hi) of @tmpl as a SPLIT-EMISSION piece: fault depth = the
+     * walk stamp, terminating branch unresolved (the range never reaches
+     * it), no wrong path.  When the range's last insn is the faulting
+     * self-loop itself (@rep_split), its retired-iteration facts ride the
+     * emission and the fan-out renders them.  Everything the range does
+     * not claim — the aborted attempt's memops, the excluded tail — is
+     * dropped afterwards: it is not an observation of a retired
+     * instruction, and the re-execution delivers it again. */
+    auto emit_piece = [&](BBTemplate *tmpl, uint32_t lo, uint32_t hi,
+                          bool rep_split) {
+        const bool excluded = !g_features.trace_faults && walk_in_sync_;
+        if (out_stream && hi > lo && !excluded) {
+            g_emit_fault_depth = g_features.trace_faults ? walk_depth_ : 0;
+            g_dbg_depth_src = CST_DSRC_PIPELINE;
+            RepArchFacts pf;
+            if (rep_split) {
+                pf = rep_state(cpu_index_).pb_walk_facts;
+            }
+            rep_emit_handoff(cpu_index_, pf);
+            emit_body_entry(out_stream, tmpl, cpu_index_, {},
+                            /*wp_first_tb_unavail=*/false,
+                            /*branch_successor_pc=*/0,
+                            /*branch_successor_known=*/false,
+                            lo, hi, /*thread_end=*/false);
+        }
+        g_mem_recorder.clear_cp(cpu_index_);
+        pending_reg_snaps(cpu_index_).clear();
+        cp_chain_snap_mark(cpu_index_) = 0;
+    };
+
     ptrdiff_t cont = frame_idx_for_resume(resume, ev.asid);
     if (cont >= 0 &&
         tmpl_subrun_pos(frames_[(size_t)cont].full_tmpl, walk_prev_)
@@ -3212,64 +2561,102 @@ void PathBuilder::classify_fault_enter(const struct qemu_plugin_cpu_event &ev,
         cont = -1;
     }
     if (cont < 0) {                                        /* case (a2) */
-        /* Same guards as (a) minus the resume-PC identity: the faulting
-         * TB must be a byte-identical subrun of the frame's template
-         * and the NEW resume PC must lie inside it (a suffix extending
-         * past a force-committed head keeps the old (b) path, so the
-         * frame key never leaves its template).  collect_piece re-keys
-         * the frame and records the new anchor. */
         cont = frame_idx_for_block(walk_prev_, resume, ev.asid);
     }
     if (cont >= 0) {                                  /* case (a) / (a2) */
+        CtxFrame &f = frames_[(size_t)cont];
         g_mutex_lock(&data_lock);
         cp_chain(cpu_index_).reset();
         g_mutex_unlock(&data_lock);
         cst_jump_diag_step(resume, walk_prev_->start_pc, (int)ev.priv, 1,
                            "fault-enter(a)");
-        collect_piece(frames_[(size_t)cont], resume);
-        frames_[(size_t)cont].returned = false;   /* back in flight */
-        *prev_stashed = true;
+        recredit(walk_prev_, resume);
+        uint32_t k1 = UINT32_MAX;
+        if (f.full_tmpl && f.full_tmpl->insn_pcs) {
+            for (uint32_t x = 0; x < f.full_tmpl->n_insns; x++) {
+                if (f.full_tmpl->insn_pcs[x] == resume) {
+                    k1 = x;
+                    break;
+                }
+            }
+        }
+        const RepArchFacts &wfa = rep_state(cpu_index_).pb_walk_facts;
+        const bool rep_split = wfa.pc != 0 && wfa.pc == resume &&
+                               wfa.iters > 0;
+        if (k1 != UINT32_MAX && k1 > f.emitted_to) {
+            /* (a2): the suffix retired [emitted_to, k1) before the new
+             * fault — a mid-excursion continuation of the SAME template.
+             * A faulting self-loop's range includes it (its retired
+             * iterations are real), and the next continuation starts AT
+             * it (the re-execution completes it). */
+            emit_piece(f.full_tmpl, f.emitted_to,
+                       rep_split ? k1 + 1 : k1, rep_split);
+            f.emitted_to = k1;
+        } else if (k1 != UINT32_MAX && rep_split) {
+            /* (a): the same self-loop re-faulted having retired further
+             * iterations mid-piece — publish them; the continuation
+             * cursor stays on the instruction. */
+            emit_piece(f.full_tmpl, k1, k1 + 1, true);
+            f.emitted_to = k1;
+        } else {
+            /* (a): the same instruction re-faulted; nothing retired. */
+            g_mem_recorder.clear_cp(cpu_index_);
+            pending_reg_snaps(cpu_index_).clear();
+        }
+        f.resume_pc = resume;
+        f.returned = false;                       /* back in flight */
+        *prev_emitted = true;
         return;
     }
     /* Case (b) needs the SAME address-space identity check its sibling
-     * lookups make.  frame_idx_for_resume and frame_idx_for_block both
-     * compare asid; tmpl_contains_pc does not, so an event from another
-     * address space whose resume PC happens to fall inside the pinned
-     * walk_prev_ (identical text at identical addresses is the norm — the
-     * same binary, the same shared library, the same kernel) would mint a
-     * CtxFrame stamped with the FOREIGN asid inside the pinned process's
-     * fault depth.  The retention gate now keeps such an event out of the
-     * seal entirely; this enforces the invariant at the consumer too. */
-    if (!*prev_stashed && tmpl_contains_pc(walk_prev_, resume) &&
+     * lookups make (see the retention gate). */
+    if (!*prev_emitted && tmpl_contains_pc(walk_prev_, resume) &&
         ctx_asid_foreign(ev.asid)) {
         g_stats.case_b_frame_asid_mismatch++;
     }
-    if (!*prev_stashed && tmpl_contains_pc(walk_prev_, resume) &&
+    if (!*prev_emitted && tmpl_contains_pc(walk_prev_, resume) &&
         !ctx_asid_foreign(ev.asid)) {                             /* (b) */
         BBTemplate *full_bb = fold_prev_full_bb(walk_prev_);
+        cst_jump_diag_step(resume, walk_prev_->start_pc, (int)ev.priv, 1,
+                           "fault-enter(b)");
+        recredit(walk_prev_, resume);
+        uint32_t K = UINT32_MAX;
+        if (full_bb && full_bb->insn_pcs) {
+            for (uint32_t x = 0; x < full_bb->n_insns; x++) {
+                if (full_bb->insn_pcs[x] == resume) {
+                    K = x;
+                    break;
+                }
+            }
+        }
+        if (K == UINT32_MAX) {
+            /* The resume PC is not in the folded template (a force-
+             * committed incomplete head): no prefix can be named, so
+             * nothing is emitted and no frame opens — the accumulators
+             * are dropped with the unnameable block. */
+            g_mem_recorder.clear_cp(cpu_index_);
+            pending_reg_snaps(cpu_index_).clear();
+            cp_chain_snap_mark(cpu_index_) = 0;
+            *prev_emitted = true;
+            return;
+        }
+        const RepArchFacts &wfb = rep_state(cpu_index_).pb_walk_facts;
+        const bool rep_split = wfb.pc != 0 && wfb.pc == resume &&
+                               wfb.iters > 0;
+        emit_piece(full_bb, 0, rep_split ? K + 1 : K, rep_split);
         g_stats.census_frames_opened++;
         frames_.emplace_back();
         CtxFrame &f = frames_.back();
         f.full_tmpl = full_bb;
         f.asid = ev.asid;
-        /* The depth the faulting BB ran at: prev's promote-time stamp
-         * (NOT this event's depth_after, which is post-entry), plus the
-         * decomposition sidecar — the async component frozen inside it —
-         * so the merge can re-derive the level at completion. */
         f.depth = walk_depth_;
         f.async_in_depth = g_pb_walk_async[pb_vcpu_slot(cpu_index_)];
         f.owner_tp = ev.tp;
         f.owner_tp_ok = ev.tp_ok != 0;
-        /* The excursion belongs to the thread that ran the faulting BB —
-         * @owner_tid is exactly the identity that block is emitted with, so
-         * the frame and its interrupted block agree by construction.  This is
-         * what keeps a peer thread scheduled onto this vCPU during the
-         * excursion at its OWN nesting depth. */
         f.tid = owner_tid;
-        cst_jump_diag_step(resume, walk_prev_->start_pc, (int)ev.priv, 1,
-                           "fault-enter(b)");
-        collect_piece(f, resume);
-        *prev_stashed = true;
+        f.resume_pc = resume;
+        f.emitted_to = K;
+        *prev_emitted = true;
         return;
     }
     /* case (c): consumed, no action. */
@@ -3835,9 +3222,6 @@ void PathBuilder::absorb_events(const StepIn &in)
     if (frames_.size() > g_stats.frames_peak) {
         g_stats.frames_peak = frames_.size();
     }
-    if (susp_stack_.size() > g_stats.susp_stack_peak) {
-        g_stats.susp_stack_peak = susp_stack_.size();
-    }
 
     /* Captured-async OWNERSHIP, from this step's FRESH drain — each event seen
      * exactly once, like the kexc pass above and unlike the retained-event
@@ -3941,6 +3325,57 @@ void PathBuilder::absorb_events(const StepIn &in)
     }
 }
 
+/*
+ * EMIT-AT-DEPARTURE: the pending-seal slot's block is leaving this vCPU's
+ * traced flow (a foreign-ASID dispatch, an abandoned async window with no
+ * departure PC).  It executed; its extent was measured — and its tail
+ * dst snaps captured — by the first dispatch after it (the prologue's
+ * note_prev_extent site), so it is emitted NOW at that extent with its
+ * terminating branch honestly unresolved, instead of being held for a
+ * seal that may never come.  Anything past the emitted range is
+ * unobserved and is dropped with the departure.
+ */
+void PathBuilder::emit_prev_at_departure(const StepIn &in)
+{
+    (void)in;
+    BodyStreamState *out_stream =
+        g_trace_segments.is_active() ? g_trace_segments.body_stream()
+                                     : nullptr;
+    uint64_t executed = 0;
+    bool have = prev_extent(&executed);
+    if (!have && retired_executed_of(cpu_index_, prev_tb_, &executed)) {
+        have = true;
+        if (executed > 0) {
+            executed--;             /* tail snap never captured */
+        }
+    }
+    if (out_stream && have && executed > 0) {
+        CloseWalk cw;
+        cw.head = prev_tb_;
+        cw.have_extent = true;
+        cw.executed = executed;
+        cw.prev_start =
+            qemu_plugin_u64_get(g_scoreboard.prev_start_pc, cpu_index_);
+        cw.set_depth = true;
+        cw.depth = prev_depth_;
+        cw.async_in_depth = g_pb_prev_async[pb_vcpu_slot(cpu_index_)];
+        cw.facts = &rep_state(cpu_index_).pb_prev_facts;
+        close_walk_emit(out_stream, cpu_index_, cw);
+        g_stats.departure_emits++;
+        g_stats.departure_emit_insns += cw.insns_emitted;
+    } else if (have && executed == 0) {
+        /* Nothing of it ran; nothing is owed. */
+    } else {
+        g_stats.departure_extent_unknown++;
+    }
+    g_mem_recorder.clear_cp(cpu_index_);
+    pending_reg_snaps(cpu_index_).clear();
+    cp_chain_snap_mark(cpu_index_) = 0;
+    g_mutex_lock(&data_lock);
+    cp_chain(cpu_index_).reset();
+    g_mutex_unlock(&data_lock);
+}
+
 PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
 {
     /* Only a CONTINUE reaches window management and then step_seal; every
@@ -3965,21 +3400,6 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
      * harder bail between the phases also drops the walk prev the
      * override was meant for. */
     seal_pc_override_ = 0;
-
-    /* One-step hold-off for the resume arrow (Stage 4).  The abandoned-async
-     * no-departure arm suspends the deferred prev and then FALLS THROUGH to
-     * the promote (unlike the foreign-ASID arrow, which returns early).  If
-     * the resume arrow ran on this same step it would immediately re-arm and
-     * seal that just-suspended prev against cur — but the abandoned window
-     * means cur is the OTHER guest thread the scheduler handed this vCPU
-     * (a proper resume would have refetched the departure PC), not prev's
-     * successor, so that seal is the cross-thread taken-edge poisoning the
-     * departure-PC override exists to prevent.  Holding the resume off this
-     * one step lets cur promote fresh and defers the suspended prev to its
-     * TRUE successor's later resume (or the retire-at-return backstop).  Only
-     * the abandoned arm sets it; off the async-recovery path it stays false
-     * and the resume arrow is unchanged (byte-identical). */
-    bool hold_resume_this_step = false;
 
     /* Segment-boundary reg-snap hygiene (Case C).  A change in the segment
      * generation since this thread's last step means the segment just opened
@@ -4131,30 +3551,17 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
                 seal_pc_override_ = async_departure_pc_;
                 async_departure_pc_ = 0;
             } else if (prev_tb_) {
-                /* SUSPEND-OR-SEAL, abandoned-async arrow (plan §1.2,
-                 * Stage 4).  Freeze the deferred prev + its four sinks
-                 * onto the suspension stack, so an inner fault-handler
-                 * level interrupted by an abandoned window seals at ITS
-                 * OWN depth when the pinned context returns, rather than
-                 * being lost.  The abandoned arm falls THROUGH to promote
-                 * cur (the force-closed window's block, which the
-                 * recovery keeps traced — g_capture_mute stayed false),
-                 * so the resume arrow is held off this one step
-                 * (hold_resume_this_step): cur is the other thread, not
-                 * prev's successor, and an immediate resume would seal
-                 * prev against it — exactly the cross-thread taken edge
-                 * the departure-PC seal exists to avoid.  The suspension
-                 * defers to prev's true later resume, or to the
-                 * retire-at-return backstop if it never returns. */
-                suspend_prev(prev_owner_asid_, prev_owner_live_,
-                             in.cpu_index);
+                /* EMIT-AT-DEPARTURE, abandoned-async arrow: the window
+                 * closed with no departure PC, so cur is another guest
+                 * thread and prev's successor can never be resolved.  The
+                 * block executed at its measured extent — emit it now with
+                 * the branch honestly unresolved; nothing is held. */
+                emit_prev_at_departure(in);
                 g_stats.susp_abandoned++;
                 clear_prev();
-                hold_resume_this_step = true;
-                if (pb_diag() || pb_susp_diag()) {
-                    fprintf(stderr, "[pathbuilder] ABANDONED-SUSPEND "
-                            "cur=0x%" PRIx64 " (no departure pc; prev "
-                            "deferred to later resume)\n",
+                if (pb_diag()) {
+                    fprintf(stderr, "[pathbuilder] ABANDONED-DEPARTURE-EMIT "
+                            "cur=0x%" PRIx64 "\n",
                             in.cur ? in.cur->start_pc : 0);
                 }
             }
@@ -4318,48 +3725,25 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
                                 in.cur ? in.cur->n_insns : 0, in.live_priv,
                                 in.live_asid, kexc_exc_entry_, kf);
             }
-            /* SUSPEND-OR-SEAL (plan §1.2).  Freeze the deferred prev + its
-             * four sinks onto the suspension stack instead of dropping
-             * them, so the pinned process's resume seals the interrupted
-             * (fault-handler) block at ITS OWN DEPTH — closing the
-             * syscall_fault_nesting manifestations where the intermediate
-             * level was lost to a DROP (2->1->0 / 0->1->2 instead of 2->0 /
-             * 0->2).  Do NOT retire-at-return here: the frame stays in flight
-             * and completes normally when the suspension resumes; the
-             * retire-at-return backstop covers only the un-resumable tail
-             * (displacement / orphan / stale sweep).  When prev is null there
-             * is nothing to suspend (a second foreign TB in the same span,
-             * prev already cleared) — just clear the accumulators.  Mute the
-             * foreign TB's accesses either way (the step recomputes
-             * g_capture_mute at every dispatch, so the mute self-clears with
-             * the span). */
+            /* EMIT-AT-DEPARTURE (foreign boundary).  The deferred prev is
+             * the pinned process's block and this dispatch belongs to
+             * somebody else: the block departs the traced flow here, so it
+             * is emitted NOW at its measured extent, terminating branch
+             * honestly unresolved — never held for a resume, never
+             * dropped.  When prev is null there is nothing owed — just
+             * clear the accumulators.  Mute the foreign TB's accesses
+             * either way (the step recomputes g_capture_mute at every
+             * dispatch, so the mute self-clears with the span). */
             if (prev_tb_) {
-                suspend_prev(prev_owner_asid_, prev_owner_live_, in.cpu_index);
+                emit_prev_at_departure(in);
             } else {
                 g_mem_recorder.clear_cp(cpu_index_);
                 pending_reg_snaps(cpu_index_).clear();
             }
             g_capture_mute = true;
             clear_prev();
-            return StepStatus::SUSPENDED_FOREIGN;
+            return StepStatus::SUSPENDED;
         }
-    }
-
-    /* Resume arrow (plan §1.3): the pinned process is back at an owned,
-     * non-excluded TB (every gate above passed, so this step will CONTINUE).
-     * Pop the suspension whose (asid, live) matches this resuming context —
-     * restoring the deferred prev + its four frozen sinks — so the promote
-     * below walks the SUSPENDED prev and the seal emits the intermediate
-     * handler level at its own depth.  Off the contention path the stack is
-     * empty and this is a no-op (byte-identical).
-     *
-     * hold_resume_this_step suppresses the pop for the one step where the
-     * abandoned-async arrow just suspended prev and fell through (Stage 4):
-     * cur is the force-closed window's OTHER thread, so resuming prev against
-     * it here would fabricate the cross-thread edge the arm suspended to
-     * avoid — the suspension waits for prev's true successor instead. */
-    if (!susp_stack_.empty() && !hold_resume_this_step) {
-        resume_suspension(in.pinned_asid, in.live_asid);
     }
 
     /* Promote: cur becomes the pending seal; the seal phase walks the
@@ -4377,17 +3761,7 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
     g_dbg_walk_depth_src = g_dbg_prev_depth_src;
     walk_in_sync_ = prev_in_sync_;
     set_prev(in.cur);
-    /* cur's own facts are only readable at the next dispatch. */
-    rep_state(in.cpu_index).pb_prev_facts = RepArchFacts();
-    rep_state(in.cpu_index).pb_prev_facts_armed = true;
-    /* Record cur's owning (thread,asid) so a later foreign span that
-     * suspends this now-deferred prev freezes the RIGHT owner (Stage 3): the
-     * pinned effective asid is the frame-identity key, the live asid the
-     * wide-register per-process discriminator.  A kernel TB under KPTI-off
-     * shares its process's CR3, so live is the owning process there too. */
-    prev_owner_asid_ = in.pinned_asid;
-    prev_owner_live_ = in.live_asid;
-    gap_record_continue(in.live_priv);
+        gap_record_continue(in.live_priv);
     /* CONTINUE hands control to the glue's window management (the shutdown
      * gate, tw_manage_window) before step_seal runs, and that is the ONE
      * window in which walk_prev_ holds a block that has executed and has
@@ -4399,206 +3773,52 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
 }
 
 /*
- * Merge completion: the frame's accumulated prefix is re-injected in
- * front of the suffix's own accumulators (drain attribution walks the
- * full template's insn_pcs in forward monotonic lockstep, so order is
- * load-bearing), the suffix's resolved branch metadata drives the emit
- * on the FULL template, and the frame is retired BEFORE the emit — the
- * synchronous WP walk it kicks must not observe the BB still pending.
- * Trailing seals of the same step keep the frame's depth and empty
- * anchors.
+ * Completion: the just-sealed BB is some frame's resumed suffix.  Under
+ * split emission the frame's prefix is already on the wire, so the
+ * completion emits the suffix as a CONTINUATION — the SAME template_id,
+ * bb_start = the frame's emitted_to cursor (the faulting instruction's
+ * index: the resume re-executes it) — with the seal's resolved branch
+ * and wrong path, then erases the frame.  The trailing seals of the same
+ * step follow unchanged.
  */
 PathBuilder::StepStatus
-PathBuilder::complete_merge(size_t idx,
-                            const std::vector<PendingEmit> &pending_emits,
-                            BodyStreamState *out_stream,
-                            unsigned int cpu_index)
+PathBuilder::complete_continuation(size_t idx,
+                                   const std::vector<PendingEmit> &pending_emits,
+                                   BodyStreamState *out_stream,
+                                   unsigned int cpu_index)
 {
     gap_merge_probe();
-    /* faults=0: the synchronous-fault handler excursion is excluded, but the
-     * merge still runs so a fault-split interrupted block reassembles whole.
-     * A frame at depth >= 1 is a NESTED fault's interrupted HANDLER block —
-     * excluded like the handler's other blocks; drop it (its prefix was
-     * capture-muted, so its buffers are empty) and discard the resume suffix's
-     * accumulators.  A depth-0 frame is the top-level interrupted block: emit
-     * it whole, its pre-fault prefix re-injected ahead of the resume suffix,
-     * but with NO fault anchors and depth clamped to 0 — a faults=0 trace
-     * carries no depth>0 entries.  Wrong-path stays on: it is ordinary
-     * correct-path code.  (The faults=1 machinery below — deeper-frame flush,
-     * anchor guard — is bypassed entirely, so it stays byte-identical.) */
-    if (!g_features.trace_faults) {
-        CtxFrame &f0 = frames_[idx];
-        if (f0.depth >= 1) {
-            g_stats.census_frames_faults0_dropped++;
-            frames_.erase(frames_.begin() + (ptrdiff_t)idx);
-            g_mem_recorder.clear_cp(cpu_index_);
-            pending_reg_snaps(cpu_index_).clear();
-            return StepStatus::MERGED;
-        }
-        const PendingEmit &pe0 = pending_emits.front();
-        if (g_features.reg_data && f0.full_tmpl) {
-            uint64_t expected = 0;
-            for (uint32_t i = 0; i < f0.full_tmpl->n_insns; i++) {
-                expected += f0.full_tmpl->insn_fields[i].n_dst_regs;
-            }
-            size_t have = f0.snaps.size() + pending_reg_snaps(cpu_index_).size();
-            if (have > expected && f0.snaps.size() <= expected) {
-                size_t excess = have - expected;
-                if (excess <= pending_reg_snaps(cpu_index_).size()) {
-                    pending_reg_snaps(cpu_index_).erase(
-                        pending_reg_snaps(cpu_index_).begin(),
-                        pending_reg_snaps(cpu_index_).begin() + (ptrdiff_t)excess);
-                }
-            }
-        }
-        g_mem_recorder.prepend_cp(cpu_index_, f0.mem);
-        if (!f0.snaps.empty()) {
-            pending_reg_snaps(cpu_index_).insert(pending_reg_snaps(cpu_index_).begin(),
-                                     f0.snaps.begin(), f0.snaps.end());
-        }
-        if (pe0.bb_tmpl && f0.full_tmpl && pe0.bb_tmpl->taken_pc) {
-            g_mutex_lock(&data_lock);
-            f0.full_tmpl->taken_pc = pe0.bb_tmpl->taken_pc;
-            g_mutex_unlock(&data_lock);
-        }
-        g_emit_fault_depth = 0;
-        g_dbg_depth_src = CST_DSRC_MERGE_ZERO;
-        g_emit_fault_anchors.clear();
-        BBTemplate *merged0 = f0.full_tmpl;
-        uint64_t merge_wrong0 = pb_no_fault_wp() ? 0 : pe0.wrong_target;
-        /* The resume suffix is this step's walked prev, so its facts are
-         * the walk snapshot; the frame carries the pre-fault prefix.  Read
-         * before the erase invalidates f0. */
-        const RepArchFacts walk0 = rep_state(cpu_index).pb_walk_facts;
-        uint64_t pre_i0 = 0, pre_m0 = 0;
-        std::vector<std::pair<uint64_t, uint64_t>> pieces0;
-        if (f0.rep_pre_pc != 0 && f0.rep_pre_pc == walk0.pc) {
-            pre_i0 = f0.rep_pre_iters;
-            pre_m0 = f0.rep_pre_memops;
-            pieces0 = std::move(f0.rep_pieces);
-        }
-        g_stats.census_frames_merged++;
-        frames_.erase(frames_.begin() + (ptrdiff_t)idx);
-        rep_emit_handoff(cpu_index, walk0, pre_i0, pre_m0,
-                         std::move(pieces0));
-        emit_finalized_bb(out_stream, merged0, pe0.branch_pc,
-                          pe0.emit_current_pc, merge_wrong0, cpu_index);
-        for (size_t i = 1; i < pending_emits.size(); i++) {
-            const PendingEmit &pe2 = pending_emits[i];
-            rep_emit_handoff(cpu_index, rep_state(cpu_index).pb_walk_facts);
-            emit_finalized_bb(out_stream, pe2.bb_tmpl, pe2.branch_pc,
-                              pe2.emit_current_pc, pe2.wrong_target, cpu_index);
-        }
-        return StepStatus::MERGED;
-    }
 
-    /* Retire-at-return backstop (deferred from Stage 0, landed now that
-     * completion is (thread,asid)-scoped — Stage 2).  @idx was picked by
-     * frame_idx_for_completion under the asid key, so it is unambiguously
-     * THIS process's completing frame — and that scoped pick is what makes
-     * the flush below safe (the Stage-0 hazard was an ambiguous @idx: flushing
-     * deeper than a mis-picked foreign frame could erase another process's
-     * live excursion).  Any frame still in flight that nests DEEPER (a higher
-     * stack index; frames_ is push / fault-nesting order) has leaked: inner
-     * faults unwind before their outer under strict LIFO, so a deeper frame
-     * surviving to this completion means its own resume suffix was lost /
-     * never sealed under contention.  Emit each inner (depth >= 1) frame's
-     * level now, deepest-first, BEFORE the outer frame's merged BB, so the
-     * unwind steps down one level at a time (2->1->0) instead of collapsing
-     * straight to the outer's depth (2->0 — the syscall_fault_nesting jump
-     * retire_prev_frame cannot reach, because the leaked frame's suffix never
-     * passed through a suspension).  Depth >= 1 mirrors retire_prev_frame:
-     * a depth-0 (user) frame is the unwind floor and never anchors a >1 jump,
-     * and emitting user code standalone would degrade an entry the content
-     * oracle validates.
-     *
-     * The deeper frames are NOT filtered on CtxFrame::asid equality: frames_
-     * only ever holds the pinned process's own excursions (a foreign TB's
-     * prev is dropped before classification can stash it), but a KERNEL
-     * fault's event-stamped asid is whatever mm happens to be loaded at the
-     * fault instant — under multi-process churn routinely another task's
-     * (the same reason kexc ownership exists: live ASID is not ownership for
-     * kernel code).  An equality filter here would skip exactly the pinned
-     * process's own leaked handler frames (observed: the depth-1 kernel frame
-     * stamped with a churn CR3, its level then lost to a 2->0 jump).  A stamp
-     * mismatch is reported as a diagnostic, same demotion as the completion
-     * byte guard.  flush_frame_unwound erases index i > idx, which never
-     * shifts @idx, so the reference below stays valid; its own anchor guard
-     * drops any level it cannot place without an anchor-at-unwind
-     * violation. */
-    if (out_stream) {
-        const uint64_t complete_asid = frames_[idx].asid;
+    /* Leaked deeper ledger entries of the SAME thread: strict LIFO says an
+     * inner excursion unwinds before its outer, so a deeper same-tid frame
+     * surviving to this completion lost its own continuation (its suffix
+     * never sealed).  It holds nothing emittable — its prefix reached the
+     * wire at its fault — so it is simply retired from the ledger, keeping
+     * the depth count honest.  A peer thread's frame is a concurrent
+     * excursion, not an inner one, and stays. */
+    {
         const uint32_t complete_tid = frames_[idx].tid;
-        for (size_t i = frames_.size(); i-- > idx + 1; ) {
-            if (frames_[i].depth < 1) {
-                continue;
-            }
-            /* Ownership IS filtered, unlike the asid stamp below: "deeper on
-             * the stack" only means "nested inside" within ONE guest thread.
-             * A peer thread's frame sitting above this one on the shared
-             * per-vCPU ledger is a concurrent excursion, not an inner one —
-             * flushing it here would emit that thread's level into the
-             * completing thread's stream, fabricating the very depth jump the
-             * flush exists to prevent.  It stays for its own unwind. */
-            if (frames_[i].tid != complete_tid) {
+        for (size_t i2 = frames_.size(); i2-- > idx + 1; ) {
+            if (frames_[i2].tid != complete_tid) {
                 g_stats.depth_tid_deeper_spared++;
                 continue;
             }
-            if (pb_diag() && frames_[i].asid != complete_asid) {
-                fprintf(stderr, "[pathbuilder] DIAG deeper-flush asid stamp "
-                        "drift (non-behavioral): frame full=0x%" PRIx64
-                        " depth=%u asid=0x%" PRIx64 " vs completing asid=0x%"
-                        PRIx64 "\n",
-                        frames_[i].full_tmpl ? frames_[i].full_tmpl->start_pc
-                                             : 0,
-                        frames_[i].depth, frames_[i].asid, complete_asid);
-            }
-            flush_frame_unwound(i, out_stream, cpu_index);
+            /* Fate ledger: a leaked ledger entry retired with nothing to
+             * emit (its prefix is already on the wire). */
+            g_stats.census_frames_unwound_dropped++;
+            frames_.erase(frames_.begin() + (ptrdiff_t)i2);
         }
     }
+
     CtxFrame &f = frames_[idx];
     const PendingEmit &pe = pending_emits.front();
     if (pb_diag()) {
-        fprintf(stderr, "[pathbuilder] EMIT full=0x%" PRIx64 " fsnaps=%zu "
-                "suffsnaps=%zu nmem=%zu "
-                "branch_pc=0x%" PRIx64 " cur=0x%" PRIx64 " wrong=0x%" PRIx64
-                " frames=%zu\n",
-                f.full_tmpl ? f.full_tmpl->start_pc : 0, f.snaps.size(),
-                pending_reg_snaps(cpu_index_).size(), f.mem.size(),
+        fprintf(stderr, "[pathbuilder] CONTINUATION full=0x%" PRIx64
+                " start=%u branch_pc=0x%" PRIx64 " cur=0x%" PRIx64
+                " wrong=0x%" PRIx64 " frames=%zu\n",
+                f.full_tmpl ? f.full_tmpl->start_pc : 0, f.emitted_to,
                 pe.branch_pc, pe.emit_current_pc, pe.wrong_target,
                 frames_.size());
-    }
-    /* Discard any leaked prefix in the resume suffix's pending snaps before
-     * prepending the frame.  When a sync-fault handler abandons a chain on a
-     * TB discontinuity, the chain assembler drops its fragments but its
-     * already-captured dst snaps stay in pending_reg_snaps (no async-suspend
-     * or segment-edge clear runs on the sync-fault path), landing at the
-     * FRONT of pending — ahead of this resume suffix's own snaps.  The frame
-     * prefix (f.snaps, captured at stash and equal to the faulting BB's
-     * pre-fault dsts) is authoritative, so any excess over the merged
-     * template's Σ n_dst_regs is exactly that leaked front; trim it, keeping
-     * the suffix's real snaps.  Without this the merged entry over-counts and
-     * the emit-time backstop drops the whole entry's reg-data — this recovers
-     * the correct positional attribution instead. */
-    if (g_features.reg_data && f.full_tmpl) {
-        uint64_t expected = 0;
-        for (uint32_t i = 0; i < f.full_tmpl->n_insns; i++) {
-            expected += f.full_tmpl->insn_fields[i].n_dst_regs;
-        }
-        size_t have = f.snaps.size() + pending_reg_snaps(cpu_index_).size();
-        if (have > expected && f.snaps.size() <= expected) {
-            size_t excess = have - expected;
-            if (excess <= pending_reg_snaps(cpu_index_).size()) {
-                pending_reg_snaps(cpu_index_).erase(
-                    pending_reg_snaps(cpu_index_).begin(),
-                    pending_reg_snaps(cpu_index_).begin() + (ptrdiff_t)excess);
-            }
-        }
-    }
-    g_mem_recorder.prepend_cp(cpu_index_, f.mem);
-    if (!f.snaps.empty()) {
-        pending_reg_snaps(cpu_index_).insert(pending_reg_snaps(cpu_index_).begin(),
-                                 f.snaps.begin(), f.snaps.end());
     }
     /* The faulting BB and its resuming suffix share the terminal branch,
      * so they share its resolved static target. */
@@ -4607,43 +3827,11 @@ PathBuilder::complete_merge(size_t idx,
         f.full_tmpl->taken_pc = pe.bb_tmpl->taken_pc;
         g_mutex_unlock(&data_lock);
     }
-    /* Anchor guard on the merge emit (mirrors flush_frame_unwound's guard,
-     * plan §1.4 — the safety net against a depth-JUMP / anchor-at-unwind
-     * trade).  A merged (fault-anchored) entry must land at its excursion's
-     * unwind — its same-tid predecessor strictly DEEPER.  Under multi-process
-     * kernel-fault interleave a frame can be created off the pinned process's
-     * shared-kernel deferred prev by ANOTHER task's fault (a kernel event's
-     * asid stamp is not ownership — the Stage-2 finding) and then completed by
-     * the pinned process via the kernel-content path, with the excursion's
-     * deeper handler blocks never traced in the pinned stream
-     * (g_last_emit_fault_depth <= f.depth).  Emitting it anchored at f.depth
-     * then fabricates the residual depth-0 merge (anch=[0] at depth 0 whose
-     * predecessor is also depth 0) or a >1 depth JUMP.  When the deeper
-     * predecessor is absent, emit the faulting BB as a PLAIN block clamped to
-     * the predecessor's depth (no anchor, no jump) — the honest
-     * representation of a fault whose excursion the pinned stream did not see.
-     * Byte-inert off the contention path: a genuine nested fault's handler
-     * emits deeper first, so the guard never triggers (g_last_emit > f.depth).
-     * The deeper-frame flush above may have just emitted the true deeper
-     * predecessor, in which case g_last_emit is deep and the anchor stays. */
-    /* Emission-time depth.  f.depth froze the captured-async level in force
-     * when the faulting block EXECUTED; the completing execution (the resume
-     * suffix that just sealed) ran under the level in force NOW, and this
-     * emission's wire position is here — so the merged entry carries the
-     * frame's SYNCHRONOUS component plus the owner's async level at
-     * completion.  A window that opened across the excursion (level 0 at the
-     * fault, 1 at the merge) otherwise emits the merge BELOW the depth-1
-     * tail that follows it — the merge-before-tail 2->0 jump; a window that
-     * closed across it otherwise emits ABOVE the tail.  Byte-identical
-     * whenever the two levels agree, which is every excursion no captured
-     * window edge crosses. */
+    /* Emission-time depth: the frame's SYNCHRONOUS component plus the
+     * owner's async level at completion (a captured window opening or
+     * closing across the excursion moves the staircase the wire walks). */
     uint32_t f_async_create = f.async_in_depth ? 1u : 0u;
     if (f_async_create > f.depth) {
-        /* Unreachable by construction — every writer of the stamp writes the
-         * sidecar with it (segment open, the walk promotion, suspend/resume,
-         * the abandon release) — but a silent unsigned wrap here would put a
-         * garbage depth on the wire, so the impossible case is counted
-         * rather than assumed away. */
         g_stats.merge_async_decomp_invalid++;
         f_async_create = f.depth;
     }
@@ -4656,548 +3844,40 @@ PathBuilder::complete_merge(size_t idx,
     } else if (f_async_now < f_async_create) {
         g_stats.merge_async_level_dropped++;
     }
-    /* User-content clamp, mirroring stamp_cur_depth's: a user block is never
-     * handler content, so a merged USER frame emits at 0 exactly as its
-     * pipeline neighbours do.  (Unreachable with the level addition in
-     * practice — a user resume suffix's own step abandons or return-closes
-     * the window one step before its merge completes — but the clamp makes
-     * the wire convention provable rather than argued.) */
     if (f.full_tmpl && !f.full_tmpl->is_system) {
-        eff_depth = 0;
+        eff_depth = 0;              /* a user block is never handler content */
+    }
+    if (!g_features.trace_faults) {
+        eff_depth = 0;              /* faults=0 carries no depth>0 entries */
     }
     if (depth3_render_off()) {
-        eff_depth = f.depth;            /* measurement arm: frozen stamp */
+        eff_depth = f.depth;        /* measurement arm: frozen stamp */
     }
-    if ((pb_diag() || pb_depth_diag()) && eff_depth != f.depth) {
-        fprintf(stderr, "[pathbuilder] MERGE-LEVEL-MOVED full=0x%" PRIx64
-                " f.depth=%u (async_in=%u) -> eff=%u (async_now=%u)\n",
-                f.full_tmpl ? f.full_tmpl->start_pc : 0, f.depth,
-                f_async_create, eff_depth, f_async_now);
-    }
-    if (last_emit_fault_depth(cpu_index_) > eff_depth) {
-        g_emit_fault_depth = eff_depth;
-        g_dbg_depth_src = CST_DSRC_MERGE;
-        g_emit_fault_anchors = f.anchors;
-    } else {
-        g_emit_fault_depth = last_emit_fault_depth(cpu_index_);
-        g_dbg_depth_src = CST_DSRC_MERGE_PLAIN;
-        g_emit_fault_anchors.clear();
-        if (pb_diag() || pb_susp_diag()) {
-            fprintf(stderr, "[pathbuilder] MERGE-DEANCHOR full=0x%" PRIx64
-                    " f.depth=%u eff=%u last_emit=%u nanchor=%zu (no deeper "
-                    "predecessor; emit plain)\n",
-                    f.full_tmpl ? f.full_tmpl->start_pc : 0, f.depth,
-                    eff_depth, last_emit_fault_depth(cpu_index_), f.anchors.size());
-        }
-    }
-    BBTemplate *merged = f.full_tmpl;
-    uint64_t merge_wrong = pb_no_fault_wp() ? 0 : pe.wrong_target;
-    /* Self-loop facts for the merged entry: the resume suffix (this step's
-     * walked prev) supplies the completing execution, the frame supplies
-     * the pre-fault prefix.  Read before the erase invalidates f. */
-    const RepArchFacts walkf = rep_state(cpu_index).pb_walk_facts;
-    uint64_t pre_i = 0, pre_m = 0;
-    std::vector<std::pair<uint64_t, uint64_t>> pieces;
-    if (f.rep_pre_pc != 0 && f.rep_pre_pc == walkf.pc) {
-        pre_i = f.rep_pre_iters;
-        pre_m = f.rep_pre_memops;
-        pieces = std::move(f.rep_pieces);
-    }
+    g_emit_fault_depth = eff_depth;
+    g_dbg_depth_src = CST_DSRC_MERGE;
+
+    BBTemplate *full = f.full_tmpl;
+    uint32_t cont_start = f.emitted_to < full->n_insns ? f.emitted_to
+                                                       : full->n_insns;
+    uint64_t cont_wrong = pb_no_fault_wp() ? 0 : pe.wrong_target;
     g_stats.census_frames_merged++;
-    frames_.erase(frames_.begin() + idx);
-    rep_emit_handoff(cpu_index, walkf, pre_i, pre_m, std::move(pieces));
-    emit_finalized_bb(out_stream, merged, pe.branch_pc,
-                      pe.emit_current_pc, merge_wrong, cpu_index);
-    g_emit_fault_anchors.clear();
+    frames_.erase(frames_.begin() + (ptrdiff_t)idx);
+    rep_emit_handoff(cpu_index, rep_state(cpu_index).pb_walk_facts);
+    emit_finalized_bb(out_stream, full, pe.branch_pc,
+                      pe.emit_current_pc, cont_wrong, cpu_index, cont_start);
     for (size_t i = 1; i < pending_emits.size(); i++) {
         const PendingEmit &pe2 = pending_emits[i];
         rep_emit_handoff(cpu_index, rep_state(cpu_index).pb_walk_facts);
         emit_finalized_bb(out_stream, pe2.bb_tmpl, pe2.branch_pc,
                           pe2.emit_current_pc, pe2.wrong_target, cpu_index);
     }
-    return StepStatus::MERGED;
+    return StepStatus::SEALED;
 }
 
-/*
- * Unwind flush (see the header): retire an inner fault frame AT ITS RETURN by
- * emitting its merged faulting BB standalone — the frame's own template, at
- * its own fault depth + anchors, from its OWN accumulated memop / reg-snap
- * buffers — then erasing it.  Used when the frame's resume suffix (the block
- * whose seal would complete the merge) is DROPPED or never seals under host
- * contention, so its depth level is emitted at the unwind rather than lost
- * and collapsed into a >1 depth jump.  No wrong-path, and the terminal branch
- * is left unresolved (the suffix that resolves it is gone), like the
- * segment-final flush.
- *
- * The current CP memop / pending reg-snap accumulators hold the block being
- * sealed THIS step (the outer frame's resume suffix, still pending), so they
- * are set aside and restored around the frame's own emit.
- *
- * Anchor-at-unwind guard: an anchored (merged) entry must follow a strictly
- * DEEPER one (syscall_fault_nesting).  If this thread's last-emitted depth is
- * not strictly greater than the frame's, emitting here would fabricate that
- * violation (the unwind already stepped past this level, or the predecessor
- * is not this frame's handler) — so the frame is dropped WITHOUT emit.  Its
- * merged BB is lost, but no anchor/step violation is introduced: depth is
- * already at or below this level, so no >1 jump opens either.
- */
-void PathBuilder::flush_frame_unwound(size_t idx, BodyStreamState *out_stream,
-                                      unsigned int cpu_index)
-{
-    CtxFrame f = std::move(frames_[idx]);
-    frames_.erase(frames_.begin() + (ptrdiff_t)idx);
 
-    if (!out_stream || !f.full_tmpl) {
-        /* Erased with nothing emitted.  Silent before this census: the
-         * frame's executed prefix goes with it and no row said so. */
-        g_stats.census_frames_unwound_dropped++;
-        return;
-    }
-    /* Emission-time depth, same re-derivation as the merge (see
-     * complete_merge): the frame's synchronous component plus the owner's
-     * async level at THIS emission's position. */
-    uint32_t uf_async_create = f.async_in_depth ? 1u : 0u;
-    if (uf_async_create > f.depth) {
-        g_stats.merge_async_decomp_invalid++;   /* see complete_merge */
-        uf_async_create = f.depth;
-    }
-    const uint32_t uf_async_now =
-        (async_captured_ && async_owner_ok_ && f.owner_tp_ok &&
-         f.owner_tp == async_owner_tp_) ? 1u : 0u;
-    uint32_t eff_depth = f.depth - uf_async_create + uf_async_now;
-    if (uf_async_now > uf_async_create) {
-        g_stats.merge_async_level_gained++;
-    } else if (uf_async_now < uf_async_create) {
-        g_stats.merge_async_level_dropped++;
-    }
-    /* User-content clamp, exactly as complete_merge applies it: a user block
-     * is never handler content, and format.rst 4.2a makes that absolute, so
-     * the level re-derivation may never raise a user frame off zero. */
-    if (f.full_tmpl && !f.full_tmpl->is_system) {
-        eff_depth = 0;
-    }
-    if (depth3_render_off()) {
-        eff_depth = f.depth;            /* measurement arm: frozen stamp */
-    }
-    if (!(last_emit_fault_depth(cpu_index_) > eff_depth)) {
-        if (pb_diag()) {
-            fprintf(stderr, "[pathbuilder] UNWIND-FLUSH-SKIP full=0x%" PRIx64
-                    " depth=%u eff=%u last_emit_depth=%u (anchor guard)\n",
-                    f.full_tmpl->start_pc, f.depth, eff_depth,
-                    last_emit_fault_depth(cpu_index_));
-        }
-        /* THE FRAME IS ALREADY ERASED AND NOTHING WAS EMITTED.  The
-         * anchor guard is a deliberate trade — an anchored entry with no
-         * strictly deeper predecessor would fabricate a depth violation —
-         * but it is still a DROP of the excursion's executed prefix, and
-         * it used to be counted as census_frames_unwound_emitted, a fate
-         * the ledger documents as "put its prefix on the wire".  A named
-         * fate that is itself a drop makes the fate identity balance while
-         * the instructions are gone, which is the exact shape the census
-         * exists to make impossible. */
-        g_stats.census_frames_unwound_guard_dropped++;
-        g_stats.census_frames_unwound_guard_insns +=
-            census_frame_prefix_insns(f);
-        return;
-    }
-    g_stats.census_frames_unwound_emitted++;
 
-    /* Set the current block's accumulators aside; emit from the frame's own. */
-    std::vector<WPMemAccess> cur_mem;
-    g_mem_recorder.take_cp(cpu_index_, cur_mem);
-    std::vector<RegSnap> cur_snaps = std::move(pending_reg_snaps(cpu_index_));
-    pending_reg_snaps(cpu_index_).clear();
 
-    g_mem_recorder.prepend_cp(cpu_index_, f.mem);
-    pending_reg_snaps(cpu_index_) = f.snaps;
-    g_emit_fault_depth = eff_depth;
-    g_dbg_depth_src = CST_DSRC_UNWIND;
-    g_emit_fault_anchors = f.anchors;
 
-    if (pb_diag() || pb_depth_diag()) {
-        fprintf(stderr, "[pathbuilder] UNWIND-FLUSH full=0x%" PRIx64 " depth=%u "
-                "eff=%u nanchor=%zu nmem=%zu pred_depth=%u frames_left=%zu\n",
-                f.full_tmpl->start_pc, f.depth, eff_depth, f.anchors.size(),
-                f.mem.size(), last_emit_fault_depth(cpu_index_), frames_.size());
-    }
-
-    /* Suffix-less emission: every retired iteration is prefix (the resume
-     * suffix is gone), so hand the whole prefix through the pre_* seam and
-     * publish zero suffix iterations.  The piece table pairs each middle
-     * piece's aborted-attempt surplus onto its own faulted iteration; the
-     * LAST piece's surplus has no re-execution on this wire and is
-     * (correctly) never rendered.  The delivered stream is complete for
-     * the n_iter it renders, so this is not a memop mismatch. */
-    RepArchFacts unwound_facts;
-    unwound_facts.pc = f.rep_pre_pc;
-    unwound_facts.iters = 0;
-    rep_emit_handoff(cpu_index, unwound_facts, f.rep_pre_iters,
-                     f.rep_pre_memops, std::move(f.rep_pieces));
-    emit_body_entry(out_stream, f.full_tmpl, cpu_index, {});
-
-    g_emit_fault_anchors.clear();
-    g_emit_fault_depth = 0;
-
-    /* Restore the current block's accumulators (emit drained them). */
-    g_mem_recorder.clear_cp(cpu_index_);
-    g_mem_recorder.prepend_cp(cpu_index_, cur_mem);
-    pending_reg_snaps(cpu_index_) = std::move(cur_snaps);
-}
-
-/*
- * AN OPEN FAULT FRAME IS HOLDING INSTRUCTIONS THE GUEST RAN.
- *
- * A FAULT_ENTER stashes the faulting block whole into frames_ and waits for
- * its FAULT_RETURN: the merge then puts the block on the wire exactly once,
- * prefix and resume suffix reassembled.  user_clock_fault_recredit's comment
- * states that premise in as many words — "the merge puts the faulting block
- * on the wire exactly once, whole".  When the SEGMENT CLOSES before the
- * return, the merge never runs, the premise is simply false, and the frame
- * dies at the next on_segment_open's orphan drop taking its executed
- * pre-fault prefix with it.  The window clock billed that prefix at the very
- * next dispatch, so the loss surfaces as clock_minus_wire > 0 — measured
- * deterministically on aarch64 (3 instructions of a 9-instruction user block,
- * 10/10 budgets) and on riscv64 (1 and 5, by where the demand fault lands),
- * and NOT visible at all for a kernel frame, which the user-only residual
- * cannot see.  Neither needs SMP, and neither needs the stall ceiling: any
- * close route reaches this.
- *
- * The prefix is emitted here, at the close, from the frame's OWN accumulated
- * memop / reg-snap buffers, and the frame is erased.
- *
- * TRUNCATED, which is what separates this from flush_frame_unwound.  That
- * flush emits the frame's template WHOLE, and is right to: it fires when a
- * frame's resume suffix was DROPPED, so the guest did execute the rest and
- * the whole block is the honest record.  At a close the suffix has not run
- * at all — the segment ended inside the handler — so the block is emitted at
- * exactly the extent that retired: up to the instruction the handler would
- * have resumed on, which is by construction the first one that did NOT
- * retire.  (The single exception is a self-loop that faulted MID-INSTRUCTION:
- * its own retired iterations are real, so it is kept and published through
- * the pre-iteration seam, the same way the unwind flush does.)
- *
- * DEEPEST FRAME FIRST, mirroring complete_merge's deeper-frame flush: the
- * entries then step down one fault level at a time from the handler blocks
- * already on the wire (2 -> 1 -> 0) instead of collapsing to the outermost
- * frame's depth.  No anchors are published: an anchor marks a faulting
- * instruction INSIDE a reassembled block, and a prefix that stops before its
- * faulting instruction contains none.  The terminal branch is unresolved and
- * no wrong path is forked, like every other close-time emission.
- */
-void PathBuilder::flush_frames_at_close(BodyStreamState *out_stream,
-                                        unsigned int cpu_index)
-{
-    if (frames_.empty() || close_frames_falsifier()) {
-        return;
-    }
-    if (!out_stream) {
-        /* Nowhere to put them: the segment has no body stream, so this IS a
-         * drop and nothing here can undo it.  Say so rather than returning
-         * a quiet zero — and charge it to the discard gate, because the
-         * clear() below is exactly what makes the post-flush occupancy
-         * census read a satisfied zero over it. */
-        g_stats.close_frames_unflushable += frames_.size();
-        g_stats.close_holder_discarded += frames_.size();
-        for (const CtxFrame &fr : frames_) {
-            g_stats.close_holder_discarded_insns +=
-                census_frame_prefix_insns(fr);
-        }
-        frames_.clear();
-        return;
-    }
-
-    /* The block being sealed by the close's own walk owns the live
-     * accumulators; the frames emit from theirs. */
-    std::vector<WPMemAccess> cur_mem;
-    g_mem_recorder.take_cp(cpu_index_, cur_mem);
-    std::vector<RegSnap> cur_snaps = std::move(pending_reg_snaps(cpu_index_));
-    pending_reg_snaps(cpu_index_).clear();
-
-    while (!frames_.empty()) {
-        CtxFrame f = std::move(frames_.back());
-        frames_.pop_back();
-        if (!f.full_tmpl || !f.full_tmpl->insn_pcs) {
-            g_stats.close_frame_prefix_unplaced++;
-            g_stats.close_holder_discarded++;
-            continue;
-        }
-        /* Where the handler would have resumed IS the extent: a pushed
-         * fault always re-executes its faulting instruction, so that
-         * instruction and everything after it did not retire. */
-        uint32_t ran = UINT32_MAX;
-        for (uint32_t k = 0; k < f.full_tmpl->n_insns; k++) {
-            if (f.full_tmpl->insn_pcs[k] == f.resume_pc) {
-                ran = k;
-                break;
-            }
-        }
-        if (ran == UINT32_MAX) {
-            /* The resume PC is not one of the block's instructions, so no
-             * extent can be named and emitting any of it would be a guess.
-             * This must not happen; it has its own must-be-0 row. */
-            g_stats.close_frame_prefix_unplaced++;
-            g_stats.close_holder_discarded++;
-            continue;
-        }
-        /* A self-loop that faulted part-way through its OWN iterations
-         * retired those iterations, so the faulting instruction is kept and
-         * its retired count published through the pre-iteration seam. */
-        const bool rep_split = f.rep_pre_iters > 0 &&
-                               f.rep_pre_pc == f.resume_pc;
-        uint32_t take = rep_split ? ran + 1 : ran;
-        if (take == 0) {
-            /* The fault landed on the block's first instruction: nothing of
-             * it retired, so there is nothing to emit and nothing is lost. */
-            g_stats.close_frames_empty_prefix++;
-            continue;
-        }
-        BBTemplate *pfx = nullptr;
-        g_mutex_lock(&data_lock);
-        BBTemplate *frag = f.full_tmpl;
-        pfx = g_template_store.commit_partial_bb(frag->start_pc, &frag, 1,
-                                                 take);
-        g_mutex_unlock(&data_lock);
-        if (!pfx) {
-            g_stats.close_frame_prefix_unplaced++;
-            g_stats.close_holder_discarded++;
-            g_stats.close_holder_discarded_insns += take;
-            continue;
-        }
-
-        /* Emission depth: the frame's own, with the same async-component
-         * re-derivation the merge and the unwind flush apply, and the same
-         * absolute user-content clamp (format.rst §4.2a — a user block is
-         * never handler content). */
-        uint32_t cf_async_create = f.async_in_depth ? 1u : 0u;
-        if (cf_async_create > f.depth) {
-            g_stats.merge_async_decomp_invalid++;
-            cf_async_create = f.depth;
-        }
-        const uint32_t cf_async_now =
-            (async_captured_ && async_owner_ok_ && f.owner_tp_ok &&
-             f.owner_tp == async_owner_tp_) ? 1u : 0u;
-        uint32_t eff_depth = f.depth - cf_async_create + cf_async_now;
-        if (!pfx->is_system) {
-            eff_depth = 0;
-        }
-        if (depth3_render_off()) {
-            eff_depth = f.depth;
-        }
-
-        g_mem_recorder.prepend_cp(cpu_index_, f.mem);
-        pending_reg_snaps(cpu_index_) = f.snaps;
-        g_emit_fault_depth = eff_depth;
-        g_dbg_depth_src = CST_DSRC_UNWIND;
-        g_emit_fault_anchors.clear();
-
-        if (pb_diag() || pb_depth_diag()) {
-            fprintf(stderr, "[pathbuilder] CLOSE-FRAME-FLUSH full=0x%" PRIx64
-                    " n=%u ran=%u take=%u depth=%u eff=%u sys=%d "
-                    "frames_left=%zu\n",
-                    f.full_tmpl->start_pc, f.full_tmpl->n_insns, ran, take,
-                    f.depth, eff_depth, (int)pfx->is_system, frames_.size());
-        }
-
-        RepArchFacts close_facts;
-        if (rep_split) {
-            close_facts.pc = f.rep_pre_pc;
-            close_facts.iters = 0;
-            rep_emit_handoff(cpu_index, close_facts, f.rep_pre_iters,
-                             f.rep_pre_memops, std::move(f.rep_pieces));
-        } else {
-            rep_emit_handoff(cpu_index, close_facts);
-        }
-        emit_body_entry(out_stream, pfx, cpu_index, {});
-
-        g_emit_fault_depth = 0;
-        g_mem_recorder.clear_cp(cpu_index_);
-        pending_reg_snaps(cpu_index_).clear();
-
-        g_stats.close_frames_flushed++;
-        g_stats.close_frame_insns_recovered += take;
-        if (pfx->is_system) {
-            g_stats.close_frame_sys_insns_recovered += take;
-        } else {
-            g_stats.close_frame_user_insns_recovered += take;
-        }
-    }
-
-    /* Put the closing walk's own accumulators back. */
-    g_mem_recorder.clear_cp(cpu_index_);
-    g_mem_recorder.prepend_cp(cpu_index_, cur_mem);
-    pending_reg_snaps(cpu_index_) = std::move(cur_snaps);
-}
-
-/*
- * A deferred prev is about to be discarded without resuming (the
- * retire-at-return tail: an over-cap displacement or a stale sweep past its
- * owner's return).  If that prev is an in-flight INNER fault frame's resume
- * suffix, its seal would have completed the merge — retiring that frame at
- * its return.  Discarding it silently is exactly what leaks the frame under
- * contention (it lingers un-returned, inflating every later fault's depth
- * until a coarse sweep collapses it: the residual 2->0 / kernel 2->0->2
- * depth jump).  Retire it now instead, emitting its depth level at the
- * unwind.  Only inner (depth>=1, kernel-handler) frames flush: a depth-0
- * (user) frame is the unwind floor — it can never anchor a >1 jump — and
- * emitting user code standalone would degrade a user entry the content
- * oracle validates.
- */
-void PathBuilder::retire_prev_frame(BBTemplate *prev, uint64_t seal_asid,
-                                    unsigned int cpu_index)
-{
-    if (!g_features.fault_depth_trailer || pb_no_merge() ||
-        !prev || frames_.empty()) {
-        return;
-    }
-    BodyStreamState *out_stream =
-        g_trace_segments.is_active() ? g_trace_segments.body_stream() : nullptr;
-    if (!out_stream) {
-        return;
-    }
-    /* The retired prev is the pinned process's OWN block, so it is matched
-     * within its (thread,asid): seal_asid is the pinned effective asid. */
-    ptrdiff_t ci = frame_idx_for_completion(prev, seal_asid);
-    if (ci >= 0 && frames_[(size_t)ci].depth >= 1) {
-        flush_frame_unwound((size_t)ci, out_stream, cpu_index);
-    }
-}
-
-/*
- * Suspend-or-seal (Stage 3, plan §1.2).  Freeze the deferred prev and its
- * four thread-local sinks (committed CP memops, per-insn dst snaps, the
- * in-flight chain prefix, and the depth stamp) onto susp_stack_, keyed on
- * the OWNING (asid, live) captured at the block's promote.  The caller
- * guarantees prev_tb_ != nullptr.  Over the SUSP_STACK_CAP bound the OLDEST
- * suspension falls back to retire-at-return (Decision A): flush its fault
- * level now and evict it to make room, so the stack stays bounded and no
- * depth level is silently lost to displacement.
- */
-void PathBuilder::suspend_prev(uint64_t owner_asid, uint64_t owner_live,
-                               unsigned int cpu_index)
-{
-    if (susp_stack_.size() >= SUSP_STACK_CAP) {
-        retire_suspension(0, cpu_index);        /* oldest -> retire-at-return */
-        susp_stack_.erase(susp_stack_.begin());
-        g_stats.susp_displaced++;
-    }
-    susp_stack_.emplace_back();
-    SuspendedPrev &s = susp_stack_.back();
-    s.prev = prev_tb_;
-    s.depth = prev_depth_;
-    /* Freeze prev's extent measurement with it (see SuspendedPrev::extent);
-     * the suspending dispatch's own prologue is what recorded it. */
-    s.extent = prev_extent_;
-    s.extent_valid = prev_extent_valid_;
-    s.async_in_depth = g_pb_prev_async[pb_vcpu_slot(cpu_index)];
-    s.asid = owner_asid;
-    s.owner_live = owner_live;
-    g_mem_recorder.take_cp(cpu_index_, s.mem);              /* drains the CP buffer */
-    s.snaps = std::move(pending_reg_snaps(cpu_index_));
-    pending_reg_snaps(cpu_index_).clear();
-    s.snap_mark = cp_chain_snap_mark(cpu_index_);
-    cp_chain_snap_mark(cpu_index_) = 0;     /* the sink is empty again */
-    s.chain = cp_chain(cpu_index_).detach_state();
-    s.rep_facts = rep_state(cpu_index).pb_prev_facts;
-    g_stats.susp_pushed++;
-    g_dbg_susp = susp_stack_.size();
-    cst_jump_diag_step(0, s.prev ? s.prev->start_pc : 0, -1, 1, "SUSPEND");
-    if (pb_diag() || pb_susp_diag()) {
-        fprintf(stderr, "[pathbuilder] SUSPEND prev=0x%" PRIx64 " depth=%u "
-                "asid=0x%" PRIx64 " live=0x%" PRIx64 " nmem=%zu nsnaps=%zu "
-                "stack=%zu\n",
-                s.prev ? s.prev->start_pc : 0, s.depth, s.asid, s.owner_live,
-                s.mem.size(), s.snaps.size(), susp_stack_.size());
-    }
-}
-
-/*
- * The resume arrow (plan §1.3).  The pinned process is back at an owned,
- * non-excluded TB (all gates passed).  Pop the top-most suspension whose
- * owning asid matches the resuming context's pinned effective asid and
- * re-arm the four sinks so the promote below walks the suspended prev and
- * the seal emits the intermediate handler block AT ITS OWN DEPTH.
- *
- * The match keys ONLY on the pinned effective asid (StepIn::pinned_asid, the
- * dwell tag on narrow-ASID targets) — the load-bearing Stage-2 finding: a
- * kept KERNEL block's LIVE asid is whatever mm is loaded (a PTI overlay, a
- * TLB-maintenance scratch), NOT ownership, so gating the resume on live asid
- * strands the pinned process's own kernel-handler suspensions un-resumable
- * (observed: a kept kernel block promoted under a 0x...d2000 overlay never
- * matches the pinned 0x...c4000).  Cross-process safety in trace-all is the
- * COMPLETION path's job (frame_matches_completion keys user frames on the
- * hard asid and kernel frames on content), not the resume re-arm's.  Returns
- * true iff a suspension was restored.
- */
-bool PathBuilder::resume_suspension(uint64_t resume_asid, uint64_t resume_live)
-{
-    (void)resume_live;                           /* diagnostic only; see above */
-    for (size_t i = susp_stack_.size(); i-- > 0; ) {
-        SuspendedPrev &s = susp_stack_[i];
-        if (s.asid != resume_asid) {
-            continue;
-        }
-        prev_tb_ = s.prev;                       /* re-arm the pending seal */
-        prev_depth_ = s.depth;
-        /* ...and the answer to "how much of it ran", which the promote
-         * below carries to the seal walk.  Without this the walk had no
-         * measurement for a resumed prev and folded it whole. */
-        prev_extent_ = s.extent;
-        prev_extent_valid_ = s.extent_valid;
-        g_pb_prev_async[pb_vcpu_slot(cpu_index_)] = s.async_in_depth;
-        rep_state(cpu_index_).pb_prev_facts = s.rep_facts;
-        rep_state(cpu_index_).pb_prev_facts_armed = false;
-        g_dbg_prev_depth_src = CST_PDSRC_RESUME;
-        g_dbg_prev_depth = prev_depth_;
-        prev_owner_asid_ = s.asid;
-        prev_owner_live_ = s.owner_live;
-        g_mem_recorder.prepend_cp(cpu_index_, s.mem);        /* restore committed memops */
-        if (!s.snaps.empty()) {                  /* restore per-insn snaps */
-            pending_reg_snaps(cpu_index_).insert(pending_reg_snaps(cpu_index_).begin(),
-                                     s.snaps.begin(), s.snaps.end());
-        }
-        /* The restored snaps go to the FRONT, so the chain's share of them
-         * is still the leading @snap_mark — whatever the sink had picked up
-         * meanwhile now sits behind them and belongs to no chain yet. */
-        cp_chain_snap_mark(cpu_index_) = s.snap_mark;
-        cp_chain(cpu_index_).attach_state(std::move(s.chain));
-        cst_jump_diag_step(0, prev_tb_ ? prev_tb_->start_pc : 0, -1, 1,
-                           "RESUME");
-        if (pb_diag() || pb_susp_diag()) {
-            fprintf(stderr, "[pathbuilder] RESUME prev=0x%" PRIx64 " depth=%u "
-                    "asid=0x%" PRIx64 " live=0x%" PRIx64 " stack=%zu\n",
-                    prev_tb_ ? prev_tb_->start_pc : 0, prev_depth_,
-                    resume_asid, resume_live, susp_stack_.size() - 1);
-        }
-        susp_stack_.erase(susp_stack_.begin() + (ptrdiff_t)i);
-        g_stats.susp_resumed++;
-        return true;
-    }
-    return false;
-}
-
-/*
- * Retire a held suspension without resuming it — the "suspend couldn't cover
- * this" tail (over-cap displacement; a stale sweep past its owner's return).
- * Emit its fault level via retire_prev_frame (keyed on its own owning asid,
- * anchor-guarded so it can never trade a depth-JUMP for an anchor-at-unwind
- * violation), draining the frozen accumulators back so the flush emits from
- * them, then leave the entry for the caller to erase.
- */
-void PathBuilder::retire_suspension(size_t idx, unsigned int cpu_index)
-{
-    SuspendedPrev &s = susp_stack_[idx];
-    /* retire_prev_frame -> flush_frame_unwound emits from the FRAME's own
-     * buffers and save/restores the LIVE accumulators around its emit, so the
-     * suspension's frozen mem/snaps need not be re-injected; only prev + its
-     * owning asid drive the frame match. */
-    retire_prev_frame(s.prev, s.asid, cpu_index);
-    if (pb_diag() || pb_susp_diag()) {
-        fprintf(stderr, "[pathbuilder] SUSP-RETIRE prev=0x%" PRIx64 " depth=%u "
-                "asid=0x%" PRIx64 " stack=%zu\n",
-                s.prev ? s.prev->start_pc : 0, s.depth, s.asid,
-                susp_stack_.size());
-    }
-}
 
 /*
  * Stamp the depth cur (already promoted by step_events) runs at, and with it
@@ -5418,7 +4098,7 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
                  *   with no action, exactly the pre-event-stream
                  *   behaviour (same rule as the successor override
                  *   above). */
-                if (fault_on && !pb_no_merge()) {
+                if (fault_on) {
                     /* Same predicate object as the retention gate's arm
                      * (b) — async_window_interior(), not a second copy of
                      * the rule.  Two independent spellings of "is this
@@ -5432,14 +4112,15 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
                         if (async_captured_) {
                             g_stats.fault_enter_classified_in_win++;
                         }
-                        classify_fault_enter(ev, &prev_stashed, in.walk_tid);
+                        classify_fault_enter(ev, &prev_stashed, in.walk_tid,
+                                             out_stream, in);
                     } else {
                         g_stats.fault_enter_skipped_in_async++;
                     }
                 }
             } else if (ev.kind == QEMU_PLUGIN_CPU_EV_FAULT_RETURN) {
                 raw_depth_ = ev.depth_after;
-                if (fault_on && !pb_no_merge()) {
+                if (fault_on) {
                     apply_fault_return(ev);
                 }
             }
@@ -5521,30 +4202,6 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
                     }
                 }
                 f.returned = true;
-            }
-            /* One-line summary: a user TB retiring >1 un-returned frame at
-             * once is exactly the residual 2->0 leak-drain discontinuity. */
-            if ((pb_diag() || pb_depth_diag()) && leaked > 1) {
-                fprintf(stderr, "[pathbuilder] RETIRE-LEAK-BURST user_tb=0x%"
-                        PRIx64 " count=%u (inflight drops %u->0)\n",
-                        in.cur ? in.cur->start_pc : 0, leaked, leaked);
-            }
-            /* Suspension stale sweep (Stage 3, Decision A "stale-sweep retire
-             * while held").  This pinned USER TB proves the process is at
-             * fault-nesting depth 0, and the resume arrow already ran in
-             * step_events — so any suspension STILL held for THIS process's
-             * (asid, live) reached user privilege without resuming (its owner
-             * took a different path than the suspended continuation).  It can
-             * no longer reseal; retire it at its depth (anchor-guarded) so its
-             * level is not silently lost, then drop it.  Only this process's
-             * suspensions are touched — a peer process's held suspension stays
-             * for its own resume. */
-            for (size_t i = susp_stack_.size(); i-- > 0; ) {
-                if (susp_stack_[i].asid == in.pinned_asid) {
-                    retire_suspension(i, in.cpu_index);
-                    susp_stack_.erase(susp_stack_.begin() + (ptrdiff_t)i);
-                    g_stats.susp_stale_retired++;
-                }
             }
         }
         /* interrupts=1 abandoned-window recovery: a pinned USER TB proves the
@@ -5706,7 +4363,6 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
         g_dbg_async_captured = seal_async_lvl;
         g_dbg_depth_next = depth_next_;
         g_dbg_frames = frames_.size();
-        g_dbg_susp = susp_stack_.size();
         /* Skip the pure user/steady-state (depth 0, no frames, prev depth 0)
          * UNLESS the current TB is a REP string op (rep_subtmpl), whose
          * fanned-out emit is the residual jump's locus: keep every step that
@@ -5752,9 +4408,11 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
                        prev_stashed ? "seal/STASHED" : "seal");
 
     if (prev_stashed) {
-        /* prev was folded into a fault frame: nothing seals, and the
-         * step skips the deferred window closes. */
-        return StepStatus::STASHED;
+        /* prev's executed prefix (or a mid-excursion continuation) was
+         * EMITTED by the classification: the walk has nothing further to
+         * seal, and nothing is held — the step counts as sealed, so the
+         * deferred window closes may run. */
+        return StepStatus::SEALED;
     }
 
     /* ---- process_tb: the shared seal walk ---- */
@@ -5819,7 +4477,13 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
             sink.assign(all.begin() + (ptrdiff_t)lo,
                         all.begin() + (ptrdiff_t)hi);
             rep_emit_handoff(in.cpu_index, rep_state(in.cpu_index).pb_walk_facts);
-            emit_body_entry(out_stream, c.bb_tmpl, in.cpu_index, {});
+            emit_body_entry(out_stream, c.bb_tmpl, in.cpu_index, {},
+                            /*wp_first_tb_unavail=*/false,
+                            /*branch_successor_pc=*/0,
+                            /*branch_successor_known=*/false,
+                            /*bb_start=*/0,
+                            /*bb_stop=*/c.bb_tmpl->n_insns,
+                            /*thread_end=*/false);
             sink.clear();
         }
         sink.assign(all.begin() + (ptrdiff_t)pos, all.end());
@@ -5843,7 +4507,7 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
     /* The seal runs on the pinned process's live context; its effective asid
      * (in.pinned_asid) is the (thread,asid) key completion matches on. */
     ptrdiff_t mtop = -1;
-    if (fault_on && !pb_no_merge() && any_finalize && !pending_emits.empty()) {
+    if (fault_on && any_finalize && !pending_emits.empty()) {
         mtop = frame_idx_for_completion(pending_emits.front().bb_tmpl,
                                         in.pinned_asid);
     }
@@ -5852,10 +4516,10 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
                 mtop, frames_.size());
     }
     if (mtop >= 0) {
-        StepStatus st = complete_merge((size_t)mtop, pending_emits, out_stream,
-                                       in.cpu_index);
-        /* The merge just RETIRED this excursion's frames.  cur is the block
-         * the pinned process runs AFTER the faulting BB reassembled, so it
+        StepStatus st = complete_continuation((size_t)mtop, pending_emits,
+                                              out_stream, in.cpu_index);
+        /* The completion just RETIRED this excursion's frames.  cur is the
+         * block the pinned process runs AFTER the excursion closed, so it
          * is at the post-unwind depth — re-stamp it (see stamp_cur_depth). */
         stamp_cur_depth(in, /*post_merge=*/true);
         return st;

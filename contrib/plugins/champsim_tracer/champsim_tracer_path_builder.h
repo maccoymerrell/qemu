@@ -87,30 +87,47 @@ bool collect_finalized_bbs(unsigned int cpu_index,
                            std::vector<CutEmit> &cut_emits);
 
 /* Run the WP simulator (if armed) and emit one finalized BB's BodyEntry.
+ * @bb_start is the entry's declared range start: 0 for an ordinary seal,
+ * the resume index for a fault continuation (same template, bb_start =
+ * index(resume_pc); §4.2a).  The range always runs to the template's end
+ * — a seal resolves the terminating branch, which is the last insn.
  * Caller holds exec_lock; must NOT hold data_lock. */
 void emit_finalized_bb(BodyStreamState *out_stream,
                        BBTemplate *bb_tmpl,
                        uint64_t prev_last,
                        uint64_t current_pc,
                        uint64_t wrong_target,
-                       unsigned int cpu_index);
+                       unsigned int cpu_index,
+                       uint32_t bb_start = 0);
 
 /* Build a BodyEntry from the calling thread's CP memop/reg-snap
- * accumulators (draining them) and write it to @out_stream.  @wp_entries
- * is moved in.  @wp_first_tb_unavail marks a kicked excursion whose
- * first wrong-path target could not be fetched/translated (so
- * @wp_entries is empty); the writer emits it as a chain-level
- * CST_WP_EVENT_TRANSLATION_UNAVAIL event (docs/format.rst
- * §4.4).  Caller holds exec_lock; data_lock is NOT held.  Used by
- * PathBuilder::flush_final, which emits without branch resolution or WP
- * (unlike emit_finalized_bb above). */
+ * accumulators (draining them FOR THE DECLARED RANGE) and write it to
+ * @out_stream.  @wp_entries is moved in.  @wp_first_tb_unavail marks a
+ * kicked excursion whose first wrong-path target could not be
+ * fetched/translated (so @wp_entries is empty); the writer raises
+ * CST_BB_FLAG_WP_FIRST_TARGET_UNAVAIL on the CP block record
+ * (docs/format.rst §4.4).
+ *
+ * @bb_start / @bb_stop declare the executed range [bb_start, bb_stop) of
+ * @bb_tmpl's instructions this entry FULLY OBSERVED (§4.2a) — REQUIRED,
+ * no default: every call site states its range, [0, n_insns) for a
+ * whole-block run.  The CP memop drain takes only memops attributed
+ * inside the range and leaves the rest for the continuation entry;
+ * billing (covered / wire arch-insn counters) advances by the range's
+ * width, never the template's.  @thread_end marks the context's final
+ * entry of the segment (CST_BB_FLAG_THREAD_END).
+ *
+ * Caller holds exec_lock; data_lock is NOT held. */
 void emit_body_entry(BodyStreamState *out_stream,
                      BBTemplate *bb_tmpl,
                      unsigned int cpu_index,
                      std::vector<WPBBEntry> wp_entries,
-                     bool wp_first_tb_unavail = false,
-                     uint64_t branch_successor_pc = 0,
-                     bool branch_successor_known = false);
+                     bool wp_first_tb_unavail,
+                     uint64_t branch_successor_pc,
+                     bool branch_successor_known,
+                     uint32_t bb_start,
+                     uint32_t bb_stop,
+                     bool thread_end = false);
 
 /* CP-step accumulators owned by champsim_tracer.cc.  PathBuilder moves
  * them into / out of its frames (the stash and the merge re-injection)
@@ -155,12 +172,10 @@ enum CstDepthSrc : uint8_t {
     CST_DSRC_UNWIND,         /* flush_frame_unwound at f.depth              */
     CST_DSRC_FLUSH_FINAL,    /* segment-final flush                         */
 };
-/* Provenance of prev_depth_ / walk_depth_, so a restored suspension's frozen
- * stamp is distinguishable from a freshly computed one. */
+/* Provenance of prev_depth_ / walk_depth_. */
 enum CstPrevDepthSrc : uint8_t {
     CST_PDSRC_NONE = 0,
     CST_PDSRC_SEAL,          /* computed from frames_ at this step's seal   */
-    CST_PDSRC_RESUME,        /* restored from a SuspendedPrev's frozen stamp*/
 };
 /* PROCESS-WIDE, deliberately NOT thread_local.  The plugin is dlopen'd, so
  * its whole TLS block comes out of glibc's static-TLS surplus (1664 B); the
@@ -188,9 +203,6 @@ void cst_jump_diag_step(uint64_t cur_pc, uint64_t prev_pc, int priv,
 /* Raise the online assertion for an emit at @depth (no-op unless gated). */
 void cst_jump_diag_emit(uint64_t seq, uint32_t tid, uint64_t pc,
                         uint32_t depth, int is_sys, size_t n_anchors);
-/* Transfer register like g_emit_fault_depth (same one-step lifetime,
- * same safety argument). */
-extern thread_local std::vector<uint32_t> g_emit_fault_anchors CST_TLS_HOT;
 /* Tail-insn dst snaps awaiting their BB's emission.  Captured during a
  * TB's body, drained at that vCPU's NEXT CP step — a lifetime that
  * crosses dispatches, so it must be keyed by vCPU, not by host thread
@@ -246,20 +258,8 @@ void census_note_prev_promote(void);
  */
 extern uint64_t g_promote_seq;
 
-/* CST_NO_TRUNC falsifier: is the named walk's truncation disabled?  See
- * truncation_falsifier_mask() in champsim_tracer_path_builder.cc.  True only
- * in a deliberately falsified arm — never in a capture run. */
-bool trunc_falsifier_close(void);
-bool trunc_falsifier_seal(void);
-
-/* CST_NO_SEAL_STASH falsifier: is the deferred-seal extent stash disabled?
- * True only in a deliberately falsified arm — never in a capture run. */
-bool seal_stash_falsifier(void);
 /* CST_SEALEXT: per-seal diagnostic print for unanswered extent questions. */
 bool seal_extent_diag(void);
-/* CST_NO_CLOSE_FRAMES falsifier: is the close-time fault-frame flush
- * disabled?  True only in a deliberately falsified arm. */
-bool close_frames_falsifier(void);
 
 /* Index of @pc among the instructions of the dispatched TB whose head is
  * @head (fragments walked in execution order), or UINT32_MAX. */
@@ -274,133 +274,42 @@ void user_clock_fault_recredit(unsigned int cpu_index, uint64_t insns);
  * ---- PathBuilder proper ----
  */
 
-/* One in-flight fault excursion: the faulting BB whose pieces are being
- * set aside until its resume suffix seals.  Frame identity comes from
- * the FAULT_ENTER event ({resume_pc, asid} stamped at the fault
- * instant — so a page-fault handler rewriting the MMU context register
- * mid-excursion cannot drift the key), and @returned records the frame's
- * FAULT_RETURN event — the completion is still fired by the resume
- * suffix's SEAL, one or more TB steps later.  (The foreign-ASID
- * suspend-or-seal arrow freezes the deferred prev in a SuspendedPrev
- * instead of dropping it, so a frame never loses chain state.
- * SuspendedPrev keys on this SAME (thread,asid): susp_.asid =
- * StepIn::pinned_asid at suspend time, and a resume requires the resuming
- * TB's effective asid to match — the identical key frame_idx_for_completion
- * uses, so a suspension cannot be resumed cross-process.) */
-/* One suspended deferred-prev: the four thread-local sinks the seal phase
- * consumes, frozen atomically across a foreign-ASID span (plan §1.1) so the
- * pinned process's resume seals the interrupted block at its own depth
- * instead of the block being DROPPED and its fault level lost (the
- * manifestation-2/3 fix).  Keyed on the OWNING (thread,asid): @asid is the
- * pinned effective asid (StepIn::pinned_asid) sampled at the block's promote
- * — the Stage-2 frame-identity key (the dwell tag on narrow-ASID targets) —
- * and @owner_live is the live asid the block executed under (a wide-register
- * per-process discriminator: a constant marker pin cannot tell two owned
- * x86 processes apart, but their CR3s can).  A resume requires BOTH to
- * match, so a suspension can never be restored into a foreign context. */
-struct SuspendedPrev {
-    BBTemplate *prev = nullptr;         /* the deferred prev block; its seal
-                                         * emits the intermediate level */
-    uint32_t depth = 0;                 /* prev's promote-time depth stamp */
-    uint8_t async_in_depth = 0;         /* the captured-async component (0/1)
-                                         * frozen inside @depth, carried so the
-                                         * decomposition survives suspension
-                                         * (the abandon-release re-stamp needs
-                                         * to know whether a resumed stamp
-                                         * still holds a released level) */
-    uint64_t asid = 0;                  /* owning pinned effective asid */
-    uint64_t owner_live = 0;            /* owning live asid (wide discriminator) */
-    std::vector<WPMemAccess> mem;       /* prev's committed CP memops */
-    std::vector<RegSnap> snaps;         /* prev's per-insn dst snaps */
-    size_t snap_mark = 0;               /* how many of @snaps, from the front,
-                                         * belong to @chain's fragments — the
-                                         * sink and the chain are frozen
-                                         * together, so their correspondence
-                                         * must be frozen with them */
-    BBChainAssembler::ChainState chain; /* in-flight chain prefix (page-split BB) */
-    RepArchFacts rep_facts;             /* prev's self-loop facts, frozen with
-                                         * it: the per-callback latch will
-                                         * describe other TBs by the time this
-                                         * suspension seals */
-    /* HOW MUCH OF @prev RAN, frozen with it.
-     *
-     * The measurement is taken at the first dispatch after prev — which IS
-     * the foreign/async dispatch that suspends it, whose prologue runs
-     * before any gate can bail the step — and it lives in the live
-     * prev_extent_ slot.  clear_prev() then files it under seal_prev_ and
-     * invalidates the live one, and resume_suspension used to restore
-     * prev_tb_ WITHOUT it: the promote that followed carried an invalid
-     * measurement, the seal walk declared the extent unknown, and the fold
-     * claimed prev's full translated length on no evidence.  Measured on
-     * x86_64 -smp 2 as "seal walks with an unknown extent" tracking
-     * suspend-or-seal prev resumed one for one across 12 cells, and as a
-     * clock_minus_wire of -3 (the wire OVER-claiming) in one of them. */
-    uint64_t extent = 0;
-    bool extent_valid = false;
-};
-
+/* One in-flight fault excursion — an IDENTITY AND DEPTH LEDGER ENTRY,
+ * nothing more.  Under split emission the interrupted block's executed
+ * prefix went on the wire AT THE FAULT (classify_fault_enter emits
+ * [0, k) the moment the FAULT_ENTER classifies), so a frame holds no
+ * memops, no reg snaps, no piece tables: it records only WHICH block is
+ * awaiting its continuation and at what depth, so the resumed suffix can
+ * be emitted as the SAME template with bb_start = index(resume_pc), and
+ * so the depth pipeline can count the thread's un-returned excursions.
+ * Frame identity comes from the FAULT_ENTER event ({resume_pc, asid}
+ * stamped at the fault instant); @returned records the FAULT_RETURN —
+ * the continuation is still fired by the resume suffix's SEAL, one or
+ * more TB steps later. */
 struct CtxFrame {
     BBTemplate *full_tmpl = nullptr;   /* the faulting BB's full template */
     uint64_t asid = 0;                 /* event-stamped owning address space;
-                                        * the (thread,asid) match key for
-                                        * resume / block / completion — and,
-                                        * Stage 3, suspend/resume */
+                                        * the (thread,asid) completion key */
     uint64_t resume_pc = 0;            /* faulting insn = where ERET lands */
     uint32_t depth = 0;                /* depth the faulting BB ran at */
     uint8_t async_in_depth = 0;        /* the captured-async component (0/1)
-                                        * frozen inside @depth at the stamp.
-                                        * The merge emits at the frame's
-                                        * SYNCHRONOUS depth plus the owner's
-                                        * async level AT COMPLETION — a
-                                        * captured window opening or closing
-                                        * across the excursion moves the
-                                        * staircase the wire walks, and the
-                                        * merged entry must land on it (see
-                                        * complete_merge) */
+                                        * frozen inside @depth at the stamp;
+                                        * the continuation emits at the
+                                        * frame's SYNCHRONOUS depth plus the
+                                        * owner's async level AT COMPLETION */
     /* The OWNING thread's raw thread pointer at the frame's FAULT_ENTER
-     * (the event's own delivery-instant stamp, ev.tp/ev.tp_ok — exception
-     * entry does not move the identity registers, so it names the faulting
-     * thread).  The emission-time async-level re-derivation compares this
-     * against the window owner, which is tp-keyed: the frame may emit from
-     * a step whose CURRENT context is already another thread's (a switch
-     * step's seal, an unwind at a user TB), so the step's own cur_tp cannot
-     * stand in for the frame's. */
+     * (the event's own delivery-instant stamp) — the async-level
+     * re-derivation compares this against the window owner. */
     uint64_t owner_tp = 0;
     bool owner_tp_ok = false;
-    uint32_t tid = 0;                  /* OWNING guest thread: the identity
-                                        * the faulting BB is emitted with.
-                                        * frames_ is per-vCPU, but a vCPU
-                                        * multiplexes guest threads, so an
-                                        * excursion belongs to the thread that
-                                        * entered it — a peer thread scheduled
-                                        * on the same vCPU is at its own
-                                        * nesting depth (format.rst §4.2a:
-                                        * fault_depth is the depth THIS basic
-                                        * block executed at) */
-    bool returned = false;             /* FAULT_RETURN observed, seal pending */
-    std::vector<WPMemAccess> mem;      /* accumulated memops (insn_pc-keyed) */
-    std::vector<RegSnap> snaps;        /* accumulated reg snaps (insn order) */
-    std::vector<uint32_t> anchors;     /* faulting-insn indices in full_tmpl */
-    /* Fault-split self-loop prefix: when the faulting instruction IS a REP
-     * (resume_pc == its pc), the iterations its partial execution retired
-     * and the REP memops it delivered before the fault, accumulated across
-     * pieces (a movsb spanning two never-touched pages faults twice).  The
-     * merge adds the resume suffix's iterations for the architectural total
-     * and uses the memop count to pair the re-delivered partial iteration
-     * onto the iteration that faulted. */
-    uint64_t rep_pre_pc = 0;
-    uint64_t rep_pre_iters = 0;
-    uint64_t rep_pre_memops = 0;
-    /* Per-piece breakdown of the same prefix, in fault order: one
-     * (iterations retired, REP memops delivered) pair per collect_piece
-     * call.  The totals above are the sums; the emit-time partition needs
-     * the boundaries because each piece's aborted-attempt surplus belongs
-     * to the iteration that faulted at THAT piece's end, not to the last
-     * faulted iteration — with the totals alone a multi-piece split
-     * mis-pairs every iteration after the first fault (measured:
-     * cst_runs/x86close, pc_mf_movsb).  Size = number of mid-instruction
-     * faults this REP took (1 for the common demand fault). */
-    std::vector<std::pair<uint64_t, uint64_t>> rep_pieces;
+    uint32_t tid = 0;                  /* OWNING guest thread (format.rst
+                                        * §4.2a: fault_depth is per-thread) */
+    bool returned = false;             /* FAULT_RETURN observed */
+    /* How many instructions of @full_tmpl this excursion has already put
+     * on the wire — the next continuation's bb_start.  Starts at the
+     * first fault's prefix length; a case-(a2) later fault advances it
+     * past the mid-suffix continuation it emits. */
+    uint32_t emitted_to = 0;
 };
 
 class PathBuilder {
@@ -511,12 +420,12 @@ public:
      * next normally-sealed step). */
     enum class StepStatus {
         CONTINUE,         /* step_events: proceed to window mgmt + seal */
-        SUSPENDED,        /* async window open: prev untouched, TB dropped */
-        SUSPENDED_FOREIGN,/* foreign ASID: prev SUSPENDED onto the stack for
-                           * the pinned process's resume */
-        STASHED,          /* prev folded into a fault frame; nothing seals */
+        SUSPENDED,        /* async mute window open / foreign ASID: the
+                           * TB is not traced.  A held prev was either
+                           * kept (async: the resume seals it against its
+                           * real target) or emitted at its measured
+                           * extent (foreign: emit-at-departure). */
         NO_SEAL,          /* no previous context / no BB completed */
-        MERGED,           /* a fault frame completed and emitted */
         SEALED,           /* normal seal + emit path ran to completion */
     };
 
@@ -689,7 +598,6 @@ public:
     }
     const BBTemplate *seal_prev_block() const { return seal_prev_; }
     bool live_prev_extent_valid() const { return prev_extent_valid_; }
-    size_t susp_depth() const { return susp_stack_.size(); }
 
     /* The pending-seal slot (the deferred prev TB); read by the blkwatch
      * exec print in vcpu_tb_exec's shared prologue. */
@@ -725,11 +633,9 @@ public:
      * deferred route); ignored otherwise. */
     void flush_final(bool walk_prev = true, bool prev_in_flight = false);
 
-    /* Does this builder hold ANYTHING a close would have to drain?  The
-     * peer-flush loop used to ask only about the pending-seal slot, so a
-     * peer holding open fault frames, a suspension, an in-flight chain or a
-     * captured reg-snap sink behind an EMPTY slot was skipped whole — and
-     * with it flush_frames_at_close, which no other path reaches. */
+    /* Does this builder hold anything a close would have to drain — a
+     * pending-seal slot with retired instructions, an in-flight chain, or
+     * per-vCPU accumulator content? */
     bool holds_close_work() const;
 
     /* Is a close landing BETWEEN step_events and step_seal, i.e. with the
@@ -807,9 +713,14 @@ private:
     bool kexc_kernel_tb_keep(const StepIn &in);
     void kexc_reset();
     /* @owner_tid is StepIn::walk_tid: a frame opened here is the deferred
-     * prev's excursion, so the thread that ran that block owns it. */
+     * prev's excursion, so the thread that ran that block owns it.  Under
+     * split emission this EMITS the interrupted block's executed prefix
+     * (or a mid-excursion continuation) to @out_stream the moment the
+     * event classifies, and keeps only a ledger frame. */
     void classify_fault_enter(const struct qemu_plugin_cpu_event &ev,
-                              bool *prev_stashed, uint32_t owner_tid);
+                              bool *prev_emitted, uint32_t owner_tid,
+                              BodyStreamState *out_stream,
+                              const StepIn &in);
     void apply_fault_return(const struct qemu_plugin_cpu_event &ev);
     ptrdiff_t frame_idx_for_resume(uint64_t resume_pc, uint64_t asid) const;
     ptrdiff_t frame_idx_for_block(const BBTemplate *piece, uint64_t resume,
@@ -829,52 +740,24 @@ private:
                                          uint64_t seal_asid);
     ptrdiff_t frame_idx_for_completion(const BBTemplate *suffix,
                                        uint64_t seal_asid) const;
-    void collect_piece(CtxFrame &f, uint64_t resume_pc);
     BBTemplate *fold_prev_full_bb(BBTemplate *prev);
-    StepStatus complete_merge(size_t idx,
-                              const std::vector<PendingEmit> &pending_emits,
-                              BodyStreamState *out_stream,
-                              unsigned int cpu_index);
-    /* Unwind flush: emit frames_[idx]'s merged faulting BB at its own
-     * fault depth + anchors, using the frame's OWN accumulated buffers
-     * (the current CP / reg-snap accumulators are saved and restored), no
-     * wrong-path, unresolved terminal branch — then erase the frame.  This
-     * retires an inner fault frame AT ITS RETURN when its resume suffix was
-     * dropped / never sealed under host contention, so its depth level is
-     * emitted (the interrupted BB carries the depth it ran at) instead of
-     * being collaterally lost and collapsed into a >1 depth jump.  Guarded
-     * against an anchor-at-unwind violation via g_last_emit_fault_depth.
-     * Caller holds exec_lock; data_lock is NOT held. */
-    void flush_frame_unwound(size_t idx, BodyStreamState *out_stream,
-                             unsigned int cpu_index);
-    /* Segment close: emit the EXECUTED PREFIX of every fault frame still in
-     * flight, deepest frame first, and erase them.  Unlike
-     * flush_frame_unwound this truncates the frame's full template at the
-     * faulting instruction — at a close the suffix has not run, so emitting
-     * the whole block would claim instructions the guest never executed.
-     * Called from flush_final on every close route; see the definition.
-     * Caller holds exec_lock; data_lock is NOT held. */
-    void flush_frames_at_close(BodyStreamState *out_stream,
-                               unsigned int cpu_index);
-    /* Segment close: emit every SUSPENDED deferred prev — the block, its
-     * frozen CP memops, its frozen per-insn dst snaps and chain mark, its
-     * frozen in-flight chain and its frozen self-loop facts — at the extent
-     * frozen with it, most-recent (deepest) first, and empty the stack.
-     * No close route touched susp_stack_ before this; its only exits were a
-     * resume, an over-cap displacement, a stale sweep and the next segment
-     * open's orphan drop, and the two middle ones emit the FRAME whose
-     * resume suffix the prev is, never the suspension's own contents.
-     * Caller holds exec_lock; data_lock is NOT held. */
-    void flush_suspensions_at_close(BodyStreamState *out_stream,
-                                    unsigned int cpu_index);
+    /* Completion: the just-sealed suffix matched frames_[idx].  Emit it as
+     * a CONTINUATION of the frame's full template — SAME template_id,
+     * bb_start = the frame's emitted_to cursor — with the seal's resolved
+     * branch, then erase the frame.  The trailing pending_emits follow
+     * unchanged. */
+    StepStatus complete_continuation(size_t idx,
+                                     const std::vector<PendingEmit> &pending_emits,
+                                     BodyStreamState *out_stream,
+                                     unsigned int cpu_index);
+
 
     /* The one close-time walk-and-emit.  Folds @a.head's fragment list into
      * the in-flight chain up to the retired extent, finalizes whatever
      * seals (including a chain the close leaves mid-BB), and emits each
-     * block from the accumulators the caller has installed.  Shared by the
-     * pending-seal slot's own walk and by the suspension drain so the two
-     * cannot drift: a second copy of a truncation rule is the same
-     * over-claim waiting on a second call site. */
+     * block from the accumulators the caller has installed.  Shared by
+     * every close-time / departure-time emission so a truncation rule has
+     * exactly one copy. */
     struct CloseWalk {
         BBTemplate *head = nullptr;     /* fragment list to walk (may be null:
                                          * the chain is still finalized) */
@@ -882,14 +765,14 @@ private:
         uint64_t executed = 0;          /* instructions of @head that RETIRED */
         uint64_t prev_start = 0;        /* scoreboard's last-executed fragment,
                                          * 0 when the caller has no such
-                                         * marker (a frozen suspension) */
-        bool snap_tail = true;          /* capture the last executed insn's dst
-                                         * snaps (taken one insn late, so its
-                                         * own successor never fired) */
+                                         * marker */
         bool set_depth = false;         /* stamp g_emit_fault_depth per block */
         uint32_t depth = 0;
         uint8_t async_in_depth = 0;
         const RepArchFacts *facts = nullptr;
+        /* Mark the LAST block this walk emits as its context's final entry
+         * (CST_BB_FLAG_THREAD_END).  Set by the close-time flush only. */
+        bool thread_end_last = false;
         /* Filled by the walk: the template extent that reached the wire,
          * split by privilege.  Measured from the blocks emitted, not from
          * what the slot held — the difference is the whole of 81239d89cd. */
@@ -898,41 +781,17 @@ private:
     };
     uint32_t close_walk_emit(BodyStreamState *out_stream,
                              unsigned int cpu_index, CloseWalk &a);
-    /* Retire-at-return on the block @prev (the pinned process's own deferred
-     * prev, matched within its (thread,asid)): if @prev is an inner fault
-     * frame's resume suffix, flush that frame at its depth via
-     * flush_frame_unwound so its level is not lost.  Fetches the active body
-     * stream itself (no-op when no segment is active).  Used for a
-     * suspension retired without resuming (over-cap displacement / stale
-     * sweep).  @seal_asid is the owning effective asid, so the retired frame
-     * is matched within one (thread,asid) — same key as completion. */
-    void retire_prev_frame(BBTemplate *prev, uint64_t seal_asid,
-                           unsigned int cpu_index);
-
-    /* Suspend-or-seal arrows (Stage 3, plan §1.2/§1.3).  suspend_prev freezes
-     * the deferred prev + its four sinks onto susp_stack_ (over-cap: retire
-     * the oldest via retire_prev_frame and evict it); resume_suspension pops
-     * the entry whose (asid, owner_live) matches the resuming context and
-     * restores the four sinks so the seal walks the suspended prev; the
-     * @cpu_index is only needed for the over-cap retire. */
-    void suspend_prev(uint64_t owner_asid, uint64_t owner_live,
-                      unsigned int cpu_index);
-    bool resume_suspension(uint64_t resume_asid, uint64_t resume_live);
-    /* Emit a held suspension's fault level via retire_prev_frame, then drop
-     * it from the stack (the "suspend couldn't cover this" tail). */
-    void retire_suspension(size_t idx, unsigned int cpu_index);
+    /* Emit-at-departure: the pending-seal slot's block is leaving this
+     * vCPU's traced flow (foreign-ASID dispatch; abandoned async window).
+     * Emit it NOW at its measured extent with the terminating branch
+     * honestly unresolved, and drop everything past the range.  Caller
+     * clears the slot afterwards. */
+    void emit_prev_at_departure(const StepIn &in);
 
     /* In-flight fault excursions, fault-nesting order (completion may
-     * retire a mid-stack frame; see frame_idx_for_completion). */
+     * retire a mid-stack frame; see frame_idx_for_completion).  Identity
+     * and depth ledger entries only — see CtxFrame. */
     std::vector<CtxFrame> frames_;
-
-    /* Suspended deferred-prev blocks (Stage 3).  A bounded stack — nested
-     * foreign/async spans across different (thread,asid) owners each push an
-     * entry, and a resume pops the matching one (Decision A); over-cap the
-     * oldest falls back to retire-at-return.  Orphan-dropped at
-     * on_segment_open (like frames_).  Empty off the contention path. */
-    std::vector<SuspendedPrev> susp_stack_;
-    static constexpr size_t SUSP_STACK_CAP = 8;
 
     /* A retained event, with the async-window state that held AT ITS OWN
      * POSITION in the drain.  The stamp is taken once, in event order, from
@@ -1051,17 +910,7 @@ private:
     uint64_t seal_prev_extent_ = 0;
     bool     seal_prev_extent_valid_ = false;
     uint32_t prev_depth_ = 0;
-
-    /* Owner identity of the current pending-seal prev, sampled at its promote
-     * (Stage 3): the (thread,asid) the block executed under, frozen into a
-     * suspension so a resume matches the SAME owned process.  prev_owner_asid_
-     * is the pinned effective asid (dwell tag on narrow targets); prev_owner_
-     * live_ is the live asid (the wide-register per-process discriminator).
-     * Both restored from a suspension on resume so a re-suspension re-freezes
-     * the right owner. */
-    uint64_t prev_owner_asid_ = 0;
-    uint64_t prev_owner_live_ = 0;
-
+    
     /* Cross-phase snapshot: the prev the seal phase walks (and its
      * promote-time depth stamp), captured by step_events before the
      * swap. */

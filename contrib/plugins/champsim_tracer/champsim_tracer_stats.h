@@ -1364,6 +1364,14 @@ struct Stats {
      * at its depth by the sweep; orphan_dropped counts entries discarded
      * (no emit) at a segment-open boundary.  All zero off the contention
      * path (no foreign drops -> no suspensions). */
+    /* Emit-at-departure (epoch 0x1E model): blocks the foreign-ASID /
+     * abandoned-async arrows emitted at their measured extent the moment
+     * they left the traced flow, and the instructions those emissions
+     * carried.  The unknown row counts departures with no measurable
+     * extent (nothing emitted; nothing was observable). */
+    uint64_t departure_emits = 0;
+    uint64_t departure_emit_insns = 0;
+    uint64_t departure_extent_unknown = 0;
     uint64_t susp_pushed = 0;
     uint64_t susp_resumed = 0;
     uint64_t susp_displaced = 0;

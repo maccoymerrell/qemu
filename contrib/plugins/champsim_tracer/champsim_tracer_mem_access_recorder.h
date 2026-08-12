@@ -59,11 +59,16 @@ public:
                     const std::vector<WPMemAccess> &front);
 
     /* Drain the CP accumulator into @dyn_params, attributing each
-     * memop to the matching insn_pc within @bb_tmpl's insn list.
-     * Empties the CP buffer on return. */
+     * memop to the matching insn_pc within @bb_tmpl's insn list.  Only
+     * memops attributed inside [range_lo, range_hi) are taken; memops of
+     * the same template outside the range are LEFT in the buffer for the
+     * continuation entry (§4.2a — an entry is complete for the range it
+     * declares).  A whole-block caller passes [0, n_insns). */
     void drain_cp_into_dyn_params(unsigned int cpu_index,
                                   std::vector<DynParam> &dyn_params,
-                                  const BBTemplate *bb_tmpl);
+                                  const BBTemplate *bb_tmpl,
+                                  uint32_t range_lo,
+                                  uint32_t range_hi);
 
     /* Release every vCPU's CP buffers and the calling thread's
      * read-scratch.  Same pattern as

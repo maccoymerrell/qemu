@@ -1171,13 +1171,11 @@ struct BodyEntry {
      * block record at BLOCK_POS; delta-persistent, so a depth repeated by
      * the same template costs zero bytes and user-mode stays all-default. */
     uint32_t fault_depth = 0;
-    /* For a faulting BB reassembled across its fault excursions (whole-BB
-     * merge): the indices of the instructions that faulted, one per
-     * excursion, in order.  Empty for ordinary entries.  NOT on the wire
-     * as of epoch 0x1E — the executed range replaces the anchor list (a
-     * continuation entry's bb_start IS the resume index); the field
-     * survives only until the merge machinery itself is removed. */
-    std::vector<uint32_t> fault_anchors;
+    /* This entry is its (asid, thread) context's FINAL entry of the
+     * segment — set by the close-time flush on the last block it emits
+     * for a context, emitted as CST_BB_FLAG_THREAD_END on the entry's
+     * block record (§5.7). */
+    bool thread_end = false;
     /* Wire thread identity: always a GUEST-THREAD id, stable across vCPU
      * migration and distinct for threads that time-slice one vCPU.  System
      * mode resolves it from the kernel per-thread pointer; user mode uses

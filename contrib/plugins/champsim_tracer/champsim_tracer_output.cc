@@ -3650,6 +3650,10 @@ static void emit_body_record_payload(
     if (num_wp == 0 && entry->wp_first_tb_unavail) {
         cp_flags |= CST_BB_FLAG_WP_FIRST_TARGET_UNAVAIL;
     }
+    /* The context's final entry of the segment (close-time flush). */
+    if (entry->thread_end) {
+        cp_flags |= CST_BB_FLAG_THREAD_END;
+    }
 
     BBDeltaInput cp_rec;
     cp_rec.template_id  = entry->template_id;

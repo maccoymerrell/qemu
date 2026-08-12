@@ -792,9 +792,20 @@ static void riscv_itrigger_update_count(CPURISCVState *env)
              * If itrigger is not enabled in this privilege mode,
              * the number of executed instructions will be discard and
              * the count field in itrigger will not change.
+             *
+             * itrigger_timer[] is a QEMU_CLOCK_VIRTUAL timer, whose
+             * deadlines are NANOSECONDS: icount_get_locked() reads
+             * qemu_icount_bias + icount_to_ns(raw icount).  An
+             * instruction count is neither of those terms, so arming at
+             * `current_icount + count` arms at a timestamp that is
+             * behind the clock by the bias plus the whole icount shift.
+             * The timer therefore expires the moment it is armed, and
+             * this branch re-arms it at the same past deadline from its
+             * own callback: the vCPU never advances.  Convert.
              */
             timer_mod(env->itrigger_timer[i],
-                      current_icount + count);
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      icount_to_ns(count));
         }
     }
 }
@@ -842,9 +853,12 @@ static void itrigger_reg_write(CPURISCVState *env, target_ulong index,
             env->tdata1[index] = new_val;
             if (icount_enabled()) {
                 env->last_icount = icount_get_raw();
-                /* set the count to timer */
+                /* set the count to timer -- in virtual-clock nanoseconds,
+                 * which is what the timer's deadline means; see the
+                 * conversion note in riscv_itrigger_update_count. */
                 timer_mod(env->itrigger_timer[index],
-                          env->last_icount + itrigger_get_count(env, index));
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                          icount_to_ns(itrigger_get_count(env, index)));
             } else {
                 env->itrigger_enabled = riscv_itrigger_enabled(env);
             }

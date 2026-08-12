@@ -5798,6 +5798,7 @@ static void finish_trace_segment(bool prev_executed = true,
         const Stats s = stats_snapshot();
         const uint64_t frames_fated =
             s.census_frames_merged + s.census_frames_unwound_emitted +
+            s.census_frames_unwound_guard_dropped +
             s.census_frames_unwound_dropped + s.census_frames_faults0_dropped +
             s.census_frames_orphan_dropped + s.close_frames_flushed +
             s.close_frames_empty_prefix + s.close_frame_prefix_unplaced +

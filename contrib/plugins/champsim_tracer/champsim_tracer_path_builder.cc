@@ -203,6 +203,32 @@ bool seal_stash_falsifier(void)
     return v;
 }
 
+/*
+ * CST_NO_CLOSE_STREAM: the falsifier arm for the DISCARD half of the
+ * whole-class gate.  Every other arm here turns a drain OFF and leaves its
+ * holder occupied, which the post-flush occupancy census sees; this one
+ * makes the two close drains take their own no-stream exit, where they
+ * EMPTY the holder and emit nothing.  That is the failure shape
+ * close_holder_undrained cannot see by construction, and the arm exists so
+ * close_holder_discarded can be shown to fire rather than asserted to work.
+ * A falsifier arm, not a capture.
+ */
+static bool close_nostream_falsifier(void)
+{
+    static const bool v = []() {
+        if (getenv("CST_NO_CLOSE_STREAM") == nullptr) {
+            return false;
+        }
+        fprintf(stderr, "champsim_tracer: CST_NO_CLOSE_STREAM — the close's "
+                "fault-frame and suspension drains are handed no body "
+                "stream, so they DISCARD their occupants instead of "
+                "emitting them.  This trace is missing instructions the "
+                "guest executed; it is a falsifier arm, not a capture.\n");
+        return true;
+    }();
+    return v;
+}
+
 /* CST_SEALEXT: per-seal report of every extent question the walk could not
  * answer from the retired cursor.  Diagnostic only, inert unless set. */
 bool seal_extent_diag(void)
@@ -1553,6 +1579,10 @@ uint32_t PathBuilder::close_walk_emit(BodyStreamState *out_stream,
     return (uint32_t)finalized.size();
 }
 
+/* Architectural instructions of a whole TB fragment list.  Defined below
+ * beside the census; declared here because both close drains need it. */
+static uint32_t closedrop_tb_insns(const BBTemplate *head);
+
 void PathBuilder::flush_final(bool walk_prev, bool prev_in_flight)
 {
     BodyStreamState *out_stream = g_trace_segments.body_stream();
@@ -1699,7 +1729,9 @@ void PathBuilder::flush_final(bool walk_prev, bool prev_in_flight)
      * ahead of the closing walk's own blocks (deepest / most recent first
      * within the stack, mirroring the fault-frame flush).
      */
-    flush_suspensions_at_close(out_stream, cpu_index);
+    flush_suspensions_at_close(close_nostream_falsifier() ? nullptr
+                                                          : out_stream,
+                               cpu_index);
 
     CloseWalk cw;
     cw.head = (walk_prev || deferred_walk) ? prev_tb_ : nullptr;
@@ -1710,12 +1742,32 @@ void PathBuilder::flush_final(bool walk_prev, bool prev_in_flight)
     cw.facts = &rep_state(cpu_index).pb_prev_facts;
     if (prev_start != 0 || deferred_walk) {
         close_walk_emit(out_stream, cpu_index, cw);
+    } else {
+        /*
+         * THE CLOSE WALK IS SKIPPED ENTIRELY, AND IT TAKES THE CHAIN WITH
+         * IT.  prev_start is this vCPU's last-executed-fragment marker,
+         * zeroed by the previous flush_final and re-armed by the next
+         * dispatch's inline store; when it reads 0 the walk is not called
+         * at all, so neither the slot's retired prefix nor the IN-FLIGHT
+         * CHAIN is finalized — and the unconditional cp_chain.reset() at
+         * the tail of this function then empties the chain anyway, which is
+         * precisely why the post-flush occupancy census reads zero over it.
+         */
+        uint64_t skipped = cp_chain(cpu_index_).in_flight_insns();
+        if (cw.head && have_extent) {
+            skipped += executed;
+        }
+        if (skipped) {
+            g_stats.close_holder_discarded++;
+            g_stats.close_holder_discarded_insns += skipped;
+        }
     }
 
     /* Every fault frame still open is holding an executed prefix that no
      * FAULT_RETURN will ever come to merge.  Emit it here — this is the
      * last moment anything can (see flush_frames_at_close). */
-    flush_frames_at_close(out_stream, cpu_index);
+    flush_frames_at_close(close_nostream_falsifier() ? nullptr : out_stream,
+                          cpu_index);
 
     /*
      * THE SINKS THAT ARE LEFT.  Everything above emits blocks; these four
@@ -1757,7 +1809,19 @@ void PathBuilder::flush_final(bool walk_prev, bool prev_in_flight)
     pending_evs_.clear();
     /* The cross-phase walk snapshot is consumed by the seal this close
      * stands in for; leaving it set makes the next census read a holder
-     * that no longer exists. */
+     * that no longer exists.
+     *
+     * Unless no seal ever ran on it.  mid_step_ says this builder is
+     * parked between step_events' promote and step_seal — the three glue
+     * bails after a CONTINUE leave it that way across callback boundaries —
+     * and in that state walk_prev_ is a block that EXECUTED and was never
+     * sealed.  Nulling it here is a discard, and it is invisible to the
+     * post-flush occupancy gate twice over: walk_prev_ is not in that
+     * gate's predicate at all, and this assignment empties it anyway. */
+    if (mid_step_ && walk_prev_) {
+        g_stats.close_holder_discarded++;
+        g_stats.close_holder_discarded_insns += closedrop_tb_insns(walk_prev_);
+    }
     walk_prev_ = nullptr;
 
     /* cp_chain and the CP memop buffer are per-vCPU; exec_lock (held)
@@ -1801,8 +1865,16 @@ void PathBuilder::flush_suspensions_at_close(BodyStreamState *out_stream,
     }
     if (!out_stream) {
         /* Nowhere to put them.  This IS the drop and nothing here can undo
-         * it; say so rather than returning a quiet zero. */
+         * it; say so rather than returning a quiet zero — and charge it to
+         * the discard gate, since the clear() is what makes the post-flush
+         * occupancy census read a satisfied zero over it. */
         g_stats.close_susp_unflushable += susp_stack_.size();
+        g_stats.close_holder_discarded += susp_stack_.size();
+        for (const SuspendedPrev &sp : susp_stack_) {
+            g_stats.close_holder_discarded_insns += sp.extent_valid
+                ? sp.extent
+                : (sp.prev ? closedrop_tb_insns(sp.prev) : 0);
+        }
         susp_stack_.clear();
         return;
     }
@@ -1862,7 +1934,15 @@ void PathBuilder::flush_suspensions_at_close(BodyStreamState *out_stream,
         const uint64_t got = cw.insns_emitted;
         const uint64_t got_user = cw.user_insns_emitted;
         if (n == 0 || got == 0) {
+            /* The entry reached here with a retired extent (extent == 0
+             * took the `continue` above) and its walk put no block on the
+             * wire, so the frozen prefix is gone.  The pop has already
+             * emptied the holder, so the post-flush occupancy census sees
+             * nothing — this row is the only place it is visible. */
             g_stats.close_susp_empty++;
+            g_stats.close_holder_discarded++;
+            g_stats.close_holder_discarded_insns += s.extent_valid
+                ? s.extent : closedrop_tb_insns(s.prev);
         } else {
             g_stats.close_susp_flushed++;
             g_stats.close_susp_insns_recovered += got;
@@ -4673,7 +4753,6 @@ void PathBuilder::flush_frame_unwound(size_t idx, BodyStreamState *out_stream,
         g_stats.census_frames_unwound_dropped++;
         return;
     }
-    g_stats.census_frames_unwound_emitted++;
     /* Emission-time depth, same re-derivation as the merge (see
      * complete_merge): the frame's synchronous component plus the owner's
      * async level at THIS emission's position. */
@@ -4707,8 +4786,21 @@ void PathBuilder::flush_frame_unwound(size_t idx, BodyStreamState *out_stream,
                     f.full_tmpl->start_pc, f.depth, eff_depth,
                     last_emit_fault_depth(cpu_index_));
         }
+        /* THE FRAME IS ALREADY ERASED AND NOTHING WAS EMITTED.  The
+         * anchor guard is a deliberate trade — an anchored entry with no
+         * strictly deeper predecessor would fabricate a depth violation —
+         * but it is still a DROP of the excursion's executed prefix, and
+         * it used to be counted as census_frames_unwound_emitted, a fate
+         * the ledger documents as "put its prefix on the wire".  A named
+         * fate that is itself a drop makes the fate identity balance while
+         * the instructions are gone, which is the exact shape the census
+         * exists to make impossible. */
+        g_stats.census_frames_unwound_guard_dropped++;
+        g_stats.census_frames_unwound_guard_insns +=
+            census_frame_prefix_insns(f);
         return;
     }
+    g_stats.census_frames_unwound_emitted++;
 
     /* Set the current block's accumulators aside; emit from the frame's own. */
     std::vector<WPMemAccess> cur_mem;
@@ -4801,8 +4893,15 @@ void PathBuilder::flush_frames_at_close(BodyStreamState *out_stream,
     if (!out_stream) {
         /* Nowhere to put them: the segment has no body stream, so this IS a
          * drop and nothing here can undo it.  Say so rather than returning
-         * a quiet zero. */
+         * a quiet zero — and charge it to the discard gate, because the
+         * clear() below is exactly what makes the post-flush occupancy
+         * census read a satisfied zero over it. */
         g_stats.close_frames_unflushable += frames_.size();
+        g_stats.close_holder_discarded += frames_.size();
+        for (const CtxFrame &fr : frames_) {
+            g_stats.close_holder_discarded_insns +=
+                census_frame_prefix_insns(fr);
+        }
         frames_.clear();
         return;
     }
@@ -4819,6 +4918,7 @@ void PathBuilder::flush_frames_at_close(BodyStreamState *out_stream,
         frames_.pop_back();
         if (!f.full_tmpl || !f.full_tmpl->insn_pcs) {
             g_stats.close_frame_prefix_unplaced++;
+            g_stats.close_holder_discarded++;
             continue;
         }
         /* Where the handler would have resumed IS the extent: a pushed
@@ -4836,6 +4936,7 @@ void PathBuilder::flush_frames_at_close(BodyStreamState *out_stream,
              * extent can be named and emitting any of it would be a guess.
              * This must not happen; it has its own must-be-0 row. */
             g_stats.close_frame_prefix_unplaced++;
+            g_stats.close_holder_discarded++;
             continue;
         }
         /* A self-loop that faulted part-way through its OWN iterations
@@ -4858,6 +4959,8 @@ void PathBuilder::flush_frames_at_close(BodyStreamState *out_stream,
         g_mutex_unlock(&data_lock);
         if (!pfx) {
             g_stats.close_frame_prefix_unplaced++;
+            g_stats.close_holder_discarded++;
+            g_stats.close_holder_discarded_insns += take;
             continue;
         }
 

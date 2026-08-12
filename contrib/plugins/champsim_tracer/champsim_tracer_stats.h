@@ -440,6 +440,14 @@ struct Stats {
      *   unwound_dropped      flush_frame_unwound had no stream / no
      *                        template and erased it silently — an
      *                        UNCOUNTED drop before this census
+     *   unwound_guard_dropped
+     *                        flush_frame_unwound's anchor guard erased the
+     *                        frame WITHOUT emitting (no strictly deeper
+     *                        predecessor to anchor against).  Counted as
+     *                        unwound_EMITTED until this row existed, so the
+     *                        ledger asserted a wire emission that never
+     *                        happened and the fate identity balanced over a
+     *                        drop
      *   faults0_dropped      faults=0 nested-handler frame discarded
      *   orphan_dropped       on_segment_open cleared it (its full_tmpl
      *                        dangles into the cleared bb_map_) — likewise
@@ -466,6 +474,8 @@ struct Stats {
     uint64_t census_frames_merged = 0;
     uint64_t census_frames_unwound_emitted = 0;
     uint64_t census_frames_unwound_dropped = 0;
+    uint64_t census_frames_unwound_guard_dropped = 0;
+    uint64_t census_frames_unwound_guard_insns = 0;
     uint64_t census_frames_faults0_dropped = 0;
     uint64_t census_frames_orphan_dropped = 0;
     uint64_t census_frames_held_at_close = 0;
@@ -614,6 +624,27 @@ struct Stats {
      * not depend on remembering to add a row per new holder. */
     uint64_t close_holder_undrained = 0;
     uint64_t close_holder_undrained_insns = 0;
+
+    /* THE OTHER HALF OF THE WHOLE-CLASS GATE.
+     *
+     * close_holder_undrained is read on the POST-flush census pass, and
+     * every drain flush_final performs EMPTIES its holder unconditionally —
+     * including on its own no-emit exits (no body stream, an unnameable
+     * frame extent, a suspension whose walk produced no block, a
+     * pending-seal slot the close-walk gate skipped, the unwind flush's
+     * anchor guard).  So the post-pass occupancy answers "did the drain
+     * RUN", not "did the work reach the WIRE": a holder the drain cleared
+     * without emitting reads zero, exactly like one it emitted.  The
+     * falsifier arms that make the gate fire all work the other way round
+     * (they skip the drain and LEAVE the holder occupied), so the one
+     * failure shape the gate was demonstrated on is the one it can see.
+     *
+     * This is the discard half: every close-time site that empties a holder
+     * WITHOUT putting its contents on the wire, with the retired extent
+     * that went with it.  Must be 0, and it is the row that fails a cell
+     * when a drain silently eats its occupant. */
+    uint64_t close_holder_discarded = 0;
+    uint64_t close_holder_discarded_insns = 0;
 
     /* THE LATENT HOLDER (PathBuilder::walk_prev_).  The cross-phase
      * snapshot the seal walk folds is undrained and non-zero at nearly

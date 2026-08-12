@@ -216,6 +216,11 @@ bool retired_executed_of(unsigned int cpu_index, const BBTemplate *head,
 bool retired_executed_prev(unsigned int cpu_index, const BBTemplate *head,
                            uint64_t *out);
 
+/* Is @head the block the guest is standing IN on @cpu_index — the current
+ * dispatch, and only that?  The one question a mid-instruction fact may be
+ * applied to.  See the definition in champsim_tracer.cc. */
+bool retired_is_in_flight(unsigned int cpu_index, const BBTemplate *head);
+
 /* Close census: one pending-seal slot promote.  Out of line because the
  * g_stats macro is not in scope in this header (stats.h is included after
  * it in every TU). */

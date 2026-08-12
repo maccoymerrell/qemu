@@ -1618,9 +1618,35 @@ void PathBuilder::flush_final(bool walk_prev, bool prev_in_flight)
         bool known = retired_executed_of(cpu_index, prev_tb_, &deferred_ran) ||
                      prev_extent(&deferred_ran);
         if (known && prev_in_flight) {
-            /* The guest is standing IN this block: its current instruction
-             * has begun and has not retired. */
-            if (deferred_ran > 0) {
+            /*
+             * THE MID-INSTRUCTION FACT BELONGS TO ONE BLOCK, NOT TO THE SLOT.
+             *
+             * prev_in_flight is QEMU's statement about the vCPU's CURRENT
+             * instruction (qemu_plugin_vm_shutdown_cb's in_guest_insn): the
+             * guest is standing inside the store that performs the poweroff,
+             * so that instruction has begun and has not retired.  It is only
+             * a statement about THIS slot when the slot holds the block the
+             * guest is standing in.
+             *
+             * On a system guest it usually does not.  The pending-seal slot
+             * holds the last block of the PINNED process, and the poweroff is
+             * executed by whatever process ran `poweroff` — a different
+             * address space, dispatches later, on a cursor that has long
+             * since rolled past.  Subtracting there removes an instruction
+             * the guest retired: measured on all four ISAs at HEAD as a
+             * final wire entry of insns=1 for the 2-instruction block
+             * 0x401014 whose census line read ran=2, against insns=2 for the
+             * same block on the marshalled (in_guest_insn=false) route.
+             *
+             * So the subtraction is gated on the ONE dispatch position that
+             * can hold an in-flight block.  The other two answers —
+             * retired_executed_of's previous-dispatch arm and the
+             * note_prev_extent stash — are both measured AFTER a successor
+             * dispatched, which is proof the block ran to its end.
+             */
+            if (!retired_is_in_flight(cpu_index, prev_tb_)) {
+                g_stats.close_deferred_prev_inflight_stale++;
+            } else if (deferred_ran > 0) {
                 deferred_ran--;
                 g_stats.close_deferred_prev_inflight_trimmed++;
             }

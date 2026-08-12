@@ -575,6 +575,17 @@ struct Stats {
     uint64_t close_deferred_prev_walked = 0;
     uint64_t close_deferred_prev_insns = 0;
     uint64_t close_deferred_prev_inflight_trimmed = 0;
+    /* ...and the closes where QEMU said an instruction was in flight and the
+     * slot was NOT the block it was in flight in.  The pending-seal slot
+     * holds the last block of the PINNED process; a guest poweroff is
+     * performed by whichever process ran it, so on a system guest this is
+     * the common case, not the exception.  The subtraction is declined here
+     * -- both remaining extent sources (retired_executed_of's previous-
+     * dispatch arm, and the note_prev_extent stash) are measured only once a
+     * successor has dispatched, which is proof the block ran to its end.
+     * Descriptive, not a must-be-0: a close landing outside the traced
+     * process is normal. */
+    uint64_t close_deferred_prev_inflight_stale = 0;
     /* The deferred route held a block and no extent could be measured for
      * it, so nothing could be emitted without guessing.  Must be 0. */
     uint64_t close_deferred_prev_extent_unknown = 0;

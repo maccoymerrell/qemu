@@ -902,6 +902,31 @@ bool retired_executed_of(unsigned int cpu_index, const BBTemplate *head,
 }
 
 /*
+ * IS @head THE BLOCK THE GUEST IS STANDING IN ON @cpu_index?
+ *
+ * There is exactly one dispatch position at which that can be true: the
+ * CURRENT one.  retired_executed_of also answers for the PREVIOUS dispatch,
+ * and PathBuilder::prev_extent answers from a measurement taken at the first
+ * dispatch AFTER prev — both of which are positions a successor block has
+ * already been dispatched from, so the block they describe provably ran to
+ * its end.
+ *
+ * The distinction matters to exactly one caller: the machine-shutdown
+ * close, which is told by QEMU whether the vCPU is inside a guest
+ * instruction (qemu_plugin_vm_shutdown_cb's in_guest_insn) and subtracts
+ * that begun-but-unretired instruction from the slot's retired prefix.
+ * That fact is about the vCPU's CURRENT instruction; the pending-seal slot
+ * holds the last block of the PINNED process, which on a system guest is
+ * almost never the process performing the poweroff.  Applying the
+ * subtraction to a slot the cursor can no longer name drops an instruction
+ * that retired.
+ */
+bool retired_is_in_flight(unsigned int cpu_index, const BBTemplate *head)
+{
+    return head && head == g_retired_tb_head[retired_slot(cpu_index)];
+}
+
+/*
  * The same question asked SPECIFICALLY of the previous dispatch.
  *
  * retired_executed_of accepts either dispatch position because a segment

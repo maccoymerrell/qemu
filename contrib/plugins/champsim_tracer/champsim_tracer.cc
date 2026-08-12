@@ -5626,6 +5626,13 @@ static void finish_trace_segment(bool prev_executed = true,
                 }
                 flush_order.push_back({ b->prev_seq(), i });
             }
+            if (closing_cpu >= CST_PIN_MAX_VCPUS) {
+                /* Past the per-vCPU array bound (path_builder_if_created
+                 * clamps, this loop cannot).  The closing vCPU is flushed
+                 * whatever else happens -- it was flushed unconditionally
+                 * before this ordering existed and must stay that way. */
+                flush_order.push_back({ UINT64_MAX, closing_cpu });
+            }
             std::stable_sort(flush_order.begin(), flush_order.end(),
                              [](const CloseFlush &a, const CloseFlush &b) {
                                  return a.seq != b.seq ? a.seq < b.seq

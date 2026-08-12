@@ -194,6 +194,14 @@ Knobs: ``CST_DELAY_DIAG_MS`` sets the sample window (default 250);
 checked against a delay of known size rather than merely observed to
 move.  The injection distorts the run it is used on, by design.
 
+Calibration, x86-64 user mode, ``wp=1 wpdepth=64``: injecting 100 µs moves
+the median reported excursion from 5.83 µs to 106.20 µs — a measured
+100.37 µs against 100 injected, 0.37 % error — and occupancy from 0.5269
+to 0.9525, where the gap term the baseline implies (5.23 µs per
+excursion) predicts 0.9530.  The duration reading and the two-way
+partition are therefore both checked against something external to the
+instrument, not merely observed to respond.
+
 What it does **not** measure, stated rather than left silent:
 
 * The gap term is not decomposed.  This instrument holds no

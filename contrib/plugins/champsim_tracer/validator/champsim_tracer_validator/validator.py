@@ -4324,6 +4324,7 @@ def _check_wrong_path_chains(entries: list[dict],
     # chain-level-event acceptance below look AHEAD for a later CP
     # instance of the same static branch.
     records: list[dict] = []
+    n_unresolved_exempt = 0
     for e in entries:
         runs = template_runs.get(e["template_id"], [])
         if not runs:
@@ -4344,6 +4345,21 @@ def _check_wrong_path_chains(entries: list[dict],
         # recover the original index.
         key = str(cp_pos + cp_pos_offset)
         if key not in wrong_paths:
+            continue
+
+        # THE FORK PREDICTION DOES NOT APPLY TO AN UNRESOLVED TERMINAL.
+        # A wrong path forks off a RESOLVED branch outcome — the same
+        # invariant _check_wp_fork_resolved enforces from the other side
+        # — and the emit-at-departure family (a foreign-span departure,
+        # an abandoned async window, the SMP migration drain) publishes
+        # its block at the measured extent with the terminating branch
+        # honestly unresolved and no chain.  The generator's positional
+        # prediction has no subject there.  Scoped strictly: the entry
+        # must carry NO outcome and NO chain — an entry that forked and
+        # diverged still gets its verdict — and the exemption is tallied
+        # in a notable INFO, never silent.
+        if e.get("branch_taken") is None and not e.get("wp_entries"):
+            n_unresolved_exempt += 1
             continue
 
         exp_chain = list(wrong_paths[key].get("wp_chain", []))
@@ -4593,6 +4609,14 @@ def _check_wrong_path_chains(entries: list[dict],
                 f"(sim_insns={actual_sim_insns}, budget={wp_insn_budget}); "
                 f"predicted {len(exp_chain)}{ev_note}",
             ))
+    if n_unresolved_exempt:
+        issues.append(Issue(
+            "wrong_path_chains", "info",
+            f"{n_unresolved_exempt} predicted fork(s) landed on entries "
+            f"whose terminating branch is declared unresolved "
+            f"(emit-at-departure / migration-drain emissions) — no chain "
+            f"is owed off an unresolved outcome",
+            {"notable": True, "unresolved_exempt": n_unresolved_exempt}))
     return issues
 
 

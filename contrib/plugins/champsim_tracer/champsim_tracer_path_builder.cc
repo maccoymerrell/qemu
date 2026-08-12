@@ -1157,6 +1157,13 @@ uint32_t PathBuilder::close_walk_emit(BodyStreamState *out_stream,
     if (!out_stream) {
         return 0;
     }
+    /* SMP claim-ledger provenance: name this drain for the duration of its
+     * emissions (see g_cst_emit_site). */
+    struct SiteGuard {
+        const char *old;
+        SiteGuard(const char *s) : old(g_cst_emit_site) { g_cst_emit_site = s; }
+        ~SiteGuard() { g_cst_emit_site = old; }
+    } smp_site_guard(a.site);
     std::vector<BBTemplate *> finalized;
 
     g_mutex_lock(&data_lock);
@@ -1330,7 +1337,32 @@ static uint32_t closedrop_tb_insns(const BBTemplate *head);
  * vCPU state.  The final entry this flush emits for the context carries
  * CST_BB_FLAG_THREAD_END.
  */
-void PathBuilder::flush_final(bool walk_prev, bool prev_in_flight)
+/* See the declaration: the close's thread-keyed THREAD_END pre-pass. */
+bool PathBuilder::close_flush_will_emit(void) const
+{
+    if (mid_step_ && walk_prev_ != nullptr) {
+        return true;
+    }
+    if (prev_tb_) {
+        uint64_t executed = 0;
+        if (prev_extent(&executed)) {
+            if (executed > 0) {
+                return true;
+            }
+        } else if (retired_executed_of(cpu_index_, prev_tb_, &executed)) {
+            /* The flush's direct-cursor arm excludes the never-snapped
+             * tail (and the shutdown route's in-flight instruction —
+             * over-prediction there is caught by the mispredict row). */
+            if (executed > 1) {
+                return true;
+            }
+        }
+    }
+    return cp_chain(cpu_index_).has_active_chain();
+}
+
+void PathBuilder::flush_final(bool walk_prev, bool prev_in_flight,
+                              bool stamp_thread_end)
 {
     BodyStreamState *out_stream = g_trace_segments.body_stream();
     unsigned int cpu_index = cpu_index_;
@@ -1364,7 +1396,8 @@ void PathBuilder::flush_final(bool walk_prev, bool prev_in_flight)
         mw.depth = walk_depth_;
         mw.async_in_depth = g_pb_walk_async[pb_vcpu_slot(cpu_index_)];
         mw.facts = &rep_state(cpu_index).pb_walk_facts;
-        mw.thread_end_last = true;
+        mw.thread_end_last = stamp_thread_end;
+        mw.site = "flush-midstep";
         close_walk_emit(out_stream, cpu_index, mw);
     }
     walk_prev_ = nullptr;
@@ -1388,6 +1421,31 @@ void PathBuilder::flush_final(bool walk_prev, bool prev_in_flight)
      */
     uint64_t executed = 0;
     bool have_extent = false;
+    /* SMP condition census: classify a PEER slot's extent source at a
+     * close.  The stash was measured at the first dispatch after prev —
+     * definitively past — while the live retired cursor belongs to a vCPU
+     * whose thread may still be executing, and a slot that is that vCPU's
+     * CURRENT in-flight head is a block whose execution the close is
+     * reading mid-flight.  Counters only; the drain below is unchanged. */
+    const bool smp_peer_close = g_cst_closing_cpu != UINT32_MAX &&
+                                cpu_index_ != g_cst_closing_cpu;
+    if (prev_tb_ && smp_peer_close) {
+        uint64_t smp_e = 0;
+        if (prev_extent(&smp_e)) {
+            g_stats.smp_close_peer_stash_extent++;
+        } else if (retired_executed_of(cpu_index, prev_tb_, &smp_e)) {
+            g_stats.smp_close_peer_live_cursor++;
+            if (retired_is_in_flight(cpu_index, prev_tb_)) {
+                g_stats.smp_close_peer_inflight_head++;
+                if (cst_smp_diag()) {
+                    fprintf(stderr, "[smpdiag] close peer slot is vCPU %u's "
+                            "IN-FLIGHT head: pc=0x%" PRIx64 " ran=%" PRIu64
+                            " closing_cpu=%u\n", cpu_index_,
+                            prev_tb_->start_pc, smp_e, g_cst_closing_cpu);
+                }
+            }
+        }
+    }
     if (prev_tb_) {
         if (prev_extent(&executed)) {
             have_extent = true;
@@ -1446,7 +1504,8 @@ void PathBuilder::flush_final(bool walk_prev, bool prev_in_flight)
         cw.depth = prev_depth_;
         cw.async_in_depth = g_pb_prev_async[pb_vcpu_slot(cpu_index_)];
         cw.facts = &rep_state(cpu_index).pb_prev_facts;
-        cw.thread_end_last = true;
+        cw.thread_end_last = stamp_thread_end;
+        cw.site = smp_peer_close ? "flush-peer-slot" : "flush-slot";
         close_walk_emit(out_stream, cpu_index, cw);
     } else if (cp_chain(cpu_index_).has_active_chain()) {
         /* No walkable slot, but the chain still holds fragments that ran
@@ -1460,7 +1519,8 @@ void PathBuilder::flush_final(bool walk_prev, bool prev_in_flight)
         cw.depth = prev_depth_;
         cw.async_in_depth = g_pb_prev_async[pb_vcpu_slot(cpu_index_)];
         cw.facts = &rep_state(cpu_index).pb_prev_facts;
-        cw.thread_end_last = true;
+        cw.thread_end_last = stamp_thread_end;
+        cw.site = "flush-chain";
         close_walk_emit(out_stream, cpu_index, cw);
     }
 
@@ -1663,16 +1723,21 @@ void path_builder_close_state_report(FILE *f, const char *why,
     }
 }
 
-void path_builder_flush_final(unsigned int cpu_index)
+void path_builder_flush_final(unsigned int cpu_index,
+                              bool stamp_thread_end)
 {
-    path_builder(cpu_index).flush_final();
+    path_builder(cpu_index).flush_final(/* walk_prev= */ true,
+                                        /* prev_in_flight= */ false,
+                                        stamp_thread_end);
 }
 
 void path_builder_flush_final_chain_only(unsigned int cpu_index,
-                                         bool prev_in_flight)
+                                         bool prev_in_flight,
+                                         bool stamp_thread_end)
 {
     path_builder(cpu_index).flush_final(/* walk_prev= */ false,
-                                        prev_in_flight);
+                                        prev_in_flight,
+                                        stamp_thread_end);
 }
 
 /*
@@ -2617,11 +2682,13 @@ void PathBuilder::classify_fault_enter(const struct qemu_plugin_cpu_event &ev,
              * faulting attempt itself.  Publish it; a piece cut before
              * its terminating branch stays honestly unresolved. */
             const bool rep_edge = rep_split && tmpl->insn_pcs;
+            g_cst_emit_site = "fault-prefix";
             emit_body_entry(out_stream, tmpl, cpu_index_, {},
                             /*wp_first_tb_unavail=*/false,
                             rep_edge ? tmpl->insn_pcs[hi - 1] : 0,
                             /*branch_successor_known=*/rep_edge,
                             lo, hi, /*thread_end=*/false);
+            g_cst_emit_site = "seal";
         }
         g_mem_recorder.clear_cp(cpu_index_);
         pending_reg_snaps(cpu_index_).clear();
@@ -3519,6 +3586,7 @@ void PathBuilder::emit_prev_at_departure(const StepIn &in)
         cw.depth = prev_depth_;
         cw.async_in_depth = g_pb_prev_async[pb_vcpu_slot(cpu_index_)];
         cw.facts = &rep_state(cpu_index_).pb_prev_facts;
+        cw.site = "departure";
         close_walk_emit(out_stream, cpu_index_, cw);
         g_stats.departure_emits++;
         g_stats.departure_emit_insns += cw.insns_emitted;
@@ -3533,6 +3601,64 @@ void PathBuilder::emit_prev_at_departure(const StepIn &in)
     g_mutex_lock(&data_lock);
     cp_chain(cpu_index_).reset();
     g_mutex_unlock(&data_lock);
+}
+
+/* See the declaration in champsim_tracer_path_builder.h.  CST_NO_MIGRATE_
+ * DRAIN is the falsifier arm: it restores the pre-fix behaviour (the
+ * vacated holder waits for a close that emits it out of program order) so
+ * the displaced-block class is reproducible on demand. */
+void PathBuilder::drain_migrated_holder(void)
+{
+    BodyStreamState *out_stream =
+        g_trace_segments.is_active() ? g_trace_segments.body_stream()
+                                     : nullptr;
+    uint64_t executed = 0;
+    bool have = prev_extent(&executed);
+    if (!have && retired_executed_of(cpu_index_, prev_tb_, &executed)) {
+        /* The vacated vCPU's cursor is PARKED: nothing has dispatched on
+         * it since the held block (that absence is why the drain exists),
+         * so the answer is the block's own retired count, not a later
+         * dispatch's.  The tail insn retired but its dst snap was never
+         * taken — its successor never began here — so the stop rule
+         * excludes it, exactly as flush_final's direct-cursor arm does. */
+        have = true;
+        if (executed > 0) {
+            executed--;
+        }
+    }
+    /* BILLED == PUBLISHED: the held block's retired prefix was never
+     * folded into the window clock by a next dispatch on this vCPU (none
+     * came).  Credit exactly what this drain PUBLISHES — nothing when no
+     * segment is active to publish into; the credit refuses positionally
+     * when a fold DID bill it. */
+    if (out_stream && have && executed > 0) {
+        user_clock_close_credit(cpu_index_, prev_tb_, executed);
+    }
+    if (out_stream && have && executed > 0) {
+        CloseWalk cw;
+        cw.head = prev_tb_;
+        cw.have_extent = true;
+        cw.executed = executed;
+        cw.prev_start =
+            qemu_plugin_u64_get(g_scoreboard.prev_start_pc, cpu_index_);
+        cw.set_depth = true;
+        cw.depth = prev_depth_;
+        cw.async_in_depth = g_pb_prev_async[pb_vcpu_slot(cpu_index_)];
+        cw.facts = &rep_state(cpu_index_).pb_prev_facts;
+        cw.site = "migrate-drain";
+        close_walk_emit(out_stream, cpu_index_, cw);
+        g_stats.smp_migrated_holders_drained++;
+        g_stats.smp_migrated_holder_insns += cw.insns_emitted;
+    } else if (!have) {
+        g_stats.smp_migrate_drain_extent_unknown++;
+    }
+    g_mem_recorder.clear_cp(cpu_index_);
+    pending_reg_snaps(cpu_index_).clear();
+    cp_chain_snap_mark(cpu_index_) = 0;
+    g_mutex_lock(&data_lock);
+    cp_chain(cpu_index_).reset();
+    g_mutex_unlock(&data_lock);
+    clear_prev();
 }
 
 PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
@@ -3924,6 +4050,69 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
     g_dbg_walk_depth_src = g_dbg_prev_depth_src;
     walk_in_sync_ = prev_in_sync_;
     set_prev(in.cur);
+    /* SMP condition census + the migration drain: a guest thread whose
+     * consecutive USER promotes land on different vCPUs migrated between
+     * them; if the vCPU it left still holds an unsealed pending-seal slot
+     * IT promoted, the one-dispatch lookahead was orphaned mid-block.
+     * Identity comes from the step's cur_tid peek (CST_TID_UNSEEN steps
+     * are skipped); the map is exec_lock-serialised like every promote.
+     *
+     * USER PROMOTES ONLY, on both sides.  Under SMP the kernel strands
+     * share the owning thread's tid (the kexc ownership rule), so a
+     * timer interrupt landing on a PEER vCPU promotes kernel TBs under
+     * the same tid while the thread's user code keeps running where it
+     * was — a map that moved on those saw a PHANTOM migration and the
+     * drain stole a LIVE builder's pending work mid-flow (measured on a
+     * churn cell: a CFG-impossible insertion the claim ledger named
+     * with site=migrate-drain, and a 175-insn clock-vs-wire shortfall
+     * from the stolen accumulators).  A USER promote is the thread
+     * itself executing, which it can only do in one place: the map
+     * moves exactly when the thread does, and the vacated holder —
+     * user block or the excursion sliver it left — is provably stale. */
+    {
+        static auto &tid_last_vcpu =
+            *new std::unordered_map<uint32_t, unsigned int>();
+        if (in.cur != nullptr && in.cur_tid != CST_TID_UNSEEN &&
+            in.user_owned) {
+            auto it = tid_last_vcpu.find(in.cur_tid);
+            if (it != tid_last_vcpu.end() && it->second != in.cpu_index) {
+                g_stats.smp_thread_migrations++;
+                PathBuilder *left = path_builder_if_created(it->second);
+                if (left && left != this && left->prev() != nullptr &&
+                    left->prev_tid() == in.cur_tid) {
+                    g_stats.smp_migrated_holder_pending++;
+                    if (cst_smp_diag()) {
+                        fprintf(stderr, "[smpdiag] tid %u migrated vCPU %u"
+                                "->%u leaving unsealed slot pc=0x%" PRIx64
+                                " behind\n", in.cur_tid, it->second,
+                                in.cpu_index, left->prev()->start_pc);
+                    }
+                    /* THE THREAD-KEYED DRAIN.  This promote is the proof
+                     * the thread's program order continues HERE: the
+                     * vacated builder's held block precedes everything
+                     * this step will emit, and nothing on that vCPU is
+                     * coming to seal it.  Publish it now, in order (see
+                     * drain_migrated_holder).  CST_NO_MIGRATE_DRAIN is
+                     * the falsifier arm: pre-fix behaviour, the holder
+                     * waits for the close and surfaces displaced. */
+                    static const bool no_drain =
+                        getenv("CST_NO_MIGRATE_DRAIN") != nullptr;
+                    if (!no_drain) {
+                        left->drain_migrated_holder();
+                    }
+                }
+                it->second = in.cpu_index;
+            } else if (it == tid_last_vcpu.end()) {
+                tid_last_vcpu.emplace(in.cur_tid, in.cpu_index);
+            }
+        }
+        /* The holder's promoting-thread stamp is taken on EVERY promote —
+         * a kernel excursion sliver carries its owning thread, so a real
+         * migration drains it too; only the map above is user-gated. */
+        if (in.cur != nullptr) {
+            prev_tid_ = in.cur_tid;
+        }
+    }
     /* cur's own self-loop facts are only readable at the NEXT dispatch
      * (QEMU's plugin_rep_* fields describe the TB that finished before a
      * dispatch), so promoting arms the consume-once absorb at the head of
@@ -4065,6 +4254,7 @@ PathBuilder::complete_continuation(size_t idx,
     g_stats.census_frames_merged++;
     frames_.erase(frames_.begin() + (ptrdiff_t)idx);
     rep_emit_handoff(cpu_index, rep_state(cpu_index).pb_walk_facts);
+    g_cst_emit_site = "continuation";
     if (suffix_whole && pe.bb_tmpl) {
         g_stats.merge_cut_frame_suffix_insns += pe.bb_tmpl->n_insns;
         emit_finalized_bb(out_stream, pe.bb_tmpl, pe.branch_pc,
@@ -4074,6 +4264,7 @@ PathBuilder::complete_continuation(size_t idx,
                           pe.emit_current_pc, cont_wrong, cpu_index,
                           cont_start);
     }
+    g_cst_emit_site = "seal";
     for (size_t i = 1; i < pending_emits.size(); i++) {
         const PendingEmit &pe2 = pending_emits[i];
         rep_emit_handoff(cpu_index, rep_state(cpu_index).pb_walk_facts);
@@ -4645,6 +4836,30 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
                                               in.prev_start, seal_current_pc,
                                               pending_emits, cut_emits);
 
+    /* SMP condition census: this seal resolved at least one terminal
+     * branch, and the successor evidence (the scoreboard's current_pc /
+     * the dispatching TB) comes from a step whose executing thread is NOT
+     * the thread that ran the sealed block — the cross-thread successor
+     * read named by the prepush taken-edge poisoning finding.  Counted
+     * whenever the tids demonstrably differ (both resolved); the gates may
+     * still refuse the evidence downstream. */
+    if (any_finalize && in.walk_tid != in.cur_tid &&
+        in.walk_tid != CST_TID_UNSEEN && in.cur_tid != CST_TID_UNSEEN) {
+        for (const PendingEmit &pe : pending_emits) {
+            if (pe.branch_pc != 0) {
+                g_stats.smp_seal_cross_thread_succ++;
+                if (cst_smp_diag()) {
+                    fprintf(stderr, "[smpdiag] cross-thread successor at "
+                            "seal: block=0x%" PRIx64 " walk_tid=%u "
+                            "cur_tid=%u succ=0x%" PRIx64 " vcpu=%u\n",
+                            pe.bb_tmpl->start_pc, in.walk_tid, in.cur_tid,
+                            pe.emit_current_pc, in.cpu_index);
+                }
+                break;
+            }
+        }
+    }
+
     /*
      * Blocks the walk sealed because control left them (see CutEmit).  They
      * precede everything this step goes on to emit, so they are emitted
@@ -4686,6 +4901,7 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
             sink.assign(all.begin() + (ptrdiff_t)lo,
                         all.begin() + (ptrdiff_t)hi);
             rep_emit_handoff(in.cpu_index, rep_state(in.cpu_index).pb_walk_facts);
+            g_cst_emit_site = "cut";
             emit_body_entry(out_stream, c.bb_tmpl, in.cpu_index, {},
                             /*wp_first_tb_unavail=*/false,
                             /*branch_successor_pc=*/0,
@@ -4695,6 +4911,7 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
                             /*thread_end=*/false);
             sink.clear();
         }
+        g_cst_emit_site = "seal";
         sink.assign(all.begin() + (ptrdiff_t)pos, all.end());
         size_t &mark = cp_chain_snap_mark(in.cpu_index);
         mark = mark >= pos ? mark - pos : 0;

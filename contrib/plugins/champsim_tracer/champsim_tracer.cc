@@ -2734,6 +2734,26 @@ uint32_t &last_emit_fault_depth(unsigned int cpu_index)
  * exec_lock, which orders it exactly as the body stream it describes. */
 uint64_t g_dbg_last_emit_seq = 0;
 
+/* ---- SMP attribution-pair instrument (Stats::smp_*) --------------------
+ *
+ * Emit-site provenance for the per-thread claim ledger in emit_body_entry:
+ * every emission call site names itself so a duplicate claim's report says
+ * WHICH two mechanisms produced the two claims (the ordinary seal, a cut,
+ * a fault prefix, a continuation, a close-time flush, a departure).  A
+ * plain global, not TLS (the static-TLS budget is spent — see the
+ * CST_JUMP_DIAG block above); every writer runs under exec_lock. */
+const char *g_cst_emit_site = "seal";
+/* The vCPU a segment close is executing on while its flush hook runs, or
+ * UINT32_MAX outside a close.  Read by PathBuilder::flush_final to
+ * classify PEER-slot extents (stash vs live cursor). */
+unsigned int g_cst_closing_cpu = UINT32_MAX;
+
+bool cst_smp_diag(void)
+{
+    static const bool v = getenv("CST_SMP_DIAG") != nullptr;
+    return v;
+}
+
 /* CST_JUMP_DIAG mirrors (see champsim_tracer_path_builder.h): the depth
  * pipeline's provenance, published so the online step-discipline assertion
  * in emit_body_entry can name the code path that stamped the depth. */
@@ -4582,6 +4602,158 @@ static void heartbeat_progress(uint64_t icount)
     progress_next += progress_step;
 }
 
+/* ---- SMP attribution-pair claim ledger (Stats::smp_dup_*) --------------
+ *
+ * THE CONDITION, INSTRUMENTED AT THE CHOKE POINT.  Every body entry claims
+ * a range of one template's instructions for one guest thread; an
+ * instruction claimed twice is the trace-invalidating duplicate pair
+ * (mid-stream re-emission / duplicate final entry at the budget close).
+ * The ledger keeps, per thread, the last two USER claims and fires the
+ * moment a new claim re-covers one of them at a position the previous
+ * entry's own resolved DIRECT terminal makes unreachable — so a genuine
+ * self-loop (taken edge to its own start), an indirect branch, a REP
+ * fan-out and a disjoint fault-split continuation all stay silent, and a
+ * fire names the two emit sites, vCPUs and seqs of the double claim.
+ *
+ * Everything runs under exec_lock (every emission does); the map is
+ * process-lifetime by the stats.cc immortalization rule.
+ */
+struct SmpClaim {
+    const BBTemplate *tmpl = nullptr;
+    uint32_t bb_start = 0;
+    uint32_t bb_stop = 0;
+    uint64_t seq = 0;
+    unsigned vcpu = 0;
+    const char *site = "";
+    size_t seg = 0;            /* g_segments_written stamp */
+    uint32_t depth = 0;
+    bool valid = false;
+};
+struct SmpTidLedger {
+    SmpClaim last[2];          /* [0] = most recent */
+};
+static std::unordered_map<uint32_t, SmpTidLedger> &g_smp_claims =
+    *new std::unordered_map<uint32_t, SmpTidLedger>();
+
+/* Can @p's terminal successor set DEFINITIVELY exclude a next entry at
+ * @pc?  Only a full-range claim whose terminal is a resolved DIRECT
+ * branch (or a branchless page-split block, whose one successor is its
+ * fall-through) can answer yes; everything else answers no and the
+ * checker stays silent. */
+static bool smp_succ_excludes(const SmpClaim &p, uint64_t pc)
+{
+    const BBTemplate *t = p.tmpl;
+    if (!t || t->n_insns == 0 || !t->insn_fields ||
+        p.bb_stop != t->n_insns) {
+        return false;
+    }
+    int bi = TemplateStore::template_branch_index(t);
+    if (bi < 0) {
+        /* No terminal branch: the block was split by the translator and
+         * its only successor is the fall-through. */
+        return t->fall_through_pc != 0 && pc != t->fall_through_pc;
+    }
+    switch (t->insn_fields[bi].branch_type) {
+    case BRANCH_DIRECT_JUMP:
+    case BRANCH_DIRECT_CALL:
+        return t->taken_pc != 0 && pc != t->taken_pc;
+    case BRANCH_COND_DIRECT:
+        return t->taken_pc != 0 && t->fall_through_pc != 0 &&
+               pc != t->taken_pc && pc != t->fall_through_pc;
+    default:
+        return false;              /* indirect / return / syscall / REP */
+    }
+}
+
+static inline uint64_t smp_claim_start_pc(const SmpClaim &c)
+{
+    return (c.tmpl && c.tmpl->insn_pcs && c.bb_start < c.tmpl->n_insns)
+        ? c.tmpl->insn_pcs[c.bb_start] : (c.tmpl ? c.tmpl->start_pc : 0);
+}
+
+static inline bool smp_claims_overlap(const SmpClaim &a, const SmpClaim &b)
+{
+    return a.tmpl == b.tmpl &&
+           a.bb_start < b.bb_stop && b.bb_start < a.bb_stop;
+}
+
+static void smp_claim_report(const char *what, const SmpClaim &cur,
+                             const SmpClaim &dup, const SmpClaim &between)
+{
+    fprintf(stderr, "champsim_tracer: [smpdiag] %s: tid-claim seq=%" PRIu64
+            " pc=0x%" PRIx64 " [%u,%u) vcpu=%u site=%s RE-CLAIMS seq=%"
+            PRIu64 " vcpu=%u site=%s%s%s (between: seq=%" PRIu64
+            " pc=0x%" PRIx64 " site=%s)\n",
+            what, cur.seq, smp_claim_start_pc(cur), cur.bb_start,
+            cur.bb_stop, cur.vcpu, cur.site, dup.seq, dup.vcpu, dup.site,
+            cur.vcpu != dup.vcpu ? " CROSS-VCPU" : "",
+            strcmp(cur.site, dup.site) != 0 ? " CROSS-SITE" : "",
+            between.valid ? between.seq : 0,
+            between.valid ? smp_claim_start_pc(between) : 0,
+            between.valid ? between.site : "-");
+}
+
+/* One check per emitted entry; @tid ledger updated afterwards.  Fires
+ * Stats::smp_dup_adjacent_claims / smp_dup_wrongpc_reemit; the falsifier
+ * arm (CST_SMP_DUP_FALSIFY) replays the previous claim through the same
+ * predicates once per run so the plumbing is provably able to fire. */
+static void smp_claim_check(uint32_t tid, const BBTemplate *t,
+                            uint32_t lo, uint32_t hi, uint64_t seq,
+                            unsigned int cpu_index, uint32_t depth)
+{
+    SmpTidLedger &L = g_smp_claims[tid];
+    if (t->is_system) {
+        /* A kernel entry breaks user-flow adjacency for this thread
+         * (signal delivery, excursions): forget the claims rather than
+         * reasoning across it. */
+        L.last[0].valid = L.last[1].valid = false;
+        return;
+    }
+    if (hi <= lo) {
+        return;                     /* empty range: claims nothing */
+    }
+    g_stats.smp_dup_ledger_checks++;
+    const SmpClaim cur{ t, lo, hi, seq, cpu_index, g_cst_emit_site,
+                        g_segments_written, depth, true };
+    const SmpClaim p1 = L.last[0];
+    const SmpClaim p2 = L.last[1];
+    const uint64_t cur_pc = smp_claim_start_pc(cur);
+    auto live = [&](const SmpClaim &c) {
+        return c.valid && c.seg == cur.seg && c.depth == cur.depth;
+    };
+    if (live(p1) && smp_claims_overlap(cur, p1) &&
+        smp_succ_excludes(p1, cur_pc)) {
+        /* Shape (B): the immediately preceding entry's instructions are
+         * claimed again although its own resolved terminal cannot lead
+         * here. */
+        g_stats.smp_dup_adjacent_claims++;
+        smp_claim_report("DUPLICATE adjacent claim", cur, p1, SmpClaim{});
+    } else if (live(p1) && live(p2) && smp_claims_overlap(cur, p2) &&
+               cur.bb_start == p2.bb_start && cur.bb_stop == p2.bb_stop &&
+               smp_succ_excludes(p1, cur_pc)) {
+        /* Shape (A): the block emitted two entries ago is re-emitted at a
+         * position the intervening entry's resolved terminal makes
+         * unreachable. */
+        g_stats.smp_dup_wrongpc_reemit++;
+        smp_claim_report("DUPLICATE re-emission one entry later", cur, p2,
+                         p1);
+    }
+    /* Falsifier: prove the predicate + counter + report path can fire on
+     * this run's own data (a synthetic re-claim of p1 behind itself —
+     * never written to the wire). */
+    static const bool falsify = getenv("CST_SMP_DUP_FALSIFY") != nullptr;
+    static bool falsified = false;
+    if (falsify && !falsified && live(p1) &&
+        smp_claims_overlap(p1, p1) &&
+        smp_succ_excludes(p1, smp_claim_start_pc(p1))) {
+        falsified = true;
+        g_stats.smp_dup_falsifier_fires++;
+        smp_claim_report("FALSIFIER synthetic re-claim", p1, p1, SmpClaim{});
+    }
+    L.last[1] = p1;
+    L.last[0] = cur;
+}
+
 /*
  * Build a BodyEntry from the calling thread's CP memop/reg-snap
  * accumulators (draining them) and write it to @out_stream.
@@ -4853,6 +5025,13 @@ void emit_body_entry(BodyStreamState *out_stream,
         if (entry.thread_id != g_vcpu_user_tid[cpu_index]) {
             (sys ? g_tiddiag_kern_retagged : g_tiddiag_user_retagged)++;
         }
+    }
+    /* SMP attribution-pair claim ledger: one check per emitted entry, at
+     * the entry's FINAL range and identity (see smp_claim_check above). */
+    if (bb_tmpl) {
+        smp_claim_check(entry.thread_id, bb_tmpl, entry.bb_start,
+                        entry.bb_stop, entry.seq_num, cpu_index,
+                        entry.fault_depth);
     }
     /* Context asid (regfile / FieldState table key ONLY): the process asid,
      * held stable across a kernel excursion.  Equals asid_index in user
@@ -5848,6 +6027,12 @@ static void finish_trace_segment(bool prev_executed = true,
                                  unsigned int closing_cpu = UINT32_MAX,
                                  bool prev_in_flight = false)
 {
+    /* SMP condition census: name the closing vCPU for the duration of the
+     * close so flush_final can classify PEER-slot drains (see
+     * g_cst_closing_cpu).  UINT32_MAX (the plugin-exit route) means every
+     * builder is a peerless flush and the peer counters stay silent. */
+    g_cst_closing_cpu = closing_cpu;
+
     /* Segments actually finalised to a file.  The SimPoint report counts
      * captures with THIS, not with the schedule iterator's index: the
      * iterator only advances on a budget close, so a schedule ended by an
@@ -6065,14 +6250,51 @@ static void finish_trace_segment(bool prev_executed = true,
                 g_stats.close_flush_reordered_builders += moved_ahead;
             }
 
-            for (const CloseFlush &cf : flush_order) {
+            /*
+             * THE CONTEXT'S FINAL, NOT THE BUILDER'S.  Several builders
+             * can drain for ONE context at one close — the closing vCPU's
+             * own flush plus a peer holding the same thread's kernel
+             * excursion sliver is the measured shape — and a flush that
+             * stamped CST_BB_FLAG_THREAD_END on "its" last entry declared
+             * an end mid-context (the thread_end oracle's stamp lie).
+             * The flush order is already fixed, so decide finality by
+             * thread BEFORE flushing: for each context, only the LAST
+             * flush in the order that will EMIT may stamp.  A wrong
+             * emission prediction is counted (never silent); the oracle
+             * remains the enforcement.
+             */
+            std::unordered_map<uint32_t, size_t> smp_last_emitter;
+            std::vector<uint8_t> smp_will_emit(flush_order.size(), 0);
+            for (size_t fi = 0; fi < flush_order.size(); fi++) {
+                unsigned int fcpu = flush_order[fi].cpu;
+                PathBuilder *fb = path_builder_if_created(fcpu);
+                const bool will = fb && fb->close_flush_will_emit();
+                smp_will_emit[fi] = will ? 1 : 0;
+                if (will) {
+                    smp_last_emitter[resolve_thread_id(fcpu)] = fi;
+                }
+            }
+            auto smp_stamp_here = [&](size_t fi) {
+                unsigned int fcpu = flush_order[fi].cpu;
+                auto it = smp_last_emitter.find(resolve_thread_id(fcpu));
+                return it != smp_last_emitter.end() && it->second == fi;
+            };
+
+            for (size_t fi = 0; fi < flush_order.size(); fi++) {
+                const CloseFlush &cf = flush_order[fi];
                 if (cf.cpu == closing_cpu) {
                     /* The closing vCPU's own pending final entry. */
+                    const uint64_t cb = g_seg_arch_insns;
                     if (prev_executed) {
-                        path_builder_flush_final(closing_cpu);
+                        path_builder_flush_final(closing_cpu,
+                                                 smp_stamp_here(fi));
                     } else {
                         path_builder_flush_final_chain_only(closing_cpu,
-                                                            prev_in_flight);
+                                                            prev_in_flight,
+                                                            smp_stamp_here(fi));
+                    }
+                    if ((g_seg_arch_insns != cb) != (smp_will_emit[fi] != 0)) {
+                        g_stats.smp_close_stamp_mispredict++;
                     }
                     continue;
                 }
@@ -6102,10 +6324,15 @@ static void finish_trace_segment(bool prev_executed = true,
                  */
                 const uint64_t arch_before = g_seg_arch_insns;
                 const uint64_t user_before = g_stats.wire_user_arch_insns;
-                b->flush_final();
+                b->flush_final(/* walk_prev= */ true,
+                               /* prev_in_flight= */ false,
+                               smp_stamp_here(fi));
                 const uint64_t got_all = g_seg_arch_insns - arch_before;
                 uint64_t got = got_all;
                 uint64_t got_user = g_stats.wire_user_arch_insns - user_before;
+                if ((got_all != 0) != (smp_will_emit[fi] != 0)) {
+                    g_stats.smp_close_stamp_mispredict++;
+                }
                 if (had_slot) {
                     g_stats.close_peer_slots_flushed++;
                     if (got == 0) {
@@ -6148,9 +6375,33 @@ static void finish_trace_segment(bool prev_executed = true,
                                  return a.seq != b.seq ? a.seq < b.seq
                                                        : a.cpu < b.cpu;
                              });
-            for (const CloseFlush &cf : exit_order) {
+            /* Thread-keyed finality, same rule as the ordinary close:
+             * only a context's LAST emitting flush stamps THREAD_END. */
+            std::unordered_map<uint32_t, size_t> smp_last_emitter;
+            std::vector<uint8_t> smp_will_emit(exit_order.size(), 0);
+            for (size_t fi = 0; fi < exit_order.size(); fi++) {
+                PathBuilder *fb = path_builder_if_created(exit_order[fi].cpu);
+                const bool will = fb && fb->close_flush_will_emit();
+                smp_will_emit[fi] = will ? 1 : 0;
+                if (will) {
+                    smp_last_emitter[
+                        resolve_thread_id(exit_order[fi].cpu)] = fi;
+                }
+            }
+            for (size_t fi = 0; fi < exit_order.size(); fi++) {
+                const CloseFlush &cf = exit_order[fi];
                 if (PathBuilder *b = path_builder_if_created(cf.cpu)) {
-                    b->flush_final();
+                    auto it = smp_last_emitter.find(
+                        resolve_thread_id(cf.cpu));
+                    const uint64_t cb = g_seg_arch_insns;
+                    b->flush_final(/* walk_prev= */ true,
+                                   /* prev_in_flight= */ false,
+                                   it != smp_last_emitter.end() &&
+                                   it->second == fi);
+                    if ((g_seg_arch_insns != cb) !=
+                        (smp_will_emit[fi] != 0)) {
+                        g_stats.smp_close_stamp_mispredict++;
+                    }
                 }
             }
         }
@@ -6363,6 +6614,10 @@ static void finish_trace_segment(bool prev_executed = true,
                          g_hist.interval_size);
     }
     qemu_plugin_outs(report->str);
+
+    /* The close is over: peer classification in any later flush (a next
+     * segment's, the teardown's) must not inherit this close's vCPU. */
+    g_cst_closing_cpu = UINT32_MAX;
 }
 
 /* True when the dead-latch detector is armed: marker mode, per-process

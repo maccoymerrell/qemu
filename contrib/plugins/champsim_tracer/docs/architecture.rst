@@ -1809,6 +1809,29 @@ the contention path — user mode and a deterministic single-process
 system trace cross no foreign or abandoned boundary — no departure
 fires and the output is byte-identical.
 
+**The migration arrow (SMP).**  The pending-seal slot is per-vCPU, but
+program order is per guest thread.  When the guest scheduler moves the
+traced thread to another vCPU, the block the vacated builder still
+holds precedes everything the thread will emit from its new vCPU — and
+nothing on the old one is coming to seal it: a vacated vCPU idles
+inside the excluded async window that delivered the migration, so the
+foreign-boundary drain never fires there.  The holder is therefore
+drained **at the owning thread's first promote on its new vCPU** — the
+proof that its program order continues there — through the same
+departure emission: measured extent (the stash, or the vacated vCPU's
+parked retired cursor minus the never-snapped tail instruction),
+executed depth, terminating branch declared unresolved, and the window
+clock billed exactly what the drain publishes.  Left parked instead,
+the block surfaces only at the segment close, thousands of entries out
+of its context's program order — the source of the historical SMP
+churn shapes: a CFG-impossible adjacency where the parked block's
+neighbours sealed without it, two parked executions of one loop block
+surfacing back to back in the close's flush, and a context-final flag
+on an entry whose context continues.  ``CST_NO_MIGRATE_DRAIN``
+restores the parked behaviour as a falsifier arm.  A thread that never
+changes vCPU — every user-mode trace, every ``-smp 1`` system trace —
+never takes the arrow and its output is byte-identical.
+
 On the wire (``CST_FLAG_FAULT``, set in marker mode; user-mode traces
 advertise no fault machinery): every CP entry carries ``fault_depth``
 (0 = normal code, ≥1 = handler code at that nesting level,

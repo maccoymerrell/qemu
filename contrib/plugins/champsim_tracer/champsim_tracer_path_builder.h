@@ -155,6 +155,23 @@ uint32_t &last_emit_fault_depth(unsigned int cpu_index);
  * exec_lock). */
 extern uint64_t g_dbg_last_emit_seq;
 
+/* ---- SMP attribution-pair instrument (Stats::smp_*) --------------------
+ *
+ * g_cst_emit_site: emit-site provenance for the per-thread claim ledger in
+ * emit_body_entry.  Default "seal"; every non-seal emission call site sets
+ * it for the duration of its emissions and restores it, so a duplicate
+ * claim's report can name WHICH two mechanisms produced the two claims.
+ * Plain global (static-TLS budget is spent); written under exec_lock only.
+ *
+ * g_cst_closing_cpu: the vCPU a segment close is executing on while its
+ * flush hook runs (UINT32_MAX outside a close), so flush_final can
+ * classify a PEER slot's extent source (stash vs live cursor).
+ *
+ * cst_smp_diag(): the CST_SMP_DIAG gate, shared across TUs. */
+extern const char *g_cst_emit_site;
+extern unsigned int g_cst_closing_cpu;
+bool cst_smp_diag(void);
+
 /* ---- CST_JUMP_DIAG: online depth-step violation detector (diagnostic) ----
  *
  * The syscall_fault_nesting oracle is an OFFLINE check over the finished
@@ -632,6 +649,10 @@ public:
      * exec print in vcpu_tb_exec's shared prologue. */
     BBTemplate *prev() const { return prev_tb_; }
 
+    /* The guest thread that promoted the current slot (SMP condition
+     * census only; see the member). */
+    uint32_t prev_tid() const { return prev_tid_; }
+
     /* Flush the pending final-TB body entry before a segment finishes.
      * BodyEntries are emitted lazily — the seal phase emits the
      * *previous* TB's entry once its branch direction is known — so a TB
@@ -660,7 +681,19 @@ public:
      * and an instruction that has not completed has not delivered all its
      * memory operations.  Only meaningful with @walk_prev false (the
      * deferred route); ignored otherwise. */
-    void flush_final(bool walk_prev = true, bool prev_in_flight = false);
+    void flush_final(bool walk_prev = true, bool prev_in_flight = false,
+                     bool stamp_thread_end = true);
+
+    /* Will flush_final put at least one entry on the wire for this
+     * builder?  The close's thread-keyed THREAD_END pre-pass asks it: the
+     * flag belongs to the CONTEXT's last close-emission, and several
+     * builders can drain for one context at one close, so only the last
+     * one that will EMIT may stamp.  Mirrors flush_final's own arms (the
+     * mid-step walk snapshot, the pending-seal slot at its publishable
+     * extent, the in-flight chain); a mispredict is counted at the flush
+     * (Stats::smp_close_stamp_mispredict) and the validator's thread_end
+     * oracle is the enforcement. */
+    bool close_flush_will_emit(void) const;
 
     /* Does this builder hold anything a close would have to drain — a
      * pending-seal slot with retired instructions, an in-flight chain, or
@@ -814,6 +847,9 @@ private:
         /* Mark the LAST block this walk emits as its context's final entry
          * (CST_BB_FLAG_THREAD_END).  Set by the close-time flush only. */
         bool thread_end_last = false;
+        /* Emit-site provenance for the SMP claim ledger (g_cst_emit_site):
+         * which drain this walk is. */
+        const char *site = "close-walk";
         /* Filled by the walk: the template extent that reached the wire,
          * split by privilege.  Measured from the blocks emitted, not from
          * what the slot held — the difference is the whole of 81239d89cd. */
@@ -828,6 +864,32 @@ private:
      * honestly unresolved, and drop everything past the range.  Caller
      * clears the slot afterwards. */
     void emit_prev_at_departure(const StepIn &in);
+
+public:
+    /* THE THREAD-KEYED DRAIN (the migration arrow of emit-at-departure).
+     *
+     * The pending-seal slot is per-vCPU but program order is per THREAD:
+     * when the guest scheduler moves the traced thread to another vCPU,
+     * the block this builder still holds precedes everything the thread
+     * will emit from there, and no dispatch on THIS vCPU is coming to
+     * seal it — a vacated vCPU idles (the departure interrupt's excluded
+     * window swallowed the scheduler and never closes here), so the
+     * foreign-boundary drain never fires and the block used to sit until
+     * the segment close, surfacing thousands of entries out of program
+     * order (cp_execution_order desync, the mid-stream duplicate /
+     * displaced-block class) and mis-stamped as a context final.
+     *
+     * Called by the OWNING THREAD's first promote on its new vCPU, under
+     * exec_lock, before that step emits anything: the drain publishes the
+     * held block at its measured extent (the stash, or the vacated
+     * cursor's parked answer minus the never-snapped tail), bills the
+     * window clock exactly what it publishes (the credit refuses a slot
+     * a dispatch fold already billed), clears this builder's accumulators
+     * and slot, and leaves the terminating branch honestly unresolved —
+     * the same range arithmetic as every other departure. */
+    void drain_migrated_holder(void);
+
+private:
 
     /* In-flight fault excursions, fault-nesting order (completion may
      * retire a mid-stack frame; see frame_idx_for_completion).  Identity
@@ -944,6 +1006,12 @@ private:
      * execution and its BBs' emission one step later, and reading depth
      * at seal would lose the handler's level. */
     BBTemplate *prev_tb_ = nullptr;
+    /* SMP condition instrument: the guest thread whose dispatch promoted
+     * the current pending-seal slot (the step's cur_tid peek at the
+     * promote; CST_TID_UNSEEN when the identity was unresolved there).
+     * Diagnostic provenance only — read by the migration condition census
+     * (Stats::smp_migrated_holder_pending), never by tracer logic. */
+    uint32_t prev_tid_ = CST_TID_UNSEEN;
     /* See note_prev_extent: prev's executed count, measured at the first
      * dispatch after it, for the close walk on a vCPU the process left. */
     uint64_t prev_extent_ = 0;
@@ -1287,9 +1355,11 @@ PathBuilder *path_builder_if_created(unsigned int cpu_index);
  * The _chain_only variant is PathBuilder::flush_final(false) — the
  * deferred window close, whose pending-seal slot holds a TB that has
  * not run yet. */
-void path_builder_flush_final(unsigned int cpu_index);
+void path_builder_flush_final(unsigned int cpu_index,
+                              bool stamp_thread_end = true);
 void path_builder_flush_final_chain_only(unsigned int cpu_index,
-                                         bool prev_in_flight = false);
+                                         bool prev_in_flight = false,
+                                         bool stamp_thread_end = true);
 
 /* The close census: one pass per segment close over every builder that
  * ever ran, naming everything still held (see

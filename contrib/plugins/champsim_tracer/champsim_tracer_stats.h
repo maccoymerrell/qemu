@@ -504,6 +504,70 @@ struct Stats {
     uint64_t close_peer_user_insns_recovered = 0;
     uint64_t close_peer_slots_emitted_nothing = 0;
 
+    /* ---- SMP attribution pair: condition instruments ------------------
+     *
+     * The last exempted intermittent class on x86 -smp 4 churn: (A) a
+     * mid-stream DUPLICATE entry — a BB re-emitted at a CFG-impossible
+     * position one entry after its real emission — and (B) a duplicate
+     * FINAL entry at the budget close.  Both are an instruction claimed
+     * twice, which is trace-invalidating.  These counters instrument the
+     * CONDITION at the suspected sites, not the outcome: the per-thread
+     * claim ledger at the emission choke point (emit_body_entry) fires
+     * the moment a second claim goes on the wire, with the emit-site
+     * provenance of both claims, and the site counters below record the
+     * cross-vCPU circumstances (a seal resolving a successor produced by
+     * another thread's dispatch; a thread migrating off a vCPU whose
+     * pending-seal slot still holds its unsealed block; a close reading
+     * a peer's LIVE retired cursor) that can only produce the duplicate
+     * under SMP scheduling.
+     *
+     * smp_dup_adjacent_claims: entry N+1 re-claims entry N's instructions
+     * (same template, overlapping range, same thread, same depth) where
+     * the template's own terminal branch makes self-succession impossible
+     * (direct branch, both edges known, neither is the block's start).
+     * smp_dup_wrongpc_reemit: entry N+1 exactly re-claims entry N-1 while
+     * entry N's resolved direct terminal cannot reach it — shape (A).
+     * Both must be 0; the ledger-checks row proves the checker ran, and
+     * the falsifier row (CST_SMP_DUP_FALSIFY) proves it can fire. */
+    uint64_t smp_dup_adjacent_claims = 0;
+    uint64_t smp_dup_wrongpc_reemit = 0;
+    uint64_t smp_dup_ledger_checks = 0;
+    uint64_t smp_dup_falsifier_fires = 0;
+    /* Seal resolved a block's terminal successor on a step whose executing
+     * thread differs from the thread that ran the block (walk_tid !=
+     * cur_tid) — the cross-thread successor read named by the prepush
+     * taken-edge poisoning finding.  Condition, not defect: the gates may
+     * refuse the evidence downstream; pairs with the duplicate rows. */
+    uint64_t smp_seal_cross_thread_succ = 0;
+    /* A guest thread's consecutive promotes landed on different vCPUs. */
+    uint64_t smp_thread_migrations = 0;
+    /* Of those, the vCPU it left still held an unsealed pending-seal slot
+     * promoted by that same thread — the one-dispatch lookahead orphaned
+     * mid-block by the migration. */
+    uint64_t smp_migrated_holder_pending = 0;
+    /* Close-time peer-slot extent provenance: the stash (measured at the
+     * first dispatch after prev — definitively past) vs the LIVE retired
+     * cursor of a vCPU that may still be executing, and the slot being
+     * that vCPU's CURRENT in-flight head at the close. */
+    uint64_t smp_close_peer_stash_extent = 0;
+    uint64_t smp_close_peer_live_cursor = 0;
+    uint64_t smp_close_peer_inflight_head = 0;
+    /* The thread-keyed migration drain (the fix the condition census
+     * above caught in the act): holders drained at the owning thread's
+     * first promote on another vCPU, the instructions they published,
+     * and the drain finding no answerable extent (must be 0 — the stash
+     * or the vacated vCPU's parked cursor answers for every observed
+     * shape; an unanswerable one is a dropped block and must be seen). */
+    uint64_t smp_migrated_holders_drained = 0;
+    uint64_t smp_migrated_holder_insns = 0;
+    uint64_t smp_migrate_drain_extent_unknown = 0;
+    /* The close's thread-keyed THREAD_END pre-pass (only the context's
+     * LAST emitting flush stamps) predicted a flush's emission wrongly —
+     * the stamp may sit one flush early or the context's close-final may
+     * be unstamped; the validator's thread_end oracle is the enforcement
+     * and this row makes the prediction's misses visible in the run. */
+    uint64_t smp_close_stamp_mispredict = 0;
+
     /* ---- CLOSE CENSUS (CST_CLOSEDROP) --------------------------------
      *
      * THE WHOLE CLASS, NOT ONE HOLDER AT A TIME.  Five rounds each fixed a

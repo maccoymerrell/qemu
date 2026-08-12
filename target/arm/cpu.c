@@ -224,6 +224,24 @@ static void cp_reg_check_reset(gpointer key, gpointer value,  gpointer opaque)
     assert(oldvalue == newvalue);
 }
 
+/*
+ * The MPU and SAU register files survive a CPU reset -- they are reached
+ * through pointers to heap arrays that a reset must not drop -- so they sit
+ * past end_reset_fields, which also puts them outside the region the plugin's
+ * speculative snapshot copies (cpu_plugin_arch_state_size() returns
+ * offsetof(CPUArchState, end_reset_fields)).  That is the whole premise of
+ * arm_pmsa_write_discarded() in helper.c: a wrong-path write here is never
+ * rolled back, so it must not happen.  Check the premise rather than assert
+ * it in prose -- if the marker ever moves to cover this state, the rollback
+ * becomes automatic and the guard in helper.c should go.
+ */
+QEMU_BUILD_BUG_ON(offsetof(CPUARMState, pmsav7) <
+                  offsetof(CPUARMState, end_reset_fields));
+QEMU_BUILD_BUG_ON(offsetof(CPUARMState, pmsav8) <
+                  offsetof(CPUARMState, end_reset_fields));
+QEMU_BUILD_BUG_ON(offsetof(CPUARMState, sau) <
+                  offsetof(CPUARMState, end_reset_fields));
+
 static void arm_cpu_reset_hold(Object *obj, ResetType type)
 {
     CPUState *cs = CPU(obj);

@@ -4033,13 +4033,40 @@ static uint64_t pmsav7_read(CPUARMState *env, const ARMCPRegInfo *ri)
     return *u32p;
 }
 
+/*
+ * Wrong-path (plugin speculative execution): the MPU and SAU register files
+ * are not rollback-eligible, so a discarded path must not write them.
+ *
+ * The plugin's speculative snapshot copies CPUArchState[0 ..
+ * end_reset_fields) -- that is what cpu_plugin_arch_state_size() returns --
+ * and every PMSAv7/PMSAv8/SAU field sits past that marker, most of them in
+ * heap arrays the struct only holds a pointer to.  It cannot move: those
+ * pointers must survive a CPU reset, which is exactly what the marker
+ * delimits.  So a speculative MPU programming write is never undone, and a
+ * discarded path would permanently rewrite the guest's memory-protection
+ * configuration -- which the correct path then keeps, with a tlb_flush()
+ * already performed against it.  Drop the write instead; the same reasoning
+ * covers every writer in this family.
+ *
+ * The reads are deliberately left alone.  A wrong path is entitled to read
+ * architectural state and act on what it finds; only the escape matters.
+ */
+static bool arm_pmsa_write_discarded(CPUARMState *env)
+{
+#ifdef CONFIG_PLUGIN
+    return env_cpu(env)->plugin_spec_mode;
+#else
+    return false;
+#endif
+}
+
 static void pmsav7_write(CPUARMState *env, const ARMCPRegInfo *ri,
                          uint64_t value)
 {
     ARMCPU *cpu = env_archcpu(env);
     uint32_t *u32p = *(uint32_t **)raw_ptr(env, ri);
 
-    if (!u32p) {
+    if (!u32p || arm_pmsa_write_discarded(env)) {
         return;
     }
 
@@ -4051,6 +4078,11 @@ static void pmsav7_write(CPUARMState *env, const ARMCPRegInfo *ri,
 static void pmsav7_rgnr_write(CPUARMState *env, const ARMCPRegInfo *ri,
                               uint64_t value)
 {
+    /* Wrong-path: not rollback-eligible, see arm_pmsa_write_discarded(). */
+    if (arm_pmsa_write_discarded(env)) {
+        return;
+    }
+
     ARMCPU *cpu = env_archcpu(env);
     uint32_t nrgs = cpu->pmsav7_dregion;
 
@@ -4067,6 +4099,11 @@ static void pmsav7_rgnr_write(CPUARMState *env, const ARMCPRegInfo *ri,
 static void prbar_write(CPUARMState *env, const ARMCPRegInfo *ri,
                           uint64_t value)
 {
+    /* Wrong-path: not rollback-eligible, see arm_pmsa_write_discarded(). */
+    if (arm_pmsa_write_discarded(env)) {
+        return;
+    }
+
     ARMCPU *cpu = env_archcpu(env);
 
     tlb_flush(CPU(cpu)); /* Mappings may have changed - purge! */
@@ -4081,6 +4118,11 @@ static uint64_t prbar_read(CPUARMState *env, const ARMCPRegInfo *ri)
 static void prlar_write(CPUARMState *env, const ARMCPRegInfo *ri,
                           uint64_t value)
 {
+    /* Wrong-path: not rollback-eligible, see arm_pmsa_write_discarded(). */
+    if (arm_pmsa_write_discarded(env)) {
+        return;
+    }
+
     ARMCPU *cpu = env_archcpu(env);
 
     tlb_flush(CPU(cpu)); /* Mappings may have changed - purge! */
@@ -4095,6 +4137,11 @@ static uint64_t prlar_read(CPUARMState *env, const ARMCPRegInfo *ri)
 static void prselr_write(CPUARMState *env, const ARMCPRegInfo *ri,
                            uint64_t value)
 {
+    /* Wrong-path: not rollback-eligible, see arm_pmsa_write_discarded(). */
+    if (arm_pmsa_write_discarded(env)) {
+        return;
+    }
+
     ARMCPU *cpu = env_archcpu(env);
 
     /*
@@ -4111,6 +4158,11 @@ static void prselr_write(CPUARMState *env, const ARMCPRegInfo *ri,
 static void hprbar_write(CPUARMState *env, const ARMCPRegInfo *ri,
                           uint64_t value)
 {
+    /* Wrong-path: not rollback-eligible, see arm_pmsa_write_discarded(). */
+    if (arm_pmsa_write_discarded(env)) {
+        return;
+    }
+
     ARMCPU *cpu = env_archcpu(env);
 
     tlb_flush(CPU(cpu)); /* Mappings may have changed - purge! */
@@ -4125,6 +4177,11 @@ static uint64_t hprbar_read(CPUARMState *env, const ARMCPRegInfo *ri)
 static void hprlar_write(CPUARMState *env, const ARMCPRegInfo *ri,
                           uint64_t value)
 {
+    /* Wrong-path: not rollback-eligible, see arm_pmsa_write_discarded(). */
+    if (arm_pmsa_write_discarded(env)) {
+        return;
+    }
+
     ARMCPU *cpu = env_archcpu(env);
 
     tlb_flush(CPU(cpu)); /* Mappings may have changed - purge! */
@@ -4139,6 +4196,11 @@ static uint64_t hprlar_read(CPUARMState *env, const ARMCPRegInfo *ri)
 static void hprenr_write(CPUARMState *env, const ARMCPRegInfo *ri,
                           uint64_t value)
 {
+    /* Wrong-path: not rollback-eligible, see arm_pmsa_write_discarded(). */
+    if (arm_pmsa_write_discarded(env)) {
+        return;
+    }
+
     uint32_t n;
     uint32_t bit;
     ARMCPU *cpu = env_archcpu(env);
@@ -4175,6 +4237,11 @@ static uint64_t hprenr_read(CPUARMState *env, const ARMCPRegInfo *ri)
 static void hprselr_write(CPUARMState *env, const ARMCPRegInfo *ri,
                            uint64_t value)
 {
+    /* Wrong-path: not rollback-eligible, see arm_pmsa_write_discarded(). */
+    if (arm_pmsa_write_discarded(env)) {
+        return;
+    }
+
     ARMCPU *cpu = env_archcpu(env);
 
     /*
@@ -4191,6 +4258,11 @@ static void hprselr_write(CPUARMState *env, const ARMCPRegInfo *ri,
 static void pmsav8r_regn_write(CPUARMState *env, const ARMCPRegInfo *ri,
                           uint64_t value)
 {
+    /* Wrong-path: not rollback-eligible, see arm_pmsa_write_discarded(). */
+    if (arm_pmsa_write_discarded(env)) {
+        return;
+    }
+
     ARMCPU *cpu = env_archcpu(env);
     uint8_t index = (extract32(ri->opc0, 0, 1) << 4) |
                     (extract32(ri->crm, 0, 3) << 1) | extract32(ri->opc2, 2, 1);

@@ -1267,6 +1267,51 @@ Suppressing device and global side effects
    transparency*) knows to re-deliver it rather than merely re-arm.
    The re-arm itself is unconditional and needs no such record.
 
+   The second escape route is architectural state the snapshot does not
+   reach.  A register whose write is neither a device poke nor a
+   guest-memory store still escapes if the register lives past
+   ``end_reset_fields``, because that offset is precisely what
+   ``cpu_plugin_arch_state_size()`` copies.  Two register files are in
+   that position by necessity rather than oversight, and both are gated
+   at their writers:
+
+   * **x86 MTRRs and machine-check banks**
+     (``target/i386/tcg/system/misc_helper.c``).  ``mtrr_fixed``,
+     ``mtrr_deftype``, ``mtrr_var``, ``mcg_ctl`` and ``mce_banks`` are
+     preserved across a CPU reset and so sit past the marker; a
+     discarded ring-0 ``wrmsr`` would permanently rewrite the guest's
+     memory-type and machine-check configuration.  ``mcg_status`` is
+     deliberately left writable: it precedes the marker, is rolled back
+     with the rest of the register file, and letting the wrong path
+     write it keeps that path self-consistent with its own ``rdmsr``.
+     Every other ``wrmsr`` destination in that helper — ``pat``,
+     ``vm_hsave``, ``tsc_aux``, ``msr_ia32_misc_enable``,
+     ``msr_bndcfgs``, ``pkrs``, ``msr_smi_count``, the ``SYSENTER`` and
+     ``SYSCALL`` bases, ``efer`` — precedes the marker and is restored.
+
+   * **Arm MPU and SAU** (``target/arm/helper.c``,
+     ``arm_pmsa_write_discarded``).  ``pmsav7``, ``pmsav8`` and ``sau``
+     hold their region descriptors in heap arrays the struct reaches
+     through a pointer, and the pointers must survive a CPU reset, so
+     the whole family sits past the marker.  A discarded write to
+     ``PRBAR`` / ``PRLAR`` / ``PRSELR`` / ``HPRBAR`` / ``HPRLAR`` /
+     ``HPRSELR`` / ``HPRENR`` / ``DRBAR`` / ``DRSR`` / ``DRACR`` /
+     ``RGNR`` would permanently reprogram the guest's memory
+     protection, with the ``tlb_flush()`` those writers perform already
+     applied against it.  The reads are untouched: a wrong path is
+     entitled to read architectural state and act on what it finds.
+     ``ARM_CP_IO`` — the generic gate in ``target/arm/tcg/op_helper.c``
+     — does not cover these, because a PMSA region register has no
+     device side effect; it is ordinary CPU state that merely happens to
+     live outside the snapshot.  The M-profile CPUs reach the same state
+     through NVIC MMIO instead, which the spec store buffer already
+     contains.
+
+     ``target/arm/cpu.c`` carries the premise as three
+     ``QEMU_BUILD_BUG_ON`` offset checks rather than as prose.  If the
+     marker is ever moved to cover this state the rollback becomes
+     automatic, the assertions fire, and the guard should go with them.
+
 ``accel/tcg/cputlb.c`` — wrong-path TLB-install log
 
    Speculative accesses still run ``tlb_fill`` on a miss and install

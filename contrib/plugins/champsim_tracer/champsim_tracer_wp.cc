@@ -18,6 +18,7 @@
 
 #include "champsim_tracer.h"
 #include "champsim_tracer_bb_template_cache.h"
+#include "champsim_tracer_delay.h"
 #include "champsim_tracer_reg_snap_collector.h"
 #include "champsim_tracer_scoreboard.h"
 #include "champsim_tracer_stats.h"
@@ -664,6 +665,12 @@ static WpStep wp_exec_one_tb(WpWalkState &st)
          */
         uint64_t xlat_exhausted_before = qemu_plugin_spec_reserve_exhausted();
         tb_ok = qemu_plugin_exec_tb();
+        /* Delay attribution: one speculative dispatch.  Gated at the call so
+         * the disarmed hot path pays a relaxed int load and a predictable
+         * branch, not a thread-local resolution. */
+        if (cst_delay_armed()) {
+            cst_delay_note_spec_tb();
+        }
         tmpl = g_wp_state.last_executed_tb;
         /*
          * Latch the architectural self-loop accounting of the TB just
@@ -1751,6 +1758,17 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
     st.first_tb_unavail  = first_tb_unavail;
 
     /*
+     * Delay attribution (CST_DELAY_DIAG; inert and unmeasured otherwise).
+     * Scoped over the WHOLE call, including the saved-state failure return
+     * below: the snapshot costs wall time whether or not it succeeds, and an
+     * excursion that vanishes from the accounting when it fails would let the
+     * one number this instrument reports — the fraction of a vCPU's wall
+     * clock the walker holds — be understated exactly where a pathology
+     * would put it.  Disarmed, this is a relaxed int load and a branch.
+     */
+    CstDelayExcursion delay_scope(cpu_index, wrong_target);
+
+    /*
      * Privilege domain the excursion speculates in: the launching correct-path
      * context's, fixed by branch_pc's VA class.  Spec mode redirects only PC
      * and sandboxes memory — it never writes the paging/privilege registers —
@@ -1957,6 +1975,10 @@ std::vector<WPBBEntry> simulate_wrong_path_ext(uint64_t branch_pc,
             hist->wp_early_exits++;
         }
     }
+
+    /* Hand the walk's outcome to the delay bracket, which bills the wall and
+     * thread-CPU time of this call when its destructor runs below. */
+    delay_scope.result(sim_insns, early_exit);
 
     return std::move(wp_chain);
 }

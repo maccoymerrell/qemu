@@ -119,6 +119,104 @@ assembly artifact rather than a code change; the committed template is
 kept, a once-per-run explanatory note goes to stderr, and the event is
 counted in the ``SMC extent-only artifacts`` statistic.
 
+.. _wp-wall-clock-cost:
+
+Wall-clock cost of the wrong-path walker
+----------------------------------------
+
+The wrong-path walker is the dominant consumer of a traced vCPU's host
+wall clock, and by a wide margin.  This is a cost bound rather than a
+fidelity bound — nothing about the trace's content depends on it — but
+it is large enough, and its consequences on a full-system guest are
+indirect enough, that it is documented here rather than left to be
+rediscovered.
+
+**How large.**  Measured on x86-64, one vCPU, ``wp=1 wpdepth=64``, with
+the excursion-occupancy instrument described below: wrong-path
+excursions hold roughly **half of the vCPU thread's wall clock** —
+median occupancy 0.53 on a user-mode static binary and 0.52 (peak 0.72)
+on a system-mode marker capture.  The same user-mode workload traced
+with ``wp=0`` completes in 1.33 s against 7.76 s with ``wp=1``: the
+walker is a 5.8x multiplier on total capture time at the default depth.
+Cost rises with ``wpdepth`` and with anything that shortens translation
+blocks (a small ``-accel tcg,tb-size=`` forces more speculative
+dispatches per excursion).
+
+**Why it does not corrupt anything.**  The excursion runs with the
+guest's virtual clock frozen (``qemu_plugin_spec_vtime_pause``), and
+correct-path instrumentation runs under the same freeze, so none of this
+host time is charged to the guest's architected timers.  The guest is
+not told that it was slow; it is simply advanced less per second of real
+time.  Every wrong-path state instrument — interrupts lost or gained
+across the excursion, timer counters, device state, register rollback —
+reads zero throughout, correctly, because nothing is corrupt.
+
+**Why it is nonetheless worth measuring.**  A full-system guest is a
+control loop: it services a periodic tick whose cost is a roughly fixed
+number of *instructions*, so the fraction of its own time the guest
+spends on tick work grows as the instruction rate it is allowed falls.
+Occupancy is the term that decides how far that rate falls.  At the
+measured ~0.5 there is ample margin.  The failure mode this bound exists
+to make visible is occupancy approaching 1 — the guest kept from
+retiring instructions long enough that it cannot outrun its own timer —
+and no count of excursions can distinguish that from a healthy capture,
+because cheap and expensive excursions count identically.
+
+.. _delay-instrument:
+
+Measuring the delay: ``CST_DELAY_DIAG``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``CST_DELAY_DIAG=1`` arms a diagnostic that attributes a vCPU's host
+wall clock to the wrong-path walker.  It is off by default, it takes no
+decision and ends no run, and it changes nothing the tracer emits.
+
+Each vCPU's timeline between two consecutive excursion ends is
+partitioned exactly two ways, both measured and neither modelled::
+
+    span = excursion wall time + gap wall time
+
+``occ`` is ``excursion / span`` — the headline.  ``gap`` is everything
+else: correct-path instrumentation, guest execution, and any interval the
+host scheduler had the thread off-CPU.  Both clocks are read at every
+boundary (``CLOCK_MONOTONIC`` and ``CLOCK_THREAD_CPUTIME_ID``), so
+``sched = span_cpu / span_wall`` separates a delay caused by tracer work
+(``sched`` near 1) from one caused by host contention (``sched`` well
+below 1) instead of confounding them.  A sampler thread reports on its
+own clock — not from a callback — so an excursion that is *still open*
+is reported with its current age (``inflight_ms``) rather than being
+invisible until it finishes.
+
+Knobs: ``CST_DELAY_DIAG_MS`` sets the sample window (default 250);
+``CST_DELAY_DIAG_MIN_OCC`` suppresses windows below a threshold;
+``CST_DELAY_DIAG_INJECT_US=<n>`` is a positive control that burns a known
+``n`` microseconds inside every excursion, so the reported figure can be
+checked against a delay of known size rather than merely observed to
+move.  The injection distorts the run it is used on, by design.
+
+What it does **not** measure, stated rather than left silent:
+
+* The gap term is not decomposed.  This instrument holds no
+  correct-path hook, so it cannot separate correct-path instrumentation
+  from guest execution inside the gap.  ``RtFactorGate``'s guest-realtime
+  factor supplies that split, and the two are meant to be read together
+  on one run (``CST_RT_TRACE=1 CST_DELAY_DIAG=1``).
+* ``exec_lock`` is invisible.  A vCPU blocked waiting on a peer's
+  excursion spends that time in its own gap term, indistinguishable
+  there from guest execution.
+* It costs what it measures with.  Armed, it adds ~1.07 µs per excursion
+  (~10 % of wall on a cell running ~4 400 excursions/s), dominated by
+  ``CLOCK_THREAD_CPUTIME_ID``, which has no vDSO fast path (~215 ns
+  against ~31 ns for ``CLOCK_MONOTONIC``).  Both boundary reads are
+  ordered so that the expensive one falls outside the interval it times,
+  but the instrument still perturbs the run by roughly a tenth — immaterial
+  when hunting a hundredfold effect, and not to be quoted as a baseline.
+
+An armed run that observes no excursion at all says so once per window
+(``no wrong-path excursion has been observed on any vCPU since arming``)
+rather than printing nothing, so silence can never be misread as a
+measurement of health.
+
 Hard bounds at a glance
 -----------------------
 

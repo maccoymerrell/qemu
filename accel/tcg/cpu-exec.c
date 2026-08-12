@@ -1831,7 +1831,26 @@ void cpu_plugin_spec_vtime_pause(CPUState *cpu)
      * instead.  It is x86-ONLY because other ISAs' WP execution legitimately
      * takes the BQL for a sandboxed device access, and holding it here would
      * recursively self-lock (bql_lock asserts !bql_locked()).  Bounded by
-     * wpdepth; the excursion never blocks on the iothread, so no deadlock.
+     * wpdepth.
+     *
+     * It does NOT follow that the excursion cannot deadlock, and this comment
+     * used to end by saying it could not.  An excursion BLOCKS on the BQL
+     * every time it takes one: at the bql_lock above, on every target; at
+     * cpu_plugin_spec_vtime_resume's, on the targets that do not hold it
+     * through; and at cpu_plugin_arch_state_restore's on RISC-V.  It does so
+     * while still holding whatever lock the plugin took before calling in, so
+     * the excursion's lock order is plugin-lock then BQL.  Any seam that
+     * dispatches a plugin callback with the BQL ALREADY held and then blocks
+     * on that same plugin lock runs the order the other way and closes an
+     * AB/BA cycle.  process_queued_cpu_work() is such a seam — it runs a
+     * non-exclusive work item with the BQL held — and the machine-shutdown
+     * callback is placed through it.  Measured on aarch64 and riscv64,
+     * -smp 4, wp=1, a marker window open, SIGTERM: 4 cells of 9 stopped dead
+     * with the shutdown callback waiting on the plugin's lock, that lock's
+     * holder waiting here for the BQL the callback's own vCPU holds, and
+     * every thread in futex_wait at zero CPU.  The cure belongs at the
+     * dispatching seam, which must not hold the BQL across a plugin
+     * callback; nothing about the hold below makes an excursion safe.
      */
 #if defined(TARGET_I386)
     {

@@ -195,6 +195,23 @@ typedef uint64_t qemu_plugin_id_t;
  *   called through a function pointer whose type no longer matches its
  *   definition.  Rebuild the plugin against this header.
  *
+ * version 21:
+ * - added qemu_plugin_current_vcpu_index: the vCPU whose thread the
+ *   calling code is running on, which is what the state APIs that take
+ *   no vCPU argument (qemu_plugin_get_process_id, _get_thread_id,
+ *   _get_narrow_asid, the register and memory readers) resolve through.
+ *   QEMU_PLUGIN_VCPU_NONE outside vCPU context.
+ * - INCOMPATIBLE: the @vcpu_index of qemu_plugin_vm_shutdown_cb_t now
+ *   names the vCPU the shutdown CAME FROM and nothing else.  It used to
+ *   name the vCPU the callback was placed on, which on the monitor /
+ *   QMP / host-signal route is a vCPU QEMU picked to have a thread to
+ *   run on -- so the argument read as a fact about the guest while
+ *   carrying a fact about QEMU's own scheduling.  That route now passes
+ *   QEMU_PLUGIN_VCPU_UNNAMED, and a plugin that wants to know whose
+ *   registers it is about to read asks qemu_plugin_current_vcpu_index().
+ *   A plugin declaring 16 through 20 is refused at
+ *   qemu_plugin_register_vm_shutdown_cb().
+ *
  * ABI changes that predate this notice
  * ------------------------------------
  *
@@ -217,7 +234,11 @@ typedef uint64_t qemu_plugin_id_t;
  *   doorbell slot, its stop callback in the start slot, and the stop
  *   slot filled from an argument register it never wrote.
  * - qemu_plugin_vm_shutdown_cb_t gained @in_guest_insn inside version
- *   19, as above.  Requires version 20.
+ *   19, as above.  Requires version 20.  Its @vcpu_index changed meaning
+ *   again in version 21, which is what the entry point now requires: the
+ *   argument list is unchanged there, so nothing but the version number
+ *   separates a plugin that reads it as a placement from one that reads
+ *   it as an origin.
  *
  * Note on control-flow integrity: a --enable-cfi build cannot check any
  * of this.  Under -fsanitize=cfi-icall an indirect call into a plugin
@@ -230,7 +251,23 @@ typedef uint64_t qemu_plugin_id_t;
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 20
+#define QEMU_PLUGIN_VERSION 21
+
+/*
+ * The two values a signed vCPU index takes when it is not an index.
+ *
+ * QEMU_PLUGIN_VCPU_NONE says there is no vCPU to speak of: no vCPU has
+ * been created, or the code asking is not running on a vCPU thread.
+ *
+ * QEMU_PLUGIN_VCPU_UNNAMED says a vCPU exists and the plugin is running
+ * on one, but the event being reported does not belong to any particular
+ * vCPU.  It is the difference between "QEMU has nothing to tell you" and
+ * "QEMU has something to tell you and it is that no vCPU is meant" --
+ * distinct facts, and a plugin that has to guess which one it is holding
+ * will attribute an event to a vCPU that did not cause it.
+ */
+#define QEMU_PLUGIN_VCPU_NONE     (-1)
+#define QEMU_PLUGIN_VCPU_UNNAMED  (-2)
 
 /**
  * struct qemu_info_t - system information for plugins
@@ -1391,9 +1428,27 @@ void qemu_plugin_register_devio_cb(qemu_plugin_id_t id,
 /**
  * typedef qemu_plugin_vm_shutdown_cb_t - machine-shutdown hook
  * @id: plugin ID
- * @vcpu_index: the vCPU the callback is running on, or -1 if QEMU could
- *              not place it on one (no vCPU has been created yet, or the
- *              machine is going down without ever having run)
+ * @vcpu_index: the vCPU the shutdown CAME FROM -- the one that executed
+ *              the device write, and the only vCPU this event is a fact
+ *              about.  Two non-indices stand for the cases where there
+ *              is no such vCPU:
+ *
+ *              QEMU_PLUGIN_VCPU_UNNAMED -- the monitor, a QMP client or
+ *              SIGINT/SIGTERM asked, and no vCPU is responsible.  The
+ *              callback still runs on a vCPU thread, because that is the
+ *              only place guest memory, registers and the privilege /
+ *              address-space APIs resolve; WHICH vCPU is QEMU's own
+ *              scheduling decision, taken by which of them reaches a
+ *              translation-block boundary first, and it carries no
+ *              information about the guest.  Ask
+ *              qemu_plugin_current_vcpu_index() for the one whose state
+ *              the no-argument state APIs will read.
+ *
+ *              QEMU_PLUGIN_VCPU_NONE -- no vCPU has been created, or
+ *              none could be reached, so the callback is NOT running on
+ *              a vCPU thread and no guest state is readable at all.
+ *              A plugin holding an open capture can free it here but
+ *              cannot close it against the machine.
  * @in_guest_insn: the callback is running INSIDE the guest instruction
  *              that caused the shutdown -- a guest poweroff is a device
  *              write, and the request arrives part-way through the store
@@ -1402,12 +1457,17 @@ void qemu_plugin_register_devio_cb(qemu_plugin_id_t id,
  *              QMP and SIGINT/SIGTERM are marshalled onto a vCPU at a TB
  *              BOUNDARY, where the last dispatched block completed.
  *
- *              A plugin that closes a capture here needs the difference
- *              and cannot derive it: both routes present the same vCPU
- *              index and the same dispatch position, while one of them
- *              has an instruction in flight whose memory operations are
- *              only partly observed.  Guessing costs an instruction in
- *              one direction and a partial block in the other.
+ *              A plugin that closes a capture needs this, because
+ *              claiming the in-flight instruction publishes a block whose
+ *              memory operations are only partly observed and discarding
+ *              it throws away instructions the guest retired.  It is a
+ *              statement about POSITION in the instruction stream and
+ *              @vcpu_index is a statement about ORIGIN; QEMU makes both
+ *              rather than leaving either to be read off the other.  As
+ *              it happens the only route that names a vCPU today is also
+ *              the only one with an instruction in flight, but that is a
+ *              property of where QEMU's shutdown requests come from, not
+ *              a promise of this interface.
  *
  * Dispatched once, when the machine is going down for any reason: the
  * guest powered itself off or reset with -no-reboot, the monitor or a
@@ -1434,11 +1494,21 @@ typedef void (*qemu_plugin_vm_shutdown_cb_t)(qemu_plugin_id_t id,
  *
  * This callback is dispatched from the shutdown request itself, before
  * the main loop leaves and before qemu_cleanup() runs, and QEMU places
- * it on a vCPU thread whenever one exists (directly when the request
- * already came from vCPU context — the usual case, since a guest
- * poweroff is a device write the guest itself executed — and via
- * run_on_cpu() otherwise).  Guest memory, vCPU registers and the
- * privilege/address-space APIs are all live and stable inside it.
+ * it on a vCPU thread whenever one can be reached — directly when the
+ * request already came from vCPU context (the usual case, since a guest
+ * poweroff is a device write the guest itself executed), otherwise by
+ * offering the work to every live vCPU and taking whichever reaches a
+ * translation-block boundary first.  Guest memory, vCPU registers and
+ * the privilege/address-space APIs are all live and stable inside it.
+ *
+ * That offer is BOUNDED.  A vCPU that has stopped making progress — a
+ * plugin lock held across a stall, a guest wedged in an MMIO access,
+ * anything that keeps it out of its work queue — would otherwise hold
+ * the shutdown open for as long as it lasts, and the request that
+ * carries it is the one the operator sent to make QEMU exit.  When the
+ * bound expires QEMU says so on stderr and dispatches with
+ * QEMU_PLUGIN_VCPU_NONE: a plugin gets a degraded close rather than the
+ * machine getting a hang.
  *
  * It is dispatched at most once per run.  System emulation only: under
  * user-mode emulation the exit callback already runs on a guest thread
@@ -1468,6 +1538,24 @@ void qemu_plugin_register_atexit_cb(qemu_plugin_id_t id,
 /* returns how many vcpus were started at this point */
 QEMU_PLUGIN_API
 int qemu_plugin_num_vcpus(void);
+
+/**
+ * qemu_plugin_current_vcpu_index() - which vCPU the caller is running on
+ *
+ * Returns the index of the vCPU whose thread the calling code is on, or
+ * QEMU_PLUGIN_VCPU_NONE outside vCPU context.
+ *
+ * This is the vCPU the state APIs that take no vCPU argument read from —
+ * qemu_plugin_get_process_id(), qemu_plugin_get_thread_id(),
+ * qemu_plugin_get_narrow_asid(), the register readers and the memory
+ * readers all resolve through it, and they assert rather than answer when
+ * it is QEMU_PLUGIN_VCPU_NONE.  Most callbacks are handed the vCPU they
+ * concern and have no need of this; the ones that need it are the events
+ * QEMU marshals onto a vCPU thread it chose, where the vCPU carrying the
+ * work and the vCPU the work is about are different questions.
+ */
+QEMU_PLUGIN_API
+int qemu_plugin_current_vcpu_index(void);
 
 /**
  * qemu_plugin_outs() - output string via QEMU's logging system

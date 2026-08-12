@@ -197,8 +197,17 @@ static void plugin_require_abi(qemu_plugin_id_t id, const char *api, int since);
 void qemu_plugin_register_vm_shutdown_cb(qemu_plugin_id_t id,
                                          qemu_plugin_vm_shutdown_cb_t cb)
 {
-    /* @in_guest_insn appended inside version 19; 20 is the first that says so */
-    plugin_require_abi(id, "qemu_plugin_vm_shutdown_cb_t", 20);
+    /*
+     * @in_guest_insn appended inside version 19; 20 is the first that says
+     * so.  21 moved again, without touching the argument list: @vcpu_index
+     * stopped naming the vCPU the callback was PLACED on and started naming
+     * the vCPU the shutdown CAME FROM.  A version number is the only thing
+     * that separates the two readings, so it has to be the gate -- a plugin
+     * built at 20 would read QEMU_PLUGIN_VCPU_UNNAMED as "no vCPU exists"
+     * and, on a route where one does, close its capture without ever
+     * looking at the machine.
+     */
+    plugin_require_abi(id, "qemu_plugin_vm_shutdown_cb_t", 21);
     vm_shutdown_hook = cb;
 }
 
@@ -220,17 +229,26 @@ bool qemu_plugin_vm_shutdown_dispatch(int vcpu_index, bool in_guest_insn)
 {
     qemu_plugin_vm_shutdown_cb_t cb = vm_shutdown_hook;
 
-    if (!cb || vm_shutdown_dispatched) {
+    if (!cb) {
         return false;
     }
-    vm_shutdown_dispatched = true;
+    /*
+     * Claimed with an atomic exchange because the callers are no longer
+     * serialised.  The marshalled route offers the work to every vCPU and
+     * stops waiting after a bounded interval, so a vCPU that frees up late
+     * can be inside this function at the same moment as the thread that
+     * gave up on it, and a plugin must see this callback once.
+     */
+    if (qatomic_xchg(&vm_shutdown_dispatched, true)) {
+        return false;
+    }
     cb(0, vcpu_index, in_guest_insn);
     return true;
 }
 
 bool qemu_plugin_vm_shutdown_armed(void)
 {
-    return vm_shutdown_hook && !vm_shutdown_dispatched;
+    return vm_shutdown_hook && !qatomic_read(&vm_shutdown_dispatched);
 }
 
 /*

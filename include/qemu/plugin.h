@@ -237,7 +237,13 @@ void qemu_plugin_vm_shutdown(void);
 /*
  * The two halves of that dispatch.  _armed reports whether a plugin
  * registered a hook that has not yet fired; _dispatch delivers it at most
- * once per run and names the vCPU it is running on (-1 if none exists).
+ * once per run, claiming the single delivery atomically because more than
+ * one thread may offer it.
+ *
+ * @vcpu_index names the vCPU the shutdown CAME FROM, not the vCPU the
+ * callback ended up on: QEMU_PLUGIN_VCPU_UNNAMED where the request came
+ * from outside the machine and a vCPU was borrowed to run the callback,
+ * QEMU_PLUGIN_VCPU_NONE where there was no vCPU to borrow.
  */
 bool qemu_plugin_vm_shutdown_dispatch(int vcpu_index,
                                      bool in_guest_insn);

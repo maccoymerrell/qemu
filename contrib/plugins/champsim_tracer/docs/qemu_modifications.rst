@@ -225,6 +225,16 @@ Plugin API additions
      three return their user-mode defaults — privilege 0, ASID 0, paging
      on — in ``*-linux-user``, where a process always has one valid
      address space.
+   * ``qemu_plugin_current_vcpu_index`` — the vCPU whose thread the
+     calling code is on, or ``QEMU_PLUGIN_VCPU_NONE`` outside vCPU
+     context.  That vCPU is the subject of every state API above that
+     takes no vCPU argument, all of which assert on ``current_cpu``
+     rather than answering when there is none; this lets a plugin ask
+     instead of finding out by aborting.  It exists for the events QEMU
+     MARSHALS onto a vCPU thread of its own choosing — the machine
+     shutdown, below — where the vCPU carrying the callback and the vCPU
+     the callback is about are different questions with different
+     answers.
    * ``qemu_plugin_vaddr_to_paddr`` — debug-walks the executing vCPU's
      current translation to return the physical address a virtual
      address maps to (0 when unmapped).  It supplies the physical-page
@@ -1675,16 +1685,24 @@ Machine-shutdown notification
    Adds ``qemu_plugin_register_vm_shutdown_cb()`` (plugin API version
    16): the machine is going down, close what you have open.
 
-   The callback's SIGNATURE changed when ``in_guest_insn`` was added
-   below, and it changed while the version constant still read 19 — so
-   19 names both the two-argument and the three-argument callback and
-   cannot be honoured either way.  ``QEMU_PLUGIN_MIN_VERSION`` is 2 and
-   deliberately stays there, since raising it to cover one API would
-   reject every unrelated old plugin as well.  The gate is instead at
-   the entry point: ``qemu_plugin_register_vm_shutdown_cb()`` refuses a
-   plugin declaring below version 20 and says to rebuild, rather than
-   calling through a function pointer whose type no longer matches its
-   definition.
+   The callback's CONTRACT has moved twice.  ``in_guest_insn`` was
+   added below, and it was added while the version constant still read
+   19 — so 19 names both the two-argument and the three-argument
+   callback and cannot be honoured either way.  Version 21 then changed
+   what ``vcpu_index`` means without touching the argument list at all:
+   the same three arguments now carry the vCPU the shutdown CAME FROM
+   where they used to carry the vCPU the callback was PLACED on.  That
+   second move leaves no trace a compiler or a linker can find, so the
+   version number is the only thing that can separate the two readings.
+
+   ``QEMU_PLUGIN_MIN_VERSION`` is 2 and deliberately stays there, since
+   raising it to cover one API would reject every unrelated old plugin
+   as well.  The gate is instead at the entry point:
+   ``qemu_plugin_register_vm_shutdown_cb()`` refuses a plugin declaring
+   below version 21 and says to rebuild.  A plugin built at 20 would
+   read ``QEMU_PLUGIN_VCPU_UNNAMED`` as the old "no vCPU exists" and
+   close its capture without ever looking at the machine, on a route
+   where the machine is right there and readable.
 
    Two earlier entry points changed signature the same silent way and
    are gated the same way: ``qemu_plugin_spec_mode_begin()`` gained
@@ -1722,26 +1740,65 @@ Machine-shutdown notification
    * ``qemu_system_shutdown()`` in the main loop — the only path a HOST
      SIGNAL reaches, because ``qemu_system_killed()`` runs in a signal
      handler and sets ``shutdown_requested`` directly.  Here there is no
-     ``current_cpu``, so the callback is marshalled onto a vCPU thread
-     with ``run_on_cpu()``: it releases the BQL while it waits, and the
-     work executes at a translation-block boundary — outside any plugin
-     callback, so the plugin's own locks are free.
+     ``current_cpu``, so the callback is marshalled onto a vCPU thread:
+     the work is offered to every live vCPU with ``async_run_on_cpu()``
+     and the first one to drain its work queue delivers it, at a
+     translation-block boundary — outside any plugin callback, so the
+     plugin's own locks are free.
 
-   The callback is told WHICH of the two it is, because the difference is
-   not derivable on the plugin side and it decides what the plugin may
-   emit.  ``in_guest_insn`` is true only on the first route: a guest
-   poweroff is a device write, so the request arrives part-way through
-   the store that performs it and that instruction has BEGUN and has not
-   retired -- its memory operations are only partly observed.  On the
-   marshalled route the work runs at a translation-block boundary and the
-   last dispatched block completed.  Both present the same vCPU index and
-   the same dispatch position, so a plugin closing a capture here would
-   otherwise have to guess, and either guess costs it: claiming the
-   in-flight instruction publishes a block whose memops are incomplete
-   (cst_audit's memop-bimodality oracle catches it), while discarding an
-   instruction that did retire is a dropped instruction.  The tracer
-   walks the slot's retired prefix and subtracts exactly the in-flight
-   instruction when this flag says there is one.
+   WHICH vCPU the marshalled callback lands on is decided by that race,
+   and the callback says so rather than presenting the winner as a
+   finding.  ``vcpu_index`` names the vCPU the shutdown CAME FROM: a
+   real index on the guest-poweroff route, ``QEMU_PLUGIN_VCPU_UNNAMED``
+   on the marshalled one, ``QEMU_PLUGIN_VCPU_NONE`` where no vCPU could
+   be reached at all.  A plugin that needs to know whose registers it is
+   about to read — the vCPU the no-argument state APIs resolve through —
+   asks ``qemu_plugin_current_vcpu_index()``, and the two answers are
+   deliberately separate calls because they are separate facts.  Under
+   round-robin TCG they are not even the same vCPU: one vCPU's work
+   queue is drained without ``current_cpu`` being pointed at it.
+
+   Offering the work to every vCPU rather than to ``first_cpu`` is what
+   makes the placement robust as well as honest.  ``first_cpu`` has no
+   better claim than any other to be reachable; it may be halted, it may
+   be stopped, and — the case that matters for this tracer — it may be
+   the vCPU parked behind a plugin lock that another vCPU is holding.
+   Waiting on that one vCPU meant waiting for the stall to clear, and a
+   stall that does not clear held the shutdown open forever, on the
+   request the operator sent precisely to make QEMU exit.
+
+   The offer is bounded at ten seconds.  When it expires QEMU reports
+   the degraded close on stderr and dispatches with
+   ``QEMU_PLUGIN_VCPU_NONE``: the plugin is told plainly that no guest
+   state is readable, which is a worse close than it wanted and a far
+   better outcome than a machine that will not go down.  The queued work
+   items stay queued; a vCPU that frees up afterwards finds the hook
+   already fired, which is why the one-shot claim is an atomic exchange
+   rather than a plain flag.
+
+   ``in_guest_insn`` reports POSITION, and it is a separate statement
+   from ``vcpu_index``'s statement of ORIGIN.  It is true only on the
+   guest-poweroff route: a guest poweroff is a device write, so the
+   request arrives part-way through the store that performs it and that
+   instruction has BEGUN and has not retired — its memory operations are
+   only partly observed.  On the marshalled route the work runs at a
+   translation-block boundary and the last dispatched block completed.
+   A plugin closing a capture would otherwise have to guess, and either
+   guess costs it: claiming the in-flight instruction publishes a block
+   whose memops are incomplete (cst_audit's memop-bimodality oracle
+   catches it), while discarding an instruction that did retire is a
+   dropped instruction.  The tracer walks the slot's retired prefix and
+   subtracts exactly the in-flight instruction when this flag says there
+   is one.
+
+   The contract is exercised by ``tests/plugin-shutdown/check.sh``,
+   which builds a probe plugin and takes an x86-64 guest to a shutdown
+   four ways: a guest poweroff must name the vCPU that performed the
+   write and that vCPU must be the one whose state is live; a SIGTERM
+   must name none and still run in vCPU context; a run whose first vCPU
+   is stalled inside an instrumentation callback must still shut down
+   promptly, on some other vCPU; and a run whose only vCPU is stalled
+   must shut down on the bound, with the diagnostic.
 
    Both run before ``qemu_cleanup()``, and the dispatch is idempotent:
    whichever fires first wins.  The hook lives in ``plugins/core.c``

@@ -629,6 +629,17 @@ int qemu_plugin_num_vcpus(void)
 }
 
 /*
+ * The vCPU the caller is running on, which is the one every state API
+ * that takes no vCPU argument resolves through.  Those APIs assert on
+ * current_cpu; this reports the same fact and lets a plugin ask instead
+ * of finding out by aborting.
+ */
+int qemu_plugin_current_vcpu_index(void)
+{
+    return current_cpu ? current_cpu->cpu_index : QEMU_PLUGIN_VCPU_NONE;
+}
+
+/*
  * Plugin output
  */
 void qemu_plugin_outs(const char *string)

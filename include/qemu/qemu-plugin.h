@@ -72,10 +72,24 @@ typedef uint64_t qemu_plugin_id_t;
  *   qemu_plugin_cpu_state_free (CPU state snapshot/rollback)
  * - added qemu_plugin_set_pc, qemu_plugin_get_pc (program counter access)
  * - added qemu_plugin_exec_inline_insn (execute one instruction)
+ * - added qemu_plugin_spec_mode_begin, qemu_plugin_spec_mode_end
+ *   (speculative-execution window: guest stores land in a sandbox and
+ *   are discarded at the end of the window).  Added inside this version
+ *   without a history entry; the signature it first shipped with is not
+ *   the one below — see version 6.
  *
  * version 6:
  * - added qemu_plugin_insn_detail (structured Capstone detail for
  *   instruction operands, groups, and implicit registers)
+ * - INCOMPATIBLE: qemu_plugin_spec_mode_begin() gained @saved_state
+ *   while the version constant still read 5, so 5 names both the
+ *   no-argument and the one-argument spelling and cannot be honoured
+ *   either way; 6 is the first version that distinguishes them, and
+ *   qemu_plugin_spec_mode_begin() refuses the run when any loaded
+ *   plugin declares less.  A caller built before the change passes
+ *   nothing, and the state qemu_plugin_spec_mode_end() later restores
+ *   the vCPU from would be whatever the first argument register held.
+ *   Rebuild the plugin against this header.
  *
  * version 7:
  * - added qemu_plugin_insn_branch_target_pc (the translator-resolved
@@ -107,17 +121,30 @@ typedef uint64_t qemu_plugin_id_t;
  * version 12:
  * - added qemu_plugin_register_devio_cb (block-device I/O issue/complete
  *   notifications from the block backend, for disk-request wire records).
- *   The registration also carries a doorbell hook: the guest's virtqueue
- *   notify (kick) executes in vCPU context, so the block backend's later
- *   (main-loop) issue notification is correlated back to the issuing vCPU
- *   through a device token, giving exact owner attribution instead of a
- *   positional guess.
+ *   As added, the registration took a start and a stop callback only,
+ *   and attribution was positional: a record was charged to the next
+ *   body entry.  The doorbell hook went in later, inside this version —
+ *   see version 13.
  *
  * version 13:
  * - added qemu_plugin_thread_ptr_tracks_current (whether the target's
  *   thread-pointer register still names the executing software thread
  *   when sampled inside the kernel, so a guest task switch that happens
  *   entirely in kernel code can be followed).
+ * - INCOMPATIBLE: qemu_plugin_register_devio_cb() gained @doorbell_cb —
+ *   the guest's virtqueue notify (kick) executes in vCPU context, so the
+ *   block backend's later (main-loop) issue notification is correlated
+ *   back to the issuing vCPU through a device token, replacing the
+ *   positional guess — and qemu_plugin_devio_start_cb_t gained
+ *   @dev_token.  Both went in while the version constant still read 12,
+ *   so 12 names two incompatible spellings and cannot be honoured
+ *   either way; 13 is the first version that distinguishes them, and
+ *   qemu_plugin_register_devio_cb() refuses a plugin declaring less.
+ *   @doorbell_cb was INSERTED, not appended: a version-12 caller's
+ *   start callback would land in the doorbell slot, its stop callback
+ *   in the start slot, and the stop slot would be filled from an
+ *   argument register that caller never wrote.  Rebuild the plugin
+ *   against this header.
  *
  * version 14:
  * - struct qemu_plugin_cpu_event gained @tp/@tp_ok: the thread pointer
@@ -212,41 +239,13 @@ typedef uint64_t qemu_plugin_id_t;
  *   A plugin declaring 16 through 20 is refused at
  *   qemu_plugin_register_vm_shutdown_cb().
  *
- * ABI changes that predate this notice
- * ------------------------------------
- *
- * Three entry points changed signature WITHOUT the version constant
- * moving, so the version in force at the time names two incompatible
- * spellings of the same symbol.  QEMU now refuses the ambiguous version
- * along with everything below it, at the entry point itself, because
- * QEMU_PLUGIN_MIN_VERSION cannot express "this one API changed" without
- * also rejecting plugins that never touch it:
- *
- * - qemu_plugin_spec_mode_begin() gained @saved_state inside version 5.
- *   Requires version 6.  A caller built before the change passes no
- *   argument at all, and the vCPU state qemu_plugin_spec_mode_end()
- *   later restores from would be whatever the first argument register
- *   happened to hold.
- * - qemu_plugin_register_devio_cb() gained @doorbell_cb, and
- *   qemu_plugin_devio_start_cb_t gained @dev_token, inside version 12.
- *   Requires version 13.  This one MISALIGNS rather than appends: a
- *   three-argument caller has its start callback installed in the
- *   doorbell slot, its stop callback in the start slot, and the stop
- *   slot filled from an argument register it never wrote.
- * - qemu_plugin_vm_shutdown_cb_t gained @in_guest_insn inside version
- *   19, as above.  Requires version 20.  Its @vcpu_index changed meaning
- *   again in version 21, which is what the entry point now requires: the
- *   argument list is unchanged there, so nothing but the version number
- *   separates a plugin that reads it as a placement from one that reads
- *   it as an origin.
- *
- * Note on control-flow integrity: a --enable-cfi build cannot check any
- * of this.  Under -fsanitize=cfi-icall an indirect call into a plugin
- * traps because the target lives in a module the CFI type tables do not
- * cover, whether or not the signatures agree -- which is why every
- * dispatch site that calls into a plugin carries QEMU_DISABLE_CFI.  A
- * signature mismatch is undefined behaviour on its own terms; CFI is
- * not the instrument that finds it.
+ * Where an entry above says a signature changed WITHOUT the version
+ * constant moving, the version in force at the time names two
+ * incompatible spellings of the same symbol and cannot be honoured
+ * either way, so the entry point refuses the ambiguous version along
+ * with everything below it.  The gate sits at the entry point rather
+ * than at QEMU_PLUGIN_MIN_VERSION because a floor raised for one API
+ * would also reject every old plugin that never touches it.
  */
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;

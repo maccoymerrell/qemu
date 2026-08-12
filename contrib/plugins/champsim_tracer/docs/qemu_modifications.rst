@@ -1938,12 +1938,6 @@ Machine-shutdown notification
    callbacks land one slot over and the stop slot is filled from a
    register that caller never wrote.
 
-   Control-flow integrity is not the instrument that catches any of
-   this.  Under ``-fsanitize=cfi-icall`` an indirect call into a plugin
-   traps because the target is in a module the CFI type tables do not
-   cover, matching signature or not; that is why every dispatch site
-   into a plugin carries ``QEMU_DISABLE_CFI``.
-
    The existing ``qemu_plugin_register_atexit_cb()`` cannot serve this
    purpose in system emulation.  It fires from libc's ``atexit(3)``,
    which runs *after* ``qemu_cleanup()`` has stopped every vCPU and torn

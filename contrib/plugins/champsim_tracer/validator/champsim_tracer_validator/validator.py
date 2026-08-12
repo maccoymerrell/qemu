@@ -1475,16 +1475,20 @@ def _check_memop_bimodality(
     predication rate genuinely warrants a wider band.  Correct-path
     only — wrong-path wandering carries no dataflow contract.
 
-    A fault-TRUNCATED execution is excluded from the population
-    entirely.  An entry carrying fault anchors (``fault_at``) stopped
-    part-way through its template — in the limit at insn 0, before any
-    memop-capable instruction retired — so it never had the chance to
-    realise the template's memops, and the wire says so explicitly.
-    Counting it as a zero-memop outlier reports a completeness loss the
-    trace itself already explains (a kernel copy loop taking a page
-    fault on its first store is the canonical case).  This costs the
-    oracle no strictness: the loss it exists to catch is a SILENT one,
-    and a silently dropped memop section carries no anchor.
+    A PARTIAL execution is excluded from the population entirely.  An
+    entry whose declared range ``[bb_start, bb_stop)`` (§4.2a) does not
+    cover the whole template ran part of the block — in the limit one
+    instruction — so it never had the chance to realise the template's
+    full memop complement, and the wire says so explicitly.  Counting
+    it as a zero-memop outlier reports a completeness loss the trace
+    itself already explains (a kernel copy loop taking a page fault on
+    its first store is the canonical case).  This costs the oracle no
+    strictness: the loss it exists to catch is a SILENT one, and a
+    silently dropped memop section declares no partial range.  (The
+    population itself shifts once split emission makes partial entries
+    routine rather than exceptional; the thresholds are tunable and the
+    exclusion is exact — mirrored with ``cst_lint.h``'s
+    ``MemopBimodalityLint``, which keys on the same range.)
     """
     from collections import defaultdict
     per_tid: dict[int, list[int]] = defaultdict(list)
@@ -1517,7 +1521,7 @@ def _check_memop_bimodality(
                     optional_only.add(tid)
         if tid in excluded:
             continue                      # nothing here to hold to the rule
-        if e.get("fault_anchors"):
+        if _entry_is_partial(e, tmpl):
             truncated += 1                # partial execution; not comparable
             continue
         dps = e.get("dyn_params") or []
@@ -1788,12 +1792,15 @@ def _check_per_execution_memop_shape(
         tmpl = templates_by_id.get(tid)
         if tmpl is None:
             continue
-        # Kernel templates and fault-handler executions (fault_depth>0)
-        # are exempt: a faulting access transfers 0 bytes on the attempt
-        # that traps and the full width on the post-handler retry, so the
-        # per-execution shape legitimately differs across a fault.  Fault
-        # blocks must not perturb the user workload's shape baseline.
-        if tmpl.get("is_system") or int(e.get("fault_depth", 0) or 0) > 0:
+        # Kernel templates, fault-handler executions (fault_depth>0) and
+        # PARTIAL entries (a declared range shorter than the template,
+        # §4.2a) are exempt: a faulting access transfers 0 bytes on the
+        # attempt that traps and the full width on the post-handler
+        # retry, and a split stretch realises only its own range's
+        # memops — neither may perturb the user workload's whole-block
+        # shape baseline.
+        if (tmpl.get("is_system") or int(e.get("fault_depth", 0) or 0) > 0
+                or _entry_is_partial(e, tmpl)):
             continue
         shape = _shape_for_entry(e, tmpl)
         if tid not in baseline:
@@ -4244,7 +4251,16 @@ def _check_wrong_path_chains(entries: list[dict],
             blocks = [bid for (bid, _)
                       in template_runs.get(wp["template_id"], [])]
             wp_raw.extend(blocks)
-            actual_sim_insns += int(wp.get("n_insns", 0) or 0)
+            # A speculative block contributes the instructions of its
+            # DECLARED range (§4.2a): bb_stop - bb_start, which is
+            # n_insns exactly when the block ran whole.  The wpdepth
+            # budget arithmetic must count what the walker simulated,
+            # not what the template holds.
+            w_start = int(wp.get("bb_start", 0) or 0)
+            w_stop = wp.get("bb_stop")
+            w_n = int(wp.get("n_insns", 0) or 0)
+            w_stop = w_n if w_stop is None else int(w_stop)
+            actual_sim_insns += max(0, w_stop - w_start)
             if crossed:
                 wp_left_user = True
 
@@ -5002,22 +5018,25 @@ def _check_fault_excursions(entries: list[dict],
     n_handler = 0
     max_depth = 0
     user_at_depth = 0
-    n_merged = 0          # faulting BBs reassembled across excursions
+    n_split = 0           # continuation entries (bb_start > 0, §4.2a)
     for e in entries:
-        # Faulting-instruction anchors mark a BB that faulted and was
-        # reassembled whole; verify each indexes a real instruction.
-        anchors = e.get("fault_anchors") or []
-        if anchors:
-            n_merged += 1
-            t = templates_by_id.get(e["template_id"])
+        # A continuation entry resumes the block an excursion (or a
+        # capture boundary) interrupted; its resume index must name a
+        # real instruction of its own template.  Contiguity with the
+        # prefix is range_continuity's job — this asserts only the
+        # in-template bound the anchor-era check asserted per anchor.
+        t = templates_by_id.get(e["template_id"])
+        e_start = int(e.get("bb_start", 0) or 0)
+        if e_start > 0:
+            n_split += 1
             n_insns = len(t.get("insns") or []) if t else 0
-            for a in anchors:
-                if n_insns and a >= n_insns:
-                    issues.append(Issue(
-                        "fault_excursions", "error",
-                        f"entry seq={e.get('seq_num')} (BB{e['template_id']}) "
-                        f"fault anchor {a} out of range (n_insns={n_insns})",
-                        {"seq_num": e.get("seq_num"), "anchor": a}))
+            if n_insns and e_start >= n_insns:
+                issues.append(Issue(
+                    "fault_excursions", "error",
+                    f"entry seq={e.get('seq_num')} (BB{e['template_id']}) "
+                    f"resumes at index {e_start}, out of range "
+                    f"(n_insns={n_insns})",
+                    {"seq_num": e.get("seq_num"), "bb_start": e_start}))
         d = int(e.get("fault_depth", 0) or 0)
         if d == 0:
             n_depth0 += 1
@@ -5051,10 +5070,10 @@ def _check_fault_excursions(entries: list[dict],
     return [Issue(
         "fault_excursions", "info",
         f"fault excursions: {n_handler} handler entries (max depth "
-        f"{max_depth}), all kernel-privileged; {n_merged} faulting BBs "
-        f"reassembled whole; {n_depth0} entries at baseline depth 0",
+        f"{max_depth}), all kernel-privileged; {n_split} split-resumed "
+        f"block stretch(es); {n_depth0} entries at baseline depth 0",
         {"handler_entries": n_handler, "max_depth": max_depth,
-         "merged_bbs": n_merged, "depth0_entries": n_depth0})]
+         "split_stretches": n_split, "depth0_entries": n_depth0})]
 
 
 def _check_call_return_balance(entries: list[dict],
@@ -5634,6 +5653,189 @@ def _template_successor_pcs(t: dict,
     return s
 
 
+def _entry_range(e: dict, tmpl: dict | None) -> tuple[int, int, int]:
+    """Resolve an entry's executed range ``[bb_start, bb_stop)`` against
+    its template (format spec §4.2a).  ``bb_stop`` is ``None`` on a
+    whole-block entry (the wire's baseline default), so it resolves to
+    the template's instruction count.  Returns ``(start, stop, n_insns)``."""
+    n = len((tmpl or {}).get("insns") or [])
+    start = int(e.get("bb_start", 0) or 0)
+    stop = e.get("bb_stop")
+    stop = n if stop is None else int(stop)
+    return start, stop, n
+
+
+def _entry_is_partial(e: dict, tmpl: dict | None) -> bool:
+    start, stop, n = _entry_range(e, tmpl)
+    return start > 0 or stop < n
+
+
+def _check_range_invocations(entries: list[dict],
+                             templates_by_id: dict,
+                             trace_meta: dict | None = None) -> list[Issue]:
+    """Executed-range well-formedness and continuity (format spec §4.2a).
+
+    An entry declares the half-open range ``[bb_start, bb_stop)`` of its
+    template it fully observed.  A block interrupted mid-flight emits one
+    entry per stretch, in strict program order within its
+    ``(thread_id, asid)`` context: the prefix ``[0, k)``, the excursion's
+    entries at a deeper ``fault_depth``, then the continuation ``[k, n)``.
+    This check enforces what that shape makes checkable:
+
+      * **sanity** — every entry satisfies ``0 <= start < stop <= n``
+        (the decoder rejects violations on the wire; this re-asserts it
+        for the decoded structures the oracle mutations perturb);
+      * **continuity** — an entry with ``bb_start = k > 0`` must continue
+        an OPEN invocation of the same template in the same context whose
+        stop is exactly ``k``.  A continuation without its prefix, or a
+        non-contiguous one, is a wire defect, never a licensed shorthand
+        (§4.2a: the format has no way to skip instructions mid-block);
+      * **abandonment** — while an invocation is open, the only entries
+        its context may emit before the continuation are the excursion's
+        (``fault_depth`` strictly deeper).  A same-or-shallower entry
+        that is not the continuation abandons the block: legal when an
+        excursion is on the wire to explain the redirect (a handler may
+        never return), a defect when nothing intervened — a user-mode
+        stream cannot lose the tail of a block invisibly.  With
+        ``faults=0`` the handler is deliberately excluded from capture,
+        so a redirect leaves no wire evidence and the abandonment arm is
+        N/A there (continuity above still holds — §4.2a promises the
+        stretches arrive adjacent, in order, with nothing between).
+
+    A trailing open invocation (window/budget close mid-block) is legal:
+    the stream simply ends, or the entry is its context's last.
+    """
+    issues: list[Issue] = []
+    faults_excluded = "faults=0" in str((trace_meta or {}).get("command", ""))
+    # ctx -> {template_id -> {"stop", "depth", "seq", "excursion_seen"}}
+    open_by_ctx: dict[tuple, dict[int, dict]] = {}
+    n_split = n_continued = 0
+    err_cap = 5
+
+    def _err(msg: str, **detail):
+        if len(issues) < err_cap:
+            issues.append(Issue("range_continuity", "error", msg, detail))
+        else:
+            issues.append(Issue("range_continuity", "error", msg))
+
+    for e in entries:
+        t = templates_by_id.get(e["template_id"])
+        if t is None:
+            continue
+        ctx = (int(e.get("thread_id", 0)), int(e.get("asid_index", 0)))
+        d = int(e.get("fault_depth", 0) or 0)
+        start, stop, n = _entry_range(e, t)
+        seq = e.get("seq_num")
+        tid = int(e["template_id"])
+
+        if not (0 <= start < stop <= n):
+            _err(f"entry seq={seq} (BB{tid}) declares malformed range "
+                 f"[{start},{stop}) against n_insns={n}",
+                 seq_num=seq, start=start, stop=stop, n_insns=n)
+            continue
+
+        opens = open_by_ctx.setdefault(ctx, {})
+
+        # Excursion bookkeeping: an entry strictly deeper than an open
+        # invocation is the excursion that interrupted it — expected.
+        for inv in opens.values():
+            if d > inv["depth"]:
+                inv["excursion_seen"] = True
+
+        if start > 0:
+            n_continued += 1
+            inv = opens.get(tid)
+            if inv is None:
+                _err(f"entry seq={seq} (BB{tid}) continues at "
+                     f"[{start},{stop}) but no open invocation of that "
+                     f"template exists in context {ctx}",
+                     seq_num=seq, start=start)
+            elif inv["stop"] != start or inv["depth"] != d:
+                _err(f"entry seq={seq} (BB{tid}) continues at {start} but "
+                     f"its open invocation stopped at {inv['stop']} "
+                     f"(depth {inv['depth']} vs {d}); a continuation must "
+                     f"resume exactly where the prefix stopped",
+                     seq_num=seq, start=start, open_stop=inv["stop"])
+                del opens[tid]
+            else:
+                if stop < n:
+                    inv.update(stop=stop, seq=seq, excursion_seen=False)
+                else:
+                    del opens[tid]
+            # Fall through to the abandonment sweep below for OTHER opens.
+        else:
+            prev = opens.get(tid)
+            if prev is not None and prev["depth"] == d:
+                if not (prev["excursion_seen"] or faults_excluded):
+                    _err(f"entry seq={seq} (BB{tid}) re-opens the template "
+                         f"while its invocation from seq={prev['seq']} is "
+                         f"still open at {prev['stop']} with no excursion "
+                         f"between — the earlier block lost its tail",
+                         seq_num=seq, prev_seq=prev["seq"])
+                del opens[tid]
+
+        # Abandonment: any open invocation at depth >= d that this entry
+        # did not continue can no longer be continued (the context moved
+        # on at its level).  With an excursion on the wire the redirect
+        # is explained; without one it is a defect.
+        for otid in [k for k, inv in opens.items()
+                     if inv["depth"] >= d and not (k == tid and start > 0)]:
+            inv = opens[otid]
+            if not (inv["excursion_seen"] or faults_excluded):
+                _err(f"entry seq={seq} in context {ctx} abandons the open "
+                     f"invocation of BB{otid} (stopped at {inv['stop']}, "
+                     f"seq={inv['seq']}) with no excursion on the wire to "
+                     f"explain the cut",
+                     seq_num=seq, abandoned=otid, open_stop=inv["stop"])
+            del opens[otid]
+
+        if start == 0 and stop < n:
+            n_split += 1
+            opens[tid] = {"stop": stop, "depth": d, "seq": seq,
+                          "excursion_seen": False}
+
+    errors = [i for i in issues if i.severity == "error"]
+    if errors:
+        return errors[: err_cap + 1]
+    return [Issue(
+        "range_continuity", "info",
+        f"{n_split} split invocation(s) opened, {n_continued} "
+        f"continuation(s), all contiguous within their contexts",
+        {"splits": n_split, "continuations": n_continued})]
+
+
+def _check_wp_fork_resolved(entries: list[dict]) -> list[Issue]:
+    """A wrong path forks off a RESOLVED terminating branch (the fork
+    redirects the PC to the not-taken alternative of an outcome the
+    tracer observed).  An entry that carries a wrong-path chain but no
+    resolved branch outcome is therefore self-contradictory: either the
+    outcome was withheld (a stuck CST_BB_FLAG_BRANCH_UNRESOLVED — the
+    flag latching past the entry it described) or the chain was forged.
+    An entry whose range does not reach the terminating branch forks no
+    wrong path, so absence of both is always consistent."""
+    issues: list[Issue] = []
+    n_forked = 0
+    for e in entries:
+        wps = [w for w in (e.get("wp_entries") or []) if w.get("template_id")]
+        if not wps:
+            continue
+        n_forked += 1
+        if e.get("branch_taken") is None and len(issues) < 5:
+            issues.append(Issue(
+                "wp_fork_resolved", "error",
+                f"entry seq={e.get('seq_num')} (BB{e['template_id']}) "
+                f"carries a {len(wps)}-block wrong-path chain but no "
+                f"resolved branch outcome; a wrong path forks off a "
+                f"resolved branch only",
+                {"seq_num": e.get("seq_num"), "wp_blocks": len(wps)}))
+    if issues:
+        return issues
+    return [Issue(
+        "wp_fork_resolved", "info",
+        f"{n_forked} WP-forking entries all carry a resolved branch "
+        f"outcome", {"forked": n_forked})]
+
+
 def _check_thread_chain(entries: list[dict],
                         templates_by_id: dict,
                         expected_guest_threads: int | None = None,
@@ -5685,6 +5887,10 @@ def _check_thread_chain(entries: list[dict],
                 rep_branch_id = int(bid)
                 break
 
+    # tid -> (template_id, stop) of an OPEN partial user entry (§4.2a):
+    # its only legitimate user-side successor is its own continuation.
+    partial_by_tid: dict[int, tuple[int, int]] = {}
+
     for e in entries:
         t = templates_by_id.get(e["template_id"])
         if t is None:
@@ -5696,20 +5902,45 @@ def _check_thread_chain(entries: list[dict],
             continue
         pc = int(t.get("start_pc", 0))
         n_user += 1
-        succ = _template_successor_pcs(t, rep_branch_id)
+        start, stop, n = _entry_range(e, t)
 
         prev = chain_by_tid.get(tid, "unseen")
-        if prev == "unseen":
+        if start > 0:
+            # A continuation names the SAME template and resumes exactly
+            # where the thread's open partial entry stopped — asserted
+            # here even across an intervening kernel excursion, which is
+            # precisely the case the old excursion-restart laxity could
+            # not check.  A continuation with no open partial, or at the
+            # wrong index, does not continue this thread's control flow.
+            tid_pairs += 1
+            if partial_by_tid.get(tid) == (int(e["template_id"]), start):
+                tid_connected += 1
+            else:
+                orphans.append((e.get("seq_num"), pc, tid))
+        elif prev == "unseen":
             births_by_tid[tid] = (e.get("seq_num"), pc)   # first sight
         elif prev is None:
-            pass                                          # excursion restart
+            # Excursion restart: the kernel may resume the thread at a
+            # redirected PC (a handler that never returns), so a fresh
+            # whole-or-prefix entry restarts the chain without penalty.
+            # Any open partial was legitimately abandoned by the redirect.
+            partial_by_tid.pop(tid, None)
         else:
             tid_pairs += 1
             if pc in prev:
                 tid_connected += 1
             else:
                 orphans.append((e.get("seq_num"), pc, tid))
-        chain_by_tid[tid] = succ
+
+        if stop < n:
+            # Partial user entry: it never reached its terminating
+            # branch, so the template's successor set is NOT a
+            # legitimate next-user-PC — only its own continuation is.
+            partial_by_tid[tid] = (int(e["template_id"]), stop)
+            chain_by_tid[tid] = set()
+        else:
+            partial_by_tid.pop(tid, None)
+            chain_by_tid[tid] = _template_successor_pcs(t, rep_branch_id)
 
     for seq, pc, tid in orphans[:5]:
         issues.append(Issue(
@@ -5758,8 +5989,10 @@ def _check_thread_strand_sequential(entries: list[dict],
     control flow.
 
     Filtered to one context, entry N's terminal branch names entry N+1's
-    start (or one of its fault anchors, for a merged block).  When it does
-    not, the strand was diverted, and the diversion is remembered.  Every
+    resume PC — the template's start, or ``insns[bb_start].pc`` for a
+    continuation entry (§4.2a); one explicit PC, never a set of
+    alternatives.  When it does not, the strand was diverted, and the
+    diversion is remembered.  Every
     diversion the format documents ends the strand's participation for a
     while and resumes exactly where a *nesting* boundary says it should:
     entering an excursion raises ``fault_depth``, returning lowers it, a
@@ -5815,13 +6048,17 @@ def _check_thread_strand_sequential(entries: list[dict],
         clock = seen_by_ctx.get(ctx, 0) + 1
         seen_by_ctx[ctx] = clock
 
-        # Where control may legitimately land in THIS entry: its own start,
-        # or any instruction a fault anchor resumes it at (merged block).
-        resume_pcs = {int(t.get("start_pc", 0))}
+        # Where control lands in THIS entry — SINGULAR and explicit
+        # (§4.2a): a whole-block or prefix entry starts at the template's
+        # start; a continuation entry (bb_start > 0) resumes at exactly
+        # its bb_start instruction's PC.  One PC, not a set of
+        # alternatives — strictly stronger than the anchor-era union.
         insns = t.get("insns") or []
-        for a in e.get("fault_anchors") or []:
-            if 0 <= int(a) < len(insns):
-                resume_pcs.add(int(insns[int(a)]["pc"]))
+        e_start = int(e.get("bb_start", 0) or 0)
+        if 0 < e_start < len(insns):
+            resume_pcs = {int(insns[e_start]["pc"])}
+        else:
+            resume_pcs = {int(t.get("start_pc", 0))}
 
         prev = prev_by_ctx.get(ctx)
         known = prev is not None and prev["target"] is not None
@@ -6031,10 +6268,11 @@ def _check_syscall_fault_nesting(entries: list[dict],
         for it.  The user-level clamp and the non-migrating threads stay
         strict; whole-system multi-process attribution (ASID on the
         wire) is future work, see docs/architecture.rst,
-      * fault-anchored (whole-BB-merged) entries sit at the unwind of
-        an excursion: the same tid was at a *higher* depth on the
-        previous entry, or the anchor marks the merged completion of
-        the faulting BB at its own level,
+      * continuation entries (``bb_start > 0``) sit directly at the
+        excursion boundary: the same tid's previous entry either ran
+        strictly deeper (the handler this continuation returns from) or
+        is the block's own ``[0, k)`` prefix (``faults=0``, where the
+        handler is excluded and the stretches arrive adjacent),
       * depth histogram is reported so nesting regressions are visible.
     """
     bn = trace_meta.get("branch_names") or {}
@@ -6048,6 +6286,7 @@ def _check_syscall_fault_nesting(entries: list[dict],
     depth_hist: Counter = Counter()
     prev_depth_by_tid: dict[int, int] = {}
     prev_sys_by_tid: dict[int, bool] = {}
+    prev_tmpl_by_tid: dict[int, tuple[int, int]] = {}
     step_errors = 0
 
     # Per-tid syscall windows: user syscall block -> kernel entries ->
@@ -6089,37 +6328,52 @@ def _check_syscall_fault_nesting(entries: list[dict],
                     f"depth jumped {pd} -> {d}; excursions must nest and "
                     f"unwind one level at a time",
                     {"seq_num": e.get("seq_num"), "from": pd, "to": d}))
-        # A fault-anchored entry is the whole-BB merge of the block the
-        # excursion interrupted, so it must sit at the unwind: the same
-        # tid's previous entry ran one level deeper (inside the fault
-        # handler this merge is returning from).
+        # A continuation entry (bb_start = k > 0, §4.2a) resumes the
+        # block an excursion interrupted, so within its own tid it must
+        # sit DIRECTLY at the excursion boundary: the tid's previous
+        # entry either ran strictly deeper (the handler content this
+        # continuation returns from), or — when the handler was excluded
+        # from capture (``faults=0``) — is this block's own prefix, same
+        # template, stopped at exactly k.  This is checkable by
+        # ADJACENCY because program order is unconditional: nothing is
+        # deferred or reassembled, so the split shape sits on the wire
+        # exactly where the guest ran it.  It replaces the anchor-era
+        # unwind heuristic with a direct statement, expressible only
+        # because the range made program order unconditional.
         #
-        # This ran single-threaded ONLY, on the reasoning that a
-        # multi-thread trace's same-tid predecessor "may be an unrelated
-        # thread's entry" — which cannot happen: prev_depth_by_tid is keyed
-        # BY tid, so the predecessor is the same thread by construction.
-        # The real multi-thread caveat is the one the step rule already
-        # names: a preemptible kernel can put a thread's user entry (clamped
-        # to depth 0) next to its own kernel entries, and the fault stack is
-        # per-vCPU, so a PRIVILEGE-CROSSING predecessor carries no usable
-        # depth.  Exempting exactly that pair keeps every real multi-thread
-        # anchor assertion live instead of switching the whole check off —
-        # it was dark in system.churn_x86, the one regime where the merge
-        # machinery runs under multi-process fault contention, i.e. exactly
-        # where an anchor-at-unwind regression would first appear.
-        anchor_exempt = (guest_threads > 1 and ps is not None
-                         and ps != is_sys)
-        if (not anchor_exempt
-                and e.get("fault_anchors") and pd is not None and pd <= d):
+        # This runs keyed BY tid, so the predecessor is the same thread
+        # by construction.  The one multi-thread caveat is the step
+        # rule's own: a PRIVILEGE-CROSSING predecessor carries no usable
+        # depth (user entries are clamped to 0 next to raw-depth kernel
+        # entries), so exactly that pair is exempted — the check stays
+        # live everywhere else, including churn_x86's multi-process
+        # fault contention where a continuation-order regression would
+        # first appear.
+        cont_exempt = (guest_threads > 1 and ps is not None
+                       and ps != is_sys)
+        e_start = int(e.get("bb_start", 0) or 0)
+        pt = prev_tmpl_by_tid.get(tid)
+        if (not cont_exempt and e_start > 0 and pd is not None
+                and not (pd > d
+                         or (pd == d and pt is not None
+                             and pt[0] == int(e["template_id"])
+                             and pt[1] == e_start))):
             issues.append(Issue(
                 "syscall_fault_nesting", "error",
-                f"entry seq={e.get('seq_num')} thread={tid} carries fault "
-                f"anchors {e['fault_anchors']} at depth {d} but the tid's "
-                f"previous entry was at depth {pd}; a merged faulting BB "
-                f"must follow its excursion's unwind",
-                {"seq_num": e.get("seq_num"), "depth": d, "prev": pd}))
+                f"entry seq={e.get('seq_num')} thread={tid} resumes at "
+                f"index {e_start} (depth {d}) but the tid's previous "
+                f"entry was neither the excursion it returns from "
+                f"(depth {pd} not > {d}) nor its own prefix stopped at "
+                f"{e_start}; a continuation must directly follow the "
+                f"excursion that interrupted its block",
+                {"seq_num": e.get("seq_num"), "depth": d, "prev": pd,
+                 "bb_start": e_start}))
         prev_depth_by_tid[tid] = d
         prev_sys_by_tid[tid] = is_sys
+        e_stop = e.get("bb_stop")
+        prev_tmpl_by_tid[tid] = (
+            int(e["template_id"]),
+            len(t.get("insns") or []) if e_stop is None else int(e_stop))
 
         if in_syscall_by_tid.get(tid):
             if is_sys:
@@ -7380,6 +7634,8 @@ def validate_structural(trace_path: Path,
                                              templates_by_id)
     issues += _check_thread_record_cadence(
         entries, trace_meta.get("body_record_order") or [])
+    issues += _check_range_invocations(entries, templates_by_id, trace_meta)
+    issues += _check_wp_fork_resolved(entries)
     issues += _check_thread_chain(entries, templates_by_id,
                                   expected_guest_threads, trace_meta)
     issues += _check_thread_strand_sequential(entries, templates_by_id)
@@ -7570,6 +7826,16 @@ def validate(meta_path: Path, trace_path: Path,
     cp_entries = entries[cp_start:]
     cp_flat: list[int] = []
     for e in cp_entries:
+        # A continuation entry (bb_start > 0, §4.2a) resumes an
+        # invocation its [0, k) prefix already opened: the prefix
+        # contributed the block visit, so the continuation contributes
+        # none — one invocation, however many stretches carried it.
+        # Whether the stretches actually chain contiguously is
+        # _check_range_invocations' job (range_continuity), asserted
+        # below; folding here without that check would silently launder
+        # a prefixless continuation into a fresh visit.
+        if int(e.get("bb_start", 0) or 0) > 0:
+            continue
         for bid, _ in template_runs.get(e["template_id"], []):
             cp_flat.append(bid)
     cp_block_seq = _collapse_runs(cp_flat)
@@ -7817,6 +8083,8 @@ def validate(meta_path: Path, trace_path: Path,
     issues += _check_thread_chain(entries, templates_by_id,
                                   expected_guest_threads=1,
                                   trace_meta=trace_meta)
+    issues += _check_range_invocations(entries, templates_by_id, trace_meta)
+    issues += _check_wp_fork_resolved(entries)
     issues += _check_thread_strand_sequential(entries, templates_by_id)
     # WP-event tallies are global (the writer counts every WP fault,
     # including those in the pre-window prologue — which in system mode

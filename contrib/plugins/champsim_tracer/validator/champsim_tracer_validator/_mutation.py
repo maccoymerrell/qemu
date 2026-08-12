@@ -667,6 +667,53 @@ def _m_bb_successor_missequence(triple, gen_meta) -> Optional[str]:
     return None
 
 
+def _m_split_pair_reorder(triple, gen_meta) -> Optional[str]:
+    """Split one whole-block entry into its two §4.2a stretches and emit
+    them in the WRONG order — the continuation ``[k, n)`` before its own
+    prefix ``[0, k)``.  Program order is unconditional: a continuation
+    that arrives before the prefix that opens its invocation is exactly
+    the reordering the range contract exists to make detectable, and
+    ``range_continuity`` must flag it (a continuation with no open
+    invocation, then a prefix left dangling)."""
+    _meta, templates, entries = triple
+    by_id = {t["template_id"]: t for t in templates}
+    for j in range(1, len(entries)):
+        e = entries[j]
+        t = by_id.get(e["template_id"])
+        n = len((t or {}).get("insns") or [])
+        if n < 2 or e.get("bb_start") or e.get("bb_stop") is not None:
+            continue
+        k = n // 2
+        cont = dict(e)
+        pref = dict(e)
+        cont["bb_start"], cont["bb_stop"] = k, n
+        pref["bb_start"], pref["bb_stop"] = 0, k
+        # The prefix never reached the terminating branch: no outcome.
+        pref["branch_taken"] = None
+        pref["branch_target"] = None
+        pref["wp_entries"] = []
+
+        def _by_idx(rows, lo, hi):
+            out = []
+            for r in rows or []:
+                idx = getattr(r, "insn_index", None)
+                if idx is None and isinstance(r, dict):
+                    idx = r.get("insn_index")
+                if idx is not None and lo <= int(idx) < hi:
+                    out.append(r)
+            return out
+
+        cont["dyn_params"] = _by_idx(e.get("dyn_params"), k, n)
+        pref["dyn_params"] = _by_idx(e.get("dyn_params"), 0, k)
+        cont["reg_snaps"] = _by_idx(e.get("reg_snaps"), k, n)
+        pref["reg_snaps"] = _by_idx(e.get("reg_snaps"), 0, k)
+        entries[j: j + 1] = [cont, pref]
+        return (f"entry seq={e.get('seq_num')} (BB{e['template_id']}, "
+                f"n={n}) split at {k} and REORDERED: [{k},{n}) emitted "
+                f"before [0,{k})")
+    return None
+
+
 def _m_ppage_corrupt(triple, gen_meta) -> Optional[str]:
     """Corrupt a per-memop physical-page (LOAD_PPAGE / STORE_PPAGE) value.
     Requires a physaddr=1 (system-mode) substrate; the fast user-mode
@@ -791,26 +838,168 @@ def _raw_dump(cst_path: Path, decode_bin: Path) -> Optional[str]:
     return proc.stdout
 
 
-def _wp_chain_hdr_offset(raw_text: str, want_has_events: bool) -> Optional[int]:
-    """First WP chain header's ``body.cst`` byte offset (format.rst Step
-    6.8 / §4.3) whose ``CST_WP_CHAIN_HAS_EVENTS`` bit matches
-    @want_has_events, per a ``cst_decode --format=raw`` structural dump
-    (every line there carries the absolute in-member byte offset the
-    line's read started at, per cst_raw.cc).  ``chain_hdr`` packs
-    ``num_wp`` in its high bits and the presence bit in bit 0; bit 0 of an
-    unsigned LEB128 encoding always lands in bit 0 of the FIRST byte
-    regardless of how many bytes the value spans, so flipping just that
-    bit (the caller's job) never perturbs num_wp."""
-    marker = "CST_WP_CHAIN_HAS_EVENTS"
+# ---- epoch 0x1E block-record injection (format.rst §5.7 / Step 6.7) --------
+#
+# The block-level facts — executed range, flags, fault depth — are ordinary
+# field-delta records at BLOCK_POS = num_insns, delta-persistent per
+# (template_id, BLOCK_POS, fid) with baselines (0, num_insns, 0, ...).  A
+# wire mutation therefore INJECTS a record into one entry's own
+# cp_delta_section: re-encode the section's len and n_records ULEBs, keep
+# the existing record bytes, and append the new record at the section's
+# tail (BLOCK_POS is the highest position, so a trailing block record
+# keeps the non-descending (ipos, fid) order).  Everything needed to aim
+# the splice — the numeric field ids, the bb_flag masks, each template's
+# num_insns, each entry's section geometry — is parsed from the
+# ``cst_decode --format=raw`` structural dump of the pristine substrate.
+
+
+def _uleb_encode(v: int) -> bytes:
+    out = bytearray()
+    while True:
+        b = v & 0x7F
+        v >>= 7
+        if v:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+
+
+def _sleb_encode(v: int) -> bytes:
+    out = bytearray()
+    while True:
+        b = v & 0x7F
+        v >>= 7
+        done = (v == 0 and not (b & 0x40)) or (v == -1 and (b & 0x40))
+        out.append(b if done else b | 0x80)
+        if done:
+            return bytes(out)
+
+
+_RAW_OFF = re.compile(r"^\s*@([0-9a-fA-F]+)\s")
+_RAW_MAP = re.compile(r'map "(\w+)"')
+_RAW_MAP_ENTRY = re.compile(r"(\d+) = (\S+)$")
+_RAW_TMPL = re.compile(r"template_id=(\d+)\s+start_pc=\S+\s+num_insns=(\d+)")
+_RAW_CPSEC = re.compile(r"cp_delta_section\s+len=(\d+)")
+_RAW_NREC = re.compile(r"n_records=(\d+)$")
+# cst_raw's named() prints "fid=<numeric> (<resolved name>)".
+_RAW_REC = re.compile(
+    r"rec\[\d+\] ipos\+=\d+ ->ipos=(\d+)\s+fid=\d+ \(([^)]*)\)")
+_RAW_ENTRY_TMPL = re.compile(r"->template_id=(-?\d+)\s+\[Step 6\.4\]")
+_RAW_NUMWP = re.compile(r"num_wp=(\d+)$")
+
+
+def _parse_raw_body(raw_text: str) -> dict:
+    """Structure of the raw dump the injection helpers aim by: the
+    field_id / bb_flag encoding maps (name -> numeric id / mask), each
+    template's num_insns, and per CP entry the template id, the
+    cp_delta_section geometry (len-ULEB offset, payload length,
+    n_records offset + count), its records' (ipos, fid name), and the
+    entry's num_wp.  Body offsets are in-member byte offsets of
+    ``body.cst`` (cst_raw.cc prints each line's read-start offset)."""
+    maps: dict[str, dict[str, int]] = {}
+    tmpl_insns: dict[int, int] = {}
+    entries: list[dict] = []
+    cur_map = None
+    in_body = False
+    e = None                      # entry under construction
+    state = None                  # None | "want_sec" | "want_nrec" | "recs"
     for line in raw_text.splitlines():
-        if "chain_hdr=" not in line:
+        if "=== BODY member ===" in line:
+            in_body = True
+            cur_map = None
             continue
-        if (marker in line) != want_has_events:
+        if not in_body:
+            mm = _RAW_MAP.search(line)
+            if mm:
+                cur_map = maps.setdefault(mm.group(1), {})
+                continue
+            if cur_map is not None:
+                me = _RAW_MAP_ENTRY.search(line)
+                if me:
+                    cur_map[me.group(2)] = int(me.group(1))
+                    continue
+            mt = _RAW_TMPL.search(line)
+            if mt:
+                tmpl_insns[int(mt.group(1))] = int(mt.group(2))
             continue
-        m = re.match(r"\s*@([0-9a-fA-F]+)", line)
-        if m:
-            return int(m.group(1), 16)
-    return None
+        # body member
+        off_m = _RAW_OFF.match(line)
+        off = int(off_m.group(1), 16) if off_m else None
+        if "ENTRY  tag=" in line:
+            e = {"template_id": None, "sec_off": None, "sec_len": None,
+                 "nrec_off": None, "n_records": None, "recs": [],
+                 "num_wp": 0}
+            entries.append(e)
+            state = "want_sec"
+            continue
+        if e is None:
+            continue
+        if state == "want_sec":
+            mt = _RAW_ENTRY_TMPL.search(line)
+            if mt:
+                e["template_id"] = int(mt.group(1))
+                continue
+            ms = _RAW_CPSEC.search(line)
+            if ms and off is not None:
+                e["sec_off"], e["sec_len"] = off, int(ms.group(1))
+                state = "want_nrec"
+            continue
+        if state == "want_nrec":
+            mn = _RAW_NREC.search(line)
+            if mn and off is not None:
+                e["nrec_off"], e["n_records"] = off, int(mn.group(1))
+                state = "recs"
+            continue
+        if state == "recs":
+            mr = _RAW_REC.search(line)
+            if mr:
+                e["recs"].append((int(mr.group(1)), mr.group(2)))
+                continue
+            if "wp_chain_section" in line:
+                state = "want_numwp"    # num_wp prints on the NEXT line
+                continue
+            state = None                # CP section fully captured, no WP
+            continue
+        if state == "want_numwp":
+            mw = _RAW_NUMWP.search(line)
+            if mw:
+                e["num_wp"] = int(mw.group(1))
+            state = None
+            continue
+    return {"maps": maps, "tmpl_insns": tmpl_insns, "entries": entries}
+
+
+def _inject_block_record(cst_bytes: bytes, entry: dict, n_insns: int,
+                         fid: int, delta: int) -> Optional[bytes]:
+    """Splice one field-delta record (ipos = BLOCK_POS, @fid, @delta) at
+    the tail of @entry's cp_delta_section inside the ``body.cst`` tar
+    member, re-encoding the section's len and n_records ULEBs."""
+    members = _tar_members(cst_bytes)
+    bn = _member_name(members, "body.cst")
+    if bn is None:
+        return None
+    m, data = members[bn]
+    sec_off, sec_len = entry["sec_off"], entry["sec_len"]
+    nrec_off, n_records = entry["nrec_off"], entry["n_records"]
+    if None in (sec_off, sec_len, nrec_off, n_records):
+        return None
+    sec_end = nrec_off + sec_len          # payload starts at n_records
+    if sec_end > len(data):
+        return None
+    last_ipos = entry["recs"][-1][0] if entry["recs"] else 0
+    if last_ipos > n_insns:
+        return None
+    rec = (_uleb_encode(n_insns - last_ipos) + _uleb_encode(fid)
+           + _sleb_encode(delta))
+    old_nrec_w = len(_uleb_encode(n_records))
+    body_rest = data[nrec_off + old_nrec_w: sec_end]
+    new = (data[:sec_off]
+           + _uleb_encode(sec_len + len(rec))
+           + _uleb_encode(n_records + 1)
+           + body_rest + rec + data[sec_end:])
+    members[bn] = (m, bytes(new))
+    return _repack(members)
 
 
 _BR_TARGET_REC = re.compile(r"^\s*@([0-9a-fA-F]+)\s+((?:[0-9a-f]{2} )+)\s")
@@ -866,19 +1055,9 @@ def _mw_branch_target_corrupt(cst_bytes: bytes, decode_bin: Path,
     return _repack(members)
 
 
-def _mw_wp_events_presence_flip(cst_bytes: bytes, decode_bin: Path,
-                                work: Path,
-                                want_has_events: bool) -> Optional[bytes]:
-    """Flip the ``CST_WP_CHAIN_HAS_EVENTS`` bit (format.rst §4.3/§4.4,
-    Step 6.8) of one WP chain header on the wire, in the direction
-    selected by @want_has_events (True: an events-bearing header,
-    set->clear; False: an events-free header, clear->set).  Locates the
-    target byte via a ``cst_decode --format=raw`` structural dump of the
-    pristine substrate, then XORs bit 0 of that single byte in the
-    ``body.cst`` tar member -- num_wp (the ULEB's remaining bits) is left
-    untouched.  Returns None (SKIP) if the substrate carries no chain
-    header in the requested direction, or if it doesn't raw-decode."""
-    probe = work / "_wp_events_presence_probe.cst"
+def _raw_parsed(cst_bytes: bytes, decode_bin: Path, work: Path,
+                tag: str) -> Optional[dict]:
+    probe = work / f"_{tag}_probe.cst"
     probe.write_bytes(cst_bytes)
     try:
         raw_text = _raw_dump(probe, decode_bin)
@@ -886,40 +1065,177 @@ def _mw_wp_events_presence_flip(cst_bytes: bytes, decode_bin: Path,
         probe.unlink(missing_ok=True)
     if raw_text is None:
         return None
-    off = _wp_chain_hdr_offset(raw_text, want_has_events)
-    if off is None:
+    return _parse_raw_body(raw_text)
+
+
+def _entry_geometry_ok(e: dict) -> bool:
+    return (e.get("template_id") is not None and e.get("sec_off") is not None
+            and e.get("nrec_off") is not None)
+
+
+def _mw_range_stop_overflow(cst_bytes: bytes, decode_bin: Path,
+                            work: Path) -> Optional[bytes]:
+    """Push one entry's CST_FID_BB_STOP past its template's num_insns
+    (delta +1 against the num_insns baseline, §5.7).  A conformant
+    decoder MUST reject the entry at Step 6.4's range check — this is
+    the epoch's replacement for the retired presence-bit desync proof:
+    a block record that mis-frames the entry must fail loudly, never
+    silently reshape what the entry claims."""
+    p = _raw_parsed(cst_bytes, decode_bin, work, "range_stop_overflow")
+    if p is None:
         return None
-    members = _tar_members(cst_bytes)
-    bn = _member_name(members, "body.cst")
-    if bn is None or off >= len(members[bn][1]):
+    fid = p["maps"].get("field_id", {}).get("CST_FID_BB_STOP")
+    if fid is None:
         return None
-    m, data = members[bn]
-    b = bytearray(data)
-    b[off] ^= 0x01
-    members[bn] = (m, bytes(b))
-    return _repack(members)
+    for e in p["entries"]:
+        if not _entry_geometry_ok(e):
+            continue
+        n = p["tmpl_insns"].get(e["template_id"])
+        if not n:
+            continue
+        if any(ip >= n for ip, _ in e["recs"]):
+            continue                      # keep clear of existing block recs
+        return _inject_block_record(cst_bytes, e, n, fid, +1)
+    return None
 
 
-def _mw_wp_events_presence_clear(cst_bytes: bytes, decode_bin: Path,
-                                 work: Path) -> Optional[bytes]:
-    """HAS_EVENTS set->clear on a chain that DOES carry a
-    ``wp_events_section``: the decoder stops expecting it, so that
-    section's real bytes (its own length prefix, then num_events + event
-    records) are left on the wire exactly where the next body record's
-    tag byte is expected -- a stream desync."""
-    return _mw_wp_events_presence_flip(cst_bytes, decode_bin, work,
-                                       want_has_events=True)
+def _mw_range_inverted(cst_bytes: bytes, decode_bin: Path,
+                       work: Path) -> Optional[bytes]:
+    """Raise one entry's CST_FID_BB_START to num_insns while BB_STOP
+    stays at its num_insns baseline: the declared range is empty /
+    inverted, which no honest entry can state (a block that executed
+    nothing is not an event, §4.2a) — the decoder MUST reject."""
+    p = _raw_parsed(cst_bytes, decode_bin, work, "range_inverted")
+    if p is None:
+        return None
+    fid = p["maps"].get("field_id", {}).get("CST_FID_BB_START")
+    if fid is None:
+        return None
+    for e in p["entries"]:
+        if not _entry_geometry_ok(e):
+            continue
+        n = p["tmpl_insns"].get(e["template_id"])
+        if not n:
+            continue
+        if any(ip >= n for ip, _ in e["recs"]):
+            continue
+        return _inject_block_record(cst_bytes, e, n, fid, +n)
+    return None
 
 
-def _mw_wp_events_presence_set(cst_bytes: bytes, decode_bin: Path,
-                               work: Path) -> Optional[bytes]:
-    """HAS_EVENTS clear->set on a chain that carries NO events section:
-    the decoder now expects a ``wp_events_section`` immediately following
-    and consumes the next body record's bytes as a phantom section (its
-    own bogus length prefix, then whatever that many bytes decode to as
-    num_events + event records) -- a stream desync."""
-    return _mw_wp_events_presence_flip(cst_bytes, decode_bin, work,
-                                       want_has_events=False)
+def _mw_range_out_of_record(cst_bytes: bytes, decode_bin: Path,
+                            work: Path) -> Optional[bytes]:
+    """Shrink CST_FID_BB_STOP by one on an entry whose OWN section
+    carries a per-instruction record at the template's last position:
+    that record now claims an observation of an instruction the entry
+    itself disclaims, and a conformant decoder MUST reject it (§4.2a's
+    normative rule; the range scopes every per-instruction family)."""
+    p = _raw_parsed(cst_bytes, decode_bin, work, "range_out_of_record")
+    if p is None:
+        return None
+    fid = p["maps"].get("field_id", {}).get("CST_FID_BB_STOP")
+    if fid is None:
+        return None
+    for e in p["entries"]:
+        if not _entry_geometry_ok(e):
+            continue
+        n = p["tmpl_insns"].get(e["template_id"])
+        if not n or n < 2:
+            continue
+        if any(ip >= n for ip, _ in e["recs"]):
+            continue
+        if not any(ip == n - 1 for ip, _ in e["recs"]):
+            continue                      # need a record the shrink orphans
+        return _inject_block_record(cst_bytes, e, n, fid, -1)
+    return None
+
+
+def _mw_range_stuck(cst_bytes: bytes, decode_bin: Path,
+                    work: Path) -> Optional[bytes]:
+    """Shrink CST_FID_BB_STOP by one on a QUIET entry (no record of its
+    own at the last position): the wire stays decoder-clean — the range
+    is well-formed and scopes every record present — but the entry now
+    claims it stopped one instruction short, and the cell DELTA-PERSISTS
+    to every later entry of the template.  The catch must come from the
+    validator's range oracle: an invocation left open mid-stream with no
+    excursion on the wire to explain the cut (range_continuity)."""
+    p = _raw_parsed(cst_bytes, decode_bin, work, "range_stuck")
+    if p is None:
+        return None
+    fid = p["maps"].get("field_id", {}).get("CST_FID_BB_STOP")
+    if fid is None:
+        return None
+    for i, e in enumerate(p["entries"]):
+        if not _entry_geometry_ok(e) or i + 1 >= len(p["entries"]):
+            continue
+        n = p["tmpl_insns"].get(e["template_id"])
+        if not n or n < 2:
+            continue
+        if any(ip >= n - 1 for ip, _ in e["recs"]):
+            continue                      # quiet at the orphaned tail
+        return _inject_block_record(cst_bytes, e, n, fid, -1)
+    return None
+
+
+def _mw_stuck_bb_flags(cst_bytes: bytes, decode_bin: Path,
+                       work: Path) -> Optional[bytes]:
+    """Latch CST_BB_FLAG_BRANCH_UNRESOLVED onto an entry that carries a
+    wrong-path chain and no branch record of its own (its outcome rides
+    the delta-persistent cells).  The decoder tolerates it — the flag
+    legitimately suppresses the outcome read — and the flag then STICKS
+    to every later entry of the template, eating their outcomes too.
+    The catch must come from the validator: an entry whose wrong-path
+    chain proves the branch WAS resolved cannot honestly claim its
+    successor was never observed (wp_fork_resolved)."""
+    p = _raw_parsed(cst_bytes, decode_bin, work, "stuck_bb_flags")
+    if p is None:
+        return None
+    fid = p["maps"].get("field_id", {}).get("CST_FID_BB_FLAGS")
+    mask = p["maps"].get("bb_flag", {}).get("CST_BB_FLAG_BRANCH_UNRESOLVED")
+    if fid is None or not mask:
+        return None
+    for e in p["entries"]:
+        if not _entry_geometry_ok(e) or e["num_wp"] < 1:
+            continue
+        n = p["tmpl_insns"].get(e["template_id"])
+        if not n:
+            continue
+        if any(ip >= n for ip, _ in e["recs"]):
+            continue
+        if any("BRANCH" in name for _, name in e["recs"]):
+            continue                      # decoder would reject (§5.6); the
+                                          # tolerated shape is the point here
+        return _inject_block_record(cst_bytes, e, n, fid, +mask)
+    return None
+
+
+def _mw_fabricated_branch_on_unresolved(cst_bytes: bytes, decode_bin: Path,
+                                        work: Path) -> Optional[bytes]:
+    """Raise CST_BB_FLAG_BRANCH_UNRESOLVED on an entry that stages a
+    branch-outcome singleton in its OWN section: the entry now both
+    declares its successor unobserved and publishes one — §5.6's
+    writer-side prohibition made bytes.  A conformant decoder MUST
+    reject the contradiction rather than pick a side silently."""
+    p = _raw_parsed(cst_bytes, decode_bin, work, "fabricated_branch")
+    if p is None:
+        return None
+    fid = p["maps"].get("field_id", {}).get("CST_FID_BB_FLAGS")
+    mask = p["maps"].get("bb_flag", {}).get("CST_BB_FLAG_BRANCH_UNRESOLVED")
+    if fid is None or not mask:
+        return None
+    for e in p["entries"]:
+        if not _entry_geometry_ok(e):
+            continue
+        n = p["tmpl_insns"].get(e["template_id"])
+        if not n:
+            continue
+        if any(ip >= n for ip, _ in e["recs"]):
+            continue
+        if not any(name in ("CST_FID_BRANCH_TAKEN", "CST_FID_BRANCH_TARGET")
+                   for _, name in e["recs"]):
+            continue
+        return _inject_block_record(cst_bytes, e, n, fid, +mask)
+    return None
 
 
 def _m_smc_revision_byte_flip(triple, smc_sub) -> Optional[str]:
@@ -1058,7 +1374,11 @@ CATALOGUE: list = [
     Mutation("bb_successor_missequence", "oracle",
              "reorder two correct-path entries",
              _m_bb_successor_missequence,
-             expect=("cp_execution_order", "wrong_path_chains")),
+             # A reorder of identity-carrying entries trips the per-thread
+             # bookkeeping (chain / switch-flag cadence) before the
+             # positional CP comparison gets a say — both routes gate.
+             expect=("cp_execution_order", "wrong_path_chains",
+                     "thread_chain", "thread_records")),
     Mutation("thread_id_forge", "oracle",
              "stamp a foreign guest-thread id onto an entry",
              _m_thread_id_forge,
@@ -1099,15 +1419,38 @@ CATALOGUE: list = [
              "move one encoded branch target (CST_FID_BRANCH_TARGET "
              "displacement) on the wire",
              _mw_branch_target_corrupt),
-    Mutation("wp_events_presence_flip_clear", "wire_oracle",
-             "flip CST_WP_CHAIN_HAS_EVENTS set->clear on a chain that has "
-             "an events section (orphans its bytes onto the next record)",
-             _mw_wp_events_presence_clear),
-    Mutation("wp_events_presence_flip_set", "wire_oracle",
-             "flip CST_WP_CHAIN_HAS_EVENTS clear->set on a chain with no "
-             "events section (consumes the next record as a phantom "
-             "wp_events_section)",
-             _mw_wp_events_presence_set),
+    Mutation("split_pair_reorder", "oracle",
+             "reorder a split invocation's stretches: the [k,n) "
+             "continuation emitted before its own [0,k) prefix",
+             _m_split_pair_reorder,
+             expect=("range_continuity", "thread_chain")),
+    Mutation("range_stop_overflow", "wire_oracle",
+             "push CST_FID_BB_STOP past the template's num_insns "
+             "(decoder MUST reject the malformed range)",
+             _mw_range_stop_overflow),
+    Mutation("range_inverted", "wire_oracle",
+             "raise CST_FID_BB_START to num_insns against the default "
+             "stop (empty/inverted range; decoder MUST reject)",
+             _mw_range_inverted),
+    Mutation("range_out_of_record", "wire_oracle",
+             "shrink CST_FID_BB_STOP below a per-insn record the entry "
+             "itself stages (decoder MUST reject the out-of-range record)",
+             _mw_range_out_of_record),
+    Mutation("fabricated_branch_on_unresolved", "wire_oracle",
+             "raise CST_BB_FLAG_BRANCH_UNRESOLVED on an entry that stages "
+             "a branch outcome in its own section (decoder MUST reject "
+             "the contradiction, per the section 5.6 prohibition)",
+             _mw_fabricated_branch_on_unresolved),
+    Mutation("range_stuck", "wire_oracle",
+             "shrink CST_FID_BB_STOP on a quiet entry: decoder-clean, but "
+             "the invocation is left open mid-stream with no excursion "
+             "and the shrunken cell delta-persists (range_continuity)",
+             _mw_range_stuck),
+    Mutation("stuck_bb_flags", "wire_oracle",
+             "latch CST_BB_FLAG_BRANCH_UNRESOLVED onto a WP-forking entry "
+             "with no branch record of its own: decoder-clean, but the "
+             "chain proves the branch resolved (wp_fork_resolved)",
+             _mw_stuck_bb_flags),
 ]
 
 

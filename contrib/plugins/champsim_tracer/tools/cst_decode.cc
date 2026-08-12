@@ -983,6 +983,13 @@ struct RecordSpan {
     uint32_t min_ipos = UINT32_MAX;
     uint32_t max_ipos = 0;
     bool     any      = false;
+    /* This section staged a branch-outcome singleton of its own
+     * (CST_FID_BRANCH_TAKEN / _TARGET).  §5.6: a writer that could not
+     * observe the successor stages NEITHER and raises
+     * CST_BB_FLAG_BRANCH_UNRESOLVED — an entry that both raises the
+     * flag and stages an outcome is publishing a successor it declares
+     * it never observed, and there is no honest reading of that. */
+    bool     staged_branch = false;
 };
 
 /* True iff @fid names a member of the block-level family (§5.7). */
@@ -1059,6 +1066,10 @@ void apply_record_deltas(BodyWalker &walker, Reader &sec, uint64_t n_records,
                     span->any = true;
                     if (pos < span->min_ipos) span->min_ipos = pos;
                     if (pos > span->max_ipos) span->max_ipos = pos;
+                    if (fid == ids.fid_branch_taken ||
+                        fid == ids.fid_branch_target) {
+                        span->staged_branch = true;
+                    }
                 }
             }
         }
@@ -1306,6 +1317,20 @@ void BodyWalker::decode_field_delta(Reader &outer,
             " outside declared range [" + std::to_string(bc.bb_start) +
             ", " + std::to_string(bc.bb_stop) + ") of template " +
             std::to_string(template_id) + " — reject");
+    }
+    /* §5.6: an entry that raises CST_BB_FLAG_BRANCH_UNRESOLVED declares
+     * the writer never observed its successor, so a branch-outcome
+     * singleton staged in the SAME section publishes an outcome the
+     * entry itself disclaims — reject.  A later entry that RESOLVES the
+     * slot clears the flag in the same section it stages the outcome,
+     * so this fires only on the contradiction, never on recovery. */
+    if (span.staged_branch &&
+        (bc.bb_flags & ids.bb_flag_branch_unresolved)) {
+        throw std::runtime_error(
+            "entry of template " + std::to_string(template_id) +
+            " raises CST_BB_FLAG_BRANCH_UNRESOLVED yet stages a branch"
+            " outcome in its own section — a fabricated successor,"
+            " reject");
     }
     if (bc_out) *bc_out = bc;
 
@@ -1654,6 +1679,16 @@ void BodyWalker::consume_field_section(Reader &outer, uint32_t template_id,
                 std::to_string(cells.bb_start) + ", " +
                 std::to_string(cells.bb_stop) + ") of template " +
                 std::to_string(template_id) + " — reject");
+        }
+        /* §5.6 contradiction (mirrors the batch walker): the flag says
+         * "successor never observed", the same section stages one. */
+        if (span.staged_branch &&
+            (cells.bb_flags & ids.bb_flag_branch_unresolved)) {
+            throw std::runtime_error(
+                "entry of template " + std::to_string(template_id) +
+                " raises CST_BB_FLAG_BRANCH_UNRESOLVED yet stages a branch"
+                " outcome in its own section — a fabricated successor,"
+                " reject");
         }
         if (bc) *bc = cells;
     } else if (bc) {

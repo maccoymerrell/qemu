@@ -27,6 +27,7 @@ Layout::
     │   ├── _smc.py                # self-modifying-code workload family (shape-preserving + shape-changing) + discriminator truth table
     │   ├── _full.py               # `full` unified runner: tiers + coverage registry
     │   ├── _mutation.py           # `mutation` adversarial strictness harness
+    │   ├── _range_cells.py        # `range_cells` mid-block resume/stop acceptance harness
     │   └── tests/
     │       ├── test_decoder_smoke.py       # package unit test
     │       ├── test_wp_synthetic_fault.py  # WP fault continue-to-budget test
@@ -220,6 +221,19 @@ Sub-commands
    at a time and asserts a specific check catches each corruption.
    Runs standalone, or in-process from ``full``'s
    ``features.mutation_strictness`` check.
+
+``range_cells``
+   Targeted mid-block resume/stop cells: exact executed-range
+   assertions (:doc:`format` §4.2a) at the five capture boundaries
+   that produce partial entries — a user block split by a demand
+   fault, an icount window billing exactly its budget, an END-marker
+   close mid-block, a REP invocation rejoined by range chaining, and
+   a wrong-path chain cutting its last block at the wpdepth
+   remainder.  ``--selftest`` proves each assertion rejects its
+   falsifier (the pre-range merged/overshooting shape) on synthetic
+   fixtures; the live cells run against existing ``all`` run
+   directories and are the acceptance harness for split emission — a
+   writer that still merges or overshoots fails them by design.
 
 .. _validator-full:
 
@@ -597,11 +611,12 @@ outside the repo as standalone scripts):
    A template that is legitimately bimodal AT SCALE (heavy predication,
    a REP loop empty as often as not) is not flagged; the zero-rate
    threshold below which executions count as "a small minority of
-   outliers" is tunable.  A fault-TRUNCATED execution — an entry
-   carrying fault anchors, which stopped part-way through its template
-   and so never had the chance to realise its memops — is excluded from
-   the population entirely, since the wire already explains its
-   shortfall; the silent loss the oracle hunts carries no anchor.
+   outliers" is tunable.  A PARTIAL execution — an entry whose declared
+   range (:doc:`format` §4.2a) stops short of the template, so it never
+   had the chance to realise the full memop complement — is excluded
+   from the population entirely, since the wire already explains its
+   shortfall; the silent loss the oracle hunts declares no partial
+   range.
    Implemented twice, deliberately kept in sync:
    ``cst::MemopBimodalityLint`` (``tools/cst_lint.h``) feeds
    ``cst_audit``'s always-on ``MEMOP BIMODALITY`` report section
@@ -1063,7 +1078,7 @@ Four mutation layers, matching where strictness has to live:
    oracle is re-run against the damaged decode through a
    decoder-shaped stand-in (no re-tracing needed); it must raise a
    gating error in one of the mutation's declared ``expect`` checks.
-   19 of the 25 catalogue entries are this layer: flipping a captured
+   20 of the 30 catalogue entries are this layer: flipping a captured
    dst-register value or misattributing it to the wrong register id,
    swapping two memop addresses or flipping a captured load/store data
    byte, dropping the memops from the segment's final body entry (the
@@ -1080,7 +1095,10 @@ Four mutation layers, matching where strictness has to live:
    two blocks of a predicted wrong-path chain, a depth-0 WP
    missequence paired with a later synthetic fault mark (the fault
    must not excuse the earlier divergence), reordering two
-   correct-path entries, forging a foreign guest-thread id onto an
+   correct-path entries, splitting one whole-block entry into its two
+   §4.2a stretches and emitting the continuation before its own
+   prefix (``split_pair_reorder`` — ``range_continuity``'s teeth),
+   forging a foreign guest-thread id onto an
    entry, corrupting a per-memop physical-page value, dropping a
    ``DEVIO_STOP`` record, corrupting a self-modified block's
    non-baseline revision bytes, and corrupting a *shape-changed*
@@ -1099,7 +1117,9 @@ Four mutation layers, matching where strictness has to live:
    malformed input rather than silently emitting a partial trace. 3
    catalogue entries: corrupting the ``CST_MAGIC`` in the header
    member, removing the body member from the container, and
-   truncating the body member payload.
+   truncating the body member payload.  The block-record injections
+   below also end at the decoder, but they need a raw-dump locate
+   pass first, so they ride the ``wire_oracle`` plumbing.
 ``wire_verify``
    A wire-level mutation that leaves the body stream structurally
    well-formed and corrupts only what a record *means*, so no decode
@@ -1118,10 +1138,28 @@ Four mutation layers, matching where strictness has to live:
    The real decoder runs first; if it accepts the file (rc=0), the
    mutated file is handed to the full ``validate()`` oracle as a
    second line of defense, and a semantic mismatch there is an
-   equally valid catch. 2 catalogue entries: flipping the WP chain
-   header's ``CST_WP_CHAIN_HAS_EVENTS`` presence bit set→clear on a
-   chain that has an events section, and clear→set on a chain that
-   doesn't.
+   equally valid catch.  6 catalogue entries, all epoch-0x1E
+   block-record injections: a field-delta record is spliced into one
+   entry's own ``cp_delta_section`` at ``BLOCK_POS`` (the section's
+   ``len`` and ``n_records`` ULEBs re-encoded; the target aimed by a
+   ``--format=raw`` locate pass over the pristine substrate).  Four
+   MUST die in the decoder — ``range_stop_overflow`` (``BB_STOP``
+   past ``num_insns``), ``range_inverted`` (``BB_START`` at
+   ``num_insns`` against the default stop), ``range_out_of_record``
+   (a shrunken stop orphaning a per-insn record the entry itself
+   stages), and ``fabricated_branch_on_unresolved``
+   (``CST_BB_FLAG_BRANCH_UNRESOLVED`` raised in the same section
+   that stages a branch outcome — the §5.6 prohibition made bytes).
+   Two are decoder-clean by construction and MUST be caught by the
+   validator's range oracles — ``range_stuck`` (a quiet entry's stop
+   shrunk: the invocation is left open mid-stream with no excursion,
+   and the cell delta-persists to every later entry;
+   ``range_continuity``) and ``stuck_bb_flags`` (the unresolved flag
+   latched onto a WP-forking entry whose outcome rides the
+   persistent cells; ``wp_fork_resolved``).  These six re-cover, and
+   extend, the desync class the retired ``CST_WP_CHAIN_HAS_EVENTS``
+   presence-bit flips proved before the events section left the
+   wire.
 
 Each catalogue entry records, per mutation, whether it was applied,
 caught (and by which check id), or skipped (the substrate did not
@@ -1213,19 +1251,23 @@ These don't need a generator ``meta.json`` and run on any ``.cst``.
    execution in order — so each must continue that SAME thread's
    control flow: its start PC is reachable from the tid's previous user
    block (fall-through, static branch target, or a CP-observed profile
-   target).  A kernel excursion (``is_system`` entries) may resume the
-   thread at a redirected PC, so it breaks the chain and the first user
-   entry after it restarts without penalty.  A disconnect within a
-   tid's own chain is an *orphan*: a dropped user block, a phantom
-   entry, or foreign code leaking past the pin.  Matching per tid (not
-   globally against a live set) cannot launder one thread's block onto
-   another's successors, so it is strictly stronger than the
-   pre-identity check; ``chains`` in the info detail is the number of
-   distinct guest threads that contributed user entries.  Runs in
-   ``validate_structural`` (``thread_test``, ``churn_test``); not yet
-   wired into the ``all`` battery — it correctly fails on a known
-   fault-merge defect (see the comment at the ``validate()`` call
-   site).
+   target).  A partial user entry (a declared range stopping short of
+   the template, :doc:`format` §4.2a) never reached its terminating
+   branch, so its only legitimate user-side successor is its own
+   continuation: the SAME template resuming at exactly its stop index —
+   asserted even across an intervening kernel excursion, which is
+   precisely what the range makes checkable.  A kernel excursion may
+   otherwise resume the thread at a redirected PC (a handler that never
+   returns), so after one a fresh entry restarts the chain without
+   penalty.  A disconnect within a tid's own chain is an *orphan*: a
+   dropped user block, a phantom entry, or foreign code leaking past
+   the pin.  Matching per tid (not globally against a live set) cannot
+   launder one thread's block onto another's successors, so it is
+   strictly stronger than the pre-identity check; ``chains`` in the
+   info detail is the number of distinct guest threads that contributed
+   user entries.  Runs in ``validate_structural`` (``thread_test``,
+   ``churn_test``) and in every ``validate()`` call — i.e. the ``all``
+   battery.
 
 ``thread_strand``
    Sequentiality of every ``(thread_id, asid)`` context — the property a
@@ -1234,8 +1276,10 @@ These don't need a generator ``meta.json`` and run on any ``.cst``.
    Where ``thread_chain`` follows *user* code per thread, this check
    walks the whole stream, kernel included, and uses each entry's
    resolved terminal branch: filtered to one context, entry N's branch
-   target should name entry N+1's start PC (or one of its fault anchors,
-   for a merged block).  When it does not, the strand was diverted, and
+   target should name entry N+1's resume PC — the template's start, or
+   ``insns[bb_start].pc`` for a continuation entry (:doc:`format`
+   §4.2a); one explicit PC, never a set of alternatives.  When it does
+   not, the strand was diverted, and
    the dangling target is remembered.  Every diversion the format
    documents crosses a boundary the wire makes visible — entering an
    excursion raises ``fault_depth``, returning lowers it, a
@@ -1251,6 +1295,35 @@ These don't need a generator ``meta.json`` and run on any ``.cst``.
    the check that fails a trace in which two vCPUs' kernel work shares
    one thread id.  Runs in ``validate_structural`` and ``validate``.
 
+``range_continuity``
+   Executed-range well-formedness and continuity (:doc:`format`
+   §4.2a).  Every entry's declared range must satisfy
+   ``0 <= start < stop <= num_insns``; a continuation entry
+   (``bb_start = k > 0``) must continue an OPEN invocation of the same
+   template in the same ``(thread_id, asid)`` context whose stop is
+   exactly ``k`` — a continuation without its prefix, or a
+   non-contiguous one, is a wire defect, never a licensed shorthand.
+   While an invocation is open, the only entries its context may emit
+   before the continuation are the excursion's (strictly deeper
+   ``fault_depth``); a same-or-shallower entry that is not the
+   continuation abandons the block, which is legal only when an
+   excursion is on the wire to explain the redirect (a handler may
+   never return) — a user-mode stream cannot lose the tail of a block
+   invisibly.  Under ``faults=0`` the handler is excluded from capture,
+   so the abandonment arm is N/A there; continuity always holds.  A
+   trailing open invocation (window or budget close mid-block) is
+   legal.  Runs in ``validate_structural`` and ``validate``.
+
+``wp_fork_resolved``
+   A wrong path forks off a RESOLVED terminating branch (the fork
+   redirects the PC to the not-taken alternative of an outcome the
+   tracer observed), and an entry whose range does not reach its
+   branch forks no wrong path.  An entry that carries a wrong-path
+   chain but no resolved branch outcome is therefore
+   self-contradictory — a stuck ``CST_BB_FLAG_BRANCH_UNRESOLVED``
+   latching past the entry it described, or a forged chain.  Runs in
+   ``validate_structural`` and ``validate``.
+
 ``syscall_fault_nesting``
    Nested-excursion discipline (system-mode marker runs).  The
    generated marker workload issues one syscall whose kernel path is
@@ -1260,9 +1333,15 @@ These don't need a generator ``meta.json`` and run on any ``.cst``.
    pre-maps it) — so the trace must contain at least one user-syscall
    excursion with ``fault_depth >= 1`` entries inside it.
    Independent of the probe: per-tid fault depth changes by at most
-   one between consecutive entries, and a fault-anchored
-   (whole-BB-merged) entry sits at its excursion's unwind.  The
-   fault-depth histogram is reported for regression visibility.
+   one between consecutive entries, and a continuation entry
+   (``bb_start > 0``) sits directly at its excursion's boundary — the
+   tid's previous entry either ran strictly deeper (the handler the
+   continuation returns from) or is the block's own prefix stopped at
+   exactly the resume index (``faults=0``, where the handler is
+   excluded and the stretches arrive adjacent).  Checkable by
+   adjacency because program order is unconditional (:doc:`format`
+   §4.2a).  The fault-depth histogram is reported for regression
+   visibility.
 
 ``user_code_identity``
    ASID-pin content gate (system-mode marker runs).  Every

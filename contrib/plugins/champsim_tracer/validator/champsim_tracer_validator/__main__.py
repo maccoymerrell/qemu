@@ -408,6 +408,10 @@ def _parse_args() -> argparse.Namespace:
     from . import _mutation as MUT
     MUT.add_parser(sub)
 
+    # range_cells — mid-block resume/stop acceptance harness (§4.2a).
+    from . import _range_cells as RC
+    RC.add_parser(sub)
+
     return p.parse_args()
 
 
@@ -1421,6 +1425,9 @@ def main() -> int:
     if args.cmd == "mutation":
         from . import _mutation as MUT
         return MUT.cmd_mutation(args)
+    if args.cmd == "range_cells":
+        from . import _range_cells as RC
+        return RC.cmd_range_cells(args)
     return 2
 
 

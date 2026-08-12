@@ -1385,20 +1385,60 @@ def devio_mutation_substrate(build_dir: Path, work_root: Path) -> dict | None:
 # scenario 6: faults / interrupts — the two handler-tracing flags (system)
 # ---------------------------------------------------------------------------
 
+_LEGACY_ENTRY_RE = re.compile(
+    r"^ENTRY \d+ thread=(\d+)(?: asid=(\d+))?(?: switch=\d)?"
+    r"(?: fault_depth=(\d+))?(?: range=(\d+)\.\.(\d+))? template=BB(\d+)")
+
+
 def _depth_hist(cfg: MPConfig, cst: Path) -> dict:
-    """{depth -> count} over the trace's per-entry fault trailers."""
-    _, raw = _run([_decode(cfg), "--format=raw", str(cst)], timeout=600)
+    """{depth -> count} over the per-entry CST_FID_BB_FAULT_DEPTH values,
+    read from the legacy text (epoch 0x1E carries the depth as a block
+    field record; the raw dump prints deltas, not per-entry absolutes).
+    The legacy line prints ``fault_depth=`` only when nonzero, so depth-0
+    entries are counted from the remaining ENTRY lines — a regex that
+    can never match must not report an empty histogram as depth-free."""
+    _, txt = _run([_decode(cfg), "--format=legacy", str(cst)], timeout=600)
     hist: dict = {}
-    for m in re.finditer(r"fault_depth=(\d+)", raw):
-        d = int(m.group(1))
+    for line in txt.splitlines():
+        m = _LEGACY_ENTRY_RE.match(line)
+        if not m:
+            continue
+        d = int(m.group(3)) if m.group(3) is not None else 0
         hist[d] = hist.get(d, 0) + 1
     return hist
 
 
-def _anchor_count(cfg: MPConfig, cst: Path) -> int:
-    """Number of entries carrying a non-empty fault anchor list."""
-    _, raw = _run([_decode(cfg), "--format=raw", str(cst)], timeout=600)
-    return len(re.findall(r"anchors=\[\d", raw))
+def _split_shape(cfg: MPConfig, cst: Path) -> tuple[int, int]:
+    """(partial_entries, discontinuities) over the trace's declared
+    executed ranges (format spec §4.2a) — the replacement for the
+    retired fault-anchor census.  A partial entry prints ``range=k..m``
+    on its legacy line; a continuation (k > 0) must resume, within its
+    (thread, asid) context, exactly where the same template's open
+    stretch stopped.  ``discontinuities`` counts continuations that
+    don't — under ``faults=0`` the stretches must additionally arrive
+    with nothing between them, but adjacency is asserted by the full
+    validator; this light parse asserts the stop/start agreement that
+    any well-formed split must satisfy."""
+    _, txt = _run([_decode(cfg), "--format=legacy", str(cst)], timeout=600)
+    partial = discont = 0
+    open_by_key: dict = {}      # (thread, asid, template) -> open stop
+    for line in txt.splitlines():
+        m = _LEGACY_ENTRY_RE.match(line)
+        if not m:
+            continue
+        thread, asid = m.group(1), m.group(2) or "0"
+        tid = m.group(6)
+        if m.group(4) is None:
+            open_by_key.pop((thread, asid, tid), None)
+            continue
+        start, stop = int(m.group(4)), int(m.group(5))
+        partial += 1
+        key = (thread, asid, tid)
+        if start > 0:
+            if open_by_key.pop(key, None) != start:
+                discont += 1
+        open_by_key[key] = stop     # may itself still be partial
+    return partial, discont
 
 
 def run_faults_interrupts_probe(cfg: MPConfig) -> MPResult:
@@ -1407,8 +1447,8 @@ def run_faults_interrupts_probe(cfg: MPConfig) -> MPResult:
 
       * faults=1 (default) establishes the workload triggers synchronous
         handlers (a depth>=1 entry) — otherwise faults=0 proves nothing;
-      * faults=0 SUPPRESSES them: no depth>0 entry, no anchor, and the
-        interrupted blocks still reassemble whole (audit clean / strict rc=0);
+      * faults=0 SUPPRESSES them: no depth>0 entry, and any interrupted
+        block's split ranges are contiguous (audit clean / strict rc=0);
       * interrupts=1 CAPTURES the asynchronous handler: depth>=1 present,
         audit clean, strict rc=0, no WP storm (boot completes in-budget).
     """
@@ -1447,13 +1487,21 @@ def run_faults_interrupts_probe(cfg: MPConfig) -> MPResult:
         return _emit("faults / interrupts handler-tracing flags", subs)
     h0 = _depth_hist(cfg, cst0)
     deep0 = sum(c for d, c in h0.items() if d >= 1)
-    anch0 = _anchor_count(cfg, cst0)
+    if not h0:
+        subs.append(SubCheck(
+            "2. faults=0 trace decoded at least one entry", False,
+            "legacy decode surfaced no ENTRY lines — the depth census "
+            "has no subject and must not report a pass"))
+        return _emit("faults / interrupts handler-tracing flags", subs)
+    split0, disc0 = _split_shape(cfg, cst0)
     ok0a, asum0 = _audit_clean(cfg, cst0)
     src0 = _strict_rc(cfg, cst0)
     subs.append(SubCheck(
-        "2. faults=0 excludes handlers (no depth>0, no anchors) + clean",
-        deep0 == 0 and anch0 == 0 and ok0a and src0 == 0,
-        f"deep_entries={deep0} anchors={anch0} strict_rc={src0} audit[{asum0}]"))
+        "2. faults=0 excludes handlers (no depth>0) and every split "
+        "range is contiguous + clean",
+        deep0 == 0 and disc0 == 0 and ok0a and src0 == 0,
+        f"deep_entries={deep0} split_entries={split0} "
+        f"discontinuities={disc0} strict_rc={src0} audit[{asum0}]"))
 
     # --- (3) interrupts=1: async handler captured at depth>=1 ---
     outi = od / "interrupts1"

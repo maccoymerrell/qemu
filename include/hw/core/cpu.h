@@ -776,9 +776,11 @@ struct CPUState {
      * collapses to a memcpy + mask update.  Lines are bump-allocated
      * from plugin_spec_store_pool so spec_mode_end can release
      * entries by truncating the pool without per-line g_free traffic.
-     * Hash value type is PluginSpecLine* (see plugin-spec.h).
+     * Hash value type is the line's POOL INDEX + 1 (see
+     * spec_line_get_or_alloc: the pool moves when it grows, so a stored
+     * pointer would dangle; an index survives the realloc).
      * plugin_spec_mode itself lives outside CONFIG_PLUGIN (see above). */
-    GHashTable *plugin_spec_store_buf;        /* line_addr -> PluginSpecLine* */
+    GHashTable *plugin_spec_store_buf;        /* line_addr -> pool idx + 1 */
     void *plugin_spec_store_pool;             /* PluginSpecLine[] */
     size_t plugin_spec_store_pool_used;       /* high water in pool */
     size_t plugin_spec_store_pool_cap;        /* allocated slots */

@@ -731,9 +731,14 @@ bool qemu_plugin_read_memory_vaddr(uint64_t addr, GByteArray *data, size_t len)
             unsigned remain  = PLUGIN_SPEC_LINE_SIZE - idx;
             unsigned chunk   = (unsigned)(len - off) < remain
                 ? (unsigned)(len - off) : remain;
-            PluginSpecLine *line = (PluginSpecLine *)g_hash_table_lookup(
+            /* Hash value = pool index + 1 (see spec_line_get_or_alloc). */
+            gpointer val = g_hash_table_lookup(
                 current_cpu->plugin_spec_store_buf,
                 GUINT_TO_POINTER((guintptr)line_addr));
+            PluginSpecLine *line = val
+                ? &((PluginSpecLine *)current_cpu->plugin_spec_store_pool)
+                      [GPOINTER_TO_SIZE(val) - 1]
+                : NULL;
             if (line) {
                 uint64_t mask = line->valid_mask >> idx;
                 for (unsigned k = 0; k < chunk; k++) {
@@ -994,13 +999,26 @@ bool qemu_plugin_exec_tb(void)
  * (used = 0) at spec_mode_end — entries from prior simulations are
  * never freed, just overwritten on reuse.  Returns NULL when the
  * sandbox line cap is reached and the line isn't already tracked.
+ *
+ * The hash table's value is the line's POOL INDEX plus one, never a
+ * pointer into the pool.  The pool grows by g_realloc_n, which moves
+ * the array: a stored pointer would dangle into the freed copy at the
+ * first growth inside an excursion, and every later hit on a
+ * pre-growth line would read — and worse, WRITE — freed heap.
+ * Measured exactly so under ASAN (riscv64, tb-size=4, wpdepth=65536:
+ * heap-use-after-free in spec_load_bytes against a 20 KiB region this
+ * function's realloc freed), and the writes are the mechanism behind
+ * the downstream free(): invalid pointer aborts the same configuration
+ * produced.  An index is stable across growth by construction; each
+ * lookup resolves it against the pool base of the moment.
  */
 PluginSpecLine *spec_line_get_or_alloc(CPUState *cpu, vaddr line_addr)
 {
-    PluginSpecLine *line = (PluginSpecLine *)g_hash_table_lookup(
+    PluginSpecLine *pool = (PluginSpecLine *)cpu->plugin_spec_store_pool;
+    gpointer val = g_hash_table_lookup(
         cpu->plugin_spec_store_buf, GUINT_TO_POINTER((guintptr)line_addr));
-    if (line) {
-        return line;
+    if (val) {
+        return &pool[GPOINTER_TO_SIZE(val) - 1];
     }
     if (cpu->plugin_spec_store_pool_used >= PLUGIN_SPEC_STORE_LINE_MAX) {
         return NULL;
@@ -1018,14 +1036,16 @@ PluginSpecLine *spec_line_get_or_alloc(CPUState *cpu, vaddr line_addr)
         cpu->plugin_spec_store_pool = g_realloc_n(
             cpu->plugin_spec_store_pool, new_cap, sizeof(PluginSpecLine));
         cpu->plugin_spec_store_pool_cap = new_cap;
+        pool = (PluginSpecLine *)cpu->plugin_spec_store_pool;
     }
-    PluginSpecLine *pool = (PluginSpecLine *)cpu->plugin_spec_store_pool;
-    line = &pool[cpu->plugin_spec_store_pool_used++];
+    size_t idx = cpu->plugin_spec_store_pool_used++;
+    PluginSpecLine *line = &pool[idx];
     line->valid_mask = 0;
     /* bytes[] left uninitialised; valid_mask gates reads, so unused
      * bytes are never observed. */
     g_hash_table_insert(cpu->plugin_spec_store_buf,
-                        GUINT_TO_POINTER((guintptr)line_addr), line);
+                        GUINT_TO_POINTER((guintptr)line_addr),
+                        GSIZE_TO_POINTER(idx + 1));
     return line;
 }
 

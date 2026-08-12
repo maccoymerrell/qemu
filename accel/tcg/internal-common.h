@@ -124,8 +124,16 @@ static inline bool cpu_plugin_spec_redirect_probe(CPUState *cpu)
 
 static inline PluginSpecLine *spec_line_lookup(CPUState *cpu, vaddr line_addr)
 {
-    return (PluginSpecLine *)g_hash_table_lookup(
+    /* The hash value is the line's pool index + 1, resolved against the
+     * pool base of the moment — never a stored pointer, which the pool's
+     * realloc growth would leave dangling (see spec_line_get_or_alloc). */
+    gpointer val = g_hash_table_lookup(
         cpu->plugin_spec_store_buf, GUINT_TO_POINTER((guintptr)line_addr));
+    if (!val) {
+        return NULL;
+    }
+    return &((PluginSpecLine *)cpu->plugin_spec_store_pool)
+                [GPOINTER_TO_SIZE(val) - 1];
 }
 
 static inline void spec_store_byte(CPUState *cpu, vaddr addr, uint8_t val)

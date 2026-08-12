@@ -155,6 +155,7 @@ FEATURES: dict[str, str] = {
     "behavior:isa_crosscheck": "the decode metadata the tracer consumes (Capstone + the disas/capstone.c correction boundary) agrees with an independently maintained decoder (LLVM MC) across an exhaustive sweep of the opcode-bearing encoding space, on all four ISAs, outside a justified allowlist",
     "behavior:decode_fixups": "the repairs the plugin makes to the decode boundary -- the register edges apply_isa_branch_fixups() restores, the register groups the operand walker expands, the branch taxonomy the ISA tables supply -- still happen, asserted per signature in both directions so a repair that silently stops fails as surely as one nobody wrote down; the boundary comparison cannot see this, because a regressed repair reintroduces exactly the disagreement its allowlist already expects",
     "behavior:decode_fields": "the InsnFields the dependency model records -- the layer the trace is BUILT from -- agree with LLVM MC across an exhaustive fields-layer sweep on mipsel and aarch64, the two ISAs whose only register-capture ground truth is static decode (no PIN, no Spike); the check first PROVES the oracle can fire by injecting a wrong register attribution (--falsify) and requiring the gate to go red naming the damaged mnemonic, then requires the undamaged sweep to be green outside tools/isaxcheck_fields_allow.txt with zero dead rules",
+    "behavior:lldet_watchdog": "the lldet hang watchdog -- the harness's only detection for the livelock/hang class, since the product carries no detect-and-handle -- adjudicates a genuinely stalled child in BOTH verdict classes (DEADLOCK: frozen, zero CPU delta; LIVELOCK: burning a core with zero trace/console/write growth) and leaves a slow-but-growing child alone through the SLOW extension; a healthy cell cannot be killed by design, so a fire-proof built from one records a deadline crossing and a natural exit and proves nothing, which is what every silent cell in every hang wave was previously resting on",
     "behavior:implicit_operands": "the implicit operands — architectural state an instruction touches that its encoding does not name — that the decode boundary reports today are still reported, asserted per encoding against expectations derived from BEHAVIOUR rather than from any decoder (Arm's Machine Readable Architecture, the Sail RISC-V model, QEMU's MIPS TCG translator), so the class of defect where Capstone and LLVM agree and are both wrong is visible at all; each row carries a disposition and the dynamic weight of its instruction form",
     "behavior:segment_final_memops": "the segment's last body entry carries its memory operands, matching the earlier executions of the same true BB (the deferred icount/simpoint window close emits it after it has run, not before)",
     "behavior:smc_revisions": "self-modifying code: correct-path template-revision minting for rewrites that preserve OR change the block's instruction boundaries, content-signature id reuse, and the per-pc revision cap (4-ISA)",
@@ -1789,6 +1790,107 @@ def _chk_decode_fields(ctx: Ctx) -> Outcome:
                    "oracle is static decode)", subs)
 
 
+def _chk_lldet_watchdog(ctx: Ctx) -> Outcome:
+    """The hang detector's own fire-proof.
+
+    lldet is the ONLY sanctioned detection for the livelock/hang class:
+    the product carries no detect-and-handle, so every "no hang" result
+    this harness reports is really the statement "the watchdog watched
+    and stayed silent".  That statement is worth exactly as much as the
+    proof that the watchdog can speak, and until this check existed there
+    was none.  The protocol that was supposed to supply it ran a HEALTHY
+    cell under ``CST_LLDET_TIMEOUT=5`` and demanded a kill -- but a
+    healthy cell cannot be killed by design and must not be: adjudicate()
+    needs a SECOND sample ``SAMPLE_GAP_S`` after the deadline, and a cell
+    that finishes in between simply exits.  Every artifact that protocol
+    produced therefore recorded the deadline being crossed, one sample,
+    no verdict, and a natural exit -- an instrument photographed in the
+    act of not firing, filed as the evidence that it fires.
+
+    The condition the watchdog adjudicates is a STALL, so the arms have
+    to stall.  Both verdict classes get one, because they are reached
+    through different branches and a working DEADLOCK arm says nothing
+    about LIVELOCK -- which is the shape the class is actually named for,
+    a guest burning host cores while the trace, the console and the write
+    counter all stand still:
+
+      1. DEADLOCK -- a frozen child (zero CPU delta, zero growth).
+      2. LIVELOCK -- a spinning child (a full core, zero growth).
+      3. PROGRESS control -- a child that is slow but growing its trace
+         file.  It must NOT be killed, and must be seen taking the SLOW
+         extension.  Without it the two kill arms are equally consistent
+         with a watchdog that kills everything it watches, which would
+         make every silent cell in every wave meaningless in the other
+         direction.
+
+    No qemu, no guest, no trace: the subject is the adjudicator, and
+    feeding it real cells would only reintroduce the dependence on a
+    stall nobody can summon on demand.
+    """
+    from . import _lldet as L
+
+    work = ctx.dir("lldet_watchdog")
+    spin = "import time\nwhile True: time.sleep(0)\n"
+    grow = ("import time\n"
+            "for i in range(12):\n"
+            "    open(%r, 'ab').write(b'x' * 4096)\n"
+            "    time.sleep(2)\n")
+
+    def arm(name: str, cmd: list) -> tuple[int, object, L.Watch]:
+        prefix = str(work / name)
+        old = os.environ.get("CST_LLDET_TIMEOUT")
+        os.environ["CST_LLDET_TIMEOUT"] = "5"
+        try:
+            watch = L.Watch(key=L.config_key("x86_64", "system", 1, 64),
+                            budget=None,
+                            growth_patterns=L.default_growth_patterns(prefix),
+                            sidecar_path=Path(prefix + ".lldet"),
+                            label=f"lldet selftest {name}")
+        finally:
+            if old is None:
+                os.environ.pop("CST_LLDET_TIMEOUT", None)
+            else:
+                os.environ["CST_LLDET_TIMEOUT"] = old
+        with open(prefix + ".log", "w") as f:
+            rc, verdict = L.run_watched(cmd, watch, stdout=f, stderr=f)
+        return rc, verdict, watch
+
+    subs: list = []
+    all_ok = True
+
+    for name, cmd, want in (
+            ("deadlock", [sys.executable, "-c",
+                          "import time; time.sleep(120)"], "DEADLOCK"),
+            ("livelock", [sys.executable, "-c", spin], "LIVELOCK")):
+        rc, verdict, _w = arm(name, cmd)
+        kind = getattr(verdict, "kind", None)
+        ok = (rc == L.LLDET_EXIT and kind == want)
+        all_ok = all_ok and ok
+        subs.append({"name": f"{name} arm", "ok": ok, "detail":
+                     f"rc={rc} (want {L.LLDET_EXIT}), verdict={kind} "
+                     f"(want {want})" + ("" if ok else
+                     "  -- the watchdog did not fire on a stalled child, "
+                     "so every silent cell it has ever watched is "
+                     "unproven")})
+
+    prefix = str(work / "progress")
+    rc, verdict, watch = arm("progress", [sys.executable, "-c",
+                                          grow % (prefix + ".cst")])
+    ok = (rc == 0 and verdict is None and watch.extensions >= 1)
+    all_ok = all_ok and ok
+    subs.append({"name": "progress control", "ok": ok, "detail":
+                 f"rc={rc} (want 0), verdict={getattr(verdict, 'kind', None)}"
+                 f" (want None), SLOW extensions={watch.extensions} (want "
+                 ">=1)" + ("" if ok else
+                 "  -- a growing child was killed or was never adjudicated; "
+                 "a watchdog that cannot tell slow from stuck manufactures "
+                 "hangs instead of finding them")})
+
+    return Outcome("pass" if all_ok else "fail",
+                   "lldet adjudicates a stalled child in both verdict "
+                   "classes and leaves a growing one alone", subs)
+
+
 def _chk_implicit_operands(ctx: Ctx) -> Outcome:
     """Ground truth that never passed through a decoder at all.
 
@@ -2169,6 +2271,10 @@ def build_checks() -> list:
                    "(mipsel + aarch64: static decode is their register-"
                    "capture oracle)",
                    ["behavior:decode_fields"], _chk_decode_fields))
+    C.append(Check("features.lldet_watchdog", "features",
+                   "the hang watchdog's own fire-proof: it kills a frozen "
+                   "and a spinning child and spares a growing one",
+                   ["behavior:lldet_watchdog"], _chk_lldet_watchdog))
     C.append(Check("features.implicit_operands", "features",
                    "implicit-operand assertion table: expectations derived "
                    "from behaviour (MRA / Sail / TCG translators), not from "

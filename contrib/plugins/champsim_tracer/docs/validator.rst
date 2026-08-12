@@ -923,6 +923,41 @@ outside the repo as standalone scripts):
    from an oracle that cannot alert is not evidence.  The single-encoding
    arms ride ``--hex`` with ``--check``, which routes the bytes through
    the same signature, allowlist and exit-code machinery as the sweep.
+``features.lldet_watchdog``
+   The hang detector's own fire-proof.  The tracer carries no
+   detect-and-handle for the livelock/hang class — by ruling, detection
+   lives in the harness — so ``lldet`` is the only thing standing between
+   a wedged guest and a run that reports nothing at all.  Every "no hang"
+   result the battery produces is therefore the narrower statement *the
+   watchdog watched and stayed silent*, and that statement is worth
+   exactly what the proof that the watchdog can speak is worth.
+
+   The subject is the adjudicator, so the check drives it directly and
+   uses no guest, no qemu and no trace.  Three arms, each a child process
+   with a five-second deadline:
+
+   - **deadlock** — a frozen child.  Zero CPU delta and zero growth must
+     produce a ``DEADLOCK`` verdict and exit ``89``.
+   - **livelock** — a spinning child.  A full host core with zero trace,
+     console and write growth must produce a ``LIVELOCK`` verdict and
+     exit ``89``.  The two arms reach the verdict through different
+     branches, and livelock is the shape the class is named for, so a
+     working deadlock arm vouches for nothing here.
+   - **progress control** — a slow child that keeps growing its trace
+     file.  It must *not* be killed, and must be observed taking the
+     ``SLOW`` extension.  Without this arm the kill arms are equally
+     consistent with a watchdog that kills everything it watches, which
+     would empty the battery's silences of meaning in the other
+     direction.
+
+   A healthy validator cell cannot be used as this proof, and the attempt
+   is instructive: ``adjudicate()`` requires a *second* sample
+   ``SAMPLE_GAP_S`` after the deadline, so a cell that finishes in
+   between simply exits.  Shortening the deadline against a healthy cell
+   yields a sidecar showing the deadline crossed, one sample taken, no
+   verdict and a natural exit — an instrument photographed in the act of
+   not firing.  The condition being adjudicated is a stall, so the arms
+   must stall.
 ``features.implicit_operands``
    An *implicit* operand is architectural state an instruction touches
    that its encoding does not name: AArch64 ``ret`` reading ``x30``,

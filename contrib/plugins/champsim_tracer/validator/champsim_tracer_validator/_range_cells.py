@@ -12,14 +12,23 @@ wire contract requires at a specific capture boundary:
                     equals the stated stop, and the final entry declares
                     the partial range that makes it exact;
   ``marker_end``    the END marker terminates the tracer mid-block: the
-                    final user entry's ``bb_stop`` indexes the END-marker
-                    instruction itself — the close fires from inside its
-                    execution, so its results are unobservable and it is
-                    excluded (``bb_stop`` counts fully-OBSERVED
-                    instructions, not retired ones);
-  ``rep_split``     a REP invocation interrupted mid-flight re-joins by
-                    range chaining alone: every stretch contiguous, the
-                    fan-out sub-entries' counts intact;
+                    final user entry stops AT the END marker — the close
+                    fires from inside the firing instruction's execution,
+                    so the published range excludes it, stopping either
+                    exactly at the firing instruction (stash path, tail
+                    snap captured) or one retired-but-unobserved
+                    instruction earlier (direct-cursor path); the
+                    END-marker pcs are DERIVED from the trace's own
+                    template bytes (the champsim_marker.h contract),
+                    an existing carrier, not a new meta field;
+  ``rep_split``     a REP invocation interrupted mid-flight by a kernel
+                    excursion keeps its fan-out intact: iteration
+                    entries appear on both sides of the excursion and
+                    the per-iteration stores tile the staged transfer
+                    span exactly — no iteration lost, none duplicated
+                    (the cell stages its own system boot: a
+                    marker-bracketed REP STOSB whose destination
+                    crosses into a never-touched page);
   ``wp_own_range``  a speculative block carries its OWN range: a chain
                     that exhausts the wpdepth budget mid-block cuts its
                     last block at exactly the remainder — the chain's
@@ -139,12 +148,127 @@ def assert_budget_close(entries: list[dict], tby: dict,
     return False, "no entries decoded — nothing was billed"
 
 
+def _le32(w: int) -> bytes:
+    return bytes((w & 0xff, (w >> 8) & 0xff, (w >> 16) & 0xff,
+                  (w >> 24) & 0xff))
+
+
+def _end_marker_seq_bytes(isa: str) -> list[bytes] | None:
+    """Per-instruction byte encodings of the END-marker sequence for @isa,
+    mirroring champsim_marker.h's encoders exactly (the contract's magic
+    and length are parsed out of the header via asm_blocks, so this can
+    never silently drift from what the plugin detects)."""
+    from . import asm_blocks as B
+    _magic, end, seq = B._marker_contract()
+    if isa == "x86_64":
+        unit = [bytes((0xB8,)) + _le32(end)]
+    elif isa == "aarch64":
+        unit = [_le32(0x52800000 | ((end & 0xffff) << 5)),
+                _le32(0x72a00000 | ((end >> 16) << 5))]
+    elif isa == "riscv64":
+        unit = [_le32(((end >> 12) << 12) | (10 << 7) | 0x37),
+                _le32(((end & 0xfff) << 20) | (10 << 15) | (10 << 7) | 0x13)]
+    elif isa in ("mipsel", "mips"):
+        unit = [_le32(0x3c080000 | (end >> 16)),
+                _le32(0x35080000 | (end & 0xffff))]
+    else:
+        return None
+    return unit * seq
+
+
+def derive_end_marker_pcs(tby: dict, isa: str) -> tuple[list[int] | None, str]:
+    """Derive the END-marker sequence's instruction pcs from the trace's
+    own template bytes — the existing carrier.  The templates section
+    publishes every instruction's encoding, and a marker workload's END
+    sequence is on the wire in at least one template (typically cut short
+    by the close, sometimes complete via a wrong-path visit).  A partial
+    witness is placed by contradiction: candidate positions whose other
+    slots collide with KNOWN non-marker bytes are rejected, and the
+    candidate witnessed by the most template instructions wins; a tie is
+    ambiguity and fails loudly rather than guessing."""
+    seqb = _end_marker_seq_bytes(isa)
+    if seqb is None:
+        return None, f"no END-marker encoding known for ISA {isa!r}"
+    offs = [0]
+    for b in seqb[:-1]:
+        offs.append(offs[-1] + len(b))
+    known: dict[int, bytes] = {}
+    conflict: set = set()
+    for t in tby.values():
+        if t.get("is_system"):
+            continue
+        for insd in (t.get("insns") or []):
+            pc = int(insd.get("pc", -1))
+            b = insd.get("raw_bytes") or b""
+            if pc < 0 or not b:
+                continue
+            if pc in known and known[pc] != b:
+                conflict.add(pc)
+            else:
+                known[pc] = b
+    candidates: set = set()
+    for pc, b in known.items():
+        if pc in conflict:
+            continue
+        for j, exp in enumerate(seqb):
+            if b == exp:
+                candidates.add(pc - offs[j])
+    scored: list[tuple[int, int]] = []
+    for c in sorted(candidates):
+        score = 0
+        ok = True
+        for i, exp in enumerate(seqb):
+            slot = c + offs[i]
+            if slot in conflict:
+                ok = False
+                break
+            kb = known.get(slot)
+            if kb is None:
+                continue                      # not on the wire: allowed
+            if kb == exp:
+                score += 1
+            else:
+                ok = False                    # a KNOWN different insn sits
+                break                         # where the sequence would be
+        if ok:
+            scored.append((score, c))
+    if not scored:
+        return None, ("no template instruction carries the END-marker "
+                      "byte sequence — the trace has no END marker to "
+                      "derive (not a marker-mode trace, or the close "
+                      "dropped every marker template)")
+    best = max(s for s, _ in scored)
+    top = [c for s, c in scored if s == best]
+    if len(top) != 1:
+        return None, (f"END-marker position ambiguous: {len(top)} "
+                      f"candidate placements tie at {best}/{len(seqb)} "
+                      f"witnessed instructions")
+    seq_pcs = [top[0] + o for o in offs]
+    return seq_pcs, (f"derived from template bytes: sequence at "
+                     f"0x{seq_pcs[0]:x}..0x{seq_pcs[-1]:x} "
+                     f"({best}/{len(seqb)} insns witnessed on the wire)")
+
+
 def assert_marker_end(entries: list[dict], tby: dict,
-                      marker_pc: int) -> tuple[bool, str]:
-    """The final user entry stops AT the END-marker instruction: its
-    template contains @marker_pc at index m, and ``bb_stop == m`` — the
-    marker instruction's own execution triggered the close, so it is
-    retired but not fully observed, and the range excludes it."""
+                      seq_pcs: list[int]) -> tuple[bool, str]:
+    """The final user entry stops AT the END marker.  The close fires
+    from inside the firing instruction (the sequence's last), so the
+    published range always excludes it; the S18 stop rule licenses
+    exactly two stop points (``bb_stop`` counts fully-OBSERVED
+    instructions, not retired ones):
+
+      * the firing instruction itself — stash path, the last retired
+        instruction's results were snapped;
+      * one instruction earlier — direct-cursor path, the last retired
+        instruction's results were never observable and it is excluded
+        too.
+
+    Anything past the firing instruction published its execution (the
+    pre-range overshoot); anything earlier than the one licensed
+    unobserved-tail instruction under-published what retired."""
+    if len(seq_pcs) < 2:
+        return False, "END-marker sequence must carry >= 2 pcs"
+    firing, before = seq_pcs[-1], seq_pcs[-2]
     last_user = None
     for e in entries:
         if not _is_sys(e, tby):
@@ -153,63 +277,152 @@ def assert_marker_end(entries: list[dict], tby: dict,
         return False, "no user entries decoded"
     t = tby.get(last_user["template_id"]) or {}
     ins = t.get("insns") or []
-    m = next((i for i, x in enumerate(ins)
-              if int(x.get("pc", -1)) == marker_pc), None)
     start, stop, n = _rng(last_user, tby)
-    if m is None:
-        return False, (f"final user entry BB{last_user['template_id']} does "
-                       f"not contain the END-marker pc 0x{marker_pc:x} "
-                       f"(range [{start},{stop}) of {n})")
-    if stop != m:
-        return False, (f"final user entry stops at {stop} but the END "
-                       f"marker sits at index {m}: an END marker close "
-                       f"must exclude the marker instruction itself "
-                       f"(bb_stop counts fully-observed instructions)")
-    return True, (f"final user entry BB{last_user['template_id']} stops "
-                  f"exactly at the END marker (index {m})")
+    if stop < n:
+        stop_pc = int(ins[stop].get("pc", -1))
+    else:
+        stop_pc = int(t.get("fall_through_pc", -1))
+    if stop_pc == firing:
+        return True, (f"final user entry BB{last_user['template_id']} "
+                      f"stops exactly at the END firing insn "
+                      f"0x{firing:x} (every retired insn observed)")
+    if stop_pc == before:
+        return True, (f"final user entry BB{last_user['template_id']} "
+                      f"stops one insn short of the END firing insn "
+                      f"0x{firing:x} (the one licensed "
+                      f"retired-but-unobserved tail excluded)")
+    published_firing = any(
+        int(x.get("pc", -1)) == firing for x in ins[start:stop])
+    if published_firing:
+        return False, (f"final user entry BB{last_user['template_id']} "
+                       f"publishes the END firing insn 0x{firing:x} "
+                       f"inside its range [{start},{stop}) — an END "
+                       f"close must exclude the instruction that fired "
+                       f"it (its results are unobservable)")
+    return False, (f"final user entry BB{last_user['template_id']} stops "
+                   f"at pc 0x{stop_pc:x}, but an END close may stop only "
+                   f"at the firing insn 0x{firing:x} or one insn before "
+                   f"it (0x{before:x}) — more than the licensed "
+                   f"unobserved tail is missing from the wire")
 
 
-def assert_rep_split(entries: list[dict], tby: dict,
-                     rep_tmpl: int) -> tuple[bool, str]:
-    """Every invocation of the REP template @rep_tmpl folds to exactly
-    ``[0, n)`` through contiguous stretches, and at least one invocation
-    was split (>= 2 stretches) — the shape a mid-REP interruption must
-    leave under range chaining."""
-    n = len((tby.get(rep_tmpl) or {}).get("insns") or [])
-    open_stop: dict[tuple, int] = {}
-    n_split = n_whole = 0
+def assert_rep_split(entries: list[dict], tby: dict, rep_pc: int,
+                     expect_lo: int | None = None,
+                     expect_bytes: int | None = None) -> tuple[bool, str]:
+    """A REP invocation interrupted mid-flight keeps its fan-out intact
+    (format spec §4.2a + the bulk-memory self-loop contract): iteration
+    entries appear on BOTH sides of the kernel excursion, and the
+    per-iteration stores of the whole invocation tile a contiguous byte
+    span — no iteration lost, none duplicated, each rendered at its own
+    position.  With @expect_lo/@expect_bytes (the staged transfer span)
+    the tile must equal ``[expect_lo, expect_lo + expect_bytes)`` — the
+    architectural count, not the delivered-callback count.
+
+    An invocation is the maximal run, within one context, of entries
+    whose executed range covers the REP instruction at @rep_pc
+    (the entering block's entry, ranged continuations, and the 1-insn
+    self-loop sub-template's per-iteration entries alike), with kernel
+    or ``fault_depth >= 1`` entries in between marking excursions."""
+    idx_by_tmpl: dict[int, int] = {}
+    for tid, t in tby.items():
+        for i, x in enumerate(t.get("insns") or []):
+            if int(x.get("pc", -1)) == rep_pc:
+                idx_by_tmpl[tid] = i
+                break
+    if not idx_by_tmpl:
+        return False, f"no template contains the REP insn at 0x{rep_pc:x}"
+
+    st: dict[tuple, dict] = {}
+    results: list[tuple[str, str]] = []       # (kind, msg): ok|bad|unsplit
+
+    def finalize(s: dict) -> None:
+        stores = sorted(s["stores"])
+        if not stores:
+            return                            # zero-count REP: no subject
+        holes = []
+        cur = stores[0][0]
+        for a, sz in stores:
+            if a != cur:
+                holes.append((cur, a))
+            cur = max(cur, a + sz)
+        lo, span = stores[0][0], cur - stores[0][0]
+        if holes:
+            h = holes[0]
+            results.append(("bad", (
+                f"REP@0x{rep_pc:x}: iteration stores do not tile — "
+                f"[0x{h[0]:x},0x{h[1]:x}) missing inside "
+                f"[0x{lo:x},0x{cur:x}) ({len(stores)} stores over "
+                f"{s['interruptions']} interruption(s)); an iteration "
+                f"was lost or overlapped")))
+            return
+        if expect_lo is not None and expect_bytes is not None and \
+                (lo != expect_lo or span != expect_bytes):
+            results.append(("bad", (
+                f"REP@0x{rep_pc:x}: invocation tiles "
+                f"[0x{lo:x},0x{lo + span:x}) ({span} bytes) but the "
+                f"staged transfer was [0x{expect_lo:x},"
+                f"0x{expect_lo + expect_bytes:x}) ({expect_bytes} "
+                f"bytes) — {expect_bytes - span} byte(s) of retired "
+                f"iterations are not on the wire")))
+            return
+        if not s["resumed"]:
+            results.append(("unsplit", (
+                f"invocation tiles [0x{lo:x},0x{cur:x}) whole, with no "
+                f"kernel excursion between iteration entries")))
+            return
+        results.append(("ok", (
+            f"REP@0x{rep_pc:x}: invocation split by "
+            f"{s['interruptions']} kernel excursion(s), {len(stores)} "
+            f"iteration stores tile [0x{lo:x},0x{lo + span:x}) exactly")))
+
     for e in entries:
-        if int(e["template_id"]) != rep_tmpl:
-            continue
         c = _ctx(e)
-        start, stop, _n = _rng(e, tby)
-        if start == 0:
-            if c in open_stop:
-                return False, (f"REP BB{rep_tmpl} re-opened while a stretch "
-                               f"was open at {open_stop[c]} — an invocation "
-                               f"lost its tail")
-            if stop == n:
-                n_whole += 1
+        tid = int(e["template_id"])
+        depth = int(e.get("fault_depth", 0) or 0)
+        sysn = _is_sys(e, tby)
+        s = st.get(c)
+        covers = False
+        if tid in idx_by_tmpl:
+            k = idx_by_tmpl[tid]
+            start, stop, _n = _rng(e, tby)
+            covers = start <= k < stop
+        if covers:
+            if s is None:
+                st[c] = s = {"stores": [], "interruptions": 0,
+                             "resumed": False, "pending_exc": False}
+            elif s["pending_exc"]:
+                s["interruptions"] += 1
+                if s["stores"]:
+                    s["resumed"] = True       # iterations on both sides
+                s["pending_exc"] = False
+            k = idx_by_tmpl[tid]
+            for d in (e.get("dyn_params") or []):
+                if getattr(d, "type_name", "") == "store" and \
+                        int(getattr(d, "insn_index", -1)) == k:
+                    s["stores"].append((int(d.value),
+                                        max(1, int(d.data_size or 1))))
+        elif s is not None:
+            if sysn or depth >= 1:
+                s["pending_exc"] = True
             else:
-                open_stop[c] = stop
-        else:
-            if open_stop.get(c) != start:
-                return False, (f"REP BB{rep_tmpl} continuation at {start} "
-                               f"does not continue its open stretch "
-                               f"({open_stop.get(c)})")
-            if stop == n:
-                del open_stop[c]
-                n_split += 1
-            else:
-                open_stop[c] = stop
-    if open_stop:
-        return False, f"REP BB{rep_tmpl}: {len(open_stop)} stretch(es) open"
-    if n_split == 0:
-        return False, (f"REP BB{rep_tmpl}: {n_whole} whole invocations, 0 "
-                       f"split — the interruption the cell stages never "
-                       f"produced a split shape")
-    return True, (f"REP BB{rep_tmpl}: {n_split} split invocation(s) "
-                  f"rejoined exactly, {n_whole} whole")
+                finalize(s)
+                del st[c]
+    for s in st.values():
+        finalize(s)
+
+    if not results:
+        return False, (f"no invocation of the REP insn at 0x{rep_pc:x} "
+                       f"delivered any stores — nothing to assert")
+    bad = [m for k, m in results if k == "bad"]
+    if bad:
+        return False, bad[0]
+    ok = [m for k, m in results if k == "ok"]
+    if ok:
+        return True, ok[0]
+    return False, (f"REP@0x{rep_pc:x}: no invocation was interrupted "
+                   f"mid-flight — the staged kernel excursion between "
+                   f"iterations is not on the wire "
+                   f"({results[0][1]})")
 
 
 def assert_wp_own_range(entries: list[dict], tby: dict,
@@ -263,21 +476,35 @@ def assert_wp_own_range(entries: list[dict], tby: dict,
 # (the pre-range shape) must FAIL.
 # ---------------------------------------------------------------------------
 
-def _fx_tmpl(tid, n, sys=False, pcs=None, mem_at=()):
+def _fx_tmpl(tid, n, sys=False, pcs=None, mem_at=(), fall_through=None,
+             raw=None):
     ins = []
     for i in range(n):
         ins.append({"pc": (pcs[i] if pcs else 0x1000 + 16 * tid + i),
                     "n_loads": 1 if i in mem_at else 0, "n_stores": 0,
-                    "branch_type": 0})
+                    "branch_type": 0,
+                    "raw_bytes": (raw or {}).get(i, b"")})
     return {"template_id": tid, "start_pc": ins[0]["pc"], "insns": ins,
-            "is_system": sys}
+            "is_system": sys,
+            "fall_through_pc": (fall_through if fall_through is not None
+                                else ins[-1]["pc"] + 4)}
+
+
+class _FxDyn:
+    """Fixture stand-in for the decode runner's DynParam."""
+
+    def __init__(self, type_name, value, insn_index, data_size=1):
+        self.type_name = type_name
+        self.value = value
+        self.insn_index = insn_index
+        self.data_size = data_size
 
 
 def _fx_e(tid, start=0, stop=None, depth=0, thread=0, wp=None, seq=0,
-          thread_end=False):
+          thread_end=False, dyn=None):
     return {"template_id": tid, "thread_id": thread, "asid_index": 0,
             "seq_num": seq, "fault_depth": depth, "bb_start": start,
-            "bb_stop": stop, "wp_entries": wp or [], "dyn_params": [],
+            "bb_stop": stop, "wp_entries": wp or [], "dyn_params": dyn or [],
             "reg_snaps": [], "branch_taken": None, "branch_target": None,
             "thread_end": thread_end}
 
@@ -321,17 +548,72 @@ def run_selftest() -> int:
           ([_fx_e(1), _fx_e(2), _fx_e(3), _fx_e(4, 0, 2)], tby2, 17),
           ([_fx_e(1), _fx_e(2), _fx_e(3), _fx_e(4)], tby2, 17))
 
-    # 3. marker_end: END pc at index 2 of BB7; stop==2 — vs. stop==n.
-    tby3 = {7: _fx_tmpl(7, 4, pcs=[0x40, 0x44, 0x48, 0x4c])}
+    # 3. marker_end: END sequence at pcs 0x44/0x48/0x4c of BB7 (firing
+    # 0x4c).  Stash path stops AT the firing insn — vs. the whole block
+    # published (the pre-range overshoot, firing insn inside the range).
+    tby3 = {7: _fx_tmpl(7, 5, pcs=[0x40, 0x44, 0x48, 0x4c, 0x50],
+                        fall_through=0x54)}
+    seq3 = [0x44, 0x48, 0x4c]
     check("marker_end", assert_marker_end,
-          ([_fx_e(7, 0, 2)], tby3, 0x48),
-          ([_fx_e(7)], tby3, 0x48))
+          ([_fx_e(7, 0, 3)], tby3, seq3),
+          ([_fx_e(7)], tby3, seq3))
 
-    # 4. rep_split: [0,1)+[1,3) rejoined — vs. the stretches REORDERED.
-    tby4 = {5: _fx_tmpl(5, 3)}
+    # 3b. marker_end direct-cursor path: one retired-but-unobserved tail
+    # insn excluded — vs. stopping two short (an under-published close).
+    check("marker_end_tail", assert_marker_end,
+          ([_fx_e(7, 0, 2)], tby3, seq3),
+          ([_fx_e(7, 0, 1)], tby3, seq3))
+
+    # 3c. the END-marker pc DERIVATION (the existing-carrier surface):
+    # a full byte-witnessed sequence resolves to its pcs, and a partial
+    # single-insn witness is placed by contradiction with known
+    # neighbouring bytes — vs. a trace carrying no marker bytes at all.
+    seqb = _end_marker_seq_bytes("x86_64")
+    stride = len(seqb[0])
+    d_pcs = [0x100 + i * stride for i in range(len(seqb))]
+
+    def drv(tby, want):
+        pcs, detail = derive_end_marker_pcs(tby, "x86_64")
+        return (pcs == want), detail
+
+    tby_full = {1: _fx_tmpl(1, 4, pcs=d_pcs + [d_pcs[-1] + stride],
+                            raw={0: seqb[0], 1: seqb[1], 2: seqb[2],
+                                 3: b"\x0f\x05"})}
+    tby_part = {1: _fx_tmpl(1, 3, pcs=[0x100 - 2 * stride,
+                                       0x100 - stride, 0x100],
+                            raw={0: b"\x83\xc3\x01", 1: b"\xeb\x00",
+                                 2: seqb[0]})}
+    tby_none = {1: _fx_tmpl(1, 2, pcs=[0x100, 0x105],
+                            raw={0: b"\x0f\x05", 1: b"\xeb\x00"})}
+    check("marker_derive", drv, (tby_full, d_pcs), (tby_none, d_pcs))
+    check("marker_derive_partial", drv, (tby_part, d_pcs), (tby_none, d_pcs))
+
+    # 4. rep_split: a REP invocation split by a kernel excursion with its
+    # fan-out intact (stores tile the staged span) — vs. an iteration
+    # LOST across the excursion (a hole in the tile).
+    tby4 = {5: _fx_tmpl(5, 4, pcs=[0x10, 0x15, 0x1a, 0x1f]),
+            12: _fx_tmpl(12, 1, pcs=[0x1f]),
+            9: _fx_tmpl(9, 2, sys=True)}
+    rep_conform = [_fx_e(5, dyn=[_FxDyn("store", 0xA000, 3)]),
+                   _fx_e(9, depth=1),
+                   _fx_e(12, dyn=[_FxDyn("store", 0xA001, 0)]),
+                   _fx_e(12, dyn=[_FxDyn("store", 0xA002, 0)])]
+    rep_hole = [_fx_e(5, dyn=[_FxDyn("store", 0xA000, 3)]),
+                _fx_e(9, depth=1),
+                _fx_e(12, dyn=[_FxDyn("store", 0xA002, 0)])]
     check("rep_split", assert_rep_split,
-          ([_fx_e(5, 0, 1), _fx_e(5, 1, None)], tby4, 5),
-          ([_fx_e(5, 1, None), _fx_e(5, 0, 1)], tby4, 5))
+          (rep_conform, tby4, 0x1f, 0xA000, 3),
+          (rep_hole, tby4, 0x1f, 0xA000, 3))
+
+    # 4b. rep_split subject direction: the same tile with NO excursion
+    # between iterations is a missing subject, not a pass — the staged
+    # interruption must be visible on the wire.
+    rep_unsplit = [_fx_e(5, dyn=[_FxDyn("store", 0xA000, 3)]),
+                   _fx_e(12, dyn=[_FxDyn("store", 0xA001, 0)]),
+                   _fx_e(12, dyn=[_FxDyn("store", 0xA002, 0)])]
+    check("rep_split_subject", assert_rep_split,
+          (rep_conform, tby4, 0x1f, 0xA000, 3),
+          (rep_unsplit, tby4, 0x1f, 0xA000, 3))
 
     # 5. wp_own_range: chain of 3x5-insn blocks under budget 12: last
     # block cut [0,2) — vs. run whole (15 > 12).
@@ -387,14 +669,157 @@ def _decode(trace: Path):
     return meta, tby, entries
 
 
-def _find_marker_pc(meta: dict, tby: dict) -> int | None:
-    """END-marker pc: the plugin records the resolved END pc in the trace
-    meta when marker mode ran (surfaced by the legacy header)."""
+def end_marker_pcs(meta: dict, tby: dict,
+                   isa: str) -> tuple[list[int] | None, str]:
+    """The END-marker sequence's instruction pcs.  Preferred carrier is
+    the trace's own template bytes (:func:`derive_end_marker_pcs` — on
+    the wire today, no format change); a future epoch that publishes the
+    resolved firing pc in META is honoured first if present."""
     for key in ("end_marker_pc", "marker_end_pc"):
         v = meta.get(key)
         if v:
-            return int(v)
-    return None
+            seqb = _end_marker_seq_bytes(isa)
+            if seqb is None:
+                return None, f"no END-marker encoding known for ISA {isa!r}"
+            offs = [0]
+            for b in seqb[:-1]:
+                offs.append(offs[-1] + len(b))
+            start = int(v) - offs[-1]
+            return ([start + o for o in offs],
+                    f"META {key}=0x{int(v):x}")
+    return derive_end_marker_pcs(tby, isa)
+
+
+# The dedicated rep_split subject: a marker-bracketed REP STOSB whose
+# destination begins _REP_PRE bytes before a never-touched page, so the
+# guest kernel demand-faults mid-loop with retired iterations on both
+# sides.  The .bss region is 64 KiB-padded from the file tail so the
+# loader's partial-page zeroing cannot pre-map it (same discipline as
+# asm_blocks.emit_trace_fault_probe); x86-64 guest pages are 4 KiB.
+_REP_COUNT = 96
+_REP_PRE = 32
+_REP_PAGE = 4096
+
+
+def _rep_probe_source() -> str:
+    from . import asm_blocks as B
+    lines = [
+        "        .section .bss",
+        "        .balign 65536",
+        "        .skip 65536",
+        "cst_rep_page:",
+        "        .skip 65536",
+        "",
+        "        .section .text",
+        "        .globl _start",
+        "_start:",
+    ]
+    lines += B.emit_trace_marker("x86_64")
+    # A fresh TB after the marker: the marker's own TB is the dropped
+    # one-TB segment-open boundary, so the REP must not share it.
+    lines += [
+        "        jmp Lrep",
+        "Lrep:",
+        f"        leaq cst_rep_page+{_REP_PAGE - _REP_PRE}(%rip), %rdi",
+        f"        mov ${_REP_COUNT}, %ecx",
+        "        mov $0x5a, %eax",
+        "        rep stosb",
+        "        jmp Lend",
+        "Lend:",
+        "        add $1, %ebx",
+    ]
+    lines += B.emit_trace_marker_end("x86_64")
+    lines += [
+        "        mov $60, %eax",
+        "        xor %edi, %edi",
+        "        syscall",
+        "        hlt",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _rep_split_cell(build_dir: Path, work: Path) -> tuple[bool, str]:
+    """Stage, boot and judge the rep_split subject (x86_64 system boot).
+    Every missing prerequisite is a loud failure: a cell whose subject
+    cannot be staged must never read as a pass."""
+    import shutil
+    from . import _system as S
+
+    qemu = build_dir / "qemu-system-x86_64"
+    plugin = build_dir / "contrib/plugins/libchampsim_tracer.so"
+    missing = [str(p) for p in (qemu, plugin) if not p.is_file()]
+    if missing:
+        return False, f"cannot stage the REP boot: missing {missing}"
+    kernel, root = S.default_kernel("x86_64"), S.default_root("x86_64")
+    if not kernel.is_file() or not root.is_dir():
+        return False, ("system harness absent (x86_64 kernel/rootfs) — "
+                       "the REP subject needs a system boot for its "
+                       "mid-flight kernel excursion")
+    for tool in ("gcc", "nm", "cpio", "gzip"):
+        if not shutil.which(tool):
+            return False, f"cannot stage the REP boot: {tool} not in PATH"
+
+    work.mkdir(parents=True, exist_ok=True)
+    src = work / "rep_probe.S"
+    src.write_text(_rep_probe_source())
+    binp = work / "rep_probe"
+    r = subprocess.run(["gcc", "-static", "-nostdlib", "-nostartfiles",
+                        "-no-pie", "-O1",
+                        "-fno-asynchronous-unwind-tables",
+                        str(src), "-o", str(binp)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return False, f"REP probe failed to assemble: {r.stderr[-300:]}"
+    page_sym = None
+    for ln in subprocess.run(["nm", str(binp)], capture_output=True,
+                             text=True).stdout.splitlines():
+        parts = ln.split()
+        if len(parts) >= 3 and parts[2] == "cst_rep_page":
+            page_sym = int(parts[0], 16)
+    if page_sym is None:
+        return False, "cst_rep_page not in the REP probe's symbol table"
+    expect_lo = page_sym + _REP_PAGE - _REP_PRE
+
+    cpio = S.stage_initramfs(root, binp, work / "stage")
+    out = work / "rep_probe_trace"
+    cst = Path(f"{out}.cst")
+    if cst.exists():
+        cst.unlink()
+    opts = (f"outfile={out},wpdepth=8,"
+            f"trace_window=marker:simulation=200000,memdata=1,"
+            f"compress=zstd -T0 -3 -q -c")
+    cmd = S.system_qemu_cmd(qemu, kernel, cpio, plugin, opts)
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        return False, "REP boot timed out (600s)"
+    console = (p.stdout or "") + (p.stderr or "")
+    (work / "rep_probe.console.log").write_text(console)
+    if p.returncode != 0:
+        return False, f"REP boot exited rc={p.returncode}"
+    segs = S.parse_finished_segments(console)
+    if len(segs) != 1 or segs[0].get("flag") != "END":
+        return False, (f"REP boot closed "
+                       f"{[s.get('flag') for s in segs] or 'no segment'}, "
+                       f"expected exactly one END close — the REP did "
+                       f"not run inside a marker window")
+    if not cst.is_file():
+        return False, "REP boot closed a window but wrote no .cst"
+
+    meta, tby, entries = _decode(cst)
+    bn = meta.get("branch_names") or {}
+    rep_ids = {int(k) for k, v in bn.items() if v == "BRANCH_REP"}
+    rep_pcs = sorted({int(x.get("pc", -1)) for t in tby.values()
+                      if not t.get("is_system")
+                      for x in (t.get("insns") or [])
+                      if int(x.get("branch_type", 0)) in rep_ids})
+    if not rep_pcs:
+        return False, ("REP boot trace carries no user BRANCH_REP "
+                       "template — the staged REP is not on the wire")
+    ok, detail = assert_rep_split(entries, tby, rep_pcs[0],
+                                  expect_lo, _REP_COUNT)
+    return ok, (f"(dedicated boot, staged span 0x{expect_lo:x}"
+                f"+{_REP_COUNT}) {detail}")
 
 
 def _budget_close_cell(user_dir: Path, u_trace: Path, build_dir: Path,
@@ -447,9 +872,11 @@ def _budget_close_cell(user_dir: Path, u_trace: Path, build_dir: Path,
 def run_cells(user_dir: Path, sys_dir: Path, build_dir: Path,
               wpdepth: int) -> int:
     """Run the live cells against an existing `all` user run dir and an
-    `all --system` marker run dir.  Reports each verdict; rc 1 if any
-    cell fails — including failing because the writer does not yet emit
-    the split shape (that is a true statement about the trace)."""
+    `all --system` marker run dir; ``budget_close`` re-traces its own
+    sized window and ``rep_split`` boots its own staged system subject.
+    Reports each verdict; rc 1 if any cell fails — including failing
+    because the writer does not yet emit the split shape (that is a
+    true statement about the trace)."""
     rc = 0
     verdicts: list[tuple[str, bool, str]] = []
 
@@ -472,34 +899,22 @@ def run_cells(user_dir: Path, sys_dir: Path, build_dir: Path,
         meta_s, tby_s, entries_s = _decode(s_trace)
         verdicts.append(("fault_split",
                          *assert_fault_split(entries_s, tby_s)))
-        mpc = _find_marker_pc(meta_s, tby_s)
-        if mpc is None:
-            verdicts.append(("marker_end", False,
-                             "trace meta carries no END-marker pc"))
+        isa = meta_s.get("target_name") or "x86_64"
+        seq_pcs, why = end_marker_pcs(meta_s, tby_s, isa)
+        if seq_pcs is None:
+            verdicts.append(("marker_end", False, why))
         else:
-            verdicts.append(("marker_end",
-                             *assert_marker_end(entries_s, tby_s, mpc)))
-        # REP template: the x86 generator's REP block is the template
-        # whose first insn repeats (the 1-insn self-loop sub-template's
-        # parent); locate by the REP branch class in the encoding maps.
-        bn = meta_s.get("branch_names") or {}
-        rep_ids = {int(k) for k, v in bn.items() if v == "BRANCH_REP"}
-        rep_tmpl = None
-        for tid, t in tby_s.items():
-            ins = t.get("insns") or []
-            if ins and int(ins[-1].get("branch_type", 0)) in rep_ids \
-                    and not t.get("is_system"):
-                rep_tmpl = tid
-                break
-        if rep_tmpl is None:
-            verdicts.append(("rep_split", False,
-                             "no user REP template in the trace"))
-        else:
-            verdicts.append(("rep_split",
-                             *assert_rep_split(entries_s, tby_s, rep_tmpl)))
+            ok, detail = assert_marker_end(entries_s, tby_s, seq_pcs)
+            verdicts.append(("marker_end", ok, f"({why}) {detail}"))
     else:
-        for name in ("fault_split", "marker_end", "rep_split"):
+        for name in ("fault_split", "marker_end"):
             verdicts.append((name, False, f"no trace in {sys_dir}"))
+
+    # rep_split stages its own subject (a dedicated system boot): the
+    # `all` workloads deliberately carry no REP, so the cell brings one.
+    verdicts.append(("rep_split",
+                     *_rep_split_cell(build_dir,
+                                      (sys_dir or user_dir) / "range_rep")))
 
     print("\nRANGE CELLS (format spec 4.2a acceptance harness)")
     for name, ok, detail in verdicts:
@@ -526,7 +941,8 @@ def add_parser(sub) -> None:
     p.add_argument("--sys-dir", type=Path, default=None,
                    help="an `all --system` x86_64 marker run directory")
     p.add_argument("--build-dir", type=Path, default=None,
-                   help="QEMU build dir (for the self-sized budget re-trace)")
+                   help="QEMU build dir (for the self-sized budget re-trace "
+                        "and the staged REP system boot)")
     p.add_argument("--depth", type=int, default=64,
                    help="the runs' wpdepth (WP budget target)")
 

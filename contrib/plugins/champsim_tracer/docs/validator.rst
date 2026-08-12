@@ -227,15 +227,45 @@ Sub-commands
    assertions (:doc:`format` §4.2a) at the five capture boundaries
    that produce partial entries — a user block split by a demand
    fault, an icount window billing exactly its budget, an END-marker
-   close mid-block, a REP invocation rejoined by range chaining, and
-   a wrong-path chain cutting its last block at the wpdepth
-   remainder.  ``--selftest`` proves each assertion rejects its
-   falsifier (the pre-range merged/overshooting shape) on synthetic
-   fixtures — including both ``thread_end`` falsifiers (a context's
-   final entry missing the stamp; a stamp lying mid-stream); the live
-   cells run against existing ``all`` run directories and are the
-   acceptance harness for split emission — a writer that still merges
-   or overshoots fails them by design.
+   close mid-block, a REP invocation interrupted mid-flight, and a
+   wrong-path chain cutting its last block at the wpdepth remainder.
+
+   Two cells stage their own subjects rather than depending on the
+   supplied run directories to happen to contain one.
+   ``budget_close`` re-traces the user workload under a window sized,
+   from the exit-closed trace's own decoded ranges, to provably land
+   mid-block.  ``rep_split`` assembles and boots a dedicated x86-64
+   system workload — a marker-bracketed ``REP STOSB`` whose
+   destination crosses into a never-touched page, so the guest kernel
+   demand-faults mid-loop — and asserts the fan-out survived the
+   interruption: iteration entries on both sides of the excursion,
+   and the per-iteration stores tiling the staged span exactly (the
+   architectural count, never the delivered-callback count).
+
+   ``marker_end`` needs the END-marker pcs, and takes them from a
+   carrier the wire already has: the templates section publishes
+   every instruction's byte encoding, and the END sequence's
+   encoding is fixed by ``champsim_marker.h`` (parsed, not
+   restated), so the sequence is located in the trace's own template
+   bytes.  A partial witness — the close typically cuts the marker
+   block short — is placed by contradiction against the known
+   neighbouring bytes, and an ambiguous placement fails loudly
+   rather than guessing.  The final user entry must then stop at the
+   firing instruction (stash path) or one instruction earlier
+   (direct-cursor path, the one licensed retired-but-unobserved
+   tail); publishing the firing instruction, or stopping any
+   earlier, fails.
+
+   ``--selftest`` proves each assertion rejects its falsifier (the
+   pre-range merged/overshooting shape, a lost REP iteration, an
+   unwitnessed marker) on synthetic fixtures — including both
+   ``thread_end`` falsifiers (a context's final entry missing the
+   stamp; a stamp lying mid-stream) and both END-marker derivation
+   directions (a full byte-witnessed sequence; a single-instruction
+   witness placed by contradiction).  The live cells are the
+   acceptance harness for split emission: a writer that still
+   merges, overshoots, or drops retired REP iterations fails them by
+   design.
 
 .. _validator-full:
 

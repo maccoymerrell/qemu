@@ -404,7 +404,8 @@ def assess_clock_progress(segments: list[dict], label: str = "") -> list[str]:
 
 def run_with_clock_watchdog(cmd: list[str], log_path,
                             stall_timeout_s: int = CLOCK_STALL_TIMEOUT_S,
-                            poll_s: float = 5.0) -> tuple[int, str]:
+                            poll_s: float = 5.0,
+                            lldet=None) -> tuple[int, str]:
     """Run a system-mode qemu @cmd with console + plugin stderr to
     @log_path, watching the guest's user-instruction clock while it runs.
 
@@ -425,6 +426,15 @@ def run_with_clock_watchdog(cmd: list[str], log_path,
     grace period several times longer -- enough that no legitimate startup
     trips it, short enough that a guest which wedges before making any
     progress is still bounded rather than left to some outer timeout.
+
+    @lldet, when given, is a ``_lldet.Watch``: the calibrated-deadline +
+    condition-sampling watchdog rides this same poll loop as a second,
+    complementary instrument.  The clock leg watches the GUEST's user
+    clock (a guest that spins in the kernel); lldet watches the HOST
+    process (a qemu that deadlocks before the window ever opens, or
+    burns CPU with no trace output).  An lldet verdict kills the run,
+    appends the verdict block (evidence + stacks) to @log_path, and is
+    returned as the stall reason.
 
     Returns (rc, stall_reason); stall_reason is "" when the watchdog did not
     fire.  The process group is killed so a qemu that ignores SIGTERM in the
@@ -449,9 +459,16 @@ def run_with_clock_watchdog(cmd: list[str], log_path,
     # what the operator set.  golden_net.py arms it for the canonical system
     # cells, where the calibration exists.
     env = dict(os.environ)
+    # Ptraceable child (prctl PR_SET_PTRACER_ANY, survives execve): under
+    # yama ptrace_scope=1 the lldet verdict's `gdb -p` backtrace would
+    # otherwise be refused.  Costs nothing when no verdict fires.
+    from . import _lldet as _LL
     with open(log_path, "w") as f:
         p = subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT,
-                             start_new_session=True, env=env)
+                             start_new_session=True, env=env,
+                             preexec_fn=_LL.ptraceable_preexec)
+        if lldet is not None:
+            lldet.start()
         last_progress, last_change = None, time.monotonic()
         try:
             while True:
@@ -467,6 +484,24 @@ def run_with_clock_watchdog(cmd: list[str], log_path,
                     return rc, ""
                 except subprocess.TimeoutExpired:
                     pass
+                if lldet is not None:
+                    v = lldet.adjudicate(p.pid)
+                    if v is not None:
+                        # Stacks are already collected (pre-kill).  The
+                        # verdict block lands in the cell's own log --
+                        # loudly, after the child is dead so the append
+                        # cannot be interleaved away.
+                        os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                        p.wait()
+                        try:
+                            with open(log_path, "a") as lf:
+                                lf.write("\n" + v.block() + "\n")
+                        except OSError:
+                            pass
+                        for line in v.block().splitlines():
+                            print(line, flush=True)
+                        return _LL.LLDET_EXIT, (
+                            f"watchdog VERDICT {v.kind}: {v.summary}")
                 try:
                     now = parse_user_clock_progress(
                         Path(log_path).read_text(errors="replace"))
@@ -487,7 +522,8 @@ def run_with_clock_watchdog(cmd: list[str], log_path,
                 if idle >= budget:
                     os.killpg(os.getpgid(p.pid), signal.SIGKILL)
                     p.wait()
-                    return 1, (f"user clock frozen at {now} user insns for "
+                    return 1, (f"clock stall: user clock frozen at {now} "
+                               f"user insns for "
                                f"{idle:.0f}s of wall time -- the guest has "
                                f"stopped making progress")
         finally:

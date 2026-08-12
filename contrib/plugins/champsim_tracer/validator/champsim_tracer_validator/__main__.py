@@ -27,6 +27,7 @@ from . import analyzer as A
 from . import validator as V
 from . import _system as SYS
 from . import _full as FULL
+from . import _lldet as LLDET
 from . import _must0
 
 
@@ -400,6 +401,9 @@ def _parse_args() -> argparse.Namespace:
     # full — the ONE unified entrypoint (tiers + coverage map + one code).
     FULL.add_parser(sub)
 
+    # lldet_calibrate — remeasure the watchdog's healthy-throughput table.
+    LLDET.add_parser(sub)
+
     # mutation — adversarial strictness proof (see _mutation.py).
     from . import _mutation as MUT
     MUT.add_parser(sub)
@@ -615,9 +619,22 @@ def _trace_system(args, isa: str, bin_path: Path, plugin: Path,
     # clock while the guest runs.  A guest that has stopped taking interrupts
     # keeps executing (it spins in the kernel), so it never exits on its own;
     # without this the run only ends when some outer timeout fires.
-    rc, stall = SYS.run_with_clock_watchdog(cmd, console)
+    #
+    # The lldet watchdog rides the same poll loop: a calibrated overall
+    # deadline (from the window's user-insn budget and the measured healthy
+    # throughput of this isa/system/smp/wp configuration) with condition
+    # sampling at the threshold.  A simpoint-scheduled window has no single
+    # stated budget, so it falls back to the per-mode ceiling.
+    watch = None
+    if LLDET.enabled():
+        watch = LLDET.watch_for(
+            isa=isa, mode="system", smp=getattr(args, "smp", 1),
+            wpdepth=args.depth, budget=None if sp_file else args.stop,
+            growth_prefix=str(out_base), console_path=console,
+            label=f"system trace {isa}")
+    rc, stall = SYS.run_with_clock_watchdog(cmd, console, lldet=watch)
     if stall:
-        print(f"trace[{isa}]: FAIL  clock stall: {stall}")
+        print(f"trace[{isa}]: FAIL  {stall}")
         return 1
     # A GUEST THAT NEVER RAN THE WORKLOAD IS A FAILURE THAT MUST NAME
     # ITSELF.  With `panic=-1` and `-no-reboot`, a kernel that panics before
@@ -826,10 +843,20 @@ def cmd_trace(args, isa: str | None = None) -> int:
         cmd += ["-tb-size", str(int(tb_size))]
     cmd += ["-plugin", f"{plugin},{plugin_opts}", str(bin_path)]
     print(f"trace[{isa}]: {' '.join(cmd)}")
-    rc = subprocess.call(cmd)
+    # Calibrated watchdog in place of a flat (or absent) timeout: the
+    # icount window's stop is the cell's stated instruction budget; a
+    # symbol window traces to workload exit, which has no stated budget
+    # and falls back to the per-mode ceiling.
+    rc = LLDET.call_watched(
+        cmd, isa=isa, mode="user", wpdepth=args.depth,
+        budget=None if start_sym else args.stop,
+        growth_prefix=str(out_base), label=f"user trace {isa}")
     cst = Path(f"{out_base}.cst")
     if rc != 0 or not cst.is_file():
-        print(f"trace[{isa}]: FAIL rc={rc}")
+        print(f"trace[{isa}]: FAIL rc={rc}"
+              + (" (killed by the lldet watchdog; see the [lldet] VERDICT "
+                 f"above and {out_base}.lldet)" if rc == LLDET.LLDET_EXIT
+                 else ""))
         return rc or 1
     print(f"trace[{isa}]: wrote {cst.name}")
     return 0
@@ -1060,7 +1087,13 @@ def cmd_thread_test(args) -> int:
             cmd = [str(qemu), "-plugin", f"{plugin},{plugin_opts}",
                    str(bin_path)]
             print(f"trace[{isa}]: {' '.join(cmd)}")
-            rc = subprocess.call(cmd)
+            # The pair runs to exit (no stated instruction budget), so the
+            # watchdog uses the per-mode ceiling instead of a calibrated
+            # budget-derived deadline.
+            rc = LLDET.call_watched(
+                cmd, isa=isa, mode="user", wpdepth=args.depth, budget=None,
+                growth_prefix=str(bin_path),
+                label=f"thread_test {isa} (user)")
             if rc != 0 or not cst_path.is_file():
                 print(f"thread_test[{isa}]: trace FAILED rc={rc}")
                 rc_total = 1
@@ -1311,7 +1344,11 @@ def cmd_simpoint_test(args) -> int:
             plugin_opts += ",regdata=1"
         cmd = [str(qemu), "-plugin", f"{plugin},{plugin_opts}", str(bin_path)]
         print(f"trace[{isa}]: {' '.join(cmd)}")
-        rc = subprocess.call(cmd)
+        # The program runs to exit after the scheduled intervals close, so
+        # there is no stated total budget; the per-mode ceiling applies.
+        rc = LLDET.call_watched(
+            cmd, isa=isa, mode="user", wpdepth=args.depth, budget=None,
+            growth_prefix=str(out_base), label=f"simpoint_test {isa}")
         if rc != 0:
             print(f"trace[{isa}]: FAIL rc={rc}")
             rc_total = 1
@@ -1379,6 +1416,8 @@ def main() -> int:
         return cmd_churn_test(args)
     if args.cmd == "full":
         return FULL.cmd_full(args)
+    if args.cmd == "lldet_calibrate":
+        return LLDET.cmd_lldet_calibrate(args)
     if args.cmd == "mutation":
         from . import _mutation as MUT
         return MUT.cmd_mutation(args)

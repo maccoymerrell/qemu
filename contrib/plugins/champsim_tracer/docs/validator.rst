@@ -1646,6 +1646,104 @@ What it does:
      the content checks above are the gate),
    * ``cst_audit`` and ``cst_decode --strict`` exit clean.
 
+.. _validator-lldet:
+
+The lldet watchdog (calibrated timeouts + condition sampling)
+-------------------------------------------------------------
+
+Every qemu invocation the validator makes — the ``trace`` subcommand in
+both modes, ``thread_test``, ``churn_test`` and ``simpoint_test`` — runs
+under an external watchdog, ``_lldet.py``.  It is harness-side machinery
+only: the tracer itself never detects deadlock or livelock (it blocks
+honestly when, for example, its compress sink stalls), and the watchdog
+never touches the tracer or QEMU.  The design follows the maintainer's
+ruling on automated livelock detection: set reasonable timeouts derived
+from the number of instructions being traced, using non-livelocking
+traces as the estimator.
+
+**Calibrated deadline.**  A cell's instruction budget is known up front
+(``--stop``, or the marker window's user-instruction budget).  The
+watchdog computes ``timeout = k * (boot_floor + budget / ips)`` where
+``ips`` is the *measured* healthy throughput of that
+``isa/mode/smpN/wp`` configuration, read from the checked-in table
+``champsim_tracer_validator/lldet_calibration.json``.  The table carries
+its provenance (date, HEAD sha, host, seeds, the exact command) beside
+the numbers; per config it stores the *slowest* healthy sample, the
+most generous choice.  ``k`` (5.0) is stated in the table.  A cell with
+no stated budget — a run that traces to workload exit, like
+``thread_test`` or a simpoint schedule — falls back to a per-mode
+ceiling instead.  Two footnotes on the configuration axes: a ``nowp``
+row cannot be measured because ``wpdepth > 0`` is a plugin invariant
+(lookups for it fall back to the slower ``wp`` sibling), and the table
+is calibrated at the standard depth 64 — an extreme-depth stress cell
+(``wpdepth=65536``) runs slower than its calibrated estimate and leans
+on the SLOW arm below, which is exactly what that arm is for.
+
+Recalibration is one command (run it when the tracer's throughput
+changes materially, and commit the regenerated table)::
+
+   python -m champsim_tracer_validator lldet_calibrate \
+       --build-dir ../../../../build -o /tmp/cal --write
+
+**Condition sampling at the threshold.**  Crossing the deadline never
+kills blind.  Two samples ~10s apart measure the qemu process group's
+host CPU time, the trace files' size (``*.cst*`` / ``*.body_tmp*``),
+the console log's size (system mode), and the group's *written bytes*
+(``/proc/<pid>/io`` ``wchar``).  The write counter is load-bearing: with
+``compress=`` the on-disk body can sit at zero bytes for an entire
+healthy run while the compressor buffers, so file sizes alone would
+accuse a healthy cell — ``wchar`` counts the plugin's writes into the
+compress pipe and moves whenever the tracer emits.  The classification:
+
+=============  ===================================  =========================
+verdict        condition                            action
+=============  ===================================  =========================
+``DEADLOCK``   zero CPU delta, zero output growth   kill; verdict + stacks
+``LIVELOCK``   CPU burning, zero output growth      kill; verdict + stacks
+``SLOW``       output still growing                 extend the deadline
+                                                    (bounded, logged); kill
+                                                    only if a later sample
+                                                    stops growing
+=============  ===================================  =========================
+
+The SLOW arm is the difference between this and a flat timeout: a
+healthy cell on a loaded host is slow, not stuck, and is never killed
+while it provably progresses.  The only bound on a progressing cell is
+the hard ceiling (12x the calibrated timeout), which names itself
+(``HARD_CEILING``) rather than masquerading as a guest verdict.
+
+A watchdog kill is loud by construction: the verdict line
+(``[lldet] VERDICT: LIVELOCK -- ...``), both samples, and a
+``gdb -p`` all-thread backtrace (the child is made ptraceable via
+``prctl(PR_SET_PTRACER_ANY)``) go to stdout, to a ``<outfile>.lldet``
+sidecar, and — for system cells — into the guest console log after the
+kill.  The run exits 89 (``LLDET_EXIT``), distinct from the plugin's
+own progress-gate exit 88.  In system mode the watchdog *complements*
+``run_with_clock_watchdog``'s guest-clock legs: the clock legs watch
+the guest's user-instruction clock once the window opens; lldet watches
+the host process, so a qemu that wedges *before the window ever opens*
+— invisible to the clock legs by design — is still bounded and named.
+
+Environment knobs: ``CST_LLDET=off`` disables the watchdog,
+``CST_LLDET_K`` / ``CST_LLDET_TIMEOUT`` override the deadline,
+``CST_LLDET_TABLE`` points at an alternate table.
+
+For ad-hoc cell harnesses outside the validator there is a standalone
+wrapper, ``validator/lldet_watch.py`` (deployed as
+``/mnt/md0/QEMU/cst_runs/lib/lldet_watch``)::
+
+   lldet_watch --isa mipsel --mode system --smp 2 --budget 150000 \
+       --growth-prefix "$CELL/out" --console "$CELL/console" -- \
+       qemu-system-mipsel ...
+
+All three verdicts have been proven to fire (an instrument that has
+never fired is not an instrument): a SIGSTOPped healthy qemu is named
+``DEADLOCK`` with a frozen CPU counter in the evidence; a spinning
+workload under a window that never opens is named ``LIVELOCK`` at 1.00
+cores with the TCG-loop backtrace; and a healthy cell contending with
+CPU burners on its core crosses its deadline, is extended while its
+output grows, completes, and exits 0.
+
 Adding new validator coverage
 -----------------------------
 

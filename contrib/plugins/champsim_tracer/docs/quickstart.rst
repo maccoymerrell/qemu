@@ -433,7 +433,7 @@ plugin sees its argv.
 Ending a run without the workload's cooperation
 -----------------------------------------------
 
-Three things can end a system-mode capture that the traced process
+Four things can end a system-mode capture that the traced process
 cannot end itself, and the first is the one to design a run around:
 
 1. **The guest shuts down.**  The tracer closes any open segment when the
@@ -455,13 +455,35 @@ cannot end itself, and the first is the one to design a run around:
    Whatever the target does — finishes, crashes, is killed, hangs — the
    guest reaches ``poweroff`` and the trace closes there.
 
-2. **The any-context ceiling** (``stall_ceiling_any``, above) — the
+2. **The guest resets.**  A machine reset without ``-no-reboot`` tears
+   the machine down and boots it again *inside the same QEMU process*:
+   no shutdown happens, and every address-space name the tracer pinned
+   is recycled by the new world.  The tracer therefore treats the reset
+   request itself as a close: the segment is finalised while the
+   pre-reset machine still exists, the close line ends in ``RESET``,
+   the statistics report carries ``closed by machine reset``, and the
+   run then ends — the rebooted world is never recorded.  Always armed,
+   like the shutdown close, and it covers every delivery path (guest
+   reset device writes, the x86 triple fault, a watchdog's reset
+   action, monitor/QMP ``system_reset``).  A reset with no window open
+   closes nothing: a boot-chain reset before the workload runs is
+   legitimate, and a marker in the booted world can still open its
+   window.
+
+3. **The any-context ceiling** (``stall_ceiling_any``, above) — the
    architectural bound for a guest that keeps running and never shuts
    down.
 
-3. **The dead-latch timeout** (``latch_timeout``, above) — opt-in,
-   wall-clock, and the only one of the three that can close a window
-   whose process is merely slow.
+4. **The dead latch** (``latch_idle_insns`` / ``latch_timeout``,
+   above) — opt-in, and the only one of the four that can close a
+   window whose process is merely slow.  A stamp that would mark the
+   pinned process as recently alive is only accepted with proof: the
+   refreshing context must still map the marker's own code page to the
+   physical page the marker executed from.  Without that proof a
+   page-table root that Linux recycled into a *successor* process
+   would keep refreshing the dead window's stamp forever — measured
+   doing exactly that under a fork storm — and the latch could never
+   fire in the very situation it exists for.
 
 Examples::
 

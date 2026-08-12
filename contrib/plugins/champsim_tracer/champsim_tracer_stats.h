@@ -955,12 +955,29 @@ struct Stats {
      * the workload finished. */
     uint64_t dead_latch_closes_ms = 0;
     uint64_t dead_latch_closes_insns = 0;
+    /* Dead-latch stamp refreshes REFUSED because the refreshing context
+     * could not prove it is still the pinned process: the marker page no
+     * longer translates to the physical page the marker executed from
+     * (deadlatch_live_probe).  The signature of a recycled page-table
+     * root wearing the dead window's name — a nonzero value here on a
+     * latch-closed run is the witness that the close was earned against
+     * a forged life-sign, and on a run that did NOT close it names the
+     * forgery the latch is currently outliving. */
+    uint64_t dead_latch_refresh_refused = 0;
     /* Segments closed by the machine-shutdown backstop: the guest powered
      * off (or QEMU was asked to exit) with a capture still open, so the
      * window was closed and finalised there rather than abandoned.  A
      * nonzero value means the trace is TRUNCATED at that point and the
      * workload never reached its END marker. */
     uint64_t vm_shutdown_closes = 0;
+    /* Segments closed by the machine-reset route: the guest (or a
+     * watchdog / monitor request) RESET the machine with a capture still
+     * open.  The reboot is a fresh world in the same process — new
+     * kernel, every address-space name recycled — so the window is
+     * closed at the reset request, while the machine it was recording
+     * still exists, and the run then ends; recording across the teardown
+     * would attribute the new world's execution to the dead pin. */
+    uint64_t vm_reset_closes = 0;
 
     /*
      * rep_unretired_pass_dropped — an empty leading pass of a fan-out

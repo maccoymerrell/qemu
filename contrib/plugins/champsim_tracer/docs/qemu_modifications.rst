@@ -2091,6 +2091,69 @@ Machine-shutdown notification
    that terminates by construction whatever the target does.  See
    :doc:`quickstart`.
 
+Machine-reset notification
+--------------------------
+
+``include/qemu/qemu-plugin.h``, ``plugins/core.c``, ``plugins/system.c``,
+``include/qemu/plugin.h``, ``system/runstate.c``
+
+   Adds ``qemu_plugin_register_vm_reset_cb()`` (plugin API version 22):
+   the machine is about to be torn down and booted again *inside the
+   same process*.
+
+   A guest RESET is the teardown the shutdown seam never sees.  With
+   rebooting enabled (no ``-no-reboot``), ``qemu_system_reset_request()``
+   sets ``reset_requested`` and the main loop pauses the vCPUs, resets
+   the machine, and resumes it — no shutdown request, no
+   ``qemu_cleanup()``, no atexit, so neither the shutdown callback nor
+   the exit callback ever fires.  Everything a plugin has been recording
+   stops being true at that boundary: the new world's kernel reallocates
+   page tables, and every guest-derived identity (for this tracer, the
+   pinned page-table root) is up for recycling by processes that have
+   nothing to do with the traced one.  Measured before the seam existed:
+   a marker window survived a guest ``reboot -f`` and 2.04e9 post-marker
+   instructions, ended only by the any-context ceiling.
+
+   The dispatch point is ``qemu_system_reset_request()`` itself, on the
+   branch that will really reset — every delivery path funnels through
+   it: the guest's reset device writes (x86 port 92h, the PIIX RCR and
+   ICH9 RCR, the i8042 pulse, ACPI GED reset; Arm PSCI ``SYSTEM_RESET``;
+   the RISC-V ``sifive_test`` finisher; the Malta ``SOFTRES`` register),
+   the x86 triple fault (``target/i386/tcg/excp_helper.c``), a
+   watchdog's reset action (``hw/watchdog/watchdog.c``), and a
+   monitor/QMP ``system_reset``.  A request that ``-no-reboot`` (or
+   non-resettable vCPUs) converts into a shutdown takes the shutdown
+   dispatch in ``qemu_system_shutdown()`` instead — a reset is never
+   reported as both.  Boot-time and wakeup resets call
+   ``qemu_system_reset()`` directly, not the request, and are not
+   events: nothing a plugin recorded predates the machine's first
+   reset.
+
+   Placement mirrors the shutdown seam, including the BQL discipline
+   that seam measured and A/B-proved.  A guest-initiated request
+   arrives on the responsible vCPU's own thread holding the BQL from
+   the device write, so the dispatch is queued to that vCPU's next
+   translation-block boundary (where the work runner drops the BQL
+   around the callback, carrying the origin index); the reset
+   performance in the main loop then waits, at
+   ``qemu_plugin_vm_reset_wait_placed()``, for that delivery before the
+   machine it must report on is torn down.  Monitor/QMP/watchdog
+   requests are offered to every live vCPU, exactly like the marshalled
+   shutdown.  Unlike the shutdown hook this one can fire more than once
+   per run — each teardown is its own event, and only concurrent
+   duplicates of the same event are folded.
+
+   The tracer registers it always (system mode) and treats a reset with
+   a window open as a named close route: the segment is finalised at
+   the request, while the pre-reset machine still exists, with the
+   close reason ``RESET`` and the ``closed by machine reset``
+   statistics row, and the run then ends at the rebooted world's first
+   translation — recording across the teardown would attribute the new
+   world's execution, under recycled address-space names, to the dead
+   pin.  A reset with no window open closes nothing and the run
+   continues (a boot-chain reset before the workload is legitimate).
+   See :doc:`quickstart`.
+
 Guest threads in user mode
 --------------------------
 

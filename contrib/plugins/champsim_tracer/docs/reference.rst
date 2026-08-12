@@ -1288,7 +1288,16 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
        close`` line, close line ``IDLE``, and ``dead-latch windows closed
        (idle insns)`` in the statistics.  Covers the shape where the
        traced process is killed or never scheduled again — the opposite
-       of ``stall_ceiling``, which needs it to be running.
+       of ``stall_ceiling``, which needs it to be running.  Both latch
+       denominators accept an idleness-stamp refresh only with proof of
+       life — the refreshing context must still map the marker's own
+       code page to the physical page the marker executed from —
+       because a recycled page-table root otherwise refreshes a dead
+       window's stamp in the dead process's name forever (see
+       :doc:`quickstart` and ``dead-latch refreshes refused`` in the
+       statistics); and the instruction-denominated sweep rides the
+       global retirement clock itself, so it cannot starve while the
+       idle it measures can grow.
    * - ``stall_ceiling_any=<arch insns>``
      - ``2000000000``
      - Termination bound for a system-mode capture whose traced process
@@ -1302,9 +1311,13 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
        simpoint system capture with it disabled and neither dead latch
        (``latch_idle_insns``, ``latch_timeout``) given is REFUSED at
        startup — that configuration cannot terminate.
-       Independent of the always-armed machine-shutdown close, which
-       ends a capture when the guest powers off (close line
-       ``SHUTDOWN``).
+       Independent of the two always-armed machine closes: shutdown,
+       which ends a capture when the guest powers off (close line
+       ``SHUTDOWN``), and reset, which ends it when the guest resets
+       without ``-no-reboot`` (close line ``RESET``, ``closed by
+       machine reset`` in the statistics; the rebooted world is a new
+       machine in the same process and is never recorded into the old
+       window — see :doc:`quickstart`).
    * - ``trace_window=MODE:KEY=VALUE+...``
      - unset (trace whole run)
      - Segmentation.  Exactly one mode; each mode accepts only its

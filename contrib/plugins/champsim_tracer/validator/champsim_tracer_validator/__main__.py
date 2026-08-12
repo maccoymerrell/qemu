@@ -398,6 +398,48 @@ def _parse_args() -> argparse.Namespace:
                          "ASID space inside the sleep window).")
     system_args(ct)
 
+    dl = sub.add_parser(
+        "deadlatch_test",
+        help="Dead-latch must-fire test (system mode): the marked "
+             "workload is built WITHOUT its END marker, opens its window "
+             "and exits — the run must then be ended by the "
+             "latch_idle_insns dead latch, in BOTH inertness shapes: "
+             "'storm' (a fork loop recycles the dead page-table root, so "
+             "every stamp refresh is forged until the proof-of-life probe "
+             "refuses it) and 'quiet' (no context switch ever happens, so "
+             "only the retirement-driven sweep beat can run the sweep).  "
+             "A run the latch does not close is killed by the watchdog "
+             "and FAILS — this cell exists to prove the backstop fires.")
+    common(dl)
+    dl.add_argument("--seed", type=_parse_seed, required=True)
+    dl.add_argument("--isa", choices=ISA_CHOICES, action="append",
+                    required=True)
+    dl.add_argument("--build-dir", type=Path, required=True)
+    dl.add_argument("--diamonds", type=int, default=8)
+    dl.add_argument("--side-len-min", type=int, default=2)
+    dl.add_argument("--side-len-max", type=int, default=4)
+    dl.add_argument("--depth", type=int, default=8,
+                    help="Wrong-path depth; kept small — the test's "
+                         "subject is the close, not WP coverage.")
+    dl.add_argument("--stop", type=int, default=100_000_000_000,
+                    help="Marker-window user-insn budget.  Deliberately "
+                         "enormous: nothing but the dead latch may close "
+                         "this window.")
+    dl.add_argument("--hot-iters", type=int, default=2_000,
+                    help="Loop iterations per diamond side, so the "
+                         "workload retires enough user instructions for "
+                         "the latch's refresh machinery to be exercised "
+                         "while it is alive.")
+    dl.add_argument("--latch-insns", type=int, default=3_000_000,
+                    help="latch_idle_insns threshold for the run.")
+    dl.add_argument("--shapes", default="storm,quiet",
+                    help="Comma-separated subset of {storm,quiet}.")
+    dl.add_argument("--compress", choices=["none", "xz", "zstd", "gzip"],
+                    default="zstd",
+                    help="Trace compression (the storm shape records the "
+                         "guest until the latch threshold is spent).")
+    system_args(dl)
+
     # full — the ONE unified entrypoint (tiers + coverage map + one code).
     FULL.add_parser(sub)
 
@@ -462,6 +504,9 @@ def cmd_generate(args, isa: str | None = None) -> None:
         # instead, so the image must not carry one: an injected run that
         # produced a trace anyway would prove nothing about the injector.
         start_marker=not getattr(args, "attach", False),
+        # deadlatch_test builds the workload that opens its window and
+        # exits without closing it (the latch's subject).
+        end_marker=getattr(args, "end_marker", True),
         sleep_probe=getattr(args, "sleep_probe", 0),
         devio_probe=getattr(args, "devio_probe", 0),
     )
@@ -521,6 +566,9 @@ def _optional_plugin_opts(args) -> str:
         opts += f",iframe_rate={int(args.iframe_rate)}"
     if getattr(args, "wpprune", 0):
         opts += f",wpprune={int(args.wpprune)}"
+    extra = getattr(args, "_plugin_extra", "")
+    if extra:
+        opts += f",{extra}"
     return opts
 
 
@@ -631,9 +679,15 @@ def _trace_system(args, isa: str, bin_path: Path, plugin: Path,
     # stated budget, so it falls back to the per-mode ceiling.
     watch = None
     if LLDET.enabled():
+        # A caller whose window budget is deliberately unreachable (the
+        # deadlatch_test) sets _lldet_budget=None so the deadline falls
+        # back to the per-mode ceiling instead of scaling with a budget
+        # nothing will ever spend.
         watch = LLDET.watch_for(
             isa=isa, mode="system", smp=getattr(args, "smp", 1),
-            wpdepth=args.depth, budget=None if sp_file else args.stop,
+            wpdepth=args.depth,
+            budget=getattr(args, "_lldet_budget",
+                           None if sp_file else args.stop),
             growth_prefix=str(out_base), console_path=console,
             label=f"system trace {isa}")
     rc, stall = SYS.run_with_clock_watchdog(cmd, console, lldet=watch)
@@ -1306,6 +1360,155 @@ def cmd_churn_test(args) -> int:
     return rc_total
 
 
+def cmd_deadlatch_test(args) -> int:
+    """Dead-latch must-fire test (system mode).
+
+    The marked workload is generated WITHOUT its END marker: it opens
+    the trace window, retires its user instructions, and exits with the
+    window still open — the exact subject the dead latch exists for.
+    The guest then keeps running in one of two shapes, each of which
+    held the latch inert before its two mechanisms were fixed:
+
+      * ``storm`` — init forks ``/bin/true`` in a loop.  Linux recycles
+        the dead workload's freed page-table root into a successor
+        process, whose every schedule-in and user instruction then
+        arrives in the dead window's name; the stamp refresh must
+        REFUSE those (the marker-page proof-of-life probe), or the idle
+        never accumulates.  The cell asserts the refusals happened
+        (``dead-latch refreshes refused``), so a pass is never vacuous.
+      * ``quiet`` — init spins in shell builtins.  No fork, no context
+        switch, no address-space write: the ASID-write sweep trigger is
+        silent, and only the retirement-driven sweep beat can age the
+        window out.
+
+    In both shapes the run must END BY THE LATCH: close reason IDLE,
+    ``dead-latch windows closed (idle insns)`` >= 1, a decodable .cst,
+    and every ``(must be 0)`` census row at zero.  A run that does not
+    close is killed by the clock watchdog and fails — this cell is the
+    backstop's must-fire proof, not a content test (the storm shape's
+    trace deliberately carries up to latch_idle_insns of successor
+    execution between the death and the close; attribution under a
+    recycled root is the separate, open identity issue).
+    """
+    args.system = True
+    args.end_marker = False
+    args._plugin_extra = f"latch_idle_insns={int(args.latch_insns)}"
+    # The window budget is deliberately unreachable, so the watchdog must
+    # not derive its deadline from it; fall back to the per-mode ceiling.
+    args._lldet_budget = None
+    shapes = [s.strip() for s in args.shapes.split(",") if s.strip()]
+    rc_total = 0
+    for isa in args.isa:
+        for shape in shapes:
+            print(f"\n==== deadlatch_test {isa} ({shape}) ====")
+            cmd_generate(args, isa)
+            if cmd_build(args, isa) != 0:
+                rc_total = 1
+                continue
+            prog = _prog_base(args.out_dir, args.prog)
+            bin_path = _bin_path(args.out_dir, prog, isa)
+            out_base = Path(f"{_trace_base(args.out_dir, prog, isa)}"
+                            f"_{shape}")
+            plugin = (args.build_dir / "contrib" / "plugins"
+                      / "libchampsim_tracer.so")
+            args._init_text = SYS.deadlatch_init(shape)
+            try:
+                rc = _trace_system(args, isa, bin_path, plugin, out_base)
+            finally:
+                args._init_text = None
+            if rc == RC_SKIP:
+                return RC_SKIP
+            if rc != 0:
+                print(f"deadlatch_test[{isa}/{shape}]: FAIL  the run was "
+                      f"not ended by the dead latch (rc={rc}) — the "
+                      f"backstop did not fire")
+                rc_total = 1
+                continue
+
+            console = Path(f"{out_base}.console.log")
+            ctext = console.read_text() if console.exists() else ""
+            if "(window left open)" not in ctext:
+                print(f"deadlatch_test[{isa}/{shape}]: FAIL  the guest "
+                      f"never reported the workload's exit — the latch "
+                      f"was not under test")
+                rc_total = 1
+            if "dead-latch close asid=" not in ctext:
+                print(f"deadlatch_test[{isa}/{shape}]: FAIL  no "
+                      f"'dead-latch close' line — whatever closed this "
+                      f"run, it was not the latch")
+                rc_total = 1
+
+            stats_log = Path(f"{out_base}.stats.log")
+            stext = stats_log.read_text() if stats_log.is_file() else ""
+            closes = _stats_value(stext,
+                                  "dead-latch windows closed (idle insns)")
+            refused = _stats_value(stext,
+                                   "dead-latch refreshes refused")
+            if not closes:
+                print(f"deadlatch_test[{isa}/{shape}]: FAIL  statistics "
+                      f"carry no idle-insn dead-latch close")
+                rc_total = 1
+            if shape == "storm" and not refused:
+                print(f"deadlatch_test[{isa}/{shape}]: FAIL  zero "
+                      f"refused refreshes — the recycled-root forgery "
+                      f"this shape exists to present never arose, so "
+                      f"the probe was not under test (vacuous)")
+                rc_total = 1
+            print(f"deadlatch_test[{isa}/{shape}]: closes={closes} "
+                  f"refreshes_refused={refused}")
+
+            cst = Path(f"{out_base}.cst")
+            report = V.validate_structural(cst, expected_threads=1,
+                                           expected_guest_threads=1,
+                                           marker=True)
+            print(report.summary())
+            # Two named, TRUE tolerances — printed, never silent:
+            #
+            #   thread_end (both shapes): the latch closes a context whose
+            #   process stopped executing long before the close, so its
+            #   last entry was emitted with no way to know it was final;
+            #   the wire has no retroactive stamp.  OPEN wire-contract
+            #   question for the deadlatch/ceiling close family (task #93).
+            #
+            #   storm shape, single-process structure: between the death
+            #   and the close the recycled root's successor process IS
+            #   captured under the stale pin (the open identity gap, task
+            #   #44, bounded here by latch_idle_insns), so oracles that
+            #   assume one process's control flow are inapplicable to this
+            #   shape by construction.
+            tolerated = {"thread_end"}
+            if shape == "storm":
+                tolerated |= {"syscall_transitions", "thread_chain",
+                              "thread_distribution",
+                              "syscall_fault_nesting", "range_continuity"}
+            hard = [e for e in report.errors() if e.check not in tolerated]
+            for e in report.errors():
+                if e.check in tolerated:
+                    print(f"deadlatch_test[{isa}/{shape}]: tolerated "
+                          f"[{e.check}] (named open issue, see the cell's "
+                          f"tolerance note): {e.message}")
+            for e in hard:
+                print(f"deadlatch_test[{isa}/{shape}]: FAIL [{e.check}] "
+                      f"{e.message}")
+            if hard:
+                rc_total = 1
+            if _must0.gate([stats_log], f"deadlatch_test[{isa}/{shape}]"):
+                rc_total = 1
+    return rc_total
+
+
+def _stats_value(stats_text: str, label: str) -> int:
+    """The integer value of the first statistics row whose label starts
+    with @label, 0 when absent."""
+    for line in stats_text.splitlines():
+        if line.startswith(label):
+            try:
+                return int(line.split()[-1])
+            except ValueError:
+                return 0
+    return 0
+
+
 def cmd_simpoint_test(args) -> int:
     """End-to-end segmentation test.
 
@@ -1447,6 +1650,8 @@ def main() -> int:
         return cmd_thread_test(args)
     if args.cmd == "churn_test":
         return cmd_churn_test(args)
+    if args.cmd == "deadlatch_test":
+        return cmd_deadlatch_test(args)
     if args.cmd == "full":
         return FULL.cmd_full(args)
     if args.cmd == "lldet_calibrate":

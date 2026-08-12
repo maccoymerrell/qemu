@@ -134,6 +134,27 @@ with ``compress=`` set, could not start its compression pipe).  The
 plugin doesn't ``mkdir -p`` for you; create the target directory
 before invoking QEMU.
 
+**A ``<outfile>.cst.body_tmp[.<codec>]`` file with no ``<outfile>.cst``**
+
+The run ended without a close.  The body member streams to this
+temporary file for the whole life of a segment, but the header member
+(templates, register schema — everything a decoder needs) is buffered
+in memory and only written at ``finish``, when the two are assembled
+into the outer ``.cst`` archive and the temporaries unlinked.  A run
+that dies before that point — ``SIGKILL``, a crash, ``abort()`` (which
+skips ``atexit`` and therefore the plugin's exit hook), or the
+guest-realtime gate's deliberate ``_exit`` after declaring the guest
+wedged — leaves exactly this signature: an orphaned body temporary and
+no archive.  The orphan is **not** a salvageable trace; without the
+header member its bytes cannot be decoded, and no tool will try.  It
+is left in place, deliberately, as postmortem evidence of where the
+body stream stopped.
+
+Distinguish it from the neighbouring signature: **both** temporaries
+(``.body_tmp`` and ``.header_tmp``) next to a missing ``.cst``, with a
+``tar assembly failed`` message on stderr, mean the close itself ran
+and only the final archive step failed (disk full, permissions).
+
 Trace decode
 ------------
 

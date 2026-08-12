@@ -399,16 +399,15 @@ static inline bool deadlatch_root_is_dead(uint64_t idle_ms,
 static void deadlatch_on_asid_write(unsigned int vcpu_index,
                                     uint64_t new_asid);
 
-/* Progress-driven peer sweep cadence: while an owned process runs, check
- * for dead PEER windows every this many of its user-instructions (the
- * design's "segment-budget threshold crossing" trigger).  This makes a
- * live dominant process age out a dead peer through its OWN progress —
- * independent of how often the guest happens to write the address-space
- * register — and refreshes the running window's own stamp so it is never
- * itself false-aged.  Reset per segment (user_count_reset). */
+/* Retirement-driven sweep cadence: one sweep per this many globally
+ * retired guest instructions (deadlatch_beat, driven from the per-TB
+ * correct-path step — any context, any privilege).  Riding the global
+ * retirement clock is what makes the instruction-denominated latch's
+ * trigger inseparable from its threshold's denominator: the sweep runs
+ * exactly while idle_insns can grow, independent of how often the guest
+ * writes the address-space register or schedules the owned process. */
 static constexpr uint64_t DEADLATCH_UIC_STRIDE = 8192;
-static uint64_t g_deadlatch_checked_uic = 0;
-static void deadlatch_clock_check(unsigned int cpu_index, uint64_t live_pid);
+static void deadlatch_beat(unsigned int cpu_index);
 
 /*
  * Does this CPU model name a thread architecturally at all?  Set false at
@@ -567,6 +566,14 @@ static bool g_seg_end_marker_close = false;
  * (covered vs budget) sit next to it.  nullptr = ordinary rendering.
  */
 static const char *g_seg_close_reason = nullptr;
+
+/* Deferred end-of-run for the machine-RESET close route: set by
+ * vcpu_vm_reset_cb after it finalises the segment (possibly under the
+ * BQL, inside the resetting device write), consumed at the top of
+ * vcpu_tb_trans, where the exit runs on a vCPU thread outside any
+ * device dispatch.  See the reset-route comment block ahead of
+ * vcpu_vm_reset_cb. */
+static std::atomic<bool> g_reset_exit_pending{false};
 
 /* CST_MARKER_DIAG: trace every correct-path invocation of the marker exec
  * callbacks (plus WP-gated / step-bail counters) to stderr.  Diagnostic
@@ -984,9 +991,6 @@ void user_clock_fault_recredit(unsigned int cpu_index, uint64_t insns)
         insns = g_user_icount;
     }
     g_user_icount -= insns;
-    if (g_deadlatch_checked_uic > g_user_icount) {
-        g_deadlatch_checked_uic = g_user_icount;
-    }
     if (g_stats.user_clock_retired_insns >= insns) {
         g_stats.user_clock_retired_insns -= insns;
     }
@@ -1048,7 +1052,6 @@ static inline void user_count_reset(unsigned int cpu_index,
 {
     g_user_icount = 0;
     user_clock_stall_reset();
-    g_deadlatch_checked_uic = 0;
     for (int i = 0, n = qemu_plugin_num_vcpus(); i < n; i++) {
         qemu_plugin_u64_set(g_scoreboard.user_seen, (unsigned)i,
                             (unsigned)i == cpu_index
@@ -1399,6 +1402,34 @@ struct OwnedSpace {
     uint64_t raw_asid = 0;
     uint64_t raw_asid_last = 0;
     uint32_t raw_asid_names = 0;
+    /*
+     * The marker instruction's own code page — virtual page and the
+     * physical page it translated to when the marker executed — kept as
+     * the window's PROOF-OF-LIFE anchor for the dead-latch detector.
+     *
+     * The latch's design premise ("a dead process's page-table root is
+     * never loaded again") is false on a real guest: Linux hands the
+     * freed root page to the next fork, and QEMU's identity layer
+     * interns the raw root VALUE, so the successor process reads as the
+     * owned space and every schedule-in / owned-execution event it
+     * produces is forged in the dead window's name.  Measured (cell
+     * e1_idle_diag): the recycled root was re-stamped thousands of times
+     * over 190 s while the pinned process was provably dead, holding the
+     * idle below any threshold forever.
+     *
+     * What a successor CANNOT forge is this mapping: only the process
+     * that executed the marker maps @marker_vpage to @marker_pphys (a
+     * different binary maps other physical pages there or nothing at
+     * all; the page itself outlives the process in the page cache, so
+     * the compare stays meaningful).  A stamp refresh must present this
+     * proof (deadlatch_live_probe).  Known accepted residual, shared
+     * with the narrow-ASID dwell machinery: a second instance of the
+     * SAME binary maps the same file page and passes.  0/0 (user mode,
+     * or no usable physical anchor) disables the probe and keeps the
+     * bare-membership refresh.
+     */
+    uint64_t marker_vpage = 0;
+    uint64_t marker_pphys = 0;
 };
 static std::unordered_map<uint64_t, OwnedSpace> &g_owned_info =
     *new std::unordered_map<uint64_t, OwnedSpace>();
@@ -3118,9 +3149,16 @@ struct RtFactorGate {
                 "capture now (#61)\n"
                 "  rather than letting it finish a trace that passes every "
                 "content check while\n"
-                "  carrying tens of times the healthy instruction count.\n\n",
+                "  carrying tens of times the healthy instruction count.\n"
+                "  No .cst is assembled — an abandoned capture must not look "
+                "like a delivered\n"
+                "  one.  The partial body member (*.body_tmp*) is left on "
+                "disk for postmortem;\n"
+                "  it is this abandonment's signature, not a salvageable "
+                "trace (the header\n"
+                "  member only exists at a real close).  Exit status %d.\n\n",
                 stall, stall_limit,
-                di ? (double)da / (double)di : 0.0);
+                di ? (double)da / (double)di : 0.0, CST_RT_GATE_EXIT);
             fflush(stderr);
             _exit(CST_RT_GATE_EXIT);
         }
@@ -3148,8 +3186,16 @@ struct RtFactorGate {
             "  run fails loudly instead of finishing a trace that passes "
             "every content check\n"
             "  while carrying tens of times the healthy architectural insn "
-            "count.\n\n",
-            f, floor, streak, (double)sample_ns / 1e6, secs);
+            "count.\n"
+            "  No .cst is assembled — an abandoned capture must not look "
+            "like a delivered\n"
+            "  one.  The partial body member (*.body_tmp*) is left on disk "
+            "for postmortem;\n"
+            "  it is this abandonment's signature, not a salvageable trace "
+            "(the header\n"
+            "  member only exists at a real close).  Exit status %d.\n\n",
+            f, floor, streak, (double)sample_ns / 1e6, secs,
+            CST_RT_GATE_EXIT);
         fflush(stderr);
         _exit(CST_RT_GATE_EXIT);
     }
@@ -6394,6 +6440,96 @@ static inline uint64_t deadlatch_idle_insns(uint64_t root, uint64_t now_insns)
     }
     return now_insns >= it->second ? now_insns - it->second : 0;
 }
+/*
+ * Proof of life for a dead-latch stamp refresh.
+ *
+ * The refresh events the latch used to trust — a schedule-in of the owned
+ * root, an owned user TB executing — are all FORGEABLE: Linux recycles a
+ * dead process's page-table root page into the next fork, QEMU's identity
+ * layer interns the raw root value, and the successor process then
+ * produces every one of those events in the dead window's name (measured:
+ * cell e1_idle_diag re-stamped a dead window's root ~5700 times over
+ * 190 s and held its idle below every threshold — the exposure whose
+ * DOCUMENTED mitigation is this very latch).  What a successor cannot
+ * forge is the pinned space's own mapping of the marker page: translate
+ * the marker instruction's virtual page through the CURRENT address space
+ * and demand the physical page the marker actually executed from.  A
+ * recycled root maps something else there, or nothing.
+ *
+ * Runs on the vCPU thread whose event is being credited (both refresh
+ * sites qualify), so the debug walk goes through that vCPU's live root.
+ * Fails CLOSED: an unmapped / re-mapped marker page refuses the refresh,
+ * which at worst closes a live window early — the documented hazard
+ * direction of an opt-in idleness detector, tuned by raising the
+ * threshold, never by trusting a forgeable signal.  No usable anchor
+ * (user mode, or a synthetic bit-63 anchor) keeps bare-membership
+ * refresh, i.e. the probe never LOOSENS the old behaviour.  Caller holds
+ * exec_lock.
+ */
+static bool deadlatch_live_probe(uint64_t pid)
+{
+    auto it = g_owned_info.find(pid);
+    if (it == g_owned_info.end()) {
+        return false;
+    }
+    const OwnedSpace &os = it->second;
+    if (!os.marker_pphys || (os.marker_pphys & (1ULL << 63))) {
+        return true;             /* no usable anchor: refresh as before */
+    }
+    uint64_t pa;
+    if (!qemu_plugin_vaddr_to_paddr(os.marker_vpage, &pa)) {
+        g_stats.dead_latch_refresh_refused++;
+        return false;
+    }
+    if ((pa & PIN_PAGE_MASK) != os.marker_pphys) {
+        g_stats.dead_latch_refresh_refused++;
+        return false;
+    }
+    return true;
+}
+
+/* CST_DEADLATCH_DIAG: prove the detector's CONDITION, not its outcome.
+ * One rate-limited line per second from the two sweep drivers, under
+ * exec_lock: the owned set, each root's two idle readings, and how many
+ * times each driver refreshed a stamp.  A latch that never fires either
+ * never sweeps (the line never prints) or keeps being refreshed (the
+ * refresh counters climb while the process is dead) — the two inertness
+ * mechanisms this distinguishes.  Instrumentation only. */
+static uint64_t g_dl_diag_refresh_asid = 0;   /* stamp refreshes, asid hook */
+static uint64_t g_dl_diag_refresh_clock = 0;  /* stamp refreshes, user clock */
+static void deadlatch_diag(const char *site, uint64_t now, uint64_t now_insns)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("CST_DEADLATCH_DIAG") != nullptr;
+    }
+    if (!on) {
+        return;
+    }
+    static uint64_t last_print_ms;
+    if (now - last_print_ms < 1000) {
+        return;
+    }
+    last_print_ms = now;
+    GString *s = g_string_new(nullptr);
+    g_string_append_printf(s,
+        "[dldiag] site=%s owned=%zu refr_asid=%" PRIu64
+        " refr_clock=%" PRIu64 " arch=%" PRIu64 " user=%" PRIu64,
+        site, g_owned.size(), g_dl_diag_refresh_asid,
+        g_dl_diag_refresh_clock, now_insns, g_user_icount);
+    for (uint64_t root : g_owned) {
+        auto it = g_owned_last_sched.find(root);
+        uint64_t idle_ms = it == g_owned_last_sched.end()
+            ? 0 : now - it->second;
+        g_string_append_printf(s, " root=0x%" PRIx64 " idle_ms=%" PRIu64
+                               " idle_insns=%" PRIu64,
+                               owned_raw_asid_locked(root), idle_ms,
+                               deadlatch_idle_insns(root, now_insns));
+    }
+    fprintf(stderr, "%s\n", s->str);
+    g_string_free(s, TRUE);
+}
+
 /* Count a reaped window against the denominator that reaped it, so the
  * statistics report distinguishes a wall-clock close from an idle-insn
  * one without anyone having to read stderr. */
@@ -6541,10 +6677,15 @@ static void deadlatch_on_asid_write(unsigned int vcpu_index, uint64_t new_asid)
         uint64_t now = deadlatch_now_ms();
         uint64_t now_insns = deadlatch_now_insns();
         uint64_t pid = live_process_id();
-        if (owned_contains_locked(pid)) {
+        /* A schedule-in refreshes the stamp only with PROOF the space is
+         * still the pinned process's (deadlatch_live_probe): the bare
+         * root-value match is exactly what a recycled root forges. */
+        if (owned_contains_locked(pid) && deadlatch_live_probe(pid)) {
             g_owned_last_sched[pid] = now;            /* live: schedule-in */
             g_owned_last_sched_insns[pid] = now_insns;
+            g_dl_diag_refresh_asid++;
         }
+        deadlatch_diag("asid", now, now_insns);
         do_exit = deadlatch_sweep_wide(now, now_insns, vcpu_index);
     }
     g_rec_mutex_unlock(&exec_lock);
@@ -6554,51 +6695,63 @@ static void deadlatch_on_asid_write(unsigned int vcpu_index, uint64_t new_asid)
 }
 
 /*
- * Progress-driven peer sweep, called off the owned user clock (throttled to
- * once per DEADLATCH_UIC_STRIDE user insns — see the constant).  The vCPU
- * is executing an OWNED user TB right now, so ITS window is alive: refresh
- * it, and close any OTHER owned window idle past the timeout (a dead peer
- * whose process died mid-window without an END marker).  The running window
- * is never closed here, so the owned set cannot empty on this path — the
- * whole-set/last-window backstop lives on the ASID-write path.  Caller
- * holds exec_lock; @live_pid is the owned address space executing now.
+ * Retirement-driven sweep beat, called from the correct-path step glue
+ * (events_path_step) BEFORE the foreign/async gates and throttled to one
+ * sweep per DEADLATCH_UIC_STRIDE globally-retired instructions (sampled
+ * 1-in-256 dispatched TBs, so the steady-state cost is one branch).
+ *
+ * This replaces the owned-user-clock peer sweep, whose trigger had the
+ * detector's own blind spot built in: it ran only while an OWNED user TB
+ * executed, and the ASID-write trigger runs only when the guest writes
+ * the root register — so a guest whose one traced process died and which
+ * then never context-switched swept NOTHING while retiring hundreds of
+ * millions of instructions (task #9 hole 1, measured at 250 M).  The
+ * instruction-denominated latch's subject is "the guest retired N insns
+ * while the window showed no life", so its sweep must ride the same
+ * clock the threshold is denominated in: any correct-path TB, any
+ * context.  When no instruction retires at all, idle_insns cannot cross
+ * either — the beat stopping WITH the denominator is the correct
+ * behaviour, not a hole (the wall-clock arm alone cannot age a fully
+ * halted guest; that residual stands documented in PluginConfig).
+ *
+ * Unlike the old peer sweep this one may close the WHOLE set: the
+ * running context need not be owned, and a dead last window must not
+ * survive on the technicality of which trigger sees it.  Refresh of the
+ * live context demands the same proof of life as every other refresh.
+ * Caller holds exec_lock; on a whole-set close the segment is finalised
+ * (the pending seal slot holds the PREVIOUS, fully-executed TB — the
+ * ceiling close's position) and the process exits like the END marker's
+ * last-window close.
  */
-static void deadlatch_clock_check(unsigned int cpu_index, uint64_t live_pid)
+static void deadlatch_beat(unsigned int cpu_index)
 {
-    (void)cpu_index;
-    if (!deadlatch_enabled()) {
+    static uint64_t divider;                    /* exec_lock-guarded */
+    static uint64_t last_sweep_insns;
+    if (!deadlatch_enabled() || (++divider & 255u) != 0) {
         return;
     }
-    uint64_t now = deadlatch_now_ms();
+    if (!g_trace_segments.is_active() ||
+        g_trace_segments.is_shutting_down()) {
+        return;
+    }
     uint64_t now_insns = deadlatch_now_insns();
-    if (owned_contains_locked(live_pid)) {
-        g_owned_last_sched[live_pid] = now;               /* running: fresh */
-        g_owned_last_sched_insns[live_pid] = now_insns;
+    if (now_insns - last_sweep_insns < DEADLATCH_UIC_STRIDE) {
+        return;
     }
-    std::vector<DeadRoot> dead;
-    for (uint64_t root : g_owned) {
-        if (root == live_pid) {
-            continue;
-        }
-        auto it = g_owned_last_sched.find(root);
-        if (it == g_owned_last_sched.end()) {
-            g_owned_last_sched[root] = now;
-            g_owned_last_sched_insns[root] = now_insns;
-            continue;
-        }
-        uint64_t idle = now - it->second;
-        uint64_t idle_insns = deadlatch_idle_insns(root, now_insns);
-        bool by_insns = false;
-        if (deadlatch_root_is_dead(idle, idle_insns, &by_insns)) {
-            dead.push_back({root, idle, idle_insns, by_insns});
-        }
+    last_sweep_insns = now_insns;
+    uint64_t now = deadlatch_now_ms();
+    uint64_t pid = live_process_id();
+    if (owned_contains_locked(pid) && deadlatch_live_probe(pid)) {
+        g_owned_last_sched[pid] = now;                /* running: fresh */
+        g_owned_last_sched_insns[pid] = now_insns;
+        g_dl_diag_refresh_clock++;
     }
-    for (const auto &d : dead) {
-        uint64_t raw = owned_raw_asid_locked(d.root);
-        uint64_t dropped = owned_retire_root_locked(d.root);
-        deadlatch_report_root(raw, d.idle_ms, d.idle_insns, d.by_insns,
-                              g_owned.size(), dropped);
-        deadlatch_count_close(d.by_insns);
+    deadlatch_diag("beat", now, now_insns);
+    if (deadlatch_sweep_wide(now, now_insns, cpu_index)) {
+        /* The segment is finalised and shutting down; leave the step's
+         * lock and end the run the way the END marker's close does. */
+        g_rec_mutex_unlock(&exec_lock);
+        exit(0);
     }
 }
 
@@ -8458,6 +8611,13 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
      * finalised rather than abandoned. */
     user_clock_stall_any_check(cpu_index, icount_prev);
 
+    /* Dead-latch sweep beat, at the same point for the same reason: its
+     * subject is precisely a window whose owner no longer executes, so
+     * the sweep must ride TBs that are not the owner's.  Throttled to
+     * one sweep per DEADLATCH_UIC_STRIDE retired instructions; may
+     * finalise the segment and exit like the END marker's close. */
+    deadlatch_beat(cpu_index);
+
     /*
      * Architectural retired-instruction cursor.  Advanced on EVERY dispatch
      * in EVERY mode, not only under a pin: the segment-close walk uses it to
@@ -8653,9 +8813,6 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
                 rs_clk.prev_tb_rep_contains(rs_clk.cp_facts.pc)) {
                 if (g_user_icount > 0) {
                     g_user_icount--;
-                    if (g_deadlatch_checked_uic > g_user_icount) {
-                        g_deadlatch_checked_uic = g_user_icount;
-                    }
                 }
                 g_stats.rep_clock_ticks_withheld++;
             }
@@ -8754,18 +8911,6 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
                             delta - tb_insns;
                     }
                 }
-            }
-            /* Progress-driven dead-latch peer sweep (throttled).  A live
-             * owned process ages out a dead peer through its own user-clock
-             * progress, so a straggler window closes even when the guest is
-             * not context-switching (the ASID-write trigger's blind spot).
-             * Off the hot path: one compare per owned TB, the sweep only at
-             * a stride crossing. */
-            if (deadlatch_configured() &&
-                g_user_icount - g_deadlatch_checked_uic >=
-                    DEADLATCH_UIC_STRIDE) {
-                g_deadlatch_checked_uic = g_user_icount;
-                deadlatch_clock_check(cpu_index, live_process_id());
             }
         }
         if (cur_tb_tmpl) {
@@ -10387,7 +10532,6 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
          * address-space value on a narrow-ASID target. */
         uint64_t root_phys, sig, vpage;
         marker_anchor(pc, asid, &root_phys, &sig, &vpage);
-        (void)vpage;
         g_owned.insert(pid);
         g_owned_last_sched[pid] = deadlatch_now_ms();
         g_owned_last_sched_insns[pid] = deadlatch_now_insns();
@@ -10399,6 +10543,10 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
         os.sig = sig;
         os.raw_asid = asid;
         os.raw_asid_last = qemu_plugin_get_narrow_asid();
+        /* Proof-of-life anchor for the dead latch: the marker's own code
+         * page, virtual and physical (see the OwnedSpace field comment). */
+        os.marker_vpage = vpage;
+        os.marker_pphys = root_phys;
         if (cpu_index < CST_PIN_MAX_VCPUS) {
             g_pin_vcpu[cpu_index].asid.store(asid, std::memory_order_relaxed);
             g_pin_vcpu[cpu_index].pid.store(pid, std::memory_order_relaxed);
@@ -10481,7 +10629,6 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
          * traces byte-identical. */
         uint64_t root_phys, sig, vpage;
         marker_anchor(pc, asid, &root_phys, &sig, &vpage);
-        (void)vpage;
         if (!pid && g_system_mode) {
             marker_refuse_no_root();
         }
@@ -10498,6 +10645,10 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
         os.sig = sig;
         os.raw_asid = asid;
         os.raw_asid_last = qemu_plugin_get_narrow_asid();
+        /* Proof-of-life anchor for the dead latch: the marker's own code
+         * page, virtual and physical (see the OwnedSpace field comment). */
+        os.marker_vpage = vpage;
+        os.marker_pphys = root_phys;
         if (cpu_index < CST_PIN_MAX_VCPUS) {
             g_pin_vcpu[cpu_index].asid.store(asid, std::memory_order_relaxed);
             g_pin_vcpu[cpu_index].pid.store(pid, std::memory_order_relaxed);
@@ -11231,6 +11382,16 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         return;
     }
 
+    /* Deferred end-of-run for the RESET close (see vcpu_vm_reset_cb): the
+     * close ran at the reset request, possibly under the BQL; the exit is
+     * taken here, on a vCPU thread outside any device write — the same
+     * context the dead-latch and ceiling closes exit from.  The rebooted
+     * machine retranslates everything, so this fires within milliseconds
+     * of the new world starting. */
+    if (g_reset_exit_pending.load(std::memory_order_acquire)) {
+        exit(0);
+    }
+
     /* Shutdown gate: a segment close on another vCPU thread sets the
      * shutting-down flag and calls exit(0), whose teardown races any
      * still-running vCPU (translation is not is_active-gated — new code
@@ -11746,14 +11907,13 @@ static void vcpu_vm_shutdown_cb(qemu_plugin_id_t id, int vcpu_index,
          * close that is not like the others.  The ceiling and the
          * budget close from the TOP of a correct-path step, where the
          * pending seal slot holds the PREVIOUS block — fully executed,
-         * so it is emitted.  This close arrives from a DEVICE WRITE, in
-         * the middle of the block that performs it: the pending slot
-         * holds a block that is still running, and emitting it writes an
-         * execution whose memory operations were only partly observed.
-         * Caught by cst_audit's memop-bimodality oracle — "1/841 CP
-         * executions realised zero memops" — on a first version of this
-         * that used true.  So the in-flight block is dropped and only
-         * the completed chain is flushed.
+         * so it is emitted.  This close can arrive MID-INSTRUCTION: the
+         * pending slot then holds a block that is still running, and
+         * emitting it writes an execution whose memory operations were
+         * only partly observed.  Caught by cst_audit's memop-bimodality
+         * oracle — "1/841 CP executions realised zero memops" — on a
+         * first version of this that used true.  So an in-flight block
+         * is dropped and only the completed chain is flushed.
          */
         /*
          * DROPPED WHOLE, THOUGH, IS TOO MUCH.  Everything AHEAD of the
@@ -11763,6 +11923,16 @@ static void vcpu_vm_shutdown_cb(qemu_plugin_id_t id, int vcpu_index,
          * prefix and subtracts exactly the one begun-but-unretired
          * instruction (insn_started is added at the TOP of an instruction,
          * so it is already counted).
+         *
+         * A guest poweroff used to be the mid-instruction case — the
+         * dispatch ran inside the device write that performs it.  QEMU
+         * now queues that route to the writing vCPU's next TB boundary
+         * (the write's BQL must not be held into the plugin's lock: the
+         * AB/BA against a peer's wrong-path excursion, measured on
+         * riscv64 -smp 4 poweroff), so it arrives with the vCPU named,
+         * in_guest_insn FALSE, and the block that performed the write
+         * fully retired.  The trim keys off the flag, not the route, so
+         * it fires exactly when something is in flight.
          */
         finish_trace_segment(/* prev_executed= */ false,
                              (unsigned int)vcpu_index,
@@ -11773,6 +11943,83 @@ static void vcpu_vm_shutdown_cb(qemu_plugin_id_t id, int vcpu_index,
         finish_trace_segment();
     }
     g_trace_segments.set_shutting_down();
+    g_rec_mutex_unlock(&exec_lock);
+}
+
+/* ==================== Machine reset: a close route too ====================
+ *
+ * A guest RESET is the teardown the shutdown route never sees: the machine
+ * is torn down and booted again inside the same QEMU process, so neither
+ * the shutdown callback nor atexit fires, and a capture left open would
+ * outlive the machine that ran its process.  The reboot is a fresh world —
+ * new kernel, every address-space name recycled — and the recycled names
+ * mean its execution would be recorded INTO the stale window under the
+ * dead pin (per docs/format.rst and the marker contract, trace-invalidating:
+ * the window must contain exactly the marker process).  Measured before
+ * this route existed: a marker window survived a guest `reboot -f` and
+ * 2.04e9 post-marker instructions, ended only by the any-context ceiling.
+ *
+ * So a reset with a window open is a named close route, RESET: the segment
+ * is closed at the reset REQUEST, while the machine being recorded still
+ * exists, with the shutdown route's discipline (the request arrives inside
+ * the device write / triple fault that performs it, so the in-flight
+ * instruction is trimmed the same way).  Delivery paths all funnel through
+ * qemu_system_reset_request — x86 port 92h / PIIX RCR / i8042 pulse /
+ * triple fault, Arm PSCI SYSTEM_RESET, the RISC-V sifive_test finisher,
+ * the Malta SOFTRES register, the watchdog's reset action, monitor/QMP
+ * system_reset — and a reset that -no-reboot converts into a shutdown
+ * takes the shutdown route instead, never both.
+ *
+ * After the close the run ENDS (the END marker's own discipline: a capture
+ * whose process is gone has nothing left to record, and the rebooted world
+ * must not be).  The exit is DEFERRED to the next translation rather than
+ * taken here: this callback can run inside a device write with the BQL
+ * held, and ending the process under the BQL re-creates the lock-order
+ * exposure the marshalled shutdown dispatch had to drop the BQL to avoid.
+ * The reboot retranslates everything, so the deferral is milliseconds.
+ * A reset with NO window open closes nothing and the run continues — a
+ * boot-chain reset before the workload runs is legitimate, and a marker
+ * in the booted world may still open its window.
+ */
+static void vcpu_vm_reset_cb(qemu_plugin_id_t id, int vcpu_index,
+                             bool in_guest_insn)
+{
+    if (!g_system_mode) {
+        return;
+    }
+    g_rec_mutex_lock(&exec_lock);
+    if (!g_trace_segments.is_active() ||
+        g_trace_segments.is_shutting_down()) {
+        g_rec_mutex_unlock(&exec_lock);
+        return;                      /* nothing open — reboot untraced */
+    }
+    g_stats.vm_reset_closes++;
+    uint64_t covered = marker_user_clock() ? g_user_icount : g_host_icount;
+    fprintf(stderr,
+        "\nchampsim_tracer: *** MACHINE RESET WITH THE WINDOW OPEN ***\n"
+        "  the guest is resetting while a capture is still running.  The "
+        "machine that\n  ran the traced process is being torn down; the "
+        "world that boots next is a\n  different one whose recycled "
+        "address-space names must not land in this\n  window.  Closing the "
+        "segment here — the trace is finalised and TRUNCATED at\n  %" PRIu64
+        " %sinstructions — and the run ends at the next translation.\n\n",
+        covered, marker_user_clock() ? "user " : "");
+    fflush(stderr);
+    g_seg_end_marker_close = false;
+    g_seg_close_reason = "RESET";
+    if (vcpu_index >= 0 && (unsigned)vcpu_index < CST_PIN_MAX_VCPUS) {
+        /* Same in-flight discipline as the shutdown close: the request
+         * arrives from inside the instruction performing it, so the
+         * retired prefix is drained and the begun-but-unretired
+         * instruction subtracted (see vcpu_vm_shutdown_cb). */
+        finish_trace_segment(/* prev_executed= */ false,
+                             (unsigned int)vcpu_index,
+                             /* prev_in_flight= */ in_guest_insn);
+    } else {
+        finish_trace_segment();
+    }
+    g_trace_segments.set_shutting_down();
+    g_reset_exit_pending.store(true, std::memory_order_release);
     g_rec_mutex_unlock(&exec_lock);
 }
 
@@ -12606,6 +12853,10 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
          * process (see vcpu_vm_shutdown_cb).  Always registered — a
          * backstop that is opt-in is not a backstop. */
         qemu_plugin_register_vm_shutdown_cb(id, vcpu_vm_shutdown_cb);
+        /* And the teardown the shutdown route never sees: a machine
+         * RESET boots a new world in the same process, which must not
+         * be recorded into the old world's window (vcpu_vm_reset_cb). */
+        qemu_plugin_register_vm_reset_cb(id, vcpu_vm_reset_cb);
         /* Keep the per-vCPU asid_match flag current from the
          * architectural ASID-write commit points (fires even while the
          * path-event queue is disabled; wrong-path writes suppressed).

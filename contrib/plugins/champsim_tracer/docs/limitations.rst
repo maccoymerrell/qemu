@@ -548,7 +548,18 @@ rather than assumed away:
   process that exited without running its END marker is what exposes
   this, so the mitigations are the window-closing ones —
   ``latch_timeout=<ms>`` and ``latch_idle_insns=<N>`` — not an identity
-  test.
+  test.  The latches themselves are hardened against the recycle they
+  mitigate: a successor wearing the dead window's root produces every
+  idleness-refresh event in its name (measured re-stamping a dead
+  window thousands of times under a fork storm, holding the latch
+  inert indefinitely), so a stamp refresh demands proof of life — the
+  refreshing context must still map the marker's own code page to the
+  physical page the marker executed from, which only the process that
+  ran the marker (or a second instance of the same binary, the
+  already-named residual) can do.  Until the latch's threshold is
+  spent, the successor's user execution is still *captured* under the
+  stale pin — the latch bounds the exposure at ``latch_idle_insns``;
+  it does not close the identity gap itself.
 * **A narrow address-space TAG reassigned to a LIVE process** (MIPS
   ``EntryHi.ASID`` is 8 bits over a 16-entry TLB, so rollover is the
   normal state on a busy guest).  This is **not** an exposure, because

@@ -245,6 +245,25 @@ struct PluginConfig {
      * timeout chosen to exceed the longest legitimate idle their workload
      * exhibits; enable it for latch traces where processes may die without
      * their END marker and the icount budget is too coarse a fallback.
+     *
+     * A STAMP REFRESH DEMANDS PROOF OF LIFE.  The events that would mark
+     * an owned root "recently alive" — a schedule-in of its value, a
+     * counted user TB under it — are all forged by the one exposure this
+     * latch is the documented mitigation for: Linux recycles a dead
+     * process's page-table root page into the next fork, and the
+     * successor then produces every refresh event in the dead window's
+     * name (measured: a fork-storm guest re-stamped a dead window
+     * thousands of times over 190 s and held both denominators below any
+     * threshold).  So a refresh is accepted only when the refreshing
+     * context still maps the marker's own code page to the physical page
+     * the marker executed from (deadlatch_live_probe) — a mapping only
+     * the process that ran the marker can present, up to the already-
+     * documented second-instance-of-the-same-binary residual.  The probe
+     * fails CLOSED: a live process whose marker page was evicted or
+     * unmapped stops refreshing and is reaped at the threshold, which is
+     * the opt-in idleness hazard's existing direction (close early),
+     * tuned by raising the threshold.  Refusals are counted
+     * (dead_latch_refresh_refused).
      */
     uint64_t latch_timeout_ms = 0;
 
@@ -288,7 +307,15 @@ struct PluginConfig {
      *     instruction retires at all and stall_ceiling can never advance.
      *     Its denominator is every instruction the guest retires, in any
      *     context, and it is per-root: it closes one dead window and leaves
-     *     live peers tracing.
+     *     live peers tracing.  Its SWEEP rides the same denominator
+     *     (deadlatch_beat, one sweep per stride of globally retired
+     *     instructions, from the per-TB step in any context), so the
+     *     trigger cannot starve while the threshold can grow; a guest
+     *     retiring nothing at all grows neither, which is the correct
+     *     reading, not a hole.  The one shape neither arm can age is a
+     *     FULLY HALTED guest with the wall-clock arm unset — no
+     *     instruction retires and no wall-clock latch is armed; give
+     *     latch_timeout as well when that shape matters.
      *
      *   stall_ceiling_any (ON by default) bounds the same not-running shape
      *     but at SEGMENT granularity — it is the termination bound of last

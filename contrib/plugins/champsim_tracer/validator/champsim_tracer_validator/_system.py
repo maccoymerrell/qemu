@@ -694,6 +694,55 @@ def churn_init(pre: int, during: int) -> str:
     return _INIT_CHURN.format(pre=int(pre), during=int(during))
 
 
+# Dead-latch-test inits.  The workload (built WITHOUT its END marker) runs
+# in the foreground and exits with its window still open; what the guest
+# does NEXT selects which of the latch's two failure mechanisms the cell
+# exercises, and both shapes must end in a dead-latch IDLE close:
+#
+#   storm — a fork loop (each iteration burns a subshell + /bin/true, two
+#   fresh mm's).  Linux hands the dead workload's freed page-table root to
+#   one of those forks, QEMU's identity layer interns the raw root value,
+#   and the successor then presents every refresh event in the dead
+#   window's name.  This is the shape that held the latch inert for 580 s
+#   in three sized attempts; the stamp's proof-of-life probe is what makes
+#   it close.  No poweroff: the LATCH must end this run.
+#
+#   quiet — a pure shell-builtin spin (no forks, no execs, no address-space
+#   writes after the first schedule).  Nothing recycles the root, but
+#   nothing context-switches either, so the ASID-write sweep trigger never
+#   fires; the retirement-driven sweep beat is what makes it close.
+_INIT_DEADLATCH_STORM = """#!/bin/sh
+mount -t devtmpfs none /dev 2>/dev/null
+mount -t proc  none /proc 2>/dev/null
+mount -t sysfs none /sys  2>/dev/null
+exec >/dev/console 2>&1 </dev/console
+echo "=== cst_validator deadlatch-test guest (storm): $(uname -r) ==="
+/workload
+echo "=== /workload exit=$? (window left open) ==="
+while true; do /bin/true; done
+"""
+
+_INIT_DEADLATCH_QUIET = """#!/bin/sh
+mount -t devtmpfs none /dev 2>/dev/null
+mount -t proc  none /proc 2>/dev/null
+mount -t sysfs none /sys  2>/dev/null
+exec >/dev/console 2>&1 </dev/console
+echo "=== cst_validator deadlatch-test guest (quiet): $(uname -r) ==="
+/workload
+echo "=== /workload exit=$? (window left open) ==="
+while :; do :; done
+"""
+
+
+def deadlatch_init(shape: str) -> str:
+    """The deadlatch-test /init script for @shape ('storm' or 'quiet')."""
+    if shape == "storm":
+        return _INIT_DEADLATCH_STORM
+    if shape == "quiet":
+        return _INIT_DEADLATCH_QUIET
+    raise ValueError(f"deadlatch_init: unknown shape {shape!r}")
+
+
 # The ptrace marker injector, built for the GUEST (it runs inside the
 # guest, on the guest's own /workload).  The tracer's four target ISAs all
 # have a backend in cst_attach.c; the compiler for each is the same cross

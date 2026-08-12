@@ -28,7 +28,7 @@ This document specifies the on-disk ``.cst`` stream written by
 ``champsim_tracer_output.cc`` and decoded by ``cst_decode``, and is the
 canonical reference for both the format and the tracer's use of it.
 The format is in its pre-release epoch, identified by ``CST_MAGIC``
-(``0x1D545343``).  See *Format Stability and Conformance* (below) for
+(``0x1E545343``).  See *Format Stability and Conformance* (below) for
 what the epoch identifier fixes, the minimum a conformant trace must
 carry, and the forward-compatibility rules that govern additive
 evolution within the epoch.
@@ -96,17 +96,30 @@ Format Stability and Conformance
 The magic epoch
 ~~~~~~~~~~~~~~~
 
-``CST_MAGIC`` (``0x1D545343``) identifies the format epoch.  It is fixed
-for the whole pre-release: the layout evolves within the epoch, but
-every change is *additive* and leaves the magic untouched.  Additive
-evolution needs no magic change because every numeric domain
-resolves through the per-trace encoding maps and body records are
-self-delimiting, so a reader built to this specification stays
-correct across additive changes.  A structurally breaking change — a
-different record shape, step order, or structurally-required field
-set — bumps ``CST_MAGIC``: the magic is the format-epoch identifier and
-that bump is the signal for "not the same format".  A change of that
-kind is expected only at a formal release.
+``CST_MAGIC`` (``0x1E545343``) identifies the format epoch.  Within an
+epoch the layout evolves, but every change is *additive* and leaves
+the magic untouched.  Additive evolution needs no magic change because
+every numeric domain resolves through the per-trace encoding maps and
+body records are self-delimiting, so a reader built to this
+specification stays correct across additive changes.  A structurally
+breaking change — a different record shape, step order, or
+structurally-required field set — bumps ``CST_MAGIC``: the magic is the
+format-epoch identifier and that bump is the signal for "not the same
+format".
+
+The magic's low three bytes spell ``'C' 'S' 'T'``; its high byte is the
+epoch counter.  ``0x1D545343`` is the **previous** epoch, in which a
+body entry carried a fixed synchronous-fault trailer, a packed
+wrong-path chain header, and a separate wrong-path events section, and
+in which one entry always described a whole basic-block invocation.
+This epoch replaces all four with block-level field-delta records
+(§5.7) and an explicit executed range.  The two are not
+interconvertible and a reader MUST reject a magic it does not
+implement rather than attempt either: a ``0x1D`` reader handed a
+``0x1E`` body desynchronises at the first entry, and — the reason the
+epoch had to move rather than extend — a reader that merely *skipped*
+the unrecognised range records would stay byte-synchronised while
+silently over-claiming executed instructions on every partial entry.
 
 Forward compatibility (normative)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -161,7 +174,9 @@ carry:
 * **Body:** a leading ``BODY_TAG_ASID_SWITCH`` (declaring the opening
   address space, with its inline identity) followed by a
   ``BODY_TAG_THREAD_SWITCH`` (declaring the opening thread); one
-  ``BODY_TAG_ENTRY`` per correct-path BB invocation; and for every
+  ``BODY_TAG_ENTRY`` per contiguous run of a correct-path BB
+  invocation — one entry when the block ran whole, and one per
+  uninterrupted stretch when it did not (§4.2a); and for every
   memop an instruction issues, that memop's effective address
   (``CST_FID_LOAD_ADDR{k}`` / ``CST_FID_STORE_ADDR{k}``) together with
   the ``CST_FID_N_LOADS`` / ``CST_FID_N_STORES`` counts; a terminating
@@ -185,8 +200,8 @@ absence by the same gate:
      - ``CST_FLAG_PHYSADDR`` clear
    * - Per-template profile block (§6)
      - ``CST_FLAG_PROFILE`` clear
-   * - Synchronous-fault depth trailer (per entry, §4.2a)
-     - ``CST_FLAG_FAULT`` clear (system mode only; every entry's depth is implicitly ``0`` with no anchors)
+   * - Per-entry fault depth (``CST_FID_BB_FAULT_DEPTH``, §5.7)
+     - ``CST_FLAG_FAULT`` clear (system mode only; every entry's depth is then ``0``)
    * - Per-insn dependency sub-block
      - insn's ``CST_INSN_FLAG_HAS_DEP_BLOCK`` clear
    * - Immediate value
@@ -201,8 +216,8 @@ absence by the same gate:
      - empty ``symbol_name``
    * - Wrong-path chain (per entry)
      - ``CST_FLAG_WP`` clear (the section is omitted from every ENTRY/IFRAME); with the flag set, an individual entry may still carry ``num_wp == 0``
-   * - Wrong-path events (per entry)
-     - the chain header's ``CST_WP_CHAIN_HAS_EVENTS`` bit clear (§4.3/§4.4) — true whenever the entry's chain, if any, produced no event; independent of ``CST_FLAG_WP``'s own per-trace gate
+   * - Wrong-path block events (§4.4)
+     - the block carries no ``CST_FID_BB_FLAGS`` record and its flag cell reads ``0`` — a block with nothing to report costs no bytes, exactly as any other unchanged field does
    * - Validation IFRAMEs
      - record simply absent (pure redundancy)
 
@@ -225,14 +240,15 @@ header member (Step 1):
   per-instruction PCs and sizes, because the guest may re-cut the block
   into different instructions (kernel alternatives and static-key
   patching, JIT re-emission) and not merely patch bytes in place.
-  Self-modification is not the only reason two templates share a
-  ``start_pc``: a block whose EXECUTION was cut short — the guest
-  entered it and the trace window closed, or control left it, before
-  its last instruction — is emitted at the extent that actually ran, so
-  a trace can hold both the whole block and a shorter prefix of it at
-  one address.  The prefix is an ordinary template carrying no special
-  flag, because there is nothing special about it to a consumer: it
-  describes exactly the instructions that executed.  Size
+  A block whose EXECUTION was cut short does **not** mint a template:
+  its entry names the whole block's ``template_id`` and declares the
+  range of it that ran (§4.2a), so the templates section holds one
+  entry for the block and the body says how much of it each invocation
+  covered.  The one remaining non-self-modifying reason two templates
+  share a ``start_pc`` is a block whose TAIL WAS NEVER TRANSLATED — a
+  block that spans a page boundary and whose continuation the guest
+  never fetched has no whole-block template to name, so what was
+  translated is a template in its own right.  Size
   every per-block structure from the ``template_id`` actually
   referenced, never from another revision at the same address.  A
   decoder that also wants a per-pc view builds
@@ -240,9 +256,9 @@ header member (Step 1):
   i.e. body-reference, order); the live revision at any point in the
   body stream is simply whichever ``template_id`` the entries there
   name.  Never resolve a block by ``start_pc`` alone.
-* ``encoding_maps`` — thirteen maps (``opcode``, ``branch_type``,
+* ``encoding_maps`` — twelve maps (``opcode``, ``branch_type``,
   ``reg``, ``field_id``, ``header_flag``, ``insn_flag``, ``body_tag``,
-  ``wp_event_flag``, ``wp_chain_flag``, ``metaflags``, ``dep_block_flag``,
+  ``bb_flag``, ``metaflags``, ``dep_block_flag``,
   ``mem_access_pattern``, ``profile_flag``), each
   ``value : u64 → name : string``.  Built from the encoding-maps
   section in Step 1.  (Parsing is generic — Step 3 reads whatever
@@ -295,7 +311,7 @@ sanity check.
 
 ::
 
-   2.1  magic        : u32_le   ; must equal 0x1D545343 ("CST" + 0x1D)
+   2.1  magic        : u32_le   ; must equal 0x1E545343 ("CST" + 0x1E)
    2.2  isa          : u8       ; TraceISA enum (see Reference §2)
    2.3  flags        : u8       ; CST_FLAG_* bitmask (Reference §2)
    2.4  start_insn          : ULEB
@@ -390,9 +406,18 @@ self-describing.  Decode it into a fresh ``encoding_maps`` table.
             omit one is rejected here:
               body_tag:    BODY_TAG_END, BODY_TAG_ENTRY,
                            BODY_TAG_THREAD_SWITCH, BODY_TAG_ASID_SWITCH
-              header_flag: CST_FLAG_PROFILE, CST_FLAG_WP, CST_FLAG_FAULT
+              header_flag: CST_FLAG_PROFILE, CST_FLAG_WP
               insn_flag:   CST_INSN_FLAG_HAS_IMM,
                            CST_INSN_FLAG_HAS_DEP_BLOCK
+              field_id:    CST_FID_BB_START, CST_FID_BB_STOP
+
+            The two range field-IDs are required even though no
+            byte-level branch depends on them, because their ABSENCE is
+            not detectable from the bytes: a reader that cannot resolve
+            them parses every entry correctly and then materialises the
+            whole template for a partial entry, over-claiming executed
+            instructions with no parse error to show for it (§5.7).
+            Rejecting here is what makes that failure impossible.
 
         (b) Structural, required only when the tagged construct
             appears.  Resolve each if present; its absence is an error
@@ -405,19 +430,18 @@ self-describing.  Decode it into a fresh ``encoding_maps`` table.
                               CST_DEP_BLOCK_HAS_ADDR
                                                  (iff a dependency
                                                   sub-block appears)
-              wp_event_flag:  CST_WP_EVENT_FAULT (iff a wrong-path
-                                                  event record appears)
-              wp_chain_flag:  CST_WP_CHAIN_HAS_EVENTS (iff
-                                                  CST_FLAG_WP is set —
-                                                  every wp_chain_section
-                                                  carries this bit)
+              field_id:       CST_FID_BB_FAULT_INSN
+                                                 (iff a block declares
+                                                  CST_BB_FLAG_SYNTHETIC_
+                                                  FAULT — the index is a
+                                                  sibling record, §5.7)
               field_id:       CST_FID_EXTENDED   (iff an extended
                                                   field-delta record
                                                   appears)
 
         Every other name — all `opcode`, `branch_type`, `reg`,
         `metaflags`, `mem_access_pattern`, and `profile_flag` values,
-        the remaining `header_flag` / `insn_flag` / `wp_event_flag`
+        the remaining `header_flag` / `insn_flag` / `bb_flag`
         bits, and every `field_id` family/slot name — is resolved
         purely as the recipe encounters its numeric value, under the
         open-map rule: every value that appears has an entry, and a
@@ -626,7 +650,7 @@ trailing one is the truncation sentinel.  Verify both.
 ::
 
    5.1  open the body member's decompressed byte stream.
-   5.2  lead : u32_le ; must equal 0x1D545343
+   5.2  lead : u32_le ; must equal 0x1E545343
    5.3  body record stream := bytes between @lead and the trailing
         CST_MAGIC.  If you have the whole member in memory you can
         peek the last 4 bytes here; for streaming decoders, defer the
@@ -799,51 +823,41 @@ Loop until a ``BODY_TAG_END`` is seen:
           cur_template_id = prev_entry_template_id + template_id_delta
           prev_entry_template_id = cur_template_id
           cp_delta_section   : section          ; see Step 6.7
-          if (header.flags & header_flag.CST_FLAG_FAULT):
-            fault_depth      : ULEB              ; see §4.2a
-            n_anchors        : ULEB
-            repeat n_anchors times:
-              anchor         : ULEB
-          if (header.flags & header_flag.CST_FLAG_WP):
-            wp_chain_section  : section          ; see Step 6.8; its
-                                                  ; leading ULEB also
-                                                  ; carries the
-                                                  ; wp_chain_flag.
-                                                  ; CST_WP_CHAIN_HAS_EVENTS
-                                                  ; bit decoded below
-            if (has_wp_events):                  ; from Step 6.8's chain
-                                                  ; header, just decoded
-              wp_events_section : section          ; see Step 6.9
-          ; when CST_FLAG_FAULT is clear the fault trailer is absent and
-          ; this entry's depth is implicitly 0 with no anchors (§4.2a).
-          ; when CST_FLAG_WP is clear the wp_chain_section is absent
-          ; and the entry has no wrong-path chain (num_wp treated as
-          ; 0).  When CST_FLAG_WP is set but has_wp_events is clear,
-          ; wp_events_section is entirely absent — no length prefix,
-          ; no payload — rather than an empty section (§4.3/§4.4).
-          seq_num += 1
-          Emit a CP body entry tagged (seq_num, cur_template_id,
-          prev_thread_id, prev_asid_index) carrying the cp_delta_section's decoded
-          dyn_params + reg_snaps, fault_depth/anchors (if CST_FLAG_FAULT),
-          the wp_chain_section's WPEntries, and the wp_events bits applied
-          to those WPEntries.
-   6.5  IFRAME record (validation-only; producers may omit it):
-          cp_delta_section   : section
-          if (header.flags & header_flag.CST_FLAG_FAULT):
-            fault_depth      : ULEB              ; see §4.2a
-            n_anchors        : ULEB
-            repeat n_anchors times:
-              anchor         : ULEB
           if (header.flags & header_flag.CST_FLAG_WP):
             wp_chain_section  : section          ; see Step 6.8
-            if (has_wp_events):                  ; from the chain
-                                                  ; header just decoded
-              wp_events_section : section          ; see Step 6.9
+          ; when CST_FLAG_WP is clear the wp_chain_section is absent
+          ; and the entry has no wrong-path chain (num_wp treated as
+          ; 0).
+          ;
+          ; The entry has no other payload.  Everything that is a fact
+          ; about the BLOCK rather than about one of its instructions —
+          ; the executed range, the fault depth, the block flags —
+          ; rides cp_delta_section as an ordinary field-delta record at
+          ; the reserved block position (Step 6.7, §5.7), so an entry
+          ; with nothing block-level to report carries no bytes for it.
+          seq_num += 1
+          Read the block's range from the field state after decoding
+          cp_delta_section:
+            bb_start = cell(cur_template_id, BLOCK_POS, CST_FID_BB_START)
+            bb_stop  = cell(cur_template_id, BLOCK_POS, CST_FID_BB_STOP)
+          where BLOCK_POS = template.num_insns and the cells' baseline
+          defaults are 0 and template.num_insns respectively (§5.7).
+          Reject the entry if not 0 <= bb_start < bb_stop <= num_insns.
+          Emit a CP body entry tagged (seq_num, cur_template_id,
+          prev_thread_id, prev_asid_index) carrying the cp_delta_section's
+          decoded dyn_params + reg_snaps for instructions
+          [bb_start, bb_stop) ONLY, the block-level cells, and the
+          wp_chain_section's WPEntries.
+   6.5  IFRAME record (validation-only; producers may omit it):
+          cp_delta_section   : section
+          if (header.flags & header_flag.CST_FLAG_WP):
+            wp_chain_section  : section          ; see Step 6.8
           Decode each section against fresh "nothing observed yet"
           overlays; the values reconstructed must match the
           immediately-preceding ENTRY exactly (template_id, dyn_params,
-          reg_snaps, fault_depth/anchors, WP chain).  IFRAMEs do not
-          advance prev_entry_template_id and do not emit a body entry.
+          reg_snaps, the block-level cells including bb_start/bb_stop,
+          WP chain).  IFRAMEs do not advance prev_entry_template_id and
+          do not emit a body entry.
    6.6  END record:
           num_entries : ULEB
           must equal the total number of BODY_TAG_ENTRY records seen
@@ -856,34 +870,31 @@ Loop until a ``BODY_TAG_END`` is seen:
           n_records : ULEB
           ipos : u32 = 0                  ; reset at section start; not
                                           ; carried across sections
-          repeat n_records times: one field-delta record per Step 6.10.
+          repeat n_records times: one field-delta record per Step 6.9.
         After all records are consumed the section payload must be
         empty.
+        ; A record's ipos addresses an instruction of the section's
+        ; template when ipos < num_insns, and addresses the BLOCK
+        ; itself at the one reserved position ipos == num_insns
+        ; (BLOCK_POS).  Block-level field-IDs are numerically above
+        ; every per-instruction field-ID and BLOCK_POS is above every
+        ; instruction position, so the block's records sort last within
+        ; the section for free and a decoder needs no separate pass to
+        ; find them — only to have applied the whole section before it
+        ; materialises anything (§5.7).  Reject a record whose
+        ; ipos > num_insns, or whose ipos == num_insns carries a
+        ; per-instruction field-ID, or whose ipos < num_insns carries a
+        ; block-level one.
    6.8  WP chain section payload:
-          chain_hdr     : ULEB
-          num_wp        = chain_hdr >> 1
-          has_wp_events = (chain_hdr & ids.wp_chain_has_events) != 0
+          num_wp : ULEB
           repeat num_wp times:
             wp_template_id_delta : SLEB
             wp_delta_section     : section    ; decode per Step 6.7
-        ; chain_hdr packs num_wp in its high bits and the
-        ; wp_chain_flag.CST_WP_CHAIN_HAS_EVENTS bit in bit 0 — a
-        ; decoder that only wants num_wp shifts right by one.  See
-        ; §4.3 for why the presence bit rides here instead of a
-        ; dedicated per-entry byte.
-   6.9  WP events section payload:
-          num_events : ULEB
-          prev_wp_index : i32 = -1
-          repeat num_events times:
-            pos_gap   : ULEB
-            wp_index  = prev_wp_index + 1 + pos_gap
-            ev_flags  : u8       ; wp_event_flag bits
-            if (ev_flags & ids.wp_event_fault):
-              fault_insn_index : ULEB
-            apply ev_flags + (optional) fault_insn_index to
-            wp_entries[wp_index] from Step 6.8.
-            prev_wp_index = wp_index
-   6.10 One field-delta record:
+        ; Each wp_delta_section carries that speculative block's own
+        ; block-level records at its own BLOCK_POS — its range, and any
+        ; CST_FID_BB_FLAGS / CST_FID_BB_FAULT_INSN it needs (§4.4).
+        ; num_wp is the bare block count: nothing is packed into it.
+   6.9  One field-delta record:
           ipos_delta : ULEB    ; running ipos += ipos_delta (sparse positions)
           fid        : ULEB    ; resolve via encoding_maps.field_id
                                  (writer packs hot fields into the
@@ -917,7 +928,7 @@ bytes from the body member's stream:
 
 ::
 
-   7.1  trail : u32_le   ; must equal 0x1D545343
+   7.1  trail : u32_le   ; must equal 0x1E545343
    7.2  the body member's stream must be exhausted at this point
         (no further bytes).  Reject otherwise.
 
@@ -977,7 +988,7 @@ state for the same field.
 
 ::
 
-   CST_MAGIC              = 0x1D545343       bytes: 'C' 'S' 'T' 0x1D
+   CST_MAGIC              = 0x1E545343       bytes: 'C' 'S' 'T' 0x1E
    CST_FID_SLOT_COUNT     = 512              max memops / dst regs per insn
 
 ``CST_MAGIC`` and ``CST_FID_SLOT_COUNT`` are the only numerically-fixed
@@ -1041,13 +1052,12 @@ CPSR) N→N, Z→Z, C→C, V→V (no parity).
 
 Readers reject any file whose magic disagrees with ``CST_MAGIC``.
 
-The MEM_DATA / REG_DATA / PHYSADDR bits are advisory hints about field
-families — the field IDs still determine what actually appears in
-each delta section.  CST_FLAG_PROFILE, CST_FLAG_WP, and CST_FLAG_FAULT are
-structural: they gate the presence of whole blocks (the
-per-template profile block — Step 4.6 / §6, the per-entry
-wrong-path chain section — Steps 6.4–6.5, and the per-entry
-synchronous-fault depth trailer — §4.2a), exactly as the
+The MEM_DATA / REG_DATA / PHYSADDR / FAULT bits are advisory hints about
+field families — the field IDs still determine what actually appears in
+each delta section.  CST_FLAG_PROFILE and CST_FLAG_WP are structural:
+they gate the presence of whole blocks (the
+per-template profile block — Step 4.6 / §6, and the per-entry
+wrong-path chain section — Steps 6.4–6.5), exactly as the
 per-insn CST_INSN_FLAG_HAS_DEP_BLOCK gates the dep sub-block.  Resolve
 every flag through the ``header_flag`` map — the trace assigns each bit,
 a reader never assumes a position:
@@ -1055,14 +1065,11 @@ a reader never assumes a position:
 - ``CST_FLAG_MEM_DATA`` — LOAD_DATA / STORE_DATA may appear
 - ``CST_FLAG_REG_DATA`` — DST_REG fields may appear
 - ``CST_FLAG_PROFILE`` — per-template §6 profile block present
-- ``CST_FLAG_WP`` — per-entry wrong-path chain present (§4.3); the
-  sibling wrong-path *events* section is gated one level finer, by the
-  chain header's own ``CST_WP_CHAIN_HAS_EVENTS`` bit (below) rather than
-  by a header flag, since whether a given entry's chain produced an
-  event varies entry to entry where ``CST_FLAG_WP`` itself does not
-- ``CST_FLAG_FAULT`` — per-entry synchronous-fault depth trailer present
-  (§4.2a); system mode only — a user-mode trace never sets it, and every
-  entry's depth is implicitly ``0`` with no anchors
+- ``CST_FLAG_WP`` — per-entry wrong-path chain present (§4.3)
+- ``CST_FLAG_FAULT`` — ``CST_FID_BB_FAULT_DEPTH`` may appear (§5.7);
+  system mode only — a user-mode trace never sets it and every entry's
+  depth is ``0``.  Advisory: the field-ID is what actually carries the
+  depth, so a reader that simply reads the cell is correct either way
 - ``CST_FLAG_PHYSADDR`` — ``CST_FID_*_PPAGE`` families may appear
   (§5.3.1); system mode only (``physaddr=1``); its name is present in
   the ``header_flag`` map only when physical-page capture is active, so
@@ -1116,17 +1123,25 @@ is set on the per-insn flag byte), resolved through the
 - ``CST_DEP_BLOCK_HAS_REG`` — dst_dep + store_data_dep present
 - ``CST_DEP_BLOCK_HAS_ADDR`` — load_addr_dep + store_addr_dep present
 
-Wrong-path event flags, resolved through the ``wp_event_flag`` map:
+Block-level flags, resolved through the ``bb_flag`` map.  They are the
+bits of the ``CST_FID_BB_FLAGS`` block-level field (§5.7), which every
+correct-path and wrong-path block can carry:
 
-- ``CST_WP_EVENT_TRANSLATION_UNAVAIL``
-- ``CST_WP_EVENT_FAULT``
+- ``CST_BB_FLAG_SYNTHETIC_FAULT`` — this wrong-path block consumed
+  synthetic data; the instruction index rides the sibling
+  ``CST_FID_BB_FAULT_INSN`` (§4.4)
+- ``CST_BB_FLAG_TRANSLATION_UNAVAIL`` — this wrong-path block is its
+  excursion's last: the next speculative fetch could not be translated
+  (§4.4)
+- ``CST_BB_FLAG_WP_FIRST_TARGET_UNAVAIL`` — set on a *correct-path*
+  entry whose wrong-path excursion was kicked but whose first target
+  could not be fetched, so the chain is empty (§4.4)
+- ``CST_BB_FLAG_THREAD_END`` — this entry is the last one this
+  ``(thread_id, asid)`` context contributes to the segment (§4.2a)
 
-WP chain header flag, resolved through the ``wp_chain_flag`` map — the
-bit packed into the WP chain section's leading ``chain_hdr`` ULEB
-alongside ``num_wp`` (§4.3):
-
-- ``CST_WP_CHAIN_HAS_EVENTS`` — a ``wp_events_section`` (§4.4) follows
-  this entry's chain
+The vocabulary is open like every other map: a bit whose name the
+trace does not carry is not set anywhere in that trace, and a reader
+that meets an unrecognised bit ignores it, per the reserved-bits rule.
 
 3. Header
 ~~~~~~~~~
@@ -1138,7 +1153,7 @@ the first thing a decoder needs.
 ::
 
    +--------------------------------------------------+
-   | magic               u32  = 0x1D545343            |
+   | magic               u32  = 0x1E545343            |
    | isa                 u8   TraceISA                |
    | flags               u8   CST_FLAG_* bits         |
    | start_insn          ULEB                         |
@@ -1236,8 +1251,7 @@ The writer emits these maps:
    | insn_flag     | CST_INSN_FLAG_* template flag bits            |
    | dep_block_flag| CST_DEP_BLOCK_* dep sub-block flag bits       |
    | body_tag      | BODY_TAG_* stream record tags                 |
-   | wp_event_flag | CST_WP_EVENT_* wrong-path event bits          |
-   | wp_chain_flag | CST_WP_CHAIN_* wrong-path chain header bits   |
+   | bb_flag       | CST_BB_FLAG_* block-level flag bits           |
    | metaflags     | CST_METAFLAGS_* canonical flag bits           |
    | mem_access_pattern | CST_PAT_* template-profile access classes|
    | profile_flag  | CST_PROFILE_* template-profile pat_flags bits |
@@ -1255,18 +1269,31 @@ states which names a conformant trace is actually required to carry.
 4. Body Stream
 ~~~~~~~~~~~~~~
 
-Conceptually, every ``BODY_TAG_ENTRY`` record describes one *invocation*
-of one true basic block on the architectural correct path.  Each
-record carries: the template ID (which gives the static instruction
-sequence), every per-instruction load and store address that fired
-during this invocation (and value, if ``MEM_DATA`` is on), the
-post-execution snapshot of every destination register written
-(if ``REG_DATA`` is on), and the wrong-path chain — a sequence of
-speculative basic-block invocations the CPU would have run if its
-branch predictor had resolved the just-completed branch the other
-way.  Body entries appear in correct-path execution order; the
-field-delta encoding scheme below is a compression layer over
-that conceptual picture, not a different shape of data.
+Conceptually, every ``BODY_TAG_ENTRY`` record describes one
+*uninterrupted run of instructions* within one invocation of one true
+basic block on the architectural correct path.  Each record carries:
+the template ID (which gives the static instruction sequence), the
+half-open range ``[bb_start, bb_stop)`` of that template the run
+covered (§4.2a — ``[0, num_insns)``, the whole block, unless the record
+says otherwise), every load and store address that fired for an
+instruction inside that range (and value, if ``MEM_DATA`` is on), the
+post-execution snapshot of every destination register those
+instructions wrote (if ``REG_DATA`` is on), and the wrong-path chain — a
+sequence of speculative basic-block invocations the CPU would have run
+if its branch predictor had resolved the just-completed branch the
+other way.  An invocation the guest ran straight through is one
+record; an invocation something interrupted is one record per stretch
+it ran, in the order it ran them.  The field-delta encoding scheme
+below is a compression layer over that conceptual picture, not a
+different shape of data.
+
+**Order.**  Within one ``(thread_id, asid)`` context the records appear
+in strict program order, unconditionally: a block is emitted when
+execution leaves it, at the extent that ran, so nothing is ever held
+back to be placed later.  Across contexts the stream interleaves in
+dispatch order.  A consumer filtering to one context therefore reads a
+single instruction stream with no reordering to undo and no rule to
+special-case — see §4.2a.
 
 The body stream is a sequence of tagged records ending in one footer.
 It opens with a mandatory context declaration — a ``BODY_TAG_ASID_SWITCH``
@@ -1300,6 +1327,13 @@ It opens with a mandatory context declaration — a ``BODY_TAG_ASID_SWITCH``
 ``num_entries`` must match the number of ``BODY_TAG_ENTRY`` records seen.
 ``BODY_TAG_IFRAME`` records are not counted; they are pure
 validation/resync redundancy.
+
+It is a count of RECORDS, not of block invocations: an invocation that
+ran in several stretches contributes one record per stretch (§4.2a).  A
+consumer sizing a per-invocation structure from ``num_entries``
+over-counts by exactly the number of interruptions the segment
+contains; the quantity that counts invocations is the number of
+records whose ``bb_start`` is ``0``.
 
 4.1 BODY_TAG_THREAD_SWITCH
 ^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -1461,8 +1495,8 @@ mints a request.
 4.2 BODY_TAG_ENTRY
 ^^^^^^^^^^^^^^^^^^
 
-Each entry records one correct-path basic block and its optional
-wrong-path chain.
+Each entry records one contiguous run of a correct-path basic block
+and its optional wrong-path chain.
 
 ::
 
@@ -1472,18 +1506,18 @@ wrong-path chain.
    |   current_template_id - previous_entry_template  |
    +--------------------------------------------------+
    | cp_delta_section                section          |
-   +--------------------------------------------------+
-   | fault_depth_trailer                              |  only if CST_FLAG_FAULT
-   |                                                   |  (§4.2a)
+   |   per-instruction records, then this block's     |
+   |   block-level records at BLOCK_POS (§5.7)        |
    +--------------------------------------------------+
    | wp_chain_section                section          |  only if CST_FLAG_WP
    +--------------------------------------------------+
-   | wp_events_section               section          |  only if CST_FLAG_WP
-   |                                                   |  AND the chain
-   |                                                   |  header's
-   |                                                   |  CST_WP_CHAIN_HAS_EVENTS
-   |                                                   |  bit is set (§4.3)
-   +--------------------------------------------------+
+
+The entry has exactly two payload members after the template delta,
+and one of them is conditional.  There is no per-entry trailer and no
+side-section: a fact about the block travels as a field-delta record
+inside ``cp_delta_section`` exactly as a fact about an instruction
+does, so a block with nothing to declare beyond its instructions pays
+nothing for the possibility.
 
 ``previous_entry_template`` starts at 0 and updates after each CP entry.
 The current guest-thread ID comes from the most recent
@@ -1492,35 +1526,92 @@ recent ``BODY_TAG_ASID_SWITCH``; because the body opens with an
 ``(asid, thread)`` declaration (§4.1a, §4.1), an ENTRY is always preceded
 by both, and every entry carries a well-defined ``(asid, thread)`` context.
 
-4.2a Synchronous-Fault Depth Trailer
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+4.2a Executed Range and Program Order
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Rides every ``BODY_TAG_ENTRY`` and ``BODY_TAG_IFRAME`` payload, immediately
-after ``cp_delta_section`` and before the (optional) wrong-path chain, when
-the header's ``CST_FLAG_FAULT`` bit is set.  System mode only — a user-mode
-trace never sets the flag, the trailer is absent from every entry, and a
-reader treats every entry's depth as ``0`` with no anchors.
+An entry declares which instructions of its template it executed.  The
+declaration is the half-open range ``[bb_start, bb_stop)``, carried by
+the two block-level field-IDs ``CST_FID_BB_START`` and
+``CST_FID_BB_STOP`` (§5.7) with baseline defaults ``0`` and the
+template's ``num_insns``, so an entry that ran the whole block declares
+nothing and costs nothing.  Both are instruction INDICES into the
+template's per-insn descriptor array — the same index space ``ins_pos``
+addresses — and ``bb_stop`` is EXCLUSIVE: ``bb_stop == num_insns`` means
+the block's last instruction executed.  A well-formed entry satisfies
+``0 <= bb_start < bb_stop <= num_insns``; the empty range is not
+emitted, because a block that executed nothing is not an event.
+
+``bb_stop`` is the count of leading instructions from ``bb_start`` whose
+execution this entry **fully observed** — not the count that retired.
+The two differ at the moment execution is taken away mid-block: an
+instruction's destination registers are readable only once the next
+instruction begins (§5.4), so a run cut short inside an instruction
+callback has one retired instruction whose results are not yet
+observable, and the entry excludes it.  It reappears as the first
+instruction of the continuation, or does not appear at all.  This is
+what makes a partial entry honest rather than merely short: every
+instruction the range names has its complete memops and its complete
+post-execution register state, and the entry asserts nothing whatever
+about instructions outside the range.
+
+A block interrupted and later resumed produces one entry per stretch,
+each naming the same ``template_id``:
 
 ::
 
-   +--------------------------------------------------+
-   | fault_depth                     ULEB             |
-   |   0 = normal code; >= 1 = handler code at this   |
-   |   exception-nesting depth                        |
-   | n_anchors                       ULEB             |
-   |   count of faulting-instruction indices below    |
-   | repeat n_anchors times:                          |
-   |   anchor                        ULEB             |
-   |     0-based index of a faulting instruction      |
-   |     within this (possibly merged) block          |
-   +--------------------------------------------------+
+   invocation of BB T (num_insns = 7), a fault at instruction 3:
 
-``fault_depth`` is the exception-nesting depth at which this basic block
-executed: ``0`` for ordinary, non-handler code; ``>= 1`` for the code of a
+     entry   template T   [0, 3)     the run before the fault
+     entry   handler blocks ...      the excursion, at fault_depth 1
+     entry   template T   [3, 7)     the resumption
+
+The instruction the excursion interrupted is the range's exclusive
+``bb_stop`` on one entry and its inclusive ``bb_start`` on the next —
+one index, named twice, from the two sides.  A consumer rejoins an
+invocation by chaining, within one context, each entry naming a
+``template_id`` to the next entry naming that same ``template_id``
+whose ``bb_start`` equals this one's ``bb_stop``; the chain begins at
+an entry whose ``bb_start`` is ``0`` and ends at one whose ``bb_stop``
+is ``num_insns``.  A successor whose ``bb_start`` is neither ``0`` nor
+the predecessor's ``bb_stop`` is a wire defect, not a licensed
+shorthand — the format has no way to skip instructions in the middle
+of a block.
+
+**Order is unconditional.**  Within one ``(thread_id, asid)`` context
+the entries are in strict program order with no exceptions.  A block
+is emitted when execution leaves it, at the extent that ran, so the
+prefix of an interrupted block is on the wire *before* the handler
+that interrupted it, and its continuation *after* — the order the
+guest ran them in.  Nothing is deferred, reassembled, or placed
+retrospectively, and a consumer needs no rule to detect or undo a
+reordering.
+
+Normative consequences of a declared range:
+
+* A memop record MUST NOT appear at an ``ins_pos`` outside
+  ``[bb_start, bb_stop)``, and a consumer MUST NOT materialise memops
+  for such a position.  A memop an instruction delivered before losing
+  the machine — the aborted attempt of a faulted bulk operation, §5.2 —
+  belongs to the entry whose range contains that instruction, which is
+  the entry that re-executes it, never the entry that stopped before
+  it.
+* A destination-register snapshot MUST NOT appear at an ``ins_pos``
+  outside the range, and a consumer MUST NOT synthesise one.  A
+  consumer walking the template to size or index per-instruction state
+  clamps that walk to the range; a walk over ``num_insns`` regardless
+  is the single mistake this record shape exists to prevent.
+* The instruction count an entry contributes to the trace is
+  ``bb_stop - bb_start``, not ``num_insns``.
+* The branch-outcome singletons (§5.6) appear only on an entry whose
+  range contains the terminating branch.
+
+**Fault depth.**  ``CST_FID_BB_FAULT_DEPTH`` (§5.7) is the
+exception-nesting depth at which this basic block executed: ``0`` for
+ordinary, non-handler code; ``>= 1`` for the code of a
 synchronous-fault handler — or, with ``interrupts=1``, an asynchronous-
 interrupt handler — that detoured execution at that nesting level.
-User-privilege entries always carry depth ``0``: user code is never handler
-content.
+User-privilege entries always carry depth ``0``: user code is never
+handler content.
 
 The nesting is a property of the entry's own ``thread_id``.  Concurrent
 threads detour independently, so a consumer reads the depth column per
@@ -1530,36 +1621,35 @@ same core during that excursion carries its own — normally ``0`` — depth.
 Interleaving two threads' entries and reading the column as a single stack
 is a consumer error, not a wire property.
 
-``n_anchors`` / ``anchor`` mark a *faulting basic block reassembled whole*.
-When a synchronous fault interrupts a block mid-flight, the plugin merges
-the block's pre-fault prefix and its post-return suffix back into one
-entry rather than splitting it at the fault, and each ``anchor`` records the
-0-based instruction index of one faulting excursion, in order, so a
-consumer sees the interrupted block once, whole, with its detour points
-marked instead of twice with a phantom seam.  ``n_anchors == 0`` on every
-ordinary entry, including an ordinary (non-merged) handler-body entry — a
-handler's own basic blocks did not themselves fault, so they carry no
-anchors of their own.
+The range and the depth together are the whole wire mechanism behind
+both system-mode handler-tracing options (see :doc:`reference` for the
+full option semantics); neither adds a wire record of its own:
 
-The trailer is the single wire mechanism behind both system-mode
-handler-tracing options (see :doc:`reference` for the full option
-semantics); neither adds a wire record of its own:
-
-- ``faults=1`` (default) traces a synchronous-fault handler as first-class
-  code at its depth, with the interrupted block's anchors populated.
-  ``faults=0`` excludes the handler from capture instead — the interrupted
-  block still reassembles whole (the merge is kept) but is de-anchored and
-  clamped to depth ``0``, exactly as if no fault had occurred, so a
-  ``faults=0`` trace advertises ``CST_FLAG_FAULT`` yet never emits an
-  anchor or a depth ``> 0`` entry.
+- ``faults=1`` (default) traces a synchronous-fault handler as
+  first-class code at its depth, between the interrupted block's
+  ranges.  ``faults=0`` excludes the handler from capture instead: the
+  interrupted block still emits its ranges, in order, with nothing
+  between them and depth ``0`` throughout, so a ``faults=0`` trace
+  advertises ``CST_FLAG_FAULT`` yet never emits a depth ``> 0`` entry.
 - ``interrupts=0`` (default) excludes an asynchronous interrupt's handler
-  excursion entirely.  ``interrupts=1`` traces it instead, riding this same
-  trailer at depth ``>= 1`` — one level added on top of any live
-  synchronous-fault nesting — with no anchors of its own: an asynchronous
-  interrupt lands on a basic-block boundary, so nothing needs reassembling.
+  excursion entirely.  ``interrupts=1`` traces it instead, at depth
+  ``>= 1`` — one level added on top of any live synchronous-fault
+  nesting.  An asynchronous interrupt lands on a basic-block boundary,
+  so the block it follows is a whole one and no range is split.
 
 See :doc:`architecture`, "Asynchronous interrupts and the two
 handler-tracing flags", for the capture-side mechanics behind both options.
+
+**Thread end.**  ``CST_BB_FLAG_THREAD_END`` on an entry states that this
+is the last entry its ``(thread_id, asid)`` context contributes to the
+segment: the guest thread ended, or the trace window closed on it.
+Combined with the range it says exactly where that context's
+instruction stream stops, so a consumer neither waits for a
+continuation that will not come nor has to infer the end from a
+context simply not reappearing.  In a user-mode trace, where a
+thread index is released on exit and may be reissued to a thread
+created later (§4.1), the flag is also what separates the two
+occupants of one index.
 
 4.3 Wrong-Path Chain Section
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -1571,9 +1661,7 @@ the CP block. Template IDs are delta-coded within the chain.
 
    wp_chain_section payload:
 
-     chain_hdr : ULEB
-       num_wp        = chain_hdr >> 1
-       has_wp_events = chain_hdr & wp_chain_flag.CST_WP_CHAIN_HAS_EVENTS
+     num_wp : ULEB
 
      repeat num_wp times:
        wp_template_id_delta : SLEB
@@ -1582,85 +1670,58 @@ the CP block. Template IDs are delta-coded within the chain.
 Wrong-path field state is forked from the current correct-path state at
 the start of the chain and discarded at the end of the entry.
 
-The chain header's low bit, ``CST_WP_CHAIN_HAS_EVENTS``, announces
-whether the following ``wp_events_section`` (§4.4) is present at all —
-see that section for why the presence signal lives here rather than in
-a dedicated per-entry byte. ``num_wp`` occupies the remaining bits, so a
-reader that wants only the block count shifts ``chain_hdr`` right by
-one; the shift costs nothing in practice because ``num_wp`` stays small
-(bounded by the ``wpdepth`` excursion budget) and so keeps the header a
-single wire byte in the overwhelming majority of entries, exactly as
-the unpacked ``num_wp : ULEB`` did before.
+``num_wp`` is a plain block count with nothing packed into it.  Each
+chain block's ``wp_delta_section`` is an ordinary field-delta section
+(§5) and therefore carries that block's own block-level records at its
+own ``BLOCK_POS`` — its executed range and, where there is something to
+say, its ``CST_FID_BB_FLAGS`` and ``CST_FID_BB_FAULT_INSN`` (§4.4).  A
+speculative block is described in the same terms as a correct-path
+one, by the same records, and a chain whose blocks all ran whole and
+reported nothing costs the chain header and the per-block template
+deltas alone.
 
-4.4 Wrong-Path Events Section
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+4.4 Wrong-Path Block Events
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Events annotate the entry's wrong-path chain: an event whose resolved
-index addresses a chain position identifies a wrong-path block that
-contains a synthetic-data fault or could not be translated; an event
-whose resolved index lies past the chain is chain-level and describes
-the unrealized first target of the wrong path itself (see below).
+Two conditions a wrong-path excursion can meet are named on the wire,
+and both are block-level facts carried by the block they describe:
+``CST_BB_FLAG_SYNTHETIC_FAULT`` (with the sibling
+``CST_FID_BB_FAULT_INSN`` naming the instruction) and
+``CST_BB_FLAG_TRANSLATION_UNAVAIL``.  Each rides its own chain block's
+``wp_delta_section``, at that block's ``BLOCK_POS``, as an ordinary
+field-delta record (§5.7).  There is no side-section and no index
+space: a block that has nothing to report emits no record, which is
+what a sparse field does natively, and a block that does costs one
+record.
 
-The section itself is present on the wire only when the preceding
-``wp_chain_section``'s header carried ``CST_WP_CHAIN_HAS_EVENTS`` (§4.3);
-an entry whose chain produced no event carries no ``wp_events_section``
-at all — no length prefix, no ``num_events = 0`` payload, nothing. A
-reader that has already decoded the chain header therefore knows before
-reaching this point in the stream whether to expect the section below.
+The flags delta-persist per ``(template_id, BLOCK_POS,
+CST_FID_BB_FLAGS)`` like every other cell, so a writer MUST emit a
+record whenever a block's flags differ from that cell's current value —
+including back to ``0`` on the next clean execution of a template that
+reported something last time.
 
-::
+One condition belongs to no block and is therefore carried by the
+correct-path entry that owns the excursion:
+``CST_BB_FLAG_WP_FIRST_TARGET_UNAVAIL`` on the CP entry says the
+excursion was kicked but its first fetch could not complete, so the
+chain is empty (``num_wp == 0``).  This makes the architecturally
+faithful 0-block chain explicit rather than indistinguishable from an
+entry whose wrong path was never simulated.  Putting it on the CP
+entry is what lets the wire describe an empty chain at all: there is
+no block to hang it on.
 
-   wp_events_section payload:
+``CST_BB_FLAG_TRANSLATION_UNAVAIL`` marks its block as the excursion's
+**last**: the next speculative fetch's target could not be translated —
+un-resident code under demand paging, a refused garbage region, a
+speculative fetch crossing the privilege boundary the excursion
+launched at, or the host's speculative code buffer exhausted — so the
+walk stops there.  It is the sole stop the wire names, and it is set
+on the last block that did complete, not on a block that did not
+exist.
 
-     num_events : ULEB
-
-     repeat num_events times:
-       pos_gap            : ULEB     index = prev_index + 1 + pos_gap
-       ev_flags           : u8       CST_WP_EVENT_* bits
-       if ev_flags has CST_WP_EVENT_FAULT:
-         fault_insn_index : ULEB
-
-``prev_index`` starts at -1. ``fault_insn_index`` is the 0-based index of
-the faulting instruction within that wrong-path block.
-
-The events are a **sparse side-section** — one per correct-path entry,
-naming only the wrong-path blocks that carry an event — rather than an
-``ev_flags`` byte on every ``WPEntry``.  Wrong-path events are rare: on a
-representative wrong-path-heavy trace only about one correct-path entry in
-a hundred carries any event, so the section spends bytes only where an
-event exists, whereas a per-``WPEntry`` flag byte would spend one byte on
-every speculative block to record nothing on the overwhelming majority.
-The sparse form is under a third the size of the per-``WPEntry``
-alternative on such a trace.  It also expresses what a per-``WPEntry`` byte
-cannot: a chain-level event on an empty chain (``num_wp == 0``) has no
-block to attach a flag byte to.
-
-Sparse-within-the-section is not, on its own, sparse-across-the-*trace*:
-even an entry that carries zero events still paid, until the
-``CST_WP_CHAIN_HAS_EVENTS`` bit was introduced, an unconditional
-``wp_events_section`` — its own length prefix plus a ``num_events = 0``
-payload byte — on *every* ``BODY_TAG_ENTRY`` and ``BODY_TAG_IFRAME``, not
-just the ones with something to report. How many entries carry an event
-is workload-dependent — measured traces range from about one entry in a
-hundred to roughly one in five on a fault-heavy workload — but the
-no-event majority's framing is pure overhead at either density: on the
-fault-heavy end it was half the section's total wire cost, and on the
-sparse end essentially all of it. ``wp_chain_flag`` closes that gap by
-moving the presence signal one level up: the writer decides, before it
-even opens the WP chain sub-section, whether this entry has any event
-to report, and packs that decision into a bit of the chain header's
-leading ``chain_hdr`` ULEB (§4.3) — a field that is already
-unconditionally present whenever ``CST_FLAG_WP`` is set, so folding a
-bit into it costs nothing new. When the bit is clear the
-``wp_events_section`` is skipped entirely rather than emitted empty,
-collapsing its cost on a no-event entry from two bytes to zero. A
-dedicated per-entry flag byte would have worked semantically but would
-itself cost one byte on every entry, undoing most of the saving it was
-meant to provide; reusing the chain header's existing field is what
-keeps the common case free.
-
-``CST_WP_EVENT_FAULT`` marks a wrong-path block that contains a
-**synthetic-data fault** at ``fault_insn_index``.  On a mispredicted path
+``CST_BB_FLAG_SYNTHETIC_FAULT`` marks a wrong-path block that contains a
+**synthetic-data fault** at the instruction index its sibling
+``CST_FID_BB_FAULT_INSN`` record names.  On a mispredicted path
 no instruction ever retires, so a back-end synchronous fault a
 speculative instruction would raise is never actually taken by a real
 core — the branch-mispredict squash kills the path before commit.  The
@@ -1688,12 +1749,20 @@ an ordinary branch and continuing on the not-taken side to the
 instruction's destinations are left stale — the same deterministic
 placeholder — so its dependents still execute.
 
-``CST_WP_EVENT_FAULT`` is therefore an **attribute** of a block —
-"this block consumed synthetic data" — and never a terminator.  A
-reader MUST NOT infer termination from it, including when it lands on
-the chain's last block, where it is a coincidence rather than the
-cause.  Only a **front-end** fault (translation-unavailable, below)
-stops an excursion, and it is the sole stop the wire names.
+``CST_BB_FLAG_SYNTHETIC_FAULT`` is therefore an **attribute** of a
+block — "this block consumed synthetic data" — and never a terminator.
+A reader MUST NOT infer termination from it, including when it lands
+on the chain's last block, where it is a coincidence rather than the
+cause.  Only a **front-end** fault
+(``CST_BB_FLAG_TRANSLATION_UNAVAIL``, above) stops an excursion, and it
+is the sole stop the wire names.
+
+For the same reason ``CST_FID_BB_FAULT_INSN`` is **not** the block's
+``bb_stop``.  The excursion continues past the marked instruction on
+placeholder data, so the block executes to its end and its range says
+so; folding the marked index into ``bb_stop`` would assert a
+termination the format explicitly denies.  The two indices are
+independent and a block routinely carries both.
 
 An excursion can nonetheless end short of its ``wpdepth`` budget with
 nothing on the wire to say so.  Alongside the skip-and-continue path
@@ -1707,26 +1776,11 @@ that hit a bail, except by comparing the chain's instruction count
 against the ``wpdepth`` recorded in the header's ``command`` string
 (§3).
 
-Bit 2 of ``ev_flags`` is **free** — unassigned, available for a future
-event flag.  Writers write it 0 and readers ignore it, per the
-reserved-bits rule ("Format Stability and Conformance").
-
-The event index space extends one convention beyond the chain: a
-resolved index ``>= num_wp`` does not address any encoded wrong-path
-block — it is a **chain-level** event describing the excursion's first
-target, which was never realized as a block.  The writer emits exactly
-one form of chain-level event: on an entry whose wrong-path chain is
-empty (``num_wp == 0``) because the excursion was kicked but its first
-fetch could not complete — the target's translation is unavailable at
-that point in execution (for example a software-managed-TLB ISA where
-the refill exception cannot be taken speculatively, so real hardware
-would also fetch nothing) — the section carries ``num_events = 1``,
-``pos_gap = 0``, ``ev_flags = CST_WP_EVENT_TRANSLATION_UNAVAIL``.  This
-makes the architecturally faithful 0-block chain explicit rather than
-indistinguishable from an entry whose wrong path was never simulated.
-Readers MUST accept a resolved index ``>= num_wp``, apply the event to
-the chain as a whole rather than to a block, and still consume
-``fault_insn_index`` when the FAULT bit is set.
+The unfetchable first target that
+``CST_BB_FLAG_WP_FIRST_TARGET_UNAVAIL`` names arises for the same
+reasons as the mid-chain case, plus one of its own: on a
+software-managed-TLB ISA the refill exception cannot be taken
+speculatively, so real hardware would also fetch nothing there.
 
 4.5 BODY_TAG_IFRAME
 ^^^^^^^^^^^^^^^^^^^
@@ -1743,20 +1797,19 @@ writer had, or skip it entirely.
    +--------------------------------------------------+
    | tag = 3                         u8               |
    | cp_delta_section                section          |
-   | fault_depth_trailer                              |  only if CST_FLAG_FAULT
-   |                                                   |  (§4.2a)
    | wp_chain_section                section          |  only if CST_FLAG_WP
-   | wp_events_section               section          |  only if CST_FLAG_WP
-   |                                                   |  AND the chain
-   |                                                   |  header's
-   |                                                   |  CST_WP_CHAIN_HAS_EVENTS
-   |                                                   |  bit is set (§4.3)
    +--------------------------------------------------+
 
 The IFRAME inherits the ``template_id`` of the preceding ENTRY (no
 ``template_id_delta`` is encoded). Inside, every field-delta record is
 encoded against ``template_default`` rather than against the persistent
-overlay state, so the decoded value is absolute. When the CP-side
+overlay state, so the decoded value is absolute — block-level records
+included, so a partial ENTRY's IFRAME states ``bb_start`` and
+``bb_stop`` absolutely and an ENTRY that ran its block whole emits
+neither (both already equal their defaults).  The reconstructed range
+is part of what must match, and it bounds what the IFRAME's own
+register and memop reconstruction covers, exactly as it bounds the
+ENTRY's.  When the CP-side
 triggers an IFRAME, the entire body record is re-emitted in IFRAME
 mode — including every WP-chain entry attached to that CP block; WP
 entries are never IFRAME'd independently of their owning CP entry.
@@ -1821,9 +1874,23 @@ across sections is the per-template field-state cell keyed by
 ``(template_id, ipos, field_id)`` (see below); the wire-level ``ipos``
 cursor is just the in-section pointer used to address those cells.
 
+Positions ``0 .. num_insns-1`` address the template's instructions.
+The one position above them, ``ipos == num_insns``, addresses the
+**block itself** and is written ``BLOCK_POS`` throughout this spec; it
+carries the block-level fields of §5.7 and nothing else.  No
+instruction occupies it, so ``(template_id, BLOCK_POS, field_id)`` is
+an ordinary cell in the same key space with the same lifetime and the
+same overlay rules — the block dictionary is the instruction
+dictionary, addressed one position further along.
+
 Records are emitted in non-descending ``(ipos, fid)`` order. When two
 records describe the same instruction, the later record has
-``ipos_delta = 0``.
+``ipos_delta = 0``.  Because ``BLOCK_POS`` is above every instruction
+position, a section's block-level records are its last, which costs
+one ``ipos_delta`` and requires no ordering rule of its own; a decoder
+that applies the whole section before materialising anything (the
+two-pass shape the delta model already requires) has the range in hand
+before it needs it.
 
 Every record is a scalar delta record:
 
@@ -1889,7 +1956,7 @@ The CP overlay is unaffected by speculative records.
 5.1 Field-ID Space
 ^^^^^^^^^^^^^^^^^^
 
-Field IDs are ULEB128 on the wire (Step 6.10).  Numeric IDs are
+Field IDs are ULEB128 on the wire (Step 6.9).  Numeric IDs are
 **not** pinned in the format spec; the header's ``field_id`` encoding
 map (Reference §3.1) carries the (id → name) pair for every field
 the trace uses, and decoders MUST look up fields by name there.
@@ -1935,8 +2002,8 @@ Field families (one canonical name each):
   snapshots, indexed by the template's ``dst_regs`` array position.
   Gated on ``CST_FLAG_REG_DATA``.  Source-register values are not
   emitted on the wire — consumers reconstruct them from a regfile
-  that the wp_event_flag stream + initial-state REGFILE records
-  + DST_REG snapshots collectively define.
+  that the initial-state REGFILE records and the DST_REG snapshots
+  collectively define.
 
 * **Width families** — the byte width of each captured value, for
   value-prediction consumers that need to know how many bytes a
@@ -2022,6 +2089,25 @@ Field families (one canonical name each):
   scalar-delta byte after this field-id's record is followed by
   one extra ULEB whose value is reserved.
 
+* **Block-level singletons** (five; addressed at ``BLOCK_POS`` rather
+  than at an instruction — see §5.7 for the full contract):
+
+  * ``CST_FID_BB_START`` — index of the first instruction of the
+    template this entry executed.  Baseline default ``0``.
+  * ``CST_FID_BB_STOP`` — one past the index of the last instruction
+    this entry fully observed.  Baseline default is the template's
+    ``num_insns``, the only per-template baseline outside the
+    instruction-metadata family.
+  * ``CST_FID_BB_FLAGS`` — bitmask of ``CST_BB_FLAG_*`` bits, resolved
+    through the ``bb_flag`` map (§2).  Baseline default ``0``.
+  * ``CST_FID_BB_FAULT_DEPTH`` — exception-nesting depth this block
+    executed at (§4.2a).  Baseline default ``0``; gated advisorily on
+    ``CST_FLAG_FAULT``.
+  * ``CST_FID_BB_FAULT_INSN`` — instruction index of a wrong-path
+    block's synthetic-data fault (§4.4).  Baseline default ``0``,
+    meaningful only when ``CST_BB_FLAG_SYNTHETIC_FAULT`` is set in the
+    same block's flags.
+
 * **Branch-outcome singletons** (two; always advertised — see §5.6):
 
   * ``CST_FID_BRANCH_TAKEN`` — ``1`` if the BB's terminating branch
@@ -2046,9 +2132,11 @@ Field families (one canonical name each):
 **Layout intent (non-normative).**  The writer assigns numeric
 IDs so the hot fields — slot counts, metaflags, and low-slot
 memops + destination snapshots — collectively occupy IDs ``< 128``
-and therefore emit as a single ULEB byte.  High-slot families
-and the cold instruction-metadata singletons fall into the
-2-byte ULEB range (IDs 128..16383).  A future writer may
+and therefore emit as a single ULEB byte.  High-slot families,
+the cold instruction-metadata singletons and the block-level
+singletons fall into the 2-byte ULEB range (IDs 128..16383);
+the block-level ones sit above every per-instruction ID, which
+is what makes a section's block records sort last for free.  A future writer may
 re-shuffle within these constraints (e.g., promote a different
 hot field into the 1-byte range based on observed frequency)
 without bumping ``CST_MAGIC``; readers consume the per-trace
@@ -2438,7 +2526,7 @@ holds.  The consequence differs by path:
   changed translation always emits a delta, so the reconstructed physical
   address is *exact* for every CP memop.
 * **Wrong path** — a speculative access served synthetic data (see the
-  ``CST_WP_EVENT_FAULT`` machinery, §4.4) has no translation and emits
+  ``CST_BB_FLAG_SYNTHETIC_FAULT`` machinery, §4.4) has no translation and emits
   nothing; the decoded value for that WP memop is then the slot's *last
   observed* translation — best-effort, and possibly stale for the wild
   address.  TLB-hit WP accesses carry their real translation exactly like
@@ -2476,6 +2564,16 @@ that's the pre-exec hook of the next canonical insn; for the tail
 insn of every TB it's the next TB's tb_exec callback. Both points
 guarantee the architectural register state reflects the just-finished
 instruction's writes and not yet the next instruction's.
+
+This timing is what the entry's ``bb_stop`` is measured against
+(§4.2a).  An instruction whose successor point has not been reached is
+not observable yet, so it lies outside the range and the entry carries
+no snapshot for it; an instruction inside the range carries a snapshot
+for every destination its template declares.  The rule holds
+regardless of ``CST_FLAG_REG_DATA``: the flag decides whether the
+captured values are written to the wire, never how far the range
+extends, so a trace's block ranges are identical with register data on
+and off.
 
 Register snapshots are scalar 512-bit values. The capture path copies
 up to the first 64 little-endian bytes returned by
@@ -2583,32 +2681,36 @@ Coverage and gating:
   in every trace's ``field_id`` map (they cost nothing on non-branch entries).
   A trace produced by a writer that predates the feature names neither, and
   a consumer then falls back to successor look-ahead.
-* **Branch-terminated blocks only.**  A page-split continuation (no
-  terminating branch) carries neither FID; a decoder surfaces the outcome
-  only when the template ends in a branch.
+* **Only where the range reaches the branch.**  Two populations carry
+  neither FID and have no outcome to surface.  A template with no
+  terminating branch at all — a page-split continuation — is the
+  first.  The second is any entry whose executed range (§4.2a) stops
+  at or before the terminating branch's ``ins_pos``: that entry did
+  not run the branch, so it has no direction and no target, and a
+  decoder MUST NOT read the two cells for it.  This is routine rather
+  than rare — every interrupted block contributes one such entry — so
+  a consumer treats "no outcome on this entry" as an ordinary state,
+  and looks for the invocation's outcome on the entry whose range does
+  contain the branch.
 
   .. warning::
 
-     A **branch-terminated** block whose successor the writer never observed
-     is not covered by that sentence, and omitting the two FIDs does not make
-     its outcome blank.  Both delta-persist per ``(ins_pos, fid)``: an entry
-     that carries neither record reads back as a repeat of whatever last
-     occupied that slot — for ``BRANCH_TAKEN`` that can be a different
-     template's branch at the same index — and the decoder marks the outcome
-     valid.  Such an entry therefore publishes a **direction and target it
+     The range rule above is what makes an absent outcome *readable* as
+     absent, and it is load-bearing.  The two FIDs delta-persist per
+     ``(ins_pos, fid)``, so an entry that carries neither record reads back
+     as a repeat of whatever last occupied that slot — for ``BRANCH_TAKEN``
+     that can be a different template's branch at the same index.  Omission
+     alone therefore does not mean "no outcome"; it means "unchanged".  A
+     consumer must decide by the range — an entry whose ``bb_stop`` does not
+     pass the terminating branch has no outcome, whatever the cells hold —
+     and never by whether records were present.
+     A block whose range *does* contain the branch, but whose successor the
+     writer could not resolve, would publish a **direction and target it
      never took**, indistinguishable on the wire from a block that genuinely
-     repeated its last outcome.  A writer produces them wherever a flush
-     emits without resolving a successor: the segment-close walk, the
-     fault-frame unwind, the close-frame prefix and the cut-short walk.  This
-     is **not** confined to a segment's last entry — a close that flushes a
-     peer vCPU's held slot emits a block that executed much earlier, so the
-     fabricated outcome can land mid-history.  Nor is a budget close exempt:
-     an ``x86_64 -smp 4`` marker cell closed on ``why=BUDGET`` produced one on
-     a block whose own ``STORE_DATA0`` payload (``0x601``, feeding
-     ``test``/``je``) proves the recorded "taken" impossible.  The writer
-     counts these emissions in ``branch_outcome_unresolved_cp`` /
-     ``branch_outcome_unresolved_wp``; a consumer that trusts branch outcomes
-     must read those before trusting them.
+     repeated its last outcome; the wire cannot say "unresolved".  The writer
+     counts any such emission in ``branch_outcome_unresolved_cp`` /
+     ``branch_outcome_unresolved_wp``, and a consumer that trusts branch
+     outcomes must read those before trusting them.
 * **REP string operations** fan out into one entry per iteration, all at the
   REP PC; the self-looping REP "branch" is reported taken to its own PC for
   every iteration but the last, which exits to the real successor — so the
@@ -2627,12 +2729,12 @@ where the branch went:
   blocks are emitted before the target's first instruction retires.  The
   handler's entry carries a higher ``fault_depth`` (§4.2a).
 * **The target's block faults part-way.**  A faulting block is emitted
-  **once, whole**, keyed on its architectural ``start_pc``, only after every
-  excursion it took has completed, and carries one *fault anchor* per
-  excursion (§4.2a).  The branch that entered it names its ``start_pc``
-  while
-  each excursion's return names an anchor's instruction PC — and the record
-  that follows either of them is the handler, not the block.
+  as the ranges it ran (§4.2a), in program order, with the handler's
+  blocks between them.  The branch that entered it names its
+  ``start_pc``, which is the first entry's own resume PC; each
+  excursion's return names the next entry's, ``insn_pcs[bb_start]``.
+  The record that follows either of them is the handler, not the
+  block's continuation.
 * **Strands interleave.**  Kernel work owned by one traced context but
   executed on several vCPUs is stamped with that one context, so consecutive
   entries can belong to independent strands.
@@ -2650,27 +2752,109 @@ the OS intervenes.
 the architectural continuation rather than against adjacency: direction
 against the encoded target itself (``taken == (target != fall_through_pc)``,
 unconditional terminators forced taken), and the target against the entry
-where the context resumes the target's instruction stream — at its
-``start_pc`` or at one of its fault anchors.  A pair whose adjacent record
-does not carry the target is deferred only when the trace positively signals
-the diversion (a ``fault_depth`` step, the successor's fault anchors, a
-thread switch, a privilege-domain gap, or both endpoints inside a kernel
-excursion), and the deferred target must then be matched by a later entry of
-the same context — directly, at that entry's own ``start_pc`` (*resumed*), or
-indirectly, at a later block of the excursion naming the same PC
-(*corroborated*).  Every deferral is tallied by signal with its resumed /
-corroborated / never-resumed split, so a suppression cannot hide inside the
-diversion accounting.  A fault-merged entry is checked from the other side as
-well: each of its resume PCs — ``start_pc`` and every anchor's instruction PC
-— must be the encoded target of some branch in that context.  Non-final WP
+where the context resumes the target's instruction stream.  Every entry has
+exactly one resume PC — ``insn_pcs[bb_start]``, which is ``start_pc`` on an
+entry that began the block — so the match is an equality against one PC
+rather than a membership test against a set of alternatives.  A pair whose
+adjacent record does not carry the target is deferred only when the trace
+positively signals the diversion (a ``fault_depth`` step, a successor entry
+whose ``bb_start`` is non-zero, a thread switch, a privilege-domain gap, or
+both endpoints inside a kernel excursion), and the deferred target must then
+be matched by a later entry of the same context — directly, at that entry's
+own resume PC (*resumed*), or indirectly, at a later block of the excursion
+naming the same PC (*corroborated*).  Every deferral is tallied by signal
+with its resumed / corroborated / never-resumed split, so a suppression
+cannot hide inside the diversion accounting.  A resumed entry is checked from
+the other side as well: its resume PC must be the encoded target of some
+branch in that context.  Non-final WP
 blocks are cross-checked in-chain against the next chain block's
-``start_pc``; a block the ``wp_events`` section marks faulting or
+``start_pc``; a block whose ``CST_FID_BB_FLAGS`` marks it faulting or
 untranslatable ends its strand and is tallied as a diversion.  A
 syscall-class block is exempt from that licence and checked strictly: the
 wrong path continues past a syscall at its architectural fall-through, so
 its successor is exactly predictable, and the fault marker it always
 carries (raising is how a syscall leaves speculative execution) does not
 excuse a mismatch.
+
+5.7 Block-Level Fields
+^^^^^^^^^^^^^^^^^^^^^^
+
+Some facts belong to the basic-block execution rather than to any one
+of its instructions: how much of the block ran, at what exception
+depth, and what happened to it.  They are carried by field-delta
+records exactly like per-instruction facts, addressed at the reserved
+position ``BLOCK_POS = template.num_insns`` (§5), inside the same
+``cp_delta_section`` / ``wp_delta_section`` the block's instruction
+records ride.  There is no separate section, no count, and no framing
+of their own: a block with nothing to declare emits no record and pays
+no bytes, and a block with something to declare pays one record for
+it.
+
+Every rule of §5 applies unchanged.  State is keyed
+``(template_id, BLOCK_POS, field_id)``; it **persists across entries**
+for the whole body stream, so a value repeated by the next execution
+of the same template costs zero bytes.  CP and WP keep separate
+overlays: a CP record writes the CP overlay, a WP record writes the WP
+overlay and resolves its baseline ``WP → CP → template default``, so a
+speculative block whose range or flags match the correct path's costs
+nothing to say so.  IFRAMEs encode block-level records against fresh
+overlays like every other field, making them absolute (§4.5).
+
+Because state persists, **omission means "unchanged", never
+"absent"**.  A writer MUST emit a record whenever a block's value for
+one of these fields differs from that cell's current value — including
+the return to a default, such as a template that ran partially once
+and runs whole thereafter, or a wrong-path block that reported a
+synthetic fault last time and does not this time.
+
+::
+
+   block-level field-IDs, all addressed at ipos == BLOCK_POS
+
+   +-------------------------------+---------+---------------------+
+   | field_id                      | default | scope               |
+   +-------------------------------+---------+---------------------+
+   | CST_FID_BB_START              | 0       | CP and WP blocks    |
+   | CST_FID_BB_STOP               | num_insns | CP and WP blocks  |
+   | CST_FID_BB_FLAGS              | 0       | CP and WP blocks    |
+   | CST_FID_BB_FAULT_DEPTH        | 0       | CP blocks           |
+   | CST_FID_BB_FAULT_INSN         | 0       | WP blocks           |
+   +-------------------------------+---------+---------------------+
+
+``CST_FID_BB_START`` / ``CST_FID_BB_STOP`` are the executed range
+``[bb_start, bb_stop)``, in template instruction indices, ``bb_stop``
+exclusive.  ``CST_FID_BB_STOP``'s baseline default is the block's own
+``num_insns`` — the only per-template baseline outside the
+instruction-metadata family — so the whole-block case is the free one:
+an entry that ran its block from the first instruction to the last
+carries neither record.  §4.2a states what a declared range means for
+the entry's contents; the normative summary is that memops and
+register snapshots exist for the instructions inside the range and for
+no others, and that a consumer clamps every per-instruction walk to
+it.  A reader MUST reject an entry whose decoded range does not
+satisfy ``0 <= bb_start < bb_stop <= num_insns``.
+
+``CST_FID_BB_FLAGS`` is a bitmask whose bits resolve through the
+``bb_flag`` map (§2).  Bits a reader does not recognise are ignored,
+per the reserved-bits rule; the map states which bits this trace can
+set.
+
+``CST_FID_BB_FAULT_DEPTH`` is the exception-nesting depth described in
+§4.2a.  It is a per-template cell like any other, so a block that only
+ever runs at one depth pays one record at its first sighting and
+nothing afterwards, and a block that runs at two pays only on the
+change.
+
+``CST_FID_BB_FAULT_INSN`` is the instruction index of a wrong-path
+block's synthetic-data fault, meaningful only when the same block's
+``CST_FID_BB_FLAGS`` carries ``CST_BB_FLAG_SYNTHETIC_FAULT``.  It is
+deliberately not ``bb_stop``: the excursion continues past it (§4.4).
+
+Two positions, one dictionary.  A decoder needs no second state table,
+no second record shape and no second pass — the block's cells sit one
+index past the block's instructions in the table it already keeps, and
+the only new obligation is to read the range before it materialises
+anything and to clamp what it materialises to that range.
 
 6. Templates Section
 ~~~~~~~~~~~~~~~~~~~~
@@ -2685,7 +2869,13 @@ mutated bytes (Step 0).  Revisions at one ``start_pc`` need not agree
 in ``num_insns`` or in their per-instruction PCs and sizes: a guest
 that re-cuts a block into different instructions mints a revision of
 the new shape, and the wire carries it exactly as it carries any other
-template.  A body ``ENTRY`` (§4.2) always names a block
+template.  A block the guest entered and did not finish mints nothing:
+the entry names the whole block and declares the range that ran
+(§4.2a), so a shorter execution is a body fact, not a template.  The
+one non-self-modifying way two templates come to share a ``start_pc``
+is a block whose continuation was never translated, which leaves what
+was translated as a template of its own.  A body ``ENTRY`` (§4.2)
+always names a block
 by ``template_id``; never resolve a block by ``start_pc`` alone, and
 never size a block from a sibling revision.
 

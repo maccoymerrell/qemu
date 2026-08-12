@@ -1322,7 +1322,8 @@ Environment knobs
 -----------------
 
 Environment variables the plugin and its tools consult.  All except
-``CST_SPEC_FLUSH_BUDGET`` and ``CST_DECODE_THREADS`` are
+``CST_SPEC_FLUSH_BUDGET``, ``CST_DECODE_THREADS``,
+``CST_SINK_STALL_SECS`` and ``CST_SINK_STALL_ABORT_SECS`` are
 **diagnostics**: they exist for debugging and A/B isolation, perturb
 either output or performance, and have no place in a production
 trace run.
@@ -1338,6 +1339,23 @@ trace run.
        triggers a proactive ``tb_flush`` + reclaim; default 256 MiB.
        Also the reclaim live-fire test knob.  See
        :ref:`template-lifetimes`.
+   * - ``CST_SINK_STALL_SECS``
+     - Interval, in seconds, at which a wait on the ``compress=``
+       sink that has taken **no further bytes** for the whole
+       interval is reported on stderr; default ``60``, ``0``
+       disables the report.  Three waits are covered: a vCPU
+       thread waiting for a free output chunk (the guest is frozen
+       between instructions), the close draining the writer
+       thread, and the close waiting for the compression pipe to
+       exit.  What is tested is the sink's byte count, not elapsed
+       time, so a merely slow compressor never trips it.
+   * - ``CST_SINK_STALL_ABORT_SECS``
+     - No-progress deadline, in seconds, after which such a wait
+       ends the run (exit status ``97``) with the trace
+       **incomplete**, instead of continuing to wait.  Off unless
+       set: a compressor that is still taking bytes is still
+       writing the trace, and only the operator knows whether an
+       unfinishable run should end or hold.
    * - ``CST_MEMSTATS``
      - *Diagnostic.*  Template-store footprint breakdowns (per-array
        byte totals, duplicate-chain histogram) at segment close and

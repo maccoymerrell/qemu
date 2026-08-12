@@ -122,7 +122,14 @@ static bool close_member_file(FILE *f, bool is_pipe, const char *label)
         return true;
     }
     if (is_pipe) {
+        /* pclose waits for the compressor to EXIT.  A compressor that has
+         * taken every byte and then never finishes parks the close here,
+         * after the writer drain has already returned -- the same silence,
+         * one step further on.  Watched, for the same reason. */
+        void *watch = sink_stall_watch_begin(
+            "the close waiting for the compression pipe to exit");
         int rc = pclose(f);
+        sink_stall_watch_end(watch);
         if (rc != 0) {
             fprintf(stderr,
                     "champsim_tracer: %s compression pipe exited with status %d\n",

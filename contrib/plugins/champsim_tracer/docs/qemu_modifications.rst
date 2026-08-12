@@ -1846,9 +1846,17 @@ Machine-shutdown notification
    The dispatch is placed to be both EARLY and ON A vCPU:
 
    * ``qemu_system_shutdown_request()`` — the guest poweroff / reset /
-     monitor / QMP path.  A guest poweroff is a device write the guest
-     itself executed, so this arrives on the writing vCPU's own thread
-     with its state live: the callback runs directly.
+     monitor / QMP path.  A guest that powers itself off reaches this
+     from its own instruction stream, so it arrives on that vCPU's own
+     thread with its state live: the callback runs directly.  The
+     CONDUIT belongs to the machine and not to this interface.  An
+     x86-64 guest writes the ACPI sleep register and the request comes
+     out of the store; an ``-M virt`` aarch64 guest executes ``hvc #0``
+     and QEMU answers it itself as PSCI ``SYSTEM_OFF``
+     (``target/arm/tcg/psci.c``, reached from ``arm_cpu_do_interrupt()``
+     — exception delivery, with no device write anywhere in it).  Both
+     are the guest's own execution asking for the shutdown, and both
+     arrive here the same way.
    * ``qemu_system_shutdown()`` in the main loop — the only path a HOST
      SIGNAL reaches, because ``qemu_system_killed()`` runs in a signal
      handler and sets ``shutdown_requested`` directly.  Here there is no
@@ -1889,11 +1897,10 @@ Machine-shutdown notification
    rather than a plain flag.
 
    ``in_guest_insn`` reports POSITION, and it is a separate statement
-   from ``vcpu_index``'s statement of ORIGIN.  It is true only on the
-   guest-poweroff route: a guest poweroff is a device write, so the
-   request arrives part-way through the store that performs it and that
-   instruction has BEGUN and has not retired — its memory operations are
-   only partly observed.  On the marshalled route the work runs at a
+   from ``vcpu_index``'s statement of ORIGIN.  It is true on the route
+   the guest's own execution took to the shutdown request, where the
+   instruction that caused it has BEGUN and has not been observed to
+   complete.  On the marshalled route the work runs at a
    translation-block boundary and the last dispatched block completed.
    A plugin closing a capture would otherwise have to guess, and either
    guess costs it: claiming the in-flight instruction publishes a block
@@ -1903,6 +1910,50 @@ Machine-shutdown notification
    subtracts exactly the in-flight instruction when this flag says there
    is one.
 
+   WHICH instruction that is follows the conduit.  A probe plugin that
+   records the last instruction to reach an execution callback reads
+   ``outw %ax, %dx`` on x86-64 — the ACPI store, whose memory operations
+   are only partly observed at the dispatch — and ``hvc #0`` on aarch64
+   ``-M virt``.  The aarch64 one is the stronger case, not the weaker:
+   the PSCI handler powers the CPU off inside the call, so the guest
+   never leaves that instruction and no instruction after it ever
+   begins; the probe's execution count is unchanged between the
+   shutdown callback and ``plugin_exit``, where on x86-64 the guest goes
+   on to execute 94 more.  Either way the instruction's result snapshot
+   — captured one instruction behind, by the NEXT instruction's callback
+   — does not exist at the close, which is what makes subtracting it
+   right rather than merely cautious.  With the pinned process powering
+   the machine off itself, so that the slot the drain reads IS the block
+   the guest stands in, both ISAs subtract exactly one:
+   ``close_deferred_prev_inflight_trimmed`` reads 1 and the final entry
+   is the two-instruction PSCI stub ``bti c ; hvc #0`` published as one
+   instruction.  With the poweroff run from a process the window is not
+   pinned to, both instead read ``close_deferred_prev_inflight_stale``
+   = 1: the fact is about the vCPU's current instruction and the slot
+   holds somebody else's block, so the subtraction is refused.
+
+   The flag is INFERRED from ``current_cpu`` being set at the request,
+   which is a fact about the thread rather than about the guest.  The
+   two coincide wherever a shutdown request reaches
+   ``qemu_system_shutdown_request()`` from inside ``cpu_exec()``, which
+   is every route the guest itself can take to it — a device write and a
+   trapped instruction alike.  They come apart in one place, and it is
+   worth naming because it is not visible from the plugin side: under
+   ``-icount`` with round-robin TCG, ``icount_handle_deadline()`` runs
+   ``QEMU_CLOCK_VIRTUAL`` timer callbacks on the vCPU thread with
+   ``current_cpu`` still pointing at the vCPU of the previous loop
+   iteration (``accel/tcg/tcg-accel-ops-icount.c``,
+   ``accel/tcg/tcg-accel-ops-rr.c``), so a timer that requested a
+   shutdown from there would be reported as in-guest while the last
+   dispatched block was in fact complete, and the drain would subtract
+   an instruction that retired.  The discriminator that would make the
+   flag a fact rather than an inference is ``cpu_exec()``'s own
+   ``CPUState::running``, which a stale ``current_cpu`` always reads
+   false.  It is not applied here because no configuration this tracer
+   runs uses ``-icount`` and no such timer has been exercised: a
+   predicate whose failing arm cannot be made to fire is not a fix that
+   can be shown to work.
+
    The contract is exercised by ``tests/plugin-shutdown/check.sh``,
    which builds a probe plugin and takes an x86-64 guest to a shutdown
    four ways: a guest poweroff must name the vCPU that performed the
@@ -1910,7 +1961,10 @@ Machine-shutdown notification
    must name none and still run in vCPU context; a run whose first vCPU
    is stalled inside an instrumentation callback must still shut down
    promptly, on some other vCPU; and a run whose only vCPU is stalled
-   must shut down on the bound, with the diagnostic.
+   must shut down on the bound, with the diagnostic.  All four cells are
+   x86-64, so the check covers one of the two conduits: the trapped-call
+   form an aarch64 ``-M virt`` guest uses is exercised by the cells
+   described above and not by this script.
 
    Both run before ``qemu_cleanup()``, and the dispatch is idempotent:
    whichever fires first wins.  The hook lives in ``plugins/core.c``

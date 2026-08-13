@@ -1788,14 +1788,30 @@ static void cst_clkeq_check(CPUState *cpu, int64_t pre_thaw)
      * only readout of the condition -- was unavailable on an SMP run, which is
      * where the condition lives.  CST_CLKEQ_EVERY sets the period; at 500 the
      * same cell reports it, and reads 528694.
+     *
+     * A period that cannot be used is SAID, not swapped in silence.  An
+     * operator who asks for a period and is given a different one without
+     * being told reads the resulting lines as answering the question they
+     * set, which is the same misreading the fixed 20000 produced.  The
+     * period is per-vCPU-thread like the count it gates, so a thread reads
+     * the environment once and the refusal is announced once per process.
      */
+#define CST_CLKEQ_EVERY_DEFAULT 20000
     static __thread uint64_t n_excursions;
-    static int every = -1;
+    static __thread int every = -1;
     if (every < 0) {
         const char *s = getenv("CST_CLKEQ_EVERY");
-        every = s ? atoi(s) : 20000;
+        every = s ? atoi(s) : CST_CLKEQ_EVERY_DEFAULT;
         if (every <= 0) {
-            every = 20000;
+            static int refusal_announced;
+            if (qatomic_xchg(&refusal_announced, 1) == 0) {
+                fprintf(stderr, "[clkeq] CST_CLKEQ_EVERY=\"%s\" is not a "
+                        "positive period; refused, reporting every %d "
+                        "excursions per vcpu instead\n",
+                        s ? s : "", CST_CLKEQ_EVERY_DEFAULT);
+                fflush(stderr);
+            }
+            every = CST_CLKEQ_EVERY_DEFAULT;
         }
     }
     if ((++n_excursions % (unsigned)every) == 0) {

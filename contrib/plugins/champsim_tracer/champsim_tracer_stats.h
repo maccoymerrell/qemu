@@ -655,12 +655,32 @@ struct Stats {
      * CST_SMP_PEER_INFLIGHT_FALSIFY (smp_close_peer_extent_note,
      * champsim_tracer.cc) reach that window on demand on any ISA; being
      * synthetic they perturb only the copies the classification reads, and
-     * the counters reach no wire.  What the in-flight case MEANS for the
-     * extent the flush then publishes is a live question: peers are not
-     * quiesced at a close. */
+     * the counters reach no wire.
+     *
+     * The in-flight case is what the close-time extent snapshot exists
+     * for.  Peers are still not quiesced — the close holds exec_lock, so a
+     * peer stops only at its next dispatch — but the extent the flush
+     * publishes for such a slot is no longer read off a counter that vCPU
+     * is advancing: retired_close_extent_arm samples every vCPU's
+     * in-flight count before TraceSegmentManager::finish() shuts the
+     * observation sinks, and every close-path reader is answered from that
+     * sample (see the comment on retired_close_extent_arm,
+     * champsim_tracer.cc).  The row is therefore a provenance fact about
+     * WHERE the extent came from, not an alarm about it moving. */
     uint64_t smp_close_peer_stash_extent = 0;
     uint64_t smp_close_peer_live_cursor = 0;
     uint64_t smp_close_peer_inflight_head = 0;
+    /* Of the in-flight-head slots, those whose retired cursor had moved
+     * PAST the close-time sample by the time the flush read it, and the
+     * instructions it had moved by.  That difference is what the peer ran
+     * after the sinks were shut — instructions no memop, dst snap or
+     * synthetic EA was recorded for — so it is exactly the extent a
+     * live-cursor read would have published from the template with
+     * inherited field values.  Reported, not enforced: the snapshot
+     * already keeps it out of the wire, and the number says whether the
+     * cell reached the condition at all. */
+    uint64_t smp_close_peer_inflight_drift = 0;
+    uint64_t smp_close_peer_inflight_drift_insns = 0;
     /* The thread-keyed migration drain (the fix the condition census
      * above caught in the act): holders drained at the owning thread's
      * first promote on another vCPU, the instructions they published,

@@ -887,6 +887,67 @@ static inline void retired_reset(unsigned int cpu_index)
  * Returns false when @head is neither — no answer is better than a wrong
  * truncation, and the caller counts the case (see close_walk_extent_unknown).
  */
+/*
+ * THE IN-FLIGHT EXTENT A CLOSE READS MUST BE SAMPLED WHILE THE CAPTURE IS
+ * STILL RECORDING.
+ *
+ * retired_in_flight() reads insn_started, which is an UNGATED inline add
+ * (one per instruction, registered last among an instruction's ops), while
+ * every observation sink is gated on the is_active scoreboard slot:
+ * vcpu_insn_reg_snap_cb, vcpu_mem_cb and vcpu_insn_synth_ea_cb all bail
+ * when the segment is not active.  TraceSegmentManager::finish() clears
+ * active_ BEFORE it runs the close's flush hook, and a close quiesces
+ * nobody: it holds exec_lock, so a PEER vCPU stops only when it reaches
+ * its next vcpu_tb_exec callback, and until then it runs out the rest of
+ * the TB it is standing in with every sink shut.  A live read taken inside
+ * the flush hook therefore counts instructions nothing recorded -- up to
+ * the whole TB, since retired_executed_of clamps to its length -- and the
+ * flush publishes them from the template with their fields inherited from
+ * an earlier execution's delta-persist slots.  That is the fabrication
+ * class of the branch-outcome and close-drained-register defects, reached
+ * through the extent instead of through a field.
+ *
+ * So the extent is sampled ONCE per close, on the closing thread, before
+ * the capture stops recording, and every close-path reader is answered
+ * from that snapshot.  The sample is honest by the op order the inline add
+ * documents: insn_started is registered AFTER the per-insn reg-snap
+ * callback, so a value of c proves instruction c's whole prologue ran --
+ * including the capture of instruction c-1's destinations -- and therefore
+ * that instructions 1..c-1 completed with their observations recorded.
+ * c-1 is exactly what the flush's stop rule publishes.  A peer that runs
+ * further between the sample and the drain only appends past the prefix
+ * being published; it cannot un-record what is already in the sink, and it
+ * cannot emit, because emission needs the exec_lock the closing thread
+ * holds.
+ */
+static const BBTemplate *g_close_extent_head[CST_PIN_MAX_VCPUS];
+static uint64_t g_close_extent_insns[CST_PIN_MAX_VCPUS];
+static bool     g_close_extent_armed;
+
+static void retired_close_extent_arm(void)
+{
+    const unsigned int n = (unsigned int)qemu_plugin_num_vcpus();
+    for (unsigned int i = 0; i < CST_PIN_MAX_VCPUS; i++) {
+        if (i < n) {
+            g_close_extent_head[i] = g_retired_tb_head[i];
+            g_close_extent_insns[i] = retired_in_flight(i);
+        } else {
+            g_close_extent_head[i] = nullptr;
+            g_close_extent_insns[i] = 0;
+        }
+    }
+    g_close_extent_armed = true;
+}
+
+static void retired_close_extent_disarm(void)
+{
+    g_close_extent_armed = false;
+    for (unsigned int i = 0; i < CST_PIN_MAX_VCPUS; i++) {
+        g_close_extent_head[i] = nullptr;
+        g_close_extent_insns[i] = 0;
+    }
+}
+
 bool retired_executed_of(unsigned int cpu_index, const BBTemplate *head,
                          uint64_t *out)
 {
@@ -896,7 +957,12 @@ bool retired_executed_of(unsigned int cpu_index, const BBTemplate *head,
     unsigned s = retired_slot(cpu_index);
     uint64_t n;
     if (head == g_retired_tb_head[s]) {
-        n = retired_in_flight(cpu_index);
+        /* The in-flight arm.  Inside a close this comes from the sample
+         * taken before recording stopped; outside one the reader is the
+         * vCPU's own thread and the counter is not moving under it. */
+        n = (g_close_extent_armed && g_close_extent_head[s] == head)
+            ? g_close_extent_insns[s]
+            : retired_in_flight(cpu_index);
     } else if (head == g_retired_prev_head[s]) {
         n = g_retired_prev_executed[s];
     } else {
@@ -2713,20 +2779,6 @@ static void devio_stop_cb(uint64_t request_id)
  * emit_body_entry into the entry's fault trailer.  0 = normal code,
  * >=1 = fault-handler code at that nesting. */
 thread_local uint32_t g_emit_fault_depth CST_TLS_HOT = 0;
-
-/* Fault depth of the LAST body entry emitted on each vCPU's stream; the
- * unwind-flush anchor guard (PathBuilder::flush_frame_unwound) reads it to
- * keep a merged faulting BB from landing at a depth its predecessor doesn't
- * strictly exceed.  Per-vCPU, not per-thread: the value carries across CP
- * steps, and under round-robin TCG one host thread interleaves every
- * vCPU's steps. */
-static uint32_t g_last_emit_fault_depths[CST_PIN_MAX_VCPUS];
-
-uint32_t &last_emit_fault_depth(unsigned int cpu_index)
-{
-    return g_last_emit_fault_depths[cpu_index < CST_PIN_MAX_VCPUS
-                                    ? cpu_index : CST_PIN_MAX_VCPUS - 1];
-}
 
 /* CST diag correlation: the seq_num of the most recent body entry emitted
  * process-wide, so the per-step depth diag can be tied to a wire position.
@@ -4895,11 +4947,36 @@ void smp_close_peer_extent_note(unsigned int cpu_index,
         return;
     }
     g_stats.smp_close_peer_inflight_head++;
-    if (cst_smp_diag()) {
-        fprintf(stderr, "[smpdiag] close peer slot is vCPU %u's IN-FLIGHT "
-                "head: pc=0x%" PRIx64 " ran=%" PRIu64 " closing_cpu=%u\n",
-                cpu_index, slot ? slot->start_pc : 0, extent,
-                g_cst_closing_cpu);
+    /*
+     * THE DRIFT THE SNAPSHOT REMOVES, MEASURED RATHER THAN ASSERTED.
+     *
+     * @extent came from the close-time sample, taken before
+     * TraceSegmentManager::finish() shut the observation sinks.  Read the
+     * counter AGAIN here, live, at the moment the flush would have read
+     * it: the difference is the number of instructions this peer executed
+     * with nothing recording them, which is exactly what a live-cursor
+     * extent would have published from the template with inherited field
+     * values.  Zero on a peer that has not moved; positive says the fix
+     * was load-bearing on this cell and by how much.  Read-only — it
+     * changes no extent and reaches no wire.
+     */
+    if (slot) {
+        const uint64_t cap = tb_head_insns(slot);
+        uint64_t live = retired_in_flight(cpu_index);
+        if (live > cap) {
+            live = cap;
+        }
+        if (live > extent) {
+            g_stats.smp_close_peer_inflight_drift++;
+            g_stats.smp_close_peer_inflight_drift_insns += live - extent;
+        }
+        if (cst_smp_diag()) {
+            fprintf(stderr, "[smpdiag] close peer slot is vCPU %u's "
+                    "IN-FLIGHT head: pc=0x%" PRIx64 " ran=%" PRIu64
+                    " live_at_flush=%" PRIu64 " closing_cpu=%u\n",
+                    cpu_index, slot->start_pc, extent, live,
+                    g_cst_closing_cpu);
+        }
     }
 }
 
@@ -5159,11 +5236,6 @@ void emit_body_entry(BodyStreamState *out_stream,
     }
     entry.thread_end = thread_end;
     entry.fault_depth = g_emit_fault_depth;
-    /* Record this thread's last-emitted depth for the unwind-flush anchor
-     * guard.  A REP fan-out below emits its sub-entries at this same depth
-     * (they inherit entry.fault_depth), so the parent stamp is the last
-     * emitted level regardless. */
-    last_emit_fault_depth(cpu_index) = g_emit_fault_depth;
     /* Guest-thread identity on the wire.  cpu_index is a lookup key for the
      * per-vCPU identity (and for live register reads — regfile capture, WP
      * lane gates); the index itself never reaches the stream. */
@@ -6100,12 +6172,11 @@ static inline BBTemplate *cp_chain_finalize_if_complete(unsigned int cpu_index)
 /*
  * CST_NO_PEER_HOLDERS: the falsifier arm for the peer gate itself.  The loop
  * used to ask `if (!b || !b->prev()) continue;` -- the pending-seal SLOT and
- * nothing else -- so a peer vCPU holding open fault frames, a suspension, an
- * in-flight chain or a captured reg-snap sink behind an EMPTY slot was
- * skipped whole, and with it flush_frames_at_close, which no other path
- * reaches.  With this set the gate reverts to the slot-only question, so a
- * run pair measures what the wider gate recovers.  A falsifier arm, not a
- * capture.
+ * nothing else -- so a peer vCPU holding an in-flight chain or a captured
+ * reg-snap sink behind an EMPTY slot was skipped whole, and with it the
+ * flush's chain arm, which no other path reaches.  With this set the gate
+ * reverts to the slot-only question, so a run pair measures what the wider
+ * gate recovers.  A falsifier arm, not a capture.
  */
 static bool peer_holders_falsifier(void)
 {
@@ -6181,6 +6252,15 @@ static void finish_trace_segment(bool prev_executed = true,
      * g_cst_closing_cpu).  UINT32_MAX (the plugin-exit route) means every
      * builder is a peerless flush and the peer counters stay silent. */
     g_cst_closing_cpu = closing_cpu;
+
+    /* Sample every vCPU's in-flight retired extent NOW, while the capture
+     * is still recording, so the census and the flush hook below both read
+     * a stable number instead of a counter a peer is still advancing with
+     * its observation sinks already shut (see retired_close_extent_arm).
+     * This is the first statement of the close for that reason: everything
+     * after it — the pre census, finish()'s active_ clear, the peer flush
+     * order — must see the same extents. */
+    retired_close_extent_arm();
 
     /* Segments actually finalised to a file.  The SimPoint report counts
      * captures with THIS, not with the schedule iterator's index: the
@@ -6483,6 +6563,25 @@ static void finish_trace_segment(bool prev_executed = true,
                  */
                 const uint64_t arch_before = g_seg_arch_insns;
                 const uint64_t user_before = g_stats.wire_user_arch_insns;
+                /*
+                 * prev_in_flight STAYS FALSE, INCLUDING FOR A SLOT THAT IS
+                 * THE PEER'S CURRENT HEAD.
+                 *
+                 * The extra subtraction that flag controls is not a second
+                 * safety margin, it is a second copy of the first one.
+                 * insn_started's add is registered LAST among an
+                 * instruction's ops, so a cursor reading c always means
+                 * instruction c's prologue has run and instructions
+                 * 1..c-1 completed with their observations recorded --
+                 * whether the vCPU is mid-body of c or sitting between
+                 * instructions.  The stop rule's unconditional
+                 * `executed--` publishes exactly those c-1, so the
+                 * begun-but-unretired instruction is already outside the
+                 * extent and taking one more would drop an instruction
+                 * that ran and was fully observed.  What the peer case
+                 * actually needed was a STABLE c, which the close-time
+                 * snapshot now supplies.
+                 */
                 b->flush_final(/* walk_prev= */ true,
                                /* prev_in_flight= */ false,
                                smp_stamp_here(fi));
@@ -6776,8 +6875,11 @@ static void finish_trace_segment(bool prev_executed = true,
     qemu_plugin_outs(report->str);
 
     /* The close is over: peer classification in any later flush (a next
-     * segment's, the teardown's) must not inherit this close's vCPU. */
+     * segment's, the teardown's) must not inherit this close's vCPU, and
+     * the in-flight extent snapshot must not answer for a vCPU that has
+     * since run on. */
     g_cst_closing_cpu = UINT32_MAX;
+    retired_close_extent_disarm();
 }
 
 /* True when the dead-latch detector is armed: marker mode, per-process

@@ -140,15 +140,6 @@ void emit_body_entry(BodyStreamState *out_stream,
  * models (MTTCG: one thread per vCPU; round-robin: one thread total,
  * and a step cannot be preempted mid-dispatch). */
 extern thread_local uint32_t g_emit_fault_depth CST_TLS_HOT;
-/* Fault depth stamped on the MOST RECENTLY emitted body entry of a
- * vCPU's stream (set by emit_body_entry).  Read by the unwind-flush
- * anchor guard so a leaked inner frame is only emitted at the unwind
- * when its depth is strictly shallower than its predecessor (an
- * anchored entry must follow a deeper one); never write it elsewhere.
- * Per-vCPU (NOT thread-keyed): it carries meaning across CP steps, and
- * under round-robin TCG consecutive steps on the one host thread
- * belong to different vCPUs. */
-uint32_t &last_emit_fault_depth(unsigned int cpu_index);
 /* CST diag correlation: seq_num of the most recent body entry emitted
  * process-wide.  A wire-position cursor for the gap/jump diagnostics;
  * plain static like the g_dbg_* mirrors below (every writer runs under
@@ -185,10 +176,7 @@ enum CstDepthSrc : uint8_t {
     CST_DSRC_NONE = 0,
     CST_DSRC_PIPELINE,       /* step_seal: g_emit_fault_depth = walk_depth_ */
     CST_DSRC_MERGE,          /* complete_merge, anchored at f.depth         */
-    CST_DSRC_MERGE_PLAIN,    /* complete_merge, de-anchored to last_emit    */
-    CST_DSRC_MERGE_ZERO,     /* complete_merge deeper-frame flush at 0      */
-    CST_DSRC_UNWIND,         /* flush_frame_unwound at f.depth              */
-    CST_DSRC_FLUSH_FINAL,    /* segment-final flush                         */
+    CST_DSRC_CLOSE_WALK,     /* close_walk_emit's set_depth arm             */
 };
 /* Provenance of prev_depth_ / walk_depth_. */
 enum CstPrevDepthSrc : uint8_t {
@@ -312,6 +300,15 @@ void user_clock_close_credit(unsigned int cpu_index, const BBTemplate *head,
  * the raw `covered` at segment finish; a no-op in system mode.  See the
  * definition in champsim_tracer.cc. */
 void user_raw_clock_unbilled(uint64_t insns);
+
+/* A block that reached its own terminating branch is complete without a
+ * successor dispatch — a syscall IS a terminator, so the exit syscall's
+ * block does not owe the wire a dispatch that can never come.  Asked by
+ * flush_final's direct-cursor arm instead of dropping the slot's last
+ * instruction; captures the terminator's dst snaps when it answers true.
+ * See the definition in champsim_tracer.cc for all four conditions. */
+bool close_seal_at_terminator(unsigned int cpu_index, const BBTemplate *head,
+                              uint64_t executed);
 
 /* True when the deferred budget/simpoint close will try to take at this
  * step's end (pending + armed + segment active) AND no peer builder holds

@@ -726,10 +726,7 @@ static const char *dsrc_name(uint8_t s)
     switch (s) {
     case CST_DSRC_PIPELINE:    return "pipeline";
     case CST_DSRC_MERGE:       return "merge";
-    case CST_DSRC_MERGE_PLAIN: return "merge-plain";
-    case CST_DSRC_MERGE_ZERO:  return "merge-zero";
-    case CST_DSRC_UNWIND:      return "unwind-flush";
-    case CST_DSRC_FLUSH_FINAL: return "flush-final";
+    case CST_DSRC_CLOSE_WALK:  return "close-walk";
     default:                   return "none";
     }
 }
@@ -1261,13 +1258,9 @@ void PathBuilder::on_segment_open()
      * segment-open is baselined out so the window starts at depth 0
      * rather than inheriting a pre-trace excursion. */
     primed_ = false;
-    /* The emit-side trailer registers are shared with emit_body_entry;
-     * zero them so nothing leaks into the new segment's first entry.  The
-     * last-emitted-depth guard likewise resets so the new segment's first
-     * unwind flush compares against a clean baseline, not a stale prior
-     * segment's depth. */
+    /* The emit-side trailer register is shared with emit_body_entry; zero
+     * it so nothing leaks into the new segment's first entry. */
     g_emit_fault_depth = 0;
-    last_emit_fault_depth(cpu_index_) = 0;
 }
 
 /*
@@ -1490,7 +1483,7 @@ uint32_t PathBuilder::close_walk_emit(BodyStreamState *out_stream,
                 eff = a.depth;
             }
             g_emit_fault_depth = eff;
-            g_dbg_depth_src = CST_DSRC_UNWIND;
+            g_dbg_depth_src = CST_DSRC_CLOSE_WALK;
         }
         rep_emit_handoff(cpu_index, facts);
         const bool is_final = a.thread_end_last &&
@@ -1650,7 +1643,15 @@ void PathBuilder::flush_final(bool walk_prev, bool prev_in_flight,
                     g_stats.close_deferred_prev_inflight_trimmed++;
                 }
             }
-            if (executed > 0) {
+            /* THE TAIL IS DROPPED ONLY WHEN THE BLOCK DID NOT FINISH.
+             * A block that reached its own terminating branch is complete
+             * here and now — a syscall is a terminator, so the exiting
+             * program's last block does not owe the wire a dispatch that
+             * can never arrive — and close_seal_at_terminator takes the
+             * terminator's dst snaps so the whole block, register slice
+             * included, goes out at its full extent. */
+            if (executed > 0 &&
+                !close_seal_at_terminator(cpu_index, prev_tb_, executed)) {
                 executed--;                   /* tail snap never captured */
             }
         } else {

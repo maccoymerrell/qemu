@@ -4944,7 +4944,7 @@ def _check_header_window(trace_meta: dict,
 
 
 def _check_iframe_cadence(body_stats: dict,
-                          cp_entries: list[dict],
+                          entries: list[dict],
                           trace_meta: dict) -> list[Issue]:
     """The writer emits an IFRAME per `iframe_rate` *per-template*
     emissions (`tmpl->emit_count % iframe_rate == 0`).  So whether an
@@ -4964,11 +4964,30 @@ def _check_iframe_cadence(body_stats: dict,
       * If any single template was emitted >= iframe_rate times, at
         least one IFRAME must have fired.
       * iframe_count must equal sum(per_template_hits // iframe_rate).
+
+    @entries must be EVERY CP entry in the trace.  Both operands of the
+    floor identity are whole-segment quantities — `emit_count` runs from
+    the segment open and `iframe_count` counts every IFRAME in the file —
+    so a caller that hands over a slice makes the identity compare a
+    whole-trace numerator with a partial denominator and the check reports
+    a tracer defect that is its own.  The population is asserted below
+    rather than trusted: a check that cannot find its subject must fail.
     """
     issues: list[Issue] = []
     cp = int(body_stats.get("cp_entries", 0))
     iframes = int(body_stats.get("iframe_count", 0))
     rate = _parse_iframe_rate_from_command(trace_meta.get("command", ""))
+
+    if len(entries) != cp:
+        issues.append(Issue(
+            "iframe_cadence", "error",
+            f"the cadence check was handed {len(entries)} entries but the "
+            f"trace has {cp} CP entries — the per-template hit floor would "
+            f"be computed over a different population than iframe_count "
+            f"covers, so this check has no subject",
+            {"entries_given": len(entries), "cp_entries": cp},
+        ))
+        return issues
 
     if iframes > cp:
         issues.append(Issue(
@@ -4981,7 +5000,7 @@ def _check_iframe_cadence(body_stats: dict,
 
     # Per-template hit counter (the trace's actual emission distribution).
     hits: dict[int, int] = {}
-    for e in cp_entries:
+    for e in entries:
         tid = int(e.get("template_id", 0))
         hits[tid] = hits.get(tid, 0) + 1
     max_hits = max(hits.values()) if hits else 0
@@ -8396,7 +8415,19 @@ def validate(meta_path: Path, trace_path: Path,
 
     body_stats = trace_meta.get("body_stats") or {}
     stats["body_stats"] = body_stats
-    issues += _check_iframe_cadence(body_stats, cp_entries, trace_meta)
+    # THE WHOLE ENTRY LIST, NOT THE PROLOGUE-STRIPPED TAIL.  The IFRAME
+    # cadence is a writer invariant over the SEGMENT: the counter it
+    # divides (BBTemplate::emit_count) starts at the segment open and
+    # `iframe_count` in body_stats counts every IFRAME in the file.
+    # Handing it `cp_entries` — entries[cp_start:], the slice that drops
+    # everything before the generated block's first execution — compared a
+    # whole-trace numerator against a partial denominator: measured on
+    # /mnt/md0/QEMU/cst_runs/ub/agentc/wave/post_a_aarch64_2_97 (aarch64
+    # system -smp 2), template 700 is emitted 200102 times across the
+    # trace and 2001 times after cp_start, so the floor read 0 against a
+    # correct iframe_count of 2 and the cell scored error=1 on a conforming
+    # tracer.
+    issues += _check_iframe_cadence(body_stats, entries, trace_meta)
     # Guest-thread identity: the generated workload is single-threaded,
     # so every entry — user, or kernel inheriting the current thread —
     # carries tid 0, no matter which vCPU(s) the scheduler used or how the

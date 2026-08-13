@@ -22,6 +22,8 @@
 #include "cpu.h"
 #include "internal.h"
 #include "exec/cputlb.h"
+#include "qemu/notify.h"
+#include "system/system.h"
 
 /* Called for updates to CP0_Status.  */
 void sync_c0_status(CPUMIPSState *env, CPUMIPSState *cpu, int tc)
@@ -91,10 +93,23 @@ void cpu_mips_store_status(CPUMIPSState *env, target_ulong val)
     }
 }
 
+/*
+ * Count of guest CP0_Cause writes that raced a concurrent update of the same
+ * word from another thread.  Every one of these was, before the compare-and-
+ * swap below, a silently lost interrupt-pending bit.  Reported by MVPTIMER's
+ * siblings under MIPS_MVP_DEBUG; the retry itself is unconditional.
+ */
+static uint64_t mvp_cause_cas_retries;
+
+uint64_t mips_cause_cas_retries(void)
+{
+    return qatomic_read(&mvp_cause_cas_retries);
+}
+
 void cpu_mips_store_cause(CPUMIPSState *env, target_ulong val)
 {
     uint32_t mask = 0x00C00300;
-    uint32_t old = env->CP0_Cause;
+    uint32_t old, new;
     int i;
 
     if (env->insn_flags & ISA_MIPS_R2) {
@@ -104,9 +119,35 @@ void cpu_mips_store_cause(CPUMIPSState *env, target_ulong val)
         mask &= ~((1 << CP0Ca_WP) & val);
     }
 
-    env->CP0_Cause = (env->CP0_Cause & ~mask) | (val & mask);
+    /*
+     * Compare-and-swap, not a plain read-modify-write.
+     *
+     * @mask covers only the software-writable bits; IP7..IP2, and Cause.TI,
+     * are driven by hardware -- the i8259/CBUS lines and the CP0 timer -- and
+     * in QEMU that hardware is the iothread, running concurrently with this
+     * vCPU.  A plain "Cause = (Cause & ~mask) | (val & mask)" reads the word,
+     * computes, and writes it back; a device raise that lands in that window
+     * is overwritten and the guest never sees the interrupt.  It then waits
+     * for a wakeup that has already been delivered and lost, and sleeps to
+     * its clockevent ceiling.
+     *
+     * This is reachable from a peer VPE too: Linux MIPS vsmp sends every IPI
+     * as write_vpe_c0_cause(read_vpe_c0_cause() | C_SW0), which arrives here
+     * through helper_mttc0_cause() writing ANOTHER vCPU's CP0_Cause.
+     */
+    do {
+        old = qatomic_read(&env->CP0_Cause);
+        new = (old & ~mask) | (val & mask);
+        if (new == old) {
+            break;
+        }
+        if (qatomic_cmpxchg(&env->CP0_Cause, old, new) == old) {
+            break;
+        }
+        qatomic_inc(&mvp_cause_cas_retries);
+    } while (true);
 
-    if ((old ^ env->CP0_Cause) & (1 << CP0Ca_DC)) {
+    if ((old ^ new) & (1 << CP0Ca_DC)) {
         if (env->CP0_Cause & (1 << CP0Ca_DC)) {
             cpu_mips_stop_count(env);
         } else {
@@ -116,7 +157,7 @@ void cpu_mips_store_cause(CPUMIPSState *env, target_ulong val)
 
     /* Set/reset software interrupts */
     for (i = 0 ; i < 2 ; i++) {
-        if ((old ^ env->CP0_Cause) & (1 << (CP0Ca_IP + i))) {
+        if ((old ^ new) & (1 << (CP0Ca_IP + i))) {
             cpu_mips_soft_irq(env, i, env->CP0_Cause & (1 << (CP0Ca_IP + i)));
         }
     }
@@ -184,6 +225,55 @@ static uint64_t mvp_gate_mask;     /* VPEs observed gated off by EVP */
 static MipsMvpEvent mvp_last_halt[MIPS_MVP_MAXVPE];
 static MipsMvpEvent mvp_last_wake[MIPS_MVP_MAXVPE];
 
+/*
+ * CP0 Count/Compare condition, latched per VPE (see internal.h).
+ *
+ * skew is the whole point: deadline_ns minus where the guest's own Compare
+ * asked for the tick.  It is zero on every healthy arming and it is exactly
+ * the clamp distance on a clamped one, whatever the sample time, so a single
+ * row names which arm parked a tick.
+ */
+typedef struct MipsCp0TimerLatch {
+    uint64_t n_arm, n_arm_wrap, n_arm_behind, n_fire;
+    int64_t arm_now, arm_deadline, fire_now;
+    uint32_t arm_count, arm_compare, arm_wait, arm_op;
+    uint32_t fire_count, fire_compare, fire_cause;
+    /*
+     * A last-arm latch alone cannot answer "was a tick ever parked": the
+     * parking arm is long gone by the time anything looks.  The extremes are
+     * what the question is about, so keep the largest interval ever
+     * programmed (with the arm that programmed it) and the largest gap ever
+     * observed between two deliveries -- the outage itself.
+     */
+    uint32_t max_wait, max_wait_op;
+    int64_t max_fire_gap, prev_fire_now;
+} MipsCp0TimerLatch;
+
+static MipsCp0TimerLatch mvp_timer[MIPS_MVP_MAXVPE];
+
+static void mvp_report_timer(CPUState *cs);
+
+/*
+ * End-of-run census of the CP0 timer arms.  The MVPGATE/MVPWEDGE reports fire
+ * early or not at all, and the question "did any VPE ever have its tick armed
+ * somewhere other than where the guest asked" is about the WHOLE run, so the
+ * per-VPE latches are printed once more as the machine goes down.  Debug-gated
+ * like everything else here; it reports, it does not act.
+ */
+static void mvp_exit_report(Notifier *n, void *opaque)
+{
+    CPUState *cs;
+
+    CPU_FOREACH(cs) {
+        mvp_report_timer(cs);
+    }
+    fprintf(stderr, "MVPCAUSERACE cas_retries=%" PRIu64 "\n",
+            mips_cause_cas_retries());
+    fflush(stderr);
+}
+
+static Notifier mvp_exit_notifier = { .notify = mvp_exit_report };
+
 void mips_mvp_debug_init(void)
 {
     const char *s;
@@ -193,6 +283,9 @@ void mips_mvp_debug_init(void)
     }
     s = getenv("MIPS_MVP_DEBUG");
     mips_mvp_debug = (s && *s && *s != '0') ? 1 : 0;
+    if (mips_mvp_debug) {
+        qemu_add_exit_notifier(&mvp_exit_notifier);
+    }
 }
 
 static const char *mvp_opname(int op)
@@ -347,6 +440,78 @@ void mips_mvp_note_run(CPUState *target, int op)
     }
 }
 
+void mips_mvp_note_timer(CPUMIPSState *env, int op, uint32_t wait,
+                         int64_t now_ns, int64_t deadline_ns)
+{
+    int i = env_cpu(env)->cpu_index;
+    MipsCp0TimerLatch *t;
+
+    if (!mips_mvp_debug || i < 0 || i >= MIPS_MVP_MAXVPE) {
+        return;
+    }
+    t = &mvp_timer[i];
+
+    if (op == MIPS_CP0T_FIRE) {
+        if (t->prev_fire_now && now_ns - t->prev_fire_now > t->max_fire_gap) {
+            t->max_fire_gap = now_ns - t->prev_fire_now;
+        }
+        t->prev_fire_now = now_ns;
+        t->n_fire++;
+        t->fire_now = now_ns;
+        t->fire_count = cpu_mips_get_count_val_raw(env, now_ns);
+        t->fire_compare = env->CP0_Compare;
+        t->fire_cause = env->CP0_Cause;
+        return;
+    }
+
+    t->n_arm++;
+    if (op == MIPS_CP0T_ARM_WRAP) {
+        t->n_arm_wrap++;
+    } else if (op == MIPS_CP0T_ARM_BEHIND) {
+        t->n_arm_behind++;
+    }
+    t->arm_now = now_ns;
+    t->arm_deadline = deadline_ns;
+    t->arm_count = cpu_mips_get_count_val_raw(env, now_ns);
+    t->arm_compare = env->CP0_Compare;
+    t->arm_wait = wait;
+    t->arm_op = op;
+    if (wait > t->max_wait) {
+        t->max_wait = wait;
+        t->max_wait_op = op;
+    }
+}
+
+static void mvp_report_timer(CPUState *cs)
+{
+    int i = cs->cpu_index;
+    MipsCp0TimerLatch *t;
+    int32_t d;
+
+    if (i < 0 || i >= MIPS_MVP_MAXVPE) {
+        return;
+    }
+    t = &mvp_timer[i];
+    /*
+     * Signed modular distance from the last armed Count to Compare: what the
+     * guest asked for.  The clamp arms program something else, and the
+     * difference is the skew that a parked tick is made of.
+     */
+    d = (int32_t)(t->arm_compare - t->arm_count);
+    fprintf(stderr, "MVPTIMER cpu=%d arms=%" PRIu64 " wrap=%" PRIu64
+                    " behind=%" PRIu64 " fires=%" PRIu64
+                    " max_wait=0x%08x max_wait_op=%u max_fire_gap=%" PRId64
+                    " | last_arm wait=0x%08x Count=0x%08x Compare=0x%08x"
+                    " guest_ticks=%d deadline=%" PRId64 " now=%" PRId64
+                    " | last_fire Count=0x%08x Compare=0x%08x Cause=0x%08x"
+                    " now=%" PRId64 "\n",
+            i, t->n_arm, t->n_arm_wrap, t->n_arm_behind, t->n_fire,
+            t->max_wait, t->max_wait_op, t->max_fire_gap,
+            t->arm_wait, t->arm_count, t->arm_compare, d,
+            t->arm_deadline, t->arm_now,
+            t->fire_count, t->fire_compare, t->fire_cause, t->fire_now);
+}
+
 /*
  * Which of mips_vpe_active()'s four independent clauses is holding this VPE
  * off the run queue.  They are not interchangeable: EVP is processor-wide
@@ -383,6 +548,7 @@ static void mvp_report_cpu(const char *what, CPUState *cs)
             (uint32_t)env->active_tc.CP0_TCHalt,
             (uint32_t)env->CP0_Status, (uint32_t)env->CP0_Cause,
             cs->interrupt_request, cs->halted, env->active_tc.PC);
+    mvp_report_timer(cs);
 }
 
 /*

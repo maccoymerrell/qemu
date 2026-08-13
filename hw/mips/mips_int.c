@@ -38,10 +38,18 @@ static void cpu_mips_irq_request(void *opaque, int irq, int level)
 
     BQL_LOCK_GUARD();
 
+    /*
+     * Atomic, because the BQL does not serialise the other side.  A vCPU
+     * writing its own (or, through mttc0, a peer VPE's) CP0_Cause runs a
+     * plain read-modify-write of this whole word from a TCG helper with no
+     * BQL held, so a device raise landing between that read and its write is
+     * simply erased -- and IP7..IP2 are architecturally read-only bits that a
+     * guest write must never disturb.  See cpu_mips_store_cause().
+     */
     if (level) {
-        env->CP0_Cause |= 1 << (irq + CP0Ca_IP);
+        qatomic_or(&env->CP0_Cause, 1 << (irq + CP0Ca_IP));
     } else {
-        env->CP0_Cause &= ~(1 << (irq + CP0Ca_IP));
+        qatomic_and(&env->CP0_Cause, ~(1 << (irq + CP0Ca_IP)));
     }
 
     if (kvm_enabled() && (irq == 2 || irq == 3)) {

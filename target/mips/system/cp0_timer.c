@@ -27,25 +27,33 @@
 #include "internal.h"
 
 /* MIPS R4K timer */
-static uint32_t cpu_mips_get_count_val(CPUMIPSState *env)
+uint32_t cpu_mips_get_count_val_raw(CPUMIPSState *env, int64_t now_ns)
 {
-    int64_t now_ns;
-    now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     return env->CP0_Count +
             (uint32_t)clock_ns_to_ticks(env->count_clock, now_ns);
+}
+
+static uint32_t cpu_mips_get_count_val(CPUMIPSState *env)
+{
+    return cpu_mips_get_count_val_raw(env,
+                                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 }
 
 static void cpu_mips_timer_update(CPUMIPSState *env)
 {
     uint64_t now_ns, next_ns;
     uint32_t wait;
+    int op;
 
     now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    wait = env->CP0_Compare - cpu_mips_get_count_val(env);
+    wait = env->CP0_Compare - cpu_mips_get_count_val_raw(env, now_ns);
+    op = MIPS_CP0T_ARM;
     /* Clamp interval to overflow if virtual time had not progressed */
     if (!wait) {
+        op = MIPS_CP0T_ARM_WRAP;
         wait = UINT32_MAX;
     } else if (wait > INT32_MAX) {
+        op = MIPS_CP0T_ARM_BEHIND;
         /*
          * The target is BEHIND Count: architectural equality-match
          * semantics say "fire at the wrap", a full ~2^32 ticks away.  Real
@@ -71,6 +79,9 @@ static void cpu_mips_timer_update(CPUMIPSState *env)
     }
     next_ns = now_ns + clock_ticks_to_ns(env->count_clock, wait);
     timer_mod(env->timer, next_ns);
+    if (unlikely(mips_mvp_debug > 0)) {
+        mips_mvp_note_timer(env, op, wait, now_ns, next_ns);
+    }
 }
 
 /* Expire the timer.  */
@@ -102,9 +113,15 @@ static void cpu_mips_timer_expire(CPUMIPSState *env)
 #endif
     cpu_mips_timer_update(env);
     if (env->insn_flags & ISA_MIPS_R2) {
-        env->CP0_Cause |= 1 << CP0Ca_TI;
+        /* Atomic: this runs on the iothread, the guest clears it from its
+         * own vCPU thread, and both touch the whole Cause word. */
+        qatomic_or(&env->CP0_Cause, 1 << CP0Ca_TI);
     }
     qemu_irq_raise(env->irq[(env->CP0_IntCtl >> CP0IntCtl_IPTI) & 0x7]);
+    if (unlikely(mips_mvp_debug > 0)) {
+        mips_mvp_note_timer(env, MIPS_CP0T_FIRE, 0,
+                            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), 0);
+    }
 }
 
 #ifdef CONFIG_PLUGIN
@@ -200,7 +217,7 @@ void cpu_mips_store_compare(CPUMIPSState *env, uint32_t value)
         cpu_mips_timer_update(env);
     }
     if (env->insn_flags & ISA_MIPS_R2) {
-        env->CP0_Cause &= ~(1 << CP0Ca_TI);
+        qatomic_and(&env->CP0_Cause, ~(1 << CP0Ca_TI));
     }
     qemu_irq_lower(env->irq[(env->CP0_IntCtl >> CP0IntCtl_IPTI) & 0x7]);
 }

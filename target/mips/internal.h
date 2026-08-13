@@ -159,6 +159,29 @@ struct CPUMIPSTLBContext {
 void sync_c0_status(CPUMIPSState *env, CPUMIPSState *cpu, int tc);
 void cpu_mips_store_status(CPUMIPSState *env, target_ulong val);
 void cpu_mips_store_cause(CPUMIPSState *env, target_ulong val);
+uint64_t mips_cause_cas_retries(void);
+
+/*
+ * Update a field of CP0_Cause without disturbing bits owned by another
+ * thread.  IP7..IP2 and TI are driven by the iothread (device lines, the CP0
+ * timer); every read-modify-write of the whole word from a vCPU is a chance
+ * to erase a pending interrupt that arrived in the window.  Exception entry
+ * writes BD/CE/EC on every single exception, so this is the hottest such
+ * window in the model.
+ */
+static inline void mips_cause_set_field(CPUMIPSState *env, uint32_t mask,
+                                        uint32_t val)
+{
+    uint32_t old, new;
+
+    do {
+        old = qatomic_read(&env->CP0_Cause);
+        new = (old & ~mask) | (val & mask);
+        if (new == old) {
+            return;
+        }
+    } while (qatomic_cmpxchg(&env->CP0_Cause, old, new) != old);
+}
 
 /*
  * MVPControl condition instrument.  MIPS MT defines MVPControl as one
@@ -199,11 +222,35 @@ enum {
     MIPS_MVP_WAKE_EVP,
     MIPS_MVP_WAKE_TC,
 };
+/*
+ * CP0 Count/Compare condition instrument, latched per VPE beside the
+ * run-state edges above and printed by the same report.
+ *
+ * A guest that stops making progress with every VPE idle in WAIT and no
+ * interrupt pending looks identical to a guest that is merely idle -- the
+ * architectural state is the same word for word, measured.  What tells them
+ * apart is not in the guest at all: it is where the HOST QEMUTimer that will
+ * deliver the next tick has been armed, relative to where the guest's own
+ * Compare asked for it.  cpu_mips_timer_update has two clamp arms that arm it
+ * somewhere else, so the last arming of each kind is latched here and the
+ * arms are counted, per VPE.
+ */
+enum {
+    MIPS_CP0T_ARM,          /* deadline programmed from Compare - Count     */
+    MIPS_CP0T_ARM_WRAP,     /* wait == 0     -> clamped to a 2^32 wrap      */
+    MIPS_CP0T_ARM_BEHIND,   /* wait past Count -> clamped to 2^24 (rescue)  */
+    MIPS_CP0T_FIRE,         /* expiry delivered: Cause.TI set, IP7 raised   */
+};
 extern int mips_mvp_debug;
 void mips_mvp_debug_init(void);
 void mips_mvp_note(CPUMIPSState *env, int op, uint32_t before, uint32_t after);
 void mips_mvp_note_gate(CPUMIPSState *env);
 void mips_mvp_note_run(CPUState *target, int op);
+void mips_mvp_note_timer(CPUMIPSState *env, int op, uint32_t wait,
+                         int64_t now_ns, int64_t deadline_ns);
+/* Architected Count as of an ALREADY-SAMPLED virtual time.  The instrument
+ * must report the same instant the arming used, not a second, later read. */
+uint32_t cpu_mips_get_count_val_raw(CPUMIPSState *env, int64_t now_ns);
 
 extern const VMStateDescription vmstate_mips_cpu;
 

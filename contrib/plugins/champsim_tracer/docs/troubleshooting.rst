@@ -584,11 +584,18 @@ Recognising the state, and the one test that discriminates
 
 Score a capture on whether **its segment closed**, never on how long the
 cell took.  A capture in this state prints ``starting segment 'marker'``
-and never the ``end marker — closing`` / ``finished segment … END`` pair:
-the workload's END marker executed on the correct path and the window did
-not act on it, so the window is still open when the run is stopped, and
-the cell's ``stats.log`` is empty because the close that writes it never
-ran.  Elapsed time does not discriminate.  Under host contention a
+and never the ``end marker — closing`` / ``finished segment … END`` pair,
+so the window is still open when the run is stopped and the cell's
+``stats.log`` is empty because the close that writes it never ran.  The
+window is open for want of an END, not for having ignored one: the END
+marker is a user-space instruction, and in this state the guest stops
+retiring user-space instructions before reaching it.  On the canonical
+cell that is measurable to the instruction — 40 of 40 closing cells end
+at a machine-wide user-instruction count of 7,058,329 to 7,058,585,
+because the END terminates the run where it is crossed, while the
+non-closing cell's user count stops at 7,045,897 and never moves again.
+The close machinery is therefore not the place to look; the reason the
+traced task never runs again is.  Elapsed time does not discriminate.  Under host contention a
 healthy cell can spend minutes inside the window and still close — cells
 that stalled for over two minutes and then finished normally sit in the
 same waves as the ones described here — while a capture in this state
@@ -596,17 +603,25 @@ closes never.
 
 On the canonical x86_64 marker cell the state has a constant shape:
 
-* the traced process's user-instruction stream stops inside the guest's
-  shutdown path at a point reproducible to within a few hundred
-  instructions across runs, about thirteen thousand user instructions
-  short of where a healthy cell reaches poweroff.  A guest merely starved
-  of host CPU stops wherever it happens to be; this one stops in the same
-  place every time;
+* the machine's user-instruction stream stops — not the traced process's
+  alone, every process's — at a point reproducible to within a few
+  hundred instructions across runs, about twelve and a half thousand user
+  instructions short of the END marker.  A guest merely starved of host
+  CPU stops wherever it happens to be; this one stops in the same place
+  every time;
 * the guest is neither idle nor stopped.  Kernel instructions keep
-  retiring at close to a million per guest-second inside the scheduler's
-  accounting band, guest time keeps advancing, and the LAPIC keeps
-  delivering timer interrupts at the guest's tick rate.  The scheduler
-  never picks the traced task again;
+  retiring, and fast: 113.7 million of them over the 8.6 guest-seconds
+  (160 host-seconds) that followed the last user instruction in the
+  measured cell, which is 13.2 M per guest-second and 0.71 M per
+  host-second.  Guest time keeps advancing and interrupts keep being
+  delivered — 5,239 async windows over those 8.6 guest-seconds, and 14.8%
+  of everything retired in them is interrupt context.  Sampled program
+  counters land in the CFS accounting band and nowhere else:
+  ``update_curr``, ``update_load_avg``, ``update_cfs_rq_load_avg``,
+  ``__update_load_avg_cfs_rq``, ``___update_load_sum``,
+  ``entity_eligible``, ``cpuacct_charge``, ``rb_add_augmented_cached``,
+  ``min_deadline_cb_propagate``.  The scheduler never picks a user task
+  again;
 * every wrong-path corruption instrument reads zero across the episode —
   device-register digests, the armed-deadline digests for all three
   clocks, the interrupt gain/loss counters.  Nothing is corrupted.

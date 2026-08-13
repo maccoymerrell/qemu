@@ -29,6 +29,8 @@ from . import _system as SYS
 from . import _full as FULL
 from . import _lldet as LLDET
 from . import _must0
+from . import _stall_condition as STALL
+from . import _plugin_load as PLUGLOAD
 
 
 ISA_CHOICES = ("x86_64", "aarch64", "riscv64", "mipsel")
@@ -446,6 +448,12 @@ def _parse_args() -> argparse.Namespace:
     # lldet_calibrate — remeasure the watchdog's healthy-throughput table.
     LLDET.add_parser(sub)
 
+    # stall_scan — replay the labelled corpus behind the stall gate.
+    STALL.add_parser(sub)
+
+    # plugin_load — the plugin links AND loads (RTLD_NOW), not just links.
+    PLUGLOAD.add_parser(sub)
+
     # mutation — adversarial strictness proof (see _mutation.py).
     from . import _mutation as MUT
     MUT.add_parser(sub)
@@ -764,15 +772,35 @@ def _run_and_log(cmd: list[str], log_path: Path) -> int:
     return rc
 
 
+def _stats_log_for(console_log: Path) -> Path:
+    """The plugin's stats sidecar for the cell whose console log is @console_log.
+
+    The two are siblings of one ``outfile`` base.  The report line the stall
+    gate reads is NOT in the console: ``qemu_plugin_outs`` goes through
+    qemu_log, whose fd is already closed by the time plugin_exit runs on a
+    guest-initiated exit, which is exactly why the plugin mirrors the report
+    to ``<outfile>.stats.log``."""
+    name = console_log.name
+    base = name[:-len(".console.log")] if name.endswith(".console.log") \
+        else console_log.stem
+    return console_log.with_name(f"{base}.stats.log")
+
+
 def _check_segment_coverage(console_log: Path, require_ok: bool = False,
-                            label: str = "", smp: int = 1) -> int:
+                            label: str = "", smp: int = 1,
+                            workload: str = "") -> int:
     """Assert the plugin's per-segment coverage line from the captured
     console log: ``finished segment [...] user_covered=C user_budget=B
     ... FLAG``.  UNDER means the window closed before its budget for a
     reason other than the end marker — always an error.  @require_ok
     additionally rejects END closes (the workload must have run past
     its budget, so kernel/excursion instructions charged to the user
-    clock would surface as covered != budget).  Returns 0 on pass."""
+    clock would surface as covered != budget).  Returns 0 on pass.
+
+    @workload names the cell's workload for the stall-condition leg, which
+    does not gate the shapes whose traced process is legitimately off-CPU
+    (see ``_stall_condition.OFF_CPU_WORKLOADS``); the label alone carries only
+    the ISA at most call sites."""
     try:
         text = console_log.read_text()
     except OSError:
@@ -841,6 +869,19 @@ def _check_segment_coverage(console_log: Path, require_ok: bool = False,
     for msg in SYS.assess_clock_progress(segs, label=label):
         print(f"clock: {msg}  FAIL")
         rc = 1
+    # Workload-progress stall condition (_stall_condition.py).  The ratio leg
+    # above is gated off below CLOCK_INFLATION_MIN_COVERED user instructions,
+    # where fixed per-segment cost dominates the ratio; this leg has no
+    # coverage floor because its score is normalised by the segment's own
+    # retired count, so it is what covers the sub-floor regime the ratio leg
+    # cannot judge -- and that regime is where the escaped x86 marker cells
+    # live (854-857 covered, ratios to 8197).
+    verdict = STALL.assess(_stats_log_for(console_log), label=label,
+                           workload=workload or label)
+    for line in verdict.lines:
+        print(line)
+    if not verdict.ok:
+        rc = 1
     return rc
 
 
@@ -857,6 +898,16 @@ def cmd_trace(args, isa: str | None = None) -> int:
     plugin = args.build_dir / "contrib" / "plugins" / "libchampsim_tracer.so"
     if not plugin.is_file():
         print(f"trace[{isa}]: FAIL  plugin not found: {plugin}")
+        return 1
+    # THE PLUGIN LINKS IS NOT THE PLUGIN LOADS.  Two commits on this branch
+    # ship an object with an undefined internal symbol; QEMU opens plugins
+    # RTLD_NOW, so they die at load and every cell downstream fails on some
+    # unrelated symptom.  Asserted here (memoised: tens of ms, once per
+    # build) so the failure names itself before anything is run.
+    load_ok, load_lines = PLUGLOAD.check_once(args.build_dir, label=isa)
+    for line in load_lines:
+        print(line)
+    if not load_ok:
         return 1
 
     out_base = _trace_base(args.out_dir, prog, isa)
@@ -1319,7 +1370,8 @@ def cmd_churn_test(args) -> int:
             rc_total = 1
 
         if _check_segment_coverage(console, require_ok=True, label=isa,
-                                   smp=getattr(args, "smp", 1)):
+                                   smp=getattr(args, "smp", 1),
+                                   workload="churn"):
             rc_total = 1
 
         stats_log = Path(f"{out_base}.stats.log")
@@ -1666,6 +1718,10 @@ def main() -> int:
         return FULL.cmd_full(args)
     if args.cmd == "lldet_calibrate":
         return LLDET.cmd_lldet_calibrate(args)
+    if args.cmd == "stall_scan":
+        return STALL.cmd_stall_scan(args)
+    if args.cmd == "plugin_load":
+        return PLUGLOAD.cmd_plugin_load(args)
     if args.cmd == "mutation":
         from . import _mutation as MUT
         return MUT.cmd_mutation(args)

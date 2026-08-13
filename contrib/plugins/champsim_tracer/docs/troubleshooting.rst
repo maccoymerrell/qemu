@@ -598,8 +598,11 @@ The close machinery is therefore not the place to look; the reason the
 traced task never runs again is.  Elapsed time does not discriminate.  Under host contention a
 healthy cell can spend minutes inside the window and still close — cells
 that stalled for over two minutes and then finished normally sit in the
-same waves as the ones described here — while a capture in this state
-closes never.
+same waves as the ones described here.  A capture held in this state to
+the end of the run closes never; one that comes out of it closes, and
+ships a trace carrying the episode (see
+:ref:`troubleshooting-escaped-stall`), so the close is where to start
+reading and not where to stop.
 
 On the canonical x86_64 marker cell the state has a constant shape:
 
@@ -625,6 +628,71 @@ On the canonical x86_64 marker cell the state has a constant shape:
 * every wrong-path corruption instrument reads zero across the episode —
   device-register digests, the armed-deadline digests for all three
   clocks, the interrupt gain/loss counters.  Nothing is corrupted.
+
+.. _troubleshooting-escaped-stall:
+
+The episode that ends, and the trace it leaves behind
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A capture that never closes is caught by whatever bounds the run.  The
+one that matters is the capture that spends a long stretch in this shape
+and then comes out of it: the guest reaches its END marker, the window
+closes, the ``.cst`` is assembled, and every content check passes.  What
+that trace carries is not what the workload did.
+
+The measurement is direct, because the shape is fixed: 1350 canonical
+x86_64 marker cells across five build arms all cover 854 to 857 user
+instructions, so the kernel work a capture carries is comparable cell to
+cell.  Over the 1325 that closed, the architectural instructions carried
+per instruction of user coverage read as follows.
+
+==================================== ==================== ================
+                                     arch insns / covered stall_fraction
+==================================== ==================== ================
+median of the 1325                                  168.5            0.165
+90th percentile                                     178.4            0.215
+15 cells                                    637 to 8,197   0.579 to 0.949
+==================================== ==================== ================
+
+The most extreme of those closed normally, exited zero, and shipped a
+trace holding 7,025,221 architectural instructions where the median cell
+of the identical workload holds 144,000 — 45 times the kernel work, for
+the same 857 user instructions.  The distribution between the two is
+continuous, and it continues without a break into the cells that were
+killed before they could close.  Where an outer bound happens to cut is
+therefore not where the condition begins, and *"the segment closed"* is a
+necessary reading, not a sufficient one.
+
+``stall_fraction`` above is what the validator gates on, and it is
+computed from the two architectural counts the tracer already prints:
+
+.. code-block:: text
+
+    stall_fraction = worst_user_stall / (insn_per_guest_s x guest_s)
+
+— the largest number of instructions the guest retired between two
+advances of the traced process's user clock, over the instructions it
+retired while the capture was open.  A reading of 0.949 says that
+ninety-five per cent of everything the machine retired inside the capture
+happened in one stretch during which the traced process did not execute a
+single instruction.  Nothing in it is a time, a rate or a cost, so it
+reads the same on an idle host and a saturated one.
+
+Two properties of the reading are worth keeping in mind when using it.
+It is a LOWER bound: ``worst_user_stall`` is sampled, and a stall is
+measured from the last sample before it began to the last before it
+ended, so the instrument can only under-report.  A reading over the gate
+is therefore a measurement; a reading under it only rules the condition
+out when the sampling was fine enough to have caught it, which is
+``stall_fraction + 2/samples <= gate``.  And it reads the TRACED
+PROCESS's user clock, so a workload whose marked process is legitimately
+off-CPU — the validator's churn cell, which runs a stream of short-lived
+processes beside the marked one — can read high while the machine is
+healthy.  Distinguishing those needs a count of user-mode instructions
+retired MACHINE-WIDE, which the tracer does not keep; where that count is
+available from a second instruction sampler the same episode is separated
+far more sharply, the 1325 closing cells reading 0.00079 to 0.00102 at
+the 90th percentile against 0.202 and up for every cell that was killed.
 
 Reproducing it, and why a zero needs its own power
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

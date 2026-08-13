@@ -278,6 +278,44 @@ Sub-commands
    merges, overshoots, or drops retired REP iterations fails them by
    design.
 
+``plugin_load``
+   Proves the built plugin can be **loaded**, not merely linked.  A
+   shared object may carry an unresolved symbol and still link;
+   whether that is fatal is decided at load, and QEMU opens plugins
+   with ``g_module_open(..., G_MODULE_BIND_LOCAL)``, which without
+   ``G_MODULE_BIND_LAZY`` is ``RTLD_NOW`` — every symbol resolves
+   before ``qemu_plugin_install`` is looked up.  A standalone
+   ``dlopen`` cannot stand in for this: the plugin's
+   ``qemu_plugin_*`` symbols come from the QEMU executable, so a
+   standalone load fails on a perfectly good object.  The check runs
+   a real QEMU from the build dir against the plugin — a system
+   target under ``-M none``, a user target with no guest binary,
+   both a fraction of a second and neither needing a guest image —
+   and reads the verdict from the output rather than the exit
+   status, which is nonzero either way.
+
+   Each probe first proves it can report the failure it is looking
+   for, by being run once against a plugin path that cannot exist.
+   A binary that stays silent for a plugin that is not there cannot
+   speak for one that does not resolve, and is discarded rather than
+   trusted; if none survives, the check fails, because a question
+   that could not be asked has not been answered.  ``cmd_trace``
+   asserts it once per build before running anything.
+
+``stall_scan``
+   Replays a labelled corpus of instruction-sampler trajectories
+   (``<cell>.sample.tsv`` + ``<cell>.status.txt``, optionally
+   ``<cell>.stats.log``) and re-proves the workload-progress stall
+   detector described in :ref:`troubleshooting-escaped-stall`.  It
+   scores every cell from architectural counts only, reports the
+   distribution over the cells that closed against the ones that did
+   not, exercises the shipped in-suite gate over the same cells'
+   ``stats.log``, and exits nonzero when the instrument misses a
+   known-wedged cell, flags more than a stated fraction of the rest,
+   fires on nothing at all, or cannot find a corpus.  It is the
+   detector's positive control: an instrument whose ability to fire
+   is unproven has no standing when it is silent.
+
 .. _validator-full:
 
 Unified runner (``full``)

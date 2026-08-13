@@ -458,7 +458,21 @@ def run_with_clock_watchdog(cmd: list[str], log_path,
     # escaped-wedge ratio, and until it is, this harness passes through only
     # what the operator set.  golden_net.py arms it for the canonical system
     # cells, where the calibration exists.
-    env = dict(os.environ)
+    # The plugin's diagnostic sampler, whose report the stall-condition gate
+    # reads, samples on a 250 ms host-time grid by default: one sample over a
+    # validator system segment, at which resolution the gate can certify
+    # nothing and would pass on a reading it never took.
+    #
+    # THAT THE CADENCE CANNOT REACH THE WIRE IS A STATIC FACT, not an A/B
+    # result: `sample_ns` in champsim_tracer.cc has exactly four references —
+    # its initialiser, the CST_RT_GATE_WINDOW_MS parse, the `if (dh <
+    # sample_ns) return;` that decides whether to record a diagnostic sample,
+    # and a printf in the realtime gate's abort text.  No tracing decision
+    # reads it.  (An A/B on the trace bytes could not have shown this anyway:
+    # two runs of this cell at the SAME cadence differ, so the cell is not
+    # byte-reproducible and a hash comparison proves nothing here.)
+    from . import _stall_condition as _STALL
+    env = _STALL.sampler_env()
     # Ptraceable child (prctl PR_SET_PTRACER_ANY, survives execve): under
     # yama ptrace_scope=1 the lldet verdict's `gdb -p` backtrace would
     # otherwise be refused.  Costs nothing when no verdict fires.

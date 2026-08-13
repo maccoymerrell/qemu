@@ -1258,7 +1258,22 @@ static target_ulong riscv_pmu_ctr_get_fixed_counters_val(CPURISCVState *env,
         if (icount_enabled()) {
                 curr_val = inst ? icount_get_raw() : icount_get();
         } else {
-            curr_val = cpu_get_host_ticks();
+            /*
+             * cpu_get_ticks(), not cpu_get_host_ticks(): both count host CPU
+             * cycles, but only the former is the VM's tick counter -- offset
+             * and gated on timers_state.cpu_ticks_enabled.  The raw host
+             * counter is nobody's clock.  It runs while the VM is stopped, so
+             * a `-S` pause or a monitor stop/cont makes the guest's mcycle
+             * jump by the pause; and it runs through the clock freeze a TCG
+             * plugin takes for instrumentation or for a speculative
+             * excursion, so cycle/instret advance while `time` (ACLINT mtime,
+             * a function of QEMU_CLOCK_VIRTUAL) stands still.  Those are two
+             * architectural counters the guest can read against each other,
+             * and RISC-V's own audit in riscv_spec_clock_resync asserts every
+             * RISC-V counter is a pure function of the virtual clock.  It was
+             * not: this one was a function of the host's.
+             */
+            curr_val = cpu_get_ticks();
         }
 
         goto done;

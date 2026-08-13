@@ -461,3 +461,89 @@ After any of the above, two scripts give you fast confidence:
 * ``champsim_tracer_mnemonic_audit.py`` walks a sample workload and
   reports any Capstone mnemonic with no ``insn_classification`` row,
   flagging silent ``GEN_OP_UNKNOWN`` regressions.
+
+Committing a change
+-------------------
+
+The tracer is developed in one shared working tree, and more than one
+session edits it at a time — each on its own files, each expecting its
+commit to carry those files and no others.  Stage by explicit path::
+
+    $ git add contrib/plugins/champsim_tracer/champsim_tracer_decode.cc \
+              contrib/plugins/champsim_tracer/docs/decoder.rst
+    $ git diff --cached --stat
+
+Read that ``--stat`` before every commit and confirm each path listed
+is one you edited; ``git restore --staged <path>`` takes back anything
+that is not yours.  Re-read the tip (``git rev-parse HEAD``) at the
+same moment, since a peer may have landed since you started.
+
+**Do not commit with** ``-a``.  ``git commit -a`` stages every tracked
+file that differs from ``HEAD``, which in a shared tree is your work
+plus whatever a concurrent session has half-finished, and it does so
+without printing what it took.
+
+What the sweep costs is the record rather than the code.  The message
+is the only durable description a diff ever gets, and a swept-in file
+falsifies two of them at once: the commit that ends up carrying the
+foreign hunks describes something else, so ``git log -S`` and
+``git blame`` answer a question about that code with a subject that
+has nothing to do with it, and the change those hunks belonged to
+lands with no commit describing it at all.  Neither is repairable
+afterwards — the message is part of the sha, and a sha other work has
+already built on cannot be amended or rebased away.  The corrections
+below exist because two commits are in that state.
+
+Where a subject does not describe its diff
+------------------------------------------
+
+Two commits carry substantially more than their subjects name.  Both
+are ancestors of later work and are permanent as written, so this
+section is where their contents are recorded: a ``git log -S`` or
+``git blame`` that lands on either sha is reconciled here rather than
+against the subject line.
+
+``25ad3052ea`` — *"a sweep close ends every context unstamped, and the
+oracle says so instead of failing"*.  The subject describes the
+thread-end ruling and its oracle, which the commit does contain:
+:doc:`format`'s thread-end paragraph naming the two sweep close
+routes, ``parse_close_reason`` and the sweep arm of
+``_check_thread_end_flags`` in the validator's ``validator.py``, and
+``deadlatch_test``'s retired tolerance in ``__main__.py``.  The
+message describes nothing else, and the commit also contains four
+unrelated bodies of work:
+
+* the ``exec_lock`` acquisition bracket in ``champsim_tracer.cc`` and
+  the matching extension of ``champsim_tracer_delay.{cc,h}`` — the
+  delay instrument's lock-wait term, whose introducing commit
+  ``git log -S cst_delay_lock_wait_begin`` reports as this one;
+* the sidecar-resolution rework in ``tools/cst_audit_main.cc``, which
+  enumerates the four ``outfile=`` spellings and makes a stats log it
+  cannot find a failure instead of a green ``NOT CHECKED``, together
+  with the :doc:`decoder` section that documents it;
+* the guest-time-transparency rewording in :doc:`architecture` and
+  :doc:`qemu_modifications`, which restates the tick-storm outcome as
+  what those layers exclude rather than a hazard that survives them;
+* the wrong-path cost and time-transparency material in
+  :doc:`limitations`, including the ``wp-time-transparency`` anchor.
+
+``c7cdf3eddf`` — *"the extent a close publishes for a peer is sampled
+while the capture still records"*.  The subject describes the
+close-time extent snapshot, which the commit does contain:
+``retired_close_extent_arm`` / ``_disarm``, the in-flight arm of
+``retired_executed_of``, the sample taken as ``finish_trace_segment``'s
+first statement, the drift census in ``smp_close_peer_extent_note``,
+and the two ``Stats`` rows and report lines that carry it.  The commit
+additionally introduces the *caller* of the exit-syscall seal: the
+``close_seal_at_terminator`` declaration in
+``champsim_tracer_path_builder.h`` and its call in
+``PathBuilder::flush_final``, where it suppresses the stop rule's
+tail-instruction drop.  That function's definition and the reasoning
+behind it arrive one commit later, in ``c6ca18a0d8`` (*"a block whose
+terminator ran does not owe the wire a dispatch"*), so ``git blame``
+on the call site answers ``c7cdf3eddf`` while the change that explains
+the seal is ``c6ca18a0d8``.  The same commit also removes the
+``last_emit_fault_depth`` mirror and collapses ``CstDepthSrc`` to the
+provenance values that still exist — write-only leftovers of the
+close-walk decomposition that had already deleted
+``flush_frame_unwound`` — which the message likewise does not mention.

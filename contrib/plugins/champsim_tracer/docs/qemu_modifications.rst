@@ -724,6 +724,34 @@ for a guest that stops progressing on a build that has them.
    deferred expiry has to be re-delivered, not as the gate on whether
    to reconcile.
 
+   On x86 the first obligation is met by a *lock*, not by a
+   recomputation, and the lock is one-directional.  The guest TSC is
+   the only architectural counter on any of the four targets that is
+   not already a function of ``QEMU_CLOCK_VIRTUAL``: it is derived
+   from the host cycle counter, while the LAPIC timer, HPET, PIT and
+   ACPI PM are derived from host ``CLOCK_MONOTONIC``.
+   ``x86_spec_clock_resync`` re-pins the first to the second at every
+   thaw, along a line anchored once (``cpu_plugin_tsc_anchor``) and
+   sloped by the self-calibrated host TSC frequency.  Because x86
+   requires the TSC to be monotonic, ``cpu_plugin_pin_tsc`` may raise
+   the guest TSC to that line and may never lower it, so the pin can
+   add agreement between the pair but cannot remove disagreement.
+
+   The separation that survives is measured rather than assumed.
+   ``CST_TSCLOCK`` reports it at the one place both halves are read at
+   a single instant under the clock's own seqlock; ``CST_NOPIN``
+   measures the same pair with the offset write skipped, so a quiet
+   reading is distinguishable from a stuck instrument.  On the
+   x86_64 system-mode marker shape, one guest per physical core with a
+   contention hog on that core's other SMT thread, the guest TSC sits
+   above its line for essentially every pin, and the separation
+   reaches roughly a millisecond at the median cell and low tens of
+   milliseconds at the tail of a twenty-second run, growing with host
+   contention and bounded by nothing in time.  Whether that separation
+   is large enough to matter to a particular guest is a property of
+   that guest's timekeeping: Linux's clocksource watchdog compares the
+   two over half-second windows and objects past 62.5 ms.
+
 A device timer may not re-arm itself at the current time
 (``gic_vptimer_update``, ``hw/timer/mips_gictimer.c``)
 

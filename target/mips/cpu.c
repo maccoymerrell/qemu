@@ -110,6 +110,25 @@ static void mips_cpu_dump_state(CPUState *cs, FILE *f, int flags)
                  env->CP0_Config2, env->CP0_Config3);
     qemu_fprintf(f, "    Config4 0x%08x Config5 0x%08x\n",
                  env->CP0_Config4, env->CP0_Config5);
+#if !defined(CONFIG_USER_ONLY)
+    /*
+     * On an MT processor the run/halt state of a VPE is decided by state
+     * that none of the above shows: MVPControl.EVP gates every VPE of the
+     * processor at once (mips_cpu_has_work()), and TCStatus.A / TCHalt gate
+     * the thread context.  A dump taken to explain why a vCPU is not
+     * running has to be able to name them.
+     */
+    if (ase_mt_available(env)) {
+        qemu_fprintf(f, "    MVPControl 0x%08x MVPConf0 0x%08x "
+                     "VPEConf0 0x%08x\n",
+                     env->mvp->CP0_MVPControl, env->mvp->CP0_MVPConf0,
+                     env->CP0_VPEConf0);
+        qemu_fprintf(f, "    TCStatus 0x%08x TCHalt 0x" TARGET_FMT_lx
+                     " VPEControl 0x%08x\n",
+                     env->active_tc.CP0_TCStatus, env->active_tc.CP0_TCHalt,
+                     env->CP0_VPEControl);
+    }
+#endif
     if ((flags & CPU_DUMP_FPU) && (env->hflags & MIPS_HFLAG_FPU)) {
         fpu_dump_state(env, f, flags);
     }
@@ -165,6 +184,15 @@ static bool mips_cpu_has_work(CPUState *cs)
         }
 
         if (!mips_vpe_active(env)) {
+            /*
+             * Condition instrument: this vCPU is runnable by every
+             * architectural rule and is being held off the run queue by the
+             * processor-wide EVP gate alone.  Reported once per vCPU, and
+             * only when EVP -- not VPA -- is what closed the gate.
+             */
+            if (unlikely(mips_mvp_debug > 0)) {
+                mips_mvp_note_gate(env);
+            }
             has_work = false;
         }
     }
@@ -490,6 +518,9 @@ static void mips_cpu_realizefn(DeviceState *dev, Error **errp)
 #endif
     fpu_init(env, env->cpu_model);
     mvp_init(env);
+#if !defined(CONFIG_USER_ONLY)
+    mips_mvp_debug_init();
+#endif
 
     cpu_reset(cs);
     qemu_init_vcpu(cs);

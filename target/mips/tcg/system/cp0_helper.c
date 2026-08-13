@@ -588,6 +588,8 @@ void helper_mtc0_mvpcontrol(CPUMIPSState *env, target_ulong arg1)
 
     /* TODO: Enable/disable shared TLB, enable/disable VPEs. */
 
+    mips_mvp_note(env, mask ? MIPS_MVP_MTC0_WR : MIPS_MVP_MTC0_NA,
+                  env->mvp->CP0_MVPControl, newval);
     env->mvp->CP0_MVPControl = newval;
 }
 
@@ -1912,14 +1914,20 @@ target_ulong helper_dvpe(CPUMIPSState *env)
     prev = env->mvp->CP0_MVPControl;
 
     if (env->CP0_VPEConf0 & (1 << CP0VPEC0_MVP)) {
+        mips_mvp_note(env, MIPS_MVP_DVPE_RD, prev, prev);
         CPU_FOREACH(other_cs) {
             MIPSCPU *other_cpu = MIPS_CPU(other_cs);
             /* Turn off all VPEs except the one executing the dvpe.  */
             if (&other_cpu->env != env) {
+                uint32_t before = other_cpu->env.mvp->CP0_MVPControl;
                 other_cpu->env.mvp->CP0_MVPControl &= ~(1 << CP0MVPCo_EVP);
+                mips_mvp_note(env, MIPS_MVP_DVPE_WR, before,
+                              other_cpu->env.mvp->CP0_MVPControl);
                 mips_vpe_sleep(other_cpu);
             }
         }
+    } else {
+        mips_mvp_note(env, MIPS_MVP_DVPE_NA, prev, prev);
     }
     return prev;
 }
@@ -1938,6 +1946,7 @@ target_ulong helper_evpe(CPUMIPSState *env)
     prev = env->mvp->CP0_MVPControl;
 
     if (env->CP0_VPEConf0 & (1 << CP0VPEC0_MVP)) {
+        mips_mvp_note(env, MIPS_MVP_EVPE_RD, prev, prev);
         CPU_FOREACH(other_cs) {
             MIPSCPU *other_cpu = MIPS_CPU(other_cs);
 
@@ -1945,10 +1954,15 @@ target_ulong helper_evpe(CPUMIPSState *env)
                 /* If the VPE is WFI, don't disturb its sleep.  */
                 && !mips_vpe_is_wfi(other_cpu)) {
                 /* Enable the VPE.  */
+                uint32_t before = other_cpu->env.mvp->CP0_MVPControl;
                 other_cpu->env.mvp->CP0_MVPControl |= (1 << CP0MVPCo_EVP);
+                mips_mvp_note(env, MIPS_MVP_EVPE_WR, before,
+                              other_cpu->env.mvp->CP0_MVPControl);
                 mips_vpe_wake(other_cpu); /* And wake it up.  */
             }
         }
+    } else {
+        mips_mvp_note(env, MIPS_MVP_EVPE_NA, prev, prev);
     }
     return prev;
 }

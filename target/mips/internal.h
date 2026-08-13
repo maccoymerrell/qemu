@@ -160,6 +160,35 @@ void sync_c0_status(CPUMIPSState *env, CPUMIPSState *cpu, int tc);
 void cpu_mips_store_status(CPUMIPSState *env, target_ulong val);
 void cpu_mips_store_cause(CPUMIPSState *env, target_ulong val);
 
+/*
+ * MVPControl condition instrument.  MIPS MT defines MVPControl as one
+ * register per processor, shared by every VPE of that processor, and the
+ * guest's dvpe()/evpe(prev) nesting protocol restores EVP only when the
+ * dvpe that opened the section observed EVP already set.  A VPE left with
+ * EVP clear fails mips_vpe_active() and mips_cpu_has_work() then forces
+ * has_work false, so it never leaves WAIT again.
+ *
+ * The instrument records every read and every write of the shared word,
+ * tracks how many VPEs currently owe an evpe restore, and names the
+ * strand structurally: EVP clear with no outstanding restorer is a
+ * processor that no future evpe can re-enable.  It is off unless
+ * MIPS_MVP_DEBUG is set in the environment.  See target/mips/system/cp0.c.
+ */
+enum {
+    MIPS_MVP_DVPE_RD,   /* dvpe on a VPE that owns MVP: opens a section  */
+    MIPS_MVP_DVPE_WR,
+    MIPS_MVP_EVPE_RD,   /* evpe on a VPE that owns MVP: closes it        */
+    MIPS_MVP_EVPE_WR,
+    MIPS_MVP_DVPE_NA,   /* dvpe/evpe on a VPE without MVP: architecturally */
+    MIPS_MVP_EVPE_NA,   /* a no-op, recorded because the guest still ran it */
+    MIPS_MVP_MTC0_WR,
+    MIPS_MVP_MTC0_NA,
+};
+extern int mips_mvp_debug;
+void mips_mvp_debug_init(void);
+void mips_mvp_note(CPUMIPSState *env, int op, uint32_t before, uint32_t after);
+void mips_mvp_note_gate(CPUMIPSState *env);
+
 extern const VMStateDescription vmstate_mips_cpu;
 
 static inline bool cpu_mips_hw_interrupts_enabled(CPUMIPSState *env)

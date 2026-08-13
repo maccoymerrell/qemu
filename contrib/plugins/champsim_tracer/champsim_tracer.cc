@@ -2852,8 +2852,26 @@ struct VcpuDeferredClose {
     bool icount_shutdown_pending = false;
     bool simpoint_close_pending = false;
     bool window_close_armed = false;
+    /* The END marker fired on this vCPU and the capture is running out
+     * the marker's own true BB before it closes (see
+     * marker_close_and_exit).  Unlike the two above this needs no second
+     * armed step: the marker's block has already executed when the arm is
+     * raised, so the first boundary the arm survives to IS the end of the
+     * END-marker BB, and one step more would put a block PAST the END on
+     * the wire. */
+    bool end_close_pending = false;
 };
 static VcpuDeferredClose g_deferred_close[CST_PIN_MAX_VCPUS];
+
+/*
+ * Has an END marker already claimed the close?  The arm above is per-vCPU
+ * because the block it runs out is on the marker's own vCPU; this is the
+ * process-wide "the END has been seen" latch, and it is what makes the
+ * close non-re-entrant — a second END sequence, or the same one re-reached
+ * through the unowned-END path, finds the stop already owned and adds
+ * nothing.  Read outside exec_lock by the marker fence diagnostics.
+ */
+static std::atomic<bool> g_end_close_claimed{false};
 
 static VcpuDeferredClose &deferred_close(unsigned int cpu_index)
 {
@@ -3800,8 +3818,12 @@ static void reset_segment_local_state(unsigned int cpu_index)
     pending_reg_snaps(cpu_index).clear();
     cp_chain_snap_mark(cpu_index) = 0;
     /* A fresh window is never mid-close (the arm self-clears the moment
-     * neither close is pending, so this is belt-and-braces). */
+     * no close is pending, so this is belt-and-braces).  The END arm is
+     * cleared with it: an END terminates the run, so a segment opening
+     * after one is not a state this can reach — and if it ever were, the
+     * new window would inherit a close it never earned. */
     deferred_close(cpu_index).window_close_armed = false;
+    deferred_close(cpu_index).end_close_pending = false;
 
     /* Per-segment disk-I/O record state: request ids are compact and
      * monotonic WITHIN a segment, so the counter, the pending queues,
@@ -7562,19 +7584,32 @@ void emit_finalized_bb(BodyStreamState *out_stream,
  * hooks have covered insn[0..S-2], so the range still owed is
  * [S-1, ran-1] — a single instruction when the tail retired, and empty
  * when it was abandoned mid-flight and will be re-executed.
+ *
+ * @at_close marks the ONE caller that is the segment's own closing flush
+ * (close_seal_at_terminator) rather than a dispatch, and two things follow
+ * from it.  The active-segment test below belongs to the dispatch-time
+ * callers — it keeps the hot path from capturing outside a window — and
+ * the close runs with that flag already cleared
+ * (TraceSegmentManager::finish drops it before it calls the flush hook),
+ * so a close that went through it would capture nothing and hand the emit
+ * a short register slice, which the emit then discards WHOLE.  And there
+ * is no successor to put in the terminating branch's REG_IP dst, nor any
+ * goto_tb staleness to repair: a block that left TCG through an exception
+ * synced its PC on the way out, so the live read is the value.
  */
 static void snap_prev_tail_dsts(unsigned int cpu_index,
                                 const BBTemplate *tmpl,
                                 uint64_t current_pc,
                                 uint32_t ran,
-                                bool aborted_tail)
+                                bool aborted_tail,
+                                bool at_close = false)
 {
     if (aborted_tail || ran == 0) {
         return;
     }
     if (g_features.reg_data && tmpl->insn_reg_names &&
         tmpl->n_insns > 0 &&
-        g_trace_segments.is_active_atomic()) {
+        (at_close || g_trace_segments.is_active_atomic())) {
         /* Capture the tail insn(s) whose dsts the per-insn hooks could
          * not reach.  Templates are in true execution order, so the
          * last insn is the delay slot on a delay-slot tail
@@ -7602,7 +7637,7 @@ static void snap_prev_tail_dsts(unsigned int cpu_index,
                 RegSnap s;
                 g_reg_snaps.read_into_snap(
                     cpu_index, nl->dst_qemu_reg_keys[i], &s);
-                if (fl->dst_regs[i] == REG_IP) {
+                if (!at_close && fl->dst_regs[i] == REG_IP) {
                     /* The BB-terminating branch's PC dst.  Correct-path
                      * TBs chain via goto_tb, which SKIPS the env->eip
                      * write at the boundary, so the live read is stale
@@ -7621,6 +7656,70 @@ static void snap_prev_tail_dsts(unsigned int cpu_index,
         }
         capture_tail(last);           /* delay slot, or branch on non-delay ISAs */
     }
+}
+
+/*
+ * THE TERMINATOR IS THE SEAL POINT, NOT THE NEXT DISPATCH.
+ *
+ * A close finds the pending-seal slot holding a block no later dispatch
+ * ever measured, and the flush's stop rule then drops its last instruction:
+ * that instruction's dst snaps are taken by its SUCCESSOR's pre-exec
+ * callback, and no successor began.  For a block the guest merely stopped
+ * inside, dropping it is right — the instruction is not architecturally
+ * past.  For a block that ran to its own TERMINATOR it is not: a syscall IS
+ * a block terminator, so the exit syscall's block is complete the moment
+ * the syscall retires, and waiting for a dispatch that can never come cut
+ * every user-mode run's last block one instruction short of the syscall
+ * that ended the program (measured: the unsealed-at-close ledger read peak
+ * 1, route EXIT, `mov %edx,%eax` at 0x4112c9 with `syscall` missing).
+ *
+ * So ask the architectural question instead.  Returns true — and captures
+ * the terminator's own dst snaps, so the block's register slice is whole —
+ * when all four hold:
+ *
+ *   - every instruction of the slot's fragment chain retired (@executed
+ *     covers the chain), so the terminator is not still in flight;
+ *   - the chain's last fragment ends at a terminating branch
+ *     (TB_TERMINUS_COMPLETE — a bare branch still owes its delay slot, a
+ *     NONE tail still owes the rest of its true BB);
+ *   - @head is this vCPU's CURRENT dispatch, which together with the
+ *     first condition places the vCPU at the end of that TB.  Its next
+ *     dispatch enters vcpu_tb_exec and blocks on the exec_lock this close
+ *     holds, so the registers cannot move under the read;
+ *   - the caller is on the direct-cursor path, i.e. no later dispatch
+ *     stashed an extent — one that did also took the tail snaps, and this
+ *     would duplicate them.
+ *
+ * The live read is the terminator's post-exec state for the same reason
+ * the dispatch-time capture's is: nothing has executed since.  It is taken
+ * with @at_close set, which both lets the capture past the active-segment
+ * guard the closing flush has already cleared and leaves the terminating
+ * branch's REG_IP dst on its live read — there is no successor PC to
+ * substitute, and the exception that ended the block synced the PC.
+ */
+bool close_seal_at_terminator(unsigned int cpu_index,
+                              const BBTemplate *head,
+                              uint64_t executed)
+{
+    const BBTemplate *last = nullptr;
+    uint64_t total = 0;
+    for (const BBTemplate *f = head; f; f = f->next_tb_fragment) {
+        total += f->n_insns;
+        last = f;
+    }
+    if (!last || total == 0 || executed != total) {
+        return false;
+    }
+    if (last->terminus != (uint8_t)TB_TERMINUS_COMPLETE) {
+        return false;
+    }
+    if (!retired_is_in_flight(cpu_index, head)) {
+        return false;
+    }
+    snap_prev_tail_dsts(cpu_index, last, /* current_pc= */ 0,
+                        last->n_insns, /* aborted_tail= */ false,
+                        /* at_close= */ true);
+    return true;
 }
 
 /*
@@ -8594,9 +8693,16 @@ static inline bool close_diag(void)
  */
 bool deferred_close_take_pending(unsigned int cpu_index)
 {
-    if (!((deferred_close(cpu_index).icount_shutdown_pending ||
-           deferred_close(cpu_index).simpoint_close_pending) &&
-          deferred_close(cpu_index).window_close_armed &&
+    /* The END arm has no second armed step (see VcpuDeferredClose): its
+     * take fires at the first boundary the arm survives to, and the seal's
+     * own empty-chain / fan-out tests are that boundary, so asking for
+     * `armed` here would suppress the stamp on the one step the take
+     * actually happens. */
+    const bool end_pend = deferred_close(cpu_index).end_close_pending;
+    if (!((end_pend ||
+           ((deferred_close(cpu_index).icount_shutdown_pending ||
+             deferred_close(cpu_index).simpoint_close_pending) &&
+            deferred_close(cpu_index).window_close_armed)) &&
           g_trace_segments.is_active())) {
         return false;
     }
@@ -8619,7 +8725,9 @@ bool deferred_close_take_pending(unsigned int cpu_index)
 static void run_deferred_window_closes(PathBuilder &pb, unsigned int cpu_index,
                                        const BBTemplate *cur_tb_tmpl)
 {
-    if (!deferred_close(cpu_index).icount_shutdown_pending && !deferred_close(cpu_index).simpoint_close_pending) {
+    if (!deferred_close(cpu_index).icount_shutdown_pending &&
+        !deferred_close(cpu_index).simpoint_close_pending &&
+        !deferred_close(cpu_index).end_close_pending) {
         deferred_close(cpu_index).window_close_armed = false;
         return;
     }
@@ -8732,6 +8840,36 @@ static void run_deferred_window_closes(PathBuilder &pb, unsigned int cpu_index,
         g_stats.window_close_fanout_hold_capped++;
     }
     held_steps = 0;
+    /*
+     * END-MARKER TAKE.  Both gates above have passed, so this step's tail
+     * is a true-BB boundary with no fan-out instruction in flight — and
+     * because the arm was raised from inside the marker instruction's own
+     * execution, the nearest such boundary is the end of the END-marker's
+     * own block.  The seal that just ran emitted it whole.
+     *
+     * FIRST, and without the second armed step the budget close takes.
+     * First, because an END outranks every other stop: a budget crossing
+     * that armed on the same step must not close the window a route ahead
+     * of the one the workload chose.  Without the extra step, because the
+     * arm is raised AFTER the marker's block executed rather than before —
+     * the budget close waits a step for the crossing TB to run, and here
+     * that step has already happened, so one more would put a block PAST
+     * the END marker on the wire.
+     */
+    if (deferred_close(cpu_index).end_close_pending) {
+        deferred_close(cpu_index).end_close_pending = false;
+        deferred_close(cpu_index).window_close_armed = false;
+        if (!pb.seal_stamped_thread_end()) {
+            /* Same accounting as the icount take: this close emits nothing
+             * for the closing context, so the seal owned the THREAD_END
+             * stamp and did not take it.  Named, never silent. */
+            g_stats.close_thread_end_missed++;
+        }
+        finish_trace_segment(/* prev_executed= */ false, cpu_index);
+        g_trace_segments.set_shutting_down();
+        g_rec_mutex_unlock(&exec_lock);
+        exit(0);
+    }
     if (!deferred_close(cpu_index).window_close_armed) {
         deferred_close(cpu_index).window_close_armed = true;
         return;
@@ -8782,6 +8920,24 @@ static void run_deferred_window_closes(PathBuilder &pb, unsigned int cpu_index,
             g_stats.close_thread_end_missed++;   /* see the icount take */
         }
         finish_trace_segment(/* prev_executed= */ false, cpu_index);
+        if (g_end_close_claimed.load(std::memory_order_relaxed)) {
+            /*
+             * AN END OUTRANKS THE SCHEDULE, WHICHEVER vCPU CLOSES.
+             *
+             * The END take above cannot be beaten on the marker's own
+             * vCPU — it is tested first and needs no second armed step —
+             * but on an SMP guest a PEER's budget crossing can reach its
+             * take between the END's arm and the END's own boundary.  The
+             * simpoint close is the one route here that would survive it,
+             * advancing to the next cluster on a workload that has
+             * already ended, so a claimed END terminates the run instead
+             * (see marker_close_and_exit: the ruling is about the END,
+             * not about which vCPU happened to close).
+             */
+            g_trace_segments.set_shutting_down();
+            g_rec_mutex_unlock(&exec_lock);
+            exit(0);
+        }
         g_simpoints.advance();
         deferred_close(cpu_index).simpoint_close_pending = false;
         pb.clear_prev();
@@ -10865,13 +11021,51 @@ static void marker_open_trace_window(unsigned int cpu_index, uint64_t asid,
 }
 
 /* All-windows-closed stop shared by the END-marker paths.  The caller holds
- * exec_lock; when a segment is live this latches the end-marker close, closes
- * it, and exit(0)s (never returns); otherwise it releases exec_lock and
- * returns.  @last_window selects the multi-process "(last window)" diagnostic
+ * exec_lock; when a segment is live this CLAIMS the close for the END marker
+ * and arms it to run at the end of the marker's own true BB, then releases
+ * exec_lock and returns; the pinned-simpoint positioning arm still exits
+ * here.  @last_window selects the multi-process "(last window)" diagnostic
  * over the legacy single-pin one. */
 static void marker_close_and_exit(bool last_window, unsigned int cpu_index)
 {
     if (g_trace_segments.is_active() && !g_trace_segments.is_shutting_down()) {
+        /*
+         * THE END MARKER CLOSES AT A BLOCK BOUNDARY, NOT MID-BLOCK.
+         *
+         * This runs from inside the marker instruction's own execution
+         * callback, so the block the marker sits in has not finished: the
+         * TB is in the pending-seal slot with its later instructions still
+         * to run, its memory callbacks unfired and its dst registers
+         * unsnapped.  Closing here published that block sealed at whatever
+         * had retired — one instruction on x86_64, four on the ISAs whose
+         * marker sequence is four instructions long — and the
+         * unsealed-at-close ledger read exactly that: peak 1, route END,
+         * the first instruction of the END sequence.
+         *
+         * Blocks are always closed out where it is in our power, and here
+         * it is: raise the arm and let the guest run out the marker's own
+         * true BB.  The close then runs from run_deferred_window_closes at
+         * the first step tail with no in-flight chain — the BB's own
+         * boundary — by which time the ordinary seal walk has already
+         * emitted the whole block with its memops, its register deltas and
+         * its resolved terminal branch, exactly like every other entry.
+         * Where the BB spans several TBs (a page split) or ends in a
+         * mid-TB branch, "no in-flight chain" is still the same boundary:
+         * the chain assembler is what decides it, not the TB edge.
+         *
+         * END-ALWAYS-WINS IS UNTOUCHED.  g_seg_end_marker_close is
+         * latched HERE, at the marker, so the route this run closes by is
+         * decided the moment the END executes and every close from now on
+         * reports END; the arm below is only where in the instruction
+         * stream that close lands.  The claim latch makes it
+         * non-re-entrant: a second END sequence, or the same one arriving
+         * again through the unowned-END path, finds the stop already owned
+         * and adds nothing.
+         */
+        if (g_end_close_claimed.exchange(true, std::memory_order_relaxed)) {
+            g_rec_mutex_unlock(&exec_lock);
+            return;
+        }
         if (last_window) {
             fprintf(stderr,
                     "champsim_tracer: end marker — closing after %" PRIu64
@@ -10881,10 +11075,9 @@ static void marker_close_and_exit(bool last_window, unsigned int cpu_index)
                     PRIu64 " user insns\n", g_user_icount);
         }
         g_seg_end_marker_close = true;
-        finish_trace_segment(/* prev_executed= */ true, cpu_index);
-        g_trace_segments.set_shutting_down();
+        deferred_close(cpu_index).end_close_pending = true;
         g_rec_mutex_unlock(&exec_lock);
-        exit(0);
+        return;
     }
     /*
      * END with NO window open.  In a pinned-simpoint run this is the
@@ -11412,21 +11605,35 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
          * correct path in an address space this trace owns.  Anything that
          * returned before this point without closing is counted at the
          * call site (see marker_end_no_close). */
-        uint64_t raw = asid;
-        auto oit = g_owned_info.find(pid);
-        if (oit != g_owned_info.end()) {
-            raw = oit->second.raw_asid;
-            g_owned_info.erase(oit);
-        }
-        g_owned.erase(pid);
-        g_owned_last_sched.erase(pid);
-        g_owned_last_sched_insns.erase(pid);
-        if (cpu_index < CST_PIN_MAX_VCPUS) {
-            g_pin_vcpu[cpu_index].pid.store(0, std::memory_order_relaxed);
-            g_pin_vcpu[cpu_index].confirmed.store(false,
+        /*
+         * THE LAST WINDOW KEEPS ITS OWNERSHIP UNTIL THE CLOSE TAKES.
+         *
+         * Dropping the ending space from the owned set is how a
+         * multi-process capture stops tracing one participant while the
+         * others run on — but when this END is the last window, the close
+         * it raises now runs at the end of the marker's own block
+         * (marker_close_and_exit), and the tracer has to still own the
+         * address space to get there: an unowned dispatch is a foreign
+         * span, which mutes capture, sets the deferred prev aside and
+         * would leave the very block this close exists to finish
+         * unemitted.  So the last window's bookkeeping is left standing
+         * and the segment close tears it down.
+         */
+        if (g_owned.size() > 1) {
+            uint64_t raw = asid;
+            auto oit = g_owned_info.find(pid);
+            if (oit != g_owned_info.end()) {
+                raw = oit->second.raw_asid;
+                g_owned_info.erase(oit);
+            }
+            g_owned.erase(pid);
+            g_owned_last_sched.erase(pid);
+            g_owned_last_sched_insns.erase(pid);
+            if (cpu_index < CST_PIN_MAX_VCPUS) {
+                g_pin_vcpu[cpu_index].pid.store(0, std::memory_order_relaxed);
+                g_pin_vcpu[cpu_index].confirmed.store(false,
                                                   std::memory_order_relaxed);
-        }
-        if (!g_owned.empty()) {
+            }
             /* Other windows remain open — do NOT close the segment.  Drop
              * only this space: recompute the emitting vCPU's gates/flag so
              * its TBs stop being owned; other vCPUs that were running it
@@ -11465,8 +11672,9 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
             g_rec_mutex_unlock(&exec_lock);
             return;
         }
-        /* Last window closed: all-windows-closed stop (peer of the
-         * icount/budget stop — whichever fires first wins). */
+        /* The last window: all-windows-closed stop (peer of the
+         * icount/budget stop — whichever fires first wins).  Its owned-set
+         * entry stands until the close takes; see the note above. */
         marker_close_and_exit(/* last_window= */ true, cpu_index);
         return;
     }

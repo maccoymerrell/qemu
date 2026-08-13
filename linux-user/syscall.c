@@ -6701,7 +6701,8 @@ typedef struct {
     pthread_mutex_t mutex;
     pthread_cond_t cond;
     pthread_t thread;
-    uint32_t tid;
+    uint32_t tid;         /* host tid */
+    uint32_t guest_tid;   /* name in the pinned identity space (see -pid) */
     abi_ulong child_tidptr;
     abi_ulong parent_tidptr;
     sigset_t sigmask;
@@ -6722,10 +6723,14 @@ static void *clone_func(void *arg)
     ts = get_task_state(cpu);
     info->tid = sys_gettid();
     task_settid(ts);
+    /* The tid the GUEST is told is the one it can name again later, so it is
+     * the pinned-space name whenever -pid is in use (an identity map
+     * otherwise).  task_settid above has already registered this thread. */
+    info->guest_tid = vpid_from_host(info->tid);
     if (info->child_tidptr)
-        put_user_u32(info->tid, info->child_tidptr);
+        put_user_u32(info->guest_tid, info->child_tidptr);
     if (info->parent_tidptr)
-        put_user_u32(info->tid, info->parent_tidptr);
+        put_user_u32(info->guest_tid, info->parent_tidptr);
     qemu_guest_random_seed_thread_part2(cpu->random_seed);
     /* Enable signals.  */
     sigprocmask(SIG_SETMASK, &info->sigmask, NULL);
@@ -6870,7 +6875,7 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
         if (ret == 0) {
             /* Wait for the child to initialize.  */
             pthread_cond_wait(&info.cond, &info.mutex);
-            ret = info.tid;
+            ret = info.guest_tid;
         } else {
             ret = -1;
         }
@@ -6882,6 +6887,13 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
         /* if no CLONE_VM, we consider it is a fork */
         if (flags & CLONE_INVALID_FORK_FLAGS) {
             return -TARGET_EINVAL;
+        }
+
+        /* A second process leaves the space -pid can name deterministically;
+         * refuse rather than pin the parent and leave the child on
+         * host-allocated numbers. */
+        if (qemu_vpid_base) {
+            vpid_refuse_new_process("fork");
         }
 
         /* We can't support custom termination signals */
@@ -6917,9 +6929,9 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
                mapping.  We can't repeat the spinlock hack used above because
                the child process gets its own copy of the lock.  */
             if (flags & CLONE_CHILD_SETTID)
-                put_user_u32(sys_gettid(), child_tidptr);
+                put_user_u32(vpid_self(), child_tidptr);
             if (flags & CLONE_PARENT_SETTID)
-                put_user_u32(sys_gettid(), parent_tidptr);
+                put_user_u32(vpid_self(), parent_tidptr);
             ts = get_task_state(cpu);
             if (flags & CLONE_SETTLS)
                 cpu_set_tls (env, newtls);
@@ -8412,7 +8424,7 @@ static int open_self_stat(CPUArchState *cpu_env, int fd)
     for (i = 0; i < 44; i++) {
         if (i == 0) {
             /* pid */
-            g_string_printf(buf, FMT_pid " ", getpid());
+            g_string_printf(buf, FMT_pid " ", vpid_tgid());
         } else if (i == 1) {
             /* app name */
             gchar *bin = g_strrstr(ts->bprm->argv[0], "/");
@@ -8423,7 +8435,7 @@ static int open_self_stat(CPUArchState *cpu_env, int fd)
             g_string_assign(buf, "R "); /* we are running right now */
         } else if (i == 3) {
             /* ppid */
-            g_string_printf(buf, FMT_pid " ", getppid());
+            g_string_printf(buf, FMT_pid " ", vpid_ppid());
         } else if (i == 19) {
             /* num_threads */
             int cpus = 0;
@@ -8491,7 +8503,7 @@ static int is_proc_myself(const char *filename, const char *entry)
             filename += strlen("self/");
         } else if (*filename >= '1' && *filename <= '9') {
             char myself[80];
-            snprintf(myself, sizeof(myself), "%d/", getpid());
+            snprintf(myself, sizeof(myself), "%d/", vpid_tgid());
             if (!strncmp(filename, myself, strlen(myself))) {
                 filename += strlen(myself);
             } else {
@@ -9402,6 +9414,160 @@ _syscall5(int, sys_move_mount, int, __from_dfd, const char *, __from_pathname,
  * of syscall results, can be performed.
  * All errnos that do_syscall() returns must be -TARGET_<errcode>.
  */
+/*
+ * Every syscall that takes a pid or tid FROM the guest, and where the argument
+ * position is all that is needed to translate it.  One table rather than a
+ * check inside each case body: the set has to be exhaustive to be correct --
+ * a missed entry hands a pinned-space number straight to the host kernel,
+ * where it names an unrelated process -- and a table is the only form of this
+ * that can be read against the syscall list in one pass.
+ *
+ * Syscalls whose RESULT is a pid are not here; those are translated where the
+ * result is produced (getpid, gettid, getppid, getpgrp, getpgid, getsid,
+ * setsid, set_tid_address, clone).  wait4/waitpid/waitid are absent on
+ * purpose: -pid refuses fork, so the guest has no children and neither their
+ * argument nor their result can carry a name in the pinned space.
+ */
+enum {
+    VPID_ARG1 = 1,          /* arg1 is a pid/tid */
+    VPID_ARG2,              /* arg2 is a pid/tid */
+    VPID_ARG2_IF_PROCESS,   /* arg2 is a pid only when arg1 == PRIO_PROCESS;
+                             * for PRIO_PGRP it is a process group and for
+                             * PRIO_USER a uid, neither of which lives in the
+                             * pinned space */
+};
+
+static const struct {
+    int num;        /* TARGET_NR_* */
+    int arg;        /* which argument holds the pid/tid */
+} vpid_arg_syscalls[] = {
+#ifdef TARGET_NR_kill
+    { TARGET_NR_kill, VPID_ARG1 },
+#endif
+#ifdef TARGET_NR_tkill
+    { TARGET_NR_tkill, VPID_ARG1 },
+#endif
+#ifdef TARGET_NR_tgkill
+    { TARGET_NR_tgkill, VPID_ARG1 }, { TARGET_NR_tgkill, VPID_ARG2 },
+#endif
+#ifdef TARGET_NR_rt_sigqueueinfo
+    { TARGET_NR_rt_sigqueueinfo, VPID_ARG1 },
+#endif
+#ifdef TARGET_NR_rt_tgsigqueueinfo
+    { TARGET_NR_rt_tgsigqueueinfo, VPID_ARG1 }, { TARGET_NR_rt_tgsigqueueinfo, VPID_ARG2 },
+#endif
+#ifdef TARGET_NR_setpgid
+    { TARGET_NR_setpgid, VPID_ARG1 }, { TARGET_NR_setpgid, VPID_ARG2 },
+#endif
+#ifdef TARGET_NR_getpgid
+    { TARGET_NR_getpgid, VPID_ARG1 },
+#endif
+#ifdef TARGET_NR_getsid
+    { TARGET_NR_getsid, VPID_ARG1 },
+#endif
+#ifdef TARGET_NR_getpriority
+    { TARGET_NR_getpriority, VPID_ARG2_IF_PROCESS },
+#endif
+#ifdef TARGET_NR_setpriority
+    { TARGET_NR_setpriority, VPID_ARG2_IF_PROCESS },
+#endif
+#ifdef TARGET_NR_sched_setparam
+    { TARGET_NR_sched_setparam, VPID_ARG1 },
+#endif
+#ifdef TARGET_NR_sched_getparam
+    { TARGET_NR_sched_getparam, VPID_ARG1 },
+#endif
+#ifdef TARGET_NR_sched_setscheduler
+    { TARGET_NR_sched_setscheduler, VPID_ARG1 },
+#endif
+#ifdef TARGET_NR_sched_getscheduler
+    { TARGET_NR_sched_getscheduler, VPID_ARG1 },
+#endif
+#ifdef TARGET_NR_sched_setattr
+    { TARGET_NR_sched_setattr, VPID_ARG1 },
+#endif
+#ifdef TARGET_NR_sched_getattr
+    { TARGET_NR_sched_getattr, VPID_ARG1 },
+#endif
+#ifdef TARGET_NR_sched_setaffinity
+    { TARGET_NR_sched_setaffinity, VPID_ARG1 },
+#endif
+#ifdef TARGET_NR_sched_getaffinity
+    { TARGET_NR_sched_getaffinity, VPID_ARG1 },
+#endif
+#ifdef TARGET_NR_sched_rr_get_interval
+    { TARGET_NR_sched_rr_get_interval, VPID_ARG1 },
+#endif
+#ifdef TARGET_NR_sched_rr_get_interval_time64
+    { TARGET_NR_sched_rr_get_interval_time64, VPID_ARG1 },
+#endif
+#ifdef TARGET_NR_prlimit64
+    { TARGET_NR_prlimit64, VPID_ARG1 },
+#endif
+#ifdef TARGET_NR_process_vm_readv
+    { TARGET_NR_process_vm_readv, VPID_ARG1 },
+#endif
+#ifdef TARGET_NR_process_vm_writev
+    { TARGET_NR_process_vm_writev, VPID_ARG1 },
+#endif
+#ifdef TARGET_NR_migrate_pages
+    { TARGET_NR_migrate_pages, VPID_ARG1 },
+#endif
+#ifdef TARGET_NR_move_pages
+    { TARGET_NR_move_pages, VPID_ARG1 },
+#endif
+#ifdef TARGET_NR_kcmp
+    { TARGET_NR_kcmp, VPID_ARG1 }, { TARGET_NR_kcmp, VPID_ARG2 },
+#endif
+#ifdef TARGET_NR_ptrace
+    { TARGET_NR_ptrace, VPID_ARG2 },
+#endif
+#ifdef TARGET_NR_pidfd_open
+    { TARGET_NR_pidfd_open, VPID_ARG1 },
+#endif
+#ifdef TARGET_NR_pidfd_send_signal
+    { TARGET_NR_pidfd_send_signal, 0 },  /* pidfd, not a pid: listed so the audit is complete */
+#endif
+};
+
+/*
+ * Map the pid/tid arguments of @num out of the pinned identity space, in
+ * place.  Returns false when the guest named a positive pid it cannot have
+ * learned from us; the caller answers ESRCH rather than let the number reach
+ * the host kernel.  A no-op unless -pid is in use.
+ */
+static bool vpid_map_syscall_args(int num, abi_long *arg1, abi_long *arg2)
+{
+    if (!qemu_vpid_base) {
+        return true;
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(vpid_arg_syscalls); i++) {
+        if (vpid_arg_syscalls[i].num != num) {
+            continue;
+        }
+        switch (vpid_arg_syscalls[i].arg) {
+        case VPID_ARG1:
+            if (!vpid_to_host(arg1)) {
+                return false;
+            }
+            break;
+        case VPID_ARG2:
+            if (!vpid_to_host(arg2)) {
+                return false;
+            }
+            break;
+        case VPID_ARG2_IF_PROCESS:
+            if (*arg1 == PRIO_PROCESS && !vpid_to_host(arg2)) {
+                return false;
+            }
+            break;
+        default:
+            break;      /* not a pid argument */
+        }
+    }
+    return true;
+}
+
 static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
                             abi_long arg2, abi_long arg3, abi_long arg4,
                             abi_long arg5, abi_long arg6, abi_long arg7,
@@ -9409,6 +9575,12 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
 {
     CPUState *cpu = env_cpu(cpu_env);
     abi_long ret;
+
+    /* Translate any pid/tid the guest passed us back to the host's own
+     * numbering before it reaches a host syscall (see -pid). */
+    if (!vpid_map_syscall_args(num, &arg1, &arg2)) {
+        return -TARGET_ESRCH;
+    }
 #if defined(TARGET_NR_stat) || defined(TARGET_NR_stat64) \
     || defined(TARGET_NR_lstat) || defined(TARGET_NR_lstat64) \
     || defined(TARGET_NR_fstat) || defined(TARGET_NR_fstat64) \
@@ -9728,12 +9900,12 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
 #if defined(TARGET_NR_getxpid) && defined(TARGET_ALPHA)
     /* Alpha specific */
     case TARGET_NR_getxpid:
-        cpu_env->ir[IR_A4] = getppid();
-        return get_errno(getpid());
+        cpu_env->ir[IR_A4] = vpid_ppid();
+        return get_errno(vpid_tgid());
 #endif
 #ifdef TARGET_NR_getpid
     case TARGET_NR_getpid:
-        return get_errno(getpid());
+        return get_errno(vpid_tgid());
 #endif
     case TARGET_NR_mount:
         {
@@ -10146,14 +10318,17 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
 #endif
 #ifdef TARGET_NR_getppid /* not on alpha */
     case TARGET_NR_getppid:
-        return get_errno(getppid());
+        return get_errno(vpid_ppid());
 #endif
 #ifdef TARGET_NR_getpgrp
     case TARGET_NR_getpgrp:
-        return get_errno(getpgrp());
+        return get_errno(vpid_pgrp());
 #endif
     case TARGET_NR_setsid:
-        return get_errno(setsid());
+        ret = get_errno(setsid());
+        /* The new session id is this process's own pid, which in the pinned
+         * space is its pinned name; unpinned, hand back what the host said. */
+        return (is_error(ret) || !qemu_vpid_base) ? ret : vpid_pgrp();
 #ifdef TARGET_NR_sigaction
     case TARGET_NR_sigaction:
         {
@@ -11081,7 +11256,26 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
         if (!p) {
             return -TARGET_EFAULT;
         }
-        ret = get_errno(getrandom(p, arg2, arg3));
+        if (qemu_guest_random_is_deterministic()) {
+            /*
+             * -seed pins the guest's randomness, and getrandom(2) is how a
+             * modern guest asks for it -- glibc seeds the stack protector and
+             * the pointer guard through this call at every start-up, and
+             * stores the result in .bss where the whole run downstream of it
+             * differs.  Passing it to the host would leave -seed covering
+             * AT_RANDOM and not this, so a run with a pinned seed would still
+             * not reproduce.  Serve it from the same pinned PRNG instead.
+             *
+             * The flags need no attention here: GRND_RANDOM and
+             * GRND_NONBLOCK both describe how long the kernel may wait for
+             * entropy, and a seeded PRNG has it immediately, so the request
+             * is always satisfied in full.
+             */
+            ret = qemu_guest_getrandom(p, arg2, NULL) == 0
+                ? (abi_long)arg2 : -TARGET_EIO;
+        } else {
+            ret = get_errno(getrandom(p, arg2, arg3));
+        }
         unlock_user(p, arg1, ret);
         return ret;
 #endif
@@ -11466,7 +11660,11 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
         return ret;
 #endif
     case TARGET_NR_getpgid:
-        return get_errno(getpgid(arg1));
+        ret = get_errno(getpgid(arg1));
+        /* Pinned, the traced thread group is alone and leads its own group,
+         * so any group it can name is its own; the host's real group id is
+         * inherited from the launching shell and differs between runs. */
+        return (is_error(ret) || !qemu_vpid_base) ? ret : vpid_pgrp();
     case TARGET_NR_fchdir:
         return get_errno(fchdir(arg1));
     case TARGET_NR_personality:
@@ -11574,7 +11772,9 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
         return ret;
 #endif
     case TARGET_NR_getsid:
-        return get_errno(getsid(arg1));
+        ret = get_errno(getsid(arg1));
+        /* Same as getpgid: pinned, it leads its own session. */
+        return (is_error(ret) || !qemu_vpid_base) ? ret : vpid_pgrp();
 #if defined(TARGET_NR_fdatasync) /* Not on alpha (osf_datasync ?) */
     case TARGET_NR_fdatasync:
         return get_errno(fdatasync(arg1));
@@ -12793,7 +12993,7 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
         return TARGET_PAGE_SIZE;
 #endif
     case TARGET_NR_gettid:
-        return get_errno(sys_gettid());
+        return get_errno(vpid_self());
 #ifdef TARGET_NR_readahead
     case TARGET_NR_readahead:
 #if TARGET_ABI_BITS == 32 && !defined(TARGET_ABI_MIPSN32)
@@ -13121,7 +13321,7 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
         TaskState *ts = get_task_state(cpu);
         ts->child_tidptr = arg1;
         /* do not call host set_tid_address() syscall, instead return tid() */
-        return get_errno(sys_gettid());
+        return get_errno(vpid_self());
     }
 #endif
 

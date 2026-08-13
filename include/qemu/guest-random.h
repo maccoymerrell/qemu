@@ -65,4 +65,15 @@ int qemu_guest_getrandom(void *buf, size_t len, Error **errp);
  */
 void qemu_guest_getrandom_nofail(void *buf, size_t len);
 
+/**
+ * qemu_guest_random_is_deterministic(void)
+ *
+ * True once qemu_guest_random_seed_main has pinned the guest PRNG (-seed).
+ * A caller that can either satisfy a guest's request for randomness from that
+ * PRNG or hand it to the host uses this to decide: with a pinned seed the
+ * guest must see the pinned stream, or the seed only covers part of what the
+ * guest reads and the run is still not reproducible.
+ */
+bool qemu_guest_random_is_deterministic(void);
+
 #endif /* QEMU_GUEST_RANDOM_H */

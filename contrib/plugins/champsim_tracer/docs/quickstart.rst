@@ -1041,9 +1041,26 @@ match each other.
        Mersenne Twister seeded by ``N``.  Backs the ``AT_RANDOM``
        16-byte auxv entry that glibc reads for the stack canary,
        the pointer-mangling key (``__pointer_chk_guard``), and
-       several internal hash-table seeds, plus any guest call to
-       ``getrandom(2)``.  Without it every run gets fresh
-       cryptographic-random bytes here.
+       several internal hash-table seeds.  ``getrandom(2)`` is
+       served from that same PRNG rather than forwarded to the
+       host, which matters more than ``AT_RANDOM`` on a current
+       glibc: a static binary seeds its pointer guard through the
+       syscall, stores the result in ``.bss``, and every value
+       derived from it afterwards carries the difference.  Without
+       ``-seed`` both sources hand out fresh host entropy.
+   * - Guest process identity
+     - ``-pid N`` on the QEMU binary (env ``QEMU_PID``)
+     - Renames the guest's thread group into a private space: the
+       initial thread is ``N`` and each further guest thread takes
+       the next number in the order the guest created it, with
+       ``getppid`` reading 0 and the process leading its own group
+       and session.  Without it the guest reads the host's own
+       pid and tid, which differ every run — and they do not stay
+       in a register: glibc's ``__tls_init_tp`` stores the
+       ``set_tid_address`` result into the TCB during start-up on
+       every run, so the number is in guest memory from the first
+       few thousand instructions onward.  ``-pid`` refuses a guest
+       that starts a second process (see :ref:`repro-identity`).
    * - Guest base address
      - ``-B address`` (env ``QEMU_GUEST_BASE``)
      - Fixes the host↔guest virtual-address offset so PIE
@@ -1101,11 +1118,17 @@ Even with the full flag set above, four sources are not
 controlled by any QEMU flag:
 
 * **Host-passthrough syscalls.**  ``gettimeofday``,
-  ``clock_gettime``, ``time``, ``getpid``, ``gettid`` and reads
-  from ``/proc/self/*`` go straight to the host.  Workloads
-  that read wall-clock time or hash by PID will diverge.  The
-  tracer records the divergence faithfully; pin the workload's
-  clock at the workload level if bit-stability is required.
+  ``clock_gettime`` and ``time`` go straight to the host, so a
+  workload that reads wall-clock time diverges.  ``getpid`` /
+  ``gettid`` / ``getppid`` / ``getpgrp`` and ``getrandom`` no
+  longer belong on this list — ``-pid`` and ``-seed`` pin them.
+  Note also that a syscall which *writes* host state into guest
+  memory counts here even when it looks inert: ``fstat(1)`` puts
+  stdout's inode and timestamps in the guest's buffer, so a run
+  whose stdout is redirected to a different file is running on
+  different input.  Point the two runs being compared at the
+  same destination.  The tracer records whatever the guest was
+  given, faithfully; it is the input that has to be held still.
 * **Pre-segment icount drift.**  When a segment opens at a
   fixed ``icount=N``, every guest instruction *before* the
   segment counts toward ``N`` — including the dynamic linker
@@ -1123,17 +1146,20 @@ controlled by any QEMU flag:
 * **Multi-vCPU interleaving.**  Multi-threaded guest workloads
   can interleave vCPUs differently across runs.  See
   :ref:`multi-vcpu` in the architecture doc.
-* **WP reads of uninitialised data.**  The wrong-path simulator
-  follows branch directions the program would not normally
-  take, so it can dereference a stack frame or malloc chunk
-  while it still holds residue from a prior function call.
-  The bytes there are whatever the OS / glibc / a prior caller
-  happened to leave behind — they are not bound by the
-  program's data-flow.  Aggregate WP counts (entries, total
-  instructions, address-set coverage) remain reproducible; a
-  small number of WP fragments' value bytes do not.  See
-  :doc:`limitations` for the detailed mechanism and why this is
-  fundamentally not fixable from the plugin side.
+* **The wrong path amplifies whatever is left unpinned.**  The
+  wrong path dereferences values the program never would, so a
+  single guest-visible byte that differs between two runs
+  reappears as an address, then as the load at that address,
+  then as the branch that load decides — thousands of differing
+  body lines from one differing input.  This is amplification,
+  not a separate source: with every input above pinned, the
+  wrong path is byte-identical run to run (measured: 12 of 12
+  repeat traces of a full-libc x86_64 binary hash the same,
+  against 12 of 12 distinct with ``-pid`` or ``-seed`` dropped).
+  The practical consequence is diagnostic: when a wrong-path
+  A/B shows a large diff, look for the *first* divergence and
+  expect it to be one value on the correct path, not many on
+  the wrong one.
 
 Cross-host reproducibility holds when the above-listed
 controllable sources are pinned — the same guest binary
@@ -1151,18 +1177,39 @@ Recommended invocation for maximum reproducibility
 
    $ env -i HOME=/tmp PATH=/usr/bin LANG=C \
      taskset -c 0 setarch -R \
-     qemu-x86_64 -seed 42 -B 0x40000000 -R 8G \
+     qemu-x86_64 -seed 42 -pid 4242 -B 0x40000000 -R 8G \
        -plugin ./libchampsim_tracer.so,outfile=run,wp=1,memdata=1,regdata=1,\
                 trace_window=icount:start=0+stop=20000000 \
        ./your_workload
 
-With all six knobs in place on the same host and same QEMU +
-plugin build, the CP path of a single-vCPU workload is
-reproducible byte-for-byte except for the residual sources
-listed above.  Drop any of the layer-1 knobs (``-seed`` /
-``-B`` / ``-R``) and the *content* of any windowed segment
-shifts via the pre-segment-icount-drift mechanism — even when
-the workload itself reads no clocks and uses no randomness.
+With all seven knobs in place on the same host and same QEMU +
+plugin build, and the two runs given the same stdin/stdout, a
+single-vCPU workload that reads no clock is reproducible
+byte-for-byte — the wrong path included.  Drop any of the
+layer-1 knobs (``-seed`` / ``-pid`` / ``-B`` / ``-R``) and the
+*content* of any windowed segment shifts via the
+pre-segment-icount-drift mechanism — even when the workload
+itself reads no clocks and uses no randomness.
+
+.. _repro-identity:
+
+Scope of ``-pid``
+~~~~~~~~~~~~~~~~~
+
+``-pid`` names one thread group.  A guest that starts a second
+process leaves the space it can number deterministically — the
+child's allocations interleave with the parent's under host
+scheduling — so QEMU refuses the ``fork`` with a message naming
+the option rather than pinning the parent and leaving the child
+on host-allocated numbers, which would be irreproducibility that
+does not show up anywhere in the result.  Threads are fully
+supported: ``clone`` does not return to the guest until the new
+thread has registered its name, so the numbering follows the
+guest's own creation order.  Every syscall that takes a pid or
+tid maps back to the host value, so signalling, scheduling and
+``pthread_kill`` behave normally; a positive pid the guest never
+received from us is answered ``ESRCH`` instead of being handed
+to the host kernel, where it would name an unrelated process.
 
 Feeding ChampSim
 ----------------

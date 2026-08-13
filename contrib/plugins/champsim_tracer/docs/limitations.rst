@@ -991,31 +991,44 @@ best-effort by design; wrong-path *control flow* and *addresses* are not.
 Reproducibility caveats
 -----------------------
 
-See :ref:`reproducibility` in the quickstart for the recommended
-invocation recipe that controls the major byte-stability
-breakers (ASLR, kernel-supplied randomness, host scheduling,
-inherited environment).  One residual non-determinism source
-deserves its own treatment here because it is fundamentally not
-fixable from the plugin side:
+See :ref:`reproducibility` in the quickstart for the invocation
+that pins the byte-stability breakers (ASLR, kernel-supplied
+randomness, process identity, host scheduling, inherited
+environment).  With those pinned, a single-vCPU user-mode trace
+is bit-deterministic, wrong path included; what follows is the
+boundary of that statement.
 
-**Traces are not bit-deterministic.**  Even with every
-controllable randomness source pinned (``-seed N`` for
-``AT_RANDOM``, ``env -i`` for the inherited environment,
-``setarch -R`` for host ASLR, ``taskset -c 0`` for host
-scheduling), body records vary slightly run-to-run.
-The residue manifests as a small fluctuation in load-address,
-load-data, store-data, destination-register snapshots,
-and basic-block execution counts.
+**A trace is exactly as reproducible as the guest's input.**
+The tracer records what the guest did, so anything the guest can
+read that differs between two runs comes back as a difference in
+the trace, and the wrong path magnifies it: a mispredicted path
+dereferences values the program never would, so one differing
+byte becomes an address, a load at that address, and the branch
+that load decides.  A measured example is worth more than the
+rule.  Two runs of a static-glibc x86_64 binary at a fixed build
+with ASLR off and ``-seed 1`` differed in 33,186 body lines and
+in the wrong path's fault and atomic counts.  The whole
+difference came from two guest-visible inputs that were not
+pinned: ``set_tid_address`` returned the host tid (glibc stores
+it in the TCB during start-up), and ``getrandom`` returned host
+entropy into the ``.bss`` word glibc uses as its pointer guard.
+Pinning both with ``-pid`` and ``-seed`` took 12 of 12 repeat
+traces to a single hash; without either, 12 of 12 were distinct.
 
-**Why it happens.**  The wrong-path simulator may occassional
-stumble into data bytes and decode them as instructions, which
-is normal speculative behaviour but non-deterministic because the
-data bytes can change between runs.  When this happens, the WP
-chain diverges and the trace captures a different sequence of
-events. In addition, startup behavior of the program 
-(e.g., dynamic loader decisions, heap layout) can differ 
-between runs and cause different instruction sequences
-to be executed, which also leads to non-deterministic traces.
+**What is genuinely outside the pin.**  A workload that reads a
+clock, a workload given different file descriptors (an
+``fstat`` of a redirected stdout puts that file's inode into
+guest memory), and a multi-threaded workload whose vCPUs
+interleave differently.  These are properties of the run, not of
+the tracer, and the tracer records them faithfully; hold them
+still at the harness level when byte-stability is required.
+
+**Diagnostic consequence.**  When a wrong-path A/B comes back
+with a large diff, do not read it as many independent
+divergences.  Find the *first* differing record and identify
+which side it is on: in every case measured so far it was a
+single value on the correct path, and everything after it was
+that one value propagating.
 
 **Adjacent invariant: true-BB SHAPES *are* deterministic.**  A
 separate flavour of WP non-determinism — multiple distinct

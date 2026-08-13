@@ -2253,6 +2253,74 @@ Guest threads in user mode
    stack for the stack — and raising it is a deliberate act that belongs
    with a re-measured multithreaded guest run.
 
+Deterministic guest input (linux-user)
+--------------------------------------
+
+A trace is an artifact a consumer re-derives results from, so two runs
+of the same binary at the same build have to produce the same bytes.
+They did not, and the wrong path made it obvious long before the
+correct path did: it dereferences values the program never would, so
+one guest-visible byte that differs between runs comes back as an
+address, a load, and a branch.  Both leaks were host state entering
+guest *memory* through a syscall, where it stays for the rest of the
+run.
+
+``linux-user/main.c``, ``linux-user/syscall.c``, ``linux-user/elfload.c``
+
+   ``-pid N`` (env ``QEMU_PID``) pins the guest-visible process
+   identity.  Without it a guest reads the host's own pid and tid:
+   glibc's ``__tls_init_tp`` stores the ``set_tid_address`` result into
+   the TCB during start-up on every run, which was the first differing
+   record in the measured repro.  With it, the initial thread is ``N``
+   and each further guest thread takes the next number in the order the
+   guest created it — deterministic because ``clone`` does not return
+   to the guest until the new thread has registered (``task_settid`` →
+   ``vpid_register``).  ``getppid`` reads 0, the pid-namespace answer
+   for a parent outside the space, and the process leads its own group
+   and session.
+
+   The translation is a bijection in both directions.  Results are
+   mapped host → guest where they are produced (``getpid``, ``gettid``,
+   ``getppid``, ``getpgrp``, ``getpgid``, ``getsid``, ``setsid``,
+   ``set_tid_address``, ``clone``, the ``/proc/self`` emulation and the
+   core-dump prstatus/prpsinfo notes).  Arguments are mapped guest →
+   host in one table, ``vpid_arg_syscalls``, consulted at the top of
+   ``do_syscall1``: the set has to be exhaustive to be correct — a
+   missed entry hands a pinned-space number to the host kernel where it
+   names an unrelated process — and a table is the only form of that
+   which can be read against the syscall list in one pass.  A positive
+   pid the guest never received is answered ``ESRCH`` rather than
+   forwarded.
+
+   The rename covers one thread group.  A guest that starts a second
+   process leaves the space ``-pid`` can number deterministically, so
+   ``do_fork`` refuses with a message naming the option instead of
+   pinning the parent and leaving the child on host-allocated numbers —
+   irreproducibility that would appear nowhere in the result.  With
+   ``-pid`` absent every path above is the identity function and
+   behaviour is unchanged.
+
+``linux-user/syscall.c``, ``util/guest-random.c``, ``include/qemu/guest-random.h``
+
+   ``getrandom(2)`` is served from the ``-seed`` PRNG instead of the
+   host.  ``-seed`` already claimed this class, and the plugin
+   documentation said so, but the syscall went straight to the host
+   kernel — so the seed covered ``AT_RANDOM`` and not the call a
+   current glibc actually uses.  A static binary seeds its pointer
+   guard through ``getrandom`` into ``.bss``; in the measured repro
+   that word was the source of every remaining correct-path
+   difference, and of most of the wrong-path ones downstream of it.
+   ``qemu_guest_random_is_deterministic()`` exposes the flag
+   ``qemu_guest_random_seed_main`` sets, and the syscall consults it;
+   without ``-seed`` the host call is used exactly as before.  The
+   ``GRND_RANDOM`` / ``GRND_NONBLOCK`` flags need no handling, since
+   they describe how long the kernel may wait for entropy and a seeded
+   PRNG has it immediately.
+
+   Measured, x86_64 static-glibc workload, ASLR off, 12 repeat traces
+   hashed as ``golden_net`` does: 12 distinct with ``-seed`` alone, 12
+   distinct with ``-pid`` alone, 1 distinct with both.
+
 Build wiring
 ------------
 

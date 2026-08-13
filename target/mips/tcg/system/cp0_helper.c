@@ -103,12 +103,52 @@ static inline void mips_vpe_sleep(MIPSCPU *cpu)
     cpu_reset_interrupt(cs, CPU_INTERRUPT_WAKE);
 }
 
+/*
+ * Is this VPE's OWN thread state activated -- mips_vpe_active() without the
+ * processor-wide MVPControl.EVP term.
+ *
+ * The two questions are not interchangeable.  EVP says whether the whole
+ * processor may issue right now, and it is 0 for every VPE inside any DVPE
+ * section; VPA / TCStatus.A / TCHalt say whether this particular VPE and
+ * thread context are enabled at all.  Only the second is a property of the
+ * TC whose registers are being written.
+ */
+static bool mips_vpe_tc_activated(CPUMIPSState *env)
+{
+    return (env->CP0_VPEConf0 & (1 << CP0VPEC0_VPA))
+        && (env->active_tc.CP0_TCStatus & (1 << CP0TCSt_A))
+        && !(env->active_tc.CP0_TCHalt & 1);
+}
+
+/*
+ * Reacting to a write of a TC's own halt/activation state.
+ *
+ * These asked mips_vpe_active(), which folds in EVP -- and MIPS MT requires
+ * VPEs to be disabled before a VPE may touch another's TC registers, so
+ * every one of these writes arrives with EVP already 0.  Both answers were
+ * therefore constants inside the only window they are reached from:
+ *
+ *   - mips_tc_sleep() halted the VPE unconditionally.  Through
+ *     helper_mtc0_tchalt() that VPE is the caller itself, so a VPE that had
+ *     just executed DVPE put ITSELF to sleep in the middle of its own
+ *     section, before the EVPE that would re-enable the processor.  Nothing
+ *     could reschedule it, because mips_cpu_has_work() gates on the same
+ *     EVP it had cleared, so the machine stopped with the restore still
+ *     owed -- the residual malta -smp 4 boot wedge.
+ *   - mips_tc_wake() woke nobody, so a TC that the guest un-halted inside a
+ *     section was never scheduled, and an IPI delivered to it was never
+ *     collected: "Unable to send backtrace IPI to CPU0 - perhaps it hung?".
+ *
+ * The processor-wide gate is not theirs to apply.  mips_cpu_has_work()
+ * already holds every VPE off the run queue while EVP is clear, and it is
+ * the DVPE that cleared EVP which owns waking them again.
+ */
 static inline void mips_tc_wake(MIPSCPU *cpu, int tc)
 {
     CPUMIPSState *c = &cpu->env;
 
     /* FIXME: TC reschedule.  */
-    if (mips_vpe_active(c) && !mips_vpe_is_wfi(cpu)) {
+    if (mips_vpe_tc_activated(c) && !mips_vpe_is_wfi(cpu)) {
         mips_vpe_wake(cpu);
     }
 }
@@ -118,7 +158,7 @@ static inline void mips_tc_sleep(MIPSCPU *cpu, int tc)
     CPUMIPSState *c = &cpu->env;
 
     /* FIXME: TC reschedule.  */
-    if (!mips_vpe_active(c)) {
+    if (!mips_vpe_tc_activated(c)) {
         mips_vpe_sleep(cpu);
     }
 }
@@ -569,7 +609,7 @@ void helper_mtc0_index(CPUMIPSState *env, target_ulong arg1)
 void helper_mtc0_mvpcontrol(CPUMIPSState *env, target_ulong arg1)
 {
     uint32_t mask = 0;
-    uint32_t newval;
+    int32_t oldval, newval;
 
 #ifdef CONFIG_PLUGIN
     /* Wrong-path: writes the shared MVP context (env->mvp), out of snapshot. */
@@ -577,20 +617,33 @@ void helper_mtc0_mvpcontrol(CPUMIPSState *env, target_ulong arg1)
         return;
     }
 #endif
-    if (env->CP0_VPEConf0 & (1 << CP0VPEC0_MVP)) {
-        mask |= (1 << CP0MVPCo_CPA) | (1 << CP0MVPCo_VPC) |
-                (1 << CP0MVPCo_EVP);
-    }
-    if (env->mvp->CP0_MVPControl & (1 << CP0MVPCo_VPC)) {
-        mask |= (1 << CP0MVPCo_STLB);
-    }
-    newval = (env->mvp->CP0_MVPControl & ~mask) | (arg1 & mask);
+    /*
+     * MVPControl is shared by every VPE of the processor, so this masked
+     * read-modify-write races the EVP bit that DVPE/EVPE own.  A plain
+     * load-modify-store would publish a whole word computed from a stale
+     * sample and silently undo a sibling's EVPE; the compare-exchange makes
+     * the write conditional on nothing having moved underneath it.  The
+     * STLB clause of the mask is recomputed each attempt because it is
+     * itself a function of the value being replaced.
+     */
+    do {
+        oldval = qatomic_read(&env->mvp->CP0_MVPControl);
+        mask = 0;
+        if (env->CP0_VPEConf0 & (1 << CP0VPEC0_MVP)) {
+            mask |= (1 << CP0MVPCo_CPA) | (1 << CP0MVPCo_VPC) |
+                    (1 << CP0MVPCo_EVP);
+        }
+        if (oldval & (1 << CP0MVPCo_VPC)) {
+            mask |= (1 << CP0MVPCo_STLB);
+        }
+        newval = (oldval & ~mask) | (arg1 & mask);
 
-    /* TODO: Enable/disable shared TLB, enable/disable VPEs. */
+        /* TODO: Enable/disable shared TLB, enable/disable VPEs. */
+    } while (qatomic_cmpxchg(&env->mvp->CP0_MVPControl,
+                             oldval, newval) != oldval);
 
     mips_mvp_note(env, mask ? MIPS_MVP_MTC0_WR : MIPS_MVP_MTC0_NA,
-                  env->mvp->CP0_MVPControl, newval);
-    env->mvp->CP0_MVPControl = newval;
+                  oldval, newval);
 }
 
 void helper_mtc0_vpecontrol(CPUMIPSState *env, target_ulong arg1)
@@ -1911,23 +1964,63 @@ target_ulong helper_dvpe(CPUMIPSState *env)
         return 0;
     }
 #endif
-    prev = env->mvp->CP0_MVPControl;
-
-    if (env->CP0_VPEConf0 & (1 << CP0VPEC0_MVP)) {
-        mips_mvp_note(env, MIPS_MVP_DVPE_RD, prev, prev);
-        CPU_FOREACH(other_cs) {
-            MIPSCPU *other_cpu = MIPS_CPU(other_cs);
-            /* Turn off all VPEs except the one executing the dvpe.  */
-            if (&other_cpu->env != env) {
-                uint32_t before = other_cpu->env.mvp->CP0_MVPControl;
-                other_cpu->env.mvp->CP0_MVPControl &= ~(1 << CP0MVPCo_EVP);
-                mips_mvp_note(env, MIPS_MVP_DVPE_WR, before,
-                              other_cpu->env.mvp->CP0_MVPControl);
-                mips_vpe_sleep(other_cpu);
-            }
-        }
-    } else {
+    if (!(env->CP0_VPEConf0 & (1 << CP0VPEC0_MVP))) {
+        /* Without MVP, DVPE reads MVPControl and changes nothing. */
+        prev = env->mvp->CP0_MVPControl;
         mips_mvp_note(env, MIPS_MVP_DVPE_NA, prev, prev);
+        return prev;
+    }
+
+    /*
+     * One instruction, one read-modify-write.
+     *
+     * MVPControl is a single per-processor register shared by every VPE of
+     * the processor, and the value DVPE returns is what the guest's nesting
+     * protocol tests to decide whether its matching EVPE has to restore EVP
+     * (`prev = dvpe(); ... evpe(prev);`).  Sampling it and clearing EVP must
+     * therefore be indivisible.  Walking the sibling list and clearing the
+     * bit once per sibling instead gave the instruction N-1 separate stores
+     * with the sample outside all of them, so a peer's EVPE landing in the
+     * middle was undone afterwards by this VPE's remaining stores: the peer
+     * had already spent its restore, this VPE still owed one, and EVP stayed
+     * clear.  Every VPE then failed mips_vpe_active(), mips_cpu_has_work()
+     * forced has_work false with an enabled interrupt pending, and the
+     * machine never retired another instruction.
+     */
+    prev = qatomic_fetch_and(&env->mvp->CP0_MVPControl,
+                             ~(int32_t)(1 << CP0MVPCo_EVP));
+    mips_mvp_note(env, MIPS_MVP_DVPE_RD, prev, prev);
+    mips_mvp_note(env, MIPS_MVP_DVPE_WR, prev,
+                  prev & ~(1 << CP0MVPCo_EVP));
+
+    if (!(prev & (1 << CP0MVPCo_EVP))) {
+        /*
+         * The processor was already disabled, so this DVPE is nested inside
+         * another VPE's -- and on hardware it could not have been reached at
+         * all, because that other VPE's DVPE stopped this one from issuing.
+         * QEMU cannot stop a sibling mid-TB, so the instruction does get
+         * executed here; what it must not do is act as though it owned the
+         * disable.  Sleeping the siblings from a nested DVPE halts the VPE
+         * that is holding the section open -- the one VPE that will run the
+         * matching EVPE, because the guest's `evpe(prev)` restores only when
+         * its own DVPE saw EVP set.  That VPE then cannot be rescheduled,
+         * since mips_vpe_active() is false for it too, and the whole
+         * processor stops with EVP clear and the restore still owed.
+         *
+         * Sleeping siblings therefore belongs to the DVPE that performed the
+         * 1 -> 0 transition, and to no other.  With the transition itself
+         * atomic, exactly one VPE owns an open section at a time, and no
+         * peer can halt it while it is open.
+         */
+        return prev;
+    }
+
+    CPU_FOREACH(other_cs) {
+        MIPSCPU *other_cpu = MIPS_CPU(other_cs);
+        /* Put every VPE except the one executing the dvpe to sleep. */
+        if (&other_cpu->env != env) {
+            mips_vpe_sleep(other_cpu);
+        }
     }
     return prev;
 }
@@ -1943,26 +2036,59 @@ target_ulong helper_evpe(CPUMIPSState *env)
         return 0;
     }
 #endif
-    prev = env->mvp->CP0_MVPControl;
-
-    if (env->CP0_VPEConf0 & (1 << CP0VPEC0_MVP)) {
-        mips_mvp_note(env, MIPS_MVP_EVPE_RD, prev, prev);
-        CPU_FOREACH(other_cs) {
-            MIPSCPU *other_cpu = MIPS_CPU(other_cs);
-
-            if (&other_cpu->env != env
-                /* If the VPE is WFI, don't disturb its sleep.  */
-                && !mips_vpe_is_wfi(other_cpu)) {
-                /* Enable the VPE.  */
-                uint32_t before = other_cpu->env.mvp->CP0_MVPControl;
-                other_cpu->env.mvp->CP0_MVPControl |= (1 << CP0MVPCo_EVP);
-                mips_mvp_note(env, MIPS_MVP_EVPE_WR, before,
-                              other_cpu->env.mvp->CP0_MVPControl);
-                mips_vpe_wake(other_cpu); /* And wake it up.  */
-            }
-        }
-    } else {
+    if (!(env->CP0_VPEConf0 & (1 << CP0VPEC0_MVP))) {
+        /* Without MVP, EVPE reads MVPControl and changes nothing. */
+        prev = env->mvp->CP0_MVPControl;
         mips_mvp_note(env, MIPS_MVP_EVPE_NA, prev, prev);
+        return prev;
+    }
+
+    /* One instruction, one read-modify-write -- see helper_dvpe(). */
+    prev = qatomic_fetch_or(&env->mvp->CP0_MVPControl,
+                            (int32_t)(1 << CP0MVPCo_EVP));
+    mips_mvp_note(env, MIPS_MVP_EVPE_RD, prev, prev);
+    mips_mvp_note(env, MIPS_MVP_EVPE_WR, prev,
+                  prev | (1 << CP0MVPCo_EVP));
+
+    if (prev & (1 << CP0MVPCo_EVP)) {
+        /*
+         * Already enabled: this EVPE closes nothing, so there is nobody it
+         * put to sleep to wake.  The mirror of the nested-DVPE case above.
+         */
+        return prev;
+    }
+
+    CPU_FOREACH(other_cs) {
+        MIPSCPU *other_cpu = MIPS_CPU(other_cs);
+
+        /*
+         * Wake every sibling, because the matching DVPE slept every sibling.
+         * mips_vpe_sleep() halts a VPE that was running and clears its wake
+         * request, so nothing but this wake will schedule it again: a VPE
+         * stopped mid-computation has no pending interrupt to revive it.
+         *
+         * The old "if the VPE is WFI, don't disturb its sleep" guard could
+         * not survive here.  It asked mips_vpe_is_wfi() of the live shared
+         * word, so the first sibling's write set EVP and made the answer
+         * true for every later halted sibling: an EVPE closing a DVPE that
+         * had slept N-1 VPEs woke exactly one of them, and the rest stayed
+         * halted with the wake request DVPE cleared never reissued.  An IPI
+         * delivered into that window sets CPU_INTERRUPT_HARD on a vCPU that
+         * is never asked for work again, which is how a guest reports
+         * "Unable to send backtrace IPI to CPU0 - perhaps it hung?".
+         *
+         * Asked instead of the SAMPLED word the guard is vacuous rather than
+         * order-dependent -- an EVPE that reaches this loop sampled EVP
+         * clear, under which mips_vpe_active() is false for every VPE -- so
+         * there is no honest form of it to keep.  The cost is that a VPE
+         * that had executed WAIT before the DVPE leaves WAIT here without an
+         * interrupt; MIPS permits WAIT to terminate for implementation
+         * reasons and Linux's idle loop re-enters, and this is what the
+         * first sibling has always had done to it.
+         */
+        if (&other_cpu->env != env) {
+            mips_vpe_wake(other_cpu); /* Wake it up.  */
+        }
     }
     return prev;
 }

@@ -67,7 +67,7 @@ static bool mips_vp_is_wfi(MIPSCPU *c)
     return cpu->halted && mips_vp_active(env);
 }
 
-static inline void mips_vpe_wake(MIPSCPU *c)
+static inline void mips_vpe_wake(MIPSCPU *c, int why)
 {
 #ifdef CONFIG_PLUGIN
     /* Wrong-path: don't poke another VPE's global interrupt/run state. */
@@ -80,12 +80,15 @@ static inline void mips_vpe_wake(MIPSCPU *c)
      * because there might be other conditions that state that c should
      * be sleeping.
      */
+    if (unlikely(mips_mvp_debug > 0)) {
+        mips_mvp_note_run(CPU(c), why);
+    }
     bql_lock();
     cpu_interrupt(CPU(c), CPU_INTERRUPT_WAKE);
     bql_unlock();
 }
 
-static inline void mips_vpe_sleep(MIPSCPU *cpu)
+static inline void mips_vpe_sleep(MIPSCPU *cpu, int why)
 {
     CPUState *cs = CPU(cpu);
 
@@ -99,6 +102,9 @@ static inline void mips_vpe_sleep(MIPSCPU *cpu)
      * The VPE was shut off, really go to bed.
      * Reset any old _WAKE requests.
      */
+    if (unlikely(mips_mvp_debug > 0)) {
+        mips_mvp_note_run(cs, why);
+    }
     cs->halted = 1;
     cpu_reset_interrupt(cs, CPU_INTERRUPT_WAKE);
 }
@@ -149,7 +155,7 @@ static inline void mips_tc_wake(MIPSCPU *cpu, int tc)
 
     /* FIXME: TC reschedule.  */
     if (mips_vpe_tc_activated(c) && !mips_vpe_is_wfi(cpu)) {
-        mips_vpe_wake(cpu);
+        mips_vpe_wake(cpu, MIPS_MVP_WAKE_TC);
     }
 }
 
@@ -159,7 +165,7 @@ static inline void mips_tc_sleep(MIPSCPU *cpu, int tc)
 
     /* FIXME: TC reschedule.  */
     if (!mips_vpe_tc_activated(c)) {
-        mips_vpe_sleep(cpu);
+        mips_vpe_sleep(cpu, MIPS_MVP_SLEEP_TC);
     }
 }
 
@@ -641,6 +647,25 @@ void helper_mtc0_mvpcontrol(CPUMIPSState *env, target_ulong arg1)
         /* TODO: Enable/disable shared TLB, enable/disable VPEs. */
     } while (qatomic_cmpxchg(&env->mvp->CP0_MVPControl,
                              oldval, newval) != oldval);
+
+    /*
+     * EVP means the same thing however it was written, so an mtc0 that moves
+     * it takes the same ownership as the DVPE or EVPE that would have.  Left
+     * out, an mtc0 that cleared EVP would open a section nobody owns -- every
+     * VPE reading the bit as its own disable, which is the state this claim
+     * exists to prevent.
+     */
+    if ((oldval ^ newval) & (1 << CP0MVPCo_EVP)) {
+        if (newval & (1 << CP0MVPCo_EVP)) {
+            qatomic_cmpxchg(&env->mvp->evp_owner,
+                            env_cpu(env)->cpu_index, -1);
+        } else {
+            qatomic_set(&env->mvp->evp_owner, env_cpu(env)->cpu_index);
+            if (mips_vpe_tc_activated(env)) {
+                env_cpu(env)->halted = 0;   /* see helper_dvpe() */
+            }
+        }
+    }
 
     mips_mvp_note(env, mask ? MIPS_MVP_MTC0_WR : MIPS_MVP_MTC0_NA,
                   oldval, newval);
@@ -2009,17 +2034,62 @@ target_ulong helper_dvpe(CPUMIPSState *env)
          *
          * Sleeping siblings therefore belongs to the DVPE that performed the
          * 1 -> 0 transition, and to no other.  With the transition itself
-         * atomic, exactly one VPE owns an open section at a time, and no
-         * peer can halt it while it is open.
+         * atomic, exactly one VPE owns an open section at a time, and no peer
+         * ISSUES a halt to it while that section is open.
+         *
+         * That is not the same as the owner never being found halted, and
+         * reading it as though it were is what left this stall open.  An
+         * order issued by the PREVIOUS owner, before the EVPE that let this
+         * transition happen, is still unobserved in the target until its next
+         * trip through the top of cpu_exec(); it lands on whatever that VPE
+         * has become by then.  The claim below cancels it.
          */
         return prev;
+    }
+
+    /*
+     * This VPE now holds the processor disabled, and the state has to say so,
+     * because "EVP is clear" means the opposite thing about it than it means
+     * about its siblings -- see CPUMIPSMVPContext::evp_owner.
+     */
+    qatomic_set(&env->mvp->evp_owner, env_cpu(env)->cpu_index);
+
+    /*
+     * A stop order this VPE is still carrying is void: it is executing.
+     *
+     * mips_vpe_sleep() stores into a sibling's ->halted from another thread,
+     * and a sibling already inside a TB does not read that store until the
+     * top of cpu_exec().  It can therefore run on for an unbounded number of
+     * instructions after the store -- including, as measured on this guest in
+     * every one of 14 stalls, the DVPE right here.  The order was issued to
+     * stop a VPE from executing during someone else's section; that section
+     * has since ended (its EVPE is what allowed this DVPE to win), and the
+     * VPE it named is now the one VPE that architecture says must keep
+     * running.  Observing it later would park the owner with EVP clear, and
+     * nothing could ever wake it: the EVPE that would is the instruction it
+     * has not reached.
+     *
+     * No further order can arrive while this section is open.  A peer's
+     * sibling-sleep loop runs only inside a section it owns, and its EVPE --
+     * the instruction that lets this DVPE win -- comes after that loop in its
+     * own program order, so every order issued by the previous owner was
+     * issued before this transition.
+     *
+     * The TC's own activation state is asked anyway rather than assumed: a
+     * halt that came from TCHalt / VPA / TCStatus.A is the thread context
+     * saying it must not execute, which is a fact about this VPE and not a
+     * stale statement about someone else's section, and nothing here may
+     * override it.
+     */
+    if (mips_vpe_tc_activated(env)) {
+        env_cpu(env)->halted = 0;
     }
 
     CPU_FOREACH(other_cs) {
         MIPSCPU *other_cpu = MIPS_CPU(other_cs);
         /* Put every VPE except the one executing the dvpe to sleep. */
         if (&other_cpu->env != env) {
-            mips_vpe_sleep(other_cpu);
+            mips_vpe_sleep(other_cpu, MIPS_MVP_SLEEP_DVPE);
         }
     }
     return prev;
@@ -2058,6 +2128,15 @@ target_ulong helper_evpe(CPUMIPSState *env)
         return prev;
     }
 
+    /*
+     * The section is closed, so release the claim -- but only this VPE's own.
+     * The enable above is what lets the next DVPE win, and that DVPE claims
+     * ownership for itself; a plain store here could land after that claim and
+     * erase it, leaving the new owner reading the shared bit as its own
+     * disable again.  The compare-exchange releases nothing it does not own.
+     */
+    qatomic_cmpxchg(&env->mvp->evp_owner, env_cpu(env)->cpu_index, -1);
+
     CPU_FOREACH(other_cs) {
         MIPSCPU *other_cpu = MIPS_CPU(other_cs);
 
@@ -2087,7 +2166,7 @@ target_ulong helper_evpe(CPUMIPSState *env)
          * first sibling has always had done to it.
          */
         if (&other_cpu->env != env) {
-            mips_vpe_wake(other_cpu); /* Wake it up.  */
+            mips_vpe_wake(other_cpu, MIPS_MVP_WAKE_EVPE); /* Wake it up. */
         }
     }
     return prev;
@@ -2112,11 +2191,21 @@ target_ulong helper_dvp(CPUMIPSState *env)
     prev = env->CP0_VPControl;
 
     if (!((env->CP0_VPControl >> CP0VPCtl_DIS) & 1)) {
+        /*
+         * As in helper_dvpe(): the VP issuing DVP is the one VP that keeps
+         * running, so a sleep order it is still carrying from a peer -- one
+         * a VP inside a TB cannot observe until the top of cpu_exec() -- is
+         * stale, and observing it later would park the VP that owes the
+         * matching EVP.
+         */
+        if (mips_vpe_tc_activated(env)) {
+            env_cpu(env)->halted = 0;
+        }
         CPU_FOREACH(other_cs) {
             MIPSCPU *other_cpu = MIPS_CPU(other_cs);
             /* Turn off all VPs except the one executing the dvp. */
             if (&other_cpu->env != env) {
-                mips_vpe_sleep(other_cpu);
+                mips_vpe_sleep(other_cpu, MIPS_MVP_SLEEP_DVP);
             }
         }
         env->CP0_VPControl |= (1 << CP0VPCtl_DIS);
@@ -2145,7 +2234,7 @@ target_ulong helper_evp(CPUMIPSState *env)
                  * If the VP is WFI, don't disturb its sleep.
                  * Otherwise, wake it up.
                  */
-                mips_vpe_wake(other_cpu);
+                mips_vpe_wake(other_cpu, MIPS_MVP_WAKE_EVP);
             }
         }
         env->CP0_VPControl &= ~(1 << CP0VPCtl_DIS);

@@ -119,6 +119,35 @@ static const VMStateDescription vmstate_inactive_tc = {
 
 /* MVP state */
 
+/*
+ * Which VPE holds the processor disabled, sent only while one does.
+ *
+ * MVPControl.EVP clear disables every VPE except the one that cleared it, so
+ * a migration taken inside a DVPE section has to carry the exception with it;
+ * arriving without it, the owner would read the shared bit as its own disable
+ * and mips_cpu_has_work() would refuse to schedule the only VPE that can
+ * issue the EVPE.  Sent as a subsection so a stream taken outside a section
+ * -- every ordinary one -- is unchanged, and an older destination is only
+ * refused for a state it genuinely cannot represent.
+ */
+static bool mvp_evp_owner_needed(void *opaque)
+{
+    CPUMIPSMVPContext *mvp = opaque;
+
+    return qatomic_read(&mvp->evp_owner) >= 0;
+}
+
+static const VMStateDescription vmstate_mvp_evp_owner = {
+    .name = "cpu/mvp/evp_owner",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = mvp_evp_owner_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_INT32(evp_owner, CPUMIPSMVPContext),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_mvp = {
     .name = "cpu/mvp",
     .version_id = 1,
@@ -128,6 +157,10 @@ static const VMStateDescription vmstate_mvp = {
         VMSTATE_INT32(CP0_MVPConf0, CPUMIPSMVPContext),
         VMSTATE_INT32(CP0_MVPConf1, CPUMIPSMVPContext),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_mvp_evp_owner,
+        NULL
     }
 };
 

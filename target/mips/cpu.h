@@ -122,6 +122,25 @@ struct CPUMIPSMVPContext {
 #define CP0MVPC1_PCX    20
 #define CP0MVPC1_PCP2   10
 #define CP0MVPC1_PCP1   0
+    /*
+     * cpu_index of the VPE that performed the MVPControl.EVP 1 -> 0
+     * transition, or -1 while the processor is enabled.
+     *
+     * MIPS MT: "DVPE ... the multi-VPE processor is placed in single-VPE
+     * mode, in which only the VPE issuing the instruction is allowed to
+     * execute."  EVP clear therefore says something about every VPE EXCEPT
+     * one, and this names the exception.  Without it mips_vpe_active() reads
+     * the shared bit as disabling the VPE that cleared it, which is both
+     * wrong and terminal: the only instruction that can set EVP again is the
+     * EVPE that same VPE has not reached yet.
+     *
+     * Claimed with a plain store by whoever wins the 1 -> 0 transition (those
+     * transitions are totally ordered by the atomic on MVPControl, so the
+     * newest claim is the last store), released with a compare-exchange
+     * against the releaser's own index so a release cannot clobber a claim
+     * that a newer section has already made.
+     */
+    int32_t evp_owner;
 };
 
 typedef struct mips_def_t mips_def_t;

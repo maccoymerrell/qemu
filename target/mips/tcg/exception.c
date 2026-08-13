@@ -77,6 +77,12 @@ void helper_wait(CPUMIPSState *env)
     }
 #endif
 
+#if !defined(CONFIG_USER_ONLY)
+    /* The only architecturally legitimate self-halt; see target/mips/cp0.c. */
+    if (unlikely(mips_mvp_debug > 0)) {
+        mips_mvp_note_run(cs, MIPS_MVP_SLEEP_WAIT);
+    }
+#endif
     cs->halted = 1;
     cpu_reset_interrupt(cs, CPU_INTERRUPT_WAKE);
     /*

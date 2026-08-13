@@ -2170,6 +2170,102 @@ Machine-reset notification
    continues (a boot-chain reset before the workload is legitimate).
    See :doc:`quickstart`.
 
+MIPS MT: a disabled processor still has one VPE running
+-------------------------------------------------------
+
+``target/mips/cpu.h``, ``target/mips/internal.h``, ``target/mips/cpu.c``,
+``target/mips/cpu-defs.c.inc``, ``target/mips/tcg/system/cp0_helper.c``
+and ``target/mips/system/machine.c``
+
+   ``-M malta -cpu 34Kf -smp 4`` stopped in early boot, every vCPU
+   halted, at a different point every time.  This is an upstream QEMU
+   defect: every halt site involved ships in ``origin/master``, and the
+   stall reproduces on a stock build with no plugin loaded.
+
+   MIPS MT defines ``DVPE`` as placing the processor "in single-VPE
+   mode, in which only the VPE issuing the instruction is allowed to
+   execute", so ``MVPControl.EVP`` clear says something about every VPE
+   *except one*.  ``mips_vpe_active()`` read the bare bit and so applied
+   the disable to the VPE that issued the ``DVPE`` as well.  For that
+   VPE the answer is not merely inaccurate, it is terminal:
+   ``mips_cpu_has_work()`` discards even a pending enabled interrupt on
+   that arm, and the only instruction that can set ``EVP`` again is the
+   ``EVPE`` that same VPE has not reached yet.
+
+   What delivers it there is that a sibling stop is asynchronous.
+   ``mips_vpe_sleep()`` stores into a peer's ``->halted`` from another
+   thread, and a peer already inside a TB does not read that store until
+   the top of ``cpu_exec()``.  It runs on -- for an unbounded number of
+   instructions, and in particular past a ``DVPE`` of its own.  The
+   order was issued to stop it from executing during someone else's
+   section; by the time it is observed, that section has ended and the
+   VPE it named is the one VPE that must keep running.  Measured on the
+   instrument below, that is the whole stall, in 14 of 14 cells and in
+   26 of 26 taken before it: the halted VPE holding ``EVP`` down was
+   parked at a TB boundary between its own ``DVPE`` and the ``EVPE`` it
+   owed, and had been halted by a peer's ``DVPE`` from the section
+   immediately preceding.
+
+   ``CPUMIPSMVPContext`` therefore gains ``evp_owner``, the ``cpu_index``
+   of the VPE that performed the ``EVP`` 1 ``->`` 0 transition, and
+   ``mips_vpe_active()`` exempts it from the ``EVP`` term.  Ownership is
+   claimed with a plain store by whoever wins that transition -- those
+   transitions are totally ordered by the atomic on ``MVPControl``, so
+   the newest claim is the last store -- and released with a
+   compare-exchange against the releaser's own index, so a release
+   cannot erase a claim a newer section has already made.  ``mtc0
+   MVPControl`` maintains it too, because ``EVP`` means the same thing
+   however it was written.
+
+   The stale order is cancelled where it is provably stale: a VPE that
+   wins the transition is executing, so it clears its own ``->halted``.
+   Nothing can re-issue an order to it while its section is open --
+   a peer's sibling-sleep loop runs only inside a section it owns, and
+   the ``EVPE`` that lets the next ``DVPE`` win comes after that loop in
+   its own program order -- so every order it could be carrying was
+   issued before the transition it just won.  ``DVP`` (Release 6) takes
+   the same one line for the same reason.
+
+   ``evp_owner`` migrates as a subsection sent only while a section is
+   open, so an ordinary stream is unchanged and a migration taken inside
+   one does not arrive with the exception dropped.
+
+   MEASURED on the boot wave the defect was found with, control and
+   treatment interleaved so they share the host: the wedge predicate fires
+   0 times in 320 boots after, against 30 of 40 before, and all 320 report
+   ``smp: Brought up 1 node, 4 CPUs``.  A cell passes by reaching
+   power-down, which is architectural forward progress; console silence
+   only arms the diagnostic dump, because a quiet guest is ordinary and the
+   first attempt at this measurement called a boot wedged that went on to
+   run its workload and power off.
+
+   Three of those 320 stopped anyway, and they are a different mechanism,
+   not a smaller amount of this one: the EVP predicate fired on none of
+   them, and two stopped at the identical console point, the malta ATAPI
+   CD-ROM probe, alongside the guest's own report that an RCU grace-period
+   kthread's timer wakeup never arrived.  That is unclosed, and it is
+   named here rather than folded into the rate above.
+
+``MIPS_MVP_DEBUG`` (``target/mips/system/cp0.c``)
+
+   The condition instrument that produced the finding, off unless the
+   environment variable is set.  It reports ``MVPGATE`` the first time a
+   vCPU is held off the run queue by an MT gate, naming which of
+   ``mips_vpe_active()``'s clauses closed it; ``MVPWEDGE`` when every
+   vCPU is halted *and* every vCPU is gated, which is terminal by
+   construction and is a statement about machine state rather than about
+   how long anything took; and behind both a ring of every read and
+   write of the shared word.
+
+   The ring also records every run-state edge -- ``DVPE``/``DVP``
+   sleeping a sibling, an ``mtc0``/``mttc0`` to ``TCHalt``
+   deactivating a thread context, a VPE's own ``WAIT``, and the matching
+   wakes -- as (setter, target, setter pc), with the newest of each
+   latched per VPE outside the ring so the answer survives it wrapping.
+   A stall in which every VPE is halted is a question about who halted
+   each one, and until those edges were recorded the reports could
+   describe the state without naming the instruction that produced it.
+
 Guest threads in user mode
 --------------------------
 

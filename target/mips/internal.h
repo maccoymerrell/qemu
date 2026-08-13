@@ -183,11 +183,27 @@ enum {
     MIPS_MVP_EVPE_NA,   /* a no-op, recorded because the guest still ran it */
     MIPS_MVP_MTC0_WR,
     MIPS_MVP_MTC0_NA,
+    /*
+     * Run-state edges.  cs->halted decides whether a vCPU is offered to the
+     * scheduler at all, so a stall in which every VPE is halted is only
+     * explained by naming, for each VPE, which instruction on which VPE
+     * halted it.  Each of these records the setter, the target and the
+     * setter's guest PC; a per-VPE latch keeps the newest of each kind so
+     * the answer survives the ring wrapping.
+     */
+    MIPS_MVP_SLEEP_DVPE,  /* dvpe put a sibling to sleep                  */
+    MIPS_MVP_SLEEP_DVP,   /* dvp (R6) put a sibling to sleep              */
+    MIPS_MVP_SLEEP_TC,    /* mtc0/mttc0 TCHalt deactivated a TC           */
+    MIPS_MVP_SLEEP_WAIT,  /* the VPE executed WAIT                        */
+    MIPS_MVP_WAKE_EVPE,
+    MIPS_MVP_WAKE_EVP,
+    MIPS_MVP_WAKE_TC,
 };
 extern int mips_mvp_debug;
 void mips_mvp_debug_init(void);
 void mips_mvp_note(CPUMIPSState *env, int op, uint32_t before, uint32_t after);
 void mips_mvp_note_gate(CPUMIPSState *env);
+void mips_mvp_note_run(CPUState *target, int op);
 
 extern const VMStateDescription vmstate_mips_cpu;
 
@@ -309,12 +325,29 @@ static inline void restore_pamask(CPUMIPSState *env)
     }
 }
 
+/*
+ * Is the processor enabled as far as THIS VPE is concerned?
+ *
+ * MVPControl.EVP is one bit shared by every VPE, but it does not say the
+ * same thing to all of them.  DVPE "places the processor in single-VPE mode,
+ * in which only the VPE issuing the instruction is allowed to execute", so
+ * EVP clear disables every VPE except the one that cleared it -- and that VPE
+ * is named by evp_owner.
+ *
+ * Reading the bare bit instead makes the exception disappear, and the
+ * disappearance is terminal rather than merely inaccurate.  The owner is the
+ * only VPE that will execute the matching EVPE, so a VPE that is halted while
+ * it owns the section can never be scheduled to issue the one instruction
+ * that would schedule it: mips_cpu_has_work() discards even a pending enabled
+ * interrupt on this arm.
+ */
 static inline int mips_vpe_active(CPUMIPSState *env)
 {
     int active = 1;
 
-    /* Check that the VPE is enabled.  */
-    if (!(env->mvp->CP0_MVPControl & (1 << CP0MVPCo_EVP))) {
+    /* Check that the processor is enabled, or that this VPE disabled it.  */
+    if (!(env->mvp->CP0_MVPControl & (1 << CP0MVPCo_EVP)) &&
+        qatomic_read(&env->mvp->evp_owner) != env_cpu(env)->cpu_index) {
         active = 0;
     }
     /* Check that the VPE is activated.  */

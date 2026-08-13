@@ -1042,6 +1042,7 @@ static void fpu_init (CPUMIPSState *env, const mips_def_t *def)
 static void mvp_init(CPUMIPSState *env)
 {
     env->mvp = g_malloc0(sizeof(CPUMIPSMVPContext));
+    env->mvp->evp_owner = -1;   /* no DVPE section is open */
 
     if (!ase_mt_available(env)) {
         return;

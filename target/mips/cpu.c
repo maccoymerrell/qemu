@@ -370,6 +370,9 @@ static void mips_cpu_reset_hold(Object *obj, ResetType type)
         env->active_tc.CP0_TCHalt = 1;
         cs->halted = 1;
 
+        /* A reset leaves no DVPE section open, whichever VPE held one.  */
+        qatomic_set(&env->mvp->evp_owner, -1);
+
         if (cs->cpu_index == 0) {
             /* VPE0 starts up enabled.  */
             env->mvp->CP0_MVPControl |= (1 << CP0MVPCo_EVP);

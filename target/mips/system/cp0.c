@@ -132,22 +132,36 @@ void cpu_mips_store_cause(CPUMIPSState *env, target_ulong val)
  *      every VPE is halted, and every VPE is held off the run queue by the
  *      EVP gate in mips_cpu_has_work().
  *
- * That is terminal by construction, and it is a statement about machine
- * state, not about how long anything took: no VPE can run, so no VPE can
- * execute the instruction that would let any of them run again.  Device
- * interrupts do not help -- mips_cpu_has_work() discards them on exactly
- * this arm.  The ring behind the report is the interleaving of reads and
- * writes of the shared word that produced it.
+ * It is a statement about machine state and not about how long anything
+ * took, which is what makes it usable: no VPE that has come to rest in it
+ * can run, so none can execute the instruction that would let any of them
+ * run again, and device interrupts do not help because mips_cpu_has_work()
+ * discards them on exactly this arm.  The ring behind the report is the
+ * interleaving of reads and writes of the shared word that produced it.
+ *
+ * It is NOT terminal by construction, and an earlier version of this comment
+ * said it was.  cs->halted can be set on a vCPU from another thread, and a
+ * vCPU already inside a TB does not read it until the top of cpu_exec(), so
+ * the predicate can find every VPE halted while one of them is still
+ * retiring instructions and about to reach the EVPE that reopens the
+ * processor.  Measured: one control boot fired MVPWEDGE (owed=0x4, the owner
+ * parked in mips_mt_send_ipi) and then powered off six seconds later.  A
+ * single report is therefore a necessary condition, not a proof; what makes
+ * a stall a stall is that the guest never resumes, and the report says which
+ * of the four gates to look at when it does not.
  */
 
 int mips_mvp_debug = -1;
 
 #define MIPS_MVP_RING 4096
+#define MIPS_MVP_MAXVPE 32
 
 typedef struct MipsMvpEvent {
     uint64_t seq;
-    int32_t cpu;
+    int32_t cpu;        /* VPE that executed the instruction        */
+    int32_t target;     /* VPE it acted on, or -1 for the shared word */
     int32_t op;
+    uint32_t pc;        /* setter's guest PC                        */
     uint32_t before;
     uint32_t after;
     int32_t owed;
@@ -159,6 +173,16 @@ static uint32_t mvp_owed_mask;     /* VPEs that still owe an evpe restore */
 static uint32_t mvp_strand_seen;   /* strand already reported for this run */
 static uint64_t mvp_strands;
 static uint64_t mvp_gate_mask;     /* VPEs observed gated off by EVP */
+
+/*
+ * Newest run-state edge per VPE, latched outside the ring.
+ *
+ * The ring answers "what was the interleaving"; these answer "what halted
+ * this particular VPE", which is the question a stall with every VPE halted
+ * actually poses, and they answer it however long ago it happened.
+ */
+static MipsMvpEvent mvp_last_halt[MIPS_MVP_MAXVPE];
+static MipsMvpEvent mvp_last_wake[MIPS_MVP_MAXVPE];
 
 void mips_mvp_debug_init(void)
 {
@@ -182,8 +206,25 @@ static const char *mvp_opname(int op)
     case MIPS_MVP_EVPE_NA: return "evpe.na";
     case MIPS_MVP_MTC0_WR: return "mtc0.wr";
     case MIPS_MVP_MTC0_NA: return "mtc0.na";
+    case MIPS_MVP_SLEEP_DVPE: return "slp.dvpe";
+    case MIPS_MVP_SLEEP_DVP:  return "slp.dvp";
+    case MIPS_MVP_SLEEP_TC:   return "slp.tc";
+    case MIPS_MVP_SLEEP_WAIT: return "slp.wait";
+    case MIPS_MVP_WAKE_EVPE:  return "wak.evpe";
+    case MIPS_MVP_WAKE_EVP:   return "wak.evp";
+    case MIPS_MVP_WAKE_TC:    return "wak.tc";
     default: return "?";
     }
+}
+
+static void mvp_print_event(const char *what, const MipsMvpEvent *e)
+{
+    fprintf(stderr, "%s %6" PRIu64 " cpu=%d %-8s target=%d pc=0x%08x "
+                    "%08x -> %08x evp=%d->%d owed=0x%x\n",
+            what, e->seq, e->cpu, mvp_opname(e->op), e->target, e->pc,
+            e->before, e->after,
+            (e->before >> CP0MVPCo_EVP) & 1, (e->after >> CP0MVPCo_EVP) & 1,
+            e->owed);
 }
 
 static void mvp_dump_ring(void)
@@ -199,11 +240,7 @@ static void mvp_dump_ring(void)
         if (e->seq != i) {
             continue;   /* overwritten while we were printing */
         }
-        fprintf(stderr, "MVPRING %6" PRIu64 " cpu=%d %-7s %08x -> %08x "
-                        "evp=%d->%d owed=0x%x\n",
-                e->seq, e->cpu, mvp_opname(e->op), e->before, e->after,
-                (e->before >> CP0MVPCo_EVP) & 1, (e->after >> CP0MVPCo_EVP) & 1,
-                e->owed);
+        mvp_print_event("MVPRING", e);
     }
     fflush(stderr);
 }
@@ -242,7 +279,9 @@ void mips_mvp_note(CPUMIPSState *env, int op, uint32_t before, uint32_t after)
     s = qatomic_fetch_inc(&mvp_seq);
     e = &mvp_ring[s % MIPS_MVP_RING];
     e->cpu = cs->cpu_index;
+    e->target = -1;
     e->op = op;
+    e->pc = (uint32_t)env->active_tc.PC;
     e->before = before;
     e->after = after;
     e->owed = owed;
@@ -260,6 +299,55 @@ void mips_mvp_note(CPUMIPSState *env, int op, uint32_t before, uint32_t after)
 }
 
 /*
+ * Run-state edge: some VPE just halted or un-halted @target.
+ *
+ * cs->halted is the last word on whether a vCPU is offered to the scheduler,
+ * so in a stall where every VPE is halted the only question left is which
+ * instruction, on which VPE, set it -- and the sites that can are few:
+ * DVPE/DVP sleeping siblings, an mtc0/mttc0 to TCHalt deactivating a thread
+ * context, and the VPE's own WAIT.  Recording (setter, target, setter pc) at
+ * each of them turns "every VPE is halted" into a named culprit.  The setter
+ * is read from current_cpu because every one of these sites is reached from
+ * a TCG helper on the issuing vCPU's own thread.
+ */
+void mips_mvp_note_run(CPUState *target, int op)
+{
+    CPUState *cs = current_cpu;
+    uint64_t s;
+    MipsMvpEvent *e, rec;
+
+    if (!mips_mvp_debug) {
+        return;
+    }
+
+    memset(&rec, 0, sizeof(rec));
+    rec.cpu = cs ? cs->cpu_index : -1;
+    rec.target = target->cpu_index;
+    rec.op = op;
+    rec.pc = cs ? (uint32_t)MIPS_CPU(cs)->env.active_tc.PC : 0;
+    rec.before = (uint32_t)MIPS_CPU(target)->env.mvp->CP0_MVPControl;
+    rec.after = rec.before;
+    rec.owed = qatomic_read(&mvp_owed_mask);
+
+    s = qatomic_fetch_inc(&mvp_seq);
+    rec.seq = s;
+    e = &mvp_ring[s % MIPS_MVP_RING];
+    *e = rec;
+    qatomic_set(&e->seq, s);
+
+    if (target->cpu_index >= 0 && target->cpu_index < MIPS_MVP_MAXVPE) {
+        bool halting = (op == MIPS_MVP_SLEEP_DVPE || op == MIPS_MVP_SLEEP_DVP ||
+                        op == MIPS_MVP_SLEEP_TC || op == MIPS_MVP_SLEEP_WAIT);
+
+        if (halting) {
+            mvp_last_halt[target->cpu_index] = rec;
+        } else {
+            mvp_last_wake[target->cpu_index] = rec;
+        }
+    }
+}
+
+/*
  * Which of mips_vpe_active()'s four independent clauses is holding this VPE
  * off the run queue.  They are not interchangeable: EVP is processor-wide
  * and only an executing VPE can set it, while VPA/TCStatus.A/TCHalt are
@@ -268,8 +356,13 @@ void mips_mvp_note(CPUMIPSState *env, int op, uint32_t before, uint32_t after)
  */
 static void mvp_gate_reason(CPUMIPSState *env, char *buf, size_t n)
 {
-    snprintf(buf, n, "%s%s%s%s",
-             (env->mvp->CP0_MVPControl & (1 << CP0MVPCo_EVP)) ? "" : "EVP0 ",
+    bool evp = env->mvp->CP0_MVPControl & (1 << CP0MVPCo_EVP);
+    bool owner = qatomic_read(&env->mvp->evp_owner) ==
+                 env_cpu(env)->cpu_index;
+
+    snprintf(buf, n, "%s%s%s%s%s",
+             (evp || owner) ? "" : "EVP0 ",
+             (!evp && owner) ? "EVPOWNER " : "",
              (env->CP0_VPEConf0 & (1 << CP0VPEC0_VPA)) ? "" : "VPA0 ",
              (env->active_tc.CP0_TCStatus & (1 << CP0TCSt_A)) ? "" : "TCA0 ",
              (env->active_tc.CP0_TCHalt & 1) ? "TCHALT " : "");
@@ -278,7 +371,7 @@ static void mvp_gate_reason(CPUMIPSState *env, char *buf, size_t n)
 static void mvp_report_cpu(const char *what, CPUState *cs)
 {
     CPUMIPSState *env = &MIPS_CPU(cs)->env;
-    char why[40];
+    char why[56];
 
     mvp_gate_reason(env, why, sizeof(why));
     fprintf(stderr, "%s cpu=%d gate=[%s] MVPControl=%08x VPEConf0=%08x "
@@ -345,6 +438,28 @@ void mips_mvp_note_gate(CPUMIPSState *env)
             old | bit);
     CPU_FOREACH(other) {
         mvp_report_cpu("MVPWEDGE", other);
+    }
+    /*
+     * The latched edges answer the question the state dump cannot: every VPE
+     * is halted, so for each one, name the instruction that halted it and the
+     * VPE that issued it.
+     */
+    CPU_FOREACH(other) {
+        int i = other->cpu_index;
+
+        if (i < 0 || i >= MIPS_MVP_MAXVPE) {
+            continue;
+        }
+        if (mvp_last_halt[i].op || mvp_last_halt[i].seq) {
+            mvp_print_event("MVPHALT", &mvp_last_halt[i]);
+        } else {
+            fprintf(stderr, "MVPHALT (none) target=%d\n", i);
+        }
+        if (mvp_last_wake[i].op || mvp_last_wake[i].seq) {
+            mvp_print_event("MVPWAKE", &mvp_last_wake[i]);
+        } else {
+            fprintf(stderr, "MVPWAKE (none) target=%d\n", i);
+        }
     }
     mvp_dump_ring();
 }

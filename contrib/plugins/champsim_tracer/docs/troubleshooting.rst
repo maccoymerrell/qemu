@@ -579,6 +579,72 @@ other address spaces.  Armed globally the detector called that a wedge —
 it did, on ``system.churn_x86``.  Until the budget is recorded per
 workload, the validator passes through only what the operator set.
 
+Recognising the state, and the one test that discriminates
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Score a capture on whether **its segment closed**, never on how long the
+cell took.  A capture in this state prints ``starting segment 'marker'``
+and never the ``end marker — closing`` / ``finished segment … END`` pair:
+the workload's END marker executed on the correct path and the window did
+not act on it, so the window is still open when the run is stopped, and
+the cell's ``stats.log`` is empty because the close that writes it never
+ran.  Elapsed time does not discriminate.  Under host contention a
+healthy cell can spend minutes inside the window and still close — cells
+that stalled for over two minutes and then finished normally sit in the
+same waves as the ones described here — while a capture in this state
+closes never.
+
+On the canonical x86_64 marker cell the state has a constant shape:
+
+* the traced process's user-instruction stream stops inside the guest's
+  shutdown path at a point reproducible to within a few hundred
+  instructions across runs, about thirteen thousand user instructions
+  short of where a healthy cell reaches poweroff.  A guest merely starved
+  of host CPU stops wherever it happens to be; this one stops in the same
+  place every time;
+* the guest is neither idle nor stopped.  Kernel instructions keep
+  retiring at close to a million per guest-second inside the scheduler's
+  accounting band, guest time keeps advancing, and the LAPIC keeps
+  delivering timer interrupts at the guest's tick rate.  The scheduler
+  never picks the traced task again;
+* every wrong-path corruption instrument reads zero across the episode —
+  device-register digests, the armed-deadline digests for all three
+  clocks, the interrupt gain/loss counters.  Nothing is corrupted.
+
+Reproducing it, and why a zero needs its own power
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The state is rare, its frequency moves with host contention, and it has
+not been eliminated, so an attempt to observe it has to bring its own
+contention rather than wait for the machine to supply some, and has to be
+sized against the frequency of **the tree being tested** rather than one
+measured on another tree.
+
+The shape that produces it is the canonical marker cell — window
+``marker:simulation=3000000+policy=latch``, ``wpdepth=64``, one vCPU
+pinned to a single core, a 180 s harness cap — with that core's SMT
+sibling held busy for the life of the cell and the rest of the host under
+memory-bandwidth load.  Cells are cheap, a healthy one closing in
+seconds, so the practical unit is a wave of a few hundred scored on the
+close.  Interleave the arms of any comparison cell by cell instead of
+running one arm and then the other: the frequency tracks host load over
+tens of minutes, and the same tree measured before and during a quiet
+period differs by more than any two trees do — the tree that produced 8
+non-closes in 120 cells under load produced none in 105 when the machine
+went quiet.
+
+Measured that way at 370 cells per arm, the frequency has fallen by
+roughly twenty-fold over the trees between ``a2712d64b2`` and
+``e7df2be670`` (20/370, then 4/370 at ``790a5fdb0c``, then 1/370), and
+the sharpest single step sits at the commit that taught the wrong-path
+TLB log to survive a large page (``a2712d64b2`` 20/370 versus
+``337b0265b9`` 0/120, Fisher p = 0.003).  It is not zero at any point
+tested, and the surviving cells are the same shape as the original ones
+down to the stopping instruction.  A wave of a few hundred clean cells is
+therefore weak evidence about this state: at the frequency the last of
+those trees shows, a thousand consecutive clean cells still happen about
+one time in fourteen.
+
 Where to look next
 ------------------
 

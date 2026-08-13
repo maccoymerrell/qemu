@@ -205,6 +205,14 @@ uint64_t cpu_plugin_ticks_peer_only_thaws(void);
  *
  * No-op while ticks are disabled.  Caller must hold BQL.
  */
+/*
+ * Sample the anchor the lock line is drawn through -- the guest TSC and the
+ * guest virtual clock AT ONE INSTANT.  Read separately the host time between
+ * the two reads becomes a permanent constant bias in the line, so the caller
+ * must not compose this pair itself.  Caller must hold BQL.
+ */
+void cpu_plugin_tsc_anchor(int64_t *ref_tsc, int64_t *ref_clk);
+
 void cpu_plugin_pin_tsc(int64_t ref_tsc, int64_t ref_clk, double tsc_hz);
 #endif
 

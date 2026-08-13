@@ -423,12 +423,23 @@ static void x86_spec_clock_resync(CPUState *cs, SpecClockResyncReason reason)
             g_pin_cal_ns  += hm - g_pin_last_hm;
         }
         if (g_pin_cal_ns >= 200 * 1000 * 1000) {
-            /* Freeze the ratio and anchor the lock at the current (still
+            /*
+             * Freeze the ratio and anchor the lock at the current (still
              * unskewed) values; from here the TSC is a pure function of the
-             * virtual clock. */
+             * virtual clock.
+             *
+             * The anchor is taken as ONE point, through cpu_plugin_tsc_anchor,
+             * not as cpu_get_ticks() followed by cpu_get_clock().  Read
+             * separately, the guest TSC coordinate is sampled first and every
+             * nanosecond of host time before the clock read is subtracted from
+             * the line and from nothing else -- and unlike the per-pin case
+             * this one never washes out, because the line and the TSC have the
+             * same slope by construction.  A line planted below the free-
+             * running value is a line the pin's downward refusal declines to
+             * apply, so the lock quietly stops locking.
+             */
             g_pin_tsc_hz  = (double)g_pin_cal_tsc / (double)g_pin_cal_ns * 1e9;
-            g_pin_ref_tsc = cpu_get_ticks();
-            g_pin_ref_clk = cpu_get_clock();
+            cpu_plugin_tsc_anchor(&g_pin_ref_tsc, &g_pin_ref_clk);
             g_pin_ready   = true;
         }
     }

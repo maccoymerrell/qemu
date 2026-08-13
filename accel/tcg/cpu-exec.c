@@ -38,6 +38,9 @@
 #include "exec/exec-all.h"
 #include "system/cpu-timers.h"
 #include "system/runstate.h"
+#ifndef CONFIG_USER_ONLY
+#include "system/system.h"      /* rtc_clock, for the excursion clock audit */
+#endif
 #include "exec/replay-core.h"
 #include "system/tcg.h"
 #include "exec/helper-proto-common.h"
@@ -1822,6 +1825,219 @@ static void cst_clkeq_check(CPUState *cpu, int64_t pre_thaw)
         fflush(stderr);
     }
 }
+
+/*
+ * CST_CLKAUDIT: can a guest observe ANY time discontinuity across a wrong-path
+ * excursion?  Answered by enumerating the sources rather than by checking the
+ * ones we thought of.
+ *
+ * cst_clkeq above samples ONE field, QEMU_CLOCK_VIRTUAL.  A zero from it is a
+ * statement about that field and nothing else, and a guest has more than one
+ * clock: on x86 alone the kernel reads the TSC, the HPET, the ACPI PM timer,
+ * the LAPIC current-count, the PIT and the CMOS RTC, and its clocksource
+ * watchdog exists precisely to cross-check one against another.  A per-field
+ * instrument can only ever report on the fields someone listed.
+ *
+ * The enumeration is made complete by taking it one level below the guest's
+ * clocks, at their ROOTS.  Every guest-visible timebase in QEMU is computed on
+ * demand, at the moment the guest reads it, from one of six host-side
+ * quantities.  Sampling those six therefore covers every derived source --
+ * including sources in devices this file has never heard of, and ones not yet
+ * written -- provided the derivation set really is closed.  That is a source
+ * property, so it is established mechanically rather than asserted:
+ *
+ *     grep -rn 'qemu_clock_get_\(ns\|ms\|us\)(' --include=*.c hw/ target/ system/
+ *     grep -rn 'cpu_get_host_ticks()\|cpu_get_ticks()\|cpus_get_elapsed_ticks()'
+ *
+ * Every hit resolves to a literal QEMU_CLOCK_* or to the one global selector
+ * rtc_clock (which is itself one of QEMU_CLOCK_HOST / _REALTIME / _VIRTUAL).
+ * Re-run those two greps when adding a device or a target: a new root is a new
+ * row here, and a hit that bottoms out in neither list is a hole in this
+ * instrument, not a clean result.
+ *
+ * The rows, and what each is allowed to do across an excursion:
+ *
+ *   VIRTUAL     cpus_get_virtual_clock()   HPET, ACPI PM, PIT, LAPIC timer,
+ *                                          Arm CNTVCT/CNTPCT, MIPS CP0 Count,
+ *                                          RISC-V ACLINT mtime.  MUST NOT MOVE.
+ *   VMTICKS     cpu_get_ticks()            x86 TSC (cpus_get_elapsed_ticks),
+ *                                          RISC-V mcycle/minstret.  MUST NOT
+ *                                          MOVE -- x86 additionally re-pins it
+ *                                          to the virtual clock at every thaw,
+ *                                          so this row also checks that pin.
+ *   VIRTUAL_RT  cpu_get_clock()            QEMU_CLOCK_VIRTUAL_RT.  MUST NOT
+ *                                          MOVE (same gate as the above).
+ *   HOST        get_clock_realtime()       host wall time.  Guest-visible ONLY
+ *                                          through an RTC model, and only when
+ *                                          rtc_clock names it -- so the
+ *                                          exemption is COMPUTED from
+ *                                          rtc_clock, never assumed.
+ *   REALTIME    get_clock()                host monotonic.  Same rule.
+ *   HOSTTICKS   cpu_get_host_ticks()       raw host cycle counter.  No target
+ *                                          reads it in system mode; the row
+ *                                          exists so that claim is measured
+ *                                          rather than believed, and is
+ *                                          reported as an unconditional
+ *                                          exemption.  RISC-V's
+ *                                          mcycle/minstret DID read it, which
+ *                                          is why the row is not simply absent.
+ *
+ * A row that must not move and moved is named, with its delta, in both halves:
+ * ADVANCED (it moved while the window was open -- the freeze did not hold) and
+ * NOTRESTORED (it did not come back across the thaw and the per-target
+ * resync).  Exempt rows are still sampled and still reported, once, with the
+ * reason -- an exemption an operator cannot see is an exemption nobody
+ * checked.
+ *
+ * Positive control: CST_NOFREEZE skips the freeze, so under it every
+ * must-not-move row must report ADVANCED.  A run with CST_CLKAUDIT and
+ * CST_NOFREEZE both set that reports nothing has a broken instrument.
+ */
+typedef enum {
+    CST_CLKROOT_VIRTUAL,
+    CST_CLKROOT_VMTICKS,
+    CST_CLKROOT_VIRTUAL_RT,
+    CST_CLKROOT_HOST,
+    CST_CLKROOT_REALTIME,
+    CST_CLKROOT_HOSTTICKS,
+    CST_CLKROOT__COUNT
+} CstClkRoot;
+
+static const char * const cst_clkroot_name[CST_CLKROOT__COUNT] = {
+    [CST_CLKROOT_VIRTUAL]    = "QEMU_CLOCK_VIRTUAL",
+    [CST_CLKROOT_VMTICKS]    = "VM_TICKS",
+    [CST_CLKROOT_VIRTUAL_RT] = "QEMU_CLOCK_VIRTUAL_RT",
+    [CST_CLKROOT_HOST]       = "QEMU_CLOCK_HOST",
+    [CST_CLKROOT_REALTIME]   = "QEMU_CLOCK_REALTIME",
+    [CST_CLKROOT_HOSTTICKS]  = "HOST_TICKS",
+};
+
+static bool cst_clkaudit_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("CST_CLKAUDIT") != NULL;
+    }
+    return on > 0;
+}
+
+/*
+ * Whether a moving root is a guest-visible discontinuity.  For the three
+ * gated roots the answer is fixed.  For the two host clocks it depends on
+ * whether an RTC model is currently pointed at them, which is what rtc_clock
+ * says -- so the exemption is derived from live configuration, and an
+ * operator who passes -rtc clock=host (or runs without a plugin, so the
+ * adoption in rtc_adopt_vm_clock_for_plugin() does not fire) gets the row
+ * enforced instead of excused.
+ */
+static bool cst_clkroot_must_hold(CstClkRoot r, const char **why)
+{
+    switch (r) {
+    case CST_CLKROOT_VIRTUAL:
+    case CST_CLKROOT_VMTICKS:
+    case CST_CLKROOT_VIRTUAL_RT:
+        *why = "guest-visible";
+        return true;
+    case CST_CLKROOT_HOST:
+        if (rtc_clock == QEMU_CLOCK_HOST) {
+            *why = "guest-visible: rtc_clock == QEMU_CLOCK_HOST";
+            return true;
+        }
+        *why = "host-only: no RTC points at it";
+        return false;
+    case CST_CLKROOT_REALTIME:
+        if (rtc_clock == QEMU_CLOCK_REALTIME) {
+            *why = "guest-visible: rtc_clock == QEMU_CLOCK_REALTIME";
+            return true;
+        }
+        *why = "host-only: no RTC points at it";
+        return false;
+    case CST_CLKROOT_HOSTTICKS:
+    default:
+        *why = "host-only: no system-mode target reads the raw host counter";
+        return false;
+    }
+}
+
+static void cst_clkaudit_sample(int64_t v[CST_CLKROOT__COUNT])
+{
+    v[CST_CLKROOT_VIRTUAL]    = cpus_get_virtual_clock();
+    v[CST_CLKROOT_VMTICKS]    = cpu_get_ticks();
+    v[CST_CLKROOT_VIRTUAL_RT] = cpu_get_clock();
+    /*
+     * The two host clocks are read through their raw accessors rather than
+     * qemu_clock_get_ns(), which wraps them in REPLAY_CLOCK: an instrument
+     * must not consume a replay event.
+     */
+    v[CST_CLKROOT_HOST]       = get_clock_realtime();
+    v[CST_CLKROOT_REALTIME]   = get_clock();
+    v[CST_CLKROOT_HOSTTICKS]  = cpu_get_host_ticks();
+}
+
+static __thread int64_t g_clkaudit_pause[CST_CLKROOT__COUNT];
+
+static void cst_clkaudit_note_pause(void)
+{
+    if (cst_clkaudit_on()) {
+        cst_clkaudit_sample(g_clkaudit_pause);
+    }
+}
+
+static void cst_clkaudit_check(CPUState *cpu,
+                               const int64_t pre_thaw[CST_CLKROOT__COUNT])
+{
+    if (!cst_clkaudit_on()) {
+        return;
+    }
+    int64_t post[CST_CLKROOT__COUNT];
+    static __thread uint64_t n_adv[CST_CLKROOT__COUNT];
+    static __thread uint64_t n_not[CST_CLKROOT__COUNT];
+    static __thread bool exempt_said[CST_CLKROOT__COUNT];
+
+    cst_clkaudit_sample(post);
+
+    for (int r = 0; r < CST_CLKROOT__COUNT; r++) {
+        const char *why = NULL;
+        bool must = cst_clkroot_must_hold(r, &why);
+        int64_t d_in  = pre_thaw[r] - g_clkaudit_pause[r];
+        int64_t d_out = post[r]     - g_clkaudit_pause[r];
+
+        if (!must) {
+            /* Said once per row per thread, with the movement it was excused
+             * for, so the exemption is visible and its size is on the record. */
+            if (!exempt_said[r]) {
+                exempt_said[r] = true;
+                fprintf(stderr, "[clkaudit] cpu%d EXEMPT root=%s reason=\"%s\" "
+                        "in_excursion_delta=%" PRId64 "\n", cpu->cpu_index,
+                        cst_clkroot_name[r], why, d_in);
+                fflush(stderr);
+            }
+            continue;
+        }
+        if (d_in != 0) {
+            n_adv[r]++;
+            if ((n_adv[r] & (n_adv[r] - 1)) == 0) {
+                fprintf(stderr, "[clkaudit] cpu%d ADVANCED root=%s (%s) "
+                        "pause=%" PRId64 " in_excursion=%" PRId64
+                        " delta=%" PRId64 " n=%" PRIu64 "\n", cpu->cpu_index,
+                        cst_clkroot_name[r], why, g_clkaudit_pause[r],
+                        pre_thaw[r], d_in, n_adv[r]);
+                fflush(stderr);
+            }
+        }
+        if (d_out != 0) {
+            n_not[r]++;
+            if ((n_not[r] & (n_not[r] - 1)) == 0) {
+                fprintf(stderr, "[clkaudit] cpu%d NOTRESTORED root=%s (%s) "
+                        "pause=%" PRId64 " resume=%" PRId64
+                        " delta=%" PRId64 " n=%" PRIu64 "\n", cpu->cpu_index,
+                        cst_clkroot_name[r], why, g_clkaudit_pause[r],
+                        post[r], d_out, n_not[r]);
+                fflush(stderr);
+            }
+        }
+    }
+}
 /*
  * CST_CLKPROBE (#80 diagnostic): measure the guest-visible TSC-vs-monotonic
  * skew the WP time-freeze accumulates.  Every excursion the freeze excludes a
@@ -1958,6 +2174,7 @@ void cpu_plugin_spec_vtime_pause(CPUState *cpu)
     }
 #ifdef CONFIG_PLUGIN
     cst_clkeq_note_pause();           /* #77 falsifier: excursion clock equality */
+    cst_clkaudit_note_pause();        /* every root a guest clock derives from */
 #endif
 #if defined(TARGET_RISCV) && defined(CONFIG_PLUGIN)
     /*
@@ -2082,9 +2299,17 @@ void cpu_plugin_spec_vtime_resume(CPUState *cpu)
      * ticks already enabled and left them so.
      */
     int64_t clkeq_pre_thaw = 0;
+    int64_t clkaudit_pre_thaw[CST_CLKROOT__COUNT] = { 0 };
 #ifdef CONFIG_PLUGIN
     if (cst_clkeq_on()) {
         clkeq_pre_thaw = cpu_get_clock();   /* before the thaw: did it move? */
+    }
+    if (cst_clkaudit_on()) {
+        /* Sampled here, inside the still-open window: this is what the guest
+         * would have read had it executed one more instruction before the
+         * excursion closed, and it is the only place the "did the freeze hold
+         * for the WHOLE window" half of the question can be answered. */
+        cst_clkaudit_sample(clkaudit_pre_thaw);
     }
     if (!cst_nofreeze())   /* #77 arm: never disabled ticks; don't re-enable */
 #endif
@@ -2144,6 +2369,7 @@ void cpu_plugin_spec_vtime_resume(CPUState *cpu)
      * value the guest will see.
      */
     cst_clkeq_check(cpu, clkeq_pre_thaw);
+    cst_clkaudit_check(cpu, clkaudit_pre_thaw);
     /*
      * The leak diff belongs after the LAST step of the restore, for the same
      * reason: a comparison taken before the restore finishes reports the work

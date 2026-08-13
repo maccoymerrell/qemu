@@ -1779,9 +1779,26 @@ static void cst_clkeq_check(CPUState *cpu, int64_t pre_thaw)
      * inside a peer's window, so a large figure alongside zero ADVANCED lines
      * is the measurement that the machine-wide reference count is what holds
      * the requirement, not luck.
+     *
+     * The count that gates this line is per-vCPU-thread, so the period has to
+     * be chosen against the excursions ONE vCPU takes, not the machine's total.
+     * A fixed 20000 silently reports nothing on exactly the cells the peer
+     * figure exists for: an x86_64 -smp 4 marker cell taking 20587 excursions
+     * spread over four vCPUs printed no line at all, so peer_only_thaws -- the
+     * only readout of the condition -- was unavailable on an SMP run, which is
+     * where the condition lives.  CST_CLKEQ_EVERY sets the period; at 500 the
+     * same cell reports it, and reads 528694.
      */
     static __thread uint64_t n_excursions;
-    if ((++n_excursions % 20000) == 0) {
+    static int every = -1;
+    if (every < 0) {
+        const char *s = getenv("CST_CLKEQ_EVERY");
+        every = s ? atoi(s) : 20000;
+        if (every <= 0) {
+            every = 20000;
+        }
+    }
+    if ((++n_excursions % (unsigned)every) == 0) {
         fprintf(stderr, "[clkeq] cpu%d excursions=%" PRIu64 " advanced=%" PRIu64
                 " notrestored=%" PRIu64 " peer_only_thaws=%" PRIu64 "\n",
                 cpu->cpu_index, n_excursions, n_adv, n_not,

@@ -560,24 +560,32 @@ took on *every* run: the END block reached the wire at its full
 translated instruction count while the marker's exit stopped its last
 instructions from running, so the captured slice was always short
 against that inflated expectation and was discarded whole.  The close
-walk now truncates the block to what executed
-(:doc:`architecture`, *the segment-finish flush*) and the subset reads
-0 — but it stays broken out, because a reading of 0 there is a claim
-about the dominant case and has to be visible as one.
+walk now truncates the block to what executed (:doc:`architecture`,
+*the segment-finish flush*), which removed that whole-run behaviour —
+but **the subset does not read 0**, and this document said it did until
+the claim was checked against the runs.
+
+Across 391 recent ``.stats.log`` sidecars carrying both counters, five
+report ``CP reg-snap slice dropped 1``: two of them at end-marker close
+(``r3/cells/t_hd_x8``, ``r3/cells/s_pre_x2``, both x86-64, 4 register
+deltas discarded each) and three by some other close route
+(``census0/sd_smp2`` 2 deltas, ``census0/tt_x86`` 4 deltas,
+``census0/tt_mi`` 0 deltas).  The truncation fixed the common case, not
+the last one.  Read the subset as what it is — a live counter that
+distinguishes the two close routes when a drop does occur — and read a
+nonzero ``dropped`` on any run as the completeness loss it is.  Nothing
+in this section asserts a value the counter has been observed to take;
+that is the mistake the previous wording made.
 
 Because the two counters live only in the plugin's own
 ``<outfile>.stats.log`` sidecar (:doc:`quickstart`, *Output files and
 stderr*) — never on the wire — a pure trace-file reader cannot recover
-them after the fact.  ``cst_audit`` auto-detects the sidecar beside the
-trace (stripping a trailing ``.cst`` from the trace path and appending
-``.stats.log`` — the common ``outfile=run`` case, where it lands at
-``run.stats.log``; simpoint mode's position-suffixed segment files do
-not map back this way and need ``--stats-log`` explicitly) or accepts
-an explicit path:
+them after the fact.  ``cst_audit`` finds the sidecar beside the trace,
+or accepts an explicit ``--stats-log=PATH``:
 
 .. code-block:: console
 
-   $ build/contrib/plugins/cst_audit --stats-log=run.stats.log run.cst
+   $ build/contrib/plugins/cst_audit run.cst
    === COMPLETENESS (Oracle 1; run.stats.log) ===
      CP reg-snap slice dropped                0
        at end-marker close                    0
@@ -590,15 +598,31 @@ A sidecar written by a plugin old enough to lack the breakdown rows
 prints ``NOT REPORTED`` for them rather than ``0``: an absent counter
 is an unobserved quantity, not a satisfied one.
 
-When no sidecar is found (auto-detected path missing) the section
-still prints, saying ``NOT CHECKED`` and naming the path it looked
-for — a check whose subject is missing must not read as a check that
-passed.  This is the offline half of a check the validator
-also runs at trace-generation time as a registered, gating feature
-(``features.reg_snap_accounting``, :doc:`validator`); passing an
-explicit ``--stats-log`` that turns out unreadable or missing either
-counter IS an error (``cst_audit`` exits 1), so a consumer who
-deliberately asks for the check gets a hard answer, not a silent skip.
+Finding the sidecar means undoing two different derivations of the same
+``outfile=`` string.  The trace name strips a trailing ``.cst`` before
+re-appending it, and inserts a segment label in simpoint mode; the
+sidecar name appends to the string verbatim.  So ``outfile=run`` gives
+``run.cst`` / ``run.stats.log``, ``outfile=run.cst`` gives ``run.cst`` /
+``run.cst.stats.log``, and a simpoint run gives
+``run-<position>B.cst`` segment files against one shared
+``run.stats.log``.  All four spellings are enumerated and probed in
+order.  The simpoint label is decidable from the filename — the plugin
+mints it as ``<whole>B`` or ``<whole>_<frac>B``, digits only, with
+``_`` chosen for the fractional separator precisely so the only ``.``
+in the name is the extension — so a segment file resolves to its run's
+sidecar without being told.
+
+**If no candidate carries the counters, the audit fails.**  It used to
+print ``NOT CHECKED`` and exit 0, which meant every simpoint segment
+trace — whose sidecar the old single-candidate rule could not name —
+scored green on an oracle that had not run, with a 100.00 % byte rollup
+beside it.  A check that cannot find its subject is not a check that
+passed.  ``--no-stats-log`` remains available to skip the oracle
+deliberately; the point is that skipping is now a decision on the
+record rather than something that happens quietly.  This is the offline
+half of a check the validator also runs at trace-generation time as a
+registered, gating feature (``features.reg_snap_accounting``,
+:doc:`validator`).
 
 Validating a trace
 ------------------

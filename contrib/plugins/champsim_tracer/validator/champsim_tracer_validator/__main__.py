@@ -1458,17 +1458,22 @@ def cmd_deadlatch_test(args) -> int:
                   f"refreshes_refused={refused}")
 
             cst = Path(f"{out_base}.cst")
+            # The close route comes out of the run's own console line, not
+            # out of what this cell meant to exercise: the thread_end
+            # oracle relaxes exactly one arm for a sweep close, so the
+            # relaxation must be keyed on what actually closed the segment.
+            close_reason = V.parse_close_reason(ctext)
+            if close_reason is None:
+                print(f"deadlatch_test[{isa}/{shape}]: FAIL  no "
+                      f"'finished segment' line to name the close route — "
+                      f"the thread_end oracle cannot know which arm applies")
+                rc_total = 1
             report = V.validate_structural(cst, expected_threads=1,
                                            expected_guest_threads=1,
-                                           marker=True)
+                                           marker=True,
+                                           close_reason=close_reason)
             print(report.summary())
-            # Two named, TRUE tolerances — printed, never silent:
-            #
-            #   thread_end (both shapes): the latch closes a context whose
-            #   process stopped executing long before the close, so its
-            #   last entry was emitted with no way to know it was final;
-            #   the wire has no retroactive stamp.  OPEN wire-contract
-            #   question for the deadlatch/ceiling close family (task #93).
+            # One named, TRUE tolerance — printed, never silent:
             #
             #   storm shape, single-process structure: between the death
             #   and the close the recycled root's successor process IS
@@ -1476,7 +1481,12 @@ def cmd_deadlatch_test(args) -> int:
             #   #44, bounded here by latch_idle_insns), so oracles that
             #   assume one process's control flow are inapplicable to this
             #   shape by construction.
-            tolerated = {"thread_end"}
+            # thread_end is NO LONGER tolerated: the sweep-close arm of
+            # the oracle now states the contract instead of excusing a
+            # failure (format.rst §4.2a — a context with nothing pending
+            # at the close ends unstamped), so a thread_end error here is
+            # a real one again.
+            tolerated: set[str] = set()
             if shape == "storm":
                 tolerated |= {"syscall_transitions", "thread_chain",
                               "thread_distribution",

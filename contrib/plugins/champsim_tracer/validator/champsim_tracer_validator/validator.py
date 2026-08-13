@@ -6054,7 +6054,40 @@ def _check_wp_fork_resolved(entries: list[dict]) -> list[Issue]:
         f"outcome", {"forked": n_forked})]
 
 
-def _check_thread_end_flags(entries: list[dict]) -> list[Issue]:
+#: Close routes that fire BECAUSE the pinned context stopped executing.
+#: The dead latch and the any-context ceiling are raised by a sweep, not
+#: by the context's own progress, so at the moment they fire the context
+#: has nothing pending: its last entry went to the wire through the
+#: ordinary seal path, when nothing could know it was final, and the
+#: close-time flush emits nothing to carry the stamp.  The fact is
+#: retroactive and the wire is already written, so THREAD_END is a
+#: positive marker here and its absence is the contract (format.rst
+#: §4.2a, "Thread end"), not a forgotten stamp.  Every other route --
+#: END marker, process exit, icount/simpoint budget, machine shutdown,
+#: reset -- is raised on a context that is still running, so the close
+#: does have a final to stamp and the F6 arm applies in full.
+_THREAD_END_SWEEP_CLOSES = frozenset({"IDLE", "CEILING"})
+
+_CLOSE_REASON_RE = re.compile(
+    r"champsim_tracer: finished segment \[icount .*?\]\s.*?\s(\S+)\s*$",
+    re.MULTILINE)
+
+
+def parse_close_reason(console_text: str) -> str | None:
+    """The close route named by the LAST ``finished segment`` line.
+
+    The plugin ends that line with the close reason (IDLE, CEILING,
+    SHUTDOWN, RESET, END) or, when no route named itself, with the
+    coverage verdict (OK / UNDER / END).  Returns None when the text
+    carries no such line, which callers must treat as "unknown" — the
+    strict arm, never a tolerance.
+    """
+    found = _CLOSE_REASON_RE.findall(console_text or "")
+    return found[-1] if found else None
+
+
+def _check_thread_end_flags(entries: list[dict],
+                            close_reason: str | None = None) -> list[Issue]:
     """CST_BB_FLAG_THREAD_END marks each context's final entry at EVERY
     close route (thread exit, END marker, icount/simpoint budget, idle
     ceiling, machine shutdown), format spec §4.2a/§5.6.  A consumer
@@ -6076,6 +6109,16 @@ def _check_thread_end_flags(entries: list[dict]) -> list[Issue]:
       * **the stamp never lies** — an entry carrying the flag anywhere
         in the stream must be its context's last; a flagged context
         that keeps executing declared an end that wasn't.
+
+    @close_reason names the route that ended the segment (see
+    parse_close_reason).  On a SWEEP close — the dead latch and the
+    any-context ceiling — the first arm does not apply and is not run:
+    those routes fire because the context stopped executing, so nothing
+    of it is pending and the close emits no final to stamp.  The arm is
+    reported as not-applicable with the reason and the unstamped count
+    named, never as a pass, and the second arm still runs in full.  An
+    unknown reason takes the strict path: a check does not weaken itself
+    on missing evidence.
 
     An empty body has no contexts and nothing to assert (info)."""
     issues: list[Issue] = []
@@ -6107,6 +6150,19 @@ def _check_thread_end_flags(entries: list[dict]) -> list[Issue]:
         seen_back.add(ctx)
         tail_finals.append(e)
     missing = [e for e in tail_finals if not e.get("thread_end")]
+    sweep = (close_reason or "").upper() in _THREAD_END_SWEEP_CLOSES
+    if sweep:
+        issues.append(Issue(
+            "thread_end", "info",
+            f"close route {close_reason} is a sweep: it fires because the "
+            f"context stopped executing, so the close has no pending final "
+            f"to stamp and {len(missing)} of {len(tail_finals)} trailing "
+            f"context final(s) end unstamped by contract (format.rst §4.2a) "
+            f"— the close-finals arm is NOT APPLICABLE here and was not "
+            f"run; the stamp-never-lies arm was",
+            {"close_reason": close_reason, "unstamped_finals": len(missing),
+             "tail_finals": len(tail_finals)}))
+        missing = []
     for e in missing[:5]:
         issues.append(Issue(
             "thread_end", "error",
@@ -7937,7 +7993,8 @@ def validate_structural(trace_path: Path,
                         expected_guest_threads: int | None = None,
                         marker: bool = False,
                         pinned_binary: Path | None = None,
-                        expect_migration: bool = False) -> Report:
+                        expect_migration: bool = False,
+                        close_reason: str | None = None) -> Report:
     """Decode @trace_path and run only the checks that don't depend on
     the generator's meta.json (correct_path, blocks, wrong_paths).
 
@@ -7994,7 +8051,7 @@ def validate_structural(trace_path: Path,
         entries, trace_meta.get("body_record_order") or [])
     issues += _check_range_invocations(entries, templates_by_id, trace_meta)
     issues += _check_wp_fork_resolved(entries)
-    issues += _check_thread_end_flags(entries)
+    issues += _check_thread_end_flags(entries, close_reason)
     issues += _check_thread_chain(entries, templates_by_id,
                                   expected_guest_threads, trace_meta)
     issues += _check_thread_strand_sequential(entries, templates_by_id)

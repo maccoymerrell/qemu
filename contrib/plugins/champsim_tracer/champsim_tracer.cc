@@ -32,6 +32,7 @@
 #include "champsim_tracer_bb_chain_assembler.h"
 #include "champsim_tracer_bb_template_cache.h"
 #include "champsim_tracer_branch_history.h"
+#include "champsim_tracer_delay.h"
 #include "champsim_tracer_marker_detect.h"
 #include "champsim_tracer_mem_access_recorder.h"
 #include "champsim_tracer_path_builder.h"
@@ -9093,7 +9094,20 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
         pb.mark_events_queue_enabled(cpu_index);
     }
 
+    /* Delay instrument (CST_DELAY_DIAG, off by default): bracket the
+     * acquisition, not the hold.  simulate_wrong_path_ext runs under this
+     * lock, so on a multi-vCPU guest a peer's excursion is what a vCPU waits
+     * behind here — and without this bracket that wait was billed to the
+     * waiter's undifferentiated gap term, where it was indistinguishable from
+     * guest execution.  The gate is a relaxed int load when disarmed. */
+    const bool delay_lock_timed = cst_delay_armed();
+    if (delay_lock_timed) {
+        cst_delay_lock_wait_begin(cpu_index);
+    }
     g_rec_mutex_lock(&exec_lock);
+    if (delay_lock_timed) {
+        cst_delay_lock_wait_end(cpu_index);
+    }
 
     /* Guest-realtime instrument (#61).  Sampled here — one point that runs
      * once per correct-path TB, with the guest clock already frozen (the

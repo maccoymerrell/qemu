@@ -637,9 +637,13 @@ Guest-time transparency
 
 Plugin instrumentation runs on the vCPU thread but is not guest
 execution; these mechanisms keep its host wall-clock cost out of
-the guest's clocks.  A traced guest whose timer-tick handler costs
-more than a tick period otherwise collapses into a self-sustaining
-tick/scheduler storm.
+the guest's clocks.  Without them a traced guest would bill
+instrumentation against its own tick period, and a handler that
+outran that period would leave the next tick already pending on
+return.  With them, no instrumentation cost reaches a guest clock at
+all, so that outcome is what the mechanisms exclude rather than a
+hazard that survives them — and it is not an available explanation
+for a guest that stops progressing on a build that has them.
 
 ``CPUState::plugin_vclock_depth`` + ``cpu_plugin_vclock_pause`` /
 ``_resume`` (``accel/tcg/cpu-exec.c``)

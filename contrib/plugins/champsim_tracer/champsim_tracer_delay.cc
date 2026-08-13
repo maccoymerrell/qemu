@@ -76,6 +76,19 @@ struct alignas(64) DelaySlot {
     std::atomic<uint64_t> gap_cpu_ns{0};      /* thread CPU time between them */
     std::atomic<uint64_t> last_end_wall{0};   /* absolute, at last end */
     std::atomic<uint64_t> last_end_cpu{0};    /* absolute, at last end */
+    /* exec_lock wait, carved out of the gap term.  A vCPU blocked behind a
+     * peer's excursion used to be indistinguishable here from a vCPU running
+     * guest code, and — because only an excursion boundary marked a slot
+     * seen — a vCPU that never speculated was not printed at all.  Both are
+     * fixed by billing the wait separately and marking the slot on it. */
+    std::atomic<uint64_t> lock_wait_ns{0};    /* wall time blocked on it */
+    std::atomic<uint64_t> lock_n{0};          /* contended acquisitions */
+    std::atomic<uint64_t> lock_wait_max_ns{0};/* longest single wait */
+    /* Wall timestamp of an acquisition that has not completed, 0 when not
+     * waiting: the sampler reports its age, so a vCPU blocked RIGHT NOW
+     * behind a long excursion is visible while it is blocked rather than
+     * only after the peer lets go. */
+    std::atomic<uint64_t> lock_open{0};
     /* In-flight excursion: wall timestamp of its begin, 0 when idle.  This is
      * the field that makes an excursion visible WHILE it runs — the sampler
      * reports its age, so a single long excursion is distinguishable from a
@@ -106,6 +119,12 @@ thread_local uint64_t t_tbs;
  * outermost bracket bills, so a future nesting cannot silently double-count
  * wall time and inflate the very number this instrument exists to report. */
 thread_local unsigned t_depth;
+
+/* In-flight exec_lock acquisition on this thread.  Same depth-guard reason
+ * as t_depth: exec_lock is recursive, so a nested acquire must not overwrite
+ * the outer wait's start. */
+thread_local uint64_t t_lock_begin;
+thread_local unsigned t_lock_depth;
 
 /* ------------------------------------------------------------------ */
 /* Reporting                                                           */
@@ -141,6 +160,7 @@ static void emit(const char *buf, size_t len)
 struct SamplerPrev {
     uint64_t exc_n, exc_wall, exc_cpu, exc_tbs, exc_insns, exc_early;
     uint64_t gap_wall, gap_cpu, end_wall, end_cpu;
+    uint64_t lock_wait, lock_n;
     bool     valid;
 };
 
@@ -190,6 +210,10 @@ void *sampler_main(void *)
             const uint64_t end_cpu   = s.last_end_cpu.load(std::memory_order_relaxed);
             const uint64_t open      = s.open_wall.load(std::memory_order_relaxed);
             const uint64_t target    = s.open_target.load(std::memory_order_relaxed);
+            const uint64_t lockw     = s.lock_wait_ns.load(std::memory_order_relaxed);
+            const uint64_t lock_n    = s.lock_n.load(std::memory_order_relaxed);
+            const uint64_t lock_max  = s.lock_wait_max_ns.load(std::memory_order_relaxed);
+            const uint64_t lock_open = s.lock_open.load(std::memory_order_relaxed);
 
             SamplerPrev &p = prev[i];
             if (!p.valid) {
@@ -199,6 +223,7 @@ void *sampler_main(void *)
                 p.exc_early = exc_early;
                 p.gap_wall = gap_wall; p.gap_cpu = gap_cpu;
                 p.end_wall = end_wall; p.end_cpu = end_cpu;
+                p.lock_wait = lockw; p.lock_n = lock_n;
                 continue;
             }
 
@@ -210,19 +235,24 @@ void *sampler_main(void *)
             const uint64_t d_early = exc_early - p.exc_early;
             const uint64_t d_gapw  = gap_wall  - p.gap_wall;
             const uint64_t d_gapc  = gap_cpu   - p.gap_cpu;
+            const uint64_t d_lockw = lockw     - p.lock_wait;
+            const uint64_t d_lockn = lock_n    - p.lock_n;
 
             p.exc_n = exc_n; p.exc_wall = exc_wall; p.exc_cpu = exc_cpu;
             p.exc_tbs = exc_tbs; p.exc_insns = exc_ins;
             p.exc_early = exc_early;
             p.gap_wall = gap_wall; p.gap_cpu = gap_cpu;
             p.end_wall = end_wall; p.end_cpu = end_cpu;
+            p.lock_wait = lockw; p.lock_n = lock_n;
 
             /*
              * The span this window accounts for is the vCPU's own timeline
              * between the two excursion ends that bracket it, and it is
              * partitioned exactly: span = excursion wall + gap wall, both
-             * measured, neither modelled.  occ is the headline — the
-             * fraction of the vCPU's wall clock the wrong-path walker held.
+             * measured, neither modelled.  occ is the excursion share of
+             * that span — a TRACER COST figure for this vCPU thread, not a
+             * statement about guest progress (the guest's clock is frozen
+             * across an excursion and rolled back on return; see the header).
              */
             const uint64_t span_wall = d_wall + d_gapw;
             const uint64_t span_cpu  = d_cpu  + d_gapc;
@@ -234,10 +264,39 @@ void *sampler_main(void *)
              * see the end of — idle, or still inside the open excursion. */
             const double cover = win ? (double)span_wall / (double)win : 0.0;
 
+            /*
+             * exec_lock wait is reported as a DURATION, not as a fraction of
+             * anything.  Neither available denominator is honest here.  span
+             * is anchored on excursion ends, so a vCPU that never ran an
+             * excursion has no span at all — and that vCPU is exactly the one
+             * whose wait matters, the peer queued behind someone else's
+             * excursion.  The sampler's own window does not work either: a
+             * wait is billed when it COMPLETES, so a wait longer than one
+             * window lands whole in the window it ended in and the quotient
+             * exceeds 1 (measured at 8.78 on a four-thread user-mode cell
+             * whose longest single wait was 1.73 s against a 200 ms window).
+             * A ratio above 1 is not an occupancy, and printing one would
+             * invite exactly the misreading this instrument must not invite.
+             * So: milliseconds billed in this window, the run total beside
+             * it, and the age of a wait that is still open.  Summed over a
+             * run the billed figure is exact; a single window's figure is a
+             * billing, not a fraction.
+             */
+            const double lock_ms = (double)d_lockw / 1e6;
+            const double lock_inflight_ms =
+                lock_open && now > lock_open
+                    ? (double)(now - lock_open) / 1e6 : 0.0;
+
             const double inflight_ms =
                 open && now > open ? (double)(now - open) / 1e6 : 0.0;
 
-            if (occ < g_min_occ && !open && d_n == 0) {
+            /* Anything happened on this vCPU — an excursion, a contended
+             * acquire, or one of either still open — is reported.  The
+             * min_occ threshold only ever suppressed quiet EXCURSION
+             * windows, and applying it to a lock wait would re-hide the
+             * waiter this term was added to make visible. */
+            if (occ < g_min_occ && !open && d_n == 0 &&
+                d_lockw == 0 && !lock_open) {
                 continue;
             }
 
@@ -245,13 +304,16 @@ void *sampler_main(void *)
              * process started, not a per-window figure — the per-window view
              * of a long excursion is inflight_ms, which reports it while it
              * is still running rather than after it ends. */
-            char line[640];
+            char line[768];
             int n = snprintf(line, sizeof(line),
                 "[cstdelay] t=%.3f cpu=%u occ=%.4f sched=%.4f cpuocc=%.4f "
                 "cover=%.3f exc=%" PRIu64 " exc_s=%.1f avg_us=%.2f "
                 "runmax_us=%.1f tb_exc=%.2f ins_exc=%.2f early=%" PRIu64 " "
-                "inflight_ms=%.1f target=0x%" PRIx64 " | tot_exc=%" PRIu64
-                " tot_exc_s=%.2f tot_occ=%.4f\n",
+                "inflight_ms=%.1f target=0x%" PRIx64 " "
+                "lock_ms=%.1f lock_n=%" PRIu64 " lock_avg_us=%.2f "
+                "lock_runmax_us=%.1f lock_inflight_ms=%.1f | "
+                "tot_exc=%" PRIu64 " tot_exc_s=%.2f tot_occ=%.4f "
+                "tot_lock_s=%.2f\n",
                 (double)(now - t0) / 1e9, i, occ, sched, cpuocc, cover,
                 d_n,
                 (double)d_n / ((double)win / 1e9),
@@ -261,9 +323,13 @@ void *sampler_main(void *)
                 d_n ? (double)d_ins / (double)d_n : 0.0,
                 d_early,
                 inflight_ms, target,
+                lock_ms, d_lockn,
+                d_lockn ? (double)d_lockw / (double)d_lockn / 1e3 : 0.0,
+                (double)lock_max / 1e3, lock_inflight_ms,
                 exc_n, (double)exc_wall / 1e9,
                 (exc_wall + gap_wall)
-                    ? (double)exc_wall / (double)(exc_wall + gap_wall) : 0.0);
+                    ? (double)exc_wall / (double)(exc_wall + gap_wall) : 0.0,
+                (double)lockw / 1e9);
             if (n > 0) {
                 emit(line, (size_t)n > sizeof(line) - 1 ? sizeof(line) - 1
                                                         : (size_t)n);
@@ -281,10 +347,11 @@ void *sampler_main(void *)
          * health.
          */
         if (!reported) {
-            char line[192];
+            char line[224];
             int n = snprintf(line, sizeof(line),
-                "[cstdelay] t=%.3f no wrong-path excursion has been observed "
-                "on any vCPU since arming\n",
+                "[cstdelay] t=%.3f no wrong-path excursion and no contended "
+                "exec_lock acquisition has been observed on any vCPU since "
+                "arming\n",
                 (double)(now - t0) / 1e9);
             if (n > 0) {
                 emit(line, (size_t)n);
@@ -351,8 +418,9 @@ bool cst_delay_arm_probe(void)
     char banner[320];
     int bn = snprintf(banner, sizeof(banner),
         "[cstdelay] armed: window=%" PRIu64 "ms inject=%" PRIu64 "us "
-        "min_occ=%.3f  (occ = fraction of a vCPU's wall clock held by "
-        "wrong-path excursions)\n",
+        "min_occ=%.3f  (occ = fraction of a vCPU THREAD's HOST wall clock "
+        "held by wrong-path excursions; lock_ms = its exec_lock wait.  Tracer "
+        "cost only — an excursion consumes no guest time)\n",
         (uint64_t)(g_sample_ns / 1000000ull),
         (uint64_t)(g_inject_ns / 1000ull), g_min_occ);
     if (bn > 0) {
@@ -498,4 +566,58 @@ void cst_delay_excursion_end(unsigned int cpu_index, uint64_t sim_insns,
 void cst_delay_note_spec_tb(void)
 {
     t_tbs++;
+}
+
+/* ------------------------------------------------------------------ */
+/* exec_lock wait                                                      */
+/* ------------------------------------------------------------------ */
+
+void cst_delay_lock_wait_begin(unsigned int cpu_index)
+{
+    if (t_lock_depth++ || cpu_index >= CST_PIN_MAX_VCPUS || !g_slots) {
+        return;
+    }
+    const uint64_t w = mono_ns();
+    t_lock_begin = w;
+    DelaySlot &s = g_slots[cpu_index];
+    /* Published BEFORE the blocking call, so the sampler can report the
+     * wait's age while the thread is still inside it.  Reporting a wait only
+     * once it completes would make this term blind for exactly as long as
+     * the peer's excursion runs, which is the interval it exists to show. */
+    s.lock_open.store(w, std::memory_order_relaxed);
+    /* Mark the slot used here as well as at an excursion boundary: a vCPU
+     * that only ever WAITS still has to appear in the report. */
+    s.seen.store(1, std::memory_order_relaxed);
+}
+
+void cst_delay_lock_wait_end(unsigned int cpu_index)
+{
+    if (t_lock_depth == 0) {
+        return;
+    }
+    if (--t_lock_depth || cpu_index >= CST_PIN_MAX_VCPUS || !g_slots) {
+        return;
+    }
+    const uint64_t w = mono_ns();
+    DelaySlot &s = g_slots[cpu_index];
+    s.lock_open.store(0, std::memory_order_relaxed);
+
+    /*
+     * An uncontended acquire costs a few tens of nanoseconds, which is the
+     * clock pair's own cost rather than a wait; billing it would turn this
+     * term into a count of correct-path TBs.  Only intervals longer than the
+     * measurement floor are billed, and lock_n counts the same set — so
+     * lock_avg_us is the average of what was actually counted, not an
+     * average diluted by every uncontended pass.
+     */
+    static const uint64_t kFloorNs = 1000;   /* 1 us */
+    const uint64_t dw = w > t_lock_begin ? w - t_lock_begin : 0;
+    if (dw < kFloorNs) {
+        return;
+    }
+    s.lock_wait_ns.fetch_add(dw, std::memory_order_relaxed);
+    s.lock_n.fetch_add(1, std::memory_order_relaxed);
+    if (dw > s.lock_wait_max_ns.load(std::memory_order_relaxed)) {
+        s.lock_wait_max_ns.store(dw, std::memory_order_relaxed);
+    }
 }

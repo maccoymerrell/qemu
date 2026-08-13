@@ -1714,7 +1714,17 @@ instruction stream stops.  It is a positive marker, not an exhaustive
 one: a context whose last entry was already on the wire when the close
 arrived (nothing of it was pending) ends with the segment itself and
 carries no flag, so a consumer treats the segment boundary as the end
-of every context the flag did not already end.  In a user-mode trace,
+of every context the flag did not already end.  Two close routes end
+*every* context that way by construction — the dead-latch (IDLE) close
+and the any-context ceiling — because they are raised by a sweep
+precisely when the pinned context has stopped executing, so at the
+moment they fire nothing of it is pending and the final entry it did
+contribute went to the wire through the ordinary seal path, when
+nothing could know it was the last.  The flag is not withheld there,
+it is unavailable: the fact is retroactive and the entry is already
+written.  A segment closed by either route therefore names no context
+end at all, and the segment boundary is the whole answer.  In a
+user-mode trace,
 where a thread index is released on exit and may be reissued to a
 thread created later (§4.1), a flagged entry also separates the two
 occupants of one index.

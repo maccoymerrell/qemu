@@ -2139,13 +2139,22 @@ Guest-time transparency
 
 Plugin work runs on the vCPU thread but is not guest execution, so
 its host wall-clock cost must never be charged to guest time.  The
-stakes are highest in system mode: if one guest timer-tick
-handler's instrumented cost exceeds the tick period, the next tick
-is already pending when the handler returns and the guest collapses
-into a self-sustaining tick/scheduler storm (RCU stalls, zero
-foreground progress).  Three cooperating layers keep the guest's
-clocks clean; all are no-ops in user mode, and the QEMU side of
+stakes are highest in system mode: instrumented cost billed to the
+guest would put a timer-tick handler's cost against the tick period
+itself, and a handler that outran its own period would leave the next
+tick already pending on return.  Three cooperating layers keep the
+guest's clocks clean; all are no-ops in user mode, and the QEMU side of
 each is catalogued in :doc:`qemu_modifications`.
+
+**That failure mode is the counterfactual, not a live hazard.**  With
+the three layers in place no instrumentation cost reaches a guest clock,
+so no amount of tracer work — however deep the speculation, however long
+a single excursion — can produce it.  It is written down because it is
+what the layers below are *for*, and because it is the thing an
+unfrozen clock would cause.  It is not an explanation available for a
+guest that stops making progress under a build that has these layers: a
+frozen clock cannot be starved by host time, so such a case is a state
+defect on the wrong path's restore, not a cost effect.
 
 * **Per-callback vclock freeze.**  ``VClockPauseGuard`` wraps the
   CP step in ``vcpu_tb_exec`` and the translation work in

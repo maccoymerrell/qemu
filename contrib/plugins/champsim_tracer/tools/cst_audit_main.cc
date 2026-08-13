@@ -829,6 +829,10 @@ std::string row(const std::string &label, uint64_t b, uint64_t total,
  * the same numbers and the same verdict cst_audit's exit code reflects.
  */
 struct CompletenessStats {
+    /* A file was opened at this path.  Distinguishes "no sidecar there"
+     * from "a sidecar that does not carry the counters", which are
+     * different faults and want different messages. */
+    bool     found    = false;
     bool     present  = false;
     uint64_t dropped  = 0;
     uint64_t trimmed  = 0;
@@ -850,6 +854,7 @@ CompletenessStats read_completeness_stats(const std::string &path)
     CompletenessStats out;
     FILE *f = std::fopen(path.c_str(), "r");
     if (!f) return out;
+    out.found = true;
     char line[512];
     static const char *kDropped  = "CP reg-snap slice dropped";
     static const char *kTrimmed  = "CP reg-snap leak trimmed";
@@ -894,25 +899,87 @@ CompletenessStats read_completeness_stats(const std::string &path)
     return out;
 }
 
-/* Auto-detect the sidecar beside @trace_path: the plugin names it
- * `<outfile>.stats.log`, where `<outfile>` is the SAME basename the
- * `.cst` itself was derived from (quickstart.rst, `outfile=` — a
- * trailing `.cst` on the user's basename is stripped before either
- * suffix is appended).  So for the common non-simpoint case, stripping
- * the trace's own `.cst` suffix and appending `.stats.log` recovers it
- * exactly.  Simpoint mode's `<basename>-<positionB>.cst` segment files
- * do NOT map back to the shared `.stats.log` this way (the position
- * suffix has no fixed un-delimiting rule) — pass --stats-log explicitly
- * in that case. */
-std::string default_stats_log_path(const std::string &trace_path)
+/*
+ * Auto-detect the sidecar beside @trace_path.
+ *
+ * The two names are derived from the SAME `outfile=` string by different
+ * rules, so recovering one from the other means undoing both:
+ *
+ *   trace  = strip_dot_cst(outfile) [ "-" <label> ] ".cst"
+ *              — TraceSegmentManager::open_output, which strips a trailing
+ *                ".cst" from the user's string and re-appends it, inserting
+ *                the segment label only when simpoint mode is active.
+ *   stats  = outfile ".stats.log"
+ *              — champsim_tracer.cc's install path, which appends to the
+ *                user's string VERBATIM, stripping nothing.
+ *
+ * So `outfile=run` gives run.cst / run.stats.log, while `outfile=run.cst`
+ * gives run.cst / run.cst.stats.log — the same trace file, two different
+ * sidecars.  Both spellings are enumerated rather than guessed at.
+ *
+ * The simpoint label is not an opaque suffix: it is minted by exactly one
+ * printf pair (champsim_tracer.cc, the simpoint window open) as the
+ * position in billions of instructions, `<whole>B` or `<whole>_<frac>B`,
+ * with '_' chosen for the fractional separator precisely so the only '.'
+ * in the name is the extension.  That grammar — digits, optionally '_'
+ * and more digits, then a final 'B' — is decidable from the filename, so
+ * `<base>-<label>.cst` DOES map back to `<base>.stats.log`.  Enumerating
+ * it is what lets Oracle 1 run on a simpoint segment at all; without it
+ * the derived path never existed and the check silently stood down on
+ * every multi-segment capture.
+ *
+ * Candidates are returned most-specific-first and probed in order; the
+ * first one that carries the counters wins.  A basename that genuinely
+ * ends in something like `-12B` merely adds a candidate that will not be
+ * found, which costs one failed fopen.
+ */
+bool has_simpoint_label(const std::string &stem, size_t *label_start)
 {
-    std::string p = trace_path;
+    /* <base>-<digits>[_<digits>]B, scanned from the right. */
+    if (stem.size() < 3 || stem.back() != 'B') return false;
+    size_t i = stem.size() - 1;          /* at 'B' */
+    size_t digits = 0;
+    bool   saw_sep = false;
+    while (i > 0) {
+        char c = stem[i - 1];
+        if (c >= '0' && c <= '9') {
+            digits++;
+            i--;
+        } else if (c == '_' && !saw_sep && digits > 0) {
+            saw_sep = true;
+            digits = 0;
+            i--;
+        } else if (c == '-' && digits > 0) {
+            *label_start = i - 1;        /* index of the '-' */
+            return true;
+        } else {
+            return false;
+        }
+    }
+    return false;
+}
+
+std::vector<std::string> default_stats_log_candidates(
+    const std::string &trace_path)
+{
+    std::string stem = trace_path;
     static const char kSuffix[] = ".cst";
     size_t sn = sizeof(kSuffix) - 1;
-    if (p.size() >= sn && p.compare(p.size() - sn, sn, kSuffix) == 0) {
-        p.resize(p.size() - sn);
+    if (stem.size() >= sn && stem.compare(stem.size() - sn, sn, kSuffix) == 0) {
+        stem.resize(stem.size() - sn);
     }
-    return p + ".stats.log";
+
+    std::vector<std::string> out;
+    out.push_back(stem + ".stats.log");           /* outfile=<stem>      */
+    out.push_back(stem + ".cst.stats.log");       /* outfile=<stem>.cst  */
+
+    size_t label_start = 0;
+    if (has_simpoint_label(stem, &label_start)) {
+        std::string base = stem.substr(0, label_start);
+        out.push_back(base + ".stats.log");       /* simpoint, bare      */
+        out.push_back(base + ".cst.stats.log");   /* simpoint, .cst      */
+    }
+    return out;
 }
 
 std::string fd_row(const std::string &label, const Bucket &cp,
@@ -1120,10 +1187,13 @@ static void usage(const char *argv0)
         "usage: %s [options] <trace.cst>\n"
         "  --stats-log=PATH          plugin sidecar for the completeness\n"
         "                            check (Oracle 1); default: auto-detect\n"
-        "                            <trace-without-.cst>.stats.log beside\n"
-        "                            the trace\n"
-        "  --no-stats-log            skip the completeness check even if a\n"
-        "                            sidecar is auto-detected\n"
+        "                            beside the trace, undoing both the\n"
+        "                            .cst-stripping and the simpoint\n"
+        "                            -<position>B segment suffix\n"
+        "  --no-stats-log            skip the completeness check.  Without\n"
+        "                            this, a sidecar that cannot be found\n"
+        "                            or does not carry the counters FAILS\n"
+        "                            the audit — the oracle never ran\n"
         "  --bimodal-off             skip the memop bimodality lint (Oracle 2)\n"
         "  --bimodal-min-execs=N     min CP executions before a template's\n"
         "                            zero-rate is judged (default 8)\n"
@@ -1180,9 +1250,6 @@ int main(int argc, char **argv)
     if (!trace_path) {
         usage(argv[0]);
         return 2;
-    }
-    if (!stats_log_explicit && !no_stats_log) {
-        stats_log_path = default_stats_log_path(trace_path);
     }
 
     try {
@@ -1363,13 +1430,40 @@ int main(int argc, char **argv)
             }
         }
 
-        /* Oracle 1 — the plugin's own dropped-slice accounting, surfaced
-         * from the <outfile>.stats.log sidecar when available (see
-         * read_completeness_stats above).  Silently absent when no
-         * sidecar was found and none was requested; --stats-log=PATH
-         * makes an unreadable/malformed sidecar an explicit failure. */
-        if (!no_stats_log && !stats_log_path.empty()) {
-            CompletenessStats cs = read_completeness_stats(stats_log_path);
+        /*
+         * Oracle 1 — the plugin's own dropped-slice accounting, read from
+         * the <outfile>.stats.log sidecar (see read_completeness_stats
+         * above).
+         *
+         * A CHECK THAT CANNOT FIND ITS SUBJECT FAILS.  This used to print
+         * "NOT CHECKED" and exit 0 whenever the derived sidecar path did
+         * not exist, which made every simpoint segment trace — whose
+         * sidecar the old single-candidate rule could never name — score
+         * green on an oracle that had not run.  The byte rollup still read
+         * 100.00%, so a harness keying on the exit code or on the rollup
+         * line saw nothing wrong.  Skipping is now reachable only by
+         * asking for it (--no-stats-log), which puts the decision in the
+         * caller's hands and on the record.
+         */
+        if (!no_stats_log) {
+            std::vector<std::string> cands;
+            if (stats_log_explicit) {
+                cands.push_back(stats_log_path);
+            } else {
+                cands = default_stats_log_candidates(trace_path);
+            }
+
+            CompletenessStats cs;
+            bool any_found = false;
+            for (const auto &c : cands) {
+                CompletenessStats t = read_completeness_stats(c);
+                any_found = any_found || t.found;
+                if (t.present) {
+                    cs = t;
+                    stats_log_path = c;
+                    break;
+                }
+            }
             if (cs.present) {
                 std::printf("\n=== COMPLETENESS (Oracle 1; %s) ===\n",
                             stats_log_path.c_str());
@@ -1432,24 +1526,39 @@ int main(int argc, char **argv)
                         stats_log_path.c_str());
                     fail = true;
                 }
-            } else if (stats_log_explicit) {
-                std::fprintf(stderr,
-                    "cst_audit: FAIL: --stats-log=%s did not carry both "
-                    "completeness counters\n", stats_log_path.c_str());
-                fail = true;
             } else {
-                /* Auto-detect found nothing.  Say so.  A check whose
-                 * subject is missing produced no verdict, and printing
-                 * nothing lets a reader of a clean audit believe Oracle 1
-                 * passed when it never ran. */
+                /* No candidate carried the counters.  Two distinguishable
+                 * faults: nothing was there at all, or a file was there
+                 * and did not say what a stats-log says (truncated by a
+                 * killed run, or not a stats-log).  Both are a check
+                 * without its subject, so both fail; the message says
+                 * which, and lists every path tried so the caller can
+                 * point --stats-log at the right one. */
                 std::printf("\n=== COMPLETENESS (Oracle 1) ===\n"
-                            "  NOT CHECKED: no stats-log sidecar at %s\n"
-                            "  (pass --stats-log=PATH to require it)\n",
-                            stats_log_path.c_str());
+                            "  FAILED: %s\n",
+                            any_found
+                              ? "a sidecar was found but carries neither "
+                                "completeness counter"
+                              : "no stats-log sidecar found");
+                for (const auto &c : cands) {
+                    std::printf("    tried %s\n", c.c_str());
+                }
+                std::printf("  (pass --stats-log=PATH to name it, or "
+                            "--no-stats-log to skip this oracle)\n");
+                std::fprintf(stderr,
+                    "cst_audit: FAIL: completeness oracle has no subject: %s "
+                    "(%zu path(s) tried, first %s); the dropped-slice "
+                    "invariant did not run\n",
+                    any_found ? "sidecar carried neither counter"
+                              : "no stats-log sidecar found",
+                    cands.size(),
+                    cands.empty() ? "(none)" : cands.front().c_str());
+                fail = true;
             }
-        } else if (no_stats_log) {
+        } else {
             std::printf("\n=== COMPLETENESS (Oracle 1) ===\n"
-                        "  NOT CHECKED: disabled on the command line\n");
+                        "  NOT CHECKED: disabled on the command line "
+                        "(--no-stats-log)\n");
         }
 
         if (fail) {

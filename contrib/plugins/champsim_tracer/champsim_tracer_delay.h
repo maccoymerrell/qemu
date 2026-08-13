@@ -6,55 +6,65 @@
  * emits, takes no decision, and ends no run.  Its only job is to make one
  * quantity visible while it is happening.
  *
- * WHAT IT MEASURES, AND WHY THAT IS A DIFFERENT QUESTION FROM THE ONE THE
- * OTHER INSTRUMENTS ANSWER.
+ * WHAT IT MEASURES: TRACER COST, AND NOTHING ELSE.
  *
- * Every existing wrong-path instrument measures DAMAGE: interrupts lost or
- * gained across an excursion, timer counters that failed to be restored,
- * device state a speculative access moved, register state that leaked past
- * the rollback.  Those all answer "did the excursion corrupt something?".
+ * The subject is how much of a vCPU THREAD's host wall clock the tracer
+ * consumed, and where inside the tracer it went.  That is a cost figure.  It
+ * is not, and must never be read as, a statement about the guest.
  *
- * There is a failure shape they are all blind to by construction.  The guest
- * stops making architectural progress, every corruption instrument reads
- * zero, and nothing is wrong with any state the excursion touched — because
- * nothing is corrupt.  The vCPU thread is simply not executing guest
- * instructions: it is inside the tracer.  A count of excursions cannot
- * separate that case from a healthy one (cheap excursions and expensive
- * excursions count the same), and a corruption instrument cannot see it at
- * all (there is no corruption).  What is needed is an instrument whose
- * subject is DELAY: how much of a vCPU's wall time the tracer consumed, and
- * where inside the tracer it went.
+ * THE GUEST CANNOT SEE ANY OF THIS.  An excursion runs with the guest's
+ * virtual clock frozen (cpu_plugin_spec_vtime_pause), and the resume
+ * DISCARDS the interval the excursion consumed, so the guest's architected
+ * counters read the same value after an excursion as before it — the clock
+ * is returned to where it stood when the excursion started (see
+ * qemu_plugin_spec_vtime_pause / _resume in qemu-plugin.h).  Correct-path
+ * instrumentation runs under the same freeze via VClockPauseGuard.  No
+ * quantity this file reports is therefore guest-visible time, and no number
+ * printed here may be offered as a mechanism by which a guest stopped making
+ * progress.  A guest that stops progressing under wp=1 and does not under
+ * wp=0 has a wrong-path RESTORE defect — state the excursion changed and
+ * did not put back — and the place to hunt is the restore, not the cost.
+ * These figures bound the cost of a capture: how long it takes and how it
+ * scales, so a run can be sized.
  *
  * THE DECOMPOSITION.  Each vCPU's timeline between two consecutive excursion
- * ends is partitioned exactly two ways, with no residue and no modelling:
+ * ends is partitioned with no residue and no modelling:
  *
- *   span = excursion wall time + gap wall time
+ *   span = excursion wall + exec_lock wait wall + remaining gap wall
  *
  * where "excursion" is the whole of simulate_wrong_path_ext (snapshot,
- * spec-mode walk, restore) and "gap" is everything between one excursion
- * ending and the next beginning — correct-path instrumentation, guest
- * execution, and any interval the host scheduler had the thread off-CPU.
- * The headline number is the excursion OCCUPANCY, exc_wall / span: the
- * fraction of the vCPU's own wall clock that the wrong-path walker held.
+ * spec-mode walk, restore); "exec_lock wait" is the interval a vCPU spent
+ * blocked acquiring exec_lock before its correct-path step could run; and
+ * the remaining gap is correct-path instrumentation, guest execution, and
+ * any interval the host scheduler had the thread off-CPU.  All three are
+ * measured at their own boundaries.
+ *
+ * WHY THE LOCK TERM IS SEPARATE.  simulate_wrong_path_ext runs under
+ * exec_lock, so on a multi-vCPU guest the vCPU holding an excursion and the
+ * vCPUs waiting behind it are in completely different states — and before
+ * this term existed they were indistinguishable, because a waiter's blocked
+ * interval fell into its own undifferentiated gap alongside guest execution.
+ * Worse, a vCPU that never ran an excursion of its own was never reported at
+ * all: the sampler only printed slots that had been touched by an excursion
+ * boundary, so the machine's waiters were silently absent from the output.
+ * A lock wait now marks the slot seen and is reported on its own, whether or
+ * not that vCPU ever speculates.
  *
  * SEPARATING TRACER COST FROM HOST CONTENTION.  Wall time alone cannot tell
  * "the tracer is consuming this vCPU" from "the host is not scheduling this
  * vCPU", and a load-dependent reading is not evidence (a busy host depresses
  * every wall-clock ratio).  Both clocks are therefore sampled at every
- * boundary: CLOCK_MONOTONIC and CLOCK_THREAD_CPUTIME_ID for the vCPU thread
- * itself.  sched = span_cpu / span_wall is the fraction of the span the
- * thread was actually on-CPU, so a delay caused by host contention
- * (sched well below 1) is distinguishable from a delay caused by tracer work
- * (sched near 1, occ near 1) rather than confounded with it.
+ * excursion boundary: CLOCK_MONOTONIC and CLOCK_THREAD_CPUTIME_ID for the
+ * vCPU thread itself.  sched = span_cpu / span_wall is the fraction of the
+ * span the thread was actually on-CPU, so cost measured under host
+ * contention is distinguishable from cost that is really the tracer's.
  *
- * WHAT IT DOES NOT MEASURE.  The gap term is not decomposed: this instrument
- * cannot separate correct-path instrumentation from guest execution inside
- * it, because it holds no correct-path hook.  RtFactorGate's guest-realtime
- * factor supplies that complementary split, and the two are designed to be
- * read together on one run (CST_RT_TRACE=1 CST_DELAY_DIAG=1).  It also does
- * not observe exec_lock: a vCPU blocked waiting on a peer's excursion spends
- * that time in its own gap term, indistinguishable there from guest
- * execution.  Both are stated limits, not silences.
+ * WHAT IT DOES NOT MEASURE.  The remaining gap is not decomposed further:
+ * this instrument brackets the lock acquisition but not the correct-path
+ * step's body, so it cannot separate correct-path instrumentation from guest
+ * execution inside what is left.  RtFactorGate's guest-realtime factor
+ * supplies that complementary split by design, and the two are meant to be
+ * read together on one run (CST_RT_TRACE=1 CST_DELAY_DIAG=1).
  *
  * SAMPLED FROM A SEPARATE THREAD, ON PURPOSE.  An in-callback sampler can
  * only observe at the moments the tracer hands control back, so it is blind
@@ -103,6 +113,26 @@ void cst_delay_excursion_end(unsigned int cpu_index, uint64_t sim_insns,
  * an unconditional call would resolve a thread-local on every speculative
  * dispatch of every run, armed or not. */
 void cst_delay_note_spec_tb(void);
+
+/*
+ * exec_lock acquisition boundaries, bracketing the blocking call itself:
+ *
+ *   cst_delay_lock_wait_begin(cpu_index);
+ *   g_rec_mutex_lock(&exec_lock);
+ *   cst_delay_lock_wait_end(cpu_index);
+ *
+ * Both are no-ops unless armed, and every caller gates on cst_delay_armed()
+ * so the disarmed cost is a relaxed int load and a predictable branch — this
+ * sits on the correct-path step, once per traced TB.  Only WALL time is
+ * sampled here: a thread blocked on a mutex accrues no thread CPU time, so
+ * the second clock would report nothing while doubling a hot-path cost.
+ *
+ * The pair is depth-guarded like the excursion bracket.  exec_lock is a
+ * GRecMutex and the correct-path step is reached from more than one hook, so
+ * a re-entrant acquire must not clobber the outer wait's start timestamp.
+ */
+void cst_delay_lock_wait_begin(unsigned int cpu_index);
+void cst_delay_lock_wait_end(unsigned int cpu_index);
 
 /*
  * RAII bracket for one excursion.  Scoped over the whole of

@@ -1438,11 +1438,22 @@ static bool wprot_ready(void)
 #define SDIFF_CPU_SZ  sizeof(CPUState)   /* now INCLUDES neg.tlb descriptors */
 #define SDIFF_ENV_OFF offsetof(CPUArchState, end_reset_fields)
 #define SDIFF_ENV_SZ  (sizeof(CPUArchState) - offsetof(CPUArchState, end_reset_fields))
-static uint8_t g_sdiff_cpu[SDIFF_CPU_SZ];
-static uint8_t g_sdiff_env[SDIFF_ENV_SZ];
-static uint8_t g_sdiff_cpu_seen[SDIFF_CPU_SZ];
-static uint8_t g_sdiff_env_seen[SDIFF_ENV_SZ];
-static bool    g_sdiff_have = false;
+/*
+ * The snapshot buffers are per-vCPU-thread.  They hold one specific CPUState's
+ * bytes, and the pair that produces a verdict is a snapshot on one thread and
+ * the compare that follows it on that same thread; a process-wide buffer makes
+ * that pair depend on no peer vCPU opening an excursion in between, which is
+ * not a property this file can assert -- the serialisation that would grant it
+ * belongs to a plugin's lock, not to QEMU.  Shared, a peer's snapshot would be
+ * compared against this vCPU's registers and every byte where the two vCPUs
+ * legitimately differ would be reported as a leak.  The `seen` filters stay
+ * per-thread with them, so first-occurrence reporting is per-vCPU too.
+ */
+static __thread uint8_t g_sdiff_cpu[SDIFF_CPU_SZ];
+static __thread uint8_t g_sdiff_env[SDIFF_ENV_SZ];
+static __thread uint8_t g_sdiff_cpu_seen[SDIFF_CPU_SZ];
+static __thread uint8_t g_sdiff_env_seen[SDIFF_ENV_SZ];
+static __thread bool    g_sdiff_have = false;
 static int     g_sdiff_on = -1;
 static long    g_sdiff_delay = 0;
 static time_t  g_sdiff_start = 0;
@@ -1477,11 +1488,58 @@ static bool sdiff_enabled(void)
     return true;
 }
 
+/*
+ * Name every byte that differs across an excursion BY CONSTRUCTION, so an
+ * un-named offset is the finding.  Left unnamed, these bury a real leak: they
+ * are reported on essentially every excursion, and the reader who has learned
+ * to scroll past them scrolls past the one line that matters.
+ *
+ * Three groups, and none of them is an un-restored wrong-path mutation:
+ *
+ *  - ASYNC SIGNALLING (exit_request, interrupt_request, work_list).  These are
+ *    written by OTHER threads -- the iothread's device models raise an
+ *    interrupt line, cpu_exit() sets the kick, async_run_on_cpu() queues an
+ *    item -- while this vCPU sits in the excursion.  They MUST survive it:
+ *    restoring them would discard a device interrupt the guest is owed, which
+ *    is the failure the RISC-V mip and MIPS CP0_Cause work exists to prevent.
+ *    On x86 the excursion holds the BQL end to end, so the iothread cannot
+ *    interleave and this group does not appear; on the other targets it does.
+ *
+ *  - PLUGIN PER-EXECUTION REPORT SCRATCH (the plugin_rep_* block).  QEMU
+ *    rewrites these at every instruction execution as the OUTPUT of that
+ *    execution; they carry nothing from one to the next.  A consumer reads
+ *    them inside the callback for the execution that produced them -- the
+ *    tracer latches its own copy at the top of its dispatch callback, before
+ *    any excursion can run, precisely because a wrong path overwrites them.
+ *
+ *  - EXCURSION BOOKKEEPING (plugin_spec_vtime_paused, plugin_spec_timer_dirty,
+ *    plugin_spec_tlb_log and its siblings).  plugin_spec_vtime_paused is this
+ *    detector's own bracket: set before the snapshot, cleared before the
+ *    compare, so it differs on every excursion ever measured.
+ */
 static const char *sdiff_cpu_field(size_t off)
 {
-    if (off == offsetof(CPUState, interrupt_request)) return "interrupt_request";
+    if (off == offsetof(CPUState, interrupt_request)) {
+        return "interrupt_request (async: raised by another thread - must survive)";
+    }
+    if (off == offsetof(CPUState, exit_request)) {
+        return "exit_request (async: kick from another thread - must survive)";
+    }
+    if (off >= offsetof(CPUState, work_list) &&
+        off <  offsetof(CPUState, work_list) + sizeof(((CPUState *)0)->work_list)) {
+        return "work_list (async: queued by another thread - must survive)";
+    }
     if (off == offsetof(CPUState, cflags_next_tb))     return "cflags_next_tb";
-    if (off == offsetof(CPUState, exit_request))       return "exit_request";
+    if (off >= offsetof(CPUState, plugin_rep_iters) &&
+        off <  offsetof(CPUState, plugin_mops_report) + sizeof(void *)) {
+        return "(plugin per-execution report scratch - rewritten every insn)";
+    }
+    if (off == offsetof(CPUState, plugin_spec_vtime_paused)) {
+        return "plugin_spec_vtime_paused (this detector's own bracket)";
+    }
+    if (off == offsetof(CPUState, plugin_spec_timer_dirty)) {
+        return "plugin_spec_timer_dirty (consumed by the excursion-exit resync)";
+    }
     if (off >= offsetof(CPUState, plugin_spec_tlb_log) &&
         off <  offsetof(CPUState, neg)) {
         return "(plugin_spec_tlb_log/plugin block - intentional)";
@@ -2016,7 +2074,6 @@ void cpu_plugin_spec_vtime_resume(CPUState *cpu)
         g_wprot_active = false;
     }
     tlbsave_restore(cpu);         /* #77: revert full TLB (causation test) */
-    sdiff_compare(cpu);           /* #77: detect un-restored CPU-state leak */
 #endif
     /*
      * Resync every guest clock to the frozen virtual time HERE -- the true
@@ -2054,6 +2111,16 @@ void cpu_plugin_spec_vtime_resume(CPUState *cpu)
      * value the guest will see.
      */
     cst_clkeq_check(cpu, clkeq_pre_thaw);
+    /*
+     * The leak diff belongs after the LAST step of the restore, for the same
+     * reason: a comparison taken before the restore finishes reports the work
+     * the restore has not done yet as work it will never do.  Its predecessor
+     * sat before cpu_plugin_clock_resync(), which is what consumes and clears
+     * plugin_spec_timer_dirty -- so the flag was named as an un-restored byte
+     * on every excursion that set one, by the statement that was about to
+     * clear it.
+     */
+    sdiff_compare(cpu);            /* #77: un-restored CPU-state leak */
 #endif
 #endif
     /*

@@ -638,9 +638,12 @@ roughly twenty-fold over the trees between ``a2712d64b2`` and
 ``e7df2be670`` (20/370, then 4/370 at ``790a5fdb0c``, then 1/370), and
 the sharpest single step sits at the commit that taught the wrong-path
 TLB log to survive a large page (``a2712d64b2`` 20/370 versus
-``337b0265b9`` 0/120, Fisher p = 0.003).  It is not zero at any point
-tested, and the surviving cells are the same shape as the original ones
-down to the stopping instruction.  A wave of a few hundred clean cells is
+``337b0265b9`` 0/120, Fisher p = 0.003).  The last tree still produces
+it, and the cells it produces are the same shape as the original ones
+down to the stopping instruction; the two intermediate points that read
+zero were each measured over 120 cells, a size at which the frequency
+their neighbours show goes unseen about one time in four, so their zeros
+are not evidence of absence.  A wave of a few hundred clean cells is
 therefore weak evidence about this state: at the frequency the last of
 those trees shows, a thousand consecutive clean cells still happen about
 one time in fourteen.

@@ -407,10 +407,16 @@ static void x86_spec_clock_resync(CPUState *cs, SpecClockResyncReason reason)
     int64_t hm = get_clock();
 
     if (g_pin_ready) {
-        int64_t target = g_pin_ref_tsc +
-            (int64_t)(g_pin_tsc_hz * (double)(cpu_get_clock() - g_pin_ref_clk)
-                      / 1e9);
-        cpu_plugin_pin_tsc(target);
+        /*
+         * The LINE is handed over, not a point on it.  Evaluating
+         * ref_tsc + tsc_hz * (cpu_get_clock() - ref_clk) here and passing the
+         * answer separates the virtual-clock read from the host-TSC read that
+         * cpu_plugin_pin_tsc() derives the offset from, and everything
+         * between the two lands on the guest TSC alone -- see that function
+         * for the measurement.  Only the writer of the offset can sample both
+         * at one instant, so only it may evaluate the line.
+         */
+        cpu_plugin_pin_tsc(g_pin_ref_tsc, g_pin_ref_clk, g_pin_tsc_hz);
     } else {
         if (g_pin_last_hm) {
             g_pin_cal_tsc += ht - g_pin_last_ht;

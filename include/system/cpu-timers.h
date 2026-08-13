@@ -177,16 +177,35 @@ bool cpu_plugin_ticks_thaw(int cpu_index);
 uint64_t cpu_plugin_ticks_peer_only_thaws(void);
 
 /*
- * Force cpu_get_ticks() (the guest TSC source) to read @target_tsc right now by
- * re-basing cpu_ticks_offset, without touching cpu_clock_offset.  Used by the
- * wrong-path tracer to re-lock the guest TSC to QEMU_CLOCK_VIRTUAL after each
- * speculative excursion: the guest TSC is derived from the host rdtsc and the
- * guest HPET from host CLOCK_MONOTONIC, two host oscillators whose ratio drifts
- * across excursions, so without re-locking they diverge and the guest's
- * clocksource watchdog marks the TSC unstable.  No-op while ticks are disabled.
- * Caller must hold BQL.
+ * Ceiling, in host TSC ticks, on how far apart the pin's virtual-clock sample
+ * and host-TSC sample may be taken; the pair is retaken while it is exceeded.
+ * Orders of magnitude above an uncontended back-to-back read and far below a
+ * host scheduling slice, so it separates "the two reads happened together"
+ * from "this thread was descheduled between them" on any plausible host TSC
+ * frequency without this header needing to know what that frequency is.
  */
-void cpu_plugin_pin_tsc(int64_t target_tsc);
+#define CPU_PIN_TSC_READ_WINDOW 1000000
+
+/*
+ * Re-lock cpu_get_ticks() (the guest TSC source) to QEMU_CLOCK_VIRTUAL by
+ * re-basing cpu_ticks_offset, without touching cpu_clock_offset.  The guest
+ * TSC is derived from the host rdtsc and the guest HPET/LAPIC from host
+ * CLOCK_MONOTONIC, two host oscillators whose ratio drifts across the tracer's
+ * clock freezes, so without re-locking they diverge and the guest's
+ * clocksource watchdog marks the TSC unstable.
+ *
+ * The caller passes the LINE -- an anchor point (@ref_tsc, @ref_clk) and its
+ * slope @tsc_hz in host TSC ticks per second -- not a target computed from a
+ * virtual-clock read of its own.  The clock sample and the host-TSC sample
+ * must describe the same instant, which only the writer of the offset can
+ * arrange; a target handed in from outside carries whatever host time elapsed
+ * between the caller's read and this write, and subtracts it from the guest
+ * TSC alone.  Guest-visible monotonicity is enforced against the value a
+ * reader would have received, so the guest TSC never steps backwards.
+ *
+ * No-op while ticks are disabled.  Caller must hold BQL.
+ */
+void cpu_plugin_pin_tsc(int64_t ref_tsc, int64_t ref_clk, double tsc_hz);
 #endif
 
 /*

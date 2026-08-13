@@ -223,31 +223,76 @@ uint64_t cpu_plugin_ticks_peer_only_thaws(void)
                                            : plugin_ticks_peer_only_thaws;
 }
 
-void cpu_plugin_pin_tsc(int64_t target_tsc)
+void cpu_plugin_pin_tsc(int64_t ref_tsc, int64_t ref_clk, double tsc_hz)
 {
     seqlock_write_lock(&timers_state.vm_clock_seqlock,
                        &timers_state.vm_clock_lock);
     if (timers_state.cpu_ticks_enabled) {
         /*
-         * Guest-visible TSC monotonicity is an invariant here, not an
-         * observation.  Setting cpu_ticks_prev = target below deliberately
-         * carries the pin past cpu_get_ticks_locked()'s backwards-read clamp,
-         * so a target below the last value handed to any reader would step
-         * the guest's TSC backwards — TSC-derived sched_clock is marked
-         * stable on this class of guest and consumes such a step unclamped.
-         * Measured across ~25 M pins the target never was below prev
-         * (wpwedge lane), but nothing enforced it; clamp so nothing ever can.
-         * The residual is absorbed by the next pin, which recomputes the
-         * target from the reference point, not from prev.
+         * The line is evaluated HERE, from a virtual-clock sample taken
+         * beside the host-TSC sample the offset is derived from, because the
+         * two have to describe the same instant.  A caller that computes
+         * "where the virtual clock says the TSC should be" and hands the
+         * answer in has already separated them: the offset written below is
+         * then `where the clock was THEN` minus `the host TSC NOW`, and every
+         * nanosecond between the two reads is subtracted from the guest TSC
+         * and from nothing else.  The pin plants the guest TSC that far below
+         * its own line, and the next pin -- which recomputes from the
+         * reference point -- shoves it back up in one step.
+         *
+         * That is not a small effect at plugin cadence.  Measured over 38
+         * cells of the x86_64 system marker shape (agentJ, lc/agentJ/pin):
+         * 726 pins left the guest's architectural TSC LOWER than the previous
+         * pin had set it -- the largest by 3,416,524 ticks, 1.55 ms, over a
+         * 36 us real interval -- and the corrective steps reached
+         * 536,335,461 ticks, 244 ms handed to the guest in one instant, with
+         * 138.9 M ticks (63 ms) injected per cell at the median.  x86
+         * requires the TSC to be monotonic and this class of guest marks
+         * TSC-derived sched_clock stable, so it consumes both directions
+         * unclamped.
+         *
+         * The interval between the two reads is bounded by re-reading rather
+         * than assumed short: a host preemption landing between them is
+         * exactly the case that produced the milliseconds above, and "rare"
+         * is not a bound.  After a few attempts the pin proceeds anyway --
+         * under pathological load a spin here would be worse than the
+         * residual, and the residual is still clamped below.
          */
-        if (target_tsc < timers_state.cpu_ticks_prev) {
-            target_tsc = timers_state.cpu_ticks_prev;
+        int64_t host_tsc = 0, vclock = 0;
+        for (int tries = 0; ; tries++) {
+            int64_t after;
+            host_tsc = cpu_get_host_ticks();
+            vclock = cpu_get_clock_locked();
+            after = cpu_get_host_ticks();
+            if (after - host_tsc < CPU_PIN_TSC_READ_WINDOW || tries >= 8) {
+                break;
+            }
         }
-        /* Choose the offset so cpu_get_ticks_locked() == target_tsc now, and
-         * keep the monotonicity clamp consistent so the next read does not
-         * snap the value back forward. */
-        timers_state.cpu_ticks_offset = target_tsc - cpu_get_host_ticks();
-        timers_state.cpu_ticks_prev = target_tsc;
+        int64_t target = ref_tsc +
+            (int64_t)(tsc_hz * (double)(vclock - ref_clk) / 1e9);
+        /*
+         * Guest-visible TSC monotonicity is an invariant here, not an
+         * observation, and the value it must be measured against is what a
+         * reader would ACTUALLY have received at @host_tsc with the offset
+         * standing now -- not cpu_ticks_prev, which this function last wrote
+         * as a target rather than as anything a reader was handed.  A target
+         * below the free-running value is therefore refused, and refusing it
+         * costs only the lock's precision: the guest TSC then runs at the
+         * host rate until the line catches up, which is the same slope, since
+         * tsc_hz is calibrated from that very host ratio.
+         */
+        int64_t readable = timers_state.cpu_ticks_offset + host_tsc;
+        if (target < readable) {
+            target = readable;
+        }
+        if (target < timers_state.cpu_ticks_prev) {
+            target = timers_state.cpu_ticks_prev;
+        }
+        /* Choose the offset so cpu_get_ticks_locked() == target at the
+         * instant @host_tsc was read, and keep the monotonicity clamp
+         * consistent so the next read does not snap the value back forward. */
+        timers_state.cpu_ticks_offset = target - host_tsc;
+        timers_state.cpu_ticks_prev = target;
     }
     seqlock_write_unlock(&timers_state.vm_clock_seqlock,
                          &timers_state.vm_clock_lock);

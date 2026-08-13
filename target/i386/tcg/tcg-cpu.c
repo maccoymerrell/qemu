@@ -384,11 +384,22 @@ static bool x86_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
  * ratio is the hardware property and freezes in the interval do not bias
  * it), then frozen so the lock slope never moves afterwards.
  */
-static __thread int64_t g_pin_last_ht, g_pin_last_hm;  /* previous host sample */
-static __thread int64_t g_pin_cal_tsc, g_pin_cal_ns;   /* calibration sums */
-static __thread double  g_pin_tsc_hz;                  /* frozen once ready */
-static __thread int64_t g_pin_ref_tsc, g_pin_ref_clk;  /* lock reference point */
-static __thread bool    g_pin_ready;
+/*
+ * One line for the whole machine, not one per host thread.  cpu_plugin_pin_tsc
+ * writes timers_state.cpu_ticks_offset, which is VM-global: with a per-thread
+ * reference point and a per-thread tsc_hz, each vCPU pins the one guest TSC to
+ * a slightly different line, and consecutive pins from different vCPUs fight —
+ * the guest TSC then jitters (and, past the monotonicity clamp, ratchets to
+ * whichever line is highest) instead of being the pure function of the virtual
+ * clock this hook exists to make it.  These are read and written only from
+ * x86_spec_clock_resync, which both of its callers invoke with the BQL held,
+ * so the BQL is what serialises them.
+ */
+static int64_t g_pin_last_ht, g_pin_last_hm;  /* previous host sample */
+static int64_t g_pin_cal_tsc, g_pin_cal_ns;   /* calibration sums */
+static double  g_pin_tsc_hz;                  /* frozen once ready */
+static int64_t g_pin_ref_tsc, g_pin_ref_clk;  /* lock reference point */
+static bool    g_pin_ready;
 
 static void x86_spec_clock_resync(CPUState *cs, SpecClockResyncReason reason)
 {

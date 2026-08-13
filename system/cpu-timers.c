@@ -135,6 +135,94 @@ void cpu_disable_ticks(void)
 }
 
 #ifdef CONFIG_PLUGIN
+/*
+ * Outstanding plugin clock freezes, across every vCPU.  Guarded by the BQL,
+ * which both entry points below require and which cpu_enable_ticks() and
+ * cpu_disable_ticks() already require for the seqlock they write.
+ *
+ * The count exists because the thing being counted is global while its owners
+ * are not.  timers_state is one clock for the whole machine and
+ * cpu_ticks_enabled is one boolean, while a plugin freeze is opened and
+ * closed per-vCPU: the wrong-path excursion pause in cpu_plugin_spec_vtime_
+ * pause() belongs to the excursion's vCPU, and the correct-path
+ * instrumentation window in cpu_plugin_vclock_pause() belongs to whichever
+ * vCPU is running a plugin callback -- including a translation callback,
+ * which is not serialised against a peer's excursion at all.  With both
+ * calling cpu_disable_ticks()/cpu_enable_ticks() directly, the peer's window
+ * closing restarted the guest clock in the middle of the excursion, and the
+ * excursion's own thaw then found the clock already running and did nothing:
+ * the guest clock advanced by the excursion's remaining host wall time,
+ * which is exactly what the freeze exists to prevent.
+ *
+ * The holder array alongside it exists to MEASURE the defect this count
+ * closes, rather than assert it: each entry names the vCPU that took one
+ * outstanding reference, so a thaw can tell that the freeze it is leaving
+ * behind is held ONLY by other vCPUs.  That is exactly the predecessor's
+ * failure condition -- its own guards saw this vCPU's windows and nothing
+ * else, so it called cpu_enable_ticks() precisely then.  A residual that
+ * still includes this vCPU's own outer window is NOT counted: the
+ * predecessor handled that case correctly.  Structurally zero on a
+ * single-vCPU machine.
+ */
+#define PLUGIN_TICKS_HOLDERS_MAX 64
+static int plugin_ticks_freeze_depth;
+static int plugin_ticks_holder[PLUGIN_TICKS_HOLDERS_MAX];
+static bool plugin_ticks_holders_overflowed;
+static uint64_t plugin_ticks_peer_only_thaws;
+
+void cpu_plugin_ticks_freeze(int cpu_index)
+{
+    assert(bql_locked());
+    if (plugin_ticks_freeze_depth < PLUGIN_TICKS_HOLDERS_MAX) {
+        plugin_ticks_holder[plugin_ticks_freeze_depth] = cpu_index;
+    } else {
+        plugin_ticks_holders_overflowed = true;
+    }
+    if (plugin_ticks_freeze_depth++ == 0) {
+        cpu_disable_ticks();
+    }
+}
+
+bool cpu_plugin_ticks_thaw(int cpu_index)
+{
+    assert(bql_locked());
+    assert(plugin_ticks_freeze_depth > 0);
+
+    /* Drop one reference belonging to @cpu_index, keeping the array packed. */
+    int n = MIN(plugin_ticks_freeze_depth, PLUGIN_TICKS_HOLDERS_MAX);
+    for (int i = n - 1; i >= 0; i--) {
+        if (plugin_ticks_holder[i] == cpu_index) {
+            plugin_ticks_holder[i] = plugin_ticks_holder[n - 1];
+            break;
+        }
+    }
+    if (--plugin_ticks_freeze_depth > 0) {
+        bool mine_remains = false;
+        n = MIN(plugin_ticks_freeze_depth, PLUGIN_TICKS_HOLDERS_MAX);
+        for (int i = 0; i < n; i++) {
+            if (plugin_ticks_holder[i] == cpu_index) {
+                mine_remains = true;
+                break;
+            }
+        }
+        if (!mine_remains) {
+            plugin_ticks_peer_only_thaws++;
+        }
+        return false;
+    }
+    if (!runstate_is_running()) {
+        return false;
+    }
+    cpu_enable_ticks();
+    return true;
+}
+
+uint64_t cpu_plugin_ticks_peer_only_thaws(void)
+{
+    return plugin_ticks_holders_overflowed ? UINT64_MAX
+                                           : plugin_ticks_peer_only_thaws;
+}
+
 void cpu_plugin_pin_tsc(int64_t target_tsc)
 {
     seqlock_write_lock(&timers_state.vm_clock_seqlock,

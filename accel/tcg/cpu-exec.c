@@ -1631,13 +1631,105 @@ static void tlbsave_restore(CPUState *cpu)
 #endif /* CONFIG_PLUGIN && !CONFIG_USER_ONLY */
 
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
-static bool cst_nofreeze(void)   /* cached: called on every excursion */
+/*
+ * Run excursions WITHOUT freezing the guest virtual clock (#77 arm).  Both
+ * spellings select it: CST_NOFREEZE, and CST_NO_VTPAUSE, which used to be a
+ * separate and much blunter switch -- it returned out of
+ * cpu_plugin_spec_vtime_pause() before plugin_spec_vtime_paused was set, so it
+ * did not merely leave the clock running, it left the excursion WINDOW closed.
+ * That flag is what the RISC-V external-mip record, the RISC-V/MIPS/Arm timer
+ * expiry gates, the interrupt-line suppression, the wrong-path kick re-arm and
+ * the excursion-exit clock resync all key on, so the arm silently disabled
+ * every one of them and manufactured the leaks it was meant to discriminate
+ * against.  Its own comment claimed it kept "the excursion flag + resync";
+ * that claim was false.  One meaning now, and it is the documented one.
+ *
+ * Cached: called on every excursion.
+ */
+static bool cst_nofreeze(void)
 {
     static int v = -1;
     if (v < 0) {
-        v = getenv("CST_NOFREEZE") != NULL;
+        v = getenv("CST_NOFREEZE") != NULL || getenv("CST_NO_VTPAUSE") != NULL;
     }
     return v;
+}
+
+/*
+ * CST_CLKEQ (#77 falsifier): the excursion's defining requirement, measured.
+ * On return from a wrong path the guest virtual clock must read what it read
+ * when the excursion began -- not merely have been unfrozen, but be back at
+ * the pause-point value.  Sample it three times and name which half failed:
+ *
+ *   ADVANCED   the clock moved while the excursion was open: the freeze was
+ *              not in effect for the whole window (a peer vCPU's plugin
+ *              window restarting the global clock is how that happens).
+ *   NOTRESTORED  the clock did not come back to the pause-point value across
+ *              the thaw and the per-target resync.
+ *
+ * Positive control: CST_NOFREEZE / CST_NO_VTPAUSE deliberately skip the
+ * freeze, so every excursion must report ADVANCED under them.  A run with the
+ * instrument armed and that arm set which reports nothing has a broken
+ * instrument, not a clean clock.
+ */
+static __thread int64_t g_clkeq_pause;
+static bool cst_clkeq_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("CST_CLKEQ") != NULL;
+    }
+    return on > 0;
+}
+static void cst_clkeq_note_pause(void)
+{
+    if (cst_clkeq_on()) {
+        g_clkeq_pause = cpu_get_clock();
+    }
+}
+static void cst_clkeq_check(CPUState *cpu, int64_t pre_thaw)
+{
+    if (!cst_clkeq_on()) {
+        return;
+    }
+    int64_t post = cpu_get_clock();
+    static __thread uint64_t n_adv, n_not;
+    if (pre_thaw != g_clkeq_pause) {
+        n_adv++;
+        if ((n_adv & (n_adv - 1)) == 0) {   /* powers of two: bound the spam */
+            fprintf(stderr, "[clkeq] cpu%d ADVANCED field=QEMU_CLOCK_VIRTUAL "
+                    "pause=%" PRId64 " in_excursion=%" PRId64 " delta=%" PRId64
+                    "ns n=%" PRIu64 "\n", cpu->cpu_index, g_clkeq_pause,
+                    pre_thaw, pre_thaw - g_clkeq_pause, n_adv);
+            fflush(stderr);
+        }
+    }
+    if (post != g_clkeq_pause) {
+        n_not++;
+        if ((n_not & (n_not - 1)) == 0) {
+            fprintf(stderr, "[clkeq] cpu%d NOTRESTORED field=QEMU_CLOCK_VIRTUAL "
+                    "pause=%" PRId64 " resume=%" PRId64 " delta=%" PRId64
+                    "ns n=%" PRIu64 "\n", cpu->cpu_index, g_clkeq_pause, post,
+                    post - g_clkeq_pause, n_not);
+            fflush(stderr);
+        }
+    }
+    /*
+     * The CONDITION, reported next to the outcome: how many plugin freezes so
+     * far ended with every remaining freeze held by a DIFFERENT vCPU.  Each is
+     * an occasion on which a per-vCPU thaw would have restarted the guest clock
+     * inside a peer's window, so a large figure alongside zero ADVANCED lines
+     * is the measurement that the machine-wide reference count is what holds
+     * the requirement, not luck.
+     */
+    static __thread uint64_t n_excursions;
+    if ((++n_excursions % 20000) == 0) {
+        fprintf(stderr, "[clkeq] cpu%d excursions=%" PRIu64 " advanced=%" PRIu64
+                " notrestored=%" PRIu64 " peer_only_thaws=%" PRIu64 "\n",
+                cpu->cpu_index, n_excursions, n_adv, n_not,
+                cpu_plugin_ticks_peer_only_thaws());
+        fflush(stderr);
+    }
 }
 /*
  * CST_CLKPROBE (#80 diagnostic): measure the guest-visible TSC-vs-monotonic
@@ -1753,28 +1845,19 @@ void cpu_plugin_spec_vtime_pause(CPUState *cpu)
     if (cpu->plugin_spec_vtime_paused) {
         return;
     }
-#ifdef CONFIG_PLUGIN
-    static int no_vtpause = -1;    /* cache: getenv per excursion is a hot path */
-    if (no_vtpause < 0) {
-        no_vtpause = getenv("CST_NO_VTPAUSE") != NULL;
-    }
-    if (no_vtpause) {                 /* #77 test: don't freeze guest clock in WP */
-        return;
-    }
-#endif
     bool need_bql = !bql_locked();
     if (need_bql) {
         bql_lock();
     }
 #ifdef CONFIG_PLUGIN
     cst_clkprobe(false);              /* #80: skew measurement (gated) */
-    /* #77 test: keep the excursion flag + resync, but DON'T freeze the guest
+    /* #77 arm: keep the excursion window + resync, but DON'T freeze the guest
      * virtual clock during WP (lets the stimer deadline still be reached in a
      * WP-saturated spin).  Distinguishes timer-freeze starvation from a leak. */
     if (!cst_nofreeze())
 #endif
     {
-        cpu_disable_ticks();
+        cpu_plugin_ticks_freeze(cpu->cpu_index);
 #ifdef CONFIG_PLUGIN
         /* The other half of the freeze: under -icount the guest clock is
          * driven by retired instructions, which cpu_disable_ticks() does not
@@ -1782,6 +1865,9 @@ void cpu_plugin_spec_vtime_pause(CPUState *cpu)
         icount_plugin_freeze(cpu, &g_spec_icount_freeze);
 #endif
     }
+#ifdef CONFIG_PLUGIN
+    cst_clkeq_note_pause();           /* #77 falsifier: excursion clock equality */
+#endif
 #if defined(TARGET_RISCV) && defined(CONFIG_PLUGIN)
     /*
      * Start the excursion's pending-interrupt record empty, and do it under
@@ -1815,12 +1901,13 @@ void cpu_plugin_spec_vtime_pause(CPUState *cpu)
     /*
      * x86 only: hold the BQL across the whole wrong-path excursion so the main
      * loop (iothread) cannot interleave mid-WP.  The excursion freezes the
-     * guest virtual clock (cpu_disable_ticks above), but that freeze is a
-     * VM-global boolean+offset, not per-vCPU: x86 delivers speculative page
-     * faults extremely often, so the abnormal-longjmp / fault-skip spec_mode
-     * re-entry cycling runs far more than on other ISAs and can leave the
-     * disable/enable unbalanced, desyncing cpu_clock_offset from
-     * cpu_ticks_offset.  The guest's TSC-vs-HPET clocksource watchdog then
+     * guest virtual clock (cpu_plugin_ticks_freeze above); the underlying
+     * cpu_ticks_enabled is a VM-global boolean, not per-vCPU, and x86 delivers
+     * speculative page faults extremely often, so the abnormal-longjmp /
+     * fault-skip spec_mode re-entry cycling runs far more than on other ISAs.
+     * Before the reference count that boolean had two independent owners and
+     * the disable/enable could be left unbalanced, desyncing cpu_clock_offset
+     * from cpu_ticks_offset.  The guest's TSC-vs-HPET clocksource watchdog then
      * marks the TSC unstable and wedges timekeeping/RCU — a system-mode
      * livelock (the vCPU spins in WP while jiffies drift and the scheduler
      * starves; confirmed: holding the BQL, or booting tsc=reliable, both clear
@@ -1891,26 +1978,36 @@ void cpu_plugin_spec_vtime_resume(CPUState *cpu)
         bql_lock();
     }
     /*
-     * Re-enable ticks only if the VM is still running.  do_vm_stop() calls
-     * cpu_disable_ticks() BEFORE pausing vcpus (system/cpus.c), so a QMP
-     * vm_stop landing during this excursion leaves ticks disabled and owns
-     * that state; blindly re-enabling here would advance the guest clock while
-     * the VM is meant to be stopped.  vm_start()'s cpu_enable_ticks() restores
-     * ticks when the VM resumes.  (cpu_disable_ticks/enable_ticks is a single
-     * global boolean, not a refcount, so the plugin pause must not fight the
-     * vm_stop owner.)
+     * Give back the freeze this excursion took.  cpu_plugin_ticks_thaw() owns
+     * both the arbitration and the vm_stop deference: the clock restarts only
+     * when the LAST outstanding plugin freeze closes -- this excursion's, the
+     * correct-path instrumentation window nested around it on this vCPU, and
+     * any window a PEER vCPU has open, all of which drive the one global
+     * cpu_ticks_enabled -- and never while a vm_stop owns the stopped clock.
+     * The predecessor of that call was a bare cpu_enable_ticks() conditioned
+     * on this vCPU's own plugin_vclock_depth, which can say nothing about a
+     * peer: a peer's translation callback closing its window mid-excursion
+     * restarted the clock underneath this excursion, and this thaw then found
+     * ticks already enabled and left them so.
      */
-    if (runstate_is_running()
+    int64_t clkeq_pre_thaw = 0;
 #ifdef CONFIG_PLUGIN
-        && !cst_nofreeze()   /* #77 test: never disabled ticks; don't re-enable */
-#endif
-        && cpu->plugin_vclock_depth == 0  /* callback freeze still active */
-        ) {
-        cpu_enable_ticks();
-#ifdef CONFIG_PLUGIN
-        icount_plugin_thaw(cpu, &g_spec_icount_freeze);
-#endif
+    if (cst_clkeq_on()) {
+        clkeq_pre_thaw = cpu_get_clock();   /* before the thaw: did it move? */
     }
+    if (!cst_nofreeze())   /* #77 arm: never disabled ticks; don't re-enable */
+#endif
+    {
+        cpu_plugin_ticks_thaw(cpu->cpu_index);
+    }
+#ifdef CONFIG_PLUGIN
+    /*
+     * The icount position belongs to the excursion that captured it, not to
+     * whichever freeze happens to be last out: restore it here unconditionally
+     * (a no-op when icount is off or the record was never armed).
+     */
+    icount_plugin_thaw(cpu, &g_spec_icount_freeze);
+#endif
     cpu->plugin_spec_vtime_paused = false;
 #ifdef CONFIG_PLUGIN
     cst_clkprobe(true);            /* #80: skew measurement (gated) */
@@ -1950,6 +2047,13 @@ void cpu_plugin_spec_vtime_resume(CPUState *cpu)
     if (getenv("CST_RUNTIMERS")) {
         qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
     }
+    /*
+     * The excursion's defining requirement, checked where it must hold: the
+     * guest virtual clock now reads what it read when the excursion began.
+     * Sampled after the thaw and after the per-target resync, so it sees the
+     * value the guest will see.
+     */
+    cst_clkeq_check(cpu, clkeq_pre_thaw);
 #endif
 #endif
     /*
@@ -1986,16 +2090,24 @@ void cpu_plugin_spec_vtime_resume(CPUState *cpu)
  * collapses into a self-sustaining tick/scheduler storm (context-switch
  * storm, RCU-kthread starvation, zero foreground progress).
  *
- * Nesting (plugin_vclock_depth) lets callers wrap arbitrary regions without
- * coordinating; composition with the WP pause is by "ticks re-enable only
- * when both mechanisms have fully resumed".  The vm_stop guard mirrors
- * cpu_plugin_spec_vtime_resume: never re-enable a clock a vm_stop owns.
+ * Nesting (plugin_vclock_depth) counts this vCPU's own windows, so callers
+ * can wrap arbitrary regions without coordinating.  Composition with the WP
+ * pause, and with a window open on a DIFFERENT vCPU, is not this counter's
+ * job: each vCPU's outermost window takes one reference on the machine-wide
+ * freeze (cpu_plugin_ticks_freeze), and the clock restarts only when the last
+ * reference anywhere goes away.  It used to be this counter's job, via a
+ * short-circuit on this vCPU's plugin_spec_vtime_paused, which is blind to a
+ * peer: a translation callback on vCPU 1 takes no exec lock and so runs
+ * freely inside vCPU 0's wrong-path excursion, and its window closing called
+ * cpu_enable_ticks() and restarted the guest clock in the middle of that
+ * excursion.  The vm_stop guard lives in cpu_plugin_ticks_thaw(): never
+ * re-enable a clock a vm_stop owns.
  */
 void cpu_plugin_vclock_pause(CPUState *cpu)
 {
 #ifndef CONFIG_USER_ONLY
-    if (cpu->plugin_vclock_depth++ > 0 || cpu->plugin_spec_vtime_paused) {
-        return;                    /* already frozen */
+    if (cpu->plugin_vclock_depth++ > 0) {
+        return;                    /* already frozen by an outer window */
     }
 #ifdef CONFIG_PLUGIN
     if (cst_nofreeze()) {
@@ -2006,7 +2118,7 @@ void cpu_plugin_vclock_pause(CPUState *cpu)
     if (need_bql) {
         bql_lock();
     }
-    cpu_disable_ticks();
+    cpu_plugin_ticks_freeze(cpu->cpu_index);
     if (need_bql) {
         bql_unlock();
     }
@@ -2017,8 +2129,8 @@ void cpu_plugin_vclock_resume(CPUState *cpu)
 {
 #ifndef CONFIG_USER_ONLY
     g_assert(cpu->plugin_vclock_depth > 0);
-    if (--cpu->plugin_vclock_depth > 0 || cpu->plugin_spec_vtime_paused) {
-        return;                    /* still frozen by an outer window / WP */
+    if (--cpu->plugin_vclock_depth > 0) {
+        return;                    /* still frozen by an outer window */
     }
 #ifdef CONFIG_PLUGIN
     if (cst_nofreeze()) {
@@ -2029,16 +2141,11 @@ void cpu_plugin_vclock_resume(CPUState *cpu)
     if (need_bql) {
         bql_lock();
     }
-    if (runstate_is_running()) {
-        cpu_enable_ticks();
+    if (cpu_plugin_ticks_thaw(cpu->cpu_index)) {
 #if defined(CONFIG_PLUGIN)
-        /* A wrong-path excursion that ended while this instrumentation window
-         * was open left the tick re-enable (and so the icount restore) to us;
-         * no-op when it did not. */
-        icount_plugin_thaw(cpu, &g_spec_icount_freeze);
-        /* Same contract, cheaper case: no guest state moved, but a counter
-         * derived from a different host oscillator than the virtual clock
-         * still has to be re-pinned to the frozen time on every thaw. */
+        /* The clock actually restarted here: no guest state moved, but a
+         * counter derived from a different host oscillator than the virtual
+         * clock still has to be re-pinned to the frozen time on every thaw. */
         cpu_plugin_clock_resync(cpu, SPEC_CLOCK_THAW);
 #endif
     }

@@ -141,6 +141,19 @@ struct CPUMIPSMVPContext {
      * that a newer section has already made.
      */
     int32_t evp_owner;
+
+    /*
+     * The processor's Count time base.  MIPS MT gives one processor one
+     * Count, shared by every VPE of that processor, and a guest that treats
+     * it as a clocksource requires every VPE to read the same value at the
+     * same instant.  Held here rather than per-VPE for exactly the reason
+     * MVPControl is: see cpu_mips_store_count().
+     *
+     * This is the OFFSET form, the same as CPUMIPSState::CP0_Count -- the
+     * architected value minus the elapsed count_clock ticks -- so that a
+     * read is offset + ticks(now).
+     */
+    int32_t CP0_Count;
 };
 
 typedef struct mips_def_t mips_def_t;

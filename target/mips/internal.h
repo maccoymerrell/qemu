@@ -251,6 +251,7 @@ void mips_mvp_note_timer(CPUMIPSState *env, int op, uint32_t wait,
 /* Architected Count as of an ALREADY-SAMPLED virtual time.  The instrument
  * must report the same instant the arming used, not a second, later read. */
 uint32_t cpu_mips_get_count_val_raw(CPUMIPSState *env, int64_t now_ns);
+void cpu_mips_restore_count_base(CPUMIPSState *env);
 
 extern const VMStateDescription vmstate_mips_cpu;
 

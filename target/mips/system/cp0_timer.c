@@ -26,10 +26,52 @@
 #include "system/kvm.h"
 #include "internal.h"
 
+/*
+ * The Count time base this VPE reads and writes.
+ *
+ * MIPS MT: Count belongs to the PROCESSOR, not to a VPE.  malta_mips_config()
+ * advertises the vCPUs of an `-smp N` malta as the VPEs of ONE MT processor
+ * (MVPConf0.PVPE), every one of them shares VPE 0's CPUMIPSMVPContext, and the
+ * guest reads that single counter as the machine's clocksource -- Linux
+ * registers it as "MIPS", 32 bits, and reads it with mfc0 $9 on whichever CPU
+ * happens to be running.  A clocksource has to be monotonic across the CPUs
+ * that read it.
+ *
+ * Per-VPE storage cannot be: the field is an OFFSET from the virtual clock, so
+ * one instant reads as a different time on every VPE whose offset differs, and
+ * the offsets do not stay equal because the guest writes Count.
+ * synchronise_count_master()/_slave() has every CPU store the same value "all
+ * at once", which on MT hardware is one register and is therefore exact; with
+ * one field per vCPU each store landed whenever that vCPU thread happened to
+ * be scheduled and moved only itself.  Measured on a Linux 6.6 malta -smp 4
+ * guest that had just printed "Synchronize counters for CPU 1..3: done.", one
+ * instant read 0x2e8126d5 / 0x2e8171f0 / 0x2e8128ad / 0x2e8126ca on VPEs 0..3:
+ * a spread of 19,227 ticks, 120 us at the Malta 160 MHz count rate, and
+ * permanent for the rest of the run.  Over 295 boots every single one was
+ * incoherent, median 1,940 ticks and worst 20,833.  A clocksource read that
+ * moves backwards makes the guest's clocksource_delta() return 0, so its
+ * timekeeping stops advancing for the width of the skew each time it migrates
+ * onto a lagging VPE.
+ *
+ * Storing the base once, in the shared MVP context, is what makes every VPE
+ * read the same instant by construction; keeping it in step by copying between
+ * per-VPE fields cannot, because two VPEs storing Count concurrently leave
+ * whichever copy each wrote last (measured: a residual of up to 247 ticks).
+ * CPUMIPSState::CP0_Count is still written as the migration/gdbstub view of
+ * the register, and remains the storage on a CPU without the MT ASE.
+ */
+static int32_t *mips_count_base(CPUMIPSState *env)
+{
+    if (ase_mt_available(env) && env->mvp) {
+        return &env->mvp->CP0_Count;
+    }
+    return &env->CP0_Count;
+}
+
 /* MIPS R4K timer */
 uint32_t cpu_mips_get_count_val_raw(CPUMIPSState *env, int64_t now_ns)
 {
-    return env->CP0_Count +
+    return qatomic_read(mips_count_base(env)) +
             (uint32_t)clock_ns_to_ticks(env->count_clock, now_ns);
 }
 
@@ -177,7 +219,7 @@ void mips_cpu_plugin_resync_timers(CPUState *cs)
 uint32_t cpu_mips_get_count(CPUMIPSState *env)
 {
     if (env->CP0_Cause & (1 << CP0Ca_DC)) {
-        return env->CP0_Count;
+        return qatomic_read(mips_count_base(env));
     } else {
         uint64_t now_ns;
 
@@ -192,6 +234,33 @@ uint32_t cpu_mips_get_count(CPUMIPSState *env)
     }
 }
 
+/*
+ * A store of Count is a store to one register: every VPE sharing this
+ * processor's base computes its own deadline from it, so all of them are
+ * re-armed, not just the VPE that stored.  Their CPUMIPSState::CP0_Count
+ * mirrors are refreshed at the same time, because that mirror is what
+ * vmstate_mips_cpu saves.
+ */
+static void mips_count_rearm_siblings(CPUMIPSState *env)
+{
+    CPUState *cs;
+
+    if (!ase_mt_available(env) || !env->mvp) {
+        return;
+    }
+    CPU_FOREACH(cs) {
+        CPUMIPSState *other = &MIPS_CPU(cs)->env;
+
+        if (other == env || other->mvp != env->mvp || !other->timer) {
+            continue;
+        }
+        other->CP0_Count = qatomic_read(&env->mvp->CP0_Count);
+        if (!(other->CP0_Cause & (1 << CP0Ca_DC))) {
+            cpu_mips_timer_update(other);
+        }
+    }
+}
+
 void cpu_mips_store_count(CPUMIPSState *env, uint32_t count)
 {
     /*
@@ -201,12 +270,15 @@ void cpu_mips_store_count(CPUMIPSState *env, uint32_t count)
      */
     if (env->CP0_Cause & (1 << CP0Ca_DC) || !env->timer) {
         env->CP0_Count = count;
+        qatomic_set(mips_count_base(env), count);
     } else {
         /* Store new count register */
         env->CP0_Count = count - (uint32_t)clock_ns_to_ticks(env->count_clock,
                         qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        qatomic_set(mips_count_base(env), env->CP0_Count);
         /* Update timer timer */
         cpu_mips_timer_update(env);
+        mips_count_rearm_siblings(env);
     }
 }
 
@@ -224,14 +296,25 @@ void cpu_mips_store_compare(CPUMIPSState *env, uint32_t value)
 
 void cpu_mips_start_count(CPUMIPSState *env)
 {
-    cpu_mips_store_count(env, env->CP0_Count);
+    cpu_mips_store_count(env, qatomic_read(mips_count_base(env)));
 }
 
 void cpu_mips_stop_count(CPUMIPSState *env)
 {
     /* Store the current value */
-    env->CP0_Count += (uint32_t)clock_ns_to_ticks(env->count_clock,
-                        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    env->CP0_Count = qatomic_read(mips_count_base(env)) +
+        (uint32_t)clock_ns_to_ticks(env->count_clock,
+                                    qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    qatomic_set(mips_count_base(env), env->CP0_Count);
+}
+
+/*
+ * vmstate_mips_cpu saves CPUMIPSState::CP0_Count, so a loaded machine has the
+ * per-VPE mirrors but not the shared base they are mirrors of.  Seed it.
+ */
+void cpu_mips_restore_count_base(CPUMIPSState *env)
+{
+    qatomic_set(mips_count_base(env), env->CP0_Count);
 }
 
 static void mips_timer_cb(void *opaque)

@@ -231,14 +231,13 @@ enum {
  * architectural state is the same word for word, measured.  What tells them
  * apart is not in the guest at all: it is where the HOST QEMUTimer that will
  * deliver the next tick has been armed, relative to where the guest's own
- * Compare asked for it.  cpu_mips_timer_update has two clamp arms that arm it
+ * Compare asked for it.  cpu_mips_timer_update has one clamp arm that arms it
  * somewhere else, so the last arming of each kind is latched here and the
  * arms are counted, per VPE.
  */
 enum {
     MIPS_CP0T_ARM,          /* deadline programmed from Compare - Count     */
-    MIPS_CP0T_ARM_WRAP,     /* wait == 0     -> clamped to a 2^32 wrap      */
-    MIPS_CP0T_ARM_BEHIND,   /* wait past Count -> clamped to 2^24 (rescue)  */
+    MIPS_CP0T_ARM_BEHIND,   /* target not in the future -> 2^24 (rescue)    */
     MIPS_CP0T_FIRE,         /* expiry delivered: Cause.TI set, IP7 raised   */
 };
 extern int mips_mvp_debug;

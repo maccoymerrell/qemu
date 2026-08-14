@@ -69,7 +69,10 @@
  * 120-boot wave afterwards report 2104, 2104 and 2108 jiffies, i.e. RCU
  * noticing at its bare CONFIG_RCU_CPU_STALL_TIMEOUT and carrying no wrap
  * quantum at all.  A residual stall mechanism therefore survives this fix and
- * is a different one; do not read the coherent base as closing it.
+ * is a different one; do not read the coherent base as closing it.  That
+ * second mechanism was the wait == 0 clamp in cpu_mips_timer_update below,
+ * and it is a HOST timer parked a wrap out rather than a guest clocksource
+ * read jumping one -- same quantum, opposite direction.
  *
  * Storing the base once, in the shared MVP context, is what makes every VPE
  * read the same instant by construction; keeping it in step by copying between
@@ -108,21 +111,18 @@ static void cpu_mips_timer_update(CPUMIPSState *env)
     now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     wait = env->CP0_Compare - cpu_mips_get_count_val_raw(env, now_ns);
     op = MIPS_CP0T_ARM;
-    /* Clamp interval to overflow if virtual time had not progressed */
-    if (!wait) {
-        op = MIPS_CP0T_ARM_WRAP;
-        wait = UINT32_MAX;
-    } else if (wait > INT32_MAX) {
+    if (wait == 0 || wait > INT32_MAX) {
         op = MIPS_CP0T_ARM_BEHIND;
         /*
-         * The target is BEHIND Count: architectural equality-match
-         * semantics say "fire at the wrap", a full ~2^32 ticks away.  Real
+         * The target is NOT IN THE FUTURE: Compare is behind Count, or it is
+         * Count exactly, and either way the next equality match is a full
+         * ~2^32 ticks away — 26.8435 s at the Malta 160 MHz count rate.  Real
          * silicon only ever gets here transiently (a guest's next-event
          * write races Count by nanoseconds and its -ETIME readback
          * recovers); under TCG the guest's read-Count -> write-Compare
          * window costs wall (= virtual) time that can exceed small deltas
          * entirely — most of all while boot code is still being
-         * translated — so the OS's bounded retries can ALL land behind
+         * translated — so the OS's bounded retries can ALL land at or behind
          * Count, its clockevent dies, and the CPU parks in idle until the
          * wrap fires or a cross-CPU rescue arrives (observed on Malta SMP,
          * Linux 6.6: a ~21 s RCU-stall-and-NMI tick outage on every boot,
@@ -134,6 +134,36 @@ static void cpu_mips_timer_update(CPUMIPSState *env)
          * tick-storm cadence, while every legitimate future program (OS
          * contract: delta <= 2^31 - 1) is untouched.  A real reprogram
          * replaces this deadline long before it fires.
+         *
+         * wait == 0 is the SAME condition and not a separate one, which is
+         * why it shares the arm.  It used to be clamped to UINT32_MAX under
+         * the justification "clamp interval to overflow if virtual time had
+         * not progressed"; virtual time progressing is not what the test
+         * measures — the guest landing its program exactly ON Count is —
+         * and the clamp parked that VPE's tick for the whole wrap with
+         * nothing scheduled to reprogram it.
+         *
+         * Measured, 120 instrumented malta -smp 4 boots, every arm tagged
+         * with its call site (no arm went untagged): 17 boots took the
+         * wait == 0 arm and all 17 came from cpu_mips_store_compare — never
+         * from the expiry re-arm, a Count store, an MT sibling re-arm or the
+         * excursion resync.  15 were Linux's c0_compare_int_usable() probe
+         * loop, which reads Count back and reprograms ~1.9 us later; those
+         * are harmless and are why merely counting the arm looks innocent.
+         * The other 2 were synchronise_count_master+0xc4, whose closing
+         * `write_c0_compare(read_c0_count() + COUNTON)` (COUNTON = 100 ticks
+         * = 625 ns of virtual time under TCG) has no readback, no -ETIME
+         * check and no retry — it is the "arrange for an interrupt in a
+         * short while" that the SMP bring-up path leaves behind.  In both,
+         * the NEXT arm on that VPE was the parked deadline firing 26.85 s
+         * later, and the measured gap between two timer deliveries was
+         * 26.853 s and 26.846 s.  No other boot in that wave had a tick gap
+         * over 1.36 s.
+         *
+         * That also explains the shape of the symptom: synchronise_count_
+         * master() runs on the boot CPU, and the surviving RCU stalls all
+         * name CPU 0 with "(0 ticks this GP)" while the other VPEs keep
+         * ticking.
          */
         wait = 1 << 24;
     }

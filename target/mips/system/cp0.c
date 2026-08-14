@@ -234,7 +234,7 @@ static MipsMvpEvent mvp_last_wake[MIPS_MVP_MAXVPE];
  * row names which arm parked a tick.
  */
 typedef struct MipsCp0TimerLatch {
-    uint64_t n_arm, n_arm_wrap, n_arm_behind, n_fire;
+    uint64_t n_arm, n_arm_behind, n_fire;
     int64_t arm_now, arm_deadline, fire_now;
     uint32_t arm_count, arm_compare, arm_wait, arm_op;
     uint32_t fire_count, fire_compare, fire_cause;
@@ -465,9 +465,7 @@ void mips_mvp_note_timer(CPUMIPSState *env, int op, uint32_t wait,
     }
 
     t->n_arm++;
-    if (op == MIPS_CP0T_ARM_WRAP) {
-        t->n_arm_wrap++;
-    } else if (op == MIPS_CP0T_ARM_BEHIND) {
+    if (op == MIPS_CP0T_ARM_BEHIND) {
         t->n_arm_behind++;
     }
     t->arm_now = now_ns;
@@ -498,14 +496,14 @@ static void mvp_report_timer(CPUState *cs)
      * difference is the skew that a parked tick is made of.
      */
     d = (int32_t)(t->arm_compare - t->arm_count);
-    fprintf(stderr, "MVPTIMER cpu=%d arms=%" PRIu64 " wrap=%" PRIu64
+    fprintf(stderr, "MVPTIMER cpu=%d arms=%" PRIu64
                     " behind=%" PRIu64 " fires=%" PRIu64
                     " max_wait=0x%08x max_wait_op=%u max_fire_gap=%" PRId64
                     " | last_arm wait=0x%08x Count=0x%08x Compare=0x%08x"
                     " guest_ticks=%d deadline=%" PRId64 " now=%" PRId64
                     " | last_fire Count=0x%08x Compare=0x%08x Cause=0x%08x"
                     " now=%" PRId64 "\n",
-            i, t->n_arm, t->n_arm_wrap, t->n_arm_behind, t->n_fire,
+            i, t->n_arm, t->n_arm_behind, t->n_fire,
             t->max_wait, t->max_wait_op, t->max_fire_gap,
             t->arm_wait, t->arm_count, t->arm_compare, d,
             t->arm_deadline, t->arm_now,

@@ -302,6 +302,16 @@ typedef struct CPUTLBDesc {
      */
     vaddr large_page_addr;
     vaddr large_page_mask;
+#ifdef CONFIG_PLUGIN
+    /*
+     * The pair above, saved at wrong-path excursion entry and put back at
+     * exit -- see cpu_plugin_spec_tlb_note(), which also records why these
+     * moved here from file-scope arrays.  Per-mmu_idx AND per-vCPU because
+     * that is what they shadow.
+     */
+    vaddr plugin_spec_lp_addr;
+    vaddr plugin_spec_lp_mask;
+#endif
     /* host time (in ns) at the beginning of the time window */
     int64_t window_begin_ns;
     /* maximum number of entries observed in the window */
@@ -335,6 +345,15 @@ typedef struct CPUTLBCommon {
     size_t full_flush_count;
     size_t part_flush_count;
     size_t elide_flush_count;
+#ifdef CONFIG_PLUGIN
+    /*
+     * True between cpu_plugin_spec_tlb_note() and
+     * cpu_plugin_spec_tlb_flush_logged() on THIS vCPU: the large-page region
+     * saved in CPUTLBDesc::plugin_spec_lp_* is valid and owed a restore.
+     * Protected by @lock, like the tables it guards.
+     */
+    bool plugin_spec_lp_saved;
+#endif
 } CPUTLBCommon;
 
 /*

@@ -1101,23 +1101,45 @@ static void plugin_spec_tlb_log_add(CPUState *cpu, int mmu_idx, vaddr page,
 #endif
 
 #ifdef CONFIG_PLUGIN
-static vaddr g_spec_lp_addr[NB_MMU_MODES];
-static vaddr g_spec_lp_mask[NB_MMU_MODES];
-static bool  g_spec_lp_saved;
-
 /*
  * Snapshot the per-mmu_idx large-page escalation region at excursion entry.
  * tlb_add_large_page() only ever WIDENS it, so a wrong-path install would
  * widen it permanently and escalate unrelated correct-path page flushes into
  * full flushes long after the walk was discarded.
+ *
+ * The save lives in the vCPU's own CPUTLBDesc/CPUTLBCommon.  It used to live
+ * in file-scope arrays -- one set for the whole machine, holding a value that
+ * is per-vCPU and per-mmu_idx.  Two vCPUs inside an excursion at the same
+ * time would have interleaved as note(A), note(B), flush(A), flush(B): A's
+ * restore installs B's large-page region into A's descriptors, and since a
+ * region can be NARROWER, a later flush of a page inside A's true region
+ * stops escalating and stale entries survive it; B, whose saved flag A's
+ * restore already cleared, is never restored at all and keeps the widening
+ * the save exists to undo.
+ *
+ * THAT INTERLEAVING CANNOT HAPPEN TODAY, and this is not a bug report: the
+ * ChampSim Tracer runs its wrong-path walk synchronously inside
+ * emit_finalized_bb while holding exec_lock, which is machine-wide, so a peer
+ * vCPU's vcpu_tb_exec blocks there and no second excursion can open.  The
+ * defect was never observed and cannot be, on any target, while that
+ * serialisation holds.  It is corrected anyway because the storage class was
+ * simply wrong for the datum -- the arrays were found by an exhaustive diff
+ * of every writable global in the QEMU executable across an excursion, where
+ * they were the only entry not accounted for by the diff's own bracket -- and
+ * because the containment path must not depend on a plugin-side lock for its
+ * per-vCPU state to stay separate.
  */
 void cpu_plugin_spec_tlb_note(CPUState *cpu)
 {
+    CPUTLB *tlb = &cpu->neg.tlb;
+
+    qemu_spin_lock(&tlb->c.lock);
     for (int i = 0; i < NB_MMU_MODES; i++) {
-        g_spec_lp_addr[i] = cpu->neg.tlb.d[i].large_page_addr;
-        g_spec_lp_mask[i] = cpu->neg.tlb.d[i].large_page_mask;
+        tlb->d[i].plugin_spec_lp_addr = tlb->d[i].large_page_addr;
+        tlb->d[i].plugin_spec_lp_mask = tlb->d[i].large_page_mask;
     }
-    g_spec_lp_saved = true;
+    tlb->c.plugin_spec_lp_saved = true;
+    qemu_spin_unlock(&tlb->c.lock);
 }
 
 /*
@@ -1146,12 +1168,12 @@ void cpu_plugin_spec_tlb_flush_logged(CPUState *cpu)
         }
         tlb_flush_vtlb_page_locked(cpu, midx, page);
     }
-    if (g_spec_lp_saved) {
+    if (tlb->c.plugin_spec_lp_saved) {
         for (int i = 0; i < NB_MMU_MODES; i++) {
-            tlb->d[i].large_page_addr = g_spec_lp_addr[i];
-            tlb->d[i].large_page_mask = g_spec_lp_mask[i];
+            tlb->d[i].large_page_addr = tlb->d[i].plugin_spec_lp_addr;
+            tlb->d[i].large_page_mask = tlb->d[i].plugin_spec_lp_mask;
         }
-        g_spec_lp_saved = false;
+        tlb->c.plugin_spec_lp_saved = false;
     }
     qemu_spin_unlock(&tlb->c.lock);
 }

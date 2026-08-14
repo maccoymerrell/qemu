@@ -788,7 +788,7 @@ def _stats_log_for(console_log: Path) -> Path:
 
 def _check_segment_coverage(console_log: Path, require_ok: bool = False,
                             label: str = "", smp: int = 1,
-                            workload: str = "") -> int:
+                            workload: str = "", system: bool = False) -> int:
     """Assert the plugin's per-segment coverage line from the captured
     console log: ``finished segment [...] user_covered=C user_budget=B
     ... FLAG``.  UNDER means the window closed before its budget for a
@@ -876,12 +876,21 @@ def _check_segment_coverage(console_log: Path, require_ok: bool = False,
     # retired count, so it is what covers the sub-floor regime the ratio leg
     # cannot judge -- and that regime is where the escaped x86 marker cells
     # live (854-857 covered, ratios to 8197).
-    verdict = STALL.assess(_stats_log_for(console_log), label=label,
-                           workload=workload or label)
-    for line in verdict.lines:
-        print(line)
-    if not verdict.ok:
-        rc = 1
+    #
+    # @system says the cell ran under qemu-system-<isa>, and it is what makes
+    # "no guest clock" a failure rather than a fact.  Under qemu-user there is
+    # no guest clock to read, so the plugin prints factor=n/a by design; a gate
+    # that reads that as "a system cell that closed a window produced no
+    # readable segment" convicts every user-mode cell of the defect it exists
+    # to find.  simpoint_test is the one that showed it -- a user-mode battery
+    # whose fourteen content checks all report errors=0, failed by this leg.
+    if system:
+        verdict = STALL.assess(_stats_log_for(console_log), label=label,
+                               workload=workload or label)
+        for line in verdict.lines:
+            print(line)
+        if not verdict.ok:
+            rc = 1
     return rc
 
 
@@ -1018,7 +1027,8 @@ def cmd_validate(args, isa: str | None = None) -> int:
         # segment-close line must not report an under-budget close.
         console = Path(f"{_trace_base(args.out_dir, prog, isa)}.console.log")
         if console.is_file() and _check_segment_coverage(
-                console, label=isa, smp=getattr(args, "smp", 1)):
+                console, label=isa, smp=getattr(args, "smp", 1),
+                system=bool(getattr(args, "system", False))):
             rc = 1
     return rc
 
@@ -1238,7 +1248,10 @@ def cmd_thread_test(args) -> int:
                            and i.severity == "info"), 0)
             run_ok = (not report.errors()) and chains == 2
             if _check_segment_coverage(console, label=isa,
-                                       smp=getattr(args, "smp", 1)):
+                                       smp=getattr(args, "smp", 1),
+                                       workload="thread_test",
+                                       system=bool(getattr(args, "system",
+                                                           False))):
                 run_ok = False
             # Decoupling evidence from the vCPU<->tid bindings (diag).
             # thread_id == vCPU index would force every binding to be
@@ -1371,7 +1384,9 @@ def cmd_churn_test(args) -> int:
 
         if _check_segment_coverage(console, require_ok=True, label=isa,
                                    smp=getattr(args, "smp", 1),
-                                   workload="churn"):
+                                   workload="churn",
+                                   system=bool(getattr(args, "system",
+                                                       False))):
             rc_total = 1
 
         stats_log = Path(f"{out_base}.stats.log")

@@ -532,7 +532,13 @@ The tracer reports the relevant quantities at exit, unconditionally::
 
   champsim_tracer: guest_realtime factor=0.087 worst_sample=0.038 samples=9
     in_segment_host_s=2.49 guest_s=0.217 insn_per_guest_s=2.679M
-    ticktax=0.6747 worst_user_stall=44582 stall_detector=live
+    segment_insns=581343 ticktax=0.6747 worst_user_stall=44582
+    stall_detector=live
+
+``segment_insns`` is the instructions the guest retired while the capture
+was open, printed exactly.  A consumer must use it rather than recover it
+from the rate beside it; see the stall-condition section below for what
+that reconstruction costs.
 
 ``ticktax`` is the fraction of retired guest instructions spent inside
 asynchronous interrupts; at 1.0 the guest can make no progress at all.
@@ -668,7 +674,7 @@ computed from the two architectural counts the tracer already prints:
 
 .. code-block:: text
 
-    stall_fraction = worst_user_stall / (insn_per_guest_s x guest_s)
+    stall_fraction = worst_user_stall / segment_insns
 
 — the largest number of instructions the guest retired between two
 advances of the traced process's user clock, over the instructions it
@@ -678,13 +684,28 @@ happened in one stretch during which the traced process did not execute a
 single instruction.  Nothing in it is a time, a rate or a cost, so it
 reads the same on an idle host and a saturated one.
 
-Two properties of the reading are worth keeping in mind when using it.
-It is a LOWER bound: ``worst_user_stall`` is sampled, and a stall is
-measured from the last sample before it began to the last before it
-ended, so the instrument can only under-report.  A reading over the gate
-is therefore a measurement; a reading under it only rules the condition
-out when the sampling was fine enough to have caught it, which is
-``stall_fraction + 2/samples <= gate``.  And it reads the TRACED
+Both terms must come from the report verbatim.  ``segment_insns`` is
+printed for exactly that reason: recovering it as ``insn_per_guest_s x
+guest_s`` divides by a guest clock printed to three decimals, and that
+clock is frozen across every excursion, so a marker window can close
+inside a few milliseconds of it.  At ``guest_s=0.003`` the three decimals
+are a 17 per cent quantisation — wider than the whole distance from the
+healthy band to the gate — and the reconstruction has been measured
+3.2 times larger than every instruction the guest retired in the run.
+
+Two further properties of the reading matter when using it.  It is
+SAMPLED, and the sampling has no reliable direction.  A stall is measured
+from the last sample before it began to the last before it ended, which
+under-reports; but the same grid hides an *advance* of the user clock
+just as readily, and a workload that retires its whole burst between two
+samples never resets the stretch and reads as a total stall.  What makes
+a trip trustworthy is arithmetic the report already carries: the stalled
+instructions and the traced user instructions are disjoint subsets of the
+segment, so ``worst_user_stall + traced_icount <= segment_insns``.  A
+report that violates that has contradicted itself and is not scoreable —
+neither a stall nor a clean bill of health.  A reading under the gate
+only rules the condition out when the sampling was fine enough to have
+caught it, which is ``stall_fraction + 2/samples <= gate``.  And it reads the TRACED
 PROCESS's user clock, so a workload whose marked process is legitimately
 off-CPU — the validator's churn cell, which runs a stream of short-lived
 processes beside the marked one — can read high while the machine is

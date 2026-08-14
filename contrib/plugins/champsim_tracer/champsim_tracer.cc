@@ -3303,13 +3303,27 @@ struct RtFactorGate {
         double f = (double)tot_vc_ns / (double)tot_host_ns;
         double gsec = (double)tot_vc_ns / 1e9;
         double rg = gsec > 0 ? (double)tot_icnt / gsec : 0.0;
+        /*
+         * segment_insns is tot_icnt VERBATIM, and it is the field a consumer
+         * must divide worst_user_stall by.  It is printed because the rate
+         * beside it cannot be inverted: a reader that reconstructs the count
+         * as insn_per_guest_s x guest_s divides by a guest clock rounded to
+         * three decimals, and this clock is FROZEN across every excursion, so
+         * a whole marker window can close inside a few milliseconds of it.
+         * At guest_s=0.003 those three decimals are a 17% quantisation on the
+         * denominator; the reconstruction then exceeded the run's own retired
+         * count by 3.2x and drove the validator's stall gate to a "fraction"
+         * of 1.050 on a cell whose arch/user was 1.2.  The count is exact and
+         * costs one field, so the round trip through a rate is removed rather
+         * than bounded.
+         */
         g_string_append_printf(out,
             "champsim_tracer: guest_realtime factor=%.4f worst_sample=%.4f "
             "samples=%u in_segment_host_s=%.2f guest_s=%.3f "
-            "insn_per_guest_s=%.3fM ticktax=%.4f "
+            "insn_per_guest_s=%.3fM segment_insns=%" PRIu64 " ticktax=%.4f "
             "worst_user_stall=%" PRIu64 " stall_detector=%s\n",
             f, have_worst ? worst_factor : f, samples,
-            (double)tot_host_ns / 1e9, gsec, rg / 1e6,
+            (double)tot_host_ns / 1e9, gsec, rg / 1e6, tot_icnt,
             tot_icnt ? (double)tot_async / (double)tot_icnt : 0.0,
             worst_stall,
             user_moved ? (armed_stall ? "live" : "live-unarmed") : "INERT");

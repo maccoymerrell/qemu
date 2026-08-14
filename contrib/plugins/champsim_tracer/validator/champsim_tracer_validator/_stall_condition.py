@@ -107,14 +107,36 @@ through ``CST_RT_GATE_WINDOW_MS``) and only notices that the user clock moved
 at a sample boundary.  A stall is therefore measured from the last sample
 before it began to the last sample before it ended, so the reading is biased
 LOW by at most one sample window at each end — at most ``2/samples`` of the
-segment.  The instrument cannot over-report; it can only miss.
+segment.
 
-The bias has a direction, and the direction is what makes the gate sound.
-Because the instrument can only under-report, **a reading above the gate is a
-fact, not an inference** — the true stall is at least that large — so the trip
-is valid at any sample count.  The converse is not: a reading *below* the gate
-only rules the condition out when the grid was fine enough to have caught it,
-which is ``stall_fraction + 2/samples <= gate``.  Both are reported:
+THAT LAST SENTENCE USED TO READ "the instrument cannot over-report; it can
+only miss", and the trip was checked before anything about sample counts on
+the strength of it.  IT IS FALSE, and the tip's own regression battery is what
+disproved it.  The grid hides an advance of the user clock exactly as readily
+as it hides a stall: if the traced process retires its whole burst between two
+samples, no sample ever sees ``g_user_icount`` at a different value, the
+stretch is never reset, and ``worst_user_stall`` grows to cover the segment.
+thread_test aarch64 --system --smp 2 reads ``worst_user_stall`` 45,231,089
+against a 45,243,792-instruction segment — a claimed 100.0% stall — on a cell
+that retired 200,006 traced user instructions inside that same segment, with
+arch/user of 1.1.  The bias therefore has NO reliable direction on a bursty
+workload, and a reading above the gate is not by itself a fact.
+
+What makes a trip trustworthy is not the grid, it is arithmetic the report
+carries anyway.  ``worst_user_stall`` counts instructions retired with no
+traced user instruction among them, so that set and the traced user
+instructions are disjoint subsets of the segment:
+
+    worst_user_stall + traced_icount <= segment_insns
+
+:func:`assess` checks it, and a report that violates it is ``NOT SCOREABLE``
+— the instrument contradicted itself, which is a defect in the measurement
+and neither a stall nor a clean bill of health.  Every one of the 1350 corpus
+cells satisfies it, including all 25 killed cells and all 15 flagged closed
+ones, so the check costs the detector nothing where the detector works.  A
+reading *below* the gate only rules the condition out when the grid was fine
+enough to have caught it, which is ``stall_fraction + 2/samples <= gate``.
+Both are reported:
 :attr:`RtReport.stall_fraction` is the measured lower bound and
 :attr:`RtReport.stall_fraction_ub` the largest value consistent with it.
 
@@ -141,6 +163,27 @@ because a gate whose blind spot is undocumented is worse than no gate.
 
 The corpus's real marker cells carry 15 (p50) to 593 samples and certify
 comfortably; it is only the synthetic cell that cannot.
+
+THE DENOMINATOR IS A COUNT, NOT A RECONSTRUCTION
+================================================
+
+The score originally recovered the segment's instruction count as
+``insn_per_guest_s x guest_s`` from two printed values.  ``guest_s`` is
+printed to three decimals AND it is the FROZEN guest clock, so a whole marker
+window can close inside a few milliseconds of it: the corpus runs guest_s of
+about 12 s, where three decimals are 4e-5 and the reconstruction is exact for
+every purpose — and the validator's own system segments run guest_s of 0.003
+to 0.009, where the same three decimals are 6% to 17%, wider than the whole
+distance from the healthy p90 (0.215) to the gate (0.50).  On thread_test
+x86_64 the reconstruction came out at 1,838,680,893 against a run whose total
+``host_icount`` was 574,703,440 — 3.2x every instruction the guest retired —
+and the gate read a "fraction" of 1.050 and failed the cell.  With the count
+read directly the same cell reads 0.000.
+
+The plugin now prints ``segment_insns`` verbatim and that field is used when
+present.  :attr:`RtReport.denominator_rel_error` bounds the fallback for
+reports written before it existed, and a fallback too coarse to support the
+comparison is ``NOT SCOREABLE`` rather than judged.
 
 WHAT THIS SCORE DOES *NOT* SEPARATE
 ===================================
@@ -191,6 +234,15 @@ STALL_FRACTION_NOTE = 0.25
 #: Operational override, for positive controls and for re-measuring the band.
 #: Reading it is logged by :func:`threshold` so a lowered gate can never be
 #: mistaken for the shipped one.
+#: Largest relative error the score's DENOMINATOR may carry and still be
+#: judged.  Only a report that predates the plugin's ``segment_insns`` field
+#: can carry any: 5% is a fifth of the distance between the measured healthy
+#: p90 (0.215) and the gate (0.50), so a reading that clears the gate with
+#: this much slack still clears it.  The 1350-cell corpus runs guest_s ~ 12 s,
+#: where the same three decimals are 4e-5 -- which is why this defect was
+#: invisible there and fired on the validator's own millisecond segments.
+DENOMINATOR_REL_ERROR_MAX = 0.05
+
 _ENV_MAX = "CST_STALL_FRACTION_MAX"
 
 #: Sampling cadence (ms of host time) the validator asks the plugin's
@@ -225,6 +277,19 @@ OFF_CPU_WORKLOADS: dict[str, str] = {
              "off-CPU while the guest retires instructions in other address "
              "spaces; separating that from a wedge needs a machine-wide "
              "user-retirement count the plugin does not keep",
+    "thread_test": "the capture is not scoped to the marked process: the "
+                   "clone pair runs one short burst inside a guest that boots "
+                   "for the rest of the segment, so the denominator counts "
+                   "execution the traced process was never running in.  "
+                   "Measured at 5b9ecaec94, segment_insns over the traced "
+                   "window's own architectural span (trace_arch_insns) is "
+                   "174x on riscv64, 205x on aarch64 and 5372x on x86_64, "
+                   "against 3-7x for every cell of the 1350-cell marker "
+                   "corpus the gate was calibrated on.  All three then read "
+                   "0.995-1.000 with arch/user of 1.1-1.3 -- the same "
+                   "ambiguity churn has, arriving through a boot instead of "
+                   "through sibling processes, and needing the same "
+                   "machine-wide user-retirement count to resolve",
 }
 
 
@@ -269,11 +334,42 @@ class RtReport:
     stall_detector: str = ""
     traced_icount: int | None = None
     trace_arch_insns: int | None = None
+    #: The plugin's own exact count of the instructions retired inside the
+    #: segment (``segment_insns=`` in the guest_realtime line).  None on a
+    #: report written before the plugin printed it.
+    segment_insns_exact: int | None = None
 
     @property
     def segment_insns(self) -> float:
-        """Instructions the guest retired while the capture was open."""
+        """Instructions the guest retired while the capture was open.
+
+        Prefer the plugin's exact count.  The fallback -- rate x guest clock
+        -- is a reconstruction through two printed values and is only sound
+        while ``guest_s`` is large enough that three decimal places do not
+        matter; :attr:`denominator_rel_error` says when it is not, and
+        :func:`assess` refuses to score rather than reporting a fabricated
+        fraction.
+        """
+        if self.segment_insns_exact is not None:
+            return float(self.segment_insns_exact)
         return self.insn_per_guest_s * self.guest_s
+
+    @property
+    def denominator_rel_error(self) -> float:
+        """Relative error the denominator carries.
+
+        Zero when the plugin printed the count.  Otherwise ``guest_s`` is
+        printed to three decimals, so it carries +/-0.0005 s -- and this clock
+        is FROZEN across every excursion, so a whole marker window can close
+        inside a few milliseconds of it.  At guest_s=0.003 that is 17%, which
+        is larger than the entire distance between the healthy band and the
+        gate; a score computed on it is not a measurement of anything.
+        """
+        if self.segment_insns_exact is not None:
+            return 0.0
+        if self.guest_s <= 0:
+            return 1.0
+        return min(1.0, 0.0005 / self.guest_s)
 
     @property
     def stall_fraction(self) -> float | None:
@@ -335,6 +431,8 @@ def parse_rt_report(stats_text: str) -> RtReport | None:
             ticktax=float(kv.get("ticktax", 0.0)),
             samples=int(kv.get("samples", 0)),
             stall_detector=kv.get("stall_detector", ""),
+            segment_insns_exact=(int(kv["segment_insns"])
+                                 if "segment_insns" in kv else None),
             traced_icount=traced, trace_arch_insns=arch)
     except (KeyError, ValueError) as e:
         return RtReport(measurable=False,
@@ -399,11 +497,26 @@ def assess(stats_path: Path, label: str = "",
                      f"condition could not be measured")
         return Verdict(False, lines)
     if not r.measurable:
-        lines.append(f"stall[{label}]: FAIL  the plugin could not measure the "
-                     f"guest clock ({r.why_not}) — a system cell that closed "
-                     f"a window must produce a readable segment, and without "
-                     f"one the stall condition is unmeasured, not absent")
-        return Verdict(False, lines)
+        # THE SUBJECT IS THE REPORT, AND THE REPORT IS HERE.  A missing or
+        # unreadable stats.log fails above, because then the check cannot find
+        # its subject.  This is the other case: the report exists and says the
+        # plugin could not read the guest clock, which is a statement about
+        # the instrument and not about the guest.  Failing on it was a
+        # coin-flip -- the mipsel marker cell closes at END after 547 user
+        # instructions, and whether that window outlives one 250 ms sample
+        # decides between "samples=2, stall_fraction=0.162, pass" and "no
+        # guest clock, FAIL".  Two runs of the identical cell at 5b9ecaec94
+        # produced exactly those two outcomes.  A per-commit gate that fails
+        # half the time on a healthy cell is worse than no gate, and a blind
+        # instrument must not convict its subject.
+        lines.append(f"stall[{label}]: NOT SCOREABLE  the plugin could not "
+                     f"measure the guest clock ({r.why_not}).  The report is "
+                     f"present and says the instrument could not look, which "
+                     f"is not evidence about the guest; a window too short to "
+                     f"span one sample produces this on a perfectly healthy "
+                     f"cell.  The condition is unmeasured here, and unmeasured "
+                     f"is neither absent nor present.")
+        return Verdict(True, lines, not_certified=True)
 
     sf = r.stall_fraction
     if sf is None:
@@ -418,6 +531,64 @@ def assess(stats_path: Path, label: str = "",
     if excuse is not None:
         lines.append(f"stall[{label}]: NOT GATED — {excuse}")
         return Verdict(True, lines)
+
+    # ------------------------------------------------------------------
+    # THE READING MUST BE ARITHMETICALLY POSSIBLE BEFORE IT IS JUDGED.
+    #
+    # Two ways it can fail to be, both observed at 5b9ecaec94 on cells that
+    # every other check calls healthy, and both of which previously read as
+    # a detection:
+    #
+    #   1. The denominator is a RECONSTRUCTION.  Before the plugin printed
+    #      segment_insns, the count was recovered as rate x guest_s from a
+    #      guest clock printed to three decimals -- and that clock is frozen
+    #      across excursions, so a whole marker window closes inside a few
+    #      milliseconds of it.  At guest_s=0.003 the quantisation is 17%,
+    #      wider than the entire distance from the healthy band to the gate.
+    #
+    #   2. The reading CONTRADICTS ITS OWN REPORT.  worst_user_stall counts
+    #      instructions retired with no traced user instruction among them,
+    #      so those instructions and the traced user instructions are
+    #      disjoint subsets of the segment:
+    #
+    #          worst_user_stall + traced_icount <= segment_insns
+    #
+    #      An exact inequality over counts the same report already carries.
+    #      thread_test x86_64 read 1,930,142,142 + 200,004 against a segment
+    #      of 1,838,680,893 -- i.e. it claimed a stretch with no user
+    #      progress larger than the segment, on a cell whose arch/user was
+    #      1.2.  Both statements cannot be true.
+    #
+    # Neither case is a stall and neither is a clean bill of health.  A
+    # broken instrument must not convict its subject, so these report and do
+    # not fail -- but they never report silently, because "the instrument
+    # could not look" and "the guest was healthy" are different findings.
+    # ------------------------------------------------------------------
+    rel = r.denominator_rel_error
+    if rel > DENOMINATOR_REL_ERROR_MAX:
+        lines.append(
+            f"stall[{label}]: NOT SCOREABLE  the segment's instruction count "
+            f"was reconstructed as insn_per_guest_s x guest_s={r.guest_s:.3f}, "
+            f"which three printed decimals quantise to +/-{100.0 * rel:.1f}% "
+            f"(limit {100.0 * DENOMINATOR_REL_ERROR_MAX:.1f}%).  The score's "
+            f"denominator is not a measurement at this guest clock, so the "
+            f"reading is neither a detection nor a clean bill of health.  A "
+            f"plugin that prints segment_insns removes this entirely; this "
+            f"report predates that field.")
+        return Verdict(True, lines, not_certified=True)
+
+    disjoint = float(r.worst_user_stall) + float(r.traced_icount or 0)
+    if disjoint > r.segment_insns * (1.0 + 1e-9):
+        lines.append(
+            f"stall[{label}]: NOT SCOREABLE  the report contradicts itself: "
+            f"worst_user_stall {r.worst_user_stall} plus traced_icount "
+            f"{r.traced_icount} is {disjoint:.0f}, which exceeds the "
+            f"{r.segment_insns:.0f} instructions the segment retired.  Those "
+            f"two sets are disjoint by construction, so one of the counts is "
+            f"not scoped to the segment.  This is a defect in the "
+            f"measurement, not a stall — a stretch with no user progress "
+            f"cannot be longer than the segment that contains it.")
+        return Verdict(True, lines, not_certified=True)
 
     # THE TRIP IS SOUND AT ANY RESOLUTION.  The sampling grid can only make
     # worst_user_stall too small, never too large, so a reading over the gate

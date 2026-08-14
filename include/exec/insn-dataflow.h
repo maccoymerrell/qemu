@@ -118,6 +118,8 @@ typedef struct InsnDataflow {
     uint8_t  n_calls;
 } InsnDataflow;
 
+#ifdef CONFIG_PLUGIN
+
 /*
  * Run the extraction over the TB currently being translated and leave the
  * per-instruction results where translator_loop()'s caller can hand them to a
@@ -142,5 +144,21 @@ unsigned insn_dataflow_nregs(void);
 
 /* Name and env offset of global @i, for a consumer building its own map. */
 const char *insn_dataflow_reg_name(unsigned i, uint32_t *off, uint32_t *size);
+
+#else /* !CONFIG_PLUGIN */
+
+/*
+ * accel/tcg/insn-dataflow.c is only compiled when plugins are enabled, but
+ * translator_loop() is generic code and reaches the extractor behind
+ * @plugin_enabled -- a runtime flag, not a compile-time one.  With plugins
+ * off that flag is a constant false and the call is dead, but it still has to
+ * compile, so the entry point gets the same no-op stub plugin-gen.h gives
+ * plugin_gen_tb_end() next to it.  Only the extractor needs one: every other
+ * entry point above is reached from plugins/, which is not built either.
+ */
+static inline void insn_dataflow_extract(unsigned num_insns)
+{ }
+
+#endif /* CONFIG_PLUGIN */
 
 #endif /* EXEC_INSN_DATAFLOW_H */

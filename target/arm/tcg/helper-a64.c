@@ -884,12 +884,12 @@ illegal_return:
  * cpu->plugin_rep_iters so the published count is exactly the number
  * of accesses reported.  DC ZVA publishes nothing and passes false.
  */
+#ifdef CONFIG_PLUGIN
 static void arm_plugin_emit_pieces(CPUARMState *env, uint64_t addr,
                                    uint64_t size, const void *host,
                                    int memidx, enum qemu_plugin_mem_rw rw,
                                    bool count)
 {
-#ifdef CONFIG_PLUGIN
     CPUState *cs = env_cpu(env);
 
     if (likely(!cs->neg.plugin_mem_cbs)) {
@@ -941,13 +941,8 @@ static void arm_plugin_emit_pieces(CPUARMState *env, uint64_t addr,
         addr += bytes;
         size -= bytes;
     }
-#else
-    (void)env; (void)addr; (void)size; (void)host; (void)memidx; (void)rw;
-    (void)count;
-#endif
 }
 
-#ifdef CONFIG_PLUGIN
 /*
  * Per-vCPU run accumulator for the byte-at-a-time MOPS fallbacks (see
  * the reporter comment above).  One run per direction; the wrong path

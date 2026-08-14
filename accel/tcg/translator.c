@@ -12,9 +12,7 @@
 #include "qemu/error-report.h"
 #include "exec/exec-all.h"
 #include "exec/translator.h"
-#ifdef CONFIG_PLUGIN
 #include "exec/insn-dataflow.h"
-#endif
 #include "exec/cpu_ldst.h"
 #include "exec/plugin-gen.h"
 #include "exec/oracle.h"

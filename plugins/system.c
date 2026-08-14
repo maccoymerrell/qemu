@@ -14,6 +14,7 @@
 #include "hw/boards.h"
 #include "qemu/main-loop.h"
 #include "hw/core/cpu.h"
+#include "system/cpu-timers.h"
 
 #include "plugin.h"
 
@@ -23,6 +24,11 @@ void qemu_plugin_fillin_mode_info(qemu_info_t *info)
     info->system_emulation = true;
     info->system.smp_vcpus = ms->smp.cpus;
     info->system.max_vcpus = ms->smp.max_cpus;
+}
+
+void qemu_plugin_mode_plugin_loaded(void)
+{
+    cpu_plugin_clock_discipline_arm();
 }
 
 /*

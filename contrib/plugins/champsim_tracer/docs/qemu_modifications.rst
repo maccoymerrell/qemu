@@ -701,9 +701,9 @@ for a guest that stops progressing on a build that has them.
    zero guest time.  The frozen clock is authoritative, so an
    implementation resynchronises the sources to it rather than the
    reverse.  Three obligations: re-derive each architectural counter
-   from the frozen clock (x86's TSC free-runs off the host rdtsc and
-   is re-pinned; Arm, RISC-V and MIPS counters are already functions
-   of the virtual clock); re-arm every host timer from its restored
+   from the frozen clock (x86's TSC is locked to the virtual clock
+   once and follows it from then on; Arm, RISC-V and MIPS counters are
+   already functions of it); re-arm every host timer from its restored
    compare register and re-deliver any expiry the excursion
    suppressed; and re-derive the CPU interrupt-request line from the
    restored architectural pending state.  Called with the BQL held and
@@ -724,33 +724,50 @@ for a guest that stops progressing on a build that has them.
    deferred expiry has to be re-delivered, not as the gate on whether
    to reconcile.
 
-   On x86 the first obligation is met by a *lock*, not by a
-   recomputation, and the lock is one-directional.  The guest TSC is
-   the only architectural counter on any of the four targets that is
-   not already a function of ``QEMU_CLOCK_VIRTUAL``: it is derived
-   from the host cycle counter, while the LAPIC timer, HPET, PIT and
-   ACPI PM are derived from host ``CLOCK_MONOTONIC``.
-   ``x86_spec_clock_resync`` re-pins the first to the second at every
-   thaw, along a line anchored once (``cpu_plugin_tsc_anchor``) and
-   sloped by the self-calibrated host TSC frequency.  Because x86
-   requires the TSC to be monotonic, ``cpu_plugin_pin_tsc`` may raise
-   the guest TSC to that line and may never lower it, so the pin can
-   add agreement between the pair but cannot remove disagreement.
+   On x86 the first obligation is discharged by construction rather
+   than at every thaw.  The guest TSC is the only architectural
+   counter on any of the four targets that is not natively a function
+   of ``QEMU_CLOCK_VIRTUAL``: ``cpu_get_ticks()`` accumulates the host
+   cycle counter, while the LAPIC timer, HPET, PIT and ACPI PM are
+   derived from host ``CLOCK_MONOTONIC``.  Two oscillators cannot be
+   frozen together.  ``cpu_disable_ticks()`` reads the host cycle
+   counter and then ``CLOCK_MONOTONIC``, and ``cpu_enable_ticks()``
+   does the same on the way out, so the pair subtracts one real
+   interval from the tick counter and a different one from the virtual
+   clock — differing by the two functions' own read gaps, and
+   expressed in units whose ratio the pair never measures.  That
+   difference is a property of each function's compiled shape, so its
+   sign is fixed, and a plugin that freezes once per instrumentation
+   window performs tens of thousands of such pairs a second.
 
-   The separation that survives is measured rather than assumed.
-   ``CST_TSCLOCK`` reports it at the one place both halves are read at
-   a single instant under the clock's own seqlock; ``CST_NOPIN``
-   measures the same pair with the offset write skipped, so a quiet
-   reading is distinguishable from a stuck instrument.  On the
-   x86_64 system-mode marker shape, one guest per physical core with a
-   contention hog on that core's other SMT thread, the guest TSC sits
-   above its line for essentially every pin, and the separation
-   reaches roughly a millisecond at the median cell and low tens of
-   milliseconds at the tail of a twenty-second run, growing with host
-   contention and bounded by nothing in time.  Whether that separation
-   is large enough to matter to a particular guest is a property of
-   that guest's timekeeping: Linux's clocksource watchdog compares the
-   two over half-second windows and objects past 62.5 ms.
+   Reconciling the pair afterwards cannot close it.  A counter x86
+   forbids to run backwards can only be corrected upwards, so a
+   correction adds agreement when the TSC is behind and declines when
+   it is ahead: the displacement is rectified rather than averaged,
+   and accumulates without bound.  Measured on the x86_64 system-mode
+   marker shape with such a correction in place, the guest TSC stood
+   above its own reference line at essentially every correction point,
+   and the separation reached roughly a millisecond at the median cell
+   and low tens of milliseconds at the tail of a twenty-second run.
+
+   ``x86_spec_clock_resync`` therefore removes the second oscillator
+   instead of reconciling it.  It measures the host's own cycles per
+   ``CLOCK_MONOTONIC`` second over the first ~0.2 s of emulation and
+   hands that ratio to ``cpu_plugin_tsc_lock_to_vclock()``, after
+   which ``cpu_get_ticks()`` is a fixed affine function of
+   ``cpu_get_clock()``.  The two guest clocksources are then the same
+   oscillator: the freeze stops both on one flag and the thaw resumes
+   both from one offset, whatever either function's read gap is, and
+   the hook has nothing left to do.  Arming is continuous and one-shot
+   — the line is anchored at the pair's current value — so the guest
+   sees neither a step nor a rate change, and the displacement
+   accumulated before arming is frozen in as a constant instead of
+   continuing to grow.  Nothing is armed unless a plugin freeze runs,
+   so a plugin-free machine keeps the host-sourced counter untouched.
+
+   Whether a residual separation matters to a particular guest is a
+   property of that guest's timekeeping: Linux's clocksource watchdog
+   compares the two over half-second windows and objects past 62.5 ms.
 
 A device timer may not re-arm itself at the current time
 (``gic_vptimer_update``, ``hw/timer/mips_gictimer.c``)

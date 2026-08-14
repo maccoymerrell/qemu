@@ -344,104 +344,69 @@ static bool x86_vaddr_is_kernel(CPUState *cs, uint64_t vaddr)
  *
  * x86's audit of guest-observable time sources:
  *
- *   TSC (and TSC_AUX/rdtscp)   derived from the HOST rdtsc via
- *                              cpu_get_ticks(); needs the pin below.
+ *   TSC (and TSC_AUX/rdtscp)   cpu_get_ticks(), via cpus_get_elapsed_ticks().
  *   LAPIC timer, TSC-deadline  QEMUTimers armed off QEMU_CLOCK_VIRTUAL
  *   HPET, PIT (i8254), RTC     (hw/intc/apic.c, hw/timer/).
  *
- * Only the first is a problem.  Everything in the second group is armed
- * directly from QEMU_CLOCK_VIRTUAL, which the freeze stops and the thaw
- * resumes at the same value: a deadline expressed in frozen-clock ns is
- * still the same deadline afterwards, so those timers need no re-arm.  None
- * of them lives in CPUX86State either, so the wrong-path register restore
- * cannot roll one back — x86 has no architectural compare register shadowing
- * a host timer the way Arm's CNTV_CVAL, RISC-V's stimecmp and MIPS's
- * CP0_Compare do.  (A speculative MSR write to IA32_TSC_DEADLINE reaches
- * apic_handle_tsc_deadline, but wrong-path device access is sandboxed, so it
- * never reaches the APIC model.)
+ * Everything in the second group is armed directly from QEMU_CLOCK_VIRTUAL,
+ * which the freeze stops and the thaw resumes at the same value: a deadline
+ * expressed in frozen-clock ns is still the same deadline afterwards, so
+ * those timers need no re-arm.  None of them lives in CPUX86State either, so
+ * the wrong-path register restore cannot roll one back — x86 has no
+ * architectural compare register shadowing a host timer the way Arm's
+ * CNTV_CVAL, RISC-V's stimecmp and MIPS's CP0_Compare do.  (A speculative MSR
+ * write to IA32_TSC_DEADLINE reaches apic_handle_tsc_deadline, but wrong-path
+ * device access is sandboxed, so it never reaches the APIC model.)
  *
- * The TSC is the exception, and the reason this hook must also run on the
- * plain thaw and not just at excursion exit.  The guest TSC comes from the
- * host rdtsc (cpu_get_host_ticks) while the guest HPET/LAPIC clock comes
- * from host CLOCK_MONOTONIC (get_clock).  Those two host oscillators do not
- * keep a constant ratio across frozen windows versus running ones (TSC read
- * jitter, P-state effects), so however exactly balanced the freeze is, the
- * two GUEST clocksources diverge by a growing skew — measured ~38 ns per
- * excursion, accumulating to hundreds of ms — until the guest's
- * clocksource watchdog marks the TSC unstable and wedges timekeeping and
- * RCU.  That is the x86 system-mode livelock.
+ * The TSC was the exception, because cpu_get_ticks() accumulated the host
+ * cycle counter while everything else accumulated host CLOCK_MONOTONIC: two
+ * host oscillators, sampled at four different instants by each freeze/thaw
+ * pair, drifting apart by a fixed displacement per pair that a one-directional
+ * correction could only rectify and never remove — until the guest's
+ * clocksource watchdog marked the TSC unstable and wedged timekeeping and RCU.
  *
- * Resync per the contract's first clause: re-derive the architectural
- * counter FROM the frozen virtual clock rather than letting it free-run off
- * its own host source.  Forcing
+ * It is no longer an exception.  The hook's whole remaining job is to measure
+ * the host's own cycles-per-CLOCK_MONOTONIC-second ratio and hand it to
+ * cpu_plugin_tsc_lock_to_vclock(), which makes cpu_get_ticks() an affine
+ * function of QEMU_CLOCK_VIRTUAL from that instant on.  The two guest
+ * clocksources are then the same oscillator, freezing one freezes both, and
+ * the resync obligation is discharged structurally rather than at every thaw.
  *
- *     guest_TSC := ref_tsc + tsc_hz * (guest_clock - ref_clock)
+ * The ratio is self-calibrated over the first ~0.2 s of emulation, both host
+ * clocks sampled over the same real intervals so freezes inside them do not
+ * bias it.  Arming is continuous (the line is anchored at the pair's current
+ * value) and one-shot, so the guest sees neither a step nor a rate change,
+ * and the displacement accumulated before arming is frozen in as a constant
+ * instead of continuing to grow.  Reading the two host clocks here rather
+ * than at one instant no longer matters: the difference lands in the ratio's
+ * last few parts per billion, not in a term that ratchets.
  *
- * at every thaw locks the two guest clocksources together by construction,
- * whatever the host clocks do.  tsc_hz is the host TSC frequency, self-
- * calibrated from the host rdtsc/monotonic ratio over the first ~0.2 s of
- * emulation (both host clocks sampled over the same real intervals, so the
- * ratio is the hardware property and freezes in the interval do not bias
- * it), then frozen so the lock slope never moves afterwards.
- */
-/*
- * One line for the whole machine, not one per host thread.  cpu_plugin_pin_tsc
- * writes timers_state.cpu_ticks_offset, which is VM-global: with a per-thread
- * reference point and a per-thread tsc_hz, each vCPU pins the one guest TSC to
- * a slightly different line, and consecutive pins from different vCPUs fight —
- * the guest TSC then jitters (and, past the monotonicity clamp, ratchets to
- * whichever line is highest) instead of being the pure function of the virtual
- * clock this hook exists to make it.  These are read and written only from
- * x86_spec_clock_resync, which both of its callers invoke with the BQL held,
- * so the BQL is what serialises them.
+ * BQL-serialised: both callers of this hook hold it, which is what protects
+ * the calibration accumulators below and the one-shot arming.
  */
 static int64_t g_pin_last_ht, g_pin_last_hm;  /* previous host sample */
 static int64_t g_pin_cal_tsc, g_pin_cal_ns;   /* calibration sums */
-static double  g_pin_tsc_hz;                  /* frozen once ready */
-static int64_t g_pin_ref_tsc, g_pin_ref_clk;  /* lock reference point */
-static bool    g_pin_ready;
+static bool    g_pin_locked;                  /* lock armed; nothing left */
 
 static void x86_spec_clock_resync(CPUState *cs, SpecClockResyncReason reason)
 {
-    int64_t ht = cpu_get_host_ticks();
-    int64_t hm = get_clock();
+    int64_t ht, hm;
 
-    if (g_pin_ready) {
-        /*
-         * The LINE is handed over, not a point on it.  Evaluating
-         * ref_tsc + tsc_hz * (cpu_get_clock() - ref_clk) here and passing the
-         * answer separates the virtual-clock read from the host-TSC read that
-         * cpu_plugin_pin_tsc() derives the offset from, and everything
-         * between the two lands on the guest TSC alone -- see that function
-         * for the measurement.  Only the writer of the offset can sample both
-         * at one instant, so only it may evaluate the line.
-         */
-        cpu_plugin_pin_tsc(g_pin_ref_tsc, g_pin_ref_clk, g_pin_tsc_hz);
-    } else {
-        if (g_pin_last_hm) {
-            g_pin_cal_tsc += ht - g_pin_last_ht;
-            g_pin_cal_ns  += hm - g_pin_last_hm;
-        }
-        if (g_pin_cal_ns >= 200 * 1000 * 1000) {
-            /*
-             * Freeze the ratio and anchor the lock at the current (still
-             * unskewed) values; from here the TSC is a pure function of the
-             * virtual clock.
-             *
-             * The anchor is taken as ONE point, through cpu_plugin_tsc_anchor,
-             * not as cpu_get_ticks() followed by cpu_get_clock().  Read
-             * separately, the guest TSC coordinate is sampled first and every
-             * nanosecond of host time before the clock read is subtracted from
-             * the line and from nothing else -- and unlike the per-pin case
-             * this one never washes out, because the line and the TSC have the
-             * same slope by construction.  A line planted below the free-
-             * running value is a line the pin's downward refusal declines to
-             * apply, so the lock quietly stops locking.
-             */
-            g_pin_tsc_hz  = (double)g_pin_cal_tsc / (double)g_pin_cal_ns * 1e9;
-            cpu_plugin_tsc_anchor(&g_pin_ref_tsc, &g_pin_ref_clk);
-            g_pin_ready   = true;
-        }
+    if (g_pin_locked) {
+        return;
+    }
+
+    ht = cpu_get_host_ticks();
+    hm = get_clock();
+
+    if (g_pin_last_hm) {
+        g_pin_cal_tsc += ht - g_pin_last_ht;
+        g_pin_cal_ns  += hm - g_pin_last_hm;
+    }
+    if (g_pin_cal_ns >= 200 * 1000 * 1000) {
+        cpu_plugin_tsc_lock_to_vclock((double)g_pin_cal_tsc /
+                                      (double)g_pin_cal_ns * 1e9);
+        g_pin_locked = true;
     }
     g_pin_last_ht = ht;
     g_pin_last_hm = hm;

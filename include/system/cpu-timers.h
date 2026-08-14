@@ -176,44 +176,30 @@ bool cpu_plugin_ticks_thaw(int cpu_index);
  */
 uint64_t cpu_plugin_ticks_peer_only_thaws(void);
 
-/*
- * Ceiling, in host TSC ticks, on how far apart the pin's virtual-clock sample
- * and host-TSC sample may be taken; the pair is retaken while it is exceeded.
- * Orders of magnitude above an uncontended back-to-back read and far below a
- * host scheduling slice, so it separates "the two reads happened together"
- * from "this thread was descheduled between them" on any plausible host TSC
- * frequency without this header needing to know what that frequency is.
- */
-#define CPU_PIN_TSC_READ_WINDOW 1000000
-
-/*
- * Re-lock cpu_get_ticks() (the guest TSC source) to QEMU_CLOCK_VIRTUAL by
- * re-basing cpu_ticks_offset, without touching cpu_clock_offset.  The guest
- * TSC is derived from the host rdtsc and the guest HPET/LAPIC from host
- * CLOCK_MONOTONIC, two host oscillators whose ratio drifts across the tracer's
- * clock freezes, so without re-locking they diverge and the guest's
- * clocksource watchdog marks the TSC unstable.
+/**
+ * cpu_plugin_tsc_lock_to_vclock: derive cpu_get_ticks() from cpu_get_clock()
+ * @tsc_hz: slope of the lock, in ticks per second of QEMU_CLOCK_VIRTUAL
  *
- * The caller passes the LINE -- an anchor point (@ref_tsc, @ref_clk) and its
- * slope @tsc_hz in host TSC ticks per second -- not a target computed from a
- * virtual-clock read of its own.  The clock sample and the host-TSC sample
- * must describe the same instant, which only the writer of the offset can
- * arrange; a target handed in from outside carries whatever host time elapsed
- * between the caller's read and this write, and subtracts it from the guest
- * TSC alone.  Guest-visible monotonicity is enforced against the value a
- * reader would have received, so the guest TSC never steps backwards.
+ * cpu_get_ticks() (the guest TSC source on x86, and the cycle/time CSR source
+ * elsewhere) normally accumulates the host cycle counter, while
+ * cpu_get_clock() -- QEMU_CLOCK_VIRTUAL, and with it every QEMUTimer-backed
+ * device clock -- accumulates host CLOCK_MONOTONIC.  Two oscillators, and a
+ * freeze/thaw pair samples them at four different instants and subtracts the
+ * two intervals in two different units, so each pair displaces one guest
+ * clock relative to the other.  Under a plugin that freezes per
+ * instrumentation window the displacement is repeated tens of thousands of
+ * times a second and, because an architectural counter that may not run
+ * backwards can only be corrected upwards, it is rectified rather than
+ * averaged.
  *
- * No-op while ticks are disabled.  Caller must hold BQL.
+ * Arming this makes the tick counter a fixed affine function of the virtual
+ * clock, so freezing the clock freezes the counter by construction and no
+ * reconciliation is needed.  See the long form in system/cpu-timers.c.
+ *
+ * Continuous and idempotent: the first call anchors the line at the current
+ * value of the pair, later ones do nothing.  Caller must hold the BQL.
  */
-/*
- * Sample the anchor the lock line is drawn through -- the guest TSC and the
- * guest virtual clock AT ONE INSTANT.  Read separately the host time between
- * the two reads becomes a permanent constant bias in the line, so the caller
- * must not compose this pair itself.  Caller must hold BQL.
- */
-void cpu_plugin_tsc_anchor(int64_t *ref_tsc, int64_t *ref_clk);
-
-void cpu_plugin_pin_tsc(int64_t ref_tsc, int64_t ref_clk, double tsc_hz);
+void cpu_plugin_tsc_lock_to_vclock(double tsc_hz);
 #endif
 
 /*

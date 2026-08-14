@@ -24,6 +24,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/cutils.h"
+#include "qemu/host-utils.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
@@ -39,9 +40,52 @@
 
 /* clock and ticks */
 
+#ifdef CONFIG_PLUGIN
+/*
+ * The tick counter as a function of the virtual clock -- see
+ * cpu_plugin_tsc_lock_to_vclock().  Zero @plugin_tsc_per_ns_q32 means the
+ * lock has never been armed and cpu_get_ticks_locked() keeps its own host
+ * source.  All four are written once, under the seqlock write lock with the
+ * BQL held, and read under whichever of the two the reader already holds.
+ */
+static uint64_t plugin_tsc_per_ns_q32;      /* ticks per clock ns, 32.32 */
+static int64_t plugin_tsc_ref_ticks;        /* ticks at the arming instant */
+static int64_t plugin_tsc_ref_clk;          /* clock at the arming instant */
+
+static int64_t plugin_tsc_from_clock(int64_t clk)
+{
+    uint64_t lo, hi;
+
+    /*
+     * @clk is cpu_get_clock_locked(), which never decreases, and @ref_clk was
+     * sampled from it, so the delta cannot be negative.  The multiply is done
+     * in 128 bits because a 32.32 rate times a nanosecond count overflows 64
+     * for any run longer than a few seconds.
+     */
+    mulu64(&lo, &hi, (uint64_t)(clk - plugin_tsc_ref_clk),
+           plugin_tsc_per_ns_q32);
+    return plugin_tsc_ref_ticks + (int64_t)((hi << 32) | (lo >> 32));
+}
+#endif
+
 static int64_t cpu_get_ticks_locked(void)
 {
-    int64_t ticks = timers_state.cpu_ticks_offset;
+    int64_t ticks;
+
+#ifdef CONFIG_PLUGIN
+    if (plugin_tsc_per_ns_q32) {
+        /*
+         * One oscillator.  No monotonicity clamp is needed or wanted here:
+         * the value is an increasing function of cpu_get_clock_locked(),
+         * which is itself non-decreasing across freezes, thaws and host
+         * software suspend, so the result cannot step backwards and
+         * cpu_ticks_prev has nothing to correct.
+         */
+        return plugin_tsc_from_clock(cpu_get_clock_locked());
+    }
+#endif
+
+    ticks = timers_state.cpu_ticks_offset;
     if (timers_state.cpu_ticks_enabled) {
         ticks += cpu_get_host_ticks();
     }
@@ -224,253 +268,72 @@ uint64_t cpu_plugin_ticks_peer_only_thaws(void)
 }
 
 /*
- * CST_TSCLOCK: the guest's TSC and the guest's QEMU_CLOCK_VIRTUAL are a
- * DERIVED-VS-SOURCE PAIR -- one is computed from the host cycle counter, the
- * other from host CLOCK_MONOTONIC, and the only thing that keeps them telling
- * the same story is the pin below.  A guest whose sched_clock comes from one
- * and whose tick comes from the other cannot be reasoned about at all once
- * they disagree, so the disagreement is measured rather than assumed absent.
+ * cpu_plugin_tsc_lock_to_vclock: make the tick counter a function of the
+ * virtual clock, so that one freeze stops both.
+ * @tsc_hz: the slope, in ticks per second of QEMU_CLOCK_VIRTUAL.
  *
- * Sampled at the one place both halves are read at a single instant under the
- * seqlock write lock, so the figure is the pair's real separation and not the
- * interval between two reads:
+ * cpu_get_ticks() and cpu_get_clock() are two independent HOST oscillators:
+ * the first accumulates cpu_get_host_ticks() (the host cycle counter), the
+ * second get_clock() (host CLOCK_MONOTONIC).  A guest built on both -- x86
+ * takes its TSC from the first and its LAPIC, HPET, PIT and ACPI PM timers
+ * from the second -- only holds together while the two agree, and a plugin
+ * freeze is where they stop agreeing:
  *
- *     skew = (what a reader would get now) - (where the lock line says it is)
+ *     cpu_disable_ticks()      reads the host cycle counter at instant a,
+ *                              then CLOCK_MONOTONIC at instant b > a.
+ *     cpu_enable_ticks()       reads the host cycle counter at instant c,
+ *                              then CLOCK_MONOTONIC at instant d > c.
  *
- * AHEAD (skew > 0) is the direction the pin cannot correct: it may only push
- * the guest TSC up, since x86 forbids a backwards TSC.  BEHIND is corrected
- * in one step, and the size of that step is the guest-visible forward jump.
- * Both counters must be non-zero on a healthy run -- a zero in either column
- * means the comparison is stuck, not that the clocks agree.
+ * The pair subtracts [a, c] from the tick counter and [b, d] from the virtual
+ * clock.  Those are DIFFERENT REAL INTERVALS -- they differ by
+ * (d - c) - (b - a), the difference of the two functions' own read gaps --
+ * and they are subtracted in DIFFERENT UNITS, at a ratio this code never
+ * measures.  Neither term is noise: the gap is a property of the compiled
+ * shape of each function, so its sign is fixed and every freeze/thaw pair
+ * moves the guest's tick counter the same way relative to the guest's virtual
+ * clock.  A plugin that freezes once per instrumentation window performs tens
+ * of thousands of pairs per second, and nothing in the pair ever gives the
+ * displacement back.
  *
- * Control: CST_NOPIN measures the same pair with the offset write skipped, so
- * the skew is known to grow.  An instrument that reports a small figure under
- * CST_NOPIN is broken and its quiet reading under the pin means nothing.
+ * Reconciling the two afterwards cannot close this.  An architectural counter
+ * that may not run backwards -- the x86 TSC -- can only be corrected upwards,
+ * so a correction step ADDS agreement when the counter is behind and declines
+ * when it is ahead: the disagreement is rectified rather than averaged, and
+ * accumulates without bound.  Measured on the x86_64 system marker shape over
+ * 556 cells with such a correction in place: the counter stood above its own
+ * reference line at 100.00% of correction points in the median cell, by a
+ * median 0.97 ms and a maximum 11.20 ms inside a ~20 s run.
+ *
+ * So the fix is not a better correction, it is removing the second
+ * oscillator.  Once armed, cpu_get_ticks_locked() computes the tick counter
+ * from cpu_get_clock_locked() alone.  Both then stop on the same
+ * cpu_ticks_enabled and resume from the same cpu_clock_offset, so a freeze
+ * removes exactly the same real interval from both BY CONSTRUCTION, whatever
+ * either function's read gap is, and the two can no longer separate.
+ *
+ * Arming is continuous: the reference point is the pair's value at the
+ * arming instant, so the guest sees no step, and the slope is the caller's
+ * measured host ratio, so it sees no rate change either.  Idempotent -- the
+ * first caller fixes the line; a later one must not move it, since the
+ * counter would jump.  No-op for @tsc_hz <= 0.  Caller must hold the BQL.
  */
-static bool cst_nopin(void)
+void cpu_plugin_tsc_lock_to_vclock(double tsc_hz)
 {
-    static int v = -1;
-    if (v < 0) {
-        v = getenv("CST_NOPIN") != NULL;
-    }
-    return v > 0;
-}
-
-/*
- * CST_TSCJUMP="<ns>:<period_pins>[:both]" -- the discriminating falsifier for
- * the whole "guest-visible time discontinuity" family, and the only way to
- * study a 1-in-370 outcome with any power.  Every @period pins, hand the guest
- * a forward step of @ns:
- *
- *   tsc   (default)  the TSC alone steps forward.  The guest's TSC-derived
- *                    sched_clock and its QEMU_CLOCK_VIRTUAL-derived LAPIC tick
- *                    now disagree by @ns: a PAIR INCONSISTENCY.
- *   both             the TSC and QEMU_CLOCK_VIRTUAL step forward together, so
- *                    every guest clock agrees that @ns elapsed: a CONSISTENT
- *                    LOSS, exactly what a host SMI or a descheduled vCPU looks
- *                    like, and something the guest is built to survive.
- *
- * The two arms separate "the guest lost time" from "the guest's clocks stopped
- * agreeing".  Diagnostic only; unset, not one branch of this is taken.
- */
-static bool cst_tscjump_cfg(int64_t *ns, uint64_t *period, bool *both)
-{
-    static int on = -1;
-    static int64_t g_ns;
-    static uint64_t g_period;
-    static bool g_both;
-
-    if (on < 0) {
-        const char *e = getenv("CST_TSCJUMP");
-        on = 0;
-        if (e && *e) {
-            char *end = NULL;
-            g_ns = strtoll(e, &end, 0);
-            if (end && *end == ':') {
-                g_period = strtoull(end + 1, &end, 0);
-            }
-            g_both = end && strstr(end, "both") != NULL;
-            if (g_ns != 0 && g_period != 0) {
-                on = 1;
-                fprintf(stderr, "[tscjump] armed: %+" PRId64 " ns every %"
-                        PRIu64 " pins, arm=%s\n", g_ns, g_period,
-                        g_both ? "both" : "tsc");
-                fflush(stderr);
-            } else {
-                fprintf(stderr, "[tscjump] CST_TSCJUMP=\"%s\" is not "
-                        "<ns>:<period>[:both]; refused\n", e);
-                fflush(stderr);
-            }
-        }
-    }
-    *ns = g_ns;
-    *period = g_period;
-    *both = g_both;
-    return on > 0;
-}
-
-static void cst_tsclock_note(int64_t line, int64_t readable, double tsc_hz)
-{
-    static int on = -1;
-    static uint64_t n, n_ahead, n_behind, every;
-    static int64_t max_ahead, max_behind, last;
-
-    if (on < 0) {
-        const char *e = getenv("CST_TSCLOCK");
-        on = e ? 1 : 0;
-        every = (e && *e) ? strtoull(e, NULL, 0) : 0;
-        if (every == 0) {
-            every = 200000;
-        }
-    }
-    if (!on) {
+    if (!(tsc_hz > 0)) {
         return;
     }
-    int64_t skew = readable - line;
-    last = skew;
-    n++;
-    if (skew > 0) {
-        n_ahead++;
-        if (skew > max_ahead) {
-            max_ahead = skew;
-        }
-    } else if (skew < 0) {
-        n_behind++;
-        if (-skew > max_behind) {
-            max_behind = -skew;
-        }
-    }
-    if ((n % every) == 0) {
-        double hz = tsc_hz > 0 ? tsc_hz : 1e9;
-        fprintf(stderr, "[tsclock] pins=%" PRIu64 " ahead=%" PRIu64
-                " behind=%" PRIu64 " max_ahead=%.4fms max_behind=%.4fms "
-                "last=%.4fms tsc_hz=%.6fGHz\n", n, n_ahead, n_behind,
-                (double)max_ahead / hz * 1e3, (double)max_behind / hz * 1e3,
-                (double)last / hz * 1e3, hz / 1e9);
-        fflush(stderr);
-    }
-}
-
-void cpu_plugin_tsc_anchor(int64_t *ref_tsc, int64_t *ref_clk)
-{
-    /*
-     * The anchor is a POINT, so its two coordinates have to be read at one
-     * instant, for the same reason the pin below evaluates the line where it
-     * writes the offset.  Taken as two separate calls -- cpu_get_ticks() then
-     * cpu_get_clock() -- the guest TSC is sampled before the virtual clock,
-     * and the host time between the two reads becomes a PERMANENT constant
-     * offset in the lock line: the line is planted that far below the
-     * free-running TSC and, having the same slope, never catches up.  Since
-     * the pin refuses any target below what a reader would receive, a line
-     * biased low is a pin that mostly declines to act, which is not a
-     * property anybody chose.
-     *
-     * Both coordinates are read here under the seqlock write lock the pin
-     * uses, from the *_locked accessors, so no reader can observe the pair
-     * half-taken and no caller can deadlock on the spinlock its own
-     * cpu_get_ticks() would take.  Caller must hold BQL.
-     */
     seqlock_write_lock(&timers_state.vm_clock_seqlock,
                        &timers_state.vm_clock_lock);
-    *ref_tsc = cpu_get_ticks_locked();
-    *ref_clk = cpu_get_clock_locked();
-    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
-                         &timers_state.vm_clock_lock);
-}
-
-void cpu_plugin_pin_tsc(int64_t ref_tsc, int64_t ref_clk, double tsc_hz)
-{
-    seqlock_write_lock(&timers_state.vm_clock_seqlock,
-                       &timers_state.vm_clock_lock);
-    if (timers_state.cpu_ticks_enabled) {
+    if (!plugin_tsc_per_ns_q32) {
         /*
-         * The line is evaluated HERE, from a virtual-clock sample taken
-         * beside the host-TSC sample the offset is derived from, because the
-         * two have to describe the same instant.  A caller that computes
-         * "where the virtual clock says the TSC should be" and hands the
-         * answer in has already separated them: the offset written below is
-         * then `where the clock was THEN` minus `the host TSC NOW`, and every
-         * nanosecond between the two reads is subtracted from the guest TSC
-         * and from nothing else.  The pin plants the guest TSC that far below
-         * its own line, and the next pin -- which recomputes from the
-         * reference point -- shoves it back up in one step.
-         *
-         * That is not a small effect at plugin cadence.  Measured over 38
-         * cells of the x86_64 system marker shape (agentJ, lc/agentJ/pin):
-         * 726 pins left the guest's architectural TSC LOWER than the previous
-         * pin had set it -- the largest by 3,416,524 ticks, 1.55 ms, over a
-         * 36 us real interval -- and the corrective steps reached
-         * 536,335,461 ticks, 244 ms handed to the guest in one instant, with
-         * 138.9 M ticks (63 ms) injected per cell at the median.  x86
-         * requires the TSC to be monotonic and this class of guest marks
-         * TSC-derived sched_clock stable, so it consumes both directions
-         * unclamped.
-         *
-         * The interval between the two reads is bounded by re-reading rather
-         * than assumed short: a host preemption landing between them is
-         * exactly the case that produced the milliseconds above, and "rare"
-         * is not a bound.  After a few attempts the pin proceeds anyway --
-         * under pathological load a spin here would be worse than the
-         * residual, and the residual is still clamped below.
+         * Order matters only for readability: the reference tick value is
+         * still taken from the host-sourced path, because the lock is not
+         * armed until the rate is stored last.
          */
-        int64_t host_tsc = 0, vclock = 0;
-        for (int tries = 0; ; tries++) {
-            int64_t after;
-            host_tsc = cpu_get_host_ticks();
-            vclock = cpu_get_clock_locked();
-            after = cpu_get_host_ticks();
-            if (after - host_tsc < CPU_PIN_TSC_READ_WINDOW || tries >= 8) {
-                break;
-            }
-        }
-        int64_t target = ref_tsc +
-            (int64_t)(tsc_hz * (double)(vclock - ref_clk) / 1e9);
-        /*
-         * Guest-visible TSC monotonicity is an invariant here, not an
-         * observation, and the value it must be measured against is what a
-         * reader would ACTUALLY have received at @host_tsc with the offset
-         * standing now -- not cpu_ticks_prev, which this function last wrote
-         * as a target rather than as anything a reader was handed.  A target
-         * below the free-running value is therefore refused, and refusing it
-         * costs only the lock's precision: the guest TSC then runs at the
-         * host rate until the line catches up, which is the same slope, since
-         * tsc_hz is calibrated from that very host ratio.
-         */
-        int64_t readable = timers_state.cpu_ticks_offset + host_tsc;
-        cst_tsclock_note(target, readable, tsc_hz);
-        {
-            int64_t jns; uint64_t jper; bool jboth;
-            if (cst_tscjump_cfg(&jns, &jper, &jboth)) {
-                static uint64_t jn;
-                if ((++jn % jper) == 0) {
-                    target += (int64_t)(tsc_hz * (double)jns / 1e9);
-                    if (jboth) {
-                        timers_state.cpu_clock_offset += jns;
-                    }
-                }
-            }
-        }
-        if (target < readable) {
-            target = readable;
-        }
-        if (target < timers_state.cpu_ticks_prev) {
-            target = timers_state.cpu_ticks_prev;
-        }
-        if (cst_nopin()) {
-            /*
-             * Diagnostic arm: measure the pair without locking it, so the
-             * instrument above has a control in which the skew is known to
-             * grow.  Never on by default.
-             */
-            seqlock_write_unlock(&timers_state.vm_clock_seqlock,
-                                 &timers_state.vm_clock_lock);
-            return;
-        }
-        /* Choose the offset so cpu_get_ticks_locked() == target at the
-         * instant @host_tsc was read, and keep the monotonicity clamp
-         * consistent so the next read does not snap the value back forward. */
-        timers_state.cpu_ticks_offset = target - host_tsc;
-        timers_state.cpu_ticks_prev = target;
+        plugin_tsc_ref_ticks = cpu_get_ticks_locked();
+        plugin_tsc_ref_clk = cpu_get_clock_locked();
+        plugin_tsc_per_ns_q32 =
+            (uint64_t)(tsc_hz * 4294967296.0 / 1000000000.0);
     }
     seqlock_write_unlock(&timers_state.vm_clock_seqlock,
                          &timers_state.vm_clock_lock);

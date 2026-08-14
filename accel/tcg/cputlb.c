@@ -1150,6 +1150,25 @@ void cpu_plugin_spec_tlb_note(CPUState *cpu)
  * kernel.  Here the caller knows precisely which single entries exist to
  * remove, so it removes them, with the same two primitives the helper's
  * non-escalating branch uses.
+ *
+ * The JUMP-CACHE half of tlb_flush_page_by_mmuidx_async_0 -- its two
+ * tb_jmp_cache_clear_page() calls -- is deliberately absent, and the asymmetry
+ * is not an omission (#124).  That clear exists because an ordinary page flush
+ * is issued when the guest CHANGES a virtual-to-physical mapping (invlpg, a
+ * CR3 write, a shootdown), which can leave the jump cache holding a TB
+ * translated from the page's OLD physical contents; the jump cache is keyed on
+ * the virtual PC alone, so nothing else would catch it.  An excursion changes
+ * no mapping.  It installs entries for the mapping already in force and this
+ * function removes them again, so no jump-cache entry becomes stale by
+ * anything the excursion did.
+ *
+ * Nor can the excursion's OWN jump-cache entries be served to the correct
+ * path: tb_lookup() validates a jump-cache hit against pc, cs_base, flags AND
+ * cflags, and every wrong-path TB carries CF_NO_GOTO_TB | CF_NO_GOTO_PTR |
+ * CF_SINGLE_STEP (plus CF_FORCE_SLOW in spec mode), a combination the correct
+ * path never requests -- such an entry misses and is overwritten.  Adding the
+ * clear here would therefore buy nothing and would discard correct-path
+ * translations on every excursion.
  */
 void cpu_plugin_spec_tlb_flush_logged(CPUState *cpu)
 {
@@ -1304,23 +1323,46 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
      * Only evict the old entry to the victim tlb if it's for a
      * different page; otherwise just overwrite the stale data.
      *
-     * Wrong-path (#77): skip the victim-tlb eviction entirely.  The eviction
-     * is pure softmmu housekeeping (preserve the displaced entry so a future
-     * lookup can re-promote it) -- it is NOT needed to translate the
-     * speculative access, and it mutates persistent victim-TLB / counter state
-     * that the spec containment does not revert, corrupting the correct path.
-     * Overwriting the slot is harmless: the spec install log invalidates this
-     * slot on excursion exit and the correct path simply re-fills on its next
-     * access.
+     * Wrong-path (#77): skip the victim-tlb WRITE.  Preserving the displaced
+     * entry so a future lookup can re-promote it is pure softmmu housekeeping
+     * -- it is not needed to translate the speculative access, and it mutates
+     * persistent victim-TLB state (vindex, vtable, vfulltlb) that the spec
+     * containment does not revert, corrupting the correct path.  Overwriting
+     * the main slot is harmless: the spec install log invalidates it on
+     * excursion exit and the correct path re-fills on its next access.
+     *
+     * The OCCUPANCY ACCOUNTING is not part of that housekeeping and is not
+     * skipped.  desc->n_used_entries counts occupied slots of the main table
+     * only -- a victim-TLB entry is not counted, which is precisely why the
+     * eviction decrements it -- so the decrement records "this slot's previous
+     * tenant is gone", which is equally true when the tenant is destroyed
+     * rather than preserved.  Skipping it made a speculative install account
+     * differently from the correct-path install of the same page into the same
+     * occupied slot: the spec path incremented with no matching decrement, and
+     * cpu_plugin_spec_tlb_flush_logged then decremented once at excursion exit
+     * when it cleared the slot, leaving the counter one ABOVE the occupancy it
+     * describes, cumulatively, until the next full flush of that mmu_idx reset
+     * it.  n_used_entries feeds only tlb_mmu_resize_locked, so the consequence
+     * is a table grown on a fictitious occupancy rate -- it reaches nothing the
+     * guest computes -- but the containment's rule is that it must not change
+     * what the correct path would have counted, and this changed it.
+     *
+     * Measured, x86_64 system marker cell, 16384 excursions: 10251 speculative
+     * installs displaced a live entry for a different page, and the per-
+     * excursion drift between n_used_entries and a recount of the occupied
+     * slots was non-zero on 4757 of them (sum of |drift| 19672).  With the
+     * decrement restored: 607 and 1331, both signs, from causes this hunk does
+     * not address and does not claim to.
      */
-    if (!cpu_plugin_spec_active(cpu) &&
-        !tlb_hit_page_anyprot(te, addr_page) && !tlb_entry_is_empty(te)) {
-        unsigned vidx = desc->vindex++ % CPU_VTLB_SIZE;
-        CPUTLBEntry *tv = &desc->vtable[vidx];
+    if (!tlb_hit_page_anyprot(te, addr_page) && !tlb_entry_is_empty(te)) {
+        if (!cpu_plugin_spec_active(cpu)) {
+            unsigned vidx = desc->vindex++ % CPU_VTLB_SIZE;
+            CPUTLBEntry *tv = &desc->vtable[vidx];
 
-        /* Evict the old entry into the victim tlb.  */
-        copy_tlb_helper_locked(tv, te);
-        desc->vfulltlb[vidx] = desc->fulltlb[index];
+            /* Evict the old entry into the victim tlb.  */
+            copy_tlb_helper_locked(tv, te);
+            desc->vfulltlb[vidx] = desc->fulltlb[index];
+        }
         tlb_n_used_entries_dec(cpu, mmu_idx);
     }
 

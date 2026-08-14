@@ -52,14 +52,6 @@ static uint64_t plugin_tsc_per_ns_q32;      /* ticks per clock ns, 32.32 */
 static int64_t plugin_tsc_ref_ticks;        /* ticks at the arming instant */
 static int64_t plugin_tsc_ref_clk;          /* clock at the arming instant */
 
-/*
- * The host instant at which the guest clock was stopped, or 0 while it runs.
- * Written by plugin_clock_state_add() and by cpu_enable_ticks(); read by every
- * clock reader.  See the discipline's own comment further down.
- */
-static int64_t plugin_clock_frozen_at;
-static bool plugin_clock_should_stop(void);
-
 static int64_t plugin_tsc_from_clock(int64_t clk)
 {
     uint64_t lo, hi;
@@ -128,18 +120,7 @@ int64_t cpu_get_clock_locked(void)
 
     time = timers_state.cpu_clock_offset;
     if (timers_state.cpu_ticks_enabled) {
-#ifdef CONFIG_PLUGIN
-        /*
-         * While the plugin clock discipline holds the guest clock stopped, the
-         * clock reads the host instant at which it was stopped rather than the
-         * host instant now.  One word decides it, so the stopping side needs no
-         * lock -- see plugin_clock_state_add().
-         */
-        int64_t frozen = qatomic_read(&plugin_clock_frozen_at);
-        time += frozen ? frozen : get_clock();
-#else
         time += get_clock();
-#endif
     }
 
     return time;
@@ -171,24 +152,9 @@ void cpu_enable_ticks(void)
     seqlock_write_lock(&timers_state.vm_clock_seqlock,
                        &timers_state.vm_clock_lock);
     if (!timers_state.cpu_ticks_enabled) {
-        int64_t now = get_clock();
-
         timers_state.cpu_ticks_offset -= cpu_get_host_ticks();
-        timers_state.cpu_clock_offset -= now;
+        timers_state.cpu_clock_offset -= get_clock();
         timers_state.cpu_ticks_enabled = 1;
-#ifdef CONFIG_PLUGIN
-        /*
-         * vm_stop owns cpu_ticks_enabled; the plugin discipline owns
-         * plugin_clock_frozen_at.  They are separate variables with separate
-         * owners precisely so neither has to arbitrate for the other -- but the
-         * clock coming back up must land in whichever state the discipline is
-         * in, or a machine restarted mid-freeze would run the guest's clock
-         * through the rest of that freeze.  The SAME @now is used for both, so
-         * the pair is exact rather than a second sample apart.
-         */
-        qatomic_set(&plugin_clock_frozen_at,
-                    plugin_clock_should_stop() ? now : 0);
-#endif
     }
     seqlock_write_unlock(&timers_state.vm_clock_seqlock,
                        &timers_state.vm_clock_lock);
@@ -205,13 +171,8 @@ void cpu_disable_ticks(void)
                        &timers_state.vm_clock_lock);
     if (timers_state.cpu_ticks_enabled) {
         timers_state.cpu_ticks_offset += cpu_get_host_ticks();
-        /* Reads plugin_clock_frozen_at, so the stopped value is carried over. */
         timers_state.cpu_clock_offset = cpu_get_clock_locked();
         timers_state.cpu_ticks_enabled = 0;
-#ifdef CONFIG_PLUGIN
-        /* Absorbed into the offset above; a stale stamp must not be reused. */
-        qatomic_set(&plugin_clock_frozen_at, 0);
-#endif
     }
     seqlock_write_unlock(&timers_state.vm_clock_seqlock,
                          &timers_state.vm_clock_lock);
@@ -219,239 +180,91 @@ void cpu_disable_ticks(void)
 
 #ifdef CONFIG_PLUGIN
 /*
- * THE GUEST CLOCK DISCIPLINE
- * ==========================
+ * Outstanding plugin clock freezes, across every vCPU.  Guarded by the BQL,
+ * which both entry points below require and which cpu_enable_ticks() and
+ * cpu_disable_ticks() already require for the seqlock they write.
  *
- * Contract, and it is an equivalence, not an exclusion list:
+ * The count exists because the thing being counted is global while its owners
+ * are not.  timers_state is one clock for the whole machine and
+ * cpu_ticks_enabled is one boolean, while a plugin freeze is opened and
+ * closed per-vCPU: the wrong-path excursion pause in cpu_plugin_spec_vtime_
+ * pause() belongs to the excursion's vCPU, and the correct-path
+ * instrumentation window in cpu_plugin_vclock_pause() belongs to whichever
+ * vCPU is running a plugin callback -- including a translation callback,
+ * which is not serialised against a peer's excursion at all.  With both
+ * calling cpu_disable_ticks()/cpu_enable_ticks() directly, the peer's window
+ * closing restarted the guest clock in the middle of the excursion, and the
+ * excursion's own thaw then found the clock already running and did nothing:
+ * the guest clock advanced by the excursion's remaining host wall time,
+ * which is exactly what the freeze exists to prevent.
  *
- *     The guest's virtual clock advances across guest execution, and across
- *     nothing else.
- *
- * The predecessor of this code stated the same intent the other way round --
- * it named the regions that must NOT advance the clock (a plugin's per-TB
- * callback, its translation callback, a wrong-path excursion) and stopped the
- * clock across each.  An exclusion list is only ever as complete as its
- * author's enumeration, and this one was not complete: measured on the x86_64
- * system marker shape, 47.6% of all the guest virtual time a traced run
- * produced elapsed while the vCPU was not inside translated code at all, and
- * 96.6% of that was inside tb_gen_code() -- translation, which no bracket
- * covered because no plugin callback is running there.  Per translated block
- * the guest was charged 63.5 us of its own time against 13.2 us for the same
- * block with no plugin loaded.  A guest whose clock is charged for work its
- * instructions did not do reads its own scheduling quantum as already spent
- * on every pass, and the quantity that decides it -- host time per guest
- * instruction -- is not something the enumeration can bound, because it is
- * set by the host.
- *
- * So the enumeration is gone.  The clock is stopped by default and the ONE
- * place that starts it is the entry to translated guest code, cpu_tb_exec().
- * A region can only be charged to the guest by being inside that call; there
- * is nothing to keep in sync and nothing to forget, and a future callback
- * added anywhere else is covered on the day it is written.
- *
- * The state is three counters, packed into one word so that a mutator sees
- * the whole predicate change atomically:
- *
- *   windows    plugin clock windows open anywhere (the correct-path
- *              instrumentation window, a wrong-path excursion).  Any open
- *              window stops the clock.  This is the predecessor's counter and
- *              its meaning is unchanged.
- *   in_loop    vCPUs inside cpu_exec().  When this is zero every vCPU is
- *              halted or out in the main loop, and the clock MUST run: a
- *              guest waiting in hlt for a timer deadline it computed on this
- *              clock will never be woken by a clock that is stopped.  This is
- *              the idle escape and it is what makes "stopped by default" safe.
- *   in_guest   vCPUs inside tcg_qemu_tb_exec() at the top level.  Non-zero
- *              means some vCPU is executing guest instructions.
- *
- *     stopped  <=>  windows > 0
- *                   || (armed && in_loop > 0 && in_guest == 0)
- *
- * A wrong-path excursion dispatches through cpu_tb_exec() too, so it raises
- * in_guest -- and it is correctly still frozen, because the excursion holds a
- * window and windows dominate.  Nothing special is needed for it.
- *
- * WHY THE STOPPING SIDE TAKES NO LOCK.  Stopping writes exactly one word
- * (@plugin_clock_frozen_at); cpu_clock_offset does not move.  A reader
- * therefore sees either the running form or the stopped form and both name
- * the same instant to within the gap between the get_clock() call and the
- * store that follows it -- two adjacent statements.  The predecessor took the
- * BQL here, and a BQL acquisition is a blocking wait, taken with the clock
- * still running, whose whole duration was charged to the guest: 2.13 ms in a
- * single window on a loaded host.  A wait that the guest pays for is exactly
- * the defect, so the stopping side may not contain one, and this one does not.
- *
- * WHY THE STARTING SIDE MAY.  Starting moves two words (it subtracts the
- * elapsed frozen span from cpu_clock_offset and clears the stamp), so it
- * needs the seqlock the clock's readers already use.  It runs with the clock
- * ALREADY STOPPED, so however long it waits for that lock, the guest is
- * charged nothing -- and the instant it resumes from is sampled inside the
- * lock, as late as possible, so the wait is excluded rather than billed.  The
- * asymmetry is the whole design: a wait is free when the clock is stopped and
- * ruinous when it is not.
- *
- * OWNERSHIP.  vm_stop/vm_start own cpu_ticks_enabled; this discipline owns
- * plugin_clock_frozen_at.  Two variables, two owners, so neither has to
- * arbitrate for the other.  The predecessor had both driving cpu_ticks_enabled
- * and needed a runstate_is_running() special case to keep a plugin thaw from
- * restarting a clock a vm_stop owned -- a case that could drop the last
- * reference and return with the clock stopped and no owner left to restart it.
- * That case cannot be expressed here.
- *
- * SMP RESIDUAL, stated rather than hidden: the counters are updated with one
- * atomic each and the stamp with a separate store, so two vCPUs transitioning
- * in opposite directions in the same handful of nanoseconds can leave the
- * clock stopped or running for that handful.  The error is bounded by the
- * distance between two adjacent instructions, it is not proportional to any
- * wait, and it cannot accumulate: every start subtracts the whole span the
- * stamp describes.  -smp 1, which is what the system-mode marker workflow
- * runs, has no such window at all.
+ * The holder array alongside it exists to MEASURE the defect this count
+ * closes, rather than assert it: each entry names the vCPU that took one
+ * outstanding reference, so a thaw can tell that the freeze it is leaving
+ * behind is held ONLY by other vCPUs.  That is exactly the predecessor's
+ * failure condition -- its own guards saw this vCPU's windows and nothing
+ * else, so it called cpu_enable_ticks() precisely then.  A residual that
+ * still includes this vCPU's own outer window is NOT counted: the
+ * predecessor handled that case correctly.  Structurally zero on a
+ * single-vCPU machine.
  */
-#define PC_WIN_SHIFT    0
-#define PC_LOOP_SHIFT  20
-#define PC_GUEST_SHIFT 40
-#define PC_FIELD_MASK  0xfffffULL
-#define PC_ONE(shift)  (1ULL << (shift))
-#define PC_FIELD(s, shift) (((s) >> (shift)) & PC_FIELD_MASK)
-
-static uint64_t plugin_clock_state;
-static bool plugin_clock_armed;
-
-static bool plugin_clock_state_stopped(uint64_t st)
-{
-    if (PC_FIELD(st, PC_WIN_SHIFT) != 0) {
-        return true;
-    }
-    return plugin_clock_armed &&
-           PC_FIELD(st, PC_LOOP_SHIFT) != 0 &&
-           PC_FIELD(st, PC_GUEST_SHIFT) == 0;
-}
-
-static bool plugin_clock_should_stop(void)
-{
-    return plugin_clock_state_stopped(qatomic_read(&plugin_clock_state));
-}
-
-/* Start the clock again from the instant it was stopped.  See above. */
-static void plugin_clock_start(void)
-{
-    seqlock_write_lock(&timers_state.vm_clock_seqlock,
-                       &timers_state.vm_clock_lock);
-    if (plugin_clock_frozen_at) {
-        /*
-         * Sampled here, holding the lock, with nothing left to do but publish:
-         * everything this function waited for happened while the clock was
-         * stopped and is therefore excluded from guest time, which is the
-         * point.
-         */
-        if (timers_state.cpu_ticks_enabled) {
-            timers_state.cpu_clock_offset -=
-                get_clock() - plugin_clock_frozen_at;
-        }
-        qatomic_set(&plugin_clock_frozen_at, 0);
-    }
-    /*
-     * A peer may have re-stopped the machine while this thread waited.  Land
-     * in whichever state the counters now describe rather than in the one
-     * they described on entry.
-     */
-    if (plugin_clock_should_stop()) {
-        qatomic_set(&plugin_clock_frozen_at, get_clock());
-    }
-    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
-                         &timers_state.vm_clock_lock);
-}
-
-/*
- * @delta: the packed counter change, added atomically.
- * @at:    the host instant the caller sampled BEFORE doing anything else, or 0
- *         when the transition this call can cause is a start (which samples
- *         its own instant, late, inside the lock).
- */
-static void plugin_clock_state_add(uint64_t delta, int64_t at)
-{
-    uint64_t old = qatomic_fetch_add(&plugin_clock_state, delta);
-    bool was = plugin_clock_state_stopped(old);
-    bool now = plugin_clock_state_stopped(old + delta);
-
-    if (was == now) {
-        return;
-    }
-    if (now) {
-        /*
-         * Enforced rather than reasoned: a caller that passes at == 0 is
-         * asserting this call cannot stop the clock, and 0 is the running
-         * sentinel, so a wrong assertion would publish "running" while the
-         * counters say stopped and the clock would run until the next
-         * transition.  The three stopping directions all sample first.
-         */
-        assert(at != 0);
-        /* One word, no lock: the guest may not pay for a wait.  See above. */
-        qatomic_set(&plugin_clock_frozen_at, at);
-    } else {
-        plugin_clock_start();
-    }
-}
+#define PLUGIN_TICKS_HOLDERS_MAX 64
+static int plugin_ticks_freeze_depth;
+static int plugin_ticks_holder[PLUGIN_TICKS_HOLDERS_MAX];
+static bool plugin_ticks_holders_overflowed;
+static uint64_t plugin_ticks_peer_only_thaws;
 
 void cpu_plugin_ticks_freeze(int cpu_index)
 {
-    int64_t at = get_clock();     /* FIRST statement: nothing ahead of it */
-
-    plugin_clock_state_add(PC_ONE(PC_WIN_SHIFT), at);
+    assert(bql_locked());
+    if (plugin_ticks_freeze_depth < PLUGIN_TICKS_HOLDERS_MAX) {
+        plugin_ticks_holder[plugin_ticks_freeze_depth] = cpu_index;
+    } else {
+        plugin_ticks_holders_overflowed = true;
+    }
+    if (plugin_ticks_freeze_depth++ == 0) {
+        cpu_disable_ticks();
+    }
 }
 
 bool cpu_plugin_ticks_thaw(int cpu_index)
 {
-    plugin_clock_state_add(-PC_ONE(PC_WIN_SHIFT), 0);
+    assert(bql_locked());
+    assert(plugin_ticks_freeze_depth > 0);
+
+    /* Drop one reference belonging to @cpu_index, keeping the array packed. */
+    int n = MIN(plugin_ticks_freeze_depth, PLUGIN_TICKS_HOLDERS_MAX);
+    for (int i = n - 1; i >= 0; i--) {
+        if (plugin_ticks_holder[i] == cpu_index) {
+            plugin_ticks_holder[i] = plugin_ticks_holder[n - 1];
+            break;
+        }
+    }
+    if (--plugin_ticks_freeze_depth > 0) {
+        bool mine_remains = false;
+        n = MIN(plugin_ticks_freeze_depth, PLUGIN_TICKS_HOLDERS_MAX);
+        for (int i = 0; i < n; i++) {
+            if (plugin_ticks_holder[i] == cpu_index) {
+                mine_remains = true;
+                break;
+            }
+        }
+        if (!mine_remains) {
+            plugin_ticks_peer_only_thaws++;
+        }
+        return false;
+    }
+    if (!runstate_is_running()) {
+        return false;
+    }
+    cpu_enable_ticks();
     return true;
 }
 
-void cpu_plugin_guest_loop_enter(void)
+uint64_t cpu_plugin_ticks_peer_only_thaws(void)
 {
-    int64_t at = get_clock();     /* FIRST statement: nothing ahead of it */
-
-    plugin_clock_state_add(PC_ONE(PC_LOOP_SHIFT), at);
-}
-
-void cpu_plugin_guest_loop_exit(void)
-{
-    plugin_clock_state_add(-PC_ONE(PC_LOOP_SHIFT), 0);
-}
-
-void cpu_plugin_guest_exec_enter(void)
-{
-    plugin_clock_state_add(PC_ONE(PC_GUEST_SHIFT), 0);
-}
-
-void cpu_plugin_guest_exec_exit(void)
-{
-    int64_t at = get_clock();     /* FIRST statement: nothing ahead of it */
-
-    plugin_clock_state_add(-PC_ONE(PC_GUEST_SHIFT), at);
-}
-
-void cpu_plugin_clock_discipline_arm(void)
-{
-    int64_t at = get_clock();
-    uint64_t st;
-
-    /*
-     * Arming can only ever move the predicate towards stopped, and only for a
-     * vCPU already inside cpu_exec() and outside translated code.  Sampling
-     * first keeps that transition honest for a machine armed mid-run; the
-     * ordinary case arms before any vCPU starts, where the counters are zero
-     * and nothing transitions.
-     */
-    qatomic_set(&plugin_clock_armed, true);
-    st = qatomic_read(&plugin_clock_state);
-    if (plugin_clock_state_stopped(st) && !qatomic_read(&plugin_clock_frozen_at)) {
-        qatomic_set(&plugin_clock_frozen_at, at);
-    }
-}
-
-bool cpu_plugin_clock_discipline_armed(void)
-{
-    return qatomic_read(&plugin_clock_armed);
+    return plugin_ticks_holders_overflowed ? UINT64_MAX
+                                           : plugin_ticks_peer_only_thaws;
 }
 
 /*

@@ -17,8 +17,3 @@ void qemu_plugin_fillin_mode_info(qemu_info_t *info)
 {
     info->system_emulation = false;
 }
-
-void qemu_plugin_mode_plugin_loaded(void)
-{
-    /* No guest virtual clock in user mode; nothing to protect. */
-}

@@ -680,21 +680,6 @@ struct CPUState {
      */
     bool plugin_spec_mode;
 
-    /*
-     * How many guest-execution brackets this vCPU currently holds open, i.e.
-     * how deep it is inside translated guest code.  The guest clock discipline
-     * (system/cpu-timers.c) runs the guest's clock across exactly those spans.
-     *
-     * A DEPTH and not a flag, because the dispatches nest: a wrong-path
-     * excursion is kicked from a plugin callback that the generated code calls
-     * from inside a block, so its own dispatches sit inside the correct-path
-     * one.  It is a depth so that a fault, which unwinds several frames at
-     * once and returns through none of them, can be told exactly how many
-     * brackets it crossed -- each landing pad names the depth its frame was
-     * entered at, and closes everything above it.
-     */
-    int plugin_in_guest_exec;
-
 #ifdef CONFIG_PLUGIN
     CPUPluginState *plugin_state;
 

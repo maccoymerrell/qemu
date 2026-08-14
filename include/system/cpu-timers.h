@@ -131,69 +131,50 @@ void cpu_disable_ticks(void);
 
 #ifdef CONFIG_PLUGIN
 /**
- * The guest clock discipline.  Its contract is one sentence:
+ * cpu_plugin_ticks_freeze: stop the guest clock for a plugin window
+ * @cpu_index: the vCPU taking the reference
  *
- *     the guest's virtual clock advances across guest execution, and across
- *     nothing else.
+ * cpu_enable_ticks()/cpu_disable_ticks() drive a single VM-GLOBAL boolean,
+ * but a plugin freeze is entered and left per-vCPU: a wrong-path excursion
+ * on one vCPU and a correct-path instrumentation window on another are two
+ * independent owners of that one boolean.  Called directly, the second owner
+ * to leave re-enables the clock while the first is still inside its window,
+ * so the first one's window is not time-transparent after all and its exit
+ * finds the clock resumed from a base that moved.  These two entry points
+ * reference-count the freeze across every vCPU, so ticks stop on the first
+ * entry and restart only when the last window closes.
  *
- * The implementation and the reasoning behind it are in system/cpu-timers.c;
- * what a caller needs is below.  None of these require the BQL -- deliberately,
- * because a blocking wait taken with the guest clock running is charged to the
- * guest, and that is the defect the discipline exists to make unrepresentable.
- */
-
-/**
- * cpu_plugin_ticks_freeze / cpu_plugin_ticks_thaw: open and close a plugin
- * clock window
- * @cpu_index: unused; retained so call sites read as being about a vCPU
- *
- * Any open window anywhere on the machine stops the guest clock, so a
- * wrong-path excursion on one vCPU and a correct-path instrumentation window
- * on another compose without either having to know about the other.  Balanced
- * pairs, nestable.  The thaw returns true unconditionally; nothing may depend
- * on which call restarted the clock, because that is decided by the whole
- * machine's state and not by this caller's.
+ * Caller must hold the BQL.
  */
 void cpu_plugin_ticks_freeze(int cpu_index);
+
+/**
+ * cpu_plugin_ticks_thaw: leave a plugin clock freeze
+ * @cpu_index: the vCPU giving back the reference it took
+ *
+ * Returns true if this call actually restarted the clock, i.e. it was the
+ * last outstanding freeze and the VM is running.  Returns false when another
+ * freeze is still outstanding, or when a vm_stop owns the stopped clock (it
+ * calls cpu_disable_ticks() before pausing the vCPUs, and vm_start() is what
+ * restarts them) -- a plugin freeze must never fight that owner.
+ *
+ * Caller must hold the BQL.
+ */
 bool cpu_plugin_ticks_thaw(int cpu_index);
 
 /**
- * cpu_plugin_guest_exec_enter / _exit: bracket the execution of guest code
+ * cpu_plugin_ticks_peer_only_thaws: how often a freeze was left entirely to peers
  *
- * Called around tcg_qemu_tb_exec() -- the one call through which QEMU enters
- * translated guest code -- so that being inside that call is what makes a host
- * interval count as guest time.  Everything else the emulator does between
- * guest instructions (block lookup, translation, exception dispatch, a plugin's
- * callbacks) is outside the bracket and is therefore not charged to the guest,
- * without anyone having to enumerate it.
+ * Counts the thaws that left the clock stopped with EVERY remaining freeze held
+ * by a different vCPU.  Each one is an occasion on which restarting the clock
+ * from this vCPU's own view -- which is all cpu_enable_ticks() behind a
+ * per-vCPU guard can see -- would have run the guest clock inside a peer's
+ * window.  A residual that still contains one of this vCPU's own windows is
+ * deliberately excluded: a per-vCPU guard gets that case right.  Zero by
+ * construction on a single-vCPU machine.  UINT64_MAX means the holder array
+ * overflowed and the figure is not trustworthy; it is never silently capped.
  */
-void cpu_plugin_guest_exec_enter(void);
-void cpu_plugin_guest_exec_exit(void);
-
-/**
- * cpu_plugin_guest_loop_enter / _exit: bracket a vCPU's stay in cpu_exec()
- *
- * The idle escape.  A vCPU that has left cpu_exec() is halted or out in the
- * main loop, and its next wake is a timer deadline expressed on this very
- * clock -- so when no vCPU is inside cpu_exec() the clock runs, whatever the
- * discipline would otherwise say.  Without this, a guest that executes hlt
- * would wait on a clock only its own execution could advance.
- */
-void cpu_plugin_guest_loop_enter(void);
-void cpu_plugin_guest_loop_exit(void);
-
-/**
- * cpu_plugin_clock_discipline_arm: switch the guest clock to the discipline
- *
- * Called once, when a plugin is loaded.  Before it, the clock behaves exactly
- * as an unplugged QEMU's does and only an explicit window stops it; after it,
- * the clock is stopped by default and guest execution is what starts it.  It
- * is armed by the mere presence of a plugin rather than by a plugin asking:
- * an instrumented run's host cost is not the guest's to pay, and a plugin that
- * had to opt in could forget to.
- */
-void cpu_plugin_clock_discipline_arm(void);
-bool cpu_plugin_clock_discipline_armed(void);
+uint64_t cpu_plugin_ticks_peer_only_thaws(void);
 
 /**
  * cpu_plugin_tsc_lock_to_vclock: derive cpu_get_ticks() from cpu_get_clock()

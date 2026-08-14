@@ -146,15 +146,4 @@ void plugin_evq_note_drained(CPUState *cpu);
  */
 void qemu_plugin_fillin_mode_info(qemu_info_t *info);
 
-/**
- * qemu_plugin_mode_plugin_loaded() - mode-specific reaction to a plugin load
- *
- * System emulation arms the guest clock discipline here (see
- * include/system/cpu-timers.h): once anything instruments the run, the guest's
- * virtual clock must advance across guest execution and across nothing else,
- * or the host cost of instrumenting is charged to the guest as though its own
- * instructions had spent it.  No-op in user mode, which has no guest clock.
- */
-void qemu_plugin_mode_plugin_loaded(void);
-
 #endif /* PLUGIN_H */

@@ -449,61 +449,6 @@ static vaddr log_pc(CPUState *cpu, const TranslationBlock *tb)
     }
 }
 
-/*
- * The guest-execution bracket.  The guest's virtual clock runs across guest
- * execution and across nothing else, so being inside tcg_qemu_tb_exec() is
- * exactly what makes a host interval count as guest time; see the discipline
- * in system/cpu-timers.c.  No-ops without CONFIG_PLUGIN and in user mode,
- * where there is no guest clock to protect.
- *
- * @plugin_in_guest_exec makes the bracket closeable from the exit that does not
- * return through cpu_tb_exec(): a fault raised inside the block siglongjmps to
- * the pad in cpu_exec(), and cpu_exec_longjmp_cleanup() closes it there.
- */
-#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
-static inline void guest_exec_enter(CPUState *cpu)
-{
-    cpu->plugin_in_guest_exec++;
-    cpu_plugin_guest_exec_enter();
-}
-
-static inline void guest_exec_exit(CPUState *cpu)
-{
-    cpu_plugin_guest_exec_exit();
-    cpu->plugin_in_guest_exec--;
-}
-
-/*
- * Close every bracket opened above @depth.  A landing pad passes the depth its
- * own frame was entered at, so a fault that crossed three nested dispatches
- * closes three brackets and a fault that crossed one closes one -- the pad does
- * not have to know which, and a normal return through cpu_tb_exec() has already
- * left nothing above @depth to close.
- */
-static inline void guest_exec_unwind(CPUState *cpu, int depth)
-{
-    while (cpu->plugin_in_guest_exec > depth) {
-        guest_exec_exit(cpu);
-    }
-}
-
-static inline void cpu_plugin_guest_loop_enter_if_armed(void)
-{
-    cpu_plugin_guest_loop_enter();
-}
-
-static inline void cpu_plugin_guest_loop_exit_if_armed(void)
-{
-    cpu_plugin_guest_loop_exit();
-}
-#else
-static inline void guest_exec_enter(CPUState *cpu) { }
-static inline void guest_exec_exit(CPUState *cpu) { }
-static inline void guest_exec_unwind(CPUState *cpu, int depth) { }
-static inline void cpu_plugin_guest_loop_enter_if_armed(void) { }
-static inline void cpu_plugin_guest_loop_exit_if_armed(void) { }
-#endif
-
 /* Execute a TB, and fix up the CPU state afterwards if necessary */
 /*
  * Disable CFI checks.
@@ -526,23 +471,7 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
     }
 
     qemu_thread_jit_execute();
-    {
-        /*
-         * The one call through which QEMU enters translated guest code, and so
-         * the one place the guest's virtual clock is allowed to run.  See the
-         * discipline in system/cpu-timers.c: outside this bracket the clock is
-         * stopped, which is what keeps host work the guest did not do -- block
-         * lookup, translation, exception dispatch, plugin callbacks -- from
-         * being charged to the guest as though its instructions had done it.
-         *
-         * @plugin_in_guest_exec is the repair handle for the exit that does not
-         * come back here: a fault inside the block siglongjmps to cpu_exec's
-         * pad, and cpu_exec_longjmp_cleanup() closes the bracket from there.
-         */
-        guest_exec_enter(cpu);
-        ret = tcg_qemu_tb_exec(cpu_env(cpu), tb_ptr);
-        guest_exec_exit(cpu);
-    }
+    ret = tcg_qemu_tb_exec(cpu_env(cpu), tb_ptr);
 #ifdef CONFIG_ORACLE
     /*
      * The last instruction of an armed TB has no following boundary probe, so
@@ -629,17 +558,6 @@ static void cpu_exec_longjmp_cleanup(CPUState *cpu)
 {
     /* Non-buggy compilers preserve this; assert the correct value. */
     g_assert(cpu == current_cpu);
-
-    /*
-     * The guest-execution bracket's abnormal exit.  A fault raised inside a
-     * translated block never returns through cpu_tb_exec(), so the brackets
-     * opened there are closed HERE -- first, before any of the cleanup below,
-     * because everything below is emulator work and the guest is no longer
-     * executing.  This is the OUTER pad: the unwind reached cpu_exec()'s own
-     * landing pad, so every frame that could hold a bracket is gone and the
-     * depth goes to zero.
-     */
-    guest_exec_unwind(cpu, 0);
 
 #ifdef CONFIG_PLUGIN
     /*
@@ -842,8 +760,6 @@ bool cpu_plugin_exec_inline(CPUState *cpu)
      */
     sigjmp_buf saved_jmp_env;
     memcpy(&saved_jmp_env, &cpu->jmp_env, sizeof(sigjmp_buf));
-    /* This frame's guest-execution depth; its pad closes only what it opened. */
-    int saved_guest_depth = cpu->plugin_in_guest_exec;
 
     if (sigsetjmp(cpu->jmp_env, 0) == 0) {
         cpu_tb_exec(cpu, tb, &tb_exit);
@@ -851,10 +767,7 @@ bool cpu_plugin_exec_inline(CPUState *cpu)
         memcpy(&cpu->jmp_env, &saved_jmp_env, sizeof(sigjmp_buf));
         return true;
     } else {
-        /* Exception during wrong-path execution; clean up and report.  This is
-         * a LOCAL pad -- the unwind stopped here, so the frames beneath it keep
-         * their brackets and only this frame's are closed. */
-        guest_exec_unwind(cpu, saved_guest_depth);
+        /* Exception during wrong-path execution; clean up and report */
         cpu->neg.can_do_io = true;
         qemu_plugin_disable_mem_helpers(cpu);
 #ifdef CONFIG_USER_ONLY
@@ -961,8 +874,6 @@ bool cpu_plugin_exec_tb(CPUState *cpu)
      */
     sigjmp_buf saved_jmp_env;
     memcpy(&saved_jmp_env, &cpu->jmp_env, sizeof(sigjmp_buf));
-    /* This frame's guest-execution depth; its pad closes only what it opened. */
-    int saved_guest_depth = cpu->plugin_in_guest_exec;
 
     if (sigsetjmp(cpu->jmp_env, 0) == 0) {
         tb = tb_lookup(cpu, pc, cs_base, flags, cflags);
@@ -1001,10 +912,6 @@ bool cpu_plugin_exec_tb(CPUState *cpu)
         memcpy(&cpu->jmp_env, &saved_jmp_env, sizeof(sigjmp_buf));
         return true;
     } else {
-        /* A fault inside the block never returns through cpu_tb_exec(), so the
-         * brackets are closed by whichever pad the unwind lands in.  This is a
-         * LOCAL pad: only this frame's are closed. */
-        guest_exec_unwind(cpu, saved_guest_depth);
         cpu->neg.can_do_io = true;
         qemu_plugin_disable_mem_helpers(cpu);
 #ifdef CONFIG_USER_ONLY
@@ -1912,8 +1819,9 @@ static void cst_clkeq_check(CPUState *cpu, int64_t pre_thaw)
     }
     if ((++n_excursions % (unsigned)every) == 0) {
         fprintf(stderr, "[clkeq] cpu%d excursions=%" PRIu64 " advanced=%" PRIu64
-                " notrestored=%" PRIu64 "\n",
-                cpu->cpu_index, n_excursions, n_adv, n_not);
+                " notrestored=%" PRIu64 " peer_only_thaws=%" PRIu64 "\n",
+                cpu->cpu_index, n_excursions, n_adv, n_not,
+                cpu_plugin_ticks_peer_only_thaws());
         fflush(stderr);
     }
 }
@@ -2532,14 +2440,14 @@ void cpu_plugin_vclock_pause(CPUState *cpu)
         return;
     }
 #endif
-    /*
-     * No BQL.  Stopping the guest clock writes one word and takes no lock, so
-     * there is no wait here for the guest to be charged for -- which is the
-     * whole point: the predecessor took the BQL first and stamped the freeze
-     * afterwards, so the entire acquisition, up to 2.13 ms on a loaded host,
-     * was guest virtual time in which the guest retired nothing.
-     */
+    bool need_bql = !bql_locked();
+    if (need_bql) {
+        bql_lock();
+    }
     cpu_plugin_ticks_freeze(cpu->cpu_index);
+    if (need_bql) {
+        bql_unlock();
+    }
 #endif
 }
 
@@ -2555,17 +2463,14 @@ void cpu_plugin_vclock_resume(CPUState *cpu)
         return;
     }
 #endif
-    /*
-     * No BQL either: the starting side takes the clock's own seqlock, and it
-     * takes it with the clock ALREADY stopped, so however long it waits the
-     * guest is charged nothing.  That asymmetry -- a wait is free when the
-     * clock is stopped and ruinous when it is not -- is why the stopping side
-     * above may hold no lock and this one may.
-     */
+    bool need_bql = !bql_locked();
+    if (need_bql) {
+        bql_lock();
+    }
     if (cpu_plugin_ticks_thaw(cpu->cpu_index)) {
 #if defined(CONFIG_PLUGIN)
         /*
-         * The window closed here: no guest state moved, but each
+         * The clock actually restarted here: no guest state moved, but each
          * target still has to reconcile the clocks it owns to the frozen
          * time -- an armed host QEMUTimer whose deadline was computed against
          * the pre-freeze virtual clock, above all.
@@ -2579,6 +2484,9 @@ void cpu_plugin_vclock_resume(CPUState *cpu)
          */
         cpu_plugin_clock_resync(cpu, SPEC_CLOCK_THAW);
 #endif
+    }
+    if (need_bql) {
+        bql_unlock();
     }
 #endif
 }
@@ -3239,13 +3147,6 @@ int cpu_exec(CPUState *cpu)
 
     RCU_READ_LOCK_GUARD();
     cpu_exec_enter(cpu);
-    /*
-     * The idle escape for the guest clock discipline (system/cpu-timers.c).
-     * Between here and the matching exit the clock is stopped unless this vCPU
-     * is executing guest code; once every vCPU has left, it runs again, so a
-     * guest halted in hlt still reaches the timer deadline that wakes it.
-     */
-    cpu_plugin_guest_loop_enter_if_armed();
 
     /*
      * Calculate difference between guest clock and host clock.
@@ -3257,7 +3158,6 @@ int cpu_exec(CPUState *cpu)
 
     ret = cpu_exec_setjmp(cpu, &sc);
 
-    cpu_plugin_guest_loop_exit_if_armed();
     cpu_exec_exit(cpu);
     return ret;
 }

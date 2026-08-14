@@ -316,7 +316,6 @@ int qemu_plugin_load_list(QemuPluginList *head, Error **errp)
             return err;
         }
         QTAILQ_REMOVE(head, desc, entry);
-        qemu_plugin_mode_plugin_loaded();
     }
     return 0;
 }

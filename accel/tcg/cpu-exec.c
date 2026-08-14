@@ -2469,9 +2469,19 @@ void cpu_plugin_vclock_resume(CPUState *cpu)
     }
     if (cpu_plugin_ticks_thaw(cpu->cpu_index)) {
 #if defined(CONFIG_PLUGIN)
-        /* The clock actually restarted here: no guest state moved, but a
-         * counter derived from a different host oscillator than the virtual
-         * clock still has to be re-pinned to the frozen time on every thaw. */
+        /*
+         * The clock actually restarted here: no guest state moved, but each
+         * target still has to reconcile the clocks it owns to the frozen
+         * time -- an armed host QEMUTimer whose deadline was computed against
+         * the pre-freeze virtual clock, above all.
+         *
+         * This used to say the resync was here to re-pin a counter derived
+         * from a different host oscillator than the virtual clock.  That was
+         * the x86 TSC, and c1657092ce removed the second oscillator instead
+         * of reconciling it, so x86's hook now has nothing to do past its
+         * one-shot arming.  The call stays because arm, mips and riscv all
+         * register the hook for the timer reason above.
+         */
         cpu_plugin_clock_resync(cpu, SPEC_CLOCK_THAW);
 #endif
     }

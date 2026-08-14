@@ -48,10 +48,28 @@
  * instant read 0x2e8126d5 / 0x2e8171f0 / 0x2e8128ad / 0x2e8126ca on VPEs 0..3:
  * a spread of 19,227 ticks, 120 us at the Malta 160 MHz count rate, and
  * permanent for the rest of the run.  Over 295 boots every single one was
- * incoherent, median 1,940 ticks and worst 20,833.  A clocksource read that
- * moves backwards makes the guest's clocksource_delta() return 0, so its
- * timekeeping stops advancing for the width of the skew each time it migrates
- * onto a lagging VPE.
+ * incoherent, median 1,940 ticks and worst 20,833.
+ *
+ * What a backwards read costs the guest is a FORWARD jump of one full wrap,
+ * not a stall.  Linux registers this counter with a 32-bit mask ("clocksource:
+ * MIPS: mask: 0xffffffff"), so clocksource_delta() computes (now - last) &
+ * 0xffffffff; the CONFIG_CLOCKSOURCE_VALIDATE_LAST_CYCLE guard that would
+ * return 0 tests the delta as a signed 64-bit value and can never fire on a
+ * 32-bit mask.  A read that lands on a VPE @skew ticks behind therefore
+ * returns 2^32 - skew ticks, and at the Malta 160 MHz count rate that is
+ * 4294967296 / 160e6 = 26.8435 s, or 2684.4 jiffies at HZ=100, handed to
+ * timekeeping in one step.
+ *
+ * That quantum is what the symptom is made of.  Every malta -smp 4 RCU stall
+ * captured before this change -- 5 cells across three waves in
+ * /mnt/md0/QEMU/cst_runs/p1/malta3/{ab1,ab2} -- reports "rcu_sched kthread
+ * timer wakeup didn't happen for" 2684, 2684, 2684, 2684 and 2686 jiffies,
+ * one-hot on the wrap and nowhere near RCU's own 21 s reporting threshold.
+ * With the base shared the wrap population is gone: the 3 stall cells in a
+ * 120-boot wave afterwards report 2104, 2104 and 2108 jiffies, i.e. RCU
+ * noticing at its bare CONFIG_RCU_CPU_STALL_TIMEOUT and carrying no wrap
+ * quantum at all.  A residual stall mechanism therefore survives this fix and
+ * is a different one; do not read the coherent base as closing it.
  *
  * Storing the base once, in the shared MVP context, is what makes every VPE
  * read the same instant by construction; keeping it in step by copying between

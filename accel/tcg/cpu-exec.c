@@ -1323,7 +1323,19 @@ static int      g_wprot_nblk = 0;
 static bool     g_wprot_collected = false;
 static bool     g_wprot_installed = false;
 static bool     g_wprot_active = false;
-static bool     g_wp_bql_held = false;  /* #77 test: BQL held across excursion */
+/*
+ * Per-EXCURSION, therefore per-vCPU: the pause that sets it and the resume
+ * that consumes it are two halves of one vCPU's excursion.  File scope was
+ * the wrong storage class for that datum and every other per-excursion
+ * static in this file is already __thread (g_spec_icount_freeze,
+ * g_clkeq_pause, g_clkaudit_pause, the clkprobe accumulators, the sdiff
+ * buffers).  Shared, two vCPUs cross: A's pause sets it and keeps the BQL,
+ * B's resume reads A's flag as its own and reaches bql_unlock() without
+ * holding the lock, while A's own resume then sees it false and never
+ * unlocks -- the BQL held by a vCPU forever.  Unlike the diagnostics around
+ * it this path is not env-gated, so that is product behaviour.
+ */
+static __thread bool g_wp_bql_held;     /* #77 test: BQL held across excursion */
 static int      g_wprot_enabled = -1;
 static long     g_wprot_delay = 15;
 static time_t   g_wprot_start = 0;

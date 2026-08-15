@@ -11798,9 +11798,20 @@ static TbPoison detect_tb_poison(uint64_t pc, const uint64_t *insn_pcs,
         poison_it->second != bytes_hash) {
         /* Different bytes than when the verdict was made: the VA has been
          * reused by another context since (process exit, exec, page reuse).
-         * The old verdict says nothing about THIS content — clear it and
-         * evaluate normally below. */
-        g_poisoned_pcs.erase(poison_it);
+         * The old verdict says nothing about THIS content — ignore it HERE
+         * and evaluate normally below.
+         *
+         * Ignore, never erase.  The paragraph above states the rule this
+         * function is built on: a spec-mode translation only READS this
+         * state.  Erasing was the one place that broke it, and it broke it
+         * in the direction that matters — a wrong-path read of a VA whose
+         * page is mid-refill or belongs to a reused ASID sees a different
+         * hash by construction, so the entry a correct-path sighting placed
+         * was dropped by exactly the garbage read the poison exists to
+         * refuse.  Nothing is stranded by keeping it: the correct path
+         * clears its own stale entries unconditionally in the arm below
+         * (per start_pc and per canonical VA), which is the ground-truth
+         * rule this cache follows everywhere else. */
         poison_it = g_poisoned_pcs.end();
     }
     if (poison_it != g_poisoned_pcs.end() && spec) {

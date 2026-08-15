@@ -98,6 +98,31 @@ def _have(tool: str) -> bool:
     return False
 
 
+class _SeedsNotSeed(argparse.Action):
+    """Refuse ``--seed`` on a subcommand that only has ``--seeds``.
+
+    argparse abbreviates long options, so on a parser that defines ``--seeds``
+    (a REPEAT COUNT) and no ``--seed``, ``--seed 4243`` is silently accepted as
+    ``--seeds 4243`` -- a 4,243-run sweep where the caller asked for one run at
+    seed 4243.  That is a recorded harness defect (it fired once already), and
+    it is not fixed by discipline: the abbreviation is argparse's default and
+    the two names differ by one character.  Defining ``--seed`` explicitly makes
+    the exact match win and turns the silent absorption into a refusal that
+    says which option the caller wanted.
+    """
+
+    def __init__(self, option_strings, dest, **kw):
+        kw.setdefault("nargs", 1)
+        super().__init__(option_strings, dest, **kw)
+
+    def __call__(self, parser, ns, values, option_string=None):
+        parser.error(
+            "%s takes --seeds (a REPEAT COUNT), not --seed.  argparse would "
+            "otherwise abbreviate --seed to --seeds and run %s repetitions "
+            "instead of one.  Use --seeds <count> if you meant the count."
+            % (parser.prog, values[0] if values else "N"))
+
+
 def _parse_seed(s: str) -> int:
     s = s.strip()
     return int(s, 0)
@@ -344,6 +369,8 @@ def _parse_args() -> argparse.Namespace:
                          "rebalances), so it reports ambiguous-split; this "
                          "forces the migration the decoupling proof needs. "
                          "Use with --smp 2.")
+    tt.add_argument("--seed", action=_SeedsNotSeed, default=argparse.SUPPRESS,
+                    help=argparse.SUPPRESS)
     tt.add_argument("--seeds", type=int, default=1,
                     help="Repeat the traced run this many times (varied "
                          "scheduling entropy) and require the guest-thread "

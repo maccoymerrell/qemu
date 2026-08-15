@@ -82,6 +82,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+import argparse
 from pathlib import Path
 
 # Exit status of a run the watchdog killed.  Distinct from the plugin's own
@@ -739,6 +740,12 @@ def add_parser(sub) -> None:
                    help="Comma list of user,system (default both).")
     c.add_argument("--smp", default="1",
                    help="Comma list of system-mode vCPU counts (default 1).")
+    # verdict24: --seed would abbreviate to --seeds here too (the recorded
+    # thread_test defect, same shape).  Defining it explicitly makes the exact
+    # match win and refuses instead of silently running N repetitions.
+    from .__main__ import _SeedsNotSeed as _SNS
+    c.add_argument("--seed", action=_SNS, default=argparse.SUPPRESS,
+                   help=argparse.SUPPRESS)
     c.add_argument("--seeds", type=int, default=2,
                    help="Healthy seeds per configuration (default 2).")
     c.add_argument("--budget", type=int, default=200_000,

@@ -2497,7 +2497,6 @@ static void gt_update_irq(ARMCPU *cpu, int timeridx)
      * correct path's interrupt delivery.
      */
     if (unlikely(CPU(cpu)->plugin_spec_mode)) {
-        CPU(cpu)->plugin_spec_timer_dirty = true;
         return;
     }
 #endif
@@ -2634,14 +2633,15 @@ static void gt_recalc_timer(ARMCPU *cpu, int timeridx)
      * userspace).  The c14_timer[].ctl ISTATUS this would recompute is in
      * CPUArchState and is restored regardless.
      *
-     * Mark the host timer dirty so the wrong-path state restore re-syncs it:
-     * this call may be the host timer's own (iothread) callback firing during
+     * This call may be the host timer's own (iothread) callback firing during
      * the walk, which hits this gate and returns without re-arming, leaving
-     * the one-shot timer dead.  Re-syncing on exit reconciles host timer and
-     * registers regardless of which spec path dirtied it.
+     * the one-shot timer dead.  Nothing is recorded about that here, because
+     * nothing needs to be: arm_cpu_plugin_resync_timers() re-runs
+     * gt_recalc_timer over every present timer at excursion exit
+     * unconditionally, so the host timer is reconciled with the restored
+     * registers whether or not this gate was ever taken.
      */
     if (unlikely(CPU(cpu)->plugin_spec_mode)) {
-        CPU(cpu)->plugin_spec_timer_dirty = true;
         return;
     }
 #endif
@@ -3242,8 +3242,6 @@ void arm_cpu_plugin_resync_timers(CPUState *cs)
 {
     ARMCPU *cpu = ARM_CPU(cs);
     bool held;
-
-    cs->plugin_spec_timer_dirty = false;
 
     held = bql_locked();
     if (!held) {

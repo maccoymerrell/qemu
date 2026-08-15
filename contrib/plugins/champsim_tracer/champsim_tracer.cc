@@ -2978,17 +2978,23 @@ std::atomic<uint64_t> g_total_arch_insns{0};
  *
  *   R_g    = d(arch insns) / d(guest seconds)
  *       how many instructions the guest gets to retire per guest-second.
- *       This is the one that decides whether the guest can survive its own
- *       periodic tick: servicing a tick costs a roughly fixed number of guest
- *       INSTRUCTIONS, so the guest-time price of one tick is N_tick / R_g and
- *       the fraction of guest time spent in tick service is HZ * N_tick / R_g.
- *       At 1 the guest does nothing but service ticks and forward progress
- *       stops — the wedge.  R_g falls as UNPAUSED tracer overhead rises,
- *       which is precisely why the wedge is load-dependent.
+ *       Reported as insn_per_guest_s, and paired with the exact retired
+ *       count (segment_insns) so a consumer never has to invert the rate.
+ *
+ * WHAT R_g DOES NOT TELL YOU.  It is a rate, and no rate has ever been shown
+ * to select the system-mode stall this tracer can enter (the traced process
+ * alive in the kernel, retiring tens of millions of instructions without one
+ * user-space instruction).  Measured over the 3,838-cell wrong-path-necessity
+ * corpus, R_g in stalled captures is not depressed but slightly ELEVATED —
+ * p50 2.897M against 2.819M in healthy wrong-path captures (AUC 0.600), and
+ * higher again than the 2.404M of captures taken with the wrong path off
+ * (AUC 0.762).  A reader who expects the stalled cell to be the slow one by
+ * this number will not find it.  Use worst_user_stall, which counts
+ * architectural instructions and selects the condition exactly.
  *
  * WHY THIS IS NOT A CORRECTNESS KNOB.  Measurement is unconditional and
  * changes nothing the tracer emits.  The GATE is opt-in (CST_RT_GATE) and its
- * only power is to abort loudly — it can turn a silent multi-hour wedge into
+ * only power is to abort loudly — it can turn a silent multi-hour stall into
  * an immediate diagnosable failure, and it can never quietly capture less.
  */
 struct RtFactorGate {
@@ -3025,12 +3031,26 @@ struct RtFactorGate {
     /*
      * TICK TAX.  Instructions retired inside an asynchronous interrupt (the
      * periodic timer tick, and everything the scheduler does on the way out
-     * of it) versus instructions retired in total.  That ratio IS the
-     * fraction of its own time the guest spends servicing its tick, and the
-     * livelock condition is the ratio reaching 1: the guest returns from a
-     * tick with the next one already pending and never gets back to the
-     * workload.  Attributed per TB from the already-latched async decision,
-     * so it costs one compare and one add.
+     * of it) versus instructions retired in total, attributed per TB from
+     * the already-latched async decision, so it costs one compare and one
+     * add.  It answers one question — how much of what the guest retired
+     * was interrupt work — and it is a composition measure, not a health
+     * one.
+     *
+     * IT DOES NOT DETECT THE STALL, AND MUST NOT BE READ AS IF IT DID.  The
+     * saturation reading of this ratio — that the guest returns from a tick
+     * with the next already pending, the ratio reaches 1, and forward
+     * progress stops — is not what the corpus shows.  Over 3,838 marker
+     * cells the ratio never exceeded 0.794 in any cell of any arm, and in
+     * the stalled cells it sits at p50 0.689 against 0.703 in the healthy
+     * wrong-path cells: LOWER in the condition (AUC 0.215), because a
+     * stalled traced process is not in interrupt context at all, it is on
+     * the scheduler's context-switch path.  Two thirds of everything this
+     * fixture retires is interrupt work in EVERY cell of both arms, stalled
+     * or healthy, which is a property of a mostly-idle guest and not a
+     * symptom.  A sub-1 tick tax is therefore not evidence of health, and
+     * no threshold on it separates the two populations.  worst_user_stall
+     * is the field that does.
      */
     uint64_t async_insns = 0;
     uint64_t last_icnt   = 0;
@@ -8636,8 +8656,16 @@ bool collect_finalized_bbs(unsigned int cpu_index,
  * execution, so its host wall-clock cost must not be charged to guest time:
  * left unfrozen, a heavily traced guest timer-tick handler can cost more
  * guest time than one tick period, and the guest collapses into a
- * self-sustaining tick/scheduler storm (context-switch storm, RCU-kthread
- * starvation, zero foreground progress — the x86 system-mode livelock).
+ * self-sustaining tick/scheduler storm — the mechanism this guard was
+ * written to close, and it is closed.
+ *
+ * It is not a general account of guest stalls, and must not be read as one.
+ * The freeze is in force in every capture taken since, including every
+ * capture that has shown the system-mode stall condition, so a stall
+ * observed with this guard in place is a DIFFERENT mechanism and its cause
+ * is elsewhere.  Reasoning that begins "the tracer is expensive, therefore
+ * the guest stalls" does not survive that fact.
+ *
  * Nestable and composes with the wrong-path vtime pause; no-op in user mode.
  */
 struct VClockPauseGuard {

@@ -541,12 +541,22 @@ from the rate beside it; see the stall-condition section below for what
 that reconstruction costs.
 
 ``ticktax`` is the fraction of retired guest instructions spent inside
-asynchronous interrupts; at 1.0 the guest can make no progress at all.
-``worst_user_stall`` is the largest number of instructions the guest
-retired without the traced process executing a single user-space
-instruction — the healthy value on the canonical cell is tens of
-thousands.  ``stall_detector=INERT`` means the user-instruction clock
-never moved inside the segment, so nothing was watching.
+asynchronous interrupts.  It describes what the guest retired, not
+whether the guest is healthy, and it does **not** select the stall
+condition: across 3,838 marker cells the ratio never exceeded 0.794, and
+in the stalled cells it reads *lower* (p50 0.689) than in healthy ones
+(p50 0.703).  On this fixture two thirds of everything the guest retires
+is interrupt work in every cell, stalled or not, because the guest is
+otherwise idle.  Read it to understand a trace's composition; do not
+read a value below 1.0 as a clean bill of health.
+
+``worst_user_stall`` is the field that selects the condition: the largest
+number of instructions the guest retired without the traced process
+executing a single user-space instruction — the healthy value on the
+canonical cell is tens of thousands, and a stalled capture reads millions
+to hundreds of millions.  ``stall_detector=INERT`` means the
+user-instruction clock never moved inside the segment, so nothing was
+watching.
 
 Environment knobs (all detection only; none changes what is traced):
 

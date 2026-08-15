@@ -23,15 +23,22 @@
  * Both numbers are measured, not guessed (cst_runs/fence, 304 contended
  * marker cells on the devio fixture): a healthy capture's worst stall is
  * 2.2e5 architectural instructions (the fsync path, measured by the
- * user_clock_worst_stall counter this ceiling shares), while cells that hit
- * the tick-saturation treadmill stall for tens of millions and STILL
- * recover — the largest recovery observed was 1.25e8 instructions, while
- * the cells that never recovered were still stalled at 1.6e8 when their
+ * user_clock_worst_stall counter this ceiling shares), while cells that
+ * enter the stall condition stall for tens of millions and STILL recover —
+ * the largest recovery observed was 1.25e8 instructions, while the cells
+ * that never recovered were still stalled at 1.6e8 when their
  * 900-second cap ended them.  The ceiling is set at twice the largest
  * recovery on record (~1200x anything healthy), so it does not truncate a
  * capture that would have finished, and it ends the case that otherwise
  * never would.  The warning level is where an operator wants to
  * know a stall is developing, long before the ceiling acts.
+ *
+ * The bound is what is measured here; the condition's MECHANISM is not
+ * settled and no name for it is asserted in this file.  Tick saturation
+ * specifically is ruled out as the selector: the tracer's own tick-tax
+ * ratio is LOWER in the stalled cells than in healthy ones (see the TICK
+ * TAX note in champsim_tracer.cc).  A ceiling is a termination bound and
+ * carries no theory of what it is bounding.
  */
 #define CST_STALL_CEILING_DEFAULT 256000000ull
 #define CST_STALL_WARN_DEFAULT     32000000ull

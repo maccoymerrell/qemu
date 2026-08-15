@@ -1579,9 +1579,21 @@ static const char *sdiff_cpu_field(size_t off)
     if (off == offsetof(CPUState, plugin_spec_timer_dirty)) {
         return "plugin_spec_timer_dirty (consumed by the excursion-exit resync)";
     }
+    /*
+     * The TLB log AND NOTHING PAST IT.  This range used to run to
+     * offsetof(CPUState, neg), which is not the plugin block: past the log's
+     * own overflow flag it swallowed plugin_spec_absent,
+     * plugin_spec_mem_faulted, cpu_index, tcg_cflags, halted,
+     * exception_index and iommu_notifiers, and printed every one of them
+     * with the word "intentional" beside it.  tcg_cflags is the reason this
+     * matters: curr_cflags() reads it and it selects the TB the correct path
+     * looks up, so a perturbation there is a retranslate-forever shape that
+     * this detector was reporting as expected noise.  A name is a claim that
+     * a difference is understood; it must cover only what it names.
+     */
     if (off >= offsetof(CPUState, plugin_spec_tlb_log) &&
-        off <  offsetof(CPUState, neg)) {
-        return "(plugin_spec_tlb_log/plugin block - intentional)";
+        off <= offsetof(CPUState, plugin_spec_tlb_log_overflow)) {
+        return "(plugin_spec_tlb_log - intentional)";
     }
     if (off >= offsetof(CPUState, neg)) {
         return "(neg/TLB)";

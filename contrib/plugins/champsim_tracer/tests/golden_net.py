@@ -998,8 +998,27 @@ def canon_user_slice(build: Path, cst: Path) -> str:
 
 # --- system recipe runner ---------------------------------------------------
 def _set_vmem():
-    resource.setrlimit(resource.RLIMIT_AS, (SYS_VMEM_KB * 1024,
-                                            SYS_VMEM_KB * 1024))
+    """Cap the child's address space, clamped to whatever cap we inherited.
+
+    The cap is a ceiling, never a raise.  A caller that already runs under a
+    TIGHTER limit — ``ulimit -v 16777216`` is the standing p1 cell shape — has
+    set both the soft and the hard RLIMIT_AS, and raising a hard limit needs
+    CAP_SYS_RESOURCE.  Asking for the full ``SYS_VMEM_KB`` there raises EPERM
+    inside the preexec_fn, which surfaces in the parent as SubprocessError and
+    ends the run: a harness failure that reads as a failed check.  Clamping
+    keeps the tighter outer cap (the correct semantic — the outer limit wins)
+    and lets the child run.
+    """
+    want = SYS_VMEM_KB * 1024
+    try:
+        _soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        if hard != resource.RLIM_INFINITY:
+            want = min(want, hard)
+        resource.setrlimit(resource.RLIMIT_AS, (want, hard))
+    except (ValueError, OSError):
+        # Could not set any cap.  The run is still valid — the cap is a
+        # guard rail, not a measurement — so do not fail the child for it.
+        pass
 
 
 def sys_assets(freeze: bool):

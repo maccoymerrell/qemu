@@ -109,8 +109,18 @@ class BlockGT:
 # Symbol table helpers
 # ---------------------------------------------------------------------------
 
-def _collect_block_symbols(binary) -> dict[str, tuple[int, int]]:
-    """Return { sym_name: (address, size) } for all `blk_*` symbols.
+def _collect_block_symbols(binary,
+                           wanted: "set[str] | None" = None
+                           ) -> dict[str, tuple[int, int]]:
+    """Return { sym_name: (address, size) } for the generator's block
+    symbols.
+
+    @wanted names the exact symbols to collect — the metadata's own
+    ``sym_name`` set.  That is what lets a namespaced image (the
+    multi-thread oracle links N bodies whose symbols carry a ``tK_``
+    prefix) be analyzed with the same code path: the meta already knows
+    which names are its own.  Without it the collector falls back to the
+    single-thread convention, every ``blk_*`` symbol in the image.
 
     LIEF's Symbol.size is often 0 for labels placed via inline asm; we
     treat size 0 as "span up to next block symbol".
@@ -118,7 +128,12 @@ def _collect_block_symbols(binary) -> dict[str, tuple[int, int]]:
     out: dict[str, tuple[int, int]] = {}
     for sym in binary.symbols:
         name = sym.name
-        if not name or not name.startswith("blk_"):
+        if not name:
+            continue
+        if wanted is not None:
+            if name not in wanted:
+                continue
+        elif not name.startswith("blk_"):
             continue
         out[name] = (int(sym.value), int(sym.size))
     return out
@@ -145,13 +160,20 @@ def _section_for_pc(binary, pc: int):
 def analyze(binary_path: Path, meta_path: Path) -> Path:
     """Disassemble `binary_path`, annotate `meta_path` with ground
     truth, and write it back in place.  Returns `meta_path`.
+
+    A metadata file that carries ``mt_sym_prefix`` describes one thread of
+    a multi-thread stitched image: its block and helper symbols were
+    namespaced at link time, so the lookups below are driven by the
+    metadata's own names rather than the bare single-thread convention.
     """
     meta = json.loads(meta_path.read_text())
     classifier = get_classifier()
     binary, md, _ = classifier.make_capstone(binary_path)
     isa = meta["isa"]
+    sym_prefix = str(meta.get("mt_sym_prefix", "") or "")
 
-    syms = _collect_block_symbols(binary)
+    wanted = {b["sym_name"] for b in meta["blocks"] if b.get("sym_name")}
+    syms = _collect_block_symbols(binary, wanted or None)
 
     # For computing each block's end_pc we need the *next address that
     # belongs to a different function/symbol*, not just the next blk_
@@ -291,8 +313,9 @@ def analyze(binary_path: Path, meta_path: Path) -> Path:
     # of each direct_call / indirect_call visit when computing the
     # WP-budget trim point.
     leaf_n = 0
+    leaf_name = f"{sym_prefix}wptgen_leaf"
     for sym in binary.symbols:
-        if sym.name == "wptgen_leaf":
+        if sym.name == leaf_name:
             leaf_addr = int(sym.value)
             leaf_size = int(sym.size)
             sec = _section_for_pc(binary, leaf_addr)

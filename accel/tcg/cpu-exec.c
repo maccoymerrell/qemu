@@ -2319,6 +2319,38 @@ void cpu_plugin_spec_vtime_pause(CPUState *cpu)
      * cpu_plugin_arch_state_restore — is target-specific.  The cure belongs
      * at the dispatching seam, which must not hold the BQL across a plugin
      * callback; nothing about the hold below makes an excursion safe.
+     *
+     * WHAT THE HOLD IS FOR NOW, which is not what it was added for.  Both of
+     * the reasons above have been paid off elsewhere.  The unbalanced
+     * disable/enable is gone: cpu_plugin_ticks_freeze() arbitrates the one
+     * cpu_ticks_enabled through a reference count, so the pair cannot be left
+     * astray by a peer.  The oscillator split is gone too -- c1657092ce made
+     * cpu_get_ticks() a fixed affine function of cpu_get_clock(), so the TSC
+     * and QEMU_CLOCK_VIRTUAL stop and restart together by construction and
+     * the guest's TSC-vs-HPET watchdog has nothing left to find.  And the
+     * AB/BA cycle the paragraph above describes is closed at its seam, by the
+     * BQL drop around the shutdown dispatch in plugins/system.c.
+     *
+     * What keeps the hold here is a third property nobody set out to buy: on
+     * x86 it is the only thing that keeps a guest-visible timer callback out
+     * of an excursion window.  A plugin freeze stops the clock's VALUE and
+     * leaves its PROCESSING running, so an iothread that is free to take a
+     * virtual timerlist pass mid-excursion evaluates deadlines against a
+     * clock that is not moving and enters the callbacks it finds due --
+     * inside the window, on the wrong path's watch.  Holding the BQL from
+     * pause to resume is what denies it that pass.  Measured on the x86_64
+     * system marker cell with --devio-probe 256, counting callbacks ENTERED
+     * while an excursion was open: none at all with the hold, in 24 of 24
+     * boots; 27 to 73 per boot without it, in 24 of 24, every one of them on
+     * a thread other than the excursion's own -- over 5.97M and 5.99M
+     * excursions respectively, so the arms are matched and the zero is the
+     * hold's doing rather than an arm that did not run.
+     *
+     * So this is not spare belt-and-braces to be removed for tidiness.  Until
+     * the guest-visible-clock stall in util/qemu-timer.c is wired to that same
+     * reference count -- it is written, and it has no caller yet -- removing
+     * the hold does not give a lock back, it admits the event class the
+     * wrong-path boundary exists to exclude, and admits it on x86 only.
      */
 #if defined(TARGET_I386)
     {

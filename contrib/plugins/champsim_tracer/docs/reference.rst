@@ -1303,8 +1303,10 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
      - Termination bound for a system-mode capture whose traced process
        stops running (killed, blocked, never scheduled).  Counts guest
        instructions retired in ANY context since the pinned user clock
-       last advanced; on crossing, the segment is closed through the end
-       marker's own path — finalised and truncated, close line
+       last advanced; on crossing, the segment is closed where the guest
+       stands — unlike the end marker's close this one cannot wait for a
+       block boundary, because no boundary is coming is the very
+       condition it fires on — finalised and truncated, close line
        ``CEILING``, ``any-context stall closes`` in the statistics.
        Architectural, so it is load-invariant; see :doc:`quickstart` for
        what that means in wall-clock.  ``0`` disables it, and a marker or

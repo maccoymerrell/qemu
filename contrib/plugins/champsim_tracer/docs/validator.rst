@@ -258,25 +258,36 @@ Sub-commands
    every instruction's byte encoding, and the END sequence's
    encoding is fixed by ``champsim_marker.h`` (parsed, not
    restated), so the sequence is located in the trace's own template
-   bytes.  A partial witness — the close typically cuts the marker
-   block short — is placed by contradiction against the known
-   neighbouring bytes, and an ambiguous placement fails loudly
-   rather than guessing.  The final user entry must then stop at the
-   firing instruction (stash path) or one instruction earlier
-   (direct-cursor path, the one licensed retired-but-unobserved
-   tail); publishing the firing instruction, or stopping any
-   earlier, fails.
+   bytes.  A partial witness — a capture that stopped inside the
+   sequence — is placed by contradiction against the known
+   neighbouring bytes, with a structural prefix tie-break for the
+   pair-encoded markers (any close removes a *suffix*, so the true
+   placement's witnessed slots start at slot 0 with no hole), and an
+   ambiguous placement fails loudly rather than guessing.
+
+   The cell then asserts the deferred-close contract of
+   :doc:`format` §4.2a on the final user entry: it is the WHOLE
+   sealed block the marker fired inside — ``bb_stop`` equal to the
+   template's ``num_insns``, the block ending at its own terminating
+   branch, and the firing instruction inside the published range —
+   and the close billed exactly what it published (``user insns
+   actually executed`` == ``user insns emitted to the wire``, read
+   from the run's own ``stats.log``).  A truncated final entry, an
+   entry for a block *after* the marker's own, an unterminated block,
+   a billed/published mismatch, and a missing stats pair each fail.
 
    ``--selftest`` proves each assertion rejects its falsifier (the
    pre-range merged/overshooting shape, a lost REP iteration, an
    unwitnessed marker) on synthetic fixtures — including both
    ``thread_end`` falsifiers (a context's final entry missing the
-   stamp; a stamp lying mid-stream) and both END-marker derivation
+   stamp; a stamp lying mid-stream), all three END-marker derivation
    directions (a full byte-witnessed sequence; a single-instruction
-   witness placed by contradiction).  The live cells are the
-   acceptance harness for split emission: a writer that still
-   merges, overshoots, or drops retired REP iterations fails them by
-   design.
+   witness placed by contradiction; a pair-encoded partial witness
+   resolved by the prefix rule, against a genuinely ambiguous pair
+   that must be refused), and all four ``marker_end`` directions
+   above.  The live cells are the acceptance harness for split
+   emission: a writer that still merges, overshoots, or drops
+   retired REP iterations fails them by design.
 
 ``plugin_load``
    Proves the built plugin can be **loaded**, not merely linked.  A

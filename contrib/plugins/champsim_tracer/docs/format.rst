@@ -1593,23 +1593,40 @@ instruction the range names has its complete memops and its complete
 post-execution register state, and the entry asserts nothing whatever
 about instructions outside the range.
 
-The END marker is the case where this rule is normative rather than
-merely mechanical.  A marker-mode segment's last entry MUST NOT carry
-the instruction that fired the END marker inside its range, nor any
-instruction after it in the block: the marker is a *position* the guest
-placed to end the region of interest, so the firing instruction and its
-successors are outside what the trace may claim.  The firing
-instruction is also unobservable in the mechanical sense — the close
-runs from inside its own execution callback, before its destinations
-are readable — so the writer's stop rule lands the range's exclusive
-``bb_stop`` at the firing instruction, or one instruction earlier when
-that last retired instruction's results were never captured either.
-Both stop points are conforming; anything past the firing instruction
-is a wire defect.  The block containing the marker is therefore
-normally left unterminated, and its entry is a partial one — which is
-exactly what this section exists to express.  A reader that needs the
-marker's own position finds it as the first instruction of the
-sequence, whose bytes the templates section carries.
+.. _fmt-end-marker-range:
+
+The END marker is the one stop where this section is normative rather
+than merely mechanical, and what it requires is a **whole block**.  A
+marker-mode segment's close is deferred to the end of the true BB the
+marker fired inside, so the entry publishing that block publishes it
+COMPLETE: ``bb_stop`` equals the template's ``num_insns``, the block is
+sealed at its own terminating branch, and the firing instruction
+together with its block-mates reaches the wire carrying its memory
+operands, its register deltas where the trace carries register data,
+and the block's resolved branch outcome.  It is an ordinary entry,
+produced by the ordinary seal.  In a single-context capture it is the
+segment's last entry.
+
+The marker's *position* is carried INSIDE that block rather than by the
+range.  A consumer that needs it locates the END sequence in the
+template's own instruction bytes — ``insn_bytes`` (§6), and the
+sequence's encoding is fixed by the marker contract — and reads the
+region of interest as ending at that index.  The instructions at and
+after it are the tail of the final block: on the wire because the block
+is published whole, and outside the region the marker delimits.  What
+ran and where the region ends are two different statements, and the
+format carries both rather than collapsing them into one number.
+
+Truncating the final entry at the firing instruction is therefore NOT
+conforming.  It publishes a block the guest sealed as one that was
+never finished, discards the observations of instructions that
+demonstrably executed, and expresses a position the templates section
+already carries — buying nothing, at the cost of an unterminated
+terminal block and a segment whose final entry is partial for no
+architectural reason.  A final entry on this route whose ``bb_stop`` is
+less than its template's ``num_insns``, or whose block is not
+branch-terminated, means the close landed mid-block: a wire defect, not
+a licensed stop point.
 
 A block interrupted and later resumed produces one entry per stretch,
 each naming the same ``template_id``:

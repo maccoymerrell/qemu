@@ -145,18 +145,23 @@ struct Stats {
      * sit behind `if (!g_seg_end_marker_close)` while the drop itself ran
      * unconditionally, so on a marker-window trace — where the segment
      * ALWAYS closes on the END marker — the counter was structurally unable
-     * to observe the one drop that happens on every single run.  A reader
-     * who saw 0 concluded "nothing was dropped" and was wrong.  The
-     * end-marker-close subset is still separable, below, but it is no longer
-     * separable from the total by being invisible. */
+     * to observe drops taken on that route at all.  A reader who saw 0
+     * concluded "nothing was dropped" and had no way to be right or wrong.
+     * The end-marker-close subset is still separable, below, but it is no
+     * longer separable from the total by being invisible — which is what
+     * makes today's zero worth reading. */
     uint64_t reg_snap_slice_dropped = 0;
     /* Subset of reg_snap_slice_dropped taken while the segment was closing
-     * on the guest's END marker.  Attribution only — an END-truncated block
-     * loses its tail dst snaps because the marker exits the process before
-     * the block's later instructions run, which is a real loss of register
-     * deltas from an entry the trace still emits at full n_insns.  Counted
-     * apart so the "expected" case can be told from a capture bug without
-     * either of them being silent. */
+     * on the guest's END marker.  Attribution only, and its expected value
+     * is now ZERO: the END close is deferred to the boundary of the block
+     * the marker fired inside, so that block's later instructions DO run
+     * and their dst snaps are taken by the ordinary dispatch prologue —
+     * there is no truncated tail left for the emit to drop.  (Measured 0
+     * on the system marker cell of all four ISAs.)  The bucket stays
+     * because that is a claim an instrument should carry rather than a
+     * reader assume: if a future close ever lands mid-block on this route
+     * again, the drop it causes is named here instead of being averaged
+     * into the total. */
     uint64_t reg_snap_slice_dropped_end_close = 0;
     /* How many RegSnap values those drops actually threw away.  The event
      * count above says a slice was lost; this says how much register delta

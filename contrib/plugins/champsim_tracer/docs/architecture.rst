@@ -831,9 +831,19 @@ load-bearing — under ``exec_lock``:
     branch, wrong path.  The slot at that point holds the *next*
     dispatching TB, which the flush must not walk, so the deferred
     window close passes ``flush_final(walk_prev=false)`` and finalizes
-    the in-flight chain only.  The closes the guest's own progress
-    raises — process exit, the END marker, the dead-latch sweep — all
-    fire on a TB that has run, and walk the slot as usual.
+    the in-flight chain only.
+
+    The **END marker** defers to a true-BB boundary too, and for the
+    same reason, but it needs no second armed step: the marker fires
+    from inside its own instruction's callback, so its block has
+    already begun executing when the arm is raised, and the first
+    boundary the arm survives to *is* that block's own.  One armed step
+    more would put a block past the END on the wire.  See
+    :ref:`unsealed-at-close` for the ruling and its reason.
+
+    The closes the guest's own progress raises where it stands —
+    process exit, the dead-latch sweep, the stall ceiling — cannot
+    defer: they fire on a TB that has run, and walk the slot as usual.
 
 **The seal walk** (``collect_finalized_bbs``; shared by the per-step
 seal, the fault-continuation seal, and the segment-final flush) walks the
@@ -1052,9 +1062,9 @@ observations are complete, and discards only per-instruction state
 that no emitted range claims.  Its pieces:
 
 * **A close landing mid-step** (between ``step_events``' promote and
-  ``step_seal`` — where the END-marker close and the deferred icount /
-  simpoint close both land) holds a block that has just finished
-  executing: its extent was measured and its tail destination snaps
+  ``step_seal``, or at the top of a step before its promote — where the
+  stall ceiling and the dead-latch sweep fire) holds a block that has
+  just finished executing: its extent was measured and its tail destination snaps
   captured by that very dispatch's prologue.  It is emitted at that
   extent; the seal that would have resolved its terminating branch
   never ran, so the branch is declared unresolved
@@ -1068,10 +1078,11 @@ that no emitted range claims.  Its pieces:
   but its snapshot was never taken — its successor never began — so
   the stop excludes it; the machine-shutdown close additionally
   excludes the instruction in flight at the close, which began and did
-  not retire.  The deferred icount / simpoint close's slot holds the
-  TB dispatching *now* — extent zero, so nothing is emitted; that
-  close waits a step precisely so the budget-crossing TB seals
-  normally first (step 6 above).
+  not retire.  The **deferred** closes — the icount and simpoint
+  budgets and the END marker — never reach this case: their slot holds
+  the TB dispatching *now*, extent zero, so nothing is emitted, and the
+  block each was armed on has already been emitted whole by that step's
+  ordinary seal (step 6 above).
 * **Fault-ledger entries** are forgotten: their prefixes are already
   on the wire, so a close loses only the pending continuations'
   identities, never instructions.
@@ -1087,9 +1098,11 @@ equals what it publishes at every close — an instruction the close
 could not fully observe is outside the range, off the wire, and off
 the clock alike.
 
-The close does not land on a block boundary.  The END marker fires from
-inside an instruction callback part-way through its own block, and a
-ceiling or a guest death can stop execution anywhere.  The scoreboard's
+A close does not always land on a block boundary.  The deferred ones
+do — the icount and simpoint budgets and the END marker each wait for a
+true-BB boundary — but a ceiling, a machine teardown or a guest death
+stops execution wherever the guest happens to be, and those are the
+closes this walk exists for.  The scoreboard's
 ``prev_start_pc`` resolves the last-executed *fragment* and says nothing
 about how far into it the guest got, so the walk asks the
 per-instruction architectural clock (``VCPUScoreBoard::insn_started``,
@@ -1139,7 +1152,7 @@ nobody named — which is how the departure producer was found (a two-thread
 ``-smp 2`` system cell minted one template with every other producer at
 zero).
 
-Two close regimes, and only one of them can leave work unsealed:
+Two close regimes, and neither of them leaves work unsealed:
 
 *Target-reached closes* — an icount or simpoint budget, and the SMP
 peer flushes that ride with them.  These defer by a whole dispatch
@@ -1150,47 +1163,57 @@ an ``-smp 2`` two-thread system cell and an ``-smp 4`` multi-process
 churn cell, both closing ``OK`` at budget with ``clock_minus_wire=0``.
 
 *Terminal closes* — the guest ending (user mode) and the END marker
-(system mode).  The stopping instruction is *inside* a block by
-construction, and the block containing it has no continuation to seal
-with, so each context stopped that way contributes exactly one unsealed
-block.  Measured 1 on every single-thread cell — user ``all`` and system
-marker, all four ISAs.  The block each one names is the stopping
-instruction's own: in user mode ``mov $60, %rax; xor %rdi, %rdi;
-syscall`` and its per-ISA equivalents — the exit syscall, whose
-``syscall`` begins and never returns; in system mode the first
-instruction of the END sequence, where the END ruling terminates the
-tracer.
+(system mode).  The stopping instruction is *inside* a block on both
+routes by construction, and both close that block out anyway, by two
+different mechanisms:
 
-A two-thread user cell reads **2**, one per thread, and the trace names
-both: the child's block is ``mov $60, %rax`` (``exit``) and the parent's
-is ``mov $231, %rax`` (``exit_group``), each cut before its own
-``syscall``.  That is not N-1: the N-1 shape assumes one thread reaches
-the stopping target and keeps executing until its block seals, and on
-this route no thread does — every thread ends inside its own exit
-syscall.
+* The exiting program's last block ends at its own **terminator**.  A
+  ``syscall`` *is* a branch terminator, so ``mov $60, %rax; xor %rdi,
+  %rdi; syscall`` and its per-ISA equivalents are architecturally
+  complete the moment the syscall retires — there is no successor
+  dispatch coming and none is needed.  ``close_seal_at_terminator``
+  asks exactly that question (every instruction of the chain retired,
+  last fragment ``TB_TERMINUS_COMPLETE``, the slot is this vCPU's
+  current dispatch) and captures the terminator's own destination
+  snaps, so the block is sealed with its register slice whole rather
+  than cut one instruction short of the syscall that ended the program.
+* The END marker's block ends at a **boundary the close waits for**.
+  The marker fires from inside its own instruction's callback, so its
+  block has begun and has not finished; the close is therefore deferred
+  — ``marker_close_and_exit`` raises the arm, ``run_deferred_window_closes``
+  takes it at the first step tail with no in-flight chain, which
+  (because the arm went up *after* the marker's block began) is that
+  block's own boundary, however many TBs it spans and whether it ends
+  at a TB edge or a mid-TB branch.  By then the ordinary seal walk has
+  emitted the block whole.
 
-So the bound is: **one unsealed block per context the close stops
-mid-block, and zero for a close whose stopping point was deferred to a
-block boundary.**  A count above that on a target-reached route is a
-defect, not a corner: it means a thread was cut off at a stopping point
-the tracer could have deferred past.
+Measured **0** on every cell: user ``all`` and system ``all --system
+--marker`` on x86_64, aarch64, riscv64 and mipsel, plus a two-thread
+user cell.  On the four marker cells ``user insns actually executed``
+equals ``user insns emitted to the wire`` (327, 378, 542, 547) with
+``unpublished insns unbilled at the close`` 0 — billed is published,
+and the block that made it so is the marker's own, on the wire entire.
 
-On the terminal routes the count of one is not a defect to drive out;
-it is the shape of a stop that lands mid-block, and **the END marker
-must not defer past it**.  A budget can wait for the crossing block to
-seal because a budget is a quantity — where it lands in the instruction
-stream carries no meaning.  A marker is a *position*: the guest placed
-it to say "the region of interest ends here", so every instruction from
-the firing one onward is outside what the workload asked to be traced.
-Running the block out to seal it publishes them — on the x86_64 marker
-cell the marker sits in a function whose remaining instructions are its
-own epilogue, and a deferred close put the second and third marker
-instructions plus ``nop; pop %rbp; ret`` (with the ``ret``'s stack load)
-on the wire, past the marker that ended the region.  The unsealed block
-is the honest price of stopping where the guest said to stop, and the
-declared executed range (:doc:`format` §4.2a) is the format's way of
-saying so.  The instrument answers "how many, whose, and stopped by
-what"; the policy is this.
+The A/B against a synchronous END close is where the bound is legible.
+Taking the same four marker cells with the close made synchronous
+again, each publishes five instructions fewer (322, 373, 537, 542 —
+the tail of the marker's own block), ``unsealed true-BBs sealed at a
+close`` reads **1** on all four, and ``cut-short block templates
+minted`` is one higher on each.  Billed still equals published there,
+which is the point worth keeping: that identity holds on both sides
+and so cannot be what decides between them — it says the close was
+honest about what it kept, never that it should have kept less.  The
+residue the deferral does not touch is aarch64's, whose cut-short
+count falls 3 → 2 rather than to zero; the one it removes is the END
+close's, and the remaining two are minted elsewhere in that boot.
+
+So the bound is: **zero unsealed blocks at any close whose stopping
+point is a block boundary or a block's own terminator, and one per
+context only where a close stops a thread that has neither** — the
+stall ceiling, a machine teardown, a guest death, where by
+construction no boundary is coming.  A count above that is a defect,
+not a corner: it means a thread was cut off at a stopping point the
+tracer could have deferred past or sealed at.
 
 The stop rule is also what keeps the final block's register deltas
 complete.  A destination snapshot is captured one instruction late
@@ -1201,6 +1224,45 @@ means every instruction inside the emitted range has its complete
 memops and its complete post-execution register state — the range is
 short of what retired by at most the one unobservable boundary
 instruction, and it asserts nothing about it.
+
+.. _end-defers-ruling:
+
+The END marker defers: the ruling
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+**Settled 2026-08-15.**  The maintainer's words: *"resolving the END
+marker, we SHOULD delay closure until the end of the block once we see
+it."*  It is recorded here, with its reason and its date, because this
+section once left the policy open and a later reader took the silence
+for a decision and reverted the behaviour to match the stale prose.
+
+The reason is the one this whole section is built on — *blocks are
+always closed out where it is in our power* — and at an END it is in
+our power.  The marker's block is already executing when the arm goes
+up, so waiting for its boundary costs no extra step and buys a sealed
+terminal block carrying its memory operands, its register deltas and
+its resolved terminating branch, exactly like every other entry.  A
+trace whose final block is left unterminated for no architectural
+reason is the defect; the deferral is what prevents it.
+
+An END marker is a position as well as a stop, and the wire carries
+both facts without collapsing one into the other.  The block is
+published whole, and the marker's own index *inside* it is recoverable
+from the template's instruction bytes — which is where a consumer reads
+"the region of interest ends here" (:doc:`format` §4.2a).  Truncating
+the entry at the marker would express that position by destroying the
+block, and would discard the observations of instructions that
+demonstrably ran; the format asks the consumer to read a published
+position, not the writer to manufacture an unsealed block.
+
+The deferral stops at the marker's own block and not one block later.
+The arm takes at the FIRST boundary it survives to and deliberately
+needs no second armed step — the budget close's second step exists
+because its crossing TB has not run yet, and the marker's block has —
+so nothing after the END marker's block reaches the wire.  ``range_cells``
+``marker_end`` asserts all of it on the wire (whole sealed block, END
+inside the published range, billed == published) and rejects the
+truncated shape as its falsifier.
 
 .. _template-lifetimes:
 
@@ -1698,7 +1760,9 @@ itself stays.
 A workload shorter than its budget emits the **end marker** (the
 same sequence shape, built on ``CST_MARKER_END_MAGIC``) just before
 it exits.  Executed in the pinned address space, it closes the
-window at that point — the "budget *or* program end" stop.  Closing
+window there — the "budget *or* program end" stop — at the end of
+the true BB the marker fired inside, so that block reaches the wire
+whole (:ref:`end-defers-ruling`).  Closing
 at the marker rather than at process teardown matters because a
 freed ASID can be reused by another process and silently re-match
 the pin; the finish line reports ``END`` rather than an underrun.

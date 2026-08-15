@@ -408,8 +408,10 @@ plugin sees its argv.
    user clock last advanced — kernel work, other processes, the idle task
    — sampled before the gates that drop foreign and asynchronous blocks,
    because a guest whose traced process is gone executes nothing else.
-   When it is crossed the segment is closed through the end marker's own
-   path: the trace is **finalised and truncated**, never abandoned, and
+   When it is crossed the segment is closed where the guest stands —
+   there is no block boundary coming, which is the very condition the
+   ceiling names, so unlike the end marker's close this one cannot
+   defer: the trace is **finalised and truncated**, never abandoned, and
    the close says so — the segment's own close line ends in ``CEILING``,
    the statistics report carries ``any-context stall closes``, and a
    banner names the ceiling and the option that changes it.
@@ -440,7 +442,9 @@ cannot end itself, and the first is the one to design a run around:
    machine goes down — a guest ``poweroff``, a reset under ``-no-reboot``,
    a monitor/QMP request, or ``SIGINT``/``SIGTERM`` to QEMU.  The close
    happens while the machine is still assembled and on a vCPU thread, so
-   the trace is finalised exactly as an end marker would finalise it; the
+   the trace is finalised and complete rather than abandoned — though,
+   unlike the end marker's close, it stops the guest wherever the
+   shutdown found it rather than at a block boundary; the
    close line ends in ``SHUTDOWN`` and the statistics report carries
    ``closed by machine shutdown``.  This is always armed and needs no
    option.

@@ -11,16 +11,16 @@ wire contract requires at a specific capture boundary:
                     budget: the sum of every entry's ``stop - start``
                     equals the stated stop, and the final entry declares
                     the partial range that makes it exact;
-  ``marker_end``    the END marker terminates the tracer mid-block: the
-                    final user entry stops AT the END marker — the close
-                    fires from inside the firing instruction's execution,
-                    so the published range excludes it, stopping either
-                    exactly at the firing instruction (stash path, tail
-                    snap captured) or one retired-but-unobserved
-                    instruction earlier (direct-cursor path); the
-                    END-marker pcs are DERIVED from the trace's own
-                    template bytes (the champsim_marker.h contract),
-                    an existing carrier, not a new meta field;
+  ``marker_end``    the END marker terminates the tracer at the end of
+                    the block it fired inside: the final user entry is
+                    that block WHOLE — ``bb_stop == num_insns``, sealed
+                    at its own terminating branch, with the firing
+                    instruction inside the published range — and the
+                    close bills exactly what it published (executed ==
+                    emitted).  The END-marker pcs are DERIVED from the
+                    trace's own template bytes (the champsim_marker.h
+                    contract), an existing carrier, not a new meta
+                    field;
   ``rep_split``     a REP invocation interrupted mid-flight by a kernel
                     excursion keeps its fan-out intact: iteration
                     entries appear on both sides of the excursion and
@@ -340,60 +340,106 @@ def derive_end_marker_pcs(tby: dict, isa: str) -> tuple[list[int] | None, str]:
 
 
 def assert_marker_end(entries: list[dict], tby: dict,
-                      seq_pcs: list[int]) -> tuple[bool, str]:
-    """The final user entry stops AT the END marker.  The close fires
-    from inside the firing instruction (the sequence's last), so the
-    published range always excludes it; the S18 stop rule licenses
-    exactly two stop points (``bb_stop`` counts fully-OBSERVED
-    instructions, not retired ones):
+                      seq_pcs: list[int],
+                      billing: tuple[int, int] | None = None
+                      ) -> tuple[bool, str]:
+    """The final user entry is the WHOLE SEALED BLOCK the END marker
+    fired inside.
 
-      * the firing instruction itself — stash path, the last retired
-        instruction's results were snapped;
-      * one instruction earlier — direct-cursor path, the last retired
-        instruction's results were never observable and it is excluded
-        too.
+    THE RULING (2026-08-15, maintainer): on seeing an END the close is
+    DEFERRED to the end of the marker's own true BB, so the ordinary
+    seal walk emits that block like every other entry.  Blocks are
+    always closed out where it is in our power, and here it is: the
+    marker's block has already begun executing when the arm is raised,
+    so the first true-BB boundary the arm survives to is that block's
+    own.  What the wire therefore carries at the end of a marker-mode
+    segment is a COMPLETE entry, not a partial one.
 
-    Anything past the firing instruction published its execution (the
-    pre-range overshoot); anything earlier than the one licensed
-    unobserved-tail instruction under-published what retired."""
-    if len(seq_pcs) < 2:
-        return False, "END-marker sequence must carry >= 2 pcs"
-    firing, before = seq_pcs[-1], seq_pcs[-2]
+    Four things are asserted of it, all on the same entry:
+
+      * ``bb_stop == num_insns`` — the block is published whole.  A
+        range that stops short is the pre-ruling truncation: the close
+        landed mid-block after all;
+      * the block is sealed at its own terminating branch — it ran out
+        to its terminator rather than being cut at a TB edge;
+      * the END firing instruction lies INSIDE the published range.
+        This is what makes it the marker's own block and not some
+        later one: an entry past the marker's block would mean the
+        close ran on after the boundary it was armed for;
+      * the close billed exactly what it published (@billing is
+        ``(user insns actually executed, user insns emitted to the
+        wire)`` from the run's ``stats.log``; they must be equal).
+
+    The marker's POSITION is carried inside the block, at the index
+    where the sequence starts, and a consumer reads the region of
+    interest as ending there — see :doc:`format` §4.2a.  Publishing the
+    block whole is what lets it: the instructions after the marker are
+    on the wire with their memory operands, their register deltas and
+    the block's resolved terminating branch, and the reader is the one
+    that decides where the region stops.
+
+    @billing is REQUIRED.  A cell that cannot find the two rows cannot
+    judge the identity and must fail rather than pass on silence."""
+    if not seq_pcs:
+        return False, "END-marker sequence carries no pcs"
+    firing = seq_pcs[-1]
+    marker_start = seq_pcs[0]
     last_user = None
     for e in entries:
         if not _is_sys(e, tby):
             last_user = e
     if last_user is None:
         return False, "no user entries decoded"
-    t = tby.get(last_user["template_id"]) or {}
+    tid = last_user["template_id"]
+    t = tby.get(tid) or {}
     ins = t.get("insns") or []
     start, stop, n = _rng(last_user, tby)
-    if stop < n:
-        stop_pc = int(ins[stop].get("pc", -1))
-    else:
-        stop_pc = int(t.get("fall_through_pc", -1))
-    if stop_pc == firing:
-        return True, (f"final user entry BB{last_user['template_id']} "
-                      f"stops exactly at the END firing insn "
-                      f"0x{firing:x} (every retired insn observed)")
-    if stop_pc == before:
-        return True, (f"final user entry BB{last_user['template_id']} "
-                      f"stops one insn short of the END firing insn "
-                      f"0x{firing:x} (the one licensed "
-                      f"retired-but-unobserved tail excluded)")
-    published_firing = any(
-        int(x.get("pc", -1)) == firing for x in ins[start:stop])
-    if published_firing:
-        return False, (f"final user entry BB{last_user['template_id']} "
-                       f"publishes the END firing insn 0x{firing:x} "
-                       f"inside its range [{start},{stop}) — an END "
-                       f"close must exclude the instruction that fired "
-                       f"it (its results are unobservable)")
-    return False, (f"final user entry BB{last_user['template_id']} stops "
-                   f"at pc 0x{stop_pc:x}, but an END close may stop only "
-                   f"at the firing insn 0x{firing:x} or one insn before "
-                   f"it (0x{before:x}) — more than the licensed "
-                   f"unobserved tail is missing from the wire")
+    where = [i for i in range(start, stop)
+             if int(ins[i].get("pc", -1)) == firing]
+    if stop != n:
+        # THE PRE-RULING SHAPE.  Name it as such: a truncated final
+        # entry is exactly what the deferral exists to prevent, and the
+        # message is what a future reader will be handed.
+        return False, (f"final user entry BB{tid} publishes [{start},"
+                       f"{stop}) of a {n}-insn block — the END close "
+                       f"must defer to the end of the marker's own true "
+                       f"BB and publish it WHOLE (bb_stop == {n}); a "
+                       f"range stopping short means the close landed "
+                       f"mid-block")
+    if not _branch_terminated(t):
+        return False, (f"final user entry BB{tid} covers all {n} insns "
+                       f"but its template does not end at a branch — the "
+                       f"block was cut at a TB edge rather than sealed "
+                       f"at its own terminator, so the close did not "
+                       f"reach the boundary it was armed for")
+    if not where:
+        return False, (f"final user entry BB{tid} at 0x{t.get('start_pc', 0):x} "
+                       f"does not contain the END firing insn "
+                       f"0x{firing:x} — the close ran PAST the marker's "
+                       f"own block, putting a block after the END on the "
+                       f"wire")
+    if billing is None:
+        return False, (f"final user entry BB{tid} is the whole sealed "
+                       f"marker block, but the close's billing identity "
+                       f"could not be read (stats.log rows 'user insns "
+                       f"actually executed' / 'user insns emitted to the "
+                       f"wire' not found) — a cell that cannot find its "
+                       f"subject fails")
+    executed, emitted = billing
+    if executed != emitted:
+        return False, (f"final user entry BB{tid} is the whole sealed "
+                       f"marker block, but the close billed "
+                       f"{executed} user insns and published {emitted} — "
+                       f"billed == published must hold at an END close")
+    seq_at = [i for i in range(start, stop)
+              if int(ins[i].get("pc", -1)) == marker_start]
+    return True, (f"final user entry BB{tid} at "
+                  f"0x{int(t.get('start_pc', 0)):x} publishes the whole "
+                  f"sealed marker block [{start},{n}), sealed at its "
+                  f"terminating branch; the END sequence sits at index "
+                  f"{seq_at[0] if seq_at else '?'} and its firing insn "
+                  f"0x{firing:x} at index {where[0]}, both inside the "
+                  f"range; billed == published ({executed} == {emitted})")
 
 
 def assert_rep_split(entries: list[dict], tby: dict, rep_pc: int,
@@ -670,20 +716,54 @@ def run_selftest() -> int:
           ([_fx_e(1), _fx_e(2), _fx_e(3), _fx_e(4)], tby2, 17))
 
     # 3. marker_end: END sequence at pcs 0x44/0x48/0x4c of BB7 (firing
-    # 0x4c).  Stash path stops AT the firing insn — vs. the whole block
-    # published (the pre-range overshoot, firing insn inside the range).
+    # 0x4c), the block sealed by a branch at its last index.  Conforming
+    # is the DEFERRED shape the ruling requires: the whole 5-insn block,
+    # firing insn inside it, billed == published.
+    #
+    # FALSIFIER: the truncated final entry [0,3) stopping AT the firing
+    # instruction — the pre-ruling synchronous close.  It is internally
+    # consistent (it bills exactly what it publishes) and every earlier
+    # spelling of this assertion accepted it, which is why it is the
+    # falsifier that matters: an assertion that cannot reject a
+    # mid-block END close would license the flip again.
     tby3 = {7: _fx_tmpl(7, 5, pcs=[0x40, 0x44, 0x48, 0x4c, 0x50],
                         fall_through=0x54)}
+    tby3[7]["insns"][4]["branch_type"] = 4
     seq3 = [0x44, 0x48, 0x4c]
     check("marker_end", assert_marker_end,
-          ([_fx_e(7, 0, 3)], tby3, seq3),
-          ([_fx_e(7)], tby3, seq3))
+          ([_fx_e(7)], tby3, seq3, (5, 5)),
+          ([_fx_e(7, 0, 3)], tby3, seq3, (3, 3)))
 
-    # 3b. marker_end direct-cursor path: one retired-but-unobserved tail
-    # insn excluded — vs. stopping two short (an under-published close).
-    check("marker_end_tail", assert_marker_end,
-          ([_fx_e(7, 0, 2)], tby3, seq3),
-          ([_fx_e(7, 0, 1)], tby3, seq3))
+    # 3b. the OTHER side of the deferral: the close must stop at the
+    # marker's own block boundary and not one block later.  Falsifier:
+    # a whole, sealed, correctly-billed block that simply does not
+    # contain the END firing instruction — the close ran on past the
+    # boundary it was armed for and put a block AFTER the END on the
+    # wire.  (A single armed step more would do exactly this, which is
+    # why the END arm takes at the first boundary it survives to.)
+    tby3b = dict(tby3)
+    tby3b[8] = _fx_tmpl(8, 4, pcs=[0x54, 0x58, 0x5c, 0x60],
+                        fall_through=0x64)
+    tby3b[8]["insns"][3]["branch_type"] = 4
+    check("marker_end_past_block", assert_marker_end,
+          ([_fx_e(7)], tby3b, seq3, (5, 5)),
+          ([_fx_e(7), _fx_e(8)], tby3b, seq3, (9, 9)))
+
+    # 3c. the billing identity carried by the same cell: an END close
+    # bills exactly what it publishes.  Falsifier: the whole sealed
+    # block on the wire with the clock one instruction ahead of it —
+    # the shape a close that emitted less than it billed leaves, which
+    # the range assertions alone cannot see.
+    check("marker_end_billing", assert_marker_end,
+          ([_fx_e(7)], tby3, seq3, (5, 5)),
+          ([_fx_e(7)], tby3, seq3, (6, 5)))
+
+    # 3c-bis. and the same cell must refuse to judge at all when the
+    # billing rows are missing: a check that cannot find its subject
+    # fails rather than passing on silence.
+    check("marker_end_billing_absent", assert_marker_end,
+          ([_fx_e(7)], tby3, seq3, (5, 5)),
+          ([_fx_e(7)], tby3, seq3, None))
 
     # 3c. the END-marker pc DERIVATION (the existing-carrier surface):
     # a full byte-witnessed sequence resolves to its pcs, and a partial
@@ -711,12 +791,20 @@ def run_selftest() -> int:
 
     # 3d. the PREFIX tie-break, on a pair-encoded marker (aarch64-shaped:
     # a two-instruction load pair repeated, so slot i and slot i+2 carry
-    # identical bytes).  An END close truncates the sequence's tail, and
-    # the surviving 4-of-6 witness matches the sequence read from slot 0
-    # and, byte for byte, read from slot 2 — placement by contradiction
-    # cannot separate them because the two slots BEFORE the block are not
-    # on the wire at all.  Only the prefix rule can: the close removes a
-    # suffix, so the witnessed slots of the true placement start at 0.
+    # identical bytes).  Whenever a capture stops INSIDE the sequence —
+    # a budget or ceiling close landing there, or a trace whose marker
+    # block was published only in part — the surviving 4-of-6 witness
+    # matches the sequence read from slot 0 and, byte for byte, read
+    # from slot 2; placement by contradiction cannot separate them
+    # because the two slots BEFORE the block are not on the wire at all.
+    # Only the prefix rule can, and it is structural: any close removes
+    # a SUFFIX of what the guest ran, so the witnessed slots of the true
+    # placement start at slot 0 with no hole.
+    #
+    # (The END close no longer produces this shape — it defers to the
+    # marker block's boundary and publishes the sequence whole — but the
+    # rule is about what a partial witness means, not about which close
+    # produced it, and the derivation is reached from every route.)
     #
     # Conforming: one such truncated witness resolves to the earlier
     # placement.  Falsifier: the same shape appearing at TWO unrelated
@@ -731,8 +819,8 @@ def run_selftest() -> int:
 
     def _a64_trunc(base, tid):
         """Template holding only the first 4 slots of the pair marker,
-        with nothing on the wire below @base (the truncated close's shape).
-        """
+        with nothing on the wire below @base — the shape any capture
+        that stopped inside the sequence leaves behind."""
         return _fx_tmpl(tid, 4,
                         pcs=[base + i * a_stride for i in range(4)],
                         raw={i: a_seqb[i] for i in range(4)})
@@ -1026,6 +1114,44 @@ def _budget_close_cell(user_dir: Path, u_trace: Path, build_dir: Path,
     return ok, f"(window sized to S={S} of {total}) {detail}"
 
 
+def _close_billing(trace: Path) -> tuple[int, int] | None:
+    """The close's billed/published pair, read from the run's own
+    ``stats.log`` beside @trace: ``user insns actually executed`` (what
+    the owned process's dispatches retired, from the per-instruction
+    clock) and ``user insns emitted to the wire``.  Their equality IS
+    the ``clock_minus_wire=0`` identity the segment finish reports.
+
+    Returns None when either row is absent — the caller fails on that
+    rather than judging the range shape alone.  Both labels are matched
+    at the START of a stripped line, so the indented sub-rows that
+    follow them ("of them self-loop fan-out surplus") cannot be picked
+    up by mistake."""
+    stats = trace.parent / (trace.stem + ".stats.log")
+    if not stats.exists():
+        cand = sorted(trace.parent.glob("*.stats.log"))
+        if len(cand) != 1:
+            return None
+        stats = cand[0]
+    want = {"user insns actually executed": None,
+            "user insns emitted to the wire": None}
+    try:
+        text = stats.read_text(errors="replace")
+    except OSError:
+        return None
+    for raw in text.splitlines():
+        line = raw.strip()
+        for label in want:
+            if want[label] is None and line.startswith(label):
+                tail = line[len(label):].strip().split()
+                if tail and tail[-1].isdigit():
+                    want[label] = int(tail[-1])
+    executed = want["user insns actually executed"]
+    emitted = want["user insns emitted to the wire"]
+    if executed is None or emitted is None:
+        return None
+    return executed, emitted
+
+
 def run_cells(user_dir: Path, sys_dir: Path, build_dir: Path,
               wpdepth: int) -> int:
     """Run the live cells against an existing `all` user run dir and an
@@ -1063,7 +1189,9 @@ def run_cells(user_dir: Path, sys_dir: Path, build_dir: Path,
         if seq_pcs is None:
             verdicts.append(("marker_end", False, why))
         else:
-            ok, detail = assert_marker_end(entries_s, tby_s, seq_pcs)
+            billing = _close_billing(s_trace)
+            ok, detail = assert_marker_end(entries_s, tby_s, seq_pcs,
+                                           billing)
             verdicts.append(("marker_end", ok, f"({why}) {detail}"))
     else:
         for name in ("fault_split", "marker_end"):

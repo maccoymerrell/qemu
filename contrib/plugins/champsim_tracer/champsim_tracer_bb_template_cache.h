@@ -666,9 +666,13 @@ private:
     std::unordered_map<BBKey, BBTemplatePtr, BBKeyHash> alt_map_;
     /*
      * Blocks whose EXECUTION was cut short — the guest entered the block and
-     * something ended it before its last instruction: the END marker closing
-     * the window, a ceiling, a control-flow discontinuity that abandoned the
-     * chain mid-BB.
+     * something ended it before its last instruction: a ceiling, a machine
+     * teardown, a control-flow discontinuity that abandoned the chain
+     * mid-BB.  NOT the END marker: its close is deferred to the boundary of
+     * the block it fired inside, so that block runs to its terminator and is
+     * committed at full extent like any other (the system marker cell mints
+     * one fewer cut-short template on every ISA than a synchronous END close
+     * does).
      *
      * They cannot live in bb_map_.  That map is keyed by (asid_root,
      * start_pc) only, and resolve_true_bb classifies a shorter run of the

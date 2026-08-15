@@ -1263,9 +1263,17 @@ def _chk_reg_snap_accounting(ctx: Ctx) -> Outcome:
     all_ok = True
     for isa in ISA_ALL:
         d = ctx.dir(f"feat_reg_snap_accounting_{isa}")
+        # ISA_COMPILER is a static table with a row for every ISA in
+        # ISA_ALL, so `if not cc` could never be true and this skip could
+        # never fire: on a host without the cross toolchain the tier ran on
+        # to subprocess.call() and died on FileNotFoundError instead of
+        # skipping.  The question the skip means to ask is whether the
+        # compiler is INSTALLED, which is a PATH lookup.
         cc = M.ISA_COMPILER.get(isa)
-        if not cc:
-            subs.append({"name": isa, "ok": True, "detail": "skip (no compiler)"})
+        if not cc or not M._have(cc):
+            subs.append({"name": isa, "ok": True,
+                         "detail": f"skip ({cc or 'no compiler'} not in PATH "
+                                   f"-- this host cannot build {isa})"})
             continue
         params = G.GenerateParams(seed=ctx.seed, isa=isa, num_diamonds=8,
                                   hot_iters=1000)
@@ -1351,9 +1359,17 @@ def _chk_final_entry_memops(ctx: Ctx) -> Outcome:
     all_ok = True
     for isa in ISA_ALL:
         d = ctx.dir(f"feat_final_memops_{isa}")
+        # ISA_COMPILER is a static table with a row for every ISA in
+        # ISA_ALL, so `if not cc` could never be true and this skip could
+        # never fire: on a host without the cross toolchain the tier ran on
+        # to subprocess.call() and died on FileNotFoundError instead of
+        # skipping.  The question the skip means to ask is whether the
+        # compiler is INSTALLED, which is a PATH lookup.
         cc = M.ISA_COMPILER.get(isa)
-        if not cc:
-            subs.append({"name": isa, "ok": True, "detail": "skip (no compiler)"})
+        if not cc or not M._have(cc):
+            subs.append({"name": isa, "ok": True,
+                         "detail": f"skip ({cc or 'no compiler'} not in PATH "
+                                   f"-- this host cannot build {isa})"})
             continue
         # Long-running so the icount window closes mid-flight; dense enough
         # in load/store blocks that most stops land on a memop-carrying BB.
@@ -1498,9 +1514,17 @@ def _chk_static_coverage(ctx: Ctx) -> Outcome:
     all_ok = True
     for isa in ISA_ALL:
         d = ctx.dir(f"feat_wp_coverage_{isa}")
+        # ISA_COMPILER is a static table with a row for every ISA in
+        # ISA_ALL, so `if not cc` could never be true and this skip could
+        # never fire: on a host without the cross toolchain the tier ran on
+        # to subprocess.call() and died on FileNotFoundError instead of
+        # skipping.  The question the skip means to ask is whether the
+        # compiler is INSTALLED, which is a PATH lookup.
         cc = M.ISA_COMPILER.get(isa)
-        if not cc:
-            subs.append({"name": isa, "ok": True, "detail": "skip (no compiler)"})
+        if not cc or not M._have(cc):
+            subs.append({"name": isa, "ok": True,
+                         "detail": f"skip ({cc or 'no compiler'} not in PATH "
+                                   f"-- this host cannot build {isa})"})
             continue
         params = G.GenerateParams(seed=ctx.seed, isa=isa, num_diamonds=8,
                                   hot_iters=200)

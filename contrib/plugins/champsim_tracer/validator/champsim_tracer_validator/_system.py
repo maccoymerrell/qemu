@@ -628,6 +628,72 @@ def scan_guest_console(console_text: str) -> list[str]:
     return out
 
 
+# --------------------------------------------------------------------------
+# Kernel page-table isolation.
+#
+# KPTI-OFF is the canonical system-mode configuration (multiasid_plan §0):
+# with isolation disabled the kernel shares each process's ASID, so the
+# wire's (asid,vaddr) key covers kernel and user under one process root.
+# Every system-mode capture on record was taken that way, and a capture with
+# KPTI ON does not carry the same wire semantics.
+#
+# Nothing asserted it.  It held on x86 only because the boot table appends
+# `nopti`; on the validator's default x86 boot it holds for a SECOND,
+# unrelated reason (the default TCG cpu is AMD-branded, so Linux never
+# considers Meltdown at all and prints nothing either way); and on aarch64 it
+# holds for a THIRD (`-cpu max` reports ID_AA64PFR0_EL1.CSV3, so
+# UNMAP_KERNEL_AT_EL0 -- which IS compiled into that kernel -- stays dormant).
+# Two of the three are properties of a `-cpu` choice made for other reasons.
+# Change the model and KPTI silently comes back on, with no line in any
+# report saying so.
+#
+# The check below is deliberately ONE-SIDED: a kernel that turns isolation on
+# always announces it, on both architectures that have it, so a positive
+# signature is proof and its absence is the ordinary quiet case.  It can
+# therefore never fail a healthy cell, and it cannot pass vacuously on the
+# thing it is checking.  riscv64 and mipsel have no KPTI to assert.
+KPTI_ON_SIGNATURES: list[tuple[str, str]] = [
+    # x86: arch/x86/mm/pti.c pti_print_if_insecure()/pti_check_boottime_disable()
+    ("Kernel/User page tables isolation: enabled", "x86_64"),
+    # arm64: the cpufeature is announced like every other detected feature.
+    ("CPU features: detected: Kernel page table isolation (KPTI)", "aarch64"),
+    ("Kernel page table isolation (KPTI)", "aarch64"),
+]
+
+
+def kpti_is_on(console_text: str) -> str | None:
+    """The console signature saying the guest turned page-table isolation
+    ON, or None when it printed no such line.  One-sided by construction:
+    see the comment above."""
+    for token, _arch in KPTI_ON_SIGNATURES:
+        if token in console_text:
+            return token
+    return None
+
+
+def assess_kpti(console_text: str, label: str = "") -> list[str]:
+    """One message when the guest booted with page-table isolation ON.
+
+    Empty list means no KPTI-on signature was printed, which is the
+    canonical configuration.  A cell that WANTS isolation on (the
+    ``CST_QEMU_EXTRA_ARGS=-cpu qemu64,vendor=GenuineIntel`` shape the module
+    docstring describes) declares it by setting ``CST_EXPECT_KPTI=1``, and
+    then the same evidence is reported without failing the run."""
+    tok = kpti_is_on(console_text)
+    if tok is None:
+        return []
+    if os.environ.get("CST_EXPECT_KPTI", "").strip() not in ("", "0"):
+        print(f"kpti[{label}]: page-table isolation is ON, as this cell "
+              f"asked for (CST_EXPECT_KPTI set) — console says {tok!r}")
+        return []
+    return [f"{label}: the guest booted with kernel page-table isolation ON "
+            f"(console says {tok!r}) -- KPTI-off is the canonical "
+            f"system-mode configuration, and a capture taken with it on does "
+            f"not carry the same (asid,vaddr) wire semantics.  Boot with "
+            f"`nopti` (x86) / a CSV3-reporting -cpu (aarch64), or set "
+            f"CST_EXPECT_KPTI=1 if this cell means to test isolation."]
+
+
 def default_kernel(isa: str) -> Path:
     b = _ISA_BOOT[isa]
     return SYSTEST_ROOT / b["dir"] / b["kernel"]

@@ -526,16 +526,28 @@ def cmd_generate(args, isa: str | None = None) -> None:
 
 
 def cmd_build(args, isa: str | None = None) -> int:
+    """Assemble/link the generated workload for @isa.  Returns 0 only when
+    the binary exists afterwards.
+
+    Neither "no source" nor "no compiler" is a success.  Both used to
+    return 0, so `build --isa X` reported success while producing nothing:
+    the caller that reads only the status was told the workload was built,
+    and the next step failed on some unrelated symptom (or, for a caller
+    that builds as its own step, did not fail at all).  A step that cannot
+    do the thing it was asked to do fails, and names which of the two
+    reasons it was."""
     isa = isa or args.isa
     prog = _prog_base(args.out_dir, args.prog)
     src = _src_path(args.out_dir, f"{prog}_{isa}")
     if not src.is_file():
-        print(f"build[{isa}]: SKIP  source not found: {src}")
-        return 0
+        print(f"build[{isa}]: FAIL  source not found: {src} "
+              f"(generate has to run first, and has to have succeeded)")
+        return 1
     cc = ISA_COMPILER[isa]
     if not _have(cc):
-        print(f"build[{isa}]: SKIP  {cc} not in PATH")
-        return 0
+        print(f"build[{isa}]: FAIL  {cc} not in PATH -- this host cannot "
+              f"build a {isa} workload, so it cannot run a {isa} cell")
+        return 1
     out = _bin_path(args.out_dir, prog, isa)
     cmd = [cc] + ISA_CFLAGS[isa] + [
         "-O1", "-fno-asynchronous-unwind-tables",
@@ -552,7 +564,13 @@ def cmd_build(args, isa: str | None = None) -> int:
     rc = subprocess.call(cmd)
     if rc != 0:
         print(f"build[{isa}]: FAIL rc={rc}")
-    return rc
+        return rc
+    if not out.is_file():
+        print(f"build[{isa}]: FAIL  the compiler exited 0 but produced no "
+              f"{out} -- reporting the exit status alone would have passed "
+              f"this")
+        return 1
+    return 0
 
 
 def _optional_plugin_opts(args) -> str:
@@ -813,6 +831,13 @@ def _check_segment_coverage(console_log: Path, require_ok: bool = False,
     rc_cpus = 0
     for msg in SYS.assess_online_cpus(text, smp, label=label):
         print(f"smp: {msg}  FAIL")
+        rc_cpus = 1
+    # Was the capture taken in the canonical KPTI-off configuration?  Asked
+    # here for the same reason as the vCPU count: every downstream check
+    # passes on a KPTI-on capture, and the wire it produced does not mean
+    # what the consumer will read it to mean.
+    for msg in SYS.assess_kpti(text, label=label):
+        print(f"kpti: {msg}  FAIL")
         rc_cpus = 1
     segs = SYS.parse_finished_segments(text)
     if not segs:

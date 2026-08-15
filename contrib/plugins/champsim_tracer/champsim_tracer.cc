@@ -11944,8 +11944,23 @@ static uint32_t build_canonical_insns(struct qemu_plugin_tb *tb,
     uint32_t canonical_n_insns = 0;
 
     /* WIN_MARKER: the predecessor half of a straddling sequence, taken while
-     * the page it sits on is still resident (see marker_witness_straddle). */
-    if (marker_scan_enabled() && g_marker_seq.valid) {
+     * the page it sits on is still resident (see marker_witness_straddle).
+     *
+     * Correct-path translations only.  The witness table is persistent and
+     * the correct path PREFERS it over its own guest read (the
+     * `from_witness || marker_read_guest` below), so a wrong-path entry is
+     * not a spare copy of the same answer — it is the answer.  A spec-mode
+     * translation reaches this point with a real TB of real guest bytes,
+     * but not necessarily the same EXTENT: "freshest translation wins" in
+     * marker_straddle_witness_note lets a wrong-path TB carrying fewer head
+     * slots overwrite a correct-path witness, after which the prefix
+     * reconstruction fails, marker_whole_match yields MARKER_WHICH_NONE and
+     * the terminating instruction is never armed.  A missed END is
+     * trace-invalidating, so the wrong path does not get a vote here.
+     *
+     * The gate is on the NOTE, not on the arming: spec translations keep
+     * byte-for-byte the instrumentation shape they have today. */
+    if (marker_scan_enabled() && g_marker_seq.valid && !g_wp_in_progress) {
         marker_witness_straddle(tb, raw_n_insns);
     }
 
@@ -12058,7 +12073,17 @@ static uint32_t build_canonical_insns(struct qemu_plugin_tb *tb,
                 bool have_pp = from_witness
                     ? (witness_pa != 0 && (pp = witness_pa, true))
                     : marker_page_paddr(seq_base, &pp);
-                if (have_pp && marker_page_paddr(raw_pc, &tp)) {
+                /* Correct-path translations only, for the same reason the
+                 * witness note is gated: the pair table is persistent, and
+                 * a second DIFFERENT predecessor page behind one tail page
+                 * latches `conflicting` permanently, after which
+                 * marker_straddle_pair_lookup refuses that tail forever.  A
+                 * wrong-path translation reaching a straddling tail through
+                 * a reused or mid-refill page is precisely how a second
+                 * predecessor appears, so letting it vote can make a
+                 * straddling END permanently undecidable. */
+                if (have_pp && marker_page_paddr(raw_pc, &tp) &&
+                    !g_wp_in_progress) {
                     marker_straddle_pair_note(tp, pp & ~(page - 1), which);
                 } else {
                     pair_keyed = false;     /* unrecorded: keep the recheck */

@@ -790,6 +790,46 @@ struct qemu_plugin_cpu_state {
      */
     int exception_index;
     uint32_t halted;
+    /*
+     * The per-execution self-loop report (the plugin_rep_* block), for the
+     * same reason and by the same rule as the two fields above: a wrong-path
+     * walk dirties it, and the correct path reads it.
+     *
+     * It is a PUBLICATION CHANNEL, not scratch.  A fan-out instruction
+     * publishes its architectural facts here as it executes, and the consumer
+     * reads them at the NEXT dispatch, because the fields describe the
+     * execution that finished before the callback -- so the value is in flight
+     * across exactly the boundary a speculative excursion is kicked from.  An
+     * excursion that executes any fan-out instruction overwrites the channel
+     * mid-flight, and what the correct path then reads is the wrong path's
+     * count.
+     *
+     * The consumer cannot defend itself.  plugin_rep_pc names the instruction
+     * the report describes, and that is the whole identity: it is an ADDRESS.
+     * A speculative walk that re-enters the very instruction it was launched
+     * from -- the ordinary case, since the excursion starts at the untaken
+     * side of the block that instruction ended -- republishes the same
+     * address with a different count, and no reader can tell the two apart.
+     * Provenance would have to travel with the value, which means it belongs
+     * here, at the excursion boundary, and not in any one consumer.
+     *
+     * Restoring the whole block also keeps a genuine mid-instruction state
+     * intact: a fan-out split by a fault leaves retired-iteration facts
+     * pending for the piece still to come, and an excursion taken in between
+     * must give that state back untouched rather than leave the resumed
+     * instruction reading the speculation's numbers.
+     *
+     * Target-independent on purpose.  x86 REP publishes from generated code
+     * in do_gen_rep(); AArch64 FEAT_MOPS publishes from its step helpers.
+     * Both write these fields, and neither is gated on speculation, so the
+     * repair belongs at the one boundary both cross.
+     */
+    uint64_t rep_iters;
+    uint64_t rep_pc;
+    uint64_t rep_bytes;
+    bool rep_complete;
+    bool rep_reenter;
+    bool rep_chunk;
 };
 
 struct qemu_plugin_cpu_state *qemu_plugin_cpu_state_save(void)
@@ -803,6 +843,12 @@ struct qemu_plugin_cpu_state *qemu_plugin_cpu_state_save(void)
                                   state->arch_state_size);
     state->exception_index = current_cpu->exception_index;
     state->halted = current_cpu->halted;
+    state->rep_iters = current_cpu->plugin_rep_iters;
+    state->rep_pc = current_cpu->plugin_rep_pc;
+    state->rep_bytes = current_cpu->plugin_rep_bytes;
+    state->rep_complete = current_cpu->plugin_rep_complete;
+    state->rep_reenter = current_cpu->plugin_rep_reenter;
+    state->rep_chunk = current_cpu->plugin_rep_chunk;
 
     return state;
 }
@@ -818,6 +864,19 @@ bool qemu_plugin_cpu_state_restore(struct qemu_plugin_cpu_state *state)
     cpu_plugin_arch_state_restore(state->arch_state, state->arch_state_size);
     current_cpu->exception_index = state->exception_index;
     current_cpu->halted = state->halted;
+    /*
+     * Hand the self-loop report back exactly as the correct path left it.
+     * A consumer inside the excursion has already read the speculative
+     * values it wanted (it reads them per speculative execution, before this
+     * runs); what must not survive is the wrong path's last publication
+     * sitting in the channel when the correct path next looks.
+     */
+    current_cpu->plugin_rep_iters = state->rep_iters;
+    current_cpu->plugin_rep_pc = state->rep_pc;
+    current_cpu->plugin_rep_bytes = state->rep_bytes;
+    current_cpu->plugin_rep_complete = state->rep_complete;
+    current_cpu->plugin_rep_reenter = state->rep_reenter;
+    current_cpu->plugin_rep_chunk = state->rep_chunk;
     return true;
 }
 

@@ -748,6 +748,16 @@ struct CPUState {
      * instruction never write it, which is also how a consumer recognises
      * that no architectural count is available at all.
      *
+     * The name is an ADDRESS, and an address cannot say which PATH published
+     * the value beside it.  That distinction is kept where it can be kept:
+     * this whole block is saved and restored across a speculative excursion
+     * with the rest of the wrong path's rollback (qemu_plugin_cpu_state_save
+     * / _restore), so what a correct-path consumer reads was published by
+     * correct-path execution.  Without that the invariant is unavailable to
+     * any consumer at all -- an excursion is kicked from the end of the very
+     * block a fan-out instruction terminates, and a speculative re-entry of
+     * that same instruction republishes the same pc with a different count.
+     *
      * plugin_rep_chunk qualifies plugin_rep_reenter: true when the re-enter
      * happened at a canonical chunk boundary — the point where do_gen_rep's
      * loop translation itself leaves the block every REP_MAX+1-and-change

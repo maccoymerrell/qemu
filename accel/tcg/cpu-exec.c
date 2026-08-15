@@ -1520,12 +1520,24 @@ static bool sdiff_enabled(void)
  *    On x86 the excursion holds the BQL end to end, so the iothread cannot
  *    interleave and this group does not appear; on the other targets it does.
  *
- *  - PLUGIN PER-EXECUTION REPORT SCRATCH (the plugin_rep_* block).  QEMU
- *    rewrites these at every instruction execution as the OUTPUT of that
- *    execution; they carry nothing from one to the next.  A consumer reads
- *    them inside the callback for the execution that produced them -- the
- *    tracer latches its own copy at the top of its dispatch callback, before
- *    any excursion can run, precisely because a wrong path overwrites them.
+ *  - THE PER-EXECUTION REPORT'S LAZILY ALLOCATED ACCUMULATOR
+ *    (plugin_mops_report).  A pointer to per-vCPU storage the FEAT_MOPS byte
+ *    fallbacks allocate on first use and keep for the vCPU's lifetime, so it
+ *    goes NULL -> heap on the first excursion that needs it.  What it HOLDS is
+ *    already path-separated inside the allocation (the accumulator carries a
+ *    correct-path and a wrong-path context and selects on plugin_spec_mode),
+ *    so the surviving pointer carries no wrong-path value into the correct
+ *    path.
+ *
+ *    The scalar report beside it -- the plugin_rep_* block -- is NOT in this
+ *    group and must not be added to it.  It is a publication channel read one
+ *    dispatch after the execution that wrote it, which is across the boundary
+ *    an excursion is kicked from, and its only identity is an address; a
+ *    speculative re-entry of the same instruction is therefore indis-
+ *    tinguishable from the correct-path execution it displaced.  It is saved
+ *    and restored with the rest of the rollback (qemu_plugin_cpu_state_save /
+ *    _restore) and so does not differ here.  If it ever appears in this
+ *    detector's output again, that is the finding.
  *
  *  - THE WRONG-PATH STORE SANDBOX (plugin_spec_store_buf, _pool, _pool_used,
  *    _pool_cap, _atomic_scratch, _store_overflow).  The sandbox that holds the
@@ -1562,9 +1574,18 @@ static const char *sdiff_cpu_field(size_t off)
         return "work_list (async: queued by another thread - must survive)";
     }
     if (off == offsetof(CPUState, cflags_next_tb))     return "cflags_next_tb";
-    if (off >= offsetof(CPUState, plugin_rep_iters) &&
+    /*
+     * plugin_mops_report AND NOTHING BEFORE IT.  This range used to start at
+     * plugin_rep_iters, which silenced the entire self-loop publication
+     * channel -- the six fields a wrong-path fan-out instruction overwrites
+     * and the correct path reads at its next dispatch.  Those are restored
+     * now, so they do not differ; naming them would re-hide the leak the
+     * restore exists to prevent.
+     */
+    if (off >= offsetof(CPUState, plugin_mops_report) &&
         off <  offsetof(CPUState, plugin_mops_report) + sizeof(void *)) {
-        return "(plugin per-execution report scratch - rewritten every insn)";
+        return "(FEAT_MOPS report accumulator - lazily allocated, vCPU "
+               "lifetime; its contents are path-separated internally)";
     }
     if (off >= offsetof(CPUState, plugin_spec_store_buf) &&
         off <  offsetof(CPUState, plugin_spec_store_overflow) +

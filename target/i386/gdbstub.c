@@ -240,6 +240,24 @@ int x86_cpu_gdb_read_register(CPUState *cs, GByteArray *mem_buf, int n)
             return gdb_read_reg_cs64(env->hflags, mem_buf, env->cr[4]);
         case IDX_CTL_CR8_REG:
 #ifndef CONFIG_USER_ONLY
+#ifdef CONFIG_PLUGIN
+            /*
+             * Wrong-path (speculative): cpu_get_apic_tpr reads the APIC
+             * device, and apic_sync_vapic(SYNC_FROM_VAPIC) writes s->tpr
+             * from the vAPIC page — a device mutation outside the env
+             * snapshot, which the excursion's register restore cannot undo,
+             * feeding apic_get_ppr and interrupt delivery.  helper_read_cr8
+             * already refuses this for the guest's own MOV-from-CR8; this is
+             * the same device access reached through the plugin register-read
+             * API (qemu_plugin_read_register -> gdb_read_register), and it
+             * was the one of the two paths without the gate.  Return the
+             * env-shadowed V_TPR bits, exactly as the helper does.
+             */
+            if (cs->plugin_spec_mode) {
+                tpr = env->int_ctl & V_TPR_MASK;
+                return gdb_read_reg_cs64(env->hflags, mem_buf, tpr);
+            }
+#endif
             tpr = cpu_get_apic_tpr(cpu->apic_state);
 #else
             tpr = 0;

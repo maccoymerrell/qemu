@@ -154,6 +154,10 @@ FIXTURES = [
 
 VOLATILE_PREFIXES = ("COMMAND ", "DATETIME ", "; command=", "; datetime=")
 
+# Why this reference was (re)captured -- set from --reason by main(), stored
+# in the manifest.  See the --reason help for why it is mandatory.
+CAPTURE_REASON = ""
+
 
 # --- helpers ----------------------------------------------------------------
 def cst_decode_bin(build: Path) -> Path:
@@ -555,7 +559,8 @@ def capture(build: Path, root: Path, waivers: dict) -> int:
     # Record the capture-time work root: the path is a wire INPUT (guest
     # argv[0]/AT_EXECFN sizes set the stack base -> REG_SP), so a check
     # under any other root is structurally red.  check() enforces this.
-    manifest = {"work_root": str(root), "provenance": prov, "cells": {},
+    manifest = {"work_root": str(root), "provenance": prov,
+                "recapture_reason": CAPTURE_REASON, "cells": {},
                 "svg": {}, "svg_fixtures": {}, "excluded": {}}
     bad = 0
     # Determinism pre-check: trace each cell N_DET times to the SAME out-dir
@@ -751,6 +756,18 @@ def _report_reference_provenance(manifest: dict, now: dict) -> None:
     print(f"under test: HEAD {nh.get('sha','?')}"
           + (f", {len(now['dirty_wire_sources'])} uncommitted wire source(s)"
              if now.get("dirty_wire_sources") else ""))
+    # The recapture claim, read back where a red net is being interpreted:
+    # "these bytes replaced the previous reference because X" is the first
+    # thing worth knowing when the next change disagrees with them.
+    why = manifest.get("recapture_reason")
+    if why:
+        print(f"reference captured because: {why}")
+    elif "recapture_reason" in manifest:
+        print("reference carries an EMPTY recapture reason -- it was "
+              "recorded without saying why (see --reason)")
+    else:
+        print("reference predates the recapture-reason record: why it "
+              "replaced its predecessor is not recoverable from the manifest")
 
 
 def _dump_legacy_diff(build: Path, cst: Path, cell: str) -> None:
@@ -1208,7 +1225,8 @@ def sys_capture(build: Path, root: Path, waivers: dict) -> int:
     if root.exists():
         shutil.rmtree(root)
     GOLDEN_DIR.mkdir(parents=True, exist_ok=True)
-    manifest = {"work_root": str(root), "provenance": prov, "recipe": {},
+    manifest = {"work_root": str(root), "provenance": prov,
+                "recapture_reason": CAPTURE_REASON, "recipe": {},
                 "canon_cells": {}, "fixture_decode": {}, "excluded": {}}
     bad = 0
 
@@ -1474,10 +1492,34 @@ def main() -> int:
                          "a reference captured from uncommitted wire sources. "
                          "Recorded in the manifest.  `check` always waives "
                          "it.")
+    # A RECAPTURE IS A CLAIM, AND THE CLAIM GOES IN THE MANIFEST.
+    #
+    # A golden reference is the only thing standing between a wire-content
+    # change and nobody noticing.  Overwriting one is therefore an
+    # assertion -- "the new bytes are the correct bytes, and here is why
+    # the old ones were not" -- and an assertion nobody wrote down is
+    # indistinguishable, a month later, from a red net someone silenced.
+    # So `capture` will not run without a reason, and the reason is stored
+    # next to the hashes it justifies.  `check` never needs one: it
+    # asserts nothing.
+    ap.add_argument("--reason", default=None,
+                    help="REQUIRED for capture: why the reference is being "
+                         "replaced -- name the defect the old bytes carried, "
+                         "or the intended wire change.  Recorded in the "
+                         "manifest alongside the hashes.")
     args = ap.parse_args()
     build = args.build_dir
+    if args.mode == "capture" and not (args.reason or "").strip():
+        print("golden_net: capture refuses to overwrite a reference without "
+              "--reason.\n  A recapture asserts the new bytes are correct; "
+              "say what was wrong with the old ones\n  (the defect, or the "
+              "intended wire change).  It is recorded in the manifest.",
+              file=sys.stderr)
+        return 2
     waivers = {"allow_stale": args.allow_stale,
                "allow_dirty": args.allow_dirty}
+    global CAPTURE_REASON
+    CAPTURE_REASON = (args.reason or "").strip()
 
     # ONE net at a time per work root.  capture and check both create and
     # delete cell directories under the root, and nothing else serialized

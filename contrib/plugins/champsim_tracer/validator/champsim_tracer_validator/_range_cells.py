@@ -284,9 +284,9 @@ def derive_end_marker_pcs(tby: dict, isa: str) -> tuple[list[int] | None, str]:
         for j, exp in enumerate(seqb):
             if b == exp:
                 candidates.add(pc - offs[j])
-    scored: list[tuple[int, int]] = []
+    scored: list[tuple[int, int, int]] = []
     for c in sorted(candidates):
-        score = 0
+        wit: list[int] = []
         ok = True
         for i, exp in enumerate(seqb):
             slot = c + offs[i]
@@ -297,19 +297,38 @@ def derive_end_marker_pcs(tby: dict, isa: str) -> tuple[list[int] | None, str]:
             if kb is None:
                 continue                      # not on the wire: allowed
             if kb == exp:
-                score += 1
+                wit.append(i)
             else:
                 ok = False                    # a KNOWN different insn sits
                 break                         # where the sequence would be
         if ok:
-            scored.append((score, c))
+            # A PARTIAL WITNESS IS A PREFIX, NEVER A MIDDLE.
+            #
+            # The only thing that takes marker instructions off the wire is
+            # the END close, and it removes a SUFFIX: the firing instruction
+            # (mid-callback, unobservable) and, on the direct-cursor path,
+            # the retired-but-unsnapped one before it.  Everything earlier
+            # in the sequence executed and was published.  So the true
+            # placement's witnessed slots are 0..k-1 with no hole, and a
+            # candidate witnessed only from the middle outward is proposing
+            # that the writer dropped marker instructions the guest ran
+            # before ones it kept — which no close does.
+            #
+            # This is what separates the two placements a pair-encoded
+            # marker (aarch64 / riscv64 / mipsel: a repeated two-insn
+            # load pair) otherwise ties on once the close has truncated it:
+            # 4 witnessed pair-slots match the sequence read from slot 0 and,
+            # equally well, read from slot 2.  Only the first is a prefix.
+            prefix = 1 if wit == list(range(len(wit))) else 0
+            scored.append((prefix, len(wit), c))
     if not scored:
         return None, ("no template instruction carries the END-marker "
                       "byte sequence — the trace has no END marker to "
                       "derive (not a marker-mode trace, or the close "
                       "dropped every marker template)")
-    best = max(s for s, _ in scored)
-    top = [c for s, c in scored if s == best]
+    best_key = max((p, n) for p, n, _ in scored)
+    top = [c for p, n, c in scored if (p, n) == best_key]
+    best = best_key[1]
     if len(top) != 1:
         return None, (f"END-marker position ambiguous: {len(top)} "
                       f"candidate placements tie at {best}/{len(seqb)} "
@@ -689,6 +708,42 @@ def run_selftest() -> int:
                             raw={0: b"\x0f\x05", 1: b"\xeb\x00"})}
     check("marker_derive", drv, (tby_full, d_pcs), (tby_none, d_pcs))
     check("marker_derive_partial", drv, (tby_part, d_pcs), (tby_none, d_pcs))
+
+    # 3d. the PREFIX tie-break, on a pair-encoded marker (aarch64-shaped:
+    # a two-instruction load pair repeated, so slot i and slot i+2 carry
+    # identical bytes).  An END close truncates the sequence's tail, and
+    # the surviving 4-of-6 witness matches the sequence read from slot 0
+    # and, byte for byte, read from slot 2 — placement by contradiction
+    # cannot separate them because the two slots BEFORE the block are not
+    # on the wire at all.  Only the prefix rule can: the close removes a
+    # suffix, so the witnessed slots of the true placement start at 0.
+    #
+    # Conforming: one such truncated witness resolves to the earlier
+    # placement.  Falsifier: the same shape appearing at TWO unrelated
+    # addresses, where both placements are prefixes with equal witness —
+    # genuinely ambiguous, and the derivation must refuse rather than pick.
+    a_seqb = _end_marker_seq_bytes("aarch64")
+    a_stride = len(a_seqb[0])
+
+    def drv_a64(tby, want):
+        pcs, detail = derive_end_marker_pcs(tby, "aarch64")
+        return (pcs == want), detail
+
+    def _a64_trunc(base, tid):
+        """Template holding only the first 4 slots of the pair marker,
+        with nothing on the wire below @base (the truncated close's shape).
+        """
+        return _fx_tmpl(tid, 4,
+                        pcs=[base + i * a_stride for i in range(4)],
+                        raw={i: a_seqb[i] for i in range(4)})
+
+    a_base = 0x400a2c
+    a_pcs = [a_base + i * a_stride for i in range(len(a_seqb))]
+    tby_pair = {1: _a64_trunc(a_base, 1)}
+    tby_pair_two = {1: _a64_trunc(a_base, 1),
+                    2: _a64_trunc(a_base + 0x1000, 2)}
+    check("marker_derive_pair_prefix", drv_a64,
+          (tby_pair, a_pcs), (tby_pair_two, a_pcs))
 
     # 4. rep_split: a REP invocation split by a kernel excursion with its
     # fan-out intact (stores tile the staged span) — vs. an iteration

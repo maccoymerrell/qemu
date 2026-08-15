@@ -1593,6 +1593,24 @@ instruction the range names has its complete memops and its complete
 post-execution register state, and the entry asserts nothing whatever
 about instructions outside the range.
 
+The END marker is the case where this rule is normative rather than
+merely mechanical.  A marker-mode segment's last entry MUST NOT carry
+the instruction that fired the END marker inside its range, nor any
+instruction after it in the block: the marker is a *position* the guest
+placed to end the region of interest, so the firing instruction and its
+successors are outside what the trace may claim.  The firing
+instruction is also unobservable in the mechanical sense — the close
+runs from inside its own execution callback, before its destinations
+are readable — so the writer's stop rule lands the range's exclusive
+``bb_stop`` at the firing instruction, or one instruction earlier when
+that last retired instruction's results were never captured either.
+Both stop points are conforming; anything past the firing instruction
+is a wire defect.  The block containing the marker is therefore
+normally left unterminated, and its entry is a partial one — which is
+exactly what this section exists to express.  A reader that needs the
+marker's own position finds it as the first instruction of the
+sequence, whose bytes the templates section carries.
+
 A block interrupted and later resumed produces one entry per stretch,
 each naming the same ``template_id``:
 

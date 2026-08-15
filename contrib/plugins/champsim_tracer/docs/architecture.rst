@@ -1173,11 +1173,24 @@ So the bound is: **one unsealed block per context the close stops
 mid-block, and zero for a close whose stopping point was deferred to a
 block boundary.**  A count above that on a target-reached route is a
 defect, not a corner: it means a thread was cut off at a stopping point
-the tracer could have deferred past.  On the terminal routes the
-question is not the count but the policy — whether the END marker
-should, like a budget, defer its close until the block it fired inside
-seals.  The instrument answers "how many, whose, and stopped by what";
-that ruling is elsewhere.
+the tracer could have deferred past.
+
+On the terminal routes the count of one is not a defect to drive out;
+it is the shape of a stop that lands mid-block, and **the END marker
+must not defer past it**.  A budget can wait for the crossing block to
+seal because a budget is a quantity — where it lands in the instruction
+stream carries no meaning.  A marker is a *position*: the guest placed
+it to say "the region of interest ends here", so every instruction from
+the firing one onward is outside what the workload asked to be traced.
+Running the block out to seal it publishes them — on the x86_64 marker
+cell the marker sits in a function whose remaining instructions are its
+own epilogue, and a deferred close put the second and third marker
+instructions plus ``nop; pop %rbp; ret`` (with the ``ret``'s stack load)
+on the wire, past the marker that ended the region.  The unsealed block
+is the honest price of stopping where the guest said to stop, and the
+declared executed range (:doc:`format` §4.2a) is the format's way of
+saying so.  The instrument answers "how many, whose, and stopped by
+what"; the policy is this.
 
 The stop rule is also what keeps the final block's register deltas
 complete.  A destination snapshot is captured one instruction late

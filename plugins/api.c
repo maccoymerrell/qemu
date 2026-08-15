@@ -1439,6 +1439,24 @@ void qemu_plugin_spec_mode_end(void)
     current_cpu->plugin_spec_store_pool_used = 0;
 
     /*
+     * The fault flag belongs to the memop that raised it, and the excursion
+     * it belonged to is over.  It is set only under cpu_plugin_spec_active()
+     * and consumed by qemu_plugin_spec_mem_faulted_take(), whose contract is
+     * that the memory callback takes it immediately after the access — but
+     * two constructions break that pairing and leave it set: an instruction
+     * FETCH raises it with no memory callback behind it to take it, and a
+     * consumer that returns before its take (a per-instruction slot cap, a
+     * muted segment) never reaches one.  Left set, it is read by the FIRST
+     * memop of the NEXT excursion, which is tagged faulted and stripped of
+     * its physical page though nothing faulted for it.
+     *
+     * Cleared at END, not at BEGIN: a fault skip tears spec mode down and
+     * re-enters it mid-excursion, so clearing on entry would erase a flag
+     * that is still live.
+     */
+    current_cpu->plugin_spec_mem_faulted = false;
+
+    /*
      * Flush the softmmu TLB on spec-mode exit (no-op in user mode).  Spec-mode
      * accesses still run tlb_fill on a miss and install entries that a regime
      * change on the wrong path can invalidate for the correct path; the

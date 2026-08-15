@@ -1497,7 +1497,7 @@ static bool sdiff_enabled(void)
  * are reported on essentially every excursion, and the reader who has learned
  * to scroll past them scrolls past the one line that matters.
  *
- * Three groups, and none of them is an un-restored wrong-path mutation:
+ * Four groups, and none of them is an un-restored wrong-path mutation:
  *
  *  - ASYNC SIGNALLING (exit_request, interrupt_request, work_list).  These are
  *    written by OTHER threads -- the iothread's device models raise an
@@ -1515,10 +1515,27 @@ static bool sdiff_enabled(void)
  *    tracer latches its own copy at the top of its dispatch callback, before
  *    any excursion can run, precisely because a wrong path overwrites them.
  *
+ *  - THE WRONG-PATH STORE SANDBOX (plugin_spec_store_buf, _pool, _pool_used,
+ *    _pool_cap, _atomic_scratch, _store_overflow).  The sandbox that holds the
+ *    excursion's speculative stores is an allocator, and its buffer is kept
+ *    across excursions on purpose: qemu_plugin_spec_mode_end empties the line
+ *    index and resets the high-water mark but does NOT free the pool, so the
+ *    next excursion reuses it.  The pointers therefore go NULL -> heap on the
+ *    first excursion that stores, and the cap grows when a wider one needs
+ *    more lines.  What the sandbox HOLDS is discarded at excursion exit --
+ *    that is the sandbox's whole purpose -- so the surviving allocation
+ *    carries no wrong-path value into the correct path.
+ *
  *  - EXCURSION BOOKKEEPING (plugin_spec_vtime_paused, plugin_spec_timer_dirty,
  *    plugin_spec_tlb_log and its siblings).  plugin_spec_vtime_paused is this
  *    detector's own bracket: set before the snapshot, cleared before the
  *    compare, so it differs on every excursion ever measured.
+ *
+ * The rest of the plugin block is DELIBERATELY left unnamed -- the fault stack
+ * and its depth, the event queue, plugin_spec_saved_state, the identity memo.
+ * A change there across an excursion is exactly the finding this detector is
+ * for, and naming the block wholesale to quieten the sandbox lines would hide
+ * it.
  */
 static const char *sdiff_cpu_field(size_t off)
 {
@@ -1536,6 +1553,13 @@ static const char *sdiff_cpu_field(size_t off)
     if (off >= offsetof(CPUState, plugin_rep_iters) &&
         off <  offsetof(CPUState, plugin_mops_report) + sizeof(void *)) {
         return "(plugin per-execution report scratch - rewritten every insn)";
+    }
+    if (off >= offsetof(CPUState, plugin_spec_store_buf) &&
+        off <  offsetof(CPUState, plugin_spec_store_overflow) +
+               sizeof(((CPUState *)0)->plugin_spec_store_overflow)) {
+        return "(wrong-path store sandbox - a pool DELIBERATELY reused across "
+               "excursions: qemu_plugin_spec_mode_end clears the line index "
+               "and resets pool_used, and keeps the buffer)";
     }
     if (off == offsetof(CPUState, plugin_spec_vtime_paused)) {
         return "plugin_spec_vtime_paused (this detector's own bracket)";

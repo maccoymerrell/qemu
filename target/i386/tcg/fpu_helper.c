@@ -2508,7 +2508,7 @@ static void cpu_set_fpus(CPUX86State *env, uint16_t fpus)
          * Here the processor deasserts FERR#; in response, the chipset deasserts
          * IGNNE#.
          */
-        cpu_clear_ignne();
+        cpu_clear_ignne(env);
     }
 #endif
 }

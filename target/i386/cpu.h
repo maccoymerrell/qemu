@@ -2390,7 +2390,7 @@ int cpu_get_pic_interrupt(CPUX86State *s);
 void x86_register_ferr_irq(qemu_irq irq);
 void fpu_check_raise_ferr_irq(CPUX86State *s);
 void cpu_set_ignne(void);
-void cpu_clear_ignne(void);
+void cpu_clear_ignne(CPUX86State *env);
 #endif
 
 /* mpx_helper.c */

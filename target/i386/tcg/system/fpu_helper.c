@@ -51,9 +51,18 @@ void fpu_check_raise_ferr_irq(CPUX86State *env)
     }
 }
 
-void cpu_clear_ignne(void)
+/*
+ * Takes the env it acts on.  Its sole caller is cpu_set_fpus(), i.e. an
+ * x87 state load executing ON a vCPU, and IGNNE is that vCPU's own hidden
+ * flag; reading first_cpu instead made an FRSTOR/FLDENV/XRSTOR on any vCPU
+ * but the first clear vCPU 0's IGNNE and leave its own set.  The reader,
+ * fpu_check_raise_ferr_irq(), then asserts FERR# on vCPU 0's next unmasked
+ * x87 error, an interrupt that guest never earned.  (cpu_set_ignne() keeps
+ * first_cpu deliberately: its caller is the port-F0h chipset write, which
+ * is a machine-wide event and holds the BQL to prove it.)
+ */
+void cpu_clear_ignne(CPUX86State *env)
 {
-    CPUX86State *env = &X86_CPU(first_cpu)->env;
     env->hflags2 &= ~HF2_IGNNE_MASK;
 }
 

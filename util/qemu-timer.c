@@ -177,6 +177,81 @@ void qemu_clock_enable(QEMUClockType type, bool enabled)
     }
 }
 
+/*
+ * The guest-visible virtual-clock PROCESSING stall.  See
+ * qemu_clock_plugin_stall_set() in qemu/timer.h for the contract; this is
+ * the state it sets and the four places that read it.
+ *
+ * Those four are not a list of the sites that seemed to matter.  Every
+ * evaluation of a QEMU_CLOCK_VIRTUAL deadline in this file is a comparison
+ * of a timer's expire_time against qemu_clock_get_ns(clock->type), and there
+ * are exactly four such comparisons reachable from outside:
+ *
+ *     timerlist_expired()        <- qemu_clock_expired()
+ *     timerlist_deadline_ns()    <- timerlistgroup_deadline_ns()
+ *     qemu_clock_deadline_ns_all()
+ *     timerlist_run_timers()     <- qemu_clock_run_timers(),
+ *                                   timerlistgroup_run_timers(),
+ *                                   qemu_clock_run_all_timers()
+ *
+ * Every other public entry point in this file funnels into one of them, so
+ * gating these four gates the clock rather than gating a set of callers.
+ * The remaining comparison, in timer_mod_ns_locked(), sorts a new deadline
+ * against the ones already on the list and never reads the clock at all.
+ * timer_expired() takes its current_time from its caller and is likewise not
+ * an evaluation of the clock by this file.  Re-derive with:
+ *
+ *     grep -n 'qemu_clock_get_ns\|timer_expired_ns' util/qemu-timer.c
+ *
+ * The handshake with the release is Dekker's, and it is here because the
+ * cost of losing it is a hang.  A reader that hides a deadline from the main
+ * loop leaves the main loop parked on an infinite poll, so the release MUST
+ * see the flag of every reader that hid one.  Reader: publish the flag, then
+ * re-read the stall.  Releaser: clear the stall, then read the flag.  With a
+ * full barrier on each side at least one of the two sees the other, so a
+ * reader that still observes the stall is guaranteed to be notified, and a
+ * reader that observes the release computes the real deadline instead of
+ * hiding one.  A doubled notify is possible and costs a wakeup; a missed one
+ * is not possible, and that is the asymmetry worth paying a fence for.
+ */
+static bool plugin_vclock_stall;
+static bool plugin_vclock_deadline_hidden;
+
+static bool vclock_processing_stalled(QEMUClockType type)
+{
+    if (type != QEMU_CLOCK_VIRTUAL) {
+        return false;
+    }
+    if (!qatomic_read(&plugin_vclock_stall)) {
+        return false;
+    }
+    qatomic_set(&plugin_vclock_deadline_hidden, true);
+    smp_mb();
+    return qatomic_read(&plugin_vclock_stall);
+}
+
+void qemu_clock_plugin_stall_set(bool on)
+{
+    if (on) {
+        qatomic_set(&plugin_vclock_stall, true);
+        return;
+    }
+
+    qatomic_set(&plugin_vclock_stall, false);
+    smp_mb();
+    /*
+     * Notify ONLY if the stall actually hid something.  An unconditional
+     * notify here is a main-loop wakeup per correct-path instrumentation
+     * window -- that is once per translation block, and it was measured to
+     * turn a 14-second fixture into a 79-second one.  The wakeup belongs to
+     * the deadline that was hidden, not to the freeze that hid nothing.
+     */
+    if (qatomic_read(&plugin_vclock_deadline_hidden) &&
+        qatomic_xchg(&plugin_vclock_deadline_hidden, false)) {
+        qemu_clock_notify(QEMU_CLOCK_VIRTUAL);
+    }
+}
+
 bool timerlist_has_timers(QEMUTimerList *timer_list)
 {
     return !!qatomic_read(&timer_list->active_timers);
@@ -193,6 +268,10 @@ bool timerlist_expired(QEMUTimerList *timer_list)
     int64_t expire_time = 0;
 
     if (!qatomic_read(&timer_list->active_timers)) {
+        return false;
+    }
+
+    if (vclock_processing_stalled(timer_list->clock->type)) {
         return false;
     }
 
@@ -227,6 +306,10 @@ int64_t timerlist_deadline_ns(QEMUTimerList *timer_list)
     }
 
     if (!timer_list->clock->enabled) {
+        return -1;
+    }
+
+    if (vclock_processing_stalled(timer_list->clock->type)) {
         return -1;
     }
 
@@ -265,6 +348,10 @@ int64_t qemu_clock_deadline_ns_all(QEMUClockType type, int attr_mask)
     QEMUClock *clock = qemu_clock_ptr(type);
 
     if (!clock->enabled) {
+        return -1;
+    }
+
+    if (vclock_processing_stalled(type)) {
         return -1;
     }
 
@@ -614,6 +701,9 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
     if (!timer_list->clock->enabled) {
         goto out;
     }
+    if (vclock_processing_stalled(timer_list->clock->type)) {
+        goto out;
+    }
 
     switch (timer_list->clock->type) {
     case QEMU_CLOCK_REALTIME:
@@ -647,6 +737,21 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
     qemu_mutex_lock(&timer_list->active_timers_lock);
     pass = ++timer_list->run_pass;
     while ((ts = timer_list->active_timers)) {
+        /*
+         * The stall can be taken while this pass is already running -- the
+         * BQL excludes a main-loop pass from overlapping a freeze entry, but
+         * an iothread-owned virtual timerlist is not covered by that
+         * argument.  Stop before the next pop and leave the remainder
+         * armed; the release notifies, and the pass resumes from the same
+         * head against the same clock value.  A callback already executing
+         * runs to completion: this stops the next one, it does not drain
+         * the current one, which is the whole reason it is not
+         * qemu_clock_enable().
+         */
+        if (vclock_processing_stalled(timer_list->clock->type)) {
+            qemu_mutex_unlock(&timer_list->active_timers_lock);
+            goto out;
+        }
         if (!timer_expired_ns(ts, current_time)) {
             /* No expired timers left.  The checkpoint can be skipped
              * if no timers fired or they were all external.

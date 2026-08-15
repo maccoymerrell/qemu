@@ -235,6 +235,40 @@ void qemu_clock_notify(QEMUClockType type);
 void qemu_clock_enable(QEMUClockType type, bool enabled);
 
 /**
+ * qemu_clock_plugin_stall_set:
+ * @on: true to stall guest-visible virtual-clock processing, false to resume
+ *
+ * While the stall is held, QEMU_CLOCK_VIRTUAL is not merely fixed in value:
+ * it is not EVALUATED.  No deadline derived from it is reported, no timer
+ * registered on it is found expired, and no callback registered on it is
+ * entered.  Armed timers stay armed, in their existing order, with their
+ * existing expire_time; nothing is popped, deferred or recorded.  They are
+ * evaluated exactly once after the release, against the same clock value
+ * they were armed against -- which is the same value, because the caller
+ * that holds the stall is also the one that stopped the clock.
+ *
+ * The other three clock types are untouched.  QEMU_CLOCK_REALTIME,
+ * QEMU_CLOCK_HOST and QEMU_CLOCK_VIRTUAL_RT are not guest-visible time, and
+ * the monitor, the block layer and the management plane run on them.
+ *
+ * NOT a refcount and deliberately so: the freeze it serves is already
+ * counted, machine-wide, by plugin_ticks_freeze_depth, and a second count
+ * beside the first is a second answer to "is the machine frozen".  The
+ * caller drives this from that count's 0<->1 transitions and is the single
+ * authority.
+ *
+ * NOT implemented as qemu_clock_enable(QEMU_CLOCK_VIRTUAL, false), which has
+ * exactly the right read side and the wrong wait side: it blocks on every
+ * attached timerlist's timers_done_ev, so a vCPU taking it under the BQL
+ * waits for an iothread timerlist pass whose callback may want the BQL.
+ * This stops the NEXT callback rather than draining the current one, and
+ * never waits for anything.
+ *
+ * Caller holds the BQL.  Read without it from iothread timerlists.
+ */
+void qemu_clock_plugin_stall_set(bool on);
+
+/**
  * qemu_clock_run_timers:
  * @type: clock on which to operate
  *

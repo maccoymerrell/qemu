@@ -12192,8 +12192,11 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 
     /* Lifetime-class selection (#91): templates built for a wrong-path
      * translation are born SPEC — reclaimable at tb_flush unless the
-     * correct path executes them first (see TmplLife). */
-    g_template_store.set_creating_spec(g_wp_in_progress);
+     * correct path executes them first (see TmplLife).  The label lasts
+     * exactly as long as this translation (TemplateStore::TranslationScope):
+     * templates minted at execution time belong to a cache the reclaim never
+     * touches, and must not answer to a translation's flag. */
+    TemplateStore::TranslationScope spec_class_scope(g_wp_in_progress);
 
     /*
      * Every TB gets the full heavy translation, regardless of segment

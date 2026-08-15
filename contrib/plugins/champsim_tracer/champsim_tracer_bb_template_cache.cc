@@ -43,6 +43,11 @@ void TemplateStore::set_creating_spec(bool spec)
     tls_creating_spec = spec;
 }
 
+TemplateStore &TemplateStore::TranslationScope::g_template_store_ref()
+{
+    return g_template_store;
+}
+
 /* The CODE's live translation address-space id — the key component that
  * disambiguates a shared code VA across owned processes (see BBKey).  Every
  * store mutator/lookup runs from a live vCPU context (translation, or CP/WP
@@ -490,25 +495,18 @@ BBTemplate *TemplateStore::commit_alt_bb(uint64_t start_pc,
         return it->second.get();   /* idempotent re-mint of the same block */
     }
 
-    /* An alternate is minted from a branch's untaken side; the current
-     * thread may be mid-wrong-path (tls_creating_spec true), whose SPEC
-     * lifetime + reclaim accounting must NOT apply here — an alternate is a
-     * segment-scoped CODE dictionary entry, not a reclaimable spec
-     * translation.  Force the CODE class across the build (build_bb_template
-     * reads tls_creating_spec for both life AND note_spec_creation), then
-     * restore.  template_id 0 is a placeholder: for_each_alt assigns the real
-     * wire id lazily so the mint never consumes an id an executed block would
-     * otherwise take (the body stays byte-identical). */
-    bool saved_spec = tls_creating_spec;
-    tls_creating_spec = false;
+    /* An alternate is a segment-scoped dictionary entry for a block that was
+     * never executed, minted from a branch's untaken side — CODE like every
+     * other true-BB template, and no reclaim's business.  template_id 0 is a
+     * placeholder: for_each_alt assigns the real wire id lazily so the mint
+     * never consumes an id an executed block would otherwise take (the body
+     * stays byte-identical). */
     BBTemplatePtr tmpl = build_bb_template(/* template_id= */ 0,
                                            start_pc, n_insns,
                                            insn_pcs, insn_fields,
                                            insn_sizes, insn_bytes,
                                            insn_reg_names,
                                            symbol_name, fall_through_pc);
-    tls_creating_spec = saved_spec;
-    tmpl->life = TmplLife::CODE;   /* ordinary never-executed entry; no flag */
     BBTemplate *raw = tmpl.get();
     alt_map_[key] = std::move(tmpl);
     return raw;
@@ -563,12 +561,10 @@ void TemplateStore::census(std::FILE *out) const
 {
     /* Per-bucket tallies of the serialisable true-BB cache (bb_map_).
      *
-     * The reliable CP-vs-WP provenance discriminator is is_system_cp_confirmed
-     * (set only by a correct-path finalize; a WP-only commit leaves it false),
-     * NOT the life class — a true-BB's SPEC/CODE label is assigned at commit
-     * from the thread's last-translation tls_creating_spec, which can be
-     * stale-true when a CP finalize follows a WP translation, so life
-     * mislabels CP true-BBs as SPEC.  The census keys on cp_confirmed. */
+     * The CP-vs-WP provenance discriminator is is_system_cp_confirmed (set
+     * only by a correct-path finalize; a WP-only commit leaves it false), not
+     * the life class — every true BB is CODE, whichever path committed it,
+     * because none of them is reclaimable.  The census keys on cp_confirmed. */
     size_t sent_conf = 0, sent_unconf = 0;       /* kernel in the sentinel */
     size_t kroot_conf = 0, kroot_unconf = 0;     /* kernel under a real root */
     size_t user_root = 0, user_sentinel = 0;     /* user (sentinel would be a bug) */
@@ -832,7 +828,12 @@ static BBTemplatePtr build_bb_template(uint32_t template_id,
     }
     BBTemplatePtr tmpl(g_new0(BBTemplate, 1));
     tmpl->template_id = template_id;
-    tmpl->life = tls_creating_spec ? TmplLife::SPEC : TmplLife::CODE;
+    /* A true-BB template is minted at EXECUTION time, into a cache the
+     * reclaim never walks (bb_map_ / partial_bb_map_ / alt_map_ own their
+     * templates outright; reclaim_spec_templates partitions tb_templates_).
+     * It is CODE by construction, on either path: a wrong-path commit's
+     * template outlives every flush exactly as a correct-path one does. */
+    tmpl->life = TmplLife::CODE;
     tmpl->start_pc = start_pc;
     tmpl->n_insns = n_insns;
     tmpl->fall_through_pc = fall_through_pc;
@@ -865,14 +866,12 @@ static BBTemplatePtr build_bb_template(uint32_t template_id,
                &insn_bytes[(size_t)i * MAX_INSN_BYTES],
                MAX_INSN_BYTES);
     }
-    if (tls_creating_spec) {
-        /* Reclaimable-footprint accounting for the proactive-flush
-         * trigger — exact now that the span pool is sized. */
-        g_template_store.note_spec_creation(sizeof(BBTemplate) +
-            (uint64_t)n_insns * (sizeof(InsnFields) + sizeof(uint64_t) +
-                                 1 + MAX_INSN_BYTES + sizeof(InsnRegNames)) +
-            tmpl->insn_fields_pool_bytes);
-    }
+    /* No reclaimable-footprint accounting here.  spec_pending_bytes_ is the
+     * estimate of what the NEXT reclaim can free, and it is what asks QEMU
+     * for a proactive tb_flush; a true BB is not reclaimable, so crediting
+     * its bytes would ask for flushes that cannot reduce the footprint they
+     * were asked for.  The wrong path's volume — and the whole of #91 — is
+     * the fragment path (create_tb_template), which accounts for itself. */
     /*
      * No delay-slot reorder: the template stays in TRUE EXECUTION ORDER
      * [.., branch, delay-slot].  Reordering to branch-last would make

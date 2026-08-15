@@ -392,6 +392,40 @@ public:
      * of templates freed. */
     void set_creating_spec(bool spec);
     uint64_t spec_pending_bytes() const { return spec_pending_bytes_; }
+    /*
+     * Extent of the label: ONE translation.
+     *
+     * The lifetime class is a property of the translator's output.  Only
+     * create_tb_template — reached solely from inside vcpu_tb_trans — mints a
+     * template the reclaim can free, and only those bytes belong in
+     * spec_pending_bytes_.  Templates minted at EXECUTION time (the true-BB
+     * funnel, build_bb_template via get_or_create_bb_template) land in
+     * bb_map_, which no reclaim touches; they are CODE by construction.
+     *
+     * A label that outlives its translation is therefore read by a caller it
+     * does not describe: the correct-path true-BB commits that follow a
+     * wrong-path translation — starting with the very block whose branch
+     * launched the excursion — see the wrong path's flag.  They are then
+     * labelled SPEC (the census records this as a known mislabel) and their
+     * bytes are credited to a reclaimable-footprint estimate that no reclaim
+     * can ever reduce, while that estimate is what asks QEMU for a tb_flush.
+     * Scoping the label to its translation keeps the estimate exact and makes
+     * the flush request a function of wrong-path fetch residue alone.
+     */
+    struct TranslationScope {
+        explicit TranslationScope(bool spec)
+        {
+            g_template_store_ref().set_creating_spec(spec);
+        }
+        ~TranslationScope()
+        {
+            g_template_store_ref().set_creating_spec(false);
+        }
+        TranslationScope(const TranslationScope &) = delete;
+        TranslationScope &operator=(const TranslationScope &) = delete;
+    private:
+        static TemplateStore &g_template_store_ref();
+    };
     void note_spec_creation(uint64_t bytes) { spec_pending_bytes_ += bytes; }
     uint64_t reclaim_spec_templates(void);
 

@@ -4576,14 +4576,28 @@ def _check_wrong_path_chains(entries: list[dict],
             # The two are not the same event.  `wp_left_user` models a
             # PRIVILEGE crossing, where the tail is unpredictable only
             # from the crossing on, and demanding the whole predicted
-            # user prefix first is right.  The wire's flag names four
-            # causes -- un-resident code, a refused garbage region, a
-            # privilege-boundary fetch, and the host's speculative code
-            # buffer being exhausted -- and the last of those is a HOST
-            # resource condition that has nothing to do with how much of
-            # the guest's predicted path remains.  It becomes reachable
-            # mid-prefix as soon as guest threads run concurrently, which
-            # is why single-thread cells never met it.
+            # user prefix first is right.  The wire's flag POOLS several
+            # stops (format.rst §4.4); which one fired is a question for
+            # the plugin's own counters, not for this check.  In the
+            # measured user-mode cells the counters answered it: chain
+            # cut by code-buffer 0, first-TB unavailable 0, one WP early
+            # exit -- the wrong path computed a target outside mapped
+            # instruction space (the user-mode escape), which under
+            # concurrent guest threads is schedule-dependent because the
+            # state feeding a wrong-path target varies with the
+            # interleaving.  A single-thread cell is deterministic, so a
+            # seed either always meets the escape or never does; that is
+            # why this first surfaced with the multi-thread oracle.  A
+            # code-buffer cut can never be the accepted explanation for
+            # anything: the "WP chain cut by code-buffer (must be 0)"
+            # census row fails any capture that has one, independently
+            # of this accept.  In SYSTEM mode the flag is routine, not a
+            # defect: the privilege-domain-switch terminate (the
+            # SMEP/PXN model, champsim_tracer_wp.cc) deliberately rides
+            # the same marker -- in one clean --smp 2 cell, 1,413 of
+            # 1,419 flags were kernel-launched domain crossings, every
+            # one on its chain's last block -- so nothing here may key
+            # on mode.
             #
             # Strictness is kept where it does work: the flag must sit on
             # the block the walk actually stopped at (the spec sets it on

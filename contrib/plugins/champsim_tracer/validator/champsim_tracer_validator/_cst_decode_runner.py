@@ -31,14 +31,17 @@ this file (the canonical in-tree build location).
 
 from __future__ import annotations
 
+import bisect
 import dataclasses
-import mmap
 import os
+import pickle
 import re
 import shutil
 import subprocess
 import tempfile
 from array import array
+from collections import OrderedDict
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Iterator
 
@@ -556,126 +559,150 @@ def _parse_observations(lines: list[str], i: int,
     return dyn, snaps, mflags, lanes, i
 
 
-def _iter_body(lines: list[str], i: int,
-               reg_name_to_id: dict[str, int]) -> Iterator[dict]:
+def _body_start(lines, i: int) -> int:
+    """Index of the first line after the ``BODY`` section header, or -1 when
+    the decode has no body section at all."""
     while i < len(lines) and lines[i] == "":
         i += 1
     if i >= len(lines):
-        return
+        return -1
     if lines[i] != "BODY" or lines[i + 1] != "----":
         raise ValueError("expected BODY section header")
-    i += 2
-    while i < len(lines):
-        line = lines[i]
-        if line == "":
-            i += 1
-            continue
-        m = _ENTRY_HEAD_RE.match(line)
-        if not m:
-            i += 1
-            continue
-        seq_num = int(m.group(1))
-        thread_id = int(m.group(2))
-        asid_index = int(m.group(3)) if m.group(3) is not None else 0
-        thread_switched = m.group(4) == "1"
-        fault_depth = int(m.group(5)) if m.group(5) is not None else 0
-        # Executed range [bb_start, bb_stop) — printed only when partial,
-        # so None here means "whole block" (resolved after the template
-        # is known by consumers that need the absolute stop).
-        bb_start = int(m.group(6)) if m.group(6) is not None else 0
-        bb_stop = int(m.group(7)) if m.group(7) is not None else None
-        template_id = int(m.group(8))
-        branch_taken = (None if m.group(9) is None
-                        else m.group(9) == "taken")
-        branch_target = (None if m.group(10) is None
-                         else int(m.group(10), 16))
-        thread_end = m.group(11) is not None
+    return i + 2
+
+
+def _parse_entry_at(lines, i: int,
+                    reg_name_to_id: dict[str, int]) -> tuple[dict, int]:
+    """Parse the one ENTRY record whose head line sits at @i.
+
+    Returns ``(entry, next_i)``.  An entry is self-contained -- it begins at
+    its own ``ENTRY`` head and stops at the first line that is neither its
+    ``cp:`` block, one of its ``wp[k]`` blocks, nor its chain-level wp note --
+    so this can be called at any indexed head without replaying the stream.
+    That property is what makes :class:`_EntrySeq` possible.
+    """
+    m = _ENTRY_HEAD_RE.match(lines[i])
+    if not m:
+        raise ValueError(f"not an ENTRY head at line {i}: {lines[i]!r}")
+    seq_num = int(m.group(1))
+    thread_id = int(m.group(2))
+    asid_index = int(m.group(3)) if m.group(3) is not None else 0
+    thread_switched = m.group(4) == "1"
+    fault_depth = int(m.group(5)) if m.group(5) is not None else 0
+    # Executed range [bb_start, bb_stop) — printed only when partial,
+    # so None here means "whole block" (resolved after the template
+    # is known by consumers that need the absolute stop).
+    bb_start = int(m.group(6)) if m.group(6) is not None else 0
+    bb_stop = int(m.group(7)) if m.group(7) is not None else None
+    template_id = int(m.group(8))
+    branch_taken = (None if m.group(9) is None
+                    else m.group(9) == "taken")
+    branch_target = (None if m.group(10) is None
+                     else int(m.group(10), 16))
+    thread_end = m.group(11) is not None
+    i += 1
+    n_lines = len(lines)
+    # CP block: indented "cp:" header followed by observations.
+    cp_dyn: list[DynParam] = []
+    cp_snaps: list[dict] = []
+    cp_mflags: list[dict] = []
+    cp_lanes: list[dict] = []
+    wp_entries: list[dict] = []
+    if i < n_lines and lines[i] == "  cp:":
         i += 1
-        # CP block: indented "cp:" header followed by observations.
-        cp_dyn: list[DynParam] = []
-        cp_snaps: list[dict] = []
-        cp_mflags: list[dict] = []
-        cp_lanes: list[dict] = []
-        wp_entries: list[dict] = []
-        if i < len(lines) and lines[i] == "  cp:":
+        # Strip leading 4 spaces from observation lines so the
+        # generic parser reads them.
+        obs_lines: list[str] = []
+        while i < n_lines and lines[i].startswith("    "):
+            obs_lines.append(lines[i][4:])
             i += 1
-            # Strip leading 4 spaces from observation lines so the
-            # generic parser reads them.
-            obs_lines: list[str] = []
-            while i < len(lines) and lines[i].startswith("    "):
-                obs_lines.append(lines[i][4:])
-                i += 1
-            j = 0
-            cp_dyn, cp_snaps, cp_mflags, cp_lanes, _ = _parse_observations(
-                obs_lines, j, reg_name_to_id)
-        while i < len(lines):
-            mw = _WP_HEAD_RE.match(lines[i])
-            if not mw:
-                break
-            i += 1
-            wp = {
-                "index": int(mw.group(1)),
-                "template_id": int(mw.group(2)),
-                "n_insns": int(mw.group(3)),
-                "bb_start": (int(mw.group(4))
-                             if mw.group(4) is not None else 0),
-                "bb_stop": (int(mw.group(5))
-                            if mw.group(5) is not None else None),
-                "dyn_params": [],
-                "reg_snaps": [],
-                "metaflags": [],
-                "lane_masks": [],
-                "fault": False,
-                "translation_unavailable": False,
-                "fault_insn_index": None,
-            }
-            if i < len(lines) and lines[i].startswith("    status:"):
-                tokens = lines[i][len("    status: "):].split()
-                for t in tokens:
-                    if t == "FAULT":
-                        wp["fault"] = True
-                    elif t.startswith("FAULT@insn"):
-                        wp["fault"] = True
-                        wp["fault_insn_index"] = int(t[len("FAULT@insn"):])
-                    elif t == "TRANSLATION_UNAVAILABLE":
-                        wp["translation_unavailable"] = True
-                i += 1
-            obs_lines = []
-            while i < len(lines) and lines[i].startswith("    "):
-                obs_lines.append(lines[i][4:])
-                i += 1
-            j = 0
-            (wp["dyn_params"], wp["reg_snaps"],
-             wp["metaflags"], wp["lane_masks"], _) = _parse_observations(
-                obs_lines, j, reg_name_to_id)
-            wp_entries.append(wp)
-        # Chain-level TRANSLATION_UNAVAIL event (format spec §4.4): the
-        # excursion was kicked but its first target could not be
-        # fetched, so the entry has no wp[k] blocks and the decoder
-        # prints this line instead.
-        wp_first_fetch_unavailable = False
-        if i < len(lines) and lines[i] == "  wp: none (first fetch unavailable)":
-            wp_first_fetch_unavailable = True
-            i += 1
-        yield {
-            "seq_num": seq_num,
-            "template_id": template_id,
-            "thread_id": thread_id,
-            "asid_index": asid_index,
-            "thread_switched": thread_switched,
-            "branch_taken": branch_taken,
-            "branch_target": branch_target,
-            "thread_end": thread_end,
-            "fault_depth": fault_depth,
-            "bb_start": bb_start,
-            "bb_stop": bb_stop,
-            "dyn_params": cp_dyn,
-            "reg_snaps": cp_snaps,
-            "metaflags": cp_mflags,
-            "lane_masks": cp_lanes,
-            "wp_entries": wp_entries,
-            "wp_first_fetch_unavailable": wp_first_fetch_unavailable,
+        j = 0
+        cp_dyn, cp_snaps, cp_mflags, cp_lanes, _ = _parse_observations(
+            obs_lines, j, reg_name_to_id)
+    while i < n_lines:
+        mw = _WP_HEAD_RE.match(lines[i])
+        if not mw:
+            break
+        i += 1
+        wp = {
+            "index": int(mw.group(1)),
+            "template_id": int(mw.group(2)),
+            "n_insns": int(mw.group(3)),
+            "bb_start": (int(mw.group(4))
+                         if mw.group(4) is not None else 0),
+            "bb_stop": (int(mw.group(5))
+                        if mw.group(5) is not None else None),
+            "dyn_params": [],
+            "reg_snaps": [],
+            "metaflags": [],
+            "lane_masks": [],
+            "fault": False,
+            "translation_unavailable": False,
+            "fault_insn_index": None,
         }
+        if i < n_lines and lines[i].startswith("    status:"):
+            tokens = lines[i][len("    status: "):].split()
+            for t in tokens:
+                if t == "FAULT":
+                    wp["fault"] = True
+                elif t.startswith("FAULT@insn"):
+                    wp["fault"] = True
+                    wp["fault_insn_index"] = int(t[len("FAULT@insn"):])
+                elif t == "TRANSLATION_UNAVAILABLE":
+                    wp["translation_unavailable"] = True
+            i += 1
+        obs_lines = []
+        while i < n_lines and lines[i].startswith("    "):
+            obs_lines.append(lines[i][4:])
+            i += 1
+        j = 0
+        (wp["dyn_params"], wp["reg_snaps"],
+         wp["metaflags"], wp["lane_masks"], _) = _parse_observations(
+            obs_lines, j, reg_name_to_id)
+        wp_entries.append(wp)
+    # Chain-level TRANSLATION_UNAVAIL event (format spec §4.4): the
+    # excursion was kicked but its first target could not be
+    # fetched, so the entry has no wp[k] blocks and the decoder
+    # prints this line instead.
+    wp_first_fetch_unavailable = False
+    if i < n_lines and lines[i] == "  wp: none (first fetch unavailable)":
+        wp_first_fetch_unavailable = True
+        i += 1
+    return {
+        "seq_num": seq_num,
+        "template_id": template_id,
+        "thread_id": thread_id,
+        "asid_index": asid_index,
+        "thread_switched": thread_switched,
+        "branch_taken": branch_taken,
+        "branch_target": branch_target,
+        "thread_end": thread_end,
+        "fault_depth": fault_depth,
+        "bb_start": bb_start,
+        "bb_stop": bb_stop,
+        "dyn_params": cp_dyn,
+        "reg_snaps": cp_snaps,
+        "metaflags": cp_mflags,
+        "lane_masks": cp_lanes,
+        "wp_entries": wp_entries,
+        "wp_first_fetch_unavailable": wp_first_fetch_unavailable,
+    }, i
+
+
+def _iter_body(lines, i: int,
+               reg_name_to_id: dict[str, int]) -> Iterator[dict]:
+    """Yield every body ENTRY in stream order, retaining none of them."""
+    i = _body_start(lines, i)
+    if i < 0:
+        return
+    n_lines = len(lines)
+    while i < n_lines:
+        line = lines[i]
+        if line == "" or not _ENTRY_HEAD_RE.match(line):
+            i += 1
+            continue
+        entry, i = _parse_entry_at(lines, i, reg_name_to_id)
+        yield entry
 
 
 # ---------------------------------------------------------------------------
@@ -698,46 +725,104 @@ class _LineFile:
     passes re-scanned it.  That pattern exhausted 487 GiB of host RAM and
     took the machine down for two days.
 
-    Here the text stays on disk, mmapped, and the only resident structure is
-    an 8-bytes-per-line offset index -- ~4 GB for that same 540 M-line trace
-    instead of 60+ GB, with no change to how the parsers address it.
-    Sequential access (the overwhelmingly common pattern) costs a slice of
-    the mapping; random access costs the same.
+    Here the text stays on disk and the only resident structure is an
+    8-bytes-per-line offset index, with no change to how the parsers address
+    it.  Bytes are pulled through ``os.pread`` into one bounded window rather
+    than through a whole-file mmap: a mapping's resident pages are charged to
+    this process's RSS, so streaming a 1.5 GB decode through one would report
+    (and hold) 1.5 GB of page cache as if it were the parser's own heap.
+    ``pread`` leaves those pages in the kernel's cache where they belong and
+    the window costs :data:`_WINDOW` bytes no matter how long the trace is.
+
+    ``mark_prefixes`` records, during the single index-building pass, the line
+    numbers of every line beginning with one of the given prefixes.  That is
+    what lets the readers above find the ENTRY / REGFILE / BODY_STATS records
+    without re-walking tens of millions of lines per question asked.
     """
 
-    __slots__ = ("_path", "_fh", "_mm", "_off", "_n", "_own")
+    __slots__ = ("_path", "_fh", "_fd", "_off", "_n", "_own", "_size",
+                 "_buf", "_buf_lo", "_buf_hi", "marks")
 
-    def __init__(self, path: str | os.PathLike, *, own: bool = False):
+    @property
+    def path(self) -> str:
+        return self._path
+
+    # One read window.  Big enough that sequential line access costs one
+    # syscall per few thousand lines; small enough to be irrelevant to RSS.
+    _WINDOW = 1 << 22          # 4 MiB
+
+    def __init__(self, path: str | os.PathLike, *, own: bool = False,
+                 mark_prefixes: tuple[bytes, ...] = ()):
         self._path = str(path)
         self._own = own
-        self._fh = open(self._path, "rb")
-        size = os.fstat(self._fh.fileno()).st_size
-        if size == 0:
-            self._mm = None
-            self._off = array("q")
-            self._n = 0
-            return
-        self._mm = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_READ)
-        off = array("q")
+        self._fh = open(self._path, "rb", buffering=1 << 20)
+        self._fd = self._fh.fileno()
+        if own:
+            # Unlink NOW, while the fd holds the data alive.  A scratch file
+            # that only disappears in close() survives a kill -9 and fills
+            # the array; this one cannot outlive the process by construction.
+            try:
+                os.unlink(self._path)
+            except OSError:
+                pass
+            self._own = False
+        self._size = os.fstat(self._fd).st_size
+        self._buf = b""
+        self._buf_lo = 0
+        self._buf_hi = 0
+        self.marks: dict[bytes, "array[int]"] = {
+            p: array("q") for p in mark_prefixes}
+        self._off = array("q")
+        self._n = 0
+        if self._size:
+            self._build_index(mark_prefixes)
+
+    def _build_index(self, mark_prefixes: tuple[bytes, ...]) -> None:
+        """One pass: line-start offsets, plus the line numbers of every
+        marked prefix.  Consumes the buffered handle opened in __init__ (the
+        scratch file is already unlinked by then, so it cannot be reopened by
+        name); every later read goes through ``os.pread`` on the same fd,
+        which is position-independent and leaves the file's pages in the
+        kernel page cache rather than in this process's RSS."""
+        off = self._off
         append = off.append
+        # (first byte, prefix, len, sink) -- the byte test rejects almost
+        # every line without slicing it.
+        probes = [(p[0], p, len(p), self.marks[p]) for p in mark_prefixes]
         pos = 0
-        find = self._mm.find
-        while pos < size:
+        idx = 0
+        for raw in self._fh:
             append(pos)
-            nl = find(b"\n", pos)
-            if nl < 0:
-                break
-            pos = nl + 1
-        self._off = off
-        self._n = len(off)
+            if probes and raw:
+                b0 = raw[0]
+                for first, pre, plen, sink in probes:
+                    if b0 == first and raw[:plen] == pre:
+                        sink.append(idx)
+                        break
+            pos += len(raw)
+            idx += 1
+        self._n = idx
 
     def __len__(self) -> int:
         return self._n
 
+    def _read(self, start: int, end: int) -> bytes:
+        """Bytes [start, end) via the sliding window."""
+        if start >= self._buf_lo and end <= self._buf_hi:
+            return self._buf[start - self._buf_lo:end - self._buf_lo]
+        want = max(self._WINDOW, end - start)
+        buf = os.pread(self._fd, want, start)
+        if len(buf) < end - start:          # short read at EOF
+            end = start + len(buf)
+        self._buf = buf
+        self._buf_lo = start
+        self._buf_hi = start + len(buf)
+        return buf[:end - start]
+
     def _line(self, i: int) -> str:
         start = self._off[i]
-        end = self._off[i + 1] if i + 1 < self._n else self._mm.size()
-        raw = self._mm[start:end]
+        end = self._off[i + 1] if i + 1 < self._n else self._size
+        raw = self._read(start, end)
         if raw.endswith(b"\n"):
             raw = raw[:-1]
         if raw.endswith(b"\r"):
@@ -765,9 +850,7 @@ class _LineFile:
             yield self._line(i)
 
     def close(self) -> None:
-        if self._mm is not None:
-            self._mm.close()
-            self._mm = None
+        self._buf = b""
         if self._fh is not None:
             self._fh.close()
             self._fh = None
@@ -777,12 +860,417 @@ class _LineFile:
             except OSError:
                 pass
 
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:                                   # noqa: BLE001
+            pass
+
     def __enter__(self):
         return self
 
     def __exit__(self, *exc):
         self.close()
         return False
+
+    def __deepcopy__(self, memo):
+        # Reached only if some new path deepcopies a structure that still
+        # points at the open decode.  Say so, instead of dying six frames
+        # down on "cannot pickle '_io.BufferedReader'".
+        raise TypeError(
+            "_LineFile is an open decode, not data: it cannot be deepcopied. "
+            "The lazy views over it (_EntrySeq, _BodyOrderSeq) each define "
+            "__deepcopy__ and hand back plain, independent Python objects -- "
+            "copy those, or iterate.")
+
+
+_ENTRY_MARK = b"ENTRY "
+_REGFILE_MARK = b"REGFILE "
+_STATS_MARK = b"BODY_STATS"
+_BODY_MARKS = (_ENTRY_MARK, _REGFILE_MARK, _STATS_MARK)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+# How many parsed entries the sequence keeps hot.  The checks read with
+# strong locality (a walk plus the odd `entries[idx + 1]` look-ahead), so a
+# small window absorbs nearly all re-reads; anything larger just buys back
+# the unbounded residency this class exists to remove.
+_ENTRY_CACHE_DEFAULT = 4096
+
+# Above this many entries, .materialize() refuses.  The mutation matrix and
+# the multi-thread provers legitimately need a real mutable list, and their
+# substrates are proof-sized (a 120 k-instruction trace, a few thousand
+# entries).  A 3 M-instruction system cell is ~576 k entries at ~18 KB each --
+# the 10.3 GiB that took the host down.  Nothing may cross that line silently.
+_MATERIALIZE_MAX_DEFAULT = 100_000
+
+# The body-record-order view is two machine words per record, not a whole
+# entry, so its ceiling sits far higher -- but it is still a ceiling, so a
+# trace nobody sized for cannot quietly become hundreds of MB of tuples.
+_ORDER_MATERIALIZE_MAX_DEFAULT = 2_000_000
+
+# Below this many entries the whole body parses in well under a second, so
+# the parsed-entry spill would cost a scratch file to save nothing.
+_SPILL_MIN_ENTRIES = 20_000
+
+
+def _spill_enabled() -> bool:
+    return os.environ.get("CST_DECODE_PARSED_SPILL", "1") != "0"
+
+
+def _spill_dir(lines: "_LineFile") -> str:
+    """Alongside the decode itself -- on the array, never /tmp (the OS SSD
+    on this host, which a multi-GB spill would fill)."""
+    env = os.environ.get("CST_DECODE_SCRATCH")
+    if env:
+        return env
+    d = os.path.dirname(lines.path)
+    return d if d and os.access(d, os.W_OK) else str(Path.cwd())
+
+
+class _ParsedSpill:
+    """Write-through store of PARSED entries, keyed by entry index.
+
+    ``validate()`` walks the body around forty times -- one pass per check.
+    Reading them lazily off the legacy text means each pass re-runs the
+    regex parse, which turns a bounded decode into a slow one.  So the
+    first read of an entry parses it and writes the parsed form here; every
+    later read is an unpickle, which costs a fraction of the parse and
+    still holds nothing resident.
+
+    Append-only, unlinked at creation, addressed by ``pread``/``pwrite`` --
+    the resident cost is two machine words per entry regardless of how big
+    the body is.
+    """
+
+    __slots__ = ("_fh", "_fd", "_off", "_len", "_end")
+
+    def __init__(self, n: int, scratch_dir: str):
+        fd, path = tempfile.mkstemp(prefix=".cstparsed-", suffix=".bin",
+                                    dir=scratch_dir)
+        self._fh = os.fdopen(fd, "r+b")
+        self._fd = self._fh.fileno()
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        # len == 0 means "not written yet"; a pickled entry is never empty.
+        self._off = array("q", bytes(8 * n))
+        self._len = array("q", bytes(8 * n))
+        self._end = 0
+
+    def get(self, k: int):
+        ln = self._len[k]
+        if not ln:
+            return None
+        return pickle.loads(os.pread(self._fd, ln, self._off[k]))
+
+    def put(self, k: int, entry: dict) -> None:
+        blob = pickle.dumps(entry, protocol=pickle.HIGHEST_PROTOCOL)
+        off = self._end
+        os.pwrite(self._fd, blob, off)
+        self._end = off + len(blob)
+        self._off[k] = off
+        self._len[k] = len(blob)
+
+    def close(self) -> None:
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except OSError:
+                pass
+            self._fh = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:                                   # noqa: BLE001
+            pass
+
+
+class _EntrySeq(Sequence):
+    """The body entries of a decode, as a lazy disk-backed sequence.
+
+    Indistinguishable from ``list[dict]`` for every read the validator does --
+    ``len()``, ``seq[i]``, negative indices, slicing, iteration, ``reversed``,
+    ``enumerate``, ``zip`` -- but it holds no entries.  ``seq[i]`` parses the
+    record at its indexed line offset on demand and a bounded LRU absorbs the
+    checks' locality; iteration walks the same path and retains nothing.
+    Resident cost is the line index, the entry index and the LRU, none of
+    which grow with how much the trace executed.
+
+    WHY THIS EXISTS.  ``decode_champsim_tracer`` used to return
+    ``list(_iter_body(...))``.  On a ``--stop 3000000`` system-marker cell
+    that is ~576 k entry dicts at ~18 KB apiece -- 10.3 GiB measured, per
+    cell.  Twelve to fifteen concurrent validator lanes reached ~190 GiB and
+    made the host unresponsive.  The eager list was never a requirement of
+    any caller; it was the shape the API happened to have.
+
+    Entries handed out by ``seq[i]`` are the cached objects, so a consumer
+    that MUTATES one would see its edit persist until eviction and then
+    vanish.  No read-only consumer does (audited).  The consumers that do
+    mutate -- the mutation matrix, the multi-thread provers -- take a
+    ``copy.deepcopy`` of the whole triple first, which lands on
+    :meth:`materialize` and gives them a genuine, independent ``list``.
+    """
+
+    __slots__ = ("_lines", "_rid", "_idx", "_lo", "_hi", "_cache", "_cap",
+                 "_root", "_spill")
+
+    def __init__(self, lines: _LineFile, body_start: int,
+                 reg_name_to_id: dict[str, int], *,
+                 idx=None, lo: int = 0, hi: int | None = None,
+                 cache=None, root: "_EntrySeq | None" = None,
+                 spill: "_ParsedSpill | None" = None):
+        self._lines = lines
+        self._rid = reg_name_to_id
+        if idx is None:
+            marks = lines.marks.get(_ENTRY_MARK, array("q"))
+            # ENTRY heads only ever occur in the body; clip anyway so a
+            # header that ever grew one cannot be read as a record.
+            first = bisect.bisect_left(marks, body_start) if body_start > 0 else 0
+            idx = marks[first:] if first else marks
+        self._idx = idx
+        self._lo = lo
+        self._hi = len(idx) if hi is None else hi
+        self._cap = _env_int("CST_DECODE_ENTRY_CACHE", _ENTRY_CACHE_DEFAULT)
+        self._cache = OrderedDict() if cache is None else cache
+        # A view keeps its parent (and so the open decode) alive.
+        self._root = root
+        if spill is not None:
+            self._spill = spill
+        elif root is None and _spill_enabled() and len(idx) > _SPILL_MIN_ENTRIES:
+            self._spill = _ParsedSpill(len(idx), _spill_dir(lines))
+        else:
+            self._spill = None
+
+    # -- sequence protocol -------------------------------------------------
+
+    def __len__(self) -> int:
+        return self._hi - self._lo
+
+    def _parse(self, k: int) -> dict:
+        entry, _ = _parse_entry_at(self._lines, self._idx[k], self._rid)
+        return entry
+
+    def _fresh(self, k: int) -> dict:
+        """A newly-built entry at absolute index @k, shared with nobody."""
+        spill = self._spill
+        if spill is not None:
+            got = spill.get(k)
+            if got is not None:
+                return got
+            entry = self._parse(k)
+            spill.put(k, entry)
+            return entry
+        return self._parse(k)
+
+    def _at(self, k: int) -> dict:
+        """Entry at absolute index @k, through the LRU."""
+        cache = self._cache
+        hit = cache.get(k)
+        if hit is not None:
+            cache.move_to_end(k)
+            return hit
+        entry = self._fresh(k)
+        cache[k] = entry
+        if len(cache) > self._cap:
+            cache.popitem(last=False)
+        return entry
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            start, stop, step = key.indices(len(self))
+            if step == 1:
+                return _EntrySeq(self._lines, 0, self._rid,
+                                 idx=self._idx,
+                                 lo=self._lo + start,
+                                 hi=self._lo + max(start, stop),
+                                 cache=self._cache,
+                                 root=self._root or self,
+                                 spill=self._spill)
+            # Non-unit step is not on any path today; parse the (small)
+            # window rather than growing a second lazy shape for it.
+            return [self._at(self._lo + k)
+                    for k in range(start, stop, step)]
+        n = len(self)
+        if key < 0:
+            key += n
+        if not 0 <= key < n:
+            raise IndexError(key)
+        return self._at(self._lo + key)
+
+    def __iter__(self) -> Iterator[dict]:
+        at = self._at
+        for k in range(self._lo, self._hi):
+            yield at(k)
+
+    def __eq__(self, other) -> bool:
+        # The container this replaced was a list, and callers compare two
+        # decodes with `==` (the decoder smoke test does exactly that).
+        # Without this, that comparison silently degrades to identity and
+        # reports every pair of equal decodes as different.
+        if other is self:
+            return True
+        if isinstance(other, (str, bytes, bytearray)):
+            return NotImplemented
+        if not isinstance(other, Sequence):
+            return NotImplemented
+        if len(self) != len(other):
+            return False
+        return all(a == b for a, b in zip(self, other))
+
+    __hash__ = None         # same as list: equal-by-content, so unhashable
+
+    # -- explicit materialisation -----------------------------------------
+
+    def materialize(self, limit: int | None = None) -> list[dict]:
+        """A real, independent ``list[dict]`` -- guarded by size.
+
+        Every entry is parsed fresh (the LRU is bypassed), so the result
+        shares nothing with this sequence and is safe to mutate.  Above
+        @limit entries this REFUSES rather than quietly reproducing the
+        residency that took the host down; a consumer that genuinely needs
+        the whole body of a large trace is a defect to convert to streaming,
+        not a case to widen the limit for.
+        """
+        if limit is None:
+            limit = _env_int("CST_DECODE_MATERIALIZE_MAX",
+                             _MATERIALIZE_MAX_DEFAULT)
+        n = len(self)
+        if n > limit:
+            raise MemoryError(
+                f"refusing to materialise {n} decoded body entries "
+                f"(limit {limit}).  The eager list is what put ~10 GiB per "
+                f"cell on the host; iterate the sequence, or raise "
+                f"CST_DECODE_MATERIALIZE_MAX deliberately if this really is "
+                f"a proof-sized trace.")
+        return [self._fresh(k) for k in range(self._lo, self._hi)]
+
+    def __deepcopy__(self, memo) -> list[dict]:
+        # copy.deepcopy(triple) is how the mutation matrix and the
+        # multi-thread provers get something they can damage.  Give them a
+        # genuine list -- already freshly parsed, so nothing is shared.
+        return self.materialize()
+
+    # -- lifetime ----------------------------------------------------------
+
+    def close(self) -> None:
+        # A view shares the root's cache and its open decode; closing one
+        # must not pull either out from under the sequence it was sliced from.
+        if self._root is None:
+            self._cache.clear()
+            if self._spill is not None:
+                self._spill.close()
+                self._spill = None
+            self._lines.close()
+
+    def __repr__(self) -> str:
+        return f"<_EntrySeq {len(self)} entries (lazy)>"
+
+
+class _BodyOrderSeq(Sequence):
+    """``meta["body_record_order"]`` as a lazy sequence.
+
+    One ``("regfile" | "entry", thread_id)`` tuple per body record, in stream
+    order -- the positional view the record-cadence checks need (a thread's
+    REGFILE must precede its first ENTRY).  Materialising it eagerly costs one
+    tuple per record, which grows with the trace exactly like the entry list
+    did; here the record's line number is already known from the decode's
+    index pass and the tuple is rebuilt on access.
+    """
+
+    __slots__ = ("_lines", "_idx")
+
+    def __init__(self, lines: _LineFile, body_start: int):
+        self._lines = lines
+        # Interleave line number and kind in one flat array: two machine
+        # words per record, never a tuple object per record -- not even
+        # transiently, which is why the two sorted mark arrays are merged
+        # rather than concatenated and sorted.
+        flat = array("q")
+        append = flat.append
+        cuts = []
+        for mark in (_REGFILE_MARK, _ENTRY_MARK):
+            marks = lines.marks.get(mark, array("q"))
+            first = (bisect.bisect_left(marks, body_start)
+                     if body_start > 0 else 0)
+            cuts.append((marks, first, len(marks)))
+        (ra, ai, an), (ea, ei, en) = cuts
+        while ai < an and ei < en:
+            if ra[ai] < ea[ei]:
+                append(ra[ai]); append(0); ai += 1
+            else:
+                append(ea[ei]); append(1); ei += 1
+        while ai < an:
+            append(ra[ai]); append(0); ai += 1
+        while ei < en:
+            append(ea[ei]); append(1); ei += 1
+        self._idx = flat
+
+    def __len__(self) -> int:
+        return len(self._idx) // 2
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            return [self[k] for k in range(*key.indices(len(self)))]
+        n = len(self)
+        if key < 0:
+            key += n
+        if not 0 <= key < n:
+            raise IndexError(key)
+        line_no = self._idx[2 * key]
+        kind = self._idx[2 * key + 1]
+        line = self._lines[line_no]
+        if kind:
+            m = _ENTRY_HEAD_RE.match(line)
+            return ("entry", int(m.group(2)))
+        m = _REGFILE_HEAD_RE.match(line)
+        return ("regfile", int(m.group(1)))
+
+    def __iter__(self):
+        for k in range(len(self)):
+            yield self[k]
+
+    def __eq__(self, other) -> bool:
+        if other is self:
+            return True
+        if isinstance(other, (str, bytes, bytearray)):
+            return NotImplemented
+        if not isinstance(other, Sequence):
+            return NotImplemented
+        if len(self) != len(other):
+            return False
+        return all(a == b for a, b in zip(self, other))
+
+    __hash__ = None
+
+    def materialize(self, limit: int | None = None) -> list[tuple[str, int]]:
+        if limit is None:
+            limit = _env_int("CST_DECODE_ORDER_MATERIALIZE_MAX",
+                             _ORDER_MATERIALIZE_MAX_DEFAULT)
+        n = len(self)
+        if n > limit:
+            raise MemoryError(
+                f"refusing to materialise {n} body-record-order tuples "
+                f"(limit {limit}); iterate the sequence instead")
+        return [self[k] for k in range(n)]
+
+    def __deepcopy__(self, memo) -> list[tuple[str, int]]:
+        # meta rides inside the (meta, templates, entries) triple that the
+        # mutation matrix and the multi-thread provers deepcopy.  Without
+        # this, deepcopy walks into the open decode behind this view and
+        # dies on its file handle -- which is exactly what it did.
+        return self.materialize()
 
 
 def _decode_scratch_dir(path: str | os.PathLike) -> str:
@@ -873,34 +1361,57 @@ def _parse_header(lines) -> tuple[dict, list[dict], int, dict]:
     return meta, templates, i, rid_by_name
 
 
-def _parse_full(text) -> tuple[dict, list[dict], list[dict]]:
+def _parse_full(text) -> tuple[dict, list[dict], Sequence]:
     # Accepts either a str (small inputs, tests) or an already-open
     # _LineFile / list[str].  A str is split here exactly as before; a
     # _LineFile is addressed in place so the text never enters RAM.
     lines = text.splitlines() if isinstance(text, str) else text
 
     meta, templates, i, rid_by_name = _parse_header(lines)
-    entries = list(_iter_body(lines, i, rid_by_name))
+    if isinstance(lines, _LineFile):
+        # The disk-backed path: entries and the record-order view are lazy
+        # sequences over the decode's own index, so neither grows with how
+        # much the trace executed.
+        body_start = _body_start(lines, i)
+        entries: Sequence = _EntrySeq(lines, max(body_start, 0), rid_by_name)
+        order: Sequence = _BodyOrderSeq(lines, max(body_start, 0))
+    else:
+        # In-memory input (a str, or a plain list of lines in the tests).
+        # It is already fully resident by construction, so there is nothing
+        # for laziness to save here.
+        entries = list(_iter_body(lines, i, rid_by_name))
+        order = _scan_body_order(lines)
     # Trailing BODY_STATS section.  Emitted unconditionally by the
     # legacy renderer; we scan the full output for it rather than
     # tracking position because the body iterator above leaves `i`
     # mid-stream when it short-circuits.
     meta["body_stats"] = _parse_body_stats(lines)
     meta["impossible_attributions"] = _parse_impossible_attributions(lines)
-    meta["body_record_order"] = _scan_body_order(lines)
+    meta["body_record_order"] = order
     return meta, templates, entries
 
 
 _REGFILE_HEAD_RE = re.compile(r"^REGFILE thread=(\d+) n=\d+$")
 
 
-def _scan_body_order(lines: list[str]) -> list[tuple[str, int]]:
+def _scan_body_order(lines) -> Sequence:
     """Ordered body-record stream: ("regfile", thread_id) and
     ("entry", thread_id) tuples in the order the records appear in the
     body section.  ``_iter_body`` deliberately skips REGFILE blocks (they
     carry no per-entry payload the validator's entry checks consume), so
     record *ordering* invariants — a thread's REGFILE preceding its first
-    ENTRY — need this positional view."""
+    ENTRY — need this positional view.
+
+    On a disk-backed decode this returns the lazy :class:`_BodyOrderSeq` --
+    same reads, but two machine words per record instead of a tuple object,
+    and no whole-file re-scan to build it."""
+    if isinstance(lines, _LineFile) and _ENTRY_MARK in lines.marks:
+        i = 0
+        n = len(lines)
+        while i < n and lines[i] != "BODY":
+            i += 1
+        body_start = i + 2 if i < n else 0
+        return _BodyOrderSeq(lines, body_start)
     order: list[tuple[str, int]] = []
     in_body = False
     for i, line in enumerate(lines):
@@ -941,7 +1452,7 @@ def _parse_impossible_attributions(lines: list[str]) -> dict:
     return out
 
 
-def _parse_body_stats(lines: list[str]) -> dict:
+def _parse_body_stats(lines) -> dict:
     """Scan for the BODY_STATS section emitted at end of legacy output."""
     stats: dict = {
         "cp_entries": 0,
@@ -953,9 +1464,18 @@ def _parse_body_stats(lines: list[str]) -> dict:
         "translation_unavail_count": 0,
         "atomic_count": 0,
     }
-    i = 0
-    while i < len(lines) and lines[i] != "BODY_STATS":
-        i += 1
+    if isinstance(lines, _LineFile) and _STATS_MARK in lines.marks:
+        # The section header's line number was recorded by the decode's one
+        # index pass; walking tens of millions of lines to rediscover it is
+        # the kind of whole-file re-scan this reader exists to avoid.
+        hits = lines.marks[_STATS_MARK]
+        i = next((h for h in hits if lines[h] == "BODY_STATS"), None)
+        if i is None:
+            return stats
+    else:
+        i = 0
+        while i < len(lines) and lines[i] != "BODY_STATS":
+            i += 1
     if i >= len(lines):
         return stats
     if i + 1 >= len(lines) or lines[i + 1] != "----------":
@@ -975,16 +1495,60 @@ def _parse_body_stats(lines: list[str]) -> dict:
 
 
 def decode_champsim_tracer(bin_path):
-    """Eager decoder.  Returns (meta, templates, entries).
+    """Decode a trace.  Returns ``(meta, templates, entries)``.
 
-    The decode is spilled to disk and addressed through _LineFile, so the
-    legacy text is never resident.  `entries` still scales with the trace --
-    that is inherent to an eager API -- but the multi-copy text blow-up that
-    took the host down is gone.
+    ``entries`` is a LAZY, disk-backed :class:`_EntrySeq`, not a list: it
+    reads like ``list[dict]`` for every access the validator makes, and its
+    residency does not grow with how much the trace executed.  The decode
+    itself is spilled to disk and addressed through :class:`_LineFile`, so
+    the legacy text is never resident either.
+
+    This function used to return ``list(_iter_body(...))``.  A ``--stop
+    3000000`` system-marker cell decodes to ~576 k entries at ~18 KB apiece:
+    10.3 GiB, measured, for one cell, before validate() had checked anything.
+    Concurrent lanes multiplied that until the host stopped responding.  The
+    lazy sequence is the same read surface at a bounded cost, so no call site
+    had to change to get the bound.
+
+    The returned sequence owns the open decode.  Drop it (or call
+    ``.close()``) when done; the scratch file is unlinked at open, so it can
+    never outlive the process regardless.
     """
     out = _run_cst_decode_to_file(bin_path)
-    with _LineFile(out, own=True) as lines:
-        return _parse_full(lines)
+    lines = _LineFile(out, own=True, mark_prefixes=_BODY_MARKS)
+    try:
+        meta, templates, entries = _parse_full(lines)
+    except BaseException:
+        lines.close()
+        raise
+    if os.environ.get(FORCE_EAGER_ENV) == "1":
+        # TEST LEVER, and the only thing that may ever set it is the
+        # residency tripwire (`decode_bound`), which needs the pre-fix shape
+        # to prove it can go red.  This reinstates exactly the unbounded
+        # materialisation that put ~10 GiB per cell on the host.
+        entries = list(entries)
+        meta["body_record_order"] = list(meta.get("body_record_order") or [])
+    return meta, templates, entries
+
+
+# Set to "1" ONLY by the residency tripwire, to prove it fires.  Any other
+# use reinstates the defect this module exists to prevent.
+FORCE_EAGER_ENV = "CST_DECODE_FORCE_EAGER_UNBOUNDED"
+
+
+def decode_residency_facts(entries) -> dict:
+    """What the residency tripwire needs to know about a decode's entry
+    container: whether it is the lazy sequence at all, how many entries it
+    presents, how many lines of legacy text back it, and how many entries
+    the LRU may hold.  Reported rather than assumed, so the bound the
+    tripwire checks against is derived from the decode in front of it."""
+    if isinstance(entries, _EntrySeq):
+        return {"lazy": True,
+                "entries": len(entries),
+                "lines": len(entries._lines),
+                "cache_cap": entries._cap}
+    return {"lazy": False, "entries": len(entries),
+            "lines": 0, "cache_cap": 0}
 
 
 def decode_champsim_tracer_header(bin_path):
@@ -998,7 +1562,7 @@ def decode_champsim_tracer_header(bin_path):
     consume, no scratch file left behind.
     """
     out = _run_cst_decode_to_file(bin_path)
-    with _LineFile(out, own=True) as lines:
+    with _LineFile(out, own=True, mark_prefixes=_BODY_MARKS) as lines:
         meta, templates, _i, _rid = _parse_header(lines)
         meta["body_stats"] = _parse_body_stats(lines)
         meta["impossible_attributions"] = _parse_impossible_attributions(lines)
@@ -1008,27 +1572,23 @@ def decode_champsim_tracer_header(bin_path):
 def iter_decode_champsim_tracer(bin_path, *, body_record_order: bool = False):
     """Streaming decoder.  Returns (meta, templates, entries_iterator).
 
-    Genuinely lazy, unlike the eager :func:`decode_champsim_tracer`: the
-    header, the encoding maps and the templates are parsed up front (all
+    The header, the encoding maps and the templates are parsed up front (all
     bounded by the trace's template count, not its length), and body entries
-    are then YIELDED one at a time.  Resident cost is the _LineFile offset
-    index plus one entry, so a 20 M-instruction trace costs a few GB instead
-    of tens of GB.
+    are then YIELDED one at a time.  Resident cost is the _LineFile line index
+    plus one entry.
 
-    Use this for anything large.  `decode_champsim_tracer` materialises every
-    entry into a list and its peak grows without bound with trace length --
-    measured at 25.6 GB and still climbing on a 20 M-instruction trace before
-    it was cut short.
+    This is the single-pass, forward-only form.  :func:`decode_champsim_tracer`
+    is bounded too -- it returns a lazy random-access sequence over the same
+    decode -- so prefer that when the consumer needs ``len()``, indexing or
+    more than one pass, and this when it genuinely just walks the body once.
 
     `meta["body_stats"]` and `meta["impossible_attributions"]` are computed
     (both are bounded summaries).  `meta["body_record_order"]` is NOT, by
-    default: it returns one tuple per body record, so it grows with the trace
-    and would defeat the point.  Pass body_record_order=True if you need it
-    and know the trace is small; otherwise the key is absent, and absent is
-    honest -- it is not silently empty.
+    default: pass body_record_order=True if you need it; otherwise the key is
+    absent, and absent is honest -- it is not silently empty.
     """
     out = _run_cst_decode_to_file(bin_path)
-    lines = _LineFile(out, own=True)
+    lines = _LineFile(out, own=True, mark_prefixes=_BODY_MARKS)
     try:
         meta, templates, i, rid_by_name = _parse_header(lines)
         meta["body_stats"] = _parse_body_stats(lines)

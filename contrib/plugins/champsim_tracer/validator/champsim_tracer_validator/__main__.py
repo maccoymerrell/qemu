@@ -563,6 +563,11 @@ def _parse_args() -> argparse.Namespace:
     from . import _range_cells as RC
     RC.add_parser(sub)
 
+    # decode_bound — the decode stage's residency tripwire (see
+    # _decode_bound.py: the 10.3 GiB-per-cell incident it exists to catch).
+    from . import _decode_bound as DBOUND
+    DBOUND.add_parser(sub)
+
     return p.parse_args()
 
 
@@ -2066,6 +2071,9 @@ def main() -> int:
     if args.cmd == "range_cells":
         from . import _range_cells as RC
         return RC.cmd_range_cells(args)
+    if args.cmd == "decode_bound":
+        from . import _decode_bound as DBOUND
+        return DBOUND.cmd_decode_bound(args)
     return 2
 
 

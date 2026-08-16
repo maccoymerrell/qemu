@@ -906,16 +906,20 @@ def _check_cp_memops(entries: list[dict],
     # counting the same memop pattern N times when a block sits inside
     # a loop).  Preference order: the first COMPLETE execution (ranges
     # tiling [0, n)); if none ever completes, the first opened group.
-    # @all_entries maps tid -> list of every CP entry on that
+    # @all_dps maps tid -> the dyn_params of every CP entry on that
     # template, used when at least one block in the bipartite
     # component opts into aggregate_fanout — true today for the REP-
     # iteration block, whose iter 2..N body entries live on
     # subsequent executions of the 1-insn self-loop sub-template.
+    # It holds the dyn_params lists, NOT the entries: the aggregate
+    # consumer reads nothing else, and an entry drags its whole
+    # wrong-path chain along with it — the difference between a
+    # bounded fold and one that grows with how much the trace ran.
     tmpl_to_blocks: dict[int, set[int]] = {}
     block_to_tmpls: dict[int, set[int]] = {}
     rep_group: dict[int, list[dict]] = {}
     rep_complete: dict[int, bool] = {}
-    all_entries: dict[int, list[dict]] = {}
+    all_dps: dict[int, list] = {}
     # (tid, (thread, asid)) -> [entries-so-far, next expected start]
     open_group: dict[tuple[int, tuple], list] = {}
 
@@ -925,7 +929,7 @@ def _check_cp_memops(entries: list[dict],
         cp_blocks = {bid for (bid, _) in runs if bid in cp_set}
         if not cp_blocks:
             continue
-        all_entries.setdefault(tid, []).append(e)
+        all_dps.setdefault(tid, []).extend(e.get("dyn_params") or [])
         if tid not in tmpl_to_blocks:
             tmpl_to_blocks[tid] = cp_blocks
             for bid in cp_blocks:
@@ -1040,10 +1044,10 @@ def _check_cp_memops(entries: list[dict],
         fanout = any(blocks_by_id[bid].get("aggregate_fanout")
                      for bid in comp_blocks)
         def _dps_for(tid: int) -> list:
+            if fanout:
+                return list(all_dps.get(tid, []))
             out: list = []
-            src = (all_entries.get(tid, []) if fanout
-                   else rep_group.get(tid, []))
-            for e in src:
+            for e in rep_group.get(tid, []):
                 out.extend(e.get("dyn_params", []) or [])
             return out
 
@@ -1442,9 +1446,6 @@ def _check_segment_final_memops(
     final = cp_entries[-1]
     tid = final.get("template_id")
     tmpl = templates_by_id.get(tid) or {}
-    peers = [e for e in cp_entries[:-1]
-             if e.get("template_id") == tid
-             and not _entry_is_partial(e, tmpl)]
     tmpl_insns = tmpl.get("insns") or []
     static_memop_slots = sum(
         1 for i in tmpl_insns
@@ -1471,16 +1472,32 @@ def _check_segment_final_memops(
             tally[key] = tally.get(key, 0) + 1
         return (count, tuple(sorted(tally.items())))
 
-    if len(peers) < 2:
+    # The peers are the earlier WHOLE-BLOCK executions of the final entry's
+    # template.  Only their count and their memop SHAPES are ever read, so
+    # fold both in one pass instead of holding the entries: on a hot loop
+    # that list is a large fraction of the whole body, and an entry carries
+    # its wrong-path chain with it.
+    scoped_needed = f_start > 0 or f_stop < f_n
+    n_peers = 0
+    peer_shapes: set[tuple] = set()
+    peer_shapes_scoped: set[tuple] = set()
+    for p in cp_entries[:-1]:
+        if p.get("template_id") != tid or _entry_is_partial(p, tmpl):
+            continue
+        n_peers += 1
+        peer_shapes.add(shape(p))
+        if scoped_needed:
+            peer_shapes_scoped.add(shape(p, f_start, f_stop))
+
+    if n_peers < 2:
         return [Issue("segment_final_memops", "info",
                       f"final entry's template {tid} executes "
-                      f"{len(peers) + 1}x; no repetition oracle "
+                      f"{n_peers + 1}x; no repetition oracle "
                       f"(static memop slots={static_memop_slots})")]
-    peer_shapes = {shape(p) for p in peers}
     if len(peer_shapes) != 1:
         return [Issue("segment_final_memops", "info",
                       f"final entry's template {tid} has a variable memop "
-                      f"shape across {len(peers)} earlier executions; "
+                      f"shape across {n_peers} earlier executions; "
                       f"no invariant to assert")]
     want = peer_shapes.pop()
     if want[0] == 0:
@@ -1490,7 +1507,7 @@ def _check_segment_final_memops(
     if f_start > 0 or f_stop < f_n:
         # Partial final entry: scope the invariant to its declared
         # range (peer tallies re-derived over the same [start, stop)).
-        want = {shape(p, f_start, f_stop) for p in peers}.pop()
+        want = peer_shapes_scoped.pop()
         if want[0] == 0:
             return [Issue(
                 "segment_final_memops", "info",
@@ -1505,13 +1522,13 @@ def _check_segment_final_memops(
             "segment_final_memops", "error",
             f"segment's final body entry (seq {final.get('seq_num')}, "
             f"template {tid}) carries {got[0]} memops, but all "
-            f"{len(peers)} earlier executions of that template carry "
+            f"{n_peers} earlier executions of that template carry "
             f"{want[0]} — the final entry's memory operands were dropped",
             {"template_id": tid,
              "final_seq": final.get("seq_num"),
              "final_memops": got[0],
              "expected_memops": want[0],
-             "peer_executions": len(peers),
+             "peer_executions": n_peers,
              "static_memop_slots": static_memop_slots,
              "final_shape": [list(k) + [v] for k, v in got[1]],
              "expected_shape": [list(k) + [v] for k, v in want[1]]},
@@ -1519,10 +1536,10 @@ def _check_segment_final_memops(
     return [Issue(
         "segment_final_memops", "info",
         f"segment's final body entry carries its {want[0]} memops "
-        f"(template {tid}, matched against {len(peers)} earlier "
+        f"(template {tid}, matched against {n_peers} earlier "
         f"executions)",
         {"template_id": tid, "memops": want[0],
-         "peer_executions": len(peers)})]
+         "peer_executions": n_peers})]
 
 
 def _memop_is_architecturally_optional(isa: str, raw) -> bool:

@@ -778,6 +778,25 @@ outside the repo as standalone scripts):
    ``program``/``comment``); asserts the trace decodes clean.
 ``features.mutation_strictness``
    The :ref:`mutation <validator-mutation>` matrix, run in-process.
+``features.decode_residency``
+   The decode stage's memory footprint is bounded by the trace's
+   *shape*, not by how much of it executed.  ``decode_champsim_tracer``
+   hands back a lazy disk-backed sequence of body entries: reads like
+   ``list[dict]``, holds a line index, an entry index and a small LRU,
+   and parses each entry from the spilled decode on access (a
+   write-through spill of the parsed form keeps the validator's many
+   passes over the body cheap).  A whole trace becomes a real list only
+   through the explicit ``materialize()`` escape, which refuses above
+   ``CST_DECODE_MATERIALIZE_MAX`` entries.
+
+   The check captures a cell of a few hundred thousand entries, decodes
+   it in a child process and walks it end to end, and requires the
+   child's peak RSS to sit under a budget derived from what that design
+   costs — the line index at 8 bytes per line, the entry indices, the
+   LRU's ceiling.  It then decodes the same trace a second time with the
+   eager materialisation forced back on, and requires *that* run to
+   exceed the budget: a residency gate that cannot be made to go red
+   proves nothing, so failing to fire fails the check.
 ``features.final_entry_memops``
    The segment's **last** body entry keeps its memory operands.
    Body entries are emitted one TB late, so an entry flushed on a

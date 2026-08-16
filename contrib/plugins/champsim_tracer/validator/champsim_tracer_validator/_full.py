@@ -121,6 +121,7 @@ FEATURES: dict[str, str] = {
     "wire:FID_branch_target":    "CST_FID_BRANCH_TARGET landing PC",
     # ---- offline tools / lints ------------------------------------------
     "tool:cst_decode_legacy":    "cst_decode --format=legacy (validator oracle)",
+    "tool:decode_residency":     "the validator's decode stage stays bounded on a large trace -- entries are read lazily off the spilled decode, never materialised as a list (the 10.3 GiB-per-cell incident)",
     "tool:cst_decode_templates": "cst_decode --templates-only",
     "tool:cst_decode_raw":       "cst_decode --format=raw",
     "tool:cst_decode_strict":    "cst_decode --strict impossible-attribution lint",
@@ -1335,6 +1336,29 @@ def _chk_mutation(ctx: Ctx) -> Outcome:
                    f"0 holes; skipped={res['skipped']}", subs)
 
 
+def _chk_decode_bound(ctx: Ctx) -> Outcome:
+    """The decode stage's residency tripwire.
+
+    ``decode_champsim_tracer`` returned ``list(_iter_body(...))`` until the
+    ruling below: ~576 k entry dicts at ~18 KB apiece on a 3 M-instruction
+    system cell, 10.3 GiB measured, per lane, before validate() had checked
+    anything -- 12-15 lanes reached ~190 GiB and the host stopped responding.
+    "DECODE IS STREAMING, THIS IS A BUG."
+
+    A trace large enough for the two shapes to be far apart is decoded in a
+    child and walked end to end; peak RSS must sit under a bound derived
+    from what the lazy design actually costs.  The same trace is then
+    decoded with the eager shape forced back on, and that run MUST breach
+    the bound -- a residency gate that has never gone red is a gate nobody
+    has tested, so failing to fire is itself a failure here.
+    """
+    d = ctx.dir("feat_decode_bound")
+    rc, tail = _run_cli(
+        ["decode_bound", "--build-dir", str(ctx.build_dir), "-o", str(d)],
+        timeout=2400, log_path=d / "run.log")
+    return _cli_outcome(rc, tail, 2400)
+
+
 def _chk_options_smoke(ctx: Ctx) -> Outcome:
     """Direct qemu-user drive of the long-tail options (histogram,
     wp_memdata, wp_regdata, program/comment) that no other check sets;
@@ -1393,7 +1417,9 @@ def _final_entry_memop_probe(cst: Path):
     from . import validator as V
     _meta, templates, entries = \
         V._load_decoder().decode_champsim_tracer(cst)
-    cp = list(entries)          # decode_champsim_tracer yields CP entries
+    # The decode's entries are a lazy sequence; read it as one.  `list()`
+    # here would reinstate exactly the residency the lazy shape removed.
+    cp = entries                # decode_champsim_tracer yields CP entries
     if len(cp) < 3:                    # (WP blocks hang off e["wp_entries"])
         return "unusable", f"only {len(cp)} CP entries"
     by_id = {t["template_id"]: t for t in templates}
@@ -1415,13 +1441,20 @@ def _final_entry_memop_probe(cst: Path):
             tally[k] = tally.get(k, 0) + 1
         return (len(dps), tuple(sorted(tally.items())))
 
-    peers = [e for e in cp[:-1] if e.get("template_id") == tid]
-    if len(peers) < 2:
-        return "unusable", f"final template {tid} executes {len(peers)+1}x"
-    shapes = {shape(p) for p in peers}
+    # Count and shapes only -- never the peer entries themselves, each of
+    # which drags its whole wrong-path chain along.
+    n_peers = 0
+    shapes = set()
+    for p in cp[:-1]:
+        if p.get("template_id") != tid:
+            continue
+        n_peers += 1
+        shapes.add(shape(p))
+    if n_peers < 2:
+        return "unusable", f"final template {tid} executes {n_peers+1}x"
     if len(shapes) != 1:
         return "unusable", (f"final template {tid} memop shape varies over "
-                            f"{len(peers)} executions")
+                            f"{n_peers} executions")
     want = shapes.pop()
     if want[0] == 0:
         return "unusable", (f"final template {tid} performs no memops "
@@ -1430,9 +1463,9 @@ def _final_entry_memop_probe(cst: Path):
     if got == want:
         return "pass", (f"final entry (seq {final.get('seq_num')}, template "
                         f"{tid}) carries {got[0]} memops == "
-                        f"{len(peers)} peer executions")
+                        f"{n_peers} peer executions")
     return "drop", (f"final entry (seq {final.get('seq_num')}, template "
-                    f"{tid}) carries {got[0]} memops but its {len(peers)} "
+                    f"{tid}) carries {got[0]} memops but its {n_peers} "
                     f"peer executions all carry {want[0]}")
 
 
@@ -2519,6 +2552,10 @@ def build_checks() -> list:
                    "adversarial mutation matrix: oracle catches corruption",
                    ["behavior:mutation_strictness", "wire:wp_chain_flag"],
                    _chk_mutation))
+    C.append(Check("features.decode_residency", "features",
+                   "decode stage stays bounded on a large trace "
+                   "(both directions: lazy under budget, forced-eager over)",
+                   ["tool:decode_residency"], _chk_decode_bound))
     C.append(Check("features.wrong_path_coverage", "features",
                    "static_templates=1 fall-through/BTB coverage oracle (4-ISA)",
                    ["behavior:wrong_path_coverage"], _chk_static_coverage))

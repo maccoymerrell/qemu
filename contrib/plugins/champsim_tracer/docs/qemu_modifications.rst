@@ -677,6 +677,55 @@ for a guest that stops progressing on a build that has them.
    legitimately takes the BQL for sandboxed device accesses) so the
    iothread cannot interleave mid-excursion.
 
+``qemu_clock_plugin_stall_set`` (``util/qemu-timer.c``) +
+``cpu_plugin_spec_ticks_freeze`` / ``_thaw`` (``system/cpu-timers.c``)
+
+   The *processing* half of the wrong-path freeze, and the reason a
+   speculative excursion needs no per-target repair for guest-visible
+   timers.  Stopping the clock's value alone leaves a state the guest
+   can never occupy on its own — the clock reads a constant while
+   deadlines are still evaluated against that constant — and a
+   callback entered in that state runs on execution the guest never
+   performed and writes state the excursion's restore then rolls back.
+
+   So while a speculative bracket is open the clock is not evaluated
+   either: ``QEMU_CLOCK_VIRTUAL`` reports no deadline and
+   ``timerlist_run_timers`` enters no callback on a virtual timerlist.
+   Timers are **left on the active list** — not popped, not deferred,
+   not recorded — so every armed deadline is still armed at the thaw
+   and is evaluated exactly once afterwards, against the same clock
+   value it was armed against.  ``QEMU_CLOCK_REALTIME``,
+   ``QEMU_CLOCK_HOST`` and ``QEMU_CLOCK_VIRTUAL_RT`` are untouched:
+   they are not guest-visible time, and the monitor, the block layer
+   and the management plane run on them.
+
+   Scoped to the speculative bracket and to nothing else.  A
+   correct-path instrumentation window brackets a callback that runs
+   between two instructions the guest really executed, so every event
+   derived from guest time still has a legal position inside it and
+   freezing the value is the whole requirement.  Riding the stall on
+   the machine-wide value-freeze reference instead suspends the
+   guest's timer processing for most of a run rather than for its
+   excursions, and was measured to add three whole guest timer periods
+   to the worst observed stall.
+
+   Four reads gate the clock rather than a list of callers.
+   ``timerlist_expired``, ``timerlist_deadline_ns``,
+   ``qemu_clock_deadline_ns_all`` and ``timerlist_run_timers`` are
+   every evaluation of a ``QEMU_CLOCK_VIRTUAL`` deadline in
+   ``util/qemu-timer.c``, and every other public entry point funnels
+   into one of them.  The stall is taken before the value freeze and
+   released after it, so the value-stopped-processing-running state
+   has zero width in both directions; and reader and releaser hand off
+   through Dekker's algorithm, because a deadline hidden from a main
+   loop that is never re-notified is a hang.
+
+   What this deletes, rather than merely making cheaper, is a family
+   of per-ISA boundary re-evaluation sites.  A gate that existed to
+   catch a guest-visible timer callback firing inside an excursion has
+   nothing left to catch, and an excursion-exit replay of a firing the
+   gate suppressed has no firing to replay.
+
 ``IcountFreeze`` + ``icount_plugin_freeze`` / ``_thaw``
 (``accel/tcg/icount-common.c``)
 

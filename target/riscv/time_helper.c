@@ -60,14 +60,6 @@ static void riscv_stimer_cb(void *opaque)
                 (int)CPU(cpu)->plugin_spec_vtime_paused,
                 (unsigned long long)cpu->env.stimecmp);
     }
-    /*
-     * Gate on plugin_spec_vtime_paused (whole excursion) not just
-     * plugin_spec_mode: see riscv_vstimer_cb / #77 -- a fault-skip gap clears
-     * spec_mode while the excursion is still live, and a STIP set there is lost.
-     */
-    if (CPU(cpu)->plugin_spec_mode || CPU(cpu)->plugin_spec_vtime_paused) {
-        return;
-    }
 #endif
     riscv_cpu_update_mip(&cpu->env, MIP_STIP, BOOL_TO_MASK(1));
 }

@@ -2148,11 +2148,17 @@ closed:
      - Status
    * - ``tests/golden/manifest.json`` — w1–w7 × 4 ISAs (25 cells)
      - Single-thread user-mode wire bytes
-     - **No.** ``quick.user_<isa>`` runs the full generative oracle over
-       the same generator and the same knobs.
+     - **No.**  Each golden cell runs ``validator all`` with that
+       workload's own knobs and compares the validator's exit status to
+       a recorded baseline — all 25 baselines are 0 — so the generative
+       oracle already judges the same content inside the same cell.
+       (``quick.user_<isa>`` is *not* the reason: it never runs
+       ``--stride-loops`` or ``--depth 128``, so it does not cover the
+       w5/w6 knobs.)
      - Unchanged.  Correctly a no-unintended-change gate.
-   * - SVG metric goldens (``w1_baseline``, ``w3_coverage`` × 21
-       metrics, plus the system fixtures × 6 system metrics)
+   * - SVG metric goldens (``w1_baseline``, ``w3_coverage`` × 22
+       metrics = 44 renders, plus 28 fixture renders — one system
+       fixture × (22 + 6 system metrics))
      - ``cst_visualize`` rendered SVG bytes
      - **Yes.**  Nothing computes an expected metric series from the
        generated metadata, so the rendered output has no oracle at all.
@@ -2181,6 +2187,16 @@ closed:
      - The decoder and tools over real system content
      - **Yes.**
      - **Remains.**  A frozen real trace is the point of that net.
+   * - ``baseline/_ref/manifest.json`` — 162 cells (20 genval seeds
+       × 4 ISAs × wp0/wp1, plus SPEC mcf), driven by
+       ``baseline/baseline.py compare``
+     - Reference wire bytes across a wide seed corpus
+     - **No.**  Its workloads are generator seeds the generative oracle
+       already covers, and it gates no battery check (``full`` runs
+       ``quick.golden``, never ``baseline.py``).
+     - Unchanged.  A third golden, listed so this map is the complete
+       inventory; note its wp1 half compares only a reproducible audit
+       subset, not bytes.
    * - *(none)* — ``thread_test``
      - Multi-thread wire
      - No golden existed at all.  Its checks were structural, so

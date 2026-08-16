@@ -177,6 +177,63 @@ bool cpu_plugin_ticks_thaw(int cpu_index);
 uint64_t cpu_plugin_ticks_peer_only_thaws(void);
 
 /**
+ * cpu_plugin_spec_ticks_freeze: freeze the guest clock for a SPECULATIVE window
+ * @cpu_index: the vCPU taking the reference
+ *
+ * The wrong-path form of cpu_plugin_ticks_freeze(), and the only form that
+ * stops the clock's PROCESSING as well as its value.
+ *
+ * There are two kinds of plugin clock freeze in this tree and they are not the
+ * same event.  A CORRECT-PATH instrumentation window brackets a plugin
+ * callback that runs beside guest execution the guest itself performed: the
+ * guest is between two of its own instructions, its clock must not absorb the
+ * callback's host cost, and that is the whole requirement -- freezing the
+ * VALUE meets it.  A SPECULATIVE window brackets execution the guest never
+ * performed.  Inside it there is no guest instruction stream at all, so an
+ * event derived from guest time has no legal position: a virtual-clock
+ * deadline evaluated there is evaluated against a clock that is not running,
+ * and a callback entered there runs on the wrong path's watch, writing state
+ * the excursion's restore then rolls back.
+ *
+ * So the processing stall is scoped to this pair and to nothing else.  Riding
+ * it on the machine-wide freeze reference instead -- which the correct-path
+ * window also takes, once per translation block -- was measured: the guest's
+ * timer processing was then suspended for most of the run rather than for the
+ * excursions, and the x86 system marker cell went from 0 to 5 stalled cells in
+ * 12 with a new 24.2-24.4k-instruction stall cluster.  The correct-path window
+ * keeps its value-only freeze.
+ *
+ * Machine-wide, for the same reason cpu_plugin_ticks_freeze() is: one clock,
+ * many windows.  A peer's translation callback takes no exec lock and would
+ * otherwise run a guest timer callback inside another vCPU's excursion.
+ *
+ * Ordering, which is the substance of the pair: the stall is taken BEFORE the
+ * value freeze and released AFTER the thaw, so the state that must not exist
+ * -- value stopped while deadlines are still being evaluated against it -- has
+ * zero width at both edges.
+ *
+ * Caller must hold the BQL.
+ */
+void cpu_plugin_spec_ticks_freeze(int cpu_index);
+
+/**
+ * cpu_plugin_spec_ticks_thaw: leave a speculative clock freeze
+ * @cpu_index: the vCPU giving back the reference it took
+ *
+ * The processing stall is released on every path, including the one where the
+ * value stays frozen because a vm_stop owns it -- a stall outliving the freeze
+ * that justified it would silence the guest's virtual clock for the rest of
+ * the run, and a stopped machine runs no guest-visible timers anyway.
+ *
+ * Returns nothing, unlike cpu_plugin_ticks_thaw(): that one's bool tells the
+ * correct-path window whether it was the call that restarted the clock, and
+ * an excursion has no use for the answer.
+ *
+ * Caller must hold the BQL.
+ */
+void cpu_plugin_spec_ticks_thaw(int cpu_index);
+
+/**
  * cpu_plugin_tsc_lock_to_vclock: derive cpu_get_ticks() from cpu_get_clock()
  * @tsc_hz: slope of the lock, in ticks per second of QEMU_CLOCK_VIRTUAL
  *

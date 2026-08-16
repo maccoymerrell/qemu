@@ -251,11 +251,25 @@ void qemu_clock_enable(QEMUClockType type, bool enabled);
  * QEMU_CLOCK_HOST and QEMU_CLOCK_VIRTUAL_RT are not guest-visible time, and
  * the monitor, the block layer and the management plane run on them.
  *
- * NOT a refcount and deliberately so: the freeze it serves is already
- * counted, machine-wide, by plugin_ticks_freeze_depth, and a second count
- * beside the first is a second answer to "is the machine frozen".  The
- * caller drives this from that count's 0<->1 transitions and is the single
+ * NOT a refcount and deliberately so: the caller counts, this switch obeys.
+ * Its one caller is cpu_plugin_spec_ticks_freeze()/_thaw() in
+ * system/cpu-timers.c, which drives it from the 0<->1 transitions of the
+ * machine-wide count of outstanding SPECULATIVE freezes and is the single
  * authority.
+ *
+ * That count is not the same as the count of outstanding clock-VALUE freezes
+ * beside it, and the difference is the point.  A plugin also freezes the
+ * clock's value around a correct-path instrumentation callback, once per
+ * translation block, and there the guest is between two of its own
+ * instructions: every guest-time event still has a legal position and only
+ * the callback's host cost must be kept out of the clock, so the value
+ * freeze alone is the whole requirement.  Only a speculative window --
+ * execution the guest never performed, with no instruction stream to place
+ * an event in -- needs the clock to stop being evaluated as well.  Riding
+ * this switch on the value count instead was measured: the guest's timer
+ * processing was suspended for most of the run rather than for the
+ * excursions, and the x86 system marker cell went from 0 stalled cells in 12
+ * to 5, with a stall cluster that had not existed before.
  *
  * NOT implemented as qemu_clock_enable(QEMU_CLOCK_VIRTUAL, false), which has
  * exactly the right read side and the wrong wait side: it blocks on every

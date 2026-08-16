@@ -240,11 +240,14 @@ void qemu_clock_plugin_stall_set(bool on)
     qatomic_set(&plugin_vclock_stall, false);
     smp_mb();
     /*
-     * Notify ONLY if the stall actually hid something.  An unconditional
-     * notify here is a main-loop wakeup per correct-path instrumentation
-     * window -- that is once per translation block, and it was measured to
-     * turn a 14-second fixture into a 79-second one.  The wakeup belongs to
-     * the deadline that was hidden, not to the freeze that hid nothing.
+     * Notify ONLY if the stall actually hid something.  The release runs once
+     * per wrong-path excursion, which on a system trace is hundreds of
+     * thousands to millions of times per run, and an unconditional notify is
+     * a main-loop wakeup for each one; when this switch was briefly driven
+     * from the clock-value freeze instead -- once per translation block --
+     * the same unconditional notify turned a 14-second fixture into a
+     * 79-second one.  The wakeup belongs to the deadline that was hidden, not
+     * to the freeze that hid nothing.
      */
     if (qatomic_read(&plugin_vclock_deadline_hidden) &&
         qatomic_xchg(&plugin_vclock_deadline_hidden, false)) {

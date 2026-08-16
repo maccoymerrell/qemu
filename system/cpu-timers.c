@@ -32,6 +32,7 @@
 #include "qemu/main-loop.h"
 #include "qemu/option.h"
 #include "qemu/seqlock.h"
+#include "qemu/timer.h"
 #include "system/replay.h"
 #include "system/runstate.h"
 #include "hw/core/cpu.h"
@@ -265,6 +266,57 @@ uint64_t cpu_plugin_ticks_peer_only_thaws(void)
 {
     return plugin_ticks_holders_overflowed ? UINT64_MAX
                                            : plugin_ticks_peer_only_thaws;
+}
+
+/*
+ * Outstanding SPECULATIVE freezes, across every vCPU: the count that owns the
+ * guest-visible virtual clock's PROCESSING stall.  See the contract on
+ * cpu_plugin_spec_ticks_freeze() in the header for why the stall belongs to
+ * this count and not to plugin_ticks_freeze_depth beside it.
+ *
+ * A second count next to the first is not a second answer to "is the clock
+ * frozen".  The value freeze is one question with one answer and
+ * plugin_ticks_freeze_depth is still its sole authority -- every freeze,
+ * speculative or not, goes through it.  This count answers a different
+ * question, "is a wrong path currently executing", and the two differ
+ * precisely because the correct-path window also freezes the value.  Written
+ * only under the BQL, which both entry points assert.
+ */
+static int plugin_spec_stall_depth;
+
+void cpu_plugin_spec_ticks_freeze(int cpu_index)
+{
+    assert(bql_locked());
+    /*
+     * Processing first, then the value.  The state being excluded is "the
+     * clock reads a constant while deadlines are still evaluated against that
+     * constant", so the order that must never exist is value-stopped-
+     * processing-running; taking the stall first gives that state zero width
+     * on entry, and releasing it last gives it zero width on exit.
+     */
+    if (plugin_spec_stall_depth++ == 0) {
+        qemu_clock_plugin_stall_set(true);
+    }
+    cpu_plugin_ticks_freeze(cpu_index);
+}
+
+void cpu_plugin_spec_ticks_thaw(int cpu_index)
+{
+    assert(bql_locked());
+    assert(plugin_spec_stall_depth > 0);
+
+    cpu_plugin_ticks_thaw(cpu_index);
+    /*
+     * Unconditional, including on the path where the thaw above declined to
+     * restart the clock because a vm_stop owns it.  The stall is this count's
+     * to release and nobody else will: left behind, it would outlive every
+     * freeze that justified it and hide the virtual clock's deadlines for the
+     * remainder of the run.  A stopped machine runs no guest-visible timers
+     * regardless; that is vm_stop's doing, not this stall's.
+     */
+    if (--plugin_spec_stall_depth == 0) {
+        qemu_clock_plugin_stall_set(false);
+    }
 }
 
 /*

@@ -2233,7 +2233,19 @@ void cpu_plugin_spec_vtime_pause(CPUState *cpu)
     if (!cst_nofreeze())
 #endif
     {
-        cpu_plugin_ticks_freeze(cpu->cpu_index);
+        /*
+         * The SPECULATIVE freeze: the clock's value stops, and so does its
+         * processing.  This is the only bracket that stops processing, and
+         * the reason is that this is the only bracket inside which the guest
+         * is not between two of its own instructions -- there is no legal
+         * position here for an event derived from guest time.  The
+         * correct-path instrumentation window below
+         * (cpu_plugin_vclock_pause) keeps the value-only freeze: it brackets
+         * a callback that runs beside real guest execution, where every
+         * guest-time event still has a position and only the callback's host
+         * cost must be kept out of the clock.
+         */
+        cpu_plugin_spec_ticks_freeze(cpu->cpu_index);
 #ifdef CONFIG_PLUGIN
         /* The other half of the freeze: under -icount the guest clock is
          * driven by retired instructions, which cpu_disable_ticks() does not
@@ -2331,26 +2343,35 @@ void cpu_plugin_spec_vtime_pause(CPUState *cpu)
      * AB/BA cycle the paragraph above describes is closed at its seam, by the
      * BQL drop around the shutdown dispatch in plugins/system.c.
      *
-     * What keeps the hold here is a third property nobody set out to buy: on
-     * x86 it is the only thing that keeps a guest-visible timer callback out
-     * of an excursion window.  A plugin freeze stops the clock's VALUE and
-     * leaves its PROCESSING running, so an iothread that is free to take a
-     * virtual timerlist pass mid-excursion evaluates deadlines against a
-     * clock that is not moving and enters the callbacks it finds due --
-     * inside the window, on the wrong path's watch.  Holding the BQL from
-     * pause to resume is what denies it that pass.  Measured on the x86_64
+     * The third property the hold was found to be carrying -- that on x86 it
+     * was the only thing keeping a guest-visible timer callback out of an
+     * excursion window -- is the one this comment used to end on, and it is
+     * the one that has now moved.  A plugin freeze used to stop the clock's
+     * VALUE and leave its PROCESSING running, so an iothread free to take a
+     * virtual timerlist pass mid-excursion evaluated deadlines against a
+     * clock that was not moving and entered the callbacks it found due,
+     * inside the window, on the wrong path's watch.  Measured on the x86_64
      * system marker cell with --devio-probe 256, counting callbacks ENTERED
      * while an excursion was open: none at all with the hold, in 24 of 24
      * boots; 27 to 73 per boot without it, in 24 of 24, every one of them on
      * a thread other than the excursion's own -- over 5.97M and 5.99M
-     * excursions respectively, so the arms are matched and the zero is the
+     * excursions respectively, so the arms were matched and the zero was the
      * hold's doing rather than an arm that did not run.
      *
-     * So this is not spare belt-and-braces to be removed for tidiness.  Until
-     * the guest-visible-clock stall in util/qemu-timer.c is wired to that same
-     * reference count -- it is written, and it has no caller yet -- removing
-     * the hold does not give a lock back, it admits the event class the
-     * wrong-path boundary exists to exclude, and admits it on x86 only.
+     * cpu_plugin_spec_ticks_freeze() above now denies that pass directly, on
+     * every target, without taking a lock: the excursion suspends the
+     * guest-visible clock's processing for its own duration, so the pass
+     * reports no deadline and enters no callback whether or not anyone holds
+     * the BQL.  On x86 that makes the hold redundant for THIS purpose, and it
+     * means the exclusion no longer stops at x86.
+     *
+     * The hold nonetheless stays for now, and deliberately: it was introduced
+     * against a measured livelock, its removal is a lock-order change on the
+     * one target where the excursion runs longest, and it gets its own commit
+     * and its own A/B rather than being deleted as a side effect of this one.
+     * What has changed is the argument for keeping it, which is no longer
+     * "removing it admits the event class the wrong-path boundary exists to
+     * exclude".
      */
 #if defined(TARGET_I386)
     {
@@ -2415,7 +2436,8 @@ void cpu_plugin_spec_vtime_resume(CPUState *cpu)
     if (!cst_nofreeze())   /* #77 arm: never disabled ticks; don't re-enable */
 #endif
     {
-        cpu_plugin_ticks_thaw(cpu->cpu_index);
+        /* Value back first, then processing -- see the pair's contract. */
+        cpu_plugin_spec_ticks_thaw(cpu->cpu_index);
     }
 #ifdef CONFIG_PLUGIN
     /*
@@ -2529,6 +2551,17 @@ void cpu_plugin_spec_vtime_resume(CPUState *cpu)
  * cpu_enable_ticks() and restarted the guest clock in the middle of that
  * excursion.  The vm_stop guard lives in cpu_plugin_ticks_thaw(): never
  * re-enable a clock a vm_stop owns.
+ *
+ * VALUE ONLY, and that is the difference from the wrong-path pause.  This
+ * window brackets a callback that runs beside guest execution the guest
+ * really performed: the guest sits between two of its own instructions, so
+ * every event derived from guest time still has a legal position and the only
+ * requirement is that the callback's host cost stays out of the clock.
+ * Suspending the clock's PROCESSING here as well was tried and measured red
+ * -- once per translation block the guest's timers stop being evaluated, and
+ * on the x86 system marker cell 5 cells in 12 stalled with a 24.2-24.4k
+ * instruction cluster that had not existed before.  The processing stall
+ * belongs to cpu_plugin_spec_ticks_freeze() and to nothing else.
  */
 void cpu_plugin_vclock_pause(CPUState *cpu)
 {

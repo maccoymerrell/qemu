@@ -144,13 +144,20 @@ static bool trans_wfi(DisasContext *ctx, arg_wfi *a)
 #ifndef CONFIG_USER_ONLY
     decode_save_opc(ctx, 0);
     /*
-     * helper_wfi reads QEMU_CLOCK_VIRTUAL (the idle-boundary timer
-     * reconcile, riscv_cpu_plugin_wfi_resync).  Under -icount a clock
-     * read is only legal from a TB's final instruction (can_do_io);
-     * a mid-TB wfi — OpenSBI's secondary-hart wait loop, the kernel
-     * poweroff path — otherwise dies with "Bad icount read".  WFI never
-     * returns to the TB (halt or exception, both cpu_loop_exit), so
-     * ending the TB here discards only untaken fall-through code.
+     * helper_wfi can read QEMU_CLOCK_VIRTUAL.  Under -icount a clock read
+     * is only legal from a TB's final instruction (can_do_io); a mid-TB
+     * wfi — OpenSBI's secondary-hart wait loop, the kernel poweroff path
+     * — otherwise dies with "Bad icount read".  WFI never returns to the
+     * TB (halt or exception, both cpu_loop_exit), so ending the TB here
+     * discards only untaken fall-through code.
+     *
+     * The reader this was written for, the idle-boundary timer reconcile,
+     * is gone; what remains is the CST_TIMER_DIAG probe, and that is
+     * enough to keep the requirement.  Whether a clock read happens is a
+     * run-time branch inside a TB translated once, so the TB has to be
+     * shaped for the case where it does — and the shape is not a run-time
+     * choice either: dropping it would move a TB boundary, and with it
+     * the trace, on a setting nobody set.
      */
     translator_io_start(&ctx->base);
     gen_update_pc(ctx, ctx->cur_insn_len);

@@ -139,28 +139,6 @@ static void riscv_aclint_mtimer_cb(void *opaque)
                 cs ? (int)cs->plugin_spec_vtime_paused : -1,
                 (unsigned long long)state->s->timecmp[state->num]);
     }
-    /*
-     * Wrong-path (speculative) excursion on the target hart: qemu_irq_raise
-     * here would set mip.MTIP in env — register state the excursion's
-     * walk-end restore then erases — while this one-shot QEMUTimer does not
-     * re-arm itself.  The raise would be swallowed and the machine timer
-     * parked forever: with the hart's clockevent driven through SBI
-     * (no Sstc), the guest tick never fires again (the ARM gt-timer /
-     * riscv stimer storm class, #77).  Defer: return without raising, and
-     * let riscv_cpu_plugin_resync_timers re-derive the MTIP level and host
-     * deadline from the architected timecmp at the true excursion-exit
-     * boundary.  It does that on every exit, unconditionally, so nothing has
-     * to be recorded here for the deferral to be repaired.  Gate on
-     * plugin_spec_vtime_paused (the WHOLE excursion),
-     * not just spec_mode: a wrong-path fault-skip briefly clears spec_mode
-     * while the snapshot is still live.  A fire racing excursion ENTRY
-     * (snapshot already taken, flags not yet visible to this thread) slips
-     * past this gate; that side is caught by the mip-rollback detection in
-     * cpu_plugin_arch_state_restore.
-     */
-    if (cs && (cs->plugin_spec_mode || cs->plugin_spec_vtime_paused)) {
-        return;
-    }
 #endif
     qemu_irq_raise(state->s->timer_irqs[state->num]);
 }

@@ -293,22 +293,4 @@ void riscv_cpu_plugin_resync_timers(CPUState *cs)
     riscv_plugin_reconcile_timers(env);
 }
 
-/*
- * Idle-boundary reconcile (#77).  Called from helper_wfi on the correct path,
- * just before the guest halts.  A wrong-path excursion can defer/drop a stimer
- * firing whose re-raise is then lost: the excursion-exit resync re-evaluates
- * due-ness against the rdtime clock that cpu_disable_ticks froze at excursion
- * entry, so an already-elapsed deadline reads "not due" and STIP is dropped; or
- * no further excursion runs before the guest idles.  The host stimer is then
- * left unarmed (expire_time = -1) while the architected stimecmp has already
- * passed (STIP should be pending but is 0) -> WFI sleeps on a wake that never
- * comes -> system livelock.  Reconcile against stimecmp on the REAL (running)
- * clock here so the idling guest always has a valid wake source.  WFI is rare,
- * so this is not a per-excursion cost and cannot storm; it is idempotent for an
- * already-correctly-armed timer.
- */
-void riscv_cpu_plugin_wfi_resync(CPUState *cs)
-{
-    riscv_plugin_reconcile_timers(cpu_env(cs));
-}
 #endif

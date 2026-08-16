@@ -614,14 +614,6 @@ void helper_wfi(CPURISCVState *env)
                     !!(env->mstatus & MSTATUS_SIE), (unsigned long long)env->mip);
             fflush(stderr);
         }
-        /*
-         * #77: reconcile the host timer + STIP against the architected stimecmp
-         * before the guest idles, so a wrong-path excursion that deferred or
-         * dropped a timer firing cannot leave WFI sleeping on a dead timer.
-         * Correct path only (spec mode is gated out above); see
-         * riscv_cpu_plugin_wfi_resync().
-         */
-        riscv_cpu_plugin_wfi_resync(cs);
 #endif
         cs->halted = 1;
         cs->exception_index = EXCP_HLT;

@@ -1312,7 +1312,7 @@ Four mutation layers, matching where strictness has to live:
    oracle is re-run against the damaged decode through a
    decoder-shaped stand-in (no re-tracing needed); it must raise a
    gating error in one of the mutation's declared ``expect`` checks.
-   20 of the 30 catalogue entries are this layer: flipping a captured
+   22 of the 32 catalogue entries are this layer: flipping a captured
    dst-register value or misattributing it to the wrong register id,
    swapping two memop addresses or flipping a captured load/store data
    byte, dropping the memops from the segment's final body entry (the
@@ -1332,6 +1332,11 @@ Four mutation layers, matching where strictness has to live:
    correct-path entries, splitting one whole-block entry into its two
    §4.2a stretches and emitting the continuation before its own
    prefix (``split_pair_reorder`` — ``range_continuity``'s teeth),
+   dropping the segment's final CP entry and moving the close stamp
+   onto its predecessor, so a lost tail is the only defect
+   (``cp_tail_entry_dropped`` — ``plugin_cp_tail_dropped``'s teeth,
+   on a substrate whose window budget is nearly untouched, so nothing
+   about the stop can excuse the short path),
    forging a foreign guest-thread id onto an
    entry, corrupting a per-memop physical-page value, dropping a
    ``DEVIO_STOP`` record, corrupting a self-modified block's
@@ -1785,10 +1790,47 @@ Coverage / WP
    patterns.
 
 ``plugin_cp_tail_dropped``
-   Diagnostic: surfaces the (known) plugin behaviour of dropping
-   the CP entry for the final TB when it ends in a process-exiting
-   syscall, so downstream checks don't false-fail on the missing
-   tail block.
+   The correct path stops short: the block visits the trace carries are
+   a strict prefix of the expected path, and the window still had
+   user-instruction budget left when the capture ended.  A window that
+   was not stopped owes the whole path, so a prefix there is a lost
+   tail — classically the segment's final entry, the block that ends in
+   the process-exiting syscall.  The budget is read from the trace
+   header's ``TOTAL_TARGET_INSNS`` and the instructions delivered are
+   counted from the wire itself, which is the same quantity the tracer
+   bills to the window clock and prints as ``wire_user_insns``; the
+   trace therefore states its own stop, and the check needs nothing
+   outside it.
+
+   Counting the delivered instructions rather than merely reading the
+   configured budget is what keeps the excuse honest: a capture that
+   lost blocks lost their instructions too, so it falls short of its
+   budget and is judged here rather than excused.  The boundary is the
+   overshoot — a window closes on the first block that carries the
+   clock to or past its budget, so a loss no larger than that final
+   block leaves the count still at or above the budget and is not
+   separable by path shape alone.  The stamp and the byte census cover
+   that width: a segment whose final entry vanished is a segment whose
+   close went unstamped (``thread_end``), and the tracer's own
+   ``clock_minus_wire`` row states the same conservation from the
+   writer's side.
+
+``cp_window_budget_truncated``
+   The complement, and not a defect: the window spent its whole
+   user-instruction budget before the workload reached its end marker,
+   so the capture stops mid-workload by design and the correct path is
+   covered as a prefix.  The uncovered suffix is dropped from what the
+   oracle expects rather than credited as observed: ``cp_distinct`` is
+   the record of which blocks the correct path reached, and a block the
+   capture never got to does not belong in it.  A loss *inside* the
+   covered prefix is a different shape entirely — it breaks the prefix
+   relation, so the whole-path comparison runs and ``blocks_covered`` /
+   ``cp_execution_order`` judge it as usual.  Reported as a notable INFO
+   naming how far the capture got and why, because a capture that
+   quietly began stopping early would otherwise look the same as one
+   that was merely short.  A marker cell whose workload outgrows its
+   ``--stop`` budget lands here; raising the budget until the segment
+   closes ``END`` is what makes such a cell cover its whole path.
 
 ``unconditional_direction``
    Every unconditional direct jump / direct call records its branch

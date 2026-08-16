@@ -782,6 +782,26 @@ def _m_thread_end_dropped(triple, gen_meta) -> Optional[str]:
     return None            # substrate carries no stamped close-final
 
 
+def _m_cp_tail_entry_dropped(triple, gen_meta) -> Optional[str]:
+    """Drop the segment's final CP entry — precisely the loss
+    ``plugin_cp_tail_dropped`` exists to catch.  The standard substrate
+    runs to completion and closes on the guest's own exit syscall with
+    the window budget barely touched, so the correct path owes its whole
+    length and nothing about the window can excuse a short one.  The
+    close stamp moves to the new last entry so the trace's only defect is
+    the missing tail, not an unstamped close (which `thread_end` would
+    catch instead, proving a different check)."""
+    _meta, _tmpl, entries = triple
+    if len(entries) < 2:
+        return None
+    gone = entries.pop()
+    if gone.get("thread_end"):
+        entries[-1]["thread_end"] = True
+    return (f"dropped final CP entry seq={gone.get('seq_num')} "
+            f"(template={gone.get('template_id')}); close stamp moved to "
+            f"seq={entries[-1].get('seq_num')}")
+
+
 # ---- wire mutations --------------------------------------------------------
 
 def _tar_members(cst_bytes: bytes) -> dict:
@@ -1406,6 +1426,11 @@ CATALOGUE: list = [
              expect=("thread_end",),
              covered_by="range_cells --selftest (thread_end falsifier "
                         "fixtures, always run)"),
+    Mutation("cp_tail_entry_dropped", "oracle",
+             "drop the segment's final CP entry on a substrate that ran "
+             "to its own end with the window budget unspent",
+             _m_cp_tail_entry_dropped,
+             expect=("plugin_cp_tail_dropped",)),
     Mutation("ppage_corrupt", "oracle",
              "corrupt a per-memop physical-page value",
              _m_ppage_corrupt,

@@ -5962,6 +5962,32 @@ def _entry_is_partial(e: dict, tmpl: dict | None) -> bool:
     return start > 0 or stop < n
 
 
+def _wire_user_insns(entries: list[dict], templates_by_id: dict) -> int:
+    """Count the user-mode instructions the trace actually carries.
+
+    This is the same quantity the tracer bills to the window clock and
+    prints as ``wire_user_insns`` on its per-segment console line, and
+    the tracer's own ``clock_minus_wire`` asserts the two are equal --
+    so reconstructing it from the wire reads the window's own clock
+    without needing the console, and works on any ``.cst`` validated
+    offline.  Only the instructions an entry's range NAMES count
+    (format spec 4.2a): a partial entry contributes its range, never
+    its template's full length.  Kernel-side entries are excluded
+    because the window clock excludes them -- the budget is spent in
+    user space, which is what makes a budget close comparable to the
+    header's declared total.
+    """
+    total = 0
+    for e in entries:
+        tmpl = templates_by_id.get(e["template_id"])
+        if tmpl is None or tmpl.get("is_system"):
+            continue
+        start, stop, _n = _entry_range(e, tmpl)
+        if stop > start:
+            total += stop - start
+    return total
+
+
 def _check_range_invocations(entries: list[dict],
                              templates_by_id: dict,
                              trace_meta: dict | None = None) -> list[Issue]:
@@ -8261,6 +8287,7 @@ def validate(meta_path: Path, trace_path: Path,
 
     correct_path = list(meta["correct_path"])
     blocks_by_id = {b["block_id"]: b for b in meta["blocks"]}
+    templates_by_id = {t["template_id"]: t for t in templates}
 
     # Symbol-based start: trim correct_path to begin at the block
     # whose label was used as the trace_window=symbol:name= target.
@@ -8331,55 +8358,128 @@ def validate(meta_path: Path, trace_path: Path,
     cp_block_seq = _collapse_runs(cp_flat)
     cp_distinct = set(cp_block_seq)
 
-    # Plugin sanity check: the CP entry for a TB is emitted lazily when
-    # the *next* TB starts, so a TB terminated by a process-exiting
-    # syscall currently disappears from CP.  We detect this pattern
-    # structurally: if the distinct CP blocks visited are a strict
-    # prefix of `correct_path` (run-length-collapsed to handle CFG-level
-    # self-loops), the missing suffix is the dropped tail.
-    plugin_drop_tail: list[int] = []
+    # Does the CP stop before the workload's path does?  Detected
+    # structurally: the blocks visited are a strict prefix of
+    # `correct_path` (run-length-collapsed to fold CFG-level self-loops),
+    # so the walk went the right way and simply stopped.
+    cp_tail_missing: list[int] = []
     _correct_collapsed = _collapse_runs(correct_path)
     if cp_block_seq and len(cp_block_seq) < len(_correct_collapsed):
         if cp_block_seq == _correct_collapsed[:len(cp_block_seq)]:
-            plugin_drop_tail = _correct_collapsed[len(cp_block_seq):]
+            cp_tail_missing = _correct_collapsed[len(cp_block_seq):]
+
+    # A capture stops for a reason, and the reason decides whether a CP
+    # that ends before the workload does is a defect at all.  The window's
+    # user-instruction budget is declared in the trace header
+    # (TOTAL_TARGET_INSNS) and the instructions the wire carries are
+    # countable from the wire, so the trace states its own stop: once the
+    # second reaches the first, the capture ended because the budget ran
+    # out, mid-workload, and the correct path is EXPECTED to stop wherever
+    # that happened.  A window that has NOT spent its budget owes the whole
+    # path, and a prefix there is a real loss.
+    #
+    # Counting what the wire DELIVERED, rather than trusting the header's
+    # number on its own, is what stops the excuse from covering the defect:
+    # a capture that lost blocks lost their instructions with them, so it
+    # reads short of its budget and lands in the error branch.  The residual
+    # width is the overshoot -- the window closes on the first block that
+    # carries the clock to or past the budget, so a loss no larger than that
+    # one block still counts at or above it.  `thread_end` (the vanished
+    # entry took the close stamp with it) and the tracer's own
+    # `clock_minus_wire` census row are the instruments that span that width.
+    window_budget = int(trace_meta.get("total_target_insns", 0) or 0)
+    wire_user = _wire_user_insns(entries, templates_by_id)
+    budget_spent = window_budget > 0 and wire_user >= window_budget
 
     stats["cp_start_index"] = cp_start
     stats["cp_entries_after_prologue"] = len(cp_entries)
     stats["cp_flat_block_visits"] = len(cp_flat)
     stats["cp_distinct_block_run_length"] = len(cp_block_seq)
+    stats["wire_user_insns"] = wire_user
+    stats["window_budget_spent"] = budget_spent
 
-    # Report the CP-tail-dropped plugin bug if present.  This is the
-    # root cause of any subsequent `blocks_covered` / `cp_execution_order`
-    # failures involving blocks after the last emitted CP entry, so we
-    # flag it explicitly to make the report actionable.
-    if plugin_drop_tail:
-        missing_labels = ", ".join(f"blk_{b}" for b in plugin_drop_tail)
+    # Default: the oracle expects the whole path, and compares it against
+    # exactly what the wire showed.
+    expected_collapsed = _correct_collapsed
+    expected_blocks = list(correct_path)
+    cp_distinct_effective = cp_distinct
+    cp_block_seq_effective = cp_block_seq
+
+    if cp_tail_missing and budget_spent:
+        # The window spent its budget before the workload finished.  The
+        # uncovered suffix was never captured because it was never asked
+        # for, so it is REMOVED from what the oracle expects -- not
+        # fabricated into what the oracle saw.
+        #
+        # Both arrangements leave the two checks below vacuous in this
+        # shape (a prefix compared against itself), so this is not extra
+        # scrutiny and is not claimed as any; what changes is what the
+        # report states.  `cp_distinct` is the oracle's record of the
+        # blocks the correct path covered, and crediting it with blocks
+        # the capture never reached records an observation that did not
+        # happen -- for a reader, and for anything later added downstream
+        # of it.  A loss INSIDE the covered prefix is not this case at
+        # all: it breaks the prefix relation, so `cp_tail_missing` is
+        # empty and the full-path comparison runs on the default path.
+        #
+        # Audible, because a capture that silently started stopping early
+        # is exactly what a quiet accept would hide.
+        expected_collapsed = _correct_collapsed[:len(cp_block_seq)]
+        expected_blocks = expected_collapsed
+        issues.append(Issue(
+            "cp_window_budget_truncated", "info",
+            f"the marker window spent its {window_budget}-instruction user "
+            f"budget ({wire_user} user insns on the wire) before the "
+            f"workload reached its end marker, so the correct path is "
+            f"covered as a prefix: {len(cp_block_seq)} of "
+            f"{len(_correct_collapsed)} block visits captured, "
+            f"{len(cp_tail_missing)} beyond the budget not expected",
+            {"notable": True,
+             "captured_block_visits": len(cp_block_seq),
+             "path_block_visits": len(_correct_collapsed),
+             "wire_user_insns": wire_user,
+             "window_budget": window_budget},
+        ))
+    elif cp_tail_missing:
+        # Nothing about the window accounts for the stop: it either had
+        # budget left or declared none, and the tail went missing anyway.
+        # The rendered list is capped; the full sequence stays in the
+        # detail dict, where a consumer can read all of it without a
+        # multi-hundred-kilobyte line in the report.
+        _shown = cp_tail_missing[:40]
+        missing_labels = ", ".join(f"blk_{b}" for b in _shown)
+        if len(cp_tail_missing) > len(_shown):
+            missing_labels += f", ... ({len(cp_tail_missing)} total)"
+        # An unbounded window declares no budget at all, so there is no
+        # budget to have spent -- it owes the whole path unconditionally.
+        why = (f"the window is unbounded ({wire_user} user insns on the "
+               f"wire), so it owed the whole path"
+               if window_budget <= 0 else
+               f"the window's budget is unspent ({wire_user} user insns "
+               f"on the wire of a {window_budget}-instruction budget)")
         issues.append(Issue(
             "plugin_cp_tail_dropped", "error",
-            "champsim_tracer plugin dropped the CP entry for the final TB "
-            "(ends in process-exit syscall); blocks visible only via "
-            f"a SYSCALL_USERMODE WP entry: {missing_labels}",
-            {"missing_cp_tail": plugin_drop_tail},
+            f"CP ends {len(cp_tail_missing)} block visits short of the "
+            f"correct path and {why}, so the capture lost the tail "
+            f"rather than being stopped at it; missing: {missing_labels}",
+            {"missing_cp_tail": cp_tail_missing,
+             "wire_user_insns": wire_user,
+             "window_budget": window_budget},
         ))
-        stats["plugin_dropped_cp_tail"] = plugin_drop_tail
+        stats["plugin_dropped_cp_tail"] = cp_tail_missing
+        # The error is already reported; suppress the downstream restatement
+        # of the same loss so the report names it once.  Kept in separate
+        # names: `cp_block_seq` itself stays the sequence actually observed,
+        # because `_check_wrong_path_chains` below reads it as evidence.
+        cp_distinct_effective = cp_distinct | set(cp_tail_missing)
+        cp_block_seq_effective = cp_block_seq + cp_tail_missing
 
-    # When the CP-tail-drop plugin bug is detected, the missing suffix
-    # blocks cannot possibly pass blocks_covered / cp_execution_order,
-    # so pretend the dropped blocks *were* covered (in order) for the
-    # downstream checks.  The underlying plugin bug is already reported.
-    if plugin_drop_tail:
-        cp_distinct = cp_distinct | set(plugin_drop_tail)
-        cp_block_seq_effective = cp_block_seq + plugin_drop_tail
-    else:
-        cp_block_seq_effective = cp_block_seq
-
-    issues += _check_blocks_covered(correct_path, cp_distinct)
+    issues += _check_blocks_covered(expected_blocks, cp_distinct_effective)
     # cp_block_seq is run-length-collapsed; for CFG-level self-loop
     # blocks (StrideLoopHead) the correct_path has the same block_id
     # repeated for each iteration, so collapse it here too — for
     # LoopHead↔LoopBody loops the alternation makes this a no-op.
-    correct_path_collapsed = _collapse_runs(correct_path)
-    issues += _check_cp_execution_order(correct_path_collapsed,
+    issues += _check_cp_execution_order(expected_collapsed,
                                         cp_block_seq_effective)
 
     # wpprune drops the wrong path for cold branches, so WP-discovered
@@ -8414,8 +8514,6 @@ def validate(meta_path: Path, trace_path: Path,
             f"{imp.get('regdata', 0)} regdata "
             f"({imp.get('regdata_insns', 0)} distinct insns)",
             dict(imp)))
-
-    templates_by_id = {t["template_id"]: t for t in templates}
 
     arena_info = _find_arena_address(binary_path)
     if arena_info is None:

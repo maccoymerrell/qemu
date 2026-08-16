@@ -141,6 +141,8 @@ FEATURES: dict[str, str] = {
     "behavior:marker_detection_exact": "a COMPLETE marker sequence is never missed: the whole-sequence byte match made at translation time fires exactly once, on the sequence's last instruction, and still fires when that instruction is a branch target — the translation block then starts mid-sequence and the preceding instruction slots have to be read out of guest memory rather than out of the block",
     "behavior:marker_no_false_claim": "an INCOMPLETE marker sequence is never claimed: CST_MARKER_SEQ_LEN-1 adjacent units, a lone START unit, a lone END unit, and the chimera (the START sequence's leading units followed by the END sequence's last unit — the two share their terminating instruction on the fixed-width ISAs) all open no window and write no segment",
     "behavior:guest_thread_identity": "thread_id is guest thread, not vCPU",
+    "behavior:multithread_content": "each guest thread's stream is compared 1v1 against ITS OWN generated ground truth — order, blocks, per-block instruction identity, memop kind/value/attribution, register values and wrong-path chains — with no golden in the loop; interleaving between threads is scheduling and is deliberately not asserted",
+    "behavior:per_thread_stream_purity": "one generated body maps to exactly one tid and no thread's entry appears in another thread's stream; every entry carrying generated code is accounted for by exactly one thread (bijection + purity + census)",
     "behavior:thread_strand_sequential": "every (thread_id, asid) context reads as one sequential strand: concurrent guest threads never share an id, so a kernel strand is never braided with another vCPU's",
     "behavior:asid_recycle":     "narrow-ASID recycle-no-cross-attribution",
     "behavior:spec_clock_resync": "wrong-path excursions are time-transparent: every guest clock, host timer and interrupt line is resynchronised to the frozen virtual time on exit, so the guest keeps taking interrupts and making user-space progress (4-ISA, system mode)",
@@ -240,6 +242,8 @@ def _mk(**over) -> SimpleNamespace:
         system=False, kernel=None, rootfs=None, sys_mem="512M", smp=1,
         # thread_test / churn_test knobs
         iters=None, migrate=False, migrate_churn=False, seeds=1,
+        # multi-thread content oracle (thread_test's content stage / mt_test)
+        content=True, content_seed=0x7A11, threads=2, prove=False,
         sleep_probe=40, churn_pre=60, churn_during=300,
         _init_text=None,
     )
@@ -344,6 +348,28 @@ def _chk_user(isa: str):
              "--hot-iters", "200", "--compress", "zstd", "--stop", "200000"],
             timeout=420, log_path=d / "run.log")
         return _cli_outcome(rc, tail, 420)
+    return fn
+
+
+def _chk_mt_content(isa: str):
+    """Multi-thread CONTENT, generatively.
+
+    N synthetic bodies (own seed, own code region, own arena, own
+    expected stream) stitched into one binary, the trace split on the
+    wire's own thread_id, every stream compared 1v1 against its thread's
+    ground truth — no golden anywhere in the loop.  ``--prove`` runs the
+    same cell adversarially: a defect planted in a NAMED thread must be
+    caught AND attributed to that thread, so the row proves the oracle
+    fires as well as that it passes."""
+    def fn(ctx: Ctx) -> Outcome:
+        d = ctx.dir(f"quick_mt_{isa}")
+        rc, tail = _run_cli(
+            ["mt_test", "--isa", isa, "--seed", _seedhex(ctx),
+             "--build-dir", str(ctx.build_dir), "-o", str(d),
+             "--threads", "3", "--diamonds", "6", "--regdata",
+             "--compress", "zstd", "--prove"],
+            timeout=600, log_path=d / "run.log")
+        return _cli_outcome(rc, tail, 600)
     return fn
 
 
@@ -2074,6 +2100,14 @@ def build_checks() -> list:
         C.append(Check(f"quick.user_{isa}", "quick",
                        f"user-mode 4-ISA correctness ({isa})",
                        list(core_user), _chk_user(isa)))
+    for isa in ISA_ALL:
+        C.append(Check(f"quick.mt_content_{isa}", "quick",
+                       f"multi-thread per-thread content oracle ({isa}, "
+                       f"3 generated bodies + planted-defect proof)",
+                       ["behavior:multithread_content",
+                        "behavior:per_thread_stream_purity",
+                        "wire:BODY_TAG_THREAD_SWITCH"],
+                       _chk_mt_content(isa)))
     C.append(Check("quick.iframe", "quick",
                    "IFRAME resync cadence (iframe_rate override)",
                    ["opt:iframe_rate", "wire:BODY_TAG_IFRAME"], _chk_iframe))

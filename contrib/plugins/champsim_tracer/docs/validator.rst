@@ -18,6 +18,9 @@ Layout::
     │   ├── asm_blocks.py          # CodeBlock library + _register_probe
     │   ├── _probe_specs.py        # inline-asm coverage probes
     │   ├── _thread_test_asm.py    # hand-written 2-thread programs
+    │   ├── _mt_gen.py             # N-body multi-thread generator + stitcher
+    │   ├── _mt_check.py           # per-thread 1v1 content oracle
+    │   ├── _mt_prove.py           # planted-defect proof for that oracle
     │   ├── validator.py           # the named checks
     │   ├── classify.py            # per-ISA reg classification scanning
     │   ├── _cst_decode_runner.py  # parses cst_decode's legacy output
@@ -69,8 +72,50 @@ Every run follows a five-stage pipeline:
    run every named check, and emit a summary report.
 
 The default ``all`` subcommand runs the whole pipeline end-to-end.
-Specialised sub-commands (``simpoint_test``, ``thread_test``) run a
-narrower pipeline tailored to a specific tracer feature.
+Specialised sub-commands (``simpoint_test``, ``thread_test``,
+``mt_test``) run a narrower pipeline tailored to a specific tracer
+feature.
+
+.. _validator-oracles-vs-goldens:
+
+Correctness comes from generative oracles, not from goldens
+-----------------------------------------------------------
+
+The two mechanisms in this harness answer different questions, and the
+harness is only trustworthy while the difference is kept sharp.
+
+**A generative oracle asks "is this right?"**  The workload is built
+from a seed, so its expected content — which blocks execute, in which
+order, what each instruction is, which memops it performs, with which
+values, and which wrong paths fork from it — is *computed*, never
+observed.  The trace is compared against that computation.  A tracer
+that regresses is caught the first time it regresses, on a machine that
+has never seen a correct trace of this workload, because nothing about
+the comparison depends on a previous run.
+
+**A golden asks "did this change?"**  A golden is a frozen byte image of
+a previous run.  It is a superb no-unintended-change gate for a
+refactor: it notices a shifted field, a reordered record, a dropped
+byte, anywhere in the wire, including in the parts no named check reads.
+What it cannot do is tell you the frozen bytes were ever *correct*.
+Re-captured against a defective tracer it locks the defect in, and every
+run afterwards reports agreement.  In the worst case its whole verdict
+reduces to *"as broken as before"*.
+
+So the standing rule:
+
+* **Goldens are no-unintended-change gates for refactors, only.**  They
+  gate ``quick.golden`` and the system canon cells, and they are
+  re-captured deliberately, never as a way of making a red run green.
+* **Correctness is established by generative comparison.**  Any content
+  claim the harness makes should trace back to something the generator
+  computed, not to something a previous run happened to emit.
+
+Where a golden is currently the *only* content check on some content,
+that is a gap in the generative side, and it is recorded as such — see
+:ref:`the golden-dependence map <validator-golden-map>`.  The
+multi-thread oracle (:ref:`mt_test <validator-mt>`) exists because
+multi-thread content used to be one of those places.
 
 Quickstart
 ----------
@@ -199,6 +244,18 @@ Sub-commands
    assertions run against the guest-thread identities the tracer
    resolves from the kernel per-thread pointer — the vCPU is absent
    from the wire, so they hold however the scheduler placed the pair.
+   Those assertions are structural; the cell also runs the
+   :ref:`content oracle <validator-mt>` beside them by default.
+
+``mt_test``
+   :ref:`Multi-thread content oracle <validator-mt>`.  Generates ``N``
+   independent synthetic bodies — one per guest thread, each with its
+   own seed, code region, arena and expected stream — stitches them
+   into one binary behind a driver thread that clones and joins them,
+   then splits the trace on the wire's own ``thread_id`` and compares
+   every stream 1v1 against its thread's generated ground truth.  No
+   golden is involved.  ``--prove`` plants a defect in each named
+   thread and requires the oracle to catch it *and* name the thread.
 
 ``churn_test``
    :ref:`Multi-process churn test <validator-churn>`.  System-mode
@@ -414,13 +471,22 @@ reserved for a confirmed upstream break or a genuinely
 timing-sensitive scenario that would otherwise produce a false RED
 under host contention; two ``multiproc`` checks use it (below).
 
-**quick** — 9 checks.  Mostly the ``all`` pipeline documented above,
-run under fixed flags per ISA, plus a handful of narrow one-off smoke
-checks and a byte-for-byte golden regression net:
+**quick** — 13 checks.  Mostly the ``all`` pipeline documented above,
+run under fixed flags per ISA, plus the multi-thread content oracle, a
+handful of narrow one-off smoke checks, and a byte-for-byte golden
+regression net:
 
 ``quick.user_x86_64`` / ``quick.user_aarch64`` / ``quick.user_riscv64`` / ``quick.user_mipsel``
    ``all`` with ``--diamonds 8 --coverage --regdata --hot-iters 200``,
    one per ISA — user-mode 4-ISA correctness.
+``quick.mt_content_x86_64`` / ``quick.mt_content_aarch64`` / ``quick.mt_content_riscv64`` / ``quick.mt_content_mipsel``
+   ``mt_test --threads 3 --regdata --prove``, one per ISA — the
+   :ref:`multi-thread content oracle <validator-mt>`.  Three generated
+   bodies are stitched into one binary and each thread's stream is
+   compared 1v1 against its own ground truth; ``--prove`` then plants a
+   defect in every named thread and requires the oracle to catch it and
+   name the thread, so the row proves the check fires as well as that it
+   passes.
 ``quick.iframe``
    ``all --iframe-rate 500 --regdata`` (x86_64) — IFRAME resync
    cadence under an aggressive override.
@@ -1853,6 +1919,17 @@ Run-to-completion is reliable because the parent's
 zero on exit — both threads always finish.  Per-thread entry counts
 are deterministic enough to compare across runs at a glance.
 
+Every assertion in that list is **structural**.  The clone pair is
+hand-written asm with no computed ground truth, so nothing above says
+what either thread executed — a tracer emitting the right shape with the
+wrong instructions in it passes all of them.  That is why the same cell
+also runs the generative content oracle by default: after the structure
+stage it generates ``--threads N`` synthetic bodies, stitches them into
+one binary, traces them in the same mode, and compares each thread's
+stream 1v1 against its own ground truth (see :ref:`mt_test
+<validator-mt>`).  ``--no-content`` drops back to structure only;
+``--content-seed`` picks the bodies' seed.
+
 System-mode SMP form
 ~~~~~~~~~~~~~~~~~~~~
 
@@ -1899,6 +1976,218 @@ seen on two vCPUs (migration), a vCPU hosting two tids (time-slice), or
 a binding whose tid simply differs from its vCPU index.  A run whose
 bindings were all ``tid == vcpu`` is ambiguous, not a failure; the gate
 fails only if *no* run in the set distinguished the identity.
+
+.. _validator-mt:
+
+Multi-thread content oracle (``mt_test``)
+------------------------------------------
+
+``thread_test`` above checks the *shape* of a multi-thread wire.  Every
+one of its assertions — two tids, two well-formed chains, one REGFILE
+each, the vCPU absent — is satisfied by a tracer that emits the right
+shape with the wrong instructions inside it, because the clone pair it
+traces is hand-written asm with no computed ground truth to compare
+against.  ``mt_test`` supplies the missing subject: **one synthetic
+workload per thread**, so multi-thread *content* is checked the same way
+single-thread content is, generatively, with no golden in the loop.
+
+.. code-block:: console
+
+   $ python3 -m champsim_tracer_validator mt_test \
+         --isa x86_64 --seed 0x4242 --threads 3 \
+         --build-dir ../../../../build -o out/ --prove
+
+The workload
+~~~~~~~~~~~~
+
+``_mt_gen.py`` generates ``N`` independent bodies and stitches them into
+one binary:
+
+* **Thread K** gets its own seed (derived from the run seed by hashing,
+  so no two threads share CFG structure), its own diamond CFG, its own
+  code region (symbols namespaced ``tK_``), its own ``arena``
+  (``tK_arena``) and its own ``meta.json``.  The bodies are disjoint *by
+  construction* — that is what makes each thread's expected content
+  exact, and what lets the trace be split and compared 1v1.
+* **The driver** clones the ``N`` workers onto private stacks, each
+  entering at ``tK__start``; futex-joins every one of them through its
+  ``CLONE_CHILD_CLEARTID`` slot; and only then fires the single END
+  marker and ``exit_group``.
+
+The driver runs no generated code, and it exists for a reason worth
+stating: the generated CFG's terminal block ends in ``SYS_exit``, so a
+thread that runs a body cannot outlive it, and the marker contract wants
+exactly one END — after all the content it closes over.  A body-running
+thread firing the END would close the window over the other threads'
+unfinished work.  The driver's own stream is therefore checked by
+*containment* rather than by a CFG oracle: it must carry no generated
+body's code, which is the mis-tagging invariant approached from the
+other side.
+
+Symbol namespacing happens at the object level (``objcopy
+--redefine-syms`` over the defined symbols only, so mipsel's libgcc
+references still resolve), not in the emitter.  Each thread's ``.S`` is
+byte-for-byte what the single-thread generator emits, so the
+multi-thread cell inherits every block class, probe and assertion
+instead of growing a parallel dialect that could drift.
+
+What is asserted, and what deliberately is not
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``_mt_check.py`` splits the trace on the wire's own ``thread_id`` and
+runs the single-thread content oracle over each stream:
+
+* ``tK.cp_execution_order`` / ``tK.blocks_covered`` — this thread's
+  correct path, in order, whole.
+* ``tK.template_raw_bytes`` / ``tK.block_insn_counts`` /
+  ``tK.expected_insns`` — per-block instruction identity.
+* ``tK.cp_memops`` / ``tK.per_execution_memop_data`` /
+  ``tK.memop_insn_attribution`` / ``tK.memop_count_assertions`` /
+  ``tK.per_execution_memop_shape`` — memop kind, value, and which
+  instruction performed it.
+* ``tK.reg_value_assertions`` / ``tK.expected_reg_sets`` — register
+  content, when ``--regdata`` is in effect.
+* ``tK.wrong_path_chains`` — this thread's speculative chains.
+
+**Order WITHIN a thread's stream is ground truth and is asserted.
+INTERLEAVING between threads is scheduling and is not.**  A check that
+asserted where one thread's entries fall relative to another's would be
+asserting the host scheduler, and would fail for reasons that say
+nothing about the tracer.
+
+Four cross-thread invariants come with ``N`` threads that no
+single-thread oracle can see:
+
+``mt_bijection``
+   Each generated body is claimed by exactly one tid, and each tid
+   claims at most one body.  The mapping is **discovered** from which
+   stream carries which thread's code — never assumed from clone order,
+   which would make the purity assertion circular.
+
+``mt_stream_purity``
+   No thread's entry appears in another thread's stream.  This is the
+   assertion that actually falsifies a mis-tagging tracer.
+
+``mt_entry_census``
+   Every entry carrying generated code is accounted for by exactly one
+   thread's own stream, so a mis-tagged entry cannot vanish into a
+   total.
+
+``tK.thread_regfile``
+   Every contributing tid carries its initial ``BODY_TAG_REGFILE``
+   before its first entry (``docs/format.rst`` is the contract).
+
+Every issue names its thread — in the check id, in the message and in
+the ``detail`` — because attribution *is* the claim a per-thread oracle
+makes.  "A mismatch somewhere" is not 1v1.
+
+Proving the oracle fires (``--prove``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A checker that only ever passes is indistinguishable from no checker, so
+``--prove`` plants a defect in a **named** thread and requires the oracle
+to catch it *and say whose it was*.  Caught but attributed to the wrong
+thread — or to no thread — fails exactly as loudly as slipping through.
+Four defects per thread:
+
+``meta_insn``
+   One instruction's expected opcode is perturbed in thread K's
+   metadata.  The trace is untouched and correct; the oracle must reject
+   it because the ground truth no longer describes it.
+``meta_memop``
+   One expected memop value in thread K's metadata is flipped.
+``wp_drop``
+   Thread K's wrong-path chains are dropped from the decode.  This one
+   exists because ``wrong_path_chains`` reports nothing on a clean run
+   by design, so silence there has to be shown to be a pass rather than
+   a vacuum.
+``image_byte``
+   ONE byte in the linked binary — the byte of thread K's arena seeding
+   one ``cond_branch`` predicate — is flipped and the workload is
+   re-traced.  Thread K then walks the other side of that diamond while
+   every other thread is bit-identical, so the divergence is real
+   execution, not a bookkeeping edit.
+
+Ground truth is disassembled from the clean image *before* any mutation:
+an oracle re-derived from the damaged binary would agree with it and
+prove nothing.
+
+Modes
+~~~~~
+
+Both modes are supported and both are content-checked identically.
+Under ``qemu-user`` the tid is the guest thread qemu-user allocates per
+clone; with ``--system --smp N`` the driver installs distinct per-thread
+pointers (its own before the marker, each worker's via
+``CLONE_SETTLS``) and the tid is the guest-thread identity the tracer
+resolves from the per-thread pointer register — so the same per-thread
+content assertions hold with a whole kernel interleaved into the
+streams.
+
+``thread_test`` runs this cell as its **content stage** by default
+(``--no-content`` drops back to structure only), in whichever mode
+``thread_test`` itself was invoked.  Structure and content sit side by
+side there; neither stands in for the other.
+
+.. _validator-golden-map:
+
+Golden-dependence map
+~~~~~~~~~~~~~~~~~~~~~
+
+Where a golden is currently the *only* content check, recorded honestly
+so the generative side's remaining gaps are visible rather than assumed
+closed:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 26 30 22 22
+
+   * - Golden
+     - Guards
+     - Sole content check?
+     - Status
+   * - ``tests/golden/manifest.json`` — w1–w7 × 4 ISAs (25 cells)
+     - Single-thread user-mode wire bytes
+     - **No.** ``quick.user_<isa>`` runs the full generative oracle over
+       the same generator and the same knobs.
+     - Unchanged.  Correctly a no-unintended-change gate.
+   * - SVG metric goldens (``w1_baseline``, ``w3_coverage`` × 21
+       metrics, plus the system fixtures × 6 system metrics)
+     - ``cst_visualize`` rendered SVG bytes
+     - **Yes.**  Nothing computes an expected metric series from the
+       generated metadata, so the rendered output has no oracle at all.
+     - **Remains.**  Replacing it means deriving each metric's expected
+       series from ``meta.json`` (branch direction, BB length, gen-op
+       mix and dep depth are all already computed there) and comparing
+       the renderer's series against that, leaving the golden to guard
+       only pixel layout.
+   * - ``tests/golden/manifest_system.json`` — ``devio_sys_x86_64``,
+       ``devio_sys_x86_64_int1``
+     - Real-guest system CP-user-slice content (kernel, virtio,
+       interrupts)
+     - **Yes.**  A real guest has no generated ground truth.
+     - **Remains.**  Only a generative *guest* — a synthetic workload
+       driving real devices with computed expected device traffic —
+       would replace it.
+   * - ``devio_sys_x86_64_smp2``
+     - Multi-vCPU real-guest system content
+     - **Yes** for the real guest.
+     - **Remains** for real-guest content, but it is no longer the only
+       thing standing between a per-thread mis-tagging defect and a
+       green run: ``mt_test --system --smp N`` now checks per-thread
+       content generatively, and proves it does.
+   * - Fixture decode net (frozen system ``.cst`` → ``cst_decode``
+       output)
+     - The decoder and tools over real system content
+     - **Yes.**
+     - **Remains.**  A frozen real trace is the point of that net.
+   * - *(none)* — ``thread_test``
+     - Multi-thread wire
+     - No golden existed at all.  Its checks were structural, so
+       multi-thread CONTENT was **unchecked**, not golden-checked.
+     - **Closed by this push.**  ``thread_test`` runs the generative
+       content oracle beside its structure checks by default, and
+       ``quick.mt_content_<isa>`` gates all four ISAs in ``full``.
 
 .. _validator-churn:
 

@@ -369,6 +369,18 @@ def _parse_args() -> argparse.Namespace:
                          "rebalances), so it reports ambiguous-split; this "
                          "forces the migration the decoupling proof needs. "
                          "Use with --smp 2.")
+    tt.add_argument("--content", action="store_true", default=True,
+                    help="Also run the generative multi-thread CONTENT "
+                         "oracle beside the structure checks (default on): "
+                         "N synthetic bodies stitched into one binary, the "
+                         "trace split on the wire's thread_id, every stream "
+                         "compared 1v1 against its own generated ground "
+                         "truth.  No golden is involved.")
+    tt.add_argument("--no-content", dest="content", action="store_false")
+    tt.add_argument("--content-seed", type=_parse_seed, default=0x7A11,
+                    help="Seed for the content stage's generated bodies.")
+    tt.add_argument("--threads", type=int, default=2,
+                    help="Generated bodies in the content stage (default 2).")
     tt.add_argument("--seed", action=_SeedsNotSeed, default=argparse.SUPPRESS,
                     help=argparse.SUPPRESS)
     tt.add_argument("--seeds", type=int, default=1,
@@ -376,6 +388,59 @@ def _parse_args() -> argparse.Namespace:
                          "scheduling entropy) and require the guest-thread "
                          "invariants on every run; reports x/N.")
     system_args(tt)
+
+    mt = sub.add_parser(
+        "mt_test",
+        help="Multi-thread CONTENT oracle: N independent synthetic "
+             "workloads, one per guest thread, stitched into one binary; "
+             "the trace is split on the wire's thread_id and each stream "
+             "is compared 1v1 against its thread's generated ground "
+             "truth.  No golden is involved.  --prove plants a defect in "
+             "each named thread and requires the oracle to catch it AND "
+             "name the thread.")
+    common(mt)
+    mt.add_argument("--isa", choices=ISA_CHOICES, action="append",
+                    required=True)
+    mt.add_argument("--build-dir", type=Path, required=True)
+    mt.add_argument("--seed", type=_parse_seed, required=True,
+                    help="Run seed.  Each thread's body is generated from "
+                         "a distinct seed derived from it, so no two "
+                         "threads share CFG structure.")
+    mt.add_argument("--threads", type=int, default=2,
+                    help="Number of generated bodies (default 2).  Each "
+                         "runs on its own cloned thread; a thin driver "
+                         "thread clones them, joins them all, and fires "
+                         "the single END marker.")
+    mt.add_argument("--diamonds", type=int, default=6)
+    mt.add_argument("--side-len-min", type=int, default=2)
+    mt.add_argument("--side-len-max", type=int, default=4)
+    mt.add_argument("--coverage", action="store_true",
+                    help="Prepend one of every probe block to each "
+                         "thread's body.")
+    mt.add_argument("--hot-iters", type=int, default=0)
+    mt.add_argument("--depth", type=int, default=64)
+    mt.add_argument("--stop", type=int, default=20_000_000,
+                    help="Trace-window instruction budget.  The default is "
+                         "far above what the bodies spend, so the window "
+                         "closes on the workload's own end and the content "
+                         "oracle sees every thread whole.")
+    mt.add_argument("--regdata", action="store_true", default=True,
+                    help="Emit destination register values (default on: "
+                         "the per-thread reg-value assertions need them).")
+    mt.add_argument("--no-regdata", dest="regdata", action="store_false")
+    mt.add_argument("--seeds", type=int, default=1,
+                    help="Repeat the whole cell with seed, seed+1, ... and "
+                         "require every run green (the negative half of "
+                         "the proof).")
+    mt.add_argument("--compress", choices=("none", "xz", "zstd", "gzip"),
+                    default="zstd", help="See `trace --compress`.")
+    mt.add_argument("--prove", action="store_true",
+                    help="Run the planted-defect proof: per thread, a "
+                         "perturbed expected instruction, a perturbed "
+                         "expected memop, a dropped wrong path, and ONE "
+                         "flipped image byte (re-traced) must each be "
+                         "caught and attributed to that thread.")
+    system_args(mt)
 
     ct = sub.add_parser(
         "churn_test",
@@ -1274,6 +1339,7 @@ def cmd_thread_test(args) -> int:
             print(report.summary())
             if report.errors():
                 rc_total = 1
+            rc_total |= _thread_test_content(args, isa, out_dir)
             continue
 
         # ---- system: N seeded runs, guest-thread-identity assertions ----
@@ -1354,7 +1420,192 @@ def cmd_thread_test(args) -> int:
                       f"guest-thread tid from the vCPU index (every "
                       f"binding was tid==vcpu)")
                 rc_total = 1
+        rc_total |= _thread_test_content(args, isa, out_dir)
     return rc_total
+
+
+def _thread_test_content(args, isa: str, out_dir: Path) -> int:
+    """thread_test's CONTENT stage, run beside its structure checks.
+
+    The clone pair thread_test traces is hand-written asm with no
+    generated ground truth, so its assertions are structural by
+    construction: two tids, two well-formed chains, the vCPU absent from
+    the wire.  Structure is not content — a tracer that emitted the right
+    SHAPE with the wrong instructions in it passes every one of those
+    checks, and until now the only thing standing between that and a
+    green run was a golden, which asserts no more than "identical to the
+    last capture".
+
+    So the same cell now also runs the generative multi-thread oracle in
+    the SAME mode: N synthetic bodies stitched into one binary, the trace
+    split on the wire's thread_id, each stream compared 1v1 against its
+    own meta.json.  Structure and content, side by side, neither standing
+    in for the other.  ``--no-content`` drops back to structure only."""
+    from . import _mt_gen as MG
+    if not getattr(args, "content", True):
+        return 0
+    if isa not in MG._DRIVERS:
+        print(f"thread_test[{isa}]: content SKIP  no multi-thread driver")
+        return 0
+    d = Path(out_dir) / f"content_{isa}"
+    d.mkdir(parents=True, exist_ok=True)
+    # thread_test's own namespace has no generator knobs; the cell reads
+    # its defaults through getattr, and out_dir is separate so the
+    # structure stage's artifacts are never overwritten.
+    sub = argparse.Namespace(**vars(args))
+    sub.out_dir = d
+    seed = int(getattr(args, "content_seed", 0x7A11))
+    print(f"\n---- thread_test {isa}: content oracle "
+          f"(seed 0x{seed:x}) ----")
+    return mt_content_cell(sub, isa, seed, d, prog="mtc",
+                           label="thread_test")
+
+
+def cmd_mt_test(args) -> int:
+    """Multi-thread CONTENT oracle (deliverables 1-3).
+
+    ``thread_test`` asserts the SHAPE of a multi-thread wire — two tids,
+    two well-formed chains, the vCPU absent.  It says nothing about what
+    each thread executed, so multi-thread content has until now leaned on
+    goldens, which can only report "as broken as before".
+
+    This cell builds the generative oracle instead: N independent
+    synthetic bodies (own seed, own code region, own arena, own expected
+    stream), stitched into one binary by a driver thread that clones them
+    onto private stacks and joins them all.  The trace is then split on
+    the wire's own ``thread_id`` and every stream is compared 1v1 against
+    its thread's ``meta.json`` — execution order, blocks covered, per-block
+    instruction identity, memop kind/value/attribution, register values
+    and wrong-path chains — plus the cross-thread invariants no
+    single-thread oracle can see (bijection, purity, census, per-thread
+    REGFILE).
+
+    Interleaving between threads is scheduling and is deliberately NOT
+    asserted; order WITHIN a thread's stream is ground truth and is.
+    """
+    from . import _mt_gen as MG
+
+    system = getattr(args, "system", False)
+    rc_total = 0
+    for isa in args.isa:
+        print(f"\n==== mt_test {isa}{' (system)' if system else ''} ====")
+        if isa not in MG._DRIVERS:
+            print(f"mt_test[{isa}]: SKIP  no multi-thread driver for this ISA")
+            continue
+        out_dir = Path(args.out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        plugin = args.build_dir / "contrib" / "plugins" / "libchampsim_tracer.so"
+        if not plugin.is_file():
+            print(f"mt_test[{isa}]: FAIL  plugin not found: {plugin}")
+            rc_total = 1
+            continue
+        load_ok, load_lines = PLUGLOAD.check_once(args.build_dir, label=isa)
+        for line in load_lines:
+            print(line)
+        if not load_ok:
+            rc_total = 1
+            continue
+
+        for run in range(max(1, int(getattr(args, "seeds", 1)))):
+            seed = int(args.seed) + run
+            rc_total |= mt_content_cell(
+                args, isa, seed, out_dir,
+                prog=f"mt{run}" if run else "mt",
+                prove=bool(getattr(args, "prove", False)),
+                label="mt_test")
+    return rc_total
+
+
+def mt_content_cell(args, isa: str, seed: int, out_dir: Path,
+                    prog: str = "mt", prove: bool = False,
+                    label: str = "mt_test") -> int:
+    """One multi-thread content cell: generate N bodies, stitch, trace,
+    and check every thread's stream 1v1 against its own ground truth.
+
+    Shared by ``mt_test`` and by ``thread_test``'s content stage, so the
+    two can never drift into checking different things."""
+    from . import _mt_gen as MG
+    from . import _mt_check as MC
+    from . import _mt_prove as MP
+
+    system = bool(getattr(args, "system", False))
+    plugin = args.build_dir / "contrib" / "plugins" / "libchampsim_tracer.so"
+    params = MG.MTParams(
+        isa=isa, seed=seed,
+        threads=int(getattr(args, "threads", 2)),
+        num_diamonds=int(getattr(args, "diamonds", 6)),
+        side_len_min=int(getattr(args, "side_len_min", 2)),
+        side_len_max=int(getattr(args, "side_len_max", 4)),
+        coverage=bool(getattr(args, "coverage", False)),
+        hot_iters=int(getattr(args, "hot_iters", 0)),
+        marker=system)
+    index = MG.generate(params, out_dir, prog=prog)
+    index_path = Path(index["_index_path"])
+    rc, bin_path = MG.build(
+        params, out_dir, index, ISA_COMPILER[isa], ISA_CFLAGS[isa],
+        extra_link=["-lgcc"] if isa == "mipsel" else None)
+    if rc != 0:
+        return 1
+
+    # Ground truth is disassembled from the CLEAN image, before any
+    # mutation: an oracle re-derived from a mutated binary would agree
+    # with it and prove nothing.
+    for t in index["threads"]:
+        A.analyze(bin_path, out_dir / t["meta"])
+
+    cst_path = Path(f"{bin_path}.cst")
+    depth = int(getattr(args, "depth", 64))
+
+    def _retrace(_bin=bin_path) -> int:
+        return _mt_trace(args, isa, _bin, plugin, bin_path)
+
+    rc = _retrace()
+    if rc != 0 or not cst_path.is_file():
+        print(f"{label}[{isa}] seed 0x{seed:x}: content trace FAILED rc={rc}")
+        return 1
+
+    report = MC.validate_mt(index_path, cst_path, bin_path,
+                            wp_insn_budget=depth)
+    print(report.summary())
+    if report.errors():
+        for i in report.errors()[:8]:
+            print(f"    [{i.check}] {i.message}")
+        return 1
+    print(f"{label}[{isa}] seed 0x{seed:x}: content PASS  "
+          f"{params.threads} thread(s) checked 1v1 against generated "
+          f"ground truth (no golden involved)")
+
+    if not prove:
+        return 0
+    fails, rows = MP.prove(index_path, cst_path, bin_path, isa, depth,
+                           _retrace)
+    print(f"\n-- planted-defect proof [{isa} seed 0x{seed:x}] --")
+    print(MP.format_table(rows))
+    if fails:
+        print(f"{label}[{isa}]: FAIL  {fails} planted defect(s) were not "
+              f"caught AND attributed to their thread")
+        return 1
+    print(f"{label}[{isa}]: proof PASS  every planted defect was caught "
+          f"and named its thread")
+    return 0
+
+
+def _mt_trace(args, isa: str, bin_path: Path, plugin: Path,
+              out_base: Path) -> int:
+    """Trace the stitched multi-thread binary (user or system mode)."""
+    if getattr(args, "system", False):
+        return _trace_system(args, isa, bin_path, plugin, out_base)
+    qemu = args.build_dir / ISA_QEMU[isa]
+    if not qemu.is_file():
+        print(f"mt_test[{isa}]: FAIL  qemu not found: {qemu}")
+        return 1
+    plugin_opts = (f"outfile={out_base},wpdepth={args.depth},"
+                   f"trace_window=icount:start=0;stop={args.stop},memdata=1"
+                   ) + _optional_plugin_opts(args)
+    cmd = [str(qemu), "-plugin", f"{plugin},{plugin_opts}", str(bin_path)]
+    return LLDET.call_watched(
+        cmd, isa=isa, mode="user", wpdepth=args.depth, budget=args.stop,
+        growth_prefix=str(out_base), label=f"mt_test {isa} (user)")
 
 
 def cmd_churn_test(args) -> int:
@@ -1777,6 +2028,8 @@ def main() -> int:
         return cmd_simpoint_test(args)
     if args.cmd == "thread_test":
         return cmd_thread_test(args)
+    if args.cmd == "mt_test":
+        return cmd_mt_test(args)
     if args.cmd == "churn_test":
         return cmd_churn_test(args)
     if args.cmd == "deadlatch_test":

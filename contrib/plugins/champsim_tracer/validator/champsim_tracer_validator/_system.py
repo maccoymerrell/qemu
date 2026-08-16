@@ -738,6 +738,97 @@ def default_init(attach: bool = False) -> str:
         run=f"/{ATTACH_GUEST_PATH} /workload" if attach else "/workload")
 
 
+# Idle-boundary init: the same run-then-poweroff shape as the default, with
+# the guest kernel's own idle accounting read across the workload's sleep.
+#
+# It exists because "the guest reached its idle instruction" is not otherwise
+# observable from outside.  A single-vCPU system cell whose workload never
+# blocks never lets the run queue empty, so the kernel never executes its idle
+# instruction (riscv `wfi`, arm `wfi`, x86 `hlt`) and the whole idle boundary
+# — where a system commits to sleeping on a timer it has already armed — goes
+# unexercised.  Pairing this init with a workload that nanosleeps inside the
+# trace window (``--sleep-probe``) empties the run queue for a bounded stretch,
+# and the two /proc/uptime reads MEASURE that it emptied rather than assuming
+# it: field 2 of /proc/uptime is the kernel's summed idle time, so the
+# difference is guest-observed idle seconds and a cell that stopped idling
+# reports a difference of zero.
+#
+# WHY THE SECOND READ IS ON A TIMER, AND WHY THE TIMER IS SHORTER THAN THE
+# SLEEP.  A traced system run does not outlive its trace: once the marked
+# window spends its budget the capture closes and the run is torn down, so
+# /init's line after /workload is never reached and the "after" read never
+# happens.  Putting the read on a background timer is necessary but not
+# sufficient — the timer counts GUEST time, and guest time barely advances
+# once the workload starts computing, because that is exactly what the
+# wrong-path excursion bracket freezes.  A timer armed past the end of the
+# sleep therefore expires only in a stretch of guest time the trace has all
+# but stopped, and it, too, never fires.
+#
+# So the read is taken a couple of seconds BEFORE the sleep is due to end,
+# while the guest is still idling and its clock still running at wall rate.
+# That is not a weaker reading: it samples the idle counter strictly inside
+# the open window, which is where the boundary being covered has to be
+# crossed.
+#
+# The subshell cannot manufacture what it measures.  Idle time accrues from an
+# EMPTY run queue, and a shell blocked in sleep(1) is not on the run queue any
+# more than /init blocked in wait(2) is; without the workload's own sleep the
+# workload is runnable throughout and the difference stays at zero.  That
+# direction is checked, not argued: idle_console_verdict is run against the
+# console of a cell WITHOUT a sleep probe as well.
+#
+# Kept as a separate init rather than folded into the default because the
+# console text and the extra forks are part of a system capture's traced
+# bytes: every existing system cell, and the system golden net, would move.
+_INIT_IDLE = """#!/bin/sh
+mount -t devtmpfs none /dev 2>/dev/null
+mount -t proc  none /proc 2>/dev/null
+mount -t sysfs none /sys  2>/dev/null
+exec >/dev/console 2>&1 </dev/console
+echo "=== cst_validator system-mode guest: $(uname -r) ==="
+read _up _idle < /proc/uptime
+echo "=== cst_idle_before $_idle ==="
+( sleep {after} ; read _u2 _i2 < /proc/uptime ; \
+  echo "=== cst_idle_after $_i2 ===" ) &
+/workload
+_rc=$?
+echo "=== /workload exit=$_rc ; powering off ==="
+poweroff -f
+"""
+
+# The console markers idle_init() writes, and the parser for them.  Kept
+# beside the template so a change to one is a change to both.
+IDLE_BEFORE_RE = re.compile(r"^=== cst_idle_before ([0-9.]+) ===", re.M)
+IDLE_AFTER_RE = re.compile(r"^=== cst_idle_after ([0-9.]+) ===", re.M)
+
+
+def idle_init(sleep_probe_s: int) -> str:
+    """The run-then-poweroff /init that reads the guest's own idle accounting
+    across a @sleep_probe_s-second workload sleep.  See _INIT_IDLE.
+
+    The second read lands shortly before the workload's sleep is due to end,
+    so it is taken while the guest is still idle and its clock still running
+    at wall rate — not after the traced compute has all but stopped guest
+    time, and not after the run has been torn down."""
+    return _INIT_IDLE.format(after=max(1, int(sleep_probe_s) - 2))
+
+
+def read_guest_idle(console_text: str):
+    """Guest idle seconds accumulated across the workload, from the two
+    /proc/uptime reads idle_init() writes to the console.
+
+    Returns ``(before, after)`` or ``None`` when either marker is missing.
+    ``None`` is not "no idle": it is "this console was not produced by
+    idle_init(), so nothing about idling can be read from it", and a caller
+    that treats it as a zero would be reporting a measurement it never made.
+    """
+    b = IDLE_BEFORE_RE.search(console_text)
+    a = IDLE_AFTER_RE.search(console_text)
+    if not b or not a:
+        return None
+    return float(b.group(1)), float(a.group(1))
+
+
 # Churn-test init: the marked workload runs concurrently with a stream of
 # short-lived unmarked processes (each shell-loop iteration forks a subshell
 # and execs /bin/true, so every iteration burns through two fresh mm's and

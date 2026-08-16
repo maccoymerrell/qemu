@@ -304,6 +304,15 @@ def _parse_args() -> argparse.Namespace:
                     help="See `generate --stride-loops`.")
     al.add_argument("--devio-probe", type=int, default=0,
                     help="See `generate --devio-probe`.")
+    al.add_argument("--sleep-probe", type=int, default=0,
+                    help="Seconds the marked workload nanosleeps right "
+                         "after pinning.  The user clock is frozen for the "
+                         "duration (sleeping retires no user instructions) "
+                         "so the window stays open, and with nothing else "
+                         "runnable the guest kernel reaches its idle "
+                         "instruction -- the only shape in which a "
+                         "single-vCPU system cell exercises the idle "
+                         "boundary at all.")
     al.add_argument("--marker", action="store_true",
                     help="See `generate --marker`.")
     al.add_argument("--compress", choices=("none", "xz", "zstd", "gzip"),
@@ -758,6 +767,15 @@ def _trace_system(args, isa: str, bin_path: Path, plugin: Path,
     stage_dir.mkdir(parents=True, exist_ok=True)
 
     init_text = getattr(args, "_init_text", None)
+    if init_text is None and getattr(args, "sleep_probe", 0) > 0:
+        # A workload that sleeps inside the window empties the guest's run
+        # queue, which is the only way a single-vCPU cell reaches the
+        # kernel's idle instruction.  Take the guest's own idle accounting
+        # across the workload so the cell MEASURES that it idled instead of
+        # assuming it (SYS.read_guest_idle reads the pair back).  Callers
+        # that supply their own init (churn_test, deadlatch_test) keep it:
+        # they sleep for a different reason and own their console.
+        init_text = SYS.idle_init(int(args.sleep_probe))
     attach_bin = None
     if getattr(args, "attach", False):
         if init_text is not None:

@@ -147,6 +147,7 @@ FEATURES: dict[str, str] = {
     "behavior:asid_recycle":     "narrow-ASID recycle-no-cross-attribution",
     "behavior:spec_clock_resync": "wrong-path excursions are time-transparent: every guest clock, host timer and interrupt line is resynchronised to the frozen virtual time on exit, so the guest keeps taking interrupts and making user-space progress (4-ISA, system mode)",
     "behavior:aclint_clockevent": "a riscv guest whose clockevent is the ACLINT machine timer reached through SBI (Sstc off), the second of riscv's two supervisor-timer paths and the one the default -cpu max never takes",
+    "behavior:guest_idle_boundary": "the guest kernel reaches its idle instruction inside an open trace window, so the boundary at which it commits to sleeping on an already-armed timer is crossed under tracing",
     "behavior:whole_system_capture": "trace-all captures an unmarked peer",
     "behavior:dead_latch":       "dead-latch ages a killed peer's window out",
     "behavior:cross_segment_consistency": "per-simpoint template shape consistency",
@@ -780,12 +781,12 @@ def _chk_clock_progress(isa: str):
 
 # ---- clock-source coverage -------------------------------------------------
 #
-# The check below exists because a system cell can be perfectly green and
-# still never touch the machinery it is credited with covering.  It asks for a
-# specific clock-source configuration AND reads the guest's own console back to
-# confirm the guest actually adopted it, because a configuration flag that
-# silently stops taking effect is indistinguishable from one that works if the
-# only thing checked is that the run passed.
+# The two checks below exist because a system cell can be perfectly green and
+# still never touch the machinery it is credited with covering.  Each one asks
+# for a specific clock-source configuration AND reads the guest's own console
+# back to confirm the guest actually adopted it, because a configuration flag
+# that silently stops taking effect is indistinguishable from one that works
+# if the only thing checked is that the run passed.
 
 def _console_text(d: Path) -> str:
     """Every guest console log written under @d, concatenated.
@@ -840,6 +841,46 @@ def aclint_console_verdict(con: str) -> Outcome:
                    "reports no sstc and the kernel logged no sstc timer")
 
 
+def idle_console_verdict(con: str, sleep_s: int) -> Outcome:
+    """Did the guest whose console is @con actually go idle across a
+    @sleep_s-second sleep probe?  Split out for the same reason as
+    aclint_console_verdict."""
+    if not con:
+        return Outcome("fail",
+                       "no guest console log was written, so whether the "
+                       "guest idled cannot be read -- a check that cannot "
+                       "find its subject fails")
+    from . import _system as SYS
+    pair = SYS.read_guest_idle(con)
+    if pair is None:
+        return Outcome("fail",
+                       "the guest console carries no cst_idle_before/after "
+                       "markers, so the idle-accounting init did not run and "
+                       "this cell proves nothing about the idle boundary")
+    before, after = pair
+    got = after - before
+    # A third of the probe.  The read is taken two seconds before the sleep
+    # is due to end and the guest spends the first second or so of the probe
+    # finishing the marker's own work, so a healthy cell lands near
+    # sleep_s - 3 (measured: 6.63s of a 10s probe).  The regression this
+    # guards against does not shave the figure, it collapses it to zero --
+    # the run queue either empties or it does not -- so the threshold is set
+    # to separate those two, with room for a slow start under host load.
+    want = sleep_s / 3.0
+    if got < want:
+        return Outcome("fail",
+                       f"the guest accumulated {got:.2f}s of idle inside a "
+                       f"{sleep_s}s sleep probe (needs >= {want:.2f}s): the "
+                       "run queue never emptied, so the kernel never reached "
+                       "its idle instruction and the idle boundary is "
+                       "untested")
+    return Outcome("pass",
+                   f"guest idled {got:.2f}s inside the {sleep_s}s sleep probe "
+                   f"with the marker window open (/proc/uptime {before:.2f} "
+                   f"-> {after:.2f}), so the kernel reached its idle "
+                   "instruction under tracing")
+
+
 def _chk_aclint_riscv64(ctx: Ctx) -> Outcome:
     """riscv64 system cell whose clockevent is the ACLINT machine timer.
 
@@ -870,6 +911,45 @@ def _chk_aclint_riscv64(ctx: Ctx) -> Outcome:
     if out.status != "pass":
         return out
     return aclint_console_verdict(_console_text(d))
+
+
+def _chk_idle_riscv64(ctx: Ctx) -> Outcome:
+    """riscv64 system cell whose guest actually goes idle inside the window.
+
+    Every other single-vCPU system cell keeps its run queue non-empty for the
+    whole trace window: the marked workload computes, init waits for it, and
+    nothing blocks.  A guest in that shape never executes its idle instruction,
+    so the idle boundary — the point at which a kernel commits to sleeping
+    until a timer it has already armed fires — is never crossed while the
+    tracer is running, and anything the excursion machinery does there is
+    untested.
+
+    ``--sleep-probe`` puts a nanosleep in the workload right after the marker
+    pins the window.  Sleeping retires no user instructions, so the window's
+    budget does not move and the window stays open, while the run queue
+    empties and the kernel idles.
+
+    That the guest idled is MEASURED, not assumed: with a sleep probe the run
+    stages the idle-accounting init (_system.idle_init), which reads field 2
+    of /proc/uptime — the kernel's summed idle time — once at boot and once
+    from a background timer, and prints both to the console.  The second read
+    lands INSIDE the probe rather than after it, because a traced run does not
+    outlive its trace and guest time barely advances once the workload starts
+    computing; see _INIT_IDLE.  idle_console_verdict carries the threshold and
+    the reason for it."""
+    sleep_s = 10
+    d = ctx.dir("system_idle_riscv64")
+    rc, tail = _run_cli(
+        ["all", "--isa", "riscv64", "--seed", _seedhex(ctx),
+         "--build-dir", str(ctx.build_dir), "-o", str(d),
+         "--system", "--marker", "--stop", "200000",
+         "--hot-iters", "5000", "--devio-probe", "256",
+         "--sleep-probe", str(sleep_s)],
+        timeout=1200, log_path=d / "run.log")
+    out = _cli_outcome(rc, tail, 1200)
+    if out.status != "pass":
+        return out
+    return idle_console_verdict(_console_text(d), sleep_s)
 
 
 def _chk_thread_system(ctx: Ctx) -> Outcome:
@@ -2285,15 +2365,21 @@ def build_checks() -> list:
                        f"excursions ({_isa} system boot)",
                        ["behavior:spec_clock_resync", "opt:window_marker"],
                        _chk_clock_progress(_isa)))
-    # The clock-source shape the boot table's -cpu max leaves untouched.
-    # A registry entry first: it exists so a mechanism that is currently
-    # exercised by NO cell cannot quietly go back to being exercised by
-    # no cell.
+    # The two clock-source shapes the boot table's -cpu max / never-blocking
+    # workload leave untouched.  Both are registry entries first: they exist
+    # so a mechanism that is currently exercised by NO cell cannot quietly go
+    # back to being exercised by no cell.
     C.append(Check("system.aclint_riscv64", "system",
                    "clockevent on the SBI/ACLINT machine timer, Sstc off "
                    "(riscv64 system boot)",
                    ["behavior:aclint_clockevent", "behavior:spec_clock_resync",
                     "opt:window_marker"], _chk_aclint_riscv64))
+    C.append(Check("system.idle_riscv64", "system",
+                   "guest reaches its idle instruction inside the marker "
+                   "window (riscv64 system boot)",
+                   ["behavior:guest_idle_boundary",
+                    "behavior:spec_clock_resync", "opt:window_marker"],
+                   _chk_idle_riscv64))
 
     C.append(Check("multiproc.trace_all_x86", "multiproc",
                    "trace-all vs latch differential (x86)",

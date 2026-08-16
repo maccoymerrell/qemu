@@ -507,7 +507,7 @@ regression net:
    path rather than its own per-check directory) — byte-for-byte
    wire and ``cst_visualize`` SVG regression.
 
-**system** — 12 checks.  ``system.churn_x86``,
+**system** — 13 checks.  ``system.churn_x86``,
 ``system.churn_mipsel``, ``system.thread_x86``, ``system.thread_mipsel``
 and the four ``system.clock_progress_<isa>`` checks literally invoke the
 ``churn_test`` / ``thread_test`` sub-commands documented above under
@@ -586,6 +586,35 @@ add coverage no other sub-command exposes:
    timer interrupt is available via Sstc.  The first two are positive
    anchors, so a console the harness failed to write fails the check
    instead of reading as a console without Sstc in it.
+``system.idle_riscv64``
+   ``all --system --marker --sleep-probe 10`` on riscv64.  Every other
+   single-vCPU system cell keeps the guest's run queue non-empty for
+   the whole window — the marked workload computes, init waits for
+   it, nothing blocks — so the guest never executes its idle
+   instruction and the idle boundary is never crossed under tracing.
+   ``--sleep-probe`` puts a ``nanosleep`` in the workload right
+   after the marker pins the window: sleeping retires no user
+   instructions, so the window's budget does not move and the window
+   stays open while the run queue empties and the kernel idles.
+
+   That the guest idled is measured, not assumed.  A run with a sleep
+   probe stages the idle-accounting ``/init``, which reads the
+   kernel's own summed idle time (field 2 of ``/proc/uptime``) once at
+   boot and once from a background timer, and prints both to the
+   console.  The second read is deliberately taken a couple of seconds
+   *before* the probe is due to end: a traced run does not outlive its
+   trace, and guest time barely advances once the workload starts
+   computing — that is what the excursion bracket freezes — so a timer
+   armed past the end of the sleep expires in a stretch of guest time
+   the trace has all but stopped and never fires at all.  Sampling
+   inside the sleep also reads the counter where the boundary is
+   actually crossed, with the window open.
+
+   The check requires at least a third of the probe to show up as
+   idle.  A healthy cell lands near ``sleep − 3`` seconds; the
+   regression this guards against does not shave that figure, it
+   collapses it to zero, because the run queue either empties or it
+   does not.
 ``system.attach_mipsel``
    ``all --system --attach`` on mipsel — the ptrace-injected marker
    (:program:`cst_attach`'s ``PTRACE_PEEKUSER``/``POKEUSER`` backend)

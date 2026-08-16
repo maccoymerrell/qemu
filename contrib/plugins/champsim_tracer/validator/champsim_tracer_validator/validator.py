@@ -4444,13 +4444,30 @@ def _check_wrong_path_chains(entries: list[dict],
             # the excursion was kicked but its first fetch could not
             # complete, so the chain is empty and says so explicitly.
             "chain_event": bool(e.get("wp_first_fetch_unavailable")),
+            # Block-level TRANSLATION_UNAVAIL on the chain's LAST emitted
+            # block (format spec §4.4).  The spec makes this flag the
+            # excursion's stop -- "marks its block as the excursion's
+            # last ... it is the sole stop the wire names, and it is set
+            # on the last block that did complete" -- and names four
+            # causes, only one of which is the privilege crossing that
+            # `wp_left_user` models.
+            "stop_flag_on_last": bool(
+                wp_list and wp_list[-1].get("translation_unavailable")),
         })
 
     def _realizes_exact_or_longer(r: dict) -> bool:
         """True when @r emitted a non-empty chain satisfying the
-        exact-or-longer invariant under the same terminators the
-        verdicts below accept: full predicted length, provable budget
-        exhaustion, or a user-CFG crossing at/after the full prefix."""
+        exact-or-longer invariant under a DELIBERATELY NARROWER set of
+        terminators than the verdicts below accept: full predicted
+        length, provable budget exhaustion, or a user-CFG crossing
+        at/after the full prefix.
+
+        A chain that stopped at the wire's own TRANSLATION_UNAVAIL flag
+        is excluded on purpose.  This helper's job is to corroborate an
+        EMPTY chain elsewhere by showing the same static branch does
+        speculate into real code when it can; a chain that itself
+        stopped because a fetch could not be translated is the weakest
+        possible witness for that, so it does not vouch for anyone."""
         if not r["actual_wp"] or r["first_fail"] >= 0:
             return False
         if len(r["actual_wp"]) >= len(r["exp_chain"]):
@@ -4545,6 +4562,49 @@ def _check_wrong_path_chains(entries: list[dict],
             # short chain here; the fault must continue to a real terminator.)
             if wp_left_user and left_user_at is not None \
                     and left_user_at >= len(exp_chain):
+                continue
+            # Block-level TRANSLATION_UNAVAIL on the chain's LAST block
+            # (format spec §4.4).  This is the terminator 4b2eb82724
+            # already meant to accept -- its taxonomy lists "a mid-chain /
+            # first-fetch translation-unavailable event" among the real
+            # terminators -- but the implementation only ever reached it
+            # through `wp_left_user`, which additionally demands the stop
+            # land at/after the full predicted length.  For a *mid-chain*
+            # stop that condition is false by definition, so the accept
+            # the message describes was dead code.
+            #
+            # The two are not the same event.  `wp_left_user` models a
+            # PRIVILEGE crossing, where the tail is unpredictable only
+            # from the crossing on, and demanding the whole predicted
+            # user prefix first is right.  The wire's flag names four
+            # causes -- un-resident code, a refused garbage region, a
+            # privilege-boundary fetch, and the host's speculative code
+            # buffer being exhausted -- and the last of those is a HOST
+            # resource condition that has nothing to do with how much of
+            # the guest's predicted path remains.  It becomes reachable
+            # mid-prefix as soon as guest threads run concurrently, which
+            # is why single-thread cells never met it.
+            #
+            # Strictness is kept where it does work: the flag must sit on
+            # the block the walk actually stopped at (the spec sets it on
+            # "the last block that did complete"), the emitted prefix must
+            # already be exact (first_fail < 0, checked above), and a
+            # short chain whose last block carries NO flag is still a
+            # truncation.  Accepting silently would hide a plugin that
+            # started stopping early, so the accept is audible.
+            if actual_wp and rec["stop_flag_on_last"]:
+                issues.append(Issue(
+                    "wrong_path_chains", "info",
+                    f"WP at CP pos {cp_pos} (blk_{last_cp_bid}) stopped at "
+                    f"{len(actual_wp)} of {len(exp_chain)} predicted blocks "
+                    f"with CST_BB_FLAG_TRANSLATION_UNAVAIL on its last "
+                    f"block — the wire's own terminator (format.rst §4.4); "
+                    f"prefix verified exact",
+                    {"notable": True, "cp_pos": cp_pos,
+                     "branch": last_cp_bid,
+                     "emitted": len(actual_wp),
+                     "predicted": len(exp_chain),
+                     "sim_insns": actual_sim_insns}))
                 continue
             # Chain-level TRANSLATION_UNAVAIL event (format spec §4.4):
             # the plugin kicked the excursion but the first fetch could

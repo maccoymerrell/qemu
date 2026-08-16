@@ -146,6 +146,7 @@ FEATURES: dict[str, str] = {
     "behavior:thread_strand_sequential": "every (thread_id, asid) context reads as one sequential strand: concurrent guest threads never share an id, so a kernel strand is never braided with another vCPU's",
     "behavior:asid_recycle":     "narrow-ASID recycle-no-cross-attribution",
     "behavior:spec_clock_resync": "wrong-path excursions are time-transparent: every guest clock, host timer and interrupt line is resynchronised to the frozen virtual time on exit, so the guest keeps taking interrupts and making user-space progress (4-ISA, system mode)",
+    "behavior:aclint_clockevent": "a riscv guest whose clockevent is the ACLINT machine timer reached through SBI (Sstc off), the second of riscv's two supervisor-timer paths and the one the default -cpu max never takes",
     "behavior:whole_system_capture": "trace-all captures an unmarked peer",
     "behavior:dead_latch":       "dead-latch ages a killed peer's window out",
     "behavior:cross_segment_consistency": "per-simpoint template shape consistency",
@@ -775,6 +776,100 @@ def _chk_clock_progress(isa: str):
                        "physaddr=1,devio=1,interrupts=1,faults=1,kexc=1"})
         return _cli_outcome(rc, tail, 1200)
     return fn
+
+
+# ---- clock-source coverage -------------------------------------------------
+#
+# The check below exists because a system cell can be perfectly green and
+# still never touch the machinery it is credited with covering.  It asks for a
+# specific clock-source configuration AND reads the guest's own console back to
+# confirm the guest actually adopted it, because a configuration flag that
+# silently stops taking effect is indistinguishable from one that works if the
+# only thing checked is that the run passed.
+
+def _console_text(d: Path) -> str:
+    """Every guest console log written under @d, concatenated.
+
+    Returns "" when none was written; callers treat that as "the subject was
+    not found" and fail, never as "the condition was absent"."""
+    return "".join(p.read_text(errors="replace")
+                   for p in sorted(d.rglob("*.console.log")))
+
+
+def aclint_console_verdict(con: str) -> Outcome:
+    """Did the guest whose console is @con drive its clockevent through the
+    ACLINT machine timer?  Split out from the check so it can be run against
+    a captured console of each kind and shown to answer differently -- a gate
+    whose passing side has never been contrasted with its failing side is a
+    gate nobody has tested."""
+    if not con:
+        return Outcome("fail",
+                       "no guest console log was written, so the clock "
+                       "source cannot be confirmed -- a check that cannot "
+                       "find its subject fails")
+    isa_line = next((l for l in con.splitlines()
+                     if "Boot HART ISA Extensions" in l), None)
+    tmr_line = next((l for l in con.splitlines()
+                     if "Platform Timer Device" in l), None)
+    if isa_line is None or tmr_line is None:
+        return Outcome("fail",
+                       "the guest console carries no OpenSBI banner "
+                       f"(ISA-extensions line {'found' if isa_line else 'MISSING'}, "
+                       f"timer-device line {'found' if tmr_line else 'MISSING'}), "
+                       "so the cell's clock source is unreadable")
+    if "sstc" in isa_line.split(":", 1)[-1]:
+        return Outcome("fail",
+                       "the boot CPU still reports Sstc despite "
+                       "-cpu max,sstc=false, so the kernel programs stimecmp "
+                       "directly and the ACLINT machine timer is not the "
+                       f"clockevent: {isa_line.strip()}")
+    if "aclint-mtimer" not in tmr_line:
+        return Outcome("fail",
+                       "Sstc is off but the platform timer is not the ACLINT "
+                       f"mtimer, so this cell covers neither path: "
+                       f"{tmr_line.strip()}")
+    if "sstc extension" in con:
+        return Outcome("fail",
+                       "the guest kernel reports its S-mode timer interrupt "
+                       "as available via the sstc extension, so it did not "
+                       "fall back to the SBI/ACLINT clockevent this cell "
+                       "exists to exercise")
+    return Outcome("pass",
+                   "clockevent confirmed on the SBI/ACLINT path from the "
+                   f"guest's own console: {tmr_line.strip()}; boot CPU "
+                   "reports no sstc and the kernel logged no sstc timer")
+
+
+def _chk_aclint_riscv64(ctx: Ctx) -> Outcome:
+    """riscv64 system cell whose clockevent is the ACLINT machine timer.
+
+    riscv has two ways for a supervisor to get a timer interrupt, and they run
+    through entirely different QEMU device code.  With the Sstc extension the
+    kernel programs ``stimecmp`` directly and the firing arrives from
+    ``riscv_stimer_cb``; without it the kernel calls SBI, OpenSBI programs the
+    ACLINT ``mtimecmp``, and the firing arrives from ``riscv_aclint_mtimer_cb``
+    with an M-mode round trip in between.  The validator's riscv64 boot table
+    asks for ``-cpu max``, which has Sstc, so every system cell in the suite
+    takes the first path and the ACLINT timer callback is never entered at
+    all -- the second path had no cell.
+
+    This check is that cell.  ``sstc=false`` on top of ``-cpu max`` (a later
+    ``-cpu`` wins, see _system.system_qemu_cmd) removes the extension, and the
+    guest's own console is read back to confirm the swap happened rather than
+    assuming the flag took; see aclint_console_verdict for the three clauses
+    and why two of them are positive anchors."""
+    d = ctx.dir("system_aclint_riscv64")
+    rc, tail = _run_cli(
+        ["all", "--isa", "riscv64", "--seed", _seedhex(ctx),
+         "--build-dir", str(ctx.build_dir), "-o", str(d),
+         "--system", "--marker", "--stop", "200000",
+         "--hot-iters", "5000", "--devio-probe", "256"],
+        timeout=1200, log_path=d / "run.log",
+        extra_env={"CST_QEMU_EXTRA_ARGS": "-cpu max,sstc=false"})
+    out = _cli_outcome(rc, tail, 1200)
+    if out.status != "pass":
+        return out
+    return aclint_console_verdict(_console_text(d))
 
 
 def _chk_thread_system(ctx: Ctx) -> Outcome:
@@ -2190,6 +2285,15 @@ def build_checks() -> list:
                        f"excursions ({_isa} system boot)",
                        ["behavior:spec_clock_resync", "opt:window_marker"],
                        _chk_clock_progress(_isa)))
+    # The clock-source shape the boot table's -cpu max leaves untouched.
+    # A registry entry first: it exists so a mechanism that is currently
+    # exercised by NO cell cannot quietly go back to being exercised by
+    # no cell.
+    C.append(Check("system.aclint_riscv64", "system",
+                   "clockevent on the SBI/ACLINT machine timer, Sstc off "
+                   "(riscv64 system boot)",
+                   ["behavior:aclint_clockevent", "behavior:spec_clock_resync",
+                    "opt:window_marker"], _chk_aclint_riscv64))
 
     C.append(Check("multiproc.trace_all_x86", "multiproc",
                    "trace-all vs latch differential (x86)",

@@ -507,7 +507,7 @@ regression net:
    path rather than its own per-check directory) — byte-for-byte
    wire and ``cst_visualize`` SVG regression.
 
-**system** — 11 checks.  ``system.churn_x86``,
+**system** — 12 checks.  ``system.churn_x86``,
 ``system.churn_mipsel``, ``system.thread_x86``, ``system.thread_mipsel``
 and the four ``system.clock_progress_<isa>`` checks literally invoke the
 ``churn_test`` / ``thread_test`` sub-commands documented above under
@@ -565,6 +565,27 @@ add coverage no other sub-command exposes:
    mipsel.  Uses the churn guest under the full system option set —
    a gate for a clock bug has to run the configuration in which the
    clocks are touched.
+``system.aclint_riscv64``
+   ``all --system --marker`` on riscv64 under
+   ``CST_QEMU_EXTRA_ARGS="-cpu max,sstc=false"``.  A riscv supervisor
+   gets its timer interrupt one of two ways, and they run through
+   entirely different device code: with the Sstc extension the kernel
+   programs ``stimecmp`` itself and the firing arrives from the CPU's
+   own supervisor timer; without it the kernel calls SBI, firmware
+   programs the ACLINT's ``mtimecmp``, and the firing arrives from the
+   ACLINT machine timer with an M-mode round trip in between.  The
+   riscv64 boot table asks for ``-cpu max``, which has Sstc, so every
+   other system cell takes the first path only.  This one removes the
+   extension (a later ``-cpu`` wins over the boot table's) so the
+   second path carries the clockevent.
+
+   The swap is confirmed from the guest's own console rather than
+   assumed from the flag: firmware's ISA-extension banner must not
+   list ``sstc``, its platform-timer banner must name
+   ``aclint-mtimer``, and the kernel must not log that its S-mode
+   timer interrupt is available via Sstc.  The first two are positive
+   anchors, so a console the harness failed to write fails the check
+   instead of reading as a console without Sstc in it.
 ``system.attach_mipsel``
    ``all --system --attach`` on mipsel — the ptrace-injected marker
    (:program:`cst_attach`'s ``PTRACE_PEEKUSER``/``POKEUSER`` backend)

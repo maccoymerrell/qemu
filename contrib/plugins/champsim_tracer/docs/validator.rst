@@ -797,6 +797,15 @@ outside the repo as standalone scripts):
    eager materialisation forced back on, and requires *that* run to
    exceed the budget: a residency gate that cannot be made to go red
    proves nothing, so failing to fire fails the check.
+
+   The same check covers the lazy views' **lifetime**, which is what
+   laziness costs.  A view is only readable while the decode behind it
+   is open, and ``iter_decode_champsim_tracer(...,
+   body_record_order=True)`` hands one back alongside a generator that
+   closes that decode when it finishes — so the check reads the
+   record-order view after the decode has closed and requires the
+   same answer.  Reading a closed decode raises rather than returning
+   whatever the released file descriptor now points at.
 ``features.final_entry_memops``
    The segment's **last** body entry keeps its memory operands.
    Body entries are emitted one TB late, so an entry flushed on a

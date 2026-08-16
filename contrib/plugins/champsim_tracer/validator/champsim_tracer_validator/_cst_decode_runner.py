@@ -808,6 +808,17 @@ class _LineFile:
 
     def _read(self, start: int, end: int) -> bytes:
         """Bytes [start, end) via the sliding window."""
+        if self._fd < 0:
+            # A lazy view (_EntrySeq / _BodyOrderSeq) outlived the decode it
+            # addresses.  Say so.  Reading on regardless is worse than an
+            # error: the fd number this object used has been released, so a
+            # pread through it lands on whatever file the process opened
+            # next and returns that file's bytes, silently.
+            raise ValueError(
+                f"_LineFile({self._path!r}) is closed -- a lazy view over "
+                f"this decode outlived it.  Views hold a reference to keep "
+                f"the decode alive; something closed it explicitly, or the "
+                f"view was built over a decode owned by a `with` block.")
         if start >= self._buf_lo and end <= self._buf_hi:
             return self._buf[start - self._buf_lo:end - self._buf_lo]
         want = max(self._WINDOW, end - start)
@@ -851,9 +862,20 @@ class _LineFile:
 
     def close(self) -> None:
         self._buf = b""
+        # Retire the window as well as its contents: leaving _buf_lo/_buf_hi
+        # behind lets a post-close read whose range falls inside the old
+        # window be served from the emptied buffer, which returns empty
+        # strings with no error at all.
+        self._buf_lo = 0
+        self._buf_hi = 0
         if self._fh is not None:
             self._fh.close()
             self._fh = None
+        # And retire the fd NUMBER.  Once released it can be handed to the
+        # next file this process opens, and _read() addresses it directly:
+        # a stale _fd is how a use-after-close reads another file's bytes
+        # instead of failing.  -1 makes _read say what happened.
+        self._fd = -1
         if self._own:
             try:
                 os.unlink(self._path)
@@ -1603,6 +1625,14 @@ def iter_decode_champsim_tracer(bin_path, *, body_record_order: bool = False):
         try:
             yield from _iter_body(lines, i, rid_by_name)
         finally:
-            lines.close()
+            # When body_record_order was asked for, meta holds a lazy view
+            # over THIS decode, and the caller may read it after the walk --
+            # it was a plain list of tuples before the views existed, and
+            # nothing in the API says it stops being readable.  Closing here
+            # would leave them holding a view over a closed file.  The view
+            # owns a reference, so dropping both releases the decode; the
+            # fd is not leaked, only handed over.
+            if not body_record_order:
+                lines.close()
 
     return meta, templates, _entries()

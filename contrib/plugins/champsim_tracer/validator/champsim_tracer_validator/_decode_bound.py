@@ -71,6 +71,41 @@ def bound_bytes(facts: dict) -> int:
 
 # --- the probe (runs as a child process) -----------------------------------
 
+def _order_view_survives(cst: str) -> tuple[bool, str]:
+    """The streaming decoder's record-order view must outlive its decode.
+
+    ``iter_decode_champsim_tracer(..., body_record_order=True)`` used to hand
+    back a plain ``list[tuple]``; it is now a lazy view over the same spilled
+    decode that the entry generator closes when it finishes.  A caller that
+    reads the order after walking the body is doing nothing wrong, so the
+    view has to still work — and the failure is not a clean one.  A closed
+    ``_LineFile`` whose fd number has been reused reads THAT file's bytes,
+    so the wrong answer arrives without an error.  Checked, not assumed.
+    """
+    from . import _cst_decode_runner as R
+
+    meta, _t, it = R.iter_decode_champsim_tracer(cst, body_record_order=True)
+    order = meta.get("body_record_order")
+    if order is None:
+        return False, "body_record_order=True produced no view"
+    n = len(order)
+    if n < 2:
+        return False, f"record-order view has only {n} records"
+    probe_at = range(min(4, n))
+    head = [order[k] for k in probe_at]
+    next(it, None)      # start the generator so close() reaches its finally
+    it.close()          # the decode-close path, without paying for a walk
+    try:
+        again = [order[k] for k in probe_at]
+    except Exception as e:                                   # noqa: BLE001
+        return False, (f"record-order view unusable once its decode closed: "
+                       f"{type(e).__name__}: {e}")
+    if len(order) != n or again != head:
+        return False, ("record-order view changed once its decode closed: "
+                       f"{head} -> {again}")
+    return True, f"{n} records, readable after the decode closed"
+
+
 def _probe(cst: str) -> int:
     """Decode @cst, walk every entry, report peak RSS and shape as JSON.
 
@@ -98,8 +133,17 @@ def _probe(cst: str) -> int:
     n_order = len(order)
 
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+
+    # Lifetime, not residency — but it belongs to the same contract (the
+    # views are what made the decode bounded, and a view that outlives its
+    # decode is the price).  Measured after `peak` is taken so it cannot
+    # move the number this check is really about.
+    order_ok, order_detail = _order_view_survives(cst)
+
     json.dump({"peak_rss": peak, "walked": n, "seq_sum": seq_sum,
-               "order": n_order, "templates": len(templates), **facts},
+               "order": n_order, "templates": len(templates),
+               "order_survives": order_ok, "order_detail": order_detail,
+               **facts},
               sys.stdout)
     sys.stdout.write("\n")
     return 0
@@ -154,6 +198,10 @@ def check_decode_bound(cst: Path, *, timeout: int = 1800) -> tuple[bool, str]:
     if not lazy.get("lazy"):
         return False, (f"decode_champsim_tracer returned a plain list of "
                        f"{n_entries} entries -- the eager shape is back")
+    if not lazy.get("order_survives"):
+        return False, ("the streaming decoder's record-order view did not "
+                       "survive its own decode closing: "
+                       f"{lazy.get('order_detail', 'no detail')}")
     if peak > limit:
         return False, (f"lazy decode peaked at {peak / MiB:.0f} MiB, over its "
                        f"{limit / MiB:.0f} MiB budget for {n_entries} entries "
@@ -178,7 +226,9 @@ def check_decode_bound(cst: Path, *, timeout: int = 1800) -> tuple[bool, str]:
                   f"lazy peak {peak / MiB:.0f} MiB <= {limit / MiB:.0f} MiB "
                   f"budget; forced-eager peak {e_peak / MiB:.0f} MiB exceeds "
                   f"it ({e_peak / max(peak, 1):.1f}x the lazy peak), so the "
-                  f"bound is measured and the tripwire is proven live")
+                  f"bound is measured and the tripwire is proven live; "
+                  f"record-order view lifetime OK "
+                  f"({lazy.get('order_detail', '')})")
 
 
 # --- CLI ------------------------------------------------------------------

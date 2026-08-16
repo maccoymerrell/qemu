@@ -196,7 +196,6 @@ static void cpu_mips_timer_expire(CPUMIPSState *env)
      */
     if (env_cpu(env)->plugin_spec_mode ||
         env_cpu(env)->plugin_spec_vtime_paused) {
-        env_cpu(env)->plugin_spec_timer_dirty = true;
         env->plugin_spec_timer_expired = true;
         return;
     }
@@ -217,7 +216,8 @@ static void cpu_mips_timer_expire(CPUMIPSState *env)
 #ifdef CONFIG_PLUGIN
 /*
  * Reconcile the host R4K timer with the architected CP0_Count/Compare after a
- * wrong-path excursion (no-op unless the excursion dirtied the timer).  Called
+ * wrong-path excursion.  Runs on every excursion exit, including ones that
+ * disturbed nothing, and is idempotent on an already consistent timer.  Called
  * from cpu_plugin_spec_vtime_resume — the true excursion-exit boundary, with
  * spec mode ended and the BQL held (a re-delivered expiry raises the timer IRQ
  * line through cpu_mips_irq_request, which expects the BQL).
@@ -238,7 +238,6 @@ void mips_cpu_plugin_resync_timers(CPUState *cs)
     cs->plugin_spec_irq_dirty = false;
     cpu_mips_plugin_reconcile_irq(env);
 
-    cs->plugin_spec_timer_dirty = false;
     expired = env->plugin_spec_timer_expired;
     env->plugin_spec_timer_expired = false;
 

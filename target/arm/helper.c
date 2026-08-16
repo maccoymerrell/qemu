@@ -3225,8 +3225,8 @@ void arm_gt_hvtimer_cb(void *opaque)
  * re-arms or re-fires the host timer, so it is exactly the reconciliation the
  * contract asks for, for every source at once.
  *
- * Run over every present timer UNCONDITIONALLY.  This used to be gated on
- * plugin_spec_timer_dirty, i.e. on having observed one of the two mechanisms
+ * Run over every present timer UNCONDITIONALLY.  This used to be gated on a
+ * flag the spec gates set, i.e. on having observed one of the two mechanisms
  * above; anything that desynced a timer without tripping that flag — a
  * rolled-back CNTVOFF, an expiry racing excursion entry before the gates are
  * visible to the iothread, a timer reprogrammed from a path with no spec gate

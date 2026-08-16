@@ -1660,11 +1660,10 @@ static RISCVException read_time(CPURISCVState *env, int csrno,
             if ((++n & 0x3fff) == 0) {
                 int64_t dl = env->stimer ? env->stimer->expire_time : -1;
                 fprintf(stderr, "[time] t=0x%llx stimecmp=0x%llx STIP=%d "
-                        "stimer_deadline=%lld dirty=%d\n",
+                        "stimer_deadline=%lld\n",
                         (unsigned long long)*val,
                         (unsigned long long)env->stimecmp,
-                        !!(env->mip & MIP_STIP), (long long)dl,
-                        cs->plugin_spec_timer_dirty);
+                        !!(env->mip & MIP_STIP), (long long)dl);
             }
         }
     }

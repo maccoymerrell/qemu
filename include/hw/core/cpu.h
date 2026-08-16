@@ -931,29 +931,11 @@ struct CPUState {
      */
     QemuPluginCpuEventQueue plugin_evq;
     /*
-     * Register-coupled host-QEMUTimer desync guard for wrong-path rollback.
-     * Some targets back an architected timer (e.g. ARM generic timer) with a
-     * host QEMUTimer that lives OUTSIDE the CPUArchState register snapshot the
-     * wrong-path walk rolls back.  Two things can desync that host timer from
-     * the restored registers: (1) gt_recalc_timer is spec-gated, so a guest
-     * speculative timer-register write does not reprogram it; (2) worse, the
-     * host timer can FIRE in the iothread while the vcpu thread is mid-walk —
-     * its callback hits the spec gate and returns without re-arming, leaving
-     * the one-shot timer dead.  Either way, after the walk unwinds the
-     * registers say "armed/expired" but the host timer never fires again, and
-     * the guest's timer subsystem livelocks (the aarch64 system-mode storm).
-     * The target's spec-gated timer path sets this flag; on wrong-path exit
-     * the per-target state restore re-syncs the host timer to the restored
-     * registers (idempotent) and clears it.
-     */
-    bool plugin_spec_timer_dirty;
-    /*
-     * Interrupt-line twin of the timer flag: a wrong-path window (or the
-     * fault-skip gap inside one, when spec_mode is briefly false but the
-     * register snapshot is still live) suppressed or raced an update of
-     * the target's env-derived CPU_INTERRUPT_HARD line.  The excursion-
-     * exit resync recomputes the line from restored state — the register
-     * restore is a raw memcpy and never drives it — so a line raised
+     * A wrong-path window (or the fault-skip gap inside one, when spec_mode
+     * is briefly false but the register snapshot is still live) suppressed or
+     * raced an update of the target's env-derived CPU_INTERRUPT_HARD line.
+     * The excursion-exit resync recomputes the line from restored state — the
+     * register restore is a raw memcpy and never drives it — so a line raised
      * from a rolled-back pending bit cannot outlive the excursion.
      */
     bool plugin_spec_irq_dirty;

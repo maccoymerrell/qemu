@@ -30,18 +30,19 @@ static void riscv_vstimer_cb(void *opaque)
 #ifdef CONFIG_PLUGIN
     /*
      * Wrong-path: the host timer fired during a speculative excursion.  Don't
-     * touch the (rolled-back) interrupt state on the discarded path; just flag
-     * the host timer for re-sync on excursion exit so it isn't left dead (this
-     * one-shot has now fired and the cb does not itself re-arm).
+     * touch the (rolled-back) interrupt state on the discarded path; return
+     * without delivering.  The one-shot has now fired and the cb does not
+     * itself re-arm, so the deferred firing is owed to the guest; it is paid
+     * by riscv_cpu_plugin_resync_timers, which re-derives the deadline and
+     * re-raises on every excursion exit whether or not this gate was taken.
      *
      * Gate on plugin_spec_vtime_paused (true for the WHOLE excursion), not just
      * plugin_spec_mode: a wrong-path fault-skip briefly clears spec_mode
      * (spec_mode_end -> restore -> spec_mode_begin) while the snapshot is still
      * live and vtime still paused.  A real IRQ set in that gap is rolled back by
-     * the final wp_end restore but never re-synced (dirty unset), losing it (#77).
+     * the final wp_end restore, so it must not be raised here at all (#77).
      */
     if (CPU(cpu)->plugin_spec_mode || CPU(cpu)->plugin_spec_vtime_paused) {
-        CPU(cpu)->plugin_spec_timer_dirty = true;
         return;
     }
 #endif
@@ -65,7 +66,6 @@ static void riscv_stimer_cb(void *opaque)
      * spec_mode while the excursion is still live, and a STIP set there is lost.
      */
     if (CPU(cpu)->plugin_spec_mode || CPU(cpu)->plugin_spec_vtime_paused) {
-        CPU(cpu)->plugin_spec_timer_dirty = true;
         return;
     }
 #endif
@@ -88,7 +88,6 @@ void riscv_timer_write_timecmp(CPURISCVState *env, QEMUTimer *timer,
      * path.
      */
     if (env_cpu(env)->plugin_spec_mode) {
-        env_cpu(env)->plugin_spec_timer_dirty = true;
         return;
     }
 #endif
@@ -265,9 +264,11 @@ static void riscv_plugin_reconcile_timers(CPURISCVState *env)
 /*
  * Wrong-path excursion-exit reconcile (#77).  A WP excursion can perturb the
  * host timers — a stimer cb fires and is deferred, or stimecmp is rolled back
- * by the register-state restore.  The cb sets plugin_spec_timer_dirty when it
- * suppresses a firing; re-arm / re-raise once per excursion when dirty so the
- * deferred firing is not lost.  Runs at the true excursion-exit boundary
+ * by the register-state restore.  Re-arm and re-raise once per excursion,
+ * unconditionally, so a firing the cb suppressed is not lost -- correctness
+ * does not depend on the cb having recorded that it suppressed one, nor on
+ * every way a timer can drift having been enumerated.  Runs at the true
+ * excursion-exit boundary
  * (cpu_plugin_spec_vtime_resume), after ticks are re-enabled and spec mode has
  * ended, not at an intermediate fault-skip restore.
  */
@@ -290,7 +291,6 @@ void riscv_cpu_plugin_resync_timers(CPUState *cs)
      * desync produced by the rollback alone. */
     cs->plugin_spec_irq_dirty = false;
     riscv_cpu_update_mip(env, 0, 0);
-    cs->plugin_spec_timer_dirty = false;
     if (getenv("CST_TIMER_DIAG")) {
         fprintf(stderr, "[stimer] RESYNC stimecmp=0x%llx vstimecmp=0x%llx "
                 "rdtime=%d%s\n",

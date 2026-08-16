@@ -716,13 +716,14 @@ for a guest that stops progressing on a build that has them.
 
    Reconciling unconditionally rather than on an event flag is
    deliberate.  The predecessor of this hook was three per-ISA point
-   patches behind a ``plugin_spec_timer_dirty`` gate that only fired
-   when a desync had been *observed*; every clock source no patch
-   covered, and every desync the register rollback produced on its
-   own, drifted silently.  ``CPUState::plugin_spec_timer_dirty`` and
-   ``plugin_spec_irq_dirty`` survive only as the record of *which*
-   deferred expiry has to be re-delivered, not as the gate on whether
-   to reconcile.
+   patches behind a dirty-flag gate that only fired when a desync had
+   been *observed*; every clock source no patch covered, and every
+   desync the register rollback produced on its own, drifted silently.
+   No flag now records that a reconcile is owed, because none is
+   consulted.  What a spec gate does still record is the one thing a
+   reconcile cannot recover from architectural state — that a host
+   timer *expiry* was suppressed and is owed a delivery, which on MIPS
+   is ``CPUMIPSState::plugin_spec_timer_expired``.
 
    On x86 the first obligation is discharged by construction rather
    than at every thaw.  The guest TSC is the only architectural

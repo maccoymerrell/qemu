@@ -1118,10 +1118,12 @@ void cpu_plugin_arch_state_restore(void *saved, size_t size)
      * gap) during the excursion's host wall-clock window — the architected
      * registers revert but the host QEMUTimer does not, leaving it parked
      * (e.g. at INT64_MAX) and never firing again.  The guest's timer subsystem
-     * then livelocks: the aarch64 system-mode storm.  Detect any such rollback
-     * here and flag a resync (below) to re-arm the host timer to match the
-     * restored registers.  This is NOT covered by the spec-gate dirty flag,
-     * because the desyncing gt_recalc_timer ran with spec mode closed.
+     * then livelocks: the aarch64 system-mode storm.  Nothing is detected
+     * here: arm_cpu_plugin_resync_timers re-runs gt_recalc_timer over every
+     * present timer at excursion exit, unconditionally, so this restore only
+     * has to avoid damaging the registers that reconcile reads from.  That
+     * also covers the desync a detection here could never have caught: a
+     * gt_recalc_timer that ran with spec mode closed, in the fault-skip gap.
      */
     /*
      * env->irq_line_state is the level of the six inbound interrupt lines,
@@ -1257,9 +1259,8 @@ void cpu_plugin_arch_state_restore(void *saved, size_t size)
      * Timer resync is deferred to cpu_plugin_spec_vtime_resume (the true
      * excursion-exit boundary).  Running it here would fire at an intermediate
      * wrong-path fault-skip restore (spec_mode_end -> restore -> spec_mode_begin),
-     * consuming plugin_spec_timer_dirty and synthesising STIP that the FINAL
-     * wp_end restore then clobbers with the stale snapshot -- losing the timer
-     * IRQ and livelocking the guest (#77).
+     * synthesising STIP that the FINAL wp_end restore then clobbers with the
+     * stale snapshot -- losing the timer IRQ and livelocking the guest (#77).
      */
 #else
     memcpy(env, saved, size);
@@ -1268,15 +1269,15 @@ void cpu_plugin_arch_state_restore(void *saved, size_t size)
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
     /*
      * The R4K host timer (env->timer) lives outside this register snapshot.
-     * If the restore rolls back CP0_Count/Compare, re-arm it so a rolled-back
-     * compare can't leave it stale (the ARM storm class).
+     * A restore that rolls CP0_Count/Compare back is reconciled by
+     * mips_cpu_plugin_resync_timers, which re-arms from the restored compare
+     * on every excursion exit whether or not anything here noticed the
+     * rollback.  What no reconcile can reconstruct from architectural state is
+     * a firing that was suppressed, so the one thing recorded here is a
+     * deferred EXPIRY.
      */
     {
         const CPUMIPSState *s = (const CPUMIPSState *)saved;
-        if (env->CP0_Count != s->CP0_Count ||
-            env->CP0_Compare != s->CP0_Compare) {
-            current_cpu->plugin_spec_timer_dirty = true;
-        }
         /*
          * Cause.TI materialised in the LIVE env after the snapshot was
          * taken: the R4K timer expired in the race window at excursion
@@ -1291,7 +1292,6 @@ void cpu_plugin_arch_state_restore(void *saved, size_t size)
          */
         if ((env->insn_flags & ISA_MIPS_R2) &&
             ((env->CP0_Cause & ~s->CP0_Cause) & (1 << CP0Ca_TI))) {
-            current_cpu->plugin_spec_timer_dirty = true;
             env->plugin_spec_timer_expired = true;
         }
     }
@@ -1550,10 +1550,10 @@ static bool sdiff_enabled(void)
  *    that is the sandbox's whole purpose -- so the surviving allocation
  *    carries no wrong-path value into the correct path.
  *
- *  - EXCURSION BOOKKEEPING (plugin_spec_vtime_paused, plugin_spec_timer_dirty,
- *    plugin_spec_tlb_log and its siblings).  plugin_spec_vtime_paused is this
- *    detector's own bracket: set before the snapshot, cleared before the
- *    compare, so it differs on every excursion ever measured.
+ *  - EXCURSION BOOKKEEPING (plugin_spec_vtime_paused, plugin_spec_tlb_log and
+ *    its siblings).  plugin_spec_vtime_paused is this detector's own bracket:
+ *    set before the snapshot, cleared before the compare, so it differs on
+ *    every excursion ever measured.
  *
  * The rest of the plugin block is DELIBERATELY left unnamed -- the fault stack
  * and its depth, the event queue, plugin_spec_saved_state, the identity memo.
@@ -1596,9 +1596,6 @@ static const char *sdiff_cpu_field(size_t off)
     }
     if (off == offsetof(CPUState, plugin_spec_vtime_paused)) {
         return "plugin_spec_vtime_paused (this detector's own bracket)";
-    }
-    if (off == offsetof(CPUState, plugin_spec_timer_dirty)) {
-        return "plugin_spec_timer_dirty (consumed by the excursion-exit resync)";
     }
     /*
      * The TLB log AND NOTHING PAST IT.  This range used to run to
@@ -2497,10 +2494,9 @@ void cpu_plugin_spec_vtime_resume(CPUState *cpu)
      * The leak diff belongs after the LAST step of the restore, for the same
      * reason: a comparison taken before the restore finishes reports the work
      * the restore has not done yet as work it will never do.  Its predecessor
-     * sat before cpu_plugin_clock_resync(), which is what consumes and clears
-     * plugin_spec_timer_dirty -- so the flag was named as an un-restored byte
-     * on every excursion that set one, by the statement that was about to
-     * clear it.
+     * sat before cpu_plugin_clock_resync(), so every byte that call restores
+     * was reported as an un-restored leak by the statement that was about to
+     * restore it.
      */
     sdiff_compare(cpu);            /* #77: un-restored CPU-state leak */
 #endif

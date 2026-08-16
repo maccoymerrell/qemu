@@ -146,10 +146,12 @@ static void riscv_aclint_mtimer_cb(void *opaque)
      * re-arm itself.  The raise would be swallowed and the machine timer
      * parked forever: with the hart's clockevent driven through SBI
      * (no Sstc), the guest tick never fires again (the ARM gt-timer /
-     * riscv stimer storm class, #77).  Defer: flag the excursion dirty and
+     * riscv stimer storm class, #77).  Defer: return without raising, and
      * let riscv_cpu_plugin_resync_timers re-derive the MTIP level and host
      * deadline from the architected timecmp at the true excursion-exit
-     * boundary.  Gate on plugin_spec_vtime_paused (the WHOLE excursion),
+     * boundary.  It does that on every exit, unconditionally, so nothing has
+     * to be recorded here for the deferral to be repaired.  Gate on
+     * plugin_spec_vtime_paused (the WHOLE excursion),
      * not just spec_mode: a wrong-path fault-skip briefly clears spec_mode
      * while the snapshot is still live.  A fire racing excursion ENTRY
      * (snapshot already taken, flags not yet visible to this thread) slips
@@ -157,7 +159,6 @@ static void riscv_aclint_mtimer_cb(void *opaque)
      * cpu_plugin_arch_state_restore.
      */
     if (cs && (cs->plugin_spec_mode || cs->plugin_spec_vtime_paused)) {
-        cs->plugin_spec_timer_dirty = true;
         return;
     }
 #endif
@@ -173,7 +174,8 @@ static void riscv_aclint_mtimer_cb(void *opaque)
  * one-shot host timer has already fired and will not re-arm itself) — or one
  * whose mip.MTIP raise the excursion's register restore erased — takes the
  * "timecmp <= rtc" branch and raises MTIP now; a still-future deadline
- * re-arms the QEMUTimer.  Idempotent, so a spurious dirty flag is safe.
+ * re-arms the QEMUTimer.  Idempotent, so running it on an excursion that
+ * disturbed nothing is safe.
  * Called from riscv_cpu_plugin_resync_timers with spec mode ended (driving
  * the IRQ line is safe) and the BQL held.
  */

@@ -769,10 +769,14 @@ for a guest that stops progressing on a build that has them.
    been *observed*; every clock source no patch covered, and every
    desync the register rollback produced on its own, drifted silently.
    No flag now records that a reconcile is owed, because none is
-   consulted.  What a spec gate does still record is the one thing a
-   reconcile cannot recover from architectural state — that a host
-   timer *expiry* was suppressed and is owed a delivery, which on MIPS
-   is ``CPUMIPSState::plugin_spec_timer_expired``.
+   consulted, and none records that a *delivery* is owed either.  A
+   spec gate only declines: it returns without writing guest-visible
+   state on the discarded path, and records nothing, because the
+   firing it declines was never taken off the timer list.  The
+   processing stall above is what makes that true — a
+   ``QEMU_CLOCK_VIRTUAL`` timer is not popped inside an excursion, so
+   its deadline is still armed at the thaw and the first timer pass
+   afterwards delivers it.
 
    On x86 the first obligation is discharged by construction rather
    than at every thaw.  The guest TSC is the only architectural

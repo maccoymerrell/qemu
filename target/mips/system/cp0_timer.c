@@ -182,21 +182,25 @@ static void cpu_mips_timer_expire(CPUMIPSState *env)
      * Wrong-path (speculative): don't set CP0_Cause[TI], drive the timer IRQ
      * line, or reprogram the host timer on the discarded path.  CP0_Cause is in
      * the register snapshot and is rolled back, but the IRQ line and the host
-     * QEMUTimer are external state that is not.  This callback may be the host
-     * timer firing mid-excursion; flag it so the expiry is re-delivered on exit
-     * (mips_cpu_plugin_resync_timers) instead of being lost — the raise must
-     * not be dropped, and re-arming alone would park the timer a full Count
-     * wrap out (wait = Compare - Count computes ~0 -> clamps to UINT32_MAX).
+     * QEMUTimer are external state that is not.
+     *
+     * Nothing is recorded for a later replay.  Inside an excursion this is not
+     * the timer list's callback path: a QEMU_CLOCK_VIRTUAL timer is never
+     * popped while the excursion holds that clock's processing stall.  What can
+     * still reach it is cpu_mips_get_count, noticing an already-elapsed deadline
+     * while a wrong-path mfc0 reads Count -- and that path does not pop the
+     * timer either, so whatever the gate declines is still on the active list,
+     * still armed, and delivered by the first timer pass after the thaw.
+     * Nothing is owed, so nothing needs recording for a replay to pay back.
      *
      * Gate on plugin_spec_vtime_paused (true for the WHOLE excursion), not
      * just plugin_spec_mode: a wrong-path fault-skip briefly clears spec_mode
      * (spec_mode_end -> restore -> spec_mode_begin) while the snapshot is
      * still live, and a Cause.TI/IP set in that gap is erased by the final
-     * walk-end restore (mirror of the riscv stimer/aclint-mtimer gates, #77).
+     * walk-end restore.
      */
     if (env_cpu(env)->plugin_spec_mode ||
         env_cpu(env)->plugin_spec_vtime_paused) {
-        env->plugin_spec_timer_expired = true;
         return;
     }
 #endif
@@ -225,7 +229,6 @@ static void cpu_mips_timer_expire(CPUMIPSState *env)
 void mips_cpu_plugin_resync_timers(CPUState *cs)
 {
     CPUMIPSState *env = cpu_env(cs);
-    bool expired;
 
     /* Reconcile the interrupt line from restored CP0_Cause first: an
      * excursion (or its fault-skip gap) can suppress a line update while
@@ -238,27 +241,12 @@ void mips_cpu_plugin_resync_timers(CPUState *cs)
     cs->plugin_spec_irq_dirty = false;
     cpu_mips_plugin_reconcile_irq(env);
 
-    expired = env->plugin_spec_timer_expired;
-    env->plugin_spec_timer_expired = false;
-
+    /* Re-arm the host deadline from the restored CP0_Count/Compare.  There is
+     * no expiry to replay: an expiry the gate declined to deliver is one the
+     * timer list never popped, so it is still armed and still owed to the
+     * guest by the timer list itself. */
     if (env->timer && !(env->CP0_Cause & (1 << CP0Ca_DC))) {
-        if (expired) {
-            /*
-             * The host timer genuinely expired mid-excursion and its delivery
-             * was deferred by the gate in cpu_mips_timer_expire.  Re-deliver
-             * it on the correct path — set Cause.TI, raise the timer IRQ
-             * line, and re-arm — the same sequence a normal expiry runs.
-             * cpu_mips_timer_update alone would lose the raise and, with
-             * Count sitting at Compare, re-arm a full Count wrap (~2^32
-             * ticks) in the future: a lost guest tick and a stalled
-             * clockevent until the wraparound.
-             */
-            cpu_mips_timer_expire(env);
-        } else {
-            /* Only Count/Compare were rolled back (a speculative CP0 write
-             * erased); re-arm the host deadline from the restored values. */
-            cpu_mips_timer_update(env);
-        }
+        cpu_mips_timer_update(env);
     }
 }
 #endif

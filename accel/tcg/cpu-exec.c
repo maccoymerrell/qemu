@@ -1272,29 +1272,14 @@ void cpu_plugin_arch_state_restore(void *saved, size_t size)
      * A restore that rolls CP0_Count/Compare back is reconciled by
      * mips_cpu_plugin_resync_timers, which re-arms from the restored compare
      * on every excursion exit whether or not anything here noticed the
-     * rollback.  What no reconcile can reconstruct from architectural state is
-     * a firing that was suppressed, so the one thing recorded here is a
-     * deferred EXPIRY.
+     * rollback.  Nothing is recorded before the memcpy, because the live env
+     * cannot gain a Cause.TI the snapshot lacks.  The excursion window opens
+     * BEFORE the snapshot is taken and under the BQL, so every caller of
+     * cpu_mips_timer_expire sees the flags: mips_timer_cb runs from the main
+     * loop holding that same BQL, and the other two run on this vCPU thread.
+     * The gate therefore always returns, and a speculative MTC0 can only
+     * CLEAR Cause.TI, never set it.
      */
-    {
-        const CPUMIPSState *s = (const CPUMIPSState *)saved;
-        /*
-         * Cause.TI materialised in the LIVE env after the snapshot was
-         * taken: the R4K timer expired in the race window at excursion
-         * ENTRY (snapshot taken, spec/vtime flags not yet visible to the
-         * iothread), so the gate in cpu_mips_timer_expire could not defer
-         * it.  The memcpy below erases the pending TI/IP while the host
-         * QEMUTimer has already been re-armed a full Count wrap out — the
-         * tick would be lost.  Mark it as a deferred expiry so
-         * mips_cpu_plugin_resync_timers re-delivers it at excursion exit
-         * (mirror of the riscv mip-rollback detection).  Pre-R2 CPUs have
-         * no Cause.TI to key on; only the in-excursion cb gate covers them.
-         */
-        if ((env->insn_flags & ISA_MIPS_R2) &&
-            ((env->CP0_Cause & ~s->CP0_Cause) & (1 << CP0Ca_TI))) {
-            env->plugin_spec_timer_expired = true;
-        }
-    }
     memcpy(env, saved, size);
     /* Timer resync deferred to cpu_plugin_spec_vtime_resume -- see #77. */
 #else

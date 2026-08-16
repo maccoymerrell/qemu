@@ -936,7 +936,23 @@ def _chk_idle_riscv64(ctx: Ctx) -> Outcome:
     lands INSIDE the probe rather than after it, because a traced run does not
     outlive its trace and guest time barely advances once the workload starts
     computing; see _INIT_IDLE.  idle_console_verdict carries the threshold and
-    the reason for it."""
+    the reason for it.
+
+    ITS STALL METRIC IS ELEVATED BY CONSTRUCTION, and anything that reads that
+    metric has to know it.  ``worst_user_stall`` measures the longest stretch
+    the guest went without retiring a user instruction, and a ten-second sleep
+    inside the window IS such a stretch -- deliberately, since that is how the
+    run queue is emptied.  Measured over four seeds against the same cell
+    without the probe, interleaved in one wave: ``stall_fraction`` 0.17-0.19
+    against 0.004-0.009, and ``worst_user_stall`` ~1.1M architectural
+    instructions against ~25k.  No cell fires the stall check (its threshold
+    is 0.500, so there is 2.6x of headroom) and none went NOT CERTIFIED, but
+    two consequences follow:
+
+      * a red here is the probe until proven otherwise, not #106;
+      * this cell must NEVER be pooled into a stall-condition rate wave.  Its
+        elevation is a property of its own configuration, so including it
+        would be measuring the sleep probe."""
     sleep_s = 10
     d = ctx.dir("system_idle_riscv64")
     rc, tail = _run_cli(

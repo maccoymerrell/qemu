@@ -615,6 +615,20 @@ add coverage no other sub-command exposes:
    regression this guards against does not shave that figure, it
    collapses it to zero, because the run queue either empties or it
    does not.
+
+   This cell's stall metric is elevated by construction, and anything
+   reading that metric has to know it.  ``worst_user_stall`` measures
+   the longest stretch the guest went without retiring a user
+   instruction, and the sleep probe is exactly such a stretch — that
+   is how the run queue is emptied.  Measured over four seeds against
+   the same cell without the probe, interleaved in one wave:
+   ``stall_fraction`` 0.17–0.19 against 0.004–0.009, and
+   ``worst_user_stall`` around 1.1 M architectural instructions
+   against about 25 k.  Nothing fires the stall check — its threshold
+   is 0.500 — and nothing came back NOT CERTIFIED, but a red here is
+   the probe until proven otherwise, and the cell must never be pooled
+   into a stall-condition rate wave, where it would only measure its
+   own sleep.
 ``system.attach_mipsel``
    ``all --system --attach`` on mipsel — the ptrace-injected marker
    (:program:`cst_attach`'s ``PTRACE_PEEKUSER``/``POKEUSER`` backend)

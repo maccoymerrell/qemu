@@ -782,21 +782,110 @@ outside the repo as standalone scripts):
    The decode stage's memory footprint is bounded by the trace's
    *shape*, not by how much of it executed.  ``decode_champsim_tracer``
    hands back a lazy disk-backed sequence of body entries: reads like
-   ``list[dict]``, holds a line index, an entry index and a small LRU,
-   and parses each entry from the spilled decode on access (a
-   write-through spill of the parsed form keeps the validator's many
-   passes over the body cheap).  A whole trace becomes a real list only
-   through the explicit ``materialize()`` escape, which refuses above
-   ``CST_DECODE_MATERIALIZE_MAX`` entries.
+   ``list[dict]``, holds a line index, an entry index and a cache of
+   parsed entries, and parses each entry from the spilled decode on
+   access (a write-through spill of the parsed form keeps the
+   validator's many passes over the body cheap).  A whole trace becomes
+   a real list only through the explicit ``materialize()`` escape, which
+   refuses above ``CST_DECODE_MATERIALIZE_MAX`` entries.
+
+   The cache is bounded in **bytes**, not in entries, and the budget is
+   a process-wide pool rather than a per-decode allowance — two live
+   decodes share one ceiling instead of each claiming it.
+   ``CST_DECODE_CACHE_MB`` sets it, default 11264 (11 GiB).  Entries are not
+   interchangeable units of memory (one is ~18 KB on a system cell and
+   ~49 KB on a user cell), so a count bounds bytes only by accident;
+   each admission is charged a measured estimate of what it costs
+   resident — a recursive size sampled one admission in 256, scaled to
+   the rest by their exact pickled length — and refunded verbatim when
+   it is evicted.
+
+   Replacement is **random**, not least-recently-used, and that is a
+   correctness property of the budget rather than a tuning preference.
+   ``validate()`` reads the body as ~22 full forward passes, which is
+   the access pattern LRU is worst at: on a cyclic scan of a body larger
+   than the cache, the least-recently-used entry is always the one the
+   next pass is about to want.  Measured on an x86_64 user cell with an
+   LRU holding 46% of the body, the hit rate was **0.0%** — a cache
+   holding half the trace and returning none of it.  Random replacement
+   evicts nothing systematically, so the hit rate follows the resident
+   fraction (``h = exp(-(1-h)/r)``; ~75% at 90% residency) and a body
+   that overflows the budget degrades in proportion instead of falling
+   off a cliff.  ``cache_hit_rate`` in the residency facts reports it,
+   so a policy that stops paying is visible rather than inferred.
+
+   The default is sized to the machine, not to the smallest number that
+   still bounds.  A body that fits inside it is cached whole and the
+   validator's ~22 passes run at the speed of the eager list they
+   replaced; a larger one degrades gracefully.  The last few percent of a
+   body are worth far more than they weigh, because a miss is a re-parse
+   and a hit is free — on the 3 M-instruction riscv64 system cell, whose
+   parsed body charges 10.44 GiB:
+
+   .. list-table::
+      :header-rows: 1
+
+      * - budget
+        - resident
+        - hit rate
+        - per-pass
+        - peak RSS
+      * - 10 GiB
+        - 95.8%
+        - 91.4%
+        - 5.3 s
+        - 10.43 GiB
+      * - 12 GiB
+        - 100%
+        - 100%
+        - 0.5 s
+        - 10.51 GiB
+
+   Ten times the per-pass cost for 0.08 GiB of resident memory, which is
+   why the default is 11 GiB rather than 10: it is the largest setting
+   whose *worst* case — a body too big to fit, so the cache simply fills
+   — stays inside both the standing 16 GiB ``ulimit -v`` per cell and the
+   machine's ~150 GiB across twelve concurrent lanes.
+
+   Below that threshold the curve is **not monotonic**, which is worth
+   knowing before tuning the budget down.  On the same cell, 64 MiB and
+   512 MiB both return a 0.0% hit rate — neither holds enough of a
+   632,121-entry body for a full pass to find anything — but 512 MiB
+   costs twice as much per pass (102 s against 54 s) and 38:16 against
+   22:22 end to end.  The extra is not decode work, since the misses are
+   identical; it is CPython's cyclic collector, whose cost scales with
+   the number of live container objects, and a half-gigabyte of cached
+   entries is several million of them that never produce a hit.  Measured
+   directly: the same 512 MiB pass costs 39 s with ``gc.disable()``, so
+   2.6x of it was collection.  A budget that cannot hold the body is
+   therefore better off small; the collector is left alone rather than
+   worked around, because freezing a memory-bounded component's objects
+   out of collection trades a bound for a leak.
 
    The check captures a cell of a few hundred thousand entries, decodes
-   it in a child process and walks it end to end, and requires the
-   child's peak RSS to sit under a budget derived from what that design
-   costs — the line index at 8 bytes per line, the entry indices, the
-   LRU's ceiling.  It then decodes the same trace a second time with the
-   eager materialisation forced back on, and requires *that* run to
-   exceed the budget: a residency gate that cannot be made to go red
-   proves nothing, so failing to fire fails the check.
+   it in a child process and walks it end to end **twice** — one pass
+   over a cold cache never re-reads anything, and it is the second pass
+   onwards that a cache exists for.  It runs two arms, each naming its
+   own budget explicitly: at the shipped 11 GiB default this substrate
+   would fit entirely, and a gate that measures a cache nothing ever
+   evicted from is measuring nothing.
+
+   *Bounded* (64 MiB) requires the child's peak RSS under a budget
+   derived from what the design costs — the line index at 8 bytes per
+   line, the entry indices, the cache's own budget — and then decodes
+   the same trace with the eager materialisation forced back on and
+   requires *that* run to exceed it.  *Budget honoured* (256 MiB, on a
+   body larger than that) requires the cache to actually fill and evict,
+   never to charge itself over its own ceiling, and — the assertion with
+   teeth — peak RSS to land under the bound the budget implies, which is
+   what makes the accounting answerable to the machine rather than to
+   itself.  Both arms carry their own red-lever and fail if it does not
+   fire: ``CST_DECODE_FORCE_EAGER_UNBOUNDED`` for the first,
+   ``CST_DECODE_CACHE_MISACCOUNT`` — which divides every charge, so the
+   cache holds a multiple of its books — for the second.  A residency
+   gate that cannot be made to go red proves nothing, so failing to fire
+   fails the check, as does a substrate too small to tell the shapes
+   apart.
 
    The same check covers the lazy views' **lifetime**, which is what
    laziness costs.  A view is only readable while the decode behind it

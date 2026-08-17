@@ -35,12 +35,15 @@ import bisect
 import dataclasses
 import os
 import pickle
+import random
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import types
+import weakref
 from array import array
-from collections import OrderedDict
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Iterator
@@ -922,11 +925,65 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-# How many parsed entries the sequence keeps hot.  The checks read with
-# strong locality (a walk plus the odd `entries[idx + 1]` look-ahead), so a
-# small window absorbs nearly all re-reads; anything larger just buys back
-# the unbounded residency this class exists to remove.
-_ENTRY_CACHE_DEFAULT = 4096
+# How much memory the parsed entries may occupy, in MiB.  A BUDGET, not a
+# count: the thing that has to stay under control is bytes, and entries are
+# not interchangeable units of it (measured across four ISAs, one entry is
+# 18 KB on a system cell and 49 KB on a user cell).
+#
+# WHY THE DEFAULT IS 10 GiB.  The first bound counted entries -- 4096 of
+# them, about 74 MB -- which is two orders of magnitude below what a lane is
+# allowed to hold, and the gap was paid for in time: every one of
+# `validate()`'s ~22 passes over a 632,121-entry body missed the cache almost
+# entirely and unpickled the whole body back off the spill, turning 3:46 into
+# ~20 minutes.  The ruling:
+#
+#     "It is okay to use ~150 GiB of RAM, but your rebalance is killing
+#      performance to keep runs below 20.  Too aggressive."
+#
+# so the working set is sized to the machine rather than to the smallest
+# number that still technically bounds.  A cell whose parsed body fits in the
+# budget now runs at eager speed; only a genuinely oversized one degrades to
+# parse-on-access.  The arithmetic is in `_CachePool`.
+#
+# WHY 11 GiB AND NOT 10.  10240 was tried first and lands just under the
+# cliff on the very cell this exists for.  The 3 M riscv64 system cell's
+# parsed body charges 10.44 GiB, so a 10 GiB budget holds 95.8% of it and
+# evicts 180,274 times; the 4.2% that does not fit costs a re-parse on every
+# pass.  Measured, same cell, same code, four passes each:
+#
+#     budget 10 GiB   95.8% resident   hit rate 91.4%   pass 5.3 s   RSS 10.43 GiB
+#     budget 12 GiB    100% resident   hit rate  100%   pass 0.5 s   RSS 10.51 GiB
+#
+# Ten times the per-pass cost for 0.08 GiB of resident memory -- the last few
+# percent of a body is worth far more than it weighs, because a miss is a
+# re-parse and a hit is free.  11 GiB is the largest default that keeps the
+# worst case inside both limits: a body too big for it fills the cache and
+# peaks near 12.3 GiB against the standing 16 GiB `ulimit -v` (3.7 GiB of
+# margin), and twelve lanes at that is ~148 GiB, inside the ~150 GiB the
+# machine is allowed to give up.  12288 would hold more bodies whole but puts
+# twelve lanes at ~159 GiB, over the line.
+_CACHE_MB_DEFAULT = 11264
+
+# One dict slot, one victim-pool slot and the (entry, charge) tuple that records
+# what was charged.  Small next to an entry, but 10 GiB of 18 KB entries is
+# ~580 k slots, so it is not nothing and it is not free to ignore.
+_SLOT_OVERHEAD_BYTES = 256
+
+# Charging every admission its true recursive size costs more than the
+# unpickle it rides on (160 us against 45 us on a system cell, 370 us against
+# a ~100 us parse on a user cell), so the size of one entry in N is measured
+# and the rest are scaled from their pickled length.  Measured across seven
+# cells and four ISAs, live-bytes-per-pickled-byte is 7.32-8.89 BETWEEN cells
+# but flat to two decimal places WITHIN one (7.32 / 7.32, 8.88 / 8.89), which
+# is exactly the shape a per-decode calibration handles and a compiled-in
+# constant does not.
+_CACHE_SAMPLE_EVERY = 256
+
+# Only ever consulted before the first sample lands, and the first admission
+# IS a sample -- so this is a defensive floor, not a working default.  Set
+# above the largest per-entry size measured anywhere (49,089 B, x86_64 user).
+_ENTRY_BYTES_SEED = 64 * 1024
+_ENTRY_RATIO_SEED = 9.0
 
 # Above this many entries, .materialize() refuses.  The mutation matrix and
 # the multi-thread provers legitimately need a real mutable list, and their
@@ -996,6 +1053,15 @@ class _ParsedSpill:
             return None
         return pickle.loads(os.pread(self._fd, ln, self._off[k]))
 
+    def size(self, k: int) -> int:
+        """Pickled length of entry @k, or 0 if it has never been written.
+
+        This is what the cache's byte budget scales from: an exact,
+        already-computed per-entry number that tracks how big each entry
+        really is, where a flat per-entry average would not.
+        """
+        return self._len[k]
+
     def put(self, k: int, entry: dict) -> None:
         blob = pickle.dumps(entry, protocol=pickle.HIGHEST_PROTOCOL)
         off = self._end
@@ -1019,16 +1085,380 @@ class _ParsedSpill:
             pass
 
 
+_SIZEOF_ATOMIC = (str, bytes, bytearray, int, float, complex, bool,
+                  type(None))
+_SIZEOF_OPAQUE = (type, types.ModuleType, types.FunctionType,
+                  types.BuiltinFunctionType, types.MethodType)
+
+
+def _deep_sizeof(obj) -> int:
+    """Recursive size of one decoded entry, in bytes.
+
+    Follows dicts, sequences AND instance ``__dict__`` / ``__slots__``: a
+    body entry's ``dyn_params`` are :class:`DynParam` dataclasses, whose
+    seven-field ``__dict__`` is several times the 48-byte instance header.
+    A sizer that stops at the header under-counts an entry by about half,
+    and for a memory budget an under-count is the direction that hurts --
+    it over-admits.
+
+    Shared objects (interned strings, small ints) are counted once per
+    entry rather than once per process, so the number is an upper bound on
+    the entry's marginal cost.  Validated against RSS: summed over 8,000
+    held entries it lands within 3% of the resident growth they cause.
+    """
+    seen: set[int] = set()
+    total = 0
+    stack = [obj]
+    gso = sys.getsizeof
+    while stack:
+        o = stack.pop()
+        i = id(o)
+        if i in seen:
+            continue
+        seen.add(i)
+        total += gso(o)
+        if isinstance(o, _SIZEOF_ATOMIC):
+            continue
+        if isinstance(o, dict):
+            stack.extend(o.keys())
+            stack.extend(o.values())
+            continue
+        if isinstance(o, (list, tuple, set, frozenset)):
+            stack.extend(o)
+            continue
+        if isinstance(o, _SIZEOF_OPAQUE):
+            # A class or a module reached from an entry would drag the
+            # interpreter in behind it.  Nothing in a decoded entry does;
+            # this makes that structural, not a hope.
+            continue
+        d = getattr(o, "__dict__", None)
+        if isinstance(d, dict):
+            stack.append(d)
+        for cls in type(o).__mro__:
+            for name in getattr(cls, "__slots__", ()) or ():
+                try:
+                    stack.append(getattr(o, name))
+                except AttributeError:
+                    pass
+    return total
+
+
+class _CachePool:
+    """The process-wide ceiling on parsed-entry cache bytes.
+
+    The budget belongs to the PROCESS, not to one decode.  Decodes do
+    coexist -- ``_diff_entries`` walks a pair side by side, the
+    cross-segment check opens one per segment -- and if each were entitled
+    to the whole budget the ceiling would be a per-decode number wearing a
+    process-wide name, which is how a 10 GiB bound quietly becomes 30.
+
+    THE ARITHMETIC, against the standing ``ulimit -v 16777216`` cell shape.
+    Measured on the largest cell here -- the 3 M riscv64 system cell,
+    632,121 entries / 31,514,301 lines, whose parsed body charges 10.44 GiB
+    and so fits inside the 11 GiB default -- running the full ``validate()``:
+
+        parsed entries, charged                     10.44 GiB
+        line index, entry / record-order / spill
+          indices, interpreter, templates,
+          encoding maps, and the checks' own
+          working sets (measured as the residue)     1.26 GiB
+        ------------------------------------------- --------
+        total, measured                             ~11.7 GiB
+
+    against a 16 GiB cap.  A body too large for the budget fills it instead
+    and peaks near 12.3 GiB, which is the worst case and still leaves
+    3.7 GiB.  Both sit within a factor of the 11.07 GiB the pre-fix eager
+    decode reached on this same cell under this same cap without hitting it,
+    so the default is bounded by a residency already demonstrated to fit
+    rather than by an estimate.  Twelve lanes at the worst case is ~148 GiB,
+    inside the ~150 GiB the machine is allowed to give up.
+
+    When the total goes over, the pool takes from the LARGEST live cache
+    rather than from whoever happened to be growing, so a second decode
+    starting against a first that has already filled up is throttled fairly
+    instead of being starved down to one entry.
+    """
+
+    __slots__ = ("budget", "_caches")
+
+    def __init__(self, budget: int):
+        self.budget = budget
+        self._caches: list[weakref.ref] = []
+
+    def register(self, cache: "_ByteCache") -> None:
+        self._caches = [r for r in self._caches if r() is not None]
+        self._caches.append(weakref.ref(cache))
+
+    def live(self) -> list["_ByteCache"]:
+        out = []
+        keep = []
+        for r in self._caches:
+            c = r()
+            if c is not None:
+                keep.append(r)
+                out.append(c)
+        self._caches = keep
+        return out
+
+    def total(self) -> int:
+        # Deliberately does not rebuild the registry: this runs on every
+        # cache admission, which on a large cell is millions of calls, and
+        # the sweep only earns its keep when something has actually died.
+        t = 0
+        dead = False
+        for r in self._caches:
+            c = r()
+            if c is None:
+                dead = True
+            else:
+                t += c.bytes
+        if dead:
+            self._caches = [r for r in self._caches if r() is not None]
+        return t
+
+    def enforce(self, keeper: "_ByteCache", protect: int) -> None:
+        """Evict until the process total is inside the budget.
+
+        @keeper is the cache that just admitted and @protect the key it
+        admitted; that one entry is never the victim, so a budget below the
+        size of a single entry still hands back the entry the caller asked
+        for instead of looping forever.
+        """
+        total = self.total()
+        if total <= self.budget:
+            return
+        caches = self.live()
+        while total > self.budget:
+            victim = None
+            best = 0
+            for c in caches:
+                floor = 1 if c is keeper else 0
+                if len(c) > floor and c.bytes > best:
+                    victim, best = c, c.bytes
+            if victim is None:
+                return          # nothing left that may be given up
+            freed = victim.evict_one(protect if victim is keeper else None)
+            if freed <= 0:
+                return          # the victim could not give anything up
+            total -= freed
+
+
+_POOL: _CachePool | None = None
+
+
+def _pool() -> _CachePool:
+    """The pool, built on first use so the budget reflects the environment
+    the process was started with (every measurement path spawns a child with
+    ``CST_DECODE_CACHE_MB`` already set)."""
+    global _POOL
+    if _POOL is None:
+        mb = _env_int("CST_DECODE_CACHE_MB", _CACHE_MB_DEFAULT)
+        _POOL = _CachePool(max(0, mb) * 1024 * 1024)
+    return _POOL
+
+
+class _ByteCache:
+    """Cache of parsed entries bounded by BYTES, with RANDOM replacement.
+
+    Each admission is charged what the entry actually costs resident.  The
+    charge is recorded alongside the entry and refunded verbatim on
+    eviction, so a calibration that moves mid-decode cannot make the
+    accounting drift -- what went in is what comes out.
+
+    WHY NOT LRU.  ``validate()`` reads the body as ~22 full forward passes.
+    That is the exact access pattern least-recently-used is worst at: on a
+    cyclic scan of a body slightly larger than the cache, the least-recently
+    used entry is always the one the next pass is about to ask for, so every
+    access misses.  Measured, on an x86_64 user cell whose body is 0.12 GiB,
+    with an LRU holding 1,551 of its 3,371 entries -- 46% of the body
+    resident:
+
+        hits 0        misses 3,371        hit rate 0.0%
+
+    A cache holding nearly half the body and returning nothing is not a
+    tuning problem, it is the wrong policy.  Random replacement has no such
+    blind spot: no entry is systematically evicted just before it is needed,
+    so the hit rate tracks the resident fraction instead of collapsing to
+    zero, and a body that overflows the budget degrades in proportion rather
+    than falling off a cliff.  It is also why the budget can be sized for
+    the machine and left alone -- a cell too big for it gets slower by the
+    fraction that does not fit, not by a factor.
+
+    Eviction picks a uniformly random resident entry and swap-removes it,
+    which is O(1); recency is deliberately not tracked, because tracking it
+    is what produced the zero above.
+    """
+
+    # __weakref__ is required, not incidental: the pool tracks live caches
+    # by weak reference so a dropped decode leaves the process-wide total
+    # on its own, with nothing to remember to un-account.
+    __slots__ = ("_map", "_keys", "_pos", "_rng", "_bytes", "_peak", "_adm",
+                 "_deep_sum", "_pick_sum", "_mean_sum", "_mean_n",
+                 "_evictions", "_hits", "_misses", "_misaccount",
+                 "__weakref__")
+
+    def __init__(self):
+        self._map: dict[int, tuple] = {}
+        # Victim pool: _keys[_pos[k]] == k for every resident k, so a random
+        # victim is one randrange and one swap-remove.
+        self._keys: list[int] = []
+        self._pos: dict[int, int] = {}
+        # Its own stream, seeded fixed: the cache must not perturb anyone
+        # else's use of `random`, and two runs of the same cell should evict
+        # the same way so a timing measurement is repeatable.
+        self._rng = random.Random(0xC57CACE)
+        self._hits = 0
+        self._misses = 0
+        self._bytes = 0
+        self._peak = 0
+        self._adm = 0
+        self._deep_sum = 0          # sampled true sizes ...
+        self._pick_sum = 0          # ... against their pickled lengths
+        self._mean_sum = 0
+        self._mean_n = 0
+        self._evictions = 0
+        # TEST LEVER, and the only thing that may ever set it is the
+        # residency tripwire, which needs a deliberately mis-accounted
+        # charge to prove its budget arm can go red.  Any other use makes
+        # the cache hold N times what it says it holds.
+        self._misaccount = max(1, _env_int("CST_DECODE_CACHE_MISACCOUNT", 1))
+        _pool().register(self)
+
+    def __len__(self) -> int:
+        return len(self._map)
+
+    @property
+    def bytes(self) -> int:
+        return self._bytes
+
+    @property
+    def peak_bytes(self) -> int:
+        return self._peak
+
+    @property
+    def evictions(self) -> int:
+        return self._evictions
+
+    @property
+    def hit_rate(self) -> float:
+        """Fraction of reads served from memory.
+
+        The number that says whether the budget is buying anything: an
+        eviction policy can hold most of a body and still return none of
+        it, and without this that failure is invisible from outside.
+        """
+        total = self._hits + self._misses
+        return self._hits / total if total else 0.0
+
+    @property
+    def ratio(self) -> float:
+        """Measured live bytes per pickled byte, or the seed if unsampled."""
+        if self._pick_sum:
+            return self._deep_sum / self._pick_sum
+        return _ENTRY_RATIO_SEED
+
+    def _charge(self, entry: dict, pickled_len: int) -> int:
+        """What to bill @entry, and the calibration it feeds."""
+        self._adm += 1
+        if self._adm % _CACHE_SAMPLE_EVERY == 1:
+            deep = _deep_sizeof(entry)
+            self._mean_sum += deep
+            self._mean_n += 1
+            if pickled_len:
+                self._deep_sum += deep
+                self._pick_sum += pickled_len
+            cost = deep
+        elif pickled_len and self._pick_sum:
+            cost = pickled_len * self._deep_sum // self._pick_sum
+        elif self._mean_n:
+            cost = self._mean_sum // self._mean_n
+        else:
+            cost = _ENTRY_BYTES_SEED
+        return (cost + _SLOT_OVERHEAD_BYTES) // self._misaccount
+
+    def get(self, k: int):
+        hit = self._map.get(k)
+        if hit is None:
+            self._misses += 1
+            return None
+        self._hits += 1
+        return hit[0]
+
+    def put(self, k: int, entry: dict, pickled_len: int) -> None:
+        cost = self._charge(entry, pickled_len)
+        old = self._map.get(k)
+        if old is not None:
+            self._bytes -= old[1]
+        else:
+            self._pos[k] = len(self._keys)
+            self._keys.append(k)
+        self._map[k] = (entry, cost)
+        self._bytes += cost
+        _pool().enforce(self, protect=k)
+        # AFTER enforcement.  An entry has to exist before it can be
+        # charged, so between those two lines the cache is over budget by
+        # one entry -- unavoidable in any cache, and not what "peak
+        # residency" is asking about.  Sampling here reports the level the
+        # cache actually settles at, which is the number the budget is a
+        # promise about.
+        if self._bytes > self._peak:
+            self._peak = self._bytes
+
+    def evict_one(self, protect: int | None = None) -> int:
+        """Drop a uniformly random resident entry; returns bytes refunded.
+
+        @protect is the key just admitted, which is never the victim -- the
+        caller asked for it, and evicting it would let a budget smaller than
+        one entry loop forever without ever handing anything back.
+        """
+        keys = self._keys
+        n = len(keys)
+        if n == 0:
+            return 0
+        i = self._rng.randrange(n)
+        if keys[i] == protect:
+            if n == 1:
+                return 0
+            i = (i + 1) % n
+        return self._drop_at(i)
+
+    def _drop_at(self, i: int) -> int:
+        keys = self._keys
+        k = keys[i]
+        last = keys.pop()
+        if last != k:
+            keys[i] = last
+            self._pos[last] = i
+        del self._pos[k]
+        _entry, cost = self._map.pop(k)
+        self._bytes -= cost
+        self._evictions += 1
+        return cost
+
+    def clear(self) -> None:
+        self._map.clear()
+        self._keys.clear()
+        self._pos.clear()
+        self._bytes = 0
+
+
 class _EntrySeq(Sequence):
     """The body entries of a decode, as a lazy disk-backed sequence.
 
     Indistinguishable from ``list[dict]`` for every read the validator does --
     ``len()``, ``seq[i]``, negative indices, slicing, iteration, ``reversed``,
-    ``enumerate``, ``zip`` -- but it holds no entries.  ``seq[i]`` parses the
-    record at its indexed line offset on demand and a bounded LRU absorbs the
-    checks' locality; iteration walks the same path and retains nothing.
-    Resident cost is the line index, the entry index and the LRU, none of
-    which grow with how much the trace executed.
+    ``enumerate``, ``zip`` -- but what it holds is capped in BYTES rather than
+    growing with the trace.  ``seq[i]`` parses the record at its indexed line
+    offset on demand and a byte-budgeted cache (:class:`_ByteCache`, against the
+    process-wide :class:`_CachePool`) absorbs the checks' locality; iteration
+    walks the same path.  Resident cost is the line index, the entry index and
+    that budget, none of which grow with how much the trace executed.
+
+    The budget is deliberately large -- 10 GiB by default, sized to the
+    machine rather than to the smallest number that still bounds -- so a body
+    that fits in it is cached whole and the validator's ~22 passes run at the
+    speed of the eager list they replaced.  A body that does not fit degrades
+    to parse-on-access, which is the case the bound exists for.
 
     WHY THIS EXISTS.  ``decode_champsim_tracer`` used to return
     ``list(_iter_body(...))``.  On a ``--stop 3000000`` system-marker cell
@@ -1045,7 +1475,7 @@ class _EntrySeq(Sequence):
     :meth:`materialize` and gives them a genuine, independent ``list``.
     """
 
-    __slots__ = ("_lines", "_rid", "_idx", "_lo", "_hi", "_cache", "_cap",
+    __slots__ = ("_lines", "_rid", "_idx", "_lo", "_hi", "_cache",
                  "_root", "_spill")
 
     def __init__(self, lines: _LineFile, body_start: int,
@@ -1064,8 +1494,10 @@ class _EntrySeq(Sequence):
         self._idx = idx
         self._lo = lo
         self._hi = len(idx) if hi is None else hi
-        self._cap = _env_int("CST_DECODE_ENTRY_CACHE", _ENTRY_CACHE_DEFAULT)
-        self._cache = OrderedDict() if cache is None else cache
+        # A slice shares the parent's cache: same entries, same budget, one
+        # set of books.  Its own budget would be a second entitlement to the
+        # process-wide ceiling.
+        self._cache = _ByteCache() if cache is None else cache
         # A view keeps its parent (and so the open decode) alive.
         self._root = root
         if spill is not None:
@@ -1084,29 +1516,36 @@ class _EntrySeq(Sequence):
         entry, _ = _parse_entry_at(self._lines, self._idx[k], self._rid)
         return entry
 
-    def _fresh(self, k: int) -> dict:
-        """A newly-built entry at absolute index @k, shared with nobody."""
+    def _fresh_sized(self, k: int) -> tuple[dict, int]:
+        """A newly-built entry at index @k, with its pickled length.
+
+        The length is what the byte budget bills against -- it is already
+        known exactly wherever the parsed spill is in play, so the common
+        case costs nothing to measure.  0 means "no spill here", and the
+        cache falls back to its running mean.
+        """
         spill = self._spill
         if spill is not None:
             got = spill.get(k)
             if got is not None:
-                return got
+                return got, spill.size(k)
             entry = self._parse(k)
             spill.put(k, entry)
-            return entry
-        return self._parse(k)
+            return entry, spill.size(k)
+        return self._parse(k), 0
+
+    def _fresh(self, k: int) -> dict:
+        """A newly-built entry at absolute index @k, shared with nobody."""
+        return self._fresh_sized(k)[0]
 
     def _at(self, k: int) -> dict:
-        """Entry at absolute index @k, through the LRU."""
+        """Entry at absolute index @k, through the byte-budgeted LRU."""
         cache = self._cache
         hit = cache.get(k)
         if hit is not None:
-            cache.move_to_end(k)
             return hit
-        entry = self._fresh(k)
-        cache[k] = entry
-        if len(cache) > self._cap:
-            cache.popitem(last=False)
+        entry, plen = self._fresh_sized(k)
+        cache.put(k, entry, plen)
         return entry
 
     def __getitem__(self, key):
@@ -1559,18 +1998,33 @@ FORCE_EAGER_ENV = "CST_DECODE_FORCE_EAGER_UNBOUNDED"
 
 
 def decode_residency_facts(entries) -> dict:
-    """What the residency tripwire needs to know about a decode's entry
-    container: whether it is the lazy sequence at all, how many entries it
-    presents, how many lines of legacy text back it, and how many entries
-    the LRU may hold.  Reported rather than assumed, so the bound the
-    tripwire checks against is derived from the decode in front of it."""
+    """What the residency tripwire needs to know about a decode.
+
+    Whether the container is the lazy sequence at all, how many entries it
+    presents, how many lines of legacy text back it, and the cache's own
+    books: the byte budget it was given, the high-water mark it actually
+    charged, how many entries that was and how many it had to evict.
+    Reported rather than assumed, so the bound the tripwire checks against
+    is derived from the decode in front of it -- and so "the budget was
+    honoured" can be distinguished from "nothing was ever cached", which
+    would satisfy any ceiling and prove nothing.
+    """
     if isinstance(entries, _EntrySeq):
+        cache = entries._cache
         return {"lazy": True,
                 "entries": len(entries),
                 "lines": len(entries._lines),
-                "cache_cap": entries._cap}
-    return {"lazy": False, "entries": len(entries),
-            "lines": 0, "cache_cap": 0}
+                "cache_budget": _pool().budget,
+                "cache_peak_bytes": cache.peak_bytes,
+                "cache_bytes": cache.bytes,
+                "cache_entries": len(cache),
+                "cache_evictions": cache.evictions,
+                "cache_hit_rate": round(cache.hit_rate, 4),
+                "cache_ratio": round(cache.ratio, 3)}
+    return {"lazy": False, "entries": len(entries), "lines": 0,
+            "cache_budget": _pool().budget, "cache_peak_bytes": 0,
+            "cache_bytes": 0, "cache_entries": 0, "cache_evictions": 0,
+            "cache_hit_rate": 0.0, "cache_ratio": 0.0}
 
 
 def decode_champsim_tracer_header(bin_path):

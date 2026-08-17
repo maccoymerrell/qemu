@@ -12,15 +12,38 @@ WHAT THIS CHECKS.  That the ruling still holds — measured, not asserted
 from the source.  A trace big enough for the difference to be unmistakable
 is decoded in a child process and walked end to end; the child's peak RSS
 must sit under a bound DERIVED from what the lazy design actually costs
-(the line index, the entry index, the bounded LRU), not under a number
-somebody once wrote down.
+(the line index, the entry index, the cache's byte budget), not under a
+number somebody once wrote down.
 
-AND THAT THE TRIPWIRE CAN FIRE.  A gate that has never gone red is a gate
-nobody has tested.  The same trace is decoded a second time with
-``CST_DECODE_FORCE_EAGER_UNBOUNDED=1``, which reinstates the pre-fix
-materialisation; that run MUST exceed the bound.  If it does not — the
-substrate is too small, the machine is too generous, the lever stopped
-working — this check FAILS rather than reporting a pass it cannot support.
+WHY THE CHECK SETS ``CST_DECODE_CACHE_MB`` ITSELF.  The budget shipped by
+default is 11 GiB, sized to the machine so that a body which fits in it is
+cached whole and the validator runs at eager speed.  A tripwire run at that
+default would be measuring nothing: this check's substrate is ~80 k entries,
+which fits entirely, so lazy and eager would peak within noise of each other
+and a pass would be unearned.  So both arms below name their own budget.
+What is under test is the BOUNDING MACHINERY, never the default.
+
+TWO ARMS, because a budget has two ways to be wrong — it can fail to bound,
+and it can bound something other than what it says.
+
+  BOUNDED (cache 64 MiB) — with the cache squeezed to a fraction of the
+  body, peak RSS must sit under the derived bound.  Then the same trace is
+  decoded with ``CST_DECODE_FORCE_EAGER_UNBOUNDED=1``, which reinstates the
+  pre-fix materialisation, and THAT run must exceed it.  A gate that cannot
+  be made to go red proves nothing, so failing to fire fails the check, as
+  does a substrate too small to tell the two shapes apart.
+
+  BUDGET HONOURED (cache 256 MiB, on a body larger than that) — the cache
+  must actually fill (peak accounted bytes near the budget, evictions
+  non-zero: "nothing was ever cached" satisfies any ceiling and proves
+  nothing), must never charge itself over its own budget, and — the part
+  that has teeth — the child's peak RSS must land under the bound the
+  budget implies.  That last one is what makes the accounting answerable to
+  reality rather than to itself.  Its own red-lever is
+  ``CST_DECODE_CACHE_MISACCOUNT``, which divides every charge so the cache
+  holds N times what its books say; under it the internal invariant still
+  passes and the RSS bound breaks, which is exactly the failure this arm
+  exists to catch.
 """
 
 from __future__ import annotations
@@ -43,8 +66,7 @@ MiB = 1 << 20
 #              text, doubled for array over-allocation and slack.
 #   PER_ENTRY  the entry-head index and the body-record-order index: a few
 #              machine words per body record.
-#   PER_CACHED the bounded LRU of parsed entries, at a generous ceiling for
-#              how large one entry (with its wrong-path chain) can get.
+#   the cache's own byte budget, taken from the decode rather than assumed.
 #
 # Nothing here scales with how much the trace EXECUTED except through the
 # indices, which is the whole point: a term proportional to entry count at
@@ -52,7 +74,13 @@ MiB = 1 << 20
 BASE_BYTES = 384 * MiB
 PER_LINE_BYTES = 16
 PER_ENTRY_BYTES = 64
-PER_CACHED_ENTRY_BYTES = 32 * 1024
+
+# The cache charges an ESTIMATE of each entry's resident cost (a sampled
+# recursive size, scaled by pickled length).  An estimate is allowed to be
+# wrong by a margin; it is not allowed to be wrong by a multiple.  Measured
+# agreement between charged bytes and RSS growth is within 3%, so 25% is
+# slack, not permission.
+CACHE_TOLERANCE = 1.25
 
 # A floor on the substrate, not the proof.  The proof is the explicit
 # "forced-eager exceeds the budget" assertion below; this only stops the
@@ -61,12 +89,47 @@ PER_CACHED_ENTRY_BYTES = 32 * 1024
 # list is already multiple times the budget.
 MIN_ENTRIES_TO_PROVE = 60_000
 
+# The two budgets the arms run at.  BOUNDED_MB is small enough that the
+# body cannot fit however the entries are sized; HONOURED_MB is a middle
+# setting the substrate must genuinely overflow for the arm to mean
+# anything (asserted against the measured body size, never assumed).
+#
+# HONOURED_MB is not a round number picked for looks -- it is bracketed on
+# both sides by what the red-lever has to be able to do.  The substrate's
+# parsed body charges ~1,219 MiB, and with the lever dividing charges by
+# MISACCOUNT_FACTOR the cache holds MISACCOUNT_FACTOR x the budget:
+#
+#   upper bound  4 x 256 = 1024 MiB is still under the 1,219 MiB body, so
+#                the misaccounted run KEEPS EVICTING and so still reaches
+#                the residency assertion.  Much above 305 MiB and the body
+#                fits, eviction stops, and the arm goes red for the wrong
+#                reason -- true, but not the one being tested.
+#   lower bound  the breach has to clear the bound's own slack:
+#                60 + 4B > 384 + 55 + 5 + 1.25B needs B > ~140 MiB.
+#
+# 256 sits in the middle of (140, 305) with margin at both ends.  If the
+# substrate ever changes shape the arm fails loudly ("evicted nothing")
+# rather than quietly proving less.
+BOUNDED_MB = 64
+HONOURED_MB = 256
 
-def bound_bytes(facts: dict) -> int:
-    return (BASE_BYTES
-            + PER_LINE_BYTES * int(facts.get("lines", 0))
-            + PER_ENTRY_BYTES * int(facts.get("entries", 0))
-            + PER_CACHED_ENTRY_BYTES * int(facts.get("cache_cap", 0)))
+# The budget arm's own red lever: divide every charge by this and the cache
+# holds N times what its books say.  4 rather than something larger because
+# the lever has to leave the arm's OTHER preconditions intact -- at a big
+# enough factor the whole body fits under the inflated budget, eviction
+# stops, and the arm goes red for "nothing was evicted" instead of for the
+# residency breach it is supposed to catch.
+MISACCOUNT_ENV = "CST_DECODE_CACHE_MISACCOUNT"
+MISACCOUNT_FACTOR = 4
+CACHE_MB_ENV = "CST_DECODE_CACHE_MB"
+
+
+def bound_bytes(facts: dict, *, tolerance: float = 1.0) -> int:
+    """Peak RSS the decode is entitled to, derived from the decode itself."""
+    return int(BASE_BYTES
+               + PER_LINE_BYTES * int(facts.get("lines", 0))
+               + PER_ENTRY_BYTES * int(facts.get("entries", 0))
+               + tolerance * int(facts.get("cache_budget", 0)))
 
 
 # --- the probe (runs as a child process) -----------------------------------
@@ -116,21 +179,31 @@ def _probe(cst: str) -> int:
     from . import _cst_decode_runner as R
 
     meta, templates, entries = R.decode_champsim_tracer(cst)
-    facts = R.decode_residency_facts(entries)
 
     # Walk the body exactly as a check would: full pass, plus the indexed
     # and reversed access patterns the validator actually uses.  A "lazy"
     # container that quietly materialised on iteration would show up here.
+    # TWICE, because one pass over a cold cache never re-reads anything and
+    # so never shows whether the cache is holding what it claims -- the
+    # validator makes ~22 passes, and it is the second one onwards that the
+    # budget is for.
     n = 0
     seq_sum = 0
-    for e in entries:
-        n += 1
-        seq_sum += int(e.get("seq_num", 0) or 0)
+    for _pass in range(2):
+        n = 0
+        for e in entries:
+            n += 1
+            seq_sum += int(e.get("seq_num", 0) or 0)
     if len(entries) > 4:
         for probe in (0, len(entries) // 2, -1):
             seq_sum += int(entries[probe].get("seq_num", 0) or 0)
     order = meta.get("body_record_order") or []
     n_order = len(order)
+
+    # AFTER the walk: before it, the cache is empty and every one of its
+    # numbers is zero, which would let a budget arm "pass" on a cache that
+    # was never asked to hold anything.
+    facts = R.decode_residency_facts(entries)
 
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
 
@@ -149,14 +222,22 @@ def _probe(cst: str) -> int:
     return 0
 
 
-def _run_probe(cst: Path, *, eager: bool, timeout: int) -> dict:
+def _run_probe(cst: Path, *, eager: bool, timeout: int, cache_mb: int,
+               misaccount: int = 1) -> dict:
+    from ._cst_decode_runner import FORCE_EAGER_ENV
     env = dict(os.environ)
     if eager:
-        from ._cst_decode_runner import FORCE_EAGER_ENV
         env[FORCE_EAGER_ENV] = "1"
     else:
-        from ._cst_decode_runner import FORCE_EAGER_ENV
         env.pop(FORCE_EAGER_ENV, None)
+    # Named explicitly, never inherited: the shipped default is 11 GiB and
+    # would swallow this substrate whole, so a run that silently picked it
+    # up would measure nothing and say it measured something.
+    env[CACHE_MB_ENV] = str(cache_mb)
+    if misaccount != 1:
+        env[MISACCOUNT_ENV] = str(misaccount)
+    else:
+        env.pop(MISACCOUNT_ENV, None)
     proc = subprocess.run(
         [sys.executable, "-m", "champsim_tracer_validator._decode_bound",
          "--probe", str(cst)],
@@ -178,7 +259,8 @@ def _run_probe(cst: Path, *, eager: bool, timeout: int) -> dict:
 
 def check_decode_bound(cst: Path, *, timeout: int = 1800) -> tuple[bool, str]:
     """Returns (ok, detail).  See the module docstring for what is proven."""
-    lazy = _run_probe(cst, eager=False, timeout=timeout)
+    # --- arm 1: BOUNDED, with the cache squeezed well under the body ------
+    lazy = _run_probe(cst, eager=False, timeout=timeout, cache_mb=BOUNDED_MB)
     if "error" in lazy:
         return False, f"lazy probe failed: {lazy['error']}"
 
@@ -198,6 +280,12 @@ def check_decode_bound(cst: Path, *, timeout: int = 1800) -> tuple[bool, str]:
     if not lazy.get("lazy"):
         return False, (f"decode_champsim_tracer returned a plain list of "
                        f"{n_entries} entries -- the eager shape is back")
+    if int(lazy.get("cache_budget", 0)) != BOUNDED_MB * MiB:
+        # The arm must run at the budget it says it runs at, or it is
+        # measuring the default and calling it a bound.
+        return False, (f"probe ran at a {int(lazy.get('cache_budget', 0)) / MiB:.0f} "
+                       f"MiB cache budget, not the {BOUNDED_MB} MiB this arm "
+                       f"sets -- {CACHE_MB_ENV} did not reach the decode")
     if not lazy.get("order_survives"):
         return False, ("the streaming decoder's record-order view did not "
                        "survive its own decode closing: "
@@ -209,7 +297,7 @@ def check_decode_bound(cst: Path, *, timeout: int = 1800) -> tuple[bool, str]:
 
     # The other direction: the same measurement, against the shape the fix
     # removed.  It has to blow the budget, or this check proves nothing.
-    eager = _run_probe(cst, eager=True, timeout=timeout)
+    eager = _run_probe(cst, eager=True, timeout=timeout, cache_mb=BOUNDED_MB)
     if "error" in eager:
         return False, f"forced-eager probe failed: {eager['error']}"
     e_peak = int(eager.get("peak_rss", 0))
@@ -222,13 +310,100 @@ def check_decode_bound(cst: Path, *, timeout: int = 1800) -> tuple[bool, str]:
                        f"cannot distinguish the defect from the fix at this "
                        f"trace size, so its pass would be unearned")
 
-    return True, (f"{n_entries} entries / {lazy.get('lines')} lines: "
-                  f"lazy peak {peak / MiB:.0f} MiB <= {limit / MiB:.0f} MiB "
+    # --- arm 2: BUDGET HONOURED, at a middle setting ----------------------
+    ok, detail = _check_budget_honoured(cst, timeout=timeout, body_hint=lazy)
+    if not ok:
+        return False, detail
+
+    return True, (f"{n_entries} entries / {lazy.get('lines')} lines.  "
+                  f"BOUNDED (cache {BOUNDED_MB} MiB): lazy peak "
+                  f"{peak / MiB:.0f} MiB <= {limit / MiB:.0f} MiB derived "
                   f"budget; forced-eager peak {e_peak / MiB:.0f} MiB exceeds "
                   f"it ({e_peak / max(peak, 1):.1f}x the lazy peak), so the "
-                  f"bound is measured and the tripwire is proven live; "
-                  f"record-order view lifetime OK "
+                  f"bound is measured and the tripwire is proven live.  "
+                  f"{detail}  Record-order view lifetime OK "
                   f"({lazy.get('order_detail', '')})")
+
+
+def _check_budget_honoured(cst: Path, *, timeout: int,
+                           body_hint: dict) -> tuple[bool, str]:
+    """The budget arm, plus the proof that it can go red.
+
+    Same shape as the bounded arm above: assert, then break the thing the
+    assertion depends on and require the assertion to notice.  Here the
+    lever divides every charge, so the cache holds a multiple of what its
+    books say -- a cache whose accounting has drifted from reality is
+    exactly the defect this arm exists to catch, and if the arm passes
+    under the lever it was never catching it.
+    """
+    ok, detail, _facts = _budget_arm(cst, timeout=timeout, misaccount=1)
+    if not ok:
+        return False, detail
+
+    red_ok, red_detail, _rfacts = _budget_arm(
+        cst, timeout=timeout, misaccount=MISACCOUNT_FACTOR)
+    if red_ok:
+        return False, (f"the budget arm passed with every charge divided by "
+                       f"{MISACCOUNT_FACTOR}: it cannot tell a cache holding "
+                       f"{MISACCOUNT_FACTOR}x its own books from one that is "
+                       f"accounted honestly, so its pass is unearned")
+
+    return True, (f"{detail}  Red-lever ({MISACCOUNT_ENV}="
+                  f"{MISACCOUNT_FACTOR}) fires: {red_detail}")
+
+
+def _budget_arm(cst: Path, *, timeout: int,
+                misaccount: int) -> tuple[bool, str, dict]:
+    """The cache holds what its budget says, and its books match reality."""
+    mid = _run_probe(cst, eager=False, timeout=timeout, cache_mb=HONOURED_MB,
+                     misaccount=misaccount)
+    if "error" in mid:
+        return False, f"budget-honoured probe failed: {mid['error']}", mid
+
+    budget = int(mid.get("cache_budget", 0))
+    if budget != HONOURED_MB * MiB:
+        return False, (f"budget arm ran at {budget / MiB:.0f} MiB, not the "
+                       f"{HONOURED_MB} MiB it sets -- {CACHE_MB_ENV} did not "
+                       f"reach the decode"), mid
+
+    charged = int(mid.get("cache_peak_bytes", 0))
+    evictions = int(mid.get("cache_evictions", 0))
+    peak = int(mid.get("peak_rss", 0))
+    limit = bound_bytes(mid, tolerance=CACHE_TOLERANCE)
+
+    # The substrate has to be bigger than the budget, or "it fit" is the
+    # only thing being measured and eviction is never exercised.
+    if evictions <= 0:
+        return False, (f"budget arm evicted nothing at a {HONOURED_MB} MiB "
+                       f"budget: the substrate ({mid.get('entries')} entries) "
+                       f"fits inside it, so this arm cannot show the budget "
+                       f"is honoured -- it only shows it was never reached"), mid
+    # ... and the cache has to have actually used what it was given.  A
+    # cache that stays near empty satisfies every ceiling and proves none.
+    if charged < budget // 2:
+        return False, (f"budget arm filled the cache to only "
+                       f"{charged / MiB:.0f} MiB of its {budget / MiB:.0f} MiB "
+                       f"budget -- under-filling passes any ceiling, so this "
+                       f"arm's pass would be unearned"), mid
+    # The internal invariant: the books never exceed the budget.
+    if charged > budget:
+        return False, (f"cache charged itself {charged:,} B against a "
+                       f"{budget:,} B budget (over by {charged - budget:,}) "
+                       f"-- the accounting does not honour its own ceiling"), mid
+    # The external one, which is the part with teeth: the books have to
+    # correspond to memory the process actually holds.
+    if peak > limit:
+        return False, (f"budget arm peaked at {peak / MiB:.0f} MiB against a "
+                       f"{limit / MiB:.0f} MiB bound for a "
+                       f"{budget / MiB:.0f} MiB budget -- the cache's books "
+                       f"say it held {charged / MiB:.0f} MiB, so the charge "
+                       f"is not what the entries actually cost"), mid
+
+    return True, (f"BUDGET HONOURED (cache {HONOURED_MB} MiB): filled to "
+                  f"{charged / MiB:.0f} MiB of {budget / MiB:.0f} MiB with "
+                  f"{evictions} evictions, peak RSS {peak / MiB:.0f} MiB <= "
+                  f"{limit / MiB:.0f} MiB, charge-to-pickled ratio "
+                  f"{mid.get('cache_ratio')}."), mid
 
 
 # --- CLI ------------------------------------------------------------------

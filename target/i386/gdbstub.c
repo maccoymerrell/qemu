@@ -439,6 +439,24 @@ int x86_cpu_gdb_write_register(CPUState *cs, uint8_t *mem_buf, int n)
         case IDX_CTL_CR8_REG:
             len = gdb_write_reg_cs64(env->hflags, mem_buf, &tmp);
 #ifndef CONFIG_USER_ONLY
+#ifdef CONFIG_PLUGIN
+            /*
+             * Wrong-path (speculative): cpu_set_apic_tpr writes the APIC
+             * device (apic_set_tpr -> apic_update_irq can raise
+             * CPU_INTERRUPT_HARD) -- a device mutation outside the env
+             * snapshot, which the excursion's register restore cannot undo.
+             * helper_write_cr8 already refuses this for the guest's own
+             * MOV-to-CR8; this is the same device access reached through the
+             * register-write API, the write twin of the gated CR8 read
+             * above.  Apply the env-shadowed V_TPR bits exactly as the
+             * helper does; the walk-end restore rolls them back.
+             */
+            if (cs->plugin_spec_mode) {
+                env->int_ctl = (env->int_ctl & ~V_TPR_MASK) |
+                               (tmp & V_TPR_MASK);
+                return len;
+            }
+#endif
             cpu_set_apic_tpr(cpu->apic_state, tmp);
 #endif
             return len;

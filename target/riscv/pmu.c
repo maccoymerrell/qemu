@@ -549,10 +549,17 @@ void riscv_pmu_timer_cb(void *priv)
      * gt-timer precedent, accel/tcg/cpu-exec.c).  pmu_timer_trigger_irq would
      * re-arm cpu->pmu_timer (outside the WP snapshot, not reconciled by
      * riscv_cpu_plugin_resync_timers) and clear counter->irq_overflow_left.
-     * Bail on the discarded path; the guest re-arms on its next real counter
-     * write (riscv_pmu_setup_timer, itself spec-gated).
+     * Bail on the discarded path; the one-shot has now fired and does not
+     * re-arm itself, so the deferred expiry is owed to the guest -- it is
+     * paid by riscv_pmu_plugin_resync below, from excursion-exit reconcile.
+     *
+     * Gate on plugin_spec_vtime_paused (true for the WHOLE excursion), not
+     * just plugin_spec_mode: a wrong-path fault-skip briefly clears spec_mode
+     * while the snapshot is still live, and a firing in that gap would set an
+     * OF bit the final restore rolls back while its LCOFIP raise is recorded
+     * and replayed -- a fabricated LCOFIP-without-OF (#77).
      */
-    if (CPU(cpu)->plugin_spec_mode) {
+    if (CPU(cpu)->plugin_spec_mode || CPU(cpu)->plugin_spec_vtime_paused) {
         return;
     }
 #endif
@@ -561,6 +568,30 @@ void riscv_pmu_timer_cb(void *priv)
     pmu_timer_trigger_irq(cpu, RISCV_PMU_EVENT_HW_CPU_CYCLES);
     pmu_timer_trigger_irq(cpu, RISCV_PMU_EVENT_HW_INSTRUCTIONS);
 }
+
+#ifdef CONFIG_PLUGIN
+/*
+ * Wrong-path excursion-exit payback for a deferred pmu_timer expiry.  The
+ * overflow one-shot may have fired during the excursion and been bailed by
+ * the gate in riscv_pmu_timer_cb; it does not re-arm itself, so the deferred
+ * firing is owed to the guest.  Re-run the trigger evaluation from CURRENT
+ * counter truth: pmu_timer_trigger_irq reads the live counter value, sets OF
+ * and raises LCOFIP only if the counter really overflowed (the OF-clear
+ * check keeps this consume-once), and otherwise re-arms the timer for the
+ * remaining distance.  The same re-derivation shape as the stimer/ACLINT
+ * resyncs -- never a replay of a recorded event -- and, like them, it runs
+ * unconditionally at every excursion exit, so correctness does not depend on
+ * the cb having recorded that it suppressed a firing.
+ */
+void riscv_pmu_plugin_resync(RISCVCPU *cpu)
+{
+    if (!cpu->pmu_timer) {
+        return;
+    }
+    pmu_timer_trigger_irq(cpu, RISCV_PMU_EVENT_HW_CPU_CYCLES);
+    pmu_timer_trigger_irq(cpu, RISCV_PMU_EVENT_HW_INSTRUCTIONS);
+}
+#endif
 
 int riscv_pmu_setup_timer(CPURISCVState *env, uint64_t value, uint32_t ctr_idx)
 {

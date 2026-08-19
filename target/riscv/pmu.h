@@ -27,6 +27,9 @@ bool riscv_pmu_ctr_monitor_instructions(CPURISCVState *env,
 bool riscv_pmu_ctr_monitor_cycles(CPURISCVState *env,
                                   uint32_t target_ctr);
 void riscv_pmu_timer_cb(void *priv);
+#ifdef CONFIG_PLUGIN
+void riscv_pmu_plugin_resync(RISCVCPU *cpu);
+#endif
 void riscv_pmu_init(RISCVCPU *cpu, Error **errp);
 int riscv_pmu_update_event_map(CPURISCVState *env, uint64_t value,
                                uint32_t ctr_idx);

@@ -20,6 +20,7 @@
 #include "qemu/log.h"
 #include "qemu/main-loop.h"
 #include "cpu_bits.h"
+#include "pmu.h"
 #include "time_helper.h"
 #include "hw/intc/riscv_aclint.h"
 
@@ -291,6 +292,12 @@ void riscv_cpu_plugin_resync_timers(CPUState *cs)
                 env->vstimecmp == 0 ? " (old:spurious-VSTIP)" : "");
     }
     riscv_plugin_reconcile_timers(env);
+    /*
+     * The PMU overflow one-shot is the same deferred-cb class, but it runs
+     * on QEMU_CLOCK_VIRTUAL directly and does not depend on rdtime_fn, so
+     * its payback sits outside riscv_plugin_reconcile_timers' rdtime gate.
+     */
+    riscv_pmu_plugin_resync(RISCV_CPU(cs));
 }
 
 #endif

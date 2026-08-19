@@ -904,7 +904,9 @@ bool cpu_plugin_exec_tb(CPUState *cpu)
          * exactly as if the excursion had taken zero host time.
          */
         if (cpu->plugin_spec_mode) {
-            qatomic_set(&cpu->neg.icount_decr.u16.high, 0);
+            if (qatomic_xchg(&cpu->neg.icount_decr.u16.high, 0)) {
+                cpu->plugin_spec_kick_deferred = true;
+            }
         }
 #endif
         cpu_tb_exec(cpu, tb, &tb_exit);
@@ -2499,10 +2501,28 @@ void cpu_plugin_spec_vtime_resume(CPUState *cpu)
      * excursion is thereby bounded by that one excursion, by construction,
      * and wrong-path content is independent of host IRQ timing.
      */
-    if (qatomic_read(&cpu->exit_request) ||
-        qatomic_read(&cpu->interrupt_request)) {
+    /*
+     * Edge semantics: reconstruct the kick iff this excursion actually
+     * cleared one (plugin_spec_kick_deferred, set by the WP dispatch
+     * that consumed it), or one is in the register right now (landed
+     * after the last dispatch).  The request flags are NOT consulted:
+     * interrupt_request holds level bits that stay set while a line is
+     * pending (e.g. a masked IRQ), so reconstructing from them would
+     * fabricate a kick nobody posted, every excursion, for as long as
+     * the line stays high.
+     */
+    if (cpu->plugin_spec_kick_deferred ||
+        qatomic_read(&cpu->neg.icount_decr.u16.high)) {
         qatomic_set(&cpu->neg.icount_decr.u16.high, -1);
     }
+    /*
+     * The deferral flag must not outlive its excursion: this resume runs on
+     * BOTH exit paths (the walker's normal wp_end and the abnormal
+     * longjmp cleanup), so clearing it here — outside the branch above —
+     * is what keeps a deferred kick from leaking into the next excursion's
+     * re-arm decision.
+     */
+    cpu->plugin_spec_kick_deferred = false;
     if (need_bql || we_hold_from_pause) {
         bql_unlock();
     }

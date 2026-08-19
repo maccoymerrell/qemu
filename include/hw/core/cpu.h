@@ -855,6 +855,9 @@ struct CPUState {
      * architected counters.
      */
     bool plugin_spec_vtime_paused;
+    /* An excursion WP-dispatch cleared a pending kick (icount_decr.u16.high
+     * was nonzero at the clear).  Consumed by the edge-semantics re-arm. */
+    bool plugin_spec_kick_deferred;
     /*
      * Nesting depth of qemu_plugin_vclock_pause/resume: freezes the guest
      * virtual clock while a plugin runs instrumentation work on the vCPU

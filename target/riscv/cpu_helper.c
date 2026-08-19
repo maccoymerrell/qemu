@@ -1952,7 +1952,19 @@ bool riscv_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
     qemu_log_mask(CPU_LOG_MMU, "%s ad %" VADDR_PRIx " rw %d mmu_idx %d\n",
                   __func__, address, access_type, mmu_idx);
 
-    pmu_tlb_fill_incr_ctr(cpu, access_type);
+    /*
+     * Wrong-path (speculative): do not let a WP TLB fill increment guest
+     * hpmcounters.  The counter state itself is rolled back by the
+     * excursion's register restore, so the increment buys nothing -- but an
+     * overflow it triggers raises MIP_LCOFIP through riscv_cpu_update_mip
+     * WITHOUT the guest-write bracket, so the external-delta record logs it
+     * and the excursion-exit replay re-imposes it onto restored state whose
+     * OF bit and counter were rolled back: a fabricated LCOFIP with
+     * scountovf showing no cause.
+     */
+    if (!cs->plugin_spec_mode) {
+        pmu_tlb_fill_incr_ctr(cpu, access_type);
+    }
     if (two_stage_lookup) {
         /* Two stage lookup */
         ret = get_physical_address(env, &pa, &prot, address,

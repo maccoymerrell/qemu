@@ -146,4 +146,17 @@ void plugin_evq_note_drained(CPUState *cpu);
  */
 void qemu_plugin_fillin_mode_info(qemu_info_t *info);
 
+/**
+ * qemu_plugin_vclock_agency_mode - track the PLUGIN-ACTIVE condition
+ * @active: true when the first plugin installs, false when the last
+ *          uninstalls
+ *
+ * The event-agency discipline (qemu/vclock-agency.h) is gated on the
+ * runtime condition "a plugin is loaded/instrumenting", never on an
+ * environment knob.  System-mode implementation arms the discipline
+ * (plugins/system.c); user-mode is a no-op (plugins/user.c) -- there is
+ * no iothread/VIRTUAL consumption split to move in user mode.
+ */
+void qemu_plugin_vclock_agency_mode(bool active);
+
 #endif /* PLUGIN_H */

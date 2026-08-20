@@ -50,6 +50,8 @@
 #include "tb-hash.h"
 #include "tb-context.h"
 #include "tb-internal.h"
+#include "qemu/cst_bqslice.h"
+#include "qemu/vclock-agency.h"
 #include "internal-common.h"
 #include "internal-target.h"
 #include "exec/cputlb.h"
@@ -762,6 +764,18 @@ bool cpu_plugin_exec_inline(CPUState *cpu)
     memcpy(&saved_jmp_env, &cpu->jmp_env, sizeof(sigjmp_buf));
 
     if (sigsetjmp(cpu->jmp_env, 0) == 0) {
+#ifndef CONFIG_USER_ONLY
+        /* Guest-insn slice bounding: same spec-dispatch quantum rule as
+         * cpu_plugin_exec_tb -- see the comment there. */
+        if (unlikely(cst_bq_on)) {
+            if (cpu->plugin_spec_mode) {
+                cpu->neg.icount_decr.u16.low = cst_bq_quantum;
+                cst_bq_note_wp_reload();
+            } else {
+                cst_bq_note_nonspec_dispatch();
+            }
+        }
+#endif
         cpu_tb_exec(cpu, tb, &tb_exit);
         cpu->running = saved_running;
         memcpy(&cpu->jmp_env, &saved_jmp_env, sizeof(sigjmp_buf));
@@ -906,6 +920,29 @@ bool cpu_plugin_exec_tb(CPUState *cpu)
         if (cpu->plugin_spec_mode) {
             if (qatomic_xchg(&cpu->neg.icount_decr.u16.high, 0)) {
                 cpu->plugin_spec_kick_deferred = true;
+            }
+        }
+#endif
+#ifndef CONFIG_USER_ONLY
+        /*
+         * Guest-insn slice bounding: spec TBs inherit the budget
+         * prologue (the arming edge precedes any translation --
+         * mirroring icount's effect on WP blocks), and this dispatch's
+         * .low half must never present an exhausted budget to a
+         * wrong-path TB (the prologue would refuse to execute it and
+         * the walker would see a false bail).  Give each SPEC-MODE
+         * dispatch its own full quantum; the CP value was saved at
+         * excursion open and is restored by
+         * cpu_plugin_spec_vtime_resume.  A dispatch with spec mode
+         * CLEAR is only counted (tripwire): it is not entitled to free
+         * budget.
+         */
+        if (unlikely(cst_bq_on)) {
+            if (cpu->plugin_spec_mode) {
+                cpu->neg.icount_decr.u16.low = cst_bq_quantum;
+                cst_bq_note_wp_reload();
+            } else {
+                cst_bq_note_nonspec_dispatch();
             }
         }
 #endif
@@ -2164,6 +2201,12 @@ static void cst_clkprobe(bool resume)
  */
 static __thread IcountFreeze g_spec_icount_freeze;
 
+/* Guest-insn slice bounding: the CORRECT PATH's remaining slice budget,
+ * saved at excursion open and restored at excursion close (see
+ * cpu_plugin_spec_vtime_pause/_resume). */
+static __thread uint16_t g_cst_bq_exc_low;
+static __thread bool g_cst_bq_exc_low_active;
+
 /*
  * The per-target clock resynchronisation hook (TCGCPUOps::spec_clock_resync).
  * Every guest-observable clock and every armed host QEMUTimer is reconciled
@@ -2237,6 +2280,24 @@ void cpu_plugin_spec_vtime_pause(CPUState *cpu)
         icount_plugin_freeze(cpu, &g_spec_icount_freeze);
 #endif
     }
+#ifdef CONFIG_PLUGIN
+    /*
+     * Guest-insn slice bounding: the default-clock mirror of
+     * icount_plugin_freeze's u16.low capture (that call is a no-op off
+     * icount).  Save the CORRECT PATH's remaining budget here, at the
+     * true excursion open; every spec-mode dispatch runs on its own
+     * full quantum (cpu_plugin_exec_tb/_inline), and
+     * cpu_plugin_spec_vtime_resume puts this value back, so WP depth
+     * cannot drain the CP slice.  Deliberately OUTSIDE the
+     * cst_nofreeze() gate above: the budget rule must not silently
+     * change under that lever.
+     */
+    if (unlikely(cst_bq_on)) {
+        g_cst_bq_exc_low = cpu->neg.icount_decr.u16.low;
+        g_cst_bq_exc_low_active = true;
+        cst_bq_note_exc_save();
+    }
+#endif
 #ifdef CONFIG_PLUGIN
     cst_clkeq_note_pause();           /* #77 falsifier: excursion clock equality */
     cst_clkaudit_note_pause();        /* every root a guest clock derives from */
@@ -2430,6 +2491,18 @@ void cpu_plugin_spec_vtime_resume(CPUState *cpu)
      * (a no-op when icount is off or the record was never armed).
      */
     icount_plugin_thaw(cpu, &g_spec_icount_freeze);
+    /*
+     * Guest-insn slice bounding: the matching CP budget restore.  This
+     * function runs on BOTH excursion exits (normal wp_end and the
+     * abnormal longjmp cleanup), same as the thaw above, so the CP
+     * slice resumes with exactly the budget it entered with regardless
+     * of what the wrong path spent.
+     */
+    if (g_cst_bq_exc_low_active) {
+        cpu->neg.icount_decr.u16.low = g_cst_bq_exc_low;
+        g_cst_bq_exc_low_active = false;
+        cst_bq_note_exc_restore();
+    }
 #endif
     cpu->plugin_spec_vtime_paused = false;
 #ifdef CONFIG_PLUGIN
@@ -3064,6 +3137,53 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
     }
 
     /* Instruction counter expired.  */
+    if (unlikely(cst_bq_on) && !icount_enabled()) {
+        /*
+         * Guest-insn slice bounding (event-agency discipline): the
+         * mid-slice refill, mirroring the icount refill below MINUS all
+         * timekeeping: no icount_update (no VIRTUAL-clock credit), no
+         * icount_extra (the whole budget fits the u16), no deadline.
+         * The chain is already broken (*last_tb = NULL above), and the
+         * loop takes the normal cpu_handle_interrupt pass next
+         * iteration -- the icount execution shape exactly.  icount's
+         * shortened-TB regeneration (insns_left < tb->icount) is
+         * structurally unreachable here: quantum >= 512 = TCG_MAX_INSNS
+         * >= tb->icount, asserted.
+         */
+        cst_bq_note_breakout(cpu->neg.icount_decr.u16.low);
+        g_assert(tb->icount <= cst_bq_quantum);
+#if !defined(CONFIG_USER_ONLY)
+        /*
+         * Event-agency consumption (PRODUCT; see qemu/vclock-agency.h):
+         * THE product consumption site -- every consumption happens at
+         * a guest-insn slice breakout.  Predicate is the
+         * intervention-proven one: a FRESH qemu_clock_deadline_ns_all(
+         * VIRTUAL, ATTR_ALL) == 0 read (icount_handle_deadline's own
+         * test), NOT a cached compare.  Site+predicate were proven by
+         * the archival LX geometry (wave/locus 0/6) and replicated on
+         * this lineage by the trigger-site wave (wave/proddr PTB 0/6,
+         * VLX 0/6, vs dispatch-top P 6/6 and disarmed VOFF 6/6); the
+         * dispatch-top site and its VIRTUAL_RT nudge are the disproven
+         * geometry and were never landed.  The spec-mode skip lives
+         * inside vclock_agency_consume.  Delivery lag is bounded in
+         * GUEST-INSTRUCTION time by the slice quantum -- the quantum IS
+         * the discipline's delivery bound, which is why the slice
+         * bounding arms on the same plugin-install edge as the
+         * discipline itself.  A per-excursion consumption site was
+         * considered and rejected: it would run device callbacks from
+         * inside the plugin's emit path (exec_lock held, fragment walk
+         * in flight), where a callback-driven tb_flush is
+         * reentrancy-unsafe.
+         */
+        if (vclock_agency_engaged() &&
+            qemu_clock_deadline_ns_all(QEMU_CLOCK_VIRTUAL,
+                                       QEMU_TIMER_ATTR_ALL) == 0) {
+            vclock_agency_consume(cpu, true);
+        }
+#endif
+        cpu->neg.icount_decr.u16.low = cst_bq_quantum;
+        return;
+    }
     assert(icount_enabled());
 #ifndef CONFIG_USER_ONLY
     /* Ensure global icount has gone forward */
@@ -3088,10 +3208,79 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
 
 /* main execution loop */
 
+/*
+ * Guest-insn slice bounding posture guard, one-time.  Armed together
+ * with -icount, two disciplines would write icount_decr.u16.low (and
+ * the slice refill would shadow the real icount refill); armed in a
+ * user-mode binary, the WP save/restore bracket (softmmu-only
+ * cpu_plugin_spec_vtime_pause/_resume) does not exist.  The product
+ * arming edge (plugins/system.c) can produce neither state -- it
+ * declines under icount and is softmmu-only -- so this guard polices
+ * the CST_BUDGET_QUANTUM override, and the invariant if the arming
+ * edge ever changes.
+ */
+static void cst_bq_posture_check(void)
+{
+    static bool cst_bq_checked;
+
+    if (cst_bq_checked) {
+        return;
+    }
+    cst_bq_checked = true;
+#ifdef CONFIG_USER_ONLY
+    fprintf(stderr, "[CSTBQ] FATAL: guest-insn slice bounding is"
+            " system-mode only (the WP excursion budget bracket is"
+            " softmmu-only); refusing\n");
+    abort();
+#else
+    if (icount_enabled()) {
+        fprintf(stderr, "[CSTBQ] FATAL: guest-insn slice bounding and"
+                " -icount are both armed; two writers of"
+                " icount_decr.u16.low; refusing\n");
+        abort();
+    }
+#endif
+}
+
 static int __attribute__((noinline))
 cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
 {
     int ret;
+
+    /*
+     * Guest-insn slice bounding: the initial budget load, mirroring the
+     * outer u16.low load icount does in icount_prepare_for_run
+     * (tcg-accel-ops-icount.c) -- MINUS the deadline derivation (no
+     * clock coupling, no deadline read).  Nothing else writes u16.low
+     * on the default clock, so low==0 means "never seeded, or consumed
+     * to exactly zero"; both want a fresh quantum.  Mid-slice
+     * exhaustion reloads in cpu_loop_exec_tb, exactly where icount
+     * refills.
+     */
+    if (unlikely(cst_bq_on)) {
+        cst_bq_posture_check();
+        if (cpu->neg.icount_decr.u16.low == 0) {
+            cpu->neg.icount_decr.u16.low = cst_bq_quantum;
+            cst_bq_note_seed();
+        }
+    }
+#ifndef CONFIG_USER_ONLY
+    /*
+     * Event-agency posture (PRODUCT): an engaged exclusion whose
+     * consumer is unreachable is a livelock shape, not a lookalike to
+     * tolerate.  The product consumes ONLY at slice breakouts, so an
+     * active discipline REQUIRES the slice bounding armed -- the
+     * arming edge (plugins/system.c) arms both or neither, and this
+     * guard is the invariant's tripwire, not a second decision point.
+     */
+    if (unlikely(qatomic_read(&vclock_agency_active)) && !cst_bq_on) {
+        fprintf(stderr, "qemu: vclock-agency: FATAL: discipline active"
+                " with guest-insn slice bounding unarmed -- the"
+                " consumption site cannot be reached; the arming edge"
+                " is broken\n");
+        abort();
+    }
+#endif
 
     /* if an exception is pending, we execute it here */
     while (!cpu_handle_exception(cpu, &ret)) {

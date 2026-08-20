@@ -15,6 +15,7 @@
 #include "exec/insn-dataflow.h"
 #include "exec/cpu_ldst.h"
 #include "exec/plugin-gen.h"
+#include "qemu/cst_bqslice.h"
 #include "exec/oracle.h"
 #include "exec/cpu_ldst.h"
 #include "exec/tswap.h"
@@ -47,6 +48,20 @@ static TCGOp *gen_tb_start(DisasContextBase *db, uint32_t cflags)
 {
     TCGv_i32 count = NULL;
     TCGOp *icount_start_insn = NULL;
+    /*
+     * Guest-insn slice bounding (event-agency discipline; see
+     * qemu/cst_bqslice.h): emit the SAME budget prologue icount emits
+     * (the sub below and the st16 back to icount_decr.u16.low), on the
+     * default clock, with no other CF_USE_ICOUNT effect.  The exit
+     * check against u32 < 0 is the EXISTING !CF_NOIRQ check --
+     * unchanged.  CF_NOIRQ TBs are not billed: icount may bill them
+     * because higher-level code guarantees budget (and the replay
+     * exception step strips CF_USE_ICOUNT); off-icount an unchecked
+     * sub would wrap u16.low.  The arming edge precedes any
+     * translation (plugin install, before the machine starts), so
+     * every cached TB agrees.
+     */
+    bool cst_bq_bill = cst_bq_on && !(cflags & (CF_USE_ICOUNT | CF_NOIRQ));
 
     if ((cflags & CF_USE_ICOUNT) || !(cflags & CF_NOIRQ)) {
         count = tcg_temp_new_i32();
@@ -55,7 +70,7 @@ static TCGOp *gen_tb_start(DisasContextBase *db, uint32_t cflags)
                        - offsetof(ArchCPU, env));
     }
 
-    if (cflags & CF_USE_ICOUNT) {
+    if ((cflags & CF_USE_ICOUNT) || cst_bq_bill) {
         /*
          * We emit a sub with a dummy immediate argument. Keep the insn index
          * of the sub so that we later (when we know the actual insn count)
@@ -79,7 +94,7 @@ static TCGOp *gen_tb_start(DisasContextBase *db, uint32_t cflags)
         tcg_gen_brcondi_i32(TCG_COND_LT, count, 0, tcg_ctx->exitreq_label);
     }
 
-    if (cflags & CF_USE_ICOUNT) {
+    if ((cflags & CF_USE_ICOUNT) || cst_bq_bill) {
         tcg_gen_st16_i32(count, tcg_env,
                          offsetof(ArchCPU, parent_obj.neg.icount_decr.u16.low)
                          - offsetof(ArchCPU, env));
@@ -91,10 +106,13 @@ static TCGOp *gen_tb_start(DisasContextBase *db, uint32_t cflags)
 static void gen_tb_end(const TranslationBlock *tb, uint32_t cflags,
                        TCGOp *icount_start_insn, int num_insns)
 {
-    if (cflags & CF_USE_ICOUNT) {
+    if (icount_start_insn) {
         /*
          * Update the num_insn immediate parameter now that we know
-         * the actual insn count.
+         * the actual insn count.  Non-NULL exactly when gen_tb_start
+         * emitted the budget sub: always under CF_USE_ICOUNT
+         * (identical to the old CF_USE_ICOUNT test), and under
+         * guest-insn slice billing.
          */
         tcg_set_insn_param(icount_start_insn, 2,
                            tcgv_i32_arg(tcg_constant_i32(num_insns)));

@@ -30,6 +30,7 @@
 #include "system/cpu-timers.h"
 #include "qemu/main-loop.h"
 #include "qemu/notify.h"
+#include "qemu/vclock-agency.h"
 #include "qemu/guest-random.h"
 #include "exec/cpu-common.h"
 #include "tcg/startup.h"
@@ -108,10 +109,25 @@ static void rr_stop_kick_timer(void)
 static void rr_wait_io_event(void)
 {
     CPUState *cpu;
+    bool vagency_parked = false;
 
     while (all_cpu_threads_idle()) {
+        /*
+         * Event-agency halt rule: in single-threaded TCG this one
+         * thread IS the whole vCPU class, and it idles exactly when
+         * every vCPU is idle -- so its park is by construction the
+         * "all vCPU threads parked" lift edge (see
+         * qemu/vclock-agency.h).  Runs under the BQL.
+         */
+        if (!vagency_parked) {
+            vagency_parked = true;
+            vclock_agency_vcpu_park();
+        }
         rr_stop_kick_timer();
         qemu_cond_wait_bql(first_cpu->halt_cond);
+    }
+    if (vagency_parked) {
+        vclock_agency_vcpu_unpark();
     }
 
     rr_start_kick_timer();
@@ -206,6 +222,11 @@ static void *rr_cpu_thread_fn(void *arg)
             qemu_wait_io_event_common(cpu);
         }
     }
+
+    /* Event-agency: guest execution (and with it TB boundaries)
+     * begins here; the kick-off wait above needed no park because the
+     * thread had not onlined yet. */
+    vclock_agency_thread_online();
 
     rr_start_kick_timer();
 

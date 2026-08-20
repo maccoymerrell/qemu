@@ -61,6 +61,7 @@
 #include "tb-jmp-cache.h"
 #include "tb-hash.h"
 #include "tb-context.h"
+#include "qemu/cst_bqslice.h"
 #include "tb-internal.h"
 #include "internal-common.h"
 #include "internal-target.h"
@@ -215,6 +216,17 @@ void cpu_restore_state_from_tb(CPUState *cpu, TranslationBlock *tb,
         /*
          * Reset the cycle counter to the start of the block and
          * shift if to the number of actually executed instructions.
+         */
+        cpu->neg.icount_decr.u16.low += insns_left;
+    } else if (cst_bq_on && !(tb_cflags(tb) & CF_NOIRQ)) {
+        /*
+         * The identical refund for slice-billed TBs (gen_tb_start
+         * billed the whole TB at entry; a mid-TB unwind must give the
+         * unexecuted tail back, exactly as icount does above).  The
+         * arming edge precedes any translation, so any TB being
+         * unwound off-icount was billed iff !CF_NOIRQ.  Cannot
+         * overflow: low_at_entry <= quantum <= 0xffff and
+         * low_now + insns_left <= low_at_entry.
          */
         cpu->neg.icount_decr.u16.low += insns_left;
     }

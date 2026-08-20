@@ -253,6 +253,11 @@ static int plugin_load(struct qemu_plugin_desc *desc, const qemu_info_t *info, E
     ctx->installing = true;
     rc = install(ctx->id, info, desc->argc, desc->argv);
     ctx->installing = false;
+    if (rc == 0) {
+        /* PLUGIN-ACTIVE edge: a plugin is now loaded/instrumenting
+         * (event-agency discipline; idempotent, system-mode decides) */
+        qemu_plugin_vclock_agency_mode(true);
+    }
     if (rc) {
         error_setg(errp, "Could not load plugin %s: qemu_plugin_install returned error code %d",
                    desc->path, rc);
@@ -363,6 +368,11 @@ static void plugin_reset_destroy__locked(struct qemu_plugin_reset_data *data)
     success = g_hash_table_remove(plugin.id_ht, &ctx->id);
     g_assert(success);
     QTAILQ_REMOVE(&plugin.ctxs, ctx, entry);
+    if (QTAILQ_EMPTY(&plugin.ctxs)) {
+        /* PLUGIN-ACTIVE edge: the last plugin is gone -- restore stock
+         * VIRTUAL consumption (event-agency discipline) */
+        qemu_plugin_vclock_agency_mode(false);
+    }
     if (data->cb) {
         data->cb(ctx->id);
     }

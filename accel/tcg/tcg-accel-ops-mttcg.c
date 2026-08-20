@@ -30,6 +30,7 @@
 #include "qemu/main-loop.h"
 #include "qemu/notify.h"
 #include "qemu/guest-random.h"
+#include "qemu/vclock-agency.h"
 #include "hw/boards.h"
 #include "tcg/startup.h"
 #include "tcg-accel-ops.h"
@@ -84,6 +85,10 @@ static void *mttcg_cpu_thread_fn(void *arg)
     cpu_thread_signal_created(cpu);
     qemu_guest_random_seed_thread_part2(cpu->random_seed);
 
+    /* Event-agency: this thread now owns TB boundaries (it parks and
+     * unparks around its idle wait in qemu_wait_io_event). */
+    vclock_agency_thread_online();
+
     /* process any pending work */
     cpu->exit_request = 1;
 
@@ -117,6 +122,8 @@ static void *mttcg_cpu_thread_fn(void *arg)
         qemu_wait_io_event(cpu);
     } while (!cpu->unplug || cpu_can_run(cpu));
 
+    /* Event-agency: no boundaries from this thread anymore. */
+    vclock_agency_thread_offline();
     tcg_cpu_destroy(cpu);
     bql_unlock();
     rcu_remove_force_rcu_notifier(&force_rcu.notifier);

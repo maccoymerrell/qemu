@@ -38,6 +38,7 @@
 #include "hw/core/cpu.h"
 #include "system/cpu-timers.h"
 #include "system/cpu-timers-internal.h"
+#include "qemu/vclock-agency.h"
 
 /* clock and ticks */
 
@@ -496,7 +497,18 @@ static void do_nothing(CPUState *cpu, run_on_cpu_data unused)
 
 void qemu_timer_notify_cb(void *opaque, QEMUClockType type)
 {
-    if (!icount_enabled() || type != QEMU_CLOCK_VIRTUAL) {
+    /*
+     * Event-agency (PRODUCT): while engaged, a main-loop VIRTUAL
+     * notify must reach the CONSUMER of VIRTUAL deadlines -- the vCPU
+     * class -- not the iothread poll loop that no longer watches
+     * VIRTUAL.  The two branches below are icount's own; the product
+     * predicate simply rides the same gate.  While LIFTED (all vCPU
+     * threads parked) vclock_agency_engaged() is false and the stock
+     * qemu_notify_event() path serves the iothread, which owns VIRTUAL
+     * again for exactly that window.
+     */
+    if (!(icount_enabled() || vclock_agency_engaged()) ||
+        type != QEMU_CLOCK_VIRTUAL) {
         qemu_notify_event();
         return;
     }
@@ -529,4 +541,63 @@ void cpu_timers_init(void)
     seqlock_init(&timers_state.vm_clock_seqlock);
     qemu_spin_init(&timers_state.vm_clock_lock);
     vmstate_register(NULL, 0, &vmstate_timers, &timers_state);
+}
+
+/*
+ * Event-agency consumption (PRODUCT; see qemu/vclock-agency.h): run
+ * due QEMU_CLOCK_VIRTUAL timers in-thread, on the vCPU, at a
+ * guest-insn slice breakout the vCPU owns.  Mirrors
+ * icount_handle_deadline / icount_notify_aio_contexts in order: take
+ * the BQL if not held (the icount_prepare_for_run bracket),
+ * qemu_clock_notify(VIRTUAL) (wakes every VIRTUAL timerlist's notifier
+ * so AioContext-attached lists run in their home context, exactly as
+ * under icount), then qemu_clock_run_timers(VIRTUAL) (the main-loop
+ * list, here, in this thread).  The caller sits inside cpu_exec's RCU
+ * read section; QEMU RCU read sections are sleepable and
+ * BQL-inside-RCU is the cpu_handle_interrupt pattern, so callbacks
+ * must not synchronize_rcu -- none of the VIRTUAL device callbacks do.
+ *
+ * THE SMP RULE: ANY vCPU may consume at its own boundary under the BQL
+ * -- the sole consumer is the vCPU CLASS, not a designated vCPU.  No
+ * ownership handoff exists to get wrong: the BQL serializes concurrent
+ * boundaries, each consumption drains whatever is due, and a peer's
+ * boundary that loses the race finds nothing due and continues.  What
+ * the design forbids is the ASYNC agent racing excursion restore
+ * edges, not multiple ordered in-thread consumers.
+ *
+ * THE WRONG-PATH RULE: device timer callbacks never run inside a
+ * spec-mode excursion.  A boundary observed with plugin_spec_mode set
+ * is skipped and counted (vagency_spec_mode_skips, expected 0 -- the
+ * CP exec loop cannot run in spec mode; nonzero is a spec-escape
+ * witness, not grounds to abort).  A deadline that comes due while an
+ * excursion is in flight is consumed at the first slice breakout after
+ * the restore: the excursion brackets a boundary, its clock freeze
+ * makes entry and exit one guest instant, and the guest-insn slice
+ * budget (saved at excursion open, restored at close) guarantees the
+ * post-restore chain presents that breakout within one quantum --
+ * before the delivery bound the quantum states is ever exceeded.
+ */
+void vclock_agency_consume(CPUState *cpu, bool breakout_site)
+{
+#ifdef CONFIG_PLUGIN
+    if (unlikely(cpu->plugin_spec_mode)) {
+        vclock_agency_note_spec_skip();
+        return;
+    }
+#endif
+    bool unlock = false;
+
+    if (!bql_locked()) {
+        bql_lock();
+        unlock = true;
+    }
+    vclock_agency_boundary_begin();
+    qemu_clock_notify(QEMU_CLOCK_VIRTUAL);
+    qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
+    vclock_agency_boundary_end();
+    if (unlock) {
+        bql_unlock();
+    }
+    vclock_agency_note_consume();
+    vclock_agency_note_consume_site(breakout_site);
 }

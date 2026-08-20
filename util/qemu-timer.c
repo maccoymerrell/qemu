@@ -30,6 +30,7 @@
 #include "system/cpu-timers.h"
 #include "system/replay.h"
 #include "system/cpus.h"
+#include "qemu/vclock-agency.h"
 
 #ifdef CONFIG_POSIX
 #include <pthread.h>
@@ -143,7 +144,20 @@ static void qemu_clock_init(QEMUClockType type, QEMUTimerListNotifyCB *notify_cb
 
 bool qemu_clock_use_for_deadline(QEMUClockType type)
 {
-    return !(icount_enabled() && (type == QEMU_CLOCK_VIRTUAL));
+    /*
+     * Event-agency discipline (PRODUCT; see qemu/vclock-agency.h):
+     * while a TCG plugin is active and a vCPU thread is unparked, the
+     * vCPU class is the sole consumer of VIRTUAL deadlines and this
+     * predicate excludes VIRTUAL exactly as icount's own gate does --
+     * one predicate, both gated callers (the poll-timeout computation
+     * via timerlistgroup_deadline_ns and qemu_clock_run_all_timers).
+     * The halt rule lifts the exclusion when every vCPU thread parks
+     * (vclock_agency_engaged then reads false): with no boundaries
+     * left to consume at and no guest running, the iothread's stock
+     * consumption is race-free and required.
+     */
+    return !((icount_enabled() || vclock_agency_engaged()) &&
+             (type == QEMU_CLOCK_VIRTUAL));
 }
 
 void qemu_clock_notify(QEMUClockType type)
@@ -227,7 +241,21 @@ static bool vclock_processing_stalled(QEMUClockType type)
     }
     qatomic_set(&plugin_vclock_deadline_hidden, true);
     smp_mb();
-    return qatomic_read(&plugin_vclock_stall);
+    if (qatomic_read(&plugin_vclock_stall)) {
+        /*
+         * Event-agency witness: with the discipline engaged the
+         * iothread never evaluates a VIRTUAL deadline, so this
+         * per-excursion fence is redundant and a confirmed hide here
+         * must not happen.  Counted, never asserted (see the flatten
+         * criterion: the stall/hidden/Dekker machinery is only
+         * deleted once this counter has its witnesses).
+         */
+        if (vclock_agency_engaged()) {
+            vclock_agency_note_fence_hit();
+        }
+        return true;
+    }
+    return false;
 }
 
 void qemu_clock_plugin_stall_set(bool on)
@@ -552,6 +580,20 @@ void timer_mod_ns(QEMUTimer *ts, int64_t expire_time)
     qemu_mutex_unlock(&timer_list->active_timers_lock);
 
     if (rearm) {
+        /*
+         * Event-agency slot maintenance: a rearm means this timer
+         * became its list's head, i.e. a candidate clock-wide minimum.
+         * Fold it BEFORE timerlist_rearm's notify, so a reader woken
+         * by the notify sees a slot that already contains this
+         * deadline (witness only -- the product consumes on the fresh
+         * breakout-site read, never from the slot).
+         */
+        if (unlikely(qatomic_read(&vclock_agency_active)) &&
+            timer_list->clock->type == QEMU_CLOCK_VIRTUAL) {
+            vclock_agency_fold(expire_time,
+                               timer_list ==
+                               main_loop_tlg.tl[QEMU_CLOCK_VIRTUAL]);
+        }
         timerlist_rearm(timer_list);
     }
 }
@@ -575,6 +617,13 @@ void timer_mod_anticipate_ns(QEMUTimer *ts, int64_t expire_time)
         }
     }
     if (rearm) {
+        /* Event-agency slot maintenance -- see timer_mod_ns. */
+        if (unlikely(qatomic_read(&vclock_agency_active)) &&
+            timer_list->clock->type == QEMU_CLOCK_VIRTUAL) {
+            vclock_agency_fold(expire_time,
+                               timer_list ==
+                               main_loop_tlg.tl[QEMU_CLOCK_VIRTUAL]);
+        }
         timerlist_rearm(timer_list);
     }
 }
@@ -918,6 +967,18 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
     qemu_mutex_unlock(&timer_list->active_timers_lock);
 
 out:
+    /*
+     * Event-agency (PRODUCT): every VIRTUAL pass is classified (the
+     * foreign-consumer tripwire) and the slot re-derived -- running
+     * timers consumed heads, so the cached minimum must be raised to
+     * the new true head.  This is the only place the slot moves UP.
+     */
+    if (unlikely(qatomic_read(&vclock_agency_active)) &&
+        timer_list->clock->type == QEMU_CLOCK_VIRTUAL) {
+        vclock_agency_note_vpass(
+            timer_list == main_loop_tlg.tl[QEMU_CLOCK_VIRTUAL]);
+        vclock_agency_resync();
+    }
     qemu_event_set(&timer_list->timers_done_ev);
     return progress;
 }
@@ -1037,4 +1098,40 @@ int64_t qemu_clock_advance_virtual_time(int64_t dest)
     qemu_clock_notify(QEMU_CLOCK_VIRTUAL);
 
     return clock;
+}
+
+/*
+ * Event-agency resync: re-derive the cached next-due VIRTUAL witness
+ * slot from the timerlists themselves (the icount budget-recompute
+ * pattern without the ns->insn identity).  Protocol: reset the slot to
+ * INT64_MAX, then fold every list head under its lock.  A concurrent
+ * armer folds too (timer_mod inserts under the list lock BEFORE
+ * folding), so any timer armed before its fold is visible to this
+ * walk, and the fold itself is a monotone lower bound -- the slot can
+ * end stale-early, never stale-late.  Lives here because this file
+ * owns qemu_clocks[] and the per-list locks.
+ */
+void vclock_agency_resync(void)
+{
+    QEMUTimerList *tl;
+
+    if (!qatomic_read(&vclock_agency_active)) {
+        return;
+    }
+    vclock_agency_slot_reset();
+    QLIST_FOREACH(tl, &qemu_clocks[QEMU_CLOCK_VIRTUAL].timerlists, list) {
+        bool has = false;
+        int64_t expire = 0;
+
+        qemu_mutex_lock(&tl->active_timers_lock);
+        if (tl->active_timers) {
+            has = true;
+            expire = tl->active_timers->expire_time;
+        }
+        qemu_mutex_unlock(&tl->active_timers_lock);
+        if (has) {
+            vclock_agency_fold(expire,
+                               tl == main_loop_tlg.tl[QEMU_CLOCK_VIRTUAL]);
+        }
+    }
 }

@@ -16,6 +16,11 @@
 #include "hw/core/cpu.h"
 
 #include "plugin.h"
+#include "qemu/timer.h"
+#include "qemu/vclock-agency.h"
+#include "qemu/cst_bqslice.h"
+#include "system/cpu-timers.h"
+#include "system/tcg.h"
 
 void qemu_plugin_fillin_mode_info(qemu_info_t *info)
 {
@@ -382,4 +387,43 @@ void qemu_plugin_vm_reset_wait_placed(void)
         qemu_cond_wait_bql(&plugin_reset_placed_cond);
     }
     plugin_reset_deferred = false;
+}
+
+/*
+ * Event-agency arming (PRODUCT; see qemu/vclock-agency.h).  The
+ * condition is PLUGIN-ACTIVE -- a runtime fact decided at the plugin
+ * loader's install/uninstall edges -- never an environment knob.
+ *
+ * Arming turns on BOTH halves of the discipline: the VIRTUAL
+ * exclusion/consumption side (vclock_agency_set_active) and the
+ * guest-insn slice bounding whose breakouts carry the consumption
+ * (cst_bq_product_arm) -- the delivery bound IS the slice quantum, so
+ * the two are one product decision, armed on one edge.  There is no
+ * wake timer: the trigger-site wave (wave/proddr) proved the
+ * dispatch-top trigger and its VIRTUAL_RT nudge are the disproven
+ * geometry, and the slice breakout needs no real-time wake.
+ */
+void qemu_plugin_vclock_agency_mode(bool active)
+{
+    if (active) {
+        /*
+         * Under icount the deadline-consumption discipline is already
+         * icount's own (same predicate, same notify branch, plus the
+         * real warp timer); under a non-TCG accel there are no TB
+         * boundaries to consume at.  Both leave stock behaviour.
+         */
+        if (icount_enabled() || !tcg_enabled()) {
+            return;
+        }
+        /* the slice half arms first so no engaged window can exist
+         * without its consumption sites */
+        cst_bq_product_arm();
+        vclock_agency_set_active(true);
+        /* fold in every VIRTUAL timer armed before the plugin loaded
+         * (witness slot; the consumption predicate is the fresh
+         * breakout-site read) */
+        vclock_agency_resync();
+    } else {
+        vclock_agency_set_active(false);
+    }
 }

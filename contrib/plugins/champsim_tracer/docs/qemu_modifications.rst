@@ -1041,6 +1041,89 @@ Interrupt replay across the wrong-path rollback
    rest of the speculative state.  Timer bits stay out of the replay —
    the resync re-derives them from the architected compare registers.
 
+   MIPS follows the RISC-V shape at ``cpu_mips_irq_request``, the
+   single BQL-held funnel through which every device writer of
+   ``CP0_Cause.IP7..IP2`` passes (those bits are read-only to the
+   guest, so every in-window writer is external): the device's
+   set/clear delta is recorded in complementary masks placed after
+   ``end_reset_fields`` -- outside the snapshot, so the restore cannot
+   rewind the record itself -- and the excursion-exit restore reads,
+   rewinds, re-applies and zeroes the record as one BQL bracket.  The
+   replay applies the device's last level, not a sticky OR.
+   ``Cause.TI`` stays with the timer reconcile and the software bits
+   ``IP1..IP0`` are guest-written architectural state, correctly
+   rolled back with the snapshot.
+
+Event-evaluation agency (system mode)
+-------------------------------------
+
+On the default clock, ``QEMU_CLOCK_VIRTUAL`` deadlines are evaluated
+by the iothread, concurrently with guest execution.  A real core has
+no such second agent: it is the sole, synchronous evaluator of its own
+pending events, at instruction boundaries it owns, and speculation
+cannot interact with event evaluation at all.  While the tracer's
+wrong-path machinery runs, that concurrent agent is exactly what every
+excursion pauses, hides from and races -- so while a TCG plugin
+instruments in system mode, the vCPU class becomes the sole consumer
+of ``QEMU_CLOCK_VIRTUAL``.  The discipline arms at the plugin loader's
+install edge -- a runtime condition, never an environment knob -- and
+declines under ``-icount`` (whose own deadline discipline it mirrors)
+and under non-TCG accelerators.  Four pieces
+(``include/qemu/vclock-agency.h`` carries the full design):
+
+``Guest-insn slice bounding`` (``include/qemu/cst_bqslice.h``)
+
+   Every translation block bills its instruction count against
+   ``icount_decr.u16.low`` exactly as icount's translated prologue
+   does, with none of icount's timekeeping; an exhausted slice breaks
+   the TB chain out to the refill in ``cpu_loop_exec_tb``.  The slice
+   quantum is the discipline's **delivery bound**, stated in guest
+   instructions: 65535 by default -- the ``u16`` cadence icount itself
+   runs at whenever a deadline exceeds the ``u16`` budget --
+   overridable through ``CST_BUDGET_QUANTUM`` in ``[512, 65535]``.
+   A mid-TB unwind refunds the unexecuted tail; a wrong-path dispatch
+   runs on its own full quantum, with the correct path's remaining
+   budget saved at excursion open and restored at close, so wrong-path
+   depth can never drain the correct path's slice.
+
+``Consumption at the slice breakout`` (``accel/tcg/cpu-exec.c``)
+
+   At each slice exhaustion the vCPU evaluates a fresh
+   ``qemu_clock_deadline_ns_all(VIRTUAL, ATTR_ALL) == 0`` read --
+   ``icount_handle_deadline``'s own test -- and, when due, runs
+   VIRTUAL timers in-thread under the BQL
+   (``vclock_agency_consume``).  Any vCPU may consume at its own
+   boundary; the BQL serializes concurrent boundaries and a peer that
+   loses the race finds nothing due.  A boundary observed inside a
+   wrong-path excursion is skipped and counted -- device timer
+   callbacks never run on the wrong path's watch.
+
+``The exclusion`` (``util/qemu-timer.c``, ``system/cpu-timers.c``)
+
+   While engaged, ``qemu_clock_use_for_deadline(VIRTUAL)`` reads
+   false -- the identical single predicate icount extends -- so the
+   iothread neither polls on nor runs main-loop VIRTUAL timers, and
+   ``qemu_timer_notify_cb`` redirects VIRTUAL notifies to the vCPU
+   class instead of the iothread poll loop.
+
+``The halt rule`` (``system/cpus.c``)
+
+   When the last vCPU thread parks in its idle wait the exclusion
+   lifts and the iothread consumes VIRTUAL normally: no boundaries
+   exist to consume at, no guest runs, so the race this design removes
+   cannot occur while lifted.  The park edge notifies the iothread so
+   its poll timeout is recomputed with VIRTUAL; the unpark edge
+   re-engages.  There is no timed wait and no watchdog shape -- the
+   lift is exact.
+
+The module keeps five tripwire counters (consumption liveness,
+spec-mode skips, stall-fence hits, foreign VIRTUAL passes, AioContext
+VIRTUAL arms); they count and warn once, never gate, and an exit
+report prints only when one fired.  A cached next-due deadline slot is
+maintained as a witness for external samplers; nothing in the
+discipline consumes from it -- the consumption predicate is always the
+fresh breakout-site read.
+
 Speculative-execution support
 -----------------------------
 

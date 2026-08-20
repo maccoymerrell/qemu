@@ -67,6 +67,28 @@ static void cpu_mips_irq_request(void *opaque, int irq, int level)
      * (mirror of the riscv path, #77).
      */
     if (cs->plugin_spec_mode || cs->plugin_spec_vtime_paused) {
+        /*
+         * A device raise is not speculative: the qatomic above just landed
+         * it in a Cause word the walk-end restore is about to rewind, which
+         * would silently drop a real interrupt (UART, GIC, IPI) -- unlike
+         * the timer bit there is no compare register to re-derive it from.
+         * Record the externally-caused delta for the restore to replay.
+         * Complementary set/clear, so the replay applies the device's LAST
+         * level, not a sticky OR.  IP7..IP2 only: IP1..IP0 arrive here from
+         * the guest's own (speculative, therefore discardable) Cause writes
+         * via cpu_mips_soft_irq.  The BQL this function holds is what orders
+         * the record against the replay's own BQL bracket.
+         */
+        if (irq >= 2) {
+            uint32_t bit = 1 << (irq + CP0Ca_IP);
+            if (level) {
+                env->plugin_ext_ip_set |= bit;
+                env->plugin_ext_ip_clear &= ~bit;
+            } else {
+                env->plugin_ext_ip_clear |= bit;
+                env->plugin_ext_ip_set &= ~bit;
+            }
+        }
         cs->plugin_spec_irq_dirty = true;
         return;
     }

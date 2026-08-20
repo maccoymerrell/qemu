@@ -1206,6 +1206,25 @@ typedef struct CPUArchState {
     struct {} end_reset_fields;
 
     /* Fields from here on are preserved across CPU reset. */
+#ifdef CONFIG_PLUGIN
+    /*
+     * External-interrupt replay across a wrong-path (speculative) excursion.
+     * CP0_Cause sits inside the register snapshot, so the excursion-exit
+     * restore rewinds it -- including IP7..IP2 bits a device asserted or
+     * deasserted DURING the excursion, which are real and must survive.
+     * cpu_mips_irq_request is the single funnel for every writer of those
+     * bits (they are read-only to the guest: cpu_mips_store_cause's write
+     * mask excludes them, so every in-window writer IS external); it records
+     * the delta here and the restore replays it over the rewound Cause.
+     * Cause.TI stays out of the delta (the timer reconcile owns it) and
+     * IP1..IP0 are guest-written architectural state, correctly rolled back.
+     * Deliberately placed after end_reset_fields so the record is outside
+     * the snapshot and cannot itself be rolled back.  See the replay comment
+     * in cpu_plugin_arch_state_restore.
+     */
+    uint32_t plugin_ext_ip_set;      /* externally raised during excursion */
+    uint32_t plugin_ext_ip_clear;    /* externally lowered during excursion */
+#endif
     CPUMIPSMVPContext *mvp;
 #if !defined(CONFIG_USER_ONLY)
     CPUMIPSTLBContext *tlb;

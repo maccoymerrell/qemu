@@ -1311,15 +1311,66 @@ void cpu_plugin_arch_state_restore(void *saved, size_t size)
      * A restore that rolls CP0_Count/Compare back is reconciled by
      * mips_cpu_plugin_resync_timers, which re-arms from the restored compare
      * on every excursion exit whether or not anything here noticed the
-     * rollback.  Nothing is recorded before the memcpy, because the live env
-     * cannot gain a Cause.TI the snapshot lacks.  The excursion window opens
-     * BEFORE the snapshot is taken and under the BQL, so every caller of
-     * cpu_mips_timer_expire sees the flags: mips_timer_cb runs from the main
-     * loop holding that same BQL, and the other two run on this vCPU thread.
-     * The gate therefore always returns, and a speculative MTC0 can only
-     * CLEAR Cause.TI, never set it.
+     * rollback.  Nothing is recorded for the TIMER before the memcpy,
+     * because the live env cannot gain a Cause.TI the snapshot lacks.  The
+     * excursion window opens BEFORE the snapshot is taken and under the BQL,
+     * so every caller of cpu_mips_timer_expire sees the flags: mips_timer_cb
+     * runs from the main loop holding that same BQL, and the other two run
+     * on this vCPU thread.  The gate therefore always returns, and a
+     * speculative MTC0 can only CLEAR Cause.TI, never set it.
+     *
+     * Rollback with EXTERNAL REPLAY (the riscv mip pattern above, adapted).
+     * Cause.IP1..IP0 are guest-written architectural state and Cause.TI is
+     * owed by the timer machinery, so rewinding those with the snapshot is
+     * exactly right.  But IP7..IP2 are read-only to the guest --
+     * cpu_mips_store_cause's write mask excludes them -- so every in-window
+     * writer of those bits is an external device (i8259/CBUS UART lines,
+     * GIC, IPIs) whose raise is real, and unlike the timer bit there is no
+     * compare register to re-derive it from: rewinding it silently drops the
+     * interrupt.  cpu_mips_irq_request records the externally-caused delta;
+     * replay it over the rewound Cause.
+     *
+     * Read the record, rewind, re-apply and zero as ONE BQL bracket.
+     * cpu_mips_irq_request is the record's only writer and holds the BQL, so
+     * the bracket is what orders the replay against a concurrent iothread
+     * raise: without it a raise landing between the mask read and the reset
+     * below is zeroed unread -- neither kept in Cause (the memcpy rewound
+     * its qatomic_or) nor replayed.  The lock is taken once per excursion
+     * (the two callers are the normal wp_end restore and the abnormal
+     * longjmp cleanup, mutually exclusive excursion exits; fault-skip does
+     * not restore mid-excursion), and the ordering -- plugin walk lock, then
+     * BQL -- is the one cpu_plugin_spec_vtime_pause already establishes on
+     * this thread.  The masks live after end_reset_fields, outside the
+     * snapshot, so the memcpy cannot roll the record itself back.  Zeroing
+     * them here is the consume-once step; the reset at window open
+     * (cpu_plugin_spec_vtime_pause) clears anything recorded after this
+     * consume, so the NEXT excursion cannot replay a raise the guest may
+     * have acknowledged in between.  The exit reconcile
+     * (mips_cpu_plugin_resync_timers -> cpu_mips_plugin_reconcile_irq) then
+     * recomputes CPU_INTERRUPT_HARD from the now-correct Cause, so a
+     * replayed raise produces its kick edge through the reconcile.
      */
-    memcpy(env, saved, size);
+    {
+        bool need_bql = !bql_locked();
+        uint32_t replay_set, replay_clear;
+
+        if (need_bql) {
+            bql_lock();
+        }
+        replay_set = env->plugin_ext_ip_set;
+        replay_clear = env->plugin_ext_ip_clear;
+        memcpy(env, saved, size);
+        /* Atomic for the same reason as cpu_mips_irq_request's own update:
+         * a peer VPE's mttc0 read-modify-write of this whole word runs on
+         * its vCPU thread without the BQL. */
+        qatomic_or(&env->CP0_Cause, replay_set);
+        qatomic_and(&env->CP0_Cause, ~replay_clear);
+        env->plugin_ext_ip_set = 0;
+        env->plugin_ext_ip_clear = 0;
+        if (need_bql) {
+            bql_unlock();
+        }
+    }
     /* Timer resync deferred to cpu_plugin_spec_vtime_resume -- see #77. */
 #else
     memcpy(env, saved, size);
@@ -2322,6 +2373,23 @@ void cpu_plugin_spec_vtime_pause(CPUState *cpu)
         CPURISCVState *renv = cpu_env(cpu);
         renv->plugin_spec_mip_set = 0;
         renv->plugin_spec_mip_clear = 0;
+    }
+#endif
+#if defined(TARGET_MIPS) && defined(CONFIG_PLUGIN)
+    /*
+     * Same rule for the mips external Cause.IP record: start it empty, under
+     * the same BQL hold that opens the window (cpu_mips_irq_request, the
+     * record's only writer, takes the BQL for its update).  The consume-then-
+     * reset argument is the riscv comment above, verbatim: a raise recorded
+     * after the restore's consume and before this window closes is already
+     * live in CP0_Cause (nothing rewinds it after the restore), and clearing
+     * the residue here keeps the NEXT excursion's replay from resurrecting
+     * an interrupt the guest may have acknowledged in between.
+     */
+    {
+        CPUMIPSState *menv = cpu_env(cpu);
+        menv->plugin_ext_ip_set = 0;
+        menv->plugin_ext_ip_clear = 0;
     }
 #endif
     cpu->plugin_spec_vtime_paused = true;

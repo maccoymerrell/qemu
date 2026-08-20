@@ -127,25 +127,6 @@ _ISA_BOOT = {
                 "extra_append": "ieee754=relaxed"},
 }
 
-# Per-ISA CPU override used only when more than one vCPU is asked for.
-#
-# mipsel: P5600 cannot be brought up multi-vCPU under QEMU.  malta routes
-# -smp >1 on a Config3.CMGCR CPU through the CPS block, and QEMU's CPS
-# models N vCPUs as N VPs inside ONE core (hw/misc/mips_cmgcr.c returns 0
-# for GCR_CONFIG, so PCORES == 0), while Linux only counts more than one VP
-# per core when the CPU has the MT ASE or the Release 6 VP bit
-# (mips_cps_numvps(), arch/mips/include/asm/mips-cps.h).  P5600 is MIPS32r5
-# with neither, so the topology comes out {1} total 1 and the guest boots
-# single-CPU.  34Kf has the MT ASE and no CMGCR, so it takes malta's
-# non-CPS path and Linux's MT SMVP bring-up, which does online every vCPU.
-# The cost is that 34Kf has no Config3.PW: a multi-vCPU mipsel guest and a
-# guest with CP0_PWBase are, today, mutually exclusive.  ONLINE_CPUS_RE
-# below turns any silent fallback into a failure rather than a quiet
-# single-CPU run.
-_ISA_SMP_CPU = {
-    "mipsel": "34Kf",
-}
-
 # The kernel's own count of the vCPUs it actually onlined.  A cell that asks
 # for N vCPUs and silently gets one is not an SMP cell; every check that
 # depends on concurrency then passes for the wrong reason.

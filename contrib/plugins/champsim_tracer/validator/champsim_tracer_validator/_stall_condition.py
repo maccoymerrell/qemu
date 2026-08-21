@@ -231,6 +231,19 @@ STALL_FRACTION_MAX = 0.50
 #: cell's output so a drift toward the gate is visible before it trips.
 STALL_FRACTION_NOTE = 0.25
 
+#: ABSOLUTE abnormality floor for the EXACT stretch (see "EXACT ACCOUNTING"
+#: below).  A stretch must be large in absolute architectural terms before its
+#: fraction of a small segment is evidence of the condition: the ratio alone
+#: convicts micro-windows whose one timer tick dominates a tiny denominator.
+#: Derivation, all measured: the 1350-cell corpus's healthy maximum
+#: worst_user_stall is 44,703 (kickcatch capstone band 19,980-44,703 agrees);
+#: the SMALLEST escaped instance on record is tip_L3R37 at ~368k
+#: (0.605 x 609,223), then 4.6M and 6.6M.  100,000 sits 2.2x above the
+#: healthy maximum and 3.7x below the smallest escaped instance — a margin
+#: on both sides, from data, not taste.  A stretch under the floor is still
+#: REPORTED with its composition; it just cannot fail the cell on a ratio.
+STALL_ABS_MIN = 100_000
+
 #: Operational override, for positive controls and for re-measuring the band.
 #: Reading it is logged by :func:`threshold` so a lowered gate can never be
 #: mistaken for the shipped one.
@@ -310,6 +323,10 @@ def threshold() -> tuple[float, str]:
 # --------------------------------------------------------------------------
 
 _RT_LINE = re.compile(r"^champsim_tracer: guest_realtime (.*)$", re.M)
+_EX_LINE = re.compile(r"^champsim_tracer: stretch_exact (.*)$", re.M)
+_EXRING_LINE = re.compile(
+    r"^champsim_tracer: stretch_ring n=(\d+) stride=(\d+) pcs=([0-9a-f,]+)$",
+    re.M)
 _KV = re.compile(r"([a-z_]+)=([^\s]+)")
 _ICOUNT_LINE = re.compile(
     r"^champsim_tracer: host_icount=(\d+) traced_icount=(\d+)"
@@ -338,6 +355,33 @@ class RtReport:
     #: segment (``segment_insns=`` in the guest_realtime line).  None on a
     #: report written before the plugin printed it.
     segment_insns_exact: int | None = None
+    #: EXACT stretch accounting (the ``stretch_exact`` line): per-TB, no
+    #: sampling grid, no certification arithmetic.  None on a report written
+    #: before the plugin kept it.
+    ex: dict | None = None
+    #: Strided TB start PCs of the worst stretch, for naming kernel work
+    #: offline against the guest kernel's symbol map.
+    ex_ring: list | None = None
+
+    @property
+    def stall_fraction_exact(self) -> float | None:
+        if self.ex is None:
+            return None
+        seg = self.segment_insns
+        if seg <= 0:
+            return None
+        return self.ex["worst"] / seg
+
+    def ex_composition(self) -> str:
+        e = self.ex or {}
+        w = max(1, e.get("worst", 0))
+        return ("async=%d(%.0f%%) kern_gated=%d kern_foreign=%d "
+                "user_foreign=%d user_gated=%d; traced_user=%d "
+                "machine_user=%d"
+                % (e.get("async", 0), 100.0 * e.get("async", 0) / w,
+                   e.get("kern_gated", 0), e.get("kern_foreign", 0),
+                   e.get("user_foreign", 0), e.get("user_gated", 0),
+                   e.get("traced_user", 0), e.get("machine_user", 0)))
 
     @property
     def segment_insns(self) -> float:
@@ -415,13 +459,25 @@ def parse_rt_report(stats_text: str) -> RtReport | None:
         return None
     body = m.group(1)
     kv = dict(_KV.findall(body))
+    ex = None
+    exm = _EX_LINE.search(stats_text)
+    if exm:
+        try:
+            ex = {k: int(v) for k, v in _KV.findall(exm.group(1))}
+        except ValueError:
+            ex = None
+    ex_ring = None
+    rm = _EXRING_LINE.search(stats_text)
+    if rm:
+        ex_ring = [int(x, 16) for x in rm.group(3).split(",") if x]
     ic = _ICOUNT_LINE.search(stats_text)
     traced = int(ic.group(2)) if ic else None
     arch = int(ic.group(4)) if ic else None
     if "factor" not in kv or kv["factor"] == "n/a":
         return RtReport(measurable=False,
                         why_not=body.strip(),
-                        traced_icount=traced, trace_arch_insns=arch)
+                        traced_icount=traced, trace_arch_insns=arch,
+                        ex=ex, ex_ring=ex_ring)
     try:
         return RtReport(
             measurable=True,
@@ -433,7 +489,8 @@ def parse_rt_report(stats_text: str) -> RtReport | None:
             stall_detector=kv.get("stall_detector", ""),
             segment_insns_exact=(int(kv["segment_insns"])
                                  if "segment_insns" in kv else None),
-            traced_icount=traced, trace_arch_insns=arch)
+            traced_icount=traced, trace_arch_insns=arch,
+            ex=ex, ex_ring=ex_ring)
     except (KeyError, ValueError) as e:
         return RtReport(measurable=False,
                         why_not=f"unparsable guest_realtime line ({e}): {body}",
@@ -529,7 +586,72 @@ def assess(stats_path: Path, label: str = "",
     lines.append(f"stall[{label}]: {describe(r)}")
 
     if excuse is not None:
-        lines.append(f"stall[{label}]: NOT GATED — {excuse}")
+        comp = (f"  Measured composition of the worst stretch (exact): "
+                f"{r.ex_composition()}." if r.ex is not None else "")
+        lines.append(f"stall[{label}]: NOT GATED — {excuse}.{comp}")
+        return Verdict(True, lines)
+
+    # ------------------------------------------------------------------
+    # EXACT PATH.  A report carrying the ``stretch_exact`` line was made by
+    # the per-TB tracker: the numerator is exact in both directions, so the
+    # sampling-resolution machinery below (NOT CERTIFIED, the ub bound) does
+    # not apply, and the stretch arrives with its own composition.  Two-term
+    # verdict: the fraction says the stretch dominated its segment, and the
+    # ABSOLUTE floor (:data:`STALL_ABS_MIN`, derivation at the definition)
+    # says the stretch is large enough to be abnormal at all.  A micro-window
+    # whose single timer tick dominates a tiny denominator fails the first
+    # term and not the second — that is the measured resolution of the
+    # 21/386 capstone red (PHASE1_CAPSTONE.md §2): every such stretch sat
+    # inside the healthy absolute band and decomposed as asynchronous
+    # interrupt work plus in-context kernel service, with zero foreign
+    # activity.  The composition is printed either way, and a genuinely
+    # large stretch still fails exactly as before — with its content named.
+    # ------------------------------------------------------------------
+    if r.ex is not None:
+        wex = r.ex.get("worst", 0)
+        disj = float(wex) + float(r.traced_icount or 0)
+        if disj > r.segment_insns * (1.0 + 1e-9):
+            lines.append(
+                f"stall[{label}]: NOT SCOREABLE  the exact report "
+                f"contradicts itself: stretch worst {wex} plus traced_icount "
+                f"{r.traced_icount} exceeds segment_insns "
+                f"{r.segment_insns:.0f}.  A defect in the measurement, not "
+                f"a stall.")
+            return Verdict(True, lines, not_certified=True)
+        sfe = r.stall_fraction_exact
+        comp = r.ex_composition()
+        ringtxt = ""
+        if r.ex_ring:
+            ringtxt = ("  Stretch PCs (strided): " +
+                       ",".join("%x" % pc for pc in r.ex_ring[:16]) +
+                       ("..." if len(r.ex_ring) > 16 else ""))
+        if sfe is not None and sfe > gate and wex >= STALL_ABS_MIN:
+            lines.append(
+                f"stall[{label}]: FAIL  exact stall_fraction {sfe:.3f} "
+                f"exceeds {gate:.3f} [{prov}] AND the stretch ({wex} insns) "
+                f"exceeds the absolute abnormality floor "
+                f"({STALL_ABS_MIN}): {wex} of the {r.segment_insns:.0f} "
+                f"instructions the guest retired while the capture was open "
+                f"fell inside ONE stretch in which the traced process did "
+                f"not retire a single user-space instruction.  Composition: "
+                f"{comp}.{ringtxt}")
+            return Verdict(False, lines)
+        if sfe is not None and sfe > gate:
+            lines.append(
+                f"stall[{label}]: PASS (micro-window adjudicated)  exact "
+                f"stall_fraction {sfe:.3f} is over {gate:.3f}, but the "
+                f"stretch itself ({wex} insns) sits inside the healthy "
+                f"absolute band (corpus healthy max 44,703; smallest escaped "
+                f"instance ~368k; floor {STALL_ABS_MIN}).  A ratio on a "
+                f"segment this small measures where one interrupt landed, "
+                f"not workload health.  Composition: {comp}.{ringtxt}")
+            return Verdict(True, lines)
+        if sfe is not None and sfe > STALL_FRACTION_NOTE:
+            lines.append(
+                f"stall[{label}]: note  exact stall_fraction {sfe:.3f} is "
+                f"above the measured healthy band "
+                f"({STALL_FRACTION_NOTE:.2f}) but under the gate "
+                f"({gate:.3f}) [{prov}].  Composition: {comp}.")
         return Verdict(True, lines)
 
     # ------------------------------------------------------------------

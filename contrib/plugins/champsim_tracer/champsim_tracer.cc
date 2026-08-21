@@ -2814,9 +2814,144 @@ struct RtFactorGate {
         _exit(CST_RT_GATE_EXIT);
     }
 
+    /*
+     * #113: EXACT workload-progress stretch accounting.  The sampled
+     * worst_user_stall above observes the user clock only at sample
+     * boundaries, so its bias has no reliable direction on a bursty
+     * workload and a short segment cannot be certified at any cadence
+     * (see validator _stall_condition.py, RESOLUTION).  This tracker is
+     * the replacement: it runs on EVERY correct-path TB, under exec_lock,
+     * and maintains the current no-traced-user stretch exactly — worst
+     * value, composition by (async | kernel/user x gated/foreign), a
+     * machine-wide user-privilege retirement count (the count the gate's
+     * OFF_CPU_WORKLOADS ambiguity needs), and a strided ring of TB start
+     * PCs so a kernel-only stretch can be NAMED offline against the guest
+     * kernel's symbol map.  A handful of integer ops per TB; counters
+     * feeding a report, never a gate on the trace path.  On an SMP guest
+     * the retirement delta between notes is a cross-vCPU high-water delta
+     * attributed to the observing TB's class — exact on a uniprocessor
+     * guest, an attribution approximation under SMP (the worst/stretch
+     * totals stay exact either way).
+     */
+    static constexpr unsigned EX_RING = 64;
+    static constexpr uint64_t EX_RING_STRIDE = 256;
+    struct {
+        bool     active = false;
+        bool     worst_is_cur = false;
+        uint64_t last_icnt = 0;
+        uint64_t last_user = 0;
+        uint64_t cur = 0, cur_async = 0, cur_kg = 0, cur_kf = 0,
+                 cur_uf = 0, cur_ug = 0;
+        uint64_t ring_pc[EX_RING]; unsigned ring_n = 0; uint64_t ring_next = 0;
+        uint64_t worst = 0, w_async = 0, w_kg = 0, w_kf = 0,
+                 w_uf = 0, w_ug = 0;
+        uint64_t w_ring[EX_RING]; unsigned w_ring_n = 0;
+        uint64_t user_foreign_total = 0;
+        uint64_t traced_user_total  = 0;
+    } ex;
+
+    void ex_snapshot_ring(void)
+    {
+        if (ex.worst_is_cur) {
+            memcpy(ex.w_ring, ex.ring_pc, sizeof(ex.ring_pc));
+            ex.w_ring_n = ex.ring_n;
+            ex.worst_is_cur = false;
+        }
+    }
+
+    void ex_reset_stretch(void)
+    {
+        ex.cur = ex.cur_async = ex.cur_kg = ex.cur_kf = 0;
+        ex.cur_uf = ex.cur_ug = 0;
+        ex.ring_n = 0;
+        ex.ring_next = EX_RING_STRIDE;
+    }
+
+    void note_tb_exact(bool seg_active, bool async, bool kernel, bool gated,
+                       uint64_t pc)
+    {
+        uint64_t icnt = icount_hwm();
+        if (!seg_active) {
+            if (ex.active) {
+                ex_snapshot_ring();
+                ex.active = false;
+            }
+            return;
+        }
+        if (!ex.active) {
+            ex.active = true;
+            ex.last_icnt = icnt;
+            ex.last_user = g_user_icount;
+            ex_reset_stretch();
+        }
+        uint64_t d = icnt > ex.last_icnt ? icnt - ex.last_icnt : 0;
+        ex.last_icnt = icnt;
+        if (d) {
+            ex.cur += d;
+            if (async) {
+                ex.cur_async += d;
+            } else if (kernel) {
+                (gated ? ex.cur_kg : ex.cur_kf) += d;
+            } else if (gated) {
+                ex.cur_ug += d;
+            } else {
+                ex.cur_uf += d;
+                ex.user_foreign_total += d;
+            }
+            if (ex.cur >= ex.ring_next) {
+                ex.ring_pc[ex.ring_n % EX_RING] = pc;
+                ex.ring_n++;
+                ex.ring_next += EX_RING_STRIDE;
+            }
+            if (ex.cur > ex.worst) {
+                ex.worst  = ex.cur;
+                ex.w_async = ex.cur_async;
+                ex.w_kg = ex.cur_kg; ex.w_kf = ex.cur_kf;
+                ex.w_uf = ex.cur_uf; ex.w_ug = ex.cur_ug;
+                ex.worst_is_cur = true;
+            }
+        }
+        uint64_t u = g_user_icount;
+        if (u != ex.last_user) {
+            /* Advance, or an epoch reset (pin zeroes the clock): either
+             * way the stretch is over. */
+            if (u > ex.last_user) {
+                ex.traced_user_total += u - ex.last_user;
+            }
+            ex.last_user = u;
+            ex_snapshot_ring();
+            ex_reset_stretch();
+        }
+    }
+
+    void ex_report(GString *out)
+    {
+        ex_snapshot_ring();
+        g_string_append_printf(out,
+            "champsim_tracer: stretch_exact worst=%" PRIu64
+            " async=%" PRIu64 " kern_gated=%" PRIu64 " kern_foreign=%" PRIu64
+            " user_foreign=%" PRIu64 " user_gated=%" PRIu64
+            " traced_user=%" PRIu64 " machine_user=%" PRIu64 "\n",
+            ex.worst, ex.w_async, ex.w_kg, ex.w_kf, ex.w_uf, ex.w_ug,
+            ex.traced_user_total,
+            ex.traced_user_total + ex.user_foreign_total);
+        if (ex.w_ring_n) {
+            unsigned n = ex.w_ring_n < EX_RING ? ex.w_ring_n : EX_RING;
+            g_string_append_printf(out,
+                "champsim_tracer: stretch_ring n=%u stride=%" PRIu64 " pcs=",
+                ex.w_ring_n, EX_RING_STRIDE);
+            for (unsigned i = 0; i < n; i++) {
+                g_string_append_printf(out, "%s%" PRIx64, i ? "," : "",
+                                       ex.w_ring[i]);
+            }
+            g_string_append_printf(out, "\n");
+        }
+    }
+
     void report(GString *out)
     {
         close_segment();
+        ex_report(out);
         if (!supported || tot_host_ns <= 0) {
             g_string_append_printf(out,
                 "champsim_tracer: guest_realtime factor=n/a "
@@ -8876,8 +9011,15 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
      * same cross-vCPU class the cpu_index-array conversion just retired).
      * Amortised 1-in-1024 internally; g_user_icount, which the stall
      * detector reads, is likewise exec_lock-owned. */
-    g_rt_gate.note_tb(g_capture_mute, icount_prev);
-    g_rt_gate.tick(g_trace_segments.is_active_atomic());
+    {
+        bool seg_active = g_trace_segments.is_active_atomic();
+        g_rt_gate.note_tb(g_capture_mute, icount_prev);
+        g_rt_gate.note_tb_exact(seg_active, g_capture_mute,
+                                cur_tb_tmpl && cur_tb_tmpl->is_system,
+                                marker_gate_get(cpu_index),
+                                cur_tb_tmpl ? cur_tb_tmpl->start_pc : 0);
+        g_rt_gate.tick(seg_active);
+    }
     /*
      * Leaked-fence tripwire, always armed.  This step IS the correct path
      * (the wrong-path early-out fires above it), so the wrong-path session

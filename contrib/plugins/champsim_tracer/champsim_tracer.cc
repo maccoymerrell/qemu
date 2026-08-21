@@ -1389,12 +1389,20 @@ static bool ep_read_user_sp(uint64_t *sp)
         tls_tried = true;
         GArray *regs = qemu_plugin_get_registers();
         if (regs) {
-            static const char *const sp_names[] = {"rsp", "sp", "x2", "r29"};
-            for (guint i = 0; !tls_h && i < regs->len; i++) {
-                qemu_plugin_reg_descriptor *d =
-                    &g_array_index(regs, qemu_plugin_reg_descriptor, i);
-                for (size_t n = 0;
-                     n < sizeof(sp_names) / sizeof(sp_names[0]); n++) {
+            /* Stack-pointer gdb names per supported target: x86_64 "rsp",
+             * aarch64/riscv64 "sp", mips "r29".  NAME-priority outer loop:
+             * a lower-priority name must never shadow a higher one, and no
+             * alias may collide with an unrelated register on another
+             * target (the founding defect: "x2" — riscv's ABI number for
+             * sp, which riscv's own gdb xml does not use — matched
+             * aarch64's GENERAL register x2, which execve zeroes, so every
+             * TLS-less aarch64 marker refused on an SP that read 0). */
+            static const char *const sp_names[] = {"rsp", "sp", "r29"};
+            for (size_t n = 0;
+                 !tls_h && n < sizeof(sp_names) / sizeof(sp_names[0]); n++) {
+                for (guint i = 0; i < regs->len; i++) {
+                    qemu_plugin_reg_descriptor *d =
+                        &g_array_index(regs, qemu_plugin_reg_descriptor, i);
                     if (d->name && strcmp(d->name, sp_names[n]) == 0) {
                         tls_h = d->handle;
                         break;
@@ -1806,8 +1814,9 @@ static void marker_refuse_no_thread_identity(void)
         "champsim_tracer: refusing to open the trace window — the marked "
         "process\ncarries no thread identity the tracer can maintain.  Its "
         "thread pointer\nreads 0 (a TLS-less binary), and the endpoint "
-        "identity cannot arm:\n  the user stack-pointer register is not "
-        "readable on this target.\nWithout an identity, distinct threads "
+        "identity cannot arm:\n  the user stack-pointer register was "
+        "absent, unreadable, or read 0 at the\n  marker instant.\nWithout "
+        "an identity, distinct threads "
         "of the marked process would share\none thread_id on the wire.  "
         "The capture is refused now rather than\nshipped looking clean.  "
         "No trace is written.\n");

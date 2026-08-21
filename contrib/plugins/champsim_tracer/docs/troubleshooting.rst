@@ -703,36 +703,40 @@ are a 17 per cent quantisation — wider than the whole distance from the
 healthy band to the gate — and the reconstruction has been measured
 3.2 times larger than every instruction the guest retired in the run.
 
-Two further properties of the reading matter when using it.  It is
-SAMPLED, and the sampling has no reliable direction.  A stall is measured
-from the last sample before it began to the last before it ended, which
-under-reports; but the same grid hides an *advance* of the user clock
-just as readily, and a workload that retires its whole burst between two
-samples never resets the stretch and reads as a total stall.  What makes
-a trip trustworthy is arithmetic the report already carries: the stalled
-instructions and the traced user instructions are disjoint subsets of the
-segment, so ``worst_user_stall + traced_icount <= segment_insns``.  A
-report that violates that has contradicted itself and is not scoreable —
-neither a stall nor a clean bill of health.  A reading under the gate
-only rules the condition out when the sampling was fine enough to have
-caught it, which is ``stall_fraction + 2/samples <= gate``.  And it reads the TRACED
-PROCESS's user clock, so a workload whose marked process is legitimately
-off-CPU — the validator's churn cell, which runs a stream of short-lived
-processes beside the marked one — can read high while the machine is
-healthy.  Distinguishing those needs a count of user-mode instructions
-retired MACHINE-WIDE, which the tracer does not keep; where that count is
-available from a second instruction sampler the same episode is separated
-far more sharply, the 1325 closing cells reading 0.00079 to 0.00102 at
-the 90th percentile against 0.202 and up for every cell that was killed.
+The report also carries an EXACT form of the stretch, maintained per
+executed TB rather than on a sampling grid: the ``stretch_exact`` line
+gives the worst no-traced-user stretch with zero bias in either
+direction, its composition (asynchronous-interrupt work, kernel work in
+the gated context, kernel and user work in foreign contexts), the
+machine-wide user-privilege retirement count, and a strided ring of the
+stretch's TB start PCs (``stretch_ring``) that names kernel work against
+the guest's symbol map.  The validator scores the exact fields whenever
+they are present: no resolution bound applies, and the verdict is
+two-term — the stretch must dominate its segment AND exceed an absolute
+abnormality floor derived from the measured corpus, so a micro-window
+whose single timer tick dominates a tiny denominator is adjudicated with
+its composition printed rather than convicted on a ratio.  The
+machine-wide user count also resolves the off-CPU ambiguity directly: a
+workload whose marked process is legitimately off-CPU (the validator's
+churn cell) shows its foreign user retirement in the composition instead
+of reading as a stall.  The self-consistency arithmetic still applies to
+every report: the stalled instructions and the traced user instructions
+are disjoint subsets of the segment, so
+``worst + traced_icount <= segment_insns``, and a report that violates it
+has contradicted itself and is not scoreable.  Reports written before
+``stretch_exact`` existed carry only the SAMPLED reading, whose grid has
+no reliable direction and certifies nothing on a short segment; the
+``stall_fraction + 2/samples <= gate`` bound applies to those alone.
 
 Reproducing it, and why a zero needs its own power
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The state is rare, its frequency moves with host contention, and it has
-not been eliminated, so an attempt to observe it has to bring its own
-contention rather than wait for the machine to supply some, and has to be
-sized against the frequency of **the tree being tested** rather than one
-measured on another tree.
+The class is open by standing rule even with its known mechanisms
+closed, and any frequency it has moves with host contention, so an
+attempt to observe it has to bring its own contention rather than wait
+for the machine to supply some, and has to be sized against the
+frequency of **the tree being tested** rather than one measured on
+another tree.
 
 The shape that produces it is the canonical marker cell — window
 ``marker:simulation=3000000+policy=latch``, ``wpdepth=64``, one vCPU
@@ -747,20 +751,24 @@ period differs by more than any two trees do — the tree that produced 8
 non-closes in 120 cells under load produced none in 105 when the machine
 went quiet.
 
-Measured that way at 370 cells per arm, the frequency has fallen by
-roughly twenty-fold over the trees between ``a2712d64b2`` and
-``e7df2be670`` (20/370, then 4/370 at ``790a5fdb0c``, then 1/370), and
-the sharpest single step sits at the commit that taught the wrong-path
-TLB log to survive a large page (``a2712d64b2`` 20/370 versus
-``337b0265b9`` 0/120, Fisher p = 0.003).  The last tree still produces
-it, and the cells it produces are the same shape as the original ones
-down to the stopping instruction; the two intermediate points that read
-zero were each measured over 120 cells, a size at which the frequency
-their neighbours show goes unseen about one time in four, so their zeros
-are not evidence of absence.  A wave of a few hundred clean cells is
-therefore weak evidence about this state: at the frequency the last of
-those trees shows, a thousand consecutive clean cells still happen about
-one time in fourteen.
+The mechanism behind the measured episodes was found by intervention —
+an input/output thread's consumption of a VIRTUAL timer deadline racing
+the wrong-path interposition — and is closed by construction at
+``34e55de9fc``: exactly one consumer evaluates VIRTUAL deadlines, at
+slice breakouts, and the racing consumer does not exist in the shipped
+binary.  Post-fix, the canonical cell measures 0 stalls in 24 under the
+full contention recipe (``e57d01c938``), and the exact-stretch
+re-adjudication at ``ee5f9a0191`` reads 0 gate failures over 52 cells
+and all four ISA batteries, every over-gate ratio decomposing as
+asynchronous-interrupt work inside a micro-window with zero foreign
+activity.  Rates measured on earlier trees are deliberately not quoted
+beside those numbers: identically shaped waves on one tree have been
+measured differing several-fold with the cause unfound, so cross-wave
+rate ladders mislead — compare arms only when they are interleaved cell
+by cell inside one wave.  The class itself stays open by standing rule:
+a fix closes a mechanism, never the class, and a green battery is
+exposure, not proof of absence — which is why the detector remains armed
+and its zero still needs the power analysis above.
 
 Where to look next
 ------------------

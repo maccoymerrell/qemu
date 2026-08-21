@@ -823,33 +823,18 @@ rather than assumed away:
   the guest renamed a live address space and the trace kept following
   it).
 
-**A system-mode capture requires a CPU model that supplies a page-table
-root, and a guest that programmed it.**  This is a refusal, not a
-degradation.  x86-64 (CR3), AArch64 (TTBR0_EL1) and RISC-V (SATP)
-supply one on every model.  On MIPS the register is **CP0 PWBase**, and
-only a model advertising ``Config3.PW`` implements it — in QEMU today
-that is **P5600** alone.  ``hw/mips/malta.c`` defaults to 24Kf on
-MIPS32 and 20Kc on MIPS64, so ``-cpu P5600`` is **required** for a
-mipsel system capture::
-
-    qemu-system-mipsel -M malta -cpu P5600 ...
-
-Two refusals enforce it, both before any byte is written:
-
-* the CPU model implements no root — refused at ``qemu_plugin_install``,
-  so QEMU exits non-zero before the first vCPU exists, before any block
-  is translated and before any marker byte can be read;
-* the model implements one but the guest never programmed it (``nohtw``
-  on the kernel command line, ``CONFIG_MIPS_HTW=n``, or a kernel that
-  declined the walker) — the live value is 0, which is an absence and
-  not a name, so the window refuses to **open** at the START marker and
-  the process exits ``89``.  A window that has already emitted bytes is
-  never retired by this path.
-
-The guest kernel must therefore print ``Hardware Page Table Walker
-enabled``.  For ``-smp > 1`` it also needs ``CONFIG_MIPS_CPS=y``: P5600
-has no MT ASE and brings secondaries up through CPS, so a kernel built
-only with ``CONFIG_MIPS_MT_SMP`` silently comes up with one vCPU.
+**A system-mode capture names its process by a page-table root, so it
+needs a CPU model that supplies one and a guest that programmed it.**
+The cores this is validated on, per ISA, are listed in
+:ref:`the system-mode support matrix <system-cpu-support>`, together
+with the machines they run on and what the guest kernel has to enable;
+user mode needs no identity machinery at all and carries no such
+requirement.  Both conditions are enforced rather than assumed: a model
+that names no address space is refused at ``qemu_plugin_install``,
+before the first vCPU exists, and a guest that left the register at
+zero is refused at the START marker, before the window opens.  Neither
+is a degradation of an in-flight capture — no byte has been written
+when either fires.
 
 **PWBase is guest-writable, so a guest that repurposed it would be
 misread.**  Unlike a thread pointer this is self-enforcing — the

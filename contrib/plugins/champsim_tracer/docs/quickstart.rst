@@ -725,30 +725,86 @@ attribution depend on.  The knobs are collected here.  Every one is a
 no-op for a user-mode (``qemu-<isa>``) run, so nothing in this section
 changes a user-mode trace.
 
-**Choose a CPU model that supplies a page-table root.**  A system
-capture identifies its process by the root the architecture itself
-translates from, so the model must implement one.  x86-64 (CR3),
-AArch64 (TTBR0_EL1) and RISC-V (SATP) do on every model.  On MIPS the
-register is **CP0 PWBase**, implemented only by models advertising
-``Config3.PW`` — in QEMU today that is **P5600** alone, while
-``-M malta`` defaults to 24Kf.  ``-cpu P5600`` is therefore required::
+.. _system-cpu-support:
+
+**Supported CPU models.**  A system capture names the process it is
+following by the page-table root the architecture itself translates from
+— x86-64 ``CR3``, AArch64 ``TTBR0_EL1``, RISC-V ``SATP``, MIPS CP0
+``PWBase`` — so the supported models are the models that implement that
+register.  The table lists the cores system mode is validated against:
+each is exercised end to end by the system-mode validator (see
+:doc:`validator`), on the machine shown.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 12 26 20 42
+
+   * - ISA
+     - Validated cores
+     - Machine
+     - Notes
+   * - ``x86_64``
+     - ``qemu64`` — the ``pc`` default, so no ``-cpu`` is needed;
+       ``-cpu max`` is also validated, and is what an AVX workload
+       wants
+     - ``-M pc`` (the default machine)
+     - ``CR3`` is architectural, so every x86-64 model names an address
+       space.  Boot with ``nopti`` (below).
+   * - ``aarch64``
+     - ``-cpu max,pauth-impdef=on``
+     - ``-M virt``
+     - ``TTBR0_EL1`` is architectural, so every AArch64 model names an
+       address space.  ``max`` reports ``ID_AA64PFR0_EL1.CSV3``, which
+       is what keeps the canonical isolation-off configuration below in
+       force without a command-line switch.
+   * - ``riscv64``
+     - ``-cpu max``
+     - ``-M virt`` (boots through the bundled OpenSBI)
+     - ``SATP`` is architectural, so every RISC-V model names an
+       address space.  ``max`` exposes the ``V`` extension, so a vector
+       workload executes instead of trapping.
+   * - ``mipsel``
+     - ``-cpu P5600``
+     - ``-M malta``
+     - P5600 implements ``Config3.PW`` and CP0 ``PWBase``, the hardware
+       page-table walker's base register, and ``Config3.ULRI``, so
+       guest threads are named too.  ``-M malta`` defaults to 24Kf, so
+       pass ``-cpu P5600`` explicitly.  ``-smp > 1`` additionally needs
+       ``CONFIG_MIPS_CPS=y`` in the guest kernel — P5600 has no MT ASE
+       and brings secondaries up through CPS; the validated mipsel
+       configuration is a single vCPU.
+
+A mipsel run therefore looks like this::
 
    qemu-system-mipsel -M malta -cpu P5600 -kernel vmlinux \
        -initrd rootfs.cpio.gz -append "console=ttyS0 panic=-1" \
        -plugin ./libchampsim_tracer.so,outfile=run,\
        trace_window=marker:simulation=20000000 ...
 
-The guest kernel must also enable the walker: ``CONFIG_MIPS_HTW=y``
-and no ``nohtw`` on the kernel command line, so that ``dmesg`` prints
-``Hardware Page Table Walker enabled``.  For ``-smp > 1`` add
-``CONFIG_MIPS_CPS=y``; P5600 has no MT ASE and brings secondaries up
-through CPS, so a kernel built only with ``CONFIG_MIPS_MT_SMP`` comes
-up with a single vCPU.
+and the guest kernel enables the walker with ``CONFIG_MIPS_HTW=y`` and
+no ``nohtw`` on the kernel command line, so that ``dmesg`` prints
+``Hardware Page Table Walker enabled`` — the one line that confirms the
+kernel programmed ``PWBase`` rather than declining the walker after
+probing it.
 
-Neither condition is silently tolerated.  A model with no root is
-refused at plugin install, before the machine is built, and a guest
-that never programmed one is refused at the START marker, before the
-window opens — see :doc:`limitations`.
+Both conditions — a model that supplies the root, and a guest that
+programmed it — are checked rather than assumed, and neither is
+silently tolerated.  A model that names no address space is refused at
+``qemu_plugin_install``, before the machine is built, so QEMU exits
+non-zero before the first vCPU exists and before any block is
+translated.  A model that supplies the register while the guest left it
+at zero is refused at the START marker, before the window opens, and
+the process exits ``89``; a window that has already emitted bytes is
+never retired by this path.
+
+**User mode needs none of this.**  ``qemu-<isa>`` runs one guest
+process in one address space, so there is nothing to name and no
+identity machinery to feed: the model requirements above simply do not
+apply.  User-mode support is whatever QEMU's ``linux-user`` supports
+for the ISA, across the tracer's four targets — ``qemu-x86_64``,
+``qemu-aarch64``, ``qemu-riscv64`` and ``qemu-mipsel``.  A ``-cpu``
+argument there selects the feature set QEMU emulates for the workload;
+the tracer records whatever executes under it.
 
 **Pin the traced process to one vCPU.**  A trace is scoped to a single
 guest address space, and kernel-code per-thread attribution stays

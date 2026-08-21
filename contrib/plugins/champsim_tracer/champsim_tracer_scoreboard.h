@@ -40,9 +40,11 @@ public:
     /* live-ASID == pinned-ASID flag (per-vCPU 0/1); see the field
      * comment in champsim_tracer.h. */
     qemu_plugin_u64 asid_match;
-    /* Context gate for the heavy per-TB capture callback (per-vCPU 0/1);
-     * see the field comment in champsim_tracer.h. */
+    /* Context gate for the heavy per-TB capture callback and its light
+     * re-acquisition probe (per-vCPU 0/1); see the field comments in
+     * champsim_tracer.h. */
     qemu_plugin_u64 trace_this_ctx;
+    qemu_plugin_u64 pin_probe;
     /* QEMU-written "drain owed" flag; see the field comment in
      * champsim_tracer.h and qemu_plugin_cpu_events_pending_slot(). */
     qemu_plugin_u64 evq_pending;

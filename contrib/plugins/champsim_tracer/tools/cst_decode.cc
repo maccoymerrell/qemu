@@ -617,10 +617,11 @@ void BodyWalker::handle_thread_switch(WalkState &ws)
 /*
  * BODY_TAG_ASID_SWITCH: rebase the address-space dimension of the
  * context.  Read the sleb128 asid-index delta; on an index's FIRST
- * sighting also consume its inline identity (u64 root_phys + u64 sig),
- * exactly as the writer emitted it.  P1 records only current_asid; the
- * identity bytes are parsed for wire consistency (Phase 2 surfaces them
- * to consumers).
+ * sighting also consume its two inline label words (u64 root_phys LABEL +
+ * u64 sig, reserved 0), exactly as the writer emitted it.  These are
+ * LABELS, never identities a consumer may match across time; the decoder
+ * keeps only current_asid and consumes the label words for wire
+ * consistency.
  */
 void BodyWalker::handle_asid_switch(WalkState &ws)
 {
@@ -630,8 +631,8 @@ void BodyWalker::handle_asid_switch(WalkState &ws)
         ws.seen_asids.resize((size_t)ws.current_asid + 1, false);
     }
     if (!ws.seen_asids[ws.current_asid]) {
-        (void)body_.u64_le();   /* root_phys — Phase 2 surfaces identity */
-        (void)body_.u64_le();   /* sig                                   */
+        (void)body_.u64_le();   /* root_phys — a LABEL, not an identity  */
+        (void)body_.u64_le();   /* sig — reserved, always 0              */
         ws.seen_asids[ws.current_asid] = true;
     }
     ws.pending_asid_switch = true;

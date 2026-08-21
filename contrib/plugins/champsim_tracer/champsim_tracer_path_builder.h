@@ -318,6 +318,13 @@ bool close_seal_at_terminator(unsigned int cpu_index, const BBTemplate *head,
  * (CST_BB_FLAG_THREAD_END).  See the definition. */
 bool deferred_close_take_pending(unsigned int cpu_index);
 
+/* END-take coverage wait: the END-sequence pc the pending END take on
+ * @cpu_index is still waiting to see emitted, or 0 when no wait is in
+ * force.  The seal's THREAD_END stamp asks it so a boundary whose walk
+ * does not publish the covering block never stamps (the take holds
+ * there — see run_deferred_window_closes). */
+uint64_t cst_end_take_wait_vaddr(unsigned int cpu_index);
+
 /*
  * ---- PathBuilder proper ----
  */
@@ -330,14 +337,18 @@ bool deferred_close_take_pending(unsigned int cpu_index);
  * awaiting its continuation and at what depth, so the resumed suffix can
  * be emitted as the SAME template with bb_start = index(resume_pc), and
  * so the depth pipeline can count the thread's un-returned excursions.
- * Frame identity comes from the FAULT_ENTER event ({resume_pc, asid}
- * stamped at the fault instant); @returned records the FAULT_RETURN —
- * the continuation is still fired by the resume suffix's SEAL, one or
- * more TB steps later. */
+ * Frame identity is (tid, window, resume_pc) — the owning guest thread,
+ * the marker-window ordinal in force when the fault classified, and the
+ * faulting instruction (v4 default Q6, maintainer-vetoable: no address-
+ * space root or ASID is ever stored or compared as an identity; the
+ * WINDOW ORDINAL is the model's only stable internal key).  @returned
+ * records the FAULT_RETURN — the continuation is still fired by the
+ * resume suffix's SEAL, one or more TB steps later. */
 struct CtxFrame {
     BBTemplate *full_tmpl = nullptr;   /* the faulting BB's full template */
-    uint64_t asid = 0;                 /* event-stamped owning address space;
-                                        * the (thread,asid) completion key */
+    uint64_t window = 0;               /* marker-window ordinal at the
+                                        * frame's classification — the
+                                        * (tid, window) completion key */
     uint64_t resume_pc = 0;            /* faulting insn = where ERET lands */
     uint32_t depth = 0;                /* depth the faulting BB ran at */
     uint8_t async_in_depth = 0;        /* the captured-async component (0/1)
@@ -380,29 +391,30 @@ public:
         uint64_t prev_start;      /* scoreboard prev_start_pc */
         uint64_t prev_ft;         /* scoreboard prev_fall_through */
         uint64_t current_pc;      /* scoreboard current_pc */
-        bool pinned;              /* marker-mode ASID pin armed */
-        uint64_t pinned_asid;     /* the vCPU's EFFECTIVE pin (dwell tag
-                                   * on narrow-ASID targets, marker-time
-                                   * value on wide ones); valid iff
-                                   * pinned */
+        bool pinned;              /* marker window armed (content gate) */
+        uint64_t pinned_asid;     /* the vCPU's ENTERING user root — a
+                                   * label carried from the last gated
+                                   * user TB, never an identity; valid
+                                   * iff pinned */
         uint64_t live_asid;       /* live read at TB exec (0 unpinned) */
         int live_priv;            /* live read at TB exec (-1 unpinned) */
-        bool user_owned;          /* priv==0 TB owned by the pinned
-                                   * process (pin_user_tb_owned: legacy
-                                   * ASID equality on wide targets,
-                                   * physical-page verification on
-                                   * narrow ones); false for kernel TBs
+        bool user_owned;          /* priv==0 TB in a CAPTURED context
+                                   * (the content-gate bit, widened by
+                                   * trace-all); false for kernel TBs
                                    * and when unpinned */
         bool live_root_owned = true;
-                                  /* whether the LIVE address-space root is
-                                   * one the trace CAPTURES: the pin,
-                                   * another open window's root (Stage B1),
-                                   * or — under trace-all — any root at all.
-                                   * The glue fills it for kernel TBs on
-                                   * wide-register targets, where the root
-                                   * IS the process; everywhere else it
-                                   * stays true and the kernel keep rule's
-                                   * foreign-root refusal is inert */
+                                  /* the per-vCPU CONTENT-GATE BIT (plus
+                                   * the trace-all bypass): does the live
+                                   * context map a latched window's marker
+                                   * bytes?  RULING 3 makes this the WHOLE
+                                   * kernel keep rule — kernel code in a
+                                   * gated space is traced, borrowed-mm
+                                   * kthreads included.  One relaxed load,
+                                   * filled by the glue when pinned. */
+        uint64_t cur_window = 0;  /* marker-window ordinal in force on this
+                                   * vCPU (0 = none): the internal cache /
+                                   * frame key component (v4 default Q5/Q6,
+                                   * maintainer-vetoable) */
         const struct qemu_plugin_cpu_event *evs;
         size_t n_evs;
         unsigned int cpu_index;
@@ -441,24 +453,6 @@ public:
          * vCPU), where the minted-tid peek could only say UNSEEN. */
         uint64_t cur_tp = 0;
         bool cur_tp_ok = false;
-        /* STRICT flavour of the same sample, for the kexc task-identity
-         * ownership rule: true only when the register itself named the
-         * CURRENT task at this step's privilege (a fresh thread_ptr_sample
-         * success) — never the inherited last-committed value, which is
-         * exactly the stale evidence that rule exists to overrule.  The raw
-         * value is never minted into a tid, so a kernel keep decision cannot
-         * renumber the wire. */
-        bool cur_tp_strict = false;
-        /* Is the live address-space root a per-process IDENTITY on this
-         * target?  True for the wide-register roots (x86 CR3, AArch64
-         * TTBR0_EL1, RISC-V SATP): the value is a page-table base, unique
-         * per process for the life of the process, so "the pinned root is
-         * installed" names the pinned process and nothing else.  False on a
-         * narrow-ASID target (MIPS EntryHi.ASID), where the OS recycles the
-         * value and equality is a coincidence of bits — there the root-owned
-         * recovery below must not fire.  Filled from the pin's reuse-guard
-         * arming, so it is a property of the target, not of the workload. */
-        bool asid_is_identity = false;
     };
 
     /* A guest thread the identity map has not minted an id for yet.  Never
@@ -493,7 +487,7 @@ public:
      * gate bails, so events during bailed steps accumulate to the next
      * surviving step.  Caller holds exec_lock. */
     /* Fold one drained batch of ordered path events into the persistent
-     * builder state: the kexc ownership pass, the retention pass (which
+     * builder state: the retention pass (which
      * moves the async window cursor) and the captured-async ownership
      * pass, in event order.  NEVER emits — every write to the body stream
      * lives in step_seal — so it is safe to run on a TB the heavy capture
@@ -502,7 +496,7 @@ public:
      * step_events calls this; so does the light per-TB absorber
      * (vcpu_evq_absorb), which is what gives the event queue a consumer in
      * the windows where every attribution gate is closed.  Only these
-     * StepIn fields are read: pinned, pinned_asid, asid_is_identity,
+     * StepIn fields are read: pinned, live_root_owned, cur_window,
      * live_asid (diagnostics), cur_tp/cur_tp_ok, cur_tid, cpu_index,
      * evs/n_evs. */
     void absorb_events(const StepIn &in);
@@ -776,20 +770,6 @@ public:
 
 private:
     void prime_from_live();
-    void kexc_apply_asid_write(uint64_t new_asid);
-    /* True while this excursion's stored raw ASID values are still in the
-     * namespace generation they were recorded in — the single gate every
-     * stored-value comparison passes through (see g_asid_identity_gen). */
-    bool kexc_values_current() const;
-    /* @tp/@tp_valid: the step's raw thread-pointer sample (StepIn::cur_tp),
-     * seeding the owned-thread identity map when the TB is owned. */
-    void kexc_user_tb(uint64_t live_asid, bool owned,
-                      uint64_t tp, bool tp_valid);
-    /* @in supplies the executing fragment (block PC + instruction count) and
-     * the live / pinned ASIDs, all of which feed only the ownership-census
-     * instrumentation; the keep rule itself reads excursion state alone. */
-    bool kexc_kernel_tb_keep(const StepIn &in);
-    void kexc_reset();
     /* @owner_tid is StepIn::walk_tid: a frame opened here is the deferred
      * prev's excursion, so the thread that ran that block owns it.  Under
      * split emission this EMITS the interrupted block's executed prefix
@@ -800,14 +780,14 @@ private:
                               BodyStreamState *out_stream,
                               const StepIn &in);
     void apply_fault_return(const struct qemu_plugin_cpu_event &ev);
-    ptrdiff_t frame_idx_for_resume(uint64_t resume_pc, uint64_t asid) const;
-    ptrdiff_t frame_idx_for_block(const BBTemplate *piece, uint64_t resume,
-                                  uint64_t asid) const;
+    ptrdiff_t frame_idx_for_resume(uint64_t resume_pc) const;
+    ptrdiff_t frame_idx_for_block(const BBTemplate *piece,
+                                  uint64_t resume) const;
     /* Completion candidate for a just-sealed BB claiming to be some frame's
-     * resume suffix.  @seal_asid is the pinned process's representative
-     * asid at the seal (StepIn::pinned_asid): a frame can only
-     * complete against a suffix sealed in ITS OWN (thread,asid) — the thread
-     * dimension is implicit (PathBuilder is per-vCPU-thread TLS), and this
+     * resume suffix.  Keyed (tid, window, resume_pc) — v4 default Q6,
+     * maintainer-vetoable: @seal_window is the window ordinal at the seal
+     * (StepIn::cur_window) and @seal_tid the committed thread
+     * (StepIn::walk_tid), and this
      * asid is the second half of the (thread,asid) key.  USER frames match
      * the hard asid key (merge_suffix_matches is a PURE DIAGNOSTIC there —
      * Decision C); KERNEL-code frames (is_system) also complete on the
@@ -815,9 +795,11 @@ private:
      * stamp the loaded mm, not ownership (see the .cc comment). */
     static bool frame_matches_completion(const CtxFrame &f,
                                          const BBTemplate *suffix,
-                                         uint64_t seal_asid);
+                                         uint64_t seal_window,
+                                  uint32_t seal_tid);
     ptrdiff_t frame_idx_for_completion(const BBTemplate *suffix,
-                                       uint64_t seal_asid) const;
+                                       uint64_t seal_window,
+                                  uint32_t seal_tid) const;
     /* @out_head_cut reports that the fold force-committed a
      * TRANSLATION-CUT head it could not complete from the cache: the
      * returned template ends at the faulting instruction, and a frame
@@ -937,8 +919,9 @@ private:
      *
      * Async edges are NOT retained: their whole effect is assignment into
      * persistent members, done once at drain (O(1)), plus the per-event
-     * in_async stamp above.  ASID_WRITE is consumed once at drain by the
-     * kexc ownership pass and read by nobody afterwards.
+     * in_async stamp above.  ASID_WRITE's whole effect is the synchronous
+     * content-gate refresh at the same commit point; the queued copy is
+     * discarded here.
      *
      * Under CST_RETAIN_ALL=1 the ownership guard on the append is bypassed
      * (and nothing else changes) so the discriminating experiment can run
@@ -982,7 +965,7 @@ private:
      * state — the same rule the TB gates apply, re-asked at the event's
      * position in the drain.  See champsim_tracer_path_builder.cc. */
     bool event_is_ours(const struct qemu_plugin_cpu_event &ev,
-                       const StepIn &in, bool in_async, size_t idx) const;
+                       const StepIn &in, bool in_async) const;
 
     /* Is @ev INTERIOR to the outstanding async window, as opposed to merely
      * concurrent with it?  The single spelling of that question — the
@@ -993,26 +976,11 @@ private:
     static bool async_window_interior(const struct qemu_plugin_cpu_event &ev,
                                       bool in_async);
 
-    /* Per-event snapshot of the kernel-excursion ownership edge, indexed by
-     * position in the current drain (filled by the kexc pass, read by
-     * event_is_ours). */
-    std::vector<uint8_t> drain_kexc_own_;
-
-    /* The pin, sampled at the last drain, so a consumer that does not
-     * receive the StepIn (classify_fault_enter) can still ask the
-     * address-space identity question. */
-    uint64_t pin_asid_cur_ = 0;
-    bool     pin_armed_cur_ = false;
-    bool     pin_identity_cur_ = false;
-
-    /* True when @asid demonstrably names an address space other than the
-     * traced one.  Conservative: false whenever the question cannot be
-     * answered (unpinned, or a narrow-ASID target where equality of the raw
-     * bits is not identity). */
-    bool ctx_asid_foreign(uint64_t asid) const
-    {
-        return pin_armed_cur_ && pin_identity_cur_ && asid != pin_asid_cur_;
-    }
+    /* The marker-window ordinal at the last drain (StepIn::cur_window),
+     * so a consumer that does not receive the StepIn
+     * (classify_fault_enter, apply_fault_return) can still stamp and
+     * match the frame key's window component. */
+    uint64_t win_cur_ = 0;
 
     /* CST_RETAIN_CHECK only: the OLD unconditional retention, kept verbatim
      * alongside the new one so every seal can compare the two derivations.
@@ -1131,10 +1099,9 @@ private:
 
     /* Per-vCPU window measurement + id (formerly process-wide statics in
      * the .cc).  Under SMP a peer vCPU's pre-prime step or fresh ENTER
-     * must not close or clobber THIS vCPU's open window record: the kexc
-     * async re-latch gate reads the id, so the cross-vCPU clobber was
-     * wire-visible (a skipped re-latch drops the post-window kernel tail),
-     * and the per-window own/peer/asidw tallies were interleaved noise.
+     * must not close or clobber THIS vCPU's open window record (a
+     * cross-vCPU clobber was wire-visible, and the per-window
+     * own/peer/asidw tallies were interleaved noise).
      * The id values stay globally unique via g_async_win_seq (exec_lock).
      * Heap-resident like everything else here: no static-TLS cost. */
     uint64_t win_id_ = 0;
@@ -1212,139 +1179,6 @@ private:
     uint32_t seg_gen_seen_ = 0;
     bool drop_open_leak_pending_ = false;
 
-    /*
-     * ---- Kernel-excursion ownership (kexc=1) ----
-     *
-     * Who owns a kernel TB?  The user address space the kernel was
-     * entered FROM — not whatever the live ASID register happens to
-     * hold, because a kernel is free to run under a private address
-     * space (PTI-style entry switches) or to scribble save/probe values
-     * into the ASID register for TLB maintenance.  All of it is
-     * observable architecturally: privilege transitions delimit the
-     * excursion and ASID_WRITE path events expose every committed swap.
-     *
-     *   user TB (priv==0)   ownership resets; the step glue's
-     *                       pin_user_tb_owned verdict is recorded as
-     *                       kexc_user_owned_ (on wide-register targets
-     *                       that is the exact legacy live-ASID
-     *                       equality; on narrow-ASID targets it is the
-     *                       physical-page verification — a raw value
-     *                       match after a rollover is not identity),
-     *                       and the live ASID as kexc_last_user_asid_.
-     *   kernel-entry edge   the first priv!=0 TB after a priv==0 TB —
-     *                       once per excursion, at the OUTERMOST
-     *                       user->kernel transition (nested faults
-     *                       inside a syscall do not re-fire it):
-     *                       exc_entry_ = last_user_asid_, entry_owned_
-     *                       = user_owned_, overlay cleared, cut
-     *                       cleared.
-     *   ASID_WRITE (new V)  only meaningful while in kernel:
-     *                         V == exc_entry_   restore: the entering
-     *                                           address space is loaded
-     *                                           again, so ownership
-     *                                           continues — which means
-     *                                           retiring any standing cut
-     *                                           (it described an address
-     *                                           space that is no longer in
-     *                                           force).  The overlay is
-     *                                           kept, so a further third
-     *                                           value cuts again.
-     *                         no overlay yet    overlay_ = V (the
-     *                                           excursion's kernel
-     *                                           overlay — a PTI entry
-     *                                           switch or a TLB-
-     *                                           maintenance save/probe;
-     *                                           NOT a committed switch)
-     *                         V == overlay_     nothing
-     *                         else              cut_ = true (a third
-     *                                           distinct value is a
-     *                                           committed context
-     *                                           switch; sticky until
-     *                                           the next user TB)
-     *   kernel TB           keep for the trace iff
-     *                       entry_owned_ && !cut_ (the async
-     *                       exclusion has already run).  This REPLACES
-     *                       the live-ASID foreign-drop test for priv!=0
-     *                       TBs only.
-     *
-     * Conservative by construction: a TLB-maintenance loop writing two
-     * DIFFERENT probe values fakes a cut and under-attributes until the
-     * next user TB (counted in kexc_cuts); kernel TBs before a
-     * segment's first user TB have no owner and drop.  An ASID_WRITE
-     * inside an async window still updates this state (the window's TBs
-     * are excluded regardless) so post-window ownership is right.
-     * Storm detection only counts distinct values (>= threshold warns
-     * once per segment + kexc_write_storm); pin invalidation on ASID
-     * rollover is a later policy decision.
-     */
-    bool     kexc_in_kernel_ = false;   /* excursion open (edge latched) */
-    bool     kexc_have_user_ = false;   /* last_user_asid_ is valid */
-    uint64_t kexc_last_user_asid_ = 0;
-    bool     kexc_user_owned_ = false;  /* last user TB's ownership
-                                         * verdict (TB-history: survives
-                                         * kexc_reset with last_user) */
-    uint64_t kexc_exc_entry_ = 0;       /* owning ASID at the entry edge */
-    /* The raw-value namespace generation @kexc_exc_entry_ was latched under
-     * (g_asid_identity_gen).  A narrow-ASID space recycles, so the entry
-     * VALUE returning is proof of identity only while the generation has
-     * not moved; once it has, the same bits may name any process and every
-     * arrow that compares against @kexc_exc_entry_ must stand down. */
-    uint32_t kexc_exc_entry_gen_ = 0;
-    bool     kexc_entry_owned_ = false; /* ownership latched at the edge */
-    bool     kexc_have_overlay_ = false;
-    uint64_t kexc_overlay_ = 0;
-    bool     kexc_cut_ = false;
-    /* Which decline-census arm refused the last dropped kernel TB
-     * (0 none, 1 no_user, 2 not_owned, 3 cut, 4 task-identity) — read by
-     * the CST_JUMP_DIAG gap-condition recorder only; no behavioral
-     * reader. */
-    uint8_t  kexc_last_decline_ = 0;
-    /* This excursion has seen an entry-ASID restore that retired a standing
-     * cut.  Instrumentation only (it partitions the kernel TBs that the
-     * sticky-cut defect used to refuse); never consulted by the keep rule. */
-    bool     kexc_restored_after_cut_ = false;
-    /* Distinct new-values this excursion (storm detection).  Bounded
-     * scan is fine: the set never grows past the storm threshold. */
-    static constexpr uint32_t KEXC_STORM_THRESHOLD = 16;
-    uint64_t kexc_vals_[KEXC_STORM_THRESHOLD];
-    uint32_t kexc_nvals_ = 0;
-    bool     kexc_stormed_ = false;     /* this excursion already counted */
-
-    /* Async re-latch (interrupts=1 only).  A captured window's content —
-     * the handler and everything the guest scheduler runs before the
-     * departure PC is re-fetched — routinely includes foreign user TBs,
-     * which reset the excursion state above and re-latch the entry edge to
-     * a FOREIGN owner.  The interrupted excursion's own post-window kernel
-     * tail then refuses on not_owned all the way to user privilege, which
-     * silently deletes its depth level from the wire (the residual 2->0).
-     * The ASYNC_RETURN producer fires only when the departure PC is
-     * re-fetched with the departure thread pointer, so the return is proof
-     * the machine is back in the state the window interrupted: snapshot
-     * the ownership block at ASYNC_ENTER and restore it on the owner's
-     * genuine return.  A window that never returns (abandon, pre-prime,
-     * segment boundary) invalidates the snapshot instead. */
-    struct KexcSnap {
-        bool     valid = false;
-        bool     in_kernel;
-        bool     have_user, user_owned;
-        uint64_t last_user_asid;
-        uint64_t exc_entry;
-        uint32_t exc_entry_gen;
-        bool     entry_owned;
-        bool     have_overlay;
-        uint64_t overlay;
-        bool     cut, restored_after_cut;
-        uint64_t vals[KEXC_STORM_THRESHOLD];
-        uint32_t nvals;
-        bool     stormed;
-    } kexc_snap_;
-    /* Census flag (mirrors kexc_restored_after_cut_): this excursion's
-     * ownership was re-latched from an async-return snapshot; cleared by
-     * kexc_reset.  Never consulted by the keep rule. */
-    bool kexc_relatched_ = false;
-    void kexc_async_snapshot();
-    void kexc_async_restore();
-
     bool evq_enabled_ = false;
     unsigned int cpu_index_ = 0;
 
@@ -1396,37 +1230,5 @@ void path_builder_close_state_report(FILE *f, const char *why,
                                      unsigned int closing_cpu,
                                      const char *phase, bool print,
                                      bool ledger);
-
-/*
- * ---- Narrow-ASID identity generation ----
- *
- * A raw ASID value names a process only for as long as the OS has not
- * recycled it.  On a narrow-ASID target (MIPS: an architecturally 8-bit
- * EntryHi.ASID) the OS MUST recycle, and when it does every value the
- * tracer stored silently starts naming somebody else.  This counter is the
- * generation of the raw-value namespace: each piece of evidence that the
- * space wrapped bumps it, and a stored value stamped with an older
- * generation is no longer identity — only a coincidence of bits.  Bumped
- * from the committed-ASID-write hook's rollover detector and from a dwell
- * re-pin; read by the kexc excursion arrows, which stamp the generation
- * beside every raw value they keep.
- *
- * Monotone and process-wide, never reset: a reset would make two different
- * namespaces compare equal, which is the very defect it exists to prevent.
- * Wide-register targets (CR3 / TTBR0 / SATP) never bump it, so their
- * comparisons are byte-identical to before.
- */
-extern std::atomic<uint32_t> g_asid_identity_gen;
-void asid_identity_gen_bump(const char *why);
-
-/* Invalidate the kexc owned-thread identity map (rollover-scale evidence:
- * an ASID-write storm, a narrow-ASID dwell re-pin, a foreign user TB carrying
- * the pinned ASID value).  A stale (thread-pointer, asid) pair must never
- * satisfy the task-identity kernel ownership rule after the raw asid value
- * may have been handed to another process.  Caller holds exec_lock. */
-void kexc_owned_tp_invalidate(const char *why);
-
-
-
 
 #endif /* CHAMPSIM_TRACER_PATH_BUILDER_H */

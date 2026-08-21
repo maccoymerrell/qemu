@@ -51,8 +51,8 @@ extern "C" {
 #define CST_TLS_HOT __attribute__((tls_model("initial-exec")))
 
 /* ===== Constants ===== */
-/* Upper bound for every per-vCPU state array (g_rep_state, cp_chain(),
- * path_builder(), the CP capture accumulators, ...).  All
+/* Upper bound for every per-vCPU state array (g_rep_state, the content-
+ * gate bits, cp_chain(), path_builder(), the CP capture accumulators, ...).  All
  * accessors clamp, so an out-of-range cpu_index degrades to sharing the
  * last slot rather than indexing out of bounds. */
 inline constexpr unsigned CST_PIN_MAX_VCPUS = 1024;
@@ -348,16 +348,19 @@ inline constexpr size_t CST_EVQ_TB_EVENT_MAX = 512 + 4;
  */
 #define CST_RT_GATE_EXIT         88
 
+
 /*
  * Process exit status when the tracer REFUSES TO OPEN a window because the
- * guest never programmed the page-table-root register the capture would be
- * identified by (a MIPS guest booted with "nohtw", or built
- * CONFIG_MIPS_HTW=n, so CP0 PWBase reads 0 and names no address space).
- * Deliberately distinct from CST_RT_GATE_EXIT: nothing was captured and
- * nothing was abandoned -- the window never opened and no trace file exists,
- * so a harness must not read this as a truncated capture.
+ * MARKED process carries no thread identity the tracer can maintain: its
+ * thread pointer reads 0 (TLS-less), and the rev3 endpoint identity — user
+ * SP regions read at the endpoints of kernel excursions — cannot arm
+ * (the user stack-pointer register is unreadable on this target).
+ * Nothing was captured, nothing was
+ * abandoned, no trace file exists.  This refusal is what replaced the #137
+ * silent stand-down — a clean-looking trace whose kernel strands pooled
+ * kworker/scheduler work under the marked (asid, tid=0) pair.
  */
-#define CST_NO_ROOT_EXIT         89
+#define CST_NO_THREAD_IDENT_EXIT 90
 
 #define CST_FID_SLOT_COUNT      (cst_wire::FID_SLOT_COUNT)  /* slots per slotted family */
 #define CST_FID_SLOT_STRIDE      8    /* family IDs per slot (== family count) */
@@ -1202,20 +1205,10 @@ struct BodyEntry {
      * per-context field-state / regfile tables and drives
      * BODY_TAG_ASID_SWITCH.  Default 0 so any entry built off the main
      * capture path stays single-address-space. */
+    /* Compact address-space LABEL index (wire tag AND the (asid, thread)
+     * context key — one field; the captured-at-execution carry).  0 in
+     * user mode / a single address space. */
     uint32_t asid_index = 0;
-    /* Context asid index — the PROCESS asid, decoupled from the memory
-     * asid above.  Pinned system mode: the entering process's user CR3
-     * index, held stable across a kernel excursion.  A kernel (is_system)
-     * block carries THIS index on the wire instead of the live root
-     * (KPTI-invariant tagging), and the per-(asid,thread) regfile /
-     * FieldState tables are keyed by that wire asid — so one guest thread
-     * keeps a single register-file context across user<->kernel even
-     * under KPTI's distinct kernel CR3.  Equals asid_index in user mode /
-     * unpinned (live == process), keeping those traces byte-identical.
-     * INTERNAL: feeds the kernel-block wire tag only, never serialised
-     * directly.  Default 0 to match asid_index's single-address-space
-     * default. */
-    uint32_t ctx_asid_index = 0;
     /* QEMU vCPU index this entry came from — used ONLY for live register
      * reads (BODY_TAG_REGFILE capture on a thread's first emit, WP lane
      * gates); never serialised.  Distinct from thread_id: on a system
@@ -1312,14 +1305,24 @@ typedef struct {
     /* Context gate for the heavy per-TB capture callback (vcpu_tb_exec).
      * Folds is_active AND pinned-context-ownership into ONE JIT-testable
      * slot so a foreign / unowned TB is never dispatched at all — no
-     * callback, no vclock pause, no drop decision.  A bare is_active
-     * mirror on every supported target: an address space is named by its
-     * page-table root (CR3 / TTBR0 / SATP / CP0 PWBase), a reliable
-     * per-process id, so a foreign block is dropped inside the step and
-     * no context has to be gated out of dispatch.  Maintained
-     * EVENT-DRIVEN (see refresh_ctx_gates): at every is_active edge and
-     * at each committed address-space write. */
+     * callback, no vclock pause, no drop decision.  Byte-identical to
+     * is_active everywhere the ownership question is trivial (user mode,
+     * unpinned system, and the wide-register system pins whose ASID is a
+     * reliable process id); it diverges only for a narrow-ASID (MIPS)
+     * system pin, where a recycled ASID cannot distinguish processes and
+     * the physical-page probe adjudicates.  Maintained EVENT-DRIVEN (see
+     * refresh_ctx_gates): at every is_active edge, at each ASID-write
+     * commit, and when the light probe re-acquires the pinned process. */
     uint64_t trace_this_ctx;
+    /* Companion gate for the light re-acquisition probe (vcpu_pin_probe),
+     * set only for a narrow-ASID system pin.  1 exactly when a segment is
+     * active but this vCPU's dwell is NOT a confirmed-owned pinned
+     * context: the light probe runs per such TB (a user-clock cursor
+     * tick, the physical-page content probe on user TBs, and the capture
+     * mute the heavy drop path used to set) and flips trace_this_ctx to 1
+     * on the TB that re-acquires the process.  0 (probe never fires) for
+     * user mode, unpinned system, and wide-register pins. */
+    uint64_t pin_probe;
     /* "A path-event drain is owed on this vCPU".  Written by QEMU, not by
      * the plugin: 1 on every cpu_plugin_evq_push, 0 on every
      * qemu_plugin_drain_cpu_events (see qemu_plugin_cpu_events_pending_slot).
@@ -1482,7 +1485,6 @@ extern const char *target_name;
  * boundary in champsim_tracer_path_builder.cc).  Currently RISC-V
  * M-mode (priv 3): M-mode fetches bypass satp entirely, so OpenSBI
  * handling a sync SBI ecall still reads the pinned process's satp. */
-extern int g_xlate_bypass_priv;
 /* True when the guest target is big-endian (currently only MIPS BE, when
  * trace_isa==TRACE_ISA_MIPS and target_name does not end in "el").  Set
  * once during qemu_plugin_install.  qemu_plugin_read_register() returns
@@ -1596,14 +1598,6 @@ struct TraceFeatures {
      * simulation runs — system AND user mode alike.  CST_NO_FAULT clears it
      * for A/B: accesses still run on garbage, but the fault is not marked. */
     bool     wp_synthetic_marking = false;
-    /* Kernel-excursion ownership (kexc=1): attribute kernel (priv!=0) TBs
-     * by the owning excursion's entry ASID — tracked through ASID-write
-     * path events — instead of by the live ASID, so PTI-style kernel
-     * entry switches don't drop the pinned process's synchronous kernel
-     * work.  Off (default) keeps the live-ASID rule byte-for-byte; the
-     * PathBuilder then consumes-and-ignores ASID_WRITE events.  See the
-     * ownership state machine in champsim_tracer_path_builder.h. */
-    bool     kexc = false;
     /* Physical-page capture (physaddr=1): record the physical PAGE base of
      * every load/store so a consumer can rebuild the physical address as
      * ppage | (vaddr & CST_PPAGE_OFFSET_MASK).  SYSTEM MODE ONLY — forced
@@ -1635,6 +1629,18 @@ struct TraceFeatures {
     uint32_t alt_depth = 0;
 };
 extern TraceFeatures g_features;
+
+/*
+ * rev3 endpoint identity armed (thread_identity_note.md): the MARKED
+ * process's thread pointer reads 0 (TLS-less), so thread identity fell to
+ * the degenerate case — user-SP regions observed at the endpoints of
+ * kernel excursions.  Set at most once, at window open, under exec_lock,
+ * after the one capability check (a readable user SP; loud refusal
+ * otherwise — marker_latch_thread_identity_guard; Q10 v4 default,
+ * maintainer-vetoable).  Read by the identity samplers.  False on every
+ * TLS-ful workload, whose behaviour is unchanged byte-for-byte.
+ */
+extern bool g_cst_ep_mode;
 extern char *qemu_command_line;
 extern char *trace_comment;
 
@@ -1650,22 +1656,18 @@ extern uint64_t simulation_insns;
  * byte change detected at translation time)?  Acquires data_lock. */
 bool cst_pc_is_poisoned(uint64_t pc);
 
-/* Phase-2 ASID identity of the single pinned address space (see
- * multiasid_plan.md §2), read on the body-stream emit path to fill the
- * BODY_TAG_ASID_SWITCH record's first-sighting identity.  Root = the
- * page-table root physical address (masked CR3 / TTBR base / SATP PPN /
- * MIPS pgd); sig = a stable representative code-page content signature.
- * Both are 0 when unpinned (user mode / no marker), keeping user traces
- * byte-identical.  The emit path holds exec_lock, as does every writer. */
-uint64_t cst_pinned_asid_root(void);
-uint64_t cst_pinned_asid_sig(void);
-
 /* Identity (page-table root physical address + content signature) of a
  * compact asid index, as recorded on the index's first sighting.  Returns
  * false for an unassigned index.  The body-stream emit path carries this
  * inline on an index's first BODY_TAG_ASID_SWITCH.  Caller holds exec_lock,
  * as does every writer of the identity store. */
 bool cst_asid_identity(uint32_t index, uint64_t *root, uint64_t *sig);
+
+/* The marker-window ordinal in force on the calling vCPU (0 = none): the
+ * internal code-cache / frame key component (v4 default Q5/Q14,
+ * maintainer-vetoable — the WINDOW, not any root or ASID value, is the
+ * model's only stable internal identity). */
+uint64_t cst_cur_window(void);
 
 /* Why the most recent spec-mode exec_tb produced no template (TLS; set
  * before each spec exec_tb, refined by detect_tb_poison).  Diagnostic

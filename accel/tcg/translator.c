@@ -15,8 +15,11 @@
 #include "exec/insn-dataflow.h"
 #include "exec/cpu_ldst.h"
 #include "exec/plugin-gen.h"
-#include "qemu/cst_bqslice.h"
+#include "qemu/plugin.h"
 #include "exec/oracle.h"
+#include "qemu/cst_bqslice.h"
+#include "tcg/helper-info.h"
+#include "exec/helper-head.h.inc"
 #include "exec/cpu_ldst.h"
 #include "exec/tswap.h"
 #include "tcg/tcg-op-common.h"
@@ -49,17 +52,16 @@ static TCGOp *gen_tb_start(DisasContextBase *db, uint32_t cflags)
     TCGv_i32 count = NULL;
     TCGOp *icount_start_insn = NULL;
     /*
-     * Guest-insn slice bounding (event-agency discipline; see
-     * qemu/cst_bqslice.h): emit the SAME budget prologue icount emits
-     * (the sub below and the st16 back to icount_decr.u16.low), on the
-     * default clock, with no other CF_USE_ICOUNT effect.  The exit
-     * check against u32 < 0 is the EXISTING !CF_NOIRQ check --
+     * CST_BUDGET_QUANTUM (knob A): emit the SAME budget prologue icount
+     * emits (the sub below and the st16 back to icount_decr.u16.low),
+     * on the default clock, with no other CF_USE_ICOUNT effect.  The
+     * exit check against u32 < 0 is the EXISTING !CF_NOIRQ check --
      * unchanged.  CF_NOIRQ TBs are not billed: icount may bill them
      * because higher-level code guarantees budget (and the replay
-     * exception step strips CF_USE_ICOUNT); off-icount an unchecked
-     * sub would wrap u16.low.  The arming edge precedes any
-     * translation (plugin install, before the machine starts), so
-     * every cached TB agrees.
+     * exception step strips CF_USE_ICOUNT); off-icount an unchecked sub
+     * would wrap u16.low.  The knob is translate-time-global (set before
+     * any translation, constant for the run), so every cached TB agrees.
+     * See include/qemu/cst_bqslice.h.
      */
     bool cst_bq_bill = cst_bq_on && !(cflags & (CF_USE_ICOUNT | CF_NOIRQ));
 
@@ -110,9 +112,9 @@ static void gen_tb_end(const TranslationBlock *tb, uint32_t cflags,
         /*
          * Update the num_insn immediate parameter now that we know
          * the actual insn count.  Non-NULL exactly when gen_tb_start
-         * emitted the budget sub: always under CF_USE_ICOUNT
-         * (identical to the old CF_USE_ICOUNT test), and under
-         * guest-insn slice billing.
+         * emitted the budget sub: always under CF_USE_ICOUNT (identical
+         * to the old CF_USE_ICOUNT test), and under CST_BUDGET_QUANTUM
+         * (knob A) billing.
          */
         tcg_set_insn_param(icount_start_insn, 2,
                            tcgv_i32_arg(tcg_constant_i32(num_insns)));
@@ -140,6 +142,193 @@ bool translator_use_goto_tb(DisasContextBase *db, vaddr dest)
     return translator_is_same_page(db, dest);
 }
 
+/*
+ * NEVER-SPLIT (atomic) CODE SEQUENCES — plugin-registered byte patterns
+ * the translator keeps whole inside one TB (ChampSim Tracer marker
+ * sequences; see qemu_plugin_register_nosplit_code_sequences and
+ * docs/qemu_modifications.rst).
+ *
+ * At every CLEAN TB-end decision (DISAS_TOO_MANY: page boundary, budget,
+ * single-step — never a real control transfer), the translated tail is
+ * compared against the registered sequences.  If it is a PROPER prefix of
+ * one, translation continues through the sequence via the normal
+ * code-fetch path: a cross-page continuation is an ordinary cross-page TB
+ * (tb->page_addr[1]), and a fetch fault is the fault the next fetch was
+ * about to take — the standard translation restart services it.  The
+ * whole sequence therefore always appears together in one TB.
+ */
+
+/* Read @len already-translated bytes at @addr out of the TB's own host
+ * pages.  Mirrors translator_st's page-split walk, but is valid mid-loop
+ * (translator_st sizes itself from tb->size, which is only set at the
+ * end).  Refuses the MMIO/record paths — those TBs are deliberately
+ * capped and must not be extended. */
+static bool translator_nosplit_read(const DisasContextBase *db, void *dest,
+                                    vaddr addr, size_t len)
+{
+    size_t offset, offset_end, offset_page1;
+
+    if (db->fake_insn || db->record_len != 0 || !db->host_addr[0] ||
+        addr < db->pc_first) {
+        return false;
+    }
+    offset = addr - db->pc_first;
+    offset_end = offset + len;
+    offset_page1 = -(db->pc_first | TARGET_PAGE_MASK);
+
+    if (offset_end <= offset_page1) {
+        memcpy(dest, db->host_addr[0] + offset, len);
+        return true;
+    }
+    if (offset < offset_page1) {
+        size_t len0 = offset_page1 - offset;
+        memcpy(dest, db->host_addr[0] + offset, len0);
+        offset += len0;
+        dest = (uint8_t *)dest + len0;
+    }
+    if (db->host_addr[1] && offset >= offset_page1) {
+        memcpy(dest, db->host_addr[1] + (offset - offset_page1),
+               offset_end - offset);
+        return true;
+    }
+    return false;
+}
+
+/*
+ * v4 repair (maintainer-vetoable): the stop-decision verdict.
+ *
+ * EXTEND  — the tail is a proper prefix of a registered sequence and the
+ *           continuation is representable: rescind the stop and continue
+ *           through the sequence.
+ * REFUSE  — the tail is mid-sequence but extension is impossible for a
+ *           hard reason (CF_COUNT_MASK ceiling, third page).  The caller
+ *           RETREATS: it ends the TB before the sequence's first
+ *           instruction so the sequence opens the next TB whole.
+ * NO_MATCH — an ordinary stop.
+ */
+typedef enum {
+    NOSPLIT_NO_MATCH,
+    NOSPLIT_EXTEND,
+    NOSPLIT_REFUSE,
+} NosplitVerdict;
+
+/* Classify the TB's translated tail against the registered never-split
+ * sequences.  On EXTEND the continuation stays within pc_first's page
+ * pair (a TB holds at most two pages) and the insn count stays under
+ * CF_COUNT_MASK.  On REFUSE, @seq_start_pc is the guest pc where the
+ * longest matched prefix begins — the retreat point. */
+static NosplitVerdict translator_nosplit_continue(const DisasContextBase *db,
+                                                  vaddr *seq_start_pc)
+{
+    const uint8_t *seqs[QEMU_PLUGIN_NOSPLIT_MAX];
+    size_t seq_len, n, max_l, best_match = 0, best_feasible = 0;
+    uint8_t tail[64];
+
+    n = qemu_plugin_nosplit_seqs(seqs, &seq_len);
+    if (n == 0) {
+        return NOSPLIT_NO_MATCH;
+    }
+    max_l = MIN((size_t)(db->pc_next - db->pc_first), seq_len - 1);
+    if (max_l == 0 || max_l > sizeof(tail)) {
+        return NOSPLIT_NO_MATCH;
+    }
+    if (!translator_nosplit_read(db, tail, db->pc_next - max_l, max_l)) {
+        return NOSPLIT_NO_MATCH;
+    }
+    for (size_t i = 0; i < n; i++) {
+        for (size_t l = max_l; l >= 1; l--) {
+            if (l <= best_feasible) {
+                break;                          /* cannot improve */
+            }
+            if (memcmp(tail + (max_l - l), seqs[i], l) != 0) {
+                continue;
+            }
+            best_match = MAX(best_match, l);
+            vaddr end = db->pc_next + (seq_len - l) - 1;
+            vaddr page0 = db->pc_first & TARGET_PAGE_MASK;
+            if (end < db->pc_next) {
+                continue;                       /* address-space wrap */
+            }
+            if ((end & TARGET_PAGE_MASK) - page0 > TARGET_PAGE_SIZE) {
+                continue;                       /* would need a 3rd page */
+            }
+            best_feasible = l;
+            break;                              /* longest for this seq */
+        }
+    }
+    if (best_match == 0) {
+        return NOSPLIT_NO_MATCH;
+    }
+    *seq_start_pc = db->pc_next - best_match;
+    if (db->num_insns >= CF_COUNT_MASK) {
+        /* Ceiling refusal is hard for any match: retreat, don't split. */
+        return NOSPLIT_REFUSE;
+    }
+    return best_feasible ? NOSPLIT_EXTEND : NOSPLIT_REFUSE;
+}
+
+/*
+ * v4 repair (maintainer-vetoable): per-insn boundary records for the
+ * never-split RETREAT.  A sequence prefix is at most seq_len-1 < 64
+ * bytes, instructions are at least one byte, so the last 64 boundaries
+ * always cover any retreat point.  Records are only maintained while
+ * never-split sequences are registered.
+ */
+#define NOSPLIT_RING_LEN 64
+typedef struct NosplitInsnRec {
+    vaddr pc;                   /* guest pc of this insn's first byte */
+    TCGOp *op_tail;             /* last op emitted before this insn */
+    TCGOp *insn_start_prev;     /* db->insn_start of the previous insn */
+    uint64_t tstate;            /* target checkpoint (ops->nosplit_checkpoint) */
+} NosplitInsnRec;
+
+/*
+ * End the TB before the sequence's first instruction instead of
+ * splitting the sequence: drop every op from that boundary on (the
+ * precedent is the target-side one-insn rewind on a refused page
+ * crossing, e.g. i386 advance_pc's siglongjmp), rewind
+ * pc_next/num_insns/insn_start, and leave is_jmp = DISAS_TOO_MANY so
+ * the sequence opens the NEXT TB whole.  Single-shot by construction:
+ * the caller breaks out of the translation loop immediately after.
+ *
+ * Gives up (plain split, no rewind of state) when the retreat point is
+ * mid-insn, would empty the TB, predates the ring, or the target hook
+ * vetoes.  The dropped insns are a byte-prefix of a registered sequence
+ * — immediate loads by construction — so target-private decode state
+ * they could dirty is limited to what ops->nosplit_retreat re-syncs.
+ */
+static void translator_nosplit_retreat(DisasContextBase *db, CPUState *cpu,
+                                       const TranslatorOps *ops,
+                                       int *max_insns,
+                                       const NosplitInsnRec *ring,
+                                       vaddr seq_start_pc)
+{
+    int j, lo;
+
+    db->is_jmp = DISAS_TOO_MANY;
+    /* Keep at least insn 1: an empty TB cannot be emitted. */
+    lo = MAX(db->num_insns - (NOSPLIT_RING_LEN - 1), 2);
+    for (j = db->num_insns; j >= lo; j--) {
+        const NosplitInsnRec *r = &ring[(j - 1) % NOSPLIT_RING_LEN];
+        if (r->pc < seq_start_pc) {
+            return;             /* sequence starts mid-insn: give up */
+        }
+        if (r->pc == seq_start_pc) {
+            if (ops->nosplit_retreat &&
+                !ops->nosplit_retreat(db, cpu, r->pc, r->tstate)) {
+                return;         /* target vetoed: give up */
+            }
+            tcg_remove_ops_after(r->op_tail);
+            db->num_insns = j - 1;
+            *max_insns = j - 1;
+            db->pc_next = r->pc;
+            db->insn_start = r->insn_start_prev;
+            return;
+        }
+    }
+    /* Retreat point at pc_first or beyond the ring: give up. */
+}
+
 void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
                      vaddr pc, void *host_pc, const TranslatorOps *ops,
                      DisasContextBase *db)
@@ -148,6 +337,16 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     TCGOp *icount_start_insn;
     TCGOp *first_insn_start = NULL;
     bool plugin_enabled;
+    int nosplit_icount_cap;
+    bool nosplit_active;
+    vaddr nosplit_rearm_pc = 0;
+    NosplitInsnRec nosplit_ring[NOSPLIT_RING_LEN];
+    {
+        const uint8_t *nosplit_seqs[QEMU_PLUGIN_NOSPLIT_MAX];
+        size_t nosplit_seq_len;
+        nosplit_active =
+            qemu_plugin_nosplit_seqs(nosplit_seqs, &nosplit_seq_len) != 0;
+    }
 
     /* Initialize DisasContext */
     db->tb = tb;
@@ -156,8 +355,10 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
     db->is_jmp = DISAS_NEXT;
     db->num_insns = 0;
     db->max_insns = *max_insns;
+    nosplit_icount_cap = db->max_insns;
     db->insn_start = NULL;
     db->fake_insn = false;
+    db->nosplit_extend = false;
     db->host_addr[0] = host_pc;
     db->host_addr[1] = NULL;
     db->record_start = 0;
@@ -176,6 +377,17 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
 
     while (true) {
         *max_insns = ++db->num_insns;
+        if (nosplit_active) {
+            /* v4 repair: record this insn's boundary for a possible
+             * never-split RETREAT (see translator_nosplit_retreat). */
+            NosplitInsnRec *r =
+                &nosplit_ring[(db->num_insns - 1) % NOSPLIT_RING_LEN];
+            r->pc = db->pc_next;
+            r->op_tail = tcg_last_op();
+            r->insn_start_prev = db->insn_start;
+            r->tstate = ops->nosplit_checkpoint
+                        ? ops->nosplit_checkpoint(db, cpu) : 0;
+        }
         ops->insn_start(db, cpu);
         db->insn_start = tcg_last_op();
         if (first_insn_start == NULL) {
@@ -225,20 +437,89 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
 
         /* Stop translation if translate_insn so indicated.  */
         if (db->is_jmp != DISAS_NEXT) {
-            break;
+            /* Never-split: a CLEAN stop (page boundary / target budget)
+             * mid-sequence continues through the sequence instead.  Real
+             * control transfers are never DISAS_TOO_MANY and never
+             * continue.
+             *
+             * v4 repair (maintainer-vetoable), refuse-once semantics:
+             * a re-arm at a pc where a previous re-arm made no progress
+             * is a target refusal that persists; together with op-buffer
+             * pressure it is a HARD refusal, and a hard refusal mid-
+             * sequence RETREATS — ends the TB before the sequence's
+             * first insn — instead of re-arming (the old re-arm spin)
+             * or splitting the sequence. */
+            if (db->is_jmp == DISAS_TOO_MANY && nosplit_active) {
+                vaddr seq_start = 0;
+                NosplitVerdict v =
+                    translator_nosplit_continue(db, &seq_start);
+                if (v == NOSPLIT_EXTEND &&
+                    (tcg_op_buf_full() ||
+                     (db->nosplit_extend &&
+                      db->pc_next == nosplit_rearm_pc))) {
+                    v = NOSPLIT_REFUSE;
+                }
+                if (v == NOSPLIT_EXTEND) {
+                    nosplit_rearm_pc = db->pc_next;
+                    db->nosplit_extend = true;
+                    db->is_jmp = DISAS_NEXT;
+                } else {
+                    if (v == NOSPLIT_REFUSE) {
+                        translator_nosplit_retreat(db, cpu, ops, max_insns,
+                                                   nosplit_ring, seq_start);
+                    }
+                    break;
+                }
+            } else {
+                break;
+            }
         }
 
         /* Stop translation if the output buffer is full,
            or we have executed all of the allowed instructions.  */
         if (tcg_op_buf_full() || db->num_insns >= db->max_insns) {
-            db->is_jmp = DISAS_TOO_MANY;
-            break;
+            /* Never-split: extend the budget (icount / single-step
+             * included — the sequence is atomic to the translator by
+             * design) rather than end mid-sequence.  gen_tb_end bills
+             * at most the ORIGINAL budget so an icount slice cannot
+             * livelock on a TB it can never afford.
+             *
+             * v4 repair: a hard refusal mid-sequence (op-buffer
+             * pressure, CF_COUNT_MASK ceiling) RETREATS instead of
+             * splitting, so budget-and-boundary collisions no longer
+             * split fixed-width straddles. */
+            NosplitVerdict v = NOSPLIT_NO_MATCH;
+            vaddr seq_start = 0;
+            if (nosplit_active) {
+                v = translator_nosplit_continue(db, &seq_start);
+                if (v == NOSPLIT_EXTEND && tcg_op_buf_full()) {
+                    v = NOSPLIT_REFUSE;
+                }
+            }
+            if (v == NOSPLIT_EXTEND) {
+                nosplit_rearm_pc = db->pc_next;
+                db->nosplit_extend = true;
+                db->max_insns = db->num_insns + 1;
+            } else if (v == NOSPLIT_REFUSE) {
+                translator_nosplit_retreat(db, cpu, ops, max_insns,
+                                           nosplit_ring, seq_start);
+                break;
+            } else {
+                db->is_jmp = DISAS_TOO_MANY;
+                break;
+            }
         }
     }
 
     /* Emit code to exit the TB, as indicated by db->is_jmp.  */
     ops->tb_stop(db, cpu);
-    gen_tb_end(tb, cflags, icount_start_insn, db->num_insns);
+    /* Never-split extension: bill at most the budget the TB was asked
+     * for.  Identical to db->num_insns except when the atomic-sequence
+     * continue-through pushed num_insns past the requested count — an
+     * icount head check billed the full count would then exit forever
+     * on a slice that can never afford the TB. */
+    gen_tb_end(tb, cflags, icount_start_insn,
+               MIN(db->num_insns, nosplit_icount_cap));
 
     /*
      * Manage can_do_io for the translation block: set to false before

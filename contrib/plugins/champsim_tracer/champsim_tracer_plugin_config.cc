@@ -85,11 +85,6 @@ bool set_wp_regdata(PluginConfig *cfg, const char *v)
     return true;
 }
 
-bool set_kexc(PluginConfig *cfg, const char *v)
-{
-    cfg->kexc = atoi(v);
-    return cfg->kexc == 0 || cfg->kexc == 1;
-}
 
 bool set_faults(PluginConfig *cfg, const char *v)
 {
@@ -226,6 +221,7 @@ bool set_curtask_off(PluginConfig *cfg, const char *v)
  *   trace_window=simpoint:file=mcf.sp+interval=100000000+simulation=20000000+warmup=2000000
  *   trace_window=symbol:name=main+occurrence=3+simulation=20000000
  *   trace_window=marker:simulation=20000000+policy=latch
+ *   trace_window=marker:simulation=20000000+simpoints=mcf.sp+interval=100000000+warmup=2000000
  *
  * First colon-delimited token names the mode; each mode accepts only
  * its own keys (cross-mode keys are rejected, no silent mixing).
@@ -323,7 +319,40 @@ bool parse_kv_pair(PluginConfig *cfg, const char *mode,
                     "'latch' or 'trace-all' (got '%s')\n", kv.second);
             return false;
         }
-        return bad_key("simulation, policy");
+        /*
+         * SimPoint schedule COMPOSED ONTO the marker window.
+         *
+         * A marker anchor and a SimPoint schedule are two separate
+         * inputs.  The marker says WHOSE instructions are being counted
+         * (it latches the address space that executed the START sequence
+         * and zeroes that process's user-instruction clock); the schedule
+         * says WHICH intervals of that clock to capture.  Neither implies
+         * the other: `trace_window=simpoint:` alone states only that
+         * SimPoint offsets are in use, and in system mode that is refused
+         * at install because it names a position on a clock without
+         * saying whose clock it is.
+         *
+         * The offsets are read exactly as the simpoint window reads them
+         * (same file format, same interval scaling, same warmup); what
+         * changes is the clock they position on.
+         */
+        if (match("simpoints")) {
+            g_free(cfg->simpoints_file);
+            cfg->simpoints_file = g_strdup(kv.second);
+            cfg->marker_sched_keys = true;
+            return true;
+        }
+        if (match("interval")) {
+            cfg->simpoint_interval = g_ascii_strtoull(kv.second, nullptr, 10);
+            cfg->marker_sched_keys = true;
+            return cfg->simpoint_interval > 0;
+        }
+        if (match("warmup")) {
+            cfg->warmup_insns = g_ascii_strtoull(kv.second, nullptr, 10);
+            cfg->marker_sched_keys = true;
+            return true;
+        }
+        return bad_key("simulation, policy, simpoints, interval, warmup");
     }
     fprintf(stderr,
             "champsim_tracer: trace_window: unknown mode '%s' "
@@ -405,7 +434,6 @@ const struct {
     { "regdata",    set_regdata    },
     { "wp_memdata", set_wp_memdata },
     { "wp_regdata", set_wp_regdata },
-    { "kexc",       set_kexc       },
     { "faults",     set_faults     },
     { "interrupts", set_interrupts },
     { "devio",      set_devio      },
@@ -460,6 +488,7 @@ bool parse_plugin_options(PluginConfig *cfg, int argc, char **argv)
                 "file", "interval", "warmup",
                 "simulation",                          /* simpoint */
                 "name", "occurrence",                  /* symbol */
+                "policy", "simpoints",                 /* marker */
                 nullptr,
             };
             bool looks_like_tw = false;

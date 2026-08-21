@@ -11,10 +11,15 @@
  *   fork; child: PTRACE_TRACEME, execvp(target)
  *   parent: wait for the exec-stop  (target now mapped, stopped at its first
  *           userspace instruction, IN ITS OWN address space)
- *           save the bytes at the entry PC; poke the marker sequence there
- *           run the whole sequence      -> plugin observes it, pins ASID
- *           restore the original bytes and the registers; detach
- *           target runs from its real entry, on-disk binary never touched
+ *           poke the marker sequence at the entry PC and PERSIST it
+ *             (content-as-gate: the window re-reads those bytes at every
+ *             context switch)
+ *           x86: single-step the sequence -> plugin observes it, pins ASID;
+ *             restore the registers, resume just past the marker; detach
+ *           aarch64/rv64/mipsel: detach — the released child executes the
+ *             persisted marker itself (plugin observes it, pins ASID) and
+ *             falls through into its own code at entry + marker bytes
+ *           on-disk binary never touched (the patch is in the live image)
  *
  * Why ptrace and not LD_PRELOAD: a preload-constructor only works for
  * dynamic binaries (no loader runs a static one), whereas ptrace reaches
@@ -23,31 +28,67 @@
  * space, so the marker's ASID would be the launcher's, not the target's.
  *
  * Portability.  The injector is the only OS/arch-specific piece, isolated
- * behind a three-call backend (regs_get/regs_set/regs_pc, encode_patch,
- * run_patch) selected by CST_ATTACH_ARCH_*.  Linux backends exist for
+ * behind a small backend (regs_get/regs_pc + encode_patch everywhere;
+ * regs_set/regs_set_pc/run_patch on x86, whose marker is parent-stepped)
+ * selected by CST_ATTACH_ARCH_*.  Linux backends exist for
  * x86/x86-64, AArch64, RV64 and little-endian 32-bit MIPS — the four ISAs
  * the tracer targets.  A non-Linux guest is a new backend (Windows debug
  * API, macOS Mach, BSD ptrace) plus a per-arch marker encoding in
  * champsim_marker.h — not a redesign.  Unsupported host/arch combinations
  * fail loudly at build or run rather than silently mis-attaching.
  *
- * Two ways to run the injected sequence, one per backend family:
+ * INJECTION CHOREOGRAPHY — two backend families, and why neither leaves a
+ * transient byte where a captured TB can see it:
  *
- *   x86 single-steps it.  PTRACE_SINGLESTEP is backed by EFLAGS.TF, which
- *   every x86 kernel exposes, and the sequence is CST_MARKER_SEQ_LEN
- *   instructions long.
+ *   x86 single-steps the sequence.  PTRACE_SINGLESTEP is backed by
+ *   EFLAGS.TF, which every x86 kernel exposes; CST_MARKER_SEQ_LEN steps
+ *   retire the marker under the parent's control, the stop PC proves it
+ *   ran, and the register file (the marker clobbers %eax) is restored
+ *   exactly, with the resume PC placed on the first instruction past the
+ *   persisted marker.  The patch is the marker alone — nothing transient
+ *   is ever in the live image.
  *
- *   The fixed-width ISAs append a trap instruction after the sequence and
- *   PTRACE_CONT to it.  Single-step is not a portable primitive: RISC-V
- *   has no architectural single-step usable from S-mode (Linux answers
- *   PTRACE_SINGLESTEP with -EIO, which is why gdb software-steps RISC-V),
- *   and stepping is in any case six stops instead of one.  PTRACE_CONT and
- *   a breakpoint trap are universally available, and they let the marker's
- *   instructions retire back-to-back, which is exactly the adjacency the
- *   plugin's execution-time detector looks for.  All three trap handlers
- *   (arm64 brk_handler, riscv do_trap_break, mips do_bp with break code 0)
- *   report SIGTRAP with the PC left ON the trap instruction, so the stop
- *   PC is a positive check that the whole sequence executed.
+ *   The fixed-width ISAs (aarch64 / RV64 / mipsel) POKE-AND-RELEASE: the
+ *   patch is the marker sequence alone, and after writing it the parent
+ *   simply detaches.  The child executes the persisted marker at its
+ *   entry and falls through into its own first unreplaced instruction at
+ *   entry + CST_ATTACH_MARKER_SEQ_BYTES — exactly where the old
+ *   trap-based choreography used to place the resume PC by hand.  No
+ *   post-marker stop exists, and none is load-bearing:
+ *
+ *     - PC placement is the natural fall-through;
+ *     - there is no trailing trap slot to restore;
+ *     - the only register-file damage is the marker's scratch register
+ *       (a64 w0 / riscv a0 / mips $t0) left holding the final marker
+ *       immediate.  At execve the kernel hands _start zeroed GPRs and no
+ *       ABI grants a scratch register meaning at the entry point, so an
+ *       entry that READS it before writing it is already outside the
+ *       process-start contract — a strictly weaker imposition than the
+ *       one this injector openly makes anyway (the first
+ *       CST_ATTACH_MARKER_SEQ_BYTES of entry code are replaced by the
+ *       persisted marker and never execute).  The canonical entries
+ *       (glibc _start, ld.so _start on all three ISAs) write their first
+ *       argument register before reading it.
+ *
+ *   These backends previously appended a breakpoint trap (arm64 brk #0,
+ *   riscv ebreak, mips break) after the sequence, PTRACE_CONTed to it,
+ *   and restored the trap slot at the stop.  That choreography is GONE,
+ *   and must not come back in any placement: QEMU translates whole TBs,
+ *   and the marker's TB — translated the instant the sequence first
+ *   executes, i.e. BEFORE any ptrace stop can restore anything — extends
+ *   past the sequence into whatever bytes follow it.  The trap byte was
+ *   therefore captured into a wire template (template_raw_bytes flagged
+ *   the mips break word 0x0000000d at entry+24 against the target's
+ *   image), and no stop placed after the marker can avoid the same
+ *   capture, because the stop's own instruction bytes would sit in a
+ *   translated-and-captured TB just the same.  Single-step is not a
+ *   portable escape either: RISC-V Linux answers PTRACE_SINGLESTEP with
+ *   -EIO (gdb software-steps it, which is the same trap problem), and
+ *   MIPS has no hardware trace bit.  What the stop bought — the stop-PC
+ *   proof of retirement — is carried by the plugin itself now: the
+ *   marker's execution is what opens the trace window, so a run that
+ *   produced a window is the proof, and a failed injection is loud at
+ *   the poke.
  *
  * Instruction-cache coherency after patching text is the kernel's job on
  * every one of these ISAs: PTRACE_POKETEXT lands in access_process_vm(),
@@ -139,21 +180,6 @@
 typedef unsigned long cst_word;
 #define CST_WORD sizeof(cst_word)
 
-/* Read @len bytes at guest address @addr from the traced child @pid. */
-static int peek_bytes(pid_t pid, unsigned long addr, uint8_t *buf, size_t len)
-{
-    for (size_t off = 0; off < len; off += CST_WORD) {
-        errno = 0;
-        long w = ptrace(PTRACE_PEEKTEXT, pid, addr + off, 0);
-        if (w == -1 && errno) {
-            return -1;
-        }
-        size_t n = (len - off < CST_WORD) ? len - off : CST_WORD;
-        memcpy(buf + off, &w, n);
-    }
-    return 0;
-}
-
 /* Write @len bytes to guest address @addr in the traced child @pid,
  * preserving the bytes beyond @len within the final partial word. */
 static int poke_bytes(pid_t pid, unsigned long addr, const uint8_t *buf,
@@ -183,27 +209,33 @@ static int poke_bytes(pid_t pid, unsigned long addr, const uint8_t *buf,
 /* ------------------------------------------------------------------ *
  * Per-arch backend.
  *
- * Three things vary across ISAs and nothing else does:
+ * What varies across ISAs and nothing else does:
  *
- *   cst_regs / regs_get / regs_set / regs_pc
- *       save, restore and read the PC out of the child's register state.
- *       The saved state must cover everything the injected sequence
- *       clobbers, because the target has to resume from its real entry
- *       with the register file the kernel handed it at execve.
+ *   cst_regs / regs_get / regs_pc
+ *       read the child's register state (the entry PC lives there).
+ *   regs_set / regs_set_pc              (x86 only)
+ *       restore the register file after single-stepping the marker and
+ *       place the resume PC past it.  The fixed-width backends have no
+ *       post-marker stop (poke-and-release; see the header comment), so
+ *       they never write registers at all.
  *   encode_patch()
- *       the bytes written at the entry: the marker sequence, plus (on the
- *       trap-terminated backends) the trap that ends it.
- *   run_patch()
- *       run the patch and stop with the whole marker sequence retired.
+ *       the bytes written at the entry: the marker sequence, nothing
+ *       else.  A trailing trap is forbidden — its byte lands inside the
+ *       marker's translated-and-captured TB (header comment).
+ *   run_patch()                          (x86 only)
+ *       single-step the marker to retirement under the parent's control.
  *
- * CST_ATTACH_PATCH_BYTES is the patch length, which is also how many
- * original bytes are saved and restored.
+ * CST_ATTACH_PATCH_BYTES is the patch length; every patched byte is
+ * persisted (content-as-gate), so nothing is saved or restored.
  * ------------------------------------------------------------------ */
 
 #if defined(CST_ATTACH_ARCH_X86)
 
 #define CST_ATTACH_ARCH_NAME     "x86"
 #define CST_ATTACH_PATCH_BYTES   CST_MARKER_X86_SEQ_BYTES
+/* The persisted portion of the patch (the marker; x86 has no trailing
+ * trap, so it is the whole patch). */
+#define CST_ATTACH_MARKER_SEQ_BYTES CST_MARKER_X86_SEQ_BYTES
 #define CST_ATTACH_ENTRY_ALIGN   1u        /* x86 insns are unaligned */
 
 struct cst_regs { struct user_regs_struct r; };
@@ -225,6 +257,15 @@ static unsigned long regs_pc(const struct cst_regs *s)
     return s->r.rip;
 #else
     return s->r.eip;
+#endif
+}
+
+static void regs_set_pc(struct cst_regs *s, unsigned long pc)
+{
+#if defined(__x86_64__)
+    s->r.rip = pc;
+#else
+    s->r.eip = pc;
 #endif
 }
 
@@ -259,21 +300,20 @@ static int run_patch(pid_t pid, unsigned long entry)
     return 0;
 }
 
-#else   /* the fixed-width, trap-terminated backends */
+#else   /* the fixed-width, poke-and-release backends */
 
 /*
  * aarch64 / RV64 / mipsel all encode the marker as CST_MARKER_SEQ_LEN
- * two-instruction immediate-load pairs (champsim_marker.h), so the patch
- * is that sequence followed by one 4-byte trap.
+ * two-instruction immediate-load pairs (champsim_marker.h); the patch is
+ * that sequence and nothing else, all of it persisted.
  */
-#define CST_ATTACH_TRAP_BYTES    4u
-#define CST_ATTACH_PATCH_BYTES   (CST_MARKER_PAIR_SEQ_BYTES + \
-                                  CST_ATTACH_TRAP_BYTES)
+#define CST_ATTACH_PATCH_BYTES   CST_MARKER_PAIR_SEQ_BYTES
+/* The persisted portion of the patch — the whole of it. */
+#define CST_ATTACH_MARKER_SEQ_BYTES CST_MARKER_PAIR_SEQ_BYTES
 
 #if defined(CST_ATTACH_ARCH_A64)
 
 #define CST_ATTACH_ARCH_NAME     "aarch64"
-#define CST_ATTACH_TRAP_INSN     0xd4200000u    /* brk #0 */
 #define CST_ATTACH_ENTRY_ALIGN   4u
 
 /* NT_PRSTATUS is struct user_regs_struct: x0..x30, sp, pc, pstate. */
@@ -282,10 +322,6 @@ struct cst_regs { struct user_regs_struct r; };
 #elif defined(CST_ATTACH_ARCH_RISCV)
 
 #define CST_ATTACH_ARCH_NAME     "riscv64"
-#define CST_ATTACH_TRAP_INSN     0x00100073u    /* ebreak (base ISA, 4-byte;
-                                                 * never the 2-byte c.ebreak,
-                                                 * so the patch stays a whole
-                                                 * number of 4-byte slots) */
 /*
  * IALIGN is 16 on any hart implementing the C extension, so a 32-bit
  * instruction is legal at any 2-byte boundary and RISC-V entry points are
@@ -303,21 +339,21 @@ struct cst_regs { struct user_regs_struct r; };
 #else   /* CST_ATTACH_ARCH_MIPS */
 
 #define CST_ATTACH_ARCH_NAME     "mipsel"
-#define CST_ATTACH_TRAP_INSN     0x0000000du    /* break (code 0) */
 #define CST_ATTACH_ENTRY_ALIGN   4u
 
 /*
- * MIPS reads and writes single registers by uapi index instead of a
- * regset.  NT_PRSTATUS on MIPS is an elf_gregset_t whose layout is spelled
- * out in the kernel's non-uapi <asm/reg.h> (the MIPS32_EF_* offsets), so
- * it is not something userspace can address portably; PTRACE_PEEKUSER's
- * index space *is* uapi (asm/ptrace.h: 0..31 GPRs, PC == 64) and is what
- * gdb uses.  Two indices cover everything the injection touches: PC, and
- * $t0 == GPR 8, the register the marker's lui/ori pair loads.
+ * MIPS reads single registers by uapi index instead of a regset.
+ * NT_PRSTATUS on MIPS is an elf_gregset_t whose layout is spelled out in
+ * the kernel's non-uapi <asm/reg.h> (the MIPS32_EF_* offsets), so it is
+ * not something userspace can address portably; PTRACE_PEEKUSER's index
+ * space *is* uapi (asm/ptrace.h: 0..31 GPRs, PC == 64) and is what gdb
+ * uses.  One index covers everything the injection touches: PC.  ($t0,
+ * the marker's scratch register, is deliberately NOT saved/restored —
+ * poke-and-release has no stop to restore it at; see the header comment
+ * for why the residue is within the process-start contract.)
  */
-#define CST_ATTACH_MIPS_T0       8
 
-struct cst_regs { unsigned long pc; unsigned long t0; };
+struct cst_regs { unsigned long pc; };
 
 #endif  /* per-arch struct cst_regs */
 
@@ -327,13 +363,6 @@ static int regs_get(pid_t pid, struct cst_regs *s)
 {
     struct iovec io = { .iov_base = &s->r, .iov_len = sizeof(s->r) };
     return ptrace(PTRACE_GETREGSET, pid, (void *)(unsigned long)NT_PRSTATUS,
-                  &io) == -1 ? -1 : 0;
-}
-
-static int regs_set(pid_t pid, const struct cst_regs *s)
-{
-    struct iovec io = { .iov_base = (void *)&s->r, .iov_len = sizeof(s->r) };
-    return ptrace(PTRACE_SETREGSET, pid, (void *)(unsigned long)NT_PRSTATUS,
                   &io) == -1 ? -1 : 0;
 }
 
@@ -351,27 +380,7 @@ static int regs_get(pid_t pid, struct cst_regs *s)
     if (pc == -1 && errno) {
         return -1;
     }
-    errno = 0;
-    long t0 = ptrace(PTRACE_PEEKUSER, pid,
-                     (void *)(unsigned long)CST_ATTACH_MIPS_T0, 0);
-    if (t0 == -1 && errno) {
-        return -1;
-    }
     s->pc = (unsigned long)pc;
-    s->t0 = (unsigned long)t0;
-    return 0;
-}
-
-static int regs_set(pid_t pid, const struct cst_regs *s)
-{
-    if (ptrace(PTRACE_POKEUSER, pid, (void *)(unsigned long)PC,
-               (void *)s->pc) == -1) {
-        return -1;
-    }
-    if (ptrace(PTRACE_POKEUSER, pid, (void *)(unsigned long)CST_ATTACH_MIPS_T0,
-               (void *)s->t0) == -1) {
-        return -1;
-    }
     return 0;
 }
 
@@ -391,77 +400,44 @@ static void encode_patch(uint8_t *out)
 #else
     cst_marker_mips_encode_seq_imm(out, CST_MARKER_MAGIC);
 #endif
-    cst_marker_put_u32le(out + CST_MARKER_PAIR_SEQ_BYTES,
-                         CST_ATTACH_TRAP_INSN);
-}
-
-/*
- * Let the whole sequence retire in one go and stop on the trailing trap.
- * The marker instructions execute back-to-back at user privilege in the
- * target's address space, which is precisely the run the plugin's
- * execution-time detector recognises.
- *
- * A stop that is not our trap is a signal the fresh, handler-less child
- * had no business receiving; swallow it (deliver 0 rather than re-raise,
- * which would kill a process with no handlers installed) and continue,
- * bounded so a pathological guest cannot spin here forever.
- */
-static int run_patch(pid_t pid, unsigned long entry)
-{
-    const unsigned MAX_SPURIOUS = 16;
-    unsigned spurious = 0;
-
-    for (;;) {
-        if (ptrace(PTRACE_CONT, pid, 0, 0) == -1) {
-            perror("cst_attach: PTRACE_CONT");
-            return -1;
-        }
-        int status;
-        if (waitpid(pid, &status, 0) < 0) {
-            perror("cst_attach: waitpid(marker)");
-            return -1;
-        }
-        if (!WIFSTOPPED(status)) {
-            fprintf(stderr,
-                    "cst_attach: target exited during marker sequence\n");
-            return -1;
-        }
-        if (WSTOPSIG(status) == SIGTRAP) {
-            break;
-        }
-        if (++spurious > MAX_SPURIOUS) {
-            fprintf(stderr, "cst_attach: target kept stopping on signal %d "
-                    "instead of the marker trap\n", WSTOPSIG(status));
-            return -1;
-        }
-    }
-
-    /*
-     * The stop PC is the proof the sequence ran: all three trap handlers
-     * leave it on the trap instruction, i.e. exactly one full marker
-     * sequence past the entry.  Anything else means the target did not
-     * execute what we wrote, so refuse rather than resume it with an
-     * unknown amount of the patch retired.
-     */
-    struct cst_regs at_trap;
-    if (regs_get(pid, &at_trap) != 0) {
-        perror("cst_attach: read regs at marker trap");
-        return -1;
-    }
-    unsigned long want = entry + CST_MARKER_PAIR_SEQ_BYTES;
-    if (regs_pc(&at_trap) != want) {
-        fprintf(stderr, "cst_attach[" CST_ATTACH_ARCH_NAME "]: marker trap at "
-                "0x%lx, expected 0x%lx (sequence did not execute as "
-                "written)\n", regs_pc(&at_trap), want);
-        return -1;
-    }
-    return 0;
 }
 
 #endif  /* backend family */
 
 /*
- * Inject the marker sequence at the target's entry, run it, then restore.
+ * Inject the marker sequence at the target's entry and PERSIST it.
+ *
+ * CONTENT-AS-GATE (system mode): the tracer's gate refresh re-reads the
+ * START bytes at the latched vaddr on every committed address-space switch,
+ * so the marker bytes must stay at that vaddr for the window to survive.
+ * This injector therefore LEAVES the marker sequence patched at the entry
+ * (it does NOT restore it — the earlier restore closed the window at the
+ * first refresh).  Every patched byte is persisted marker; nothing
+ * transient is ever written into the image (a trailing trap would be
+ * captured into a wire template by whole-TB translation — see the header
+ * comment).  How the sequence then executes is per family:
+ *
+ *   x86: single-stepped under the parent (run_patch), register file
+ *   restored, resume PC placed at entry + CST_ATTACH_MARKER_SEQ_BYTES.
+ *
+ *   aarch64 / RV64 / mipsel: poke-and-release — the caller detaches and
+ *   the child itself executes the persisted marker at its entry, falling
+ *   through into its first unreplaced instruction at
+ *   entry + CST_ATTACH_MARKER_SEQ_BYTES.  The marker's scratch register
+ *   residue is within the process-start contract (header comment).
+ *
+ * Consequence, stated loudly: the target's original entry prologue
+ * (CST_ATTACH_MARKER_SEQ_BYTES) is REPLACED by the persisted marker.  A
+ * fully transparent capture — one that preserves the target's own prologue
+ * byte-for-byte — requires relocating the real entry behind an mmap'd RX
+ * scratch page and latching the marker there; that relocation, and an
+ * injected mlock(2) to pin the marker page, are the remaining refinement.
+ * Marker-page residency across refreshes otherwise relies on the guest
+ * keeping the page resident (a no-swap initramfs — the validator's shape —
+ * or `swapoff`); a gated context whose page pages out at a refresh gates
+ * the capture off, which the plugin's `gated context lost marker page
+ * residency` counter makes loud.
+ *
  * At the exec-stop the child is at its first userspace instruction in its
  * own address space; the marker runs there, so the plugin pins to the
  * target's ASID.  Returns 0 on success.
@@ -489,30 +465,31 @@ static int inject_marker_at_entry(pid_t pid)
     uint8_t patch[CST_ATTACH_PATCH_BYTES];
     encode_patch(patch);
 
-    uint8_t orig[CST_ATTACH_PATCH_BYTES];
-    if (peek_bytes(pid, entry, orig, sizeof(orig)) != 0) {
-        perror("cst_attach: read entry bytes");
-        return -1;
-    }
     if (poke_bytes(pid, entry, patch, sizeof(patch)) != 0) {
         perror("cst_attach: write marker");
         return -1;
     }
 
+#if defined(CST_ATTACH_ARCH_X86)
+    /* Single-step the marker to retirement, then restore the register
+     * file (the marker clobbered %eax) and advance the PC to the first
+     * instruction past the persisted marker so the target resumes there
+     * rather than re-executing it. */
     if (run_patch(pid, entry) != 0) {
         return -1;
     }
-
-    /* Restore the original entry bytes and rewind the PC so the target
-     * runs from its real first instruction, fully intact. */
-    if (poke_bytes(pid, entry, orig, sizeof(orig)) != 0) {
-        perror("cst_attach: restore entry bytes");
+    struct cst_regs resume = saved_regs;
+    regs_set_pc(&resume, entry + CST_ATTACH_MARKER_SEQ_BYTES);
+    if (regs_set(pid, &resume) != 0) {
+        perror("cst_attach: set resume registers");
         return -1;
     }
-    if (regs_set(pid, &saved_regs) != 0) {
-        perror("cst_attach: restore entry registers");
-        return -1;
-    }
+#endif
+    /* Fixed-width backends: nothing left to do.  The detach in run()
+     * releases the child at its entry; it executes the persisted marker
+     * itself and falls through into its own code.  The proof the marker
+     * ran is the plugin's: the sequence's execution is what opens the
+     * trace window. */
     return 0;
 }
 

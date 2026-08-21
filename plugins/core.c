@@ -40,100 +40,44 @@
 static qemu_plugin_asid_write_cb_t asid_write_hook;
 
 /*
- * ADDRESS-SPACE AND THREAD IDENTITY (opaque monotonic ids).
+ * Never-split code sequences (qemu_plugin_register_nosplit_code_sequences).
  *
- * Base QEMU keys its TLB on the translation regime (mmu_idx) and maintains
- * no notion of WHICH address space a vCPU is in, so this is a new primitive
- * rather than a re-export of an existing one.  It is deliberately the whole
- * mechanism: the target hook reports the RAW architectural key
- * (TCGCPUOps::get_plugin_identity) and this layer maps each distinct key to
- * a monotonically increasing id.  Plugins never see the key, so nothing
- * they do can depend on interpreting it.
- *
- * The map is process-wide, not per-vCPU: the same address space seen on two
- * vCPUs must produce the SAME id, which a per-vCPU table could not do.  It
- * is written only when a vCPU's architectural key changes (a context
- * switch, not a TB), so the mutex is uncontended in practice; every hot-path
- * read is served by the per-vCPU memo in CPUState.
- *
- * Key 0 is reserved for "no identity" and is never interned: a target with
- * no hook, and a CPU model with no thread-pointer register, both land on it
- * and must report id 0 so a consumer can see the architecture named nothing.
+ * The registered byte patterns are guest-code sequences the TRANSLATOR must
+ * keep whole inside one TB (see translator_loop's continue-through).  One
+ * process-wide table, written once at plugin install (before any guest code
+ * translates) and read at translation time; the count is published last with
+ * a release store so a translator thread that observes n > 0 also observes
+ * the fully-copied patterns.
  */
-static GMutex plugin_identity_lock;
-static GHashTable *plugin_space_id_map;     /* raw key -> id */
-static GHashTable *plugin_thread_id_map;    /* raw key -> id */
-static uint64_t plugin_space_id_next = 1;
-static uint64_t plugin_thread_id_next = 1;
+static uint8_t nosplit_seq_bytes[QEMU_PLUGIN_NOSPLIT_MAX][64];
+static size_t nosplit_seq_len;
+static size_t nosplit_seq_n;
 
-static uint64_t plugin_intern_locked(GHashTable **map, uint64_t *next,
-                                     uint64_t key)
+size_t qemu_plugin_nosplit_seqs(const uint8_t **seqs, size_t *seq_len)
 {
-    if (key == 0) {
-        return 0;
+    size_t n = qatomic_load_acquire(&nosplit_seq_n);
+    for (size_t i = 0; i < n; i++) {
+        seqs[i] = nosplit_seq_bytes[i];
     }
-    if (!*map) {
-        *map = g_hash_table_new(g_int64_hash, g_int64_equal);
-    }
-    gpointer v = g_hash_table_lookup(*map, &key);
-    if (v) {
-        return *(uint64_t *)v;
-    }
-    uint64_t *k = g_new(uint64_t, 1);
-    uint64_t *id = g_new(uint64_t, 1);
-    *k = key;
-    *id = (*next)++;
-    g_hash_table_insert(*map, k, id);
-    return *id;
+    *seq_len = nosplit_seq_len;
+    return n;
 }
 
-/*
- * Re-read this vCPU's architectural identity keys and refresh its interned
- * ids.  Cheap and idempotent: the common case is two loads out of the CPU
- * state, two comparisons against the memo, and no lock at all.
- *
- * Call sites must be places where the target's architectural state is
- * coherent for the executing vCPU — the address-space commit points (which
- * run in a helper, after the store) and the plugin API (called from
- * callbacks whose registration decides whether TCG globals have been
- * spilled).  Registers that live in TCG globals (x86 segment bases, RISC-V
- * tp) are only guaranteed current in a CB_RW_REGS callback; the memo makes
- * a stale read self-correcting at the next coherent sample rather than
- * sticky.
- */
-void plugin_identity_sample(CPUState *cpu)
+void qemu_plugin_register_nosplit_code_sequences(const uint8_t *seqs,
+                                                 size_t seq_len,
+                                                 size_t n_seqs)
 {
-    const TCGCPUOps *ops = cpu->cc->tcg_ops;
-    uint64_t space_key = 0, thread_key = 0;
-
-    if (ops && ops->get_plugin_identity) {
-        ops->get_plugin_identity(cpu, &space_key, &thread_key);
-    }
-    if (cpu->plugin_identity_valid &&
-        cpu->plugin_space_key == space_key &&
-        cpu->plugin_thread_key == thread_key) {
+    if (!seqs || !seq_len || !n_seqs ||
+        seq_len > sizeof(nosplit_seq_bytes[0]) ||
+        n_seqs > QEMU_PLUGIN_NOSPLIT_MAX) {
+        qatomic_store_release(&nosplit_seq_n, 0);
         return;
     }
-    bool space_changed = !cpu->plugin_identity_valid ||
-                         cpu->plugin_space_key != space_key;
-    bool thread_changed = !cpu->plugin_identity_valid ||
-                          cpu->plugin_thread_key != thread_key;
-
-    g_mutex_lock(&plugin_identity_lock);
-    if (space_changed) {
-        cpu->plugin_process_id = plugin_intern_locked(&plugin_space_id_map,
-                                                      &plugin_space_id_next,
-                                                      space_key);
+    for (size_t i = 0; i < n_seqs; i++) {
+        memcpy(nosplit_seq_bytes[i], seqs + i * seq_len, seq_len);
     }
-    if (thread_changed) {
-        cpu->plugin_thread_id = plugin_intern_locked(&plugin_thread_id_map,
-                                                     &plugin_thread_id_next,
-                                                     thread_key);
-    }
-    g_mutex_unlock(&plugin_identity_lock);
-    cpu->plugin_space_key = space_key;
-    cpu->plugin_thread_key = thread_key;
-    cpu->plugin_identity_valid = true;
+    nosplit_seq_len = seq_len;
+    qatomic_store_release(&nosplit_seq_n, n_seqs);
 }
 
 void qemu_plugin_register_asid_write_cb(qemu_plugin_id_t id,
@@ -434,16 +378,6 @@ void cpu_plugin_evq_push(CPUState *cpu, int kind, uint64_t pc,
      * queued event; the value passed is the just-committed one the
      * per-target state hook reports.
      */
-    if (kind == QEMU_PLUGIN_CPU_EVENT_ASID_WRITE) {
-        /*
-         * The architectural commit point for the address space: the store
-         * has retired and the TLB flush decision has been made, so this is
-         * where the vCPU's process identity changes.  Sampling here (not
-         * only from the API) means a consumer reading the id inside this
-         * very hook already sees the NEW address space.
-         */
-        plugin_identity_sample(cpu);
-    }
     if (kind == QEMU_PLUGIN_CPU_EVENT_ASID_WRITE && asid_write_hook) {
         int hpriv = 0;
         uint64_t hasid = 0;

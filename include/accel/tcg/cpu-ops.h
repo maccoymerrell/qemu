@@ -128,68 +128,6 @@ struct TCGCPUOps {
     bool (*plugin_thread_ptr_tracks_current)(CPUState *cpu);
 
     /**
-     * @get_plugin_identity: report the RAW architectural identity keys
-     *
-     * Optional; system-mode targets only.  Fills @space_key with the
-     * architecturally-designated name of the address space the vCPU is
-     * translating through RIGHT NOW, and @thread_key with the
-     * architecturally-designated per-thread pointer register.  Both are
-     * verbatim architectural state, composed only where the architecture
-     * itself splits the name across fields:
-     *
-     *   x86-64   CR3 (PCID kept when CR4.PCIDE, else the architecturally
-     *            ignored low 12 bits masked; the NOFLUSH command bit is
-     *            never state)              /  FS.base (GS.base for a
-     *            non-long-mode task)
-     *   AArch64  TTBR0_EL1 BADDR with the architectural ASID (TCR_EL1.A1
-     *            selects which TTBR supplies it) reassembled into the
-     *            ASID field                /  TPIDR_EL0
-     *   RISC-V   SATP (already {MODE,ASID,PPN}); VSATP under virt
-     *                                      /  tp (x4)
-     *   MIPS     EntryHi.ASID, with CP0 MemoryMapID above it when
-     *            Config5.MI makes MemoryMapID the TLB tag
-     *                                      /  CP0 UserLocal
-     *
-     * These are COMPARED, never interpreted: no guest memory is read, no
-     * value's content is tested for shape, and nothing about any operating
-     * system is assumed.  A key of 0 means "the architecture provides no
-     * such name in this state" — for @thread_key that is the honest answer
-     * on a CPU model that implements no thread-pointer register (a MIPS
-     * model with Config3.ULRI clear), and the identity layer reports id 0
-     * ("no identity") rather than inventing one.
-     *
-     * The core interns each distinct key into a monotonic opaque id and
-     * hands the plugin only the id (qemu_plugin_get_process_id() /
-     * qemu_plugin_get_thread_id()); see plugin_identity_sample().
-     */
-    void (*get_plugin_identity)(CPUState *cpu, uint64_t *space_key,
-                                uint64_t *thread_key);
-
-    /**
-     * @get_plugin_narrow_asid: the target's exhaustible address-space TAG
-     *
-     * Optional.  Reports the narrow, operating-system-recycled tag the
-     * target's TLB carries, when it has one that is distinct from the
-     * page-table root @get_plugin_identity reports — on MIPS, EntryHi.ASID
-     * (with MemoryMapID where Config5.MI makes it the tag).  NULL, and
-     * therefore 0, on every target whose only address-space name IS the
-     * root: x86-64, AArch64 and RISC-V tag their TLBs from a field of the
-     * root register itself, so there is no second value to report.
-     *
-     * It is NOT an identity and must never be used as one: an operating
-     * system re-points these values at different live address spaces as the
-     * space is exhausted, which is the whole reason identity keys on the
-     * root instead.  It exists so a consumer can WITNESS that recycling —
-     * count how much of the tag space a guest burned during a run — using a
-     * value that is independent of, and cannot be inferred from, the
-     * ownership key it is meant to corroborate.  Verbatim architectural
-     * state; no guest memory is read.
-     *
-     * See qemu_plugin_get_narrow_asid().
-     */
-    uint64_t (*get_plugin_narrow_asid)(CPUState *cpu);
-
-    /**
      * @vaddr_is_kernel: classify a code virtual address's privilege domain
      *
      * Optional.  Returns true when @vaddr lies in the guest's KERNEL

@@ -615,14 +615,6 @@ typedef struct {
     MetaFlagsMapperFn     flags_to_metaflags;
     AddrCanonicalizeFn    canonicalize_addr;
     /*
-     * xlate_bypass_priv — the privilege level that executes with the
-     * paging/translation register bypassed, so pinned attribution must
-     * exclude it (RISC-V M-mode runs with satp inert).  -1 means no such
-     * level; every row that has none states it explicitly, because a
-     * zero-filled default would read as user privilege.
-     */
-    int                   xlate_bypass_priv;
-    /*
      * has_be_variant — the ISA ships a big-endian QEMU target.  The run
      * is big-endian when set unless the target_name carries the
      * little-endian "el" suffix (MIPS mips/mips64 vs mipsel/mips64el);
@@ -652,7 +644,7 @@ static const char *const isa_prefixes_mips[]    = { "mips64el", "mips64",
 
 extern const IsaProperties isa_properties[];
 const IsaProperties isa_properties[] = {
-    [TRACE_ISA_UNKNOWN] = { .xlate_bypass_priv = -1 },
+    [TRACE_ISA_UNKNOWN] = {},
     [TRACE_ISA_X86]     = {
         .include_implicit_regs = true,
         .target_prefixes = isa_prefixes_x86,
@@ -660,7 +652,6 @@ const IsaProperties isa_properties[] = {
         .cap_mode_for_target = cap_mode_x86,
         .flags_to_metaflags = x86_flags_to_metaflags,
         .canonicalize_addr = x86_canonicalize_addr,
-        .xlate_bypass_priv = -1,
         .marker_encode_seq = cst_marker_x86_encode_seq_imm,
         .marker_insn_bytes = CST_MARKER_X86_INSN_BYTES,
         .marker_seq_insns  = CST_MARKER_SEQ_LEN,
@@ -673,7 +664,6 @@ const IsaProperties isa_properties[] = {
         .reg_alias_inserter = insert_aarch64_reg_aliases,
         .flags_to_metaflags = aarch64_flags_to_metaflags,
         .canonicalize_addr = aarch64_canonicalize_addr,
-        .xlate_bypass_priv = -1,
         .marker_encode_seq = cst_marker_a64_encode_seq_imm,
         .marker_insn_bytes = CST_MARKER_PAIR_INSN_BYTES,
         .marker_seq_insns  = CST_MARKER_PAIR_SEQ_INSNS,
@@ -696,8 +686,6 @@ const IsaProperties isa_properties[] = {
         .cap_arch = CS_ARCH_RISCV,
         .cap_mode_for_target = cap_mode_riscv,
         .canonicalize_addr = riscv_canonicalize_addr,
-        /* M-mode (normalized priv 3) executes with satp bypassed. */
-        .xlate_bypass_priv = 3,
         .marker_encode_seq = cst_marker_riscv_encode_seq_imm,
         .marker_insn_bytes = CST_MARKER_PAIR_INSN_BYTES,
         .marker_seq_insns  = CST_MARKER_PAIR_SEQ_INSNS,
@@ -716,7 +704,6 @@ const IsaProperties isa_properties[] = {
         .cap_arch = CS_ARCH_MIPS,
         .cap_mode_for_target = cap_mode_mips,
         .canonicalize_addr = mips_canonicalize_addr,
-        .xlate_bypass_priv = -1,
         /* mips/mips64 are big-endian; mipsel/mips64el carry the "el" suffix. */
         .has_be_variant = true,
         .marker_encode_seq = cst_marker_mips_encode_seq_imm,

@@ -171,29 +171,6 @@ struct CPUClass {
 
     void (*disas_set_info)(CPUState *cpu, disassemble_info *info);
 
-    /**
-     * @plugin_identity_caps: what the RESOLVED CPU MODEL can name
-     *
-     * Optional.  Reports, as a bitmask of enum qemu_plugin_identity_cap,
-     * which of the two identity keys of TCGCPUOps::get_plugin_identity this
-     * particular model can actually supply.  The distinction is a property
-     * of the model, not of the target: on MIPS the page-table root lives in
-     * CP0 PWBase, which only a model with Config3.PW implements, and CP0
-     * UserLocal only exists with Config3.ULRI.  On the targets whose root
-     * and thread registers are architecturally mandatory (x86-64 CR3/FS.base,
-     * AArch64 TTBR0/TPIDR_EL0, RISC-V SATP/tp) every model answers with both
-     * bits set.
-     *
-     * A CLASS method taking the ObjectClass deliberately: a plugin has to be
-     * able to decide whether a capture is possible AT INSTALL TIME, which is
-     * before machine_run_board_init() and therefore before the first
-     * CPUState exists.  See qemu_plugin_identity_caps().
-     *
-     * NULL means "names nothing" — the caller must treat a missing method
-     * exactly as a zero mask, never as "assume it works".
-     */
-    uint64_t (*plugin_identity_caps)(ObjectClass *oc);
-
     const char *deprecation_note;
     struct AccelCPUClass *accel_cpu;
 
@@ -684,29 +661,6 @@ struct CPUState {
     CPUPluginState *plugin_state;
 
     /*
-     * Current (process, thread) identity of this vCPU — QEMU-maintained,
-     * per-vCPU, handed to plugins as OPAQUE monotonic integers.
-     *
-     * @plugin_space_key / @plugin_thread_key are the RAW architectural keys
-     * the target's TCGCPUOps::get_plugin_identity hook last reported; they
-     * are a one-entry memo, so a re-sample that finds the same architectural
-     * state costs one comparison and never touches the intern table.
-     * @plugin_process_id / @plugin_thread_id are the interned ids.  0 means
-     * "no identity": a target with no hook (user mode) and a CPU model that
-     * implements no thread-pointer register both report it.
-     *
-     * Refreshed by plugin_identity_sample() at the architectural commit
-     * point for the address space (the same site that flushes the TLB and
-     * pushes the ASID_WRITE event) and on demand from the plugin API, whose
-     * callers sample in a context where the architectural state is coherent.
-     */
-    uint64_t plugin_space_key;
-    uint64_t plugin_thread_key;
-    uint64_t plugin_process_id;
-    uint64_t plugin_thread_id;
-    bool plugin_identity_valid;
-
-    /*
      * Architectural self-loop accounting for the fan-out instruction (an
      * x86 REP-prefixed string operation) most recently executed on this
      * vCPU.  Both fields are written by target-generated TCG from the
@@ -933,6 +887,15 @@ struct CPUState {
      * plugin opts in via qemu_plugin_cpu_events_set().
      */
     QemuPluginCpuEventQueue plugin_evq;
+    /*
+     * A wrong-path window (or the fault-skip gap inside one, when spec_mode
+     * is briefly false but the register snapshot is still live) suppressed or
+     * raced an update of the target's env-derived CPU_INTERRUPT_HARD line.
+     * The excursion-exit resync recomputes the line from restored state — the
+     * register restore is a raw memcpy and never drives it — so a line raised
+     * from a rolled-back pending bit cannot outlive the excursion.
+     */
+    bool plugin_spec_irq_dirty;
     /*
      * Wrong-path TLB-install log.  Speculative (wrong-path) accesses can
      * install softmmu TLB entries on a miss.  Rather than a full tlb_flush()

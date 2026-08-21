@@ -6064,7 +6064,11 @@ static void gen_mtc0(DisasContext *ctx, TCGv arg, int reg, int sel)
             break;
         case CP0_REG05__PWBASE:
             check_pw(ctx);
-            gen_helper_mtc0_pwbase(tcg_env, arg);
+            /* Q13 v4 default, maintainer-vetoable: EntryHi ASID_WRITE is
+             * the sole gate-refresh event; PWBase is stored inline (its
+             * committed-write event push retired with the identity
+             * apparatus). */
+            gen_mtc0_store32(arg, offsetof(CPUMIPSState, CP0_PWBase));
             register_name = "PWBase";
             break;
         case CP0_REG05__PWFIELD:
@@ -7530,7 +7534,7 @@ static void gen_dmtc0(DisasContext *ctx, TCGv arg, int reg, int sel)
             break;
         case CP0_REG05__PWBASE:
             check_pw(ctx);
-            gen_helper_dmtc0_pwbase(tcg_env, arg);
+            tcg_gen_st_tl(arg, tcg_env, offsetof(CPUMIPSState, CP0_PWBase));
             register_name = "PWBase";
             break;
         case CP0_REG05__PWFIELD:
@@ -15252,12 +15256,42 @@ static void mips_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
     }
 }
 
+/*
+ * v4 repair (maintainer-vetoable): never-split RETREAT support.  The
+ * checkpoint captures hflags at each insn boundary; a retreat restores
+ * it, so ending the TB at a boundary that re-opens a delay slot (the
+ * dropped sequence's first insn was the slot of a kept branch) re-arms
+ * the pending-branch state.  saved_hflags is poisoned so save_cpu_state
+ * in tb_stop re-emits the hflags (and, under BMASK, btarget) stores —
+ * the spills it thinks it already emitted may have been dropped with
+ * the retreated ops.  ctx->btarget itself is compile-time state set by
+ * the kept branch and is still valid.  The dropped insns are LUI/ORI
+ * immediate loads and never touch hflags themselves.
+ */
+static uint64_t mips_tr_nosplit_checkpoint(DisasContextBase *dcbase,
+                                           CPUState *cpu)
+{
+    return container_of(dcbase, DisasContext, base)->hflags;
+}
+
+static bool mips_tr_nosplit_retreat(DisasContextBase *dcbase, CPUState *cpu,
+                                    vaddr retreat_pc, uint64_t checkpoint)
+{
+    DisasContext *ctx = container_of(dcbase, DisasContext, base);
+
+    ctx->hflags = (uint32_t)checkpoint;
+    ctx->saved_hflags = ~ctx->hflags;
+    return true;
+}
+
 static const TranslatorOps mips_tr_ops = {
     .init_disas_context = mips_tr_init_disas_context,
     .tb_start           = mips_tr_tb_start,
     .insn_start         = mips_tr_insn_start,
     .translate_insn     = mips_tr_translate_insn,
     .tb_stop            = mips_tr_tb_stop,
+    .nosplit_checkpoint = mips_tr_nosplit_checkpoint,
+    .nosplit_retreat    = mips_tr_nosplit_retreat,
 };
 
 void mips_translate_code(CPUState *cs, TranslationBlock *tb,

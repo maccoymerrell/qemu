@@ -93,16 +93,6 @@ struct PluginConfig {
      * adds per-interval breakdowns of the attribution tables to the
      * per-segment summary. */
     int       histogram_intervals = 0;
-    /* Kernel-excursion ownership model (kexc=1, system/marker mode).
-     * When on, kernel (priv!=0) TBs are attributed to the trace by the
-     * owning excursion — the user address space the kernel was entered
-     * from, tracked through ASID-write path events — instead of by the
-     * live ASID, so a kernel that switches to a private address space
-     * on entry (PTI-style) keeps its synchronous-handler coverage.
-     * kexc=0 restores the live-ASID rule (kernel work whose live ASID
-     * differs from the pinned value — e.g. a PTI kernel page-table base
-     * — is dropped); it is byte-for-byte the pre-ownership behavior. */
-    int       kexc              = 1;
     /* Synchronous-fault handler tracing (faults=0/1, system mode).  When on
      * (default), a synchronous fault detours execution into a handler that is
      * traced as first-class code at its exception-nesting depth, and the
@@ -119,7 +109,7 @@ struct PluginConfig {
      * against its real successor (today's behavior).  interrupts=1 TRACES the
      * handler: its kernel basic blocks appear at exception depth >= 1 between
      * the interrupted context's entries, attributed to the interrupted address
-     * space through the same kexc excursion-ownership machinery a synchronous
+     * space through the same content-gate rule a synchronous
      * fault uses.  The wire carries it through the existing depth trailer — no
      * new records.  Inert in user mode (no asynchronous interrupts). */
     int       interrupts        = 0;
@@ -234,6 +224,12 @@ struct PluginConfig {
     enum MarkerPolicy { MARKER_LATCH = 0, MARKER_TRACE_ALL = 1 };
     int marker_policy = MARKER_LATCH;
 
+    /* True once a marker window has been given any SimPoint-schedule key
+     * (simpoints / interval / warmup).  Half a composition is refused at
+     * install rather than silently ignored: schedule keys with no schedule
+     * position nothing. */
+    bool marker_sched_keys = false;
+
     /*
      * Dead-latch timeout (latch_timeout=<ms>).  In marker latch mode a
      * process that exits WITHOUT running its END marker would leave its
@@ -253,24 +249,14 @@ struct PluginConfig {
      * exhibits; enable it for latch traces where processes may die without
      * their END marker and the icount budget is too coarse a fallback.
      *
-     * A STAMP REFRESH DEMANDS PROOF OF LIFE.  The events that would mark
-     * an owned root "recently alive" — a schedule-in of its value, a
-     * counted user TB under it — are all forged by the one exposure this
-     * latch is the documented mitigation for: Linux recycles a dead
-     * process's page-table root page into the next fork, and the
-     * successor then produces every refresh event in the dead window's
-     * name (measured: a fork-storm guest re-stamped a dead window
-     * thousands of times over 190 s and held both denominators below any
-     * threshold).  So a refresh is accepted only when the refreshing
-     * context still maps the marker's own code page to the physical page
-     * the marker executed from (deadlatch_live_probe) — a mapping only
-     * the process that ran the marker can present, up to the already-
-     * documented second-instance-of-the-same-binary residual.  The probe
-     * fails CLOSED: a live process whose marker page was evicted or
-     * unmapped stops refreshing and is reaped at the threshold, which is
-     * the opt-in idleness hazard's existing direction (close early),
-     * tuned by raising the threshold.  Refusals are counted
-     * (dead_latch_refresh_refused).
+     * THE STAMP IS GATED LIFE.  With content-as-gate the refresh events
+     * are not forgeable by a recycled root: the ONE global last-gated-
+     * execution stamp advances only when a context that MAPS a latched
+     * window's marker bytes executes (or evaluates gated at a committed
+     * root write) — a successor process maps different bytes there, or
+     * nothing, and cannot refresh.  Q-DEADWIN v4 default, maintainer-
+     * vetoable: per-window closure is retired; the segment closes when
+     * ALL gated activity has been idle past a threshold.
      */
     uint64_t latch_timeout_ms = 0;
 

@@ -1354,15 +1354,6 @@ void mips_cpu_do_interrupt(CPUState *cs)
     case EXCP_SYSCALL:
         cause = 8;
         update_badinstr = 1;
-        /*
-         * [cstwit]: a guest workload timestamps its own phases onto the
-         * shared CP0_Count clock with close(-MAGIC).  Read here, at the
-         * trap, where $v0/$a0 still hold the syscall's arguments.  Inert
-         * unless CST_ASIDWITNESS names a file, and never on the wrong path.
-         */
-        if (!cs->plugin_spec_mode) {
-            cst_wit_syscall(env);
-        }
         goto set_EPC;
     case EXCP_BREAK:
         cause = 9;

@@ -4579,38 +4579,17 @@ void body_stream_write_entry(BodyStreamState *st, BodyEntry *entry)
     uint64_t body_start = bw_tell_bytes(&st->bw);
     uint32_t tid = entry->thread_id;
 
-    /* Wire asid tag (KPTI-off canonical model, multiasid_plan §0/§7): a
-     * kernel (priv>0) block carries the OWNING PROCESS asid on the wire, not
-     * the live page-table root.  entry->tmpl->is_system is the per-block
-     * privilege stamp — the SAME flag serialised as CST_INSN_FLAG_SYSTEM on
-     * this block's insns — so the block's system bit and its asid tag always
-     * agree.  Under the canonical KPTI-off baseline the kernel shares the
-     * process root, so ctx_asid_index == asid_index for kernel blocks too and
-     * this is a no-op; forcing it makes the trace KPTI-INVARIANT — an isolated
-     * kernel root (if the guest runs KPTI, the unsupported config) never
-     * reaches the wire as an asid — and, crucially, defers a process's FIRST
-     * wire sighting to its first traced USER block, where its content
-     * signature is latchable.  User blocks are unchanged (ctx == live at
-     * priv 0), so user-mode and single-address-space traces stay
-     * byte-identical. */
+    /* Wire asid tag: entry->asid_index IS the captured-at-execution LABEL
+     * index (one field; the KPTI-invariance fold this replaces is provably
+     * a no-op under content gating — a KPTI kernel root maps no marker
+     * bytes, so it is never gated, never traced, and can never reach the
+     * wire.  Q17 default: a kernel block attests the live value). */
     uint32_t wire_asid = entry->asid_index;
-    if (entry->tmpl && entry->tmpl->is_system) {
-        wire_asid = entry->ctx_asid_index;
-    }
 
     /* The (asid, thread) context key for the per-context field-state and
      * regfile tables — the WIRE asid, so the writer's delta baselines and
      * the decoder's replay tables are keyed identically BY CONSTRUCTION.
-     * Kernel blocks carry the owning process on the wire (above), so a
-     * thread still keeps ONE register-file context across a user<->kernel
-     * excursion.  User blocks key by their live address space — which is
-     * the executing process — even where the per-vCPU ctx latch lags (the
-     * latch advances only on user-owned TBs, so under multi-process
-     * gating another owned process's user run would otherwise be keyed to
-     * the stale latch context while its wire tag says the live process:
-     * writer and decoder would then delta against different histories,
-     * corrupting decoded values and tripping IFRAME validation).  User
-     * mode / a single address space: wire_asid == 0 → key == tid, so
+     * User mode / a single address space: wire_asid == 0 → key == tid, so
      * those traces stay byte-identical. */
     uint64_t ctx_key = ((uint64_t)wire_asid << 32) | tid;
 

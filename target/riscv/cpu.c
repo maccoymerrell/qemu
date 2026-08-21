@@ -3036,27 +3036,6 @@ static const struct SysemuCPUOps riscv_sysemu_ops = {
 };
 #endif
 
-#if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
-/*
- * Which identity keys this MODEL can supply (CPUClass::plugin_identity_caps).
- * Both, unconditionally: SATP carries {MODE,ASID,PPN} on any RISC-V CPU
- * that translates, and tp is a general-purpose register every model has.
- * Answering the query at all is what lets a plugin state its precondition
- * once, ISA-agnostically, instead of special-casing the one target whose
- * models differ.
- *
- * Set from the CPU type's own class_init rather than from the accelerator's
- * cpu_class_init hook: the query has to be answerable from
- * qemu_plugin_install(), which QEMU runs immediately before
- * machine_run_board_init(), and accel_init_interfaces() — the only thing
- * that reaches the accelerator hooks — runs INSIDE machine_run_board_init().
- */
-static uint64_t riscv_plugin_identity_caps(ObjectClass *oc)
-{
-    return QEMU_PLUGIN_IDENT_SPACE_IS_ROOT | QEMU_PLUGIN_IDENT_NAMES_THREAD;
-}
-#endif
-
 static void riscv_cpu_common_class_init(ObjectClass *c, void *data)
 {
     RISCVCPUClass *mcc = RISCV_CPU_CLASS(c);
@@ -3084,7 +3063,6 @@ static void riscv_cpu_common_class_init(ObjectClass *c, void *data)
     cc->get_arch_id = riscv_get_arch_id;
 #endif
 #if defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
-    cc->plugin_identity_caps = riscv_plugin_identity_caps;
 #endif
     cc->gdb_arch_name = riscv_gdb_arch_name;
 

@@ -10460,10 +10460,32 @@ static void aarch64_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
     }
 }
 
+/*
+ * v4 repair (maintainer-vetoable): never-split RETREAT re-sync.  The
+ * generic loop is ending the TB at @retreat_pc, dropping the sequence-
+ * prefix insns (MOVZ/MOVK immediate loads) translated beyond it.
+ * tb_stop's DISAS_TOO_MANY path targets pc_curr + 4, so re-sync the
+ * private pc_curr to the last kept insn.  The dropped insns never sync
+ * the pc, so pc_save is stable under CF_PCREL.  A BTYPE reset spill the
+ * first dropped insn emitted is dropped with it: env keeps the pending
+ * BTYPE, the retreat TB exits without touching it, and the next TB —
+ * which re-translates that insn — performs its own check and reset.
+ */
+static bool aarch64_tr_nosplit_retreat(DisasContextBase *dcbase,
+                                       CPUState *cpu, vaddr retreat_pc,
+                                       uint64_t checkpoint)
+{
+    DisasContext *dc = container_of(dcbase, DisasContext, base);
+
+    dc->pc_curr = retreat_pc - 4;
+    return true;
+}
+
 const TranslatorOps aarch64_translator_ops = {
     .init_disas_context = aarch64_tr_init_disas_context,
     .tb_start           = aarch64_tr_tb_start,
     .insn_start         = aarch64_tr_insn_start,
     .translate_insn     = aarch64_tr_translate_insn,
     .tb_stop            = aarch64_tr_tb_stop,
+    .nosplit_retreat    = aarch64_tr_nosplit_retreat,
 };

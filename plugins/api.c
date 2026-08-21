@@ -640,6 +640,40 @@ int qemu_plugin_current_vcpu_index(void)
 }
 
 /*
+ * One-shot per-vCPU work item (qemu_plugin_async_run_on_vcpu): a small
+ * heap closure carried through async_run_on_cpu, so the callback runs on
+ * the target vCPU's own thread with that vCPU's live context (registers,
+ * address space) resolvable through current_cpu.
+ */
+struct plugin_vcpu_async_closure {
+    qemu_plugin_vcpu_async_cb_t cb;
+    void *userdata;
+};
+
+static void plugin_vcpu_async_tramp(CPUState *cpu, run_on_cpu_data data)
+{
+    struct plugin_vcpu_async_closure *cl = data.host_ptr;
+
+    cl->cb(cpu->cpu_index, cl->userdata);
+    g_free(cl);
+}
+
+void qemu_plugin_async_run_on_vcpu(unsigned int vcpu_index,
+                                   qemu_plugin_vcpu_async_cb_t cb,
+                                   void *userdata)
+{
+    CPUState *cpu = qemu_get_cpu(vcpu_index);
+
+    if (!cpu || !cb) {
+        return;
+    }
+    struct plugin_vcpu_async_closure *cl = g_new(struct plugin_vcpu_async_closure, 1);
+    cl->cb = cb;
+    cl->userdata = userdata;
+    async_run_on_cpu(cpu, plugin_vcpu_async_tramp, RUN_ON_CPU_HOST_PTR(cl));
+}
+
+/*
  * Plugin output
  */
 void qemu_plugin_outs(const char *string)
@@ -973,30 +1007,6 @@ uint64_t qemu_plugin_get_thread_ptr(void)
     const TCGCPUOps *ops = current_cpu->cc->tcg_ops;
     if (ops && ops->get_plugin_thread_ptr) {
         return ops->get_plugin_thread_ptr(current_cpu);
-    }
-    return 0;
-}
-
-uint64_t qemu_plugin_get_process_id(void)
-{
-    g_assert(current_cpu);
-    plugin_identity_sample(current_cpu);
-    return current_cpu->plugin_process_id;
-}
-
-uint64_t qemu_plugin_get_thread_id(void)
-{
-    g_assert(current_cpu);
-    plugin_identity_sample(current_cpu);
-    return current_cpu->plugin_thread_id;
-}
-
-uint64_t qemu_plugin_get_narrow_asid(void)
-{
-    g_assert(current_cpu);
-    const TCGCPUOps *ops = current_cpu->cc->tcg_ops;
-    if (ops && ops->get_plugin_narrow_asid) {
-        return ops->get_plugin_narrow_asid(current_cpu);
     }
     return 0;
 }

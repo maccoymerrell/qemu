@@ -293,11 +293,16 @@ uint64_t qemu_plugin_current_task_offset(bool *set);
 void qemu_plugin_current_task_offset_store(uint64_t offset);
 
 /*
- * Refresh @cpu's (process, thread) identity from the target's raw
- * architectural keys, interning each distinct key into a monotonic opaque
- * id.  See CPUState::plugin_process_id.
+ * Never-split (atomic) code byte sequences registered by a plugin
+ * (qemu_plugin_register_nosplit_code_sequences).  The translator consults
+ * them at every clean TB-end decision and continues translating through a
+ * sequence a TB boundary would otherwise cut.  Returns the number of
+ * registered sequences (0 = feature off) and fills @seqs[] (up to
+ * QEMU_PLUGIN_NOSPLIT_MAX pointers, valid for the process lifetime) and
+ * *@seq_len (all sequences share one length).
  */
-void plugin_identity_sample(CPUState *cpu);
+#define QEMU_PLUGIN_NOSPLIT_MAX 2
+size_t qemu_plugin_nosplit_seqs(const uint8_t **seqs, size_t *seq_len);
 
 void qemu_plugin_add_dyn_cb_arr(GArray *arr);
 
@@ -334,6 +339,13 @@ void qemu_plugin_user_prefork_lock(void);
 void qemu_plugin_user_postfork(bool is_child);
 
 #else /* !CONFIG_PLUGIN */
+
+#define QEMU_PLUGIN_NOSPLIT_MAX 2
+static inline size_t qemu_plugin_nosplit_seqs(const uint8_t **seqs,
+                                              size_t *seq_len)
+{
+    return 0;
+}
 
 static inline void qemu_plugin_add_opts(void)
 { }

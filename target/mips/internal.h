@@ -300,19 +300,6 @@ static inline bool cpu_mips_hw_interrupts_pending(CPUMIPSState *env)
 
 void msa_reset(CPUMIPSState *env);
 
-/*
- * [cstwit] target-side address-space witness (tcg/system/cp0_helper.c).
- * Inert unless CST_ASIDWITNESS names a file; see the comment block there for
- * why the witness for an ownership experiment has to live in the target and
- * not in either arm's own counters.
- */
-#if !defined(CONFIG_USER_ONLY)
-void cst_wit_bind(CPUMIPSState *env);
-void cst_wit_syscall(CPUMIPSState *env);
-void cst_wit_asidw(CPUMIPSState *env, uint64_t old, uint64_t nw);
-void cst_wit_pwbw(CPUMIPSState *env, uint64_t old, uint64_t nw);
-#endif
-
 /* cp0_timer.c */
 uint32_t cpu_mips_get_count(CPUMIPSState *env);
 void cpu_mips_store_count(CPUMIPSState *env, uint32_t value);

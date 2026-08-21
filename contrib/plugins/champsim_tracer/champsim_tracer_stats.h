@@ -317,23 +317,6 @@ struct Stats {
      * These count both sides at their source so the residual is measured
      * rather than inferred, and so the second effect is caught where it
      * happens instead of at the end.
-     *
-     * SCOPE OF clock_minus_wire (binding, so its zero cannot be
-     * over-quoted).  It is a USER-INSTRUCTION identity and nothing wider.
-     * Both terms are defined over user-privilege blocks of an owned
-     * address space: the window clock bills only those (a kernel excursion
-     * is traced but never counted), and wire_user_arch_insns sums only
-     * non-system templates.  A KERNEL block that a close failed to publish
-     * therefore moves NEITHER term, and the row still reads 0.  Read it as
-     * "the user instructions the window clock billed are the user
-     * instructions on the wire" — never as "the segment published
-     * everything it executed".
-     *
-     * Kernel completeness is a different invariant and is carried
-     * elsewhere: the block-FID epoch's billed==published at every close
-     * route, which holds over every emitted block regardless of privilege.
-     * A check that wants the wider claim must assert THAT; this row cannot
-     * witness it and a gate reading 0 here has not tested it.
      */
     /* User (non-system) architectural instructions actually EMITTED to the
      * body stream this segment — the plugin-side twin of OWNED_CP, with no
@@ -370,7 +353,9 @@ struct Stats {
      * instruction count, and the excess instructions in them.  This is the
      * clock billing the owned process for work that was not the owned TB —
      * a foreign process's user instructions retired since the last owned
-     * dispatch, most visibly a fork child's. */
+     * dispatch.  (Under content gating a fork child maps the marker bytes
+     * and is itself traced, so the canonical example is now an UNGATED
+     * process's slice — an execve'd successor, a never-marked peer.) */
     uint64_t user_clock_bill_mismatch_tbs = 0;
     uint64_t user_clock_bill_excess_insns = 0;
     /* Bills taken with no template for the dispatched TB.  Such a TB cannot
@@ -580,16 +565,13 @@ struct Stats {
      * land on; anything else is an unmeasured close and this is the only
      * thing standing between it and a silent over-claim.  Must be 0. */
     uint64_t close_walk_extent_unknown = 0;
-    /* USER entries emitted while a FOREIGN address space was live on the
-     * vCPU — the emitting context is not the one the block executed in.
-     * Emissions lag execution (deferred seal, close flush), so the live
-     * page-table root at the emit is not the block's; each of these is an
-     * entry whose wire asid the carry (g_vcpu_cur_asid_index, the index of
-     * the most recent USER TB on this vCPU) had to supply.  Non-zero
-     * exactly where a close ran while the traced process was off-vCPU — a
-     * shutdown performed by another process — so it is NOT must-be-0: it
-     * is the size of the set a live read would have mis-stamped, and it
-     * reads the same on both arms of CST_ASID_LIVE. */
+    /* LABEL-FIDELITY witness: entries emitted while the live address-
+     * space value differed from the carried label (emissions lag
+     * execution — deferred seal, close flush — so the carry
+     * g_vcpu_cur_asid_index names the block being emitted, and the live
+     * value names whatever context happens to be current at the writer).
+     * NOT must-be-0: it is the size of the set a live read would have
+     * mis-stamped. */
     uint64_t emit_asid_foreign_context = 0;
     /* Pending-seal slots flushed at a segment close from a vCPU OTHER than
      * the closing one.  Each is a TB the pinned process executed on a vCPU
@@ -775,6 +757,11 @@ struct Stats {
     uint64_t census_frames_opened = 0;
     uint64_t census_frames_merged = 0;
     uint64_t census_frames_unwound_dropped = 0;
+    /* Excursion ended by an exception-table fixup: the guest re-entered the
+     * frame's own template at an interior pc other than the resume PC (no
+     * FAULT_RETURN can arrive — the ERET target was software-advanced), so
+     * the frame was retired with its merge dead by construction. */
+    uint64_t census_frames_diverted = 0;
     uint64_t census_frames_orphan_dropped = 0;
     uint64_t census_frames_held_at_close = 0;
     uint64_t census_prev_promoted = 0;
@@ -989,12 +976,31 @@ struct Stats {
      * rep_exit_edge_recovered — a retiring REP whose observed successor was
      *   its own PC (the same single-iteration translation jumps back before
      *   taking the zero-count exit); the emitted terminal edge was restored
-     *   to the architectural fall-through. */
+     *   to the architectural fall-through.
+     * rep_fanout_reg_iters_reconstructed — iterations rendered by a fan-out
+     *   whose per-iteration destination-register snapshots were
+     *   reconstructed (#138): the parent entry carries iteration 1's
+     *   post-state, each sub-entry its own iteration's, and the final
+     *   iteration the captured END state verbatim (CMPS flags excepted:
+     *   RF is still set after the final counted iteration, because the
+     *   instruction completes only in the unrendered trailing pass) — the
+     *   same values the single-iteration (-icount) translation captures
+     *   live.
+     * rep_fanout_reg_slots_underived — destination slots (counted once per
+     *   fan-out emission) whose non-final-iteration values no
+     *   reconstruction law covers: an accumulator-coupled family
+     *   (SCAS/LODS flags or data register), a compare without captured
+     *   memop values (memdata off), or a pointer stream the stride/END
+     *   self-check refused.  Those slots are published ABSENT (width 0) on
+     *   the non-final iterations — absence, never a guess; the final
+     *   iteration still carries the END snapshot. */
     uint64_t rep_iters_architectural = 0;
     uint64_t rep_iters_inferred = 0;
     uint64_t rep_iters_memop_mismatch = 0;
     uint64_t rep_trailing_pass_dropped = 0;
     uint64_t rep_exit_edge_recovered = 0;
+    uint64_t rep_fanout_reg_iters_reconstructed = 0;
+    uint64_t rep_fanout_reg_slots_underived = 0;
     /* rep_piece_table_degenerate — a fault-split REP emission arrived with a
      * per-piece prefix table it could not use, so the emission fell back to
      * the total-based split rather than mis-place slices.
@@ -1065,104 +1071,63 @@ struct Stats {
      * was measured on probes/threadrep.S (cst_runs/x86s2 item B,
      * ported here). */
     uint64_t warmup_boundary_in_fanout = 0;
-    /* marker_wp_fenced_start / _end — invocations of the START/END
-     * marker exec callbacks dropped by the wrong-path fence
-     * (speculation routinely runs the marker bytes: the wrong path of a
-     * spin-wait branch falls straight into the END sequence).  Condition
-     * counters: a zero over a run with WP enabled means the workload's
-     * marker bytes were never speculatively executed, NOT that the
-     * fence is idle-safe. */
-    uint64_t marker_wp_fenced_start = 0;
-    uint64_t marker_wp_fenced_end = 0;
-    /* marker_fence_session_only — a marker callback was dropped where
-     * ONLY the per-vCPU WP-session gate fired: the QEMU-side spec-mode
-     * flag AND the walker thread's g_wp_state.in_progress both read
-     * false while this vCPU was inside a wrong-path session bracket.
-     * This is exactly the leak shape the pre-fence 385k-insn END close
-     * (matrix_prepush/tt_sys_x86b) implied and the two-flag fence could
-     * not name; MUST be 0 — nonzero means a speculative invocation
-     * reached the run-state machine's doorstep past both flags and was
-     * stopped only by the session gate. */
-    uint64_t marker_fence_session_only = 0;
 
     /*
-     * INVARIANT TRIPWIRES and CONDITION COUNTERS.
+     * MARKER COUNTERS (content-as-gate).
      *
-     * The marker is decided in the bytes at translation time and fires from
-     * one instruction (see champsim_tracer_marker_detect.h), so there is no
-     * run to break, hand off or leave outstanding.  What remains are the
-     * ways a correct-path marker can still be LOST, which are about the
-     * wrong-path fence, not about detection.
+     * The marker is decided in the bytes at translation time and the whole
+     * open/release happens there too (never-split + whole-TB scan), so
+     * there is no run to break, no fence and no straddle verdict left to
+     * count.  What remains:
      *
-     * marker_prefix_unreadable — CONDITION, not a tripwire.  An instruction
-     *   that IS the terminating instruction of a marker sequence, whose
-     *   preceding slots could not be read from guest memory when it
-     *   executed.  It does NOT mean those slots did not execute: on a
-     *   software-managed TLB (mipsel) the read fails for a page that is
-     *   still mapped, once its TLB entry has been evicted by the kernel code
-     *   that ran between the two halves of the sequence.  This counter is
-     *   therefore how often the exact source could not be consulted, and
-     *   nothing more; a straddling sequence is decided from its physical
-     *   page pair instead (marker_straddle_*).  See
-     *   champsim_tracer_marker_detect.h for the measurement that falsified
-     *   the older reading of this counter.
-     * marker_straddle_pair_resolved — CONDITION.  Reads that could not be
-     *   serviced and were answered by the sequence's physical page pair.
-     *   Every one of these is a marker that the read alone would have lost.
-     * marker_straddle_conflicts — MUST BE 0 in a single-binary capture.  Two
-     *   DIFFERENT predecessor physical pages recorded behind the same tail
-     *   physical page: the address-space reuse case.  Nonzero is not a bug —
-     *   it is the guard firing — but it means the tail no longer determines
-     *   the pair and those sequences fall back to the read alone.
-     * marker_straddle_undecided — CONDITION, and the sharp one.  A
-     *   marker-shaped instruction whose sequence spans two pages, whose read
-     *   could not be serviced, AND for which no physical page pair was ever
-     *   witnessed.  Nonzero has exactly one benign shape: a LONE
-     *   marker-terminating instruction at the start of a page whose
-     *   predecessor page was never executed as marker prefix — the bytes
-     *   before it are not a sequence and nothing should be claimed.  The
-     *   adversarial `chaff` cell builds that on purpose and reads 2 per
-     *   execution of it (one per armed callback).  What it can NOT be is a
-     *   sequence that really ran: the predecessor page's own translation
-     *   witnesses it while that page is resident, and the witness is what
-     *   the pair is built from.  So on any cell WITHOUT a deliberate lone
-     *   tail this is 0, and a nonzero there is the missed-marker defect
-     *   coming back.
-     * marker_end_suppressed  — MUST BE 0.  An END marker executed on the
-     *   CORRECT PATH and the wrong-path fence dropped it anyway: the
-     *   execution was demonstrably not speculative (QEMU's spec-mode flag
-     *   clear AND this thread not inside the walker), so only a LEAKED
-     *   session bracket can have suppressed it, and the window it should
-     *   have closed is still open.  Tested ahead of the fence's return in
-     *   vcpu_marker_end_cb, which is the only place it CAN be tested: the
-     *   drop is the violation, and a counter placed after it is
-     *   structurally blind to the case it exists to name.  Positive
-     *   control: CST_FENCE_FORCE_END.
-     * marker_end_no_close    — CONDITION, not a tripwire.  An END marker
-     *   completed on the correct path in an address space this trace does
-     *   not own, so nothing closed.  Expected whenever a process this trace
-     *   does not own runs an END sequence, which byte-decided detection
-     *   sees and the old adjacency run usually did not.  Split from
-     *   marker_end_suppressed for exactly that reason: fusing an expected
-     *   condition with a violated invariant makes the invariant
-     *   unenforceable.
+     * marker_page_unreadable_at_refresh — WITNESS, must be 0 on a healthy
+     *   run.  Predicate, exactly (R5): a gate refresh ran in the SAME
+     *   context this vCPU was last gated ON for — prior per-vCPU gate bit
+     *   still set AND the live architectural root equal to the carried
+     *   last-GATED label — and a latched window's marker bytes were no
+     *   longer readable through it.  That is a gated→unreadable
+     *   TRANSITION: the marked process's marker page stopped being
+     *   readable, i.e. the residency requirement (mlock(2) the sequence
+     *   page before START; ops fallback: swap off) was broken.  The
+     *   context gates OFF — honest and contract-visible — and this
+     *   counter is what makes the violation loud.  A never-gated context
+     *   that does not map the vaddr (every foreign mm) also reads as
+     *   unreadable but is NOT a residency violation; it lands in
+     *   refresh_evaluated_not_traced ALONE.  Stated boundary: a loss
+     *   discovered only after a foreign round trip (the marked process
+     *   returns to the vCPU with its page already gone) arrives with the
+     *   prior bit OFF and is not counted — deliberately, because on a
+     *   narrow-ASID guest (MIPS, 8-bit) a rolled-over generation hands
+     *   recycled root values to foreign processes, and without the
+     *   prior-bit requirement any such recycled root would false-fire
+     *   this witness against a foreign mm.  That loss still gates the
+     *   context off (honest), visible as the marked process ceasing to
+     *   be traced.
+     * refresh_evaluated_not_traced — CONDITION.  Every gate refresh that
+     *   evaluated and concluded NOT traced (foreign mm's — readable or
+     *   not — and residency losses alike): the size of the
+     *   untraced-context refresh traffic, and the anti-vacuity witness
+     *   that the content check actually runs.
+     * marker_end_no_close    — CONDITION, not a tripwire.  An END reached
+     *   translation in a context that maps no open window's marker bytes,
+     *   so no window could be released.  Split from the forced close's
+     *   tripwire shape: fusing an expected condition with a violated
+     *   invariant makes the invariant unenforceable.
      * wp_session_on_cp       — MUST BE 0.  A wrong-path session bracket was
      *   still flagged while this vCPU ran the CORRECT path: a leaked fence
-     *   flag, which would silently drop every subsequent marker callback on
-     *   that vCPU and leave its window open forever.  Tested at TWO points,
-     *   and it needs both: the correct-path step (which the JIT dispatches
-     *   only for an owned context inside a window, and not at all during the
-     *   pinned-simpoint fast-forward), and every committed address-space
-     *   write (which fires regardless of ownership, window and
-     *   fast-forward).  Positive control: CST_FENCE_FORCE_SESSION.
+     *   flag.  Tested at TWO points, and it needs both: the correct-path
+     *   step, and every committed address-space write (which fires
+     *   regardless of ownership, window and fast-forward).  Positive
+     *   control: CST_FENCE_FORCE_SESSION.
      */
-    uint64_t marker_prefix_unreadable = 0;
-    uint64_t marker_straddle_pair_resolved = 0;
-    uint64_t marker_straddle_conflicts = 0;
-    uint64_t marker_straddle_undecided = 0;
-    uint64_t marker_end_suppressed = 0;
+    uint64_t marker_gate_refresh_events = 0;   /* the DENOMINATOR: every
+                                    * content-gate re-evaluation (committed
+                                    * root writes, window opens/releases,
+                                    * vCPU init, peer seeds) */
+    uint64_t marker_page_unreadable_at_refresh = 0;
+    uint64_t refresh_evaluated_not_traced = 0;
     uint64_t marker_end_no_close = 0;
-    /* An END that executed on the correct path, could not be attributed to
+        /* An END that executed on the correct path, could not be attributed to
      * any owner, and closed the capture anyway.  MAINTAINER RULING
      * (2026-08-02): "END kills the tracer, regardless of simpoints, just
      * like a program ending in user mode would do."  Nonzero means the
@@ -1170,11 +1135,6 @@ struct Stats {
      * but the trace still ends where its workload does, which is the
      * invariant that cannot be traded. */
     uint64_t marker_end_forced_close = 0;
-    /* An END whose owner the learned-code-page probe could not name, and
-     * which the SOLE open window claimed instead.  Narrow-ASID (MIPS) only:
-     * an END running out of a page mapped after the START — a JIT stub, a
-     * run-time-built sequence — is invisible to a page map.  Nonzero is
-     * ordinary; it is what keeps marker_end_forced_close at 0. */
     uint64_t wp_session_on_cp = 0;
     /* Worst stall: architectural instructions retired in an owned context
      * between two advances of the pinned user clock (diagnostic — the
@@ -1187,25 +1147,14 @@ struct Stats {
      * any-context ceiling raised. */
     uint64_t user_clock_worst_stall_any = 0;
     uint64_t stall_any_closes = 0;
-    /* Owned marker windows retired by the dead-latch detector, split by
-     * which denominator crossed: the wall-clock timeout (latch_timeout) or
-     * the guest-instruction idle (latch_idle_insns).  Both are per-window,
-     * not per-segment: several may be counted before the set empties and
-     * the segment closes.  Nonzero on either means at least one traced
-     * process was judged dead WITHOUT having run its END marker, so its
-     * strand of the trace stops where the detector fired rather than where
-     * the workload finished. */
+    /* Segments closed by the idle backstop (the ONE global last-gated-
+     * execution stamp), split by which denominator crossed: the wall-clock
+     * timeout (latch_timeout) or the guest-instruction idle
+     * (latch_idle_insns).  Nonzero means the capture was judged dead
+     * WITHOUT an END marker having run, so the trace stops where the
+     * backstop fired rather than where the workload finished. */
     uint64_t dead_latch_closes_ms = 0;
     uint64_t dead_latch_closes_insns = 0;
-    /* Dead-latch stamp refreshes REFUSED because the refreshing context
-     * could not prove it is still the pinned process: the marker page no
-     * longer translates to the physical page the marker executed from
-     * (deadlatch_live_probe).  The signature of a recycled page-table
-     * root wearing the dead window's name — a nonzero value here on a
-     * latch-closed run is the witness that the close was earned against
-     * a forged life-sign, and on a run that did NOT close it names the
-     * forgery the latch is currently outliving. */
-    uint64_t dead_latch_refresh_refused = 0;
     /* Segments closed by the machine-shutdown backstop: the guest powered
      * off (or QEMU was asked to exit) with a capture still open, so the
      * window was closed and finalised there rather than abandoned.  A
@@ -1288,112 +1237,8 @@ struct Stats {
     /* Decode-side warning count. */
     uint64_t unknown_insn_warnings = 0;
 
-    /* Kernel-excursion ownership (kexc=1; all zero when off).  Writes is
-     * every ASID_WRITE path event consumed; overlays counts excursions
-     * that installed a kernel overlay ASID (a PTI entry switch or a
-     * TLB-maintenance save/probe value); cuts counts committed context
-     * switches (a third distinct value inside one excursion); kept /
-     * dropped split the kernel (priv!=0) TBs the ownership rule
-     * admitted vs refused; write_storm counts excursions whose distinct
-     * new-value count hit the storm threshold. */
-    uint64_t kexc_asid_writes = 0;
-    uint64_t kexc_overlays = 0;
-    uint64_t kexc_cuts = 0;
-    uint64_t kexc_kernel_kept = 0;
-    uint64_t kexc_kernel_dropped = 0;
-    uint64_t kexc_write_storm = 0;
-    /* Restore-to-entry accounting.  An ASID write whose new value is the
-     * excursion's ENTRY value puts the entering address space back in force,
-     * so the excursion's ownership continues: entry_restores counts every
-     * such write and cut_retired_by_restore the subset that found a
-     * committed-switch cut standing (the cut described an address space that
-     * is no longer loaded, so the restore retires it).
-     *
-     * cut_declined_at_entry_asid is the INVARIANT: a kernel TB refused for a
-     * committed switch while the live address-space register nonetheless
-     * holds the excursion's own entry value.  Nothing can be both switched
-     * away and switched back, so this must read 0 — it is the tripwire for
-     * the sticky-cut defect (a cut that outlives the switch it describes).
-     * It is stated in architectural terms on purpose: a flag-shaped version
-     * ("declined in an excursion that once restored") cannot tell the defect
-     * from a legitimate SECOND switch after the restore.
-     *
-     * post_restore_kept_* is the recovery census — kernel TBs admitted in an
-     * excursion whose cut a restore retired, i.e. exactly the population the
-     * defect refused; post_restore_kept_foreign_live is its own tripwire, the
-     * subset admitted while the live register held neither the entry value
-     * nor the kernel overlay (a genuine foreign leak would land here). */
-    uint64_t kexc_entry_restores = 0;
-    uint64_t kexc_cut_retired_by_restore = 0;
-    uint64_t kexc_cut_declined_at_entry_asid = 0;
-    uint64_t kexc_post_restore_kept_tbs = 0;
-    uint64_t kexc_post_restore_kept_insns = 0;
-    uint64_t kexc_post_restore_kept_foreign_live = 0;
-    /* Decline-reason census: every refused kernel TB lands in exactly one of
-     * no_user (the segment has not seen a user TB yet, so nothing owns the
-     * excursion), not_owned (it was entered from a foreign user TB — the
-     * dominant and CORRECT reason in a single-address-space trace) and cut (a
-     * committed switch moved the address space mid-excursion).
-     * not_owned_live_pinned narrows the middle one to the blocks whose live
-     * address space is nonetheless the pinned process's: an excursion the
-     * pinned process re-enters without an intervening user TB is latched to
-     * the foreign entry, which is a SEPARATE attribution question from the
-     * cut and is not adjudicated here. */
-    uint64_t kexc_decl_no_user = 0;
-    uint64_t kexc_decl_not_owned = 0;
-    uint64_t kexc_decl_cut = 0;
-    uint64_t kexc_decl_not_owned_live_pinned = 0;
-    /* Async re-latch (interrupts=1 + kexc=1): a captured window snapshots
-     * the excursion-ownership state at ASYNC_ENTER, and a genuine
-     * ASYNC_RETURN in the owner's context restores it — the producer fires
-     * only on a departure-PC re-fetch with the departure thread pointer, so
-     * the machine is provably back in the interrupted excursion, and
-     * whatever the window's foreign interleave did to the entry edge no
-     * longer describes it.  The census mirrors the cut-restore one: TBs
-     * kept after a re-latch are exactly the pinned excursion's post-window
-     * tail a foreign-latched edge would have refused. */
-    uint64_t kexc_async_snapshots = 0;
-    uint64_t kexc_async_relatches = 0;
-    uint64_t kexc_async_relatch_skipped = 0;
-    uint64_t kexc_post_relatch_kept_tbs = 0;
-    uint64_t kexc_post_relatch_kept_insns = 0;
-    /* Task-identity kernel ownership (kexc=1, thread-pointer-tracking
-     * targets).  A kernel TB is the work of the task EXECUTING it, and on a
-     * target whose thread-pointer register still names the current task at
-     * kernel privilege that identity is directly readable — where the
-     * entry-edge inference (ownership of the last user TB this vCPU ran)
-     * mis-latches whenever the pinned process re-enters the kernel with no
-     * intervening own user TB, the register does not.  kept/dropped
-     * partition every kernel keep decision the identity rule made; the
-     * disagreement pair measures exactly where it and the entry-edge rule
-     * differ (recovered = edge refused / identity kept: the foreign-latch
-     * refusals; excluded = edge kept / identity refused: the borrowed-mm
-     * kthread and post-switch foreign tails the edge rule leaked). */
-    uint64_t kexc_tp_kept_tbs = 0;
-    uint64_t kexc_tp_dropped_tbs = 0;
-    uint64_t kexc_tp_recovered_tbs = 0;
-    uint64_t kexc_tp_recovered_insns = 0;
-    uint64_t kexc_tp_excluded_tbs = 0;
-    uint64_t kexc_tp_excluded_insns = 0;
-    /* The excluded population partitioned by WHY the (tp, asid) pair missed.
-     * known_thread: the executing thread pointer IS a recorded owned thread
-     * but the live address space is not the one it was recorded under — the
-     * context-switch window, where the kernel has installed the next task's
-     * page tables and not yet switched register state.  unknown_thread: the
-     * executing thread pointer was never an owned thread at all, so the
-     * block is unambiguously another task's kernel work that the entry-edge
-     * rule admitted. */
-    uint64_t kexc_tp_excluded_known_thread = 0;
-    uint64_t kexc_tp_excluded_unknown_thread = 0;
-    /* Recovered-span RETURN witness (both rules).  A kernel excursion ends
-     * by returning to the user context that owns it, so a span containing a
-     * task-identity recovery must land on an OWNED user TB.  The foreign
-     * flavour MUST be 0 — a non-zero count would mean the recovery admitted
-     * a foreign task's blocks.  This corroborates the recovery on the wire,
-     * independently of the (tp, asid) pair that decided it. */
-    uint64_t kexc_recovered_span_owned_user = 0;
-    uint64_t kexc_recovered_span_foreign_user = 0;
-    /* Thread-identity ruling census (system mode).  aliased: kernel task
+    /* Guest-thread kernel-entry aliasing census (system mode; RULING 2/3's
+     * primary anti-vacuity witness).  aliased: kernel task
      * values joined to the ENTERING thread's tid at a user->kernel
      * exception edge — kernel-on-behalf keeping the thread's id where the
      * raw register value changes at the privilege boundary (a TLS-less
@@ -1405,179 +1250,45 @@ struct Stats {
     uint64_t tid_task_aliased = 0;
     uint64_t tid_kernel_task_minted = 0;
     uint64_t tid_alias_expired = 0;
-    /* Condition census for the entry-edge foreign latch, measured on both
-     * rules: kernel TBs the edge rule refuses as not-owned while the
-     * executing task's (thread-pointer, live asid) identity is a recorded
-     * owned thread — i.e. the latch refusing the pinned process's own
-     * kernel work. */
-    uint64_t kexc_decl_not_owned_tp_owned = 0;
-    /* Live-root recovery (the non-async entry-edge foreign latch).  Kernel
-     * TBs the entry-edge rule refused while the PINNED address-space root
-     * was installed — the pinned process re-entering the kernel with no
-     * intervening user TB of its own.  On a wide-register target the root
-     * is a per-process identity, so these are recovered, not guessed; the
-     * _over_cut flavour counts the ones whose excursion also carried a
-     * standing committed-switch cut (the switch moved the space away and
-     * back, and the root says the process is running again). */
-    uint64_t kexc_root_recovered_tbs = 0;
-    uint64_t kexc_root_recovered_insns = 0;
-    uint64_t kexc_root_recovered_over_cut = 0;
-    /* The cut-side twin of kexc_decl_not_owned_live_pinned: kernel TBs a
-     * standing cut refused while the pinned root was live.  Same false
-     * refusal, reached through the other decline arm. */
-    uint64_t kexc_decl_cut_live_pinned = 0;
-    /* Owned-thread identity map churn.  Invalidations are the rollover
-     * defence: ASID-write storm, narrow-ASID dwell re-pin, or a foreign
-     * user TB carrying the pinned ASID value each clear the map, so a
-     * recycled raw value can never satisfy a stale (tp, asid) pair. */
-    uint64_t kexc_tp_map_inserts = 0;
-    uint64_t kexc_tp_map_invalidations = 0;
-    /* Thread-pointer samples that read back 0 — the architectural "no
-     * identity" value (MIPS CP0 UserLocal on a model without Config3.ULRI,
-     * a TLS-less task's aarch64 TPIDR_EL0 or x86 FS.base).  Never seeded
-     * into the map and never matched against it, so those TBs stand down to
-     * the entry-edge rule exactly as a non-tracking target does; a guest
-     * reporting 0 on the PINNED process's own user TBs is one where the
-     * identity rule cannot apply at all, and this counter says so. */
-    uint64_t kexc_tp_null_samples = 0;
-    /* Misattribution WITNESS, measured on both rules.  What it actually
-     * tests, stated as the code tests it: the LAST kernel TB this vCPU
-     * stepped was KEPT, and the next TB is a user TB whose ownership
-     * verdict is FOREIGN, with no user TB of any kind in between — so the
-     * kept span ran into another task's user code and its tail was that
-     * task's kernel work.  Two properties follow, and neither is a
-     * weakness of the invariant, only of its RESOLUTION: it speaks for the
-     * span's last block rather than for every block of the span, and it
-     * fires once per span however many blocks were misattributed.  It is
-     * therefore a lower bound on the phenomenon — measured on the x86
-     * system-clock cell, ONE count of this stood for 34,402 kernel TBs /
-     * 229,826 instructions kept under a foreign root.  The block-level
-     * measure is kexc_kernel_kept_foreign_root; this one remains because
-     * it is the wire-side statement (a span that ENDS foreign), and it is
-     * the only arm the narrow-ASID target has.  The _pinned_val flavour
-     * counts the narrow-ASID collision: the foreign user TB carries the
-     * pinned ASID VALUE (a rollover handed it over), the raw-value compare
-     * defect's smoking gun. */
-    uint64_t kexc_kept_span_foreign_user = 0;
-    uint64_t kexc_kept_span_foreign_user_pinned_val = 0;
-    /* The kept-span witness's CAUSE, measured at the block instead of at the
-     * span's end: kernel TBs KEPT on a wide-register target while the live
-     * address-space root was not the pinned one.  On such a target the root
-     * IS the process — the very argument the live-root recovery rests on to
-     * ADMIT — so a block executed under a foreign root is a foreign task's
-     * kernel work whatever the vCPU's user-TB history says.  It MUST be 0:
-     * the keep rule refuses those blocks, and this is what proves the
-     * refusal complete rather than typical.  The narrow-ASID target is
-     * deliberately absent — there a value match is a coincidence of recycled
-     * bits rather than identity, in BOTH directions. */
-    uint64_t kexc_kernel_kept_foreign_root = 0;
-    uint64_t kexc_kernel_kept_foreign_root_insns = 0;
-    /* Its complement, a condition counter: the kernel TBs that rule REFUSES,
-     * and the instructions in them — foreign kernel work the trace no longer
-     * carries.  Nonzero is health, not a defect. */
-    uint64_t kexc_kernel_refused_foreign_root = 0;
-    uint64_t kexc_kernel_refused_foreign_root_insns = 0;
-    /* Narrow-ASID identity generation (see g_asid_identity_gen).  bumps
-     * counts observations that the raw-value namespace recycled; the two
-     * refusals count the raw-value comparisons that stood down because of
-     * one — an excursion's entry value coming back in a later generation
-     * (which would otherwise retire a cut and hand the rest of the
-     * excursion to whoever now holds the value), and an async re-latch
-     * whose snapshot of raw values aged out while its window was open. */
-    uint64_t asid_identity_gen_bumps = 0;
-    /* Committed ASID writes seen while an excursion's stored values were
-     * already a generation behind (the exposure window), and — the sharp
-     * one — writes of the excursion's OWN stored entry VALUE inside that
-     * window.  The latter IS the narrow-ASID collision: those bits were
-     * handed to another process, and the unguarded arrow reads them as the
-     * excursion's address space returning.  Both are measured on BOTH arms;
-     * the two "refused" counters below fire only where the guard acts. */
-    uint64_t kexc_stale_gen_writes = 0;
-    uint64_t kexc_entry_value_collisions = 0;
-    uint64_t kexc_async_snap_stale_gen = 0;
-    uint64_t kexc_entry_restore_refused_stale_gen = 0;
-    uint64_t kexc_async_relatch_refused_stale_gen = 0;
-    /* Kernel (priv!=0) TBs dropped because they executed at the target's
-     * translation-bypassing privilege level (RISC-V M-mode firmware, which
-     * satp does not govern; see g_xlate_bypass_priv).  Counted on both
-     * attribution rules (kexc on and off), separately from
-     * kexc_kernel_dropped — these TBs never consult the ownership rule. */
-    uint64_t kexc_mmode_dropped = 0;
-    /* DISTINCT raw EntryHi.ASID values committed since the pin, counted
-     * unconditionally over the whole owned-window lifetime (see
-     * asid_sweep_note in champsim_tracer.cc).  This is a WITNESS, not a
-     * detector: it says how much of the guest's narrow ASID space burned
-     * while the window was open, so a test that claims to have exercised a
-     * rollover has to show >= the space's size here or FAIL as vacuous.  It
-     * cannot be reset by the traced process being scheduled, and no
-     * ownership decision reads it -- ownership keys on the page-table root.
-     * Reaching the space's size means the guest reissued every name; it
-     * does NOT mean anything went wrong. */
-    uint64_t asid_names_committed_since_pin = 0;
+    /*
+     * rev3 ENDPOINT IDENTITY witnesses (the thread_identity_note.md rev3
+     * degenerate case: the marked process's thread pointer reads 0, so
+     * thread identity falls to user-SP regions observed at the endpoints
+     * of kernel excursions, with thread-pointer WRITE events as switch
+     * evidence).  Four load-bearing rows — rule-armed, return endpoints,
+     * strands minted, refusals.  The kernel-span CUTTING arms that once
+     * accompanied them died with kernel-span ownership (RULING 3): kernel
+     * code in a gated space is traced, so there is no span to cut and no
+     * exclusion census.
+     */
+    /* The endpoint rule ARMED at a window open (marked process degenerate,
+     * capability verified).  0 on every TLS-ful workload. */
+    uint64_t ep_rule_armed = 0;
+    /* RETURN endpoints observed: a kernel->user crossing whose first user
+     * TB re-sampled the user SP.  Kernel-interior SP is NEVER consulted —
+     * this and a segment's first user sighting are the only SP
+     * observation points (rev3: trampolines, IST stacks, per-CPU entry
+     * stacks are not handled but unobserved). */
+    uint64_t ep_return_endpoints = 0;
+    /* Distinct user-SP regions minted as thread identities (rev3: two live
+     * threads cannot share a user stack; a region is a thread; mint at
+     * first sighting, reidentify by region). */
+    uint64_t ep_strands_minted = 0;
+    /* Loud refusals fired at a window open because the marked process was
+     * degenerate and the endpoint rule could not arm (the user SP was
+     * unreadable).  The refusal path _exit()s, so a
+     * nonzero value is only ever seen if the refusal was downgraded — the
+     * stderr message is the primary witness; this row exists so the
+     * warn-path can never be silent. */
+    uint64_t ep_refusals = 0;
 
-    /* Physical-page process identity (narrow-ASID targets; all zero on
-     * the wide-register targets and in user mode).  The pin's authority
-     * is the map of user-code pages (virtual page -> physical page) the
-     * pinned process has executed; the per-vCPU ASID value is only a
-     * dwell tag.  repins counts dwells where the pinned process was
-     * re-acquired under a DIFFERENT ASID value (generation rollover
-     * re-numbering it, or a migration onto a vCPU where its per-CPU
-     * ASID differs); phys_mismatch counts user TBs refused because a
-     * mapped virtual page ran DIFFERENT BYTES (a foreign process
-     * aliasing the pinned value's VAs — a frame mismatch alone is not
-     * enough, the page's content signature must also differ);
-     * refault_repaired counts mapped pages whose frame moved but whose
-     * bytes matched (a clean code page evicted and re-faulted), re-tied
-     * to the new frame instead of refused; unverified counts user TBs
-     * dropped while a dwell awaited its first map hit (a foreign
-     * process that never touches mapped pages parks here forever,
-     * traced never); pages is the map's final size. */
-    /* DISTINCT raw EntryHi.ASID values the OWNED address space was observed
-     * executing user code under, when it exceeded one.  The second, and
-     * independent, anti-vacuity witness: it is measured on the owned
-     * execution path and depends on no ownership decision (there is no
-     * re-bind rule to be a sub-event of), so >= 2 is direct evidence that
-     * the guest renamed a live address space while the trace kept following
-     * it -- which is exactly what keying on the page-table root buys. */
-    uint64_t owned_asid_names_seen = 0;
-    /* User TBs dropped because the address space they executed in is not
-     * one this trace owns -- THE foreign-drop path.  A zero over a run
-     * that contained foreign execution means the check never ran. */
+        /* User TBs dropped because the context they executed in maps no
+     * latched window's marker bytes (the content gate) -- THE foreign-drop
+     * path.  A zero over a run that contained foreign execution means the
+     * check never ran. */
     uint64_t pin_unverified_dropped = 0;
-    /* This CPU model implements no architectural thread-pointer register, so
-     * strands inside the window carry no thread name (see
-     * pin_note_thread_naming).  Cross-ISA, and NOT an ownership problem:
-     * ownership is the page-table root and never consults a thread name.
-     * The window is not retired, nothing is dropped; only the per-strand
-     * labelling is coarser. */
-    uint64_t pin_thread_identity_absent = 0;
 
-    /* Root-reuse guard, wide-register targets (x86 CR3 / AArch64 TTBR /
-     * RISC-V SATP -- see the ROOT-REUSE GUARD note in champsim_tracer.cc).
-     * Every committed write of an owned root re-walks that window's user
-     * code-page anchors in the live address space.
-     *
-     *   anchors    is how many anchor pages the owned windows learned --
-     *              zero means the walk had nothing to judge by, so a zero
-     *              in the rows below proves nothing;
-     *   verified   is a schedule-in the walk positively identified as the
-     *              same process -- the positive control for the guard;
-     *   unresolved is a schedule-in where no anchor page was mapped in the
-     *              live space, so the guard could say nothing and FAILED
-     *              OPEN (the window stays open; a live process whose text
-     *              was reclaimed must not lose it);
-     *   detected   is a root proven to hold a DIFFERENT process's code --
-     *              the defect this guard exists for.  Nonzero is not a
-     *              tracer fault: it means the traced process ended with its
-     *              window open and the kernel handed its page-table root to
-     *              a successor, whose blocks were excluded (and whose
-     *              window was closed) instead of being recorded as the
-     *              traced process's own. */
-    /* User TBs excluded because the root running them was proven to belong
-     * to a successor process.  These are the instructions the tracer used to
-     * record as the traced process's own. */
-
-    /* DEVIO exact-owner attribution (devio=1, system mode; zero otherwise).
+        /* DEVIO exact-owner attribution (devio=1, system mode; zero otherwise).
      * A doorbell kick is queued on its kicking vCPU's bounded FIFO
      * (kDevioKickFifoCap entries, champsim_tracer_output.cc) and matched
      * at block-backend issue by device token, oldest kick first.
@@ -1588,16 +1299,6 @@ struct Stats {
      * means one vCPU is kicking a device far faster than the block
      * backend drains it. */
     uint64_t devio_fifo_kicks_dropped = 0;
-
-    /* Pinned-process migration-detect guard (system-mode pin, SMP guests).
-     * Set once per segment when the pinned process is seen executing USER
-     * code on more than one vCPU within a segment — a pinned-process-mode
-     * misuse the diagnostic makes loud: pin the workload to a core
-     * (cst_attach does this by default) for stable per-thread identity.  A
-     * migrating pinned process is outside the single-address-space tracer's
-     * clean-attribution envelope.  Zero on single-vCPU guests, in user
-     * mode, and on any unpinned run. */
-    uint64_t pin_multivcpu_observed = 0;
 
     /* Emit-at-departure (epoch 0x1E model): blocks the foreign-ASID /
      * abandoned-async arrows emitted at their measured extent the moment
@@ -1720,11 +1421,14 @@ struct Stats {
      *   async_win_peer_with_asidw windows that served a peer stamp AND saw an
      *                             ASID write
      *   async_win_peer_no_asidw   windows that served a peer stamp with NO
-     *                             ASID write at all -- context changes no
-     *                             address-space rule can see (same-mm thread
-     *                             switch, borrowed-mm kernel thread, recycled
-     *                             narrow ASID).  Zero only means the condition
-     *                             did not arise in this run. */
+     *                             ASID write at all -- a same-mm thread
+     *                             switch, the one context change no
+     *                             address-space-change event marks (the
+     *                             other two old sources are gone: a
+     *                             borrowed-mm kthread is traced by RULING 3
+     *                             and narrow-ASID recycling is a
+     *                             non-concept).  Zero only means the
+     *                             condition did not arise in this run. */
     uint64_t async_captures = 0;
     uint64_t async_captures_reopened = 0;
     uint64_t async_capture_owner_unseen = 0;
@@ -1810,15 +1514,10 @@ struct Stats {
      *                           exactly 0, and any other value is a failure.
      * seal_successor_from_foreign_fault
      *                           the seal's architectural-successor override
-     *                           was taken from an event of another address
-     *                           space — a foreign process's fault standing in
-     *                           for the pinned block's branch target.  The
-     *                           corruption the gate removes; must be 0.
-     * case_b_frame_asid_mismatch
-     *                           a fault-entry classification matched the
-     *                           deferred prev by PC while naming a foreign
-     *                           address space (identical text at identical
-     *                           addresses).  Must be 0.
+     *                           was taken from an event of a non-gated
+     *                           context standing in for the traced block's
+     *                           branch target.  The corruption the gate
+     *                           removes; must be 0.
      */
     /* The OTHER per-vCPU structure a long untraced span could grow, peaked
      * so the claim "no retained structure grows with untraced execution" is
@@ -1873,7 +1572,6 @@ struct Stats {
     uint64_t retention_events_refused = 0;
     uint64_t retention_appends_from_untraced_events = 0;
     uint64_t seal_successor_from_foreign_fault = 0;
-    uint64_t case_b_frame_asid_mismatch = 0;
 
     /* ---- CST_RETAIN_CHECK equivalence harness (test-only) ---------------
      * Cell populations of the compared events, so a zero mismatch count can

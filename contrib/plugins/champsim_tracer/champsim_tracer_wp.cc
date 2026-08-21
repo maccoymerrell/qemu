@@ -268,13 +268,11 @@ static bool wp_set_pc_checked(uint64_t pc)
  * third fence gate exists to catch, and the shape in which a window stays
  * open forever because every marker callback on that vCPU is dropped.
  *
- * It is the POSITIVE CONTROL for the three tripwires that name that leak
- * and had never been seen to fire: `WP session flag on correct path`
- * (tested on every correct-path step), `marker fence session-only` (tested
- * at the marker callbacks' fence) and `marker END with no close` (whose
- * correct-path suppression test sits ahead of that fence — see
- * vcpu_marker_end_cb).  Nothing else in the plugin reads the bracket, so
- * with the variable unset this is one cached-int load per excursion.
+ * It is the POSITIVE CONTROL for the tripwire that names that leak: `WP
+ * session flag on correct path` (tested on every correct-path step and at
+ * every committed address-space write).  Nothing else in the plugin reads
+ * the bracket, so with the variable unset this is one cached-int load per
+ * excursion.
  */
 static bool wp_force_session_leak(void)
 {

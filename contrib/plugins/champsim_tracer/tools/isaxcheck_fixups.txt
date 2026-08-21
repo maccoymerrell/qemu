@@ -192,10 +192,7 @@ mipsel W-flow-added syscall BRANCH_SYSCALL_TYPE
 mipsel W-flow-reclassed jr BRANCH_RETURN
 
 # Traps, interrupt/system returns and the LOOP family: control transfers
-# Capstone gives no group for.  The `bnd`-prefixed and `repz`-prefixed
-# call/return forms are reclassifications rather than additions -- the
-# prefix is a hint, and the instruction under it is still the call or the
-# return it always was.
+# Capstone gives no group for.
 x86_64 W-flow-added int BRANCH_SYSCALL_TYPE
 x86_64 W-flow-added int1 BRANCH_SYSCALL_TYPE
 x86_64 W-flow-added int3 BRANCH_SYSCALL_TYPE
@@ -216,10 +213,6 @@ x86_64 W-flow-added ud1 BRANCH_SYSCALL_TYPE
 x86_64 W-flow-added ud2 BRANCH_SYSCALL_TYPE
 x86_64 W-flow-added vmcall BRANCH_SYSCALL_TYPE
 x86_64 W-flow-added vmmcall BRANCH_SYSCALL_TYPE
-x86_64 W-flow-reclassed bnd callq BRANCH_REP
-x86_64 W-flow-reclassed bnd lretl BRANCH_REP
-x86_64 W-flow-reclassed bnd lretq BRANCH_REP
-x86_64 W-flow-reclassed bnd retq BRANCH_REP
 
 # --- x86_64 ------------------------------------------------------------
 #
@@ -274,12 +267,6 @@ x86_64 W-flow-added repne scasq BRANCH_REP
 x86_64 W-flow-added repne stosb BRANCH_REP
 x86_64 W-flow-added repne stosl BRANCH_REP
 x86_64 W-flow-added repne stosq BRANCH_REP
-x86_64 W-flow-added xacquire xchgb BRANCH_REP
-x86_64 W-flow-added xacquire xchgl BRANCH_REP
-x86_64 W-flow-added xrelease xchgb BRANCH_REP
-x86_64 W-flow-added xrelease xchgl BRANCH_REP
-x86_64 W-flow-reclassed repz retq BRANCH_REP
-x86_64 W-flow-reclassed repz retw BRANCH_REP
 
 # Multi-byte NOP: `nopw 0(%rax,%rax,1)` carries a full addressing operand
 # that computes nothing.  The tracer records the address inputs, because the
@@ -287,17 +274,15 @@ x86_64 W-flow-reclassed repz retw BRANCH_REP
 # discarded -- a consumer modelling the AGU sees the same work the hardware
 # does.
 #
-# `bswapw` and `ffreep` are encodings whose behaviour the architecture does
-# not define (a 16-bit BSWAP) or that no assembler emits (FFREEP is the
-# undocumented FFREE+pop).  The table gives them a destination; Capstone
-# gives them none.
+# `bswapw` is an encoding whose behaviour the architecture does not define
+# (a 16-bit BSWAP).  The table gives it a destination; Capstone gives it
+# none.
 x86_64 W-rd-added nopl +REG_GPR#
 x86_64 W-rd-added nopq +REG_GPR#
 x86_64 W-rd-added nopw +REG_GPR#
 x86_64 W-wr-added bswapw +REG_FP_REG
 x86_64 W-wr-added bswapw +REG_GPR#
 x86_64 W-wr-added bswapw +REG_SP
-x86_64 W-wr-added ffreep +REG_FPR#
 x86_64 W-wr-added fstpnce +REG_FPR#
 
 # CET shadow-stack ops.  Capstone reports their register operand with no
@@ -307,8 +292,6 @@ x86_64 W-wr-added fstpnce +REG_FPR#
 # reg selects the operation.
 x86_64 W-rd-added rdsspq +REG_GPR#
 x86_64 W-rd-added umonitor +REG_GPR#
-x86_64 W-wr-added incsspd +REG_GPR#
-x86_64 W-wr-added incsspq +REG_GPR#
 x86_64 W-wr-added rdsspd +REG_GPR#
 
 # The rm half of the ModRM sweep reaches the rest of these same repairs.
@@ -329,23 +312,8 @@ x86_64 W-rd-added rdsspq +REG_FP_REG
 x86_64 W-rd-added rdsspq +REG_SP
 x86_64 W-rd-added umonitor +REG_FP_REG
 x86_64 W-rd-added umonitor +REG_SP
-x86_64 W-wr-added incsspd +REG_FP_REG
-x86_64 W-wr-added incsspd +REG_SP
-x86_64 W-wr-added incsspq +REG_FP_REG
-x86_64 W-wr-added incsspq +REG_SP
 x86_64 W-wr-added rdsspd +REG_FP_REG
 x86_64 W-wr-added rdsspd +REG_SP
-
-# The BND prefix reclassification, on the three spellings the wider sweep
-# adds.  `bnd retq` and `bnd callq` were already listed; BND reuses the F2
-# byte that is otherwise REPNE, and the tracer's branch classifier keys on
-# the prefix, so the whole `bnd` family reads as BRANCH_REP.  That is the
-# existing behaviour being asserted on more encodings, not a new one -- and
-# it is written down here precisely so that if the classifier is ever taught
-# to tell BND from REPNE, these lines go dead and say so.
-x86_64 W-flow-reclassed bnd lretw BRANCH_REP
-x86_64 W-flow-reclassed bnd notrack callq BRANCH_REP
-x86_64 W-flow-reclassed bnd retw BRANCH_REP
 
 # XBEGIN is the one genuinely new KIND of repair the rm sweep exposes, and
 # it is a deliberate modelling decision rather than a defect on either side.
@@ -358,11 +326,10 @@ x86_64 W-flow-reclassed bnd retw BRANCH_REP
 x86_64 W-flow-dropped xbegin BRANCH_NONE
 
 # The repairs the WIDENED x86 sweep (REX as a full field, ModRM.mod = 01/10,
-# and the whole VEX space) newly asserts.  Two kinds, and both are the
-# existing machinery being held in place on more encodings rather than new
-# behaviour.
+# and the whole VEX space) newly asserts: the existing machinery being held
+# in place on more encodings rather than new behaviour.
 #
-# 1. The 16-bit REPNE string forms.  `66 f2 a7` and its siblings become
+# The 16-bit REPNE string forms.  `66 f2 a7` and its siblings become
 # reachable once mod = 10 lets a string opcode sit where the ModRM byte
 # goes.  The tracer's branch classifier keys on the REP/REPNE prefix and
 # gives them BRANCH_REP, which the boundary does not carry -- the same
@@ -375,62 +342,16 @@ x86_64 W-flow-added repne outsw BRANCH_REP
 x86_64 W-flow-added repne scasw BRANCH_REP
 x86_64 W-flow-added repne stosw BRANCH_REP
 
-# 2. The operand walker recovering registers Capstone dropped.  Capstone
-# 6.0.0-Alpha7 reports access == 0 on the register operands of the AVX-512
-# mask ops (kadd*, ktest*, kunpck*) and of the vpermil2pd/ps VEX.L=1 forms,
-# so the boundary's implicit read/write sets come back EMPTY --
-# `--hex=c5c54ac0` (`kaddb %k0,%k7,%k0`) shows boundary RD{} WR{} against
-# fields RD{REG_PRED0,REG_PRED7} WR{REG_PRED0}.  The plugin's own operand
-# walker reads the operand list rather than the access flags and puts the
-# dependencies back.  These lines are what proves that recovery still
-# happens: the boundary-layer allowlist records the same encodings as a
-# Capstone defect (Z-access0), and WITHOUT these entries a regression in the
-# walker would cancel out against that record and the gate would stay green
-# while the trace lost the registers.  The MEM half of the same Capstone
-# defect is NOT recovered for these -- see the cause-4 block in
-# isaxcheck_allow.txt.
-#
-# vbroadcasti128 and vcvtpd2psx USED to be in that list and no longer are.
-# Each one's erasure hit both operands, and repairing only the MEM half at
-# the boundary made things worse rather than better: the walker stopped
-# synthesising the destination once the insn looked like an ordinary load,
-# trading loads=0/DST{REG_VEC0} for loads=1/DST{-}.  Both halves of both are
-# now repaired in `cap_x86_is_erased_mem_load` (disas/capstone.c), the
-# walker's recovery became unnecessary, and their `W-wr-added
-# vbroadcasti128 +REG_VEC#` and `W-wr-added vcvtpd2psx +REG_VEC#` lines went
-# dead and were deleted with the changes that retired them -- which is
-# exactly the lifecycle this file's header prescribes for a repair the
-# boundary has taken over.
-#
-# vpermil2pd/ps stays, and its entries are load-bearing for a different
-# reason than the mask ops': the walker is currently the ONLY thing
-# supplying its registers, because the boundary repair that would take them
-# over cannot be written against an access == 0 gate.  See the vpermil2
-# paragraph in isaxcheck_allow.txt's cause-4 block for the shape.
-x86_64 W-rd-added kaddb +REG_PRED#
-x86_64 W-rd-added kaddd +REG_PRED#
-x86_64 W-rd-added kaddq +REG_PRED#
-x86_64 W-rd-added kaddw +REG_PRED#
-x86_64 W-rd-added ktestb +REG_PRED#
-x86_64 W-rd-added ktestd +REG_PRED#
-x86_64 W-rd-added ktestq +REG_PRED#
-x86_64 W-rd-added ktestw +REG_PRED#
-x86_64 W-rd-added kunpckdq +REG_PRED#
-x86_64 W-rd-added kunpckwd +REG_PRED#
-x86_64 W-rd-added vpermil2pd +REG_VEC#
-x86_64 W-rd-added vpermil2ps +REG_VEC#
-x86_64 W-wr-added kaddb +REG_PRED#
-x86_64 W-wr-added kaddd +REG_PRED#
-x86_64 W-wr-added kaddq +REG_PRED#
-x86_64 W-wr-added kaddw +REG_PRED#
-x86_64 W-wr-added ktestb +REG_PRED#
-x86_64 W-wr-added ktestd +REG_PRED#
-x86_64 W-wr-added ktestq +REG_PRED#
-x86_64 W-wr-added ktestw +REG_PRED#
-x86_64 W-wr-added kunpckdq +REG_PRED#
-x86_64 W-wr-added kunpckwd +REG_PRED#
-x86_64 W-wr-added vpermil2pd +REG_VEC#
-x86_64 W-wr-added vpermil2ps +REG_VEC#
+# The AVX-512 mask ops (kadd*, ktest*, kunpck*) and the vpermil2pd/ps forms
+# used to carry `W-rd-added` / `W-wr-added` rows here: Capstone 6.0.0-Alpha7
+# reports access == 0 on their register operands, and the plugin's operand
+# walker put the dependencies back.  The boundary now repairs those operands
+# itself in disas/capstone.c (`--hex=c5c54ac0`, `kaddb %k0,%k7,%k0`, shows
+# boundary RD{k0,k7} WR{k0} agreeing with the fields layer), so the walker's
+# recovery is no longer a plugin-side difference and the rows went dead and
+# were deleted -- the same boundary-takeover lifecycle this file's header
+# prescribes, and the one vbroadcasti128 and vcvtpd2psx followed before
+# them.
 
 # JALR.HB is JALR with a hazard barrier: it links, so it is a call.  The
 # boundary carries no call group for it; the tracer's branch classifier

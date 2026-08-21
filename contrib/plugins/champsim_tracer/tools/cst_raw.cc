@@ -615,9 +615,12 @@ void dump_body(FILE *out, BodyStream &bs, const Header &h, uint64_t max_entries)
                 size_t ioff = b.consumed();
                 uint64_t root_phys = b.u64_le();
                 uint64_t sig = b.u64_le();
+                /* These two words are LABELS, never an identity a consumer
+                 * may match across time: root_phys is the live architectural
+                 * address-space value at first sighting, sig is reserved 0. */
                 emitf(out, b, ioff, 1,
-                      "identity (first sighting): root_phys=0x%" PRIx64
-                      " sig=0x%" PRIx64, root_phys, sig);
+                      "asid label (first sighting): root_phys=0x%" PRIx64
+                      " label_aux=0x%" PRIx64, root_phys, sig);
             }
             continue;
         }

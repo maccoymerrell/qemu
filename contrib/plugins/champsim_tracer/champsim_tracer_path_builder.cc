@@ -277,31 +277,6 @@ static void retain_arms_check_once()
     }
 }
 
-/* Kernel-excursion ownership diagnostics: the entry-ASID restore arrow and
- * the kernel TBs an excursion admits or refuses after one.  Prints each
- * distinct block PC once (the interesting population is the set of blocks,
- * not the dynamic count, and a kernel excursion re-executes the same handler
- * text millions of times). */
-static bool kexc_diag()
-{
-    static const bool v = getenv("CST_KEXC_DIAG") != nullptr;
-    return v;
-}
-
-/* First-sighting filter for the kexc PC dumps.  Written only under
- * kexc_diag(), and every writer holds exec_lock (kexc runs inside the CP
- * step), so one process-wide set records the true interleave.  Immortal,
- * like the jump-diag rings: a teardown racing a late step must not touch
- * freed storage. */
-static bool kexc_pc_first_sighting(const char *bucket, uint64_t pc)
-{
-    static std::set<std::pair<const char *, uint64_t>> *seen = nullptr;
-    if (!seen) {
-        seen = new std::set<std::pair<const char *, uint64_t>>();
-    }
-    return seen->insert({bucket, pc}).second;
-}
-
 /* Captured-async-window edge log (ENTER / RETURN / in-window ASID write /
  * close) with the window's identity, the guest thread at each edge and the
  * per-window ownership condition counters.  Measurement instrument only —
@@ -322,36 +297,12 @@ static bool depth3_off()
     static const bool v = getenv("CST_DEPTH3_OFF") != nullptr;
     return v;
 }
-/* Per-defect switches under the master.  The kexc verdict decides how much
- * kernel code is captured and therefore how often the two rendering
- * conditions can be observed at all, so a wave that varies both at once
- * cannot attribute a change to either; these let one be held fixed. */
+/* Per-defect switch under the master: the rendering arrow alone. */
 static bool depth3_render_off()
 {
     static const bool v = getenv("CST_DEPTH3_NO_RENDER") != nullptr;
     return v || depth3_off();
 }
-static bool depth3_kexc_off()
-{
-    static const bool v = getenv("CST_DEPTH3_NO_KEXC") != nullptr;
-    return v || depth3_off();
-}
-static bool depth3_gen_off()
-{
-    static const bool v = getenv("CST_DEPTH3_NO_GEN") != nullptr;
-    return v || depth3_off();
-}
-/* The foreign-root refusal (see kexc_kernel_tb_keep).  Turning it off
- * restores the rule that admitted a kernel block executing under another
- * process's page-table root, which is what makes the pre-fix behaviour
- * available as a positive control for the two counters that name it —
- * "kexc kernel TBs kept on a foreign root" and the kept-span witness. */
-static bool kexc_root_refuse_off()
-{
-    static const bool v = getenv("CST_KEXC_NO_ROOT_REFUSE") != nullptr;
-    return v || depth3_kexc_off();
-}
-
 /*
  * ---- Per-vCPU seal-pipeline sidecars ----
  *
@@ -372,292 +323,6 @@ static inline unsigned pb_vcpu_slot(unsigned cpu_index)
  * needs the decomposition to ride beside the sum. */
 static uint8_t g_pb_prev_async[PB_MAX_VCPUS];
 static uint8_t g_pb_walk_async[PB_MAX_VCPUS];
-/* Whether the LAST TB this vCPU stepped through the foreign-ASID gate was a
- * kexc-KEPT kernel TB — the kept-span misattribution witness latch (see
- * kexc_kept_span_foreign_user in the stats). */
-static uint8_t g_pb_last_kernel_kept[PB_MAX_VCPUS];
-/* Whether the kernel span this vCPU is currently in contains at least one TB
- * the task-identity rule RECOVERED (the entry edge refused it).  Read at the
- * next user TB: a recovered span must return to an OWNED user TB, because a
- * kernel excursion ends by returning to the user context that owns it.  That
- * return is the wire-level corroboration that the recovered blocks are the
- * pinned process's own kernel work and not a foreign task's. */
-static uint8_t g_pb_last_kernel_recovered[PB_MAX_VCPUS];
-
-/*
- * ---- Kept-span witness diagnostics (CST_KEXCWIT) ----
- *
- * The kept-span misattribution witness (kexc_kept_span_foreign_user) reports
- * a VERDICT — a kept kernel span ended at a foreign user TB — without saying
- * what the span was.  This records the span itself: every kernel TB of it
- * with the evidence each keep/decline rested on, every committed ASID write
- * that crossed it, and the user TBs at both ends.  Measurement only; nothing
- * in the tracer's logic reads it, and with the variable unset it costs one
- * cached-bool load per kernel TB.
- */
-static bool kexcwit_diag()
-{
-    static const bool v = getenv("CST_KEXCWIT") != nullptr;
-    return v;
-}
-
-enum : uint8_t {
-    KW_KTB = 0,          /* a kernel TB stepped through the keep rule */
-    KW_ASIDW = 1,        /* a committed ASID write applied to the excursion */
-    KW_SUSP = 2,         /* a TB the async window suspended (never traced) */
-};
-enum : uint8_t {                        /* KW_KTB flag bits */
-    KWF_KEEP = 1u << 0, KWF_EDGE = 1u << 1, KWF_ROOT = 1u << 2,
-    KWF_CUT = 1u << 3, KWF_TPKNOWN = 1u << 4, KWF_TPOK = 1u << 5,
-    KWF_ENTRY_OWNED = 1u << 6, KWF_OVERLAY = 1u << 7,
-};
-enum : uint8_t {                        /* KW_ASIDW classification */
-    KWW_RESTORE = 1, KWW_OVERLAY = 2, KWW_OVERLAY_REPEAT = 3, KWW_CUT = 4,
-    KWW_STALE_CUT = 5, KWW_NOT_IN_KERNEL = 6,
-};
-struct KexcWitEvent {
-    uint64_t pc;                        /* KW_KTB/KW_SUSP: block pc.
-                                         * KW_ASIDW: the value written */
-    uint64_t live;                      /* live asid at the event */
-    uint64_t tp;                        /* the GUEST's own statement of which
-                                         * task is executing (x86 needs
-                                         * curtask_off= for this to be live
-                                         * at kernel privilege) */
-    uint32_t n_insns;
-    uint8_t  kind;
-    uint8_t  flags;                     /* KW_KTB: KWF_*  KW_ASIDW: KWW_* */
-    uint8_t  priv;
-    uint8_t  tp_strict;
-};
-static constexpr unsigned KEXCWIT_HEAD = 24;   /* the span's opening blocks */
-static constexpr unsigned KEXCWIT_RING = 96;   /* and its most recent ones */
-struct KexcWitSpan {
-    KexcWitEvent head[KEXCWIT_HEAD];
-    KexcWitEvent ev[KEXCWIT_RING];
-    uint32_t nhead;
-    uint32_t n;                         /* events recorded (ring-capped) */
-    uint32_t total;                     /* events this span */
-    uint32_t kept_tbs, kept_insns, kernel_tbs, susp_tbs;
-    uint32_t kept_foreign_root_tbs, kept_foreign_root_insns;
-    uint64_t open_user_pc, open_user_asid;
-    uint8_t  open_user_owned, have_open_user;
-};
-/* Heap-allocated on first use so the diag costs no static footprint (the
- * plugin's static-TLS block is at the meson tripwire's ceiling).  Every
- * access runs inside the CP step under exec_lock, exactly like the per-vCPU
- * arrays above. */
-static KexcWitSpan *kexcwit_span(unsigned cpu_index)
-{
-    static KexcWitSpan *spans = nullptr;
-    if (!spans) {
-        spans = new KexcWitSpan[PB_MAX_VCPUS]();
-    }
-    return &spans[pb_vcpu_slot(cpu_index)];
-}
-static void kexcwit_push(unsigned cpu_index, const KexcWitEvent &e)
-{
-    KexcWitSpan *s = kexcwit_span(cpu_index);
-    s->total++;
-    if (s->nhead < KEXCWIT_HEAD) {
-        s->head[s->nhead++] = e;
-    }
-    if (s->n < KEXCWIT_RING) {
-        s->ev[s->n++] = e;
-    } else {                            /* keep the TAIL: the span's end is
-                                         * what the witness is about */
-        memmove(&s->ev[0], &s->ev[1], sizeof(s->ev[0]) * (KEXCWIT_RING - 1));
-        s->ev[KEXCWIT_RING - 1] = e;
-    }
-}
-static void kexcwit_open_span(unsigned cpu_index, uint64_t user_pc,
-                              uint64_t user_asid, bool owned)
-{
-    KexcWitSpan *s = kexcwit_span(cpu_index);
-    *s = KexcWitSpan();
-    s->open_user_pc = user_pc;
-    s->open_user_asid = user_asid;
-    s->open_user_owned = owned ? 1 : 0;
-    s->have_open_user = 1;
-}
-static void kexcwit_dump(unsigned cpu_index, const char *why, uint64_t pc,
-                         uint64_t live, uint64_t pinned, uint64_t tp)
-{
-    KexcWitSpan *s = kexcwit_span(cpu_index);
-    fprintf(stderr, "[kexcwit] %s cpu=%u user_pc=0x%" PRIx64 " live=0x%"
-            PRIx64 " pinned=0x%" PRIx64 " tp=0x%" PRIx64 "\n", why,
-            cpu_index, pc, live, pinned, tp);
-    fprintf(stderr, "[kexcwit]   span: opened_from user_pc=0x%" PRIx64
-            " asid=0x%" PRIx64 " owned=%u (have=%u); kernel_tbs=%u kept=%u "
-            "kept_insns=%u kept_on_foreign_root=%u/%u insns suspended=%u "
-            "events=%u (head %u + tail %u)\n",
-            s->open_user_pc, s->open_user_asid, s->open_user_owned,
-            s->have_open_user, s->kernel_tbs, s->kept_tbs, s->kept_insns,
-            s->kept_foreign_root_tbs, s->kept_foreign_root_insns,
-            s->susp_tbs, s->total, s->nhead, s->n);
-    for (uint32_t i = 0; i < s->nhead + s->n; i++) {
-        const bool in_head = i < s->nhead;
-        const KexcWitEvent &e = in_head ? s->head[i] : s->ev[i - s->nhead];
-        if (!in_head && i == s->nhead) {
-            fprintf(stderr, "[kexcwit]   ---- span head above, tail below "
-                    "----\n");
-        }
-        if (e.kind == KW_ASIDW) {
-            static const char *w[] = { "?", "restore", "overlay",
-                                       "overlay-repeat", "CUT", "stale-CUT",
-                                       "not-in-kernel" };
-            fprintf(stderr, "[kexcwit]   %3u ASIDW new=0x%" PRIx64
-                    " (%s) live_before=0x%" PRIx64 "\n", i, e.pc,
-                    e.flags < 7 ? w[e.flags] : "?", e.live);
-        } else if (e.kind == KW_SUSP) {
-            fprintf(stderr, "[kexcwit]   %3u SUSP  pc=0x%" PRIx64
-                    " live=0x%" PRIx64 " priv=%u n=%u task=0x%" PRIx64 "\n",
-                    i, e.pc, e.live, e.priv, e.n_insns, e.tp);
-        } else {
-            fprintf(stderr, "[kexcwit]   %3u KTB   pc=0x%" PRIx64
-                    " live=0x%" PRIx64 " priv=%u n=%u task=0x%" PRIx64
-                    "%s %s [edge=%u root=%u cut=%u overlay=%u entry_owned=%u "
-                    "tp_known=%u tp_ok=%u]\n",
-                    i, e.pc, e.live, e.priv, e.n_insns, e.tp,
-                    e.tp_strict ? "" : "(weak)",
-                    (e.flags & KWF_KEEP) ? "KEPT   " : "dropped",
-                    !!(e.flags & KWF_EDGE), !!(e.flags & KWF_ROOT),
-                    !!(e.flags & KWF_CUT), !!(e.flags & KWF_OVERLAY),
-                    !!(e.flags & KWF_ENTRY_OWNED), !!(e.flags & KWF_TPKNOWN),
-                    !!(e.flags & KWF_TPOK));
-        }
-    }
-    fflush(stderr);
-}
-
-/*
- * ---- Owned-thread identity map (kexc task-identity ownership) ----
- *
- * thread-pointer value -> the live asid recorded at that thread's most
- * recent OWNED user TB.  An entry is proof "this (tp, asid) pair named a
- * thread of the pinned process" — the seed the kernel keep rule checks the
- * executing task against.  Process-wide (a pinned thread migrating across
- * vCPUs stays owned) and guarded by exec_lock like every kexc arrow;
- * immortal, per the plugin-lifetime rule for process-wide aggregates.
- * Lazily cleared at each segment generation; invalidated wholesale on
- * rollover-scale evidence (kexc_owned_tp_invalidate).
- */
-struct KexcTpMap {
-    std::unordered_map<uint64_t, uint64_t> map;
-    uint32_t seg_gen = UINT32_MAX;
-    /* Sticky for the segment: at least one owned user TB has produced a
-     * usable identity, so the rule APPLIES on this target/guest.  It has to
-     * be sticky rather than "map is non-empty", because an invalidation
-     * empties the map and must not silently hand the decision back to the
-     * entry-edge rule the identity rule exists to replace: after a rollover
-     * the edge state is exactly as suspect as the values were.  Armed with
-     * an empty map refuses every kernel TB until the owner's next user TB
-     * re-seeds it — the conservative direction. */
-    bool armed = false;
-};
-static KexcTpMap *g_kexc_tp;
-
-static void kexc_tp_fresh()
-{
-    if (!g_kexc_tp) {
-        g_kexc_tp = new KexcTpMap();
-    }
-    uint32_t gen = g_segment_generation.load(std::memory_order_relaxed);
-    if (g_kexc_tp->seg_gen != gen) {
-        g_kexc_tp->map.clear();
-        g_kexc_tp->armed = false;
-        g_kexc_tp->seg_gen = gen;
-    }
-}
-
-/* Does the task-identity rule apply on this guest at all?  False on a
- * target that does not track the thread pointer at kernel privilege, and on
- * one whose thread pointer is architecturally absent (a MIPS model without
- * Config3.ULRI reads CP0 UserLocal as 0 for every task, including the
- * pinned process's own user TBs) — there the entry-edge rule stands
- * unchanged. */
-static bool kexc_tp_armed()
-{
-    kexc_tp_fresh();
-    return g_kexc_tp->armed;
-}
-
-/* A zero thread pointer is the architectural "no identity" value, not an
- * identity: MIPS CP0 UserLocal reads 0 on a model without Config3.ULRI (and
- * on every task of a kernel that does not write it), aarch64 TPIDR_EL0 and
- * x86 FS.base are 0 for a task with no TLS.  Admitting it would make every
- * such task indistinguishable — on a non-ULRI MIPS guest, ONE owned user TB
- * would hand the whole kernel to every process on the machine.  Treat it as
- * unknown on both sides: never seeded, never matched, so the target degrades
- * to the entry-edge rule exactly as a non-tracking target does. */
-static inline bool kexc_tp_usable(uint64_t tp)
-{
-    return tp != 0;
-}
-
-static void kexc_tp_record(uint64_t tp, uint64_t live_asid)
-{
-    if (!kexc_tp_usable(tp)) {
-        g_stats.kexc_tp_null_samples++;
-        return;
-    }
-    kexc_tp_fresh();
-    auto it = g_kexc_tp->map.find(tp);
-    if (it == g_kexc_tp->map.end()) {
-        g_kexc_tp->map.emplace(tp, live_asid);
-        g_stats.kexc_tp_map_inserts++;
-        g_kexc_tp->armed = true;
-    } else {
-        it->second = live_asid;
-    }
-}
-
-static bool kexc_tp_owned(uint64_t tp, uint64_t live_asid)
-{
-    kexc_tp_fresh();
-    auto it = g_kexc_tp->map.find(tp);
-    return it != g_kexc_tp->map.end() && it->second == live_asid;
-}
-
-/* Is @tp a thread the map has EVER seen owned, whatever address space is
- * live now?  Partitions the excluded population: a known thread under a
- * different live ASID is the context-switch window (the kernel has already
- * installed the next task's page tables but not yet switched the register
- * state), while an unknown thread is unambiguously another task's work. */
-static bool kexc_tp_known_thread(uint64_t tp)
-{
-    kexc_tp_fresh();
-    return g_kexc_tp->map.find(tp) != g_kexc_tp->map.end();
-}
-
-std::atomic<uint32_t> g_asid_identity_gen{1};
-
-/* One observation that the raw ASID-value namespace recycled.  Bumping the
- * generation is what makes every value stamped before it stop being an
- * identity; the owned-thread map is keyed on a raw value too, so it goes
- * with it.  Caller holds exec_lock (the ASID-write hook and the dwell
- * re-pin both run inside it). */
-void asid_identity_gen_bump(const char *why)
-{
-    uint32_t g = g_asid_identity_gen.fetch_add(1, std::memory_order_relaxed);
-    g_stats.asid_identity_gen_bumps++;
-    if (kexc_diag()) {
-        fprintf(stderr, "[kexcdiag] ASID-GEN bump %u -> %u (%s)\n",
-                g, g + 1, why);
-    }
-    kexc_owned_tp_invalidate(why);
-}
-
-void kexc_owned_tp_invalidate(const char *why)
-{
-    if (g_kexc_tp && !g_kexc_tp->map.empty()) {
-        g_kexc_tp->map.clear();
-        g_stats.kexc_tp_map_invalidations++;
-        if (kexc_diag()) {
-            fprintf(stderr, "[kexcdiag] TP-MAP invalidate (%s)\n", why);
-        }
-    }
-}
-
 /*
  * Per-window measurement of the ownership CONDITION (not of its outcome): the
  * open window's id, where it opened in the body stream, how many depth stamps
@@ -668,8 +333,8 @@ void kexc_owned_tp_invalidate(const char *why)
  * The window RECORD (id, tallies) is per-vCPU PathBuilder state, like the
  * level it measures: a window's lifetime is per-vCPU QEMU state, and under
  * SMP a peer vCPU must be unable to close or clobber a record it does not
- * own (the kexc async re-latch gate reads the id — a cross-vCPU clobber
- * there was wire-visible, not just measurement noise).  Only the id
+ * own (a cross-vCPU clobber there was wire-visible, not just measurement
+ * noise).  Only the id
  * GENERATOR is process-wide, so ids stay unique across vCPUs; every writer
  * runs under exec_lock.
  */
@@ -766,25 +431,17 @@ constexpr size_t JD_RING = 32;
  * the plugin's step stream — every TB QEMU executed reaches step_events
  * before any gate — between the most recent async-window close and the
  * flagged emit: how many steps survived the gates, how many were refused
- * and WHY (per gate / per kexc decline arm), and the first refused PCs.
+ * and WHY (per gate), and the first refused PCs.
  * Dumped by the online jump detector alongside its rings.
  */
 enum : uint8_t {
     GAP_R_ASYNC = 0,        /* async mute bail (interrupts=0 only) */
-    GAP_R_MMODE,            /* translation-bypass privilege drop */
-    GAP_R_LEGACY_ASID,      /* kexc off: kernel live-ASID mismatch */
-    GAP_R_USER_UNOWNED,     /* user TB not owned by the pin */
-    GAP_R_KEXC_NO_USER,     /* kexc decline: no user context yet */
-    GAP_R_KEXC_NOT_OWNED,   /* kexc decline: entry edge not owned */
-    GAP_R_KEXC_CUT,         /* kexc decline: committed-switch cut */
-    GAP_R_KEXC_TP,          /* kexc decline: executing task not owned */
-    GAP_R_KEXC_ROOT,        /* kexc decline: foreign address-space root */
+    GAP_R_USER_UNOWNED,     /* user TB in a non-gated context */
+    GAP_R_KERNEL_UNGATED,   /* kernel TB in a non-gated context */
     GAP_R_N
 };
 static const char *const gap_reason_name[GAP_R_N] = {
-    "async-mute", "mmode", "legacy-asid", "user-unowned",
-    "kexc-no-user", "kexc-not-owned", "kexc-cut", "kexc-tp-refused",
-    "kexc-root-foreign",
+    "async-mute", "user-unowned", "kernel-ungated",
 };
 struct GapDropRec {
     uint64_t pc, live_asid, exc_entry;
@@ -1201,7 +858,6 @@ void PathBuilder::on_segment_open()
     }
     g_stats.census_frames_orphan_dropped += frames_.size();
     gap_disarm();
-    kexc_snap_.valid = false;
     frames_.clear();
     pending_evs_.clear();
     ref_evs_.clear();
@@ -1239,21 +895,9 @@ void PathBuilder::on_segment_open()
     prev_in_sync_ = false;
     walk_in_sync_ = false;
     seal_pc_override_ = 0;
-    /* Per-vCPU sidecars follow their TLS siblings across the boundary.  The
-     * owned-thread identity map clears itself lazily on the generation key
-     * (kexc_tp_fresh). */
+    /* Per-vCPU sidecars follow their TLS siblings across the boundary. */
     g_pb_prev_async[pb_vcpu_slot(cpu_index_)] = 0;
     g_pb_walk_async[pb_vcpu_slot(cpu_index_)] = 0;
-    g_pb_last_kernel_kept[pb_vcpu_slot(cpu_index_)] = 0;
-    g_pb_last_kernel_recovered[pb_vcpu_slot(cpu_index_)] = 0;
-    /* Kernel-excursion ownership starts the segment unowned: the pin was
-     * just captured at user privilege, so the first user TB re-seeds
-     * last_user_asid_; kernel TBs before it have no owner and drop
-     * (conservative, and a window of at most the marker's own tail). */
-    kexc_reset();
-    kexc_have_user_ = false;
-    kexc_last_user_asid_ = 0;
-    kexc_user_owned_ = false;
     /* Re-prime lazily at the next seal: a fault in flight across
      * segment-open is baselined out so the window starts at depth 0
      * rather than inheriting a pre-trace excursion. */
@@ -1955,596 +1599,17 @@ void PathBuilder::prime_from_live()
     primed_ = true;
 }
 
-/*
- * ---- Kernel-excursion ownership (kexc=1) ----
- * The model and the full rule table live at the state declarations in
- * champsim_tracer_path_builder.h; these are its four arrows.
- */
-
-/* Close any open excursion; the next kernel TB fires a fresh entry
- * edge.  last_user_asid_ deliberately survives (it is TB-history, not
- * excursion state). */
-void PathBuilder::kexc_reset()
-{
-    kexc_in_kernel_ = false;
-    kexc_have_overlay_ = false;
-    kexc_overlay_ = 0;
-    kexc_cut_ = false;
-    kexc_restored_after_cut_ = false;
-    kexc_nvals_ = 0;
-    kexc_stormed_ = false;
-    kexc_relatched_ = false;
-}
-
-/* Async re-latch pair (see the header comment at kexc_snap_).  Snapshot
- * everything kexc_kernel_tb_keep consults plus the per-excursion
- * instrumentation state, so a restored excursion behaves — and reports —
- * exactly as if the window's interleave had not touched it. */
-void PathBuilder::kexc_async_snapshot()
-{
-    kexc_snap_.valid = true;
-    kexc_snap_.in_kernel = kexc_in_kernel_;
-    kexc_snap_.have_user = kexc_have_user_;
-    kexc_snap_.user_owned = kexc_user_owned_;
-    kexc_snap_.last_user_asid = kexc_last_user_asid_;
-    kexc_snap_.exc_entry = kexc_exc_entry_;
-    kexc_snap_.exc_entry_gen = kexc_exc_entry_gen_;
-    kexc_snap_.entry_owned = kexc_entry_owned_;
-    kexc_snap_.have_overlay = kexc_have_overlay_;
-    kexc_snap_.overlay = kexc_overlay_;
-    kexc_snap_.cut = kexc_cut_;
-    kexc_snap_.restored_after_cut = kexc_restored_after_cut_;
-    memcpy(kexc_snap_.vals, kexc_vals_, sizeof(kexc_vals_));
-    kexc_snap_.nvals = kexc_nvals_;
-    kexc_snap_.stormed = kexc_stormed_;
-    g_stats.kexc_async_snapshots++;
-}
-
-void PathBuilder::kexc_async_restore()
-{
-    kexc_in_kernel_ = kexc_snap_.in_kernel;
-    kexc_have_user_ = kexc_snap_.have_user;
-    kexc_user_owned_ = kexc_snap_.user_owned;
-    kexc_last_user_asid_ = kexc_snap_.last_user_asid;
-    kexc_exc_entry_ = kexc_snap_.exc_entry;
-    kexc_exc_entry_gen_ = kexc_snap_.exc_entry_gen;
-    kexc_entry_owned_ = kexc_snap_.entry_owned;
-    kexc_have_overlay_ = kexc_snap_.have_overlay;
-    kexc_overlay_ = kexc_snap_.overlay;
-    kexc_cut_ = kexc_snap_.cut;
-    kexc_restored_after_cut_ = kexc_snap_.restored_after_cut;
-    memcpy(kexc_vals_, kexc_snap_.vals, sizeof(kexc_vals_));
-    kexc_nvals_ = kexc_snap_.nvals;
-    kexc_stormed_ = kexc_snap_.stormed;
-    kexc_snap_.valid = false;
-    kexc_relatched_ = true;
-    g_stats.kexc_async_relatches++;
-    if (kexc_diag()) {
-        fprintf(stderr, "[kexcdiag] ASYNC-RELATCH entry=0x%" PRIx64
-                " owned=%d in_kernel=%d cut=%d\n",
-                kexc_exc_entry_, (int)kexc_entry_owned_,
-                (int)kexc_in_kernel_, (int)kexc_cut_);
-    }
-}
-
-/* Are this excursion's STORED raw ASID values (@kexc_exc_entry_, and the
- * overlay derived inside the same excursion) still in the namespace
- * generation they were recorded in?  Every comparison of a stored value
- * against a live one goes through this: a narrow-ASID space recycles, and
- * once it has, equal bits are a coincidence, not an identity.  Always true
- * on a wide-register target, whose generation never moves. */
-bool PathBuilder::kexc_values_current() const
-{
-    return kexc_exc_entry_gen_ ==
-           g_asid_identity_gen.load(std::memory_order_relaxed);
-}
-
-/* One ASID_WRITE path event (@new_asid = the committed NEW value).
- * Applied exactly once, at the step that drained it, before any gate —
- * including steps the async window suspends: the window's TBs are
- * excluded regardless, but the ownership state must track the writes so
- * post-window attribution is right.  Only meaningful while an excursion
- * is open; a write draining outside one (e.g. the segment's very first
- * steps) has no owner to classify against and is consumed. */
-void PathBuilder::kexc_apply_asid_write(uint64_t new_asid)
-{
-    g_stats.kexc_asid_writes++;
-    if (!kexc_in_kernel_) {
-        return;
-    }
-
-    /* Storm detection (detection only; pin-invalidation policy is a
-     * later decision): distinct new-values this excursion. */
-    if (!kexc_stormed_) {
-        bool seen = false;
-        for (uint32_t i = 0; i < kexc_nvals_; i++) {
-            if (kexc_vals_[i] == new_asid) {
-                seen = true;
-                break;
-            }
-        }
-        if (!seen) {
-            kexc_vals_[kexc_nvals_++] = new_asid;
-            if (kexc_nvals_ >= KEXC_STORM_THRESHOLD) {
-                kexc_stormed_ = true;
-                g_stats.kexc_write_storm++;
-                /* Rollover-scale churn inside one excursion: any recorded
-                 * (tp, asid) ownership pair may now name a foreign process.
-                 * Conservative wholesale invalidation — the owner's next
-                 * user TB re-seeds. */
-                kexc_owned_tp_invalidate("asid-write storm");
-                /* One stderr warning per segment (any thread). */
-                static std::atomic<uint32_t> warned_gen{UINT32_MAX};
-                uint32_t gen = g_segment_generation.load(
-                    std::memory_order_relaxed);
-                uint32_t prev = warned_gen.exchange(
-                    gen, std::memory_order_relaxed);
-                if (prev != gen) {
-                    fprintf(stderr, "champsim_tracer: kexc: ASID-write "
-                            "storm (>= %u distinct values in one kernel "
-                            "excursion, entry ASID 0x%" PRIx64 ") — "
-                            "possible ASID rollover; ownership stays "
-                            "conservative (cut)\n",
-                            KEXC_STORM_THRESHOLD, kexc_exc_entry_);
-                }
-            }
-        }
-    }
-
-    /* Raw-value equality is identity only within one namespace generation.
-     * Once the ASID space is known to have recycled, the entry VALUE coming
-     * back proves nothing — it may now be a foreign process's — so the
-     * restore arrow stands down and the write is classified as any other
-     * foreign value would be (overlay, then cut).  This is the narrow-ASID
-     * rollover collision: without the guard the arrow retires the cut and
-     * hands the excursion's remaining kernel work to the wrong process. */
-    if (!kexc_values_current()) {
-        /* The space recycled while this excursion was open.  Census first,
-         * on BOTH arms: a write of the excursion's own stored entry VALUE
-         * in a later namespace generation is the narrow-ASID collision
-         * itself — the OS handed those bits to somebody else and the
-         * unguarded arrow would read them as "our address space is back",
-         * retire the standing cut and hand the rest of the excursion to
-         * whoever now holds the value. */
-        g_stats.kexc_stale_gen_writes++;
-        const bool collision = new_asid == kexc_exc_entry_;
-        if (collision) {
-            g_stats.kexc_entry_value_collisions++;
-            if (kexc_diag()) {
-                fprintf(stderr, "[kexcdiag] ENTRY-VALUE-COLLISION new=0x%"
-                        PRIx64 " entry=0x%" PRIx64 " gen %u != %u cut=%d\n",
-                        new_asid, kexc_exc_entry_, kexc_exc_entry_gen_,
-                        g_asid_identity_gen.load(std::memory_order_relaxed),
-                        (int)kexc_cut_);
-            }
-        }
-        if (!depth3_gen_off()) {
-            /* No stored-value comparison may fire in a stale generation:
-             * the write is classified as a foreign value would be, which
-             * for an excursion already carrying an overlay means a cut. */
-            if (collision) {
-                g_stats.kexc_entry_restore_refused_stale_gen++;
-            }
-            if (!kexc_cut_) {
-                kexc_cut_ = true;
-                g_stats.kexc_cuts++;
-            }
-            return;
-        }
-        /* Measurement arm: fall through to the raw-value arrows below,
-         * which is the defect. */
-    }
-    if (new_asid == kexc_exc_entry_) {
-        /* Restore: the address space the excursion was ENTERED from is
-         * loaded again, so the excursion's own kernel work resumes here —
-         * which means retiring a standing cut.  A cut records that the
-         * address space MOVED to a third distinct value; once the entry
-         * value is written back, that statement no longer describes the
-         * machine, and leaving the flag set would refuse the entering
-         * process's own post-switch-back kernel path all the way to its
-         * next user TB.  Only the cut clears: the overlay is kept, so a
-         * further third value cuts again, and kexc_entry_owned_ is not
-         * touched — it was latched from kexc_user_owned_, which cannot
-         * change while an excursion is open (kexc_user_tb closes one), so
-         * re-latching it here would provably be a no-op. */
-        g_stats.kexc_entry_restores++;
-        if (kexc_cut_) {
-            kexc_cut_ = false;
-            g_stats.kexc_cut_retired_by_restore++;
-            kexc_restored_after_cut_ = true;
-            if (kexc_diag()) {
-                fprintf(stderr, "[kexcdiag] RESTORE-AFTER-CUT entry=0x%"
-                        PRIx64 " overlay=0x%" PRIx64 " owned=%d\n",
-                        kexc_exc_entry_, kexc_overlay_,
-                        (int)kexc_entry_owned_);
-            }
-        }
-        return;                     /* restore; ownership continues */
-    }
-    if (!kexc_have_overlay_) {
-        kexc_have_overlay_ = true;  /* the excursion's kernel overlay —
-                                     * a PTI-style entry switch or a
-                                     * TLB-maintenance save/probe; NOT a
-                                     * committed switch */
-        kexc_overlay_ = new_asid;
-        g_stats.kexc_overlays++;
-        return;
-    }
-    if (new_asid == kexc_overlay_) {
-        return;
-    }
-    if (!kexc_cut_) {
-        kexc_cut_ = true;           /* third distinct value = committed
-                                     * context switch; sticky until the
-                                     * next user TB */
-        g_stats.kexc_cuts++;
-    }
-}
-
-/* Every priv==0 TB: the excursion (if any) is over, live ASID is
- * authoritative again, and this address space is the owner of the next
- * kernel entry.  Foreign user TBs update ownership too — after a
- * committed switch, the next process's kernel work must charge to ITS
- * user ASID, not linger on the pin.  @owned is the step glue's
- * pin_user_tb_owned verdict: on narrow-ASID targets a raw value match
- * is not proof of identity (a rollover can hand the pinned value to a
- * foreign process), so the ownership seed carries the verified bit
- * rather than re-deriving it from ASID equality. */
-void PathBuilder::kexc_user_tb(uint64_t live_asid, bool owned,
-                               uint64_t tp, bool tp_valid)
-{
-    kexc_reset();
-    kexc_last_user_asid_ = live_asid;
-    kexc_have_user_ = true;
-    kexc_user_owned_ = owned;
-    /* Task-identity seed: an OWNED user TB proves the executing (thread
-     * pointer, live asid) pair names a thread of the pinned process — the
-     * ownership witness the kernel keep rule checks the executing task
-     * against.  A user-privilege sample is always trustworthy, but the pair
-     * is only USEFUL where the register also tracks the current task at
-     * kernel privilege; recording unconditionally is harmless (the kernel
-     * rule only consults the map when its own sample is valid there). */
-    if (owned && tp_valid) {
-        kexc_tp_record(tp, live_asid);
-    }
-}
-
-/* Every non-suspended priv!=0 TB: latch the entry edge once at the
- * outermost user->kernel transition (nested faults inside an open
- * excursion never re-fire it — the single-edge model), then answer the
- * ownership question.  Replaces the live-ASID foreign-drop test for
- * kernel TBs only. */
-bool PathBuilder::kexc_kernel_tb_keep(const StepIn &in)
-{
-    uint64_t start_pc = in.cur ? in.cur->start_pc : 0;
-    uint32_t n_insns = in.cur ? in.cur->n_insns : 0;
-    if (!kexc_in_kernel_) {
-        kexc_reset();
-        kexc_in_kernel_ = true;
-        kexc_exc_entry_ = kexc_last_user_asid_;
-        kexc_exc_entry_gen_ =
-            g_asid_identity_gen.load(std::memory_order_relaxed);
-        kexc_entry_owned_ = kexc_user_owned_;
-    }
-    /* @ours: the excursion was entered from a verified-owned user TB, so
-     * every block of it belongs to the pinned process unless a committed
-     * switch has since moved the address space elsewhere. */
-    bool ours = kexc_have_user_ && kexc_entry_owned_;
-    bool edge_keep = ours && !kexc_cut_;
-
-    /* Task-identity rule.  A kernel TB is the work of the task EXECUTING it,
-     * and on a target whose thread-pointer register tracks the current task
-     * at kernel privilege that identity is directly readable: keep iff the
-     * executing (tp, live asid) pair is a recorded owned thread.  This is
-     * what the entry-edge inference above approximates from vCPU history —
-     * and mis-latches whenever the pinned process re-enters the kernel with
-     * no intervening own user TB (a wake-up switch tail, a sync block
-     * resumed after foreign user code), refusing the whole excursion; it is
-     * also what the edge cannot revoke when the scheduler hands the kernel
-     * to a task it has no address-space evidence for (a borrowed-mm kthread,
-     * a same-mm switch).  in.cur_tp_strict is true at kernel privilege
-     * exactly on tracking targets, so non-tracking targets (RISC-V, whose
-     * trap entry repurposes tp) keep the edge rule byte-for-byte. */
-    /* The rule APPLIES iff the target tracks the thread pointer here and the
-     * pinned process has produced at least one usable identity this segment.
-     * Once it applies, a sample of 0 is a verdict, not an abstention: the
-     * pinned process demonstrably has a non-zero thread pointer (that is
-     * what armed the rule), so a task executing with none — a kernel thread
-     * — is not it. */
-    bool tp_known = in.cur_tp_strict && kexc_tp_armed();
-    if (in.cur_tp_strict && !kexc_tp_usable(in.cur_tp)) {
-        g_stats.kexc_tp_null_samples++;
-    }
-    bool tp_ok = tp_known && kexc_tp_usable(in.cur_tp) &&
-                 kexc_tp_owned(in.cur_tp, in.live_asid);
-
-    /*
-     * Live-root recovery — the non-async entry-edge foreign latch.
-     *
-     * The edge rule asks "was the last user TB this vCPU ran ours?", which
-     * is a proxy for "is this the pinned process's kernel work".  The proxy
-     * fails in one direction the guest produces constantly: the pinned
-     * process re-enters the kernel with no intervening user TB of its own —
-     * the scheduler picks it up inside a blocking syscall, a wake-up tail
-     * runs after another task's user code, a fault handler resumes after a
-     * preemption — and the edge, latched at the outermost transition, still
-     * names whoever ran last.  The whole excursion then declines, which is
-     * where the depth levels and the handler tails go missing.
-     *
-     * On a wide-register target the question has a direct answer: the live
-     * address-space root IS the process.  A kernel TB executing with the
-     * pinned root installed is the pinned process's kernel work, whatever
-     * the vCPU's user-TB history says, so the root re-latches the edge.
-     * This is not a heuristic on those targets — CR3 / TTBR0_EL1 / SATP is a
-     * page-table base, unique per live process — and it is deliberately
-     * inert on the narrow-ASID target, where the same equality is a
-     * coincidence of recycled bits (in.asid_is_identity).
-     */
-    const bool root_owned = in.asid_is_identity && in.pinned &&
-                            in.live_asid == in.pinned_asid;
-    if (in.asid_is_identity && !root_owned) {
-        /* The address space has left the pinned root.  Whatever the
-         * excursion does from here is outside the evidence the recovery
-         * rests on, so the span-return witness stops describing it --
-         * otherwise a recovered span that later context-switches away would
-         * be blamed for the foreign user TB the switch leads to. */
-        g_pb_last_kernel_recovered[pb_vcpu_slot(in.cpu_index)] = 0;
-    }
-    if (root_owned && !edge_keep) {
-        g_stats.kexc_root_recovered_tbs++;
-        g_stats.kexc_root_recovered_insns += n_insns;
-        /* Arm the span-return witness: a recovered span must end at an
-         * OWNED user TB, because a kernel excursion returns to the user
-         * context that owns it (see kexc_recovered_span_*). */
-        g_pb_last_kernel_recovered[pb_vcpu_slot(in.cpu_index)] = 1;
-        if (kexc_cut_) {
-            g_stats.kexc_root_recovered_over_cut++;
-        }
-        if (kexc_diag() && kexc_pc_first_sighting("rootrec", start_pc)) {
-            fprintf(stderr, "[kexcdiag] ROOT-RECOVERED pc=0x%" PRIx64
-                    " ninsns=%u live=0x%" PRIx64 " entry=0x%" PRIx64
-                    " owned=%d cut=%d\n", start_pc, n_insns, in.live_asid,
-                    kexc_exc_entry_, (int)kexc_entry_owned_, (int)kexc_cut_);
-        }
-    }
-
-    if (tp_known) {
-        if (tp_ok) {
-            g_stats.kexc_tp_kept_tbs++;
-        } else {
-            g_stats.kexc_tp_dropped_tbs++;
-        }
-        if (tp_ok && !edge_keep) {
-            g_stats.kexc_tp_recovered_tbs++;
-            g_stats.kexc_tp_recovered_insns += n_insns;
-            g_pb_last_kernel_recovered[pb_vcpu_slot(in.cpu_index)] = 1;
-        } else if (!tp_ok && edge_keep) {
-            g_stats.kexc_tp_excluded_tbs++;
-            g_stats.kexc_tp_excluded_insns += n_insns;
-            /* Partition the excluded population by WHY the pair missed. */
-            if (kexc_tp_known_thread(in.cur_tp)) {
-                g_stats.kexc_tp_excluded_known_thread++;
-            } else {
-                g_stats.kexc_tp_excluded_unknown_thread++;
-            }
-            if (kexc_diag() && kexc_pc_first_sighting("tpexcl", start_pc)) {
-                fprintf(stderr, "[kexcdiag] TP-EXCLUDED pc=0x%" PRIx64
-                        " ninsns=%u live=0x%" PRIx64 " tp=0x%" PRIx64
-                        " entry=0x%" PRIx64 " (edge kept, task foreign)\n",
-                        start_pc, n_insns, in.live_asid, in.cur_tp,
-                        kexc_exc_entry_);
-            }
-        }
-        /* Condition census (both arms): the entry-edge foreign latch —
-         * refused as not-owned while the executing task IS an owned
-         * thread. */
-        if (kexc_have_user_ && !kexc_entry_owned_ && tp_ok) {
-            g_stats.kexc_decl_not_owned_tp_owned++;
-        }
-    }
-
-    /*
-     * The layered verdict.  The edge rule and the live-root rule each
-     * ADMIT (they answer "is this ours?" from different evidence, and a
-     * yes from either is a yes); the task-identity rule only REFUSES.  It
-     * is exclusion-only by construction: a thread pointer proves which task
-     * is executing, so it can veto a block the address-space evidence would
-     * have admitted — the borrowed-mm kernel thread, the post-switch tail
-     * still running on our page tables — but it cannot admit a block on its
-     * own, because a thread-pointer VALUE can repeat across processes
-     * (identical binaries lay their TLS at identical addresses) while a
-     * page-table root cannot.
-     */
-    const bool tp_foreign = tp_known && !tp_ok;
-    /*
-     * Foreign-root refusal — the live-root rule's OTHER direction.
-     *
-     * The recovery above admits a kernel TB because, on a wide-register
-     * target, the live address-space root IS the process.  That fact is
-     * symmetric and the rule was not: a block executing under a root the
-     * trace does not own is, by the same fact, another task's kernel work,
-     * whatever the vCPU's user-TB history says.  The entry edge admitted
-     * those blocks because the committed switch that installed the foreign
-     * root was spent on the excursion's OVERLAY slot — the first foreign
-     * value of an excursion is presumed to be a PTI-style entry switch or a
-     * TLB-maintenance save/probe, and only a THIRD distinct value cuts.
-     * With KPTI off (the canonical configuration) nothing else claims that
-     * slot, so a scheduler switch AWAY from the pinned process consumes it
-     * and the whole tail of the switch — the next task's kernel work, up to
-     * its return to its own user code — entered the trace as ours.
-     *
-     * Exclusion-only, exactly like the task-identity rule: it admits
-     * nothing, it removes the blocks whose executing address space says
-     * they are not ours.  Inert on the narrow-ASID target, where the same
-     * equality is a coincidence of recycled bits (in.asid_is_identity), and
-     * inert while unpinned.  The cost under KPTI ON is real and named in
-     * docs/limitations.rst: the kernel-side root is foreign by this test
-     * too, so kernel coverage stands down to what the pinned root executes.
-     */
-    const bool root_foreign = in.asid_is_identity && in.pinned &&
-                              !in.live_root_owned;
-    bool keep = depth3_kexc_off()
-                    ? edge_keep
-                    : ((edge_keep || root_owned) && !tp_foreign &&
-                       (!root_foreign || kexc_root_refuse_off()));
-    if (root_foreign) {
-        /* Both arms of the invariant, at the block: what the rule let
-         * through (must be 0) and what it removed. */
-        if (keep) {
-            g_stats.kexc_kernel_kept_foreign_root++;
-            g_stats.kexc_kernel_kept_foreign_root_insns += n_insns;
-            if (kexc_diag() &&
-                kexc_pc_first_sighting("keptforeignroot", start_pc)) {
-                fprintf(stderr, "[kexcdiag] KEPT-ON-FOREIGN-ROOT pc=0x%"
-                        PRIx64 " ninsns=%u live=0x%" PRIx64 " pinned=0x%"
-                        PRIx64 " entry=0x%" PRIx64 " overlay=0x%" PRIx64
-                        " edge=%d cut=%d\n", start_pc, n_insns, in.live_asid,
-                        in.pinned_asid, kexc_exc_entry_, kexc_overlay_,
-                        (int)edge_keep, (int)kexc_cut_);
-            }
-        } else if (edge_keep && !tp_foreign) {
-            g_stats.kexc_kernel_refused_foreign_root++;
-            g_stats.kexc_kernel_refused_foreign_root_insns += n_insns;
-        }
-    }
-    if (keep) {
-        g_stats.kexc_kernel_kept++;
-        /* Post-re-latch census (mirrors the post-restore one below): blocks
-         * admitted while the excursion runs on an async-return re-latched
-         * edge are exactly the post-window tail a foreign-latched edge
-         * refused all the way to user privilege. */
-        if (kexc_relatched_) {
-            g_stats.kexc_post_relatch_kept_tbs++;
-            g_stats.kexc_post_relatch_kept_insns += n_insns;
-        }
-        /* Post-restore recovery census: the blocks the restore arrow puts
-         * back in the trace.  A cut is monotone within an excursion unless a
-         * restore retires it, so a block admitted after one is exactly a
-         * block a sticky cut would have refused.  Its own tripwire is the
-         * live address space: the arrow may only re-admit blocks running
-         * under the excursion's entry value, or under the kernel overlay the
-         * excursion already accepted as benign (an idle / kthread borrow) —
-         * anything else would be foreign work entering the trace. */
-        if (kexc_restored_after_cut_) {
-            g_stats.kexc_post_restore_kept_tbs++;
-            g_stats.kexc_post_restore_kept_insns += n_insns;
-            bool own_space = (kexc_values_current() || depth3_gen_off()) &&
-                             (in.live_asid == kexc_exc_entry_ ||
-                              (kexc_have_overlay_ &&
-                               in.live_asid == kexc_overlay_));
-            if (!own_space) {
-                g_stats.kexc_post_restore_kept_foreign_live++;
-            }
-            if (kexc_diag() &&
-                (!own_space ||
-                 kexc_pc_first_sighting("recovered", start_pc))) {
-                fprintf(stderr, "[kexcdiag] RECOVERED%s pc=0x%" PRIx64
-                        " ninsns=%u entry=0x%" PRIx64 " overlay=0x%" PRIx64
-                        " live=0x%" PRIx64 " pin=0x%" PRIx64 "\n",
-                        own_space ? "" : "/OFF-SPACE", start_pc, n_insns,
-                        kexc_exc_entry_, kexc_overlay_, in.live_asid,
-                        in.pinned_asid);
-            }
-        }
-    } else {
-        g_stats.kexc_kernel_dropped++;
-        /* Decline-reason census.  Exactly one arm fires per refused block.
-         * A block the task-identity rule refused that the edge rule would
-         * have kept has no edge-state reason — it is the executing task
-         * itself that is foreign (the borrowed-mm kthread / post-switch
-         * tail class); everything else reports the edge state as before. */
-        if (!depth3_kexc_off() && tp_foreign && (edge_keep || root_owned)) {
-            kexc_last_decline_ = 4;
-        } else if (!kexc_root_refuse_off() && root_foreign && edge_keep) {
-            /* The edge would have kept it; the executing address space is
-             * another process's.  Its own arm, so the cut census keeps
-             * meaning "the excursion saw a third distinct value". */
-            kexc_last_decline_ = 5;
-        } else if (!kexc_have_user_) {
-            g_stats.kexc_decl_no_user++;
-            kexc_last_decline_ = 1;
-        } else if (!kexc_entry_owned_) {
-            g_stats.kexc_decl_not_owned++;
-            kexc_last_decline_ = 2;
-            /* The excursion was latched to a foreign entry, yet the address
-             * space in force is the pinned one: a re-entry with no
-             * intervening user TB.  A separate attribution question from the
-             * cut; recorded, not adjudicated. */
-            if (in.live_asid == in.pinned_asid) {
-                g_stats.kexc_decl_not_owned_live_pinned++;
-            }
-        } else {
-            g_stats.kexc_decl_cut++;
-            kexc_last_decline_ = 3;
-            if (in.pinned && in.live_asid == in.pinned_asid) {
-                g_stats.kexc_decl_cut_live_pinned++;
-            }
-            /* THE TRIPWIRE.  A cut asserts the address space moved away; the
-             * live register says it is the excursion's own entry value.  Both
-             * cannot hold, so a non-zero count is a cut outliving the switch
-             * it describes — the sticky-cut defect. */
-            if ((kexc_values_current() || depth3_gen_off()) &&
-                in.live_asid == kexc_exc_entry_) {
-                g_stats.kexc_cut_declined_at_entry_asid++;
-                if (kexc_diag() &&
-                    kexc_pc_first_sighting("stalecut", start_pc)) {
-                    fprintf(stderr, "[kexcdiag] STALE-CUT-DECLINE pc=0x%"
-                            PRIx64 " ninsns=%u entry=0x%" PRIx64
-                            " overlay=0x%" PRIx64 " restored=%d\n",
-                            start_pc, n_insns, kexc_exc_entry_,
-                            kexc_overlay_, (int)kexc_restored_after_cut_);
-                }
-            }
-        }
-    }
-    /* Kept-span witness latch: the misattribution census at the next user
-     * TB reads whether this vCPU's kernel flow was being TRACED when it
-     * returned to user code (see kexc_kept_span_foreign_user). */
-    g_pb_last_kernel_kept[pb_vcpu_slot(in.cpu_index)] = keep ? 1 : 0;
-    if (kexcwit_diag()) {
-        KexcWitSpan *s = kexcwit_span(in.cpu_index);
-        s->kernel_tbs++;
-        if (keep) {
-            s->kept_tbs++;
-            s->kept_insns += n_insns;
-            if (in.asid_is_identity && in.pinned &&
-                in.live_asid != in.pinned_asid) {
-                s->kept_foreign_root_tbs++;
-                s->kept_foreign_root_insns += n_insns;
-            }
-        }
-        KexcWitEvent e{};
-        e.kind = KW_KTB;
-        e.pc = start_pc;
-        e.live = in.live_asid;
-        e.tp = in.cur_tp;
-        e.tp_strict = in.cur_tp_strict ? 1 : 0;
-        e.n_insns = n_insns;
-        e.priv = (uint8_t)in.live_priv;
-        e.flags = (uint8_t)((keep ? KWF_KEEP : 0) |
-                            (edge_keep ? KWF_EDGE : 0) |
-                            (root_owned ? KWF_ROOT : 0) |
-                            (kexc_cut_ ? KWF_CUT : 0) |
-                            (tp_known ? KWF_TPKNOWN : 0) |
-                            (tp_ok ? KWF_TPOK : 0) |
-                            (kexc_entry_owned_ ? KWF_ENTRY_OWNED : 0) |
-                            (kexc_have_overlay_ ? KWF_OVERLAY : 0));
-        kexcwit_push(in.cpu_index, e);
-    }
-    return keep;
-}
-
-/* Frame lookup by the FAULT event's identity: resume PC plus the ASID
- * stamped at the event instant.  Both the frame's ENTER and a later
- * re-fault/return of the same instruction are stamped while the faulting
- * process is current, so the pair matches exactly — a handler rewriting the MMU context
- * register mid-excursion cannot drift the key at match time.  Top-down so nesting (LIFO position) is respected when
- * duplicate resume PCs exist. */
-ptrdiff_t PathBuilder::frame_idx_for_resume(uint64_t resume_pc,
-                                            uint64_t asid) const
+/* Frame lookup by resume PC within the CURRENT marker window (win_cur_,
+ * stamped at each drain): both the frame's ENTER and a later re-fault /
+ * return of the same instruction classify while the faulting flow's
+ * window is in force, so the (window, resume_pc) pair matches without any
+ * address-space identity (v4 default Q6).  Top-down so nesting (LIFO
+ * position) is respected when duplicate resume PCs exist. */
+ptrdiff_t PathBuilder::frame_idx_for_resume(uint64_t resume_pc) const
 {
     for (size_t i = frames_.size(); i-- > 0; ) {
-        if (frames_[i].resume_pc == resume_pc && frames_[i].asid == asid) {
+        if (frames_[i].resume_pc == resume_pc &&
+            frames_[i].window == win_cur_) {
             return (ptrdiff_t)i;
         }
     }
@@ -2559,15 +1624,14 @@ ptrdiff_t PathBuilder::frame_idx_for_resume(uint64_t resume_pc,
  * fresh fault it takes on a LATER instruction belongs to the same
  * pending block — not to a new frame keyed at the suffix's start, which
  * would drop every instruction ahead of the first resume from the
- * merged emission.  Same ASID and byte-content guards as the resume
+ * merged emission.  Same window and byte-content guards as the resume
  * match; top-down so nesting is respected. */
 ptrdiff_t PathBuilder::frame_idx_for_block(const BBTemplate *piece,
-                                           uint64_t resume,
-                                           uint64_t asid) const
+                                           uint64_t resume) const
 {
     for (size_t i = frames_.size(); i-- > 0; ) {
         const CtxFrame &f = frames_[i];
-        if (f.asid == asid &&
+        if (f.window == win_cur_ &&
             tmpl_contains_pc(f.full_tmpl, resume) &&
             tmpl_subrun_pos(f.full_tmpl, piece) != UINT32_MAX) {
             return (ptrdiff_t)i;
@@ -2578,31 +1642,17 @@ ptrdiff_t PathBuilder::frame_idx_for_block(const BBTemplate *piece,
 
 /*
  * Completion candidate for a just-sealed BB claiming to be some frame's
- * resume suffix.  Keyed on the completing seal's (thread,asid): the thread
- * is implicit (PathBuilder is per-vCPU-thread TLS), and @seal_asid — the
- * pinned process's effective asid at the seal (StepIn::pinned_asid) — is the
- * second half of the key.
- *
- * USER frames match on the hard key (f.asid == seal_asid).  That makes the
- * cross-ASID swallow the byte guard was added to catch (a same-VA frame from
- * ANOTHER process consuming an innocent seal, e.g. resume 0x4003f0 — owned
- * processes all map code at the same low VAs) IMPOSSIBLE BY CONSTRUCTION,
- * and a user fault's event stamp is reliably the faulting process's own
- * asid, so the key never misses a genuine completion.  merge_suffix_matches
- * is demoted to a pure diagnostic on this arm (Decision C).
- *
- * KERNEL-code frames (full_tmpl->is_system, CP-authoritative) additionally
- * complete on the byte-content path when the asid key misses: a kernel
- * fault's event stamp is whatever mm is loaded at the fault instant — under
- * multi-process churn routinely another task's (live ASID is not ownership
- * for kernel code; the reason kexc ownership exists) — so the hard key alone
- * strands the pinned process's own kernel-handler frames un-completable,
- * leaving stale frames to perturb the fault-storm interleave.  The content
- * guard is not process-ambiguous here the way it is for user VAs: kernel
- * text is one shared image, frames_ only ever holds the pinned process's
- * excursions (a foreign TB's prev is dropped before classification can
- * stash one), and the completing suffix is a kexc-kept kernel block of the
- * pinned process.  The stamp drift is reported as a diagnostic.
+ * resume suffix.  Keyed on (tid, window, resume_pc) — v4 default Q6,
+ * maintainer-vetoable.  @seal_window is the marker-window ordinal at the
+ * completing seal (StepIn::cur_window) and @seal_tid the seal's COMMITTED
+ * thread (StepIn::walk_tid, the same sampler that stamped f.tid at
+ * FAULT_ENTER).  The window component makes the cross-space swallow (a
+ * same-VA frame from ANOTHER gated space consuming an innocent seal —
+ * concurrent instances and fork children map code at identical low VAs)
+ * impossible by construction; the tid component scopes completion to the
+ * owning thread.  No root or ASID is stored or compared.  The byte guard
+ * is a pure diagnostic: a mismatch on the full key is a bug to REPORT
+ * (self-modified code, a decode drift), not a reason to reject.
  *
  * Preferred match: a frame whose FAULT_RETURN was already observed (event
  * identity).  Fallback: QEMU's fault-stack pop is strict LIFO, so a non-LIFO
@@ -2612,54 +1662,43 @@ ptrdiff_t PathBuilder::frame_idx_for_block(const BBTemplate *piece,
  */
 bool PathBuilder::frame_matches_completion(const CtxFrame &f,
                                            const BBTemplate *suffix,
-                                           uint64_t seal_asid)
+                                           uint64_t seal_window,
+                                           uint32_t seal_tid)
 {
     if (f.resume_pc != suffix->start_pc) {
         return false;
     }
-    if (f.asid == seal_asid) {
-        /* Byte guard demoted to a pure diagnostic on the asid-keyed arm:
-         * a mismatch here is a bug to REPORT (self-modified code, a decode
-         * drift), not a reason to reject a same-address-space completion. */
-        if (pb_diag() && !merge_suffix_matches(f.full_tmpl, suffix)) {
-            fprintf(stderr, "[pathbuilder] DIAG completion byte mismatch "
-                    "(non-behavioral; asid-keyed): frame full=0x%" PRIx64
-                    " resume=0x%" PRIx64 " asid=0x%" PRIx64 " vs suffix=0x%"
-                    PRIx64 "\n",
-                    f.full_tmpl ? f.full_tmpl->start_pc : 0,
-                    f.resume_pc, f.asid, suffix->start_pc);
-        }
-        return true;
+    if (f.window != seal_window || f.tid != seal_tid) {
+        return false;
     }
-    if (f.full_tmpl && f.full_tmpl->is_system &&
-        merge_suffix_matches(f.full_tmpl, suffix)) {
-        if (pb_diag()) {
-            fprintf(stderr, "[pathbuilder] DIAG kernel-frame completion via "
-                    "content (asid stamp drift): frame full=0x%" PRIx64
-                    " resume=0x%" PRIx64 " asid=0x%" PRIx64 " vs seal asid=0x%"
-                    PRIx64 "\n",
-                    f.full_tmpl->start_pc, f.resume_pc, f.asid, seal_asid);
-        }
-        return true;
+    if (pb_diag() && !merge_suffix_matches(f.full_tmpl, suffix)) {
+        fprintf(stderr, "[pathbuilder] DIAG completion byte mismatch "
+                "(non-behavioral; key-matched): frame full=0x%" PRIx64
+                " resume=0x%" PRIx64 " window=%" PRIu64 " vs suffix=0x%"
+                PRIx64 "\n",
+                f.full_tmpl ? f.full_tmpl->start_pc : 0,
+                f.resume_pc, f.window, suffix->start_pc);
     }
-    return false;
+    return true;
 }
 
 ptrdiff_t PathBuilder::frame_idx_for_completion(const BBTemplate *suffix,
-                                                uint64_t seal_asid) const
+                                                uint64_t seal_window,
+                                                uint32_t seal_tid) const
 {
     if (!suffix) {
         return -1;
     }
     for (size_t i = frames_.size(); i-- > 0; ) {
         const CtxFrame &f = frames_[i];
-        if (f.returned && frame_matches_completion(f, suffix, seal_asid)) {
+        if (f.returned &&
+            frame_matches_completion(f, suffix, seal_window, seal_tid)) {
             return (ptrdiff_t)i;
         }
     }
     for (size_t i = frames_.size(); i-- > 0; ) {
         const CtxFrame &f = frames_[i];
-        if (frame_matches_completion(f, suffix, seal_asid)) {
+        if (frame_matches_completion(f, suffix, seal_window, seal_tid)) {
             return (ptrdiff_t)i;
         }
     }
@@ -2927,14 +1966,14 @@ void PathBuilder::classify_fault_enter(const struct qemu_plugin_cpu_event &ev,
         }
     };
 
-    ptrdiff_t cont = frame_idx_for_resume(resume, ev.asid);
+    ptrdiff_t cont = frame_idx_for_resume(resume);
     if (cont >= 0 &&
         tmpl_subrun_pos(frames_[(size_t)cont].full_tmpl, walk_prev_)
             == UINT32_MAX) {
         cont = -1;
     }
     if (cont < 0) {                                        /* case (a2) */
-        cont = frame_idx_for_block(walk_prev_, resume, ev.asid);
+        cont = frame_idx_for_block(walk_prev_, resume);
     }
     if (cont >= 0) {                                  /* case (a) / (a2) */
         CtxFrame &f = frames_[(size_t)cont];
@@ -2984,14 +2023,10 @@ void PathBuilder::classify_fault_enter(const struct qemu_plugin_cpu_event &ev,
         *prev_emitted = true;
         return;
     }
-    /* Case (b) needs the SAME address-space identity check its sibling
-     * lookups make (see the retention gate). */
-    if (!*prev_emitted && tmpl_contains_pc(walk_prev_, resume) &&
-        ctx_asid_foreign(ev.asid)) {
-        g_stats.case_b_frame_asid_mismatch++;
-    }
-    if (!*prev_emitted && tmpl_contains_pc(walk_prev_, resume) &&
-        !ctx_asid_foreign(ev.asid)) {                             /* (b) */
+    /* Case (b): the retention gate (event_is_ours) already scoped this
+     * event to the gated flow, so no per-event address-space check
+     * remains (v4: no root is ever compared). */
+    if (!*prev_emitted && tmpl_contains_pc(walk_prev_, resume)) {  /* (b) */
         bool head_cut = false;
         BBTemplate *full_bb = fold_prev_full_bb(walk_prev_, &head_cut);
         cst_jump_diag_step(resume, walk_prev_->start_pc, (int)ev.priv, 1,
@@ -3078,7 +2113,7 @@ void PathBuilder::classify_fault_enter(const struct qemu_plugin_cpu_event &ev,
         CtxFrame &f = frames_.back();
         f.full_tmpl = full_bb;
         f.full_cut = cut_frame;
-        f.asid = ev.asid;
+        f.window = win_cur_;
         f.depth = walk_depth_;
         f.async_in_depth = g_pb_walk_async[pb_vcpu_slot(cpu_index_)];
         f.owner_tp = ev.tp;
@@ -3099,7 +2134,7 @@ void PathBuilder::classify_fault_enter(const struct qemu_plugin_cpu_event &ev,
  * match no frame and are consumed silently. */
 void PathBuilder::apply_fault_return(const struct qemu_plugin_cpu_event &ev)
 {
-    ptrdiff_t idx = frame_idx_for_resume(ev.pc, ev.asid);
+    ptrdiff_t idx = frame_idx_for_resume(ev.pc);
     if (idx >= 0) {
         frames_[(size_t)idx].returned = true;
         gap_record_fault_return(ev.pc);
@@ -3182,30 +2217,23 @@ bool PathBuilder::async_window_interior(const struct qemu_plugin_cpu_event &ev,
 }
 
 /*
- * Is this event the traced context's own?
- *
- * NOT a new rule: the EXISTING attribution gate, re-evaluated on the event's
- * own recorded state (ev.asid / ev.priv / ev.tp / ev.tp_ok, stamped by the
- * producer at the event instant) instead of on the TB that happens to be
- * dispatching.  That is what makes retention an attribution decision taken
- * in the same place, from the same inputs, as CONTINUE/SUSPEND.
- *
- * The stamping instant is what makes it sound: a synchronous fault is pushed
- * from the target's do_interrupt BEFORE the privilege/address-space switch
- * (RISC-V: target/riscv/cpu_helper.c, the push precedes riscv_cpu_set_mode),
- * so the event names the FAULTING context, not the handler it is about to
- * enter.  A foreign process page-faulting therefore carries the foreign
- * asid, fails here, and contributes nothing.
- *
- * @idx is the event's position in this drain, used to read the excursion-
- * ownership snapshot taken at that position.
+ * Ownership predicate for ONE event: is this fault event part of the flow
+ * the trace captures?  Under content-as-gate the answer IS the per-vCPU
+ * gate bit (StepIn::live_root_owned — the content check settled at the
+ * last committed root write, plus the trace-all bypass), at every
+ * privilege: RULING 3 traces kernel code in a gated space, so there is no
+ * separate kernel arm, no excursion-ownership mirror and no root
+ * equality.  The one surviving special case is async-window INTERIORITY,
+ * which belongs to the standing async-interrupt-exclusion ruling, not to
+ * ownership (preserved verbatim; the exclusion keys on the per-vCPU async
+ * flag and the ASYNC_ENTER/RETURN queue events — v4 default,
+ * maintainer-vetoable).
  */
 bool PathBuilder::event_is_ours(const struct qemu_plugin_cpu_event &ev,
-                                const StepIn &in, bool in_async,
-                                size_t idx) const
+                                const StepIn &in, bool in_async) const
 {
-    /* (a) Unpinned (trace-all / user mode): everything is ours, verbatim
-     * legacy behaviour. */
+    /* (a) Unpinned (user mode): everything is ours, verbatim legacy
+     * behaviour. */
     if (!in.pinned) {
         return true;
     }
@@ -3225,71 +2253,15 @@ bool PathBuilder::event_is_ours(const struct qemu_plugin_cpu_event &ev,
             g_stats.async_interior_kernel_refused++;
             return false;
         }
-        /* The rescued population: the pinned process's own user-privilege
+        /* The rescued population: the gated flow's own user-privilege
          * synchronous faults, raised while some context's async window was
          * still outstanding.  Nonzero here is the defect condition having
          * arisen and been handled; 0 means it did not arise this run. */
         g_stats.async_interior_user_priv_kept++;
     }
 
-    /* (c) Translation-bypassing privilege (RISC-V M-mode): firmware above
-     * the OS kernel drops on BOTH attribution rules — the same refusal the
-     * TB gate makes.  g_xlate_bypass_priv is -1 until the target's ident is
-     * read, and ev.priv is unsigned, so the comparison is inert before
-     * then. */
-    if (ev.priv > 0 && g_xlate_bypass_priv > 0 &&
-        (int)ev.priv == g_xlate_bypass_priv) {
-        return false;
-    }
-
-    /* (d) User privilege: the live-ASID equality the user TB rule uses.
-     * in.pinned_asid is already the EFFECTIVE pin (the dwell tag on
-     * narrow-ASID targets).
-     *
-     * KNOWN GAP, narrow-ASID targets (MIPS, in.asid_is_identity false).
-     * There the raw value is 8 bits and recycles, so equality is a
-     * COINCIDENCE, not identity — the TB gate answers this question with
-     * physical-page verification (pin_user_tb_owned), which an event cannot
-     * be asked.  Admitting on raw equality therefore lets a colliding
-     * foreign process's events in, and the bound below does not hold: the
-     * validator's mipsel churn cells trip the retention tripwire.  The
-     * tripwire refuses the run rather than accumulate silently, but this is
-     * an incomplete fix on that target, not a closed one; it needs the same
-     * page-identity evidence the block gate uses, keyed off ev.pc. */
-    if (ev.priv == 0) {
-        return ev.asid == in.pinned_asid;
-    }
-
-    /* (e/f) Kernel privilege. */
-    if (!g_features.kexc) {
-        /* Legacy rule: the live ASID, exactly as the TB gate applies it
-         * when kexc is off.  See the startup refusal in
-         * champsim_tracer.cc: system mode + a pin requires kexc, because
-         * this read is the untrustworthy one inside the kernel and a
-         * conservative "retain anyway" would preserve the unboundedness. */
-        return ev.asid == in.pinned_asid;
-    }
-
-    /* The event-level mirror of kexc_kernel_tb_keep, from the event's own
-     * state.  The edge rule and the live-root rule each ADMIT; the
-     * task-identity rule and the foreign-root rule only REFUSE. */
-    const bool edge_own = idx < drain_kexc_own_.size()
-                              ? drain_kexc_own_[idx] != 0
-                              : (kexc_in_kernel_ && kexc_have_user_ &&
-                                 kexc_entry_owned_ && !kexc_cut_);
-    const bool root_owned = in.asid_is_identity && ev.asid == in.pinned_asid;
-    const bool root_foreign = in.asid_is_identity && ev.asid != in.pinned_asid;
-    /* ev.tp_ok is the producer's answer to "does this register name the
-     * executing thread HERE" — the same question in.cur_tp_strict answers
-     * for a TB.  A borrowed-mm kernel thread running on our page tables is
-     * refused by this arm, which is what keeps the root rule from admitting
-     * an unbounded stream of a context we do not trace. */
-    const bool tp_known = ev.tp_ok && kexc_tp_armed();
-    const bool tp_foreign = tp_known &&
-                            !(kexc_tp_usable(ev.tp) &&
-                              kexc_tp_owned(ev.tp, ev.asid));
-
-    return (edge_own || root_owned) && !tp_foreign && !root_foreign;
+    /* (c) The gate bit, both privileges (RULING 3). */
+    return in.live_root_owned;
 }
 
 /*
@@ -3390,9 +2362,9 @@ void PathBuilder::retain_check_compare(uint64_t new_resume_pc)
 
 /*
  * Fold ONE drained batch of ordered path events into this builder's
- * persistent state.  Three ordered passes, in event order: the kernel-
- * excursion ownership pass, the retention pass (which also moves the
- * async window cursor), and the captured-async ownership pass.
+ * persistent state.  Two ordered passes, in event order: the retention
+ * pass (which also moves the async window cursor), and the captured-async
+ * ownership pass.
  *
  * THIS FUNCTION NEVER EMITS.  Everything it touches is builder state; the
  * seal walk, the merge completions and every write to the body stream stay
@@ -3404,119 +2376,13 @@ void PathBuilder::retain_check_compare(uint64_t new_resume_pc)
  *
  * It is also the ONLY implementation of these passes.  step_events calls it
  * with the full StepIn; the absorber calls it with the subset those passes
- * actually read (pinned / pinned_asid / asid_is_identity / cur_tp /
+ * actually read (pinned / live_root_owned / cur_window / cur_tp /
  * cur_tid / cpu_index).  A batch consumed off the dispatch path and a batch
  * consumed on it therefore fold identically, in the same order, into the
  * same members -- there is no second copy of this logic to drift.
  */
 void PathBuilder::absorb_events(const StepIn &in)
 {
-    /* Per-event snapshot of the kernel-excursion ownership edge, taken at
-     * each event's OWN position in the fresh drain below.  The retention
-     * decision for a kernel-privilege event asks the excursion-ownership
-     * question exactly where the event sits, so an ASID_WRITE earlier in the
-     * same batch is inside the answer and a later one is not — the same
-     * interleaving the kexc pass itself relies on.  Sized by the batch, which
-     * is this dispatch's own events; empty off the kexc path. */
-    drain_kexc_own_.clear();
-
-    /* Kernel-excursion ownership: apply this step's FRESH drain of
-     * ASID_WRITE events exactly once, before any gate — the retained-
-     * event rescans below must never see them twice, and a step the
-     * async window suspends (or any later gate bails) still updates
-     * ownership so post-window state is right.  The event's asid field
-     * carries the committed NEW value for this kind.  With kexc off the
-     * events are consumed-and-ignored (the async and fault scans below
-     * skip kind 4 by construction), keeping legacy behavior
-     * byte-for-byte. */
-    if (g_features.kexc && in.pinned) {
-        drain_kexc_own_.reserve(in.n_evs);
-        for (size_t i = 0; i < in.n_evs; i++) {
-            const struct qemu_plugin_cpu_event &kev = in.evs[i];
-            /* BEFORE this event's own apply: the excursion-ownership verdict
-             * that held when the event fired. */
-            drain_kexc_own_.push_back((uint8_t)(kexc_in_kernel_ &&
-                                                kexc_have_user_ &&
-                                                kexc_entry_owned_ &&
-                                                !kexc_cut_));
-            if (kev.kind == QEMU_PLUGIN_CPU_EV_ASID_WRITE) {
-                if (kexcwit_diag()) {
-                    /* Classify the write from the state delta it produces,
-                     * so the record can never disagree with the arrow that
-                     * actually ran. */
-                    const bool k0 = kexc_in_kernel_, c0 = kexc_cut_;
-                    const bool o0 = kexc_have_overlay_;
-                    kexc_apply_asid_write(kev.asid);
-                    KexcWitEvent e{};
-                    e.kind = KW_ASIDW;
-                    e.pc = kev.asid;
-                    e.live = in.live_asid;
-                    e.flags = !k0 ? KWW_NOT_IN_KERNEL
-                            : (!c0 && kexc_cut_) ? KWW_CUT
-                            : (!o0 && kexc_have_overlay_) ? KWW_OVERLAY
-                            : (kev.asid == kexc_exc_entry_) ? KWW_RESTORE
-                            : KWW_OVERLAY_REPEAT;
-                    kexcwit_push(in.cpu_index, e);
-                } else {
-                    kexc_apply_asid_write(kev.asid);
-                }
-            } else if (!g_features.trace_interrupts) {
-                /* interrupts=0: windows are excluded content, ownership
-                 * tracks the writes alone — legacy byte-for-byte. */
-            } else if (kev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_ENTER) {
-                /* Async re-latch, snapshot arrow: pair the ownership state
-                 * with the departure this window will eventually re-fetch.
-                 * A REOPEN deliberately overwrites — the new departure
-                 * resumes into the state at ITS delivery, not the outer
-                 * one's.  Ordered with the ASID_WRITE applies above so a
-                 * write earlier in this drain is inside the snapshot and a
-                 * later one is window content. */
-                kexc_async_snapshot();
-            } else if (kev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_RETURN) {
-                /* Restore arrow: only for a window whose owner is proven —
-                 * the return context is the thread the level belongs to
-                 * (the producer's departure-tp check makes the two agree;
-                 * an unsighted or peer context leaves the state alone and
-                 * the edge keeps today's behavior). */
-                /* The snapshot stores RAW ASID values.  If the namespace
-                 * generation moved while the window was open, the space
-                 * recycled and those bits no longer name the processes they
-                 * did at ASYNC_ENTER — restoring them would re-latch the
-                 * excursion to whoever now holds the value.  A proven return
-                 * with a stale snapshot is refused, not repaired: the edge
-                 * simply keeps whatever the interleave left. */
-                const bool snap_gen_ok =
-                    kexc_snap_.exc_entry_gen ==
-                    g_asid_identity_gen.load(std::memory_order_relaxed);
-                if (win_id_ && kexc_snap_.valid && !snap_gen_ok) {
-                    g_stats.kexc_async_snap_stale_gen++;   /* both arms */
-                }
-                if (win_id_ && kexc_snap_.valid && !snap_gen_ok &&
-                    !depth3_gen_off()) {
-                    g_stats.kexc_async_relatch_refused_stale_gen++;
-                    if (kexc_diag()) {
-                        fprintf(stderr, "[kexcdiag] ASYNC-RELATCH-STALE "
-                                "entry=0x%" PRIx64 " snap gen %u != %u\n",
-                                kexc_snap_.exc_entry,
-                                kexc_snap_.exc_entry_gen,
-                                g_asid_identity_gen.load(
-                                    std::memory_order_relaxed));
-                    }
-                    kexc_snap_.valid = false;
-                } else if (win_id_ && kexc_snap_.valid &&
-                    async_owner_ok_ && in.cur_tp_ok &&
-                    in.cur_tp == async_owner_tp_) {
-                    kexc_async_restore();
-                } else {
-                    if (win_id_) {
-                        g_stats.kexc_async_relatch_skipped++;
-                    }
-                    kexc_snap_.valid = false;
-                }
-            }
-        }
-    }
-
     /*
      * ------------------------------------------------------------------
      * RETENTION, decided in the same place and from the same inputs as the
@@ -3533,8 +2399,9 @@ void PathBuilder::absorb_events(const StepIn &in)
      *                       serving as in_async delimiters (done here as a
      *                       per-event stamp).  Both effects survive; only
      *                       the redundant copy is gone.
-     *   ASID_WRITE          consumed by the kexc pass above and read by no
-     *                       later consumer — never retained.
+     *   ASID_WRITE          its whole effect is the synchronous content-
+     *                       gate refresh at the same commit point — the
+     *                       queued copy is discarded unread.
      *   FAULT_ENTER/RETURN  stamped with the window state AT THIS POSITION
      *                       and retained IFF the event is the traced
      *                       context's own (event_is_ours).
@@ -3548,9 +2415,7 @@ void PathBuilder::absorb_events(const StepIn &in)
     retain_arms_check_once();
     const bool keep_all = retain_all();
     const bool fold_now = !slow_fold();
-    pin_armed_cur_ = in.pinned;
-    pin_asid_cur_ = in.pinned_asid;
-    pin_identity_cur_ = in.asid_is_identity;
+    win_cur_ = in.cur_window;
     for (size_t i = 0; i < in.n_evs; i++) {
         const struct qemu_plugin_cpu_event &ev = in.evs[i];
         const bool ev_in_async = drain_async_open_;
@@ -3583,7 +2448,7 @@ void PathBuilder::absorb_events(const StepIn &in)
             break;
         case QEMU_PLUGIN_CPU_EV_FAULT_ENTER:
         case QEMU_PLUGIN_CPU_EV_FAULT_RETURN: {
-            const bool ours = event_is_ours(ev, in, ev_in_async, i);
+            const bool ours = event_is_ours(ev, in, ev_in_async);
             ev_ours = ours;
             if (ours) {
                 g_stats.retention_events_owned++;
@@ -3654,8 +2519,8 @@ void PathBuilder::absorb_events(const StepIn &in)
     }
 
     /* Captured-async OWNERSHIP, from this step's FRESH drain — each event seen
-     * exactly once, like the kexc pass above and unlike the retained-event
-     * rescan below, which deliberately replays.  The level a window
+     * exactly once, unlike the retained-event rescan below, which
+     * deliberately replays.  The level a window
      * contributes belongs to the thread the interrupt was DELIVERED in
      * (format.rst §4.2a), and the ENTER event itself carries that thread's
      * pointer (ev.tp/ev.tp_ok, stamped by the producer at the delivery
@@ -3983,7 +2848,6 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
             async_win_close("PREPRIME", in.cur_tid);
             gap_disarm();       /* nothing owed pre-prime */
         }
-        kexc_snap_.valid = false;   /* pre-prime window: no owed re-latch */
     } else if (!slow_fold()) {
         /* Folded at drain, O(1) per event, into these same members with the
          * same assignment semantics.  The rescan below is the reference form
@@ -4012,8 +2876,8 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
                 async_departure_pc_ = 0;
             }
             /* ASID_WRITE (kind 4) is window-neutral: consumed by the
-             * kexc ownership pass at drain time above, explicitly
-             * ignored here on the legacy (kexc=0) rule. */
+             * content-gate refresh at its own commit point, explicitly
+             * ignored here. */
         }
     }
     g_capture_mute = async_excluding_;
@@ -4112,146 +2976,37 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
              * deferred prev for the resume), not the ASID drop. */
             gap_record_drop(GAP_R_ASYNC, in.cur ? in.cur->start_pc : 0,
                             in.cur ? in.cur->n_insns : 0, in.live_priv,
-                            in.live_asid, kexc_exc_entry_, 0);
-            if (kexcwit_diag()) {
-                KexcWitSpan *s = kexcwit_span(in.cpu_index);
-                s->susp_tbs++;
-                KexcWitEvent e{};
-                e.kind = KW_SUSP;
-                e.pc = in.cur ? in.cur->start_pc : 0;
-                e.live = in.live_asid;
-                e.tp = in.cur_tp;
-                e.tp_strict = in.cur_tp_strict ? 1 : 0;
-                e.n_insns = in.cur ? in.cur->n_insns : 0;
-                e.priv = (uint8_t)in.live_priv;
-                kexcwit_push(in.cpu_index, e);
-            }
+                            in.live_asid, 0, 0);
             return StepStatus::SUSPENDED;
         }
     }
 
-    /* Foreign-ASID boundary (non-async; the async case bailed above,
-     * preserving prev).  With kexc on, kernel (priv!=0) TBs are gated by
-     * the excursion-ownership rule INSTEAD of the live ASID — the live
-     * register is not trustworthy inside the kernel (PTI entry
-     * switches, TLB-maintenance save/probe writes) — while user
-     * (priv==0) TBs keep the live-ASID rule verbatim, additionally
-     * driving the ownership edges (reset + owner tracking).  Suspended
-     * TBs never reach this point, so excluded async-window content
-     * drives no ownership edge. */
+    /* Gate boundary (non-async; the async case bailed above, preserving
+     * prev).  Under content-as-gate ONE bit answers both privilege arms:
+     * does the live context map a latched window's marker bytes
+     * (StepIn::live_root_owned, settled at the last committed root write;
+     * user TBs additionally carry the trace-all widening in user_owned)?
+     * RULING 3: kernel code in a gated address space is traced —
+     * borrowed-mm kthreads, wake tails and post-switch tails included.
+     * There is no excursion-ownership inference, no task-identity veto,
+     * no root equality anywhere.  A translation-bypassing privilege level
+     * (RISC-V M-mode firmware) refreshes no gate, so the bit simply
+     * stands and firmware in a gated context is traced (Q16 v4 default,
+     * maintainer-vetoable).  Suspended TBs never reach this point. */
     if (in.pinned) {
         bool drop;
-        if (in.live_priv > 0 && in.live_priv == g_xlate_bypass_priv) {
-            /* Translation-bypassing privilege level (RISC-V M-mode; see
-             * g_xlate_bypass_priv in champsim_tracer.cc).  Execution here
-             * never translates through the pinned register — the live
-             * satp is a stale bystander, and matching it (or owning the
-             * excursion under kexc) says nothing about whose work this
-             * is.  It is firmware above the OS kernel, not the pinned
-             * process's kernel work, so it drops on BOTH attribution
-             * rules.  Deliberately ahead of the kexc arrows: a dropped
-             * M-mode TB neither opens nor cuts an excursion, so an
-             * S-mode excursion interrupted by a sync SBI call resumes
-             * with its ownership intact. */
-            g_stats.kexc_mmode_dropped++;
-            g_pb_last_kernel_kept[pb_vcpu_slot(in.cpu_index)] = 0;
-            g_pb_last_kernel_recovered[pb_vcpu_slot(in.cpu_index)] = 0;
-            drop = true;
-        } else if (!g_features.kexc) {
-            drop = in.live_priv == 0 ? !in.user_owned
-                                     : in.live_asid != in.pinned_asid;
-        } else if (in.live_priv == 0) {
-            /* Kept-span misattribution witness (both arms): the kernel span
-             * this vCPU just finished tracing flowed directly into a user TB
-             * the ownership verdict calls FOREIGN — so its tail was that
-             * foreign task's kernel work.  The pinned-value flavour is the
-             * narrow-ASID raw-value collision (a rollover handed the pinned
-             * value to another process), which also invalidates the
-             * owned-thread identity map: a recycled value must not satisfy a
-             * stale (tp, asid) pair. */
-            unsigned wslot = pb_vcpu_slot(in.cpu_index);
-            /* Recovered-span return witness.  A kernel excursion ends by
-             * returning to the user context that owns it, so a span the
-             * task-identity rule recovered must land on an OWNED user TB.
-             * The foreign flavour MUST be 0: it would mean the rule admitted
-             * blocks the edge refused and they turned out to be a foreign
-             * task's after all.  This is the recovery's proof of correctness
-             * on the wire itself, independent of the (tp, asid) pair that
-             * made the decision. */
-            if (g_pb_last_kernel_recovered[wslot]) {
-                if (in.user_owned) {
-                    g_stats.kexc_recovered_span_owned_user++;
-                } else {
-                    g_stats.kexc_recovered_span_foreign_user++;
-                    if (kexc_diag()) {
-                        fprintf(stderr, "[kexcdiag] RECOVERED-SPAN-FOREIGN "
-                                "pc=0x%" PRIx64 " live=0x%" PRIx64 " pin=0x%"
-                                PRIx64 " tp=0x%" PRIx64 "\n",
-                                in.cur ? in.cur->start_pc : 0, in.live_asid,
-                                in.pinned_asid, in.cur_tp);
-                    }
-                }
-            }
-            g_pb_last_kernel_recovered[wslot] = 0;
-            if (g_pb_last_kernel_kept[wslot] && !in.user_owned) {
-                if (kexcwit_diag()) {
-                    kexcwit_dump(in.cpu_index, "KEPT-SPAN-FOREIGN-USER",
-                                 in.cur ? in.cur->start_pc : 0, in.live_asid,
-                                 in.pinned_asid, in.cur_tp);
-                }
-                g_stats.kexc_kept_span_foreign_user++;
-                if (in.live_asid == in.pinned_asid) {
-                    g_stats.kexc_kept_span_foreign_user_pinned_val++;
-                }
-                if (kexc_diag()) {
-                    fprintf(stderr, "[kexcdiag] KEPT-SPAN-FOREIGN-USER "
-                            "pc=0x%" PRIx64 " live=0x%" PRIx64 " pin=0x%"
-                            PRIx64 " tp=0x%" PRIx64 "\n",
-                            in.cur ? in.cur->start_pc : 0, in.live_asid,
-                            in.pinned_asid, in.cur_tp);
-                }
-            }
-            g_pb_last_kernel_kept[wslot] = 0;
-            if (!in.user_owned && in.live_asid == in.pinned_asid) {
-                kexc_owned_tp_invalidate("pinned-value foreign user");
-            }
-            kexc_user_tb(in.live_asid, in.user_owned, in.cur_tp,
-                         in.cur_tp_strict);
-            if (kexcwit_diag()) {
-                kexcwit_open_span(in.cpu_index,
-                                  in.cur ? in.cur->start_pc : 0,
-                                  in.live_asid, in.user_owned);
-            }
+        if (in.live_priv == 0) {
             drop = !in.user_owned;
         } else {
-            drop = !kexc_kernel_tb_keep(in);
+            drop = !in.live_root_owned;
         }
         if (drop) {
             if (cst_jump_diag() && g_gap.armed) {
-                uint8_t r;
-                if (in.live_priv > 0 &&
-                    in.live_priv == g_xlate_bypass_priv) {
-                    r = GAP_R_MMODE;
-                } else if (!g_features.kexc) {
-                    r = in.live_priv == 0 ? GAP_R_USER_UNOWNED
-                                          : GAP_R_LEGACY_ASID;
-                } else if (in.live_priv == 0) {
-                    r = GAP_R_USER_UNOWNED;
-                } else {
-                    r = kexc_last_decline_ == 1 ? GAP_R_KEXC_NO_USER
-                      : kexc_last_decline_ == 2 ? GAP_R_KEXC_NOT_OWNED
-                      : kexc_last_decline_ == 4 ? GAP_R_KEXC_TP
-                      : kexc_last_decline_ == 5 ? GAP_R_KEXC_ROOT
-                                                : GAP_R_KEXC_CUT;
-                }
-                uint8_t kf = (uint8_t)((kexc_entry_owned_ ? 1 : 0) |
-                                       (kexc_cut_ ? 2 : 0) |
-                                       (kexc_have_user_ ? 4 : 0) |
-                                       (kexc_stormed_ ? 8 : 0) |
-                                       (kexc_restored_after_cut_ ? 16 : 0));
+                uint8_t r = in.live_priv == 0 ? GAP_R_USER_UNOWNED
+                                              : GAP_R_KERNEL_UNGATED;
                 gap_record_drop(r, in.cur ? in.cur->start_pc : 0,
                                 in.cur ? in.cur->n_insns : 0, in.live_priv,
-                                in.live_asid, kexc_exc_entry_, kf);
+                                in.live_asid, 0, 0);
             }
             /* EMIT-AT-DEPARTURE (foreign boundary).  The deferred prev is
              * the pinned process's block and this dispatch belongs to
@@ -4298,7 +3053,7 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
      * are skipped); the map is exec_lock-serialised like every promote.
      *
      * USER PROMOTES ONLY, on both sides.  Under SMP the kernel strands
-     * share the owning thread's tid (the kexc ownership rule), so a
+     * share the owning thread's tid, so a
      * timer interrupt landing on a PEER vCPU promotes kernel TBs under
      * the same tid while the thread's user code keeps running where it
      * was — a map that moved on those saw a PHANTOM migration and the
@@ -4764,10 +3519,10 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
                     apply_fault_return(ev);
                 }
             }
-            /* async kinds were applied by step_events.  ASID_WRITE (kind
-             * 4) is consumed at drain time for kexc ownership (step_events);
-             * the fault-depth trailer no longer reads it.  Depth is the
-             * pinned process's OWN un-returned fault count (below), which the
+            /* async kinds were applied by step_events.  ASID_WRITE's
+             * whole effect is the synchronous content-gate refresh; the
+             * fault-depth trailer does not read it.  Depth is the traced
+             * flow's OWN un-returned fault count (below), which the
              * context switch an ASID_WRITE marks cannot perturb. */
         }
         pending_evs_.clear();
@@ -4842,6 +3597,78 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
                     }
                 }
                 f.returned = true;
+            }
+        }
+        /* RETURN BY DIVERSION (exception-table fixup).  A handler may end a
+         * fault excursion without ever re-executing the faulting
+         * instruction: the kernel's exception-table fixup ADVANCES the
+         * resume point (Linux/MIPS handle_sys substitutes 0 for an
+         * unreadable stack argument and its ERET lands on bad_stack_aN,
+         * which branches to the NEXT load; x86 copy_user error paths are
+         * the same shape).  QEMU's strict-LIFO cpu_plugin_fault_pop
+         * rightly refuses that ERET (its target is not the pushed resume
+         * PC), so no FAULT_RETURN arrives — but the excursion IS over,
+         * and the dispatch now entering the frame's own template at an
+         * INTERIOR pc other than the resume PC is the witness: handler
+         * content never re-enters the faulted block's instruction stream;
+         * only the diverted return does.  Without this sweep the frame
+         * stays in flight, so (1) every later stamp of the thread counts
+         * a dead excursion — the block's own resumed pieces and the NEXT
+         * fixup fault's excursion emit at the SAME depth, breaking the
+         * strictly-deeper contract range_continuity enforces — and (2)
+         * the (a2) join reads the next fault's advanced resume PC as
+         * mid-excursion retirement and publishes a range the guest never
+         * executed (the fixup SKIPPED those instructions; observed as the
+         * mipsel handle_sys range=0..1/1..2/2..3 fabrication).
+         *
+         * The frame is ERASED, not merely marked returned: its pending
+         * merge is dead by construction (the resume PC was skipped, so a
+         * later dispatch there belongs to a DIFFERENT invocation), and a
+         * lingering copy would let that invocation's seal complete an
+         * abandoned block.  An already-published prefix stays on the wire
+         * as an abandoned open invocation, which the checker licenses
+         * exactly here: the excursion that ends by diversion is on the
+         * wire to explain the cut.
+         *
+         * Three spared entries, each owned by other machinery: AT the
+         * resume PC (genuine re-execution; completion/rejoin), at the
+         * template's HEAD (an ordinary new invocation arriving by call or
+         * branch, not a return), and an interior entry whose PREDECESSOR
+         * (walk_prev_, the TB dispatched immediately before cur) is
+         * itself a subrun of the frame's template — that is the resumed
+         * suffix FLOWING across a TB boundary (TB at the resume retired,
+         * the next TB continues by fall-through), not an entry from
+         * outside.  The fixup return always arrives from outside the
+         * template (the trampoline is its own code), which is what the
+         * predecessor test reads. */
+        if (fault_on && in.cur) {
+            for (size_t i = frames_.size(); i-- > 0; ) {
+                CtxFrame &f = frames_[i];
+                if (f.returned || f.tid != in.cur_tid ||
+                    f.window != win_cur_) {
+                    continue;
+                }
+                const uint64_t entry_pc = in.cur->start_pc;
+                if (entry_pc == f.resume_pc || !f.full_tmpl ||
+                    entry_pc == f.full_tmpl->start_pc ||
+                    !tmpl_contains_pc(f.full_tmpl, entry_pc)) {
+                    continue;
+                }
+                if (walk_prev_ &&
+                    tmpl_subrun_pos(f.full_tmpl, walk_prev_) != UINT32_MAX) {
+                    continue;      /* suffix flow across a TB boundary */
+                }
+                g_stats.census_frames_diverted++;
+                cst_jump_diag_step(entry_pc, f.full_tmpl->start_pc,
+                                   in.live_priv, 1, "fault-diverted");
+                if (pb_diag() || pb_depth_diag()) {
+                    fprintf(stderr, "[pathbuilder] DIVERTED entry=0x%" PRIx64
+                            " frame full=0x%" PRIx64 " resume=0x%" PRIx64
+                            " emitted_to=%u\n",
+                            entry_pc, f.full_tmpl->start_pc, f.resume_pc,
+                            f.emitted_to);
+                }
+                frames_.erase(frames_.begin() + (ptrdiff_t)i);
             }
         }
         /* interrupts=1 abandoned-window recovery: a pinned USER TB proves the
@@ -4948,12 +3775,6 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
                     g_pb_walk_async[aslot] = 0;
                     g_pb_prev_async[aslot] = 0;
                 }
-                /* An abandoned window never re-fetches its departure, so
-                 * the snapshot's "machine is back where it left" premise is
-                 * void — the ownership state stays as the interleave left
-                 * it (this TB is user privilege: the very next step
-                 * re-latches fresh anyway). */
-                kexc_snap_.valid = false;
                 {
                     uint64_t closed_win = win_id_;
                     async_win_close("ABANDON", in.cur_tid);
@@ -5170,12 +3991,13 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
     }
 
     /* ---- merge completion (front seal only) ---- */
-    /* The seal runs on the pinned process's live context; its effective asid
-     * (in.pinned_asid) is the (thread,asid) key completion matches on. */
+    /* The seal runs on the gated flow's live context; the window ordinal
+     * in force (in.cur_window) and the committed thread (in.walk_tid) are
+     * the (tid, window) key completion matches on (v4 default Q6). */
     ptrdiff_t mtop = -1;
     if (fault_on && any_finalize && !pending_emits.empty()) {
         mtop = frame_idx_for_completion(pending_emits.front().bb_tmpl,
-                                        in.pinned_asid);
+                                        in.cur_window, in.walk_tid);
     }
     if (in.watch_pc && walk_prev_ && walk_prev_->start_pc == in.watch_pc) {
         fprintf(stderr, "[blkwatch] mtop=%td frames=%zu (events)\n",
@@ -5250,6 +4072,34 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
             fanout = fanout || tmpl_has_fanout(pe.bb_tmpl);
         }
         stamp_thread_end = !fanout;
+        /* END-take coverage wait (cst_end_take_wait_vaddr): the
+         * translate-raised END arm holds its take until the END block's
+         * body record is published, so at a boundary whose walk does NOT
+         * publish the covering block the take provably does not fire —
+         * a stamp there would flag a mid-stream entry (the lie).  Only
+         * a walk that itself emits the block covering the awaited pc
+         * stamps; the take then fires at this same step's end.  Scanned
+         * on the per-insn pcs (positional), full extent — the seal
+         * walk's emissions publish whole blocks. */
+        if (stamp_thread_end) {
+            if (uint64_t wait_pc = cst_end_take_wait_vaddr(in.cpu_index)) {
+                bool covers = false;
+                for (const PendingEmit &pe : pending_emits) {
+                    const BBTemplate *t = pe.bb_tmpl;
+                    for (uint32_t i = 0; t && t->insn_pcs &&
+                                         i < t->n_insns; i++) {
+                        if (t->insn_pcs[i] == wait_pc) {
+                            covers = true;
+                            break;
+                        }
+                    }
+                    if (covers) {
+                        break;
+                    }
+                }
+                stamp_thread_end = covers;
+            }
+        }
     }
 
     for (const PendingEmit &pe : pending_emits) {

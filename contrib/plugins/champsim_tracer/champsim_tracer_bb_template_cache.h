@@ -429,25 +429,6 @@ public:
     void note_spec_creation(uint64_t bytes) { spec_pending_bytes_ += bytes; }
     uint64_t reclaim_spec_templates(void);
 
-    /* Drop @asid_root's (asid_root, *) entries from the per-class chain
-     * dedup indices when its trace window closes (its END marker / removal
-     * from the owned set), so the dedup index does not accumulate one
-     * bucket per address space across many disparate ASIDs.  These buckets
-     * cache only lookup_tb_chain's "already translated" shortcut and are
-     * not serialised, so dropping them is wire-neutral and frees no
-     * fragment (the pointers index tb_templates_, which persists).
-     *
-     * The closed process's true-BB templates (bb_map_) are NOT freed here:
-     * the templates section is serialised once at segment finish and every
-     * emitted body entry references its template_id, so freeing an emitted
-     * template mid-segment dangles those references — emitted templates
-     * live until clear_bb_map at the segment boundary.  tb_templates_
-     * fragments likewise stay pinned by live QEMU exec-cb udata until a
-     * tb_flush (reclaim_spec_templates).  Within a segment, template memory
-     * is bounded by the window's distinct-code footprint, not by process
-     * turnover.  Returns the number of dedup buckets dropped.  Caller holds
-     * data_lock. */
-    uint64_t reclaim_asid(uint64_t asid_root);
 
     /* CST_MEMSTATS: print a footprint breakdown of the template store to
      * @out — template counts, per-array byte totals (insn_fields dominates:

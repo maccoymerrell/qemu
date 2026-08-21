@@ -48,24 +48,22 @@ TemplateStore &TemplateStore::TranslationScope::g_template_store_ref()
     return g_template_store;
 }
 
-/* The CODE's live translation address-space id — the key component that
- * disambiguates a shared code VA across owned processes (see BBKey).  Every
- * store mutator/lookup runs from a live vCPU context (translation, or CP/WP
- * execution under exec_lock), where qemu_plugin_get_addr_space_id() and
- * qemu_plugin_get_priv_level() are valid and report the address space and
- * privilege the code being (de)serialised belongs to; the user-mode root is
- * the SAME value the per-entry memory dimension resolves from
- * (resolve_asid_index), so the code and memory dimensions agree.  create_tb_
- * template already reads qemu_plugin_get_priv_level() the same way, so the
- * store is already coupled to the live vCPU.  A single address space always
- * reports root 0, so single-process keys, and single-process output, are
- * bit-identical to the old start_pc-only scheme.
- *
- * A single address space always reports root 0, so single-process keys, and
- * single-process output, are bit-identical to the old start_pc-only scheme. */
+/* The CODE's key-space component: the MARKER-WINDOW ORDINAL in force on
+ * the executing vCPU (v4 default Q5/Q14, maintainer-vetoable) — the key
+ * that disambiguates a shared code VA across concurrently gated address
+ * spaces.  No root or ASID value is ever stored or compared: the window
+ * is the model's only stable internal identity, and two instances gated
+ * by the SAME window (identical marker vaddr — Q15) deliberately share
+ * buckets, a code-dedup collision the model accepts (Q14: never an
+ * attribution error, since the gate is content).  Every store
+ * mutator/lookup runs from a live vCPU context (translation, or CP/WP
+ * execution under exec_lock), where cst_cur_window() is valid.  Unarmed
+ * runs (user-mode icount/full-run) hold ordinal 0 throughout, so those
+ * keys — and the output — are bit-identical to the old start_pc-only
+ * scheme. */
 static inline uint64_t store_live_asid_root(void)
 {
-    return qemu_plugin_get_addr_space_id();
+    return cst_cur_window();
 }
 
 /* KPTI-off canonical model (multiasid_plan §7): the true-BB template a block
@@ -73,9 +71,9 @@ static inline uint64_t store_live_asid_root(void)
  * the block is KERNEL code, instead of the entering process's live root — the
  * kernel is one physical instance mapped into every process, so the same
  * kernel code at the same VA becomes one serialised template rather than one
- * per process.  USER code keys by its live root (the process's, stable across
- * a kernel excursion under KPTI-off) so two owned processes sharing a code VA
- * stay distinct (Bug A).
+ * per process.  USER code keys by the gating window's ordinal (stable
+ * across a kernel excursion) so two separately gated processes sharing a
+ * code VA stay distinct (Bug A).
  *
  * The bucket is selected by the block's start_pc through the ARCHITECTURAL VA
  * classifier (cst_va_is_kernel_code → qemu_plugin_vaddr_is_kernel, the
@@ -83,7 +81,7 @@ static inline uint64_t store_live_asid_root(void)
  * is what makes the shared bucket safe against the wrong path: kernel and user
  * VA ranges are architecturally disjoint, so a user VA can NEVER classify
  * kernel — a wrong-path walk that speculatively translates a user VA at kernel
- * privilege and mis-stamps it is_system=1 still keys by the live process root
+ * privilege and mis-stamps it is_system=1 still keys by the gating window
  * (its VA classifies user), so two processes' user code at one VA can never
  * conflate in the sentinel.  Both the correct and wrong paths therefore route
  * a kernel-VA block into the shared bucket (so WP-only-discovered kernel code
@@ -92,13 +90,13 @@ static inline uint64_t store_live_asid_root(void)
  * terminate on the wrong path (champsim_tracer_wp.cc) ends any excursion that
  * would cross the kernel/user boundary, so a committed WP block's VA class
  * matches the domain it was fetched in.  The internal fragment-chain indices
- * (tb_chain_dedup_/spec_chain_index_) still key by the live root; the shared
- * identity is only the wire-visible template. */
+ * (tb_chain_dedup_/spec_chain_index_) still key by the window ordinal; the
+ * shared identity is only the wire-visible template. */
 static inline uint64_t store_asid_root(uint64_t start_pc)
 {
     return cst_va_is_kernel_code(start_pc)
                ? CST_KERNEL_ASID_ROOT
-               : qemu_plugin_get_addr_space_id();
+               : cst_cur_window();
 }
 
 /* Stable zeroed sentinel: a fragment may lack insn_reg_names while
@@ -1998,51 +1996,4 @@ uint64_t TemplateStore::reclaim_spec_templates(void)
         life_audit_after_reclaim(freed);
     }
     return n;
-}
-
-uint64_t TemplateStore::reclaim_asid(uint64_t asid_root)
-{
-    /* Window-close reclaim for one address space (see the header).  Drops
-     * the closed process's (asid_root, *) entries from BOTH per-class chain
-     * dedup indices.  Those buckets only cache the "already translated this
-     * TB" shortcut for lookup_tb_chain: their vectors hold BBTemplate*
-     * pointers INTO tb_templates_, so erasing a bucket forgets the shortcut
-     * without freeing any fragment (the fragments stay owned by
-     * tb_templates_).  A later re-translation of this VA — only if the
-     * window ever reopens — simply misses dedup and mints a fresh chain,
-     * which is correct and bounded.  Wire-neutral: neither index is
-     * serialised.
-     *
-     * The true-BB templates in bb_map_ are DELIBERATELY NOT freed here.
-     * The templates section is serialised once, at segment finish
-     * (write_bin_templates -> for_each_bb), and every body entry emitted
-     * during this window references its template_id; freeing an emitted
-     * template mid-segment would leave those references dangling in the
-     * wire (a decode-time "dangling template ref").  Emitted templates must
-     * therefore live until the segment's templates section is written —
-     * clear_bb_map frees them wholesale at the segment boundary.  Likewise
-     * tb_templates_ fragments stay pinned by live QEMU exec-cb udata and
-     * are only reclaimable at a tb_flush (reclaim_spec_templates).  Within a
-     * segment, template memory is thus bounded by the segment's
-     * distinct-code footprint (which the icount/marker window caps), not by
-     * process turnover. */
-    uint64_t dropped = 0;
-    for (auto it = tb_chain_dedup_.begin(); it != tb_chain_dedup_.end(); ) {
-        if (it->first.asid_root == asid_root) {
-            dropped++;
-            it = tb_chain_dedup_.erase(it);
-        } else {
-            ++it;
-        }
-    }
-    for (auto it = spec_chain_index_.begin();
-         it != spec_chain_index_.end(); ) {
-        if (it->first.asid_root == asid_root) {
-            dropped++;
-            it = spec_chain_index_.erase(it);
-        } else {
-            ++it;
-        }
-    }
-    return dropped;
 }

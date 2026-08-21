@@ -229,6 +229,130 @@ int get_physical_address(CPUMIPSState *env, hwaddr *physical,
     return ret;
 }
 
+/*
+ * Debug-read fallback through the guest page tables — v4 default #2,
+ * maintainer-vetoable.
+ *
+ * A debug read (gdbstub, monitor, qemu_plugin_read_memory_vaddr — the
+ * ChampSim Tracer's content-gate refresh) resolves through the software
+ * TLB matched against the live EntryHi.ASID, so immediately after a
+ * switch_mm a RESIDENT page's translation is simply not in the TLB and
+ * the read fails even though the guest maps the page.  When the model
+ * implements the hardware page-table walker (Config3.PW, PWCtl.PWEn),
+ * fall back to the same directory walk the walker performs, from CP0
+ * PWBase, SIDE-EFFECT-FREE: PWBase is used strictly as a TRANSLATION
+ * INPUT — never stored, compared, or reported as an identity — and the
+ * walk inserts no TLB entry and raises no exception.  Directory
+ * pointers are virtual (kseg0 in practice) and resolve through
+ * get_physical_address; entries are read from guest RAM physically.
+ * Deliberately narrow: huge-page directory entries and non-4K leaf
+ * configurations are not decoded — the walk reports failure and the
+ * caller keeps today's behaviour (an honest gate-off, counted by the
+ * plugin's unreadable-at-refresh witness).
+ */
+static bool mips_htw_walk_debug(CPUState *cs, vaddr address, hwaddr *out)
+{
+    CPUMIPSState *env = cpu_env(cs);
+    int gdw = (env->CP0_PWSize >> CP0PS_GDW) & 0x3F;
+    int udw = (env->CP0_PWSize >> CP0PS_UDW) & 0x3F;
+    int mdw = (env->CP0_PWSize >> CP0PS_MDW) & 0x3F;
+    int ptw = (env->CP0_PWSize >> CP0PS_PTW) & 0x3F;
+    int ptew = (env->CP0_PWSize >> CP0PS_PTEW) & 0x3F;
+    int pf_gdw = (env->CP0_PWField >> CP0PF_GDW) & 0x3F;
+    int pf_udw = (env->CP0_PWField >> CP0PF_UDW) & 0x3F;
+    int pf_mdw = (env->CP0_PWField >> CP0PF_MDW) & 0x3F;
+    int pf_ptw = (env->CP0_PWField >> CP0PF_PTW) & 0x3F;
+    int pf_ptew = (env->CP0_PWField >> CP0PF_PTEW) & 0x3F;
+    int hugepg = (env->CP0_PWCtl >> CP0PC_HUGEPG) & 0x1;
+    int psn = (env->CP0_PWCtl >> CP0PC_PSN) & 0x3F;
+    MemOp native_op =
+        (((env->CP0_PWSize >> CP0PS_PS) & 1) == 0) ? MO_32 : MO_64;
+    MemOp directory_mop = (hugepg && (ptew == 1)) ? native_op + 1 : native_op;
+    MemOp leaf_mop = (ptew == 1) ? native_op + 1 : native_op;
+    uint64_t base = env->CP0_PWBase;
+    const struct { int dw; int pf; } lvl[3] = {
+        { gdw, pf_gdw }, { udw, pf_udw }, { mdw, pf_mdw },
+    };
+
+    if (!(env->CP0_Config3 & (1 << CP0C3_PW)) ||
+        !(env->CP0_PWCtl & (1 << CP0PC_PWEN)) ||
+        !(gdw > 0 || udw > 0 || mdw > 0) || ptew > 1 ||
+        pf_ptw != TARGET_PAGE_BITS || base == 0) {
+        return false;
+    }
+
+    for (int l = 0; l < 3; l++) {
+        hwaddr epa;
+        int eprot;
+        unsigned esz = memop_size(directory_mop);
+        uint8_t buf[8];
+        uint64_t entry;
+
+        if (lvl[l].dw <= 0) {
+            continue;
+        }
+        uint64_t eva = base |
+            ((uint64_t)((address >> lvl[l].pf) & ((1 << lvl[l].dw) - 1))
+             << directory_mop);
+        if (get_physical_address(env, &epa, &eprot, eva, MMU_DATA_LOAD,
+                                 mips_env_mmu_index(env)) != TLBRET_MATCH) {
+            return false;
+        }
+        cpu_physical_memory_read(epa, buf, esz);
+        if (esz == 8) {
+            entry = mips_env_is_bigendian(env) ? ldq_be_p(buf) : ldq_le_p(buf);
+        } else {
+            entry = mips_env_is_bigendian(env) ? (uint32_t)ldl_be_p(buf)
+                                               : (uint32_t)ldl_le_p(buf);
+        }
+        if (hugepg && extract64(entry, psn, 1)) {
+            return false;               /* huge page: not decoded here */
+        }
+        base = entry;
+    }
+
+    {
+        hwaddr ppa;
+        int pprot;
+        unsigned psz = memop_size(leaf_mop);
+        uint8_t buf[8];
+        uint64_t pte;
+        unsigned entry_bits = psz << 3;
+        int ptei = pf_ptew;
+        uint64_t pva = base |
+            ((uint64_t)((address >> pf_ptw) & ((1 << ptw) - 1)) << leaf_mop);
+
+        if (get_physical_address(env, &ppa, &pprot, pva, MMU_DATA_LOAD,
+                                 mips_env_mmu_index(env)) != TLBRET_MATCH) {
+            return false;
+        }
+        cpu_physical_memory_read(ppa, buf, psz);
+        if (psz == 8) {
+            pte = mips_env_is_bigendian(env) ? ldq_be_p(buf) : ldq_le_p(buf);
+        } else {
+            pte = mips_env_is_bigendian(env) ? (uint32_t)ldl_be_p(buf)
+                                             : (uint32_t)ldl_le_p(buf);
+        }
+        /* Same layout conversion the walker's get_tlb_entry_layout does. */
+        if (ptei > (int)entry_bits) {
+            ptei -= 32;
+        }
+        if (ptei < 2) {
+            return false;
+        }
+        pte >>= (ptei - 2);
+        uint64_t rixi = pte & 3;
+        pte >>= 2;
+        pte |= rixi << CP0EnLo_XI;
+        if (!(pte & 2)) {
+            return false;               /* EntryLo.V clear: not present */
+        }
+        *out = (hwaddr)((pte >> 6) << 12) |
+               (address & ((1 << TARGET_PAGE_BITS) - 1));
+        return true;
+    }
+}
+
 hwaddr mips_cpu_get_phys_page_debug(CPUState *cs, vaddr addr)
 {
     CPUMIPSState *env = cpu_env(cs);
@@ -237,6 +361,9 @@ hwaddr mips_cpu_get_phys_page_debug(CPUState *cs, vaddr addr)
 
     if (get_physical_address(env, &phys_addr, &prot, addr, MMU_DATA_LOAD,
                              mips_env_mmu_index(env)) != 0) {
+        if (mips_htw_walk_debug(cs, addr, &phys_addr)) {
+            return phys_addr;
+        }
         return -1;
     }
     return phys_addr;

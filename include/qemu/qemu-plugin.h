@@ -106,9 +106,6 @@ typedef uint64_t qemu_plugin_id_t;
  *   even while the per-vCPU path-event queue is disabled)
  *
  * version 10:
- * - added qemu_plugin_vaddr_to_paddr (debug-walk the current address
- *   space's translation; physical-page identity for address spaces a
- *   narrow ASID cannot distinguish)
  * - added qemu_plugin_get_thread_ptr (the kernel-maintained per-thread
  *   pointer register; guest-thread identity independent of the vCPU a
  *   thread happens to be scheduled on)
@@ -184,26 +181,9 @@ typedef uint64_t qemu_plugin_id_t;
  *   non-empty queue at that call is a bug and QEMU says so.
  *
  * version 18:
- * - added qemu_plugin_get_process_id / qemu_plugin_get_thread_id: QEMU
- *   maintains a per-vCPU (address space, thread) identity from the
- *   architecturally-designated registers of each target and hands the
- *   plugin OPAQUE monotonic integers.  The plugin can compare them and
- *   nothing else; the raw register value, its width, its reuse
- *   behaviour and its per-target composition all stay inside QEMU.
- *
- * version 19:
- * - added qemu_plugin_get_narrow_asid: the target's exhaustible TLB tag
- *   (MIPS EntryHi.ASID), for WITNESSING an operating system's recycling of
- *   it.  Explicitly not an identity — see qemu_plugin_get_process_id().
- * - added qemu_plugin_identity_caps: which of the two identity keys the
- *   RESOLVED CPU MODEL can actually supply, answerable at install time
- *   (before the first vCPU exists) so a plugin that cannot work without
- *   a page-table root can refuse the run instead of mis-attributing it.
- * - qemu_plugin_get_process_id() on MIPS now reports CP0 PWBase, the
- *   hardware page-table walker's base register, on any model that
- *   implements it (Config3.PW).  MIPS thereby joins x86-64/AArch64/
- *   RISC-V in naming an address space by the root the architecture
- *   itself walks from, instead of by a recycled 8-bit EntryHi.ASID.
+ * - (the identity interning APIs added here and in 19 were retired with
+ *   no consumers: the ChampSim Tracer's content-as-gate model stores and
+ *   compares no process identity.)
  *
  * version 20:
  * - added qemu_plugin_spec_reserve_opens / _exhausted: how hard a
@@ -225,8 +205,7 @@ typedef uint64_t qemu_plugin_id_t;
  * version 21:
  * - added qemu_plugin_current_vcpu_index: the vCPU whose thread the
  *   calling code is running on, which is what the state APIs that take
- *   no vCPU argument (qemu_plugin_get_process_id, _get_thread_id,
- *   _get_narrow_asid, the register and memory readers) resolve through.
+ *   no vCPU argument (the register and memory readers) resolve through.
  *   QEMU_PLUGIN_VCPU_NONE outside vCPU context.
  * - INCOMPATIBLE: the @vcpu_index of qemu_plugin_vm_shutdown_cb_t now
  *   names the vCPU the shutdown CAME FROM and nothing else.  It used to
@@ -251,6 +230,19 @@ typedef uint64_t qemu_plugin_id_t;
  *   shutdown callback.  Resets converted to shutdowns by -no-reboot
  *   arrive on the shutdown callback instead, never on both.
  *
+ * version 23:
+ * - added qemu_plugin_register_nosplit_code_sequences: byte patterns
+ *   the translator must never split across a TB boundary.  When a TB
+ *   would otherwise end (page boundary, instruction budget,
+ *   single-step) with its final bytes forming a proper prefix of a
+ *   registered sequence, translation continues through the sequence
+ *   via the normal code-fetch path, so the whole sequence always
+ *   appears together in one TB.
+ * - added qemu_plugin_async_run_on_vcpu: queue a one-shot callback to
+ *   run on a specific vCPU's own thread at its next safe point, so a
+ *   plugin can sample per-vCPU state (e.g. read guest memory through
+ *   that vCPU's current address space) without cross-thread reads.
+ *
  * Where an entry above says a signature changed WITHOUT the version
  * constant moving, the version in force at the time names two
  * incompatible spellings of the same symbol and cannot be honoured
@@ -262,7 +254,7 @@ typedef uint64_t qemu_plugin_id_t;
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 22
+#define QEMU_PLUGIN_VERSION 23
 
 /*
  * The two values a signed vCPU index takes when it is not an index.
@@ -1335,6 +1327,56 @@ void qemu_plugin_register_asid_write_cb(qemu_plugin_id_t id,
                                         qemu_plugin_asid_write_cb_t cb);
 
 /**
+ * qemu_plugin_register_nosplit_code_sequences() - never-split byte patterns
+ * @seqs: @n_seqs byte patterns of @seq_len bytes each, back to back
+ *        (pattern i at @seqs + i * @seq_len); copied out before return
+ * @seq_len: bytes per pattern (all patterns share one length)
+ * @n_seqs: number of patterns (at most 2); 0 or NULL @seqs clears
+ *
+ * Registers guest-code byte sequences the translator must keep whole
+ * inside a single translation block.  When a TB would otherwise end
+ * cleanly (page boundary, instruction budget, single-step) with its
+ * final translated bytes forming a proper prefix of a registered
+ * sequence, translation continues through the sequence via the normal
+ * code-fetch path (cross-page TBs included).  Sequences are matched on
+ * raw guest-memory bytes.  Intended to be called once, at install time,
+ * before any guest code translates; a fetch fault while continuing is
+ * the fault the next fetch was about to take and is serviced by the
+ * ordinary translation restart.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_register_nosplit_code_sequences(const uint8_t *seqs,
+                                                 size_t seq_len,
+                                                 size_t n_seqs);
+
+/**
+ * typedef qemu_plugin_vcpu_async_cb_t - one-shot per-vCPU work item
+ * @vcpu_index: the vCPU whose thread the callback is running on
+ * @userdata: pointer passed at queue time
+ */
+typedef void (*qemu_plugin_vcpu_async_cb_t)(unsigned int vcpu_index,
+                                            void *userdata);
+
+/**
+ * qemu_plugin_async_run_on_vcpu() - run a callback on a vCPU's own thread
+ * @vcpu_index: target vCPU
+ * @cb: callback to run
+ * @userdata: passed through to @cb
+ *
+ * Queues @cb to run on @vcpu_index's own thread at that vCPU's next
+ * safe point (between translation blocks).  The callback may read
+ * guest state through the target vCPU's live context — registers,
+ * memory via the vCPU's current address space — which a cross-thread
+ * read cannot do.  Fire-and-forget; ordering against guest execution
+ * is only "at a TB boundary, soon".  No-op if @vcpu_index names no
+ * present vCPU.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_async_run_on_vcpu(unsigned int vcpu_index,
+                                   qemu_plugin_vcpu_async_cb_t cb,
+                                   void *userdata);
+
+/**
  * enum qemu_plugin_devio_dir - direction/kind of a block-device request
  * @QEMU_PLUGIN_DEVIO_READ: data read from the device into guest memory
  * @QEMU_PLUGIN_DEVIO_WRITE: data written from guest memory to the device
@@ -1612,8 +1654,7 @@ int qemu_plugin_num_vcpus(void);
  * QEMU_PLUGIN_VCPU_NONE outside vCPU context.
  *
  * This is the vCPU the state APIs that take no vCPU argument read from —
- * qemu_plugin_get_process_id(), qemu_plugin_get_thread_id(),
- * qemu_plugin_get_narrow_asid(), the register readers and the memory
+ * the register readers and the memory
  * readers all resolve through it, and they assert rather than answer when
  * it is QEMU_PLUGIN_VCPU_NONE.  Most callbacks are handed the vCPU they
  * concern and have no need of this; the ones that need it are the events
@@ -2510,29 +2551,6 @@ QEMU_PLUGIN_API
 bool qemu_plugin_paging_enabled(void);
 
 /**
- * qemu_plugin_vaddr_to_paddr() - translate a guest-virtual address
- * @vaddr: guest-virtual address in the vCPU's CURRENT address space
- * @paddr: filled with the guest-physical translation on success
- *
- * Debug-walks the current address space's translation (page tables, or
- * the live software TLB on TLB-refill architectures such as MIPS)
- * without perturbing it.  Returns false when no translation exists
- * right now — on a TLB-refill architecture that includes mappings the
- * guest TLB has evicted, so a false is "unknown", not "unmapped".
- *
- * Physical addresses are the one architectural identity virtual
- * aliases cannot forge: two processes mapping the same virtual page to
- * different content necessarily map different physical pages, while a
- * narrow, recycled ASID (MIPS EntryHi.ASID) can silently alias them.
- * A plugin pinned to one process can therefore verify address-space
- * identity by physical page when the ASID value alone is ambiguous.
- * In ``*-linux-user`` (one address space, no guest MMU) the identity map
- * is returned.  Must be called from a vCPU context.
- */
-QEMU_PLUGIN_API
-bool qemu_plugin_vaddr_to_paddr(uint64_t vaddr, uint64_t *paddr);
-
-/**
  * qemu_plugin_vaddr_is_kernel() - classify a code VA's privilege domain
  * @vaddr: a guest-virtual code (instruction-fetch) address
  *
@@ -2579,89 +2597,6 @@ QEMU_PLUGIN_API
 uint64_t qemu_plugin_get_thread_ptr(void);
 
 /**
- * qemu_plugin_get_process_id() - opaque id of the vCPU's current address space
- *
- * Returns a monotonically-assigned integer naming the address space this
- * vCPU is translating through right now.  Two samples carry the same id
- * exactly when the architecture names the same address space: x86-64 CR3
- * (with PCID when CR4.PCIDE), AArch64 TTBR0_EL1 with the ASID TCR_EL1.A1
- * selects, RISC-V SATP (VSATP under virtualization), MIPS CP0 PWBase (the
- * hardware page-table walker's base register, normalised to a physical
- * address when it names one through kseg0/kseg1) on a model with
- * Config3.PW, and EntryHi.ASID with MemoryMapID on one without.  QEMU
- * composes and compares those registers; the plugin never sees them, so it
- * cannot come to depend on a target's register width, layout or reuse
- * behaviour.
- *
- * The id is a NAME, not a lifetime: a page-table root freed and handed to
- * a successor process reports the same id for both, because the
- * architecture itself says they are the same address space now.  Narrower
- * names are worse: a MIPS model without Config3.PW is named only by an
- * 8-bit EntryHi.ASID that an operating system re-points at a different
- * LIVE process on rollover.  A consumer that must not confuse two live
- * processes should ask qemu_plugin_identity_caps() whether the resolved
- * model names an address space by its root, and refuse the run when it
- * does not.
- *
- * Returns 0 when the target maintains no address-space register the
- * plugin interface can name — user-mode emulation, where a QEMU process
- * IS one address space, and a model that implements a root register the
- * guest has never programmed.  Must be called from a vCPU context.
- */
-QEMU_PLUGIN_API
-uint64_t qemu_plugin_get_process_id(void);
-
-/**
- * qemu_plugin_get_thread_id() - opaque id of the vCPU's current thread
- *
- * Returns a monotonically-assigned integer naming the software thread the
- * architecture's per-thread pointer register currently identifies:
- * x86-64 FS.base (GS.base for a non-long-mode task), AArch64 TPIDR_EL0,
- * RISC-V tp, MIPS CP0 UserLocal.  As with qemu_plugin_get_process_id()
- * the raw value never leaves QEMU and only equality is meaningful.
- *
- * Returns 0 for "the architecture names no thread here": a CPU model that
- * implements no thread-pointer register (a MIPS model with Config3.ULRI
- * clear), a task that has never been given one, or user-mode emulation.
- * 0 is NOT an identity — two zeros are not the same thread, they are two
- * absences — and a consumer must treat it as unknown, never as a match.
- *
- * Sample it where the register is coherent: registers that live in TCG
- * globals are only guaranteed spilled to the CPU state in a callback
- * registered with QEMU_PLUGIN_CB_R_REGS or QEMU_PLUGIN_CB_RW_REGS.
- * Must be called from a vCPU context.
- */
-QEMU_PLUGIN_API
-uint64_t qemu_plugin_get_thread_id(void);
-
-/**
- * qemu_plugin_get_narrow_asid() - the target's exhaustible address-space tag
- *
- * Returns the RAW, narrow, operating-system-recycled tag the target's TLB
- * carries, where the target has one distinct from the page-table root:
- * MIPS EntryHi.ASID (with MemoryMapID where Config5.MI makes it the tag).
- * Returns 0 on x86-64, AArch64 and RISC-V, whose TLB tag is a field of the
- * root register itself and therefore not a second value, and in user mode.
- *
- * THIS IS NOT AN IDENTITY.  Two samples carrying the same value are not the
- * same address space: an operating system re-points these tags at different
- * LIVE address spaces as the space is exhausted, which is exactly why
- * qemu_plugin_get_process_id() reports the root instead.  Using this value
- * to decide ownership, attribution, or anything else about whose
- * instructions are executing reintroduces that hazard in full.
- *
- * It exists to WITNESS the recycling — to count how much of the tag space a
- * guest burned during a run — with a value that is independent of the
- * identity it corroborates.  A test that claims to have driven a guest
- * through an ASID rollover can prove it here, and a test that cannot show
- * the space was swept knows its result is vacuous.
- *
- * Must be called from a vCPU context.
- */
-QEMU_PLUGIN_API
-uint64_t qemu_plugin_get_narrow_asid(void);
-
-/**
  * qemu_plugin_thread_ptr_tracks_current() - is the thread pointer valid
  *                                           above user privilege?
  *
@@ -2687,56 +2622,6 @@ uint64_t qemu_plugin_get_narrow_asid(void);
  */
 QEMU_PLUGIN_API
 bool qemu_plugin_thread_ptr_tracks_current(void);
-
-/**
- * enum qemu_plugin_identity_cap - what the resolved CPU model can name
- * @QEMU_PLUGIN_IDENT_SPACE_IS_ROOT: qemu_plugin_get_process_id() is derived
- *   from the PAGE-TABLE ROOT the hardware itself translates from, so two
- *   live address spaces can never share an id.  Clear means the model names
- *   an address space only by a narrow, operating-system-recycled tag (a MIPS
- *   model without Config3.PW: an 8-bit EntryHi.ASID over a 16-entry TLB,
- *   which Linux re-points at a different live process on rollover).
- * @QEMU_PLUGIN_IDENT_NAMES_THREAD: the model implements the architecture's
- *   per-thread pointer register, so qemu_plugin_get_thread_id() can be
- *   non-zero (MIPS Config3.ULRI; unconditional elsewhere).
- * @QEMU_PLUGIN_IDENT_MODEL_KNOWN: a CPU model was resolved at all.  Clear
- *   means the machine has no cpu_type (-M none) or its type would not
- *   resolve to a class, which is a different situation from a model that
- *   resolved and names nothing — and needs a different diagnosis, so the
- *   two are not both reported as a bare zero.
- */
-enum qemu_plugin_identity_cap {
-    QEMU_PLUGIN_IDENT_SPACE_IS_ROOT = 1u << 0,
-    QEMU_PLUGIN_IDENT_NAMES_THREAD  = 1u << 1,
-    QEMU_PLUGIN_IDENT_MODEL_KNOWN   = 1u << 2,
-};
-
-/**
- * qemu_plugin_identity_caps() - what the resolved CPU model can name
- *
- * Returns a mask of enum qemu_plugin_identity_cap describing the identity
- * keys the machine's CPU MODEL — whether given with -cpu or defaulted by
- * the board — is able to supply.  Unlike every other identity call this one
- * needs no vCPU: it resolves the machine's cpu_type to its class and asks
- * the class, so it is answerable from qemu_plugin_install(), before
- * machine_run_board_init() has created a single CPUState.  That is the
- * point of it — a plugin whose output is invalid without a page-table root
- * can refuse to install, which exits QEMU before any guest instruction
- * runs, rather than discovering the problem mid-capture and shipping a
- * mis-attributed or truncated trace.
- *
- * The mask describes the MODEL, not the guest: a model with
- * %QEMU_PLUGIN_IDENT_SPACE_IS_ROOT still reports process id 0 while the
- * guest has not programmed the register (a MIPS kernel booted with
- * "nohtw", or built without CONFIG_MIPS_HTW).  Both conditions have to be
- * checked, and 0 must never be treated as an identity.
- *
- * Returns 0 in user-mode emulation (one address space per QEMU process, so
- * there is nothing to name), for a machine with no CPU type (-M none), and
- * for any target that does not implement the query.  Callable at any time.
- */
-QEMU_PLUGIN_API
-uint64_t qemu_plugin_identity_caps(void);
 
 /**
  * qemu_plugin_set_current_task_offset() - declare where the guest kernel

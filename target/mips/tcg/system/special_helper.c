@@ -129,15 +129,6 @@ static inline void exception_return(CPUMIPSState *env)
     }
 #endif
 
-    /*
-     * [cstwit]: the (asid, pwbase) binding of the mm about to run.  Placed
-     * after compute_hflags so MIPS_HFLAG_UM already reflects the mode being
-     * returned to, and skipped on the wrong path -- a speculative eret must
-     * not manufacture an address-space observation.
-     */
-    if (!env_cpu(env)->plugin_spec_mode) {
-        cst_wit_bind(env);
-    }
 }
 
 void helper_eret(CPUMIPSState *env)

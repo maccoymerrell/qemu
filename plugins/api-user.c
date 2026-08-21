@@ -15,18 +15,6 @@
 #include "exec/log.h"
 
 /*
- * Nothing to name: qemu-user emulates one program in one address space, so
- * there is no address-space register and no page-table root to report.  An
- * empty mask, not a claim of capability — a plugin that needs a root should
- * be checking info->system_emulation first, and gets the honest answer if
- * it does not.
- */
-uint64_t qemu_plugin_identity_caps(void)
-{
-    return 0;
-}
-
-/*
  * Virtual Memory queries - these are all NOPs for user-mode which
  * only ever has visibility of virtual addresses.
  */
@@ -50,13 +38,6 @@ uint64_t qemu_plugin_hwaddr_phys_addr(const struct qemu_plugin_hwaddr *haddr)
 const char *qemu_plugin_hwaddr_device_name(const struct qemu_plugin_hwaddr *h)
 {
     return g_intern_static_string("Invalid");
-}
-
-bool qemu_plugin_vaddr_to_paddr(uint64_t vaddr, uint64_t *paddr)
-{
-    /* One address space, no guest MMU: the identity map. */
-    *paddr = vaddr;
-    return true;
 }
 
 /*

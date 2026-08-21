@@ -6693,6 +6693,11 @@ static void finish_trace_segment(bool prev_executed = true,
          * dispatches lands in the next owned TB's bill.  The per-bill split
          * is in the stats report (user_clock_bill_*).
          *
+         * Both terms are USER-privilege only, so this row is blind by
+         * construction to a kernel block a close failed to publish — see
+         * the binding scope note on the WINDOW-CLOCK vs WIRE block in
+         * champsim_tracer_stats.h before quoting a zero here as coverage.
+         *
          * The segment's user self-loop fan-out surplus is folded into the
          * comparison on the clock side: the fan-out writes one entry per
          * iteration where every clock counts the instruction once, and the

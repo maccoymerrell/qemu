@@ -317,6 +317,23 @@ struct Stats {
      * These count both sides at their source so the residual is measured
      * rather than inferred, and so the second effect is caught where it
      * happens instead of at the end.
+     *
+     * SCOPE OF clock_minus_wire (binding, so its zero cannot be
+     * over-quoted).  It is a USER-INSTRUCTION identity and nothing wider.
+     * Both terms are defined over user-privilege blocks of an owned
+     * address space: the window clock bills only those (a kernel excursion
+     * is traced but never counted), and wire_user_arch_insns sums only
+     * non-system templates.  A KERNEL block that a close failed to publish
+     * therefore moves NEITHER term, and the row still reads 0.  Read it as
+     * "the user instructions the window clock billed are the user
+     * instructions on the wire" — never as "the segment published
+     * everything it executed".
+     *
+     * Kernel completeness is a different invariant and is carried
+     * elsewhere: the block-FID epoch's billed==published at every close
+     * route, which holds over every emitted block regardless of privilege.
+     * A check that wants the wider claim must assert THAT; this row cannot
+     * witness it and a gate reading 0 here has not tested it.
      */
     /* User (non-system) architectural instructions actually EMITTED to the
      * body stream this segment — the plugin-side twin of OWNED_CP, with no

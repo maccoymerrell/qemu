@@ -365,11 +365,11 @@ that vCPU — correct while a process stays put, wrong for work left on a
 vCPU it has migrated off.  Pinning keeps a RISC-V trace inside that
 envelope: :program:`cst_attach` confines the target to one guest CPU by
 default (``--pin-cpu N`` / ``--no-pin``), and ``taskset`` / ``isolcpus``
-do the same for a compiled-in marker.  When a segment observes the pinned
+do the same for a compiled-in marker.  When a segment observes the traced
 process running **user** code on more than one vCPU — the architectural
-migration signal — the plugin emits **one** stderr warning per segment and
-sets the ``pin_multivcpu_observed`` stat, making the exposure loud rather
-than silent.  The per-vCPU kernel-nesting discipline the validator's
+migration signal — the plugin emits **one** stderr warning per segment,
+making the exposure loud rather than silent.  The per-vCPU kernel-nesting
+discipline the validator's
 ``syscall_fault_nesting`` check asserts is relaxed at the migration seam
 for the same reason (a documented boundary, verified by the
 forced-migration test, not a papered-over defect).
@@ -690,50 +690,38 @@ Correct-path flow
 -----------------
 
 ``vcpu_tb_exec`` fires once per executed TB.  It is registered as a
-conditional callback on the scoreboard's ``trace_this_ctx`` slot,
-which folds ``is_active`` together with pinned-context ownership: the
-JIT skips the dispatch entirely between segments *and* for any TB the
-trace does not own.  Its ``udata`` is the head fragment of the TB's
+conditional callback on the scoreboard's ``trace_this_ctx`` slot — a
+bare ``is_active`` mirror — so the JIT skips the dispatch entirely
+between segments; foreign-ness within a segment is the content-gate
+bit, tested inside the step.  Its ``udata`` is the head fragment of the TB's
 per-translation fragment list.  The callback has two layers: a short
 shared prologue, then the PathBuilder step.
 
-``trace_this_ctx`` is a bare ``is_active`` mirror.  Every supported
-target names an address space by a **page-table root** — x86 ``CR3``,
-AArch64 ``TTBR0``, RISC-V ``SATP``, MIPS ``CP0 PWBase`` — which is a
-reliable per-process id, so a block executing in an address space the
-trace does not own is dropped inside the step and no context has to be
-gated out of dispatch at all.  The gate exists to skip the dispatch
-*between* segments, which is where the saving is: user mode, an
-unpinned system trace and a marker pin all read the same mirror.
+``trace_this_ctx`` stays a bare ``is_active`` mirror: the heavy step
+must keep dispatching for non-gated contexts too, because the
+any-context termination bounds (the stall ceiling, the idle-backstop
+beat) ride it — a guest whose traced process is dead executes nothing
+*but* foreign TBs.  Foreign-ness itself is the per-vCPU **content-gate
+bit**, computed event-driven and tested as one relaxed load inside the
+step.
 
-Ownership itself is one set lookup.  ``qemu_plugin_get_process_id()``
-returns an opaque monotonic id QEMU mints per distinct architectural
-address-space value (see :doc:`qemu_modifications`), ``g_owned`` holds
-the ids of the address spaces whose windows are open, and a block is
-ours exactly when its live id is in that set — so **every thread inside
-an owned address space is traced**, and the thread id only labels
-strands on the wire.  **There is no re-bind rule.**  The id is interned
-from the page-table root, which an operating system cannot re-point at a
-second live address space, so a window is never transferred to a name it
-did not open under: no verdict is deferred, nothing is quarantined, no
-block of the traced process is ever held back waiting for a witness, and
-an END marker can never be swallowed by a suspended span.  The rule that
-once followed a thread across address-space names was measured unsound —
-``fork()`` copies the thread pointer verbatim, so a forked child presented
-as a thread of an owned space under an unowned name and the pin walked
-onto it — and root-keyed ownership then made it unnecessary.  That is the
-whole rule.
+The gate is one cached bit per vCPU.  At each committed address-space
+change the tracer re-reads the marker sequence's bytes at each latched
+window vaddr through the live context; a context that maps them is
+traced, and every thread inside it is traced — borrowed-mm kernel
+threads included.  No page-table root, ASID or process id is ever
+stored or compared as an identity; the thread id only labels strands
+on the wire.  There is no re-bind rule because there is nothing to
+re-bind: recycling, migration and narrow-ASID identity are
+non-concepts under content gating.
 
-The wire's address-space naming is deliberately a separate thing from
-the ownership key: each owned window records ``{root_phys, sig}`` from
-its marker's own code page (``marker_anchor``) and the compact wire asid
-index is derived from that, so an ``EntryHi.ASID`` rollover cannot churn
-the index of a process that never moved.  Both slots are maintained
-event-driven (``refresh_ctx_gates``): at every ``is_active`` edge, at
-each committed address-space write, and on a re-acquiring probe — never
-on the per-TB path.  This is what keeps a churning guest from paying the
-guest-clock freeze on millions of dropped foreign TBs (the throttle that
-otherwise collapses the guest virtual clock to a fraction of realtime).
+The wire's address-space naming is a LABEL: the compact asid index is
+allocated from the live architectural value observed at each gate
+refresh that evaluates on (never on the emit path, which reads the
+per-vCPU carry).  Both the gate bit and the label carry are maintained
+event-driven (``refresh_ctx_gates`` / ``marker_gate_refresh``): at
+every ``is_active`` edge, at each committed address-space write, at
+window opens/releases and at vCPU init — never on the per-TB path.
 
 **Shared prologue** (before any lock):
 
@@ -1630,77 +1618,38 @@ already holds is work no compiler emits, so the sequence cannot
 occur in real code by accident; and it needs no ELF symbols, no
 host icount, and no guest-kernel modification.
 
-That a run of bytes is a marker is a property of the **bytes**, so
-it is decided in the bytes, at translation time, and fires from
-**one** instruction.  For every instruction it translates,
-``vcpu_tb_trans`` asks whether that instruction is, byte for byte,
-the *terminating* instruction of a marker sequence.  When it is, the
-translator compares the ``CST_MARKER_SEQ_LEN``\ -1 instruction slots
-immediately before it — a fixed run of fixed-width slots at known
-offsets — against the rest of that sequence, reading them from the
-TB's own translated instruction stream when the TB reaches back that
-far and from guest memory otherwise.  A whole-sequence match arms
-exactly one execution callback, on that one instruction, and that
-callback firing *is* the marker.
+That a run of bytes is a marker is a property of the **bytes**, so it
+is decided in the bytes, at translation time: one ``memcmp`` over the
+TB's delivered instruction stream against the START/END patterns, under
+a single gate — not spec-mode.  Base QEMU's translator never ends a TB
+inside a magic-sequence prefix (the never-split guarantee, see
+:doc:`qemu_modifications`), so the three instructions always arrive
+together in one TB and there is no unresolved-prefix case, no execution
+callback, and no wrong-path fence beyond the one gate.  Two deliberate
+semantics follow: detection fires at TRANSLATION (reach, not
+execution), and a jump landing mid-sequence executes fewer than the
+full run of magic instructions and is NOT a marker.
 
-The mechanism is chosen for what it makes impossible.  Nothing that
-happens *between* a marker's instructions can change their bytes, so
-nothing that happens between them can lose the marker: a fault, an
-interrupt or a single-step trap taken mid-sequence changes nothing;
-a task migrating to another vCPU mid-sequence changes nothing, since
-the callback is on one instruction and fires on whichever vCPU runs
-it; a page straddle or any TB slicing changes nothing, since the
-match is over guest memory rather than over a TB; and ``-icount``,
-one-instruction-per-TB translation and a single-stepping
-``cst_attach`` injector change nothing, for the same reason.  START
-and END are compared as *whole* sequences, immediates included, so
-the word the two magics share on every fixed-width target — where
-the sequences differ only in a low byte — cannot make one look like
-the other.
+START latches the marker sequence's **virtual address**.  The window
+*is* that vaddr; every address space that maps its bytes is traced —
+concurrent instances, same-binary successors and fork children
+included — and compiling the marker out is how a process opts out.
+Identical ``(vaddr, bytes)`` is the same window by construction, so a
+second instance at the same layout shares the first's window.  The
+marker-sequence page must stay resident (``mlock(2)`` it before START):
+an unreadable window vaddr at a gate refresh gates off, honestly and —
+when the refreshing context is the one that was gated, i.e. the prior
+per-vCPU gate bit is set and the live root still equals the carried
+last-gated label — counted (``gated context lost marker page
+residency``, a must-be-0 witness).  A foreign context that does not map
+the window vaddr also reads as unreadable but is the content gate
+working as designed; it is counted only as ``gate refresh evaluated
+NOT traced``.
 
-The one case the translation-time look cannot settle is a sequence
-whose preceding slots are not resident when the terminating
-instruction is translated.  The callback is armed anyway, flagged to
-re-read guest memory when the instruction executes, where those
-slots are necessarily present: the same CPU fetched and retired them
-one or two instructions earlier, and nothing has run since that
-could have unmapped them.  A read that fails even then does not
-claim the marker, and the attempt is published as ``marker prefix
-unreadable`` rather than guessed at in either direction.
+A latched window defines both the trace filter and the window clock:
 
-Marker detection is a correct-path fact, and the wrong path is
-fenced out of it at the callback level by two independent gates:
-the QEMU-side per-vCPU spec-mode flag
-(``qemu_plugin_in_spec_mode()`` — the ground truth for the
-*executing* vCPU, visible to a speculative invocation regardless of
-which thread's TLS the callback reads) and the per-thread
-``g_wp_state.in_progress`` session flag.  Speculation routinely runs
-the marker bytes — the wrong path of a spin-wait branch falls
-straight into the END sequence on every excursion — so an invocation
-that leaked past the fence would open or close a window from
-wrong-path execution.  The callbacks stay
-*registered* on every translation, spec-born ones included: the
-fence is in the callback, not the registration, because suppressing
-registration on wrong-path translations changes their
-instrumentation shape and was observed (A/B on the SMP thread_test)
-to livelock the guest at segment open through a QEMU-base
-interaction.  ``CST_MARKER_DIAG=1`` prints every correct-path
-marker-callback invocation (plus WP-gated and step-bail counters)
-for triage.
-
-The marker must execute *inside the target's own address space* —
-it is compiled into the workload (or injected at its entry point),
-never run by a launcher that then ``execve``\ s, because ``execve``
-replaces the address space and would leave the pin on the
-launcher's.  When it fires, the plugin captures the executing
-vCPU's address-space ID (``qemu_plugin_get_addr_space_id()`` — CR3
-on x86, SATP on RISC-V, TTBR0 on Arm, the MIPS ASID), stores it as
-the **pin**, and opens a segment of ``simulation`` instructions.
-
-The pin defines both the trace filter and the window clock:
-
-* **Privilege 0 at the pinned ASID** is the ground truth for "the
-  workload's own instruction".  Those instructions are traced *and
+* **User privilege in a gated address space** is the ground truth for
+  "the workload's own instruction".  Those instructions are traced *and
   counted*: the window budget, the progress heartbeat, and the
   finish report all run on this user-instruction clock, so a
   marker-mode window covers the same user-space instructions a
@@ -1722,47 +1671,38 @@ The pin defines both the trace filter and the window clock:
   instrument — ``user_clock_billed_insns`` minus
   ``user_clock_retired_insns`` is the phantom bill, visible instead of
   silently gone.
-* **Kernel execution at the pinned ASID** (syscalls, fault
-  handlers) is traced but *not counted*.  Its templates carry
+* **Kernel execution in a gated address space** (syscalls, fault
+  handlers — and, per the kernel-keep ruling, borrowed-mm kernel
+  threads and post-switch tails running on the gated page tables) is
+  traced but *not counted*.  Its templates carry
   ``is_system``, stamped from the live correct-path privilege at
   execution time — authoritative over any wrong-path seed, because
   speculation can cross the privilege boundary and translate code
   in the wrong context — and serialized on every instruction
   descriptor as the ``SYSTEM`` flag bit.
-* **Foreign address spaces** are neither traced nor counted: the
-  PathBuilder's foreign-ASID boundary excludes their TBs.  The pinned
-  process's own deferred prev is not lost with the span — it is
-  emitted at the boundary, at its measured extent, with its
-  terminating branch honestly unresolved (see
+* **An address space that does not map the latched bytes** is neither
+  traced nor counted.  The traced flow's own deferred prev is not lost
+  with the span — it is emitted at the boundary, at its measured
+  extent, with its terminating branch honestly unresolved (see
   :ref:`emit-at-departure <emit-at-departure>`); async excursions take
   the mute suspend instead — see :ref:`async-exclusion`.
 
-Two per-target refinements keep the pin honest about what the
-address-space register can actually attest.  On RISC-V the highest
-privilege level does not translate through the pinned register at
-all — M-mode fetches bypass ``satp`` — so firmware handling a
-synchronous SBI call executes while the register still holds the
-pinned process's value.  Those TBs are firmware a level above the
-OS kernel, not the process's kernel work, and the attribution path
-drops them regardless of the ASID match (the ``kexc M-mode TBs
-dropped`` stat).  On MIPS the pin is a bare ``EntryHi.ASID`` value
-from an architecturally 8-bit space the OS recycles by generations,
-so a rollover can silently re-assign the pinned value to a
-different process; the synchronous ASID-write hook watches for the
-pinned value returning after enough *distinct* other values to
-imply the space wrapped, and answers with one stderr warning plus
-the ``pin ASID reuse suspected`` stat — detection only, the pin
-itself stays.
+A translation-bypassing privilege level (RISC-V M-mode firmware, which
+``satp`` does not govern) commits no address-space write, so the gate
+bit simply stands and firmware reached from a gated context is traced
+with it (v4 default, maintainer-vetoable).
 
 A workload shorter than its budget emits the **end marker** (the
 same sequence shape, built on ``CST_MARKER_END_MAGIC``) just before
 it exits.  Executed in the pinned address space, it closes the
 window there — the "budget *or* program end" stop — at the end of
 the true BB the marker fired inside, so that block reaches the wire
-whole (:ref:`end-defers-ruling`).  Closing
-at the marker rather than at process teardown matters because a
-freed ASID can be reused by another process and silently re-match
-the pin; the finish line reports ``END`` rather than an underrun.
+whole (:ref:`end-defers-ruling`).  An END releases every latched
+vaddr the ending context maps (that set *is* "this process" under
+content gating; two same-vaddr instances share one window, so the
+first END un-gates both); the last window's release closes the
+segment, and the finish line reports ``END`` rather than an
+underrun.
 
 Segment opens in marker mode follow the same per-thread boundary as
 every other mode: ``reset_segment_local_state`` runs once on the
@@ -1790,6 +1730,16 @@ startup under ``*-softmmu`` (see :doc:`quickstart`).  They remain
 user-mode windows, where qemu-user emulates one program and the
 question does not arise — and there the pin holds ``UNPINNED``, so
 the whole machinery costs one relaxed atomic load per TB.
+
+A SimPoint schedule is not an exception to that: it is a *second*
+input, composed onto the marker window as
+``marker:...+simpoints=<file>+interval=<n>``.  The marker latches the
+address space and zeroes the process's user-instruction clock; the
+offsets then position the capture on that clock, which is what makes
+offsets derived from a user-mode BBV run valid here (kernel work is
+traced and attributed by the excursion ownership rules, but never
+advances the clock).  The anchor and the schedule stay separable —
+neither turns the other on.
 
 .. _fault-excursions:
 
@@ -1915,6 +1865,31 @@ entry is preferred by event identity; an entry whose return was
 never observed (a non-LIFO guest return — a context switch inside a
 blocking fault resuming the outer task first) completes on the same
 keys at its suffix's seal.
+
+**Return by diversion (exception-table fixup).**  A handler may end
+an excursion without re-executing the faulting instruction: the
+kernel's exception-table fixup *advances* the resume point past it
+(Linux/MIPS ``handle_sys`` substitutes zero for an unreadable stack
+argument and returns to the next load; ``copy_user`` error paths on
+every ISA share the shape).  The exception return then targets the
+fixup, not the pushed resume PC, so the pop's exact match rightly
+refuses it and no ``FAULT_RETURN`` exists.  The dispatch that
+re-enters the ledger entry's own template at an interior PC other
+than the resume PC — arriving from *outside* the template, which is
+what distinguishes it from a resumed suffix flowing across a TB
+boundary — is the witness that the excursion is over: the entry is
+retired on the spot (``census frames diverted``), its merge dead by
+construction, because the resume PC was skipped and a later dispatch
+there belongs to a different invocation.  The skipped instructions
+never retired and never reach the wire; an already-published prefix
+stays behind as an abandoned open invocation, which §4.2a licenses
+exactly when the excursion is on the wire to explain the cut; and
+the re-entered code runs as a fresh chain of its own template.
+Leaving such an entry in flight instead would count a dead excursion
+into every later stamp of the thread — the block's own resumed
+pieces and the next fixup fault's handler would emit at the *same*
+depth — and would let the next fault's advanced resume PC read as
+mid-excursion retirement of instructions the fixup skipped.
 
 .. _emit-at-departure:
 

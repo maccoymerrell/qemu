@@ -213,12 +213,14 @@ tracer targets one chosen process inside it, and the kernel becomes part
 of the picture:
 
 * **The window is guest-driven and marker-scoped.**  A process runs a
-  magic marker instruction sequence at its entry; the plugin opens the
-  trace window there and admits that process's address space to an
-  owned-ASID set.  Under the default ``policy=latch`` every process
-  that runs the START marker joins the set and is traced concurrently
-  until its own END marker; ``policy=trace-all`` instead widens the
-  first START to capture every context.  Each captured entry carries a
+  magic marker instruction sequence at its entry; the plugin latches
+  that sequence's virtual address as a window.  From then on, at every
+  committed address-space change, it reads the sequence bytes at each
+  latched vaddr through the live context — mapping them is the whole
+  test for being traced.  Under the default ``policy=latch`` every
+  process that runs the START marker latches a window and is traced
+  concurrently until its own END marker; ``policy=trace-all`` instead
+  widens the first START to capture every context.  Each captured entry carries a
   ``(thread_id, asid)`` context — rebased by ``BODY_TAG_ASID_SWITCH``
   records — so a consumer can separate interleaved processes in the one
   body stream.  The window budget counts the *user-space* instructions

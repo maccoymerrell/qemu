@@ -195,6 +195,15 @@ plugin sees its argv.
    symbol occurrence — see ``symbol`` mode below) and is rejected
    under the other two modes.
 
+   This mode is a **user-mode** window.  A simpoint schedule states
+   *which* intervals to capture and nothing about *whose* — so on its
+   own it cannot open a system-mode window, and ``*-softmmu`` refuses
+   it at install exactly as it refuses ``icount`` and ``symbol``.  To
+   capture SimPoint intervals inside a full-system guest, compose the
+   schedule onto a marker window (:ref:`composing SimPoints onto the
+   marker window <marker-simpoints>`, below): the marker supplies the
+   anchor, the schedule supplies the offsets.
+
    **Simpoints file format.**  ``file`` is consumed verbatim in the
    `SimPoint <https://cseweb.ucsd.edu/~calder/simpoint/>`_ tool's own
    output format, so the file ``SimPoint`` writes with
@@ -237,6 +246,8 @@ plugin sees its argv.
    ``qemu_plugin_insn_symbol`` on the TB's first instruction; the
    symbol name must match exactly (no demangling, no fnmatch).
 
+.. _marker-window:
+
 ``trace_window=marker:simulation=<insns>+policy=latch|trace-all``
    Guest-driven window for **system-mode** tracing
    (``qemu-system-<isa>``).  The workload carries a magic marker
@@ -253,6 +264,41 @@ plugin sees its argv.
    marker contract, the address-space pin, and what a system-mode
    trace contains.
 
+   A marker window is the **only** window a system-mode capture has.
+   ``icount``, ``symbol`` and ``simpoint`` position a clock, and a
+   position on a clock cannot say whose instructions it is counting;
+   under ``*-softmmu`` all three — and the default no-``trace_window``
+   run — are refused at plugin install, before the machine is built.
+   The refusal names the composition below.
+
+   .. _marker-simpoints:
+
+   **Composing SimPoints onto the marker window.**  A marker anchor and
+   a SimPoint schedule are two separate inputs, and neither implies the
+   other.  Written together they read::
+
+      trace_window=marker:simulation=<insns>+simpoints=<path>+interval=<insns>+warmup=<insns>
+
+   ``simpoints``, ``interval`` and ``warmup`` mean exactly what they
+   mean under ``simpoint`` mode (same file format, same interval
+   granularity, same pre-position warm-up); what the marker changes is
+   the *clock they position on*.  The START marker latches the traced
+   process's address space and zeroes that process's user-instruction
+   clock, and the offsets then position the capture on that clock —
+   which is what makes offsets computed from a user-mode BBV run of the
+   same binary valid inside a full-system guest, since kernel work is
+   traced but never advances the clock.  One scheduled cluster per
+   window; the run ends like any marker run, at the workload's END
+   marker.
+
+   Three half-compositions are refused at install rather than being
+   quietly reinterpreted: ``policy=trace-all`` with a schedule (there is
+   no single latched clock to position on), ``interval=``/``warmup=``
+   with no ``simpoints=`` (schedule keys with no schedule position
+   nothing), and a composed window under ``qemu-user`` (there is nothing
+   for an anchor to disambiguate when the emulator runs one program —
+   use ``simpoint`` mode there).
+
    ``policy`` governs what happens once more than one process is
    running the marker sequence concurrently:
 
@@ -268,6 +314,23 @@ plugin sees its argv.
      met.  Only the capture gate widens: the icount clock and
      end-of-window detection still ride that first marker process's
      user instructions, so the owned set stays the single clock pin.
+
+   .. important::
+
+      **The marker page must stay resident.**  In system mode the
+      tracer decides *which* contexts are traced by content: at every
+      committed address-space switch it re-reads the *start*-marker
+      bytes at the latched virtual address through the live address
+      space.  A page that is swapped out (or unmapped) at that moment
+      reads as "not traced" — the run gates off, honestly and visibly
+      (the ``gated context lost marker page residency`` counter is the
+      witness and must stay 0: it fires exactly when a context that
+      *was* the marked process — same live root as its last gated
+      refresh — no longer reads its marker bytes; a foreign address
+      space that never mapped them is counted only as
+      ``gate refresh evaluated NOT traced``).  A marked workload should ``mlock(2)``
+      the page holding its start-marker sequence before executing it;
+      the ops fallback is ``swapoff`` in the guest.
 
    To trace an **unmodified binary** (no compiled-in marker), run it
    inside the guest under :program:`cst_attach`, which injects the
@@ -314,9 +377,8 @@ plugin sees its argv.
    vCPU, ``cst_attach`` confines the target to a single guest CPU by
    default (``--pin-cpu N`` selects the CPU, ``--no-pin`` disables the
    confinement).  A compiled-in marker gets the same guarantee from
-   ``taskset``/``isolcpus``.  If a pinned process migrates across vCPUs
-   anyway, the plugin emits one ``pin_multivcpu_observed`` warning per
-   segment — pin it to a core for clean per-thread attribution.
+   ``taskset``/``isolcpus`` — pin it to a core for clean per-thread
+   attribution.
 
    .. important::
 
@@ -379,7 +441,7 @@ plugin sees its argv.
    closed on this denominator says so: the ``dead-latch close`` line
    reports ``idle=<N> insns`` with the threshold that fired, the segment
    close line ends in ``IDLE`` rather than ``END``, and the statistics
-   report carries ``dead-latch windows closed (idle insns)``.
+   report carries ``dead-latch closes (idle insns)``.
 
    It is **not** a duplicate of ``stall_ceiling`` (:doc:`reference`),
    which covers the opposite shape: there the pinned process is alive and
@@ -497,6 +559,7 @@ Examples::
    trace_window=marker:simulation=20000000
    trace_window=marker:policy=latch+simulation=20000000 latch_timeout=2000
    trace_window=marker:policy=trace-all+simulation=20000000
+   trace_window=marker:simulation=20000000+simpoints=mcf.sp+interval=100000000+warmup=2000000
 
 Without ``trace_window=`` the segment opens at process start and runs
 until the guest exits — equivalent to ``trace_window=icount:start=0``
@@ -822,8 +885,7 @@ clean only while the traced process remains on one vCPU.  A
 compiled-in marker gets this from ``taskset`` / ``isolcpus`` on the
 guest workload; :program:`cst_attach` confines an unmodified binary to
 one guest CPU by default (``--pin-cpu N`` selects the CPU, ``--no-pin``
-disables the confinement).  A process that migrates across vCPUs
-anyway draws one ``pin_multivcpu_observed`` warning per segment.
+disables the confinement).
 
 **Boot with kernel page-table isolation off.**  Add ``nopti``
 (equivalently ``pti=off``) to the guest kernel command line for x86,
@@ -840,11 +902,11 @@ apart from user code by the per-insn ``SYSTEM`` bit) and shared kernel
 code deduplicates to a single template instead of one copy per
 process.  OS isolation is then modeled *by the consumer* from the
 ``SYSTEM`` bit rather than baked into the trace — see the *System-mode
-traces* discussion in :doc:`concepts`.  When a kernel does run in a
-private address space on entry (a PTI-style page-table base), the
-``kexc`` option (default on) carries that kernel excursion back to the
-user process it was entered from so its synchronous-handler coverage is
-kept rather than dropped; see :doc:`reference`.
+traces* discussion in :doc:`concepts`.  A kernel that runs in a
+private address space on entry (a PTI-style page-table base) executes
+its excursions in a context that maps no marker bytes, so its kernel
+coverage is simply not captured — KPTI off is the canonical
+configuration; see :doc:`concepts`.
 
 **Disk-I/O records: virtio-blk with ioeventfd=off and no iothread.**
 With ``devio`` on (the default), the tracer brackets each disk request

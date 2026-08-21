@@ -11,7 +11,7 @@ Out-of-scope categories
 **Whole-system tracing.**  System-mode tracing is marker-scoped, not
 whole-machine.  Each captured process carries a ``(thread_id, asid)``
 context; under the default ``policy=latch`` every process that runs
-the START marker joins an owned address-space set and is traced —
+the START marker latches its marker vaddr as a window and is traced —
 along with the kernel code it synchronously invokes — until its END
 marker, while ``policy=trace-all`` widens the first START to capture
 all contexts (see the *System-mode tracing* section of
@@ -644,32 +644,17 @@ to the incoming task while the outgoing one is still architecturally
 executing.  The window is bounded by that fixed instruction distance and
 is entirely inside kernel scheduler code.
 
-.. _limits-kexc-foreign-root:
-
-**Kernel coverage ends where the address space does.**  A kernel block
-is attributed to the trace by the excursion that entered the kernel
-(``kexc=1``), but on a wide-register target — x86 ``CR3``, AArch64
-``TTBR0``, RISC-V ``satp`` — that inference is *bounded by the root the
-block actually executes under*: on those targets the root IS the
-process, so a block running under a root the trace does not capture is
-another task's kernel work and is refused however the excursion was
-entered.  What this bounds is not hypothetical: without it, a scheduler
-switch away from the pinned process while it sat in the kernel handed
-the trace the whole tail of the switch — the incoming task's kernel
-work, up to its return to its own user code.  Measured on one x86-64
-system cell, 34,402 basic blocks and 229,826 instructions, 77% of the
-kernel instructions in the delivered trace.
-
-Two consequences follow.  A guest that switches to a **private kernel
-page-table base** on entry — KPTI on — runs its whole excursion under a
-root the trace does not own, so its kernel coverage stands down to what
-executes on the pinned root; KPTI off is the configuration this tracer
-is characterised on, and the isolation is modelled downstream from the
-``SYSTEM`` flag instead.  And the blocks between a committed switch and
-the trace's decision to stop following it are *absent* rather than
-mis-credited: exclusion, not attribution, is what the rule guarantees.
-``kexc kernel TBs kept on a foreign root`` is the invariant's witness
-(must be 0); ``... refused on a foreign root`` counts what it removed.
+**Kernel coverage follows the content gate.**  A kernel block is
+traced exactly when the address space it executes in maps a latched
+window's marker bytes (the same one-bit rule user blocks follow):
+kernel code reached from a gated context — syscalls, fault handlers,
+borrowed-mm kernel threads, post-switch tails still on the gated page
+tables — is the traced flow's, and kernel work of a context that maps
+no marker bytes is not captured.  A guest that switches to a private
+kernel page-table base on entry — KPTI on — runs its kernel excursions
+in a context that maps no marker bytes, so kernel coverage stands down
+to nothing there; KPTI off is the configuration this tracer is
+characterised on.
 
 **A speculatively fetched syscall is never performed.**  The WP
 simulator walks *past* a syscall, software interrupt or trap at its
@@ -764,84 +749,28 @@ shutdown is inconvenient; it is opt-in and off by default, because
 idleness alone cannot distinguish a dead process from a merely
 long-blocked live one.
 
-**Ownership is address-space equality, so an address-space NAME reused
-under a live process is the one thing that can move it.**  The tracer
-asks QEMU which address space a vCPU is executing in
-(``qemu_plugin_get_process_id()``: an opaque id QEMU mints per distinct
-architectural value — x86-64 CR3 with PCID, AArch64 TTBR0_EL1 with the
-ASID ``TCR_EL1.A1`` selects, RISC-V SATP, MIPS CP0 ``PWBase``) and
-traces a block exactly when that space is one a marker opened.  Every
-thread inside an owned address space is traced, including one the trace
-has never seen; the thread id only labels strands on the wire.  Nothing
-in the decision looks at what code a process is running, so a fork, a
-second instance of the same binary and a byte-identical page at the same
-virtual address are all simply *not this address space*.
+**The trace filter is content-at-vaddr, so scope follows the bytes.**
+At every committed address-space change the tracer reads the marker
+sequence's bytes at each latched window vaddr through the live context
+and traces the context exactly when they match.  No root, ASID or
+process id is ever stored or compared as an identity, so there is no
+recycling exposure, no re-bind rule and no proof-of-life probe: a
+successor process either maps the latched bytes (and is, by the
+contract, traced — concurrent instances, same-binary successors and
+fork children are all deliberately in scope) or it does not (and is
+not).  The residual obligations are stated positively: the marker page
+must stay resident (``mlock(2)`` before START; a *gated* context whose
+marker page stops being readable gates off, counted by ``gated context
+lost marker page residency`` — a foreign context that never mapped the
+bytes lands in ``gate refresh evaluated NOT traced`` alone), and
+a process that wants out compiles the marker out.  The opt-in
+window-closing backstops for a process that dies without its END
+marker — ``latch_timeout=<ms>`` and ``latch_idle_insns=<N>`` — reduce
+to ONE global last-gated-execution stamp pair: the segment closes when
+every gated context has been idle past the threshold (per-window aging
+while another gated window still executes is deliberately retired —
+v4 default, maintainer-vetoable).
 
-What the identity does not carry is a lifetime.  Two cases, both named
-rather than assumed away:
-
-* **A page-table root freed and handed to a successor** (the
-  wide-register targets).  Once the traced process exits, the kernel may
-  give its root page to the next process that asks, and the
-  architecture then says that value *is* the new process's address
-  space.  Equality cannot separate them.  A window left open by a
-  process that exited without running its END marker is what exposes
-  this, so the mitigations are the window-closing ones —
-  ``latch_timeout=<ms>`` and ``latch_idle_insns=<N>`` — not an identity
-  test.  The latches themselves are hardened against the recycle they
-  mitigate: a successor wearing the dead window's root produces every
-  idleness-refresh event in its name (measured re-stamping a dead
-  window thousands of times under a fork storm, holding the latch
-  inert indefinitely), so a stamp refresh demands proof of life — the
-  refreshing context must still map the marker's own code page to the
-  physical page the marker executed from, which only the process that
-  ran the marker (or a second instance of the same binary, the
-  already-named residual) can do.  Until the latch's threshold is
-  spent, the successor's user execution is still *captured* under the
-  stale pin — the latch bounds the exposure at ``latch_idle_insns``;
-  it does not close the identity gap itself.
-* **A narrow address-space TAG reassigned to a LIVE process** (MIPS
-  ``EntryHi.ASID`` is 8 bits over a 16-entry TLB, so rollover is the
-  normal state on a busy guest).  This is **not** an exposure, because
-  the tag is not the identity: on any MIPS model implementing the
-  hardware page-table walker the reported address space is **CP0
-  PWBase**, the base the walker itself translates from, which Linux
-  writes at every ``switch_mm``.  Two live address spaces cannot share
-  a page-table root, so a rollover renames nothing the tracer looks at
-  — there is no re-bind rule, no claim, no deferred verdict, and no
-  instruction of the traced process is ever withheld or dropped waiting
-  for one.  A ``fork()`` child is distinguished by construction: it gets
-  a new ``mm``, hence a new pgd, hence a different address space from
-  its first instruction, and no thread pointer is consulted so none can
-  be forged.  The same root is reported on every vCPU running that
-  ``mm``, so an SMP migration is not a rename either.
-
-  Two counters witness the guest's behaviour without participating in
-  any decision: ``distinct raw ASID names committed since the pin``
-  (how much of the tag space the guest burned) and ``distinct raw ASID
-  names the OWNED space executed under`` (greater than one exactly when
-  the guest renamed a live address space and the trace kept following
-  it).
-
-**A system-mode capture names its process by a page-table root, so it
-needs a CPU model that supplies one and a guest that programmed it.**
-The cores this is validated on, per ISA, are listed in
-:ref:`the system-mode support matrix <system-cpu-support>`, together
-with the machines they run on and what the guest kernel has to enable;
-user mode needs no identity machinery at all and carries no such
-requirement.  Both conditions are enforced rather than assumed: a model
-that names no address space is refused at ``qemu_plugin_install``,
-before the first vCPU exists, and a guest that left the register at
-zero is refused at the START marker, before the window opens.  Neither
-is a degradation of an in-flight capture — no byte has been written
-when either fires.
-
-**PWBase is guest-writable, so a guest that repurposed it would be
-misread.**  Unlike a thread pointer this is self-enforcing — the
-hardware walker translates from the value, so a guest that put
-something else there would fault rather than merely be mislabelled —
-but it is an assumption about guest behaviour and is stated here as
-one.
 
 **Wrong-path excursions are time-transparent, but not free.**  An
 excursion consumes zero guest time — the guest virtual clock is frozen

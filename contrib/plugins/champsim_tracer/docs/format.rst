@@ -717,7 +717,11 @@ or fault handler runs as its caller, but a context switch performed entirely
 inside the kernel hands the rest of the strand to the incoming task — a
 freshly cloned child finishing its return path before it has ever executed a
 user instruction, or a kernel thread scheduled in, is that task and not its
-predecessor.  The producer follows those switches wherever the target's
+predecessor.  A borrowed-mm kernel thread scheduled onto the gated page
+tables is such a strand: it is traced under the gated context's
+``asid`` label while carrying its own ``thread_id``, minted from its
+own kernel task identity — a thread *within the traced flow*, kept by
+ruling.  The producer follows those switches wherever the target's
 thread-pointer register still names the current task at kernel privilege
 (see :doc:`limitations` for the targets where it does not, and for the
 consequences when it does not).  The practical guarantee this buys a
@@ -727,20 +731,27 @@ breaks only at the nesting boundaries the format makes visible
 (``fault_depth`` changes, privilege-domain gaps).  Two concurrently
 executing threads never share a ``thread_id``.
 
-**Address space (asid).**  The ``asid`` dimension names the address space a
+**Address space (asid).**  The ``asid`` values on the wire are *labels*,
+never identities: the producer records the live architectural
+address-space value at capture through its compact first-sighting index,
+and nothing in the format asserts that a label outlives the context it
+was read from.  A window (what the producer traces) is identified by its
+latched marker virtual address and its content — the anchor ``sig`` word
+in the first-sighting identity carries 0.  The ``asid`` dimension names the address space a
 block executed in, carried alongside ``thread_id`` as the second half of the
 context.  Memory is keyed ``(asid, vaddr)``: the same virtual address under two
 asids is two different physical memories, and a consumer that models a cache
 or memory hierarchy must qualify every address by the current asid.  The wire
 carries a **compact asid index** assigned on first sighting (0, 1, 2, …); each
-index's identity — the page-table root physical address (``root_phys``: CR3 /
-TTBR0/1 base / SATP PPN / MIPS ``CP0 PWBase``, normalised to a physical
-address when the kernel names it through kseg0/kseg1) plus a content ``sig``
-disambiguating a reused root — rides that index's first
+index's LABEL — the live architectural address-space value at capture
+(``root_phys``: CR3 / TTBR0/1 base / SATP PPN / MIPS ``EntryHi.ASID``) plus a
+reserved ``sig`` word (always 0) — rides that index's first
 ``BODY_TAG_ASID_SWITCH``, mirroring how a thread's register file rides its
-first ENTRY.  The root-physical is used rather than the architectural ASID
-field because the latter (8/16-bit on ARM and MIPS) rolls over and is reused
-across a long trace.
+first ENTRY.  The label is an honest attestation of the value in force, never
+an identity a consumer may match across time: the index names a VALUE per
+segment, and if the guest reuses the value the index may be reused with it
+(minting a fresh index on reuse would require comparing the values as
+identities, which the model forbids).
 
 A single-address-space (marker/pin) trace declares asid index 0 in the opening
 context record and never switches the asid dimension again: every virtual
@@ -1411,18 +1422,21 @@ memory.
    |   current_asid_index - previous_asid_index       |
    | -- present only on this index's FIRST sighting --|
    | root_phys                       u64  (LE)        |
-   |   page-table root physical address (identity)    |
+   |   address-space value at first sighting (label)  |
    | sig                             u64  (LE)        |
-   |   content signature; 0 until assigned            |
+   |   reserved; always 0                             |
    +--------------------------------------------------+
 
 ``previous_asid_index`` starts at 0.  The **compact asid index** is
-assigned on first sighting (0, 1, 2, …); its identity — ``root_phys``
-(the page-table root physical: CR3, TTBR0/1 base, SATP PPN, or MIPS
-``CP0 PWBase``)
-plus a content ``sig`` that distinguishes a root-physical reused by a new
-address space after the original process died — rides that index's first
-switch record only.  A decoder tracks which indices it has already seen;
+assigned on first sighting (0, 1, 2, …).  ``root_phys`` is a **label**
+— an honest attestation of the live architectural address-space value
+in force at first sighting (CR3, TTBR0/1 base, SATP, or the MIPS
+``EntryHi.ASID`` field), never an identity a consumer may match across
+time.  The index labels a VALUE per segment, not a process, and may be
+reused if the guest reuses the value (minting a fresh index on reuse
+would require detecting reuse, i.e. comparing roots as identities,
+which the model forbids).  ``sig`` is reserved and always 0.  Both
+words ride that index's first switch record only.  A decoder tracks which indices it has already seen;
 a repeat sighting of an index carries the bare ``asid_index_delta`` with no
 trailing identity words.  This first-sighting-inline scheme mirrors the
 per-thread register file (§4.6) and keeps the stream self-describing

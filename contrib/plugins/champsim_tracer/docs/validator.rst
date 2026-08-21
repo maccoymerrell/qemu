@@ -520,7 +520,7 @@ add coverage no other sub-command exposes:
 
 ``system.user_x86``
    ``all --system --marker --coverage --regdata`` under ``-cpu max``
-   — the full-oracle marker/pin battery (ASID-switch records, kexc
+   — the full-oracle marker battery (ASID-switch records, content-gate
    excursion ownership, syscall/fault nesting, user-code identity)
    against a real system boot.
 ``system.churn_x86`` / ``system.churn_mipsel``
@@ -631,7 +631,10 @@ add coverage no other sub-command exposes:
    own sleep.
 ``system.attach_mipsel``
    ``all --system --attach`` on mipsel — the ptrace-injected marker
-   (:program:`cst_attach`'s ``PTRACE_PEEKUSER``/``POKEUSER`` backend)
+   (:program:`cst_attach`'s ``PTRACE_PEEKUSER`` poke-and-release
+   backend: the persisted marker is written at the entry and the
+   released child executes it itself, no trailing trap — a trap byte
+   would be captured into a wire template by whole-TB translation)
    opens the window for a workload with no compiled-in marker; a run
    that produces a trace at all is the check, since only the
    injection can have opened it.  The only standing gate that reaches
@@ -2433,12 +2436,12 @@ closed:
 Multi-process churn test (``churn_test``)
 -----------------------------------------
 
-The ASID pin must follow *only* the marked process across ASID reuse.
-On MIPS the ASID space is 8 bits, so a few hundred short-lived
-processes force a generation rollover and the guest kernel reassigns
-the pinned ASID value to foreign processes while the trace window is
-open — the exact scenario the pin's reuse detector
-(``pin_asid_reuse_suspected``) and the kexc ownership model guard.
+The content gate must trace *only* contexts that map the marker bytes
+while foreign address spaces churn.  Init forks hundreds of
+short-lived processes while the trace window is open; none of them
+maps a latched window's marker bytes, so none may reach the trace —
+the byte-identity and chain assertions below are the direct statement
+of "map them, traced; don't, not traced".
 
 .. code-block:: console
 
@@ -2465,9 +2468,9 @@ What it does:
    * the window closed **at budget** on the user clock
      (``user_covered == budget``, OK flag) — the workload outlives
      the budget by construction (``--hot-iters``),
-   * ``pin_asid_reuse_suspected`` and ``kexc ASID-write events`` are
-     reported from the stats log (the detector may legitimately fire;
-     the content checks above are the gate),
+   * ``marker gate refreshes`` is reported from the stats log (the
+     vacuity witness: foreign address spaces really were scheduled
+     inside the open window),
    * ``cst_audit`` and ``cst_decode --strict`` exit clean.
 
 .. _validator-lldet:

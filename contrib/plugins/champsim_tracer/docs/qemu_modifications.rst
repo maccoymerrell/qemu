@@ -95,6 +95,15 @@ Plugin API additions
      is the pinned process's so the JIT-inlined user-instruction
      countdown can be compensated for foreign-process execution.
      The callback runs on the owning vCPU thread.
+   * ``qemu_plugin_register_nosplit_code_sequences`` — byte patterns
+     the translator must never split across a TB boundary (the
+     marker sequences).  See *Never-split code sequences* below.
+   * ``qemu_plugin_async_run_on_vcpu`` — queue a one-shot callback
+     on a specific vCPU's own thread at its next safe point, so the
+     plugin can evaluate per-vCPU state through that vCPU's live
+     context (the content-as-gate refresh reads guest memory through
+     the target vCPU's current address space, which a cross-thread
+     read cannot do).  A thin wrapper over ``async_run_on_cpu``.
    * ``qemu_plugin_fault_depth`` — the live synchronous-fault
      nesting depth from QEMU's fault stack (see *Path-event
      delivery*).  The plugin baselines per-segment depth reporting
@@ -235,13 +244,6 @@ Plugin API additions
      shutdown, below — where the vCPU carrying the callback and the vCPU
      the callback is about are different questions with different
      answers.
-   * ``qemu_plugin_vaddr_to_paddr`` — debug-walks the executing vCPU's
-     current translation to return the physical address a virtual
-     address maps to (0 when unmapped).  It supplies the physical-page
-     identity a narrow ASID cannot distinguish — two processes that
-     alias the same short MIPS ASID still occupy distinct physical
-     pages — and backs the ``physaddr=1`` per-memop physical-page
-     records.
    * ``qemu_plugin_get_thread_ptr`` — the kernel-maintained per-thread
      pointer state for the running thread, giving guest-thread identity
      independent of the vCPU a thread happens to be scheduled on: x86-64
@@ -334,134 +336,32 @@ Plugin API additions
    current EL / ``TTBR0_EL1`` / ``SCTLR.M``
    (``target/arm/cpu.c``), RISC-V from ``priv`` / ``SATP`` /
    (``SATP != 0 && priv != M``) (``target/riscv/tcg/tcg-cpu.c``), and
-   MIPS from ``KSU`` / ``CP0 PWBase`` (``EntryHi.ASID`` on a model
-   without ``Config3.PW``) / always-true (the MIPS TLB has no global
-   enable) (``target/mips/cpu.c``).  ``plugins/api.c`` calls
+   MIPS from ``KSU`` / ``EntryHi.ASID`` (the value the TLB actually
+   tags translations with, reported as a LABEL on every model — no
+   page-table root is ever reported as an identity) / always-true (the
+   MIPS TLB has no global enable) (``target/mips/cpu.c``).  ``plugins/api.c`` calls
    the hook when present and otherwise returns the user-mode defaults.
    The hook is gated ``CONFIG_PLUGIN && !CONFIG_USER_ONLY``; porting a
    new ISA to system-mode tracing means implementing it (see
    :doc:`extending`).
 
-``include/accel/tcg/cpu-ops.h``, ``plugins/core.c`` and per-target
-``TCGCPUOps::get_plugin_identity``
+``target/mips/system/physaddr.c`` — debug reads fall back to the
+hardware page-table walk
 
-   Base QEMU keys its TLB on the translation regime (``mmu_idx``) and
-   maintains no notion of WHICH address space a vCPU is in, so this is a
-   new primitive rather than a re-export of an existing one.  A second
-   optional ``TCGCPUOps`` callback,
-   ``get_plugin_identity(cpu, *space_key, *thread_key)``, reports the
-   RAW architectural identity keys; ``plugins/core.c`` interns each
-   distinct key into a monotonically increasing id and caches the pair
-   per vCPU (``CPUState::plugin_process_id`` /
-   ``plugin_thread_id``), refreshing it at the address-space commit
-   point (beside the ``ASID_WRITE`` push) and on demand from the API.
-   Plugins receive only the ids, through
-   ``qemu_plugin_get_process_id()`` and ``qemu_plugin_get_thread_id()``
-   (``QEMU_PLUGIN_VERSION = 19``), so nothing a plugin does can come to
-   depend on a target's register width, layout or reuse behaviour.
-
-   Each target composes its keys only where the architecture itself
-   splits the name across fields, and reads nothing but registers — no
-   guest memory, no test of a value's *content*, no operating-system
-   layout:
-
-   * x86-64 — ``CR3``, with the PCID kept when ``CR4.PCIDE`` is set and
-     the architecturally-ignored low 12 bits masked when it is not, and
-     the NOFLUSH command bit (never stored state) always masked;
-     ``FS.base``, or ``GS.base`` for a non-long-mode task.
-   * AArch64 — ``TTBR0_EL1``'s table base recombined with the
-     architectural ASID, which ``TCR_EL1.A1`` places in ``TTBR0_EL1`` or
-     ``TTBR1_EL1``; ``TPIDR_EL0``.
-   * RISC-V — ``SATP`` (already ``{MODE, ASID, PPN}``), or ``VSATP``
-     under H-extension virtualization; ``tp`` (``x4``).
-   * MIPS — ``CP0 PWBase``, the hardware page-table walker's base
-     register, on a model implementing the walker (``Config3.PW``),
-     normalised to a physical address when the kernel names it through
-     kseg0/kseg1.  This makes MIPS the same kind of target as the other
-     three: the key is the root the hardware translates from, per-``mm``,
-     identical on every vCPU running that ``mm``, and distinct for a
-     ``fork`` child from its first instruction.  Zero is **not** a
-     fallback — a guest that never programmed the register (``nohtw``,
-     ``CONFIG_MIPS_HTW=n``) reports an absence, and substituting the
-     narrow tag there would silently restore the reuse hazard on exactly
-     the boots where it is invisible.  A model without ``Config3.PW``
-     reports ``EntryHi.ASID`` under the CPU's ASID mask, with
-     ``CP0 MemoryMapID`` above it when ``Config5.MI`` makes MemoryMapID
-     the TLB tag.  Thread key: ``CP0 UserLocal``.
-
-   A key of 0 means "the architecture names nothing in this state" and
-   is never interned, so id 0 is an *absence*, not an identity: a target
-   with no hook (user-mode emulation, where a QEMU process is one
-   address space) and a CPU model that implements no thread-pointer
-   register (a MIPS model with ``Config3.ULRI`` clear) both report it,
-   and a consumer must treat it as unknown rather than as a match.
-
-   Registers that live in TCG globals (the x86 segment bases, RISC-V
-   ``tp``) are only guaranteed spilled to the CPU state in a callback
-   registered ``QEMU_PLUGIN_CB_R_REGS`` or ``QEMU_PLUGIN_CB_RW_REGS``;
-   the per-vCPU memo makes a sample taken elsewhere self-correcting at
-   the next coherent one rather than sticky.
-
-``include/hw/core/cpu.h``, ``plugins/api-system.c`` and per-target
-``CPUClass::plugin_identity_caps``
-
-   A CLASS method — ``plugin_identity_caps(ObjectClass *oc)`` — reporting
-   which identity keys the RESOLVED CPU MODEL can supply, exported to
-   plugins as ``qemu_plugin_identity_caps()``.  It takes the class, not a
-   ``CPUState``, because the question it answers has to be answerable
-   from ``qemu_plugin_install()``: ``system/vl.c`` resolves
-   ``current_machine->cpu_type`` from the board default and then from
-   ``-cpu`` well before ``qmp_x_exit_preconfig()`` reaches
-   ``qemu_init_board()``, which loads plugins and only then calls
-   ``machine_run_board_init()``.  A plugin whose output would be invalid
-   without a page-table root can therefore refuse the run before the
-   first vCPU exists.
-
-   It is installed from each target's own ``class_init`` (i386 and
-   RISC-V in ``target/*/cpu.c``, not their ``tcg-cpu.c``): the
-   accelerator's ``init_accel_cpu`` hook runs from
-   ``accel_init_interfaces()``, which is called *inside*
-   ``machine_run_board_init()`` — a caps method installed there would
-   read NULL at exactly the moment it is asked for.
-
-   x86-64, AArch64 and RISC-V answer ``SPACE_IS_ROOT | NAMES_THREAD``
-   unconditionally.  MIPS reads its model definition's ``CP0_Config3``
-   for ``PW`` (bit 24) and ``ULRI`` (bit 13); today only ``P5600``
-   sets ``PW``.  ``-M none``, an unresolvable ``cpu_type`` and a target
-   without the method all report an empty mask, so the safe answer is
-   the default rather than an assumption.
-
-``include/accel/tcg/cpu-ops.h`` and
-``TCGCPUOps::get_plugin_narrow_asid``
-
-   ``get_plugin_narrow_asid(cpu)``, exported as
-   ``qemu_plugin_get_narrow_asid()``, reports the target's exhaustible
-   TLB TAG where that is a different value from the page-table root —
-   MIPS ``EntryHi.ASID`` (with ``MemoryMapID``).  NULL, hence 0, on
-   x86-64, AArch64 and RISC-V, whose TLB tag is a field of the root
-   register itself.
-
-   It is explicitly **not** an identity, and the API documentation says
-   so: an operating system re-points these tags at different live
-   address spaces.  It exists so that a consumer can WITNESS that
-   recycling with a value independent of the identity key it
-   corroborates — a rollover test that measured the guest's ASID sweep
-   through the ownership key would only be restating its own premise.
-
-``target/mips/tcg/translate.c``, ``target/mips/tcg/system_helper.h.inc``
-and ``target/mips/tcg/system/cp0_helper.c``
-
-   ``mtc0``/``dmtc0`` to ``CP0 PWBase`` were inline TCG stores; they are
-   now ``helper_mtc0_pwbase`` / ``helper_dmtc0_pwbase``.  The write is
-   the MIPS ADDRESS-SPACE COMMIT POINT — Linux reaches it from
-   ``htw_set_pwbase()`` inside ``TLBMISS_HANDLER_SETUP_PGD()``, i.e. at
-   every ``switch_mm``/``activate_mm`` — so the plugin identity has to be
-   resampled exactly there.  The helper stores the value and, only when
-   it changed, pushes ``QEMU_PLUGIN_CPU_EVENT_ASID_WRITE``; there is no
-   ``tlb_flush``, because PWBase says where the walker starts and
-   invalidates no existing translation.  ``cpu_plugin_evq_push`` is inert
-   on the wrong path and compiled out under ``--disable-plugins``,
-   leaving one helper call per context switch.
+   ``mips_cpu_get_phys_page_debug`` resolves through the software TLB
+   matched against the live ``EntryHi.ASID``, so immediately after a
+   ``switch_mm`` a resident page's translation is simply not in the TLB
+   and a debug read fails.  On a model implementing the hardware
+   page-table walker (``Config3.PW``, ``PWCtl.PWEn``), a miss now falls
+   back to the same directory walk the walker performs, from
+   ``CP0 PWBase``, side-effect-free: no TLB insertion, no exception, and
+   PWBase used strictly as a TRANSLATION INPUT — never stored, compared
+   or reported as an identity.  This is what makes the ChampSim Tracer's
+   content-gate refresh (``qemu_plugin_read_memory_vaddr`` at each
+   committed address-space change) readable on MIPS.  Huge-page
+   directory entries and non-4K leaf configurations are not decoded; the
+   walk reports failure and the caller keeps the plain miss.  (v4
+   default #2, maintainer-vetoable.)
 
 ``plugins/api.c`` and ``disas/disas-target.c``
 
@@ -576,6 +476,103 @@ Per-ISA translator call sites
      (the unconditional ``JAL``) and ``gen_branch`` (the B-type
      conditionals), using ``ctx->base.pc_next + imm``.  ``JALR``
      (indirect) is unaffected.
+
+Never-split code sequences
+--------------------------
+
+The marker detector decides in the bytes, at translation time, from one
+TB: a TB that contains the whole marker sequence.  What makes that TB
+guaranteed to exist is this modification — the translator never ends a
+TB inside a marker sequence.
+
+``plugins/core.c`` — pattern store
+
+   ``qemu_plugin_register_nosplit_code_sequences`` copies up to two
+   byte patterns (START and END, one shared length) into a
+   process-wide table at plugin install time; ``qemu_plugin_nosplit_
+   seqs`` (``include/qemu/plugin.h``) reads it back at translation
+   time.  ``NULL``/0 clears the table, which turns the feature off —
+   a build with no registered patterns translates byte-identically
+   to stock QEMU.
+
+``accel/tcg/translator.c`` — the continue-through
+
+   At every CLEAN TB-end decision — ``DISAS_TOO_MANY``, which is the
+   page-boundary, instruction-budget and single-step stop, never a
+   real control transfer — the loop asks whether the TB's final
+   translated bytes form a PROPER prefix of a registered sequence
+   (``translator_nosplit_continue``, reading the already-translated
+   bytes back out of the TB's own host pages).  If they do, the stop
+   is rescinded and translation continues through the sequence via
+   the normal code-fetch path: a continuation onto the next page is
+   an ordinary cross-page TB (``tb->page_addr[1]``), and a fetch
+   fault is the fault the next fetch was about to take, serviced by
+   the standard translation restart.  The budget arm extends
+   ``db->max_insns`` as needed, so the sequence is atomic to the
+   translator even under ``-icount`` and single-stepping (deliberate
+   semantics: a gdb single-step steps over a whole sequence).
+
+   Bounds: the completed sequence must stay within the TB's two-page
+   reach (a TB holds at most two pages), the insn count stays below
+   ``CF_COUNT_MASK``, the MMIO/record fetch paths (deliberately
+   capped TBs) never extend, and a full TCG op buffer never extends.
+
+   The RETREAT (v4 repair, maintainer-vetoable).  When the tail is
+   mid-sequence but extension is refused for a hard reason — the
+   ``CF_COUNT_MASK`` ceiling (an instruction budget that collides
+   exactly with the page boundary), op-buffer pressure, a third page,
+   or a target refusal that persists (a re-arm that made no progress)
+   — the loop neither extends nor splits: it ends the TB *before*
+   the sequence's first instruction, so the sequence opens the next
+   TB whole.  The loop keeps a ring of per-insn boundaries (pc, last
+   op, previous insn_start, and an optional target checkpoint word);
+   the retreat drops every op from the sequence boundary on — the
+   multi-insn generalization of the target-side one-insn rewind on a
+   refused page crossing — rewinds ``pc_next``/``num_insns``, and
+   stops with ``DISAS_TOO_MANY``.  ``plugin_gen_tb_end`` already
+   truncates the plugin's insn list to the final count, so the
+   dropped insns never reach the tracer.  Retreat is single-shot per
+   translation (refuse-once: the old blind re-arm spin is dead) and
+   gives up — a plain split, correctness unharmed — when the retreat
+   point is mid-insn, would empty the TB, or the target vetoes.
+
+   Two optional ``TranslatorOps`` hooks let targets keep private
+   decode state coherent across a retreat: ``nosplit_checkpoint``
+   captures a per-insn state word (MIPS: ``hflags``, so a retreat
+   that re-opens a delay slot re-arms the pending branch), and
+   ``nosplit_retreat`` re-syncs the private pc and lazily-flushed
+   spills (i386: ``dc->pc`` and a conservative ``cc_op`` re-spill;
+   aarch64: ``pc_curr``) or vetoes.  riscv needs neither: its
+   ``DISAS_TOO_MANY`` exit reads only ``pc_next``.  The soundness
+   contract is that dropped insns are a byte-prefix of a registered
+   sequence — immediate-load instructions on every ISA — which never
+   sync the pc or touch flags/hflags themselves.
+
+``target/i386/tcg/translate.c`` — the two-page relaxation (v4 repair,
+maintainer-vetoable)
+
+   x86's variable-length decoder refuses, in ``advance_pc``, any
+   *subsequent* instruction whose last byte leaves the TB's first
+   page — for an extended TB that refusal re-fired on every
+   sequence instruction after the first crossing one, re-armed
+   blindly, and span until the op buffer filled (the pre-repair
+   straddle markers never fired).  While the never-split extension
+   is active (``DisasContextBase.nosplit_extend``, set only after a
+   sequence prefix matched at a clean stop), ``advance_pc`` instead
+   permits instructions whose bytes lie entirely within the TB's
+   TWO-page window — page slot 1 is already claimed by the first
+   crossing fetch, so page-protection tracking is intact by
+   construction — and never beyond page 2.  Ordinary translation
+   (no registered sequences, or no matched prefix) never sets the
+   flag and remains byte-identical.
+
+   ``gen_tb_end`` bills at most the ORIGINALLY-requested budget when
+   the extension pushed ``num_insns`` past it: an icount head check
+   billed at the extended count would exit forever on a slice that
+   can never afford the TB (a livelock), so the extension instead
+   under-bills the slice by at most ``seq_insns − 1`` instructions
+   on the rare run where an icount deadline lands inside a marker
+   sequence.
 
 Path-event delivery
 -------------------

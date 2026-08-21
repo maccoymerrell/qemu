@@ -1076,39 +1076,6 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
      - ``0``
      - Per-segment interval histograms (N buckets) in the exit-time
        summary.
-   * - ``kexc=0|1``
-     - ``1``
-     - Kernel-excursion ownership (**system mode only**).  When on, a
-       kernel (privilege ``!= 0``) basic block is attributed to the
-       trace by the *owning excursion* — the user address space the
-       kernel was entered from, tracked through ASID-write path events —
-       rather than by the live ASID.  That inference recovers the kernel
-       work the live ASID alone loses: an excursion resumed after another
-       task's user code, a handler tail after a preemption, a sticky cut.
-       It is **bounded by the executing address space**: on a
-       wide-register target (x86 ``CR3``, Arm ``TTBR0``, RISC-V ``satp``)
-       the root *is* the process, so a kernel block running under a root
-       the trace does not capture is refused however the excursion was
-       entered — the ``kexc kernel TBs kept on a foreign root`` statistic
-       is that rule's must-be-0 witness, and its complement
-       ``... refused on a foreign root`` counts the foreign kernel work
-       kept out.  The consequence, named: a guest that switches to a
-       *private kernel* page-table base on entry (KPTI on) executes its
-       whole kernel excursion under a root the trace does not own, so its
-       kernel coverage stands down to what runs on the pinned root.  KPTI
-       off is the configuration this tracer is characterised on.
-       ``kexc=0`` restores the strict live-ASID rule: kernel work whose
-       live ASID differs from the pinned value is dropped.  Ignored in
-       user mode.  In system mode ``kexc=0`` is **refused at startup**
-       when the window is pinned (``trace_window=marker`` or
-       ``simpoint``): with the excursion model off there is no
-       trustworthy answer to *whose work is this* at kernel privilege —
-       the live register is the very read the model exists to replace —
-       so neither the block gate nor the path-event retention gate can
-       attribute a kernel fault, and retention would have to fall back to
-       keeping every kernel-privilege event, unbounded in the length of
-       untraced execution.  Refused rather than run in a partial form;
-       use ``kexc=1`` or an unpinned window.
    * - ``faults=0|1``
      - ``1``
      - Synchronous-fault handler tracing (**system mode only**).  When on,
@@ -1134,7 +1101,7 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
        the interrupted context's entries (a captured async window is one
        level; a synchronous fault taken inside it nests one deeper),
        attributed to the interrupted address space through the same
-       kernel-excursion ownership (``kexc``) machinery a synchronous fault
+       content-gate rule a synchronous fault
        uses, and the interrupted block seals against the interrupt's
        departure PC so no phantom edge runs through the handler entry.  The
        depth rides the existing block-level fault-depth record — no new
@@ -1285,18 +1252,15 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
        host load — prefer this denominator.  The two are independent:
        either alone or both, and a window closes as soon as either
        crosses.  Reported as ``idle=<N> insns`` on the ``dead-latch
-       close`` line, close line ``IDLE``, and ``dead-latch windows closed
+       close`` line, close line ``IDLE``, and ``dead-latch closes
        (idle insns)`` in the statistics.  Covers the shape where the
        traced process is killed or never scheduled again — the opposite
-       of ``stall_ceiling``, which needs it to be running.  Both latch
-       denominators accept an idleness-stamp refresh only with proof of
-       life — the refreshing context must still map the marker's own
-       code page to the physical page the marker executed from —
-       because a recycled page-table root otherwise refreshes a dead
-       window's stamp in the dead process's name forever (see
-       :doc:`quickstart` and ``dead-latch refreshes refused`` in the
-       statistics); and the instruction-denominated sweep rides the
-       global retirement clock itself, so it cannot starve while the
+       of ``stall_ceiling``, which needs it to be running.  The idle
+       stamp advances only on GATED execution (a context that maps the
+       marker bytes), so a foreign process scheduled into the system
+       cannot refresh a dead window's stamp: it is never gated, and the
+       idle simply accumulates.  The instruction-denominated sweep rides
+       the global retirement clock itself, so it cannot starve while the
        idle it measures can grow.
    * - ``stall_ceiling_any=<arch insns>``
      - ``2000000000``
@@ -1329,6 +1293,12 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
        ``symbol:name=<sym>+occurrence=<N>+simulation=<insns>``;
        ``marker:simulation=<insns>+policy=latch|trace-all`` (guest-driven,
        system-mode; ``policy`` defaults to ``latch`` — see :doc:`quickstart`).
+       The marker window additionally accepts a SimPoint schedule composed
+       onto it — ``+simpoints=<path>+interval=<insns>+warmup=<insns>`` — which
+       is how a full-system capture uses SimPoints: the marker supplies the
+       anchor (whose clock), the schedule the offsets (which intervals of it).
+       ``icount``, ``symbol`` and a bare ``simpoint`` are user-mode windows and
+       are refused at install under ``*-softmmu``.
    * - ``program=<string>``
      - unset
      - Free-form program identifier stamped into the header.
@@ -1404,22 +1374,3 @@ trace run.
      - Decompressor thread count for the offline tools' ``xz``
        pipeline (``0`` = one per core; ``1`` forces serial for
        lowest memory; unset = a bounded auto of min(cores, 8)).
-   * - ``CST_STRADDLE_DIAG``
-     - *Diagnostic.*  One line per straddle witness taken and per
-       straddling marker decision — the tail, the head length, which
-       sequence matched, and the predecessor page's physical address
-       — so a sequence that goes undecided names the source that was
-       missing rather than only its count.
-   * - ``CST_STRADDLE_FORCE_UNREADABLE``
-     - *Positive control.*  Treats every straddling sequence's
-       backward read as unserviceable, so the sequence's physical
-       page pair has to decide the whole run on its own.  Whether
-       that read can be serviced is a property of the guest's TLB at
-       one instant, so without this a suite can pass without ever
-       exercising the pair.  It cannot make a marker appear.
-
-The modified QEMU base carries its own ``CST_*`` diagnostic
-switches (clock-skew probes, wrong-path state-diff snapshots,
-timer-freeze A/B toggles) in ``accel/tcg/cpu-exec.c``; they gate
-QEMU-side instrumentation rather than plugin behaviour and are
-enumerated at their definition sites.

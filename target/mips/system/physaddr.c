@@ -252,6 +252,18 @@ int get_physical_address(CPUMIPSState *env, hwaddr *physical,
  */
 static bool mips_htw_walk_debug(CPUState *cs, vaddr address, hwaddr *out)
 {
+#if defined(TARGET_MIPS64)
+    /* QEMU models the hardware page-table walker for 32-bit MIPS only:
+     * page_table_walk_refill and the CP0PF_* fields it reads are
+     * compiled out under TARGET_MIPS64 (tcg/system/tlb_helper.c), so
+     * there is no walker here to mirror and no guest on such a model
+     * programs PWBase.  The debug read keeps the TLB-resident path —
+     * the same honest degradation every model without Config3.PW takes
+     * under content gating, counted by the unreadable-at-refresh
+     * witness.  No MIPS model is excluded by this; mirror the walker
+     * here if upstream ever models it for MIPS64. */
+    return false;
+#else
     CPUMIPSState *env = cpu_env(cs);
     int gdw = (env->CP0_PWSize >> CP0PS_GDW) & 0x3F;
     int udw = (env->CP0_PWSize >> CP0PS_UDW) & 0x3F;
@@ -351,6 +363,7 @@ static bool mips_htw_walk_debug(CPUState *cs, vaddr address, hwaddr *out)
                (address & ((1 << TARGET_PAGE_BITS) - 1));
         return true;
     }
+#endif
 }
 
 hwaddr mips_cpu_get_phys_page_debug(CPUState *cs, vaddr addr)

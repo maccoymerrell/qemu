@@ -1280,6 +1280,11 @@ x86_64 R-wr-missing faddp +fpsw
 x86_64 R-wr-missing femms +mm#,st#
 x86_64 R-wr-missing ffree +fpsw
 x86_64 R-wr-missing ffreep +fpsw
+# FFREE(P)'s st(i) is a tag-word selector, neither read nor written as
+# data; the boundary drops the operand outright (cap_x86_is_x87_tag_only,
+# disas/capstone.c), which the checker classes as an unmodelled operand.
+# Deletable when the tracer models the x87 tag word, which it does not.
+x86_64 Z-unmodelled-op ffreep
 x86_64 R-wr-missing fxrstor64 +fpcw,fpsw
 x86_64 R-wr-missing fxrstor +fpcw,fpsw
 x86_64 R-wr-missing movq +r#
@@ -1445,7 +1450,6 @@ x86_64 R-wr-phantom xrelease xchgb +r#
 x86_64 R-wr-phantom xrelease xchgl +r#
 x86_64 Z-access0 bswapw REG
 x86_64 Z-access0 cldemote MEM
-x86_64 Z-access0 ffreep REG
 x86_64 Z-access0 nopl MEM
 x86_64 Z-access0 nopl REG
 x86_64 Z-access0 nopq MEM
@@ -2110,8 +2114,6 @@ x86_64 M-miss-store xrstors64
 # what they are and Capstone does not; and the CET / monitor / RDRAND ops,
 # whose implicit register operands the two describe differently.
 x86_64 R-rd-missing clrssbsy +r#
-x86_64 R-rd-missing incsspd +r#
-x86_64 R-rd-missing incsspq +r#
 x86_64 R-rd-missing rclb +flags
 x86_64 R-rd-missing rcrb +flags
 x86_64 R-rd-missing rcrq +flags
@@ -2144,8 +2146,6 @@ x86_64 R-wr-phantom subq +flags,r#
 # ops, none of which the tracer's guests execute; capstone_workaround_probe
 # is the tool that says when a workaround for one becomes removable.
 x86_64 Z-access0 clrssbsy MEM
-x86_64 Z-access0 incsspd REG
-x86_64 Z-access0 incsspq REG
 x86_64 Z-access0 ljmpq MEM
 x86_64 Z-access0 prefetchwt1 MEM
 x86_64 Z-access0 rdsspd REG
@@ -4782,62 +4782,20 @@ x86_64 D-llvm-only {vex}
 x86_64 M-llvm-mem-cs-none vmaskmovdqu load store
 x86_64 M-miss-load vmaskmovpd
 x86_64 M-miss-load vmaskmovps
-x86_64 M-miss-load vpermil2pd
-x86_64 M-miss-load vpermil2ps
 x86_64 M-miss-load vpmaskmovd
 x86_64 M-miss-load vpmaskmovq
 x86_64 M-miss-store vldmxcsr
-x86_64 R-rd-missing kaddb +k#
-x86_64 R-rd-missing kaddd +k#
-x86_64 R-rd-missing kaddq +k#
-x86_64 R-rd-missing kaddw +k#
-x86_64 R-rd-missing ktestb +k#
-x86_64 R-rd-missing ktestd +k#
-x86_64 R-rd-missing ktestq +k#
-x86_64 R-rd-missing ktestw +k#
-x86_64 R-rd-missing kunpckdq +k#
-x86_64 R-rd-missing kunpckwd +k#
 x86_64 R-rd-missing vgatherdpd +v#
 x86_64 R-rd-missing vgatherdps +v#
 x86_64 R-rd-missing vgatherqpd +v#
 x86_64 R-rd-missing vgatherqps +v#
 x86_64 R-rd-missing vpcmpestrm +r#
-x86_64 R-rd-missing vpermil2pd +v#
-x86_64 R-rd-missing vpermil2ps +v#
 x86_64 R-rd-missing vpgatherdd +v#
 x86_64 R-rd-missing vpgatherdq +v#
 x86_64 R-rd-missing vpgatherqd +v#
 x86_64 R-rd-missing vpgatherqq +v#
-x86_64 R-wr-missing kaddb +k#
-x86_64 R-wr-missing kaddd +k#
-x86_64 R-wr-missing kaddq +k#
-x86_64 R-wr-missing kaddw +k#
-x86_64 R-wr-missing ktestb +flags
-x86_64 R-wr-missing ktestd +flags
-x86_64 R-wr-missing ktestq +flags
-x86_64 R-wr-missing ktestw +flags
-x86_64 R-wr-missing kunpckdq +k#
-x86_64 R-wr-missing kunpckwd +k#
 x86_64 R-wr-missing vpcmpestrm +flags,v#
 x86_64 R-wr-missing vpcmpistrm +flags,v#
-x86_64 R-wr-missing vpermil2pd +v#
-x86_64 R-wr-missing vpermil2ps +v#
-x86_64 R-wr-phantom vpermil2pd +v#
-x86_64 R-wr-phantom vpermil2ps +v#
-x86_64 Z-access0 kaddb REG
-x86_64 Z-access0 kaddd REG
-x86_64 Z-access0 kaddq REG
-x86_64 Z-access0 kaddw REG
-x86_64 Z-access0 ktestb REG
-x86_64 Z-access0 ktestd REG
-x86_64 Z-access0 ktestq REG
-x86_64 Z-access0 ktestw REG
-x86_64 Z-access0 kunpckdq REG
-x86_64 Z-access0 kunpckwd REG
-x86_64 Z-access0 vpermil2pd MEM
-x86_64 Z-access0 vpermil2pd REG
-x86_64 Z-access0 vpermil2ps MEM
-x86_64 Z-access0 vpermil2ps REG
 
 # --- mipsel: the residual the `sa`-swept sweep reaches.
 #

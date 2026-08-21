@@ -430,6 +430,12 @@ static bool cap_x86_is_erased_mem_load(const char *mnem);
 static bool cap_x86_is_lost_mem_store(const char *mnem);
 static bool cap_x86_is_gather(const char *mnem);
 static uint8_t cap_x86_x87_mem_access(const char *mnem);
+static bool cap_x86_is_mask_arith_dest_last(const char *mnem);
+static bool cap_x86_is_ktest(const char *mnem);
+static bool cap_x86_is_ssp_read(const char *mnem);
+static bool cap_x86_is_x87_tag_only(const char *mnem);
+static void cap_x86_add_implicit(qemu_plugin_insn_info *out, csh handle,
+                                 unsigned int reg, bool is_write);
 
 /*
  * Extract per-operand detail for x86 into the plugin operand struct.
@@ -518,14 +524,63 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
      * it READ, and FRSTOR reports its memory SOURCE written — see
      * cap_x86_x87_mem_access. */
     uint8_t x87_mem = cap_x86_x87_mem_access(insn->mnemonic);
+    /* Capstone-6.0.0-Alpha7 bug: the AVX-512 mask-arithmetic KADD* /
+     * KUNPCK* and the XOP VPERMIL2P* forms report access == 0 on every
+     * operand — see cap_x86_is_mask_arith_dest_last.  Their dataflow is
+     * fixed by the encoding: the last operand (AT&T order — QEMU's
+     * Capstone syntax — lists the destination last) is written, every
+     * other register or memory operand is read.  Without this the
+     * VPERMIL2P* memory source also loses its load lane entirely. */
+    bool dest_last = cap_x86_is_mask_arith_dest_last(insn->mnemonic);
+    /* Capstone-6.0.0-Alpha7 bug: KTEST* reports access == 0 on both
+     * operands AND an empty implicit regs_write[] — unlike TEST, which
+     * carries EFLAGS there.  KTEST reads both mask registers and writes
+     * only EFLAGS, so force READ below and restore the implicit EFLAGS
+     * write here. */
+    bool ktest_op = cap_x86_is_ktest(insn->mnemonic);
+    /* Capstone-6.0.0-Alpha7 bug: INCSSPD / INCSSPQ report their sole
+     * register operand access == 0.  The register supplies the pop
+     * count — a pure READ; the write target is SSP, which is not an
+     * operand. */
+    bool ssp_read = cap_x86_is_ssp_read(insn->mnemonic);
+    /* FFREEP names an st(i) operand it never reads or writes as data —
+     * it only marks the x87 tag word empty.  Capstone reports
+     * access == 0, which downstream would repair into a fabricated
+     * access; drop the operand instead (the multi-byte-NOP treatment,
+     * for a register). */
+    bool tag_only = cap_x86_is_x87_tag_only(insn->mnemonic);
+
+    if (ktest_op) {
+        cap_x86_add_implicit(out, handle, X86_REG_EFLAGS, true);
+    }
 
     for (uint8_t i = 0; i < n; i++) {
         const cs_x86_op *cop = &x86->operands[i];
         qemu_plugin_operand *op = &out->operands[i];
 
         op->access = cop->access;
-        if (test_read) {
+        if (test_read || ktest_op || ssp_read) {
             op->access = QEMU_PLUGIN_OP_ACC_READ;
+        }
+        if (dest_last && cop->type != X86_OP_IMM) {
+            op->access = (i == n - 1) ? QEMU_PLUGIN_OP_ACC_WRITE
+                                      : QEMU_PLUGIN_OP_ACC_READ;
+        }
+        if (tag_only) {
+            op->type = QEMU_PLUGIN_OP_INVALID;
+            op->reg_name[0] = '\0';
+            op->reg_id     = 0;
+            op->index_name[0] = '\0';
+            op->index_id   = 0;
+            op->imm = 0;
+            op->access = 0;
+            op->size = cop->size;
+            op->lane_bytes = 0;
+            op->scale = 1;
+            op->shift_type = 0;
+            op->shift_amount = 0;
+            op->segment_id = 0;
+            continue;
         }
         op->size = cop->size;
         op->lane_bytes = insn_lane_bytes;
@@ -1160,6 +1215,77 @@ static bool cap_x86_is_test(const char *mnem)
      * testl/testq.  Prefix-match — no other x86 mnemonic starts with
      * "test" (ktest/vptest begin with k/v). */
     return mnem && g_str_has_prefix(mnem, "test");
+}
+
+/*
+ * Capstone 6.0.0-Alpha7 x86 access-flag bugs: whole families whose
+ * every operand comes back access == 0.
+ *
+ * The three-operand AVX-512 mask arithmetic (KADDB/W/D/Q, KUNPCKBW/
+ * WD/DQ) and the XOP permutes (VPERMIL2PD/PS) write exactly one
+ * operand — the destination, which AT&T operand order lists LAST —
+ * and read every other register or memory operand.  No form of any
+ * of these mnemonics deviates, so the (position, access) repair is
+ * architecturally exact.  "vpermil2" is disjoint from the AVX
+ * "vpermilp*" prefix, which Capstone reports correctly.
+ */
+static bool cap_x86_is_mask_arith_dest_last(const char *mnem)
+{
+    return mnem && (g_str_has_prefix(mnem, "kadd") ||
+                    g_str_has_prefix(mnem, "kunpck") ||
+                    g_str_has_prefix(mnem, "vpermil2"));
+}
+
+/* KTESTB/W/D/Q: mask-register TEST — reads both operands, writes only
+ * EFLAGS.  Excluded from cap_x86_is_test by its prefix, and unlike
+ * TEST its Capstone detail carries an EMPTY implicit regs_write[], so
+ * the EFLAGS write needs restoring as well (see cap_x86_add_implicit
+ * at the caller). */
+static bool cap_x86_is_ktest(const char *mnem)
+{
+    return mnem && g_str_has_prefix(mnem, "ktest");
+}
+
+/* INCSSPD/INCSSPQ: the register operand supplies the shadow-stack pop
+ * count — a pure READ.  The architectural write target is SSP, which
+ * never appears in the operand array. */
+static bool cap_x86_is_ssp_read(const char *mnem)
+{
+    return mnem && g_str_has_prefix(mnem, "incssp");
+}
+
+/* FFREEP: tags st(i) empty and pops — the named register is neither
+ * read nor written as data.  (FFREE reports the same access == 0 but
+ * is untouched here until proven mis-repaired: the fields sweep that
+ * established this family only ever observed FFREEP.) */
+static bool cap_x86_is_x87_tag_only(const char *mnem)
+{
+    return mnem && strcmp(mnem, "ffreep") == 0;
+}
+
+/* Append @reg to the implicit write (@is_write) or read list of an x86
+ * decode unless it is already there — the cap_mips_add_implicit
+ * pattern, for CS_ARCH_X86. */
+static void cap_x86_add_implicit(qemu_plugin_insn_info *out, csh handle,
+                                 unsigned int reg, bool is_write)
+{
+    uint16_t *ids   = is_write ? out->regs_write_id : out->regs_read_id;
+    uint8_t  *cnt   = is_write ? &out->n_regs_write : &out->n_regs_read;
+    char (*names)[QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ] =
+        is_write ? out->regs_write : out->regs_read;
+
+    for (uint8_t i = 0; i < *cnt; i++) {
+        if (ids[i] == reg) {
+            return;
+        }
+    }
+    if (*cnt >= QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS) {
+        return;
+    }
+    cap_copy_reg_name(names[*cnt], QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                      handle, reg, CS_ARCH_X86);
+    ids[*cnt] = reg;
+    (*cnt)++;
 }
 
 /*

@@ -635,6 +635,11 @@ void decode_detail_to_generic(uint64_t pc,
         a[GEN_OP_RET]     = false;
         a[GEN_OP_SYSCALL] = false;
         a[GEN_OP_NOP]     = false;
+        /* TEST discards its result and writes only the flags register
+         * — it never writes an operand, so the fallback must not
+         * invent a destination (ktest* fabricated a k-register write
+         * through this hole). */
+        a[GEN_OP_TEST]    = false;
         return a;
     }();
 
@@ -645,8 +650,27 @@ void decode_detail_to_generic(uint64_t pc,
         }
     }
 
-    bool first_is_dst = opcode_first_is_dst[out->opcode];
-    bool seen_first_reg = false;
+    /*
+     * Fallback destination slot: the operand ORDER is the syntax's,
+     * and QEMU runs Capstone in AT&T syntax for x86, which lists the
+     * destination LAST — so the x86 fallback destination is the last
+     * register operand.  The dest-first ISAs (MIPS / RISC-V / AArch64)
+     * keep the first register operand.  Getting this wrong assigns
+     * the write to a source and drops the true destination (the
+     * kadd/kunpck/vpermil2 defect class).
+     */
+    uint8_t dst_reg_idx = UINT8_MAX;
+    if (!have_access_info && opcode_first_is_dst[out->opcode]) {
+        for (uint8_t i = 0; i < info->n_operands; i++) {
+            if (info->operands[i].type != QEMU_PLUGIN_OP_REG) {
+                continue;
+            }
+            dst_reg_idx = i;
+            if (trace_isa != TRACE_ISA_X86) {
+                break;          /* dest-first: first REG operand */
+            }                   /* AT&T: last REG operand wins */
+        }
+    }
     for (uint8_t i = 0; i < info->n_operands; i++) {
         const qemu_plugin_operand *op = &info->operands[i];
 
@@ -660,12 +684,11 @@ void decode_detail_to_generic(uint64_t pc,
                     add_dst_cap_reg(out, out_names, op->reg_id);
                 }
             } else {
-                if (first_is_dst && !seen_first_reg) {
+                if (i == dst_reg_idx) {
                     add_dst_cap_reg(out, out_names, op->reg_id);
                 } else {
                     add_src_cap_reg(out, out_names, op->reg_id);
                 }
-                seen_first_reg = true;
             }
             break;
         }

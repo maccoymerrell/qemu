@@ -89,7 +89,6 @@ static void cpu_mips_irq_request(void *opaque, int irq, int level)
                 env->plugin_ext_ip_set &= ~bit;
             }
         }
-        cs->plugin_spec_irq_dirty = true;
         return;
     }
 #endif

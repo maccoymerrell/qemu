@@ -846,11 +846,11 @@ void riscv_cpu_interrupt(CPURISCVState *env)
      * excursion (vtime_paused), not just spec_mode: the fault-skip gap
      * briefly clears spec_mode while the snapshot is live, and an
      * iothread mip update landing there would drive the line from state
-     * the walk-end restore erases.  Mark the excursion dirty so the exit
-     * resync recomputes the line from restored state.
+     * the walk-end restore erases.  The excursion-exit resync recomputes
+     * the line from restored state unconditionally, so nothing has to be
+     * recorded here for it.
      */
     if (cs->plugin_spec_mode || cs->plugin_spec_vtime_paused) {
-        cs->plugin_spec_irq_dirty = true;
         return;
     }
 #endif

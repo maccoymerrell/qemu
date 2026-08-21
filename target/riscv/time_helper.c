@@ -278,11 +278,9 @@ void riscv_cpu_plugin_resync_timers(CPUState *cs)
      * riscv_cpu_interrupt is the normal mip-update path's own line logic,
      * idempotent from current state.
      *
-     * Unconditional, like the timer reconcile below.  The previous gate
-     * (plugin_spec_irq_dirty) only fired when a line drive had actually been
-     * observed and suppressed during the excursion, which misses every
-     * desync produced by the rollback alone. */
-    cs->plugin_spec_irq_dirty = false;
+     * Unconditional, like the timer reconcile below.  Gating it on "a line
+     * drive was observed and suppressed during the excursion" misses every
+     * desync produced by the rollback alone, so there is no gate. */
     riscv_cpu_update_mip(env, 0, 0);
     if (getenv("CST_TIMER_DIAG")) {
         fprintf(stderr, "[stimer] RESYNC stimecmp=0x%llx vstimecmp=0x%llx "

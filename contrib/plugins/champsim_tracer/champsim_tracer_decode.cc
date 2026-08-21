@@ -567,8 +567,17 @@ void decode_detail_to_generic(uint64_t pc,
      * Capstone MEM operand access flags (mnemonic-agnostic: MOVS
      * 1L+1S, CMPS 2L, STOS 1S, LODS/SCAS 1L, INS 1S, OUTS 1L).  Lets
      * the body emitter fan one TB-exec's memop stream into N entries.
+     *
+     * Guarded on the mnemonic table not already naming a branch: the
+     * boundary only reports has_rep on the string family, whose rows
+     * are all BRANCH_NONE, so on correct input the guard never bites.
+     * It exists because the F2/F3 prefix byte is overloaded (BND on
+     * CALL/RET/JMP/Jcc, XACQUIRE/XRELEASE, `repz ret` padding): if a
+     * boundary regression ever reports has_rep on one of those again,
+     * the resolved CALL/RET/JUMP taxonomy must win over the REP
+     * self-loop promotion, not be overwritten by it.
      */
-    if (info->has_rep) {
+    if (info->has_rep && out->branch_type == BRANCH_NONE) {
         out->branch_type        = BRANCH_REP;
         out->branch_conditional = true;
         for (unsigned i = 0; i < info->n_operands; i++) {

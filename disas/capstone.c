@@ -662,8 +662,19 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
 
     /* x86 prefixes */
     out->has_lock = (x86->prefix[0] == X86_PREFIX_LOCK);
+    /* A group-1 F3/F2 byte carries REP/REPNE semantics only on the
+     * string and IO-string family.  On every other instruction the
+     * same byte is a different prefix that shares the encoding — BND
+     * (MPX) on near CALL/RET/JMP/Jcc, XACQUIRE/XRELEASE on locked
+     * forms, inert padding on `repz ret` — none of which iterate, so
+     * publishing them as REP turns a return into a conditional
+     * self-loop.  Gate on the family, not on Capstone's branch
+     * groups: Capstone drops the RET group entirely on the imm16
+     * return forms (`bnd retq $0x1c04` reports no group at all), so
+     * the groups cannot carry this decision. */
     out->has_rep = (x86->prefix[0] == X86_PREFIX_REP ||
-                    x86->prefix[0] == X86_PREFIX_REPNE);
+                    x86->prefix[0] == X86_PREFIX_REPNE) &&
+                   string_op;
 }
 
 /*

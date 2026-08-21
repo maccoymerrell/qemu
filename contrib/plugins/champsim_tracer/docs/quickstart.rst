@@ -806,6 +806,16 @@ for the ISA, across the tracer's four targets — ``qemu-x86_64``,
 argument there selects the feature set QEMU emulates for the workload;
 the tracer records whatever executes under it.
 
+That includes threads, without a core-model caveat on any target.
+``linux-user`` runs every guest thread on its own host thread with its
+own CPU state, so a multithreaded workload executes with real
+parallelism on every ISA — including ``qemu-mipsel``, whose
+*system-mode* entry above is single-vCPU.  Multithreaded user-mode
+capture is validated per ISA: the thread and multi-thread content
+batteries (``thread_test``, ``mt_test``, and the ``thread_chain``
+check inside every ISA's ``all`` battery) run their per-ISA guest
+implementations, mipsel included.
+
 **Pin the traced process to one vCPU.**  A trace is scoped to a single
 guest address space, and kernel-code per-thread attribution stays
 clean only while the traced process remains on one vCPU.  A

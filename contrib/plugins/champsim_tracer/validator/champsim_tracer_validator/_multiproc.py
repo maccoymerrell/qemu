@@ -15,12 +15,11 @@ The three scenarios exercised here:
   an UNMARKED peer's user code; ``policy=latch`` renders it invisible.  The
   differential is the whole point.
 * :func:`run_mips_latch` (mipsel, narrow 8-bit ASID) — two MARKED workloads
-  latch independently; the pin is anchored by physical-code-page identity,
-  not the (aliased) EntryHi.ASID value.  ``--churn`` rolls the 8-bit ASID
-  space to prove recycle-no-cross-attribution.
-* :func:`run_x86_dead_latch_kill` (x86_64) — a marked peer is ``kill -9``'d
-  mid-window with no END marker; the dead-latch detector must age it out so
-  the segment still closes cleanly (qemu exits, trace is well-formed).
+  built at the same text base share ONE latched marker vaddr (identical
+  vaddr + bytes = one window, by construction), yet each is a distinct
+  address space that maps the marker bytes, so BOTH are traced under
+  distinct asid LABELS.  The 8-bit EntryHi.ASID field aliasing is irrelevant
+  to the content gate, which never treats an ASID value as an identity.
 
 Every function returns an :class:`MPResult` (``.ok`` plus per-subcheck
 detail) and takes an :class:`MPConfig` carrying the (parameterized) build
@@ -38,6 +37,7 @@ import subprocess
 from pathlib import Path
 
 from . import generator as G
+from . import _lldet as LLDET
 from . import _system as SYS
 
 
@@ -175,7 +175,7 @@ def _stage(isa: str, stage_dir: Path, payload: list, init_text: str) -> Path:
 
 def _boot(cfg: MPConfig, isa: str, cpio: Path, out_base: Path,
           plugin_opts: str, extra_qemu: list | None = None,
-          kernel: Path | None = None) -> tuple:
+          kernel: Path | None = None, budget: int | None = None) -> tuple:
     plugin = cfg.build_dir / "contrib/plugins/libchampsim_tracer.so"
     qemu = cfg.build_dir / f"qemu-system-{isa}"
     kernel = Path(kernel) if kernel is not None else SYS.default_kernel(isa)
@@ -192,6 +192,25 @@ def _boot(cfg: MPConfig, isa: str, cpio: Path, out_base: Path,
     if extra_qemu:
         cmd += list(extra_qemu)
     console = Path(f"{out_base}.console.log")
+    if budget is not None and LLDET.enabled():
+        # A caller that states its window's instruction budget gets the
+        # calibrated deadline instead of the fixed cap below: the lldet
+        # discipline's k * (boot floor + budget / healthy insns-per-sec)
+        # for this isa/system configuration, with the condition sampler
+        # riding the same poll loop.  The fixed cap predates the
+        # discipline and sat BELOW the expected wall time of a healthy
+        # 3M-insn marker window at the calibrated x86_64/system
+        # throughput, so it killed healthy boots mid-window (rc=124, no
+        # .cst) and the cell could never reach a real verdict.
+        with open(console, "w") as f:
+            watch = LLDET.watch_for(
+                isa=isa, mode="system", smp=1, wpdepth=cfg.depth,
+                budget=budget, growth_prefix=str(out_base),
+                console_path=console,
+                label=f"multiproc boot {isa} ({out_base.name})")
+            rc, _verdict = LLDET.run_watched(cmd, watch,
+                                             stdout=f, stderr=f)
+        return rc, console, Path(f"{out_base}.cst")
     import os as _os
     import signal as _signal
     with open(console, "w") as f:
@@ -239,21 +258,17 @@ def _audit(cfg: MPConfig) -> str:
     return str(cfg.build_dir / "contrib/plugins/cst_audit")
 
 
-def _raw_identities(cfg: MPConfig, cst: Path) -> dict:
-    """asid_index -> (root_phys, sig) from the first-sighting identities."""
-    _, out = _run([_decode(cfg), "--format=raw", str(cst)])
-    idents: dict = {}
-    cur = None
-    for line in out.splitlines():
-        m = re.search(r"->asid_index=(-?\d+)", line)
-        if m:
-            cur = int(m.group(1))
-            continue
-        m = re.search(r"identity \(first sighting\): root_phys=0x([0-9a-f]+)"
-                      r"\s+sig=0x([0-9a-f]+)", line)
-        if m and cur is not None:
-            idents[cur] = (int(m.group(1), 16), int(m.group(2), 16))
-    return idents
+def _entry_asid_labels(cfg: MPConfig, cst: Path) -> set:
+    """The set of distinct asid LABEL indices that carry ENTRY records.
+
+    Under content-as-gate there is no root/sig identity to read: ``root_phys``
+    is a LABEL (a live architectural attestation) and ``sig`` is permanently
+    0, so the first-sighting pair no longer names a process.  The honest
+    multi-process witness is simply how many distinct asid labels carry body
+    entries — every address space that maps the marker bytes is traced under
+    its own label, so >=2 labels with entries is >=2 captured address spaces.
+    """
+    return {a for a, _t, _s in _legacy_entries(cfg, cst)}
 
 
 def _regfile_contexts(cfg: MPConfig, cst: Path) -> set:
@@ -341,15 +356,21 @@ def _close_line(console: Path) -> tuple:
 
 
 def _parse_console_mips(console: Path) -> dict:
+    """Marker-window narration from the plugin's stderr (mipsel latch cell).
+
+    Under content-as-gate the window is a latched marker VADDR: a second
+    address space that maps the SAME vaddr's bytes shares the one window
+    (``marker opened additional window`` fires only for a DISTINCT vaddr —
+    Q15), and a release names window counts, not narrow ASID owners.  The
+    old ``narrow owner`` / ``pinned ASID value`` lines are gone with the
+    per-root detector."""
     text = console.read_text(errors="replace")
-    add = len(re.findall(r"additional window for narrow owner", text))
-    mid = len(re.findall(r"closed narrow owner \d+ \(\d+ still tracing\)",
-                         text))
+    add = len(re.findall(r"marker opened additional window at ", text))
+    rel = len(re.findall(r"end marker . released \d+ window\(s\)", text))
     last = re.search(r"closing after (\d+) user insns \(last window\)", text)
-    reuse = "pinned ASID value" in text
-    return {"add": add, "mid": mid,
+    return {"add": add, "rel": rel,
             "last_uinsns": int(last.group(1)) if last else None,
-            "reuse_warn": reuse, "text": text}
+            "text": text}
 
 
 # ---------------------------------------------------------------------------
@@ -402,26 +423,12 @@ poweroff -f
 """
 
 
-_INIT_KILL = """#!/bin/sh
-mount -t devtmpfs none /dev 2>/dev/null
-mount -t proc  none /proc 2>/dev/null
-mount -t sysfs none /sys  2>/dev/null
-exec >/dev/console 2>&1 </dev/console
-echo "=== cst deadlatch kill-test guest: $(uname -r) ==="
-/workloadA &
-apid=$!
-/workloadB &
-bpid=$!
-echo "=== launched A=$apid B=$bpid ==="
-sleep %(kill_after)d
-kill -9 $bpid
-echo "=== killed B=$bpid (no END marker) ==="
-wait $apid; echo "=== workloadA exit=$? ==="
-i=0
-while [ $i -lt %(churn)d ]; do /bin/true; i=$((i+1)); done
-echo "=== churn done ; poweroff ==="
-poweroff -f
-"""
+# The dead-latch KILL scenario (_INIT_KILL + run_x86_dead_latch_kill) is
+# retired: per-window dead-latch closure — a dead process's window aging out
+# while ANOTHER gated window is still executing — is no longer a promise the
+# model makes.  With one global last-gated-execution idle stamp the segment
+# ends when ALL gated activity ends; the must-fire proof of THAT backstop is
+# the ``deadlatch_test`` cell (storm/quiet), not a per-peer kill.
 
 
 # ---------------------------------------------------------------------------
@@ -474,18 +481,17 @@ def run_trace_all_differential(cfg: MPConfig) -> MPResult:
         subs.append(SubCheck("trace-all boot produced a trace", False,
                              f"qemu_rc={rc} cst MISSING"))
         return _emit("x86 trace-all differential", subs)
-    idents = _raw_identities(cfg, cst)
     ents = _legacy_entries(cfg, cst)
     entry_asids = {a for a, _t, _s in ents}
-    roots = {r for (r, _s) in idents.values()}
-    sigs = {s for (_r, s) in idents.values()}
-    repr_root = idents.get(0, (None, None))[0]
-    other = {i: v for i, v in idents.items()
-             if i != 0 and v[0] != repr_root}
+    # trace-all widens capture to every address space, so the UNMARKED progB
+    # is captured under its OWN asid label (index != 0, the marker process's
+    # opening label).  The gate is stated positively here: >=2 distinct asid
+    # labels carry entries, at least one of them not progA's opening label.
+    other = {a for a in entry_asids if a != 0}
     subs.append(SubCheck(
-        "1. progB captured with own root+sig (>=2 address spaces)",
-        len(roots) >= 2 and len(other) >= 1 and len(entry_asids) >= 2,
-        f"roots={len(roots)} sigs={len(sigs)} asid_idx={sorted(idents)}"))
+        "1. progB captured under its own asid label (>=2 address spaces)",
+        len(entry_asids) >= 2 and len(other) >= 1,
+        f"asid_labels={sorted(entry_asids)}"))
     reason, uinsns = _close_line(console)
     b_entries = sum(1 for a, _t, _s in ents if a in other)
     subs.append(SubCheck(
@@ -515,17 +521,18 @@ def run_trace_all_differential(cfg: MPConfig) -> MPResult:
     rc2, console2, cst2 = _boot(cfg, isa, cpio, base_l,
                                 opts("latch").format(base=base_l))
     if cst2.exists():
-        idents2 = _raw_identities(cfg, cst2)
         ents2 = _legacy_entries(cfg, cst2)
         entry_asids2 = {a for a, _t, _s in ents2}
-        roots2 = {r for (r, _s) in idents2.values()}
         okL, asumL = _audit_clean(cfg, cst2)
         srcL = _strict_rc(cfg, cst2)
+        # policy=latch: an UNMARKED peer never maps the marker bytes, so the
+        # content gate keeps it invisible — only the marked process's own
+        # label (index 0) carries entries.  This is the model's gate stated
+        # in the negative and is the whole point of the differential.
         subs.append(SubCheck(
             "L. latch differential: unmarked progB ABSENT (one address space)",
-            len(roots2) <= 1 and entry_asids2.issubset({0})
-            and okL and srcL == 0,
-            f"roots={len(roots2)} entry_asids={sorted(entry_asids2)} "
+            entry_asids2.issubset({0}) and okL and srcL == 0,
+            f"entry_asids={sorted(entry_asids2)} "
             f"qemu_rc={rc2} strict_rc={srcL}"))
     else:
         subs.append(SubCheck("L. latch differential boot produced a trace",
@@ -567,20 +574,20 @@ def run_mips_latch(cfg: MPConfig) -> MPResult:
                      [SubCheck("boot produced a trace", False,
                                f"qemu_rc={rc} cst MISSING")])
 
-    idents = _raw_identities(cfg, cst)
     ents = _legacy_entries(cfg, cst)
     entry_asids = {a for a, _t, _s in ents}
     tp = _template_pcs(cfg, cst)
     con = _parse_console_mips(console)
     subs: list = []
 
-    roots = {r for (r, _s) in idents.values()}
-    sigs = {s for (_r, s) in idents.values()}
+    # Two MARKED processes, each its own address space mapping the marker
+    # bytes -> both traced under distinct asid LABELS.  (root_phys is a
+    # label and sig is 0, so there is no identity pair to compare; the
+    # narrow 8-bit EntryHi.ASID aliasing is irrelevant to the content gate.)
     subs.append(SubCheck(
-        "1. two owned processes, distinct (root_phys, sig)",
-        len(idents) >= 2 and len(entry_asids) >= 2 and len(roots) >= 2
-        and len(sigs) >= 2,
-        f"asid_idx={sorted(idents)} roots={len(roots)} sigs={len(sigs)}"))
+        "1. two captured address spaces (>=2 distinct asid labels)",
+        len(entry_asids) >= 2,
+        f"asid_labels={sorted(entry_asids)}"))
 
     seq = [a for a, _t, _s in ents]
     transitions = sum(1 for i in range(1, len(seq)) if seq[i] != seq[i - 1])
@@ -590,6 +597,24 @@ def run_mips_latch(cfg: MPConfig) -> MPResult:
         f"entries={len(seq)} transitions={transitions} "
         f"asids={sorted(entry_asids)}"))
 
+    # SHARED WINDOW => SHARED TEMPLATES.
+    #
+    # The template cache is keyed by (WINDOW, vaddr) -- the window ordinal
+    # is the only stable identity the reduced model has; the asid on the
+    # wire is a LABEL, never an identity.  Both processes here are built at
+    # the same -Ttext, so both map the marker bytes at the same virtual
+    # address, so by Q15 they are ONE window (subcheck 4 asserts exactly
+    # that: no additional window opened).  One window plus (window, vaddr)
+    # keying means a virtual address executed under BOTH asid labels
+    # resolves to the SAME template under both -- there is nothing left for
+    # a per-asid split to come from, and a split would mean the key had
+    # picked up an address-space identity it is not supposed to have.
+    #
+    # This is the exact inverse of what the root-keyed cache produced, and
+    # it is asserted as such: no shared VA may be disambiguated per asid.
+    # Per-PROCESS state has not gone anywhere -- subcheck 5 asserts the
+    # per-(process, thread) register contexts, which is where a process's
+    # own state lives now.
     asid_pc_tmpl: dict = {}
     for a, t, _s in ents:
         pc = tp.get(t)
@@ -600,21 +625,32 @@ def run_mips_latch(cfg: MPConfig) -> MPResult:
     for (a, pc), tmpls in asid_pc_tmpl.items():
         pc_to_asids.setdefault(pc, {})[a] = tmpls
     shared = {pc: d for pc, d in pc_to_asids.items() if len(d) >= 2}
-    disambiguated = 0
-    for pc, d in shared.items():
+    split_pcs: list = []
+    for pc, d in sorted(shared.items()):
         per_asid = list(d.values())
-        if set().union(*per_asid) and all(
-                per_asid[0].isdisjoint(o) for o in per_asid[1:]):
-            disambiguated += 1
+        # A re-translation (tb flush, SMC) can mint a fresh template id for
+        # the same vaddr mid-run, so the sets are not required to be equal;
+        # what the keying forbids is the labels having NO template in
+        # common at a vaddr they both executed.
+        if not set.intersection(*per_asid):
+            split_pcs.append(pc)
     subs.append(SubCheck(
-        "3. same-VA disambiguation (shared VA -> own templates per asid)",
-        len(shared) >= 1 and disambiguated >= 1,
-        f"shared_VAs={len(shared)} disambiguated={disambiguated}"))
+        "3. shared window -> shared templates ((window, vaddr) keying: "
+        "no per-asid split)",
+        len(shared) >= 1 and not split_pcs,
+        f"shared_VAs={len(shared)} split_per_asid={len(split_pcs)}"
+        + (f" e.g. {[hex(p) for p in split_pcs[:3]]}" if split_pcs else "")))
 
+    # Same text base -> identical marker vaddr -> ONE shared window is the
+    # asserted outcome (Q15): no "additional window" opens for a second
+    # address space that maps the SAME vaddr's bytes, and the segment
+    # closes at the last window.  Both processes are still captured
+    # (subcheck 1); the window count is one, by construction.
     subs.append(SubCheck(
-        "4. both windows open + middle-close + last-close",
-        con["add"] >= 1 and con["mid"] >= 1 and con["last_uinsns"] is not None,
-        f"add={con['add']} mid={con['mid']} last={con['last_uinsns']}"))
+        "4. one shared window (same vaddr) + last-window close",
+        con["add"] == 0 and con["last_uinsns"] is not None,
+        f"additional_windows={con['add']} releases={con['rel']} "
+        f"last={con['last_uinsns']}"))
 
     rctx = _regfile_contexts(cfg, cst)
     rf_asids = {a for a, _t in rctx}
@@ -636,195 +672,7 @@ def run_mips_latch(cfg: MPConfig) -> MPResult:
         and 0 < con["last_uinsns"] < cfg.budget,
         f"user_insns={con['last_uinsns']} budget={cfg.budget}"))
 
-    if cfg.churn > 0:
-        subs.append(SubCheck(
-            "RECYCLE: ASID churn provoked, owned procs stay attributed",
-            entry_asids.issubset(set(idents.keys()))
-            and len(roots) == len(idents) and ok6 and src == 0,
-            f"reuse_warn={con['reuse_warn']} entry_asids={sorted(entry_asids)} "
-            f"owned={sorted(idents)}"))
-
     res = _emit("mipsel narrow-ASID latch", subs)
-    res.artifacts = {"cst": str(cst)}
-    return res
-
-
-# ---------------------------------------------------------------------------
-# scenario 3: x86 dead-latch kill (peer killed mid-window, no END)
-# ---------------------------------------------------------------------------
-
-def run_x86_dead_latch_kill(cfg: MPConfig, latch_timeout: int = 750,
-                            kill_after: int = 2, churn: int = 60) -> MPResult:
-    """Kill progB mid-window (no END marker) and prove the dead-latch
-    detector -- not some other backstop -- is what closes its window.
-
-    ``latch_timeout`` (ms) is deliberately small, not the ~3s a human
-    would reach for.  ``deadlatch_now_ms()`` is unavoidably
-    ``CLOCK_MONOTONIC`` (real host wall time is the only clock that
-    keeps advancing once every owned process has died -- see the
-    comment on ``g_latch_timeout_ms`` in champsim_tracer.cc), so the
-    detector's firing genuinely is wall-clock driven and cannot be
-    made to run on guest virtual time.  What made the OLD 3000ms
-    default flaky was pitting that wall clock against an unrelated,
-    comparably-sized budget: whether progA's own run plus the
-    post-kill churn loop took more or less than ~3s of REAL time was a
-    coin flip under host contention, and a fast/quiet host could reach
-    "last window closes" before the timeout ever elapsed.
-
-    750ms was picked empirically, not guessed: an earlier attempt at
-    25ms (a couple of TCG-instrumented instructions' worth of wall
-    time, in theory "thousands of instructions of headroom") measured
-    idle=97ms and FALSELY aged out a still-alive process seconds into
-    boot -- ordinary two-and-three-way scheduling contention between
-    progA, progB and the init shell routinely opens gaps close to a
-    guest kernel's scheduling quantum, which is real, guest-scheduler-
-    driven wall-clock jitter, not death.  750ms clears that jitter
-    with headroom (observed idle=1393ms for the genuinely-killed peer
-    in the same scenario) while staying far below what progA's own
-    run + the churn loop reliably takes.  It cannot falsely age out a
-    LIVE root either way -- deadlatch_clock_check() refreshes the
-    running root's own timestamp on every throttled call, so only a
-    root that is never scheduled again (the actually-dead one) can go
-    stale.
-
-    Subcheck 1 deliberately does NOT depend on the guest's own "killed
-    B" echo reaching the console: qemu exits the instant the trace's
-    last window closes (deadlatch_close_segment's "caller should
-    exit(0)"), and that abrupt teardown can beat the guest's
-    still-buffered serial-console bytes to being drained -- losing
-    output the guest already produced, not evidence it never ran.
-    "marker opened additional window for asid ... (2 owned)" is the
-    plugin's OWN host-stderr line (unbuffered, never routed through
-    the guest UART) and is what proves B was genuinely alive and under
-    active tracing before it died.  Subcheck 2 then pins WHICH root the
-    detector took, without encoding which peer marked first: the dead
-    latch must close exactly one of the two owned roots AND the
-    remaining window must close on its own END marker.  Only progA can
-    produce that END (progB is killed mid-sleep and never reaches its
-    own), so the pair of mechanisms identifies the roots even though the
-    marking order is the guest scheduler's choice."""
-    isa = "x86_64"
-    skip = _preconditions(cfg, isa)
-    if skip:
-        return MPResult(ok=True, subchecks=[], artifacts={}, skipped=True,
-                        skip_reason=skip)
-    od = cfg.out_dir
-    od.mkdir(parents=True, exist_ok=True)
-    # progA: modest hold then a long-enough active phase to keep driving
-    # deadlatch_clock_check() well past progB's (tiny) timeout; progB:
-    # marks + sleeps long, is killed mid-sleep (never runs its END).
-    bin_a = _gen_build(isa, "progA", cfg.seed_a, 6, 800, 1, True, od / "A")
-    bin_b = _gen_build(isa, "progB", cfg.seed_b, 8, 800, 12, True, od / "B")
-    init = _INIT_KILL % {"kill_after": kill_after, "churn": churn}
-    cpio = _stage(isa, od / "stage", [("workloadA", bin_a),
-                                      ("workloadB", bin_b)], init)
-    out_base = od / "kill"
-    plugin_opts = (f"outfile={out_base},wpdepth={cfg.depth},"
-                   f"trace_window=marker:policy=latch+simulation={cfg.budget},"
-                   f"memdata=1,latch_timeout={latch_timeout}")
-    rc, console, cst = _boot(cfg, isa, cpio, out_base, plugin_opts)
-    ctext = console.read_text(errors="replace") if console.exists() else ""
-    subs: list = []
-    if rc == 124:
-        # At this threshold the boot cap means the guest never reached the
-        # kill/churn phase at all (e.g. a wedged kernel boot) -- a real
-        # failure, not aging-lost-the-race.  Gating: report it as such.
-        subs.append(SubCheck(
-            "dead-latch closed the segment within the boot cap", False,
-            f"boot exceeded {cfg.boot_timeout_s}s cap; the guest never "
-            f"reached poweroff -- not a timing race at this threshold"))
-        return _emit("x86 dead-latch kill", subs)
-
-    # Subcheck 1 deliberately does NOT grep for the guest's own "killed B"
-    # echo: qemu exits the instant the trace's last window closes (see
-    # deadlatch_close_segment's "caller should exit(0)"), which can beat
-    # the abrupt process teardown to draining the guest's still-buffered
-    # serial-console bytes -- losing output the guest already executed,
-    # not a sign it never ran.  "marker opened additional window for asid
-    # ... (2 owned)" is the plugin's OWN host-stderr line (unbuffered, not
-    # routed through the guest UART at all) confirming B was genuinely
-    # alive and under active tracing before it died -- a reliable proxy
-    # for the same fact the echo was meant to show.
-    open_re = re.compile(
-        r"marker opened additional window for asid (0x[0-9a-fA-F]+) "
-        r"\((\d+) owned\)")
-    open_m = open_re.search(ctext)
-    subs.append(SubCheck(
-        "1. peer B was alive and under active tracing before it died",
-        bool(open_m) and open_m.group(2) == "2",
-        f"opened: {open_m.group(0)}" if open_m
-        else "no second owned window ever opened"))
-
-    # Subcheck 2 is ORDER-INDEPENDENT, and that is load-bearing.
-    #
-    # Which of the two peers reaches its START marker first is the guest
-    # scheduler's choice, not an invariant of anything.  Asserting that the
-    # SECOND opener -- the one named by "opened additional window" -- is the
-    # one the dead-latch closes therefore encodes a scheduling order, and
-    # fails on a correct capture whenever B happens to mark first: the line
-    # then names A, the detector still ages out B exactly as it should, and
-    # the comparison reports a mismatch of two adjacent CR3 values.
-    #
-    # "Exactly one of the two closed" is NOT enough on its own, and settling
-    # for it would retire the claim this check exists to make.  It is
-    # satisfied just as happily by the INVERSION -- the detector aging out
-    # the live survivor and leaving the dead peer's window open -- which is
-    # the worst outcome this scenario can produce, not an acceptable one.
-    #
-    # The identity is recoverable without encoding a scheduling order,
-    # because the two windows close by DIFFERENT MECHANISMS and only one
-    # assignment of those mechanisms is physically possible:
-    #
-    #   progB is killed mid-sleep and never executes its END marker, so its
-    #   window can ONLY be closed by the dead latch;
-    #   progA runs to completion, so its window is closed by its own END
-    #   marker ("end marker -- closing ... (last window)").
-    #
-    # A killed process cannot execute an END marker.  So if the detector had
-    # inverted the two -- aged out progA and left progB open -- no END marker
-    # could ever arrive for the remaining window and the segment could not
-    # close this way.  Requiring dead-latch-closes-one AND end-marker-closes-
-    # the-last therefore pins WHICH root the detector took, while staying
-    # true whichever peer reached its marker first.
-    fired_re = re.compile(r"marker fired at icount \d+, asid "
-                          r"(0x[0-9a-fA-F]+)")
-    fired_m = fired_re.search(ctext)
-    owned = {m.group(1) for m in (fired_m, open_m) if m}
-    dl_lines = [ln for ln in ctext.splitlines() if "dead-latch close" in ln]
-    dl_re = re.compile(r"dead-latch close asid=(0x[0-9a-fA-F]+)")
-    dl_asids = {m.group(1) for ln in dl_lines
-               for m in [dl_re.search(ln)] if m}
-    survivors = owned - dl_asids
-    # The survivor's own END marker closing the LAST window is what proves
-    # the dead latch took the dead peer and not the live one.
-    end_closed = bool(re.search(r"end marker — closing after \d+ user insns "
-                                r"\(last window\)", ctext)
-                      or re.search(r"end marker -- closing after \d+ user "
-                                   r"insns \(last window\)", ctext))
-    ok2 = (rc == 0 and cst.exists() and len(owned) == 2
-           and len(dl_asids) == 1 and dl_asids <= owned
-           and len(survivors) == 1 and end_closed)
-    subs.append(SubCheck(
-        "2. the dead-latch detector closed the DEAD peer's window and the "
-        "survivor closed its own with an END marker (causal identity, "
-        "independent of which peer reached its marker first)",
-        ok2,
-        f"qemu_rc={rc} cst={'exists' if cst.exists() else 'MISSING'} "
-        f"owned_asids={sorted(owned)} dead_latch_asids={sorted(dl_asids)} "
-        f"survivor={sorted(survivors)} survivor_closed_by_end={end_closed}"))
-
-    if cst.exists():
-        idents = _raw_identities(cfg, cst)
-        ok_audit, asum = _audit_clean(cfg, cst)
-        src = _strict_rc(cfg, cst)
-        subs.append(SubCheck(
-            "3. both processes attributed (killed peer traced up to its "
-            "death, survivor traced throughout); trace well-formed",
-            len(idents) == 2 and ok_audit and src == 0,
-            f"asid_idx={sorted(idents)} strict_rc={src} audit[{asum}]"))
-    else:
-        subs.append(SubCheck("3. trace well-formed", False, "no trace"))
-    res = _emit("x86 dead-latch kill", subs)
     res.artifacts = {"cst": str(cst)}
     return res
 

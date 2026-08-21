@@ -45,6 +45,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from . import _multiproc as MP
+from . import _r4 as R4
 from . import _marker as MK
 from . import _must0
 
@@ -66,14 +67,12 @@ FEATURES: dict[str, str] = {
     "opt:regdata":               "dst-register value capture (regdata=1)",
     "opt:wp_memdata":            "WP-side mem-data tristate override",
     "opt:wp_regdata":            "WP-side reg-data tristate override",
-    "opt:kexc":                  "kernel-excursion ownership model (kexc=0|1)",
     "opt:faults":                "synchronous-fault handler tracing (faults=0|1)",
     "opt:interrupts":            "asynchronous-interrupt handler tracing (interrupts=0|1)",
     "opt:devio":                 "disk-I/O bracketing records (devio=1)",
     "opt:physaddr":              "per-memop physical-page capture (physaddr=1)",
     "opt:histogram":             "per-segment histogram intervals (histogram=N)",
     "opt:iframe_rate":           "IFRAME resync interval (iframe_rate=N)",
-    "opt:latch_timeout":         "marker dead-latch wall-clock timeout",
     "opt:program_comment":       "program=/comment= header strings",
     "opt:window_icount":         "trace_window=icount:start;stop",
     "opt:window_simpoint":       "trace_window=simpoint:file;interval;...",
@@ -81,18 +80,23 @@ FEATURES: dict[str, str] = {
     "opt:window_marker":         "trace_window=marker:simulation",
     "opt:window_marker_latch":   "trace_window=marker:policy=latch",
     "opt:window_marker_traceall": "trace_window=marker:policy=trace-all",
-    "opt:window_system_marker_only": "system mode accepts ONLY "
-                                  "trace_window=marker — icount, symbol, "
-                                  "simpoint and the default window are "
-                                  "refused at plugin install, because a "
-                                  "position on a clock cannot say whose "
-                                  "instructions it is counting",
+    "opt:window_marker_simpoints": "simpoints COMPOSED onto the marker "
+                                  "window (trace_window=marker:...+"
+                                  "simpoints=<file>+interval=<n>) — the "
+                                  "marker says whose clock, the offsets say "
+                                  "which intervals of it",
+    "opt:window_system_marker_only": "system mode needs a MARKER ANCHOR — "
+                                  "icount, symbol, bare simpoint and the "
+                                  "default window are refused at plugin "
+                                  "install, because a position on a clock "
+                                  "cannot say whose instructions it is "
+                                  "counting",
     # ---- wire: body tags -------------------------------------------------
     "wire:BODY_TAG_ENTRY":       "correct-path BB invocation record",
     "wire:BODY_TAG_REGFILE":     "per-(segment,thread) register-file snapshot",
     "wire:BODY_TAG_THREAD_SWITCH": "thread-id context rebase",
     "wire:BODY_TAG_IFRAME":      "absolute-snapshot ENTRY resync",
-    "wire:BODY_TAG_ASID_SWITCH": "ASID/address-space rebase + identity",
+    "wire:BODY_TAG_ASID_SWITCH": "ASID/address-space rebase (asid is a LABEL)",
     "wire:BODY_TAG_DEVIO_START": "disk-I/O request start",
     "wire:BODY_TAG_DEVIO_STOP":  "disk-I/O request completion",
     # ---- wire: header feature flags -------------------------------------
@@ -137,20 +141,18 @@ FEATURES: dict[str, str] = {
     "behavior:wp_fault_to_budget": "WP execution-time fault continues to budget",
     "behavior:wp_tlb_cold_capture": "WP fetch of a valid-PTE but TLB-cold code page captures real bytes (system mode)",
     "behavior:syscall_fault_nesting": "system-mode syscall/fault nesting discipline",
-    "behavior:user_code_identity": "ASID-pin: user templates byte-match binary",
+    "behavior:user_code_identity": "content gate: every captured user template byte-matches the marked image",
     "behavior:marker_injection": "cst_attach ptrace-injects the marker into an unmarked target's entry point",
-    "behavior:marker_detection_exact": "a COMPLETE marker sequence is never missed: the whole-sequence byte match made at translation time fires exactly once, on the sequence's last instruction, and still fires when that instruction is a branch target — the translation block then starts mid-sequence and the preceding instruction slots have to be read out of guest memory rather than out of the block",
+    "behavior:marker_detection_exact": "a COMPLETE marker sequence is never missed: the base translator never splits a magic sequence across TBs, so the whole-sequence byte match made at translation time sees all of it in one delivered block and fires there — translation reach IS detection, with no execution callback behind it; a branch landing mid-sequence reaches fewer than the full sequence's instructions and is deliberately NOT a marker",
     "behavior:marker_no_false_claim": "an INCOMPLETE marker sequence is never claimed: CST_MARKER_SEQ_LEN-1 adjacent units, a lone START unit, a lone END unit, and the chimera (the START sequence's leading units followed by the END sequence's last unit — the two share their terminating instruction on the fixed-width ISAs) all open no window and write no segment",
     "behavior:guest_thread_identity": "thread_id is guest thread, not vCPU",
     "behavior:multithread_content": "each guest thread's stream is compared 1v1 against ITS OWN generated ground truth — order, blocks, per-block instruction identity, memop kind/value/attribution, register values and wrong-path chains — with no golden in the loop; interleaving between threads is scheduling and is deliberately not asserted",
     "behavior:per_thread_stream_purity": "one generated body maps to exactly one tid and no thread's entry appears in another thread's stream; every entry carrying generated code is accounted for by exactly one thread (bijection + purity + census)",
     "behavior:thread_strand_sequential": "every (thread_id, asid) context reads as one sequential strand: concurrent guest threads never share an id, so a kernel strand is never braided with another vCPU's",
-    "behavior:asid_recycle":     "narrow-ASID recycle-no-cross-attribution",
     "behavior:spec_clock_resync": "wrong-path excursions are time-transparent: every guest clock, host timer and interrupt line is resynchronised to the frozen virtual time on exit, so the guest keeps taking interrupts and making user-space progress (4-ISA, system mode)",
     "behavior:aclint_clockevent": "a riscv guest whose clockevent is the ACLINT machine timer reached through SBI (Sstc off), the second of riscv's two supervisor-timer paths and the one the default -cpu max never takes",
     "behavior:guest_idle_boundary": "the guest kernel reaches its idle instruction inside an open trace window, so the boundary at which it commits to sleeping on an already-armed timer is crossed under tracing",
     "behavior:whole_system_capture": "trace-all captures an unmarked peer",
-    "behavior:dead_latch":       "dead-latch ages a killed peer's window out",
     "behavior:cross_segment_consistency": "per-simpoint template shape consistency",
     "behavior:tb_flush_reclaim": "template reclamation across a mid-trace tb_flush",
     "behavior:addr_is_data":     "aarch64 tagged-pointer data-is-address heuristic",
@@ -554,13 +556,16 @@ def _chk_system_user(ctx: Ctx) -> Outcome:
 def _chk_system_simpoint(ctx: Ctx) -> Outcome:
     """SYSTEM-mode marker+simpoint composition, judged FROM THE TRACE.
 
-    A system-mode ``trace_window=simpoint`` is not an alternative to a marker
-    window -- it IS one, with a SimPoint schedule inside it.  The START
-    marker pins the address space and zeroes the user clock
-    (``pinned_simpoint_mode`` turns marker scanning on for exactly this
-    reason), and the SimPoint offsets then position the capture on that
-    clock.  Kernel work is traced but never advances the clock, which is what
-    makes offsets derived from a user-mode bbv run valid here.
+    A marker anchor and a SimPoint schedule are two separate inputs, and
+    neither implies the other.  The capture is written as the explicit
+    composition -- ``trace_window=marker:...+simpoints=<file>+interval=<n>``
+    -- because a bare ``trace_window=simpoint`` names positions on a clock
+    without saying whose clock it is, and system mode refuses it
+    (``features.system_window_modes`` proves that refusal).  The START
+    marker pins the address space and zeroes the user clock, and the
+    SimPoint offsets then position the capture on that clock.  Kernel work
+    is traced but never advances the clock, which is what makes offsets
+    derived from a user-mode bbv run valid here.
 
     THIS CHECK EXISTS BECAUSE DELETING THAT COMPOSITION ENTIRELY LEFT
     ``validator full`` GREEN.  ``features.simpoint`` is user-mode and
@@ -759,12 +764,14 @@ def _chk_clock_progress(isa: str):
     loop).
 
     Run with the full system-mode option set -- devio, interrupts, faults,
-    kexc, physaddr -- rather than the trace-shape defaults.  Those are the
+    physaddr -- rather than the trace-shape defaults.  Those are the
     options a real system-mode capture uses, and they are the ones that put
     the wrong path in contact with the machine's clocks: devio sandboxes
-    speculative device access, and interrupts/kexc keep the excursion
-    machinery interleaved with interrupt entry.  A gate for a clock bug has
-    to run the configuration in which the clocks are actually touched."""
+    speculative device access, and interrupts keep the excursion machinery
+    interleaved with interrupt entry.  A gate for a clock bug has to run the
+    configuration in which the clocks are actually touched.  (Kernel-excursion
+    tracing is unconditional now — the kexc= switch retired with the
+    root-ownership model, so it is no longer part of the option set.)"""
     def fn(ctx: Ctx) -> Outcome:
         d = ctx.dir(f"system_clock_{isa}")
         rc, tail = _run_cli(
@@ -775,7 +782,7 @@ def _chk_clock_progress(isa: str):
              "--churn-during", "220"],
             timeout=1200, log_path=d / "run.log",
             extra_env={"CST_PLUGIN_EXTRA_ARGS":
-                       "physaddr=1,devio=1,interrupts=1,faults=1,kexc=1"})
+                       "physaddr=1,devio=1,interrupts=1,faults=1"})
         return _cli_outcome(rc, tail, 1200)
     return fn
 
@@ -1011,16 +1018,23 @@ def _chk_trace_all(ctx: Ctx) -> Outcome:
 
 def _chk_mips_latch(ctx: Ctx) -> Outcome:
     cfg = MP.MPConfig(build_dir=ctx.build_dir,
-                      out_dir=ctx.dir("mp_mips_latch"), budget=4_000_000,
-                      churn=40)
+                      out_dir=ctx.dir("mp_mips_latch"), budget=4_000_000)
     return _mp_outcome(MP.run_mips_latch(cfg))
 
 
-def _chk_dead_latch(ctx: Ctx) -> Outcome:
-    cfg = MP.MPConfig(build_dir=ctx.build_dir,
-                      out_dir=ctx.dir("mp_dead_latch"), budget=4_000_000,
-                      boot_timeout_s=120)
-    return _mp_outcome(MP.run_x86_dead_latch_kill(cfg))
+def _chk_r4_fork(ctx: Ctx) -> Outcome:
+    cfg = MP.MPConfig(build_dir=ctx.build_dir, out_dir=ctx.dir("r4_fork"))
+    return _mp_outcome(R4.run_fork_child(cfg))
+
+
+def _chk_r4_concurrent(ctx: Ctx) -> Outcome:
+    cfg = MP.MPConfig(build_dir=ctx.build_dir, out_dir=ctx.dir("r4_concurrent"))
+    return _mp_outcome(R4.run_concurrent_instances(cfg))
+
+
+def _chk_r4_execve(ctx: Ctx) -> Outcome:
+    cfg = MP.MPConfig(build_dir=ctx.build_dir, out_dir=ctx.dir("r4_execve"))
+    return _mp_outcome(R4.run_execve_boundary(cfg))
 
 
 # ===========================================================================
@@ -2358,32 +2372,35 @@ def build_checks() -> list:
     # leaked-prefix trim).  Restored to a hard gate.
     C.append(Check("system.user_x86", "system",
                    "system-mode marker/pin full-oracle battery (x86)",
-                   ["opt:window_marker", "opt:kexc",
+                   ["opt:window_marker",
                     "wire:BODY_TAG_ASID_SWITCH",
                     "behavior:syscall_fault_nesting",
                     "behavior:user_code_identity"], _chk_system_user))
     C.append(Check("system.simpoint_x86", "system",
-                   "system-mode marker+simpoint composition (x86)",
-                   ["opt:window_simpoint", "opt:window_marker"],
+                   "system-mode marker+simpoint composition (x86): simpoint "
+                   "offsets written ONTO the marker window",
+                   ["opt:window_marker", "opt:window_marker_simpoints"],
                    _chk_system_simpoint))
     C.append(Check("system.churn_x86", "system",
                    "multi-process ASID-churn pin (x86)",
                    ["tool:cst_decode_strict", "tool:cst_audit",
                     # churn_test's validate_structural(marker=True,
                     # pinned_binary=...) genuinely exercises the marker
-                    # window, kexc excursion ownership, ASID_SWITCH wire
-                    # records, syscall/fault nesting, and the pin's
-                    # user-code identity gate — and passes as a HARD gate,
-                    # so these features stay runtime-covered even while
-                    # the full-oracle system.user_x86 battery is XFAIL.
-                    "opt:window_marker", "opt:kexc",
+                    # window, kernel excursions, ASID_SWITCH wire records,
+                    # syscall/fault nesting, and the content gate — and
+                    # passes as a HARD gate, so these features stay
+                    # runtime-covered even while the full-oracle
+                    # system.user_x86 battery is XFAIL.
+                    "opt:window_marker",
                     "wire:BODY_TAG_ASID_SWITCH",
                     "behavior:syscall_fault_nesting",
                     "behavior:user_code_identity"],
                    _chk_churn("x86_64")))
     C.append(Check("system.churn_mipsel", "system",
-                   "multi-process ASID-churn pin, narrow ASID (mipsel)",
-                   ["behavior:asid_recycle"], _chk_churn("mipsel")))
+                   "multi-process ASID-churn content gate, narrow ASID "
+                   "(mipsel)",
+                   ["behavior:user_code_identity",
+                    "wire:BODY_TAG_ASID_SWITCH"], _chk_churn("mipsel")))
     C.append(Check("system.attach_mipsel", "system",
                    "ptrace-injected marker opens the window for a workload "
                    "with no compiled-in marker (mipsel)",
@@ -2445,16 +2462,33 @@ def build_checks() -> list:
                        "Non-gating to avoid false REDs; the latch-differential "
                        "half is a hard assertion and always runs.")))
     C.append(Check("multiproc.latch_mips", "multiproc",
-                   "narrow-ASID two-process latch + recycle (mipsel)",
-                   ["behavior:asid_recycle"], _chk_mips_latch))
-    C.append(Check("multiproc.dead_latch_x86", "multiproc",
-                   "dead-latch ages a killed peer's window out (x86), "
-                   "proven causally via the detector's own log line, "
-                   "at a threshold (latch_timeout=750ms) picked to clear "
-                   "guest scheduling jitter without racing progA's runtime",
-                   ["opt:latch_timeout", "behavior:dead_latch"],
-                   _chk_dead_latch))
-
+                   "narrow-ASID two-process shared-window latch (mipsel)",
+                   ["wire:BODY_TAG_ASID_SWITCH",
+                    "behavior:user_code_identity"], _chk_mips_latch))
+    _R4_TIMING = (
+        "content-gate scope cell: the child/peer must be scheduled by the "
+        "guest INSIDE the open window to be captured, which the host cannot "
+        "guarantee under concurrent load — a miss is a scheduling artefact, "
+        "not a wire fault.  Non-gating to avoid false REDs; the byte-identity "
+        "and content-gate assertions are exact when the cell runs.")
+    C.append(Check("multiproc.r4_fork_x86", "multiproc",
+                   "fork child inherits the content gate by mapping the "
+                   "marker bytes, without re-marking (x86)",
+                   ["opt:window_marker", "wire:BODY_TAG_ASID_SWITCH",
+                    "behavior:user_code_identity"],
+                   _chk_r4_fork, known_issue=_R4_TIMING))
+    C.append(Check("multiproc.r4_concurrent_x86", "multiproc",
+                   "two concurrent instances of one marked binary are both "
+                   "traced under distinct labels, one shared window (x86)",
+                   ["opt:window_marker", "wire:BODY_TAG_ASID_SWITCH",
+                    "behavior:user_code_identity",
+                    "behavior:whole_system_capture"],
+                   _chk_r4_concurrent, known_issue=_R4_TIMING))
+    C.append(Check("multiproc.r4_execve_x86", "multiproc",
+                   "an execve'd child falls OUT of the content gate: its "
+                   "unmarked image is never captured (x86)",
+                   ["opt:window_marker", "behavior:user_code_identity"],
+                   _chk_r4_execve, known_issue=_R4_TIMING))
     # The marker's one invariant, in both of its directions.  Neither is
     # visible in the wire: a MISS produces no trace at all, and a FALSE CLAIM
     # produces a perfectly well-formed trace of the wrong process.  x86_64 and
@@ -2470,10 +2504,12 @@ def build_checks() -> list:
                     "opt:window_marker", "opt:window_marker_latch"],
                    MK.chk_marker_detection))
     C.append(Check("features.system_window_modes", "features",
-                   "system mode accepts only trace_window=marker; icount / "
-                   "symbol / simpoint / the default are refused at plugin "
-                   "install (both directions proven)",
-                   ["opt:window_system_marker_only"],
+                   "system mode needs a marker anchor: icount / symbol / "
+                   "bare simpoint / the default are refused at plugin "
+                   "install, the marker window and simpoints composed onto "
+                   "it install (both directions proven)",
+                   ["opt:window_system_marker_only",
+                    "opt:window_marker_simpoints"],
                    MK.chk_system_window_modes))
     C.append(Check("features.simpoint", "features",
                    "per-simpoint segment independence + consistency",

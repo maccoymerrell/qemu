@@ -3,15 +3,21 @@
 
 The trace marker (``champsim_marker.h``) is CST_MARKER_SEQ_LEN identical
 immediate-loads in a row, and it is decided in the BYTES at translation
-time: for every instruction whose encoding equals the LAST instruction of a
-marker sequence, the translator compares the instruction slots immediately
-before it against the rest of that sequence, and only a whole-sequence match
-arms the execution callback.  One instruction, one callback, one event.
+time: base QEMU's translator never ends a translation block inside a
+magic-sequence prefix, so the whole sequence always arrives in one block,
+and the plugin fires from a single ``memcmp`` of that block's delivered
+bytes against the START/END patterns — no execution callback, no fence.
+One block, one match, one event, at TRANSLATION (reach), not execution.
 
 That design has exactly one invariant, and it has two directions:
 
     A COMPLETE MARKER SEQUENCE IS NEVER MISSED,
     AND AN INCOMPLETE ONE IS NEVER CLAIMED.
+
+A corollary the model makes explicit: a jump that lands MID-sequence makes
+the block start mid-sequence, so fewer than CST_MARKER_SEQ_LEN magic
+instructions appear together and the whole-block match cannot form — such a
+control flow is NOT a marker and must open no window (cell ``missable``).
 
 Both directions are load-bearing and neither is visible in the wire.  A miss
 produces no trace at all — a run that looks like a workload that simply never
@@ -26,17 +32,20 @@ Three checks live here:
 ``features.marker_detection``
     Runs three purpose-built workloads per ISA (x86_64 and aarch64) under
     ``trace_window=marker``: a plain positive, an all-decoys negative, and a
-    positive whose marker sequences are entered mid-sequence through a
-    branch.  The negative is the "never claimed" direction; the branch-target
-    positive is the "never missed" direction in its hardest form.
+    workload whose marker sequences are entered mid-sequence through a
+    branch.  The negative and the mid-sequence workload are both "never
+    claimed" directions — the mid-sequence branch makes the block start
+    inside the sequence, so under whole-block matching fewer than
+    CST_MARKER_SEQ_LEN magic instructions appear together and NO window may
+    open; the plain positive is the "never missed" direction.
 
     aarch64 is not decoration.  On the fixed-width targets the START and END
     sequences are built from a two-instruction load pair whose second
     instruction — the high-half ``movk`` — is IDENTICAL between the two
     magics, so the terminating instruction of a START sequence and of an END
-    sequence are the same 4 bytes.  A detector that decided from one word
-    could not tell them apart, and could be walked into claiming a marker
-    from a mixture of the two.  The chimera decoy is that exact shape.
+    sequence are the same 4 bytes.  Whole-block matching is what tells them
+    apart — a decoy that presents a genuine marker tail is rejected only by
+    comparing the whole sequence.  The chimera decoy is that exact shape.
 
 ``features.system_window_modes``
     In system mode the only window that names a process is the marker, so
@@ -214,9 +223,15 @@ def _epilogue() -> list:
 
 
 def wl_positive(isa: str) -> list:
-    """(A) complete START, work, complete END, more work, exit."""
+    """(A) complete START, work, complete END, more work, exit.
+
+    The START marker is emitted through :func:`emit_trace_marker_locked`, so
+    the workload ``mlock``\\ s its marker page before running it — the model's
+    residency requirement.  (User-mode detection needs no content re-read, so
+    the lock is belt-and-suspenders here, but the same generated shape drives
+    system-mode runs where it is load-bearing.)"""
     return (_prologue()
-            + B.emit_trace_marker(isa)
+            + B.emit_trace_marker_locked(isa)
             + _work(isa, 2000, "a1")
             + B.emit_trace_marker_end(isa)
             + _work(isa, 500, "a2")
@@ -236,8 +251,8 @@ def wl_negative(isa: str) -> list:
       * the CHIMERA — the first CST_MARKER_SEQ_LEN-1 units of the START
         sequence immediately followed by the LAST unit of the END sequence.
         On the fixed-width ISAs the two sequences' terminating instruction is
-        the same bytes, so this shape presents a genuine marker tail to the
-        cheap filter and can only be rejected by comparing whole sequences.
+        the same bytes, so this shape presents a genuine marker tail and can
+        only be rejected by matching the WHOLE block against the pattern.
     """
     start_u = _seq_units(B.emit_trace_marker(isa))
     end_u = _seq_units(B.emit_trace_marker_end(isa))
@@ -260,14 +275,18 @@ def wl_negative(isa: str) -> list:
 
 
 def wl_missable(isa: str) -> list:
-    """(C) the same markers as (A), placed so they are hard to see.
+    """(C) the markers of (A), entered MID-sequence through a branch — which
+    under whole-block matching is NOT a marker and must open no window.
 
     An unconditional jump lands on the sequence's LAST instruction, so the
-    translation block starts mid-sequence: the detector cannot read the
-    preceding instruction slots out of the block it is translating and has to
-    read them out of guest memory.  The sequence is contiguous in memory
-    exactly as in (A) — only the control flow into it differs — so the
-    required outcome is identical to (A).
+    translation block starts mid-sequence and contains fewer than
+    CST_MARKER_SEQ_LEN magic instructions.  The whole-block ``memcmp`` cannot
+    form a match against bytes that are not in the block, and base QEMU's
+    never-split rule only keeps a sequence together when the block reaches it
+    from the front — it does not reach backwards for a block entered at the
+    tail.  So detection fires at TRANSLATION on the WHOLE sequence only, and
+    a mid-sequence entry executes too few magic instructions to be one: the
+    required outcome is the NEGATIVE — no window, no segment, guest exits 0.
     """
     def entered_mid(seq: list, label: str) -> list:
         return (_jump(isa, label)
@@ -291,8 +310,9 @@ def _negative_self_check(isa: str) -> str:
     the "no window opened" test for the wrong reason — or fail it while the
     plugin was right.  Both marker sequences must be absent from the decoy
     listing as contiguous instruction runs, and the terminating instruction of
-    each must be PRESENT, so the plugin's cheap tail filter has something to
-    arm on and the rejection it then makes is a real rejection.
+    each must be PRESENT, so the whole-block match has a real marker tail to
+    reject against and the rejection it then makes is a real rejection rather
+    than a trivial mismatch on the last instruction.
     """
     lines = _insns(wl_negative(isa))
     start = _insns(B.emit_trace_marker(isa))
@@ -438,7 +458,9 @@ def chk_marker_detection(ctx):
         for tag, build, judge in (
                 ("positive", wl_positive, _judge_positive),
                 ("negative", wl_negative, _judge_negative),
-                ("missable", wl_missable, _judge_positive)):
+                # A mid-sequence branch entry is NOT a marker under
+                # whole-block matching: it must open no window (negative).
+                ("missable", wl_missable, _judge_negative)):
             name = f"{isa}/{tag}"
             binp = _build_workload(isa, d, tag, build(isa))
             if binp is None:
@@ -480,9 +502,11 @@ def chk_marker_detection(ctx):
                         "toolchain; nothing was verified", subs)
     return _outcome(
         "pass",
-        "a complete marker sequence is never missed (plain + entered "
-        "mid-sequence through a branch) and an incomplete one is never "
-        f"claimed ({', '.join(MARKER_ISAS)})", subs)
+        "a complete marker sequence is never missed (plain), and an "
+        "incomplete one is never claimed — neither the all-decoys shape nor "
+        "a mid-sequence branch entry (which executes fewer than "
+        f"CST_MARKER_SEQ_LEN magic instructions) opens a window "
+        f"({', '.join(MARKER_ISAS)})", subs)
 
 
 # ===========================================================================
@@ -536,12 +560,19 @@ def chk_system_window_modes(ctx):
     subs: list = []
     ok_all = True
 
+    # A marker anchor and a simpoint schedule are two separate inputs, and
+    # neither implies the other: trace_window=simpoint states only that
+    # SimPoint offsets are in use.  It therefore belongs on the refused list
+    # for the same reason icount and symbol do -- it names positions on a
+    # clock without saying whose clock -- and the composition below is where
+    # a system-mode SimPoint capture is expressed.
     refused = [
         ("icount", f"{base},trace_window=icount:start=0+stop=100000"),
         ("symbol", f"{base},trace_window=symbol:name=main"
                    f"+simulation=100000"),
-        ("simpoint", f"{base},trace_window=simpoint:file={sp}"
-                     f"+interval=100000+simulation=100000"),
+        ("simpoint (bare, no marker anchor)",
+         f"{base},trace_window=simpoint:file={sp}"
+         f"+interval=100000+simulation=100000"),
         ("default (no trace_window)", base),
     ]
     for name, opts in refused:
@@ -563,22 +594,35 @@ def chk_system_window_modes(ctx):
     # ACCEPTED: the marker window must get past install.  With -S there is no
     # guest to run and nothing to close the window, so the process is expected
     # to be still alive at the timeout — judge the install, as specified.
-    opts = f"{base}_marker,trace_window=marker:simulation=100000+policy=latch"
-    rc, err, timed_out = _system_probe(ctx, opts, timeout=25)
-    saw_refusal = SYS_REFUSAL in err
-    saw_install = SYS_ACCEPTED_MARK in err
-    ok = (not saw_refusal) and saw_install
-    ok_all = ok_all and ok
-    if saw_refusal:
-        detail = "marker window was REFUSED in system mode"
-    elif not saw_install:
-        detail = (f"no '{SYS_ACCEPTED_MARK}' line — the plugin never got past "
-                  f"install (rc={rc}, timed_out={timed_out})")
-    else:
-        detail = ("installed, window armed"
-                  + (" (still running at the timeout, as expected)"
-                     if timed_out else f" (exited {rc})"))
-    subs.append({"name": "accepted/marker", "ok": ok, "detail": detail})
+    #
+    # Both accepted forms run: the bare marker anchor, and the COMPOSITION —
+    # simpoint offsets written onto that anchor.  The composition is the only
+    # way a system-mode capture can use SimPoints at all now that the bare
+    # simpoint window is refused above, so if it did not install, the refusal
+    # would have removed a capability rather than renamed it.
+    accepted = [
+        ("marker",
+         f"{base}_marker,trace_window=marker:simulation=100000+policy=latch"),
+        ("marker+simpoints",
+         f"{base}_marksp,trace_window=marker:simulation=100000"
+         f"+policy=latch+simpoints={sp}+interval=100000+warmup=1000"),
+    ]
+    for name, opts in accepted:
+        rc, err, timed_out = _system_probe(ctx, opts, timeout=25)
+        saw_refusal = SYS_REFUSAL in err
+        saw_install = SYS_ACCEPTED_MARK in err
+        ok = (not saw_refusal) and saw_install
+        ok_all = ok_all and ok
+        if saw_refusal:
+            detail = f"the {name} window was REFUSED in system mode"
+        elif not saw_install:
+            detail = (f"no '{SYS_ACCEPTED_MARK}' line — the plugin never got "
+                      f"past install (rc={rc}, timed_out={timed_out})")
+        else:
+            detail = ("installed, window armed"
+                      + (" (still running at the timeout, as expected)"
+                         if timed_out else f" (exited {rc})"))
+        subs.append({"name": f"accepted/{name}", "ok": ok, "detail": detail})
 
     if not ok_all:
         (d / "last.stderr").write_text(err)
@@ -595,9 +639,8 @@ def chk_system_window_modes(ctx):
         if junk.suffix in (".log", ".cst") or junk.name.endswith(".stats.log"):
             junk.unlink(missing_ok=True)
 
-    return _outcome(
-        "pass" if ok_all else "fail",
-        "system mode accepts only trace_window=marker: icount / symbol / "
-        "simpoint / the default are refused at install (non-zero exit + "
-        "message), marker is not",
-        subs)
+    msg = ("system mode needs a MARKER ANCHOR: icount / symbol / bare "
+           "simpoint / the default are refused at install (non-zero exit + "
+           "message); the marker window and simpoints COMPOSED onto it "
+           "install")
+    return _outcome("pass" if ok_all else "fail", msg, subs)

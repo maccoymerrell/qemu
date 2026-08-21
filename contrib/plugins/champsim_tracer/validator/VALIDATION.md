@@ -109,44 +109,32 @@ RED.  Currently:
   contention safety net (it is otherwise a hard 6/6 with the ordered
   launch, and the latch-differential half always asserts).
 
-### Dead-latch determinism
+### Dead-latch backstop (idle close)
 
-`multiproc.dead_latch_x86` is a hard gate, not an XFAIL, even though the
-detector it exercises is unavoidably wall-clock driven:
-`deadlatch_now_ms()` reads `CLOCK_MONOTONIC` by design (real host time is
-the only clock that keeps advancing once every owned process has died —
-see the comment on `g_latch_timeout_ms` in `champsim_tracer.cc`), so the
-mechanism itself cannot be reworked onto guest virtual time without
-changing what it is.  What made the check flaky was not that wall clock —
-it was pitting a 3-second `latch_timeout` against an unrelated,
-comparably-sized budget (progA's own runtime plus a post-kill churn
-loop): whether that budget finished in more or less than ~3s of real time
-was a coin flip under host contention.
+The per-window kill scenario (`multiproc.dead_latch_x86` /
+`run_x86_dead_latch_kill`) is **retired**.  Under content-as-gate the
+idle backstop is ONE global last-gated-execution stamp: a dead process's
+window does not age out while another gated window is still executing —
+the segment ends when ALL gated activity ends.  Per-window aging is no
+longer a promise the model makes, so a cell that asserts it tests a
+retired behaviour.
 
-`run_x86_dead_latch_kill` shrinks `latch_timeout` to 750ms, a value
-picked empirically rather than guessed: an earlier attempt at 25ms
-measured `idle=97ms` and falsely aged out a still-alive process seconds
-into boot, because ordinary two/three-way scheduling contention between
-progA, progB and the init shell routinely opens gaps close to the guest
-kernel's scheduling quantum — real scheduler jitter, not death. 750ms
-clears that jitter with comfortable headroom (observed `idle=1393ms` for
-the genuinely-killed peer in the same scenario) while staying far below
-what progA's run plus the churn loop reliably takes, and it cannot
-falsely age out a *live* root either way: `deadlatch_clock_check()`
-refreshes the running root's own timestamp on every throttled call, so
-only a root that is never scheduled again goes stale.
+The must-fire proof of the surviving global backstop is the standalone
+`deadlatch_test` cell (not part of the `full` registry).  It builds a
+marked workload WITHOUT its END marker, opens the window, and exits with
+it still open, in two shapes:
 
-The check's assertions are also causal now, not just "a trace exists".
-Subcheck 1 does not depend on the guest's own "killed B" echo reaching
-the console — qemu exits the instant the trace's last window closes
-(`deadlatch_close_segment`'s "caller should exit(0)"), and that abrupt
-teardown can beat the guest's still-buffered serial-console bytes to
-being drained, losing output the guest already produced.  Instead it
-reads the plugin's own host-stderr line ("marker opened additional
-window for asid ... (2 owned)", never routed through the guest UART) to
-confirm B was genuinely alive and under active tracing before it died.
-Subcheck 2 then cross-checks that the *same* asid is the one the
-dead-latch detector later closes.
+* `storm` — a fork loop schedules foreign address spaces that the content
+  gate evaluates to NOT-TRACED (`gate refresh evaluated NOT traced` >= 1,
+  the non-vacuity gate); none is captured, so nothing advances the gated
+  idle stamp and the window ages out.
+* `quiet` — a shell-builtin spin: no context switch ever fires a gate
+  refresh, so only the retirement-driven sweep beat can age the window.
+
+Both must END BY THE LATCH: close reason `IDLE`, `dead-latch closes (idle
+insns)` >= 1, a decodable `.cst`, the full structural oracle GREEN (no
+successor is captured, so nothing is tolerated), and every `(must be 0)`
+census row at zero.
 
 ### System-mode guest CPU
 
@@ -240,9 +228,11 @@ decode/audit helpers).
 First fully green end-to-end `full` run (quiet host, 0 foreign qemu):
 2026-07-17, work-root `/mnt/md0/QEMU/cst_runs/valunify/GATE2`,
 `counts: pass=20 fail=0 skip=1 xfail=2`, `OVERALL: PASS (exit 0)`;
-runtime-uncovered only `behavior:dead_latch`, `opt:latch_timeout`
-(both attached to the non-gating dead-latch check) and
-`opt:window_symbol` (attached to the documented plugin trigger bug).
+runtime-uncovered only `opt:window_symbol` (attached to the documented
+plugin trigger bug).  (The `behavior:dead_latch` / `opt:latch_timeout`
+ids retired with the per-window kill cell; the global idle backstop is
+proven by the standalone `deadlatch_test` cell — see *Dead-latch
+backstop* above.)
 
 ---
 

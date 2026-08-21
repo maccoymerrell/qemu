@@ -81,13 +81,12 @@ _ISA_BOOT = {
                 "console": "ttyS0"},
     # P5600 is the only MIPS model in QEMU that sets Config3.PW
     # (target/mips/cpu-defs.c.inc), so it is the only one on which the guest
-    # kernel enables the hardware page-table walker and therefore the only
-    # one on which CP0_PWBase -- the page-table root Linux writes from
-    # htw_set_pwbase() at every switch_mm -- is a live register.  The
-    # ownership model keys on that root, so the mipsel system guest boots on
-    # P5600; "Hardware Page Table Walker enabled" on the console is the
-    # condition that says so, and it does not appear on the malta default
-    # (24Kc).
+    # kernel enables the hardware page-table walker ("Hardware Page Table
+    # Walker enabled" on the console; the malta default never prints it).
+    # The retired root-keyed ownership model required that register;
+    # content-as-gate names no root, and P5600 stays as the established
+    # single-vCPU boot shape that the fixtures, the lldet calibration and
+    # the NaN handling below are built on.
     #
     # ieee754=relaxed: P5600 resets FCR31 with ABS2008|NAN2008 set and its
     # rw_bitmask (0xFF83FFFF) makes both bits read-only, so Linux probes the
@@ -105,16 +104,16 @@ _ISA_BOOT = {
     # no matter which ELF is admitted.  Drop it once the base rootfs is
     # rebuilt against a 2008-NaN libc.
     "mipsel":  {"dir": "mipsel",  "kernel": "vmlinux",
-                # -cpu P5600 is REQUIRED, not a tuning choice: it is the only
-                # QEMU MIPS model implementing Config3.PW / CP0 PWBase, the
-                # hardware page-table walker's base register, which is what a
-                # system capture names its process by.  malta defaults to
-                # 24Kf, which supplies no page-table root, and the plugin
-                # REFUSES TO INSTALL on it rather than name an address space
-                # by an 8-bit EntryHi.ASID a Linux guest reassigns to a
-                # different live process on rollover.  P5600 also sets
-                # Config3.ULRI (thread ids keep working) and Config3.CMGCR
-                # (the malta CPS SMP path).
+                # -cpu P5600 is the single-vCPU boot shape.  The root-keyed
+                # ownership doctrine that once made it REQUIRED (and made
+                # the plugin refuse rootless models rather than name an
+                # address space by a recycled 8-bit EntryHi.ASID) is
+                # retired: the gate is the marker bytes' presence in the
+                # current address space, and no model is named by a
+                # page-table root.  P5600 also sets Config3.ULRI (thread
+                # ids keep working).  For -smp >1 the harness boots 34Kf
+                # instead (_ISA_SMP_CPU below): P5600's CPS bring-up
+                # onlines only one vCPU.
                 "machine": ["-M", "malta", "-cpu", "P5600"],
                 "console": "ttyS0",
                 # BLOCKER 3 (d9aa0e05ef): the shipped base rootfs is a
@@ -125,6 +124,25 @@ _ISA_BOOT = {
                 # generation, and on this CPU it cannot change FP semantics
                 # either.  Drop it once the base rootfs is rebuilt 2008-NaN.
                 "extra_append": "ieee754=relaxed"},
+}
+
+# Per-ISA CPU override used only when more than one vCPU is asked for.
+#
+# mipsel: P5600 cannot be brought up multi-vCPU under QEMU.  malta routes
+# -smp >1 on a Config3.CMGCR CPU through the CPS block, and QEMU's CPS
+# models N vCPUs as N VPs inside ONE core (hw/misc/mips_cmgcr.c returns 0
+# for GCR_CONFIG, so PCORES == 0), while Linux only counts more than one VP
+# per core when the CPU has the MT ASE or the Release 6 VP bit
+# (mips_cps_numvps(), arch/mips/include/asm/mips-cps.h).  P5600 is MIPS32r5
+# with neither, so the topology comes out {1} total 1 and the guest boots
+# single-CPU.  34Kf has the MT ASE and no CMGCR, so it takes malta's
+# non-CPS path and Linux's MT SMVP bring-up, which does online every vCPU.
+# 34Kf having no Config3.PW costs nothing any more: content-as-gate names
+# no page-table root, so a rootless model is admissible and a traced
+# mipsel SMP cell can exist again.  _ONLINE_CPUS_RE below still turns any
+# silent single-CPU fallback into a failure rather than a quiet run.
+_ISA_SMP_CPU = {
+    "mipsel": "34Kf",
 }
 
 # The kernel's own count of the vCPUs it actually onlined.  A cell that asks
@@ -530,37 +548,13 @@ def run_with_clock_watchdog(cmd: list[str], log_path,
                 p.wait()
 
 
-# f2b6e2f4e7 replaced the single `pin ASID reuse suspected` heuristic with
-# the two counts the ownership model actually reasons from: how many raw ASID
-# names the guest committed anywhere since the pin (the allocator pressure the
-# churn test is manufacturing) and how many of them the OWNED address space
-# itself executed under (a pinned process that stays put reads 0).  The
-# validator kept asking for the old name and had been failing every churn
-# cell, on every ISA, ever since.
-_PIN_NAMES_RE = re.compile(
-    r"distinct raw ASID names committed since the pin\s+(\d+)")
-_OWNED_NAMES_RE = re.compile(
-    r"distinct raw ASID names the OWNED space executed under\s+(\d+)")
-_KEXC_ASID_RE = re.compile(r"kexc ASID-write events\s+(\d+)")
-
-
-def parse_pin_asid_names(stats_text: str) -> tuple[int | None, int | None]:
-    """(names committed since the pin, names the owned space ran under)
-    from a <out>.stats.log.  Either is None when its row is absent, which
-    the caller must treat as a check that could not find its subject."""
-    m = _PIN_NAMES_RE.search(stats_text)
-    o = _OWNED_NAMES_RE.search(stats_text)
-    return (int(m.group(1)) if m else None,
-            int(o.group(1)) if o else None)
-
-
-def parse_kexc_asid_writes(stats_text: str) -> int | None:
-    """The `kexc ASID-write events` counter from a <out>.stats.log —
-    every guest context switch writes the ASID register, so this is the
-    churn test's kernel-side evidence that other processes were being
-    scheduled while the pinned window was open."""
-    m = _KEXC_ASID_RE.search(stats_text)
-    return int(m.group(1)) if m else None
+# The churn/deadlatch cells no longer parse any ASID-name or kexc census:
+# the content-as-gate model stores no ASID as an identity, so there is
+# nothing to count.  A context switch is now witnessed by the plugin's
+# `marker gate refreshes` row (churn's non-vacuity gate) and the honest
+# offline gate is `_check_user_code_identity` (every captured user template
+# byte-matches the marked image).  The old `distinct raw ASID names ...`
+# and `kexc ASID-write events` parsers were removed with those rows.
 
 
 # --------------------------------------------------------------------------
@@ -852,17 +846,17 @@ def churn_init(pre: int, during: int) -> str:
 # exercises, and both shapes must end in a dead-latch IDLE close:
 #
 #   storm — a fork loop (each iteration burns a subshell + /bin/true, two
-#   fresh mm's).  Linux hands the dead workload's freed page-table root to
-#   one of those forks, QEMU's identity layer interns the raw root value,
-#   and the successor then presents every refresh event in the dead
-#   window's name.  This is the shape that held the latch inert for 580 s
-#   in three sized attempts; the stamp's proof-of-life probe is what makes
-#   it close.  No poweroff: the LATCH must end this run.
+#   fresh mm's).  Each successor is a fresh address space that does NOT map
+#   the marker bytes at the latched vaddr, so every gate refresh it fires
+#   evaluates to NOT-TRACED and it is never captured — nothing it runs
+#   keeps the window alive.  This is the shape that held the latch inert
+#   for 580 s in three sized attempts; the idle stamp now ages because no
+#   gated execution advances it.  No poweroff: the LATCH must end this run.
 #
 #   quiet — a pure shell-builtin spin (no forks, no execs, no address-space
-#   writes after the first schedule).  Nothing recycles the root, but
-#   nothing context-switches either, so the ASID-write sweep trigger never
-#   fires; the retirement-driven sweep beat is what makes it close.
+#   writes after the first schedule).  Nothing context-switches, so no gate
+#   refresh fires at all; the retirement-driven sweep beat is what makes it
+#   close.
 _INIT_DEADLATCH_STORM = """#!/bin/sh
 mount -t devtmpfs none /dev 2>/dev/null
 mount -t proc  none /proc 2>/dev/null
@@ -1017,13 +1011,22 @@ def system_qemu_cmd(qemu_system: Path, kernel: Path, initrd: Path,
     ]
     if smp and int(smp) > 1:
         cmd += ["-smp", str(int(smp))]
-        # No per-cell -cpu override anywhere: the model comes from the boot
-        # shape above and nothing may quietly replace it.  mipsel SMP used to
-        # switch to 34Kf for the MT ASE; P5600 has no MT ASE and brings up
-        # secondaries through CPS (Config3.CMGCR) instead, so the guest
-        # kernel needs CONFIG_MIPS_CPS=y.  Substituting 34Kf back would
-        # silently restore a model with no page-table root -- which the
-        # plugin now refuses outright, so the failure would at least be
-        # loud, but the harness must not create it in the first place.
+        # Multi-vCPU cells take the per-ISA SMP CPU override.  On mipsel
+        # that is 34Kf: its MT ASE rides malta's non-CPS path and Linux's
+        # SMVP bring-up onlines every vCPU, while P5600's CPS path models N
+        # VPs inside one core and the guest comes up single-CPU (see
+        # _ISA_SMP_CPU).  The old refusal doctrine that forbade this swap
+        # (34Kf has no page-table root) is retired with the root identity
+        # itself: content-as-gate names no root, so the rootless model is
+        # admissible.  assess_online_cpus still fails any cell whose guest
+        # did not online what it asked for, so a wrong model stays loud.
+        smp_cpu = _ISA_SMP_CPU.get(isa)
+        if smp_cpu:
+            for i, arg in enumerate(cmd):
+                if arg == "-cpu":
+                    cmd[i + 1] = smp_cpu
+                    break
+            else:
+                cmd += ["-cpu", smp_cpu]
     cmd += os.environ.get("CST_QEMU_EXTRA_ARGS", "").split()
     return cmd

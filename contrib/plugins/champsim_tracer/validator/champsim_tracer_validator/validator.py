@@ -289,9 +289,75 @@ def _load_pt_load_segments(binary_path: "Path | None"
             for seg in img.segments if seg.type == seg_load]
 
 
+def _marker_entry_overlay(binary_path: "Path | None",
+                          isa: str) -> list[tuple[int, bytes]]:
+    """The persisted-marker image overlay for a ``cst_attach``-injected run.
+
+    cst_attach replaces the first START-marker-sequence bytes of the
+    target's live image at its ELF entry point and PERSISTS them
+    (content-as-gate: the plugin re-reads those bytes at every committed
+    address-space switch, so they must stay).  The on-disk ELF never
+    changes, so for an injected run the authoritative expected image is
+    the ELF *with the marker overlaid at its entry* — a trace template
+    showing anything else there (the original prologue = the injection
+    never happened, or foreign bytes) must still fail.
+
+    Returns ``[(entry_va, marker_seq_bytes)]``, or ``[]`` when the ELF
+    can't be parsed (callers treat that as "no overlay", matching the
+    PT_LOAD loader's behaviour).  The byte encodings mirror
+    champsim_marker.h's per-arch encoders exactly (magic and sequence
+    length are parsed from that header via asm_blocks._marker_contract,
+    so the expectation cannot drift from the contract)."""
+    if binary_path is None:
+        return []
+    try:
+        import lief
+        entry = int(lief.parse(str(binary_path)).entrypoint)
+    except Exception:
+        return []
+    from .asm_blocks import _marker_contract
+    magic, _end, seq_len = _marker_contract()
+    hi16, lo16 = magic >> 16, magic & 0xffff
+    if isa == "x86_64":
+        unit = bytes([0xB8]) + magic.to_bytes(4, "little")
+    elif isa == "aarch64":
+        movz = 0x52800000 | (lo16 << 5)
+        movk = 0x72A00000 | (hi16 << 5)
+        unit = movz.to_bytes(4, "little") + movk.to_bytes(4, "little")
+    elif isa == "riscv64":
+        lui = ((magic >> 12) << 12) | (10 << 7) | 0x37
+        addi = ((magic & 0xFFF) << 20) | (10 << 15) | (10 << 7) | 0x13
+        unit = lui.to_bytes(4, "little") + addi.to_bytes(4, "little")
+    elif isa == "mipsel":
+        lui = 0x3C080000 | hi16
+        ori = 0x35080000 | lo16
+        unit = lui.to_bytes(4, "little") + ori.to_bytes(4, "little")
+    else:
+        return []
+    return [(entry, unit * seq_len)]
+
+
+def _apply_image_overlay(loads: list[tuple[int, bytes]],
+                         overlay: "list[tuple[int, bytes]] | None"
+                         ) -> list[tuple[int, bytes]]:
+    """Patch @overlay spans onto PT_LOAD @loads (out-of-place)."""
+    if not overlay:
+        return loads
+    patched: list[tuple[int, bytes]] = []
+    for base, blob in loads:
+        for va, data in overlay:
+            if base <= va and va + len(data) <= base + len(blob):
+                off = va - base
+                blob = blob[:off] + data + blob[off + len(data):]
+        patched.append((base, blob))
+    return patched
+
+
 def _check_template_raw_bytes(templates: list[dict],
                               blocks_by_id: dict[int, dict],
-                              binary_path: "Path | None" = None
+                              binary_path: "Path | None" = None,
+                              image_overlay:
+                                  "list[tuple[int, bytes]] | None" = None
                               ) -> list[Issue]:
     """Byte-for-byte compare each template insn's `raw_bytes` against
     ground truth for the same PC.
@@ -326,7 +392,8 @@ def _check_template_raw_bytes(templates: list[dict],
         for ins in gt["insns"]:
             gt_by_pc[int(ins["pc"])] = ins
 
-    image_loads = _load_pt_load_segments(binary_path)
+    image_loads = _apply_image_overlay(_load_pt_load_segments(binary_path),
+                                       image_overlay)
 
     def _image_bytes(va: int, n: int) -> bytes | None:
         for base, blob in image_loads:
@@ -5157,6 +5224,28 @@ def _check_syscall_transitions(entries: list[dict],
     fall-through staying outstanding is expected.  No user syscalls at
     all -> info (e.g. a fault-only workload).
 
+    CONTEXT.  A syscall and its resume belong to one *wire context* —
+    ``(thread_id, asid_index)`` — never to a thread id alone.  A
+    thread_id is a guest-thread identifier, not a process identifier:
+    two address spaces routinely carry the same one, and a single
+    process spans two contexts whenever the guest reassigns its ASID
+    under it (the latch is per process and survives the migration, so
+    the wire announces the new context with a BODY_TAG_ASID_SWITCH and
+    a fresh BODY_TAG_REGFILE and keeps publishing).  Keying on the
+    thread alone pairs a syscall in one address space with the next
+    user block of another and reports a resume the wire never claimed.
+
+    DISCONTINUITY.  The body stream is a *window*, not a contiguous
+    execution: gating drops a context's blocks whenever the gate
+    evaluates NOT-TRACED, and the drops are counted in the writer's
+    stats rather than published.  A BODY_TAG_REGFILE for a context that
+    has already contributed entries is the wire's explicit "state here
+    is not a delta from what came before" signal — the whole
+    architectural file had to be re-snapshotted.  No pending syscall may
+    be paired across one: the next user entry after such a re-announce
+    is whatever the gate re-acquired, not the syscall's return.  Those
+    pendings are dropped and counted (``refused``), never asserted over.
+
     RANGE-AWARENESS (format spec §4.2a).  A syscall is pending only
     when the entry's declared range actually includes the template's
     final (syscall) instruction: a ``[0, k)`` stretch of a
@@ -5181,30 +5270,65 @@ def _check_syscall_transitions(entries: list[dict],
         ins = t.get("insns") or []
         return bool(ins) and int(ins[-1].get("branch_type", 0)) in syscall_ids
 
+    # Positional REGFILE view, aligned to @entries: body_record_order is
+    # one ("regfile"|"entry", thread_id) tuple per body record in stream
+    # order, so the k-th "entry" tuple is entries[k].  regfile_before[k]
+    # holds the thread ids re-announced immediately before entries[k].
+    # Only consumed when the two views agree on the entry count — a
+    # partial or absent order stream leaves the discontinuity rule off
+    # rather than mis-aligning it onto the wrong entries.
+    order = trace_meta.get("body_record_order") or []
+    regfile_before: dict[int, list[int]] = {}
+    n_order_entries = sum(1 for rec in order if rec[0] == "entry")
+    if order and n_order_entries == len(entries):
+        k = 0
+        for kind, otid in order:
+            if kind == "entry":
+                k += 1
+            else:
+                regfile_before.setdefault(k, []).append(int(otid))
+
     issues: list[Issue] = []
     verified = 0
+    refused = 0
     strict = guest_threads <= 1
-    outstanding: dict[int, int] = {}    # resume pc -> open count
-    out_pc: dict[int, int] = {}         # resume pc -> a syscall pc (messages)
-    # Per-GUEST-THREAD: the most recent user block that ended in a syscall,
-    # and whether a kernel block for THAT thread has been seen since.
-    # Tracking per tid (not globally) is essential on a concurrent SMP run:
-    # another guest thread's user block legitimately interleaves between a
-    # thread's syscall and its own kernel entry, which a global tracker
-    # misreads as "syscall not followed by a kernel block".  Kernel blocks
-    # inherit the tid of the thread that entered the kernel, so a thread's
-    # excursion lands on its own pending slot.
-    pending_by_tid: dict[int, tuple[int, int]] = {}   # tid -> (syscall_pc, ft)
-    saw_kernel_by_tid: dict[int, bool] = {}
-    for e in entries:
+    # Per wire CONTEXT (thread_id, asid_index):
+    #   outstanding[ctx][resume_pc] -> open count   (a fall-through PC is
+    #     only meaningful inside its own address space; same-vaddr blocks
+    #     in a second address space must not consume it)
+    #   pending[ctx] -> (syscall_insn_pc, block_pc, fall_through_pc)
+    #   saw_kernel[ctx] -> a kernel block for THAT context since the syscall
+    # Tracking per context (not per tid, and not globally) is essential on
+    # a concurrent SMP run: another guest thread's user block legitimately
+    # interleaves between a thread's syscall and its own kernel entry,
+    # which a global tracker misreads as "syscall not followed by a kernel
+    # block".  Kernel blocks inherit the context of the thread that
+    # entered the kernel, so a context's excursion lands on its own slot.
+    outstanding: dict[tuple, dict[int, int]] = {}
+    pending: dict[tuple, tuple[int, int, int]] = {}
+    saw_kernel: dict[tuple, bool] = {}
+    for idx, e in enumerate(entries):
+        for otid in regfile_before.get(idx, ()):
+            # A context re-announce: everything armed for that thread
+            # before it is on the far side of a coverage discontinuity.
+            # The order stream names the thread, not the asid, so drop
+            # every context on that thread — this can only ever refuse
+            # an assertion, never manufacture one.
+            for ctx in [c for c in pending if c[0] == otid]:
+                del pending[ctx]
+                saw_kernel.pop(ctx, None)
+                refused += 1
+            for ctx in [c for c in outstanding if c[0] == otid]:
+                outstanding.pop(ctx, None)
         t = templates_by_id.get(e["template_id"])
         if t is None:
             continue
-        tid = int(e.get("thread_id", 0))
+        ctx = (int(e.get("thread_id", 0) or 0),
+               int(e.get("asid_index", 0) or 0))
         is_sys = bool(t.get("is_system"))
         if is_sys:
-            if pending_by_tid.get(tid) is not None:
-                saw_kernel_by_tid[tid] = True
+            if pending.get(ctx) is not None:
+                saw_kernel[ctx] = True
             continue
         start, stop, n = _entry_range(e, t)
         # Range-resolved position: a continuation entry (bb_start > 0)
@@ -5215,62 +5339,74 @@ def _check_syscall_transitions(entries: list[dict],
             ins = t.get("insns") or []
             if start < len(ins):
                 pc = int(ins[start]["pc"])
-        pend = pending_by_tid.pop(tid, None)
+        pend = pending.pop(ctx, None)
         if pend is not None:
-            sy_pc, sy_ft = pend
-            if not saw_kernel_by_tid.get(tid, False):
+            sy_pc, sy_blk, sy_ft = pend
+            if not saw_kernel.get(ctx, False):
                 issues.append(Issue(
                     "syscall_transitions", "error",
-                    f"user syscall at 0x{sy_pc:x} (thread {tid}) was not "
-                    f"followed by a kernel (system) block before returning "
-                    f"to user",
-                    {"syscall_pc": sy_pc, "tid": tid}))
+                    f"user syscall at 0x{sy_pc:x} (thread {ctx[0]} "
+                    f"asid {ctx[1]}) was not followed by a kernel "
+                    f"(system) block before returning to user",
+                    {"syscall_pc": sy_pc, "tid": ctx[0], "asid": ctx[1]}))
             else:
                 # The syscall entered the kernel; its resume is now open.
-                outstanding[sy_ft] = outstanding.get(sy_ft, 0) + 1
-                out_pc[sy_ft] = sy_pc
+                ctx_out = outstanding.setdefault(ctx, {})
+                ctx_out[sy_ft] = ctx_out.get(sy_ft, 0) + 1
                 # This user block is the kernel's return target: it must
                 # resume one of the outstanding syscalls (strict mode) —
                 # in multi-thread mode a mid-flow resume of a previously
                 # preempted thread is legal.
-                if outstanding.get(pc, 0) > 0:
-                    outstanding[pc] -= 1
-                    if not outstanding[pc]:
-                        del outstanding[pc]
+                if ctx_out.get(pc, 0) > 0:
+                    ctx_out[pc] -= 1
+                    if not ctx_out[pc]:
+                        del ctx_out[pc]
                     verified += 1
                 elif strict:
                     issues.append(Issue(
                         "syscall_transitions", "error",
-                        f"syscall at 0x{sy_pc:x} returned to user at "
-                        f"0x{pc:x}, expected the fall-through 0x{sy_ft:x}",
-                        {"syscall_pc": sy_pc, "expected_ft": sy_ft,
-                         "got": pc}))
-            saw_kernel_by_tid[tid] = False
-        elif outstanding.get(pc, 0) > 0:
-            # A user entry resuming an outstanding fall-through without
-            # kernel blocks immediately before it: the return interleaved
-            # with other threads' entries (or the excluded window hid the
-            # tail of the excursion).  Consume it.
-            outstanding[pc] -= 1
-            if not outstanding[pc]:
-                del outstanding[pc]
-            verified += 1
+                        f"syscall at 0x{sy_pc:x} (block 0x{sy_blk:x}, "
+                        f"thread {ctx[0]} asid {ctx[1]}) returned to user "
+                        f"at 0x{pc:x}, expected the fall-through "
+                        f"0x{sy_ft:x}",
+                        {"syscall_pc": sy_pc, "syscall_block": sy_blk,
+                         "expected_ft": sy_ft, "got": pc,
+                         "tid": ctx[0], "asid": ctx[1]}))
+            saw_kernel[ctx] = False
+        else:
+            ctx_out = outstanding.get(ctx)
+            if ctx_out and ctx_out.get(pc, 0) > 0:
+                # A user entry resuming an outstanding fall-through
+                # without kernel blocks immediately before it: the return
+                # interleaved with other threads' entries (or the excluded
+                # window hid the tail of the excursion).  Consume it.
+                ctx_out[pc] -= 1
+                if not ctx_out[pc]:
+                    del ctx_out[pc]
+                verified += 1
         # Arm only when this entry's range includes the final (syscall)
         # instruction: a prefix stretch cut before the syscall must not
         # arm — the syscall has not executed yet; the continuation that
         # carries it does.
         if ends_in_syscall(t) and stop >= n:
-            pending_by_tid[tid] = (pc, int(t.get("fall_through_pc", 0)))
-            saw_kernel_by_tid[tid] = False
+            ins = t.get("insns") or []
+            sy_pc = int(ins[-1]["pc"]) if ins else pc
+            pending[ctx] = (sy_pc, pc, int(t.get("fall_through_pc", 0)))
+            saw_kernel[ctx] = False
 
     if issues:
         return issues
+    note = ""
+    if refused:
+        note = (f"; {refused} pending syscall(s) not asserted over a "
+                f"context re-announce (REGFILE: coverage discontinuity)")
     return [Issue(
         "syscall_transitions", "info",
         f"verified {verified} user-syscall round-trip(s) "
         f"(branch out to kernel + return to an outstanding fall-through)"
-        + ("" if verified else "; none returned (terminal exit only)"),
-        {"verified": verified})]
+        + ("" if verified else "; none returned (terminal exit only)")
+        + note,
+        {"verified": verified, "refused": refused})]
 
 
 def _check_fault_excursions(entries: list[dict],
@@ -5565,38 +5701,71 @@ def _check_unconditional_direction(templates: list[dict],
     return issues
 
 
+def _entry_context_census(entries) -> tuple[set, set]:
+    """One pass over the entry stream returning ``(thread_ids, contexts)``.
+
+    A *context* is the ``(asid label, thread id)`` PAIR, because that is the
+    unit the writer's per-context bookkeeping is keyed on: field-state
+    overlays and the REGFILE-emitted set both key on
+    ``(wire_asid << 32) | thread_id``.  A guest thread pointer can collide
+    across address spaces, and -- the reason it matters here -- the asid on
+    the wire is a LABEL sampled at capture, so one traced process legitimately
+    appears under more than one label (a narrow-ASID guest recycles the value
+    while the window is open).  Each such label change starts a new delta
+    baseline, so each needs its own absolute register file.
+
+    Returned as sets so both callers share the single pass; the entry
+    sequence is lazy and disk-backed, so a pass is a file scan.
+    """
+    tids: set = set()
+    ctxs: set = set()
+    for e in entries or ():
+        t = int(e.get("thread_id", 0))
+        tids.add(t)
+        ctxs.add((int(e.get("asid_index", 0) or 0), t))
+    return tids, ctxs
+
+
 def _check_regfile_records(body_stats: dict,
                            expected_threads: int = 1,
-                           entries: list[dict] | None = None) -> list[Issue]:
-    """A BODY_TAG_REGFILE record must precede each thread's first
-    BODY_TAG_ENTRY in the segment.  Single-segment, single-thread
-    traces should therefore carry exactly one REGFILE.  Multi-thread
-    runs scale to one per (thread, segment).
+                           entries: list[dict] | None = None,
+                           contexts: set | None = None) -> list[Issue]:
+    """A BODY_TAG_REGFILE record must precede each CONTEXT's first
+    BODY_TAG_ENTRY in the segment, where a context is the (asid label,
+    thread id) pair the writer keys its delta baselines on.  A
+    single-segment, single-thread, single-label trace therefore carries
+    exactly one REGFILE; multi-thread runs scale to one per (context,
+    segment), and so do runs where the guest recycles the asid LABEL of the
+    traced process while its window is open.
 
     @expected_threads is the traced process's thread population, which in
     system mode is a LOWER bound on the contexts that emit: a kernel-only
     strand (a kernel thread on a borrowed mm) is its own guest thread and
-    needs its own initial register file.  Given @entries the expectation is
-    therefore the number of distinct thread ids that actually contributed,
-    which must still be at least @expected_threads; ``thread_records`` is
-    the check that asserts each REGFILE's *position* relative to its
-    thread's first entry.
+    needs its own initial register file, and a label change gives an
+    already-seen thread a second one.  Given @entries (or a precomputed
+    @contexts) the expectation is therefore the number of distinct contexts
+    that actually contributed, which must still be at least
+    @expected_threads; ``thread_records`` is the check that asserts each
+    REGFILE's *position* relative to its context's first entry.
     """
     actual = int(body_stats.get("regfile_count", 0))
     expected = expected_threads
-    if entries is not None:
-        observed = len({int(e.get("thread_id", 0)) for e in entries})
-        expected = max(expected_threads, observed)
+    if contexts is None and entries is not None:
+        _tids, contexts = _entry_context_census(entries)
+    if contexts is not None:
+        expected = max(expected_threads, len(contexts))
     if actual != expected:
         return [Issue(
             "regfile_records", "error",
             f"regfile_count={actual}, expected {expected} "
-            f"(one per (segment, thread))",
-            {"actual": actual, "expected": expected},
+            f"(one per (segment, asid label, thread))",
+            {"actual": actual, "expected": expected,
+             "contexts": sorted(contexts) if contexts is not None else None},
         )]
     return [Issue(
         "regfile_records", "info",
-        f"regfile_count={actual}",
+        f"regfile_count={actual}"
+        + (f" over contexts {sorted(contexts)}" if contexts else ""),
     )]
 
 
@@ -5646,7 +5815,8 @@ def _check_wp_events(body_stats: dict,
 
 def _check_thread_switch(body_stats: dict,
                          expected_threads: int = 1,
-                         system: bool = False) -> list[Issue]:
+                         system: bool = False,
+                         thread_ids: set | None = None) -> list[Issue]:
     """Every segment body's first record is a mandatory
     BODY_TAG_THREAD_SWITCH stating the starting thread (an ordinary
     delta from 0), so the count is never 0.  Multi-thread runs add real
@@ -5682,7 +5852,12 @@ def _check_thread_switch(body_stats: dict,
     vs 61/384 -- see cst_runs/tsw/FINDINGS.md).
 
     So in system mode the assertion here is only the one the wire
-    guarantees: at least one opener per contributing context.  What
+    guarantees: at least one THREAD_SWITCH per contributing thread.  The
+    floor is the thread population, not ``regfile_count``: a REGFILE is
+    per (asid label, thread) context, and a context can be new because the
+    LABEL changed while the thread did not -- that change is announced by
+    BODY_TAG_ASID_SWITCH, and demanding a THREAD_SWITCH for it would demand
+    the writer announce a thread change that did not happen.  What
     would make an extra switch SYNTHETIC is asserted by the two checks
     that own it and are always run alongside this one:
     ``thread_records`` (a switch flag is set on an entry iff its tid
@@ -5714,14 +5889,15 @@ def _check_thread_switch(body_stats: dict,
                 {"actual": actual, "expected": regfiles},
             )]
     elif expected_threads == 1 and system:
-        if actual < regfiles:
+        floor = len(thread_ids) if thread_ids else expected_threads
+        if actual < floor:
             return [Issue(
                 "thread_switch", "error",
-                f"thread_switch_count={actual} < regfile_count="
-                f"{regfiles}: every context that contributed entries must "
+                f"thread_switch_count={actual} < {floor} contributing "
+                f"thread(s): every thread that contributed entries must "
                 f"have been announced by a BODY_TAG_THREAD_SWITCH before "
                 f"its first entry",
-                {"actual": actual, "expected_min": regfiles},
+                {"actual": actual, "expected_min": floor},
             )]
     elif actual < expected_threads:
         return [Issue(
@@ -5735,7 +5911,9 @@ def _check_thread_switch(body_stats: dict,
     return [Issue(
         "thread_switch", "info",
         f"thread_switch_count={actual} (expected_threads="
-        f"{expected_threads}, regfile_count={regfiles})",
+        f"{expected_threads}, contributing_threads="
+        f"{len(thread_ids) if thread_ids else '?'}, "
+        f"regfile_count={regfiles})",
     )]
 
 
@@ -5853,12 +6031,22 @@ def _check_thread_record_cadence(entries: list[dict],
         later ENTRY carries it iff its ``thread_id`` differs from the
         previous ENTRY's — the writer emits a switch record only when
         the running guest thread changes.
-      * **A thread's REGFILE precedes its first ENTRY.**  Field-state
-        delta encoding is per-thread, so a consumer must have thread
-        T's full register file in hand before decoding T's first entry;
-        the writer guarantees this by emitting BODY_TAG_REGFILE lazily
-        right before each thread's first ENTRY of the segment.  Exactly
-        one REGFILE per contributing thread per segment.
+      * **A context's REGFILE precedes its first ENTRY.**  Field-state
+        delta encoding is per-CONTEXT -- the (asid label, thread id) pair
+        the writer keys its overlays on -- so a consumer must have that
+        context's full register file in hand before decoding its first
+        entry; the writer guarantees this by emitting BODY_TAG_REGFILE
+        lazily right before each context's first ENTRY of the segment.
+        Exactly one REGFILE per contributing context per segment.
+
+        The context, not the thread, is the unit because the asid on the
+        wire is a LABEL sampled at capture: a narrow-ASID guest recycles
+        the traced process's label while its window is open, and the
+        relabelled stream is a fresh delta baseline that needs its own
+        absolute register file.  A REGFILE's context is read off the ENTRY
+        it precedes -- the writer emits it immediately before the entry
+        that triggered it, so the next ENTRY record in the stream IS that
+        entry.
     """
     issues: list[Issue] = []
 
@@ -5886,46 +6074,67 @@ def _check_thread_record_cadence(entries: list[dict],
             "thread_records", "error",
             f"...and {flag_errors - 5} more switch-flag mismatches"))
 
-    # REGFILE-before-first-ENTRY, from the positional record stream.
-    first_entry_pos: dict[int, int] = {}
-    regfile_pos: dict[int, list[int]] = {}
+    # REGFILE-before-first-ENTRY, from the positional record stream, keyed
+    # by context.  `j` is how many ENTRY records have been passed, so it is
+    # the index of the NEXT entry -- which is the one a REGFILE at this
+    # position was emitted for.
+    first_entry_pos: dict[tuple, int] = {}
+    regfile_pos: dict[tuple, list[int]] = {}
+    orphan_regfiles: list[int] = []
+    n_entries = len(entries)
+    j = 0
     for pos, (kind, tid) in enumerate(body_record_order or []):
         if kind == "entry":
-            first_entry_pos.setdefault(tid, pos)
+            asid = (int(entries[j].get("asid_index", 0) or 0)
+                    if j < n_entries else 0)
+            first_entry_pos.setdefault((asid, tid), pos)
+            j += 1
         elif kind == "regfile":
-            regfile_pos.setdefault(tid, []).append(pos)
-    for tid, epos in sorted(first_entry_pos.items()):
-        rposes = regfile_pos.get(tid, [])
+            if j >= n_entries:
+                orphan_regfiles.append(pos)
+                continue
+            asid = int(entries[j].get("asid_index", 0) or 0)
+            regfile_pos.setdefault((asid, tid), []).append(pos)
+    for ctx, epos in sorted(first_entry_pos.items()):
+        asid, tid = ctx
+        rposes = regfile_pos.get(ctx, [])
         if not rposes:
             issues.append(Issue(
                 "thread_records", "error",
-                f"thread {tid} contributed entries but has no REGFILE "
-                f"record in the segment",
-                {"tid": tid}))
+                f"context (asid {asid}, thread {tid}) contributed entries "
+                f"but has no REGFILE record in the segment",
+                {"asid": asid, "tid": tid}))
         elif min(rposes) > epos:
             issues.append(Issue(
                 "thread_records", "error",
-                f"thread {tid}'s REGFILE (record #{min(rposes)}) appears "
-                f"after its first ENTRY (record #{epos})",
-                {"tid": tid}))
+                f"context (asid {asid}, thread {tid})'s REGFILE (record "
+                f"#{min(rposes)}) appears after its first ENTRY "
+                f"(record #{epos})",
+                {"asid": asid, "tid": tid}))
         if len(rposes) > 1:
             issues.append(Issue(
                 "thread_records", "error",
-                f"thread {tid} has {len(rposes)} REGFILE records in one "
-                f"segment; expected exactly one",
-                {"tid": tid, "count": len(rposes)}))
-    for tid in sorted(set(regfile_pos) - set(first_entry_pos)):
+                f"context (asid {asid}, thread {tid}) has {len(rposes)} "
+                f"REGFILE records in one segment; expected exactly one",
+                {"asid": asid, "tid": tid, "count": len(rposes)}))
+    for ctx in sorted(set(regfile_pos) - set(first_entry_pos)):
         issues.append(Issue(
             "thread_records", "error",
-            f"REGFILE for thread {tid} but the thread contributed no "
-            f"entries",
-            {"tid": tid}))
+            f"REGFILE for context (asid {ctx[0]}, thread {ctx[1]}) but the "
+            f"context contributed no entries",
+            {"asid": ctx[0], "tid": ctx[1]}))
+    for pos in orphan_regfiles:
+        issues.append(Issue(
+            "thread_records", "error",
+            f"REGFILE at record #{pos} is followed by no ENTRY — a REGFILE "
+            f"exists to prime the entry it precedes",
+            {"record": pos}))
 
     if not issues:
         issues.append(Issue(
             "thread_records", "info",
             f"switch flags consistent across {len(entries)} entries; "
-            f"REGFILE precedes first ENTRY for thread(s) "
+            f"REGFILE precedes first ENTRY for (asid, thread) context(s) "
             f"{sorted(first_entry_pos)}"))
     return issues
 
@@ -6638,7 +6847,10 @@ def _check_thread_strand_sequential(entries: list[dict],
 def _check_user_code_identity(templates: list[dict],
                               entries: list[dict],
                               templates_by_id: dict,
-                              binary_path: Path) -> list[Issue]:
+                              binary_path: Path,
+                              image_overlay:
+                                  "list[tuple[int, bytes]] | None" = None
+                              ) -> list[Issue]:
     """Every user-privilege template the CP stream executed must be the
     pinned binary's own code: each template instruction's raw bytes
     must equal the ELF image's bytes at that virtual address.
@@ -6650,6 +6862,11 @@ def _check_user_code_identity(templates: list[dict],
     (the -nostdlib workload shares no code with anything else in the
     guest).  WP-only templates are exempt (wrong-path fetch may wander
     off the binary by design) and reported as info.
+
+    @image_overlay (cst_attach runs): the persisted marker the injector
+    left at the entry point IS the pinned process's live user code —
+    the expected image is the ELF with that overlay applied
+    (:func:`_marker_entry_overlay`), never the raw ELF.
     """
     try:
         import lief
@@ -6670,6 +6887,7 @@ def _check_user_code_identity(templates: list[dict],
     for seg in img.segments:
         if seg.type == seg_load:
             loads.append((int(seg.virtual_address), bytes(seg.content)))
+    loads = _apply_image_overlay(loads, image_overlay)
 
     def image_bytes(va: int, n: int) -> bytes | None:
         for base, blob in loads:
@@ -6774,9 +6992,8 @@ def _check_syscall_fault_nesting(entries: list[dict],
         core, where it never migrates and per-thread attribution is
         exact.  A cross-vCPU migration is explicitly outside that
         clean-attribution envelope — the plugin's migration-detect guard
-        emits a stderr warning and a pin_multivcpu_observed stat when it
-        sees the pinned process span vCPUs, and cst_attach pins the
-        target by default to avoid it.  A migrated thread's USER-code
+        emits a stderr warning when it sees the traced process span
+        vCPUs, and cst_attach pins the target by default to avoid it.  A migrated thread's USER-code
         tid still follows the thread correctly (verified by the thread
         chain and distribution checks); only KERNEL-code per-thread
         identity across the migration is unrecoverable from an
@@ -8147,10 +8364,13 @@ def validate_structural(trace_path: Path,
     issues += _check_unconditional_direction(templates, entries,
                                              templates_by_id, trace_meta)
     issues += _check_iframe_cadence(body_stats, entries, trace_meta)
+    # One pass for both: the REGFILE unit is the (asid label, thread)
+    # context, the THREAD_SWITCH floor is the thread population.
+    _tids, _ctxs = _entry_context_census(entries)
     issues += _check_regfile_records(body_stats, expected_threads,
-                                     entries)
+                                     contexts=_ctxs)
     issues += _check_thread_switch(body_stats, expected_threads,
-                                   system=bool(marker))
+                                   system=bool(marker), thread_ids=_tids)
     if marker:
         # System-mode thread_ids are GUEST-THREAD identities, dense
         # 0..N-1 by first-sighting order — NOT vCPU indexes, and not
@@ -8292,10 +8512,18 @@ def validate(meta_path: Path, trace_path: Path,
              expected_warmup: int | None = 0,
              expected_threads: int = 1,
              start_symbol: str | None = None,
-             marker: bool = False) -> Report:
+             marker: bool = False,
+             injected_marker: bool = False) -> Report:
     meta = json.loads(meta_path.read_text())
     dec = _load_decoder()
     trace_meta, templates, entries = dec.decode_champsim_tracer(trace_path)
+
+    # cst_attach runs (--attach): the injector persisted the START marker
+    # over the first marker-sequence bytes at the ELF entry, so the
+    # expected image for every byte-identity check is the ELF with that
+    # overlay applied.  Empty for non-injected runs.
+    image_overlay = (_marker_entry_overlay(binary_path, meta.get("isa", ""))
+                     if injected_marker else [])
 
     pcmap = PcMap(meta["blocks"])
     template_runs: dict[int, list[tuple[int, int]]] = {
@@ -8504,7 +8732,8 @@ def validate(meta_path: Path, trace_path: Path,
     wpprune = _parse_wpprune_from_command(trace_meta.get("command", ""))
 
     # Disassembly-driven first-order sanity checks.
-    issues += _check_template_raw_bytes(templates, blocks_by_id, binary_path)
+    issues += _check_template_raw_bytes(templates, blocks_by_id, binary_path,
+                                        image_overlay=image_overlay)
     issues += _check_block_insn_counts(templates, blocks_by_id, pcmap,
                                        cp_set, wpprune=wpprune)
     # The per-block opcode/branch-type coverage assertions assume the full
@@ -8684,10 +8913,11 @@ def validate(meta_path: Path, trace_path: Path,
     threads_effective = expected_threads
     issues += _check_thread_distribution(entries, expected_threads,
                                          templates_by_id)
+    _tids, _ctxs = _entry_context_census(entries)
     issues += _check_regfile_records(body_stats, threads_effective,
-                                     entries)
+                                     contexts=_ctxs)
     issues += _check_thread_switch(body_stats, threads_effective,
-                                   system=bool(marker))
+                                   system=bool(marker), thread_ids=_tids)
     issues += _check_thread_record_cadence(
         entries, trace_meta.get("body_record_order") or [])
     # The generated workload is single-threaded, so its user-privilege
@@ -8727,9 +8957,11 @@ def validate(meta_path: Path, trace_path: Path,
                                                trace_meta,
                                                require_nested=True)
         # ASID-pin content gate: user templates executed on CP must be
-        # the pinned binary's own bytes.
+        # the pinned binary's own bytes (with the persisted-marker
+        # overlay applied for cst_attach runs).
         issues += _check_user_code_identity(templates, entries,
-                                            templates_by_id, binary_path)
+                                            templates_by_id, binary_path,
+                                            image_overlay=image_overlay)
 
     # ---- Per-insn regdata semantic checks ----------------------------------
     opcode_names = dict(trace_meta.get("encoding_maps", {}).get("opcode", {}))

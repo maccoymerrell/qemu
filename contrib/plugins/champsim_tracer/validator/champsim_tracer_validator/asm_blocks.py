@@ -232,11 +232,114 @@ def _marker_seq(isa: str, magic: int, seq: int) -> list[str]:
             f"  ori $t0, $t0, 0x{lo16:x}"] * seq
 
 
+def emit_thread_ptr_install(isa: str) -> list[str]:
+    """Install a thread pointer BEFORE the marker, x86_64 only.
+
+    A generated workload is TLS-less, and on the stock x86 boot shape
+    (qemu64, no FSGSBASE) user code cannot write the thread pointer by
+    instruction, so the tracer's thread-identity guard refuses the
+    marker LOUDLY — correct for a real TLS-less process, but the
+    generated workloads exist to exercise the supported shapes, and a
+    real process has a thread pointer.  One arch_prctl(ARCH_SET_FS)
+    (syscall 158, code 0x1002) pointed at the arena installs identity
+    through the kernel exactly as a real runtime does, keeping stock
+    qemu64 in the validated matrix while leaving genuinely TLS-less
+    processes refused per the guard's contract.  The other ISAs'
+    identity paths were green without this and stay byte-identical
+    (empty emission); the thread_test harness carries its own install
+    (_thread_test_asm._TP_SET_PARENT)."""
+    if isa != "x86_64":
+        return []
+    return [
+        "  movq $158, %rax",
+        "  movq $0x1002, %rdi",
+        "  leaq arena(%rip), %rsi",
+        "  syscall",
+    ]
+
+
+# mlock(2) syscall numbers per ISA (the marker-page residency requirement).
+#   x86_64 149 | aarch64/riscv64 (asm-generic) 228 | mipsel (o32) 4154
+_MLOCK_NR = {"x86_64": 149, "aarch64": 228, "riscv64": 228, "mipsel": 4154}
+
+
+def emit_mlock_start_marker(isa: str) -> list[str]:
+    """Lock the page(s) holding the START marker sequence resident BEFORE
+    it executes, so the sequence bytes are always readable at the latched
+    virtual address.
+
+    The system-mode content gate re-reads the START-marker bytes at the
+    latched vaddr through the live address space at every committed
+    address-space change; a marker page paged out at that moment reads as
+    "not traced" and gates the capture off — counted by the ``gated
+    context lost marker page residency`` must-be-0 witness, which fires
+    exactly for a context that WAS gated (same live root as its last
+    gated refresh) and lost the page.  ``mlock(2)`` over a page-aligned, sequence-spanning
+    region is the workload's half of that contract (:doc:`quickstart`).
+
+    Emitted immediately before the caller's START marker; the caller places
+    the ``cst_start_marker`` label at the marker's first instruction (a
+    forward reference the assembler resolves).  Two pages are locked from
+    the page base so the region covers the sequence even if it straddles a
+    page boundary — page-aligned and seq-spanning.  The return value is
+    ignored: mlock is a residency hint, and a failure (e.g. RLIMIT_MEMLOCK)
+    leaves the run correct where the page happens to stay resident, with the
+    plugin's unreadable-at-refresh witness the loud backstop either way."""
+    nr = _MLOCK_NR[isa]
+    if isa == "x86_64":
+        return [
+            "  leaq cst_start_marker(%rip), %rdi",
+            "  andq $-4096, %rdi",          # page base
+            "  movq $8192, %rsi",           # two pages: covers a straddle
+            f"  movq ${nr}, %rax",          # __NR_mlock
+            "  syscall",
+        ]
+    if isa == "aarch64":
+        return [
+            "  adrp x0, cst_start_marker",
+            "  add  x0, x0, :lo12:cst_start_marker",
+            "  bic  x0, x0, #0xfff",        # page base
+            "  mov  x1, #8192",
+            f"  mov  x8, #{nr}",            # __NR_mlock
+            "  svc  #0",
+        ]
+    if isa == "riscv64":
+        return [
+            "  lla  a0, cst_start_marker",
+            "  li   t0, -4096",
+            "  and  a0, a0, t0",            # page base
+            "  li   a1, 8192",
+            f"  li   a7, {nr}",             # __NR_mlock
+            "  ecall",
+        ]
+    # mipsel (o32); .set noreorder is in force — no branches here, so no
+    # delay slots to fill.
+    return [
+        "  la   $a0, cst_start_marker",
+        "  li   $t0, 0xfffff000",
+        "  and  $a0, $a0, $t0",            # page base
+        "  li   $a1, 8192",
+        f"  li   $v0, {nr}",               # __NR_mlock
+        "  syscall",
+    ]
+
+
 def emit_trace_marker(isa: str) -> list[str]:
     """Emit the START marker: the per-ISA marker sequence the plugin
     detects to open and ASID-pin the trace window (trace_window=marker)."""
     magic, _end, seq = _marker_contract()
     return _marker_seq(isa, magic, seq)
+
+
+def emit_trace_marker_locked(isa: str) -> list[str]:
+    """The START marker preceded by its ``mlock`` (residency) prologue and
+    tagged with the ``cst_start_marker`` label the prologue locks.  This is
+    the emission every REAL marker workload should use; the bare
+    :func:`emit_trace_marker` stays for decoy shapes that must NOT open a
+    window and so need neither residency nor a label."""
+    return (emit_mlock_start_marker(isa)
+            + ["cst_start_marker:"]
+            + emit_trace_marker(isa))
 
 
 def emit_trace_syscall_probe(isa: str) -> list[str]:
@@ -426,9 +529,9 @@ def emit_trace_sleep_probe(isa: str, seconds: int) -> list[str]:
 
     The churn test uses this to hold the marker-pinned window open on a
     frozen user clock (sleeping burns no user instructions) while the
-    guest's init forks through enough short-lived processes to roll the
-    ASID space over — the pinned process then wakes and runs the actual
-    workload *after* its ASID generation was recycled, which is the
+    guest's init forks through a stream of short-lived processes — foreign
+    address spaces that the content gate evaluates and rejects (they do not
+    map the marker bytes) while the window stays open, which is the
     content-purity scenario the test asserts.  The timespec lives on the
     stack; the syscall ABI registers are clobbered before the workload
     proper starts, which is harmless (same contract as the other

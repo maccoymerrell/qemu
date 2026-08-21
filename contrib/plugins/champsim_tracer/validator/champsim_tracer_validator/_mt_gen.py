@@ -134,7 +134,7 @@ def _driver_x86_64(n: int, marker: bool) -> list[str]:
                     ".type _start, @function", "_start:"]
     if marker:
         L += _tp_set_driver("x86_64")
-        L += B.emit_trace_marker("x86_64")
+        L += B.emit_trace_marker_locked("x86_64")
         L += B.emit_entry_jump("x86_64", "cst_mt_main")
         L += ["cst_mt_main:"]
         L += B.emit_trace_syscall_probe("x86_64")
@@ -183,7 +183,7 @@ def _driver_aarch64(n: int, marker: bool) -> list[str]:
                     ".type _start, @function", "_start:"]
     if marker:
         L += _tp_set_driver("aarch64")
-        L += B.emit_trace_marker("aarch64")
+        L += B.emit_trace_marker_locked("aarch64")
         L += B.emit_entry_jump("aarch64", "cst_mt_main")
         L += ["cst_mt_main:"]
         L += B.emit_trace_syscall_probe("aarch64")
@@ -241,7 +241,7 @@ def _driver_riscv64(n: int, marker: bool) -> list[str]:
                     ".type _start, @function", "_start:"]
     if marker:
         L += _tp_set_driver("riscv64")
-        L += B.emit_trace_marker("riscv64")
+        L += B.emit_trace_marker_locked("riscv64")
         L += B.emit_entry_jump("riscv64", "cst_mt_main")
         L += ["cst_mt_main:"]
         L += B.emit_trace_syscall_probe("riscv64")
@@ -292,7 +292,7 @@ def _driver_mipsel(n: int, marker: bool) -> list[str]:
                     ".type _start, @function", "_start:"]
     if marker:
         L += _tp_set_driver("mipsel")
-        L += B.emit_trace_marker("mipsel")
+        L += B.emit_trace_marker_locked("mipsel")
         L += B.emit_entry_jump("mipsel", "cst_mt_main")
         L += ["cst_mt_main:"]
         L += B.emit_trace_syscall_probe("mipsel")

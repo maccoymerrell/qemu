@@ -48,8 +48,8 @@ The trace produced (either mode) must show:
     (``validate_structural`` with ``expected_guest_threads=2``).
 """
 
-from .asm_blocks import (emit_trace_marker, emit_trace_marker_end,
-                         emit_entry_jump)
+from .asm_blocks import (emit_trace_marker, emit_trace_marker_locked,
+                         emit_trace_marker_end, emit_entry_jump)
 
 # Per-ISA source templates.  Placeholders:
 #   {marker}     — trace start-marker block at _start ("" without --marker)
@@ -647,7 +647,7 @@ def thread_test_asm(isa: str, marker: bool = False,
     mk = ""
     endmk = ""
     if marker:
-        mk = "\n".join(emit_trace_marker(isa)
+        mk = "\n".join(emit_trace_marker_locked(isa)
                        + emit_entry_jump(isa, "cst_thread_main")
                        + ["cst_thread_main:"])
         endmk = "\n".join(emit_trace_marker_end(isa))

@@ -959,7 +959,7 @@ def _rep_probe_source() -> str:
         "        .globl _start",
         "_start:",
     ]
-    lines += B.emit_trace_marker("x86_64")
+    lines += B.emit_trace_marker_locked("x86_64")
     # A fresh TB after the marker: the marker's own TB is the dropped
     # one-TB segment-open boundary, so the REP must not share it.
     lines += [

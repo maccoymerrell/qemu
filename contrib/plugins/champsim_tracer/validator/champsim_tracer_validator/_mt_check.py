@@ -40,6 +40,8 @@ Author: Maccoy Merrell.  SPDX-License-Identifier: GPL-2.0-or-later
 from __future__ import annotations
 
 import json
+from array import array
+from collections.abc import Sequence
 from pathlib import Path
 
 from . import validator as V
@@ -80,6 +82,37 @@ def _retag(issues: list, thread: int, tid: "int | None") -> list:
         out.append(Issue(f"t{thread}.{i.check}", i.severity,
                          f"[thread {thread} tid {tid}] {i.message}", detail))
     return out
+
+
+class _ThreadStream(Sequence):
+    """One thread's entries, as a lazy view over the decode's own lazy body.
+
+    Holds entry INDICES (an ``array('q')``, a machine word apiece), never
+    the entry dicts: each read goes back through the decode's byte-budgeted
+    sequence, so the checker's residency stays bounded by that budget.  The
+    eager shape this replaces -- ``[e for e in entries if e["thread_id"] ==
+    tid]`` -- pinned every one of a thread's entry dicts simultaneously,
+    which on a system-mode SMP capture re-materialised the body the lazy
+    decode exists to keep off the heap (measured: a 7.85 GB legacy text
+    walked into ~14 GB RSS before the compare had judged anything; the same
+    decode-into-RAM shape the residency ruling removed from the decode
+    stage).  Supports everything the per-thread oracle does to a stream:
+    ``len()``, ``seq[i]``, negative indices, slicing (another view over the
+    same indices), iteration, ``enumerate``, ``reversed``."""
+
+    __slots__ = ("_entries", "_idx")
+
+    def __init__(self, entries, idx):
+        self._entries = entries
+        self._idx = idx
+
+    def __len__(self) -> int:
+        return len(self._idx)
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            return _ThreadStream(self._entries, self._idx[key])
+        return self._entries[self._idx[key]]
 
 
 # ---------------------------------------------------------------------------
@@ -316,8 +349,14 @@ def validate_mt(index_path: Path, trace_path: Path, binary_path: Path,
     # assertion circular.
     owners_by_tid: dict[int, dict[int, int]] = {}
     unlabelled_by_tid: dict[int, int] = {}
-    for e in entries:
+    # One pass also records each tid's entry indices, so the per-thread
+    # streams below are views into the lazy decode rather than lists of
+    # entry dicts (see _ThreadStream for why that distinction is the whole
+    # residency story).
+    idx_by_tid: dict[int, array] = {}
+    for i, e in enumerate(entries):
         etid = int(e.get("thread_id", 0))
+        idx_by_tid.setdefault(etid, array("q")).append(i)
         k = own.of(e["template_id"])
         if k is None:
             unlabelled_by_tid[etid] = unlabelled_by_tid.get(etid, 0) + 1
@@ -409,7 +448,7 @@ def validate_mt(index_path: Path, trace_path: Path, binary_path: Path,
         tid = tid_of_thread.get(k)
         if tid is None:
             continue
-        stream = [e for e in entries if int(e.get("thread_id", 0)) == tid]
+        stream = _ThreadStream(entries, idx_by_tid.get(tid, array("q")))
         owned = [t for t in templates if own.of(t["template_id"]) == k]
         arena = find_symbol(binary_path, metas[k]["arena"]["symbol"])
         t_issues, t_stats = _thread_content_issues(

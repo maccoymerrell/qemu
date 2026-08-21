@@ -507,12 +507,13 @@ def _parse_args() -> argparse.Namespace:
              "workload is built WITHOUT its END marker, opens its window "
              "and exits — the run must then be ended by the "
              "latch_idle_insns dead latch, in BOTH inertness shapes: "
-             "'storm' (a fork loop recycles the dead page-table root, so "
-             "every stamp refresh is forged until the proof-of-life probe "
-             "refuses it) and 'quiet' (no context switch ever happens, so "
-             "only the retirement-driven sweep beat can run the sweep).  "
-             "A run the latch does not close is killed by the watchdog "
-             "and FAILS — this cell exists to prove the backstop fires.")
+             "'storm' (a fork loop schedules foreign address spaces that "
+             "the content gate evaluates to NOT-TRACED, so nothing keeps "
+             "the window alive and the idle stamp ages) and 'quiet' (no "
+             "context switch ever happens, so only the retirement-driven "
+             "sweep beat can age the window out).  A run the latch does "
+             "not close is killed by the watchdog and FAILS — this cell "
+             "exists to prove the backstop fires.")
     common(dl)
     dl.add_argument("--seed", type=_parse_seed, required=True)
     dl.add_argument("--isa", choices=ISA_CHOICES, action="append",
@@ -749,22 +750,22 @@ def _trace_system(args, isa: str, bin_path: Path, plugin: Path,
 
     # The marker (at the workload's _start) opens + ASID-pins the window.
     #
-    # With --simpoints, the window is the COMPOSITION the TODO here used to
-    # defer: system-mode trace_window=simpoint IS a marker window with a
-    # SimPoint schedule inside it (pinned_simpoint_mode).  The START marker
-    # pins the address space and zeroes the user clock; the SimPoint offsets
-    # then position the capture on that clock.  The count-set precondition
-    # the TODO named is met -- the window counter excludes kernel and
-    # wrong-ASID instructions, which is exactly what makes offsets derived
-    # from a user-mode bbv run valid inside a full-system guest.
+    # With --simpoints the window is the explicit COMPOSITION: simpoint
+    # offsets written ONTO the marker window.  The two are separate inputs
+    # and neither implies the other -- the marker says whose instructions
+    # are counted (it pins the address space and zeroes that process's user
+    # clock), the offsets say which intervals of that clock to capture.  A
+    # bare trace_window=simpoint carries no anchor and the plugin refuses it
+    # in system mode.  The count-set precondition is met either way -- the
+    # window counter excludes kernel and wrong-ASID instructions, which is
+    # exactly what makes offsets derived from a user-mode bbv run valid
+    # inside a full-system guest.
     sp_file = getattr(args, "simpoints", None)
+    window_opt = f"trace_window=marker:simulation={args.stop}"
     if sp_file:
-        window_opt = (f"trace_window=simpoint:file={sp_file}"
-                      f"+interval={getattr(args, 'sp_interval', 100000)}"
-                      f"+warmup={getattr(args, 'sp_warmup', 0)}"
-                      f"+simulation={args.stop}")
-    else:
-        window_opt = f"trace_window=marker:simulation={args.stop}"
+        window_opt += (f"+simpoints={sp_file}"
+                       f"+interval={getattr(args, 'sp_interval', 100000)}"
+                       f"+warmup={getattr(args, 'sp_warmup', 0)}")
     plugin_opts = (f"outfile={out_base},wpdepth={args.depth},"
                    f"{window_opt},memdata=1") + _optional_plugin_opts(args)
 
@@ -1133,12 +1134,71 @@ def cmd_analyze(args, isa: str | None = None) -> int:
     return 0
 
 
+def _validate_simpoint_segments(args, isa: str, bin_path: Path,
+                                meta: Path, trace_base_cst: Path) -> int:
+    """The validate stage for a system-mode marker+simpoint composition.
+
+    The subject is the set of per-cluster ``<base>-simpoint_<N>.cst``
+    segments the trace stage wrote, never the single-segment name.  Each
+    segment is a standalone trace that opens mid-program on the latched
+    user clock, so the whole-run content oracle (``V.validate``, whose
+    ground truth is the correct path from program entry) has no defined
+    subject on it; the per-segment structural oracle does — the same
+    split ``simpoint_test`` already makes for the user-mode twin.
+    Segments are decoded in reverse order (independence: segment N must
+    decode as if segment N-1 never existed) and, when more than one was
+    scheduled, the shared templates must agree across segments."""
+    seg_files = sorted(trace_base_cst.parent.glob(
+        f"{trace_base_cst.stem}-simpoint_*.cst"))
+    if not seg_files or not meta.is_file():
+        # Reached only when tracing reported success, so the inputs are
+        # supposed to exist.  Validating nothing is not validating.
+        print(f"validate[{isa}]: FAIL  missing inputs "
+              f"(simpoint segments matching "
+              f"{trace_base_cst.stem}-simpoint_*.cst: {len(seg_files)}, "
+              f"meta={meta.is_file()})")
+        return 1
+    rc = 0
+    for seg in reversed(seg_files):
+        print(f"validate[{isa}] segment {seg.name}:")
+        report = V.validate_structural(seg, expected_threads=1, marker=True,
+                                       pinned_binary=bin_path
+                                       if bin_path.is_file() else None)
+        print(report.summary())
+        if report.errors():
+            rc = 1
+    if len(seg_files) > 1:
+        print(f"validate[{isa}] cross-segment consistency:")
+        xseg = V.validate_cross_segment_consistency(list(seg_files))
+        print(xseg.summary())
+        if xseg.errors():
+            rc = 1
+    # System-mode runs capture the guest console; every scheduled
+    # cluster's segment-close line is asserted, same as the marker path.
+    console = Path(f"{trace_base_cst.parent / trace_base_cst.stem}"
+                   f".console.log")
+    if console.is_file() and _check_segment_coverage(
+            console, label=isa, smp=getattr(args, "smp", 1),
+            system=True):
+        rc = 1
+    return rc
+
+
 def cmd_validate(args, isa: str | None = None) -> int:
     isa = isa or args.isa
     prog = _prog_base(args.out_dir, args.prog)
     bin_path = _bin_path(args.out_dir, prog, isa)
     meta = _meta_path(args.out_dir, prog, isa)
     trace = Path(f"{_trace_base(args.out_dir, prog, isa)}.cst")
+    if getattr(args, "simpoints", None) and getattr(args, "system", False):
+        # A system-mode simpoint-scheduled run never writes <base>.cst:
+        # each scheduled cluster lands in <base>-simpoint_<N>.cst (the
+        # trace stage already reports those names).  Looking for the
+        # single-segment name here failed every successful composition
+        # run for want of a subject.  (User-mode `all` ignores
+        # --simpoints at the trace stage, so only the system composition
+        # takes this branch.)
+        return _validate_simpoint_segments(args, isa, bin_path, meta, trace)
     if not trace.is_file() or not meta.is_file():
         # Reached only when tracing reported success, so the inputs are
         # supposed to exist.  Validating nothing is not validating.
@@ -1159,7 +1219,12 @@ def cmd_validate(args, isa: str | None = None) -> int:
                         expected_warmup=0,
                         expected_threads=1,
                         start_symbol=start_sym,
-                        marker=marker)
+                        marker=marker,
+                        # cst_attach persisted the START marker over the
+                        # entry prologue; byte-identity checks compare
+                        # against the ELF + that overlay.
+                        injected_marker=bool(getattr(args, "attach",
+                                                     False)))
     print(report.summary())
     rc = 1 if report.errors() else 0
     if marker:
@@ -1639,19 +1704,33 @@ def cmd_churn_test(args) -> int:
     ``_system.churn_init``); on MIPS the churn rolls the 8-bit ASID
     space over, forcing the guest kernel to reassign the pinned ASID
     value to foreign processes while the trace window is open.  The
-    pin must follow only the marked process:
+    capture is decided by CONTENT: at every committed address-space
+    change the plugin re-reads the START-marker bytes at the latched
+    virtual address through the live context, and only a context that
+    maps them is traced.  The churn manufactures exactly the pressure
+    that would break a root-identity pin — foreign address spaces created
+    and scheduled while the window is open — and the assertion is that
+    none of them is captured:
 
       * every user-privilege template the CP stream executed must
-        byte-match the marked binary's ELF image (foreign user code
-        leaking past the pin cannot byte-match the -nostdlib workload),
+        byte-match the marked binary's ELF image (foreign user code that
+        does not map the marker bytes cannot byte-match the -nostdlib
+        workload) — the content gate stated offline
+        (``_check_user_code_identity``),
       * the user entries form one control-flow chain (thread_chain),
       * the window closes AT its budget on the user clock
         (user_covered == budget, OK flag) — the workload outlives the
         budget by construction (--hot-iters),
-      * the ASID-name census is readable and the guest actually switched
-        contexts inside the open window (``kexc ASID-write events`` > 0) —
-        without that the pin was never under test and a pass is vacuous,
-      * cst_audit and cst_decode --strict stay clean.
+      * the gate actually re-evaluated while the window was open
+        (``marker gate refreshes`` > 0) — every guest context switch
+        fires one, so zero means no foreign process was ever scheduled
+        and the cell tested nothing,
+      * cst_audit and cst_decode --strict stay clean, and every
+        ``(must be 0)`` census row (including ``gated context lost
+        marker page residency`` — the residency witness, which foreign
+        refreshes must NOT count: a foreign mm that does not map the
+        marker vaddr lands in ``gate refresh evaluated NOT traced``
+        alone) is zero.
     """
     args.system = True
     rc_total = 0
@@ -1679,9 +1758,9 @@ def cmd_churn_test(args) -> int:
         # Guest-side churn actually happened: init echoes its phases.
         # The plugin exits qemu the moment the window closes at budget,
         # so the *completion* echo of the in-flight churn is usually
-        # cut off — its start echo plus the kernel-side scheduling
-        # signature (kexc ASID-write events in the stats log) are the
-        # evidence that churn overlapped the open window.
+        # cut off — its start echo plus the gate-refresh count in the
+        # stats log (every context switch fires one) are the evidence
+        # that churn overlapped the open window.
         console = Path(f"{out_base}.console.log")
         ctext = console.read_text() if console.exists() else ""
         for tag in ("pre-workload churn done", "in-flight churn started"):
@@ -1717,27 +1796,27 @@ def cmd_churn_test(args) -> int:
 
         stats_log = Path(f"{out_base}.stats.log")
         stats_text = stats_log.read_text() if stats_log.is_file() else ""
-        names, owned_names = SYS.parse_pin_asid_names(stats_text)
-        kexc_writes = SYS.parse_kexc_asid_writes(stats_text)
-        if names is None or owned_names is None or kexc_writes is None:
+        refreshes = _stats_value(stats_text, "marker gate refreshes")
+        if not stats_log.is_file() or "marker gate refreshes" not in stats_text:
             print(f"churn_test[{isa}]: FAIL  {stats_log.name} carries no "
-                  f"ASID-name census ('distinct raw ASID names ...' / "
-                  f"'kexc ASID-write events') -- the churn evidence cannot "
+                  f"'marker gate refreshes' row -- the churn evidence cannot "
                   f"be read, so this cell is not adjudicated")
             rc_total = 1
         else:
-            print(f"churn_test[{isa}]: asid_names_since_pin={names} "
-                  f"owned_space_names={owned_names} "
-                  f"kexc_asid_writes={kexc_writes} "
-                  f"(detector report; content checks above are the gate)")
+            print(f"churn_test[{isa}]: marker_gate_refreshes={refreshes} "
+                  f"(content checks above are the gate)")
             # The churn must have reached the kernel while the window was
-            # open.  Every guest context switch writes the ASID register,
-            # so zero of them means no other process was scheduled and the
-            # cell tested nothing -- a pass here would be vacuous.
-            if kexc_writes == 0:
-                print(f"churn_test[{isa}]: FAIL  no ASID writes while the "
-                      f"pinned window was open -- no foreign process was "
-                      f"scheduled, so the pin was never under test")
+            # open.  Every committed guest context switch fires one gate
+            # refresh, so zero of them means no other process was scheduled
+            # and the cell tested nothing -- a pass here would be vacuous.
+            if refreshes == 0:
+                print(f"churn_test[{isa}]: FAIL  no gate refreshes while the "
+                      f"marked window was open -- no foreign process was "
+                      f"scheduled, so the content gate was never under test")
+                rc_total = 1
+            # Every (must be 0) invariant, including the marker-page
+            # residency witness, must hold.
+            if _must0.gate([stats_log], f"churn_test[{isa}]"):
                 rc_total = 1
 
         for tool, extra in (("cst_audit", []), ("cst_decode", ["--strict"])):
@@ -1760,28 +1839,26 @@ def cmd_deadlatch_test(args) -> int:
     the trace window, retires its user instructions, and exits with the
     window still open — the exact subject the dead latch exists for.
     The guest then keeps running in one of two shapes, each of which
-    held the latch inert before its two mechanisms were fixed:
+    held the latch inert before its mechanisms were fixed:
 
-      * ``storm`` — init forks ``/bin/true`` in a loop.  Linux recycles
-        the dead workload's freed page-table root into a successor
-        process, whose every schedule-in and user instruction then
-        arrives in the dead window's name; the stamp refresh must
-        REFUSE those (the marker-page proof-of-life probe), or the idle
-        never accumulates.  The cell asserts the refusals happened
-        (``dead-latch refreshes refused``), so a pass is never vacuous.
+      * ``storm`` — init forks ``/bin/true`` in a loop.  Each successor
+        is a fresh address space that does NOT map the marker bytes at
+        the latched vaddr, so every gate refresh it triggers evaluates
+        to NOT-TRACED and nothing it runs keeps the window alive.  The
+        cell asserts at least one such refresh happened
+        (``gate refresh evaluated NOT traced`` >= 1), so a pass is never
+        vacuous — and because the successor is never captured, the trace
+        stays a clean single-process shape.
       * ``quiet`` — init spins in shell builtins.  No fork, no context
-        switch, no address-space write: the ASID-write sweep trigger is
-        silent, and only the retirement-driven sweep beat can age the
-        window out.
+        switch, no address-space write: no gate refresh fires at all,
+        and only the retirement-driven sweep beat can age the window out.
 
     In both shapes the run must END BY THE LATCH: close reason IDLE,
-    ``dead-latch windows closed (idle insns)`` >= 1, a decodable .cst,
-    and every ``(must be 0)`` census row at zero.  A run that does not
-    close is killed by the clock watchdog and fails — this cell is the
-    backstop's must-fire proof, not a content test (the storm shape's
-    trace deliberately carries up to latch_idle_insns of successor
-    execution between the death and the close; attribution under a
-    recycled root is the separate, open identity issue).
+    ``dead-latch closes (idle insns)`` >= 1, a decodable .cst, the full
+    structural oracle GREEN (no successor is captured, so nothing is
+    tolerated), and every ``(must be 0)`` census row at zero.  A run that
+    does not close is killed by the clock watchdog and fails — this cell
+    is the backstop's must-fire proof.
     """
     args.system = True
     args.end_marker = False
@@ -1825,30 +1902,29 @@ def cmd_deadlatch_test(args) -> int:
                       f"never reported the workload's exit — the latch "
                       f"was not under test")
                 rc_total = 1
-            if "dead-latch close asid=" not in ctext:
-                print(f"deadlatch_test[{isa}/{shape}]: FAIL  no "
-                      f"'dead-latch close' line — whatever closed this "
-                      f"run, it was not the latch")
-                rc_total = 1
+            # The old per-root "dead-latch close asid=" line is gone with the
+            # per-root detector; the close route is judged by the IDLE close
+            # reason (below), which the global idle backstop stamps.
 
             stats_log = Path(f"{out_base}.stats.log")
             stext = stats_log.read_text() if stats_log.is_file() else ""
             closes = _stats_value(stext,
-                                  "dead-latch windows closed (idle insns)")
-            refused = _stats_value(stext,
-                                   "dead-latch refreshes refused")
+                                  "dead-latch closes (idle insns)")
+            not_traced = _stats_value(stext,
+                                      "gate refresh evaluated NOT traced")
             if not closes:
                 print(f"deadlatch_test[{isa}/{shape}]: FAIL  statistics "
                       f"carry no idle-insn dead-latch close")
                 rc_total = 1
-            if shape == "storm" and not refused:
-                print(f"deadlatch_test[{isa}/{shape}]: FAIL  zero "
-                      f"refused refreshes — the recycled-root forgery "
-                      f"this shape exists to present never arose, so "
-                      f"the probe was not under test (vacuous)")
+            if shape == "storm" and not not_traced:
+                print(f"deadlatch_test[{isa}/{shape}]: FAIL  zero gate "
+                      f"refreshes evaluated NOT-TRACED — the foreign "
+                      f"address spaces this shape exists to schedule "
+                      f"never arrived (or were wrongly captured), so the "
+                      f"content gate was not under test (vacuous)")
                 rc_total = 1
             print(f"deadlatch_test[{isa}/{shape}]: closes={closes} "
-                  f"refreshes_refused={refused}")
+                  f"gate_not_traced={not_traced}")
 
             cst = Path(f"{out_base}.cst")
             # The close route comes out of the run's own console line, not
@@ -1861,39 +1937,32 @@ def cmd_deadlatch_test(args) -> int:
                       f"'finished segment' line to name the close route — "
                       f"the thread_end oracle cannot know which arm applies")
                 rc_total = 1
+            elif close_reason != "IDLE":
+                # The idle backstop stamps IDLE; any other close route means
+                # something ELSE ended the run, so the latch was not proven.
+                # (Replaces the old per-root "dead-latch close asid=" console
+                # grep, which the per-root detector removed.)
+                print(f"deadlatch_test[{isa}/{shape}]: FAIL  segment closed "
+                      f"'{close_reason}', not IDLE — the dead latch was not "
+                      f"what closed this run")
+                rc_total = 1
             report = V.validate_structural(cst, expected_threads=1,
                                            expected_guest_threads=1,
                                            marker=True,
                                            close_reason=close_reason)
             print(report.summary())
-            # One named, TRUE tolerance — printed, never silent:
-            #
-            #   storm shape, single-process structure: between the death
-            #   and the close the recycled root's successor process IS
-            #   captured under the stale pin (the open identity gap, task
-            #   #44, bounded here by latch_idle_insns), so oracles that
-            #   assume one process's control flow are inapplicable to this
-            #   shape by construction.
-            # thread_end is NO LONGER tolerated: the sweep-close arm of
-            # the oracle now states the contract instead of excusing a
-            # failure (format.rst §4.2a — a context with nothing pending
-            # at the close ends unstamped), so a thread_end error here is
-            # a real one again.
-            tolerated: set[str] = set()
-            if shape == "storm":
-                tolerated |= {"syscall_transitions", "thread_chain",
-                              "thread_distribution",
-                              "syscall_fault_nesting", "range_continuity"}
-            hard = [e for e in report.errors() if e.check not in tolerated]
+            # Nothing is tolerated any more.  Under content-as-gate the
+            # storm's forked successors never map the marker bytes, so
+            # they are never captured: the trace is a clean single-process
+            # shape in BOTH shapes, and every structural error is real.
+            # (The old tolerance set excused oracles that assumed one
+            # process's control flow, because a recycled root used to
+            # capture the successor under a stale pin — task #44, which the
+            # content gate closes by construction.)
             for e in report.errors():
-                if e.check in tolerated:
-                    print(f"deadlatch_test[{isa}/{shape}]: tolerated "
-                          f"[{e.check}] (named open issue, see the cell's "
-                          f"tolerance note): {e.message}")
-            for e in hard:
                 print(f"deadlatch_test[{isa}/{shape}]: FAIL [{e.check}] "
                       f"{e.message}")
-            if hard:
+            if report.errors():
                 rc_total = 1
             if _must0.gate([stats_log], f"deadlatch_test[{isa}/{shape}]"):
                 rc_total = 1

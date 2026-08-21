@@ -248,6 +248,10 @@ def emit_source(cfg: CFG, plans: list[B.BlockPlan],
         "_start:",
     ])
     if marker:
+        # Thread identity must exist BEFORE the window opens: the plugin
+        # latches identity at marker fire (x86_64-only emission; see
+        # emit_thread_ptr_install).
+        lines.extend(B.emit_thread_ptr_install(isa))
         if start_marker:
             # Trace marker first thing in _start, so it executes in this
             # workload's own address space — the plugin opens + ASID-pins
@@ -261,7 +265,12 @@ def emit_source(cfg: CFG, plans: list[B.BlockPlan],
             # marker in the image, nothing else can open the window.  The
             # probes below and the END marker are unaffected — they run
             # in-window either way.
-            lines.extend(B.emit_trace_marker(isa))
+            #
+            # mlock the marker page first: system mode re-reads the START
+            # bytes at the latched vaddr on every address-space switch, so
+            # the page must stay resident (emit_trace_marker_locked wraps
+            # the mlock + label + sequence).
+            lines.extend(B.emit_trace_marker_locked(isa))
         # One returning syscall in-window so the system-mode validator can
         # check the user->kernel->fall-through round trip.  No-op in user
         # mode (kernel not traced); harmless before the workload starts.

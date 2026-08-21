@@ -804,8 +804,8 @@ private:
     ptrdiff_t frame_idx_for_block(const BBTemplate *piece, uint64_t resume,
                                   uint64_t asid) const;
     /* Completion candidate for a just-sealed BB claiming to be some frame's
-     * resume suffix.  @seal_asid is the pinned process's effective asid at
-     * the seal (StepIn::pinned_asid = pin_effective_asid): a frame can only
+     * resume suffix.  @seal_asid is the pinned process's representative
+     * asid at the seal (StepIn::pinned_asid): a frame can only
      * complete against a suffix sealed in ITS OWN (thread,asid) — the thread
      * dimension is implicit (PathBuilder is per-vCPU-thread TLS), and this
      * asid is the second half of the (thread,asid) key.  USER frames match

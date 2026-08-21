@@ -697,22 +697,14 @@ trace does not own.  Its ``udata`` is the head fragment of the TB's
 per-translation fragment list.  The callback has two layers: a short
 shared prologue, then the PathBuilder step.
 
-``trace_this_ctx`` is a bare ``is_active`` mirror everywhere the
-ownership question is trivial — user mode, an unpinned system trace,
-and the wide-register system pins (CR3 / TTBR0 / SATP) whose ASID is
-a reliable per-process id, foreign-dropped inside the step as before.
-It diverges only for a **narrow-ASID (MIPS) system pin**, where the
-architectural address-space name is 8 bits wide and an operating system
-reassigns it under live processes: there only a vCPU whose live address
-space is owned traces, and a separate light callback, ``vcpu_pin_probe``
-(gated on the companion ``pin_probe`` slot, registered ahead of
-``vcpu_tb_exec``), runs for every other in-segment TB.  The light probe
-carries the whole per-foreign-TB budget — a user-clock cursor tick, one
-owned-set lookup on user TBs, and the capture mute the heavy drop path
-used to set — with no ``VClockPauseGuard`` and no PathBuilder step; on
-the TB that re-acquires an owned address space it flips
-``trace_this_ctx`` to 1 so the heavy callback's re-loaded brcond fires
-for that same TB.
+``trace_this_ctx`` is a bare ``is_active`` mirror.  Every supported
+target names an address space by a **page-table root** — x86 ``CR3``,
+AArch64 ``TTBR0``, RISC-V ``SATP``, MIPS ``CP0 PWBase`` — which is a
+reliable per-process id, so a block executing in an address space the
+trace does not own is dropped inside the step and no context has to be
+gated out of dispatch at all.  The gate exists to skip the dispatch
+*between* segments, which is where the saving is: user mode, an
+unpinned system trace and a marker pin all read the same mirror.
 
 Ownership itself is one set lookup.  ``qemu_plugin_get_process_id()``
 returns an opaque monotonic id QEMU mints per distinct architectural
@@ -720,12 +712,17 @@ address-space value (see :doc:`qemu_modifications`), ``g_owned`` holds
 the ids of the address spaces whose windows are open, and a block is
 ours exactly when its live id is in that set — so **every thread inside
 an owned address space is traced**, and the thread id only labels
-strands on the wire.  The one thing an opaque id cannot carry is a
-lifetime, and on a narrow name that matters: if a thread already seen
-inside an owned space reappears under an id the trace does not own, the
-pin **re-binds** to the new id (``pin_rebind_locked``), the old one stops
-being owned that instant, and the window's wire identity, liveness
-stamps and thread set move across unchanged.  That is the whole rule.
+strands on the wire.  **There is no re-bind rule.**  The id is interned
+from the page-table root, which an operating system cannot re-point at a
+second live address space, so a window is never transferred to a name it
+did not open under: no verdict is deferred, nothing is quarantined, no
+block of the traced process is ever held back waiting for a witness, and
+an END marker can never be swallowed by a suspended span.  The rule that
+once followed a thread across address-space names was measured unsound —
+``fork()`` copies the thread pointer verbatim, so a forked child presented
+as a thread of an owned space under an unowned name and the pin walked
+onto it — and root-keyed ownership then made it unnecessary.  That is the
+whole rule.
 
 The wire's address-space naming is deliberately a separate thing from
 the ownership key: each owned window records ``{root_phys, sig}`` from
@@ -1777,7 +1774,7 @@ step — TLS cursors can only be reset from their own thread.
 A mid-run open executes on one vCPU but activates **every**
 vCPU's scoreboard (``is_active`` mirror plus the budget sentinel,
 each ``is_active`` write followed by ``refresh_ctx_gates`` to stamp
-the derived ``trace_this_ctx`` / ``pin_probe`` gates): on an SMP
+the derived ``trace_this_ctx`` gate): on an SMP
 guest the pinned process's threads run wherever the scheduler put
 them, and a vCPU left inactive would silently carry no trace
 coverage — and no user-clock contribution — for the whole segment.  The user-instruction clock's delta source is likewise

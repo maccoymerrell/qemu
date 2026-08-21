@@ -51,8 +51,8 @@ extern "C" {
 #define CST_TLS_HOT __attribute__((tls_model("initial-exec")))
 
 /* ===== Constants ===== */
-/* Upper bound for every per-vCPU state array (g_rep_state, g_pin_vcpu,
- * cp_chain(), path_builder(), the CP capture accumulators, ...).  All
+/* Upper bound for every per-vCPU state array (g_rep_state, cp_chain(),
+ * path_builder(), the CP capture accumulators, ...).  All
  * accessors clamp, so an out-of-range cpu_index degrades to sharing the
  * last slot rather than indexing out of bounds. */
 inline constexpr unsigned CST_PIN_MAX_VCPUS = 1024;
@@ -1312,24 +1312,14 @@ typedef struct {
     /* Context gate for the heavy per-TB capture callback (vcpu_tb_exec).
      * Folds is_active AND pinned-context-ownership into ONE JIT-testable
      * slot so a foreign / unowned TB is never dispatched at all — no
-     * callback, no vclock pause, no drop decision.  Byte-identical to
-     * is_active everywhere the ownership question is trivial (user mode,
-     * unpinned system, and the wide-register system pins whose ASID is a
-     * reliable process id); it diverges only for a narrow-ASID (MIPS)
-     * system pin, where a recycled ASID cannot distinguish processes and
-     * the physical-page probe adjudicates.  Maintained EVENT-DRIVEN (see
-     * refresh_ctx_gates): at every is_active edge, at each ASID-write
-     * commit, and when the light probe re-acquires the pinned process. */
+     * callback, no vclock pause, no drop decision.  A bare is_active
+     * mirror on every supported target: an address space is named by its
+     * page-table root (CR3 / TTBR0 / SATP / CP0 PWBase), a reliable
+     * per-process id, so a foreign block is dropped inside the step and
+     * no context has to be gated out of dispatch.  Maintained
+     * EVENT-DRIVEN (see refresh_ctx_gates): at every is_active edge and
+     * at each committed address-space write. */
     uint64_t trace_this_ctx;
-    /* Companion gate for the light re-acquisition probe (vcpu_pin_probe),
-     * set only for a narrow-ASID system pin.  1 exactly when a segment is
-     * active but this vCPU's dwell is NOT a confirmed-owned pinned
-     * context: the light probe runs per such TB (a user-clock cursor
-     * tick, the physical-page content probe on user TBs, and the capture
-     * mute the heavy drop path used to set) and flips trace_this_ctx to 1
-     * on the TB that re-acquires the process.  0 (probe never fires) for
-     * user mode, unpinned system, and wide-register pins. */
-    uint64_t pin_probe;
     /* "A path-event drain is owed on this vCPU".  Written by QEMU, not by
      * the plugin: 1 on every cpu_plugin_evq_push, 0 on every
      * qemu_plugin_drain_cpu_events (see qemu_plugin_cpu_events_pending_slot).

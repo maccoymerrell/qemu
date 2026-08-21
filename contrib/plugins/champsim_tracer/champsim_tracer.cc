@@ -253,9 +253,9 @@ static std::atomic<uint64_t> g_pinned_pid{0};
  * consumer behaves exactly as it did against the single pin.
  *
  * Generalizes the single g_pinned_asid gate: `g_pinned_asid` is retained
- * as the FIRST/representative owned root (so the narrow-ASID MIPS path,
- * pin_effective_asid, cst_pinned_asid_root/sig and the "marker mode armed"
- * predicate keep working single-process), while the actual foreign-drop
+ * as the FIRST/representative owned root (so cst_pinned_asid_root/sig and
+ * the "marker mode armed" predicate keep working single-process), while
+ * the actual foreign-drop
  * predicate (pin_user_tb_owned, wide-register) and the coarse-FF
  * asid_match flag consult SET MEMBERSHIP here.
  *
@@ -1266,25 +1266,6 @@ static const char *cmdline_cpu_option(void)
 }
 
 /*
- * NARROW-ASID PATH: DEAD, PENDING ITS REMOVAL.
- *
- * This flag armed the physical-page dwell/verify machinery that stood in
- * for a page-table root on MIPS.  MIPS now HAS a root -- CP0 PWBase, on any
- * model with Config3.PW -- and the tracer refuses to install in system mode
- * on a model that has none (see the install refusal in
- * qemu_plugin_install), so no supported configuration can reach the narrow
- * path.  Nothing sets the flag any more; every `if (g_pin_reuse_guard)`
- * below is unreachable.
- *
- * Left in place for exactly one commit, so that the identity change and the
- * excision of the machinery it obsoletes are separately reviewable and
- * separately bisectable.  An unreachable branch is untrustable surface: the
- * follow-up commit deletes the flag, pin_page_sig(), the per-owner page
- * maps, vcpu_pin_probe() and every branch listed here.
- */
-static constexpr bool g_pin_reuse_guard = false;
-
-/*
  * ASID-SWEEP WITNESS (the guest side of the rollover question).
  *
  * Ownership does NOT depend on this and never reads it.  A window is owned
@@ -1343,91 +1324,6 @@ static void asid_sweep_note(uint64_t raw)
         g_asid_sweep_count.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
-/*
- * Physical-page process identity (narrow-ASID targets; currently MIPS).
- *
- * The wide-register targets pin a page-table base (CR3 / TTBR0 / SATP):
- * equality is stable per process and distinct across processes for the
- * whole run.  MIPS exposes no such register — the CP0 audit recorded in
- * mips_get_plugin_state (target/mips/cpu.c) found Context.PTEBase is a
- * per-CPU constant on a 32-bit Linux guest and KScratch / MemoryMapID
- * absent from the 24K/34K-class models — so the bare EntryHi.ASID pin
- * inherits every weakness of an 8-bit, per-CPU, generation-recycled
- * space: a rollover hands the pinned VALUE to a foreign process (whose
- * user code then traces as if pinned), hands the pinned PROCESS a new
- * value (its execution stops matching), and a migration lands the
- * process on a vCPU where its per-CPU ASID differs from the pin.
- *
- * The identity that survives all three is the user code itself: the
- * pinned process's code pages carry the same BYTES no matter which
- * ASID value or vCPU it currently holds, while a foreign process
- * aliasing the same virtual addresses runs different bytes (a distinct
- * binary at that VA) — and byte-identical code shared from the page
- * cache is the same content, which the trace records identically
- * either way.  So on narrow-ASID targets the pin's AUTHORITY is a map
- * of executed user-code pages (virtual page -> {physical page, content
- * signature}), seeded at the marker and grown by every verified user
- * TB; the per-vCPU ASID value is a dwell tag:
- *
- *   - an ASID write ends the vCPU's dwell (confirmed=false; the value
- *     may have been handed to anyone);
- *   - the first user TB of a dwell must probe the map: a hit-match
- *     confirms the dwell (one probe per context switch, not per TB); a
- *     content MISMATCH on a mapped page is a foreign process and the
- *     TB is dropped; an unmapped page stays unverified and the TB is
- *     dropped (the genuine process resumes on a page it has executed,
- *     so it confirms immediately; a foreign process that never touches
- *     mapped pages parks unverified forever — traced never);
- *   - a user TB probing hit-match under a DIFFERENT ASID value
- *     re-acquires the process: the vCPU's dwell tag re-pins to the live
- *     value (rollover re-numbering and cross-vCPU migration both land
- *     here, one-TB lossy).
- *
- * The physical frame is the FAST path, not the authority: a frame match
- * confirms without touching guest memory, but a frame mismatch is not
- * proof of a foreign process — the guest evicts a clean file-backed
- * code page under memory pressure and re-faults it to a DIFFERENT frame
- * with identical bytes (observed reliably across the churn test's sleep
- * window: 512 MiB guest, hundreds of short-lived processes).  Anchoring
- * on the frame alone stalled there — the marker page, the map's only
- * seed, re-faulted while the pinned process slept, so every revisit
- * mismatched and the process (its entire hot region unmapped, having
- * run only post-rollover) never re-acquired.  Content is the true
- * invariant: on a frame mismatch the probe reads the page's bytes and
- * compares their signature, so a re-faulted page reads as a hit (and
- * refreshes its frame) while a genuinely foreign page reads as a
- * mismatch.  Reading guest memory is confined to that mismatch path —
- * the frame fast-path and the confirmed-dwell hot path never touch it.
- *
- * Verification runs only on narrow-ASID targets (g_pin_reuse_guard) in
- * the CP step glue under exec_lock — the map needs no lock of its own;
- * the marker's seed takes exec_lock around it.  The map is immortal
- * (see "Immortal process-wide aggregates" in docs/architecture.rst) and
- * reset at each marker fire.  Known residual, accepted: two live
- * instances of the SAME binary share byte-identical text, so a
- * re-acquisition cannot tell them apart (their user code is identical;
- * data capture may interleave) — the duplicate-binary discriminator
- * would need private (written) page anchors, deliberately not spent
- * here.
- */
-/* CST_PIN_MAX_VCPUS moved to champsim_tracer.h: the per-vCPU state
- * arrays now span several TUs (chain assembler, PathBuilder, memory
- * recorder), all sized and clamped identically. */
-struct PinVcpuState {
-    /* The RAW architectural address-space value this vCPU last ran owned
-     * code under (x86 CR3, MIPS EntryHi.ASID, ...).  Wire naming and the
-     * effective-pin compare read it; it is NEVER the ownership key. */
-    std::atomic<uint64_t> asid{CST_ASID_UNPINNED};
-    /* The OWNED address space (QEMU process id) this vCPU is executing in,
-     * 0 when it is executing something the trace does not own.  THIS is the
-     * ownership key. */
-    std::atomic<uint64_t> pid{0};
-    /* Mirror of (pid != 0), read by refresh_ctx_gates to drive the
-     * JIT-visible context gate.  Settled at every committed address-space
-     * write and by the light probe's re-acquisition. */
-    std::atomic<bool> confirmed{false};
-};
-static PinVcpuState g_pin_vcpu[CST_PIN_MAX_VCPUS];
 static constexpr uint64_t PIN_PAGE_MASK = ~(uint64_t)0xFFF;
 
 /*
@@ -2366,20 +2262,7 @@ static void asid_identity_reset(void)
  * process byte-identity), each other process's own-code fingerprint. */
 static inline uint32_t resolve_asid_index(unsigned int cpu_index)
 {
-    /* Narrow-ASID latch (MIPS, g_pin_reuse_guard, not trace-all): the live
-     * EntryHi.ASID is an 8-bit recycled value, so the per-entry memory asid
-     * must be the OWNER's stable index (held in g_vcpu_cur_asid_index across
-     * a kernel excursion), not asid_root_to_index(live value) — which would
-     * mint a spurious new index the moment the OS rolls the process's ASID
-     * over.  User mode (asid 0, owner 0's anchor is (0,0)) and single-pin
-     * (owner 0 -> index 0) stay byte-identical.  Wide targets, trace-all
-     * (every context by its live root, Stage B2), and unpinned runs keep the
-     * live-root mapping unchanged. */
-    if (g_pin_reuse_guard && !marker_trace_all() &&
-        g_pinned_asid.load(std::memory_order_relaxed) != CST_ASID_UNPINNED &&
-        cpu_index < CST_PIN_MAX_VCPUS) {
-        return g_vcpu_cur_asid_index[cpu_index];
-    }
+    (void)cpu_index;
     uint64_t root = qemu_plugin_get_addr_space_id();
     return asid_root_to_index(root, asid_first_sight_sig(root));
 }
@@ -2534,12 +2417,9 @@ static void marker_refuse_no_root(void)
 static bool pin_user_tb_owned(unsigned int cpu_index, uint64_t live_pid,
                               uint64_t live_tid)
 {
+    (void)cpu_index;
     (void)live_tid;
     bool owned = owned_contains_locked(live_pid);
-    if (cpu_index < CST_PIN_MAX_VCPUS) {
-        g_pin_vcpu[cpu_index].pid.store(owned ? live_pid : 0,
-                                        std::memory_order_relaxed);
-    }
     if (!owned) {
         /* Not an address space this trace owns.  This counter IS the drop
          * path: a zero over a run with foreign execution in it means the
@@ -2557,57 +2437,24 @@ static bool pin_user_tb_owned(unsigned int cpu_index, uint64_t live_pid,
 }
 
 
-/* The per-vCPU effective pin value: what kernel-TB attribution and the
- * asid_match flag compare against.  Narrow targets follow the vCPU's
- * dwell tag; wide targets use the marker-time value. */
-static inline uint64_t pin_effective_asid(unsigned int cpu_index,
-                                          uint64_t pinned_asid)
-{
-    if (g_pin_reuse_guard && cpu_index < CST_PIN_MAX_VCPUS) {
-        return g_pin_vcpu[cpu_index].asid.load(std::memory_order_relaxed);
-    }
-    return pinned_asid;
-}
-
 /*
- * Recompute this vCPU's context gates (trace_this_ctx / pin_probe) from
- * the live segment-active flag and the pin-ownership state, and stamp
- * them into the scoreboard.  This is the single event-driven maintainer
- * — called at every is_active edge, at each committed ASID write, and on
- * a light-probe re-acquisition — so the heavy per-TB callback is gated
- * by ONE JIT-testable slot instead of the runtime foreign-drop decision.
+ * Recompute this vCPU's context gate (trace_this_ctx) from the live
+ * segment-active flag and stamp it into the scoreboard.  This is the
+ * single event-driven maintainer — called at every is_active edge and at
+ * each committed address-space write — so the heavy per-TB callback is
+ * gated by ONE JIT-testable slot instead of a runtime decision.
  *
- * Divergence from a bare is_active mirror happens ONLY for a narrow-ASID
- * (MIPS) system pin: there a recycled EntryHi.ASID cannot distinguish
- * processes, so only a physical-page-confirmed dwell (g_pin_vcpu
- * .confirmed) is traced and every other context runs the light probe.
- * User mode, unpinned system, and the wide-register pins (CR3 / TTBR0 /
- * SATP — a reliable per-process id, foreign-dropped in the heavy step as
- * before) keep trace_this_ctx == is_active and never arm the probe, so
- * their traces are byte-identical to the pre-gating path.
+ * The gate is a bare is_active mirror on every supported target: an
+ * address space is named by its page-table root (x86 CR3, AArch64 TTBR0,
+ * RISC-V SATP, MIPS CP0 PWBase), a reliable per-process id, so ownership
+ * is decided by set membership inside the heavy step and no context has
+ * to be gated out of dispatch to keep the attribution honest.
  */
 static inline void refresh_ctx_gates(unsigned int cpu_index)
 {
     bool active = qemu_plugin_u64_get(g_scoreboard.is_active, cpu_index) != 0;
-    /* Trace-all captures EVERY context, so the heavy callback must dispatch
-     * for all in-segment TBs on all ISAs — trace_this_ctx == is_active, no
-     * narrow-ASID divergence (the dwell probe would otherwise gate out
-     * unconfirmed contexts we intend to trace).  The clock still rides the
-     * marker pin via pin_user_tb_owned in the heavy step. */
-    bool diverge = g_pin_reuse_guard && !marker_trace_all() &&
-        g_pinned_asid.load(std::memory_order_relaxed) != CST_ASID_UNPINNED;
-    if (!diverge) {
-        qemu_plugin_u64_set(g_scoreboard.trace_this_ctx, cpu_index,
-                            active ? 1 : 0);
-        qemu_plugin_u64_set(g_scoreboard.pin_probe, cpu_index, 0);
-        return;
-    }
-    bool conf = cpu_index < CST_PIN_MAX_VCPUS &&
-        g_pin_vcpu[cpu_index].confirmed.load(std::memory_order_relaxed);
     qemu_plugin_u64_set(g_scoreboard.trace_this_ctx, cpu_index,
-                        (active && conf) ? 1 : 0);
-    qemu_plugin_u64_set(g_scoreboard.pin_probe, cpu_index,
-                        (active && !conf) ? 1 : 0);
+                        active ? 1 : 0);
 }
 
 /* Synchronous ASID-write hook: keep the per-vCPU asid_match flag in
@@ -2663,19 +2510,9 @@ static void asid_write_track_cb(unsigned int vcpu_index, uint64_t new_asid)
     g_rec_mutex_unlock(&exec_lock);
     qemu_plugin_u64_set(g_scoreboard.asid_match, vcpu_index, match);
     if (pinned != CST_ASID_UNPINNED && vcpu_index < CST_PIN_MAX_VCPUS) {
-        /* A committed address-space write is exactly when ownership can
-         * change, so the per-vCPU verdict (and the JIT-visible context
-         * gate it drives) is settled HERE, off the per-TB path.  A vCPU
-         * that switched into an unowned space stops dispatching the heavy
-         * callback and stops tracing until it switches back into one. */
-        g_pin_vcpu[vcpu_index].pid.store(match ? pid : 0,
-                                         std::memory_order_relaxed);
-        g_pin_vcpu[vcpu_index].confirmed.store(match != 0,
-                                               std::memory_order_relaxed);
-        if (match) {
-            g_pin_vcpu[vcpu_index].asid.store(new_asid,
-                                              std::memory_order_relaxed);
-        }
+        /* A committed address-space write is exactly when the JIT-visible
+         * context gate can change, so it is settled HERE, off the per-TB
+         * path. */
         refresh_ctx_gates(vcpu_index);
     }
 
@@ -4535,23 +4372,10 @@ static void start_trace_segment(const char *label,
              * kernel excursion before the first user TB then folds to the
              * entering process rather than the KPTI kernel CR3.  Just after
              * asid_identity_reset, so this first-sighting maps to index 0 —
-             * single-address-space stays byte-identical.
-             *
-             * Narrow-ASID latch (MIPS): the opener is owner 0, whose stable
-             * anchor (marker_anchor, not the recycled EntryHi.ASID) is the
-             * process key; derive index 0 from it so the seed matches every
-             * later user-TB attribution (seal path below). */
-            const OwnedSpace *os = g_pin_reuse_guard
-                ? owned_info_locked(
-                      g_pin_vcpu[cpu_index].pid.load(std::memory_order_relaxed))
-                : nullptr;
-            if (os) {
-                seed_asid_index = asid_root_to_index(os->root_phys, os->sig);
-            } else {
-                uint64_t seed_root = qemu_plugin_get_addr_space_id();
-                seed_asid_index = asid_root_to_index(
-                    seed_root, asid_first_sight_sig(seed_root));
-            }
+             * single-address-space stays byte-identical. */
+            uint64_t seed_root = qemu_plugin_get_addr_space_id();
+            seed_asid_index = asid_root_to_index(
+                seed_root, asid_first_sight_sig(seed_root));
         }
         g_vcpu_cur_asid_index[cpu_index] = seed_asid_index;
     }
@@ -9723,7 +9547,7 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
      * vCPU's EFFECTIVE pin: the dwell tag on narrow-ASID targets (which
      * re-pins across rollover/migration), the marker-time value on the
      * wide-register ones. */
-    in.pinned_asid = pin_effective_asid(cpu_index, pinned_asid);
+    in.pinned_asid = pinned_asid;
     in.live_asid = live_asid;
     in.live_priv = live_priv;
     /* CAPTURE ownership drives the foreign-ASID drop, the kernel-excursion
@@ -9763,9 +9587,9 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
             in.cur_tp_ok = true;
         }
     }
-    /* Wide-register roots are per-process identities; the narrow-ASID (MIPS)
-     * pin's reuse guard is armed exactly when they are not. */
-    in.asid_is_identity = !g_pin_reuse_guard;
+    /* Every supported target names an address space by a page-table root,
+     * which is a per-process identity. */
+    in.asid_is_identity = true;
     /* Does the trace CAPTURE the address space this block is executing in?
      * The kernel keep rule refuses a block whose live root is nobody's the
      * trace owns (see kexc_kernel_kept_foreign_root); asking here keeps the
@@ -9916,26 +9740,10 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
          * root maps to the same index) so a subsequent kernel excursion
          * folds this thread's regfile/FieldState CONTEXT to the entering
          * process, not the KPTI kernel CR3.  Set every user TB (not only on
-         * a tid change) so it holds the entering asid at the excursion.
-         *
-         * Narrow-ASID latch (MIPS, not trace-all): key on the CONFIRMED
-         * owner's stable anchor rather than the recycled EntryHi.ASID, so a
-         * rollover of the process's value never mints a spurious index and
-         * the memory/context asid stays pinned to the owning process across
-         * its whole run.  Trace-all keeps the live-root mapping (Stage B2:
-         * every context by its own root). */
-        const OwnedSpace *os = (g_pin_reuse_guard && !marker_trace_all())
-            ? owned_info_locked(
-                  g_pin_vcpu[cpu_index].pid.load(std::memory_order_relaxed))
-            : nullptr;
-        if (os) {
-            g_vcpu_cur_asid_index[cpu_index] =
-                asid_root_to_index(os->root_phys, os->sig);
-        } else {
-            uint64_t live_root = qemu_plugin_get_addr_space_id();
-            g_vcpu_cur_asid_index[cpu_index] =
-                asid_root_to_index(live_root, asid_first_sight_sig(live_root));
-        }
+         * a tid change) so it holds the entering asid at the excursion. */
+        uint64_t live_root = qemu_plugin_get_addr_space_id();
+        g_vcpu_cur_asid_index[cpu_index] =
+            asid_root_to_index(live_root, asid_first_sight_sig(live_root));
         /* Migration-detect guard: record this vCPU in the pinned process's
          * per-segment user-vCPU set (every user TB, not only on a tid
          * change), firing one warning if the process spans vCPUs. */
@@ -9960,100 +9768,6 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
 }
 
 /*
- * Light per-TB probe for the unowned / unconfirmed context under a
- * narrow-ASID system pin.  Registered (only when g_pin_reuse_guard)
- * BEFORE the heavy vcpu_tb_exec and gated on the pin_probe scoreboard
- * slot, so it dispatches ONLY while a segment is active and this vCPU's
- * dwell is not a confirmed-owned pinned context — never for user mode,
- * unpinned system, or a wide-register pin.  It is the whole per-foreign-
- * TB budget: no VClockPauseGuard, no PathBuilder step, and exec_lock is
- * taken only on the user-TB probe path.  Everything the heavy callback's
- * foreign-ASID arm used to do for a foreign span (mute the per-insn
- * capture callbacks, set the deferred prev aside so nothing seals across
- * the gap, tick the user-clock cursor) is done here instead — cheaply — and
- * on the TB that re-acquires the pinned process it flips trace_this_ctx
- * to 1 so the heavy callback's re-loaded brcond fires for that same TB.
- */
-static void vcpu_pin_probe(unsigned int cpu_index, void *udata)
-{
-    /* Wrong-path simulation re-dispatches the TB's callbacks on the same
-     * thread that already owns the CP step; it touches no pin state. */
-    if (g_wp_in_progress) {
-        return;
-    }
-    BBTemplate *cur_tb_tmpl = (BBTemplate *)udata;
-    uint64_t icount = qemu_plugin_u64_get(g_scoreboard.insn_count, cpu_index);
-
-    /* Ownership re-acquisition (user TBs only; a kernel TB's ownership is
-     * decided by the kexc machinery in the heavy path).  One O(1) owned-set
-     * lookup per unconfirmed user TB until the vCPU is back in an address
-     * space this trace owns. */
-    if (cur_tb_tmpl && cpu_index < CST_PIN_MAX_VCPUS &&
-        !g_pin_vcpu[cpu_index].confirmed.load(std::memory_order_relaxed) &&
-        qemu_plugin_get_priv_level() == 0) {
-        uint64_t live_asid = qemu_plugin_get_addr_space_id();
-        uint64_t live_pid = live_process_id();
-        g_rec_mutex_lock(&exec_lock);
-        PinVcpuState &ps = g_pin_vcpu[cpu_index];
-        /* Plain owned-set membership, and nothing else: there is no
-         * re-bind rule for an unowned space to be admitted by. */
-        bool owned = owned_contains_locked(live_pid);
-        if (owned) {
-            owned_note_raw_asid(live_pid, qemu_plugin_get_narrow_asid());
-            ps.pid.store(live_pid, std::memory_order_relaxed);
-            ps.asid.store(live_asid, std::memory_order_relaxed);
-            ps.confirmed.store(true, std::memory_order_relaxed);
-            qemu_plugin_u64_set(g_scoreboard.asid_match, cpu_index, 1);
-            refresh_ctx_gates(cpu_index);   /* trace_this_ctx=1, pin_probe=0 */
-            g_rec_mutex_unlock(&exec_lock);
-            /* Do NOT advance the user cursor here: the heavy callback
-             * fires for this very TB (its brcond re-loads trace_this_ctx)
-             * and folds this TB's delta into the user clock itself. */
-            return;
-        }
-        /* An address space this trace does not own — the drop this gate
-         * exists for.  Counted, so a zero proves the check never ran. */
-        g_stats.pin_unverified_dropped++;
-        g_rec_mutex_unlock(&exec_lock);
-    }
-
-    /* Unowned this TB.  Mute the per-insn capture callbacks (still gated
-     * on is_active, they self-drop on g_capture_mute) so the foreign
-     * span's registers/memops never pile into the pinned process's
-     * pending state.
-     *
-     * Dropping the deferred prev, though, is a USER-TB decision only.  The
-     * physical-page map adjudicates USER-CODE identity; a kernel TB carries
-     * no user-code PC to probe (see the priv==0 guard above), so a kernel
-     * TB reaching here is a synchronous excursion — a fault/exception
-     * handler — whose ownership the heavy path decides with the kexc
-     * machinery, not the dwell.  The pinned process's own fault handler
-     * routes through this light probe whenever a transient foreign ASID
-     * write (a brief kernel overlay, e.g. a MIPS EntryHi ASID scratch) has
-     * un-confirmed the dwell an instant before the exception; destroying
-     * the interrupted user block's pending seal HERE drops that block
-     * outright (silent CP corruption — the resume then seals a later block
-     * against the handler's fetch, and the interrupted block never emits).
-     * Leave prev intact for kernel TBs: the pinned process resumes at the
-     * faulting instruction and seals the interrupted block against its real
-     * successor (the case-(c) fault path), exactly as the heavy+kexc path
-     * would have; a genuinely foreign span still drops prev when its own
-     * USER code resumes and mismatches the physical-page map (the priv==0
-     * probe above).  INSIDE an async window prev is likewise preserved
-     * (the SUSPENDED contract — the resume seals the interrupted branch
-     * against its real target). */
-    g_capture_mute = true;
-    if (!qemu_plugin_in_async_int() && qemu_plugin_get_priv_level() == 0) {
-        g_mem_recorder.clear_cp(cpu_index);
-        path_builder(cpu_index).clear_prev();
-    }
-    /* User-clock cursor tick: advance this vCPU's seen cursor so the
-     * foreign span's instructions never fold into the pinned process's
-     * user clock when it resumes (the delta is measured from HERE). */
-    user_seen_advance(cpu_index, icount);
-}
-
-/*
  * ---------------------------------------------------------------------------
  * The event-queue absorber: the per-TB drain point.
  * ---------------------------------------------------------------------------
@@ -10064,10 +9778,13 @@ static void vcpu_pin_probe(unsigned int cpu_index, void *udata)
  * context is both in-segment AND owned.  Every window where that gate is
  * shut is a window where the queue has NO consumer at all:
  *
- *   W1 a foreign / unconfirmed context (narrow-ASID pins: trace_this_ctx
- *      diverges from is_active only there, so this is where it was caught);
- *   W2 inter-segment (is_active == 0 zeroes trace_this_ctx AND pin_probe on
- *      every ISA, so neither existing callback dispatches);
+ *   W1 a foreign / unconfirmed context under the narrow-ASID pin, where
+ *      trace_this_ctx diverged from is_active — the window this absence
+ *      was first caught in.  That path is gone: the gate mirrors is_active
+ *      on every target, so an in-segment foreign TB now dispatches the
+ *      heavy callback (which drops it) and drains on the way;
+ *   W2 inter-segment (is_active == 0 zeroes trace_this_ctx on every ISA,
+ *      so the heavy callback does not dispatch);
  *   W3 after the marker window closes -- W2's code path, mirrored to every
  *      vCPU;
  *   W4 pre-first-segment once the queue has been enabled, between simpoint
@@ -10088,7 +9805,7 @@ static void vcpu_pin_probe(unsigned int cpu_index, void *udata)
  * exception edges around it produced.
  *
  * REGISTERED LAST, after vcpu_tb_exec.  Each cond_cb re-loads its slot when
- * it runs (the same ordering the budget cb and pin_probe already rely on), so
+ * it runs (the same ordering the budget cb already relies on), so
  * on a TB where the heavy callback dispatched, its own drain has already
  * zeroed evq_pending and this callback's brcond is false: the light path runs
  * on exactly the TBs where nothing else drained, and the traced path pays one
@@ -10142,8 +9859,8 @@ static void vcpu_evq_absorb(unsigned int cpu_index, void *udata)
      * the absorber has no block to attribute and never asks for one. */
     uint64_t pinned = g_pinned_asid.load(std::memory_order_relaxed);
     in.pinned = pinned != CST_ASID_UNPINNED;
-    in.pinned_asid = pin_effective_asid(cpu_index, pinned);
-    in.asid_is_identity = !g_pin_reuse_guard;
+    in.pinned_asid = pinned;
+    in.asid_is_identity = true;
     in.live_priv = qemu_plugin_get_priv_level();
     in.live_asid = qemu_plugin_get_addr_space_id();
     /* Read-only peek, never the minting sample: minting a thread id here
@@ -10182,8 +9899,8 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
      * pinned-context ownership), so the JIT only dispatches it in-segment
      * for a context this trace owns.  Inter-segment dispatch is handled
      * solely by inline_add (icount/budget) and vcpu_tb_check_budget; a
-     * foreign / unowned in-segment TB is handled by the light
-     * vcpu_pin_probe instead (narrow-ASID pins) or never diverges at all.
+     * foreign / unowned in-segment TB dispatches like any other and the
+     * step drops it, so the gate never diverges from is_active.
      *
      * udata = the head fragment of this TB's per-translation fragment
      * list, set when the translation was armed in vcpu_tb_trans.
@@ -10220,16 +9937,11 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
         uint64_t icount_ff = qemu_plugin_u64_get(g_scoreboard.insn_count,
                                                  cpu_index);
         uint64_t delta = user_seen_advance(cpu_index, icount_ff);
-        /* Positioning accuracy only, lock-free: compare against the
-         * vCPU's effective pin (dwell tag on narrow-ASID targets) but
-         * without the map probe — a rollover during a long fast-forward
-         * can drift the count until the process's next verified dwell;
-         * the traced window itself is always probe-verified. */
+        /* Positioning accuracy only, lock-free: the live page-table root
+         * against the representative pin, with no lock taken. */
         bool ff_counted =
             qemu_plugin_get_addr_space_id() ==
-                pin_effective_asid(cpu_index,
-                                   g_pinned_asid.load(
-                                       std::memory_order_relaxed)) &&
+                g_pinned_asid.load(std::memory_order_relaxed) &&
             qemu_plugin_get_priv_level() == 0;
         /* The positioning clock follows the same window-clock rule as the
          * traced fold in events_path_step (which this fast path bypasses):
@@ -11048,14 +10760,11 @@ static bool marker_claim(void *udata, MarkerWhich which, uint64_t *pc_out)
     return true;
 }
 
-/* Open the marker trace window on @cpu_index.  The three WIN_MARKER
- * first-open paths — wide-register, narrow-ASID, and legacy single-pin —
- * share this exact body: guard against a redundant open, then window +
- * user-clock reset + segment start.  @root_phys is logged only on the
- * narrow-ASID path (@have_root_phys); the trace-affecting statements are
- * identical across all three callers.  The caller holds exec_lock. */
-static void marker_open_trace_window(unsigned int cpu_index, uint64_t asid,
-                                     bool have_root_phys, uint64_t root_phys)
+/* Open the marker trace window on @cpu_index.  Both WIN_MARKER first-open
+ * paths — wide-register and legacy single-pin — share this exact body:
+ * guard against a redundant open, then window + user-clock reset + segment
+ * start.  The caller holds exec_lock. */
+static void marker_open_trace_window(unsigned int cpu_index, uint64_t asid)
 {
     if (g_trace_segments.is_active() || g_trace_segments.is_shutting_down()) {
         return;
@@ -11068,21 +10777,11 @@ static void marker_open_trace_window(unsigned int cpu_index, uint64_t asid,
      * (kernel calls are traced but not counted); start the counter here at
      * the marker's icount. */
     user_count_reset(cpu_index, lo);
-    if (have_root_phys) {
-        fprintf(stderr,
-                "champsim_tracer: marker fired at icount %" PRIu64
-                ", asid 0x%" PRIx64 " priv=%d (0=user,3=kernel) "
-                "pc=0x%" PRIx64 " root_phys=0x%" PRIx64
-                " — tracing %" PRIu64 " insns\n",
-                lo, asid, qemu_plugin_get_priv_level(),
-                qemu_plugin_get_pc(), root_phys, span);
-    } else {
-        fprintf(stderr, "champsim_tracer: marker fired at icount %" PRIu64
-                ", asid 0x%" PRIx64 " priv=%d (0=user,3=kernel) pc=0x%" PRIx64
-                " — tracing %" PRIu64 " insns\n",
-                lo, asid, qemu_plugin_get_priv_level(),
-                qemu_plugin_get_pc(), span);
-    }
+    fprintf(stderr, "champsim_tracer: marker fired at icount %" PRIu64
+            ", asid 0x%" PRIx64 " priv=%d (0=user,3=kernel) pc=0x%" PRIx64
+            " — tracing %" PRIu64 " insns\n",
+            lo, asid, qemu_plugin_get_priv_level(),
+            qemu_plugin_get_pc(), span);
     start_trace_segment("marker", lo, hi, /* warmup= */ 0, span,
                         cpu_index, /* simpoint_weight= */ 0.0);
 }
@@ -11338,12 +11037,6 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
          * page, virtual and physical (see the OwnedSpace field comment). */
         os.marker_vpage = vpage;
         os.marker_pphys = root_phys;
-        if (cpu_index < CST_PIN_MAX_VCPUS) {
-            g_pin_vcpu[cpu_index].asid.store(asid, std::memory_order_relaxed);
-            g_pin_vcpu[cpu_index].pid.store(pid, std::memory_order_relaxed);
-            g_pin_vcpu[cpu_index].confirmed.store(true,
-                                                  std::memory_order_relaxed);
-        }
         pin_note_thread_naming(asid, tid);
         if (first_open) {
             /* First window: pin the representative, seed its identity
@@ -11353,9 +11046,7 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
             g_pinned_pid.store(pid, std::memory_order_relaxed);
             asid_sweep_reset();
             g_pin_repr_sig.store(sig, std::memory_order_relaxed);
-            marker_open_trace_window(cpu_index, asid,
-                                     /* have_root_phys= */ g_pin_reuse_guard,
-                                     root_phys);
+            marker_open_trace_window(cpu_index, asid);
             /* Assign this window's compact asid index (index 0) with its own
              * marker-page signature.  Runs AFTER start_trace_segment (which
              * resets the per-segment identity map) so the pre-registration
@@ -11368,12 +11059,10 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
              * representative's), and recompute this vCPU's gates so its TBs
              * begin dispatching the heavy callback.  Other vCPUs running
              * this space pick it up at their next address-space write. */
-            if (!g_pin_reuse_guard && sig) {
+            if (sig) {
                 asid_set_user_sig(asid, sig);
             }
-            asid_root_to_index(os.root_phys,
-                               g_pin_reuse_guard ? sig
-                                                 : asid_first_sight_sig(asid));
+            asid_root_to_index(os.root_phys, asid_first_sight_sig(asid));
             qemu_plugin_u64_set(g_scoreboard.asid_match, cpu_index, 1);
             refresh_ctx_gates(cpu_index);
             fprintf(stderr,
@@ -11440,12 +11129,6 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
          * page, virtual and physical (see the OwnedSpace field comment). */
         os.marker_vpage = vpage;
         os.marker_pphys = root_phys;
-        if (cpu_index < CST_PIN_MAX_VCPUS) {
-            g_pin_vcpu[cpu_index].asid.store(asid, std::memory_order_relaxed);
-            g_pin_vcpu[cpu_index].pid.store(pid, std::memory_order_relaxed);
-            g_pin_vcpu[cpu_index].confirmed.store(true,
-                                                  std::memory_order_relaxed);
-        }
         pin_note_thread_naming(asid, tid);
     }
     g_rec_mutex_unlock(&exec_lock);
@@ -11507,7 +11190,7 @@ static void vcpu_marker_cb(unsigned int cpu_index, void *udata)
     }
 
     g_rec_mutex_lock(&exec_lock);
-    marker_open_trace_window(cpu_index, asid, /* have_root_phys= */ false, 0);
+    marker_open_trace_window(cpu_index, asid);
     g_rec_mutex_unlock(&exec_lock);
 }
 
@@ -11696,11 +11379,6 @@ static void vcpu_marker_end_cb(unsigned int cpu_index, void *udata)
             g_owned.erase(pid);
             g_owned_last_sched.erase(pid);
             g_owned_last_sched_insns.erase(pid);
-            if (cpu_index < CST_PIN_MAX_VCPUS) {
-                g_pin_vcpu[cpu_index].pid.store(0, std::memory_order_relaxed);
-                g_pin_vcpu[cpu_index].confirmed.store(false,
-                                                  std::memory_order_relaxed);
-            }
             /* Other windows remain open — do NOT close the segment.  Drop
              * only this space: recompute the emitting vCPU's gates/flag so
              * its TBs stop being owned; other vCPUs that were running it
@@ -12553,26 +12231,13 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             QEMU_PLUGIN_COND_GE, g_scoreboard.budget, (1ULL << 63),
             (void *)head_fragment);
     }
-    /* Light re-acquisition probe (narrow-ASID system pins only).  Gated
-     * on pin_probe and registered BEFORE the heavy callback so that on
-     * the TB re-acquiring the pinned process it flips trace_this_ctx to
-     * 1, and the heavy callback's brcond — re-loaded from the scoreboard
-     * — fires for that same TB (the identical ordering trick the budget
-     * cb uses above).  Not registered for user mode or wide-register
-     * pins, so those paths carry no extra per-TB brcond. */
-    if (g_pin_reuse_guard) {
-        qemu_plugin_register_vcpu_tb_exec_cond_cb(
-            tb, vcpu_pin_probe, QEMU_PLUGIN_CB_NO_REGS,
-            QEMU_PLUGIN_COND_GE, g_scoreboard.pin_probe, 1,
-            (void *)head_fragment);
-    }
     /* Heavy callback: chain assembler, WP simulator, body-entry
      * emission.  Gated via cond_cb on trace_this_ctx (is_active folded
      * with pinned-context ownership) so it is NOT dispatched at all
      * inter-segment OR for a foreign / unowned context — the JIT emits a
      * brcond and skips the call, sparing the vclock pause and the drop
      * decision the dropped foreign TB used to pay.  For user mode,
-     * unpinned system, and wide-register pins trace_this_ctx mirrors
+     * unpinned system, and every system pin trace_this_ctx mirrors
      * is_active exactly, so the cb fires per TB just as it did before. */
     qemu_plugin_register_vcpu_tb_exec_cond_cb(
         tb, vcpu_tb_exec, QEMU_PLUGIN_CB_RW_REGS,
@@ -12583,9 +12248,9 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
      * UNCONDITIONAL — every translated TB on every target carries it, with
      * no ownership, privilege or segment condition — because the windows it
      * exists for are precisely the ones where every such condition is
-     * false.  Registering it under `if (g_pin_reuse_guard)` the way the pin
-     * probe is registered would cover one target and one of the five
-     * windows; that was round 3's mistake and it is not repeated here.
+     * false.  Registering it under an ownership or target condition would
+     * cover one target and one of the five windows; that was round 3's
+     * mistake and it is not repeated here.
      *
      * REGISTERED LAST.  Per-TB callbacks run in registration order and each
      * cond_cb re-loads its slot, so on any TB where the heavy vcpu_tb_exec

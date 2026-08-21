@@ -6775,7 +6775,17 @@ static void finish_trace_segment(bool prev_executed = true,
          * still print rep_fanout for visibility into where the
          * arch-vs-BBV divergence comes from. */
         /* wire_user_insns / clock_minus_wire: the OWNED_CP-vs-user_covered
-         * comparison, computed by the run that produced both numbers.  A
+         * comparison, computed by the run that produced both numbers.
+         *
+         * SCOPE CONTRACT (#73): both terms count USER instructions only —
+         * the window clock bills user retirement and the wire term counts
+         * user templates.  A kernel-side emission drop is invisible to
+         * this identity by construction, so a 0 here certifies the USER
+         * ledger and nothing else; kernel completeness is the epoch's
+         * billed==published property, certified by its own gates.  Never
+         * quote this 0 for the kernel side.
+         *
+         * A
          * nonzero residual is instructions the window clock billed to the
          * owned process that no user template carries — the clock's bill is
          * a delta of insn_count reads, so anything retired between two owned

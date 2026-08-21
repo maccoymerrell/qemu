@@ -63,26 +63,25 @@ static void append_branch_breakdown(GString *report, const Stats &stats)
  * policy says keep dispatching until the block seals (END, BUDGET,
  * CEILING).
  *
- * Printed whenever anything was recorded, or whenever the falsifier arm
- * was on, so a run that legitimately leaves nothing unsealed prints
- * nothing here and its zero is read off the counter rows above.
+ * Printed whenever anything was recorded, so a run that legitimately
+ * leaves nothing unsealed prints nothing here and its zero is read off the
+ * counter rows above.
  */
 static void append_unsealed_at_close(GString *report)
 {
     const CloseUnsealedSummary s = close_unsealed_summary();
     const std::vector<CloseUnsealedRow> &rows = close_unsealed_rows();
-    if (s.blocks == 0 && !s.falsified) {
+    if (s.blocks == 0) {
         return;
     }
     g_string_append_printf(report,
-        "Unsealed true-BBs at a close%s:\n"
+        "Unsealed true-BBs at a close:\n"
         "  closes observed              %14" PRIu64 "\n"
         "  closes leaving one unsealed  %14" PRIu64 "\n"
         "  unsealed blocks (all closes) %14" PRIu64 "\n"
         "  PEAK blocks at one close     %14" PRIu64 "\n"
         "  PEAK contexts at one close   %14" PRIu64 "  (close #%" PRIu64
         ", %s)\n",
-        s.falsified ? "  [CST_UNSEALED_FALSIFY — NOT A MEASUREMENT]" : "",
         s.closes, s.closes_with, s.blocks, s.peak_blocks, s.peak_contexts,
         s.peak_close_seq, s.peak_reason ? s.peak_reason : "-");
     if (s.rows_dropped) {
@@ -255,8 +254,6 @@ void append_stats_summary(GString *report, const char *label,
         { "SMP dup: CFG-impossible re-emissions one entry later (must be 0)",
                                                  stats.smp_dup_wrongpc_reemit },
         { "  claim-ledger checks performed",      stats.smp_dup_ledger_checks },
-        { "  falsifier fires (CST_SMP_DUP_FALSIFY)",
-                                                 stats.smp_dup_falsifier_fires },
         { "SMP cond: seals whose successor came from another thread's dispatch",
                                                  stats.smp_seal_cross_thread_succ },
         { "SMP cond: guest-thread migrations between vCPUs",
@@ -484,19 +481,8 @@ void append_stats_summary(GString *report, const char *label,
         { "retention entries walked",            stats.retention_scan_events },
         { "retention events owned",              stats.retention_events_owned },
         { "retention events refused",            stats.retention_events_refused },
-        { "retention appends from untraced events (must be 0)",
-                                                stats.retention_appends_from_untraced_events },
         { "seal successor from foreign fault (must be 0)",
                                                 stats.seal_successor_from_foreign_fault },
-        { "rcheck seals compared",               stats.rcheck_seals },
-        { "rcheck ENTER in-async compared",      stats.rcheck_cmp_enter_in_async },
-        { "rcheck ENTER not-in-async compared",  stats.rcheck_cmp_enter_not_async },
-        { "rcheck RETURN in-async compared",     stats.rcheck_cmp_return_in_async },
-        { "rcheck RETURN not-in-async compared", stats.rcheck_cmp_return_not_async },
-        { "rcheck events ours",                  stats.rcheck_cmp_ours },
-        { "rcheck events foreign",               stats.rcheck_cmp_foreign },
-        { "rcheck resume-pc mismatches",         stats.rcheck_mismatch_resume_pc },
-        { "rcheck in-async mismatches",          stats.rcheck_mismatch_in_async },
         /* ---- close census (see Stats: CLOSE CENSUS) ---- */
         { "census closes",                       stats.census_closes },
         { "census frames opened",                stats.census_frames_opened },
@@ -531,8 +517,6 @@ void append_stats_summary(GString *report, const char *label,
                                                 stats.close_peer_holder_flushes },
         { "  insns those flushes emitted",
                                                 stats.close_peer_holder_insns_recovered },
-        { "peer builders holding work and NOT flushed (must be 0)",
-                                                stats.close_peer_holders_skipped },
         { "closes that flushed a peer AHEAD of the closing vCPU",
                                                 stats.close_flush_reordered },
         { "  builders the dispatch clock moved ahead",

@@ -109,11 +109,6 @@ public:
      * when there is no chain. */
     bool in_flight_is_system() const;
 
-    /* Name the in-flight chain on @out: entry pc, fragment count,
-     * instruction count, privilege, and the entry pc that is about to break
-     * it.  Diagnostic (CST_CHAINDROP_DIAG). */
-    void describe_in_flight(std::FILE *out, uint64_t breaking_pc) const;
-
     /* Drop the in-flight chain.
      *
      * Two callers mean two different things by this.  After finalize() it

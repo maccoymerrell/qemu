@@ -59,10 +59,14 @@ uint32_t g_smc_revision_cap = 1024;   /* SMC per-PC revision cap (smc_plan §5-A
 /* ---- #77 diagnostic ring buffer (gated on CST_RING) -------------------
  * Records recent correct-path BB starts ('C') and wrong-path instruction
  * PCs ('W') into an in-memory ring (no I/O on the hot path).  A periodic
- * overwrite dump to /tmp/rv_ring.txt means the last dump before QEMU is
- * killed shows the steady-state CP loop + the WP running through it.  A
- * one-shot dump to /tmp/rv_ring_onset.txt fires the first time a sustained
- * near-PC CP run is seen, capturing the WP that ran BEFORE the loop formed. */
+ * overwrite dump to rv_ring.txt means the last dump before QEMU is killed
+ * shows the steady-state CP loop + the WP running through it.  A one-shot
+ * dump to rv_ring_onset.txt fires the first time a sustained near-PC CP
+ * run is seen, capturing the WP that ran BEFORE the loop formed.
+ *
+ * Both land in the trace outfile's own directory (beside the .cst and its
+ * .stats.log), never on the OS disk: a run whose outputs are placed on a
+ * data volume must not have a diagnostic sink quietly writing elsewhere. */
 namespace {
 struct CstRingEvt { char tag; uint64_t pc; };
 constexpr uint32_t CST_RING_SZ = 32768;
@@ -72,10 +76,23 @@ int        g_cst_ring_on = -1;
 uint64_t   g_cst_last_cp_pc = 0;
 uint64_t   g_cst_loop_run = 0;
 bool       g_cst_onset_dumped = false;
+/* Directory the dumps go in, taken from the outfile at install time.  A
+ * dump cannot precede the install, so the "." fallback is unreachable in
+ * a real run; it keeps the writer total if one ever does. */
+char      *g_cst_ring_dir = nullptr;
 
-void cst_ring_dump_to(const char *path)
+void cst_ring_set_output_path(const char *outfile)
 {
+    g_free(g_cst_ring_dir);
+    g_cst_ring_dir = outfile ? g_path_get_dirname(outfile) : nullptr;
+}
+
+void cst_ring_dump_to(const char *name)
+{
+    char *path = g_build_filename(g_cst_ring_dir ? g_cst_ring_dir : ".",
+                                  name, nullptr);
     FILE *f = fopen(path, "w");
+    g_free(path);
     if (!f) {
         return;
     }
@@ -103,7 +120,7 @@ void cst_ring_push(char tag, uint64_t pc)
     /* Periodic overwrite dump on TOTAL event count (C or W), so a
      * wrong-path-dominated stream (runaway WP excursion) still dumps. */
     if ((g_cst_ring_head % 200000) == 0) {
-        cst_ring_dump_to("/tmp/rv_ring.txt");
+        cst_ring_dump_to("rv_ring.txt");
     }
 
     if (tag != 'C') {
@@ -120,7 +137,7 @@ void cst_ring_push(char tag, uint64_t pc)
         g_cst_loop_run = 0;
     }
     if (!g_cst_onset_dumped && g_cst_loop_run > 12000) {
-        cst_ring_dump_to("/tmp/rv_ring_onset.txt");
+        cst_ring_dump_to("rv_ring_onset.txt");
         g_cst_onset_dumped = true;
     }
 }
@@ -1243,15 +1260,6 @@ static bool tiddiag_on(void)
     return tiddiag_level() > 0;
 }
 
-/* CST_TID2_DIAG: stderr-only condition instrument for the SMP async-owner
- * work — which vCPU mints identities when, and which vCPU receives async
- * interrupts in whose context.  Never wire content. */
-static bool tid2diag_on(void)
-{
-    static const bool v = getenv("CST_TID2_DIAG") != nullptr;
-    return v;
-}
-
 /* CST_TIDDIAG=2: trace every transition of the thread-pointer register as
  * sampled on THIS vCPU, at whatever privilege the TB runs at, so an offline
  * check can answer whether the register discriminates KERNEL strands (a
@@ -1583,7 +1591,7 @@ static uint32_t thread_identity_sample(unsigned int cpu_index, int live_priv)
             tid = g_vcpu_cur_tid[cpu_index];
             g_thread_tid_map->emplace(tp, tid);
             g_stats.tid_task_aliased++;
-            if (tiddiag_on() || tid2diag_on()) {
+            if (tiddiag_on()) {
                 fprintf(stderr, "champsim_tracer: [tiddiag] entry-alias: "
                         "task=0x%" PRIx64 " -> tid=%u (vcpu=%u)\n",
                         tp, tid, cpu_index);
@@ -1595,11 +1603,6 @@ static uint32_t thread_identity_sample(unsigned int cpu_index, int live_priv)
                  * no user identity to join — a kernel thread's own strand. */
                 g_stats.tid_kernel_task_minted++;
             }
-        }
-        if (tid2diag_on() && g_thread_tid_next != next_before) {
-            fprintf(stderr, "champsim_tracer: [tid2] MINT vcpu=%u priv=%d "
-                    "tp=0x%" PRIx64 " tid=%u\n",
-                    cpu_index, live_priv, tp, tid);
         }
         if (live_priv != 0) {
             g_vcpu_alias_pending[cpu_index] = false;   /* consumed */
@@ -2274,12 +2277,6 @@ const char *g_cst_emit_site = "seal";
  * UINT32_MAX outside a close.  Read by PathBuilder::flush_final to
  * classify PEER-slot extents (stash vs live cursor). */
 unsigned int g_cst_closing_cpu = UINT32_MAX;
-
-bool cst_smp_diag(void)
-{
-    static const bool v = getenv("CST_SMP_DIAG") != nullptr;
-    return v;
-}
 
 /* CST_JUMP_DIAG mirrors (see champsim_tracer_path_builder.h): the depth
  * pipeline's provenance, published so the online step-discipline assertion
@@ -3454,12 +3451,6 @@ Stats *g_current_hist_bucket = nullptr;  /* extern in stats.h */
  */
 static void reset_segment_local_state(unsigned int cpu_index)
 {
-    if (getenv("CST_SEGDIAG")) {
-        fprintf(stderr, "champsim_tracer: [segdiag] reset_segment_local_state"
-                " bb_map=%zu active=%d\n",
-                g_template_store.bb_count(),
-                (int)g_trace_segments.is_active());
-    }
     g_mutex_lock(&data_lock);
     /* Clearing bb_map_ drops the old BBTemplates and their
      * accumulated emit_count; the next commit_true_bb rebuilds each
@@ -3604,22 +3595,11 @@ void user_raw_clock_unbilled(uint64_t insns)
  * start, e.g. the very first TB of a lo=0 window) credits nothing and
  * leaves single-segment runs byte-identical.  No-op in system mode, whose
  * window clocks bill by retirement folds.
- *
- * CST_SEG_OPEN_CREDIT_OFF=1 severs the credit (falsifier lever, the
- * CST_REP_FACTS_OFF precedent): it reproduces the published-but-unbilled
- * open-boundary shape on demand so the validator's per-segment
- * clock_minus_wire gate can be proven able to fire.  Never set it on a
- * production run.
  */
 static void user_raw_clock_open_credit(uint64_t lo, uint64_t icount_now,
                                        const BBTemplate *cross_head)
 {
     if (g_system_mode || !cross_head) {
-        return;
-    }
-    static const bool credit_off =
-        getenv("CST_SEG_OPEN_CREDIT_OFF") != nullptr;
-    if (credit_off) {
         return;
     }
     uint64_t tb_len = 0;
@@ -4205,11 +4185,6 @@ static void start_trace_segment(const char *label,
                             (uint64_t)BUDGET_INACTIVE_SENTINEL);
         refresh_ctx_gates((unsigned)i);
     }
-    if (getenv("CST_SMP_DIAG")) {
-        fprintf(stderr, "champsim_tracer: [smpdiag] segment open on cpu %d: "
-                "num_vcpus=%d\n", (int)cpu_index, qemu_plugin_num_vcpus());
-    }
-
     uint64_t span = stop > start ? stop - start : 0;
     progress_step = span >= 10 ? span / 10 : 1;
     progress_next = start + progress_step;
@@ -4457,9 +4432,7 @@ static void smp_claim_report(const char *what, const SmpClaim &cur,
 }
 
 /* One check per emitted entry; @tid ledger updated afterwards.  Fires
- * Stats::smp_dup_adjacent_claims / smp_dup_wrongpc_reemit; the falsifier
- * arm (CST_SMP_DUP_FALSIFY) replays the previous claim through the same
- * predicates once per run so the plumbing is provably able to fire. */
+ * Stats::smp_dup_adjacent_claims / smp_dup_wrongpc_reemit. */
 static void smp_claim_check(uint32_t tid, const BBTemplate *t,
                             uint32_t lo, uint32_t hi, uint64_t seq,
                             unsigned int cpu_index, uint32_t depth)
@@ -4501,18 +4474,6 @@ static void smp_claim_check(uint32_t tid, const BBTemplate *t,
         smp_claim_report("DUPLICATE re-emission one entry later", cur, p2,
                          p1);
     }
-    /* Falsifier: prove the predicate + counter + report path can fire on
-     * this run's own data (a synthetic re-claim of p1 behind itself —
-     * never written to the wire). */
-    static const bool falsify = getenv("CST_SMP_DUP_FALSIFY") != nullptr;
-    static bool falsified = false;
-    if (falsify && !falsified && live(p1) &&
-        smp_claims_overlap(p1, p1) &&
-        smp_succ_excludes(p1, smp_claim_start_pc(p1))) {
-        falsified = true;
-        g_stats.smp_dup_falsifier_fires++;
-        smp_claim_report("FALSIFIER synthetic re-claim", p1, p1, SmpClaim{});
-    }
     L.last[1] = p1;
     L.last[0] = cur;
 }
@@ -4524,53 +4485,11 @@ static void smp_claim_check(uint32_t tid, const BBTemplate *t,
  * is counted (Stats::smp_close_stamp_mispredict) rather than left silent
  * — the validator's thread_end oracle remains the enforcement.
  *
- * A must-be-0 row that has never been SEEN to fire is not evidence of
- * anything: of the 70 instrumented SMP cells that reported this row
- * before the arm below existed, all 70 read 0 — equally consistent with
- * a correct prediction and with a detector wired to nothing.  CST_SMP_
- * STAMP_FALSIFY resolves that ambiguity by inverting the prediction once
- * per run at a flush that really ran, so the comparison, the counter and
- * the report are exercised on the run's own data.  It perturbs the copy
- * the COMPARISON reads — @predicted is taken by value, after the flush
- * has already run, and is read nowhere else — never the smp_last_emitter
- * map that decides the stamp, so no emission changes, exactly as CST_SMP_
- * DUP_FALSIFY's synthetic re-claim is never written to the wire.
- *
- * That is measured, not merely argued: a fixed user-mode program traced
- * armed and unarmed produces a byte-identical .cst while this row moves
- * 0 -> 1.  Reaching that measurement took three corrections worth
- * recording, because each first produced a confident wrong answer.  The
- * comparison needs a same-arm control (two unarmed runs differed, so the
- * first "the wire changed" verdict was measuring nothing); the outfile
- * path and the environment block both sit on the guest stack, so the arms
- * must share one output path and the control must set a DECOY variable of
- * equal length that the plugin never reads; and one 8-byte register field
- * holding a guest stack pointer varies between two runs of the SAME arm
- * and has to be masked before any cross-arm claim.  Under those controls
- * every arm hashes alike.  See validator-side ab_stamp.sh in the arc's
- * run directory.
  */
 static void smp_stamp_mispredict_note(bool emitted, bool predicted)
 {
-    static const bool falsify = getenv("CST_SMP_STAMP_FALSIFY") != nullptr;
-    static bool falsified = false;
-    if (falsify && !falsified) {
-        falsified = true;
-        predicted = !predicted;
-        if (cst_smp_diag()) {
-            fprintf(stderr, "champsim_tracer: [smpdiag] FALSIFIER stamp "
-                    "prediction inverted at a flush that %s\n",
-                    emitted ? "emitted" : "emitted nothing");
-        }
-    }
     if (emitted != predicted) {
         g_stats.smp_close_stamp_mispredict++;
-        if (cst_smp_diag()) {
-            fprintf(stderr, "champsim_tracer: [smpdiag] close stamp "
-                    "MISPREDICT: predicted %s, flush %s\n",
-                    predicted ? "emit" : "no-emit",
-                    emitted ? "emitted" : "emitted nothing");
-        }
     }
 }
 
@@ -4599,53 +4518,14 @@ static void smp_stamp_mispredict_note(bool emitted, bool predicted)
  * no arm anywhere classified 98 peer slots as 77 stash and 21 live cursor,
  * over 21 cells.  The old zero was an ISA blind spot.
  *
- * Both rows are classification outcomes rather than claims that work went
- * unpublished, so both arms are SYNTHETIC, in the CST_SMP_STAMP_FALSIFY
- * family: they perturb the copies of the three facts that the
- * CLASSIFICATION reads, once per run, and never the machine state those
- * facts were read from.  CST_SMP_PEER_LIVE_FALSIFY drives one real peer
- * close down the live-cursor arm; CST_SMP_PEER_INFLIGHT_FALSIFY drives one
- * down the in-flight arm inside it.  Each still requires a genuine peer
- * close with a genuine held slot to reach this function at all, so the arm
- * proves the predicate chain, the counters and the report lines are wired
- * to a reachable site rather than merely quiet.
- *
- * What the arm fabricates it also PRINTS: the diagnostic names the real
- * (stash, cursor, in-flight) triple beside the forced one, so an armed
- * run's record says what the machine actually reported.  Neither arm is on
- * by default and neither is read by tracer logic; being counters-only,
- * neither can change a byte of the wire.
+ * Counters only: nothing here is read by tracer logic and nothing here can
+ * change a byte of the wire.
  */
 void smp_close_peer_extent_note(unsigned int cpu_index,
                                 const BBTemplate *slot,
                                 bool from_stash, bool from_cursor,
                                 bool in_flight, uint64_t extent)
 {
-    static const bool falsify_live =
-        getenv("CST_SMP_PEER_LIVE_FALSIFY") != nullptr;
-    static const bool falsify_inflight =
-        getenv("CST_SMP_PEER_INFLIGHT_FALSIFY") != nullptr;
-    static bool falsified = false;
-
-    if ((falsify_live || falsify_inflight) && !falsified) {
-        falsified = true;
-        if (cst_smp_diag()) {
-            fprintf(stderr, "champsim_tracer: [smpdiag] FALSIFIER peer-slot "
-                    "extent classification forced to %s at pc=0x%" PRIx64
-                    " (real: stash=%d cursor=%d inflight=%d ran=%" PRIu64
-                    ")\n",
-                    falsify_inflight ? "IN-FLIGHT head" : "LIVE cursor",
-                    slot ? slot->start_pc : 0,
-                    (int)from_stash, (int)from_cursor, (int)in_flight,
-                    extent);
-        }
-        from_stash = false;
-        from_cursor = true;
-        if (falsify_inflight) {
-            in_flight = true;
-        }
-    }
-
     if (from_stash) {
         g_stats.smp_close_peer_stash_extent++;
         return;
@@ -4680,13 +4560,6 @@ void smp_close_peer_extent_note(unsigned int cpu_index,
         if (live > extent) {
             g_stats.smp_close_peer_inflight_drift++;
             g_stats.smp_close_peer_inflight_drift_insns += live - extent;
-        }
-        if (cst_smp_diag()) {
-            fprintf(stderr, "[smpdiag] close peer slot is vCPU %u's "
-                    "IN-FLIGHT head: pc=0x%" PRIx64 " ran=%" PRIu64
-                    " live_at_flush=%" PRIu64 " closing_cpu=%u\n",
-                    cpu_index, slot->start_pc, extent, live,
-                    g_cst_closing_cpu);
         }
     }
 }
@@ -4897,17 +4770,6 @@ void emit_body_entry(BodyStreamState *out_stream,
      * (warmup_boundary_in_fanout), never silent. */
     if (g_seg_warmup_end_trace_insns == UINT64_MAX &&
         g_seg_warmup_crossed && g_trace_segments.is_active()) {
-        /* CST_WMHOLD_OFF: measurement kill switch (behaviour gated,
-         * condition census on both arms)
-         * — restores the historical thread-blind pc-or-kernel
-         * release so a paired probe wave measures the same condition
-         * under both behaviours.  The census counters and the placement
-         * tripwire run on both arms; only the peer-thread defer arrow is
-         * gated. */
-        static int wm_hold_off = -1;
-        if (wm_hold_off < 0) {
-            wm_hold_off = getenv("CST_WMHOLD_OFF") ? 1 : 0;
-        }
         const RepSelfLoopState &rs_wh = rep_state(cpu_index);
         bool wm_defer = false;
         if (rs_wh.warmup_hold_any() && bb_tmpl) {
@@ -4918,8 +4780,7 @@ void emit_body_entry(BodyStreamState *out_stream,
                     continue;
                 }
                 if (bb_tmpl->start_pc == h.pc || bb_tmpl->is_system ||
-                    (!wm_hold_off &&
-                     h.tid != RepBoundaryHold::CST_HOLD_TID_UNKNOWN &&
+                    (h.tid != RepBoundaryHold::CST_HOLD_TID_UNKNOWN &&
                      h.tid != rec_tid)) {
                     wm_defer = true;
                 }
@@ -5065,16 +4926,6 @@ void emit_body_entry(BodyStreamState *out_stream,
         }
         if (pending_reg_snaps(cpu_index).size() > expected_snaps) {
             size_t excess = pending_reg_snaps(cpu_index).size() - (size_t)expected_snaps;
-            if (getenv("CST_SNAP_DIAG")) {
-                fprintf(stderr, "champsim_tracer: [snapdiag] reg-snap SURPLUS "
-                        "BB start=0x%" PRIx64 " n_insns=%u pending=%zu "
-                        "expected=%" PRIu64 " fdepth=%u is_sys=%d "
-                        "— trimming %zu leaked prefix\n",
-                        bb_tmpl->start_pc, bb_tmpl->n_insns,
-                        pending_reg_snaps(cpu_index).size(), expected_snaps,
-                        g_emit_fault_depth,
-                        (int)bb_tmpl->is_system, excess);
-            }
             pending_reg_snaps(cpu_index).erase(pending_reg_snaps(cpu_index).begin(),
                                     pending_reg_snaps(cpu_index).begin() + (ptrdiff_t)excess);
             g_stats.reg_snap_leak_trimmed++;
@@ -5106,58 +4957,6 @@ void emit_body_entry(BodyStreamState *out_stream,
                 g_stats.reg_snap_slice_dropped_end_close++;
             }
             g_stats.reg_snap_slice_drop_discarded += n_discarded;
-            if (getenv("CST_SNAP_DIAG")) {
-                fprintf(stderr, "champsim_tracer: [snapdiag] reg-snap "
-                        "%s BB start=0x%" PRIx64 " n_insns=%u pending=%zu"
-                        " expected=%" PRIu64 " end_marker=%d fdepth=%u "
-                        "is_sys=%d — dropping reg_snaps\n",
-                        pending_reg_snaps(cpu_index).size() < expected_snaps
-                            ? "SHORTFALL" : "SURPLUS",
-                        bb_tmpl->start_pc, bb_tmpl->n_insns,
-                        pending_reg_snaps(cpu_index).size(), expected_snaps,
-                        (int)g_seg_end_marker_close, g_emit_fault_depth,
-                        (int)bb_tmpl->is_system);
-                /*
-                 * Name what is being thrown away.  The sink is POSITIONAL,
-                 * so the k-th pending snap belongs to the k-th dst slot in
-                 * the template's prefix-sum order — the same walk
-                 * build_entry_view does.  Printing insn pc + register name +
-                 * value turns "4 register deltas were discarded" from a
-                 * count into an identified loss.
-                 */
-                const std::vector<RegSnap> &pv = pending_reg_snaps(cpu_index);
-                size_t slot = 0;
-                for (uint32_t i = 0; i < bb_tmpl->n_insns && slot < pv.size();
-                     i++) {
-                    const InsnFields *fi = &bb_tmpl->insn_fields[i];
-                    for (uint8_t d = 0; d < fi->n_dst_regs &&
-                                        slot < pv.size(); d++, slot++) {
-                        const char *rn = "?";
-                        if (bb_tmpl->insn_reg_names &&
-                            bb_tmpl->insn_reg_names[i].dst_qemu_reg_keys &&
-                            bb_tmpl->insn_reg_names[i].dst_qemu_reg_keys[d] &&
-                            bb_tmpl->insn_reg_names[i]
-                                .dst_qemu_reg_keys[d]->name) {
-                            rn = bb_tmpl->insn_reg_names[i]
-                                     .dst_qemu_reg_keys[d]->name;
-                        }
-                        fprintf(stderr, "champsim_tracer: [snapdiag]   "
-                                "discarded slot %zu: insn[%u] pc=0x%" PRIx64
-                                " dst[%u]=%s width=%u value=0x%016" PRIx64
-                                "\n", slot, i,
-                                bb_tmpl->insn_pcs ? bb_tmpl->insn_pcs[i] : 0,
-                                d, rn, (unsigned)pv[slot].width_bytes,
-                                pv[slot].value.limb[0]);
-                    }
-                }
-                for (; slot < pv.size(); slot++) {
-                    fprintf(stderr, "champsim_tracer: [snapdiag]   "
-                            "discarded slot %zu: BEYOND the template's dst "
-                            "slots width=%u value=0x%016" PRIx64 "\n",
-                            slot, (unsigned)pv[slot].width_bytes,
-                            pv[slot].value.limb[0]);
-                }
-            }
             pending_reg_snaps(cpu_index).clear();
         }
     }
@@ -6088,9 +5887,6 @@ static inline void cp_chain_append(unsigned int cpu_index, BBTemplate *frag)
     const bool will_discard = cp_chain(cpu_index).would_discard(frag->start_pc);
     const bool dropped_system = will_discard &&
                                 cp_chain(cpu_index).in_flight_is_system();
-    if (will_discard && getenv("CST_CHAINDROP_DIAG")) {
-        cp_chain(cpu_index).describe_in_flight(stderr, frag->start_pc);
-    }
     const bool dropped_chain =
         cp_chain(cpu_index).append_fragment(frag->start_pc, frag,
                                             frag->fall_through_pc,
@@ -6148,77 +5944,6 @@ static inline BBTemplate *cp_chain_finalize_if_complete(unsigned int cpu_index)
         return bb_tmpl;
     }
     return nullptr;
-}
-
-/*
- * CST_NO_PEER_FLUSH: the falsifier arm for the peer pending-seal flush.
- * With it set the close reverts to flushing only the closing vCPU's slot,
- * which is what the peer flush exists to fix -- so a run pair with and
- * without it measures the drop the fix removes, instead of asserting it.
- * A falsifier arm, not a capture.
- */
-/*
- * CST_NO_PEER_HOLDERS: the falsifier arm for the peer gate itself.  The loop
- * used to ask `if (!b || !b->prev()) continue;` -- the pending-seal SLOT and
- * nothing else -- so a peer vCPU holding an in-flight chain or a captured
- * reg-snap sink behind an EMPTY slot was skipped whole, and with it the
- * flush's chain arm, which no other path reaches.  With this set the gate
- * reverts to the slot-only question, so a run pair measures what the wider
- * gate recovers.  A falsifier arm, not a capture.
- */
-static bool peer_holders_falsifier(void)
-{
-    static const bool v = []() {
-        if (getenv("CST_NO_PEER_HOLDERS") == nullptr) {
-            return false;
-        }
-        fprintf(stderr, "champsim_tracer: CST_NO_PEER_HOLDERS — a peer vCPU "
-                "whose pending-seal slot is empty is skipped at the close "
-                "even when it holds fault frames, suspensions or a chain.  "
-                "This trace is missing instructions the guest executed; it "
-                "is a falsifier arm, not a capture.\n");
-        return true;
-    }();
-    return v;
-}
-
-static bool peer_flush_falsifier(void)
-{
-    static const bool v = []() {
-        if (getenv("CST_NO_PEER_FLUSH") == nullptr) {
-            return false;
-        }
-        fprintf(stderr, "champsim_tracer: CST_NO_PEER_FLUSH — peer vCPU "
-                "pending-seal slots are DROPPED at the close.  This trace "
-                "is missing instructions the guest executed; it is a "
-                "falsifier arm, not a capture.\n");
-        return true;
-    }();
-    return v;
-}
-
-/*
- * CST_NO_CLOSE_ORDER: the falsifier arm for the close's flush ORDER.  With
- * it set the close reverts to flushing its own vCPU first and the peers
- * after it in ascending vCPU order — appending blocks the guest ran EARLIER
- * behind blocks it ran later, which is what breaks strand sequentiality on
- * the wire.  A falsifier arm, not a capture.
- */
-static bool close_order_falsifier(void)
-{
-    static const bool v = []() {
-        if (getenv("CST_NO_CLOSE_ORDER") == nullptr) {
-            return false;
-        }
-        fprintf(stderr, "champsim_tracer: CST_NO_CLOSE_ORDER — the close "
-                "flushes its own vCPU before every peer regardless of when "
-                "their blocks ran, so a (thread_id, asid) context can carry "
-                "an earlier block behind a later one.  This trace's body is "
-                "out of program order; it is a falsifier arm, not a "
-                "capture.\n");
-        return true;
-    }();
-    return v;
 }
 
 /*
@@ -6317,7 +6042,6 @@ static void finish_trace_segment(bool prev_executed = true,
      * previous rounds each closed one holder and asserted the rest were
      * empty, and none of them could show it.
      */
-    static const bool census_print = getenv("CST_CLOSEDROP") != nullptr;
     /* Name the close ROUTE, not just the flush mode: "exec"/"deferred"
      * lumped the END marker, the dead latch and the plugin_exit teardown
      * into one string, and a census whose rows cannot be grouped by close
@@ -6340,20 +6064,6 @@ static void finish_trace_segment(bool prev_executed = true,
      * migration drains, which are not stopping points).
      */
     close_unsealed_begin(census_why);
-    /*
-     * MIRRORED TO THE STATS FILE, NOT ONLY TO stderr.  In user mode the
-     * guest's exit syscall reaches plugin_exit through preexit_cleanup
-     * AFTER QEMU has torn its log fd down (see the note beside
-     * qemu_plugin_outs in plugin_exit), so a close taken there writes its
-     * census into a closed stderr and the run reports nothing.  A census
-     * whose output can silently vanish on one whole mode is not evidence.
-     */
-    path_builder_close_state_report(stderr, census_why, closing_cpu,
-                                    "pre", census_print, /* ledger= */ false);
-    if (census_print && stats_file) {
-        path_builder_close_state_report(stats_file, census_why, closing_cpu,
-                                        "pre", true, /* ledger= */ false);
-    }
 
     /* Drain any chain still in flight.  This may call emit_body_entry
      * one or more times, which bumps g_seg_arch_insns — so we print
@@ -6401,10 +6111,6 @@ static void finish_trace_segment(bool prev_executed = true,
              * (note_prev_extent), because the retired cursor on a vacated
              * vCPU has long since rolled past.
              */
-            const bool no_peers = peer_flush_falsifier();
-            const bool slot_only_gate = peer_holders_falsifier();
-            const bool no_order = close_order_falsifier();
-
             struct CloseFlush { uint64_t seq; unsigned int cpu; };
             std::vector<CloseFlush> flush_order;
             for (unsigned int i = 0; i < CST_PIN_MAX_VCPUS; i++) {
@@ -6433,13 +6139,6 @@ static void finish_trace_segment(bool prev_executed = true,
                 if (!b || !b->holds_close_work()) {
                     continue;
                 }
-                if (no_peers || (slot_only_gate && !b->prev())) {
-                    /* Held work and was not flushed: the drop the falsifier
-                     * arm exists to produce, counted so the arm is visible
-                     * in the run's own stats rather than asserted. */
-                    g_stats.close_peer_holders_skipped++;
-                    continue;
-                }
                 flush_order.push_back({ b->prev_seq(), i });
             }
             if (closing_cpu >= CST_PIN_MAX_VCPUS) {
@@ -6454,22 +6153,12 @@ static void finish_trace_segment(bool prev_executed = true,
                                  return a.seq != b.seq ? a.seq < b.seq
                                                        : a.cpu < b.cpu;
                              });
-            if (no_order) {
-                /* The falsifier arm: the pre-fix order, closing vCPU first
-                 * and peers after it in ascending vCPU index. */
-                std::stable_sort(flush_order.begin(), flush_order.end(),
-                                 [&](const CloseFlush &a, const CloseFlush &b) {
-                                     bool ac = a.cpu == closing_cpu;
-                                     bool bc = b.cpu == closing_cpu;
-                                     return ac != bc ? ac : a.cpu < b.cpu;
-                                 });
-            }
             /* How many builders the dispatch clock moved AHEAD of the
              * closing vCPU -- precisely the blocks the old order appended
              * behind it.  Counted so a run says for itself whether its
              * close was one where the ordering mattered: a close that found
-             * no peer holding work reads zero and is evidence of nothing.
-             * Zero by construction under CST_NO_CLOSE_ORDER. */
+             * no peer holding work reads zero and is evidence of
+             * nothing. */
             unsigned int moved_ahead = 0;
             for (const CloseFlush &cf : flush_order) {
                 if (cf.cpu == closing_cpu) {
@@ -6658,15 +6347,10 @@ static void finish_trace_segment(bool prev_executed = true,
      * the peak and the run totals before anything else reads them. */
     close_unsealed_end();
 
-    /* POST pass: what survived every drain the close performs.  This is
-     * the drop, and it is where the held_at_close ledger is taken. */
+    /* What survived every drain the close performs.  This is the drop,
+     * and it is where the held_at_close ledger is taken. */
     const uint64_t held_frames_before = g_stats.census_frames_held_at_close;
-    path_builder_close_state_report(stderr, census_why, closing_cpu,
-                                    "post", census_print, /* ledger= */ true);
-    if (census_print && stats_file) {
-        path_builder_close_state_report(stats_file, census_why, closing_cpu,
-                                        "post", true, /* ledger= */ false);
-    }
+    path_builder_close_state_report();
     /*
      * THE FATE IDENTITY.
      *
@@ -6699,21 +6383,6 @@ static void finish_trace_segment(bool prev_executed = true,
             s.census_frames_opened == frames_fated + frames_live;
         if (!frames_ok) {
             g_stats.census_balance_broken++;
-        }
-        for (FILE *cf : { stderr, stats_file }) {
-            if (!census_print || !cf) {
-                continue;
-            }
-            fprintf(cf,
-                    "[censusfate] why=%s frames: opened=%" PRIu64
-                    " fated=%" PRIu64 " held=%" PRIu64 " %s"
-                    " | prev: promoted=%" PRIu64 " close_walked=%" PRIu64
-                    " close_dropped=%" PRIu64 "(insns=%" PRIu64 ")\n",
-                    census_why, s.census_frames_opened, frames_fated,
-                    frames_live, frames_ok ? "BALANCE-ok" : "BALANCE-BROKEN",
-                    s.census_prev_promoted, s.census_prev_close_walked,
-                    s.census_prev_close_dropped,
-                    s.census_prev_close_dropped_insns);
         }
     }
 
@@ -6820,16 +6489,6 @@ static void finish_trace_segment(bool prev_executed = true,
                                   std::memory_order_relaxed);
         g_total_arch_insns.fetch_add(g_seg_arch_insns,
                                      std::memory_order_relaxed);
-    }
-
-    /* Template-cache census (kernel-bucket duplication investigation): dump
-     * the per-bucket breakdown of the templates just serialised (finish()
-     * above wrote the templates section), before the segment's bb_map_ is
-     * cleared at the next open.  Diagnostic only, gated by env. */
-    if (getenv("CST_TMPL_CENSUS")) {
-        g_mutex_lock(&data_lock);
-        g_template_store.census(stderr);
-        g_mutex_unlock(&data_lock);
     }
 
     /* CST_MEMSTATS (#91): template-store footprint breakdown at segment
@@ -8114,20 +7773,6 @@ bool collect_finalized_bbs(unsigned int cpu_index,
     const uint32_t tb_total = tb_head_insns(prev_tb_head);
     uint64_t executed = started;
     bool aborted_tail = false;
-    if (!falsify && !have_extent && prev_tb_head != nullptr &&
-        seal_extent_diag()) {
-        PathBuilder &pbd = path_builder(cpu_index);
-        unsigned miss = pbd.seal_extent_miss(prev_tb_head);
-        fprintf(stderr, "[sealext] UNANSWERED prev=0x%" PRIx64 " n=%u "
-                "cur=0x%" PRIx64 " at=%u miss=%u(%s%s) seal_prev=0x%" PRIx64
-                " live_valid=%d susp=%zu\n",
-                prev_tb_head ? prev_tb_head->start_pc : 0, tb_total,
-                current_pc, tb_head_insn_index(prev_tb_head, current_pc),
-                miss, (miss & 1u) ? "no-measurement " : "",
-                (miss & 2u) ? "other-block" : "",
-                pbd.seal_prev_block() ? pbd.seal_prev_block()->start_pc : 0,
-                (int)pbd.live_prev_extent_valid(), (size_t)0);
-    }
     if (falsify) {
         /* The extent question was never asked, so this is not an unknown
          * extent — it is the pre-a07df2d053 walk, which had no such
@@ -8443,21 +8088,6 @@ static std::atomic<bool> g_spec_flush_latched{false};
  * before it has run (see g_window_close_armed).  The pending slot at the
  * close therefore holds a TB that has not executed, and the flush skips it.
  */
-/* CST_CLOSE_DIAG: one line per deferred-close evaluation.  Reports the
- * three predicates that decide whether this step takes the close, so a
- * window that closed at the wrong point can be read back to the step that
- * armed it.  Diagnostic only — no effect on the trace. */
-static inline bool close_diag(void)
-{
-    static std::atomic<int> v{-1};
-    int x = v.load(std::memory_order_relaxed);
-    if (x < 0) {
-        x = getenv("CST_CLOSE_DIAG") ? 1 : 0;
-        v.store(x, std::memory_order_relaxed);
-    }
-    return x != 0;
-}
-
 /*
  * Will the deferred window close try to take at this step's end, with this
  * seal's final emission standing as the closing context's segment-final
@@ -8585,16 +8215,6 @@ static void run_deferred_window_closes(PathBuilder &pb, unsigned int cpu_index,
             }
         }
     }
-    if (close_diag()) {
-        fprintf(stderr, "[closediag] eval clock=%" PRIu64
-                " chain=%d armed=%d fanout_hold=%d(any=%d) icount_pend=%d "
-                "sp_pend=%d pc=0x%" PRIx64 "\n",
-                g_user_icount, (int)cp_chain(cpu_index).has_active_chain(),
-                (int)deferred_close(cpu_index).window_close_armed, (int)fanout_hold,
-                (int)rs_cd.warmup_hold_any(),
-                (int)deferred_close(cpu_index).icount_shutdown_pending, (int)deferred_close(cpu_index).simpoint_close_pending,
-                cur_tb_tmpl ? cur_tb_tmpl->start_pc : 0);
-    }
     /* Not at a BB boundary yet (or the segment already closed under us):
      * hold the arm and let a later step take the close. */
     if (cp_chain(cpu_index).has_active_chain() || !g_trace_segments.is_active()) {
@@ -8712,11 +8332,6 @@ static void run_deferred_window_closes(PathBuilder &pb, unsigned int cpu_index,
     if (rs_cd.warmup_hold_any()) {
         g_stats.window_close_in_fanout++;
     }
-    if (close_diag()) {
-        fprintf(stderr, "[closediag] TAKE clock=%" PRIu64 "\n",
-                g_user_icount);
-    }
-
     /* Deferred-exit on icount window-stop.  The trigger was set in
      * tw_manage_window when icount first crossed window_stop. */
     if (deferred_close(cpu_index).icount_shutdown_pending) {
@@ -9464,40 +9079,6 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
     in.cur_window = cpu_index < CST_PIN_MAX_VCPUS
         ? g_vcpu_cur_window[cpu_index].load(std::memory_order_relaxed) : 0;
 
-    /* CST_TID2_DIAG: the delivery-condition instrument for the SMP async
-     * ownership work.  For every async edge drained this step, print the
-     * step's vCPU, the event's own privilege/pc/asid, the LIVE thread
-     * pointer at the drain step (raw, plus whether the current privilege
-     * makes it trustworthy), the identity map's verdict on it, and the
-     * step's gates — which vCPU mints when, and which vCPU receives
-     * interrupts in whose context, in one joinable stream.  stderr only;
-     * no behavioural change. */
-    if (tid2diag_on() && g_system_mode) {
-        for (size_t di = 0; di < in.n_evs; di++) {
-            const struct qemu_plugin_cpu_event &dev = in.evs[di];
-            if (dev.kind != QEMU_PLUGIN_CPU_EV_ASYNC_ENTER &&
-                dev.kind != QEMU_PLUGIN_CPU_EV_ASYNC_RETURN) {
-                continue;
-            }
-            uint64_t dtp = qemu_plugin_get_thread_ptr();
-            bool dtrust = live_priv == 0 || thread_ptr_tracks_current();
-            bool dhit = g_thread_tid_map &&
-                        g_thread_tid_map->count(dtp) != 0;
-            fprintf(stderr, "champsim_tracer: [tid2] %s vcpu=%u evpriv=%d "
-                    "evpc=0x%" PRIx64 " evasid=0x%" PRIx64
-                    " evtp=0x%" PRIx64 " evtpok=%d live_priv=%d "
-                    "tp=0x%" PRIx64 " trust=%d maphit=%d peek=%u uown=%d "
-                    "mapsz=%zu\n",
-                    dev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_ENTER ? "ENTER"
-                                                               : "RETURN",
-                    cpu_index, (int)dev.priv, dev.pc, dev.asid,
-                    dev.tp, (int)dev.tp_ok, live_priv,
-                    dtp, (int)dtrust, (int)dhit, in.cur_tid,
-                    (int)in.user_owned,
-                    g_thread_tid_map ? g_thread_tid_map->size() : 0);
-        }
-    }
-
     /* Pre-window phase: async-window arrows, foreign-ASID boundary, prev
      * swap — in that order, before any window decision. */
     PathBuilder::StepStatus st = pb.step_events(in);
@@ -9910,23 +9491,6 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     uint64_t icount_prev = qemu_plugin_u64_get(
         g_scoreboard.insn_count, cpu_index);
     g_host_icount = icount_prev;
-
-    /* CST_SMP_DIAG: one line at each vCPU's first in-segment dispatch —
-     * SMP coverage triage (a vCPU missing from this set traced nothing). */
-    static const bool smp_diag = getenv("CST_SMP_DIAG") != nullptr;
-    if (smp_diag) {
-        /* Per-vCPU, not per-thread: under round-robin TCG one thread
-         * dispatches every vCPU and a thread-keyed latch would announce
-         * only the first. */
-        static bool announced[CST_PIN_MAX_VCPUS];
-        bool &a = announced[cpu_index < CST_PIN_MAX_VCPUS
-                            ? cpu_index : CST_PIN_MAX_VCPUS - 1];
-        if (!a) {
-            a = true;
-            fprintf(stderr, "champsim_tracer: [smpdiag] first exec dispatch "
-                    "on cpu %u\n", cpu_index);
-        }
-    }
 
     /* The PathBuilder consumes the ordered per-vCPU event queue and runs
      * the CP step from here on.  Everything above this line is the shared
@@ -11866,14 +11430,6 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
             final_stats.wp_session_on_cp);
         fflush(stderr);
     }
-    if (getenv("CST_STATSDBG")) {
-        /* Positive control for the paragraph above: the thread-local read
-         * and the aggregate, side by side, at the same instant. */
-        fprintf(stderr, "[statsdbg] tls.wp_sess=%" PRIu64
-                " agg.wp_sess=%" PRIu64 "\n",
-                g_stats.wp_session_on_cp, final_stats.wp_session_on_cp);
-        fflush(stderr);
-    }
     g_rt_gate.report(report);
 
     g_mutex_lock(&data_lock);
@@ -12310,6 +11866,8 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     }
     g_trace_segments.set_output_path(cfg.output_path);
     g_trace_segments.set_compress_cmd(cfg.compress_cmd);
+    /* The CST_RING dumps go beside the trace, not on the OS disk. */
+    cst_ring_set_output_path(cfg.output_path);
 
     unknown_warn_path = g_strdup_printf("%s.unknown_warnings.log",
                                         cfg.output_path);
@@ -12477,24 +12035,11 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
      * translated.  QEMU writes it on every queue push and clears it on
      * every drain; the per-TB absorber registered in vcpu_tb_trans is
      * conditional on it.  Without it the absorber's brcond is never true
-     * and the queue reverts to growing with untraced execution.
-     *
-     * CST_EVQ_NOABSORB=1 withholds the registration.  It is the A/B arm —
-     * the SAME binary, the same instrument, the same everything, minus the
-     * mechanism — so the before/after numbers are not confounded by a
-     * different build.  It is a diagnostic, never a supported mode: QEMU's
+     * and the queue reverts to growing with untraced execution.  QEMU's
      * structural tripwire is likewise only armed when the slot is
      * published, because the ceiling is a claim about what a per-TB drain
-     * point makes impossible.  Announced on stderr so a run that has it set
-     * can never be mistaken for a shipping one. */
-    if (getenv("CST_EVQ_NOABSORB")) {
-        fprintf(stderr, "champsim_tracer: *** CST_EVQ_NOABSORB: the per-TB "
-                "event-queue drain point is DISABLED (A/B arm).  The queue "
-                "is unbounded in this run and the producer tripwire is not "
-                "armed.  Never a shipping configuration. ***\n");
-    } else {
-        qemu_plugin_cpu_events_pending_slot(g_scoreboard.evq_pending);
-    }
+     * point makes impossible. */
+    qemu_plugin_cpu_events_pending_slot(g_scoreboard.evq_pending);
 
     qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
     qemu_plugin_register_flush_cb(id, vcpu_tb_flush);

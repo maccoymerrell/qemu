@@ -103,8 +103,7 @@ public:
     static constexpr size_t  FID_LUT = cst::FID_LUT_SIZE;
 
     AttributionLint(const Header &h, const std::vector<Template> &templates)
-        : reg_enabled_(h.has_reg_data()),
-          debug_(std::getenv("CST_LINT_DEBUG") != nullptr)
+        : reg_enabled_(h.has_reg_data())
     {
         /* Exempt opcode classes, resolved by name from the trace's
          * own opcode map so renumbering stays harmless.  Synthetic-EA
@@ -184,36 +183,20 @@ public:
      * insn (template_id, ipos).  @count > 0. */
     void note_mem(uint32_t template_id, uint32_t ipos, uint64_t count) {
         mem_memops_ += count;
-        if (distinct_mem_.insert(insn_key(template_id, ipos)).second &&
-            debug_) {
-            std::fprintf(stderr,
-                         "cst lint: impossible memops on template %u "
-                         "insn[%u] (count %llu this entry)\n",
-                         template_id, ipos, (unsigned long long)count);
-        }
+        distinct_mem_.insert(insn_key(template_id, ipos));
     }
 
     /* One CP dst-reg value record landed on an impossible slot. */
     void note_reg(uint32_t template_id, uint32_t ipos) {
         reg_records_ += 1;
-        if (distinct_reg_.insert(insn_key(template_id, ipos)).second &&
-            debug_) {
-            std::fprintf(stderr,
-                         "cst lint: impossible dst-reg value on template %u "
-                         "insn[%u]\n", template_id, ipos);
-        }
+        distinct_reg_.insert(insn_key(template_id, ipos));
     }
 
     /* One body record (CP ENTRY or WP chain block) named @template_id
      * and the templates section defines no such id. */
-    void note_dangling(uint32_t template_id, bool is_wp) {
+    void note_dangling(uint32_t template_id) {
         dangling_refs_ += 1;
-        if (distinct_dangling_.insert(template_id).second && debug_) {
-            std::fprintf(stderr,
-                         "cst lint: %s record references undefined "
-                         "template id %u\n",
-                         is_wp ? "WP" : "CP entry", template_id);
-        }
+        distinct_dangling_.insert(template_id);
     }
 
     uint64_t mem_violations() const { return mem_memops_; }
@@ -262,13 +245,9 @@ public:
 
         /* A CP N_LOADS/N_STORES record for mem-impossible insn
          * (template_id, ipos) on @thread carrying signed delta @d
-         * (low 64 bits; counts live far below that).  @dbg_ordinal is
-         * a caller-defined position hint (the audit's CP-entry count)
-         * surfaced by CST_LINT_DEBUG so an offender can be located
-         * without a full decode pass. */
+         * (low 64 bits; counts live far below that). */
         void on_count_delta(uint32_t thread, uint32_t template_id,
-                            uint32_t ipos, bool is_stores, uint64_t d,
-                            uint64_t dbg_ordinal = 0) {
+                            uint32_t ipos, bool is_stores, uint64_t d) {
             ThreadState &ts = state_at(thread);
             uint64_t ck = cell_key(template_id, ipos, is_stores);
             uint64_t &cell = ts.cells[ck];
@@ -285,16 +264,7 @@ public:
             agg.memops += new_total - old_total;
             if (old_total == 0 && new_total != 0) {
                 agg.insns++;
-                if (lint_.distinct_mem_.insert(
-                        insn_key(template_id, ipos)).second &&
-                    lint_.debug_) {
-                    std::fprintf(stderr,
-                                 "cst lint: impossible memops on template %u "
-                                 "insn[%u] (count %llu, near CP entry %llu)\n",
-                                 template_id, ipos,
-                                 (unsigned long long)new_total,
-                                 (unsigned long long)dbg_ordinal);
-                }
+                lint_.distinct_mem_.insert(insn_key(template_id, ipos));
             } else if (old_total != 0 && new_total == 0) {
                 agg.insns--;
             }
@@ -345,10 +315,6 @@ private:
     std::unordered_map<uint32_t, std::vector<uint8_t>> rows_;
     std::vector<int16_t> dst_slot_;
     bool reg_enabled_;
-    /* CST_LINT_DEBUG=1: print each first-seen offending insn to
-     * stderr so a flagged trace names its offenders without a
-     * separate dump pass. */
-    bool debug_;
 
     uint64_t mem_memops_    = 0;
     uint64_t reg_records_   = 0;
@@ -611,14 +577,6 @@ public:
      * carry has an architecturally-optional access (reported, so the
      * exclusion is never silent). */
     uint64_t excluded_templates() const { return excluded_templates_; }
-
-    /* Running realised-memop total for (thread, template) — the value
-     * on_cp_entry_end() turns into this execution's zero/nonzero
-     * verdict.  Exposed for diagnostics only. */
-    uint64_t running_total(uint32_t thread, uint32_t template_id) const {
-        auto it = running_.find(cell_key(thread, template_id));
-        return it == running_.end() ? 0 : it->second;
-    }
 
 private:
     struct Hist {

@@ -261,35 +261,6 @@ static bool wp_set_pc_checked(uint64_t pc)
 }
 
 /*
- * CST_FENCE_FORCE_SESSION=<n> — directed control (diagnostic, off by
- * default): when the n-th excursion ends (default 1), do NOT clear this
- * vCPU's wrong-path session bracket.  From then on the CORRECT path runs
- * carrying a flag that says it is speculative — precisely the leak the
- * third fence gate exists to catch, and the shape in which a window stays
- * open forever because every marker callback on that vCPU is dropped.
- *
- * It is the POSITIVE CONTROL for the tripwire that names that leak: `WP
- * session flag on correct path` (tested on every correct-path step and at
- * every committed address-space write).  Nothing else in the plugin reads
- * the bracket, so with the variable unset this is one cached-int load per
- * excursion.
- */
-static bool wp_force_session_leak(void)
-{
-    static int lim = -1;
-    if (lim < 0) {
-        const char *e = getenv("CST_FENCE_FORCE_SESSION");
-        int v = e ? atoi(e) : 0;
-        lim = (e && v <= 0) ? 1 : v;
-    }
-    if (lim <= 0) {
-        return false;
-    }
-    static std::atomic<int> n{0};
-    return n.fetch_add(1, std::memory_order_relaxed) + 1 >= lim;
-}
-
-/*
  * Exit the wrong-path speculative session: restore the scoreboard cursor
  * from the snapshot wp_enter_spec_session took, leave spec mode, and restore
  * + free the saved CPU register state.  The symmetric counterpart to
@@ -299,7 +270,7 @@ static void wp_end_spec_session(unsigned int cpu_index,
                                 struct qemu_plugin_cpu_state *saved_state)
 {
     g_wp_in_progress = false;
-    if (cpu_index < CST_PIN_MAX_VCPUS && !wp_force_session_leak()) {
+    if (cpu_index < CST_PIN_MAX_VCPUS) {
         g_wp_session_vcpu[cpu_index].store(false, std::memory_order_relaxed);
     }
 

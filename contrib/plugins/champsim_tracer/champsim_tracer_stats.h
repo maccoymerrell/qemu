@@ -527,10 +527,10 @@ struct Stats {
      *               continuation never came
      *
      * _cut_frag has real occupants on every terminal-route cell measured
-     * so far.  _tb_edge has so far only been driven by the falsifier arm
-     * (CST_UNSEALED_FALSIFY): the counter is proven able to fire, but no
-     * genuine occupant has appeared yet, so a 0 in it says "the close did
-     * not land on a cross-TB block", not "this cannot happen".
+     * so far.  _tb_edge was exercised end-to-end by the falsifier wave that
+     * closed this arc but has yet to see a genuine occupant, so a 0 in it
+     * says "the close did not land on a cross-TB block", not "this cannot
+     * happen".
      *
      * _blocks is their sum.  _closes counts closes that produced at
      * least one, _contexts sums the distinct (vCPU, thread) identities
@@ -620,12 +620,11 @@ struct Stats {
      * (direct branch, both edges known, neither is the block's start).
      * smp_dup_wrongpc_reemit: entry N+1 exactly re-claims entry N-1 while
      * entry N's resolved direct terminal cannot reach it — shape (A).
-     * Both must be 0; the ledger-checks row proves the checker ran, and
-     * the falsifier row (CST_SMP_DUP_FALSIFY) proves it can fire. */
+     * Both must be 0; the ledger-checks row proves the checker ran, and a
+     * falsifier wave proved the predicates able to fire. */
     uint64_t smp_dup_adjacent_claims = 0;
     uint64_t smp_dup_wrongpc_reemit = 0;
     uint64_t smp_dup_ledger_checks = 0;
-    uint64_t smp_dup_falsifier_fires = 0;
     /* Seal resolved a block's terminal successor on a step whose executing
      * thread differs from the thread that ran the block (walk_tid !=
      * cur_tid) — the cross-thread successor read named by the prepush
@@ -655,11 +654,9 @@ struct Stats {
      * aarch64, 10 riscv64).  All 21 were also the in-flight head — the
      * stash is missing exactly when no dispatch followed the promote, and
      * then the slot still IS that vCPU's current dispatch, so the two rows
-     * name one window from two sides.  CST_SMP_PEER_LIVE_FALSIFY and
-     * CST_SMP_PEER_INFLIGHT_FALSIFY (smp_close_peer_extent_note,
-     * champsim_tracer.cc) reach that window on demand on any ISA; being
-     * synthetic they perturb only the copies the classification reads, and
-     * the counters reach no wire.
+     * name one window from two sides.  A synthetic falsifier wave against
+     * smp_close_peer_extent_note reached that window on demand on other
+     * ISAs, so neither row is merely quiet.
      *
      * The in-flight case is what the close-time extent snapshot exists
      * for.  Peers are still not quiesced — the close holds exec_lock, so a
@@ -691,8 +688,8 @@ struct Stats {
      * and the drain finding no answerable extent (must be 0 — the stash
      * or the vacated vCPU's parked cursor answers for every observed
      * shape; an unanswerable one is a dropped block and must be seen).
-     * CST_SMP_DRAIN_UNK_FALSIFY severs one drain's extent lookup so the
-     * must-be-0 row is proven reachable rather than merely quiet. */
+     * A falsifier wave severed one drain's extent lookup and saw the row
+     * move, so it is proven reachable rather than merely quiet. */
     uint64_t smp_migrated_holders_drained = 0;
     uint64_t smp_migrated_holder_insns = 0;
     uint64_t smp_migrate_drain_extent_unknown = 0;
@@ -701,12 +698,12 @@ struct Stats {
      * the stamp may sit one flush early or the context's close-final may
      * be unstamped; the validator's thread_end oracle is the enforcement
      * and this row makes the prediction's misses visible in the run.
-     * CST_SMP_STAMP_FALSIFY inverts the COMPARISON's copy of the
-     * prediction once per run — the stamping decision and therefore the
-     * wire are unchanged — so the row is proven able to fire. */
+     * A falsifier wave inverted the COMPARISON's copy of the prediction —
+     * leaving the stamping decision and therefore the wire unchanged — and
+     * saw the row move, so it is proven able to fire. */
     uint64_t smp_close_stamp_mispredict = 0;
 
-    /* ---- CLOSE CENSUS (CST_CLOSEDROP) --------------------------------
+    /* ---- CLOSE CENSUS -------------------------------------------------
      *
      * THE WHOLE CLASS, NOT ONE HOLDER AT A TIME.  Five rounds each fixed a
      * single structure that was holding retired-but-unemitted work at a
@@ -718,9 +715,9 @@ struct Stats {
      * are still in it at the close is a DROP unless a drain named below
      * emitted them.
      *
-     * The occupancy half is printed per close by
-     * PathBuilder::close_state_report (pre-flush and post-flush lines);
-     * these counters are what make the two halves add up across a run.
+     * The occupancy half is read per close by
+     * PathBuilder::close_state_report; these counters are what make the
+     * two halves add up across a run.
      *
      * Under split emission a CtxFrame is an identity-and-depth ledger
      * entry — its block's executed prefix reached the wire at the fault —
@@ -796,10 +793,6 @@ struct Stats {
      * prev=0x0.  The gate now asks whether the builder holds ANYTHING. */
     uint64_t close_peer_holder_flushes = 0;
     uint64_t close_peer_holder_insns_recovered = 0;
-    /* A peer builder that held work at the close and was NOT flushed.
-     * Reachable only through CST_NO_PEER_FLUSH / CST_NO_PEER_HOLDERS; must
-     * be 0 on any capture. */
-    uint64_t close_peer_holders_skipped = 0;
 
     /* THE ORDER THE CLOSE EMITS IN.  A close used to flush its own vCPU
      * first and the peers after it, which appends blocks the guest ran
@@ -814,9 +807,7 @@ struct Stats {
      * of the closing vCPU, which is exactly the population whose wire order
      * the fix changes.  A run whose close found no peer holding work reads
      * zero here and is evidence of nothing either way -- which is the whole
-     * reason it is reported.  Under CST_NO_CLOSE_ORDER it is zero by
-     * construction, so the pair also shows the arm really turns the
-     * ordering off. */
+     * reason it is reported. */
     uint64_t close_flush_reordered = 0;
     uint64_t close_flush_reordered_builders = 0;
 
@@ -1117,8 +1108,7 @@ struct Stats {
      *   still flagged while this vCPU ran the CORRECT path: a leaked fence
      *   flag.  Tested at TWO points, and it needs both: the correct-path
      *   step, and every committed address-space write (which fires
-     *   regardless of ownership, window and fast-forward).  Positive
-     *   control: CST_FENCE_FORCE_SESSION.
+     *   regardless of ownership, window and fast-forward).
      */
     uint64_t marker_gate_refresh_events = 0;   /* the DENOMINATOR: every
                                     * content-gate re-evaluation (committed
@@ -1202,8 +1192,9 @@ struct Stats {
      * retired guest work silently absent from the wire.  The measured
      * instance was the severed pb_prev_facts arm: 32 of 96 REP STOSB
      * iterations between two demand faults never reached the wire while
-     * every other gate stayed green.  CST_REP_FACTS_OFF reproduces that
-     * shape on demand, which is how this tripwire's firing is proven.
+     * every other gate stayed green.  A falsifier wave severed that arm
+     * and reproduced the shape, which is how this tripwire's firing is
+     * proven.
      */
     uint64_t rep_split_retired_iters_dropped = 0;
     uint64_t rep_split_retired_drops = 0;
@@ -1507,11 +1498,6 @@ struct Stats {
      * retention_events_owned    fault events the attribution gate admitted.
      * retention_events_refused  fault events it refused (untraced context,
      *                           firmware, excluded-window interior).
-     * retention_appends_from_untraced_events
-     *                           refused events that were retained ANYWAY.
-     *                           Reachable only in the CST_RETAIN_ALL
-     *                           experiment arm; on a shipping run this is
-     *                           exactly 0, and any other value is a failure.
      * seal_successor_from_foreign_fault
      *                           the seal's architectural-successor override
      *                           was taken from an event of a non-gated
@@ -1570,23 +1556,7 @@ struct Stats {
     uint64_t retention_scan_events = 0;
     uint64_t retention_events_owned = 0;
     uint64_t retention_events_refused = 0;
-    uint64_t retention_appends_from_untraced_events = 0;
     uint64_t seal_successor_from_foreign_fault = 0;
-
-    /* ---- CST_RETAIN_CHECK equivalence harness (test-only) ---------------
-     * Cell populations of the compared events, so a zero mismatch count can
-     * no longer be reported from a region where the answer is constant: a
-     * cell that must be exercised and reads 0 is a FAILED check, not a pass.
-     */
-    uint64_t rcheck_seals = 0;
-    uint64_t rcheck_cmp_enter_in_async = 0;
-    uint64_t rcheck_cmp_enter_not_async = 0;
-    uint64_t rcheck_cmp_return_in_async = 0;
-    uint64_t rcheck_cmp_return_not_async = 0;
-    uint64_t rcheck_cmp_ours = 0;
-    uint64_t rcheck_cmp_foreign = 0;
-    uint64_t rcheck_mismatch_resume_pc = 0;
-    uint64_t rcheck_mismatch_in_async = 0;
 
     /* Per-execution attribution.  cp_* bumped at vcpu_tb_exec walking
      * the prev TB's template; wp_* inside the WP per-iteration loop.
@@ -1649,7 +1619,6 @@ struct CloseUnsealedSummary {
     uint64_t peak_close_seq;     /* which close set peak_contexts */
     const char *peak_reason;     /* its route; nullptr when never set */
     uint64_t rows_dropped;       /* sample rows past the ledger's cap */
-    bool falsified;              /* CST_UNSEALED_FALSIFY was on */
 };
 
 /* Open a close's accumulation window.  @reason is the close route

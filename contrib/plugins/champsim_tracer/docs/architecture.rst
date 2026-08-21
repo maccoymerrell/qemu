@@ -980,7 +980,8 @@ fault events exactly once, then runs the shared seal walk:
   already unwound (its ``FAULT_RETURN`` was observed), so it drops out
   of the count immediately even though its continuation (the resume
   suffix's seal) is still pending.  ``raw_depth_`` tracks the last
-  event's ``depth_after`` for the ``CST_DEPTH_DIAG`` log only.
+  event's ``depth_after`` for the depth-pipeline mirrors only; nothing
+  in the trailer is derived from it.
 
   **Frames are owned per guest thread.**  ``frames_`` is per-vCPU, and a
   vCPU multiplexes guest threads, so the ledger alone cannot say whose
@@ -1947,42 +1948,40 @@ of its context's program order — the source of the historical SMP
 churn shapes: a CFG-impossible adjacency where the parked block's
 neighbours sealed without it, two parked executions of one loop block
 surfacing back to back in the close's flush, and a context-final flag
-on an entry whose context continues.  ``CST_NO_MIGRATE_DRAIN``
-restores the parked behaviour as a falsifier arm.  A thread that never
-changes vCPU — every user-mode trace, every ``-smp 1`` system trace —
-never takes the arrow and its output is byte-identical.
+on an entry whose context continues.  A thread that never changes
+vCPU — every user-mode trace, every ``-smp 1`` system trace — never
+takes the arrow and its output is byte-identical.
 
-**Falsifier arms of the SMP rows.**  The SMP condition rows include
-several that must read 0, and a row that has only ever been observed at
-0 is equally consistent with a correct tracer and with a detector wired
-to nothing.  Each therefore has an arm that makes it fire on demand, in
-one of two kinds.  *Synthetic* arms exercise the predicate, the counter
-and the report on the run's own data while leaving the wire
-byte-identical: ``CST_SMP_DUP_FALSIFY`` replays one claim through the
-duplicate ledger, and ``CST_SMP_STAMP_FALSIFY`` inverts the copy of the
-close's emission prediction that the mispredict comparison reads —
-never the copy that decides the ``THREAD_END`` stamp.  Their
-wire-neutrality is measured rather than asserted, and measuring it takes
-care: a user-mode trace is reproducible only when both arms share one
-output path and an environment block of identical size (argv and environ
-are on the guest stack, and the trace records it), and one register field
-carrying a guest stack pointer varies between two runs of the *same* arm
-and must be masked.  Under those controls the armed and unarmed traces
-hash alike while the row moves.  *Severing* arms
-genuinely remove the mechanism, because the row's whole meaning is that
-something went unpublished and no synthetic fire could honestly stand
-for it: ``CST_NO_MIGRATE_DRAIN`` parks the migrated holder again, and
-``CST_SMP_DRAIN_UNK_FALSIFY`` forces one drain's extent lookup to fail,
-so ``migrate drain extent unknown`` is proven reachable.  A severing arm
-drops a block, and the validator's content checks are expected to refuse
-the resulting trace — that refusal is the arm working.  None of these is
-on by default and none is consulted by tracer logic.
+**How the SMP must-be-0 rows were proven able to fire.**  The SMP
+condition rows include several that must read 0, and a row that has only
+ever been observed at 0 is equally consistent with a correct tracer and
+with a detector wired to nothing.  A dedicated falsifier wave settled
+that question for each of them, in one of two kinds.  *Synthetic* arms
+exercised the predicate, the counter and the report on a run's own data
+while leaving the wire byte-identical — one claim replayed through the
+duplicate ledger, and the mispredict comparison's copy of the close's
+emission prediction inverted, never the copy that decides the
+``THREAD_END`` stamp.  Their wire-neutrality was measured rather than
+asserted, and measuring it took care: a user-mode trace is reproducible
+only when both arms share one output path and an environment block of
+identical size (argv and environ are on the guest stack, and the trace
+records it), and one register field carrying a guest stack pointer varies
+between two runs of the *same* arm and had to be masked.  Under those
+controls the armed and unarmed traces hashed alike while the row moved.
+*Severing* arms genuinely removed the mechanism, because the row's whole
+meaning is that something went unpublished and no synthetic fire could
+honestly stand for it: the migrated holder was parked again, and one
+drain's extent lookup was forced to fail, so ``migrate drain extent
+unknown`` is a proven-reachable row.  A severing arm drops a block, and
+the validator's content checks refused the resulting trace — that
+refusal was the arm working.  The arms were experiment scaffolding, not
+tracer behaviour, and were removed once the wave closed.
 
-The peer-slot extent **provenance** rows take synthetic arms for the
-same reason and of the same kind.  At a close, a peer vCPU's held slot
-is classified by which lookup can still answer for it: the stash the
-first dispatch after the promote recorded (definitively past), the
-vCPU's live retired cursor (a thread that may still be executing), and
+The peer-slot extent **provenance** rows were proven the same way and
+for the same reason.  At a close, a peer vCPU's held slot is classified
+by which lookup can still answer for it: the stash the first dispatch
+after the promote recorded (definitively past), the vCPU's live retired
+cursor (a thread that may still be executing), and
 whether the slot is that vCPU's current in-flight head — a block the
 close is reading mid-flight.  Because the stash is written by that
 first dispatch whether it was owned or foreign, a peer still holding a
@@ -1999,13 +1998,12 @@ Every one of those 21 was also the in-flight head, and that identity is
 structural rather than lucky: the stash is missing exactly when no
 dispatch has followed the promote on that vCPU, and in that case the
 held slot still *is* the vCPU's current dispatch.  The two rows
-therefore name one window, from two sides.  What the arms —
-``CST_SMP_PEER_LIVE_FALSIFY`` and ``CST_SMP_PEER_INFLIGHT_FALSIFY`` —
-buy is reaching that window on demand, on any ISA, instead of by
-scheduling draw.  They perturb only the copies the classification reads
-and print the machine's real answer beside the forced one; the three
-counters are written in exactly one place and read in exactly one (the
-stats report), so no arm here can reach the wire at all.
+therefore name one window, from two sides.  What the falsifier wave
+bought was reaching that window on demand, on any ISA, instead of by
+scheduling draw: its arms perturbed only the copies the classification
+reads and printed the machine's real answer beside the forced one.  The
+three counters are written in exactly one place and read in exactly one
+(the stats report), so nothing here can reach the wire at all.
 
 Peers are **not** quiesced at a close: ``exec_lock`` serialises the
 per-TB callbacks, and a peer executing translated guest code is in

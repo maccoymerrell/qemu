@@ -294,7 +294,6 @@ struct LintCtx {
     const std::vector<uint8_t>         *row;      /* template caps row */
     uint32_t                            thread;
     uint32_t                            template_id;
-    uint64_t                            entry_ordinal;  /* debug locator */
     /* Memop bimodality lint (cst_lint.h) — null when disabled
      * (--bimodal-off) or, like @lint above, for WP sections. */
     cst::MemopBimodalityLint           *bimodal;
@@ -391,7 +390,7 @@ static inline void tally_fd_record(
         if (want_impossible) {
             lctx->tracker->on_count_delta(lctx->thread, lctx->template_id,
                                           *ipos, f == ids.fid_n_stores,
-                                          wd[0], lctx->entry_ordinal);
+                                          wd[0]);
         }
         if (want_bimodal) {
             lctx->bimodal->on_count_delta(lctx->thread, lctx->template_id,
@@ -508,13 +507,12 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
             /* Dangling-template-ref lint (cst_lint.h): a CP ENTRY
              * naming an id the templates section never defined. */
             if (!cp_tmpl) {
-                lint->note_dangling((uint32_t)prev_cp_tid,
-                                    /*is_wp=*/false);
+                lint->note_dangling((uint32_t)prev_cp_tid);
             }
             LintCtx lctx = {
                 lint, &tracker, lint->row((uint32_t)prev_cp_tid),
                 (uint32_t)current_thread, (uint32_t)prev_cp_tid,
-                s->cp_entries, bimodal,
+                bimodal,
             };
             RangeCells *cp_rc = range_cells_for(prev_cp_tid);
             uint32_t cp_ipos = 0;
@@ -551,23 +549,6 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
              * block and is excluded from the population — the range
              * predicate replaces the old fault-anchor one (§4.2a). */
             if (bimodal) {
-                /* CST_BIMODAL_DIAG=<tid>: one line per zero-memop CP
-                 * execution of that template — investigation aid, off
-                 * unless the environment asks for it. */
-                static const char *diag_env = std::getenv("CST_BIMODAL_DIAG");
-                static const long  diag_tid =
-                    diag_env ? std::strtol(diag_env, nullptr, 0) : -1;
-                if (diag_env && (long)prev_cp_tid == diag_tid &&
-                    bimodal->tracks((uint32_t)prev_cp_tid) &&
-                    bimodal->running_total((uint32_t)current_thread,
-                                           (uint32_t)prev_cp_tid) == 0) {
-                    std::fprintf(stderr,
-                        "BIMODAL_DIAG entry=%llu thread=%d tid=%d "
-                        "n_records=%llu range=[%u,%u)\n",
-                        (unsigned long long)s->cp_entries, current_thread,
-                        prev_cp_tid, (unsigned long long)n_records,
-                        cp_rs, cp_re);
-                }
                 bimodal->on_cp_entry_end((uint32_t)current_thread,
                                          (uint32_t)prev_cp_tid,
                                          /*fault_truncated=*/cp_partial);
@@ -615,8 +596,7 @@ void walk_body(cst::Reader &body, const cst::ResolvedIds &ids,
                 /* Dangling-template-ref lint: id 0 is the writer's
                  * "no template" sentinel, every other id must resolve. */
                 if (!wp_tmpl && prev_wp_tid != 0) {
-                    lint->note_dangling((uint32_t)prev_wp_tid,
-                                        /*is_wp=*/true);
+                    lint->note_dangling((uint32_t)prev_wp_tid);
                 }
                 RangeCells *wp_rc = range_cells_for(prev_wp_tid);
                 uint32_t wp_ipos = 0;

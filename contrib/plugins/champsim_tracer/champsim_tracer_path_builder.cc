@@ -70,21 +70,6 @@ std::vector<CloseUnsealedRow> &unsealed_rows_store = unsealed.rows;
  * count keeps going and rows_dropped says the sample stopped. */
 constexpr size_t kUnsealedRowCap = 256;
 
-/*
- * FALSIFIER.  The bound's whole content is a run of zeros on the
- * single-thread cells, and a zero from an instrument that cannot fire is
- * worth nothing.  CST_UNSEALED_FALSIFY makes every close record one
- * synthetic row on each builder the close drains, exercising the whole
- * path — window open, note, dedup, peak, ledger row, report line — with
- * no effect on what any walk emits.  The summary carries `falsified` so a
- * falsifier run can never be quoted as a measurement.
- */
-bool unsealed_falsify()
-{
-    static const bool v = getenv("CST_UNSEALED_FALSIFY") != nullptr;
-    return v;
-}
-
 }  /* namespace */
 
 void close_unsealed_begin(const char *reason)
@@ -95,7 +80,6 @@ void close_unsealed_begin(const char *reason)
     unsealed.seq = unsealed.sum.closes;
     unsealed.blocks = 0;
     unsealed.ctxs.clear();
-    unsealed.sum.falsified = unsealed_falsify();
     g_mutex_unlock(&unsealed_lock);
 }
 
@@ -199,110 +183,6 @@ static bool pb_diag()
     return v;
 }
 
-static bool pb_depth_diag()
-{
-    static const bool v = getenv("CST_DEPTH_DIAG") != nullptr;
-    return v;
-}
-
-/*
- * ----------------------------------------------------------------------
- * Retention A/B switches (experiment only; the shipping default is off).
- *
- * Each flips EXACTLY ONE thing, so an arm isolates one variable:
- *
- *   CST_RETAIN_ALL   bypasses the ownership guard on the retention append
- *                    and nothing else — same drain, same O(1) async fold,
- *                    same in_async stamps, same seal derivation.  This is
- *                    the unbounded arm, and the only difference between it
- *                    and the default is WHICH EVENTS ARE KEPT.
- *   CST_SLOW_FOLD    replaces the O(1) drain-time async fold with the old
- *                    rescan of the whole retention, and nothing else.  Only
- *                    meaningful together with CST_RETAIN_ALL (the rescan
- *                    needs the async events present); the plugin refuses
- *                    the invalid pairing rather than measure a silently
- *                    different thing.
- *   CST_RETAIN_CHECK maintains BOTH the old and the new seal derivations
- *                    every step and compares them at every seal, bucketing
- *                    the compared events so a zero-population cell fails
- *                    instead of reporting a vacuous zero mismatch.
- * ----------------------------------------------------------------------
- */
-static bool retain_all()
-{
-    static const bool v = getenv("CST_RETAIN_ALL") != nullptr;
-    return v;
-}
-
-static bool slow_fold()
-{
-    static const bool v = getenv("CST_SLOW_FOLD") != nullptr;
-    return v;
-}
-
-static bool retain_check()
-{
-    static const bool v = getenv("CST_RETAIN_CHECK") != nullptr;
-    return v;
-}
-
-
-
-
-/* CST_SEALEXT: per-seal report of every extent question the walk could not
- * answer from the retired cursor.  Diagnostic only, inert unless set. */
-bool seal_extent_diag(void)
-{
-    static const bool v = getenv("CST_SEALEXT") != nullptr;
-    return v;
-}
-
-
-/* CST_SLOW_FOLD rescans the retention for async edges, so it measures the
- * intended thing only when the retention still contains them.  Refuse the
- * invalid pairing instead of silently measuring a third, unnamed arm. */
-static void retain_arms_check_once()
-{
-    static bool done = false;
-    if (done) {
-        return;
-    }
-    done = true;
-    if (slow_fold() && !retain_all()) {
-        fprintf(stderr, "champsim_tracer: FATAL CST_SLOW_FOLD requires "
-                "CST_RETAIN_ALL (the reference fold rescans the retention, "
-                "which the bounded arm does not populate with async edges)\n");
-        fflush(stderr);
-        abort();
-    }
-}
-
-/* Captured-async-window edge log (ENTER / RETURN / in-window ASID write /
- * close) with the window's identity, the guest thread at each edge and the
- * per-window ownership condition counters.  Measurement instrument only —
- * nothing in the tracer's logic reads it. */
-static bool pb_async_diag()
-{
-    static const bool v = getenv("CST_ASYNC_DIAG") != nullptr;
-    return v;
-}
-
-/* Measurement-arm kill switch for this arc's behavioural arrows (the
- * emission-time async-level re-derivation, the abandon-release re-stamp and
- * the task-identity kernel ownership rule): the condition census runs on
- * BOTH arms, only the behaviour is gated, so a paired wave measures the
- * same condition under the old and the new rendering. */
-static bool depth3_off()
-{
-    static const bool v = getenv("CST_DEPTH3_OFF") != nullptr;
-    return v;
-}
-/* Per-defect switch under the master: the rendering arrow alone. */
-static bool depth3_render_off()
-{
-    static const bool v = getenv("CST_DEPTH3_NO_RENDER") != nullptr;
-    return v || depth3_off();
-}
 /*
  * ---- Per-vCPU seal-pipeline sidecars ----
  *
@@ -349,17 +229,6 @@ void PathBuilder::async_win_close(const char *kind, uint32_t tid)
         } else {
             g_stats.async_win_peer_no_asidw++;
         }
-    }
-    if (pb_async_diag()) {
-        fprintf(stderr, "[asyncdiag] CLOSE win=%" PRIu64 " kind=%s tid=%u "
-                "owner_tp=0x%" PRIx64 " owner_ok=%d seq=%" PRIu64
-                " spanned=%" PRId64 " asidw=%u "
-                "own_stamps=%u peer_stamps=%u\n",
-                win_id_, kind, tid, async_owner_tp_, (int)async_owner_ok_,
-                g_dbg_last_emit_seq,
-                (int64_t)(g_dbg_last_emit_seq - win_enter_seq_),
-                win_asidw_, win_own_stamps_,
-                win_peer_stamps_);
     }
     win_id_ = 0;
     win_enter_seq_ = 0;
@@ -536,29 +405,6 @@ static void gap_record_fault_return(uint64_t pc)
     g_gap.fr_pc = pc;
     g_gap.cont_at_fr = g_gap.steps_cont;
     g_gap.drops_at_fr = gap_total_drops();
-}
-
-/* Two-direction observability probe: under CST_GAP_DIAG_ALL every merge
- * completion prints a one-line gap summary, so the instrument's ZERO
- * direction (no steps refused since the window close) is demonstrably
- * reported as zero on ordinary merges — the alpha direction cannot be an
- * artifact of only ever printing when drops exist. */
-static void gap_merge_probe(void)
-{
-    static const bool all = getenv("CST_GAP_DIAG_ALL") != nullptr;
-    if (!all) {
-        return;
-    }
-    if (!g_gap.armed) {
-        fprintf(stderr, "[gapdiag] MERGE emitseq=%" PRIu64
-                " (no window close on record)\n", g_dbg_last_emit_seq);
-        return;
-    }
-    fprintf(stderr, "[gapdiag] MERGE emitseq=%" PRIu64 " close=%s win=%"
-            PRIu64 "@%" PRIu64 " fr=%s cont=%u(kern=%u) dropped=%u\n",
-            g_dbg_last_emit_seq, g_gap.close_kind, g_gap.win_id,
-            g_gap.close_seq, g_gap.fr_seq ? "seen" : "none",
-            g_gap.steps_cont, g_gap.steps_cont_kernel, gap_total_drops());
 }
 
 static void gap_dump(uint64_t viol_seq)
@@ -860,7 +706,6 @@ void PathBuilder::on_segment_open()
     gap_disarm();
     frames_.clear();
     pending_evs_.clear();
-    ref_evs_.clear();
     retained_first_enter_pc_ = 0;
     absorbed_opened_window_ = false;
     drain_async_open_ = qemu_plugin_in_async_int();
@@ -1095,14 +940,6 @@ uint32_t PathBuilder::close_walk_emit(BodyStreamState *out_stream,
             }
         }
     }
-    if (a.at_close && unsealed_falsify()) {
-        /* The falsifier arm (see the ledger): record one synthetic row per
-         * close-walk so the whole instrument — window, dedup, peak, sample
-         * row, report line — is exercised on a cell that legitimately
-         * leaves nothing unsealed.  Emission is untouched. */
-        close_unsealed_note(cpu_index_, a.tid, 0, 0, false,
-                            CST_UNSEALED_TB_EDGE);
-    }
     g_mutex_unlock(&data_lock);
 
     const RepArchFacts &facts =
@@ -1122,9 +959,6 @@ uint32_t PathBuilder::close_walk_emit(BodyStreamState *out_stream,
             uint32_t eff = a.depth - create + now;
             if (!bb_tmpl->is_system) {
                 eff = 0;
-            }
-            if (depth3_render_off()) {
-                eff = a.depth;
             }
             g_emit_fault_depth = eff;
             g_dbg_depth_src = CST_DSRC_CLOSE_WALK;
@@ -1433,10 +1267,7 @@ static uint32_t closedrop_tb_insns(const BBTemplate *head)
 }
 
 
-void PathBuilder::close_state_report(FILE *f, const char *why,
-                                     unsigned int closing_cpu,
-                                     const char *phase, bool print,
-                                     bool ledger) const
+void PathBuilder::close_state_report() const
 {
     /*
      * OCCUPANCY OF EVERY HOLDER — read, not inferred.  Under split
@@ -1478,91 +1309,40 @@ void PathBuilder::close_state_report(FILE *f, const char *why,
     const bool undrained = prev_undrained > 0 || chain_n != 0 ||
         (mid_step_ && walk_prev_ != nullptr);
 
-    if (ledger) {
-        g_stats.census_frames_held_at_close += frames_.size();
-        g_stats.census_walkprev_held_at_close += walk_prev_ ? 1 : 0;
-        g_stats.census_chain_held_at_close += chain_n ? 1 : 0;
-        g_stats.census_chain_held_insns += chain_n;
-        g_stats.census_snaps_held_at_close += n_snaps;
-        g_stats.census_snapmark_held_at_close += snap_mark;
-        g_stats.census_cpmem_held_at_close += n_cpmem;
-        g_stats.census_cpcarry_held_at_close += n_carry;
-        g_stats.census_evs_held_at_close += n_evs;
-        g_stats.census_repfacts_held_at_close += (uint64_t)rep_held;
-        g_stats.census_wmhold_held_at_close += (uint64_t)wm_held;
-        g_stats.census_wpmem_held_at_close += (uint64_t)wp_open;
-        if (undrained) {
-            g_stats.close_holder_undrained++;
-            g_stats.close_holder_undrained_insns += undrained_insns;
-        }
-        if (wp_open) {
-            g_stats.close_wp_session_open++;
-        }
+    g_stats.census_frames_held_at_close += frames_.size();
+    g_stats.census_walkprev_held_at_close += walk_prev_ ? 1 : 0;
+    g_stats.census_chain_held_at_close += chain_n ? 1 : 0;
+    g_stats.census_chain_held_insns += chain_n;
+    g_stats.census_snaps_held_at_close += n_snaps;
+    g_stats.census_snapmark_held_at_close += snap_mark;
+    g_stats.census_cpmem_held_at_close += n_cpmem;
+    g_stats.census_cpcarry_held_at_close += n_carry;
+    g_stats.census_evs_held_at_close += n_evs;
+    g_stats.census_repfacts_held_at_close += (uint64_t)rep_held;
+    g_stats.census_wmhold_held_at_close += (uint64_t)wm_held;
+    g_stats.census_wpmem_held_at_close += (uint64_t)wp_open;
+    if (undrained) {
+        g_stats.close_holder_undrained++;
+        g_stats.close_holder_undrained_insns += undrained_insns;
     }
-
-    if (!print) {
-        return;
-    }
-
-    fprintf(f, "[census] %s why=%s vcpu=%u%s prev=0x%" PRIx64
-            "(n=%u,ran=%" PRIu64 ",rk=%d,sys=%d,flushed=%d) walkprev=0x%" PRIx64
-            "(n=%u,mid=%d) chain=%u frames=%zu "
-            "snaps=%zu(mark=%zu) cpmem=%zu carry=%zu "
-            "evs=%zu rep=%d wmhold=%d wpsess=%d undrained=%" PRIu64
-            "\n",
-            phase, why, cpu_index_, cpu_index_ == closing_cpu ? "*" : "",
-            prev_tb_ ? prev_tb_->start_pc : 0,
-            prev_tb_ ? closedrop_tb_insns(prev_tb_) : 0,
-            prev_ran, prev_ran_known,
-            prev_tb_ ? (int)prev_tb_->is_system : -1,
-            flushed,
-            walk_prev_ ? walk_prev_->start_pc : 0, walkprev_n,
-            mid_step_ ? 1 : 0,
-            chain_n, frames_.size(),
-            n_snaps, snap_mark, n_cpmem, n_carry, n_evs,
-            rep_held, wm_held, wp_open,
-            undrained ? undrained_insns : 0);
-
-    for (const CtxFrame &fr : frames_) {
-        fprintf(f, "[census]   FRAME full=0x%" PRIx64 " n=%u sys=%d "
-                "resume=0x%" PRIx64 " depth=%u tid=%u returned=%d "
-                "emitted_to=%u\n",
-                fr.full_tmpl ? fr.full_tmpl->start_pc : 0,
-                fr.full_tmpl ? fr.full_tmpl->n_insns : 0,
-                fr.full_tmpl ? (int)fr.full_tmpl->is_system : -1,
-                fr.resume_pc, fr.depth, fr.tid, (int)fr.returned,
-                fr.emitted_to);
-    }
-    if (cp_chain(cpu_index_).has_active_chain()) {
-        cp_chain(cpu_index_).describe_in_flight(f, 0);
+    if (wp_open) {
+        g_stats.close_wp_session_open++;
     }
 }
 
-void path_builder_close_state_report(FILE *f, const char *why,
-                                     unsigned int closing_cpu,
-                                     const char *phase, bool print,
-                                     bool ledger)
+void path_builder_close_state_report(void)
 {
     for (unsigned int i = 0; i < CST_PIN_MAX_VCPUS; i++) {
         if (PathBuilder *b = path_builder_if_created(i)) {
-            b->close_state_report(f, why, closing_cpu, phase, print, ledger);
+            b->close_state_report();
         }
     }
-    /* Process-wide holders, once per phase.  The DEVIO queues hold
-     * completed records waiting for the next body entry to carry them; a
-     * close that emits no further entry drops them. */
-    const bool post = phase && phase[0] == 'p' && phase[1] == 'o';
-    if (post) {
-        size_t ds = 0, dt = 0;
-        devio_pending_counts(&ds, &dt);
-        if (ledger) {
-            g_stats.census_devio_held_at_close += ds + dt;
-        }
-        if (print && (ds || dt)) {
-            fprintf(f, "[census] post GLOBAL devio_starts=%zu devio_stops=%zu\n",
-                    ds, dt);
-        }
-    }
+    /* Process-wide holders.  The DEVIO queues hold completed records
+     * waiting for the next body entry to carry them; a close that emits no
+     * further entry drops them. */
+    size_t ds = 0, dt = 0;
+    devio_pending_counts(&ds, &dt);
+    g_stats.census_devio_held_at_close += ds + dt;
 }
 
 void path_builder_flush_final(unsigned int cpu_index,
@@ -1715,15 +1495,6 @@ ptrdiff_t PathBuilder::frame_idx_for_completion(const BBTemplate *suffix,
  * the incomplete chain so the emit references a template the decoder
  * will actually see.
  */
-/* Falsifier lever for the translation-cut repair (Stats::fold_prev_*):
- * refuse the cached-whole substitution so the cut-frame fallback arm and
- * its instruments provably fire on the deterministic mipsel cell. */
-static bool pb_fold_no_whole()
-{
-    static const bool v = getenv("CST_FOLD_NO_WHOLE") != nullptr;
-    return v;
-}
-
 BBTemplate *PathBuilder::fold_prev_full_bb(BBTemplate *prev,
                                            bool *out_head_cut)
 {
@@ -1796,8 +1567,7 @@ BBTemplate *PathBuilder::fold_prev_full_bb(BBTemplate *prev,
      */
     if (fell_back && full_bb) {
         g_stats.fold_prev_head_incomplete++;
-        BBTemplate *whole = pb_fold_no_whole()
-            ? nullptr : g_template_store.whole_block_covering(full_bb);
+        BBTemplate *whole = g_template_store.whole_block_covering(full_bb);
         if (whole) {
             /* CP-authoritative privilege stamp, as install_own_extent's
              * stamp arm: this block is being adopted for a CP emission at
@@ -2163,16 +1933,7 @@ void PathBuilder::apply_fault_return(const struct qemu_plugin_cpu_event &ev)
  */
 static size_t retention_tripwire()
 {
-    /* CST_RETENTION_TRIPWIRE lowers the threshold so the abort path itself
-     * can be fired on demand and shown to work — an instrument that has
-     * never been observed to fire is not evidence.  Test-only; it can only
-     * make the check STRICTER, never disable it. */
-    static const size_t v = [] {
-        const char *e = getenv("CST_RETENTION_TRIPWIRE");
-        size_t d = 2 * 64 + 2;
-        return e ? strtoul(e, nullptr, 0) : d;
-    }();
-    return v;
+    return 2 * 64 + 2;
 }
 
 /*
@@ -2265,102 +2026,6 @@ bool PathBuilder::event_is_ours(const struct qemu_plugin_cpu_event &ev,
 }
 
 /*
- * CST_RETAIN_CHECK: compare the OLD seal-time derivation (run here over
- * ref_evs_, the unconditional retention, verbatim) against the NEW one, and
- * record the CELL POPULATIONS of everything compared.
- *
- * The populations are the point.  A previous version of this comparison
- * reported "0 mismatches" over ~1500 events while its own log showed zero
- * events with in_async true — every compared event sat where the answer is
- * constant, so the transformation under test was never exercised.  Here the
- * cells are counted, and a required cell reading 0 is a FAILED check.
- */
-void PathBuilder::retain_check_compare(uint64_t new_resume_pc)
-{
-    g_stats.rcheck_seals++;
-
-    /* OLD derivation: the batch-shape prologue, then the ordered scan. */
-    bool old_in_async = false;
-    for (const RetainedEv &r : ref_evs_) {
-        if (r.ev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_RETURN) {
-            old_in_async = true;
-            break;
-        }
-        if (r.ev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_ENTER) {
-            break;
-        }
-    }
-    uint64_t old_resume_pc = 0;
-    for (const RetainedEv &r : ref_evs_) {
-        const struct qemu_plugin_cpu_event &ev = r.ev;
-        if (ev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_ENTER) {
-            old_in_async = true;
-        } else if (ev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_RETURN) {
-            old_in_async = false;
-        }
-        if (ev.kind != QEMU_PLUGIN_CPU_EV_FAULT_ENTER &&
-            ev.kind != QEMU_PLUGIN_CPU_EV_FAULT_RETURN) {
-            continue;
-        }
-        if (ev.kind == QEMU_PLUGIN_CPU_EV_FAULT_ENTER &&
-            !old_in_async && old_resume_pc == 0) {
-            old_resume_pc = ev.pc;
-        }
-        /* Cell census over every compared fault event. */
-        if (ev.kind == QEMU_PLUGIN_CPU_EV_FAULT_ENTER) {
-            if (r.in_async) {
-                g_stats.rcheck_cmp_enter_in_async++;
-            } else {
-                g_stats.rcheck_cmp_enter_not_async++;
-            }
-        } else {
-            if (r.in_async) {
-                g_stats.rcheck_cmp_return_in_async++;
-            } else {
-                g_stats.rcheck_cmp_return_not_async++;
-            }
-        }
-        if (r.ours) {
-            g_stats.rcheck_cmp_ours++;
-        } else {
-            g_stats.rcheck_cmp_foreign++;
-        }
-        if (r.in_async != old_in_async) {
-            g_stats.rcheck_mismatch_in_async++;
-            if (pb_diag()) {
-                fprintf(stderr, "[rcheck] IN_ASYNC new=%d old=%d kind=%u "
-                        "pc=0x%" PRIx64 " asid=0x%" PRIx64 "\n",
-                        (int)r.in_async, (int)old_in_async, ev.kind, ev.pc,
-                        ev.asid);
-            }
-        }
-    }
-
-    /* The successor override.  Under the default (owned-only) retention the
-     * two legitimately differ exactly when the old one picked a foreign
-     * event; that is the corruption being removed, and it is counted
-     * separately, so only an unexplained difference is a mismatch. */
-    if (old_resume_pc != new_resume_pc && !retain_all()) {
-        bool explained = false;
-        for (const RetainedEv &r : ref_evs_) {
-            if (r.ev.kind == QEMU_PLUGIN_CPU_EV_FAULT_ENTER &&
-                r.ev.pc == old_resume_pc && !r.ours) {
-                explained = true;
-                break;
-            }
-        }
-        if (!explained) {
-            g_stats.rcheck_mismatch_resume_pc++;
-            if (pb_diag()) {
-                fprintf(stderr, "[rcheck] RESUME_PC new=0x%" PRIx64
-                        " old=0x%" PRIx64 " (unexplained)\n",
-                        new_resume_pc, old_resume_pc);
-            }
-        }
-    }
-}
-
-/*
  * Fold ONE drained batch of ordered path events into this builder's
  * persistent state.  Two ordered passes, in event order: the retention
  * pass (which also moves the async window cursor), and the captured-async
@@ -2412,20 +2077,17 @@ void PathBuilder::absorb_events(const StepIn &in)
      * bound rather than a measurement.
      * ------------------------------------------------------------------
      */
-    retain_arms_check_once();
-    const bool keep_all = retain_all();
-    const bool fold_now = !slow_fold();
     win_cur_ = in.cur_window;
     for (size_t i = 0; i < in.n_evs; i++) {
         const struct qemu_plugin_cpu_event &ev = in.evs[i];
         const bool ev_in_async = drain_async_open_;
-        bool keep = keep_all;
+        bool keep = false;
         bool ev_ours = true;
 
         switch (ev.kind) {
         case QEMU_PLUGIN_CPU_EV_ASYNC_ENTER:
             drain_async_open_ = true;
-            if (primed_ && fold_now) {
+            if (primed_) {
                 if (g_features.trace_interrupts) {
                     async_captured_ = 1;
                     absorbed_opened_window_ = true;
@@ -2437,7 +2099,7 @@ void PathBuilder::absorb_events(const StepIn &in)
             break;
         case QEMU_PLUGIN_CPU_EV_ASYNC_RETURN:
             drain_async_open_ = false;
-            if (primed_ && fold_now) {
+            if (primed_) {
                 if (g_features.trace_interrupts) {
                     async_captured_ = 0;
                 } else {
@@ -2455,12 +2117,6 @@ void PathBuilder::absorb_events(const StepIn &in)
                 keep = true;
             } else {
                 g_stats.retention_events_refused++;
-                if (keep_all) {
-                    /* Only reachable in the unbounded experiment arm.  In
-                     * the shipping default this counter must read exactly
-                     * 0; a nonzero value is a failure, not a warning. */
-                    g_stats.retention_appends_from_untraced_events++;
-                }
             }
             /* The seal's architectural-successor override.  Taken from the
              * first retained non-in-async FAULT_ENTER, exactly as the old
@@ -2487,9 +2143,6 @@ void PathBuilder::absorb_events(const StepIn &in)
         if (keep) {
             pending_evs_.push_back(RetainedEv{ev, ev_in_async, ev_ours});
         }
-        if (retain_check()) {
-            ref_evs_.push_back(RetainedEv{ev, ev_in_async, ev_ours});
-        }
     }
 
     /* Retention tripwire.  |pending_evs_| is bounded by the traced context's
@@ -2499,7 +2152,7 @@ void PathBuilder::absorb_events(const StepIn &in)
      * fault-stack limit's worth of enter/return pairs.  Exceeding it means
      * that argument is false and there is a real defect — refuse loudly
      * rather than cap, truncate or drop anything. */
-    if (!keep_all && pending_evs_.size() > retention_tripwire()) {
+    if (pending_evs_.size() > retention_tripwire()) {
         fprintf(stderr, "champsim_tracer: FATAL retention tripwire: %zu "
                 "retained events exceeds the %zu bound (traced trap nesting "
                 "cannot reach this; this is a tracer bug, not a workload)\n",
@@ -2557,16 +2210,6 @@ void PathBuilder::absorb_events(const StepIn &in)
                 if (!async_owner_ok_) {
                     g_stats.async_capture_owner_unseen++;
                 }
-                if (pb_async_diag()) {
-                    fprintf(stderr, "[asyncdiag] ENTER win=%" PRIu64
-                            " pc=0x%" PRIx64 " tid=%u owner_tp=0x%" PRIx64
-                            " owner_ok=%d priv=%d asid=0x%" PRIx64
-                            " seq=%" PRIu64 " pinned=%d primed=%d\n",
-                            win_id_, ev.pc, in.cur_tid, async_owner_tp_,
-                            (int)async_owner_ok_, (int)ev.priv,
-                            ev.asid, g_dbg_last_emit_seq, (int)in.pinned,
-                            (int)primed_);
-                }
             } else if (ev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_RETURN) {
                 if (win_id_) {
                     g_stats.async_closed_by_return++;
@@ -2591,12 +2234,6 @@ void PathBuilder::absorb_events(const StepIn &in)
                     g_gap.close_pc = ev.pc;
                 }
                 async_owner_ok_ = false;
-                if (pb_async_diag()) {
-                    fprintf(stderr, "[asyncdiag] RETURN pc=0x%" PRIx64
-                            " tid=%u priv=%d seq=%" PRIu64 "\n",
-                            ev.pc, in.cur_tid, (int)ev.priv,
-                            g_dbg_last_emit_seq);
-                }
             } else if (ev.kind == QEMU_PLUGIN_CPU_EV_ASID_WRITE &&
                        win_id_) {
                 /* Measurement only.  An address-space switch inside an open
@@ -2606,15 +2243,6 @@ void PathBuilder::absorb_events(const StepIn &in)
                  * event at all. */
                 win_asidw_++;
                 g_stats.async_asid_write_in_window++;
-                if (pb_async_diag()) {
-                    fprintf(stderr, "[asyncdiag] ASIDW win=%" PRIu64
-                            " new_asid=0x%" PRIx64 " priv=%d seq=%" PRIu64
-                            " owner=%u cur_tid=%u\n",
-                            win_id_, ev.asid, (int)ev.priv,
-                            g_dbg_last_emit_seq,
-                            (unsigned)(async_owner_ok_ ? 1 : 0),
-                            in.cur_tid);
-                }
             }
         }
     }
@@ -2672,10 +2300,7 @@ void PathBuilder::emit_prev_at_departure(const StepIn &in)
     g_mutex_unlock(&data_lock);
 }
 
-/* See the declaration in champsim_tracer_path_builder.h.  CST_NO_MIGRATE_
- * DRAIN is the falsifier arm: it restores the pre-fix behaviour (the
- * vacated holder waits for a close that emits it out of program order) so
- * the displaced-block class is reproducible on demand. */
+/* See the declaration in champsim_tracer_path_builder.h. */
 void PathBuilder::drain_migrated_holder(void)
 {
     BodyStreamState *out_stream =
@@ -2683,41 +2308,6 @@ void PathBuilder::drain_migrated_holder(void)
                                      : nullptr;
     uint64_t executed = 0;
     bool have = prev_extent(&executed);
-    /* CST_SMP_DRAIN_UNK_FALSIFY is the falsifier arm of the drain's
-     * must-be-0 row: it forces the extent lookup to fail once per run so
-     * smp_migrate_drain_extent_unknown is PROVEN reachable.  The row read
-     * 0 in all 169 instrumented cells that reported it before this arm
-     * existed, which on its own cannot distinguish "the stash or the
-     * parked cursor always answers" from "the branch is unreachable and
-     * the row means nothing".  Unlike
-     * the claim-ledger and stamp falsifiers this one cannot be synthetic
-     * — the counter's whole meaning is that a block went unpublished — so
-     * it genuinely severs one drain, and is a severing arm of the same
-     * family as CST_NO_MIGRATE_DRAIN, never on by default. */
-    {
-        static const bool falsify =
-            getenv("CST_SMP_DRAIN_UNK_FALSIFY") != nullptr;
-        static bool falsified = false;
-        if (falsify && !falsified) {
-            falsified = true;
-            have = false;
-            executed = 0;
-            if (cst_smp_diag()) {
-                fprintf(stderr, "champsim_tracer: [smpdiag] FALSIFIER drain "
-                        "extent forced unknown at pc=0x%" PRIx64 "\n",
-                        prev_tb_ ? prev_tb_->start_pc : 0);
-            }
-            g_stats.smp_migrate_drain_extent_unknown++;
-            g_mem_recorder.clear_cp(cpu_index_);
-            pending_reg_snaps(cpu_index_).clear();
-            cp_chain_snap_mark(cpu_index_) = 0;
-            g_mutex_lock(&data_lock);
-            cp_chain(cpu_index_).reset();
-            g_mutex_unlock(&data_lock);
-            clear_prev();
-            return;
-        }
-    }
     if (!have && retired_executed_of(cpu_index_, prev_tb_, &executed)) {
         /* The vacated vCPU's cursor is PARKED: nothing has dispatched on
          * it since the held block (that absence is why the drain exists),
@@ -2848,37 +2438,10 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
             async_win_close("PREPRIME", in.cur_tid);
             gap_disarm();       /* nothing owed pre-prime */
         }
-    } else if (!slow_fold()) {
-        /* Folded at drain, O(1) per event, into these same members with the
-         * same assignment semantics.  The rescan below is the reference form
-         * kept only for the CST_SLOW_FOLD arm. */
-        async_enter_this_batch = drain_opened_window;
     } else {
-        for (const RetainedEv &rev : pending_evs_) {
-            const struct qemu_plugin_cpu_event &ev = rev.ev;
-            if (ev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_ENTER) {
-                if (g_features.trace_interrupts) {
-                    /* Capture: contribute one depth level and remember the
-                     * batch opened a window, so the interrupted prev seals
-                     * against the departure PC below. */
-                    async_captured_ = 1;
-                    async_enter_this_batch = true;
-                } else {
-                    async_excluding_ = true;
-                }
-                async_departure_pc_ = ev.pc;
-            } else if (ev.kind == QEMU_PLUGIN_CPU_EV_ASYNC_RETURN) {
-                if (g_features.trace_interrupts) {
-                    async_captured_ = 0;
-                } else {
-                    async_excluding_ = false;
-                }
-                async_departure_pc_ = 0;
-            }
-            /* ASID_WRITE (kind 4) is window-neutral: consumed by the
-             * content-gate refresh at its own commit point, explicitly
-             * ignored here. */
-        }
+        /* Folded at drain, O(1) per event, into these same members with the
+         * same assignment semantics. */
+        async_enter_this_batch = drain_opened_window;
     }
     g_capture_mute = async_excluding_;
 
@@ -3076,25 +2639,13 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
                 if (left && left != this && left->prev() != nullptr &&
                     left->prev_tid() == in.cur_tid) {
                     g_stats.smp_migrated_holder_pending++;
-                    if (cst_smp_diag()) {
-                        fprintf(stderr, "[smpdiag] tid %u migrated vCPU %u"
-                                "->%u leaving unsealed slot pc=0x%" PRIx64
-                                " behind\n", in.cur_tid, it->second,
-                                in.cpu_index, left->prev()->start_pc);
-                    }
                     /* THE THREAD-KEYED DRAIN.  This promote is the proof
                      * the thread's program order continues HERE: the
                      * vacated builder's held block precedes everything
                      * this step will emit, and nothing on that vCPU is
                      * coming to seal it.  Publish it now, in order (see
-                     * drain_migrated_holder).  CST_NO_MIGRATE_DRAIN is
-                     * the falsifier arm: pre-fix behaviour, the holder
-                     * waits for the close and surfaces displaced. */
-                    static const bool no_drain =
-                        getenv("CST_NO_MIGRATE_DRAIN") != nullptr;
-                    if (!no_drain) {
-                        left->drain_migrated_holder();
-                    }
+                     * drain_migrated_holder). */
+                    left->drain_migrated_holder();
                 }
                 it->second = in.cpu_index;
             } else if (it == tid_last_vcpu.end()) {
@@ -3116,19 +2667,10 @@ PathBuilder::StepStatus PathBuilder::step_events(const StepIn &in)
      * fan-out falls back to the memop-derived count, and a mid-REP fault
      * discards its retired iterations instead of publishing them as the
      * rep-split piece (the classify rep_split predicate reads these facts)
-     * — the measured 32-of-96 REP STOSB wire loss.  CST_REP_FACTS_OFF is
-     * the falsifier lever: it reproduces exactly that severed-wire shape
-     * so the "(must be 0)" retired-iteration drop counter is provable on
-     * demand. */
-    {
-        static const bool rep_facts_off =
-            getenv("CST_REP_FACTS_OFF") != nullptr;
-        if (!rep_facts_off) {
-            rep_state(in.cpu_index).pb_prev_facts = RepArchFacts();
-            rep_state(in.cpu_index).pb_prev_facts_armed = true;
-        }
-    }
-        gap_record_continue(in.live_priv);
+     * — the measured 32-of-96 REP STOSB wire loss. */
+    rep_state(in.cpu_index).pb_prev_facts = RepArchFacts();
+    rep_state(in.cpu_index).pb_prev_facts_armed = true;
+    gap_record_continue(in.live_priv);
     /* CONTINUE hands control to the glue's window management (the shutdown
      * gate, tw_manage_window) before step_seal runs, and that is the ONE
      * window in which walk_prev_ holds a block that has executed and has
@@ -3155,8 +2697,6 @@ PathBuilder::complete_continuation(size_t idx,
                                    BodyStreamState *out_stream,
                                    unsigned int cpu_index)
 {
-    gap_merge_probe();
-
     /* Leaked deeper ledger entries of the SAME thread: strict LIFO says an
      * inner excursion unwinds before its outer, so a deeper same-tid frame
      * surviving to this completion lost its own continuation (its suffix
@@ -3219,9 +2759,6 @@ PathBuilder::complete_continuation(size_t idx,
     }
     if (!g_features.trace_faults) {
         eff_depth = 0;              /* faults=0 carries no depth>0 entries */
-    }
-    if (depth3_render_off()) {
-        eff_depth = f.depth;        /* measurement arm: frozen stamp */
     }
     g_emit_fault_depth = eff_depth;
     g_dbg_depth_src = CST_DSRC_MERGE;
@@ -3335,7 +2872,7 @@ void PathBuilder::stamp_cur_depth(const StepIn &in, bool post_merge)
         if (foreign_inflight > g_stats.depth_tid_max_foreign) {
             g_stats.depth_tid_max_foreign = foreign_inflight;
         }
-        if (pb_diag() || pb_depth_diag() || cst_jump_diag()) {
+        if (pb_diag() || cst_jump_diag()) {
             fprintf(stderr, "[pathbuilder] TID-DISOWN cur=0x%" PRIx64
                     " tid=%u own=%u foreign=%u frames=%zu\n",
                     in.cur ? in.cur->start_pc : 0, in.cur_tid,
@@ -3392,7 +2929,7 @@ void PathBuilder::stamp_cur_depth(const StepIn &in, bool post_merge)
         if (delta > g_stats.depth_restamp_max_delta) {
             g_stats.depth_restamp_max_delta = delta;
         }
-        if (pb_diag() || pb_depth_diag() || cst_jump_diag()) {
+        if (pb_diag() || cst_jump_diag()) {
             fprintf(stderr, "[pathbuilder] RESTAMP cur=0x%" PRIx64
                     " %u -> %u (delta %u) frames=%zu\n",
                     in.cur ? in.cur->start_pc : 0, was, prev_depth_, delta,
@@ -3445,7 +2982,6 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
     if (!primed_) {
         prime_from_live();
         pending_evs_.clear();   /* priming swallow */
-        ref_evs_.clear();
         retained_first_enter_pc_ = 0;
         /* The window cursor starts from the live truth at the prime; every
          * pre-prime edge was just discarded with the swallow. */
@@ -3457,9 +2993,6 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
          * opened on an EARLIER bailed step (it guessed "in a window" from
          * the batch's first async edge being a RETURN); the cursor knows. */
         fault_resume_pc = fault_on ? retained_first_enter_pc_ : 0;
-        if (retain_check()) {
-            retain_check_compare(fault_resume_pc);
-        }
         for (const RetainedEv &rev : pending_evs_) {
             const struct qemu_plugin_cpu_event &ev = rev.ev;
             const bool ev_in_async = rev.in_async;
@@ -3526,7 +3059,6 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
              * context switch an ASID_WRITE marks cannot perturb. */
         }
         pending_evs_.clear();
-        ref_evs_.clear();
         retained_first_enter_pc_ = 0;
         /*
          * Fault-trailer depth = the pinned process's OWN synchronous-fault
@@ -3661,7 +3193,7 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
                 g_stats.census_frames_diverted++;
                 cst_jump_diag_step(entry_pc, f.full_tmpl->start_pc,
                                    in.live_priv, 1, "fault-diverted");
-                if (pb_diag() || pb_depth_diag()) {
+                if (pb_diag()) {
                     fprintf(stderr, "[pathbuilder] DIVERTED entry=0x%" PRIx64
                             " frame full=0x%" PRIx64 " resume=0x%" PRIx64
                             " emitted_to=%u\n",
@@ -3761,15 +3293,13 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
                     }
                     if (release) {
                         g_stats.async_abandon_stamp_stripped++;
-                        if (!depth3_render_off()) {
-                            walk_depth_ -= 1;
-                            g_dbg_walk_depth = walk_depth_;
-                            if (pb_diag() || pb_depth_diag()) {
-                                fprintf(stderr, "[pathbuilder] ABANDON-STRIP "
-                                        "walk=0x%" PRIx64 " -> depth %u\n",
-                                        walk_prev_ ? walk_prev_->start_pc : 0,
-                                        walk_depth_);
-                            }
+                        walk_depth_ -= 1;
+                        g_dbg_walk_depth = walk_depth_;
+                        if (pb_diag()) {
+                            fprintf(stderr, "[pathbuilder] ABANDON-STRIP "
+                                    "walk=0x%" PRIx64 " -> depth %u\n",
+                                    walk_prev_ ? walk_prev_->start_pc : 0,
+                                    walk_depth_);
                         }
                     }
                     g_pb_walk_async[aslot] = 0;
@@ -3824,26 +3354,6 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
         g_dbg_async_captured = seal_async_lvl;
         g_dbg_depth_next = depth_next_;
         g_dbg_frames = frames_.size();
-        /* Skip the pure user/steady-state (depth 0, no frames, prev depth 0)
-         * UNLESS the current TB is a REP string op (rep_subtmpl), whose
-         * fanned-out emit is the residual jump's locus: keep every step that
-         * carries excursion context or a REP so the per-step log stays small
-         * yet captures the interleave.  g_dbg_last_emit_seq ties the step to
-         * the wire position. */
-        bool cur_is_rep = in.cur && in.cur->rep_subtmpl.ptr != nullptr;
-        if (pb_depth_diag() &&
-            (cur_is_rep ||
-             !(depth_next_ == 0 && walk_depth_ == 0 && prev_depth_ == 0 &&
-               frames_.empty()))) {
-            fprintf(stderr, "[depthdiag] seq~%" PRIu64 " cur=0x%" PRIx64
-                    " walk_prev=0x%" PRIx64 " priv=%d rep=%d raw=%u inflight=%u "
-                    "depth_next=%u prev_depth=%u walk_depth=%u frames=%zu\n",
-                    g_dbg_last_emit_seq,
-                    in.cur ? in.cur->start_pc : 0,
-                    walk_prev_ ? walk_prev_->start_pc : 0, in.live_priv,
-                    (int)cur_is_rep, raw_depth_, pinned_inflight, depth_next_,
-                    prev_depth_, walk_depth_, frames_.size());
-        }
     }
 
     /* Stamp cur (already promoted by step_events) with the depth it runs at,
@@ -3909,13 +3419,6 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
         for (const PendingEmit &pe : pending_emits) {
             if (pe.branch_pc != 0) {
                 g_stats.smp_seal_cross_thread_succ++;
-                if (cst_smp_diag()) {
-                    fprintf(stderr, "[smpdiag] cross-thread successor at "
-                            "seal: block=0x%" PRIx64 " walk_tid=%u "
-                            "cur_tid=%u succ=0x%" PRIx64 " vcpu=%u\n",
-                            pe.bb_tmpl->start_pc, in.walk_tid, in.cur_tid,
-                            pe.emit_current_pc, in.cpu_index);
-                }
                 break;
             }
         }

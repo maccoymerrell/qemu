@@ -732,7 +732,7 @@ std::vector<WPEntry> BodyWalker::decode_wp_chain(
         /* Dangling-template-ref lint (cst_lint.h): id 0 is the writer's
          * "no template" sentinel, every other id must resolve. */
         if (!wtmpl && wp_tmpl != 0) {
-            lint_.note_dangling((uint32_t)wp_tmpl, /*is_wp=*/true);
+            lint_.note_dangling((uint32_t)wp_tmpl);
         }
         /* Each block's own block-level records ride its wp_delta_section
          * (§4.3/§4.4): its executed range, and its events as
@@ -799,7 +799,7 @@ void BodyWalker::handle_entry(WalkState &ws, const Callback &cb)
      * template the templates section never defined is structural
      * corruption, whatever the id's value. */
     if (!cp_tmpl) {
-        lint_.note_dangling((uint32_t)entry_tmpl, /*is_wp=*/false);
+        lint_.note_dangling((uint32_t)entry_tmpl);
     }
     BlockCells bc;
     decode_field_delta(body_, (uint32_t)entry_tmpl, cp_tmpl,

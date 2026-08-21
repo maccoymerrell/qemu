@@ -7,7 +7,6 @@
 #include "champsim_tracer_bb_chain_assembler.h"
 #include "champsim_tracer_bb_template_cache.h"
 #include <inttypes.h>
-#include <dlfcn.h>
 
 #include "champsim_tracer_stats.h"
 
@@ -148,32 +147,6 @@ bool BBChainAssembler::in_flight_is_system() const
            fragments_.front()->is_system;
 }
 
-void BBChainAssembler::describe_in_flight(std::FILE *out,
-                                          uint64_t breaking_pc) const
-{
-    if (fragments_.empty()) {
-        return;
-    }
-    std::fprintf(out,
-        "champsim_tracer: [chaindrop] entry=0x%" PRIx64 " frags=%zu insns=%u "
-        "last_ft=0x%" PRIx64 " breaking_pc=0x%" PRIx64 " is_sys=%d "
-        "await_ds=%d gen=%s\n",
-        entry_pc_, fragments_.size(), chain_insns(fragments_), last_ft_,
-        breaking_pc, (int)in_flight_is_system(), (int)awaiting_delay_slot_,
-        my_gen_ == g_segment_generation.load(std::memory_order_relaxed)
-            ? "same" : "stale");
-    for (const BBTemplate *f : fragments_) {
-        if (!f) {
-            continue;
-        }
-        std::fprintf(out,
-            "champsim_tracer: [chaindrop]   frag pc=0x%" PRIx64 " n=%u "
-            "ft=0x%" PRIx64 " terminus=%u\n",
-            f->start_pc, f->n_insns, f->fall_through_pc,
-            (unsigned)f->terminus);
-    }
-}
-
 BBTemplate *BBChainAssembler::finalize_truncated(BBTemplate *tail_frag,
                                                  uint32_t tail_insns)
 {
@@ -221,20 +194,6 @@ void BBChainAssembler::reset()
         if (g_stats.reg_snap_chain_reset_first_pc == 0) {
             g_stats.reg_snap_chain_reset_first_pc =
                 entry_pc_ ? entry_pc_ : fragments_.front()->start_pc;
-        }
-        if (getenv("CST_CHAIN_RESET_TRACE")) {
-            void *ra = __builtin_return_address(0);
-            Dl_info di;
-            unsigned long off = 0;
-            if (dladdr(ra, &di) && di.dli_fbase) {
-                off = (unsigned long)((char *)ra - (char *)di.dli_fbase);
-            }
-            fprintf(stderr, "[chainreset] entry=0x%" PRIx64 " first=0x%"
-                    PRIx64 " frags=%zu insns=%u sys=%d raoff=0x%lx\n",
-                    entry_pc_, fragments_.front()->start_pc,
-                    fragments_.size(), chain_insns(fragments_),
-                    (int)fragments_.front()->is_system, off);
-            fflush(stderr);
         }
     }
     entry_pc_ = 0;

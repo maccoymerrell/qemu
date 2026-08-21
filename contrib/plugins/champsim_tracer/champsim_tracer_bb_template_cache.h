@@ -372,14 +372,6 @@ public:
     void for_each_alt(uint32_t &next_id,
                       const std::function<void(BBTemplate &)> &fn);
 
-    /* Diagnostic: dump a per-bucket census of the serialisable true-BB
-     * cache (bb_map_) to @out, splitting the shared kernel sentinel bucket
-     * from the per-process root buckets and CODE vs SPEC lifetime, and
-     * quantifying kernel-code duplication (distinct kernel start_pcs vs
-     * kernel templates).  Gated by CST_TMPL_CENSUS at the call site; must
-     * run before clear_bb_map drops the segment's templates. */
-    void census(std::FILE *out) const;
-
     /* SPEC-lifetime template reclaim (#91): see TmplLife.
      * set_creating_spec selects the lifetime class of templates built by
      * the CURRENT translation (called by vcpu_tb_trans with its spec

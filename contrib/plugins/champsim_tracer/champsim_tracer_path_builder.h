@@ -156,12 +156,9 @@ extern uint64_t g_dbg_last_emit_seq;
  *
  * g_cst_closing_cpu: the vCPU a segment close is executing on while its
  * flush hook runs (UINT32_MAX outside a close), so flush_final can
- * classify a PEER slot's extent source (stash vs live cursor).
- *
- * cst_smp_diag(): the CST_SMP_DIAG gate, shared across TUs. */
+ * classify a PEER slot's extent source (stash vs live cursor). */
 extern const char *g_cst_emit_site;
 extern unsigned int g_cst_closing_cpu;
-bool cst_smp_diag(void);
 
 /* ---- CST_JUMP_DIAG: online depth-step violation detector (diagnostic) ----
  *
@@ -273,9 +270,6 @@ void smp_close_peer_extent_note(unsigned int cpu_index,
  * sequentiality — sees a break the format does not document.
  */
 extern uint64_t g_promote_seq;
-
-/* CST_SEALEXT: per-seal diagnostic print for unanswered extent questions. */
-bool seal_extent_diag(void);
 
 /* Index of @pc among the instructions of the dispatched TB whose head is
  * @head (fragments walked in execution order), or UINT32_MAX. */
@@ -636,16 +630,6 @@ public:
         return true;
     }
 
-    /* Diagnostic only (CST_SEALEXT): WHY seal_prev_extent could not answer
-     * for @head.  Bit 0 — no measurement was carried across the swap at all;
-     * bit 1 — one was carried but it belongs to a DIFFERENT block.  The two
-     * misses have different causes and only the report distinguishes them. */
-    unsigned seal_extent_miss(const BBTemplate *head) const
-    {
-        return (seal_prev_extent_valid_ ? 0u : 1u) |
-               (head == seal_prev_ ? 0u : 2u);
-    }
-    const BBTemplate *seal_prev_block() const { return seal_prev_; }
     bool live_prev_extent_valid() const { return prev_extent_valid_; }
 
     /* The pending-seal slot (the deferred prev TB); read by the blkwatch
@@ -753,20 +737,12 @@ public:
      * pending self-loop facts — leaves with no drain and no counter, so
      * a clock-vs-wire residual at a close has no site to name.
      *
-     * This walks all of them and prints one [census] line per builder,
-     * TWICE per close: @phase "pre" before anything is flushed (what the
-     * close inherited) and "post" after the flush hook has run (what
-     * survived it, which is the drop).  The post pass is also where the
-     * held_at_close ledger rows in Stats are accumulated, so the fate
-     * identity "entered == fated + held" is checkable over a whole run.
-     *
-     * Printing is behind CST_CLOSEDROP; the ledger accumulation is not
-     * (a counter that only exists when a diagnostic is enabled cannot be
-     * quoted as evidence for a run that did not enable it). */
-    void close_state_report(FILE *f, const char *why,
-                            unsigned int closing_cpu,
-                            const char *phase, bool print,
-                            bool ledger) const;
+     * This walks all of them and folds what each is still holding into
+     * the held_at_close ledger rows in Stats, so the fate identity
+     * "entered == fated + held" is checkable over a whole run.  Taken
+     * AFTER the close's flush hook has run: what survives it is the
+     * drop. */
+    void close_state_report() const;
 
 private:
     void prime_from_live();
@@ -921,11 +897,7 @@ private:
      * persistent members, done once at drain (O(1)), plus the per-event
      * in_async stamp above.  ASID_WRITE's whole effect is the synchronous
      * content-gate refresh at the same commit point; the queued copy is
-     * discarded here.
-     *
-     * Under CST_RETAIN_ALL=1 the ownership guard on the append is bypassed
-     * (and nothing else changes) so the discriminating experiment can run
-     * the unbounded arm in the same binary. */
+     * discarded here. */
     std::vector<RetainedEv> pending_evs_;
 
     /* One batch-local fact the seal needs but cannot recompute: a capture
@@ -982,12 +954,6 @@ private:
      * match the frame key's window component. */
     uint64_t win_cur_ = 0;
 
-    /* CST_RETAIN_CHECK only: the OLD unconditional retention, kept verbatim
-     * alongside the new one so every seal can compare the two derivations.
-     * Unbounded by construction — never a default, never a shipping path. */
-    std::vector<RetainedEv> ref_evs_;
-    void retain_check_compare(uint64_t new_resume_pc);
-
     /* The single pending-seal slot: the deferred prev TB, plus the fault
      * depth stamped when it EXECUTED.  Stamping at promote time (not at
      * seal time) is required — the fault stack may pop between a TB's
@@ -1033,7 +999,7 @@ private:
      * process's frames with a busy boot's leaked frames and the churn
      * tasks' transient ones — no per-vCPU baseline scalar can partition it,
      * so the trailer counts our own frames instead.  raw_depth_ tracks
-     * depth_after of the last fault event for the CST_DEPTH_DIAG log only. */
+     * depth_after of the last fault event for the depth mirrors only. */
     uint32_t depth_next_ = 0;
 
     /* Stamp cur's fault depth (and the faults=0 sync-span flag) from the
@@ -1221,14 +1187,9 @@ void path_builder_flush_final_chain_only(unsigned int cpu_index,
                                          bool stamp_thread_end = true);
 
 /* The close census: one pass per segment close over every builder that
- * ever ran, naming everything still held (see
- * PathBuilder::close_state_report).  Called twice per close — @phase
- * "pre" before the flush hook, "post" after it.  @print is the
- * CST_CLOSEDROP gate; the ledger accumulation in the "post" pass runs
- * regardless. */
-void path_builder_close_state_report(FILE *f, const char *why,
-                                     unsigned int closing_cpu,
-                                     const char *phase, bool print,
-                                     bool ledger);
+ * ever ran, folding everything still held into the held_at_close ledger
+ * (see PathBuilder::close_state_report).  Called once per close, after
+ * the flush hook. */
+void path_builder_close_state_report(void);
 
 #endif /* CHAMPSIM_TRACER_PATH_BUILDER_H */

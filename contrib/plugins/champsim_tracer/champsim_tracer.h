@@ -1293,35 +1293,29 @@ typedef struct {
      * function-call / TLS-cache overhead the callback's C-level
      * early-bail still pays. */
     uint64_t is_active;
-    /* 1 while the live address space is the pinned one, 0 otherwise.
-     * Maintained by the synchronous ASID-write hook (see
-     * asid_write_track_cb): the value only changes at the architectural
-     * address-space-register commit points, so a per-write update keeps
-     * the flag exact with zero per-TB cost.  It is what lets the context
-     * gates below, and the wide-register owned-set membership test, answer
-     * "is the live address space one this trace owns?" with no per-TB
-     * probe. */
+    /* JIT-testable mirror of this vCPU's CONTENT-GATE BIT (1 when the
+     * live context maps a latched marker window's bytes, 0 otherwise).
+     * Maintained event-driven by refresh_ctx_gates / marker_gate_refresh
+     * at every committed address-space change — the gate itself is the
+     * content check; this slot only lets the JIT-inlined coarse
+     * fast-forward compensation brcond on the same verdict without a
+     * call.  Never an identity: no root or ASID value is stored here. */
     uint64_t asid_match;
-    /* Context gate for the heavy per-TB capture callback (vcpu_tb_exec).
-     * Folds is_active AND pinned-context-ownership into ONE JIT-testable
-     * slot so a foreign / unowned TB is never dispatched at all — no
-     * callback, no vclock pause, no drop decision.  Byte-identical to
-     * is_active everywhere the ownership question is trivial (user mode,
-     * unpinned system, and the wide-register system pins whose ASID is a
-     * reliable process id); it diverges only for a narrow-ASID (MIPS)
-     * system pin, where a recycled ASID cannot distinguish processes and
-     * the physical-page probe adjudicates.  Maintained EVENT-DRIVEN (see
-     * refresh_ctx_gates): at every is_active edge, at each ASID-write
-     * commit, and when the light probe re-acquires the pinned process. */
+    /* Context gate for the heavy per-TB capture callback (vcpu_tb_exec):
+     * a bare is_active mirror, deliberately.  The heavy step must keep
+     * dispatching for FOREIGN contexts too, because the any-context
+     * termination bounds (stall ceiling, idle-backstop beat) ride it —
+     * foreign-ness within a segment is the content-gate bit above,
+     * tested as one relaxed load inside the step.  Maintained
+     * EVENT-DRIVEN (see refresh_ctx_gates): at every is_active edge, at
+     * each committed address-space write, at window opens/releases and
+     * at vCPU init. */
     uint64_t trace_this_ctx;
-    /* Companion gate for the light re-acquisition probe (vcpu_pin_probe),
-     * set only for a narrow-ASID system pin.  1 exactly when a segment is
-     * active but this vCPU's dwell is NOT a confirmed-owned pinned
-     * context: the light probe runs per such TB (a user-clock cursor
-     * tick, the physical-page content probe on user TBs, and the capture
-     * mute the heavy drop path used to set) and flips trace_this_ctx to 1
-     * on the TB that re-acquires the process.  0 (probe never fires) for
-     * user mode, unpinned system, and wide-register pins. */
+    /* RETIRED gate of the narrow-ASID re-acquisition probe: content
+     * gating removed its consumer, and no callback registers on this
+     * slot any more — it is allocated and zeroed only.  Deleting the
+     * field is owed as a follow-up (kept through the reduction landing
+     * to leave the validated scoreboard layout untouched). */
     uint64_t pin_probe;
     /* "A path-event drain is owed on this vCPU".  Written by QEMU, not by
      * the plugin: 1 on every cpu_plugin_evq_push, 0 on every

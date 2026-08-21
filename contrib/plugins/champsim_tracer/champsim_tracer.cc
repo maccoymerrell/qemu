@@ -9451,12 +9451,13 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
  *
  * QEMU's per-vCPU path-event queue is grow-only and never drops.  Its only
  * consumer used to be events_path_step, reached only from the heavy
- * vcpu_tb_exec, which the JIT dispatches only when trace_this_ctx says this
- * context is both in-segment AND owned.  Every window where that gate is
+ * vcpu_tb_exec, which the JIT then dispatched only when trace_this_ctx
+ * said this context was both in-segment AND owned.  Every window where that gate is
  * shut is a window where the queue has NO consumer at all:
  *
- *   W1 a foreign / unconfirmed context (narrow-ASID pins: trace_this_ctx
- *      diverges from is_active only there, so this is where it was caught);
+ *   W1 a foreign / unconfirmed context (narrow-ASID pins, since retired:
+ *      trace_this_ctx diverged from is_active only there, so this is
+ *      where it was caught);
  *   W2 inter-segment (is_active == 0 zeroes trace_this_ctx AND pin_probe on
  *      every ISA, so neither existing callback dispatches);
  *   W3 after the marker window closes -- W2's code path, mirrored to every
@@ -9479,7 +9480,7 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
  * exception edges around it produced.
  *
  * REGISTERED LAST, after vcpu_tb_exec.  Each cond_cb re-loads its slot when
- * it runs (the same ordering the budget cb and pin_probe already rely on), so
+ * it runs (the same ordering the budget cb already relies on), so
  * on a TB where the heavy callback dispatched, its own drain has already
  * zeroed evq_pending and this callback's brcond is false: the light path runs
  * on exactly the TBs where nothing else drained, and the traced path pays one
@@ -9572,12 +9573,12 @@ static void vcpu_evq_absorb(unsigned int cpu_index, void *udata)
 static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
 {
     /* This callback is registered via register_vcpu_tb_exec_cond_cb
-     * gated on the trace_this_ctx scoreboard slot (is_active folded with
-     * pinned-context ownership), so the JIT only dispatches it in-segment
-     * for a context this trace owns.  Inter-segment dispatch is handled
-     * solely by inline_add (icount/budget) and vcpu_tb_check_budget;
-     * foreign-ness within a segment is the content-gate bit, tested
-     * inside the step (the dispatch shape never diverges).
+     * gated on the trace_this_ctx scoreboard slot (a bare is_active
+     * mirror), so the JIT only dispatches it in-segment.  Inter-segment
+     * dispatch is handled solely by inline_add (icount/budget) and
+     * vcpu_tb_check_budget; foreign-ness within a segment is the
+     * content-gate bit, tested inside the step (the dispatch shape
+     * never diverges).
      *
      * udata = the head fragment of this TB's per-translation fragment
      * list, set when the translation was armed in vcpu_tb_trans.
@@ -11287,13 +11288,12 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
             (void *)head_fragment);
     }
     /* Heavy callback: chain assembler, WP simulator, body-entry
-     * emission.  Gated via cond_cb on trace_this_ctx (is_active folded
-     * with pinned-context ownership) so it is NOT dispatched at all
-     * inter-segment OR for a foreign / unowned context — the JIT emits a
-     * brcond and skips the call, sparing the vclock pause and the drop
-     * decision the dropped foreign TB used to pay.  For user mode,
-     * unpinned system, and wide-register pins trace_this_ctx mirrors
-     * is_active exactly, so the cb fires per TB just as it did before. */
+     * emission.  Gated via cond_cb on trace_this_ctx (a bare is_active
+     * mirror) so it is NOT dispatched at all inter-segment — the JIT
+     * emits a brcond and skips the call.  Foreign contexts within a
+     * segment DO dispatch (the any-context termination bounds ride this
+     * callback); foreign-ness is the content-gate bit, one relaxed load
+     * inside the step. */
     qemu_plugin_register_vcpu_tb_exec_cond_cb(
         tb, vcpu_tb_exec, QEMU_PLUGIN_CB_RW_REGS,
         QEMU_PLUGIN_COND_GE, g_scoreboard.trace_this_ctx, 1,

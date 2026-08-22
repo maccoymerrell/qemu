@@ -2006,7 +2006,34 @@ static void marker_gate_refresh(unsigned int cpu_index)
                 g_stats.marker_page_unreadable_at_refresh++;
             }
             g_stats.refresh_evaluated_not_traced++;
+            /*
+             * WHY it said no.  An unreadable marker page taken while the
+             * vCPU is privileged is not evidence of a foreign context --
+             * on AArch64 a kernel with PSTATE.PAN set cannot read user
+             * memory at all -- and the gate latching OFF on it is the
+             * leading suspect for the aarch64 truncation (2/44 boots,
+             * cst_runs/p3/t170/FINDING_aarch64_gate_loss.md).  Split it
+             * from the unmapped-in-this-space case, which IS evidence,
+             * and from a readable page whose bytes differ, which is the
+             * gate working as designed.
+             */
+            if (unreadable) {
+                if (qemu_plugin_get_priv_level() != 0) {
+                    g_stats.refresh_unreadable_in_kernel++;
+                } else {
+                    g_stats.refresh_unreadable_in_user++;
+                }
+            } else {
+                g_stats.refresh_content_mismatch++;
+            }
         }
+    }
+    /* The transition, which is what a truncation actually looks like: an
+     * OFF with no later ON while the marked process is still running. */
+    if (prior_gated && !on) {
+        g_stats.refresh_gate_turned_off++;
+    } else if (!prior_gated && on) {
+        g_stats.refresh_gate_turned_on++;
     }
     marker_gate_set(cpu_index, on);
     if (cpu_index < CST_PIN_MAX_VCPUS) {

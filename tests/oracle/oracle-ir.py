@@ -245,6 +245,7 @@ class Insn(object):
         self.diff_w = set()          # what the runtime differ saw change
         self.ccop_w = 0              # lone cc_op stores, see ARCH_ALIAS
         self.inside = 0              # accesses recovered from inside a helper
+        self.opaque = 0              # ops the walk DECLINED to answer for
         self.reenc = {}              # writes that only re-encoded a register
         self.variants = []           # one (r, w) per translation of this pc
 
@@ -277,6 +278,7 @@ def parse(path, target, layout):
             if m:
                 i = get(int(m.group(1), 16))
                 i.ops = int(m.group(2))
+                i.opaque += int(m.group(4))
                 # An A line ends one translation of this pc.  Keeping the
                 # variants apart is what makes it possible to say whether the
                 # *architectural* set moved when the op stream did.
@@ -523,6 +525,16 @@ def main():
     rows = {pc: (b, t) for pc, b, t in disas_window(args.compare, lo, hi)}
 
     agree = disagree = 0
+    # A REFUSAL IS NOT A DISAGREEMENT.  Where the walk met a helper it could
+    # not see inside, it marks the instruction opaque and says so; summing
+    # those with instructions it answered completely inflates the headline
+    # with rows that are a statement about the derivation's reach, not about
+    # the decoder.  On the first x86_64 sample that was 31 of 66 signatures --
+    # half the number a reader would otherwise take as disagreement.  The
+    # plugin API already draws this line (an incomplete set is refused, never
+    # truncated); the comparison has to draw it too.
+    opaque_insns = 0
+    opaque_groups = collections.Counter()
     groups = collections.Counter()
     reenc_cost = collections.Counter()
     examples = {}
@@ -562,10 +574,13 @@ def main():
             sig = "%s %s +%s" % (kind, mnem,
                                  ",".join(sorted(re.sub(r"\d+", "#", d)
                                                  for d in delta)))
-            groups[sig] += 1
+            (opaque_groups if i.opaque else groups)[sig] += 1
             examples.setdefault(sig, (pc, text, hexb))
         if notes:
-            disagree += 1
+            if i.opaque:
+                opaque_insns += 1
+            else:
+                disagree += 1
             if i.helpers:
                 helper_only[mnem] += 1
             if not args.summary:
@@ -581,13 +596,24 @@ def main():
         for sig, n in groups.most_common():
             pc, text, hexb = examples[sig]
             print("%-8d %-46s 0x%x %s [%s]" % (n, sig, pc, text[:30], hexb))
+        if opaque_groups:
+            print("\nOPAQUE -- the walk met a helper and declined; these are "
+                  "the derivation's reach, not the decoder's error:")
+            for sig, n in opaque_groups.most_common():
+                pc, text, hexb = examples[sig]
+                print("%-8d %-46s 0x%x %s [%s]"
+                      % (n, sig, pc, text[:30], hexb))
     if reenc_cost:
         print("\nthe re-encoding rule takes a flag write away from these, and "
               "the tracer still claims one:")
         for m, n in reenc_cost.most_common():
             print("    %-12s %d" % (m, n))
     print("\n%d agree, %d disagree, %d instructions, %d distinct signatures"
-          % (agree, disagree, agree + disagree, len(groups)))
+          % (agree, disagree, agree + disagree + opaque_insns, len(groups)))
+    print("%d instruction(s) the walk declined (opaque: a helper it cannot see "
+          "inside), carrying %d signature(s) -- reported apart from the "
+          "disagreement count on purpose"
+          % (opaque_insns, len(opaque_groups)))
     return 0
 
 

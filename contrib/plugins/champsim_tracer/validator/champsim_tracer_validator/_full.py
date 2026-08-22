@@ -2633,9 +2633,10 @@ def build_checks() -> list:
                    "asserted in both directions (4-ISA)",
                    ["behavior:decode_fixups"], _chk_decode_fixups))
     C.append(Check("features.decode_fields", "features",
-                   "dependency-model fields vs LLVM MC, falsifier-armed "
-                   "(mipsel + aarch64: static decode is their register-"
-                   "capture oracle)",
+                   "dependency-model fields vs LLVM MC, falsifier-armed, "
+                   "all four ISAs (mipsel and aarch64 have no other "
+                   "register-capture oracle; x86_64 and riscv64 gate it as "
+                   "a second opinion)",
                    ["behavior:decode_fields"], _chk_decode_fields))
     C.append(Check("features.lldet_watchdog", "features",
                    "the hang watchdog's own fire-proof: it kills a frozen "

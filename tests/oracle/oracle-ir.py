@@ -196,12 +196,32 @@ def load_generic_ids(isa_header):
     return out
 
 
-def to_generic(name, gmap):
+# QEMU's own segment ordering, target/i386/cpu.h R_ES..R_GS.  oracle-interpret
+# names a descriptor-cache field by its index -- segs[1] is "seg1" -- while the
+# tracer's vocabulary is the gdb register name, "cs".  Two names for one
+# register is not a disagreement about dataflow, so the index is spelled out
+# here rather than left to the catch-all below.
+SEG_ORDER = {
+    "x86_64": ("es", "cs", "ss", "ds", "fs", "gs"),
+}
+
+SEG_RE = re.compile(r"seg(\d+)$")
+
+
+def to_generic(name, gmap, isa=None):
     if name is None:
         return None
     if name in gmap:
         return gmap[name]
+    m = SEG_RE.match(name)
+    if m:
+        order = SEG_ORDER.get(isa, ())
+        idx = int(m.group(1))
+        if idx < len(order) and order[idx] in gmap:
+            return gmap[order[idx]]
     if name.startswith("seg"):
+        # A segment register the index above could not place.  It stays
+        # distinct from every named one so it can never match by accident.
         return "REG_SEG?"
     return name
 
@@ -547,8 +567,8 @@ def main():
         hexb, text = rows[pc]
         src, dst = isaxcheck_sets(args.isaxcheck, isa, hexb)
 
-        ir_r = {to_generic(n, gmap) for n in i.r}
-        ir_w = {to_generic(n, gmap) for n in i.w}
+        ir_r = {to_generic(n, gmap, isa) for n in i.r}
+        ir_w = {to_generic(n, gmap, isa) for n in i.w}
         # RIP is materialised lazily and is dropped from both sides of every
         # comparison isaxcheck makes, for the same reason: whether it appears
         # is a property of where the TB ended, not of the instruction.

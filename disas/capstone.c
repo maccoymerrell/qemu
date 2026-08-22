@@ -434,6 +434,7 @@ static bool cap_x86_is_mask_arith_dest_last(const char *mnem);
 static bool cap_x86_is_ktest(const char *mnem);
 static bool cap_x86_is_ssp_read(const char *mnem);
 static bool cap_x86_is_x87_tag_only(const char *mnem);
+static bool cap_x86_is_cmov(const char *mnem);
 static void cap_x86_add_implicit(qemu_plugin_insn_info *out, csh handle,
                                  unsigned int reg, bool is_write);
 
@@ -533,11 +534,23 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
      * VPERMIL2P* memory source also loses its load lane entirely. */
     bool dest_last = cap_x86_is_mask_arith_dest_last(insn->mnemonic);
     /* Capstone-6.0.0-Alpha7 bug: KTEST* reports access == 0 on both
-     * operands AND an empty implicit regs_write[] — unlike TEST, which
-     * carries EFLAGS there.  KTEST reads both mask registers and writes
-     * only EFLAGS, so force READ below and restore the implicit EFLAGS
-     * write here. */
+     * operands AND an empty implicit regs_write[].  KTEST reads both mask
+     * registers and writes only EFLAGS, so force READ below and restore
+     * the implicit EFLAGS write here.
+     *
+     * That comment used to add "unlike TEST, which carries EFLAGS there",
+     * and it was FALSE for half of TEST: `testb %dl, %al` carries the
+     * implicit EFLAGS write, `testb %dl, 0x1122(%rbx, %rsi)` does not.
+     * The memory-operand form is the one compilers emit constantly, and
+     * without the write the Jcc that reads those flags has no producer in
+     * the trace at all -- a broken dependency chain on one of the most
+     * common instruction pairs in x86.  XADD is the same shape and worse:
+     * it loses the EFLAGS write in BOTH forms, and `lock xadd` is how
+     * every atomic increment is written.  TEST and XADD always write the
+     * flags, so restoring it unconditionally is architecturally exact and
+     * a no-op wherever Capstone already reports it. */
     bool ktest_op = cap_x86_is_ktest(insn->mnemonic);
+    bool xadd_op = g_str_has_prefix(insn->mnemonic, "xadd");
     /* Capstone-6.0.0-Alpha7 bug: INCSSPD / INCSSPQ report their sole
      * register operand access == 0.  The register supplies the pop
      * count — a pure READ; the write target is SSP, which is not an
@@ -549,8 +562,21 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
      * access; drop the operand instead (the multi-byte-NOP treatment,
      * for a register). */
     bool tag_only = cap_x86_is_x87_tag_only(insn->mnemonic);
+    /* Capstone-6.0.0-Alpha7 bugs on the conditional moves, two of them.
+     * CMOVcc reports its destination WRITE-only: a conditional move
+     * whose condition is false leaves the destination holding the value
+     * it already had, so the old value is an input and the instruction
+     * is a three-input op (source, old destination, flags).  Reported as
+     * a pure write, the trace carries no RAW edge from whatever produced
+     * that value -- and cmov is not a corner of the ISA, it is what a
+     * compiler emits wherever it removes a branch.  FCMOVcc is worse:
+     * its two operand roles come back INVERTED, ST(0) read and ST(i)
+     * written, when the instruction moves ST(i) into ST(0).  See
+     * cap_x86_is_cmov. */
+    bool cmov = cap_x86_is_cmov(insn->mnemonic);
+    bool fcmov = cmov && insn->mnemonic[0] == 'f';
 
-    if (ktest_op) {
+    if (ktest_op || test_read || xadd_op) {
         cap_x86_add_implicit(out, handle, X86_REG_EFLAGS, true);
     }
 
@@ -622,6 +648,17 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
              * the mask written. */
             if (gather && i == 0) {
                 op->access |= QEMU_PLUGIN_OP_ACC_WRITE;
+            }
+            /* The conditional-move destination -- last in AT&T order --
+             * is read-modify-write, and its source is a pure read.
+             * Stated in full rather than ORed in, because FCMOVcc needs
+             * both halves: Capstone hands it the two roles the wrong way
+             * round, so ORing would leave ST(i) still marked written. */
+            if (cmov && i == n - 1) {
+                op->access = QEMU_PLUGIN_OP_ACC_READ
+                           | QEMU_PLUGIN_OP_ACC_WRITE;
+            } else if (fcmov && i == 0) {
+                op->access = QEMU_PLUGIN_OP_ACC_READ;
             }
             break;
         case X86_OP_IMM:
@@ -949,6 +986,36 @@ static bool cap_x86_is_lost_mem_store(const char *mnem)
  * `subprojects/capstone`, or run `capstone_workaround_probe`; see
  * docs/troubleshooting.rst.
  */
+/*
+ * CMOVcc / FCMOVcc: does this mnemonic move conditionally?
+ *
+ * Capstone marks the destination of every conditional move WRITE-only,
+ * which is only true when the condition holds.  When it does not the
+ * destination keeps its previous value -- architecturally the
+ * instruction is defined as "if (cc) dest <- src", so dest is live on
+ * entry either way, and every out-of-order model treats it as a third
+ * input.  Without the READ the trace claims a WAW where the hardware has
+ * a RAW, on an instruction compilers emit specifically to avoid a
+ * branch, so the shape it distorts is the one it appears in most.
+ *
+ * FCMOVcc carries a second, larger defect: `fcmovb %st(1), %st(0)` comes
+ * back RD{st0} WR{st1} -- the roles of the two operands exchanged, as if
+ * the Intel-order description had been applied to the AT&T-order operand
+ * array.  That does not merely lose an edge, it publishes a definition of
+ * a register the instruction never writes and drops the one it does, so
+ * the destination is forced read-write and the source read.
+ *
+ * A prefix test is exact here: the mnemonic space beginning `cmov` is
+ * the sixteen condition codes crossed with the operand-size suffix, and
+ * `fcmov` is the eight x87 forms.  Nothing else in x86 starts either
+ * way.  Owed upstream as a bug report, not yet sent.
+ */
+static bool cap_x86_is_cmov(const char *mnem)
+{
+    if (!mnem || !mnem[0]) return false;
+    return g_str_has_prefix(mnem, "cmov") || g_str_has_prefix(mnem, "fcmov");
+}
+
 static bool cap_x86_is_gather(const char *mnem)
 {
     if (!mnem || !mnem[0]) return false;

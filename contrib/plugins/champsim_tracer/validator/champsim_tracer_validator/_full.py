@@ -2003,16 +2003,21 @@ def _chk_decode_fields(ctx: Ctx) -> Outcome:
          execution-derived register capture lands and starts closing the
          inherited Capstone gaps that file names as open defects.
 
-    GATING, mipsel + aarch64 + riscv64.  x86_64 and riscv64 close the same
-    loop through PIN and Spike (owner ruling 2026-08-09), so here the layer
-    is a second opinion rather than the only one -- but riscv64's residual
-    is now triaged (#169: 348 rows, six classes, every one a case where
-    LLVM MC cannot express what the fields side records -- CSRs modelled as
-    immediates, whole-register vector groups named by their first member,
-    and RISC-V HINT encodings reported as if they were operations), so it
-    is gated.  x86_64 is NOT: its sweep had not completed when this was
-    written, and the one attempt that "passed" was a 900 s timeout whose
-    zero rows are not a clean sweep.
+    GATING, ALL FOUR ISAs as of #169.  mipsel and aarch64 are the ISAs
+    whose only independent register-capture ground truth is static decode;
+    x86_64 and riscv64 close the same loop through PIN and Spike (owner
+    ruling 2026-08-09), so there the layer is a second opinion rather than
+    the only one -- but a gated second opinion is worth more than an
+    ungated one, and both residuals are now triaged into named families in
+    tools/isaxcheck_fields_allow.txt (riscv64 348 rows / six classes,
+    x86_64 1,339 rows / seven families).
+
+    ONE NUMBER IN THE SUMMARY LINE IS NOT A PASS: `size_gap=`.  Those are
+    encodings where the two decoders consumed different byte counts, so
+    they decoded different instructions and the register / memory / branch
+    comparison never ran on them -- 6.4 M of them on x86_64.  The gate
+    reports the count rather than hiding the exclusion; the length
+    disagreement itself is gated by features.isa_crosscheck's D class.
     """
     tool = ctx.build_dir / "contrib/plugins/isaxcheck"
     allow = (Path(__file__).resolve().parents[2]
@@ -2028,12 +2033,20 @@ def _chk_decode_fields(ctx: Ctx) -> Outcome:
 
     # One known-good encoding per ISA, chosen to compare clean when
     # healthy (asserted below) so the falsified runs are a strict A/B.
+    #
+    # Every probe names DISTINCT source and destination registers on
+    # purpose: --falsify=add-dst plants the first source into the
+    # destination set, so a probe like `add x1, x1, x1` would plant a
+    # register that is already there, the signature would not change, and
+    # the falsifier would silently fail to fire -- which is exactly the
+    # shape of instrument this check exists to refuse.
     probes = {"mipsel": ("2120a600", "addu"),     # addu $a0, $a1, $a2
               "aarch64": ("4100038b", "add"),     # add x1, x2, x3
-              "riscv64": ("b3003100", "add")}    # add x1, x2, x3
+              "riscv64": ("b3003100", "add"),     # add x1, x2, x3
+              "x86_64": ("4889d1", "movq")}       # movq %rdx, %rcx
     subs: list = []
     all_ok = True
-    for isa in ("mipsel", "aarch64", "riscv64"):
+    for isa in ("mipsel", "aarch64", "riscv64", "x86_64"):
         hexenc, mnem = probes[isa]
         base = [str(tool), f"--isa={isa}", "--layer=fields", "--classes=MBR"]
         ok = True
@@ -2063,9 +2076,16 @@ def _chk_decode_fields(ctx: Ctx) -> Outcome:
                     + (p.stdout or p.stderr).strip()[:200])
 
         if ok:
-            p = subprocess.run(base + ["--jobs=8", f"--allow={allow}",
-                                       "--check"],
-                               text=True, capture_output=True, timeout=1800)
+            # x86_64 sweeps 1.25 G encodings against the other ISAs' 17 M
+            # to 164 M; it gets more shards and more wall clock.  A sweep
+            # killed by its timeout exits 124 with no rows, which reads
+            # exactly like a clean run to anything that only counts NEW
+            # lines -- that has already happened once, so the budget is
+            # sized to the work rather than shared.
+            p = subprocess.run(base + [f"--jobs={16 if isa == 'x86_64' else 8}",
+                                       f"--allow={allow}", "--check"],
+                               text=True, capture_output=True,
+                               timeout=3600 if isa == "x86_64" else 1800)
             head = (p.stdout or "").splitlines()
             summary = head[0] if head else (p.stderr or "").strip()[:200]
             if p.returncode != 0:
@@ -2081,9 +2101,10 @@ def _chk_decode_fields(ctx: Ctx) -> Outcome:
         all_ok = all_ok and ok
         subs.append({"name": isa, "ok": ok, "detail": "\n".join(details)})
     return Outcome("pass" if all_ok else "fail",
-                   "dependency-model fields vs LLVM MC, falsifier-armed "
-                   "(mipsel + aarch64, the ISAs whose register-capture "
-                   "oracle is static decode)", subs)
+                   "dependency-model fields vs LLVM MC, falsifier-armed, "
+                   "all four ISAs (1.58 G encodings; read size_gap= in each "
+                   "summary line for what the comparison declined to score)",
+                   subs)
 
 
 def _chk_lldet_watchdog(ctx: Ctx) -> Outcome:

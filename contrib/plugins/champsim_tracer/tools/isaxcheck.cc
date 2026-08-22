@@ -558,6 +558,18 @@ static std::string norm_x86(std::string r) {
     if (r.size() > 3 && r.compare(0, 3, "xmm") == 0) return "v" + r.substr(3);
     if (r.size() > 3 && r.compare(0, 3, "ymm") == 0) return "v" + r.substr(3);
     if (r.size() > 3 && r.compare(0, 3, "zmm") == 0) return "v" + r.substr(3);
+    /*
+     * x87 stack slots.  Capstone spells them `st(1)`, LLVM spells them
+     * `st1`, and ST(0) is `st` on LLVM's side with no index at all.  One
+     * spelling, chosen here, so the two land on the same token: without
+     * it every x87 operand is an `FN-unmapped-llvm-reg <mnem> st1` that
+     * says only "the decoders punctuate differently", and -- the part
+     * that matters -- the Capstone side could LOSE the operand without
+     * changing that signature.
+     */
+    if (r.size() > 3 && r.compare(0, 3, "st(") == 0 && r.back() == ')')
+        return "st" + r.substr(3, r.size() - 4);
+    if (r == "st") return "st0";
     // DF is a BIT of RFLAGS, and LLVM models it as a register in its own
     // right so that the string instructions can name the one flag they
     // read without claiming to read the arithmetic flags too.  Capstone
@@ -612,6 +624,17 @@ static bool is_dropped_reg(const std::string &c)
 {
     if (c == "pc" || c == "rip" || c == "eip" || c == "ip") return true;
     if (isa == ISA_X86_64 && (c == "mxcsr" || c == "ssp")) return true;
+    /*
+     * RIZ / EIZ are not registers.  They are LLVM's pseudo-operands for a
+     * SIB byte whose index field encodes NO INDEX, printed so that
+     * `(%rdi,%riz)` and `(%rdi)` stay distinguishable in AT&T syntax.
+     * Capstone omits them, the architecture has no such register, and the
+     * dependency model records no edge for one -- so every occurrence is
+     * a token one decoder invented, and there are 1057 signatures of them
+     * on an x86_64 fields sweep.  Dropped on both sides for the same
+     * reason the zero register is: it carries no dataflow.
+     */
+    if (isa == ISA_X86_64 && (c == "riz" || c == "eiz")) return true;
     if (!drop_zero) return false;
     switch (isa) {
     case ISA_AARCH64: return c == "zr";
@@ -1206,6 +1229,30 @@ static std::string falsify_mode, falsify_mnem;
  * shows up in every signature key rather than silently. */
 enum { BR_NONE = 0, BR_RETURN = 3, BR_DIRECT_CALL = 7, BR_INDIRECT_CALL = 8 };
 
+/*
+ * ENCODINGS THE TWO DECODERS DID NOT READ AS THE SAME INSTRUCTION.
+ *
+ * Both sides accepting the byte string is not the same as both sides
+ * decoding the same instruction: where they consume a DIFFERENT NUMBER OF
+ * BYTES they have each described something the other never looked at.  x86
+ * is full of it -- LLVM MC stops at a lone `f3` and calls it `xrelease`
+ * where Capstone folds the prefix into the `xchg` behind it, and the same
+ * happens for `bnd`/`repne` and for `64 65` segment pairs -- and every one
+ * of those pairs would otherwise be scored by the register, memory and
+ * branch classes as a disagreement about semantics.  It is not one: it is
+ * the arithmetic of comparing a five-byte instruction against a one-byte
+ * prefix, and an allowlist row "justifying" it would be justifying a
+ * difference only the length gap created.
+ *
+ * So the comparison stops here and the encoding is COUNTED, never silently
+ * dropped: `size_gap=` in the summary line is the gate's own measure of
+ * how much of the sweep its oracle declined to read the same way, and
+ * ISAX_DUMP_SIZEGAP names the mnemonics.  The disagreement itself is not
+ * lost -- class D reports it as `D-size-mismatch <mnem>`, which is where it
+ * is gated (the boundary allowlist carries 359 triaged x86_64 rows of it).
+ */
+static std::map<std::string, unsigned long> size_gap_by_mnem;
+
 static void compare(const uint8_t *b, size_t n)
 {
     CsView c; LlView l;
@@ -1308,6 +1355,9 @@ static void compare(const uint8_t *b, size_t n)
     }
 
     if (!c.ok || !l.ok) return;
+
+    /* Not the same instruction on the two sides -- see size_gap_by_mnem. */
+    if (c.size != l.size) { size_gap_by_mnem[m]++; return; }
 
     /*
      * FIELDS LAYER.  Swap the Capstone side over to what the dependency
@@ -2282,6 +2332,8 @@ int main(int argc, char **argv)
     if (emit_raw) {
         run_sweep(shard, nshard);
         printf("#tried\t%lu\n", total_tried);
+        for (auto &kv : size_gap_by_mnem)
+            printf("#sizegap\t%lu\t%s\n", kv.second, kv.first.c_str());
         for (auto &kv : buckets)
             printf("%s\t%lu\t%s\n", kv.first.c_str(), kv.second.n,
                    kv.second.sample.c_str());
@@ -2313,6 +2365,9 @@ int main(int argc, char **argv)
                 close(pfd[1]);
                 run_sweep(j, jobs);
                 printf("#tried\t%lu\n", total_tried);
+                for (auto &kv : size_gap_by_mnem)
+                    printf("#sizegap\t%lu\t%s\n", kv.second,
+                           kv.first.c_str());
                 for (auto &kv : buckets)
                     printf("%s\t%lu\t%s\n", kv.first.c_str(), kv.second.n,
                            kv.second.sample.c_str());
@@ -2324,6 +2379,7 @@ int main(int argc, char **argv)
             pids.push_back(pid);
         }
         buckets.clear();
+        size_gap_by_mnem.clear();
         for (size_t j = 0; j < fds.size(); j++) {
             FILE *f = fdopen(fds[j], "r");
             if (!f) { perror("fdopen"); return 2; }
@@ -2349,6 +2405,7 @@ int main(int argc, char **argv)
                                        ? std::string()
                                        : line.substr(t2 + 1);
                 if (key == "#tried") { total_tried += cnt; continue; }
+                if (key == "#sizegap") { size_gap_by_mnem[samp] += cnt; continue; }
                 auto &b = buckets[key];
                 if (!b.n) b.sample = samp;
                 b.n += cnt;
@@ -2398,13 +2455,24 @@ int main(int argc, char **argv)
                cfg.name, total_tried, buckets.size(),
                buckets.size() - unallowed, unallowed, dead.size());
     else
-        printf("# isa=%s layer=%s encodings_tried=%lu distinct_signatures=%zu "
-               "allowlisted=%zu unallowed=%lu subtarget_gap=%lu/%lu "
+    {
+        unsigned long size_gap_encodings = 0;
+        for (const auto &kv : size_gap_by_mnem) size_gap_encodings += kv.second;
+        printf("# isa=%s layer=%s encodings_tried=%lu "
+               "distinct_signatures=%zu allowlisted=%zu unallowed=%lu "
+               "subtarget_gap=%lu/%lu size_gap=%zu/%lu "
                "dead_allow_rules=%zu ambiguous_reg_tokens=%u\n",
                cfg.name, layer == LAYER_FIELDS ? "fields" : "boundary",
                total_tried, buckets.size(),
-               buckets.size() - unallowed, unallowed, gap_sigs, gap_encodings,
+               buckets.size() - unallowed, unallowed,
+               gap_sigs, gap_encodings,
+               size_gap_by_mnem.size(), size_gap_encodings,
                dead.size(), regmap_ambiguous_tokens);
+        if (getenv("ISAX_DUMP_SIZEGAP"))
+            for (const auto &kv : size_gap_by_mnem)
+                fprintf(stderr, "SIZEGAP %-8lu %s\n", kv.second,
+                        kv.first.c_str());
+    }
     if (!opt_taken.empty() || !opt_skipped.empty()) {
         printf("# llvm=%s optional_features_taken=%s skipped=%s\n",
                LLVM_VERSION_STRING, join(opt_taken).c_str(),

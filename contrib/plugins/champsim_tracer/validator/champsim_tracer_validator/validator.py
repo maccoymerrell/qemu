@@ -3134,6 +3134,29 @@ def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
             exp_src -= written
             exp_dst |= written
 
+    elif isa == "x86_64":
+        # CMOVcc keeps the destination's previous value when the condition
+        # is false, so the destination is an input as well as an output;
+        # Capstone marks it write-only and the trace would carry no RAW
+        # edge from whatever produced that value.  Mirrors cap_x86_is_cmov
+        # (disas/capstone.c), and asserted POSITIVELY rather than skipped:
+        # if the boundary correction were dropped, `actual_src` would lose
+        # the register and this row would go red.  (FCMOVcc, whose two
+        # operand roles Capstone exchanges, cannot be asserted here -- the
+        # `st(` skip above takes every x87 row.)
+        if mnem.startswith("cmov"):
+            exp_src |= exp_dst
+        # TEST loses its implicit EFLAGS write whenever an operand is
+        # memory, and XADD loses it in every form.  The boundary restores
+        # it unconditionally; both instructions always write the flags, so
+        # the expectation is unconditional too.
+        if mnem.startswith(("test", "xadd")):
+            try:
+                import capstone as _cs
+                add(exp_dst, _cs.x86.X86_REG_EFLAGS)
+            except Exception:
+                pass
+
 
 def _check_call_return_store(
     templates: list[dict],

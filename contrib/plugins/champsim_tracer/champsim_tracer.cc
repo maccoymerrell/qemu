@@ -43,6 +43,7 @@
 #include "champsim_tracer_simpoint_manager.h"
 #include "champsim_tracer_stats.h"
 #include "champsim_tracer_stats_report.h"
+#include "champsim_tracer_irdf.h"
 #include "champsim_tracer_trace_segment_manager.h"
 #include "champsim_tracer_wp_thread_state.h"
 #include "champsim_tracer_writer.h"
@@ -10668,6 +10669,20 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         return;
     }
 
+    /*
+     * irdf=1: score QEMU's own dataflow for this TB against the decode
+     * above, here and nowhere else -- the accessors are keyed on (tb, idx)
+     * and this is the last point at which that pair still names anything.
+     * The raw index is what QEMU knows; canonical_index carries it to the
+     * tracer's own slot for the same instruction.  Off by default, reads
+     * only, and it cannot reach the wire.
+     */
+    for (uint32_t i = 0; i < raw_n_insns; i++) {
+        if (canonical_first[i]) {
+            irdf_note_insn(tb, i, &insn_info[canonical_index[i]]);
+        }
+    }
+
     /* Partition the TB's canonical insn stream at every non-final
      * branch terminator.  TCG and Capstone don't always agree on
      * which insns end control flow (e.g. MIPS conditional traps:
@@ -11342,6 +11357,7 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
         fflush(stderr);
     }
     g_rt_gate.report(report);
+    irdf_report(report);
 
     g_mutex_lock(&data_lock);
     append_stats_summary(report, "Cumulative", final_stats);
@@ -11508,6 +11524,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
      * cfg (ownership moved); the rest are freed by
      * plugin_config_free below. */
     max_wrong_path_depth = cfg.wp_depth;
+    irdf_enable(cfg.irdf);
     g_wp_prune           = cfg.wp_prune;
     enable_wrong_path    = cfg.enable_wp;
     /*

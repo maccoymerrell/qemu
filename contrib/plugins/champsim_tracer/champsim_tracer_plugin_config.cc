@@ -24,6 +24,13 @@ bool set_wpprune(PluginConfig *cfg, const char *v)
     return cfg->wp_prune >= 0 && cfg->wp_prune <= 2;
 }
 
+bool set_irdf(PluginConfig *cfg, const char *v)
+{
+    int n = atoi(v);
+    cfg->irdf = (n != 0);
+    return n == 0 || n == 1;
+}
+
 bool set_outfile(PluginConfig *cfg, const char *v)
 {
     g_free(cfg->output_path);
@@ -425,6 +432,7 @@ const struct {
 } options[] = {
     { "wpdepth",    set_wpdepth    },
     { "wpprune",    set_wpprune    },
+    { "irdf",       set_irdf       },
     { "outfile",    set_outfile    },
     { "compress",   set_compress   },
     { "wp",         set_wp         },

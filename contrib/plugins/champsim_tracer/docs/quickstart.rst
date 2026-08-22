@@ -636,6 +636,35 @@ rather than spawning further wrong-path chains.
    a branch that is cold early and warms up later starts getting WP
    walks once it warms.
 
+``irdf=<0|1>``
+   Score QEMU's own per-instruction dataflow against the tracer's
+   Capstone-derived register sets, and write the verdict to the stats
+   log.  Default ``0``.
+
+   This is a diagnostic, not a capture setting.  It reads QEMU's
+   translation through the ``qemu_plugin_insn_reg_*`` accessors at
+   translation time and compares, per instruction, the two answers to
+   "what does this read and write".  A trace captured with ``irdf=1``
+   is identical to one captured without it.
+
+   What it reports matters as much as the agreement count, because
+   most of what the accessors can say on some targets is *nothing*:
+
+   * **helper** — the instruction's work happens inside a call the
+     extraction cannot see into (x86 division, the SSE and x87
+     helpers).
+   * **field** — it touched CPU state the register namespace omits.
+     The namespace is QEMU's TCG globals; on x86_64 that is 35
+     entries, and it contains no vector register, no x87 stack, no
+     MXCSR and no segment selector.  Those are reached by offset into
+     ``CPUArchState`` instead, which this diagnostic records but
+     cannot yet name.
+   * **incomplete** — the extraction ran out of room.
+
+   None of the three is counted as a disagreement.  A refusal to
+   answer and a wrong answer are different things, and summing them
+   overstates the disagreement badly enough to hide the real one.
+
 Capture flags
 ~~~~~~~~~~~~~
 

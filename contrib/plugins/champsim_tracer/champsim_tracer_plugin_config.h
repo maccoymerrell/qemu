@@ -80,6 +80,11 @@ struct PluginConfig {
      * monomorphic — no alternative target to mispredict toward); 2 = also
      * drop WP unless the branch has been seen BOTH taken and not-taken. */
     int       wp_prune          = 0;
+    /* irdf=1: cross-check QEMU's own per-instruction dataflow against the
+     * tracer's Capstone-derived register sets, at translation, and write
+     * the verdict to the sidecar log.  Reads only -- a trace captured with
+     * it on is byte-identical to one captured with it off. */
+    bool      irdf              = false;
     bool      enable_wp         = true;
     bool      enable_mem_data   = false;
     bool      enable_reg_data   = false;

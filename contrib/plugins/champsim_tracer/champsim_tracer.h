@@ -1300,7 +1300,7 @@ typedef struct {
      * content check; this slot only lets the JIT-inlined coarse
      * fast-forward compensation brcond on the same verdict without a
      * call.  Never an identity: no root or ASID value is stored here. */
-    uint64_t asid_match;
+    uint64_t content_gate;
     /* Context gate for the heavy per-TB capture callback (vcpu_tb_exec):
      * a bare is_active mirror, deliberately.  The heavy step must keep
      * dispatching for FOREIGN contexts too, because the any-context
@@ -1311,12 +1311,6 @@ typedef struct {
      * each committed address-space write, at window opens/releases and
      * at vCPU init. */
     uint64_t trace_this_ctx;
-    /* RETIRED gate of the narrow-ASID re-acquisition probe: content
-     * gating removed its consumer, and no callback registers on this
-     * slot any more — it is allocated and zeroed only.  Deleting the
-     * field is owed as a follow-up (kept through the reduction landing
-     * to leave the validated scoreboard layout untouched). */
-    uint64_t pin_probe;
     /* "A path-event drain is owed on this vCPU".  Written by QEMU, not by
      * the plugin: 1 on every cpu_plugin_evq_push, 0 on every
      * qemu_plugin_drain_cpu_events (see qemu_plugin_cpu_events_pending_slot).

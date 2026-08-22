@@ -1002,16 +1002,17 @@ static inline uint64_t user_seen_advance(unsigned int cpu_index,
  * FF_COARSE_MARGIN short of the simpoint's effective start;
  * vcpu_tb_check_budget hands the final stretch to the exact path.
  *
- * Exactness: a JIT inline op cannot test the live ASID, so the raw
- * decrement counts every process's user instructions.  The correction
- * rides the scoreboard asid_match flag — maintained by the synchronous
- * ASID-write hook at the architectural commit points, so it is exact at
+ * Exactness: a JIT inline op cannot test whether the live context is a
+ * traced one, so the raw decrement counts every process's user
+ * instructions.  The correction rides the scoreboard content_gate flag —
+ * the JIT-testable mirror of the per-vCPU content-gate bit, maintained
+ * event-driven at every committed address-space change, so it is exact at
  * every user TB with zero per-TB maintenance — via a compensating
  * cond_cb registered between the decrement and the crossing detector:
- * when asid_match == 0 (a foreign process's user TB), a trivial
- * callback adds the decrement back and tallies the foreign count.  The
- * countdown therefore counts exactly the PINNED process's user
- * instructions; concurrent user workloads (e.g. a duplicate of the
+ * when content_gate == 0 (a user TB in a context that does not map a
+ * latched marker window's bytes), a trivial callback adds the decrement
+ * back and tallies the foreign count.  The countdown therefore counts
+ * exactly the TRACED process's user instructions; concurrent user workloads (e.g. a duplicate of the
  * traced program) cost only the tiny add-back call on their own TBs,
  * never positioning error.  The pinned process's TBs pay one untaken
  * JIT compare.
@@ -1029,8 +1030,8 @@ static uint64_t g_ff_foreign_insns = 0;   /* compensated foreign user insns */
 static constexpr uint64_t FF_COARSE_MARGIN = 200000000;   /* 200M-insn exact tail */
 
 /* Compensation callback for the coarse countdown: fires (via cond_cb
- * on asid_match == 0) only on user TBs executed by a process other
- * than the pinned one; adds the TB's unconditional decrement back so
+ * on content_gate == 0) only on user TBs executed in a context that does
+ * not map the marker bytes; adds the TB's unconditional decrement back so
  * the countdown nets to pinned-process user instructions only.  udata
  * carries the TB's raw insn count.  Post-handoff stale firings (before
  * the handoff flush lands) add to the sentinel-parked budget —
@@ -1054,7 +1055,7 @@ static void vcpu_tb_ff_foreign(unsigned int cpu_index, void *udata)
  * translation pass under -icount — the canonical translation bbv counted
  * makes no such entry), add its unconditional decrement back.  Ownership:
  * a re-entry chain is synchronous within one process, so the live
- * asid_match stands in for the previous execution's; a foreign process's
+ * content_gate stands in for the previous execution's; a foreign process's
  * REP (same shared-code TB) is skipped here because vcpu_tb_ff_foreign
  * already added its whole decrement back.  udata = the REP's PC, keying
  * the facts to this instruction.  Off the fast-forward hot path by
@@ -1063,7 +1064,7 @@ static void vcpu_tb_ff_rep(unsigned int cpu_index, void *udata)
 {
     if (qemu_plugin_rep_pc() == (uint64_t)(uintptr_t)udata &&
         qemu_plugin_rep_reenter() && !qemu_plugin_rep_chunk_boundary() &&
-        qemu_plugin_u64_get(g_scoreboard.asid_match, cpu_index) != 0) {
+        qemu_plugin_u64_get(g_scoreboard.content_gate, cpu_index) != 0) {
         qemu_plugin_u64_add(g_scoreboard.budget, cpu_index, 1);
         g_stats.rep_ff_ticks_withheld++;
     }
@@ -1941,7 +1942,7 @@ static bool marker_gate_eval(uint64_t *ord_out, bool *unreadable_out)
  * termination bounds (stall_ceiling_any, the idle-backstop beat) ride it —
  * a guest whose traced process is dead executes nothing BUT foreign TBs.
  * Foreign-ness itself is the CONTENT-GATE BIT (marker_gate_get), computed
- * event-driven and tested as one relaxed load in the step; asid_match
+ * event-driven and tested as one relaxed load in the step; content_gate
  * mirrors the bit for the JIT-inlined coarse fast-forward compensation.
  */
 static inline void refresh_ctx_gates(unsigned int cpu_index)
@@ -1949,8 +1950,7 @@ static inline void refresh_ctx_gates(unsigned int cpu_index)
     bool active = qemu_plugin_u64_get(g_scoreboard.is_active, cpu_index) != 0;
     qemu_plugin_u64_set(g_scoreboard.trace_this_ctx, cpu_index,
                         active ? 1 : 0);
-    qemu_plugin_u64_set(g_scoreboard.pin_probe, cpu_index, 0);
-    qemu_plugin_u64_set(g_scoreboard.asid_match, cpu_index,
+    qemu_plugin_u64_set(g_scoreboard.content_gate, cpu_index,
                         marker_gate_get(cpu_index) ? 1 : 0);
 }
 
@@ -9200,8 +9200,8 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
  *   W1 a foreign / unconfirmed context (narrow-ASID pins, since retired:
  *      trace_this_ctx diverged from is_active only there, so this is
  *      where it was caught);
- *   W2 inter-segment (is_active == 0 zeroes trace_this_ctx AND pin_probe on
- *      every ISA, so neither existing callback dispatches);
+ *   W2 inter-segment (is_active == 0 zeroes trace_this_ctx on every ISA,
+ *      so the heavy callback did not dispatch);
  *   W3 after the marker window closes -- W2's code path, mirrored to every
  *      vCPU;
  *   W4 pre-first-segment once the queue has been enabled, between simpoint
@@ -10175,12 +10175,12 @@ static void marker_translate_start(unsigned int cpu_index, uint64_t seq_vaddr,
              * is_active stays 0 — nothing dispatches per TB; the gated
              * budget countdown fires the handoff FF_COARSE_MARGIN short
              * of the target.  The marker translates in the gated context,
-             * so asid_match seeds to 1 here; the ASID-write hook
-             * maintains it from now on.  Flush so TBs translated before
+             * so content_gate seeds to 1 here; the event-driven gate
+             * refresh maintains it from now on.  Flush so TBs translated before
              * the latch are retired before the countdown accumulates. */
             g_ff_coarse_target = eff_start - FF_COARSE_MARGIN;
             g_ff_foreign_insns = 0;
-            qemu_plugin_u64_set(g_scoreboard.asid_match, cpu_index, 1);
+            qemu_plugin_u64_set(g_scoreboard.content_gate, cpu_index, 1);
             g_ff_coarse.store(true, std::memory_order_relaxed);
             qemu_plugin_u64_set(g_scoreboard.budget, cpu_index,
                                 g_ff_coarse_target);
@@ -10959,11 +10959,11 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
          * unconditional decrement above and the crossing detector
          * below (per-TB callbacks execute in registration order), so a
          * foreign-process user TB nets to zero before the crossing is
-         * evaluated.  asid_match == 0 exactly when the live address
-         * space is not the pinned one. */
+         * evaluated.  content_gate == 0 exactly when the live context
+         * does not map a latched marker window's bytes. */
         qemu_plugin_register_vcpu_tb_exec_cond_cb(
             tb, vcpu_tb_ff_foreign, QEMU_PLUGIN_CB_NO_REGS,
-            QEMU_PLUGIN_COND_EQ, g_scoreboard.asid_match, 0,
+            QEMU_PLUGIN_COND_EQ, g_scoreboard.content_gate, 0,
             (void *)(uintptr_t)raw_n_insns);
         /* REP window-clock compensation (see vcpu_tb_ff_rep): only on TBs
          * that BEGIN with a fan-out instruction — the TB every re-entering

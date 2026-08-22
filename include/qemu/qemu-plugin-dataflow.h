@@ -1,9 +1,18 @@
 /*
  * Plugin ABI for per-instruction dataflow derived from QEMU's own translation.
  *
- * PROPOSED - not yet wired into plugins/api.c.  The layout rules below are the
- * point of the file and are worth agreeing before anything is built against
- * them.
+ * IMPLEMENTED in plugins/api.c and exported by visibility; the layout rules
+ * below are the point of the file and were agreed before anything was built
+ * against them.  (This header said "PROPOSED - not yet wired into
+ * plugins/api.c" long after api.c grew qemu_plugin_dataflow_nregs() and the
+ * PLUGIN_DF_SET accessors, which is the kind of stale claim that sends a
+ * reader looking for work already done.)
+ *
+ * WHAT IS STILL NOT DONE, so the distinction stays visible: no plugin CALLS
+ * any of this yet.  champsim_tracer still takes its register and memory
+ * dataflow from Capstone; wiring it to these accessors -- and measuring the
+ * two against each other on the same encodings -- is the remaining work of
+ * the behavioural-oracle arc.
  *
  * Why the API looks defensive
  * ---------------------------

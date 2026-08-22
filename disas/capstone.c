@@ -2156,7 +2156,11 @@ static bool cap_aarch64_is_buggy_shift_imm_alias(const char *mnem)
  * per-instruction mem_acc fallback table, but in Alpha7 that table is
  * CS_AC_INVALID for the same rows, so the MEM operand reaches us with
  * access == 0.  The immediate-offset, pre/post-index, exclusive,
- * CAS/LD<op> atomic, and vector structure forms all report correctly.
+ * CAS/LD<op> atomic, and vector structure forms report a non-zero
+ * access.  Non-zero is not the same as correct: the EXCLUSIVE forms
+ * report a superset -- see cap_aarch64_exclusive_mem_access below,
+ * which corrects them.  This inference is only about the rows that
+ * report NOTHING.
  * Without correction the operand walker mints no static load/store
  * slot at all for the affected instructions — the trace template
  * claims a plain load/store/atomic cannot touch memory, dropping its
@@ -2208,6 +2212,78 @@ static unsigned cap_aarch64_infer_mem_access(const char *mnem)
     }
     if (g_str_has_prefix(mnem, "st")) {
         return QEMU_PLUGIN_OP_ACC_WRITE;
+    }
+    return 0;
+}
+
+/*
+ * Capstone-6.0.0-Alpha7 reports READ|WRITE on the MEM operand of the
+ * load-exclusive AND store-exclusive forms alike.  Both are supersets of
+ * what the instruction does: a load-exclusive reads memory and marks the
+ * exclusive monitor, and marking the monitor is not a memory write; a
+ * store-exclusive conditionally writes and returns its status in a
+ * register, and reads nothing.
+ *
+ * Measured with the wrap's own cstool (build/subprojects/capstone), MEM
+ * operand access:
+ *
+ *   ldaxr x0,[x1]    c85ffc20   READ|WRITE   should be READ
+ *   ldxr  x0,[x1]    c85f7c20   READ|WRITE   should be READ
+ *   ldaxp x0,xzr,[x1] c87ffc20  READ|WRITE   should be READ
+ *   ldar  x0,[x1]    c8dffc20   READ         correct -- the control that
+ *                                            shows this is specific to the
+ *                                            exclusives, not to acquire /
+ *                                            release forms in general
+ *   ldadd x0,x0,[x1] f8200020   READ|WRITE   correct, genuinely both
+ *
+ * It matters because the operand walker mints one slot per access bit off
+ * the SAME MEM operand, so a load-exclusive template declares a STORE slot
+ * the instruction never fills -- a dependency edge the guest never has,
+ * handed to whatever models the trace.  Measured on a probe before this
+ * correction: the ldaxr entry declared `st[%gp1]` with no address and every
+ * execution delivered only `ld=`, never `st=`.
+ *
+ * ONLY THE LOAD SIDE IS CORRECTED, and that is a measurement, not a
+ * conservatism.  Capstone reports READ|WRITE on the STORE-exclusives too,
+ * and architecturally that is also a superset -- a store-exclusive writes
+ * and returns status, it does not read.  But QEMU implements STXR/STLXR
+ * with a cmpxchg helper that performs a REAL load, and the plugin's memop
+ * callback sees it: the stlxr entry declares `ld[%gp1](0x410160)` WITH an
+ * address and every execution delivers a matching `ld=`.  Declaring
+ * WRITE-only there would leave that delivered access with no slot to land
+ * in -- trading a phantom slot for an orphaned memop, which is worse.  The
+ * trace records what executed.
+ *
+ * That leaves a real question this correction does not answer: QEMU's
+ * store-exclusive reads memory where hardware does not, so a consumer sees
+ * a read-modify-write for an instruction that architecturally only writes.
+ * That is an emulation artefact, not a decoding one, and it needs its own
+ * decision rather than being papered over here.
+ *
+ * The LSE read-modify-write families (swp / cas / ld<op> / st<op>) really
+ * do both and must not be touched, which is why this matches the exclusive
+ * mnemonics exactly rather than reasoning from "ld" / "st".
+ *
+ * Unlike cap_aarch64_infer_mem_access, this corrects a WRONG non-zero
+ * access, so it cannot be folded into that helper's access == 0 guard.
+ * Returns 0 when the mnemonic is not a load-exclusive, leaving Capstone's
+ * answer alone.  Revisit on a Capstone bump: if a future release reports
+ * READ here, this becomes dead code and should go.
+ */
+static unsigned cap_aarch64_exclusive_mem_access(const char *mnem)
+{
+    /* Load-exclusive: ldxr/ldaxr/ldxp/ldaxp and their b/h widths. */
+    static const char *const load_ex[] = {
+        "ldxr", "ldaxr", "ldxp", "ldaxp",
+    };
+
+    if (!mnem || !mnem[0]) {
+        return 0;
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(load_ex); i++) {
+        if (g_str_has_prefix(mnem, load_ex[i])) {
+            return QEMU_PLUGIN_OP_ACC_READ;
+        }
     }
     return 0;
 }
@@ -2300,6 +2376,15 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
              * (see cap_aarch64_infer_mem_access). */
             if (cop->access == 0) {
                 op->access = cap_aarch64_infer_mem_access(insn->mnemonic);
+            } else {
+                /* Capstone reported something, but for the exclusive
+                 * forms what it reported is a superset (see
+                 * cap_aarch64_exclusive_mem_access). */
+                unsigned ex =
+                    cap_aarch64_exclusive_mem_access(insn->mnemonic);
+                if (ex != 0) {
+                    op->access = ex;
+                }
             }
             break;
         case ARM64_OP_PRED:

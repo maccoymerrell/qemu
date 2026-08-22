@@ -50,6 +50,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -64,15 +65,51 @@ DATAFLOW_MODES = ("access", "drop", "addreg", "implicit", "memdir", "all")
 FACT = re.compile(r"^[DACYV] ")
 
 
-def build_probe(workdir, name="probe_x86_64"):
+# Cross prefixes, same map check-oracle.py uses.  x86_64 is native.
+CROSS = {
+    "x86_64": "",
+    "riscv64": "riscv64-linux-gnu-",
+    "mipsel": "mipsel-linux-gnu-",
+    "aarch64": "aarch64-linux-gnu-",
+}
+
+# Per-ISA assembler flags, same values check-oracle.py uses.  The riscv64
+# probe contains vsetvli, which needs the V extension enabled explicitly.
+PROBE_CFLAGS = {
+    "x86_64": [],
+    "riscv64": ["-march=rv64gcv"],
+    "mipsel": ["-mfp32", "-modd-spreg"],
+    "aarch64": [],
+}
+
+
+def build_probe(workdir, isa):
+    """Assemble the probe FOR THIS ISA.
+
+    This used to default to probe_x86_64 and ignore --isa entirely, so
+    `--isa aarch64` ran qemu-aarch64 on an x86_64 ELF and died at exit 255.
+    The flag existed, the check could only ever run on one target, and the
+    other three had never been exercised.
+    """
+    if isa not in CROSS:
+        raise SystemExit("unknown isa %s (have %s)"
+                         % (isa, ", ".join(sorted(CROSS))))
+    name = "probe_" + isa
+    src = os.path.join(HERE, name + ".S")
+    if not os.path.exists(src):
+        raise SystemExit("no probe source %s" % src)
+    prefix = CROSS[isa]
+    if prefix and shutil.which(prefix + "gcc") is None:
+        raise SystemExit("no %sgcc -- install the cross toolchain for %s"
+                         % (prefix, isa))
     elf = os.path.join(workdir, name)
-    subprocess.check_call(["gcc", "-nostdlib", "-static", "-o", elf,
-                           os.path.join(HERE, name + ".S")])
+    subprocess.check_call([prefix + "gcc"] + PROBE_CFLAGS[isa]
+                          + ["-nostdlib", "-static", "-o", elf, src])
     return elf
 
 
-def sym(elf, name):
-    out = subprocess.check_output(["nm", elf], text=True)
+def sym(elf, name, prefix=""):
+    out = subprocess.check_output([prefix + "nm", elf], text=True)
     for line in out.split("\n"):
         f = line.split()
         if len(f) >= 3 and f[2] == name:
@@ -80,12 +117,12 @@ def sym(elf, name):
     raise SystemExit("no symbol %s in %s" % (name, elf))
 
 
-def oracle_facts(qemu, elf, workdir, mutate, helper_reads):
+def oracle_facts(qemu, elf, workdir, mutate, helper_reads, prefix=""):
     report = os.path.join(workdir, "indep-%s.oracle" % (mutate or "base"))
     env = dict(os.environ)
     env.update({"QEMU_ORACLE": report,
-                "QEMU_ORACLE_PC_LO": hex(sym(elf, "oracle_begin")),
-                "QEMU_ORACLE_PC_HI": hex(sym(elf, "oracle_end")),
+                "QEMU_ORACLE_PC_LO": hex(sym(elf, "oracle_begin", prefix)),
+                "QEMU_ORACLE_PC_HI": hex(sym(elf, "oracle_end", prefix)),
                 "QEMU_ORACLE_HELPER_READS": "1" if helper_reads else "0"})
     env.pop("QEMU_CAP_MUTATE", None)
     if mutate:
@@ -96,17 +133,37 @@ def oracle_facts(qemu, elf, workdir, mutate, helper_reads):
         return [ln for ln in fh if FACT.match(ln)]
 
 
-def disas_encodings(elf, lo, hi):
+def disas_encodings(elf, lo, hi, prefix=""):
+    # The CROSS objdump, not the host one: a native objdump refuses a
+    # foreign ELF outright, which is how --isa stayed unexercised.
     out = subprocess.check_output(
-        ["objdump", "-d", "--insn-width=16", elf], text=True)
+        [prefix + "objdump", "-d", "--insn-width=16", elf], text=True)
+    # objdump renders the encoding two ways.  x86 prints space-separated
+    # bytes in MEMORY order ("48 ff cb").  The fixed-width targets print the
+    # instruction WORD ("8b010002"), which on these little-endian ISAs is the
+    # memory bytes reversed -- so a word must be byte-swapped to become the
+    # hex string every other tool here speaks.  Reading the word as if it
+    # were already memory order is how three ISAs parsed zero encodings and
+    # the check reported 0/0.  0/0 fails loudly rather than passing, which is
+    # the only reason this was visible at all.
     seen, rows = set(), []
+    row_re = re.compile(r"\s+([0-9a-f]+):\t([0-9a-f ]+?)\t+(.*)")
     for line in out.splitlines():
-        m = re.match(r"\s+([0-9a-f]+):\s+((?:[0-9a-f]{2} )+)\s*(.*)", line)
+        m = row_re.match(line)
         if not m:
             continue
         if not lo <= int(m.group(1), 16) < hi:
             continue
-        hexb = m.group(2).replace(" ", "")
+        field = m.group(2).strip()
+        if " " in field:
+            hexb = field.replace(" ", "")            # already memory order
+        else:
+            if len(field) % 2:
+                continue
+            b = [field[i:i + 2] for i in range(0, len(field), 2)]
+            hexb = "".join(reversed(b))              # word -> LE memory order
+        if not hexb:
+            continue
         if hexb not in seen:
             seen.add(hexb)
             rows.append((hexb, m.group(3).strip()))
@@ -192,9 +249,11 @@ def main():
         if not os.path.exists(p):
             raise SystemExit("missing %s" % p)
 
-    elf = build_probe(args.workdir)
-    lo, hi = sym(elf, "oracle_begin"), sym(elf, "oracle_end")
-    encodings = disas_encodings(elf, lo, hi)
+    elf = build_probe(args.workdir, args.isa)
+    xprefix = CROSS[args.isa]
+    lo, hi = (sym(elf, "oracle_begin", xprefix),
+              sym(elf, "oracle_end", xprefix))
+    encodings = disas_encodings(elf, lo, hi, xprefix)
     hr = not args.no_helper_reads
 
     checked, bad = check_no_capstone_symbols(args.build_dir, args.isa)
@@ -209,7 +268,7 @@ def main():
               % ", ".join(os.path.basename(c) for c in checked))
     static_ok = bool(checked) and not bad
 
-    base_facts = oracle_facts(qemu, elf, args.workdir, None, hr)
+    base_facts = oracle_facts(qemu, elf, args.workdir, None, hr, xprefix)
     base_tracer = {h: tracer_answer(isax, args.isa, h, None)
                    for h, _ in encodings}
     print("probe: %d instructions, %d distinct encodings, "
@@ -225,7 +284,7 @@ def main():
         classmoved = sum(1 for h, _ in encodings
                          if tracer_answer(isax, args.isa, h, mode)[1]
                          != base_tracer[h][1])
-        facts = oracle_facts(qemu, elf, args.workdir, mode, hr)
+        facts = oracle_facts(qemu, elf, args.workdir, mode, hr, xprefix)
         drift = sum(1 for a, b in zip(base_facts, facts) if a != b)
         drift += abs(len(base_facts) - len(facts))
 

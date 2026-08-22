@@ -35,6 +35,15 @@ oracle_begin:
         fadd    d4, d2, d3        /* -> d4 and the FP status word */
         fdiv    d5, d2, d3        /* inexact: sticky FP flag */
         fcmp    d2, d3            /* FP compare writes the same flag words */
+        /*
+         * Memory operands.  Without at least one load and one store the
+         * QEMU_CAP_MUTATE=memdir positive control has no subject, and
+         * check-independence.py fails the mode 0/N rather than passing a
+         * mutation it could not exercise.  x6 addresses the scratch word.
+         */
+        adr     x6, oracle_scratch
+        str     x0, [x6]          /* store: memop direction OUT */
+        ldr     x7, [x6]          /* load:  memop direction IN  */
         .globl oracle_end
 oracle_end:
         nop
@@ -42,3 +51,8 @@ oracle_end:
         mov     x0, #0
         mov     x8, #93           /* __NR_exit */
         svc     #0
+
+        .data
+        .align  3
+oracle_scratch:
+        .quad   0

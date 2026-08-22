@@ -92,18 +92,50 @@ WORKLOADS = [
      "args": ["--diamonds", "8", "--depth", "128"]},
     {"name": "w7_iframe",    "seed": "0x0707", "isas": ALL_ISAS,
      "args": ["--diamonds", "8", "--depth", "4", "--iframe-rate", "50"]},
-    # NOTE: flush-heavy workloads (large coverage+regdata, and --tb-size 1)
-    # are intentionally NOT byte-golden cells.  When the guest's translated
-    # code + plugin instrumentation overflows the code cache, tb_flush
-    # timing depends on the plugin .so codegen, so the *byte* trace shifts
-    # across any rebuild (even behavior-preserving ones) — a false positive
-    # for byte-identity.  The tracer is flush-INVARIANT semantically (the
-    # decoded execution and the validator result are identical with vs
-    # without flushing); those workloads are covered by `validator all`
-    # and tests/large_scale.sh (whose coverage/wide-cfg/hot-stress shapes
-    # exercise coverage+regdata), not by this byte net.
-    #   w8_dense  (--coverage --regdata)   -> validator/large_scale
-    #   w9_tbflush(--diamonds 64 --tb-size 1) -> validator/large_scale
+    # The one cell that can witness the REP register contract (#174/#175):
+    # a repeating instruction fanned out WITH register capture on.  Every
+    # other cell has at most one of the two -- w2_regdata carries registers
+    # but contains no REP at all, and w3_coverage fans out 175 rep movsq
+    # with no register data -- so before this cell existed the byte net
+    # returned GREEN against a change that rewrote how REP registers are
+    # published, because nothing it traced had both.  x86_64 gives rep
+    # movsq (8- and 20-iteration), aarch64 the FEAT_MOPS triple.
+    #
+    # This is the SMALL coverage+regdata shape, measured non-flushing
+    # (1263 architectural instructions, 26 fan-outs); the exclusion below
+    # is about the LARGE dense one, which is a different workload.
+    {"name": "w8_repregs",   "seed": "0x0808", "isas": ["x86_64", "aarch64"],
+     "args": ["--coverage", "--regdata"]},
+    # A flushing cell IS a byte-golden cell.  The claim that used to sit
+    # here -- that tb_flush timing depends on the plugin .so codegen, so a
+    # flush-heavy trace shifts its bytes across any rebuild -- was never
+    # measured, and the measurements below do not support it.
+    #
+    # MEASURED (cst_runs/p3/flushinv2, --diamonds 64 --regdata, x86_64,
+    # setarch -R, equal-length argv so only the cache size differs):
+    #   * -tb-size 1 takes 1 tb_flush, -tb-size 8 takes 0 (lever proven
+    #     to fire, via CST_MEMSTATS).
+    #   * Both arms produce 519 templates and, once template IDs are
+    #     normalised, decoded output differing in exactly 2 lines -- a
+    #     stack-pointer value.  The stack moved because -tb-size changes
+    #     QEMU's OWN mmap layout, not because of the flush.
+    #   * At fixed build and fixed args, the FLUSHING cell is fully
+    #     deterministic across runs: 0 differing lines of 35859, identical
+    #     template count and identical ID numbering.
+    # So the trace is flush-invariant in content AND in encoding; what is
+    # allocation-order sensitive is template ID numbering, and only when
+    # something perturbs wrong-path wander (the guest-layout shift that
+    # -tb-size itself causes is one such thing -- the flush is not).
+    #
+    # w9_tbflush is therefore a cell, not an exclusion.  Its `capture`
+    # traces every cell twice and refuses a non-deterministic one, so if
+    # this account is ever wrong the harness says so instead of silently
+    # excluding the case.
+    {"name": "w9_tbflush",   "seed": "0x0909", "isas": ["x86_64"],
+     "args": ["--diamonds", "64", "--regdata", "--tb-size", "1"]},
+    # w8_dense (large --coverage --regdata) stays out for a reason that IS
+    # measured: it is a scale cell covered by validator/large_scale.  The
+    # SMALL coverage+regdata shape is w8_repregs above.
 ]
 
 # SVG goldens: render every metric on two traces (guards Phase 7).

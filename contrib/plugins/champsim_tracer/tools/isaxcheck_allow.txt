@@ -487,6 +487,37 @@ aarch64 M-miss-load st1d
 aarch64 M-miss-load st1h
 aarch64 M-miss-load st1q
 aarch64 M-miss-load st1w
+
+# THE AArch64 LOAD-EXCLUSIVES, and the reason they only became visible at
+# 733a65dfb0.  LLVM sets mayStore on ldxr / ldaxr / ldxp / ldaxp (with the
+# byte and halfword forms) the same way it sets it on the barriers above:
+# the exclusive monitor is unmodelled state, and mayStore is how the
+# scheduler is told not to move memory across it.  Architecturally a
+# load-exclusive reads memory and marks the monitor; it writes nothing.
+#
+# Until 733a65dfb0 nothing appeared here, and that was two errors
+# cancelling rather than agreement: Capstone 6.0.0-Alpha7 reports
+# READ|WRITE on the MEM operand of these forms, so the boundary claimed a
+# store too and the comparison matched.  The Capstone side is now
+# corrected (cap_aarch64_exclusive_mem_access), and the disagreement it
+# leaves is LLVM's alone.
+#
+# Which side is right was MEASURED, not argued: on an aarch64 probe the
+# ldaxr entry declared `st[%gp1]` with no address and every execution
+# delivered only `ld=`, never `st=` -- a slot QEMU's memop callbacks can
+# never fill.  ldar is the control (READ only, unchanged) and the LSE
+# read-modify-writes (ldadd, swp) keep both slots, so this is specific to
+# the exclusives rather than a blanket rule about acquire/release.
+# Evidence: /mnt/md0/QEMU/cst_runs/p3/t177/FINDING.md.
+aarch64 M-miss-store ldaxp
+aarch64 M-miss-store ldaxr
+aarch64 M-miss-store ldaxrb
+aarch64 M-miss-store ldaxrh
+aarch64 M-miss-store ldxp
+aarch64 M-miss-store ldxr
+aarch64 M-miss-store ldxrb
+aarch64 M-miss-store ldxrh
+
 aarch64 M-miss-store prfb
 aarch64 M-miss-store prfd
 aarch64 M-miss-store prfh

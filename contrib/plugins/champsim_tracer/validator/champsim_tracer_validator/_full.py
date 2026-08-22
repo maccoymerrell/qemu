@@ -2003,9 +2003,16 @@ def _chk_decode_fields(ctx: Ctx) -> Outcome:
          execution-derived register capture lands and starts closing the
          inherited Capstone gaps that file names as open defects.
 
-    GATING, mipsel + aarch64.  x86_64 and riscv64 close the same loop
-    through PIN and Spike (owner ruling 2026-08-09); their fields residual
-    is not yet triaged and is deliberately not run here.
+    GATING, mipsel + aarch64 + riscv64.  x86_64 and riscv64 close the same
+    loop through PIN and Spike (owner ruling 2026-08-09), so here the layer
+    is a second opinion rather than the only one -- but riscv64's residual
+    is now triaged (#169: 348 rows, six classes, every one a case where
+    LLVM MC cannot express what the fields side records -- CSRs modelled as
+    immediates, whole-register vector groups named by their first member,
+    and RISC-V HINT encodings reported as if they were operations), so it
+    is gated.  x86_64 is NOT: its sweep had not completed when this was
+    written, and the one attempt that "passed" was a 900 s timeout whose
+    zero rows are not a clean sweep.
     """
     tool = ctx.build_dir / "contrib/plugins/isaxcheck"
     allow = (Path(__file__).resolve().parents[2]
@@ -2022,10 +2029,11 @@ def _chk_decode_fields(ctx: Ctx) -> Outcome:
     # One known-good encoding per ISA, chosen to compare clean when
     # healthy (asserted below) so the falsified runs are a strict A/B.
     probes = {"mipsel": ("2120a600", "addu"),     # addu $a0, $a1, $a2
-              "aarch64": ("4100038b", "add")}     # add x1, x2, x3
+              "aarch64": ("4100038b", "add"),     # add x1, x2, x3
+              "riscv64": ("b3003100", "add")}    # add x1, x2, x3
     subs: list = []
     all_ok = True
-    for isa in ("mipsel", "aarch64"):
+    for isa in ("mipsel", "aarch64", "riscv64"):
         hexenc, mnem = probes[isa]
         base = [str(tool), f"--isa={isa}", "--layer=fields", "--classes=MBR"]
         ok = True

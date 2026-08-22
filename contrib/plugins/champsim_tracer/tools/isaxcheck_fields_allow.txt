@@ -9,13 +9,23 @@
 # Author: Maccoy Merrell
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# WHY ONLY mipsel AND aarch64.  This layer is the static-decode oracle the
-# owner named for the two ISAs with no external ground truth (no PIN, no
-# Spike): it is what must alert when the QEMU-execution-derived register
-# capture of the behavioural-oracle arc disagrees with what the trace
-# records today.  x86_64 and riscv64 close that loop through PIN and Spike
-# instead; their fields residual is not yet triaged and is NOT vouched for
-# by this file.
+# WHY THESE ISAs.  This layer is the static-decode oracle the owner named
+# for mipsel and aarch64, the two ISAs with no external ground truth (no
+# PIN, no Spike): it is what must alert when the QEMU-execution-derived
+# register capture of the behavioural-oracle arc disagrees with what the
+# trace records today.  x86_64 and riscv64 close that loop through PIN and
+# Spike as well, so the layer is a SECOND opinion there rather than the
+# only one -- but a second opinion that is gated is worth more than one
+# that is not, and the residual that kept riscv64 out is now triaged
+# (#169, below).
+#
+# x86_64 IS STILL ABSENT, and for a stated reason rather than an omission:
+# its sweep had not completed when this section was written.  An earlier
+# attempt was killed by a 900 s timeout and reported "0 NEW rows", which
+# is a TIMEOUT'S output and not a clean sweep -- do not quote it as one.
+# Until a completed x86_64 sweep exists and its residual is triaged the
+# same way, x86_64 is NOT vouched for by this file and the gate does not
+# run it.
 #
 # THE ROWS ARE THE OBSERVED RESIDUAL, EXACTLY.  Every row was produced by
 # a full sweep (151.0 M mipsel / 163.6 M aarch64 encodings, Capstone
@@ -615,3 +625,427 @@ aarch64 FR-wr-phantom ldg +REG_SP
 # `aarch64 R-rd-missing tlbi +r#`, whose comment is the verification.
 aarch64 FR-rd-missing tlbi +REG_GPR#
 
+# =====================================================================
+# riscv64
+# =====================================================================
+#
+# TRIAGED 2026-08-22 (#169, discharging the #95 residual).  Every row
+# below was produced by a full `--layer=fields --classes=MBR` sweep and
+# is the observed residual EXACTLY -- 348 rows, 253 mnemonics, six
+# signature classes.  The through-line: in every class measured the
+# fields side is the one telling the truth and LLVM MC is the one that
+# cannot express it.  That is why these are allowlisted rather than
+# fixed -- there is nothing on our side to fix.
+#
+
+# Traps as control flow.  ebreak / ecall / unimp end a basic block on the
+# fields side -- the same classification the mipsel break / syscall rows
+# above carry -- while LLVM's per-opcode flags do not mark them.
+#   3 rows
+riscv64 FB-flow-presence ebreak cs-yes llvm-no
+riscv64 FB-flow-presence ecall cs-yes llvm-no
+riscv64 FB-flow-presence unimp cs-yes llvm-no
+
+# `jr 1(ra)` is not a return: a jump through ra with a NON-ZERO offset
+# does not resume the caller, and the fields side declines to call it
+# one.
+#   1 rows
+riscv64 FB-ret-mismatch jr cs-noret
+
+# LLVM MC does not model a CSR as a REGISTER.  In its instruction
+# descriptions the CSR is an immediate operand, so for every csr* form
+# llvmRD and llvmWR are BOTH empty and the fields side is the only one
+# naming the state the instruction touches.  `csrc fflags, zero`
+# (73301000) reads fflags to clear bits in it; the fields side records
+# REG_FCSR, LLVM records nothing at all.  The FP arithmetic entries are
+# the same fact from the other side: they read the rounding mode out of
+# fcsr, which LLVM's operand list has no way to say.  The tracer is
+# right here and the oracle is silent, not contradicting.
+#   85 rows
+riscv64 FR-rd-phantom csrc +REG_FCSR
+riscv64 FR-rd-phantom csrci +REG_FCSR
+riscv64 FR-rd-phantom csrr +REG_FCSR
+riscv64 FR-rd-phantom csrrc +REG_FCSR
+riscv64 FR-rd-phantom csrrci +REG_FCSR
+riscv64 FR-rd-phantom csrrs +REG_FCSR
+riscv64 FR-rd-phantom csrrsi +REG_FCSR
+riscv64 FR-rd-phantom csrrw +REG_FCSR
+riscv64 FR-rd-phantom csrrwi +REG_FCSR
+riscv64 FR-rd-phantom csrs +REG_FCSR
+riscv64 FR-rd-phantom csrsi +REG_FCSR
+riscv64 FR-rd-phantom fadd.d +REG_FCSR
+riscv64 FR-rd-phantom fadd.h +REG_FCSR
+riscv64 FR-rd-phantom fadd.s +REG_FCSR
+riscv64 FR-rd-phantom fcvt.bf16.s +REG_FCSR
+riscv64 FR-rd-phantom fcvt.d.h +REG_FCSR
+riscv64 FR-rd-phantom fcvt.d.l +REG_FCSR
+riscv64 FR-rd-phantom fcvt.d.lu +REG_FCSR
+riscv64 FR-rd-phantom fcvt.d.s +REG_FCSR
+riscv64 FR-rd-phantom fcvt.d.w +REG_FCSR
+riscv64 FR-rd-phantom fcvt.d.wu +REG_FCSR
+riscv64 FR-rd-phantom fcvt.h.d +REG_FCSR
+riscv64 FR-rd-phantom fcvt.h.l +REG_FCSR
+riscv64 FR-rd-phantom fcvt.h.lu +REG_FCSR
+riscv64 FR-rd-phantom fcvt.h.s +REG_FCSR
+riscv64 FR-rd-phantom fcvt.h.w +REG_FCSR
+riscv64 FR-rd-phantom fcvt.h.wu +REG_FCSR
+riscv64 FR-rd-phantom fcvt.l.d +REG_FCSR
+riscv64 FR-rd-phantom fcvt.l.h +REG_FCSR
+riscv64 FR-rd-phantom fcvt.l.s +REG_FCSR
+riscv64 FR-rd-phantom fcvt.lu.d +REG_FCSR
+riscv64 FR-rd-phantom fcvt.lu.h +REG_FCSR
+riscv64 FR-rd-phantom fcvt.lu.s +REG_FCSR
+riscv64 FR-rd-phantom fcvt.s.bf16 +REG_FCSR
+riscv64 FR-rd-phantom fcvt.s.d +REG_FCSR
+riscv64 FR-rd-phantom fcvt.s.h +REG_FCSR
+riscv64 FR-rd-phantom fcvt.s.l +REG_FCSR
+riscv64 FR-rd-phantom fcvt.s.lu +REG_FCSR
+riscv64 FR-rd-phantom fcvt.s.w +REG_FCSR
+riscv64 FR-rd-phantom fcvt.s.wu +REG_FCSR
+riscv64 FR-rd-phantom fcvt.w.d +REG_FCSR
+riscv64 FR-rd-phantom fcvt.w.h +REG_FCSR
+riscv64 FR-rd-phantom fcvt.w.s +REG_FCSR
+riscv64 FR-rd-phantom fcvt.wu.d +REG_FCSR
+riscv64 FR-rd-phantom fcvt.wu.h +REG_FCSR
+riscv64 FR-rd-phantom fcvt.wu.s +REG_FCSR
+riscv64 FR-rd-phantom fcvtmod.w.d +REG_FCSR
+riscv64 FR-rd-phantom fdiv.d +REG_FCSR
+riscv64 FR-rd-phantom fdiv.h +REG_FCSR
+riscv64 FR-rd-phantom fdiv.s +REG_FCSR
+riscv64 FR-rd-phantom fmadd.d +REG_FCSR
+riscv64 FR-rd-phantom fmadd.h +REG_FCSR
+riscv64 FR-rd-phantom fmadd.s +REG_FCSR
+riscv64 FR-rd-phantom fmsub.d +REG_FCSR
+riscv64 FR-rd-phantom fmsub.h +REG_FCSR
+riscv64 FR-rd-phantom fmsub.s +REG_FCSR
+riscv64 FR-rd-phantom fmul.d +REG_FCSR
+riscv64 FR-rd-phantom fmul.h +REG_FCSR
+riscv64 FR-rd-phantom fmul.s +REG_FCSR
+riscv64 FR-rd-phantom fnmadd.d +REG_FCSR
+riscv64 FR-rd-phantom fnmadd.h +REG_FCSR
+riscv64 FR-rd-phantom fnmadd.s +REG_FCSR
+riscv64 FR-rd-phantom fnmsub.d +REG_FCSR
+riscv64 FR-rd-phantom fnmsub.h +REG_FCSR
+riscv64 FR-rd-phantom fnmsub.s +REG_FCSR
+riscv64 FR-rd-phantom frcsr +REG_FCSR
+riscv64 FR-rd-phantom frflags +REG_FCSR
+riscv64 FR-rd-phantom fround.d +REG_FCSR
+riscv64 FR-rd-phantom fround.h +REG_FCSR
+riscv64 FR-rd-phantom fround.s +REG_FCSR
+riscv64 FR-rd-phantom froundnx.d +REG_FCSR
+riscv64 FR-rd-phantom froundnx.h +REG_FCSR
+riscv64 FR-rd-phantom froundnx.s +REG_FCSR
+riscv64 FR-rd-phantom frrm +REG_FCSR
+riscv64 FR-rd-phantom fscsr +REG_FCSR
+riscv64 FR-rd-phantom fsflags +REG_FCSR
+riscv64 FR-rd-phantom fsflagsi +REG_FCSR
+riscv64 FR-rd-phantom fsqrt.d +REG_FCSR
+riscv64 FR-rd-phantom fsqrt.h +REG_FCSR
+riscv64 FR-rd-phantom fsqrt.s +REG_FCSR
+riscv64 FR-rd-phantom fsrm +REG_FCSR
+riscv64 FR-rd-phantom fsrmi +REG_FCSR
+riscv64 FR-rd-phantom fsub.d +REG_FCSR
+riscv64 FR-rd-phantom fsub.h +REG_FCSR
+riscv64 FR-rd-phantom fsub.s +REG_FCSR
+
+# Same silence, vector control state: vstart / vtype / vl / vcsr.  The
+# csr* forms addressing them, and the vector instructions that read vtype
+# and vl to know their own shape, record REG_VCTRL on the fields side
+# against an empty LLVM operand list.
+#   88 rows
+riscv64 FR-rd-phantom csrc +REG_VCTRL
+riscv64 FR-rd-phantom csrci +REG_VCTRL
+riscv64 FR-rd-phantom csrr +REG_VCTRL
+riscv64 FR-rd-phantom csrrc +REG_VCTRL
+riscv64 FR-rd-phantom csrrci +REG_VCTRL
+riscv64 FR-rd-phantom csrrs +REG_VCTRL
+riscv64 FR-rd-phantom csrrsi +REG_VCTRL
+riscv64 FR-rd-phantom csrrw +REG_VCTRL
+riscv64 FR-rd-phantom csrrwi +REG_VCTRL
+riscv64 FR-rd-phantom csrs +REG_VCTRL
+riscv64 FR-rd-phantom csrsi +REG_VCTRL
+riscv64 FR-rd-phantom vfadd.vf +REG_VCTRL
+riscv64 FR-rd-phantom vfadd.vv +REG_VCTRL
+riscv64 FR-rd-phantom vfcvt.f.xu.v +REG_VCTRL
+riscv64 FR-rd-phantom vfcvt.x.f.v +REG_VCTRL
+riscv64 FR-rd-phantom vfcvt.xu.f.v +REG_VCTRL
+riscv64 FR-rd-phantom vfdiv.vf +REG_VCTRL
+riscv64 FR-rd-phantom vfdiv.vv +REG_VCTRL
+riscv64 FR-rd-phantom vfmacc.vf +REG_VCTRL
+riscv64 FR-rd-phantom vfmacc.vv +REG_VCTRL
+riscv64 FR-rd-phantom vfmadd.vf +REG_VCTRL
+riscv64 FR-rd-phantom vfmadd.vv +REG_VCTRL
+riscv64 FR-rd-phantom vfmsac.vf +REG_VCTRL
+riscv64 FR-rd-phantom vfmsac.vv +REG_VCTRL
+riscv64 FR-rd-phantom vfmsub.vf +REG_VCTRL
+riscv64 FR-rd-phantom vfmsub.vv +REG_VCTRL
+riscv64 FR-rd-phantom vfmul.vf +REG_VCTRL
+riscv64 FR-rd-phantom vfmul.vv +REG_VCTRL
+riscv64 FR-rd-phantom vfnmacc.vf +REG_VCTRL
+riscv64 FR-rd-phantom vfnmacc.vv +REG_VCTRL
+riscv64 FR-rd-phantom vfnmadd.vf +REG_VCTRL
+riscv64 FR-rd-phantom vfnmadd.vv +REG_VCTRL
+riscv64 FR-rd-phantom vfnmsac.vf +REG_VCTRL
+riscv64 FR-rd-phantom vfnmsac.vv +REG_VCTRL
+riscv64 FR-rd-phantom vfnmsub.vf +REG_VCTRL
+riscv64 FR-rd-phantom vfnmsub.vv +REG_VCTRL
+riscv64 FR-rd-phantom vfrdiv.vf +REG_VCTRL
+riscv64 FR-rd-phantom vfredosum.vs +REG_VCTRL
+riscv64 FR-rd-phantom vfredusum.vs +REG_VCTRL
+riscv64 FR-rd-phantom vfrsub.vf +REG_VCTRL
+riscv64 FR-rd-phantom vfsqrt.v +REG_VCTRL
+riscv64 FR-rd-phantom vfsub.vf +REG_VCTRL
+riscv64 FR-rd-phantom vfsub.vv +REG_VCTRL
+riscv64 FR-rd-phantom vfwadd.vf +REG_VCTRL
+riscv64 FR-rd-phantom vfwadd.vv +REG_VCTRL
+riscv64 FR-rd-phantom vfwadd.wf +REG_VCTRL
+riscv64 FR-rd-phantom vfwadd.wv +REG_VCTRL
+riscv64 FR-rd-phantom vfwmacc.vf +REG_VCTRL
+riscv64 FR-rd-phantom vfwmacc.vv +REG_VCTRL
+riscv64 FR-rd-phantom vfwmaccbf16.vf +REG_VCTRL
+riscv64 FR-rd-phantom vfwmaccbf16.vv +REG_VCTRL
+riscv64 FR-rd-phantom vfwmsac.vf +REG_VCTRL
+riscv64 FR-rd-phantom vfwmsac.vv +REG_VCTRL
+riscv64 FR-rd-phantom vfwmul.vf +REG_VCTRL
+riscv64 FR-rd-phantom vfwmul.vv +REG_VCTRL
+riscv64 FR-rd-phantom vfwnmacc.vf +REG_VCTRL
+riscv64 FR-rd-phantom vfwnmacc.vv +REG_VCTRL
+riscv64 FR-rd-phantom vfwnmsac.vf +REG_VCTRL
+riscv64 FR-rd-phantom vfwnmsac.vv +REG_VCTRL
+riscv64 FR-rd-phantom vfwredosum.vs +REG_VCTRL
+riscv64 FR-rd-phantom vfwredusum.vs +REG_VCTRL
+riscv64 FR-rd-phantom vfwsub.vf +REG_VCTRL
+riscv64 FR-rd-phantom vfwsub.vv +REG_VCTRL
+riscv64 FR-rd-phantom vfwsub.wf +REG_VCTRL
+riscv64 FR-rd-phantom vfwsub.wv +REG_VCTRL
+riscv64 FR-rd-phantom vl1r.v +REG_VCTRL
+riscv64 FR-rd-phantom vl1re16.v +REG_VCTRL
+riscv64 FR-rd-phantom vl1re32.v +REG_VCTRL
+riscv64 FR-rd-phantom vl1re64.v +REG_VCTRL
+riscv64 FR-rd-phantom vl2r.v +REG_VCTRL
+riscv64 FR-rd-phantom vl2re16.v +REG_VCTRL
+riscv64 FR-rd-phantom vl2re32.v +REG_VCTRL
+riscv64 FR-rd-phantom vl2re64.v +REG_VCTRL
+riscv64 FR-rd-phantom vl4r.v +REG_VCTRL
+riscv64 FR-rd-phantom vl4re16.v +REG_VCTRL
+riscv64 FR-rd-phantom vl4re32.v +REG_VCTRL
+riscv64 FR-rd-phantom vl4re64.v +REG_VCTRL
+riscv64 FR-rd-phantom vl8r.v +REG_VCTRL
+riscv64 FR-rd-phantom vl8re16.v +REG_VCTRL
+riscv64 FR-rd-phantom vl8re32.v +REG_VCTRL
+riscv64 FR-rd-phantom vl8re64.v +REG_VCTRL
+riscv64 FR-rd-phantom vmv1r.v +REG_VCTRL
+riscv64 FR-rd-phantom vmv2r.v +REG_VCTRL,REG_VEC#
+riscv64 FR-rd-phantom vs1r.v +REG_VCTRL
+riscv64 FR-rd-phantom vs2r.v +REG_VCTRL,REG_VEC#
+riscv64 FR-rd-phantom vs4r.v +REG_VCTRL,REG_VEC#
+riscv64 FR-rd-phantom vs8r.v +REG_VCTRL,REG_VEC#
+riscv64 FR-rd-phantom vsetivli +REG_VCTRL
+
+# Same silence, the remaining system CSRs.
+#   14 rows
+riscv64 FR-rd-phantom csrc +REG_SYS
+riscv64 FR-rd-phantom csrci +REG_SYS
+riscv64 FR-rd-phantom csrr +REG_SYS
+riscv64 FR-rd-phantom csrrc +REG_SYS
+riscv64 FR-rd-phantom csrrci +REG_SYS
+riscv64 FR-rd-phantom csrrs +REG_SYS
+riscv64 FR-rd-phantom csrrsi +REG_SYS
+riscv64 FR-rd-phantom csrrw +REG_SYS
+riscv64 FR-rd-phantom csrrwi +REG_SYS
+riscv64 FR-rd-phantom csrs +REG_SYS
+riscv64 FR-rd-phantom csrsi +REG_SYS
+riscv64 FR-rd-phantom rdcycle +REG_SYS
+riscv64 FR-rd-phantom rdinstret +REG_SYS
+riscv64 FR-rd-phantom rdtime +REG_SYS
+
+# Whole-register vector forms touch a GROUP.  vl<N>r.v loads N
+# consecutive vector registers and vmv<N>r.v moves N; LLVM's operand list
+# names only the first of the group.  `vl8r.v v0, (zero)` (070080e2) has
+# fieldsWR{REG_VEC0..REG_VEC7} against llvmWR{REG_VEC0} -- eight
+# registers written, one named.  The RISC-V vector spec defines the
+# group; the fields side follows it.
+#   62 rows
+riscv64 FR-rd-phantom vadc.vim +REG_VEC#
+riscv64 FR-rd-phantom vadc.vvm +REG_VEC#
+riscv64 FR-rd-phantom vadc.vxm +REG_VEC#
+riscv64 FR-rd-phantom vfmerge.vfm +REG_VEC#
+riscv64 FR-rd-phantom vlm.v +REG_VEC#
+riscv64 FR-rd-phantom vmadc.vi +REG_VEC#
+riscv64 FR-rd-phantom vmadc.vim +REG_VEC#
+riscv64 FR-rd-phantom vmadc.vv +REG_VEC#
+riscv64 FR-rd-phantom vmadc.vvm +REG_VEC#
+riscv64 FR-rd-phantom vmadc.vx +REG_VEC#
+riscv64 FR-rd-phantom vmadc.vxm +REG_VEC#
+riscv64 FR-rd-phantom vmand.mm +REG_VEC#
+riscv64 FR-rd-phantom vmandn.mm +REG_VEC#
+riscv64 FR-rd-phantom vmerge.vim +REG_VEC#
+riscv64 FR-rd-phantom vmerge.vvm +REG_VEC#
+riscv64 FR-rd-phantom vmerge.vxm +REG_VEC#
+riscv64 FR-rd-phantom vmfeq.vf +REG_VEC#
+riscv64 FR-rd-phantom vmfeq.vv +REG_VEC#
+riscv64 FR-rd-phantom vmfge.vf +REG_VEC#
+riscv64 FR-rd-phantom vmfgt.vf +REG_VEC#
+riscv64 FR-rd-phantom vmfle.vf +REG_VEC#
+riscv64 FR-rd-phantom vmfle.vv +REG_VEC#
+riscv64 FR-rd-phantom vmflt.vf +REG_VEC#
+riscv64 FR-rd-phantom vmflt.vv +REG_VEC#
+riscv64 FR-rd-phantom vmfne.vf +REG_VEC#
+riscv64 FR-rd-phantom vmfne.vv +REG_VEC#
+riscv64 FR-rd-phantom vmmv.m +REG_VEC#
+riscv64 FR-rd-phantom vmnand.mm +REG_VEC#
+riscv64 FR-rd-phantom vmnor.mm +REG_VEC#
+riscv64 FR-rd-phantom vmnot.m +REG_VEC#
+riscv64 FR-rd-phantom vmor.mm +REG_VEC#
+riscv64 FR-rd-phantom vmorn.mm +REG_VEC#
+riscv64 FR-rd-phantom vmsbc.vv +REG_VEC#
+riscv64 FR-rd-phantom vmsbc.vvm +REG_VEC#
+riscv64 FR-rd-phantom vmsbc.vx +REG_VEC#
+riscv64 FR-rd-phantom vmsbc.vxm +REG_VEC#
+riscv64 FR-rd-phantom vmsbf.m +REG_VEC#
+riscv64 FR-rd-phantom vmseq.vi +REG_VEC#
+riscv64 FR-rd-phantom vmseq.vv +REG_VEC#
+riscv64 FR-rd-phantom vmseq.vx +REG_VEC#
+riscv64 FR-rd-phantom vmsgt.vi +REG_VEC#
+riscv64 FR-rd-phantom vmsgt.vx +REG_VEC#
+riscv64 FR-rd-phantom vmsgtu.vi +REG_VEC#
+riscv64 FR-rd-phantom vmsgtu.vx +REG_VEC#
+riscv64 FR-rd-phantom vmsle.vi +REG_VEC#
+riscv64 FR-rd-phantom vmsle.vv +REG_VEC#
+riscv64 FR-rd-phantom vmsle.vx +REG_VEC#
+riscv64 FR-rd-phantom vmsleu.vi +REG_VEC#
+riscv64 FR-rd-phantom vmsleu.vv +REG_VEC#
+riscv64 FR-rd-phantom vmsleu.vx +REG_VEC#
+riscv64 FR-rd-phantom vmslt.vv +REG_VEC#
+riscv64 FR-rd-phantom vmslt.vx +REG_VEC#
+riscv64 FR-rd-phantom vmsltu.vv +REG_VEC#
+riscv64 FR-rd-phantom vmsltu.vx +REG_VEC#
+riscv64 FR-rd-phantom vmsne.vi +REG_VEC#
+riscv64 FR-rd-phantom vmsne.vv +REG_VEC#
+riscv64 FR-rd-phantom vmsne.vx +REG_VEC#
+riscv64 FR-rd-phantom vmsof.m +REG_VEC#
+riscv64 FR-rd-phantom vmxnor.mm +REG_VEC#
+riscv64 FR-rd-phantom vmxor.mm +REG_VEC#
+riscv64 FR-rd-phantom vsbc.vvm +REG_VEC#
+riscv64 FR-rd-phantom vsbc.vxm +REG_VEC#
+
+# The write half of the same CSR silence: a csr* form that writes fflags
+# / frm / fcsr records REG_FCSR where LLVM records nothing.
+#   17 rows
+riscv64 FR-wr-phantom csrc +REG_FCSR
+riscv64 FR-wr-phantom csrci +REG_FCSR
+riscv64 FR-wr-phantom csrrc +REG_FCSR
+riscv64 FR-wr-phantom csrrci +REG_FCSR
+riscv64 FR-wr-phantom csrrs +REG_FCSR
+riscv64 FR-wr-phantom csrrsi +REG_FCSR
+riscv64 FR-wr-phantom csrrw +REG_FCSR
+riscv64 FR-wr-phantom csrrwi +REG_FCSR
+riscv64 FR-wr-phantom csrs +REG_FCSR
+riscv64 FR-wr-phantom csrsi +REG_FCSR
+riscv64 FR-wr-phantom csrw +REG_FCSR
+riscv64 FR-wr-phantom csrwi +REG_FCSR
+riscv64 FR-wr-phantom fscsr +REG_FCSR
+riscv64 FR-wr-phantom fsflags +REG_FCSR
+riscv64 FR-wr-phantom fsflagsi +REG_FCSR
+riscv64 FR-wr-phantom fsrm +REG_FCSR
+riscv64 FR-wr-phantom fsrmi +REG_FCSR
+
+# The write half for vector control state.
+#   12 rows
+riscv64 FR-wr-phantom csrc +REG_VCTRL
+riscv64 FR-wr-phantom csrci +REG_VCTRL
+riscv64 FR-wr-phantom csrrc +REG_VCTRL
+riscv64 FR-wr-phantom csrrci +REG_VCTRL
+riscv64 FR-wr-phantom csrrs +REG_VCTRL
+riscv64 FR-wr-phantom csrrsi +REG_VCTRL
+riscv64 FR-wr-phantom csrrw +REG_VCTRL
+riscv64 FR-wr-phantom csrrwi +REG_VCTRL
+riscv64 FR-wr-phantom csrs +REG_VCTRL
+riscv64 FR-wr-phantom csrsi +REG_VCTRL
+riscv64 FR-wr-phantom csrw +REG_VCTRL
+riscv64 FR-wr-phantom csrwi +REG_VCTRL
+
+# The write half for the remaining system CSRs.
+#   13 rows
+riscv64 FR-wr-phantom csrc +REG_SYS
+riscv64 FR-wr-phantom csrci +REG_SYS
+riscv64 FR-wr-phantom csrrc +REG_SYS
+riscv64 FR-wr-phantom csrrci +REG_SYS
+riscv64 FR-wr-phantom csrrs +REG_SYS
+riscv64 FR-wr-phantom csrrsi +REG_SYS
+riscv64 FR-wr-phantom csrrw +REG_SYS
+riscv64 FR-wr-phantom csrrwi +REG_SYS
+riscv64 FR-wr-phantom csrs +REG_SYS
+riscv64 FR-wr-phantom csrsi +REG_SYS
+riscv64 FR-wr-phantom csrw +REG_SYS
+riscv64 FR-wr-phantom csrwi +REG_SYS
+riscv64 FR-wr-phantom unimp +REG_SYS
+
+# The write half of the whole-register vector group.
+#   13 rows
+riscv64 FR-wr-phantom vl2r.v +REG_VEC#
+riscv64 FR-wr-phantom vl2re16.v +REG_VEC#
+riscv64 FR-wr-phantom vl2re32.v +REG_VEC#
+riscv64 FR-wr-phantom vl2re64.v +REG_VEC#
+riscv64 FR-wr-phantom vl4r.v +REG_VEC#
+riscv64 FR-wr-phantom vl4re16.v +REG_VEC#
+riscv64 FR-wr-phantom vl4re32.v +REG_VEC#
+riscv64 FR-wr-phantom vl4re64.v +REG_VEC#
+riscv64 FR-wr-phantom vl8r.v +REG_VEC#
+riscv64 FR-wr-phantom vl8re16.v +REG_VEC#
+riscv64 FR-wr-phantom vl8re32.v +REG_VEC#
+riscv64 FR-wr-phantom vl8re64.v +REG_VEC#
+riscv64 FR-wr-phantom vmv2r.v +REG_VEC#
+
+# RISC-V HINT encodings, where the fields side records NO dataflow and
+# LLVM reports the underlying encoding's register fields.  The spec makes
+# these hints, not operations: C.ADDI with imm=0 and rd!=x0 is a HINT (a
+# C.NOP is the rd=x0 case), Zimop's cmop.N and Zihintntl's ntl.* / c.ntl.*
+# are hints by construction, and c.slli64 / c.srai64 / c.srli64 are
+# RV128-only encodings that are hints on RV64.  A hint has no
+# architectural register effect, so recording none is the correct answer
+# and LLVM is describing the bit pattern rather than the semantics.
+#   20 rows
+riscv64 FR-rd-missing c.addi +REG_FP_REG
+riscv64 FR-rd-missing c.addi +REG_GPR#
+riscv64 FR-rd-missing c.addi +REG_LR
+riscv64 FR-rd-missing c.addi +REG_SP
+riscv64 FR-rd-missing c.ntl.all +REG_GPR#
+riscv64 FR-rd-missing c.ntl.p1 +REG_SP
+riscv64 FR-rd-missing c.ntl.pall +REG_GPR#
+riscv64 FR-rd-missing c.ntl.s1 +REG_GPR#
+riscv64 FR-rd-missing c.slli64 +REG_FP_REG
+riscv64 FR-rd-missing c.slli64 +REG_GPR#
+riscv64 FR-rd-missing c.slli64 +REG_LR
+riscv64 FR-rd-missing c.slli64 +REG_SP
+riscv64 FR-rd-missing c.srai64 +REG_FP_REG
+riscv64 FR-rd-missing c.srai64 +REG_GPR#
+riscv64 FR-rd-missing c.srli64 +REG_FP_REG
+riscv64 FR-rd-missing c.srli64 +REG_GPR#
+riscv64 FR-rd-missing ntl.all +REG_GPR#
+riscv64 FR-rd-missing ntl.p1 +REG_SP
+riscv64 FR-rd-missing ntl.pall +REG_GPR#
+riscv64 FR-rd-missing ntl.s1 +REG_GPR#
+
+# The write half of the same HINT encodings.
+#   20 rows
+riscv64 FR-wr-missing c.addi +REG_FP_REG
+riscv64 FR-wr-missing c.addi +REG_GPR#
+riscv64 FR-wr-missing c.addi +REG_LR
+riscv64 FR-wr-missing c.addi +REG_SP
+riscv64 FR-wr-missing c.slli64 +REG_FP_REG
+riscv64 FR-wr-missing c.slli64 +REG_GPR#
+riscv64 FR-wr-missing c.slli64 +REG_LR
+riscv64 FR-wr-missing c.slli64 +REG_SP
+riscv64 FR-wr-missing c.srai64 +REG_FP_REG
+riscv64 FR-wr-missing c.srai64 +REG_GPR#
+riscv64 FR-wr-missing c.srli64 +REG_FP_REG
+riscv64 FR-wr-missing c.srli64 +REG_GPR#
+riscv64 FR-wr-missing cmop.1 +REG_LR
+riscv64 FR-wr-missing cmop.11 +REG_GPR#
+riscv64 FR-wr-missing cmop.13 +REG_GPR#
+riscv64 FR-wr-missing cmop.15 +REG_GPR#
+riscv64 FR-wr-missing cmop.3 +REG_GPR#
+riscv64 FR-wr-missing cmop.5 +REG_GPR#
+riscv64 FR-wr-missing cmop.7 +REG_GPR#
+riscv64 FR-wr-missing cmop.9 +REG_GPR#

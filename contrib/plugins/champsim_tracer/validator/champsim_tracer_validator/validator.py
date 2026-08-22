@@ -3135,6 +3135,23 @@ def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
             exp_dst |= written
 
     elif isa == "x86_64":
+        # Match the STEM, not the mnemonic: Capstone puts prefix words inside
+        # it, so the locked form is "lock xaddq" and a bare
+        # startswith("xadd") misses precisely the encoding that matters --
+        # `lock xadd` is the atomic increment.  The boundary makes the same
+        # skip (cap_x86_mnem_stem); this mirror has to make it too, or it
+        # disagrees with the thing it mirrors.
+        stem = mnem
+        _moved = True
+        while _moved:
+            _moved = False
+            for _pfx in ("lock ", "rep ", "repe ", "repz ", "repne ",
+                         "repnz ", "bnd ", "notrack ", "xacquire ",
+                         "xrelease ", "data16 ", "addr32 ", "rex64 "):
+                if stem.startswith(_pfx):
+                    stem = stem[len(_pfx):]
+                    _moved = True
+                    break
         # CMOVcc keeps the destination's previous value when the condition
         # is false, so the destination is an input as well as an output;
         # Capstone marks it write-only and the trace would carry no RAW
@@ -3144,13 +3161,13 @@ def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
         # the register and this row would go red.  (FCMOVcc, whose two
         # operand roles Capstone exchanges, cannot be asserted here -- the
         # `st(` skip above takes every x87 row.)
-        if mnem.startswith("cmov"):
+        if stem.startswith("cmov"):
             exp_src |= exp_dst
         # TEST loses its implicit EFLAGS write whenever an operand is
         # memory, and XADD loses it in every form.  The boundary restores
         # it unconditionally; both instructions always write the flags, so
         # the expectation is unconditional too.
-        if mnem.startswith(("test", "xadd")):
+        if stem.startswith(("test", "xadd")):
             try:
                 import capstone as _cs
                 add(exp_dst, _cs.x86.X86_REG_EFLAGS)

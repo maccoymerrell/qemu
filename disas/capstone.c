@@ -434,6 +434,7 @@ static bool cap_x86_is_mask_arith_dest_last(const char *mnem);
 static bool cap_x86_is_ktest(const char *mnem);
 static bool cap_x86_is_ssp_read(const char *mnem);
 static bool cap_x86_is_x87_tag_only(const char *mnem);
+static const char *cap_x86_mnem_stem(const char *mnem);
 static bool cap_x86_is_cmov(const char *mnem);
 static void cap_x86_add_implicit(qemu_plugin_insn_info *out, csh handle,
                                  unsigned int reg, bool is_write);
@@ -550,7 +551,7 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
      * flags, so restoring it unconditionally is architecturally exact and
      * a no-op wherever Capstone already reports it. */
     bool ktest_op = cap_x86_is_ktest(insn->mnemonic);
-    bool xadd_op = g_str_has_prefix(insn->mnemonic, "xadd");
+    bool xadd_op = g_str_has_prefix(cap_x86_mnem_stem(insn->mnemonic), "xadd");
     /* Capstone-6.0.0-Alpha7 bug: INCSSPD / INCSSPQ report their sole
      * register operand access == 0.  The register supplies the pop
      * count — a pure READ; the write target is SSP, which is not an
@@ -574,7 +575,7 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
      * written, when the instruction moves ST(i) into ST(0).  See
      * cap_x86_is_cmov. */
     bool cmov = cap_x86_is_cmov(insn->mnemonic);
-    bool fcmov = cmov && insn->mnemonic[0] == 'f';
+    bool fcmov = cmov && cap_x86_mnem_stem(insn->mnemonic)[0] == 'f';
 
     if (ktest_op || test_read || xadd_op) {
         cap_x86_add_implicit(out, handle, X86_REG_EFLAGS, true);
@@ -1010,10 +1011,44 @@ static bool cap_x86_is_lost_mem_store(const char *mnem)
  * `fcmov` is the eight x87 forms.  Nothing else in x86 starts either
  * way.  Owed upstream as a bug report, not yet sent.
  */
+/*
+ * Capstone puts the prefix words INSIDE the mnemonic: the locked form of XADD
+ * is "lock xaddq", not "xaddq".  A predicate that prefix-matches the bare
+ * stem therefore misses exactly the encodings that carry a prefix -- and for
+ * XADD that is `lock xadd`, the atomic increment, which is the form worth
+ * caring about.  This skips the prefix words so the stem test means what it
+ * says.  (Found by the behavioural oracle's IR comparison within an hour of
+ * the XADD fix landing without it.)
+ */
+static const char *cap_x86_mnem_stem(const char *mnem)
+{
+    static const char *const prefixes[] = {
+        "lock ", "rep ", "repe ", "repz ", "repne ", "repnz ",
+        "bnd ", "notrack ", "xacquire ", "xrelease ",
+        "data16 ", "addr32 ", "rex64 ",
+    };
+    bool moved = true;
+
+    if (!mnem) return "";
+    while (moved) {
+        moved = false;
+        for (size_t i = 0; i < ARRAY_SIZE(prefixes); i++) {
+            if (g_str_has_prefix(mnem, prefixes[i])) {
+                mnem += strlen(prefixes[i]);
+                moved = true;
+                break;
+            }
+        }
+    }
+    return mnem;
+}
+
 static bool cap_x86_is_cmov(const char *mnem)
 {
-    if (!mnem || !mnem[0]) return false;
-    return g_str_has_prefix(mnem, "cmov") || g_str_has_prefix(mnem, "fcmov");
+    const char *stem = cap_x86_mnem_stem(mnem);
+
+    if (!stem[0]) return false;
+    return g_str_has_prefix(stem, "cmov") || g_str_has_prefix(stem, "fcmov");
 }
 
 static bool cap_x86_is_gather(const char *mnem)
@@ -1279,9 +1314,10 @@ static bool cap_x86_is_erased_mem_load(const char *mnem)
 static bool cap_x86_is_test(const char *mnem)
 {
     /* AT&T syntax (QEMU's) size-suffixes the mnemonic: testb/testw/
-     * testl/testq.  Prefix-match — no other x86 mnemonic starts with
-     * "test" (ktest/vptest begin with k/v). */
-    return mnem && g_str_has_prefix(mnem, "test");
+     * testl/testq.  Prefix-match on the STEM — no other x86 mnemonic starts
+     * with "test" (ktest/vptest begin with k/v), and the stem skip is what
+     * keeps a prefixed form from slipping past (see cap_x86_mnem_stem). */
+    return g_str_has_prefix(cap_x86_mnem_stem(mnem), "test");
 }
 
 /*

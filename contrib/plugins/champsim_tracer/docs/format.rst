@@ -2440,6 +2440,43 @@ visit:
 3. Both the parent BB template and the sub-template appear in the
    templates section; their ``template_id``\ s are independent and
    delta-encoded as usual in the body stream.
+4. **Destination registers ride the LAST iteration, and only it.**
+   Iterations 1..N-1 publish no destination-register write for the
+   fanned-out instruction; iteration N publishes the instruction's whole
+   architectural result.  Source registers are unaffected — every
+   iteration reads its pointers and counter, so all N entries carry
+   their sources.
+
+   This is a property of the wire, not a capture limitation, and a
+   consumer must read it as one: the absence of a register write on
+   iterations 1..N-1 means *the instruction has not produced its result
+   yet*, not *the value was not captured*.  A repeating instruction
+   updates its architectural registers once, when it completes.  The
+   fan-out exists so that the memops — which genuinely differ per
+   iteration — have somewhere to attach; the registers do not differ per
+   iteration in any sense a consumer may observe.
+
+   Publishing intermediate per-iteration values would misrepresent the
+   hardware in two ways that matter to anyone modelling a register file:
+   it would imply a rename allocation per iteration, which no machine
+   performs for a string or memory-copy instruction, and it would create
+   a serial dependency chain of length N through the counter and pointer
+   registers — turning a block copy that real hardware pipelines at many
+   bytes per cycle into N dependent steps.  Under this contract the N
+   entries are mutually independent: they all read the pre-completion
+   pointer and counter values, and one of them writes the result.
+
+   The value published on iteration N is the state the capture observed
+   after the instruction completed, published at the entry where it
+   becomes architecturally true.  It is not placed on iteration 1: that
+   would republish a later instant's state at an earlier one.
+
+   The rule is ISA-neutral and holds under every translation regime.
+   x86 ``REP`` string operations and AArch64 ``FEAT_MOPS``
+   (``CPYF*``/``SET*``) fan out through the same path and obey it, and a
+   single-iteration translation (``-icount``), which *could* read each
+   iteration's registers live, publishes the same single write in the
+   same place.
 
 What one iteration *is* differs by family, because only one of the two
 has an architectural iteration to count.
@@ -2517,9 +2554,11 @@ callbacks, which varies with how QEMU translated the instruction
 (``-icount``, single-step, ``EFLAGS.TF``, the interrupt shadow, a
 mid-REP exception).  The trailing re-entry a single-iteration
 translation makes after the final iteration contributes no entry.  A
-REP therefore renders the same entries, edges and memops under every
-translation, and on the wrong path — always single-stepped — as on the
-correct path.  A zero-count REP is a retired instruction and emits its
+REP therefore renders the same entries, edges, memops and
+destination-register writes under every translation, and on the wrong
+path — always single-stepped — as on the correct path.  The register
+half of that invariance is the rule above: exactly one destination
+write, on the final iteration, whatever the translation.  A zero-count REP is a retired instruction and emits its
 one entry, carrying no memops.
 
 A demand fault inside an iteration does not change the entry count

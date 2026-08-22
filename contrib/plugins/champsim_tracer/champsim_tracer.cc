@@ -4995,17 +4995,13 @@ void emit_body_entry(BodyStreamState *out_stream,
      * A looping translation captures only the instruction's END state,
      * which is the truth for the FINAL iteration and for no other; the
      * x86 REP families' stepping discipline determines every
-     * intermediate state, so the fan-out reconstructs them — the count
-     * register from its once-per-iteration decrement, a pointer
-     * register from the next iteration's own memop address, CMPS flags
-     * from the two values the iteration itself compared (available in
-     * memdata traces).  A slot no law covers is left ABSENT (width 0)
-     * on the non-final iterations and counted, never guessed; the
-     * final iteration carries the captured END state verbatim (CMPS
-     * flags excepted — RF is still set there, see rep_fill_iter_snaps).
-     * The single-iteration translation (-icount) captures the same
-     * values live; the reconstruction is what keeps the wire
-     * clock-invariant.
+     * intermediate state, and the wire does not publish one: a
+     * repeating instruction updates its architectural registers ONCE,
+     * on completion, so iterations 1..N-1 carry NO destination register
+     * write and iteration N carries the instruction's observed result
+     * (#174).  That is what keeps the wire clock-invariant — the
+     * single-iteration (-icount) translation, which could read each
+     * iteration live, publishes the same one write in the same place.
      */
     BBTemplate *rep_sub = bb_tmpl
         ? g_template_store.seg_deref(bb_tmpl->rep_subtmpl)
@@ -5386,276 +5382,75 @@ void emit_body_entry(BodyStreamState *out_stream,
                 };
 
                 /*
-                 * Per-iteration destination-register reconstruction
-                 * (#138).  Each fanned-out entry owes the same reg-data
-                 * contract as any other entry: the destination values
-                 * ITS OWN iteration produced.  The looping translation
-                 * captured only the END state — iteration N's truth —
-                 * so iterations 1..N-1 are rebuilt from the stepping
-                 * laws the END state and the entry's own memop stream
-                 * pin down exactly:
+                 * REGISTER CONTRACT FOR A FANNED-OUT SELF-LOOP (#174).
                  *
-                 *   COUNTER  (x86 RCX): one decrement per executed
-                 *     iteration, so iteration k retires END + (N-1-k).
-                 *   POINTER  (RSI/RDI): a pointer's post-iteration
-                 *     value IS the address its next iteration accesses,
-                 *     already recorded in the memop stream; matched to
-                 *     its stream by a fixed per-iteration stride that
-                 *     the END value must seal, refused otherwise.
-                 *   CMPFLAGS (CMPS): the compare of the two values the
-                 *     iteration loaded, recomputable when the memop
-                 *     values were captured (memdata); non-arithmetic
-                 *     bits ride from the END state, and RF is set while
-                 *     the repetition is architecturally in flight — the
-                 *     same mid-repetition state a single-iteration
-                 *     translation captures live.  Self-checked: the law
-                 *     must reproduce the END state's arithmetic bits
-                 *     from the final iteration's data or it is refused.
+                 * The fan-out is a deliberate deviation: ONE architectural
+                 * instruction is rendered as N entries so that the memops,
+                 * which genuinely differ per iteration, have somewhere to
+                 * attach.  Its REGISTERS are not like its memops.  A
+                 * repeating instruction updates its architectural registers
+                 * ONCE, when it completes; the per-iteration values a
+                 * looping translation never materialises are not
+                 * architectural state a consumer may observe, and no real
+                 * machine renames a destination per iteration.
                  *
-                 * A slot no law covers (SCAS/LODS accumulator-coupled
-                 * slots, a compare without captured values, a refuted
-                 * stream) stays ABSENT (width 0) on non-final
-                 * iterations and is counted — absence, never a guess.
-                 * Gated to x86 (arch_known implies the x86 publication
-                 * channel; the counter/pointer laws are REP semantics,
-                 * not MOPS semantics).
+                 * Publishing them would inject two fictions into every
+                 * consumer that models a register file: rename pressure
+                 * proportional to the iteration count, and a SERIAL
+                 * dependency chain of length N through RCX/RSI/RDI — turning
+                 * a block copy that hardware pipelines at many bytes per
+                 * cycle into N dependent steps.  So:
+                 *
+                 *   iterations 1 .. N-1 publish NO destination register
+                 *   write; iteration N publishes the instruction's whole
+                 *   architectural result.
+                 *
+                 * The value placed on iteration N is the END state the
+                 * capture actually observed (sampled once, at the successor
+                 * instruction's pre-execution snapshot, after every
+                 * iteration has run).  It is published at the entry where it
+                 * was observed and where it becomes architecturally true —
+                 * putting it on iteration 1 would republish a later
+                 * instant's state at an earlier one, the defect shape of
+                 * #79.  Nothing is derived and nothing is invented: the one
+                 * published value is read, and the absent ones are absent
+                 * because the instruction did not produce them yet.
+                 *
+                 * Sources are untouched — every iteration reads its
+                 * pointers and counter, so all N entries keep their source
+                 * registers and stay independent of one another.
+                 *
+                 * ISA-neutral by construction: x86 REP and AArch64
+                 * FEAT_MOPS fan out through this same path and obey the
+                 * same contract, with no per-family law to write.
+                 *
+                 * IFRAME-safe: emit_iframe_if_due re-encodes the CP
+                 * register families from the PERSISTENT overlay, not from
+                 * the entry's snaps, so an entry that publishes no register
+                 * write re-encodes to the running state (the pre-completion
+                 * values) rather than to template defaults.
                  */
-                enum class RepRegLawKind : uint8_t {
-                    Absent, Counter, Pointer, CmpFlags
-                };
-                struct RepRegLaw {
-                    RepRegLawKind kind = RepRegLawKind::Absent;
-                    unsigned pos   = 0;  /* Pointer: memop position     */
-                    unsigned pos_a = 0;  /* CmpFlags: minuend load      */
-                    unsigned pos_b = 0;  /* CmpFlags: subtrahend load   */
-                };
-                constexpr uint64_t REP_X86_ARITH_FLAGS = 0x8d5;
-                constexpr uint64_t REP_X86_RF_FLAG     = 0x10000;
                 unsigned n_dst = lf->n_dst_regs;
-                bool fan_regs = false;
                 RegSnap rep_end_snaps[MAX_DST_REGS];
-                RepRegLaw rep_laws[MAX_DST_REGS];
-                /* Position j of iteration k in the REP memop stream.  A
-                 * fault-merged slice carries the aborted attempt as a
-                 * prefix; the re-executed (real) accesses are the LAST
-                 * mpi of the slice, so index from the top. */
-                auto rep_pos_dp = [&](size_t k, unsigned j)
-                        -> const DynParam * {
-                    size_t lo, hi;
-                    rep_slice(k, lo, hi);
-                    if (hi < lo + mpi) {
-                        return nullptr;
-                    }
-                    return &rep_dps[hi - mpi + j];
-                };
-                /* x86 CMP arithmetic flags of (a - b) at element width
-                 * @wb bytes: CF, PF, AF, ZF, SF, OF. */
-                auto rep_cmp_flags = [](uint64_t a, uint64_t b,
-                                        unsigned wb) -> uint64_t {
-                    unsigned bits = wb * 8;
-                    uint64_t mask = bits >= 64 ? ~UINT64_C(0)
-                                    : (UINT64_C(1) << bits) - 1;
-                    a &= mask;
-                    b &= mask;
-                    uint64_t r = (a - b) & mask;
-                    uint64_t msb = UINT64_C(1) << (bits - 1);
-                    uint64_t f = 0;
-                    if (a < b)                    f |= 0x001;   /* CF */
-                    uint8_t p = (uint8_t)r;
-                    p ^= p >> 4;
-                    p ^= p >> 2;
-                    p ^= p >> 1;
-                    if (!(p & 1))                 f |= 0x004;   /* PF */
-                    if ((a ^ b ^ r) & 0x10)       f |= 0x010;   /* AF */
-                    if (r == 0)                   f |= 0x040;   /* ZF */
-                    if (r & msb)                  f |= 0x080;   /* SF */
-                    if ((a ^ b) & (a ^ r) & msb)  f |= 0x800;   /* OF */
-                    return f;
-                };
-                if (g_features.reg_data && arch_known &&
-                    trace_isa == TRACE_ISA_X86 && n_dst > 0 &&
-                    entry.reg_snaps.size() >= n_dst &&
-                    rep_sub->n_insns == 1 &&
-                    rep_sub->insn_fields[0].n_dst_regs == n_dst) {
+                bool rep_regs = (g_features.reg_data && n_dst > 0 &&
+                                 n_dst <= MAX_DST_REGS &&
+                                 entry.reg_snaps.size() >= n_dst);
+                if (rep_regs) {
+                    /* The REP is the parent BB's LAST instruction, so its
+                     * destination slots are the tail of the parent's
+                     * positional snap vector.  Lift the observed END state
+                     * out for iteration N, and leave the parent (iteration
+                     * 1) publishing no write for those slots. */
+                    RegSnap *tail = entry.reg_snaps.data() +
+                                    (entry.reg_snaps.size() - n_dst);
                     for (unsigned d = 0; d < n_dst; d++) {
-                        rep_end_snaps[d] = entry.reg_snaps[
-                            entry.reg_snaps.size() - n_dst + d];
+                        rep_end_snaps[d] = tail[d];
+                        cst_wide_zero(&tail[d].value);
+                        tail[d].width_bytes = 0;
                     }
-                    /* Stream uniformity: every iteration must expose
-                     * its mpi real accesses for the memop-anchored
-                     * laws; the counter law needs only the END state. */
-                    bool pos_ok = true;
-                    for (size_t k = 0; k < n_iter && pos_ok; k++) {
-                        pos_ok = rep_pos_dp(k, 0) != nullptr;
-                    }
-                    for (unsigned d = 0; d < n_dst; d++) {
-                        const RegSnap &es = rep_end_snaps[d];
-                        RepRegLaw law;
-                        uint8_t gid = lf->dst_regs[d];
-                        if (es.width_bytes == 0) {
-                            /* No END truth for this slot. */
-                        } else if (gid == REG_GPR1) {
-                            law.kind = RepRegLawKind::Counter;
-                        } else if (gid != REG_FLAGS && pos_ok) {
-                            uint64_t end_lo = es.value.limb[0];
-                            for (unsigned j = 0; j < mpi; j++) {
-                                uint64_t stride =
-                                    rep_pos_dp(1, j)->value -
-                                    rep_pos_dp(0, j)->value;
-                                if (stride == 0) {
-                                    continue;
-                                }
-                                bool uniform = true;
-                                for (size_t k = 1; k + 1 < n_iter; k++) {
-                                    if (rep_pos_dp(k + 1, j)->value -
-                                        rep_pos_dp(k, j)->value != stride) {
-                                        uniform = false;
-                                        break;
-                                    }
-                                }
-                                if (!uniform ||
-                                    rep_pos_dp(n_iter - 1, j)->value +
-                                    stride != end_lo) {
-                                    continue;
-                                }
-                                if (law.kind == RepRegLawKind::Pointer) {
-                                    /* Second matching stream: harmless
-                                     * only if byte-identical (CMPS with
-                                     * equal pointers); ambiguous
-                                     * otherwise — refuse. */
-                                    bool same = true;
-                                    for (size_t k = 0;
-                                         k < n_iter && same; k++) {
-                                        same = rep_pos_dp(k, j)->value ==
-                                               rep_pos_dp(k, law.pos)->value;
-                                    }
-                                    if (!same) {
-                                        law.kind = RepRegLawKind::Absent;
-                                        break;
-                                    }
-                                } else {
-                                    law.kind = RepRegLawKind::Pointer;
-                                    law.pos  = j;
-                                }
-                            }
-                        }
-                        rep_laws[d] = law;
-                    }
-                    /* Second pass: CMPS flags.  Needs the two pointer
-                     * laws to name which load stream is which operand
-                     * ([RSI] - [RDI]). */
-                    for (unsigned d = 0; d < n_dst; d++) {
-                        if (lf->dst_regs[d] != REG_FLAGS ||
-                            rep_end_snaps[d].width_bytes == 0 ||
-                            !pos_ok || mpi != 2 || !lf->writes_int_flags) {
-                            continue;
-                        }
-                        int pa = -1, pb = -1;
-                        for (unsigned e = 0; e < n_dst; e++) {
-                            if (rep_laws[e].kind != RepRegLawKind::Pointer) {
-                                continue;
-                            }
-                            if (lf->dst_regs[e] == REG_GPR4) {
-                                pa = (int)rep_laws[e].pos;   /* RSI */
-                            } else if (lf->dst_regs[e] == REG_GPR5) {
-                                pb = (int)rep_laws[e].pos;   /* RDI */
-                            }
-                        }
-                        if (pa < 0 || pb < 0) {
-                            continue;
-                        }
-                        /* Both streams must be loads carrying values of
-                         * one uniform element width. */
-                        uint8_t elem = rep_pos_dp(0, (unsigned)pa)->data_size;
-                        bool usable = elem > 0 && elem <= 8;
-                        for (size_t k = 0; k < n_iter && usable; k++) {
-                            const DynParam *da = rep_pos_dp(k, (unsigned)pa);
-                            const DynParam *db = rep_pos_dp(k, (unsigned)pb);
-                            usable = da->type == DYN_LOAD_ADDR &&
-                                     db->type == DYN_LOAD_ADDR &&
-                                     da->data_size == elem &&
-                                     db->data_size == elem;
-                        }
-                        if (!usable) {
-                            continue;
-                        }
-                        /* Self-check against the END state's own
-                         * arithmetic bits. */
-                        uint64_t end_fl = rep_end_snaps[d].value.limb[0];
-                        uint64_t chk = rep_cmp_flags(
-                            rep_pos_dp(n_iter - 1, (unsigned)pa)->data.limb[0],
-                            rep_pos_dp(n_iter - 1, (unsigned)pb)->data.limb[0],
-                            elem);
-                        if ((end_fl & REP_X86_ARITH_FLAGS) != chk) {
-                            continue;
-                        }
-                        rep_laws[d].kind  = RepRegLawKind::CmpFlags;
-                        rep_laws[d].pos_a = (unsigned)pa;
-                        rep_laws[d].pos_b = (unsigned)pb;
-                    }
-                    for (unsigned d = 0; d < n_dst; d++) {
-                        if (rep_laws[d].kind == RepRegLawKind::Absent) {
-                            g_stats.rep_fanout_reg_slots_underived++;
-                        }
-                    }
-                    g_stats.rep_fanout_reg_iters_reconstructed += n_iter;
-                    fan_regs = true;
+                    g_stats.rep_fanout_reg_writes_deferred +=
+                        (uint64_t)(n_iter - 1);
                 }
-                /* Iteration k's destination snapshots (0-based).  The
-                 * final iteration is the captured END state verbatim for
-                 * every law EXCEPT CmpFlags: the state after the final
-                 * counted iteration still carries RF, because the
-                 * instruction completes (and drops RF) only in the
-                 * trailing zero-count pass — which the wire deliberately
-                 * does not render (rep_trailing_pass_dropped), and which
-                 * the single-iteration translation's capture therefore
-                 * has not yet executed.  The END capture's RF-clear
-                 * belongs to that unrendered pass. */
-                auto rep_fill_iter_snaps = [&](size_t k, RegSnap *out) {
-                    for (unsigned d = 0; d < n_dst; d++) {
-                        const RegSnap &es = rep_end_snaps[d];
-                        const RepRegLaw &law = rep_laws[d];
-                        if (law.kind == RepRegLawKind::CmpFlags) {
-                            const DynParam *da = rep_pos_dp(k, law.pos_a);
-                            const DynParam *db = rep_pos_dp(k, law.pos_b);
-                            uint64_t fl = rep_cmp_flags(da->data.limb[0],
-                                                        db->data.limb[0],
-                                                        da->data_size);
-                            fl |= es.value.limb[0] &
-                                  ~(REP_X86_ARITH_FLAGS | REP_X86_RF_FLAG);
-                            fl |= REP_X86_RF_FLAG;  /* still in flight */
-                            RegSnap s;
-                            s.value = cst_wide_from_u64(fl);
-                            s.width_bytes = es.width_bytes;
-                            out[d] = s;
-                            continue;
-                        }
-                        if (k == n_iter - 1) {
-                            out[d] = es;
-                            continue;
-                        }
-                        RegSnap s;
-                        cst_wide_zero(&s.value);
-                        s.width_bytes = 0;
-                        switch (law.kind) {
-                        case RepRegLawKind::Counter:
-                            s.value = es.value;
-                            s.value.limb[0] = es.value.limb[0] +
-                                              (uint64_t)(n_iter - 1 - k);
-                            s.width_bytes = es.width_bytes;
-                            break;
-                        case RepRegLawKind::Pointer:
-                            s.value = cst_wide_from_u64(
-                                rep_pos_dp(k + 1, law.pos)->value);
-                            s.width_bytes = es.width_bytes;
-                            break;
-                        default:
-                            break;
-                        }
-                        out[d] = s;
-                    }
-                };
-
                 /* Iter 1: parent BB template + non-REP memops + iteration
                  * 0's slice. */
                 entry.dyn_params = std::move(other_dps);
@@ -5668,14 +5463,10 @@ void emit_body_entry(BodyStreamState *out_stream,
                 /* n_iter > 1 here, so iter 1 always loops. */
                 entry.branch_successor_pc    = rep_loop_pc;
                 entry.branch_successor_known = rep_exit_known;
-                /* The parent renders iteration 1, so its REP-insn snap
-                 * slots carry iteration 1's post-state — not the whole
-                 * instruction's END state, which belongs to the final
-                 * iteration alone (#138). */
-                if (fan_regs) {
-                    rep_fill_iter_snaps(0, entry.reg_snaps.data() +
-                                           (entry.reg_snaps.size() - n_dst));
-                }
+                /* The parent renders iteration 1, which publishes no
+                 * destination register write (#174): its REP slots were
+                 * cleared above and the instruction's result rides
+                 * iteration N. */
                 if (out_stream) {
                     body_stream_write_entry(out_stream, &entry);
                 }
@@ -5795,15 +5586,26 @@ void emit_body_entry(BodyStreamState *out_stream,
                  * Positionally sound: a dedup parent is provably 1-insn,
                  * so its reg_snaps are exactly insn 0's destination
                  * slots, matching the 1-insn sub template. */
-                if (fan_regs) {
-                    sub_e.reg_snaps.resize(n_dst);
-                } else if (rep_sub == bb_tmpl && !entry.reg_snaps.empty()) {
-                    sub_e.reg_snaps = entry.reg_snaps;
+                if (rep_regs) {
+                    /* One slot per declared destination, all absent; the
+                     * final iteration below fills them with the observed
+                     * END state.  A sized-but-absent vector (rather than an
+                     * empty one) keeps the positional contract that
+                     * build_entry_view indexes by. */
+                    sub_e.reg_snaps.assign(n_dst, RegSnap{});
+                    for (unsigned d = 0; d < n_dst; d++) {
+                        cst_wide_zero(&sub_e.reg_snaps[d].value);
+                        sub_e.reg_snaps[d].width_bytes = 0;
+                    }
                 }
                 for (size_t k = 1; k < n_iter; k++) {
                     sub_e.seq_num = g_trace_segments.next_seq_num();
-                    if (fan_regs) {
-                        rep_fill_iter_snaps(k, sub_e.reg_snaps.data());
+                    if (rep_regs && k == n_iter - 1) {
+                        /* Iteration N: the instruction completes here, so
+                         * this entry carries the architectural result. */
+                        for (unsigned d = 0; d < n_dst; d++) {
+                            sub_e.reg_snaps[d] = rep_end_snaps[d];
+                        }
                     }
                     sub_e.dyn_params.clear();
                     size_t sk, ek;
@@ -5832,6 +5634,39 @@ void emit_body_entry(BodyStreamState *out_stream,
             if (bb_tmpl && !bb_tmpl->is_system && arch_known &&
                 n_iter == 1 && !rep_retired && !efacts.reenter) {
                 g_stats.wire_user_rep_extra_insns += 1;
+            }
+            /* THE SAME REGISTER CONTRACT, ENFORCED ON THE OTHER
+             * TRANSLATION REGIME (#174).  A single-iteration translation
+             * (-icount, singlestep, TF) delivers each iteration as its own
+             * execution, so this path COULD publish the live per-iteration
+             * registers it just read — and did, which made the wire's
+             * register content depend on how QEMU chose to translate.  An
+             * execution that re-enters the same repeating instruction is
+             * not its final iteration, so it publishes no destination
+             * write; the completing execution (the one that does not
+             * re-enter) carries the architectural result.  The rule is the
+             * same one the fan-out above applies, so both regimes render
+             * one write, in the same place.
+             *
+             * The discriminator is COMPLETION, not re-entry.  The last
+             * counted iteration also re-enters — into the trailing
+             * zero-count pass that contributes no entry — so gating on
+             * re-entry alone would suppress every iteration and the
+             * result would reach no entry at all.  efacts.complete marks
+             * the execution that retired the instruction, which is the
+             * last one that renders. */
+            if (efacts.reenter && !rep_retired && g_features.reg_data && lf &&
+                lf->n_dst_regs > 0 && !entry.reg_snaps.empty()) {
+                unsigned nd = lf->n_dst_regs;
+                if (entry.reg_snaps.size() >= nd) {
+                    RegSnap *tail = entry.reg_snaps.data() +
+                                    (entry.reg_snaps.size() - nd);
+                    for (unsigned d = 0; d < nd; d++) {
+                        cst_wide_zero(&tail[d].value);
+                        tail[d].width_bytes = 0;
+                    }
+                    g_stats.rep_fanout_reg_writes_deferred += 1;
+                }
             }
         }
     }

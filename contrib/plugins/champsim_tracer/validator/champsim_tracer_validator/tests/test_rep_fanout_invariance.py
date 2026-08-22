@@ -299,7 +299,8 @@ class RepFanoutInvarianceTest(unittest.TestCase):
         out = work / tag
         run = subprocess.run(
             [str(QEMU_BIN), "-plugin",
-             f"{PLUGIN_SO},outfile={out},{wp},memdata=1", str(binp)],
+             f"{PLUGIN_SO},outfile={out},{wp},memdata=1,regdata=1",
+             str(binp)],
             text=True, capture_output=True, timeout=600)
         self.assertEqual(run.returncode, 0,
                          f"{tag}: guest exited {run.returncode}\n"
@@ -328,6 +329,44 @@ class RepFanoutInvarianceTest(unittest.TestCase):
         m = _STATS_HEAD.search(stats_text)
         assert m, "stats log has no host_icount line"
         return int(m.group(1))
+
+    @staticmethod
+    def _reg_writes(templates, entries, rep_pc: int):
+        """Destination-register writes the REP at @rep_pc publishes, per entry.
+
+        Returns one integer per correct-path entry rendering that
+        instruction, in order: how many of its destination slots carry a
+        captured write.  A slot that carries one renders with a width
+        (``:w=N``); a slot the instruction has not yet produced renders
+        with no width at all, which is how the wire says "not yet".
+
+        The contract (format.rst, fan-out sub-template rule 4) is that a
+        self-looping instruction publishes its destination writes ONCE, on
+        the entry where it completes -- so the expected shape is zeros
+        followed by exactly one nonzero, at the end.
+        """
+        by_id = {t["template_id"]: t for t in templates}
+
+        def carries_rep(tmpl):
+            for i, ins in enumerate(tmpl.get("insns") or []):
+                if int(ins.get("pc", -1)) == rep_pc:
+                    return i
+            return None
+
+        out = []
+        for e in entries:
+            tmpl = by_id.get(e.get("template_id"))
+            if tmpl is None:
+                continue
+            idx = carries_rep(tmpl)
+            if idx is None:
+                continue
+            out.append(sum(
+                1 for r in (e.get("reg_snaps") or [])
+                if int(r.get("insn_index", -1)) == idx
+                and r.get("kind") == "dst"
+                and (r.get("width_bytes") or 0) > 0))
+        return out
 
     @staticmethod
     def _render(templates, entries, rep_pc: int):
@@ -486,6 +525,41 @@ class RepFanoutInvarianceTest(unittest.TestCase):
                     self._branch_types(trg_t, pc),
                     f"{label}: the instruction's branch_type differs between "
                     "the two translations")
+
+                # The register contract, in both translation regimes.
+                # Its whole point is that it does NOT depend on how QEMU
+                # chose to translate the instruction: a REP publishes one
+                # set of destination writes, on the entry that completes
+                # it, whether the loop ran as one execution or as N.
+                ctl_w = self._reg_writes(ctl_t, ctl_e, pc)
+                trg_w = self._reg_writes(trg_t, trg_e, pc)
+                self.assertEqual(
+                    ctl_w, trg_w,
+                    f"{label}: where this REP publishes its destination "
+                    f"register writes changed with how QEMU translated "
+                    f"it.\n  can_loop=true : {ctl_w}\n"
+                    f"  can_loop=false: {trg_w}\n"
+                    "Each number is how many destination slots that entry "
+                    "carries a captured write for.  A regime-dependent "
+                    "answer means the wire's register content is a "
+                    "function of a QEMU setting, not of the guest.")
+                for tag, w in (("can_loop=true", ctl_w),
+                               ("can_loop=false", trg_w)):
+                    self.assertTrue(
+                        all(x == 0 for x in w[:-1]),
+                        f"{label} ({tag}): an iteration before the last "
+                        f"published a destination register write: {w}.  "
+                        "The intermediate values of a self-looping "
+                        "instruction are not architectural results -- "
+                        "publishing them invents rename pressure and a "
+                        "serial dependency chain the hardware never has.")
+                    self.assertGreater(
+                        w[-1], 0,
+                        f"{label} ({tag}): the entry that COMPLETES this "
+                        f"REP published no destination register write: "
+                        f"{w}.  The instruction's architectural result "
+                        "reached no entry at all, so a consumer cannot "
+                        "see what it produced.")
 
                 mpi = EXPECT_MPI[label]
                 for shape in ctl_cp:

@@ -1582,6 +1582,43 @@ Wrong-path syscalls: fetched, never performed
    the deterministic placeholder the walker already applies to a skipped
    instruction's destinations.
 
+AArch64: PAN does not apply to a debug read
+------------------------------------------
+
+The content gate that decides whether the currently-executing address space
+is the marked process reads the marker bytes at their pinned virtual address
+through ``qemu_plugin_read_memory_vaddr`` — which goes to
+``cpu_memory_rw_debug``, the same accessor the gdbstub uses.
+
+On AArch64 that read failed whenever the vCPU was privileged with
+``PSTATE.PAN`` set.  ``get_S1prot`` applied the PAN restriction on every S1
+walk, including the ones flagged ``ptw->in_debug``, so a kernel-side read of a
+user address returned "unreadable".  The gate has no way to tell that answer
+apart from "the marker is not here", latched off, and — because refreshes are
+driven by address-space writes — stayed off for the remainder of the traced
+process's run.  The measured consequence was a system capture that recorded 19
+of its 384 user instructions and still closed cleanly on END: a silent
+invalidation, on roughly one boot in sixteen under host load.
+
+PAN exists so that a kernel cannot follow a user pointer by accident.  A
+debugger, a gdbstub client and a TCG plugin are none of those, and they ask
+precisely because the vCPU is stopped somewhere that cannot look; ``x/16x
+$user_ptr`` in gdb fails for the same reason.  x86 is the comparison that
+settles which side is the outlier: ``x86_cpu_get_phys_page_attrs_debug`` walks
+the tables and returns a physical address without consulting SMAP or even the
+U/S bit.
+
+``get_S1prot`` therefore skips the PAN and PAN3/EPAN clauses when
+``ptw->in_debug``.  ``in_debug`` is set only by the two debug entry points and
+never reaches the TLB-fill path a real access takes, so an EL1 load to a user
+address still faults exactly as it did before.
+
+Verified on the conditional denominator, which is the one that means anything
+here: before the change every boot that entered the condition (an
+address-space refresh during the traced window) truncated — 5 of 5 — and every
+boot that did not was complete, 75 of 75.  After it, 22 boots entered the same
+condition and none truncated, across 216 boots with no validator failures.
+
 x86 lazy-flags resolution for plugin reads
 ------------------------------------------
 

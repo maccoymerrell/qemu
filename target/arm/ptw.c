@@ -84,7 +84,8 @@ static bool get_phys_addr_gpc(CPUARMState *env, S1Translate *ptw,
 
 static int get_S1prot(CPUARMState *env, ARMMMUIdx mmu_idx, bool is_aa64,
                       int user_rw, int prot_rw, int xn, int pxn,
-                      ARMSecuritySpace in_pa, ARMSecuritySpace out_pa);
+                      ARMSecuritySpace in_pa, ARMSecuritySpace out_pa,
+                      bool in_debug);
 
 /* This mapping is common between ID_AA64MMFR0.PARANGE and TCR_ELx.{I}PS. */
 static const uint8_t pamax_map[] = {
@@ -1251,7 +1252,8 @@ static bool get_phys_addr_v6(CPUARMState *env, S1Translate *ptw,
         }
 
         result->f.prot = get_S1prot(env, mmu_idx, false, user_rw, prot_rw,
-                                    xn, pxn, result->f.attrs.space, out_space);
+                                    xn, pxn, result->f.attrs.space, out_space,
+                                    ptw->in_debug);
         if (!(result->f.prot & (1 << access_type))) {
             /* Access permission fault.  */
             fi->type = ARMFault_Permission;
@@ -1336,7 +1338,8 @@ static int get_S2prot(CPUARMState *env, int s2ap, int xn, bool s1_is_el0)
  */
 static int get_S1prot(CPUARMState *env, ARMMMUIdx mmu_idx, bool is_aa64,
                       int user_rw, int prot_rw, int xn, int pxn,
-                      ARMSecuritySpace in_pa, ARMSecuritySpace out_pa)
+                      ARMSecuritySpace in_pa, ARMSecuritySpace out_pa,
+                      bool in_debug)
 {
     ARMCPU *cpu = env_archcpu(env);
     bool is_user = regime_is_user(env, mmu_idx);
@@ -1356,7 +1359,21 @@ static int get_S1prot(CPUARMState *env, ARMMMUIdx mmu_idx, bool is_aa64,
          * We make the IMPDEF choices that SCR_EL3.SIF and Realm EL2&0
          * do not affect EPAN.
          */
-        if (user_rw && regime_is_pan(env, mmu_idx)) {
+        if (in_debug) {
+            /*
+             * A debug access is not an architectural one.  PAN exists to
+             * stop the KERNEL from following a user pointer by accident;
+             * it says nothing about what a debugger, a gdbstub client or a
+             * TCG plugin may look at, and those readers ask precisely
+             * because the CPU is stopped in a context that cannot.  Left
+             * enforced, `x/16x $user_ptr` fails whenever the guest is in
+             * EL1 with PSTATE.PAN set, and a plugin that reads a user
+             * address to decide something about the current process gets
+             * "unreadable" for a reason that has nothing to do with the
+             * process.  in_debug never reaches the TLB-fill path a real
+             * access takes, so nothing architectural is relaxed here.
+             */
+        } else if (user_rw && regime_is_pan(env, mmu_idx)) {
             prot_rw = 0;
         } else if (cpu_isar_feature(aa64_pan3, cpu) && is_aa64 &&
                    regime_is_pan(env, mmu_idx) &&
@@ -2086,7 +2103,8 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
          * result->f.attrs retains a copy of the original security space.
          */
         result->f.prot = get_S1prot(env, mmu_idx, aarch64, user_rw, prot_rw,
-                                    xn, pxn, result->f.attrs.space, out_space);
+                                    xn, pxn, result->f.attrs.space, out_space,
+                                    ptw->in_debug);
 
         /* Index into MAIR registers for cache attributes */
         attrindx = extract32(attrs, 2, 3);

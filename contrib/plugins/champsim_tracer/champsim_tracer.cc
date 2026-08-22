@@ -8711,6 +8711,32 @@ static void events_path_step(unsigned int cpu_index, BBTemplate *cur_tb_tmpl,
                 if (g_user_icount > 0) {
                     g_user_icount--;
                 }
+                /* THE CORRECTION IS MIRRORED INTO THE BILL-SITE ROWS, or
+                 * they describe a clock nobody reads (#176).  The window
+                 * clock is the BBV-identical count -- user-space
+                 * correct-path instructions, one per architectural
+                 * instruction -- and this withhold is what makes it so
+                 * when a single-iteration translation dispatches a
+                 * repeating instruction N+1 times.  Leaving the two
+                 * bill-site rows uncorrected left them reading the
+                 * DISPATCH count: on a five-REP probe, 76 billed / 59
+                 * executed under -icount against 52 / 35 on the default
+                 * clock, for a guest that executed the same 35 user
+                 * instructions either way.  "user insns actually
+                 * executed" is an architectural statement, and a REP is
+                 * one instruction however many times QEMU re-enters it.
+                 *
+                 * Both are decremented, so their difference -- the
+                 * phantom bill, instructions the clock charged that no
+                 * instruction executed -- is preserved exactly (17 in
+                 * both regimes, before and after this change) rather than
+                 * being repaired in one term and broken in the other. */
+                if (g_stats.user_clock_billed_insns > 0) {
+                    g_stats.user_clock_billed_insns--;
+                }
+                if (g_stats.user_clock_retired_insns > 0) {
+                    g_stats.user_clock_retired_insns--;
+                }
                 g_stats.rep_clock_ticks_withheld++;
             }
             rs_clk.prev_tb_counted = user_owned;

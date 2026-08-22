@@ -344,9 +344,16 @@ struct Stats {
      * it as "the per-exec walk's own view", not as a checkpoint every
      * emission passes. */
     uint64_t cp_user_seal_insns = 0;
-    /* TBs whose delta was folded into g_user_icount, and the instructions
-     * folded.  wire_user_arch_insns minus this is the residual OWNED_CP vs
-     * user_covered was standing in for. */
+    /* Owned dispatches and the instructions the bill site charged them,
+     * @delta -- the TB-ENTRY credit, which counts a block's whole
+     * instruction count when the guest enters it.  NOT what the window
+     * clock folds: g_user_icount folds @delta_retired (what executed), and
+     * this row is kept as the phantom bill's numerator, this minus
+     * user_clock_retired_insns.  Both rows carry the REP self-loop
+     * withhold's correction (see the withhold in vcpu_tb_exec), so both
+     * count architectural instructions rather than dispatches and their
+     * difference is unchanged by it.  wire_user_arch_insns minus this is
+     * the residual OWNED_CP vs user_covered was standing in for. */
     uint64_t user_clock_billed_tbs = 0;
     uint64_t user_clock_billed_insns = 0;
     /* Bills whose delta did NOT equal the dispatched TB's own architectural

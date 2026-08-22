@@ -5448,7 +5448,7 @@ void emit_body_entry(BodyStreamState *out_stream,
                         cst_wide_zero(&tail[d].value);
                         tail[d].width_bytes = 0;
                     }
-                    g_stats.rep_fanout_reg_writes_deferred +=
+                    g_stats.rep_reg_writes_deferred +=
                         (uint64_t)(n_iter - 1);
                 }
                 /* Iter 1: parent BB template + non-REP memops + iteration
@@ -5635,6 +5635,29 @@ void emit_body_entry(BodyStreamState *out_stream,
                 n_iter == 1 && !rep_retired && !efacts.reenter) {
                 g_stats.wire_user_rep_extra_insns += 1;
             }
+            /* THE SURPLUS IS CREDITED WHERE AN EXTRA ENTRY IS PUBLISHED,
+             * NOT WHERE THE FAN-OUT RUNS (#173).  clock_minus_wire is
+             * (covered + surplus) - wire, and the wire carries one entry
+             * per iteration in BOTH translation regimes.  Crediting only
+             * inside the fan-out loop tied the term to a mechanism rather
+             * than to the fact it accounts for, so under -icount (where
+             * QEMU hands over one iteration per execution and the fan-out
+             * never runs) the credit never happened and the identity read
+             * exactly minus the uncredited surplus -- an accounting
+             * artifact indistinguishable, in the printed line, from a
+             * dropped instruction.
+             *
+             * A continuation pass -- one that re-enters the instruction
+             * and is not the execution that completed it -- publishes an
+             * entry the guest did not begin an instruction for.  There are
+             * n_iter - 1 of those per instruction, the same count the
+             * fan-out credits in one go, so the identity now holds in both
+             * regimes because both terms are right, NOT because a third
+             * term was folded in to cancel the error. */
+            if (bb_tmpl && !bb_tmpl->is_system && arch_known &&
+                efacts.reenter && !rep_retired) {
+                g_stats.wire_user_rep_extra_insns += 1;
+            }
             /* THE SAME REGISTER CONTRACT, ENFORCED ON THE OTHER
              * TRANSLATION REGIME (#174).  A single-iteration translation
              * (-icount, singlestep, TF) delivers each iteration as its own
@@ -5665,7 +5688,7 @@ void emit_body_entry(BodyStreamState *out_stream,
                         cst_wide_zero(&tail[d].value);
                         tail[d].width_bytes = 0;
                     }
-                    g_stats.rep_fanout_reg_writes_deferred += 1;
+                    g_stats.rep_reg_writes_deferred += 1;
                 }
             }
         }

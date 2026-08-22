@@ -968,9 +968,17 @@ struct Stats {
      *   its own PC (the same single-iteration translation jumps back before
      *   taking the zero-count exit); the emitted terminal edge was restored
      *   to the architectural fall-through.
-     * rep_fanout_reg_writes_deferred — fan-out iterations that published NO
-     *   destination register write, i.e. (iterations - 1) per fanned-out
-     *   self-loop (#174).  A repeating instruction updates its
+     * rep_reg_writes_deferred — iterations that published NO
+     *   destination register write, i.e. (iterations - 1) per repeating
+     *   instruction (#174).  NOT a fan-out counter, despite where the
+     *   larger share of it is counted: a single-iteration translation
+     *   (-icount, single-step, TF, an interrupt shadow) never takes the
+     *   fan-out path, yet each of its continuation passes defers a write
+     *   just the same, so this reads the SAME total in both regimes while
+     *   rep_fanout reads that total and zero.  Naming it for the fan-out
+     *   would attribute the deferral to a mechanism that did not run —
+     *   the mistake #173 records on the surplus term.  A repeating
+     *   instruction updates its
      *   architectural registers ONCE, on completion; the fan-out renders
      *   one entry per iteration only so the per-iteration memops have
      *   somewhere to attach, and iteration N carries the whole
@@ -983,7 +991,7 @@ struct Stats {
     uint64_t rep_iters_memop_mismatch = 0;
     uint64_t rep_trailing_pass_dropped = 0;
     uint64_t rep_exit_edge_recovered = 0;
-    uint64_t rep_fanout_reg_writes_deferred = 0;
+    uint64_t rep_reg_writes_deferred = 0;
     /* rep_piece_table_degenerate — a fault-split REP emission arrived with a
      * per-piece prefix table it could not use, so the emission fell back to
      * the total-based split rather than mis-place slices.

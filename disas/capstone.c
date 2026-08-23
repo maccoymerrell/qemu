@@ -436,6 +436,22 @@ static bool cap_x86_is_ssp_read(const char *mnem);
 static bool cap_x86_is_x87_tag_only(const char *mnem);
 static const char *cap_x86_mnem_stem(const char *mnem);
 static bool cap_x86_is_cmov(const char *mnem);
+
+/*
+ * The EVEX prefix's own view of an instruction, decoded from the
+ * encoding rather than from Capstone's operand table -- see
+ * cap_x86_evex_classify for why the table cannot be trusted here.
+ */
+typedef struct {
+    bool is_evex;    /* the encoding really carries an EVEX prefix     */
+    bool merging;    /* EVEX.aaa != 0 and EVEX.z == 0: merge-masking   */
+    int  mask_idx;   /* operand index of the {kN} writemask, or -1     */
+    int  dest_idx;   /* AT&T dest-last with the writemask excluded, -1 */
+} cap_x86_evex;
+
+static void cap_x86_evex_classify(const cs_insn *insn, uint8_t n,
+                                  cap_x86_evex *e);
+static bool cap_x86_reg_is_vector(unsigned int reg);
 static void cap_x86_add_implicit(qemu_plugin_insn_info *out, csh handle,
                                  unsigned int reg, bool is_write);
 
@@ -576,6 +592,11 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
      * cap_x86_is_cmov. */
     bool cmov = cap_x86_is_cmov(insn->mnemonic);
     bool fcmov = cmov && cap_x86_mnem_stem(insn->mnemonic)[0] == 'f';
+    /* Capstone-6.0.0-Alpha7 access-flag bugs on the EVEX prefix: the
+     * write-mask operand always comes back access == 0, and on some
+     * iforms the whole operand list does — see cap_x86_evex_classify. */
+    cap_x86_evex evex;
+    cap_x86_evex_classify(insn, n, &evex);
 
     if (ktest_op || test_read || xadd_op) {
         cap_x86_add_implicit(out, handle, X86_REG_EFLAGS, true);
@@ -592,6 +613,26 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
         if (dest_last && cop->type != X86_OP_IMM) {
             op->access = (i == n - 1) ? QEMU_PLUGIN_OP_ACC_WRITE
                                       : QEMU_PLUGIN_OP_ACC_READ;
+        }
+        if (evex.is_evex) {
+            /* The writemask selects the lanes that are written, so a
+             * masked instruction reads it; a gather also zeroes it. */
+            if (i == evex.mask_idx) {
+                op->access = QEMU_PLUGIN_OP_ACC_READ
+                           | (gather ? QEMU_PLUGIN_OP_ACC_WRITE : 0);
+            } else if (op->access == 0 && cop->type != X86_OP_IMM) {
+                op->access = (i == evex.dest_idx)
+                           ? QEMU_PLUGIN_OP_ACC_WRITE
+                           : QEMU_PLUGIN_OP_ACC_READ;
+            }
+            /* Merge-masking keeps the suppressed lanes of a vector
+             * destination, so that destination is also a source. */
+            if (evex.merging && i != evex.mask_idx &&
+                cop->type == X86_OP_REG &&
+                cap_x86_reg_is_vector(cop->reg) &&
+                (op->access & QEMU_PLUGIN_OP_ACC_WRITE)) {
+                op->access |= QEMU_PLUGIN_OP_ACC_READ;
+            }
         }
         if (tag_only) {
             op->type = QEMU_PLUGIN_OP_INVALID;
@@ -647,7 +688,7 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
              * in leaves the correctly-reported READ and the destination's
              * own WRITE alone, and self-retires the moment Capstone marks
              * the mask written. */
-            if (gather && i == 0) {
+            if (gather && i == 0 && !evex.is_evex) {
                 op->access |= QEMU_PLUGIN_OP_ACC_WRITE;
             }
             /* The conditional-move destination -- last in AT&T order --
@@ -1049,6 +1090,132 @@ static bool cap_x86_is_cmov(const char *mnem)
 
     if (!stem[0]) return false;
     return g_str_has_prefix(stem, "cmov") || g_str_has_prefix(stem, "fcmov");
+}
+
+/*
+ * Capstone-6.0.0-Alpha7 access-flag bug workaround: the EVEX prefix.
+ *
+ * An EVEX-encoded instruction carries its write-mask register in
+ * EVEX.aaa rather than in the ModRM/VEX operand fields, and Capstone
+ * appends it as a trailing operand.  That operand comes back with
+ * access == 0 on EVERY masked EVEX encoding -- measured 2570 of 2570
+ * over the x86_64 opcode space -- so the walker, which contributes a
+ * register by its access flag, drops the mask and the trace records no
+ * dependency on it at all.  A masked instruction genuinely reads the
+ * mask: it selects which lanes are written.
+ *
+ * Two further shapes of the same defect strand operands other than the
+ * mask.  On 172 encodings the access flags of the WHOLE instruction are
+ * erased, which costs the memory operand its load lane as well as
+ * costing every register its role; the downstream fallback then reads
+ * AT&T order and takes the last register operand as the destination --
+ * which, on an EVEX encoding, is the write-mask, so the mask is
+ * published as a WRITE and the real vector destination becomes a
+ * source.  On a further 82 the instruction is annotated except for its
+ * destination, and that destination is an OPMASK register every time
+ * (VPTESTM*, VPTESTNM*, VPMOV*2M, VFPCLASS*, VPSHUFBITQMB), so the
+ * trace carries the compare but not the k register it produces.
+ *
+ * Both are the same repair: an EVEX operand Capstone left without an
+ * access takes its role from AT&T order once the write-mask is set
+ * aside.  Every one of those 254 operands is either the dest-last
+ * operand or a source, so the rule never has to guess.
+ *
+ * Both are repaired here, from the prefix rather than from a mnemonic
+ * list, because the prefix is what states the facts:
+ *
+ *   - EVEX.aaa names the writemask.  Non-zero means masked; the mask
+ *     is a READ.  Gathers additionally zero it on completion, so there
+ *     it is READ-WRITE (Intel SDM Vol. 2, VGATHERDPD "Operation").
+ *   - EVEX.z distinguishes merging from zeroing.  Under merge-masking
+ *     the lanes the mask suppresses keep the destination's previous
+ *     value, so a VECTOR register destination is read-modify-write.
+ *     XED reports exactly that and no more: RCW on a vector
+ *     destination, plain W on an opmask destination (whose suppressed
+ *     bits are zeroed, not preserved) and CW on a memory destination
+ *     (suppressed bytes are simply not written -- no load happens).
+ *     The repair therefore covers vector register destinations only.
+ *   - With the writemask set aside, the remaining operands follow the
+ *     ordinary AT&T dest-last rule, which is what recovers the
+ *     all-access-zero shape.
+ *
+ * Detection reads the encoding directly.  Capstone exposes no EVEX
+ * flag, and its operand table is precisely the thing under repair, so
+ * neither can be the source of truth.  0x62 introduces EVEX and is not
+ * a legal opcode in 64-bit mode; the two reserved-bit checks (P[3:2]
+ * must be 00, P[10] must be 1) reject the 32-bit BOUND that shares the
+ * byte.  The writemask operand is then accepted only when Capstone's
+ * own last operand IS k[EVEX.aaa], so a Capstone operand-order change
+ * retires the repair instead of misdirecting it.
+ */
+static void cap_x86_evex_classify(const cs_insn *insn, uint8_t n,
+                                  cap_x86_evex *e)
+{
+    const cs_x86 *x86 = &insn->detail->x86;
+
+    e->is_evex  = false;
+    e->merging  = false;
+    e->mask_idx = -1;
+    e->dest_idx = -1;
+
+    /* Skip the legacy prefixes EVEX may follow (segment override,
+     * address size); 66/F2/F3/REX are folded into EVEX itself and
+     * cannot appear, but skipping them costs nothing. */
+    uint16_t k = 0;
+    while (k < insn->size) {
+        uint8_t b = insn->bytes[k];
+        if (b == 0x26 || b == 0x2e || b == 0x36 || b == 0x3e ||
+            b == 0x64 || b == 0x65 || b == 0x66 || b == 0x67 ||
+            b == 0xf0 || b == 0xf2 || b == 0xf3) {
+            k++;
+        } else {
+            break;
+        }
+    }
+    if (k + 3 >= insn->size || insn->bytes[k] != 0x62) {
+        return;
+    }
+    uint8_t p0 = insn->bytes[k + 1];
+    uint8_t p1 = insn->bytes[k + 2];
+    uint8_t p2 = insn->bytes[k + 3];
+    if ((p0 & 0x0c) != 0 || (p1 & 0x04) == 0) {
+        return;                 /* reserved bits say this is not EVEX */
+    }
+    e->is_evex = true;
+
+    unsigned aaa = p2 & 0x07;
+    bool zeroing = (p2 & 0x80) != 0;
+
+    /* The writemask is Capstone's last operand -- but only trust that
+     * when the whole operand list survived truncation and the register
+     * it names is the one EVEX.aaa selects. */
+    if (aaa != 0 && n > 0 && x86->op_count == n) {
+        const cs_x86_op *last = &x86->operands[n - 1];
+        if (last->type == X86_OP_REG &&
+            last->reg >= X86_REG_K0 && last->reg <= X86_REG_K7 &&
+            (unsigned)(last->reg - X86_REG_K0) == aaa) {
+            e->mask_idx = n - 1;
+            e->merging = !zeroing;
+        }
+    }
+
+    for (int i = (int)n - 1; i >= 0; i--) {
+        if (i == e->mask_idx || x86->operands[i].type == X86_OP_IMM) {
+            continue;
+        }
+        e->dest_idx = i;
+        break;
+    }
+}
+
+/*
+ * Capstone's XMM / YMM / ZMM register ids are three contiguous banks.
+ * Used to keep the EVEX merge-masking preserve-read off opmask and
+ * memory destinations, which do not preserve.
+ */
+static bool cap_x86_reg_is_vector(unsigned int reg)
+{
+    return reg >= X86_REG_XMM0 && reg <= X86_REG_ZMM31;
 }
 
 static bool cap_x86_is_gather(const char *mnem)
@@ -3153,10 +3320,18 @@ static bool cap_riscv_is_tied_rd(const char *mnem)
  * from the scalar FP loads and stores that share those opcodes by the
  * width field -- vector uses 0b000/0b101/0b110/0b111 for 8/16/32/64-bit
  * elements, scalar FP uses 0b001/0b010/0b011/0b100 for h/w/d/q.
- * Nothing else in RVV 1.0 is encoded outside those three (the vector
- * AMOs that would have been were dropped before ratification), and
- * there are no compressed vector encodings, so a 2-byte instruction
- * cannot be one.
+ * The vector AMOs that would have been a fourth were dropped before
+ * ratification, and there are no compressed vector encodings, so a
+ * 2-byte instruction cannot be one.
+ *
+ * The ratified vector-crypto extensions then added a fourth: OP-VE
+ * (0b1110111), the major opcode Zvkned / Zvknh / Zvksh / Zvkg / Zvksed
+ * encode in, always with funct3 = 0b010.  Both authorities spell it
+ * out -- QEMU's target/riscv/insn32.decode gives all 21 of them
+ * `1110111` (vaes*, vsha2*, vsm3*, vghsh/vgmul, vsm4*), and the Sail
+ * model annotates the same encodings `OP-VE`.  Gated on funct3 so this
+ * claims the vector-crypto space and not the whole custom-3 slot that
+ * shares the opcode.
  */
 static bool cap_riscv_is_vector_encoding(const cs_insn *insn)
 {
@@ -3171,6 +3346,8 @@ static bool cap_riscv_is_vector_encoding(const cs_insn *insn)
     switch (word & 0x7f) {
     case 0x57:                              /* OP-V */
         return true;
+    case 0x77:                              /* OP-VE (vector crypto) */
+        return ((word >> 12) & 0x7) == 0x2; /* funct3 = OPMVV */
     case 0x07:                              /* LOAD-FP  */
     case 0x27:                              /* STORE-FP */
         switch ((word >> 12) & 0x7) {       /* width */
@@ -3185,6 +3362,25 @@ static bool cap_riscv_is_vector_encoding(const cs_insn *insn)
     default:
         return false;
     }
+}
+
+/*
+ * Is this Capstone register id a vector register?
+ *
+ * riscv_reg interleaves three vector runs with the GPR and FP files:
+ * the 32 singles V0..V31, the LMUL=2 aliases V0M2..V30M2, and the
+ * register GROUPS (V1_V2 .. V0_V1_V2_V3_V4_V5_V6_V7) a whole-register
+ * or segment form names in one operand.  Each run is contiguous and
+ * nothing else lives inside it, so the membership test is three range
+ * checks; the alternative -- naming 305 enumerators -- would have to be
+ * re-audited on every Capstone bump.
+ */
+static bool cap_riscv_is_vector_reg(uint16_t reg)
+{
+    return (reg >= RISCV_REG_V0 && reg <= RISCV_REG_V31)
+        || (reg >= RISCV_REG_V0M2 && reg <= RISCV_REG_V30M2)
+        || (reg >= RISCV_REG_V1_V2
+            && reg <= RISCV_REG_V0_V1_V2_V3_V4_V5_V6_V7);
 }
 
 /*
@@ -3733,6 +3929,119 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
             && out->operands[0].type == QEMU_PLUGIN_OP_REG) {
             out->operands[0].access |= QEMU_PLUGIN_OP_ACC_READ
                                      | QEMU_PLUGIN_OP_ACC_WRITE;
+        }
+        /*
+         * An RVV vector DESTINATION is also a source.
+         *
+         * A vector instruction does not write the whole of vd.  Three
+         * separate architectural rules leave part of it standing, and
+         * every one of them is settled at RUNTIME, by state a preceding
+         * `vsetvli` wrote and the encoding cannot name:
+         *
+         *   - tail-undisturbed (vtype.vta = 0): elements from vl up to
+         *     VLMAX keep their previous values;
+         *   - mask-undisturbed (vtype.vma = 0): masked-off elements keep
+         *     their previous values;
+         *   - prestart: elements below vstart are never written, whatever
+         *     vta and vma say.
+         *
+         * So there is no encoding for which the dependency can be ruled
+         * out, and under R5 -- a conditional form records every candidate
+         * -- vd is a source of the instruction.  This is the same shape as
+         * the mask-destination case the boundary already handled
+         * (cap_riscv_is_mask_dst), generalised: that one was singled out
+         * because write_vmask leaves the tail undisturbed unconditionally,
+         * which made it decidable without vtype.  The general case is not
+         * decidable in the other direction either -- "vd is not read" is
+         * exactly as much a runtime claim -- and a template that omits the
+         * read is a silent reduction (C4) rather than a neutral choice.
+         *
+         * Both authorities model it: Sail folds `vd_val` into
+         * `init_masked_result` before the element loop, and QEMU's
+         * vector helpers run `for (i = env->vstart; i < vl; i++)` and
+         * then fill the tail from vd via `vext_set_elems_1s(vd, vta, ..)`.
+         *
+         * The rule is structural, not a name list: any operand that the
+         * instruction WRITES and that names a vector register is also
+         * read.  It therefore cannot fire on the forms whose destination
+         * is a GPR or an FP register (`vcpop.m`, `vfirst.m`, `vmv.x.s`,
+         * `vfmv.f.s`, `vsetvli`) or on a store, whose vector operand is
+         * read-only to begin with.
+         */
+        if (cap_riscv_is_vector_encoding(insn)) {
+            for (uint8_t i = 0; i < n; i++) {
+                qemu_plugin_operand *op = &out->operands[i];
+                if (op->type == QEMU_PLUGIN_OP_REG
+                    && (op->access & QEMU_PLUGIN_OP_ACC_WRITE)
+                    && cap_riscv_is_vector_reg(op->reg_id)) {
+                    op->access |= QEMU_PLUGIN_OP_ACC_READ;
+                }
+            }
+        }
+        /*
+         * A segment load or store names nf vector registers, not one.
+         *
+         * `vlseg6e64.v v8, (a1)` transfers SIX fields per segment, and
+         * the fields live in six consecutive vector register groups
+         * starting at vd -- RVV v1.0 sec 7.8, and Sail says it in one
+         * call: VLSEGTYPE reads `read_vreg_seg(.., nf, vd)`, which loops
+         * `foreach (j from 0 to (nf - 1))` over `vregidx_offset(vrid,
+         * j * LMUL_reg)`, and writes back through the same offsets.
+         * Capstone names only the base, so five of the six registers a
+         * `vsseg6e64.v` reads -- and five of the six a `vlseg6e64.v`
+         * produces -- are absent from the trace: the consumer of v13
+         * never sees the load that wrote it.
+         *
+         * nf is in the encoding (bits 31:29, biased by one) for every
+         * vector load and store, so the group size is static here even
+         * though the per-field EMUL width is not; the boundary names one
+         * register per field, which is the same convention it already
+         * uses for the LMUL-sized operands elsewhere.
+         *
+         * The whole-register forms (`vl2re8.v`, `vs4r.v`) put nf in the
+         * same field but Capstone already reports THEIR group as one
+         * grouped register id, so the structural test is whether the
+         * operand names a single vector register: a group id means
+         * Capstone has already expanded it and this must not fire twice.
+         * The appended operands inherit the base operand's access, which
+         * by this point carries the vd-as-source correction above, so a
+         * segment load's fields come out read-and-written and a segment
+         * store's read-only, exactly as the base does.
+         */
+        if (insn->size == 4 && cap_riscv_is_vector_encoding(insn)
+            && n >= 1
+            && out->operands[0].type == QEMU_PLUGIN_OP_REG
+            && out->operands[0].reg_id >= RISCV_REG_V0
+            && out->operands[0].reg_id <= RISCV_REG_V31) {
+            uint32_t word = (uint32_t)insn->bytes[0] |
+                            ((uint32_t)insn->bytes[1] << 8) |
+                            ((uint32_t)insn->bytes[2] << 16) |
+                            ((uint32_t)insn->bytes[3] << 24);
+            unsigned major = word & 0x7f;
+            unsigned nf    = ((word >> 29) & 0x7) + 1;
+            if ((major == 0x07 || major == 0x27) && nf > 1) {
+                uint16_t base = out->operands[0].reg_id;
+                uint8_t access = out->operands[0].access;
+                for (unsigned k = 1; k < nf; k++) {
+                    qemu_plugin_operand *op;
+                    if (base + k > RISCV_REG_V31
+                        || out->n_operands
+                           >= QEMU_PLUGIN_INSN_DETAIL_MAX_OPS) {
+                        break;
+                    }
+                    op = &out->operands[out->n_operands];
+                    memset(op, 0, sizeof(*op));
+                    op->type   = QEMU_PLUGIN_OP_REG;
+                    op->access = access;
+                    op->reg_id = (uint16_t)(base + k);
+                    op->scale  = 1;
+                    cap_copy_reg_name(op->reg_name,
+                                      QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                                      handle, op->reg_id, cap_arch);
+                    out->n_operands++;
+                }
+                n = out->n_operands;
+            }
         }
         /*
          * Capstone 6.0.0-Alpha7 RVV vector-configuration bug workaround.

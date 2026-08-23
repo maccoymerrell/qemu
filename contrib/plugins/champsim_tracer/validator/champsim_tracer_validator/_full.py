@@ -2009,8 +2009,13 @@ def _chk_decode_fields(ctx: Ctx) -> Outcome:
     ruling 2026-08-09), so there the layer is a second opinion rather than
     the only one -- but a gated second opinion is worth more than an
     ungated one, and both residuals are now triaged into named families in
-    tools/isaxcheck_fields_allow.txt (riscv64 348 rows / six classes,
-    x86_64 1,339 rows / seven families).
+    tools/isaxcheck_fields_allow.txt (riscv64 1,845 rows / six causes,
+    x86_64 1,339 rows / seven families).  The riscv64 count is what it is
+    because the RVV, Zfa and Zicsr boundary repairs report per-mnemonic and
+    LLVM MC describes no implicit CSR or vector context at all; the rows
+    are deliberately EXPLICIT rather than globbed, so a repair that stops
+    happening for one mnemonic fails as a dead rule instead of hiding
+    behind a wildcard.
 
     ONE NUMBER IN THE SUMMARY LINE IS NOT A PASS: `size_gap=`.  Those are
     encodings where the two decoders consumed different byte counts, so

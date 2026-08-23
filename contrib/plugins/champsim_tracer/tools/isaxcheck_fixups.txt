@@ -499,3 +499,148 @@ aarch64 W-flow-added setp BRANCH_REP
 aarch64 W-flow-added setpn BRANCH_REP
 aarch64 W-flow-added setpt BRANCH_REP
 aarch64 W-flow-added setptn BRANCH_REP
+
+
+# The READ side of the RVV whole-register load group expansion.
+#
+# The `W-wr-added vl<nf>r*.v` rules above have carried the write side since
+# the group expansion landed.  The read side is newer and is not a second
+# expansion: it is the vd-as-source correction reaching the same operand.
+# `vl8re64.v v8, (a0)` is interruptible, and vstart is honoured -- elements
+# below vstart are NOT written (RVV v1.0 sec 7.9), so after a trap and
+# resume the low elements of the group keep their previous values and the
+# old vd is genuinely a source.  Capstone reports the group as ONE grouped
+# register id, so the boundary sees the primary id only and the dependency
+# model expands the register LIST; the expansion now inherits the READ
+# access the vd-as-source correction put on the base operand, which is why
+# these appear as a repair on the read side and their write twins were
+# already here.
+#
+# `vl1r*.v` does not appear: nf = 1 is a single register, nothing to expand.
+riscv64 W-rd-added vl2r.v +REG_VEC#
+riscv64 W-rd-added vl2re16.v +REG_VEC#
+riscv64 W-rd-added vl2re32.v +REG_VEC#
+riscv64 W-rd-added vl2re64.v +REG_VEC#
+riscv64 W-rd-added vl4r.v +REG_VEC#
+riscv64 W-rd-added vl4re16.v +REG_VEC#
+riscv64 W-rd-added vl4re32.v +REG_VEC#
+riscv64 W-rd-added vl4re64.v +REG_VEC#
+riscv64 W-rd-added vl8r.v +REG_VEC#
+riscv64 W-rd-added vl8re16.v +REG_VEC#
+riscv64 W-rd-added vl8re32.v +REG_VEC#
+riscv64 W-rd-added vl8re64.v +REG_VEC#
+
+
+# --- mipsel: the HI/LO accumulator split -------------------------------
+#
+# REG_ACC<n> used to carry hi<n>, lo<n> and ac<n> at once.  HI and LO are
+# two architecturally distinct registers -- `mfhi` and `mflo` read
+# different hardware, binutils mips-opc.c separates them, and QEMU's GDB
+# stub exposes them as "hi" and "lo" (gdb-xml/mips-cpu.xml) -- so the LOW
+# half keeps REG_ACC<n> and the HIGH half took REG_ACCHI<n>.
+#
+# TWO REPAIRS SHOW UP HERE, in opposite directions:
+#
+#   W-rd-added / W-wr-added ... +REG_ACCHI#
+#       AC<n> is the DSP name for the whole 64-bit accumulator and maps to
+#       both halves as a register LIST (the same shape as the AArch64
+#       D0_D1 forms).  The boundary's name-to-generic index resolves a
+#       Capstone id to its PRIMARY generic id only, so `ac0` arrives as
+#       REG_ACC0; the dependency model expands the list.  Every instruction
+#       here uses all 64 bits -- MULT/MULTU, MADD/MSUB, the DSP DPA/DPS
+#       and MAQ families, MULSA, SHILO, MTHLIP, MTTR -- so both halves are
+#       correct on both sides.
+#
+#   W-rd-dropped mfhi -REG_ACC#
+#       the other direction, and the reason the table alone cannot fix
+#       this.  Capstone 6.0.0-Alpha7 reports BOTH move-from forms as
+#       reading the whole pair (`mfhi $t0` and `mflo $t0` each yield
+#       regs_read = {ac0}), while `mthi`/`mtlo` correctly name the single
+#       half they write.  The table is keyed by REGISTER and the
+#       discriminator is the INSTRUCTION, so refine_alias_fields drops the
+#       half the mnemonic does not name.  Upstream fix path: the move-from
+#       operands should name MIPS_REG_HI<n>/LO<n> as the move-to forms
+#       already do.
+#
+#       `mflo` has no matching line, and its absence is not a gap in the
+#       repair: the pair's primary generic id IS the low half, so the
+#       boundary and the dependency model already agree for mflo and there
+#       is no difference for this layer to record.  The repair is asserted
+#       for mflo by the trace-vs-Capstone oracle instead
+#       (validator static_reg_sets), which is where it was measured.
+mipsel W-rd-added dpa.w.ph +REG_ACCHI#
+mipsel W-rd-added dpaq_s.w.ph +REG_ACCHI#
+mipsel W-rd-added dpaq_sa.l.w +REG_ACCHI#
+mipsel W-rd-added dpaqx_s.w.ph +REG_ACCHI#
+mipsel W-rd-added dpaqx_sa.w.ph +REG_ACCHI#
+mipsel W-rd-added dpau.h.qbl +REG_ACCHI#
+mipsel W-rd-added dpau.h.qbr +REG_ACCHI#
+mipsel W-rd-added dpax.w.ph +REG_ACCHI#
+mipsel W-rd-added dps.w.ph +REG_ACCHI#
+mipsel W-rd-added dpsq_s.w.ph +REG_ACCHI#
+mipsel W-rd-added dpsq_sa.l.w +REG_ACCHI#
+mipsel W-rd-added dpsqx_s.w.ph +REG_ACCHI#
+mipsel W-rd-added dpsqx_sa.w.ph +REG_ACCHI#
+mipsel W-rd-added dpsu.h.qbl +REG_ACCHI#
+mipsel W-rd-added dpsu.h.qbr +REG_ACCHI#
+mipsel W-rd-added dpsx.w.ph +REG_ACCHI#
+mipsel W-rd-added extp +REG_ACCHI#
+mipsel W-rd-added extpdp +REG_ACCHI#
+mipsel W-rd-added extpdpv +REG_ACCHI#
+mipsel W-rd-added extpv +REG_ACCHI#
+mipsel W-rd-added extr.w +REG_ACCHI#
+mipsel W-rd-added extr_r.w +REG_ACCHI#
+mipsel W-rd-added extr_rs.w +REG_ACCHI#
+mipsel W-rd-added extr_s.h +REG_ACCHI#
+mipsel W-rd-added extrv.w +REG_ACCHI#
+mipsel W-rd-added extrv_r.w +REG_ACCHI#
+mipsel W-rd-added extrv_rs.w +REG_ACCHI#
+mipsel W-rd-added extrv_s.h +REG_ACCHI#
+mipsel W-rd-added madd +REG_ACCHI#
+mipsel W-rd-added maddu +REG_ACCHI#
+mipsel W-rd-added maq_s.w.phl +REG_ACCHI#
+mipsel W-rd-added maq_s.w.phr +REG_ACCHI#
+mipsel W-rd-added maq_sa.w.phl +REG_ACCHI#
+mipsel W-rd-added maq_sa.w.phr +REG_ACCHI#
+mipsel W-rd-added mfhi +REG_ACCHI#
+mipsel W-rd-added mftr +REG_ACCHI#
+mipsel W-rd-added msub +REG_ACCHI#
+mipsel W-rd-added msubu +REG_ACCHI#
+mipsel W-rd-added mthlip +REG_ACCHI#
+mipsel W-rd-added mulsa.w.ph +REG_ACCHI#
+mipsel W-rd-added mulsaq_s.w.ph +REG_ACCHI#
+mipsel W-rd-added shilo +REG_ACCHI#
+mipsel W-rd-added shilov +REG_ACCHI#
+mipsel W-rd-dropped mfhi -REG_ACC#
+mipsel W-wr-added dpa.w.ph +REG_ACCHI#
+mipsel W-wr-added dpaq_s.w.ph +REG_ACCHI#
+mipsel W-wr-added dpaq_sa.l.w +REG_ACCHI#
+mipsel W-wr-added dpaqx_s.w.ph +REG_ACCHI#
+mipsel W-wr-added dpaqx_sa.w.ph +REG_ACCHI#
+mipsel W-wr-added dpau.h.qbl +REG_ACCHI#
+mipsel W-wr-added dpau.h.qbr +REG_ACCHI#
+mipsel W-wr-added dpax.w.ph +REG_ACCHI#
+mipsel W-wr-added dps.w.ph +REG_ACCHI#
+mipsel W-wr-added dpsq_s.w.ph +REG_ACCHI#
+mipsel W-wr-added dpsq_sa.l.w +REG_ACCHI#
+mipsel W-wr-added dpsqx_s.w.ph +REG_ACCHI#
+mipsel W-wr-added dpsqx_sa.w.ph +REG_ACCHI#
+mipsel W-wr-added dpsu.h.qbl +REG_ACCHI#
+mipsel W-wr-added dpsu.h.qbr +REG_ACCHI#
+mipsel W-wr-added dpsx.w.ph +REG_ACCHI#
+mipsel W-wr-added madd +REG_ACCHI#
+mipsel W-wr-added maddu +REG_ACCHI#
+mipsel W-wr-added maq_s.w.phl +REG_ACCHI#
+mipsel W-wr-added maq_s.w.phr +REG_ACCHI#
+mipsel W-wr-added maq_sa.w.phl +REG_ACCHI#
+mipsel W-wr-added maq_sa.w.phr +REG_ACCHI#
+mipsel W-wr-added msub +REG_ACCHI#
+mipsel W-wr-added msubu +REG_ACCHI#
+mipsel W-wr-added mthlip +REG_ACCHI#
+mipsel W-wr-added mttr +REG_ACCHI#
+mipsel W-wr-added mulsa.w.ph +REG_ACCHI#
+mipsel W-wr-added mulsaq_s.w.ph +REG_ACCHI#
+mipsel W-wr-added mult +REG_ACCHI#
+mipsel W-wr-added multu +REG_ACCHI#
+mipsel W-wr-added shilo +REG_ACCHI#
+mipsel W-wr-added shilov +REG_ACCHI#

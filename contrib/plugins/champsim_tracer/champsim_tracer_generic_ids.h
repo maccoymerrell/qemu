@@ -280,9 +280,25 @@ enum GenericRegId {
      *               for it.  On RISC-V the thread pointer is `tp` (x4),
      *               an ordinary GPR, and needs nothing here.
      *
-     * 247-249 are deliberately unallocated.  They briefly held
+     *   REG_SSP     the shadow-stack pointer — RISC-V Zicfiss `ssp`
+     *               and x86-64 CET's SSP.  Earns an ID rather than a
+     *               fold: it exists on two ISAs, and every fold on
+     *               offer manufactures a dependency that is not there.
+     *               Onto REG_SP it serialises shadow-stack traffic
+     *               against every spill, local and frame adjustment;
+     *               onto REG_LR, against every call and return.  The
+     *               shadow stack is a SEPARATE architectural structure
+     *               with its own pointer, and a consumer scheduling
+     *               against it needs to see that.  Room was not the
+     *               constraint: 248-249 remain free and the top halves
+     *               of the GPR/FPR/VEC banks are 32 unused IDs each
+     *               (96 in total), since no traced ISA has more than
+     *               32 of any one file.
+     *
+     * 248-249 are deliberately unallocated.  They briefly held
      * REG_VSTART (RISC-V vector start), REG_DSPCTRL (MIPS DSPControl)
-     * and REG_VCSR (RISC-V vcsr / MIPS MSACSR).  The first two named a
+     * and REG_VCSR (RISC-V vcsr / MIPS MSACSR) — the third of those
+     * three slots is the one REG_SSP now occupies.  The first two named a
      * register from exactly one ISA, which is the fragmentation this
      * space exists to avoid; the third split a rounding-mode-and-status
      * word away from REG_FCSR, which already is one.  They now fold to
@@ -290,6 +306,7 @@ enum GenericRegId {
      * rather than reused so nothing renumbers.
      */
     REG_TLS = 246,
+    REG_SSP = 247,
     /* Common architectural special registers: 250-254 */
     REG_SP = 250,
     REG_FLAGS = 251,
@@ -432,6 +449,7 @@ static inline const char *generic_reg_name(unsigned id)
     case REG_FCSR:    return "REG_FCSR";
     case REG_VCTRL:   return "REG_VCTRL";
     case REG_TLS:     return "REG_TLS";
+    case REG_SSP:     return "REG_SSP";
     case REG_SP:      return "REG_SP";
     case REG_FLAGS:   return "REG_FLAGS";
     case REG_IP:      return "REG_IP";

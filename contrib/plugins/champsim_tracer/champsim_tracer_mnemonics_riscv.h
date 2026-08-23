@@ -33,6 +33,14 @@ static unsigned int cs_riscv_token_to_mode(const char *tok)
     if (g_str_equal(tok, "zbkc")) return CS_MODE_RISCV_ZBKC;
     if (g_str_equal(tok, "zbkx")) return CS_MODE_RISCV_ZBKX;
     if (g_str_equal(tok, "zbs"))  return CS_MODE_RISCV_ZBS;
+    /* Standard groups Capstone decodes that this mapper used to drop on
+     * the floor.  A guest declaring any of them in Tag_RISCV_arch had
+     * those instructions decode as unknown -- for zicfiss that is the
+     * entire shadow stack, and with it every reference to ssp. */
+    if (g_str_equal(tok, "zicfiss")) return CS_MODE_RISCV_ZICFISS;
+    if (g_str_equal(tok, "zfinx"))   return CS_MODE_RISCV_ZFINX;
+    if (g_str_equal(tok, "zcmp") || g_str_equal(tok, "zcmt") ||
+        g_str_equal(tok, "zce"))     return CS_MODE_RISCV_ZCMP_ZCMT_ZCE;
     /* Half-precision FP extensions imply the FD decoder path in cs6. */
     if (g_str_equal(tok, "zfh") || g_str_equal(tok, "zfhmin")) {
         return CS_MODE_RISCV_FD;
@@ -177,7 +185,7 @@ static const RegClassification riscv_reg_class[RISCV_REG_ENDING] = {
     [RISCV_REG_INVALID] = {},
     [RISCV_REG_FFLAGS] = { .reg_id = REG_FCSR },  /* fflags */
     [RISCV_REG_FRM] = { .reg_id = REG_FCSR },  /* frm */
-    [RISCV_REG_SSP] = { .reg_id = REG_SP },  /* ssp */
+    [RISCV_REG_SSP] = { .reg_id = REG_SSP },  /* ssp */
     [RISCV_REG_VL] = { .reg_id = REG_VCTRL },  /* vl */
     [RISCV_REG_VLENB] = { .reg_id = REG_SYS },  /* vlenb */
     [RISCV_REG_VTYPE] = { .reg_id = REG_VCTRL },  /* vtype */

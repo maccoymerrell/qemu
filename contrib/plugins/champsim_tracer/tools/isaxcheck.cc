@@ -288,7 +288,33 @@ static const IsaCfg kIsaTable[] = {
      CS_MODE_RISCV64 | CS_MODE_RISCV_C | CS_MODE_RISCV_FD | CS_MODE_RISCV_A |
          CS_MODE_RISCV_V | CS_MODE_RISCV_ZBA | CS_MODE_RISCV_ZBB |
          CS_MODE_RISCV_ZBC | CS_MODE_RISCV_ZBKB | CS_MODE_RISCV_ZBKC |
-         CS_MODE_RISCV_ZBKX | CS_MODE_RISCV_ZBS,
+         CS_MODE_RISCV_ZBKX | CS_MODE_RISCV_ZBS |
+         /* ZICFISS is ADDITIVE and was missing: a sweep of all 36,864
+          * encodings in the SYSTEM funct3=100 space returned 3,057
+          * decodes and NOT ONE sspush/sspopchk/ssrdp, so RISCV_REG_SSP
+          * -- a register the classification table has always carried --
+          * was unreachable and its mapping had never once been
+          * exercised by a measurement.  Adding it perturbs nothing:
+          * on the 85,580-encoding riscv64 list the before/after is
+          * byte-identical -- 0 changed AND 0 gained, because that list
+          * contains no Zicfiss encoding either.  The gain shows up only
+          * on the targeted SYSTEM funct3=100 sweep: 0 -> 6 shadow-stack
+          * decodes (ssrdp, sspopchk), which is where REG_SSP first
+          * becomes observable at all.
+          *
+          * ZFINX and ZCMP_ZCMT_ZCE are deliberately NOT here, and this
+          * is the measurement that says why.  They are EXCLUSIVE with
+          * the F/D/C base, not additive, and Capstone applies them
+          * unconditionally when set.  Enabling them rewrote 331 already
+          * correct decodes in the same A/B: Zfinx re-prints every
+          * double/single FP instruction against the INTEGER file (144
+          * rows: feq.d, fadd.s, fcvt.d.lu ... plus 7 where fmv.d became
+          * fsgnj.d), and Zcmp/Zcmt reinterprets the compressed FP-store
+          * space (fsd -> cm.mvsa01 / cm.jalt / cm.jt).  A blanket
+          * enumeration mode cannot carry a mutually-exclusive
+          * extension; only the per-binary ELF-attribute path can, and
+          * that is where they are handled. */
+         CS_MODE_RISCV_ZICFISS,
      true},
     /* `+fp64` is load-bearing, not decoration: without it LLVM selects the
      * FR=0 AFGR64 register file and names every 64-bit FP operand D0..D15

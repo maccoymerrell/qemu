@@ -1965,8 +1965,15 @@ def classify_aarch64_reg(name: str) -> RegEntry:
 def classify_riscv_reg(name: str) -> RegEntry:
     if name in {"X0", "X0_PAIR", "DUMMY_REG_PAIR_WITH_X0"}:
         return reg_ent("REG_ZERO")
+    # ssp is the Zicfiss shadow-stack pointer.  It is NOT the data stack
+    # pointer and it is NOT the link register: the shadow stack is a
+    # separate architectural structure with its own pointer, so folding
+    # it onto either one manufactures a dependency the guest does not
+    # have -- against every spill and frame adjustment on REG_SP, or
+    # against every call and return on REG_LR.  x86-64 CET carries the
+    # same register, so REG_SSP is not a single-ISA ID.
     if name == "SSP":
-        return reg_ent("REG_SP")
+        return reg_ent("REG_SSP")
     if name in {"FFLAGS", "FRM"}:
         return reg_ent("REG_FCSR")
     # vl and vtype are the vector CONFIGURATION a vsetvl writes as a

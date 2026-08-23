@@ -1423,14 +1423,35 @@ static void compare(const uint8_t *b, size_t n)
                     note("FN-unmapped-llvm-reg " + m + " " + tok, sample);
                     continue;
                 }
-                /* Where the token has several candidates -- the tracer
-                 * splitting one architectural register across generic ids
-                 * -- any of them counts as the register being present.
-                 * Picking one arbitrarily would report a difference that
-                 * only the choice created. */
-                unsigned g = *cand->begin();
-                for (unsigned k : *cand) if (have.count(k)) { g = k; break; }
-                if (!isax_generic_reg_dropped(g)) out->insert(g);
+                /* Where the token has several candidates, EVERY one the
+                 * fields set actually contains counts as accounted for by
+                 * this LLVM register.  Two different things put several
+                 * ids behind one token and both need the same answer:
+                 *
+                 *  - the tracer splitting one architectural register
+                 *    across generic ids (AArch64 `lr` / `w30`), where at
+                 *    most one can be present and picking it is right;
+                 *  - the tracer deliberately naming SEVERAL registers for
+                 *    one operand, which is what a register-list row is --
+                 *    MIPS `$ac0` is the accumulator PAIR and resolves to
+                 *    REG_ACC0 and REG_ACCHI0 together.
+                 *
+                 * Taking one candidate and stopping reported the other
+                 * half of a pair as a phantom on every DSP accumulate and
+                 * every MADD: a difference the choice created, not one
+                 * the decoders have.  When none is present the first
+                 * candidate still stands in, so a genuinely missing
+                 * register is still reported. */
+                bool any = false;
+                for (unsigned k : *cand) {
+                    if (!have.count(k)) continue;
+                    any = true;
+                    if (!isax_generic_reg_dropped(k)) out->insert(k);
+                }
+                if (!any) {
+                    unsigned g = *cand->begin();
+                    if (!isax_generic_reg_dropped(g)) out->insert(g);
+                }
             }
         }
     }

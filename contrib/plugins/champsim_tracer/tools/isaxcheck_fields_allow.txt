@@ -175,14 +175,21 @@ mipsel FR-wr-missing bc1tl +REG_GPR#
 # CTCMSA — copy TO an MSA control register — is one disagreement seen
 # from two sides: LLVM's MCInstrDesc carries the control register as a
 # USE (so it sits in LLVM's read set, mapped through the register table
-# to REG_SYS), while Capstone and the tracer make it the DEF a
-# copy-to-control-register instruction plainly writes (the tracer's MSA
-# control id folds onto REG_FCSR).  Capstone and the tracer are correct.
+# through the register table), while Capstone and the tracer make it the
+# DEF a copy-to-control-register instruction plainly writes.  Capstone
+# and the tracer are correct.  Two id pairs appear because Capstone
+# prints an MSA control register as a bare NUMBER, so the normaliser
+# cannot tell control register N from CP0 register N and the read side
+# resolves through whichever the tracer classified -- the split CP0 file
+# now gives those two different classes.
 # Boundary twins: `mipsel R-rd-missing ctcmsa +cop#` /
 # `R-wr-phantom ctcmsa +cop#`, same single difference in the boundary
 # vocabulary.
-mipsel FR-rd-missing ctcmsa +REG_SYS
+mipsel FR-rd-missing ctcmsa +REG_SYSMMU
+mipsel FR-rd-missing ctcmsa +REG_COPROC#
+mipsel FR-wr-phantom ctcmsa +REG_SYS
 mipsel FR-wr-phantom ctcmsa +REG_FCSR
+mipsel FR-wr-phantom ctcmsa +REG_SYSID
 
 # =====================================================================
 # aarch64
@@ -3273,39 +3280,51 @@ mipsel FR-rd-phantom trunc.w.d +REG_FCSR
 mipsel FR-wr-phantom trunc.w.d +REG_FCSR
 mipsel FR-rd-phantom trunc.w.s +REG_FCSR
 mipsel FR-wr-phantom trunc.w.s +REG_FCSR
-mipsel FR-rd-phantom deret +REG_SYS
-mipsel FR-wr-phantom deret +REG_SYS
-mipsel FR-rd-phantom dvpe +REG_SYS
-mipsel FR-wr-phantom dvpe +REG_SYS
-mipsel FR-rd-phantom eret +REG_SYS
-mipsel FR-wr-phantom eret +REG_SYS
-mipsel FR-rd-phantom evpe +REG_SYS
-mipsel FR-wr-phantom evpe +REG_SYS
-mipsel FR-rd-phantom tlbinv +REG_SYS
-mipsel FR-rd-phantom tlbinvf +REG_SYS
-mipsel FR-rd-phantom tlbp +REG_SYS
-mipsel FR-wr-phantom tlbp +REG_SYS
-mipsel FR-rd-phantom tlbr +REG_SYS
-mipsel FR-wr-phantom tlbr +REG_SYS
-mipsel FR-rd-phantom tlbwi +REG_SYS
-mipsel FR-rd-phantom tlbwr +REG_SYS
-mipsel FR-rd-phantom wait +REG_SYS
+mipsel FR-rd-phantom deret +REG_SYSDBG
+mipsel FR-wr-phantom deret +REG_SYSDBG
+mipsel FR-rd-phantom dvpe +REG_SYSMMU
+mipsel FR-wr-phantom dvpe +REG_SYSMMU
+mipsel FR-rd-phantom eret +REG_SYSEXC
+mipsel FR-wr-phantom eret +REG_SYSEXC
+mipsel FR-rd-phantom evpe +REG_SYSMMU
+mipsel FR-wr-phantom evpe +REG_SYSMMU
+mipsel FR-rd-phantom tlbinv +REG_SYSMMU
+mipsel FR-rd-phantom tlbinvf +REG_SYSMMU
+mipsel FR-rd-phantom tlbp +REG_SYSMMU
+mipsel FR-wr-phantom tlbp +REG_SYSMMU
+mipsel FR-rd-phantom tlbr +REG_SYSMMU
+mipsel FR-wr-phantom tlbr +REG_SYSMMU
+mipsel FR-rd-phantom tlbwi +REG_SYSMMU
+mipsel FR-rd-phantom tlbwr +REG_SYSMMU
+mipsel FR-rd-phantom wait +REG_SYSEXC
 mipsel FR-rd-missing mftr +REG_FP_REG
 mipsel FR-rd-missing mftr +REG_GPR#
 mipsel FR-rd-missing mftr +REG_LR
 mipsel FR-rd-missing mftr +REG_SP
-mipsel FR-rd-phantom mftr +REG_ACC#
+mipsel FR-rd-phantom mftr +REG_ACC#,REG_ACCHI#
 mipsel FR-rd-phantom mftr +REG_FCSR
 mipsel FR-rd-phantom mftr +REG_FLAGS
 mipsel FR-rd-phantom mftr +REG_FPR#
 mipsel FR-rd-phantom mftr +REG_SYS
+mipsel FR-rd-phantom mftr +REG_SYSMMU
+mipsel FR-rd-phantom mftr +REG_SYSEXC
+mipsel FR-rd-phantom mftr +REG_SYSTIMER
+mipsel FR-rd-phantom mftr +REG_SYSPERF
+mipsel FR-rd-phantom mftr +REG_SYSDBG
+mipsel FR-rd-phantom mftr +REG_SYSCACHE
+mipsel FR-rd-phantom mftr +REG_SYSID
+mipsel FR-rd-phantom mftr +REG_COPROC#
 mipsel FR-wr-missing mttr +REG_GPR#
 mipsel FR-wr-missing mttr +REG_LR
 mipsel FR-wr-missing mttr +REG_SP
-mipsel FR-wr-phantom mttr +REG_ACC#
+mipsel FR-wr-phantom mttr +REG_ACC#,REG_ACCHI#
 mipsel FR-wr-phantom mttr +REG_FCSR
 mipsel FR-wr-phantom mttr +REG_FPR#
 mipsel FR-wr-phantom mttr +REG_SYS
+mipsel FR-wr-phantom mttr +REG_SYSMMU
+mipsel FR-wr-phantom mttr +REG_SYSCACHE
+mipsel FR-wr-phantom mttr +REG_SYSID
+mipsel FR-wr-phantom mttr +REG_COPROC#
 mipsel FR-rd-phantom lwle +REG_FP_REG
 mipsel FR-rd-phantom lwle +REG_GPR#
 mipsel FR-rd-phantom lwle +REG_LR

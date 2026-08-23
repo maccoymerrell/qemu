@@ -187,7 +187,7 @@ static const RegClassification riscv_reg_class[RISCV_REG_ENDING] = {
     [RISCV_REG_FRM] = { .reg_id = REG_FCSR },  /* frm */
     [RISCV_REG_SSP] = { .reg_id = REG_SSP },  /* ssp */
     [RISCV_REG_VL] = { .reg_id = REG_VCTRL },  /* vl */
-    [RISCV_REG_VLENB] = { .reg_id = REG_SYS },  /* vlenb */
+    [RISCV_REG_VLENB] = { .reg_id = REG_SYSID },  /* vlenb */
     [RISCV_REG_VTYPE] = { .reg_id = REG_VCTRL },  /* vtype */
     [RISCV_REG_VXRM] = { .reg_id = REG_FCSR },  /* vxrm */
     [RISCV_REG_VXSAT] = { .reg_id = REG_FCSR },  /* vxsat */

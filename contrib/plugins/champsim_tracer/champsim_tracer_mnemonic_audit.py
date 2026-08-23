@@ -1990,9 +1990,10 @@ def classify_riscv_reg(name: str) -> RegEntry:
     # vlenb is VLEN in bytes: a read-only implementation constant, in
     # the same class as the ID registers, and never written by anything.
     # On REG_VCTRL a read of it would take a false edge from the last
-    # vsetvli, which does not change VLEN.
+    # vsetvli, which does not change VLEN.  REG_SYSID is that class made
+    # explicit, shared with MIPS PRId/Config and fcr0.
     if name == "VLENB":
-        return reg_ent("REG_SYS")
+        return reg_ent("REG_SYSID")
     if re.fullmatch(r"X\d+", name):
         num = first_number(name) or 0
         if num == 1:
@@ -2026,6 +2027,157 @@ MIPS_GPR_NUM = {
     "S4": 20, "S5": 21, "S6": 22, "S7": 23, "T8": 24, "T9": 25,
     "K0": 26, "K1": 27, "GP": 28, "SP": 29, "FP": 30, "RA": 31,
 }
+
+
+# ---------------------------------------------------------------------
+# MIPS privileged state, grouped by DEPENDENCE BEHAVIOUR
+#
+# Every CP0 register used to land on REG_SYS -- 288 entries on one ID.
+# That is not a fold onto a shared behaviour, it is a conflation: a
+# consumer saw `mfc0 $t0, $Config3` ordered behind `mtc0 $t0, $Status`,
+# and it had no way to tell that edge from a real one.  It also blocked
+# recording the CP0 state an exception writes, because attributing
+# EPC/Cause/Status to a trapping instruction would have made EVERY
+# trapping instruction depend on EVERY unrelated CP0 access.
+#
+# 288 IDs is not the answer either.  The groups below are the sets whose
+# members a consumer must order against the SAME event, so an edge
+# inside a group is real and an edge across groups is not:
+#
+#   REG_SYSEXC    written together BY an exception and read by its
+#                 handler.  One event writes EPC, Cause, Status and
+#                 BadVAddr, so ordering a handler's reads of them
+#                 against each other costs nothing false.
+#   REG_SYSMMU    read and written by TLB maintenance (tlbr/tlbwi/
+#                 tlbwr/tlbp) and by the hardware page-table walker.
+#   REG_SYSTIMER  a counter that advances on its own and the compare
+#                 value that fires against it.  A read of Count depends
+#                 on nothing in the instruction stream.
+#   REG_SYSPERF   counters that advance on hardware events, likewise.
+#   REG_SYSDBG    EJTAG debug, watchpoints and trace.
+#   REG_SYSCACHE  cache tag/data access windows and error state.
+#   REG_SYSID     read-only implementation identification and
+#                 configuration.  A read of one of these can never
+#                 depend on anything, so it must not share an ID with
+#                 writable state -- the same reason RISC-V vlenb does
+#                 not sit on the vector-configuration ID.
+#   REG_SYS       the residual: scratch, permission and MT/virtualisation
+#                 control.
+#
+# WHAT A TRACE ACTUALLY CARRIES.  Capstone models CP0 twice: by NUMBER
+# (MIPS_REG_COP0<n>, printed "$12") and by NAME (MIPS_REG_COP0SEL_
+# STATUS).  A 537M-encoding sweep in the modes the tracer opens
+# (mips32r2le, 82.9M decodes) reached all 32 numeric constants and NONE
+# of the 161 named ones, so the numeric rows are what a real decode
+# produces and the named rows are mapped for completeness.  A register
+# NUMBER cannot see the select field, so where one number carries
+# selects of different roles its row takes the role that dominates its
+# traffic; that is named at the row, and it is why the two spellings can
+# disagree for register 15 (PRId, read constantly, versus EBase, written
+# once at boot).
+MIPS_CP0_NUM_GROUP = {
+    0:  "REG_SYSMMU",    # Index
+    1:  "REG_SYSMMU",    # Random
+    2:  "REG_SYSMMU",    # EntryLo0
+    3:  "REG_SYSMMU",    # EntryLo1
+    4:  "REG_SYSMMU",    # Context / ContextConfig  (sel 2 is UserLocal:
+                         # the thread pointer, reachable as HWR29 and
+                         # mapped to REG_TLS there)
+    5:  "REG_SYSMMU",    # PageMask / PageGrain / SegCtl / PWBase-Size
+    6:  "REG_SYSMMU",    # Wired / PWCtl
+    7:  "REG_SYS",       # HWREna -- a permission mask, not TLB state
+    8:  "REG_SYSEXC",    # BadVAddr / BadInstr / BadInstrP / BadInstrX
+    9:  "REG_SYSTIMER",  # Count
+    10: "REG_SYSMMU",    # EntryHi
+    11: "REG_SYSTIMER",  # Compare
+    12: "REG_SYSEXC",    # Status / IntCtl / SRSCtl / SRSMap
+    13: "REG_SYSEXC",    # Cause
+    14: "REG_SYSEXC",    # EPC / NestedEPC
+    15: "REG_SYSID",     # PRId (+EBase, CDMMBase, CMGCRBase, BEVVA --
+                         # PRId dominates the traffic and is read-only;
+                         # EBase is written once at boot)
+    16: "REG_SYSID",     # Config / Config1-5
+    17: "REG_SYS",       # LLAddr
+    18: "REG_SYSDBG",    # WatchLo0-15
+    19: "REG_SYSDBG",    # WatchHi0-15
+    20: "REG_SYSMMU",    # XContext / XContextConfig
+    21: "REG_SYS",       # reserved
+    22: "REG_SYS",       # implementation-dependent
+    23: "REG_SYSDBG",    # Debug / Debug2 / TraceControl / TraceIBPC
+    24: "REG_SYSDBG",    # DEPC / TraceControl3 / UserTraceData2
+    25: "REG_SYSPERF",   # PerfCtl0-7 / PerfCnt0-7
+    26: "REG_SYSCACHE",  # ErrCtl
+    27: "REG_SYSCACHE",  # CacheErr
+    28: "REG_SYSCACHE",  # ITagLo / IDataLo / DTagLo / DDataLo
+    29: "REG_SYSCACHE",  # ITagHi / IDataHi / DTagHi / DDataHi
+    30: "REG_SYSEXC",    # ErrorEPC
+    31: "REG_SYS",       # DESAVE + KScratch1-6 (two unrelated uses, so
+                         # neither group claims the number)
+}
+
+# Named CP0 constants, classified by ROLE.  Exact-prefix families first,
+# then whole names; anything unlisted falls to REG_SYS.
+MIPS_CP0_NAME_PREFIX_GROUP = (
+    ("WATCHLO",   "REG_SYSDBG"),
+    ("WATCHHI",   "REG_SYSDBG"),
+    ("TRACE",     "REG_SYSDBG"),
+    ("USERTRACEDATA", "REG_SYSDBG"),
+    ("DEBUG",     "REG_SYSDBG"),
+    ("PERFCNT",   "REG_SYSPERF"),
+    ("PERFCTL",   "REG_SYSPERF"),
+    ("CONFIG",    "REG_SYSID"),
+    ("SRSCONF",   "REG_SYSID"),
+    ("MVPCONF",   "REG_SYSID"),
+    ("SEGCTL",    "REG_SYSMMU"),
+    ("ENTRYLO",   "REG_SYSMMU"),
+)
+MIPS_CP0_NAME_GROUP = {
+    # exception state
+    "STATUS": "REG_SYSEXC", "CAUSE": "REG_SYSEXC", "EPC": "REG_SYSEXC",
+    "ERROREPC": "REG_SYSEXC", "BADVADDR": "REG_SYSEXC",
+    "BADINST": "REG_SYSEXC", "BADINSTRP": "REG_SYSEXC",
+    "BADINSTRX": "REG_SYSEXC", "NESTEDEPC": "REG_SYSEXC",
+    "NESTEDEXC": "REG_SYSEXC", "SRSCTL": "REG_SYSEXC",
+    "SRSMAP": "REG_SYSEXC", "SRSMAP2": "REG_SYSEXC",
+    "INTCTL": "REG_SYSEXC", "VIEW_IPL": "REG_SYSEXC",
+    "VIEW_RIPL": "REG_SYSEXC", "EBASE": "REG_SYSEXC",
+    "BEVVA": "REG_SYSEXC",
+    # address translation
+    "INDEX": "REG_SYSMMU", "RANDOM": "REG_SYSMMU",
+    "CONTEXT": "REG_SYSMMU", "CONTEXTCONFIG": "REG_SYSMMU",
+    "XCONTEXT": "REG_SYSMMU", "XCONTEXTCONFIG": "REG_SYSMMU",
+    "PAGEMASK": "REG_SYSMMU", "PAGEGRAIN": "REG_SYSMMU",
+    "WIRED": "REG_SYSMMU", "ENTRYHI": "REG_SYSMMU",
+    "PWBASE": "REG_SYSMMU", "PWFIELD": "REG_SYSMMU",
+    "PWSIZE": "REG_SYSMMU", "PWCTL": "REG_SYSMMU",
+    "MAAR": "REG_SYSMMU", "MAARI": "REG_SYSMMU",
+    "MEMORYMAPID": "REG_SYSMMU",
+    # counters
+    "COUNT": "REG_SYSTIMER", "COMPARE": "REG_SYSTIMER",
+    # cache windows and error state
+    "ERRCTL": "REG_SYSCACHE", "CACHEERR": "REG_SYSCACHE",
+    "ITAGLO": "REG_SYSCACHE", "IDATALO": "REG_SYSCACHE",
+    "DTAGLO": "REG_SYSCACHE", "DDATALO": "REG_SYSCACHE",
+    "ITAGHI": "REG_SYSCACHE", "IDATAHI": "REG_SYSCACHE",
+    "DTAGHI": "REG_SYSCACHE", "DDATAHI": "REG_SYSCACHE",
+    # read-only identification
+    "PRID": "REG_SYSID", "CDMMBASE": "REG_SYSID",
+    "CMGCRBASE": "REG_SYSID", "GLOBALNUMBER": "REG_SYSID",
+    # UserLocal IS the thread pointer -- the same register `rdhwr $29`
+    # reads, which already maps to REG_TLS.  The two spellings of one
+    # register agree.
+    "USERLOCAL": "REG_TLS",
+}
+
+
+def mips_cp0_group(sel_name: str) -> str:
+    """Generic ID for a named MIPS CP0 register (COP0SEL_<name>)."""
+    if sel_name in MIPS_CP0_NAME_GROUP:
+        return MIPS_CP0_NAME_GROUP[sel_name]
+    for prefix, group in MIPS_CP0_NAME_PREFIX_GROUP:
+        if sel_name.startswith(prefix):
+            return group
+    return "REG_SYS"
 
 
 def classify_mips_reg(name: str) -> RegEntry:
@@ -2070,7 +2222,12 @@ def classify_mips_reg(name: str) -> RegEntry:
         return reg_ent(numbered("REG_FPR", int(match.group(1))))
     if match := re.fullmatch(r"W(\d+)", stem):
         return reg_ent(numbered("REG_VEC", int(match.group(1))))
-    if match := re.fullmatch(r"(?:MSA|FCC)(\d+)", stem):
+    # FCC0-7 are the FP condition-code bits -- genuine predicate
+    # registers.  MSA<n> used to come through here too, which put the
+    # RESERVED MSA CONTROL registers 8-31 on REG_PRED8..31: the wrong
+    # register class entirely.  They are handled with the rest of the
+    # MSA control file below.
+    if match := re.fullmatch(r"FCC(\d+)", stem):
         return reg_ent(numbered("REG_PRED", int(match.group(1)) % 32))
     # HI and LO are architecturally DISTINCT.  `mfhi` and `mflo` read
     # different hardware, binutils mips-opc.c separates them, and QEMU
@@ -2107,6 +2264,16 @@ def classify_mips_reg(name: str) -> RegEntry:
     # registers, so they name none.
     if re.fullmatch(r"(?:MPL|P)\d+", stem):
         return reg_none()
+    # FP control file.  fcr0 (FIR) is the read-only implementation
+    # register -- the same class as MIPS PRId and RISC-V vlenb -- so it
+    # takes REG_SYSID: a read of it can never depend on anything and
+    # must not share an ID with the writable status word.  fcr31 IS the
+    # FCSR; fcr25/26/28 (FCCR / FEXR / FENR) are alternate VIEWS of the
+    # same fcr31 state and fold there as aliases.  Every other FCR
+    # encoding is architecturally RESERVED -- not distinct hardware, so
+    # naming it alongside FCSR is not an overlap.
+    if stem == "FCR0":
+        return reg_ent("REG_SYSID")
     if stem.startswith("FCR"):
         return reg_ent("REG_FCSR")
     # Hardware register 29 is CP0 UserLocal, the MIPS thread pointer, and
@@ -2115,7 +2282,35 @@ def classify_mips_reg(name: str) -> RegEntry:
     # population, so it gets the same REG_TLS the AArch64 TPIDR_EL0 does.
     if stem == "HWR29":
         return reg_ent("REG_TLS")
-    if stem.startswith(("HWR", "COP")):
+    # HWR2 is CC, a free-running cycle counter; HWR0/1/3 (CPUNum,
+    # SYNCI_Step, CCRes) are read-only implementation constants.  Only
+    # HWR29 is reachable -- the encoding sweep produced no other HWR
+    # constant -- so these rows are correctness for a decode we have not
+    # seen rather than traffic the wire carries.
+    if stem == "HWR2":
+        return reg_ent("REG_SYSTIMER")
+    if stem in {"HWR0", "HWR1", "HWR3"}:
+        return reg_ent("REG_SYSID")
+    if stem.startswith("HWR"):
+        return reg_ent("REG_SYS")
+    # CP0 -- the system coprocessor -- split by dependence behaviour.
+    # The numeric spelling is what a real decode produces (all 32
+    # reached in the sweep); the named spelling reached none of 161 and
+    # is mapped for completeness.
+    if match := re.fullmatch(r"COP0(\d+)", stem):
+        return reg_ent(MIPS_CP0_NUM_GROUP[int(match.group(1)) % 32])
+    if stem.startswith("COP0SEL_"):
+        return reg_ent(mips_cp0_group(stem[len("COP0SEL_"):]))
+    # CP2 and CP3 are implementation-defined coprocessors: the
+    # architecture assigns their registers no semantics, so there is
+    # nothing to group BY.  One ID per coprocessor file, which is what
+    # keeps them out of the CP0 classes -- the defect that mattered.
+    # CP2 is reachable (mfc2/ctc2 decode, all 32 constants); CP3 is not.
+    if re.fullmatch(r"COP2\d+", stem):
+        return reg_ent("REG_COPROC0")
+    if re.fullmatch(r"COP3\d+", stem):
+        return reg_ent("REG_COPROC1")
+    if stem.startswith("COP"):
         return reg_ent("REG_SYS")
     # DSPControl's fields are condition, carry, outflag, pos, scount and
     # EFI -- a flags word, which is what REG_FLAGS is.  It exists on
@@ -2123,12 +2318,22 @@ def classify_mips_reg(name: str) -> RegEntry:
     # folds onto whichever existing ID roughly matches its role.
     if stem.startswith("DSP"):
         return reg_ent("REG_FLAGS")
-    # MSA control and status is the vector unit's rounding mode and
+    # MSA control file.  MSACSR is the vector unit's rounding mode and
     # exception flags -- the role REG_FCSR already carries for the
-    # scalar FP unit.  Folds there rather than onto REG_VCTRL, which
-    # carries vector CONFIGURATION.
-    if stem.startswith("MSA"):
+    # scalar FP unit, and not REG_VCTRL, which carries vector
+    # CONFIGURATION.  MSAIR is the read-only implementation register and
+    # joins the identification class.  The other six named ones
+    # (MSAAccess / Save / Modify / Request / Map / Unmap, control
+    # registers 2-7) are implementation-dependent context-management
+    # registers: one function, so one ID, which is a group and not a
+    # conflation.  MSA8..MSA31 are the RESERVED control-register
+    # encodings and land here too; they used to reach REG_PRED8..31.
+    if stem == "MSAIR":
+        return reg_ent("REG_SYSID")
+    if stem == "MSACSR":
         return reg_ent("REG_FCSR")
+    if stem.startswith("MSA"):
+        return reg_ent("REG_SYS")
     return reg_none()
 
 

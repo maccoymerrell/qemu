@@ -117,14 +117,14 @@ static const RegClassification mips_reg_class[MIPS_REG_ENDING] = {
     [MIPS_REG_FP_NM] = { .reg_id = REG_FP_REG, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "s8" } },  /* fp_nm */
     [MIPS_REG_GP] = { .reg_id = REG_GPR28, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "gp" } },  /* gp */
     [MIPS_REG_GP_NM] = { .reg_id = REG_GPR28, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "gp" } },  /* gp_nm */
-    [MIPS_REG_MSAACCESS] = { .reg_id = REG_FCSR },  /* msaaccess */
+    [MIPS_REG_MSAACCESS] = { .reg_id = REG_SYS },  /* msaaccess */
     [MIPS_REG_MSACSR] = { .reg_id = REG_FCSR },  /* msacsr */
-    [MIPS_REG_MSAIR] = { .reg_id = REG_FCSR },  /* msair */
-    [MIPS_REG_MSAMAP] = { .reg_id = REG_FCSR },  /* msamap */
-    [MIPS_REG_MSAMODIFY] = { .reg_id = REG_FCSR },  /* msamodify */
-    [MIPS_REG_MSAREQUEST] = { .reg_id = REG_FCSR },  /* msarequest */
-    [MIPS_REG_MSASAVE] = { .reg_id = REG_FCSR },  /* msasave */
-    [MIPS_REG_MSAUNMAP] = { .reg_id = REG_FCSR },  /* msaunmap */
+    [MIPS_REG_MSAIR] = { .reg_id = REG_SYSID },  /* msair */
+    [MIPS_REG_MSAMAP] = { .reg_id = REG_SYS },  /* msamap */
+    [MIPS_REG_MSAMODIFY] = { .reg_id = REG_SYS },  /* msamodify */
+    [MIPS_REG_MSAREQUEST] = { .reg_id = REG_SYS },  /* msarequest */
+    [MIPS_REG_MSASAVE] = { .reg_id = REG_SYS },  /* msasave */
+    [MIPS_REG_MSAUNMAP] = { .reg_id = REG_SYS },  /* msaunmap */
     [MIPS_REG_PC] = { .reg_id = REG_IP, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "pc" } },  /* pc */
     [MIPS_REG_RA] = { .reg_id = REG_LR, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "ra" } },  /* ra */
     [MIPS_REG_RA_NM] = { .reg_id = REG_LR, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "ra" } },  /* ra_nm */
@@ -141,102 +141,102 @@ static const RegClassification mips_reg_class[MIPS_REG_ENDING] = {
     [MIPS_REG_AC2] = { .reg_id = REG_ACC2, .n_regs = 2, .regs = { REG_ACC2, REG_ACCHI2 } },  /* ac2 */
     [MIPS_REG_AC3] = { .reg_id = REG_ACC3, .n_regs = 2, .regs = { REG_ACC3, REG_ACCHI3 } },  /* ac3 */
     [MIPS_REG_AT_64] = { .reg_id = REG_GPR1, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "at" } },  /* at_64 */
-    [MIPS_REG_COP00] = { .reg_id = REG_SYS },  /* cop00 */
-    [MIPS_REG_COP01] = { .reg_id = REG_SYS },  /* cop01 */
-    [MIPS_REG_COP02] = { .reg_id = REG_SYS },  /* cop02 */
-    [MIPS_REG_COP03] = { .reg_id = REG_SYS },  /* cop03 */
-    [MIPS_REG_COP04] = { .reg_id = REG_SYS },  /* cop04 */
-    [MIPS_REG_COP05] = { .reg_id = REG_SYS },  /* cop05 */
-    [MIPS_REG_COP06] = { .reg_id = REG_SYS },  /* cop06 */
+    [MIPS_REG_COP00] = { .reg_id = REG_SYSMMU },  /* cop00 */
+    [MIPS_REG_COP01] = { .reg_id = REG_SYSMMU },  /* cop01 */
+    [MIPS_REG_COP02] = { .reg_id = REG_SYSMMU },  /* cop02 */
+    [MIPS_REG_COP03] = { .reg_id = REG_SYSMMU },  /* cop03 */
+    [MIPS_REG_COP04] = { .reg_id = REG_SYSMMU },  /* cop04 */
+    [MIPS_REG_COP05] = { .reg_id = REG_SYSMMU },  /* cop05 */
+    [MIPS_REG_COP06] = { .reg_id = REG_SYSMMU },  /* cop06 */
     [MIPS_REG_COP07] = { .reg_id = REG_SYS },  /* cop07 */
-    [MIPS_REG_COP08] = { .reg_id = REG_SYS },  /* cop08 */
-    [MIPS_REG_COP09] = { .reg_id = REG_SYS },  /* cop09 */
-    [MIPS_REG_COP20] = { .reg_id = REG_SYS },  /* cop20 */
-    [MIPS_REG_COP21] = { .reg_id = REG_SYS },  /* cop21 */
-    [MIPS_REG_COP22] = { .reg_id = REG_SYS },  /* cop22 */
-    [MIPS_REG_COP23] = { .reg_id = REG_SYS },  /* cop23 */
-    [MIPS_REG_COP24] = { .reg_id = REG_SYS },  /* cop24 */
-    [MIPS_REG_COP25] = { .reg_id = REG_SYS },  /* cop25 */
-    [MIPS_REG_COP26] = { .reg_id = REG_SYS },  /* cop26 */
-    [MIPS_REG_COP27] = { .reg_id = REG_SYS },  /* cop27 */
-    [MIPS_REG_COP28] = { .reg_id = REG_SYS },  /* cop28 */
-    [MIPS_REG_COP29] = { .reg_id = REG_SYS },  /* cop29 */
-    [MIPS_REG_COP30] = { .reg_id = REG_SYS },  /* cop30 */
-    [MIPS_REG_COP31] = { .reg_id = REG_SYS },  /* cop31 */
-    [MIPS_REG_COP32] = { .reg_id = REG_SYS },  /* cop32 */
-    [MIPS_REG_COP33] = { .reg_id = REG_SYS },  /* cop33 */
-    [MIPS_REG_COP34] = { .reg_id = REG_SYS },  /* cop34 */
-    [MIPS_REG_COP35] = { .reg_id = REG_SYS },  /* cop35 */
-    [MIPS_REG_COP36] = { .reg_id = REG_SYS },  /* cop36 */
-    [MIPS_REG_COP37] = { .reg_id = REG_SYS },  /* cop37 */
-    [MIPS_REG_COP38] = { .reg_id = REG_SYS },  /* cop38 */
-    [MIPS_REG_COP39] = { .reg_id = REG_SYS },  /* cop39 */
-    [MIPS_REG_COP010] = { .reg_id = REG_SYS },  /* cop010 */
-    [MIPS_REG_COP011] = { .reg_id = REG_SYS },  /* cop011 */
-    [MIPS_REG_COP012] = { .reg_id = REG_SYS },  /* cop012 */
-    [MIPS_REG_COP013] = { .reg_id = REG_SYS },  /* cop013 */
-    [MIPS_REG_COP014] = { .reg_id = REG_SYS },  /* cop014 */
-    [MIPS_REG_COP015] = { .reg_id = REG_SYS },  /* cop015 */
-    [MIPS_REG_COP016] = { .reg_id = REG_SYS },  /* cop016 */
+    [MIPS_REG_COP08] = { .reg_id = REG_SYSEXC },  /* cop08 */
+    [MIPS_REG_COP09] = { .reg_id = REG_SYSTIMER },  /* cop09 */
+    [MIPS_REG_COP20] = { .reg_id = REG_COPROC0 },  /* cop20 */
+    [MIPS_REG_COP21] = { .reg_id = REG_COPROC0 },  /* cop21 */
+    [MIPS_REG_COP22] = { .reg_id = REG_COPROC0 },  /* cop22 */
+    [MIPS_REG_COP23] = { .reg_id = REG_COPROC0 },  /* cop23 */
+    [MIPS_REG_COP24] = { .reg_id = REG_COPROC0 },  /* cop24 */
+    [MIPS_REG_COP25] = { .reg_id = REG_COPROC0 },  /* cop25 */
+    [MIPS_REG_COP26] = { .reg_id = REG_COPROC0 },  /* cop26 */
+    [MIPS_REG_COP27] = { .reg_id = REG_COPROC0 },  /* cop27 */
+    [MIPS_REG_COP28] = { .reg_id = REG_COPROC0 },  /* cop28 */
+    [MIPS_REG_COP29] = { .reg_id = REG_COPROC0 },  /* cop29 */
+    [MIPS_REG_COP30] = { .reg_id = REG_COPROC1 },  /* cop30 */
+    [MIPS_REG_COP31] = { .reg_id = REG_COPROC1 },  /* cop31 */
+    [MIPS_REG_COP32] = { .reg_id = REG_COPROC1 },  /* cop32 */
+    [MIPS_REG_COP33] = { .reg_id = REG_COPROC1 },  /* cop33 */
+    [MIPS_REG_COP34] = { .reg_id = REG_COPROC1 },  /* cop34 */
+    [MIPS_REG_COP35] = { .reg_id = REG_COPROC1 },  /* cop35 */
+    [MIPS_REG_COP36] = { .reg_id = REG_COPROC1 },  /* cop36 */
+    [MIPS_REG_COP37] = { .reg_id = REG_COPROC1 },  /* cop37 */
+    [MIPS_REG_COP38] = { .reg_id = REG_COPROC1 },  /* cop38 */
+    [MIPS_REG_COP39] = { .reg_id = REG_COPROC1 },  /* cop39 */
+    [MIPS_REG_COP010] = { .reg_id = REG_SYSMMU },  /* cop010 */
+    [MIPS_REG_COP011] = { .reg_id = REG_SYSTIMER },  /* cop011 */
+    [MIPS_REG_COP012] = { .reg_id = REG_SYSEXC },  /* cop012 */
+    [MIPS_REG_COP013] = { .reg_id = REG_SYSEXC },  /* cop013 */
+    [MIPS_REG_COP014] = { .reg_id = REG_SYSEXC },  /* cop014 */
+    [MIPS_REG_COP015] = { .reg_id = REG_SYSID },  /* cop015 */
+    [MIPS_REG_COP016] = { .reg_id = REG_SYSID },  /* cop016 */
     [MIPS_REG_COP017] = { .reg_id = REG_SYS },  /* cop017 */
-    [MIPS_REG_COP018] = { .reg_id = REG_SYS },  /* cop018 */
-    [MIPS_REG_COP019] = { .reg_id = REG_SYS },  /* cop019 */
-    [MIPS_REG_COP020] = { .reg_id = REG_SYS },  /* cop020 */
+    [MIPS_REG_COP018] = { .reg_id = REG_SYSDBG },  /* cop018 */
+    [MIPS_REG_COP019] = { .reg_id = REG_SYSDBG },  /* cop019 */
+    [MIPS_REG_COP020] = { .reg_id = REG_SYSMMU },  /* cop020 */
     [MIPS_REG_COP021] = { .reg_id = REG_SYS },  /* cop021 */
     [MIPS_REG_COP022] = { .reg_id = REG_SYS },  /* cop022 */
-    [MIPS_REG_COP023] = { .reg_id = REG_SYS },  /* cop023 */
-    [MIPS_REG_COP024] = { .reg_id = REG_SYS },  /* cop024 */
-    [MIPS_REG_COP025] = { .reg_id = REG_SYS },  /* cop025 */
-    [MIPS_REG_COP026] = { .reg_id = REG_SYS },  /* cop026 */
-    [MIPS_REG_COP027] = { .reg_id = REG_SYS },  /* cop027 */
-    [MIPS_REG_COP028] = { .reg_id = REG_SYS },  /* cop028 */
-    [MIPS_REG_COP029] = { .reg_id = REG_SYS },  /* cop029 */
-    [MIPS_REG_COP030] = { .reg_id = REG_SYS },  /* cop030 */
+    [MIPS_REG_COP023] = { .reg_id = REG_SYSDBG },  /* cop023 */
+    [MIPS_REG_COP024] = { .reg_id = REG_SYSDBG },  /* cop024 */
+    [MIPS_REG_COP025] = { .reg_id = REG_SYSPERF },  /* cop025 */
+    [MIPS_REG_COP026] = { .reg_id = REG_SYSCACHE },  /* cop026 */
+    [MIPS_REG_COP027] = { .reg_id = REG_SYSCACHE },  /* cop027 */
+    [MIPS_REG_COP028] = { .reg_id = REG_SYSCACHE },  /* cop028 */
+    [MIPS_REG_COP029] = { .reg_id = REG_SYSCACHE },  /* cop029 */
+    [MIPS_REG_COP030] = { .reg_id = REG_SYSEXC },  /* cop030 */
     [MIPS_REG_COP031] = { .reg_id = REG_SYS },  /* cop031 */
-    [MIPS_REG_COP210] = { .reg_id = REG_SYS },  /* cop210 */
-    [MIPS_REG_COP211] = { .reg_id = REG_SYS },  /* cop211 */
-    [MIPS_REG_COP212] = { .reg_id = REG_SYS },  /* cop212 */
-    [MIPS_REG_COP213] = { .reg_id = REG_SYS },  /* cop213 */
-    [MIPS_REG_COP214] = { .reg_id = REG_SYS },  /* cop214 */
-    [MIPS_REG_COP215] = { .reg_id = REG_SYS },  /* cop215 */
-    [MIPS_REG_COP216] = { .reg_id = REG_SYS },  /* cop216 */
-    [MIPS_REG_COP217] = { .reg_id = REG_SYS },  /* cop217 */
-    [MIPS_REG_COP218] = { .reg_id = REG_SYS },  /* cop218 */
-    [MIPS_REG_COP219] = { .reg_id = REG_SYS },  /* cop219 */
-    [MIPS_REG_COP220] = { .reg_id = REG_SYS },  /* cop220 */
-    [MIPS_REG_COP221] = { .reg_id = REG_SYS },  /* cop221 */
-    [MIPS_REG_COP222] = { .reg_id = REG_SYS },  /* cop222 */
-    [MIPS_REG_COP223] = { .reg_id = REG_SYS },  /* cop223 */
-    [MIPS_REG_COP224] = { .reg_id = REG_SYS },  /* cop224 */
-    [MIPS_REG_COP225] = { .reg_id = REG_SYS },  /* cop225 */
-    [MIPS_REG_COP226] = { .reg_id = REG_SYS },  /* cop226 */
-    [MIPS_REG_COP227] = { .reg_id = REG_SYS },  /* cop227 */
-    [MIPS_REG_COP228] = { .reg_id = REG_SYS },  /* cop228 */
-    [MIPS_REG_COP229] = { .reg_id = REG_SYS },  /* cop229 */
-    [MIPS_REG_COP230] = { .reg_id = REG_SYS },  /* cop230 */
-    [MIPS_REG_COP231] = { .reg_id = REG_SYS },  /* cop231 */
-    [MIPS_REG_COP310] = { .reg_id = REG_SYS },  /* cop310 */
-    [MIPS_REG_COP311] = { .reg_id = REG_SYS },  /* cop311 */
-    [MIPS_REG_COP312] = { .reg_id = REG_SYS },  /* cop312 */
-    [MIPS_REG_COP313] = { .reg_id = REG_SYS },  /* cop313 */
-    [MIPS_REG_COP314] = { .reg_id = REG_SYS },  /* cop314 */
-    [MIPS_REG_COP315] = { .reg_id = REG_SYS },  /* cop315 */
-    [MIPS_REG_COP316] = { .reg_id = REG_SYS },  /* cop316 */
-    [MIPS_REG_COP317] = { .reg_id = REG_SYS },  /* cop317 */
-    [MIPS_REG_COP318] = { .reg_id = REG_SYS },  /* cop318 */
-    [MIPS_REG_COP319] = { .reg_id = REG_SYS },  /* cop319 */
-    [MIPS_REG_COP320] = { .reg_id = REG_SYS },  /* cop320 */
-    [MIPS_REG_COP321] = { .reg_id = REG_SYS },  /* cop321 */
-    [MIPS_REG_COP322] = { .reg_id = REG_SYS },  /* cop322 */
-    [MIPS_REG_COP323] = { .reg_id = REG_SYS },  /* cop323 */
-    [MIPS_REG_COP324] = { .reg_id = REG_SYS },  /* cop324 */
-    [MIPS_REG_COP325] = { .reg_id = REG_SYS },  /* cop325 */
-    [MIPS_REG_COP326] = { .reg_id = REG_SYS },  /* cop326 */
-    [MIPS_REG_COP327] = { .reg_id = REG_SYS },  /* cop327 */
-    [MIPS_REG_COP328] = { .reg_id = REG_SYS },  /* cop328 */
-    [MIPS_REG_COP329] = { .reg_id = REG_SYS },  /* cop329 */
-    [MIPS_REG_COP330] = { .reg_id = REG_SYS },  /* cop330 */
-    [MIPS_REG_COP331] = { .reg_id = REG_SYS },  /* cop331 */
+    [MIPS_REG_COP210] = { .reg_id = REG_COPROC0 },  /* cop210 */
+    [MIPS_REG_COP211] = { .reg_id = REG_COPROC0 },  /* cop211 */
+    [MIPS_REG_COP212] = { .reg_id = REG_COPROC0 },  /* cop212 */
+    [MIPS_REG_COP213] = { .reg_id = REG_COPROC0 },  /* cop213 */
+    [MIPS_REG_COP214] = { .reg_id = REG_COPROC0 },  /* cop214 */
+    [MIPS_REG_COP215] = { .reg_id = REG_COPROC0 },  /* cop215 */
+    [MIPS_REG_COP216] = { .reg_id = REG_COPROC0 },  /* cop216 */
+    [MIPS_REG_COP217] = { .reg_id = REG_COPROC0 },  /* cop217 */
+    [MIPS_REG_COP218] = { .reg_id = REG_COPROC0 },  /* cop218 */
+    [MIPS_REG_COP219] = { .reg_id = REG_COPROC0 },  /* cop219 */
+    [MIPS_REG_COP220] = { .reg_id = REG_COPROC0 },  /* cop220 */
+    [MIPS_REG_COP221] = { .reg_id = REG_COPROC0 },  /* cop221 */
+    [MIPS_REG_COP222] = { .reg_id = REG_COPROC0 },  /* cop222 */
+    [MIPS_REG_COP223] = { .reg_id = REG_COPROC0 },  /* cop223 */
+    [MIPS_REG_COP224] = { .reg_id = REG_COPROC0 },  /* cop224 */
+    [MIPS_REG_COP225] = { .reg_id = REG_COPROC0 },  /* cop225 */
+    [MIPS_REG_COP226] = { .reg_id = REG_COPROC0 },  /* cop226 */
+    [MIPS_REG_COP227] = { .reg_id = REG_COPROC0 },  /* cop227 */
+    [MIPS_REG_COP228] = { .reg_id = REG_COPROC0 },  /* cop228 */
+    [MIPS_REG_COP229] = { .reg_id = REG_COPROC0 },  /* cop229 */
+    [MIPS_REG_COP230] = { .reg_id = REG_COPROC0 },  /* cop230 */
+    [MIPS_REG_COP231] = { .reg_id = REG_COPROC0 },  /* cop231 */
+    [MIPS_REG_COP310] = { .reg_id = REG_COPROC1 },  /* cop310 */
+    [MIPS_REG_COP311] = { .reg_id = REG_COPROC1 },  /* cop311 */
+    [MIPS_REG_COP312] = { .reg_id = REG_COPROC1 },  /* cop312 */
+    [MIPS_REG_COP313] = { .reg_id = REG_COPROC1 },  /* cop313 */
+    [MIPS_REG_COP314] = { .reg_id = REG_COPROC1 },  /* cop314 */
+    [MIPS_REG_COP315] = { .reg_id = REG_COPROC1 },  /* cop315 */
+    [MIPS_REG_COP316] = { .reg_id = REG_COPROC1 },  /* cop316 */
+    [MIPS_REG_COP317] = { .reg_id = REG_COPROC1 },  /* cop317 */
+    [MIPS_REG_COP318] = { .reg_id = REG_COPROC1 },  /* cop318 */
+    [MIPS_REG_COP319] = { .reg_id = REG_COPROC1 },  /* cop319 */
+    [MIPS_REG_COP320] = { .reg_id = REG_COPROC1 },  /* cop320 */
+    [MIPS_REG_COP321] = { .reg_id = REG_COPROC1 },  /* cop321 */
+    [MIPS_REG_COP322] = { .reg_id = REG_COPROC1 },  /* cop322 */
+    [MIPS_REG_COP323] = { .reg_id = REG_COPROC1 },  /* cop323 */
+    [MIPS_REG_COP324] = { .reg_id = REG_COPROC1 },  /* cop324 */
+    [MIPS_REG_COP325] = { .reg_id = REG_COPROC1 },  /* cop325 */
+    [MIPS_REG_COP326] = { .reg_id = REG_COPROC1 },  /* cop326 */
+    [MIPS_REG_COP327] = { .reg_id = REG_COPROC1 },  /* cop327 */
+    [MIPS_REG_COP328] = { .reg_id = REG_COPROC1 },  /* cop328 */
+    [MIPS_REG_COP329] = { .reg_id = REG_COPROC1 },  /* cop329 */
+    [MIPS_REG_COP330] = { .reg_id = REG_COPROC1 },  /* cop330 */
+    [MIPS_REG_COP331] = { .reg_id = REG_COPROC1 },  /* cop331 */
     [MIPS_REG_D0] = { .reg_id = REG_FPR0, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f0" } },  /* d0 */
     [MIPS_REG_D1] = { .reg_id = REG_FPR2, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f2" } },  /* d1 */
     [MIPS_REG_D2] = { .reg_id = REG_FPR4, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f4" } },  /* d2 */
@@ -297,7 +297,7 @@ static const RegClassification mips_reg_class[MIPS_REG_ENDING] = {
     [MIPS_REG_FCC5] = { .reg_id = REG_PRED5 },  /* fcc5 */
     [MIPS_REG_FCC6] = { .reg_id = REG_PRED6 },  /* fcc6 */
     [MIPS_REG_FCC7] = { .reg_id = REG_PRED7 },  /* fcc7 */
-    [MIPS_REG_FCR0] = { .reg_id = REG_FCSR, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "fcr0" } },  /* fcr0 */
+    [MIPS_REG_FCR0] = { .reg_id = REG_SYSID, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "fcr0" } },  /* fcr0 */
     [MIPS_REG_FCR1] = { .reg_id = REG_FCSR },  /* fcr1 */
     [MIPS_REG_FCR2] = { .reg_id = REG_FCSR },  /* fcr2 */
     [MIPS_REG_FCR3] = { .reg_id = REG_FCSR },  /* fcr3 */
@@ -367,10 +367,10 @@ static const RegClassification mips_reg_class[MIPS_REG_ENDING] = {
     [MIPS_REG_HI1] = { .reg_id = REG_ACCHI1 },  /* hi1 */
     [MIPS_REG_HI2] = { .reg_id = REG_ACCHI2 },  /* hi2 */
     [MIPS_REG_HI3] = { .reg_id = REG_ACCHI3 },  /* hi3 */
-    [MIPS_REG_HWR0] = { .reg_id = REG_SYS },  /* hwr0 */
-    [MIPS_REG_HWR1] = { .reg_id = REG_SYS },  /* hwr1 */
-    [MIPS_REG_HWR2] = { .reg_id = REG_SYS },  /* hwr2 */
-    [MIPS_REG_HWR3] = { .reg_id = REG_SYS },  /* hwr3 */
+    [MIPS_REG_HWR0] = { .reg_id = REG_SYSID },  /* hwr0 */
+    [MIPS_REG_HWR1] = { .reg_id = REG_SYSID },  /* hwr1 */
+    [MIPS_REG_HWR2] = { .reg_id = REG_SYSTIMER },  /* hwr2 */
+    [MIPS_REG_HWR3] = { .reg_id = REG_SYSID },  /* hwr3 */
     [MIPS_REG_HWR4] = { .reg_id = REG_SYS },  /* hwr4 */
     [MIPS_REG_HWR5] = { .reg_id = REG_SYS },  /* hwr5 */
     [MIPS_REG_HWR6] = { .reg_id = REG_SYS },  /* hwr6 */
@@ -408,30 +408,30 @@ static const RegClassification mips_reg_class[MIPS_REG_ENDING] = {
     [MIPS_REG_MPL0] = {},
     [MIPS_REG_MPL1] = {},
     [MIPS_REG_MPL2] = {},
-    [MIPS_REG_MSA8] = { .reg_id = REG_PRED8 },  /* msa8 */
-    [MIPS_REG_MSA9] = { .reg_id = REG_PRED9 },  /* msa9 */
-    [MIPS_REG_MSA10] = { .reg_id = REG_PRED10 },  /* msa10 */
-    [MIPS_REG_MSA11] = { .reg_id = REG_PRED11 },  /* msa11 */
-    [MIPS_REG_MSA12] = { .reg_id = REG_PRED12 },  /* msa12 */
-    [MIPS_REG_MSA13] = { .reg_id = REG_PRED13 },  /* msa13 */
-    [MIPS_REG_MSA14] = { .reg_id = REG_PRED14 },  /* msa14 */
-    [MIPS_REG_MSA15] = { .reg_id = REG_PRED15 },  /* msa15 */
-    [MIPS_REG_MSA16] = { .reg_id = REG_PRED16 },  /* msa16 */
-    [MIPS_REG_MSA17] = { .reg_id = REG_PRED17 },  /* msa17 */
-    [MIPS_REG_MSA18] = { .reg_id = REG_PRED18 },  /* msa18 */
-    [MIPS_REG_MSA19] = { .reg_id = REG_PRED19 },  /* msa19 */
-    [MIPS_REG_MSA20] = { .reg_id = REG_PRED20 },  /* msa20 */
-    [MIPS_REG_MSA21] = { .reg_id = REG_PRED21 },  /* msa21 */
-    [MIPS_REG_MSA22] = { .reg_id = REG_PRED22 },  /* msa22 */
-    [MIPS_REG_MSA23] = { .reg_id = REG_PRED23 },  /* msa23 */
-    [MIPS_REG_MSA24] = { .reg_id = REG_PRED24 },  /* msa24 */
-    [MIPS_REG_MSA25] = { .reg_id = REG_PRED25 },  /* msa25 */
-    [MIPS_REG_MSA26] = { .reg_id = REG_PRED26 },  /* msa26 */
-    [MIPS_REG_MSA27] = { .reg_id = REG_PRED27 },  /* msa27 */
-    [MIPS_REG_MSA28] = { .reg_id = REG_PRED28 },  /* msa28 */
-    [MIPS_REG_MSA29] = { .reg_id = REG_PRED29 },  /* msa29 */
-    [MIPS_REG_MSA30] = { .reg_id = REG_PRED30 },  /* msa30 */
-    [MIPS_REG_MSA31] = { .reg_id = REG_PRED31 },  /* msa31 */
+    [MIPS_REG_MSA8] = { .reg_id = REG_SYS },  /* msa8 */
+    [MIPS_REG_MSA9] = { .reg_id = REG_SYS },  /* msa9 */
+    [MIPS_REG_MSA10] = { .reg_id = REG_SYS },  /* msa10 */
+    [MIPS_REG_MSA11] = { .reg_id = REG_SYS },  /* msa11 */
+    [MIPS_REG_MSA12] = { .reg_id = REG_SYS },  /* msa12 */
+    [MIPS_REG_MSA13] = { .reg_id = REG_SYS },  /* msa13 */
+    [MIPS_REG_MSA14] = { .reg_id = REG_SYS },  /* msa14 */
+    [MIPS_REG_MSA15] = { .reg_id = REG_SYS },  /* msa15 */
+    [MIPS_REG_MSA16] = { .reg_id = REG_SYS },  /* msa16 */
+    [MIPS_REG_MSA17] = { .reg_id = REG_SYS },  /* msa17 */
+    [MIPS_REG_MSA18] = { .reg_id = REG_SYS },  /* msa18 */
+    [MIPS_REG_MSA19] = { .reg_id = REG_SYS },  /* msa19 */
+    [MIPS_REG_MSA20] = { .reg_id = REG_SYS },  /* msa20 */
+    [MIPS_REG_MSA21] = { .reg_id = REG_SYS },  /* msa21 */
+    [MIPS_REG_MSA22] = { .reg_id = REG_SYS },  /* msa22 */
+    [MIPS_REG_MSA23] = { .reg_id = REG_SYS },  /* msa23 */
+    [MIPS_REG_MSA24] = { .reg_id = REG_SYS },  /* msa24 */
+    [MIPS_REG_MSA25] = { .reg_id = REG_SYS },  /* msa25 */
+    [MIPS_REG_MSA26] = { .reg_id = REG_SYS },  /* msa26 */
+    [MIPS_REG_MSA27] = { .reg_id = REG_SYS },  /* msa27 */
+    [MIPS_REG_MSA28] = { .reg_id = REG_SYS },  /* msa28 */
+    [MIPS_REG_MSA29] = { .reg_id = REG_SYS },  /* msa29 */
+    [MIPS_REG_MSA30] = { .reg_id = REG_SYS },  /* msa30 */
+    [MIPS_REG_MSA31] = { .reg_id = REG_SYS },  /* msa31 */
     [MIPS_REG_P0] = {},
     [MIPS_REG_P1] = {},
     [MIPS_REG_P2] = {},
@@ -498,60 +498,60 @@ static const RegClassification mips_reg_class[MIPS_REG_ENDING] = {
     [MIPS_REG_A5_NM] = { .reg_id = REG_GPR9, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "t1" } },  /* a5_nm */
     [MIPS_REG_A6_NM] = { .reg_id = REG_GPR10, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "t2" } },  /* a6_nm */
     [MIPS_REG_A7_NM] = { .reg_id = REG_GPR11, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "t3" } },  /* a7_nm */
-    [MIPS_REG_COP0SEL_BADINST] = { .reg_id = REG_SYS },  /* cop0sel_badinst */
-    [MIPS_REG_COP0SEL_BADINSTRP] = { .reg_id = REG_SYS },  /* cop0sel_badinstrp */
-    [MIPS_REG_COP0SEL_BADINSTRX] = { .reg_id = REG_SYS },  /* cop0sel_badinstrx */
-    [MIPS_REG_COP0SEL_BADVADDR] = { .reg_id = REG_SYS },  /* cop0sel_badvaddr */
-    [MIPS_REG_COP0SEL_BEVVA] = { .reg_id = REG_SYS },  /* cop0sel_bevva */
-    [MIPS_REG_COP0SEL_CACHEERR] = { .reg_id = REG_SYS },  /* cop0sel_cacheerr */
-    [MIPS_REG_COP0SEL_CAUSE] = { .reg_id = REG_SYS },  /* cop0sel_cause */
-    [MIPS_REG_COP0SEL_CDMMBASE] = { .reg_id = REG_SYS },  /* cop0sel_cdmmbase */
-    [MIPS_REG_COP0SEL_CMGCRBASE] = { .reg_id = REG_SYS },  /* cop0sel_cmgcrbase */
-    [MIPS_REG_COP0SEL_COMPARE] = { .reg_id = REG_SYS },  /* cop0sel_compare */
-    [MIPS_REG_COP0SEL_CONFIG] = { .reg_id = REG_SYS },  /* cop0sel_config */
-    [MIPS_REG_COP0SEL_CONTEXT] = { .reg_id = REG_SYS },  /* cop0sel_context */
-    [MIPS_REG_COP0SEL_CONTEXTCONFIG] = { .reg_id = REG_SYS },  /* cop0sel_contextconfig */
-    [MIPS_REG_COP0SEL_COUNT] = { .reg_id = REG_SYS },  /* cop0sel_count */
-    [MIPS_REG_COP0SEL_DDATAHI] = { .reg_id = REG_SYS },  /* cop0sel_ddatahi */
-    [MIPS_REG_COP0SEL_DDATALO] = { .reg_id = REG_SYS },  /* cop0sel_ddatalo */
-    [MIPS_REG_COP0SEL_DEBUG] = { .reg_id = REG_SYS },  /* cop0sel_debug */
-    [MIPS_REG_COP0SEL_DEBUGCONTEXTID] = { .reg_id = REG_SYS },  /* cop0sel_debugcontextid */
+    [MIPS_REG_COP0SEL_BADINST] = { .reg_id = REG_SYSEXC },  /* cop0sel_badinst */
+    [MIPS_REG_COP0SEL_BADINSTRP] = { .reg_id = REG_SYSEXC },  /* cop0sel_badinstrp */
+    [MIPS_REG_COP0SEL_BADINSTRX] = { .reg_id = REG_SYSEXC },  /* cop0sel_badinstrx */
+    [MIPS_REG_COP0SEL_BADVADDR] = { .reg_id = REG_SYSEXC },  /* cop0sel_badvaddr */
+    [MIPS_REG_COP0SEL_BEVVA] = { .reg_id = REG_SYSEXC },  /* cop0sel_bevva */
+    [MIPS_REG_COP0SEL_CACHEERR] = { .reg_id = REG_SYSCACHE },  /* cop0sel_cacheerr */
+    [MIPS_REG_COP0SEL_CAUSE] = { .reg_id = REG_SYSEXC },  /* cop0sel_cause */
+    [MIPS_REG_COP0SEL_CDMMBASE] = { .reg_id = REG_SYSID },  /* cop0sel_cdmmbase */
+    [MIPS_REG_COP0SEL_CMGCRBASE] = { .reg_id = REG_SYSID },  /* cop0sel_cmgcrbase */
+    [MIPS_REG_COP0SEL_COMPARE] = { .reg_id = REG_SYSTIMER },  /* cop0sel_compare */
+    [MIPS_REG_COP0SEL_CONFIG] = { .reg_id = REG_SYSID },  /* cop0sel_config */
+    [MIPS_REG_COP0SEL_CONTEXT] = { .reg_id = REG_SYSMMU },  /* cop0sel_context */
+    [MIPS_REG_COP0SEL_CONTEXTCONFIG] = { .reg_id = REG_SYSMMU },  /* cop0sel_contextconfig */
+    [MIPS_REG_COP0SEL_COUNT] = { .reg_id = REG_SYSTIMER },  /* cop0sel_count */
+    [MIPS_REG_COP0SEL_DDATAHI] = { .reg_id = REG_SYSCACHE },  /* cop0sel_ddatahi */
+    [MIPS_REG_COP0SEL_DDATALO] = { .reg_id = REG_SYSCACHE },  /* cop0sel_ddatalo */
+    [MIPS_REG_COP0SEL_DEBUG] = { .reg_id = REG_SYSDBG },  /* cop0sel_debug */
+    [MIPS_REG_COP0SEL_DEBUGCONTEXTID] = { .reg_id = REG_SYSDBG },  /* cop0sel_debugcontextid */
     [MIPS_REG_COP0SEL_DEPC] = { .reg_id = REG_SYS },  /* cop0sel_depc */
     [MIPS_REG_COP0SEL_DESAVE] = { .reg_id = REG_SYS },  /* cop0sel_desave */
-    [MIPS_REG_COP0SEL_DTAGHI] = { .reg_id = REG_SYS },  /* cop0sel_dtaghi */
-    [MIPS_REG_COP0SEL_DTAGLO] = { .reg_id = REG_SYS },  /* cop0sel_dtaglo */
-    [MIPS_REG_COP0SEL_EBASE] = { .reg_id = REG_SYS },  /* cop0sel_ebase */
-    [MIPS_REG_COP0SEL_ENTRYHI] = { .reg_id = REG_SYS },  /* cop0sel_entryhi */
-    [MIPS_REG_COP0SEL_EPC] = { .reg_id = REG_SYS },  /* cop0sel_epc */
-    [MIPS_REG_COP0SEL_ERRCTL] = { .reg_id = REG_SYS },  /* cop0sel_errctl */
-    [MIPS_REG_COP0SEL_ERROREPC] = { .reg_id = REG_SYS },  /* cop0sel_errorepc */
-    [MIPS_REG_COP0SEL_GLOBALNUMBER] = { .reg_id = REG_SYS },  /* cop0sel_globalnumber */
+    [MIPS_REG_COP0SEL_DTAGHI] = { .reg_id = REG_SYSCACHE },  /* cop0sel_dtaghi */
+    [MIPS_REG_COP0SEL_DTAGLO] = { .reg_id = REG_SYSCACHE },  /* cop0sel_dtaglo */
+    [MIPS_REG_COP0SEL_EBASE] = { .reg_id = REG_SYSEXC },  /* cop0sel_ebase */
+    [MIPS_REG_COP0SEL_ENTRYHI] = { .reg_id = REG_SYSMMU },  /* cop0sel_entryhi */
+    [MIPS_REG_COP0SEL_EPC] = { .reg_id = REG_SYSEXC },  /* cop0sel_epc */
+    [MIPS_REG_COP0SEL_ERRCTL] = { .reg_id = REG_SYSCACHE },  /* cop0sel_errctl */
+    [MIPS_REG_COP0SEL_ERROREPC] = { .reg_id = REG_SYSEXC },  /* cop0sel_errorepc */
+    [MIPS_REG_COP0SEL_GLOBALNUMBER] = { .reg_id = REG_SYSID },  /* cop0sel_globalnumber */
     [MIPS_REG_COP0SEL_GTOFFSET] = { .reg_id = REG_SYS },  /* cop0sel_gtoffset */
     [MIPS_REG_COP0SEL_HWRENA] = { .reg_id = REG_SYS },  /* cop0sel_hwrena */
-    [MIPS_REG_COP0SEL_IDATAHI] = { .reg_id = REG_SYS },  /* cop0sel_idatahi */
-    [MIPS_REG_COP0SEL_IDATALO] = { .reg_id = REG_SYS },  /* cop0sel_idatalo */
-    [MIPS_REG_COP0SEL_INDEX] = { .reg_id = REG_SYS },  /* cop0sel_index */
-    [MIPS_REG_COP0SEL_INTCTL] = { .reg_id = REG_SYS },  /* cop0sel_intctl */
-    [MIPS_REG_COP0SEL_ITAGHI] = { .reg_id = REG_SYS },  /* cop0sel_itaghi */
-    [MIPS_REG_COP0SEL_ITAGLO] = { .reg_id = REG_SYS },  /* cop0sel_itaglo */
+    [MIPS_REG_COP0SEL_IDATAHI] = { .reg_id = REG_SYSCACHE },  /* cop0sel_idatahi */
+    [MIPS_REG_COP0SEL_IDATALO] = { .reg_id = REG_SYSCACHE },  /* cop0sel_idatalo */
+    [MIPS_REG_COP0SEL_INDEX] = { .reg_id = REG_SYSMMU },  /* cop0sel_index */
+    [MIPS_REG_COP0SEL_INTCTL] = { .reg_id = REG_SYSEXC },  /* cop0sel_intctl */
+    [MIPS_REG_COP0SEL_ITAGHI] = { .reg_id = REG_SYSCACHE },  /* cop0sel_itaghi */
+    [MIPS_REG_COP0SEL_ITAGLO] = { .reg_id = REG_SYSCACHE },  /* cop0sel_itaglo */
     [MIPS_REG_COP0SEL_LLADDR] = { .reg_id = REG_SYS },  /* cop0sel_lladdr */
-    [MIPS_REG_COP0SEL_MAAR] = { .reg_id = REG_SYS },  /* cop0sel_maar */
-    [MIPS_REG_COP0SEL_MAARI] = { .reg_id = REG_SYS },  /* cop0sel_maari */
-    [MIPS_REG_COP0SEL_MEMORYMAPID] = { .reg_id = REG_SYS },  /* cop0sel_memorymapid */
+    [MIPS_REG_COP0SEL_MAAR] = { .reg_id = REG_SYSMMU },  /* cop0sel_maar */
+    [MIPS_REG_COP0SEL_MAARI] = { .reg_id = REG_SYSMMU },  /* cop0sel_maari */
+    [MIPS_REG_COP0SEL_MEMORYMAPID] = { .reg_id = REG_SYSMMU },  /* cop0sel_memorymapid */
     [MIPS_REG_COP0SEL_MVPCONTROL] = { .reg_id = REG_SYS },  /* cop0sel_mvpcontrol */
-    [MIPS_REG_COP0SEL_NESTEDEPC] = { .reg_id = REG_SYS },  /* cop0sel_nestedepc */
-    [MIPS_REG_COP0SEL_NESTEDEXC] = { .reg_id = REG_SYS },  /* cop0sel_nestedexc */
-    [MIPS_REG_COP0SEL_PAGEGRAIN] = { .reg_id = REG_SYS },  /* cop0sel_pagegrain */
-    [MIPS_REG_COP0SEL_PAGEMASK] = { .reg_id = REG_SYS },  /* cop0sel_pagemask */
-    [MIPS_REG_COP0SEL_PRID] = { .reg_id = REG_SYS },  /* cop0sel_prid */
-    [MIPS_REG_COP0SEL_PWBASE] = { .reg_id = REG_SYS },  /* cop0sel_pwbase */
-    [MIPS_REG_COP0SEL_PWCTL] = { .reg_id = REG_SYS },  /* cop0sel_pwctl */
-    [MIPS_REG_COP0SEL_PWFIELD] = { .reg_id = REG_SYS },  /* cop0sel_pwfield */
-    [MIPS_REG_COP0SEL_PWSIZE] = { .reg_id = REG_SYS },  /* cop0sel_pwsize */
-    [MIPS_REG_COP0SEL_RANDOM] = { .reg_id = REG_SYS },  /* cop0sel_random */
-    [MIPS_REG_COP0SEL_SRSCTL] = { .reg_id = REG_SYS },  /* cop0sel_srsctl */
-    [MIPS_REG_COP0SEL_SRSMAP] = { .reg_id = REG_SYS },  /* cop0sel_srsmap */
-    [MIPS_REG_COP0SEL_STATUS] = { .reg_id = REG_SYS },  /* cop0sel_status */
+    [MIPS_REG_COP0SEL_NESTEDEPC] = { .reg_id = REG_SYSEXC },  /* cop0sel_nestedepc */
+    [MIPS_REG_COP0SEL_NESTEDEXC] = { .reg_id = REG_SYSEXC },  /* cop0sel_nestedexc */
+    [MIPS_REG_COP0SEL_PAGEGRAIN] = { .reg_id = REG_SYSMMU },  /* cop0sel_pagegrain */
+    [MIPS_REG_COP0SEL_PAGEMASK] = { .reg_id = REG_SYSMMU },  /* cop0sel_pagemask */
+    [MIPS_REG_COP0SEL_PRID] = { .reg_id = REG_SYSID },  /* cop0sel_prid */
+    [MIPS_REG_COP0SEL_PWBASE] = { .reg_id = REG_SYSMMU },  /* cop0sel_pwbase */
+    [MIPS_REG_COP0SEL_PWCTL] = { .reg_id = REG_SYSMMU },  /* cop0sel_pwctl */
+    [MIPS_REG_COP0SEL_PWFIELD] = { .reg_id = REG_SYSMMU },  /* cop0sel_pwfield */
+    [MIPS_REG_COP0SEL_PWSIZE] = { .reg_id = REG_SYSMMU },  /* cop0sel_pwsize */
+    [MIPS_REG_COP0SEL_RANDOM] = { .reg_id = REG_SYSMMU },  /* cop0sel_random */
+    [MIPS_REG_COP0SEL_SRSCTL] = { .reg_id = REG_SYSEXC },  /* cop0sel_srsctl */
+    [MIPS_REG_COP0SEL_SRSMAP] = { .reg_id = REG_SYSEXC },  /* cop0sel_srsmap */
+    [MIPS_REG_COP0SEL_STATUS] = { .reg_id = REG_SYSEXC },  /* cop0sel_status */
     [MIPS_REG_COP0SEL_TCBIND] = { .reg_id = REG_SYS },  /* cop0sel_tcbind */
     [MIPS_REG_COP0SEL_TCCONTEXT] = { .reg_id = REG_SYS },  /* cop0sel_tccontext */
     [MIPS_REG_COP0SEL_TCHALT] = { .reg_id = REG_SYS },  /* cop0sel_tchalt */
@@ -560,20 +560,20 @@ static const RegClassification mips_reg_class[MIPS_REG_ENDING] = {
     [MIPS_REG_COP0SEL_TCSCHEDULE] = { .reg_id = REG_SYS },  /* cop0sel_tcschedule */
     [MIPS_REG_COP0SEL_TCSCHEFBACK] = { .reg_id = REG_SYS },  /* cop0sel_tcschefback */
     [MIPS_REG_COP0SEL_TCSTATUS] = { .reg_id = REG_SYS },  /* cop0sel_tcstatus */
-    [MIPS_REG_COP0SEL_TRACECONTROL] = { .reg_id = REG_SYS },  /* cop0sel_tracecontrol */
-    [MIPS_REG_COP0SEL_TRACEDBPC] = { .reg_id = REG_SYS },  /* cop0sel_tracedbpc */
-    [MIPS_REG_COP0SEL_TRACEIBPC] = { .reg_id = REG_SYS },  /* cop0sel_traceibpc */
-    [MIPS_REG_COP0SEL_USERLOCAL] = { .reg_id = REG_SYS },  /* cop0sel_userlocal */
-    [MIPS_REG_COP0SEL_VIEW_IPL] = { .reg_id = REG_SYS },  /* cop0sel_view_ipl */
-    [MIPS_REG_COP0SEL_VIEW_RIPL] = { .reg_id = REG_SYS },  /* cop0sel_view_ripl */
+    [MIPS_REG_COP0SEL_TRACECONTROL] = { .reg_id = REG_SYSDBG },  /* cop0sel_tracecontrol */
+    [MIPS_REG_COP0SEL_TRACEDBPC] = { .reg_id = REG_SYSDBG },  /* cop0sel_tracedbpc */
+    [MIPS_REG_COP0SEL_TRACEIBPC] = { .reg_id = REG_SYSDBG },  /* cop0sel_traceibpc */
+    [MIPS_REG_COP0SEL_USERLOCAL] = { .reg_id = REG_TLS },  /* cop0sel_userlocal */
+    [MIPS_REG_COP0SEL_VIEW_IPL] = { .reg_id = REG_SYSEXC },  /* cop0sel_view_ipl */
+    [MIPS_REG_COP0SEL_VIEW_RIPL] = { .reg_id = REG_SYSEXC },  /* cop0sel_view_ripl */
     [MIPS_REG_COP0SEL_VPCONTROL] = { .reg_id = REG_SYS },  /* cop0sel_vpcontrol */
     [MIPS_REG_COP0SEL_VPECONTROL] = { .reg_id = REG_SYS },  /* cop0sel_vpecontrol */
     [MIPS_REG_COP0SEL_VPEOPT] = { .reg_id = REG_SYS },  /* cop0sel_vpeopt */
     [MIPS_REG_COP0SEL_VPESCHEDULE] = { .reg_id = REG_SYS },  /* cop0sel_vpeschedule */
     [MIPS_REG_COP0SEL_VPESCHEFBACK] = { .reg_id = REG_SYS },  /* cop0sel_vpeschefback */
-    [MIPS_REG_COP0SEL_WIRED] = { .reg_id = REG_SYS },  /* cop0sel_wired */
-    [MIPS_REG_COP0SEL_XCONTEXT] = { .reg_id = REG_SYS },  /* cop0sel_xcontext */
-    [MIPS_REG_COP0SEL_XCONTEXTCONFIG] = { .reg_id = REG_SYS },  /* cop0sel_xcontextconfig */
+    [MIPS_REG_COP0SEL_WIRED] = { .reg_id = REG_SYSMMU },  /* cop0sel_wired */
+    [MIPS_REG_COP0SEL_XCONTEXT] = { .reg_id = REG_SYSMMU },  /* cop0sel_xcontext */
+    [MIPS_REG_COP0SEL_XCONTEXTCONFIG] = { .reg_id = REG_SYSMMU },  /* cop0sel_xcontextconfig */
     [MIPS_REG_COP0SEL_YQMASK] = { .reg_id = REG_SYS },  /* cop0sel_yqmask */
     [MIPS_REG_K0_NM] = { .reg_id = REG_GPR26, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "k0" } },  /* k0_nm */
     [MIPS_REG_K1_NM] = { .reg_id = REG_GPR27, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "k1" } },  /* k1_nm */
@@ -598,14 +598,14 @@ static const RegClassification mips_reg_class[MIPS_REG_ENDING] = {
     [MIPS_REG_A2_64] = { .reg_id = REG_GPR6, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "a2" } },  /* a2_64 */
     [MIPS_REG_A3_64] = { .reg_id = REG_GPR7, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "a3" } },  /* a3_64 */
     [MIPS_REG_AC0_64] = { .reg_id = REG_ACC0, .n_regs = 2, .regs = { REG_ACC0, REG_ACCHI0 } },  /* ac0_64 */
-    [MIPS_REG_COP0SEL_CONFIG1] = { .reg_id = REG_SYS },  /* cop0sel_config1 */
-    [MIPS_REG_COP0SEL_CONFIG2] = { .reg_id = REG_SYS },  /* cop0sel_config2 */
-    [MIPS_REG_COP0SEL_CONFIG3] = { .reg_id = REG_SYS },  /* cop0sel_config3 */
-    [MIPS_REG_COP0SEL_CONFIG4] = { .reg_id = REG_SYS },  /* cop0sel_config4 */
-    [MIPS_REG_COP0SEL_CONFIG5] = { .reg_id = REG_SYS },  /* cop0sel_config5 */
-    [MIPS_REG_COP0SEL_DEBUG2] = { .reg_id = REG_SYS },  /* cop0sel_debug2 */
-    [MIPS_REG_COP0SEL_ENTRYLO0] = { .reg_id = REG_SYS },  /* cop0sel_entrylo0 */
-    [MIPS_REG_COP0SEL_ENTRYLO1] = { .reg_id = REG_SYS },  /* cop0sel_entrylo1 */
+    [MIPS_REG_COP0SEL_CONFIG1] = { .reg_id = REG_SYSID },  /* cop0sel_config1 */
+    [MIPS_REG_COP0SEL_CONFIG2] = { .reg_id = REG_SYSID },  /* cop0sel_config2 */
+    [MIPS_REG_COP0SEL_CONFIG3] = { .reg_id = REG_SYSID },  /* cop0sel_config3 */
+    [MIPS_REG_COP0SEL_CONFIG4] = { .reg_id = REG_SYSID },  /* cop0sel_config4 */
+    [MIPS_REG_COP0SEL_CONFIG5] = { .reg_id = REG_SYSID },  /* cop0sel_config5 */
+    [MIPS_REG_COP0SEL_DEBUG2] = { .reg_id = REG_SYSDBG },  /* cop0sel_debug2 */
+    [MIPS_REG_COP0SEL_ENTRYLO0] = { .reg_id = REG_SYSMMU },  /* cop0sel_entrylo0 */
+    [MIPS_REG_COP0SEL_ENTRYLO1] = { .reg_id = REG_SYSMMU },  /* cop0sel_entrylo1 */
     [MIPS_REG_COP0SEL_GUESTCTL0] = { .reg_id = REG_SYS },  /* cop0sel_guestctl0 */
     [MIPS_REG_COP0SEL_GUESTCTL1] = { .reg_id = REG_SYS },  /* cop0sel_guestctl1 */
     [MIPS_REG_COP0SEL_GUESTCTL2] = { .reg_id = REG_SYS },  /* cop0sel_guestctl2 */
@@ -616,71 +616,71 @@ static const RegClassification mips_reg_class[MIPS_REG_ENDING] = {
     [MIPS_REG_COP0SEL_KSCRATCH4] = { .reg_id = REG_SYS },  /* cop0sel_kscratch4 */
     [MIPS_REG_COP0SEL_KSCRATCH5] = { .reg_id = REG_SYS },  /* cop0sel_kscratch5 */
     [MIPS_REG_COP0SEL_KSCRATCH6] = { .reg_id = REG_SYS },  /* cop0sel_kscratch6 */
-    [MIPS_REG_COP0SEL_MVPCONF0] = { .reg_id = REG_SYS },  /* cop0sel_mvpconf0 */
-    [MIPS_REG_COP0SEL_MVPCONF1] = { .reg_id = REG_SYS },  /* cop0sel_mvpconf1 */
-    [MIPS_REG_COP0SEL_PERFCNT0] = { .reg_id = REG_SYS },  /* cop0sel_perfcnt0 */
-    [MIPS_REG_COP0SEL_PERFCNT1] = { .reg_id = REG_SYS },  /* cop0sel_perfcnt1 */
-    [MIPS_REG_COP0SEL_PERFCNT2] = { .reg_id = REG_SYS },  /* cop0sel_perfcnt2 */
-    [MIPS_REG_COP0SEL_PERFCNT3] = { .reg_id = REG_SYS },  /* cop0sel_perfcnt3 */
-    [MIPS_REG_COP0SEL_PERFCNT4] = { .reg_id = REG_SYS },  /* cop0sel_perfcnt4 */
-    [MIPS_REG_COP0SEL_PERFCNT5] = { .reg_id = REG_SYS },  /* cop0sel_perfcnt5 */
-    [MIPS_REG_COP0SEL_PERFCNT6] = { .reg_id = REG_SYS },  /* cop0sel_perfcnt6 */
-    [MIPS_REG_COP0SEL_PERFCNT7] = { .reg_id = REG_SYS },  /* cop0sel_perfcnt7 */
-    [MIPS_REG_COP0SEL_PERFCTL0] = { .reg_id = REG_SYS },  /* cop0sel_perfctl0 */
-    [MIPS_REG_COP0SEL_PERFCTL1] = { .reg_id = REG_SYS },  /* cop0sel_perfctl1 */
-    [MIPS_REG_COP0SEL_PERFCTL2] = { .reg_id = REG_SYS },  /* cop0sel_perfctl2 */
-    [MIPS_REG_COP0SEL_PERFCTL3] = { .reg_id = REG_SYS },  /* cop0sel_perfctl3 */
-    [MIPS_REG_COP0SEL_PERFCTL4] = { .reg_id = REG_SYS },  /* cop0sel_perfctl4 */
-    [MIPS_REG_COP0SEL_PERFCTL5] = { .reg_id = REG_SYS },  /* cop0sel_perfctl5 */
-    [MIPS_REG_COP0SEL_PERFCTL6] = { .reg_id = REG_SYS },  /* cop0sel_perfctl6 */
-    [MIPS_REG_COP0SEL_PERFCTL7] = { .reg_id = REG_SYS },  /* cop0sel_perfctl7 */
-    [MIPS_REG_COP0SEL_SEGCTL0] = { .reg_id = REG_SYS },  /* cop0sel_segctl0 */
-    [MIPS_REG_COP0SEL_SEGCTL1] = { .reg_id = REG_SYS },  /* cop0sel_segctl1 */
-    [MIPS_REG_COP0SEL_SEGCTL2] = { .reg_id = REG_SYS },  /* cop0sel_segctl2 */
-    [MIPS_REG_COP0SEL_SRSCONF0] = { .reg_id = REG_SYS },  /* cop0sel_srsconf0 */
-    [MIPS_REG_COP0SEL_SRSCONF1] = { .reg_id = REG_SYS },  /* cop0sel_srsconf1 */
-    [MIPS_REG_COP0SEL_SRSCONF2] = { .reg_id = REG_SYS },  /* cop0sel_srsconf2 */
-    [MIPS_REG_COP0SEL_SRSCONF3] = { .reg_id = REG_SYS },  /* cop0sel_srsconf3 */
-    [MIPS_REG_COP0SEL_SRSCONF4] = { .reg_id = REG_SYS },  /* cop0sel_srsconf4 */
-    [MIPS_REG_COP0SEL_SRSMAP2] = { .reg_id = REG_SYS },  /* cop0sel_srsmap2 */
-    [MIPS_REG_COP0SEL_TRACECONTROL2] = { .reg_id = REG_SYS },  /* cop0sel_tracecontrol2 */
-    [MIPS_REG_COP0SEL_TRACECONTROL3] = { .reg_id = REG_SYS },  /* cop0sel_tracecontrol3 */
-    [MIPS_REG_COP0SEL_USERTRACEDATA1] = { .reg_id = REG_SYS },  /* cop0sel_usertracedata1 */
-    [MIPS_REG_COP0SEL_USERTRACEDATA2] = { .reg_id = REG_SYS },  /* cop0sel_usertracedata2 */
+    [MIPS_REG_COP0SEL_MVPCONF0] = { .reg_id = REG_SYSID },  /* cop0sel_mvpconf0 */
+    [MIPS_REG_COP0SEL_MVPCONF1] = { .reg_id = REG_SYSID },  /* cop0sel_mvpconf1 */
+    [MIPS_REG_COP0SEL_PERFCNT0] = { .reg_id = REG_SYSPERF },  /* cop0sel_perfcnt0 */
+    [MIPS_REG_COP0SEL_PERFCNT1] = { .reg_id = REG_SYSPERF },  /* cop0sel_perfcnt1 */
+    [MIPS_REG_COP0SEL_PERFCNT2] = { .reg_id = REG_SYSPERF },  /* cop0sel_perfcnt2 */
+    [MIPS_REG_COP0SEL_PERFCNT3] = { .reg_id = REG_SYSPERF },  /* cop0sel_perfcnt3 */
+    [MIPS_REG_COP0SEL_PERFCNT4] = { .reg_id = REG_SYSPERF },  /* cop0sel_perfcnt4 */
+    [MIPS_REG_COP0SEL_PERFCNT5] = { .reg_id = REG_SYSPERF },  /* cop0sel_perfcnt5 */
+    [MIPS_REG_COP0SEL_PERFCNT6] = { .reg_id = REG_SYSPERF },  /* cop0sel_perfcnt6 */
+    [MIPS_REG_COP0SEL_PERFCNT7] = { .reg_id = REG_SYSPERF },  /* cop0sel_perfcnt7 */
+    [MIPS_REG_COP0SEL_PERFCTL0] = { .reg_id = REG_SYSPERF },  /* cop0sel_perfctl0 */
+    [MIPS_REG_COP0SEL_PERFCTL1] = { .reg_id = REG_SYSPERF },  /* cop0sel_perfctl1 */
+    [MIPS_REG_COP0SEL_PERFCTL2] = { .reg_id = REG_SYSPERF },  /* cop0sel_perfctl2 */
+    [MIPS_REG_COP0SEL_PERFCTL3] = { .reg_id = REG_SYSPERF },  /* cop0sel_perfctl3 */
+    [MIPS_REG_COP0SEL_PERFCTL4] = { .reg_id = REG_SYSPERF },  /* cop0sel_perfctl4 */
+    [MIPS_REG_COP0SEL_PERFCTL5] = { .reg_id = REG_SYSPERF },  /* cop0sel_perfctl5 */
+    [MIPS_REG_COP0SEL_PERFCTL6] = { .reg_id = REG_SYSPERF },  /* cop0sel_perfctl6 */
+    [MIPS_REG_COP0SEL_PERFCTL7] = { .reg_id = REG_SYSPERF },  /* cop0sel_perfctl7 */
+    [MIPS_REG_COP0SEL_SEGCTL0] = { .reg_id = REG_SYSMMU },  /* cop0sel_segctl0 */
+    [MIPS_REG_COP0SEL_SEGCTL1] = { .reg_id = REG_SYSMMU },  /* cop0sel_segctl1 */
+    [MIPS_REG_COP0SEL_SEGCTL2] = { .reg_id = REG_SYSMMU },  /* cop0sel_segctl2 */
+    [MIPS_REG_COP0SEL_SRSCONF0] = { .reg_id = REG_SYSID },  /* cop0sel_srsconf0 */
+    [MIPS_REG_COP0SEL_SRSCONF1] = { .reg_id = REG_SYSID },  /* cop0sel_srsconf1 */
+    [MIPS_REG_COP0SEL_SRSCONF2] = { .reg_id = REG_SYSID },  /* cop0sel_srsconf2 */
+    [MIPS_REG_COP0SEL_SRSCONF3] = { .reg_id = REG_SYSID },  /* cop0sel_srsconf3 */
+    [MIPS_REG_COP0SEL_SRSCONF4] = { .reg_id = REG_SYSID },  /* cop0sel_srsconf4 */
+    [MIPS_REG_COP0SEL_SRSMAP2] = { .reg_id = REG_SYSEXC },  /* cop0sel_srsmap2 */
+    [MIPS_REG_COP0SEL_TRACECONTROL2] = { .reg_id = REG_SYSDBG },  /* cop0sel_tracecontrol2 */
+    [MIPS_REG_COP0SEL_TRACECONTROL3] = { .reg_id = REG_SYSDBG },  /* cop0sel_tracecontrol3 */
+    [MIPS_REG_COP0SEL_USERTRACEDATA1] = { .reg_id = REG_SYSDBG },  /* cop0sel_usertracedata1 */
+    [MIPS_REG_COP0SEL_USERTRACEDATA2] = { .reg_id = REG_SYSDBG },  /* cop0sel_usertracedata2 */
     [MIPS_REG_COP0SEL_VPECONF0] = { .reg_id = REG_SYS },  /* cop0sel_vpeconf0 */
     [MIPS_REG_COP0SEL_VPECONF1] = { .reg_id = REG_SYS },  /* cop0sel_vpeconf1 */
-    [MIPS_REG_COP0SEL_WATCHHI0] = { .reg_id = REG_SYS },  /* cop0sel_watchhi0 */
-    [MIPS_REG_COP0SEL_WATCHHI1] = { .reg_id = REG_SYS },  /* cop0sel_watchhi1 */
-    [MIPS_REG_COP0SEL_WATCHHI2] = { .reg_id = REG_SYS },  /* cop0sel_watchhi2 */
-    [MIPS_REG_COP0SEL_WATCHHI3] = { .reg_id = REG_SYS },  /* cop0sel_watchhi3 */
-    [MIPS_REG_COP0SEL_WATCHHI4] = { .reg_id = REG_SYS },  /* cop0sel_watchhi4 */
-    [MIPS_REG_COP0SEL_WATCHHI5] = { .reg_id = REG_SYS },  /* cop0sel_watchhi5 */
-    [MIPS_REG_COP0SEL_WATCHHI6] = { .reg_id = REG_SYS },  /* cop0sel_watchhi6 */
-    [MIPS_REG_COP0SEL_WATCHHI7] = { .reg_id = REG_SYS },  /* cop0sel_watchhi7 */
-    [MIPS_REG_COP0SEL_WATCHHI8] = { .reg_id = REG_SYS },  /* cop0sel_watchhi8 */
-    [MIPS_REG_COP0SEL_WATCHHI9] = { .reg_id = REG_SYS },  /* cop0sel_watchhi9 */
-    [MIPS_REG_COP0SEL_WATCHHI10] = { .reg_id = REG_SYS },  /* cop0sel_watchhi10 */
-    [MIPS_REG_COP0SEL_WATCHHI11] = { .reg_id = REG_SYS },  /* cop0sel_watchhi11 */
-    [MIPS_REG_COP0SEL_WATCHHI12] = { .reg_id = REG_SYS },  /* cop0sel_watchhi12 */
-    [MIPS_REG_COP0SEL_WATCHHI13] = { .reg_id = REG_SYS },  /* cop0sel_watchhi13 */
-    [MIPS_REG_COP0SEL_WATCHHI14] = { .reg_id = REG_SYS },  /* cop0sel_watchhi14 */
-    [MIPS_REG_COP0SEL_WATCHHI15] = { .reg_id = REG_SYS },  /* cop0sel_watchhi15 */
-    [MIPS_REG_COP0SEL_WATCHLO0] = { .reg_id = REG_SYS },  /* cop0sel_watchlo0 */
-    [MIPS_REG_COP0SEL_WATCHLO1] = { .reg_id = REG_SYS },  /* cop0sel_watchlo1 */
-    [MIPS_REG_COP0SEL_WATCHLO2] = { .reg_id = REG_SYS },  /* cop0sel_watchlo2 */
-    [MIPS_REG_COP0SEL_WATCHLO3] = { .reg_id = REG_SYS },  /* cop0sel_watchlo3 */
-    [MIPS_REG_COP0SEL_WATCHLO4] = { .reg_id = REG_SYS },  /* cop0sel_watchlo4 */
-    [MIPS_REG_COP0SEL_WATCHLO5] = { .reg_id = REG_SYS },  /* cop0sel_watchlo5 */
-    [MIPS_REG_COP0SEL_WATCHLO6] = { .reg_id = REG_SYS },  /* cop0sel_watchlo6 */
-    [MIPS_REG_COP0SEL_WATCHLO7] = { .reg_id = REG_SYS },  /* cop0sel_watchlo7 */
-    [MIPS_REG_COP0SEL_WATCHLO8] = { .reg_id = REG_SYS },  /* cop0sel_watchlo8 */
-    [MIPS_REG_COP0SEL_WATCHLO9] = { .reg_id = REG_SYS },  /* cop0sel_watchlo9 */
-    [MIPS_REG_COP0SEL_WATCHLO10] = { .reg_id = REG_SYS },  /* cop0sel_watchlo10 */
-    [MIPS_REG_COP0SEL_WATCHLO11] = { .reg_id = REG_SYS },  /* cop0sel_watchlo11 */
-    [MIPS_REG_COP0SEL_WATCHLO12] = { .reg_id = REG_SYS },  /* cop0sel_watchlo12 */
-    [MIPS_REG_COP0SEL_WATCHLO13] = { .reg_id = REG_SYS },  /* cop0sel_watchlo13 */
-    [MIPS_REG_COP0SEL_WATCHLO14] = { .reg_id = REG_SYS },  /* cop0sel_watchlo14 */
-    [MIPS_REG_COP0SEL_WATCHLO15] = { .reg_id = REG_SYS },  /* cop0sel_watchlo15 */
+    [MIPS_REG_COP0SEL_WATCHHI0] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchhi0 */
+    [MIPS_REG_COP0SEL_WATCHHI1] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchhi1 */
+    [MIPS_REG_COP0SEL_WATCHHI2] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchhi2 */
+    [MIPS_REG_COP0SEL_WATCHHI3] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchhi3 */
+    [MIPS_REG_COP0SEL_WATCHHI4] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchhi4 */
+    [MIPS_REG_COP0SEL_WATCHHI5] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchhi5 */
+    [MIPS_REG_COP0SEL_WATCHHI6] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchhi6 */
+    [MIPS_REG_COP0SEL_WATCHHI7] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchhi7 */
+    [MIPS_REG_COP0SEL_WATCHHI8] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchhi8 */
+    [MIPS_REG_COP0SEL_WATCHHI9] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchhi9 */
+    [MIPS_REG_COP0SEL_WATCHHI10] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchhi10 */
+    [MIPS_REG_COP0SEL_WATCHHI11] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchhi11 */
+    [MIPS_REG_COP0SEL_WATCHHI12] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchhi12 */
+    [MIPS_REG_COP0SEL_WATCHHI13] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchhi13 */
+    [MIPS_REG_COP0SEL_WATCHHI14] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchhi14 */
+    [MIPS_REG_COP0SEL_WATCHHI15] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchhi15 */
+    [MIPS_REG_COP0SEL_WATCHLO0] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchlo0 */
+    [MIPS_REG_COP0SEL_WATCHLO1] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchlo1 */
+    [MIPS_REG_COP0SEL_WATCHLO2] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchlo2 */
+    [MIPS_REG_COP0SEL_WATCHLO3] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchlo3 */
+    [MIPS_REG_COP0SEL_WATCHLO4] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchlo4 */
+    [MIPS_REG_COP0SEL_WATCHLO5] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchlo5 */
+    [MIPS_REG_COP0SEL_WATCHLO6] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchlo6 */
+    [MIPS_REG_COP0SEL_WATCHLO7] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchlo7 */
+    [MIPS_REG_COP0SEL_WATCHLO8] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchlo8 */
+    [MIPS_REG_COP0SEL_WATCHLO9] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchlo9 */
+    [MIPS_REG_COP0SEL_WATCHLO10] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchlo10 */
+    [MIPS_REG_COP0SEL_WATCHLO11] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchlo11 */
+    [MIPS_REG_COP0SEL_WATCHLO12] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchlo12 */
+    [MIPS_REG_COP0SEL_WATCHLO13] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchlo13 */
+    [MIPS_REG_COP0SEL_WATCHLO14] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchlo14 */
+    [MIPS_REG_COP0SEL_WATCHLO15] = { .reg_id = REG_SYSDBG },  /* cop0sel_watchlo15 */
     [MIPS_REG_D0_64] = { .reg_id = REG_FPR0, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f0" } },  /* d0_64 */
     [MIPS_REG_D1_64] = { .reg_id = REG_FPR1, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f1" } },  /* d1_64 */
     [MIPS_REG_D2_64] = { .reg_id = REG_FPR2, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "f2" } },  /* d2_64 */

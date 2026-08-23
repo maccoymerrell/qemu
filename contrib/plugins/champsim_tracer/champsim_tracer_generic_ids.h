@@ -295,8 +295,11 @@ enum GenericRegId {
     /* Special-purpose hardware/value register classes: 225-249 */
     REG_SEG0 = 225,
     REG_SEG1, REG_SEG2, REG_SEG3, REG_SEG4, REG_SEG5,
-    REG_CTRL = 231,
-    REG_DEBUG = 232,
+    /* 231-232 unallocated.  They held REG_CTRL and REG_DEBUG, one ID
+     * for the whole x86 control file and one for the whole debug file;
+     * those are sixteen distinct registers each and now occupy
+     * REG_CTRL0..15 / REG_DEBUG0..15 above.  Left as holes rather than
+     * reused so nothing renumbers. */
     REG_BOUND0 = 233,
     REG_BOUND1, REG_BOUND2, REG_BOUND3,
     REG_ACC0 = 237,
@@ -546,8 +549,6 @@ static inline const char *generic_reg_name(unsigned id)
     /* Specials with explicit IDs first. */
     switch (id) {
     case REG_NONE:    return "REG_NONE";
-    case REG_CTRL:    return "REG_CTRL";
-    case REG_DEBUG:   return "REG_DEBUG";
     case REG_ZERO:    return "REG_ZERO";
     case REG_MATRIX:  return "REG_MATRIX";
     case REG_SYS:      return "REG_SYS";

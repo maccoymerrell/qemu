@@ -126,7 +126,10 @@ def main():
 
     # ---- tracer side, one --batch pass
     hexes = [inscope[k]['hex'] for k in inscope]
-    proc = subprocess.run([ISAX, '--isa=riscv64', '--layer=fields', '--batch'],
+    argv = [ISAX, '--isa=riscv64', '--layer=fields', '--batch']
+    fals = os.environ.get('CST_FALSIFY')
+    if fals: argv.append('--falsify=' + fals)
+    proc = subprocess.run(argv,
                           input='\n'.join(hexes) + '\n', capture_output=True, text=True)
     tr = {}
     rdr = csv.DictReader(proc.stdout.splitlines(), delimiter='\t')
@@ -237,7 +240,7 @@ if __name__ == '__main__':
     cols = ['opcode_id', 'mnemonic', 'hex', 'node', 'opcode', 'ref_status',
             'ref_src', 'ref_dst', 'trc_status', 'trc_src', 'trc_dst',
             'verdict', 'adjudication', 'sig', 'adjudication_note']
-    dest = os.path.join(ROOT, 'attrib.tsv')
+    dest = os.path.join(ROOT, os.environ.get('CST_OUT', 'attrib.tsv'))
     with open(dest, 'w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=cols, delimiter='\t', extrasaction='ignore')
         w.writeheader()
@@ -277,6 +280,18 @@ if __name__ == '__main__':
     lines.append('    read/write footprint by the (op, rd, rs1) table, not by the gate.')
     lines.append('  - extension dirty-state bookkeeping (mstatus/vsstatus .FS/.VS/.SD).')
     lines.append('')
+    lines.append('POWER (the comparison is shown to be able to fail)')
+    lines.append('  isaxcheck --falsify=drop-src:<mnem> damages the dependency model')
+    lines.append('  after isax_fields_decode(), where a real defect would sit.  Replayed')
+    lines.append('  through this comparison:')
+    lines.append('    drop-src:ctz    1 row  flips AGREE->DISAGREE (ctz), nothing else')
+    lines.append('    drop-src:jalr   2 rows flips (jalr, c.jalr -- substring match)')
+    lines.append('    drop-src:add    2 rows flips (add, c.add)')
+    lines.append('    drop-src:lw     3 rows flips (lw, c.lw, c.lwsp)')
+    lines.append('  every flip is SRC-missing on exactly the damaged mnemonics and no')
+    lines.append('  other row moves, so an agreement here is a measured agreement.')
+    lines.append('  Reproduce: CST_FALSIFY=drop-src:ctz CST_OUT=fals.tsv python compare.py')
+    lines.append('')
     lines.append('SHARED ASSUMPTION (not a disagreement, disclosed)')
     lines.append('  For vector operands whose register-group width comes from LMUL/EMUL in')
     lines.append('  vtype, the group size is a RUNTIME value, so no static attribution can')
@@ -302,5 +317,6 @@ if __name__ == '__main__':
         lines.append('  %-72s %s' % (sg[:72], ' '.join(
             '%s=%d' % (k, v) for k, v in nd.most_common(10))))
     txt = '\n'.join(lines) + '\n'
-    open(os.path.join(ROOT, 'attrib_signatures.txt'), 'w').write(txt)
+    if not os.environ.get('CST_FALSIFY'):
+        open(os.path.join(ROOT, 'attrib_signatures.txt'), 'w').write(txt)
     print(txt[:4000])

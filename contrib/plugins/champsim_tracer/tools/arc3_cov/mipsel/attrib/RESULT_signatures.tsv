@@ -1,0 +1,17 @@
+#count	signature	rules	opcodes
+189	SRC-miss{FCSR} DST-miss{FCSR}	Q-FCR31,Q-MSACSR	add.d add.ps add.s addr.ps c.eq.d c.eq.s c.f.d c.f.s c.le.d c.le.s c.lt.d c.lt.s c.nge.d c.nge.s c.ngl.d c.ngl.s c.ngle.d c.ngle.s c.ngt.d c.ngt.s c.ole.d c.ole.s c.olt.d c.olt.s c.seq.d c.seq.s c.sf.d c.sf.s c.ueq.d c.ueq.s c.ule.d c.ule.s c.ult.d c.ult.s c.un.d c.un.s ceil.l.d ceil.l.s ceil.w.d ceil.w.s cvt.d.l cvt.d.s cvt.d.w cvt.l.d cvt.l.s cvt.ps.pw cvt.pw.ps cvt.s.d cvt.s.l cvt.s.pl cvt.s.pu cvt.s.w cvt.w.d cvt.w.s div.d div.s fadd.d fadd.w fcaf.d fcaf.w fceq.d fceq.w fcle.d fcle.w fclt.d fclt.w fcne.d fcne.w fcor.d fcor.w fcueq.d fcueq.w fcule.d fcule.w fcult.d fcult.w fcun.d fcun.w fcune.d fcune.w fdiv.d fdiv.w fexdo.h fexdo.w fexp2.d fexp2.w fexupl.d fexupl.w fexupr.d fexupr.w ffint_s.d ffint_s.w ffint_u.d ffint_u.w ffql.d ffql.w ffqr.d ffqr.w flog2.d flog2.w floor.l.d floor.l.s floor.w.d floor.w.s fmadd.d fmadd.w fmax.d fmax.w fmax_a.d fmax_a.w fmin.d fmin.w fmin_a.d fmin_a.w fmsub.d fmsub.w fmul.d fmul.w frcp.d frcp.w frint.d frint.w frsqrt.d frsqrt.w fsaf.d fsaf.w fseq.d fseq.w fsle.d fsle.w fslt.d fslt.w fsne.d fsne.w fsor.d fsor.w fsqrt.d fsqrt.w fsub.d fsub.w fsueq.d fsueq.w fsule.d fsule.w fsult.d fsult.w fsun.d fsun.w fsune.d fsune.w ftint_s.d ftint_s.w ftint_u.d ftint_u.w ftq.h ftq.w ftrunc_s.d ftrunc_s.w ftrunc_u.d ftrunc_u.w madd.d madd.s msub.d msub.s mul.d mul.ps mul.s mulr.ps nmadd.d nmadd.s nmsub.d nmsub.s recip.d recip.s round.l.d round.l.s round.w.d round.w.s rsqrt.d rsqrt.s sqrt.d sqrt.s sub.d sub.ps sub.s trunc.l.d trunc.l.s trunc.w.d trunc.w.s
+25	SRC-miss{SYS} DST-miss{SYS}	Q-CP0,Q-TRAP	break deret di dmt dvpe ei emt eret evpe sdbbp syscall teq teqi tge tgei tgeiu tgeu tlbp tlbr tlt tlti tltiu tltu tne tnei
+5	SRC-miss{SYS}	Q-CP0	tlbinv tlbinvf tlbwi tlbwr wait
+4	DST-miss{SYS} DST-extra{GPRN}	B2-MTFILE	cttc2 mttc0 mttc2 mtthc2
+4	SRC-miss{SYS} SRC-extra{GPRN}	B2-MTFILE	cftc2 mftc0 mftc2 mfthc2
+3	DST-miss{ACCN} DST-extra{GPRN}	B2-MTFILE	mttacx mtthi mttlo
+3	SRC-miss{ACCN} SRC-extra{GPRN}	B2-MTFILE	mftacx mfthi mftlo
+2	DST-miss{FPRN} DST-extra{GPRN}	B2-MTFILE	mttc1 mtthc1
+2	DST-miss{LLBIT}	Q-LLBIT	ll lle
+2	SRC-miss{FPRN} SRC-extra{GPRN}	B2-MTFILE	mftc1 mfthc1
+2	SRC-miss{GPRN}	R1-TIED	lwle lwre
+2	SRC-miss{LLBIT} DST-miss{LLBIT}	Q-LLBIT	sc sce
+1	DST-miss{FCSR} DST-extra{GPRN}	B2-MTFILE	cttc1
+1	DST-miss{FLAGS} DST-extra{GPRN}	B2-MTFILE	mttdsp
+1	SRC-miss{FCSR} SRC-extra{GPRN}	B2-MTFILE	cftc1
+1	SRC-miss{FLAGS} SRC-extra{GPRN}	B2-MTFILE	mftdsp

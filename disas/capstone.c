@@ -2437,257 +2437,44 @@ static bool cap_aarch64_is_mops_set(const char *mnem)
 }
 
 /*
- * Which register file an AArch64 operand names.
+ * FP forms whose FPCR read Capstone reports on their siblings and not
+ * on them.
  *
- * Capstone's aarch64_reg enum is laid out one contiguous run per file:
- * B0..B31 at 15, D0 at 47, H0 at 79, P0 at 111, Q0 at 143, S0 at 175,
- * W0 at 207, X0 at 238, Z0 at 267, and the SME tiles ZAB0..ZT0 at 299.
- * A 128-bit V register arrives as its Q form.  The file separates
- * instruction FORMS that share a mnemonic and do not share a register
- * contract -- `fabs d2, d1` from `fabs v4.4s, v3.4s`, `sqadd v5.4s, ...`
- * from `sqadd z4.h, ...` -- which is what the FP status/control contract
- * below turns on.
+ * The implicit-register table is inconsistent here rather than
+ * deliberately silent: FCMP and FCMPE carry `fpcr`, FCCMP and FCCMPE
+ * — the same comparison under a condition — carry none; SQDMULH
+ * carries it, SQADD and UQADD do not.  The MRA has all of them reading
+ * FPCR, and for the one-source sign forms it is not incidental:
+ * FEAT_AFP's FPCR.AH changes what FABS and FNEG do to a NaN, and
+ * FPCR.NEP changes whether they merge from Vd.
+ *
+ * Over-reporting an FPCR read is the safe direction.  FPCR is written
+ * once at process start and then read by everything, so a spurious read
+ * adds an edge onto a producer that retired long ago; a spurious FPSR
+ * *write* would instead chain every FP instruction to the last one,
+ * which is why the cumulative-status half of this stays unmodelled.
  */
-typedef enum {
-    CAP_A64_FILE_NONE = 0,
-    CAP_A64_FILE_GPR,
-    CAP_A64_FILE_ADVSIMD,   /* B / H / S / D / Q (the V file) */
-    CAP_A64_FILE_SVE_Z,
-    CAP_A64_FILE_SVE_P,
-    CAP_A64_FILE_ZA,
-    CAP_A64_FILE_OTHER,
-} CapA64RegFile;
-
-static CapA64RegFile cap_aarch64_reg_file(unsigned reg)
+static bool cap_aarch64_reads_fpcr_unreported(const char *mnem)
 {
-    if ((reg >= AARCH64_REG_B0 && reg < AARCH64_REG_B0 + 32) ||
-        (reg >= AARCH64_REG_D0 && reg < AARCH64_REG_D0 + 32) ||
-        (reg >= AARCH64_REG_H0 && reg < AARCH64_REG_H0 + 32) ||
-        (reg >= AARCH64_REG_Q0 && reg < AARCH64_REG_Q0 + 32) ||
-        (reg >= AARCH64_REG_S0 && reg < AARCH64_REG_S0 + 32)) {
-        return CAP_A64_FILE_ADVSIMD;
+    /* Conditional FP compares — siblings FCMP/FCMPE report FPCR. */
+    if (g_str_has_prefix(mnem, "fccmp")) {
+        return true;
     }
-    if (reg >= AARCH64_REG_P0 && reg < AARCH64_REG_P0 + 32) {
-        return CAP_A64_FILE_SVE_P;
+    /* One-source sign manipulation — FPCR.AH / FPCR.NEP dependent. */
+    if (g_str_has_prefix(mnem, "fabs") || g_str_has_prefix(mnem, "fneg")) {
+        return true;
     }
-    if (reg >= AARCH64_REG_Z0 && reg < AARCH64_REG_Z0 + 32) {
-        return CAP_A64_FILE_SVE_Z;
+    /* SVE strictly-ordered FP reduction. */
+    if (g_str_has_prefix(mnem, "fadda")) {
+        return true;
     }
-    if (reg == AARCH64_REG_ZA || reg == AARCH64_REG_Z_MATRIX ||
-        (reg >= AARCH64_REG_ZAB0 && reg <= AARCH64_REG_ZT0)) {
-        /* ZAB0 .. ZT0 is one contiguous run holding every tile spelling
-         * (ZAB0, ZAD0..7, ZAH0..1, ZAQ0..15, ZAS0..3) and the ZT0
-         * lookup-table register. */
-        return CAP_A64_FILE_ZA;
-    }
-    if ((reg >= AARCH64_REG_W0 && reg < AARCH64_REG_W0 + 31) ||
-        (reg >= AARCH64_REG_X0 && reg < AARCH64_REG_X0 + 29) ||
-        reg == AARCH64_REG_WZR || reg == AARCH64_REG_XZR ||
-        reg == AARCH64_REG_LR || reg == AARCH64_REG_SP ||
-        reg == AARCH64_REG_WSP) {
-        return CAP_A64_FILE_GPR;
-    }
-    return reg ? CAP_A64_FILE_OTHER : CAP_A64_FILE_NONE;
-}
-
-/* The register files this instruction's operands name, as a set. */
-typedef struct {
-    bool advsimd;
-    bool sve;               /* a Z or a P operand */
-    bool za;
-    bool arranged;          /* an operand carries a `.4s`-style arrangement */
-} CapA64FileSet;
-
-static void cap_aarch64_note_file(CapA64FileSet *fs, unsigned reg)
-{
-    switch (cap_aarch64_reg_file(reg)) {
-    case CAP_A64_FILE_ADVSIMD:
-        fs->advsimd = true;
-        break;
-    case CAP_A64_FILE_SVE_Z:
-    case CAP_A64_FILE_SVE_P:
-        fs->sve = true;
-        break;
-    case CAP_A64_FILE_ZA:
-        fs->za = true;
-        break;
-    default:
-        break;
-    }
-}
-
-/*
- * @out is consulted alongside the operand array because the SME array
- * accumulate forms name ZA only in the IMPLICIT lists -- Capstone
- * reports `fmla za.d[w10, 5, vgx2], { z8.d, z9.d }, z1.d[1]` with four
- * operands, none of them ZA, and `za` in regs_read / regs_write.  Read
- * from the operands alone the form looks like ordinary SVE FMLA and
- * takes the FPSR write it must not have.
- */
-static CapA64FileSet cap_aarch64_file_set(const cs_arm64 *a64, uint8_t n,
-                                          const qemu_plugin_insn_info *out)
-{
-    CapA64FileSet fs = { false, false, false, false };
-
-    for (uint8_t i = 0; i < out->n_regs_read; i++) {
-        cap_aarch64_note_file(&fs, out->regs_read_id[i]);
-    }
-    for (uint8_t i = 0; i < out->n_regs_write; i++) {
-        cap_aarch64_note_file(&fs, out->regs_write_id[i]);
-    }
-    for (uint8_t i = 0; i < n; i++) {
-        const cs_arm64_op *o = &a64->operands[i];
-        unsigned reg = 0;
-
-        if (o->type == AARCH64_OP_REG) {
-            reg = o->reg;
-        } else if (o->type == AARCH64_OP_MEM) {
-            reg = o->mem.base;
-        } else if (o->type == AARCH64_OP_SME) {
-            /* An SME array operand names its tile in sme.tile, not in
-             * .reg; without this the ZA accumulate forms read as plain
-             * SVE and take an FPSR write they do not have. */
-            reg = o->sme.tile;
-        } else {
-            continue;
-        }
-        cap_aarch64_note_file(&fs, reg);
-        if (o->vas != AARCH64LAYOUT_INVALID) {
-            fs.arranged = true;
-        }
-    }
-    return fs;
-}
-
-/*
- * The FP control and status word, as an operand contract.
- *
- * AArch64 splits the word in two: FPCR carries the rounding mode, the
- * flush-to-zero and default-NaN controls, FEAT_AFP's AH / NEP / FIZ and
- * FEAT_EBF16's EBF, and is an INPUT to the FP datapath; FPSR carries the
- * cumulative IEEE exception bits IXC / IOC / OFC / UFC / IDC and the
- * Advanced SIMD saturation bit QC, and is an OUTPUT of it.  The generic
- * register space folds both onto REG_FCSR (see
- * champsim_tracer_generic_ids.h -- the fold is deliberate and predates
- * this), so what this contract settles is DIRECTION: which side of the
- * instruction the word sits on.
- *
- * Capstone reports part of the input half and none of the output half.
- * Its aarch64_reg enum has AARCH64_REG_FPCR and no AARCH64_REG_FPSR at
- * all, so the FPSR write cannot be named as itself and rides the FPCR
- * id, which reaches the same generic register either way.
- *
- * Three rules, each keyed on the operand FORM rather than the mnemonic
- * alone, because one mnemonic covers forms with different contracts:
- *
- *  1. The FP datapath reads FPCR.  Capstone reports this on most FP
- *     instructions and misses a scattering -- FCMP carries it, FCCMP
- *     does not; SQDMULH carries it and has no business doing so.  Scalar
- *     FABS / FNEG / FMOV read it too, through a different door:
- *     fabs_float's execute ASL opens with `FPCRType fpcr = FPCR[]` and
- *     asks IsMerging(fpcr), so FPCR.NEP decides whether the result
- *     merges with Vd.  The Advanced SIMD and SVE forms of those three
- *     mnemonics have no such read -- their ASL is
- *     `Elem[result,e,esize] = FPAbs(Elem[operand,e,esize])` and nothing
- *     else -- and QEMU agrees: gen_gvec_fabs() is a `gvec_andi` of the
- *     sign mask while the scalar path is selected on s->fpcr_ah
- *     (translate-a64.c).  The rule this replaces put the read on all
- *     three forms.
- *
- *  2. Integer saturating arithmetic reads NOTHING and writes FPSR.QC.
- *     `sqadd`, `sqdmulh`, `uqsub` and the rest compute
- *     `(Elem[result,e,esize], sat) = SatQ(...); if sat then FPSR.QC='1'`
- *     -- no FPCR read on any path.  The rule this replaces had the
- *     direction exactly backwards, naming the status word as a SOURCE
- *     and dropping the write.  The QC write belongs to the Advanced
- *     SIMD forms alone: the SVE and SVE2 spellings of the same
- *     mnemonics (`sqadd z4.h, z3.h, z2.h`, `sqdecd x3, vl2`) saturate
- *     without touching FPSR, so the scope is by register file, not by
- *     name.
- *
- *  3. Everything that can raise an IEEE exception writes FPSR: the whole
- *     FP datapath except the operations that only move or alter bits
- *     (FMOV / FABS / FNEG / FCSEL / FDUP / FEXPA / FTSSEL), the BF16
- *     dot-product and matrix family, which the architecture defines as
- *     neither generating exceptions nor updating FPSR, and the SME ZA
- *     accumulate forms, whose ASL routes through FPAdd_ZA rather than
- *     FPAdd for exactly that reason.
- *
- * Rule 3 ADDS what the tracer did not record before, and the direction
- * is deliberate.  The comment this replaces declined to model the
- * cumulative-status half on the grounds that a status write chains every
- * FP instruction to the last one.  It does -- FPSR.IXC really is an
- * accumulator, and the chain is the architecture's, not the model's.  R5
- * governs: a write that only sometimes changes the value is still a
- * write, and whether an FP status accumulator is worth scheduling
- * against is the consumer's decision, not the tracer's.
- */
-static bool cap_aarch64_is_saturating_int(const char *mnem)
-{
-    /* sq* / uq* -- SQADD, SQDMULH, UQSHL, SQXTN, ... -- plus the two
-     * mixed-sign accumulates SUQADD / USQADD.  No FP mnemonic on this
-     * ISA begins `sq` or `uq` (square root is FSQRT), so the two-letter
-     * test cannot catch one. */
+    /* Saturating integer arithmetic — sibling SQDMULH reports FPCR.
+     * The whole family writes FPSR.QC and takes its saturation
+     * behaviour from FPCR, and Capstone reports it on only part of it. */
     if ((mnem[0] == 's' || mnem[0] == 'u') && mnem[1] == 'q') {
         return true;
     }
-    return g_str_has_prefix(mnem, "suqadd") || g_str_has_prefix(mnem, "usqadd");
-}
-
-/*
- * The BF16 dot-product and matrix family: defined not to generate
- * floating-point exceptions and not to update FPSR.  Only these.  The
- * FEAT_B16B16 arithmetic -- BFADD, BFSUB, BFMUL, BFMLA, BFMLS, BFMAX,
- * BFMIN, BFCLAMP -- and the widening multiply-accumulates BFMLALB /
- * BFMLALT / BFMLSLB / BFMLSLT round through FPMulAdd and do update it,
- * as do the conversions BFCVT / BFCVTN.  All of them, this family
- * included, READ FPCR: FPCR.EBF selects the BF16 arithmetic mode.
- */
-static bool cap_aarch64_is_bf16_nonieee(const char *mnem)
-{
-    static const char *const bf[] = {
-        "bfdot", "bfmmla", "bfmopa", "bfmops", "bfvdot",
-    };
-    for (size_t i = 0; i < ARRAY_SIZE(bf); i++) {
-        if (g_str_has_prefix(mnem, bf[i])) {
-            return true;
-        }
-    }
     return false;
-}
-
-/*
- * An IEEE floating-point operation: one whose result is produced by the
- * FP datapath and can therefore raise IXC / IOC / OFC / UFC / IDC.
- *
- * The `f`-initial mnemonics minus the ones that only move bits, the
- * BF16 arithmetic, and the integer/FP conversions spelled from the
- * integer side (SCVTF / UCVTF).
- */
-static bool cap_aarch64_is_ieee_fp_op(const char *mnem)
-{
-    static const char *const bitonly[] = {
-        "fmov", "fabs", "fneg", "fcsel", "fdup", "fmovi", "fcpy",
-        "fexpa", "ftssel",
-    };
-    for (size_t i = 0; i < ARRAY_SIZE(bitonly); i++) {
-        if (g_strcmp0(mnem, bitonly[i]) == 0) {
-            return false;
-        }
-    }
-    if (g_str_has_prefix(mnem, "scvtf") || g_str_has_prefix(mnem, "ucvtf")) {
-        return true;
-    }
-    if (mnem[0] == 'b' && mnem[1] == 'f') {
-        /* BFI / BFXIL / BFC / BFM are bitfield moves that merely share
-         * the prefix; they are integer instructions. */
-        if (g_strcmp0(mnem, "bfi") == 0 || g_strcmp0(mnem, "bfxil") == 0 ||
-            g_strcmp0(mnem, "bfc") == 0 || g_strcmp0(mnem, "bfm") == 0) {
-            return false;
-        }
-        return !cap_aarch64_is_bf16_nonieee(mnem);
-    }
-    return mnem[0] == 'f';
 }
 
 /* Append @reg to the implicit-read list unless it is already there. */
@@ -2707,110 +2494,6 @@ static void cap_aarch64_add_implicit_read(qemu_plugin_insn_info *out,
                       handle, reg, CS_ARCH_ARM64);
     out->regs_read_id[out->n_regs_read] = reg;
     out->n_regs_read++;
-}
-
-/* Append @reg to the implicit-write list unless it is already there. */
-static void cap_aarch64_add_implicit_write(qemu_plugin_insn_info *out,
-                                           csh handle, unsigned int reg)
-{
-    for (uint8_t i = 0; i < out->n_regs_write; i++) {
-        if (out->regs_write_id[i] == reg) {
-            return;
-        }
-    }
-    if (out->n_regs_write >= QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS) {
-        return;
-    }
-    cap_copy_reg_name(out->regs_write[out->n_regs_write],
-                      QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
-                      handle, reg, CS_ARCH_ARM64);
-    out->regs_write_id[out->n_regs_write] = reg;
-    out->n_regs_write++;
-}
-
-/*
- * Drop @reg from the implicit-read list if Capstone put it there, for
- * the forms where Capstone reports a read the instruction does not
- * perform and the operand walk would otherwise mint a dependency.
- */
-static void cap_aarch64_drop_implicit_read(qemu_plugin_insn_info *out,
-                                           unsigned int reg)
-{
-    for (uint8_t i = 0; i < out->n_regs_read; i++) {
-        if (out->regs_read_id[i] != reg) {
-            continue;
-        }
-        for (uint8_t j = (uint8_t)(i + 1); j < out->n_regs_read; j++) {
-            out->regs_read_id[j - 1] = out->regs_read_id[j];
-            memcpy(out->regs_read[j - 1], out->regs_read[j],
-                   QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ);
-        }
-        out->n_regs_read--;
-        return;
-    }
-}
-
-/*
- * Apply the FP status/control contract described above to one decoded
- * instruction: repair the FPCR reads Capstone reports inconsistently,
- * withdraw the ones it reports for an operand shape that has none, and
- * add the FPSR write it has no register id to express.
- */
-static void cap_aarch64_fp_status_contract(const cs_insn *insn,
-                                           const cs_arm64 *a64,
-                                           csh handle,
-                                           qemu_plugin_insn_info *out)
-{
-    const char *mnem = insn->mnemonic;
-    uint8_t n;
-    CapA64FileSet fs;
-    bool reads_fpcr = false;
-    bool writes_fpsr = false;
-
-    if (!mnem || !mnem[0]) {
-        return;
-    }
-    n = MIN(a64->op_count, QEMU_PLUGIN_INSN_DETAIL_MAX_OPS);
-    fs = cap_aarch64_file_set(a64, n, out);
-
-    if (cap_aarch64_is_saturating_int(mnem)) {
-        /* Rule 2.  Withdraw whatever Capstone reported -- it names FPCR
-         * on SQDMULH and not on SQADD, and neither reads it. */
-        cap_aarch64_drop_implicit_read(out, AARCH64_REG_FPCR);
-        if (fs.advsimd && !fs.sve && !fs.za) {
-            cap_aarch64_add_implicit_write(out, handle, AARCH64_REG_FPCR);
-        }
-        return;
-    }
-
-    /* Rule 1: the input half. */
-    if (cap_aarch64_is_ieee_fp_op(mnem) ||
-        cap_aarch64_is_bf16_nonieee(mnem)) {
-        reads_fpcr = true;
-    }
-    if (g_str_has_prefix(mnem, "fabs") || g_str_has_prefix(mnem, "fneg") ||
-        g_strcmp0(mnem, "fmov") == 0) {
-        /* Scalar float form only -- no arrangement specifier, no Z or P
-         * operand. */
-        if (!fs.arranged && !fs.sve) {
-            reads_fpcr = true;
-        } else {
-            cap_aarch64_drop_implicit_read(out, AARCH64_REG_FPCR);
-        }
-    }
-
-    /* Rule 3: the output half.  The SME ZA accumulate forms route
-     * through FPAdd_ZA and leave FPSR alone. */
-    if (cap_aarch64_is_ieee_fp_op(mnem) && !fs.za) {
-        writes_fpsr = true;
-    }
-
-    if (reads_fpcr) {
-        cap_aarch64_add_implicit_read(out, handle, AARCH64_REG_FPCR);
-    }
-    if (writes_fpsr) {
-        cap_aarch64_add_implicit_write(out, handle, AARCH64_REG_FPCR);
-    }
 }
 
 /*
@@ -3397,14 +3080,16 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
      * docs/troubleshooting.rst.
      */
     /*
-     * The FP status/control contract (see
-     * cap_aarch64_fp_status_contract) is an architectural fact from the
-     * MRA rather than a version-specific Capstone defect, so it is not
-     * conditional on a Capstone revision; it adds only when the register
-     * is not already listed, so a Capstone that starts reporting the
-     * FPCR read cannot double-count.
+     * The FPCR read Capstone reports on these forms' siblings but not on
+     * them (see cap_aarch64_reads_fpcr_unreported) is an architectural
+     * fact from the MRA rather than a version-specific Capstone defect,
+     * so it is not conditional on a Capstone revision; it adds only when
+     * the register is not already listed, so a Capstone that starts
+     * reporting it cannot double-count.
      */
-    cap_aarch64_fp_status_contract(insn, a64, handle, out);
+    if (cap_aarch64_reads_fpcr_unreported(insn->mnemonic)) {
+        cap_aarch64_add_implicit_read(out, handle, AARCH64_REG_FPCR);
+    }
 
     if (insn->id == ARM64_INS_RET && a64->op_count == 0) {
         bool listed = false;

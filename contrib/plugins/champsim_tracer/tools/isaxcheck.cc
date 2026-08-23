@@ -262,7 +262,14 @@ static const IsaCfg kIsaTable[] = {
      * comparisons never look through.  The list is therefore "everything
      * Capstone decodes that LLVM can be told about", not "the extensions a
      * compiler emits", and it is complete: riscv64 reports
-     * subtarget_gap=0/0.
+     * subtarget_gap=0/0.  That number is load-bearing and it has regressed
+     * once already: switching CS_MODE_RISCV_ZICFISS on gave Capstone five
+     * shadow-stack encodings LLVM had not been told about, and the gap
+     * went to 8/1024 (the ssamoswap.* forms) while this comment still
+     * claimed zero.  Zicfiss, Zicfilp and Zcmop are in the optional list
+     * below for that reason; they also make LLVM decode c.mop.1/c.mop.5 as
+     * the shadow-stack pair and auipc x0 as `lpad`, which is what Capstone
+     * had been doing alone.
      *
      * Two of the entries show why the gap has to be measured rather than
      * assumed.  `+zihintntl` is not a rejection case at all: without it
@@ -283,7 +290,9 @@ static const IsaCfg kIsaTable[] = {
       * prefix; both spellings are offered so the gate keeps its coverage
       * across the bump instead of quietly regrowing a gap. */
      "experimental-zacas,zacas,experimental-zimop,zimop,"
-     "experimental-zfbfmin,zfbfmin,experimental-zvfbfwma,zvfbfwma",
+     "experimental-zfbfmin,zfbfmin,experimental-zvfbfwma,zvfbfwma,"
+     "experimental-zicfiss,zicfiss,experimental-zicfilp,zicfilp,"
+     "experimental-zcmop,zcmop",
      CS_ARCH_RISCV,
      CS_MODE_RISCV64 | CS_MODE_RISCV_C | CS_MODE_RISCV_FD | CS_MODE_RISCV_A |
          CS_MODE_RISCV_V | CS_MODE_RISCV_ZBA | CS_MODE_RISCV_ZBB |

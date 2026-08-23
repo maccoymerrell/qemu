@@ -8,6 +8,22 @@ sys.path.insert(0, HERE)
 import sail_effects as S
 import zcmp_profile as ZC
 
+# The two-axis taxonomy is shared by all four ISA harnesses.  A harness runs
+# from a working copy beside its evidence, so look there first and fall back to
+# the tree, which is the source of truth.
+_TOOLS = os.environ.get(
+    'CST_ARC3_TOOLS',
+    '/mnt/md0/QEMU/qemu/contrib/plugins/champsim_tracer/tools/arc3_cov')
+for _p in (HERE, ROOT, os.path.dirname(ROOT), _TOOLS):
+    if os.path.exists(os.path.join(_p, 'arc3_taxonomy.py')):
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
+        break
+else:
+    sys.exit('arc3_taxonomy.py not found (set CST_ARC3_TOOLS)')
+import arc3_taxonomy as tax
+import arc3_rules as taxrules
+
 QEMU = '/mnt/md0/QEMU/qemu'
 ISAX = os.path.join(QEMU, 'build/contrib/plugins/isaxcheck')
 SAIL = os.path.join(ROOT, 'ref/sail-riscv')
@@ -300,6 +316,9 @@ def main():
                                                  '' if c[g] == 1 else 'x%d' % c[g]))
         rec['verdict'] = 'AGREE' if not parts else 'DISAGREE'
         rec['sig'] = ';'.join(parts)
+        # ---- the two axes.  DIRECTION is measured from the very sets the
+        # verdict was taken from, so it cannot drift from it.
+        rec['set_relation'] = tax.set_relation(rs, rd, ts, td)
         adj = [adjudicate_part(rec['node'], p) for p in parts]
         done = [a for a in adj if a[0]]
         if not parts:
@@ -316,6 +335,9 @@ def main():
             extra = any(p.startswith(('SRC-extra', 'DST-extra')) for p in parts)
             rec['adjudication'] = ('MIXED' if miss and extra else
                                    'TRACER-GAP' if miss else 'TRACER-EXTRA')
+            # A derived fallback restates which way the sets differ; it names
+            # no mechanism, so it accounts for nothing (arc3_rules.RISCV).
+
             if done:
                 rec['adjudication'] += '+' + '+'.join(
                     dict.fromkeys(k for k, _ in done))
@@ -334,9 +356,29 @@ def regkey(n):
 
 if __name__ == '__main__':
     out = main()
+    # ---- the two axes, applied to every disagreeing row
+    tax_rows, tax_labels = [], collections.Counter()
+    for r in out:
+        if r['verdict'] != 'DISAGREE':
+            r.setdefault('set_relation', tax.EQUAL if r['verdict'] == 'AGREE'
+                         else 'NOT-COMPARED')
+            r['direction'] = '-' if r['verdict'] == 'AGREE' else 'NOT-COMPARED'
+            r['category'] = '-' if r['verdict'] == 'AGREE' else 'reference-gap'
+            r['accounted'] = '-'
+            continue
+        lab = r.get('adjudication', '')
+        tax_labels[lab] += 1
+        t = tax.classify(r['opcode_id'], r['mnemonic'], lab,
+                         r['set_relation'], taxrules.riscv_rule(lab))
+        tax_rows.append(t)
+        r['direction'] = t.direction
+        r['category'] = t.category
+        r['accounted'] = '1' if t.accounted else '0'
+
     cols = ['opcode_id', 'mnemonic', 'hex', 'profile', 'node', 'opcode',
             'ref_status', 'ref_src', 'ref_dst', 'trc_status', 'trc_src', 'trc_dst',
-            'verdict', 'adjudication', 'sig', 'adjudication_note']
+            'verdict', 'adjudication', 'sig', 'adjudication_note',
+            'set_relation', 'direction', 'category', 'accounted']
     dest = os.path.join(ROOT, os.environ.get('CST_OUT', 'attrib.tsv'))
     with open(dest, 'w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=cols, delimiter='\t', extrasaction='ignore')
@@ -347,6 +389,36 @@ if __name__ == '__main__':
                               if r['verdict'] == 'DISAGREE')
     sigs = collections.Counter(r['sig'] for r in out if r['verdict'] == 'DISAGREE')
     lines = []
+    # A disagreement count on its own hides the whole criterion: every
+    # disagreeing row is classified on DIRECTION (measured from the sets) and
+    # CATEGORY (the mechanism), and the cross-tabulation comes first.
+    lines.append('=' * 78)
+    lines.append('TWO-AXIS CLASSIFICATION OF THE %d DISAGREEING ROWS' % c['DISAGREE'])
+    lines.append('=' * 78)
+    lines.append('')
+    for d in tax.DIRECTIONS:
+        lines.append('  %-16s %s' % (d, tax.DIRECTION_VERDICT[d]))
+    lines.append('')
+    lines.append(tax.render_crosstab(tax_rows,
+                                     'CROSS-TABULATION  direction x category'))
+    lines.append('')
+    lines.append(tax.render_conflicts(tax_rows))
+    lines.append(tax.render_unaccounted(tax_rows))
+    lines.append('LABELS WITH NO RULE  (an adjudication the taxonomy does not map')
+    lines.append('is not an explanation; its rows are UNACCOUNTED above)')
+    _nr = [(k, n) for k, n in tax_labels.most_common()
+           if taxrules.riscv_rule(k) is None]
+    for k, n in _nr:
+        lines.append('  %6d  %s' % (n, k or '(empty)'))
+    if not _nr:
+        lines.append('  (none)')
+    lines.append('')
+    lines.append('MEMOP ATTRIBUTION  (count / address / data for every load and')
+    lines.append('store) is HALF the deliverable and this harness measures none of')
+    lines.append('it: the Sail effect analysis carries the memory clauses and the')
+    lines.append('comparison never reads them.  Reported as a hole, not implied to')
+    lines.append('be covered by the register numbers below.')
+    lines.append('')
     lines.append('riscv64 register attribution: Sail-RISCV reference vs tracer InsnFields')
     lines.append('')
     lines.append('METHOD')

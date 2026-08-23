@@ -1,7 +1,30 @@
 """Compare the tracer's InsnFields register sets against the A64 reference."""
-import csv, json, collections, re, sys
+import csv, json, collections, re, sys, os
 
 BASE = '/mnt/md0/QEMU/cst_runs/_arc3_cov/aarch64'
+
+# The two-axis taxonomy is shared by all four ISA harnesses.  A harness runs
+# from a working copy beside its evidence, so look there first and fall back to
+# the tree, which is the source of truth.
+_D = os.path.dirname(os.path.abspath(__file__))
+_TOOLS = os.environ.get(
+    'CST_ARC3_TOOLS',
+    '/mnt/md0/QEMU/qemu/contrib/plugins/champsim_tracer/tools/arc3_cov')
+for _p in (_D, os.path.dirname(_D), _TOOLS):
+    if os.path.exists(os.path.join(_p, 'arc3_taxonomy.py')):
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
+        break
+else:
+    sys.exit('arc3_taxonomy.py not found (set CST_ARC3_TOOLS)')
+if _D not in sys.path:
+    sys.path.insert(0, _D)
+import arc3_taxonomy as tax
+import arc3_rules as taxrules
+# The adjudication table lives with the adjudicator; the taxonomy translates it
+# rather than restating it, so there is exactly one place a verdict is written.
+from adjudicate import ADJ as _ADJ
+TAXRULES = taxrules.aarch64_rules(_ADJ)
 
 # ---------------------------------------------------------- canonical names
 def canon_gpr(n):
@@ -158,7 +181,8 @@ def main():
     cols = ['opcode_id', 'mnemonic', 'hex', 'disasm', 'instr_class', 'ref_rank',
             'ref_status', 'ref_src', 'ref_dst', 'trc_src', 'trc_dst',
             'verdict', 'signature', 'tierB_ref_only', 'llvm_src', 'llvm_dst',
-            'mra_vs_llvm', 'notes']
+            'mra_vs_llvm', 'notes',
+            'set_relation', 'direction', 'category', 'accounted']
     out.write('\t'.join(cols) + '\n')
 
     counts = collections.Counter()
@@ -166,8 +190,11 @@ def main():
     sig_examples = collections.defaultdict(list)
     xcheck = collections.Counter()
     xsig = collections.Counter()
+    tax_rows = []                       # the two-axis classification per DISAGREE
+    tax_sigs = collections.Counter()    # measured rows per adjudication key
 
     for x in rows:
+        trow = None
         h = x['hex']
         r = ref.get(h, {'status': 'missing', 'notes': ['no-ref-row']})
         t = trc.get(h)
@@ -213,6 +240,13 @@ def main():
                 sig = signature(rsa, rda, tsa, tda)
                 counts['disagree'] += 1
                 sigs[sig] += 1
+                # ---- the two axes.  DIRECTION is measured from the very sets
+                # the verdict was taken from, so it cannot drift from it.
+                rel = tax.set_relation(rsa, rda, tsa, tda)
+                tax_sigs[sig] += 1
+                tax_rows.append(tax.classify(x['opcode_id'], x['mnemonic'],
+                                             sig, rel, TAXRULES.get(sig)))
+                trow = tax_rows[-1]
                 if len(sig_examples[sig]) < 8:
                     sig_examples[sig].append('%s | %s | ref S{%s} D{%s} | trc S{%s} D{%s}' % (
                         x['opcode_id'], x['llvm_disasm'][:34],
@@ -237,10 +271,62 @@ def main():
             ','.join(sorted(ts)) or '-', ','.join(sorted(td)) or '-',
             verdict, sig or '-', tierb if t is not None else '-',
             ','.join(sorted(ls)) or '-', ','.join(sorted(ld)) or '-',
-            mv, ';'.join(r.get('notes', [])) or '-']) + '\n')
+            mv, ';'.join(r.get('notes', [])) or '-',
+            trow.relation if trow else (tax.EQUAL if verdict == 'agree'
+                                        else 'NOT-COMPARED'),
+            trow.direction if trow else ('-' if verdict == 'agree'
+                                         else 'NOT-COMPARED'),
+            trow.category if trow else ('-' if verdict == 'agree'
+                                        else 'reference-gap'),
+            ('1' if trow.accounted else '0') if trow else '-']) + '\n')
     out.close()
 
+    # ------------------------------------------------------------ two axes
+    # A disagreement count on its own hides the whole criterion: every
+    # disagreeing row is classified on DIRECTION (measured from the sets) and
+    # CATEGORY (the mechanism), and the cross-tabulation is printed first.
+    taxtxt = ['=' * 78,
+              'TWO-AXIS CLASSIFICATION OF THE %d DISAGREEING ROWS'
+              % counts['disagree'], '=' * 78, '']
+    for d in tax.DIRECTIONS:
+        taxtxt.append('  %-16s %s' % (d, tax.DIRECTION_VERDICT[d]))
+    taxtxt += ['', tax.render_crosstab(
+        tax_rows, 'CROSS-TABULATION  direction x category'), '',
+        tax.render_conflicts(tax_rows), tax.render_unaccounted(tax_rows)]
+    taxtxt.append('LABELS WITH NO RULE  (an adjudication the taxonomy does not')
+    taxtxt.append('map is not an explanation; its rows are UNACCOUNTED above)')
+    nr = [(k, n) for k, n in tax_sigs.most_common() if k not in TAXRULES]
+    for k, n in nr:
+        taxtxt.append('  %6d  %s' % (n, k))
+    if not nr:
+        taxtxt.append('  (none)')
+    taxtxt.append('')
+    # An adjudication whose prose states a row count is making a checkable
+    # claim about the measurement.  When it stops matching, either the tree
+    # moved under the adjudication or the adjudication was never right.
+    bad = tax.check_stated(TAXRULES, tax_sigs)
+    taxtxt.append('STATED-COUNT CHECK  (an adjudication that says "N rows." is '
+                  'checked against')
+    taxtxt.append('the measurement; a mismatch is a finding, not a rounding)')
+    if bad:
+        for k, st, got in bad:
+            taxtxt.append('  MISMATCH  stated %-4d measured %-4d  %s'
+                          % (st, got, k))
+    else:
+        taxtxt.append('  every stated row count matches the measurement')
+    taxtxt.append('')
+    taxtxt.append('MEMOP ATTRIBUTION  (count / address / data for every load '
+                  'and store) is HALF')
+    taxtxt.append('the deliverable and this harness measures none of it: the '
+                  'reference carries')
+    taxtxt.append('mem_r / mem_w per subject and the comparison never reads '
+                  'them.  Reported as')
+    taxtxt.append('a hole, not implied to be covered by the register numbers.')
+    taxtxt = '\n'.join(taxtxt) + '\n'
+    print(taxtxt)
+
     with open(BASE + '/attrib_signatures.txt', 'w') as f:
+        f.write(taxtxt + '\n')
         f.write('TOTALS %s\n\n' % dict(counts))
         f.write('DISAGREEMENT SIGNATURES (largest first)\n')
         for s, n in sigs.most_common():

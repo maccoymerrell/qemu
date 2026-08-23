@@ -27,6 +27,22 @@ import sys, os, re, json, collections
 D = os.path.dirname(os.path.abspath(__file__))
 COV = os.path.dirname(D)
 
+# The two-axis taxonomy is shared by all four ISA harnesses.  A harness runs
+# from a working copy beside its evidence, so look there first and fall back to
+# the tree, which is the source of truth.
+_TOOLS = os.environ.get(
+    'CST_ARC3_TOOLS',
+    '/mnt/md0/QEMU/qemu/contrib/plugins/champsim_tracer/tools/arc3_cov')
+for _p in (D, os.path.dirname(D), _TOOLS):
+    if os.path.exists(os.path.join(_p, 'arc3_taxonomy.py')):
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
+        break
+else:
+    sys.exit('arc3_taxonomy.py not found (set CST_ARC3_TOOLS)')
+import arc3_taxonomy as tax
+import arc3_rules as taxrules
+
 # ---------------------------------------------------------------- vocabulary
 # The tracer's declared x86 register vocabulary, parsed from its own table.
 TRACER_REG = {}
@@ -266,6 +282,8 @@ mech_count = collections.Counter()
 mech_corro = collections.defaultdict(collections.Counter)
 mech_reach = collections.defaultdict(collections.Counter)
 mech_regs = collections.defaultdict(set)
+tax_rows = []                       # the two-axis classification, one per DISAGREE
+tax_labels = collections.Counter()  # every mechanism label seen, for rule coverage
 n_collapse_dependent = 0
 unprobed_by_reach = collections.Counter()
 
@@ -286,7 +304,9 @@ for opid, mnem, enc_hex, srctab in opcodes:
         unprobed_by_reach[('tracer_decode_fail', reach)] += 1
         rows.append((opid, mnem, enc_hex, md['ext'], hexs, reach, 'UNPROBED',
                      'tracer: decoder does not decode these bytes '
-                     '(no InsnFields produced)', '', '', '', '', 'na'))
+                     '(no InsnFields produced)', '', '', '', '', 'na',
+                     'tracer-decode-gap', 'NOT-COMPARED', 'NOT-COMPARED',
+                     'tracer-defect', '0'))
         continue
     if xed is None or not xed['ok']:
         n_unprobed_ref += 1
@@ -294,7 +314,9 @@ for opid, mnem, enc_hex, srctab in opcodes:
         rows.append((opid, mnem, enc_hex, md['ext'], hexs, reach, 'UNPROBED',
                      'reference: XED does not decode these bytes', '', '',
                      ','.join(sorted(t['src'])) or '-',
-                     ','.join(sorted(t['dst'])) or '-', 'na'))
+                     ','.join(sorted(t['dst'])) or '-', 'na',
+                     'reference-decode-gap', 'NOT-COMPARED', 'NOT-COMPARED',
+                     'reference-gap', '0'))
         continue
 
     axsrc, axdst = adjudicate(hexs, xed['src'], xed['dst'])
@@ -321,7 +343,8 @@ for opid, mnem, enc_hex, srctab in opcodes:
     if not (smiss or sextra or dmiss or dextra):
         n_agree += 1
         rows.append((opid, mnem, enc_hex, md['ext'], hexs, reach, 'AGREE', '',
-                     refs, refd, trs, trd, 'agree'))
+                     refs, refd, trs, trd, 'agree',
+                     '-', tax.EQUAL, '-', '-', '-'))
         continue
 
     n_dis += 1
@@ -356,14 +379,26 @@ for opid, mnem, enc_hex, srctab in opcodes:
         if x.startswith('UNMAPPED:'):
             mech_regs[mech].add(x)
     sig_example.setdefault(sig, (opid, mnem, hexs, refs, refd, trs, trd))
+
+    # ---- the two axes.  DIRECTION is measured from the sets the verdict was
+    # taken from -- the same four -- so it cannot drift from the verdict.
+    rel = tax.set_relation(rsrc, rdst, tsrc, tdst)
+    key = taxrules.x86_key(mech)
+    tax_labels[key] += 1
+    tax_rows.append(tax.classify(opid, mnem, mech, rel,
+                                 taxrules.X86.get(key)))
+    trow = tax_rows[-1]
     rows.append((opid, mnem, enc_hex, md['ext'], hexs, reach, 'DISAGREE', sig,
-                 refs, refd, trs, trd, corro))
+                 refs, refd, trs, trd, corro,
+                 mech, rel, trow.direction, trow.category,
+                 '1' if trow.accounted else '0'))
 
 # ---------------------------------------------------------------- outputs
 with open(os.path.join(COV, 'attrib.tsv'), 'w') as f:
     f.write('#opcode_id\tmnemonic\tencoding_hex\textension\t'
             'probe_hex\tqemu_tcg_reachable\tverdict\tsignature\t'
-            'ref_src\tref_dst\ttracer_src\ttracer_dst\ticed_backs\n')
+            'ref_src\tref_dst\ttracer_src\ttracer_dst\ticed_backs\t'
+            'mechanism\tset_relation\tdirection\tcategory\taccounted\n')
     for r in rows:
         f.write('\t'.join(r) + '\n')
 
@@ -420,6 +455,49 @@ w('AGREEMENT RATE over what was actually probed      : %d/%d = %.2f%%' %
   (n_agree, n_agree + n_dis, pct(n_agree, n_agree + n_dis)))
 w('AGREEMENT RATE over the whole opcode space        : %d/%d = %.2f%%' %
   (n_agree, len(opcodes), pct(n_agree, len(opcodes))))
+w('')
+# ------------------------------------------------------------- the two axes
+# A disagreement count on its own hides the whole criterion.  Every disagreeing
+# row is classified on DIRECTION (measured from the sets) and CATEGORY (the
+# mechanism), and the cross-tabulation is printed before anything else.
+w('=' * 78)
+w('TWO-AXIS CLASSIFICATION OF THE %d DISAGREEING ROWS' % n_dis)
+w('=' * 78)
+w('')
+for d in tax.DIRECTIONS:
+    w('  %-16s %s' % (d, tax.DIRECTION_VERDICT[d]))
+w('')
+w(tax.render_crosstab(tax_rows,
+                      'CROSS-TABULATION  direction x category'))
+w('')
+w(tax.render_conflicts(tax_rows))
+w(tax.render_unaccounted(tax_rows))
+w('LABELS WITH NO RULE  (a mechanism label the taxonomy does not map is not')
+w('an explanation; its rows are UNACCOUNTED and are listed above)')
+_nr = [(k, n) for k, n in tax_labels.most_common() if k not in taxrules.X86]
+for k, n in _nr:
+    w('  %6d  %s' % (n, k))
+if not _nr:
+    w('  (none -- every mechanism label the harness emits maps onto the taxonomy)')
+w('')
+w('NOT COMPARED AT ALL  (an opcode with no comparison has no direction; it is')
+w('the most complete form of dropped information and is counted here, never')
+w('inside the cross-tabulation above)')
+w('  tracer decoder rejects the bytes, qemu-tcg reachable : %d' %
+  sum(v for (why, rc), v in unprobed_by_reach.items()
+      if why == 'tracer_decode_fail' and rc == 'yes'))
+w('  tracer decoder rejects the bytes, not reachable      : %d' %
+  sum(v for (why, rc), v in unprobed_by_reach.items()
+      if why == 'tracer_decode_fail' and rc == 'no'))
+w('  reference decoder rejects the bytes                  : %d' %
+  sum(v for (why, rc), v in unprobed_by_reach.items()
+      if why == 'reference_decode_fail'))
+w('')
+w('MEMOP ATTRIBUTION  (count / address / data for every load and store) is')
+w('HALF the deliverable and this harness does not measure any of it: the')
+w('tracer arm reads f_loads / f_stores and the reference arm carries XED\'s')
+w('memop column, and neither is compared.  Reported as a hole, not implied')
+w('to be covered by the register numbers above.')
 w('')
 w('MECHANISM ROLL-UP  (every disagreement charged to exactly one cause;')
 w('these sum to the %d disagreements above)' % n_dis)

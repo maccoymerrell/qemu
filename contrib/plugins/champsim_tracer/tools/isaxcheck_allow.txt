@@ -4331,3 +4331,505 @@ x86_64 R-rd-missing vxorps +seg
 # redundant prefix is not a feature.  Verify with `--hex=444c1122` (boundary
 # decodes, LLVM rejects) against `--hex=4c1122` (both decode).
 x86_64 D-cs-only lock adcq
+
+# =====================================================================
+# mipsel -- the FLOATING-POINT STATUS WORD the boundary names and LLVM
+# does not (378 entries)
+# =====================================================================
+#
+# WHAT: the boundary reports FCR31 (Capstone prints it `cop31`) or MSACSR
+# as both a read and a write on every COP1 / MSA arithmetic instruction;
+# LLVM MC reports neither.  Signatures `R-rd-phantom` / `R-wr-phantom
+# <mnemonic> +cop#`.
+#
+# WHY IT IS NOT A TRACER DEFECT: the register really is read and written,
+# and LLVM is the side that models nothing.  QEMU's update_fcr31() opens
+# with SET_FP_CAUSE(env->active_fpu.fcr31, ...), a read-modify-write of
+# the word (target/mips/cpu.h:83) executed on every call, then reads
+# GET_FP_ENABLE(fcr31) to decide whether the exception traps;
+# update_msacsr() is the same shape on env->active_tc.msacsr.  The
+# architecture agrees: FCSR carries the rounding mode and the enables as
+# inputs and the Cause and Flags fields as outputs of every arithmetic FP
+# instruction.  LLVM's MIPS tables have no FP status register in any
+# implicit list, which is also why a Capstone bump cannot close this --
+# the gap is in the lineage, not in the decode.  See cap_mips_fp_ctrl_reg
+# in disas/capstone.c for the class, its derivation from QEMU's call
+# graph, and the exclusions (abs / neg / the moves / cvt.ps.s / fclass /
+# fill) that are deliberately NOT listed here.
+#
+# HOW TO DELETE: if LLVM MC ever declares FCR31 / MSACSR on MIPS FP
+# arithmetic these signatures stop appearing and the gate's dead-rule arm
+# fails on them.  Spot-check with `isaxcheck --isa=mipsel --hex=00290646`
+# (`add.s`): the `llvm` line must name the control register beside `f4`.
+mipsel R-rd-phantom add.d +cop#
+mipsel R-wr-phantom add.d +cop#
+mipsel R-rd-phantom add.ps +cop#
+mipsel R-wr-phantom add.ps +cop#
+mipsel R-rd-phantom add.s +cop#
+mipsel R-wr-phantom add.s +cop#
+mipsel R-rd-phantom addr.ps +cop#
+mipsel R-wr-phantom addr.ps +cop#
+mipsel R-rd-phantom c.eq.d +cop#
+mipsel R-wr-phantom c.eq.d +cop#
+mipsel R-rd-phantom c.eq.s +cop#
+mipsel R-wr-phantom c.eq.s +cop#
+mipsel R-rd-phantom c.f.d +cop#
+mipsel R-wr-phantom c.f.d +cop#
+mipsel R-rd-phantom c.f.s +cop#
+mipsel R-wr-phantom c.f.s +cop#
+mipsel R-rd-phantom c.le.d +cop#
+mipsel R-wr-phantom c.le.d +cop#
+mipsel R-rd-phantom c.le.s +cop#
+mipsel R-wr-phantom c.le.s +cop#
+mipsel R-rd-phantom c.lt.d +cop#
+mipsel R-wr-phantom c.lt.d +cop#
+mipsel R-rd-phantom c.lt.s +cop#
+mipsel R-wr-phantom c.lt.s +cop#
+mipsel R-rd-phantom c.nge.d +cop#
+mipsel R-wr-phantom c.nge.d +cop#
+mipsel R-rd-phantom c.nge.s +cop#
+mipsel R-wr-phantom c.nge.s +cop#
+mipsel R-rd-phantom c.ngl.d +cop#
+mipsel R-wr-phantom c.ngl.d +cop#
+mipsel R-rd-phantom c.ngl.s +cop#
+mipsel R-wr-phantom c.ngl.s +cop#
+mipsel R-rd-phantom c.ngle.d +cop#
+mipsel R-wr-phantom c.ngle.d +cop#
+mipsel R-rd-phantom c.ngle.s +cop#
+mipsel R-wr-phantom c.ngle.s +cop#
+mipsel R-rd-phantom c.ngt.d +cop#
+mipsel R-wr-phantom c.ngt.d +cop#
+mipsel R-rd-phantom c.ngt.s +cop#
+mipsel R-wr-phantom c.ngt.s +cop#
+mipsel R-rd-phantom c.ole.d +cop#
+mipsel R-wr-phantom c.ole.d +cop#
+mipsel R-rd-phantom c.ole.s +cop#
+mipsel R-wr-phantom c.ole.s +cop#
+mipsel R-rd-phantom c.olt.d +cop#
+mipsel R-wr-phantom c.olt.d +cop#
+mipsel R-rd-phantom c.olt.s +cop#
+mipsel R-wr-phantom c.olt.s +cop#
+mipsel R-rd-phantom c.seq.d +cop#
+mipsel R-wr-phantom c.seq.d +cop#
+mipsel R-rd-phantom c.seq.s +cop#
+mipsel R-wr-phantom c.seq.s +cop#
+mipsel R-rd-phantom c.sf.d +cop#
+mipsel R-wr-phantom c.sf.d +cop#
+mipsel R-rd-phantom c.sf.s +cop#
+mipsel R-wr-phantom c.sf.s +cop#
+mipsel R-rd-phantom c.ueq.d +cop#
+mipsel R-wr-phantom c.ueq.d +cop#
+mipsel R-rd-phantom c.ueq.s +cop#
+mipsel R-wr-phantom c.ueq.s +cop#
+mipsel R-rd-phantom c.ule.d +cop#
+mipsel R-wr-phantom c.ule.d +cop#
+mipsel R-rd-phantom c.ule.s +cop#
+mipsel R-wr-phantom c.ule.s +cop#
+mipsel R-rd-phantom c.ult.d +cop#
+mipsel R-wr-phantom c.ult.d +cop#
+mipsel R-rd-phantom c.ult.s +cop#
+mipsel R-wr-phantom c.ult.s +cop#
+mipsel R-rd-phantom c.un.d +cop#
+mipsel R-wr-phantom c.un.d +cop#
+mipsel R-rd-phantom c.un.s +cop#
+mipsel R-wr-phantom c.un.s +cop#
+mipsel R-rd-phantom ceil.l.d +cop#
+mipsel R-wr-phantom ceil.l.d +cop#
+mipsel R-rd-phantom ceil.l.s +cop#
+mipsel R-wr-phantom ceil.l.s +cop#
+mipsel R-rd-phantom ceil.w.d +cop#
+mipsel R-wr-phantom ceil.w.d +cop#
+mipsel R-rd-phantom ceil.w.s +cop#
+mipsel R-wr-phantom ceil.w.s +cop#
+mipsel R-rd-phantom cvt.d.l +cop#
+mipsel R-wr-phantom cvt.d.l +cop#
+mipsel R-rd-phantom cvt.d.s +cop#
+mipsel R-wr-phantom cvt.d.s +cop#
+mipsel R-rd-phantom cvt.d.w +cop#
+mipsel R-wr-phantom cvt.d.w +cop#
+mipsel R-rd-phantom cvt.l.d +cop#
+mipsel R-wr-phantom cvt.l.d +cop#
+mipsel R-rd-phantom cvt.l.s +cop#
+mipsel R-wr-phantom cvt.l.s +cop#
+mipsel R-rd-phantom cvt.ps.pw +cop#
+mipsel R-wr-phantom cvt.ps.pw +cop#
+mipsel R-rd-phantom cvt.pw.ps +cop#
+mipsel R-wr-phantom cvt.pw.ps +cop#
+mipsel R-rd-phantom cvt.s.d +cop#
+mipsel R-wr-phantom cvt.s.d +cop#
+mipsel R-rd-phantom cvt.s.l +cop#
+mipsel R-wr-phantom cvt.s.l +cop#
+mipsel R-rd-phantom cvt.s.pl +cop#
+mipsel R-wr-phantom cvt.s.pl +cop#
+mipsel R-rd-phantom cvt.s.pu +cop#
+mipsel R-wr-phantom cvt.s.pu +cop#
+mipsel R-rd-phantom cvt.s.w +cop#
+mipsel R-wr-phantom cvt.s.w +cop#
+mipsel R-rd-phantom cvt.w.d +cop#
+mipsel R-wr-phantom cvt.w.d +cop#
+mipsel R-rd-phantom cvt.w.s +cop#
+mipsel R-wr-phantom cvt.w.s +cop#
+mipsel R-rd-phantom div.d +cop#
+mipsel R-wr-phantom div.d +cop#
+mipsel R-rd-phantom div.s +cop#
+mipsel R-wr-phantom div.s +cop#
+mipsel R-rd-phantom fadd.d +cop#
+mipsel R-wr-phantom fadd.d +cop#
+mipsel R-rd-phantom fadd.w +cop#
+mipsel R-wr-phantom fadd.w +cop#
+mipsel R-rd-phantom fcaf.d +cop#
+mipsel R-wr-phantom fcaf.d +cop#
+mipsel R-rd-phantom fcaf.w +cop#
+mipsel R-wr-phantom fcaf.w +cop#
+mipsel R-rd-phantom fceq.d +cop#
+mipsel R-wr-phantom fceq.d +cop#
+mipsel R-rd-phantom fceq.w +cop#
+mipsel R-wr-phantom fceq.w +cop#
+mipsel R-rd-phantom fcle.d +cop#
+mipsel R-wr-phantom fcle.d +cop#
+mipsel R-rd-phantom fcle.w +cop#
+mipsel R-wr-phantom fcle.w +cop#
+mipsel R-rd-phantom fclt.d +cop#
+mipsel R-wr-phantom fclt.d +cop#
+mipsel R-rd-phantom fclt.w +cop#
+mipsel R-wr-phantom fclt.w +cop#
+mipsel R-rd-phantom fcne.d +cop#
+mipsel R-wr-phantom fcne.d +cop#
+mipsel R-rd-phantom fcne.w +cop#
+mipsel R-wr-phantom fcne.w +cop#
+mipsel R-rd-phantom fcor.d +cop#
+mipsel R-wr-phantom fcor.d +cop#
+mipsel R-rd-phantom fcor.w +cop#
+mipsel R-wr-phantom fcor.w +cop#
+mipsel R-rd-phantom fcueq.d +cop#
+mipsel R-wr-phantom fcueq.d +cop#
+mipsel R-rd-phantom fcueq.w +cop#
+mipsel R-wr-phantom fcueq.w +cop#
+mipsel R-rd-phantom fcule.d +cop#
+mipsel R-wr-phantom fcule.d +cop#
+mipsel R-rd-phantom fcule.w +cop#
+mipsel R-wr-phantom fcule.w +cop#
+mipsel R-rd-phantom fcult.d +cop#
+mipsel R-wr-phantom fcult.d +cop#
+mipsel R-rd-phantom fcult.w +cop#
+mipsel R-wr-phantom fcult.w +cop#
+mipsel R-rd-phantom fcun.d +cop#
+mipsel R-wr-phantom fcun.d +cop#
+mipsel R-rd-phantom fcun.w +cop#
+mipsel R-wr-phantom fcun.w +cop#
+mipsel R-rd-phantom fcune.d +cop#
+mipsel R-wr-phantom fcune.d +cop#
+mipsel R-rd-phantom fcune.w +cop#
+mipsel R-wr-phantom fcune.w +cop#
+mipsel R-rd-phantom fdiv.d +cop#
+mipsel R-wr-phantom fdiv.d +cop#
+mipsel R-rd-phantom fdiv.w +cop#
+mipsel R-wr-phantom fdiv.w +cop#
+mipsel R-rd-phantom fexdo.h +cop#
+mipsel R-wr-phantom fexdo.h +cop#
+mipsel R-rd-phantom fexdo.w +cop#
+mipsel R-wr-phantom fexdo.w +cop#
+mipsel R-rd-phantom fexp2.d +cop#
+mipsel R-wr-phantom fexp2.d +cop#
+mipsel R-rd-phantom fexp2.w +cop#
+mipsel R-wr-phantom fexp2.w +cop#
+mipsel R-rd-phantom fexupl.d +cop#
+mipsel R-wr-phantom fexupl.d +cop#
+mipsel R-rd-phantom fexupl.w +cop#
+mipsel R-wr-phantom fexupl.w +cop#
+mipsel R-rd-phantom fexupr.d +cop#
+mipsel R-wr-phantom fexupr.d +cop#
+mipsel R-rd-phantom fexupr.w +cop#
+mipsel R-wr-phantom fexupr.w +cop#
+mipsel R-rd-phantom ffint_s.d +cop#
+mipsel R-wr-phantom ffint_s.d +cop#
+mipsel R-rd-phantom ffint_s.w +cop#
+mipsel R-wr-phantom ffint_s.w +cop#
+mipsel R-rd-phantom ffint_u.d +cop#
+mipsel R-wr-phantom ffint_u.d +cop#
+mipsel R-rd-phantom ffint_u.w +cop#
+mipsel R-wr-phantom ffint_u.w +cop#
+mipsel R-rd-phantom ffql.d +cop#
+mipsel R-wr-phantom ffql.d +cop#
+mipsel R-rd-phantom ffql.w +cop#
+mipsel R-wr-phantom ffql.w +cop#
+mipsel R-rd-phantom ffqr.d +cop#
+mipsel R-wr-phantom ffqr.d +cop#
+mipsel R-rd-phantom ffqr.w +cop#
+mipsel R-wr-phantom ffqr.w +cop#
+mipsel R-rd-phantom flog2.d +cop#
+mipsel R-wr-phantom flog2.d +cop#
+mipsel R-rd-phantom flog2.w +cop#
+mipsel R-wr-phantom flog2.w +cop#
+mipsel R-rd-phantom floor.l.d +cop#
+mipsel R-wr-phantom floor.l.d +cop#
+mipsel R-rd-phantom floor.l.s +cop#
+mipsel R-wr-phantom floor.l.s +cop#
+mipsel R-rd-phantom floor.w.d +cop#
+mipsel R-wr-phantom floor.w.d +cop#
+mipsel R-rd-phantom floor.w.s +cop#
+mipsel R-wr-phantom floor.w.s +cop#
+mipsel R-rd-phantom fmadd.d +cop#
+mipsel R-wr-phantom fmadd.d +cop#
+mipsel R-rd-phantom fmadd.w +cop#
+mipsel R-wr-phantom fmadd.w +cop#
+mipsel R-rd-phantom fmax.d +cop#
+mipsel R-wr-phantom fmax.d +cop#
+mipsel R-rd-phantom fmax.w +cop#
+mipsel R-wr-phantom fmax.w +cop#
+mipsel R-rd-phantom fmax_a.d +cop#
+mipsel R-wr-phantom fmax_a.d +cop#
+mipsel R-rd-phantom fmax_a.w +cop#
+mipsel R-wr-phantom fmax_a.w +cop#
+mipsel R-rd-phantom fmin.d +cop#
+mipsel R-wr-phantom fmin.d +cop#
+mipsel R-rd-phantom fmin.w +cop#
+mipsel R-wr-phantom fmin.w +cop#
+mipsel R-rd-phantom fmin_a.d +cop#
+mipsel R-wr-phantom fmin_a.d +cop#
+mipsel R-rd-phantom fmin_a.w +cop#
+mipsel R-wr-phantom fmin_a.w +cop#
+mipsel R-rd-phantom fmsub.d +cop#
+mipsel R-wr-phantom fmsub.d +cop#
+mipsel R-rd-phantom fmsub.w +cop#
+mipsel R-wr-phantom fmsub.w +cop#
+mipsel R-rd-phantom fmul.d +cop#
+mipsel R-wr-phantom fmul.d +cop#
+mipsel R-rd-phantom fmul.w +cop#
+mipsel R-wr-phantom fmul.w +cop#
+mipsel R-rd-phantom frcp.d +cop#
+mipsel R-wr-phantom frcp.d +cop#
+mipsel R-rd-phantom frcp.w +cop#
+mipsel R-wr-phantom frcp.w +cop#
+mipsel R-rd-phantom frint.d +cop#
+mipsel R-wr-phantom frint.d +cop#
+mipsel R-rd-phantom frint.w +cop#
+mipsel R-wr-phantom frint.w +cop#
+mipsel R-rd-phantom frsqrt.d +cop#
+mipsel R-wr-phantom frsqrt.d +cop#
+mipsel R-rd-phantom frsqrt.w +cop#
+mipsel R-wr-phantom frsqrt.w +cop#
+mipsel R-rd-phantom fsaf.d +cop#
+mipsel R-wr-phantom fsaf.d +cop#
+mipsel R-rd-phantom fsaf.w +cop#
+mipsel R-wr-phantom fsaf.w +cop#
+mipsel R-rd-phantom fseq.d +cop#
+mipsel R-wr-phantom fseq.d +cop#
+mipsel R-rd-phantom fseq.w +cop#
+mipsel R-wr-phantom fseq.w +cop#
+mipsel R-rd-phantom fsle.d +cop#
+mipsel R-wr-phantom fsle.d +cop#
+mipsel R-rd-phantom fsle.w +cop#
+mipsel R-wr-phantom fsle.w +cop#
+mipsel R-rd-phantom fslt.d +cop#
+mipsel R-wr-phantom fslt.d +cop#
+mipsel R-rd-phantom fslt.w +cop#
+mipsel R-wr-phantom fslt.w +cop#
+mipsel R-rd-phantom fsne.d +cop#
+mipsel R-wr-phantom fsne.d +cop#
+mipsel R-rd-phantom fsne.w +cop#
+mipsel R-wr-phantom fsne.w +cop#
+mipsel R-rd-phantom fsor.d +cop#
+mipsel R-wr-phantom fsor.d +cop#
+mipsel R-rd-phantom fsor.w +cop#
+mipsel R-wr-phantom fsor.w +cop#
+mipsel R-rd-phantom fsqrt.d +cop#
+mipsel R-wr-phantom fsqrt.d +cop#
+mipsel R-rd-phantom fsqrt.w +cop#
+mipsel R-wr-phantom fsqrt.w +cop#
+mipsel R-rd-phantom fsub.d +cop#
+mipsel R-wr-phantom fsub.d +cop#
+mipsel R-rd-phantom fsub.w +cop#
+mipsel R-wr-phantom fsub.w +cop#
+mipsel R-rd-phantom fsueq.d +cop#
+mipsel R-wr-phantom fsueq.d +cop#
+mipsel R-rd-phantom fsueq.w +cop#
+mipsel R-wr-phantom fsueq.w +cop#
+mipsel R-rd-phantom fsule.d +cop#
+mipsel R-wr-phantom fsule.d +cop#
+mipsel R-rd-phantom fsule.w +cop#
+mipsel R-wr-phantom fsule.w +cop#
+mipsel R-rd-phantom fsult.d +cop#
+mipsel R-wr-phantom fsult.d +cop#
+mipsel R-rd-phantom fsult.w +cop#
+mipsel R-wr-phantom fsult.w +cop#
+mipsel R-rd-phantom fsun.d +cop#
+mipsel R-wr-phantom fsun.d +cop#
+mipsel R-rd-phantom fsun.w +cop#
+mipsel R-wr-phantom fsun.w +cop#
+mipsel R-rd-phantom fsune.d +cop#
+mipsel R-wr-phantom fsune.d +cop#
+mipsel R-rd-phantom fsune.w +cop#
+mipsel R-wr-phantom fsune.w +cop#
+mipsel R-rd-phantom ftint_s.d +cop#
+mipsel R-wr-phantom ftint_s.d +cop#
+mipsel R-rd-phantom ftint_s.w +cop#
+mipsel R-wr-phantom ftint_s.w +cop#
+mipsel R-rd-phantom ftint_u.d +cop#
+mipsel R-wr-phantom ftint_u.d +cop#
+mipsel R-rd-phantom ftint_u.w +cop#
+mipsel R-wr-phantom ftint_u.w +cop#
+mipsel R-rd-phantom ftq.h +cop#
+mipsel R-wr-phantom ftq.h +cop#
+mipsel R-rd-phantom ftq.w +cop#
+mipsel R-wr-phantom ftq.w +cop#
+mipsel R-rd-phantom ftrunc_s.d +cop#
+mipsel R-wr-phantom ftrunc_s.d +cop#
+mipsel R-rd-phantom ftrunc_s.w +cop#
+mipsel R-wr-phantom ftrunc_s.w +cop#
+mipsel R-rd-phantom ftrunc_u.d +cop#
+mipsel R-wr-phantom ftrunc_u.d +cop#
+mipsel R-rd-phantom ftrunc_u.w +cop#
+mipsel R-wr-phantom ftrunc_u.w +cop#
+mipsel R-rd-phantom madd.d +cop#
+mipsel R-wr-phantom madd.d +cop#
+mipsel R-rd-phantom madd.s +cop#
+mipsel R-wr-phantom madd.s +cop#
+mipsel R-rd-phantom msub.d +cop#
+mipsel R-wr-phantom msub.d +cop#
+mipsel R-rd-phantom msub.s +cop#
+mipsel R-wr-phantom msub.s +cop#
+mipsel R-rd-phantom mul.d +cop#
+mipsel R-wr-phantom mul.d +cop#
+mipsel R-rd-phantom mul.ps +cop#
+mipsel R-wr-phantom mul.ps +cop#
+mipsel R-rd-phantom mul.s +cop#
+mipsel R-wr-phantom mul.s +cop#
+mipsel R-rd-phantom mulr.ps +cop#
+mipsel R-wr-phantom mulr.ps +cop#
+mipsel R-rd-phantom nmadd.d +cop#
+mipsel R-wr-phantom nmadd.d +cop#
+mipsel R-rd-phantom nmadd.s +cop#
+mipsel R-wr-phantom nmadd.s +cop#
+mipsel R-rd-phantom nmsub.d +cop#
+mipsel R-wr-phantom nmsub.d +cop#
+mipsel R-rd-phantom nmsub.s +cop#
+mipsel R-wr-phantom nmsub.s +cop#
+mipsel R-rd-phantom recip.d +cop#
+mipsel R-wr-phantom recip.d +cop#
+mipsel R-rd-phantom recip.s +cop#
+mipsel R-wr-phantom recip.s +cop#
+mipsel R-rd-phantom round.l.d +cop#
+mipsel R-wr-phantom round.l.d +cop#
+mipsel R-rd-phantom round.l.s +cop#
+mipsel R-wr-phantom round.l.s +cop#
+mipsel R-rd-phantom round.w.d +cop#
+mipsel R-wr-phantom round.w.d +cop#
+mipsel R-rd-phantom round.w.s +cop#
+mipsel R-wr-phantom round.w.s +cop#
+mipsel R-rd-phantom rsqrt.d +cop#
+mipsel R-wr-phantom rsqrt.d +cop#
+mipsel R-rd-phantom rsqrt.s +cop#
+mipsel R-wr-phantom rsqrt.s +cop#
+mipsel R-rd-phantom sqrt.d +cop#
+mipsel R-wr-phantom sqrt.d +cop#
+mipsel R-rd-phantom sqrt.s +cop#
+mipsel R-wr-phantom sqrt.s +cop#
+mipsel R-rd-phantom sub.d +cop#
+mipsel R-wr-phantom sub.d +cop#
+mipsel R-rd-phantom sub.ps +cop#
+mipsel R-wr-phantom sub.ps +cop#
+mipsel R-rd-phantom sub.s +cop#
+mipsel R-wr-phantom sub.s +cop#
+mipsel R-rd-phantom trunc.l.d +cop#
+mipsel R-wr-phantom trunc.l.d +cop#
+mipsel R-rd-phantom trunc.l.s +cop#
+mipsel R-wr-phantom trunc.l.s +cop#
+mipsel R-rd-phantom trunc.w.d +cop#
+mipsel R-wr-phantom trunc.w.d +cop#
+mipsel R-rd-phantom trunc.w.s +cop#
+mipsel R-wr-phantom trunc.w.s +cop#
+
+# =====================================================================
+# mipsel -- the CP0 registers a system-control instruction OWNS
+# =====================================================================
+#
+# WHAT: the boundary reports a CP0 register on the TLB and CP0-control
+# instructions; LLVM reports none.
+#
+# WHY IT IS NOT A TRACER DEFECT: CP0 access is the entire architectural
+# effect of these instructions, and QEMU's helpers name the registers one
+# at a time -- r4k_helper_tlbr writes EntryHi/EntryLo0/EntryLo1/PageMask
+# and reads Index (target/mips/tcg/system/tlb_helper.c:240),
+# exception_return reads Status/EPC/ErrorEPC and clears EXL,
+# helper_dvpe/evpe read-modify-write MVPControl.  LLVM's MIPS descriptors
+# carry no implicit CP0 list at all.  This is NOT the footprint of an
+# exception: the trap forms (syscall / break / sdbbp / t*) are
+# deliberately absent, because by that rule every load that can miss the
+# TLB would name CP0 too.  The tracer folds every CP0 register onto one
+# REG_SYS bucket, so the CP0 number chosen at the boundary describes the
+# access rather than being individually resolvable.
+#
+# HOW TO DELETE: if LLVM MC grows implicit CP0 lists for these the
+# signatures stop appearing and the dead-rule arm fails.  Spot-check with
+# `--hex=02000042` (`tlbwi`) and `--hex=18000042` (`eret`).
+mipsel R-rd-phantom deret +cop#
+mipsel R-wr-phantom deret +cop#
+mipsel R-rd-phantom dvpe +cop#
+mipsel R-wr-phantom dvpe +cop#
+mipsel R-rd-phantom eret +cop#
+mipsel R-wr-phantom eret +cop#
+mipsel R-rd-phantom evpe +cop#
+mipsel R-wr-phantom evpe +cop#
+mipsel R-rd-phantom tlbinv +cop#
+mipsel R-rd-phantom tlbinvf +cop#
+mipsel R-rd-phantom tlbp +cop#
+mipsel R-wr-phantom tlbp +cop#
+mipsel R-rd-phantom tlbr +cop#
+mipsel R-wr-phantom tlbr +cop#
+mipsel R-rd-phantom tlbwi +cop#
+mipsel R-rd-phantom tlbwr +cop#
+mipsel R-rd-phantom wait +cop#
+
+# =====================================================================
+# mipsel -- the MT ASE far operand's register FILE
+# =====================================================================
+#
+# WHAT: on MFTR / MTTR the boundary reports the far operand in the file
+# the (u, sel) pair selects -- CP0, DSP accumulator, DSPControl, FPR, FP
+# control or COP2 -- where LLVM reports a GPR.  Hence the paired
+# `+cop#`/`+ac#`/`+dsp`/`+f#` phantom and the `+r#` missing on the same
+# encoding: one operand reclassified, not two disagreements.
+#
+# WHY IT IS NOT A TRACER DEFECT: the far operand is not a GPR, and
+# reporting it as one both fabricates a dependency on a register the
+# instruction never touches and deletes the one it does.  QEMU's gen_mftr
+# / gen_mttr switch on exactly this pair (target/mips/tcg/translate.c:8077
+# and :8301); binutils' mips-opc.c is the only static reference that names
+# the file per form.  mftgpr / mttgpr (u=1, sel=0) genuinely ARE
+# GPR-to-GPR, agree with LLVM, and are absent here -- the family is not
+# corrected wholesale.
+#
+# HOW TO DELETE: if LLVM models the MFTR/MTTR operand classes these stop
+# appearing.  Spot-check with `--hex=00200541` (`mftc0 $a0, $5`, must read
+# a CP0 register) against `--hex=20200541` (`mftgpr`, must still read r5).
+mipsel R-rd-missing mftr +r#
+mipsel R-rd-phantom mftr +ac#
+mipsel R-rd-phantom mftr +cop#
+mipsel R-rd-phantom mftr +dsp
+mipsel R-rd-phantom mftr +f#
+mipsel R-wr-missing mttr +r#
+mipsel R-wr-phantom mttr +ac#
+mipsel R-wr-phantom mttr +cop#
+mipsel R-wr-phantom mttr +f#
+
+# =====================================================================
+# mipsel -- the EVA unaligned loads merge into their destination
+# =====================================================================
+#
+# WHAT: the boundary reports $rt as a READ on `lwle` / `lwre`; the sweep's
+# LLVM side reports no read because the disassembled MCInst leaves the
+# tied operand unmaterialised.
+#
+# WHY IT IS NOT A TRACER DEFECT: the read is real and LLVM's own
+# MCInstrDesc carries TIED_TO for it -- only the MCInst drops it, the same
+# shape as the plain LWL/LWR entries.  QEMU makes it literal: `case
+# OPC_LWLE:` sets mem_idx and falls straight through into `case OPC_LWL:`,
+# whose body opens with gen_load_gpr(t1, rt)
+# (target/mips/tcg/translate.c:2128).  A partial write that keeps the rest
+# of the register is a read-modify-write.
+#
+# HOW TO DELETE: if Capstone or LLVM materialises the tie, re-check with
+# `--hex=1900a47c` / `--hex=1a00a47c`.
+mipsel R-rd-phantom lwle +r#
+mipsel R-rd-phantom lwre +r#

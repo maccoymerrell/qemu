@@ -583,37 +583,48 @@ _register_probe('probe_rv_v0_carry_mask', {
                     '    ".option pop"',
         'clobbers': '"t0","memory"',
         'opcodes':  [],
-        # REG_VCTRL is vl/vtype, the vector configuration every RVV
-        # instruction consumes; REG_VEC0 is the carry/select operand
-        # this probe exists for.  Note its absence on the last two.
+        # REG_VCTRL is the vector control word: vl and vtype, which every
+        # RVV instruction consumes, and vstart, which every one of them
+        # WRITES (RVV v1.0 sec 3.7 -- "reset to zero at the end of
+        # execution of any vector instruction"), so it stands on both
+        # sides of every row but the vsetvli.  REG_VEC0 is the
+        # carry/select operand this probe exists for; note its absence on
+        # the last two, which encode no carry-in.
         #
-        # The vmadc / vmsbc rows also name their DESTINATION as a source.
-        # Their destination is a MASK register, and a mask tail is
-        # undisturbed regardless of vtype.vta, so the previous contents
-        # survive and the write is a read-modify-write.  vadc / vsbc /
-        # vmerge write full vectors, whose tail policy is a runtime CSR
-        # the instruction word cannot decide, so they do not.
+        # Every row names its DESTINATION as a source.  Tail-undisturbed,
+        # mask-undisturbed and prestart each leave part of vd standing and
+        # all three are settled at runtime by vtype and vstart, so no
+        # encoding can rule the dependency out; under R5 the read is
+        # recorded.  (This used to hold for the vmadc / vmsbc mask
+        # destinations only, on the grounds that a mask tail is
+        # undisturbed regardless of vta.  "vd is not read" was exactly as
+        # much a runtime claim as its opposite, so the vector rows now
+        # record it too.)
         'reg_sets': [
             {'src': ['REG_ZERO'],
              'dst': ['REG_GPR5', 'REG_VCTRL']},                 # vsetvli
-            {'src': ['REG_VEC5', 'REG_VEC6', 'REG_VCTRL', 'REG_VEC0'],
-             'dst': ['REG_VEC4']},                              # vadc.vvm
-            {'src': ['REG_VEC8', 'REG_VEC9', 'REG_VCTRL', 'REG_VEC0'],
-             'dst': ['REG_VEC7']},                              # vsbc.vvm
+            {'src': ['REG_VEC4', 'REG_VEC5', 'REG_VEC6', 'REG_VCTRL',
+                     'REG_VEC0'],
+             'dst': ['REG_VEC4', 'REG_VCTRL']},                 # vadc.vvm
+            {'src': ['REG_VEC7', 'REG_VEC8', 'REG_VEC9', 'REG_VCTRL',
+                     'REG_VEC0'],
+             'dst': ['REG_VEC7', 'REG_VCTRL']},                 # vsbc.vvm
             {'src': ['REG_VEC10', 'REG_VEC11', 'REG_VEC12', 'REG_VCTRL',
                      'REG_VEC0'],
-             'dst': ['REG_VEC10']},                             # vmadc.vvm
+             'dst': ['REG_VEC10', 'REG_VCTRL']},                # vmadc.vvm
             {'src': ['REG_VEC13', 'REG_VEC14', 'REG_VEC15', 'REG_VCTRL',
                      'REG_VEC0'],
-             'dst': ['REG_VEC13']},                             # vmsbc.vvm
-            {'src': ['REG_VEC17', 'REG_VEC18', 'REG_VCTRL', 'REG_VEC0'],
-             'dst': ['REG_VEC16']},                             # vmerge.vvm
-            {'src': ['REG_VEC20', 'REG_GPR6', 'REG_VCTRL', 'REG_VEC0'],
-             'dst': ['REG_VEC19']},                             # vmerge.vxm
+             'dst': ['REG_VEC13', 'REG_VCTRL']},                # vmsbc.vvm
+            {'src': ['REG_VEC16', 'REG_VEC17', 'REG_VEC18', 'REG_VCTRL',
+                     'REG_VEC0'],
+             'dst': ['REG_VEC16', 'REG_VCTRL']},                # vmerge.vvm
+            {'src': ['REG_VEC19', 'REG_VEC20', 'REG_GPR6', 'REG_VCTRL',
+                     'REG_VEC0'],
+             'dst': ['REG_VEC19', 'REG_VCTRL']},                # vmerge.vxm
             {'src': ['REG_VEC21', 'REG_VEC22', 'REG_VEC23', 'REG_VCTRL'],
-             'dst': ['REG_VEC21']},                             # vmadc.vv
+             'dst': ['REG_VEC21', 'REG_VCTRL']},                # vmadc.vv
             {'src': ['REG_VEC24', 'REG_VEC25', 'REG_VEC26', 'REG_VCTRL'],
-             'dst': ['REG_VEC24']},                             # vmsbc.vv
+             'dst': ['REG_VEC24', 'REG_VCTRL']},                # vmsbc.vv
         ],
     },
 })
@@ -1383,10 +1394,17 @@ _register_probe('probe_zero_reg', {
         'clobbers': '',
         'insns': [
             {"src": ["REG_GPR5", "REG_GPR6"], "dst": ["REG_ZERO"]},
-            # Capstone prints the alias (mv t2, t0): the x0 source
-            # disappears from the operand list.  Pin that behaviour —
-            # x0 is the constant zero, so no dependency is lost.
-            {"src": ["REG_GPR5"], "dst": ["REG_GPR7"]},
+            # Capstone prints the alias (mv t2, t0) and its structured
+            # detail follows the print, so the x0 source disappears from
+            # the operand list.  The boundary restores it
+            # (cap_riscv_alias_reads_x0): reading x0 is inert -- nothing
+            # ever writes it -- but "this instruction has one source" and
+            # "it has two, one of which is the constant zero" are
+            # different statements, and the same instruction spelled
+            # without the alias (`add t2, zero, t0`) already reported
+            # both.  The mipsel arm of this same probe has always
+            # expected REG_ZERO here; riscv64 now agrees with it.
+            {"src": ["REG_GPR5", "REG_ZERO"], "dst": ["REG_GPR7"]},
         ]},
     'mipsel': {
         'asm': '"addu $zero, $t0, $t1\\n\\t"\n'

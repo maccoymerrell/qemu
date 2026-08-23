@@ -134,6 +134,30 @@ aarch64 R-wr-missing smstop +nzcv
 # reachable since the sweep started filling Rn=30 (see sweep_aarch64).
 aarch64 R-rd-missing tlbi +r#
 
+# CWD / CDQ / CQO sign-extend the accumulator into the D register and leave
+# the accumulator alone.  LLVM's implicit-def list names it anyway --
+# llvm_opcode_table.tsv has `OPC CDQ ... IDEF:EAX,EDX, IUSE:EAX,` and the
+# same for CQO -- which is the register-allocator convenience LLVM's x86
+# implicit lists are known for, not an architectural claim.
+#
+# The architecture is explicit.  Intel SDM Vol. 2, CWD/CDQ/CQO "Operation":
+#   IF OperandSize = 16 THEN DX := SignExtend(AX);
+#   ELSE IF OperandSize = 32 EDX := SignExtend(EAX);
+#   ELSE IF 64-Bit Mode and OperandSize = 64 RDX := SignExtend(RAX);
+# with no assignment to the source and "Flags Affected: None".  XED agrees
+# operand for operand -- `xed -64 -v 5 -d 99` gives REG0/W/EDX and
+# REG1/R/EAX -- and so does iced-x86.
+#
+# The boundary drops Capstone's matching phantom (cap_x86_is_sign_extend_to_d)
+# because these sit immediately before a signed IDIV: an rax marked written
+# makes the trace name the CQO as the dividend's producer and hides the real
+# one.  So the tracer is short a write LLVM reports, deliberately.
+#
+# Delete these three if LLVM ever narrows CDQ/CQO/CWD to Defs = [xDX].
+x86_64 R-wr-missing cltd +r#
+x86_64 R-wr-missing cqto +r#
+x86_64 R-wr-missing cwtd +r#
+
 # =====================================================================
 # 2. Deliberate tracer modelling decisions.  The disagreement is real but
 #    the tracer's answer is the intended one, so "fixing" it would be a
@@ -3420,15 +3444,7 @@ x86_64 M-miss-load vmaskmovps
 x86_64 M-miss-load vpmaskmovd
 x86_64 M-miss-load vpmaskmovq
 x86_64 M-miss-store vldmxcsr
-x86_64 R-rd-missing vgatherdpd +v#
-x86_64 R-rd-missing vgatherdps +v#
-x86_64 R-rd-missing vgatherqpd +v#
-x86_64 R-rd-missing vgatherqps +v#
 x86_64 R-rd-missing vpcmpestrm +r#
-x86_64 R-rd-missing vpgatherdd +v#
-x86_64 R-rd-missing vpgatherdq +v#
-x86_64 R-rd-missing vpgatherqd +v#
-x86_64 R-rd-missing vpgatherqq +v#
 x86_64 R-wr-missing vpcmpestrm +flags,v#
 x86_64 R-wr-missing vpcmpistrm +flags,v#
 

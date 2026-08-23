@@ -3239,6 +3239,113 @@ def _a64_has_pred_operand(ops, op_reg_kind, _a64) -> bool:
     return False
 
 
+# The mnemonics whose zero-register operand is fixed by the ENCODING
+# rather than hidden by an alias spelling: the pointer-authentication
+# forms whose decode ASL sets `n = 31`, the BRAAZ/BLRABZ family whose
+# modifier is X[31] with source_is_sp false, and LDRAA/LDRAB, which name
+# X[31, 64] literally.  Capstone models each as its own instruction with
+# no operand for the pinned modifier, so the real operand set is as empty
+# as the printed one and the alias harvest below has nothing to take.
+# Mirrors cap_aarch64_reads_zero_modifier() in disas/capstone.c; the list
+# is closed over the 2022-12 MRA, not over Capstone's tables, so a
+# version bump cannot silently add a member.
+_A64_ZERO_MODIFIER = frozenset((
+    "autdza", "autdzb", "autiaz", "autibz", "autiza", "autizb",
+    "blraaz", "blrabz", "braaz", "brabz",
+    "ldraa", "ldrab",
+    "pacdza", "pacdzb", "paciaz", "pacibz", "paciza", "pacizb",
+))
+
+_A64_REAL_MD = None
+_A64_REAL_MD_FAILED = False
+
+
+def _a64_real_detail_handle():
+    """A second AArch64 Capstone handle pinned to CS_OPT_DETAIL_REAL.
+
+    Mirrors the companion handle cap_aarch64_restore_alias_zero_reg()
+    opens in `disas/capstone.c`, and for the same reason: DETAIL_REAL
+    fills detail from the BASE instruction even when the printed form is
+    an alias, but it cannot be turned on for the primary handle --
+    cs_option() ORs CS_OPT_DETAIL values together and offers no way to
+    clear the bit, and turning it on reshapes op_count and the operand
+    indices that every other correction in this function is written
+    against.  Opened once and cached; a failure to open disables the
+    mirror rather than failing the check, exactly as the C side returns.
+
+    The Python binding tracks `detail` in its own attribute and treats
+    any option value other than CS_OPT_ON as "detail off", so the flag is
+    restored after the option call or every subsequent decode raises
+    CS_ERR_DETAIL.
+    """
+    global _A64_REAL_MD, _A64_REAL_MD_FAILED
+    if _A64_REAL_MD is not None or _A64_REAL_MD_FAILED:
+        return _A64_REAL_MD
+    try:
+        import capstone as _cs
+        md = _cs.Cs(_cs.CS_ARCH_AARCH64,
+                    _cs.CS_MODE_ARM | _cs.CS_MODE_LITTLE_ENDIAN)
+        md.detail = True
+        md.option(_cs.CS_OPT_DETAIL, _cs.CS_OPT_DETAIL_REAL)
+        md._detail = True
+        _A64_REAL_MD = md
+    except Exception:
+        _A64_REAL_MD_FAILED = True
+        return None
+    return _A64_REAL_MD
+
+
+def _a64_restore_alias_zero_reg(d, add, exp_src: set, exp_dst: set) -> None:
+    """Mirror cap_aarch64_restore_alias_zero_reg() in `disas/capstone.c`.
+
+    `cmp x3, x2` IS `subs xzr, x3, x2` and `mov x1, x30` IS
+    `orr x1, xzr, x30`; the printed alias drops the zero register and
+    Capstone's ALIAS operand set follows the printed form.  R7.3 rules
+    that the write is recorded, so the boundary harvests the base form's
+    zero-register operands and the oracle has to harvest the same ones or
+    it reports the repair as a defect on every alias it touches.
+
+    The atomic memory operations are excluded: `staddb w1, [x2]` prints as
+    an alias of `ldaddb w1, wzr, [x2]` whose real operand set does report a
+    wzr write, but their decode guards that write on `t != 31`, so with
+    Rt = 31 it does not happen.  Keyed on the shape -- printed `st...`,
+    decoded `ld...` -- the same way the C side keys it.
+    """
+    if not getattr(d, "is_alias", False):
+        return
+    mnem = (getattr(d, "mnemonic", "") or "").lower()
+    if mnem.startswith("st"):
+        try:
+            base = (d.insn_name() or "").lower()
+        except Exception:
+            base = ""
+        if base.startswith("ld"):
+            return
+    md = _a64_real_detail_handle()
+    if md is None:
+        return
+    try:
+        import capstone as _cs
+        real = next(md.disasm(bytes(d.bytes), int(d.address)), None)
+    except Exception:
+        return
+    if real is None:
+        return
+    try:
+        real_ops = real.operands
+    except Exception:
+        return
+    zero = (_cs.aarch64.AARCH64_REG_WZR, _cs.aarch64.AARCH64_REG_XZR)
+    for o in real_ops:
+        if o.type != _cs.aarch64.AARCH64_OP_REG or o.reg not in zero:
+            continue
+        access = int(getattr(o, "access", 0) or 0)
+        if access & 1:
+            add(exp_src, o.reg)
+        if access & 2:
+            add(exp_dst, o.reg)
+
+
 def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
                                 add, exp_src: set, exp_dst: set) -> None:
     """Mirror the decode-boundary corrections in `disas/capstone.c`.
@@ -3363,6 +3470,11 @@ def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
         # The FEAT_MOPS prologue reads the PSTATE.NZCV it then rewrites.
         if mnem.startswith(("cpyp", "cpyfp", "setp", "setgp")):
             add(exp_src, _a64.AARCH64_REG_NZCV)
+        # R7.3: the zero register an alias spelling hides, and the one
+        # the encoding pins.  Both halves of 0fae66d3d2's boundary repair.
+        _a64_restore_alias_zero_reg(d, add, exp_src, exp_dst)
+        if mnem in _A64_ZERO_MODIFIER:
+            add(exp_src, _a64.AARCH64_REG_XZR)
         # The FP status/control contract (cap_aarch64_fp_status_contract).
         # FPCR is the FP datapath's INPUT and FPSR its OUTPUT; the
         # generic space folds both onto REG_FCSR and Capstone has no id
@@ -3613,6 +3725,33 @@ def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
         if mnem in ("mfhi", "mflo"):
             _pat = r"REG_ACC\d+" if mnem == "mfhi" else r"REG_ACCHI\d+"
             exp_src -= {n for n in exp_src if re.fullmatch(_pat, n)}
+        # The pre-R6 divide's fabricated `$zero` destination.  DIV / DIVU
+        # / DDIV / DDIVU in base MIPS have no rd field at all -- bits
+        # 15..6 are zero -- and write only HI:LO; the printed `$zero` is
+        # the disassembler's way of marking the raw instruction apart
+        # from the `div rd, rs, rt` assembler macro.  Capstone hands it
+        # over as a written REG operand anyway, so the boundary drops it
+        # (disas/capstone.c, gated exactly as here on the ACCUMULATOR
+        # write, because MIPS R6 redefines these as genuine three-operand
+        # instructions with a real rd and no HI/LO write -- there the
+        # destination is architectural and must survive).  Not a R7.3
+        # zero-register drop: the ISA never named the register.  Both
+        # independent references agree with the boundary -- LLVM MC
+        # reports WR{ac0} alone, and the QEMU-truth leg of the mipsel
+        # attribution harness scores the row AGREE.
+        if mnem in ("div", "divu", "ddiv", "ddivu"):
+            writes_acc = any(re.fullmatch(r"REG_ACC(HI)?\d+", n)
+                             for n in exp_dst)
+            first_reg = next((op for op in ops if op.type == op_reg_kind),
+                             None)
+            if writes_acc and first_reg is not None and ops[0] is first_reg:
+                try:
+                    import capstone as _cs0
+                    is_zero = first_reg.reg == _cs0.mips.MIPS_REG_ZERO
+                except Exception:
+                    is_zero = False
+                if is_zero and (int(getattr(first_reg, "access", 0) or 0) & 2):
+                    exp_dst.discard("REG_ZERO")
         # Tied destinations: bit-field insert, lane insert/shuffle,
         # masked select, multiply-accumulate, and the conditional moves,
         # each of which preserves part of its destination.
@@ -8797,6 +8936,26 @@ def _check_regdata_reconstruction(
             if op_name not in handlers:
                 _commit_dst_state()
                 continue
+            # AArch64 logical (shifted register) with N=1 -- ORN/BIC/EON
+            # and the MVN alias -- inverts its second operand, and the
+            # generic opcode does not say so: ORN and ORR are both
+            # GEN_OP_OR, so the handler would model `mvn x2, x3` as
+            # `x3 | 0` and flag a correct trace.  The discriminator is
+            # the encoding's own N bit, not a mnemonic list.
+            #
+            # Newly reachable rather than newly wrong: `mvn` is the alias
+            # spelling of `orn xd, xzr, xm`, so before the boundary
+            # restored the hidden zero register (0fae66d3d2, R7.3) the
+            # instruction arrived with ONE source and the two-source gate
+            # below skipped it.  Restoring the operand made the row
+            # eligible and exposed a gap the oracle always had.
+            if isa == "aarch64":
+                _raw = bytes(I.get("raw_bytes") or b"")
+                if len(_raw) >= 4:
+                    _w = int.from_bytes(_raw[:4], "little")
+                    if (_w & 0x1F000000) == 0x0A000000 and (_w >> 21) & 1:
+                        _commit_dst_state()
+                        continue
             if len(srcs) != 2 or not gpr_dsts:
                 _commit_dst_state()
                 continue

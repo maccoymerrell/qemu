@@ -1134,11 +1134,16 @@ _register_probe('probe_exact_cmp_rr', {
                 'insns': [_insn("CMP", branch_type="NONE",
                                 src=["REG_GPR0", "REG_GPR3"],
                                 dst=["REG_FLAGS"])]},
+    # aarch64 CMP is the alias spelling of SUBS with Rd = 31, so the
+    # architecture names the zero register as its destination alongside
+    # NZCV (MRA: `X[d, datasize] = result;`, unguarded).  R7.3 -- "REG_ZERO
+    # exists, so it should be specified" -- and the boundary restores what
+    # Capstone's alias operand set drops (cap_aarch64_restore_alias_zero_reg).
     'aarch64': {'asm': '"cmp x0, x1"', 'clobbers': '"cc"',
                 'opcodes': ['CMP'],
                 'insns': [_insn("CMP", branch_type="NONE",
                                 src=["REG_GPR0", "REG_GPR1"],
-                                dst=["REG_FLAGS"])]},
+                                dst=["REG_FLAGS", "REG_ZERO"])]},
     'riscv64': {'asm': '"slt t0, t1, t2"', 'clobbers': '"t0"',
                 'opcodes': ['CMP'],
                 'insns': [_insn("CMP", branch_type="NONE",
@@ -1383,9 +1388,17 @@ _register_probe('probe_zero_reg', {
                '    "add x9, sp, #16"',
         'clobbers': '"x9"',
         'insns': [
-            # Capstone prints the alias (mov x9, x10): the XZR source
-            # disappears.  Pin it — XZR is constant zero, nothing lost.
-            {"src": ["REG_GPR10"], "dst": ["REG_GPR9"]},
+            # Capstone prints the alias (mov x9, x10) and its operand set
+            # follows the print, so the XZR source disappears.  The
+            # boundary restores it (cap_aarch64_restore_alias_zero_reg):
+            # reading XZR is inert, and that is not the question R7.3
+            # answers -- "this instruction has one source" and "it has
+            # two, one of which is the constant zero" are different
+            # statements about the regfile, and the instruction spelled
+            # without the alias already reported both.  The riscv64 and
+            # mipsel arms of this probe have expected REG_ZERO in the same
+            # position since 8c4db1097e; aarch64 now agrees with them.
+            {"src": ["REG_GPR10", "REG_ZERO"], "dst": ["REG_GPR9"]},
             {"src": ["REG_SP"], "dst": ["REG_GPR9"]},
         ]},
     'riscv64': {

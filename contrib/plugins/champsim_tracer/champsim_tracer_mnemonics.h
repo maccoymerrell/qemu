@@ -594,12 +594,16 @@ typedef int (*MarkerEncodeSeqFn)(uint8_t *out, uint32_t imm);
  * badly by an edge onto a register the instruction never touched as by
  * a missing one.
  *
- * The roles and the IDs are deliberately not the same vocabulary: the
- * privileged-file groups REG_SYSEXC / REG_SYSPERF / REG_SYSDBG /
- * REG_SYSCACHE / REG_COPROC<n> are reached from the register TABLE on
- * the ISAs whose disassembler names those registers (MIPS numbers its
- * CP0 file), and only need a role here once an ISA arrives whose
- * disassembler cannot.
+ * The roles and the IDs are deliberately not the same vocabulary, and
+ * the two reach the privileged-file groups by different doors.  MIPS
+ * numbers its CP0 file and Capstone names every entry, so REG_SYSEXC /
+ * REG_SYSPERF / REG_SYSDBG / REG_SYSCACHE / REG_COPROC<n> are reached
+ * there from the register TABLE.  AArch64 is the ISA whose
+ * disassembler cannot: 2 of its 1214 system registers have a register
+ * id, so its whole privileged file arrives as a role and every one of
+ * those groups needs a case here.  REG_COPROC<n> still has no role --
+ * no traced ISA reports an implementation-defined coprocessor file
+ * through this path.
  */
 static inline uint8_t generic_reg_for_sysreg_class(uint8_t sysreg_class)
 {
@@ -612,6 +616,11 @@ static inline uint8_t generic_reg_for_sysreg_class(uint8_t sysreg_class)
     case QEMU_PLUGIN_SYSREG_MMU:       return REG_SYSMMU;
     case QEMU_PLUGIN_SYSREG_TIMER:     return REG_SYSTIMER;
     case QEMU_PLUGIN_SYSREG_SHADOWSTK: return REG_SSP;
+    case QEMU_PLUGIN_SYSREG_EXC:       return REG_SYSEXC;
+    case QEMU_PLUGIN_SYSREG_PERF:      return REG_SYSPERF;
+    case QEMU_PLUGIN_SYSREG_DBG:       return REG_SYSDBG;
+    case QEMU_PLUGIN_SYSREG_CACHE:     return REG_SYSCACHE;
+    case QEMU_PLUGIN_SYSREG_FPENABLE:  return REG_SYSFPEN;
     case QEMU_PLUGIN_SYSREG_OTHER:
     default:                           return REG_SYS;
     }

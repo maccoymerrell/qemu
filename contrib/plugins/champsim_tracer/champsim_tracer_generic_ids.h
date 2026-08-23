@@ -270,7 +270,19 @@ enum GenericRegId {
     REG_SYSID    = 107,  /* read-only implementation identification */
     REG_COPROC0  = 108,  /* implementation-defined coprocessor file 0 */
     REG_COPROC1  = 109,  /* implementation-defined coprocessor file 1 */
-    /* 110-128 unallocated — reserve for further behaviour classes. */
+    /*
+     * REG_SYSFPEN is the ENABLE gate, not a control word.  FPCR/fcsr
+     * (REG_FCSR) says how the FP datapath rounds; this says whether the
+     * instruction runs at all -- AArch64 CPACR_EL1.FPEN / CPTR_EL2.FPEN
+     * / CPTR_EL3.TFP, and the same role on the other ISAs (x86
+     * CR4.OSXSAVE + XCR0, RISC-V mstatus.FS/VS).  It has an ID of its
+     * own because the population that reads it is every FP, SIMD,
+     * vector and matrix instruction in the ISA: folded into the
+     * residual REG_SYS, one TTBR or VBAR write would order all of them
+     * behind it.
+     */
+    REG_SYSFPEN  = 110,  /* FP / vector execution-enable gate */
+    /* 111-128 unallocated — reserve for further behaviour classes. */
     /* Vector/SIMD registers: 129-192 */
     REG_VEC0 = 129,
     REG_VEC1, REG_VEC2, REG_VEC3, REG_VEC4, REG_VEC5, REG_VEC6, REG_VEC7,
@@ -561,6 +573,7 @@ static inline const char *generic_reg_name(unsigned id)
     case REG_SYSID:    return "REG_SYSID";
     case REG_COPROC0:  return "REG_COPROC0";
     case REG_COPROC1:  return "REG_COPROC1";
+    case REG_SYSFPEN:  return "REG_SYSFPEN";
     case REG_FCSR:    return "REG_FCSR";
     case REG_VCTRL:   return "REG_VCTRL";
     case REG_TLS:     return "REG_TLS";

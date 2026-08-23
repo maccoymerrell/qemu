@@ -35,6 +35,23 @@ _init_sysreg_names()
 
 TLS_REGS = {'TPIDR_EL0', 'TPIDRRO_EL0'}
 
+# The FP/SIMD/SVE/SME execution-enable gate.  R7.4 rules the read real
+# and the tracer now records it on its own generic ID (REG_SYSFPEN), so
+# the reference needs the matching token: folded into 'SYS' the
+# comparison would score the gate against every other system register
+# and could not tell a correct gate read from a wrong one.
+FPEN_REGS = {'CPACR_EL1', 'CPTR_EL2', 'CPTR_EL3'}
+
+# Vector configuration.  ZCR_ELx and SMCR_ELx carry the SVE / streaming
+# vector length, and SMCR_ELx.EZT0 is the second gate CheckSMEZT0Enabled
+# reads on the ZT0 forms.  The tracer's generic space has carried a
+# vector-configuration ID (REG_VCTRL) since before this arc -- it is what
+# RISC-V vl/vtype/vstart map to -- and cap_aarch64_sysreg_class now puts
+# these there, so the reference names the same role rather than folding
+# them into the residual.
+VCTRL_REGS = {'ZCR_EL1', 'ZCR_EL2', 'ZCR_EL3', 'ZCR_EL12',
+              'SMCR_EL1', 'SMCR_EL2', 'SMCR_EL3', 'SMCR_EL12', 'SVCR'}
+
 # The enabling-condition and translation-configuration registers.
 #
 # METHOD declares the exception-delivery, address-translation, debug,
@@ -90,7 +107,6 @@ CONFIG_REGS = re.compile(
     r'|MAIR2?_EL[123]'
     r'|PIR_EL[123]|PIRE0_EL[12]'
     r'|GCSCR_EL[123]|GCSCRE0_EL1'
-    r'|CPACR_EL1|CPTR_EL[23]'
     r')$')
 
 
@@ -99,6 +115,10 @@ def sysreg_lookup(name=None, enc=None):
         u = name.upper()
         if CONFIG_REGS.match(u):
             return None
+        if u in FPEN_REGS:
+            return 'SYSFPEN'
+        if u in VCTRL_REGS:
+            return 'VCTRL'
         if u in SYSREG_NAMES or re.match(r'^[A-Z][A-Z0-9]*_EL[0-3]', u):
             return 'TLS' if u in TLS_REGS else 'SYS'
         return None
@@ -206,13 +226,17 @@ CUT_PREFIXES = (
     'SPEBranch', 'Hint_Branch', 'AArch64.BranchAddr', 'ProfilingBufferEnabled',
 )
 CUT_EXACT = {
-    'CheckSVEEnabled', 'CheckStreamingSVEEnabled', 'CheckNonStreamingSVEEnabled',
-    'CheckStreamingSVEAndZAEnabled', 'CheckOriginalSVEEnabled', 'CheckSMEEnabled',
-    'CheckSMEAndZAEnabled', 'CheckSMEZT0Enabled', 'CheckSMEAccess',
-    'AArch64.CheckFPAdvSIMDEnabled64', 'AArch64.CheckFPEnabled64',
-    'CheckFPAdvSIMDEnabled64', 'CheckFPEnabled64',
-    'AArch64.CheckFPAdvSIMDEnabled', 'AArch64.CheckFPEnabled',
-    'AArch64.CheckFPAdvSIMDTrap', 'CheckMOPSEnabled', 'CheckLDST64BEnabled',
+    # The FP/SIMD/SVE/SME enable checks -- CheckFPAdvSIMDEnabled,
+    # CheckFPEnabled, CheckSVEEnabled and the streaming/ZA/ZT0 variants
+    # -- USED TO BE CUT HERE, and the METHOD file called that the one
+    # place this reference followed the tracer instead of the
+    # architecture.  It no longer does: the tracer records the gate
+    # (R7.4), so the checks are inlined and their CPACR_EL1 /
+    # CPTR_EL{2,3} reads are scored.  What still keeps the inlining
+    # bounded is CONFIG_REGS above, which drops SCTLR / HCR / SCR and
+    # the translation configuration those functions also touch, and
+    # IsSVEEnabled / IsInHost / ELStateUsingAArch32K, still cut below.
+    'CheckMOPSEnabled', 'CheckLDST64BEnabled',
     'CheckST64BV0Enabled', 'CheckST64BVEnabled', 'CheckSPAlignment',
     'BTypeCompatible_BTI', 'BTypeCompatible_PACIXSP', 'BigEndian',
     'IsFullA64Enabled', 'IsTMEEnabled', 'IsSVEEnabled', 'IsInHost',
@@ -350,7 +374,13 @@ def tok(kind, idx):
     if kind == 'FCSR':
         return 'FCSR'
     if kind == 'SYS':
-        return 'TLS' if idx == 'TLS' else 'SYS'
+        # sysreg_lookup put the ROLE in idx: the thread pointer, the
+        # FP/SIMD/SVE/SME enable gate and the vector configuration are
+        # the roles the tracer's generic space names separately, so the
+        # reference names them too rather than folding them into SYS.
+        if idx in ('TLS', 'SYSFPEN', 'VCTRL'):
+            return idx
+        return 'SYS'
     if kind == 'PSTATE':
         return 'PSTATE.%s' % idx
     return '%s?%s' % (kind, idx)

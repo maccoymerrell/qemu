@@ -28,6 +28,25 @@ TRC_MAP = {
     'REG_SP': 'SP', 'REG_LR': 'LR', 'REG_FP_REG': 'FP_REG', 'REG_ZERO': 'ZERO',
     'REG_IP': 'IP', 'REG_MATRIX': 'MATRIX', 'REG_VCTRL': 'VCTRL',
     'REG_PRED16': 'FFR', 'REG_VEC32': 'ZT0',
+    # The R8 split of the AArch64 system-register file (cap_aarch64_sysreg_class)
+    # gives the privileged file one generic ID per DEPENDENCE-BEHAVIOUR group
+    # instead of one for all 1,213 registers.  The reference's token space has
+    # a single 'SYS' for the whole file -- it resolves NAMES, and the split is
+    # a claim about GROUPS -- so every group folds back to 'SYS' here.  That
+    # keeps a mapping change from being scored as an attribution change; it
+    # also means this instrument is blind to the split, whose evidence is the
+    # 1,213-encoding census, not this table.
+    'REG_SYS': 'SYS', 'REG_SYSEXC': 'SYS', 'REG_SYSMMU': 'SYS',
+    'REG_SYSTIMER': 'SYS', 'REG_SYSPERF': 'SYS', 'REG_SYSDBG': 'SYS',
+    'REG_SYSCACHE': 'SYS', 'REG_SYSID': 'SYS', 'REG_COPROC0': 'SYS',
+    'REG_COPROC1': 'SYS',
+    # REG_SYSFPEN is the exception: R7.4's gate is the thing being measured,
+    # so the reference was given the matching token (mra_ref.FPEN_REGS) and
+    # the two are compared directly.
+    'REG_SYSFPEN': 'SYSFPEN',
+    # GCSPR_ELx is the AArch64 guarded-control-stack pointer, the same
+    # register role as x86 CET SSP and RISC-V ssp.
+    'REG_SSP': 'SSP',
 }
 
 

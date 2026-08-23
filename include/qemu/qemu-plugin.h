@@ -1122,11 +1122,39 @@ char *qemu_plugin_insn_disas(const struct qemu_plugin_insn *insn);
                                          * rest of the privileged file. */
 #define QEMU_PLUGIN_SYSREG_SHADOWSTK 8  /* the shadow-stack pointer:
                                          * x86 CET SSP, RISC-V Zicfiss
-                                         * ssp.  Same register on both,
-                                         * and its own dependency
-                                         * population -- neither the data
-                                         * stack pointer nor the link
-                                         * register. */
+                                         * ssp, AArch64 GCSPR_ELx.  Same
+                                         * register on all three, and its
+                                         * own dependency population --
+                                         * neither the data stack pointer
+                                         * nor the link register. */
+#define QEMU_PLUGIN_SYSREG_EXC       9  /* the state an exception writes
+                                         * on entry and an exception
+                                         * return reads back: AArch64
+                                         * ESR / FAR / ELR / SPSR / VBAR.
+                                         * A later read of one is ordered
+                                         * against the faulting
+                                         * instruction, not against the
+                                         * rest of the privileged file. */
+#define QEMU_PLUGIN_SYSREG_PERF     10  /* performance and activity
+                                         * counters and their control:
+                                         * AArch64 PM* / SPM* / AM*. */
+#define QEMU_PLUGIN_SYSREG_DBG      11  /* debug, trace and branch-record
+                                         * state: AArch64 DBG* / TRC* /
+                                         * BRB* / TRB* / MDCR. */
+#define QEMU_PLUGIN_SYSREG_CACHE    12  /* an indexed record window and
+                                         * its selector: AArch64
+                                         * CSSELR + CCSIDR (cache
+                                         * geometry), ERRSELR + ERX*
+                                         * (RAS error records). */
+#define QEMU_PLUGIN_SYSREG_FPENABLE 13  /* the enable state that decides
+                                         * whether an FP / SIMD / vector
+                                         * instruction executes or traps:
+                                         * AArch64 CPACR_EL1 /
+                                         * CPTR_EL{2,3}.  Read by the
+                                         * whole FP instruction
+                                         * population, so it cannot share
+                                         * an ID with state none of them
+                                         * touch. */
 
 /* Operand access mode (bitmask) */
 #define QEMU_PLUGIN_OP_ACC_READ  1

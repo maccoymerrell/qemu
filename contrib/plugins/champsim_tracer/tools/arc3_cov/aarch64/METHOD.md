@@ -31,26 +31,37 @@ Shared-library functions are inlined so implicit operands arrive:
 exception-delivery, address-translation, debug, profiling and trap-check
 families are cut; the cut is a list in `mra_ref.py`, not a hand-wave.
 
-## The one place the reference follows the tracer instead of the architecture
+## The enable gate, no longer a blind spot
 
 The FP/SVE/SME **enable** registers — `CPACR_EL1`, `CPTR_EL2`, `CPTR_EL3` —
-are filtered out twice over, by `CUT_EXACT` on the `Check*Enabled` family and
-by `CONFIG_REGS` in `sysreg_lookup`.  Under R7.4 those reads are real: a
-pending write to `CPACR_EL1.FPEN` has to resolve before an FP instruction can
-know whether it traps, which is an edge a renaming regfile must respect.  They
-stay filtered because the tracer does not record them yet, and the two arms
-have to be comparable.
+used to be filtered out twice over, by `CUT_EXACT` on the `Check*Enabled`
+family and by `CONFIG_REGS` in `sysreg_lookup`, because the tracer did not
+record them and the two arms had to be comparable.  That was the one place
+this reference followed the tracer instead of the architecture, and it is
+closed: R7.4 rules the read real — a pending write to `CPACR_EL1.FPEN` has
+to resolve before an FP instruction can know whether it traps — the decode
+boundary records it, and both filters are lifted.
 
-It is a blind spot with a measured size.  Lifting both filters together makes
-**2,803 of the 3,810 probed subjects** gain a `SYS` source — 771 mnemonics,
-the whole of advsimd/float/fpsimd/sve/sve2/SME — and **none of them already
-carries one**, so every one would be a new edge.  All 2,803 land on `REG_SYS`,
-which on AArch64 is the entire system-register file bar NZCV, FPCR, FPSR,
-FPMR, TPIDR and the 23 `REG_SYSID` constants.  Recording them onto that one id
-would make every FP instruction depend on every unrelated `MSR` — R8.5's
-situation, at 280× the riscv64 scale that left ten rows folded.  The AArch64
-system-register file has to be split first, exactly as `58202796b9` split
-mipsel's CP0 file before R7.6 could be honoured.
+The gate has its own token, `SYSFPEN`, matching the tracer's own
+`REG_SYSFPEN`; folded into `SYS` the comparison could not tell a correct
+gate read from a read of any other system register.  `SMCR_ELx` and
+`ZCR_ELx` likewise resolve to `VCTRL`, the vector-configuration role,
+which is what makes `SMCR_ELx.EZT0` — the second gate the `ZT0` forms
+read — visible as itself.
+
+**2,805 of the 3,810 probed subjects now agree WITH the gate on both
+sides**, where before they agreed without it.  Eight subjects do not:
+six are post-2022-12 encodings scored against LLVM MC, which has no
+legality axis and can never carry the read, and two are `SMSTART` /
+`SMSTOP`, where Capstone attaches the `MSR (immediate)` SVCR form no
+feature group and no operand this boundary classifies, so the tracer
+records that instruction as reading and writing nothing at all.
+
+What is still cut, and deliberately: `CONFIG_REGS` drops `SCTLR`, `HCR`,
+`SCR` and the translation-configuration registers those same check
+functions reach — they say how the address space is configured, not
+whether this instruction is enabled — and `IsSVEEnabled`, `IsInHost` and
+`ELStateUsingAArch32K` stay in `CUT_EXACT`.
 
 ## Liveness, because the pseudocode uses destinations as scratch
 

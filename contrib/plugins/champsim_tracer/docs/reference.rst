@@ -615,6 +615,17 @@ without implying any particular numeric base.
        performance counters and their control.  ``REG_SYSDBG`` is
        EJTAG debug, the watch registers and trace.  ``REG_SYSCACHE``
        is the cache tag/data access windows and the error state.
+       AArch64 populates the same classes from its own file:
+       ``ESR_ELx``, ``FAR_ELx``, ``ELR_ELx``, ``SPSR_ELx`` and
+       ``VBAR_ELx`` are ``REG_SYSEXC``; ``TTBR``, ``TCR``, ``MAIR``,
+       ``PAR_EL1``, ``CONTEXTIDR`` and the MPU regions are
+       ``REG_SYSMMU``; the generic timer ``CNT*`` space is
+       ``REG_SYSTIMER``; ``PM*``, ``SPM*`` and the activity monitors
+       are ``REG_SYSPERF``; the whole ``op0 = 2`` breakpoint, watchpoint,
+       ETM trace, trace-buffer and branch-record file is ``REG_SYSDBG``;
+       and the two selector-and-window pairs — ``CSSELR`` with
+       ``CCSIDR``, ``ERRSELR`` with the ``ERX*`` records — are
+       ``REG_SYSCACHE``.
        ``REG_SYSID`` is read-only implementation identification —
        MIPS ``PRId`` and ``Config``\ *n*, the FP implementation
        register ``fcr0``, ``MSAIR``, RISC-V ``vlenb`` and the machine
@@ -642,7 +653,14 @@ without implying any particular numeric base.
        architectural role (``QEMU_PLUGIN_SYSREG_OTHER`` here) rather
        than a decoder register id — Capstone has one for almost none of
        these registers, and on x86-64 it has one for none of them at
-       all.
+       all.  On AArch64 this ID is a genuine residual and not the file:
+       of the 1,213 system-register encodings the disassembler defines,
+       160 arrive here — the auxiliary control registers, the
+       fine-grained trap registers, ``SCTLR`` / ``HCR`` / ``SCR``, the
+       PSTATE field selectors, the pointer-authentication keys, the GIC
+       CPU and hypervisor interfaces and the MPAM partitioning space.
+       Everything else carries the behaviour class its group belongs
+       to.
    * - ``REG_FCSR``
      - Floating-point control / status register (RISC-V ``frm`` /
        ``fflags`` / ``fcsr``, AArch64 ``FPCR`` / ``FPSR`` / ``FPMR``,
@@ -658,9 +676,15 @@ without implying any particular numeric base.
        accumulation) is deliberately not modelled as a per-instruction
        write — see :doc:`limitations`.
    * - ``REG_VCTRL``
-     - Vector **configuration**: RVV ``vl`` and ``vtype``, SVE ``ZCR``
-       and ``VG`` (the vector-granule count ``SMSTART`` / ``SMSTOP``
-       change).  SVE's ``FFR`` is deliberately *not* here — it is the
+     - Vector **configuration**: RVV ``vl`` and ``vtype``, AArch64
+       ``ZCR_ELx``, ``SMCR_ELx``, ``SVCR`` and ``VG`` (the
+       vector-granule count ``SMSTART`` / ``SMSTOP`` change).
+       ``SMCR_ELx`` is also the second enable gate the SME2
+       lookup-table forms read: ``SMCR_ELx.EZT0`` decides on its own
+       whether an instruction touching ``ZT0`` traps, which is why
+       ``ldr``/``str`` of ``ZT0``, ``luti2``/``luti4``, ``movt`` and
+       ``zero`` take a source here as well as on ``REG_SYSFPEN``.
+       SVE's ``FFR`` is deliberately *not* here — it is the
        First Fault Register, separate architectural state that
        first-faulting loads write and ``rdffr`` / ``wrffr`` move to and
        from a predicate, so it is ``REG_PRED16``, the slot past
@@ -678,6 +702,26 @@ without implying any particular numeric base.
        read-only implementation constant and lives in ``REG_SYSID``
        with the other identification registers, so reading it takes no
        edge from a ``vsetvli`` that cannot change it.
+   * - ``REG_SYSFPEN``
+     - The FP / vector execution-**enable** gate: the state that decides
+       whether an FP, SIMD, SVE or SME instruction runs at all or takes
+       a trap.  On AArch64 that is ``CPACR_EL1.FPEN``,
+       ``CPTR_EL2.FPEN`` and ``CPTR_EL3.TFP``, and the decode boundary
+       records a read of all three on every instruction in those
+       extensions — which gate applies depends on the exception level,
+       a runtime value, so a static register set names every candidate.
+       Distinct from ``REG_FCSR``, which says how the FP datapath
+       *rounds*: an ``msr fpcr`` and an ``msr cpacr_el1`` are different
+       registers with different populations, and folding them would
+       order every FP instruction behind a rounding-mode write it does
+       not depend on.  Distinct from ``REG_SYS`` for the opposite
+       reason: the population reading this gate is the whole FP
+       instruction set, so on the residual ID one unrelated ``TTBR`` or
+       ``VBAR`` write would order all of it.  A consumer that does not
+       model traps can ignore the class; a consumer that does gets the
+       edge it needs to say why an FP instruction stalled behind a
+       privileged write.
+
    * - ``REG_TLS``
      - Thread pointer: AArch64 ``TPIDR_EL0`` / ``TPIDRRO_EL0``, and the
        MIPS CP0 UserLocal word ``rdhwr $29`` reads.  Distinct from
@@ -687,8 +731,10 @@ without implying any particular numeric base.
        happened to touch.  AArch64 ``TPIDR_EL1``, the kernel's per-CPU
        base, is a different register and stays ``REG_SYS``.
    * - ``REG_SSP``
-     - Shadow-stack pointer: RISC-V Zicfiss ``ssp`` and x86-64 CET's
-       ``SSP``.  One architectural register on two ISAs, so one ID.
+     - Shadow-stack pointer: RISC-V Zicfiss ``ssp``, x86-64 CET's
+       ``SSP`` and AArch64's guarded-control-stack pointer
+       ``GCSPR_ELx``.  One architectural register on three ISAs, so one
+       ID.
        It is deliberately neither ``REG_SP`` nor ``REG_LR``: on the
        stack pointer it would serialise shadow-stack traffic against
        every spill and frame adjustment, and on the link register

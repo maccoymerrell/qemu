@@ -3080,6 +3080,63 @@ def _riscv_reads_v0_mask(mnem: str) -> bool:
 
 
 # ---------------------------------------------------------------------
+# AArch64 FP / SIMD / SVE / SME enable-gate predicate.
+#
+# Mirrors cap_aarch64_feature_is_fp_gated() in disas/capstone.c.  The
+# names are Capstone's own group names for the FP, SIMD, vector and
+# matrix extensions -- the instructions the architecture routes through
+# CheckFPAdvSIMDEnabled / CheckSVEEnabled / CheckSMEEnabled.  The
+# integer and system extensions that sit beside them in the same enum
+# (CRC, CSSC, LSE, RAS, SPE, MOPS, MTE, PAuth) are not gated and are
+# deliberately absent.
+_A64_FP_GATED_GROUPS = frozenset((
+    "HasFPARMv8", "HasNEON", "HasFullFP16", "HasFP16FML", "HasFuseAES",
+    "HasAES", "HasSHA2", "HasSHA3", "HasSM4", "HasDotProd", "HasRDM",
+    "HasComplxNum", "HasJS", "HasFRInt3264", "HasBF16", "HasB16B16",
+    "HasMatMulInt8", "HasMatMulFP32", "HasMatMulFP64", "HasLUT",
+    "HasFAMINMAX", "HasFP8", "HasFP8FMA", "HasFP8DOT2", "HasFP8DOT4",
+    "HasSSVE_FP8FMA", "HasSSVE_FP8DOT2", "HasSSVE_FP8DOT4",
+    "HasSVE", "HasSVE2", "HasSVE2p1", "HasSVE2AES", "HasSVE2SM4",
+    "HasSVE2SHA3", "HasSVE2BitPerm",
+    "HasSME", "HasSME2", "HasSME2p1", "HasSMEF64F64", "HasSMEF16F16",
+    "HasSMEFA64", "HasSMEI16I64", "HasSMEF8F16", "HasSMEF8F32",
+    "HasSME_LUTv2",
+    "HasSVEorSME", "HasSVE2orSME", "HasSVE2orSME2",
+    "HasSVE2p1_or_HasSME", "HasSVE2p1_or_HasSME2",
+    "HasSVE2p1_or_HasSME2p1", "HasNEONorSME",
+))
+
+
+def _a64_is_fp_gated(d) -> bool:
+    for g in getattr(d, "groups", ()) or ():
+        try:
+            name = d.group_name(g)
+        except Exception:  # pragma: no cover - binding without names
+            return False
+        if name in _A64_FP_GATED_GROUPS:
+            return True
+    return False
+
+
+def _a64_touches_zt0(d, ops, op_reg_kind, _a64) -> bool:
+    zt0 = getattr(_a64, "AARCH64_REG_ZT0", None)
+    if zt0 is None:
+        return False
+    for o in ops:
+        if o.type == op_reg_kind and int(getattr(o, "reg", 0) or 0) == zt0:
+            return True
+        if o.type == _a64.AARCH64_OP_SME:
+            sme = getattr(o, "sme", None)
+            if sme is not None and int(getattr(sme, "tile", 0) or 0) == zt0:
+                return True
+    for r in list(getattr(d, "regs_read", ()) or ()) + \
+            list(getattr(d, "regs_write", ()) or ()):
+        if int(r) == zt0:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------
 # AArch64 register-file and FP-family predicates.
 #
 # These mirror cap_aarch64_reg_file() / cap_aarch64_is_ieee_fp_op() /
@@ -3318,6 +3375,23 @@ def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
                     exp_src.discard("REG_FCSR")
             if _a64_is_ieee_fp_op(mnem) and not _files["za"]:
                 add(exp_dst, _a64.AARCH64_REG_FPCR)
+
+        # R7.4's FP / SIMD / SVE / SME enable gate
+        # (cap_aarch64_add_fp_enable_gate).  CPACR_EL1.FPEN,
+        # CPTR_EL2.FPEN and CPTR_EL3.TFP decide whether the instruction
+        # executes or traps, so all three are sources; they share
+        # REG_SYSFPEN, and Capstone has a register id for none of them,
+        # so the name goes in directly.  The discriminator is the same
+        # one the boundary uses -- the per-ENCODING feature list -- and
+        # not the mnemonic: one mnemonic spans FPARMv8, SVE and SME
+        # forms, and the SVE count and vector-length forms are gated
+        # while naming nothing but a GPR.
+        if _a64_is_fp_gated(d):
+            exp_src.add("REG_SYSFPEN")
+            # ZT0 has a second gate of its own: SMCR_ELx.EZT0, which is
+            # vector configuration and not the FP gate.
+            if _a64_touches_zt0(d, ops, op_reg_kind, _a64):
+                exp_src.add("REG_VCTRL")
 
         # Operand directions Capstone states the wrong way round
         # (cap_aarch64_operand_direction).

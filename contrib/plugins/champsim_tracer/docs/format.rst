@@ -2831,8 +2831,8 @@ Current generic register layout:
    | 49..64      | REG_DEBUG0..15            |
    | 65..96      | REG_FPR0..31              |
    | 97..100     | REG_ACCHI0..3             |
-   | 101..109    | privileged behaviour      |
-   | 110..128    | unallocated               |
+   | 101..110    | privileged behaviour      |
+   | 111..128    | unallocated               |
    | 129..192    | REG_VEC0..63              |
    | 193..224    | REG_PRED0..31             |
    | 225..230    | REG_SEG0..5               |
@@ -2849,9 +2849,10 @@ architecturally distinct registers that fall outside an ISA's numbered
 file but belong to its behaviour class — AArch64 ``ZT0`` at
 ``REG_VEC32``, ``FFR`` at ``REG_PRED16``.
 
-The privileged band 101..109 is ``REG_SYSEXC``, ``REG_SYSMMU``,
+The privileged band 101..110 is ``REG_SYSEXC``, ``REG_SYSMMU``,
 ``REG_SYSTIMER``, ``REG_SYSPERF``, ``REG_SYSDBG``, ``REG_SYSCACHE``,
-``REG_SYSID``, ``REG_COPROC0`` and ``REG_COPROC1``.  The
+``REG_SYSID``, ``REG_COPROC0``, ``REG_COPROC1`` and ``REG_SYSFPEN``.
+The
 compressed-special band holds the classes that are one register rather
 than a bank: ``REG_BOUND0..3``, ``REG_ACC0..3``, ``REG_ZERO``,
 ``REG_MATRIX``, ``REG_SYS``, ``REG_FCSR``, ``REG_VCTRL``, ``REG_TLS``

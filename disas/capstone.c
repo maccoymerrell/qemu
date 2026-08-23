@@ -2607,41 +2607,106 @@ static bool cap_aarch64_sysreg_operand(const cs_arm64_op *o, uint8_t *access)
  * register enum grows these, they become ordinary REG operands and this
  * table shrinks to nothing.
  *
- * Four roles are named and everything else -- the identification
- * registers, the translation and exception control registers, the
- * counters, the debug registers -- is OTHER.  The named ones are the
- * ones whose traffic would otherwise be fabricated onto an unrelated
- * population:
+ * WHY THE WHOLE FILE IS CLASSIFIED AND NOT JUST THE HOT NAMES.  Every
+ * role that is not named here folds onto the residual generic ID, and
+ * on AArch64 that residual is the entire privileged register space.  A
+ * consumer given one ID for 1,200 registers is told that a TTBR write,
+ * a VBAR write, a PMU counter read and a timer read are all the same
+ * dependency, and an instruction that genuinely reads one of them
+ * acquires an edge from every write to the other 1,199.  That is the
+ * mapping defect the MIPS CP0 split closed for that ISA; this is the
+ * same split for this one, into the same groups -- the sets whose
+ * members a consumer must order against the SAME event.
  *
- *   NZCV     is the condition-flag register the rest of the ISA already
- *            reads and writes.  On any other role `msr nzcv, x3` would
- *            write a register the `b.eq` after it does not read -- the
- *            severance this translation exists to close.
- *   FPCR /
- *   FPSR /
- *   FPMR     are the FP control and status words, which is what
- *            AARCH64_REG_FPCR already is wherever Capstone names it
- *            directly (`fadd` reports an implicit FPCR read).
- *   TPIDR_EL0 /
- *   TPIDRRO_EL0
- *            are the user thread pointer.  Every TLS access reads one
- *            of them -- 45 of the 50 MRS/MSR sites in a hello-world
- *            static binary -- and as OTHER that read would be ordered
- *            behind whatever system register the last MRS in the trace
- *            happened to touch.
+ * THE GROUPING IS BY ENCODING, not by a list of 1,214 names, because
+ * the AArch64 system space IS organised that way: op0 separates the
+ * debug/trace file from the rest, and CRn separates the functional
+ * groups within it.  A name list would be a transcription of that
+ * structure with 1,214 chances to mistype it.  The exceptions -- the
+ * places where one CRn holds two groups -- are named as CRm/op1/op2
+ * tests and are the only hand-maintained rows.  The classification of
+ * all 1,213 defined encodings is checked against the decoder itself,
+ * not against this comment: see the a64_split census in the commit that
+ * introduced it.
  *
- * TPIDR_EL1 is deliberately NOT THREADPTR: it is the kernel's per-CPU
- * base pointer, a different register serving a different purpose that
- * merely shares a name stem.
+ *   op0 = 2  is the debug, trace and record file in its entirety.
+ *            CRn 0-3 and 7 are the breakpoint / watchpoint registers
+ *            and the ETM trace unit, CRn 8 the branch-record buffer;
+ *            CRn 9 splits (CRm < 12 is BRBE control, CRm >= 12 the
+ *            system PMU) and CRn 14 is the system PMU counters.
+ *   op0 = 3  is everything else, by CRn:
+ *            0   identification -- MIDR, MPIDR, the ID_AA64* and
+ *                AArch32 ID space, MVFR, CTR, DCZID.  A read of one
+ *                depends on nothing, which is why they may not share
+ *                an ID with writable state.  CSSELR/CCSIDR/CLIDR are
+ *                the exception: CCSIDR reads back whatever CSSELR
+ *                selected, so they are a window and its selector.
+ *            1   execution control.  CPACR_EL1 and CPTR_EL{2,3} are
+ *                the FP/SIMD/SVE/SME ENABLE gate and take their own
+ *                role; ZCR/SMCR are vector configuration; TRFCR,
+ *                TRCITECR, MDCR and SDER32 are debug/trace control;
+ *                SCTLR, HCR, SCR and the fine-grained trap registers
+ *                stay residual -- nothing in the model reads them, and
+ *                putting them beside the FP gate would order every FP
+ *                instruction behind an SCTLR write.
+ *            2   translation control -- TTBR, TCR, VTTBR, VTCR, the
+ *                granule protection tables.  Not the pointer-auth keys
+ *                (op1 = 0, CRm 1-3), not RNDR/RNDRRS, and not the
+ *                guarded control stack: GCSPR_ELx IS a shadow-stack
+ *                pointer and takes that role, the same one x86 CET SSP
+ *                and RISC-V ssp already carry.
+ *            3   AArch32 and fine-grained trap control -- residual.
+ *            4   PSTATE and exception-return state.  SPSR/ELR are
+ *                exception state; FPCR/FPSR/FPMR the FP control word;
+ *                DSPSR/DLR the debug-state save registers; SVCR vector
+ *                configuration.  The PSTATE bit selectors (SPSel, PAN,
+ *                UAO, DIT, DAIF, ...) are residual: they are not a
+ *                register file a consumer renames.
+ *            5   fault status -- ESR, AFSR, TFSR, plus the RAS error
+ *                record window (op1 = 0, CRm 3-5) which is a selector
+ *                and a window like CSSELR/CCSIDR.
+ *            6   fault address (CRm 0) and the PMSA MPU regions.
+ *            7   PAR_EL1, the address-translation result.
+ *            9   performance monitors and statistical profiling, minus
+ *                the trace buffer (CRm 11).
+ *            10  memory attributes, permission indirection, LORegions,
+ *                memory encryption.  MPAM is partitioning, not
+ *                translation, and stays residual.
+ *            12  exception vectors (VBAR) and interrupt/SError status.
+ *                The GIC CPU and hypervisor interfaces stay residual:
+ *                they are device state reached through a system
+ *                register, not part of the exception file a fault
+ *                writes.
+ *            13  CONTEXTIDR (translation context) and the activity
+ *                monitors.  TPIDR_EL0/TPIDRRO_EL0 are the user thread
+ *                pointer; TPIDR_EL{1,2,3} deliberately are NOT -- the
+ *                kernel per-CPU base is a different register serving a
+ *                different purpose that merely shares a name stem.
+ *            14  the generic timer (CRm < 8) and the PMU event
+ *                counters.
  *
  * Reproducers (`cstool -d arm64 <hex>`):
- *   200420d5  msr nzcv, x0        sysreg 0xda10
- *   00443bd5  mrs x0, fpcr        sysreg 0xda20
- *   44d03bd5  mrs x4, tpidr_el0   sysreg 0xde82
- *   e0003bd5  mrs x0, dczid_el0   sysreg 0xd807 (OTHER)
+ *   200420d5  msr nzcv, x0        sysreg 0xda10  FLAGS
+ *   00443bd5  mrs x0, fpcr        sysreg 0xda20  FPCTRL
+ *   44d03bd5  mrs x4, tpidr_el0   sysreg 0xde82  THREADPTR
+ *   401038d5  mrs x0, cpacr_el1   sysreg 0xc082  FPENABLE
+ *   002038d5  mrs x0, ttbr0_el1   sysreg 0xc100  MMU
+ *   004038d5  mrs x0, spsr_el1    sysreg 0xc200  EXC
+ *   e0003bd5  mrs x0, dczid_el0   sysreg 0xd807  IDENT
  */
+#define A64_SYSREG_OP0(e) (((e) >> 14) & 0x3)
+#define A64_SYSREG_OP1(e) (((e) >> 11) & 0x7)
+#define A64_SYSREG_CRN(e) (((e) >> 7) & 0xf)
+#define A64_SYSREG_CRM(e) (((e) >> 3) & 0xf)
+#define A64_SYSREG_OP2(e) ((e) & 0x7)
+
 static uint8_t cap_aarch64_sysreg_class(unsigned sysreg)
 {
+    unsigned op1 = A64_SYSREG_OP1(sysreg);
+    unsigned crn = A64_SYSREG_CRN(sysreg);
+    unsigned crm = A64_SYSREG_CRM(sysreg);
+    unsigned op2 = A64_SYSREG_OP2(sysreg);
+
     switch (sysreg) {
     case AARCH64_SYSREG_NZCV:
         return QEMU_PLUGIN_SYSREG_FLAGS;
@@ -2652,34 +2717,123 @@ static uint8_t cap_aarch64_sysreg_class(unsigned sysreg)
     case AARCH64_SYSREG_TPIDR_EL0:
     case AARCH64_SYSREG_TPIDRRO_EL0:
         return QEMU_PLUGIN_SYSREG_THREADPTR;
-    case AARCH64_SYSREG_MIDR_EL1:
-    case AARCH64_SYSREG_MPIDR_EL1:
-    case AARCH64_SYSREG_REVIDR_EL1:
-    case AARCH64_SYSREG_CTR_EL0:
-    case AARCH64_SYSREG_DCZID_EL0:
-    case AARCH64_SYSREG_ID_AA64AFR0_EL1:
-    case AARCH64_SYSREG_ID_AA64AFR1_EL1:
-    case AARCH64_SYSREG_ID_AA64DFR0_EL1:
-    case AARCH64_SYSREG_ID_AA64DFR1_EL1:
-    case AARCH64_SYSREG_ID_AA64DFR2_EL1:
-    case AARCH64_SYSREG_ID_AA64FPFR0_EL1:
-    case AARCH64_SYSREG_ID_AA64ISAR0_EL1:
-    case AARCH64_SYSREG_ID_AA64ISAR1_EL1:
-    case AARCH64_SYSREG_ID_AA64ISAR2_EL1:
-    case AARCH64_SYSREG_ID_AA64ISAR3_EL1:
-    case AARCH64_SYSREG_ID_AA64MMFR0_EL1:
-    case AARCH64_SYSREG_ID_AA64MMFR1_EL1:
-    case AARCH64_SYSREG_ID_AA64MMFR2_EL1:
-    case AARCH64_SYSREG_ID_AA64MMFR3_EL1:
-    case AARCH64_SYSREG_ID_AA64MMFR4_EL1:
-    case AARCH64_SYSREG_ID_AA64PFR0_EL1:
-    case AARCH64_SYSREG_ID_AA64PFR1_EL1:
-    case AARCH64_SYSREG_ID_AA64PFR2_EL1:
-    case AARCH64_SYSREG_ID_AA64SMFR0_EL1:
-    case AARCH64_SYSREG_ID_AA64ZFR0_EL1:
-        /* Read-only implementation constants -- same class, and for the
-         * same reason, as RISC-V vlenb above. */
+    default:
+        break;
+    }
+
+    if (A64_SYSREG_OP0(sysreg) == 2) {
+        /* The debug / trace / record file. */
+        if (crn == 9) {
+            /* BRBE control (CRm 0-2) against the system PMU (CRm 12-14). */
+            return crm >= 12 ? QEMU_PLUGIN_SYSREG_PERF
+                             : QEMU_PLUGIN_SYSREG_DBG;
+        }
+        if (crn == 14) {
+            return QEMU_PLUGIN_SYSREG_PERF;
+        }
+        return QEMU_PLUGIN_SYSREG_DBG;
+    }
+
+    switch (crn) {
+    case 0:
+        /* CCSIDR / CLIDR / CCSIDR2 (op1 1) read back what CSSELR
+         * (op1 2) selected; the rest of CRn 0 is read-only ID. */
+        if ((op1 == 1 && crm == 0 && op2 <= 2) ||
+            (op1 == 2 && crm == 0 && op2 == 0)) {
+            return QEMU_PLUGIN_SYSREG_CACHE;
+        }
         return QEMU_PLUGIN_SYSREG_IDENT;
+    case 1:
+        if (crm == 0 && op2 == 2) {
+            return QEMU_PLUGIN_SYSREG_FPENABLE;   /* CPACR_EL1 / _EL12 */
+        }
+        if (crm == 1 && op2 == 2) {
+            return QEMU_PLUGIN_SYSREG_FPENABLE;   /* CPTR_EL2 / CPTR_EL3 */
+        }
+        if (crm == 2 && (op2 == 0 || op2 == 6)) {
+            return QEMU_PLUGIN_SYSREG_VECCTRL;    /* ZCR_ELx / SMCR_ELx */
+        }
+        if (crm == 2 && (op2 == 1 || op2 == 3)) {
+            return QEMU_PLUGIN_SYSREG_DBG;        /* TRFCR / TRCITECR */
+        }
+        if ((crm == 1 || crm == 3) && op2 == 1 && (op1 == 4 || op1 == 6)) {
+            return QEMU_PLUGIN_SYSREG_DBG;        /* MDCR / SDER32 */
+        }
+        return QEMU_PLUGIN_SYSREG_OTHER;
+    case 2:
+        if (op1 == 0 && crm >= 1 && crm <= 3) {
+            return QEMU_PLUGIN_SYSREG_OTHER;      /* pointer-auth keys */
+        }
+        if (crm == 4) {
+            return QEMU_PLUGIN_SYSREG_OTHER;      /* RNDR / RNDRRS */
+        }
+        if (crm == 5) {
+            /* GCSPR_ELx (op2 1) is the guarded-control-stack pointer;
+             * GCSCR / GCSCRE0 are its control registers. */
+            return op2 == 1 ? QEMU_PLUGIN_SYSREG_SHADOWSTK
+                            : QEMU_PLUGIN_SYSREG_OTHER;
+        }
+        return QEMU_PLUGIN_SYSREG_MMU;
+    case 4:
+        if (crm == 0) {
+            return QEMU_PLUGIN_SYSREG_EXC;        /* SPSR_ELx / ELR_ELx */
+        }
+        if (crm == 3 && op1 == 4 && op2 <= 3) {
+            return QEMU_PLUGIN_SYSREG_EXC;        /* the AArch32 banked SPSRs */
+        }
+        if (crm == 4) {
+            return QEMU_PLUGIN_SYSREG_FPCTRL;     /* FPCR/FPSR/FPMR aliases */
+        }
+        if (crm == 5) {
+            return QEMU_PLUGIN_SYSREG_DBG;        /* DSPSR_EL0 / DLR_EL0 */
+        }
+        if (crm == 2 && op2 == 2 && op1 == 3) {
+            return QEMU_PLUGIN_SYSREG_VECCTRL;    /* SVCR */
+        }
+        return QEMU_PLUGIN_SYSREG_OTHER;
+    case 5:
+        if (op1 == 0 && crm >= 3 && crm <= 5) {
+            return QEMU_PLUGIN_SYSREG_CACHE;      /* RAS error records */
+        }
+        return QEMU_PLUGIN_SYSREG_EXC;
+    case 6:
+        return crm == 0 ? QEMU_PLUGIN_SYSREG_EXC   /* FAR / PFAR / HPFAR */
+                        : QEMU_PLUGIN_SYSREG_MMU;  /* PMSA MPU regions */
+    case 7:
+        return QEMU_PLUGIN_SYSREG_MMU;             /* PAR_EL1 */
+    case 9:
+        return crm == 11 ? QEMU_PLUGIN_SYSREG_DBG  /* trace buffer */
+                         : QEMU_PLUGIN_SYSREG_PERF;
+    case 10:
+        if (crm == 5 || crm == 6) {
+            return QEMU_PLUGIN_SYSREG_OTHER;       /* MPAM partitioning */
+        }
+        if (crm == 4) {
+            if (op1 == 0 && (op2 <= 3 || op2 == 7)) {
+                return QEMU_PLUGIN_SYSREG_MMU;     /* LORegions */
+            }
+            return QEMU_PLUGIN_SYSREG_OTHER;       /* MPAM */
+        }
+        return QEMU_PLUGIN_SYSREG_MMU;
+    case 12:
+        if (crm == 0 && op2 == 0) {
+            return QEMU_PLUGIN_SYSREG_EXC;         /* VBAR_ELx */
+        }
+        if (crm == 1) {
+            return QEMU_PLUGIN_SYSREG_EXC;         /* ISR / DISR / VDISR */
+        }
+        return QEMU_PLUGIN_SYSREG_OTHER;           /* GIC CPU interface */
+    case 13:
+        if (crm == 0) {
+            if (op2 == 1 && (op1 == 0 || op1 == 4 || op1 == 5)) {
+                return QEMU_PLUGIN_SYSREG_MMU;     /* CONTEXTIDR_ELx */
+            }
+            return QEMU_PLUGIN_SYSREG_OTHER;
+        }
+        return QEMU_PLUGIN_SYSREG_PERF;            /* activity monitors */
+    case 14:
+        return crm < 8 ? QEMU_PLUGIN_SYSREG_TIMER
+                       : QEMU_PLUGIN_SYSREG_PERF;
     default:
         return QEMU_PLUGIN_SYSREG_OTHER;
     }
@@ -3157,6 +3311,223 @@ static void cap_aarch64_fp_status_contract(const cs_insn *insn,
     }
     if (writes_fpsr) {
         cap_aarch64_add_implicit_write(out, handle, AARCH64_REG_FPCR);
+    }
+}
+
+/*
+ * The FP / SIMD / SVE / SME execution-enable gate, as a source.
+ *
+ * R7.4: "if a write to the CSR would block that instruction due to a
+ * dependency, it should be recorded".  CPACR_EL1.FPEN, CPTR_EL2.FPEN
+ * and CPTR_EL3.TFP decide whether an FP, Advanced SIMD, SVE or SME
+ * instruction executes or takes a trap, so a pending write to one of
+ * them has to resolve before any of those instructions may proceed.
+ * That is an edge a renaming regfile must respect, which is the test
+ * R7 states, and it is the same fact this boundary already records on
+ * RISC-V for wfi/mstatus.TW and the cbo/Zicfiss envcfg triple.
+ *
+ * ALL THREE ARE NAMED, not just the one the current exception level
+ * consults, for the reason R4 gives and the RISC-V envcfg triple
+ * already follows: which gate applies is a runtime value and a static
+ * register set names every candidate.  They share one generic ID
+ * (REG_SYSFPEN) because they are one behaviour group -- see
+ * cap_aarch64_sysreg_class -- so the generic register set is the same
+ * whichever of them a run actually traps on; what the three operands
+ * carry that one would not is the identification, in reg_id and
+ * reg_name, of which register a consumer is looking at.
+ *
+ * WHICH INSTRUCTIONS.  The gate belongs to exactly the instructions the
+ * architecture routes through CheckFPAdvSIMDEnabled / CheckSVEEnabled /
+ * CheckSMEEnabled, and that population is the FP, SIMD, SVE and SME
+ * extensions in their entirety.  The discriminator is Capstone's
+ * per-ENCODING feature list, not the mnemonic and not the operand
+ * register files: one mnemonic spans forms in different extensions
+ * (`fadd d0, d1, d2` is FPARMv8, `fadd z0.d, p0/m, z0.d, z1.d` is SVE,
+ * `fadd za.d[w8, 0, vgx2], {z0.d, z1.d}` is SME2), and the SVE count
+ * and vector-length forms (CNTB, RDVL) are gated while naming nothing
+ * but a GPR.  Feature membership is instruction TAXONOMY, which is what
+ * Capstone is kept for; it is not operand or access-flag information,
+ * so nothing here reaches the dependency model through a Capstone
+ * decision about registers.
+ *
+ * The list is the FP/SIMD/vector/matrix extensions.  The integer and
+ * system extensions that sit beside them in the enum -- CRC, CSSC, LSE,
+ * RAS, SPE, MOPS, MTE, PAUTH -- are NOT gated and are not here.
+ */
+static bool cap_aarch64_feature_is_fp_gated(uint16_t g)
+{
+    switch (g) {
+    /* Scalar FP and Advanced SIMD, and the V-register crypto. */
+    case AARCH64_FEATURE_HASFPARMV8:
+    case AARCH64_FEATURE_HASNEON:
+    case AARCH64_FEATURE_HASFULLFP16:
+    case AARCH64_FEATURE_HASFP16FML:
+    case AARCH64_FEATURE_HASFUSEAES:
+    case AARCH64_FEATURE_HASAES:
+    case AARCH64_FEATURE_HASSHA2:
+    case AARCH64_FEATURE_HASSHA3:
+    case AARCH64_FEATURE_HASSM4:
+    case AARCH64_FEATURE_HASDOTPROD:
+    case AARCH64_FEATURE_HASRDM:
+    case AARCH64_FEATURE_HASCOMPLXNUM:
+    case AARCH64_FEATURE_HASJS:
+    case AARCH64_FEATURE_HASFRINT3264:
+    case AARCH64_FEATURE_HASBF16:
+    case AARCH64_FEATURE_HASB16B16:
+    case AARCH64_FEATURE_HASMATMULINT8:
+    case AARCH64_FEATURE_HASMATMULFP32:
+    case AARCH64_FEATURE_HASMATMULFP64:
+    case AARCH64_FEATURE_HASLUT:
+    case AARCH64_FEATURE_HASFAMINMAX:
+    /* FEAT_FP8 and its dot/FMA companions. */
+    case AARCH64_FEATURE_HASFP8:
+    case AARCH64_FEATURE_HASFP8FMA:
+    case AARCH64_FEATURE_HASFP8DOT2:
+    case AARCH64_FEATURE_HASFP8DOT4:
+    case AARCH64_FEATURE_HASSSVE_FP8FMA:
+    case AARCH64_FEATURE_HASSSVE_FP8DOT2:
+    case AARCH64_FEATURE_HASSSVE_FP8DOT4:
+    /* SVE. */
+    case AARCH64_FEATURE_HASSVE:
+    case AARCH64_FEATURE_HASSVE2:
+    case AARCH64_FEATURE_HASSVE2P1:
+    case AARCH64_FEATURE_HASSVE2AES:
+    case AARCH64_FEATURE_HASSVE2SM4:
+    case AARCH64_FEATURE_HASSVE2SHA3:
+    case AARCH64_FEATURE_HASSVE2BITPERM:
+    /* SME. */
+    case AARCH64_FEATURE_HASSME:
+    case AARCH64_FEATURE_HASSME2:
+    case AARCH64_FEATURE_HASSME2P1:
+    case AARCH64_FEATURE_HASSMEF64F64:
+    case AARCH64_FEATURE_HASSMEF16F16:
+    case AARCH64_FEATURE_HASSMEFA64:
+    case AARCH64_FEATURE_HASSMEI16I64:
+    case AARCH64_FEATURE_HASSMEF8F16:
+    case AARCH64_FEATURE_HASSMEF8F32:
+    case AARCH64_FEATURE_HASSME_LUTV2:
+    /* The "either extension provides it" spellings. */
+    case AARCH64_FEATURE_HASSVEORSME:
+    case AARCH64_FEATURE_HASSVE2ORSME:
+    case AARCH64_FEATURE_HASSVE2ORSME2:
+    case AARCH64_FEATURE_HASSVE2P1_OR_HASSME:
+    case AARCH64_FEATURE_HASSVE2P1_OR_HASSME2:
+    case AARCH64_FEATURE_HASSVE2P1_OR_HASSME2P1:
+    case AARCH64_FEATURE_HASNEONORSME:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool cap_aarch64_is_fp_gated(const cs_insn *insn)
+{
+    const cs_detail *d = insn->detail;
+
+    if (!d) {
+        return false;
+    }
+    for (uint8_t i = 0; i < d->groups_count; i++) {
+        if (cap_aarch64_feature_is_fp_gated(d->groups[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Append a system register the ENCODING implies but no operand names.
+ *
+ * The AArch64 counterpart of cap_riscv_add_csr: an MRS/MSR operand is
+ * the only way a system register reaches the plugin from this
+ * disassembler, so a register that is architecturally part of an
+ * instruction's footprint without being printed can only be added
+ * here.  Idempotent on the sysreg encoding, and a no-op once the
+ * operand array is full.
+ */
+static void cap_aarch64_add_sysreg(qemu_plugin_insn_info *out,
+                                   unsigned sysreg, const char *name,
+                                   uint8_t access)
+{
+    qemu_plugin_operand *op;
+
+    for (uint8_t i = 0; i < out->n_operands; i++) {
+        if (out->operands[i].type == QEMU_PLUGIN_OP_SYSREG
+            && out->operands[i].reg_id == (uint16_t)sysreg) {
+            out->operands[i].access |= access;
+            return;
+        }
+    }
+    if (out->n_operands >= QEMU_PLUGIN_INSN_DETAIL_MAX_OPS) {
+        return;
+    }
+    op = &out->operands[out->n_operands];
+    memset(op, 0, sizeof(*op));
+    op->type   = QEMU_PLUGIN_OP_SYSREG;
+    op->access = access;
+    op->reg_id = (uint16_t)sysreg;
+    op->sysreg_class = cap_aarch64_sysreg_class(sysreg);
+    op->scale  = 1;
+    g_strlcpy(op->reg_name, name, QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ);
+    out->n_operands++;
+}
+
+/*
+ * ZT0 has a SECOND gate, and it is not CPACR.
+ *
+ * SMCR_ELx.EZT0 decides on its own whether an instruction that touches
+ * the SME2 lookup-table register traps -- CheckSMEZT0Enabled reads it
+ * after CheckSMEEnabled has already passed -- so by the same R7.4 test
+ * it is a second source on exactly the ZT0 forms.  It is NOT the
+ * FP-enable gate and does not share its ID: SMCR is vector
+ * configuration (it also carries the streaming vector length), which is
+ * the role REG_VCTRL names, and folding the two would order every FP
+ * instruction behind a vector-length write.
+ */
+static bool cap_aarch64_touches_zt0(const cs_arm64 *a64, uint8_t n,
+                                    const qemu_plugin_insn_info *out)
+{
+    for (uint8_t i = 0; i < n; i++) {
+        const cs_arm64_op *o = &a64->operands[i];
+
+        if ((o->type == AARCH64_OP_REG && o->reg == AARCH64_REG_ZT0) ||
+            (o->type == AARCH64_OP_SME && o->sme.tile == AARCH64_REG_ZT0)) {
+            return true;
+        }
+    }
+    for (uint8_t i = 0; i < out->n_regs_read; i++) {
+        if (out->regs_read_id[i] == AARCH64_REG_ZT0) {
+            return true;
+        }
+    }
+    for (uint8_t i = 0; i < out->n_regs_write; i++) {
+        if (out->regs_write_id[i] == AARCH64_REG_ZT0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void cap_aarch64_add_fp_enable_gate(const cs_insn *insn,
+                                           const cs_arm64 *a64, uint8_t n,
+                                           qemu_plugin_insn_info *out)
+{
+    if (!cap_aarch64_is_fp_gated(insn)) {
+        return;
+    }
+    cap_aarch64_add_sysreg(out, AARCH64_SYSREG_CPACR_EL1, "cpacr_el1",
+                           QEMU_PLUGIN_OP_ACC_READ);
+    cap_aarch64_add_sysreg(out, AARCH64_SYSREG_CPTR_EL2, "cptr_el2",
+                           QEMU_PLUGIN_OP_ACC_READ);
+    cap_aarch64_add_sysreg(out, AARCH64_SYSREG_CPTR_EL3, "cptr_el3",
+                           QEMU_PLUGIN_OP_ACC_READ);
+    if (cap_aarch64_touches_zt0(a64, n, out)) {
+        cap_aarch64_add_sysreg(out, AARCH64_SYSREG_SMCR_EL1, "smcr_el1",
+                               QEMU_PLUGIN_OP_ACC_READ);
+        cap_aarch64_add_sysreg(out, AARCH64_SYSREG_SMCR_EL2, "smcr_el2",
+                               QEMU_PLUGIN_OP_ACC_READ);
+        cap_aarch64_add_sysreg(out, AARCH64_SYSREG_SMCR_EL3, "smcr_el3",
+                               QEMU_PLUGIN_OP_ACC_READ);
     }
 }
 
@@ -3864,6 +4235,7 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
      * FPCR read cannot double-count.
      */
     cap_aarch64_fp_status_contract(insn, a64, handle, out);
+    cap_aarch64_add_fp_enable_gate(insn, a64, n, out);
     cap_aarch64_operand_direction(insn, a64, handle, out);
 
     if (insn->id == ARM64_INS_RET && a64->op_count == 0) {

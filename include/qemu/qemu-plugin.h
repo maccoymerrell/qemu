@@ -1082,7 +1082,7 @@ char *qemu_plugin_insn_disas(const struct qemu_plugin_insn *insn);
  * zeroed operand reads as "some system register" rather than as a
  * specific one.
  */
-#define QEMU_PLUGIN_SYSREG_OTHER     0  /* the long tail: ID, trap,
+#define QEMU_PLUGIN_SYSREG_OTHER     0  /* the long tail: trap,
                                          * translation, counter, debug */
 #define QEMU_PLUGIN_SYSREG_FLAGS     1  /* condition flags (AArch64 NZCV) */
 #define QEMU_PLUGIN_SYSREG_FPCTRL    2  /* FP / fixed-point rounding-mode
@@ -1092,6 +1092,14 @@ char *qemu_plugin_insn_disas(const struct qemu_plugin_insn *insn);
                                          * vtype, vstart) */
 #define QEMU_PLUGIN_SYSREG_THREADPTR 4  /* userspace thread pointer
                                          * (TPIDR_EL0, TPIDRRO_EL0) */
+#define QEMU_PLUGIN_SYSREG_IDENT     5  /* read-only implementation
+                                         * constants: AArch64 MIDR /
+                                         * MPIDR / CTR / ID_AA64*,
+                                         * RISC-V vlenb / mvendorid /
+                                         * marchid / mimpid / mhartid.
+                                         * A read of one depends on
+                                         * nothing, so it must not share
+                                         * an ID with writable state. */
 
 /* Operand access mode (bitmask) */
 #define QEMU_PLUGIN_OP_ACC_READ  1

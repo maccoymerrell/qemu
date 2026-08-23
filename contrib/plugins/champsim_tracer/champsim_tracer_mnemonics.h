@@ -600,6 +600,7 @@ static inline uint8_t generic_reg_for_sysreg_class(uint8_t sysreg_class)
     case QEMU_PLUGIN_SYSREG_FPCTRL:    return REG_FCSR;
     case QEMU_PLUGIN_SYSREG_VECCTRL:   return REG_VCTRL;
     case QEMU_PLUGIN_SYSREG_THREADPTR: return REG_TLS;
+    case QEMU_PLUGIN_SYSREG_IDENT:     return REG_SYSID;
     case QEMU_PLUGIN_SYSREG_OTHER:
     default:                           return REG_SYS;
     }

@@ -2333,6 +2333,34 @@ static uint8_t cap_aarch64_sysreg_class(unsigned sysreg)
     case AARCH64_SYSREG_TPIDR_EL0:
     case AARCH64_SYSREG_TPIDRRO_EL0:
         return QEMU_PLUGIN_SYSREG_THREADPTR;
+    case AARCH64_SYSREG_MIDR_EL1:
+    case AARCH64_SYSREG_MPIDR_EL1:
+    case AARCH64_SYSREG_REVIDR_EL1:
+    case AARCH64_SYSREG_CTR_EL0:
+    case AARCH64_SYSREG_DCZID_EL0:
+    case AARCH64_SYSREG_ID_AA64AFR0_EL1:
+    case AARCH64_SYSREG_ID_AA64AFR1_EL1:
+    case AARCH64_SYSREG_ID_AA64DFR0_EL1:
+    case AARCH64_SYSREG_ID_AA64DFR1_EL1:
+    case AARCH64_SYSREG_ID_AA64DFR2_EL1:
+    case AARCH64_SYSREG_ID_AA64FPFR0_EL1:
+    case AARCH64_SYSREG_ID_AA64ISAR0_EL1:
+    case AARCH64_SYSREG_ID_AA64ISAR1_EL1:
+    case AARCH64_SYSREG_ID_AA64ISAR2_EL1:
+    case AARCH64_SYSREG_ID_AA64ISAR3_EL1:
+    case AARCH64_SYSREG_ID_AA64MMFR0_EL1:
+    case AARCH64_SYSREG_ID_AA64MMFR1_EL1:
+    case AARCH64_SYSREG_ID_AA64MMFR2_EL1:
+    case AARCH64_SYSREG_ID_AA64MMFR3_EL1:
+    case AARCH64_SYSREG_ID_AA64MMFR4_EL1:
+    case AARCH64_SYSREG_ID_AA64PFR0_EL1:
+    case AARCH64_SYSREG_ID_AA64PFR1_EL1:
+    case AARCH64_SYSREG_ID_AA64PFR2_EL1:
+    case AARCH64_SYSREG_ID_AA64SMFR0_EL1:
+    case AARCH64_SYSREG_ID_AA64ZFR0_EL1:
+        /* Read-only implementation constants -- same class, and for the
+         * same reason, as RISC-V vlenb above. */
+        return QEMU_PLUGIN_SYSREG_IDENT;
     default:
         return QEMU_PLUGIN_SYSREG_OTHER;
     }
@@ -4245,8 +4273,21 @@ static uint8_t cap_riscv_csr_class(unsigned csr)
     case 0xc20:  /* vl     */
     case 0xc21:  /* vtype  */
         return QEMU_PLUGIN_SYSREG_VECCTRL;
+    case 0xc22:  /* vlenb    */
+    case 0xf11:  /* mvendorid*/
+    case 0xf12:  /* marchid  */
+    case 0xf13:  /* mimpid   */
+    case 0xf14:  /* mhartid  */
+        /*
+         * Read-only implementation constants.  These used to fall to
+         * OTHER, whose comment said "a read-only implementation
+         * constant" and then routed past the class that means it: the
+         * classification table's REG_SYSID row for RISCV_REG_VLENB was
+         * therefore read by nothing, because a Zicsr CSR does not take
+         * the per-ISA register path at all.
+         */
+        return QEMU_PLUGIN_SYSREG_IDENT;
     default:
-        /* vlenb (0xc22) included: a read-only implementation constant. */
         return QEMU_PLUGIN_SYSREG_OTHER;
     }
 }

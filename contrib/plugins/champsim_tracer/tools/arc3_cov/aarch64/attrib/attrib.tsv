@@ -124,7 +124,7 @@ CASPAL_CP64_comswappr	caspal	cefe6048	caspal x0, x1, x14, x15, [x22]	general	1:M
 CASPA_CP32_comswappr	caspa	b87f6408	caspa w4, w5, w24, w25, [x29]	general	1:MRA	ok	FP_REG,GPR24,GPR25,GPR4,GPR5,PSTATE.EL	GPR4,GPR5	FP_REG,GPR24,GPR25,GPR4,GPR5	GPR4,GPR5	agree	-	PSTATE.EL	FP_REG,GPR24,GPR25,GPR4,GPR5	GPR4,GPR5	same	-
 CASPA_CP64_comswappr	caspa	987d7248	caspa x18, x19, x24, x25, [x12]	general	1:MRA	ok	GPR12,GPR18,GPR19,GPR24,GPR25,PSTATE.EL	GPR18,GPR19	GPR12,GPR18,GPR19,GPR24,GPR25	GPR18,GPR19	agree	-	PSTATE.EL	GPR12,GPR18,GPR19,GPR24,GPR25	GPR18,GPR19	same	-
 CASPL_CP32_comswappr	caspl	e0fe3a08	caspl w26, w27, w0, w1, [x23]	general	1:MRA	ok	GPR0,GPR1,GPR23,GPR26,GPR27,PSTATE.EL	GPR26,GPR27	GPR0,GPR1,GPR23,GPR26,GPR27	GPR26,GPR27	agree	-	PSTATE.EL	GPR0,GPR1,GPR23,GPR26,GPR27	GPR26,GPR27	same	-
-CASPL_CP64_comswappr	caspl	e6fe3e48	caspl x30, xzr, x6, x7, [x23]	general	1:MRA	ok	GPR23,GPR6,GPR7,LR,PSTATE.EL,ZERO	LR	GPR23,GPR6,GPR7,LR,ZERO	LR	agree	-	PSTATE.EL	GPR23,GPR6,GPR7,LR,ZERO	LR,ZERO	DST+trc:ZERO	-
+CASPL_CP64_comswappr	caspl	e6fe3e48	caspl x30, xzr, x6, x7, [x23]	general	1:MRA	ok	GPR23,GPR6,GPR7,LR,PSTATE.EL,ZERO	LR	GPR23,GPR6,GPR7,LR,ZERO	LR,ZERO	disagree	DST+trc:ZERO	PSTATE.EL	GPR23,GPR6,GPR7,LR,ZERO	LR,ZERO	DST+trc:ZERO	-
 CASP_CP32_comswappr	casp	3e7e2c08	casp w12, w13, w30, wzr, [x17]	general	1:MRA	ok	GPR12,GPR13,GPR17,LR,PSTATE.EL,ZERO	GPR12,GPR13	GPR12,GPR13,GPR17,LR,ZERO	GPR12,GPR13	agree	-	PSTATE.EL	GPR12,GPR13,GPR17,LR,ZERO	GPR12,GPR13	same	-
 CASP_CP64_comswappr	casp	5a7c2048	casp x0, x1, x26, x27, [x2]	general	1:MRA	ok	GPR0,GPR1,GPR2,GPR26,GPR27,PSTATE.EL	GPR0,GPR1	GPR0,GPR1,GPR2,GPR26,GPR27	GPR0,GPR1	agree	-	PSTATE.EL	GPR0,GPR1,GPR2,GPR26,GPR27	GPR0,GPR1	same	-
 CAS_C32_comswap	cas	437ca188	cas w1, w3, [x2]	general	1:MRA	ok	GPR1,GPR2,GPR3,PSTATE.EL	GPR1	GPR1,GPR2,GPR3	GPR1	agree	-	PSTATE.EL	GPR1,GPR2,GPR3	GPR1	same	-
@@ -186,7 +186,7 @@ CMPLE_cmpge_p_p_zz_	cmple	a0831c24	cmpge p0.b, p0/z, z29.b, z28.b	sve	1:MRA	ok	P
 CMPLO_cmphi_p_p_zz_	cmplo	b0011624	cmphi p0.b, p0/z, z13.b, z22.b	sve	1:MRA	ok	PRED0,VEC13,VEC22	FLAGS,PRED0	PRED0,VEC13,VEC22	FLAGS,PRED0	agree	-	-	PRED0,VEC13,VEC22	FLAGS,PRED0	same	unbounded-loop
 CMPLS_cmphs_p_p_zz_	cmpls	60021524	cmphs p0.b, p0/z, z19.b, z21.b	sve	1:MRA	ok	PRED0,VEC19,VEC21	FLAGS,PRED0	PRED0,VEC19,VEC21	FLAGS,PRED0	agree	-	-	PRED0,VEC19,VEC21	FLAGS,PRED0	same	unbounded-loop
 CMPLT_cmpgt_p_p_zz_	cmplt	70800924	cmpgt p0.b, p0/z, z3.b, z9.b	sve	1:MRA	ok	PRED0,VEC3,VEC9	FLAGS,PRED0	PRED0,VEC3,VEC9	FLAGS,PRED0	agree	-	-	PRED0,VEC3,VEC9	FLAGS,PRED0	same	unbounded-loop
-CMPP_SUBPS_64S_dp_2src	cmpp	5f00c1ba	subps xzr, x2, x1	general	1:MRA	ok	GPR1,GPR2	FLAGS	GPR1,GPR2	FLAGS	agree	-	-	GPR1,GPR2	FLAGS,ZERO	DST+trc:ZERO	-
+CMPP_SUBPS_64S_dp_2src	cmpp	5f00c1ba	subps xzr, x2, x1	general	1:MRA	ok	GPR1,GPR2	FLAGS	GPR1,GPR2	FLAGS,ZERO	disagree	DST+trc:ZERO	-	GPR1,GPR2	FLAGS,ZERO	DST+trc:ZERO	-
 CMP_SUBS_32S_addsub_ext	cmp	9f4c216b	cmp w4, w1, uxtw #3	general	1:MRA	ok	GPR1,GPR4	FLAGS	GPR1,GPR4	FLAGS	agree	-	-	GPR1,GPR4	FLAGS,ZERO	DST+trc:ZERO	-
 CMP_SUBS_32S_addsub_imm	cmp	7f084071	cmp w3, #2, lsl #12	general	1:MRA	ok	GPR3	FLAGS	GPR3	FLAGS	agree	-	-	GPR3	FLAGS,ZERO	DST+trc:ZERO	-
 CMP_SUBS_32_addsub_shift	cmp	9f0c426b	cmp w4, w2, lsr #3	general	1:MRA	ok	GPR2,GPR4	FLAGS	GPR2,GPR4	FLAGS	agree	-	-	GPR2,GPR4	FLAGS,ZERO	DST+trc:ZERO	-
@@ -1490,7 +1490,7 @@ SBCS_64_addsub_carry	sbcs	430001fa	sbcs x3, x2, x1	general	1:MRA	ok	FLAGS,GPR1,G
 SBC_32_addsub_carry	sbc	4300015a	sbc w3, w2, w1	general	1:MRA	ok	FLAGS,GPR1,GPR2	GPR3	FLAGS,GPR1,GPR2	GPR3	agree	-	-	FLAGS,GPR1,GPR2	GPR3	same	-
 SBC_64_addsub_carry	sbc	430001da	sbc x3, x2, x1	general	1:MRA	ok	FLAGS,GPR1,GPR2	GPR3	FLAGS,GPR1,GPR2	GPR3	agree	-	-	FLAGS,GPR1,GPR2	GPR3	same	-
 SBFIZ_SBFM_32M_bitfield	sbfiz	921d0813	sbfiz w18, w12, #24, #8	general	1:MRA	ok	GPR12	GPR18	GPR12	GPR18	agree	-	-	GPR12	GPR18	same	unbounded-loop
-SBFIZ_SBFM_64M_bitfield	sbfiz	1f015593	sbfiz xzr, x8, #43, #1	general	1:MRA	ok	GPR8	-	GPR8	-	agree	-	-	GPR8	ZERO	DST+trc:ZERO	unbounded-loop
+SBFIZ_SBFM_64M_bitfield	sbfiz	1f015593	sbfiz xzr, x8, #43, #1	general	1:MRA	ok	GPR8	-	GPR8	ZERO	disagree	DST+trc:ZERO	-	GPR8	ZERO	DST+trc:ZERO	unbounded-loop
 SBFM_32M_bitfield	sbfm	64080113	sbfx w4, w3, #1, #2	general	1:MRA	ok	GPR3	GPR4	GPR3	GPR4	agree	-	-	GPR3	GPR4	same	unbounded-loop
 SBFM_64M_bitfield	sbfm	64084193	sbfx x4, x3, #1, #2	general	1:MRA	ok	GPR3	GPR4	GPR3	GPR4	agree	-	-	GPR3	GPR4	same	unbounded-loop
 SBFX_SBFM_32M_bitfield	sbfx	f8010013	sbfx w24, w15, #0, #1	general	1:MRA	ok	GPR15	GPR24	GPR15	GPR24	agree	-	-	GPR15	GPR24	same	unbounded-loop

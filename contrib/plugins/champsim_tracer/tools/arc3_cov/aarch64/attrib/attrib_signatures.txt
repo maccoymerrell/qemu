@@ -1,4 +1,4 @@
-TOTALS {'agree': 3625, 'disagree': 295, 'agree_with_tierB_refonly': 1936}
+TOTALS {'agree': 3622, 'disagree': 298, 'agree_with_tierB_refonly': 1935}
 
 DISAGREEMENT SIGNATURES (largest first)
     76  SRC+ref:VEC#
@@ -87,6 +87,10 @@ DISAGREEMENT SIGNATURES (largest first)
         eg GCSPOPCX_SYS_CR_systeminstrs | gcspopcx | ref S{ZERO} D{SYS} | trc S{-} D{-}
         eg GCSPOPX_SYS_CR_systeminstrs | gcspopx | ref S{ZERO} D{SYS} | trc S{-} D{-}
         eg GCSPUSHX_SYS_CR_systeminstrs | gcspushx | ref S{ZERO} D{SYS} | trc S{-} D{-}
+     3  DST+trc:ZERO
+        eg CASPL_CP64_comswappr | caspl x30, xzr, x6, x7, [x23] | ref S{GPR23,GPR6,GPR7,LR,ZERO} D{LR} | trc S{GPR23,GPR6,GPR7,LR,ZERO} D{LR,ZERO}
+        eg CMPP_SUBPS_64S_dp_2src | subps xzr, x2, x1 | ref S{GPR1,GPR2} D{FLAGS} | trc S{GPR1,GPR2} D{FLAGS,ZERO}
+        eg SBFIZ_SBFM_64M_bitfield | sbfiz xzr, x8, #43, #1 | ref S{GPR8} D{-} | trc S{GPR8} D{ZERO}
      2  SRC+ref:FCSR
         eg FMOV_64VX_float2int | fmov x2, v1.d[1] | ref S{FCSR,VEC1} D{GPR2} | trc S{VEC1} D{GPR2}
         eg FMOV_V64I_float2int | fmov v2.d[1], x1 | ref S{FCSR,GPR1} D{VEC2} | trc S{GPR1} D{VEC2}

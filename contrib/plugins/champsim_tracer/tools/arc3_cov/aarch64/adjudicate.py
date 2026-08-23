@@ -160,8 +160,21 @@ ADJ = {
  'SRC+trc:ZERO': ('CLOSED -- TRACER FIXED',
     'fcmp/fcmpe against #0.0: the zero is an IMMEDIATE, not the zero '
     'register.  6 rows.'),
- 'DST+trc:ZERO': ('CLOSED -- TRACER FIXED',
-    'a write to xzr is architecturally discarded.  3 rows.'),
+ 'DST+trc:ZERO': ('NEEDS RULING -- DO NOT FIX UNILATERALLY',
+    'a write to the zero register is architecturally discarded (AArch64 '
+    'XZR/WZR, RISC-V x0, MIPS $zero all read as zero however they are '
+    'written), and the reference discards it -- mra_ref.to_sets() does '
+    '`dst.discard(\'ZERO\')`.  Recorded, it is a producer for a value no '
+    'consumer can receive, and every later reader of the zero register '
+    'waits on it.  BUT the current behaviour is author-declared, not '
+    'accidental: the validator generates a block class literally named '
+    'probe_zero_reg whose expected_insns entry is '
+    '`{"src": ["REG_GPR5","REG_GPR6"], "dst": ["REG_ZERO"]}`, and '
+    'dropping the write turns that probe RED on riscv64 and mipsel.  '
+    'THE QUESTION FOR THE MAINTAINER, in one sentence: should a write to '
+    'the architectural zero register be recorded as a destination, or '
+    'discarded as the architecture discards it -- and if discarded, does '
+    'probe_zero_reg change to assert the absence?  3 rows.'),
  'SRC+ref:SYS SRC+trc:LR': ('CLOSED -- TRACER FIXED',
     'eretaa/eretab do not touch x30.  2 rows; what remains on those rows '
     'is the ELR_ELx read, counted under SRC+ref:SYS.'),

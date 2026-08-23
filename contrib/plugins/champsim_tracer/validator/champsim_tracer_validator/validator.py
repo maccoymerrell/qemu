@@ -3222,7 +3222,6 @@ def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
 
         # Operand directions Capstone states the wrong way round
         # (cap_aarch64_operand_direction).
-        exp_dst.discard("REG_ZERO")
         if mnem in ("eretaa", "eretab"):
             exp_src.discard("REG_LR")
         if mnem in ("fcmp", "fcmpe"):

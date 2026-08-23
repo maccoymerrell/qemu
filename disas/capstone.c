@@ -3042,24 +3042,6 @@ static bool cap_aarch64_has_pred_operand(const cs_arm64 *a64, uint8_t n)
     return false;
 }
 
-/* Drop @reg from the implicit-write list if Capstone put it there. */
-static void cap_aarch64_drop_implicit_write(qemu_plugin_insn_info *out,
-                                            unsigned int reg)
-{
-    for (uint8_t i = 0; i < out->n_regs_write; i++) {
-        if (out->regs_write_id[i] != reg) {
-            continue;
-        }
-        for (uint8_t j = (uint8_t)(i + 1); j < out->n_regs_write; j++) {
-            out->regs_write_id[j - 1] = out->regs_write_id[j];
-            memcpy(out->regs_write[j - 1], out->regs_write[j],
-                   QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ);
-        }
-        out->n_regs_write--;
-        return;
-    }
-}
-
 static void cap_aarch64_operand_direction(const cs_insn *insn,
                                           const cs_arm64 *a64,
                                           csh handle,
@@ -3072,19 +3054,6 @@ static void cap_aarch64_operand_direction(const cs_insn *insn,
         return;
     }
     n = MIN(a64->op_count, QEMU_PLUGIN_INSN_DETAIL_MAX_OPS);
-
-    /* A write to the zero register is architecturally discarded. */
-    cap_aarch64_drop_implicit_write(out, AARCH64_REG_XZR);
-    cap_aarch64_drop_implicit_write(out, AARCH64_REG_WZR);
-    for (uint8_t i = 0; i < n; i++) {
-        qemu_plugin_operand *op = &out->operands[i];
-        if (op->type != QEMU_PLUGIN_OP_REG) {
-            continue;
-        }
-        if (op->reg_id == AARCH64_REG_XZR || op->reg_id == AARCH64_REG_WZR) {
-            op->access &= (uint8_t)~QEMU_PLUGIN_OP_ACC_WRITE;
-        }
-    }
 
     if (g_strcmp0(mnem, "eretaa") == 0 || g_strcmp0(mnem, "eretab") == 0) {
         cap_aarch64_drop_implicit_read(out, AARCH64_REG_LR);

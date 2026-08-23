@@ -4,16 +4,16 @@ AARCH64 REGISTER ATTRIBUTION -- ADJUDICATED SUMMARY
 denominator          3920 opcode subjects (opcodes.tsv)
 probed               3920
 unprobed             0
-agree                3625
-disagree             295
+agree                3622
+disagree             298
 
 BY REFERENCE RANK
-  1:MRA        agree     3585
-  1:MRA        disagree  225
+  1:MRA        agree     3582
+  1:MRA        disagree  228
   2:LLVM-MC    agree     40
   2:LLVM-MC    disagree  70
 
-ADJUDICATION OF THE 295 DISAGREEING ROWS
+ADJUDICATION OF THE 298 DISAGREEING ROWS
      83  TRACER DEFECT -- OPEN
      76  TRACER RIGHT -- REFERENCE DEFECT (CONSTRAINED UNPREDICTABLE)
      51  REFERENCE GAP -- RANK 2 HAS NO FP STATUS MODEL
@@ -22,6 +22,7 @@ ADJUDICATION OF THE 295 DISAGREEING ROWS
      12  TRACER DEFECT -- OPEN (3 rows) / REFERENCE (9)
      10  MIXED -- 8 TRACER DEFECT, 2 SUBSUMED
       5  REFERENCE GAP -- NOT A TRACER DEFECT
+      3  NEEDS RULING -- DO NOT FIX UNILATERALLY
       1  REPRESENTATIVE ARTIFACT
 
 SIGNATURES, LARGEST FIRST
@@ -127,6 +128,23 @@ SIGNATURES, LARGEST FIRST
         the GCS push/pop forms: the sysalias result register (see
         DST+ref:SYS) plus the hidden xzr operand (see SRC+ref:ZERO). 4 rows.
 
+     3  DST+trc:ZERO
+        verdict: NEEDS RULING -- DO NOT FIX UNILATERALLY
+        a write to the zero register is architecturally discarded (AArch64
+        XZR/WZR, RISC-V x0, MIPS $zero all read as zero however they are
+        written), and the reference discards it -- mra_ref.to_sets() does
+        `dst.discard('ZERO')`. Recorded, it is a producer for a value no
+        consumer can receive, and every later reader of the zero register
+        waits on it. BUT the current behaviour is author-declared, not
+        accidental: the validator generates a block class literally named
+        probe_zero_reg whose expected_insns entry is `{"src":
+        ["REG_GPR5","REG_GPR6"], "dst": ["REG_ZERO"]}`, and dropping the
+        write turns that probe RED on riscv64 and mipsel. THE QUESTION FOR
+        THE MAINTAINER, in one sentence: should a write to the architectural
+        zero register be recorded as a destination, or discarded as the
+        architecture discards it -- and if discarded, does probe_zero_reg
+        change to assert the absence? 3 rows.
+
      2  SRC+ref:FCSR
         verdict: TRACER DEFECT -- OPEN
         two fmov element forms (`fmov v2.d[1], x1`, `fmov x2, v1.d[1]`),
@@ -225,7 +243,7 @@ BY INSTRUCTION CLASS
   advsimd        696 rows  agree   692 ( 99.4%)  disagree     4
   float          218 rows  agree   213 ( 97.7%)  disagree     5
   fpsimd          89 rows  agree    89 (100.0%)  disagree     0
-  general        921 rows  agree   830 ( 90.1%)  disagree    91
+  general        921 rows  agree   827 ( 89.8%)  disagree    94
   mortlach        54 rows  agree    54 (100.0%)  disagree     0
   mortlach2      501 rows  agree   492 ( 98.2%)  disagree     9
   post-2022-12   106 rows  agree    40 ( 37.7%)  disagree    66

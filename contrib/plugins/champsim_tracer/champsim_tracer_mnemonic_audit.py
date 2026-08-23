@@ -1919,9 +1919,34 @@ def classify_aarch64_reg(name: str) -> RegEntry:
         return RegEntry("REG_FLAGS", is_int_flags=True)
     if name == "FPCR":
         return reg_ent("REG_FCSR")
-    if name in {"FFR", "VG"}:
+    # VG is the vector-granule count -- the current SVE vector length,
+    # which SMSTART/SMSTOP change.  That is vector CONFIGURATION, the
+    # role REG_VCTRL carries for RISC-V vl/vtype, so it keeps the ID.
+    if name == "VG":
         return reg_ent("REG_VCTRL")
-    if name.startswith(("ZA", "ZT")) or name == "Z_MATRIX":
+    # FFR is the SVE First Fault Register: a separate architectural
+    # register that first-faulting loads write and RDFFR/WRFFR move to
+    # and from a P register.  Sharing REG_VCTRL with VG meant every
+    # `rdffr` took an edge from every SMSTART.  It is predicate-shaped
+    # and predicate-addressed, so it belongs in the predicate bank --
+    # AArch64's architectural predicate file has sixteen entries
+    # (P0-P15), leaving REG_PRED16 free for the one predicate that
+    # sits outside the numbered file.
+    if name == "FFR":
+        return reg_ent("REG_PRED16")
+    # The ZA tile names -- ZAB0, ZAH0-1, ZAS0-3, ZAD0-7, ZAQ0-15 -- are
+    # OVERLAPPING VIEWS of one architectural array, not 31 registers: a
+    # write through ZAS0 and a read through ZAD0 touch the same bytes.
+    # Aliases fold (R8.2), so they and the whole-array ZA / Z_MATRIX
+    # spellings stay on REG_MATRIX.  ZT0 is NOT one of them: it is the
+    # SME2 lookup-table register, 512 bits of separate architectural
+    # state that LUTI2/LUTI4 read and MOVT writes, and it needs its own
+    # identity.  It goes in the vector bank's free upper half rather
+    # than taking a new special ID -- REG_VEC32 is the first slot past
+    # the 32 registers any traced ISA numbers.
+    if name.startswith("ZT"):
+        return reg_ent("REG_VEC32")
+    if name.startswith("ZA") or name == "Z_MATRIX":
         return reg_ent("REG_MATRIX")
     if re.fullmatch(r"P\d+", name):
         return reg_ent(numbered("REG_PRED", int(name[1:])))

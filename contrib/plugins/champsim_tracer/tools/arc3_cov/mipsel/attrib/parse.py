@@ -4,6 +4,50 @@ import os, re, json, sys, collections
 
 BASE = os.environ.get("CST_ARC3_ATTRIB_DIR", os.getcwd()).rstrip("/") + "/"
 
+
+# ---------------------------------------------------------------- probe
+# THE TRACER ARM IS RE-PROBED HERE, NOT READ FROM WHATEVER IS ON DISK.
+#
+# `tracer_raw.txt` used to be produced by hand and consumed by
+# parse_tracer() below, while the documented reproduce block wrote
+# `batch_tip.tsv` -- which nothing read.  A reproduction from the tree
+# therefore scored the CURRENT reference against whichever tracer snapshot
+# happened to be lying in the run directory, and reported the difference as
+# a tracer defect: measured 2026-08-23, a HEAD tracer against a snapshot
+# taken 19.5 hours earlier turned 977/977 into 676/301, with the 189 FP
+# rows that gained REG_FCSR at the top of the signature list.  An arm that
+# cannot go stale is the only kind worth quoting, so the probe runs here.
+ISAXCHECK = os.environ.get(
+    "CST_ISAXCHECK",
+    "/mnt/md0/QEMU/qemu/build/contrib/plugins/isaxcheck")
+
+
+def probe_tracer(path):
+    """Decode every opcode's representative encoding with the tracer's own
+    fields layer and write the `== id hex` blocks parse_tracer() consumes."""
+    import subprocess
+    src = BASE + "../opcodes.tsv"
+    rows = []
+    with open(src) as f:
+        next(f)
+        for line in f:
+            c = line.rstrip("\n").split("\t")
+            if len(c) >= 3:
+                rows.append((c[0], c[2]))
+    if not rows:
+        sys.exit("probe_tracer: %s carries no opcode rows" % src)
+    with open(path, "w") as out:
+        for oid, hexs in rows:
+            p = subprocess.run([ISAXCHECK, "--isa=mipsel", "--layer=fields",
+                                "--hex=" + hexs],
+                               capture_output=True, text=True)
+            if p.returncode != 0:
+                sys.exit("probe_tracer: %s --hex=%s rc=%d: %s"
+                         % (ISAXCHECK, hexs, p.returncode, p.stderr[-500:]))
+            out.write("== %s %s\n" % (oid, hexs))
+            out.write(p.stdout)
+    print("probed %d encodings with %s" % (len(rows), ISAXCHECK))
+
 # ---------------------------------------------------------------- LLVM
 def parse_llvm(path):
     out = {}
@@ -138,6 +182,7 @@ def parse_tracer(path):
 if __name__ == "__main__":
     L = parse_llvm(BASE + "llvm_raw.txt")
     B = parse_bu(BASE + "bu_raw.txt")
+    probe_tracer(BASE + "tracer_raw.txt")
     T = parse_tracer(BASE + "tracer_raw.txt")
     print("llvm=%d bu=%d tracer=%d" % (len(L), len(B), len(T)))
     ids = set(L) & set(B) & set(T)

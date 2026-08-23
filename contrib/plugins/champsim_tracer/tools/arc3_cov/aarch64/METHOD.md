@@ -78,14 +78,22 @@ retain their old value.
 ## Running it
 
 ```sh
-python sweep.py          # MRA -> ref_mra.json      (~30 s, 3,814 subjects)
+python reprobe.py        # tracer -> tracer_fields.tsv   (one --batch call)
+python sweep.py          # MRA -> ref_mra.json      (~135 s, 3,920 subjects)
 python compare.py        # + tracer + LLVM -> attrib.tsv, attrib_signatures.txt
 python adjudicate.py     # -> attrib_adjudication.txt
 ```
 
-The tracer column comes from
-`isaxcheck --isa=aarch64 --layer=fields --hex=<bytes>`, one process per
-encoding.  `_ref/` under the run directory holds the MRA tarballs.
+`reprobe.py` IS part of the run, not an optional first step.  `compare.py`
+reads `tracer_fields.tsv` off disk and never re-probes, so skipping it scores
+the current reference against whatever tracer snapshot the run directory
+happens to hold and reports the difference as an attribution change.  Measured
+2026-08-23: with a tracer arm four commits stale, `compare.py` returned
+3609/311; re-probing at the same HEAD, and regenerating `ref_mra.json` with
+`sweep.py` so both sides speak the same token space, returned 3655/265.  The
+tracer column is `isaxcheck --isa=aarch64 --layer=fields --batch`, one call for
+all 3,920 subjects; `reprobe.py` takes the binary as `argv[1]`.  `_ref/` under
+the run directory holds the MRA tarballs.
 
 ## What the measurement rests on
 

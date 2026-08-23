@@ -207,12 +207,19 @@ awk -F'\t' 'NR>1{h=$3;print $1" "substr(h,7,2) substr(h,5,2) substr(h,3,2) subst
     ../opcodes.tsv > enc_word.txt
 $R/llvm_probe --cpu=mips32r2 --feats="$F" < enc_word.txt > llvm_raw.txt
 $R/binutils_probe                          < enc_word.txt > bu_raw.txt
-awk -F'\t' 'NR>1{print $3}' ../opcodes.tsv | \
-    /mnt/md0/QEMU/qemu/build/contrib/plugins/isaxcheck \
-        --isa=mipsel --layer=fields --batch > batch_tip.tsv
 python qemu_classes.py /mnt/md0/QEMU/qemu     # the R6 leg, out of QEMU's own C
 python parse.py && python build_ref.py && python adjudicate.py && python emit.py
 ```
+
+`parse.py` re-probes the tracer arm itself (`probe_tracer`, one
+`isaxcheck --layer=fields --hex` per opcode, ~32 s for 977), so the arm cannot
+be stale relative to the build under test; `CST_ISAXCHECK` overrides the
+binary.  It used to read a `tracer_raw.txt` that nothing in the tree wrote,
+while the block above wrote a `batch_tip.tsv` that nothing read -- so a
+reproduction scored the current reference against whatever tracer snapshot was
+lying in the run directory.  Measured 2026-08-23: a HEAD tracer against a
+snapshot 19.5 hours old turned 977/977 into 676/301, led by the 189 FP rows
+that had since gained REG_FCSR.
 
 `qemu_classes.py`, `parse.py`, `canon.py`, `build_ref.py`, `adjudicate.py` and
 `emit.py` are mirrored into the repo at

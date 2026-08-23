@@ -137,6 +137,35 @@ Read `docs/architecture.rst` for the full picture; the key load-bearing pieces:
   bump at a formal release, but **do not bump it now**, and don't write "never changes" into the spec
   or docs.
 
+## Working rule: do not stall
+
+Adopted 2026-08-22 after it had to be enforced by hand three times in one
+session.
+
+**When the next step is work rather than analysis, take the step.** Do not
+produce a summary, a plan, or a statement of intent in its place. "I'll do X
+next" is not a deliverable; X is. Writing down that a task is ready to
+implement, and then stopping, is the failure this rule exists to prevent.
+
+Specifically:
+
+- Finishing a piece of analysis is not finishing the task. If the analysis
+  names an action and nothing blocks it, do it in the same turn.
+- Do not stop to ask permission for work already directed. A ruling given
+  once stands; re-asking is stalling with extra steps.
+- Do not stop because context feels short. Land the smallest COMPLETE,
+  verified increment and commit it -- a half-built change left uncommitted
+  is the worst outcome, and "I'm running low" is not a reason to produce
+  nothing.
+- Do not stop at a wrong result. A red measurement is the start of the next
+  step, not the end of the current one.
+- Reporting is owed at the END of work, not INSTEAD of it.
+
+The one thing that legitimately stops work: an action that is destructive,
+outward-facing, or genuinely ambiguous in a way that would waste the work if
+guessed wrong. Name it in one sentence, then continue with everything it
+does not block.
+
 ## Conventions
 
 - The user (Maccoy Merrell) is the sole plugin author. Use his name for author/copyright fields, not

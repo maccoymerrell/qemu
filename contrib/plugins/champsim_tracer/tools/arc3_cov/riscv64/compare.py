@@ -57,23 +57,86 @@ def expand_group(eff, nf, nreg):
             out.add((role, cls, key))
     return out
 
-# ------------------------------------------------------- reference artifacts
-# Places where the Sail model performs a register read that the ISA does not
-# make this encoding depend on.  Each is enumerated rather than filtered by a
-# blanket rule, so the exclusion is auditable.
-REF_ARTIFACT = {
-    ('VFMVFS', 'SRC-missing:REG_FCSR'):
-        'Sail binds `rm_3b = fcsr[FRM]` only to feed illegal_fp_vd_unmasked(); '
-        'vfmv.f.s has no rounding-mode data dependency',
-    ('VFMVSF', 'SRC-missing:REG_FCSR'):
-        'as VFMVFS: fcsr[FRM] is read only by the legality gate',
-    ('VSETVL', 'SRC-missing:REG_VCTRL'):
-        'execute_vsetvl_type computes lmul_sew_ratio from the OLD vtype '
-        'unconditionally, but uses it only when requires_fixed_vlmax '
-        '(rd==x0 && rs1==x0), which this encoding is not',
-    ('VSETVLI', 'SRC-missing:REG_VCTRL'):
-        'as VSETVL: the old-vtype read is architecturally dead in this encoding',
-}
+# ------------------------------------------------- adjudicated disagreements
+# Every residual disagreement is adjudicated here, with the reason, rather
+# than dropped: the row stays DISAGREE and carries the verdict in its
+# adjudication column.  Keyed by (Sail node, regex over one signature part);
+# a row is adjudicated only when EVERY part of its signature matches an entry.
+#
+# REF-ARTIFACT   the reference performs a read the ISA does not make this
+#                encoding depend on at all.
+# GATE-READ      the reference read decides whether the instruction is LEGAL
+#                (traps / is illegal / is virtual), not what it computes.  The
+#                tracer's InsnFields has no legality axis and records no such
+#                read on any ISA -- AArch64 CPACR/HCR trapping and x86
+#                CR4.OSXSAVE are the same shape and are likewise unrecorded --
+#                so recording them on RISC-V alone would be the inconsistency.
+#                OPEN QUESTION FOR THE MAINTAINER: should a CSR that only
+#                gates legality be recorded as a source?
+# SCOPE-XLATE    address translation, PMP/PMA and platform state: an
+#                enumerated scope exclusion (see SCOPE EXCLUSIONS above) that
+#                the tracer applies on its side.  The reference leaks it when
+#                the read is INLINE in the execute clause instead of behind
+#                one of the blacklisted helpers.
+# REF-UNDERREAD  Sail writes only a SUB-RANGE of the destination (the loop is
+#                bounded by vstart / vl / eg_len), so the elements outside it
+#                keep their previous values -- a preserve the accessor scan
+#                cannot see, because no read accessor is called.  The tracer
+#                names the register as a source, which is what the
+#                architecture says.
+ADJUDICATED = [
+    (('VSETVL', 'VSETVLI'), r'^SRC-missing:REG_VCTRL$', 'REF-ARTIFACT',
+     'execute_vsetvl_type computes lmul_sew_ratio from the OLD vtype '
+     'unconditionally but uses it only when requires_fixed_vlmax '
+     '(rd==x0 && rs1==x0), which this encoding is not'),
+
+    (('VFMVFS', 'VFMVSF', 'FVVTYPE', 'FVFTYPE', 'VFMERGE', 'VFMV',
+      'VFUNARY1'), r'^SRC-missing:REG_FCSR$', 'GATE-READ',
+     'the clause binds rm_3b = fcsr[FRM] at its head and passes it only to '
+     'illegal_fp_normal() / illegal_fp_vd_unmasked(), which raise Illegal '
+     'Instruction on a reserved rounding mode; sign-injection, a slide, a '
+     'move, a merge and a classify round nothing and signal nothing, so frm '
+     'is not a data input to any of them'),
+
+    (('ZICBOM', 'ZICBOZ'), r'^SRC-missing:REG_SYS$', 'GATE-READ',
+     'menvcfg/senvcfg/henvcfg CBIE/CBCFE/CBZE decide whether the cache-block '
+     'operation is legal at the current privilege '
+     '(feature_enabled_for_priv), not what it does'),
+    (('WFI',), r'^SRC-missing:REG_SYS$', 'GATE-READ',
+     'mstatus.TW decides whether WFI traps'),
+    (('SSPUSH', 'SSPOPCHK', 'SSRDP', 'C_SSPUSH', 'C_SSPOPCHK'),
+     r'^SRC-missing:REG_SYS$', 'GATE-READ',
+     'menvcfg.SSE is the Zicfiss enable bit; the ssp traffic itself is '
+     'recorded'),
+
+    (('HLVTYPE', 'HSV'), r'^SRC-missing:REG_SYS$', 'SCOPE-XLATE',
+     'hgatp/satp/vsatp/vsstatus/mstatus/hstatus/pma_regions -- the '
+     'hypervisor load-store selects an effective privilege and translates '
+     'through the guest tables; every CSR named is address-translation, '
+     'privilege or physical-memory state'),
+    (('SFENCE_VMA', 'SINVAL_VMA', 'HFENCE_GVMA', 'HFENCE_VVMA',
+      'HINVAL_GVMA', 'HINVAL_VVMA'), r'^SRC-missing:REG_SYS$', 'SCOPE-XLATE',
+     'mstatus.TVM / hstatus / hgatp -- the privilege gate and the VMID that '
+     'scopes a TLB maintenance operation, both address-translation state'),
+    (('ZICBOP',), r'^SRC-missing:REG_SYS$', 'SCOPE-XLATE',
+     'mstatus and pma_regions: privilege and physical-memory attributes'),
+
+    (('VLRETYPE', 'VSM3ME_VV', 'VSM4K_VI'), r'^SRC-extra:REG_VEC<n>(x\d+)?$',
+     'REF-UNDERREAD',
+     'the write loop starts at vstart (VLRETYPE: `cur_elem = start_element`) '
+     'or runs over element groups eg_start..eg_len-1 (Zvk), so elements '
+     'outside that range keep their previous values; Sail calls no read '
+     'accessor for them, but the register is architecturally preserved and '
+     'therefore read'),
+]
+
+
+def adjudicate_part(node, part):
+    for nodes, rx, kind, note in ADJUDICATED:
+        if node in nodes and re.match(rx, part):
+            return kind, note
+    return None, None
+
 
 def canon(role, cls, key):
     if cls == 'GPR':
@@ -212,18 +275,27 @@ def main():
                                                  '' if c[g] == 1 else 'x%d' % c[g]))
         rec['verdict'] = 'AGREE' if not parts else 'DISAGREE'
         rec['sig'] = ';'.join(parts)
-        art = [p for p in parts if (rec['node'], p) in REF_ARTIFACT]
-        if art and len(art) == len(parts):
-            rec['adjudication'] = 'REF-ARTIFACT'
-            rec['adjudication_note'] = REF_ARTIFACT[(rec['node'], art[0])]
-        elif not parts:
+        adj = [adjudicate_part(rec['node'], p) for p in parts]
+        done = [a for a in adj if a[0]]
+        if not parts:
             rec['adjudication'] = ''
+        elif len(done) == len(parts):
+            kinds = []
+            for k, _ in done:
+                if k not in kinds: kinds.append(k)
+            rec['adjudication'] = '+'.join(kinds)
+            rec['adjudication_note'] = ' | '.join(
+                dict.fromkeys(n for _, n in done))
         else:
             miss = any(p.startswith(('SRC-missing', 'DST-missing')) for p in parts)
             extra = any(p.startswith(('SRC-extra', 'DST-extra')) for p in parts)
             rec['adjudication'] = ('MIXED' if miss and extra else
                                    'TRACER-GAP' if miss else 'TRACER-EXTRA')
-            if art: rec['adjudication'] += '+REF-ARTIFACT'
+            if done:
+                rec['adjudication'] += '+' + '+'.join(
+                    dict.fromkeys(k for k, _ in done))
+                rec['adjudication_note'] = ' | '.join(
+                    dict.fromkeys(n for _, n in done))
     return out
 
 def gen(name):
@@ -284,12 +356,15 @@ if __name__ == '__main__':
     lines.append('  isaxcheck --falsify=drop-src:<mnem> damages the dependency model')
     lines.append('  after isax_fields_decode(), where a real defect would sit.  Replayed')
     lines.append('  through this comparison:')
-    lines.append('    drop-src:ctz    1 row  flips AGREE->DISAGREE (ctz), nothing else')
-    lines.append('    drop-src:jalr   2 rows flips (jalr, c.jalr -- substring match)')
-    lines.append('    drop-src:add    2 rows flips (add, c.add)')
-    lines.append('    drop-src:lw     3 rows flips (lw, c.lw, c.lwsp)')
-    lines.append('  every flip is SRC-missing on exactly the damaged mnemonics and no')
-    lines.append('  other row moves, so an agreement here is a measured agreement.')
+    lines.append('    drop-src:ctz      1 row  flips AGREE->DISAGREE (ctz)')
+    lines.append('    drop-src:vadd.vv  1 row  flips, signature')
+    lines.append('                      SRC-missing:REG_VCTRL;SRC-missing:REG_VEC<n>x3')
+    lines.append('    add-dst:fadd.s    1 row  flips, DST-extra:REG_FPR<n>')
+    lines.append('  and nothing else moves in any of the three, so an agreement here is')
+    lines.append('  a measured agreement.  vadd.vv is the interesting one: it carries')
+    lines.append('  the vd-as-source and vl/vtype/vstart terms this pass added, so the')
+    lines.append('  new agreements are covered by the falsification and not just the')
+    lines.append('  old scalar ones.')
     lines.append('  Reproduce: CST_FALSIFY=drop-src:ctz CST_OUT=fals.tsv python compare.py')
     lines.append('')
     lines.append('SHARED ASSUMPTION (not a disagreement, disclosed)')
@@ -297,7 +372,7 @@ if __name__ == '__main__':
     lines.append('  vtype, the group size is a RUNTIME value, so no static attribution can')
     lines.append('  be exact (R1).  Both sides name one register per such operand.  Where')
     lines.append('  the ENCODING fixes the group -- nf (whole-register / segment forms) and')
-    lines.append('  nreg (vmv<nr>r.v) -- the reference expands the full group and the')
+    lines.append('  nreg (vmv<nr>r.v) -- BOTH sides expand the full group and the')
     lines.append('  comparison is exact.')
     lines.append('')
     lines.append('denominator  %d opcodes (opcodes.tsv)' % len(out))

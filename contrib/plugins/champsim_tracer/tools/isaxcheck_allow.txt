@@ -2167,6 +2167,18 @@ aarch64 R-rd-phantom mrs +sys
 aarch64 R-wr-phantom msr +sys
 aarch64 R-wr-phantom msrr +sys
 
+# The read-only implementation constants (REG_SYSID) 1b6c4995a5 split out
+# of REG_SYS: MIDR_EL1, MPIDR_EL1, REVIDR_EL1, CTR_EL0, DCZID_EL0 and the
+# ID_AA64* feature registers.  Same instructions, same structural reason as
+# the +sys block above -- the selector moved to a second class, so the
+# phantom moved with it.  A read of one of these depends on nothing, which
+# is the whole point of the class; what it must not do is share an id with
+# writable state.
+aarch64 R-rd-phantom mrrs +sysid
+aarch64 R-rd-phantom mrs +sysid
+aarch64 R-wr-phantom msr +sysid
+aarch64 R-wr-phantom msrr +sysid
+
 # The FP control/status register the tracer models specifically (REG_FCSR):
 # AArch64 FPSR/FPCR reached through MSR/MRS, RISC-V fflags / frm / fcsr and
 # the FP-alias CSR forms.

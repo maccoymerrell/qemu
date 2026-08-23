@@ -751,6 +751,20 @@ aarch64 FR-wr-phantom msr +REG_TLS
 aarch64 FR-wr-phantom msrr +REG_FCSR
 aarch64 FR-wr-phantom msrr +REG_SYS
 
+# REG_SYSID is the same family with a second selector: the read-only
+# implementation constants 1b6c4995a5 split out of REG_SYS (MIDR_EL1,
+# MPIDR_EL1, REVIDR_EL1, CTR_EL0, DCZID_EL0, the ID_AA64* block).  That
+# commit minted the id and taught disas/capstone.c to produce it without
+# adding a rule on either layer, so these four arrived unallowed and are
+# the whole of the aarch64 gate's residual.  The justification is the one
+# written above and not a new one -- LLVM carries the system register as
+# an immediate, so no register the tracer records here can appear on its
+# side, whichever class the selector lands in.
+aarch64 FR-rd-phantom mrrs +REG_SYSID
+aarch64 FR-rd-phantom mrs +REG_SYSID
+aarch64 FR-wr-phantom msr +REG_SYSID
+aarch64 FR-wr-phantom msrr +REG_SYSID
+
 # LLVM gives the whole MSR-immediate-to-PSTATE form (and MRS) an NZCV
 # def because one PSTATE field it can name IS NZCV; every alias inherits
 # it, including the SME streaming-mode switches, which write PSTATE.SM /

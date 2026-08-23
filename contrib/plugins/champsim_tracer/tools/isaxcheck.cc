@@ -2299,6 +2299,15 @@ static void usage(void)
         "  --allow=FILE    allowlist of justified residual signatures\n"
         "  --check         exit 1 if any non-allowlisted signature remains\n"
         "  --mattr=... --mcpu=...  override the LLVM subtarget\n"
+        "  --cs-mode-add=NAME[,NAME...]  add Capstone mode bits that the\n"
+        "                  shipped kIsaTable row deliberately omits because\n"
+        "                  they are EXCLUSIVE with its base and would rewrite\n"
+        "                  correct decodes if set unconditionally.  riscv64:\n"
+        "                  zcmp zcmt zce zfinx zicfiss.  A mutually-exclusive\n"
+        "                  extension cannot share an enumeration pass with the\n"
+        "                  base it displaces, so it gets its own; give the LLVM\n"
+        "                  side the matching --mattr or the two legs disagree\n"
+        "                  about which ISA they are decoding\n"
         "  --keep-zero     do not fold the architectural zero register out\n");
 }
 
@@ -2309,6 +2318,7 @@ int main(int argc, char **argv)
     const char *classes = "DZMBR";
     const char *hexone = nullptr;
     const char *mattr = nullptr, *mcpu = nullptr, *allow = nullptr;
+    const char *csmodeadd = nullptr;
     bool check = false, emit_raw = false, batch = false;
 
     for (int i = 1; i < argc; i++) {
@@ -2327,6 +2337,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--fixups")) layer = LAYER_FIXUPS;
         else if (!strncmp(argv[i], "--mattr=", 8)) mattr = argv[i] + 8;
         else if (!strncmp(argv[i], "--mcpu=", 7)) mcpu = argv[i] + 7;
+        else if (!strncmp(argv[i], "--cs-mode-add=", 14)) csmodeadd = argv[i] + 14;
         else if (!strncmp(argv[i], "--allow=", 8)) allow = argv[i] + 8;
         else if (!strncmp(argv[i], "--falsify=", 10)) {
             const char *spec = argv[i] + 10;
@@ -2346,6 +2357,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--keep-zero")) drop_zero = false;
         else { usage(); return 2; }
     }
+    /* Both layers, or the flag is a flag on one of them only. */
+    isax_fields_set_drop_zero(drop_zero);
     want_decode = strchr(classes, 'D');
     want_zeroacc = strchr(classes, 'Z');
     want_mem = strchr(classes, 'M');
@@ -2390,6 +2403,43 @@ int main(int argc, char **argv)
      * exactly what was asked for. */
     if (mattr) { cfg.features = mattr; cfg.opt_features = ""; }
     if (mcpu)  cfg.cpu = mcpu;
+    /* A mode bit kIsaTable omits because it is EXCLUSIVE with the row's base
+     * cannot be reached any other way, and an extension that cannot be
+     * reached is an extension no measurement has ever looked at (R8.7).  The
+     * names below are exactly the ones the riscv64 row's comment says it
+     * leaves out for that reason, so the enumeration that has to be run in a
+     * second profile can be run at all.  Unknown name is a hard error: a
+     * silently-ignored mode would make the pass report the BASE profile's
+     * decodes under the other profile's name. */
+    if (csmodeadd) {
+        static const struct { const char *name; int arch; unsigned bit; } kModeAdd[] = {
+            { "zcmp",    CS_ARCH_RISCV, CS_MODE_RISCV_ZCMP_ZCMT_ZCE },
+            { "zcmt",    CS_ARCH_RISCV, CS_MODE_RISCV_ZCMP_ZCMT_ZCE },
+            { "zce",     CS_ARCH_RISCV, CS_MODE_RISCV_ZCMP_ZCMT_ZCE },
+            { "zfinx",   CS_ARCH_RISCV, CS_MODE_RISCV_ZFINX },
+            { "zicfiss", CS_ARCH_RISCV, CS_MODE_RISCV_ZICFISS },
+        };
+        std::string spec(csmodeadd);
+        size_t pos = 0;
+        while (pos <= spec.size()) {
+            size_t c = spec.find(',', pos);
+            if (c == std::string::npos) c = spec.size();
+            std::string tok = spec.substr(pos, c - pos);
+            pos = c + 1;
+            if (tok.empty()) continue;
+            bool hit = false;
+            for (const auto &m : kModeAdd) {
+                if (tok == m.name && m.arch == cfg.cs_arch) {
+                    cfg.cs_mode |= m.bit; hit = true; break;
+                }
+            }
+            if (!hit) {
+                fprintf(stderr, "isaxcheck: --cs-mode-add: no Capstone mode "
+                        "named '%s' for isa %s\n", tok.c_str(), isaname);
+                return 2;
+            }
+        }
+    }
     if (allow && !load_allow(allow)) {
         fprintf(stderr, "cannot read allowlist %s\n", allow); return 2;
     }

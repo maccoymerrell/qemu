@@ -94,4 +94,10 @@ const char *isax_opcode_name(unsigned opcode);
  * branch taxonomy rather than a REG_IP dependency edge. */
 bool isax_generic_reg_dropped(unsigned gen_id);
 
+/*
+ * Mirror of isaxcheck's --keep-zero on this layer.  Must be called before
+ * any comparison runs; the default matches the boundary side's default.
+ */
+void isax_fields_set_drop_zero(bool drop);
+
 #endif /* ISAXCHECK_FIELDS_H */

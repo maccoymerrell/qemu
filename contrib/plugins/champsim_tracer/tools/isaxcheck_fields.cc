@@ -204,11 +204,28 @@ const char *isax_opcode_name(unsigned opcode)
     return generic_opcode_name_or_unknown(opcode);
 }
 
+static bool fields_drop_zero = true;
+
+void isax_fields_set_drop_zero(bool drop)
+{
+    fields_drop_zero = drop;
+}
+
 bool isax_generic_reg_dropped(unsigned gen_id)
 {
     /* Mirrors is_dropped_reg() on the boundary side: the architectural
      * zero register is a dataflow no-op whichever decoder names it, and
      * the tracer carries control flow through the BRANCH_* taxonomy and
-     * the entry stream, never through a REG_IP dependency edge. */
-    return gen_id == REG_NONE || gen_id == REG_ZERO || gen_id == REG_IP;
+     * the entry stream, never through a REG_IP dependency edge.
+     *
+     * REG_ZERO used to be struck here UNCONDITIONALLY while the boundary
+     * side honoured --keep-zero, so the flag was inert on this layer and
+     * the gate had no arm for the whole class -- measured, not inferred:
+     * on the binary that still had Capstone's fabricated $zero destination
+     * for `div`/`divu`, a mipsel fields sweep reported the identical
+     * 534/534 with the flag and without it.  The mirror is now exact. */
+    if (gen_id == REG_ZERO) {
+        return fields_drop_zero;
+    }
+    return gen_id == REG_NONE || gen_id == REG_IP;
 }

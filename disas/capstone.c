@@ -2989,6 +2989,149 @@ static unsigned cap_aarch64_exclusive_mem_access(const char *mnem)
 /*
  * Extract per-operand detail for AArch64 into the plugin operand struct.
  */
+/*
+ * Operand directions Capstone states the wrong way round on AArch64.
+ *
+ * Each of these is a measured disagreement against the Arm MRA
+ * ISA_A64_xml_A_profile-2022-12 execute pseudocode, not a guess at what
+ * the disassembler meant.
+ *
+ *   XZR / WZR as a DESTINATION.  `subps xzr, x2, x1`, `sbfiz xzr, x8,
+ *   #43, #1` and the CASP forms with an xzr in the result pair are
+ *   reported as writing the zero register.  The architecture discards
+ *   the write -- X[31] is a constant zero on read at every exception
+ *   level -- so a consumer that honours the write sees a producer for a
+ *   value no reader can ever observe, and every later `mov w2, wzr`
+ *   waits on it.  The READ side stays: the zero register genuinely is
+ *   the encoded source operand of the alias forms, and the tracer names
+ *   it there already.
+ *
+ *   ERETAA / ERETAB read x30.  They do not.  The authenticated return
+ *   address is ELR_ELx and the modifier is SP; x30 is untouched, and
+ *   eretaa.xml's execute ASL names neither.  Capstone reports it because
+ *   the plain RET alias handling leaks across the shared `ret`-family
+ *   register table (see the AARCH64_INS_ALIAS_RET note above -- the same
+ *   stale-alias defect, on the other side).
+ *
+ *   FCMP / FCMPE against #0.0 read the zero register.  The zero in
+ *   `fcmp d1, #0.0` is an IMMEDIATE -- the encoding's op2 field, not a
+ *   register operand -- and fcmp_float.xml compares against FPZero.  The
+ *   fabricated read makes an FP compare depend on the integer file.
+ *
+ *   SME ZERO and the unpredicated MOVA into ZA read the array.  They
+ *   write it and nothing else: zero_za1_ri.xml is `ZAvector[vec, VL] =
+ *   Zeros(VL)`, mova_za2_z.xml is `ZAslice[...] = Z[n + r, VL]`.  The
+ *   PREDICATED MOVA forms (`mov za0v.b[w14, 5], p3/m, z4.b`) do merge
+ *   and keep their read, which is why the scope is the absence of a
+ *   predicate operand rather than the mnemonic.  `zero {za0.d}` is
+ *   reported the whole way round -- a read and no write at all -- so it
+ *   needs the write put back, not just the read taken away.
+ */
+static bool cap_aarch64_has_pred_operand(const cs_arm64 *a64, uint8_t n)
+{
+    for (uint8_t i = 0; i < n; i++) {
+        const cs_arm64_op *o = &a64->operands[i];
+        if (o->type == AARCH64_OP_PRED) {
+            return true;
+        }
+        if (o->type == AARCH64_OP_REG &&
+            cap_aarch64_reg_file(o->reg) == CAP_A64_FILE_SVE_P) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Drop @reg from the implicit-write list if Capstone put it there. */
+static void cap_aarch64_drop_implicit_write(qemu_plugin_insn_info *out,
+                                            unsigned int reg)
+{
+    for (uint8_t i = 0; i < out->n_regs_write; i++) {
+        if (out->regs_write_id[i] != reg) {
+            continue;
+        }
+        for (uint8_t j = (uint8_t)(i + 1); j < out->n_regs_write; j++) {
+            out->regs_write_id[j - 1] = out->regs_write_id[j];
+            memcpy(out->regs_write[j - 1], out->regs_write[j],
+                   QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ);
+        }
+        out->n_regs_write--;
+        return;
+    }
+}
+
+static void cap_aarch64_operand_direction(const cs_insn *insn,
+                                          const cs_arm64 *a64,
+                                          csh handle,
+                                          qemu_plugin_insn_info *out)
+{
+    const char *mnem = insn->mnemonic;
+    uint8_t n;
+
+    if (!mnem || !mnem[0]) {
+        return;
+    }
+    n = MIN(a64->op_count, QEMU_PLUGIN_INSN_DETAIL_MAX_OPS);
+
+    /* A write to the zero register is architecturally discarded. */
+    cap_aarch64_drop_implicit_write(out, AARCH64_REG_XZR);
+    cap_aarch64_drop_implicit_write(out, AARCH64_REG_WZR);
+    for (uint8_t i = 0; i < n; i++) {
+        qemu_plugin_operand *op = &out->operands[i];
+        if (op->type != QEMU_PLUGIN_OP_REG) {
+            continue;
+        }
+        if (op->reg_id == AARCH64_REG_XZR || op->reg_id == AARCH64_REG_WZR) {
+            op->access &= (uint8_t)~QEMU_PLUGIN_OP_ACC_WRITE;
+        }
+    }
+
+    if (g_strcmp0(mnem, "eretaa") == 0 || g_strcmp0(mnem, "eretab") == 0) {
+        cap_aarch64_drop_implicit_read(out, AARCH64_REG_LR);
+    }
+
+    if (g_strcmp0(mnem, "fcmp") == 0 || g_strcmp0(mnem, "fcmpe") == 0) {
+        cap_aarch64_drop_implicit_read(out, AARCH64_REG_XZR);
+        cap_aarch64_drop_implicit_read(out, AARCH64_REG_WZR);
+        for (uint8_t i = 0; i < n; i++) {
+            qemu_plugin_operand *op = &out->operands[i];
+            if (op->type == QEMU_PLUGIN_OP_REG &&
+                (op->reg_id == AARCH64_REG_XZR ||
+                 op->reg_id == AARCH64_REG_WZR)) {
+                op->access = 0;
+            }
+        }
+    }
+
+    if (g_strcmp0(mnem, "zero") == 0 ||
+        ((g_strcmp0(mnem, "mov") == 0 || g_strcmp0(mnem, "mova") == 0) &&
+         !cap_aarch64_has_pred_operand(a64, n))) {
+        /* Only when the array is the DESTINATION -- operand 0.  The
+         * other direction, `mov { z8.b, z9.b }, za0v.b[w14, 6:7]`,
+         * reads it, and the predicated forms merge into it. */
+        const cs_arm64_op *d = n ? &a64->operands[0] : NULL;
+        unsigned dreg = !d ? 0
+                      : d->type == AARCH64_OP_SME ? d->sme.tile
+                      : d->type == AARCH64_OP_REG ? d->reg : 0;
+        bool touches_za = cap_aarch64_reg_file(dreg) == CAP_A64_FILE_ZA;
+
+        if (touches_za) {
+            out->operands[0].access &= (uint8_t)~QEMU_PLUGIN_OP_ACC_READ;
+            out->operands[0].access |= QEMU_PLUGIN_OP_ACC_WRITE;
+        }
+        if (touches_za) {
+            for (uint8_t i = 0; i < out->n_regs_read; i++) {
+                unsigned r = out->regs_read_id[i];
+                if (cap_aarch64_reg_file(r) == CAP_A64_FILE_ZA) {
+                    cap_aarch64_add_implicit_write(out, handle, r);
+                    cap_aarch64_drop_implicit_read(out, r);
+                    i = (uint8_t)(i - 1);
+                }
+            }
+        }
+    }
+}
+
 static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
                                     qemu_plugin_insn_info *out)
 {
@@ -3405,6 +3548,7 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
      * FPCR read cannot double-count.
      */
     cap_aarch64_fp_status_contract(insn, a64, handle, out);
+    cap_aarch64_operand_direction(insn, a64, handle, out);
 
     if (insn->id == ARM64_INS_RET && a64->op_count == 0) {
         bool listed = false;

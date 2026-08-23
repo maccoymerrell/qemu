@@ -1159,17 +1159,58 @@ riscv64 FR-rd-phantom rdcycle +REG_SYS
 riscv64 FR-rd-phantom rdinstret +REG_SYS
 riscv64 FR-rd-phantom rdtime +REG_SYS
 
+# THE CSRs THAT DECIDE WHETHER AN INSTRUCTION TRAPS.  LLVM MC has no
+# legality axis at all -- it describes the operands an encoding names,
+# and a trap gate is named by nothing -- so every one of these reads is
+# a phantom to it.  They are in the fields set under R7.4: a pending
+# write to the gating CSR must resolve before the instruction may
+# proceed, which is an edge a renaming regfile has to respect.
+#
+#   wfi           mstatus.TW picks between executing, an Illegal
+#                 Instruction and a Virtual Instruction trap
+#   cbo.*         menvcfg / senvcfg / henvcfg CBCFE, CBIE and CBZE gate
+#                 the cache-block operations per privilege
+#   vector FP     the unit has no rm field, so fcsr.frm is always the
+#                 rounding mode and a reserved frm makes the instruction
+#                 illegal.  Only the members that ROUND NOTHING appear
+#                 here: the rest already carried REG_FCSR through the
+#                 fflags accumulate, so LLVM's silence was already
+#                 covered by an existing row.
+#
+# vfmerge.vfm carries two phantoms at once and so has two rows: the frm
+# gate, and the mask-register group LLVM names only the base of (it was
+# in the register-group block above until the gate read joined it).
+# sspush / sspopchk / ssrdp are NOT here -- LLVM cannot decode Zicfiss
+# at all, so their rows sit in the #169 undecodable-extension residual.
+#   17 rows
+riscv64 FR-rd-phantom wfi +REG_SYS
+riscv64 FR-rd-phantom cbo.clean +REG_SYS
+riscv64 FR-rd-phantom cbo.flush +REG_SYS
+riscv64 FR-rd-phantom cbo.inval +REG_SYS
+riscv64 FR-rd-phantom cbo.zero +REG_SYS
+riscv64 FR-rd-phantom vfsgnj.vf +REG_FCSR
+riscv64 FR-rd-phantom vfsgnj.vv +REG_FCSR
+riscv64 FR-rd-phantom vfsgnjn.vf +REG_FCSR
+riscv64 FR-rd-phantom vfsgnjn.vv +REG_FCSR
+riscv64 FR-rd-phantom vfsgnjx.vf +REG_FCSR
+riscv64 FR-rd-phantom vfsgnjx.vv +REG_FCSR
+riscv64 FR-rd-phantom vfslide1down.vf +REG_FCSR
+riscv64 FR-rd-phantom vfslide1up.vf +REG_FCSR
+riscv64 FR-rd-phantom vfmv.f.s +REG_FCSR
+riscv64 FR-rd-phantom vfmv.s.f +REG_FCSR
+riscv64 FR-rd-phantom vfmerge.vfm +REG_FCSR
+riscv64 FR-rd-phantom vfmerge.vfm +REG_FCSR,REG_VEC#
+
 # Whole-register vector forms touch a GROUP.  vl<N>r.v loads N
 # consecutive vector registers and vmv<N>r.v moves N; LLVM's operand list
 # names only the first of the group.  `vl8r.v v0, (zero)` (070080e2) has
 # fieldsWR{REG_VEC0..REG_VEC7} against llvmWR{REG_VEC0} -- eight
 # registers written, one named.  The RISC-V vector spec defines the
 # group; the fields side follows it.
-#   62 rows
+#   61 rows
 riscv64 FR-rd-phantom vadc.vim +REG_VEC#
 riscv64 FR-rd-phantom vadc.vvm +REG_VEC#
 riscv64 FR-rd-phantom vadc.vxm +REG_VEC#
-riscv64 FR-rd-phantom vfmerge.vfm +REG_VEC#
 riscv64 FR-rd-phantom vlm.v +REG_VEC#
 riscv64 FR-rd-phantom vmadc.vi +REG_VEC#
 riscv64 FR-rd-phantom vmadc.vim +REG_VEC#

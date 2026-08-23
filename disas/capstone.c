@@ -3766,7 +3766,7 @@ static bool cap_riscv_is_mask_dst(const char *mnem)
 }
 
 /*
- * RISC-V scalar FP dynamic rounding: the frm read with no encoded field.
+ * RISC-V FP dynamic rounding: the frm read with no encoded field.
  *
  * An FP instruction's 3-bit rm field names a rounding mode directly
  * except for the value 0b111 (DYN), which means "use the rounding mode
@@ -3788,11 +3788,32 @@ static bool cap_riscv_is_mask_dst(const char *mnem)
  * fused-multiply-add forms -- and to 32-bit encodings, so the
  * compressed FP loads and stores (which have no rm field and no
  * rounding) cannot match.
+ *
+ * THE VECTOR FP UNIT HAS NO rm FIELD AT ALL, so for it the scalar
+ * DYN case is the ONLY case: OP-V funct3 = OPFVV (0b001) or OPFVF
+ * (0b101) is the vector FP family, every member of it takes its
+ * rounding mode from fcsr.frm, and a reserved frm makes the
+ * instruction illegal.  Both authorities say so unconditionally and
+ * per-clause: Sail opens every vector FP `execute` with `let rm_3b =
+ * fcsr[FRM]` and hands it to illegal_fp_normal() /
+ * illegal_fp_vd_unmasked(), and QEMU emits `gen_set_rm(s,
+ * RISCV_FRM_DYN)` in every OPFVV/OPFVF translator, whose helper
+ * "will return only if frm valid" (target/riscv/translate.c:744).
+ *
+ * That the read is a LEGALITY gate on the members which round nothing
+ * -- vfsgnj[n|x], vfslide1up/down.vf, vfmerge.vfm, vfmv.v.f,
+ * vfmv.f.s, vfmv.s.f, vfclass.v -- does not take it out of the set
+ * (R7.4): a pending write to frm has to resolve before any of them
+ * may proceed, which is an edge a renaming regfile must respect.  The
+ * rounding members already carried REG_FCSR through the fflags
+ * accumulate (cap_riscv_fp_signals); these thirteen carried nothing,
+ * because they signal nothing either.
  */
 static bool cap_riscv_reads_dynamic_frm(const cs_insn *insn)
 {
     uint32_t word;
     uint32_t opcode;
+    uint32_t funct3;
 
     if (insn->size != 4) {
         return false;
@@ -3800,12 +3821,16 @@ static bool cap_riscv_reads_dynamic_frm(const cs_insn *insn)
     word = (uint32_t)insn->bytes[0] | ((uint32_t)insn->bytes[1] << 8) |
            ((uint32_t)insn->bytes[2] << 16) | ((uint32_t)insn->bytes[3] << 24);
     opcode = word & 0x7f;
+    funct3 = (word >> 12) & 0x7;
+    if (opcode == 0x57) {                 /* OP-V */
+        return funct3 == 0x1 || funct3 == 0x5;   /* OPFVV / OPFVF */
+    }
     /* MADD / MSUB / NMSUB / NMADD / OP-FP. */
     if (opcode != 0x43 && opcode != 0x47 && opcode != 0x4b &&
         opcode != 0x4f && opcode != 0x53) {
         return false;
     }
-    return ((word >> 12) & 0x7) == 0x7;   /* rm == DYN */
+    return funct3 == 0x7;                 /* rm == DYN */
 }
 
 /*
@@ -4365,6 +4390,24 @@ static void cap_riscv_add_csr(qemu_plugin_insn_info *out, unsigned csr,
         g_strlcpy(op->reg_name, name, QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ);
     }
     out->n_operands++;
+}
+
+/*
+ * The environment-configuration triple, read as an enable gate.
+ *
+ * menvcfg / senvcfg / henvcfg carry the per-privilege enable bits for
+ * several extensions -- Zicbom's CBCFE and CBIE, Zicboz's CBZE,
+ * Zicfiss's SSE -- and which of the three is consulted depends on the
+ * privilege the instruction executes at, a runtime value.  A static
+ * register set names every candidate (R4), so all three go in; they
+ * all carry QEMU_PLUGIN_SYSREG_OTHER and therefore meet on one generic
+ * slot anyway.
+ */
+static void cap_riscv_add_envcfg_gate(qemu_plugin_insn_info *out)
+{
+    cap_riscv_add_csr(out, 0x30a /* menvcfg */, QEMU_PLUGIN_OP_ACC_READ);
+    cap_riscv_add_csr(out, 0x10a /* senvcfg */, QEMU_PLUGIN_OP_ACC_READ);
+    cap_riscv_add_csr(out, 0x60a /* henvcfg */, QEMU_PLUGIN_OP_ACC_READ);
 }
 
 /*
@@ -5137,12 +5180,14 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
             }
         }
         /*
-         * Scalar FP with a dynamic rounding mode reads frm (see
-         * cap_riscv_reads_dynamic_frm).  Architectural, from Sail, not
-         * a Capstone-version defect: the rm field is in the encoding
-         * and no disassembler reports the fcsr read it implies.  Added
-         * only when absent, so a decoder that starts reporting it
-         * cannot be double-counted.
+         * FP with a dynamic rounding mode reads frm -- scalar when the
+         * rm field says DYN, vector always, since the vector unit has
+         * no rm field (see cap_riscv_reads_dynamic_frm).  Architectural,
+         * from Sail and from QEMU's own gen_set_rm(), not a
+         * Capstone-version defect: the mode is in the encoding and no
+         * disassembler reports the fcsr read it implies.  Added only
+         * when absent, so a decoder that starts reporting it cannot be
+         * double-counted.
          */
         if (cap_riscv_reads_dynamic_frm(insn)) {
             bool has_frm = false;
@@ -5304,10 +5349,19 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
          *   c.sspush x1 / c.sspopchk x5   the compressed pair, carved
          *                 out of c.mop.1 and c.mop.5
          *
-         * ssp folds onto REG_SP in the generic space, which is the
-         * documented cost of a shared register vocabulary: the shadow
-         * stack pointer is a stack pointer, and a RISC-V-only register
-         * does not earn an ID of its own (champsim_tracer_generic_ids.h).
+         * ssp carries REG_SSP, an ID of its own: folding it onto REG_SP
+         * manufactured an edge with every spill and local, and folding
+         * it onto REG_LR collapsed `sspopchk ra` -- whose whole purpose
+         * is comparing the two -- to a self-dependency (R8.1, R8.6).
+         *
+         * All five also read the environment-configuration triple.
+         * menvcfg.SSE (senvcfg.SSE at U, henvcfg.SSE under H) is the
+         * Zicfiss enable bit, and Sail puts it in the encdec guard as
+         * well as at the head of every clause: with it clear the
+         * encoding is not a shadow-stack instruction at all but the
+         * Zimop it is carved out of, which writes zero to rd.  A pending
+         * write to that CSR therefore has to resolve before the
+         * instruction can be said to do anything, which is R7.4's test.
          *
          * Revisit when Capstone gains Zicfiss: the mnemonic will still
          * be wrong until then, and only the register footprint is
@@ -5341,12 +5395,14 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                         handle, out,
                         (uint16_t)(RISCV_REG_X0 + (push ? rs2 : rs1)),
                         QEMU_PLUGIN_OP_ACC_READ);
+                    cap_riscv_add_envcfg_gate(out);
                 } else if (rdp) {
                     cap_riscv_push_reg_operand(handle, out, RISCV_REG_SSP,
                                                QEMU_PLUGIN_OP_ACC_READ);
                     cap_riscv_push_reg_operand(handle, out,
                                                (uint16_t)(RISCV_REG_X0 + rd),
                                                QEMU_PLUGIN_OP_ACC_WRITE);
+                    cap_riscv_add_envcfg_gate(out);
                 } else if (rd != 0) {
                     cap_riscv_push_reg_operand(handle, out,
                                                (uint16_t)(RISCV_REG_X0 + rd),
@@ -5369,6 +5425,7 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                     handle, out,
                     (uint16_t)(RISCV_REG_X0 + (half == 0x6081 ? 1 : 5)),
                     QEMU_PLUGIN_OP_ACC_READ);
+                cap_riscv_add_envcfg_gate(out);
                 n = out->n_operands;
             }
         }
@@ -5385,11 +5442,17 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
          * names it, and the privilege restore had no producer.  `sret`
          * is the same instruction one level down (sepc, sstatus).
          *
-         * The gating CSRs Sail also reads here -- menvcfg, mseccfg,
-         * hstatus, vsstatus -- decide whether the instruction is legal
-         * at the current privilege, not what it computes; they are the
-         * same legality-gate class the boundary leaves unmodelled
-         * everywhere else and are deliberately not named.
+         * Sail reads further CSRs here -- menvcfg, mseccfg, hstatus,
+         * vsstatus -- that decide whether the instruction is legal at
+         * the current privilege.  Under R7.4 those are sources too, and
+         * they are not named here for one measured reason: every RISC-V
+         * CSR outside the FP, vector and identification roles folds onto
+         * REG_SYS (generic_reg_for_sysreg_class), which mepc and mstatus
+         * already put on this instruction, so naming them would move
+         * nothing a consumer can see.  They get named when the RISC-V
+         * CSR file is split into the REG_SYS* behaviour classes; adding
+         * an unobservable operand before that would be a table row
+         * standing in for a decode (R8.7).
          */
         if (!strcmp(insn->mnemonic, "mret")) {
             cap_riscv_add_csr(out, 0x341 /* mepc */,
@@ -5418,10 +5481,61 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
          *
          * `fence.tso` and `fence.i` have their own clauses and no FIOM
          * term, so the test is on the exact mnemonic.
+         *
+         * FIOM is a change of SEMANTICS rather than a legality gate,
+         * which is why this one was named while the CBO, WFI and
+         * Zicfiss enable bits were not.  R7.4 retired that distinction
+         * -- a CSR that decides whether an instruction TRAPS is a
+         * source, because a pending write to it must resolve before the
+         * instruction may proceed -- and those three are named below.
          */
         if (!strcmp(insn->mnemonic, "fence")) {
             cap_riscv_add_csr(out, 0x30a /* menvcfg */,
                               QEMU_PLUGIN_OP_ACC_READ);
+        }
+        /*
+         * The enable bits that decide whether WFI and a cache-block
+         * operation TRAP (R7.4).
+         *
+         * `wfi` is legal at M and S; in a virtual context mstatus.TW
+         * decides between executing, an Illegal Instruction and a
+         * Virtual Instruction trap -- Sail's WFI clause reads
+         * `mstatus[TW]` in both virtual arms.  The Zicbom and Zicboz
+         * operations are gated per privilege by the CBCFE / CBIE / CBZE
+         * fields of the environment-configuration triple, through
+         * `feature_enabled_for_priv(cur_privilege, menvcfg[..],
+         * read_senvcfg()[..], read_henvcfg()[..])`: with the bit clear
+         * the instruction raises Illegal Instruction (or Virtual
+         * Instruction) instead of touching the cache.
+         *
+         * All three envcfg registers are named, not just the one the
+         * current privilege will consult, because the privilege is a
+         * RUNTIME value and a static set records every candidate (R4) --
+         * the same rule that puts both arms of a conditional write in
+         * the set.
+         *
+         * Read from the instruction word: CBO is MISC-MEM with funct3 =
+         * 0b010, rd = 0 and the operation in the 12-bit immediate
+         * (0 inval, 1 clean, 2 flush, 4 zero).  Zicbop's `prefetch.*`
+         * shares the major opcode with funct3 = 0b110 and is NOT here:
+         * a prefetch is a hint that traps on nothing.
+         */
+        if (insn->size == 4) {
+            uint32_t word = (uint32_t)insn->bytes[0] |
+                            ((uint32_t)insn->bytes[1] << 8) |
+                            ((uint32_t)insn->bytes[2] << 16) |
+                            ((uint32_t)insn->bytes[3] << 24);
+            if (word == 0x10500073) {           /* wfi */
+                cap_riscv_add_csr(out, 0x300 /* mstatus */,
+                                  QEMU_PLUGIN_OP_ACC_READ);
+            }
+            if ((word & 0x7f) == 0x0f && ((word >> 12) & 0x7) == 0x2
+                && ((word >> 7) & 0x1f) == 0) {
+                unsigned cbo = word >> 20;
+                if (cbo == 0 || cbo == 1 || cbo == 2 || cbo == 4) {
+                    cap_riscv_add_envcfg_gate(out);
+                }
+            }
         }
         /*
          * Zacas `amocas.q` names two register PAIRS.

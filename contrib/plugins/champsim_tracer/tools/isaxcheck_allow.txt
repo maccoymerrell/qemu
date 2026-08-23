@@ -92,7 +92,10 @@ riscv64 R-rd-phantom vmadc.v*m +v#
 riscv64 R-rd-phantom vsbc.v*m +v#
 riscv64 R-rd-phantom vmsbc.v*m +v#
 riscv64 R-rd-phantom vmerge.v*m +v#
-riscv64 R-rd-phantom vfmerge.v*m +v#
+# vfmerge is vector FP, so its signature also carries the frm read the
+# unit always makes (R7.4, cap_riscv_reads_dynamic_frm); re-pointed
+# rather than deleted, because the v0 justification above is unchanged.
+riscv64 R-rd-phantom vfmerge.v*m +frm,v#
 
 # (`aarch64 R-rd-missing bl* +sp` used to sit here, over LLVM's ABI-
 # modelling implicit SP use on AArch64 calls.  The suppression it said was

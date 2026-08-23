@@ -896,8 +896,19 @@ static void refine_arm64_fp_vec(
  * (or the array is empty if implicit-regs weren't folded in for some
  * reason).  Any other register destination means the assembler
  * wrote a real arithmetic result — keep the canonical SUBS/ADDS/ANDS
- * opcode.  After promotion, REG_ZERO is stripped so the trace's
- * per-insn shape matches the assembler-visible mnemonic.
+ * opcode.
+ *
+ * REG_ZERO is NOT stripped after promotion.  It used to be, so that
+ * the per-insn shape matched the assembler-visible mnemonic — but the
+ * mnemonic is the printed alias and the destination set is a statement
+ * about the regfile, and matching one to the other is a convention
+ * rather than a fact.  REG_ZERO exists in the generic space and the
+ * instruction names it, so it is recorded; the opcode still promotes
+ * to GEN_OP_CMP / GEN_OP_TEST, which is what carries the "this is a
+ * compare" fact.  disas/capstone.c restores the same destination at
+ * the boundary for the alias spellings Capstone hides it from (see
+ * cap_aarch64_restore_alias_zero_reg); stripping it here would have
+ * undone that repair one layer up.
  */
 static void refine_arm64_cmp_alias(
     const struct qemu_plugin_insn_info *info, InsnFields *f)
@@ -923,16 +934,6 @@ static void refine_arm64_cmp_alias(
     default:
         return;
     }
-    uint8_t new_n = 0;
-    for (uint8_t d = 0; d < f->n_dst_regs; d++) {
-        if (f->dst_regs[d] == REG_ZERO) continue;
-        if (new_n != d) {
-            f->dst_regs[new_n] = f->dst_regs[d];
-            f->dst_lane_mask[new_n] = f->dst_lane_mask[d];
-        }
-        new_n++;
-    }
-    f->n_dst_regs = new_n;
 }
 
 /*

@@ -60,13 +60,24 @@ static const cs_opt_skipdata cap_skipdata_s390x = {
  * re-open the target handle with a different arch for the target in order
  * to handle AArch64 vs AArch32 mode switching.
  */
+/*
+ * The Capstone mode a disassemble_info really asks for: the target's
+ * declared cap_mode plus the endianness bit.  Named because a second
+ * handle opened for the same instruction (see
+ * cap_aarch64_restore_alias_zero_reg) has to be opened in exactly the
+ * mode the first one was, and an endianness that is added in one place
+ * and forgotten in the other decodes different bytes.
+ */
+static cs_mode cap_effective_mode(const disassemble_info *info)
+{
+    return info->cap_mode + (info->endian == BFD_ENDIAN_BIG
+                             ? CS_MODE_BIG_ENDIAN : CS_MODE_LITTLE_ENDIAN);
+}
+
 static cs_err cap_disas_start(disassemble_info *info, csh *handle)
 {
-    cs_mode cap_mode = info->cap_mode;
+    cs_mode cap_mode = cap_effective_mode(info);
     cs_err err;
-
-    cap_mode += (info->endian == BFD_ENDIAN_BIG ? CS_MODE_BIG_ENDIAN
-                 : CS_MODE_LITTLE_ENDIAN);
 
     err = cs_open(info->cap_arch, cap_mode, handle);
     if (err != CS_ERR_OK) {
@@ -3912,7 +3923,232 @@ static void cap_aarch64_operand_direction(const cs_insn *insn,
     }
 }
 
-static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
+/*
+ * The zero register an alias spelling hides.
+ *
+ * `cmp x3, x2` IS `subs xzr, x3, x2`; `mov x2, x1` IS `orr x2, xzr, x1`;
+ * `mul x3, x2, x1` IS `madd x3, x2, x1, xzr`; `cset x2, eq` IS
+ * `csinc x2, xzr, xzr, ne`.  In each the architecture names the zero
+ * register as an operand and the printed alias drops it.  Capstone
+ * follows the printed form: with the ALIAS operand set `cmp` reports
+ * `Registers modified: nzcv` and the xzr destination is simply not
+ * there.  The same instruction spelled without the alias keeps it, so
+ * the boundary named REG_ZERO on some encodings and not on others --
+ * a silent reduction rather than a policy.
+ *
+ * A write to xzr changes no architectural value, and that is exactly
+ * the argument this does NOT make.  Attribution is a regfile-dependency
+ * question, not a question about the value: the generic space has
+ * REG_ZERO, the ISA names it as this instruction's operand, so the set
+ * says so.  Both independent references agree -- the MRA execute ASL
+ * for CMP writes X[31], and LLVM MC reports WR{nzcv,zr} -- and the
+ * reference harness stopped discarding it when the rule was settled.
+ *
+ * Capstone knows the answer and exposes it through CS_OPT_DETAIL_REAL,
+ * which fills detail from the base instruction even when the printed
+ * form is an alias.  It cannot be turned on for the primary handle:
+ * cs_option() ORs CS_OPT_DETAIL values into handle->detail_opt and has
+ * no way to clear the bit again (cs.c:1073), so the setting is one-way,
+ * and turning it on reshapes op_count and the operand indices for every
+ * AArch64 alias -- which is what the RET, MOPS, SVE-merging-MOV and
+ * shift-immediate workarounds above are all written against.  So the
+ * base form is decoded on a SECOND handle that lives permanently in
+ * that mode, and only the zero-register operands it exposes are taken,
+ * as implicit reads/writes.  The printed operand array keeps the alias
+ * shape it has today; nothing else about the instruction moves.
+ *
+ * NOT covered, and a different mechanism: the forms whose zero operand
+ * is fixed by the ENCODING rather than hidden by an alias -- PACIZA /
+ * AUTIZB and the eleven others of that family (`n = 31` in the decode
+ * ASL, so the execute reads X[31]), BRAAZ / BLRABZ, LDRAA / LDRAB.
+ * Those are not aliases at all: Capstone models them as their own
+ * instructions with no operand for the hardwired modifier, so the real
+ * operand set is just as empty as the printed one and there is nothing
+ * here to harvest.
+ *
+ * Revisit on a Capstone bump: if the ALIAS operand set starts carrying
+ * the base form's zero register, the harvest becomes a no-op rather
+ * than a double-count (both helpers below are idempotent), and this
+ * can go.  Verify with `cstool -d aarch64 7f0002eb` against
+ * `cstool -r -d aarch64 7f0002eb` -- today only the second says xzr.
+ */
+static bool cap_aarch64_is_zero_reg(unsigned int reg)
+{
+    return reg == AARCH64_REG_WZR || reg == AARCH64_REG_XZR;
+}
+
+static void cap_aarch64_restore_alias_zero_reg(csh handle,
+                                               unsigned int cap_mode,
+                                               const cs_insn *insn,
+                                               qemu_plugin_insn_info *out)
+{
+    /*
+     * Thread-local companion handle, opened once per thread per mode and
+     * never explicitly freed -- the same lifetime the raw-decode cache
+     * below uses, and for the same reason: a Capstone handle is not safe
+     * for concurrent iteration and cs_open() per instruction would cost
+     * more than the decode it wraps.
+     */
+    static __thread csh real_handle;
+    static __thread cs_insn *real_insn;
+    static __thread unsigned int real_mode;
+    static __thread bool real_valid;
+
+    const uint8_t *code;
+    size_t sz;
+    uint64_t addr;
+    const cs_arm64 *real;
+    unsigned int read_reg = AARCH64_REG_INVALID;
+    unsigned int write_reg = AARCH64_REG_INVALID;
+
+    if (!insn->is_alias || !insn->usesAliasDetails) {
+        return;
+    }
+
+    /*
+     * The one family where the alias is NOT a spelling of the same
+     * access.  `staddb w1, [x2]` prints as an alias of `ldaddb w1, wzr,
+     * [x2]`, and Capstone's real operand set duly reports a wzr WRITE --
+     * but the atomic memory operations are the only A64 instructions
+     * whose register write the DECODE guards on the register number:
+     *
+     *     data = MemAtomic(address, comparevalue, value, accdesc);
+     *     if t != 31 then
+     *         X[t, regsize] = ZeroExtend(data, regsize);
+     *
+     * With Rt = 31 the write does not happen at all, so the ST<op> form
+     * genuinely has no destination register -- which is the whole reason
+     * the architecture gives it its own name.  That is a different fact
+     * from `subs xzr, x3, x2`, whose ASL says `X[d, datasize] = result;`
+     * with no guard and therefore does write the zero register.
+     *
+     * The exclusion is exactly this family and no wider: a sweep of all
+     * 2022-12 MRA instruction pages for a register access guarded on
+     * `!= 31` returns 26 pages -- the 24 LD<op> atomics aliased here as
+     * ST<op> (8 operations x ADD/CLR/EOR/SET/SMAX/SMIN/UMAX/UMIN, each
+     * with byte, halfword and word/doubleword forms), plus ST64BV and
+     * ST64BV0, whose guarded Rs status write Capstone prints explicitly
+     * rather than through an alias and which therefore never reaches
+     * here.  Everything else that names X[31] names it unconditionally.
+     *
+     * Keyed on the shape rather than a list of ids: the printed alias is
+     * an `st...` and the base instruction Capstone decoded is an
+     * `ld...`.  No other AArch64 alias inverts a load into a store.
+     */
+    if (g_str_has_prefix(insn->mnemonic, "st")) {
+        const char *base = cs_insn_name(handle, insn->id);
+
+        if (base && g_str_has_prefix(base, "ld")) {
+            return;
+        }
+    }
+
+    if (real_valid && real_mode != cap_mode) {
+        cs_free(real_insn, 1);
+        cs_close(&real_handle);
+        real_valid = false;
+    }
+    if (!real_valid) {
+        if (cs_open(CS_ARCH_ARM64, cap_mode, &real_handle) != CS_ERR_OK) {
+            return;
+        }
+        cs_option(real_handle, CS_OPT_DETAIL, CS_OPT_ON);
+        cs_option(real_handle, CS_OPT_DETAIL, CS_OPT_DETAIL_REAL);
+        real_insn = cs_malloc(real_handle);
+        if (!real_insn) {
+            cs_close(&real_handle);
+            return;
+        }
+        real_mode = cap_mode;
+        real_valid = true;
+    }
+
+    code = insn->bytes;
+    sz = insn->size;
+    addr = insn->address;
+    if (real_insn->detail) {
+        memset(real_insn->detail, 0, sizeof(*real_insn->detail));
+    }
+    if (!cs_disasm_iter(real_handle, &code, &sz, &addr, real_insn)
+        || !real_insn->detail) {
+        return;
+    }
+
+    real = &real_insn->detail->arm64;
+    for (uint8_t i = 0; i < real->op_count; i++) {
+        const cs_arm64_op *o = &real->operands[i];
+
+        if (o->type != AARCH64_OP_REG || !cap_aarch64_is_zero_reg(o->reg)) {
+            continue;
+        }
+        if (o->access & CS_AC_READ) {
+            read_reg = o->reg;
+        }
+        if (o->access & CS_AC_WRITE) {
+            write_reg = o->reg;
+        }
+    }
+
+    if (read_reg != AARCH64_REG_INVALID) {
+        cap_aarch64_add_implicit_read(out, handle, read_reg);
+    }
+    if (write_reg != AARCH64_REG_INVALID) {
+        cap_aarch64_add_implicit_write(out, handle, write_reg);
+    }
+}
+
+/*
+ * The zero register an ENCODING fixes, which no alias is hiding.
+ *
+ * Three A64 families take a pointer-authentication modifier that the
+ * encoding pins to register 31 and the assembler syntax therefore never
+ * prints.  They are not aliases -- Capstone gives each its own
+ * instruction id and its own mnemonic -- so the base-form operand set
+ * is exactly as empty as the printed one and
+ * cap_aarch64_restore_alias_zero_reg has nothing to harvest.  The
+ * architecture is explicit that the modifier is the register and not a
+ * literal zero:
+ *
+ *   PACIZA / AUTIZB and their ten siblings.  The decode sets `n = 31`
+ *   (`if n != 31 then UNDEFINED` on the Z forms, `n = 31` outright on
+ *   the HINT-space PACIAZ / AUTIBZ), and the execute is
+ *   `X[d] = AddPACIA(X[d], X[n])` -- a read of X[31].
+ *
+ *   BRAAZ / BRABZ / BLRAAZ / BLRABZ.  `Z == '0'` forces `m == 31`, which
+ *   also makes `source_is_sp` FALSE, so `modifier = X[m]` is X[31] --
+ *   this is precisely what separates them from BRAA with Rm = 31 and
+ *   Z = '1', whose modifier is SP.
+ *
+ *   LDRAA / LDRAB.  `address = AuthDA(address, X[31, 64], ...)` names
+ *   X[31] literally in the execute ASL.
+ *
+ * Deliberately NOT here, each for a reason the same pages give:
+ * PACIA1716 / AUTIA1716 take X[16]; PACIASP / RETAA and the rest of the
+ * SP forms take SP[]; PACGA takes an explicit Xm; XPACI / XPACD /
+ * XPACLRI take no modifier at all.
+ *
+ * The list is closed over the 2022-12 MRA rather than over Capstone's
+ * mnemonic table, so a Capstone bump cannot silently add a member.
+ */
+static bool cap_aarch64_reads_zero_modifier(const char *mnem)
+{
+    static const char *const zero_modifier[] = {
+        "autdza", "autdzb", "autiaz", "autibz", "autiza", "autizb",
+        "blraaz", "blrabz", "braaz", "brabz",
+        "ldraa", "ldrab",
+        "pacdza", "pacdzb", "paciaz", "pacibz", "paciza", "pacizb",
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(zero_modifier); i++) {
+        if (!strcmp(mnem, zero_modifier[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void cap_fill_arm64_operands(csh handle, unsigned int cap_mode,
+                                    const cs_insn *insn,
                                     qemu_plugin_insn_info *out)
 {
     const cs_arm64 *a64 = &insn->detail->arm64;
@@ -4330,6 +4566,12 @@ static void cap_fill_arm64_operands(csh handle, const cs_insn *insn,
     cap_aarch64_fp_status_contract(insn, a64, handle, out);
     cap_aarch64_add_fp_enable_gate(insn, a64, n, out);
     cap_aarch64_operand_direction(insn, a64, handle, out);
+
+    cap_aarch64_restore_alias_zero_reg(handle, cap_mode, insn, out);
+
+    if (cap_aarch64_reads_zero_modifier(insn->mnemonic)) {
+        cap_aarch64_add_implicit_read(out, handle, AARCH64_REG_XZR);
+    }
 
     if (insn->id == ARM64_INS_RET && a64->op_count == 0) {
         bool listed = false;
@@ -7541,7 +7783,8 @@ bool cap_disas_plugin_detail(disassemble_info *info, uint64_t pc, size_t size,
             cap_fill_x86_operands(handle, insn, out);
             break;
         case CS_ARCH_ARM64:
-            cap_fill_arm64_operands(handle, insn, out);
+            cap_fill_arm64_operands(handle, cap_effective_mode(info),
+                                    insn, out);
             break;
         default:
             cap_fill_generic_operands(handle, insn, out,
@@ -7688,7 +7931,7 @@ bool cap_disas_raw_detail(int cap_arch, unsigned int cap_mode,
             cap_fill_x86_operands(handle, insn, out);
             break;
         case CS_ARCH_ARM64:
-            cap_fill_arm64_operands(handle, insn, out);
+            cap_fill_arm64_operands(handle, cap_mode, insn, out);
             break;
         default:
             cap_fill_generic_operands(handle, insn, out, cap_arch);

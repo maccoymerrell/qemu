@@ -193,32 +193,84 @@ enum BranchType {
  */
 enum GenericRegId {
     REG_NONE = 0,
-    /* General-purpose integer registers: 1-64 */
+    /*
+     * General-purpose integer registers: 1-32.
+     *
+     * The bank was 64 wide.  No traced ISA has more than 32 GPRs
+     * (RISC-V 32, AArch64 31 + SP/ZR, MIPS 32, x86-64 APX 32 mapped
+     * onto 0-29), so 33-64 were measurably dead space and now carry
+     * the x86 control and debug files below.  See the allocation note
+     * further down.
+     */
     REG_GPR0 = 1,
     REG_GPR1, REG_GPR2, REG_GPR3, REG_GPR4, REG_GPR5, REG_GPR6, REG_GPR7,
     REG_GPR8, REG_GPR9, REG_GPR10, REG_GPR11, REG_GPR12, REG_GPR13,
     REG_GPR14, REG_GPR15, REG_GPR16, REG_GPR17, REG_GPR18, REG_GPR19,
     REG_GPR20, REG_GPR21, REG_GPR22, REG_GPR23, REG_GPR24, REG_GPR25,
     REG_GPR26, REG_GPR27, REG_GPR28, REG_GPR29, REG_GPR30, REG_GPR31,
-    REG_GPR32, REG_GPR33, REG_GPR34, REG_GPR35, REG_GPR36, REG_GPR37,
-    REG_GPR38, REG_GPR39, REG_GPR40, REG_GPR41, REG_GPR42, REG_GPR43,
-    REG_GPR44, REG_GPR45, REG_GPR46, REG_GPR47, REG_GPR48, REG_GPR49,
-    REG_GPR50, REG_GPR51, REG_GPR52, REG_GPR53, REG_GPR54, REG_GPR55,
-    REG_GPR56, REG_GPR57, REG_GPR58, REG_GPR59, REG_GPR60, REG_GPR61,
-    REG_GPR62, REG_GPR63,
-    /* Floating-point registers: 65-128 */
+    /*
+     * Control registers: 33-48.  x86-64 CR0-CR15, one ID each.  These
+     * are sixteen architecturally distinct registers with unrelated
+     * roles — CR0 mode bits, CR2 the faulting linear address, CR3 the
+     * page-table base, CR4 feature enables, CR8 the task priority —
+     * and folding them onto one ID made every `mov %cr3, %rax` take a
+     * false edge from every CR0 write.
+     */
+    REG_CTRL0 = 33,
+    REG_CTRL1, REG_CTRL2, REG_CTRL3, REG_CTRL4, REG_CTRL5, REG_CTRL6,
+    REG_CTRL7, REG_CTRL8, REG_CTRL9, REG_CTRL10, REG_CTRL11, REG_CTRL12,
+    REG_CTRL13, REG_CTRL14, REG_CTRL15,
+    /*
+     * Debug registers: 49-64.  x86-64 DR0-DR15, one ID each.  DR0-DR3
+     * hold four independent breakpoint addresses; DR6 is the status
+     * word and DR7 the control word.  DR4/DR5 are NOT separate
+     * registers — when CR4.DE is clear they alias DR6/DR7, and when it
+     * is set they fault — so they fold onto REG_DEBUG6/REG_DEBUG7 and
+     * REG_DEBUG4/REG_DEBUG5 stay unused (R8.2: an alias is not an
+     * overlap).
+     */
+    REG_DEBUG0 = 49,
+    REG_DEBUG1, REG_DEBUG2, REG_DEBUG3, REG_DEBUG4, REG_DEBUG5,
+    REG_DEBUG6, REG_DEBUG7, REG_DEBUG8, REG_DEBUG9, REG_DEBUG10,
+    REG_DEBUG11, REG_DEBUG12, REG_DEBUG13, REG_DEBUG14, REG_DEBUG15,
+    /*
+     * Floating-point registers: 65-96.  Was 64 wide; no traced ISA has
+     * more than 32 FP registers, so 97-128 now carry the accumulator
+     * high halves and the privileged-state behaviour classes below.
+     */
     REG_FPR0 = 65,
     REG_FPR1, REG_FPR2, REG_FPR3, REG_FPR4, REG_FPR5, REG_FPR6, REG_FPR7,
     REG_FPR8, REG_FPR9, REG_FPR10, REG_FPR11, REG_FPR12, REG_FPR13,
     REG_FPR14, REG_FPR15, REG_FPR16, REG_FPR17, REG_FPR18, REG_FPR19,
     REG_FPR20, REG_FPR21, REG_FPR22, REG_FPR23, REG_FPR24, REG_FPR25,
     REG_FPR26, REG_FPR27, REG_FPR28, REG_FPR29, REG_FPR30, REG_FPR31,
-    REG_FPR32, REG_FPR33, REG_FPR34, REG_FPR35, REG_FPR36, REG_FPR37,
-    REG_FPR38, REG_FPR39, REG_FPR40, REG_FPR41, REG_FPR42, REG_FPR43,
-    REG_FPR44, REG_FPR45, REG_FPR46, REG_FPR47, REG_FPR48, REG_FPR49,
-    REG_FPR50, REG_FPR51, REG_FPR52, REG_FPR53, REG_FPR54, REG_FPR55,
-    REG_FPR56, REG_FPR57, REG_FPR58, REG_FPR59, REG_FPR60, REG_FPR61,
-    REG_FPR62, REG_FPR63,
+    /*
+     * Accumulator high halves: 97-100.  REG_ACC<n> (237-240) names the
+     * LOW half; REG_ACCHI<n> names the HIGH half of the same
+     * accumulator.  MIPS `mfhi` and `mflo` read DIFFERENT hardware and
+     * binutils separates them, so one ID for both was a conflation a
+     * consumer could not undo.  An instruction that uses the whole
+     * 64-bit accumulator (MULT, the DSP DPA/EXTR family) names both
+     * IDs, which is the register-LIST shape, not a fold.
+     */
+    REG_ACCHI0 = 97,
+    REG_ACCHI1, REG_ACCHI2, REG_ACCHI3,
+    /*
+     * Privileged / system state, grouped by DEPENDENCE BEHAVIOUR:
+     * 101-109.  One ID per group of registers a consumer must order
+     * against the same events; see the allocation note below for the
+     * grouping and its reason.  REG_SYS (243) remains the residual.
+     */
+    REG_SYSEXC   = 101,  /* written by the exception an insn raises */
+    REG_SYSMMU   = 102,  /* address translation / TLB state */
+    REG_SYSTIMER = 103,  /* free-running counter and its compare */
+    REG_SYSPERF  = 104,  /* performance counters and their control */
+    REG_SYSDBG   = 105,  /* debug / watchpoint / trace state */
+    REG_SYSCACHE = 106,  /* cache tag-and-data access, error state */
+    REG_SYSID    = 107,  /* read-only implementation identification */
+    REG_COPROC0  = 108,  /* implementation-defined coprocessor file 0 */
+    REG_COPROC1  = 109,  /* implementation-defined coprocessor file 1 */
+    /* 110-128 unallocated — reserve for further behaviour classes. */
     /* Vector/SIMD registers: 129-192 */
     REG_VEC0 = 129,
     REG_VEC1, REG_VEC2, REG_VEC3, REG_VEC4, REG_VEC5, REG_VEC6, REG_VEC7,
@@ -256,53 +308,104 @@ enum GenericRegId {
     REG_VCTRL = 245,
     /*
      * These IDs are GENERIC.  They abstract a guest register onto the
-     * behaviour class a consumer schedules against; they are not, and
-     * are not meant to be, an exact naming of the architectural
-     * register underneath.  The space holds 255 entries and is shared
-     * by every ISA, so minting a new one needs strong justification —
-     * and a register that exists in a SINGLE ISA never qualifies.  Fold
-     * it onto whichever existing ID roughly matches its role.
+     * behaviour class a consumer schedules against.  What they must
+     * NOT do is put two architecturally distinct registers on one ID.
      *
-     * A fold can manufacture a dependency the guest does not have, and
-     * that is a real cost.  It is not, on its own, grounds for a new
-     * ID: it is the ordinary price of a generic format, paid so that a
-     * consumer sees one register model instead of four.  Precision is
-     * bought back through the refiners, which are per-behaviour rather
-     * than per-ISA.
+     * A fold that manufactures a dependency the guest does not have is
+     * a MAPPING DEFECT, not an accepted cost.  A consumer is misled as
+     * badly by an edge onto a register the instruction never touched
+     * as by a missing one, and it has no way to tell the false edge
+     * from a real one.  When two registers land on one ID and a
+     * renaming regfile would not have to order them against each
+     * other, the mapping is wrong and gets reworked — the space has
+     * room, and "we cannot afford an ID" is not an argument that can
+     * be made here.
+     *
+     * The converse is equally binding: two ISA register NAMES that
+     * denote the SAME hardware register belong on one ID and always
+     * did.  AArch64 v0/z0, x86 xmm16/ymm16/zmm16, rax/eax/ax/al, the
+     * AArch64 D0_D1 register-list and RISC-V V0M2 LMUL-group forms,
+     * MIPS F_HI<n>, x86 DR4/DR5 under CR4.DE=0 — all aliases, all
+     * folded.  Only distinct hardware sharing an ID is a collision.
+     *
+     * A register the harness cannot REACH is not a mapped register.
+     * A table row proves nothing on its own: RISCV_REG_SSP sat mapped
+     * and unreachable because nothing set CS_MODE_RISCV_ZICFISS, and
+     * the mapping read as correct for as long as nobody decoded for
+     * it.  A mapping claim has to name the decode that produced the
+     * register.
+     *
+     * SPACE, measured across all four generated tables (2026-08-23):
+     * the GPR and FPR banks were 64 wide and no traced ISA fills more
+     * than 32 of either, the VEC bank is 64 wide and 32 are used, and
+     * 248-249 are holes.  That is 98 IDs with nothing in them.  The
+     * dead upper halves of GPR (33-64) and FPR (97-128) now carry the
+     * x86 control/debug files and the accumulator-high and
+     * privileged-state classes; VEC 32-63 and PRED 16-31 hold the
+     * architecturally distinct registers that fall outside an ISA's
+     * numbered file but belong to its behaviour class (AArch64 ZT0,
+     * FFR).
+     *
+     *   REG_SYS*    the privileged file is grouped by DEPENDENCE
+     *               BEHAVIOUR, not enumerated.  MIPS CP0 alone has 288
+     *               entries and giving each an ID would fragment the
+     *               space for no gain, but one ID for all 288 makes
+     *               every exception-raising instruction depend on
+     *               every unrelated CP0 access.  The groups are the
+     *               sets whose members a consumer must order against
+     *               the same event:
+     *                 REG_SYSEXC    written together BY an exception
+     *                               (EPC, Cause, Status, BadVAddr,
+     *                               ErrorEPC).  An edge inside this
+     *                               group is real — one event writes
+     *                               them all — and an edge to anything
+     *                               outside it is not.
+     *                 REG_SYSMMU    read/written by TLB maintenance
+     *                 REG_SYSTIMER  a counter that advances on its own
+     *                 REG_SYSPERF   counters that advance on events
+     *                 REG_SYSDBG    debug/watch/trace
+     *                 REG_SYSCACHE  cache tag/data and error state
+     *                 REG_SYSID     read-only implementation constants
+     *                               (MIPS PRId/Config, RISC-V vlenb).
+     *                               A read of one of these depends on
+     *                               nothing, so it must not sit with
+     *                               writable state.
+     *
+     *   REG_COPROC<n>  an implementation-defined coprocessor register
+     *               file (MIPS CP2, CP3).  The architecture assigns
+     *               these no semantics, so there is nothing to group
+     *               BY; one ID per coprocessor keeps them out of the
+     *               CP0 classes, which is the defect that mattered.
      *
      *   REG_TLS     the thread pointer — AArch64 TPIDR_EL0 /
      *               TPIDRRO_EL0, the MIPS CP0 UserLocal word that
-     *               `rdhwr $29` reads, and x86-64 FS.base.  Earns an ID
-     *               on two counts: it spans three ISAs, and it is a
-     *               POINTER the guest computes addresses from rather
-     *               than a status word, so the whole CP0 / MRS
-     *               population on REG_SYS is the wrong neighbourhood
-     *               for it.  On RISC-V the thread pointer is `tp` (x4),
-     *               an ordinary GPR, and needs nothing here.
+     *               `rdhwr $29` reads, and x86-64 FS.base.  A POINTER
+     *               the guest computes addresses from rather than a
+     *               status word, so the CP0 / MRS population is the
+     *               wrong neighbourhood for it.  On RISC-V the thread
+     *               pointer is `tp` (x4), an ordinary GPR, and needs
+     *               nothing here.
      *
      *   REG_SSP     the shadow-stack pointer — RISC-V Zicfiss `ssp`
-     *               and x86-64 CET's SSP.  Earns an ID rather than a
-     *               fold: it exists on two ISAs, and every fold on
-     *               offer manufactures a dependency that is not there.
-     *               Onto REG_SP it serialises shadow-stack traffic
-     *               against every spill, local and frame adjustment;
-     *               onto REG_LR, against every call and return.  The
-     *               shadow stack is a SEPARATE architectural structure
-     *               with its own pointer, and a consumer scheduling
-     *               against it needs to see that.  Room was not the
-     *               constraint: 248-249 remain free and the top halves
-     *               of the GPR/FPR/VEC banks are 32 unused IDs each
-     *               (96 in total), since no traced ISA has more than
-     *               32 of any one file.
+     *               and x86-64 CET's SSP.  Neither fold on offer is
+     *               honest: onto REG_SP it serialises shadow-stack
+     *               traffic against every spill, local and frame
+     *               adjustment; onto REG_LR, `sspopchk ra` reads
+     *               {ra, ssp} and writes {ssp}, so a two-source
+     *               compare collapses into one source with a
+     *               self-dependency — on the instruction whose entire
+     *               purpose is comparing those two.
      *
      * 248-249 are deliberately unallocated.  They briefly held
      * REG_VSTART (RISC-V vector start), REG_DSPCTRL (MIPS DSPControl)
      * and REG_VCSR (RISC-V vcsr / MIPS MSACSR) — the third of those
-     * three slots is the one REG_SSP now occupies.  The first two named a
-     * register from exactly one ISA, which is the fragmentation this
-     * space exists to avoid; the third split a rounding-mode-and-status
-     * word away from REG_FCSR, which already is one.  They now fold to
-     * REG_VCTRL, REG_FLAGS and REG_FCSR respectively.  Left as holes
+     * three slots is the one REG_SSP now occupies.  The first two
+     * named a register from exactly one ISA whose behaviour an
+     * existing class already covered; the third split a
+     * rounding-mode-and-status word away from REG_FCSR, which already
+     * is one.  They now fold to REG_VCTRL, REG_FLAGS and REG_FCSR
+     * respectively — folds onto the SAME behaviour, which is what
+     * distinguishes them from the collisions above.  Left as holes
      * rather than reused so nothing renumbers.
      */
     REG_TLS = 246,
@@ -430,11 +533,13 @@ static inline const char *branch_type_name_or_unknown(unsigned id)
 }
 
 /*
- * Symbolic register name: a well-known special name, a class+index
- * name for the dense banks (REG_GPR<N>, REG_FPR<N>, ...), or
- * REG_CTRL/REG_DEBUG.  NULL for any ID the enum does not allocate.
- * The dense-bank result lives in a thread_local buffer; don't retain
- * the pointer past the next call.
+ * Symbolic register name: a well-known special name or a class+index
+ * name for the dense banks (REG_GPR<N>, REG_FPR<N>, REG_CTRL<N>,
+ * ...).  NULL for any ID the enum does not allocate — the holes are
+ * real and a caller that prints them is telling the truth about a
+ * trace written by a different epoch of this table.  The dense-bank
+ * result lives in a thread_local buffer; don't retain the pointer
+ * past the next call.
  */
 static inline const char *generic_reg_name(unsigned id)
 {
@@ -445,7 +550,16 @@ static inline const char *generic_reg_name(unsigned id)
     case REG_DEBUG:   return "REG_DEBUG";
     case REG_ZERO:    return "REG_ZERO";
     case REG_MATRIX:  return "REG_MATRIX";
-    case REG_SYS:     return "REG_SYS";
+    case REG_SYS:      return "REG_SYS";
+    case REG_SYSEXC:   return "REG_SYSEXC";
+    case REG_SYSMMU:   return "REG_SYSMMU";
+    case REG_SYSTIMER: return "REG_SYSTIMER";
+    case REG_SYSPERF:  return "REG_SYSPERF";
+    case REG_SYSDBG:   return "REG_SYSDBG";
+    case REG_SYSCACHE: return "REG_SYSCACHE";
+    case REG_SYSID:    return "REG_SYSID";
+    case REG_COPROC0:  return "REG_COPROC0";
+    case REG_COPROC1:  return "REG_COPROC1";
     case REG_FCSR:    return "REG_FCSR";
     case REG_VCTRL:   return "REG_VCTRL";
     case REG_TLS:     return "REG_TLS";
@@ -459,10 +573,16 @@ static inline const char *generic_reg_name(unsigned id)
     }
     /* Dense bank ranges — index relative to bank base. */
     static __thread char buf[24];
-    if (id >= REG_GPR0 && id < REG_GPR0 + 64) {
+    if (id >= REG_GPR0 && id < REG_GPR0 + 32) {
         snprintf(buf, sizeof(buf), "REG_GPR%u", id - REG_GPR0);
-    } else if (id >= REG_FPR0 && id < REG_FPR0 + 64) {
+    } else if (id >= REG_CTRL0 && id < REG_CTRL0 + 16) {
+        snprintf(buf, sizeof(buf), "REG_CTRL%u", id - REG_CTRL0);
+    } else if (id >= REG_DEBUG0 && id < REG_DEBUG0 + 16) {
+        snprintf(buf, sizeof(buf), "REG_DEBUG%u", id - REG_DEBUG0);
+    } else if (id >= REG_FPR0 && id < REG_FPR0 + 32) {
         snprintf(buf, sizeof(buf), "REG_FPR%u", id - REG_FPR0);
+    } else if (id >= REG_ACCHI0 && id < REG_ACCHI0 + 4) {
+        snprintf(buf, sizeof(buf), "REG_ACCHI%u", id - REG_ACCHI0);
     } else if (id >= REG_VEC0 && id < REG_VEC0 + 64) {
         snprintf(buf, sizeof(buf), "REG_VEC%u", id - REG_VEC0);
     } else if (id >= REG_PRED0 && id < REG_PRED0 + 32) {

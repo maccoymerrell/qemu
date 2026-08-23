@@ -2941,10 +2941,22 @@ def _x86_sysreg_facts(insn_id: int) -> tuple[tuple[str, int], ...]:
               "XSAVEOPT", "XSAVEOPT64", "XSAVES", "XSAVES64",
               "XRSTOR", "XRSTOR64", "XRSTORS", "XRSTORS64"),
              ((OTH, R),)),
-            # CET: the shadow-stack pointer.
-            (("RDSSPD", "RDSSPQ", "SAVEPREVSSP"), ((SSP, R),)),
-            (("INCSSPD", "INCSSPQ"), ((SSP, RW),)),
-            (("RSTORSSP",), ((SSP, W),)),
+            # CET: the shadow-stack pointer, in the direction each of
+            # the eight instructions has (SDM Vol. 2; QEMU's TCG i386
+            # target does not model CET, so the facts are the SDM's --
+            # the step producing each access is cited at the CET arm of
+            # the switch in disas/capstone.c).  RSTORSSP consumes the
+            # current SSP into the token it rewrites before installing
+            # the new one; SAVEPREVSSP pops with `ShadowStackPop8B(SSP)`
+            # and so advances it; SETSSBSY checks `SSP != 0` and then
+            # assigns `SSP := IA32_PL0_SSP`, which is an MSR and takes
+            # the MSR-file id for the reason IA32_TSC_AUX does above;
+            # CLRSSBSY ends with `SSP := 0` and reads it nowhere.
+            (("RDSSPD", "RDSSPQ"), ((SSP, R),)),
+            (("INCSSPD", "INCSSPQ", "RSTORSSP", "SAVEPREVSSP"),
+             ((SSP, RW),)),
+            (("SETSSBSY",), ((SSP, RW), (OTH, R))),
+            (("CLRSSBSY",), ((SSP, W),)),
         ]
         tab: dict[int, tuple[tuple[str, int], ...]] = {}
         for mnems, facts in spec:
@@ -3366,9 +3378,22 @@ def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
         else:
             if _a64_is_ieee_fp_op(mnem) or _a64_is_bf16_nonieee(mnem):
                 add(exp_src, _a64.AARCH64_REG_FPCR)
-            if mnem.startswith(("fabs", "fneg")) or mnem == "fmov":
-                # Scalar float form only: the vector and SVE forms clear,
-                # flip or copy bits and consult nothing.
+            if mnem == "fmov":
+                # NO FMOV FORM READS FPCR.  FABS and FNEG reach the
+                # control word through FPCR.NEP's merging door and FMOV
+                # does not go through it -- QEMU dispatches the first two
+                # via do_fp1_scalar_int_2fn (merging=true) and FMOV via
+                # `TRANS(FMOV_s, do_fp1_scalar_int, a, &f_scalar_fmov,
+                # false)`, and commit 64339259a9 gives exactly that as
+                # the reason the parameter exists.  FMOV (general),
+                # `fmov s0, w0`, is a bit copy between register files
+                # with no conversion, so there is no rounding mode to
+                # read.  Unconditional on the operand form, unlike the
+                # two below.
+                exp_src.discard("REG_FCSR")
+            elif mnem.startswith(("fabs", "fneg")):
+                # Scalar float form only: the vector and SVE forms clear
+                # or flip bits and consult nothing.
                 if not _files["arranged"] and not _files["sve"]:
                     add(exp_src, _a64.AARCH64_REG_FPCR)
                 else:

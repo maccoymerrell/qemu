@@ -1792,10 +1792,21 @@ x86_64 Z-access0 umonitor REG
 #
 # `R-rd-phantom ... +fpcr` is the read; `R-wr-phantom ... +fpcr` is the
 # write.  A mnemonic in one list and not the other is the contract
-# working: the bit movers (fmov/fabs/fneg/fcsel/fdup/fexpa/ftssel in
-# their vector and SVE forms) read nothing, and the BF16 dot-product and
+# working: the bit movers (fabs/fneg/fcsel/fdup/fexpa/ftssel in their
+# vector and SVE forms) read nothing, and the BF16 dot-product and
 # matrix family and the SME array accumulate forms read FPCR without
 # writing FPSR.
+#
+# FMOV IS IN NEITHER LIST, ON ANY FORM.  It sits with FABS and FNEG in
+# the bit-mover set but not in their scalar exception: FABS and FNEG go
+# through FPCR.NEP's merging door and FMOV does not, which QEMU states
+# outright by dispatching the first two through do_fp1_scalar_int_2fn
+# (merging=true) and FMOV through do_fp1_scalar_int with merging=FALSE
+# (translate-a64.c; commit 64339259a9 gives that as the reason it needed
+# the parameter).  The row this replaces was
+# `R-rd-phantom fmov +fpcr,sysfpen`, which covered every scalar FMOV
+# including FMOV (general) -- `fmov s0, w0`, a bit copy between register
+# files that performs no conversion and so has no rounding mode to read.
 #
 # `R-rd-missing` is the other direction -- state LLVM names and the
 # boundary, having adjudicated it away, does not:
@@ -1922,7 +1933,6 @@ aarch64 R-rd-phantom fmlslb +fpcr,sysfpen
 aarch64 R-rd-phantom fmlslt +fpcr,sysfpen
 aarch64 R-rd-phantom fmmla +fpcr,sysfpen
 aarch64 R-rd-phantom fmopa +fpcr,sysfpen
-aarch64 R-rd-phantom fmov +fpcr,sysfpen
 aarch64 R-rd-phantom fmsb +fpcr,sysfpen
 aarch64 R-rd-phantom fmul +fpcr,sysfpen
 aarch64 R-rd-phantom fmulx +fpcr,sysfpen
@@ -5119,9 +5129,25 @@ mipsel R-rd-phantom lwre +r#
 # tables model no descriptor-table register, no MSR file and no TSC, and
 # there is no reason to expect them to start; these rows expire if the
 # TRACER stops recording the footprint, not because the reference catches
-# up.  Where LLVM DOES name the register the rows are absent rather than
-# allowlisted -- the CET family agrees on `ssp` outright, which is the
-# check that these operands are reaching the comparison at all.
+# up.
+#
+# THERE IS NO `+ssp` ROW HERE AND THAT IS NOT AGREEMENT.  An earlier
+# version of this paragraph said the CET family agrees on `ssp` outright
+# and offered the absent rows as proof the operands reach the comparison.
+# They do not reach it: is_dropped_reg() in isaxcheck.cc drops the token
+# `ssp` on BOTH sides for isa==ISA_X86_64, so this layer cannot see the
+# x86 shadow-stack attribution in either direction.  MEASURED, 2026-08-23:
+# with `saveprevssp` recording RD{ssp} WR{} against LLVM's RD{ssp}
+# WR{ssp}, and `setssbsy` recording nothing at all against LLVM's
+# RD{ssp} WR{ssp}, this arm still exited 0 with dead_allow_rules=0.  Four
+# real attribution defects lived under that blindness (see the CET arm of
+# the switch in disas/capstone.c).  The fields layer drops `ssp` from the
+# REFERENCE side only, so the tracer's REG_SSP survives there and the
+# rows in isaxcheck_fields_allow.txt are the only place this family is
+# visible at all -- and only in the phantom direction.  BOTH DROPS EXIST
+# because LLVM names `ssp` on every CALL, modelling a shadow-stack push
+# QEMU does not perform; both delete when CALL's own shadow-stack
+# footprint is ruled on.
 #
 #   +sysmmu     sgdt/lgdt, sidt/lidt, sldt/lldt, str/ltr.  gdt.base and
 #               idt.base are stored and loaded in the translator
@@ -5139,12 +5165,17 @@ mipsel R-rd-phantom lwre +r#
 #               WRITING the x87 status word, which it does not
 #               (fpu_helper.c:757 returns env->fpuc and touches nothing).
 #   +sys        rdmsr/wrmsr/rdpmc, rdpid, rdtscp's second result,
-#               xgetbv/xsetbv and the twelve XSAVE / XRSTOR forms.  The
-#               MSR is selected at runtime by ECX, so one token for the
-#               file is what a decode can honestly say; IA32_TSC_AUX is
-#               an MSR and lands there for that reason; XCR0 is read by
-#               every xsave/xrstor because `rfbm &= env->xcr0` gates each
-#               component (fpu_helper.c:2795, :3077).
+#               xgetbv/xsetbv, the twelve XSAVE / XRSTOR forms and
+#               setssbsy.  The MSR is selected at runtime by ECX, so one
+#               token for the file is what a decode can honestly say;
+#               IA32_TSC_AUX is an MSR and lands there for that reason;
+#               XCR0 is read by every xsave/xrstor because
+#               `rfbm &= env->xcr0` gates each component
+#               (fpu_helper.c:2795, :3077).  setssbsy's is IA32_PL0_SSP
+#               (MSR 0x6A4), the register `SSP := IA32_PL0_SSP` reads --
+#               the only SSP-family term this layer can see at all, the
+#               rest being dropped by is_dropped_reg() as described
+#               above.
 #   +systimer   rdtsc / rdtscp.  A counter that advances on its own is
 #               its own dependency population.
 #   xsave       `+r#,sys` is the decode-disagreement witness (Capstone
@@ -5161,6 +5192,7 @@ x86_64 R-rd-phantom rdpid +sys
 x86_64 R-rd-phantom rdpmc +sys
 x86_64 R-rd-phantom rdtsc +systimer
 x86_64 R-rd-phantom rdtscp +sys,systimer
+x86_64 R-rd-phantom setssbsy +sys
 x86_64 R-rd-phantom sgdtq +sysmmu
 x86_64 R-rd-phantom sidtq +sysmmu
 x86_64 R-rd-phantom sldtl +sysmmu

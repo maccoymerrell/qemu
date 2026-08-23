@@ -742,9 +742,16 @@ without implying any particular numeric base.
        ``{ssp}`` — would collapse into one source with a
        self-dependency, on the instruction whose whole purpose is
        comparing those two values.  x86-64 reaches it through the
-       ``QEMU_PLUGIN_OP_SYSREG`` operand (``rdsspd`` / ``rdsspq``,
-       ``incsspd`` / ``incsspq``, ``rstorssp``, ``saveprevssp``);
-       RISC-V names it as an ordinary register operand.
+       ``QEMU_PLUGIN_OP_SYSREG`` operand, on eight instructions and in
+       the direction each of them has: read on ``rdsspd`` / ``rdsspq``;
+       read and write on ``incsspd`` / ``incsspq``, ``rstorssp`` and
+       ``saveprevssp``; read and write on ``setssbsy``, which also reads
+       the MSR file for ``IA32_PL0_SSP``, the register its
+       ``SSP := IA32_PL0_SSP`` takes the value from; write on
+       ``clrssbsy``, which ends ``SSP := 0`` and reads it nowhere.
+       ``wrss`` / ``wruss`` are not among them: they store to the shadow
+       stack at the address their memory operand names and never consult
+       the pointer.  RISC-V names it as an ordinary register operand.
    * - ``REG_SP``
      - Stack pointer.
    * - ``REG_FLAGS``

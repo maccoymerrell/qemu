@@ -894,13 +894,16 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
  *
  * SSP IS THE EXCEPTION AND IT IS NAMED AS ONE.  QEMU's TCG i386 target
  * does not model CET at all -- there is no U_CET/S_CET MSR, no PL0_SSP,
- * no shadow-stack push on a call -- so the six CET instructions execute
- * as the NOPs their encodings occupy when CET is off, and the register
- * facts here come from the Intel SDM rather than from QEMU.  They are
- * recorded anyway because the set is ARCHITECTURAL (R2): a trace of a
- * CET binary must say that `sspopchk`'s x86 sibling family reads and
- * writes the shadow-stack pointer, and REG_SSP is the id RISC-V
- * Zicfiss's `ssp` already carries -- one register, two ISAs (R8.6).
+ * no shadow-stack push on a call -- so the eight SSP-bearing CET
+ * instructions (RDSSPD/Q, INCSSPD/Q, RSTORSSP, SAVEPREVSSP, SETSSBSY,
+ * CLRSSBSY) execute as the NOPs their encodings occupy when CET is off,
+ * and the register facts here come from the Intel SDM rather than from
+ * QEMU.  They are recorded anyway because the set is ARCHITECTURAL
+ * (R2): a trace of a CET binary must say that `sspopchk`'s x86 sibling
+ * family reads and writes the shadow-stack pointer, and REG_SSP is the
+ * id RISC-V Zicfiss's `ssp` already carries -- one register, two ISAs
+ * (R8.6).  The per-instruction direction, and the SDM step that
+ * produces each access, is at the CET arm of the switch below.
  *
  * WHAT IS NOT HERE, and why it is a finding rather than an omission:
  * CLUI, STUI and ERETU carry UIF and IA32_KERNEL_GS_BASE, and this
@@ -1131,18 +1134,68 @@ static void cap_x86_add_sysregs(const cs_insn *insn,
         /* `rfbm &= env->xcr0` gates every component. */
         cap_x86_add_sysreg(out, CAP_X86_SYSREG_XCR0, CAP_X86_SYS_R);
         break;
-    /* ---- CET: the shadow-stack pointer -------------------------- */
+    /* ---- CET: the shadow-stack pointer --------------------------
+     *
+     * SEVEN instructions name SSP, and the direction is per instruction.
+     * QEMU's TCG i386 target does not model CET (see the block comment
+     * above), so the authority is the SDM Vol. 2 operation section and
+     * the step of it that produces each access is cited here.
+     *
+     *   RDSSPD/Q      `IF ShadowStackEnabled(CPL): dest := SSP` -- read
+     *                 only; the destination is an ordinary GPR operand
+     *                 Capstone already carries.
+     *   INCSSPD/Q     `SSP := SSP + (imm * 8)` -- read AND write.
+     *   RSTORSSP      the token at the memory operand is rewritten to
+     *                 carry the CURRENT SSP before `SSP := SSP_LA`
+     *                 installs the new one, so the old value is consumed
+     *                 as well as replaced -- read AND write.  The write
+     *                 alone was recorded.
+     *   SAVEPREVSSP   `previous_ssp_token := ShadowStackPop8B(SSP)`
+     *                 advances SSP by 8 before pushing the token onto
+     *                 the previous shadow stack -- read AND write.  The
+     *                 read alone was recorded.
+     *   SETSSBSY      `IF SSP != 0 THEN #GP(0)` reads it, and
+     *                 `SSP := IA32_PL0_SSP` writes it -- read AND write,
+     *                 plus the MSR the value comes FROM.  Nothing at all
+     *                 was recorded: an instruction whose entire
+     *                 architectural effect is a shadow-stack pointer
+     *                 assignment was depending on nothing.
+     *   CLRSSBSY      clears the token's busy bit and then `SSP := 0`
+     *                 -- write only; no step of it reads SSP.  Nothing
+     *                 at all was recorded.
+     *
+     * IA32_PL0_SSP (MSR 0x6A4) IS THE SOURCE OPERAND OF SETSSBSY and
+     * takes the MSR-file id for the reason IA32_TSC_AUX does above: it
+     * is an MSR, a WRMSR that writes it must resolve before SETSSBSY may
+     * read it, and one id for the file is what a decode can honestly say
+     * about a register selected at runtime.  Recording the SSP write
+     * without it would leave the written value with no producer, which
+     * is the half of the defect that a `RD{ssp} WR{ssp}` repair alone
+     * does not close.
+     *
+     * WRSS / WRUSS ARE ABSENT ON PURPOSE.  They store to the shadow
+     * stack at the linear address their memory operand names and never
+     * consult SSP, so they carry the memory access (handled by the
+     * store-repair predicate above) and no system register.  LLVM MC
+     * agrees: `--hex=0f38f608` gives RD{r0,r1} WR{} on both sides.
+     */
     case X86_INS_RDSSPD:
     case X86_INS_RDSSPQ:
-    case X86_INS_SAVEPREVSSP:
         cap_x86_add_sysreg(out, CAP_X86_SYSREG_SSP, CAP_X86_SYS_R);
         break;
     case X86_INS_INCSSPD:
     case X86_INS_INCSSPQ:
+    case X86_INS_RSTORSSP:
+    case X86_INS_SAVEPREVSSP:
         cap_x86_add_sysreg(out, CAP_X86_SYSREG_SSP,
                            CAP_X86_SYS_R | CAP_X86_SYS_W);
         break;
-    case X86_INS_RSTORSSP:
+    case X86_INS_SETSSBSY:
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_SSP,
+                           CAP_X86_SYS_R | CAP_X86_SYS_W);
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_MSR, CAP_X86_SYS_R);
+        break;
+    case X86_INS_CLRSSBSY:
         cap_x86_add_sysreg(out, CAP_X86_SYSREG_SSP, CAP_X86_SYS_W);
         break;
     default:
@@ -3084,16 +3137,50 @@ static CapA64FileSet cap_aarch64_file_set(const cs_arm64 *a64, uint8_t n,
  *  1. The FP datapath reads FPCR.  Capstone reports this on most FP
  *     instructions and misses a scattering -- FCMP carries it, FCCMP
  *     does not; SQDMULH carries it and has no business doing so.  Scalar
- *     FABS / FNEG / FMOV read it too, through a different door:
- *     fabs_float's execute ASL opens with `FPCRType fpcr = FPCR[]` and
- *     asks IsMerging(fpcr), so FPCR.NEP decides whether the result
- *     merges with Vd.  The Advanced SIMD and SVE forms of those three
- *     mnemonics have no such read -- their ASL is
+ *     FABS / FNEG read it too, through a different door: fabs_float's
+ *     execute ASL opens with `FPCRType fpcr = FPCR[]` and asks
+ *     IsMerging(fpcr), so FPCR.NEP decides whether the result merges
+ *     with Vd.  The Advanced SIMD and SVE forms of those two mnemonics
+ *     have no such read -- their ASL is
  *     `Elem[result,e,esize] = FPAbs(Elem[operand,e,esize])` and nothing
  *     else -- and QEMU agrees: gen_gvec_fabs() is a `gvec_andi` of the
  *     sign mask while the scalar path is selected on s->fpcr_ah
  *     (translate-a64.c).  The rule this replaces put the read on all
  *     three forms.
+ *
+ *     FMOV IS NOT ONE OF THEM, ON ANY ENCODING.  It shares the merging
+ *     door's shape and does not go through it, and QEMU says so in one
+ *     line: FABS and FNEG are dispatched through do_fp1_scalar_int_2fn,
+ *     which passes merging=true and writes through
+ *     write_fp_{d,s,h}reg_merging(); FMOV is
+ *     `TRANS(FMOV_s, do_fp1_scalar_int, a, &f_scalar_fmov, false)`
+ *     (translate-a64.c) -- merging=FALSE, a plain write_fp_dreg.  The
+ *     commit that introduced the parameter states the reason as its
+ *     justification for needing one: "this requires an extra parameter
+ *     to do_fp1_scalar_int(), since FMOV scalar does not have the
+ *     merging behaviour" (64339259a9).
+ *
+ *     THE OTHER FMOV FORMS, so the rule is not an over-correction that
+ *     happens to be right about one encoding.  There are four families
+ *     and NONE of them reads FPCR in QEMU's modelling:
+ *       FMOV (register)   `fmov s0, s1`  -- TRANS(FMOV_s, ...) above.
+ *       FMOV (general)    `fmov s0, w0`, `fmov x0, d0`, `fmov v0.d[1],
+ *                         x0` -- trans_FMOV_{hx,sw,dx,ux,xh,ws,xd,xu},
+ *                         eight functions that are a zero-extend and a
+ *                         write_fp_dreg, or a load out of the register
+ *                         file into cpu_reg.  This is the encoding the
+ *                         defect was measured on: a BIT COPY between
+ *                         files performs no conversion, so there is no
+ *                         rounding mode to consult and no result to
+ *                         merge.
+ *       FMOV (scalar imm) `fmov s0, #1.0` -- trans_FMOVI_s: vfp_expand_imm
+ *                         at translate time, write_fp_dreg.
+ *       FMOV (vector imm) `fmov v0.4s, #1.0` -- trans_FMOVI_v_*, a gvec
+ *                         dup of a translate-time constant.
+ *     The SVE spelling `fmov z0.s, p0/m, #1.0` is an alias of FCPY and
+ *     reaches this function under its own operand shape; it has no read
+ *     either.  So the withdrawal below is unconditional on the operand
+ *     form, unlike FABS's and FNEG's, and that asymmetry is the point.
  *
  *  2. Integer saturating arithmetic reads NOTHING and writes FPSR.QC.
  *     `sqadd`, `sqdmulh`, `uqsub` and the rest compute
@@ -3289,8 +3376,14 @@ static void cap_aarch64_fp_status_contract(const cs_insn *insn,
         cap_aarch64_is_bf16_nonieee(mnem)) {
         reads_fpcr = true;
     }
-    if (g_str_has_prefix(mnem, "fabs") || g_str_has_prefix(mnem, "fneg") ||
-        g_strcmp0(mnem, "fmov") == 0) {
+    if (g_strcmp0(mnem, "fmov") == 0) {
+        /* NO FMOV FORM READS FPCR -- see the FMOV note above.  The
+         * merging door FABS and FNEG go through is shut for this
+         * mnemonic, so whatever Capstone reported is withdrawn on every
+         * form rather than on the vector and SVE ones only. */
+        cap_aarch64_drop_implicit_read(out, AARCH64_REG_FPCR);
+    } else if (g_str_has_prefix(mnem, "fabs") ||
+               g_str_has_prefix(mnem, "fneg")) {
         /* Scalar float form only -- no arrangement specifier, no Z or P
          * operand. */
         if (!fs.arranged && !fs.sve) {

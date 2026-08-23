@@ -662,10 +662,24 @@ static bool drop_zero = true;
  *     record, so keeping the token would put a missing entry on the whole
  *     call family.  It is NOT an artifact on the CET instructions
  *     themselves, where LLVM and the tracer agree that RDSSP / INCSSP /
- *     RSTORSSP / SAVEPREVSSP touch it; the drop is asymmetric there (the
- *     tracer's REG_SSP survives into the fields comparison and LLVM's
- *     `ssp` does not) and the residual that leaves is allowlisted with
- *     that reason, not with a claim that LLVM is silent.
+ *     RSTORSSP / SAVEPREVSSP / SETSSBSY / CLRSSBSY touch it; the drop is
+ *     asymmetric at the FIELDS layer (the tracer's REG_SSP survives into
+ *     that comparison and LLVM's `ssp` does not) and the residual that
+ *     leaves is allowlisted with that reason, not with a claim that LLVM
+ *     is silent.
+ *
+ *     WHAT THIS COSTS, MEASURED 2026-08-23 rather than assumed.  The drop
+ *     is what makes BOTH layers blind to a MISSING tracer-side SSP: the
+ *     boundary layer discards the token on both sides, so it sees neither
+ *     direction, and the fields layer discards the reference's copy, so
+ *     no FR-*-missing row can form there either.  Four x86 CET
+ *     attribution defects lived in that blind spot with both arms exiting
+ *     0 and dead_allow_rules=0 -- SAVEPREVSSP's SSP write, RSTORSSP's SSP
+ *     read, and SETSSBSY and CLRSSBSY carrying no SSP at all -- and were
+ *     found by reading the SDM against the decode, not by this gate.  The
+ *     drop deletes when CALL's own shadow-stack footprint is ruled on,
+ *     and that ruling is what closes the hole; until then this family is
+ *     checked by hand.
  */
 static bool is_dropped_reg(const std::string &c)
 {

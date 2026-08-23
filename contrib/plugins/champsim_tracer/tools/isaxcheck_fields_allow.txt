@@ -367,11 +367,22 @@ aarch64 FB-flow-presence setptn cs-yes llvm-no
 # generic register space folds both onto REG_FCSR.
 #
 # FR-rd-phantom rows are the FPCR read, FR-wr-phantom rows the FPSR
-# write.  The read set excludes the bit movers (fmov/fabs/fneg/fcsel/
-# fdup/fexpa/ftssel in their vector and SVE forms) and the write set
+# write.  The read set excludes the bit movers (fabs/fneg/fcsel/fdup/
+# fexpa/ftssel in their vector and SVE forms) and the write set
 # additionally excludes the BF16 dot-product and matrix family and the
 # SME array accumulate forms, so a row appearing in one list and not the
 # other is the contract working, not an omission.
+#
+# FMOV IS IN NEITHER LIST, ON ANY FORM, which is where it differs from
+# the other two bit movers that have scalar rows.  FABS and FNEG read
+# FPCR.NEP through the merging door; FMOV does not go through it.  QEMU
+# says so in its dispatch -- do_fp1_scalar_int_2fn (merging=true) for
+# FABS/FNEG against `TRANS(FMOV_s, do_fp1_scalar_int, a, &f_scalar_fmov,
+# false)` -- and the commit that added the parameter gives that as the
+# reason it was needed (64339259a9).  The row this replaces was
+# `FR-rd-phantom fmov +REG_FCSR,REG_SYSFPEN`; it covered FMOV (general),
+# `fmov s0, w0`, which is a bit copy between register files with no
+# conversion and therefore no rounding mode to consult.
 #
 # The FR-rd-missing rows are the other direction -- registers LLVM names
 # and the tracer, having adjudicated them away, does not:
@@ -499,7 +510,6 @@ aarch64 FR-rd-phantom fmlslb +REG_FCSR,REG_SYSFPEN
 aarch64 FR-rd-phantom fmlslt +REG_FCSR,REG_SYSFPEN
 aarch64 FR-rd-phantom fmmla +REG_FCSR,REG_SYSFPEN
 aarch64 FR-rd-phantom fmopa +REG_FCSR,REG_SYSFPEN
-aarch64 FR-rd-phantom fmov +REG_FCSR,REG_SYSFPEN
 aarch64 FR-rd-phantom fmsb +REG_FCSR,REG_SYSFPEN
 aarch64 FR-rd-phantom fmul +REG_FCSR,REG_SYSFPEN
 aarch64 FR-rd-phantom fmulx +REG_FCSR,REG_SYSFPEN
@@ -3421,15 +3431,20 @@ mipsel FR-rd-phantom lwre +REG_SP
 #   +REG_SYSTIMER rdtsc and rdtscp.  A counter that advances on its own
 #                 is its own dependency population -- the same argument
 #                 that put MIPS Count and Compare on this id.
-#   +REG_SSP      rdsspd/rdsspq, incsspd/incsspq, rstorssp, saveprevssp.
-#                 QEMU's TCG i386 target does not model CET, so these
-#                 facts are the SDM's and are recorded because the set is
-#                 architectural (R2); REG_SSP is the id RISC-V Zicfiss
-#                 `ssp` already carries (R8.6).
+#   +REG_SSP      EIGHT instructions, in the direction each of them has:
+#                 read on rdsspd/rdsspq; read and write on incsspd/
+#                 incsspq, rstorssp and saveprevssp; read and write plus
+#                 the MSR the value comes from on setssbsy; write on
+#                 clrssbsy.  QEMU's TCG i386 target does not model CET,
+#                 so these facts are the SDM's and are recorded because
+#                 the set is architectural (R2); REG_SSP is the id
+#                 RISC-V Zicfiss `ssp` already carries (R8.6).  The
+#                 per-instruction SDM step that produces each access is
+#                 cited at the CET arm of the switch in
+#                 disas/capstone.c.
 #                 THESE ROWS ARE NOT "LLVM IS SILENT".  LLVM names `ssp`
 #                 on exactly these instructions and agrees with the
-#                 tracer about them -- the boundary layer shows the two
-#                 sides matching on the token.  The rows exist because
+#                 tracer about them.  The rows exist because
 #                 is_dropped_reg() drops `ssp` from the REFERENCE side,
 #                 for a reason that has nothing to do with CET decode:
 #                 LLVM also names it on every CALL, modelling the
@@ -3437,11 +3452,25 @@ mipsel FR-rd-phantom lwre +REG_SP
 #                 tracer's CALL does not record.  The drop is therefore
 #                 asymmetric at this layer -- the tracer's REG_SSP
 #                 survives and LLVM's `ssp` does not -- and these rows
-#                 are that asymmetry.  Making it symmetric would make the
-#                 gate blind to the attribution instead of merely noisy
-#                 about it, which is why it is left this way and written
-#                 down.  It deletes when CALL's own shadow-stack
-#                 footprint is ruled on.
+#                 are that asymmetry.
+#                 WHAT THE ASYMMETRY COSTS, now measured rather than
+#                 assumed.  It makes BOTH layers blind to a MISSING
+#                 tracer-side SSP: this layer discards LLVM's `ssp`
+#                 before the compare so no FR-*-missing row can form,
+#                 and the boundary layer drops the token on both sides
+#                 (isaxcheck.cc is_dropped_reg, isa==ISA_X86_64) so it
+#                 sees nothing either way.  Four attribution defects
+#                 lived there until 2026-08-23 -- saveprevssp's write,
+#                 rstorssp's read, and setssbsy and clrssbsy entirely --
+#                 with both arms exiting 0 and dead_allow_rules=0
+#                 throughout.  The three rows added with them
+#                 (FR-rd-phantom rstorssp / setssbsy, FR-wr-phantom
+#                 clrssbsy / saveprevssp / setssbsy) are what the repair
+#                 looks like from this side.  Making the drop symmetric
+#                 would trade the noise for blindness in the other
+#                 direction, which is why it is left this way; it
+#                 deletes when CALL's own shadow-stack footprint is
+#                 ruled on, and that ruling is what closes the hole.
 #   rdsspq rows   move from FR-wr-missing to FR-rd-missing, joining
 #                 rdsspd's, because X86_INS_RDSSPQ was classified
 #                 GEN_OP_NOP and is now GEN_OP_MOV like its 32-bit
@@ -3473,7 +3502,9 @@ x86_64 FR-rd-phantom rdsspd +REG_SSP
 x86_64 FR-rd-phantom rdsspq +REG_SSP
 x86_64 FR-rd-phantom rdtsc +REG_SYSTIMER
 x86_64 FR-rd-phantom rdtscp +REG_SYS,REG_SYSTIMER
+x86_64 FR-rd-phantom rstorssp +REG_SSP
 x86_64 FR-rd-phantom saveprevssp +REG_SSP
+x86_64 FR-rd-phantom setssbsy +REG_SSP,REG_SYS
 x86_64 FR-rd-phantom sgdtq +REG_SYSMMU
 x86_64 FR-rd-phantom sidtq +REG_SYSMMU
 x86_64 FR-rd-phantom sldtl +REG_SYSMMU
@@ -3498,6 +3529,7 @@ x86_64 FR-rd-phantom xsaveopt +REG_SYS
 x86_64 FR-rd-phantom xsaveopt64 +REG_SYS
 x86_64 FR-rd-phantom xsaves +REG_SYS
 x86_64 FR-rd-phantom xsaves64 +REG_SYS
+x86_64 FR-wr-phantom clrssbsy +REG_SSP
 x86_64 FR-wr-phantom incsspd +REG_SSP
 x86_64 FR-wr-phantom incsspq +REG_SSP
 x86_64 FR-wr-phantom ldmxcsr +REG_FCSR
@@ -3506,6 +3538,8 @@ x86_64 FR-wr-phantom lidtq +REG_SYSMMU
 x86_64 FR-wr-phantom lldtw +REG_SYSMMU
 x86_64 FR-wr-phantom ltrw +REG_SYSMMU
 x86_64 FR-wr-phantom rstorssp +REG_SSP
+x86_64 FR-wr-phantom saveprevssp +REG_SSP
+x86_64 FR-wr-phantom setssbsy +REG_SSP
 x86_64 FR-wr-phantom vldmxcsr +REG_FCSR
 x86_64 FR-wr-phantom wrmsr +REG_SYS
 x86_64 FR-wr-phantom xsetbv +REG_SYS

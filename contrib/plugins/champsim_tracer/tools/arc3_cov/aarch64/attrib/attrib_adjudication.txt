@@ -1,0 +1,297 @@
+AARCH64 REGISTER ATTRIBUTION -- ADJUDICATED SUMMARY
+==============================================================
+
+denominator          3920 opcode subjects (opcodes.tsv)
+probed               3920
+unprobed             0
+agree                2779
+disagree             1141
+
+BY REFERENCE RANK
+  1:MRA        agree     2673
+  1:MRA        disagree  1141
+  2:LLVM-MC    agree     106
+
+ADJUDICATION OF THE 1141 DISAGREEING ROWS
+    545  TRACER MISSES A READ
+    202  TRACER INVENTS A READ
+    175  TRACER MISSES A WRITE
+     94  TRACER MISSES BOTH
+     73  TRACER HAS THE DIRECTION BACKWARDS
+     24  TRACER MISSES TWO READS
+      6  TRACER INVENTS A READ AND MISSES A WRITE
+      5  REFERENCE GAP -- NOT A TRACER DEFECT
+      4  TRACER MISSES A WRITE AND A READ
+      3  TRACER INVENTS A WRITE
+      2  TRACER NAMES THE WRONG REGISTER
+      2  TRACER MISSES SEVEN READS
+      1  TRACER MISSES EVERYTHING
+      1  TRACER MISSES SEVEN WRITES
+      1  TRACER INVENTS A WRITE AND MISSES A READ
+      1  TRACER MISSES SIX READS
+      1  MIXED
+      1  REPRESENTATIVE ARTIFACT
+
+SIGNATURES, LARGEST FIRST
+
+   275  SRC+ref:FCSR
+        verdict: TRACER MISSES A READ
+        FPCR is an input: BF16 (FPCR.EBF) on bfdot/bfmmla/bfmlal, the
+        rounding mode on fixed-point fcvtz*/scvtf/ucvtf, and FPCR.NEP
+        merging on the fmov register-file moves. 13 of these rows are fmov,
+        where the MRA block reads FPCR unconditionally but the value reaches
+        no result on the FtoI direction -- those are reference-side
+        over-reports.
+
+   175  SRC+trc:FCSR
+        verdict: TRACER INVENTS A READ
+        fabs/fneg are sign-bit operations and the integer saturating ops
+        (sqabs/sqadd/sqshl...) consult no control word; the MRA execute ASL
+        contains no FPCR read on any path.
+
+   164  DST+ref:FCSR
+        verdict: TRACER MISSES A WRITE
+        the cumulative FP exception bits (FPSR.IXC/IOC/OFC/UFC/IDC) and the
+        saturation bit FPSR.QC are written. R5 governs: the write is
+        conditional on the operation raising the condition, and an inert
+        write is still a write.
+
+   128  SRC+ref:SYS
+        verdict: TRACER MISSES A READ
+        the pointer-authentication key registers (APIAKey_EL1 / APIBKey_EL1
+        / APDAKey_EL1 / APDBKey_EL1 / APGAKey_EL1) are inputs to
+        pac*/aut*/blra*/braa*, and GCR_EL1 is an input to addg/subg/irg.
+
+    92  DST+ref:FCSR SRC+ref:FCSR
+        verdict: TRACER MISSES BOTH
+        same class, on ops that both read FPCR and write FPSR.
+
+    76  SRC+ref:VEC#
+        verdict: TRACER MISSES A READ
+        ldff1* is a read-modify-write of its destination: elements not
+        loaded because the first-fault check stopped the access keep their
+        previous value (Elem[result,e] = Elem[orig,e] in the execute ASL).
+
+    72  DST+ref:FCSR SRC+trc:FCSR
+        verdict: TRACER HAS THE DIRECTION BACKWARDS
+        integer saturating arithmetic writes FPSR.QC and reads nothing; the
+        tracer records the status word as a SOURCE and omits the write.
+
+    38  SRC+ref:FLAGS
+        verdict: TRACER MISSES A READ
+        the MOPS prologue instructions test PSTATE.C to detect a
+        wrong-option restart (cpyp.xml lines 87/93); NZCV is a genuine
+        input.
+
+    26  SRC+ref:ZERO
+        verdict: TRACER MISSES A READ
+        the encoded operand is xzr/wzr (mov=orr Rn=31, mneg=msub Ra=31,
+        cset=csinc Rn=Rm=31). The tracer CAN name it -- it emits REG_ZERO
+        elsewhere, and --keep-zero does not change the answer -- so this is
+        an omission, not a fold. LLVM MC agrees with the reference.
+
+    26  SRC+trc:MATRIX
+        verdict: TRACER INVENTS A READ
+        these SME2 forms are write-only into ZA: the execute ASL computes
+        the result from the Z operands alone and stores it (ZAvector[vec,VL]
+        = result). The accumulating forms -- add_za_zw, the *_za_zzi group
+        -- do read ZA, and there the tracer agrees, so the model is not
+        simply always-read.
+
+    20  SRC+ref:SYS SRC+ref:ZERO
+        verdict: TRACER MISSES TWO READS
+        the PAC key, plus the xzr modifier operand of the *Z forms.
+
+    11  DST+ref:SYS
+        verdict: TRACER MISSES A WRITE
+        the sys-instruction group produces architectural results: at ->
+        PAR_EL1, the gcs push/pop forms -> GCSPR_ELx.
+
+     6  DST+ref:FCSR SRC+trc:ZERO
+        verdict: TRACER INVENTS A READ AND MISSES A WRITE
+        fcmp/fcmpe against #0.0: the zero is an IMMEDIATE, not the zero
+        register, and the FPSR exception write is absent.
+
+     4  DST+ref:SYS SRC+ref:ZERO
+        verdict: TRACER MISSES A WRITE AND A READ
+        as above.
+
+     4  SRC+ref:FLAGS SRC+ref:SYS
+        verdict: TRACER MISSES TWO READS
+        MOPS prologue NZCV plus GCR_EL1 on the tag-setting setgp* forms.
+
+     3  DST+trc:ZERO
+        verdict: TRACER INVENTS A WRITE
+        a write to xzr is architecturally discarded (casp with an xzr pair).
+
+     2  SRC+ref:SYS SRC+trc:LR
+        verdict: TRACER NAMES THE WRONG REGISTER
+        eretaa/eretab authenticate ELR_EL1, a system register. The tracer
+        records x30 (REG_LR), which the instruction does not touch.
+
+     2  DST+ref:SYS SRC+ref:SYS
+        verdict: TRACER MISSES BOTH
+        esb reads and writes DISR_EL1; irg reads and writes
+        RGSR_EL1/GCR_EL1.
+
+     2  SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:SYS
+        verdict: TRACER MISSES SEVEN READS
+        st64b/st64bv0 send a 512-bit payload held in eight consecutive X
+        registers; the tracer records two.
+
+     2  SRC+trc:GPR# SRC+trc:GPR#
+        verdict: REFERENCE GAP -- NOT A TRACER DEFECT
+        sysp/tlbip are the 128-bit system-instruction pair form, whose
+        execute ASL bottoms out in an operation this extractor does not
+        model. The tracer names the two X registers, which is right.
+
+     1  DST+ref:GPR# DST+ref:SYS SRC+ref:GPR# SRC+ref:SYS
+        verdict: TRACER MISSES EVERYTHING
+        hint #35 is chkfeat x16: it reads and writes x16 and reads the
+        feature registers. The tracer records no operand at all.
+
+     1  DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# SRC+ref:SYS
+        verdict: TRACER MISSES SEVEN WRITES
+        ld64b returns 512 bits into eight consecutive X registers; the
+        tracer records one destination.
+
+     1  DST+trc:GPR# SRC+ref:SYS
+        verdict: TRACER INVENTS A WRITE AND MISSES A READ
+        ldg has no base-register writeback; the tracer records one.
+
+     1  DST+trc:GPR# DST+trc:GPR# SRC+trc:SYS
+        verdict: REFERENCE GAP -- NOT A TRACER DEFECT
+        mrrs, the 128-bit system-register read pair; same modelling gap.
+
+     1  DST+trc:SYS SRC+trc:GPR# SRC+trc:GPR#
+        verdict: REFERENCE GAP -- NOT A TRACER DEFECT
+        msrr, same.
+
+     1  DST+trc:SYS SRC+trc:ZERO
+        verdict: REFERENCE GAP -- NOT A TRACER DEFECT
+        msr <pstatefield>, #imm; the extractor produced no effect for it.
+
+     1  SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:SYS
+        verdict: TRACER MISSES SIX READS
+        st64bv, same class.
+
+     1  DST+ref:GPR# SRC+ref:SYS SRC+trc:GPR#
+        verdict: MIXED
+        sysl writes its result into Xt from a system register; the tracer
+        has the direction of Xt inverted.
+
+     1  DST+ref:SYS SRC+ref:GPR#
+        verdict: REPRESENTATIVE ARTIFACT
+        tlbi vmalle1is: the chosen representative encoding carries Rt=28 in
+        a field the alias requires to be 0b11111, so the reference reads an
+        X register the real encoding does not have.
+
+     1  SRC+ref:MATRIX
+        verdict: TRACER MISSES A READ
+        movt zt0[8], x2 writes one slice of ZT0 and preserves the rest.
+
+     1  SRC+trc:VEC#
+        verdict: TRACER INVENTS A READ
+        pmov Zd, Pn.B writes the whole destination.
+
+     1  SRC+ref:GPR#
+        verdict: TRACER MISSES A READ
+        psel takes the slice index from w12; the tracer omits the GPR.
+
+     1  DST+ref:MATRIX SRC+trc:MATRIX
+        verdict: TRACER HAS THE DIRECTION BACKWARDS
+        zero {za0.d} writes ZA; the tracer records a read and no write.
+
+TIER B -- architectural state outside the tracer's register space
+(execution-context PSTATE bits and the PC; excluded from the verdict
+ above, counted here so nothing is hidden)
+  PSTATE.SM        760 rows
+  PSTATE.EL        380 rows
+  PSTATE.UAO       134 rows
+  IP               68 rows
+  PSTATE.A         2 rows
+
+BY INSTRUCTION CLASS
+  (none)           4 rows  agree     0 (  0.0%)  disagree     4
+  advsimd        696 rows  agree   513 ( 73.7%)  disagree   183
+  float          218 rows  agree   132 ( 60.6%)  disagree    86
+  fpsimd          89 rows  agree    89 (100.0%)  disagree     0
+  general        921 rows  agree   720 ( 78.2%)  disagree   201
+  mortlach        54 rows  agree    45 ( 83.3%)  disagree     9
+  mortlach2      501 rows  agree   292 ( 58.3%)  disagree   209
+  post-2022-12   106 rows  agree   106 (100.0%)  disagree     0
+  sve            788 rows  agree   516 ( 65.5%)  disagree   272
+  sve2           459 rows  agree   326 ( 71.0%)  disagree   133
+  system          84 rows  agree    40 ( 47.6%)  disagree    44
+
+METHOD
+------
+The reference is the rank-1 source for this ISA: the Arm MRA
+ISA_A64_xml_A_profile-2022-12 instruction pseudocode, read as pseudocode
+rather than as prose.  For each of the 3,920 opcode subjects the
+representative encoding's field bits are extracted from the regdiagram, the
+decode ASL is evaluated CONCRETELY against those bits, and the execute ASL
+is then partially evaluated with register and memory contents held unknown.
+A branch on an unknown condition executes both arms and unions their
+effects -- that is ruling R5 mechanised: a conditional form names every
+candidate operand, and an inert write is still a write.  Shared-library
+functions are inlined (ConditionHolds, FPAdd, FPProcessException, IsMerging,
+BranchTo, ...) so implicit reads reach the answer; the exception-delivery,
+address-translation, debug, profiling and trap-check families are cut, and
+the cut is enumerated in mra_ref.CUT_PREFIXES / CUT_EXACT.
+
+The tracer side is  build/contrib/plugins/isaxcheck --isa=aarch64
+--layer=fields --hex=<bytes>, whose SRC{}/DST{} lines are the tracer's own
+InsnFields via decode_detail_to_generic().  Rows where the zero register was
+in question were re-probed with --keep-zero, which did not change the answer.
+
+Both sides are canonicalised to full-width names before comparison (R4):
+x29 -> FP_REG, x30 -> LR, x31 -> ZERO, and the w/x and b/h/s/d/q views
+collapse onto their register.  A sub-register difference is therefore never
+a disagreement.  LLVM MC (rank 2) is carried on every row as an independent
+third column and supplies the reference for the 106 post-2022-12 encodings
+the 2022-12 MRA does not name.
+
+LIVENESS.  The A64 pseudocode routinely reads a destination register into a
+scratch variable and writes it back.  Taken literally, LD1 {V4.4S},[X3]
+would read V4.  A read is dropped when its value is never consumed, or when
+the variable it feeds is written back to the same register with every bit
+overwritten on a path that certainly executes.  Both halves are needed:
+single-lane LD1, merging-predicated SVE and the accumulating dot-product
+forms keep their read, and they do -- verified row by row.
+
+POWER
+-----
+Every one of the 2,746 agreeing rows that had a non-empty operand set was
+perturbed (one source dropped, or a phantom destination planted) and
+re-compared: all 2,746 flipped to disagree.  The 35 that did not flip are
+the rows with nothing to perturb.  The instrument fires.
+
+LIMITATIONS AND BLIND SPOTS
+---------------------------
+* 4,781 of 4,781 instruction ASL sections (decode, postdecode, execute)
+  parse.  35 of 1,284 shared-library functions do not; 4 of those are
+  inline-eligible AND touch a register -- RCWCheck, FPRecipEstimate, and the
+  DBGDTRRX_EL0 / DBGDTRTX_EL0 accessors.  Rows whose semantics run through
+  them may under-report an FPSR write or a debug-register access.  That
+  under-reports the reference; it cannot manufacture a tracer defect.
+* The vector length is pinned to 512 bits, the smallest value at which every
+  architectural element index is in range.  No register INDEX in the A64
+  pseudocode depends on it.
+* 879 rows contain a loop whose trip count is not decode-constant; the body
+  runs once with an unknown index.  ZERO rows ended with an unresolved
+  register index.
+* 250 rows address a ZA slice through a runtime GPR value.  Both models name
+  ZA index-free (REG_MATRIX), so the comparison is unaffected.
+* 106 rows (post-2022-12 architecture additions) are probed against rank 2,
+  LLVM MC, only -- there is no rank-1 entry for them.  All 106 agree; that
+  agreement is weaker evidence than the other 3,814.
+* Optional subsystems that attach state to OTHER instructions (branch
+  records, statistical profiling, MPAM, nested virtualization) are switched
+  off, enumerated in aslinterp.FEATURE_OFF.  Instruction EXISTENCE features
+  are never switched off.
+* 5 rows are reference gaps, not tracer defects: the 128-bit system
+  instruction/register pair forms (sysp, tlbip, mrrs, msrr) and msr
+  <pstatefield>,#imm, whose execute ASL bottoms out in an operation this
+  extractor does not model.  1 row (tlbi vmalle1is) is a representative-
+  encoding artifact.  Both are named in the signature table.

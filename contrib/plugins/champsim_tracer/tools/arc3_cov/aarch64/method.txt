@@ -1,0 +1,72 @@
+
+METHOD
+------
+The reference is the rank-1 source for this ISA: the Arm MRA
+ISA_A64_xml_A_profile-2022-12 instruction pseudocode, read as pseudocode
+rather than as prose.  For each of the 3,920 opcode subjects the
+representative encoding's field bits are extracted from the regdiagram, the
+decode ASL is evaluated CONCRETELY against those bits, and the execute ASL
+is then partially evaluated with register and memory contents held unknown.
+A branch on an unknown condition executes both arms and unions their
+effects -- that is ruling R5 mechanised: a conditional form names every
+candidate operand, and an inert write is still a write.  Shared-library
+functions are inlined (ConditionHolds, FPAdd, FPProcessException, IsMerging,
+BranchTo, ...) so implicit reads reach the answer; the exception-delivery,
+address-translation, debug, profiling and trap-check families are cut, and
+the cut is enumerated in mra_ref.CUT_PREFIXES / CUT_EXACT.
+
+The tracer side is  build/contrib/plugins/isaxcheck --isa=aarch64
+--layer=fields --hex=<bytes>, whose SRC{}/DST{} lines are the tracer's own
+InsnFields via decode_detail_to_generic().  Rows where the zero register was
+in question were re-probed with --keep-zero, which did not change the answer.
+
+Both sides are canonicalised to full-width names before comparison (R4):
+x29 -> FP_REG, x30 -> LR, x31 -> ZERO, and the w/x and b/h/s/d/q views
+collapse onto their register.  A sub-register difference is therefore never
+a disagreement.  LLVM MC (rank 2) is carried on every row as an independent
+third column and supplies the reference for the 106 post-2022-12 encodings
+the 2022-12 MRA does not name.
+
+LIVENESS.  The A64 pseudocode routinely reads a destination register into a
+scratch variable and writes it back.  Taken literally, LD1 {V4.4S},[X3]
+would read V4.  A read is dropped when its value is never consumed, or when
+the variable it feeds is written back to the same register with every bit
+overwritten on a path that certainly executes.  Both halves are needed:
+single-lane LD1, merging-predicated SVE and the accumulating dot-product
+forms keep their read, and they do -- verified row by row.
+
+POWER
+-----
+Every one of the 2,746 agreeing rows that had a non-empty operand set was
+perturbed (one source dropped, or a phantom destination planted) and
+re-compared: all 2,746 flipped to disagree.  The 35 that did not flip are
+the rows with nothing to perturb.  The instrument fires.
+
+LIMITATIONS AND BLIND SPOTS
+---------------------------
+* 4,781 of 4,781 instruction ASL sections (decode, postdecode, execute)
+  parse.  35 of 1,284 shared-library functions do not; 4 of those are
+  inline-eligible AND touch a register -- RCWCheck, FPRecipEstimate, and the
+  DBGDTRRX_EL0 / DBGDTRTX_EL0 accessors.  Rows whose semantics run through
+  them may under-report an FPSR write or a debug-register access.  That
+  under-reports the reference; it cannot manufacture a tracer defect.
+* The vector length is pinned to 512 bits, the smallest value at which every
+  architectural element index is in range.  No register INDEX in the A64
+  pseudocode depends on it.
+* 879 rows contain a loop whose trip count is not decode-constant; the body
+  runs once with an unknown index.  ZERO rows ended with an unresolved
+  register index.
+* 250 rows address a ZA slice through a runtime GPR value.  Both models name
+  ZA index-free (REG_MATRIX), so the comparison is unaffected.
+* 106 rows (post-2022-12 architecture additions) are probed against rank 2,
+  LLVM MC, only -- there is no rank-1 entry for them.  All 106 agree; that
+  agreement is weaker evidence than the other 3,814.
+* Optional subsystems that attach state to OTHER instructions (branch
+  records, statistical profiling, MPAM, nested virtualization) are switched
+  off, enumerated in aslinterp.FEATURE_OFF.  Instruction EXISTENCE features
+  are never switched off.
+* 5 rows are reference gaps, not tracer defects: the 128-bit system
+  instruction/register pair forms (sysp, tlbip, mrrs, msrr) and msr
+  <pstatefield>,#imm, whose execute ASL bottoms out in an operation this
+  extractor does not model.  1 row (tlbi vmalle1is) is a representative-
+  encoding artifact.  Both are named in the signature table.

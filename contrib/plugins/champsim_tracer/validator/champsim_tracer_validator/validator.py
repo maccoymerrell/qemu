@@ -2899,6 +2899,87 @@ def _riscv_is_mask_dst(mnem: str) -> bool:
     return len(mnem) > 5 and mnem[1] == "m" and mnem.endswith(".mm")
 
 
+def _riscv_is_vector_encoding(raw: bytes) -> bool:
+    """Mirror `cap_riscv_is_vector_encoding` — the RVV encoding space.
+
+    OP-V, the vector widths of LOAD-FP / STORE-FP, and OP-VE (the
+    vector-crypto major opcode, always funct3 = OPMVV)."""
+    if len(raw) != 4:
+        return False
+    word = int.from_bytes(raw[:4], "little")
+    major = word & 0x7f
+    if major == 0x57:
+        return True
+    if major == 0x77:
+        return ((word >> 12) & 0x7) == 0x2
+    if major in (0x07, 0x27):
+        return ((word >> 12) & 0x7) in (0, 5, 6, 7)
+    return False
+
+
+def _riscv_is_vector_reg(reg: int) -> bool:
+    """Mirror `cap_riscv_is_vector_reg` — the three riscv_reg vector runs."""
+    return (10 <= reg <= 41) or (171 <= reg <= 198) or (214 <= reg <= 458)
+
+
+def _riscv_fp_signals(mnem: str, raw: bytes) -> bool:
+    """Mirror `cap_riscv_fp_signals` — does this touch fflags?"""
+    if len(raw) != 4:
+        return False
+    word = int.from_bytes(raw[:4], "little")
+    major = word & 0x7f
+    if major in (0x43, 0x47, 0x4b, 0x4f):
+        return True
+    if major == 0x53:
+        return ((word >> 27) & 0x1f) not in (0x04, 0x1c, 0x1e)
+    if major == 0x57:
+        if ((word >> 12) & 0x7) not in (0x1, 0x5):
+            return False
+        return not mnem.startswith(("vfsgnj", "vfslide1", "vfmv",
+                                    "vfmerge", "vfclass"))
+    return False
+
+
+def _riscv_reads_vxrm(mnem: str) -> bool:
+    return mnem.startswith(("vaadd", "vasub", "vssra", "vssrl",
+                            "vsmul", "vnclip"))
+
+
+def _riscv_writes_vxsat(mnem: str) -> bool:
+    return mnem.startswith(("vsadd", "vssub", "vsmul", "vnclip"))
+
+
+def _riscv_alias_reads_x0(mnem: str, size: int) -> bool:
+    """Mirror `cap_riscv_alias_reads_x0` — the aliases that hide an x0
+    SOURCE.  `mv` only in its compressed form (`c.mv rd, rs2` is
+    `add rd, x0, rs2`; the 32-bit `mv` is `addi rd, rs, 0`)."""
+    if size == 2 and mnem == "mv":
+        return True
+    return mnem in ("li", "neg", "negw", "snez", "sltz", "sgtz", "zext.w",
+                    "beqz", "bnez", "blez", "bgez", "bltz", "bgtz")
+
+
+def _riscv_is_tied_vd(mnem: str) -> bool:
+    if not mnem.startswith("v"):
+        return False
+    if mnem in ("vmv.s.x", "vfmv.s.f"):
+        return True
+    return any(k in mnem for k in ("macc", "madd", "msac", "msub"))
+
+
+def _riscv_is_tied_rd(mnem: str) -> bool:
+    if mnem.startswith("amocas."):
+        return True
+    return mnem.startswith("cv.") and len(mnem) > 5 and mnem.endswith("nr")
+
+
+def _riscv_reads_v0_mask(mnem: str) -> bool:
+    if not mnem.startswith("v") or len(mnem) < 5:
+        return False
+    return mnem[-1] == "m" and mnem[-3] == "v" and mnem[-4] == "." \
+        and mnem[-2] in ("v", "x", "i", "f")
+
+
 def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
                                 add, exp_src: set, exp_dst: set) -> None:
     """Mirror the decode-boundary corrections in `disas/capstone.c`.
@@ -3061,12 +3142,133 @@ def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
         if _riscv_reads_dynamic_frm(raw):
             add(exp_src, _rv.RISCV_REG_FRM)
         # A mask destination is read as well as written, whatever the
-        # runtime tail policy says.
-        if _riscv_is_mask_dst(mnem):
+        # runtime tail policy says; the RVV multiply-accumulates and the
+        # scalar tied-destination families (Zacas amocas.*, CORE-V
+        # cv.*nr) arrive with their destination READ-only and have their
+        # write restored.
+        if (_riscv_is_mask_dst(mnem) or _riscv_is_tied_vd(mnem)
+                or _riscv_is_tied_rd(mnem)):
             for op in ops:
                 if op.type == op_reg_kind:
                     add(exp_src, op.reg)
+                    add(exp_dst, op.reg)
                     break
+        # The unconditionally-masked carry / merge family reads v0 as
+        # DATA; neither Capstone nor LLVM reports it.
+        if _riscv_reads_v0_mask(mnem):
+            add(exp_src, _rv.RISCV_REG_V0)
+        vec_enc = _riscv_is_vector_encoding(raw)
+        if vec_enc:
+            # An RVV vector DESTINATION is also a source: tail-
+            # undisturbed, mask-undisturbed and prestart each leave part
+            # of vd standing, and all three are settled at runtime.
+            for op in ops:
+                if (op.type == op_reg_kind
+                        and int(getattr(op, "access", 0) or 0) & 2
+                        and _riscv_is_vector_reg(int(op.reg))):
+                    add(exp_src, op.reg)
+            # A segment load or store names nf consecutive vector
+            # registers (encoding bits 31:29, biased).  The whole-
+            # register forms put nf in the same field but arrive as one
+            # grouped Capstone register id, so the expansion is gated on
+            # the operand naming a SINGLE vector register.
+            word = int.from_bytes(raw[:4], "little")
+            nf = ((word >> 29) & 0x7) + 1
+            if (word & 0x7f) in (0x07, 0x27) and nf > 1 and ops \
+                    and ops[0].type == op_reg_kind \
+                    and _rv.RISCV_REG_V0 <= int(ops[0].reg) \
+                    <= _rv.RISCV_REG_V31:
+                base = int(ops[0].reg)
+                acc = int(getattr(ops[0], "access", 0) or 0)
+                for k in range(1, nf):
+                    if base + k > _rv.RISCV_REG_V31:
+                        break
+                    # The appended fields inherit the base operand's
+                    # access AFTER the vd-as-source correction above: a
+                    # segment load's fields are read and written, a
+                    # segment store's are read only.
+                    add(exp_src, base + k)
+                    if acc & 2:
+                        add(exp_dst, base + k)
+            # Every RVV instruction reads vl/vtype and WRITES vstart;
+            # vsetvl* writes the configuration instead of consuming it.
+            if mnem.startswith("v") and not mnem.startswith("vsetvl"):
+                exp_src.add("REG_VCTRL")
+                exp_dst.add("REG_VCTRL")
+            # The fixed-point rounding mode and saturation flag.
+            if _riscv_reads_vxrm(mnem):
+                exp_src.add("REG_FCSR")
+            if _riscv_writes_vxsat(mnem):
+                exp_src.add("REG_FCSR")
+                exp_dst.add("REG_FCSR")
+        # fflags is ACCUMULATED by every FP operation that can signal.
+        if _riscv_fp_signals(mnem, raw):
+            exp_src.add("REG_FCSR")
+            exp_dst.add("REG_FCSR")
+        # The x0 an assembler alias spells out of existence.
+        if _riscv_alias_reads_x0(mnem, len(raw)):
+            add(exp_src, _rv.RISCV_REG_X0)
+        # Zimop reads nothing, and Zicfiss is carved out of it.  Both
+        # sets are rebuilt, because the correction REMOVES the phantom
+        # x0 operands Capstone reports for the cover encoding.
+        if len(raw) == 4:
+            word = int.from_bytes(raw[:4], "little")
+            if (word & 0x7f) == 0x73 and ((word >> 12) & 0x7) == 0x4 \
+                    and (word >> 31) == 1:
+                rd = (word >> 7) & 0x1f
+                rs1 = (word >> 15) & 0x1f
+                rs2 = (word >> 20) & 0x1f
+                csr12 = (word >> 20) & 0xfff
+                push = ((word >> 25) & 0x7f) == 0x67 and rs1 == 0 \
+                    and rd == 0 and rs2 in (1, 5)
+                popchk = csr12 == 0xcdc and rd == 0 and rs1 in (1, 5)
+                rdp = csr12 == 0xcdc and rs1 == 0 and rd != 0
+                exp_src.clear()
+                exp_dst.clear()
+                if push or popchk:
+                    add(exp_src, _rv.RISCV_REG_SSP)
+                    add(exp_dst, _rv.RISCV_REG_SSP)
+                    add(exp_src, _rv.RISCV_REG_X0 + (rs2 if push else rs1))
+                elif rdp:
+                    add(exp_src, _rv.RISCV_REG_SSP)
+                    add(exp_dst, _rv.RISCV_REG_X0 + rd)
+                elif rd != 0:
+                    add(exp_dst, _rv.RISCV_REG_X0 + rd)
+        if len(raw) == 2:
+            half = int.from_bytes(raw[:2], "little")
+            if half in (0x6081, 0x6281):
+                exp_src.clear()
+                exp_dst.clear()
+                add(exp_src, _rv.RISCV_REG_SSP)
+                add(exp_dst, _rv.RISCV_REG_SSP)
+                add(exp_src, _rv.RISCV_REG_X0 + (1 if half == 0x6081 else 5))
+        # A trap return reads the PC it returns to and rewrites the
+        # status word; `fence` reads menvcfg.FIOM, which changes what it
+        # orders; `lpad` reads the label in x7 and consumes ELP.
+        if mnem == "mret":
+            exp_src.add("REG_SYS")
+            exp_dst.add("REG_SYS")
+        elif mnem == "sret":
+            exp_src.add("REG_SYS")
+            exp_dst.add("REG_SYS")
+        elif mnem == "fence":
+            exp_src.add("REG_SYS")
+        elif mnem == "lpad":
+            add(exp_src, _rv.RISCV_REG_X7)
+            exp_src.add("REG_SYS")
+            exp_dst.add("REG_SYS")
+        # amocas.q names two register PAIRS; Capstone reports only the
+        # even register of each, and its structured operand order puts
+        # the memory operand between them.
+        if mnem == "amocas.q":
+            regs = [int(op.reg) for op in ops if op.type == op_reg_kind]
+            if len(regs) >= 2:
+                rd, rs2 = regs[0], regs[1]
+                if _rv.RISCV_REG_X0 <= rd < _rv.RISCV_REG_X31:
+                    add(exp_src, rd + 1)
+                    add(exp_dst, rd + 1)
+                if _rv.RISCV_REG_X0 <= rs2 < _rv.RISCV_REG_X31:
+                    add(exp_src, rs2 + 1)
 
     elif isa == "mipsel":
         # Tied destinations: bit-field insert, lane insert/shuffle,

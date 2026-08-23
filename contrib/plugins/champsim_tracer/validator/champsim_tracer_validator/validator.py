@@ -3479,6 +3479,29 @@ def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
             add(written, int(ops[0].reg))
             exp_src -= written
             exp_dst |= written
+        # The CP0 state the exception an instruction RAISES writes (R7.6).
+        # A later `mfc0` of EPC / Cause / Status must wait on the faulting
+        # instruction's write, so the edge is real and the boundary records
+        # it; Capstone names none of it.  syscall, break and the twelve
+        # conditional traps reach set_EPC, which read-modify-writes Status
+        # and Cause and writes EPC; sdbbp raises EXCP_DBp instead and
+        # carries the EJTAG Debug/DEPC pair on top, and NOT EPC.
+        # Mirrored rather than skipped, so the oracle would catch the
+        # boundary dropping this instead of going quiet.
+        _trap = ("syscall", "break", "teq", "teqi", "tge", "tgei", "tgeiu",
+                 "tgeu", "tlt", "tlti", "tltiu", "tltu", "tne", "tnei")
+        if mnem in _trap or mnem == "break16":
+            for _r in (_cs.mips.MIPS_REG_COP012, _cs.mips.MIPS_REG_COP013):
+                add(exp_src, _r)
+                add(exp_dst, _r)
+            add(exp_dst, _cs.mips.MIPS_REG_COP014)
+        elif mnem in ("sdbbp", "sdbbp16"):
+            for _r in (_cs.mips.MIPS_REG_COP012, _cs.mips.MIPS_REG_COP013,
+                       _cs.mips.MIPS_REG_COP023):
+                add(exp_src, _r)
+            for _r in (_cs.mips.MIPS_REG_COP013, _cs.mips.MIPS_REG_COP023,
+                       _cs.mips.MIPS_REG_COP024):
+                add(exp_dst, _r)
 
     elif isa == "x86_64":
         # Match the STEM, not the mnemonic: Capstone puts prefix words inside

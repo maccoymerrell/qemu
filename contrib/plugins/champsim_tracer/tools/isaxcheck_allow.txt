@@ -5016,11 +5016,13 @@ mipsel R-rd-phantom trunc.w.s +cop#
 mipsel R-wr-phantom trunc.w.s +cop#
 
 # =====================================================================
-# mipsel -- the CP0 registers a system-control instruction OWNS
+# mipsel -- the CP0 registers an instruction OWNS, and the CP0 state the
+# exception it RAISES writes
 # =====================================================================
 #
 # WHAT: the boundary reports a CP0 register on the TLB and CP0-control
-# instructions; LLVM reports none.
+# instructions, and on the instructions whose architectural effect is to
+# raise an exception; LLVM reports none on either.
 #
 # WHY IT IS NOT A TRACER DEFECT: CP0 access is the entire architectural
 # effect of these instructions, and QEMU's helpers name the registers one
@@ -5028,16 +5030,39 @@ mipsel R-wr-phantom trunc.w.s +cop#
 # and reads Index (target/mips/tcg/system/tlb_helper.c:240),
 # exception_return reads Status/EPC/ErrorEPC and clears EXL,
 # helper_dvpe/evpe read-modify-write MVPControl.  LLVM's MIPS descriptors
-# carry no implicit CP0 list at all.  This is NOT the footprint of an
-# exception: the trap forms (syscall / break / sdbbp / t*) are
-# deliberately absent, because by that rule every load that can miss the
-# TLB would name CP0 too.  The tracer folds every CP0 register onto one
-# REG_SYS bucket, so the CP0 number chosen at the boundary describes the
-# access rather than being individually resolvable.
+# carry no implicit CP0 list at all.
 #
-# HOW TO DELETE: if LLVM MC grows implicit CP0 lists for these the
-# signatures stop appearing and the dead-rule arm fails.  Spot-check with
-# `--hex=02000042` (`tlbwi`) and `--hex=18000042` (`eret`).
+# THE SECOND CLASS is the exception an instruction RAISES.  R7.6: a later
+# `mfc0` of EPC, Cause or Status must wait on the faulting instruction's
+# write, so that is an edge a renaming regfile has to respect and it is
+# recorded.  syscall, break and the twelve conditional traps reach
+# `set_EPC:` (tlb_helper.c:1420-1456), which read-modify-writes Status and
+# Cause and writes EPC; sdbbp raises EXCP_DBp instead and reaches
+# enter_debug_mode (:1204-1233), so it names Debug and DEPC on top and NOT
+# EPC.  R4 covers the conditional members -- the write is a candidate
+# whether or not the comparison fires -- and user mode, where it never
+# happens, is the same inert case.
+#
+# The line is drawn at instructions that RAISE, not at instructions that
+# can FAULT.  A load's architectural effect is the load; the fault is a
+# property of the address it computed.  Admitting it would put the
+# exception file in the set of every memory instruction, and then of every
+# instruction, since any of them can take a bus error -- a manufactured
+# edge of exactly the class R8.1 forbids.
+#
+# CP0 is no longer one bucket: since the split these numbers resolve by
+# register number into REG_SYSMMU, REG_SYSEXC, REG_SYSDBG and the residual
+# REG_SYS, so the number the boundary names is the register QEMU names and
+# the class is a consequence of it.
+#
+# HOW TO DELETE: if LLVM MC grows implicit CP0 lists for the first class
+# the signatures stop appearing and the dead-rule arm fails.  The trap
+# rows are the exception to that: LLVM will not start modelling MIPS
+# exception entry, so they go only if the tracer stops recording the
+# footprint, and R7.6 says it should not.  Spot-check with
+# `--hex=02000042` (`tlbwi`), `--hex=18000042` (`eret`), `--hex=0c000000`
+# (`syscall`) and `--hex=3f000070` (`sdbbp`, the row that names two
+# classes).
 mipsel R-rd-phantom deret +cop#
 mipsel R-wr-phantom deret +cop#
 mipsel R-rd-phantom dvpe +cop#
@@ -5055,6 +5080,36 @@ mipsel R-wr-phantom tlbr +cop#
 mipsel R-rd-phantom tlbwi +cop#
 mipsel R-rd-phantom tlbwr +cop#
 mipsel R-rd-phantom wait +cop#
+mipsel R-rd-phantom break +cop#
+mipsel R-wr-phantom break +cop#
+mipsel R-rd-phantom sdbbp +cop#
+mipsel R-wr-phantom sdbbp +cop#
+mipsel R-rd-phantom syscall +cop#
+mipsel R-wr-phantom syscall +cop#
+mipsel R-rd-phantom teq +cop#
+mipsel R-wr-phantom teq +cop#
+mipsel R-rd-phantom teqi +cop#
+mipsel R-wr-phantom teqi +cop#
+mipsel R-rd-phantom tge +cop#
+mipsel R-wr-phantom tge +cop#
+mipsel R-rd-phantom tgei +cop#
+mipsel R-wr-phantom tgei +cop#
+mipsel R-rd-phantom tgeiu +cop#
+mipsel R-wr-phantom tgeiu +cop#
+mipsel R-rd-phantom tgeu +cop#
+mipsel R-wr-phantom tgeu +cop#
+mipsel R-rd-phantom tlt +cop#
+mipsel R-wr-phantom tlt +cop#
+mipsel R-rd-phantom tlti +cop#
+mipsel R-wr-phantom tlti +cop#
+mipsel R-rd-phantom tltiu +cop#
+mipsel R-wr-phantom tltiu +cop#
+mipsel R-rd-phantom tltu +cop#
+mipsel R-wr-phantom tltu +cop#
+mipsel R-rd-phantom tne +cop#
+mipsel R-wr-phantom tne +cop#
+mipsel R-rd-phantom tnei +cop#
+mipsel R-wr-phantom tnei +cop#
 
 # =====================================================================
 # mipsel -- the MT ASE far operand's register FILE

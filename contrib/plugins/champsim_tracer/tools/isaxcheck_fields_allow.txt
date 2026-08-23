@@ -2883,14 +2883,31 @@ x86_64 FR-wr-phantom rdrandl +REG_FLAGS,REG_SP
 #               (SET_FP_CAUSE, target/mips/cpu.h:83) and reads
 #               GET_FP_ENABLE from it; update_msacsr() is the same shape.
 #               LLVM's MIPS tables model no FP status register at all.
-#   +REG_SYS    the CP0 registers the TLB and control instructions own --
-#               NOT the footprint of an exception, which is why the trap
-#               forms are absent.  QEMU's helpers name them one at a time.
+#   +REG_SYS*   the CP0 registers an instruction owns, in the class the
+#               split put them in -- REG_SYSMMU for the TLB file,
+#               REG_SYSEXC for Status/Cause/EPC, REG_SYSDBG for the EJTAG
+#               file.  QEMU's helpers name them one at a time.
+#   +REG_SYSEXC the footprint of the exception an instruction RAISES
+#     on traps   (R7.6): syscall, break and the twelve conditional traps
+#               reach set_EPC, which read-modify-writes Status and Cause
+#               and writes EPC (tlb_helper.c:1420-1456).  sdbbp raises
+#               EXCP_DBp instead and carries REG_SYSDBG on top, which is
+#               why its row is the one that names two ids.  LLVM MC
+#               models no exception footprint on any of them, so every
+#               one of these is a phantom on both sides -- the read and
+#               the write, because the model is a read-modify-write.
+#               This is NOT extended to instructions that can merely
+#               FAULT; see the reasoning at the switch in disas/capstone.c.
 #   mftr/mttr   the MT ASE far operand, reported in the file the (u, sel)
 #               pair selects instead of as a GPR.  The paired phantom and
 #               missing entries are ONE operand reclassified.
 #   lwle/lwre   the EVA unaligned loads merge into $rt, so $rt is a read;
 #               LLVM's MCInstrDesc agrees, only its MCInst drops the tie.
+#
+# The trap block below is the ONE place a deletion here would be wrong:
+# LLVM will not start modelling MIPS exception entry, so these rows do not
+# expire the way the FCR31 ones would.  They go when the tracer stops
+# recording the footprint, and R7.6 says it should not.
 #
 # HOW TO DELETE: each of these disappears exactly when LLVM MC starts
 # modelling the fact, at which point the gate's dead-rule arm fails on
@@ -3291,6 +3308,36 @@ mipsel FR-wr-phantom tlbr +REG_SYSMMU
 mipsel FR-rd-phantom tlbwi +REG_SYSMMU
 mipsel FR-rd-phantom tlbwr +REG_SYSMMU
 mipsel FR-rd-phantom wait +REG_SYSEXC
+mipsel FR-rd-phantom break +REG_SYSEXC
+mipsel FR-wr-phantom break +REG_SYSEXC
+mipsel FR-rd-phantom syscall +REG_SYSEXC
+mipsel FR-wr-phantom syscall +REG_SYSEXC
+mipsel FR-rd-phantom teq +REG_SYSEXC
+mipsel FR-wr-phantom teq +REG_SYSEXC
+mipsel FR-rd-phantom teqi +REG_SYSEXC
+mipsel FR-wr-phantom teqi +REG_SYSEXC
+mipsel FR-rd-phantom tge +REG_SYSEXC
+mipsel FR-wr-phantom tge +REG_SYSEXC
+mipsel FR-rd-phantom tgei +REG_SYSEXC
+mipsel FR-wr-phantom tgei +REG_SYSEXC
+mipsel FR-rd-phantom tgeiu +REG_SYSEXC
+mipsel FR-wr-phantom tgeiu +REG_SYSEXC
+mipsel FR-rd-phantom tgeu +REG_SYSEXC
+mipsel FR-wr-phantom tgeu +REG_SYSEXC
+mipsel FR-rd-phantom tlt +REG_SYSEXC
+mipsel FR-wr-phantom tlt +REG_SYSEXC
+mipsel FR-rd-phantom tlti +REG_SYSEXC
+mipsel FR-wr-phantom tlti +REG_SYSEXC
+mipsel FR-rd-phantom tltiu +REG_SYSEXC
+mipsel FR-wr-phantom tltiu +REG_SYSEXC
+mipsel FR-rd-phantom tltu +REG_SYSEXC
+mipsel FR-wr-phantom tltu +REG_SYSEXC
+mipsel FR-rd-phantom tne +REG_SYSEXC
+mipsel FR-wr-phantom tne +REG_SYSEXC
+mipsel FR-rd-phantom tnei +REG_SYSEXC
+mipsel FR-wr-phantom tnei +REG_SYSEXC
+mipsel FR-rd-phantom sdbbp +REG_SYSDBG,REG_SYSEXC
+mipsel FR-wr-phantom sdbbp +REG_SYSDBG,REG_SYSEXC
 mipsel FR-rd-missing mftr +REG_FP_REG
 mipsel FR-rd-missing mftr +REG_GPR#
 mipsel FR-rd-missing mftr +REG_LR

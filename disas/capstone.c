@@ -6047,15 +6047,34 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
             }
         }
         /*
-         * The CP0 registers a system-control instruction names in its
-         * OWN definition.
+         * The CP0 registers an instruction names in its OWN definition,
+         * and the CP0 state written by the exception it RAISES.
          *
-         * These are not the registers an exception writes on the way to
-         * a handler -- that footprint belongs to the exception, and by
-         * the same rule every load that can miss the TLB would read and
-         * write CP0 too.  These are the instructions whose entire
-         * architectural effect IS a CP0 access, and QEMU's helpers name
-         * the registers one by one:
+         * Two classes, and the line between them is which instructions
+         * these are -- not which registers.
+         *
+         * (a) The instruction whose entire architectural effect IS a CP0
+         *     access: tlb*, di/ei, eret, deret, wait, dvpe/evpe, dmt/emt.
+         *
+         * (b) The instruction whose architectural effect IS to raise an
+         *     exception: syscall, break, sdbbp and the twelve conditional
+         *     traps.  R7.6 puts the state that exception writes in the
+         *     raising instruction's set, because a later `mfc0` of EPC,
+         *     Cause or Status must wait on the write -- an edge a
+         *     renaming regfile has to respect (R7).  R4 covers the
+         *     conditional members: `teq` names the write as a candidate
+         *     whether or not the comparison fires, and user mode, where
+         *     the write never happens at all, is the same inert case.
+         *
+         * A load that MISSES THE TLB is neither.  Its architectural
+         * effect is the load; the fault is a property of the address it
+         * computed, not of the instruction, and admitting it would put
+         * REG_SYSEXC in the set of every memory instruction -- and then,
+         * by the same argument, of every instruction, since any of them
+         * can take a bus error.  That is a manufactured edge of exactly
+         * the class R8.1 forbids, so the line is drawn at (b).
+         *
+         * QEMU's helpers name the registers one by one:
          *
          *   tlbwi / tlbwr        read Index, EntryHi, EntryLo0/1, PageMask
          *   tlbinv / tlbinvf     read Index, EntryHi
@@ -6081,20 +6100,75 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
          * and read-modify-write MVPControl, which is what the ASE says
          * dmt/emt do to VPEControl.
          *
-         * Capstone's implicit lists are empty for all of them, so today
-         * `eret` is an instruction with no inputs and no outputs and
-         * `tlbwi` reads nothing -- a kernel's whole TLB-refill path is
-         * dependency-free.  The registers named below all fold to the
-         * tracer's one REG_SYS bucket, so the specific CP0 number is
-         * chosen to describe the access rather than to be individually
-         * resolvable; the first register of each list is enough to carry
-         * the edge, and the second is added only where the read and the
-         * write are different registers.
+         * The exception footprint, from the same source -- the general
+         * entry path in target/mips/tcg/system/tlb_helper.c:
+         *
+         *   syscall (cause 8), break (cause 9) and teq/teqi/tge/tgei/
+         *   tgeiu/tgeu/tlt/tlti/tltiu/tltu/tne/tnei (EXCP_TRAP, cause 13)
+         *   all reach `set_EPC:` (:1420).  There it READS CP0_Status --
+         *   `if (!(env->CP0_Status & (1 << CP0St_EXL)))` is the gate on
+         *   the whole write, and Status.BEV then selects the vector --
+         *   and READ-MODIFY-WRITES it (`|= 1 << CP0St_EXL`); it
+         *   read-modify-writes CP0_Cause twice, once for the BD bit
+         *   (qatomic_or/qatomic_and, :1427-1430) and once for the
+         *   exception code (mips_cause_set_field, :1456, a cmpxchg loop
+         *   over the whole word -- target/mips/internal.h:172); and it
+         *   writes CP0_EPC (:1422).
+         *
+         *   sdbbp is NOT on that path.  It raises EXCP_DBp
+         *   (translate.c:13049 and :13454, both dispatches), which goes
+         *   to `set_DEPC:` / `enter_debug_mode:` (:1204-1233): DExcCode
+         *   is a read-modify-write of CP0_Debug, CP0_DEPC takes the
+         *   resume PC, and the BD clear is the same Status-gated
+         *   read-modify-write of CP0_Cause.  So its set is Debug and
+         *   DEPC on top of Status and Cause, and NOT EPC.
+         *
+         *   The microMIPS 16-bit forms carry their OWN Capstone ids and
+         *   are listed with their base forms.  `syscall` and the twelve
+         *   traps do not need this -- Mips_SYSCALL_MM and Mips_TEQ_MM map
+         *   onto MIPS_INS_SYSCALL and MIPS_INS_TEQ -- but Mips_BREAK16_MM
+         *   and Mips_SDBBP16_MM map onto MIPS_INS_BREAK16 and
+         *   MIPS_INS_SDBBP16 (MipsMappingInsn.inc:1433, :7463), so
+         *   omitting them would drop the footprint on a microMIPS guest.
+         *   Both are REACHABLE, measured rather than assumed: a per-word
+         *   sweep of the POOL16C page 0x4400-0x47ff in `cstool micromipsel`
+         *   decodes 16 `break16` encodings (0x4680-0x468f) and 16
+         *   `sdbbp16` (0x46c0-0x46cf).  isaxcheck's mipsel row is pinned to
+         *   CS_MODE_MIPS32R2 (isaxcheck.cc:331) and the plugin only ORs in
+         *   CS_MODE_MICRO for a microMIPS ELF, so the gate cannot exercise
+         *   these two ids; that is a gate limit, stated, not a claim that
+         *   they do not decode.
+         *
+         *   CP0_BadInstr (register 8, sel 1) is written for all fourteen
+         *   of the set_EPC members -- each sets update_badinstr and
+         *   set_badinstr_registers (:1043) stores the faulting word when
+         *   Config3.BI is set.  It is not named below because register 8
+         *   carries the same generic id as 12/13/14; naming it would add
+         *   a boundary phantom and no edge.
+         *
+         * Capstone's implicit lists are empty for all of these, so before
+         * this `eret` was an instruction with no inputs and no outputs,
+         * `tlbwi` read nothing -- a kernel's whole TLB-refill path was
+         * dependency-free -- and a `syscall` was ordered against nothing
+         * the handler that follows it reads.
+         *
+         * The CP0 file is no longer one bucket.  Since the split these
+         * numbers resolve by register number into REG_SYSMMU (0, 10),
+         * REG_SYSEXC (8, 12, 13, 14), REG_SYSDBG (23, 24) and REG_SYS
+         * (1), so each number below is the register QEMU actually names
+         * and the class it lands in is a consequence of that, not a
+         * convenience.  Where a read and a write are the same register
+         * it is named on both sides, because the model is a
+         * read-modify-write and not a clobber.
          *
          * Verify with `isaxcheck --isa=mipsel --hex=02000042` (`tlbwi`),
-         * whose `SRC{}` must name REG_SYS and whose `DST{}` must stay
-         * empty, and `--hex=18000042` (`eret`), which must name it in
-         * both.
+         * whose `SRC{}` must name REG_SYSMMU and whose `DST{}` must stay
+         * empty; `--hex=18000042` (`eret`), which must name REG_SYSEXC in
+         * both; `--hex=0c000000` (`syscall`) and `--hex=34008500`
+         * (`teq $4, $5`), whose `SRC{}` and `DST{}` must both carry
+         * REG_SYSEXC; and `--hex=3f000070` (`sdbbp`), which must carry
+         * REG_SYSDBG and REG_SYSEXC in both and is the row that proves
+         * the split is doing work.
          */
         switch (insn->id) {
         case MIPS_INS_TLBWI:
@@ -6139,6 +6213,38 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
         case MIPS_INS_EMT:
             cap_mips_add_implicit(out, handle, MIPS_REG_COP01, false);
             cap_mips_add_implicit(out, handle, MIPS_REG_COP01, true);
+            break;
+        /* (b) the exception an instruction raises -- set_EPC members */
+        case MIPS_INS_SYSCALL:
+        case MIPS_INS_BREAK:
+        case MIPS_INS_BREAK16:
+        case MIPS_INS_TEQ:
+        case MIPS_INS_TEQI:
+        case MIPS_INS_TGE:
+        case MIPS_INS_TGEI:
+        case MIPS_INS_TGEIU:
+        case MIPS_INS_TGEU:
+        case MIPS_INS_TLT:
+        case MIPS_INS_TLTI:
+        case MIPS_INS_TLTIU:
+        case MIPS_INS_TLTU:
+        case MIPS_INS_TNE:
+        case MIPS_INS_TNEI:
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP012, false);
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP013, false);
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP012, true);
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP013, true);
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP014, true);
+            break;
+        /* sdbbp raises EXCP_DBp, which is a different footprint */
+        case MIPS_INS_SDBBP:
+        case MIPS_INS_SDBBP16:
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP023, false);
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP012, false);
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP013, false);
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP023, true);
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP024, true);
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP013, true);
             break;
         default:
             break;

@@ -26,16 +26,16 @@ CSR_NUM_FOLD = {
     0x00F: 'REG_FCSR',   # vcsr
     0xC20: 'REG_VCTRL',  # vl
     0xC21: 'REG_VCTRL',  # vtype
-    0xC22: 'REG_SYS',    # vlenb
+    0xC22: 'REG_SYSID',  # vlenb (read-only implementation constant)
 }
 CSR_NAME_FOLD = {
     'fcsr': 'REG_FCSR', 'fflags': 'REG_FCSR', 'frm': 'REG_FCSR',
     'vcsr': 'REG_FCSR', 'vxsat': 'REG_FCSR', 'vxrm': 'REG_FCSR',
     'vstart': 'REG_VCTRL', 'vl': 'REG_VCTRL', 'vtype': 'REG_VCTRL',
-    'vlenb': 'REG_SYS',
-    # the tracer names the Zicfiss shadow-stack pointer REG_SP
-    # (champsim_tracer_mnemonics_riscv.h: RISCV_REG_SSP -> REG_SP)
-    'ssp': 'REG_SP',
+    'vlenb': 'REG_SYSID',
+    # the Zicfiss shadow-stack pointer has an ID of its own
+    # (champsim_tracer_mnemonics_riscv.h: RISCV_REG_SSP -> REG_SSP)
+    'ssp': 'REG_SSP',
 }
 
 def expand_group(eff, nf, nreg):
@@ -65,14 +65,16 @@ def expand_group(eff, nf, nreg):
 #
 # REF-ARTIFACT   the reference performs a read the ISA does not make this
 #                encoding depend on at all.
-# GATE-READ      the reference read decides whether the instruction is LEGAL
-#                (traps / is illegal / is virtual), not what it computes.  The
-#                tracer's InsnFields has no legality axis and records no such
-#                read on any ISA -- AArch64 CPACR/HCR trapping and x86
-#                CR4.OSXSAVE are the same shape and are likewise unrecorded --
-#                so recording them on RISC-V alone would be the inconsistency.
-#                OPEN QUESTION FOR THE MAINTAINER: should a CSR that only
-#                gates legality be recorded as a source?
+# (GATE-READ)    RETIRED.  This class held the reads that decide whether an
+#                instruction TRAPS -- vector FP frm, WFI's mstatus.TW, the
+#                Zicbom/Zicboz/Zicfiss envcfg enable bits -- on the argument
+#                that InsnFields has no legality axis.  R7.4 settled it the
+#                other way: a pending write to such a CSR must resolve before
+#                the instruction may proceed, which is an edge a renaming
+#                regfile has to respect, so it is a source.  The tracer
+#                records all 23 and they agree; there is no adjudication left
+#                to make and the entries are gone rather than left to match
+#                nothing.
 # SCOPE-XLATE    address translation, PMP/PMA and platform state: an
 #                enumerated scope exclusion (see SCOPE EXCLUSIONS above) that
 #                the tracer applies on its side.  The reference leaks it when
@@ -89,25 +91,6 @@ ADJUDICATED = [
      'execute_vsetvl_type computes lmul_sew_ratio from the OLD vtype '
      'unconditionally but uses it only when requires_fixed_vlmax '
      '(rd==x0 && rs1==x0), which this encoding is not'),
-
-    (('VFMVFS', 'VFMVSF', 'FVVTYPE', 'FVFTYPE', 'VFMERGE', 'VFMV',
-      'VFUNARY1'), r'^SRC-missing:REG_FCSR$', 'GATE-READ',
-     'the clause binds rm_3b = fcsr[FRM] at its head and passes it only to '
-     'illegal_fp_normal() / illegal_fp_vd_unmasked(), which raise Illegal '
-     'Instruction on a reserved rounding mode; sign-injection, a slide, a '
-     'move, a merge and a classify round nothing and signal nothing, so frm '
-     'is not a data input to any of them'),
-
-    (('ZICBOM', 'ZICBOZ'), r'^SRC-missing:REG_SYS$', 'GATE-READ',
-     'menvcfg/senvcfg/henvcfg CBIE/CBCFE/CBZE decide whether the cache-block '
-     'operation is legal at the current privilege '
-     '(feature_enabled_for_priv), not what it does'),
-    (('WFI',), r'^SRC-missing:REG_SYS$', 'GATE-READ',
-     'mstatus.TW decides whether WFI traps'),
-    (('SSPUSH', 'SSPOPCHK', 'SSRDP', 'C_SSPUSH', 'C_SSPOPCHK'),
-     r'^SRC-missing:REG_SYS$', 'GATE-READ',
-     'menvcfg.SSE is the Zicfiss enable bit; the ssp traffic itself is '
-     'recorded'),
 
     (('HLVTYPE', 'HSV'), r'^SRC-missing:REG_SYS$', 'SCOPE-XLATE',
      'hgatp/satp/vsatp/vsstatus/mstatus/hstatus/pma_regions -- the '

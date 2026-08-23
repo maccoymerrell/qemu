@@ -48,13 +48,34 @@ TLS_REGS = {'TPIDR_EL0', 'TPIDRRO_EL0'}
 #
 # These registers are never an operand of the instruction under any
 # reading.  They say whether the instruction is ENABLED and how the
-# address space is CONFIGURED; the answer is the same for every
-# instruction executed under one configuration, so recording them makes
-# every branch, every atomic and every tagged store depend on whatever
-# system register was written last.  Measured before this filter: 395 of
-# the 426 rows carrying a system-register read carried SCTLR_EL{1,2,3},
-# 355 carried TCR_EL3 -- read by the tag-check enable predicate on every
+# address space is CONFIGURED.  Measured before this filter: 395 of the
+# 426 rows carrying a system-register read carried SCTLR_EL{1,2,3}, 355
+# carried TCR_EL3 -- read by the tag-check enable predicate on every
 # atomic and by the PAC bit-width computation, not by the instruction.
+#
+# HALF OF THAT IS A BLIND SPOT AND NOT A CUT, and the half is the ENABLE
+# registers.  This filter used to justify itself with "recording them
+# makes every branch, every atomic and every tagged store depend on
+# whatever system register was written last".  R7.4 rules the dependency
+# REAL -- "if a write to the CSR would block that instruction due to a
+# dependency, it should be recorded" -- and R8.1 rules the objection a
+# MAPPING defect rather than a reason to drop the fact.  So CPACR_EL1 and
+# CPTR_EL{2,3} stay filtered ONLY because the tracer does not record them
+# yet, which keeps the two arms comparable; the filter is aligned to the
+# tracer here, not to the architecture, and that is the one place in this
+# reference where those differ.
+#
+# SIZE OF THE BLIND SPOT, measured 2026-08-23 by lifting the filter and
+# CUT_EXACT's FP/SVE/SME enable family together: 2,803 of the 3,810
+# probed subjects gain a SYS source -- 771 distinct mnemonics across
+# advsimd 696, sve 788, sve2 455, mortlach/mortlach2 555, float 218,
+# fpsimd 89, system 2 -- and NOT ONE of them already carries a SYS
+# source, so every one would be a new edge.  All 2,803 land on REG_SYS,
+# which on AArch64 is the whole system-register file bar NZCV, FPCR,
+# FPSR, FPMR, TPIDR and the 23 REG_SYSID constants.  That is R8.5's
+# shape at 280x the riscv64 scale, and R8.5 is why it is not implemented:
+# the file must be split before the ruling can be honoured without
+# manufacturing the edge R8.1 forbids.  Lift both filters to re-measure.
 #
 # Registers that ARE operands stay: GCR_EL1 (the tag exclusion mask ADDG
 # and IRG compute from), RGSR_EL1, GMID_EL1, DCZID_EL0, ELR_ELx / SPSR_ELx

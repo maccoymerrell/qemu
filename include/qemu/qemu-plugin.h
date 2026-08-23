@@ -1056,6 +1056,16 @@ char *qemu_plugin_insn_disas(const struct qemu_plugin_insn *insn);
  * one.  reg_name carries the printed name where the disassembler
  * supplies one.
  *
+ * x86 is the one ISA where there is no architectural encoding to put
+ * there: GDTR, MXCSR, the x87 control and tag words and SSP are named
+ * by the opcode itself and carry no register number, and the MSRs are
+ * numbered but selected at RUNTIME by ECX, so a decode cannot name
+ * one.  Those operands carry a boundary-local identification value
+ * instead (see cap_x86_sysreg in disas/capstone.c) and reg_name is
+ * the architectural name.  A consumer that needs to tell two apart
+ * must therefore compare reg_name on x86, not reg_id; what the
+ * dependency model schedules against is sysreg_class either way.
+ *
  * access is filled from the direction the instruction form implies
  * (MRS reads, MSR writes, Zicsr per its rd/rs1 suppression rules)
  * because Capstone leaves the AArch64 system operand's access bits
@@ -1100,6 +1110,23 @@ char *qemu_plugin_insn_disas(const struct qemu_plugin_insn *insn);
                                          * A read of one depends on
                                          * nothing, so it must not share
                                          * an ID with writable state. */
+#define QEMU_PLUGIN_SYSREG_MMU       6  /* the state address translation
+                                         * reads: x86 GDTR / IDTR / LDTR
+                                         * / TR, the descriptor tables a
+                                         * segment load and an interrupt
+                                         * walk. */
+#define QEMU_PLUGIN_SYSREG_TIMER     7  /* a counter that advances on its
+                                         * own: x86 TSC.  A read of one
+                                         * is ordered against writes to
+                                         * the counter, not against the
+                                         * rest of the privileged file. */
+#define QEMU_PLUGIN_SYSREG_SHADOWSTK 8  /* the shadow-stack pointer:
+                                         * x86 CET SSP, RISC-V Zicfiss
+                                         * ssp.  Same register on both,
+                                         * and its own dependency
+                                         * population -- neither the data
+                                         * stack pointer nor the link
+                                         * register. */
 
 /* Operand access mode (bitmask) */
 #define QEMU_PLUGIN_OP_ACC_READ  1

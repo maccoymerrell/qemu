@@ -702,8 +702,25 @@ void decode_detail_to_generic(uint64_t pc,
         return a;
     }();
 
+    /*
+     * "Does Capstone tell us the direction of this instruction's
+     * operands?"  Only the operands Capstone itself reported can
+     * answer that.  A QEMU_PLUGIN_OP_SYSREG operand is APPENDED by the
+     * boundary -- an x86 system register or a RISC-V CSR the encoding
+     * implies but the disassembler does not name -- and it always
+     * carries a boundary-derived access, so counting it here would let
+     * one appended operand switch the whole instruction out of the
+     * positional fallback and silently drop every register Capstone
+     * reported with access == 0.  Measured: without this exclusion,
+     * naming SSP on `rdsspq %rax` costs the %rax operand entirely
+     * (SRC{REG_GPR0} -> SRC{}), because Capstone reports that operand
+     * access == 0 and the fallback is what was placing it.
+     */
     bool have_access_info = false;
     for (uint8_t i = 0; i < info->n_operands && !have_access_info; i++) {
+        if (info->operands[i].type == QEMU_PLUGIN_OP_SYSREG) {
+            continue;
+        }
         if (info->operands[i].access != 0) {
             have_access_info = true;
         }

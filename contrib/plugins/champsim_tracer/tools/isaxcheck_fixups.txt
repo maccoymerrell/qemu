@@ -287,12 +287,17 @@ x86_64 W-wr-added fstpnce +REG_FPR#
 
 # CET shadow-stack ops.  Capstone reports their register operand with no
 # access bits at all (the `Z-access0` defect class), so the boundary loses
-# it; the ISA table supplies the edge.  Reached only once ModRM.reg joined
+# it; the ISA table supplies the edge.  rdsspd and rdsspq now supply the
+# SAME edge -- a WRITE of the destination -- because X86_INS_RDSSPQ was
+# classified GEN_OP_NOP and is now GEN_OP_MOV like its 32-bit sibling; the
+# positional fallback places the operand as a destination on both, where
+# before it placed rdsspq's as a source (`W-rd-added`).  RDSSPQ moves SSP
+# into a 64-bit register; it is not a NOP.  Reached only once ModRM.reg joined
 # the x86 sweep -- these live in the 0x0F 0x1E and 0x0F 0xAE groups, where
 # reg selects the operation.
-x86_64 W-rd-added rdsspq +REG_GPR#
 x86_64 W-rd-added umonitor +REG_GPR#
 x86_64 W-wr-added rdsspd +REG_GPR#
+x86_64 W-wr-added rdsspq +REG_GPR#
 
 # The rm half of the ModRM sweep reaches the rest of these same repairs.
 #
@@ -308,11 +313,11 @@ x86_64 W-rd-added nopq +REG_FP_REG
 x86_64 W-rd-added nopq +REG_SP
 x86_64 W-rd-added nopw +REG_FP_REG
 x86_64 W-rd-added nopw +REG_SP
-x86_64 W-rd-added rdsspq +REG_FP_REG
-x86_64 W-rd-added rdsspq +REG_SP
 x86_64 W-rd-added umonitor +REG_FP_REG
 x86_64 W-rd-added umonitor +REG_SP
 x86_64 W-wr-added rdsspd +REG_FP_REG
+x86_64 W-wr-added rdsspq +REG_FP_REG
+x86_64 W-wr-added rdsspq +REG_SP
 x86_64 W-wr-added rdsspd +REG_SP
 
 # XBEGIN is the one genuinely new KIND of repair the rm sweep exposes, and

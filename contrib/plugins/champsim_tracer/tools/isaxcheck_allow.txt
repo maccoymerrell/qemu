@@ -3389,7 +3389,6 @@ x86_64 M-llvm-mem-cs-none tpause load store
 x86_64 M-miss-load wrussq
 x86_64 R-rd-missing clwb +r#
 x86_64 R-rd-missing lfence +r#
-x86_64 R-rd-phantom xsave +r#
 
 # CAUSE 3 (136 entries) -- SEGMENT AND DIRECTION-FLAG MODELLING.  Reached
 # because mod = 10 puts a string-op opcode where the ModRM byte goes, so
@@ -5178,3 +5177,114 @@ mipsel R-wr-phantom mttr +f#
 # `--hex=1900a47c` / `--hex=1a00a47c`.
 mipsel R-rd-phantom lwle +r#
 mipsel R-rd-phantom lwre +r#
+
+
+# =====================================================================
+# x86_64 -- the system registers the boundary supplies and LLVM does not
+# =====================================================================
+#
+# The boundary-layer face of the R7.2 / R7.5-x86 attribution; the
+# fields-layer face is the matching block in isaxcheck_fields_allow.txt,
+# and the two moving together is what says the plugin passed the facts
+# through instead of inventing or dropping them.
+#
+# Twelve x86 system registers reach the decode as QEMU_PLUGIN_OP_SYSREG
+# operands because Capstone's x86 register enum has an id for none of
+# them.  Each register is one QEMU names in its own modelling of the
+# instruction; the citations are at the switch in disas/capstone.c.
+#
+# THE TOKEN IS THE CLASS, NOT THE ARCHITECTURAL NAME.  A SYSREG operand
+# enters the comparison as its role token -- `sysmmu`, `fcsr`, `sys`,
+# `systimer`, `ssp` -- because that is what the dependency model
+# schedules against (see the comment at the QEMU_PLUGIN_OP_SYSREG case in
+# isaxcheck.cc).  So `stmxcsr` shows `+fcsr` here while LLVM spells the
+# same register `mxcsr`: the two sides name one register in two
+# vocabularies, and the pre-existing `R-rd-missing stmxcsr +seg` family
+# is untouched by it.
+#
+# DELETION CONDITION, and it differs from its neighbours'.  LLVM's x86
+# tables model no descriptor-table register, no MSR file and no TSC, and
+# there is no reason to expect them to start; these rows expire if the
+# TRACER stops recording the footprint, not because the reference catches
+# up.  Where LLVM DOES name the register the rows are absent rather than
+# allowlisted -- the CET family agrees on `ssp` outright, which is the
+# check that these operands are reaching the comparison at all.
+#
+#   +sysmmu     sgdt/lgdt, sidt/lidt, sldt/lldt, str/ltr.  gdt.base and
+#               idt.base are stored and loaded in the translator
+#               (target/i386/tcg/translate.c:3318, :3373, :3524, :3540);
+#               helper_lldt / helper_ltr write env->ldt / env->tr and
+#               READ env->gdt on the way (seg_helper.c:1288, :1342 and
+#               `dt = &env->gdt` at :1304, :1359), which is why the lldt
+#               and ltr rows carry the token on both sides.
+#   +fcsr       ldmxcsr/stmxcsr and their VEX forms, fldcw/fnstcw,
+#               fninit, fnsave/frstor, fxsave/fxrstor, ffree/ffreep --
+#               env->mxcsr, env->fpuc, env->fptags[], which share the
+#               FPCTRL role and therefore one token.
+#               `R-rd-phantom fnstcw +fcsr` is a REFERENCE over-read
+#               rather than our extra: LLVM and XED both model FNSTCW as
+#               WRITING the x87 status word, which it does not
+#               (fpu_helper.c:757 returns env->fpuc and touches nothing).
+#   +sys        rdmsr/wrmsr/rdpmc, rdpid, rdtscp's second result,
+#               xgetbv/xsetbv and the twelve XSAVE / XRSTOR forms.  The
+#               MSR is selected at runtime by ECX, so one token for the
+#               file is what a decode can honestly say; IA32_TSC_AUX is
+#               an MSR and lands there for that reason; XCR0 is read by
+#               every xsave/xrstor because `rfbm &= env->xcr0` gates each
+#               component (fpu_helper.c:2795, :3077).
+#   +systimer   rdtsc / rdtscp.  A counter that advances on its own is
+#               its own dependency population.
+#   xsave       `+r#,sys` is the decode-disagreement witness (Capstone
+#               reads `xsave`, LLVM reads `ptwriteq`) with the new token
+#               folded in -- the existing row repointed, not a new class.
+x86_64 R-rd-phantom fnsave +fcsr
+x86_64 R-rd-phantom fnstcw +fcsr
+x86_64 R-rd-phantom fxsave +fcsr
+x86_64 R-rd-phantom fxsave64 +fcsr
+x86_64 R-rd-phantom lldtw +sysmmu
+x86_64 R-rd-phantom ltrw +sysmmu
+x86_64 R-rd-phantom rdmsr +sys
+x86_64 R-rd-phantom rdpid +sys
+x86_64 R-rd-phantom rdpmc +sys
+x86_64 R-rd-phantom rdtsc +systimer
+x86_64 R-rd-phantom rdtscp +sys,systimer
+x86_64 R-rd-phantom sgdtq +sysmmu
+x86_64 R-rd-phantom sidtq +sysmmu
+x86_64 R-rd-phantom sldtl +sysmmu
+x86_64 R-rd-phantom sldtq +sysmmu
+x86_64 R-rd-phantom sldtw +sysmmu
+x86_64 R-rd-phantom stmxcsr +fcsr
+x86_64 R-rd-phantom strl +sysmmu
+x86_64 R-rd-phantom strq +sysmmu
+x86_64 R-rd-phantom strw +sysmmu
+x86_64 R-rd-phantom vstmxcsr +fcsr
+x86_64 R-rd-phantom xgetbv +sys
+x86_64 R-rd-phantom xrstor +sys
+x86_64 R-rd-phantom xrstor64 +sys
+x86_64 R-rd-phantom xrstors +sys
+x86_64 R-rd-phantom xrstors64 +sys
+x86_64 R-rd-phantom xsave +r#,sys
+x86_64 R-rd-phantom xsave +sys
+x86_64 R-rd-phantom xsave64 +sys
+x86_64 R-rd-phantom xsavec +sys
+x86_64 R-rd-phantom xsavec64 +sys
+x86_64 R-rd-phantom xsaveopt +sys
+x86_64 R-rd-phantom xsaveopt64 +sys
+x86_64 R-rd-phantom xsaves +sys
+x86_64 R-rd-phantom xsaves64 +sys
+x86_64 R-wr-phantom ffree +fcsr
+x86_64 R-wr-phantom ffreep +fcsr
+x86_64 R-wr-phantom fldcw +fcsr
+x86_64 R-wr-phantom fninit +fcsr
+x86_64 R-wr-phantom fnsave +fcsr
+x86_64 R-wr-phantom frstor +fcsr
+x86_64 R-wr-phantom fxrstor +fcsr
+x86_64 R-wr-phantom fxrstor64 +fcsr
+x86_64 R-wr-phantom ldmxcsr +fcsr
+x86_64 R-wr-phantom lgdtq +sysmmu
+x86_64 R-wr-phantom lidtq +sysmmu
+x86_64 R-wr-phantom lldtw +sysmmu
+x86_64 R-wr-phantom ltrw +sysmmu
+x86_64 R-wr-phantom vldmxcsr +fcsr
+x86_64 R-wr-phantom wrmsr +sys
+x86_64 R-wr-phantom xsetbv +sys

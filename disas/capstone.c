@@ -458,6 +458,8 @@ static void cap_x86_drop_implicit(qemu_plugin_insn_info *out,
 static bool cap_x86_is_sign_extend_to_d(const char *mnem);
 static void cap_x86_add_implicit(qemu_plugin_insn_info *out, csh handle,
                                  unsigned int reg, bool is_write);
+static void cap_x86_add_sysregs(const cs_insn *insn,
+                                qemu_plugin_insn_info *out);
 
 /*
  * Extract per-operand detail for x86 into the plugin operand struct.
@@ -832,7 +834,324 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
     out->has_rep = (x86->prefix[0] == X86_PREFIX_REP ||
                     x86->prefix[0] == X86_PREFIX_REPNE) &&
                    string_op;
+
+    cap_x86_add_sysregs(insn, out);
 }
+
+/*
+ * The x86 system registers, as QEMU_PLUGIN_OP_SYSREG operands.
+ *
+ * Fourteen registers reach the dependency model through no other door.
+ * Capstone's x86 register enum has no id for any of them -- GDTR, IDTR,
+ * LDTR, TR, MXCSR, the x87 control and tag words, the MSR file, TSC,
+ * IA32_TSC_AUX, XCR0 and SSP are all absent from capstone/x86.h -- so
+ * there is no row a register table could carry and no operand Capstone
+ * could hand over.  QEMU_PLUGIN_OP_SYSREG exists for exactly this: the
+ * register lives outside the ISA's ordinary file, the boundary resolves
+ * its architectural ROLE, and the dependency model renames the role.
+ *
+ * WHAT THAT COSTS TODAY, stated rather than assumed.  Without this,
+ * `lgdt` writes nothing and `sgdt` reads nothing, so a kernel's
+ * descriptor-table setup is dependency-free; `ldmxcsr` writes nothing
+ * and `stmxcsr` reads nothing, so the rounding mode an SSE kernel
+ * installs has no producer; `rdtsc` reads nothing, so every timing loop
+ * is input-less; and `wrmsr`/`rdmsr` are unordered against each other.
+ *
+ * THE FACTS ARE QEMU'S.  Each register below is one QEMU names in its
+ * own modelling of the instruction, cited at the case:
+ *
+ *   GDTR/IDTR    env->gdt / env->idt.  SGDT/SIDT load gdt.base and
+ *                idt.base (target/i386/tcg/translate.c:3318, :3373),
+ *                LGDT/LIDT store them (:3524, :3540).
+ *   LDTR/TR      env->ldt / env->tr.  SLDT/STR load ldt.selector and
+ *                tr.selector (translate.c:3252, :3274); helper_lldt
+ *                and helper_ltr write them (seg_helper.c:1288, :1342)
+ *                AND read env->gdt on the way -- `dt = &env->gdt`
+ *                (:1304, :1359) -- because the selector they take
+ *                indexes the GDT, so the GDT base is a real input.
+ *   MXCSR        env->mxcsr.  helper_ldmxcsr writes it
+ *                (fpu_helper.c:3294), STMXCSR reads it after
+ *                helper_update_mxcsr (emit.c.inc:4063-4064).
+ *   X87 control  env->fpuc, written by cpu_set_fpuc.  helper_fldcw
+ *                (fpu_helper.c:796), FNSTCW reads it, do_fninit resets
+ *                it (:832), do_xsave_fpu stores it (:2626 region),
+ *                do_fldenv restores it.
+ *   X87 tag      env->fptags[].  helper_ffree_STN (fpu_helper.c:490),
+ *                do_fninit (:832), do_xsave_fpu / do_fldenv.
+ *   MSR file     helper_rdmsr / helper_wrmsr.  The MSR is selected at
+ *                RUNTIME by ECX, so a decode cannot name which one --
+ *                every MSR access is ordered against every other, which
+ *                is what one id for the file says.  RDPMC is in the
+ *                same file: IA32_PMCn are MSRs and RDMSR reads them.
+ *   TSC          cpu_get_tsc + env->tsc_offset (misc_helper.c:64-73).
+ *   IA32_TSC_AUX env->tsc_aux, returned by helper_rdpid
+ *                (misc_helper.c:134) and by RDTSCP's ECX result.  It is
+ *                an MSR (0xc0000103), so it takes the MSR id and the
+ *                edge from a WRMSR that writes it is REAL, not folded.
+ *   XCR0         env->xcr0.  helper_xgetbv (fpu_helper.c:3186),
+ *                helper_xsetbv (:3229), and `rfbm &= env->xcr0` in
+ *                helper_xsave (:2795) and helper_xrstor (:3077).
+ *
+ * SSP IS THE EXCEPTION AND IT IS NAMED AS ONE.  QEMU's TCG i386 target
+ * does not model CET at all -- there is no U_CET/S_CET MSR, no PL0_SSP,
+ * no shadow-stack push on a call -- so the six CET instructions execute
+ * as the NOPs their encodings occupy when CET is off, and the register
+ * facts here come from the Intel SDM rather than from QEMU.  They are
+ * recorded anyway because the set is ARCHITECTURAL (R2): a trace of a
+ * CET binary must say that `sspopchk`'s x86 sibling family reads and
+ * writes the shadow-stack pointer, and REG_SSP is the id RISC-V
+ * Zicfiss's `ssp` already carries -- one register, two ISAs (R8.6).
+ *
+ * WHAT IS NOT HERE, and why it is a finding rather than an omission:
+ * CLUI, STUI and ERETU carry UIF and IA32_KERNEL_GS_BASE, and this
+ * Capstone DOES NOT DECODE THEM.  It ignores the F3 prefix that
+ * distinguishes them, so `f3 0f 01 ee` comes back `rdpkru`, `f3 0f 01
+ * ef` comes back `wrpkru` and `f3 0f 01 ca` comes back `clac` --
+ * measured, not assumed.  Keying UIF off X86_INS_RDPKRU would attribute
+ * a register to an instruction that is not the one executing.  Those
+ * two registers are unreachable until Capstone decodes the UINTR
+ * space, which is R8.7's rule applied: a register the decoder cannot
+ * reach is not a mapped register.
+ */
+typedef enum {
+    CAP_X86_SYSREG_NONE = 0,
+    CAP_X86_SYSREG_GDTR,
+    CAP_X86_SYSREG_IDTR,
+    CAP_X86_SYSREG_LDTR,
+    CAP_X86_SYSREG_TR,
+    CAP_X86_SYSREG_MXCSR,
+    CAP_X86_SYSREG_X87CW,
+    CAP_X86_SYSREG_X87TAG,
+    CAP_X86_SYSREG_MSR,
+    CAP_X86_SYSREG_TSC,
+    CAP_X86_SYSREG_TSCAUX,
+    CAP_X86_SYSREG_XCR0,
+    CAP_X86_SYSREG_SSP,
+} cap_x86_sysreg;
+
+/*
+ * Architectural name and role for each.  The NUMBER above is local to
+ * this boundary -- x86 gives these registers no architectural encoding,
+ * and the MSRs are numbered but selected at runtime, so there is
+ * nothing else to put in reg_id (see qemu_plugin_operand.reg_id).  The
+ * NAME is architectural and is what identifies the register; the ROLE
+ * is what the dependency model schedules against.
+ */
+static const struct {
+    const char *name;
+    uint8_t     role;
+} cap_x86_sysreg_tab[] = {
+    [CAP_X86_SYSREG_GDTR]   = { "gdtr",   QEMU_PLUGIN_SYSREG_MMU },
+    [CAP_X86_SYSREG_IDTR]   = { "idtr",   QEMU_PLUGIN_SYSREG_MMU },
+    [CAP_X86_SYSREG_LDTR]   = { "ldtr",   QEMU_PLUGIN_SYSREG_MMU },
+    [CAP_X86_SYSREG_TR]     = { "tr",     QEMU_PLUGIN_SYSREG_MMU },
+    [CAP_X86_SYSREG_MXCSR]  = { "mxcsr",  QEMU_PLUGIN_SYSREG_FPCTRL },
+    [CAP_X86_SYSREG_X87CW]  = { "fpcw",   QEMU_PLUGIN_SYSREG_FPCTRL },
+    [CAP_X86_SYSREG_X87TAG] = { "fptag",  QEMU_PLUGIN_SYSREG_FPCTRL },
+    [CAP_X86_SYSREG_MSR]    = { "msr",    QEMU_PLUGIN_SYSREG_OTHER },
+    [CAP_X86_SYSREG_TSC]    = { "tsc",    QEMU_PLUGIN_SYSREG_TIMER },
+    [CAP_X86_SYSREG_TSCAUX] = { "tscaux", QEMU_PLUGIN_SYSREG_OTHER },
+    [CAP_X86_SYSREG_XCR0]   = { "xcr0",   QEMU_PLUGIN_SYSREG_OTHER },
+    [CAP_X86_SYSREG_SSP]    = { "ssp",    QEMU_PLUGIN_SYSREG_SHADOWSTK },
+};
+
+/*
+ * Append one x86 system register as a SYSREG operand.  Idempotent on
+ * the register, so a decoder that starts naming one of these cannot be
+ * double-counted, and a no-op once the operand array is full -- the
+ * cap_riscv_add_csr contract, for CS_ARCH_X86.
+ */
+static void cap_x86_add_sysreg(qemu_plugin_insn_info *out,
+                               cap_x86_sysreg reg, uint8_t access)
+{
+    qemu_plugin_operand *op;
+
+    for (uint8_t i = 0; i < out->n_operands; i++) {
+        if (out->operands[i].type == QEMU_PLUGIN_OP_SYSREG
+            && out->operands[i].reg_id == (uint16_t)reg) {
+            out->operands[i].access |= access;
+            return;
+        }
+    }
+    if (out->n_operands >= QEMU_PLUGIN_INSN_DETAIL_MAX_OPS) {
+        return;
+    }
+    op = &out->operands[out->n_operands];
+    memset(op, 0, sizeof(*op));
+    op->type         = QEMU_PLUGIN_OP_SYSREG;
+    op->access       = access;
+    op->reg_id       = (uint16_t)reg;
+    op->sysreg_class = cap_x86_sysreg_tab[reg].role;
+    op->scale        = 1;
+    g_strlcpy(op->reg_name, cap_x86_sysreg_tab[reg].name,
+              QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ);
+    out->n_operands++;
+}
+
+#define CAP_X86_SYS_R  QEMU_PLUGIN_OP_ACC_READ
+#define CAP_X86_SYS_W  QEMU_PLUGIN_OP_ACC_WRITE
+
+/*
+ * The x87 environment triple.  FNSAVE / FRSTOR / FXSAVE / FXRSTOR move
+ * the control word, the tag word and (the FX pair) MXCSR together, and
+ * all three carry the FPCTRL role, so the generic set they produce is
+ * one id either way; they are named individually because reg_name is
+ * what identifies a system register on x86 and a consumer reading the
+ * operand list should see what the instruction actually moves.
+ *
+ * The x87 and SSE DATA registers those four instructions also move are
+ * NOT here, and that is a separate open question rather than a decision
+ * taken quietly: FXSAVE stores ST0-ST7 and XMM0-15, XSAVE stores
+ * whichever components EDX:EAX selects, and neither XED nor LLVM MC
+ * models that either.  Attributing it means naming the whole
+ * architectural register file on one instruction, which is true and is
+ * a ruling nobody has given.
+ */
+static void cap_x86_add_x87_env(qemu_plugin_insn_info *out, uint8_t access,
+                                bool with_mxcsr)
+{
+    cap_x86_add_sysreg(out, CAP_X86_SYSREG_X87CW, access);
+    cap_x86_add_sysreg(out, CAP_X86_SYSREG_X87TAG, access);
+    if (with_mxcsr) {
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_MXCSR, access);
+    }
+}
+
+static void cap_x86_add_sysregs(const cs_insn *insn,
+                                qemu_plugin_insn_info *out)
+{
+    switch (insn->id) {
+    /* ---- descriptor tables ------------------------------------- */
+    case X86_INS_SGDT:
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_GDTR, CAP_X86_SYS_R);
+        break;
+    case X86_INS_LGDT:
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_GDTR, CAP_X86_SYS_W);
+        break;
+    case X86_INS_SIDT:
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_IDTR, CAP_X86_SYS_R);
+        break;
+    case X86_INS_LIDT:
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_IDTR, CAP_X86_SYS_W);
+        break;
+    case X86_INS_SLDT:
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_LDTR, CAP_X86_SYS_R);
+        break;
+    case X86_INS_LLDT:
+        /* helper_lldt: `dt = &env->gdt` then write env->ldt. */
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_GDTR, CAP_X86_SYS_R);
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_LDTR, CAP_X86_SYS_W);
+        break;
+    case X86_INS_STR:
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_TR, CAP_X86_SYS_R);
+        break;
+    case X86_INS_LTR:
+        /* helper_ltr: same GDT read, then write env->tr. */
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_GDTR, CAP_X86_SYS_R);
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_TR, CAP_X86_SYS_W);
+        break;
+    /* ---- SSE control word --------------------------------------- */
+    case X86_INS_LDMXCSR:
+    case X86_INS_VLDMXCSR:
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_MXCSR, CAP_X86_SYS_W);
+        break;
+    case X86_INS_STMXCSR:
+    case X86_INS_VSTMXCSR:
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_MXCSR, CAP_X86_SYS_R);
+        break;
+    /* ---- x87 control and tag words ------------------------------ */
+    case X86_INS_FLDCW:
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_X87CW, CAP_X86_SYS_W);
+        break;
+    case X86_INS_FNSTCW:
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_X87CW, CAP_X86_SYS_R);
+        break;
+    case X86_INS_FFREE:
+    case X86_INS_FFREEP:
+        /* helper_ffree_STN marks the slot empty and touches nothing
+         * else: the tag word is the whole architectural effect. */
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_X87TAG, CAP_X86_SYS_W);
+        break;
+    case X86_INS_FNINIT:
+        cap_x86_add_x87_env(out, CAP_X86_SYS_W, false);
+        break;
+    case X86_INS_FRSTOR:
+        cap_x86_add_x87_env(out, CAP_X86_SYS_W, false);
+        break;
+    case X86_INS_FNSAVE:
+        /* do_fsave = do_fstenv (reads them) + do_fninit (writes them). */
+        cap_x86_add_x87_env(out, CAP_X86_SYS_R | CAP_X86_SYS_W, false);
+        break;
+    case X86_INS_FXSAVE:
+    case X86_INS_FXSAVE64:
+        cap_x86_add_x87_env(out, CAP_X86_SYS_R, true);
+        break;
+    case X86_INS_FXRSTOR:
+    case X86_INS_FXRSTOR64:
+        cap_x86_add_x87_env(out, CAP_X86_SYS_W, true);
+        break;
+    /* ---- the MSR file ------------------------------------------- */
+    case X86_INS_RDMSR:
+    case X86_INS_RDPMC:
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_MSR, CAP_X86_SYS_R);
+        break;
+    case X86_INS_WRMSR:
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_MSR, CAP_X86_SYS_W);
+        break;
+    /* ---- the time-stamp counter and its companion --------------- */
+    case X86_INS_RDTSC:
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_TSC, CAP_X86_SYS_R);
+        break;
+    case X86_INS_RDTSCP:
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_TSC, CAP_X86_SYS_R);
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_TSCAUX, CAP_X86_SYS_R);
+        break;
+    case X86_INS_RDPID:
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_TSCAUX, CAP_X86_SYS_R);
+        break;
+    /* ---- the extended control register -------------------------- */
+    case X86_INS_XGETBV:
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_XCR0, CAP_X86_SYS_R);
+        break;
+    case X86_INS_XSETBV:
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_XCR0, CAP_X86_SYS_W);
+        break;
+    case X86_INS_XSAVE:
+    case X86_INS_XSAVE64:
+    case X86_INS_XSAVEC:
+    case X86_INS_XSAVEC64:
+    case X86_INS_XSAVEOPT:
+    case X86_INS_XSAVEOPT64:
+    case X86_INS_XSAVES:
+    case X86_INS_XSAVES64:
+    case X86_INS_XRSTOR:
+    case X86_INS_XRSTOR64:
+    case X86_INS_XRSTORS:
+    case X86_INS_XRSTORS64:
+        /* `rfbm &= env->xcr0` gates every component. */
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_XCR0, CAP_X86_SYS_R);
+        break;
+    /* ---- CET: the shadow-stack pointer -------------------------- */
+    case X86_INS_RDSSPD:
+    case X86_INS_RDSSPQ:
+    case X86_INS_SAVEPREVSSP:
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_SSP, CAP_X86_SYS_R);
+        break;
+    case X86_INS_INCSSPD:
+    case X86_INS_INCSSPQ:
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_SSP,
+                           CAP_X86_SYS_R | CAP_X86_SYS_W);
+        break;
+    case X86_INS_RSTORSSP:
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_SSP, CAP_X86_SYS_W);
+        break;
+    default:
+        break;
+    }
+}
+
+#undef CAP_X86_SYS_R
+#undef CAP_X86_SYS_W
 
 /*
  * Lane-width helpers — see qemu_plugin_operand.lane_bytes.  Tracer-

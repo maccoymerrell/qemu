@@ -640,11 +640,23 @@ static bool drop_zero = true;
  *   - the program counter: the tracer carries control flow through the
  *     BRANCH_* taxonomy and the entry stream, never through a REG_IP
  *     dependency edge, and LLVM's MCInstrDesc does not model PC at all.
- *   - x86 MXCSR: LLVM gives every SSE/AVX instruction an implicit MXCSR use
- *     (rounding mode + exception mask); Capstone models none, and the
- *     tracer's x86 register classifier has no MXCSR slot to put it in.
- *   - x86 SSP (shadow stack pointer): an LLVM-side modelling artifact on
- *     call/ret, not an architectural GPR read a consumer can schedule on.
+ *   - x86 MXCSR: LLVM gives EVERY SSE/AVX instruction an implicit MXCSR
+ *     use (rounding mode + exception mask) and Capstone models none, so
+ *     the token would be a missing entry on most of the vector ISA.  The
+ *     tracer DOES have a slot for it now -- ldmxcsr / stmxcsr carry
+ *     REG_FCSR through the boundary's SYSREG operand (R7.2) -- so the
+ *     reason this token is dropped is the reference's blanket implicit
+ *     use, and nothing else.
+ *   - x86 SSP (shadow stack pointer): LLVM names it on every CALL, which
+ *     is its modelling of the CET shadow-stack push -- an effect QEMU's
+ *     TCG i386 target does not have and the tracer's CALL does not
+ *     record, so keeping the token would put a missing entry on the whole
+ *     call family.  It is NOT an artifact on the CET instructions
+ *     themselves, where LLVM and the tracer agree that RDSSP / INCSSP /
+ *     RSTORSSP / SAVEPREVSSP touch it; the drop is asymmetric there (the
+ *     tracer's REG_SSP survives into the fields comparison and LLVM's
+ *     `ssp` does not) and the residual that leaves is allowlisted with
+ *     that reason, not with a claim that LLVM is silent.
  */
 static bool is_dropped_reg(const std::string &c)
 {

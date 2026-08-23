@@ -2215,7 +2215,7 @@ static const InsnClassification x86_insn_class[X86_INS_ENDING] = {
                                         .dep_refine = dep_passthrough },
     [X86_INS_RDSSPD]                      = { .opcode = GEN_OP_MOV,    .branch_type = BRANCH_NONE,           .flags = MF_NONE,
                                         .dep_refine = dep_all_to_all },
-    [X86_INS_RDSSPQ]                      = { .opcode = GEN_OP_NOP,    .branch_type = BRANCH_NONE,           .flags = MF_NONE,
+    [X86_INS_RDSSPQ]                      = { .opcode = GEN_OP_MOV,    .branch_type = BRANCH_NONE,           .flags = MF_NONE,
                                         .dep_refine = dep_all_to_all },
     [X86_INS_RDTSC]                       = { .opcode = GEN_OP_NOP,    .branch_type = BRANCH_NONE,           .flags = MF_NONE,
                                         .dep_refine = dep_all_to_all },

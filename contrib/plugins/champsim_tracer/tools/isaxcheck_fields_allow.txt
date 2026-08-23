@@ -1573,7 +1573,6 @@ x86_64 FR-rd-missing flds +REG_SEG#
 x86_64 FR-rd-missing fldt +REG_SEG#
 x86_64 FR-rd-missing fmull +REG_SEG#
 x86_64 FR-rd-missing fmuls +REG_SEG#
-x86_64 FR-rd-missing fnsave +REG_FCSR,REG_SEG#
 x86_64 FR-rd-missing fnstcw +REG_SEG#
 x86_64 FR-rd-missing fnstenv +REG_FCSR,REG_SEG#
 x86_64 FR-rd-missing fnstsw +REG_FCSR,REG_SEG#
@@ -1589,8 +1588,6 @@ x86_64 FR-rd-missing fsubrs +REG_SEG#
 x86_64 FR-rd-missing fsubs +REG_SEG#
 x86_64 FR-rd-missing fxrstor +REG_SEG#
 x86_64 FR-rd-missing fxrstor64 +REG_SEG#
-x86_64 FR-rd-missing fxsave +REG_FCSR,REG_SEG#
-x86_64 FR-rd-missing fxsave64 +REG_FCSR,REG_SEG#
 x86_64 FR-rd-missing idivb +REG_SEG#
 x86_64 FR-rd-missing idivl +REG_SEG#
 x86_64 FR-rd-missing idivq +REG_SEG#
@@ -2668,12 +2665,9 @@ x86_64 FM-miss-load fxsave64
 x86_64 FM-miss-store fxrstor
 x86_64 FM-miss-store fxrstor64
 x86_64 FR-rd-missing ffreep +REG_FPR#
-x86_64 FR-rd-missing fnsave +REG_FCSR
 x86_64 FR-rd-missing fnstenv +REG_FCSR
 x86_64 FR-rd-missing fnstsw +REG_FCSR
 x86_64 FR-rd-missing fstp +REG_FPR#
-x86_64 FR-rd-missing fxsave +REG_FCSR
-x86_64 FR-rd-missing fxsave64 +REG_FCSR
 x86_64 FR-rd-phantom fadd +REG_FPR#
 x86_64 FR-rd-phantom fcmovb +REG_FPR#
 x86_64 FR-rd-phantom fcmovbe +REG_FPR#
@@ -2712,10 +2706,7 @@ x86_64 FR-wr-missing fdiv +REG_FCSR
 x86_64 FR-wr-missing fdivp +REG_FCSR
 x86_64 FR-wr-missing fdivr +REG_FCSR
 x86_64 FR-wr-missing fdivrp +REG_FCSR
-x86_64 FR-wr-missing ffree +REG_FCSR
-x86_64 FR-wr-missing ffreep +REG_FCSR
 x86_64 FR-wr-missing fincstp +REG_FCSR
-x86_64 FR-wr-missing fldcw +REG_FCSR
 x86_64 FR-wr-missing fldenv +REG_FCSR
 x86_64 FR-wr-missing fldl2e +REG_FCSR
 x86_64 FR-wr-missing fldl2t +REG_FCSR
@@ -2725,7 +2716,6 @@ x86_64 FR-wr-missing fldpi +REG_FCSR
 x86_64 FR-wr-missing fmul +REG_FCSR
 x86_64 FR-wr-missing fmulp +REG_FCSR
 x86_64 FR-wr-missing fnop +REG_FCSR
-x86_64 FR-wr-missing fnsave +REG_FCSR
 x86_64 FR-wr-missing fnstcw +REG_FCSR
 x86_64 FR-wr-missing fnstenv +REG_FCSR
 x86_64 FR-wr-missing fnstsw +REG_FCSR
@@ -2734,15 +2724,12 @@ x86_64 FR-wr-missing fprem +REG_FCSR
 x86_64 FR-wr-missing fprem1 +REG_FCSR
 x86_64 FR-wr-missing fptan +REG_FCSR
 x86_64 FR-wr-missing frndint +REG_FCSR
-x86_64 FR-wr-missing frstor +REG_FCSR
 x86_64 FR-wr-missing fscale +REG_FCSR
 x86_64 FR-wr-missing fsincos +REG_FCSR
 x86_64 FR-wr-missing fsub +REG_FCSR
 x86_64 FR-wr-missing fsubp +REG_FCSR
 x86_64 FR-wr-missing fsubr +REG_FCSR
 x86_64 FR-wr-missing fsubrp +REG_FCSR
-x86_64 FR-wr-missing fxrstor +REG_FCSR
-x86_64 FR-wr-missing fxrstor64 +REG_FCSR
 x86_64 FR-wr-missing fxtract +REG_FCSR
 x86_64 FR-wr-missing fyl2x +REG_FCSR
 x86_64 FR-wr-missing fyl2xp1 +REG_FCSR
@@ -2871,7 +2858,6 @@ x86_64 FR-rd-missing wrpkru +REG_GPR#
 x86_64 FR-rd-missing xlatb +REG_GPR#
 x86_64 FR-rd-phantom cvtpi2pd +REG_FPR#
 x86_64 FR-rd-phantom movq +REG_VEC#
-x86_64 FR-rd-phantom xsave +REG_GPR#
 x86_64 FR-wr-missing cli +REG_FLAGS
 x86_64 FR-wr-missing cmpxchg16b +REG_GPR#
 x86_64 FR-wr-missing cmpxchg8b +REG_GPR#
@@ -2887,9 +2873,6 @@ x86_64 FR-wr-missing movq +REG_SP
 x86_64 FR-wr-missing pcmpestrm +REG_FLAGS,REG_VEC#
 x86_64 FR-wr-missing pcmpistrm +REG_FLAGS,REG_VEC#
 x86_64 FR-wr-missing rdpkru +REG_GPR#
-x86_64 FR-wr-missing rdsspq +REG_FP_REG
-x86_64 FR-wr-missing rdsspq +REG_GPR#
-x86_64 FR-wr-missing rdsspq +REG_SP
 x86_64 FR-wr-missing shldl +REG_FP_REG
 x86_64 FR-wr-missing shldl +REG_GPR#
 x86_64 FR-wr-missing shldl +REG_SP
@@ -3429,3 +3412,147 @@ mipsel FR-rd-phantom lwre +REG_FP_REG
 mipsel FR-rd-phantom lwre +REG_GPR#
 mipsel FR-rd-phantom lwre +REG_LR
 mipsel FR-rd-phantom lwre +REG_SP
+
+
+# =====================================================================
+# x86_64 -- the system registers the boundary supplies and LLVM does not
+# =====================================================================
+#
+# R7.2 and the x86 half of R7.5.  Twelve x86 system registers reach the
+# dependency model through disas/capstone.c as QEMU_PLUGIN_OP_SYSREG
+# operands, because Capstone's x86 register enum has an id for none of
+# them: GDTR, IDTR, LDTR and TR (REG_SYSMMU), MXCSR and the x87 control
+# and tag words (REG_FCSR), the MSR file, IA32_TSC_AUX and XCR0
+# (REG_SYS), the time-stamp counter (REG_SYSTIMER) and the CET
+# shadow-stack pointer (REG_SSP).  The registers come from QEMU's own
+# modelling of each instruction, cited register by register at the
+# switch in disas/capstone.c.
+#
+# THE DELETION CONDITION FOR THIS BLOCK DIFFERS FROM ITS NEIGHBOURS' and
+# it is worth writing down.  LLVM MC names two of these registers and no
+# more -- MXCSR on LDMXCSR / STMXCSR, and the x87 status word -- so
+# every other row here is a phantom to LLVM in the same permanent sense
+# the mipsel CP0 rows are: LLVM's x86 tables model no descriptor-table
+# register, no MSR file, no TSC and no SSP, and there is no reason to
+# expect them to start.  These rows expire if the TRACER stops recording
+# the footprint, not because the reference catches up.
+#
+#   +REG_SYSMMU   sgdt/lgdt, sidt/lidt, sldt/lldt, str/ltr.  QEMU stores
+#                 and loads gdt.base / idt.base in the translator
+#                 (translate.c:3318, :3373, :3524, :3540) and
+#                 helper_lldt / helper_ltr write env->ldt / env->tr
+#                 (seg_helper.c:1288, :1342).  The lldt / ltr rows carry
+#                 the id on BOTH sides because those two helpers also
+#                 READ env->gdt -- `dt = &env->gdt` at :1304 and :1359 --
+#                 the selector they take being an index into the GDT.
+#   +REG_FCSR     ldmxcsr/stmxcsr and their VEX forms, fldcw/fnstcw,
+#                 fninit, fnsave/frstor, fxsave/fxrstor, ffree/ffreep.
+#                 env->mxcsr, env->fpuc and env->fptags[]; the three
+#                 share the FPCTRL role and therefore one id, so the
+#                 rows name the id once however many of the three the
+#                 instruction moves.
+#                 `FR-rd-phantom fnstcw +REG_FCSR` is the opposite
+#                 shape and is a REFERENCE over-read: LLVM (and XED)
+#                 model FNSTCW as WRITING the x87 status word.  It does
+#                 not -- QEMU's FNSTCW only reads env->fpuc
+#                 (fpu_helper.c:757) and the SDM gives it no status
+#                 effect -- so the tracer's read is the phantom only in
+#                 LLVM's frame.
+#   +REG_SYS      rdmsr/wrmsr/rdpmc, rdpid and rdtscp's second result,
+#                 xgetbv/xsetbv and the twelve XSAVE / XRSTOR forms.
+#                 The MSR is selected at RUNTIME by ECX, so one id for
+#                 the file is what a decode can honestly say; IA32_TSC_AUX
+#                 is an MSR and lands there for that reason, and XCR0 is
+#                 read by every xsave/xrstor because `rfbm &= env->xcr0`
+#                 gates each component (fpu_helper.c:2795, :3077).
+#   +REG_SYSTIMER rdtsc and rdtscp.  A counter that advances on its own
+#                 is its own dependency population -- the same argument
+#                 that put MIPS Count and Compare on this id.
+#   +REG_SSP      rdsspd/rdsspq, incsspd/incsspq, rstorssp, saveprevssp.
+#                 QEMU's TCG i386 target does not model CET, so these
+#                 facts are the SDM's and are recorded because the set is
+#                 architectural (R2); REG_SSP is the id RISC-V Zicfiss
+#                 `ssp` already carries (R8.6).
+#                 THESE ROWS ARE NOT "LLVM IS SILENT".  LLVM names `ssp`
+#                 on exactly these instructions and agrees with the
+#                 tracer about them -- the boundary layer shows the two
+#                 sides matching on the token.  The rows exist because
+#                 is_dropped_reg() drops `ssp` from the REFERENCE side,
+#                 for a reason that has nothing to do with CET decode:
+#                 LLVM also names it on every CALL, modelling the
+#                 shadow-stack push that QEMU does not perform and the
+#                 tracer's CALL does not record.  The drop is therefore
+#                 asymmetric at this layer -- the tracer's REG_SSP
+#                 survives and LLVM's `ssp` does not -- and these rows
+#                 are that asymmetry.  Making it symmetric would make the
+#                 gate blind to the attribution instead of merely noisy
+#                 about it, which is why it is left this way and written
+#                 down.  It deletes when CALL's own shadow-stack
+#                 footprint is ruled on.
+#   rdsspq rows   move from FR-wr-missing to FR-rd-missing, joining
+#                 rdsspd's, because X86_INS_RDSSPQ was classified
+#                 GEN_OP_NOP and is now GEN_OP_MOV like its 32-bit
+#                 sibling.  The justification is family (g)'s and is
+#                 unchanged: with CET off the instruction is a NOP, so
+#                 LLVM models the destination as surviving and therefore
+#                 read.
+#   +REG_SEG#     the fnsave / fxsave / fxsave64 rows lose their REG_FCSR
+#                 half and keep the segment half: the segment-base read
+#                 residual is family (b)'s and is untouched by this.
+#   xsave         `+REG_GPR#,REG_SYS` is the decode-disagreement row
+#                 (Capstone reads `xsave`, LLVM reads `ptwriteq`) with
+#                 the new id folded in; it is family (a)'s row, repointed.
+x86_64 FR-rd-missing fnsave +REG_SEG#
+x86_64 FR-rd-missing fxsave +REG_SEG#
+x86_64 FR-rd-missing fxsave64 +REG_SEG#
+x86_64 FR-rd-missing rdsspq +REG_FP_REG
+x86_64 FR-rd-missing rdsspq +REG_GPR#
+x86_64 FR-rd-missing rdsspq +REG_SP
+x86_64 FR-rd-phantom fnstcw +REG_FCSR
+x86_64 FR-rd-phantom incsspd +REG_SSP
+x86_64 FR-rd-phantom incsspq +REG_SSP
+x86_64 FR-rd-phantom lldtw +REG_SYSMMU
+x86_64 FR-rd-phantom ltrw +REG_SYSMMU
+x86_64 FR-rd-phantom rdmsr +REG_SYS
+x86_64 FR-rd-phantom rdpid +REG_SYS
+x86_64 FR-rd-phantom rdpmc +REG_SYS
+x86_64 FR-rd-phantom rdsspd +REG_SSP
+x86_64 FR-rd-phantom rdsspq +REG_SSP
+x86_64 FR-rd-phantom rdtsc +REG_SYSTIMER
+x86_64 FR-rd-phantom rdtscp +REG_SYS,REG_SYSTIMER
+x86_64 FR-rd-phantom saveprevssp +REG_SSP
+x86_64 FR-rd-phantom sgdtq +REG_SYSMMU
+x86_64 FR-rd-phantom sidtq +REG_SYSMMU
+x86_64 FR-rd-phantom sldtl +REG_SYSMMU
+x86_64 FR-rd-phantom sldtq +REG_SYSMMU
+x86_64 FR-rd-phantom sldtw +REG_SYSMMU
+x86_64 FR-rd-phantom stmxcsr +REG_FCSR
+x86_64 FR-rd-phantom strl +REG_SYSMMU
+x86_64 FR-rd-phantom strq +REG_SYSMMU
+x86_64 FR-rd-phantom strw +REG_SYSMMU
+x86_64 FR-rd-phantom vstmxcsr +REG_FCSR
+x86_64 FR-rd-phantom xgetbv +REG_SYS
+x86_64 FR-rd-phantom xrstor +REG_SYS
+x86_64 FR-rd-phantom xrstor64 +REG_SYS
+x86_64 FR-rd-phantom xrstors +REG_SYS
+x86_64 FR-rd-phantom xrstors64 +REG_SYS
+x86_64 FR-rd-phantom xsave +REG_GPR#,REG_SYS
+x86_64 FR-rd-phantom xsave +REG_SYS
+x86_64 FR-rd-phantom xsave64 +REG_SYS
+x86_64 FR-rd-phantom xsavec +REG_SYS
+x86_64 FR-rd-phantom xsavec64 +REG_SYS
+x86_64 FR-rd-phantom xsaveopt +REG_SYS
+x86_64 FR-rd-phantom xsaveopt64 +REG_SYS
+x86_64 FR-rd-phantom xsaves +REG_SYS
+x86_64 FR-rd-phantom xsaves64 +REG_SYS
+x86_64 FR-wr-phantom incsspd +REG_SSP
+x86_64 FR-wr-phantom incsspq +REG_SSP
+x86_64 FR-wr-phantom ldmxcsr +REG_FCSR
+x86_64 FR-wr-phantom lgdtq +REG_SYSMMU
+x86_64 FR-wr-phantom lidtq +REG_SYSMMU
+x86_64 FR-wr-phantom lldtw +REG_SYSMMU
+x86_64 FR-wr-phantom ltrw +REG_SYSMMU
+x86_64 FR-wr-phantom rstorssp +REG_SSP
+x86_64 FR-wr-phantom vldmxcsr +REG_FCSR
+x86_64 FR-wr-phantom wrmsr +REG_SYS
+x86_64 FR-wr-phantom xsetbv +REG_SYS

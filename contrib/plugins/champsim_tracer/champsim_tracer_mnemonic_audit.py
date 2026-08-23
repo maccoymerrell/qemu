@@ -2542,7 +2542,7 @@ def classify_x86(m: str) -> Entry:
     if m in {"syscall", "sysenter", "sysexit", "int", "int1", "int3", "vmcall", "vmmcall",
              "ud0", "ud1", "ud2"}:
         return ent("GEN_OP_SYSCALL", "BRANCH_SYSCALL_TYPE")
-    if m in {"hlt", "cpuid", "rdtsc", "rdtscp", "xgetbv", "xsetbv", "endbr32", "endbr64", "wait", "clc", "cld", "cli", "sti", "clac", "stac", "clts", "cmc", "stc", "std", "pause", "rdsspq", "clgi", "getsec", "pconfig", "rsm", "skinit", "stgi", "swapgs", "encls", "enclu", "enclv", "emms", "data16", "lock", "rep", "repne", "rex64", "xacquire", "xrelease"}:
+    if m in {"hlt", "cpuid", "rdtsc", "rdtscp", "xgetbv", "xsetbv", "endbr32", "endbr64", "wait", "clc", "cld", "cli", "sti", "clac", "stac", "clts", "cmc", "stc", "std", "pause", "clgi", "getsec", "pconfig", "rsm", "skinit", "stgi", "swapgs", "encls", "enclu", "enclv", "emms", "data16", "lock", "rep", "repne", "rex64", "xacquire", "xrelease"}:
         return ent("GEN_OP_NOP")
     if m.startswith("prefetch"):
         return ent("GEN_OP_PREFETCH")
@@ -2633,7 +2633,7 @@ def classify_x86(m: str) -> Entry:
     # above.
     if m in {"into"} or m.startswith(("bndcl", "bndcu", "bndcn", "bound", "arpl")):
         return ent("GEN_OP_CMP")
-    if m.startswith(("bndmk", "bndmov", "lar", "lsl", "lahf", "sahf", "lwpins", "lwpval", "rdfsbase", "rdgsbase", "rdrand", "rdseed", "rdpid", "rdpkru", "rdsspd", "saveprevssp", "wrfsbase", "wrgsbase", "wrmsr", "wrpkru")):
+    if m.startswith(("bndmk", "bndmov", "lar", "lsl", "lahf", "sahf", "lwpins", "lwpval", "rdfsbase", "rdgsbase", "rdrand", "rdseed", "rdpid", "rdpkru", "rdssp", "saveprevssp", "wrfsbase", "wrgsbase", "wrmsr", "wrpkru")):
         return ent("GEN_OP_MOV")
     if m.startswith(("monitor", "mwait", "umonitor", "umwait", "tpause", "xabort", "xbegin", "xend", "xtest")):
         return ent("GEN_OP_NOP")

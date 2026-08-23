@@ -600,10 +600,18 @@ without implying any particular numeric base.
        ``REG_SYSMMU`` is address-translation state (``Index``,
        ``Random``, ``EntryLo0/1``, ``Context``, ``PageMask``,
        ``Wired``, ``EntryHi``, ``XContext``, the page-walker
-       registers), read and written by TLB maintenance.
+       registers), read and written by TLB maintenance; on x86-64 it
+       is the descriptor-table file — ``GDTR``, ``IDTR``, ``LDTR`` and
+       ``TR``, which ``sgdt``/``lgdt``, ``sidt``/``lidt``,
+       ``sldt``/``lldt`` and ``str``/``ltr`` move and which a segment
+       load or an interrupt walks.  ``lldt`` and ``ltr`` carry the ID
+       on both sides: the selector they take indexes the GDT, so the
+       GDT base is an input as well as the LDT or task register being
+       an output.
        ``REG_SYSTIMER`` is a counter that advances on its own and the
        compare value that fires against it (``Count`` / ``Compare``,
-       MIPS hardware register ``CC``).  ``REG_SYSPERF`` is the
+       MIPS hardware register ``CC``, x86-64 ``TSC`` as ``rdtsc`` and
+       ``rdtscp`` read it).  ``REG_SYSPERF`` is the
        performance counters and their control.  ``REG_SYSDBG`` is
        EJTAG debug, the watch registers and trace.  ``REG_SYSCACHE``
        is the cache tag/data access windows and the error state.
@@ -623,16 +631,27 @@ without implying any particular numeric base.
        MRS / CSR / CP0 space — everything the decode boundary does not
        give a role of its own.  On MIPS that is ``HWREna``,
        ``LLAddr``, the kernel scratch registers and the MT / guest
-       control space.  AArch64 ``mrs``/``msr`` and RISC-V
+       control space.  On x86-64 it is the MSR file and ``XCR0``:
+       ``rdmsr`` / ``wrmsr`` / ``rdpmc`` select their register at run
+       time from ECX, so a decode can only say *some MSR*, and one ID
+       for the file is exactly that statement — ``IA32_TSC_AUX``,
+       which ``rdpid`` and ``rdtscp`` read, is an MSR and belongs to
+       it for the same reason.  AArch64 ``mrs``/``msr`` and RISC-V
        ``csrr``/``csrrw`` reach it through the
        ``QEMU_PLUGIN_OP_SYSREG`` operand, which carries the
        architectural role (``QEMU_PLUGIN_SYSREG_OTHER`` here) rather
        than a decoder register id — Capstone has one for almost none of
-       these registers.
+       these registers, and on x86-64 it has one for none of them at
+       all.
    * - ``REG_FCSR``
      - Floating-point control / status register (RISC-V ``frm`` /
        ``fflags`` / ``fcsr``, AArch64 ``FPCR`` / ``FPSR`` / ``FPMR``,
-       MIPS ``FCR``\ *n*).  Read by FP arithmetic wherever the rounding
+       MIPS ``FCR``\ *n*, x86-64 ``MXCSR`` and the x87 control,
+       status and tag words).  On x86-64 the three x87 words and
+       ``MXCSR`` share the ID because they are one behaviour —
+       ``ldmxcsr`` / ``stmxcsr``, ``fldcw`` / ``fnstcw``, ``fninit``,
+       ``ffree``, and the ``fnsave`` / ``frstor`` / ``fxsave`` /
+       ``fxrstor`` pairs all move them.  Read by FP arithmetic wherever the rounding
        mode is an input: on RISC-V that is any FP encoding whose ``rm``
        field is ``DYN``, on AArch64 every FP form.  The cumulative
        exception-status half (AArch64 ``FPSR``, RISC-V ``fflags``
@@ -667,6 +686,19 @@ without implying any particular numeric base.
        whatever unrelated system register the last ``mrs`` or ``mfc0``
        happened to touch.  AArch64 ``TPIDR_EL1``, the kernel's per-CPU
        base, is a different register and stays ``REG_SYS``.
+   * - ``REG_SSP``
+     - Shadow-stack pointer: RISC-V Zicfiss ``ssp`` and x86-64 CET's
+       ``SSP``.  One architectural register on two ISAs, so one ID.
+       It is deliberately neither ``REG_SP`` nor ``REG_LR``: on the
+       stack pointer it would serialise shadow-stack traffic against
+       every spill and frame adjustment, and on the link register
+       ``sspopchk ra`` — which reads ``{ra, ssp}`` and writes
+       ``{ssp}`` — would collapse into one source with a
+       self-dependency, on the instruction whose whole purpose is
+       comparing those two values.  x86-64 reaches it through the
+       ``QEMU_PLUGIN_OP_SYSREG`` operand (``rdsspd`` / ``rdsspq``,
+       ``incsspd`` / ``incsspq``, ``rstorssp``, ``saveprevssp``);
+       RISC-V names it as an ordinary register operand.
    * - ``REG_SP``
      - Stack pointer.
    * - ``REG_FLAGS``

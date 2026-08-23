@@ -589,9 +589,17 @@ typedef int (*MarkerEncodeSeqFn)(uint8_t *out, uint32_t imm);
  * generic one.  The long tail is REG_SYS; the roles with an ID of
  * their own are the ones whose dependency population is worth
  * separating -- the thread pointer, the vector configuration, the
- * arithmetic control word -- because a consumer is misled as badly by
- * an edge onto a register the instruction never touched as by a
- * missing one.
+ * arithmetic control word, the descriptor tables, the free-running
+ * counter, the shadow-stack pointer -- because a consumer is misled as
+ * badly by an edge onto a register the instruction never touched as by
+ * a missing one.
+ *
+ * The roles and the IDs are deliberately not the same vocabulary: the
+ * privileged-file groups REG_SYSEXC / REG_SYSPERF / REG_SYSDBG /
+ * REG_SYSCACHE / REG_COPROC<n> are reached from the register TABLE on
+ * the ISAs whose disassembler names those registers (MIPS numbers its
+ * CP0 file), and only need a role here once an ISA arrives whose
+ * disassembler cannot.
  */
 static inline uint8_t generic_reg_for_sysreg_class(uint8_t sysreg_class)
 {
@@ -601,6 +609,9 @@ static inline uint8_t generic_reg_for_sysreg_class(uint8_t sysreg_class)
     case QEMU_PLUGIN_SYSREG_VECCTRL:   return REG_VCTRL;
     case QEMU_PLUGIN_SYSREG_THREADPTR: return REG_TLS;
     case QEMU_PLUGIN_SYSREG_IDENT:     return REG_SYSID;
+    case QEMU_PLUGIN_SYSREG_MMU:       return REG_SYSMMU;
+    case QEMU_PLUGIN_SYSREG_TIMER:     return REG_SYSTIMER;
+    case QEMU_PLUGIN_SYSREG_SHADOWSTK: return REG_SSP;
     case QEMU_PLUGIN_SYSREG_OTHER:
     default:                           return REG_SYS;
     }

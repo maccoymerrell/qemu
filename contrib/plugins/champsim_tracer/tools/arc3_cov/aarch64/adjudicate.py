@@ -160,21 +160,47 @@ ADJ = {
  'SRC+trc:ZERO': ('CLOSED -- TRACER FIXED',
     'fcmp/fcmpe against #0.0: the zero is an IMMEDIATE, not the zero '
     'register.  6 rows.'),
- 'DST+trc:ZERO': ('NEEDS RULING -- DO NOT FIX UNILATERALLY',
-    'a write to the zero register is architecturally discarded (AArch64 '
-    'XZR/WZR, RISC-V x0, MIPS $zero all read as zero however they are '
-    'written), and the reference discards it -- mra_ref.to_sets() does '
-    '`dst.discard(\'ZERO\')`.  Recorded, it is a producer for a value no '
-    'consumer can receive, and every later reader of the zero register '
-    'waits on it.  BUT the current behaviour is author-declared, not '
-    'accidental: the validator generates a block class literally named '
-    'probe_zero_reg whose expected_insns entry is '
-    '`{"src": ["REG_GPR5","REG_GPR6"], "dst": ["REG_ZERO"]}`, and '
-    'dropping the write turns that probe RED on riscv64 and mipsel.  '
-    'THE QUESTION FOR THE MAINTAINER, in one sentence: should a write to '
-    'the architectural zero register be recorded as a destination, or '
-    'discarded as the architecture discards it -- and if discarded, does '
-    'probe_zero_reg change to assert the absence?  3 rows.'),
+ 'DST+trc:ZERO': ('CLOSED -- REFERENCE FIXED (R7.3)',
+    'subps/sbfiz/caspl writing xzr.  The tracer named REG_ZERO and the '
+    'reference dropped it -- mra_ref.to_sets() did `dst.discard(\'ZERO\')` '
+    'on the argument that the architecture discards the value.  R7.3: '
+    '"REG_ZERO exists, so it should be specified.  We should not be '
+    'dropping reg zero."  Attribution is a regfile-dependency question, '
+    'not a value question, so the discard was the reference measuring its '
+    'own convention.  The line is gone; these 3 rows AGREE.  The '
+    'author-declared validator probe probe_zero_reg '
+    '(`{"src": ["REG_GPR5","REG_GPR6"], "dst": ["REG_ZERO"]}`) is '
+    'unchanged and stays green.  3 rows.'),
+ 'SRC+ref:ZT0': ('TRACER RIGHT -- REFERENCE-SIDE (R7.1)',
+    '`movt zt0[8], x2` writes 64 bits of the 512-bit SME2 lookup-table '
+    'register, so the reference makes the destination a source to model '
+    'the preserve of the other 448.  R7.1 settles exactly this shape: a '
+    'write narrower than the register does not acquire a source, because '
+    'rename does not know the data-width-scope of the next reader and '
+    'width is carried at execution rather than in the static set.  A '
+    'register is a source when the INSTRUCTION takes it as one, and movt '
+    'does not.  Surfaced only when ZT0 was split off REG_MATRIX: while it '
+    'shared an ID with the ZA array the read and the write cancelled into '
+    'one token and the row could not be seen.  1 row.'),
+ 'DST+ref:ZERO': ('TRACER DEFECT -- OPEN (same alias loss as SRC+ref:ZERO)',
+    'cmp (6), cmn (6), tst (4).  Each is the printed alias of a base form '
+    'whose destination is xzr/wzr -- cmp = subs Rd=31, cmn = adds Rd=31, '
+    'tst = ands Rd=31 -- and Capstone\'s ALIAS operand set drops that '
+    'destination, so the tracer records DST{FLAGS} where both references '
+    'say {FLAGS, ZERO}.  Corroborated on both: the MRA execute ASL writes '
+    'X[31], and LLVM MC independently reports WR{nzcv,zr}.  This is the '
+    'DESTINATION half of SRC+ref:ZERO (46 rows, mov/mul/neg/cset/pac*Z), '
+    'the identical alias-hiding mechanism in the other direction; it was '
+    'invisible until R7.3 removed the reference discard that happened to '
+    'cancel it.  FIX PATH, measured, and NOT the one the '
+    'AARCH64_INS_ALIAS_RET note names: CS_OPT_DETAIL_REAL makes Capstone '
+    'emit the base-form operand set for an alias -- '
+    '`cstool -r -d aarch64 9f0c426b` gives op_count 3, operands[0] wzr '
+    'WRITE, "Registers modified: nzcv wzr" -- so the answer does NOT have '
+    'to come through cs_regs_access(), whose alias_id staleness is what '
+    'blocked the read half.  Not taken here: switching the operand set '
+    'for every AArch64 alias reshapes op_count and operand indices across '
+    'the whole ISA, which is its own change with its own A/B.  16 rows.'),
  'SRC+ref:SYS SRC+trc:LR': ('CLOSED -- TRACER FIXED',
     'eretaa/eretab do not touch x30.  2 rows; what remains on those rows '
     'is the ELR_ELx read, counted under SRC+ref:SYS.'),

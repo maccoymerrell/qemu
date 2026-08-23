@@ -14,10 +14,20 @@ def canon_gpr(n):
     return 'GPR%d' % n
 
 
+# The tracer's GenericRegId space is the thing being measured, so every
+# mapping change has to land here too or the comparison reports the drift
+# instead of the model.  cf574b77d4 split two AArch64 collisions:
+#   FFR left REG_VCTRL (which now carries VG, the vector-granule count)
+#        for REG_PRED16, the first slot past the architectural predicate
+#        file -- FFR is predicate-shaped and predicate-addressed.
+#   ZT0  left REG_MATRIX (which keeps the 33 overlapping VIEWS of the ZA
+#        array, aliases by R8.2) for REG_VEC32.  ZT0 is the SME2
+#        lookup-table register: separate state, not a view of ZA.
 TRC_MAP = {
     'REG_FLAGS': 'FLAGS', 'REG_FCSR': 'FCSR', 'REG_SYS': 'SYS', 'REG_TLS': 'TLS',
     'REG_SP': 'SP', 'REG_LR': 'LR', 'REG_FP_REG': 'FP_REG', 'REG_ZERO': 'ZERO',
-    'REG_IP': 'IP', 'REG_MATRIX': 'MATRIX', 'REG_VCTRL': 'FFR',
+    'REG_IP': 'IP', 'REG_MATRIX': 'MATRIX', 'REG_VCTRL': 'VCTRL',
+    'REG_PRED16': 'FFR', 'REG_VEC32': 'ZT0',
 }
 
 
@@ -39,7 +49,7 @@ def trc_tok(t):
 
 
 LLVM_MAP = {'nzcv': 'FLAGS', 'fpcr': 'FCSR', 'fpsr': 'FCSR', 'sp': 'SP',
-            'zr': 'ZERO', 'ffr': 'FFR', 'zt0': 'MATRIX', 'pc': 'IP'}
+            'zr': 'ZERO', 'ffr': 'FFR', 'zt0': 'ZT0', 'pc': 'IP'}
 
 
 def llvm_tok(t):

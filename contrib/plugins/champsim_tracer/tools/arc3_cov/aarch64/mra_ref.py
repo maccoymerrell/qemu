@@ -318,6 +318,8 @@ def tok(kind, idx):
         return 'PRED%d' % idx
     if kind == 'ZA':
         return 'MATRIX'
+    if kind == 'ZT0':
+        return 'ZT0'
     if kind == 'FFR':
         return 'FFR'
     if kind == 'PC':
@@ -336,6 +338,8 @@ def tok(kind, idx):
 def to_sets(ef):
     src = set(tok(k, i) for k, i in ef.r)
     dst = set(tok(k, i) for k, i in ef.w)
-    # a write to XZR is architecturally discarded
-    dst.discard('ZERO')
+    # R7.3: the write to XZR is RECORDED.  The architecture discards the
+    # value, but the regfile-dependency question is a different one -- the
+    # generic space has REG_ZERO and the tracer names it, so a reference
+    # that dropped it was measuring its own convention, not the tracer.
     return src, dst

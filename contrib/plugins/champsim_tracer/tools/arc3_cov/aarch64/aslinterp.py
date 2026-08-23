@@ -104,7 +104,7 @@ NZCV = {'N', 'Z', 'C', 'V'}
 REG_ACCESSORS = {
     'X': 'GPR', 'SP': 'SP', 'V': 'VEC', 'Vpart': 'VEC', 'Z': 'VEC', 'P': 'PRED',
     'PC': 'PC', 'FFR': 'FFR', 'ElemFFR': 'FFR', 'ZAvector': 'ZA', 'ZAtile': 'ZA',
-    'ZAslice': 'ZA', 'ZAhslice': 'ZA', 'ZAvslice': 'ZA', 'ZT0': 'ZA',
+    'ZAslice': 'ZA', 'ZAhslice': 'ZA', 'ZAvslice': 'ZA', 'ZT0': 'ZT0',
     'D': 'VEC', 'S': 'VEC', 'H': 'VEC', 'B': 'VEC', 'Q': 'VEC',
     '_R': 'GPR', '_Z': 'VEC', '_P': 'PRED',
 }
@@ -257,7 +257,7 @@ class Interp:
         pos = IDX_ARG.get(name, 0)
         n = as_int(vals[pos]) if pos < len(vals) else None
         w = as_int(vals[1]) if len(vals) > 1 else None
-        if n is None and kind in ('ZA', 'FFR'):
+        if n is None and kind in ('ZA', 'FFR', 'ZT0'):
             n = None
         elif n is None:
             self.ef.unresolved.add((kind, 'w'))
@@ -731,7 +731,7 @@ class Interp:
             pos = IDX_ARG.get(name, 0)
             n = as_int(vals[pos]) if pos < len(vals) else None
             if n is None:
-                if kind in ('ZA', 'FFR'):
+                if kind in ('ZA', 'FFR', 'ZT0'):
                     self.last_read_id = self.ef.add(rw, kind, None)
                     self.notes.add('index-runtime:' + kind)
                 else:

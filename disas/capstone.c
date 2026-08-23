@@ -3024,15 +3024,15 @@ static unsigned cap_aarch64_exclusive_mem_access(const char *mnem)
  * ISA_A64_xml_A_profile-2022-12 execute pseudocode, not a guess at what
  * the disassembler meant.
  *
- *   XZR / WZR as a DESTINATION.  `subps xzr, x2, x1`, `sbfiz xzr, x8,
- *   #43, #1` and the CASP forms with an xzr in the result pair are
- *   reported as writing the zero register.  The architecture discards
- *   the write -- X[31] is a constant zero on read at every exception
- *   level -- so a consumer that honours the write sees a producer for a
- *   value no reader can ever observe, and every later `mov w2, wzr`
- *   waits on it.  The READ side stays: the zero register genuinely is
- *   the encoded source operand of the alias forms, and the tracer names
- *   it there already.
+ * A WRITE TO XZR / WZR IS NOT ONE OF THEM.  `subps xzr, x2, x1`, `sbfiz
+ * xzr, x8, #43, #1` and the CASP forms with an xzr in the result pair
+ * report a write to the zero register, and that report is kept.  The
+ * architecture discards the value, but register attribution is a
+ * regfile-dependency question, not a value question: REG_ZERO exists in
+ * the generic space, the wire has always carried it, and a consumer that
+ * wants to collapse it can.  Dropping it here was tried and reverted;
+ * the reference that dropped it on the other side was measuring its own
+ * convention.  The READ side was never in question.
  *
  *   ERETAA / ERETAB read x30.  They do not.  The authenticated return
  *   address is ELR_ELx and the modifier is SP; x30 is untouched, and

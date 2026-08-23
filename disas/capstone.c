@@ -3366,6 +3366,48 @@ static uint8_t cap_riscv_csr_access(const cs_insn *insn)
 }
 
 /*
+ * Append a CSR the ENCODING implies but no operand names.
+ *
+ * A RISC-V CSR reaches the plugin as a QEMU_PLUGIN_OP_SYSREG operand
+ * carrying the raw 12-bit CSR number and its architectural role (see
+ * cap_riscv_csr_class); Capstone has register ids for only seven of the
+ * shadow forms and none at all for fcsr, vstart or vcsr, so a CSR that
+ * is architecturally part of an instruction's footprint but absent from
+ * its printed operand list can only be added this way.  Idempotent on
+ * the CSR number, so a decoder that starts reporting one of these
+ * cannot be double-counted, and a no-op once the operand array is full.
+ */
+static void cap_riscv_add_csr(qemu_plugin_insn_info *out, unsigned csr,
+                              uint8_t access)
+{
+    qemu_plugin_operand *op;
+    const char *name;
+
+    for (uint8_t i = 0; i < out->n_operands; i++) {
+        if (out->operands[i].type == QEMU_PLUGIN_OP_SYSREG
+            && out->operands[i].reg_id == (uint16_t)csr) {
+            out->operands[i].access |= access;
+            return;
+        }
+    }
+    if (out->n_operands >= QEMU_PLUGIN_INSN_DETAIL_MAX_OPS) {
+        return;
+    }
+    op = &out->operands[out->n_operands];
+    memset(op, 0, sizeof(*op));
+    op->type   = QEMU_PLUGIN_OP_SYSREG;
+    op->access = access;
+    op->reg_id = (uint16_t)csr;
+    op->sysreg_class = cap_riscv_csr_class(csr);
+    op->scale  = 1;
+    name = cap_riscv_csr_name(csr);
+    if (name) {
+        g_strlcpy(op->reg_name, name, QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ);
+    }
+    out->n_operands++;
+}
+
+/*
  * MIPS accumulator read-modify-write family.
  *
  * A multiply-accumulate adds its product to what the accumulator
@@ -3830,6 +3872,39 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                     out->n_regs_read++;
                 }
             }
+        }
+        /*
+         * Every RVV instruction WRITES vstart.
+         *
+         * vstart is the resume index a trap leaves behind so a partially
+         * executed vector instruction can be restarted, and the flip side
+         * of that contract is that a vector instruction which runs to
+         * completion must clear it -- RVV v1.0 sec 3.7: "the vstart CSR is
+         * reset to zero at the end of execution of any vector
+         * instruction".  Both authorities say it unconditionally and in
+         * one line each: Sail closes every vector `execute` clause with
+         * `set_vstart(zeros())`, and QEMU writes `env->vstart = 0` at the
+         * tail of every vector helper (66 sites, plus
+         * `tcg_gen_movi_tl(cpu_vstart, 0)` in the translated forms).
+         *
+         * The tracer already named the vector configuration as a SOURCE
+         * (vl / vtype, restored just above) and never as a destination, so
+         * a `vsetvli` and the ops it configures had a dependency edge but
+         * the vector stream itself produced nothing on that register: an
+         * instruction that traps mid-vector resumes off a value the trace
+         * says nobody wrote.  vl, vtype and vstart all carry
+         * QEMU_PLUGIN_SYSREG_VECCTRL, so they meet on one generic slot and
+         * this is that slot's producer.
+         *
+         * `vsetvl*` is excluded for the same reason it is excluded above:
+         * it writes vl and vtype (which Capstone reports) and does not
+         * touch vstart.
+         */
+        if (insn->mnemonic[0] == 'v'
+            && !g_str_has_prefix(insn->mnemonic, "vsetvl")
+            && cap_riscv_is_vector_encoding(insn)) {
+            cap_riscv_add_csr(out, 0x008 /* vstart */,
+                              QEMU_PLUGIN_OP_ACC_WRITE);
         }
     } else if (cap_arch == CS_ARCH_MIPS) {
         n = MIN(detail->mips.op_count, QEMU_PLUGIN_INSN_DETAIL_MAX_OPS);

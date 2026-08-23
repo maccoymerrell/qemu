@@ -3428,6 +3428,28 @@ static void cap_riscv_add_reg_read(csh handle, qemu_plugin_insn_info *out,
 }
 
 /*
+ * Replace the operand array with a single register operand.
+ */
+static void cap_riscv_push_reg_operand(csh handle, qemu_plugin_insn_info *out,
+                                       uint16_t reg, uint8_t access)
+{
+    qemu_plugin_operand *op;
+
+    if (out->n_operands >= QEMU_PLUGIN_INSN_DETAIL_MAX_OPS) {
+        return;
+    }
+    op = &out->operands[out->n_operands];
+    memset(op, 0, sizeof(*op));
+    op->type   = QEMU_PLUGIN_OP_REG;
+    op->access = access;
+    op->reg_id = reg;
+    op->scale  = 1;
+    cap_copy_reg_name(op->reg_name, QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                      handle, reg, CS_ARCH_RISCV);
+    out->n_operands++;
+}
+
+/*
  * Assembler aliases that hide an x0 SOURCE.
  *
  * `beqz a0, L` is `beq a0, x0, L`, `neg a0, a1` is `sub a0, x0, a1`,
@@ -4704,6 +4726,106 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
          */
         if (cap_riscv_alias_reads_x0(insn)) {
             cap_riscv_add_reg_read(handle, out, RISCV_REG_X0);
+        }
+        /*
+         * Zimop reads nothing, and the Zicfiss shadow stack is carved
+         * out of it.
+         *
+         * The May-Be-Operations occupy SYSTEM with funct3 = 0b100, the
+         * one funct3 Zicsr does not use.  Unimplemented, a MOP is
+         * defined to write zero to rd and read NOTHING -- QEMU says it
+         * in one line, `gen_set_gpr(ctx, a->rd, ctx->zero)` in
+         * trans_rvzimop.c.inc, and Sail names the parameters `_rs1` /
+         * `_rs2` to mark them unused.  Capstone reports rs1 and rs2 as
+         * read because it prints them, which manufactures a dependency
+         * on registers the instruction never looks at.
+         *
+         * Zicfiss then carves five encodings out of that space, and
+         * Capstone 6.0.0-Alpha7 cannot decode them -- it prints
+         * `sspush x1` as `mop.rr.7 zero, zero, ra` and `ssrdp a0` as
+         * `mop.r.28 a0, zero`.  The register consequence is worse than
+         * a missing read: the shadow-stack pointer is absent from both
+         * sets and x0 is reported as a DESTINATION, so a shadow-stack
+         * push produced a write to the register that cannot be written.
+         * The encodings are fixed constants -- QEMU's own
+         * target/riscv/insn32.decode lines 1033-1043 and
+         * insn16.decode 143-146 give them bit for bit, and Sail agrees
+         * -- so they are recognised here from the instruction word and
+         * the footprint is stated outright.
+         *
+         *   sspush rs2    reads ssp and rs2, writes ssp   (rs2 in x1/x5)
+         *   sspopchk rs1  reads ssp and rs1, writes ssp   (rs1 in x1/x5)
+         *   ssrdp rd      reads ssp, writes rd
+         *   c.sspush x1 / c.sspopchk x5   the compressed pair, carved
+         *                 out of c.mop.1 and c.mop.5
+         *
+         * ssp folds onto REG_SP in the generic space, which is the
+         * documented cost of a shared register vocabulary: the shadow
+         * stack pointer is a stack pointer, and a RISC-V-only register
+         * does not earn an ID of its own (champsim_tracer_generic_ids.h).
+         *
+         * Revisit when Capstone gains Zicfiss: the mnemonic will still
+         * be wrong until then, and only the register footprint is
+         * repaired here.
+         */
+        if (insn->size == 4) {
+            uint32_t word = (uint32_t)insn->bytes[0] |
+                            ((uint32_t)insn->bytes[1] << 8) |
+                            ((uint32_t)insn->bytes[2] << 16) |
+                            ((uint32_t)insn->bytes[3] << 24);
+            if ((word & 0x7f) == 0x73 && ((word >> 12) & 0x7) == 0x4
+                && (word >> 31) == 1) {
+                unsigned rd    = (word >> 7) & 0x1f;
+                unsigned rs1   = (word >> 15) & 0x1f;
+                unsigned rs2   = (word >> 20) & 0x1f;
+                unsigned f7    = (word >> 25) & 0x7f;
+                unsigned csr12 = (word >> 20) & 0xfff;
+                bool push = f7 == 0x67 && rs1 == 0 && rd == 0
+                            && (rs2 == 1 || rs2 == 5);
+                bool popchk = csr12 == 0xcdc && rd == 0
+                              && (rs1 == 1 || rs1 == 5);
+                bool rdp = csr12 == 0xcdc && rs1 == 0 && rd != 0;
+                out->n_operands = 0;
+                out->n_regs_read = 0;
+                out->n_regs_write = 0;
+                if (push || popchk) {
+                    cap_riscv_push_reg_operand(handle, out, RISCV_REG_SSP,
+                                               QEMU_PLUGIN_OP_ACC_READ
+                                               | QEMU_PLUGIN_OP_ACC_WRITE);
+                    cap_riscv_push_reg_operand(
+                        handle, out,
+                        (uint16_t)(RISCV_REG_X0 + (push ? rs2 : rs1)),
+                        QEMU_PLUGIN_OP_ACC_READ);
+                } else if (rdp) {
+                    cap_riscv_push_reg_operand(handle, out, RISCV_REG_SSP,
+                                               QEMU_PLUGIN_OP_ACC_READ);
+                    cap_riscv_push_reg_operand(handle, out,
+                                               (uint16_t)(RISCV_REG_X0 + rd),
+                                               QEMU_PLUGIN_OP_ACC_WRITE);
+                } else if (rd != 0) {
+                    cap_riscv_push_reg_operand(handle, out,
+                                               (uint16_t)(RISCV_REG_X0 + rd),
+                                               QEMU_PLUGIN_OP_ACC_WRITE);
+                }
+                n = out->n_operands;
+            }
+        }
+        if (insn->size == 2) {
+            uint16_t half = (uint16_t)insn->bytes[0] |
+                            ((uint16_t)insn->bytes[1] << 8);
+            if (half == 0x6081 || half == 0x6281) {
+                out->n_operands = 0;
+                out->n_regs_read = 0;
+                out->n_regs_write = 0;
+                cap_riscv_push_reg_operand(handle, out, RISCV_REG_SSP,
+                                           QEMU_PLUGIN_OP_ACC_READ
+                                           | QEMU_PLUGIN_OP_ACC_WRITE);
+                cap_riscv_push_reg_operand(
+                    handle, out,
+                    (uint16_t)(RISCV_REG_X0 + (half == 0x6081 ? 1 : 5)),
+                    QEMU_PLUGIN_OP_ACC_READ);
+                n = out->n_operands;
+            }
         }
         /*
          * A trap return reads the PC it returns to.

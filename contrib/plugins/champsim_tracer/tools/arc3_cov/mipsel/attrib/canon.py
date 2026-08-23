@@ -138,7 +138,21 @@ def canon_set(name):
     return set() if g is None else {g}
 
 
-DROP = {"REG_ZERO", "REG_IP", "-", "", None}
+# R7.3: "REG_ZERO exists, so it should be specified.  We should not be
+# dropping reg zero.  We weren't before, we shouldn't be now."  The id is a
+# real generic register and a set that names it differs from a set that does
+# not, so suppressing it on BOTH sides -- which is what this harness used to
+# do -- hides every place the two sides disagree about x0/$zero.  It hid them
+# symmetrically, which is why mipsel read 977/977 with the suppression in
+# place; a symmetric blindfold is still a blindfold.  aarch64's reference lost
+# the same suppression in 7880bf6125 (mra_ref.to_sets did dst.discard('ZERO'))
+# and the comparison is only cross-ISA comparable if both lose it.
+#
+# REG_IP stays.  It is not the zero register and R7.3 does not reach it: the
+# program counter is not part of the register file the dependency model
+# arbitrates, and every branch would otherwise carry a PC read/write that no
+# consumer renames.
+DROP = {"REG_IP", "-", "", None}
 
 def drop(s):
     return set(x for x in s if x not in DROP)

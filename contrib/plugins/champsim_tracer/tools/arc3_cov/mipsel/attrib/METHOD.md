@@ -57,7 +57,15 @@ comparison (`attrib/canon.py`), so a naming difference is never a disagreement.
 Per **R4** a sub-register difference is not a disagreement either: `HI<n>` and
 `LO<n>` are the two halves of the 64-bit accumulator `AC<n>` and both
 canonicalise to `REG_ACC<n>`; LLVM's `D<n>_64` (FGR64) canonicalises to
-`REG_FPR<n>`.  `REG_ZERO` and `REG_IP` are dropped on both sides.
+`REG_FPR<n>`.  `REG_IP` is dropped on both sides.
+
+**`REG_ZERO` is not.**  It used to be, symmetrically, and a symmetric
+blindfold is still a blindfold: a fabricated write to `$zero` and a correct
+absence of one compared equal.  R7.3 -- "REG_ZERO exists, so it should be
+specified.  We should not be dropping reg zero." -- removed the suppression
+from AArch64's reference in 7880bf6125, and this harness carried the same one
+until it was removed here.  Removing it flagged exactly two rows, `div` and
+`divu`, and both were real: see "What removing the suppression found" below.
 
 ## The references, in rank order
 
@@ -146,7 +154,48 @@ Every departure from the rank-1 answer carries a rule id, recorded per row in
   `cttc1` as a model question.
 * **`rdhwr`'s representative encoding parks its destination on `$zero`.** It was
   re-probed with `rt=$a0` (`3be8047c`): the destination is attributed correctly
-  (`REG_GPR4`).  No gap.
+  (`REG_GPR4`).  No gap.  Since R7.3 it is also the positive control for
+  `REG_ZERO` itself: it is the one row of the 977 whose sets name the id, both
+  sides name it, and it agrees -- so the comparison is carrying the id rather
+  than losing it somewhere quieter than the old `DROP` set.
+
+## What removing the suppression found
+
+Two rows, `div` and `divu`, and they are a **Capstone defect that is now fixed
+at the boundary** rather than an adjudication -- there is no rule id for them
+because after the fix they simply agree.
+
+The classic `div rs, rt` / `divu rs, rt` have no destination register field:
+bits 15:11 are architecturally zero and an encoding with them set does not
+decode (`1a088500` is rejected; `1a008500` is `div $zero, $a0, $a1`).  But
+Capstone's AsmString spells the destination literally, `"div\t$$zero, $rs,
+$rt"`, and then materialises that literal as operand 0 -- a `MIPS_REG_ZERO`
+carrying `CS_AC_WRITE`.  LLVM MC, whose table the string comes from, reads it
+as text and reports `RD{rs,rt} WR{ac0}` with no `$0`.  `mult`/`multu`, spelled
+without the literal, were always right.
+
+`disas/capstone.c` drops that operand, gated on the accumulator write rather
+than on the mnemonic, because MIPS R6 -- a mode `cap_mode_mips()` selects from
+the guest ELF's `e_flags` -- redefines `DIV`/`DIVU` as genuine three-operand
+instructions whose destination must survive.  Measured against Capstone
+directly:
+
+| mode | encoding | decode | operand 0 | implicit writes |
+| --- | --- | --- | --- | --- |
+| MIPS32R2 | `0085001a` | `div $zero, $a0, $a1` | `$zero` WRITE | `ac0` |
+| MIPS32R6 | `0085001a` | does not decode | -- | -- |
+| MIPS32R6 | `00a6209a` | `div $a0, $a1, $a2` | `$a0` WRITE | none |
+| MIPS32R2 | `00a6209a` | does not decode | -- | -- |
+
+so the gate separates the two forms exactly, and neither encoding is reachable
+in the other's mode.
+
+* **The built-in gate cannot see this class at all.**  `isaxcheck`'s comparison
+  normaliser folds the architectural zero register out of both sides unless
+  `--keep-zero` is passed, and no gate run passes it.  So `div`'s fabricated
+  `$zero` destination produced no gate signature and never would have; the
+  attribution harness found it only because R7.3 made this comparison stop
+  doing the same thing.
 
 ## Reproduce
 

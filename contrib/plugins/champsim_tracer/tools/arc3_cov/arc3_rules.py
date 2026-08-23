@@ -182,3 +182,91 @@ MIPSEL = {}
 
 def mipsel_rule(label):
     return MIPSEL.get(label)
+
+
+# ===========================================================================
+# riscv64, EXECUTION leg -- compare_exec.py against spike's commit log.
+#
+# Separate from RISCV above, which adjudicates the STATIC (Sail) leg.  The two
+# legs disagree for different reasons and must not share a rule table: a Sail
+# modelling gap says nothing about what spike's logger prints, and vice versa.
+#
+# Every rule here names a mechanism located in spike's own source, so it can be
+# rechecked when spike is bumped rather than believed.
+# ===========================================================================
+RISCV_EXEC = {
+    # riscv/execute.cc, commit_log_print_insn: the loop over log_reg_write
+    # begins `if (item.first == 0) continue;`.  item.first is (rd << 4) | kind,
+    # so the entry it skips is exactly an integer write to x0.  The reference
+    # therefore cannot ever report an x0 write; the tracer's is surplus.
+    'REF-X0-DISCARD':   Rule('REF-X0-DISCARD', 'reference-gap', {SUPERSET},
+                             note='spike suppresses x0 writes outright '
+                                  '(execute.cc); a tracer x0 write has no '
+                                  'counterpart to disagree with'),
+
+    # A CSR spike names that the tracer's GenericRegId vocabulary has no id
+    # for.  Reported as vocabulary, never as a dropped write, and never
+    # silently mapped onto a neighbouring id.
+    'REF-CSR-UNMAPPED': Rule('REF-CSR-UNMAPPED', 'vocabulary-gap', {SUBSET},
+                             note='the execution reference names a CSR no '
+                                  'GenericRegId spells'),
+
+    # riscv/csrs.cc:69 -- spike's CSR log entry is written from inside the CSR
+    # WRITE ACCESSOR.  An FP operation that raises no new exception flag never
+    # calls it, so the reference reports no fcsr destination at all, while the
+    # tracer names the architectural destination whether or not this execution
+    # changed it.  The reference under-reports by construction.
+    'REF-CSR-ACCESSOR-ONLY':
+        Rule('REF-CSR-ACCESSOR-ONLY', 'reference-gap', {SUPERSET},
+             note='spike logs a CSR write only when the write accessor ran; '
+                  'the tracer names the architectural destination'),
+
+    # riscv/vector_unit.cc:168 -- log_elt_write_if_needed() is ELEMENT
+    # triggered.  A fully masked-off vector operation writes no element and so
+    # logs no vector destination, though the opcode's destination register is
+    # architecturally exactly that register.
+    'REF-VEC-ELEMENT-ONLY':
+        Rule('REF-VEC-ELEMENT-ONLY', 'reference-gap', {SUPERSET},
+             note='spike logs vector ELEMENT writes; a fully masked-off op '
+                  'logs no destination at all'),
+
+    # A register both sides name, with different values.  There is no
+    # vocabulary reading of this: one of the two is wrong about what the
+    # machine did, and it is not the machine.
+    'VALUE-MISMATCH':
+        Rule('VALUE-MISMATCH', 'tracer-defect', {SUBSET},
+             note='both sides name the register; the values differ, so the '
+                  'tracer carries a value the run did not produce'),
+
+    # One GenericRegId, several architectural CSR writes in one instruction
+    # (vsetvli writes vstart, vl and vtype).  The id cannot carry them, so no
+    # value comparison at this granularity would be honest.
+    'CSR-FOLD-MULTI':
+        Rule('CSR-FOLD-MULTI', 'vocabulary-gap', {SUBSET},
+             note='the reference records several CSR writes that the tracer '
+                  'folds onto one GenericRegId, which can hold one value'),
+
+    # target/riscv/insn_trans/trans_rva.c.inc:74 -- QEMU implements SC with
+    # tcg_gen_atomic_cmpxchg_tl, and the plugin observes the compare's READ.
+    # Architecturally SC performs a store only.  Whether a memory trace should
+    # carry it is a modelling question (a real core does probe the line), so
+    # this is named and left for the maintainer rather than assumed either way.
+    # A CSR the reference writes that the guest's architecture does not have.
+    # spike at this revision carries the matrix/Zvt extension and clears its
+    # `mtype` (0xC23) inside vectorUnit_t::set_vl (vector_unit.cc:148-152), so
+    # every vsetvl logs a write to a register RVV 1.0 vsetvli does not touch.
+    # The tracer is right to have no id for it.
+    'REF-NONARCH-CSR':
+        Rule('REF-NONARCH-CSR', 'reference-defect', {SUBSET},
+             note='the reference logs a write to a CSR outside the ISA the '
+                  'guest was built for (spike Zvt mtype on every vsetvl)'),
+
+    'QEMU-SC-CMPXCHG':
+        Rule('QEMU-SC-CMPXCHG', 'needs-ruling', {SUPERSET, ORTHOGONAL},
+             note='QEMU lowers store-conditional to a cmpxchg; the tracer '
+                  'records that implementation read as a load'),
+}
+
+
+def riscv_exec_rule(label):
+    return RISCV_EXEC.get(label) if label else None

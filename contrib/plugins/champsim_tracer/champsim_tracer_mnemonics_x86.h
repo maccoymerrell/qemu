@@ -93,7 +93,7 @@ static const RegClassification x86_reg_class[X86_REG_ENDING] = {
     [X86_REG_ES] = { .reg_id = REG_SEG2, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "es" } },  /* es */
     [X86_REG_ESI] = { .reg_id = REG_GPR4, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "rsi" } },  /* esi */
     [X86_REG_ESP] = { .reg_id = REG_SP, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "rsp" } },  /* esp */
-    [X86_REG_FPSW] = { .reg_id = REG_FLAGS, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "fstat" } },  /* fpsw */
+    [X86_REG_FPSW] = { .reg_id = REG_FCSR, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "fstat" } },  /* fpsw */
     [X86_REG_FS] = { .reg_id = REG_SEG3, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "fs" } },  /* fs */
     [X86_REG_GS] = { .reg_id = REG_SEG4, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "gs" } },  /* gs */
     [X86_REG_IP] = { .reg_id = REG_IP, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "rip" } },  /* ip */
@@ -112,38 +112,38 @@ static const RegClassification x86_reg_class[X86_REG_ENDING] = {
     [X86_REG_SP] = { .reg_id = REG_SP, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "rsp" } },  /* sp */
     [X86_REG_SPL] = { .reg_id = REG_SP, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "rsp" } },  /* spl */
     [X86_REG_SS] = { .reg_id = REG_SEG5, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "ss" } },  /* ss */
-    [X86_REG_CR0] = { .reg_id = REG_CTRL, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "cr0" } },  /* cr0 */
-    [X86_REG_CR1] = { .reg_id = REG_CTRL },  /* cr1 */
-    [X86_REG_CR2] = { .reg_id = REG_CTRL, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "cr2" } },  /* cr2 */
-    [X86_REG_CR3] = { .reg_id = REG_CTRL, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "cr3" } },  /* cr3 */
-    [X86_REG_CR4] = { .reg_id = REG_CTRL, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "cr4" } },  /* cr4 */
-    [X86_REG_CR5] = { .reg_id = REG_CTRL },  /* cr5 */
-    [X86_REG_CR6] = { .reg_id = REG_CTRL },  /* cr6 */
-    [X86_REG_CR7] = { .reg_id = REG_CTRL },  /* cr7 */
-    [X86_REG_CR8] = { .reg_id = REG_CTRL, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "cr8" } },  /* cr8 */
-    [X86_REG_CR9] = { .reg_id = REG_CTRL },  /* cr9 */
-    [X86_REG_CR10] = { .reg_id = REG_CTRL },  /* cr10 */
-    [X86_REG_CR11] = { .reg_id = REG_CTRL },  /* cr11 */
-    [X86_REG_CR12] = { .reg_id = REG_CTRL },  /* cr12 */
-    [X86_REG_CR13] = { .reg_id = REG_CTRL },  /* cr13 */
-    [X86_REG_CR14] = { .reg_id = REG_CTRL },  /* cr14 */
-    [X86_REG_CR15] = { .reg_id = REG_CTRL },  /* cr15 */
-    [X86_REG_DR0] = { .reg_id = REG_DEBUG },  /* dr0 */
-    [X86_REG_DR1] = { .reg_id = REG_DEBUG },  /* dr1 */
-    [X86_REG_DR2] = { .reg_id = REG_DEBUG },  /* dr2 */
-    [X86_REG_DR3] = { .reg_id = REG_DEBUG },  /* dr3 */
-    [X86_REG_DR4] = { .reg_id = REG_DEBUG },  /* dr4 */
-    [X86_REG_DR5] = { .reg_id = REG_DEBUG },  /* dr5 */
-    [X86_REG_DR6] = { .reg_id = REG_DEBUG },  /* dr6 */
-    [X86_REG_DR7] = { .reg_id = REG_DEBUG },  /* dr7 */
-    [X86_REG_DR8] = { .reg_id = REG_DEBUG },  /* dr8 */
-    [X86_REG_DR9] = { .reg_id = REG_DEBUG },  /* dr9 */
-    [X86_REG_DR10] = { .reg_id = REG_DEBUG },  /* dr10 */
-    [X86_REG_DR11] = { .reg_id = REG_DEBUG },  /* dr11 */
-    [X86_REG_DR12] = { .reg_id = REG_DEBUG },  /* dr12 */
-    [X86_REG_DR13] = { .reg_id = REG_DEBUG },  /* dr13 */
-    [X86_REG_DR14] = { .reg_id = REG_DEBUG },  /* dr14 */
-    [X86_REG_DR15] = { .reg_id = REG_DEBUG },  /* dr15 */
+    [X86_REG_CR0] = { .reg_id = REG_CTRL0, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "cr0" } },  /* cr0 */
+    [X86_REG_CR1] = { .reg_id = REG_CTRL1 },  /* cr1 */
+    [X86_REG_CR2] = { .reg_id = REG_CTRL2, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "cr2" } },  /* cr2 */
+    [X86_REG_CR3] = { .reg_id = REG_CTRL3, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "cr3" } },  /* cr3 */
+    [X86_REG_CR4] = { .reg_id = REG_CTRL4, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "cr4" } },  /* cr4 */
+    [X86_REG_CR5] = { .reg_id = REG_CTRL5 },  /* cr5 */
+    [X86_REG_CR6] = { .reg_id = REG_CTRL6 },  /* cr6 */
+    [X86_REG_CR7] = { .reg_id = REG_CTRL7 },  /* cr7 */
+    [X86_REG_CR8] = { .reg_id = REG_CTRL8, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "cr8" } },  /* cr8 */
+    [X86_REG_CR9] = { .reg_id = REG_CTRL9 },  /* cr9 */
+    [X86_REG_CR10] = { .reg_id = REG_CTRL10 },  /* cr10 */
+    [X86_REG_CR11] = { .reg_id = REG_CTRL11 },  /* cr11 */
+    [X86_REG_CR12] = { .reg_id = REG_CTRL12 },  /* cr12 */
+    [X86_REG_CR13] = { .reg_id = REG_CTRL13 },  /* cr13 */
+    [X86_REG_CR14] = { .reg_id = REG_CTRL14 },  /* cr14 */
+    [X86_REG_CR15] = { .reg_id = REG_CTRL15 },  /* cr15 */
+    [X86_REG_DR0] = { .reg_id = REG_DEBUG0 },  /* dr0 */
+    [X86_REG_DR1] = { .reg_id = REG_DEBUG1 },  /* dr1 */
+    [X86_REG_DR2] = { .reg_id = REG_DEBUG2 },  /* dr2 */
+    [X86_REG_DR3] = { .reg_id = REG_DEBUG3 },  /* dr3 */
+    [X86_REG_DR4] = { .reg_id = REG_DEBUG6 },  /* dr4 */
+    [X86_REG_DR5] = { .reg_id = REG_DEBUG7 },  /* dr5 */
+    [X86_REG_DR6] = { .reg_id = REG_DEBUG6 },  /* dr6 */
+    [X86_REG_DR7] = { .reg_id = REG_DEBUG7 },  /* dr7 */
+    [X86_REG_DR8] = { .reg_id = REG_DEBUG8 },  /* dr8 */
+    [X86_REG_DR9] = { .reg_id = REG_DEBUG9 },  /* dr9 */
+    [X86_REG_DR10] = { .reg_id = REG_DEBUG10 },  /* dr10 */
+    [X86_REG_DR11] = { .reg_id = REG_DEBUG11 },  /* dr11 */
+    [X86_REG_DR12] = { .reg_id = REG_DEBUG12 },  /* dr12 */
+    [X86_REG_DR13] = { .reg_id = REG_DEBUG13 },  /* dr13 */
+    [X86_REG_DR14] = { .reg_id = REG_DEBUG14 },  /* dr14 */
+    [X86_REG_DR15] = { .reg_id = REG_DEBUG15 },  /* dr15 */
     [X86_REG_FP0] = { .reg_id = REG_FPR0, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "st0" } },  /* fp0 */
     [X86_REG_FP1] = { .reg_id = REG_FPR1, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "st1" } },  /* fp1 */
     [X86_REG_FP2] = { .reg_id = REG_FPR2, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "st2" } },  /* fp2 */
@@ -160,14 +160,14 @@ static const RegClassification x86_reg_class[X86_REG_ENDING] = {
     [X86_REG_K5] = { .reg_id = REG_PRED5 },  /* k5 */
     [X86_REG_K6] = { .reg_id = REG_PRED6 },  /* k6 */
     [X86_REG_K7] = { .reg_id = REG_PRED7 },  /* k7 */
-    [X86_REG_MM0] = { .reg_id = REG_VEC0 },  /* mm0 */
-    [X86_REG_MM1] = { .reg_id = REG_VEC1 },  /* mm1 */
-    [X86_REG_MM2] = { .reg_id = REG_VEC2 },  /* mm2 */
-    [X86_REG_MM3] = { .reg_id = REG_VEC3 },  /* mm3 */
-    [X86_REG_MM4] = { .reg_id = REG_VEC4 },  /* mm4 */
-    [X86_REG_MM5] = { .reg_id = REG_VEC5 },  /* mm5 */
-    [X86_REG_MM6] = { .reg_id = REG_VEC6 },  /* mm6 */
-    [X86_REG_MM7] = { .reg_id = REG_VEC7 },  /* mm7 */
+    [X86_REG_MM0] = { .reg_id = REG_FPR0 },  /* mm0 */
+    [X86_REG_MM1] = { .reg_id = REG_FPR1 },  /* mm1 */
+    [X86_REG_MM2] = { .reg_id = REG_FPR2 },  /* mm2 */
+    [X86_REG_MM3] = { .reg_id = REG_FPR3 },  /* mm3 */
+    [X86_REG_MM4] = { .reg_id = REG_FPR4 },  /* mm4 */
+    [X86_REG_MM5] = { .reg_id = REG_FPR5 },  /* mm5 */
+    [X86_REG_MM6] = { .reg_id = REG_FPR6 },  /* mm6 */
+    [X86_REG_MM7] = { .reg_id = REG_FPR7 },  /* mm7 */
     [X86_REG_R8] = { .reg_id = REG_GPR6, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "r8" } },  /* r8 */
     [X86_REG_R9] = { .reg_id = REG_GPR7, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "r9" } },  /* r9 */
     [X86_REG_R10] = { .reg_id = REG_GPR8, .qemu_reg = { .feature = "org.gnu.gdb.i386.core", .name = "r10" } },  /* r10 */

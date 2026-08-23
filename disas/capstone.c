@@ -4326,6 +4326,35 @@ static void cap_riscv_push_reg_operand(csh handle, qemu_plugin_insn_info *out,
 }
 
 /*
+ * Append a memory operand addressed by a single base register.
+ *
+ * Used by the Zicfiss shadow-stack forms, whose access Capstone reports
+ * as no access at all.  Neither `size` nor `imm` is set: no RISC-V
+ * memory operand on this boundary carries either (see the RISCV_OP_MEM
+ * arm of cap_fill_generic_operands), and the dependency model reads
+ * only the addressing registers and the access direction from a MEM
+ * operand -- op->imm and op->size are not consulted for it.
+ */
+static void cap_riscv_push_mem_operand(csh handle, qemu_plugin_insn_info *out,
+                                       uint16_t base, uint8_t access)
+{
+    qemu_plugin_operand *op;
+
+    if (out->n_operands >= QEMU_PLUGIN_INSN_DETAIL_MAX_OPS) {
+        return;
+    }
+    op = &out->operands[out->n_operands];
+    memset(op, 0, sizeof(*op));
+    op->type   = QEMU_PLUGIN_OP_MEM;
+    op->access = access;
+    op->reg_id = base;
+    op->scale  = 1;
+    cap_copy_reg_name(op->reg_name, QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                      handle, base, CS_ARCH_RISCV);
+    out->n_operands++;
+}
+
+/*
  * Assembler aliases that hide an x0 SOURCE.
  *
  * `beqz a0, L` is `beq a0, x0, L`, `neg a0, a1` is `sub a0, x0, a1`,
@@ -5662,11 +5691,25 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
          * -- so they are recognised here from the instruction word and
          * the footprint is stated outright.
          *
-         *   sspush rs2    reads ssp and rs2, writes ssp   (rs2 in x1/x5)
-         *   sspopchk rs1  reads ssp and rs1, writes ssp   (rs1 in x1/x5)
+         *   sspush rs2    reads ssp and rs2, writes ssp, STORES to
+         *                 the shadow stack at ssp - XLEN/8
+         *   sspopchk rs1  reads ssp and rs1, writes ssp, LOADS from the
+         *                 shadow stack at ssp
          *   ssrdp rd      reads ssp, writes rd
          *   c.sspush x1 / c.sspopchk x5   the compressed pair, carved
          *                 out of c.mop.1 and c.mop.5
+         *
+         * THE MEMORY ACCESS IS THE INSTRUCTION.  A shadow stack lives in
+         * memory, and the first footprint written here named only the
+         * registers: `sspush`/`sspopchk` arrived with loads=0 stores=0,
+         * so a consumer driving a cache saw a push that touched nothing
+         * and the shadow stack generated no traffic at all.  QEMU's own
+         * translation is unambiguous -- trans_sspush emits
+         * `tcg_gen_qemu_st_tl`, trans_sspopchk emits `tcg_gen_qemu_ld_tl`
+         * (target/riscv/insn_trans/trans_rvzicfiss.c.inc) -- and the
+         * address is ssp, which is why ssp is the MEM operand's base and
+         * so becomes an address dependency as well as a data one.
+         * `ssrdp` genuinely touches no memory: it moves ssp to a GPR.
          *
          * ssp carries REG_SSP, an ID of its own: folding it onto REG_SP
          * manufactured an edge with every spill and local, and folding
@@ -5714,6 +5757,10 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                         handle, out,
                         (uint16_t)(RISCV_REG_X0 + (push ? rs2 : rs1)),
                         QEMU_PLUGIN_OP_ACC_READ);
+                    cap_riscv_push_mem_operand(handle, out, RISCV_REG_SSP,
+                                               push
+                                               ? QEMU_PLUGIN_OP_ACC_WRITE
+                                               : QEMU_PLUGIN_OP_ACC_READ);
                     cap_riscv_add_envcfg_gate(out);
                 } else if (rdp) {
                     cap_riscv_push_reg_operand(handle, out, RISCV_REG_SSP,
@@ -5744,6 +5791,10 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                     handle, out,
                     (uint16_t)(RISCV_REG_X0 + (half == 0x6081 ? 1 : 5)),
                     QEMU_PLUGIN_OP_ACC_READ);
+                cap_riscv_push_mem_operand(handle, out, RISCV_REG_SSP,
+                                           half == 0x6081
+                                           ? QEMU_PLUGIN_OP_ACC_WRITE
+                                           : QEMU_PLUGIN_OP_ACC_READ);
                 cap_riscv_add_envcfg_gate(out);
                 n = out->n_operands;
             }

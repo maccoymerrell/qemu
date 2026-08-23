@@ -154,6 +154,25 @@ void insn_dataflow_extract(unsigned num_insns);
 void insn_dataflow_note_gvec(uint32_t dofs, uint32_t aofs, uint32_t bofs,
                              uint32_t oprsz);
 
+/*
+ * CP-M -- the memop choke point.
+ *
+ * qemu_ld_i64 carries ONE input, the address temp, so a post-hoc walk over
+ * the ops makes the loaded value's provenance the ADDRESS registers:
+ * `mov (%rbx),%rax` becomes indistinguishable from `mov %rbx,%rax`, and
+ * load-to-use latency -- the single edge a consumer most needs -- is gone.
+ * qemu_st_i64 has no output at all, so a store's data and address
+ * provenance are both computed and then dropped.
+ *
+ * The emitter does not have to derive any of it: `val` is the data and
+ * `addr` is the address because they are separate parameters, and `mo`
+ * states the width.  So it says so, and nothing downstream has to guess.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+void insn_dataflow_note_memop(const void *val_ts, const void *addr_ts,
+                              unsigned size, bool is_store);
+
 /* The result for instruction @i of the TB just translated, or NULL. */
 const InsnDataflow *insn_dataflow_get(unsigned i);
 
@@ -184,6 +203,11 @@ static inline void insn_dataflow_extract(unsigned num_insns)
 
 static inline void insn_dataflow_note_gvec(uint32_t dofs, uint32_t aofs,
                                            uint32_t bofs, uint32_t oprsz)
+{ }
+
+static inline void insn_dataflow_note_memop(const void *val_ts,
+                                            const void *addr_ts,
+                                            unsigned size, bool is_store)
 { }
 
 #endif /* CONFIG_PLUGIN */

@@ -835,6 +835,47 @@ static void df_apply_gvec_notes(InsnDataflow *d, TCGOp *first, TCGOp *end)
     }
 }
 
+/*
+ * CP-M -- memop notes.  See insn_dataflow_note_memop() in the header.
+ *
+ * The emitter tells us which temp is the DATA and which is the ADDRESS,
+ * because they are separate parameters of tcg_gen_qemu_ld/st_*.  A post-hoc
+ * walk cannot recover that: qemu_ld_i64 has the address temp as its only
+ * input, so the loaded value's provenance comes out as the address
+ * registers.
+ */
+#define DF_MAX_MEMOP_NOTES 64
+
+typedef struct DfMemopNote {
+    const TCGOp *anchor;
+    const void *val_ts;
+    const void *addr_ts;
+    unsigned size;
+    bool is_store;
+} DfMemopNote;
+
+static DfMemopNote df_memop[DF_MAX_MEMOP_NOTES];
+static unsigned df_n_memop;
+static bool df_memop_overflow;
+
+void insn_dataflow_note_memop(const void *val_ts, const void *addr_ts,
+                              unsigned size, bool is_store)
+{
+    if (df_disabled()) {
+        return;
+    }
+    if (df_n_memop >= DF_MAX_MEMOP_NOTES) {
+        df_memop_overflow = true;
+        return;
+    }
+    df_memop[df_n_memop].anchor = QTAILQ_LAST(&tcg_ctx->ops);
+    df_memop[df_n_memop].val_ts = val_ts;
+    df_memop[df_n_memop].addr_ts = addr_ts;
+    df_memop[df_n_memop].size = size;
+    df_memop[df_n_memop].is_store = is_store;
+    df_n_memop++;
+}
+
 void insn_dataflow_extract(unsigned num_insns)
 {
     TCGContext *s = tcg_ctx;
@@ -908,6 +949,8 @@ void insn_dataflow_extract(unsigned num_insns)
     }
     df_n_gvec = 0;
     df_gvec_overflow = false;
+    df_n_memop = 0;
+    df_memop_overflow = false;
 
     if (prof) {
         df_prof_ns += df_now() - t0;

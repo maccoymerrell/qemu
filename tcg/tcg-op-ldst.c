@@ -23,6 +23,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "exec/insn-dataflow.h"
 #include "tcg/tcg.h"
 #include "tcg/tcg-temp-internal.h"
 #include "tcg/tcg-op-common.h"
@@ -278,6 +279,15 @@ static void tcg_gen_qemu_ld_i32_int(TCGv_i32 val, TCGTemp *addr,
             g_assert_not_reached();
         }
     }
+
+    /*
+     * CP-M: val is the DATA and addr is the ADDRESS because they are
+     * separate parameters here.  Downstream that distinction is gone --
+     * qemu_ld carries only the address temp as an input, so a walk makes
+     * the loaded value depend on the address registers.  Stated here, it
+     * survives.  Capture only.
+     */
+    insn_dataflow_note_memop(val, addr, memop_size(memop), false);
 }
 
 void tcg_gen_qemu_ld_i32_chk(TCGv_i32 val, TCGTemp *addr, TCGArg idx,
@@ -330,6 +340,15 @@ static void tcg_gen_qemu_st_i32_int(TCGv_i32 val, TCGTemp *addr,
     if (swap) {
         tcg_temp_free_i32(swap);
     }
+
+    /*
+     * CP-M: val is the DATA and addr is the ADDRESS because they are
+     * separate parameters here.  Downstream that distinction is gone --
+     * qemu_ld carries only the address temp as an input, so a walk makes
+     * the loaded value depend on the address registers.  Stated here, it
+     * survives.  Capture only.
+     */
+    insn_dataflow_note_memop(val, addr, memop_size(memop), true);
 }
 
 void tcg_gen_qemu_st_i32_chk(TCGv_i32 val, TCGTemp *addr, TCGArg idx,
@@ -396,6 +415,15 @@ static void tcg_gen_qemu_ld_i64_int(TCGv_i64 val, TCGTemp *addr,
             g_assert_not_reached();
         }
     }
+
+    /*
+     * CP-M: val is the DATA and addr is the ADDRESS because they are
+     * separate parameters here.  Downstream that distinction is gone --
+     * qemu_ld carries only the address temp as an input, so a walk makes
+     * the loaded value depend on the address registers.  Stated here, it
+     * survives.  Capture only.
+     */
+    insn_dataflow_note_memop(val, addr, memop_size(memop), false);
 }
 
 void tcg_gen_qemu_ld_i64_chk(TCGv_i64 val, TCGTemp *addr, TCGArg idx,
@@ -450,6 +478,15 @@ static void tcg_gen_qemu_st_i64_int(TCGv_i64 val, TCGTemp *addr,
     if (swap) {
         tcg_temp_free_i64(swap);
     }
+
+    /*
+     * CP-M: val is the DATA and addr is the ADDRESS because they are
+     * separate parameters here.  Downstream that distinction is gone --
+     * qemu_ld carries only the address temp as an input, so a walk makes
+     * the loaded value depend on the address registers.  Stated here, it
+     * survives.  Capture only.
+     */
+    insn_dataflow_note_memop(val, addr, memop_size(memop), true);
 }
 
 void tcg_gen_qemu_st_i64_chk(TCGv_i64 val, TCGTemp *addr, TCGArg idx,
@@ -655,6 +692,15 @@ static void tcg_gen_qemu_ld_i128_int(TCGv_i128 val, TCGTemp *addr,
 
     plugin_gen_mem_callbacks_i128(val, ext_addr, addr, orig_oi,
                                   QEMU_PLUGIN_MEM_R);
+
+    /*
+     * CP-M: val is the DATA and addr is the ADDRESS because they are
+     * separate parameters here.  Downstream that distinction is gone --
+     * qemu_ld carries only the address temp as an input, so a walk makes
+     * the loaded value depend on the address registers.  Stated here, it
+     * survives.  Capture only.
+     */
+    insn_dataflow_note_memop(val, addr, memop_size(memop), false);
 }
 
 void tcg_gen_qemu_ld_i128_chk(TCGv_i128 val, TCGTemp *addr, TCGArg idx,
@@ -771,6 +817,15 @@ static void tcg_gen_qemu_st_i128_int(TCGv_i128 val, TCGTemp *addr,
 
     plugin_gen_mem_callbacks_i128(val, ext_addr, addr, orig_oi,
                                   QEMU_PLUGIN_MEM_W);
+
+    /*
+     * CP-M: val is the DATA and addr is the ADDRESS because they are
+     * separate parameters here.  Downstream that distinction is gone --
+     * qemu_ld carries only the address temp as an input, so a walk makes
+     * the loaded value depend on the address registers.  Stated here, it
+     * survives.  Capture only.
+     */
+    insn_dataflow_note_memop(val, addr, memop_size(memop), true);
 }
 
 void tcg_gen_qemu_st_i128_chk(TCGv_i128 val, TCGTemp *addr, TCGArg idx,

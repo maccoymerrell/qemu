@@ -4857,7 +4857,21 @@ def _unsupported_reg_coverage(isa: str) -> set[str]:
     return {
         "x86_64": {
             "REG_BOUND0", "REG_BOUND1", "REG_BOUND2", "REG_BOUND3",
-            "REG_CTRL", "REG_DEBUG",
+            # The control and debug files.  `mov` to or from CR<n> or
+            # DR<n> is ring-0 and faults in user mode, so a generated
+            # user-mode body can never reach one; they are outside the
+            # genval baseline for the same reason the single IDs they
+            # replaced were.  Those single IDs -- REG_CTRL and
+            # REG_DEBUG -- were retired by d7049fea95 and named nothing
+            # in the reg table from then on, so this entry was
+            # simultaneously dead (two names no table row emits) and
+            # under-covering (thirty names the table does emit, left
+            # in `reachable_unseen`).  DR4/DR5 are deliberately absent:
+            # they alias DR6/DR7 under CR4.DE=0 and fault under
+            # CR4.DE=1, so the x86 table maps neither and listing them
+            # would put back a dead row.
+            *(f"REG_CTRL{i}" for i in range(16)),
+            *(f"REG_DEBUG{i}" for i in range(16) if i not in (4, 5)),
             *(f"REG_PRED{i}" for i in range(8)),
             *(f"REG_VEC{i}" for i in range(16, 32)),
         },

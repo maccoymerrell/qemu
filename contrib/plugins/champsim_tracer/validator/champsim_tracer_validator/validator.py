@@ -2980,6 +2980,97 @@ def _riscv_reads_v0_mask(mnem: str) -> bool:
         and mnem[-2] in ("v", "x", "i", "f")
 
 
+# ---------------------------------------------------------------------
+# AArch64 register-file and FP-family predicates.
+#
+# These mirror cap_aarch64_reg_file() / cap_aarch64_is_ieee_fp_op() /
+# cap_aarch64_is_bf16_nonieee() / cap_aarch64_is_saturating_int() in
+# disas/capstone.c.  The FP status/control contract turns on the operand
+# FORM, not the mnemonic alone: `fabs d2, d1` and `fabs v4.4s, v3.4s`
+# share a name and not a register contract.
+_A64_BITONLY = frozenset((
+    "fmov", "fabs", "fneg", "fcsel", "fdup", "fmovi", "fcpy",
+    "fexpa", "ftssel",
+))
+_A64_BF16_NONIEEE = ("bfdot", "bfmmla", "bfmopa", "bfmops", "bfvdot")
+_A64_BF_INTEGER = frozenset(("bfi", "bfxil", "bfc", "bfm"))
+
+
+def _a64_is_bf16_nonieee(mnem: str) -> bool:
+    return mnem.startswith(_A64_BF16_NONIEEE)
+
+
+def _a64_is_saturating_int(mnem: str) -> bool:
+    if mnem[:1] in ("s", "u") and mnem[1:2] == "q":
+        return True
+    return mnem.startswith(("suqadd", "usqadd"))
+
+
+def _a64_is_ieee_fp_op(mnem: str) -> bool:
+    if mnem in _A64_BITONLY:
+        return False
+    if mnem.startswith(("scvtf", "ucvtf")):
+        return True
+    if mnem.startswith("bf"):
+        if mnem in _A64_BF_INTEGER:
+            return False
+        return not _a64_is_bf16_nonieee(mnem)
+    return mnem.startswith("f")
+
+
+def _a64_reg_file(reg: int, _a64) -> str:
+    for base, name in ((_a64.AARCH64_REG_B0, "advsimd"),
+                       (_a64.AARCH64_REG_D0, "advsimd"),
+                       (_a64.AARCH64_REG_H0, "advsimd"),
+                       (_a64.AARCH64_REG_Q0, "advsimd"),
+                       (_a64.AARCH64_REG_S0, "advsimd"),
+                       (_a64.AARCH64_REG_P0, "sve"),
+                       (_a64.AARCH64_REG_Z0, "sve")):
+        if base <= reg < base + 32:
+            return name
+    if reg in (_a64.AARCH64_REG_ZA, _a64.AARCH64_REG_Z_MATRIX):
+        return "za"
+    if _a64.AARCH64_REG_ZAB0 <= reg <= _a64.AARCH64_REG_ZT0:
+        return "za"
+    return "other"
+
+
+def _a64_reg_files(d, ops, op_reg_kind, op_mem_kind, _a64) -> dict:
+    """Which register files this instruction's operands name."""
+    out = {"advsimd": False, "sve": False, "za": False, "arranged": False}
+    regs = []
+    for op in ops:
+        if op.type == op_reg_kind:
+            regs.append(int(getattr(op, "reg", 0) or 0))
+        elif op.type == op_mem_kind:
+            regs.append(int(getattr(op.mem, "base", 0) or 0))
+        elif op.type == _a64.AARCH64_OP_SME:
+            sme = getattr(op, "sme", None)
+            regs.append(int(getattr(sme, "tile", 0) or 0) if sme else 0)
+        if int(getattr(op, "vas", 0) or 0):
+            out["arranged"] = True
+    for cap_id in list(getattr(d, "regs_read", []) or []) + \
+            list(getattr(d, "regs_write", []) or []):
+        regs.append(int(cap_id))
+    for reg in regs:
+        f = _a64_reg_file(reg, _a64) if reg else "other"
+        if f in out:
+            out[f] = True
+    return out
+
+
+def _a64_has_pred_operand(ops, op_reg_kind, _a64) -> bool:
+    for op in ops:
+        if op.type == _a64.AARCH64_OP_PRED:
+            return True
+        if op.type == op_reg_kind:
+            reg = int(getattr(op, "reg", 0) or 0)
+            if reg and _a64_reg_file(reg, _a64) == "sve" and \
+                    _a64.AARCH64_REG_P0 <= reg < _a64.AARCH64_REG_P0 + 32:
+                return True
+    return False
+
+
 def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
                                 add, exp_src: set, exp_dst: set) -> None:
     """Mirror the decode-boundary corrections in `disas/capstone.c`.
@@ -3104,11 +3195,54 @@ def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
         # The FEAT_MOPS prologue reads the PSTATE.NZCV it then rewrites.
         if mnem.startswith(("cpyp", "cpyfp", "setp", "setgp")):
             add(exp_src, _a64.AARCH64_REG_NZCV)
-        # The FPCR read Capstone reports on these forms' siblings and
-        # not on them.
-        if (mnem.startswith(("fccmp", "fabs", "fneg", "fadda"))
-                or (mnem[:1] in ("s", "u") and mnem[1:2] == "q")):
-            add(exp_src, _a64.AARCH64_REG_FPCR)
+        # The FP status/control contract (cap_aarch64_fp_status_contract).
+        # FPCR is the FP datapath's INPUT and FPSR its OUTPUT; the
+        # generic space folds both onto REG_FCSR and Capstone has no id
+        # for FPSR, so both halves ride AARCH64_REG_FPCR.
+        _files = _a64_reg_files(d, ops, op_reg_kind, op_mem_kind, _a64)
+        if _a64_is_saturating_int(mnem):
+            # Integer saturating arithmetic reads no control word; the
+            # Advanced SIMD forms write FPSR.QC and the SVE / SME
+            # spellings of the same mnemonics write nothing.
+            exp_src.discard("REG_FCSR")
+            if _files["advsimd"] and not _files["sve"] and not _files["za"]:
+                add(exp_dst, _a64.AARCH64_REG_FPCR)
+        else:
+            if _a64_is_ieee_fp_op(mnem) or _a64_is_bf16_nonieee(mnem):
+                add(exp_src, _a64.AARCH64_REG_FPCR)
+            if mnem.startswith(("fabs", "fneg")) or mnem == "fmov":
+                # Scalar float form only: the vector and SVE forms clear,
+                # flip or copy bits and consult nothing.
+                if not _files["arranged"] and not _files["sve"]:
+                    add(exp_src, _a64.AARCH64_REG_FPCR)
+                else:
+                    exp_src.discard("REG_FCSR")
+            if _a64_is_ieee_fp_op(mnem) and not _files["za"]:
+                add(exp_dst, _a64.AARCH64_REG_FPCR)
+
+        # Operand directions Capstone states the wrong way round
+        # (cap_aarch64_operand_direction).
+        exp_dst.discard("REG_ZERO")
+        if mnem in ("eretaa", "eretab"):
+            exp_src.discard("REG_LR")
+        if mnem in ("fcmp", "fcmpe"):
+            exp_src.discard("REG_ZERO")
+        if mnem == "zero" or (mnem in ("mov", "mova")
+                              and not _a64_has_pred_operand(ops, op_reg_kind,
+                                                            _a64)):
+            # ZA as the DESTINATION is written and not read.  The other
+            # direction reads it and the predicated forms merge into it.
+            d0 = ops[0] if ops else None
+            tile = 0
+            if d0 is not None:
+                if d0.type == _a64.AARCH64_OP_SME:
+                    tile = int(getattr(getattr(d0, "sme", None), "tile", 0)
+                               or 0)
+                elif d0.type == op_reg_kind:
+                    tile = int(getattr(d0, "reg", 0) or 0)
+            if tile and _a64_reg_file(tile, _a64) == "za":
+                add(exp_dst, tile)
+                exp_src.discard("REG_MATRIX")
 
     elif isa == "riscv64":
         try:

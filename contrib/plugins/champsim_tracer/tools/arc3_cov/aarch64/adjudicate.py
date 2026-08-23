@@ -4,96 +4,135 @@ import csv, collections
 BASE = '/mnt/md0/QEMU/cst_runs/_arc3_cov/aarch64'
 
 # signature -> (who is right, why)
+#
+# Every entry is adjudicated against the rank-1 reference read as
+# PSEUDOCODE -- the named .xml page is quoted -- with QEMU's own
+# translator as a second, independent reading wherever the architecture
+# leaves a choice.  A verdict of REFERENCE DEFECT is never asserted from
+# plausibility: it names the mechanism in the extractor that produced the
+# wrong answer.
 ADJ = {
- 'SRC+ref:FCSR': ('TRACER MISSES A READ',
-    'FPCR is an input: BF16 (FPCR.EBF) on bfdot/bfmmla/bfmlal, the rounding '
-    'mode on fixed-point fcvtz*/scvtf/ucvtf, and FPCR.NEP merging on the '
-    'fmov register-file moves.  13 of these rows are fmov, where the MRA '
-    'block reads FPCR unconditionally but the value reaches no result on '
-    'the FtoI direction -- those are reference-side over-reports.'),
- 'SRC+trc:FCSR': ('TRACER INVENTS A READ',
-    'fabs/fneg are sign-bit operations and the integer saturating ops '
-    '(sqabs/sqadd/sqshl...) consult no control word; the MRA execute ASL '
-    'contains no FPCR read on any path.'),
- 'DST+ref:FCSR': ('TRACER MISSES A WRITE',
-    'the cumulative FP exception bits (FPSR.IXC/IOC/OFC/UFC/IDC) and the '
-    'saturation bit FPSR.QC are written.  R5 governs: the write is '
-    'conditional on the operation raising the condition, and an inert '
-    'write is still a write.'),
- 'DST+ref:FCSR SRC+ref:FCSR': ('TRACER MISSES BOTH',
-    'same class, on ops that both read FPCR and write FPSR.'),
- 'DST+ref:FCSR SRC+trc:FCSR': ('TRACER HAS THE DIRECTION BACKWARDS',
-    'integer saturating arithmetic writes FPSR.QC and reads nothing; the '
-    'tracer records the status word as a SOURCE and omits the write.'),
- 'SRC+ref:SYS': ('TRACER MISSES A READ',
-    'the pointer-authentication key registers (APIAKey_EL1 / APIBKey_EL1 / '
-    'APDAKey_EL1 / APDBKey_EL1 / APGAKey_EL1) are inputs to pac*/aut*/'
-    'blra*/braa*, and GCR_EL1 is an input to addg/subg/irg.'),
- 'SRC+ref:SYS SRC+ref:ZERO': ('TRACER MISSES TWO READS',
-    'the PAC key, plus the xzr modifier operand of the *Z forms.'),
- 'SRC+ref:VEC#': ('TRACER MISSES A READ',
-    'ldff1* is a read-modify-write of its destination: elements not loaded '
-    'because the first-fault check stopped the access keep their previous '
-    'value (Elem[result,e] = Elem[orig,e] in the execute ASL).'),
- 'SRC+ref:FLAGS': ('TRACER MISSES A READ',
-    'the MOPS prologue instructions test PSTATE.C to detect a wrong-option '
-    'restart (cpyp.xml lines 87/93); NZCV is a genuine input.'),
- 'SRC+ref:FLAGS SRC+ref:SYS': ('TRACER MISSES TWO READS',
-    'MOPS prologue NZCV plus GCR_EL1 on the tag-setting setgp* forms.'),
- 'SRC+ref:ZERO': ('TRACER MISSES A READ',
-    'the encoded operand is xzr/wzr (mov=orr Rn=31, mneg=msub Ra=31, '
-    'cset=csinc Rn=Rm=31).  The tracer CAN name it -- it emits REG_ZERO '
-    'elsewhere, and --keep-zero does not change the answer -- so this is '
-    'an omission, not a fold.  LLVM MC agrees with the reference.'),
- 'SRC+trc:ZERO': ('TRACER INVENTS A READ', 'see the fcmp #0.0 class.'),
- 'DST+ref:FCSR SRC+trc:ZERO': ('TRACER INVENTS A READ AND MISSES A WRITE',
-    'fcmp/fcmpe against #0.0: the zero is an IMMEDIATE, not the zero '
-    'register, and the FPSR exception write is absent.'),
- 'DST+trc:ZERO': ('TRACER INVENTS A WRITE',
-    'a write to xzr is architecturally discarded (casp with an xzr pair).'),
- 'SRC+trc:MATRIX': ('TRACER INVENTS A READ',
-    'these SME2 forms are write-only into ZA: the execute ASL computes the '
-    'result from the Z operands alone and stores it (ZAvector[vec,VL] = '
-    'result).  The accumulating forms -- add_za_zw, the *_za_zzi group -- '
-    'do read ZA, and there the tracer agrees, so the model is not simply '
-    'always-read.'),
- 'SRC+ref:MATRIX': ('TRACER MISSES A READ',
-    'movt zt0[8], x2 writes one slice of ZT0 and preserves the rest.'),
- 'DST+ref:MATRIX SRC+trc:MATRIX': ('TRACER HAS THE DIRECTION BACKWARDS',
-    'zero {za0.d} writes ZA; the tracer records a read and no write.'),
- 'DST+ref:SYS': ('TRACER MISSES A WRITE',
-    'the sys-instruction group produces architectural results: at -> '
-    'PAR_EL1, the gcs push/pop forms -> GCSPR_ELx.'),
- 'DST+ref:SYS SRC+ref:ZERO': ('TRACER MISSES A WRITE AND A READ', 'as above.'),
- 'DST+ref:SYS SRC+ref:SYS': ('TRACER MISSES BOTH',
-    'esb reads and writes DISR_EL1; irg reads and writes RGSR_EL1/GCR_EL1.'),
- 'SRC+ref:SYS SRC+trc:LR': ('TRACER NAMES THE WRONG REGISTER',
-    'eretaa/eretab authenticate ELR_EL1, a system register.  The tracer '
-    'records x30 (REG_LR), which the instruction does not touch.'),
- 'SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:SYS':
-    ('TRACER MISSES SEVEN READS',
-     'st64b/st64bv0 send a 512-bit payload held in eight consecutive X '
-     'registers; the tracer records two.'),
- 'SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:SYS':
-    ('TRACER MISSES SIX READS', 'st64bv, same class.'),
- 'DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# SRC+ref:SYS':
-    ('TRACER MISSES SEVEN WRITES',
-     'ld64b returns 512 bits into eight consecutive X registers; the '
-     'tracer records one destination.'),
- 'DST+ref:GPR# DST+ref:SYS SRC+ref:GPR# SRC+ref:SYS': ('TRACER MISSES EVERYTHING',
+ # ---------------------------------------------------------- open, tracer
+ 'SRC+ref:VEC#': ('TRACER RIGHT -- REFERENCE DEFECT (CONSTRAINED UNPREDICTABLE)',
+    'ldff1*/ldnf1* after a suppressed access.  ldff1b_z_p_br.xml offers '
+    'three behaviours for the elements past the fault -- '
+    'ConstrainUnpredictableBool(Unpredictable_SVELDNFDATA) keeps the data, '
+    'Unpredictable_SVELDNFZERO zeroes, and the final else MERGES from '
+    '`bits(VL) orig = Z[t, VL]`.  The extractor answers FALSE to every '
+    'ConstrainUnpredictableBool, which lands on the merge arm and makes the '
+    'destination a source.  That is an extractor default, not an '
+    'architectural requirement: QEMU picks the ZERO arm -- sve_ldnfff1_r() '
+    'in target/arm/tcg/sve_helper.c, "After any fault, zero the other '
+    'elements", swap_memzero(vd, reg_off).  R6/R7: the tracer records the '
+    'implementation it traces, so no Zt read.  76 rows.'),
+ 'SRC+ref:ZERO': ('TRACER DEFECT -- OPEN',
+    'the encoded operand is xzr/wzr and the printed alias hides it '
+    '(mov = orr Rn=31, mul = madd Ra=31, neg = sub Rn=31, cset = csinc '
+    'Rn=Rm=31, and the pac*Z/aut*Z/ldraa modifier).  The tracer names '
+    'REG_ZERO whenever Capstone prints it -- 33 rows do -- so this is the '
+    'ret-alias loss again, on the operand rather than the implicit list, '
+    'and it is an inconsistency in the tracer rather than a modelling '
+    'choice.  Not fixed here: it needs the alias-to-base-form mapping '
+    'Capstone exposes only through cs_regs_access(), whose staleness '
+    'across decodes is already documented at AARCH64_INS_ALIAS_RET.  '
+    '46 rows.'),
+ 'SRC+ref:FLAGS': ('TRACER RIGHT -- REFERENCE DEFECT (LIVENESS)',
+    'the MOPS PROLOGUE (cpyfp/cpyp/setp/setgp and variants).  cpyfp.xml '
+    'reads `bits(4) nzcv = PSTATE.<N,Z,C,V>` at the top and then, in the '
+    'prologue branch, overwrites it on BOTH arms -- `nzcv = \'0000\'` when '
+    'CPYFOptionA() and `nzcv = \'0010\'` when not -- before any use.  The '
+    '`if nzcv<1> == \'1\' // PSTATE.C` wrong-option test is in the ELSE '
+    'branch, which is the Main and Epilogue stages.  The measurement '
+    'confirms the split exactly: all 40 Main and all 40 Epilogue rows '
+    'AGREE, with the tracer naming FLAGS; only the 40 prologue rows '
+    'disagree.  The extractor\'s liveness rule missed a local rebound on '
+    'both arms of an if/else.  42 rows.'),
+ 'DST+trc:FCSR SRC+trc:FCSR': ('REFERENCE GAP -- RANK 2 HAS NO FP STATUS MODEL',
+    'the post-2022-12 FP8 and FAMINMAX additions (f1cvt/f2cvt/bf1cvt/'
+    'bf2cvt families, famax/famin, fmlall*, fcvtnb, fvdotb) and the SVE2 '
+    'quadword reductions, probed against LLVM MC because the 2022-12 MRA '
+    'does not name them.  LLVM MC models no FPSR at all and reports FPCR '
+    'on no FP instruction, so it cannot adjudicate either half of the FP '
+    'status/control contract.  51 rows, all rank 2.'),
+ 'DST+trc:FCSR': ('MIXED -- 10 RANK-2 GAP, 5 REFERENCE DEFECT',
+    'famax/famin are rank-2 rows (see above).  The five frecpe rows are '
+    'rank 1 and are a reference under-report: FPRecipEstimate is one of '
+    'the shared functions the extractor cannot parse, named in its own '
+    'LIMITATIONS, and FRECPE does raise IDC/IOC/DZC.  15 rows.'),
+ 'DST+ref:SYS': ('TRACER DEFECT -- OPEN',
+    'the system-instruction group produces architectural results the '
+    'tracer does not record: AT -> PAR_EL1, the GCS push/pop forms -> '
+    'GCSPR_ELx, TRCIT, the DC/CFP/CPP/DVP/COSP context operations.  '
+    'Capstone models these as AARCH64_OP_SYSALIAS with no register at '
+    'all, so naming the result needs an encoding->register table the '
+    'boundary does not yet carry.  12 rows.'),
+ 'SRC+trc:FCSR': ('TRACER DEFECT -- OPEN (3 rows) / REFERENCE (9)',
+    'after the FP status/control contract landed, what remains is fmov '
+    'immediate forms (`fmov d2, #2.125`), where the tracer applies the '
+    'scalar-merge rule and the reference reports no read because the '
+    'immediate path never consults FPCR, and rank-2 rows.  12 rows.'),
+ 'SRC+ref:SYS': ('MIXED -- 8 TRACER DEFECT, 2 SUBSUMED',
+    'what survives the removal of the enabling-condition and translation-'
+    'configuration leak (see METHOD): GCR_EL1 on addg/subg, GMID_EL1 on '
+    'ldgm/stgm, DCZID_EL0 on stzgm, ELR_ELx/SPSR_ELx on eret/eretaa/'
+    'eretab, GCSPR_ELx on gcspopm/gcsss2.  Those are genuine operands the '
+    'tracer does not name.  NOT the pointer-authentication keys: AddPACIA '
+    'does read APIAKeyHi_EL1:APIAKeyLo_EL1, but the extractor never '
+    'reports them, so this measurement is silent about that read on both '
+    'sides -- a blind spot, recorded rather than scored.  10 rows.'),
+ 'SRC+trc:MATRIX': ('TRACER DEFECT -- OPEN',
+    'the SME2 ADD/SUB "array results" forms (add_za_zzv / add_za_zzw and '
+    'the SUB twins).  add_za_zzv.xml computes from the Z operands alone '
+    'and stores -- `ZAvector[vec, VL] = result` -- with no read.  The '
+    'ACCUMULATE form add_za_zw does read ZA and there the tracer agrees.  '
+    'Capstone reports both with the same operand types and the same '
+    'READ|WRITE access on the tile, and a count-based discriminator '
+    'collides (a 4x4 accumulate and a 2x2 results form both carry four Z '
+    'registers), so this waits for ARC 3\'s QEMU-derived dataflow.  '
+    '8 rows.'),
+ 'DST+ref:SYS SRC+ref:ZERO': ('TRACER DEFECT -- OPEN',
+    'the GCS push/pop forms: the sysalias result register (see '
+    'DST+ref:SYS) plus the hidden xzr operand (see SRC+ref:ZERO).  '
+    '4 rows.'),
+ 'SRC+ref:FCSR': ('TRACER DEFECT -- OPEN',
+    'two fmov element forms (`fmov v2.d[1], x1`, `fmov x2, v1.d[1]`), '
+    'where the scalar-merge rule is scoped off by the arrangement '
+    'specifier the element syntax carries.  2 rows.'),
+ 'SRC+ref:MATRIX': ('TRACER DEFECT -- OPEN',
+    'movt zt0[8], x2 writes one slice of ZT0 and preserves the rest, so '
+    'the destination is also a source.  1 row.'),
+ 'SRC+ref:GPR#': ('TRACER DEFECT -- OPEN',
+    'psel takes its slice index from w12; Capstone reports the operand '
+    'as AARCH64_OP_PRED with the vector-select register in '
+    'pred.vec_select, which the operand walk does not read.  1 row.'),
+ 'SRC+trc:VEC#': ('TRACER DEFECT -- OPEN',
+    'pmov Zd, Pn.B with imm == 0 writes the whole destination -- '
+    'pmov_z_pi.xml takes `result = Zeros(VL)` on that path and '
+    '`result = Z[d, VL]` only when imm != 0.  1 row.'),
+ 'DST+ref:GPR# SRC+ref:SYS SRC+trc:GPR#': ('TRACER DEFECT -- OPEN',
+    'sysl reads a system register into Xt; the tracer has the direction '
+    'of Xt inverted.  1 row.'),
+ 'DST+trc:GPR#': ('TRACER DEFECT -- OPEN',
+    'ldg has no base-register writeback; the tracer records one.  1 row.'),
+ 'DST+ref:SYS SRC+ref:SYS': ('TRACER DEFECT -- OPEN',
+    'esb reads and writes DISR_EL1; irg reads and writes '
+    'RGSR_EL1/GCR_EL1.  1 row.'),
+ 'DST+ref:GPR# DST+ref:SYS SRC+ref:GPR#': ('TRACER DEFECT -- OPEN',
     'hint #35 is chkfeat x16: it reads and writes x16 and reads the '
-    'feature registers.  The tracer records no operand at all.'),
- 'DST+trc:GPR# SRC+ref:SYS': ('TRACER INVENTS A WRITE AND MISSES A READ',
-    'ldg has no base-register writeback; the tracer records one.'),
- 'SRC+ref:GPR#': ('TRACER MISSES A READ',
-    'psel takes the slice index from w12; the tracer omits the GPR.'),
- 'SRC+trc:VEC#': ('TRACER INVENTS A READ',
-    'pmov Zd, Pn.B writes the whole destination.'),
- 'SRC+trc:FLAGS': ('REFERENCE-SIDE FOLD, TRACER RIGHT -- now resolved',
-    'kept for the record: rmif/setf8/setf16 update a SUBSET of NZCV, so a '
-    'model that folds the four flags onto one register must call the '
-    'destination a source.  The reference now applies that rule (R5) and '
-    'these rows agree.'),
+    'feature registers.  The tracer records no operand at all.  1 row.'),
+ 'SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:SYS':
+    ('TRACER DEFECT -- OPEN',
+     'st64b/st64bv0 send a 512-bit payload held in eight consecutive X '
+     'registers; the tracer records two.  1 row.'),
+ 'SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR#':
+    ('TRACER DEFECT -- OPEN', 'st64bv, same class.  1 row.'),
+ 'SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR#':
+    ('TRACER DEFECT -- OPEN', 'st64bv0 variant, same class.  1 row.'),
+ 'DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR#':
+    ('TRACER DEFECT -- OPEN',
+     'ld64b returns 512 bits into eight consecutive X registers; the '
+     'tracer records one destination.  1 row.'),
+ # ------------------------------------------------------- reference-side
  'SRC+trc:GPR# SRC+trc:GPR#': ('REFERENCE GAP -- NOT A TRACER DEFECT',
     'sysp/tlbip are the 128-bit system-instruction pair form, whose '
     'execute ASL bottoms out in an operation this extractor does not '
@@ -108,9 +147,31 @@ ADJ = {
     'tlbi vmalle1is: the chosen representative encoding carries Rt=28 in a '
     'field the alias requires to be 0b11111, so the reference reads an X '
     'register the real encoding does not have.'),
- 'DST+ref:GPR# SRC+ref:SYS SRC+trc:GPR#': ('MIXED',
-    'sysl writes its result into Xt from a system register; the tracer has '
-    'the direction of Xt inverted.'),
+ # ------------------------------------------------ closed by this session
+ 'DST+ref:FCSR': ('CLOSED -- TRACER FIXED',
+    'the FPSR cumulative-exception write, absent from every FP '
+    'instruction.  Added by the FP status/control contract in '
+    'disas/capstone.c.  405 rows at the start of this session.'),
+ 'DST+ref:FCSR SRC+ref:FCSR': ('CLOSED -- TRACER FIXED',
+    'same class, on the forms that also read FPCR.  233 rows.'),
+ 'DST+ref:FCSR SRC+trc:FCSR': ('CLOSED -- TRACER FIXED',
+    'integer saturating arithmetic: FPSR.QC written, nothing read.  The '
+    'tracer had the direction backwards.  72 rows.'),
+ 'SRC+trc:ZERO': ('CLOSED -- TRACER FIXED',
+    'fcmp/fcmpe against #0.0: the zero is an IMMEDIATE, not the zero '
+    'register.  6 rows.'),
+ 'DST+trc:ZERO': ('CLOSED -- TRACER FIXED',
+    'a write to xzr is architecturally discarded.  3 rows.'),
+ 'SRC+ref:SYS SRC+trc:LR': ('CLOSED -- TRACER FIXED',
+    'eretaa/eretab do not touch x30.  2 rows; what remains on those rows '
+    'is the ELR_ELx read, counted under SRC+ref:SYS.'),
+ 'DST+ref:MATRIX SRC+trc:MATRIX': ('CLOSED -- TRACER FIXED',
+    'zero {za0.d} writes ZA; the tracer recorded a read and no write.  '
+    '1 row.'),
+ 'SRC+trc:FLAGS': ('CLOSED -- REFERENCE FIXED',
+    'rmif/setf8/setf16 update a SUBSET of NZCV, so a model that folds the '
+    'four flags onto one register must call the destination a source.  '
+    'The reference applies that rule (R5) and these rows agree.'),
 }
 
 

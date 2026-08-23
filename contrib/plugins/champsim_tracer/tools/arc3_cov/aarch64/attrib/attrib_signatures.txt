@@ -1,51 +1,6 @@
-TOTALS {'agree': 2779, 'disagree': 1141, 'agree_with_tierB_refonly': 602}
+TOTALS {'agree': 3625, 'disagree': 295, 'agree_with_tierB_refonly': 1936}
 
 DISAGREEMENT SIGNATURES (largest first)
-   275  SRC+ref:FCSR
-        eg BFDOT_asimdelem_E | bfdot v1.4s, v6.8h, v20.2h[2] | ref S{FCSR,VEC1,VEC20,VEC6} D{VEC1} | trc S{VEC1,VEC20,VEC6} D{VEC1}
-        eg BFDOT_asimdsame2_D | bfdot v4.4s, v3.8h, v2.8h | ref S{FCSR,VEC2,VEC3,VEC4} D{VEC4} | trc S{VEC2,VEC3,VEC4} D{VEC4}
-        eg BFMMLA_asimdsame2_E | bfmmla v3.4s, v2.8h, v1.8h | ref S{FCSR,VEC1,VEC2,VEC3} D{VEC3} | trc S{VEC1,VEC2,VEC3} D{VEC3}
-        eg FCVTZS_asimdshf_C | fcvtzs v5.8h, v4.8h, #13 | ref S{FCSR,VEC4} D{VEC5} | trc S{VEC4} D{VEC5}
-        eg FCVTZS_asisdshf_C | fcvtzs d30, d16, #28 | ref S{FCSR,VEC16} D{VEC30} | trc S{VEC16} D{VEC30}
-        eg FCVTZU_asimdshf_C | fcvtzu v5.8h, v4.8h, #13 | ref S{FCSR,VEC4} D{VEC5} | trc S{VEC4} D{VEC5}
-        eg FCVTZU_asisdshf_C | fcvtzu s27, s0, #9 | ref S{FCSR,VEC0} D{VEC27} | trc S{VEC0} D{VEC27}
-        eg FMOV_32H_float2int | fmov w2, h1 | ref S{FCSR,VEC1} D{GPR2} | trc S{VEC1} D{GPR2}
-   175  SRC+trc:FCSR
-        eg FABS_asimdmisc_R | fabs v4.4s, v3.4s | ref S{VEC3} D{VEC4} | trc S{FCSR,VEC3} D{VEC4}
-        eg FABS_asimdmiscfp16_R | fabs v3.8h, v2.8h | ref S{VEC2} D{VEC3} | trc S{FCSR,VEC2} D{VEC3}
-        eg FNEG_asimdmisc_R | fneg v4.4s, v3.4s | ref S{VEC3} D{VEC4} | trc S{FCSR,VEC3} D{VEC4}
-        eg FNEG_asimdmiscfp16_R | fneg v3.8h, v2.8h | ref S{VEC2} D{VEC3} | trc S{FCSR,VEC2} D{VEC3}
-        eg fabs_z_p_z_ | fabs z4.h, p2/m, z3.h | ref S{PRED2,VEC3,VEC4} D{VEC4} | trc S{FCSR,PRED2,VEC3,VEC4} D{VEC4}
-        eg fneg_z_p_z_ | fneg z4.h, p2/m, z3.h | ref S{PRED2,VEC3,VEC4} D{VEC4} | trc S{FCSR,PRED2,VEC3,VEC4} D{VEC4}
-        eg sqabs_z_p_z_ | sqabs z4.h, p2/m, z3.h | ref S{PRED2,VEC3,VEC4} D{VEC4} | trc S{FCSR,PRED2,VEC3,VEC4} D{VEC4}
-        eg sqadd_z_p_zz_ | sqadd z4.h, p2/m, z4.h, z3.h | ref S{PRED2,VEC3,VEC4} D{VEC4} | trc S{FCSR,PRED2,VEC3,VEC4} D{VEC4}
-   164  DST+ref:FCSR
-        eg BFCVTN_asimdmisc_4S | bfcvtn v11.4h, v27.4s | ref S{FCSR,VEC27} D{FCSR,VEC11} | trc S{FCSR,VEC27} D{VEC11}
-        eg BFCVT_BS_floatdp1 | bfcvt h2, s1 | ref S{FCSR,VEC1} D{FCSR,VEC2} | trc S{FCSR,VEC1} D{VEC2}
-        eg FABD_asimdsame_only | fabd v5.4s, v4.4s, v3.4s | ref S{FCSR,VEC3,VEC4} D{FCSR,VEC5} | trc S{FCSR,VEC3,VEC4} D{VEC5}
-        eg FABD_asimdsamefp16_only | fabd v4.8h, v3.8h, v2.8h | ref S{FCSR,VEC2,VEC3} D{FCSR,VEC4} | trc S{FCSR,VEC2,VEC3} D{VEC4}
-        eg FABD_asisdsame_only | fabd d4, d3, d2 | ref S{FCSR,VEC2,VEC3} D{FCSR,VEC4} | trc S{FCSR,VEC2,VEC3} D{VEC4}
-        eg FABD_asisdsamefp16_only | fabd h3, h2, h1 | ref S{FCSR,VEC1,VEC2} D{FCSR,VEC3} | trc S{FCSR,VEC1,VEC2} D{VEC3}
-        eg FACGE_asimdsame_only | facge v5.4s, v4.4s, v3.4s | ref S{FCSR,VEC3,VEC4} D{FCSR,VEC5} | trc S{FCSR,VEC3,VEC4} D{VEC5}
-        eg FACGE_asimdsamefp16_only | facge v4.8h, v3.8h, v2.8h | ref S{FCSR,VEC2,VEC3} D{FCSR,VEC4} | trc S{FCSR,VEC2,VEC3} D{VEC4}
-   128  SRC+ref:SYS
-        eg ADDG_64_addsub_immtags | addg x4, x3, #16, #2 | ref S{GPR3,SYS} D{GPR4} | trc S{GPR3} D{GPR4}
-        eg AUTDA_64P_dp_1src | autda x2, x1 | ref S{GPR1,GPR2,SYS} D{GPR2} | trc S{GPR1,GPR2} D{GPR2}
-        eg AUTDB_64P_dp_1src | autdb x2, x1 | ref S{GPR1,GPR2,SYS} D{GPR2} | trc S{GPR1,GPR2} D{GPR2}
-        eg AUTIA1716_HI_hints | autia1716 | ref S{GPR16,GPR17,SYS} D{GPR17} | trc S{GPR16,GPR17} D{GPR17}
-        eg AUTIASP_HI_hints | autiasp | ref S{LR,SP,SYS} D{LR} | trc S{LR,SP} D{LR}
-        eg AUTIA_64P_dp_1src | autia x2, x1 | ref S{GPR1,GPR2,SYS} D{GPR2} | trc S{GPR1,GPR2} D{GPR2}
-        eg AUTIB1716_HI_hints | autib1716 | ref S{GPR16,GPR17,SYS} D{GPR17} | trc S{GPR16,GPR17} D{GPR17}
-        eg AUTIBSP_HI_hints | autibsp | ref S{LR,SP,SYS} D{LR} | trc S{LR,SP} D{LR}
-    92  DST+ref:FCSR SRC+ref:FCSR
-        eg FACLE_facge_p_p_zz_ | facge p8.h, p0/z, z13.h, z24.h | ref S{FCSR,PRED0,VEC13,VEC24} D{FCSR,PRED8} | trc S{PRED0,VEC13,VEC24} D{PRED8}
-        eg FACLT_facgt_p_p_zz_ | facgt p12.h, p1/z, z10.h, z22.h | ref S{FCSR,PRED1,VEC10,VEC22} D{FCSR,PRED12} | trc S{PRED1,VEC10,VEC22} D{PRED12}
-        eg FCMLE_fcmge_p_p_zz_ | fcmge p14.s, p1/z, z5.s, z4.s | ref S{FCSR,PRED1,VEC4,VEC5} D{FCSR,PRED14} | trc S{PRED1,VEC4,VEC5} D{PRED14}
-        eg FCMLT_fcmgt_p_p_zz_ | fcmgt p5.s, p5/z, z7.s, z6.s | ref S{FCSR,PRED5,VEC6,VEC7} D{FCSR,PRED5} | trc S{PRED5,VEC6,VEC7} D{PRED5}
-        eg bfadd_z_p_zz_ | bfadd z3.h, p1/m, z3.h, z2.h | ref S{FCSR,PRED1,VEC2,VEC3} D{FCSR,VEC3} | trc S{PRED1,VEC2,VEC3} D{VEC3}
-        eg bfadd_z_zz_ | bfadd z3.h, z2.h, z1.h | ref S{FCSR,VEC1,VEC2} D{FCSR,VEC3} | trc S{VEC1,VEC2} D{VEC3}
-        eg bfcvt_z_mz2_ | bfcvt z2.h, { z2.s, z3.s } | ref S{FCSR,VEC2,VEC3} D{FCSR,VEC2} | trc S{VEC2,VEC3} D{VEC2}
-        eg bfcvt_z_p_z_s2bf | bfcvt z3.h, p1/m, z2.s | ref S{FCSR,PRED1,VEC2,VEC3} D{FCSR,VEC3} | trc S{PRED1,VEC2,VEC3} D{VEC3}
     76  SRC+ref:VEC#
         eg ldff1b_z_p_ai_d | ldff1b { z4.d }, p2/z, [z3.d, #1] | ref S{FFR,PRED2,VEC3,VEC4} D{FFR,VEC4} | trc S{FFR,PRED2,VEC3} D{FFR,VEC4}
         eg ldff1b_z_p_ai_s | ldff1b { z4.s }, p2/z, [z3.s, #1] | ref S{FFR,PRED2,VEC3,VEC4} D{FFR,VEC4} | trc S{FFR,PRED2,VEC3} D{FFR,VEC4}
@@ -55,16 +10,25 @@ DISAGREEMENT SIGNATURES (largest first)
         eg ldff1b_z_p_br_u8 | ldff1b { z4.b }, p2/z, [x3, x1] | ref S{FFR,GPR1,GPR3,PRED2,VEC4} D{FFR,VEC4} | trc S{FFR,GPR1,GPR3,PRED2} D{FFR,VEC4}
         eg ldff1b_z_p_bz_d_64_unscaled | ldff1b { z4.d }, p2/z, [x3, z1.d] | ref S{FFR,GPR3,PRED2,VEC1,VEC4} D{FFR,VEC4} | trc S{FFR,GPR3,PRED2,VEC1} D{FFR,VEC4}
         eg ldff1b_z_p_bz_d_x32_unscaled | ldff1b { z5.d }, p3/z, [x4, z2.d,  | ref S{FFR,GPR4,PRED3,VEC2,VEC5} D{FFR,VEC5} | trc S{FFR,GPR4,PRED3,VEC2} D{FFR,VEC5}
-    72  DST+ref:FCSR SRC+trc:FCSR
-        eg SQABS_asimdmisc_R | sqabs v4.4s, v3.4s | ref S{VEC3} D{FCSR,VEC4} | trc S{FCSR,VEC3} D{VEC4}
-        eg SQABS_asisdmisc_R | sqabs h3, h2 | ref S{VEC2} D{FCSR,VEC3} | trc S{FCSR,VEC2} D{VEC3}
-        eg SQADD_asimdsame_only | sqadd v5.4s, v4.4s, v3.4s | ref S{VEC3,VEC4} D{FCSR,VEC5} | trc S{FCSR,VEC3,VEC4} D{VEC5}
-        eg SQADD_asisdsame_only | sqadd h4, h3, h2 | ref S{VEC2,VEC3} D{FCSR,VEC4} | trc S{FCSR,VEC2,VEC3} D{VEC4}
-        eg SQDMLAL_asimddiff_L | sqdmlal v1.4s, v20.4h, v7.4h | ref S{VEC1,VEC20,VEC7} D{FCSR,VEC1} | trc S{FCSR,VEC1,VEC20,VEC7} D{VEC1}
-        eg SQDMLAL_asimdelem_L | sqdmlal v1.2d, v19.2s, v4.s[0] | ref S{VEC1,VEC19,VEC4} D{FCSR,VEC1} | trc S{FCSR,VEC1,VEC19,VEC4} D{VEC1}
-        eg SQDMLAL_asisddiff_only | sqdmlal s4, h3, h2 | ref S{VEC2,VEC3,VEC4} D{FCSR,VEC4} | trc S{FCSR,VEC2,VEC3,VEC4} D{VEC4}
-        eg SQDMLAL_asisdelem_L | sqdmlal s1, h6, v4.h[5] | ref S{VEC1,VEC4,VEC6} D{FCSR,VEC1} | trc S{FCSR,VEC1,VEC4,VEC6} D{VEC1}
-    38  SRC+ref:FLAGS
+    51  DST+trc:FCSR SRC+trc:FCSR
+        eg LLVM_MC:BF1CVTL2_1 | bf1cvtl2 v2.8h, v1.16b | ref S{VEC1} D{VEC2} | trc S{FCSR,VEC1} D{FCSR,VEC2}
+        eg LLVM_MC:BF1CVTLT_1 | bf1cvtlt z2.h, z1.b | ref S{VEC1} D{VEC2} | trc S{FCSR,VEC1} D{FCSR,VEC2}
+        eg LLVM_MC:BF1CVTL_1 | bf1cvtl v2.8h, v1.8b | ref S{VEC1} D{VEC2} | trc S{FCSR,VEC1} D{FCSR,VEC2}
+        eg LLVM_MC:BF1CVTL_2 | bf1cvtl { z0.h, z1.h }, z0.b | ref S{VEC0} D{VEC0,VEC1} | trc S{FCSR,VEC0} D{FCSR,VEC0,VEC1}
+        eg LLVM_MC:BF1CVT_1 | bf1cvt z2.h, z1.b | ref S{VEC1} D{VEC2} | trc S{FCSR,VEC1} D{FCSR,VEC2}
+        eg LLVM_MC:BF1CVT_2 | bf1cvt { z2.h, z3.h }, z1.b | ref S{VEC1} D{VEC2,VEC3} | trc S{FCSR,VEC1} D{FCSR,VEC2,VEC3}
+        eg LLVM_MC:BF2CVTL2_1 | bf2cvtl2 v2.8h, v1.16b | ref S{VEC1} D{VEC2} | trc S{FCSR,VEC1} D{FCSR,VEC2}
+        eg LLVM_MC:BF2CVTLT_1 | bf2cvtlt z2.h, z1.b | ref S{VEC1} D{VEC2} | trc S{FCSR,VEC1} D{FCSR,VEC2}
+    46  SRC+ref:ZERO
+        eg AUTDZA_64Z_dp_1src | autdza x1 | ref S{GPR1,ZERO} D{GPR1} | trc S{GPR1} D{GPR1}
+        eg AUTDZB_64Z_dp_1src | autdzb x1 | ref S{GPR1,ZERO} D{GPR1} | trc S{GPR1} D{GPR1}
+        eg AUTIAZ_HI_hints | autiaz | ref S{LR,ZERO} D{LR} | trc S{LR} D{LR}
+        eg AUTIBZ_HI_hints | autibz | ref S{LR,ZERO} D{LR} | trc S{LR} D{LR}
+        eg AUTIZA_64Z_dp_1src | autiza x1 | ref S{GPR1,ZERO} D{GPR1} | trc S{GPR1} D{GPR1}
+        eg AUTIZB_64Z_dp_1src | autizb x1 | ref S{GPR1,ZERO} D{GPR1} | trc S{GPR1} D{GPR1}
+        eg BLRAAZ_64_branch_reg | blraaz x1 | ref S{GPR1,ZERO} D{LR} | trc S{GPR1} D{LR}
+        eg BLRABZ_64_branch_reg | blrabz x1 | ref S{GPR1,ZERO} D{LR} | trc S{GPR1} D{LR}
+    42  SRC+ref:FLAGS
         eg CPYFPN_CPY_memcms | cpyfpn [x27]!, [x26]!, x28! | ref S{FLAGS,GPR26,GPR27,GPR28} D{FLAGS,GPR26,GPR27,GPR28} | trc S{GPR26,GPR27,GPR28} D{FLAGS,GPR26,GPR27,GPR28}
         eg CPYFPRN_CPY_memcms | cpyfprn [x0]!, [x5]!, x25! | ref S{FLAGS,GPR0,GPR25,GPR5} D{FLAGS,GPR0,GPR25,GPR5} | trc S{GPR0,GPR25,GPR5} D{FLAGS,GPR0,GPR25,GPR5}
         eg CPYFPRTN_CPY_memcms | cpyfprtn [x19]!, [x16]!, x7! | ref S{FLAGS,GPR16,GPR19,GPR7} D{FLAGS,GPR16,GPR19,GPR7} | trc S{GPR16,GPR19,GPR7} D{FLAGS,GPR16,GPR19,GPR7}
@@ -73,89 +37,82 @@ DISAGREEMENT SIGNATURES (largest first)
         eg CPYFPRT_CPY_memcms | cpyfprt [x28]!, [x26]!, x20! | ref S{FLAGS,GPR20,GPR26,GPR28} D{FLAGS,GPR20,GPR26,GPR28} | trc S{GPR20,GPR26,GPR28} D{FLAGS,GPR20,GPR26,GPR28}
         eg CPYFPTN_CPY_memcms | cpyfptn [x19]!, [x18]!, x1! | ref S{FLAGS,GPR1,GPR18,GPR19} D{FLAGS,GPR1,GPR18,GPR19} | trc S{GPR1,GPR18,GPR19} D{FLAGS,GPR1,GPR18,GPR19}
         eg CPYFPTRN_CPY_memcms | cpyfptrn [x8]!, [x9]!, x19! | ref S{FLAGS,GPR19,GPR8,GPR9} D{FLAGS,GPR19,GPR8,GPR9} | trc S{GPR19,GPR8,GPR9} D{FLAGS,GPR19,GPR8,GPR9}
-    26  SRC+ref:ZERO
-        eg CSETM_CSINV_32_condsel | csetm w2, eq | ref S{FLAGS,ZERO} D{GPR2} | trc S{FLAGS} D{GPR2}
-        eg CSETM_CSINV_64_condsel | csetm x2, eq | ref S{FLAGS,ZERO} D{GPR2} | trc S{FLAGS} D{GPR2}
-        eg CSET_CSINC_32_condsel | cset w2, eq | ref S{FLAGS,ZERO} D{GPR2} | trc S{FLAGS} D{GPR2}
-        eg CSET_CSINC_64_condsel | cset x2, eq | ref S{FLAGS,ZERO} D{GPR2} | trc S{FLAGS} D{GPR2}
-        eg MNEG_MSUB_32A_dp_3src | mneg w3, w2, w1 | ref S{GPR1,GPR2,ZERO} D{GPR3} | trc S{GPR1,GPR2} D{GPR3}
-        eg MNEG_MSUB_64A_dp_3src | mneg x3, x2, x1 | ref S{GPR1,GPR2,ZERO} D{GPR3} | trc S{GPR1,GPR2} D{GPR3}
-        eg MOV_ORR_32_log_imm | mov w3, #-2147483645 | ref S{ZERO} D{GPR3} | trc S{-} D{GPR3}
-        eg MOV_ORR_32_log_shift | mov w2, w1 | ref S{GPR1,ZERO} D{GPR2} | trc S{GPR1} D{GPR2}
-    26  SRC+trc:MATRIX
-        eg add_za_zzv_2x1 | add za.d[w11, 5, vgx2], { z4.d, z5 | ref S{GPR11,VEC2,VEC4,VEC5} D{MATRIX} | trc S{GPR11,MATRIX,VEC2,VEC4,VEC5} D{MATRIX}
-        eg add_za_zzv_4x1 | add za.d[w11, 5, vgx4], { z4.d - z | ref S{GPR11,VEC2,VEC4,VEC5,VEC6,VEC7} D{MATRIX} | trc S{GPR11,MATRIX,VEC2,VEC4,VEC5,VEC6,VEC7} D{MATRIX}
-        eg add_za_zzw_2x2 | add za.d[w11, 5, vgx2], { z8.d, z9 | ref S{GPR11,VEC4,VEC5,VEC8,VEC9} D{MATRIX} | trc S{GPR11,MATRIX,VEC4,VEC5,VEC8,VEC9} D{MATRIX}
-        eg add_za_zzw_4x4 | add za.d[w11, 5, vgx4], { z16.d -  | ref S{GPR11,VEC10,VEC11,VEC16,VEC17,VEC18,VEC19,VEC8,VEC9} D{MATRIX} | trc S{GPR11,MATRIX,VEC10,VEC11,VEC16,VEC17,VEC18,VEC19,VEC8,VEC9} D{MATRIX}
-        eg mova_za2_z_b1 | mov za0v.b[w14, 8:9], { z6.b, z7.b | ref S{GPR14,VEC6,VEC7} D{MATRIX} | trc S{GPR14,MATRIX,VEC6,VEC7} D{MATRIX}
-        eg mova_za2_z_d1 | mov za4v.d[w14, 0:1], { z6.d, z7.d | ref S{GPR14,VEC6,VEC7} D{MATRIX} | trc S{GPR14,MATRIX,VEC6,VEC7} D{MATRIX}
-        eg mova_za2_z_h1 | mov za0v.h[w14, 2:3], { z6.h, z7.h | ref S{GPR14,VEC6,VEC7} D{MATRIX} | trc S{GPR14,MATRIX,VEC6,VEC7} D{MATRIX}
-        eg mova_za2_z_w1 | mov za0v.s[w14, 2:3], { z6.s, z7.s | ref S{GPR14,VEC6,VEC7} D{MATRIX} | trc S{GPR14,MATRIX,VEC6,VEC7} D{MATRIX}
-    20  SRC+ref:SYS SRC+ref:ZERO
-        eg AUTDZA_64Z_dp_1src | autdza x1 | ref S{GPR1,SYS,ZERO} D{GPR1} | trc S{GPR1} D{GPR1}
-        eg AUTDZB_64Z_dp_1src | autdzb x1 | ref S{GPR1,SYS,ZERO} D{GPR1} | trc S{GPR1} D{GPR1}
-        eg AUTIAZ_HI_hints | autiaz | ref S{LR,SYS,ZERO} D{LR} | trc S{LR} D{LR}
-        eg AUTIBZ_HI_hints | autibz | ref S{LR,SYS,ZERO} D{LR} | trc S{LR} D{LR}
-        eg AUTIZA_64Z_dp_1src | autiza x1 | ref S{GPR1,SYS,ZERO} D{GPR1} | trc S{GPR1} D{GPR1}
-        eg AUTIZB_64Z_dp_1src | autizb x1 | ref S{GPR1,SYS,ZERO} D{GPR1} | trc S{GPR1} D{GPR1}
-        eg BLRAAZ_64_branch_reg | blraaz x1 | ref S{GPR1,SYS,ZERO} D{LR} | trc S{GPR1} D{LR}
-        eg BLRABZ_64_branch_reg | blrabz x1 | ref S{GPR1,SYS,ZERO} D{LR} | trc S{GPR1} D{LR}
-    11  DST+ref:SYS
+    15  DST+trc:FCSR
+        eg FRECPE_asimdmisc_R | frecpe v4.4s, v3.4s | ref S{FCSR,VEC3} D{VEC4} | trc S{FCSR,VEC3} D{FCSR,VEC4}
+        eg FRECPE_asimdmiscfp16_R | frecpe v3.8h, v2.8h | ref S{FCSR,VEC2} D{VEC3} | trc S{FCSR,VEC2} D{FCSR,VEC3}
+        eg FRECPE_asisdmisc_R | frecpe d3, d2 | ref S{FCSR,VEC2} D{VEC3} | trc S{FCSR,VEC2} D{FCSR,VEC3}
+        eg FRECPE_asisdmiscfp16_R | frecpe h2, h1 | ref S{FCSR,VEC1} D{VEC2} | trc S{FCSR,VEC1} D{FCSR,VEC2}
+        eg LLVM_MC:FAMAX_1 | famax v2.2d, v1.2d, v0.2d | ref S{FCSR,VEC0,VEC1} D{VEC2} | trc S{FCSR,VEC0,VEC1} D{FCSR,VEC2}
+        eg LLVM_MC:FAMAX_2 | famax v2.2s, v1.2s, v0.2s | ref S{FCSR,VEC0,VEC1} D{VEC2} | trc S{FCSR,VEC0,VEC1} D{FCSR,VEC2}
+        eg LLVM_MC:FAMAX_3 | famax v2.4h, v1.4h, v0.4h | ref S{FCSR,VEC0,VEC1} D{VEC2} | trc S{FCSR,VEC0,VEC1} D{FCSR,VEC2}
+        eg LLVM_MC:FAMAX_4 | famax v2.4s, v1.4s, v0.4s | ref S{FCSR,VEC0,VEC1} D{VEC2} | trc S{FCSR,VEC0,VEC1} D{FCSR,VEC2}
+    12  DST+ref:SYS
         eg AT_SYS_CR_systeminstrs | at s1e1r, x16 | ref S{GPR16} D{SYS} | trc S{GPR16} D{-}
         eg CFP_SYS_CR_systeminstrs | cfp rctx, x1 | ref S{GPR1} D{SYS} | trc S{GPR1} D{-}
         eg COSP_SYS_CR_systeminstrs | cosp rctx, x1 | ref S{GPR1} D{SYS} | trc S{GPR1} D{-}
         eg CPP_SYS_CR_systeminstrs | cpp rctx, x1 | ref S{GPR1} D{SYS} | trc S{GPR1} D{-}
         eg DC_SYS_CR_systeminstrs | dc cipae, x0 | ref S{GPR0} D{SYS} | trc S{GPR0} D{-}
         eg DVP_SYS_CR_systeminstrs | dvp rctx, x1 | ref S{GPR1} D{SYS} | trc S{GPR1} D{-}
+        eg ESB_HI_hints | esb | ref S{-} D{SYS} | trc S{-} D{-}
         eg GCSPUSHM_SYS_CR_systeminstrs | gcspushm x1 | ref S{GPR1} D{SYS} | trc S{GPR1} D{-}
-        eg GCSSS1_SYS_CR_systeminstrs | gcsss1 x1 | ref S{GPR1} D{SYS} | trc S{GPR1} D{-}
-     6  DST+ref:FCSR SRC+trc:ZERO
-        eg FCMPE_DZ_floatcmp | fcmpe d1, #0.0 | ref S{FCSR,VEC1} D{FCSR,FLAGS} | trc S{FCSR,VEC1,ZERO} D{FLAGS}
-        eg FCMPE_HZ_floatcmp | fcmpe h1, #0.0 | ref S{FCSR,VEC1} D{FCSR,FLAGS} | trc S{FCSR,VEC1,ZERO} D{FLAGS}
-        eg FCMPE_SZ_floatcmp | fcmpe s1, #0.0 | ref S{FCSR,VEC1} D{FCSR,FLAGS} | trc S{FCSR,VEC1,ZERO} D{FLAGS}
-        eg FCMP_DZ_floatcmp | fcmp d1, #0.0 | ref S{FCSR,VEC1} D{FCSR,FLAGS} | trc S{FCSR,VEC1,ZERO} D{FLAGS}
-        eg FCMP_HZ_floatcmp | fcmp h1, #0.0 | ref S{FCSR,VEC1} D{FCSR,FLAGS} | trc S{FCSR,VEC1,ZERO} D{FLAGS}
-        eg FCMP_SZ_floatcmp | fcmp s1, #0.0 | ref S{FCSR,VEC1} D{FCSR,FLAGS} | trc S{FCSR,VEC1,ZERO} D{FLAGS}
+    12  SRC+trc:FCSR
+        eg FMOV_D_floatimm | fmov d2, #2.12500000 | ref S{-} D{VEC2} | trc S{FCSR} D{VEC2}
+        eg FMOV_H_floatimm | fmov h2, #2.12500000 | ref S{-} D{VEC2} | trc S{FCSR} D{VEC2}
+        eg FMOV_S_floatimm | fmov s2, #2.12500000 | ref S{-} D{VEC2} | trc S{FCSR} D{VEC2}
+        eg LLVM_MC:FMLALL_1 | fmlall za.s[w8, 0:3, vgx2], { z1.b | ref S{GPR8,MATRIX,VEC0,VEC1,VEC2} D{MATRIX} | trc S{FCSR,GPR8,MATRIX,VEC0,VEC1,VEC2} D{MATRIX}
+        eg LLVM_MC:FMLALL_2 | fmlall za.s[w8, 0:3, vgx2], { z30. | ref S{GPR8,MATRIX,VEC0,VEC30,VEC31} D{MATRIX} | trc S{FCSR,GPR8,MATRIX,VEC0,VEC30,VEC31} D{MATRIX}
+        eg LLVM_MC:FMLALL_3 | fmlall za.s[w8, 0:3, vgx2], { z30. | ref S{GPR8,MATRIX,VEC0,VEC1,VEC30,VEC31} D{MATRIX} | trc S{FCSR,GPR8,MATRIX,VEC0,VEC1,VEC30,VEC31} D{MATRIX}
+        eg LLVM_MC:FMLALL_4 | fmlall za.s[w8, 0:3, vgx4], { z1.b | ref S{GPR8,MATRIX,VEC0,VEC1,VEC2,VEC3,VEC4} D{MATRIX} | trc S{FCSR,GPR8,MATRIX,VEC0,VEC1,VEC2,VEC3,VEC4} D{MATRIX}
+        eg LLVM_MC:FMLALL_5 | fmlall za.s[w8, 0:3, vgx4], { z28. | ref S{GPR8,MATRIX,VEC0,VEC28,VEC29,VEC30,VEC31} D{MATRIX} | trc S{FCSR,GPR8,MATRIX,VEC0,VEC28,VEC29,VEC30,VEC31} D{MATRIX}
+    10  SRC+ref:SYS
+        eg ADDG_64_addsub_immtags | addg x4, x3, #16, #2 | ref S{GPR3,SYS} D{GPR4} | trc S{GPR3} D{GPR4}
+        eg ERETAA_64E_branch_reg | eretaa | ref S{SP,SYS} D{-} | trc S{SP} D{-}
+        eg ERETAB_64E_branch_reg | eretab | ref S{SP,SYS} D{-} | trc S{SP} D{-}
+        eg ERET_64E_branch_reg | eret | ref S{SYS} D{-} | trc S{-} D{-}
+        eg GCSPOPM_SYSL_RC_systeminstrs | gcspopm x1 | ref S{SYS} D{GPR1} | trc S{-} D{GPR1}
+        eg GCSSS2_SYSL_RC_systeminstrs | gcsss2 x1 | ref S{SYS} D{GPR1} | trc S{-} D{GPR1}
+        eg LDGM_64bulk_ldsttags | ldgm x2, [x1] | ref S{GPR1,SYS} D{GPR2} | trc S{GPR1} D{GPR2}
+        eg STGM_64bulk_ldsttags | stgm x2, [x1] | ref S{GPR1,GPR2,SYS} D{-} | trc S{GPR1,GPR2} D{-}
+     8  SRC+trc:MATRIX
+        eg add_za_zzv_2x1 | add za.d[w11, 5, vgx2], { z4.d, z5 | ref S{GPR11,VEC2,VEC4,VEC5} D{MATRIX} | trc S{GPR11,MATRIX,VEC2,VEC4,VEC5} D{MATRIX}
+        eg add_za_zzv_4x1 | add za.d[w11, 5, vgx4], { z4.d - z | ref S{GPR11,VEC2,VEC4,VEC5,VEC6,VEC7} D{MATRIX} | trc S{GPR11,MATRIX,VEC2,VEC4,VEC5,VEC6,VEC7} D{MATRIX}
+        eg add_za_zzw_2x2 | add za.d[w11, 5, vgx2], { z8.d, z9 | ref S{GPR11,VEC4,VEC5,VEC8,VEC9} D{MATRIX} | trc S{GPR11,MATRIX,VEC4,VEC5,VEC8,VEC9} D{MATRIX}
+        eg add_za_zzw_4x4 | add za.d[w11, 5, vgx4], { z16.d -  | ref S{GPR11,VEC10,VEC11,VEC16,VEC17,VEC18,VEC19,VEC8,VEC9} D{MATRIX} | trc S{GPR11,MATRIX,VEC10,VEC11,VEC16,VEC17,VEC18,VEC19,VEC8,VEC9} D{MATRIX}
+        eg sub_za_zzv_2x1 | sub za.d[w11, 5, vgx2], { z4.d, z5 | ref S{GPR11,VEC2,VEC4,VEC5} D{MATRIX} | trc S{GPR11,MATRIX,VEC2,VEC4,VEC5} D{MATRIX}
+        eg sub_za_zzv_4x1 | sub za.d[w11, 5, vgx4], { z4.d - z | ref S{GPR11,VEC2,VEC4,VEC5,VEC6,VEC7} D{MATRIX} | trc S{GPR11,MATRIX,VEC2,VEC4,VEC5,VEC6,VEC7} D{MATRIX}
+        eg sub_za_zzw_2x2 | sub za.d[w11, 5, vgx2], { z8.d, z9 | ref S{GPR11,VEC4,VEC5,VEC8,VEC9} D{MATRIX} | trc S{GPR11,MATRIX,VEC4,VEC5,VEC8,VEC9} D{MATRIX}
+        eg sub_za_zzw_4x4 | sub za.d[w11, 5, vgx4], { z16.d -  | ref S{GPR11,VEC10,VEC11,VEC16,VEC17,VEC18,VEC19,VEC8,VEC9} D{MATRIX} | trc S{GPR11,MATRIX,VEC10,VEC11,VEC16,VEC17,VEC18,VEC19,VEC8,VEC9} D{MATRIX}
      4  DST+ref:SYS SRC+ref:ZERO
         eg BRB_SYS_CR_systeminstrs | brb inj | ref S{ZERO} D{SYS} | trc S{-} D{-}
         eg GCSPOPCX_SYS_CR_systeminstrs | gcspopcx | ref S{ZERO} D{SYS} | trc S{-} D{-}
         eg GCSPOPX_SYS_CR_systeminstrs | gcspopx | ref S{ZERO} D{SYS} | trc S{-} D{-}
         eg GCSPUSHX_SYS_CR_systeminstrs | gcspushx | ref S{ZERO} D{SYS} | trc S{-} D{-}
-     4  SRC+ref:FLAGS SRC+ref:SYS
-        eg SETGPN_SET_memcms | setgpn [x12]!, x6!, x0 | ref S{FLAGS,GPR0,GPR12,GPR6,SYS} D{FLAGS,GPR12,GPR6} | trc S{GPR0,GPR12,GPR6} D{FLAGS,GPR12,GPR6}
-        eg SETGPTN_SET_memcms | setgptn [x22]!, x10!, x21 | ref S{FLAGS,GPR10,GPR21,GPR22,SYS} D{FLAGS,GPR10,GPR22} | trc S{GPR10,GPR21,GPR22} D{FLAGS,GPR10,GPR22}
-        eg SETGPT_SET_memcms | setgpt [x7]!, x25!, x27 | ref S{FLAGS,GPR25,GPR27,GPR7,SYS} D{FLAGS,GPR25,GPR7} | trc S{GPR25,GPR27,GPR7} D{FLAGS,GPR25,GPR7}
-        eg SETGP_SET_memcms | setgp [x16]!, x7!, x3 | ref S{FLAGS,GPR16,GPR3,GPR7,SYS} D{FLAGS,GPR16,GPR7} | trc S{GPR16,GPR3,GPR7} D{FLAGS,GPR16,GPR7}
-     3  DST+trc:ZERO
-        eg CASPL_CP64_comswappr | caspl x30, xzr, x6, x7, [x23] | ref S{GPR23,GPR6,GPR7,LR,ZERO} D{LR} | trc S{GPR23,GPR6,GPR7,LR,ZERO} D{LR,ZERO}
-        eg CMPP_SUBPS_64S_dp_2src | subps xzr, x2, x1 | ref S{GPR1,GPR2} D{FLAGS} | trc S{GPR1,GPR2} D{FLAGS,ZERO}
-        eg SBFIZ_SBFM_64M_bitfield | sbfiz xzr, x8, #43, #1 | ref S{GPR8} D{-} | trc S{GPR8} D{ZERO}
-     2  SRC+ref:SYS SRC+trc:LR
-        eg ERETAA_64E_branch_reg | eretaa | ref S{SP,SYS} D{-} | trc S{LR,SP} D{-}
-        eg ERETAB_64E_branch_reg | eretab | ref S{SP,SYS} D{-} | trc S{LR,SP} D{-}
-     2  DST+ref:SYS SRC+ref:SYS
-        eg ESB_HI_hints | esb | ref S{SYS} D{SYS} | trc S{-} D{-}
-        eg IRG_64I_dp_2src | irg x3, x2, x1 | ref S{GPR1,GPR2,SYS} D{GPR3,SYS} | trc S{GPR1,GPR2} D{GPR3}
-     2  SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:SYS
-        eg ST64BV0_64_memop | st64bv0 x3, x2, [x15] | ref S{GPR15,GPR2,GPR3,GPR4,GPR5,GPR6,GPR7,GPR8,GPR9,SYS} D{GPR3} | trc S{GPR15,GPR2} D{GPR3}
-        eg ST64B_64L_memop | st64b x2, [x1] | ref S{GPR1,GPR2,GPR3,GPR4,GPR5,GPR6,GPR7,GPR8,GPR9,SYS} D{-} | trc S{GPR1,GPR2} D{-}
+     2  SRC+ref:FCSR
+        eg FMOV_64VX_float2int | fmov x2, v1.d[1] | ref S{FCSR,VEC1} D{GPR2} | trc S{VEC1} D{GPR2}
+        eg FMOV_V64I_float2int | fmov v2.d[1], x1 | ref S{FCSR,GPR1} D{VEC2} | trc S{GPR1} D{VEC2}
      2  SRC+trc:GPR# SRC+trc:GPR#
         eg SYSP_CR_syspairinstrs | sysp #4, c0, c5, #5, x12, x13 | ref S{-} D{-} | trc S{GPR12,GPR13} D{-}
         eg TLBIP_SYSP_CR_syspairinstrs | tlbip vale2is, x24, x25 | ref S{-} D{-} | trc S{GPR24,GPR25} D{-}
-     1  DST+ref:GPR# DST+ref:SYS SRC+ref:GPR# SRC+ref:SYS
-        eg HINT_HM_hints | hint #35 | ref S{GPR16,SYS} D{GPR16,SYS} | trc S{-} D{-}
-     1  DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# SRC+ref:SYS
-        eg LD64B_64L_memop | ld64b x2, [x1] | ref S{GPR1,SYS} D{GPR2,GPR3,GPR4,GPR5,GPR6,GPR7,GPR8,GPR9} | trc S{GPR1} D{GPR2}
-     1  DST+trc:GPR# SRC+ref:SYS
-        eg LDG_64Loffset_ldsttags | ldg x3, [x2, #16] | ref S{GPR2,GPR3,SYS} D{GPR3} | trc S{GPR2,GPR3} D{GPR2,GPR3}
+     1  DST+ref:GPR# DST+ref:SYS SRC+ref:GPR#
+        eg HINT_HM_hints | hint #35 | ref S{GPR16} D{GPR16,SYS} | trc S{-} D{-}
+     1  DST+ref:SYS SRC+ref:SYS
+        eg IRG_64I_dp_2src | irg x3, x2, x1 | ref S{GPR1,GPR2,SYS} D{GPR3,SYS} | trc S{GPR1,GPR2} D{GPR3}
+     1  DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR#
+        eg LD64B_64L_memop | ld64b x2, [x1] | ref S{GPR1} D{GPR2,GPR3,GPR4,GPR5,GPR6,GPR7,GPR8,GPR9} | trc S{GPR1} D{GPR2}
+     1  DST+trc:GPR#
+        eg LDG_64Loffset_ldsttags | ldg x3, [x2, #16] | ref S{GPR2,GPR3} D{GPR3} | trc S{GPR2,GPR3} D{GPR2,GPR3}
      1  DST+trc:GPR# DST+trc:GPR# SRC+trc:SYS
         eg MRRS_RS_systemmovepr | mrrs x6, x7, S3_2_C3_C4_5 | ref S{-} D{-} | trc S{SYS} D{GPR6,GPR7}
      1  DST+trc:SYS SRC+trc:GPR# SRC+trc:GPR#
         eg MSRR_SR_systemmovepr | msrr S3_2_C3_C4_5, x6, x7 | ref S{-} D{-} | trc S{GPR6,GPR7} D{SYS}
      1  DST+trc:SYS SRC+trc:ZERO
         eg MSR_SI_pstate | msr S0_1_C4_C2_3, xzr | ref S{-} D{-} | trc S{ZERO} D{SYS}
-     1  SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:SYS
-        eg ST64BV_64_memop | st64bv x9, x10, [x15] | ref S{GPR10,GPR11,GPR12,GPR13,GPR14,GPR15,GPR16,GPR17,SYS} D{GPR9} | trc S{GPR10,GPR15} D{GPR9}
+     1  SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:SYS
+        eg ST64BV0_64_memop | st64bv0 x3, x2, [x15] | ref S{GPR15,GPR2,GPR3,GPR4,GPR5,GPR6,GPR7,GPR8,GPR9,SYS} D{GPR3} | trc S{GPR15,GPR2} D{GPR3}
+     1  SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR#
+        eg ST64BV_64_memop | st64bv x9, x10, [x15] | ref S{GPR10,GPR11,GPR12,GPR13,GPR14,GPR15,GPR16,GPR17} D{GPR9} | trc S{GPR10,GPR15} D{GPR9}
+     1  SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR#
+        eg ST64B_64L_memop | st64b x2, [x1] | ref S{GPR1,GPR2,GPR3,GPR4,GPR5,GPR6,GPR7,GPR8,GPR9} D{-} | trc S{GPR1,GPR2} D{-}
      1  DST+ref:GPR# SRC+ref:SYS SRC+trc:GPR#
         eg SYSL_RC_systeminstrs | sysl x5, #1, c2, c3, #4 | ref S{SYS} D{GPR5} | trc S{GPR5} D{-}
      1  DST+ref:SYS SRC+ref:GPR#
@@ -166,29 +123,26 @@ DISAGREEMENT SIGNATURES (largest first)
         eg pmov_z_pi_b | pmov z2, p1.b | ref S{PRED1} D{VEC2} | trc S{PRED1,VEC2} D{VEC2}
      1  SRC+ref:GPR#
         eg psel_p_ppi_ | psel p1, p5, p6.b[w12, 9] | ref S{GPR12,PRED5,PRED6} D{PRED1} | trc S{PRED5,PRED6} D{PRED1}
-     1  DST+ref:MATRIX SRC+trc:MATRIX
-        eg zero_za_i_ | zero {za0.d} | ref S{-} D{MATRIX} | trc S{MATRIX} D{-}
 
-REFERENCE CROSS-CHECK rank1(MRA) vs rank2(LLVM MC): same=2735 differ=1079
-   281  SRC+ref:FCSR
-   233  DST+ref:FCSR
-   133  SRC+ref:SYS
-    99  DST+ref:FCSR SRC+ref:FCSR
+REFERENCE CROSS-CHECK rank1(MRA) vs rank2(LLVM MC): same=2618 differ=1192
+   474  DST+ref:FCSR
+   240  DST+ref:FCSR SRC+ref:FCSR
+   136  SRC+ref:FCSR
     83  DST+trc:ZERO
     76  SRC+ref:VEC#
     51  SRC+trc:ZERO
-    38  SRC+ref:FLAGS
+    42  SRC+ref:FLAGS
     26  SRC+trc:MATRIX
-    20  SRC+ref:SYS SRC+ref:ZERO
-    13  DST+ref:SYS
+    20  SRC+ref:ZERO
+    14  DST+ref:SYS
+     9  SRC+ref:SYS
      4  DST+ref:SYS SRC+ref:ZERO
-     4  SRC+ref:FLAGS SRC+ref:SYS
      3  SRC+trc:GPR# SRC+trc:GPR#
      2  SRC+ref:SYS SRC+trc:LR
-     2  DST+ref:SYS SRC+ref:SYS
      2  DST+trc:FLAGS
      2  DST+ref:FCSR SRC+trc:FCSR
-     1  DST+ref:GPR# DST+ref:SYS SRC+ref:GPR# SRC+ref:SYS
+     1  DST+ref:GPR# DST+ref:SYS SRC+ref:GPR#
+     1  DST+ref:SYS SRC+ref:SYS
      1  DST+trc:GPR# DST+trc:GPR#
      1  DST+trc:FLAGS SRC+ref:SYS
      1  DST+ref:GPR# SRC+ref:SYS SRC+trc:GPR#

@@ -1249,6 +1249,7 @@ static bool want_decode = true, want_mem = true, want_branch = true,
  */
 enum Layer { LAYER_BOUNDARY, LAYER_FIELDS, LAYER_FIXUPS };
 static Layer layer = LAYER_BOUNDARY;
+static bool falsify_requested = false;
 
 /*
  * THE GATE'S OWN FALSIFIER.  `--falsify=drop-src:MNEM` erases the source
@@ -1268,6 +1269,76 @@ static Layer layer = LAYER_BOUNDARY;
  * production comparisons.
  */
 static std::string falsify_mode, falsify_mnem;
+
+/*
+ * THE FALSIFIER'S OWN REACH, COUNTED.  Two ways for an arm to prove
+ * nothing look identical from outside a run that exits 0: the name matched
+ * no row at all (a typo -- `drop-src:dec` against an encoding the tool
+ * calls `decq`), and the name matched but the damage was INVISIBLE because
+ * the planted item was already in the set it was planted into (`decq`
+ * writes GPR3 and FLAGS, so planting its first source lands on a register
+ * the destination set already holds and is deduplicated away).  Neither is
+ * a pass; both are an instrument vouching for nothing, which is the shape
+ * this option exists to remove rather than reproduce.  So the arms are
+ * counted separately -- rows MATCHED, and rows where the COMPARED set
+ * actually moved -- and a run that damaged nothing refuses.
+ *
+ * "Compared set" is the operative word: REG_ZERO, REG_IP and REG_NONE are
+ * struck from both sides before the register classes run, so planting or
+ * erasing one of those is a change the comparison can never see and is not
+ * counted as one.
+ */
+static unsigned long falsify_matched = 0, falsify_mutated = 0;
+
+/* Apply the requested damage to one decoded instruction's field view and
+ * record whether it changed anything the comparison can observe. */
+static void falsify_apply(IsaxFieldsView &f)
+{
+    falsify_matched++;
+    if (falsify_mode == "drop-src") {
+        bool visible = false;
+        for (unsigned g : f.src)
+            if (!isax_generic_reg_dropped(g)) { visible = true; break; }
+        f.src.clear();
+        if (visible) falsify_mutated++;
+    } else if (falsify_mode == "add-dst" && !f.src.empty()) {
+        uint8_t g = f.src[0];
+        bool collides = std::find(f.dst.begin(), f.dst.end(), g) != f.dst.end();
+        f.dst.push_back(g);
+        if (!collides && !isax_generic_reg_dropped(g)) falsify_mutated++;
+    }
+}
+
+/*
+ * Report the arm's reach, and refuse the run if it damaged nothing.  Exit
+ * status 2 -- the usage/refusal code -- never the gate's 1: a caller
+ * distinguishing "the gate went red" from "the instrument never fired"
+ * must not have to read prose to tell them apart.
+ */
+static bool falsify_refused(void)
+{
+    fprintf(stderr, "# falsify=%s:%s matched=%lu mutated=%lu\n",
+            falsify_mode.c_str(), falsify_mnem.c_str(),
+            falsify_matched, falsify_mutated);
+    if (!falsify_matched) {
+        fprintf(stderr, "isaxcheck: --falsify=%s:%s matched 0 rows -- nothing "
+                "this sweep decodes is spelled '%s', so nothing was damaged "
+                "and the result proves nothing\n",
+                falsify_mode.c_str(), falsify_mnem.c_str(),
+                falsify_mnem.c_str());
+        return true;
+    }
+    if (!falsify_mutated) {
+        fprintf(stderr, "isaxcheck: --falsify=%s:%s matched %lu rows but "
+                "changed no compared register set -- the planted item is "
+                "already in the set it landed in, or is one of the ids struck "
+                "from the comparison. This arm is INVISIBLE on this mnemonic, "
+                "not passing; pick one whose sets have room\n",
+                falsify_mode.c_str(), falsify_mnem.c_str(), falsify_matched);
+        return true;
+    }
+    return false;
+}
 
 /* BranchType values from champsim_tracer_generic_ids.h.  Restated rather
  * than included: pulling that header in would drag the plugin's include
@@ -1309,13 +1380,8 @@ static void compare(const uint8_t *b, size_t n)
     ll_decode(b, n, l);
     if (c.ok && layer != LAYER_BOUNDARY) isax_fields_decode(&info, &f);
     if (layer == LAYER_FIELDS && c.ok && f.ok && !falsify_mnem.empty() &&
-        c.mnem == falsify_mnem) {
-        if (falsify_mode == "drop-src") {
-            f.src.clear();
-        } else if (falsify_mode == "add-dst" && !f.src.empty()) {
-            f.dst.push_back(f.src[0]);
-        }
-    }
+        c.mnem == falsify_mnem)
+        falsify_apply(f);
 
     if (!c.ok && !l.ok) return;
 
@@ -2201,7 +2267,11 @@ static void usage(void)
         "  --falsify=MODE:MNEM   (fields layer only) damage the dependency\n"
         "                  model's view of MNEM before comparing: drop-src\n"
         "                  erases its reads, add-dst plants a phantom write.\n"
-        "                  Proves the gate can fire; never for real runs\n"
+        "                  Proves the gate can fire; never for real runs.\n"
+        "                  Reports matched/mutated row counts and exits 2 --\n"
+        "                  not 0, and not the gate's 1 -- when the name\n"
+        "                  matched nothing or the damage collided with the\n"
+        "                  set it landed in and so changed nothing\n"
         "  --batch         read hex encodings on stdin; write one TSV row\n"
         "                  per encoding carrying both decoders' views AND\n"
         "                  the tracer's own InsnFields (f_* columns)\n"
@@ -2255,6 +2325,7 @@ int main(int argc, char **argv)
                         "drop-src or add-dst\n");
                 return 2;
             }
+            falsify_requested = true;
         }
         else if (!strcmp(argv[i], "--check")) check = true;
         else if (!strcmp(argv[i], "--emit-raw")) emit_raw = true;
@@ -2266,6 +2337,24 @@ int main(int argc, char **argv)
     want_mem = strchr(classes, 'M');
     want_branch = strchr(classes, 'B');
     want_regs = strchr(classes, 'R');
+
+    /* An arm that cannot reach the register classes is not an arm.  Both
+     * conditions below make --falsify a guaranteed no-op, and a no-op that
+     * exits 0 is the silent-false-success this option exists to remove. */
+    if (falsify_requested && !batch) {
+        if (layer != LAYER_FIELDS) {
+            fprintf(stderr, "isaxcheck: --falsify damages the dependency "
+                    "model, which only the fields layer compares -- pass "
+                    "--layer=fields (or --batch)\n");
+            return 2;
+        }
+        if (!want_regs) {
+            fprintf(stderr, "isaxcheck: --falsify damages register sets and "
+                    "--classes=%s does not enable class R, so no comparison "
+                    "would read the damage\n", classes);
+            return 2;
+        }
+    }
 
     bool found = false;
     for (size_t i = 0; i < sizeof(kIsaTable)/sizeof(kIsaTable[0]); i++) {
@@ -2404,13 +2493,8 @@ int main(int argc, char **argv)
              * prove its own gate can go red.
              */
             if (c.ok && f.ok && !falsify_mnem.empty() &&
-                c.mnem == falsify_mnem) {
-                if (falsify_mode == "drop-src") {
-                    f.src.clear();
-                } else if (falsify_mode == "add-dst" && !f.src.empty()) {
-                    f.dst.push_back(f.src[0]);
-                }
-            }
+                c.mnem == falsify_mnem)
+                falsify_apply(f);
             std::set<unsigned> fs(f.src.begin(), f.src.end());
             std::set<unsigned> fd(f.dst.begin(), f.dst.end());
             /* The printer emits tabs inside operand lists; this is a TSV. */
@@ -2434,6 +2518,7 @@ int main(int argc, char **argv)
                    f.lane_mask_kind,
                    gensetstr(fs).c_str(), gensetstr(fd).c_str());
         }
+        if (!falsify_mnem.empty() && falsify_refused()) return 2;
         return 0;
     }
 
@@ -2441,6 +2526,10 @@ int main(int argc, char **argv)
     if (emit_raw) {
         run_sweep(shard, nshard);
         printf("#tried\t%lu\n", total_tried);
+        if (!falsify_mnem.empty()) {
+            printf("#falsmatch\t%lu\n", falsify_matched);
+            printf("#falsmut\t%lu\n", falsify_mutated);
+        }
         for (auto &kv : size_gap_by_mnem)
             printf("#sizegap\t%lu\t%s\n", kv.second, kv.first.c_str());
         for (auto &kv : buckets)
@@ -2474,6 +2563,10 @@ int main(int argc, char **argv)
                 close(pfd[1]);
                 run_sweep(j, jobs);
                 printf("#tried\t%lu\n", total_tried);
+                if (!falsify_mnem.empty()) {
+                    printf("#falsmatch\t%lu\n", falsify_matched);
+                    printf("#falsmut\t%lu\n", falsify_mutated);
+                }
                 for (auto &kv : size_gap_by_mnem)
                     printf("#sizegap\t%lu\t%s\n", kv.second,
                            kv.first.c_str());
@@ -2514,6 +2607,8 @@ int main(int argc, char **argv)
                                        ? std::string()
                                        : line.substr(t2 + 1);
                 if (key == "#tried") { total_tried += cnt; continue; }
+                if (key == "#falsmatch") { falsify_matched += cnt; continue; }
+                if (key == "#falsmut") { falsify_mutated += cnt; continue; }
                 if (key == "#sizegap") { size_gap_by_mnem[samp] += cnt; continue; }
                 auto &b = buckets[key];
                 if (!b.n) b.sample = samp;
@@ -2596,6 +2691,8 @@ int main(int argc, char **argv)
     for (const AllowRule *r : dead)
         printf("DEAD %s:%u %s %s\n", allow ? allow : "-", r->lineno,
                r->isa.c_str(), r->key.c_str());
+
+    if (!falsify_mnem.empty() && falsify_refused()) return 2;
 
     return (check && (unallowed || !dead.empty())) ? 1 : 0;
 }

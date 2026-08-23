@@ -452,6 +452,7 @@ typedef struct {
 static void cap_x86_evex_classify(const cs_insn *insn, uint8_t n,
                                   cap_x86_evex *e);
 static bool cap_x86_reg_is_vector(unsigned int reg);
+static bool cap_x86_evex_clears_mask(const char *mnem);
 static void cap_x86_add_implicit(qemu_plugin_insn_info *out, csh handle,
                                  unsigned int reg, bool is_write);
 
@@ -597,6 +598,7 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
      * iforms the whole operand list does — see cap_x86_evex_classify. */
     cap_x86_evex evex;
     cap_x86_evex_classify(insn, n, &evex);
+    bool evex_clears_mask = cap_x86_evex_clears_mask(insn->mnemonic);
 
     if (ktest_op || test_read || xadd_op) {
         cap_x86_add_implicit(out, handle, X86_REG_EFLAGS, true);
@@ -619,7 +621,8 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
              * masked instruction reads it; a gather also zeroes it. */
             if (i == evex.mask_idx) {
                 op->access = QEMU_PLUGIN_OP_ACC_READ
-                           | (gather ? QEMU_PLUGIN_OP_ACC_WRITE : 0);
+                           | (evex_clears_mask ? QEMU_PLUGIN_OP_ACC_WRITE
+                                               : 0);
             } else if (op->access == 0 && cop->type != X86_OP_IMM) {
                 op->access = (i == evex.dest_idx)
                            ? QEMU_PLUGIN_OP_ACC_WRITE
@@ -1125,8 +1128,9 @@ static bool cap_x86_is_cmov(const char *mnem)
  * list, because the prefix is what states the facts:
  *
  *   - EVEX.aaa names the writemask.  Non-zero means masked; the mask
- *     is a READ.  Gathers additionally zero it on completion, so there
- *     it is READ-WRITE (Intel SDM Vol. 2, VGATHERDPD "Operation").
+ *     is a READ.  The VSIB gathers and scatters additionally clear it
+ *     as they retire elements, so there it is READ-WRITE -- see
+ *     cap_x86_evex_clears_mask.
  *   - EVEX.z distinguishes merging from zeroing.  Under merge-masking
  *     the lanes the mask suppresses keep the destination's previous
  *     value, so a VECTOR register destination is read-modify-write.
@@ -1216,6 +1220,37 @@ static void cap_x86_evex_classify(const cs_insn *insn, uint8_t n,
 static bool cap_x86_reg_is_vector(unsigned int reg)
 {
     return reg >= X86_REG_XMM0 && reg <= X86_REG_ZMM31;
+}
+
+/*
+ * The EVEX VSIB forms whose write-mask is READ-WRITE: a gather or a
+ * scatter clears each mask bit as it retires that element, so a fault
+ * part-way through leaves the mask naming exactly the work still to do
+ * (Intel SDM Vol. 2, VPSCATTERDD "Operation": `k1[j] := 0` inside the
+ * element loop, then `k1[MAX_KL-1:KL] := 0`).
+ *
+ * The gather/scatter PREFETCH forms share the VSIB shape and most of
+ * the mnemonic but not this behaviour: VGATHERPF0DPD's pseudocode
+ * reads `k1[j]` to decide whether to prefetch and never assigns to it.
+ * XED marks their mask RW anyway; LLVM MC and iced-x86 both report it
+ * read-only, and the manual settles it -- so the list is spelled out
+ * per mnemonic rather than taken on a "vscatter" prefix, which would
+ * swallow the eight VSCATTERPF forms.
+ */
+static bool cap_x86_evex_clears_mask(const char *mnem)
+{
+    if (!mnem || !mnem[0]) {
+        return false;
+    }
+    return cap_x86_is_gather(mnem)         ||
+           g_str_equal(mnem, "vpscatterdd") ||
+           g_str_equal(mnem, "vpscatterdq") ||
+           g_str_equal(mnem, "vpscatterqd") ||
+           g_str_equal(mnem, "vpscatterqq") ||
+           g_str_equal(mnem, "vscatterdps") ||
+           g_str_equal(mnem, "vscatterdpd") ||
+           g_str_equal(mnem, "vscatterqps") ||
+           g_str_equal(mnem, "vscatterqpd");
 }
 
 static bool cap_x86_is_gather(const char *mnem)
@@ -3365,6 +3400,96 @@ static bool cap_riscv_is_vector_encoding(const cs_insn *insn)
 }
 
 /*
+ * RISC-V FP / fixed-point status-word footprint.
+ *
+ * Four CSRs carry the arithmetic control and status word, and no
+ * disassembler reports any of them as an implicit operand:
+ *
+ *   fflags (0x001)  the IEEE accrued-exception flags.  Every FP
+ *                   operation that can signal accumulates into them --
+ *                   `let new_fflags = fcsr[FFLAGS] | flags` in Sail's
+ *                   accrue_fflags (model/extensions/FD/fdext_regs.sail
+ *                   :448), and `status->float_exception_flags |= flags`
+ *                   in QEMU's softfloat -- so the access is a
+ *                   read-modify-write, not a write.
+ *   vxsat  (0x009)  the fixed-point saturation flag, accumulated the
+ *                   same way by the saturating vector ops.
+ *   vxrm   (0x00a)  the fixed-point rounding mode, a genuine data
+ *                   input: Sail reads `vcsr[vxrm]` inside
+ *                   get_fixed_rounding_incr (vext_utils_insts.sail:601).
+ *
+ * All three fold onto one generic slot (QEMU_PLUGIN_SYSREG_FPCTRL), so
+ * a consumer sees the arithmetic status word as one register; the
+ * distinction is kept here because the boundary must name real CSRs.
+ *
+ * SCALAR: the FP major opcodes.  The four fused-multiply-add majors
+ * always signal.  OP-FP signals except for three funct5 values, which
+ * are the whole of the non-signalling scalar FP space: 0b00100 is the
+ * sign-injection family (fsgnj/fsgnjn/fsgnjx), 0b11100 is the move-out
+ * and classify family (fmv.x.w/fmv.x.d/fmv.x.h, fclass.*), and 0b11110
+ * is the move-in family plus the Zfa constant load (fmv.w.x and
+ * friends, fli.*).  Sign-injection, a bit-pattern move and a
+ * classification raise no exception and round nothing; every other
+ * OP-FP form -- arithmetic, conversion, comparison, min/max, the Zfa
+ * fround / fleq / fcvtmod -- does at least one of the two.
+ *
+ * VECTOR FP: OP-V with funct3 = OPFVV (0b001) or OPFVF (0b101) is
+ * exactly the vector FP space, so `vfirst.m` (OPMVV) cannot reach here
+ * on the strength of its name.  Inside it the same five non-signalling
+ * families are excluded by mnemonic: vfsgnj*, vfslide1*, vfmv*,
+ * vfmerge*, vfclass* -- sign injection, a slide, a move and a merge,
+ * plus the classify VFUNARY1 selects with vs1 = 0b10000.
+ *
+ * VECTOR FIXED-POINT: the rounding forms read vxrm (vaadd*, vasub*,
+ * vssra*, vssrl*, vsmul*, vnclip*) and the saturating forms
+ * read-modify-write vxsat (vsadd*, vssub*, vsmul*, vnclip*).  vsmul and
+ * vnclip do both -- they round the product / narrowed value and then
+ * saturate it.  The prefixes are chosen to be unambiguous against the
+ * vector memory mnemonics that share a stem (`vsse8.v`, `vsseg2e8.v`)
+ * and against the vector-crypto `vsm3*` / `vsm4*`.
+ */
+static bool cap_riscv_fp_signals(const cs_insn *insn, uint32_t word)
+{
+    unsigned major  = word & 0x7f;
+    unsigned funct3 = (word >> 12) & 0x7;
+    unsigned funct5 = (word >> 27) & 0x1f;
+
+    switch (major) {
+    case 0x43:                          /* MADD  */
+    case 0x47:                          /* MSUB  */
+    case 0x4b:                          /* NMSUB */
+    case 0x4f:                          /* NMADD */
+        return true;
+    case 0x53:                          /* OP-FP */
+        return funct5 != 0x04 && funct5 != 0x1c && funct5 != 0x1e;
+    case 0x57:                          /* OP-V  */
+        if (funct3 != 0x1 && funct3 != 0x5) {
+            return false;               /* not OPFVV / OPFVF */
+        }
+        return !g_str_has_prefix(insn->mnemonic, "vfsgnj")
+            && !g_str_has_prefix(insn->mnemonic, "vfslide1")
+            && !g_str_has_prefix(insn->mnemonic, "vfmv")
+            && !g_str_has_prefix(insn->mnemonic, "vfmerge")
+            && !g_str_has_prefix(insn->mnemonic, "vfclass");
+    default:
+        return false;
+    }
+}
+
+static bool cap_riscv_reads_vxrm(const char *mnem)
+{
+    return g_str_has_prefix(mnem, "vaadd") || g_str_has_prefix(mnem, "vasub")
+        || g_str_has_prefix(mnem, "vssra") || g_str_has_prefix(mnem, "vssrl")
+        || g_str_has_prefix(mnem, "vsmul") || g_str_has_prefix(mnem, "vnclip");
+}
+
+static bool cap_riscv_writes_vxsat(const char *mnem)
+{
+    return g_str_has_prefix(mnem, "vsadd") || g_str_has_prefix(mnem, "vssub")
+        || g_str_has_prefix(mnem, "vsmul") || g_str_has_prefix(mnem, "vnclip");
+}
+
+/*
  * Is this Capstone register id a vector register?
  *
  * riscv_reg interleaves three vector runs with the GPR and FP files:
@@ -4215,6 +4340,40 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
             cap_riscv_add_csr(out, 0x008 /* vstart */,
                               QEMU_PLUGIN_OP_ACC_WRITE);
         }
+        /*
+         * The FP and fixed-point status word (see cap_riscv_fp_signals).
+         *
+         * fflags is accumulated, so the access is READ|WRITE: an FP
+         * instruction depends on the flags standing when it starts and
+         * leaves the union behind.  Reported by nothing -- Capstone
+         * names frm on some of the vector FP forms and no decoder names
+         * fflags anywhere -- so an `fdiv.s` that raises DZ and the
+         * `frflags` that reads it back had no dependency between them at
+         * all, and a saturating vector loop's vxsat was likewise
+         * produced by no instruction in the trace.
+         */
+        if (insn->size == 4) {
+            uint32_t word = (uint32_t)insn->bytes[0] |
+                            ((uint32_t)insn->bytes[1] << 8) |
+                            ((uint32_t)insn->bytes[2] << 16) |
+                            ((uint32_t)insn->bytes[3] << 24);
+            if (cap_riscv_fp_signals(insn, word)) {
+                cap_riscv_add_csr(out, 0x001 /* fflags */,
+                                  QEMU_PLUGIN_OP_ACC_READ
+                                  | QEMU_PLUGIN_OP_ACC_WRITE);
+            }
+            if (cap_riscv_is_vector_encoding(insn)) {
+                if (cap_riscv_reads_vxrm(insn->mnemonic)) {
+                    cap_riscv_add_csr(out, 0x00a /* vxrm */,
+                                      QEMU_PLUGIN_OP_ACC_READ);
+                }
+                if (cap_riscv_writes_vxsat(insn->mnemonic)) {
+                    cap_riscv_add_csr(out, 0x009 /* vxsat */,
+                                      QEMU_PLUGIN_OP_ACC_READ
+                                      | QEMU_PLUGIN_OP_ACC_WRITE);
+                }
+            }
+        }
     } else if (cap_arch == CS_ARCH_MIPS) {
         n = MIN(detail->mips.op_count, QEMU_PLUGIN_INSN_DETAIL_MAX_OPS);
         out->n_operands = n;
@@ -4376,9 +4535,16 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
         /*
          * Capstone 6.0.0 MIPS unaligned-load merge bug workaround.
          *
-         * LWL/LWR (and the 64-bit LDL/LDR) merge selected bytes of the
-         * loaded word into the destination register, preserving the
-         * rest — architecturally the old $rt value is an INPUT.
+         * LWL/LWR (and the 64-bit LDL/LDR, and the EVA LWLE/LWRE)
+         * merge selected bytes of the loaded word into the destination
+         * register, preserving the rest — architecturally the old $rt
+         * value is an INPUT.  The EVA pair is the same instruction with
+         * a user-mode access, and QEMU's translator makes that literal:
+         * `case OPC_LWLE:` only sets mem_idx and falls straight through
+         * into `case OPC_LWL:`, whose body opens with
+         * `gen_load_gpr(t1, rt)` (target/mips/tcg/translate.c:2128).
+         * LLVM's MCInstrDesc carries TIED_TO on all six members;
+         * Capstone carries it on none.
          * Capstone reports $rt as CS_AC_WRITE only, so the partial
          * write's dependency on the previous register value is lost
          * and consumers see the pair as a full overwrite.  Promote
@@ -4388,7 +4554,12 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
          * Revisit / remove when Capstone is bumped past 6.0.0; verify
          * with `cstool -d mips64el 03008888` (bytes `03 00 88 88`,
          * `lwl $t0,3($a0)`) -- fixed, $t0 (operands[0]) must show
-         * READ|WRITE instead of WRITE-only.  Use a `cstool` built
+         * READ|WRITE instead of WRITE-only.  A family member can be
+         * fixed alone, so the EVA pair needs its own encodings:
+         * `isaxcheck --isa=mipsel --hex=1900a47c` (`lwle $a0, 0($a1)`)
+         * and `--hex=1a00a47c` (`lwre $a0, 0($a1)`) must each show $a0
+         * in the boundary's `RD{}` set, matching the `llvm` line above
+         * it.  Use a `cstool` built
          * from `subprojects/capstone` (capstone.wrap's pinned
          * revision), not a system package, or run
          * `capstone_workaround_probe`
@@ -4396,7 +4567,8 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
          * see docs/troubleshooting.rst.
          */
         if (insn->id == MIPS_INS_LWL || insn->id == MIPS_INS_LWR
-            || insn->id == MIPS_INS_LDL || insn->id == MIPS_INS_LDR) {
+            || insn->id == MIPS_INS_LDL || insn->id == MIPS_INS_LDR
+            || insn->id == MIPS_INS_LWLE || insn->id == MIPS_INS_LWRE) {
             for (uint8_t i = 0; i < n; i++) {
                 qemu_plugin_operand *op = &out->operands[i];
                 if (op->type != QEMU_PLUGIN_OP_REG) {

@@ -81,7 +81,13 @@ def mt_reg(fil, word, from_file):
     if fil in ("SYS", "FCSR", "FLAGS"):
         return "REG_" + fil
     if fil == "ACC":
-        idx = (word >> 16) & 3 if from_file else (word >> 13) & 3
+        # The accumulator index is rt >> 2, NOT rt & 3.  QEMU's gen_mftr /
+        # gen_mttr spell the sixteen values out one at a time and the group
+        # of three (lo, hi, acx) advances by four: rt 0/1/2 -> AC0,
+        # 4/5/6 -> AC1, 8/9/10 -> AC2, 12/13/14 -> AC3
+        # (target/mips/tcg/translate.c:8213).  rt lives at [20:16] for MFTR
+        # and rd at [15:11] for MTTR, so the shift is 16+2 / 11+2.
+        idx = (word >> 18) & 3 if from_file else (word >> 13) & 3
         return "REG_ACC%d" % idx
     idx = (word >> 16) & 31 if from_file else (word >> 11) & 31
     return "REG_%s%d" % (fil, idx)

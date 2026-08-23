@@ -3400,6 +3400,78 @@ static bool cap_riscv_is_vector_encoding(const cs_insn *insn)
 }
 
 /*
+ * Append an implicit register read Capstone did not report.
+ */
+static void cap_riscv_add_reg_read(csh handle, qemu_plugin_insn_info *out,
+                                   uint16_t reg)
+{
+    for (uint8_t i = 0; i < out->n_regs_read; i++) {
+        if (out->regs_read_id[i] == reg) {
+            return;
+        }
+    }
+    for (uint8_t i = 0; i < out->n_operands; i++) {
+        if (out->operands[i].type == QEMU_PLUGIN_OP_REG
+            && out->operands[i].reg_id == reg
+            && (out->operands[i].access & QEMU_PLUGIN_OP_ACC_READ)) {
+            return;
+        }
+    }
+    if (out->n_regs_read >= QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS) {
+        return;
+    }
+    cap_copy_reg_name(out->regs_read[out->n_regs_read],
+                      QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                      handle, reg, CS_ARCH_RISCV);
+    out->regs_read_id[out->n_regs_read] = reg;
+    out->n_regs_read++;
+}
+
+/*
+ * Assembler aliases that hide an x0 SOURCE.
+ *
+ * `beqz a0, L` is `beq a0, x0, L`, `neg a0, a1` is `sub a0, x0, a1`,
+ * `li a0, 1` is `addi a0, x0, 1` -- in each the architecture names x0 as
+ * an operand and the alias spelling drops it, so Capstone's structured
+ * detail drops it too.  Spelled without the alias the same instruction
+ * keeps it: `add a0, zero, t0` reports RD{r0,r5}.  The boundary
+ * therefore named x0 on some encodings and not on others, which is a
+ * silent reduction (C4) rather than a policy -- reading x0 is inert for
+ * a scheduler, but "this instruction has one source" and "this
+ * instruction has two, one of which is the constant zero" are different
+ * statements and only one of them is what the ISA says.
+ *
+ * The list is the closure of the LLVM/Capstone alias table over aliases
+ * whose expansion has x0 in a SOURCE position.  Excluded on purpose:
+ * `seqz` (sltiu rd, rs, 1), `not` (xori rd, rs, -1) and `sext.w`
+ * (addiw rd, rs, 0), whose expansions have no x0 at all; and `ret` /
+ * `j` / `jr` / `nop`, where x0 is the DESTINATION -- a write to x0
+ * changes no architectural state, and the link-register side of those
+ * is already restored by refine_alias_fields().
+ *
+ * `mv` is the one alias that must be told apart by width: the 32-bit
+ * `mv rd, rs` is `addi rd, rs, 0` and reads no x0, while the compressed
+ * `c.mv rd, rs2` is `add rd, x0, rs2` and does.
+ */
+static bool cap_riscv_alias_reads_x0(const cs_insn *insn)
+{
+    static const char *const x0_src_aliases[] = {
+        "li", "neg", "negw", "snez", "sltz", "sgtz", "zext.w",
+        "beqz", "bnez", "blez", "bgez", "bltz", "bgtz",
+    };
+
+    if (insn->size == 2 && !strcmp(insn->mnemonic, "mv")) {
+        return true;
+    }
+    for (size_t i = 0; i < ARRAY_SIZE(x0_src_aliases); i++) {
+        if (!strcmp(insn->mnemonic, x0_src_aliases[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
  * RISC-V FP / fixed-point status-word footprint.
  *
  * Four CSRs carry the arithmetic control and status word, and no
@@ -3893,6 +3965,128 @@ static unsigned int cap_mips_fp_ctrl_reg(const char *mnem)
         return MIPS_REG_FCR31;
     }
     return 0;
+}
+
+/*
+ * Capstone's MIPS register enum is ordered alphabetically by NAME, not
+ * numerically ($zero is 26 and $at is 3), so a register number has to be
+ * recovered by naming each one.  Returns 0..31, or -1 for anything that
+ * is not a GPR.
+ */
+static int cap_mips_gpr_index(unsigned int reg)
+{
+    switch (reg) {
+    case MIPS_REG_ZERO: return 0;
+    case MIPS_REG_AT:   return 1;
+    case MIPS_REG_V0:   return 2;
+    case MIPS_REG_V1:   return 3;
+    case MIPS_REG_A0:   return 4;
+    case MIPS_REG_A1:   return 5;
+    case MIPS_REG_A2:   return 6;
+    case MIPS_REG_A3:   return 7;
+    case MIPS_REG_T0:   return 8;
+    case MIPS_REG_T1:   return 9;
+    case MIPS_REG_T2:   return 10;
+    case MIPS_REG_T3:   return 11;
+    case MIPS_REG_T4:   return 12;
+    case MIPS_REG_T5:   return 13;
+    case MIPS_REG_T6:   return 14;
+    case MIPS_REG_T7:   return 15;
+    case MIPS_REG_S0:   return 16;
+    case MIPS_REG_S1:   return 17;
+    case MIPS_REG_S2:   return 18;
+    case MIPS_REG_S3:   return 19;
+    case MIPS_REG_S4:   return 20;
+    case MIPS_REG_S5:   return 21;
+    case MIPS_REG_S6:   return 22;
+    case MIPS_REG_S7:   return 23;
+    case MIPS_REG_T8:   return 24;
+    case MIPS_REG_T9:   return 25;
+    case MIPS_REG_K0:   return 26;
+    case MIPS_REG_K1:   return 27;
+    case MIPS_REG_GP:   return 28;
+    case MIPS_REG_SP:   return 29;
+    case MIPS_REG_FP:   return 30;
+    case MIPS_REG_RA:   return 31;
+    default:            return -1;
+    }
+}
+
+/*
+ * MT ASE MFTR / MTTR: the far operand is not a GPR, and (u, sel) says
+ * which file it lives in.
+ *
+ * `MFTR rd, rt, u, sel, h` reads register `rt` of ANOTHER thread
+ * context and writes GPR `rd`; MTTR is the reverse.  The far register's
+ * FILE is selected by the (u, sel) pair, and Capstone -- like LLVM, and
+ * like the tracer behind it -- prints the far operand as a GPR whatever
+ * the pair says, collapsing all 24 named forms of the family into one
+ * GPR<->GPR move.  So `mftc0 $a0, $5` is recorded as a read of $a1,
+ * which is a register the instruction never touches, while the CP0
+ * register it does read is recorded nowhere: one fabricated dependency
+ * and one deleted one, out of a single wrong register class.
+ *
+ * The decode is QEMU's own (R6), read straight out of gen_mftr /
+ * gen_mttr in target/mips/tcg/translate.c:8077 and :8301, which switch
+ * on exactly this pair:
+ *
+ *   u == 0                CP0 register (rt, sel)          -> mftc0
+ *   u == 1, sel == 0      GPR rt                          -> mftgpr
+ *   u == 1, sel == 1      rt 0/1/2 -> AC0 lo/hi/acx,
+ *                         4/5/6 -> AC1, 8/9/10 -> AC2,
+ *                         12/13/14 -> AC3, 16 -> DSPControl
+ *   u == 1, sel == 2      FPR rt (h picks the half)       -> mftc1
+ *   u == 1, sel == 3      FP control register rt          -> cftc1
+ *   u == 1, sel == 4/5    COP2 data / control register rt -> mftc2
+ *
+ * Note the accumulator index is rt >> 2, not rt & 3: QEMU's switch
+ * spells the sixteen rt values out one at a time and the group of three
+ * (lo, hi, acx) advances by four.  `h` selects the upper half of a
+ * 64-bit FPR or COP2 register and so names the same architectural
+ * register either way.
+ *
+ * mftgpr/mttgpr genuinely ARE GPR-to-GPR and are returned unchanged,
+ * which is why the family is not corrected wholesale.  QEMU raises a
+ * reserved-instruction exception on the COP2 selectors rather than
+ * modelling them; the register class is still what the ASE defines, and
+ * the tracer folds every COP0 and COP2 register onto one REG_SYS
+ * bucket, so that fold is what the correction actually buys.
+ *
+ * Verify with `isaxcheck --isa=mipsel --hex=00200541` (`mftc0 $a0, $5`),
+ * whose SRC{} must be REG_SYS and must NOT contain REG_GPR5, and
+ * `--hex=20200541` (`mftgpr $a0, $a1`), which must still read REG_GPR5.
+ */
+static unsigned int cap_mips_mt_far_reg(int64_t u, int64_t sel, int idx)
+{
+    if (idx < 0 || idx > 31) {
+        return 0;
+    }
+    if (u == 0) {
+        return idx <= 9 ? MIPS_REG_COP00 + idx
+                        : MIPS_REG_COP010 + (idx - 10);
+    }
+    switch (sel) {
+    case 0:
+        return 0;                       /* really a GPR; leave it alone */
+    case 1:
+        if (idx == 16) {
+            return MIPS_REG_DSPCCOND;   /* stands for the DSPControl word */
+        }
+        if (idx <= 14 && (idx & 3) <= 2) {
+            return MIPS_REG_AC0 + (idx >> 2);
+        }
+        return 0;
+    case 2:
+        return MIPS_REG_F0 + idx;
+    case 3:
+        return MIPS_REG_FCR0 + idx;
+    case 4:
+    case 5:
+        return idx <= 9 ? MIPS_REG_COP20 + idx
+                        : MIPS_REG_COP210 + (idx - 10);
+    default:
+        return 0;
+    }
 }
 
 /* Append @reg to the implicit write (@is_write) or read list of a MIPS
@@ -4503,6 +4697,138 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                                       | QEMU_PLUGIN_OP_ACC_WRITE);
                 }
             }
+        }
+        /*
+         * The x0 an assembler alias spells out of existence
+         * (see cap_riscv_alias_reads_x0).
+         */
+        if (cap_riscv_alias_reads_x0(insn)) {
+            cap_riscv_add_reg_read(handle, out, RISCV_REG_X0);
+        }
+        /*
+         * A trap return reads the PC it returns to.
+         *
+         * `mret` jumps to mepc and restores the privilege level from
+         * mstatus.MPP/MPIE, writing MPP/MPIE/MIE back as it does -- the
+         * privileged manual states both halves, and Sail's MRET clause
+         * reads mepc and mstatus and writes mstatus.  The boundary
+         * reported the instruction as reading and writing NOTHING, so
+         * the one indirect jump in the kernel whose target is
+         * architecturally named had no dependency on the register that
+         * names it, and the privilege restore had no producer.  `sret`
+         * is the same instruction one level down (sepc, sstatus).
+         *
+         * The gating CSRs Sail also reads here -- menvcfg, mseccfg,
+         * hstatus, vsstatus -- decide whether the instruction is legal
+         * at the current privilege, not what it computes; they are the
+         * same legality-gate class the boundary leaves unmodelled
+         * everywhere else and are deliberately not named.
+         */
+        if (!strcmp(insn->mnemonic, "mret")) {
+            cap_riscv_add_csr(out, 0x341 /* mepc */,
+                              QEMU_PLUGIN_OP_ACC_READ);
+            cap_riscv_add_csr(out, 0x300 /* mstatus */,
+                              QEMU_PLUGIN_OP_ACC_READ
+                              | QEMU_PLUGIN_OP_ACC_WRITE);
+        } else if (!strcmp(insn->mnemonic, "sret")) {
+            cap_riscv_add_csr(out, 0x141 /* sepc */,
+                              QEMU_PLUGIN_OP_ACC_READ);
+            cap_riscv_add_csr(out, 0x100 /* sstatus */,
+                              QEMU_PLUGIN_OP_ACC_READ
+                              | QEMU_PLUGIN_OP_ACC_WRITE);
+        }
+        /*
+         * `fence` reads menvcfg.
+         *
+         * FIOM -- "Fence of I/O implies Memory" -- makes the I and O
+         * bits of a fence's predecessor and successor sets imply R and
+         * W, so the same encoding orders a different set of accesses
+         * depending on what menvcfg (or senvcfg, one level down) holds.
+         * Sail says it in two lines: `let fiom = is_fiom_active(); let
+         * pred = effective_fence_set(pred, fiom)`.  This is a change of
+         * semantics, not a legality gate, which is why it is named here
+         * and the CBO / WFI / Zicfiss enable bits are not.
+         *
+         * `fence.tso` and `fence.i` have their own clauses and no FIOM
+         * term, so the test is on the exact mnemonic.
+         */
+        if (!strcmp(insn->mnemonic, "fence")) {
+            cap_riscv_add_csr(out, 0x30a /* menvcfg */,
+                              QEMU_PLUGIN_OP_ACC_READ);
+        }
+        /*
+         * Zacas `amocas.q` names two register PAIRS.
+         *
+         * The 16-byte compare-and-swap on RV64 takes an even-odd pair
+         * for the comparand/result rd and another for the swap value
+         * rs2: rd holds the low half and rd+1 the high half, likewise
+         * rs2.  Capstone prints and reports only the even register of
+         * each pair, so half of the value being compared and half of
+         * the value being stored are absent, and the high half of the
+         * observed memory word is produced by nothing.  Sail models the
+         * pairs directly (rX_pair_bits / wX_pair_bits); amocas.w and
+         * amocas.d on RV64 are single registers and are already right.
+         *
+         * The write side of rd is restored above by
+         * cap_riscv_is_tied_rd(); this adds the odd half of both pairs.
+         * Capstone's structured operand order is not its printed order
+         * here -- the memory operand sits between rd and rs2 -- so the
+         * pair bases are the first and second REGISTER operands, not
+         * operands[0] and operands[1].
+         */
+        if (!strcmp(insn->mnemonic, "amocas.q")) {
+            uint16_t rd = 0, rs2 = 0;
+            unsigned seen = 0;
+            for (uint8_t i = 0; i < n && seen < 2; i++) {
+                if (out->operands[i].type != QEMU_PLUGIN_OP_REG) {
+                    continue;
+                }
+                if (seen == 0) {
+                    rd = out->operands[i].reg_id;
+                } else {
+                    rs2 = out->operands[i].reg_id;
+                }
+                seen++;
+            }
+            if (seen == 2
+                && rd >= RISCV_REG_X0 && rd < RISCV_REG_X31
+                && rs2 >= RISCV_REG_X0 && rs2 < RISCV_REG_X31) {
+                if (out->n_operands < QEMU_PLUGIN_INSN_DETAIL_MAX_OPS) {
+                    qemu_plugin_operand *op =
+                        &out->operands[out->n_operands];
+                    memset(op, 0, sizeof(*op));
+                    op->type   = QEMU_PLUGIN_OP_REG;
+                    op->access = QEMU_PLUGIN_OP_ACC_READ
+                               | QEMU_PLUGIN_OP_ACC_WRITE;
+                    op->reg_id = (uint16_t)(rd + 1);
+                    op->scale  = 1;
+                    cap_copy_reg_name(op->reg_name,
+                                      QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                                      handle, op->reg_id, cap_arch);
+                    out->n_operands++;
+                    n = out->n_operands;
+                }
+                cap_riscv_add_reg_read(handle, out, (uint16_t)(rs2 + 1));
+            }
+        }
+        /*
+         * Zicfilp `lpad` reads x7 and consumes the landing-pad state.
+         *
+         * A landing pad checks the label the indirect branch left in
+         * x7 (t2) against the one in its own encoding and traps on a
+         * mismatch, then clears the expected-landing-pad state the
+         * branch set.  Capstone reports the instruction as touching no
+         * register at all, so the label handshake -- the whole of
+         * Zicfilp's forward-edge integrity -- was invisible.  ELP has
+         * no CSR address of its own (its architectural homes are the
+         * status word's MPELP / SPELP fields), so the state effect is
+         * named on mstatus.
+         */
+        if (!strcmp(insn->mnemonic, "lpad")) {
+            cap_riscv_add_reg_read(handle, out, RISCV_REG_X7);
+            cap_riscv_add_csr(out, 0x300 /* mstatus: ELP */,
+                              QEMU_PLUGIN_OP_ACC_READ
+                              | QEMU_PLUGIN_OP_ACC_WRITE);
         }
     } else if (cap_arch == CS_ARCH_MIPS) {
         n = MIN(detail->mips.op_count, QEMU_PLUGIN_INSN_DETAIL_MAX_OPS);
@@ -5149,6 +5475,32 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
             break;
         default:
             break;
+        }
+        /*
+         * The MT ASE far operand's register file (see
+         * cap_mips_mt_far_reg).  Operand 1 is the far one in both
+         * directions -- MFTR prints `rd, rt, u, sel, h` and MTTR prints
+         * `rt, rd, u, sel, h`, so the near GPR is first and the far
+         * register second either way -- and operands 2 and 3 carry u and
+         * sel.  Capstone's access flags already point the right way
+         * (read for MFTR, write for MTTR); only the class is wrong.
+         */
+        if ((insn->id == MIPS_INS_MFTR || insn->id == MIPS_INS_MTTR)
+            && n >= 4
+            && out->operands[1].type == QEMU_PLUGIN_OP_REG
+            && out->operands[2].type == QEMU_PLUGIN_OP_IMM
+            && out->operands[3].type == QEMU_PLUGIN_OP_IMM) {
+            qemu_plugin_operand *far = &out->operands[1];
+            unsigned int rep =
+                cap_mips_mt_far_reg(out->operands[2].imm,
+                                    out->operands[3].imm,
+                                    cap_mips_gpr_index(far->reg_id));
+            if (rep) {
+                far->reg_id = rep;
+                cap_copy_reg_name(far->reg_name,
+                                  QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                                  handle, rep, cap_arch);
+            }
         }
     } else {
         out->n_operands = 0;

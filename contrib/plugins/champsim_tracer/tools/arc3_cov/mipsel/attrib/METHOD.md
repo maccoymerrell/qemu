@@ -1,8 +1,36 @@
 # ARC 3 register attribution -- mipsel, whole opcode space
 
-Author: Maccoy Merrell.  Tree: /mnt/md0/QEMU/qemu @ 5379a000ac (champsim-trace).
+Author: Maccoy Merrell.  Tree: /mnt/md0/QEMU/qemu, branch `champsim-trace`.
 
-## The number
+## The number, re-measured after R7.6 and R7.7
+
+| | at 5379a000ac | after the fixes | at HEAD, R7.6/R7.7 applied |
+| --- | ---: | ---: | ---: |
+| opcodes attempted | 977 | 977 | **977** |
+| tracer set == adjudicated reference set | 730 | 958 | **977** |
+| disagree | 247 | 19 | **0** |
+| **unprobed** | 0 | 0 | **0** |
+
+The last column is the whole mipsel opcode space in agreement.  Its power is
+measured, not assumed: perturbing each row's tracer set -- drop one source,
+or plant a phantom destination where both sets are empty -- flags **977 of
+977**, so the comparison is not agreeing by being blind.
+
+Nineteen of the closing rows are the two rulings:
+
+* **R7.6**, 15 rows (`break sdbbp syscall teq teqi tge tgei tgeiu tgeu tlt
+  tlti tltiu tltu tne tnei`) -- a TRACER change.  The CP0 state the exception
+  an instruction raises writes is in that instruction's set.
+* **R7.7**, 4 rows (`ll lle sc sce`) -- a REFERENCE change.  There is no
+  reservation-state register; the tracer was right and the reference's
+  invented `REG_LLBIT` is retired.
+
+The remaining 45 were reference staleness, not tracer defects: the
+accumulator split (`REG_ACCHI<n>`), the CP0 split, and the FP/MSA control
+split all landed in the tracer after the middle column was measured, and
+`canon.py` still mapped their names to the pre-split ids.
+
+## The number, as first measured
 
 | | |
 | --- | ---: |
@@ -60,11 +88,13 @@ Every departure from the rank-1 answer carries a rule id, recorded per row in
 | `L-MSACTL` | 1 | LLVM defect. `CTCMSA` models the MSA control register as a USE; the instruction writes it (`helper_msa_ctcmsa` assigns `env->active_tc.msacsr`). Corrected -- **the tracer was right**. |
 | `Q-FCR31` | 89 | QEMU truth. 108 helpers in `target/mips/tcg/fpu_helper.c` call `update_fcr31()`, which does `SET_FP_CAUSE(env->active_fpu.fcr31, ...)` unconditionally and reads `GET_FP_ENABLE(fcr31)` and the fcr31 rounding mode. `abs`/`neg`/`class`/the pure moves do not, and are correctly excluded. |
 | `Q-MSACSR` | 100 | QEMU truth. 50 MSA float helpers in `msa_helper.c` reach `update_msacsr()` (call-graph closure over the `MSA_FLOAT_*` macros, which is how the compare helpers get there). `fclass`/`fill` do not, and are correctly excluded. |
-| `Q-TRAP` | 15 | QEMU truth. `target/mips/tcg/system/tlb_helper.c` `set_EPC` (:1421-1440) writes `CP0_EPC`, `CP0_Cause.BD`, `CP0_Status.EXL` and reads `CP0_Status`; :1051/:1066 writes `CP0_BadInstr`. Per **R5** a conditional trap still names the write. |
+| `Q-TRAP` | 14 | **R7.6** + QEMU truth. `set_EPC` (`tlb_helper.c:1420-1456`) reads `CP0_Status` -- the `EXL` gate on the whole write, then `BEV` for the vector -- and read-modify-writes it; read-modify-writes `CP0_Cause` for `BD` (:1427-1430) and for the exception code (`mips_cause_set_field`, :1456, a cmpxchg loop over the word, `internal.h:172`); writes `CP0_EPC` (:1422). Registers 12/13/14, so `REG_SYSEXC`; register 8 (`BadInstr`, :1043) is the same id. Per **R4** a conditional trap names the write as a candidate whether or not it fires. |
+| `Q-TRAPD` | 1 | **R7.6** on the DEBUG entry path. `sdbbp` raises `EXCP_DBp` (`translate.c:13049`, `:13454`), not `EXCP_TRAP`, so it reaches `set_DEPC`/`enter_debug_mode` (`:1204-1233`): `CP0_Debug` read-modify-written, `CP0_DEPC` written, and the same `Status`-gated read-modify-write of `CP0_Cause`. `REG_SYSDBG` on top of `REG_SYSEXC`, and **not** `EPC`. It is the row that proves the CP0 split is doing work. |
 | `Q-CP0` | 15 | QEMU truth. The TLB and CP0-control helpers name their registers exactly: `r4k_helper_tlbr` writes EntryHi/EntryLo0/EntryLo1/PageMask, `r4k_helper_tlbp` writes Index, `helper_di`/`helper_ei` read and write `CP0_Status`, `helper_dvpe`/`helper_evpe` read-modify-write `CP0_MVPControl`. |
-| `Q-LLBIT` | 4 | The link bit. `LL`/`LLE` write it, `SC`/`SCE` read and clear it -- the entire point of the pair. QEMU models it (`env->lladdr`, `env->llval`); sail-cheri-mips is the static reference that would corroborate it and is unavailable here. |
+| `R7.7-LL` | 4 | **R7.7**: there is NO reservation-state register. Reservation state is a product of the *instruction*, not of a register; `ll`/`lle`/`sc`/`sce` name their real registers only and the monitor is the consumer's to model. Consistent with **R2** (we record ARCHITECTURAL dependencies) and with the other two ISAs, where `stlxr` and `lr.w`/`sc.w` model no monitor either. The former `Q-LLBIT` rule invented `REG_LLBIT` off `env->lladdr`/`env->llval`, which is QEMU's *implementation* of the monitor. Removed -- **the tracer was right**. |
 | `B2-MTFILE` | 24 | Rank 2 decides. The MT ASE `MFTR`/`MTTR` `(u, sel)` pair selects the register **file** of the far operand; binutils is the only reference that names it per form. LLVM, Capstone and the tracer collapse all 24 into one GPR<->GPR move (**C4**). |
 | `R1-TIED` | 2 | Rank 1 decides. `LWLE`/`LWRE` merge into the destination, so the destination is also a source (**R5**/**C4**). |
+| `B2-ACCHALF` | 2 | Rank 2 decides. LLVM's `MFHI_DSP`/`MFLO_DSP` take the accumulator PAIR as their operand class, so rank 1 names both halves; binutils names the half explicitly (`RD_HI` on `mfhi`, `RD_LO` on `mflo`) and QEMU agrees, reading `cpu_HI[acc]`/`cpu_LO[acc]` one at a time (`gen_HILO`, `translate.c:2891-2905`). Two references and the model against one operand class -- **the tracer was right**. The move-TO forms need no rule: LLVM names the single half there. |
 
 ### Rulings made against a reference
 

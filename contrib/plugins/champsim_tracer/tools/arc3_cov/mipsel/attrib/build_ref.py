@@ -1,7 +1,7 @@
 """Build the rank-1 (LLVM MC) reference operand set, desc-complete."""
 import os, json, sys, collections
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from canon import canon, drop
+from canon import canon, canon_set, drop
 
 BASE = os.environ.get("CST_ARC3_ATTRIB_DIR", os.getcwd()).rstrip("/") + "/"
 d = json.load(open(BASE + "parsed.json"))
@@ -20,22 +20,23 @@ def llvm_sets(e):
             o = ops.get(ds["tied"])
         if o is None or o["kind"] != "reg":
             continue
-        g = canon(o["val"])
+        g = canon_set(o["val"])
         if ds["role"].startswith("DEF"):
-            dst.add(g)
+            dst |= g
         else:
-            src.add(g)
+            src |= g
         if ds["tied"] is not None:
             # RMW: the destination is also a source (R5/C4).
             td = ops.get(ds["tied"])
             if td is not None and td["kind"] == "reg":
-                src.add(canon(td["val"]))
+                src |= canon_set(td["val"])
     # Variadic operands beyond the descriptor.
     for i, o in ops.items():
         if i >= len(e["dsc"]) and o["kind"] == "reg":
-            (dst if e["flags"].get("variadicOpsAreDefs") else src).add(canon(o["val"]))
-    for r in e["impuse"]: src.add(canon(r))
-    for r in e["impdef"]: dst.add(canon(r))
+            tgt = dst if e["flags"].get("variadicOpsAreDefs") else src
+            tgt |= canon_set(o["val"])
+    for r in e["impuse"]: src |= canon_set(r)
+    for r in e["impdef"]: dst |= canon_set(r)
     return drop(src), drop(dst)
 
 BU_IMPLIED_SRC = {"RD_HI":"HI", "RD_LO":"LO", "RD_$31":"REG_LR", "RD_$29":"REG_SP",

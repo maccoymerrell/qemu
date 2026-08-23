@@ -6,6 +6,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 import sail_effects as S
+import zcmp_profile as ZC
 
 QEMU = '/mnt/md0/QEMU/qemu'
 ISAX = os.path.join(QEMU, 'build/contrib/plugins/isaxcheck')
@@ -156,34 +157,74 @@ def opcode_id(r):
     if c: bits.append(c)
     return ':'.join(bits)
 
+def batch(hexes, extra):
+    argv = [ISAX, '--isa=riscv64', '--layer=fields', '--batch'] + extra
+    fals = os.environ.get('CST_FALSIFY')
+    if fals: argv.append('--falsify=' + fals)
+    proc = subprocess.run(argv, input='\n'.join(hexes) + '\n',
+                          capture_output=True, text=True)
+    tr = {}
+    for row in csv.DictReader(proc.stdout.splitlines(), delimiter='\t'):
+        tr[row['hex']] = row
+    sys.stderr.write('isaxcheck %s rows=%d rc=%d\n'
+                     % (' '.join(extra) or 'base', len(tr), proc.returncode))
+    return tr
+
+
 def main():
     inscope = {}
     with open(os.path.join(ROOT, 'opcodes.tsv')) as f:
         for row in csv.DictReader(f, delimiter='\t'):
             inscope[row['opcode_id']] = row
+    # The Zcmp/Zcmt profile is a SEPARATE enumeration pass, not eight more rows
+    # of this one: its encodings are c.fsdsp in the base decoder configuration
+    # and the two configurations cannot coexist (zcmp_profile.py has the
+    # measurement and QEMU's own refusal to build a CPU with both).  Its rows
+    # are joined to a QEMU-truth reference rather than to Sail, which has no
+    # clause for either extension.
+    zc_ref = {z['opcode_id']: z for z in ZC.ROWS}
+    base = {k: v for k, v in inscope.items()
+            if v.get('profile', ZC.BASE_PROFILE) != ZC.PROFILE}
+    zcmp = {k: v for k, v in inscope.items()
+            if v.get('profile') == ZC.PROFILE}
+    unref = [k for k in zcmp if k not in zc_ref]
+    assert not unref, ('%s-profile rows with no reference: %r' % (ZC.PROFILE, unref))
+
     rows = json.load(open(os.path.join(HERE, 'rows_vals.json')))
     byid = {}
     for r in rows: byid.setdefault(opcode_id(r), r)
-    missing = [k for k in inscope if k not in byid]
+    missing = [k for k in base if k not in byid]
     assert not missing, ('unjoined opcode rows: %d %r' % (len(missing), missing[:5]))
 
     model = S.Model(SAIL)
     an = S.Analyzer(model)
 
-    # ---- tracer side, one --batch pass
-    hexes = [inscope[k]['hex'] for k in inscope]
-    argv = [ISAX, '--isa=riscv64', '--layer=fields', '--batch']
-    fals = os.environ.get('CST_FALSIFY')
-    if fals: argv.append('--falsify=' + fals)
-    proc = subprocess.run(argv,
-                          input='\n'.join(hexes) + '\n', capture_output=True, text=True)
-    tr = {}
-    rdr = csv.DictReader(proc.stdout.splitlines(), delimiter='\t')
-    for row in rdr: tr[row['hex']] = row
-    sys.stderr.write('isaxcheck rows=%d rc=%d\n' % (len(tr), proc.returncode))
+    # ---- tracer side, one --batch pass per profile
+    tr = batch([base[k]['hex'] for k in base], [])
+    tr_zc = batch([zcmp[k]['hex'] for k in zcmp],
+                  ['--cs-mode-add=' + ZC.CS_MODE_ADD, '--mattr=' + ZC.LLVM_MATTR]) \
+            if zcmp else {}
 
     out = []
-    for oid, meta in sorted(inscope.items()):
+    for oid, meta in sorted(zcmp.items()):
+        z = zc_ref[oid]
+        rec = {'opcode_id': oid, 'mnemonic': meta['mnemonic'], 'hex': meta['hex'],
+               'node': z['opcode_id'].split(':')[1], 'ext': z['ext'],
+               'family': z['family'], 'profile': ZC.PROFILE,
+               'ref_status': 'ok', 'ref_src': ','.join(sorted(z['ref_src'], key=regkey)),
+               'ref_dst': ','.join(sorted(z['ref_dst'], key=regkey))}
+        t = tr_zc.get(meta['hex'])
+        if t is None or t['f_ok'] != '1':
+            rec['trc_status'] = 'no-fields'
+            rec['trc_src'] = rec['trc_dst'] = ''
+        else:
+            rec['trc_status'] = 'ok'
+            rec['trc_src'] = '' if t['f_src'] == '-' else t['f_src']
+            rec['trc_dst'] = '' if t['f_dst'] == '-' else t['f_dst']
+            rec['opcode'] = t['f_opcode']
+        out.append(rec)
+
+    for oid, meta in sorted(base.items()):
         r = byid[oid]
         node = r['node']
         # positional env: encdec clause parameter i carries the fixed value the
@@ -196,7 +237,8 @@ def main():
             nm = re.match(r'^([a-z_]\w*)', p.strip())
             posval.append(r['fieldvals'].get(nm.group(1)) if nm else None)
         rec = {'opcode_id': oid, 'mnemonic': meta['mnemonic'], 'hex': meta['hex'],
-               'node': node, 'ext': meta.get('ext', ''), 'family': meta.get('family', '')}
+               'node': node, 'ext': meta.get('ext', ''), 'family': meta.get('family', ''),
+               'profile': meta.get('profile', ZC.BASE_PROFILE)}
         # ---- reference
         if node not in model.exec_clauses:
             rec['ref_status'] = 'no-execute-clause'
@@ -292,8 +334,8 @@ def regkey(n):
 
 if __name__ == '__main__':
     out = main()
-    cols = ['opcode_id', 'mnemonic', 'hex', 'node', 'opcode', 'ref_status',
-            'ref_src', 'ref_dst', 'trc_status', 'trc_src', 'trc_dst',
+    cols = ['opcode_id', 'mnemonic', 'hex', 'profile', 'node', 'opcode',
+            'ref_status', 'ref_src', 'ref_dst', 'trc_status', 'trc_src', 'trc_dst',
             'verdict', 'adjudication', 'sig', 'adjudication_note']
     dest = os.path.join(ROOT, os.environ.get('CST_OUT', 'attrib.tsv'))
     with open(dest, 'w', newline='') as f:
@@ -358,7 +400,15 @@ if __name__ == '__main__':
     lines.append('  nreg (vmv<nr>r.v) -- BOTH sides expand the full group and the')
     lines.append('  comparison is exact.')
     lines.append('')
-    lines.append('denominator  %d opcodes (opcodes.tsv)' % len(out))
+    prof = collections.Counter(r.get('profile', ZC.BASE_PROFILE) for r in out)
+    lines.append('denominator  %d opcodes (opcodes.tsv): %s' % (
+        len(out), ', '.join('%s %d' % kv for kv in sorted(prof.items()))))
+    lines.append('  the %s profile is a second enumeration pass, not a subset of' % ZC.PROFILE)
+    lines.append('  the first: Zcmp/Zcmt displace the compressed FP-store encodings, so')
+    lines.append('  its representative encodings decode as c.fsdsp under the base')
+    lines.append('  decoder configuration.  Reference for those rows is QEMU\'s own')
+    lines.append('  translation (R6) -- Sail has no clause for either extension and')
+    lines.append('  LLVM MC models none of their register traffic.')
     lines.append('verdicts     %s' % dict(c))
     lines.append('adjudication %s' % dict(adj))
     lines.append('')

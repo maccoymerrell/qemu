@@ -3765,6 +3765,136 @@ static bool cap_mips_is_acc_reg(uint16_t reg)
            (reg >= MIPS_REG_LO0 && reg <= MIPS_REG_LO3);
 }
 
+/*
+ * The MIPS floating-point control/status word, on the arithmetic that
+ * maintains it.
+ *
+ * Neither Capstone nor the LLVM tables it descends from name a status
+ * register on ordinary floating-point arithmetic: `add.s $f4,$f5,$f6`
+ * comes back reading two FP registers and writing one, and nothing
+ * else.  The architecture and QEMU both say otherwise, and they say
+ * the same thing.  Every COP1 arithmetic helper in
+ * target/mips/tcg/fpu_helper.c ends in update_fcr31(), whose first act
+ * is SET_FP_CAUSE(env->active_fpu.fcr31, ...) -- and SET_FP_CAUSE is a
+ * read-modify-write (`(reg) = ((reg) & ~(0x3f << 12)) | ...`,
+ * target/mips/cpu.h:83) executed on EVERY call, not only on an
+ * exceptional one -- after which it reads GET_FP_ENABLE(fcr31) to
+ * decide whether the exception traps.  MSA is the same shape one word
+ * over: update_msacsr() in target/mips/tcg/msa_helper.c reads
+ * GET_FP_ENABLE(env->active_tc.msacsr) unconditionally and SET_FP_CAUSEs
+ * that word on both arms of its branch.  So the control register is a
+ * SOURCE and a DESTINATION on every member of both families, which is
+ * why the caller adds it to both lists.
+ *
+ * What it costs to omit: FCSR is the accumulating Cause/Flags word an
+ * FP exception handler reads and `cfc1` copies out, and its rounding
+ * mode is an input to every rounded result.  With no edge at all, a
+ * `ctc1` that changes the rounding mode is a dead write, every FP
+ * instruction in a block is mutually independent, and the handler reads
+ * a register nothing in the trace ever produced.
+ *
+ * The class is QEMU's own call graph rather than a judgement about which
+ * instructions "look arithmetic": it is the set of helpers that reach
+ * update_fcr31() / update_msacsr(), extracted from the translator's C by
+ * contrib/plugins/champsim_tracer/tools/arc3_cov/mipsel/attrib/
+ * qemu_classes.py.  What the class EXCLUDES is load-bearing and is not
+ * an oversight:
+ *
+ *   - abs / neg take no CPUMIPSState at all (helper_float_abs_s(uint32_t)
+ *     is a bit clear), and mov / movf / movt / movn / movz / class are
+ *     pure moves.  None can signal, so none maintains the word.
+ *   - `cvt.ps.s` is the single member of the cvt family with no helper:
+ *     it concatenates two singles, rounds nothing and cannot raise.
+ *   - MSA's fclass / fill / ldi never reach update_msacsr().
+ *
+ * The suffix tests carry the same weight as the stem lists.  `.s` / `.d`
+ * / `.ps` is what separates the COP1 compares from the DSP compares --
+ * `cmp.eq.ph`, `cmpu.le.qb` and `cmpgu.lt.qb` share the `cmp` stem and
+ * touch no FP status -- and the `b|h|w|d` suffix plus the leading `f` is
+ * what keeps the MSA test off the scalar family.  Measured over the
+ * tracer's whole mipsel opcode space (953 distinct mnemonics) the pair
+ * of tests selects exactly the 189 members of the two classes, with no
+ * false positive and no false negative.
+ *
+ * This is a modelling gap in the decoder lineage rather than a decode
+ * bug, so it will not go away on a Capstone bump: LLVM MC does not
+ * declare FCR31 on MIPS FP arithmetic either.  Verify with
+ * `isaxcheck --isa=mipsel --hex=00290646` (`add.s $f4,$f5,$f6`), whose
+ * `SRC{}` and `DST{}` must both name REG_FCSR, and `--hex=05290046`
+ * (`abs.s $f4,$f5`), which must name it in neither.
+ */
+static const char *const cap_mips_fcr31_stems[] = {
+    "add", "addr", "div", "madd", "maddf", "max", "maxa", "min", "mina",
+    "msub", "msubf", "mul", "mulr", "nmadd", "nmsub", "recip", "recip1",
+    "recip2", "rint", "rsqrt", "rsqrt1", "rsqrt2", "sqrt", "sub",
+};
+
+static const char *const cap_mips_msacsr_stems[] = {
+    "fadd", "fcaf", "fceq", "fcle", "fclt", "fcne", "fcor", "fcueq",
+    "fcule", "fcult", "fcun", "fcune", "fdiv", "fexdo", "fexp2", "fexupl",
+    "fexupr", "ffint_s", "ffint_u", "ffql", "ffqr", "flog2", "fmadd",
+    "fmax", "fmax_a", "fmin", "fmin_a", "fmsub", "fmul", "frcp", "frint",
+    "frsqrt", "fsaf", "fseq", "fsle", "fslt", "fsne", "fsor", "fsqrt",
+    "fsub", "fsueq", "fsule", "fsult", "fsun", "fsune", "ftint_s",
+    "ftint_u", "ftq", "ftrunc_s", "ftrunc_u",
+};
+
+static bool cap_mips_stem_is(const char *const *tab, size_t n,
+                             const char *mnem, size_t len)
+{
+    for (size_t i = 0; i < n; i++) {
+        if (!strncmp(tab[i], mnem, len) && tab[i][len] == '\0') {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The FP control/status register this mnemonic reads and writes, or 0. */
+static unsigned int cap_mips_fp_ctrl_reg(const char *mnem)
+{
+    const char *dot;
+    size_t stem;
+    bool cop1_fmt;
+
+    if (!mnem || !mnem[0]) {
+        return 0;
+    }
+    dot = strrchr(mnem, '.');
+    if (!dot) {
+        return 0;
+    }
+    stem = (size_t)(dot - mnem);
+
+    /* MSA: `f<stem>.<b|h|w|d>`. */
+    if (mnem[0] == 'f' && dot[1] && !dot[2] &&
+        (dot[1] == 'b' || dot[1] == 'h' || dot[1] == 'w' || dot[1] == 'd') &&
+        cap_mips_stem_is(cap_mips_msacsr_stems,
+                         ARRAY_SIZE(cap_mips_msacsr_stems), mnem, stem)) {
+        return MIPS_REG_MSACSR;
+    }
+    /* COP1 conversions; `cvt.` cannot be reached by the `c.` test below
+     * because that one matches the dot in position 1. */
+    if (g_str_has_prefix(mnem, "cvt.")) {
+        return strcmp(mnem, "cvt.ps.s") ? MIPS_REG_FCR31 : 0;
+    }
+    if (g_str_has_prefix(mnem, "round.") || g_str_has_prefix(mnem, "ceil.") ||
+        g_str_has_prefix(mnem, "floor.") || g_str_has_prefix(mnem, "trunc.")) {
+        return MIPS_REG_FCR31;
+    }
+    cop1_fmt = !strcmp(dot, ".s") || !strcmp(dot, ".d") || !strcmp(dot, ".ps");
+    /* COP1 compares, legacy `c.<cond>.<fmt>` and r6 `cmp.<cond>.<fmt>`. */
+    if (g_str_has_prefix(mnem, "c.") || g_str_has_prefix(mnem, "cmp.")) {
+        return cop1_fmt ? MIPS_REG_FCR31 : 0;
+    }
+    if (cop1_fmt && cap_mips_stem_is(cap_mips_fcr31_stems,
+                                     ARRAY_SIZE(cap_mips_fcr31_stems),
+                                     mnem, stem)) {
+        return MIPS_REG_FCR31;
+    }
+    return 0;
+}
+
 /* Append @reg to the implicit write (@is_write) or read list of a MIPS
  * decode unless it is already there. */
 static void cap_mips_add_implicit(qemu_plugin_insn_info *out, csh handle,
@@ -4908,6 +5038,117 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                     (*cnt)++;
                 }
             }
+        }
+        /*
+         * The FP control/status word, on the arithmetic that maintains
+         * it (see cap_mips_fp_ctrl_reg for the class and its
+         * derivation).  Both directions on every member: the Cause
+         * field is rewritten by a read-modify-write, and the enables
+         * and rounding mode are read.
+         */
+        {
+            unsigned int fpctl = cap_mips_fp_ctrl_reg(insn->mnemonic);
+            if (fpctl) {
+                cap_mips_add_implicit(out, handle, fpctl, false);
+                cap_mips_add_implicit(out, handle, fpctl, true);
+            }
+        }
+        /*
+         * The CP0 registers a system-control instruction names in its
+         * OWN definition.
+         *
+         * These are not the registers an exception writes on the way to
+         * a handler -- that footprint belongs to the exception, and by
+         * the same rule every load that can miss the TLB would read and
+         * write CP0 too.  These are the instructions whose entire
+         * architectural effect IS a CP0 access, and QEMU's helpers name
+         * the registers one by one:
+         *
+         *   tlbwi / tlbwr        read Index, EntryHi, EntryLo0/1, PageMask
+         *   tlbinv / tlbinvf     read Index, EntryHi
+         *   tlbr                 read Index; write EntryHi, EntryLo0/1,
+         *                        PageMask (r4k_helper_tlbr,
+         *                        target/mips/tcg/system/tlb_helper.c:240)
+         *   tlbp                 read EntryHi; write Index
+         *   di / ei              read and write Status
+         *                        (helper_di/helper_ei,
+         *                        system/special_helper.c:30 -- literally
+         *                        `t0 = env->CP0_Status; env->CP0_Status =
+         *                        t0 & ~(1 << CP0St_IE); return t0;`)
+         *   eret                 read Status, EPC, ErrorEPC; write Status
+         *   deret                read DEPC; write Debug
+         *   wait                 read Status, Cause
+         *   dvpe / evpe          read and write MVPControl
+         *   dmt / emt            read and write VPEControl
+         *
+         * `dmt`/`emt` are the one pair taken from the MT ASE definition
+         * instead of from QEMU: helper_dmt is a bare `return 0;` with a TODO
+         * stub (target/mips/tcg/system/cp0_helper.c:1868), so there is no
+         * modelling there to read.  Their siblings dvpe/evpe ARE modelled
+         * and read-modify-write MVPControl, which is what the ASE says
+         * dmt/emt do to VPEControl.
+         *
+         * Capstone's implicit lists are empty for all of them, so today
+         * `eret` is an instruction with no inputs and no outputs and
+         * `tlbwi` reads nothing -- a kernel's whole TLB-refill path is
+         * dependency-free.  The registers named below all fold to the
+         * tracer's one REG_SYS bucket, so the specific CP0 number is
+         * chosen to describe the access rather than to be individually
+         * resolvable; the first register of each list is enough to carry
+         * the edge, and the second is added only where the read and the
+         * write are different registers.
+         *
+         * Verify with `isaxcheck --isa=mipsel --hex=02000042` (`tlbwi`),
+         * whose `SRC{}` must name REG_SYS and whose `DST{}` must stay
+         * empty, and `--hex=18000042` (`eret`), which must name it in
+         * both.
+         */
+        switch (insn->id) {
+        case MIPS_INS_TLBWI:
+        case MIPS_INS_TLBWR:
+        case MIPS_INS_TLBINV:
+        case MIPS_INS_TLBINVF:
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP00, false);
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP010, false);
+            break;
+        case MIPS_INS_TLBR:
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP00, false);
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP010, true);
+            break;
+        case MIPS_INS_TLBP:
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP010, false);
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP00, true);
+            break;
+        case MIPS_INS_DI:
+        case MIPS_INS_EI:
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP012, false);
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP012, true);
+            break;
+        case MIPS_INS_ERET:
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP012, false);
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP014, false);
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP012, true);
+            break;
+        case MIPS_INS_DERET:
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP024, false);
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP023, true);
+            break;
+        case MIPS_INS_WAIT:
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP012, false);
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP013, false);
+            break;
+        case MIPS_INS_DVPE:
+        case MIPS_INS_EVPE:
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP00, false);
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP00, true);
+            break;
+        case MIPS_INS_DMT:
+        case MIPS_INS_EMT:
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP01, false);
+            cap_mips_add_implicit(out, handle, MIPS_REG_COP01, true);
+            break;
+        default:
+            break;
         }
     } else {
         out->n_operands = 0;

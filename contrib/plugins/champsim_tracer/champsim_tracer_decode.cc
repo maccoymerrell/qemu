@@ -347,6 +347,9 @@ static const InsnClassification *classify_insn_id(
  *    INDIRECT_JUMP); "jr $ra" is the architectural return idiom and the
  *    register is only visible per instance.  `bal` is the always-taken
  *    alias of `bgezal $zero`, so it inherits a condition it does not have.
+ *    `mfhi` and `mflo` read different halves of the accumulator, and
+ *    Capstone reports both as reading the whole pair, so the half the
+ *    mnemonic does not name is dropped here.
  *
  * BRANCH TYPE IS NOT THE ONLY FIELD IT REPAIRS, which is why it is not
  * named for one.  The same alias that hides a RISC-V call's role also hides
@@ -384,6 +387,62 @@ static void refine_alias_fields(const qemu_plugin_insn_info *info,
         if ((!strcmp(m, "jr") || !strcmp(m, "jr.hb")) &&
             !strcmp(info->op_str, "$ra")) {
             out->branch_type = BRANCH_RETURN;
+        }
+        /*
+         * `mfhi rd[, ac]` reads the HIGH half of the accumulator and
+         * `mflo rd[, ac]` the LOW half -- two different registers,
+         * which is why the generic space gives them REG_ACCHI<n> and
+         * REG_ACC<n>.  Capstone reports both as reading the WHOLE
+         * pair: MIPS_REG_AC<n>, for either mnemonic.  (Measured on
+         * Capstone 6.0.0-Alpha7: `mfhi $t0` and `mflo $t0` both yield
+         * regs_read = {ac0}, while `mult` correctly writes
+         * MIPS_REG_HI0 and MIPS_REG_LO0 as separate registers, and
+         * `mthi`/`mtlo` correctly name the single half they write.)
+         *
+         * The register table cannot fix this -- it is keyed by
+         * REGISTER and the discriminator is the INSTRUCTION -- so the
+         * AC<n> row names both halves (which is right for the DSP
+         * DPA/EXTR family, whose operations genuinely use all 64
+         * bits) and the two move-from forms drop the half they do not
+         * read here.  Without this, every `mfhi` takes a false edge
+         * from every producer of LO, and vice versa: the exact class
+         * of manufactured dependency the split exists to remove.
+         *
+         * Upstream: Capstone's MIPS move-from-accumulator operands
+         * should name MIPS_REG_HI<n> / MIPS_REG_LO<n>, as the
+         * move-to forms already do.  Revisit on a Capstone bump.
+         */
+        if (!strcmp(m, "mfhi") || !strcmp(m, "mflo")) {
+            const bool want_hi = (m[2] == 'h');
+            const uint8_t lo_first = REG_ACC0, lo_last = REG_ACC3;
+            const uint8_t hi_first = REG_ACCHI0, hi_last = REG_ACCHI3;
+            const uint8_t drop_first = want_hi ? lo_first : hi_first;
+            const uint8_t drop_last  = want_hi ? lo_last  : hi_last;
+            /*
+             * Compaction shifts src slot indices, and the address-dep
+             * masks are indexed by them.  These instructions have no
+             * memory operand so the masks are never populated; refuse
+             * rather than silently renumber if that ever changes.
+             */
+            if (!out->has_addr_deps) {
+                uint8_t keep = 0;
+                for (uint8_t i = 0; i < out->n_src_regs; i++) {
+                    uint8_t id = out->src_regs[i];
+                    if (id >= drop_first && id <= drop_last) {
+                        continue;
+                    }
+                    if (keep != i) {
+                        out->src_regs[keep]      = id;
+                        out->src_lane_mask[keep] = out->src_lane_mask[i];
+                        if (out_names) {
+                            out_names->src_qemu_reg_keys[keep] =
+                                out_names->src_qemu_reg_keys[i];
+                        }
+                    }
+                    keep++;
+                }
+                out->n_src_regs = keep;
+            }
         }
         /*
          * `bal target` is the alias of `bgezal $zero, target`, and

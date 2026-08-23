@@ -2072,8 +2072,41 @@ def classify_mips_reg(name: str) -> RegEntry:
         return reg_ent(numbered("REG_VEC", int(match.group(1))))
     if match := re.fullmatch(r"(?:MSA|FCC)(\d+)", stem):
         return reg_ent(numbered("REG_PRED", int(match.group(1)) % 32))
-    if match := re.fullmatch(r"(?:AC|HI|LO|MPL|P)(\d+)", stem):
+    # HI and LO are architecturally DISTINCT.  `mfhi` and `mflo` read
+    # different hardware, binutils mips-opc.c separates them, and QEMU
+    # exposes them as two GDB registers (gdb-xml/mips-cpu.xml "hi" and
+    # "lo").  One generic ID for both was a conflation no consumer
+    # could undo: it saw one register where the machine has two.  The
+    # LOW half keeps REG_ACC<n>; the HIGH half takes REG_ACCHI<n>.
+    #
+    # AC<n> is the MIPS DSP name for the WHOLE 64-bit accumulator, so
+    # it maps to both halves as a register LIST -- the same shape as
+    # the AArch64 D0_D1 forms, not a fold.  Capstone reports `mfhi`
+    # and `mflo` as reading AC<n> as well, which is a Capstone defect
+    # (measured: both yield MIPS_REG_AC0, while `mult` correctly
+    # writes MIPS_REG_HI0 and MIPS_REG_LO0 separately).  It is
+    # repaired at the decode boundary in refine_alias_fields, not
+    # here: this table is keyed by REGISTER and the discriminator is
+    # the INSTRUCTION.
+    if match := re.fullmatch(r"HI(\d+)", stem):
+        return reg_ent(numbered("REG_ACCHI", int(match.group(1)) % 4))
+    if match := re.fullmatch(r"LO(\d+)", stem):
         return reg_ent(numbered("REG_ACC", int(match.group(1)) % 4))
+    if match := re.fullmatch(r"AC(\d+)", stem):
+        num = int(match.group(1)) % 4
+        return reg_ent(numbered("REG_ACC", num),
+                       [numbered("REG_ACC", num),
+                        numbered("REG_ACCHI", num)])
+    # MPL<n> and P<n> are LLVM's DSP multiplier-pipeline scheduling
+    # pseudo-registers; the MIPS architecture defines no such
+    # registers.  A 537M-encoding sweep of the SPECIAL / COP0-3 /
+    # SPECIAL2 / MSA / SPECIAL3 spaces (82.9M decodes, mips32r2le)
+    # produced AC0-3, HI0-3 and LO0-3 and none of these -- which is
+    # what a pseudo-register looks like from outside a compiler.  On
+    # REG_ACC<n> they sat on top of the real LOW half.  They are not
+    # registers, so they name none.
+    if re.fullmatch(r"(?:MPL|P)\d+", stem):
+        return reg_none()
     if stem.startswith("FCR"):
         return reg_ent("REG_FCSR")
     # Hardware register 29 is CP0 UserLocal, the MIPS thread pointer, and
@@ -3671,9 +3704,14 @@ def qemu_mips_reg_key(name: str) -> QemuRegKey | None:
         return QemuRegKey(feature, "zero")
     if stem == "PC":
         return QemuRegKey(feature, "pc")
-    if stem == "LO":
+    # The architectural HI/LO pair is Capstone's HI0/LO0 (there is no
+    # bare MIPS_REG_HI or MIPS_REG_LO, so keying on "HI"/"LO" bound
+    # nothing and left the whole accumulator class unbound in the
+    # collision audit).  HI1-3/LO1-3 are the DSP ASE accumulators and
+    # QEMU's GDB stub does not name them.
+    if stem == "LO0":
         return QemuRegKey(feature, "lo")
-    if stem == "HI":
+    if stem == "HI0":
         return QemuRegKey(feature, "hi")
     if stem in MIPS_GPR_NUM:
         return QemuRegKey(feature, gpr_names[MIPS_GPR_NUM[stem]])

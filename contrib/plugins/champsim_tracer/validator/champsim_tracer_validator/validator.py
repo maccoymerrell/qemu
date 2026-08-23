@@ -3404,6 +3404,17 @@ def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
                     add(exp_src, rs2 + 1)
 
     elif isa == "mipsel":
+        # `mfhi` reads only the HIGH half of the accumulator and `mflo`
+        # only the LOW half -- two different registers, REG_ACCHI<n> and
+        # REG_ACC<n>.  Capstone names the WHOLE pair (MIPS_REG_AC<n>)
+        # for both mnemonics, so the reg table maps AC<n> to both halves
+        # (right for the DSP DPA/EXTR family) and refine_alias_fields
+        # drops the half the mnemonic does not name.  Mirrored here
+        # rather than skipped, so the oracle would catch that repair
+        # being dropped instead of going quiet.
+        if mnem in ("mfhi", "mflo"):
+            _pat = r"REG_ACC\d+" if mnem == "mfhi" else r"REG_ACCHI\d+"
+            exp_src -= {n for n in exp_src if re.fullmatch(_pat, n)}
         # Tied destinations: bit-field insert, lane insert/shuffle,
         # masked select, multiply-accumulate, and the conditional moves,
         # each of which preserves part of its destination.
@@ -4598,7 +4609,8 @@ def _unsupported_reg_coverage(isa: str) -> set[str]:
             "REG_FCSR", "REG_VCTRL",
         },
         "mipsel": {
-            "REG_ACC0", "REG_ACC1", "REG_ACC2", "REG_ACC3",
+            "REG_ACC1", "REG_ACC2", "REG_ACC3",
+            "REG_ACCHI1", "REG_ACCHI2", "REG_ACCHI3",
             "REG_FLAGS", "REG_IP",
             "REG_SYS", "REG_VCTRL",
             *(f"REG_PRED{i}" for i in range(32)),
@@ -4621,10 +4633,16 @@ def _reachable_reg_names_for_isa(isa: str) -> set[str]:
     path = _PLUGIN_SOURCE_DIR / header
     text = path.read_text()
     out: set[str] = set()
+    # The generated tables use DESIGNATED initialisers
+    # (`{ .reg_id = REG_X, .n_regs = 2, .regs = { A, B }, ... }`).  A
+    # pattern written for the older positional form matches nothing,
+    # and "nothing" reads here as "everything is covered" -- a check
+    # that cannot find its subject reporting success.  Anchor on the
+    # field names.
     entry_re = re.compile(
-        r"\[[A-Z0-9_]+\]\s*=\s*\{\s*"
+        r"\[[A-Z0-9_]+\]\s*=\s*\{\s*\.reg_id\s*=\s*"
         r"(REG_[A-Z0-9_]+)"
-        r"(?:\s*,\s*\d+\s*,\s*\{([^}]*)\})?\s*\}"
+        r"(?:[^}]*?\.regs\s*=\s*\{([^}]*)\})?"
     )
     for m in entry_re.finditer(text):
         alias_text = m.group(2)

@@ -1450,10 +1450,18 @@ _register_probe('probe_implicit_acc', {
                '    "mflo $t4"',
         'clobbers': '"$t1","$t2","$t3","$t4","hi","lo"',
         'opcodes': ['INT_MUL'],
+        # HI and LO are separate registers: REG_ACC0 is the LOW half,
+        # REG_ACCHI0 the HIGH half.  `mult` writes both; `mfhi` reads
+        # only the high half and `mflo` only the low one.  Capstone
+        # names the whole pair for both move-from forms, so the halves
+        # here are what the decode boundary's mfhi/mflo repair
+        # produces -- if that repair regresses, these two rows go back
+        # to naming both registers and this probe fails.
         'insns': [
             {}, {},
-            {"src": ["REG_GPR9", "REG_GPR10"], "dst": ["REG_ACC0"]},
-            {"src": ["REG_ACC0"], "dst": ["REG_GPR11"]},
+            {"src": ["REG_GPR9", "REG_GPR10"],
+             "dst": ["REG_ACCHI0", "REG_ACC0"]},
+            {"src": ["REG_ACCHI0"], "dst": ["REG_GPR11"]},
             {"src": ["REG_ACC0"], "dst": ["REG_GPR12"]},
         ]},
 })

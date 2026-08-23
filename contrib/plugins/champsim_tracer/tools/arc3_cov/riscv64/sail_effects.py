@@ -218,7 +218,15 @@ LEAF = {
     'read_vreg': ('R', 'VEC', 3, 2), 'write_vreg': ('W', 'VEC', 3, 2),
     'read_single_element': ('R', 'VEC', 2, None),
     'write_single_element': ('W', 'VEC', 2, None),
-    'read_vreg_seg': ('R', 'VEC', 4, 2),
+    # read_vreg_seg is a GROUP read: its body is
+    #   `foreach (j from 0 to (nf - 1)) { vreg_list[j] =
+    #      read_vreg(.., vregidx_offset(vrid, j * LMUL_reg)) }`
+    # (model/extensions/V/vext_utils_insts.sail:571-573), so a segment
+    # load reads all nf fields of the destination group, not just the
+    # base.  Reported as a group key so expand_group() widens it by nf,
+    # exactly as the write side is widened by the vregidx_offset the
+    # write_single_element calls carry.
+    'read_vreg_seg': ('R', 'VEC', 4, 'grp'),
     'write_vmask': ('W', 'VEC', 1, None),
     # scattered CSR dispatch: 254 `function clause read_CSR/write_CSR` arms
     # keyed by CSR number; the number itself is the register identity.
@@ -588,9 +596,11 @@ class Analyzer:
                 return {('R', 'VEC', self.val(args[ri], env))}
             return set()
         if name in LEAF:
-            role, cls, ai, _ = LEAF[name]
+            role, cls, ai, grp = LEAF[name]
             if ai >= len(args): return set()
             v = self.val(args[ai], env)
+            if grp == 'grp' and isinstance(v, int):
+                return {(role, cls, ('grp', v))}
             if cls == 'CSRNUM':
                 return {(role, 'CSRNUM', v)}
             if cls == 'GPRPAIR':

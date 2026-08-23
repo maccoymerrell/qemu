@@ -399,7 +399,10 @@ hardware page-table walk
    ``qemu_plugin_operand`` also carries ``sysreg_class``, the
    architectural role of a ``QEMU_PLUGIN_OP_SYSREG`` operand
    (``QEMU_PLUGIN_SYSREG_FLAGS`` / ``_FPCTRL`` / ``_VECCTRL`` /
-   ``_THREADPTR`` / ``_OTHER``).  Capstone models system registers
+   ``_THREADPTR`` / ``_IDENT`` / ``_MMU`` / ``_TIMER`` /
+   ``_SHADOWSTK`` / ``_EXC`` / ``_PERF`` / ``_DBG`` / ``_CACHE`` /
+   ``_FPENABLE``, with ``_OTHER`` the residual and the default).
+   Capstone models system registers
    outside its register enum *and* has ids for almost none of them —
    two of the 1214 entries in ``aarch64_sysreg`` — so there is no
    register id to hand over and ``reg_id`` cannot be used to classify
@@ -1583,7 +1586,7 @@ Wrong-path syscalls: fetched, never performed
    instruction's destinations.
 
 AArch64: PAN does not apply to a debug read
-------------------------------------------
+-------------------------------------------
 
 The content gate that decides whether the currently-executing address space
 is the marked process reads the marker bytes at their pinned virtual address

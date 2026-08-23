@@ -623,8 +623,15 @@ So the translation cannot be done by renumbering, and it is done where
 every other Capstone gap is closed: at the boundary.  ``disas/capstone.c``
 resolves the operand's architectural ROLE and emits a
 ``QEMU_PLUGIN_OP_SYSREG`` operand carrying it in ``sysreg_class`` —
-``QEMU_PLUGIN_SYSREG_FLAGS``, ``_FPCTRL``, ``_VECCTRL``, ``_THREADPTR``
-or ``_OTHER``.  ``reg_id`` still carries the raw architectural encoding
+``QEMU_PLUGIN_SYSREG_FLAGS``, ``_FPCTRL``, ``_VECCTRL``,
+``_THREADPTR``, ``_IDENT``, ``_MMU``, ``_TIMER``, ``_SHADOWSTK``,
+``_EXC``, ``_PERF``, ``_DBG``, ``_CACHE``, ``_FPENABLE``, or
+``_OTHER`` for the residual.  Every one of those but ``_OTHER`` exists
+because folding it into the residual would put a hot, narrow
+dependency population into the same slot as the whole system-register
+space; ``_IDENT`` is the sharpest case, since a read of an
+implementation constant depends on nothing at all.  :doc:`reference`
+tabulates the role-to-ID mapping.  ``reg_id`` still carries the raw architectural encoding
 for identification, but nothing classifies from it.  The plugin side is
 then ISA-independent: ``generic_reg_for_sysreg_class()`` renames the
 role into a generic ID, with no per-ISA branch and nothing to keep in

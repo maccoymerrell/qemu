@@ -504,8 +504,15 @@ a generic-domain register.  A register travels on the wire as one
 integer whose name comes from the trace's ``reg`` map; the names
 below are the contract.  A banked name such as ``REG_GPR0`` denotes
 slot 0 of a contiguous family — for the GPR bank the names run
-``REG_GPR0`` .. ``REG_GPR63``, index ``n`` selecting slot ``n`` —
-without implying any particular numeric base.
+``REG_GPR0`` .. ``REG_GPR31``, index ``n`` selecting slot ``n`` —
+without implying any particular numeric base.  A bank is exactly as
+wide as the range given here, and the ID space past its end belongs to
+whatever the allocation names there: the general-purpose and
+floating-point banks are 32 wide because no supported ISA numbers more
+than 32 of either file, and the IDs immediately above them carry the
+x86 control and debug files and the accumulator high halves.  The
+allocation table in :doc:`format` section 5.4 is the authority on which
+numeric ID a name occupies.
 
 .. list-table::
    :header-rows: 1
@@ -521,10 +528,22 @@ without implying any particular numeric base.
        written into a template's ``src_regs`` / ``dst_regs`` and
        consumers will not see it on the wire.  The decoder reserves
        the name purely as a debugging fallback.
-   * - ``REG_GPR0`` .. ``REG_GPR63``
-     - General-purpose integer registers.
-   * - ``REG_FPR0`` .. ``REG_FPR63``
-     - Scalar floating-point registers.
+   * - ``REG_GPR0`` .. ``REG_GPR31``
+     - General-purpose integer registers.  Thirty-two slots, which is
+       the widest integer file any supported ISA numbers.  A register
+       the ABI or the architecture gives a role of its own leaves the
+       bank for that role's ID rather than taking a slot — ``REG_SP``,
+       ``REG_FP_REG``, ``REG_LR``, ``REG_ZERO``, ``REG_TLS`` — so the
+       highest slot in use is per-ISA (``REG_GPR31`` on RISC-V,
+       ``REG_GPR28`` on AArch64 and MIPS, ``REG_GPR13`` on x86-64) and
+       no ISA occupies all thirty-two.  The IDs above the bank are
+       *not* GPRs: they are ``REG_CTRL0`` .. ``REG_CTRL15`` and
+       ``REG_DEBUG0`` .. ``REG_DEBUG15``, described below.
+   * - ``REG_FPR0`` .. ``REG_FPR31``
+     - Scalar floating-point registers.  Thirty-two slots, the widest
+       scalar FP file any supported ISA numbers.  The IDs above the
+       bank are ``REG_ACCHI0`` .. ``REG_ACCHI3`` and the privileged
+       behaviour classes, not FP registers.
    * - ``REG_VEC0`` .. ``REG_VEC63``
      - Vector / SIMD registers.  The full width is whatever the
        guest ISA exposes (XMM, YMM, ZMM on x86; Q on aarch64;
@@ -763,6 +782,98 @@ without implying any particular numeric base.
        one architecturally.
    * - ``REG_FP_REG``
      - Frame pointer (rbp / x29 / ``s0``).
+
+.. _sysreg-roles:
+
+System-register roles (``QEMU_PLUGIN_SYSREG_*``)
+------------------------------------------------
+
+Most registers reach the plugin as a Capstone register id and resolve
+through the per-ISA table.  System registers mostly cannot: Capstone
+numbers them in a space of their own and has an ordinary register id
+for almost none of them — two of the 1,214 entries in its
+``aarch64_sysreg`` enum, and none of x86-64's MSRs.  For those the
+decode boundary resolves the register's architectural ROLE instead and
+emits a ``QEMU_PLUGIN_OP_SYSREG`` operand carrying it in
+``sysreg_class``; ``reg_id`` still carries the raw architectural
+encoding, but nothing classifies from it.  On the plugin side
+``generic_reg_for_sysreg_class()`` renames the role into a generic ID
+with no per-ISA branch.
+
+The role vocabulary and the ID vocabulary are deliberately different,
+and the two doors reach the same groups: MIPS numbers its CP0 file and
+Capstone names every entry, so MIPS arrives through the register table,
+while AArch64's whole privileged file arrives as a role.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 24 36
+
+   * - ``sysreg_class``
+     - Generic ID
+     - Role
+   * - ``QEMU_PLUGIN_SYSREG_FLAGS``
+     - ``REG_FLAGS``
+     - Condition flags (AArch64 ``NZCV``).
+   * - ``QEMU_PLUGIN_SYSREG_FPCTRL``
+     - ``REG_FCSR``
+     - FP / fixed-point rounding-mode and status word.
+   * - ``QEMU_PLUGIN_SYSREG_VECCTRL``
+     - ``REG_VCTRL``
+     - Vector configuration (``vl``, ``vtype``, ``vstart``).
+   * - ``QEMU_PLUGIN_SYSREG_THREADPTR``
+     - ``REG_TLS``
+     - Userspace thread pointer (``TPIDR_EL0``, ``TPIDRRO_EL0``).
+   * - ``QEMU_PLUGIN_SYSREG_IDENT``
+     - ``REG_SYSID``
+     - Read-only implementation constants: AArch64 ``MIDR_EL1``,
+       ``MPIDR_EL1``, ``REVIDR_EL1``, ``CTR_EL0``, ``DCZID_EL0`` and
+       the ``ID_AA64*_EL1`` space; RISC-V ``vlenb``, ``mvendorid``,
+       ``marchid``, ``mimpid``, ``mhartid``.  This is the class that
+       decides whether a system-register read is ``REG_SYSID`` or the
+       residual ``REG_SYS``, and it exists because a read of an
+       implementation constant depends on nothing and must not share
+       an ID with writable state a consumer orders against.
+   * - ``QEMU_PLUGIN_SYSREG_MMU``
+     - ``REG_SYSMMU``
+     - Address-translation state, including the x86-64 descriptor
+       tables ``GDTR`` / ``IDTR`` / ``LDTR`` / ``TR``.
+   * - ``QEMU_PLUGIN_SYSREG_TIMER``
+     - ``REG_SYSTIMER``
+     - A counter that advances on its own, and its compare value.
+   * - ``QEMU_PLUGIN_SYSREG_SHADOWSTK``
+     - ``REG_SSP``
+     - The shadow-stack pointer: x86-64 CET ``SSP``, RISC-V Zicfiss
+       ``ssp``, AArch64 ``GCSPR_ELx``.
+   * - ``QEMU_PLUGIN_SYSREG_EXC``
+     - ``REG_SYSEXC``
+     - What an exception writes on entry and an exception return reads
+       back (``ESR`` / ``FAR`` / ``ELR`` / ``SPSR`` / ``VBAR``).
+   * - ``QEMU_PLUGIN_SYSREG_PERF``
+     - ``REG_SYSPERF``
+     - Performance and activity counters and their control.
+   * - ``QEMU_PLUGIN_SYSREG_DBG``
+     - ``REG_SYSDBG``
+     - Debug, trace and branch-record state.
+   * - ``QEMU_PLUGIN_SYSREG_CACHE``
+     - ``REG_SYSCACHE``
+     - An indexed record window and its selector (``CSSELR`` with
+       ``CCSIDR``, ``ERRSELR`` with the ``ERX*`` records).
+   * - ``QEMU_PLUGIN_SYSREG_FPENABLE``
+     - ``REG_SYSFPEN``
+     - The enable state that decides whether an FP / SIMD / vector
+       instruction executes or traps (``CPACR_EL1``,
+       ``CPTR_EL{2,3}``).
+   * - ``QEMU_PLUGIN_SYSREG_OTHER``
+     - ``REG_SYS``
+     - The residual, and the default: what an operand carries when the
+       boundary has no opinion, so a zeroed operand reads as *some*
+       system register rather than as a specific one.
+
+``REG_COPROC0`` / ``REG_COPROC1`` have no role of their own — no
+supported ISA reports an implementation-defined coprocessor file
+through this path, and MIPS CP2 / CP3 reach those IDs from the register
+table.
 
 .. _atomic-flag:
 

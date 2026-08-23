@@ -2852,6 +2852,17 @@ file but belong to its behaviour class — AArch64 ``ZT0`` at
 The privileged band 101..110 is ``REG_SYSEXC``, ``REG_SYSMMU``,
 ``REG_SYSTIMER``, ``REG_SYSPERF``, ``REG_SYSDBG``, ``REG_SYSCACHE``,
 ``REG_SYSID``, ``REG_COPROC0``, ``REG_COPROC1`` and ``REG_SYSFPEN``.
+Which of them a system register lands on is decided at the decode
+boundary and not by the ISA register table, on every ISA whose system
+registers Capstone has no register id for: the operand carries an
+architectural role in ``sysreg_class`` — ``QEMU_PLUGIN_SYSREG_IDENT``
+for a read-only implementation constant, ``_EXC``, ``_MMU``,
+``_TIMER``, ``_PERF``, ``_DBG``, ``_CACHE``, ``_FPENABLE`` for the
+other behaviour groups, ``_FLAGS``, ``_FPCTRL``, ``_VECCTRL``,
+``_THREADPTR``, ``_SHADOWSTK`` for the single-register classes, and
+``_OTHER`` for the residual — and the plugin renames the role to the
+ID.  The role does not travel on the wire; the ID does.
+:doc:`reference` tabulates the whole mapping.
 The
 compressed-special band holds the classes that are one register rather
 than a bank: ``REG_BOUND0..3``, ``REG_ACC0..3``, ``REG_ZERO``,

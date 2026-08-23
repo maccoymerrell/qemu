@@ -6947,6 +6947,14 @@ riscv64 R-rd-phantom cbo.zero +sys
 riscv64 R-rd-phantom fence +sys
 riscv64 R-rd-phantom mret +sys
 riscv64 R-rd-phantom sret +sys
+riscv64 R-rd-phantom ssamoswap.d +sys
+riscv64 R-rd-phantom ssamoswap.d.aq +sys
+riscv64 R-rd-phantom ssamoswap.d.aqrl +sys
+riscv64 R-rd-phantom ssamoswap.d.rl +sys
+riscv64 R-rd-phantom ssamoswap.w +sys
+riscv64 R-rd-phantom ssamoswap.w.aq +sys
+riscv64 R-rd-phantom ssamoswap.w.aqrl +sys
+riscv64 R-rd-phantom ssamoswap.w.rl +sys
 riscv64 R-rd-phantom sspopchk +sys
 riscv64 R-rd-phantom sspush +sys
 riscv64 R-rd-phantom wfi +sys

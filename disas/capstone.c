@@ -6615,6 +6615,31 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
             }
         }
         /*
+         * Zicfiss `ssamoswap.w` / `ssamoswap.d` read the same enable bit
+         * every other shadow-stack instruction reads.
+         *
+         * Capstone decodes these two natively once CS_MODE_RISCV_ZICFISS
+         * is set -- rd, rs1 and rs2 are all correct -- so unlike sspush /
+         * sspopchk / ssrdp above there is no operand list to rebuild.  What
+         * is missing is the gate: the instruction is only legal where
+         * menvcfg.SSE (senvcfg.SSE at U, henvcfg.SSE under H) is set, and
+         * Sail's SSAMOSWAP clause reads it exactly as the other five do.
+         * Under R7.4 a CSR that decides whether the instruction traps is a
+         * source, because a pending write to it must resolve before the
+         * instruction may proceed.
+         *
+         * This is the one Zicfiss instruction the R7.4 pass missed, and the
+         * reason is worth recording: the pair sat in the coverage
+         * denominator's excluded.tsv under "neither decoder in the tracer
+         * boundary decodes this encoding", a justification that stopped
+         * being true the moment CS_MODE_RISCV_ZICFISS was switched on.  A
+         * stale exclusion does not merely understate a denominator; it
+         * hides whatever the excluded rows would have measured.
+         */
+        if (!strncmp(insn->mnemonic, "ssamoswap.", 10)) {
+            cap_riscv_add_envcfg_gate(out);
+        }
+        /*
          * Zacas `amocas.q` names two register PAIRS.
          *
          * The 16-byte compare-and-swap on RV64 takes an even-odd pair
@@ -6957,6 +6982,55 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
                 op->access |= QEMU_PLUGIN_OP_ACC_READ
                             | QEMU_PLUGIN_OP_ACC_WRITE;
                 break;
+            }
+        }
+        /*
+         * The classic `div rs, rt` / `divu rs, rt` have NO destination
+         * register field.
+         *
+         * Bits 15:11 are architecturally zero for the MIPS32 two-operand
+         * divide, and an encoding with them set does not decode at all
+         * (`--hex=1a088500` is rejected; `--hex=1a008500` is
+         * `div $zero, $a0, $a1`).  Capstone's AsmString for these forms
+         * spells the destination literally -- "div\t$$zero, $rs, $rt" --
+         * and then materialises that literal as operand 0: a
+         * MIPS_REG_ZERO carrying CS_AC_WRITE.  The instruction writes
+         * HI/LO, so the operand fabricates a destination the ISA does not
+         * have.  LLVM MC, whose table the string comes from, reads it as
+         * text and reports RD{rs,rt} WR{ac0} with no $0.  `mult`/`multu`,
+         * spelled without the literal, are already right.
+         *
+         * GATED ON THE ACCUMULATOR WRITE, not on the mnemonic alone.
+         * MIPS R6 -- a mode cap_mode_mips() selects from the guest ELF's
+         * e_flags, so it is reachable -- redefines DIV/DIVU as genuine
+         * three-operand instructions with a real rd and no HI/LO write.
+         * There the destination is architectural and must survive, and
+         * the accumulator write is exactly what tells the two apart.
+         *
+         * Invisible until the coverage harness stopped suppressing
+         * REG_ZERO on both sides of the comparison (R7.3): with the
+         * suppression in place a fabricated write to $0 and a correct
+         * absence of one compared equal.
+         */
+        if (n >= 1
+            && (insn->id == MIPS_INS_DIV || insn->id == MIPS_INS_DIVU
+                || insn->id == MIPS_INS_DDIV || insn->id == MIPS_INS_DDIVU)
+            && out->operands[0].type == QEMU_PLUGIN_OP_REG
+            && out->operands[0].reg_id == MIPS_REG_ZERO
+            && (out->operands[0].access & QEMU_PLUGIN_OP_ACC_WRITE)) {
+            bool writes_acc = false;
+            for (uint8_t i = 0; i < out->n_regs_write; i++) {
+                if (cap_mips_is_acc_reg(out->regs_write_id[i])) {
+                    writes_acc = true;
+                    break;
+                }
+            }
+            if (writes_acc) {
+                for (uint8_t i = 1; i < n; i++) {
+                    out->operands[i - 1] = out->operands[i];
+                }
+                n--;
+                out->n_operands = n;
             }
         }
         /*

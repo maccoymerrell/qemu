@@ -5190,6 +5190,14 @@ riscv64 FR-wr-phantom csrwi +REG_SYSID
 riscv64 FR-rd-phantom fence +REG_SYS
 riscv64 FR-rd-phantom mret +REG_SYS
 riscv64 FR-rd-phantom sret +REG_SYS
+riscv64 FR-rd-phantom ssamoswap.d +REG_SYS
+riscv64 FR-rd-phantom ssamoswap.d.aq +REG_SYS
+riscv64 FR-rd-phantom ssamoswap.d.aqrl +REG_SYS
+riscv64 FR-rd-phantom ssamoswap.d.rl +REG_SYS
+riscv64 FR-rd-phantom ssamoswap.w +REG_SYS
+riscv64 FR-rd-phantom ssamoswap.w.aq +REG_SYS
+riscv64 FR-rd-phantom ssamoswap.w.aqrl +REG_SYS
+riscv64 FR-rd-phantom ssamoswap.w.rl +REG_SYS
 riscv64 FR-rd-phantom sspopchk +REG_SYS
 riscv64 FR-rd-phantom sspush +REG_SYS
 riscv64 FR-wr-phantom mret +REG_SYS

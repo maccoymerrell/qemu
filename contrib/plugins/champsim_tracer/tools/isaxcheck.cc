@@ -2342,6 +2342,14 @@ int main(int argc, char **argv)
      * conditions below make --falsify a guaranteed no-op, and a no-op that
      * exits 0 is the silent-false-success this option exists to remove. */
     if (falsify_requested && !batch) {
+        /* --hex prints its three views and returns before compare() unless
+         * --check is given, so the damage would never reach a signature. */
+        if (hexone && !check) {
+            fprintf(stderr, "isaxcheck: --falsify with --hex needs --check -- "
+                    "without it the encoding is printed and the run returns "
+                    "before compare(), so nothing is damaged\n");
+            return 2;
+        }
         if (layer != LAYER_FIELDS) {
             fprintf(stderr, "isaxcheck: --falsify damages the dependency "
                     "model, which only the fields layer compares -- pass "

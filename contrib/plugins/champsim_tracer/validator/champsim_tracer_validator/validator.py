@@ -2858,6 +2858,105 @@ _RISCV_CSR_GENERIC = {
 }
 
 
+# x86 is the ISA whose system registers Capstone gives no register id
+# at all -- there is no X86_REG_ entry for GDTR, MXCSR, the x87 control
+# word, an MSR, the TSC, XCR0 or SSP -- so the decode boundary carries
+# them as SYSREG operands keyed on the INSTRUCTION
+# (cap_x86_add_sysregs, disas/capstone.c) and they never pass through
+# the Capstone-register-id table the rest of this oracle uses.  The
+# mirror below is keyed the same way, on the Capstone instruction id,
+# and names the generic register DIRECTLY rather than importing the
+# boundary's role enum: an oracle that imported the mapping it checks
+# would agree with a wrong one.  Access bits are this file's own
+# convention, 1 = read and 2 = write, as used by the operand walk.
+_X86_SYSREG_MMU = "REG_SYSMMU"
+_X86_SYSREG_FPCTRL = "REG_FCSR"
+_X86_SYSREG_OTHER = "REG_SYS"
+_X86_SYSREG_TIMER = "REG_SYSTIMER"
+_X86_SYSREG_SHADOWSTK = "REG_SSP"
+
+_X86_SYSREG_FACTS: dict[int, tuple[tuple[str, int], ...]] | None = None
+
+
+def _x86_sysreg_facts(insn_id: int) -> tuple[tuple[str, int], ...]:
+    """Generic system registers an x86 instruction reads / writes.
+
+    One entry per instruction the boundary attributes, in the same
+    order and with the same direction as the switch it mirrors.  An
+    instruction absent from the table touches no system register, which
+    is also the boundary's `default:`.
+    """
+    global _X86_SYSREG_FACTS
+    if _X86_SYSREG_FACTS is None:
+        try:
+            import capstone as _cs
+            _x = _cs.x86
+        except Exception:
+            return ()
+        R, W, RW = 1, 2, 3
+        MMU = _X86_SYSREG_MMU
+        FP = _X86_SYSREG_FPCTRL
+        OTH = _X86_SYSREG_OTHER
+        TSC = _X86_SYSREG_TIMER
+        SSP = _X86_SYSREG_SHADOWSTK
+        spec: list[tuple[tuple[str, ...], tuple[tuple[str, int], ...]]] = [
+            # Descriptor tables.  LLDT and LTR also READ the GDT: the
+            # selector they take is an index into it (helper_lldt /
+            # helper_ltr both start from `&env->gdt`).
+            (("SGDT",), ((MMU, R),)),
+            (("LGDT",), ((MMU, W),)),
+            (("SIDT",), ((MMU, R),)),
+            (("LIDT",), ((MMU, W),)),
+            (("SLDT",), ((MMU, R),)),
+            (("LLDT",), ((MMU, RW),)),
+            (("STR",), ((MMU, R),)),
+            (("LTR",), ((MMU, RW),)),
+            # The SSE control word.
+            (("LDMXCSR", "VLDMXCSR"), ((FP, W),)),
+            (("STMXCSR", "VSTMXCSR"), ((FP, R),)),
+            # The x87 control and tag words.  Both carry the FPCTRL
+            # role, so the generic set they produce is one id; the
+            # environment-moving forms name both and collapse here.
+            (("FLDCW",), ((FP, W),)),
+            (("FNSTCW",), ((FP, R),)),
+            (("FFREE", "FFREEP"), ((FP, W),)),
+            (("FNINIT", "FRSTOR"), ((FP, W),)),
+            (("FNSAVE",), ((FP, RW),)),
+            (("FXSAVE", "FXSAVE64"), ((FP, R),)),
+            (("FXRSTOR", "FXRSTOR64"), ((FP, W),)),
+            # The MSR file: ECX picks the register at RUNTIME, so one
+            # id for the whole file is what a decode can honestly say.
+            (("RDMSR", "RDPMC"), ((OTH, R),)),
+            (("WRMSR",), ((OTH, W),)),
+            # The time-stamp counter and its companion, IA32_TSC_AUX,
+            # which is an MSR and lands on the MSR id for that reason.
+            (("RDTSC",), ((TSC, R),)),
+            (("RDTSCP",), ((TSC, R), (OTH, R))),
+            (("RDPID",), ((OTH, R),)),
+            # The extended control register.  Every xsave / xrstor
+            # reads it: `rfbm &= env->xcr0` gates each component.
+            (("XGETBV",), ((OTH, R),)),
+            (("XSETBV",), ((OTH, W),)),
+            (("XSAVE", "XSAVE64", "XSAVEC", "XSAVEC64",
+              "XSAVEOPT", "XSAVEOPT64", "XSAVES", "XSAVES64",
+              "XRSTOR", "XRSTOR64", "XRSTORS", "XRSTORS64"),
+             ((OTH, R),)),
+            # CET: the shadow-stack pointer.
+            (("RDSSPD", "RDSSPQ", "SAVEPREVSSP"), ((SSP, R),)),
+            (("INCSSPD", "INCSSPQ"), ((SSP, RW),)),
+            (("RSTORSSP",), ((SSP, W),)),
+        ]
+        tab: dict[int, tuple[tuple[str, int], ...]] = {}
+        for mnems, facts in spec:
+            for mnem in mnems:
+                ins_id = getattr(_x, "X86_INS_" + mnem, None)
+                if ins_id is None:
+                    continue
+                tab[int(ins_id)] = facts
+        _X86_SYSREG_FACTS = tab
+    return _X86_SYSREG_FACTS.get(int(insn_id), ())
+
+
 def _riscv_csr_access(raw: bytes) -> int:
     """Zicsr access direction read from the encoding, as
     `cap_riscv_csr_access` reads it: CSRRW/CSRRWI with rd == x0 does not
@@ -3542,6 +3641,45 @@ def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
                 add(exp_dst, _cs.x86.X86_REG_EFLAGS)
             except Exception:
                 pass
+        # CWD / CDQ / CQO sign-extend the accumulator into the D
+        # register and leave the accumulator ALONE -- Intel SDM Vol. 2
+        # "Operation": DX := SignExtend(AX), EDX := SignExtend(EAX),
+        # RDX := SignExtend(RAX), with no assignment to the source.
+        # Capstone 6.0.0-Alpha7 nonetheless names the accumulator in
+        # regs_write, and the boundary drops that phantom
+        # (cap_x86_is_sign_extend_to_d, disas/capstone.c).  It matters
+        # because these sit immediately before a signed IDIV: with rax
+        # marked written, the divide's dividend appears to be produced
+        # by the CQO rather than by whatever actually computed it, so a
+        # real RAW edge is replaced by a false one.  Mirrored rather
+        # than skipped, so the oracle would catch the repair being
+        # dropped instead of going quiet.  The Python bindings print
+        # Intel mnemonics, so the names here are cwd / cdq / cqo where
+        # the C side matches AT&T's cwtd / cltd / cqto.  Their siblings
+        # CBW / CWDE / CDQE DO write the accumulator -- that is the
+        # whole instruction -- and are deliberately absent.
+        if stem in ("cwd", "cdq", "cqo"):
+            try:
+                import capstone as _cs
+                acc: set[str] = set()
+                for _r in (_cs.x86.X86_REG_AL, _cs.x86.X86_REG_AH,
+                           _cs.x86.X86_REG_AX, _cs.x86.X86_REG_EAX,
+                           _cs.x86.X86_REG_RAX):
+                    add(acc, _r)
+                exp_dst -= acc
+            except Exception:
+                pass
+        # The x86 system registers Capstone has no register id for.
+        # They reach the trace as SYSREG operands appended by the
+        # boundary, keyed on the instruction; _x86_sysreg_facts mirrors
+        # that switch.  Nothing else can put them in the expectation:
+        # the operand walk above sees only the operands Capstone
+        # reports, and Capstone reports none of these.
+        for _name, _acc in _x86_sysreg_facts(getattr(d, "id", 0) or 0):
+            if _acc & 1:
+                exp_src.add(_name)
+            if _acc & 2:
+                exp_dst.add(_name)
 
 
 def _check_call_return_store(

@@ -1432,9 +1432,17 @@ _register_probe('probe_implicit_acc', {
         'opcodes': ['INT_MUL', 'SHL'],
         'insns': [
             {},
-            # Capstone marks RAX written too (conservative rw on the
-            # implicit pair); the trace follows Capstone.
-            {"src": ["REG_GPR0"], "dst": ["REG_GPR0", "REG_GPR2"]},
+            # CQO sign-extends RAX into RDX and leaves RAX alone
+            # (Intel SDM Vol. 2, "Operation": RDX := SignExtend(RAX),
+            # with no assignment to the source).  Capstone marks RAX
+            # written as well as read; the decode boundary drops that
+            # phantom (cap_x86_is_sign_extend_to_d, disas/capstone.c),
+            # because with RAX marked written the signed IDIV that
+            # follows a CQO appears to take its dividend from the CQO
+            # rather than from whatever computed it.  Naming RDX alone
+            # asserts that repair POSITIVELY: if it regresses, this row
+            # goes red instead of quietly passing.
+            {"src": ["REG_GPR0"], "dst": ["REG_GPR2"]},
             {},
             {"src": ["REG_GPR0", "REG_GPR3"],
              "dst": ["REG_GPR0", "REG_GPR2", "REG_FLAGS"]},

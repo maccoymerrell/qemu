@@ -2135,7 +2135,8 @@ static void usage(void)
         "                  erases its reads, add-dst plants a phantom write.\n"
         "                  Proves the gate can fire; never for real runs\n"
         "  --batch         read hex encodings on stdin; write one TSV row\n"
-        "                  per encoding carrying both decoders' views\n"
+        "                  per encoding carrying both decoders' views AND\n"
+        "                  the tracer's own InsnFields (f_* columns)\n"
         "  --layer=boundary|fields   compare LLVM against the decode\n"
         "                  boundary (default) or against the InsnFields the\n"
         "                  dependency model records\n"
@@ -2290,13 +2291,25 @@ int main(int argc, char **argv)
      * the implicit-operand assertion table (which has its own
      * spec-derived expectation and only needs the boundary's answer) and
      * the three-way version tripwire (which joins GNU binutils onto the
-     * `hex` column, hence echoing the input bytes back).
+     * `hex` column, hence echoing the input bytes back) -- plus the
+     * per-opcode register-attribution sweep, which needs the f_* columns
+     * because the trace is built from the fields layer, not the boundary.
      */
     if (batch) {
+        /*
+         * The fields columns carry the tracer's OWN InsnFields — the same
+         * third view the single-encoding path prints — so a per-opcode
+         * sweep can ask what the TRACE would record without paying one
+         * process start per encoding.  Without them a batch consumer can
+         * only see the decode boundary, which is precisely the layer the
+         * plugin's repairs sit behind (see isaxcheck_fields.h).
+         */
         printf("hex\tb_ok\tb_sz\tb_mnem\tb_ops\tb_mem\tb_r\tb_w\tb_unkmem\t"
                "b_unkreg\tb_unmodelled\tb_jmp\tb_call\tb_ret\tb_rd\tb_wr\t"
                "l_ok\tl_sz\tl_text\tl_ld\tl_st\tl_br\tl_call\tl_ret\t"
-               "l_rd\tl_wr\n");
+               "l_rd\tl_wr\t"
+               "f_ok\tf_opcode\tf_branch\tf_cond\tf_atomic\tf_loads\tf_stores\t"
+               "f_lanekind\tf_src\tf_dst\n");
         char line[256];
         while (fgets(line, sizeof line, stdin)) {
             char *p = line;
@@ -2309,13 +2322,36 @@ int main(int argc, char **argv)
                                           nullptr, 16);
             if (!n) continue;
             CsView c; LlView l;
-            cs_decode(b, n, c); ll_decode(b, n, l);
+            qemu_plugin_insn_info info;
+            IsaxFieldsView f;
+            cs_decode(b, n, c, &info); ll_decode(b, n, l);
+            if (c.ok) isax_fields_decode(&info, &f);
+            /*
+             * The falsifier reaches the batch columns for the same reason
+             * it reaches compare(): a consumer that quotes an agreement
+             * rate off f_src/f_dst is quoting an instrument, and an
+             * instrument nobody has watched fail vouches for nothing.
+             * Damaging here -- after isax_fields_decode(), where a real
+             * dependency-model defect would sit -- lets that consumer
+             * prove its own gate can go red.
+             */
+            if (c.ok && f.ok && !falsify_mnem.empty() &&
+                c.mnem == falsify_mnem) {
+                if (falsify_mode == "drop-src") {
+                    f.src.clear();
+                } else if (falsify_mode == "add-dst" && !f.src.empty()) {
+                    f.dst.push_back(f.src[0]);
+                }
+            }
+            std::set<unsigned> fs(f.src.begin(), f.src.end());
+            std::set<unsigned> fd(f.dst.begin(), f.dst.end());
             /* The printer emits tabs inside operand lists; this is a TSV. */
             std::string t = l.text;
             for (auto &ch : t)
                 if (ch == '\t' || ch == '\n' || ch == '\r') ch = ' ';
             printf("%s\t%d\t%u\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t"
-                   "%s\t%s\t%d\t%u\t%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\n",
+                   "%s\t%s\t%d\t%u\t%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t"
+                   "%d\t%s\t%s\t%d\t%d\t%u\t%u\t%u\t%s\t%s\n",
                    hexbytes(b, n).c_str(), c.ok, c.size, c.mnem.c_str(),
                    c.ops.c_str(), c.has_mem, c.mem_read, c.mem_write,
                    c.mem_unknown, c.reg_unknown, c.has_invalid_op,
@@ -2323,7 +2359,12 @@ int main(int argc, char **argv)
                    setstr(c.rd).c_str(), setstr(c.wr).c_str(),
                    l.ok, l.size, t.c_str(), l.may_load, l.may_store,
                    l.is_branch, l.is_call, l.is_ret,
-                   setstr(l.rd).c_str(), setstr(l.wr).c_str());
+                   setstr(l.rd).c_str(), setstr(l.wr).c_str(),
+                   f.ok, isax_opcode_name(f.opcode),
+                   isax_branch_name(f.branch_type), f.branch_conditional,
+                   f.is_atomic, f.max_dep_loads, f.max_dep_stores,
+                   f.lane_mask_kind,
+                   gensetstr(fs).c_str(), gensetstr(fd).c_str());
         }
         return 0;
     }

@@ -191,6 +191,12 @@ mipsel FR-wr-phantom ctcmsa +REG_SYS
 mipsel FR-wr-phantom ctcmsa +REG_FCSR
 mipsel FR-wr-phantom ctcmsa +REG_SYSID
 
+# Signatures the register-space rework surfaced under a new generic
+# id.  Same residual, new name.
+x86_64 FR-wr-missing cltd +REG_GPR#
+x86_64 FR-wr-missing cqto +REG_GPR#
+x86_64 FR-wr-missing cwtd +REG_GPR#
+
 # =====================================================================
 # aarch64
 # =====================================================================
@@ -1512,10 +1518,10 @@ x86_64 FR-rd-missing flds +REG_SEG#
 x86_64 FR-rd-missing fldt +REG_SEG#
 x86_64 FR-rd-missing fmull +REG_SEG#
 x86_64 FR-rd-missing fmuls +REG_SEG#
-x86_64 FR-rd-missing fnsave +REG_FLAGS,REG_SEG#
+x86_64 FR-rd-missing fnsave +REG_FCSR,REG_SEG#
 x86_64 FR-rd-missing fnstcw +REG_SEG#
-x86_64 FR-rd-missing fnstenv +REG_FLAGS,REG_SEG#
-x86_64 FR-rd-missing fnstsw +REG_FLAGS,REG_SEG#
+x86_64 FR-rd-missing fnstenv +REG_FCSR,REG_SEG#
+x86_64 FR-rd-missing fnstsw +REG_FCSR,REG_SEG#
 x86_64 FR-rd-missing frstor +REG_SEG#
 x86_64 FR-rd-missing fstl +REG_SEG#
 x86_64 FR-rd-missing fstpl +REG_SEG#
@@ -1528,8 +1534,8 @@ x86_64 FR-rd-missing fsubrs +REG_SEG#
 x86_64 FR-rd-missing fsubs +REG_SEG#
 x86_64 FR-rd-missing fxrstor +REG_SEG#
 x86_64 FR-rd-missing fxrstor64 +REG_SEG#
-x86_64 FR-rd-missing fxsave +REG_FLAGS,REG_SEG#
-x86_64 FR-rd-missing fxsave64 +REG_FLAGS,REG_SEG#
+x86_64 FR-rd-missing fxsave +REG_FCSR,REG_SEG#
+x86_64 FR-rd-missing fxsave64 +REG_FCSR,REG_SEG#
 x86_64 FR-rd-missing idivb +REG_SEG#
 x86_64 FR-rd-missing idivl +REG_SEG#
 x86_64 FR-rd-missing idivq +REG_SEG#
@@ -1853,7 +1859,6 @@ x86_64 FR-rd-phantom ficoml +REG_FPR#,REG_SEG#
 x86_64 FR-rd-phantom ficompl +REG_FPR#,REG_SEG#
 x86_64 FR-rd-phantom ficomps +REG_FPR#,REG_SEG#
 x86_64 FR-rd-phantom ficoms +REG_FPR#,REG_SEG#
-x86_64 FR-rd-phantom movw +REG_SEG#
 
 
 # (b) THE x87 CONTROL WORD, which Capstone cannot name at all.  LLVM
@@ -2574,8 +2579,8 @@ x86_64 FR-rd-missing mwaitx +REG_GPR#
 x86_64 FR-rd-missing pconfig +REG_GPR#
 x86_64 FR-rd-missing tpause +REG_GPR#
 x86_64 FR-rd-missing umwait +REG_GPR#
-x86_64 FR-wr-missing emms +REG_FPR#,REG_VEC#
-x86_64 FR-wr-missing femms +REG_FPR#,REG_VEC#
+x86_64 FR-wr-missing emms +REG_FPR#
+x86_64 FR-wr-missing femms +REG_FPR#
 x86_64 FR-wr-missing pconfig +REG_FLAGS,REG_GPR#
 x86_64 FR-wr-missing tpause +REG_FLAGS
 x86_64 FR-wr-missing umwait +REG_FLAGS
@@ -2608,12 +2613,12 @@ x86_64 FM-miss-load fxsave64
 x86_64 FM-miss-store fxrstor
 x86_64 FM-miss-store fxrstor64
 x86_64 FR-rd-missing ffreep +REG_FPR#
-x86_64 FR-rd-missing fnsave +REG_FLAGS
-x86_64 FR-rd-missing fnstenv +REG_FLAGS
-x86_64 FR-rd-missing fnstsw +REG_FLAGS
+x86_64 FR-rd-missing fnsave +REG_FCSR
+x86_64 FR-rd-missing fnstenv +REG_FCSR
+x86_64 FR-rd-missing fnstsw +REG_FCSR
 x86_64 FR-rd-missing fstp +REG_FPR#
-x86_64 FR-rd-missing fxsave +REG_FLAGS
-x86_64 FR-rd-missing fxsave64 +REG_FLAGS
+x86_64 FR-rd-missing fxsave +REG_FCSR
+x86_64 FR-rd-missing fxsave64 +REG_FCSR
 x86_64 FR-rd-phantom fadd +REG_FPR#
 x86_64 FR-rd-phantom fcmovb +REG_FPR#
 x86_64 FR-rd-phantom fcmovbe +REG_FPR#
@@ -2642,50 +2647,50 @@ x86_64 FR-rd-phantom fsubr +REG_FPR#
 x86_64 FR-rd-phantom ftst +REG_FPR#
 x86_64 FR-rd-phantom fucompp +REG_FPR#
 x86_64 FR-rd-phantom fxam +REG_FPR#
-x86_64 FR-wr-missing f2xm1 +REG_FLAGS
-x86_64 FR-wr-missing fadd +REG_FLAGS
-x86_64 FR-wr-missing faddp +REG_FLAGS
-x86_64 FR-wr-missing fbld +REG_FLAGS
-x86_64 FR-wr-missing fbstp +REG_FLAGS
-x86_64 FR-wr-missing fdecstp +REG_FLAGS
-x86_64 FR-wr-missing fdiv +REG_FLAGS
-x86_64 FR-wr-missing fdivp +REG_FLAGS
-x86_64 FR-wr-missing fdivr +REG_FLAGS
-x86_64 FR-wr-missing fdivrp +REG_FLAGS
-x86_64 FR-wr-missing ffree +REG_FLAGS
-x86_64 FR-wr-missing ffreep +REG_FLAGS
-x86_64 FR-wr-missing fincstp +REG_FLAGS
-x86_64 FR-wr-missing fldcw +REG_FLAGS
-x86_64 FR-wr-missing fldenv +REG_FLAGS
-x86_64 FR-wr-missing fldl2e +REG_FLAGS
-x86_64 FR-wr-missing fldl2t +REG_FLAGS
-x86_64 FR-wr-missing fldlg2 +REG_FLAGS
-x86_64 FR-wr-missing fldln2 +REG_FLAGS
-x86_64 FR-wr-missing fldpi +REG_FLAGS
-x86_64 FR-wr-missing fmul +REG_FLAGS
-x86_64 FR-wr-missing fmulp +REG_FLAGS
-x86_64 FR-wr-missing fnop +REG_FLAGS
-x86_64 FR-wr-missing fnsave +REG_FLAGS
-x86_64 FR-wr-missing fnstcw +REG_FLAGS
-x86_64 FR-wr-missing fnstenv +REG_FLAGS
-x86_64 FR-wr-missing fnstsw +REG_FLAGS
-x86_64 FR-wr-missing fpatan +REG_FLAGS
-x86_64 FR-wr-missing fprem +REG_FLAGS
-x86_64 FR-wr-missing fprem1 +REG_FLAGS
-x86_64 FR-wr-missing fptan +REG_FLAGS
-x86_64 FR-wr-missing frndint +REG_FLAGS
-x86_64 FR-wr-missing frstor +REG_FLAGS
-x86_64 FR-wr-missing fscale +REG_FLAGS
-x86_64 FR-wr-missing fsincos +REG_FLAGS
-x86_64 FR-wr-missing fsub +REG_FLAGS
-x86_64 FR-wr-missing fsubp +REG_FLAGS
-x86_64 FR-wr-missing fsubr +REG_FLAGS
-x86_64 FR-wr-missing fsubrp +REG_FLAGS
-x86_64 FR-wr-missing fxrstor +REG_FLAGS
-x86_64 FR-wr-missing fxrstor64 +REG_FLAGS
-x86_64 FR-wr-missing fxtract +REG_FLAGS
-x86_64 FR-wr-missing fyl2x +REG_FLAGS
-x86_64 FR-wr-missing fyl2xp1 +REG_FLAGS
+x86_64 FR-wr-missing f2xm1 +REG_FCSR
+x86_64 FR-wr-missing fadd +REG_FCSR
+x86_64 FR-wr-missing faddp +REG_FCSR
+x86_64 FR-wr-missing fbld +REG_FCSR
+x86_64 FR-wr-missing fbstp +REG_FCSR
+x86_64 FR-wr-missing fdecstp +REG_FCSR
+x86_64 FR-wr-missing fdiv +REG_FCSR
+x86_64 FR-wr-missing fdivp +REG_FCSR
+x86_64 FR-wr-missing fdivr +REG_FCSR
+x86_64 FR-wr-missing fdivrp +REG_FCSR
+x86_64 FR-wr-missing ffree +REG_FCSR
+x86_64 FR-wr-missing ffreep +REG_FCSR
+x86_64 FR-wr-missing fincstp +REG_FCSR
+x86_64 FR-wr-missing fldcw +REG_FCSR
+x86_64 FR-wr-missing fldenv +REG_FCSR
+x86_64 FR-wr-missing fldl2e +REG_FCSR
+x86_64 FR-wr-missing fldl2t +REG_FCSR
+x86_64 FR-wr-missing fldlg2 +REG_FCSR
+x86_64 FR-wr-missing fldln2 +REG_FCSR
+x86_64 FR-wr-missing fldpi +REG_FCSR
+x86_64 FR-wr-missing fmul +REG_FCSR
+x86_64 FR-wr-missing fmulp +REG_FCSR
+x86_64 FR-wr-missing fnop +REG_FCSR
+x86_64 FR-wr-missing fnsave +REG_FCSR
+x86_64 FR-wr-missing fnstcw +REG_FCSR
+x86_64 FR-wr-missing fnstenv +REG_FCSR
+x86_64 FR-wr-missing fnstsw +REG_FCSR
+x86_64 FR-wr-missing fpatan +REG_FCSR
+x86_64 FR-wr-missing fprem +REG_FCSR
+x86_64 FR-wr-missing fprem1 +REG_FCSR
+x86_64 FR-wr-missing fptan +REG_FCSR
+x86_64 FR-wr-missing frndint +REG_FCSR
+x86_64 FR-wr-missing frstor +REG_FCSR
+x86_64 FR-wr-missing fscale +REG_FCSR
+x86_64 FR-wr-missing fsincos +REG_FCSR
+x86_64 FR-wr-missing fsub +REG_FCSR
+x86_64 FR-wr-missing fsubp +REG_FCSR
+x86_64 FR-wr-missing fsubr +REG_FCSR
+x86_64 FR-wr-missing fsubrp +REG_FCSR
+x86_64 FR-wr-missing fxrstor +REG_FCSR
+x86_64 FR-wr-missing fxrstor64 +REG_FCSR
+x86_64 FR-wr-missing fxtract +REG_FCSR
+x86_64 FR-wr-missing fyl2x +REG_FCSR
+x86_64 FR-wr-missing fyl2xp1 +REG_FCSR
 x86_64 FR-wr-phantom fcmovb +REG_FPR#
 x86_64 FR-wr-phantom fcmovbe +REG_FPR#
 x86_64 FR-wr-phantom fcmove +REG_FPR#
@@ -2773,11 +2778,8 @@ x86_64 FR-rd-missing clwb +REG_GPR#
 x86_64 FR-rd-missing cmc +REG_FLAGS
 x86_64 FR-rd-missing cmpxchg16b +REG_GPR#
 x86_64 FR-rd-missing cmpxchg8b +REG_GPR#
-x86_64 FR-rd-missing cvtpi2pd +REG_FP_REG
 x86_64 FR-rd-missing cvtpi2pd +REG_FP_REG,REG_VEC#
-x86_64 FR-rd-missing cvtpi2pd +REG_GPR#
 x86_64 FR-rd-missing cvtpi2pd +REG_GPR#,REG_VEC#
-x86_64 FR-rd-missing cvtpi2pd +REG_SP
 x86_64 FR-rd-missing cvtpi2pd +REG_SP,REG_VEC#
 x86_64 FR-rd-missing cvtpi2pd +REG_VEC#
 x86_64 FR-rd-missing cvtsd2ss +REG_VEC#
@@ -2786,7 +2788,7 @@ x86_64 FR-rd-missing cvtsi2sdq +REG_VEC#
 x86_64 FR-rd-missing cvtsi2ssl +REG_VEC#
 x86_64 FR-rd-missing cvtsi2ssq +REG_VEC#
 x86_64 FR-rd-missing cvtss2sd +REG_VEC#
-x86_64 FR-rd-missing movq +REG_VEC#
+x86_64 FR-rd-missing movq +REG_FPR#
 x86_64 FR-rd-missing pcmpestrm +REG_GPR#
 x86_64 FR-rd-missing rclb +REG_FLAGS
 x86_64 FR-rd-missing rcll +REG_FLAGS
@@ -2809,18 +2811,10 @@ x86_64 FR-rd-missing sqrtsd +REG_VEC#
 x86_64 FR-rd-missing sqrtss +REG_VEC#
 x86_64 FR-rd-missing stc +REG_FLAGS
 x86_64 FR-rd-missing sti +REG_FLAGS
-x86_64 FR-rd-missing vgatherdpd +REG_VEC#
-x86_64 FR-rd-missing vgatherdps +REG_VEC#
-x86_64 FR-rd-missing vgatherqpd +REG_VEC#
-x86_64 FR-rd-missing vgatherqps +REG_VEC#
 x86_64 FR-rd-missing vpcmpestrm +REG_GPR#
-x86_64 FR-rd-missing vpgatherdd +REG_VEC#
-x86_64 FR-rd-missing vpgatherdq +REG_VEC#
-x86_64 FR-rd-missing vpgatherqd +REG_VEC#
-x86_64 FR-rd-missing vpgatherqq +REG_VEC#
 x86_64 FR-rd-missing wrpkru +REG_GPR#
 x86_64 FR-rd-missing xlatb +REG_GPR#
-x86_64 FR-rd-phantom cvtpi2pd +REG_VEC#
+x86_64 FR-rd-phantom cvtpi2pd +REG_FPR#
 x86_64 FR-rd-phantom movq +REG_VEC#
 x86_64 FR-rd-phantom xsave +REG_GPR#
 x86_64 FR-wr-missing cli +REG_FLAGS
@@ -2862,10 +2856,10 @@ x86_64 FR-wr-missing shrdw +REG_SP
 x86_64 FR-wr-missing sti +REG_FLAGS
 x86_64 FR-wr-missing vpcmpestrm +REG_FLAGS,REG_VEC#
 x86_64 FR-wr-missing vpcmpistrm +REG_FLAGS,REG_VEC#
-x86_64 FR-wr-missing wait +REG_FLAGS
+x86_64 FR-wr-missing wait +REG_FCSR
 x86_64 FR-wr-missing xlatb +REG_GPR#
-x86_64 FR-wr-phantom cvtpd2pi +REG_VEC#
-x86_64 FR-wr-phantom cvttpd2pi +REG_VEC#
+x86_64 FR-wr-phantom cvtpd2pi +REG_FPR#
+x86_64 FR-wr-phantom cvttpd2pi +REG_FPR#
 x86_64 FR-wr-phantom movq +REG_VEC#
 x86_64 FR-wr-phantom rdrandl +REG_FLAGS,REG_FP_REG
 x86_64 FR-wr-phantom rdrandl +REG_FLAGS,REG_GPR#

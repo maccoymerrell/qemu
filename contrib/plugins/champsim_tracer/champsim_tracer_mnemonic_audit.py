@@ -1852,23 +1852,54 @@ def classify_x86_reg(name: str) -> RegEntry:
         return reg_ent("REG_IP")
     if name == "EFLAGS":
         return RegEntry("REG_FLAGS", is_int_flags=True)
+    # FPSW is the x87 STATUS WORD -- condition codes C0-C3, the
+    # exception flags and the stack-top pointer.  That is an FP
+    # control/status word, which is exactly what REG_FCSR names on
+    # every other ISA; on REG_FLAGS it sat with EFLAGS, so an
+    # `fnstsw` took a false edge from every integer compare.  It is
+    # also NOT an integer-flags writer, so it never carried
+    # .is_int_flags and the metaflags side-channel is unaffected.
     if name == "FPSW":
-        return reg_ent("REG_FLAGS")
+        return reg_ent("REG_FCSR")
     segs = {"CS": 0, "DS": 1, "ES": 2, "FS": 3, "GS": 4, "SS": 5}
     if name in segs:
         return reg_ent(numbered("REG_SEG", segs[name]))
+    # CR0-CR15 are sixteen architecturally distinct registers with
+    # unrelated roles: CR0 mode bits, CR2 the faulting linear address,
+    # CR3 the page-table base, CR4 feature enables, CR8 the task
+    # priority.  On one ID every `mov %cr3, %rax` took a false edge
+    # from every CR0 write.
     if match := re.fullmatch(r"CR(\d+)", name):
-        return reg_ent("REG_CTRL")
+        return reg_ent(numbered("REG_CTRL", int(match.group(1))))
+    # DR0-DR3 are four independent breakpoint addresses, DR6 the status
+    # word and DR7 the control word -- distinct registers, one ID each.
+    # DR4/DR5 are NOT separate registers: with CR4.DE clear they ALIAS
+    # DR6/DR7, and with it set they fault.  An alias folds (R8.2), so
+    # they name REG_DEBUG6/REG_DEBUG7 and REG_DEBUG4/5 stay unused.
     if match := re.fullmatch(r"DR(\d+)", name):
-        return reg_ent("REG_DEBUG")
+        num = int(match.group(1))
+        if num in (4, 5):
+            num += 2
+        return reg_ent(numbered("REG_DEBUG", num))
     if match := re.fullmatch(r"K(\d+)", name):
         return reg_ent(numbered("REG_PRED", int(match.group(1))))
     if match := re.fullmatch(r"BND(\d+)", name):
         return reg_ent(numbered("REG_BOUND", int(match.group(1))))
     if match := re.fullmatch(r"(?:FP|ST)(\d+)", name):
         return reg_ent(numbered("REG_FPR", int(match.group(1))))
+    # MMX MM0-MM7 are not a register file of their own: they ARE the
+    # x87 data registers, the 64-bit mantissa field of each.  Writing
+    # MM0 destroys the x87 value in that slot and forces the tag word
+    # valid, which is why Intel requires EMMS between MMX and x87 use.
+    # A renaming regfile has to respect that edge, so MMX belongs on
+    # the FP bank with ST0-ST7.  On REG_VEC<n> it instead shared an ID
+    # with XMM<n> -- genuinely independent hardware -- and manufactured
+    # an edge between MMX and SSE code that does not exist.
+    # (ST(i) is TOP-relative and MM<n> absolute; they coincide at
+    # TOP=0, which is the state MMX code runs in.  The bank is right
+    # either way; the index is exact for the traffic that occurs.)
     if match := re.fullmatch(r"MM(\d+)", name):
-        return reg_ent(numbered("REG_VEC", int(match.group(1))))
+        return reg_ent(numbered("REG_FPR", int(match.group(1))))
     if match := re.fullmatch(r"[XYZ]MM(\d+)", name):
         return reg_ent(numbered("REG_VEC", int(match.group(1))))
     if match := re.fullmatch(r"R(\d+)(?:[BDW])?", name):

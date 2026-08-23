@@ -2822,29 +2822,52 @@ Current generic register layout:
 
 ::
 
-   +-------------+--------------------+
-   | Values      | Class              |
-   +-------------+--------------------+
-   | 0           | REG_NONE           |
-   | 1..64       | REG_GPR0..63       |
-   | 65..128     | REG_FPR0..63       |
-   | 129..192    | REG_VEC0..63       |
-   | 193..224    | REG_PRED0..31      |
-   | 225..230    | REG_SEG0..5        |
-   | 231..249    | compressed special |
-   | 250..254    | common specials    |
-   +-------------+--------------------+
+   +-------------+---------------------------+
+   | Values      | Class                     |
+   +-------------+---------------------------+
+   | 0           | REG_NONE                  |
+   | 1..32       | REG_GPR0..31              |
+   | 33..48      | REG_CTRL0..15             |
+   | 49..64      | REG_DEBUG0..15            |
+   | 65..96      | REG_FPR0..31              |
+   | 97..100     | REG_ACCHI0..3             |
+   | 101..109    | privileged behaviour      |
+   | 110..128    | unallocated               |
+   | 129..192    | REG_VEC0..63              |
+   | 193..224    | REG_PRED0..31             |
+   | 225..230    | REG_SEG0..5               |
+   | 231..249    | compressed special        |
+   | 250..254    | common specials           |
+   +-------------+---------------------------+
 
-The compressed-special band holds the classes that are one register
-rather than a bank: ``REG_CTRL``, ``REG_DEBUG``, ``REG_BOUND0..3``,
-``REG_ACC0..3``, ``REG_ZERO``, ``REG_MATRIX``, ``REG_SYS``,
-``REG_FCSR``, ``REG_VCTRL``, ``REG_TLS``, ``REG_VSTART``,
-``REG_DSPCTRL`` and ``REG_VCSR``.  System and control registers are
-spread across several of those rather than folded onto ``REG_SYS``,
-because an edge onto a register the instruction never touched misleads
-a consumer as badly as a missing one — a thread-pointer read must not
-be ordered behind an unrelated ``mrs``, and a vector op clearing
-``vstart`` must not look like it redefined ``vl``.  :doc:`reference`
+The general-purpose and floating-point banks are 32 wide because no
+supported ISA numbers more than 32 of either file; the space that
+leaves carries the x86 control and debug files, the accumulator high
+halves and the privileged behaviour classes.  The vector and predicate
+banks keep their full width, and their upper halves hold the
+architecturally distinct registers that fall outside an ISA's numbered
+file but belong to its behaviour class — AArch64 ``ZT0`` at
+``REG_VEC32``, ``FFR`` at ``REG_PRED16``.
+
+The privileged band 101..109 is ``REG_SYSEXC``, ``REG_SYSMMU``,
+``REG_SYSTIMER``, ``REG_SYSPERF``, ``REG_SYSDBG``, ``REG_SYSCACHE``,
+``REG_SYSID``, ``REG_COPROC0`` and ``REG_COPROC1``.  The
+compressed-special band holds the classes that are one register rather
+than a bank: ``REG_BOUND0..3``, ``REG_ACC0..3``, ``REG_ZERO``,
+``REG_MATRIX``, ``REG_SYS``, ``REG_FCSR``, ``REG_VCTRL``, ``REG_TLS``
+and ``REG_SSP``.
+
+Two registers that a renaming regfile would not have to order against
+each other never share an ID.  System and control registers are spread
+across the classes above rather than folded onto ``REG_SYS`` because
+an edge onto a register the instruction never touched misleads a
+consumer as badly as a missing one — a thread-pointer read must not be
+ordered behind an unrelated ``mrs``, and a read of a read-only
+identification register must not be ordered behind anything at all.
+The converse also holds: two ISA names for the same hardware register
+share one ID, which is why AArch64 ``v0``/``z0``, x86
+``xmm16``/``ymm16``/``zmm16`` and the register-list and LMUL-group
+spellings resolve to the registers they denote.  :doc:`reference`
 carries the per-ID notes.
 
 The header map, not this table, is authoritative for decoding names.

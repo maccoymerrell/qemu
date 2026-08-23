@@ -550,27 +550,80 @@ without implying any particular numeric base.
        the effective address, so ``mov %fs:0x28, %rax`` reads
        ``REG_SEG3`` and lists it in that load's address-dep mask.
        Other ISAs leave this family empty.
-   * - ``REG_CTRL``
-     - Architectural control register family (CR0..N on x86,
-       SCTLR on aarch64).
-   * - ``REG_DEBUG``
-     - Debug-control register family (DR0..N, MDSCR).
+   * - ``REG_CTRL0`` .. ``REG_CTRL15``
+     - x86 control registers, one ID per register: ``REG_CTRL0`` =
+       ``CR0``, ``REG_CTRL3`` = ``CR3``, and so on.  These are
+       architecturally distinct registers with unrelated roles — mode
+       bits, the faulting linear address, the page-table base, the
+       feature enables, the task priority — so a read of one takes no
+       edge from a write of another.
+   * - ``REG_DEBUG0`` .. ``REG_DEBUG15``
+     - x86 debug registers, one ID per register: ``DR0``..``DR3`` are
+       four independent breakpoint addresses, ``DR6`` the status word,
+       ``DR7`` the control word.  ``DR4`` and ``DR5`` are not separate
+       registers — with ``CR4.DE`` clear they alias ``DR6``/``DR7`` and
+       with it set they fault — so they resolve to ``REG_DEBUG6`` and
+       ``REG_DEBUG7`` and ``REG_DEBUG4``/``REG_DEBUG5`` are unused.
    * - ``REG_BOUND0`` .. ``REG_BOUND3``
      - x86 MPX bound registers.
-   * - ``REG_ACC0`` .. ``REG_ACC3``
-     - Accumulator-style architectural registers (MIPS HI/LO,
-       AArch64 SME accumulators).
+   * - ``REG_ACC0`` .. ``REG_ACC3``, ``REG_ACCHI0`` .. ``REG_ACCHI3``
+     - The two halves of an accumulator, held apart: ``REG_ACC``\ *n*
+       is the LOW half and ``REG_ACCHI``\ *n* the HIGH half.  MIPS
+       ``mfhi`` and ``mflo`` read different hardware, so they name
+       different IDs; ``mult``, ``div`` and the DSP multiply-accumulate
+       family use the whole 64-bit accumulator and name both.  MIPS
+       ``$ac``\ *n* is the DSP spelling of the pair and resolves to
+       both IDs, the way a register-list operand does.
    * - ``REG_ZERO``
      - Hardwired-zero register (RISC-V ``x0``, MIPS ``$zero``,
        aarch64 ``xzr``).
    * - ``REG_MATRIX``
      - Tile/matrix register family (AMX TMM, SME ZA).  An SME
        ``ldr``/``str``/``mova`` names the ZA tile here and the ``w12``
-       slice-index GPR alongside it.
+       slice-index GPR alongside it.  The tile spellings ``ZAB0``,
+       ``ZAH0``..\ ``ZAQ15`` are overlapping *views* of one
+       architectural array — a write through ``ZAS0`` and a read
+       through ``ZAD0`` touch the same bytes — so they share this ID.
+       SME2's ``ZT0`` is separate architectural state and does not: it
+       is ``REG_VEC32``, the first slot past the 32 vector registers
+       any supported ISA numbers.
+   * - ``REG_SYSEXC``, ``REG_SYSMMU``, ``REG_SYSTIMER``,
+       ``REG_SYSPERF``, ``REG_SYSDBG``, ``REG_SYSCACHE``,
+       ``REG_SYSID``
+     - Privileged state, grouped by the event its members are ordered
+       against.  ``REG_SYSEXC`` holds what an exception writes as one
+       act — MIPS ``Status``, ``Cause``, ``EPC``, ``BadVAddr``,
+       ``ErrorEPC`` — so an edge inside the group is real and an edge
+       to anything outside it is not; this is the identity that lets a
+       trapping instruction record the CP0 state its trap produces
+       without becoming dependent on every unrelated ``mfc0``.
+       ``REG_SYSMMU`` is address-translation state (``Index``,
+       ``Random``, ``EntryLo0/1``, ``Context``, ``PageMask``,
+       ``Wired``, ``EntryHi``, ``XContext``, the page-walker
+       registers), read and written by TLB maintenance.
+       ``REG_SYSTIMER`` is a counter that advances on its own and the
+       compare value that fires against it (``Count`` / ``Compare``,
+       MIPS hardware register ``CC``).  ``REG_SYSPERF`` is the
+       performance counters and their control.  ``REG_SYSDBG`` is
+       EJTAG debug, the watch registers and trace.  ``REG_SYSCACHE``
+       is the cache tag/data access windows and the error state.
+       ``REG_SYSID`` is read-only implementation identification —
+       MIPS ``PRId`` and ``Config``\ *n*, the FP implementation
+       register ``fcr0``, ``MSAIR``, RISC-V ``vlenb`` and the machine
+       ID CSRs, AArch64 ``MIDR_EL1`` and the ``ID_AA64*`` space.  A
+       read of one of those can never depend on anything, so it must
+       not share an ID with writable state.
+   * - ``REG_COPROC0``, ``REG_COPROC1``
+     - An implementation-defined coprocessor register file: MIPS CP2
+       and CP3.  The architecture assigns these registers no
+       semantics, so there is nothing to group them by; one ID per
+       coprocessor keeps them out of the system classes above.
    * - ``REG_SYS``
      - Generic system register: the long tail of the per-arch MSR /
        MRS / CSR / CP0 space — everything the decode boundary does not
-       give a role of its own.  AArch64 ``mrs``/``msr`` and RISC-V
+       give a role of its own.  On MIPS that is ``HWREna``,
+       ``LLAddr``, the kernel scratch registers and the MT / guest
+       control space.  AArch64 ``mrs``/``msr`` and RISC-V
        ``csrr``/``csrrw`` reach it through the
        ``QEMU_PLUGIN_OP_SYSREG`` operand, which carries the
        architectural role (``QEMU_PLUGIN_SYSREG_OTHER`` here) rather
@@ -586,17 +639,26 @@ without implying any particular numeric base.
        accumulation) is deliberately not modelled as a per-instruction
        write — see :doc:`limitations`.
    * - ``REG_VCTRL``
-     - Vector **configuration**: RVV ``vl`` and ``vtype``, SVE ``ZCR`` /
-       ``FFR`` / ``VG``.  On RISC-V this carries the
+     - Vector **configuration**: RVV ``vl`` and ``vtype``, SVE ``ZCR``
+       and ``VG`` (the vector-granule count ``SMSTART`` / ``SMSTOP``
+       change).  SVE's ``FFR`` is deliberately *not* here — it is the
+       First Fault Register, separate architectural state that
+       first-faulting loads write and ``rdffr`` / ``wrffr`` move to and
+       from a predicate, so it is ``REG_PRED16``, the slot past
+       AArch64's sixteen architectural predicates.  On RISC-V this
+       carries the
        vector-configuration edge — ``vsetvli`` / ``vsetivli`` /
        ``vsetvl`` write ``vl`` and ``vtype`` as a pair and every vector
        instruction reads them, so a vector kernel's operations are
        ordered against the configuration that decides how many elements
        they process.  Deliberately *only* configuration; see
-       ``REG_VCSR`` and ``REG_VSTART``, and note that RVV ``vlenb`` is a
-       read-only implementation constant and lives in ``REG_SYS`` with
-       the other identification registers, so reading it takes no edge
-       from a ``vsetvli`` that cannot change it.
+       ``REG_FCSR``, which carries the fixed-point rounding mode and
+       saturation status (``vxrm`` / ``vxsat``, MIPS ``MSACSR``)
+       because a status word is what that ID already is, and note that
+       RVV ``vlenb`` is a
+       read-only implementation constant and lives in ``REG_SYSID``
+       with the other identification registers, so reading it takes no
+       edge from a ``vsetvli`` that cannot change it.
    * - ``REG_TLS``
      - Thread pointer: AArch64 ``TPIDR_EL0`` / ``TPIDRRO_EL0``, and the
        MIPS CP0 UserLocal word ``rdhwr $29`` reads.  Distinct from
@@ -605,33 +667,6 @@ without implying any particular numeric base.
        whatever unrelated system register the last ``mrs`` or ``mfc0``
        happened to touch.  AArch64 ``TPIDR_EL1``, the kernel's per-CPU
        base, is a different register and stays ``REG_SYS``.
-   * - ``REG_VSTART``
-     - RISC-V ``vstart``, the element index a partially executed vector
-       instruction resumes from.  Distinct from ``REG_VCTRL`` because
-       every vector instruction clears it: on the shared ID each vector
-       op would look like it redefined ``vl`` and ``vtype``, replacing a
-       kernel's edges onto its configuring ``vsetvli`` with edges onto
-       its own predecessor.  Only the explicit accesses — a ``csrr`` or
-       ``csrrw`` naming ``vstart`` — appear; the per-vector-op clear is
-       not modelled, see :doc:`limitations`.
-   * - ``REG_DSPCTRL``
-     - MIPS ``DSPControl``.  One ID for one architectural register: its
-       ``ccond``, ``carry``, ``ouflag``, ``pos``, ``scount`` and
-       ``EFI`` fields all land here.  ``rddsp`` and ``wrdsp`` move the
-       whole word, ``bposge32`` branches on ``pos``, ``mthlip`` reads
-       and updates it, and the saturating DSP arithmetic writes
-       ``ouflag``.
-   * - ``REG_VCSR``
-     - The vector unit's rounding-mode and status word: RISC-V ``vcsr``
-       and its ``vxrm`` / ``vxsat`` fields, MIPS ``MSACSR``.  Separate
-       from ``REG_VCTRL`` because it is *status, not configuration* — a
-       saturating fixed-point op writes ``vxsat`` without touching
-       ``vl``, and sharing the ID would make every one of them look as
-       though it redefined the vector length its neighbours read.
-       Separate from ``REG_SYS`` because Capstone renders MSACSR as a
-       coprocessor register, which would place it beside every CP0
-       access and leave a ``cfcmsa`` reading whatever the last ``mtc0``
-       wrote.
    * - ``REG_SP``
      - Stack pointer.
    * - ``REG_FLAGS``

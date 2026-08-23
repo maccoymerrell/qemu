@@ -762,6 +762,79 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end)
     }
 }
 
+/*
+ * CP4 -- gvec operand notes.
+ *
+ * See insn_dataflow_note_gvec() in the header for why these exist.  A note is
+ * anchored to the last op the constructor had emitted when it was made, so
+ * the instruction walk can attribute it without any op numbering: the note
+ * belongs to whichever instruction's op range contains its anchor.
+ *
+ * Overflow is recorded, not silently dropped -- a vector operand we failed to
+ * note is a missing dependency, which is the direction that costs a consumer
+ * correctness rather than accuracy.
+ */
+#define DF_MAX_GVEC_NOTES 64
+
+typedef struct DfGvecNote {
+    const TCGOp *anchor;
+    uint32_t dofs, aofs, bofs, oprsz;
+} DfGvecNote;
+
+static DfGvecNote df_gvec[DF_MAX_GVEC_NOTES];
+static unsigned df_n_gvec;
+static bool df_gvec_overflow;
+
+void insn_dataflow_note_gvec(uint32_t dofs, uint32_t aofs, uint32_t bofs,
+                             uint32_t oprsz)
+{
+    if (df_disabled()) {
+        return;
+    }
+    if (df_n_gvec >= DF_MAX_GVEC_NOTES) {
+        df_gvec_overflow = true;
+        return;
+    }
+    df_gvec[df_n_gvec].anchor = QTAILQ_LAST(&tcg_ctx->ops);
+    df_gvec[df_n_gvec].dofs = dofs;
+    df_gvec[df_n_gvec].aofs = aofs;
+    df_gvec[df_n_gvec].bofs = bofs;
+    df_gvec[df_n_gvec].oprsz = oprsz;
+    df_n_gvec++;
+}
+
+/* Fold every note anchored inside [first, end) into this instruction. */
+static void df_apply_gvec_notes(InsnDataflow *d, TCGOp *first, TCGOp *end)
+{
+    TCGOp *op;
+
+    if (df_n_gvec == 0) {
+        return;
+    }
+    for (op = first; op != end; op = QTAILQ_NEXT(op, link)) {
+        for (unsigned i = 0; i < df_n_gvec; i++) {
+            if (df_gvec[i].anchor != op) {
+                continue;
+            }
+            /*
+             * Both source operands are read and the destination written,
+             * whether or not the constructor folded them away.  aofs == bofs
+             * is the folded case and df_add_field() merges the two into one
+             * field, which is right: it is one register, read once.
+             */
+            df_add_field(d, df_gvec[i].aofs, df_gvec[i].oprsz,
+                         INSN_DF_RD, NULL);
+            df_add_field(d, df_gvec[i].bofs, df_gvec[i].oprsz,
+                         INSN_DF_RD, NULL);
+            df_add_field(d, df_gvec[i].dofs, df_gvec[i].oprsz,
+                         INSN_DF_WR, NULL);
+        }
+        if (op == end) {
+            break;
+        }
+    }
+}
+
 void insn_dataflow_extract(unsigned num_insns)
 {
     TCGContext *s = tcg_ctx;
@@ -795,6 +868,7 @@ void insn_dataflow_extract(unsigned num_insns)
         }
         if (first != NULL && idx > 0) {
             df_insn(&df_out[idx - 1], first, op);
+            df_apply_gvec_notes(&df_out[idx - 1], first, op);
         }
         if (idx >= num_insns) {
             first = NULL;
@@ -805,6 +879,7 @@ void insn_dataflow_extract(unsigned num_insns)
     }
     if (first != NULL && idx > 0) {
         df_insn(&df_out[idx - 1], first, NULL);
+        df_apply_gvec_notes(&df_out[idx - 1], first, NULL);
     }
     df_ninsns = idx;
 
@@ -819,6 +894,20 @@ void insn_dataflow_extract(unsigned num_insns)
             k++;
         }
     }
+
+    /*
+     * The notes belonged to this translation only.  Reset after consuming so
+     * a stale anchor from a previous TB can never be matched against a
+     * recycled TCGOp address in the next one.
+     */
+    if (df_gvec_overflow) {
+        /* Same direction as fields_overflow: say so rather than lose it. */
+        for (unsigned i = 0; i < df_ninsns; i++) {
+            df_out[i].fields_overflow = 1;
+        }
+    }
+    df_n_gvec = 0;
+    df_gvec_overflow = false;
 
     if (prof) {
         df_prof_ns += df_now() - t0;

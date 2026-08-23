@@ -131,6 +131,29 @@ typedef struct InsnDataflow {
  */
 void insn_dataflow_extract(unsigned num_insns);
 
+/*
+ * CP4 -- the vector choke point.
+ *
+ * Eight of the 74 tcg_gen_gvec_* constructors fold a same-register operand
+ * away before emitting anything: `if (aofs == bofs)` turns pxor %xmm0,%xmm0
+ * into a constant store, and the read of xmm0 never reaches the op stream
+ * the extractor walks.  The operands are not lost, though -- they are the
+ * constructor's own PARAMETERS, one statement earlier.  So the constructor
+ * states them here, and the walk folds them in when it reaches the op this
+ * was anchored to.
+ *
+ * That the result is a constant is a QEMU optimisation, not the
+ * architecture: the instruction reads what its encoding names, and whether
+ * a downstream simulator breaks that dependency is the simulator's business.
+ * Recording it here is what keeps the answer the same whether or not TCG
+ * happens to fold -- and where TCG folds moves silently across versions.
+ *
+ * Capture only.  No op is emitted, altered or suppressed, so generated guest
+ * code is bit-identical with this compiled in.
+ */
+void insn_dataflow_note_gvec(uint32_t dofs, uint32_t aofs, uint32_t bofs,
+                             uint32_t oprsz);
+
 /* The result for instruction @i of the TB just translated, or NULL. */
 const InsnDataflow *insn_dataflow_get(unsigned i);
 
@@ -157,6 +180,10 @@ const char *insn_dataflow_reg_name(unsigned i, uint32_t *off, uint32_t *size);
  * entry point above is reached from plugins/, which is not built either.
  */
 static inline void insn_dataflow_extract(unsigned num_insns)
+{ }
+
+static inline void insn_dataflow_note_gvec(uint32_t dofs, uint32_t aofs,
+                                           uint32_t bofs, uint32_t oprsz)
 { }
 
 #endif /* CONFIG_PLUGIN */

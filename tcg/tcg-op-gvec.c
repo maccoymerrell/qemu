@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "exec/insn-dataflow.h"
 #include "tcg/tcg.h"
 #include "tcg/tcg-temp-internal.h"
 #include "tcg/tcg-op-common.h"
@@ -2611,6 +2612,17 @@ void tcg_gen_gvec_and(unsigned vece, uint32_t dofs, uint32_t aofs,
     } else {
         tcg_gen_gvec_3(dofs, aofs, bofs, oprsz, maxsz, &g);
     }
+
+    /*
+     * CP4: state the operands the fold above may have removed.
+     * aofs/bofs are this function's parameters, so nothing was ever
+     * lost here -- only downstream, in the ops.  Noted AFTER emission
+     * so the anchor op belongs to this instruction: at entry the last
+     * op is still the previous instruction's, and the note would be
+     * attributed one instruction early.
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    insn_dataflow_note_gvec(dofs, aofs, bofs, oprsz);
 }
 
 void tcg_gen_gvec_or(unsigned vece, uint32_t dofs, uint32_t aofs,
@@ -2628,6 +2640,17 @@ void tcg_gen_gvec_or(unsigned vece, uint32_t dofs, uint32_t aofs,
     } else {
         tcg_gen_gvec_3(dofs, aofs, bofs, oprsz, maxsz, &g);
     }
+
+    /*
+     * CP4: state the operands the fold above may have removed.
+     * aofs/bofs are this function's parameters, so nothing was ever
+     * lost here -- only downstream, in the ops.  Noted AFTER emission
+     * so the anchor op belongs to this instruction: at entry the last
+     * op is still the previous instruction's, and the note would be
+     * attributed one instruction early.
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    insn_dataflow_note_gvec(dofs, aofs, bofs, oprsz);
 }
 
 void tcg_gen_gvec_xor(unsigned vece, uint32_t dofs, uint32_t aofs,
@@ -2645,6 +2668,17 @@ void tcg_gen_gvec_xor(unsigned vece, uint32_t dofs, uint32_t aofs,
     } else {
         tcg_gen_gvec_3(dofs, aofs, bofs, oprsz, maxsz, &g);
     }
+
+    /*
+     * CP4: state the operands the fold above may have removed.
+     * aofs/bofs are this function's parameters, so nothing was ever
+     * lost here -- only downstream, in the ops.  Noted AFTER emission
+     * so the anchor op belongs to this instruction: at entry the last
+     * op is still the previous instruction's, and the note would be
+     * attributed one instruction early.
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    insn_dataflow_note_gvec(dofs, aofs, bofs, oprsz);
 }
 
 void tcg_gen_gvec_andc(unsigned vece, uint32_t dofs, uint32_t aofs,
@@ -2662,6 +2696,17 @@ void tcg_gen_gvec_andc(unsigned vece, uint32_t dofs, uint32_t aofs,
     } else {
         tcg_gen_gvec_3(dofs, aofs, bofs, oprsz, maxsz, &g);
     }
+
+    /*
+     * CP4: state the operands the fold above may have removed.
+     * aofs/bofs are this function's parameters, so nothing was ever
+     * lost here -- only downstream, in the ops.  Noted AFTER emission
+     * so the anchor op belongs to this instruction: at entry the last
+     * op is still the previous instruction's, and the note would be
+     * attributed one instruction early.
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    insn_dataflow_note_gvec(dofs, aofs, bofs, oprsz);
 }
 
 void tcg_gen_gvec_orc(unsigned vece, uint32_t dofs, uint32_t aofs,
@@ -2679,6 +2724,17 @@ void tcg_gen_gvec_orc(unsigned vece, uint32_t dofs, uint32_t aofs,
     } else {
         tcg_gen_gvec_3(dofs, aofs, bofs, oprsz, maxsz, &g);
     }
+
+    /*
+     * CP4: state the operands the fold above may have removed.
+     * aofs/bofs are this function's parameters, so nothing was ever
+     * lost here -- only downstream, in the ops.  Noted AFTER emission
+     * so the anchor op belongs to this instruction: at entry the last
+     * op is still the previous instruction's, and the note would be
+     * attributed one instruction early.
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    insn_dataflow_note_gvec(dofs, aofs, bofs, oprsz);
 }
 
 void tcg_gen_gvec_nand(unsigned vece, uint32_t dofs, uint32_t aofs,
@@ -2696,6 +2752,17 @@ void tcg_gen_gvec_nand(unsigned vece, uint32_t dofs, uint32_t aofs,
     } else {
         tcg_gen_gvec_3(dofs, aofs, bofs, oprsz, maxsz, &g);
     }
+
+    /*
+     * CP4: state the operands the fold above may have removed.
+     * aofs/bofs are this function's parameters, so nothing was ever
+     * lost here -- only downstream, in the ops.  Noted AFTER emission
+     * so the anchor op belongs to this instruction: at entry the last
+     * op is still the previous instruction's, and the note would be
+     * attributed one instruction early.
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    insn_dataflow_note_gvec(dofs, aofs, bofs, oprsz);
 }
 
 void tcg_gen_gvec_nor(unsigned vece, uint32_t dofs, uint32_t aofs,
@@ -2713,6 +2780,17 @@ void tcg_gen_gvec_nor(unsigned vece, uint32_t dofs, uint32_t aofs,
     } else {
         tcg_gen_gvec_3(dofs, aofs, bofs, oprsz, maxsz, &g);
     }
+
+    /*
+     * CP4: state the operands the fold above may have removed.
+     * aofs/bofs are this function's parameters, so nothing was ever
+     * lost here -- only downstream, in the ops.  Noted AFTER emission
+     * so the anchor op belongs to this instruction: at entry the last
+     * op is still the previous instruction's, and the note would be
+     * attributed one instruction early.
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    insn_dataflow_note_gvec(dofs, aofs, bofs, oprsz);
 }
 
 void tcg_gen_gvec_eqv(unsigned vece, uint32_t dofs, uint32_t aofs,
@@ -2730,6 +2808,17 @@ void tcg_gen_gvec_eqv(unsigned vece, uint32_t dofs, uint32_t aofs,
     } else {
         tcg_gen_gvec_3(dofs, aofs, bofs, oprsz, maxsz, &g);
     }
+
+    /*
+     * CP4: state the operands the fold above may have removed.
+     * aofs/bofs are this function's parameters, so nothing was ever
+     * lost here -- only downstream, in the ops.  Noted AFTER emission
+     * so the anchor op belongs to this instruction: at entry the last
+     * op is still the previous instruction's, and the note would be
+     * attributed one instruction early.
+     * Capture only; no op is emitted, altered or suppressed.
+     */
+    insn_dataflow_note_gvec(dofs, aofs, bofs, oprsz);
 }
 
 static const GVecGen2s gop_ands = {

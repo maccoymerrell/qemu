@@ -194,6 +194,11 @@ const char *isax_generic_reg_name(unsigned gen_id)
     return generic_reg_name_or_unknown(gen_id);
 }
 
+bool isax_generic_reg_indexed_file(unsigned gen_id)
+{
+    return generic_reg_is_indexed_file(gen_id);
+}
+
 const char *isax_branch_name(unsigned branch_type)
 {
     return branch_type_name_or_unknown(branch_type);

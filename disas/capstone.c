@@ -460,6 +460,65 @@ typedef struct {
     int  dest_idx;   /* AT&T dest-last with the writemask excluded, -1 */
 } cap_x86_evex;
 
+/*
+ * Capstone-6.0.0-Alpha7 bug: with more than one segment-override prefix
+ * on the same instruction, cs_x86_op.mem.segment reports the FIRST one.
+ * The hardware, and QEMU with it, takes the LAST: every override byte
+ * assigns s->override unconditionally in the prefix loop
+ * (target/i386/tcg/decode-new.c.inc, `case 0x64: s->override = R_FS`),
+ * so `65 64 ...` reads FS while Capstone says GS.  A dependency model
+ * built on the first prefix names a segment base the guest never reads
+ * and misses the one it does.
+ *
+ * The bytes decide it, being the only place the ORDER of the prefixes
+ * survives -- Capstone's own prefix[] array keeps one byte per group.
+ * Returns the Capstone register id of the last override in the leading
+ * legacy-prefix run, or 0 when the instruction carries none.
+ */
+static unsigned cap_x86_last_segment_override(const cs_insn *insn)
+{
+    unsigned last = 0;
+
+    for (uint16_t k = 0; k < insn->size; k++) {
+        switch (insn->bytes[k]) {
+        case 0x26: last = X86_REG_ES; break;
+        case 0x2e: last = X86_REG_CS; break;
+        case 0x36: last = X86_REG_SS; break;
+        case 0x3e: last = X86_REG_DS; break;
+        case 0x64: last = X86_REG_FS; break;
+        case 0x65: last = X86_REG_GS; break;
+        case 0x66: case 0x67: case 0xf0: case 0xf2: case 0xf3:
+            break;              /* other legacy prefixes, keep scanning */
+        default:
+            return last;        /* REX / opcode: the prefix run ended */
+        }
+    }
+    return last;
+}
+
+/*
+ * Is this an x87 escape, opcode byte D8..DF?  Taken from the bytes past
+ * the legacy prefixes and the REX byte, so it does not depend on the
+ * mnemonic spelling of any one form.
+ */
+static bool cap_x86_is_x87_escape(const cs_insn *insn)
+{
+    uint16_t k = 0;
+
+    while (k < insn->size) {
+        uint8_t b = insn->bytes[k];
+        if (b == 0x26 || b == 0x2e || b == 0x36 || b == 0x3e ||
+            b == 0x64 || b == 0x65 || b == 0x66 || b == 0x67 ||
+            b == 0xf0 || b == 0xf2 || b == 0xf3 ||
+            (b >= 0x40 && b <= 0x4f)) {
+            k++;
+        } else {
+            return b >= 0xd8 && b <= 0xdf;
+        }
+    }
+    return false;
+}
+
 static void cap_x86_evex_classify(const cs_insn *insn, uint8_t n,
                                   cap_x86_evex *e);
 static bool cap_x86_reg_is_vector(unsigned int reg);
@@ -619,6 +678,27 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
     if (ktest_op || test_read || xadd_op) {
         cap_x86_add_implicit(out, handle, X86_REG_EFLAGS, true);
     }
+    /*
+     * Capstone-6.0.0-Alpha7 bug: the x87 escapes name a SEGMENT REGISTER
+     * in their implicit read list.  `fcoms (%rax)` comes back reading SS
+     * and `ficoms (%rax)` reading DS, for the same encoding shape that
+     * `movl (%rax), %eax` reports no segment for at all -- and SS is not
+     * even the segment that access uses, since the default follows the
+     * BASE register and %rax means DS.  Whichever way it lands it is a
+     * dependency the guest does not have, on a register the instruction
+     * cannot read: the only segment an access genuinely takes an input
+     * from is an override, and an override arrives as the memory
+     * operand's segment_id, never through this list.
+     */
+    if (cap_x86_is_x87_escape(insn)) {
+        static const unsigned int segs[] = {
+            X86_REG_CS, X86_REG_DS, X86_REG_ES,
+            X86_REG_FS, X86_REG_GS, X86_REG_SS,
+        };
+        for (size_t j = 0; j < ARRAY_SIZE(segs); j++) {
+            cap_x86_drop_implicit(out, segs[j], false);
+        }
+    }
     if (cap_x86_is_sign_extend_to_d(insn->mnemonic)) {
         static const unsigned int acc[] = {
             X86_REG_AL, X86_REG_AH, X86_REG_AX, X86_REG_EAX, X86_REG_RAX,
@@ -760,13 +840,27 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
             op->imm = cop->mem.disp;
             op->scale = (uint8_t)cop->mem.scale;
             /*
-             * Segment override (%fs: / %gs: ...).  Capstone reports it
-             * only here -- it is absent from the implicit regs_read[]
-             * list -- and its base is a real input to the effective
-             * address, so surface it as its own operand field.  0 when
-             * the access uses the default segment.
+             * Segment override (%fs: / %gs: ...).  Its base is a real
+             * input to the effective address, so it is surfaced as its
+             * own operand field; 0 when the access uses the default
+             * segment.  Capstone decides
+             * WHETHER this access carries one -- it folds away the
+             * overrides that select a segment whose base is
+             * architecturally zero in the current mode, and that fold is
+             * kept, because a register whose value cannot reach the
+             * address is not an input.
+             *
+             * WHICH register it is comes off the prefix bytes.  Alpha7
+             * keeps the FIRST of several overrides where the hardware
+             * keeps the LAST: `65 64 ...` is reported %gs and executes
+             * %fs, because every override byte assigns s->override in
+             * QEMU's own prefix loop (decode-new.c.inc, `case 0x64:
+             * s->override = R_FS`).  A model built on the first prefix
+             * names a segment base the guest never reads and misses the
+             * one it does.  The bytes cannot be wrong about the order.
              */
-            op->segment_id = cop->mem.segment;
+            op->segment_id = cop->mem.segment
+                           ? cap_x86_last_segment_override(insn) : 0;
             /* Capstone-6.0.0-Alpha7 bugs: the r/m destination of a
              * store-form extract is a write target, not a read; so is the
              * sole memory operand of STMXCSR / VSTMXCSR and of a SETcc

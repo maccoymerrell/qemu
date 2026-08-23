@@ -1098,10 +1098,16 @@ x86_64 R-rd-missing nopq +r#
 x86_64 R-rd-missing nopw +r#
 x86_64 R-rd-missing pcmpestrm +r#
 x86_64 R-rd-missing rcll +flags
-x86_64 R-rd-missing rcll +flags,seg
+x86_64 R-rd-missing rcll +cs,flags
+x86_64 R-rd-missing rcll +ds,flags
+x86_64 R-rd-missing rcll +es,flags
+x86_64 R-rd-missing rcll +flags,ss
 x86_64 R-rd-missing rclq +flags
 x86_64 R-rd-missing rclw +flags
-x86_64 R-rd-missing rclw +flags,seg
+x86_64 R-rd-missing rclw +cs,flags
+x86_64 R-rd-missing rclw +ds,flags
+x86_64 R-rd-missing rclw +es,flags
+x86_64 R-rd-missing rclw +flags,ss
 x86_64 R-rd-missing rcpss +v#
 x86_64 R-rd-missing rsqrtss +v#
 x86_64 R-rd-missing sqrtsd +v#
@@ -1109,31 +1115,33 @@ x86_64 R-rd-missing sqrtss +v#
 x86_64 R-rd-missing stc +flags
 x86_64 R-rd-missing sti +flags
 x86_64 R-rd-missing xlatb +r#
-x86_64 R-rd-phantom bnd lretl +r#,seg
-x86_64 R-rd-phantom bnd lretq +r#,seg
-x86_64 R-rd-phantom bnd retq +r#,seg
+x86_64 R-rd-phantom bnd lretl +r#,ss
+x86_64 R-rd-phantom bnd lretq +r#,ss
+x86_64 R-rd-phantom bnd retq +r#,ss
 x86_64 R-rd-phantom cvtpi2pd +mm#
 x86_64 R-rd-phantom enter +r#
 x86_64 R-rd-phantom int3 +flags,r#
 x86_64 R-rd-phantom int +flags,r#
-x86_64 R-rd-phantom iretl +flags,r#,seg
-x86_64 R-rd-phantom iretq +flags,r#,seg
-x86_64 R-rd-phantom iretw +flags,r#,seg
+x86_64 R-rd-phantom iretl +flags,r#,ss
+x86_64 R-rd-phantom iretq +flags,r#,ss
+x86_64 R-rd-phantom iretw +flags,r#,ss
 x86_64 R-rd-phantom loope +flags,r#
 x86_64 R-rd-phantom loopne +flags,r#
 x86_64 R-rd-phantom loop +r#
-x86_64 R-rd-phantom lretl +r#,seg
-x86_64 R-rd-phantom lretq +r#,seg
-x86_64 R-rd-phantom lretw +r#,seg
+x86_64 R-rd-phantom lretl +r#,ss
+x86_64 R-rd-phantom lretq +r#,ss
+x86_64 R-rd-phantom lretw +r#,ss
 x86_64 R-rd-phantom movq +v#
 x86_64 R-rd-phantom popq +r#
 x86_64 R-rd-phantom popw +r#
-x86_64 R-rd-phantom pushq +seg
-x86_64 R-rd-phantom pushw +seg
-x86_64 R-rd-phantom repz retq +r#,seg
-x86_64 R-rd-phantom repz retw +r#,seg
-x86_64 R-rd-phantom retq +r#,seg
-x86_64 R-rd-phantom retw +r#,seg
+x86_64 R-rd-phantom pushq +fs
+x86_64 R-rd-phantom pushq +gs
+x86_64 R-rd-phantom pushw +fs
+x86_64 R-rd-phantom pushw +gs
+x86_64 R-rd-phantom repz retq +r#,ss
+x86_64 R-rd-phantom repz retw +r#,ss
+x86_64 R-rd-phantom retq +r#,ss
+x86_64 R-rd-phantom retw +r#,ss
 x86_64 R-rd-phantom sysexitl +r#
 x86_64 R-rd-phantom sysexitq +r#
 x86_64 R-rd-phantom sysretl +r#
@@ -1170,8 +1178,8 @@ x86_64 R-wr-missing sti +flags
 x86_64 R-wr-missing wait +fpsw
 x86_64 R-wr-missing xlatb +r#
 x86_64 R-wr-phantom bnd callq +r#
-x86_64 R-wr-phantom bnd lretl +r#,seg
-x86_64 R-wr-phantom bnd lretq +r#,seg
+x86_64 R-wr-phantom bnd lretl +cs,r#
+x86_64 R-wr-phantom bnd lretq +cs,r#
 x86_64 R-wr-phantom bnd retq +r#
 x86_64 R-wr-phantom callq +r#
 x86_64 R-wr-phantom cvtpd2pi +mm#
@@ -1185,12 +1193,14 @@ x86_64 R-wr-phantom iretw +flags,r#
 x86_64 R-wr-phantom loope +r#
 x86_64 R-wr-phantom loopne +r#
 x86_64 R-wr-phantom loop +r#
-x86_64 R-wr-phantom lretl +r#,seg
-x86_64 R-wr-phantom lretq +r#,seg
-x86_64 R-wr-phantom lretw +r#,seg
+x86_64 R-wr-phantom lretl +cs,r#
+x86_64 R-wr-phantom lretq +cs,r#
+x86_64 R-wr-phantom lretw +cs,r#
 x86_64 R-wr-phantom movq +v#
-x86_64 R-wr-phantom popq +r#,seg
-x86_64 R-wr-phantom popw +r#,seg
+x86_64 R-wr-phantom popq +fs,r#
+x86_64 R-wr-phantom popq +gs,r#
+x86_64 R-wr-phantom popw +fs,r#
+x86_64 R-wr-phantom popw +gs,r#
 x86_64 R-wr-phantom pushq +r#
 x86_64 R-wr-phantom pushw +r#
 x86_64 R-wr-phantom repe cmpsb +r#
@@ -1604,7 +1614,10 @@ x86_64 R-rd-missing fstpl +fpcw
 x86_64 R-rd-missing fstps +fpcw
 x86_64 R-rd-missing fstpt +fpcw
 x86_64 R-rd-missing fsts +fpcw
-x86_64 R-rd-missing fsts +fpcw,seg
+x86_64 R-rd-missing fsts +cs,fpcw
+x86_64 R-rd-missing fsts +ds,fpcw
+x86_64 R-rd-missing fsts +es,fpcw
+x86_64 R-rd-missing fsts +fpcw,ss
 x86_64 R-rd-missing fsubl +fpcw
 x86_64 R-rd-missing fsubrl +fpcw
 x86_64 R-rd-missing fsubrs +fpcw
@@ -2694,47 +2707,153 @@ x86_64 D-llvm-only xsusldtrk
 # nothing to record either.  The pre-existing `+seg` entries above are the
 # same difference seen from the phantom side, on the RIP-relative tail that
 # was already swept.
-x86_64 R-rd-missing adcb +seg
-x86_64 R-rd-missing adcl +seg
-x86_64 R-rd-missing adcw +seg
-x86_64 R-rd-missing addb +seg
-x86_64 R-rd-missing addl +seg
-x86_64 R-rd-missing addw +seg
-x86_64 R-rd-missing andb +seg
-x86_64 R-rd-missing andl +seg
-x86_64 R-rd-missing andw +seg
-x86_64 R-rd-missing bnd callq +seg
-x86_64 R-rd-missing bnd notrack callq +seg
-x86_64 R-rd-missing callq +seg
-x86_64 R-rd-missing cmpb +seg
-x86_64 R-rd-missing cmpl +seg
-x86_64 R-rd-missing cmpw +seg
-x86_64 R-rd-missing leal +seg
-x86_64 R-rd-missing leaw +seg
-x86_64 R-rd-missing lock adcl +seg
-x86_64 R-rd-missing lock adcw +seg
-x86_64 R-rd-missing lock addb +seg
-x86_64 R-rd-missing notb +seg
-x86_64 R-rd-missing notl +seg
-x86_64 R-rd-missing notrack callq +seg
-x86_64 R-rd-missing notw +seg
-x86_64 R-rd-missing orb +seg
-x86_64 R-rd-missing orl +seg
-x86_64 R-rd-missing orw +seg
-x86_64 R-rd-missing rclb +flags,seg
-x86_64 R-rd-missing sbbb +seg
-x86_64 R-rd-missing sbbl +seg
-x86_64 R-rd-missing sbbw +seg
-x86_64 R-rd-missing sldtw +seg
-x86_64 R-rd-missing subb +seg
-x86_64 R-rd-missing subl +seg
-x86_64 R-rd-missing subw +seg
-x86_64 R-rd-missing xorb +seg
-x86_64 R-rd-missing xorl +seg
-x86_64 R-rd-missing xorw +seg
-x86_64 R-rd-phantom bnd lretw +r#,seg
-x86_64 R-rd-phantom bnd retw +r#,seg
-x86_64 R-wr-phantom bnd lretw +r#,seg
+x86_64 R-rd-missing adcb +cs
+x86_64 R-rd-missing adcb +ds
+x86_64 R-rd-missing adcb +es
+x86_64 R-rd-missing adcb +ss
+x86_64 R-rd-missing adcl +cs
+x86_64 R-rd-missing adcl +ds
+x86_64 R-rd-missing adcl +es
+x86_64 R-rd-missing adcl +ss
+x86_64 R-rd-missing adcw +cs
+x86_64 R-rd-missing adcw +ds
+x86_64 R-rd-missing adcw +es
+x86_64 R-rd-missing adcw +ss
+x86_64 R-rd-missing addb +cs
+x86_64 R-rd-missing addb +ds
+x86_64 R-rd-missing addb +es
+x86_64 R-rd-missing addb +ss
+x86_64 R-rd-missing addl +cs
+x86_64 R-rd-missing addl +ds
+x86_64 R-rd-missing addl +es
+x86_64 R-rd-missing addl +ss
+x86_64 R-rd-missing addw +cs
+x86_64 R-rd-missing addw +ds
+x86_64 R-rd-missing addw +es
+x86_64 R-rd-missing addw +ss
+x86_64 R-rd-missing andb +cs
+x86_64 R-rd-missing andb +ds
+x86_64 R-rd-missing andb +es
+x86_64 R-rd-missing andb +ss
+x86_64 R-rd-missing andl +cs
+x86_64 R-rd-missing andl +ds
+x86_64 R-rd-missing andl +es
+x86_64 R-rd-missing andl +ss
+x86_64 R-rd-missing andw +cs
+x86_64 R-rd-missing andw +ds
+x86_64 R-rd-missing andw +es
+x86_64 R-rd-missing andw +ss
+x86_64 R-rd-missing bnd callq +cs
+x86_64 R-rd-missing bnd callq +es
+x86_64 R-rd-missing bnd callq +ss
+x86_64 R-rd-missing bnd notrack callq +ds
+x86_64 R-rd-missing callq +cs
+x86_64 R-rd-missing callq +es
+x86_64 R-rd-missing callq +ss
+x86_64 R-rd-missing cmpb +cs
+x86_64 R-rd-missing cmpb +ds
+x86_64 R-rd-missing cmpb +es
+x86_64 R-rd-missing cmpb +ss
+x86_64 R-rd-missing cmpl +cs
+x86_64 R-rd-missing cmpl +ds
+x86_64 R-rd-missing cmpl +es
+x86_64 R-rd-missing cmpl +ss
+x86_64 R-rd-missing cmpw +cs
+x86_64 R-rd-missing cmpw +ds
+x86_64 R-rd-missing cmpw +es
+x86_64 R-rd-missing cmpw +ss
+x86_64 R-rd-missing leal +cs
+x86_64 R-rd-missing leal +ds
+x86_64 R-rd-missing leal +es
+x86_64 R-rd-missing leal +ss
+x86_64 R-rd-missing leaw +cs
+x86_64 R-rd-missing leaw +ds
+x86_64 R-rd-missing leaw +es
+x86_64 R-rd-missing leaw +ss
+x86_64 R-rd-missing lock adcl +cs
+x86_64 R-rd-missing lock adcl +ds
+x86_64 R-rd-missing lock adcl +es
+x86_64 R-rd-missing lock adcl +ss
+x86_64 R-rd-missing lock adcw +cs
+x86_64 R-rd-missing lock adcw +ds
+x86_64 R-rd-missing lock adcw +es
+x86_64 R-rd-missing lock adcw +ss
+x86_64 R-rd-missing lock addb +cs
+x86_64 R-rd-missing lock addb +ds
+x86_64 R-rd-missing lock addb +es
+x86_64 R-rd-missing lock addb +ss
+x86_64 R-rd-missing notb +cs
+x86_64 R-rd-missing notb +ds
+x86_64 R-rd-missing notb +es
+x86_64 R-rd-missing notb +ss
+x86_64 R-rd-missing notl +cs
+x86_64 R-rd-missing notl +ds
+x86_64 R-rd-missing notl +es
+x86_64 R-rd-missing notl +ss
+x86_64 R-rd-missing notrack callq +ds
+x86_64 R-rd-missing notw +cs
+x86_64 R-rd-missing notw +ds
+x86_64 R-rd-missing notw +es
+x86_64 R-rd-missing notw +ss
+x86_64 R-rd-missing orb +cs
+x86_64 R-rd-missing orb +ds
+x86_64 R-rd-missing orb +es
+x86_64 R-rd-missing orb +ss
+x86_64 R-rd-missing orl +cs
+x86_64 R-rd-missing orl +ds
+x86_64 R-rd-missing orl +es
+x86_64 R-rd-missing orl +ss
+x86_64 R-rd-missing orw +cs
+x86_64 R-rd-missing orw +ds
+x86_64 R-rd-missing orw +es
+x86_64 R-rd-missing orw +ss
+x86_64 R-rd-missing rclb +cs,flags
+x86_64 R-rd-missing rclb +ds,flags
+x86_64 R-rd-missing rclb +es,flags
+x86_64 R-rd-missing rclb +flags,ss
+x86_64 R-rd-missing sbbb +cs
+x86_64 R-rd-missing sbbb +ds
+x86_64 R-rd-missing sbbb +es
+x86_64 R-rd-missing sbbb +ss
+x86_64 R-rd-missing sbbl +cs
+x86_64 R-rd-missing sbbl +ds
+x86_64 R-rd-missing sbbl +es
+x86_64 R-rd-missing sbbl +ss
+x86_64 R-rd-missing sbbw +cs
+x86_64 R-rd-missing sbbw +ds
+x86_64 R-rd-missing sbbw +es
+x86_64 R-rd-missing sbbw +ss
+x86_64 R-rd-missing sldtw +cs
+x86_64 R-rd-missing sldtw +ds
+x86_64 R-rd-missing sldtw +es
+x86_64 R-rd-missing sldtw +ss
+x86_64 R-rd-missing subb +cs
+x86_64 R-rd-missing subb +ds
+x86_64 R-rd-missing subb +es
+x86_64 R-rd-missing subb +ss
+x86_64 R-rd-missing subl +cs
+x86_64 R-rd-missing subl +ds
+x86_64 R-rd-missing subl +es
+x86_64 R-rd-missing subl +ss
+x86_64 R-rd-missing subw +cs
+x86_64 R-rd-missing subw +ds
+x86_64 R-rd-missing subw +es
+x86_64 R-rd-missing subw +ss
+x86_64 R-rd-missing xorb +cs
+x86_64 R-rd-missing xorb +ds
+x86_64 R-rd-missing xorb +es
+x86_64 R-rd-missing xorb +ss
+x86_64 R-rd-missing xorl +cs
+x86_64 R-rd-missing xorl +ds
+x86_64 R-rd-missing xorl +es
+x86_64 R-rd-missing xorl +ss
+x86_64 R-rd-missing xorw +cs
+x86_64 R-rd-missing xorw +ds
+x86_64 R-rd-missing xorw +es
+x86_64 R-rd-missing xorw +ss
+x86_64 R-rd-phantom bnd lretw +r#,ss
+x86_64 R-rd-phantom bnd retw +r#,ss
+x86_64 R-wr-phantom bnd lretw +cs,r#
 
 # (e) x87 control and status words, and the implicit stack top.  LLVM
 # attaches FPCW as a use and FPSW as a def to essentially the whole x87
@@ -2787,8 +2906,14 @@ x86_64 R-rd-missing fdiv +fpcw
 x86_64 R-rd-missing fdivp +fpcw
 x86_64 R-rd-missing fdivr +fpcw
 x86_64 R-rd-missing fdivrp +fpcw
-x86_64 R-rd-missing fistl +fpcw,seg
-x86_64 R-rd-missing fists +fpcw,seg
+x86_64 R-rd-missing fistl +cs,fpcw
+x86_64 R-rd-missing fistl +ds,fpcw
+x86_64 R-rd-missing fistl +es,fpcw
+x86_64 R-rd-missing fistl +fpcw,ss
+x86_64 R-rd-missing fists +cs,fpcw
+x86_64 R-rd-missing fists +ds,fpcw
+x86_64 R-rd-missing fists +es,fpcw
+x86_64 R-rd-missing fists +fpcw,ss
 x86_64 R-rd-missing fld +fpcw
 x86_64 R-rd-missing fld1 +fpcw
 x86_64 R-rd-missing fldl2e +fpcw
@@ -2808,7 +2933,10 @@ x86_64 R-rd-missing fsin +fpcw
 x86_64 R-rd-missing fsincos +fpcw
 x86_64 R-rd-missing fsqrt +fpcw
 x86_64 R-rd-missing fst +fpcw
-x86_64 R-rd-missing fstl +fpcw,seg
+x86_64 R-rd-missing fstl +cs,fpcw
+x86_64 R-rd-missing fstl +ds,fpcw
+x86_64 R-rd-missing fstl +es,fpcw
+x86_64 R-rd-missing fstl +fpcw,ss
 x86_64 R-rd-missing fsub +fpcw
 x86_64 R-rd-missing fsubp +fpcw
 x86_64 R-rd-missing fsubr +fpcw
@@ -2831,25 +2959,17 @@ x86_64 R-rd-phantom fcmovne +st#
 x86_64 R-rd-phantom fcmovnu +st#
 x86_64 R-rd-phantom fcmovu +st#
 x86_64 R-rd-phantom fcom +st#
-x86_64 R-rd-phantom fcoml +seg,st#
 x86_64 R-rd-phantom fcoml +st#
 x86_64 R-rd-phantom fcomp +st#
-x86_64 R-rd-phantom fcompl +seg,st#
 x86_64 R-rd-phantom fcompl +st#
 x86_64 R-rd-phantom fcompp +st#
-x86_64 R-rd-phantom fcomps +seg,st#
 x86_64 R-rd-phantom fcomps +st#
-x86_64 R-rd-phantom fcoms +seg,st#
 x86_64 R-rd-phantom fcoms +st#
 x86_64 R-rd-phantom fdiv +st#
 x86_64 R-rd-phantom fdivr +st#
-x86_64 R-rd-phantom ficoml +seg,st#
 x86_64 R-rd-phantom ficoml +st#
-x86_64 R-rd-phantom ficompl +seg,st#
 x86_64 R-rd-phantom ficompl +st#
-x86_64 R-rd-phantom ficomps +seg,st#
 x86_64 R-rd-phantom ficomps +st#
-x86_64 R-rd-phantom ficoms +seg,st#
 x86_64 R-rd-phantom ficoms +st#
 x86_64 R-rd-phantom fmul +st#
 x86_64 R-rd-phantom fsub +st#
@@ -3356,54 +3476,198 @@ x86_64 M-cs-mem-llvm-none repne movsw
 x86_64 M-cs-mem-llvm-none repne outsw
 x86_64 M-cs-mem-llvm-none repne scasw
 x86_64 M-cs-mem-llvm-none repne stosw
-x86_64 R-rd-missing cmpsb +seg
-x86_64 R-rd-missing cmpsl +seg
-x86_64 R-rd-missing cmpsw +seg
-x86_64 R-rd-missing imull +seg
-x86_64 R-rd-missing imulw +seg
-x86_64 R-rd-missing lodsb +seg
-x86_64 R-rd-missing lodsl +seg
-x86_64 R-rd-missing lodsw +seg
-x86_64 R-rd-missing movabsb +seg
-x86_64 R-rd-missing movabsl +seg
-x86_64 R-rd-missing movabsw +seg
-x86_64 R-rd-missing movb +seg
-x86_64 R-rd-missing movl +seg
-x86_64 R-rd-missing movsb +seg
-x86_64 R-rd-missing movsl +seg
-x86_64 R-rd-missing movsw +seg
-x86_64 R-rd-missing movw +seg
-x86_64 R-rd-missing outsb +seg
-x86_64 R-rd-missing outsl +seg
-x86_64 R-rd-missing outsw +seg
-x86_64 R-rd-missing popq +seg
-x86_64 R-rd-missing popw +seg
-x86_64 R-rd-missing rep lodsb +seg
-x86_64 R-rd-missing rep lodsl +seg
-x86_64 R-rd-missing rep lodsw +seg
-x86_64 R-rd-missing rep movsb +seg
-x86_64 R-rd-missing rep movsl +seg
-x86_64 R-rd-missing rep movsw +seg
-x86_64 R-rd-missing rep outsb +seg
-x86_64 R-rd-missing rep outsl +seg
-x86_64 R-rd-missing rep outsw +seg
-x86_64 R-rd-missing repe cmpsb +seg
-x86_64 R-rd-missing repe cmpsl +seg
-x86_64 R-rd-missing repe cmpsw +seg
-x86_64 R-rd-missing repne cmpsb +seg
-x86_64 R-rd-missing repne cmpsl +seg
-x86_64 R-rd-missing repne lodsb +seg
-x86_64 R-rd-missing repne lodsl +seg
-x86_64 R-rd-missing repne movsb +seg
-x86_64 R-rd-missing repne movsl +seg
-x86_64 R-rd-missing repne outsb +seg
-x86_64 R-rd-missing repne outsl +seg
-x86_64 R-rd-missing testb +seg
-x86_64 R-rd-missing testl +seg
-x86_64 R-rd-missing testw +seg
-x86_64 R-rd-missing xchgb +seg
-x86_64 R-rd-missing xchgl +seg
-x86_64 R-rd-missing xchgw +seg
+x86_64 R-rd-missing cmpsb +cs
+x86_64 R-rd-missing cmpsb +ds
+x86_64 R-rd-missing cmpsb +es
+x86_64 R-rd-missing cmpsb +ss
+x86_64 R-rd-missing cmpsl +cs
+x86_64 R-rd-missing cmpsl +ds
+x86_64 R-rd-missing cmpsl +es
+x86_64 R-rd-missing cmpsl +ss
+x86_64 R-rd-missing cmpsw +cs
+x86_64 R-rd-missing cmpsw +ds
+x86_64 R-rd-missing cmpsw +es
+x86_64 R-rd-missing cmpsw +ss
+x86_64 R-rd-missing imull +cs
+x86_64 R-rd-missing imull +ds
+x86_64 R-rd-missing imull +es
+x86_64 R-rd-missing imull +ss
+x86_64 R-rd-missing imulw +cs
+x86_64 R-rd-missing imulw +ds
+x86_64 R-rd-missing imulw +es
+x86_64 R-rd-missing imulw +ss
+x86_64 R-rd-missing lodsb +cs
+x86_64 R-rd-missing lodsb +ds
+x86_64 R-rd-missing lodsb +es
+x86_64 R-rd-missing lodsb +ss
+x86_64 R-rd-missing lodsl +cs
+x86_64 R-rd-missing lodsl +ds
+x86_64 R-rd-missing lodsl +es
+x86_64 R-rd-missing lodsl +ss
+x86_64 R-rd-missing lodsw +cs
+x86_64 R-rd-missing lodsw +ds
+x86_64 R-rd-missing lodsw +es
+x86_64 R-rd-missing lodsw +ss
+x86_64 R-rd-missing movabsb +cs
+x86_64 R-rd-missing movabsb +ds
+x86_64 R-rd-missing movabsb +es
+x86_64 R-rd-missing movabsb +ss
+x86_64 R-rd-missing movabsl +cs
+x86_64 R-rd-missing movabsl +ds
+x86_64 R-rd-missing movabsl +es
+x86_64 R-rd-missing movabsl +ss
+x86_64 R-rd-missing movabsw +cs
+x86_64 R-rd-missing movabsw +ds
+x86_64 R-rd-missing movabsw +es
+x86_64 R-rd-missing movabsw +ss
+x86_64 R-rd-missing movb +cs
+x86_64 R-rd-missing movb +ds
+x86_64 R-rd-missing movb +es
+x86_64 R-rd-missing movb +ss
+x86_64 R-rd-missing movl +cs
+x86_64 R-rd-missing movl +ds
+x86_64 R-rd-missing movl +es
+x86_64 R-rd-missing movl +ss
+x86_64 R-rd-missing movsb +cs
+x86_64 R-rd-missing movsb +ds
+x86_64 R-rd-missing movsb +es
+x86_64 R-rd-missing movsb +ss
+x86_64 R-rd-missing movsl +cs
+x86_64 R-rd-missing movsl +ds
+x86_64 R-rd-missing movsl +es
+x86_64 R-rd-missing movsl +ss
+x86_64 R-rd-missing movsw +cs
+x86_64 R-rd-missing movsw +ds
+x86_64 R-rd-missing movsw +es
+x86_64 R-rd-missing movsw +ss
+x86_64 R-rd-missing movw +cs
+x86_64 R-rd-missing movw +ds
+x86_64 R-rd-missing movw +es
+x86_64 R-rd-missing movw +ss
+x86_64 R-rd-missing outsb +cs
+x86_64 R-rd-missing outsb +ds
+x86_64 R-rd-missing outsb +es
+x86_64 R-rd-missing outsb +ss
+x86_64 R-rd-missing outsl +cs
+x86_64 R-rd-missing outsl +ds
+x86_64 R-rd-missing outsl +es
+x86_64 R-rd-missing outsl +ss
+x86_64 R-rd-missing outsw +cs
+x86_64 R-rd-missing outsw +ds
+x86_64 R-rd-missing outsw +es
+x86_64 R-rd-missing outsw +ss
+x86_64 R-rd-missing popq +cs
+x86_64 R-rd-missing popq +ds
+x86_64 R-rd-missing popq +es
+x86_64 R-rd-missing popq +ss
+x86_64 R-rd-missing popw +cs
+x86_64 R-rd-missing popw +ds
+x86_64 R-rd-missing popw +es
+x86_64 R-rd-missing popw +ss
+x86_64 R-rd-missing rep lodsb +cs
+x86_64 R-rd-missing rep lodsb +ds
+x86_64 R-rd-missing rep lodsb +es
+x86_64 R-rd-missing rep lodsb +ss
+x86_64 R-rd-missing rep lodsl +cs
+x86_64 R-rd-missing rep lodsl +ds
+x86_64 R-rd-missing rep lodsl +es
+x86_64 R-rd-missing rep lodsl +ss
+x86_64 R-rd-missing rep lodsw +cs
+x86_64 R-rd-missing rep lodsw +ds
+x86_64 R-rd-missing rep lodsw +es
+x86_64 R-rd-missing rep lodsw +ss
+x86_64 R-rd-missing rep movsb +cs
+x86_64 R-rd-missing rep movsb +ds
+x86_64 R-rd-missing rep movsb +es
+x86_64 R-rd-missing rep movsb +ss
+x86_64 R-rd-missing rep movsl +cs
+x86_64 R-rd-missing rep movsl +ds
+x86_64 R-rd-missing rep movsl +es
+x86_64 R-rd-missing rep movsl +ss
+x86_64 R-rd-missing rep movsw +cs
+x86_64 R-rd-missing rep movsw +ds
+x86_64 R-rd-missing rep movsw +es
+x86_64 R-rd-missing rep movsw +ss
+x86_64 R-rd-missing rep outsb +cs
+x86_64 R-rd-missing rep outsb +ds
+x86_64 R-rd-missing rep outsb +es
+x86_64 R-rd-missing rep outsb +ss
+x86_64 R-rd-missing rep outsl +cs
+x86_64 R-rd-missing rep outsl +ds
+x86_64 R-rd-missing rep outsl +es
+x86_64 R-rd-missing rep outsl +ss
+x86_64 R-rd-missing rep outsw +cs
+x86_64 R-rd-missing rep outsw +ds
+x86_64 R-rd-missing rep outsw +es
+x86_64 R-rd-missing rep outsw +ss
+x86_64 R-rd-missing repe cmpsb +cs
+x86_64 R-rd-missing repe cmpsb +ds
+x86_64 R-rd-missing repe cmpsb +es
+x86_64 R-rd-missing repe cmpsb +ss
+x86_64 R-rd-missing repe cmpsl +cs
+x86_64 R-rd-missing repe cmpsl +ds
+x86_64 R-rd-missing repe cmpsl +es
+x86_64 R-rd-missing repe cmpsl +ss
+x86_64 R-rd-missing repe cmpsw +cs
+x86_64 R-rd-missing repe cmpsw +ds
+x86_64 R-rd-missing repe cmpsw +es
+x86_64 R-rd-missing repe cmpsw +ss
+x86_64 R-rd-missing repne cmpsb +cs
+x86_64 R-rd-missing repne cmpsb +ds
+x86_64 R-rd-missing repne cmpsb +es
+x86_64 R-rd-missing repne cmpsb +ss
+x86_64 R-rd-missing repne cmpsl +cs
+x86_64 R-rd-missing repne cmpsl +ds
+x86_64 R-rd-missing repne cmpsl +es
+x86_64 R-rd-missing repne cmpsl +ss
+x86_64 R-rd-missing repne lodsb +cs
+x86_64 R-rd-missing repne lodsb +ds
+x86_64 R-rd-missing repne lodsb +es
+x86_64 R-rd-missing repne lodsb +ss
+x86_64 R-rd-missing repne lodsl +cs
+x86_64 R-rd-missing repne lodsl +ds
+x86_64 R-rd-missing repne lodsl +es
+x86_64 R-rd-missing repne lodsl +ss
+x86_64 R-rd-missing repne movsb +cs
+x86_64 R-rd-missing repne movsb +ds
+x86_64 R-rd-missing repne movsb +es
+x86_64 R-rd-missing repne movsb +ss
+x86_64 R-rd-missing repne movsl +cs
+x86_64 R-rd-missing repne movsl +ds
+x86_64 R-rd-missing repne movsl +es
+x86_64 R-rd-missing repne movsl +ss
+x86_64 R-rd-missing repne outsb +cs
+x86_64 R-rd-missing repne outsb +ds
+x86_64 R-rd-missing repne outsb +es
+x86_64 R-rd-missing repne outsb +ss
+x86_64 R-rd-missing repne outsl +cs
+x86_64 R-rd-missing repne outsl +ds
+x86_64 R-rd-missing repne outsl +es
+x86_64 R-rd-missing repne outsl +ss
+x86_64 R-rd-missing testb +cs
+x86_64 R-rd-missing testb +ds
+x86_64 R-rd-missing testb +es
+x86_64 R-rd-missing testb +ss
+x86_64 R-rd-missing testl +cs
+x86_64 R-rd-missing testl +ds
+x86_64 R-rd-missing testl +es
+x86_64 R-rd-missing testl +ss
+x86_64 R-rd-missing testw +cs
+x86_64 R-rd-missing testw +ds
+x86_64 R-rd-missing testw +es
+x86_64 R-rd-missing testw +ss
+x86_64 R-rd-missing xchgb +cs
+x86_64 R-rd-missing xchgb +ds
+x86_64 R-rd-missing xchgb +es
+x86_64 R-rd-missing xchgb +ss
+x86_64 R-rd-missing xchgl +cs
+x86_64 R-rd-missing xchgl +ds
+x86_64 R-rd-missing xchgl +es
+x86_64 R-rd-missing xchgl +ss
+x86_64 R-rd-missing xchgw +cs
+x86_64 R-rd-missing xchgw +ds
+x86_64 R-rd-missing xchgw +es
+x86_64 R-rd-missing xchgw +ss
 x86_64 R-wr-phantom repne cmpsw +r#
 x86_64 R-wr-phantom repne insw +r#
 x86_64 R-wr-phantom repne lodsw +r#
@@ -3765,396 +4029,824 @@ mipsel R-wr-phantom wrdsp +dsp
 # `3e` or `2e` and NOT ONE leads with `64` or `65` -- the live-base
 # overrides agree on both sides, so the benign family and the family that
 # would have been a real defect stay distinguishable.
-x86_64 R-rd-missing adcq +seg
-x86_64 R-rd-missing addps +seg
-x86_64 R-rd-missing addq +seg
-x86_64 R-rd-missing andnps +seg
-x86_64 R-rd-missing andps +seg
-x86_64 R-rd-missing andq +seg
-x86_64 R-rd-missing bsfl +seg
-x86_64 R-rd-missing bsfq +seg
-x86_64 R-rd-missing bsrl +seg
-x86_64 R-rd-missing bsrq +seg
-x86_64 R-rd-missing btcl +seg
-x86_64 R-rd-missing btcq +seg
-x86_64 R-rd-missing btl +seg
-x86_64 R-rd-missing btq +seg
-x86_64 R-rd-missing btrl +seg
-x86_64 R-rd-missing btrq +seg
-x86_64 R-rd-missing btsl +seg
-x86_64 R-rd-missing btsq +seg
-x86_64 R-rd-missing cldemote +seg
-x86_64 R-rd-missing clflush +seg
-x86_64 R-rd-missing cmovael +seg
-x86_64 R-rd-missing cmovaeq +seg
-x86_64 R-rd-missing cmoval +seg
-x86_64 R-rd-missing cmovaq +seg
-x86_64 R-rd-missing cmovbel +seg
-x86_64 R-rd-missing cmovbeq +seg
-x86_64 R-rd-missing cmovbl +seg
-x86_64 R-rd-missing cmovbq +seg
-x86_64 R-rd-missing cmovel +seg
-x86_64 R-rd-missing cmoveq +seg
-x86_64 R-rd-missing cmovgel +seg
-x86_64 R-rd-missing cmovgeq +seg
-x86_64 R-rd-missing cmovgl +seg
-x86_64 R-rd-missing cmovgq +seg
-x86_64 R-rd-missing cmovlel +seg
-x86_64 R-rd-missing cmovleq +seg
-x86_64 R-rd-missing cmovll +seg
-x86_64 R-rd-missing cmovlq +seg
-x86_64 R-rd-missing cmovnel +seg
-x86_64 R-rd-missing cmovneq +seg
-x86_64 R-rd-missing cmovnol +seg
-x86_64 R-rd-missing cmovnoq +seg
-x86_64 R-rd-missing cmovnpl +seg
-x86_64 R-rd-missing cmovnpq +seg
-x86_64 R-rd-missing cmovnsl +seg
-x86_64 R-rd-missing cmovnsq +seg
-x86_64 R-rd-missing cmovol +seg
-x86_64 R-rd-missing cmovoq +seg
-x86_64 R-rd-missing cmovpl +seg
-x86_64 R-rd-missing cmovpq +seg
-x86_64 R-rd-missing cmovsl +seg
-x86_64 R-rd-missing cmovsq +seg
-x86_64 R-rd-missing cmpeqps +seg
-x86_64 R-rd-missing cmpps +seg
-x86_64 R-rd-missing cmpq +seg
-x86_64 R-rd-missing cmpsq +seg
-x86_64 R-rd-missing cmpxchg16b +r#,seg
-x86_64 R-rd-missing cmpxchg8b +r#,seg
-x86_64 R-rd-missing cmpxchgb +seg
-x86_64 R-rd-missing cmpxchgl +seg
-x86_64 R-rd-missing cmpxchgq +seg
-x86_64 R-rd-missing comiss +seg
-x86_64 R-rd-missing cvtdq2ps +seg
-x86_64 R-rd-missing cvtpi2ps +seg
-x86_64 R-rd-missing cvtps2pd +seg
-x86_64 R-rd-missing cvtps2pi +seg
-x86_64 R-rd-missing cvttps2pi +seg
-x86_64 R-rd-missing decb +seg
-x86_64 R-rd-missing decl +seg
-x86_64 R-rd-missing decq +seg
-x86_64 R-rd-missing divb +seg
-x86_64 R-rd-missing divl +seg
-x86_64 R-rd-missing divps +seg
-x86_64 R-rd-missing divq +seg
-x86_64 R-rd-missing faddl +fpcw,seg
-x86_64 R-rd-missing fadds +fpcw,seg
-x86_64 R-rd-missing fbld +seg
-x86_64 R-rd-missing fbstp +fpcw,seg
-x86_64 R-rd-missing fdivl +fpcw,seg
-x86_64 R-rd-missing fdivrl +fpcw,seg
-x86_64 R-rd-missing fdivrs +fpcw,seg
-x86_64 R-rd-missing fdivs +fpcw,seg
-x86_64 R-rd-missing fiaddl +fpcw,seg
-x86_64 R-rd-missing fiadds +fpcw,seg
-x86_64 R-rd-missing fidivl +fpcw,seg
-x86_64 R-rd-missing fidivrl +fpcw,seg
-x86_64 R-rd-missing fidivrs +fpcw,seg
-x86_64 R-rd-missing fidivs +fpcw,seg
-x86_64 R-rd-missing fildl +fpcw,seg
-x86_64 R-rd-missing fildll +fpcw,seg
-x86_64 R-rd-missing filds +fpcw,seg
-x86_64 R-rd-missing fimull +fpcw,seg
-x86_64 R-rd-missing fimuls +fpcw,seg
-x86_64 R-rd-missing fistpl +fpcw,seg
-x86_64 R-rd-missing fistpll +fpcw,seg
-x86_64 R-rd-missing fistps +fpcw,seg
-x86_64 R-rd-missing fisttpl +fpcw,seg
-x86_64 R-rd-missing fisttpll +fpcw,seg
-x86_64 R-rd-missing fisttps +fpcw,seg
-x86_64 R-rd-missing fisubl +fpcw,seg
-x86_64 R-rd-missing fisubrl +fpcw,seg
-x86_64 R-rd-missing fisubrs +fpcw,seg
-x86_64 R-rd-missing fisubs +fpcw,seg
-x86_64 R-rd-missing fldcw +seg
-x86_64 R-rd-missing fldenv +seg
-x86_64 R-rd-missing fldl +fpcw,seg
-x86_64 R-rd-missing flds +fpcw,seg
-x86_64 R-rd-missing fldt +fpcw,seg
-x86_64 R-rd-missing fmull +fpcw,seg
-x86_64 R-rd-missing fmuls +fpcw,seg
-x86_64 R-rd-missing fnsave +fpcw,fpsw,seg
-x86_64 R-rd-missing fnstcw +fpcw,seg
-x86_64 R-rd-missing fnstenv +fpcw,fpsw,seg
-x86_64 R-rd-missing fnstsw +fpsw,seg
-x86_64 R-rd-missing frstor +seg
-x86_64 R-rd-missing fstpl +fpcw,seg
-x86_64 R-rd-missing fstps +fpcw,seg
-x86_64 R-rd-missing fstpt +fpcw,seg
-x86_64 R-rd-missing fsubl +fpcw,seg
-x86_64 R-rd-missing fsubrl +fpcw,seg
-x86_64 R-rd-missing fsubrs +fpcw,seg
-x86_64 R-rd-missing fsubs +fpcw,seg
-x86_64 R-rd-missing fxrstor +seg
-x86_64 R-rd-missing fxrstor64 +seg
-x86_64 R-rd-missing fxsave +fpcw,fpsw,seg
-x86_64 R-rd-missing fxsave64 +fpcw,fpsw,seg
-x86_64 R-rd-missing idivb +seg
-x86_64 R-rd-missing idivl +seg
-x86_64 R-rd-missing idivq +seg
-x86_64 R-rd-missing imulb +seg
-x86_64 R-rd-missing imulq +seg
-x86_64 R-rd-missing incb +seg
-x86_64 R-rd-missing incl +seg
-x86_64 R-rd-missing incq +seg
-x86_64 R-rd-missing invlpg +seg
-x86_64 R-rd-missing jmpq +seg
-x86_64 R-rd-missing larl +seg
-x86_64 R-rd-missing larq +seg
-x86_64 R-rd-missing lcalll +seg
-x86_64 R-rd-missing lcallq +seg
-x86_64 R-rd-missing ldmxcsr +seg
-x86_64 R-rd-missing leaq +seg
-x86_64 R-rd-missing lfsl +seg
-x86_64 R-rd-missing lfsq +seg
-x86_64 R-rd-missing lgdtq +seg
-x86_64 R-rd-missing lgs +seg
-x86_64 R-rd-missing lgsl +seg
-x86_64 R-rd-missing lidtq +seg
-x86_64 R-rd-missing ljmpl +seg
-x86_64 R-rd-missing ljmpq +seg
-x86_64 R-rd-missing lldtw +seg
-x86_64 R-rd-missing lmsww +seg
-x86_64 R-rd-missing lock adcb +seg
-x86_64 R-rd-missing lock addl +seg
-x86_64 R-rd-missing lock andb +seg
-x86_64 R-rd-missing lock andl +seg
-x86_64 R-rd-missing lock notb +seg
-x86_64 R-rd-missing lock notl +seg
-x86_64 R-rd-missing lock orb +seg
-x86_64 R-rd-missing lock orl +seg
-x86_64 R-rd-missing lock sbbb +seg
-x86_64 R-rd-missing lock sbbl +seg
-x86_64 R-rd-missing lock subb +seg
-x86_64 R-rd-missing lock subl +seg
-x86_64 R-rd-missing lock xchgb +seg
-x86_64 R-rd-missing lock xchgl +seg
-x86_64 R-rd-missing lock xorb +seg
-x86_64 R-rd-missing lock xorl +seg
-x86_64 R-rd-missing lodsq +seg
-x86_64 R-rd-missing lsll +seg
-x86_64 R-rd-missing lslq +seg
-x86_64 R-rd-missing lssl +seg
-x86_64 R-rd-missing lssq +seg
-x86_64 R-rd-missing ltrw +seg
-x86_64 R-rd-missing maxps +seg
-x86_64 R-rd-missing minps +seg
-x86_64 R-rd-missing movabsq +seg
-x86_64 R-rd-missing movaps +seg
-x86_64 R-rd-missing movbel +seg
-x86_64 R-rd-missing movbeq +seg
-x86_64 R-rd-missing movd +seg
-x86_64 R-rd-missing movdiri +seg
-x86_64 R-rd-missing movhps +seg
-x86_64 R-rd-missing movlps +seg
-x86_64 R-rd-missing movntil +seg
-x86_64 R-rd-missing movntiq +seg
-x86_64 R-rd-missing movntps +seg
-x86_64 R-rd-missing movntq +seg
-x86_64 R-rd-missing movq +seg
-x86_64 R-rd-missing movsbl +seg
-x86_64 R-rd-missing movsbq +seg
-x86_64 R-rd-missing movslq +seg
-x86_64 R-rd-missing movsq +seg
-x86_64 R-rd-missing movswl +seg
-x86_64 R-rd-missing movswq +seg
-x86_64 R-rd-missing movups +seg
-x86_64 R-rd-missing movzbl +seg
-x86_64 R-rd-missing movzbq +seg
-x86_64 R-rd-missing movzwl +seg
-x86_64 R-rd-missing movzwq +seg
-x86_64 R-rd-missing mulb +seg
-x86_64 R-rd-missing mull +seg
-x86_64 R-rd-missing mulps +seg
-x86_64 R-rd-missing mulq +seg
-x86_64 R-rd-missing negb +seg
-x86_64 R-rd-missing negl +seg
-x86_64 R-rd-missing negq +seg
-x86_64 R-rd-missing nopl +seg
-x86_64 R-rd-missing nopq +seg
-x86_64 R-rd-missing notq +seg
-x86_64 R-rd-missing notrack jmpq +seg
-x86_64 R-rd-missing notrack lcalll +seg
-x86_64 R-rd-missing notrack ljmpl +seg
-x86_64 R-rd-missing orps +seg
-x86_64 R-rd-missing orq +seg
-x86_64 R-rd-missing pabsb +seg
-x86_64 R-rd-missing pabsd +seg
-x86_64 R-rd-missing pabsw +seg
-x86_64 R-rd-missing packssdw +seg
-x86_64 R-rd-missing packsswb +seg
-x86_64 R-rd-missing packuswb +seg
-x86_64 R-rd-missing paddb +seg
-x86_64 R-rd-missing paddd +seg
-x86_64 R-rd-missing paddq +seg
-x86_64 R-rd-missing paddsb +seg
-x86_64 R-rd-missing paddsw +seg
-x86_64 R-rd-missing paddusb +seg
-x86_64 R-rd-missing paddusw +seg
-x86_64 R-rd-missing paddw +seg
-x86_64 R-rd-missing palignr +seg
-x86_64 R-rd-missing pand +seg
-x86_64 R-rd-missing pandn +seg
-x86_64 R-rd-missing pavgb +seg
-x86_64 R-rd-missing pavgw +seg
-x86_64 R-rd-missing pcmpeqb +seg
-x86_64 R-rd-missing pcmpeqd +seg
-x86_64 R-rd-missing pcmpeqw +seg
-x86_64 R-rd-missing pcmpgtb +seg
-x86_64 R-rd-missing pcmpgtd +seg
-x86_64 R-rd-missing pcmpgtw +seg
-x86_64 R-rd-missing phaddd +seg
-x86_64 R-rd-missing phaddsw +seg
-x86_64 R-rd-missing phaddw +seg
-x86_64 R-rd-missing phsubd +seg
-x86_64 R-rd-missing phsubsw +seg
-x86_64 R-rd-missing phsubw +seg
-x86_64 R-rd-missing pinsrw +seg
-x86_64 R-rd-missing pmaddubsw +seg
-x86_64 R-rd-missing pmaddwd +seg
-x86_64 R-rd-missing pmaxsw +seg
-x86_64 R-rd-missing pmaxub +seg
-x86_64 R-rd-missing pminsw +seg
-x86_64 R-rd-missing pminub +seg
-x86_64 R-rd-missing pmulhrsw +seg
-x86_64 R-rd-missing pmulhuw +seg
-x86_64 R-rd-missing pmulhw +seg
-x86_64 R-rd-missing pmullw +seg
-x86_64 R-rd-missing pmuludq +seg
-x86_64 R-rd-missing por +seg
-x86_64 R-rd-missing prefetch +seg
-x86_64 R-rd-missing prefetchnta +seg
-x86_64 R-rd-missing prefetcht0 +seg
-x86_64 R-rd-missing prefetcht1 +seg
-x86_64 R-rd-missing prefetcht2 +seg
-x86_64 R-rd-missing prefetchw +seg
-x86_64 R-rd-missing prefetchwt1 +seg
-x86_64 R-rd-missing psadbw +seg
-x86_64 R-rd-missing pshufb +seg
-x86_64 R-rd-missing pshufw +seg
-x86_64 R-rd-missing psignb +seg
-x86_64 R-rd-missing psignd +seg
-x86_64 R-rd-missing psignw +seg
-x86_64 R-rd-missing pslld +seg
-x86_64 R-rd-missing psllq +seg
-x86_64 R-rd-missing psllw +seg
-x86_64 R-rd-missing psrad +seg
-x86_64 R-rd-missing psraw +seg
-x86_64 R-rd-missing psrld +seg
-x86_64 R-rd-missing psrlq +seg
-x86_64 R-rd-missing psrlw +seg
-x86_64 R-rd-missing psubb +seg
-x86_64 R-rd-missing psubd +seg
-x86_64 R-rd-missing psubq +seg
-x86_64 R-rd-missing psubsb +seg
-x86_64 R-rd-missing psubsw +seg
-x86_64 R-rd-missing psubusb +seg
-x86_64 R-rd-missing psubusw +seg
-x86_64 R-rd-missing psubw +seg
-x86_64 R-rd-missing punpckhbw +seg
-x86_64 R-rd-missing punpckhdq +seg
-x86_64 R-rd-missing punpckhwd +seg
-x86_64 R-rd-missing punpcklbw +seg
-x86_64 R-rd-missing punpckldq +seg
-x86_64 R-rd-missing punpcklwd +seg
-x86_64 R-rd-missing pushq +seg
-x86_64 R-rd-missing pxor +seg
-x86_64 R-rd-missing rclq +flags,seg
-x86_64 R-rd-missing rcpps +seg
-x86_64 R-rd-missing rcrb +flags,seg
-x86_64 R-rd-missing rcrl +flags,seg
-x86_64 R-rd-missing rcrq +flags,seg
-x86_64 R-rd-missing rolb +seg
-x86_64 R-rd-missing roll +seg
-x86_64 R-rd-missing rolq +seg
-x86_64 R-rd-missing rorb +seg
-x86_64 R-rd-missing rorl +seg
-x86_64 R-rd-missing rorq +seg
-x86_64 R-rd-missing rsqrtps +seg
-x86_64 R-rd-missing sarb +seg
-x86_64 R-rd-missing sarl +seg
-x86_64 R-rd-missing sarq +seg
-x86_64 R-rd-missing sbbq +seg
-x86_64 R-rd-missing seta +seg
-x86_64 R-rd-missing setae +seg
-x86_64 R-rd-missing setb +seg
-x86_64 R-rd-missing setbe +seg
-x86_64 R-rd-missing sete +seg
-x86_64 R-rd-missing setg +seg
-x86_64 R-rd-missing setge +seg
-x86_64 R-rd-missing setl +seg
-x86_64 R-rd-missing setle +seg
-x86_64 R-rd-missing setne +seg
-x86_64 R-rd-missing setno +seg
-x86_64 R-rd-missing setnp +seg
-x86_64 R-rd-missing setns +seg
-x86_64 R-rd-missing seto +seg
-x86_64 R-rd-missing setp +seg
-x86_64 R-rd-missing sets +seg
-x86_64 R-rd-missing sgdtq +seg
-x86_64 R-rd-missing sha1msg1 +seg
-x86_64 R-rd-missing sha1msg2 +seg
-x86_64 R-rd-missing sha1nexte +seg
-x86_64 R-rd-missing sha1rnds4 +seg
-x86_64 R-rd-missing sha256msg1 +seg
-x86_64 R-rd-missing sha256msg2 +seg
-x86_64 R-rd-missing sha256rnds2 +seg
-x86_64 R-rd-missing shlb +seg
-x86_64 R-rd-missing shldl +seg
-x86_64 R-rd-missing shldq +seg
-x86_64 R-rd-missing shll +seg
-x86_64 R-rd-missing shlq +seg
-x86_64 R-rd-missing shrb +seg
-x86_64 R-rd-missing shrdl +seg
-x86_64 R-rd-missing shrdq +seg
-x86_64 R-rd-missing shrl +seg
-x86_64 R-rd-missing shrq +seg
-x86_64 R-rd-missing shufps +seg
-x86_64 R-rd-missing sidtq +seg
-x86_64 R-rd-missing smsww +seg
-x86_64 R-rd-missing sqrtps +seg
-x86_64 R-rd-missing stmxcsr +seg
-x86_64 R-rd-missing strw +seg
-x86_64 R-rd-missing subps +seg
-x86_64 R-rd-missing subq +seg
-x86_64 R-rd-missing testq +seg
-x86_64 R-rd-missing ucomiss +seg
-x86_64 R-rd-missing unpckhps +seg
-x86_64 R-rd-missing unpcklps +seg
-x86_64 R-rd-missing verr +seg
-x86_64 R-rd-missing verw +seg
-x86_64 R-rd-missing vmovsd +seg
-x86_64 R-rd-missing vmovss +seg
-x86_64 R-rd-missing vmovupd +seg
-x86_64 R-rd-missing vmovups +seg
-x86_64 R-rd-missing vmptrld +seg
-x86_64 R-rd-missing vmptrst +seg
-x86_64 R-rd-missing vmreadq +seg
-x86_64 R-rd-missing vmwriteq +seg
-x86_64 R-rd-missing vpinsrd +seg
-x86_64 R-rd-missing vpshufb +seg
-x86_64 R-rd-missing wrssd +seg
-x86_64 R-rd-missing wrssq +seg
-x86_64 R-rd-missing xaddb +seg
-x86_64 R-rd-missing xaddl +seg
-x86_64 R-rd-missing xaddq +seg
-x86_64 R-rd-missing xchgq +seg
-x86_64 R-rd-missing xorps +seg
-x86_64 R-rd-missing xorq +seg
-x86_64 R-rd-missing xrstor +seg
-x86_64 R-rd-missing xrstor64 +seg
-x86_64 R-rd-missing xrstors +seg
-x86_64 R-rd-missing xrstors64 +seg
-x86_64 R-rd-missing xsave +seg
-x86_64 R-rd-missing xsave64 +seg
-x86_64 R-rd-missing xsavec +seg
-x86_64 R-rd-missing xsavec64 +seg
-x86_64 R-rd-missing xsaveopt +seg
-x86_64 R-rd-missing xsaveopt64 +seg
-x86_64 R-rd-missing xsaves +seg
-x86_64 R-rd-missing xsaves64 +seg
+#
+# GRANULARITY.  These rows name the SEGMENT REGISTER, not the bank.  They
+# used to read `+seg`, because the signature key elided every bank
+# index; the six segment registers are architecturally distinct registers, so that
+# elision handed back exactly the conflation the split IDs exist to
+# prevent -- one row justified for an inert override licensed all six, and
+# a defect that swapped one segment for another keyed identically to the
+# correct mapping.  The index is now elided only for an INDEXED FILE
+# (generic_reg_is_indexed_file(), champsim_tracer_generic_ids.h), where the
+# members are interchangeable and one defect would otherwise mint 32 rows.
+#
+# What the finer key states, and the sweep now enforces line by line: every
+# `R-rd-missing` row below is `+cs`, `+ds`, `+es` or `+ss` -- the four whose base is zero in 64-bit mode -- and NOT
+# ONE is `+fs` or `+gs`.  The live-base overrides agree on
+# both sides.  Under `+seg` that discriminator could only be checked
+# by hand, off to the side of the gate; it is now the allowlist itself.
+x86_64 R-rd-missing adcq +cs
+x86_64 R-rd-missing adcq +ds
+x86_64 R-rd-missing addps +cs
+x86_64 R-rd-missing addps +ds
+x86_64 R-rd-missing addq +cs
+x86_64 R-rd-missing addq +ds
+x86_64 R-rd-missing andnps +cs
+x86_64 R-rd-missing andnps +ds
+x86_64 R-rd-missing andps +cs
+x86_64 R-rd-missing andps +ds
+x86_64 R-rd-missing andq +cs
+x86_64 R-rd-missing andq +ds
+x86_64 R-rd-missing bsfl +cs
+x86_64 R-rd-missing bsfl +ds
+x86_64 R-rd-missing bsfq +cs
+x86_64 R-rd-missing bsfq +ds
+x86_64 R-rd-missing bsrl +cs
+x86_64 R-rd-missing bsrl +ds
+x86_64 R-rd-missing bsrq +cs
+x86_64 R-rd-missing bsrq +ds
+x86_64 R-rd-missing btcl +cs
+x86_64 R-rd-missing btcl +ds
+x86_64 R-rd-missing btcq +cs
+x86_64 R-rd-missing btcq +ds
+x86_64 R-rd-missing btl +cs
+x86_64 R-rd-missing btl +ds
+x86_64 R-rd-missing btq +cs
+x86_64 R-rd-missing btq +ds
+x86_64 R-rd-missing btrl +cs
+x86_64 R-rd-missing btrl +ds
+x86_64 R-rd-missing btrq +cs
+x86_64 R-rd-missing btrq +ds
+x86_64 R-rd-missing btsl +cs
+x86_64 R-rd-missing btsl +ds
+x86_64 R-rd-missing btsq +cs
+x86_64 R-rd-missing btsq +ds
+x86_64 R-rd-missing cldemote +cs
+x86_64 R-rd-missing cldemote +ds
+x86_64 R-rd-missing clflush +cs
+x86_64 R-rd-missing clflush +ds
+x86_64 R-rd-missing cmovael +cs
+x86_64 R-rd-missing cmovael +ds
+x86_64 R-rd-missing cmovaeq +cs
+x86_64 R-rd-missing cmovaeq +ds
+x86_64 R-rd-missing cmoval +cs
+x86_64 R-rd-missing cmoval +ds
+x86_64 R-rd-missing cmovaq +cs
+x86_64 R-rd-missing cmovaq +ds
+x86_64 R-rd-missing cmovbel +cs
+x86_64 R-rd-missing cmovbel +ds
+x86_64 R-rd-missing cmovbeq +cs
+x86_64 R-rd-missing cmovbeq +ds
+x86_64 R-rd-missing cmovbl +cs
+x86_64 R-rd-missing cmovbl +ds
+x86_64 R-rd-missing cmovbq +cs
+x86_64 R-rd-missing cmovbq +ds
+x86_64 R-rd-missing cmovel +cs
+x86_64 R-rd-missing cmovel +ds
+x86_64 R-rd-missing cmoveq +cs
+x86_64 R-rd-missing cmoveq +ds
+x86_64 R-rd-missing cmovgel +cs
+x86_64 R-rd-missing cmovgel +ds
+x86_64 R-rd-missing cmovgeq +cs
+x86_64 R-rd-missing cmovgeq +ds
+x86_64 R-rd-missing cmovgl +cs
+x86_64 R-rd-missing cmovgl +ds
+x86_64 R-rd-missing cmovgq +cs
+x86_64 R-rd-missing cmovgq +ds
+x86_64 R-rd-missing cmovlel +cs
+x86_64 R-rd-missing cmovlel +ds
+x86_64 R-rd-missing cmovleq +cs
+x86_64 R-rd-missing cmovleq +ds
+x86_64 R-rd-missing cmovll +cs
+x86_64 R-rd-missing cmovll +ds
+x86_64 R-rd-missing cmovlq +cs
+x86_64 R-rd-missing cmovlq +ds
+x86_64 R-rd-missing cmovnel +cs
+x86_64 R-rd-missing cmovnel +ds
+x86_64 R-rd-missing cmovneq +cs
+x86_64 R-rd-missing cmovneq +ds
+x86_64 R-rd-missing cmovnol +cs
+x86_64 R-rd-missing cmovnol +ds
+x86_64 R-rd-missing cmovnoq +cs
+x86_64 R-rd-missing cmovnoq +ds
+x86_64 R-rd-missing cmovnpl +cs
+x86_64 R-rd-missing cmovnpl +ds
+x86_64 R-rd-missing cmovnpq +cs
+x86_64 R-rd-missing cmovnpq +ds
+x86_64 R-rd-missing cmovnsl +cs
+x86_64 R-rd-missing cmovnsl +ds
+x86_64 R-rd-missing cmovnsq +cs
+x86_64 R-rd-missing cmovnsq +ds
+x86_64 R-rd-missing cmovol +cs
+x86_64 R-rd-missing cmovol +ds
+x86_64 R-rd-missing cmovoq +cs
+x86_64 R-rd-missing cmovoq +ds
+x86_64 R-rd-missing cmovpl +cs
+x86_64 R-rd-missing cmovpl +ds
+x86_64 R-rd-missing cmovpq +cs
+x86_64 R-rd-missing cmovpq +ds
+x86_64 R-rd-missing cmovsl +cs
+x86_64 R-rd-missing cmovsl +ds
+x86_64 R-rd-missing cmovsq +cs
+x86_64 R-rd-missing cmovsq +ds
+x86_64 R-rd-missing cmpeqps +cs
+x86_64 R-rd-missing cmpeqps +ds
+x86_64 R-rd-missing cmpps +cs
+x86_64 R-rd-missing cmpps +ds
+x86_64 R-rd-missing cmpq +cs
+x86_64 R-rd-missing cmpq +ds
+x86_64 R-rd-missing cmpsq +cs
+x86_64 R-rd-missing cmpsq +ds
+x86_64 R-rd-missing cmpxchg16b +cs,r#
+x86_64 R-rd-missing cmpxchg16b +ds,r#
+x86_64 R-rd-missing cmpxchg8b +cs,r#
+x86_64 R-rd-missing cmpxchg8b +ds,r#
+x86_64 R-rd-missing cmpxchgb +cs
+x86_64 R-rd-missing cmpxchgb +ds
+x86_64 R-rd-missing cmpxchgl +cs
+x86_64 R-rd-missing cmpxchgl +ds
+x86_64 R-rd-missing cmpxchgq +cs
+x86_64 R-rd-missing cmpxchgq +ds
+x86_64 R-rd-missing comiss +cs
+x86_64 R-rd-missing comiss +ds
+x86_64 R-rd-missing cvtdq2ps +cs
+x86_64 R-rd-missing cvtdq2ps +ds
+x86_64 R-rd-missing cvtpi2ps +cs
+x86_64 R-rd-missing cvtpi2ps +ds
+x86_64 R-rd-missing cvtps2pd +cs
+x86_64 R-rd-missing cvtps2pd +ds
+x86_64 R-rd-missing cvtps2pi +cs
+x86_64 R-rd-missing cvtps2pi +ds
+x86_64 R-rd-missing cvttps2pi +cs
+x86_64 R-rd-missing cvttps2pi +ds
+x86_64 R-rd-missing decb +cs
+x86_64 R-rd-missing decb +ds
+x86_64 R-rd-missing decl +cs
+x86_64 R-rd-missing decl +ds
+x86_64 R-rd-missing decq +cs
+x86_64 R-rd-missing decq +ds
+x86_64 R-rd-missing divb +cs
+x86_64 R-rd-missing divb +ds
+x86_64 R-rd-missing divl +cs
+x86_64 R-rd-missing divl +ds
+x86_64 R-rd-missing divps +cs
+x86_64 R-rd-missing divps +ds
+x86_64 R-rd-missing divq +cs
+x86_64 R-rd-missing divq +ds
+x86_64 R-rd-missing faddl +cs,fpcw
+x86_64 R-rd-missing faddl +ds,fpcw
+x86_64 R-rd-missing fadds +cs,fpcw
+x86_64 R-rd-missing fadds +ds,fpcw
+x86_64 R-rd-missing fbld +cs
+x86_64 R-rd-missing fbld +ds
+x86_64 R-rd-missing fbstp +cs,fpcw
+x86_64 R-rd-missing fbstp +ds,fpcw
+x86_64 R-rd-missing fdivl +cs,fpcw
+x86_64 R-rd-missing fdivl +ds,fpcw
+x86_64 R-rd-missing fdivrl +cs,fpcw
+x86_64 R-rd-missing fdivrl +ds,fpcw
+x86_64 R-rd-missing fdivrs +cs,fpcw
+x86_64 R-rd-missing fdivrs +ds,fpcw
+x86_64 R-rd-missing fdivs +cs,fpcw
+x86_64 R-rd-missing fdivs +ds,fpcw
+x86_64 R-rd-missing fiaddl +cs,fpcw
+x86_64 R-rd-missing fiaddl +ds,fpcw
+x86_64 R-rd-missing fiadds +cs,fpcw
+x86_64 R-rd-missing fiadds +ds,fpcw
+x86_64 R-rd-missing fidivl +cs,fpcw
+x86_64 R-rd-missing fidivl +ds,fpcw
+x86_64 R-rd-missing fidivrl +cs,fpcw
+x86_64 R-rd-missing fidivrl +ds,fpcw
+x86_64 R-rd-missing fidivrs +cs,fpcw
+x86_64 R-rd-missing fidivrs +ds,fpcw
+x86_64 R-rd-missing fidivs +cs,fpcw
+x86_64 R-rd-missing fidivs +ds,fpcw
+x86_64 R-rd-missing fildl +cs,fpcw
+x86_64 R-rd-missing fildl +ds,fpcw
+x86_64 R-rd-missing fildll +cs,fpcw
+x86_64 R-rd-missing fildll +ds,fpcw
+x86_64 R-rd-missing filds +cs,fpcw
+x86_64 R-rd-missing filds +ds,fpcw
+x86_64 R-rd-missing fimull +cs,fpcw
+x86_64 R-rd-missing fimull +ds,fpcw
+x86_64 R-rd-missing fimuls +cs,fpcw
+x86_64 R-rd-missing fimuls +ds,fpcw
+x86_64 R-rd-missing fistpl +cs,fpcw
+x86_64 R-rd-missing fistpl +ds,fpcw
+x86_64 R-rd-missing fistpll +cs,fpcw
+x86_64 R-rd-missing fistpll +ds,fpcw
+x86_64 R-rd-missing fistps +cs,fpcw
+x86_64 R-rd-missing fistps +ds,fpcw
+x86_64 R-rd-missing fisttpl +cs,fpcw
+x86_64 R-rd-missing fisttpl +ds,fpcw
+x86_64 R-rd-missing fisttpll +cs,fpcw
+x86_64 R-rd-missing fisttpll +ds,fpcw
+x86_64 R-rd-missing fisttps +cs,fpcw
+x86_64 R-rd-missing fisttps +ds,fpcw
+x86_64 R-rd-missing fisubl +cs,fpcw
+x86_64 R-rd-missing fisubl +ds,fpcw
+x86_64 R-rd-missing fisubrl +cs,fpcw
+x86_64 R-rd-missing fisubrl +ds,fpcw
+x86_64 R-rd-missing fisubrs +cs,fpcw
+x86_64 R-rd-missing fisubrs +ds,fpcw
+x86_64 R-rd-missing fisubs +cs,fpcw
+x86_64 R-rd-missing fisubs +ds,fpcw
+x86_64 R-rd-missing fldcw +cs
+x86_64 R-rd-missing fldcw +ds
+x86_64 R-rd-missing fldenv +cs
+x86_64 R-rd-missing fldenv +ds
+x86_64 R-rd-missing fldl +cs,fpcw
+x86_64 R-rd-missing fldl +ds,fpcw
+x86_64 R-rd-missing flds +cs,fpcw
+x86_64 R-rd-missing flds +ds,fpcw
+x86_64 R-rd-missing fldt +cs,fpcw
+x86_64 R-rd-missing fldt +ds,fpcw
+x86_64 R-rd-missing fmull +cs,fpcw
+x86_64 R-rd-missing fmull +ds,fpcw
+x86_64 R-rd-missing fmuls +cs,fpcw
+x86_64 R-rd-missing fmuls +ds,fpcw
+x86_64 R-rd-missing fnsave +cs,fpcw,fpsw
+x86_64 R-rd-missing fnsave +ds,fpcw,fpsw
+x86_64 R-rd-missing fnstcw +cs,fpcw
+x86_64 R-rd-missing fnstcw +ds,fpcw
+x86_64 R-rd-missing fnstenv +cs,fpcw,fpsw
+x86_64 R-rd-missing fnstenv +ds,fpcw,fpsw
+x86_64 R-rd-missing fnstsw +cs,fpsw
+x86_64 R-rd-missing fnstsw +ds,fpsw
+x86_64 R-rd-missing frstor +cs
+x86_64 R-rd-missing frstor +ds
+x86_64 R-rd-missing fstpl +cs,fpcw
+x86_64 R-rd-missing fstpl +ds,fpcw
+x86_64 R-rd-missing fstps +cs,fpcw
+x86_64 R-rd-missing fstps +ds,fpcw
+x86_64 R-rd-missing fstpt +cs,fpcw
+x86_64 R-rd-missing fstpt +ds,fpcw
+x86_64 R-rd-missing fsubl +cs,fpcw
+x86_64 R-rd-missing fsubl +ds,fpcw
+x86_64 R-rd-missing fsubrl +cs,fpcw
+x86_64 R-rd-missing fsubrl +ds,fpcw
+x86_64 R-rd-missing fsubrs +cs,fpcw
+x86_64 R-rd-missing fsubrs +ds,fpcw
+x86_64 R-rd-missing fsubs +cs,fpcw
+x86_64 R-rd-missing fsubs +ds,fpcw
+x86_64 R-rd-missing fxrstor +cs
+x86_64 R-rd-missing fxrstor +ds
+x86_64 R-rd-missing fxrstor64 +cs
+x86_64 R-rd-missing fxrstor64 +ds
+x86_64 R-rd-missing fxsave +cs,fpcw,fpsw
+x86_64 R-rd-missing fxsave +ds,fpcw,fpsw
+x86_64 R-rd-missing fxsave64 +cs,fpcw,fpsw
+x86_64 R-rd-missing fxsave64 +ds,fpcw,fpsw
+x86_64 R-rd-missing idivb +cs
+x86_64 R-rd-missing idivb +ds
+x86_64 R-rd-missing idivl +cs
+x86_64 R-rd-missing idivl +ds
+x86_64 R-rd-missing idivq +cs
+x86_64 R-rd-missing idivq +ds
+x86_64 R-rd-missing imulb +cs
+x86_64 R-rd-missing imulb +ds
+x86_64 R-rd-missing imulq +cs
+x86_64 R-rd-missing imulq +ds
+x86_64 R-rd-missing imulq +es
+x86_64 R-rd-missing imulq +ss
+x86_64 R-rd-missing incb +cs
+x86_64 R-rd-missing incb +ds
+x86_64 R-rd-missing incl +cs
+x86_64 R-rd-missing incl +ds
+x86_64 R-rd-missing incq +cs
+x86_64 R-rd-missing incq +ds
+x86_64 R-rd-missing invlpg +cs
+x86_64 R-rd-missing invlpg +ds
+x86_64 R-rd-missing jmpq +cs
+x86_64 R-rd-missing larl +cs
+x86_64 R-rd-missing larl +ds
+x86_64 R-rd-missing larq +cs
+x86_64 R-rd-missing larq +ds
+x86_64 R-rd-missing lcalll +cs
+x86_64 R-rd-missing lcallq +cs
+x86_64 R-rd-missing lcallq +ds
+x86_64 R-rd-missing ldmxcsr +cs
+x86_64 R-rd-missing ldmxcsr +ds
+x86_64 R-rd-missing leaq +cs
+x86_64 R-rd-missing leaq +ds
+x86_64 R-rd-missing lfsl +cs
+x86_64 R-rd-missing lfsl +ds
+x86_64 R-rd-missing lfsq +cs
+x86_64 R-rd-missing lfsq +ds
+x86_64 R-rd-missing lgdtq +cs
+x86_64 R-rd-missing lgdtq +ds
+x86_64 R-rd-missing lgs +cs
+x86_64 R-rd-missing lgs +ds
+x86_64 R-rd-missing lgsl +cs
+x86_64 R-rd-missing lgsl +ds
+x86_64 R-rd-missing lidtq +cs
+x86_64 R-rd-missing lidtq +ds
+x86_64 R-rd-missing ljmpl +cs
+x86_64 R-rd-missing ljmpq +cs
+x86_64 R-rd-missing ljmpq +ds
+x86_64 R-rd-missing lldtw +cs
+x86_64 R-rd-missing lldtw +ds
+x86_64 R-rd-missing lmsww +cs
+x86_64 R-rd-missing lmsww +ds
+x86_64 R-rd-missing lock adcb +cs
+x86_64 R-rd-missing lock adcb +ds
+x86_64 R-rd-missing lock addl +cs
+x86_64 R-rd-missing lock addl +ds
+x86_64 R-rd-missing lock andb +cs
+x86_64 R-rd-missing lock andb +ds
+x86_64 R-rd-missing lock andl +cs
+x86_64 R-rd-missing lock andl +ds
+x86_64 R-rd-missing lock notb +cs
+x86_64 R-rd-missing lock notb +ds
+x86_64 R-rd-missing lock notl +cs
+x86_64 R-rd-missing lock notl +ds
+x86_64 R-rd-missing lock orb +cs
+x86_64 R-rd-missing lock orb +ds
+x86_64 R-rd-missing lock orl +cs
+x86_64 R-rd-missing lock orl +ds
+x86_64 R-rd-missing lock sbbb +cs
+x86_64 R-rd-missing lock sbbb +ds
+x86_64 R-rd-missing lock sbbl +cs
+x86_64 R-rd-missing lock sbbl +ds
+x86_64 R-rd-missing lock subb +cs
+x86_64 R-rd-missing lock subb +ds
+x86_64 R-rd-missing lock subl +cs
+x86_64 R-rd-missing lock subl +ds
+x86_64 R-rd-missing lock xchgb +cs
+x86_64 R-rd-missing lock xchgb +ds
+x86_64 R-rd-missing lock xchgl +cs
+x86_64 R-rd-missing lock xchgl +ds
+x86_64 R-rd-missing lock xorb +cs
+x86_64 R-rd-missing lock xorb +ds
+x86_64 R-rd-missing lock xorl +cs
+x86_64 R-rd-missing lock xorl +ds
+x86_64 R-rd-missing lodsq +cs
+x86_64 R-rd-missing lodsq +ds
+x86_64 R-rd-missing lsll +cs
+x86_64 R-rd-missing lsll +ds
+x86_64 R-rd-missing lslq +cs
+x86_64 R-rd-missing lslq +ds
+x86_64 R-rd-missing lssl +cs
+x86_64 R-rd-missing lssl +ds
+x86_64 R-rd-missing lssq +cs
+x86_64 R-rd-missing lssq +ds
+x86_64 R-rd-missing ltrw +cs
+x86_64 R-rd-missing ltrw +ds
+x86_64 R-rd-missing maxps +cs
+x86_64 R-rd-missing maxps +ds
+x86_64 R-rd-missing minps +cs
+x86_64 R-rd-missing minps +ds
+x86_64 R-rd-missing movabsq +cs
+x86_64 R-rd-missing movabsq +ds
+x86_64 R-rd-missing movaps +cs
+x86_64 R-rd-missing movaps +ds
+x86_64 R-rd-missing movbel +cs
+x86_64 R-rd-missing movbel +ds
+x86_64 R-rd-missing movbeq +cs
+x86_64 R-rd-missing movbeq +ds
+x86_64 R-rd-missing movd +cs
+x86_64 R-rd-missing movd +ds
+x86_64 R-rd-missing movdiri +cs
+x86_64 R-rd-missing movdiri +ds
+x86_64 R-rd-missing movhps +cs
+x86_64 R-rd-missing movhps +ds
+x86_64 R-rd-missing movlps +cs
+x86_64 R-rd-missing movlps +ds
+x86_64 R-rd-missing movntil +cs
+x86_64 R-rd-missing movntil +ds
+x86_64 R-rd-missing movntiq +cs
+x86_64 R-rd-missing movntiq +ds
+x86_64 R-rd-missing movntps +cs
+x86_64 R-rd-missing movntps +ds
+x86_64 R-rd-missing movntq +cs
+x86_64 R-rd-missing movntq +ds
+x86_64 R-rd-missing movq +cs
+x86_64 R-rd-missing movq +ds
+x86_64 R-rd-missing movsbl +cs
+x86_64 R-rd-missing movsbl +ds
+x86_64 R-rd-missing movsbq +cs
+x86_64 R-rd-missing movsbq +ds
+x86_64 R-rd-missing movslq +cs
+x86_64 R-rd-missing movslq +ds
+x86_64 R-rd-missing movslq +es
+x86_64 R-rd-missing movslq +ss
+x86_64 R-rd-missing movsq +cs
+x86_64 R-rd-missing movsq +ds
+x86_64 R-rd-missing movswl +cs
+x86_64 R-rd-missing movswl +ds
+x86_64 R-rd-missing movswq +cs
+x86_64 R-rd-missing movswq +ds
+x86_64 R-rd-missing movups +cs
+x86_64 R-rd-missing movups +ds
+x86_64 R-rd-missing movzbl +cs
+x86_64 R-rd-missing movzbl +ds
+x86_64 R-rd-missing movzbq +cs
+x86_64 R-rd-missing movzbq +ds
+x86_64 R-rd-missing movzwl +cs
+x86_64 R-rd-missing movzwl +ds
+x86_64 R-rd-missing movzwq +cs
+x86_64 R-rd-missing movzwq +ds
+x86_64 R-rd-missing mulb +cs
+x86_64 R-rd-missing mulb +ds
+x86_64 R-rd-missing mull +cs
+x86_64 R-rd-missing mull +ds
+x86_64 R-rd-missing mulps +cs
+x86_64 R-rd-missing mulps +ds
+x86_64 R-rd-missing mulq +cs
+x86_64 R-rd-missing mulq +ds
+x86_64 R-rd-missing negb +cs
+x86_64 R-rd-missing negb +ds
+x86_64 R-rd-missing negl +cs
+x86_64 R-rd-missing negl +ds
+x86_64 R-rd-missing negq +cs
+x86_64 R-rd-missing negq +ds
+x86_64 R-rd-missing nopl +cs
+x86_64 R-rd-missing nopl +ds
+x86_64 R-rd-missing nopq +cs
+x86_64 R-rd-missing nopq +ds
+x86_64 R-rd-missing notq +cs
+x86_64 R-rd-missing notq +ds
+x86_64 R-rd-missing notrack jmpq +ds
+x86_64 R-rd-missing notrack lcalll +ds
+x86_64 R-rd-missing notrack ljmpl +ds
+x86_64 R-rd-missing orps +cs
+x86_64 R-rd-missing orps +ds
+x86_64 R-rd-missing orq +cs
+x86_64 R-rd-missing orq +ds
+x86_64 R-rd-missing pabsb +cs
+x86_64 R-rd-missing pabsb +ds
+x86_64 R-rd-missing pabsd +cs
+x86_64 R-rd-missing pabsd +ds
+x86_64 R-rd-missing pabsw +cs
+x86_64 R-rd-missing pabsw +ds
+x86_64 R-rd-missing packssdw +cs
+x86_64 R-rd-missing packssdw +ds
+x86_64 R-rd-missing packsswb +cs
+x86_64 R-rd-missing packsswb +ds
+x86_64 R-rd-missing packuswb +cs
+x86_64 R-rd-missing packuswb +ds
+x86_64 R-rd-missing paddb +cs
+x86_64 R-rd-missing paddb +ds
+x86_64 R-rd-missing paddd +cs
+x86_64 R-rd-missing paddd +ds
+x86_64 R-rd-missing paddq +cs
+x86_64 R-rd-missing paddq +ds
+x86_64 R-rd-missing paddsb +cs
+x86_64 R-rd-missing paddsb +ds
+x86_64 R-rd-missing paddsw +cs
+x86_64 R-rd-missing paddsw +ds
+x86_64 R-rd-missing paddusb +cs
+x86_64 R-rd-missing paddusb +ds
+x86_64 R-rd-missing paddusw +cs
+x86_64 R-rd-missing paddusw +ds
+x86_64 R-rd-missing paddw +cs
+x86_64 R-rd-missing paddw +ds
+x86_64 R-rd-missing palignr +cs
+x86_64 R-rd-missing palignr +ds
+x86_64 R-rd-missing pand +cs
+x86_64 R-rd-missing pand +ds
+x86_64 R-rd-missing pandn +cs
+x86_64 R-rd-missing pandn +ds
+x86_64 R-rd-missing pavgb +cs
+x86_64 R-rd-missing pavgb +ds
+x86_64 R-rd-missing pavgw +cs
+x86_64 R-rd-missing pavgw +ds
+x86_64 R-rd-missing pcmpeqb +cs
+x86_64 R-rd-missing pcmpeqb +ds
+x86_64 R-rd-missing pcmpeqd +cs
+x86_64 R-rd-missing pcmpeqd +ds
+x86_64 R-rd-missing pcmpeqw +cs
+x86_64 R-rd-missing pcmpeqw +ds
+x86_64 R-rd-missing pcmpgtb +cs
+x86_64 R-rd-missing pcmpgtb +ds
+x86_64 R-rd-missing pcmpgtd +cs
+x86_64 R-rd-missing pcmpgtd +ds
+x86_64 R-rd-missing pcmpgtw +cs
+x86_64 R-rd-missing pcmpgtw +ds
+x86_64 R-rd-missing phaddd +cs
+x86_64 R-rd-missing phaddd +ds
+x86_64 R-rd-missing phaddsw +cs
+x86_64 R-rd-missing phaddsw +ds
+x86_64 R-rd-missing phaddw +cs
+x86_64 R-rd-missing phaddw +ds
+x86_64 R-rd-missing phsubd +cs
+x86_64 R-rd-missing phsubd +ds
+x86_64 R-rd-missing phsubsw +cs
+x86_64 R-rd-missing phsubsw +ds
+x86_64 R-rd-missing phsubw +cs
+x86_64 R-rd-missing phsubw +ds
+x86_64 R-rd-missing pinsrw +cs
+x86_64 R-rd-missing pinsrw +ds
+x86_64 R-rd-missing pmaddubsw +cs
+x86_64 R-rd-missing pmaddubsw +ds
+x86_64 R-rd-missing pmaddwd +cs
+x86_64 R-rd-missing pmaddwd +ds
+x86_64 R-rd-missing pmaxsw +cs
+x86_64 R-rd-missing pmaxsw +ds
+x86_64 R-rd-missing pmaxub +cs
+x86_64 R-rd-missing pmaxub +ds
+x86_64 R-rd-missing pminsw +cs
+x86_64 R-rd-missing pminsw +ds
+x86_64 R-rd-missing pminub +cs
+x86_64 R-rd-missing pminub +ds
+x86_64 R-rd-missing pmulhrsw +cs
+x86_64 R-rd-missing pmulhrsw +ds
+x86_64 R-rd-missing pmulhuw +cs
+x86_64 R-rd-missing pmulhuw +ds
+x86_64 R-rd-missing pmulhw +cs
+x86_64 R-rd-missing pmulhw +ds
+x86_64 R-rd-missing pmullw +cs
+x86_64 R-rd-missing pmullw +ds
+x86_64 R-rd-missing pmuludq +cs
+x86_64 R-rd-missing pmuludq +ds
+x86_64 R-rd-missing por +cs
+x86_64 R-rd-missing por +ds
+x86_64 R-rd-missing prefetch +cs
+x86_64 R-rd-missing prefetch +ds
+x86_64 R-rd-missing prefetchnta +cs
+x86_64 R-rd-missing prefetchnta +ds
+x86_64 R-rd-missing prefetcht0 +cs
+x86_64 R-rd-missing prefetcht0 +ds
+x86_64 R-rd-missing prefetcht1 +cs
+x86_64 R-rd-missing prefetcht1 +ds
+x86_64 R-rd-missing prefetcht2 +cs
+x86_64 R-rd-missing prefetcht2 +ds
+x86_64 R-rd-missing prefetchw +cs
+x86_64 R-rd-missing prefetchw +ds
+x86_64 R-rd-missing prefetchwt1 +cs
+x86_64 R-rd-missing prefetchwt1 +ds
+x86_64 R-rd-missing psadbw +cs
+x86_64 R-rd-missing psadbw +ds
+x86_64 R-rd-missing pshufb +cs
+x86_64 R-rd-missing pshufb +ds
+x86_64 R-rd-missing pshufw +cs
+x86_64 R-rd-missing pshufw +ds
+x86_64 R-rd-missing psignb +cs
+x86_64 R-rd-missing psignb +ds
+x86_64 R-rd-missing psignd +cs
+x86_64 R-rd-missing psignd +ds
+x86_64 R-rd-missing psignw +cs
+x86_64 R-rd-missing psignw +ds
+x86_64 R-rd-missing pslld +cs
+x86_64 R-rd-missing pslld +ds
+x86_64 R-rd-missing psllq +cs
+x86_64 R-rd-missing psllq +ds
+x86_64 R-rd-missing psllw +cs
+x86_64 R-rd-missing psllw +ds
+x86_64 R-rd-missing psrad +cs
+x86_64 R-rd-missing psrad +ds
+x86_64 R-rd-missing psraw +cs
+x86_64 R-rd-missing psraw +ds
+x86_64 R-rd-missing psrld +cs
+x86_64 R-rd-missing psrld +ds
+x86_64 R-rd-missing psrlq +cs
+x86_64 R-rd-missing psrlq +ds
+x86_64 R-rd-missing psrlw +cs
+x86_64 R-rd-missing psrlw +ds
+x86_64 R-rd-missing psubb +cs
+x86_64 R-rd-missing psubb +ds
+x86_64 R-rd-missing psubd +cs
+x86_64 R-rd-missing psubd +ds
+x86_64 R-rd-missing psubq +cs
+x86_64 R-rd-missing psubq +ds
+x86_64 R-rd-missing psubsb +cs
+x86_64 R-rd-missing psubsb +ds
+x86_64 R-rd-missing psubsw +cs
+x86_64 R-rd-missing psubsw +ds
+x86_64 R-rd-missing psubusb +cs
+x86_64 R-rd-missing psubusb +ds
+x86_64 R-rd-missing psubusw +cs
+x86_64 R-rd-missing psubusw +ds
+x86_64 R-rd-missing psubw +cs
+x86_64 R-rd-missing psubw +ds
+x86_64 R-rd-missing punpckhbw +cs
+x86_64 R-rd-missing punpckhbw +ds
+x86_64 R-rd-missing punpckhdq +cs
+x86_64 R-rd-missing punpckhdq +ds
+x86_64 R-rd-missing punpckhwd +cs
+x86_64 R-rd-missing punpckhwd +ds
+x86_64 R-rd-missing punpcklbw +cs
+x86_64 R-rd-missing punpcklbw +ds
+x86_64 R-rd-missing punpckldq +cs
+x86_64 R-rd-missing punpckldq +ds
+x86_64 R-rd-missing punpcklwd +cs
+x86_64 R-rd-missing punpcklwd +ds
+x86_64 R-rd-missing pushq +cs
+x86_64 R-rd-missing pushq +ds
+x86_64 R-rd-missing pxor +cs
+x86_64 R-rd-missing pxor +ds
+x86_64 R-rd-missing rclq +cs,flags
+x86_64 R-rd-missing rclq +ds,flags
+x86_64 R-rd-missing rcpps +cs
+x86_64 R-rd-missing rcpps +ds
+x86_64 R-rd-missing rcrb +cs,flags
+x86_64 R-rd-missing rcrb +ds,flags
+x86_64 R-rd-missing rcrl +cs,flags
+x86_64 R-rd-missing rcrl +ds,flags
+x86_64 R-rd-missing rcrq +cs,flags
+x86_64 R-rd-missing rcrq +ds,flags
+x86_64 R-rd-missing rolb +cs
+x86_64 R-rd-missing rolb +ds
+x86_64 R-rd-missing roll +cs
+x86_64 R-rd-missing roll +ds
+x86_64 R-rd-missing rolq +cs
+x86_64 R-rd-missing rolq +ds
+x86_64 R-rd-missing rorb +cs
+x86_64 R-rd-missing rorb +ds
+x86_64 R-rd-missing rorl +cs
+x86_64 R-rd-missing rorl +ds
+x86_64 R-rd-missing rorq +cs
+x86_64 R-rd-missing rorq +ds
+x86_64 R-rd-missing rsqrtps +cs
+x86_64 R-rd-missing rsqrtps +ds
+x86_64 R-rd-missing sarb +cs
+x86_64 R-rd-missing sarb +ds
+x86_64 R-rd-missing sarl +cs
+x86_64 R-rd-missing sarl +ds
+x86_64 R-rd-missing sarq +cs
+x86_64 R-rd-missing sarq +ds
+x86_64 R-rd-missing sbbq +cs
+x86_64 R-rd-missing sbbq +ds
+x86_64 R-rd-missing seta +cs
+x86_64 R-rd-missing seta +ds
+x86_64 R-rd-missing setae +cs
+x86_64 R-rd-missing setae +ds
+x86_64 R-rd-missing setb +cs
+x86_64 R-rd-missing setb +ds
+x86_64 R-rd-missing setbe +cs
+x86_64 R-rd-missing setbe +ds
+x86_64 R-rd-missing sete +cs
+x86_64 R-rd-missing sete +ds
+x86_64 R-rd-missing setg +cs
+x86_64 R-rd-missing setg +ds
+x86_64 R-rd-missing setge +cs
+x86_64 R-rd-missing setge +ds
+x86_64 R-rd-missing setl +cs
+x86_64 R-rd-missing setl +ds
+x86_64 R-rd-missing setle +cs
+x86_64 R-rd-missing setle +ds
+x86_64 R-rd-missing setne +cs
+x86_64 R-rd-missing setne +ds
+x86_64 R-rd-missing setno +cs
+x86_64 R-rd-missing setno +ds
+x86_64 R-rd-missing setnp +cs
+x86_64 R-rd-missing setnp +ds
+x86_64 R-rd-missing setns +cs
+x86_64 R-rd-missing setns +ds
+x86_64 R-rd-missing seto +cs
+x86_64 R-rd-missing seto +ds
+x86_64 R-rd-missing setp +cs
+x86_64 R-rd-missing setp +ds
+x86_64 R-rd-missing sets +cs
+x86_64 R-rd-missing sets +ds
+x86_64 R-rd-missing sgdtq +cs
+x86_64 R-rd-missing sgdtq +ds
+x86_64 R-rd-missing sha1msg1 +cs
+x86_64 R-rd-missing sha1msg1 +ds
+x86_64 R-rd-missing sha1msg2 +cs
+x86_64 R-rd-missing sha1msg2 +ds
+x86_64 R-rd-missing sha1nexte +cs
+x86_64 R-rd-missing sha1nexte +ds
+x86_64 R-rd-missing sha1rnds4 +cs
+x86_64 R-rd-missing sha1rnds4 +ds
+x86_64 R-rd-missing sha256msg1 +cs
+x86_64 R-rd-missing sha256msg1 +ds
+x86_64 R-rd-missing sha256msg2 +cs
+x86_64 R-rd-missing sha256msg2 +ds
+x86_64 R-rd-missing sha256rnds2 +cs
+x86_64 R-rd-missing sha256rnds2 +ds
+x86_64 R-rd-missing shlb +cs
+x86_64 R-rd-missing shlb +ds
+x86_64 R-rd-missing shldl +cs
+x86_64 R-rd-missing shldl +ds
+x86_64 R-rd-missing shldq +cs
+x86_64 R-rd-missing shldq +ds
+x86_64 R-rd-missing shll +cs
+x86_64 R-rd-missing shll +ds
+x86_64 R-rd-missing shlq +cs
+x86_64 R-rd-missing shlq +ds
+x86_64 R-rd-missing shrb +cs
+x86_64 R-rd-missing shrb +ds
+x86_64 R-rd-missing shrdl +cs
+x86_64 R-rd-missing shrdl +ds
+x86_64 R-rd-missing shrdq +cs
+x86_64 R-rd-missing shrdq +ds
+x86_64 R-rd-missing shrl +cs
+x86_64 R-rd-missing shrl +ds
+x86_64 R-rd-missing shrq +cs
+x86_64 R-rd-missing shrq +ds
+x86_64 R-rd-missing shufps +cs
+x86_64 R-rd-missing shufps +ds
+x86_64 R-rd-missing sidtq +cs
+x86_64 R-rd-missing sidtq +ds
+x86_64 R-rd-missing smsww +cs
+x86_64 R-rd-missing smsww +ds
+x86_64 R-rd-missing sqrtps +cs
+x86_64 R-rd-missing sqrtps +ds
+x86_64 R-rd-missing stmxcsr +cs
+x86_64 R-rd-missing stmxcsr +ds
+x86_64 R-rd-missing strw +cs
+x86_64 R-rd-missing strw +ds
+x86_64 R-rd-missing subps +cs
+x86_64 R-rd-missing subps +ds
+x86_64 R-rd-missing subq +cs
+x86_64 R-rd-missing subq +ds
+x86_64 R-rd-missing testq +cs
+x86_64 R-rd-missing testq +ds
+x86_64 R-rd-missing ucomiss +cs
+x86_64 R-rd-missing ucomiss +ds
+x86_64 R-rd-missing unpckhps +cs
+x86_64 R-rd-missing unpckhps +ds
+x86_64 R-rd-missing unpcklps +cs
+x86_64 R-rd-missing unpcklps +ds
+x86_64 R-rd-missing verr +cs
+x86_64 R-rd-missing verr +ds
+x86_64 R-rd-missing verw +cs
+x86_64 R-rd-missing verw +ds
+x86_64 R-rd-missing vmovsd +cs
+x86_64 R-rd-missing vmovsd +ds
+x86_64 R-rd-missing vmovss +cs
+x86_64 R-rd-missing vmovss +ds
+x86_64 R-rd-missing vmovupd +cs
+x86_64 R-rd-missing vmovupd +ds
+x86_64 R-rd-missing vmovups +cs
+x86_64 R-rd-missing vmovups +ds
+x86_64 R-rd-missing vmptrld +cs
+x86_64 R-rd-missing vmptrld +ds
+x86_64 R-rd-missing vmptrst +cs
+x86_64 R-rd-missing vmptrst +ds
+x86_64 R-rd-missing vmreadq +cs
+x86_64 R-rd-missing vmreadq +ds
+x86_64 R-rd-missing vmwriteq +cs
+x86_64 R-rd-missing vmwriteq +ds
+x86_64 R-rd-missing vpinsrd +cs
+x86_64 R-rd-missing vpinsrd +ds
+x86_64 R-rd-missing vpshufb +cs
+x86_64 R-rd-missing vpshufb +ds
+x86_64 R-rd-missing wrssd +cs
+x86_64 R-rd-missing wrssd +ds
+x86_64 R-rd-missing wrssq +cs
+x86_64 R-rd-missing wrssq +ds
+x86_64 R-rd-missing xaddb +cs
+x86_64 R-rd-missing xaddb +ds
+x86_64 R-rd-missing xaddl +cs
+x86_64 R-rd-missing xaddl +ds
+x86_64 R-rd-missing xaddq +cs
+x86_64 R-rd-missing xaddq +ds
+x86_64 R-rd-missing xchgq +cs
+x86_64 R-rd-missing xchgq +ds
+x86_64 R-rd-missing xorps +cs
+x86_64 R-rd-missing xorps +ds
+x86_64 R-rd-missing xorq +cs
+x86_64 R-rd-missing xorq +ds
+x86_64 R-rd-missing xrstor +cs
+x86_64 R-rd-missing xrstor +ds
+x86_64 R-rd-missing xrstor64 +cs
+x86_64 R-rd-missing xrstor64 +ds
+x86_64 R-rd-missing xrstors +cs
+x86_64 R-rd-missing xrstors +ds
+x86_64 R-rd-missing xrstors64 +cs
+x86_64 R-rd-missing xrstors64 +ds
+x86_64 R-rd-missing xsave +cs
+x86_64 R-rd-missing xsave +ds
+x86_64 R-rd-missing xsave64 +cs
+x86_64 R-rd-missing xsave64 +ds
+x86_64 R-rd-missing xsavec +cs
+x86_64 R-rd-missing xsavec +ds
+x86_64 R-rd-missing xsavec64 +cs
+x86_64 R-rd-missing xsavec64 +ds
+x86_64 R-rd-missing xsaveopt +cs
+x86_64 R-rd-missing xsaveopt +ds
+x86_64 R-rd-missing xsaveopt64 +cs
+x86_64 R-rd-missing xsaveopt64 +ds
+x86_64 R-rd-missing xsaves +cs
+x86_64 R-rd-missing xsaves +ds
+x86_64 R-rd-missing xsaves64 +cs
+x86_64 R-rd-missing xsaves64 +ds
+x86_64 R-rd-missing fcoml +cs,fpcw
+x86_64 R-rd-missing fcoml +ds,fpcw
+x86_64 R-rd-missing fcoml +es,fpcw
+x86_64 R-rd-missing fcoml +fpcw,ss
+x86_64 R-rd-missing fcompl +cs,fpcw
+x86_64 R-rd-missing fcompl +ds,fpcw
+x86_64 R-rd-missing fcomps +cs,fpcw
+x86_64 R-rd-missing fcomps +ds,fpcw
+x86_64 R-rd-missing fcoms +cs,fpcw
+x86_64 R-rd-missing fcoms +ds,fpcw
+x86_64 R-rd-missing fcoms +es,fpcw
+x86_64 R-rd-missing fcoms +fpcw,ss
+x86_64 R-rd-missing ficoml +cs,fpcw
+x86_64 R-rd-missing ficoml +ds,fpcw
+x86_64 R-rd-missing ficoml +es,fpcw
+x86_64 R-rd-missing ficoml +fpcw,ss
+x86_64 R-rd-missing ficompl +cs,fpcw
+x86_64 R-rd-missing ficompl +ds,fpcw
+x86_64 R-rd-missing ficomps +cs,fpcw
+x86_64 R-rd-missing ficomps +ds,fpcw
+x86_64 R-rd-missing ficoms +cs,fpcw
+x86_64 R-rd-missing ficoms +ds,fpcw
+x86_64 R-rd-missing ficoms +es,fpcw
+x86_64 R-rd-missing ficoms +fpcw,ss
 x86_64 R-wr-phantom notrack lcalll +r#
 
 # CAUSE 1/2 (continued) -- the NOTRACK and BND spellings of the same
@@ -4506,25 +5198,44 @@ x86_64 D-size-mismatch xrelease lock adcw
 # right not to record a dependency and LLVM's segment operand is a
 # modelling artifact.  FS and GS, which do have a live base, are recorded by
 # the tracer and are not in this family.
-x86_64 R-rd-missing vaddps +seg
-x86_64 R-rd-missing vandnps +seg
-x86_64 R-rd-missing vandps +seg
-x86_64 R-rd-missing vcmpeqps +seg
-x86_64 R-rd-missing vcvtdq2ps +seg
-x86_64 R-rd-missing vcvtps2pd +seg
-x86_64 R-rd-missing vdivps +seg
-x86_64 R-rd-missing vmaxps +seg
-x86_64 R-rd-missing vminps +seg
-x86_64 R-rd-missing vmulps +seg
-x86_64 R-rd-missing vorps +seg
-x86_64 R-rd-missing vrcpps +seg
-x86_64 R-rd-missing vrsqrtps +seg
-x86_64 R-rd-missing vshufps +seg
-x86_64 R-rd-missing vsqrtps +seg
-x86_64 R-rd-missing vsubps +seg
-x86_64 R-rd-missing vunpckhps +seg
-x86_64 R-rd-missing vunpcklps +seg
-x86_64 R-rd-missing vxorps +seg
+x86_64 R-rd-missing vaddps +cs
+x86_64 R-rd-missing vaddps +ds
+x86_64 R-rd-missing vandnps +cs
+x86_64 R-rd-missing vandnps +ds
+x86_64 R-rd-missing vandps +cs
+x86_64 R-rd-missing vandps +ds
+x86_64 R-rd-missing vcmpeqps +cs
+x86_64 R-rd-missing vcmpeqps +ds
+x86_64 R-rd-missing vcvtdq2ps +cs
+x86_64 R-rd-missing vcvtdq2ps +ds
+x86_64 R-rd-missing vcvtps2pd +cs
+x86_64 R-rd-missing vcvtps2pd +ds
+x86_64 R-rd-missing vdivps +cs
+x86_64 R-rd-missing vdivps +ds
+x86_64 R-rd-missing vmaxps +cs
+x86_64 R-rd-missing vmaxps +ds
+x86_64 R-rd-missing vminps +cs
+x86_64 R-rd-missing vminps +ds
+x86_64 R-rd-missing vmulps +cs
+x86_64 R-rd-missing vmulps +ds
+x86_64 R-rd-missing vorps +cs
+x86_64 R-rd-missing vorps +ds
+x86_64 R-rd-missing vrcpps +cs
+x86_64 R-rd-missing vrcpps +ds
+x86_64 R-rd-missing vrsqrtps +cs
+x86_64 R-rd-missing vrsqrtps +ds
+x86_64 R-rd-missing vshufps +cs
+x86_64 R-rd-missing vshufps +ds
+x86_64 R-rd-missing vsqrtps +cs
+x86_64 R-rd-missing vsqrtps +ds
+x86_64 R-rd-missing vsubps +cs
+x86_64 R-rd-missing vsubps +ds
+x86_64 R-rd-missing vunpckhps +cs
+x86_64 R-rd-missing vunpckhps +ds
+x86_64 R-rd-missing vunpcklps +cs
+x86_64 R-rd-missing vunpcklps +ds
+x86_64 R-rd-missing vxorps +cs
+x86_64 R-rd-missing vxorps +ds
 # (d) TWO REX PREFIXES.  `44 4c 11 22` is a REX byte followed by another REX
 # byte; the second immediately precedes the opcode and is the one that takes
 # effect, so the instruction is `adcq %r12, (%rdx)`.  Capstone decodes it

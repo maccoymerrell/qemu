@@ -85,6 +85,13 @@ unsigned isax_reg_table_size(void);
 
 /* Symbolic names, for signature keys a human has to read. */
 const char *isax_generic_reg_name(unsigned gen_id);
+
+/* True when the ID is a member of an indexed FILE — a bank whose members
+ * are picked by an encoding field and are interchangeable — and false for
+ * a bank that is merely numbered, whose members are distinct architectural
+ * registers.  A signature key may elide the index only in the first case;
+ * see generic_reg_is_indexed_file() in champsim_tracer_generic_ids.h. */
+bool isax_generic_reg_indexed_file(unsigned gen_id);
 const char *isax_branch_name(unsigned branch_type);
 const char *isax_opcode_name(unsigned opcode);
 

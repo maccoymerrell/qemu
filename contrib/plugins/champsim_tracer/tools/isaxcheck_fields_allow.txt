@@ -186,7 +186,7 @@ mipsel FR-wr-missing bc1tl +REG_GPR#
 # `R-wr-phantom ctcmsa +cop#`, same single difference in the boundary
 # vocabulary.
 mipsel FR-rd-missing ctcmsa +REG_SYSMMU
-mipsel FR-rd-missing ctcmsa +REG_COPROC#
+mipsel FR-rd-missing ctcmsa +REG_COPROC0
 mipsel FR-wr-phantom ctcmsa +REG_SYS
 mipsel FR-wr-phantom ctcmsa +REG_FCSR
 mipsel FR-wr-phantom ctcmsa +REG_SYSID
@@ -1413,467 +1413,1061 @@ riscv64 FR-wr-missing c.srli64 +REG_GPR#
 # The same difference with the arrow reversed (`FR-rd-phantom movw +REG_SEG#`
 # and the pushes) is the tracer carrying the %fs override into the operand
 # the instruction reads while LLVM keeps it only in the memory operand.
-x86_64 FR-rd-missing adcb +REG_SEG#
-x86_64 FR-rd-missing adcl +REG_SEG#
-x86_64 FR-rd-missing adcq +REG_SEG#
-x86_64 FR-rd-missing adcw +REG_SEG#
-x86_64 FR-rd-missing addb +REG_SEG#
-x86_64 FR-rd-missing addl +REG_SEG#
-x86_64 FR-rd-missing addps +REG_SEG#
-x86_64 FR-rd-missing addq +REG_SEG#
-x86_64 FR-rd-missing addw +REG_SEG#
-x86_64 FR-rd-missing andb +REG_SEG#
-x86_64 FR-rd-missing andl +REG_SEG#
-x86_64 FR-rd-missing andnps +REG_SEG#
-x86_64 FR-rd-missing andps +REG_SEG#
-x86_64 FR-rd-missing andq +REG_SEG#
-x86_64 FR-rd-missing andw +REG_SEG#
-x86_64 FR-rd-missing bsfl +REG_SEG#
-x86_64 FR-rd-missing bsfq +REG_SEG#
-x86_64 FR-rd-missing bsrl +REG_SEG#
-x86_64 FR-rd-missing bsrq +REG_SEG#
-x86_64 FR-rd-missing btcl +REG_SEG#
-x86_64 FR-rd-missing btcq +REG_SEG#
-x86_64 FR-rd-missing btl +REG_SEG#
-x86_64 FR-rd-missing btq +REG_SEG#
-x86_64 FR-rd-missing btrl +REG_SEG#
-x86_64 FR-rd-missing btrq +REG_SEG#
-x86_64 FR-rd-missing btsl +REG_SEG#
-x86_64 FR-rd-missing btsq +REG_SEG#
-x86_64 FR-rd-missing cldemote +REG_SEG#
-x86_64 FR-rd-missing clflush +REG_SEG#
-x86_64 FR-rd-missing cmovael +REG_SEG#
-x86_64 FR-rd-missing cmovaeq +REG_SEG#
-x86_64 FR-rd-missing cmoval +REG_SEG#
-x86_64 FR-rd-missing cmovaq +REG_SEG#
-x86_64 FR-rd-missing cmovbel +REG_SEG#
-x86_64 FR-rd-missing cmovbeq +REG_SEG#
-x86_64 FR-rd-missing cmovbl +REG_SEG#
-x86_64 FR-rd-missing cmovbq +REG_SEG#
-x86_64 FR-rd-missing cmovel +REG_SEG#
-x86_64 FR-rd-missing cmoveq +REG_SEG#
-x86_64 FR-rd-missing cmovgel +REG_SEG#
-x86_64 FR-rd-missing cmovgeq +REG_SEG#
-x86_64 FR-rd-missing cmovgl +REG_SEG#
-x86_64 FR-rd-missing cmovgq +REG_SEG#
-x86_64 FR-rd-missing cmovlel +REG_SEG#
-x86_64 FR-rd-missing cmovleq +REG_SEG#
-x86_64 FR-rd-missing cmovll +REG_SEG#
-x86_64 FR-rd-missing cmovlq +REG_SEG#
-x86_64 FR-rd-missing cmovnel +REG_SEG#
-x86_64 FR-rd-missing cmovneq +REG_SEG#
-x86_64 FR-rd-missing cmovnol +REG_SEG#
-x86_64 FR-rd-missing cmovnoq +REG_SEG#
-x86_64 FR-rd-missing cmovnpl +REG_SEG#
-x86_64 FR-rd-missing cmovnpq +REG_SEG#
-x86_64 FR-rd-missing cmovnsl +REG_SEG#
-x86_64 FR-rd-missing cmovnsq +REG_SEG#
-x86_64 FR-rd-missing cmovol +REG_SEG#
-x86_64 FR-rd-missing cmovoq +REG_SEG#
-x86_64 FR-rd-missing cmovpl +REG_SEG#
-x86_64 FR-rd-missing cmovpq +REG_SEG#
-x86_64 FR-rd-missing cmovsl +REG_SEG#
-x86_64 FR-rd-missing cmovsq +REG_SEG#
-x86_64 FR-rd-missing cmpb +REG_SEG#
-x86_64 FR-rd-missing cmpeqps +REG_SEG#
-x86_64 FR-rd-missing cmpl +REG_SEG#
-x86_64 FR-rd-missing cmpps +REG_SEG#
-x86_64 FR-rd-missing cmpq +REG_SEG#
-x86_64 FR-rd-missing cmpw +REG_SEG#
-x86_64 FR-rd-missing cmpxchg16b +REG_GPR#,REG_SEG#
-x86_64 FR-rd-missing cmpxchg8b +REG_GPR#,REG_SEG#
-x86_64 FR-rd-missing cmpxchgb +REG_SEG#
-x86_64 FR-rd-missing cmpxchgl +REG_SEG#
-x86_64 FR-rd-missing cmpxchgq +REG_SEG#
-x86_64 FR-rd-missing comiss +REG_SEG#
-x86_64 FR-rd-missing cvtdq2ps +REG_SEG#
-x86_64 FR-rd-missing cvtpi2ps +REG_SEG#
-x86_64 FR-rd-missing cvtps2pd +REG_SEG#
-x86_64 FR-rd-missing cvtps2pi +REG_SEG#
-x86_64 FR-rd-missing cvttps2pi +REG_SEG#
-x86_64 FR-rd-missing decb +REG_SEG#
-x86_64 FR-rd-missing decl +REG_SEG#
-x86_64 FR-rd-missing decq +REG_SEG#
-x86_64 FR-rd-missing divb +REG_SEG#
-x86_64 FR-rd-missing divl +REG_SEG#
-x86_64 FR-rd-missing divps +REG_SEG#
-x86_64 FR-rd-missing divq +REG_SEG#
-x86_64 FR-rd-missing faddl +REG_SEG#
-x86_64 FR-rd-missing fadds +REG_SEG#
-x86_64 FR-rd-missing fbld +REG_SEG#
-x86_64 FR-rd-missing fbstp +REG_SEG#
-x86_64 FR-rd-missing fdivl +REG_SEG#
-x86_64 FR-rd-missing fdivrl +REG_SEG#
-x86_64 FR-rd-missing fdivrs +REG_SEG#
-x86_64 FR-rd-missing fdivs +REG_SEG#
-x86_64 FR-rd-missing fiaddl +REG_SEG#
-x86_64 FR-rd-missing fiadds +REG_SEG#
-x86_64 FR-rd-missing fidivl +REG_SEG#
-x86_64 FR-rd-missing fidivrl +REG_SEG#
-x86_64 FR-rd-missing fidivrs +REG_SEG#
-x86_64 FR-rd-missing fidivs +REG_SEG#
-x86_64 FR-rd-missing fildl +REG_SEG#
-x86_64 FR-rd-missing fildll +REG_SEG#
-x86_64 FR-rd-missing filds +REG_SEG#
-x86_64 FR-rd-missing fimull +REG_SEG#
-x86_64 FR-rd-missing fimuls +REG_SEG#
-x86_64 FR-rd-missing fistl +REG_SEG#
-x86_64 FR-rd-missing fistpl +REG_SEG#
-x86_64 FR-rd-missing fistpll +REG_SEG#
-x86_64 FR-rd-missing fistps +REG_SEG#
-x86_64 FR-rd-missing fists +REG_SEG#
-x86_64 FR-rd-missing fisttpl +REG_SEG#
-x86_64 FR-rd-missing fisttpll +REG_SEG#
-x86_64 FR-rd-missing fisttps +REG_SEG#
-x86_64 FR-rd-missing fisubl +REG_SEG#
-x86_64 FR-rd-missing fisubrl +REG_SEG#
-x86_64 FR-rd-missing fisubrs +REG_SEG#
-x86_64 FR-rd-missing fisubs +REG_SEG#
-x86_64 FR-rd-missing fldcw +REG_SEG#
-x86_64 FR-rd-missing fldenv +REG_SEG#
-x86_64 FR-rd-missing fldl +REG_SEG#
-x86_64 FR-rd-missing flds +REG_SEG#
-x86_64 FR-rd-missing fldt +REG_SEG#
-x86_64 FR-rd-missing fmull +REG_SEG#
-x86_64 FR-rd-missing fmuls +REG_SEG#
-x86_64 FR-rd-missing fnstcw +REG_SEG#
-x86_64 FR-rd-missing fnstenv +REG_FCSR,REG_SEG#
-x86_64 FR-rd-missing fnstsw +REG_FCSR,REG_SEG#
-x86_64 FR-rd-missing frstor +REG_SEG#
-x86_64 FR-rd-missing fstl +REG_SEG#
-x86_64 FR-rd-missing fstpl +REG_SEG#
-x86_64 FR-rd-missing fstps +REG_SEG#
-x86_64 FR-rd-missing fstpt +REG_SEG#
-x86_64 FR-rd-missing fsts +REG_SEG#
-x86_64 FR-rd-missing fsubl +REG_SEG#
-x86_64 FR-rd-missing fsubrl +REG_SEG#
-x86_64 FR-rd-missing fsubrs +REG_SEG#
-x86_64 FR-rd-missing fsubs +REG_SEG#
-x86_64 FR-rd-missing fxrstor +REG_SEG#
-x86_64 FR-rd-missing fxrstor64 +REG_SEG#
-x86_64 FR-rd-missing idivb +REG_SEG#
-x86_64 FR-rd-missing idivl +REG_SEG#
-x86_64 FR-rd-missing idivq +REG_SEG#
-x86_64 FR-rd-missing imulb +REG_SEG#
-x86_64 FR-rd-missing imull +REG_SEG#
-x86_64 FR-rd-missing imulq +REG_SEG#
-x86_64 FR-rd-missing imulw +REG_SEG#
-x86_64 FR-rd-missing incb +REG_SEG#
-x86_64 FR-rd-missing incl +REG_SEG#
-x86_64 FR-rd-missing incq +REG_SEG#
-x86_64 FR-rd-missing invlpg +REG_SEG#
-x86_64 FR-rd-missing jmpq +REG_SEG#
-x86_64 FR-rd-missing larl +REG_SEG#
-x86_64 FR-rd-missing larq +REG_SEG#
-x86_64 FR-rd-missing ldmxcsr +REG_SEG#
-x86_64 FR-rd-missing leal +REG_SEG#
-x86_64 FR-rd-missing leaq +REG_SEG#
-x86_64 FR-rd-missing leaw +REG_SEG#
-x86_64 FR-rd-missing lfsl +REG_SEG#
-x86_64 FR-rd-missing lfsq +REG_SEG#
-x86_64 FR-rd-missing lgdtq +REG_SEG#
-x86_64 FR-rd-missing lgs +REG_SEG#
-x86_64 FR-rd-missing lgsl +REG_SEG#
-x86_64 FR-rd-missing lidtq +REG_SEG#
-x86_64 FR-rd-missing ljmpl +REG_SEG#
-x86_64 FR-rd-missing ljmpq +REG_SEG#
-x86_64 FR-rd-missing lldtw +REG_SEG#
-x86_64 FR-rd-missing lmsww +REG_SEG#
-x86_64 FR-rd-missing lock adcb +REG_SEG#
-x86_64 FR-rd-missing lock adcl +REG_SEG#
-x86_64 FR-rd-missing lock adcw +REG_SEG#
-x86_64 FR-rd-missing lock addb +REG_SEG#
-x86_64 FR-rd-missing lock addl +REG_SEG#
-x86_64 FR-rd-missing lock andb +REG_SEG#
-x86_64 FR-rd-missing lock andl +REG_SEG#
-x86_64 FR-rd-missing lock notb +REG_SEG#
-x86_64 FR-rd-missing lock notl +REG_SEG#
-x86_64 FR-rd-missing lock orb +REG_SEG#
-x86_64 FR-rd-missing lock orl +REG_SEG#
-x86_64 FR-rd-missing lock sbbb +REG_SEG#
-x86_64 FR-rd-missing lock sbbl +REG_SEG#
-x86_64 FR-rd-missing lock subb +REG_SEG#
-x86_64 FR-rd-missing lock subl +REG_SEG#
-x86_64 FR-rd-missing lock xchgb +REG_SEG#
-x86_64 FR-rd-missing lock xchgl +REG_SEG#
-x86_64 FR-rd-missing lock xorb +REG_SEG#
-x86_64 FR-rd-missing lock xorl +REG_SEG#
-x86_64 FR-rd-missing lsll +REG_SEG#
-x86_64 FR-rd-missing lslq +REG_SEG#
-x86_64 FR-rd-missing lssl +REG_SEG#
-x86_64 FR-rd-missing lssq +REG_SEG#
-x86_64 FR-rd-missing ltrw +REG_SEG#
-x86_64 FR-rd-missing maxps +REG_SEG#
-x86_64 FR-rd-missing minps +REG_SEG#
-x86_64 FR-rd-missing movabsb +REG_SEG#
-x86_64 FR-rd-missing movabsl +REG_SEG#
-x86_64 FR-rd-missing movabsq +REG_SEG#
-x86_64 FR-rd-missing movabsw +REG_SEG#
-x86_64 FR-rd-missing movaps +REG_SEG#
-x86_64 FR-rd-missing movb +REG_SEG#
-x86_64 FR-rd-missing movbel +REG_SEG#
-x86_64 FR-rd-missing movbeq +REG_SEG#
-x86_64 FR-rd-missing movd +REG_SEG#
-x86_64 FR-rd-missing movdiri +REG_SEG#
-x86_64 FR-rd-missing movhps +REG_SEG#
-x86_64 FR-rd-missing movl +REG_SEG#
-x86_64 FR-rd-missing movlps +REG_SEG#
-x86_64 FR-rd-missing movntil +REG_SEG#
-x86_64 FR-rd-missing movntiq +REG_SEG#
-x86_64 FR-rd-missing movntps +REG_SEG#
-x86_64 FR-rd-missing movntq +REG_SEG#
-x86_64 FR-rd-missing movq +REG_SEG#
-x86_64 FR-rd-missing movsbl +REG_SEG#
-x86_64 FR-rd-missing movsbq +REG_SEG#
-x86_64 FR-rd-missing movslq +REG_SEG#
-x86_64 FR-rd-missing movswl +REG_SEG#
-x86_64 FR-rd-missing movswq +REG_SEG#
-x86_64 FR-rd-missing movups +REG_SEG#
-x86_64 FR-rd-missing movw +REG_SEG#
-x86_64 FR-rd-missing movzbl +REG_SEG#
-x86_64 FR-rd-missing movzbq +REG_SEG#
-x86_64 FR-rd-missing movzwl +REG_SEG#
-x86_64 FR-rd-missing movzwq +REG_SEG#
-x86_64 FR-rd-missing mulb +REG_SEG#
-x86_64 FR-rd-missing mull +REG_SEG#
-x86_64 FR-rd-missing mulps +REG_SEG#
-x86_64 FR-rd-missing mulq +REG_SEG#
-x86_64 FR-rd-missing negb +REG_SEG#
-x86_64 FR-rd-missing negl +REG_SEG#
-x86_64 FR-rd-missing negq +REG_SEG#
-x86_64 FR-rd-missing nopl +REG_SEG#
-x86_64 FR-rd-missing nopq +REG_SEG#
-x86_64 FR-rd-missing notb +REG_SEG#
-x86_64 FR-rd-missing notl +REG_SEG#
-x86_64 FR-rd-missing notq +REG_SEG#
-x86_64 FR-rd-missing notrack jmpq +REG_SEG#
-x86_64 FR-rd-missing notrack ljmpl +REG_SEG#
-x86_64 FR-rd-missing notw +REG_SEG#
-x86_64 FR-rd-missing orb +REG_SEG#
-x86_64 FR-rd-missing orl +REG_SEG#
-x86_64 FR-rd-missing orps +REG_SEG#
-x86_64 FR-rd-missing orq +REG_SEG#
-x86_64 FR-rd-missing orw +REG_SEG#
-x86_64 FR-rd-missing pabsb +REG_SEG#
-x86_64 FR-rd-missing pabsd +REG_SEG#
-x86_64 FR-rd-missing pabsw +REG_SEG#
-x86_64 FR-rd-missing packssdw +REG_SEG#
-x86_64 FR-rd-missing packsswb +REG_SEG#
-x86_64 FR-rd-missing packuswb +REG_SEG#
-x86_64 FR-rd-missing paddb +REG_SEG#
-x86_64 FR-rd-missing paddd +REG_SEG#
-x86_64 FR-rd-missing paddq +REG_SEG#
-x86_64 FR-rd-missing paddsb +REG_SEG#
-x86_64 FR-rd-missing paddsw +REG_SEG#
-x86_64 FR-rd-missing paddusb +REG_SEG#
-x86_64 FR-rd-missing paddusw +REG_SEG#
-x86_64 FR-rd-missing paddw +REG_SEG#
-x86_64 FR-rd-missing palignr +REG_SEG#
-x86_64 FR-rd-missing pand +REG_SEG#
-x86_64 FR-rd-missing pandn +REG_SEG#
-x86_64 FR-rd-missing pavgb +REG_SEG#
-x86_64 FR-rd-missing pavgw +REG_SEG#
-x86_64 FR-rd-missing pcmpeqb +REG_SEG#
-x86_64 FR-rd-missing pcmpeqd +REG_SEG#
-x86_64 FR-rd-missing pcmpeqw +REG_SEG#
-x86_64 FR-rd-missing pcmpgtb +REG_SEG#
-x86_64 FR-rd-missing pcmpgtd +REG_SEG#
-x86_64 FR-rd-missing pcmpgtw +REG_SEG#
-x86_64 FR-rd-missing phaddd +REG_SEG#
-x86_64 FR-rd-missing phaddsw +REG_SEG#
-x86_64 FR-rd-missing phaddw +REG_SEG#
-x86_64 FR-rd-missing phsubd +REG_SEG#
-x86_64 FR-rd-missing phsubsw +REG_SEG#
-x86_64 FR-rd-missing phsubw +REG_SEG#
-x86_64 FR-rd-missing pinsrw +REG_SEG#
-x86_64 FR-rd-missing pmaddubsw +REG_SEG#
-x86_64 FR-rd-missing pmaddwd +REG_SEG#
-x86_64 FR-rd-missing pmaxsw +REG_SEG#
-x86_64 FR-rd-missing pmaxub +REG_SEG#
-x86_64 FR-rd-missing pminsw +REG_SEG#
-x86_64 FR-rd-missing pminub +REG_SEG#
-x86_64 FR-rd-missing pmulhrsw +REG_SEG#
-x86_64 FR-rd-missing pmulhuw +REG_SEG#
-x86_64 FR-rd-missing pmulhw +REG_SEG#
-x86_64 FR-rd-missing pmullw +REG_SEG#
-x86_64 FR-rd-missing pmuludq +REG_SEG#
-x86_64 FR-rd-missing por +REG_SEG#
-x86_64 FR-rd-missing prefetch +REG_SEG#
-x86_64 FR-rd-missing prefetchnta +REG_SEG#
-x86_64 FR-rd-missing prefetcht0 +REG_SEG#
-x86_64 FR-rd-missing prefetcht1 +REG_SEG#
-x86_64 FR-rd-missing prefetcht2 +REG_SEG#
-x86_64 FR-rd-missing prefetchw +REG_SEG#
-x86_64 FR-rd-missing prefetchwt1 +REG_SEG#
-x86_64 FR-rd-missing psadbw +REG_SEG#
-x86_64 FR-rd-missing pshufb +REG_SEG#
-x86_64 FR-rd-missing pshufw +REG_SEG#
-x86_64 FR-rd-missing psignb +REG_SEG#
-x86_64 FR-rd-missing psignd +REG_SEG#
-x86_64 FR-rd-missing psignw +REG_SEG#
-x86_64 FR-rd-missing pslld +REG_SEG#
-x86_64 FR-rd-missing psllq +REG_SEG#
-x86_64 FR-rd-missing psllw +REG_SEG#
-x86_64 FR-rd-missing psrad +REG_SEG#
-x86_64 FR-rd-missing psraw +REG_SEG#
-x86_64 FR-rd-missing psrld +REG_SEG#
-x86_64 FR-rd-missing psrlq +REG_SEG#
-x86_64 FR-rd-missing psrlw +REG_SEG#
-x86_64 FR-rd-missing psubb +REG_SEG#
-x86_64 FR-rd-missing psubd +REG_SEG#
-x86_64 FR-rd-missing psubq +REG_SEG#
-x86_64 FR-rd-missing psubsb +REG_SEG#
-x86_64 FR-rd-missing psubsw +REG_SEG#
-x86_64 FR-rd-missing psubusb +REG_SEG#
-x86_64 FR-rd-missing psubusw +REG_SEG#
-x86_64 FR-rd-missing psubw +REG_SEG#
-x86_64 FR-rd-missing punpckhbw +REG_SEG#
-x86_64 FR-rd-missing punpckhdq +REG_SEG#
-x86_64 FR-rd-missing punpckhwd +REG_SEG#
-x86_64 FR-rd-missing punpcklbw +REG_SEG#
-x86_64 FR-rd-missing punpckldq +REG_SEG#
-x86_64 FR-rd-missing punpcklwd +REG_SEG#
-x86_64 FR-rd-missing pxor +REG_SEG#
-x86_64 FR-rd-missing rclb +REG_FLAGS,REG_SEG#
-x86_64 FR-rd-missing rcll +REG_FLAGS,REG_SEG#
-x86_64 FR-rd-missing rclq +REG_FLAGS,REG_SEG#
-x86_64 FR-rd-missing rclw +REG_FLAGS,REG_SEG#
-x86_64 FR-rd-missing rcpps +REG_SEG#
-x86_64 FR-rd-missing rcrb +REG_FLAGS,REG_SEG#
-x86_64 FR-rd-missing rcrl +REG_FLAGS,REG_SEG#
-x86_64 FR-rd-missing rcrq +REG_FLAGS,REG_SEG#
-x86_64 FR-rd-missing rolb +REG_SEG#
-x86_64 FR-rd-missing roll +REG_SEG#
-x86_64 FR-rd-missing rolq +REG_SEG#
-x86_64 FR-rd-missing rorb +REG_SEG#
-x86_64 FR-rd-missing rorl +REG_SEG#
-x86_64 FR-rd-missing rorq +REG_SEG#
-x86_64 FR-rd-missing rsqrtps +REG_SEG#
-x86_64 FR-rd-missing sarb +REG_SEG#
-x86_64 FR-rd-missing sarl +REG_SEG#
-x86_64 FR-rd-missing sarq +REG_SEG#
-x86_64 FR-rd-missing sbbb +REG_SEG#
-x86_64 FR-rd-missing sbbl +REG_SEG#
-x86_64 FR-rd-missing sbbq +REG_SEG#
-x86_64 FR-rd-missing sbbw +REG_SEG#
-x86_64 FR-rd-missing seta +REG_SEG#
-x86_64 FR-rd-missing setae +REG_SEG#
-x86_64 FR-rd-missing setb +REG_SEG#
-x86_64 FR-rd-missing setbe +REG_SEG#
-x86_64 FR-rd-missing sete +REG_SEG#
-x86_64 FR-rd-missing setg +REG_SEG#
-x86_64 FR-rd-missing setge +REG_SEG#
-x86_64 FR-rd-missing setl +REG_SEG#
-x86_64 FR-rd-missing setle +REG_SEG#
-x86_64 FR-rd-missing setne +REG_SEG#
-x86_64 FR-rd-missing setno +REG_SEG#
-x86_64 FR-rd-missing setnp +REG_SEG#
-x86_64 FR-rd-missing setns +REG_SEG#
-x86_64 FR-rd-missing seto +REG_SEG#
-x86_64 FR-rd-missing setp +REG_SEG#
-x86_64 FR-rd-missing sets +REG_SEG#
-x86_64 FR-rd-missing sgdtq +REG_SEG#
-x86_64 FR-rd-missing sha1msg1 +REG_SEG#
-x86_64 FR-rd-missing sha1msg2 +REG_SEG#
-x86_64 FR-rd-missing sha1nexte +REG_SEG#
-x86_64 FR-rd-missing sha1rnds4 +REG_SEG#
-x86_64 FR-rd-missing sha256msg1 +REG_SEG#
-x86_64 FR-rd-missing sha256msg2 +REG_SEG#
-x86_64 FR-rd-missing sha256rnds2 +REG_SEG#
-x86_64 FR-rd-missing shlb +REG_SEG#
-x86_64 FR-rd-missing shldl +REG_SEG#
-x86_64 FR-rd-missing shldq +REG_SEG#
-x86_64 FR-rd-missing shll +REG_SEG#
-x86_64 FR-rd-missing shlq +REG_SEG#
-x86_64 FR-rd-missing shrb +REG_SEG#
-x86_64 FR-rd-missing shrdl +REG_SEG#
-x86_64 FR-rd-missing shrdq +REG_SEG#
-x86_64 FR-rd-missing shrl +REG_SEG#
-x86_64 FR-rd-missing shrq +REG_SEG#
-x86_64 FR-rd-missing shufps +REG_SEG#
-x86_64 FR-rd-missing sidtq +REG_SEG#
-x86_64 FR-rd-missing sldtw +REG_SEG#
-x86_64 FR-rd-missing smsww +REG_SEG#
-x86_64 FR-rd-missing sqrtps +REG_SEG#
-x86_64 FR-rd-missing stmxcsr +REG_SEG#
-x86_64 FR-rd-missing strw +REG_SEG#
-x86_64 FR-rd-missing subb +REG_SEG#
-x86_64 FR-rd-missing subl +REG_SEG#
-x86_64 FR-rd-missing subps +REG_SEG#
-x86_64 FR-rd-missing subq +REG_SEG#
-x86_64 FR-rd-missing subw +REG_SEG#
-x86_64 FR-rd-missing testb +REG_SEG#
-x86_64 FR-rd-missing testl +REG_SEG#
-x86_64 FR-rd-missing testq +REG_SEG#
-x86_64 FR-rd-missing testw +REG_SEG#
-x86_64 FR-rd-missing ucomiss +REG_SEG#
-x86_64 FR-rd-missing unpckhps +REG_SEG#
-x86_64 FR-rd-missing unpcklps +REG_SEG#
-x86_64 FR-rd-missing vaddps +REG_SEG#
-x86_64 FR-rd-missing vandnps +REG_SEG#
-x86_64 FR-rd-missing vandps +REG_SEG#
-x86_64 FR-rd-missing vcmpeqps +REG_SEG#
-x86_64 FR-rd-missing vcvtdq2ps +REG_SEG#
-x86_64 FR-rd-missing vcvtps2pd +REG_SEG#
-x86_64 FR-rd-missing vdivps +REG_SEG#
-x86_64 FR-rd-missing verr +REG_SEG#
-x86_64 FR-rd-missing verw +REG_SEG#
-x86_64 FR-rd-missing vmaxps +REG_SEG#
-x86_64 FR-rd-missing vminps +REG_SEG#
-x86_64 FR-rd-missing vmovsd +REG_SEG#
-x86_64 FR-rd-missing vmovss +REG_SEG#
-x86_64 FR-rd-missing vmovupd +REG_SEG#
-x86_64 FR-rd-missing vmovups +REG_SEG#
-x86_64 FR-rd-missing vmptrld +REG_SEG#
-x86_64 FR-rd-missing vmptrst +REG_SEG#
-x86_64 FR-rd-missing vmreadq +REG_SEG#
-x86_64 FR-rd-missing vmulps +REG_SEG#
-x86_64 FR-rd-missing vmwriteq +REG_SEG#
-x86_64 FR-rd-missing vorps +REG_SEG#
-x86_64 FR-rd-missing vpinsrd +REG_SEG#
-x86_64 FR-rd-missing vpshufb +REG_SEG#
-x86_64 FR-rd-missing vrcpps +REG_SEG#
-x86_64 FR-rd-missing vrsqrtps +REG_SEG#
-x86_64 FR-rd-missing vshufps +REG_SEG#
-x86_64 FR-rd-missing vsqrtps +REG_SEG#
-x86_64 FR-rd-missing vsubps +REG_SEG#
-x86_64 FR-rd-missing vunpckhps +REG_SEG#
-x86_64 FR-rd-missing vunpcklps +REG_SEG#
-x86_64 FR-rd-missing vxorps +REG_SEG#
-x86_64 FR-rd-missing wrssd +REG_SEG#
-x86_64 FR-rd-missing wrssq +REG_SEG#
-x86_64 FR-rd-missing xaddb +REG_SEG#
-x86_64 FR-rd-missing xaddl +REG_SEG#
-x86_64 FR-rd-missing xaddq +REG_SEG#
-x86_64 FR-rd-missing xchgb +REG_SEG#
-x86_64 FR-rd-missing xchgl +REG_SEG#
-x86_64 FR-rd-missing xchgq +REG_SEG#
-x86_64 FR-rd-missing xchgw +REG_SEG#
-x86_64 FR-rd-missing xorb +REG_SEG#
-x86_64 FR-rd-missing xorl +REG_SEG#
-x86_64 FR-rd-missing xorps +REG_SEG#
-x86_64 FR-rd-missing xorq +REG_SEG#
-x86_64 FR-rd-missing xorw +REG_SEG#
-x86_64 FR-rd-missing xrstor +REG_SEG#
-x86_64 FR-rd-missing xrstor64 +REG_SEG#
-x86_64 FR-rd-missing xrstors +REG_SEG#
-x86_64 FR-rd-missing xrstors64 +REG_SEG#
-x86_64 FR-rd-missing xsave +REG_SEG#
-x86_64 FR-rd-missing xsave64 +REG_SEG#
-x86_64 FR-rd-missing xsavec +REG_SEG#
-x86_64 FR-rd-missing xsavec64 +REG_SEG#
-x86_64 FR-rd-missing xsaveopt +REG_SEG#
-x86_64 FR-rd-missing xsaveopt64 +REG_SEG#
-x86_64 FR-rd-missing xsaves +REG_SEG#
-x86_64 FR-rd-missing xsaves64 +REG_SEG#
-x86_64 FR-rd-phantom fcoml +REG_FPR#,REG_SEG#
-x86_64 FR-rd-phantom fcompl +REG_FPR#,REG_SEG#
-x86_64 FR-rd-phantom fcomps +REG_FPR#,REG_SEG#
-x86_64 FR-rd-phantom fcoms +REG_FPR#,REG_SEG#
-x86_64 FR-rd-phantom ficoml +REG_FPR#,REG_SEG#
-x86_64 FR-rd-phantom ficompl +REG_FPR#,REG_SEG#
-x86_64 FR-rd-phantom ficomps +REG_FPR#,REG_SEG#
-x86_64 FR-rd-phantom ficoms +REG_FPR#,REG_SEG#
+#
+# GRANULARITY.  These rows name the SEGMENT REGISTER, not the bank.  They
+# used to read `+REG_SEG#`, because the signature key elided every bank
+# index; REG_SEG0..5 are six architecturally distinct registers, so that
+# elision handed back exactly the conflation the split IDs exist to
+# prevent -- one row justified for an inert override licensed all six, and
+# a defect that swapped one segment for another keyed identically to the
+# correct mapping.  The index is now elided only for an INDEXED FILE
+# (generic_reg_is_indexed_file(), champsim_tracer_generic_ids.h), where the
+# members are interchangeable and one defect would otherwise mint 32 rows.
+#
+# What the finer key states, and the sweep now enforces line by line: every
+# `FR-rd-missing` row below is REG_SEG0 (cs), REG_SEG1 (ds), REG_SEG2 (es)
+# or REG_SEG5 (ss) -- the four whose base is zero in 64-bit mode -- and NOT
+# ONE is REG_SEG3 (fs) or REG_SEG4 (gs).  The live-base overrides agree on
+# both sides.  Under `+REG_SEG#` that discriminator could only be checked
+# by hand, off to the side of the gate; it is now the allowlist itself.
+x86_64 FR-rd-missing adcb +REG_SEG0
+x86_64 FR-rd-missing adcb +REG_SEG1
+x86_64 FR-rd-missing adcb +REG_SEG2
+x86_64 FR-rd-missing adcb +REG_SEG5
+x86_64 FR-rd-missing adcl +REG_SEG0
+x86_64 FR-rd-missing adcl +REG_SEG1
+x86_64 FR-rd-missing adcl +REG_SEG2
+x86_64 FR-rd-missing adcl +REG_SEG5
+x86_64 FR-rd-missing adcq +REG_SEG0
+x86_64 FR-rd-missing adcq +REG_SEG1
+x86_64 FR-rd-missing adcw +REG_SEG0
+x86_64 FR-rd-missing adcw +REG_SEG1
+x86_64 FR-rd-missing adcw +REG_SEG2
+x86_64 FR-rd-missing adcw +REG_SEG5
+x86_64 FR-rd-missing addb +REG_SEG0
+x86_64 FR-rd-missing addb +REG_SEG1
+x86_64 FR-rd-missing addb +REG_SEG2
+x86_64 FR-rd-missing addb +REG_SEG5
+x86_64 FR-rd-missing addl +REG_SEG0
+x86_64 FR-rd-missing addl +REG_SEG1
+x86_64 FR-rd-missing addl +REG_SEG2
+x86_64 FR-rd-missing addl +REG_SEG5
+x86_64 FR-rd-missing addps +REG_SEG0
+x86_64 FR-rd-missing addps +REG_SEG1
+x86_64 FR-rd-missing addq +REG_SEG0
+x86_64 FR-rd-missing addq +REG_SEG1
+x86_64 FR-rd-missing addw +REG_SEG0
+x86_64 FR-rd-missing addw +REG_SEG1
+x86_64 FR-rd-missing addw +REG_SEG2
+x86_64 FR-rd-missing addw +REG_SEG5
+x86_64 FR-rd-missing andb +REG_SEG0
+x86_64 FR-rd-missing andb +REG_SEG1
+x86_64 FR-rd-missing andb +REG_SEG2
+x86_64 FR-rd-missing andb +REG_SEG5
+x86_64 FR-rd-missing andl +REG_SEG0
+x86_64 FR-rd-missing andl +REG_SEG1
+x86_64 FR-rd-missing andl +REG_SEG2
+x86_64 FR-rd-missing andl +REG_SEG5
+x86_64 FR-rd-missing andnps +REG_SEG0
+x86_64 FR-rd-missing andnps +REG_SEG1
+x86_64 FR-rd-missing andps +REG_SEG0
+x86_64 FR-rd-missing andps +REG_SEG1
+x86_64 FR-rd-missing andq +REG_SEG0
+x86_64 FR-rd-missing andq +REG_SEG1
+x86_64 FR-rd-missing andw +REG_SEG0
+x86_64 FR-rd-missing andw +REG_SEG1
+x86_64 FR-rd-missing andw +REG_SEG2
+x86_64 FR-rd-missing andw +REG_SEG5
+x86_64 FR-rd-missing bsfl +REG_SEG0
+x86_64 FR-rd-missing bsfl +REG_SEG1
+x86_64 FR-rd-missing bsfq +REG_SEG0
+x86_64 FR-rd-missing bsfq +REG_SEG1
+x86_64 FR-rd-missing bsrl +REG_SEG0
+x86_64 FR-rd-missing bsrl +REG_SEG1
+x86_64 FR-rd-missing bsrq +REG_SEG0
+x86_64 FR-rd-missing bsrq +REG_SEG1
+x86_64 FR-rd-missing btcl +REG_SEG0
+x86_64 FR-rd-missing btcl +REG_SEG1
+x86_64 FR-rd-missing btcq +REG_SEG0
+x86_64 FR-rd-missing btcq +REG_SEG1
+x86_64 FR-rd-missing btl +REG_SEG0
+x86_64 FR-rd-missing btl +REG_SEG1
+x86_64 FR-rd-missing btq +REG_SEG0
+x86_64 FR-rd-missing btq +REG_SEG1
+x86_64 FR-rd-missing btrl +REG_SEG0
+x86_64 FR-rd-missing btrl +REG_SEG1
+x86_64 FR-rd-missing btrq +REG_SEG0
+x86_64 FR-rd-missing btrq +REG_SEG1
+x86_64 FR-rd-missing btsl +REG_SEG0
+x86_64 FR-rd-missing btsl +REG_SEG1
+x86_64 FR-rd-missing btsq +REG_SEG0
+x86_64 FR-rd-missing btsq +REG_SEG1
+x86_64 FR-rd-missing cldemote +REG_SEG0
+x86_64 FR-rd-missing cldemote +REG_SEG1
+x86_64 FR-rd-missing clflush +REG_SEG0
+x86_64 FR-rd-missing clflush +REG_SEG1
+x86_64 FR-rd-missing cmovael +REG_SEG0
+x86_64 FR-rd-missing cmovael +REG_SEG1
+x86_64 FR-rd-missing cmovaeq +REG_SEG0
+x86_64 FR-rd-missing cmovaeq +REG_SEG1
+x86_64 FR-rd-missing cmoval +REG_SEG0
+x86_64 FR-rd-missing cmoval +REG_SEG1
+x86_64 FR-rd-missing cmovaq +REG_SEG0
+x86_64 FR-rd-missing cmovaq +REG_SEG1
+x86_64 FR-rd-missing cmovbel +REG_SEG0
+x86_64 FR-rd-missing cmovbel +REG_SEG1
+x86_64 FR-rd-missing cmovbeq +REG_SEG0
+x86_64 FR-rd-missing cmovbeq +REG_SEG1
+x86_64 FR-rd-missing cmovbl +REG_SEG0
+x86_64 FR-rd-missing cmovbl +REG_SEG1
+x86_64 FR-rd-missing cmovbq +REG_SEG0
+x86_64 FR-rd-missing cmovbq +REG_SEG1
+x86_64 FR-rd-missing cmovel +REG_SEG0
+x86_64 FR-rd-missing cmovel +REG_SEG1
+x86_64 FR-rd-missing cmoveq +REG_SEG0
+x86_64 FR-rd-missing cmoveq +REG_SEG1
+x86_64 FR-rd-missing cmovgel +REG_SEG0
+x86_64 FR-rd-missing cmovgel +REG_SEG1
+x86_64 FR-rd-missing cmovgeq +REG_SEG0
+x86_64 FR-rd-missing cmovgeq +REG_SEG1
+x86_64 FR-rd-missing cmovgl +REG_SEG0
+x86_64 FR-rd-missing cmovgl +REG_SEG1
+x86_64 FR-rd-missing cmovgq +REG_SEG0
+x86_64 FR-rd-missing cmovgq +REG_SEG1
+x86_64 FR-rd-missing cmovlel +REG_SEG0
+x86_64 FR-rd-missing cmovlel +REG_SEG1
+x86_64 FR-rd-missing cmovleq +REG_SEG0
+x86_64 FR-rd-missing cmovleq +REG_SEG1
+x86_64 FR-rd-missing cmovll +REG_SEG0
+x86_64 FR-rd-missing cmovll +REG_SEG1
+x86_64 FR-rd-missing cmovlq +REG_SEG0
+x86_64 FR-rd-missing cmovlq +REG_SEG1
+x86_64 FR-rd-missing cmovnel +REG_SEG0
+x86_64 FR-rd-missing cmovnel +REG_SEG1
+x86_64 FR-rd-missing cmovneq +REG_SEG0
+x86_64 FR-rd-missing cmovneq +REG_SEG1
+x86_64 FR-rd-missing cmovnol +REG_SEG0
+x86_64 FR-rd-missing cmovnol +REG_SEG1
+x86_64 FR-rd-missing cmovnoq +REG_SEG0
+x86_64 FR-rd-missing cmovnoq +REG_SEG1
+x86_64 FR-rd-missing cmovnpl +REG_SEG0
+x86_64 FR-rd-missing cmovnpl +REG_SEG1
+x86_64 FR-rd-missing cmovnpq +REG_SEG0
+x86_64 FR-rd-missing cmovnpq +REG_SEG1
+x86_64 FR-rd-missing cmovnsl +REG_SEG0
+x86_64 FR-rd-missing cmovnsl +REG_SEG1
+x86_64 FR-rd-missing cmovnsq +REG_SEG0
+x86_64 FR-rd-missing cmovnsq +REG_SEG1
+x86_64 FR-rd-missing cmovol +REG_SEG0
+x86_64 FR-rd-missing cmovol +REG_SEG1
+x86_64 FR-rd-missing cmovoq +REG_SEG0
+x86_64 FR-rd-missing cmovoq +REG_SEG1
+x86_64 FR-rd-missing cmovpl +REG_SEG0
+x86_64 FR-rd-missing cmovpl +REG_SEG1
+x86_64 FR-rd-missing cmovpq +REG_SEG0
+x86_64 FR-rd-missing cmovpq +REG_SEG1
+x86_64 FR-rd-missing cmovsl +REG_SEG0
+x86_64 FR-rd-missing cmovsl +REG_SEG1
+x86_64 FR-rd-missing cmovsq +REG_SEG0
+x86_64 FR-rd-missing cmovsq +REG_SEG1
+x86_64 FR-rd-missing cmpb +REG_SEG0
+x86_64 FR-rd-missing cmpb +REG_SEG1
+x86_64 FR-rd-missing cmpb +REG_SEG2
+x86_64 FR-rd-missing cmpb +REG_SEG5
+x86_64 FR-rd-missing cmpeqps +REG_SEG0
+x86_64 FR-rd-missing cmpeqps +REG_SEG1
+x86_64 FR-rd-missing cmpl +REG_SEG0
+x86_64 FR-rd-missing cmpl +REG_SEG1
+x86_64 FR-rd-missing cmpl +REG_SEG2
+x86_64 FR-rd-missing cmpl +REG_SEG5
+x86_64 FR-rd-missing cmpps +REG_SEG0
+x86_64 FR-rd-missing cmpps +REG_SEG1
+x86_64 FR-rd-missing cmpq +REG_SEG0
+x86_64 FR-rd-missing cmpq +REG_SEG1
+x86_64 FR-rd-missing cmpw +REG_SEG0
+x86_64 FR-rd-missing cmpw +REG_SEG1
+x86_64 FR-rd-missing cmpw +REG_SEG2
+x86_64 FR-rd-missing cmpw +REG_SEG5
+x86_64 FR-rd-missing cmpxchg16b +REG_GPR#,REG_SEG0
+x86_64 FR-rd-missing cmpxchg16b +REG_GPR#,REG_SEG1
+x86_64 FR-rd-missing cmpxchg8b +REG_GPR#,REG_SEG0
+x86_64 FR-rd-missing cmpxchg8b +REG_GPR#,REG_SEG1
+x86_64 FR-rd-missing cmpxchgb +REG_SEG0
+x86_64 FR-rd-missing cmpxchgb +REG_SEG1
+x86_64 FR-rd-missing cmpxchgl +REG_SEG0
+x86_64 FR-rd-missing cmpxchgl +REG_SEG1
+x86_64 FR-rd-missing cmpxchgq +REG_SEG0
+x86_64 FR-rd-missing cmpxchgq +REG_SEG1
+x86_64 FR-rd-missing comiss +REG_SEG0
+x86_64 FR-rd-missing comiss +REG_SEG1
+x86_64 FR-rd-missing cvtdq2ps +REG_SEG0
+x86_64 FR-rd-missing cvtdq2ps +REG_SEG1
+x86_64 FR-rd-missing cvtpi2ps +REG_SEG0
+x86_64 FR-rd-missing cvtpi2ps +REG_SEG1
+x86_64 FR-rd-missing cvtps2pd +REG_SEG0
+x86_64 FR-rd-missing cvtps2pd +REG_SEG1
+x86_64 FR-rd-missing cvtps2pi +REG_SEG0
+x86_64 FR-rd-missing cvtps2pi +REG_SEG1
+x86_64 FR-rd-missing cvttps2pi +REG_SEG0
+x86_64 FR-rd-missing cvttps2pi +REG_SEG1
+x86_64 FR-rd-missing decb +REG_SEG0
+x86_64 FR-rd-missing decb +REG_SEG1
+x86_64 FR-rd-missing decl +REG_SEG0
+x86_64 FR-rd-missing decl +REG_SEG1
+x86_64 FR-rd-missing decq +REG_SEG0
+x86_64 FR-rd-missing decq +REG_SEG1
+x86_64 FR-rd-missing divb +REG_SEG0
+x86_64 FR-rd-missing divb +REG_SEG1
+x86_64 FR-rd-missing divl +REG_SEG0
+x86_64 FR-rd-missing divl +REG_SEG1
+x86_64 FR-rd-missing divps +REG_SEG0
+x86_64 FR-rd-missing divps +REG_SEG1
+x86_64 FR-rd-missing divq +REG_SEG0
+x86_64 FR-rd-missing divq +REG_SEG1
+x86_64 FR-rd-missing faddl +REG_SEG0
+x86_64 FR-rd-missing faddl +REG_SEG1
+x86_64 FR-rd-missing fadds +REG_SEG0
+x86_64 FR-rd-missing fadds +REG_SEG1
+x86_64 FR-rd-missing fbld +REG_SEG0
+x86_64 FR-rd-missing fbld +REG_SEG1
+x86_64 FR-rd-missing fbstp +REG_SEG0
+x86_64 FR-rd-missing fbstp +REG_SEG1
+x86_64 FR-rd-missing fdivl +REG_SEG0
+x86_64 FR-rd-missing fdivl +REG_SEG1
+x86_64 FR-rd-missing fdivrl +REG_SEG0
+x86_64 FR-rd-missing fdivrl +REG_SEG1
+x86_64 FR-rd-missing fdivrs +REG_SEG0
+x86_64 FR-rd-missing fdivrs +REG_SEG1
+x86_64 FR-rd-missing fdivs +REG_SEG0
+x86_64 FR-rd-missing fdivs +REG_SEG1
+x86_64 FR-rd-missing fiaddl +REG_SEG0
+x86_64 FR-rd-missing fiaddl +REG_SEG1
+x86_64 FR-rd-missing fiadds +REG_SEG0
+x86_64 FR-rd-missing fiadds +REG_SEG1
+x86_64 FR-rd-missing fidivl +REG_SEG0
+x86_64 FR-rd-missing fidivl +REG_SEG1
+x86_64 FR-rd-missing fidivrl +REG_SEG0
+x86_64 FR-rd-missing fidivrl +REG_SEG1
+x86_64 FR-rd-missing fidivrs +REG_SEG0
+x86_64 FR-rd-missing fidivrs +REG_SEG1
+x86_64 FR-rd-missing fidivs +REG_SEG0
+x86_64 FR-rd-missing fidivs +REG_SEG1
+x86_64 FR-rd-missing fildl +REG_SEG0
+x86_64 FR-rd-missing fildl +REG_SEG1
+x86_64 FR-rd-missing fildll +REG_SEG0
+x86_64 FR-rd-missing fildll +REG_SEG1
+x86_64 FR-rd-missing filds +REG_SEG0
+x86_64 FR-rd-missing filds +REG_SEG1
+x86_64 FR-rd-missing fimull +REG_SEG0
+x86_64 FR-rd-missing fimull +REG_SEG1
+x86_64 FR-rd-missing fimuls +REG_SEG0
+x86_64 FR-rd-missing fimuls +REG_SEG1
+x86_64 FR-rd-missing fistl +REG_SEG0
+x86_64 FR-rd-missing fistl +REG_SEG1
+x86_64 FR-rd-missing fistl +REG_SEG2
+x86_64 FR-rd-missing fistl +REG_SEG5
+x86_64 FR-rd-missing fistpl +REG_SEG0
+x86_64 FR-rd-missing fistpl +REG_SEG1
+x86_64 FR-rd-missing fistpll +REG_SEG0
+x86_64 FR-rd-missing fistpll +REG_SEG1
+x86_64 FR-rd-missing fistps +REG_SEG0
+x86_64 FR-rd-missing fistps +REG_SEG1
+x86_64 FR-rd-missing fists +REG_SEG0
+x86_64 FR-rd-missing fists +REG_SEG1
+x86_64 FR-rd-missing fists +REG_SEG2
+x86_64 FR-rd-missing fists +REG_SEG5
+x86_64 FR-rd-missing fisttpl +REG_SEG0
+x86_64 FR-rd-missing fisttpl +REG_SEG1
+x86_64 FR-rd-missing fisttpll +REG_SEG0
+x86_64 FR-rd-missing fisttpll +REG_SEG1
+x86_64 FR-rd-missing fisttps +REG_SEG0
+x86_64 FR-rd-missing fisttps +REG_SEG1
+x86_64 FR-rd-missing fisubl +REG_SEG0
+x86_64 FR-rd-missing fisubl +REG_SEG1
+x86_64 FR-rd-missing fisubrl +REG_SEG0
+x86_64 FR-rd-missing fisubrl +REG_SEG1
+x86_64 FR-rd-missing fisubrs +REG_SEG0
+x86_64 FR-rd-missing fisubrs +REG_SEG1
+x86_64 FR-rd-missing fisubs +REG_SEG0
+x86_64 FR-rd-missing fisubs +REG_SEG1
+x86_64 FR-rd-missing fldcw +REG_SEG0
+x86_64 FR-rd-missing fldcw +REG_SEG1
+x86_64 FR-rd-missing fldenv +REG_SEG0
+x86_64 FR-rd-missing fldenv +REG_SEG1
+x86_64 FR-rd-missing fldl +REG_SEG0
+x86_64 FR-rd-missing fldl +REG_SEG1
+x86_64 FR-rd-missing flds +REG_SEG0
+x86_64 FR-rd-missing flds +REG_SEG1
+x86_64 FR-rd-missing fldt +REG_SEG0
+x86_64 FR-rd-missing fldt +REG_SEG1
+x86_64 FR-rd-missing fmull +REG_SEG0
+x86_64 FR-rd-missing fmull +REG_SEG1
+x86_64 FR-rd-missing fmuls +REG_SEG0
+x86_64 FR-rd-missing fmuls +REG_SEG1
+x86_64 FR-rd-missing fnstcw +REG_SEG0
+x86_64 FR-rd-missing fnstcw +REG_SEG1
+x86_64 FR-rd-missing fnstenv +REG_FCSR,REG_SEG0
+x86_64 FR-rd-missing fnstenv +REG_FCSR,REG_SEG1
+x86_64 FR-rd-missing fnstsw +REG_FCSR,REG_SEG0
+x86_64 FR-rd-missing fnstsw +REG_FCSR,REG_SEG1
+x86_64 FR-rd-missing frstor +REG_SEG0
+x86_64 FR-rd-missing frstor +REG_SEG1
+x86_64 FR-rd-missing fstl +REG_SEG0
+x86_64 FR-rd-missing fstl +REG_SEG1
+x86_64 FR-rd-missing fstl +REG_SEG2
+x86_64 FR-rd-missing fstl +REG_SEG5
+x86_64 FR-rd-missing fstpl +REG_SEG0
+x86_64 FR-rd-missing fstpl +REG_SEG1
+x86_64 FR-rd-missing fstps +REG_SEG0
+x86_64 FR-rd-missing fstps +REG_SEG1
+x86_64 FR-rd-missing fstpt +REG_SEG0
+x86_64 FR-rd-missing fstpt +REG_SEG1
+x86_64 FR-rd-missing fsts +REG_SEG0
+x86_64 FR-rd-missing fsts +REG_SEG1
+x86_64 FR-rd-missing fsts +REG_SEG2
+x86_64 FR-rd-missing fsts +REG_SEG5
+x86_64 FR-rd-missing fsubl +REG_SEG0
+x86_64 FR-rd-missing fsubl +REG_SEG1
+x86_64 FR-rd-missing fsubrl +REG_SEG0
+x86_64 FR-rd-missing fsubrl +REG_SEG1
+x86_64 FR-rd-missing fsubrs +REG_SEG0
+x86_64 FR-rd-missing fsubrs +REG_SEG1
+x86_64 FR-rd-missing fsubs +REG_SEG0
+x86_64 FR-rd-missing fsubs +REG_SEG1
+x86_64 FR-rd-missing fxrstor +REG_SEG0
+x86_64 FR-rd-missing fxrstor +REG_SEG1
+x86_64 FR-rd-missing fxrstor64 +REG_SEG0
+x86_64 FR-rd-missing fxrstor64 +REG_SEG1
+x86_64 FR-rd-missing idivb +REG_SEG0
+x86_64 FR-rd-missing idivb +REG_SEG1
+x86_64 FR-rd-missing idivl +REG_SEG0
+x86_64 FR-rd-missing idivl +REG_SEG1
+x86_64 FR-rd-missing idivq +REG_SEG0
+x86_64 FR-rd-missing idivq +REG_SEG1
+x86_64 FR-rd-missing imulb +REG_SEG0
+x86_64 FR-rd-missing imulb +REG_SEG1
+x86_64 FR-rd-missing imull +REG_SEG0
+x86_64 FR-rd-missing imull +REG_SEG1
+x86_64 FR-rd-missing imull +REG_SEG2
+x86_64 FR-rd-missing imull +REG_SEG5
+x86_64 FR-rd-missing imulq +REG_SEG0
+x86_64 FR-rd-missing imulq +REG_SEG1
+x86_64 FR-rd-missing imulq +REG_SEG2
+x86_64 FR-rd-missing imulq +REG_SEG5
+x86_64 FR-rd-missing imulw +REG_SEG0
+x86_64 FR-rd-missing imulw +REG_SEG1
+x86_64 FR-rd-missing imulw +REG_SEG2
+x86_64 FR-rd-missing imulw +REG_SEG5
+x86_64 FR-rd-missing incb +REG_SEG0
+x86_64 FR-rd-missing incb +REG_SEG1
+x86_64 FR-rd-missing incl +REG_SEG0
+x86_64 FR-rd-missing incl +REG_SEG1
+x86_64 FR-rd-missing incq +REG_SEG0
+x86_64 FR-rd-missing incq +REG_SEG1
+x86_64 FR-rd-missing invlpg +REG_SEG0
+x86_64 FR-rd-missing invlpg +REG_SEG1
+x86_64 FR-rd-missing jmpq +REG_SEG0
+x86_64 FR-rd-missing larl +REG_SEG0
+x86_64 FR-rd-missing larl +REG_SEG1
+x86_64 FR-rd-missing larq +REG_SEG0
+x86_64 FR-rd-missing larq +REG_SEG1
+x86_64 FR-rd-missing ldmxcsr +REG_SEG0
+x86_64 FR-rd-missing ldmxcsr +REG_SEG1
+x86_64 FR-rd-missing leal +REG_SEG0
+x86_64 FR-rd-missing leal +REG_SEG1
+x86_64 FR-rd-missing leal +REG_SEG2
+x86_64 FR-rd-missing leal +REG_SEG5
+x86_64 FR-rd-missing leaq +REG_SEG0
+x86_64 FR-rd-missing leaq +REG_SEG1
+x86_64 FR-rd-missing leaw +REG_SEG0
+x86_64 FR-rd-missing leaw +REG_SEG1
+x86_64 FR-rd-missing leaw +REG_SEG2
+x86_64 FR-rd-missing leaw +REG_SEG5
+x86_64 FR-rd-missing lfsl +REG_SEG0
+x86_64 FR-rd-missing lfsl +REG_SEG1
+x86_64 FR-rd-missing lfsq +REG_SEG0
+x86_64 FR-rd-missing lfsq +REG_SEG1
+x86_64 FR-rd-missing lgdtq +REG_SEG0
+x86_64 FR-rd-missing lgdtq +REG_SEG1
+x86_64 FR-rd-missing lgs +REG_SEG0
+x86_64 FR-rd-missing lgs +REG_SEG1
+x86_64 FR-rd-missing lgsl +REG_SEG0
+x86_64 FR-rd-missing lgsl +REG_SEG1
+x86_64 FR-rd-missing lidtq +REG_SEG0
+x86_64 FR-rd-missing lidtq +REG_SEG1
+x86_64 FR-rd-missing ljmpl +REG_SEG0
+x86_64 FR-rd-missing ljmpq +REG_SEG0
+x86_64 FR-rd-missing ljmpq +REG_SEG1
+x86_64 FR-rd-missing lldtw +REG_SEG0
+x86_64 FR-rd-missing lldtw +REG_SEG1
+x86_64 FR-rd-missing lmsww +REG_SEG0
+x86_64 FR-rd-missing lmsww +REG_SEG1
+x86_64 FR-rd-missing lock adcb +REG_SEG0
+x86_64 FR-rd-missing lock adcb +REG_SEG1
+x86_64 FR-rd-missing lock adcl +REG_SEG0
+x86_64 FR-rd-missing lock adcl +REG_SEG1
+x86_64 FR-rd-missing lock adcl +REG_SEG2
+x86_64 FR-rd-missing lock adcl +REG_SEG5
+x86_64 FR-rd-missing lock adcw +REG_SEG0
+x86_64 FR-rd-missing lock adcw +REG_SEG1
+x86_64 FR-rd-missing lock adcw +REG_SEG2
+x86_64 FR-rd-missing lock adcw +REG_SEG5
+x86_64 FR-rd-missing lock addb +REG_SEG0
+x86_64 FR-rd-missing lock addb +REG_SEG1
+x86_64 FR-rd-missing lock addb +REG_SEG2
+x86_64 FR-rd-missing lock addb +REG_SEG5
+x86_64 FR-rd-missing lock addl +REG_SEG0
+x86_64 FR-rd-missing lock addl +REG_SEG1
+x86_64 FR-rd-missing lock andb +REG_SEG0
+x86_64 FR-rd-missing lock andb +REG_SEG1
+x86_64 FR-rd-missing lock andl +REG_SEG0
+x86_64 FR-rd-missing lock andl +REG_SEG1
+x86_64 FR-rd-missing lock notb +REG_SEG0
+x86_64 FR-rd-missing lock notb +REG_SEG1
+x86_64 FR-rd-missing lock notl +REG_SEG0
+x86_64 FR-rd-missing lock notl +REG_SEG1
+x86_64 FR-rd-missing lock orb +REG_SEG0
+x86_64 FR-rd-missing lock orb +REG_SEG1
+x86_64 FR-rd-missing lock orl +REG_SEG0
+x86_64 FR-rd-missing lock orl +REG_SEG1
+x86_64 FR-rd-missing lock sbbb +REG_SEG0
+x86_64 FR-rd-missing lock sbbb +REG_SEG1
+x86_64 FR-rd-missing lock sbbl +REG_SEG0
+x86_64 FR-rd-missing lock sbbl +REG_SEG1
+x86_64 FR-rd-missing lock subb +REG_SEG0
+x86_64 FR-rd-missing lock subb +REG_SEG1
+x86_64 FR-rd-missing lock subl +REG_SEG0
+x86_64 FR-rd-missing lock subl +REG_SEG1
+x86_64 FR-rd-missing lock xchgb +REG_SEG0
+x86_64 FR-rd-missing lock xchgb +REG_SEG1
+x86_64 FR-rd-missing lock xchgl +REG_SEG0
+x86_64 FR-rd-missing lock xchgl +REG_SEG1
+x86_64 FR-rd-missing lock xorb +REG_SEG0
+x86_64 FR-rd-missing lock xorb +REG_SEG1
+x86_64 FR-rd-missing lock xorl +REG_SEG0
+x86_64 FR-rd-missing lock xorl +REG_SEG1
+x86_64 FR-rd-missing lsll +REG_SEG0
+x86_64 FR-rd-missing lsll +REG_SEG1
+x86_64 FR-rd-missing lslq +REG_SEG0
+x86_64 FR-rd-missing lslq +REG_SEG1
+x86_64 FR-rd-missing lssl +REG_SEG0
+x86_64 FR-rd-missing lssl +REG_SEG1
+x86_64 FR-rd-missing lssq +REG_SEG0
+x86_64 FR-rd-missing lssq +REG_SEG1
+x86_64 FR-rd-missing ltrw +REG_SEG0
+x86_64 FR-rd-missing ltrw +REG_SEG1
+x86_64 FR-rd-missing maxps +REG_SEG0
+x86_64 FR-rd-missing maxps +REG_SEG1
+x86_64 FR-rd-missing minps +REG_SEG0
+x86_64 FR-rd-missing minps +REG_SEG1
+x86_64 FR-rd-missing movabsb +REG_SEG0
+x86_64 FR-rd-missing movabsb +REG_SEG1
+x86_64 FR-rd-missing movabsb +REG_SEG2
+x86_64 FR-rd-missing movabsb +REG_SEG5
+x86_64 FR-rd-missing movabsl +REG_SEG0
+x86_64 FR-rd-missing movabsl +REG_SEG1
+x86_64 FR-rd-missing movabsl +REG_SEG2
+x86_64 FR-rd-missing movabsl +REG_SEG5
+x86_64 FR-rd-missing movabsq +REG_SEG0
+x86_64 FR-rd-missing movabsq +REG_SEG1
+x86_64 FR-rd-missing movabsw +REG_SEG0
+x86_64 FR-rd-missing movabsw +REG_SEG1
+x86_64 FR-rd-missing movabsw +REG_SEG2
+x86_64 FR-rd-missing movabsw +REG_SEG5
+x86_64 FR-rd-missing movaps +REG_SEG0
+x86_64 FR-rd-missing movaps +REG_SEG1
+x86_64 FR-rd-missing movb +REG_SEG0
+x86_64 FR-rd-missing movb +REG_SEG1
+x86_64 FR-rd-missing movb +REG_SEG2
+x86_64 FR-rd-missing movb +REG_SEG5
+x86_64 FR-rd-missing movbel +REG_SEG0
+x86_64 FR-rd-missing movbel +REG_SEG1
+x86_64 FR-rd-missing movbeq +REG_SEG0
+x86_64 FR-rd-missing movbeq +REG_SEG1
+x86_64 FR-rd-missing movd +REG_SEG0
+x86_64 FR-rd-missing movd +REG_SEG1
+x86_64 FR-rd-missing movdiri +REG_SEG0
+x86_64 FR-rd-missing movdiri +REG_SEG1
+x86_64 FR-rd-missing movhps +REG_SEG0
+x86_64 FR-rd-missing movhps +REG_SEG1
+x86_64 FR-rd-missing movl +REG_SEG0
+x86_64 FR-rd-missing movl +REG_SEG1
+x86_64 FR-rd-missing movl +REG_SEG2
+x86_64 FR-rd-missing movl +REG_SEG5
+x86_64 FR-rd-missing movlps +REG_SEG0
+x86_64 FR-rd-missing movlps +REG_SEG1
+x86_64 FR-rd-missing movntil +REG_SEG0
+x86_64 FR-rd-missing movntil +REG_SEG1
+x86_64 FR-rd-missing movntiq +REG_SEG0
+x86_64 FR-rd-missing movntiq +REG_SEG1
+x86_64 FR-rd-missing movntps +REG_SEG0
+x86_64 FR-rd-missing movntps +REG_SEG1
+x86_64 FR-rd-missing movntq +REG_SEG0
+x86_64 FR-rd-missing movntq +REG_SEG1
+x86_64 FR-rd-missing movq +REG_SEG0
+x86_64 FR-rd-missing movq +REG_SEG1
+x86_64 FR-rd-missing movsbl +REG_SEG0
+x86_64 FR-rd-missing movsbl +REG_SEG1
+x86_64 FR-rd-missing movsbq +REG_SEG0
+x86_64 FR-rd-missing movsbq +REG_SEG1
+x86_64 FR-rd-missing movslq +REG_SEG0
+x86_64 FR-rd-missing movslq +REG_SEG1
+x86_64 FR-rd-missing movslq +REG_SEG2
+x86_64 FR-rd-missing movslq +REG_SEG5
+x86_64 FR-rd-missing movswl +REG_SEG0
+x86_64 FR-rd-missing movswl +REG_SEG1
+x86_64 FR-rd-missing movswq +REG_SEG0
+x86_64 FR-rd-missing movswq +REG_SEG1
+x86_64 FR-rd-missing movups +REG_SEG0
+x86_64 FR-rd-missing movups +REG_SEG1
+x86_64 FR-rd-missing movw +REG_SEG0
+x86_64 FR-rd-missing movw +REG_SEG1
+x86_64 FR-rd-missing movw +REG_SEG2
+x86_64 FR-rd-missing movw +REG_SEG5
+x86_64 FR-rd-missing movzbl +REG_SEG0
+x86_64 FR-rd-missing movzbl +REG_SEG1
+x86_64 FR-rd-missing movzbq +REG_SEG0
+x86_64 FR-rd-missing movzbq +REG_SEG1
+x86_64 FR-rd-missing movzwl +REG_SEG0
+x86_64 FR-rd-missing movzwl +REG_SEG1
+x86_64 FR-rd-missing movzwq +REG_SEG0
+x86_64 FR-rd-missing movzwq +REG_SEG1
+x86_64 FR-rd-missing mulb +REG_SEG0
+x86_64 FR-rd-missing mulb +REG_SEG1
+x86_64 FR-rd-missing mull +REG_SEG0
+x86_64 FR-rd-missing mull +REG_SEG1
+x86_64 FR-rd-missing mulps +REG_SEG0
+x86_64 FR-rd-missing mulps +REG_SEG1
+x86_64 FR-rd-missing mulq +REG_SEG0
+x86_64 FR-rd-missing mulq +REG_SEG1
+x86_64 FR-rd-missing negb +REG_SEG0
+x86_64 FR-rd-missing negb +REG_SEG1
+x86_64 FR-rd-missing negl +REG_SEG0
+x86_64 FR-rd-missing negl +REG_SEG1
+x86_64 FR-rd-missing negq +REG_SEG0
+x86_64 FR-rd-missing negq +REG_SEG1
+x86_64 FR-rd-missing nopl +REG_SEG0
+x86_64 FR-rd-missing nopl +REG_SEG1
+x86_64 FR-rd-missing nopq +REG_SEG0
+x86_64 FR-rd-missing nopq +REG_SEG1
+x86_64 FR-rd-missing notb +REG_SEG0
+x86_64 FR-rd-missing notb +REG_SEG1
+x86_64 FR-rd-missing notb +REG_SEG2
+x86_64 FR-rd-missing notb +REG_SEG5
+x86_64 FR-rd-missing notl +REG_SEG0
+x86_64 FR-rd-missing notl +REG_SEG1
+x86_64 FR-rd-missing notl +REG_SEG2
+x86_64 FR-rd-missing notl +REG_SEG5
+x86_64 FR-rd-missing notq +REG_SEG0
+x86_64 FR-rd-missing notq +REG_SEG1
+x86_64 FR-rd-missing notrack jmpq +REG_SEG1
+x86_64 FR-rd-missing notrack ljmpl +REG_SEG1
+x86_64 FR-rd-missing notw +REG_SEG0
+x86_64 FR-rd-missing notw +REG_SEG1
+x86_64 FR-rd-missing notw +REG_SEG2
+x86_64 FR-rd-missing notw +REG_SEG5
+x86_64 FR-rd-missing orb +REG_SEG0
+x86_64 FR-rd-missing orb +REG_SEG1
+x86_64 FR-rd-missing orb +REG_SEG2
+x86_64 FR-rd-missing orb +REG_SEG5
+x86_64 FR-rd-missing orl +REG_SEG0
+x86_64 FR-rd-missing orl +REG_SEG1
+x86_64 FR-rd-missing orl +REG_SEG2
+x86_64 FR-rd-missing orl +REG_SEG5
+x86_64 FR-rd-missing orps +REG_SEG0
+x86_64 FR-rd-missing orps +REG_SEG1
+x86_64 FR-rd-missing orq +REG_SEG0
+x86_64 FR-rd-missing orq +REG_SEG1
+x86_64 FR-rd-missing orw +REG_SEG0
+x86_64 FR-rd-missing orw +REG_SEG1
+x86_64 FR-rd-missing orw +REG_SEG2
+x86_64 FR-rd-missing orw +REG_SEG5
+x86_64 FR-rd-missing pabsb +REG_SEG0
+x86_64 FR-rd-missing pabsb +REG_SEG1
+x86_64 FR-rd-missing pabsd +REG_SEG0
+x86_64 FR-rd-missing pabsd +REG_SEG1
+x86_64 FR-rd-missing pabsw +REG_SEG0
+x86_64 FR-rd-missing pabsw +REG_SEG1
+x86_64 FR-rd-missing packssdw +REG_SEG0
+x86_64 FR-rd-missing packssdw +REG_SEG1
+x86_64 FR-rd-missing packsswb +REG_SEG0
+x86_64 FR-rd-missing packsswb +REG_SEG1
+x86_64 FR-rd-missing packuswb +REG_SEG0
+x86_64 FR-rd-missing packuswb +REG_SEG1
+x86_64 FR-rd-missing paddb +REG_SEG0
+x86_64 FR-rd-missing paddb +REG_SEG1
+x86_64 FR-rd-missing paddd +REG_SEG0
+x86_64 FR-rd-missing paddd +REG_SEG1
+x86_64 FR-rd-missing paddq +REG_SEG0
+x86_64 FR-rd-missing paddq +REG_SEG1
+x86_64 FR-rd-missing paddsb +REG_SEG0
+x86_64 FR-rd-missing paddsb +REG_SEG1
+x86_64 FR-rd-missing paddsw +REG_SEG0
+x86_64 FR-rd-missing paddsw +REG_SEG1
+x86_64 FR-rd-missing paddusb +REG_SEG0
+x86_64 FR-rd-missing paddusb +REG_SEG1
+x86_64 FR-rd-missing paddusw +REG_SEG0
+x86_64 FR-rd-missing paddusw +REG_SEG1
+x86_64 FR-rd-missing paddw +REG_SEG0
+x86_64 FR-rd-missing paddw +REG_SEG1
+x86_64 FR-rd-missing palignr +REG_SEG0
+x86_64 FR-rd-missing palignr +REG_SEG1
+x86_64 FR-rd-missing pand +REG_SEG0
+x86_64 FR-rd-missing pand +REG_SEG1
+x86_64 FR-rd-missing pandn +REG_SEG0
+x86_64 FR-rd-missing pandn +REG_SEG1
+x86_64 FR-rd-missing pavgb +REG_SEG0
+x86_64 FR-rd-missing pavgb +REG_SEG1
+x86_64 FR-rd-missing pavgw +REG_SEG0
+x86_64 FR-rd-missing pavgw +REG_SEG1
+x86_64 FR-rd-missing pcmpeqb +REG_SEG0
+x86_64 FR-rd-missing pcmpeqb +REG_SEG1
+x86_64 FR-rd-missing pcmpeqd +REG_SEG0
+x86_64 FR-rd-missing pcmpeqd +REG_SEG1
+x86_64 FR-rd-missing pcmpeqw +REG_SEG0
+x86_64 FR-rd-missing pcmpeqw +REG_SEG1
+x86_64 FR-rd-missing pcmpgtb +REG_SEG0
+x86_64 FR-rd-missing pcmpgtb +REG_SEG1
+x86_64 FR-rd-missing pcmpgtd +REG_SEG0
+x86_64 FR-rd-missing pcmpgtd +REG_SEG1
+x86_64 FR-rd-missing pcmpgtw +REG_SEG0
+x86_64 FR-rd-missing pcmpgtw +REG_SEG1
+x86_64 FR-rd-missing phaddd +REG_SEG0
+x86_64 FR-rd-missing phaddd +REG_SEG1
+x86_64 FR-rd-missing phaddsw +REG_SEG0
+x86_64 FR-rd-missing phaddsw +REG_SEG1
+x86_64 FR-rd-missing phaddw +REG_SEG0
+x86_64 FR-rd-missing phaddw +REG_SEG1
+x86_64 FR-rd-missing phsubd +REG_SEG0
+x86_64 FR-rd-missing phsubd +REG_SEG1
+x86_64 FR-rd-missing phsubsw +REG_SEG0
+x86_64 FR-rd-missing phsubsw +REG_SEG1
+x86_64 FR-rd-missing phsubw +REG_SEG0
+x86_64 FR-rd-missing phsubw +REG_SEG1
+x86_64 FR-rd-missing pinsrw +REG_SEG0
+x86_64 FR-rd-missing pinsrw +REG_SEG1
+x86_64 FR-rd-missing pmaddubsw +REG_SEG0
+x86_64 FR-rd-missing pmaddubsw +REG_SEG1
+x86_64 FR-rd-missing pmaddwd +REG_SEG0
+x86_64 FR-rd-missing pmaddwd +REG_SEG1
+x86_64 FR-rd-missing pmaxsw +REG_SEG0
+x86_64 FR-rd-missing pmaxsw +REG_SEG1
+x86_64 FR-rd-missing pmaxub +REG_SEG0
+x86_64 FR-rd-missing pmaxub +REG_SEG1
+x86_64 FR-rd-missing pminsw +REG_SEG0
+x86_64 FR-rd-missing pminsw +REG_SEG1
+x86_64 FR-rd-missing pminub +REG_SEG0
+x86_64 FR-rd-missing pminub +REG_SEG1
+x86_64 FR-rd-missing pmulhrsw +REG_SEG0
+x86_64 FR-rd-missing pmulhrsw +REG_SEG1
+x86_64 FR-rd-missing pmulhuw +REG_SEG0
+x86_64 FR-rd-missing pmulhuw +REG_SEG1
+x86_64 FR-rd-missing pmulhw +REG_SEG0
+x86_64 FR-rd-missing pmulhw +REG_SEG1
+x86_64 FR-rd-missing pmullw +REG_SEG0
+x86_64 FR-rd-missing pmullw +REG_SEG1
+x86_64 FR-rd-missing pmuludq +REG_SEG0
+x86_64 FR-rd-missing pmuludq +REG_SEG1
+x86_64 FR-rd-missing por +REG_SEG0
+x86_64 FR-rd-missing por +REG_SEG1
+x86_64 FR-rd-missing prefetch +REG_SEG0
+x86_64 FR-rd-missing prefetch +REG_SEG1
+x86_64 FR-rd-missing prefetchnta +REG_SEG0
+x86_64 FR-rd-missing prefetchnta +REG_SEG1
+x86_64 FR-rd-missing prefetcht0 +REG_SEG0
+x86_64 FR-rd-missing prefetcht0 +REG_SEG1
+x86_64 FR-rd-missing prefetcht1 +REG_SEG0
+x86_64 FR-rd-missing prefetcht1 +REG_SEG1
+x86_64 FR-rd-missing prefetcht2 +REG_SEG0
+x86_64 FR-rd-missing prefetcht2 +REG_SEG1
+x86_64 FR-rd-missing prefetchw +REG_SEG0
+x86_64 FR-rd-missing prefetchw +REG_SEG1
+x86_64 FR-rd-missing prefetchwt1 +REG_SEG0
+x86_64 FR-rd-missing prefetchwt1 +REG_SEG1
+x86_64 FR-rd-missing psadbw +REG_SEG0
+x86_64 FR-rd-missing psadbw +REG_SEG1
+x86_64 FR-rd-missing pshufb +REG_SEG0
+x86_64 FR-rd-missing pshufb +REG_SEG1
+x86_64 FR-rd-missing pshufw +REG_SEG0
+x86_64 FR-rd-missing pshufw +REG_SEG1
+x86_64 FR-rd-missing psignb +REG_SEG0
+x86_64 FR-rd-missing psignb +REG_SEG1
+x86_64 FR-rd-missing psignd +REG_SEG0
+x86_64 FR-rd-missing psignd +REG_SEG1
+x86_64 FR-rd-missing psignw +REG_SEG0
+x86_64 FR-rd-missing psignw +REG_SEG1
+x86_64 FR-rd-missing pslld +REG_SEG0
+x86_64 FR-rd-missing pslld +REG_SEG1
+x86_64 FR-rd-missing psllq +REG_SEG0
+x86_64 FR-rd-missing psllq +REG_SEG1
+x86_64 FR-rd-missing psllw +REG_SEG0
+x86_64 FR-rd-missing psllw +REG_SEG1
+x86_64 FR-rd-missing psrad +REG_SEG0
+x86_64 FR-rd-missing psrad +REG_SEG1
+x86_64 FR-rd-missing psraw +REG_SEG0
+x86_64 FR-rd-missing psraw +REG_SEG1
+x86_64 FR-rd-missing psrld +REG_SEG0
+x86_64 FR-rd-missing psrld +REG_SEG1
+x86_64 FR-rd-missing psrlq +REG_SEG0
+x86_64 FR-rd-missing psrlq +REG_SEG1
+x86_64 FR-rd-missing psrlw +REG_SEG0
+x86_64 FR-rd-missing psrlw +REG_SEG1
+x86_64 FR-rd-missing psubb +REG_SEG0
+x86_64 FR-rd-missing psubb +REG_SEG1
+x86_64 FR-rd-missing psubd +REG_SEG0
+x86_64 FR-rd-missing psubd +REG_SEG1
+x86_64 FR-rd-missing psubq +REG_SEG0
+x86_64 FR-rd-missing psubq +REG_SEG1
+x86_64 FR-rd-missing psubsb +REG_SEG0
+x86_64 FR-rd-missing psubsb +REG_SEG1
+x86_64 FR-rd-missing psubsw +REG_SEG0
+x86_64 FR-rd-missing psubsw +REG_SEG1
+x86_64 FR-rd-missing psubusb +REG_SEG0
+x86_64 FR-rd-missing psubusb +REG_SEG1
+x86_64 FR-rd-missing psubusw +REG_SEG0
+x86_64 FR-rd-missing psubusw +REG_SEG1
+x86_64 FR-rd-missing psubw +REG_SEG0
+x86_64 FR-rd-missing psubw +REG_SEG1
+x86_64 FR-rd-missing punpckhbw +REG_SEG0
+x86_64 FR-rd-missing punpckhbw +REG_SEG1
+x86_64 FR-rd-missing punpckhdq +REG_SEG0
+x86_64 FR-rd-missing punpckhdq +REG_SEG1
+x86_64 FR-rd-missing punpckhwd +REG_SEG0
+x86_64 FR-rd-missing punpckhwd +REG_SEG1
+x86_64 FR-rd-missing punpcklbw +REG_SEG0
+x86_64 FR-rd-missing punpcklbw +REG_SEG1
+x86_64 FR-rd-missing punpckldq +REG_SEG0
+x86_64 FR-rd-missing punpckldq +REG_SEG1
+x86_64 FR-rd-missing punpcklwd +REG_SEG0
+x86_64 FR-rd-missing punpcklwd +REG_SEG1
+x86_64 FR-rd-missing pxor +REG_SEG0
+x86_64 FR-rd-missing pxor +REG_SEG1
+x86_64 FR-rd-missing rclb +REG_FLAGS,REG_SEG0
+x86_64 FR-rd-missing rclb +REG_FLAGS,REG_SEG1
+x86_64 FR-rd-missing rclb +REG_FLAGS,REG_SEG2
+x86_64 FR-rd-missing rclb +REG_FLAGS,REG_SEG5
+x86_64 FR-rd-missing rcll +REG_FLAGS,REG_SEG0
+x86_64 FR-rd-missing rcll +REG_FLAGS,REG_SEG1
+x86_64 FR-rd-missing rcll +REG_FLAGS,REG_SEG2
+x86_64 FR-rd-missing rcll +REG_FLAGS,REG_SEG5
+x86_64 FR-rd-missing rclq +REG_FLAGS,REG_SEG0
+x86_64 FR-rd-missing rclq +REG_FLAGS,REG_SEG1
+x86_64 FR-rd-missing rclw +REG_FLAGS,REG_SEG0
+x86_64 FR-rd-missing rclw +REG_FLAGS,REG_SEG1
+x86_64 FR-rd-missing rclw +REG_FLAGS,REG_SEG2
+x86_64 FR-rd-missing rclw +REG_FLAGS,REG_SEG5
+x86_64 FR-rd-missing rcpps +REG_SEG0
+x86_64 FR-rd-missing rcpps +REG_SEG1
+x86_64 FR-rd-missing rcrb +REG_FLAGS,REG_SEG0
+x86_64 FR-rd-missing rcrb +REG_FLAGS,REG_SEG1
+x86_64 FR-rd-missing rcrl +REG_FLAGS,REG_SEG0
+x86_64 FR-rd-missing rcrl +REG_FLAGS,REG_SEG1
+x86_64 FR-rd-missing rcrq +REG_FLAGS,REG_SEG0
+x86_64 FR-rd-missing rcrq +REG_FLAGS,REG_SEG1
+x86_64 FR-rd-missing rolb +REG_SEG0
+x86_64 FR-rd-missing rolb +REG_SEG1
+x86_64 FR-rd-missing roll +REG_SEG0
+x86_64 FR-rd-missing roll +REG_SEG1
+x86_64 FR-rd-missing rolq +REG_SEG0
+x86_64 FR-rd-missing rolq +REG_SEG1
+x86_64 FR-rd-missing rorb +REG_SEG0
+x86_64 FR-rd-missing rorb +REG_SEG1
+x86_64 FR-rd-missing rorl +REG_SEG0
+x86_64 FR-rd-missing rorl +REG_SEG1
+x86_64 FR-rd-missing rorq +REG_SEG0
+x86_64 FR-rd-missing rorq +REG_SEG1
+x86_64 FR-rd-missing rsqrtps +REG_SEG0
+x86_64 FR-rd-missing rsqrtps +REG_SEG1
+x86_64 FR-rd-missing sarb +REG_SEG0
+x86_64 FR-rd-missing sarb +REG_SEG1
+x86_64 FR-rd-missing sarl +REG_SEG0
+x86_64 FR-rd-missing sarl +REG_SEG1
+x86_64 FR-rd-missing sarq +REG_SEG0
+x86_64 FR-rd-missing sarq +REG_SEG1
+x86_64 FR-rd-missing sbbb +REG_SEG0
+x86_64 FR-rd-missing sbbb +REG_SEG1
+x86_64 FR-rd-missing sbbb +REG_SEG2
+x86_64 FR-rd-missing sbbb +REG_SEG5
+x86_64 FR-rd-missing sbbl +REG_SEG0
+x86_64 FR-rd-missing sbbl +REG_SEG1
+x86_64 FR-rd-missing sbbl +REG_SEG2
+x86_64 FR-rd-missing sbbl +REG_SEG5
+x86_64 FR-rd-missing sbbq +REG_SEG0
+x86_64 FR-rd-missing sbbq +REG_SEG1
+x86_64 FR-rd-missing sbbw +REG_SEG0
+x86_64 FR-rd-missing sbbw +REG_SEG1
+x86_64 FR-rd-missing sbbw +REG_SEG2
+x86_64 FR-rd-missing sbbw +REG_SEG5
+x86_64 FR-rd-missing seta +REG_SEG0
+x86_64 FR-rd-missing seta +REG_SEG1
+x86_64 FR-rd-missing setae +REG_SEG0
+x86_64 FR-rd-missing setae +REG_SEG1
+x86_64 FR-rd-missing setb +REG_SEG0
+x86_64 FR-rd-missing setb +REG_SEG1
+x86_64 FR-rd-missing setbe +REG_SEG0
+x86_64 FR-rd-missing setbe +REG_SEG1
+x86_64 FR-rd-missing sete +REG_SEG0
+x86_64 FR-rd-missing sete +REG_SEG1
+x86_64 FR-rd-missing setg +REG_SEG0
+x86_64 FR-rd-missing setg +REG_SEG1
+x86_64 FR-rd-missing setge +REG_SEG0
+x86_64 FR-rd-missing setge +REG_SEG1
+x86_64 FR-rd-missing setl +REG_SEG0
+x86_64 FR-rd-missing setl +REG_SEG1
+x86_64 FR-rd-missing setle +REG_SEG0
+x86_64 FR-rd-missing setle +REG_SEG1
+x86_64 FR-rd-missing setne +REG_SEG0
+x86_64 FR-rd-missing setne +REG_SEG1
+x86_64 FR-rd-missing setno +REG_SEG0
+x86_64 FR-rd-missing setno +REG_SEG1
+x86_64 FR-rd-missing setnp +REG_SEG0
+x86_64 FR-rd-missing setnp +REG_SEG1
+x86_64 FR-rd-missing setns +REG_SEG0
+x86_64 FR-rd-missing setns +REG_SEG1
+x86_64 FR-rd-missing seto +REG_SEG0
+x86_64 FR-rd-missing seto +REG_SEG1
+x86_64 FR-rd-missing setp +REG_SEG0
+x86_64 FR-rd-missing setp +REG_SEG1
+x86_64 FR-rd-missing sets +REG_SEG0
+x86_64 FR-rd-missing sets +REG_SEG1
+x86_64 FR-rd-missing sgdtq +REG_SEG0
+x86_64 FR-rd-missing sgdtq +REG_SEG1
+x86_64 FR-rd-missing sha1msg1 +REG_SEG0
+x86_64 FR-rd-missing sha1msg1 +REG_SEG1
+x86_64 FR-rd-missing sha1msg2 +REG_SEG0
+x86_64 FR-rd-missing sha1msg2 +REG_SEG1
+x86_64 FR-rd-missing sha1nexte +REG_SEG0
+x86_64 FR-rd-missing sha1nexte +REG_SEG1
+x86_64 FR-rd-missing sha1rnds4 +REG_SEG0
+x86_64 FR-rd-missing sha1rnds4 +REG_SEG1
+x86_64 FR-rd-missing sha256msg1 +REG_SEG0
+x86_64 FR-rd-missing sha256msg1 +REG_SEG1
+x86_64 FR-rd-missing sha256msg2 +REG_SEG0
+x86_64 FR-rd-missing sha256msg2 +REG_SEG1
+x86_64 FR-rd-missing sha256rnds2 +REG_SEG0
+x86_64 FR-rd-missing sha256rnds2 +REG_SEG1
+x86_64 FR-rd-missing shlb +REG_SEG0
+x86_64 FR-rd-missing shlb +REG_SEG1
+x86_64 FR-rd-missing shldl +REG_SEG0
+x86_64 FR-rd-missing shldl +REG_SEG1
+x86_64 FR-rd-missing shldq +REG_SEG0
+x86_64 FR-rd-missing shldq +REG_SEG1
+x86_64 FR-rd-missing shll +REG_SEG0
+x86_64 FR-rd-missing shll +REG_SEG1
+x86_64 FR-rd-missing shlq +REG_SEG0
+x86_64 FR-rd-missing shlq +REG_SEG1
+x86_64 FR-rd-missing shrb +REG_SEG0
+x86_64 FR-rd-missing shrb +REG_SEG1
+x86_64 FR-rd-missing shrdl +REG_SEG0
+x86_64 FR-rd-missing shrdl +REG_SEG1
+x86_64 FR-rd-missing shrdq +REG_SEG0
+x86_64 FR-rd-missing shrdq +REG_SEG1
+x86_64 FR-rd-missing shrl +REG_SEG0
+x86_64 FR-rd-missing shrl +REG_SEG1
+x86_64 FR-rd-missing shrq +REG_SEG0
+x86_64 FR-rd-missing shrq +REG_SEG1
+x86_64 FR-rd-missing shufps +REG_SEG0
+x86_64 FR-rd-missing shufps +REG_SEG1
+x86_64 FR-rd-missing sidtq +REG_SEG0
+x86_64 FR-rd-missing sidtq +REG_SEG1
+x86_64 FR-rd-missing sldtw +REG_SEG0
+x86_64 FR-rd-missing sldtw +REG_SEG1
+x86_64 FR-rd-missing sldtw +REG_SEG2
+x86_64 FR-rd-missing sldtw +REG_SEG5
+x86_64 FR-rd-missing smsww +REG_SEG0
+x86_64 FR-rd-missing smsww +REG_SEG1
+x86_64 FR-rd-missing sqrtps +REG_SEG0
+x86_64 FR-rd-missing sqrtps +REG_SEG1
+x86_64 FR-rd-missing stmxcsr +REG_SEG0
+x86_64 FR-rd-missing stmxcsr +REG_SEG1
+x86_64 FR-rd-missing strw +REG_SEG0
+x86_64 FR-rd-missing strw +REG_SEG1
+x86_64 FR-rd-missing subb +REG_SEG0
+x86_64 FR-rd-missing subb +REG_SEG1
+x86_64 FR-rd-missing subb +REG_SEG2
+x86_64 FR-rd-missing subb +REG_SEG5
+x86_64 FR-rd-missing subl +REG_SEG0
+x86_64 FR-rd-missing subl +REG_SEG1
+x86_64 FR-rd-missing subl +REG_SEG2
+x86_64 FR-rd-missing subl +REG_SEG5
+x86_64 FR-rd-missing subps +REG_SEG0
+x86_64 FR-rd-missing subps +REG_SEG1
+x86_64 FR-rd-missing subq +REG_SEG0
+x86_64 FR-rd-missing subq +REG_SEG1
+x86_64 FR-rd-missing subw +REG_SEG0
+x86_64 FR-rd-missing subw +REG_SEG1
+x86_64 FR-rd-missing subw +REG_SEG2
+x86_64 FR-rd-missing subw +REG_SEG5
+x86_64 FR-rd-missing testb +REG_SEG0
+x86_64 FR-rd-missing testb +REG_SEG1
+x86_64 FR-rd-missing testb +REG_SEG2
+x86_64 FR-rd-missing testb +REG_SEG5
+x86_64 FR-rd-missing testl +REG_SEG0
+x86_64 FR-rd-missing testl +REG_SEG1
+x86_64 FR-rd-missing testl +REG_SEG2
+x86_64 FR-rd-missing testl +REG_SEG5
+x86_64 FR-rd-missing testq +REG_SEG0
+x86_64 FR-rd-missing testq +REG_SEG1
+x86_64 FR-rd-missing testw +REG_SEG0
+x86_64 FR-rd-missing testw +REG_SEG1
+x86_64 FR-rd-missing testw +REG_SEG2
+x86_64 FR-rd-missing testw +REG_SEG5
+x86_64 FR-rd-missing ucomiss +REG_SEG0
+x86_64 FR-rd-missing ucomiss +REG_SEG1
+x86_64 FR-rd-missing unpckhps +REG_SEG0
+x86_64 FR-rd-missing unpckhps +REG_SEG1
+x86_64 FR-rd-missing unpcklps +REG_SEG0
+x86_64 FR-rd-missing unpcklps +REG_SEG1
+x86_64 FR-rd-missing vaddps +REG_SEG0
+x86_64 FR-rd-missing vaddps +REG_SEG1
+x86_64 FR-rd-missing vandnps +REG_SEG0
+x86_64 FR-rd-missing vandnps +REG_SEG1
+x86_64 FR-rd-missing vandps +REG_SEG0
+x86_64 FR-rd-missing vandps +REG_SEG1
+x86_64 FR-rd-missing vcmpeqps +REG_SEG0
+x86_64 FR-rd-missing vcmpeqps +REG_SEG1
+x86_64 FR-rd-missing vcvtdq2ps +REG_SEG0
+x86_64 FR-rd-missing vcvtdq2ps +REG_SEG1
+x86_64 FR-rd-missing vcvtps2pd +REG_SEG0
+x86_64 FR-rd-missing vcvtps2pd +REG_SEG1
+x86_64 FR-rd-missing vdivps +REG_SEG0
+x86_64 FR-rd-missing vdivps +REG_SEG1
+x86_64 FR-rd-missing verr +REG_SEG0
+x86_64 FR-rd-missing verr +REG_SEG1
+x86_64 FR-rd-missing verw +REG_SEG0
+x86_64 FR-rd-missing verw +REG_SEG1
+x86_64 FR-rd-missing vmaxps +REG_SEG0
+x86_64 FR-rd-missing vmaxps +REG_SEG1
+x86_64 FR-rd-missing vminps +REG_SEG0
+x86_64 FR-rd-missing vminps +REG_SEG1
+x86_64 FR-rd-missing vmovsd +REG_SEG0
+x86_64 FR-rd-missing vmovsd +REG_SEG1
+x86_64 FR-rd-missing vmovss +REG_SEG0
+x86_64 FR-rd-missing vmovss +REG_SEG1
+x86_64 FR-rd-missing vmovupd +REG_SEG0
+x86_64 FR-rd-missing vmovupd +REG_SEG1
+x86_64 FR-rd-missing vmovups +REG_SEG0
+x86_64 FR-rd-missing vmovups +REG_SEG1
+x86_64 FR-rd-missing vmptrld +REG_SEG0
+x86_64 FR-rd-missing vmptrld +REG_SEG1
+x86_64 FR-rd-missing vmptrst +REG_SEG0
+x86_64 FR-rd-missing vmptrst +REG_SEG1
+x86_64 FR-rd-missing vmreadq +REG_SEG0
+x86_64 FR-rd-missing vmreadq +REG_SEG1
+x86_64 FR-rd-missing vmulps +REG_SEG0
+x86_64 FR-rd-missing vmulps +REG_SEG1
+x86_64 FR-rd-missing vmwriteq +REG_SEG0
+x86_64 FR-rd-missing vmwriteq +REG_SEG1
+x86_64 FR-rd-missing vorps +REG_SEG0
+x86_64 FR-rd-missing vorps +REG_SEG1
+x86_64 FR-rd-missing vpinsrd +REG_SEG0
+x86_64 FR-rd-missing vpinsrd +REG_SEG1
+x86_64 FR-rd-missing vpshufb +REG_SEG0
+x86_64 FR-rd-missing vpshufb +REG_SEG1
+x86_64 FR-rd-missing vrcpps +REG_SEG0
+x86_64 FR-rd-missing vrcpps +REG_SEG1
+x86_64 FR-rd-missing vrsqrtps +REG_SEG0
+x86_64 FR-rd-missing vrsqrtps +REG_SEG1
+x86_64 FR-rd-missing vshufps +REG_SEG0
+x86_64 FR-rd-missing vshufps +REG_SEG1
+x86_64 FR-rd-missing vsqrtps +REG_SEG0
+x86_64 FR-rd-missing vsqrtps +REG_SEG1
+x86_64 FR-rd-missing vsubps +REG_SEG0
+x86_64 FR-rd-missing vsubps +REG_SEG1
+x86_64 FR-rd-missing vunpckhps +REG_SEG0
+x86_64 FR-rd-missing vunpckhps +REG_SEG1
+x86_64 FR-rd-missing vunpcklps +REG_SEG0
+x86_64 FR-rd-missing vunpcklps +REG_SEG1
+x86_64 FR-rd-missing vxorps +REG_SEG0
+x86_64 FR-rd-missing vxorps +REG_SEG1
+x86_64 FR-rd-missing wrssd +REG_SEG0
+x86_64 FR-rd-missing wrssd +REG_SEG1
+x86_64 FR-rd-missing wrssq +REG_SEG0
+x86_64 FR-rd-missing wrssq +REG_SEG1
+x86_64 FR-rd-missing xaddb +REG_SEG0
+x86_64 FR-rd-missing xaddb +REG_SEG1
+x86_64 FR-rd-missing xaddl +REG_SEG0
+x86_64 FR-rd-missing xaddl +REG_SEG1
+x86_64 FR-rd-missing xaddq +REG_SEG0
+x86_64 FR-rd-missing xaddq +REG_SEG1
+x86_64 FR-rd-missing xchgb +REG_SEG0
+x86_64 FR-rd-missing xchgb +REG_SEG1
+x86_64 FR-rd-missing xchgb +REG_SEG2
+x86_64 FR-rd-missing xchgb +REG_SEG5
+x86_64 FR-rd-missing xchgl +REG_SEG0
+x86_64 FR-rd-missing xchgl +REG_SEG1
+x86_64 FR-rd-missing xchgl +REG_SEG2
+x86_64 FR-rd-missing xchgl +REG_SEG5
+x86_64 FR-rd-missing xchgq +REG_SEG0
+x86_64 FR-rd-missing xchgq +REG_SEG1
+x86_64 FR-rd-missing xchgw +REG_SEG0
+x86_64 FR-rd-missing xchgw +REG_SEG1
+x86_64 FR-rd-missing xchgw +REG_SEG2
+x86_64 FR-rd-missing xchgw +REG_SEG5
+x86_64 FR-rd-missing xorb +REG_SEG0
+x86_64 FR-rd-missing xorb +REG_SEG1
+x86_64 FR-rd-missing xorb +REG_SEG2
+x86_64 FR-rd-missing xorb +REG_SEG5
+x86_64 FR-rd-missing xorl +REG_SEG0
+x86_64 FR-rd-missing xorl +REG_SEG1
+x86_64 FR-rd-missing xorl +REG_SEG2
+x86_64 FR-rd-missing xorl +REG_SEG5
+x86_64 FR-rd-missing xorps +REG_SEG0
+x86_64 FR-rd-missing xorps +REG_SEG1
+x86_64 FR-rd-missing xorq +REG_SEG0
+x86_64 FR-rd-missing xorq +REG_SEG1
+x86_64 FR-rd-missing xorw +REG_SEG0
+x86_64 FR-rd-missing xorw +REG_SEG1
+x86_64 FR-rd-missing xorw +REG_SEG2
+x86_64 FR-rd-missing xorw +REG_SEG5
+x86_64 FR-rd-missing xrstor +REG_SEG0
+x86_64 FR-rd-missing xrstor +REG_SEG1
+x86_64 FR-rd-missing xrstor64 +REG_SEG0
+x86_64 FR-rd-missing xrstor64 +REG_SEG1
+x86_64 FR-rd-missing xrstors +REG_SEG0
+x86_64 FR-rd-missing xrstors +REG_SEG1
+x86_64 FR-rd-missing xrstors64 +REG_SEG0
+x86_64 FR-rd-missing xrstors64 +REG_SEG1
+x86_64 FR-rd-missing xsave +REG_SEG0
+x86_64 FR-rd-missing xsave +REG_SEG1
+x86_64 FR-rd-missing xsave64 +REG_SEG0
+x86_64 FR-rd-missing xsave64 +REG_SEG1
+x86_64 FR-rd-missing xsavec +REG_SEG0
+x86_64 FR-rd-missing xsavec +REG_SEG1
+x86_64 FR-rd-missing xsavec64 +REG_SEG0
+x86_64 FR-rd-missing xsavec64 +REG_SEG1
+x86_64 FR-rd-missing xsaveopt +REG_SEG0
+x86_64 FR-rd-missing xsaveopt +REG_SEG1
+x86_64 FR-rd-missing xsaveopt64 +REG_SEG0
+x86_64 FR-rd-missing xsaveopt64 +REG_SEG1
+x86_64 FR-rd-missing xsaves +REG_SEG0
+x86_64 FR-rd-missing xsaves +REG_SEG1
+x86_64 FR-rd-missing xsaves64 +REG_SEG0
+x86_64 FR-rd-missing xsaves64 +REG_SEG1
+x86_64 FR-rd-missing fcoml +REG_SEG0
+x86_64 FR-rd-missing fcoml +REG_SEG1
+x86_64 FR-rd-missing fcoml +REG_SEG2
+x86_64 FR-rd-missing fcoml +REG_SEG5
+x86_64 FR-rd-missing fcompl +REG_SEG0
+x86_64 FR-rd-missing fcompl +REG_SEG1
+x86_64 FR-rd-missing fcomps +REG_SEG0
+x86_64 FR-rd-missing fcomps +REG_SEG1
+x86_64 FR-rd-missing fcoms +REG_SEG0
+x86_64 FR-rd-missing fcoms +REG_SEG1
+x86_64 FR-rd-missing fcoms +REG_SEG2
+x86_64 FR-rd-missing fcoms +REG_SEG5
+x86_64 FR-rd-missing ficoml +REG_SEG0
+x86_64 FR-rd-missing ficoml +REG_SEG1
+x86_64 FR-rd-missing ficoml +REG_SEG2
+x86_64 FR-rd-missing ficoml +REG_SEG5
+x86_64 FR-rd-missing ficompl +REG_SEG0
+x86_64 FR-rd-missing ficompl +REG_SEG1
+x86_64 FR-rd-missing ficomps +REG_SEG0
+x86_64 FR-rd-missing ficomps +REG_SEG1
+x86_64 FR-rd-missing ficoms +REG_SEG0
+x86_64 FR-rd-missing ficoms +REG_SEG1
+x86_64 FR-rd-missing ficoms +REG_SEG2
+x86_64 FR-rd-missing ficoms +REG_SEG5
 
 
 # (b) THE x87 CONTROL WORD, which Capstone cannot name at all.  LLVM
@@ -2088,9 +2682,9 @@ x86_64 FM-llvm-mem-cs-none int3 load store
 x86_64 FM-llvm-mem-cs-none ud2 load
 x86_64 FR-rd-phantom int +REG_FLAGS,REG_SP
 x86_64 FR-rd-phantom int3 +REG_FLAGS,REG_SP
-x86_64 FR-rd-phantom iretl +REG_FLAGS,REG_SEG#,REG_SP
-x86_64 FR-rd-phantom iretq +REG_FLAGS,REG_SEG#,REG_SP
-x86_64 FR-rd-phantom iretw +REG_FLAGS,REG_SEG#,REG_SP
+x86_64 FR-rd-phantom iretl +REG_FLAGS,REG_SEG5,REG_SP
+x86_64 FR-rd-phantom iretq +REG_FLAGS,REG_SEG5,REG_SP
+x86_64 FR-rd-phantom iretw +REG_FLAGS,REG_SEG5,REG_SP
 x86_64 FR-rd-phantom sysretl +REG_GPR#
 x86_64 FR-rd-phantom sysretq +REG_GPR#
 x86_64 FR-wr-phantom int +REG_FLAGS,REG_SP
@@ -2225,67 +2819,180 @@ x86_64 FM-llvm-mem-cs-none pushw store
 x86_64 FM-miss-load lcallq
 x86_64 FM-miss-load popq
 x86_64 FM-miss-load popw
-x86_64 FR-rd-missing bnd callq +REG_SEG#
-x86_64 FR-rd-missing bnd notrack callq +REG_SEG#
-x86_64 FR-rd-missing callq +REG_SEG#
-x86_64 FR-rd-missing cmpsb +REG_SEG#
-x86_64 FR-rd-missing cmpsl +REG_SEG#
-x86_64 FR-rd-missing cmpsq +REG_SEG#
-x86_64 FR-rd-missing cmpsw +REG_SEG#
-x86_64 FR-rd-missing lcalll +REG_SEG#
-x86_64 FR-rd-missing lcallq +REG_SEG#
-x86_64 FR-rd-missing lodsb +REG_SEG#
-x86_64 FR-rd-missing lodsl +REG_SEG#
-x86_64 FR-rd-missing lodsq +REG_SEG#
-x86_64 FR-rd-missing lodsw +REG_SEG#
-x86_64 FR-rd-missing movsb +REG_SEG#
-x86_64 FR-rd-missing movsl +REG_SEG#
-x86_64 FR-rd-missing movsq +REG_SEG#
-x86_64 FR-rd-missing movsw +REG_SEG#
-x86_64 FR-rd-missing notrack callq +REG_SEG#
-x86_64 FR-rd-missing notrack lcalll +REG_SEG#
-x86_64 FR-rd-missing outsb +REG_SEG#
-x86_64 FR-rd-missing outsl +REG_SEG#
-x86_64 FR-rd-missing outsw +REG_SEG#
-x86_64 FR-rd-missing popq +REG_SEG#
-x86_64 FR-rd-missing popw +REG_SEG#
-x86_64 FR-rd-missing pushq +REG_SEG#
-x86_64 FR-rd-missing rep lodsb +REG_SEG#
-x86_64 FR-rd-missing rep lodsl +REG_SEG#
-x86_64 FR-rd-missing rep lodsw +REG_SEG#
-x86_64 FR-rd-missing rep movsb +REG_SEG#
-x86_64 FR-rd-missing rep movsl +REG_SEG#
-x86_64 FR-rd-missing rep movsw +REG_SEG#
-x86_64 FR-rd-missing rep outsb +REG_SEG#
-x86_64 FR-rd-missing rep outsl +REG_SEG#
-x86_64 FR-rd-missing rep outsw +REG_SEG#
-x86_64 FR-rd-missing repe cmpsb +REG_SEG#
-x86_64 FR-rd-missing repe cmpsl +REG_SEG#
-x86_64 FR-rd-missing repe cmpsw +REG_SEG#
-x86_64 FR-rd-missing repne cmpsb +REG_SEG#
-x86_64 FR-rd-missing repne cmpsl +REG_SEG#
-x86_64 FR-rd-missing repne lodsb +REG_SEG#
-x86_64 FR-rd-missing repne lodsl +REG_SEG#
-x86_64 FR-rd-missing repne movsb +REG_SEG#
-x86_64 FR-rd-missing repne movsl +REG_SEG#
-x86_64 FR-rd-missing repne outsb +REG_SEG#
-x86_64 FR-rd-missing repne outsl +REG_SEG#
-x86_64 FR-rd-phantom bnd lretl +REG_SEG#,REG_SP
-x86_64 FR-rd-phantom bnd lretq +REG_SEG#,REG_SP
-x86_64 FR-rd-phantom bnd lretw +REG_SEG#,REG_SP
-x86_64 FR-rd-phantom bnd retq +REG_SEG#,REG_SP
-x86_64 FR-rd-phantom bnd retw +REG_SEG#,REG_SP
+x86_64 FR-rd-missing bnd callq +REG_SEG0
+x86_64 FR-rd-missing bnd callq +REG_SEG2
+x86_64 FR-rd-missing bnd callq +REG_SEG5
+x86_64 FR-rd-missing bnd notrack callq +REG_SEG1
+x86_64 FR-rd-missing callq +REG_SEG0
+x86_64 FR-rd-missing callq +REG_SEG2
+x86_64 FR-rd-missing callq +REG_SEG5
+x86_64 FR-rd-missing cmpsb +REG_SEG0
+x86_64 FR-rd-missing cmpsb +REG_SEG1
+x86_64 FR-rd-missing cmpsb +REG_SEG2
+x86_64 FR-rd-missing cmpsb +REG_SEG5
+x86_64 FR-rd-missing cmpsl +REG_SEG0
+x86_64 FR-rd-missing cmpsl +REG_SEG1
+x86_64 FR-rd-missing cmpsl +REG_SEG2
+x86_64 FR-rd-missing cmpsl +REG_SEG5
+x86_64 FR-rd-missing cmpsq +REG_SEG0
+x86_64 FR-rd-missing cmpsq +REG_SEG1
+x86_64 FR-rd-missing cmpsw +REG_SEG0
+x86_64 FR-rd-missing cmpsw +REG_SEG1
+x86_64 FR-rd-missing cmpsw +REG_SEG2
+x86_64 FR-rd-missing cmpsw +REG_SEG5
+x86_64 FR-rd-missing lcalll +REG_SEG0
+x86_64 FR-rd-missing lcallq +REG_SEG0
+x86_64 FR-rd-missing lcallq +REG_SEG1
+x86_64 FR-rd-missing lodsb +REG_SEG0
+x86_64 FR-rd-missing lodsb +REG_SEG1
+x86_64 FR-rd-missing lodsb +REG_SEG2
+x86_64 FR-rd-missing lodsb +REG_SEG5
+x86_64 FR-rd-missing lodsl +REG_SEG0
+x86_64 FR-rd-missing lodsl +REG_SEG1
+x86_64 FR-rd-missing lodsl +REG_SEG2
+x86_64 FR-rd-missing lodsl +REG_SEG5
+x86_64 FR-rd-missing lodsq +REG_SEG0
+x86_64 FR-rd-missing lodsq +REG_SEG1
+x86_64 FR-rd-missing lodsw +REG_SEG0
+x86_64 FR-rd-missing lodsw +REG_SEG1
+x86_64 FR-rd-missing lodsw +REG_SEG2
+x86_64 FR-rd-missing lodsw +REG_SEG5
+x86_64 FR-rd-missing movsb +REG_SEG0
+x86_64 FR-rd-missing movsb +REG_SEG1
+x86_64 FR-rd-missing movsb +REG_SEG2
+x86_64 FR-rd-missing movsb +REG_SEG5
+x86_64 FR-rd-missing movsl +REG_SEG0
+x86_64 FR-rd-missing movsl +REG_SEG1
+x86_64 FR-rd-missing movsl +REG_SEG2
+x86_64 FR-rd-missing movsl +REG_SEG5
+x86_64 FR-rd-missing movsq +REG_SEG0
+x86_64 FR-rd-missing movsq +REG_SEG1
+x86_64 FR-rd-missing movsw +REG_SEG0
+x86_64 FR-rd-missing movsw +REG_SEG1
+x86_64 FR-rd-missing movsw +REG_SEG2
+x86_64 FR-rd-missing movsw +REG_SEG5
+x86_64 FR-rd-missing notrack callq +REG_SEG1
+x86_64 FR-rd-missing notrack lcalll +REG_SEG1
+x86_64 FR-rd-missing outsb +REG_SEG0
+x86_64 FR-rd-missing outsb +REG_SEG1
+x86_64 FR-rd-missing outsb +REG_SEG2
+x86_64 FR-rd-missing outsb +REG_SEG5
+x86_64 FR-rd-missing outsl +REG_SEG0
+x86_64 FR-rd-missing outsl +REG_SEG1
+x86_64 FR-rd-missing outsl +REG_SEG2
+x86_64 FR-rd-missing outsl +REG_SEG5
+x86_64 FR-rd-missing outsw +REG_SEG0
+x86_64 FR-rd-missing outsw +REG_SEG1
+x86_64 FR-rd-missing outsw +REG_SEG2
+x86_64 FR-rd-missing outsw +REG_SEG5
+x86_64 FR-rd-missing popq +REG_SEG0
+x86_64 FR-rd-missing popq +REG_SEG1
+x86_64 FR-rd-missing popq +REG_SEG2
+x86_64 FR-rd-missing popq +REG_SEG5
+x86_64 FR-rd-missing popw +REG_SEG0
+x86_64 FR-rd-missing popw +REG_SEG1
+x86_64 FR-rd-missing popw +REG_SEG2
+x86_64 FR-rd-missing popw +REG_SEG5
+x86_64 FR-rd-missing pushq +REG_SEG0
+x86_64 FR-rd-missing pushq +REG_SEG1
+x86_64 FR-rd-missing rep lodsb +REG_SEG0
+x86_64 FR-rd-missing rep lodsb +REG_SEG1
+x86_64 FR-rd-missing rep lodsb +REG_SEG2
+x86_64 FR-rd-missing rep lodsb +REG_SEG5
+x86_64 FR-rd-missing rep lodsl +REG_SEG0
+x86_64 FR-rd-missing rep lodsl +REG_SEG1
+x86_64 FR-rd-missing rep lodsl +REG_SEG2
+x86_64 FR-rd-missing rep lodsl +REG_SEG5
+x86_64 FR-rd-missing rep lodsw +REG_SEG0
+x86_64 FR-rd-missing rep lodsw +REG_SEG1
+x86_64 FR-rd-missing rep lodsw +REG_SEG2
+x86_64 FR-rd-missing rep lodsw +REG_SEG5
+x86_64 FR-rd-missing rep movsb +REG_SEG0
+x86_64 FR-rd-missing rep movsb +REG_SEG1
+x86_64 FR-rd-missing rep movsb +REG_SEG2
+x86_64 FR-rd-missing rep movsb +REG_SEG5
+x86_64 FR-rd-missing rep movsl +REG_SEG0
+x86_64 FR-rd-missing rep movsl +REG_SEG1
+x86_64 FR-rd-missing rep movsl +REG_SEG2
+x86_64 FR-rd-missing rep movsl +REG_SEG5
+x86_64 FR-rd-missing rep movsw +REG_SEG0
+x86_64 FR-rd-missing rep movsw +REG_SEG1
+x86_64 FR-rd-missing rep movsw +REG_SEG2
+x86_64 FR-rd-missing rep movsw +REG_SEG5
+x86_64 FR-rd-missing rep outsb +REG_SEG0
+x86_64 FR-rd-missing rep outsb +REG_SEG1
+x86_64 FR-rd-missing rep outsb +REG_SEG2
+x86_64 FR-rd-missing rep outsb +REG_SEG5
+x86_64 FR-rd-missing rep outsl +REG_SEG0
+x86_64 FR-rd-missing rep outsl +REG_SEG1
+x86_64 FR-rd-missing rep outsl +REG_SEG2
+x86_64 FR-rd-missing rep outsl +REG_SEG5
+x86_64 FR-rd-missing rep outsw +REG_SEG0
+x86_64 FR-rd-missing rep outsw +REG_SEG1
+x86_64 FR-rd-missing rep outsw +REG_SEG2
+x86_64 FR-rd-missing rep outsw +REG_SEG5
+x86_64 FR-rd-missing repe cmpsb +REG_SEG0
+x86_64 FR-rd-missing repe cmpsb +REG_SEG1
+x86_64 FR-rd-missing repe cmpsb +REG_SEG2
+x86_64 FR-rd-missing repe cmpsb +REG_SEG5
+x86_64 FR-rd-missing repe cmpsl +REG_SEG0
+x86_64 FR-rd-missing repe cmpsl +REG_SEG1
+x86_64 FR-rd-missing repe cmpsl +REG_SEG2
+x86_64 FR-rd-missing repe cmpsl +REG_SEG5
+x86_64 FR-rd-missing repe cmpsw +REG_SEG0
+x86_64 FR-rd-missing repe cmpsw +REG_SEG1
+x86_64 FR-rd-missing repe cmpsw +REG_SEG2
+x86_64 FR-rd-missing repe cmpsw +REG_SEG5
+x86_64 FR-rd-missing repne cmpsb +REG_SEG0
+x86_64 FR-rd-missing repne cmpsb +REG_SEG1
+x86_64 FR-rd-missing repne cmpsb +REG_SEG2
+x86_64 FR-rd-missing repne cmpsb +REG_SEG5
+x86_64 FR-rd-missing repne cmpsl +REG_SEG0
+x86_64 FR-rd-missing repne cmpsl +REG_SEG1
+x86_64 FR-rd-missing repne cmpsl +REG_SEG2
+x86_64 FR-rd-missing repne cmpsl +REG_SEG5
+x86_64 FR-rd-missing repne lodsb +REG_SEG0
+x86_64 FR-rd-missing repne lodsb +REG_SEG1
+x86_64 FR-rd-missing repne lodsb +REG_SEG2
+x86_64 FR-rd-missing repne lodsb +REG_SEG5
+x86_64 FR-rd-missing repne lodsl +REG_SEG0
+x86_64 FR-rd-missing repne lodsl +REG_SEG1
+x86_64 FR-rd-missing repne lodsl +REG_SEG2
+x86_64 FR-rd-missing repne lodsl +REG_SEG5
+x86_64 FR-rd-missing repne movsb +REG_SEG0
+x86_64 FR-rd-missing repne movsb +REG_SEG1
+x86_64 FR-rd-missing repne movsb +REG_SEG2
+x86_64 FR-rd-missing repne movsb +REG_SEG5
+x86_64 FR-rd-missing repne movsl +REG_SEG0
+x86_64 FR-rd-missing repne movsl +REG_SEG1
+x86_64 FR-rd-missing repne movsl +REG_SEG2
+x86_64 FR-rd-missing repne movsl +REG_SEG5
+x86_64 FR-rd-missing repne outsb +REG_SEG0
+x86_64 FR-rd-missing repne outsb +REG_SEG1
+x86_64 FR-rd-missing repne outsb +REG_SEG2
+x86_64 FR-rd-missing repne outsb +REG_SEG5
+x86_64 FR-rd-missing repne outsl +REG_SEG0
+x86_64 FR-rd-missing repne outsl +REG_SEG1
+x86_64 FR-rd-missing repne outsl +REG_SEG2
+x86_64 FR-rd-missing repne outsl +REG_SEG5
+x86_64 FR-rd-phantom bnd lretl +REG_SEG5,REG_SP
+x86_64 FR-rd-phantom bnd lretq +REG_SEG5,REG_SP
+x86_64 FR-rd-phantom bnd lretw +REG_SEG5,REG_SP
+x86_64 FR-rd-phantom bnd retq +REG_SEG5,REG_SP
+x86_64 FR-rd-phantom bnd retw +REG_SEG5,REG_SP
 x86_64 FR-rd-phantom enter +REG_FP_REG,REG_SP
 x86_64 FR-rd-phantom loop +REG_GPR#
 x86_64 FR-rd-phantom loope +REG_FLAGS,REG_GPR#
 x86_64 FR-rd-phantom loopne +REG_FLAGS,REG_GPR#
-x86_64 FR-rd-phantom lretl +REG_SEG#,REG_SP
-x86_64 FR-rd-phantom lretq +REG_SEG#,REG_SP
-x86_64 FR-rd-phantom lretw +REG_SEG#,REG_SP
+x86_64 FR-rd-phantom lretl +REG_SEG5,REG_SP
+x86_64 FR-rd-phantom lretq +REG_SEG5,REG_SP
+x86_64 FR-rd-phantom lretw +REG_SEG5,REG_SP
 x86_64 FR-rd-phantom popq +REG_SP
 x86_64 FR-rd-phantom popw +REG_SP
-x86_64 FR-rd-phantom pushq +REG_SEG#
-x86_64 FR-rd-phantom pushw +REG_SEG#
+x86_64 FR-rd-phantom pushq +REG_SEG3
+x86_64 FR-rd-phantom pushq +REG_SEG4
+x86_64 FR-rd-phantom pushw +REG_SEG3
+x86_64 FR-rd-phantom pushw +REG_SEG4
 x86_64 FR-rd-phantom rep insb +REG_GPR#
 x86_64 FR-rd-phantom rep insl +REG_GPR#
 x86_64 FR-rd-phantom rep insw +REG_GPR#
@@ -2338,17 +3045,17 @@ x86_64 FR-rd-phantom repne stosb +REG_GPR#
 x86_64 FR-rd-phantom repne stosl +REG_GPR#
 x86_64 FR-rd-phantom repne stosq +REG_GPR#
 x86_64 FR-rd-phantom repne stosw +REG_GPR#
-x86_64 FR-rd-phantom repz retq +REG_SEG#,REG_SP
-x86_64 FR-rd-phantom repz retw +REG_SEG#,REG_SP
-x86_64 FR-rd-phantom retq +REG_SEG#,REG_SP
-x86_64 FR-rd-phantom retw +REG_SEG#,REG_SP
+x86_64 FR-rd-phantom repz retq +REG_SEG5,REG_SP
+x86_64 FR-rd-phantom repz retw +REG_SEG5,REG_SP
+x86_64 FR-rd-phantom retq +REG_SEG5,REG_SP
+x86_64 FR-rd-phantom retw +REG_SEG5,REG_SP
 x86_64 FR-rd-phantom sysexitl +REG_GPR#
 x86_64 FR-rd-phantom sysexitq +REG_GPR#
 x86_64 FR-wr-phantom bnd callq +REG_SP
 x86_64 FR-wr-phantom bnd lcalll +REG_SP
-x86_64 FR-wr-phantom bnd lretl +REG_SEG#,REG_SP
-x86_64 FR-wr-phantom bnd lretq +REG_SEG#,REG_SP
-x86_64 FR-wr-phantom bnd lretw +REG_SEG#,REG_SP
+x86_64 FR-wr-phantom bnd lretl +REG_SEG0,REG_SP
+x86_64 FR-wr-phantom bnd lretq +REG_SEG0,REG_SP
+x86_64 FR-wr-phantom bnd lretw +REG_SEG0,REG_SP
 x86_64 FR-wr-phantom bnd notrack callq +REG_SP
 x86_64 FR-wr-phantom bnd retq +REG_SP
 x86_64 FR-wr-phantom bnd retw +REG_SP
@@ -2360,13 +3067,15 @@ x86_64 FR-wr-phantom lcallw +REG_SP
 x86_64 FR-wr-phantom loop +REG_GPR#
 x86_64 FR-wr-phantom loope +REG_GPR#
 x86_64 FR-wr-phantom loopne +REG_GPR#
-x86_64 FR-wr-phantom lretl +REG_SEG#,REG_SP
-x86_64 FR-wr-phantom lretq +REG_SEG#,REG_SP
-x86_64 FR-wr-phantom lretw +REG_SEG#,REG_SP
+x86_64 FR-wr-phantom lretl +REG_SEG0,REG_SP
+x86_64 FR-wr-phantom lretq +REG_SEG0,REG_SP
+x86_64 FR-wr-phantom lretw +REG_SEG0,REG_SP
 x86_64 FR-wr-phantom notrack callq +REG_SP
 x86_64 FR-wr-phantom notrack lcalll +REG_SP
-x86_64 FR-wr-phantom popq +REG_SEG#,REG_SP
-x86_64 FR-wr-phantom popw +REG_SEG#,REG_SP
+x86_64 FR-wr-phantom popq +REG_SEG3,REG_SP
+x86_64 FR-wr-phantom popq +REG_SEG4,REG_SP
+x86_64 FR-wr-phantom popw +REG_SEG3,REG_SP
+x86_64 FR-wr-phantom popw +REG_SEG4,REG_SP
 x86_64 FR-wr-phantom pushq +REG_SP
 x86_64 FR-wr-phantom pushw +REG_SP
 x86_64 FR-wr-phantom rep insb +REG_GPR#
@@ -3355,7 +4064,7 @@ mipsel FR-rd-phantom mftr +REG_SYSPERF
 mipsel FR-rd-phantom mftr +REG_SYSDBG
 mipsel FR-rd-phantom mftr +REG_SYSCACHE
 mipsel FR-rd-phantom mftr +REG_SYSID
-mipsel FR-rd-phantom mftr +REG_COPROC#
+mipsel FR-rd-phantom mftr +REG_COPROC0
 mipsel FR-wr-missing mttr +REG_GPR#
 mipsel FR-wr-missing mttr +REG_LR
 mipsel FR-wr-missing mttr +REG_SP
@@ -3366,7 +4075,7 @@ mipsel FR-wr-phantom mttr +REG_SYS
 mipsel FR-wr-phantom mttr +REG_SYSMMU
 mipsel FR-wr-phantom mttr +REG_SYSCACHE
 mipsel FR-wr-phantom mttr +REG_SYSID
-mipsel FR-wr-phantom mttr +REG_COPROC#
+mipsel FR-wr-phantom mttr +REG_COPROC0
 mipsel FR-rd-phantom lwle +REG_FP_REG
 mipsel FR-rd-phantom lwle +REG_GPR#
 mipsel FR-rd-phantom lwle +REG_LR
@@ -3484,9 +4193,12 @@ mipsel FR-rd-phantom lwre +REG_SP
 #   xsave         `+REG_GPR#,REG_SYS` is the decode-disagreement row
 #                 (Capstone reads `xsave`, LLVM reads `ptwriteq`) with
 #                 the new id folded in; it is family (a)'s row, repointed.
-x86_64 FR-rd-missing fnsave +REG_SEG#
-x86_64 FR-rd-missing fxsave +REG_SEG#
-x86_64 FR-rd-missing fxsave64 +REG_SEG#
+x86_64 FR-rd-missing fnsave +REG_SEG0
+x86_64 FR-rd-missing fnsave +REG_SEG1
+x86_64 FR-rd-missing fxsave +REG_SEG0
+x86_64 FR-rd-missing fxsave +REG_SEG1
+x86_64 FR-rd-missing fxsave64 +REG_SEG0
+x86_64 FR-rd-missing fxsave64 +REG_SEG1
 x86_64 FR-rd-missing rdsspq +REG_FP_REG
 x86_64 FR-rd-missing rdsspq +REG_GPR#
 x86_64 FR-rd-missing rdsspq +REG_SP

@@ -624,14 +624,19 @@ static std::string norm_x86(std::string r) {
     // allowlists.
     if (r == "eflags" || r == "flags" || r == "rflags" || r == "df")
         return "flags";
-    // Any segment register is an address input via its base; which one it is
-    // does not change the dependency, and the plugin folds them all onto the
-    // same REG_SEG bank.  Capstone surfaces the override only as the MEM
-    // operand's segment_id (see cs_decode), never in a reg list, so both
-    // sides are folded onto one token.
-    if (r == "fs" || r == "gs" || r == "cs" || r == "ds" || r == "es" ||
-        r == "ss")
-        return "seg";
+    /*
+     * The six segment registers keep their own spellings.  They were once
+     * folded onto a single `seg` token, on the reasoning that a segment is
+     * an address input via its base and which one it is does not change the
+     * dependency -- but the tracer does not model them that way: REG_SEG0..5
+     * are six distinct GenericRegIds, and in long mode only FS and GS have a
+     * base at all, so CS/DS/ES/SS are inert and FS/GS are not.  Folded, the
+     * reference side could not name WHICH segment it meant, `generic_candidates`
+     * returned all six, and the first-candidate fallback in the fields layer
+     * stood REG_SEG0 in for whichever register LLVM had actually printed --
+     * a member identity nothing had measured.  Unfolded, each name resolves
+     * to exactly one ID and a segment mixed up for another one is visible.
+     */
     return r;
 }
 
@@ -737,6 +742,20 @@ static std::string norm_reg(const std::string &r) {
 static std::map<std::string, std::set<unsigned>> name_to_generic;
 
 /*
+ * The reverse direction: a Capstone register id -> the normalised token it
+ * spells.  Needed where Capstone hands over an id with no accompanying name
+ * string -- the x86 segment override on a memory operand is the only such
+ * field today -- so that side can still say which register it means.
+ */
+static std::map<unsigned, std::string> cs_id_to_norm;
+
+static std::string cs_id_norm_name(unsigned cs_id)
+{
+    auto it = cs_id_to_norm.find(cs_id);
+    return it == cs_id_to_norm.end() ? std::string("seg") : it->second;
+}
+
+/*
  * A token that lands on more than one GenericRegId is not a defect in this
  * index; it is the tracer's own classification splitting what the
  * normaliser considers one architectural register across two generic ids.
@@ -767,6 +786,7 @@ static void build_name_to_generic(void)
         std::string tok = norm_reg(nm);
         if (tok.empty()) continue;
         name_to_generic[tok].insert(g);
+        cs_id_to_norm[i] = tok;
         /*
          * A register whose two decoders do not share a SPELLING still has
          * to reach the index, or the fields layer reports
@@ -805,13 +825,35 @@ static void build_name_to_generic(void)
         }
 }
 
-/* Render a GenericRegId set into a signature-friendly list, with the
- * bank index collapsed the way liststr() collapses register numbers. */
+/*
+ * Render a GenericRegId set into a signature-friendly list.
+ *
+ * The bank index is elided the way liststr() elides register numbers --
+ * but ONLY for a bank that is an indexed FILE.  The sweep visits the same
+ * instruction with every register filling the encoding allows, so a defect
+ * in a GPR or vector operand arrives once per member and the index is not
+ * part of what went wrong; without the elision one defect would mint 32
+ * signatures and 32 allowlist rows.
+ *
+ * A bank that is numbered but NOT indexed gets its member named in full.
+ * REG_CTRL0..15, REG_DEBUG0..15, REG_SEG0..5 and REG_COPROC0/1 are sets of
+ * distinct architectural registers -- CR0 is not a filling of the same
+ * operand that could equally have been CR3 -- and those IDs exist BECAUSE
+ * one ID for the whole file conflated them.  Eliding the index here would
+ * hand that conflation straight back at the signature layer: a defect that
+ * recorded CR4 where the architecture says CR0 would key identically to
+ * the correct mapping, an allowlist row justified for one member would
+ * license all sixteen, and the gate could not tell the two apart.
+ *
+ * The classification is the ID space's own, generic_reg_is_indexed_file()
+ * in champsim_tracer_generic_ids.h, not a second opinion held here.
+ */
 static std::string genliststr(const std::vector<unsigned> &v)
 {
     std::set<std::string> cls;
     for (unsigned g : v) {
         std::string k = isax_generic_reg_name(g);
+        if (!isax_generic_reg_indexed_file(g)) { cls.insert(k); continue; }
         std::string t;
         for (char ch : k) {
             if (std::isdigit((unsigned char)ch)) {
@@ -893,10 +935,13 @@ static void cs_decode(const uint8_t *b, size_t n, CsView &v,
                 v.grd.insert(isax_generic_reg(op->index_id));
             }
             // An x86 segment override is a genuine address input the plugin
-            // folds into the memop's source set; Capstone exposes it only
-            // here, with no name field, so it is recorded by class.
+            // folds into the memop's source set.  Capstone exposes it here
+            // as a bare register id with no name field, so the name comes
+            // from the id through the same normaliser the reg lists use --
+            // the alternative, a fixed `seg` class token, cannot say WHICH
+            // segment and so cannot disagree with the reference about it.
             if (op->segment_id) {
-                v.rd.insert("seg");
+                v.rd.insert(cs_id_norm_name(op->segment_id));
                 v.grd.insert(isax_generic_reg(op->segment_id));
             }
             break;

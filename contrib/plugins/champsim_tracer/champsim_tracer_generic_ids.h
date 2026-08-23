@@ -613,6 +613,40 @@ static inline const char *generic_reg_name(unsigned id)
     return buf;
 }
 
+/*
+ * Is this ID a member of an INDEXED FILE?
+ *
+ * An indexed file is a bank whose members are selected by a field of the
+ * instruction encoding and are architecturally INTERCHANGEABLE: the
+ * general-purpose integers, the FP and vector files, the SVE predicates,
+ * the MIPS DSP accumulators (both halves) and the MPX bound registers.
+ * Nothing distinguishes REG_GPR3 from REG_GPR17 except which value the
+ * encoding happened to name, so a statement about one member of such a
+ * bank is a statement about every member.
+ *
+ * The complement is a bank that is NUMBERED BUT NOT INDEXED — a set of
+ * distinct architectural registers that share a spelling and nothing
+ * else.  REG_CTRL0..15 is the case the comment on that bank already
+ * makes: CR0 holds mode bits, CR2 a faulting address, CR3 the page-table
+ * base, CR8 the task priority.  So is REG_DEBUG0..15 (four breakpoint
+ * addresses, a status word, a control word), REG_SEG0..5 (only FS and GS
+ * carry a base in long mode) and REG_COPROC0/1 (two different
+ * implementation-defined files).  For those, one member does not stand
+ * for the bank, and a caller that elides the index — a checking tool
+ * minting a signature, a report grouping rows — is re-merging exactly
+ * what these IDs were split apart to keep separate.
+ */
+static inline bool generic_reg_is_indexed_file(unsigned id)
+{
+    return (id >= REG_GPR0   && id < REG_GPR0   + 32) ||
+           (id >= REG_FPR0   && id < REG_FPR0   + 32) ||
+           (id >= REG_ACCHI0 && id < REG_ACCHI0 + 4)  ||
+           (id >= REG_VEC0   && id < REG_VEC0   + 64) ||
+           (id >= REG_PRED0  && id < REG_PRED0  + 32) ||
+           (id >= REG_BOUND0 && id < REG_BOUND0 + 4)  ||
+           (id >= REG_ACC0   && id < REG_ACC0   + 4);
+}
+
 static inline const char *generic_reg_name_or_unknown(unsigned id)
 {
     const char *n = generic_reg_name(id);

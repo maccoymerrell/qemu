@@ -2543,6 +2543,11 @@ static CapA64FileSet cap_aarch64_file_set(const cs_arm64 *a64, uint8_t n,
             reg = o->reg;
         } else if (o->type == AARCH64_OP_MEM) {
             reg = o->mem.base;
+        } else if (o->type == AARCH64_OP_SME) {
+            /* An SME array operand names its tile in sme.tile, not in
+             * .reg; without this the ZA accumulate forms read as plain
+             * SVE and take an FPSR write they do not have. */
+            reg = o->sme.tile;
         } else {
             continue;
         }

@@ -35,10 +35,49 @@ _init_sysreg_names()
 
 TLS_REGS = {'TPIDR_EL0', 'TPIDRRO_EL0'}
 
+# The enabling-condition and translation-configuration registers.
+#
+# METHOD declares the exception-delivery, address-translation, debug,
+# profiling and trap-check families cut, and CUT_PREFIXES / CUT_EXACT cut
+# them wherever they are reached through a named function.  They are not
+# always reached that way: AddPACIA writes its own trap check inline
+# (`Enable = SCTLR_EL1.EnIA; TrapEL3 = ... SCR_EL3.API ...`), and
+# CalculateBottomPACBit reaches the stage-1 walk parameters -- TCR, TTBR,
+# MAIR, PIR -- to find how many pointer bits the translation regime
+# leaves for the PAC.  A name-keyed cut cannot see either.
+#
+# These registers are never an operand of the instruction under any
+# reading.  They say whether the instruction is ENABLED and how the
+# address space is CONFIGURED; the answer is the same for every
+# instruction executed under one configuration, so recording them makes
+# every branch, every atomic and every tagged store depend on whatever
+# system register was written last.  Measured before this filter: 395 of
+# the 426 rows carrying a system-register read carried SCTLR_EL{1,2,3},
+# 355 carried TCR_EL3 -- read by the tag-check enable predicate on every
+# atomic and by the PAC bit-width computation, not by the instruction.
+#
+# Registers that ARE operands stay: GCR_EL1 (the tag exclusion mask ADDG
+# and IRG compute from), RGSR_EL1, GMID_EL1, DCZID_EL0, ELR_ELx / SPSR_ELx
+# (what ERET resumes from), DISR_EL1, ACCDATA_EL1, PAR_EL1, GCSPR_ELx.
+CONFIG_REGS = re.compile(
+    r'^('
+    r'SCTLR2?_EL[123]'
+    r'|SCR_EL3'
+    r'|HCRX?_EL2'
+    r'|TCR2?_EL[123]'
+    r'|TTBR[01]_EL[123]'
+    r'|MAIR2?_EL[123]'
+    r'|PIR_EL[123]|PIRE0_EL[12]'
+    r'|GCSCR_EL[123]|GCSCRE0_EL1'
+    r'|CPACR_EL1|CPTR_EL[23]'
+    r')$')
+
 
 def sysreg_lookup(name=None, enc=None):
     if name is not None:
         u = name.upper()
+        if CONFIG_REGS.match(u):
+            return None
         if u in SYSREG_NAMES or re.match(r'^[A-Z][A-Z0-9]*_EL[0-3]', u):
             return 'TLS' if u in TLS_REGS else 'SYS'
         return None

@@ -119,12 +119,34 @@ def _harvest(text, funcs):
         if s.endswith(';'):
             i += 1                       # bare declaration, no body
             continue
+        #
+        # A signature whose parameter list does not fit on one line is
+        # continued on the next, indented, line(s):
+        #
+        #     (boolean, bits(N)) FPProcessNaNs(FPType type1, FPType type2,
+        #                                      bits(N) op1, bits(N) op2,
+        #                                      FPCRType fpcr)
+        #
+        # Read on until the brackets balance, otherwise the header parses
+        # as nothing and the whole function -- body included -- is lost.
+        # 193 shared functions wrap this way, among them FPProcessNaNs,
+        # FPToFixed, FixedToFP and FPRoundBase/6, which sit on the FPSR
+        # cumulative-exception path of nearly every FP instruction: with
+        # them absent the reference silently under-reports the FPSR write.
+        sig_end = i
+        while (s.count('(') > s.count(')') or s.count('[') > s.count(']')) \
+                and sig_end + 1 < len(lines):
+            sig_end += 1
+            cont = lines[sig_end]
+            if not cont.strip() or cont[0] not in ' \t':
+                break
+            s = s + ' ' + cont.strip()
         sig = _parse_sig(s)
         if sig is None:
             i += 1
             continue
         name, params, kind = sig
-        j = i + 1
+        j = sig_end + 1
         body = []
         while j < len(lines):
             l2 = lines[j]
@@ -232,11 +254,21 @@ def _params(s):
     return out
 
 
+# Bumped whenever _harvest / _parse_sig changes what gets harvested, so a
+# cache written by an older harvester is rebuilt instead of silently reused.
+# (A stale cache once hid a harvester repair completely: the reference came
+# out byte-identical and the repair looked like a no-op.)
+SHCACHE_VERSION = 2
+
+
 def load_shared():
     if os.path.exists(SHCACHE):
         with open(SHCACHE, 'rb') as f:
-            return pickle.load(f)
+            blob = pickle.load(f)
+        if isinstance(blob, tuple) and len(blob) == 2 \
+                and blob[0] == SHCACHE_VERSION:
+            return blob[1]
     fs = build_shared()
     with open(SHCACHE, 'wb') as f:
-        pickle.dump(fs, f, 2)
+        pickle.dump((SHCACHE_VERSION, fs), f, 2)
     return fs

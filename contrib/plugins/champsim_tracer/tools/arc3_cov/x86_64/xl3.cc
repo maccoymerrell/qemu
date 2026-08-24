@@ -150,6 +150,17 @@ static bool xed_elab(const uint8_t*b, unsigned n, std::string&mnem, unsigned&len
     xed_decoded_inst_t d; xed_decoded_inst_zero(&d);
     xed_decoded_inst_set_mode(&d, XED_MACHINE_MODE_LONG_64, XED_ADDRESS_WIDTH_64b);
     xed3_operand_set_cet(&d, 1);                      /* ENDBR64 needs this */
+    /* XED decodes 0F 1A / 0F 1B as a reserved NOP unless MPX decoding is
+     * switched on, and its default is off.  The guest under measurement has
+     * MPX: QEMU implements the whole extension in TCG -- cpu_bndl[4] /
+     * cpu_bndu[4] are TCG globals over CPUX86State.bnd_regs, translate.c
+     * case 0x11a / 0x11b emit real BNDCL / BNDCU / BNDCN / BNDMK / BNDMOV /
+     * BNDLDX / BNDSTX code under HF_MPX_EN_MASK, and CPUID_7_0_EBX_MPX is
+     * inside TCG_7_0_EBX_FEATURES (target/i386/cpu.c).  Leaving mpxmode at 0
+     * compares the tracer against a machine the guest is not, and charges
+     * the bound-register dependency QEMU really has to the tracer as a
+     * phantom.  This is the same shape as the `cet` line above. */
+    xed3_operand_set_mpxmode(&d, 1);
     if (xed_decode(&d,b,n)!=XED_ERROR_NONE) return false;
     len = xed_decoded_inst_get_length(&d);
     mnem = xed_iclass_enum_t2str(xed_decoded_inst_get_iclass(&d));

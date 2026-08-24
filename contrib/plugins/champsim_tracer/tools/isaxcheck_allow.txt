@@ -155,6 +155,65 @@ aarch64 R-rd-missing tlbi +r#
 # one.  So the tracer is short a write LLVM reports, deliberately.
 #
 # Delete these three if LLVM ever narrows CDQ/CQO/CWD to Defs = [xDX].
+#
+# THE IMPLICIT-REGISTER TABLE (disas/capstone.c, cap_x86_implicit) MOVED
+# THIRTEEN RULES IN THIS FILE FROM LIVE TO DEAD, AND THEY ARE DELETED
+# RATHER THAN KEPT.  Every one of them said "the tracer misses a register
+# LLVM names" for an instruction whose whole dependency is implicit --
+# xlatb, cmpxchg8b/16b, clzero, monitorx, mwaitx.  Capstone reports no
+# implicit operand for them; the table supplies the architectural set, so
+# the signature cannot occur any more and a rule that cannot fire is a
+# false statement about the tracer.
+#
+# THE ROWS BELOW ARE WHAT THE REPAIR LEFT, in three classes, and none of
+# them is a register the tracer dropped:
+#
+#  *-phantom  fs / gs / cr0 on SMSW, LMSW, SWAPGS, RD/WRFSBASE,
+#             RD/WRGSBASE, LFS, LGS: the tracer names the control or
+#             segment register and LLVM MC names NOTHING.  XED -- this
+#             arc's primary reference -- names exactly what the tracer
+#             now names, on the same encodings:
+#               0f01e0    SMSW      XED src CR0        LLVM src -
+#               0f01f0    LMSW      XED dst CR0        LLVM dst -
+#               0f01f8    SWAPGS    XED GSBASE/GSBASE  LLVM -/-
+#               f30faec0  RDFSBASE  XED src FSBASE     LLVM src -
+#               f30faed0  WRFSBASE  XED dst FSBASE     LLVM dst -
+#               0fb400    LFS       XED dst FS,RAX     LLVM dst RAX
+#             LLVM MC models these as opaque; QEMU's translation of each
+#             reads or writes precisely that state.  Recording MORE than
+#             LLVM is the direction this project accepts.
+#
+#  mwaitx     the tracer writes RAX where LLVM writes nothing.  XED
+#             writes RAX (the MONITORX/MWAITX extension returns its
+#             status there).  The RBX read the tracer also adds is NOT
+#             in this list because it made the tracer AGREE with LLVM.
+#
+#  *-missing  cs / ds on cmpxchg8b, cmpxchg16b and ud1 with a segment
+#             override.  This is the SAME pre-existing class already
+#             allowed here for cmpxchgb, cmpw and the rest -- the tracer
+#             does not attribute the segment register of an explicit
+#             memory operand -- and these three mnemonics only join it
+#             now because the register half of their disagreement was
+#             repaired and stopped masking the segment half.  The rule
+#             they replace said "+REG_GPR#,REG_SEG0"; the narrower rule
+#             is the honest one.
+#
+#             MONITORX / MWAITX with a 66, F2 or F3 prefix are the two
+#             rows where the tracer now records LESS than LLVM MC, and
+#             that is deliberate: XED REFUSES every prefixed form of both
+#             (660f01fa, 660f01fb, f20f01fa, f20f01fb, f30f01fb all
+#             decode to nothing) and reads f30f01fa as MCOMMIT, while
+#             LLVM ignores the prefix and repeats the bare instruction.
+#             The implicit-register table follows XED and declines to
+#             attach MONITORX's operands to bytes XED says are not
+#             MONITORX.
+#
+#  ud1        Capstone 6.0.0-Alpha7 decoded UD1 (0F B9 /r) as two bytes
+#             with no operands, which the same repair fixes; the row now
+#             enters the comparison at all, and LLVM's own view of it
+#             carries a memory operand for the register form and no
+#             control-flow group.  Both differences are LLVM's.
+#
 x86_64 R-wr-missing cltd +r#
 x86_64 R-wr-missing cqto +r#
 x86_64 R-wr-missing cwtd +r#
@@ -1097,8 +1156,6 @@ x86_64 R-rd-missing bswapw +r#
 x86_64 R-rd-missing clc +flags
 x86_64 R-rd-missing cli +flags
 x86_64 R-rd-missing cmc +flags
-x86_64 R-rd-missing cmpxchg16b +r#
-x86_64 R-rd-missing cmpxchg8b +r#
 x86_64 R-rd-missing cvtpi2pd +r#,v#
 x86_64 R-rd-missing cvtpi2pd +v#
 x86_64 R-rd-missing cvtsd2ss +v#
@@ -1147,7 +1204,6 @@ x86_64 R-rd-missing sqrtsd +v#
 x86_64 R-rd-missing sqrtss +v#
 x86_64 R-rd-missing stc +flags
 x86_64 R-rd-missing sti +flags
-x86_64 R-rd-missing xlatb +r#
 x86_64 R-rd-phantom bnd lretl +r#,ss
 x86_64 R-rd-phantom bnd lretq +r#,ss
 x86_64 R-rd-phantom bnd retq +r#,ss
@@ -1181,8 +1237,6 @@ x86_64 R-rd-phantom sysretl +r#
 x86_64 R-rd-phantom sysretq +r#
 x86_64 R-wr-missing bswapw +r#
 x86_64 R-wr-missing cli +flags
-x86_64 R-wr-missing cmpxchg16b +r#
-x86_64 R-wr-missing cmpxchg8b +r#
 x86_64 R-wr-missing cvtpd2pi +r#
 x86_64 R-wr-missing cvttpd2pi +r#
 x86_64 R-wr-missing emms +mm#,st#
@@ -1209,7 +1263,6 @@ x86_64 R-wr-missing shrdq +r#
 x86_64 R-wr-missing shrdw +r#
 x86_64 R-wr-missing sti +flags
 x86_64 R-wr-missing wait +fpsw
-x86_64 R-wr-missing xlatb +r#
 x86_64 R-wr-phantom bnd callq +r#
 x86_64 R-wr-phantom bnd lretl +cs,r#
 x86_64 R-wr-phantom bnd lretq +cs,r#
@@ -3053,9 +3106,6 @@ x86_64 R-wr-phantom fxam +st#
 # by a compiler for the subset the tracer targets, so the missing edges are
 # unreachable in practice; the entry records the hole rather than pretending
 # the two decoders agree.
-x86_64 R-rd-missing clzero +r#
-x86_64 R-rd-missing monitorx +r#
-x86_64 R-rd-missing mwaitx +r#
 x86_64 R-rd-missing pconfig +r#
 x86_64 R-rd-missing rdpkru +r#
 x86_64 R-rd-missing wrpkru +r#
@@ -4175,10 +4225,6 @@ x86_64 R-rd-missing cmpq +cs
 x86_64 R-rd-missing cmpq +ds
 x86_64 R-rd-missing cmpsq +cs
 x86_64 R-rd-missing cmpsq +ds
-x86_64 R-rd-missing cmpxchg16b +cs,r#
-x86_64 R-rd-missing cmpxchg16b +ds,r#
-x86_64 R-rd-missing cmpxchg8b +cs,r#
-x86_64 R-rd-missing cmpxchg8b +ds,r#
 x86_64 R-rd-missing cmpxchgb +cs
 x86_64 R-rd-missing cmpxchgb +ds
 x86_64 R-rd-missing cmpxchgl +cs
@@ -8497,3 +8543,33 @@ aarch64 R-rd-phantom luti2 +sysfpen,vctrl
 aarch64 R-rd-phantom luti4 +sysfpen,vctrl
 aarch64 R-rd-phantom str +sysfpen,vctrl
 aarch64 R-rd-phantom zero +sysfpen,vctrl
+x86_64 M-llvm-mem-cs-none ud1 load
+x86_64 R-rd-missing cmpxchg16b +cs
+x86_64 R-rd-missing cmpxchg16b +ds
+x86_64 R-rd-missing cmpxchg8b +cs
+x86_64 R-rd-missing cmpxchg8b +ds
+x86_64 R-rd-missing ud1 +cs
+x86_64 R-rd-missing ud1 +ds
+x86_64 R-rd-phantom rdfsbasel +fs
+x86_64 R-rd-phantom rdfsbaseq +fs
+x86_64 R-rd-phantom rdgsbasel +gs
+x86_64 R-rd-phantom rdgsbaseq +gs
+x86_64 R-rd-phantom smswl +cr#
+x86_64 R-rd-phantom smswq +cr#
+x86_64 R-rd-phantom smsww +cr#
+x86_64 R-rd-phantom swapgs +gs
+x86_64 R-wr-phantom lfsl +fs
+x86_64 R-wr-phantom lfsq +fs
+x86_64 R-wr-phantom lfsw +fs
+x86_64 R-wr-phantom lgs +gs
+x86_64 R-wr-phantom lgsl +gs
+x86_64 R-wr-phantom lgsw +gs
+x86_64 R-wr-phantom lmsww +cr#
+x86_64 R-wr-phantom mwaitx +r#
+x86_64 R-wr-phantom swapgs +gs
+x86_64 R-wr-phantom wrfsbasel +fs
+x86_64 R-wr-phantom wrfsbaseq +fs
+x86_64 R-wr-phantom wrgsbasel +gs
+x86_64 R-wr-phantom wrgsbaseq +gs
+x86_64 R-rd-missing monitorx +r#
+x86_64 R-rd-missing mwaitx +r#

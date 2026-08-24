@@ -100,16 +100,22 @@ $PY qemu_reach_matrix.py --evidence "$D" --attrib ../attrib.tsv \
 # An agreement rate quoted off an instrument nobody has watched fail vouches
 # for nothing.  drop-src must cost exactly the agreeing rows of the damaged
 # mnemonic, against a baseline of 5835:
-#   movq 20   vmovq 13   vpsadbw 10   sqrtsd 2   ud0 3
+#   movq 20   vmovq 13   vpsadbw 10   sqrtsd 2   ud0 3   ud1 2
+#   xlatb 1   smswl 1   lmsww 2   rdfsbasel 1   lfsl 1   cmpxchg8b 1
+# NOTE THE SPELLINGS.  --falsify matches the mnemonic EXACTLY, so `smsw`
+# matches nothing and the tool says so with exit 2 -- take the exit code,
+# never the AGREE line, or an unchanged count reads as a passing control.
 ud0 is in the list on purpose too -- it is the family the UD0 misdecode
 # repair created, and a repair nobody has watched fail is a repair that
 # vouches for nothing.
 # sqrtsd is in the list on purpose -- it is an R7.1-SCALAR row, so it proves
 # the rows that rule closed are watched rather than blindly agreeing.
 cp tracer_batch.tsv tracer_batch.good.tsv
-for M in movq vmovq vpsadbw sqrtsd ud0; do
+for M in movq vmovq vpsadbw sqrtsd ud0 ud1 xlatb smswl lmsww \
+         rdfsbasel lfsl cmpxchg8b; do
   "$Q/build/contrib/plugins/isaxcheck" --isa=x86_64 --layer=fields \
-      --falsify=drop-src:$M --batch < probe_uniq.hex > tracer_batch.tsv
+      --falsify=drop-src:$M --batch < probe_uniq.hex > tracer_batch.tsv \
+      || { echo "falsify drop-src:$M did not reach its subject"; exit 1; }
   echo -n "falsify drop-src:$M -> "
   $PY compare_attrib.py 2>/dev/null | grep -m1 '  AGREE  '
 done

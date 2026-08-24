@@ -7765,6 +7765,12 @@ static bool cap_nodetail(void)
     return cap_nodetail_on;
 }
 
+/* Registers Capstone omits for a family of x86-64 instructions whose
+ * whole dependency is implicit; the table and the reasoning are down
+ * with the other Capstone workarounds. */
+static void cap_x86_apply_implicit_table(qemu_plugin_insn_info *out,
+                                         csh handle, const cs_insn *insn);
+
 /*
  * Deliberate corruption of what Capstone says, for testing that a consumer
  * does not depend on it.
@@ -7979,6 +7985,9 @@ bool cap_disas_plugin_detail(disassemble_info *info, uint64_t pc, size_t size,
         switch (info->cap_arch) {
         case CS_ARCH_X86:
             cap_fill_x86_operands(handle, insn, out);
+            if (cap_effective_mode(info) & CS_MODE_64) {
+                cap_x86_apply_implicit_table(out, handle, insn);
+            }
             break;
         case CS_ARCH_ARM64:
             cap_fill_arm64_operands(handle, cap_effective_mode(info),
@@ -8360,18 +8369,24 @@ static bool cap_x86_gap_plan(const uint8_t *d, size_t n, CapX86GapPlan *r)
      * -- so this is a wrong answer, not a missing one, and it costs the
      * ModRM.reg and r/m registers AND the instruction length.
      *
+     * UD1, 0F B9 /r, is the same instruction shape with the same defect
+     * and takes the same repair; XED and LLVM both read 3 bytes and both
+     * name the ModRM.reg and r/m registers for it.
+     *
      * The surrogate is BT, 0F A3 /r: the same two-byte opcode and ModRM
      * shape, both operands READ, nothing written but flags.  The one
      * difference is named and undone below -- BT writes RFLAGS and UD0
      * writes nothing, which XED confirms (BT -> dst RFLAGS, UD0 -> dst
      * empty, same operands otherwise, memory form included).
      */
-    if (d[o + 1] == 0xff) {
+    if (d[o + 1] == 0xff || d[o + 1] == 0xb9) {
+        bool one = d[o + 1] == 0xb9;
+
         memcpy(r->bytes, d, len);
         r->bytes[o + 1] = 0xa3;
         r->len = len;
-        r->mnem = "ud0";
-        r->insn_id = X86_INS_UD0;
+        r->mnem = one ? "ud1" : "ud0";
+        r->insn_id = one ? X86_INS_UD1 : X86_INS_UD0;
         r->no_reg_write = true;
         return true;
     }
@@ -8411,7 +8426,8 @@ static bool cap_x86_misdecoded(const uint8_t *d, size_t n)
     if (p.p66 || p.pf2 || p.pf3) {
         return false;
     }
-    return d[p.op_at] == 0x0f && d[p.op_at + 1] == 0xff;
+    return d[p.op_at] == 0x0f &&
+           (d[p.op_at + 1] == 0xff || d[p.op_at + 1] == 0xb9);
 }
 
 /*
@@ -8456,6 +8472,114 @@ static void cap_x86_gap_apply(csh handle, const CapX86GapPlan *r,
                           handle, r->extra_read, CS_ARCH_X86);
         out->regs_read_id[i] = r->extra_read;
         out->n_regs_read = i + 1;
+    }
+}
+
+/*
+ * IMPLICIT REGISTERS CAPSTONE DOES NOT REPORT.
+ *
+ * Capstone fills regs_read[]/regs_write[] from its own implicit-operand
+ * tables, and for a family of instructions whose whole dependency IS
+ * implicit those tables are empty or short.  The result is not a decode
+ * failure -- the instruction decodes, with the right mnemonic and the
+ * right length -- so nothing above catches it: it is a SUBSET answer,
+ * the one direction this project treats as disqualifying, arriving
+ * dressed as a successful decode.
+ *
+ * Every row below is the architectural dependency, and every row was
+ * measured against BOTH reference decoders on the encoding named beside
+ * it.  Where XED and LLVM disagree the row follows XED, which is this
+ * arc's primary reference, and the disagreement is named:
+ *   MWAITX  XED reads RAX,RCX and writes RAX; LLVM reads RAX,RBX,RCX and
+ *           writes nothing.  AMD's EBX timer operand is real but only
+ *           consulted when ECX[1] is set, and a conditional source is
+ *           still a source (R4) -- so RBX is INCLUDED, which makes this
+ *           row a named superset of XED rather than a subset of LLVM.
+ *   SMSW / LMSW / SWAPGS / RD*BASE / WR*BASE / LFS / LGS
+ *           LLVM names no implicit register at all for these; XED names
+ *           the control or segment register, and QEMU's own translation
+ *           reads or writes exactly that state.
+ *
+ * A register already present as an explicit operand is listed anyway --
+ * the file's own cap_x86_add_implicit() drops the duplicate -- so the
+ * table reads as the architectural statement it is rather than as a
+ * diff against whatever Capstone happened to supply.
+ */
+typedef struct CapX86Implicit {
+    unsigned insn_id;
+    bool     bare;        /* only when NO mandatory prefix is present */
+    uint16_t read[5];
+    uint16_t write[3];
+} CapX86Implicit;
+
+static const CapX86Implicit cap_x86_implicit[] = {
+    /* d7            XLAT: AL := [RBX + AL], through DS */
+    { X86_INS_XLATB,      false, { X86_REG_RAX, X86_REG_RBX },
+                                 { X86_REG_RAX } },
+    /* 0f c7 /1      EDX:EAX compared, ECX:EBX stored, both halves written */
+    { X86_INS_CMPXCHG8B,  false, { X86_REG_RAX, X86_REG_RBX, X86_REG_RCX,
+                                   X86_REG_RDX },
+                                 { X86_REG_RDX } },
+    /* 48 0f c7 /1   the 128-bit form, same shape */
+    { X86_INS_CMPXCHG16B, false, { X86_REG_RAX, X86_REG_RBX, X86_REG_RCX,
+                                   X86_REG_RDX },
+                                 { X86_REG_RDX } },
+    /* 0f 01 /4      SMSW: the machine status word IS the low half of CR0 */
+    { X86_INS_SMSW,       false, { X86_REG_CR0 },      { 0 } },
+    /* 0f 01 /6      LMSW writes it */
+    { X86_INS_LMSW,       false, { 0 },                { X86_REG_CR0 } },
+    /* 0f 01 f8      SWAPGS exchanges GS.base with KernelGSbase */
+    { X86_INS_SWAPGS,     false, { X86_REG_GS },       { X86_REG_GS } },
+    /* f3 0f ae /0../3   the FS/GS base accessors */
+    { X86_INS_RDFSBASE,   false, { X86_REG_FS },       { 0 } },
+    { X86_INS_WRFSBASE,   false, { 0 },                { X86_REG_FS } },
+    { X86_INS_RDGSBASE,   false, { X86_REG_GS },       { 0 } },
+    { X86_INS_WRGSBASE,   false, { 0 },                { X86_REG_GS } },
+    /* 0f b4 /r, 0f b5 /r   LFS/LGS load the SELECTOR as well as the offset */
+    { X86_INS_LFS,        false, { 0 },                { X86_REG_FS } },
+    { X86_INS_LGS,        false, { 0 },                { X86_REG_GS } },
+    /* 0f 01 fc      CLZERO zeroes the line RAX addresses */
+    { X86_INS_CLZERO,     false, { X86_REG_RAX },      { 0 } },
+    /*
+     * 0f 01 fa / fb   MONITORX and MWAITX, the AMD MONITOR pair, and the
+     * only rows here that are `bare`.  A MANDATORY PREFIX TAKES THIS SPACE
+     * ELSEWHERE and Capstone does not notice: it decodes f3 0f 01 fa as
+     * `monitorx`, and those bytes are MCOMMIT.  XED reads them as MCOMMIT
+     * writing RFLAGS and reading nothing; LLVM MC repeats Capstone's
+     * mistake.  Putting MONITORX's three reads on an instruction that has
+     * none would be a WRONG set standing in for a missing one, so the
+     * prefix disqualifies the row.  The misnaming itself is not repaired
+     * here and stays visible as one disagreeing opcode.
+     */
+    { X86_INS_MONITORX,   true,  { X86_REG_RAX, X86_REG_RCX, X86_REG_RDX },
+                                 { 0 } },
+    { X86_INS_MWAITX,     true,  { X86_REG_RAX, X86_REG_RBX, X86_REG_RCX },
+                                 { X86_REG_RAX } },
+};
+
+static void cap_x86_apply_implicit_table(qemu_plugin_insn_info *out,
+                                         csh handle, const cs_insn *insn)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(cap_x86_implicit); i++) {
+        const CapX86Implicit *e = &cap_x86_implicit[i];
+        CapX86Pfx p;
+
+        if (e->insn_id != insn->id) {
+            continue;
+        }
+        if (e->bare) {
+            if (!cap_x86_scan_prefixes(insn->bytes, insn->size, &p) ||
+                p.p66 || p.pf2 || p.pf3) {
+                return;
+            }
+        }
+        for (size_t k = 0; k < ARRAY_SIZE(e->read) && e->read[k]; k++) {
+            cap_x86_add_implicit(out, handle, e->read[k], false);
+        }
+        for (size_t k = 0; k < ARRAY_SIZE(e->write) && e->write[k]; k++) {
+            cap_x86_add_implicit(out, handle, e->write[k], true);
+        }
+        return;
     }
 }
 
@@ -8643,6 +8767,9 @@ bool cap_disas_raw_detail(int cap_arch, unsigned int cap_mode,
         switch (cap_arch) {
         case CS_ARCH_X86:
             cap_fill_x86_operands(handle, insn, out);
+            if (cap_mode & CS_MODE_64) {
+                cap_x86_apply_implicit_table(out, handle, insn);
+            }
             break;
         case CS_ARCH_ARM64:
             cap_fill_arm64_operands(handle, cap_mode, insn, out);

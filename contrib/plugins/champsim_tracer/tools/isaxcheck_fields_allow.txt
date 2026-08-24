@@ -193,6 +193,65 @@ mipsel FR-wr-phantom ctcmsa +REG_SYSID
 
 # Signatures the register-space rework surfaced under a new generic
 # id.  Same residual, new name.
+#
+# THE IMPLICIT-REGISTER TABLE (disas/capstone.c, cap_x86_implicit) MOVED
+# THIRTEEN RULES IN THIS FILE FROM LIVE TO DEAD, AND THEY ARE DELETED
+# RATHER THAN KEPT.  Every one of them said "the tracer misses a register
+# LLVM names" for an instruction whose whole dependency is implicit --
+# xlatb, cmpxchg8b/16b, clzero, monitorx, mwaitx.  Capstone reports no
+# implicit operand for them; the table supplies the architectural set, so
+# the signature cannot occur any more and a rule that cannot fire is a
+# false statement about the tracer.
+#
+# THE ROWS BELOW ARE WHAT THE REPAIR LEFT, in three classes, and none of
+# them is a register the tracer dropped:
+#
+#  *-phantom  fs / gs / cr0 on SMSW, LMSW, SWAPGS, RD/WRFSBASE,
+#             RD/WRGSBASE, LFS, LGS: the tracer names the control or
+#             segment register and LLVM MC names NOTHING.  XED -- this
+#             arc's primary reference -- names exactly what the tracer
+#             now names, on the same encodings:
+#               0f01e0    SMSW      XED src CR0        LLVM src -
+#               0f01f0    LMSW      XED dst CR0        LLVM dst -
+#               0f01f8    SWAPGS    XED GSBASE/GSBASE  LLVM -/-
+#               f30faec0  RDFSBASE  XED src FSBASE     LLVM src -
+#               f30faed0  WRFSBASE  XED dst FSBASE     LLVM dst -
+#               0fb400    LFS       XED dst FS,RAX     LLVM dst RAX
+#             LLVM MC models these as opaque; QEMU's translation of each
+#             reads or writes precisely that state.  Recording MORE than
+#             LLVM is the direction this project accepts.
+#
+#  mwaitx     the tracer writes RAX where LLVM writes nothing.  XED
+#             writes RAX (the MONITORX/MWAITX extension returns its
+#             status there).  The RBX read the tracer also adds is NOT
+#             in this list because it made the tracer AGREE with LLVM.
+#
+#  *-missing  cs / ds on cmpxchg8b, cmpxchg16b and ud1 with a segment
+#             override.  This is the SAME pre-existing class already
+#             allowed here for cmpxchgb, cmpw and the rest -- the tracer
+#             does not attribute the segment register of an explicit
+#             memory operand -- and these three mnemonics only join it
+#             now because the register half of their disagreement was
+#             repaired and stopped masking the segment half.  The rule
+#             they replace said "+REG_GPR#,REG_SEG0"; the narrower rule
+#             is the honest one.
+#
+#             MONITORX / MWAITX with a 66, F2 or F3 prefix are the two
+#             rows where the tracer now records LESS than LLVM MC, and
+#             that is deliberate: XED REFUSES every prefixed form of both
+#             (660f01fa, 660f01fb, f20f01fa, f20f01fb, f30f01fb all
+#             decode to nothing) and reads f30f01fa as MCOMMIT, while
+#             LLVM ignores the prefix and repeats the bare instruction.
+#             The implicit-register table follows XED and declines to
+#             attach MONITORX's operands to bytes XED says are not
+#             MONITORX.
+#
+#  ud1        Capstone 6.0.0-Alpha7 decoded UD1 (0F B9 /r) as two bytes
+#             with no operands, which the same repair fixes; the row now
+#             enters the comparison at all, and LLVM's own view of it
+#             carries a memory operand for the register form and no
+#             control-flow group.  Both differences are LLVM's.
+#
 x86_64 FR-wr-missing cltd +REG_GPR#
 x86_64 FR-wr-missing cqto +REG_GPR#
 x86_64 FR-wr-missing cwtd +REG_GPR#
@@ -1588,10 +1647,6 @@ x86_64 FR-rd-missing cmpw +REG_SEG0
 x86_64 FR-rd-missing cmpw +REG_SEG1
 x86_64 FR-rd-missing cmpw +REG_SEG2
 x86_64 FR-rd-missing cmpw +REG_SEG5
-x86_64 FR-rd-missing cmpxchg16b +REG_GPR#,REG_SEG0
-x86_64 FR-rd-missing cmpxchg16b +REG_GPR#,REG_SEG1
-x86_64 FR-rd-missing cmpxchg8b +REG_GPR#,REG_SEG0
-x86_64 FR-rd-missing cmpxchg8b +REG_GPR#,REG_SEG1
 x86_64 FR-rd-missing cmpxchgb +REG_SEG0
 x86_64 FR-rd-missing cmpxchgb +REG_SEG1
 x86_64 FR-rd-missing cmpxchgl +REG_SEG0
@@ -3296,10 +3351,7 @@ x86_64 FM-miss-store xrstor64
 x86_64 FM-miss-store xrstors
 x86_64 FM-miss-store xrstors64
 x86_64 FR-rd-missing clrssbsy +REG_GPR#
-x86_64 FR-rd-missing clzero +REG_GPR#
 x86_64 FR-rd-missing lfence +REG_GPR#
-x86_64 FR-rd-missing monitorx +REG_GPR#
-x86_64 FR-rd-missing mwaitx +REG_GPR#
 x86_64 FR-rd-missing pconfig +REG_GPR#
 x86_64 FR-rd-missing tpause +REG_GPR#
 x86_64 FR-rd-missing umwait +REG_GPR#
@@ -3490,8 +3542,6 @@ x86_64 FR-rd-missing clc +REG_FLAGS
 x86_64 FR-rd-missing cli +REG_FLAGS
 x86_64 FR-rd-missing clwb +REG_GPR#
 x86_64 FR-rd-missing cmc +REG_FLAGS
-x86_64 FR-rd-missing cmpxchg16b +REG_GPR#
-x86_64 FR-rd-missing cmpxchg8b +REG_GPR#
 x86_64 FR-rd-missing cvtpi2pd +REG_FP_REG,REG_VEC#
 x86_64 FR-rd-missing cvtpi2pd +REG_GPR#,REG_VEC#
 x86_64 FR-rd-missing cvtpi2pd +REG_SP,REG_VEC#
@@ -3527,12 +3577,9 @@ x86_64 FR-rd-missing stc +REG_FLAGS
 x86_64 FR-rd-missing sti +REG_FLAGS
 x86_64 FR-rd-missing vpcmpestrm +REG_GPR#
 x86_64 FR-rd-missing wrpkru +REG_GPR#
-x86_64 FR-rd-missing xlatb +REG_GPR#
 x86_64 FR-rd-phantom cvtpi2pd +REG_FPR#
 x86_64 FR-rd-phantom movq +REG_VEC#
 x86_64 FR-wr-missing cli +REG_FLAGS
-x86_64 FR-wr-missing cmpxchg16b +REG_GPR#
-x86_64 FR-wr-missing cmpxchg8b +REG_GPR#
 x86_64 FR-wr-missing cvtpd2pi +REG_FP_REG
 x86_64 FR-wr-missing cvtpd2pi +REG_GPR#
 x86_64 FR-wr-missing cvtpd2pi +REG_SP
@@ -3567,7 +3614,6 @@ x86_64 FR-wr-missing sti +REG_FLAGS
 x86_64 FR-wr-missing vpcmpestrm +REG_FLAGS,REG_VEC#
 x86_64 FR-wr-missing vpcmpistrm +REG_FLAGS,REG_VEC#
 x86_64 FR-wr-missing wait +REG_FCSR
-x86_64 FR-wr-missing xlatb +REG_GPR#
 x86_64 FR-wr-phantom cvtpd2pi +REG_FPR#
 x86_64 FR-wr-phantom cvttpd2pi +REG_FPR#
 x86_64 FR-wr-phantom movq +REG_VEC#
@@ -6731,3 +6777,34 @@ aarch64 FR-rd-phantom luti2 +REG_SYSFPEN,REG_VCTRL
 aarch64 FR-rd-phantom luti4 +REG_SYSFPEN,REG_VCTRL
 aarch64 FR-rd-phantom str +REG_SYSFPEN,REG_VCTRL
 aarch64 FR-rd-phantom zero +REG_SYSFPEN,REG_VCTRL
+x86_64 FB-flow-presence ud1 cs-yes llvm-no
+x86_64 FM-llvm-mem-cs-none ud1 load
+x86_64 FR-rd-missing cmpxchg16b +REG_SEG0
+x86_64 FR-rd-missing cmpxchg16b +REG_SEG1
+x86_64 FR-rd-missing cmpxchg8b +REG_SEG0
+x86_64 FR-rd-missing cmpxchg8b +REG_SEG1
+x86_64 FR-rd-missing ud1 +REG_SEG0
+x86_64 FR-rd-missing ud1 +REG_SEG1
+x86_64 FR-rd-phantom rdfsbasel +REG_SEG3
+x86_64 FR-rd-phantom rdfsbaseq +REG_SEG3
+x86_64 FR-rd-phantom rdgsbasel +REG_SEG4
+x86_64 FR-rd-phantom rdgsbaseq +REG_SEG4
+x86_64 FR-rd-phantom smswl +REG_CTRL0
+x86_64 FR-rd-phantom smswq +REG_CTRL0
+x86_64 FR-rd-phantom smsww +REG_CTRL0
+x86_64 FR-rd-phantom swapgs +REG_SEG4
+x86_64 FR-wr-phantom lfsl +REG_SEG3
+x86_64 FR-wr-phantom lfsq +REG_SEG3
+x86_64 FR-wr-phantom lfsw +REG_SEG3
+x86_64 FR-wr-phantom lgs +REG_SEG4
+x86_64 FR-wr-phantom lgsl +REG_SEG4
+x86_64 FR-wr-phantom lgsw +REG_SEG4
+x86_64 FR-wr-phantom lmsww +REG_CTRL0
+x86_64 FR-wr-phantom mwaitx +REG_GPR#
+x86_64 FR-wr-phantom swapgs +REG_SEG4
+x86_64 FR-wr-phantom wrfsbasel +REG_SEG3
+x86_64 FR-wr-phantom wrfsbaseq +REG_SEG3
+x86_64 FR-wr-phantom wrgsbasel +REG_SEG4
+x86_64 FR-wr-phantom wrgsbaseq +REG_SEG4
+x86_64 FR-rd-missing monitorx +REG_GPR#
+x86_64 FR-rd-missing mwaitx +REG_GPR#

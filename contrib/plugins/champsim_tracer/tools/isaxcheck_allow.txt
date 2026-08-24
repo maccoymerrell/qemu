@@ -123,6 +123,37 @@ aarch64 R-wr-missing msr +nzcv
 aarch64 R-wr-missing smstart +nzcv
 aarch64 R-wr-missing smstop +nzcv
 
+# MSR (immediate) -- the PSTATE fields, and SMSTART / SMSTOP.
+#
+# The boundary translates the SYSALIAS pstatefield operand into the system
+# register the field IS -- DAIF, SPSel, PAN, UAO, DIT, SSBS, TCO, ALLINT,
+# PM, SVCR -- so `msr daifset, #2` and `msr daif, x0` are one dependency
+# node instead of two unrelated ones, and derives the same answer a second
+# time from the encoding (cap_aarch64_msr_imm_contract).  LLVM MC models
+# none of it: for the whole family its Defs are `nzcv` (allowlisted three
+# lines up, and wrong -- MSR (immediate) writes no condition flag) and its
+# Uses are empty.  So every one of these is the tracer recording state LLVM
+# does not, which is the direction that is never a defect.
+#
+# Direction comes from msr_imm.xml's `case field of`, not from convention:
+# DAIFSet/DAIFClr are `PSTATE.D = PSTATE.D OR operand<3>` and friends, a
+# read-modify-write, hence +sys on BOTH sides; SPSel/PAN/UAO/DIT/TCO/SSBS/
+# ALLINT/PM write a one-bit field whole, hence a write only.  The SVCR
+# forms read SVCR too -- SetPSTATE_SM calls ResetSVEState() only when the
+# mode CHANGES -- and carry the SME enable gate, because msr_imm.xml calls
+# CheckSMEAccess() and R7.4 makes that read a source.  Capstone attaches
+# this encoding no feature group at all, so the gate cannot come from
+# cap_aarch64_is_fp_gated and comes from the encoding instead.
+#
+# These four lines REPLACE `aarch64 Z-unmodelled-op msr` and
+# `aarch64 Z-unmodelled-op smstart`, which the tool now reports DEAD: the
+# operand they excused as unmodelled is modelled.
+aarch64 R-rd-phantom msr +sys
+aarch64 R-rd-phantom smstart +sysfpen,vctrl
+aarch64 R-rd-phantom smstop +sysfpen,vctrl
+aarch64 R-wr-phantom smstart +vctrl
+aarch64 R-wr-phantom smstop +vctrl
+
 # The TLBI operations that take NO Xt argument (TLBI VMALLE1, VMALLS12E1IS,
 # ALLE2, …) are still encoded in the SYS format, which has an Rt field; the
 # architecture requires that field to be 0b11111 for them.  LLVM keeps the
@@ -1388,7 +1419,6 @@ aarch64 Z-unmodelled-op incd
 aarch64 Z-unmodelled-op inch
 aarch64 Z-unmodelled-op incw
 aarch64 Z-unmodelled-op isb
-aarch64 Z-unmodelled-op msr
 aarch64 Z-unmodelled-op prfb
 aarch64 Z-unmodelled-op prfd
 aarch64 Z-unmodelled-op prfh
@@ -1399,7 +1429,6 @@ aarch64 Z-unmodelled-op psb
 aarch64 Z-unmodelled-op ptrue
 aarch64 Z-unmodelled-op ptrues
 aarch64 Z-unmodelled-op rprfm
-aarch64 Z-unmodelled-op smstart
 aarch64 Z-unmodelled-op sqdecb
 aarch64 Z-unmodelled-op sqdecd
 aarch64 Z-unmodelled-op sqdech

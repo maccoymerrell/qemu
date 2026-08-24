@@ -3049,8 +3049,125 @@ static bool cap_aarch64_is_block_zero_sysop(const cs_arm64 *a64, uint8_t n)
  * IC / TLBI reuse AARCH64_OP_SYSREG with a TLBI or IC sub_type for a
  * maintenance operation rather than a register, and are left alone.
  */
-static bool cap_aarch64_sysreg_operand(const cs_arm64_op *o, uint8_t *access)
+/*
+ * MSR (immediate) -- the PSTATE fields, and SMSTART / SMSTOP.
+ *
+ * `msr daifset, #2` is how every AArch64 kernel critical section masks
+ * interrupts, and `smstart` / `smstop` exist for nothing but to write
+ * SVCR.  Capstone hands all of them over as a SYSALIAS operand carrying
+ * a PSTATE-field or SVCR selector -- never a register -- so before this
+ * translation the whole family reached the dependency model reading and
+ * writing NOTHING AT ALL:
+ *
+ *   cstool -d aarch64 7f4303d5   smstart sm
+ *     op_count: 1
+ *     operands[0].type: SYS ALIAS:  operands[0].svcr: BIT = SM
+ *   cstool -d aarch64 df4703d5   msr DAIFSet, #7
+ *     operands[0].type: SYS ALIAS:  subtype PSTATEIMM0_15 = 0x1e
+ *
+ * That is the same severance MRS / MSR (register) already has a
+ * translation for, on the forms a system trace sees most.
+ *
+ * Every one of these fields IS an addressable system register in its own
+ * right -- DAIF, SPSel, PAN, UAO, DIT, SSBS, TCO, ALLINT, PM, SVCR --
+ * and the register form of each writes exactly the state the immediate
+ * form writes.  So the immediate form is given the SAME sysreg
+ * encoding, which is what makes `msr daifset, #2` and `msr daif, x0`
+ * one dependency node instead of two unrelated ones, and routes it
+ * through cap_aarch64_sysreg_class like any other MSR.
+ *
+ * DIRECTION comes from the architecture, not from a convention.
+ * msr_imm.xml's `case field of` is explicit:
+ *
+ *   DAIFSet   PSTATE.D = PSTATE.D OR operand<3>;   ... a read-modify-
+ *   DAIFClr   PSTATE.D = PSTATE.D AND NOT(...);        write, so DAIF
+ *                                                      is a source too
+ *   SPSel / PAN / UAO / DIT / TCO / SSBS / ALLINT / PM
+ *             PSTATE.<f> = operand<0>;             ... a whole write of
+ *                                                      a one-bit field
+ *   SVCRSM    CheckSMEAccess(); SetPSTATE_SM(operand<0>);
+ *
+ * The SVCR forms read SVCR as well as writing it, and that is not the
+ * narrow-write shape R7.1 excludes: SetPSTATE_SM compares the OLD value
+ * and calls ResetSVEState() only when the mode actually changes, so
+ * whether the Z, P and FFR registers are zeroed is a function of the
+ * previous SVCR.  The dependency is real.
+ */
+static bool cap_aarch64_pstate_field(const cs_arm64_op *o, uint8_t *access,
+                                     unsigned *sysreg, const char **name)
 {
+    switch (o->sysop.sub_type) {
+    case AARCH64_OP_SVCR:
+        /* smstart / smstop / msr svcrsm|svcrza|svcrsmza, #imm */
+        *sysreg = AARCH64_SYSREG_SVCR;
+        *name   = "svcr";
+        *access = QEMU_PLUGIN_OP_ACC_READ | QEMU_PLUGIN_OP_ACC_WRITE;
+        return true;
+    case AARCH64_OP_PSTATEIMM0_15:
+        switch (o->sysop.alias.pstateimm0_15) {
+        case AARCH64_PSTATEIMM0_15_DAIFSET:
+        case AARCH64_PSTATEIMM0_15_DAIFCLR:
+            *sysreg = AARCH64_SYSREG_DAIF;
+            *name   = "daif";
+            *access = QEMU_PLUGIN_OP_ACC_READ | QEMU_PLUGIN_OP_ACC_WRITE;
+            return true;
+        case AARCH64_PSTATEIMM0_15_SPSEL:
+            *sysreg = AARCH64_SYSREG_SPSEL;
+            *name   = "spsel";
+            break;
+        case AARCH64_PSTATEIMM0_15_PAN:
+            *sysreg = AARCH64_SYSREG_PAN;
+            *name   = "pan";
+            break;
+        case AARCH64_PSTATEIMM0_15_UAO:
+            *sysreg = AARCH64_SYSREG_UAO;
+            *name   = "uao";
+            break;
+        case AARCH64_PSTATEIMM0_15_DIT:
+            *sysreg = AARCH64_SYSREG_DIT;
+            *name   = "dit";
+            break;
+        case AARCH64_PSTATEIMM0_15_SSBS:
+            *sysreg = AARCH64_SYSREG_SSBS;
+            *name   = "ssbs";
+            break;
+        case AARCH64_PSTATEIMM0_15_TCO:
+            *sysreg = AARCH64_SYSREG_TCO;
+            *name   = "tco";
+            break;
+        default:
+            return false;
+        }
+        *access = QEMU_PLUGIN_OP_ACC_WRITE;
+        return true;
+    case AARCH64_OP_PSTATEIMM0_1:
+        switch (o->sysop.alias.pstateimm0_1) {
+        case AARCH64_PSTATEIMM0_1_ALLINT:
+            *sysreg = AARCH64_SYSREG_ALLINT;
+            *name   = "allint";
+            break;
+        case AARCH64_PSTATEIMM0_1_PM:
+            *sysreg = AARCH64_SYSREG_PM;
+            *name   = "pm";
+            break;
+        default:
+            return false;
+        }
+        *access = QEMU_PLUGIN_OP_ACC_WRITE;
+        return true;
+    default:
+        /* AT / DC / IC / TLBI / PRFM / BTI ... -- not a register. */
+        return false;
+    }
+}
+
+static bool cap_aarch64_sysreg_operand(const cs_arm64_op *o, uint8_t *access,
+                                       unsigned *sysreg, const char **name)
+{
+    *name = NULL;
+    if (o->type == AARCH64_OP_SYSALIAS) {
+        return cap_aarch64_pstate_field(o, access, sysreg, name);
+    }
     if (o->type != AARCH64_OP_SYSREG &&
         o->type != AARCH64_OP_REG_MRS &&
         o->type != AARCH64_OP_REG_MSR) {
@@ -3059,9 +3176,11 @@ static bool cap_aarch64_sysreg_operand(const cs_arm64_op *o, uint8_t *access)
     switch (o->sysop.sub_type) {
     case AARCH64_OP_REG_MRS:
         *access = QEMU_PLUGIN_OP_ACC_READ;
+        *sysreg = o->sysop.reg.sysreg;
         return true;
     case AARCH64_OP_REG_MSR:
         *access = QEMU_PLUGIN_OP_ACC_WRITE;
+        *sysreg = o->sysop.reg.sysreg;
         return true;
     default:
         /* TLBI / IC / an operand Capstone left unclassified. */
@@ -4081,6 +4200,119 @@ static void cap_aarch64_add_fp_enable_gate(const cs_insn *insn,
 }
 
 /*
+ * Capstone 6.0.0-Alpha7 bug: SMSTOP has an EMPTY alias operand set.
+ *
+ *   cstool -d  aarch64 7f4203d5   smstop sm   ->  no op_count line at all
+ *   cstool -r -d aarch64 7f4203d5   smstop sm   ->  op_count: 2,
+ *                                    operands[0].svcr: BIT = SM
+ *
+ * The REAL operand set carries the SVCR selector and the ALIAS operand
+ * set does not, so with the default (alias) detail the instruction
+ * arrives with zero operands.  The same hole swallows the argument-less
+ * SMSTART / SMSTOP (`smstart` == SVCRSMZA, 7f4703d5): op_count 0.
+ * SMSTART with an explicit SM or ZA argument is unaffected, which is
+ * what makes it a defect in Capstone's alias operand table rather than
+ * a modelling decision.  Reportable upstream as such; the fix there is
+ * to give AARCH64_INS_ALIAS_SMSTOP the operand list SMSTART already
+ * has.  Re-verify on a Capstone bump with the two cstool lines above.
+ *
+ * The workaround does not go through the alias id.  It reads the
+ * ENCODING, which is the one description of an MSR (immediate) that no
+ * Capstone table stands in front of:
+ *
+ *   31                    19  18 16 15 12 11  8 7  5 4   0
+ *   1101 0101 0000 0        | op1  | 0100 | CRm | op2 | 11111
+ *
+ * op1:op2 selects the PSTATE field exactly as msr_imm.xml's
+ * `case op1:op2 of` does, and for the SME forms (op1 = 3, op2 = 3) the
+ * CRm<3:1> field distinguishes SVCRSM / SVCRZA / SVCRSMZA.  Deriving it
+ * here also makes the operand-side translation self-checking: both
+ * paths name the same sysreg encoding, and cap_aarch64_add_sysreg is
+ * idempotent on it, so agreement merges and cannot double-count.
+ *
+ * The SME forms additionally carry the enable gate.  msr_imm.xml calls
+ * CheckSMEAccess() before SetPSTATE_SM, and R7.4 makes that read a real
+ * source -- but Capstone attaches this encoding NO feature group at all
+ * ("Groups: privilege" and nothing else), so cap_aarch64_is_fp_gated,
+ * which keys off the feature list, cannot see it.  The gate is added
+ * from the encoding for the same reason the register is.
+ */
+static void cap_aarch64_msr_imm_contract(const cs_insn *insn,
+                                         qemu_plugin_insn_info *out)
+{
+    uint32_t w;
+    unsigned op1, crm, op2, sel;
+    unsigned sysreg;
+    const char *name;
+    uint8_t access = QEMU_PLUGIN_OP_ACC_WRITE;
+
+    if (insn->size != 4) {
+        return;
+    }
+    w = ldl_le_p(insn->bytes);
+    /* MSR (immediate): the fixed bits, CRn == 0b0100 and Rt == 0b11111. */
+    if ((w & 0xFFF80000u) != 0xD5000000u ||
+        ((w >> 12) & 0xFu) != 0x4u || (w & 0x1Fu) != 0x1Fu) {
+        return;
+    }
+    op1 = (w >> 16) & 0x7u;
+    crm = (w >> 8) & 0xFu;
+    op2 = (w >> 5) & 0x7u;
+    sel = (op1 << 3) | op2;
+
+    switch (sel) {
+    case (0 << 3) | 3: sysreg = AARCH64_SYSREG_UAO;   name = "uao";   break;
+    case (0 << 3) | 4: sysreg = AARCH64_SYSREG_PAN;   name = "pan";   break;
+    case (0 << 3) | 5: sysreg = AARCH64_SYSREG_SPSEL; name = "spsel"; break;
+    case (1 << 3) | 0:
+        /* CRm '000x' is ALLINT, '001x' is PM; nothing else is defined. */
+        if ((crm >> 1) == 0) {
+            sysreg = AARCH64_SYSREG_ALLINT;
+            name = "allint";
+        } else if ((crm >> 1) == 1) {
+            sysreg = AARCH64_SYSREG_PM;
+            name = "pm";
+        } else {
+            return;
+        }
+        break;
+    case (3 << 3) | 1: sysreg = AARCH64_SYSREG_SSBS;  name = "ssbs";  break;
+    case (3 << 3) | 2: sysreg = AARCH64_SYSREG_DIT;   name = "dit";   break;
+    case (3 << 3) | 3:
+        /* SVCRSM / SVCRZA / SVCRSMZA -- smstart, smstop. */
+        if ((crm >> 1) < 1 || (crm >> 1) > 3) {
+            return;
+        }
+        sysreg = AARCH64_SYSREG_SVCR;
+        name = "svcr";
+        /* SetPSTATE_SM zeroes the vector state only when the mode
+         * CHANGES, so the previous value is a genuine source. */
+        access = QEMU_PLUGIN_OP_ACC_READ | QEMU_PLUGIN_OP_ACC_WRITE;
+        break;
+    case (3 << 3) | 4: sysreg = AARCH64_SYSREG_TCO;   name = "tco";   break;
+    case (3 << 3) | 6:
+    case (3 << 3) | 7:
+        /* DAIFSet / DAIFClr: OR / AND-NOT of the four bits. */
+        sysreg = AARCH64_SYSREG_DAIF;
+        name = "daif";
+        access = QEMU_PLUGIN_OP_ACC_READ | QEMU_PLUGIN_OP_ACC_WRITE;
+        break;
+    default:
+        return;
+    }
+
+    cap_aarch64_add_sysreg(out, sysreg, name, access);
+    if (sysreg == AARCH64_SYSREG_SVCR) {
+        cap_aarch64_add_sysreg(out, AARCH64_SYSREG_CPACR_EL1, "cpacr_el1",
+                               QEMU_PLUGIN_OP_ACC_READ);
+        cap_aarch64_add_sysreg(out, AARCH64_SYSREG_CPTR_EL2, "cptr_el2",
+                               QEMU_PLUGIN_OP_ACC_READ);
+        cap_aarch64_add_sysreg(out, AARCH64_SYSREG_CPTR_EL3, "cptr_el3",
+                               QEMU_PLUGIN_OP_ACC_READ);
+    }
+}
+
+/*
  * Capstone-6.0.0 bug: when UBFM/SBFM/EXTR resolves to one of the
  * three-operand alias mnemonics whose printed form is `Rd, Rn, #imm`
  * (LSL #imm, LSR #imm, ASR #imm, ROR #imm), the disassembler emits the
@@ -4764,16 +4996,27 @@ static void cap_fill_arm64_operands(csh handle, unsigned int cap_mode,
              * encoding for identification, not a Capstone register id.
              */
             uint8_t sysacc = 0;
-            if (cap_aarch64_sysreg_operand(cop, &sysacc)) {
+            unsigned sysreg = 0;
+            const char *sysname = NULL;
+            if (cap_aarch64_sysreg_operand(cop, &sysacc, &sysreg,
+                                           &sysname)) {
                 op->type   = QEMU_PLUGIN_OP_SYSREG;
                 op->access = sysacc;
-                op->reg_id = (uint16_t)cop->sysop.reg.sysreg;
-                op->sysreg_class =
-                    cap_aarch64_sysreg_class(cop->sysop.reg.sysreg);
-                cap_aarch64_copy_sysreg_name(
-                    op->reg_name, QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
-                    insn->op_str,
-                    sysacc == QEMU_PLUGIN_OP_ACC_READ);
+                op->reg_id = (uint16_t)sysreg;
+                op->sysreg_class = cap_aarch64_sysreg_class(sysreg);
+                if (sysname) {
+                    /* An MSR (immediate) prints the FIELD, not the
+                     * register -- "DAIFSet, #7", "sm" -- so the name
+                     * comes from the translation rather than from
+                     * op_str. */
+                    g_strlcpy(op->reg_name, sysname,
+                              QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ);
+                } else {
+                    cap_aarch64_copy_sysreg_name(
+                        op->reg_name, QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                        insn->op_str,
+                        sysacc == QEMU_PLUGIN_OP_ACC_READ);
+                }
                 op->index_name[0] = '\0';
                 op->index_id   = 0;
                 op->imm = 0;
@@ -5010,6 +5253,7 @@ static void cap_fill_arm64_operands(csh handle, unsigned int cap_mode,
      */
     cap_aarch64_fp_status_contract(insn, a64, handle, out);
     cap_aarch64_add_fp_enable_gate(insn, a64, n, out);
+    cap_aarch64_msr_imm_contract(insn, out);
     cap_aarch64_operand_direction(insn, a64, handle, out);
 
     cap_aarch64_restore_alias_zero_reg(handle, cap_mode, insn, out);

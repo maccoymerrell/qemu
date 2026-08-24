@@ -852,6 +852,22 @@ aarch64 FR-wr-missing msr +REG_FLAGS
 aarch64 FR-wr-missing smstart +REG_FLAGS
 aarch64 FR-wr-missing smstop +REG_FLAGS
 
+# MSR (immediate) -- the fields-layer twin of the boundary carve-out in
+# isaxcheck_allow.txt.  The PSTATE field an MSR (immediate) writes IS an
+# addressable system register, so the boundary names it and the dependency
+# model records it: DAIF for daifset/daifclr (a read-modify-write, hence
+# REG_SYS on both sides), SVCR for smstart/smstop, plus the SME enable gate
+# those two read through CheckSMEAccess.  LLVM MC has no model for any of
+# it -- Uses empty, Defs `nzcv`, which the four lines above already record
+# as wrong -- so the whole difference is state the tracer carries and the
+# reference does not.  See cap_aarch64_pstate_field and
+# cap_aarch64_msr_imm_contract for the direction of each field.
+aarch64 FR-rd-phantom msr +REG_SYS
+aarch64 FR-rd-phantom smstart +REG_SYSFPEN,REG_VCTRL
+aarch64 FR-rd-phantom smstop +REG_SYSFPEN,REG_VCTRL
+aarch64 FR-wr-phantom smstart +REG_VCTRL
+aarch64 FR-wr-phantom smstop +REG_VCTRL
+
 # SME ZA, which LLVM models as immediates rather than registers where
 # the tracer records REG_MATRIX: `zero {za1.s}` names its tile list as
 # an immediate mask on LLVM's side (boundary twins: the `zero +za`

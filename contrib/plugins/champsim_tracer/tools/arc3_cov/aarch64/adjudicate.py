@@ -41,17 +41,22 @@ ADJ = {
     'Capstone exposes only through cs_regs_access(), whose staleness '
     'across decodes is already documented at AARCH64_INS_ALIAS_RET.  '
     '46 rows.'),
- 'SRC+ref:FLAGS': ('TRACER RIGHT -- REFERENCE DEFECT (LIVENESS)',
-    'the MOPS PROLOGUE (cpyfp/cpyp/setp/setgp and variants).  cpyfp.xml '
-    'reads `bits(4) nzcv = PSTATE.<N,Z,C,V>` at the top and then, in the '
-    'prologue branch, overwrites it on BOTH arms -- `nzcv = \'0000\'` when '
-    'CPYFOptionA() and `nzcv = \'0010\'` when not -- before any use.  The '
-    '`if nzcv<1> == \'1\' // PSTATE.C` wrong-option test is in the ELSE '
-    'branch, which is the Main and Epilogue stages.  The measurement '
-    'confirms the split exactly: all 40 Main and all 40 Epilogue rows '
-    'AGREE, with the tracer naming FLAGS; only the 40 prologue rows '
-    'disagree.  The extractor\'s liveness rule missed a local rebound on '
-    'both arms of an if/else.  42 rows.'),
+ 'SRC+ref:FLAGS': ('CLOSED -- REFERENCE FIXED (ruling A), then TRACER FIXED',
+    'was the MOPS PROLOGUE (cpyfp/cpyp/setp/setgp and variants), 40 rows.  '
+    'cpyfp.xml reads `bits(4) nzcv = PSTATE.<N,Z,C,V>` at the top and '
+    'then, in the prologue branch, overwrites it on BOTH arms -- '
+    '`nzcv = \'0000\'` when CPYFOptionA() and `nzcv = \'0010\'` when not -- '
+    'before any use, so the read reaches nothing.  `used` could not see '
+    'that: it answers whether the NAME was evaluated, and the prologue '
+    'does evaluate nzcv, at the bottom, in `PSTATE.<N,Z,C,V> = nzcv`.  '
+    'Ruling A: the reference was corrected rather than labelled.  '
+    'aslinterp now tracks value flow per variable (var_reads), kills a '
+    'read when the container is rebound, and only counts a kill where '
+    'EVERY path to the join performs it.  All 40 prologue rows agree; '
+    'Main and Epilogue keep their FLAGS read.  The 2 rows that survived '
+    'were a different mechanism -- ctermeq/ctermne, whose PSTATE.V is '
+    'computed from PSTATE.C -- and are fixed on the TRACER side at the '
+    'Capstone boundary.  0 rows.'),
  'DST+trc:FCSR SRC+trc:FCSR': ('REFERENCE GAP -- RANK 2 HAS NO FP STATUS MODEL',
     'the post-2022-12 FP8 and FAMINMAX additions (f1cvt/f2cvt/bf1cvt/'
     'bf2cvt families, famax/famin, fmlall*, fcvtnb, fvdotb) and the SVE2 '

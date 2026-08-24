@@ -5254,6 +5254,32 @@ static void cap_fill_arm64_operands(csh handle, unsigned int cap_mode,
     cap_aarch64_fp_status_contract(insn, a64, handle, out);
     cap_aarch64_add_fp_enable_gate(insn, a64, n, out);
     cap_aarch64_msr_imm_contract(insn, out);
+
+    /*
+     * Capstone 6.0.0-Alpha7 implicit-read gap: CTERMEQ / CTERMNE.
+     *
+     * The SVE loop-termination compares write N and V and leave Z and C
+     * alone, and the V they write is a function of the C they did not --
+     * ctermeq_rr.xml:
+     *
+     *   if term then PSTATE.N = '1'; PSTATE.V = '0';
+     *   else         PSTATE.N = '0'; PSTATE.V = (NOT PSTATE.C);
+     *
+     * so NZCV is a source twice over: explicitly through PSTATE.C, and
+     * because a partial write of a flag file a consumer renames as one
+     * register has to merge with what was there.  Capstone reports
+     * "Registers modified: nzcv" and "Registers read: x3 x2" -- the flag
+     * read is missing.  It is NOT missing on the other partial-write
+     * form: RMIF at the same revision reports "Registers read: nzcv x2"
+     * (`cstool -d aarch64 "41 04 00 ba"`), which is what makes this a
+     * two-instruction gap in Capstone rather than a modelling choice
+     * here.  Verify on a bump with `cstool -d aarch64 6020e225`; when
+     * nzcv appears in its read list this becomes a no-op, because
+     * cap_aarch64_add_implicit_read will not duplicate it.
+     */
+    if (insn->id == AARCH64_INS_CTERMEQ || insn->id == AARCH64_INS_CTERMNE) {
+        cap_aarch64_add_implicit_read(out, handle, AARCH64_REG_NZCV);
+    }
     cap_aarch64_operand_direction(insn, a64, handle, out);
 
     cap_aarch64_restore_alias_zero_reg(handle, cap_mode, insn, out);

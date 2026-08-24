@@ -6079,7 +6079,10 @@ aarch64 FR-rd-phantom cnth +REG_SYSFPEN
 aarch64 FR-rd-phantom cntp +REG_SYSFPEN
 aarch64 FR-rd-phantom cntw +REG_SYSFPEN
 aarch64 FR-rd-phantom compact +REG_SYSFPEN
-aarch64 FR-rd-phantom ctermeq +REG_SYSFPEN
+# ctermeq / ctermne: the fields-layer twin of the NZCV carve-out in
+# isaxcheck_allow.txt.  ctermeq_rr.xml computes PSTATE.V from PSTATE.C
+# and leaves Z and C alone, so the flag file is a source.
+aarch64 FR-rd-phantom ctermeq +REG_FLAGS,REG_SYSFPEN
 aarch64 FR-rd-phantom decb +REG_SYSFPEN
 aarch64 FR-rd-phantom decd +REG_SYSFPEN
 aarch64 FR-rd-phantom dech +REG_SYSFPEN

@@ -6,6 +6,7 @@ contents held UNKNOWN.  A branch on an unknown condition executes BOTH
 arms and unions their effects, which is exactly ruling R5: a conditional
 form names every candidate operand and an inert write is still a write.
 """
+import contextlib
 import re
 import aslparse
 
@@ -86,11 +87,18 @@ class Effects:
         self.gcs_w = 0
         self.reads = {}          # read_id -> (kind, idx)
         self._next = 0
+        # When not None, every read id this expression produces is also
+        # dropped here, so the caller can say WHICH container the value
+        # ended up in.  That is what makes a killed value distinguishable
+        # from a consumed one; see Interp.live_reads.
+        self.sink = None
     def add(self, rw, kind, idx=None):
         if rw == 'r':
             self.r.add((kind, idx))
             self._next += 1
             self.reads[self._next] = (kind, idx)
+            if self.sink is not None:
+                self.sink.add(self._next)
             return self._next
         self.w.add((kind, idx))
         return None
@@ -214,6 +222,19 @@ class Interp:
         self.last_read_id = None
         self.read_var = {}
         self.flags_written = set()
+        # Value flow, which is what liveness actually needs.  `used` answers
+        # "was this NAME ever evaluated", and that is not the same question:
+        # the MOPS prologue evaluates `nzcv` at the bottom
+        # (`PSTATE.<N,Z,C,V> = nzcv`) but every path to that point has
+        # already rebound it (`nzcv = '0000'` / `nzcv = '0010'` on both arms
+        # of the option-A if/else), so the PSTATE read at the top reaches
+        # nothing.  var_reads carries, per variable, the read ids whose
+        # values it currently holds; a rebind kills them and a use consumes
+        # them.
+        self.var_reads = {}       # var -> frozenset(read_id)
+        self.bound_reads = set()  # read ids that were parked in a variable
+        self.consumed = set()     # read ids whose value reached a use
+        self.wb_var_reads = set()  # ... or was written back to a register
 
     # -------------------------------------------------- entry points
     def run(self, stmts, env):
@@ -245,26 +266,37 @@ class Interp:
                 self.writeback(lhs, rhs[1], env)
                 return
             self.last_read_id = None
-            val = self.eval(rhs, env)
+            with self._reads_of() as got:
+                val = self.eval(rhs, env)
+            if lhs[0] == 'var' and '.' not in lhs[1]:
+                self.bind_reads(lhs[1], got)
+            else:
+                self.consumed |= got
             if lhs[0] == 'var':
                 self.note_origin(lhs[1], rhs)
             self.assign(lhs, val, env)
         elif k == 'decl':
             self.last_read_id = None
-            val = self.eval(s[3], env) if s[3] is not None else UNK
+            with self._reads_of() as got:
+                val = self.eval(s[3], env) if s[3] is not None else UNK
             if s[2]:
                 if len(s[2]) == 1:
                     env[s[2][0]] = val
+                    self.bind_reads(s[2][0], got)
                     if s[3] is not None:
                         self.note_origin(s[2][0], s[3])
                     else:
                         self.origin.pop(s[2][0], None)
                         self.cover.pop(s[2][0], None)
                 else:
+                    self.consumed |= got
                     for nm in s[2]:
                         env[nm] = UNK
+                        self.var_reads.pop(nm, None)
                         self.origin.pop(nm, None)
                         self.cover.pop(nm, None)
+            else:
+                self.consumed |= got
         elif k == 'if':
             self.exec_if(s, env)
         elif k == 'for':
@@ -285,6 +317,32 @@ class Interp:
             pass
         else:
             raise AssertionError('stmt %r' % (k,))
+
+    @contextlib.contextmanager
+    def _reads_of(self):
+        """Collect the read ids produced or propagated by one expression."""
+        prev = self.ef.sink
+        got = set()
+        self.ef.sink = got
+        try:
+            yield got
+        finally:
+            self.ef.sink = prev
+            if prev is not None:
+                prev |= got
+
+    def bind_reads(self, var, rids):
+        """`var` now holds exactly `rids`; whatever it held before is dead.
+
+        The kill is the point of the whole structure.  A value read into a
+        scratch variable and then overwritten before anything looks at it
+        never reached an architectural result, so the register it came from
+        is not a dependency -- the same doctrine the register writeback
+        idiom already follows, applied to the container rather than to the
+        register.
+        """
+        self.var_reads[var] = frozenset(rids)
+        self.bound_reads |= rids
 
     def note_origin(self, var, rhs):
         self.origin.pop(var, None)
@@ -318,10 +376,31 @@ class Interp:
             for rid in rids:
                 if self.read_var.get(rid) not in self.used:
                     dead.add(rid)
+        # A value parked in a variable and overwritten on every path before
+        # anything looked at it reached no architectural result.  `used`
+        # cannot see this: it answers whether the NAME was ever evaluated,
+        # and the MOPS prologue does evaluate `nzcv` -- at the bottom, long
+        # after both arms of the option-A if/else rebound it to a literal.
+        # Reads the writeback idiom owns are excluded: their liveness is
+        # decided by coverage above, and a merging-predicated destination
+        # read must survive.
+        for rid in self.bound_reads:
+            if (rid not in self.consumed and rid not in wb_ids
+                    and rid not in self.wb_var_reads):
+                dead.add(rid)
         return set(v for rid, v in self.ef.reads.items() if rid not in dead), dead
 
     def writeback(self, lhs, var, env):
         """REG[n, w] = var  -- the scratch read-modify-write idiom."""
+        # This path evaluates `var` under suppress_use, so the value-flow
+        # tracker cannot see the use and would call every read parked in
+        # `var` dead.  Liveness for a written-back value is decided by
+        # COVERAGE below and by nothing else, so record the whole set the
+        # variable holds and exempt it -- `origin` carries one read id and
+        # a variable can hold several, which is exactly the CSEL shape:
+        # `result` leaves the if/else holding Xn on one arm and Xm on the
+        # other, and only one of the two ever reached `origin`.
+        self.wb_var_reads |= self.var_reads.get(var, frozenset())
         args = lhs[2]
         name = lhs[1][1]
         kind = REG_ACCESSORS[name]
@@ -361,12 +440,22 @@ class Interp:
                 continue
             # unknown: union this arm with the rest
             self.certain += 1
+            base = dict(self.var_reads)
             e1 = dict(env)
             fin1 = self._try(body, e1)
+            r1 = dict(self.var_reads)
+            self.var_reads = dict(base)
             rest = ('if', arms[arms.index((cond, body)) + 1:], els)
             e2 = dict(env)
             fin2 = self._try_stmt(rest, e2) if (rest[1] or rest[2]) else True
+            r2 = dict(self.var_reads)
             self.certain -= 1
+            # A kill only counts where EVERY path that reaches the join
+            # performs it; an arm that fell out (return / UNDEFINED) never
+            # reaches the join and does not vote, exactly as _join treats
+            # its environment.
+            self.var_reads = self._join_reads(
+                [r1 if fin1 else None, r2 if fin2 else None], base)
             self._join(env, e1 if fin1 else None, e2 if fin2 else None)
             return
         self.exec_block(els, env)
@@ -406,7 +495,38 @@ class Interp:
             a, b = e1.get(k, UNK), e2.get(k, UNK)
             env[k] = a if (a is b or a == b) else UNK
 
+    def _join_reads(self, arms, base):
+        """Merge per-variable read sets at a control-flow join.
+
+        Union, because a read is dead only when it is killed on every path.
+        A variable one arm never mentions still holds whatever it held
+        before the branch, so a missing key reads as `base`, not as empty.
+        """
+        live = [a for a in arms if a is not None]
+        if not live:
+            return dict(base)
+        out = {}
+        for k in set().union(*[set(a) for a in live]) | set(base):
+            acc = set()
+            for a in live:
+                acc |= a.get(k, base.get(k, frozenset()))
+            out[k] = frozenset(acc)
+        return out
+
     def exec_for(self, s, env):
+        # A loop body is never allowed to KILL a read.  A trip count this
+        # partial evaluator pinned is not a trip count the machine is
+        # obliged to run, and a body that may execute zero times cannot
+        # overwrite anything on every path.  Union with the pre-state, so
+        # a loop can only ever keep a read alive.
+        _base_reads = dict(self.var_reads)
+        try:
+            self._exec_for(s, env)
+        finally:
+            self.var_reads = self._join_reads([dict(self.var_reads)],
+                                              _base_reads)
+
+    def _exec_for(self, s, env):
         _, var, lo_e, hi_e, step, body = s
         lo, hi = self.eval(lo_e, env), self.eval(hi_e, env)
         lo, hi = as_int(lo), as_int(hi)
@@ -437,10 +557,13 @@ class Interp:
         env[var] = UNK
 
     def exec_loop_unknown(self, body, env):
+        base = dict(self.var_reads)
         self.certain += 1
         e1 = dict(env)
         self._try(body, e1)
         self.certain -= 1
+        # zero trips is a path, so the body's kills do not carry
+        self.var_reads = self._join_reads([dict(self.var_reads)], base)
         self._join(env, dict(env), e1)
 
     def exec_case(self, s, env):
@@ -458,12 +581,17 @@ class Interp:
             self.exec_block(s[3], env)
             return
         envs = []
+        base = dict(self.var_reads)
+        rmaps = []
         self.certain += 1
         for body in unknown_arms + ([s[3]] if s[3] else []):
             e = dict(env)
+            self.var_reads = dict(base)
             if self._try(body, e):
                 envs.append(e)
+                rmaps.append(dict(self.var_reads))
         self.certain -= 1
+        self.var_reads = self._join_reads(rmaps, base)
         if not envs:
             raise Undefined()
         acc = envs[0]
@@ -574,6 +702,13 @@ class Interp:
             if n in env:
                 if not self.suppress_use:
                     self.used.add(n)
+                    rs = self.var_reads.get(n)
+                    if rs:
+                        # the value reached a use, and flows onward into
+                        # whatever this expression is bound to
+                        self.consumed |= rs
+                        if self.ef.sink is not None:
+                            self.ef.sink |= rs
                 return env[n]
             if n == '_PC':
                 self.ef.add('r', 'PC', None)
@@ -919,6 +1054,15 @@ class Interp:
                 self.depth += 1
                 self.frames.append([])
                 definite = []
+                # var_reads is keyed by BARE NAME, so an inlined function
+                # whose local shares a name with the caller's -- `result`
+                # is the ASL's favourite -- would rebind the caller's
+                # variable and kill a read that is still live.  The frame
+                # gets its own map, exactly as it gets its own env; the
+                # arguments were already evaluated in the caller, which is
+                # where their reads were consumed.
+                saved_reads = self.var_reads
+                self.var_reads = {}
                 try:
                     self.exec_block(stmts, sub)
                 except ReturnSig as r:
@@ -926,6 +1070,7 @@ class Interp:
                 except Undefined:
                     pass
                 finally:
+                    self.var_reads = saved_reads
                     self.depth -= 1
                     seen = self.frames.pop() + definite
                 if not seen:

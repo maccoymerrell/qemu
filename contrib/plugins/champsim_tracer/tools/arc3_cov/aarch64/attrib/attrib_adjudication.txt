@@ -4,19 +4,18 @@ AARCH64 REGISTER ATTRIBUTION -- ADJUDICATED SUMMARY
 denominator          3920 opcode subjects (opcodes.tsv)
 probed               3920
 unprobed             0
-agree                3731
-disagree             189
+agree                3776
+disagree             144
 
 BY REFERENCE RANK
-  1:MRA        agree     3697
-  1:MRA        disagree  113
+  1:MRA        agree     3742
+  1:MRA        disagree  68
   2:LLVM-MC    agree     34
   2:LLVM-MC    disagree  76
 
-ADJUDICATION OF THE 189 DISAGREEING ROWS
+ADJUDICATION OF THE 144 DISAGREEING ROWS
      78  UNADJUDICATED
-     47  TRACER DEFECT -- OPEN
-     42  TRACER RIGHT -- REFERENCE DEFECT (LIVENESS)
+     44  TRACER DEFECT -- OPEN
      10  MIXED -- 8 TRACER DEFECT, 2 SUBSUMED
       5  MIXED -- 10 RANK-2 GAP, 5 REFERENCE DEFECT
       5  REFERENCE GAP -- NOT A TRACER DEFECT
@@ -27,25 +26,6 @@ SIGNATURES, LARGEST FIRST
 
     51  DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
         verdict: UNADJUDICATED
-
-    42  SRC+ref:FLAGS
-        verdict: TRACER RIGHT -- REFERENCE DEFECT (LIVENESS)
-        the MOPS PROLOGUE (cpyfp/cpyp/setp/setgp and variants). cpyfp.xml
-        reads `bits(4) nzcv = PSTATE.<N,Z,C,V>` at the top and then, in the
-        prologue branch, overwrites it on BOTH arms -- `nzcv = '0000'` when
-        CPYFOptionA() and `nzcv = '0010'` when not -- before any use. The
-        `if nzcv<1> == '1' // PSTATE.C` wrong-option test is in the ELSE
-        branch, which is the Main and Epilogue stages. The measurement
-        confirms the split exactly: all 40 Main and all 40 Epilogue rows
-        AGREE, with the tracer naming FLAGS; only the 40 prologue rows
-        disagree. The extractor's liveness rule missed a local rebound on
-        both arms of an if/else. 42 rows.
-
-    13  SRC+ref:FCSR
-        verdict: TRACER DEFECT -- OPEN
-        two fmov element forms (`fmov v2.d[1], x1`, `fmov x2, v1.d[1]`),
-        where the scalar-merge rule is scoped off by the arrangement
-        specifier the element syntax carries. 2 rows.
 
     12  DST+ref:SYS
         verdict: TRACER DEFECT -- OPEN
@@ -67,6 +47,12 @@ SIGNATURES, LARGEST FIRST
         extractor never reports them, so this measurement is silent about
         that read on both sides -- a blind spot, recorded rather than
         scored. 10 rows.
+
+    10  SRC+ref:FCSR
+        verdict: TRACER DEFECT -- OPEN
+        two fmov element forms (`fmov v2.d[1], x1`, `fmov x2, v1.d[1]`),
+        where the scalar-merge rule is scoped off by the arrangement
+        specifier the element syntax carries. 2 rows.
 
     10  DST+trc:FCSR SRC+trc:SYSFPEN
         verdict: UNADJUDICATED
@@ -100,7 +86,7 @@ SIGNATURES, LARGEST FIRST
         the GCS push/pop forms: the sysalias result register (see
         DST+ref:SYS) plus the hidden xzr operand (see SRC+ref:ZERO). 4 rows.
 
-     2  SRC+ref:SYSFPEN
+     2  DST+trc:VCTRL SRC+trc:VCTRL
         verdict: UNADJUDICATED
 
      2  SRC+trc:GPR# SRC+trc:GPR#
@@ -194,7 +180,7 @@ TIER B -- architectural state outside the tracer's register space
  above, counted here so nothing is hidden)
   PSTATE.EL        3422 rows
   IP               2946 rows
-  PSTATE.SM        2779 rows
+  PSTATE.SM        2769 rows
   PSTATE.ZA        364 rows
   PSTATE.UAO       134 rows
   PSTATE.A         2 rows
@@ -202,12 +188,12 @@ TIER B -- architectural state outside the tracer's register space
 BY INSTRUCTION CLASS
   (none)           4 rows  agree     4 (100.0%)  disagree     0
   advsimd        696 rows  agree   692 ( 99.4%)  disagree     4
-  float          218 rows  agree   205 ( 94.0%)  disagree    13
+  float          218 rows  agree   208 ( 95.4%)  disagree    10
   fpsimd          89 rows  agree    89 (100.0%)  disagree     0
-  general        921 rows  agree   868 ( 94.2%)  disagree    53
+  general        921 rows  agree   908 ( 98.6%)  disagree    13
   mortlach        54 rows  agree    54 (100.0%)  disagree     0
   mortlach2      501 rows  agree   492 ( 98.2%)  disagree     9
   post-2022-12   106 rows  agree    34 ( 32.1%)  disagree    72
-  sve            788 rows  agree   785 ( 99.6%)  disagree     3
+  sve            788 rows  agree   787 ( 99.9%)  disagree     1
   sve2           459 rows  agree   453 ( 98.7%)  disagree     6
   system          84 rows  agree    55 ( 65.5%)  disagree    29

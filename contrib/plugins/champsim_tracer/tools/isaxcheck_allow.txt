@@ -7826,7 +7826,10 @@ aarch64 R-rd-phantom cnth +sysfpen
 aarch64 R-rd-phantom cntp +sysfpen
 aarch64 R-rd-phantom cntw +sysfpen
 aarch64 R-rd-phantom compact +sysfpen
-aarch64 R-rd-phantom ctermeq +sysfpen
+# ctermeq / ctermne also carry the NZCV read Capstone omits and RMIF at
+# the same revision reports -- see the CTERMEQ note in disas/capstone.c.
+# LLVM MC models neither the flag read nor the enable gate.
+aarch64 R-rd-phantom ctermeq +nzcv,sysfpen
 aarch64 R-rd-phantom decb +sysfpen
 aarch64 R-rd-phantom decd +sysfpen
 aarch64 R-rd-phantom dech +sysfpen

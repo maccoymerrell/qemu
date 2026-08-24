@@ -1144,18 +1144,10 @@ x86_64 M-miss-store rorb
 x86_64 M-miss-store rorl
 x86_64 M-miss-store rorq
 x86_64 M-miss-store rorw
-x86_64 M-miss-store shldl
-x86_64 M-miss-store shldq
-x86_64 M-miss-store shldw
-x86_64 M-miss-store shrdl
-x86_64 M-miss-store shrdq
-x86_64 M-miss-store shrdw
 x86_64 R-rd-missing adoxl +r#
 x86_64 R-rd-missing adoxq +r#
 x86_64 R-rd-missing bswapw +r#
 x86_64 R-rd-missing clc +flags
-x86_64 R-rd-missing cli +flags
-x86_64 R-rd-missing cmc +flags
 x86_64 R-rd-missing cvtpi2pd +r#,v#
 x86_64 R-rd-missing cvtpi2pd +v#
 x86_64 R-rd-missing cvtsd2ss +v#
@@ -1187,23 +1179,11 @@ x86_64 R-rd-missing nopl +r#
 x86_64 R-rd-missing nopq +r#
 x86_64 R-rd-missing nopw +r#
 x86_64 R-rd-missing pcmpestrm +r#
-x86_64 R-rd-missing rcll +flags
-x86_64 R-rd-missing rcll +cs,flags
-x86_64 R-rd-missing rcll +ds,flags
-x86_64 R-rd-missing rcll +es,flags
-x86_64 R-rd-missing rcll +flags,ss
-x86_64 R-rd-missing rclq +flags
-x86_64 R-rd-missing rclw +flags
-x86_64 R-rd-missing rclw +cs,flags
-x86_64 R-rd-missing rclw +ds,flags
-x86_64 R-rd-missing rclw +es,flags
-x86_64 R-rd-missing rclw +flags,ss
 x86_64 R-rd-missing rcpss +v#
 x86_64 R-rd-missing rsqrtss +v#
 x86_64 R-rd-missing sqrtsd +v#
 x86_64 R-rd-missing sqrtss +v#
 x86_64 R-rd-missing stc +flags
-x86_64 R-rd-missing sti +flags
 x86_64 R-rd-phantom bnd lretl +r#,ss
 x86_64 R-rd-phantom bnd lretq +r#,ss
 x86_64 R-rd-phantom bnd retq +r#,ss
@@ -1223,10 +1203,6 @@ x86_64 R-rd-phantom lretw +r#,ss
 x86_64 R-rd-phantom movq +v#
 x86_64 R-rd-phantom popq +r#
 x86_64 R-rd-phantom popw +r#
-x86_64 R-rd-phantom pushq +fs
-x86_64 R-rd-phantom pushq +gs
-x86_64 R-rd-phantom pushw +fs
-x86_64 R-rd-phantom pushw +gs
 x86_64 R-rd-phantom repz retq +r#,ss
 x86_64 R-rd-phantom repz retw +r#,ss
 x86_64 R-rd-phantom retq +r#,ss
@@ -1236,7 +1212,6 @@ x86_64 R-rd-phantom sysexitq +r#
 x86_64 R-rd-phantom sysretl +r#
 x86_64 R-rd-phantom sysretq +r#
 x86_64 R-wr-missing bswapw +r#
-x86_64 R-wr-missing cli +flags
 x86_64 R-wr-missing cvtpd2pi +r#
 x86_64 R-wr-missing cvttpd2pi +r#
 x86_64 R-wr-missing emms +mm#,st#
@@ -1255,14 +1230,25 @@ x86_64 R-wr-missing fxrstor +fpcw,fpsw
 x86_64 R-wr-missing movq +r#
 x86_64 R-wr-missing pcmpestrm +flags,v#
 x86_64 R-wr-missing pcmpistrm +flags,v#
-x86_64 R-wr-missing shldl +r#
-x86_64 R-wr-missing shldq +r#
-x86_64 R-wr-missing shldw +r#
-x86_64 R-wr-missing shrdl +r#
-x86_64 R-wr-missing shrdq +r#
-x86_64 R-wr-missing shrdw +r#
-x86_64 R-wr-missing sti +flags
 x86_64 R-wr-missing wait +fpsw
+# The flag WRITE these five perform is real and LLVM MC omits it.  The
+# boundary now derives it from Capstone's own detail->x86.eflags bitmask,
+# which carries MODIFY_ZF for LAR/LSL/VERR/VERW and the full word for RSM
+# (disas/capstone.c, cap_x86_eflags_from_bitmask).  QEMU agrees on every
+# one: gen_LAR() movconds the writeback on cpu_cc_src & CC_Z, helper_verr()
+# computes `cpu_cc_compute_all(env) | CC_Z`, and RSM's helper restores the
+# whole word through cpu_load_eflags().  Intel XED names the write too; the
+# LLVM MC leg is the outlier, so this is a REFERENCE gap, not a repair to
+# undo.  Deletable when LLVM MC gains the implicit def.
+x86_64 R-wr-phantom larl +flags
+x86_64 R-wr-phantom larq +flags
+x86_64 R-wr-phantom larw +flags
+x86_64 R-wr-phantom lsll +flags
+x86_64 R-wr-phantom lslq +flags
+x86_64 R-wr-phantom lslw +flags
+x86_64 R-wr-phantom rsm +flags
+x86_64 R-wr-phantom verr +flags
+x86_64 R-wr-phantom verw +flags
 x86_64 R-wr-phantom bnd callq +r#
 x86_64 R-wr-phantom bnd lretl +cs,r#
 x86_64 R-wr-phantom bnd lretq +cs,r#
@@ -1647,7 +1633,6 @@ x86_64 M-miss-store sarl
 x86_64 M-miss-store sarw
 x86_64 M-miss-store shlw
 x86_64 M-miss-store shrw
-x86_64 R-rd-missing rcrl +flags
 x86_64 R-wr-phantom bnd lcalll +r#
 x86_64 R-wr-phantom lcallq +r#
 x86_64 R-wr-phantom lcallw +r#
@@ -1820,10 +1805,6 @@ x86_64 M-miss-store xrstors64
 # what they are and Capstone does not; and the CET / monitor / RDRAND ops,
 # whose implicit register operands the two describe differently.
 x86_64 R-rd-missing clrssbsy +r#
-x86_64 R-rd-missing rclb +flags
-x86_64 R-rd-missing rcrb +flags
-x86_64 R-rd-missing rcrq +flags
-x86_64 R-rd-missing rcrw +flags
 x86_64 R-rd-missing rdrandl +r#
 x86_64 R-rd-missing rdsspd +r#
 x86_64 R-rd-missing rdsspq +r#
@@ -2898,10 +2879,6 @@ x86_64 R-rd-missing orw +cs
 x86_64 R-rd-missing orw +ds
 x86_64 R-rd-missing orw +es
 x86_64 R-rd-missing orw +ss
-x86_64 R-rd-missing rclb +cs,flags
-x86_64 R-rd-missing rclb +ds,flags
-x86_64 R-rd-missing rclb +es,flags
-x86_64 R-rd-missing rclb +flags,ss
 x86_64 R-rd-missing sbbb +cs
 x86_64 R-rd-missing sbbb +ds
 x86_64 R-rd-missing sbbb +es
@@ -4699,16 +4676,8 @@ x86_64 R-rd-missing pushq +cs
 x86_64 R-rd-missing pushq +ds
 x86_64 R-rd-missing pxor +cs
 x86_64 R-rd-missing pxor +ds
-x86_64 R-rd-missing rclq +cs,flags
-x86_64 R-rd-missing rclq +ds,flags
 x86_64 R-rd-missing rcpps +cs
 x86_64 R-rd-missing rcpps +ds
-x86_64 R-rd-missing rcrb +cs,flags
-x86_64 R-rd-missing rcrb +ds,flags
-x86_64 R-rd-missing rcrl +cs,flags
-x86_64 R-rd-missing rcrl +ds,flags
-x86_64 R-rd-missing rcrq +cs,flags
-x86_64 R-rd-missing rcrq +ds,flags
 x86_64 R-rd-missing rolb +cs
 x86_64 R-rd-missing rolb +ds
 x86_64 R-rd-missing roll +cs
@@ -8573,3 +8542,98 @@ x86_64 R-wr-phantom wrgsbasel +gs
 x86_64 R-wr-phantom wrgsbaseq +gs
 x86_64 R-rd-missing monitorx +r#
 x86_64 R-rd-missing mwaitx +r#
+
+
+# ---------------------------------------------------------------------------
+# The EFLAGS repairs at the decode boundary (disas/capstone.c,
+# cap_x86_eflags_from_bitmask / cap_x86_eflags_read_lost) restored flag
+# dependencies Capstone published nowhere.  Where the restored access is one
+# LLVM MC does not model, the difference surfaces here.  Each of the three
+# classes below is a REFERENCE gap, not a repair to undo, and each names the
+# QEMU code that performs the access.
+#
+# (1) The shift and rotate CL forms, SHLD/SHRD, IN/OUT and POPF read the
+#     flags word, and LLVM MC's MCInstrDesc carries no implicit use of
+#     EFLAGS for them.  Intel XED names every one.  QEMU:
+#       * gen_shift_dynamic_flags() movconds cc_dst, cc_src AND cc_op on
+#         (count == 0), selecting the OLD flag state at run time -- and
+#         gen_shift_count() sets can_be_zero only for the CL form, which is
+#         why only the CL forms are here;
+#       * gen_POPF() calls write_eflags(T0, mask), a MASKED write, so every
+#         bit outside the mask keeps its previous value;
+#       * IN/OUT are gated on RFLAGS.IOPL, which QEMU hoists into
+#         DisasContext (translate.c: dc->iopl = (flags >> IOPL_SHIFT) & 3)
+#         -- a translator optimisation, not an absent dependency.
+#     Deletable when LLVM MC gains the implicit use.
+x86_64 R-rd-phantom inb +flags
+x86_64 R-rd-phantom inl +flags
+x86_64 R-rd-phantom inw +flags
+x86_64 R-rd-phantom outb +flags
+x86_64 R-rd-phantom outl +flags
+x86_64 R-rd-phantom outw +flags
+x86_64 R-rd-phantom popfq +flags
+x86_64 R-rd-phantom popfw +flags
+x86_64 R-rd-phantom rolb +flags
+x86_64 R-rd-phantom roll +flags
+x86_64 R-rd-phantom rolq +flags
+x86_64 R-rd-phantom rolw +flags
+x86_64 R-rd-phantom rorb +flags
+x86_64 R-rd-phantom rorl +flags
+x86_64 R-rd-phantom rorq +flags
+x86_64 R-rd-phantom rorw +flags
+x86_64 R-rd-phantom sarb +flags
+x86_64 R-rd-phantom sarl +flags
+x86_64 R-rd-phantom sarq +flags
+x86_64 R-rd-phantom sarw +flags
+x86_64 R-rd-phantom shlb +flags
+x86_64 R-rd-phantom shldl +flags
+x86_64 R-rd-phantom shldq +flags
+x86_64 R-rd-phantom shldw +flags
+x86_64 R-rd-phantom shll +flags
+x86_64 R-rd-phantom shlq +flags
+x86_64 R-rd-phantom shlw +flags
+x86_64 R-rd-phantom shrb +flags
+x86_64 R-rd-phantom shrdl +flags
+x86_64 R-rd-phantom shrdq +flags
+x86_64 R-rd-phantom shrdw +flags
+x86_64 R-rd-phantom shrl +flags
+x86_64 R-rd-phantom shrq +flags
+x86_64 R-rd-phantom shrw +flags
+
+# (2) rcl / rcr with a segment override.  This is the SAME pre-existing class
+#     as the file's other `+cs` / `+ds` / `+es` / `+ss` rows -- LLVM's X86
+#     memory operand always carries a segment-register slot and Capstone does
+#     not -- re-spelled only because the flags read these instructions really
+#     do perform has now left the signature.  The rows it replaces
+#     (`rclb +cs,flags` and friends) were deleted in the same commit.
+x86_64 R-rd-missing rclb +cs
+x86_64 R-rd-missing rclb +ds
+x86_64 R-rd-missing rclb +es
+x86_64 R-rd-missing rclb +ss
+x86_64 R-rd-missing rcll +cs
+x86_64 R-rd-missing rcll +ds
+x86_64 R-rd-missing rcll +es
+x86_64 R-rd-missing rcll +ss
+x86_64 R-rd-missing rclq +cs
+x86_64 R-rd-missing rclq +ds
+x86_64 R-rd-missing rclw +cs
+x86_64 R-rd-missing rclw +ds
+x86_64 R-rd-missing rclw +es
+x86_64 R-rd-missing rclw +ss
+x86_64 R-rd-missing rcrb +cs
+x86_64 R-rd-missing rcrb +ds
+x86_64 R-rd-missing rcrl +cs
+x86_64 R-rd-missing rcrl +ds
+x86_64 R-rd-missing rcrq +cs
+x86_64 R-rd-missing rcrq +ds
+
+# (3) pushq / pushw of %fs or %gs.  LLVM MC names NEITHER the segment source
+#     nor the stack pointer for these two forms; Capstone names the segment,
+#     and the boundary now adds back the rsp READ that Capstone drops on the
+#     segment pushes alone (`pushq %rax`, `pushq (%rax)`, `pushq $0` and
+#     `popq %fs` all report it).  A push computes its store address from the
+#     current rsp, so the read is architecturally required.
+x86_64 R-rd-phantom pushq +fs,r#
+x86_64 R-rd-phantom pushq +gs,r#
+x86_64 R-rd-phantom pushw +fs,r#
+x86_64 R-rd-phantom pushw +gs,r#

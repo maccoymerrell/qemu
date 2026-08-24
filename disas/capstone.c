@@ -528,6 +528,8 @@ static void cap_x86_drop_implicit(qemu_plugin_insn_info *out,
 static bool cap_x86_is_sign_extend_to_d(const char *mnem);
 static void cap_x86_add_implicit(qemu_plugin_insn_info *out, csh handle,
                                  unsigned int reg, bool is_write);
+static void cap_x86_eflags_from_bitmask(csh handle, const cs_insn *insn,
+                                       qemu_plugin_insn_info *out);
 static void cap_x86_add_sysregs(const cs_insn *insn,
                                 qemu_plugin_insn_info *out);
 
@@ -626,6 +628,18 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
      * other register or memory operand is read.  Without this the
      * VPERMIL2P* memory source also loses its load lane entirely. */
     bool dest_last = cap_x86_is_mask_arith_dest_last(insn->mnemonic);
+    /* Capstone-6.0.0-Alpha7 bug: SHLD / SHRD report EVERY operand READ, so
+     * the register or memory location they shift in place has no write at
+     * all and the double-precision shift produces nothing.  The last
+     * operand in AT&T order is the destination, and it is read-modify-write
+     * by construction -- the instruction shifts it and fills the vacated
+     * bits from the second operand, so both halves are real.  Intel XED
+     * marks the memory form RW4 and names the register form a destination;
+     * QEMU's gen_SHLD() writes it through gen_shiftd_rm_T1(). */
+    bool shiftd_rmw = g_str_has_prefix(cap_x86_mnem_stem(insn->mnemonic),
+                                       "shld")
+                   || g_str_has_prefix(cap_x86_mnem_stem(insn->mnemonic),
+                                       "shrd");
     /* Capstone-6.0.0-Alpha7 bug: KTEST* reports access == 0 on both
      * operands AND an empty implicit regs_write[].  KTEST reads both mask
      * registers and writes only EFLAGS, so force READ below and restore
@@ -678,6 +692,24 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
     if (ktest_op || test_read || xadd_op) {
         cap_x86_add_implicit(out, handle, X86_REG_EFLAGS, true);
     }
+    /* Capstone-6.0.0-Alpha7 bug: the two SEGMENT pushes lose the stack
+     * pointer READ.  `pushq %rax`, `pushq (%rax)` and `pushq $0` all come
+     * back reading AND writing rsp, and `popq %fs` reads it too; only
+     * `pushq %fs` and `pushq %gs` report the write alone.  A push computes
+     * its store address from the current rsp, so the read is not optional
+     * -- without it the trace carries no dependency from whatever last set
+     * the stack pointer. */
+    if (push_read && insn->id == X86_INS_PUSH) {
+        for (uint8_t k = 0; k < out->n_regs_write; k++) {
+            if (out->regs_write_id[k] == X86_REG_RSP ||
+                out->regs_write_id[k] == X86_REG_ESP ||
+                out->regs_write_id[k] == X86_REG_SP) {
+                cap_x86_add_implicit(out, handle, out->regs_write_id[k],
+                                     false);
+                break;
+            }
+        }
+    }
     /*
      * Capstone-6.0.0-Alpha7 bug: the x87 escapes name a SEGMENT REGISTER
      * in their implicit read list.  `fcoms (%rax)` comes back reading SS
@@ -719,6 +751,9 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
         if (dest_last && cop->type != X86_OP_IMM) {
             op->access = (i == n - 1) ? QEMU_PLUGIN_OP_ACC_WRITE
                                       : QEMU_PLUGIN_OP_ACC_READ;
+        }
+        if (shiftd_rmw && i == n - 1 && cop->type != X86_OP_IMM) {
+            op->access = QEMU_PLUGIN_OP_ACC_READ | QEMU_PLUGIN_OP_ACC_WRITE;
         }
         if (evex.is_evex) {
             /* The writemask selects the lanes that are written, so a
@@ -940,6 +975,7 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
                     x86->prefix[0] == X86_PREFIX_REPNE) &&
                    string_op;
 
+    cap_x86_eflags_from_bitmask(handle, insn, out);
     cap_x86_add_sysregs(insn, out);
 }
 
@@ -2144,6 +2180,261 @@ static void cap_x86_add_implicit(qemu_plugin_insn_info *out, csh handle,
                       handle, reg, CS_ARCH_X86);
     ids[*cnt] = reg;
     (*cnt)++;
+}
+
+/*
+ * Capstone 6.0.0-Alpha7 x86: the EFLAGS dependency is COMPUTED and never
+ * PUBLISHED as a register.
+ *
+ * cs_x86 carries a per-flag bitmask -- detail->x86.eflags -- built from
+ * the same tables that fill the operand list.  It is the only place the
+ * boundary can learn that `cli` writes IF, that `lar` writes ZF or that
+ * `shld` preserves OF.  None of it reaches detail->regs_read /
+ * regs_write: for every one of those three the implicit register lists
+ * come back EMPTY, so a consumer that reads only the register lists sees
+ * an instruction with no flag dependency at all, and the Jcc that
+ * consumes those flags has no producer anywhere in the trace.  `xadd`
+ * and `test` are the same shape on the hot path -- eflags carries their
+ * whole flag write and regs_write is empty or partial.
+ *
+ * The mapping is fixed by the architecture, not chosen here:
+ *
+ *   TEST_x       the instruction reads flag x               -> READ
+ *   PRIOR_x      flag x keeps the value it already had      -> READ + WRITE
+ *   MODIFY_x     read-modify-write of flag x                -> WRITE
+ *   SET_x        flag x forced to 1                         -> WRITE
+ *   RESET_x      flag x forced to 0                         -> WRITE
+ *   UNDEFINED_x  flag x left architecturally undefined      -> WRITE
+ *
+ * PRIOR_x is a READ because the dependency model has ONE flags register:
+ * an instruction that rewrites part of the word and preserves the rest
+ * takes the preserved part as an input.  UNDEFINED_x is a WRITE because
+ * the flag's value afterwards does not depend on its value before, so a
+ * later reader depends on THIS instruction and on nothing earlier.
+ *
+ * detail->x86.eflags is a UNION with fpu_flags, so the field is only
+ * EFLAGS off the x87 escape space; cap_x86_is_x87_escape() decides that
+ * from the instruction bytes rather than from a mnemonic list.
+ *
+ * This never removes anything: an EFLAGS access Capstone already names
+ * in regs_read / regs_write is left exactly where it is, and
+ * cap_x86_add_implicit() is idempotent.
+ */
+#define CAP_X86_EFLAGS_PRIOR                                            \
+    (X86_EFLAGS_PRIOR_OF | X86_EFLAGS_PRIOR_SF | X86_EFLAGS_PRIOR_ZF |  \
+     X86_EFLAGS_PRIOR_AF | X86_EFLAGS_PRIOR_PF | X86_EFLAGS_PRIOR_CF |  \
+     X86_EFLAGS_PRIOR_TF | X86_EFLAGS_PRIOR_IF | X86_EFLAGS_PRIOR_DF |  \
+     X86_EFLAGS_PRIOR_NT)
+
+#define CAP_X86_EFLAGS_TEST                                             \
+    (X86_EFLAGS_TEST_OF | X86_EFLAGS_TEST_SF | X86_EFLAGS_TEST_ZF |     \
+     X86_EFLAGS_TEST_PF | X86_EFLAGS_TEST_CF | X86_EFLAGS_TEST_NT |     \
+     X86_EFLAGS_TEST_DF | X86_EFLAGS_TEST_RF | X86_EFLAGS_TEST_IF |     \
+     X86_EFLAGS_TEST_TF | X86_EFLAGS_TEST_AF)
+
+#define CAP_X86_EFLAGS_MODIFY                                           \
+    (X86_EFLAGS_MODIFY_AF | X86_EFLAGS_MODIFY_CF | X86_EFLAGS_MODIFY_SF | \
+     X86_EFLAGS_MODIFY_ZF | X86_EFLAGS_MODIFY_PF | X86_EFLAGS_MODIFY_OF | \
+     X86_EFLAGS_MODIFY_TF | X86_EFLAGS_MODIFY_IF | X86_EFLAGS_MODIFY_DF | \
+     X86_EFLAGS_MODIFY_NT | X86_EFLAGS_MODIFY_RF)
+
+#define CAP_X86_EFLAGS_RESET                                            \
+    (X86_EFLAGS_RESET_OF | X86_EFLAGS_RESET_CF | X86_EFLAGS_RESET_DF |  \
+     X86_EFLAGS_RESET_IF | X86_EFLAGS_RESET_SF | X86_EFLAGS_RESET_AF |  \
+     X86_EFLAGS_RESET_TF | X86_EFLAGS_RESET_NT | X86_EFLAGS_RESET_PF |  \
+     X86_EFLAGS_RESET_RF | X86_EFLAGS_RESET_ZF | X86_EFLAGS_RESET_0F |  \
+     X86_EFLAGS_RESET_AC)
+
+#define CAP_X86_EFLAGS_SET                                              \
+    (X86_EFLAGS_SET_CF | X86_EFLAGS_SET_DF | X86_EFLAGS_SET_IF |        \
+     X86_EFLAGS_SET_OF | X86_EFLAGS_SET_SF | X86_EFLAGS_SET_ZF |        \
+     X86_EFLAGS_SET_AF | X86_EFLAGS_SET_PF)
+
+#define CAP_X86_EFLAGS_UNDEF                                            \
+    (X86_EFLAGS_UNDEFINED_OF | X86_EFLAGS_UNDEFINED_SF |                \
+     X86_EFLAGS_UNDEFINED_ZF | X86_EFLAGS_UNDEFINED_PF |                \
+     X86_EFLAGS_UNDEFINED_AF | X86_EFLAGS_UNDEFINED_CF)
+
+#define CAP_X86_EFLAGS_READS  (CAP_X86_EFLAGS_TEST | CAP_X86_EFLAGS_PRIOR)
+#define CAP_X86_EFLAGS_WRITES                                           \
+    (CAP_X86_EFLAGS_MODIFY | CAP_X86_EFLAGS_RESET | CAP_X86_EFLAGS_SET | \
+     CAP_X86_EFLAGS_UNDEF | CAP_X86_EFLAGS_PRIOR)
+
+/*
+ * The four families where Capstone's own eflags bitmask is WRONG, found by
+ * sweeping the whole x86_64 opcode denominator (8,873 encodings) and keeping
+ * every encoding whose bitmask-derived EFLAGS access is contradicted by BOTH
+ * Intel XED and LLVM MC.  That sweep returns 19 encodings outside the x87
+ * escape space, and they are exactly these four families -- so the list is
+ * exhaustive by measurement rather than by inspection:
+ *
+ *   cmp<cc>{ps,pd,ss,sd}   eflags = MODIFY AF/CF/SF/ZF/PF/OF (0x3f), the
+ *                          INTEGER `cmp`'s flag table.  The SSE compares
+ *                          write an all-ones / all-zeros MASK into their
+ *                          vector destination and touch no flag at all.
+ *   movss / movsd          eflags = TEST_DF, the STRING `movs`'s flag table.
+ *                          The scalar SSE moves read no flag.
+ *   prefetchw              eflags = 0x7ff (MODIFY AF..RF).  A prefetch hint
+ *                          affects no flag; PREFETCH (/0) correctly reports 0
+ *                          and PREFETCHWT1 (/2) does too, so only /1 is wrong.
+ *   sysexit                eflags = 0x7ff.  SYSEXIT loads CS/SS/RSP/RIP and
+ *                          does not modify RFLAGS; SYSENTER, which does clear
+ *                          IF, correctly reports MODIFY_IF alone.
+ *
+ * The VEX spellings of the first two -- vcmpltps, vmovss, vmovsd -- report a
+ * ZERO bitmask and are correct, so the repair is scoped to the legacy forms
+ * and does not need to reach them.
+ */
+static bool cap_x86_eflags_bitmask_is_wrong(const char *mnem)
+{
+    const char *m = cap_x86_mnem_stem(mnem);
+    size_t len = strlen(m);
+
+    if (g_str_has_prefix(m, "sysexit") || g_str_equal(m, "prefetchw")) {
+        return true;
+    }
+    if (g_str_equal(m, "movss") || g_str_equal(m, "movsd")) {
+        return true;
+    }
+    /* cmp<cc>ps / cmp<cc>pd / cmp<cc>ss / cmp<cc>sd, every condition code,
+     * including the `cmpps $0xa` spelling Capstone falls back to for the
+     * immediates that have no mnemonic of their own. */
+    if (g_str_has_prefix(m, "cmp") && len >= 5) {
+        const char *sfx = m + len - 2;
+        if (g_str_equal(sfx, "ps") || g_str_equal(sfx, "pd") ||
+            g_str_equal(sfx, "ss") || g_str_equal(sfx, "sd")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Capstone 6.0.0-Alpha7 x86: five families whose EFLAGS READ is missing from
+ * the eflags bitmask as well as from regs_read, so no amount of reading
+ * Capstone recovers it.  Every one is a dependency QEMU's own translator
+ * emits, cited here rather than argued:
+ *
+ *   cmc              gen_CMC() is `gen_compute_eflags(s); xori(cc_src, CC_C)`
+ *                    -- it computes the flags and flips CF, so the old word
+ *                    is an input (target/i386/tcg/emit.c.inc).
+ *   rcl / rcr        rotate THROUGH carry.  gen_RCL()/gen_RCR() call
+ *                    gen_eflags_adcox() and fold the incoming carry into the
+ *                    high part; CF is an input at every count and in every
+ *                    operand form.
+ *   popf / popfq     gen_POPF() emits write_eflags(T0, mask) -- a MASKED
+ *                    write.  Every bit outside the mask keeps the value it
+ *                    already had, which is a read of the old word.
+ *   in / out         the I/O permission check is against RFLAGS.IOPL.  QEMU
+ *                    hoists IOPL into DisasContext at translation time
+ *                    (translate.c: dc->iopl = (flags >> IOPL_SHIFT) & 3),
+ *                    which makes the read invisible in the emitted ops -- but
+ *                    that is a translator optimisation, not the architecture,
+ *                    and IOPL is RFLAGS bits 12-13.
+ *   shift/rotate     a shift or rotate BY CL whose count comes out zero
+ *   by CL            leaves every flag untouched.  gen_shift_dynamic_flags()
+ *                    emits movcond(count == 0 ? cpu_cc_dst : new) for cc_dst,
+ *                    cc_src AND cc_op, so the old flag state is selected at
+ *                    run time and is a genuine input.  QEMU draws the line in
+ *                    exactly the same place the architecture does:
+ *                    gen_shift_count() sets can_be_zero ONLY for the CL form
+ *                    (X86_OP_INT); a non-zero immediate cannot preserve, and
+ *                    a zero immediate skips the operation entirely.  That is
+ *                    why this repair is scoped to the CL forms and the
+ *                    immediate forms are left alone.
+ */
+static bool cap_x86_eflags_read_lost(const cs_insn *insn)
+{
+    static const char *const shifts[] = {
+        "rol", "ror", "rcl", "rcr", "shl", "sal", "shr", "sar",
+        "shld", "shrd",
+    };
+    const cs_x86 *x86 = &insn->detail->x86;
+    const char *m = cap_x86_mnem_stem(insn->mnemonic);
+    size_t mlen = strlen(m);
+
+    if (g_str_equal(m, "cmc")) {
+        return true;
+    }
+    if (g_str_has_prefix(m, "rcl") || g_str_has_prefix(m, "rcr")) {
+        return true;                              /* rotate through carry */
+    }
+    if (g_str_has_prefix(m, "popf")) {
+        return true;                              /* masked write */
+    }
+    /* CLI / STI clear or set IF and leave every other flag alone, which
+     * QEMU emits literally: gen_CLI() is gen_reset_eflags(s, IF_MASK), and
+     * gen_reset_eflags() LOADS env->eflags, masks one bit and stores it
+     * back (target/i386/tcg/translate.c).  The load is the read.  Their
+     * decode entries also carry chk(iopl), so RFLAGS.IOPL gates them --
+     * the same IOPL dependency the port I/O instructions have. */
+    if (g_str_equal(m, "cli") || g_str_equal(m, "sti")) {
+        return true;
+    }
+    /* The port I/O instructions, and NOT the string forms (insb / outsb),
+     * which already read DF and whose flag dependency Capstone reports. */
+    if ((g_str_has_prefix(m, "in") || g_str_has_prefix(m, "out")) &&
+        mlen <= 4 && !g_str_has_prefix(m, "ins") && !g_str_has_prefix(m, "outs")
+        && !g_str_has_prefix(m, "inc") && !g_str_has_prefix(m, "int")
+        && !g_str_has_prefix(m, "inv")) {
+        return true;
+    }
+    /* A shift or rotate whose COUNT is CL: the count can be zero, and a
+     * zero count preserves every flag. */
+    for (size_t i = 0; i < ARRAY_SIZE(shifts); i++) {
+        if (!g_str_has_prefix(m, shifts[i])) {
+            continue;
+        }
+        for (uint8_t k = 0; k < x86->op_count; k++) {
+            if (x86->operands[k].type == X86_OP_REG &&
+                x86->operands[k].reg == X86_REG_CL) {
+                return true;
+            }
+        }
+        /* On the MEMORY forms Capstone drops the count operand from the
+         * operand list entirely -- `rolb %cl, (%rax)` comes back with ONE
+         * operand, the memory one -- and CL survives only in the implicit
+         * read list.  Look there too, or the memory forms of every shift
+         * keep the defect the register forms just lost. */
+        for (uint8_t k = 0; k < insn->detail->regs_read_count; k++) {
+            unsigned int r = insn->detail->regs_read[k];
+            if (r == X86_REG_CL || r == X86_REG_CX ||
+                r == X86_REG_ECX || r == X86_REG_RCX) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return false;
+}
+
+static void cap_x86_eflags_from_bitmask(csh handle, const cs_insn *insn,
+                                        qemu_plugin_insn_info *out)
+{
+    uint64_t ef;
+
+    /* The field is fpu_flags on the x87 side of the union.  The byte test
+     * catches the D8..DF escape; Capstone's own FPU group catches FWAIT,
+     * whose 0x9B opcode is outside it and whose 0xF000 would otherwise be
+     * read as MODIFY_IF|MODIFY_DF|MODIFY_NT|MODIFY_RF. */
+    if (cap_x86_is_x87_escape(insn)) {
+        return;
+    }
+    for (uint8_t g = 0; g < insn->detail->groups_count; g++) {
+        if (insn->detail->groups[g] == X86_GRP_FPU) {
+            return;
+        }
+    }
+    if (cap_x86_eflags_bitmask_is_wrong(insn->mnemonic)) {
+        return;
+    }
+    ef = insn->detail->x86.eflags;
+    if (ef & CAP_X86_EFLAGS_WRITES) {
+        cap_x86_add_implicit(out, handle, X86_REG_EFLAGS, true);
+    }
+    if ((ef & CAP_X86_EFLAGS_READS) || cap_x86_eflags_read_lost(insn)) {
+        cap_x86_add_implicit(out, handle, X86_REG_EFLAGS, false);
+    }
 }
 
 /*

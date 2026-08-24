@@ -89,6 +89,20 @@ def match_bracket(s, i):
         i += 1
     return -1
 
+def _unwrap(s):
+    """Strip enclosing brackets that span the whole string.
+
+    A Sail clause body arrives as `{ stmt; stmt; .. }`, and pruning wraps a
+    kept branch as ` ( .. ) `, so splitting on top-level `;` without this
+    returns the entire body as ONE statement and any rule that depends on
+    statement order silently does nothing.
+    """
+    t = s.strip()
+    while t and t[0] in '({[' and match_bracket(t, 0) == len(t):
+        t = t[1:-1].strip()
+    return t
+
+
 def skip_ws(s, i):
     while i < len(s) and s[i] in ' \t\n\r': i += 1
     return i
@@ -326,6 +340,7 @@ def prune(body, env):
     for _ in range(6):
         nb = _prune_match(body, env)
         nb = _prune_if(nb, env)
+        nb = _simplify_if_conds(nb, env)
         if nb == body: return body
         body = nb
     return body
@@ -352,6 +367,16 @@ def _eval_cond(cond, env):
     cond = cond.strip()
     while cond.startswith('(') and match_bracket(cond, 0) == len(cond):
         cond = cond[1:-1].strip()
+    if cond == 'true':  return True
+    if cond == 'false': return False
+    # A BARE BOOLEAN, which is how a guard reaches a callee.  Sail spells
+    # `execute_vsetvl_type(.., requires_fixed_vlmax, ..)` and tests the
+    # parameter by name; without this the identifier falls through to the
+    # comparison regex, matches nothing, and the whole guard is undecidable
+    # even though the encoding fixes it.  Only bools are looked up here --
+    # an integer identifier standing alone is not a condition.
+    if re.match(r'^[a-z_]\w*$', cond) and isinstance(env.get(cond), bool):
+        return env[cond]
     parts = split_top(cond, '&')
     if len(parts) > 1:
         vs = [_eval_cond(p, env) for p in parts]
@@ -377,6 +402,74 @@ def _eval_cond(cond, env):
     if isinstance(a, str) or isinstance(b, str): return None
     return {'<=': a <= b, '>=': a >= b, '<': a < b, '>': a > b,
             '<_s': a < b, '<_u': a < b, '>_s': a > b, '>_u': a > b}[op]
+
+def _simplify_cond(cond, env):
+    """Rewrite a condition that cannot be decided AS A WHOLE so the operands
+    that CAN be decided stop appearing in it.
+
+    _eval_cond is all-or-nothing: `A | B | (g & C)` with A and B unknown is
+    undecidable, so the whole text survives into the scan and every register
+    named anywhere inside it is reported as a source -- including the ones
+    under a guard the encoding sets to false.  That is how `vsetvli` came to
+    read the OLD vtype: `execute_vsetvl_type` tests
+    `requires_fixed_vlmax & (lmul_sew_ratio != .. | not(valid_vtype()))`, and
+    for every encoding except the rd=x0,rs1=x0 one the conjunction is false
+    whatever vtype holds -- so no write to vtype can change what this
+    instruction does, which is the R7 test for a source.
+
+    A false disjunct becomes `false` and a true conjunct becomes `true`;
+    neither changes the value of the condition, and both remove the reads
+    that were only reachable through them.
+    """
+    c = cond.strip()
+    while c.startswith('(') and match_bracket(c, 0) == len(c):
+        c = c[1:-1].strip()
+    for sep, absorbing, identity in (('|', True, ' false '),
+                                     ('&', False, ' true ')):
+        parts = split_top(c, sep)
+        if len(parts) < 2:
+            continue
+        new, changed = [], False
+        for part in parts:
+            v = _eval_cond(part, env)
+            if v is absorbing:
+                # one true disjunct (or one false conjunct) settles it
+                return ' true ' if absorbing else ' false '
+            if v is not None:
+                new.append(identity); changed = True
+                continue
+            sub = _simplify_cond(part, env)
+            if sub.strip() != part.strip():
+                changed = True
+            new.append(sub)
+        if changed:
+            return ' ( ' + sep.join(new) + ' ) '
+        return cond
+    return cond
+
+
+def _simplify_if_conds(s, env):
+    """Apply _simplify_cond to every `if <cond> then` still standing."""
+    out = []; i = 0; n = len(s)
+    while i < n:
+        m = re.compile(r'\bif\b').search(s, i)
+        if not m:
+            out.append(s[i:]); break
+        out.append(s[i:m.end()])
+        j = skip_ws(s, m.end())
+        depth = 0; k = j
+        while k < n:
+            ch = s[k]
+            if ch in '([{': depth += 1
+            elif ch in ')]}': depth -= 1
+            elif depth == 0 and re.match(r'\bthen\b', s[k:]): break
+            k += 1
+        if k >= n:
+            out.append(s[m.end():]); break
+        out.append(' ' + _simplify_cond(s[j:k], env) + ' ')
+        i = k
+    return ''.join(out)
+
 
 def _pat_matches(pat, val):
     pat = pat.strip()
@@ -470,6 +563,26 @@ def _prune_if(s, env):
         has_else = bool(re.match(r'\belse\b', s[p:]))
         if has_else:
             es, ee = _branch_extent(s, p + 4)
+            # `else if C then D else E`.  _branch_extent stops at the FIRST
+            # `else` at its own depth, which for a chained conditional is the
+            # NESTED one, so `ee` landed before ` else E`.  Keeping the then
+            # branch then left that tail standing beside it: `let avl = if
+            # rs1 != zreg then X(rs1) else if rd != zreg then ones() else vl`
+            # pruned to `let avl = ( X(rs1) ) else vl`, and `vsetvli` was
+            # reported as reading the vector length through a branch its own
+            # encoding excludes.  Consume the rest of the chain.
+            #
+            # Only `ee` moves.  Widening _branch_extent itself was written and
+            # MEASURED FIRST: it made 398 of the 1070 rows UNACCOUNTED,
+            # because a branch beginning with `if` at the top of a clause then
+            # swallowed the statements after it and their reads disappeared
+            # (AMO lost its rs2).  This is the narrow version -- the else
+            # chain of one already-decided `if`, nothing else.
+            while True:
+                q = skip_ws(s, ee)
+                if not re.match(r'\belse\b', s[q:]):
+                    break
+                _, ee = _branch_extent(s, q + 4)
         else:
             es = ee = te
         keep = s[ts:te] if v else (s[es:ee] if has_else else ' () ')
@@ -526,14 +639,146 @@ class Analyzer:
             rest = body[m.end():]
             expr = split_top(rest, ';')[0]
             v = self.val(expr, env)
+            if v is None:
+                # `let requires_fixed_vlmax = rd == zreg & rs1 == zreg` is a
+                # value this encoding fixes just as surely as an integer one,
+                # and it is the guard the callee tests by name.  self.val
+                # cannot evaluate a comparison, so ask the condition
+                # evaluator before giving up on the binding.
+                v = _eval_cond(expr, env)
             if v is None: env.pop(nm, None)
             else: env[nm] = v
         return env
 
+    @staticmethod
+    def lets_used_after(text):
+        """Names whose binding IS consulted later in this (unpruned) body."""
+        live = set()
+        for m in re.finditer(r'\b(?:let|var)\s+\'?([a-zA-Z_]\w*)\s*'
+                             r'(?::[^=;]*)?=', text):
+            nm = m.group(1)
+            rest = text[m.end():]
+            parts = split_top(rest, ';')
+            if len(parts) < 2:
+                continue
+            if re.search(r'\b%s\b' % re.escape(nm), rest[len(parts[0]):]):
+                live.add(nm)
+        return live
+
+    def drop_dead_lets(self, s, env, depth, live_pre):
+        """Remove `let NAME = <expr>;` whose NAME is used nowhere afterwards.
+
+        Pruning removes the CODE that used a binding but leaves the binding
+        standing, and the scan then reports every register the dead
+        right-hand side names.  `execute_vsetvl_type` opens with
+
+            let lmul_sew_ratio = get_lmul_pow() - get_sew_pow();
+
+        which is computed unconditionally and consulted only under
+        `requires_fixed_vlmax` -- false for every vsetvli except the
+        rd=x0,rs1=x0 form.  Once _simplify_cond has taken that conjunct out
+        of the guard, nothing reads lmul_sew_ratio and the two vtype
+        accessors behind it are reads of a value that cannot reach any
+        output of the instruction.
+
+        GUARDED ON THE RIGHT-HAND SIDE HAVING NO WRITE.  A binding whose
+        expression also writes state is kept whatever happens to its name:
+        dropping it would delete a destination, which is the one direction
+        this project may not move in.  The guard costs one extra scan of the
+        expression and is re-entrancy-protected, since that scan would
+        otherwise try to eliminate dead lets inside itself.
+        """
+        if getattr(self, '_in_dead_let', False):
+            return s
+        if not live_pre:
+            return s
+        for _ in range(8):
+            hit = None
+            for m in re.finditer(r'\b(?:let|var)\s+\'?([a-zA-Z_]\w*)\s*'
+                                 r'(?::[^=;]*)?=', s):
+                nm = m.group(1)
+                # ONLY A BINDING PRUNING KILLED.  `live_pre` is the set of
+                # names Sail's own text consults after their definition, so a
+                # candidate outside it was never used to begin with and its
+                # right-hand side is not dead code -- it is an ACCESS the
+                # model performs for its own sake.  MEASURED without this
+                # test: the vector reductions read vd through
+                # `let vd_val = read_vreg(.., vd)` and never consult the
+                # value (Sail's own comment: "other elements in vd are
+                # treated as tail elements, currently remain unchanged"), so
+                # dropping the binding dropped a read the architecture
+                # really has -- 17 rows, every reduction plus vaeskf1.vi,
+                # went from AGREE to an unadjudicated TRACER-SUPERSET.
+                if nm not in live_pre:
+                    continue
+                rest = s[m.end():]
+                parts = split_top(rest, ';')
+                # ONLY A STATEMENT, never a `let x = e in body`.  Sail has
+                # both spellings, and the binding form has no terminating
+                # `;`: taking "everything to the end" as the expression made
+                # the body look unused, and deleting the binding deleted the
+                # body with it.  MEASURED when it was not guarded -- 398 of
+                # 1070 rows went UNACCOUNTED, AMO among them, because
+                # `let (addr, pbmt) = ..` inside translateAddr's caller took
+                # the rest of the clause with it and `X(rs1)` went with that.
+                if len(parts) < 2:
+                    continue
+                expr = parts[0]
+                if re.search(r'(?<![\w.])in(?![\w])', expr):
+                    continue
+                tail = rest[len(expr):]
+                if re.search(r'\b%s\b' % re.escape(nm), tail):
+                    continue
+                self._in_dead_let = True
+                try:
+                    sub = self.scan([], expr, env, depth + 1)
+                finally:
+                    self._in_dead_let = False
+                if any(r[0] == 'W' for r in sub):
+                    continue
+                hit = (m.start(), m.end() + len(expr))
+                break
+            if hit is None:
+                break
+            s = s[:hit[0]] + ' ' + s[hit[1]:]
+        return s
+
     def scan(self, params, body, env, depth):
-        eff = set()
+        """The effects of a clause body, STATEMENT BY STATEMENT.
+
+        The order matters for one rule and only one: a register this clause
+        has already WRITTEN, read again in a LATER statement, is the
+        instruction consuming a value it produced itself, not a source.  R7 --
+        no prior writer, so no edge a renaming register file has to respect.
+        The vsetvl family is the case: `vl` is assigned and the very next
+        statement is `X(rd) = vl`, so the reference reported that every
+        `vsetvli` READS the vector length it had just computed, and the
+        tracer -- correctly naming only REG_VCTRL as a destination -- came out
+        a subset.  The static harness had already made this exact ruling by
+        hand for Zcmp's `cm.popret`, whose `ra` is loaded from the stack
+        before the return jump reads it back.
+
+        SCOPED TO A LATER STATEMENT, which is what keeps an accumulate
+        honest: `fflags = fflags | flags` reads and writes in ONE statement,
+        the value written DEPENDS on the value read, and both survive.  A
+        `{ .. ; .. }` block is one chunk here, so the rule does not reach
+        inside it -- conservative in the direction that keeps sources.
+        """
         env = self.apply_lets(body, env)
+        live_pre = self.lets_used_after(body)
         s = prune(body, env)
+        s = self.drop_dead_lets(s, env, depth, live_pre)
+        eff = set()
+        produced = set()
+        for chunk in split_top(_unwrap(s), ';'):
+            sub = self._scan_chunk(chunk, env, depth)
+            eff |= {e for e in sub
+                    if e[0] != 'R' or (e[1], e[2]) not in produced}
+            produced |= {(e[1], e[2]) for e in sub if e[0] == 'W'}
+        return eff
+
+    def _scan_chunk(self, s, env, depth):
+        eff = set()
         i = 0; n = len(s)
         while i < n:
             c = s[i]

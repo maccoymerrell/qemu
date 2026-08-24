@@ -6150,6 +6150,39 @@ static void cap_riscv_add_reg_read(csh handle, qemu_plugin_insn_info *out,
 }
 
 /*
+ * Append an implicit register write Capstone did not report.
+ *
+ * The mirror of cap_riscv_add_reg_read, and idempotent for the same
+ * reason: a decoder that starts reporting one of these must not be
+ * double-counted.  An operand already carrying the WRITE for the same
+ * register counts as reported.
+ */
+static void cap_riscv_add_reg_write(csh handle, qemu_plugin_insn_info *out,
+                                    uint16_t reg)
+{
+    for (uint8_t i = 0; i < out->n_regs_write; i++) {
+        if (out->regs_write_id[i] == reg) {
+            return;
+        }
+    }
+    for (uint8_t i = 0; i < out->n_operands; i++) {
+        if (out->operands[i].type == QEMU_PLUGIN_OP_REG
+            && out->operands[i].reg_id == reg
+            && (out->operands[i].access & QEMU_PLUGIN_OP_ACC_WRITE)) {
+            return;
+        }
+    }
+    if (out->n_regs_write >= QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS) {
+        return;
+    }
+    cap_copy_reg_name(out->regs_write[out->n_regs_write],
+                      QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                      handle, reg, CS_ARCH_RISCV);
+    out->regs_write_id[out->n_regs_write] = reg;
+    out->n_regs_write++;
+}
+
+/*
  * Replace the operand array with a single register operand.
  */
 static void cap_riscv_push_reg_operand(csh handle, qemu_plugin_insn_info *out,
@@ -6434,6 +6467,7 @@ static const char *cap_riscv_csr_name(unsigned csr)
     case 0x009: return "vxsat";
     case 0x00a: return "vxrm";
     case 0x00f: return "vcsr";
+    case 0x017: return "jvt";
     case 0xc20: return "vl";
     case 0xc21: return "vtype";
     case 0xc22: return "vlenb";
@@ -6602,6 +6636,44 @@ static void cap_riscv_add_envcfg_gate(qemu_plugin_insn_info *out)
     cap_riscv_add_csr(out, 0x30a /* menvcfg */, QEMU_PLUGIN_OP_ACC_READ);
     cap_riscv_add_csr(out, 0x10a /* senvcfg */, QEMU_PLUGIN_OP_ACC_READ);
     cap_riscv_add_csr(out, 0x60a /* henvcfg */, QEMU_PLUGIN_OP_ACC_READ);
+}
+
+/*
+ * The register list a Zcmp push/pop encodes, as x-register numbers.
+ *
+ * `cm.push` / `cm.pop` name their transfer set with a 4-bit `rlist`
+ * field standing for a RANGE, not a bitmap: 4 is {ra}, 5 is {ra, s0},
+ * and each further value extends the s-register run by one -- except
+ * 15, which jumps from s9 to s11 because s10 cannot be transferred
+ * without s11.  Values below 4 are reserved and decode to nothing;
+ * QEMU refuses them (`reg_bitmap == 0` -> illegal instruction), so an
+ * empty return here is the same answer the guest gets.
+ *
+ * Written out of QEMU's own decode_push_pop_list()
+ * (target/riscv/insn_trans/trans_rvzce.c.inc:113-166), which is the
+ * reference this footprint is measured against: X_S0 = 8, X_S1 = 9 and
+ * X_Sn = 16, so s2..s11 are x18..x27 and the run is not contiguous with
+ * s0/s1.  Returns the number of registers written into @regs, which is
+ * at most 13.
+ */
+static unsigned cap_riscv_zcmp_rlist(unsigned rlist, uint8_t *regs)
+{
+    /* ra, then s0, s1, s2 .. s11 in transfer order. */
+    static const uint8_t sregs[12] = {
+        8, 9, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+    };
+    unsigned n = 0;
+    unsigned nsreg;
+
+    if (rlist < 4 || rlist > 15) {
+        return 0;
+    }
+    regs[n++] = 1;                              /* ra is always present */
+    nsreg = (rlist == 15) ? 12 : (rlist - 4);   /* 15 adds s10 AND s11 */
+    for (unsigned i = 0; i < nsreg; i++) {
+        regs[n++] = sregs[i];
+    }
+    return n;
 }
 
 /*
@@ -7754,6 +7826,73 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
             }
         }
         /*
+         * The privilege gate and the flush scope of a TLB-maintenance or
+         * hypervisor load/store (R7.4).
+         *
+         * `sfence.vma` is an Illegal Instruction at U, and at S when
+         * mstatus.TVM is set; at VS the same decision is hstatus.VTVM.
+         * `hfence.gvma` reads mstatus.TVM the same way.  So a pending
+         * write to those CSRs decides whether the instruction executes at
+         * all, which is R7.4's test exactly, and Sail says it in the
+         * clause head (`match mstatus[TVM] { 0b1 => Illegal_Instruction()
+         * ...`, base_insts.sail:727).
+         *
+         * The scope of the flush is the second half and is not a
+         * legality gate: `sfence.vma` and `hfence.vvma` take the VMID
+         * from hgatp (`get_vmid(VS_Stage)`), so which TLB entries the
+         * instruction removes depends on it.  That is an ordinary R7
+         * dependency on a CSR the instruction's OWN semantics consult.
+         *
+         * `hlv` / `hlvx` / `hsv` read hstatus twice over: HU decides
+         * whether U-mode may execute them at all, and SPVP selects the
+         * effective privilege the access is performed at -- a change of
+         * semantics, not just of legality.
+         *
+         * WHY THESE AND NOT `prefetch.i`.  The riscv64 comparison
+         * excludes address translation, PMP/PMA and platform state on
+         * BOTH sides, and Zicbop's prefetch reads mstatus only through
+         * `effectivePrivilege(access, mstatus, cur_privilege)` inside the
+         * translation of its own operand -- every arm of which is a
+         * no-op, so the instruction cannot trap and its result does not
+         * depend on the CSR.  The line is: a CSR the instruction's own
+         * semantics consult (including its trap gate) is a source; a CSR
+         * consulted only by the translation of its memory operand is not.
+         *
+         * Every RISC-V CSR outside the FP, vector and identification
+         * roles folds onto REG_SYS, so the three named here arrive as one
+         * generic source.  They are named individually anyway because the
+         * fold is a property of the current generic space and not of the
+         * architecture (R8), and because a reader has to be able to check
+         * the claim against the model.
+         *
+         * Selected by mnemonic: Capstone decodes all of these natively
+         * and correctly, so there is no encoding to re-derive, and
+         * `sfence.w.inval` / `sfence.inval.ir` -- which share the prefix
+         * and read nothing -- are excluded by the exact match.
+         */
+        if (!strcmp(insn->mnemonic, "sfence.vma")
+            || !strcmp(insn->mnemonic, "sinval.vma")) {
+            cap_riscv_add_csr(out, 0x300 /* mstatus: TVM  */,
+                              QEMU_PLUGIN_OP_ACC_READ);
+            cap_riscv_add_csr(out, 0x600 /* hstatus: VTVM */,
+                              QEMU_PLUGIN_OP_ACC_READ);
+            cap_riscv_add_csr(out, 0x680 /* hgatp:   VMID */,
+                              QEMU_PLUGIN_OP_ACC_READ);
+        } else if (!strcmp(insn->mnemonic, "hfence.gvma")
+                   || !strcmp(insn->mnemonic, "hinval.gvma")) {
+            cap_riscv_add_csr(out, 0x300 /* mstatus: TVM */,
+                              QEMU_PLUGIN_OP_ACC_READ);
+        } else if (!strcmp(insn->mnemonic, "hfence.vvma")
+                   || !strcmp(insn->mnemonic, "hinval.vvma")) {
+            cap_riscv_add_csr(out, 0x680 /* hgatp: VMID */,
+                              QEMU_PLUGIN_OP_ACC_READ);
+        } else if (!strncmp(insn->mnemonic, "hlv.", 4)
+                   || !strncmp(insn->mnemonic, "hlvx.", 5)
+                   || !strncmp(insn->mnemonic, "hsv.", 4)) {
+            cap_riscv_add_csr(out, 0x600 /* hstatus: HU, SPVP */,
+                              QEMU_PLUGIN_OP_ACC_READ);
+        }
+        /*
          * Zicfiss `ssamoswap.w` / `ssamoswap.d` read the same enable bit
          * every other shadow-stack instruction reads.
          *
@@ -7851,6 +7990,168 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
             cap_riscv_add_csr(out, 0x300 /* mstatus: ELP */,
                               QEMU_PLUGIN_OP_ACC_READ
                               | QEMU_PLUGIN_OP_ACC_WRITE);
+        }
+        /*
+         * Zcmp / Zcmt -- a whole function prologue that moved nothing.
+         *
+         * `cm.push {ra, s0-s11}, -112` saves thirteen registers and
+         * adjusts the stack pointer; `cm.popret` restores them and
+         * returns.  These are the instructions a -Os RISC-V compiler
+         * emits at the head and tail of EVERY function once Zcmp is on,
+         * so a trace that drops them drops the entire call-frame
+         * dataflow of the program.  Measured before this change with
+         * `isaxcheck --isa=riscv64 --cs-mode-add=zcmp --hex=42b8`: the
+         * boundary reports RD{-} WR{-} and the dependency model records
+         * SRC{-} DST{-} with loads=0 stores=0.  Nothing at all.
+         *
+         * NEITHER DECODER CAN SUPPLY IT AND NEITHER IS AT FAULT.  The
+         * transfer set is a 4-bit `rlist` field naming a RANGE of
+         * registers, and LLVM's MCInstrDesc has no way to express "the
+         * registers this immediate names": its description carries no
+         * operand and no implicit def/use for the list, so LLVM MC
+         * reports RD{} WR{} for `cm.push` exactly as Capstone does.  A
+         * second decoder cannot adjudicate what both spell the same way,
+         * which is why this footprint is written from QEMU's own
+         * translation (`trans_rvzce.c.inc`) rather than cross-checked
+         * against LLVM.
+         *
+         *   cm.push     reads sp and every register in the list, writes
+         *               sp, and STORES each listed register
+         *               (trans_cm_push: dest_gpr(xSP), get_gpr(i) per
+         *               list member, tcg_gen_qemu_st_tl, gen_set_gpr(xSP))
+         *   cm.pop      reads sp, writes sp and every listed register,
+         *               and LOADS each of them (gen_pop, ret=false)
+         *   cm.popret   the same, plus the return jump
+         *   cm.popretz  the same, plus a0 = 0 (gen_pop ret_val=true)
+         *
+         * `ra` is NOT a source of the popret forms even though the jump
+         * reads it: rlist >= 4 always contains ra, so the instruction
+         * DEFINES ra from memory before `get_gpr(ctx, xRA)` reads it
+         * back, and a value produced and consumed inside one instruction
+         * is no edge a register file has to respect (R7).
+         *
+         * The stack traffic is named per transferred register rather
+         * than as one access because that is what QEMU emits -- one
+         * `qemu_st_tl` / `qemu_ld_tl` per list member -- and the static
+         * claim is what sizes the dependency lane mask.  sp is the base
+         * of every one of them, so it is an address dependency as well
+         * as a data one.
+         *
+         * Zcmt's `cm.jt` / `cm.jalt` index a jump-vector table whose
+         * base and mode live in the JVT CSR (0x017): QEMU's helper
+         * `cm_jalt` (zce_helper.c) reads `env->jvt` before it can compute
+         * a target at all, so a pending write to JVT must resolve before
+         * this branch resolves.  Capstone reports the index immediate
+         * and nothing else.  The table ENTRY is fetched with
+         * `cpu_ld*_code`, i.e. from code space, which is outside the
+         * memop scope on both sides of the comparison and is therefore
+         * not named as a load.  `cm.jalt`'s write of ra is already
+         * reported and is left alone.
+         *
+         * `cm.mvsa01 rs1', rs2'` moves a0 -> rs1' and a1 -> rs2', so a0
+         * and a1 are SOURCES.  Both decoders put them in the implicit
+         * DEF list instead: the boundary reports WR{r8,r9,r10,r11} and
+         * RD{}, which makes an argument-marshalling move produce four
+         * registers and consume none -- every caller's argument setup
+         * detached from the callee that reads it.  `cm.mva01s`, the
+         * opposite direction, is the control and is correct in both
+         * decoders (RD{r8,r9} WR{r10,r11}), so this is one wrong
+         * implicit list rather than a family-wide gap, and it is
+         * repaired by rebuilding the pair from the encoding: rs1' and
+         * rs2' are the 3-bit s-register fields at 9:7 and 4:2, mapped by
+         * QEMU's ex_sreg_register (n < 2 ? n + 8 : n + 16).
+         *
+         * Upstream is owed a report for that last one.
+         *
+         * The whole block is gated on the `cm.` mnemonic prefix, not on
+         * the encoding: Zcmp/Zcmt occupy the compressed FP-store space
+         * and are mutually exclusive with the Zcd that C+D implies, so
+         * the same halfwords decode as `c.fsdsp` unless the guest ELF's
+         * Tag_RISCV_arch turned CS_MODE_RISCV_ZCMP_ZCMT_ZCE on
+         * (cap_mode_riscv).  Only Capstone knows which ISA it was told
+         * to decode, and the mnemonic is where it says so.
+         */
+        if (insn->size == 2 && !strncmp(insn->mnemonic, "cm.", 3)) {
+            uint16_t half = (uint16_t)insn->bytes[0] |
+                            ((uint16_t)insn->bytes[1] << 8);
+            bool is_push  = !strcmp(insn->mnemonic, "cm.push");
+            bool is_pop   = !strcmp(insn->mnemonic, "cm.pop");
+            bool is_pret  = !strcmp(insn->mnemonic, "cm.popret");
+            bool is_pretz = !strcmp(insn->mnemonic, "cm.popretz");
+
+            if (is_push || is_pop || is_pret || is_pretz) {
+                uint8_t list[13];
+                unsigned nreg = cap_riscv_zcmp_rlist((half >> 4) & 0xf, list);
+                if (nreg) {
+                    /* Capstone's second operand is the stack adjustment
+                     * it prints; keep it rather than recompute it. */
+                    int64_t adj = 0;
+                    bool has_adj = false;
+                    for (uint8_t i = 0; i < out->n_operands; i++) {
+                        if (out->operands[i].type == QEMU_PLUGIN_OP_IMM) {
+                            adj = out->operands[i].imm;
+                            has_adj = true;
+                            break;
+                        }
+                    }
+                    out->n_operands  = 0;
+                    out->n_regs_read = 0;
+                    out->n_regs_write = 0;
+                    if (has_adj) {
+                        qemu_plugin_operand *op = &out->operands[0];
+                        memset(op, 0, sizeof(*op));
+                        op->type  = QEMU_PLUGIN_OP_IMM;
+                        op->imm   = adj;
+                        op->scale = 1;
+                        out->n_operands = 1;
+                    }
+                    cap_riscv_push_reg_operand(handle, out, RISCV_REG_X2,
+                                               QEMU_PLUGIN_OP_ACC_READ
+                                               | QEMU_PLUGIN_OP_ACC_WRITE);
+                    for (unsigned i = 0; i < nreg; i++) {
+                        cap_riscv_push_mem_operand(handle, out, RISCV_REG_X2,
+                                                   is_push
+                                                   ? QEMU_PLUGIN_OP_ACC_WRITE
+                                                   : QEMU_PLUGIN_OP_ACC_READ);
+                    }
+                    for (unsigned i = 0; i < nreg; i++) {
+                        uint16_t r = (uint16_t)(RISCV_REG_X0 + list[i]);
+                        if (is_push) {
+                            cap_riscv_add_reg_read(handle, out, r);
+                        } else {
+                            cap_riscv_add_reg_write(handle, out, r);
+                        }
+                    }
+                    if (is_pretz) {
+                        cap_riscv_add_reg_write(handle, out, RISCV_REG_X10);
+                    }
+                    n = out->n_operands;
+                }
+            } else if (!strcmp(insn->mnemonic, "cm.jt")
+                       || !strcmp(insn->mnemonic, "cm.jalt")) {
+                cap_riscv_add_csr(out, 0x017 /* jvt */,
+                                  QEMU_PLUGIN_OP_ACC_READ);
+                n = out->n_operands;
+            } else if (!strcmp(insn->mnemonic, "cm.mvsa01")) {
+                unsigned r1 = (half >> 7) & 0x7;
+                unsigned r2 = (half >> 2) & 0x7;
+                out->n_operands   = 0;
+                out->n_regs_read  = 0;
+                out->n_regs_write = 0;
+                cap_riscv_push_reg_operand(
+                    handle, out,
+                    (uint16_t)(RISCV_REG_X0 + (r1 < 2 ? r1 + 8 : r1 + 16)),
+                    QEMU_PLUGIN_OP_ACC_WRITE);
+                cap_riscv_push_reg_operand(
+                    handle, out,
+                    (uint16_t)(RISCV_REG_X0 + (r2 < 2 ? r2 + 8 : r2 + 16)),
+                    QEMU_PLUGIN_OP_ACC_WRITE);
+                cap_riscv_push_reg_operand(handle, out, RISCV_REG_X10,
+                                           QEMU_PLUGIN_OP_ACC_READ);
+                cap_riscv_push_reg_operand(handle, out, RISCV_REG_X11,
+                                           QEMU_PLUGIN_OP_ACC_READ);
+                n = out->n_operands;
+            }
         }
     } else if (cap_arch == CS_ARCH_MIPS) {
         n = MIN(detail->mips.op_count, QEMU_PLUGIN_INSN_DETAIL_MAX_OPS);

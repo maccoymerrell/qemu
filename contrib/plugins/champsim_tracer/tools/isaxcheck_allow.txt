@@ -7699,6 +7699,45 @@ riscv64 R-wr-phantom csrwi +sysid
 #     Sail puts every one of them in the encdec guard or at the head of the
 #     clause.  LLVM's instruction descriptions carry no implicit CSR
 #     access at all, so none of these can appear on its side.
+
+# --- R7.4, continued: the privilege gate and the flush scope of a TLB
+#     maintenance or hypervisor load/store.  Sail decides all three in the
+#     clause head:
+#       sfence.vma / sinval.vma   Illegal at U; at S when mstatus.TVM, at VS
+#                                 when hstatus.VTVM (base_insts.sail:725-737).
+#                                 The VMID that scopes the flush comes from
+#                                 hgatp (get_vmid).
+#       hfence.gvma / hinval.gvma mstatus.TVM (hext_insts.sail:183-189)
+#       hfence.vvma / hinval.vvma hgatp.VMID, the flush scope
+#       hlv / hlvx / hsv          hstatus.HU decides whether U may execute
+#                                 them, hstatus.SPVP selects the effective
+#                                 privilege the access runs at
+#     Zicbop's `prefetch.*` is deliberately NOT here: every arm of its
+#     translation is a no-op, so it cannot trap and its result depends on no
+#     CSR -- the mstatus its Sail clause names is read only by the
+#     translation of its own operand, which is out of scope on both sides.
+#     LLVM's instruction descriptions carry no implicit CSR access at all, so
+#     none of these can appear on its side.
+riscv64 R-rd-phantom hfence.gvma +sys
+riscv64 R-rd-phantom hfence.vvma +sys
+riscv64 R-rd-phantom hinval.gvma +sys
+riscv64 R-rd-phantom hinval.vvma +sys
+riscv64 R-rd-phantom hlv.b +sys
+riscv64 R-rd-phantom hlv.bu +sys
+riscv64 R-rd-phantom hlv.d +sys
+riscv64 R-rd-phantom hlv.h +sys
+riscv64 R-rd-phantom hlv.hu +sys
+riscv64 R-rd-phantom hlv.w +sys
+riscv64 R-rd-phantom hlv.wu +sys
+riscv64 R-rd-phantom hlvx.hu +sys
+riscv64 R-rd-phantom hlvx.wu +sys
+riscv64 R-rd-phantom hsv.b +sys
+riscv64 R-rd-phantom hsv.d +sys
+riscv64 R-rd-phantom hsv.h +sys
+riscv64 R-rd-phantom hsv.w +sys
+riscv64 R-rd-phantom sfence.vma +sys
+riscv64 R-rd-phantom sinval.vma +sys
+
 riscv64 R-rd-phantom cbo.clean +sys
 riscv64 R-rd-phantom cbo.flush +sys
 riscv64 R-rd-phantom cbo.inval +sys

@@ -256,16 +256,26 @@ x86_64 R-wr-missing cwtd +r#
 # =====================================================================
 
 # Memory-hint and cache-maintenance instructions (AArch64 PRF*, MIPS
-# PREF/PREFE/CACHE/CACHEE/SYNCI) emit no TCG memop.  The tracer classifies
-# them as GEN_OP_PREFETCH / GEN_OP_CACHE_FLUSH and synthesises the address
-# slot from the opcode class, so the boundary deliberately leaves their MEM
-# operand's access bits empty rather than minting a load lane that no
-# memory callback will ever fill — see cap_aarch64_infer_mem_access(), which
-# returns 0 for the prefetch classes on purpose, and the GEN_OP_PREFETCH
-# comment in champsim_tracer_generic_ids.h.  LLVM reports mayLoad.
+# CACHE/CACHEE/SYNCI) emit no TCG memop.  The tracer classifies them as
+# GEN_OP_PREFETCH / GEN_OP_CACHE_FLUSH and synthesises the address slot from
+# the opcode class, so the boundary leaves their MEM operand's access bits
+# empty — see cap_aarch64_infer_mem_access(), which returns 0 for the
+# prefetch classes on purpose, and the GEN_OP_PREFETCH comment in
+# champsim_tracer_generic_ids.h.  LLVM reports mayLoad.
+#
+# `mipsel Z-access0 pref* MEM` USED TO BE HERE AND ITS JUSTIFICATION WAS
+# FALSE.  The sentence it rested on -- "rather than minting a load lane that
+# no memory callback will ever fill" -- was measured and is not true of
+# `pref`: the tracer synthesises the effective address and the record
+# reaches the wire, so with no lane declared it arrived ORPHANED, rendering
+# `ld(0x410180)` in parentheses instead of `ld[%gp5](0x410180)`.  x86_64
+# `prefetcht1` and aarch64 `prfm` declare loads=1 and always did.  The rule
+# is gone because the access is no longer 0, and the dead-rule detector is
+# what said so.  `synci`'s row stays: binutils calls it a STORE and the
+# synthesised record is a LOAD, which is a direction question this has not
+# answered.
 aarch64 Z-access0 prf* MEM
 aarch64 M-miss-load prf*
-mipsel Z-access0 pref* MEM
 mipsel Z-access0 cache* MEM
 mipsel Z-access0 synci MEM
 mipsel M-cs-mem-llvm-none pref*

@@ -83,6 +83,17 @@ mipsel FB-ret-mismatch jr cs-ret
 mipsel FM-cs-mem-llvm-none luxc1
 mipsel FM-cs-mem-llvm-none suxc1
 
+# `pref` / `prefe` name a MEM operand whose access Capstone reports as
+# NEITHER read nor write, and the boundary now infers READ from the opcode
+# class (see the pref block in disas/capstone.c).  LLVM's descriptions carry
+# mayLoad=0 for both, so the fields side declares a load lane and LLVM
+# declares nothing -- the same LLVM description gap as luxc1/suxc1 above.
+# x86_64 `prefetcht1` and aarch64 `prfm` both declare loads=1 and always did;
+# mipsel was the only ISA of the three whose prefetch claimed no memory, and
+# its runtime memop arrived ORPHANED because of it.
+mipsel FM-cs-mem-llvm-none pref
+mipsel FM-cs-mem-llvm-none prefe
+
 # mayLoad / mayStore are LLVM SCHEDULING properties, not semantics, and
 # LLVM sets both across the MIPS DSP-ASE arithmetic space to pin
 # instruction order around DSPControl.  None of these instructions

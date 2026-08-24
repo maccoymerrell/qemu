@@ -8407,6 +8407,52 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
             }
         }
         /*
+         * A prefetch hint reads memory, and mipsel was the only ISA that
+         * did not say so.
+         *
+         * `pref hint, off(base)` names a MEM operand and Capstone reports
+         * access == 0 on it -- no read, no write -- so the operand walker
+         * counted neither, `has_addr_deps` stayed false, and the template
+         * claimed loads=0 stores=0.  The runtime access happens anyway:
+         * decode_synthetic_ea mints the effective address, and the decoded
+         * trace shows `ld(0x410180)` -- ORPHANED, in parentheses, an access
+         * with no declared slot -- exactly the shape the store-conditional
+         * had below.
+         *
+         * SAME CONSTRUCT, THREE ANSWERS, which is what makes this a defect
+         * rather than a policy.  Measured at 2ef652ee6b:
+         *
+         *   x86_64   prefetcht1 (%rcx)      mem r=1  loads=1 addrdeps=1
+         *   aarch64  prfm pldl1keep, [x0]   mem r=1  loads=1 addrdeps=1
+         *   mipsel   pref 0, 0($a0)         mem r=0 w=0 unkMEM=1
+         *                                   loads=0 addrdeps=0
+         *
+         * binutils agrees with the other two: the `pref` entry carries
+         * INSN_LOAD_MEMORY.  A prefetch with no address is useless to the
+         * cache model that consumes this trace, and the static claim is
+         * what sizes the dependency lane mask, so the slot is declared.
+         *
+         * `synci` is NOT here and its row stays open.  binutils flags it
+         * INSN_STORE_MEMORY -- it is a cache write-back -- while
+         * decode_synthetic_ea mints a LOAD for it, so declaring a slot here
+         * would trade a missing store for an extra load rather than settle
+         * the direction.  That needs its own decision.
+         *
+         * Guarded on access == 0, so an encoding Capstone reports properly
+         * keeps its own answer, and on the MEM operand only.
+         */
+        if (!strcmp(insn->mnemonic, "pref")
+            || !strcmp(insn->mnemonic, "prefe")) {
+            for (uint8_t i = 0; i < n; i++) {
+                qemu_plugin_operand *op = &out->operands[i];
+                if (op->type != QEMU_PLUGIN_OP_MEM || op->access != 0) {
+                    continue;
+                }
+                op->access = QEMU_PLUGIN_OP_ACC_READ;
+                break;
+            }
+        }
+        /*
          * QEMU's store-conditional READS the line it stores to, and the
          * memop callback delivers that read.
          *

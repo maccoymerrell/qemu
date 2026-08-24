@@ -3018,14 +3018,6 @@ x86_64 R-rd-missing fucompp +fpcw
 x86_64 R-rd-missing fxch +fpcw
 x86_64 R-rd-missing fxtract +fpcw
 x86_64 R-rd-phantom fadd +st#
-x86_64 R-rd-phantom fcmovb +st#
-x86_64 R-rd-phantom fcmovbe +st#
-x86_64 R-rd-phantom fcmove +st#
-x86_64 R-rd-phantom fcmovnb +st#
-x86_64 R-rd-phantom fcmovnbe +st#
-x86_64 R-rd-phantom fcmovne +st#
-x86_64 R-rd-phantom fcmovnu +st#
-x86_64 R-rd-phantom fcmovu +st#
 x86_64 R-rd-phantom fcom +st#
 x86_64 R-rd-phantom fcoml +st#
 x86_64 R-rd-phantom fcomp +st#
@@ -8637,3 +8629,48 @@ x86_64 R-rd-phantom pushq +fs,r#
 x86_64 R-rd-phantom pushq +gs,r#
 x86_64 R-rd-phantom pushw +fs,r#
 x86_64 R-rd-phantom pushw +gs,r#
+
+# FCMOVcc reads the flags it tests, and LLVM MC models no flag operand for
+# the family at all.  The condition is the whole point of the instruction:
+# without it a conditional move has no dependency on what set the condition,
+# and Intel XED names RFLAGS a source on every one of the eight.  The
+# harness's ADJ-5 settled the other half -- FCMOVcc does not WRITE the flags
+# -- so the read is all that was missing.  The `+st#` rows these replace
+# were deleted in the same commit; the st(i) half of the signature is
+# unchanged and only the flags joined it.
+x86_64 R-rd-phantom fcmovb +flags
+x86_64 R-rd-phantom fcmovb +flags,st#
+x86_64 R-rd-phantom fcmovbe +flags
+x86_64 R-rd-phantom fcmovbe +flags,st#
+x86_64 R-rd-phantom fcmove +flags
+x86_64 R-rd-phantom fcmove +flags,st#
+x86_64 R-rd-phantom fcmovnb +flags
+x86_64 R-rd-phantom fcmovnb +flags,st#
+x86_64 R-rd-phantom fcmovnbe +flags
+x86_64 R-rd-phantom fcmovnbe +flags,st#
+x86_64 R-rd-phantom fcmovne +flags
+x86_64 R-rd-phantom fcmovne +flags,st#
+x86_64 R-rd-phantom fcmovnu +flags
+x86_64 R-rd-phantom fcmovnu +flags,st#
+x86_64 R-rd-phantom fcmovu +flags
+x86_64 R-rd-phantom fcmovu +flags,st#
+
+# The leaf-dispatch instructions, whose whole dependency is a register
+# convention that Capstone publishes nowhere: ENCLS / ENCLU / ENCLV,
+# RDPKRU / WRPKRU, XABORT / XBEGIN and VMFUNC all arrive with no operands
+# and no implicit registers.  The boundary restores Intel XED's sets
+# (disas/capstone.c, cap_x86_implicit[]); LLVM MC models none of them
+# either, so the repair shows up here as a phantom against LLVM.  The
+# group-7 rows are prefix-gated, so these signatures are the UNPREFIXED
+# encodings only -- 66 0F 01 CF is SEAMCALL and F3 0F 01 EE is CLUI, and
+# Capstone misnames both.
+x86_64 R-rd-phantom encls +r#
+x86_64 R-rd-phantom enclu +r#
+x86_64 R-rd-phantom enclv +r#
+x86_64 R-rd-phantom vmfunc +r#
+x86_64 R-rd-phantom xabort +r#
+x86_64 R-rd-phantom xbegin +r#
+x86_64 R-wr-phantom encls +r#
+x86_64 R-wr-phantom enclu +r#
+x86_64 R-wr-phantom enclv +r#
+x86_64 R-wr-phantom xabort +r#

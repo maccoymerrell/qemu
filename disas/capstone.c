@@ -692,6 +692,23 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
     if (ktest_op || test_read || xadd_op) {
         cap_x86_add_implicit(out, handle, X86_REG_EFLAGS, true);
     }
+    /*
+     * A REP-prefixed string instruction whose count is already zero
+     * performs NO iteration, so every register it would have written keeps
+     * the value it had: the write is conditional and the register is
+     * therefore also a read (R4).  Intel XED and iced-x86 both name it --
+     * `rep lodsq` reads RAX where the unprefixed `lodsq` does not -- and
+     * LODS is where it shows, because its accumulator is the family's only
+     * register that is a pure destination; rSI, rDI and rCX are read-write
+     * in every form and already carry the read.
+     */
+    if (string_op && (x86->prefix[0] == X86_PREFIX_REP ||
+                      x86->prefix[0] == X86_PREFIX_REPNE)) {
+        uint8_t nw = out->n_regs_write;
+        for (uint8_t k = 0; k < nw; k++) {
+            cap_x86_add_implicit(out, handle, out->regs_write_id[k], false);
+        }
+    }
     /* Capstone-6.0.0-Alpha7 bug: the two SEGMENT pushes lose the stack
      * pointer READ.  `pushq %rax`, `pushq (%rax)` and `pushq $0` all come
      * back reading AND writing rsp, and `popq %fs` reads it too; only
@@ -2371,6 +2388,15 @@ static bool cap_x86_eflags_read_lost(const cs_insn *insn)
     if (g_str_equal(m, "cli") || g_str_equal(m, "sti")) {
         return true;
     }
+    /* FCMOVcc TESTS CF / ZF / PF and moves ST(i) into ST(0) when the
+     * condition holds.  Capstone's eflags bitmask is empty for the whole
+     * family and its implicit read list names no flag, so the condition the
+     * move depends on appears nowhere.  Intel XED names RFLAGS a source;
+     * the harness's own ADJ-5 already settled the other half (FCMOVcc does
+     * not WRITE the flags), so the read is the only thing missing. */
+    if (g_str_has_prefix(m, "fcmov")) {
+        return true;
+    }
     /* The port I/O instructions, and NOT the string forms (insb / outsb),
      * which already read DF and whose flag dependency Capstone reports. */
     if ((g_str_has_prefix(m, "in") || g_str_has_prefix(m, "out")) &&
@@ -2412,27 +2438,31 @@ static void cap_x86_eflags_from_bitmask(csh handle, const cs_insn *insn,
                                         qemu_plugin_insn_info *out)
 {
     uint64_t ef;
+    bool x87;
+
+    /* The enumerated lost READS are decided from the instruction, not from
+     * the bitmask, so they are settled FIRST -- FCMOVcc lives in the x87
+     * escape space and the union guard below would otherwise swallow it. */
+    if (cap_x86_eflags_read_lost(insn)) {
+        cap_x86_add_implicit(out, handle, X86_REG_EFLAGS, false);
+    }
 
     /* The field is fpu_flags on the x87 side of the union.  The byte test
      * catches the D8..DF escape; Capstone's own FPU group catches FWAIT,
      * whose 0x9B opcode is outside it and whose 0xF000 would otherwise be
      * read as MODIFY_IF|MODIFY_DF|MODIFY_NT|MODIFY_RF. */
-    if (cap_x86_is_x87_escape(insn)) {
-        return;
+    x87 = cap_x86_is_x87_escape(insn);
+    for (uint8_t g = 0; g < insn->detail->groups_count && !x87; g++) {
+        x87 = insn->detail->groups[g] == X86_GRP_FPU;
     }
-    for (uint8_t g = 0; g < insn->detail->groups_count; g++) {
-        if (insn->detail->groups[g] == X86_GRP_FPU) {
-            return;
-        }
-    }
-    if (cap_x86_eflags_bitmask_is_wrong(insn->mnemonic)) {
+    if (x87 || cap_x86_eflags_bitmask_is_wrong(insn->mnemonic)) {
         return;
     }
     ef = insn->detail->x86.eflags;
     if (ef & CAP_X86_EFLAGS_WRITES) {
         cap_x86_add_implicit(out, handle, X86_REG_EFLAGS, true);
     }
-    if ((ef & CAP_X86_EFLAGS_READS) || cap_x86_eflags_read_lost(insn)) {
+    if (ef & CAP_X86_EFLAGS_READS) {
         cap_x86_add_implicit(out, handle, X86_REG_EFLAGS, false);
     }
 }
@@ -8846,6 +8876,53 @@ static const CapX86Implicit cap_x86_implicit[] = {
                                  { 0 } },
     { X86_INS_MWAITX,     true,  { X86_REG_RAX, X86_REG_RBX, X86_REG_RCX },
                                  { X86_REG_RAX } },
+    /*
+     * The leaf-dispatch instructions.  Capstone hands every one of these
+     * over with NO operands and NO implicit registers at all -- the whole
+     * dependency is the register convention, and without it the trace shows
+     * an instruction that reads nothing and writes nothing.  Each set below
+     * is Intel XED's, and where a second reference exists it is named.
+     *
+     * EVERY ONE OF THESE IS `bare`, for the reason the MONITORX row above
+     * gives: Capstone's group-7 decoder does not look at the mandatory
+     * prefix, so it returns `encls` for 66 0F 01 CF (SEAMCALL) and for
+     * F3 0F 01 CF, `rdpkru` for F3 0F 01 EE (CLUI), `wrpkru` for
+     * F3 0F 01 EF (STUI), and `vmfunc` and `enclu` for their prefixed code
+     * points too -- all measured, and LLVM MC disagrees with Capstone on
+     * each.  Attaching this table's registers to those bytes would put a
+     * WRONG set where a missing one is, which is the worse defect; the
+     * prefix disqualifies the row and the misnaming stays visible.
+     *
+     * 0f 01 cf/d7/c0  ENCLS / ENCLU / ENCLV: the leaf number is in EAX and
+     *                 RBX/RCX/RDX are the leaf-specific in/out registers.
+     *                 iced-x86 agrees on the reads and adds RAX and RFLAGS
+     *                 to the writes; the narrower XED set is used.
+     */
+    { X86_INS_ENCLS,      true,  { X86_REG_RAX, X86_REG_RBX, X86_REG_RCX,
+                                   X86_REG_RDX },
+                                 { X86_REG_RBX, X86_REG_RCX, X86_REG_RDX } },
+    { X86_INS_ENCLU,      true,  { X86_REG_RAX, X86_REG_RBX, X86_REG_RCX,
+                                   X86_REG_RDX },
+                                 { X86_REG_RBX, X86_REG_RCX, X86_REG_RDX } },
+    { X86_INS_ENCLV,      true,  { X86_REG_RAX, X86_REG_RBX, X86_REG_RCX,
+                                   X86_REG_RDX },
+                                 { X86_REG_RBX, X86_REG_RCX, X86_REG_RDX } },
+    /* 0f 01 ee/ef   the protection-key register accessors.  XED, iced-x86
+     *               and LLVM MC give byte-identical sets for RDPKRU. */
+    { X86_INS_RDPKRU,     true,  { X86_REG_RCX },
+                                 { X86_REG_RAX, X86_REG_RDX } },
+    { X86_INS_WRPKRU,     true,  { X86_REG_RAX, X86_REG_RCX, X86_REG_RDX },
+                                 { 0 } },
+    /* c6 f8 ib / c7 f8   the TSX pair.  XABORT hands its imm8 status to the
+     *                    fallback in EAX, and XBEGIN's fallback path writes
+     *                    EAX too, so on both the register is a conditional
+     *                    write and therefore also a read (R4). */
+    { X86_INS_XABORT,     false, { X86_REG_RAX },      { X86_REG_RAX } },
+    { X86_INS_XBEGIN,     false, { X86_REG_RAX },      { X86_REG_RAX } },
+    /* 0f 01 d4   VMFUNC: EAX selects the function.  ECX is the parameter --
+     *            the EPTP-list index for function 0 -- and iced-x86 names
+     *            it where XED does not, so it is carried as a superset. */
+    { X86_INS_VMFUNC,     true,  { X86_REG_RAX, X86_REG_RCX }, { 0 } },
 };
 
 static void cap_x86_apply_implicit_table(qemu_plugin_insn_info *out,

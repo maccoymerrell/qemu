@@ -121,6 +121,7 @@ public:
             if (kv.second == "GEN_OP_PREFETCH" ||
                 kv.second == "GEN_OP_CACHE_FLUSH" ||
                 kv.second == "GEN_OP_TLB_FLUSH" ||
+                kv.second == "GEN_OP_FENCE" ||
                 kv.second == "GEN_OP_PUSH" ||
                 kv.second == "GEN_OP_POP" ||
                 kv.second == "GEN_OP_RET") {

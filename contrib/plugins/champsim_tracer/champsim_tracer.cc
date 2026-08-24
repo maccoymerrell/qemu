@@ -9513,7 +9513,8 @@ static void arm_synth_ea_cbs(struct qemu_plugin_tb *tb, BBTemplate *new_tmpl,
         uint8_t op = new_tmpl->insn_fields[i].opcode;
         if (op != GEN_OP_PREFETCH &&
             op != GEN_OP_CACHE_FLUSH &&
-            op != GEN_OP_TLB_FLUSH) {
+            op != GEN_OP_TLB_FLUSH &&
+            op != GEN_OP_FENCE) {
             continue;
         }
         if (!new_tmpl->insn_synthetic_ea) {

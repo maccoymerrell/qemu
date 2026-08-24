@@ -399,7 +399,8 @@ void MemAccessRecorder::drain_cp_into_dyn_params(
             f->opcode == GEN_OP_RET ||
             f->opcode == GEN_OP_PREFETCH ||
             f->opcode == GEN_OP_CACHE_FLUSH ||
-            f->opcode == GEN_OP_TLB_FLUSH) {
+            f->opcode == GEN_OP_TLB_FLUSH ||
+            f->opcode == GEN_OP_FENCE) {
             return;
         }
         for (uint8_t d = 0; d < f->n_dst_regs; d++) {

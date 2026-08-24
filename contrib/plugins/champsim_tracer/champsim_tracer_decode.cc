@@ -973,6 +973,21 @@ void decode_detail_to_generic(uint64_t pc,
  * For x86 RIP-relative (PC-relative base) the base reg is dropped and
  * the absolute next-insn-PC folded into the displacement — correct and
  * avoids a needless register read at exec time.
+ *
+ * GEN_OP_FENCE joins the set on a narrower rule: only when the MEM
+ * operand carries NEITHER read NOR write access.  Address-based cache
+ * maintenance is spelled as a fence on some targets — MIPS `synci`
+ * names an effective address and binutils flags it STORE_MEM, yet the
+ * classifier calls it a fence, so its address was recorded nowhere.
+ * The access-flag condition is what keeps the widening honest: x86's
+ * `invept` / `invpcid` / `invvpid` are also fences with a MEM operand,
+ * but that operand is a real descriptor READ that already has a static
+ * slot and a runtime memop, and minting a second, synthetic access for
+ * it would double-count.  Measured across all four opcode spaces, the
+ * pair of conditions selects exactly one row (mipsel `synci`) and
+ * leaves every other fence — 9 of 10 on aarch64, 8 of 8 on riscv64,
+ * 6 of 9 on x86_64, 3 of 4 on mipsel with no MEM operand at all —
+ * untouched.
  */
 bool decode_synthetic_ea(const qemu_plugin_insn_info *info,
                          uint8_t opcode,
@@ -981,16 +996,21 @@ bool decode_synthetic_ea(const qemu_plugin_insn_info *info,
                          SyntheticEAInfo *out)
 {
     memset(out, 0, sizeof(*out));
-    if (!info ||
-        (opcode != GEN_OP_PREFETCH &&
-         opcode != GEN_OP_CACHE_FLUSH &&
-         opcode != GEN_OP_TLB_FLUSH)) {
+    bool hint_class = opcode == GEN_OP_PREFETCH ||
+                      opcode == GEN_OP_CACHE_FLUSH ||
+                      opcode == GEN_OP_TLB_FLUSH;
+    if (!info || (!hint_class && opcode != GEN_OP_FENCE)) {
         return false;
     }
     for (uint8_t i = 0; i < info->n_operands; i++) {
         const qemu_plugin_operand *op = &info->operands[i];
         if (op->type != QEMU_PLUGIN_OP_MEM) {
             continue;
+        }
+        if (!hint_class &&
+            (op->access & (QEMU_PLUGIN_OP_ACC_READ |
+                           QEMU_PLUGIN_OP_ACC_WRITE))) {
+            continue;   /* a real access, already counted; see above */
         }
         const RegClassification *base_rc = lookup_reg_class(op->reg_id);
         const RegClassification *index_rc = lookup_reg_class(op->index_id);

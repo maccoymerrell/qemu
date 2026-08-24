@@ -6083,6 +6083,67 @@ aarch64 FR-rd-phantom compact +REG_SYSFPEN
 # isaxcheck_allow.txt.  ctermeq_rr.xml computes PSTATE.V from PSTATE.C
 # and leaves Z and C alone, so the flag file is a source.
 aarch64 FR-rd-phantom ctermeq +REG_FLAGS,REG_SYSFPEN
+
+# The AArch64 system-instruction group -- the fields-layer twin of the
+# carve-out in isaxcheck_allow.txt, which carries the full reasoning.
+# SYS produces system state and SYSL consumes it into Xt; neither is in
+# the printed operand list and LLVM MC models neither, so every row here
+# is state the tracer records and the reference does not.  The two
+# `sysl +REG_GPR#` rows are LLVM having the direction of Xt backwards --
+# it makes Xt a Use and Defs nothing, and Capstone carries the same
+# error, which is why the boundary corrects it from the Rt field.
+aarch64 FR-rd-missing sysl +REG_GPR#
+aarch64 FR-rd-phantom addg +REG_SYS
+aarch64 FR-rd-phantom eret +REG_SYSEXC
+aarch64 FR-rd-phantom eretaa +REG_SYSEXC
+aarch64 FR-rd-phantom eretab +REG_SYSEXC
+aarch64 FR-rd-phantom gcspopcx +REG_SSP
+aarch64 FR-rd-phantom gcspopm +REG_SSP
+aarch64 FR-rd-phantom gcspopx +REG_SSP
+aarch64 FR-rd-phantom gcspushm +REG_SSP
+aarch64 FR-rd-phantom gcspushx +REG_SSP
+aarch64 FR-rd-phantom gcsss1 +REG_SSP
+aarch64 FR-rd-phantom gcsss2 +REG_SSP
+aarch64 FR-rd-phantom irg +REG_SYS
+aarch64 FR-rd-phantom ldgm +REG_SYSID
+aarch64 FR-rd-phantom stgm +REG_SYSID
+aarch64 FR-rd-phantom stzgm +REG_SYSID
+aarch64 FR-rd-phantom subg +REG_SYS
+aarch64 FR-rd-phantom sys +REG_SSP
+aarch64 FR-rd-phantom sysl +REG_SSP
+aarch64 FR-rd-phantom sysl +REG_SYS
+aarch64 FR-rd-phantom sysl +REG_SYSCACHE
+aarch64 FR-rd-phantom sysl +REG_SYSDBG
+aarch64 FR-rd-phantom sysl +REG_SYSMMU
+aarch64 FR-wr-phantom at +REG_SYSMMU
+aarch64 FR-wr-phantom brb +REG_SYS
+aarch64 FR-wr-phantom brb +REG_SYSDBG
+aarch64 FR-wr-phantom cfp +REG_SYS
+aarch64 FR-wr-phantom cosp +REG_SYS
+aarch64 FR-wr-phantom cpp +REG_SYS
+aarch64 FR-wr-phantom dc +REG_SYSCACHE
+aarch64 FR-wr-phantom dvp +REG_SYS
+aarch64 FR-wr-phantom esb +REG_SYSEXC
+aarch64 FR-wr-phantom gcspopcx +REG_SSP
+aarch64 FR-wr-phantom gcspopm +REG_SSP
+aarch64 FR-wr-phantom gcspopx +REG_SSP
+aarch64 FR-wr-phantom gcspushm +REG_SSP
+aarch64 FR-wr-phantom gcspushx +REG_SSP
+aarch64 FR-wr-phantom gcsss1 +REG_SSP
+aarch64 FR-wr-phantom gcsss2 +REG_SSP
+aarch64 FR-wr-phantom ic +REG_SYSCACHE
+aarch64 FR-wr-phantom irg +REG_SYS
+aarch64 FR-wr-phantom sys +REG_SSP
+aarch64 FR-wr-phantom sys +REG_SYS
+aarch64 FR-wr-phantom sys +REG_SYSCACHE
+aarch64 FR-wr-phantom sys +REG_SYSDBG
+aarch64 FR-wr-phantom sys +REG_SYSMMU
+aarch64 FR-wr-phantom sysl +REG_GPR#
+aarch64 FR-wr-phantom sysl +REG_GPR#,REG_SSP
+aarch64 FR-wr-phantom sysl +REG_SSP
+aarch64 FR-wr-phantom tlbi +REG_SYS
+aarch64 FR-wr-phantom tlbi +REG_SYSMMU
+aarch64 FR-wr-phantom trcit +REG_SYSDBG
 aarch64 FR-rd-phantom decb +REG_SYSFPEN
 aarch64 FR-rd-phantom decd +REG_SYSFPEN
 aarch64 FR-rd-phantom dech +REG_SYSFPEN

@@ -7830,6 +7830,93 @@ aarch64 R-rd-phantom compact +sysfpen
 # the same revision reports -- see the CTERMEQ note in disas/capstone.c.
 # LLVM MC models neither the flag read nor the enable gate.
 aarch64 R-rd-phantom ctermeq +nzcv,sysfpen
+
+# The AArch64 system-instruction group: SYS, SYSL and every alias of them
+# (AT, DC, IC, TLBI, CFP, CPP, DVP, COSP, TRCIT, BRB, GCSPUSH*, GCSPOP*,
+# GCSSS*), plus the encodings that take a system register as an operand
+# without printing it (ADDG, SUBG, IRG, LDGM, STGM, STZGM, ERET*, ESB).
+#
+# The whole point of a SYS instruction is to produce system state, and
+# the whole point of a SYSL is to consume it into Xt; neither is in the
+# printed operand list, so before cap_aarch64_sysinstr_contract the
+# entire group recorded only Xt.  LLVM MC models none of the system
+# state either -- llvmWR{-} on every SYS, AT, DC, IC, TLBI, CFP, BRB,
+# TRCIT and GCS form above -- so every one of these rows is the tracer
+# recording state the reference does not.
+#
+# TWO of them are the other direction on the signature axis and are NOT
+# a defect, they are LLVM being wrong about which way SYSL's Xt goes:
+#
+#   aarch64 R-rd-missing sysl +r#     LLVM makes Xt a Use
+#   aarch64 R-wr-phantom sysl +r#     ... and Defs nothing
+#
+# `cstool -d aarch64 852329d5` shows Capstone carries the same error
+# ("operands[0].type: REG = x5, operands[0].access: READ", "Registers
+# read: x5"), which is why the boundary corrects it from the Rt field
+# rather than from the access bits.  The architecture is unambiguous:
+# sysl_rc_systeminstrs writes X[t], and the MRA-derived arc3 reference
+# scores `sysl x5, #1, c2, c3, #4` as rD=GPR5.  A trace where the
+# consumer of a SYSL reads an Xt no instruction wrote is the severance
+# this closes, so the tracer is right and both legs of the reference are
+# wrong together.
+#
+# Roles come from CRn:CRm (cap_aarch64_sysinstr_class), which is how the
+# SYS space is organised: CRn 8 and the AT forms are MMU, the IC/DC
+# forms are CACHE, TRCIT and BRB are DBG, the GCS forms are the
+# shadow-stack pointer, and the prediction-restriction contexts stay
+# residual.
+aarch64 R-rd-missing sysl +r#
+aarch64 R-rd-phantom addg +sys
+aarch64 R-rd-phantom eret +sysexc
+aarch64 R-rd-phantom eretaa +sysexc
+aarch64 R-rd-phantom eretab +sysexc
+aarch64 R-rd-phantom gcspopcx +ssp
+aarch64 R-rd-phantom gcspopm +ssp
+aarch64 R-rd-phantom gcspopx +ssp
+aarch64 R-rd-phantom gcspushm +ssp
+aarch64 R-rd-phantom gcspushx +ssp
+aarch64 R-rd-phantom gcsss1 +ssp
+aarch64 R-rd-phantom gcsss2 +ssp
+aarch64 R-rd-phantom irg +sys
+aarch64 R-rd-phantom ldgm +sysid
+aarch64 R-rd-phantom stgm +sysid
+aarch64 R-rd-phantom stzgm +sysid
+aarch64 R-rd-phantom subg +sys
+aarch64 R-rd-phantom sys +ssp
+aarch64 R-rd-phantom sysl +ssp
+aarch64 R-rd-phantom sysl +sys
+aarch64 R-rd-phantom sysl +syscache
+aarch64 R-rd-phantom sysl +sysdbg
+aarch64 R-rd-phantom sysl +sysmmu
+aarch64 R-wr-phantom at +sysmmu
+aarch64 R-wr-phantom brb +sys
+aarch64 R-wr-phantom brb +sysdbg
+aarch64 R-wr-phantom cfp +sys
+aarch64 R-wr-phantom cosp +sys
+aarch64 R-wr-phantom cpp +sys
+aarch64 R-wr-phantom dc +syscache
+aarch64 R-wr-phantom dvp +sys
+aarch64 R-wr-phantom esb +sysexc
+aarch64 R-wr-phantom gcspopcx +ssp
+aarch64 R-wr-phantom gcspopm +ssp
+aarch64 R-wr-phantom gcspopx +ssp
+aarch64 R-wr-phantom gcspushm +ssp
+aarch64 R-wr-phantom gcspushx +ssp
+aarch64 R-wr-phantom gcsss1 +ssp
+aarch64 R-wr-phantom gcsss2 +ssp
+aarch64 R-wr-phantom ic +syscache
+aarch64 R-wr-phantom irg +sys
+aarch64 R-wr-phantom sys +ssp
+aarch64 R-wr-phantom sys +sys
+aarch64 R-wr-phantom sys +syscache
+aarch64 R-wr-phantom sys +sysdbg
+aarch64 R-wr-phantom sys +sysmmu
+aarch64 R-wr-phantom sysl +r#
+aarch64 R-wr-phantom sysl +r#,ssp
+aarch64 R-wr-phantom sysl +ssp
+aarch64 R-wr-phantom tlbi +sys
+aarch64 R-wr-phantom tlbi +sysmmu
+aarch64 R-wr-phantom trcit +sysdbg
 aarch64 R-rd-phantom decb +sysfpen
 aarch64 R-rd-phantom decd +sysfpen
 aarch64 R-rd-phantom dech +sysfpen

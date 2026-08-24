@@ -52,6 +52,19 @@ FPEN_REGS = {'CPACR_EL1', 'CPTR_EL2', 'CPTR_EL3'}
 VCTRL_REGS = {'ZCR_EL1', 'ZCR_EL2', 'ZCR_EL3', 'ZCR_EL12',
               'SMCR_EL1', 'SMCR_EL2', 'SMCR_EL3', 'SMCR_EL12', 'SVCR'}
 
+# The guarded control stack pointer.  GCSPR_ELx is a shadow-stack
+# pointer, which is a role the tracer's generic space has named for as
+# long as it has had x86 CET SSP and RISC-V ssp in it (REG_SSP), and
+# cap_aarch64_sysreg_class puts GCSPR_ELx there for the same reason.
+# Folded into 'SYS' here, the comparison would score every GCS push and
+# pop against the whole privileged file and could not tell a
+# shadow-stack dependency from any other system-register dependency.
+# The fourth role carve-out, on the same footing as TLS, SYSFPEN and
+# VCTRL and for the same reason: the reference names a role the tracer
+# names, so a naming difference is never scored as an attribution one.
+SSP_REGS = {'GCSPR_EL0', 'GCSPR_EL1', 'GCSPR_EL2', 'GCSPR_EL3',
+            'GCSPR_EL12'}
+
 # The enabling-condition and translation-configuration registers.
 #
 # METHOD declares the exception-delivery, address-translation, debug,
@@ -119,9 +132,21 @@ def sysreg_lookup(name=None, enc=None):
             return 'SYSFPEN'
         if u in VCTRL_REGS:
             return 'VCTRL'
+        if u in SSP_REGS:
+            return 'SSP'
         if u in SYSREG_NAMES or re.match(r'^[A-Z][A-Z0-9]*_EL[0-3]', u):
             return 'TLS' if u in TLS_REGS else 'SYS'
         return None
+    # Reached from AArch64.SysInstr / SysInstrWithResult, where the
+    # operation is named by its ENCODING and there is no register name to
+    # look up.  The guarded-control-stack operations -- GCSPUSHM/X,
+    # GCSPOPM/X/CX, GCSSS1/2, all op0 = 1, CRn = 7, CRm = 7 -- move
+    # GCSPR_ELx, so they carry the shadow-stack role rather than the
+    # residual, exactly as the named lookup above gives GCSPR_ELx.
+    if enc is not None:
+        op0, op1, crn, crm, op2 = enc
+        if op0 == 1 and crn == 7 and crm == 7:
+            return 'SSP'
     return 'SYS'
 
 
@@ -378,7 +403,7 @@ def tok(kind, idx):
         # FP/SIMD/SVE/SME enable gate and the vector configuration are
         # the roles the tracer's generic space names separately, so the
         # reference names them too rather than folding them into SYS.
-        if idx in ('TLS', 'SYSFPEN', 'VCTRL'):
+        if idx in ('TLS', 'SYSFPEN', 'VCTRL', 'SSP'):
             return idx
         return 'SYS'
     if kind == 'PSTATE':

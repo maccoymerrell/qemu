@@ -4113,11 +4113,12 @@ static bool cap_aarch64_is_fp_gated(const cs_insn *insn)
  * here.  Idempotent on the sysreg encoding, and a no-op once the
  * operand array is full.
  */
-static void cap_aarch64_add_sysreg(qemu_plugin_insn_info *out,
-                                   unsigned sysreg, const char *name,
-                                   uint8_t access)
+static void cap_aarch64_add_sysreg_class(qemu_plugin_insn_info *out,
+                                         unsigned sysreg, const char *name,
+                                         uint8_t access, uint8_t cls)
 {
     qemu_plugin_operand *op;
+    char buf[32];
 
     for (uint8_t i = 0; i < out->n_operands; i++) {
         if (out->operands[i].type == QEMU_PLUGIN_OP_SYSREG
@@ -4129,15 +4130,31 @@ static void cap_aarch64_add_sysreg(qemu_plugin_insn_info *out,
     if (out->n_operands >= QEMU_PLUGIN_INSN_DETAIL_MAX_OPS) {
         return;
     }
+    if (!name) {
+        /* An operation rather than a register: name it by its encoding,
+         * which is how the architecture names it too. */
+        snprintf(buf, sizeof(buf), "s%u_%u_c%u_c%u_%u",
+                 (sysreg >> 14) & 0x3u, (sysreg >> 11) & 0x7u,
+                 (sysreg >> 7) & 0xFu, (sysreg >> 3) & 0xFu, sysreg & 0x7u);
+        name = buf;
+    }
     op = &out->operands[out->n_operands];
     memset(op, 0, sizeof(*op));
     op->type   = QEMU_PLUGIN_OP_SYSREG;
     op->access = access;
     op->reg_id = (uint16_t)sysreg;
-    op->sysreg_class = cap_aarch64_sysreg_class(sysreg);
+    op->sysreg_class = cls;
     op->scale  = 1;
     g_strlcpy(op->reg_name, name, QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ);
     out->n_operands++;
+}
+
+static void cap_aarch64_add_sysreg(qemu_plugin_insn_info *out,
+                                   unsigned sysreg, const char *name,
+                                   uint8_t access)
+{
+    cap_aarch64_add_sysreg_class(out, sysreg, name, access,
+                                 cap_aarch64_sysreg_class(sysreg));
 }
 
 /*
@@ -4196,6 +4213,290 @@ static void cap_aarch64_add_fp_enable_gate(const cs_insn *insn,
                                QEMU_PLUGIN_OP_ACC_READ);
         cap_aarch64_add_sysreg(out, AARCH64_SYSREG_SMCR_EL3, "smcr_el3",
                                QEMU_PLUGIN_OP_ACC_READ);
+    }
+}
+
+/*
+ * System registers an AArch64 encoding IMPLIES but never prints.
+ *
+ * Capstone reports the operands an instruction spells.  A dozen AArch64
+ * instructions take a system register as a real operand without naming
+ * it in the assembly, and every one of them reached the dependency model
+ * without it: the tag-generation instructions do not depend on the tag
+ * exclusion mask, ERET does not depend on the exception-return state it
+ * returns to, and a barrier that updates the deferred-error register
+ * writes nothing.  Each of those is an edge a renaming regfile must
+ * respect, which is the test R7 states, and it is the same shape
+ * cap_riscv_add_csr already covers for that ISA.
+ *
+ * Each row is the architecture's own statement, from the MRA page named
+ * beside it -- not an inference from the mnemonic:
+ *
+ *   ADDG / SUBG   addg.xml: "Tags specified in GCR_EL1.Exclude are
+ *                 excluded from the possible outputs when modifying the
+ *                 Logical Address Tag."
+ *   IRG           irg.xml: the same exclusion, plus RGSR_EL1, which is
+ *                 the random-allocation seed the instruction both reads
+ *                 and advances.
+ *   LDGM / STGM   ldgm.xml: "a naturally aligned block of N Allocation
+ *                 Tags, where the size of N is identified in
+ *                 GMID_EL1.BS".
+ *   STZGM         stzgm.xml: the same, "where the size of N is
+ *                 identified in DCZID_EL0.BS".
+ *   ERET, ERETAA, ERETAB
+ *                 the exception-return state: ELR_ELx is where execution
+ *                 resumes and SPSR_ELx is the PSTATE it restores.
+ *   ESB           esb.xml: "an error synchronization event that might
+ *                 also update DISR_EL1".
+ *
+ * ALL THREE exception levels are named for ELR / SPSR, for the reason R4
+ * gives and the FP-enable triple above already follows: which one
+ * applies is a runtime value, and a static register set names every
+ * candidate.  They share one generic ID, so the generic register set is
+ * the same whichever the run uses; what the three carry that one would
+ * not is the identification in reg_id and reg_name.
+ *
+ * This is a modelling gap in Capstone rather than a bug in it -- there
+ * is no operand to report -- so unlike the SMSTOP workaround below it
+ * carries no revision test.
+ */
+static void cap_aarch64_implicit_sysregs(const cs_insn *insn,
+                                         qemu_plugin_insn_info *out)
+{
+    const uint8_t rd = QEMU_PLUGIN_OP_ACC_READ;
+    const uint8_t wr = QEMU_PLUGIN_OP_ACC_WRITE;
+
+    switch (insn->id) {
+    case AARCH64_INS_ADDG:
+    case AARCH64_INS_SUBG:
+        cap_aarch64_add_sysreg(out, AARCH64_SYSREG_GCR_EL1, "gcr_el1", rd);
+        break;
+    case AARCH64_INS_IRG:
+        cap_aarch64_add_sysreg(out, AARCH64_SYSREG_GCR_EL1, "gcr_el1", rd);
+        cap_aarch64_add_sysreg(out, AARCH64_SYSREG_RGSR_EL1, "rgsr_el1",
+                               rd | wr);
+        break;
+    case AARCH64_INS_LDGM:
+    case AARCH64_INS_STGM:
+        cap_aarch64_add_sysreg(out, AARCH64_SYSREG_GMID_EL1, "gmid_el1", rd);
+        break;
+    case AARCH64_INS_STZGM:
+        cap_aarch64_add_sysreg(out, AARCH64_SYSREG_DCZID_EL0, "dczid_el0",
+                               rd);
+        break;
+    case AARCH64_INS_ERET:
+    case AARCH64_INS_ERETAA:
+    case AARCH64_INS_ERETAB:
+        cap_aarch64_add_sysreg(out, AARCH64_SYSREG_ELR_EL1, "elr_el1", rd);
+        cap_aarch64_add_sysreg(out, AARCH64_SYSREG_ELR_EL2, "elr_el2", rd);
+        cap_aarch64_add_sysreg(out, AARCH64_SYSREG_ELR_EL3, "elr_el3", rd);
+        cap_aarch64_add_sysreg(out, AARCH64_SYSREG_SPSR_EL1, "spsr_el1", rd);
+        cap_aarch64_add_sysreg(out, AARCH64_SYSREG_SPSR_EL2, "spsr_el2", rd);
+        cap_aarch64_add_sysreg(out, AARCH64_SYSREG_SPSR_EL3, "spsr_el3", rd);
+        break;
+    default:
+        break;
+    }
+}
+
+/*
+ * SYS and SYSL -- the system-instruction group, whose whole result is
+ * system state the operand list never names.
+ *
+ * `at s1e1r, x16` translates an address and leaves the answer in
+ * PAR_EL1.  `sysl x5, #1, c2, c3, #4` moves system state INTO x5.  The
+ * GCS push and pop forms move the guarded-control-stack pointer.  Every
+ * one of them arrived recording only the Xt operand, so the instruction
+ * whose entire purpose is to produce system state produced none, and --
+ * worse -- SYSL's destination arrived as a source, because Capstone
+ * reports operands[0].access READ for it (`cstool -d aarch64 852329d5`:
+ * "operands[0].type: REG = x5, operands[0].access: READ", and
+ * "Registers read: x5" with nothing modified).  A trace in which the
+ * consumer of `sysl x5, ...` reads an x5 no instruction wrote is the
+ * same severance the MRS/MSR translation already closed on the register
+ * form.
+ *
+ * ENCODING, not alias id, for the same reason as the MSR (immediate)
+ * contract: the family is a single fixed pattern and no Capstone alias
+ * table stands in front of it.
+ *
+ *   SYS    1101 0101 0000 1 op1 CRn CRm op2 Rt
+ *   SYSL   1101 0101 0010 1 op1 CRn CRm op2 Rt
+ *
+ * That one test covers the printed aliases too -- AT, DC, IC, TLBI, CFP,
+ * CPP, DVP, COSP, TRCIT, BRB and the GCS forms are all SYS or SYSL
+ * encodings -- which is why they need no per-alias row.
+ *
+ * The ROLE is taken from CRn:CRm the way cap_aarch64_sysreg_class takes
+ * it from a register encoding, because the SYS space is organised the
+ * same way.  It is deliberately not `cap_aarch64_sysreg_class(enc)`:
+ * that function reads an encoding as a REGISTER address, and CRn 7 as a
+ * register is the address-translation result while CRn 7 as an operation
+ * is mostly cache maintenance.  Reading an operation with a register
+ * table would put every DC CIVAC in the same dependency group as
+ * PAR_EL1.
+ *
+ * Where the operation HAS an architectural result register, that
+ * register is what reg_id names: AT produces PAR_EL1, and the GCS forms
+ * read and write GCSPR_ELx -- both push and pop, since each has to know
+ * where the stack pointer is before it can move it.  Elsewhere there is
+ * no register to name and reg_id carries the SYS-space encoding, which
+ * is the architecture's own identifier for the operation.
+ */
+static uint8_t cap_aarch64_sysinstr_class(unsigned crn, unsigned crm,
+                                          unsigned op2, unsigned *reg,
+                                          const char **name)
+{
+    *reg = 0;
+    *name = NULL;
+    if (crn == 8) {
+        return QEMU_PLUGIN_SYSREG_MMU;             /* TLBI */
+    }
+    if (crn != 7) {
+        return QEMU_PLUGIN_SYSREG_OTHER;
+    }
+    switch (crm) {
+    case 8:
+    case 9:
+        /* AT -- the address-translation result. */
+        *reg  = AARCH64_SYSREG_PAR_EL1;
+        *name = "par_el1";
+        return QEMU_PLUGIN_SYSREG_MMU;
+    case 7:
+        /* GCSPUSHM / GCSPUSHX / GCSPOPM / GCSPOPCX / GCSPOPX /
+         * GCSSS1 / GCSSS2 -- the guarded control stack pointer, the
+         * same role x86 CET SSP and RISC-V ssp carry. */
+        *reg  = AARCH64_SYSREG_GCSPR_EL1;
+        *name = "gcspr_el1";
+        return QEMU_PLUGIN_SYSREG_SHADOWSTK;
+    case 2:
+        /* TRCIT (op2 7) and BRB (op2 4) -- trace and branch records. */
+        return (op2 == 4 || op2 == 7) ? QEMU_PLUGIN_SYSREG_DBG
+                                      : QEMU_PLUGIN_SYSREG_OTHER;
+    case 3:
+        /* CFP / CPP / DVP / COSP -- prediction restriction by context.
+         * Predictor state, not a register file. */
+        return QEMU_PLUGIN_SYSREG_OTHER;
+    default:
+        /* IC and DC: cache and cache-like maintenance. */
+        return QEMU_PLUGIN_SYSREG_CACHE;
+    }
+}
+
+static void cap_aarch64_sysinstr_contract(csh handle, const cs_insn *insn,
+                                          qemu_plugin_insn_info *out)
+{
+    uint32_t w;
+    unsigned op1, crn, crm, op2, enc, reg;
+    const char *name;
+    uint8_t cls, access;
+    bool sysl;
+
+    if (insn->size != 4) {
+        return;
+    }
+    w = ldl_le_p(insn->bytes);
+    if ((w & 0xFFF80000u) == 0xD5080000u) {
+        sysl = false;
+    } else if ((w & 0xFFF80000u) == 0xD5280000u) {
+        sysl = true;
+    } else {
+        return;
+    }
+    op1 = (w >> 16) & 0x7u;
+    crn = (w >> 12) & 0xFu;
+    crm = (w >> 8) & 0xFu;
+    op2 = (w >> 5) & 0x7u;
+
+    cls = cap_aarch64_sysinstr_class(crn, crm, op2, &reg, &name);
+    if (!reg) {
+        /* No architectural result register: identify the OPERATION by
+         * its own encoding, in the shape aarch64_sysreg uses (op0 = 1 is
+         * the SYS instruction space). */
+        enc = (1u << 14) | (op1 << 11) | (crn << 7) | (crm << 3) | op2;
+        reg = enc;
+    }
+    /* SYS produces system state; SYSL consumes it into Xt.  The GCS
+     * forms do both: each reads GCSPR_ELx to find the stack and writes
+     * it back moved. */
+    if (cls == QEMU_PLUGIN_SYSREG_SHADOWSTK) {
+        access = QEMU_PLUGIN_OP_ACC_READ | QEMU_PLUGIN_OP_ACC_WRITE;
+    } else {
+        access = sysl ? QEMU_PLUGIN_OP_ACC_READ : QEMU_PLUGIN_OP_ACC_WRITE;
+    }
+    cap_aarch64_add_sysreg_class(out, reg, name, access, cls);
+
+    if (!sysl) {
+        /*
+         * Rt == 31 on a SYS-format encoding is the architectural zero
+         * register, not an absent operand: the execute ASL reads X[t]
+         * unconditionally, so at t = 31 it reads XZR.  Capstone prints
+         * the no-operand alias (`gcspushx`, `ic ialluis`) and reports no
+         * register at all, which is the same alias loss R7.3 ruled on --
+         * REG_ZERO exists and is not to be dropped.
+         */
+        if ((w & 0x1Fu) == 31) {
+            cap_aarch64_add_implicit_read(out, handle, AARCH64_REG_XZR);
+        }
+        return;
+    }
+    /*
+     * SYSL's Xt is its DESTINATION.  Capstone reports it READ, and the
+     * Rt field is at 4:0 exactly as it is for SYS, so the operand is
+     * identified by the field rather than by trusting the access bits
+     * that are wrong.  Rt == 31 is the architectural "no register" form
+     * and stays as it is.
+     */
+    unsigned rt = w & 0x1Fu;
+    if (rt == 31) {
+        return;
+    }
+    for (uint8_t i = 0; i < out->n_operands; i++) {
+        qemu_plugin_operand *op = &out->operands[i];
+        if (op->type == QEMU_PLUGIN_OP_REG
+            && (op->reg_id == AARCH64_REG_X0 + rt
+                || op->reg_id == AARCH64_REG_W0 + rt)) {
+            op->access = QEMU_PLUGIN_OP_ACC_WRITE;
+        }
+    }
+    for (uint8_t i = 0; i < out->n_regs_read; i++) {
+        if (out->regs_read_id[i] == AARCH64_REG_X0 + rt) {
+            for (uint8_t j = i; j + 1 < out->n_regs_read; j++) {
+                out->regs_read_id[j] = out->regs_read_id[j + 1];
+                memcpy(out->regs_read[j], out->regs_read[j + 1],
+                       QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ);
+            }
+            out->n_regs_read--;
+            break;
+        }
+    }
+}
+
+/*
+ * ESB -- the HINT encoding that updates the deferred-error register.
+ *
+ * ESB is `hint #16` and Capstone reports it as AARCH64_INS_HINT, so the
+ * discriminator is the immediate, read off the encoding (CRm:op2) rather
+ * than off the alias id.
+ */
+static void cap_aarch64_hint_contract(const cs_insn *insn,
+                                      qemu_plugin_insn_info *out)
+{
+    uint32_t w;
+    unsigned imm;
+
+    if (insn->id != AARCH64_INS_HINT || insn->size != 4) {
+        return;
+    }
+    w = ldl_le_p(insn->bytes);
+    /* HINT: 1101 0101 0000 0011 0010 CRm op2 11111 */
+    if ((w & 0xFFFFF01Fu) != 0xD503201Fu) {
+        return;
+    }
+    imm = (((w >> 8) & 0xFu) << 3) | ((w >> 5) & 0x7u);
+    if (imm == 16) {                       /* ESB */
+        cap_aarch64_add_sysreg(out, AARCH64_SYSREG_DISR_EL1, "disr_el1",
+                               QEMU_PLUGIN_OP_ACC_WRITE);
     }
 }
 
@@ -5254,6 +5555,9 @@ static void cap_fill_arm64_operands(csh handle, unsigned int cap_mode,
     cap_aarch64_fp_status_contract(insn, a64, handle, out);
     cap_aarch64_add_fp_enable_gate(insn, a64, n, out);
     cap_aarch64_msr_imm_contract(insn, out);
+    cap_aarch64_implicit_sysregs(insn, out);
+    cap_aarch64_hint_contract(insn, out);
+    cap_aarch64_sysinstr_contract(handle, insn, out);
 
     /*
      * Capstone 6.0.0-Alpha7 implicit-read gap: CTERMEQ / CTERMNE.

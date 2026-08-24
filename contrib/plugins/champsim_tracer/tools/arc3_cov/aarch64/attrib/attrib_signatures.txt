@@ -1,5 +1,5 @@
 ==============================================================================
-TWO-AXIS CLASSIFICATION OF THE 144 DISAGREEING ROWS
+TWO-AXIS CLASSIFICATION OF THE 123 DISAGREEING ROWS
 ==============================================================================
 
   TRACER-SUPERSET  OK      we record something the reference omits
@@ -11,97 +11,40 @@ CROSS-TABULATION  direction x category
 
 CATEGORY (mechanism)        TRACER-SUPERSET  TRACER-SUBSET  ORTHOGONAL  UNACCOUNTED    total
 --------------------------------------------------------------------------------------------
-tracer-defect                            10             33           1           15       59
+tracer-defect                            10              7           0            0       17
 reference-defect                          0              1           0            0        1
-reference-gap                             5              0           0            0        5
-representative-artifact                   0              1           0            0        1
-unaccounted                               0              0           0           78       78
+reference-gap                            95              0           0            0       95
+unaccounted                               0              0           0           10       10
 --------------------------------------------------------------------------------------------
-TOTAL                                    15             35           1           93      144
+TOTAL                                   105              8           0           10      123
 
-  the number that matters: TRACER-SUBSET + UNACCOUNTED = 128
+  the number that matters: TRACER-SUBSET + UNACCOUNTED = 18
   (rows where we drop information, or do not know why we differ)
 
 ADJUDICATION CONFLICTS: none
 
-UNACCOUNTED -- 93 rows, 46 distinct mnemonics
+UNACCOUNTED -- 10 rows, 1 distinct mnemonics
 
   by class (category / measured set relation)
-        78  unaccounted / TRACER-SUPERSET
-        10  tracer-defect / TRACER-SUBSET
-         5  tracer-defect / TRACER-SUPERSET
+        10  unaccounted / TRACER-SUBSET
 
   by mnemonic
-         8  famax                    TRACER-SUPERSET DST+trc:FCSR SRC+trc:SYSFPEN
-         8  famin                    TRACER-SUPERSET DST+trc:FCSR SRC+trc:SYSFPEN
-         8  fmlall                   TRACER-SUPERSET SRC+trc:FCSR SRC+trc:SYSFPEN
-         5  frecpe                   TRACER-SUPERSET DST+trc:FCSR
-         4  fmlallbb                 TRACER-SUPERSET DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
-         4  fmlallbt                 TRACER-SUPERSET DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
-         4  fmlalltb                 TRACER-SUPERSET DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
-         4  fmlalltt                 TRACER-SUPERSET DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
-         2  addpt                    TRACER-SUPERSET SRC+trc:SYSFPEN
-         2  bf1cvtl                  TRACER-SUPERSET DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
-         2  bf1cvt                   TRACER-SUPERSET DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
-         2  bf2cvtl                  TRACER-SUPERSET DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
-         2  bf2cvt                   TRACER-SUPERSET DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
-         2  f1cvtl                   TRACER-SUPERSET DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
-         2  f1cvt                    TRACER-SUPERSET DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
-         2  f2cvtl                   TRACER-SUPERSET DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
-         2  f2cvt                    TRACER-SUPERSET DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
-         2  subpt                    TRACER-SUPERSET SRC+trc:SYSFPEN
-         1  addg                     TRACER-SUBSET  SRC+ref:SYS
-         1  eretaa                   TRACER-SUBSET  SRC+ref:SYS
-         1  eretab                   TRACER-SUBSET  SRC+ref:SYS
-         1  eret                     TRACER-SUBSET  SRC+ref:SYS
-         1  gcspopm                  TRACER-SUBSET  SRC+ref:SYS
-         1  gcsss2                   TRACER-SUBSET  SRC+ref:SYS
-         1  ldgm                     TRACER-SUBSET  SRC+ref:SYS
-         1  bf1cvtl2                 TRACER-SUPERSET DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
-         1  bf1cvtlt                 TRACER-SUPERSET DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
-         1  bf2cvtl2                 TRACER-SUPERSET DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
-         1  bf2cvtlt                 TRACER-SUPERSET DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
-         1  f1cvtl2                  TRACER-SUPERSET DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
-         1  f1cvtlt                  TRACER-SUPERSET DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
-         1  f2cvtl2                  TRACER-SUPERSET DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
-         1  f2cvtlt                  TRACER-SUPERSET DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
-         1  fcvtnb                   TRACER-SUPERSET DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
-         1  fvdotb                   TRACER-SUPERSET SRC+trc:FCSR SRC+trc:SYSFPEN
-         1  madpt                    TRACER-SUPERSET SRC+trc:SYSFPEN
-         1  mlapt                    TRACER-SUPERSET SRC+trc:SYSFPEN
-         1  smstart                  TRACER-SUPERSET DST+trc:VCTRL SRC+trc:VCTRL
-         1  smstop                   TRACER-SUPERSET DST+trc:VCTRL SRC+trc:VCTRL
-         1  stgm                     TRACER-SUBSET  SRC+ref:SYS
-         1  stzgm                    TRACER-SUBSET  SRC+ref:SYS
-         1  subg                     TRACER-SUBSET  SRC+ref:SYS
-         1  fmaxnmqv                 TRACER-SUPERSET DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
-         1  fmaxqv                   TRACER-SUPERSET DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
-         1  fminnmqv                 TRACER-SUPERSET DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
-         1  fminqv                   TRACER-SUPERSET DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
+        10  fmov                     TRACER-SUBSET  SRC+ref:FCSR
 
 LABELS WITH NO RULE  (an adjudication the taxonomy does not
 map is not an explanation; its rows are UNACCOUNTED above)
-      51  DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
-      10  DST+trc:FCSR SRC+trc:SYSFPEN
-       9  SRC+trc:FCSR SRC+trc:SYSFPEN
-       6  SRC+trc:SYSFPEN
-       2  DST+trc:VCTRL SRC+trc:VCTRL
+      10  SRC+ref:FCSR
 
 STATED-COUNT CHECK  (an adjudication that says "N rows." is checked against
 the measurement; a mismatch is a finding, not a rounding)
-  MISMATCH  stated 16   measured 0     DST+ref:ZERO
-  MISMATCH  stated 15   measured 5     DST+trc:FCSR
-  MISMATCH  stated 2    measured 10    SRC+ref:FCSR
-  MISMATCH  stated 1    measured 0     SRC+ref:MATRIX
-  MISMATCH  stated 46   measured 0     SRC+ref:ZERO
-  MISMATCH  stated 12   measured 0     SRC+trc:FCSR
+  every stated row count matches the measurement
 
 MEMOP ATTRIBUTION  (count / address / data for every load and store) is HALF
 the deliverable and this harness measures none of it: the reference carries
 mem_r / mem_w per subject and the comparison never reads them.  Reported as
 a hole, not implied to be covered by the register numbers.
 
-TOTALS {'agree': 3776, 'agree_with_tierB_refonly': 3379, 'disagree': 144}
+TOTALS {'agree': 3797, 'agree_with_tierB_refonly': 3389, 'disagree': 123}
 
 DISAGREEMENT SIGNATURES (largest first)
     51  DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
@@ -113,24 +56,6 @@ DISAGREEMENT SIGNATURES (largest first)
         eg LLVM_MC:BF1CVT_2 | bf1cvt { z2.h, z3.h }, z1.b | ref S{VEC1} D{VEC2,VEC3} | trc S{FCSR,SYSFPEN,VEC1} D{FCSR,VEC2,VEC3}
         eg LLVM_MC:BF2CVTL2_1 | bf2cvtl2 v2.8h, v1.16b | ref S{VEC1} D{VEC2} | trc S{FCSR,SYSFPEN,VEC1} D{FCSR,VEC2}
         eg LLVM_MC:BF2CVTLT_1 | bf2cvtlt z2.h, z1.b | ref S{VEC1} D{VEC2} | trc S{FCSR,SYSFPEN,VEC1} D{FCSR,VEC2}
-    12  DST+ref:SYS
-        eg AT_SYS_CR_systeminstrs | at s1e1r, x16 | ref S{GPR16} D{SYS} | trc S{GPR16} D{-}
-        eg CFP_SYS_CR_systeminstrs | cfp rctx, x1 | ref S{GPR1} D{SYS} | trc S{GPR1} D{-}
-        eg COSP_SYS_CR_systeminstrs | cosp rctx, x1 | ref S{GPR1} D{SYS} | trc S{GPR1} D{-}
-        eg CPP_SYS_CR_systeminstrs | cpp rctx, x1 | ref S{GPR1} D{SYS} | trc S{GPR1} D{-}
-        eg DC_SYS_CR_systeminstrs | dc cipae, x0 | ref S{GPR0} D{SYS} | trc S{GPR0} D{-}
-        eg DVP_SYS_CR_systeminstrs | dvp rctx, x1 | ref S{GPR1} D{SYS} | trc S{GPR1} D{-}
-        eg ESB_HI_hints | esb | ref S{-} D{SYS} | trc S{-} D{-}
-        eg GCSPUSHM_SYS_CR_systeminstrs | gcspushm x1 | ref S{GPR1} D{SYS} | trc S{GPR1} D{-}
-    10  SRC+ref:SYS
-        eg ADDG_64_addsub_immtags | addg x4, x3, #16, #2 | ref S{GPR3,SYS} D{GPR4} | trc S{GPR3} D{GPR4}
-        eg ERETAA_64E_branch_reg | eretaa | ref S{SP,SYS} D{-} | trc S{SP} D{-}
-        eg ERETAB_64E_branch_reg | eretab | ref S{SP,SYS} D{-} | trc S{SP} D{-}
-        eg ERET_64E_branch_reg | eret | ref S{SYS} D{-} | trc S{-} D{-}
-        eg GCSPOPM_SYSL_RC_systeminstrs | gcspopm x1 | ref S{SYS} D{GPR1} | trc S{-} D{GPR1}
-        eg GCSSS2_SYSL_RC_systeminstrs | gcsss2 x1 | ref S{SYS} D{GPR1} | trc S{-} D{GPR1}
-        eg LDGM_64bulk_ldsttags | ldgm x2, [x1] | ref S{GPR1,SYS} D{GPR2} | trc S{GPR1} D{GPR2}
-        eg STGM_64bulk_ldsttags | stgm x2, [x1] | ref S{GPR1,GPR2,SYS} D{-} | trc S{GPR1,GPR2} D{-}
     10  SRC+ref:FCSR
         eg FMOV_32H_float2int | fmov w2, h1 | ref S{FCSR,SYSFPEN,VEC1} D{GPR2} | trc S{SYSFPEN,VEC1} D{GPR2}
         eg FMOV_32S_float2int | fmov w2, s1 | ref S{FCSR,SYSFPEN,VEC1} D{GPR2} | trc S{SYSFPEN,VEC1} D{GPR2}
@@ -180,21 +105,26 @@ DISAGREEMENT SIGNATURES (largest first)
         eg FRECPE_asisdmisc_R | frecpe d3, d2 | ref S{FCSR,SYSFPEN,VEC2} D{VEC3} | trc S{FCSR,SYSFPEN,VEC2} D{FCSR,VEC3}
         eg FRECPE_asisdmiscfp16_R | frecpe h2, h1 | ref S{FCSR,SYSFPEN,VEC1} D{VEC2} | trc S{FCSR,SYSFPEN,VEC1} D{FCSR,VEC2}
         eg frecpe_z_z_ | frecpe z3.h, z2.h | ref S{FCSR,SYSFPEN,VEC2} D{VEC3} | trc S{FCSR,SYSFPEN,VEC2} D{FCSR,VEC3}
-     4  DST+ref:SYS SRC+ref:ZERO
-        eg BRB_SYS_CR_systeminstrs | brb inj | ref S{ZERO} D{SYS} | trc S{-} D{-}
-        eg GCSPOPCX_SYS_CR_systeminstrs | gcspopcx | ref S{ZERO} D{SYS} | trc S{-} D{-}
-        eg GCSPOPX_SYS_CR_systeminstrs | gcspopx | ref S{ZERO} D{SYS} | trc S{-} D{-}
-        eg GCSPUSHX_SYS_CR_systeminstrs | gcspushx | ref S{ZERO} D{SYS} | trc S{-} D{-}
+     5  SRC+trc:SSP
+        eg GCSPOPCX_SYS_CR_systeminstrs | gcspopcx | ref S{ZERO} D{SSP} | trc S{SSP,ZERO} D{SSP}
+        eg GCSPOPX_SYS_CR_systeminstrs | gcspopx | ref S{ZERO} D{SSP} | trc S{SSP,ZERO} D{SSP}
+        eg GCSPUSHM_SYS_CR_systeminstrs | gcspushm x1 | ref S{GPR1} D{SSP} | trc S{GPR1,SSP} D{SSP}
+        eg GCSPUSHX_SYS_CR_systeminstrs | gcspushx | ref S{ZERO} D{SSP} | trc S{SSP,ZERO} D{SSP}
+        eg GCSSS1_SYS_CR_systeminstrs | gcsss1 x1 | ref S{GPR1} D{SSP} | trc S{GPR1,SSP} D{SSP}
+     2  DST+trc:SSP
+        eg GCSPOPM_SYSL_RC_systeminstrs | gcspopm x1 | ref S{SSP} D{GPR1} | trc S{SSP} D{GPR1,SSP}
+        eg GCSSS2_SYSL_RC_systeminstrs | gcsss2 x1 | ref S{SSP} D{GPR1} | trc S{SSP} D{GPR1,SSP}
      2  DST+trc:VCTRL SRC+trc:VCTRL
         eg SMSTART_MSR_SI_pstate | smstart sm | ref S{SYSFPEN} D{-} | trc S{SYSFPEN,VCTRL} D{VCTRL}
         eg SMSTOP_MSR_SI_pstate | smstop sm | ref S{SYSFPEN} D{-} | trc S{SYSFPEN,VCTRL} D{VCTRL}
      2  SRC+trc:GPR# SRC+trc:GPR#
         eg SYSP_CR_syspairinstrs | sysp #4, c0, c5, #5, x12, x13 | ref S{-} D{-} | trc S{GPR12,GPR13} D{-}
         eg TLBIP_SYSP_CR_syspairinstrs | tlbip vale2is, x24, x25 | ref S{-} D{-} | trc S{GPR24,GPR25} D{-}
+     2  SRC+ref:GPR#
+        eg TLBI_SYS_CR_systeminstrs | tlbi vmalle1is | ref S{GPR28} D{SYS} | trc S{-} D{SYS}
+        eg psel_p_ppi_ | psel p1, p5, p6.b[w12, 9] | ref S{GPR12,PRED5,PRED6,SYSFPEN} D{PRED1} | trc S{PRED5,PRED6,SYSFPEN} D{PRED1}
      1  DST+ref:GPR# DST+ref:SYS SRC+ref:GPR#
         eg HINT_HM_hints | hint #35 | ref S{GPR16} D{GPR16,SYS} | trc S{-} D{-}
-     1  DST+ref:SYS SRC+ref:SYS
-        eg IRG_64I_dp_2src | irg x3, x2, x1 | ref S{GPR1,GPR2,SYS} D{GPR3,SYS} | trc S{GPR1,GPR2} D{GPR3}
      1  DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR#
         eg LD64B_64L_memop | ld64b x2, [x1] | ref S{GPR1} D{GPR2,GPR3,GPR4,GPR5,GPR6,GPR7,GPR8,GPR9} | trc S{GPR1} D{GPR2}
      1  DST+trc:GPR#
@@ -211,16 +141,10 @@ DISAGREEMENT SIGNATURES (largest first)
         eg ST64BV_64_memop | st64bv x9, x10, [x15] | ref S{GPR10,GPR11,GPR12,GPR13,GPR14,GPR15,GPR16,GPR17} D{GPR9} | trc S{GPR10,GPR15} D{GPR9}
      1  SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR#
         eg ST64B_64L_memop | st64b x2, [x1] | ref S{GPR1,GPR2,GPR3,GPR4,GPR5,GPR6,GPR7,GPR8,GPR9} D{-} | trc S{GPR1,GPR2} D{-}
-     1  DST+ref:GPR# SRC+ref:SYS SRC+trc:GPR#
-        eg SYSL_RC_systeminstrs | sysl x5, #1, c2, c3, #4 | ref S{SYS} D{GPR5} | trc S{GPR5} D{-}
-     1  DST+ref:SYS SRC+ref:GPR#
-        eg TLBI_SYS_CR_systeminstrs | tlbi vmalle1is | ref S{GPR28} D{SYS} | trc S{-} D{-}
      1  SRC+ref:ZT0
         eg movt_zt_r_ | movt zt0[8], x2 | ref S{GPR2,SYSFPEN,VCTRL,ZT0} D{ZT0} | trc S{GPR2,SYSFPEN,VCTRL} D{ZT0}
      1  SRC+trc:VEC#
         eg pmov_z_pi_b | pmov z2, p1.b | ref S{PRED1,SYSFPEN} D{VEC2} | trc S{PRED1,SYSFPEN,VEC2} D{VEC2}
-     1  SRC+ref:GPR#
-        eg psel_p_ppi_ | psel p1, p5, p6.b[w12, 9] | ref S{GPR12,PRED5,PRED6,SYSFPEN} D{PRED1} | trc S{PRED5,PRED6,SYSFPEN} D{PRED1}
 
 REFERENCE CROSS-CHECK rank1(MRA) vs rank2(LLVM MC): same=885 differ=2925
   1857  SRC+ref:SYSFPEN
@@ -231,15 +155,18 @@ REFERENCE CROSS-CHECK rank1(MRA) vs rank2(LLVM MC): same=885 differ=2925
     50  SRC+ref:SYSFPEN SRC+trc:ZERO
     26  SRC+ref:SYSFPEN SRC+trc:MATRIX
     20  SRC+ref:ZERO
-    14  DST+ref:SYS
     14  SRC+ref:SYSFPEN SRC+ref:VCTRL
-     9  SRC+ref:SYS
-     4  DST+ref:SYS SRC+ref:ZERO
+    12  DST+ref:SYS
+     7  SRC+ref:SYS
+     3  DST+ref:SSP SRC+ref:ZERO
      3  SRC+trc:GPR# SRC+trc:GPR#
      2  SRC+ref:SYS SRC+trc:LR
+     2  SRC+ref:SSP
+     2  DST+ref:SSP
      2  DST+trc:FLAGS SRC+ref:SYSFPEN
      2  DST+ref:FCSR SRC+ref:SYSFPEN SRC+trc:FCSR
      2  SRC+ref:FLAGS SRC+ref:SYSFPEN
+     1  DST+ref:SYS SRC+ref:ZERO
      1  DST+ref:GPR# DST+ref:SYS SRC+ref:GPR#
      1  DST+ref:SYS SRC+ref:SYS
      1  DST+trc:GPR# DST+trc:GPR#

@@ -273,6 +273,31 @@ BLACKLIST = {
     'check_seed_CSR', 'virtual_instruction_exception',
 }
 
+# Calls that ARE the enumerated scope exclusion, argument list included.
+#
+# BLACKLIST silences a call's BODY; it does not silence the expressions the
+# call is handed, and for these three the address-translation state arrives as
+# an ARGUMENT.  `effectivePrivilege(access, mstatus, cur_privilege)` puts the
+# bare register name in the argument list, so `prefetch.i` -- an instruction
+# every arm of whose translation is a no-op, which therefore cannot trap and
+# whose result does not depend on any CSR -- reported a REG_SYS source that
+# came entirely from translating its own operand.  `phys_access_check` reads
+# `pma_regions` in its body and is reached the same way.
+#
+# THE LINE, and it is the same one the tracer draws at the decode boundary: a
+# CSR the instruction's OWN semantics consult -- including the gate that
+# decides whether it traps -- is a source; a CSR consulted only by the
+# translation or physical-memory check of its memory operand is excluded, on
+# both sides.  `sfence.vma` reads mstatus.TVM in its clause head and keeps it;
+# `prefetch.i` reads mstatus only here and loses it.
+#
+# This cannot silence a legality gate by accident: `feature_enabled_for_priv`,
+# which is how the Zicbom/Zicboz and Zicfiss enable bits are read, is a
+# separate call and is not listed.
+SKIP_XLATE_ARGS = {
+    'effectivePrivilege', 'phys_access_check', 'pmaMatch',
+}
+
 # calls whose arguments are pure reporting and must not be scanned as reads
 SKIP_WHOLE = {
     'csr_write_callback', 'long_csr_write_callback', 'csr_read_callback',
@@ -537,7 +562,7 @@ class Analyzer:
                     if t2 > 0: t = skip_ws(s, t2)
                 iswrite = (t < n and s[t] == '=' and s[t:t + 2] != '==' and
                            (t == 0 or s[t - 1] not in '=<>!'))
-                if word in SKIP_WHOLE:
+                if word in SKIP_WHOLE or word in SKIP_XLATE_ARGS:
                     i = e; continue
                 eff |= self.call(word, args, env, iswrite, depth)
                 i = j; continue

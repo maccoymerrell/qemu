@@ -605,6 +605,22 @@ typedef int (*MarkerEncodeSeqFn)(uint8_t *out, uint32_t imm);
  * no traced ISA reports an implementation-defined coprocessor file
  * through this path.
  */
+/*
+ * A QEMU_PLUGIN_OP_SYSREG operand's own architectural name -> the name
+ * QEMU's register-descriptor list uses for the same register.
+ *
+ * The role above is a CLASS: one generic ID stands for every register
+ * that plays that part, and RISC-V alone folds six CSRs (fflags, frm,
+ * fcsr, vxsat, vxrm, vcsr) onto REG_FCSR.  A VALUE cannot be folded the
+ * same way -- reading one representative of the class publishes the
+ * wrong register's content for every other member -- so the value read
+ * is keyed on the operand's own name instead, and this is the rename
+ * from the boundary's spelling into QEMU's.  NULL means "no readable
+ * QEMU register", which leaves the field exactly as wide as the reverse
+ * index would have made it.
+ */
+typedef const char *(*SysregQemuNameFn)(const char *boundary_name);
+
 static inline uint8_t generic_reg_for_sysreg_class(uint8_t sysreg_class)
 {
     switch (sysreg_class) {
@@ -633,6 +649,17 @@ typedef struct {
     int                   cap_arch;
     CapModeForTargetFn    cap_mode_for_target;
     RegAliasInserterFn    reg_alias_inserter;
+    /*
+     * sysreg_feature / sysreg_qemu_name — how a system-register
+     * operand's VALUE is reached.  sysreg_feature is the GDB feature
+     * QEMU registers this ISA's system registers under; NULL on an ISA
+     * whose system registers QEMU does not expose, which keeps the
+     * class-level reverse index as the only source.  sysreg_qemu_name
+     * renames the boundary's spelling into QEMU's when the two differ;
+     * NULL means they are identical.
+     */
+    const char           *sysreg_feature;
+    SysregQemuNameFn      sysreg_qemu_name;
     MetaFlagsMapperFn     flags_to_metaflags;
     AddrCanonicalizeFn    canonicalize_addr;
     /*
@@ -671,6 +698,8 @@ const IsaProperties isa_properties[] = {
         .target_prefixes = isa_prefixes_x86,
         .cap_arch = CS_ARCH_X86,
         .cap_mode_for_target = cap_mode_x86,
+        .sysreg_feature = "org.gnu.gdb.i386.core",
+        .sysreg_qemu_name = x86_sysreg_qemu_name,
         .flags_to_metaflags = x86_flags_to_metaflags,
         .canonicalize_addr = x86_canonicalize_addr,
         .marker_encode_seq = cst_marker_x86_encode_seq_imm,
@@ -683,6 +712,11 @@ const IsaProperties isa_properties[] = {
         .cap_arch = CS_ARCH_AARCH64,
         .cap_mode_for_target = cap_mode_aarch64,
         .reg_alias_inserter = insert_aarch64_reg_aliases,
+        /* QEMU registers the whole AArch64 privileged file under one
+         * QEMU-private feature, spelled in the architecture's upper
+         * case; insert_aarch64_reg_aliases adds the lower-cased name
+         * the boundary recovers from the disassembly text. */
+        .sysreg_feature = "org.qemu.gdb.arm.sys.regs",
         .flags_to_metaflags = aarch64_flags_to_metaflags,
         .canonicalize_addr = aarch64_canonicalize_addr,
         .marker_encode_seq = cst_marker_a64_encode_seq_imm,
@@ -706,6 +740,10 @@ const IsaProperties isa_properties[] = {
         .target_prefixes = isa_prefixes_riscv,
         .cap_arch = CS_ARCH_RISCV,
         .cap_mode_for_target = cap_mode_riscv,
+        /* Zicsr CSRs QEMU exposes -- fflags, frm, fcsr, vstart, vxsat,
+         * vxrm, vcsr, vl, vtype, vlenb among them -- carry exactly the
+         * names cap_riscv_csr_name() spells, so no rename is needed. */
+        .sysreg_feature = "org.gnu.gdb.riscv.csr",
         .canonicalize_addr = riscv_canonicalize_addr,
         .marker_encode_seq = cst_marker_riscv_encode_seq_imm,
         .marker_insn_bytes = CST_MARKER_PAIR_INSN_BYTES,

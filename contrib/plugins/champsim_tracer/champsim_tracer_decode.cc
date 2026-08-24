@@ -36,10 +36,28 @@ static inline bool qemu_reg_key_valid(const QemuRegKey *key)
  */
 static QemuRegKey g_qemu_reg_by_gen[REG_ID_COUNT];
 
+/*
+ * True where the table's rows for one generic ID name DIFFERENT QEMU
+ * registers.
+ *
+ * The reverse index above holds one register per generic ID, which is
+ * exactly right for a Capstone alias set -- AH/AL/AX/EAX/RAX are five
+ * rows and one register -- and exactly wrong for a generic ID that
+ * deliberately folds several registers into one dependency slot.
+ * RISC-V is the live case: REG_FCSR carries fflags, frm, vxrm and
+ * vxsat, and REG_VCTRL carries vl and vtype, so "first singleton row
+ * wins" would publish fflags' content under frm's name.  Where the
+ * rows disagree the value is read from the ROW the decode matched
+ * (qemu_reg_for_row); where they agree the singleton keeps its pointer
+ * identity, and with it the register-handle cache's hit rate.
+ */
+static bool g_qemu_reg_gen_ambiguous[REG_ID_COUNT];
+
 void build_qemu_reg_reverse_index(void)
 {
     for (unsigned i = 0; i < REG_ID_COUNT; i++) {
         g_qemu_reg_by_gen[i] = QemuRegKey{};
+        g_qemu_reg_gen_ambiguous[i] = false;
     }
     if (!active_reg_table || active_reg_table_size == 0) {
         return;
@@ -64,8 +82,115 @@ void build_qemu_reg_reverse_index(void)
          * correct for value reads. */
         if (!qemu_reg_key_valid(&g_qemu_reg_by_gen[rc->reg_id])) {
             g_qemu_reg_by_gen[rc->reg_id] = rc->qemu_reg;
+        } else if (!cst_str_eq(g_qemu_reg_by_gen[rc->reg_id].feature,
+                               rc->qemu_reg.feature) ||
+                   !cst_str_eq(g_qemu_reg_by_gen[rc->reg_id].name,
+                               rc->qemu_reg.name)) {
+            g_qemu_reg_gen_ambiguous[rc->reg_id] = true;
         }
     }
+}
+
+/*
+ * Interned QemuRegKey for a SYSTEM register named by its own operand.
+ *
+ * A QEMU_PLUGIN_OP_SYSREG operand reaches the generic vocabulary
+ * through its ROLE, and a role is a class: REG_FCSR stands for RISC-V's
+ * fflags, frm, fcsr, vxsat, vxrm and vcsr all at once, REG_VCTRL for vl,
+ * vtype and vstart, and on AArch64 the whole 209-register privileged
+ * file arrives as a handful of roles.  That fold is correct for the
+ * dependency edge -- a consumer scheduling against "the FP control
+ * word" wants one slot -- and wrong for the VALUE, because
+ * g_qemu_reg_by_gen[] holds at most ONE register per class.  Where the
+ * class has no member with a readable QEMU register the destination is
+ * published with width 0, which reads back as zero and therefore agrees
+ * with any reference whenever the truth happens to be zero; where it
+ * has several, one member's content is published under all of their
+ * names.
+ *
+ * So the value is keyed on the register the operand actually names.
+ * The key must be POINTER-STABLE -- InsnRegNames stores the pointer and
+ * RegHandleCache's direct-mapped cache is keyed on its identity -- so
+ * keys are interned here and live for the process.  Returns nullptr
+ * when the ISA exposes no system-register feature, when the boundary
+ * had no name for the register, or when the rename says QEMU does not
+ * carry it; every one of those falls back to the class-level index,
+ * which is what happened before this existed.
+ */
+static GMutex             g_sysreg_key_lock;
+static GHashTable        *g_sysreg_keys;        /* name -> QemuRegKey * */
+static GHashTable        *g_sysreg_exposed;     /* name -> (gpointer)1 */
+
+/*
+ * Does QEMU carry a register by this name at all?
+ *
+ * A key that names nothing resolves to a null handle and publishes a
+ * width-0 field -- the very defect this resolver exists to remove -- and
+ * it would do so on registers the CLASS index could still have placed
+ * (AArch64 `nzcv` is not in the descriptor list, but REG_FLAGS' index
+ * entry is `cpsr`, which holds it).  So the descriptor list is consulted
+ * once and the resolver declines names it does not carry, leaving those
+ * to the fallback.  Both spellings go in because the AArch64 boundary
+ * lower-cases what QEMU spells in upper case.  An empty list is NOT
+ * cached: decode can run before any vCPU has registers to report, and a
+ * cached "nothing exists" would be permanent.
+ */
+static bool sysreg_name_exposed(const char *name)
+{
+    if (!g_sysreg_exposed) {
+        g_autoptr(GArray) regs = qemu_plugin_get_registers();
+        if (!regs || regs->len == 0) {
+            return false;
+        }
+        GHashTable *set = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                                g_free, nullptr);
+        for (unsigned i = 0; i < regs->len; i++) {
+            const qemu_plugin_reg_descriptor *d =
+                &g_array_index(regs, qemu_plugin_reg_descriptor, i);
+            if (!d->name || !d->name[0]) {
+                continue;
+            }
+            g_hash_table_add(set, g_strdup(d->name));
+            g_hash_table_add(set, g_ascii_strdown(d->name, -1));
+        }
+        g_sysreg_exposed = set;
+    }
+    return g_hash_table_contains(g_sysreg_exposed, name);
+}
+
+static const QemuRegKey *qemu_reg_for_sysreg(const char *boundary_name)
+{
+    const IsaProperties *props = &isa_properties[trace_isa];
+    const char *feature = props->sysreg_feature;
+    const char *name = boundary_name;
+
+    if (!feature || !name || !name[0]) {
+        return nullptr;
+    }
+    if (props->sysreg_qemu_name) {
+        name = props->sysreg_qemu_name(name);
+        if (!name || !name[0]) {
+            return nullptr;
+        }
+    }
+
+    g_mutex_lock(&g_sysreg_key_lock);
+    if (!sysreg_name_exposed(name)) {
+        g_mutex_unlock(&g_sysreg_key_lock);
+        return nullptr;
+    }
+    if (!g_sysreg_keys) {
+        g_sysreg_keys = g_hash_table_new(g_str_hash, g_str_equal);
+    }
+    QemuRegKey *key = (QemuRegKey *)g_hash_table_lookup(g_sysreg_keys, name);
+    if (!key) {
+        key = g_new0(QemuRegKey, 1);
+        key->feature = g_strdup(feature);
+        key->name = g_strdup(name);
+        g_hash_table_insert(g_sysreg_keys, (gpointer)key->name, key);
+    }
+    g_mutex_unlock(&g_sysreg_key_lock);
+    return key;
 }
 
 static inline const QemuRegKey *qemu_reg_for_generic(uint8_t gen_id)
@@ -75,6 +200,30 @@ static inline const QemuRegKey *qemu_reg_for_generic(uint8_t gen_id)
     }
     const QemuRegKey *k = &g_qemu_reg_by_gen[gen_id];
     return qemu_reg_key_valid(k) ? k : nullptr;
+}
+
+/*
+ * The QEMU register whose VALUE this table row stands for.  Both
+ * candidates are pointer-stable -- the row lives in a static table and
+ * the singleton in a static array -- so either can key the handle
+ * cache; the row is preferred only where the singleton would name a
+ * DIFFERENT register (see g_qemu_reg_gen_ambiguous).
+ */
+static inline const QemuRegKey *qemu_reg_for_row(const RegClassification *rc)
+{
+    if (!rc) {
+        return nullptr;
+    }
+    if (rc->reg_id < REG_ID_COUNT && g_qemu_reg_gen_ambiguous[rc->reg_id]) {
+        /*
+         * Once the rows disagree the singleton is some OTHER register,
+         * so a row that names none of its own publishes nothing rather
+         * than a neighbour's content.  A missing value is a gap a
+         * reference can see; a confidently wrong one is not.
+         */
+        return qemu_reg_key_valid(&rc->qemu_reg) ? &rc->qemu_reg : nullptr;
+    }
+    return qemu_reg_for_generic(rc->reg_id);
 }
 
 void capture_initial_regfile(unsigned int cpu_index,
@@ -170,9 +319,10 @@ static inline void add_dst_reg(InsnFields *f, InsnRegNames *refs,
 
 /*
  * Pointer-stable QemuRegKey identity: add_{src,dst}_reg routes through
- * qemu_reg_for_generic(), returning the g_qemu_reg_by_gen[] singleton
- * (RegClassification's own .qemu_reg may differ in address but holds an
- * identical (feature, name) pair).
+ * qemu_reg_for_row(), which returns the g_qemu_reg_by_gen[] singleton
+ * whenever every row for the generic ID holds the same (feature, name)
+ * pair -- the Capstone-alias case -- and the row's own key when they
+ * do not.
  *
  * Returns a mask of src_regs[] slots holding the registers behind
  * @cap_id.  One Capstone reg id can expand into multiple aliases
@@ -198,8 +348,7 @@ static inline uint64_t add_src_cap_reg(InsnFields *f, InsnRegNames *refs,
         }
         return mask;
     }
-    uint8_t slot = add_src_reg(f, refs, rc->reg_id,
-                               qemu_reg_for_generic(rc->reg_id));
+    uint8_t slot = add_src_reg(f, refs, rc->reg_id, qemu_reg_for_row(rc));
     if (slot < MAX_SRC_REGS) {
         mask |= (uint64_t)1 << slot;
     }
@@ -220,7 +369,7 @@ static inline void add_dst_cap_reg(InsnFields *f, InsnRegNames *refs,
         }
         return;
     }
-    add_dst_reg(f, refs, rc->reg_id, qemu_reg_for_generic(rc->reg_id));
+    add_dst_reg(f, refs, rc->reg_id, qemu_reg_for_row(rc));
     /*
      * Mark integer-flags writer so the encoder emits a CST_FID_METAFLAGS
      * record (Z/N/C/V/P from the REG_FLAGS dst snap).  Gated on the
@@ -823,11 +972,21 @@ void decode_detail_to_generic(uint64_t pc,
             if (gen == REG_NONE) {
                 break;
             }
+            /*
+             * The NAME is the class; the VALUE is the register the
+             * operand names (see qemu_reg_for_sysreg).  The
+             * class-level index remains the fallback for every
+             * register that resolver cannot place.
+             */
+            const QemuRegKey *sys_key = qemu_reg_for_sysreg(op->reg_name);
+            if (!sys_key) {
+                sys_key = qemu_reg_for_generic(gen);
+            }
             if (op->access & QEMU_PLUGIN_OP_ACC_READ) {
-                add_src_reg(out, out_names, gen, qemu_reg_for_generic(gen));
+                add_src_reg(out, out_names, gen, sys_key);
             }
             if (op->access & QEMU_PLUGIN_OP_ACC_WRITE) {
-                add_dst_reg(out, out_names, gen, qemu_reg_for_generic(gen));
+                add_dst_reg(out, out_names, gen, sys_key);
                 /*
                  * `msr nzcv, x3` really does define the arithmetic
                  * flags, so it owes the CST_FID_METAFLAGS record an

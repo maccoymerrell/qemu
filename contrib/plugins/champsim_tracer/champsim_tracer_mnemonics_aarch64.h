@@ -31,6 +31,33 @@ static void insert_aarch64_reg_aliases(
 {
     static const char fpu_feature[] = "org.gnu.gdb.aarch64.fpu";
     static const char sve_feature[] = "org.gnu.gdb.aarch64.sve";
+    static const char sys_feature[] = "org.qemu.gdb.arm.sys.regs";
+
+    /*
+     * The privileged file: QEMU spells these the way the architecture
+     * does, in upper case (TPIDR_EL0, ESR_EL1); the decode boundary
+     * recovers the name from Capstone's disassembly text and
+     * lower-cases it like every other register name crossing that
+     * boundary.  Alias the lower-cased spelling onto the same handle,
+     * so an `mrs`/`msr` operand's value is read from the register it
+     * actually names instead of falling back to the one representative
+     * its ROLE would pick.
+     */
+    if (cst_str_eq(desc->feature, sys_feature)) {
+        if (!desc->name || !desc->name[0]) {
+            return;
+        }
+        gchar *lower = g_ascii_strdown(desc->name, -1);
+        if (!cst_str_eq(lower, desc->name)) {
+            QemuRegKey *skey = g_new(QemuRegKey, 1);
+            skey->feature = g_strdup(sys_feature);
+            skey->name = lower;          /* hash table takes ownership */
+            g_hash_table_insert(handles, skey, desc->handle);
+        } else {
+            g_free(lower);
+        }
+        return;
+    }
 
     if (!cst_str_eq(desc->feature, sve_feature)) {
         return;

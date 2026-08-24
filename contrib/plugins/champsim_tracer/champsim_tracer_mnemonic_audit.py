@@ -3845,10 +3845,31 @@ def qemu_aarch64_reg_keys() -> dict[str, QemuRegKey]:
     return regs
 
 
+# The Zicsr control and status registers QEMU exposes.  Unlike the GPR
+# and FPR files these have no static GDB XML: target/riscv/gdbstub.c
+# builds "org.gnu.gdb.riscv.csr" at CPU-realize time from csr_ops[],
+# naming each register the way the ISA does, so the names are listed
+# here rather than parsed out of gdb-xml/.
+#
+# Only the ones Capstone gives a register id (riscv.h: RISCV_REG_FFLAGS
+# .. RISCV_REG_VXSAT) can be reached from this table; the rest of the
+# CSR space arrives as a QEMU_PLUGIN_OP_SYSREG operand and is resolved
+# from the operand's own name at decode time.  RISCV_REG_SSP is absent
+# on purpose: Zicfiss's `ssp` is not in the predicate-gated CSR list
+# QEMU registers, so there is no register to read and the row stays
+# unmapped rather than borrowing another CSR's content.
+QEMU_RISCV_CSR_FEATURE = "org.gnu.gdb.riscv.csr"
+QEMU_RISCV_CSR_NAMES = (
+    "fflags", "frm", "vl", "vtype", "vxrm", "vxsat", "vlenb",
+)
+
+
 @lru_cache(maxsize=None)
 def qemu_riscv_reg_keys() -> dict[str, QemuRegKey]:
     regs = dict(gdb_xml_reg_key_map(("riscv-64bit-cpu.xml", "riscv-64bit-fpu.xml")))
     add_sequential_qemu_reg_keys(regs, "v", 32, "org.gnu.gdb.riscv.vector")
+    for name in QEMU_RISCV_CSR_NAMES:
+        add_qemu_reg_key(regs, name, QEMU_RISCV_CSR_FEATURE)
     return regs
 
 
@@ -3938,6 +3959,8 @@ def qemu_riscv_reg_key(name: str) -> QemuRegKey | None:
         return None
     if name == "X0_PAIR":
         return None
+    if name.lower() in QEMU_RISCV_CSR_NAMES:
+        return qemu_reg_key_by_name("riscv", name.lower())
     if match := re.fullmatch(r"X(\d+)", name):
         num = int(match.group(1))
         return qemu_reg_key_by_name(
@@ -3952,8 +3975,27 @@ def qemu_riscv_reg_key(name: str) -> QemuRegKey | None:
     return None
 
 
+# The three CP0 registers QEMU's MIPS gdbstub carries (mips-cpu.xml:
+# status, badvaddr, cause).  The rest of the CP0 file, the DSP
+# accumulators above AC0, the DSPControl word, the FCC condition bits
+# and the MSA vector file are absent from the descriptor list
+# altogether, so their rows stay unmapped: there is no register to read.
+# Both spellings Capstone uses for each reach the same register --- the
+# bare CP0 number and the named `cop0sel_` form.
+QEMU_MIPS_CP0_NAMES = {
+    "COP08": "badvaddr",
+    "COP0SEL_BADVADDR": "badvaddr",
+    "COP012": "status",
+    "COP0SEL_STATUS": "status",
+    "COP013": "cause",
+    "COP0SEL_CAUSE": "cause",
+}
+
+
 def qemu_mips_reg_key(name: str) -> QemuRegKey | None:
     feature = "org.gnu.gdb.mips.cpu"
+    if name in QEMU_MIPS_CP0_NAMES:
+        return QemuRegKey(feature, QEMU_MIPS_CP0_NAMES[name])
     gpr_names = (
         "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
         "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",

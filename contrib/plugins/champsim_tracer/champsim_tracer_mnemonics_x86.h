@@ -22,6 +22,35 @@ static unsigned int cap_mode_x86(const char *target_name)
 }
 
 /*
+ * x86 system-register operand name -> the name QEMU's register list
+ * uses for the same register.
+ *
+ * The boundary names these registers architecturally (Intel's `fpcw`
+ * and `fptag`); QEMU inherited GDB's i386 spelling (`fctrl`, `ftag`)
+ * for the same two.  Everything else on the boundary's list --
+ * gdtr/idtr/ldtr/tr, the MSR window, tsc/tscaux, xcr0, ssp -- has no
+ * entry in the descriptor list at all, and NULL here says so
+ * explicitly rather than letting a near-miss spelling resolve to some
+ * other register's value.
+ */
+static const char *x86_sysreg_qemu_name(const char *name)
+{
+    if (!name || !name[0]) {
+        return NULL;
+    }
+    if (cst_str_eq(name, "mxcsr")) {
+        return "mxcsr";
+    }
+    if (cst_str_eq(name, "fpcw")) {
+        return "fctrl";
+    }
+    if (cst_str_eq(name, "fptag")) {
+        return "ftag";
+    }
+    return NULL;
+}
+
+/*
  * x86 EFLAGS → canonical CST_METAFLAGS layout.  Mapping table:
  *   bit  0  CF -> CST_METAFLAGS_C
  *   bit  2  PF -> CST_METAFLAGS_P

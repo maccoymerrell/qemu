@@ -844,16 +844,22 @@ per-instruction decode struct widens by about 48 bytes per added
 slot, and the body stream, which references templates by id rather
 than carrying operands, is unaffected.
 
-**Cumulative FP exception status is not modelled.**  AArch64 ``FPSR``
-and the RISC-V ``fflags`` accumulation are written by every FP
-instruction that can raise an exception; the tracer records neither.
-The register model carries dataflow registers, and threading a
-read-modify-write of one status word through the whole FP stream would
-put every FP instruction on a serial chain no implementation renames —
-a false dependency on that scale misleads a consumer further than the
-missing edge does.  The *control* half is modelled in full: ``FPCR``
-and ``frm`` are read wherever the rounding mode is an input, and an
-explicit ``msr fpsr`` or ``fscsr`` is a real write of ``REG_FCSR``.
+**Cumulative FP exception status is carried as a write, not as a
+read-modify-write.**  AArch64 ``FPSR`` and the RISC-V ``fflags``
+accumulation are updated by every FP instruction that can raise an
+exception, and the tracer records that update: such an instruction
+carries ``REG_FCSR`` as a destination, and under ``regdata`` the
+destination's value is the status word read back after the instruction
+executed — ``fdiv s0, s1, s2`` publishes ``FPSR`` = ``0x10`` (IXC) and
+``fdiv.s`` publishes ``fcsr`` = ``0x1``.  What is deliberately absent is
+the matching *read*: the accumulation is architecturally a
+read-modify-write, and threading that dependency through the whole FP
+stream would put every FP instruction on a serial chain no
+implementation renames, a false dependency that misleads a consumer
+further than the missing edge does.  The *control* half is modelled in
+full on both sides: ``FPCR`` and ``frm`` are read wherever the rounding
+mode is an input, and an explicit ``msr fpsr`` or ``fscsr`` is a real
+write of ``REG_FCSR``.
 
 **RISC-V ``vstart`` is modelled only where it is moved explicitly.**
 Architecturally every vector instruction reads ``vstart`` and clears
@@ -886,6 +892,43 @@ back out of ``REG_SYS`` are the ones where the collapse invented edges
 rather than merging them — the ``rdhwr $29`` thread pointer
 (``REG_TLS``), ``DSPControl`` (``REG_DSPCTRL``) and MSA's control word
 (``REG_VCSR``).
+
+**A destination whose register QEMU does not expose carries no value.**
+Under ``regdata`` a destination register's content is read back through
+the plugin register API, which offers only the registers the target's
+GDB feature set names.  Where the ISA table or the decode boundary names
+a register that list does not carry, the destination is still recorded —
+the dependency edge is unaffected — but its value rides with width zero,
+which a consumer reads as "not captured" rather than as the value zero.
+The classes affected, measured against the descriptor list each target
+actually publishes:
+
+* **x86_64** — ``REG_PRED0..7`` (the AVX-512 mask registers),
+  ``REG_VEC16..31`` (``xmm``/``ymm``/``zmm`` 16 and above),
+  ``REG_BOUND0..3`` and ``REG_DEBUG*``.  QEMU's i386 GDB feature set
+  stops at ``xmm15`` and names no ``k``, ``bnd`` or ``dr`` register, so
+  there is nothing to read; the control registers it does name
+  (``cr0``, ``cr2``, ``cr3``, ``cr4``, ``cr8``) carry values.
+* **AArch64** — ``REG_MATRIX`` and ``REG_VEC32``, the SME ``ZA`` array
+  and ``ZT0``: QEMU registers an SVE feature and no SME one.
+  ``REG_ZERO`` is width-zero by construction — ``xzr`` is not a
+  register QEMU exposes and its value is architecturally zero.
+* **RISC-V** — ``REG_SSP``.  Zicfiss's ``ssp`` is not in the
+  predicate-gated CSR list QEMU builds, so the row stays unmapped rather
+  than borrowing another CSR's content.
+* **MIPS** — the CP0 file except ``Status``, ``BadVAddr`` and ``Cause``;
+  the DSP accumulators above ``AC0``; ``DSPControl``; the ``FCC``
+  condition bits; and the MSA vector file.  QEMU's MIPS GDB feature set
+  is the integer file, the FP file, ``fcr0``/``fcr31`` and those three
+  CP0 registers, and nothing else.
+
+Where several registers share one generic ID and they do *not* all
+resolve to the same QEMU register, the value published is the one the
+decoded row or operand names, never a sibling's: RISC-V ``fflags``,
+``frm``, ``vxrm`` and ``vxsat`` each publish their own content under
+``REG_FCSR``, and ``vl`` and ``vtype`` theirs under ``REG_VCTRL``.  A
+row in such a class that names no register of its own publishes nothing
+rather than a neighbour's content.
 
 **Wrong-path decode of arbitrary bytes is best-effort.**  Capstone
 accepts encodings whose architecturally-fixed fields hold reserved

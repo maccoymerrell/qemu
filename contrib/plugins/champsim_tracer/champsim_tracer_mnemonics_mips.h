@@ -149,7 +149,7 @@ static const RegClassification mips_reg_class[MIPS_REG_ENDING] = {
     [MIPS_REG_COP05] = { .reg_id = REG_SYSMMU },  /* cop05 */
     [MIPS_REG_COP06] = { .reg_id = REG_SYSMMU },  /* cop06 */
     [MIPS_REG_COP07] = { .reg_id = REG_SYS },  /* cop07 */
-    [MIPS_REG_COP08] = { .reg_id = REG_SYSEXC },  /* cop08 */
+    [MIPS_REG_COP08] = { .reg_id = REG_SYSEXC, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "badvaddr" } },  /* cop08 */
     [MIPS_REG_COP09] = { .reg_id = REG_SYSTIMER },  /* cop09 */
     [MIPS_REG_COP20] = { .reg_id = REG_COPROC0 },  /* cop20 */
     [MIPS_REG_COP21] = { .reg_id = REG_COPROC0 },  /* cop21 */
@@ -173,8 +173,8 @@ static const RegClassification mips_reg_class[MIPS_REG_ENDING] = {
     [MIPS_REG_COP39] = { .reg_id = REG_COPROC1 },  /* cop39 */
     [MIPS_REG_COP010] = { .reg_id = REG_SYSMMU },  /* cop010 */
     [MIPS_REG_COP011] = { .reg_id = REG_SYSTIMER },  /* cop011 */
-    [MIPS_REG_COP012] = { .reg_id = REG_SYSEXC },  /* cop012 */
-    [MIPS_REG_COP013] = { .reg_id = REG_SYSEXC },  /* cop013 */
+    [MIPS_REG_COP012] = { .reg_id = REG_SYSEXC, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "status" } },  /* cop012 */
+    [MIPS_REG_COP013] = { .reg_id = REG_SYSEXC, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "cause" } },  /* cop013 */
     [MIPS_REG_COP014] = { .reg_id = REG_SYSEXC },  /* cop014 */
     [MIPS_REG_COP015] = { .reg_id = REG_SYSID },  /* cop015 */
     [MIPS_REG_COP016] = { .reg_id = REG_SYSID },  /* cop016 */
@@ -501,10 +501,10 @@ static const RegClassification mips_reg_class[MIPS_REG_ENDING] = {
     [MIPS_REG_COP0SEL_BADINST] = { .reg_id = REG_SYSEXC },  /* cop0sel_badinst */
     [MIPS_REG_COP0SEL_BADINSTRP] = { .reg_id = REG_SYSEXC },  /* cop0sel_badinstrp */
     [MIPS_REG_COP0SEL_BADINSTRX] = { .reg_id = REG_SYSEXC },  /* cop0sel_badinstrx */
-    [MIPS_REG_COP0SEL_BADVADDR] = { .reg_id = REG_SYSEXC },  /* cop0sel_badvaddr */
+    [MIPS_REG_COP0SEL_BADVADDR] = { .reg_id = REG_SYSEXC, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "badvaddr" } },  /* cop0sel_badvaddr */
     [MIPS_REG_COP0SEL_BEVVA] = { .reg_id = REG_SYSEXC },  /* cop0sel_bevva */
     [MIPS_REG_COP0SEL_CACHEERR] = { .reg_id = REG_SYSCACHE },  /* cop0sel_cacheerr */
-    [MIPS_REG_COP0SEL_CAUSE] = { .reg_id = REG_SYSEXC },  /* cop0sel_cause */
+    [MIPS_REG_COP0SEL_CAUSE] = { .reg_id = REG_SYSEXC, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "cause" } },  /* cop0sel_cause */
     [MIPS_REG_COP0SEL_CDMMBASE] = { .reg_id = REG_SYSID },  /* cop0sel_cdmmbase */
     [MIPS_REG_COP0SEL_CMGCRBASE] = { .reg_id = REG_SYSID },  /* cop0sel_cmgcrbase */
     [MIPS_REG_COP0SEL_COMPARE] = { .reg_id = REG_SYSTIMER },  /* cop0sel_compare */
@@ -551,7 +551,7 @@ static const RegClassification mips_reg_class[MIPS_REG_ENDING] = {
     [MIPS_REG_COP0SEL_RANDOM] = { .reg_id = REG_SYSMMU },  /* cop0sel_random */
     [MIPS_REG_COP0SEL_SRSCTL] = { .reg_id = REG_SYSEXC },  /* cop0sel_srsctl */
     [MIPS_REG_COP0SEL_SRSMAP] = { .reg_id = REG_SYSEXC },  /* cop0sel_srsmap */
-    [MIPS_REG_COP0SEL_STATUS] = { .reg_id = REG_SYSEXC },  /* cop0sel_status */
+    [MIPS_REG_COP0SEL_STATUS] = { .reg_id = REG_SYSEXC, .qemu_reg = { .feature = "org.gnu.gdb.mips.cpu", .name = "status" } },  /* cop0sel_status */
     [MIPS_REG_COP0SEL_TCBIND] = { .reg_id = REG_SYS },  /* cop0sel_tcbind */
     [MIPS_REG_COP0SEL_TCCONTEXT] = { .reg_id = REG_SYS },  /* cop0sel_tccontext */
     [MIPS_REG_COP0SEL_TCHALT] = { .reg_id = REG_SYS },  /* cop0sel_tchalt */

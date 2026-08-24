@@ -3443,6 +3443,36 @@ static void cap_aarch64_drop_implicit_read(qemu_plugin_insn_info *out,
     }
 }
 
+static void cap_aarch64_add_sysreg(qemu_plugin_insn_info *out,
+                                   unsigned sysreg, const char *name,
+                                   uint8_t access);
+
+/*
+ * Record the FPSR write as FPSR.
+ *
+ * Capstone's aarch64_reg enum has no AARCH64_REG_FPSR, so the write used
+ * to ride AARCH64_REG_FPCR: the same generic register either way, and
+ * for the dependency edge that was enough.  It is not enough for the
+ * VALUE.  A destination's content is read from the QEMU register the
+ * operand names, so an FPSR write named FPCR published the CONTROL
+ * word -- constant across a run that never writes it -- in place of the
+ * cumulative exception state the instruction had just changed.
+ * Measured on `fdiv s0, s1, s2`: the trace showed %fcsr = 0 while the
+ * guest's own `mrs x10, fpsr` two instructions later returned 0x10
+ * (IXC).
+ *
+ * The system-register operand carries what the register enum cannot:
+ * AARCH64_SYSREG_FPSR is a real encoding, cap_aarch64_sysreg_class()
+ * already maps it (with FPCR and FPMR) to QEMU_PLUGIN_SYSREG_FPCTRL, so
+ * the generic id is unchanged, and the name reaches QEMU's descriptor
+ * list.  Idempotent, like every other appended system register.
+ */
+static void cap_aarch64_add_fpsr_write(qemu_plugin_insn_info *out)
+{
+    cap_aarch64_add_sysreg(out, AARCH64_SYSREG_FPSR, "fpsr",
+                           QEMU_PLUGIN_OP_ACC_WRITE);
+}
+
 /*
  * Apply the FP status/control contract described above to one decoded
  * instruction: repair the FPCR reads Capstone reports inconsistently,
@@ -3471,7 +3501,7 @@ static void cap_aarch64_fp_status_contract(const cs_insn *insn,
          * on SQDMULH and not on SQADD, and neither reads it. */
         cap_aarch64_drop_implicit_read(out, AARCH64_REG_FPCR);
         if (fs.advsimd && !fs.sve && !fs.za) {
-            cap_aarch64_add_implicit_write(out, handle, AARCH64_REG_FPCR);
+            cap_aarch64_add_fpsr_write(out);
         }
         return;
     }
@@ -3508,7 +3538,7 @@ static void cap_aarch64_fp_status_contract(const cs_insn *insn,
         cap_aarch64_add_implicit_read(out, handle, AARCH64_REG_FPCR);
     }
     if (writes_fpsr) {
-        cap_aarch64_add_implicit_write(out, handle, AARCH64_REG_FPCR);
+        cap_aarch64_add_fpsr_write(out);
     }
 }
 

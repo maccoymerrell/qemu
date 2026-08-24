@@ -1702,6 +1702,14 @@ void altmint_conditional_alternate(const InsnFields *terminal,
                                    uint64_t fall_through,
                                    uint64_t followed_pc);
 
+/*
+ * Report a basic block refused because the boundary produced no decode
+ * for one of its instructions.  Defined in champsim_tracer_decode.cc,
+ * beside the unknown-mnemonic warning, so both losses reach the same
+ * sidecar log and the same stderr discipline (loud once, then quiet).
+ */
+void report_undecodable_block(uint64_t pc);
+
 /* Defined in champsim_tracer_decode.cc */
 void decode_detail_to_generic(uint64_t pc,
                               const qemu_plugin_insn_info *info,

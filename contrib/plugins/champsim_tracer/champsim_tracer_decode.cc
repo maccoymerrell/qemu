@@ -305,6 +305,44 @@ static void warn_unknown_instruction(uint64_t pc, const char *reason,
 }
 
 /*
+ * A whole basic block was refused because the boundary could not decode
+ * one of its instructions.  This is a strictly worse loss than an
+ * unknown mnemonic -- there the instruction is still traced, with
+ * opcode=GEN_OP_UNKNOWN and whatever registers the operands gave -- so
+ * it says so in its own words rather than borrowing that message.
+ */
+void report_undecodable_block(uint64_t pc)
+{
+    g_mutex_lock(&unknown_warn_lock);
+
+    static bool warned_once = false;
+    if (!warned_once) {
+        warned_once = true;
+        fprintf(stderr,
+                "champsim_tracer: no decode for the instruction at pc=0x%"
+                PRIx64 " — the WHOLE basic block containing it is refused "
+                "and does not appear in the trace.\n"
+                "  Further occurrences are silent; the exit summary counts "
+                "them under \"BBs refused, boundary could not decode\", "
+                "and %s lists each one.  On the correct path this is a "
+                "boundary decoder gap to close in disas/capstone.c, not a "
+                "property of the guest.\n",
+                pc,
+                unknown_warn_file ? "the .unknown_warnings.log file"
+                                  : "(no warn-log file open)");
+    }
+
+    if (unknown_warn_file) {
+        fprintf(unknown_warn_file,
+                "pc=0x%" PRIx64 " isa=%u reason=undecodable_block "
+                "mnemonic=<none> disas=\"\"\n",
+                pc, (unsigned int)trace_isa);
+        fflush(unknown_warn_file);
+    }
+    g_mutex_unlock(&unknown_warn_lock);
+}
+
+/*
  * Classify via direct insn_id array lookup (O(1)).  Returns the table
  * row (nullptr if out of range / no table) for the .refine callback.
  */

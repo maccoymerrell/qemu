@@ -10277,6 +10277,10 @@ static void marker_end_no_close_warn(unsigned int cpu_index, uint64_t pc,
 /* Outcome of the pre-commit instruction-memory stability check. */
 struct TbPoison {
     bool        poisoned = false;
+    /* The refusal cost the WHOLE block, so the cause is carried out to
+     * the consumer and counted there rather than left at the detection
+     * site: only the consumer knows the block was actually dropped. */
+    bool        decode_fail = false;
     uint64_t    pc = 0;
     const char *reason = nullptr;
 };
@@ -10407,6 +10411,7 @@ static TbPoison detect_tb_poison(uint64_t pc, const uint64_t *insn_pcs,
             if (!p.poisoned &&
                 cst_cap_arch >= 0 && !insn_info[ci].mnemonic[0]) {
                 p.poisoned = true;
+                p.decode_fail = true;
                 p.pc = ipc;
                 p.reason = "Capstone decode failure";
             }
@@ -10665,8 +10670,29 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     TbPoison poison = detect_tb_poison(pc, insn_pcs, insn_bytes, insn_info,
                                        canonical_n_insns);
     if (poison.poisoned) {
-        /* Do not create fragments, do not arm callbacks.  vcpu_tb_exec gets
-         * no udata for this TB; scratch is freed by TbScratch on return. */
+        /*
+         * Do not create fragments, do not arm callbacks.  vcpu_tb_exec gets
+         * no udata for this TB; scratch is freed by TbScratch on return.
+         *
+         * That refusal is WHOLE-BLOCK, and until this counter existed it
+         * was also silent: one undecodable instruction took every other
+         * instruction in the same TB out of the trace with it, and no
+         * warning, log line or statistic said a block had gone.  A guest
+         * function could run to completion and appear nowhere.  Report it
+         * -- the correct-path arm is an invariant that must read 0,
+         * because QEMU translating the TB already settled that the bytes
+         * ARE instructions of this ISA, so a boundary that cannot read
+         * them is a decoder gap to close (disas/capstone.c), not a fact
+         * about the guest.
+         */
+        if (poison.decode_fail) {
+            if (g_wp_in_progress) {
+                g_stats.tb_refused_decode_fail_wp++;
+            } else {
+                g_stats.tb_refused_decode_fail_cp++;
+                report_undecodable_block(poison.pc);
+            }
+        }
         return;
     }
 

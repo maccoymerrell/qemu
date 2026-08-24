@@ -1272,6 +1272,24 @@ struct Stats {
     /* Decode-side warning count. */
     uint64_t unknown_insn_warnings = 0;
 
+    /*
+     * Basic blocks REFUSED because the boundary could not decode one of
+     * their instructions (detect_tb_poison's "Capstone decode failure").
+     * The refusal is whole-block: a single undecodable byte sequence
+     * costs every instruction around it in the same TB, not just itself.
+     * Counted because it was previously invisible -- a guest function
+     * could execute in full and appear nowhere in the trace with nothing
+     * anywhere saying so, which is the one outcome the trace may not
+     * have.  The correct-path row is an invariant: on the correct path
+     * QEMU has already agreed these bytes are an instruction, so a
+     * refusal there is a decoder gap to close at the boundary (see
+     * cap_x86_gap_plan in disas/capstone.c), never a property of the
+     * guest.  The wrong-path row is a measurement, not an invariant: the
+     * wrong path deliberately walks into data.
+     */
+    uint64_t tb_refused_decode_fail_cp = 0;
+    uint64_t tb_refused_decode_fail_wp = 0;
+
     /* Guest-thread kernel-entry aliasing census (system mode; RULING 2/3's
      * primary anti-vacuity witness).  aliased: kernel task
      * values joined to the ENTERING thread's tid at a user->kernel

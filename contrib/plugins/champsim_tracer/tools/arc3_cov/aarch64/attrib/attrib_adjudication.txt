@@ -4,65 +4,29 @@ AARCH64 REGISTER ATTRIBUTION -- ADJUDICATED SUMMARY
 denominator          3920 opcode subjects (opcodes.tsv)
 probed               3920
 unprobed             0
-agree                3622
-disagree             298
+agree                3731
+disagree             189
 
 BY REFERENCE RANK
-  1:MRA        agree     3582
-  1:MRA        disagree  228
-  2:LLVM-MC    agree     40
-  2:LLVM-MC    disagree  70
+  1:MRA        agree     3697
+  1:MRA        disagree  113
+  2:LLVM-MC    agree     34
+  2:LLVM-MC    disagree  76
 
-ADJUDICATION OF THE 298 DISAGREEING ROWS
-     83  TRACER DEFECT -- OPEN
-     76  TRACER RIGHT -- REFERENCE DEFECT (CONSTRAINED UNPREDICTABLE)
-     51  REFERENCE GAP -- RANK 2 HAS NO FP STATUS MODEL
+ADJUDICATION OF THE 189 DISAGREEING ROWS
+     78  UNADJUDICATED
+     47  TRACER DEFECT -- OPEN
      42  TRACER RIGHT -- REFERENCE DEFECT (LIVENESS)
-     15  MIXED -- 10 RANK-2 GAP, 5 REFERENCE DEFECT
-     12  TRACER DEFECT -- OPEN (3 rows) / REFERENCE (9)
      10  MIXED -- 8 TRACER DEFECT, 2 SUBSUMED
+      5  MIXED -- 10 RANK-2 GAP, 5 REFERENCE DEFECT
       5  REFERENCE GAP -- NOT A TRACER DEFECT
-      3  NEEDS RULING -- DO NOT FIX UNILATERALLY
       1  REPRESENTATIVE ARTIFACT
+      1  TRACER RIGHT -- REFERENCE-SIDE (R7.1)
 
 SIGNATURES, LARGEST FIRST
 
-    76  SRC+ref:VEC#
-        verdict: TRACER RIGHT -- REFERENCE DEFECT (CONSTRAINED UNPREDICTABLE)
-        ldff1*/ldnf1* after a suppressed access. ldff1b_z_p_br.xml offers
-        three behaviours for the elements past the fault --
-        ConstrainUnpredictableBool(Unpredictable_SVELDNFDATA) keeps the
-        data, Unpredictable_SVELDNFZERO zeroes, and the final else MERGES
-        from `bits(VL) orig = Z[t, VL]`. The extractor answers FALSE to
-        every ConstrainUnpredictableBool, which lands on the merge arm and
-        makes the destination a source. That is an extractor default, not an
-        architectural requirement: QEMU picks the ZERO arm --
-        sve_ldnfff1_r() in target/arm/tcg/sve_helper.c, "After any fault,
-        zero the other elements", swap_memzero(vd, reg_off). R6/R7: the
-        tracer records the implementation it traces, so no Zt read. 76 rows.
-
-    51  DST+trc:FCSR SRC+trc:FCSR
-        verdict: REFERENCE GAP -- RANK 2 HAS NO FP STATUS MODEL
-        the post-2022-12 FP8 and FAMINMAX additions
-        (f1cvt/f2cvt/bf1cvt/bf2cvt families, famax/famin, fmlall*, fcvtnb,
-        fvdotb) and the SVE2 quadword reductions, probed against LLVM MC
-        because the 2022-12 MRA does not name them. LLVM MC models no FPSR
-        at all and reports FPCR on no FP instruction, so it cannot
-        adjudicate either half of the FP status/control contract. 51 rows,
-        all rank 2.
-
-    46  SRC+ref:ZERO
-        verdict: TRACER DEFECT -- OPEN
-        the encoded operand is xzr/wzr and the printed alias hides it (mov =
-        orr Rn=31, mul = madd Ra=31, neg = sub Rn=31, cset = csinc Rn=Rm=31,
-        and the pac*Z/aut*Z/ldraa modifier). The tracer names REG_ZERO
-        whenever Capstone prints it -- 33 rows do -- so this is the
-        ret-alias loss again, on the operand rather than the implicit list,
-        and it is an inconsistency in the tracer rather than a modelling
-        choice. Not fixed here: it needs the alias-to-base-form mapping
-        Capstone exposes only through cs_regs_access(), whose staleness
-        across decodes is already documented at AARCH64_INS_ALIAS_RET. 46
-        rows.
+    51  DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
+        verdict: UNADJUDICATED
 
     42  SRC+ref:FLAGS
         verdict: TRACER RIGHT -- REFERENCE DEFECT (LIVENESS)
@@ -77,12 +41,11 @@ SIGNATURES, LARGEST FIRST
         disagree. The extractor's liveness rule missed a local rebound on
         both arms of an if/else. 42 rows.
 
-    15  DST+trc:FCSR
-        verdict: MIXED -- 10 RANK-2 GAP, 5 REFERENCE DEFECT
-        famax/famin are rank-2 rows (see above). The five frecpe rows are
-        rank 1 and are a reference under-report: FPRecipEstimate is one of
-        the shared functions the extractor cannot parse, named in its own
-        LIMITATIONS, and FRECPE does raise IDC/IOC/DZC. 15 rows.
+    13  SRC+ref:FCSR
+        verdict: TRACER DEFECT -- OPEN
+        two fmov element forms (`fmov v2.d[1], x1`, `fmov x2, v1.d[1]`),
+        where the scalar-merge rule is scoped off by the arrangement
+        specifier the element syntax carries. 2 rows.
 
     12  DST+ref:SYS
         verdict: TRACER DEFECT -- OPEN
@@ -92,13 +55,6 @@ SIGNATURES, LARGEST FIRST
         Capstone models these as AARCH64_OP_SYSALIAS with no register at
         all, so naming the result needs an encoding->register table the
         boundary does not yet carry. 12 rows.
-
-    12  SRC+trc:FCSR
-        verdict: TRACER DEFECT -- OPEN (3 rows) / REFERENCE (9)
-        after the FP status/control contract landed, what remains is fmov
-        immediate forms (`fmov d2, #2.125`), where the tracer applies the
-        scalar-merge rule and the reference reports no read because the
-        immediate path never consults FPCR, and rank-2 rows. 12 rows.
 
     10  SRC+ref:SYS
         verdict: MIXED -- 8 TRACER DEFECT, 2 SUBSUMED
@@ -112,6 +68,12 @@ SIGNATURES, LARGEST FIRST
         that read on both sides -- a blind spot, recorded rather than
         scored. 10 rows.
 
+    10  DST+trc:FCSR SRC+trc:SYSFPEN
+        verdict: UNADJUDICATED
+
+     9  SRC+trc:FCSR SRC+trc:SYSFPEN
+        verdict: UNADJUDICATED
+
      8  SRC+trc:MATRIX
         verdict: TRACER DEFECT -- OPEN
         the SME2 ADD/SUB "array results" forms (add_za_zzv / add_za_zzw and
@@ -123,33 +85,23 @@ SIGNATURES, LARGEST FIRST
         collides (a 4x4 accumulate and a 2x2 results form both carry four Z
         registers), so this waits for ARC 3's QEMU-derived dataflow. 8 rows.
 
+     6  SRC+trc:SYSFPEN
+        verdict: UNADJUDICATED
+
+     5  DST+trc:FCSR
+        verdict: MIXED -- 10 RANK-2 GAP, 5 REFERENCE DEFECT
+        famax/famin are rank-2 rows (see above). The five frecpe rows are
+        rank 1 and are a reference under-report: FPRecipEstimate is one of
+        the shared functions the extractor cannot parse, named in its own
+        LIMITATIONS, and FRECPE does raise IDC/IOC/DZC. 15 rows.
+
      4  DST+ref:SYS SRC+ref:ZERO
         verdict: TRACER DEFECT -- OPEN
         the GCS push/pop forms: the sysalias result register (see
         DST+ref:SYS) plus the hidden xzr operand (see SRC+ref:ZERO). 4 rows.
 
-     3  DST+trc:ZERO
-        verdict: NEEDS RULING -- DO NOT FIX UNILATERALLY
-        a write to the zero register is architecturally discarded (AArch64
-        XZR/WZR, RISC-V x0, MIPS $zero all read as zero however they are
-        written), and the reference discards it -- mra_ref.to_sets() does
-        `dst.discard('ZERO')`. Recorded, it is a producer for a value no
-        consumer can receive, and every later reader of the zero register
-        waits on it. BUT the current behaviour is author-declared, not
-        accidental: the validator generates a block class literally named
-        probe_zero_reg whose expected_insns entry is `{"src":
-        ["REG_GPR5","REG_GPR6"], "dst": ["REG_ZERO"]}`, and dropping the
-        write turns that probe RED on riscv64 and mipsel. THE QUESTION FOR
-        THE MAINTAINER, in one sentence: should a write to the architectural
-        zero register be recorded as a destination, or discarded as the
-        architecture discards it -- and if discarded, does probe_zero_reg
-        change to assert the absence? 3 rows.
-
-     2  SRC+ref:FCSR
-        verdict: TRACER DEFECT -- OPEN
-        two fmov element forms (`fmov v2.d[1], x1`, `fmov x2, v1.d[1]`),
-        where the scalar-merge rule is scoped off by the arrangement
-        specifier the element syntax carries. 2 rows.
+     2  SRC+ref:SYSFPEN
+        verdict: UNADJUDICATED
 
      2  SRC+trc:GPR# SRC+trc:GPR#
         verdict: REFERENCE GAP -- NOT A TRACER DEFECT
@@ -212,10 +164,18 @@ SIGNATURES, LARGEST FIRST
         a field the alias requires to be 0b11111, so the reference reads an
         X register the real encoding does not have.
 
-     1  SRC+ref:MATRIX
-        verdict: TRACER DEFECT -- OPEN
-        movt zt0[8], x2 writes one slice of ZT0 and preserves the rest, so
-        the destination is also a source. 1 row.
+     1  SRC+ref:ZT0
+        verdict: TRACER RIGHT -- REFERENCE-SIDE (R7.1)
+        `movt zt0[8], x2` writes 64 bits of the 512-bit SME2 lookup-table
+        register, so the reference makes the destination a source to model
+        the preserve of the other 448. R7.1 settles exactly this shape: a
+        write narrower than the register does not acquire a source, because
+        rename does not know the data-width-scope of the next reader and
+        width is carried at execution rather than in the static set. A
+        register is a source when the INSTRUCTION takes it as one, and movt
+        does not. Surfaced only when ZT0 was split off REG_MATRIX: while it
+        shared an ID with the ZA array the read and the write cancelled into
+        one token and the row could not be seen. 1 row.
 
      1  SRC+trc:VEC#
         verdict: TRACER DEFECT -- OPEN
@@ -232,21 +192,22 @@ SIGNATURES, LARGEST FIRST
 TIER B -- architectural state outside the tracer's register space
 (execution-context PSTATE bits and the PC; excluded from the verdict
  above, counted here so nothing is hidden)
-  PSTATE.SM        1473 rows
-  PSTATE.EL        624 rows
-  IP               148 rows
+  PSTATE.EL        3422 rows
+  IP               2946 rows
+  PSTATE.SM        2779 rows
+  PSTATE.ZA        364 rows
   PSTATE.UAO       134 rows
   PSTATE.A         2 rows
 
 BY INSTRUCTION CLASS
-  (none)           4 rows  agree     0 (  0.0%)  disagree     4
+  (none)           4 rows  agree     4 (100.0%)  disagree     0
   advsimd        696 rows  agree   692 ( 99.4%)  disagree     4
-  float          218 rows  agree   213 ( 97.7%)  disagree     5
+  float          218 rows  agree   205 ( 94.0%)  disagree    13
   fpsimd          89 rows  agree    89 (100.0%)  disagree     0
-  general        921 rows  agree   827 ( 89.8%)  disagree    94
+  general        921 rows  agree   868 ( 94.2%)  disagree    53
   mortlach        54 rows  agree    54 (100.0%)  disagree     0
   mortlach2      501 rows  agree   492 ( 98.2%)  disagree     9
-  post-2022-12   106 rows  agree    40 ( 37.7%)  disagree    66
-  sve            788 rows  agree   709 ( 90.0%)  disagree    79
+  post-2022-12   106 rows  agree    34 ( 32.1%)  disagree    72
+  sve            788 rows  agree   785 ( 99.6%)  disagree     3
   sve2           459 rows  agree   453 ( 98.7%)  disagree     6
-  system          84 rows  agree    53 ( 63.1%)  disagree    31
+  system          84 rows  agree    55 ( 65.5%)  disagree    29

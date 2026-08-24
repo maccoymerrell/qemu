@@ -13,18 +13,23 @@ BASE = '/mnt/md0/QEMU/cst_runs/_arc3_cov/aarch64'
 # wrong answer.
 ADJ = {
  # ---------------------------------------------------------- open, tracer
- 'SRC+ref:VEC#': ('TRACER RIGHT -- REFERENCE DEFECT (CONSTRAINED UNPREDICTABLE)',
+ 'SRC+ref:VEC#': ('CLOSED -- REFERENCE FIXED (ruling A)',
     'ldff1*/ldnf1* after a suppressed access.  ldff1b_z_p_br.xml offers '
     'three behaviours for the elements past the fault -- '
     'ConstrainUnpredictableBool(Unpredictable_SVELDNFDATA) keeps the data, '
     'Unpredictable_SVELDNFZERO zeroes, and the final else MERGES from '
-    '`bits(VL) orig = Z[t, VL]`.  The extractor answers FALSE to every '
+    '`bits(VL) orig = Z[t, VL]`.  The extractor answered FALSE to every '
     'ConstrainUnpredictableBool, which lands on the merge arm and makes the '
-    'destination a source.  That is an extractor default, not an '
+    'destination a source.  That was an extractor default, not an '
     'architectural requirement: QEMU picks the ZERO arm -- sve_ldnfff1_r() '
     'in target/arm/tcg/sve_helper.c, "After any fault, zero the other '
-    'elements", swap_memzero(vd, reg_off).  R6/R7: the tracer records the '
-    'implementation it traces, so no Zt read.  76 rows.'),
+    'elements", swap_memzero(vd, reg_off).  Ruling A: a label does not move '
+    'a row, so the REFERENCE was corrected rather than annotated -- '
+    'aslinterp.UNPREDICTABLE_CHOICE resolves each CONSTRAINED UNPREDICTABLE '
+    'choice the way the traced implementation resolves it, with the '
+    'citation beside it, and answers no choice silently: an enum with no '
+    'entry is recorded as cu-unmodelled:<enum> in the subject notes.  These '
+    '76 rows AGREE.  76 rows at the start.'),
  'SRC+ref:ZERO': ('TRACER DEFECT -- OPEN',
     'the encoded operand is xzr/wzr and the printed alias hides it '
     '(mov = orr Rn=31, mul = madd Ra=31, neg = sub Rn=31, cset = csinc '

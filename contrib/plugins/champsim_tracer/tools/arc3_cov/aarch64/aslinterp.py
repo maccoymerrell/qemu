@@ -76,6 +76,14 @@ class Effects:
         self.unresolved = set()
         self.mem_r = 0
         self.mem_w = 0
+        # Allocation-tag memory (MTE) and Guarded-Control-Stack memory are
+        # real traffic, but they are not the instruction's DATA access and
+        # folding them into mem_r/mem_w made an atomic look like a 3-read
+        # instruction and made every BL look like a store.  Counted apart.
+        self.tag_r = 0
+        self.tag_w = 0
+        self.gcs_r = 0
+        self.gcs_w = 0
         self.reads = {}          # read_id -> (kind, idx)
         self._next = 0
     def add(self, rw, kind, idx=None):
@@ -114,7 +122,71 @@ IDX_ARG = {'X': 0, 'V': 0, 'Vpart': 0, 'Z': 0, 'P': 0, 'ZAvector': 0, 'ZAtile': 
            'B': 0, 'Q': 0, '_R': 0, '_Z': 0, '_P': 0}
 
 MEM_ACCESSORS = {'Mem', 'MemNF', 'MemAtomic', 'MemAtomicRCW', 'MemLoad64B',
-                 'MemStore64B', 'MemStore64BWithRet', 'MemSingle', 'AArch64.MemSingle'}
+                 'MemStore64B', 'MemStore64BWithRet', 'MemSingle', 'AArch64.MemSingle',
+                 # Bracket-form accessors the original set omitted.  Every one
+                 # of them bottoms out in PhysMem*Read / PhysMem*Write in the
+                 # shared ASL, so leaving them out made the reference blind to
+                 # a whole class of real memory traffic: MTE allocation-tag
+                 # accesses (LDG/STG/ST2G/STGM/LDGM/STZGM), the SVE
+                 # non-faulting single-element form, and the AArch32-shared
+                 # spellings.
+                 'MemSingleNF',
+                 'MemA', 'MemO', 'MemS', 'MemU', 'MemU_unpriv',
+                 'Mem_with_type', 'NVMem'}
+
+# Allocation-tag memory.  Separate from MEM_ACCESSORS because a tag access is
+# not the instruction's data access: the MTE tag-check path in MemAtomic and
+# MemStore64B* reads tags on a branch the interpreter cannot prove dead, which
+# scored every LSE atomic as a three-read instruction.
+TAG_ACCESSORS = {'MemTag', 'AArch64.MemTag'}
+
+# Memory accessors spelled as CALLS rather than as bracket accesses.
+#
+# access() is the only site that counted memory, and it only ever sees
+# `Foo[...]`.  `MemAtomic(...)`, `MemLoad64B(...)`, `GCSPOPM()` and the DC ZVA
+# block-zero helpers are ordinary ASL function calls, so the whole LSE atomic
+# family, the LS64 family, the Guarded Control Stack and DC ZVA were scored as
+# performing NO memory access at all.
+#
+# Each entry is (reads, writes) read off the function's own body in the MRA
+# shared pseudocode; the count is applied only if inlining the body did not
+# already account for the access, so a resolved body always wins over the
+# table and nothing is counted twice.
+# (reads, writes, channel).  Channel 'd' is the instruction's data access,
+# 't' allocation-tag memory, 'g' the Guarded Control Stack -- see the counter
+# comment on the effect record for why the three do not share a total.
+MEM_CALLS = {
+    'MemAtomic':           (1, 1, 'd'),  # PhysMemRead + PhysMemWrite, one RMW
+    'MemAtomicRCW':        (1, 1, 'd'),
+    'MemLoad64B':          (1, 0, 'd'),  # LS64: one 64-byte read
+    'MemStore64B':         (0, 1, 'd'),
+    'MemStore64BWithRet':  (0, 1, 'd'),
+    'AArch64.MemZero':     (0, 1, 'd'),  # DC ZVA block
+    'AArch64.DataMemZero': (0, 1, 'd'),
+    'AArch64.TagMemZero':  (0, 1, 't'),
+    # Guarded Control Stack.  GCSPUSHM -> AddGCSRecord -> one Mem[] store;
+    # the Ex forms push/check a four-doubleword record.  Every one of these
+    # sits behind `if GCSEnabled(PSTATE.EL)`, so the count is what the
+    # instruction does WHEN GCS IS ENABLED, never unconditional -- which is
+    # why it may not be added to the data total.
+    'GCSPUSHM':            (0, 1, 'g'),
+    'GCSPOPM':             (1, 0, 'g'),
+    'GCSPUSHX':            (0, 4, 'g'),
+    'GCSPOPX':             (4, 0, 'g'),
+    'GCSPOPCX':            (4, 0, 'g'),
+    'GCSSS1':              (0, 1, 'g'),
+    'GCSSS2':              (1, 1, 'g'),
+    'AddGCSRecord':        (0, 1, 'g'),
+    'AddGCSExRecord':      (0, 4, 'g'),
+    'LoadCheckGCSRecord':  (1, 0, 'g'),
+    'CheckGCSExRecord':    (4, 0, 'g'),
+    # The leaves.  Present so that a body that DOES resolve is counted at
+    # the architecture's own bottom edge rather than at a wrapper.
+    'PhysMemRead':         (1, 0, 'd'),
+    'PhysMemWrite':        (0, 1, 'd'),
+    'PhysMemTagRead':      (1, 0, 't'),
+    'PhysMemTagWrite':     (0, 1, 't'),
+}
 
 SYSREG_RE = re.compile(r'^[A-Z][A-Z0-9]*(_[A-Z0-9]+)*$')
 
@@ -714,13 +786,20 @@ class Interp:
             for a in args:
                 self.eval(a, env)
             return UNK
-        if name in MEM_ACCESSORS:
+        if name in MEM_ACCESSORS or name in TAG_ACCESSORS:
             for a in args:
                 self.eval(a, env)
+            tag = name in TAG_ACCESSORS
             if rw == 'r':
-                self.ef.mem_r += 1
+                if tag:
+                    self.ef.tag_r += 1
+                else:
+                    self.ef.mem_r += 1
             else:
-                self.ef.mem_w += 1
+                if tag:
+                    self.ef.tag_w += 1
+                else:
+                    self.ef.mem_w += 1
             return UNK
         if name in REG_ACCESSORS:
             kind = REG_ACCESSORS[name]
@@ -775,12 +854,44 @@ class Interp:
 
     # -------------------------------------------------- calls
     def call(self, e, env, bracket=False):
+        """Count call-spelled memory accessors, then dispatch normally.
+
+        The table is a FALLBACK, never an override: the body is given its
+        chance first, and its counts are kept if it produced any.  A wrapper
+        whose body resolved to PhysMemWrite is therefore counted once, at the
+        leaf, and a wrapper whose body was cut short is counted once, from the
+        table -- but never both.
+        """
+        name = e[1]
+        if name is None or name not in MEM_CALLS:
+            return self._call_inner(e, env, bracket)
+        ef = self.ef
+        before = (ef.mem_r, ef.mem_w, ef.tag_r, ef.tag_w, ef.gcs_r, ef.gcs_w)
+        r = self._call_inner(e, env, bracket)
+        if (ef.mem_r, ef.mem_w, ef.tag_r, ef.tag_w,
+                ef.gcs_r, ef.gcs_w) == before:
+            dr, dw, chan = MEM_CALLS[name]
+            if chan == 'd':
+                ef.mem_r += dr
+                ef.mem_w += dw
+            elif chan == 't':
+                ef.tag_r += dr
+                ef.tag_w += dw
+            else:
+                ef.gcs_r += dr
+                ef.gcs_w += dw
+            self.notes.add('mem-call-table:' + name)
+        return r
+
+    def _call_inner(self, e, env, bracket=False):
         name, args = e[1], e[2]
         if name is None:
             self.eval(e[3], env)
             for a in args:
                 self.eval(a, env)
             return UNK
+        if name == 'ConstrainUnpredictableBool':
+            return self.constrain_unpredictable(args, env)
         vals = [self.eval(a, env) for a in args]
         b = _dispatch_feature(name)
         if b is not None:
@@ -825,6 +936,23 @@ class Interp:
                         return UNK
                 return first
         return UNK
+
+    def constrain_unpredictable(self, args, env):
+        """Which permitted behaviour the traced implementation takes.
+
+        The argument is an `Unpredictable_*` enumeration constant, so it is
+        read off the AST rather than evaluated: evaluating it yields UNK and
+        UNK cannot select an arm -- both would run and their effects union,
+        which is precisely how the merge arm's destination read leaked in.
+        """
+        nm = args[0][1] if args and args[0][0] == 'var' else None
+        for a in args:
+            if a[0] != 'var':
+                self.eval(a, env)
+        if nm in UNPREDICTABLE_CHOICE:
+            return UNPREDICTABLE_CHOICE[nm]
+        self.notes.add('cu-unmodelled:' + (nm or '?'))
+        return False
 
     def lookup(self, name, nargs):
         for key in ((name, nargs, 'func'), (name, nargs, 'get'), (name, nargs, 'set')):
@@ -990,6 +1118,41 @@ def _b_currentvl(ip, v, env):
 
 def _b_false(ip, v, env):
     return False
+
+
+# ConstrainUnpredictableBool asks the IMPLEMENTATION which of several
+# architecturally-permitted behaviours it takes.  Answering FALSE to every
+# call is not a neutral default: it selects whichever arm the pseudocode
+# happens to write last, and for the SVE first-fault and non-fault loads
+# that arm MERGES the destination -- `Elem[result, e, esize] = Elem[orig, e,
+# esize]` off `bits(VL) orig = Z[t, VL]` -- which invents a source read the
+# traced implementation never performs.
+#
+# R6/R7: this reference models the implementation the tracer traces, so each
+# CONSTRAINED UNPREDICTABLE choice is resolved the way QEMU resolves it and
+# the resolution carries its citation.  A choice with no entry here is NOT
+# silently answered: it is answered FALSE and recorded as
+# `cu-unmodelled:<enum>` in the subject's notes, so the blind spot is
+# visible in the sweep census rather than assumed away.
+UNPREDICTABLE_CHOICE = {
+    # target/arm/tcg/sve_helper.c, sve_ldnfff1_r():
+    #   /* After any fault, zero the other elements. */
+    #   swap_memzero(vd, reg_off);
+    #   swap_memzero(vd + reg_off, reg_max - reg_off);
+    # QEMU takes the ZERO arm unconditionally.  It never keeps the loaded
+    # data (SVELDNFDATA) and it never merges the old destination contents,
+    # so LDFF1*/LDNF1* have no Zt source.
+    'Unpredictable_SVELDNFDATA': False,
+    'Unpredictable_SVELDNFZERO': True,
+}
+# The two choices no entry reaches, and the size of that blind spot, measured
+# rather than assumed: over the 3,920 subjects the sweep records
+# cu-unmodelled:Unpredictable_STOREONLYTAGCHECKEDCAS on 308 and
+# cu-unmodelled:Unpredictable_WFxTDEBUG on 2.  Answering BOTH of them TRUE
+# instead of FALSE moves the source or destination set of ZERO subjects
+# (/mnt/md0/QEMU/cst_runs/p3/arc3/a64zero/cuprobe), so the default is inert
+# here -- which is a measurement about this table, not a licence to leave the
+# next unmodelled choice unchecked.
 
 def _b_true(ip, v, env):
     return True

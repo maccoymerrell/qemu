@@ -4216,6 +4216,83 @@ static void cap_aarch64_add_fp_enable_gate(const cs_insn *insn,
     }
 }
 
+/* Xn as a Capstone register id.  X29 and X30 are spelled FP and LR. */
+static unsigned cap_aarch64_xreg(unsigned n)
+{
+    if (n == 29) {
+        return AARCH64_REG_FP;
+    }
+    if (n == 30) {
+        return AARCH64_REG_LR;
+    }
+    if (n == 31) {
+        return AARCH64_REG_XZR;
+    }
+    return AARCH64_REG_X0 + n;
+}
+
+/*
+ * LS64 -- the single-copy atomic 64-BYTE load and store.
+ *
+ * LD64B returns 512 bits into EIGHT consecutive X registers, Xt..Xt+7,
+ * and ST64B / ST64BV / ST64BV0 send a 512-bit payload held in the same
+ * eight.  Capstone reports one:
+ *
+ *   cstool -d aarch64 22d03ff8   ld64b x2, [x1]
+ *     operands[0] x2 WRITE ... "Registers modified: x2"
+ *
+ * so seven eighths of the dataflow of the widest data-moving
+ * instruction in the ISA was missing -- a consumer of x5 after an
+ * `ld64b x2, [x1]` read a register no instruction in the trace wrote.
+ * The register list is a property of the ENCODING, not of Capstone's
+ * view of it: ld64b.xml names X[t+i] for i = 0 to 7 and the encoding
+ * constrains Xt to be even, so the seven companions follow from Rt with
+ * nothing to infer.
+ *
+ * A modelling gap rather than a bug -- Capstone's operand ABI has one
+ * register per operand -- so no revision test.
+ */
+static void cap_aarch64_ls64_contract(const cs_insn *insn, csh handle,
+                                      qemu_plugin_insn_info *out)
+{
+    uint32_t w;
+    unsigned rt;
+    bool load;
+
+    switch (insn->id) {
+    case AARCH64_INS_LD64B:
+        load = true;
+        break;
+    case AARCH64_INS_ST64B:
+    case AARCH64_INS_ST64BV:
+    case AARCH64_INS_ST64BV0:
+        load = false;
+        break;
+    default:
+        return;
+    }
+    if (insn->size != 4) {
+        return;
+    }
+    w = ldl_le_p(insn->bytes);
+    rt = w & 0x1Fu;                    /* the payload base, always Rt */
+    if (rt & 1u) {
+        return;                        /* not an architectural encoding */
+    }
+    for (unsigned i = 1; i < 8; i++) {
+        if (rt + i > 30) {
+            break;
+        }
+        if (load) {
+            cap_aarch64_add_implicit_write(out, handle,
+                                           cap_aarch64_xreg(rt + i));
+        } else {
+            cap_aarch64_add_implicit_read(out, handle,
+                                          cap_aarch64_xreg(rt + i));
+        }
+    }
+}
+
 /*
  * System registers an AArch64 encoding IMPLIES but never prints.
  *
@@ -4283,6 +4360,13 @@ static void cap_aarch64_implicit_sysregs(const cs_insn *insn,
     case AARCH64_INS_STZGM:
         cap_aarch64_add_sysreg(out, AARCH64_SYSREG_DCZID_EL0, "dczid_el0",
                                rd);
+        break;
+    case AARCH64_INS_ST64BV0:
+        /* st64bv0.xml: the value in ACCDATA_EL1 replaces bits<31:0> of
+         * the first register of the 512-bit payload, so the register is
+         * part of the data the instruction sends. */
+        cap_aarch64_add_sysreg(out, AARCH64_SYSREG_ACCDATA_EL1,
+                               "accdata_el1", rd);
         break;
     case AARCH64_INS_ERET:
     case AARCH64_INS_ERETAA:
@@ -4454,13 +4538,13 @@ static void cap_aarch64_sysinstr_contract(csh handle, const cs_insn *insn,
     for (uint8_t i = 0; i < out->n_operands; i++) {
         qemu_plugin_operand *op = &out->operands[i];
         if (op->type == QEMU_PLUGIN_OP_REG
-            && (op->reg_id == AARCH64_REG_X0 + rt
+            && (op->reg_id == cap_aarch64_xreg(rt)
                 || op->reg_id == AARCH64_REG_W0 + rt)) {
             op->access = QEMU_PLUGIN_OP_ACC_WRITE;
         }
     }
     for (uint8_t i = 0; i < out->n_regs_read; i++) {
-        if (out->regs_read_id[i] == AARCH64_REG_X0 + rt) {
+        if (out->regs_read_id[i] == cap_aarch64_xreg(rt)) {
             for (uint8_t j = i; j + 1 < out->n_regs_read; j++) {
                 out->regs_read_id[j] = out->regs_read_id[j + 1];
                 memcpy(out->regs_read[j], out->regs_read[j + 1],
@@ -4479,7 +4563,7 @@ static void cap_aarch64_sysinstr_contract(csh handle, const cs_insn *insn,
  * discriminator is the immediate, read off the encoding (CRm:op2) rather
  * than off the alias id.
  */
-static void cap_aarch64_hint_contract(const cs_insn *insn,
+static void cap_aarch64_hint_contract(csh handle, const cs_insn *insn,
                                       qemu_plugin_insn_info *out)
 {
     uint32_t w;
@@ -4497,6 +4581,17 @@ static void cap_aarch64_hint_contract(const cs_insn *insn,
     if (imm == 16) {                       /* ESB */
         cap_aarch64_add_sysreg(out, AARCH64_SYSREG_DISR_EL1, "disr_el1",
                                QEMU_PLUGIN_OP_ACC_WRITE);
+    } else if (imm == 40) {                /* CHKFEAT, `chkfeat x16` */
+        /*
+         * hint.xml: CRm:op2 == '0101 000' is SystemHintOp_CHKFEAT, whose
+         * execute ASL is `X[16, 64] = AArch64.ChkFeat(X[16, 64])`.  The
+         * register is nowhere in the printed operand list -- Capstone
+         * reports `hint #0x28` with a single IMM operand -- so the
+         * instruction that exists to hand software a feature mask in x16
+         * depended on nothing and produced nothing.
+         */
+        cap_aarch64_add_implicit_read(out, handle, AARCH64_REG_X16);
+        cap_aarch64_add_implicit_write(out, handle, AARCH64_REG_X16);
     }
 }
 
@@ -5242,10 +5337,34 @@ static void cap_fill_arm64_operands(csh handle, unsigned int cap_mode,
              * they become reachable.  The access flags Capstone attaches to
              * the PRED operand are correct and are forwarded verbatim.
              *
-             * SME's second predicate field, pred.vec_select, has no second
-             * register slot in the plugin operand and is not represented.
-             * That is an SME-only gap, recorded in docs/limitations.rst.
+             * pred.vec_select is the SECOND register some predicate
+             * operands carry, and it means two different things.  On
+             * PSEL it is the W register the slice index comes from --
+             * `cstool -d aarch64 c154ac25` reports
+             * "operands[2].pred.vec_select: w12" and lists w12 under
+             * "Registers read", so the register is decoded and only this
+             * arm dropped it.  Without it, `psel p1, p5, p6.b[w12, 9]`
+             * depends on no general-purpose register at all and the
+             * loop-control idiom the instruction exists for is severed
+             * from the counter that drives it.
+             *
+             * On the predicate-PAIR forms the same field holds the
+             * second predicate of the pair, which is a DESTINATION:
+             * `whilegt { p14.b, p15.b }, x0, x0` parks p14 there and
+             * writes both.  Taking it as a read there would invent a
+             * dependency on a register the instruction only produces --
+             * measured, on 16,384 whilegt/whilehi/whilele/whilels
+             * encodings and 56 pext, before the W-register test below
+             * was added.  The plugin operand ABI has one register field
+             * per operand, so the slice index reaches the model the way
+             * the SME slice register does a few cases up: as an implicit
+             * read, and only when it is what PSEL puts there.
              */
+            if (cop->pred.vec_select >= AARCH64_REG_W0
+                && cop->pred.vec_select <= AARCH64_REG_W30) {
+                cap_aarch64_add_implicit_read(out, handle,
+                                              cop->pred.vec_select);
+            }
             op->type = QEMU_PLUGIN_OP_REG;
             cap_copy_reg_name(op->reg_name,
                               QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
@@ -5556,8 +5675,9 @@ static void cap_fill_arm64_operands(csh handle, unsigned int cap_mode,
     cap_aarch64_add_fp_enable_gate(insn, a64, n, out);
     cap_aarch64_msr_imm_contract(insn, out);
     cap_aarch64_implicit_sysregs(insn, out);
-    cap_aarch64_hint_contract(insn, out);
+    cap_aarch64_hint_contract(handle, insn, out);
     cap_aarch64_sysinstr_contract(handle, insn, out);
+    cap_aarch64_ls64_contract(insn, handle, out);
 
     /*
      * Capstone 6.0.0-Alpha7 implicit-read gap: CTERMEQ / CTERMNE.

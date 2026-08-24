@@ -1,5 +1,5 @@
 ==============================================================================
-TWO-AXIS CLASSIFICATION OF THE 123 DISAGREEING ROWS
+TWO-AXIS CLASSIFICATION OF THE 108 DISAGREEING ROWS
 ==============================================================================
 
   TRACER-SUPERSET  OK      we record something the reference omits
@@ -11,29 +11,23 @@ CROSS-TABULATION  direction x category
 
 CATEGORY (mechanism)        TRACER-SUPERSET  TRACER-SUBSET  ORTHOGONAL  UNACCOUNTED    total
 --------------------------------------------------------------------------------------------
-tracer-defect                            10              7           0            0       17
-reference-defect                          0              1           0            0        1
+tracer-defect                            10              0           0            0       10
+reference-defect                          0              2           0            0        2
 reference-gap                            95              0           0            0       95
-unaccounted                               0              0           0           10       10
+representative-artifact                   0              1           0            0        1
 --------------------------------------------------------------------------------------------
-TOTAL                                   105              8           0           10      123
+TOTAL                                   105              3           0            0      108
 
-  the number that matters: TRACER-SUBSET + UNACCOUNTED = 18
+  the number that matters: TRACER-SUBSET + UNACCOUNTED = 3
   (rows where we drop information, or do not know why we differ)
 
 ADJUDICATION CONFLICTS: none
 
-UNACCOUNTED -- 10 rows, 1 distinct mnemonics
-
-  by class (category / measured set relation)
-        10  unaccounted / TRACER-SUBSET
-
-  by mnemonic
-        10  fmov                     TRACER-SUBSET  SRC+ref:FCSR
+UNACCOUNTED ROWS: none
 
 LABELS WITH NO RULE  (an adjudication the taxonomy does not
 map is not an explanation; its rows are UNACCOUNTED above)
-      10  SRC+ref:FCSR
+  (none)
 
 STATED-COUNT CHECK  (an adjudication that says "N rows." is checked against
 the measurement; a mismatch is a finding, not a rounding)
@@ -44,7 +38,7 @@ the deliverable and this harness measures none of it: the reference carries
 mem_r / mem_w per subject and the comparison never reads them.  Reported as
 a hole, not implied to be covered by the register numbers.
 
-TOTALS {'agree': 3797, 'agree_with_tierB_refonly': 3389, 'disagree': 123}
+TOTALS {'agree': 3812, 'agree_with_tierB_refonly': 3404, 'disagree': 108}
 
 DISAGREEMENT SIGNATURES (largest first)
     51  DST+trc:FCSR SRC+trc:FCSR SRC+trc:SYSFPEN
@@ -56,15 +50,6 @@ DISAGREEMENT SIGNATURES (largest first)
         eg LLVM_MC:BF1CVT_2 | bf1cvt { z2.h, z3.h }, z1.b | ref S{VEC1} D{VEC2,VEC3} | trc S{FCSR,SYSFPEN,VEC1} D{FCSR,VEC2,VEC3}
         eg LLVM_MC:BF2CVTL2_1 | bf2cvtl2 v2.8h, v1.16b | ref S{VEC1} D{VEC2} | trc S{FCSR,SYSFPEN,VEC1} D{FCSR,VEC2}
         eg LLVM_MC:BF2CVTLT_1 | bf2cvtlt z2.h, z1.b | ref S{VEC1} D{VEC2} | trc S{FCSR,SYSFPEN,VEC1} D{FCSR,VEC2}
-    10  SRC+ref:FCSR
-        eg FMOV_32H_float2int | fmov w2, h1 | ref S{FCSR,SYSFPEN,VEC1} D{GPR2} | trc S{SYSFPEN,VEC1} D{GPR2}
-        eg FMOV_32S_float2int | fmov w2, s1 | ref S{FCSR,SYSFPEN,VEC1} D{GPR2} | trc S{SYSFPEN,VEC1} D{GPR2}
-        eg FMOV_64D_float2int | fmov x2, d1 | ref S{FCSR,SYSFPEN,VEC1} D{GPR2} | trc S{SYSFPEN,VEC1} D{GPR2}
-        eg FMOV_64H_float2int | fmov x2, h1 | ref S{FCSR,SYSFPEN,VEC1} D{GPR2} | trc S{SYSFPEN,VEC1} D{GPR2}
-        eg FMOV_64VX_float2int | fmov x2, v1.d[1] | ref S{FCSR,SYSFPEN,VEC1} D{GPR2} | trc S{SYSFPEN,VEC1} D{GPR2}
-        eg FMOV_D64_float2int | fmov d2, x1 | ref S{FCSR,GPR1,SYSFPEN} D{VEC2} | trc S{GPR1,SYSFPEN} D{VEC2}
-        eg FMOV_H32_float2int | fmov h2, w1 | ref S{FCSR,GPR1,SYSFPEN} D{VEC2} | trc S{GPR1,SYSFPEN} D{VEC2}
-        eg FMOV_H64_float2int | fmov h2, x1 | ref S{FCSR,GPR1,SYSFPEN} D{VEC2} | trc S{GPR1,SYSFPEN} D{VEC2}
     10  DST+trc:FCSR SRC+trc:SYSFPEN
         eg LLVM_MC:FAMAX_1 | famax v2.2d, v1.2d, v0.2d | ref S{FCSR,VEC0,VEC1} D{VEC2} | trc S{FCSR,SYSFPEN,VEC0,VEC1} D{FCSR,VEC2}
         eg LLVM_MC:FAMAX_2 | famax v2.2s, v1.2s, v0.2s | ref S{FCSR,VEC0,VEC1} D{VEC2} | trc S{FCSR,SYSFPEN,VEC0,VEC1} D{FCSR,VEC2}
@@ -120,13 +105,8 @@ DISAGREEMENT SIGNATURES (largest first)
      2  SRC+trc:GPR# SRC+trc:GPR#
         eg SYSP_CR_syspairinstrs | sysp #4, c0, c5, #5, x12, x13 | ref S{-} D{-} | trc S{GPR12,GPR13} D{-}
         eg TLBIP_SYSP_CR_syspairinstrs | tlbip vale2is, x24, x25 | ref S{-} D{-} | trc S{GPR24,GPR25} D{-}
-     2  SRC+ref:GPR#
-        eg TLBI_SYS_CR_systeminstrs | tlbi vmalle1is | ref S{GPR28} D{SYS} | trc S{-} D{SYS}
-        eg psel_p_ppi_ | psel p1, p5, p6.b[w12, 9] | ref S{GPR12,PRED5,PRED6,SYSFPEN} D{PRED1} | trc S{PRED5,PRED6,SYSFPEN} D{PRED1}
      1  DST+ref:GPR# DST+ref:SYS SRC+ref:GPR#
         eg HINT_HM_hints | hint #35 | ref S{GPR16} D{GPR16,SYS} | trc S{-} D{-}
-     1  DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR#
-        eg LD64B_64L_memop | ld64b x2, [x1] | ref S{GPR1} D{GPR2,GPR3,GPR4,GPR5,GPR6,GPR7,GPR8,GPR9} | trc S{GPR1} D{GPR2}
      1  DST+trc:GPR#
         eg LDG_64Loffset_ldsttags | ldg x3, [x2, #16] | ref S{GPR2,GPR3} D{GPR3} | trc S{GPR2,GPR3} D{GPR2,GPR3}
      1  DST+trc:GPR# DST+trc:GPR# SRC+trc:SYS
@@ -135,22 +115,18 @@ DISAGREEMENT SIGNATURES (largest first)
         eg MSRR_SR_systemmovepr | msrr S3_2_C3_C4_5, x6, x7 | ref S{-} D{-} | trc S{GPR6,GPR7} D{SYS}
      1  DST+trc:SYS SRC+trc:ZERO
         eg MSR_SI_pstate | msr S0_1_C4_C2_3, xzr | ref S{-} D{-} | trc S{ZERO} D{SYS}
-     1  SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:SYS
-        eg ST64BV0_64_memop | st64bv0 x3, x2, [x15] | ref S{GPR15,GPR2,GPR3,GPR4,GPR5,GPR6,GPR7,GPR8,GPR9,SYS} D{GPR3} | trc S{GPR15,GPR2} D{GPR3}
-     1  SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR#
-        eg ST64BV_64_memop | st64bv x9, x10, [x15] | ref S{GPR10,GPR11,GPR12,GPR13,GPR14,GPR15,GPR16,GPR17} D{GPR9} | trc S{GPR10,GPR15} D{GPR9}
-     1  SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR#
-        eg ST64B_64L_memop | st64b x2, [x1] | ref S{GPR1,GPR2,GPR3,GPR4,GPR5,GPR6,GPR7,GPR8,GPR9} D{-} | trc S{GPR1,GPR2} D{-}
+     1  SRC+ref:GPR#
+        eg TLBI_SYS_CR_systeminstrs | tlbi vmalle1is | ref S{GPR28} D{SYS} | trc S{-} D{SYS}
      1  SRC+ref:ZT0
         eg movt_zt_r_ | movt zt0[8], x2 | ref S{GPR2,SYSFPEN,VCTRL,ZT0} D{ZT0} | trc S{GPR2,SYSFPEN,VCTRL} D{ZT0}
      1  SRC+trc:VEC#
         eg pmov_z_pi_b | pmov z2, p1.b | ref S{PRED1,SYSFPEN} D{VEC2} | trc S{PRED1,SYSFPEN,VEC2} D{VEC2}
 
 REFERENCE CROSS-CHECK rank1(MRA) vs rank2(LLVM MC): same=885 differ=2925
-  1857  SRC+ref:SYSFPEN
+  1867  SRC+ref:SYSFPEN
    474  DST+ref:FCSR SRC+ref:SYSFPEN
    240  DST+ref:FCSR SRC+ref:FCSR SRC+ref:SYSFPEN
-   133  SRC+ref:FCSR SRC+ref:SYSFPEN
+   123  SRC+ref:FCSR SRC+ref:SYSFPEN
     64  DST+trc:ZERO
     50  SRC+ref:SYSFPEN SRC+trc:ZERO
     26  SRC+ref:SYSFPEN SRC+trc:MATRIX

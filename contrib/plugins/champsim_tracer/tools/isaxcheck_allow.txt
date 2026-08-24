@@ -307,7 +307,6 @@ aarch64 M-cs-mem-llvm-none adr
 aarch64 R-wr-missing while* +p#
 aarch64 R-wr-missing p*ext* +p#
 aarch64 R-wr-missing pext +p#
-aarch64 R-rd-missing psel +r#
 
 # RISC-V CSR operands.  Capstone types the CSR-number operand as one the
 # boundary cannot map to a register, so a CSR access shows no CSR
@@ -636,11 +635,6 @@ aarch64 M-miss-store prfb
 aarch64 M-miss-store prfd
 aarch64 M-miss-store prfh
 aarch64 M-miss-store prfw
-aarch64 R-rd-missing psel +r#
-aarch64 R-rd-missing st64b +r#
-aarch64 R-rd-missing st64bv0 +r#
-aarch64 R-rd-missing st64bv +r#
-aarch64 R-wr-missing ld64b +r#
 aarch64 R-wr-missing pext +p#
 aarch64 R-wr-missing whilegt +p#
 aarch64 R-wr-missing whilehi +p#
@@ -7882,6 +7876,10 @@ aarch64 R-rd-phantom ldgm +sysid
 aarch64 R-rd-phantom stgm +sysid
 aarch64 R-rd-phantom stzgm +sysid
 aarch64 R-rd-phantom subg +sys
+# st64bv0.xml: the value in ACCDATA_EL1 replaces bits<31:0> of the first
+# register of the 512-bit payload, so the system register is part of the
+# data the instruction sends.  LLVM MC does not model it.
+aarch64 R-rd-phantom st64bv0 +sys
 aarch64 R-rd-phantom sys +ssp
 aarch64 R-rd-phantom sysl +ssp
 aarch64 R-rd-phantom sysl +sys

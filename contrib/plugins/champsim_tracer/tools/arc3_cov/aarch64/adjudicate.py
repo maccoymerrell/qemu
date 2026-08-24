@@ -153,36 +153,53 @@ ADJ = {
     'hidden xzr operand, both closed with the SYS/SYSL contract -- Rt '
     '== 31 on a SYS-format encoding is the zero register the execute '
     'ASL reads, not an absent operand. 4 rows at the start.'),
- 'SRC+ref:FCSR': ('TRACER RIGHT -- REFERENCE OVER-READS (LIVENESS, OPEN)',
-    'the FMOV integer-to-FP and FP-to-integer moves (fmov w2, s1 and '
-    'its nine siblings), no longer the two element forms the earlier '
-    'count named. fmov_float_gen.xml does FPCRType fpcr = FPCR[]; '
-    'boolean merge = IsMerging(fpcr); unconditionally, but merge '
-    'reaches no result on the MOV forms: integer fsize = if op == '
-    'FPConvOp_CVT_ItoF && merge then 128 else fltsize short-circuits '
-    'on the op test, and neither the MOV_FtoI nor the MOV_ItoF arm of '
-    'the case mentions merge. So FPCR is read into a value nothing '
-    'consumes, and the tracer is right to name no FPCR source -- the '
-    'same shape the liveness fix already closed for fmov d0, d1, '
-    'where the && short-circuits BEFORE the call and the read never '
-    'happens. WHAT IS MISSING, exactly: the value-flow tracker '
-    'consumes a read at the CALL SITE, when the argument is '
-    'evaluated, instead of letting it flow through the callee return '
-    'value; a pure inlined function argument read reaches a result '
-    'only if the result does. MEASUREMENT that sizes it: 10 rows, all '
-    'rank 1, every one an FMOV_*_float2int, and the change is '
-    'confined to argument evaluation in _call_inner. 10 rows.'),
+ 'SRC+ref:FCSR': ('CLOSED -- REFERENCE FIXED (ruling A)',
+    'the FMOV integer-to-FP and FP-to-integer moves. '
+    'fmov_float_gen.xml calls IsMerging(fpcr) unconditionally, but '
+    'its answer reaches no result on the MOV forms: integer fsize = '
+    'if op == FPConvOp_CVT_ItoF && merge then 128 else fltsize '
+    'short-circuits on the op test, and neither the MOV_FtoI nor the '
+    'MOV_ItoF arm of the case mentions merge. The reference consumed '
+    'the FPCR read at the CALL SITE, when the argument was evaluated, '
+    'so the read survived a result nobody looked at. A pure '
+    'function\'s argument reaches an architectural result only if the '
+    'function\'s result does, and purity is now measured -- the '
+    'callee\'s writes are compared before and after the inline -- '
+    'rather than assumed from the name. Two holes had to be closed '
+    'with it, both found by measurement: a call whose answer is bound '
+    'to nothing (an if condition, a loop bound) has no container for '
+    'the reads to travel in and must consume, or CBZ stops depending '
+    'on Xt and 552 SVE subjects lose their governing predicate; and a '
+    'slice\'s BOUNDS are read even though the slice is written, or '
+    'GMI stops depending on the address it computes the tag from. '
+    'Whole-table, the delta is these 10 rows and nothing else: no '
+    'subject gained a read and no destination moved. 10 rows at the '
+    'start.'),
  'SRC+ref:MATRIX': ('CLOSED -- TRACER FIXED',
     'movt zt0[8], x2. Superseded by SRC+ref:ZT0 once ZT0 was split '
     'off REG_MATRIX; the surviving row is adjudicated there under '
     'R7.1. 1 row at the start.'),
- 'SRC+ref:GPR#': ('TRACER DEFECT -- OPEN',
-    'psel takes its slice index from w12; Capstone reports the '
-    'operand as AARCH64_OP_PRED with the vector-select register in '
-    'pred.vec_select, which the operand walk does not read -- the gap '
-    'docs/limitations.rst already records. The second row is st64bv, '
-    'whose Xs payload register list is adjudicated with the other '
-    'LS64 forms. 2 rows.'),
+ 'SRC+ref:GPR#': ('REPRESENTATIVE ARTIFACT (OPEN, NAMED)',
+    'tlbi vmalle1is: the chosen representative encoding carries Rt=28 '
+    'in a field the alias requires to be 0b11111, so the reference '
+    'reads an X register the real encoding does not have. The tracer '
+    'is right on both halves -- it names the TLBI write and does not '
+    'invent the register. (psel, which used to hold this key, is '
+    'CLOSED: its w12 slice index was parked in Capstone\'s '
+    'pred.vec_select, which the operand walk dropped because the '
+    'plugin operand ABI has one register field per operand. It now '
+    'arrives as an implicit read, and only when the field holds a W '
+    'register -- on the predicate-PAIR forms the same field holds a '
+    'second DESTINATION, and without that test the gate reported a '
+    'phantom predicate read on 16,384 whilegt/whilehi/whilele/whilels '
+    'encodings and 56 pext.) WHAT IS MISSING for the surviving row: '
+    'the representative is picked in build_opcodes.py from the '
+    'encoding table without applying the alias\'s own field '
+    'constraints, so re-picking it is a generator change plus a '
+    'regeneration of opcodes.tsv, which re-keys every row in the '
+    'table. MEASUREMENT that sizes it: 1 row, and the constraint '
+    'class is the SYS-format aliases with a fixed Rt, of which this '
+    'table holds one. 1 row.'),
  'SRC+trc:VEC#': ('TRACER DEFECT -- OPEN',
     'pmov Zd, Pn.B with imm == 0 writes the whole destination -- '
     'pmov_z_pi.xml takes `result = Zeros(VL)` on that path and '
@@ -201,21 +218,39 @@ ADJ = {
     'on the HINT immediate read off the encoding); irg reads GCR_EL1 '
     'and reads and writes RGSR_EL1, the random-allocation seed. 1 row '
     'at the start.'),
- 'DST+ref:GPR# DST+ref:SYS SRC+ref:GPR#': ('TRACER DEFECT -- OPEN',
-    'hint #35 is chkfeat x16: it reads and writes x16 and reads the '
-    'feature registers.  The tracer records no operand at all.  1 row.'),
- 'SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:SYS':
-    ('TRACER DEFECT -- OPEN',
-     'st64b/st64bv0 send a 512-bit payload held in eight consecutive X '
-     'registers; the tracer records two.  1 row.'),
- 'SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR#':
-    ('TRACER DEFECT -- OPEN', 'st64bv, same class.  1 row.'),
- 'SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR#':
-    ('TRACER DEFECT -- OPEN', 'st64bv0 variant, same class.  1 row.'),
- 'DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR#':
-    ('TRACER DEFECT -- OPEN',
-     'ld64b returns 512 bits into eight consecutive X registers; the '
-     'tracer records one destination.  1 row.'),
+ 'DST+ref:GPR# DST+ref:SYS SRC+ref:GPR#': ('TRACER RIGHT -- REFERENCE DEFECT (OPEN, NAMED)',
+    'hint #35 is NOT chkfeat, which this entry used to claim. CHKFEAT '
+    'is CRm:op2 == \'0101 000\', hint #40; hint #35 is CRm:op2 == '
+    '\'0100 011\', which matches no arm of hint.xml\'s decode case '
+    'and therefore executes as a NOP. The reference gives it '
+    'CHKFEAT\'s read and write of x16 because the SystemHintOp '
+    'variable the decode assigns never gets a value on this path, so '
+    'the execute section\'s `case op of` sees UNKNOWN and unions '
+    'EVERY arm. The tracer recording nothing is right, and chkfeat '
+    'itself is now recorded: isaxcheck --hex=1f2503d5 gives '
+    'SRC{REG_GPR16} DST{REG_GPR16}, where before it gave neither. '
+    'WHAT IS MISSING: the decode ASL that routes an unallocated '
+    'encoding to EndOfInstruction() is not in the section set mra_ref '
+    'runs, so modelling that call cannot reach this row. MEASURED, '
+    'not assumed: an EndOfInstruction builtin was implemented and '
+    'swept, and ZERO of the 3,920 subjects reached it, so the '
+    'instrument was inert and was reverted rather than shipped. The '
+    'fix is section selection in mra_ref, not a builtin. 1 row.'),
+ 'SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:SYS': ('CLOSED -- TRACER FIXED',
+    'st64b sends a 512-bit payload held in eight consecutive X '
+    'registers and the tracer recorded two; st64bv0 additionally '
+    'sends ACCDATA_EL1 as bits<31:0> of the first, which is the SYS '
+    'half of this signature. 1 row at the start.'),
+ 'SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR#': ('CLOSED -- TRACER FIXED',
+    'st64bv, same class as st64b. 1 row at the start.'),
+ 'SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR# SRC+ref:GPR#': ('CLOSED -- TRACER FIXED',
+    'st64bv0, same class. 1 row at the start.'),
+ 'DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR# DST+ref:GPR#': ('CLOSED -- TRACER FIXED',
+    'ld64b returns 512 bits into eight consecutive X registers and '
+    'the tracer recorded one. The register list is a property of the '
+    'ENCODING -- ld64b.xml names X[t+i] for i = 0 to 7 and Rt is '
+    'constrained even -- so cap_aarch64_ls64_contract derives the '
+    'seven companions from Rt. 1 row at the start.'),
  # ------------------------------------------------------- reference-side
  'SRC+trc:GPR# SRC+trc:GPR#': ('REFERENCE GAP -- NOT A TRACER DEFECT',
     'sysp/tlbip are the 128-bit system-instruction pair form, whose '
@@ -227,10 +262,12 @@ ADJ = {
     'msrr, same.'),
  'DST+trc:SYS SRC+trc:ZERO': ('REFERENCE GAP -- NOT A TRACER DEFECT',
     'msr <pstatefield>, #imm; the extractor produced no effect for it.'),
- 'DST+ref:SYS SRC+ref:GPR#': ('REPRESENTATIVE ARTIFACT',
-    'tlbi vmalle1is: the chosen representative encoding carries Rt=28 in a '
-    'field the alias requires to be 0b11111, so the reference reads an X '
-    'register the real encoding does not have.'),
+ 'DST+ref:SYS SRC+ref:GPR#': ('CLOSED -- TRACER FIXED (the DST half)',
+    'tlbi vmalle1is. The tracer now records the TLBI write '
+    '(cap_aarch64_sysinstr_contract), so the destination half of this '
+    'signature is gone and the row moved to SRC+ref:GPR#, where the '
+    'surviving half -- a representative-encoding artifact on the '
+    'reference side -- is adjudicated. 1 row at the start.'),
  # ------------------------------------------------ closed by this session
  'DST+ref:FCSR': ('CLOSED -- TRACER FIXED',
     'the FPSR cumulative-exception write, absent from every FP '
@@ -255,17 +292,24 @@ ADJ = {
     'author-declared validator probe probe_zero_reg '
     '(`{"src": ["REG_GPR5","REG_GPR6"], "dst": ["REG_ZERO"]}`) is '
     'unchanged and stays green.  3 rows.'),
- 'SRC+ref:ZT0': ('TRACER RIGHT -- REFERENCE-SIDE (R7.1)',
-    '`movt zt0[8], x2` writes 64 bits of the 512-bit SME2 lookup-table '
-    'register, so the reference makes the destination a source to model '
-    'the preserve of the other 448.  R7.1 settles exactly this shape: a '
-    'write narrower than the register does not acquire a source, because '
-    'rename does not know the data-width-scope of the next reader and '
-    'width is carried at execution rather than in the static set.  A '
-    'register is a source when the INSTRUCTION takes it as one, and movt '
-    'does not.  Surfaced only when ZT0 was split off REG_MATRIX: while it '
-    'shared an ID with the ZA array the read and the write cancelled into '
-    'one token and the row could not be seen.  1 row.'),
+ 'SRC+ref:ZT0': ('TRACER RIGHT -- REFERENCE-SIDE R7.1 (OPEN, NAMED)',
+    '`movt zt0[8], x2` writes 64 bits of the 512-bit SME2 '
+    'lookup-table register, so the reference makes the destination a '
+    'source to model the preserve of the other 448 -- movt_zt_r.xml '
+    'is the scratch writeback idiom, bits(512) result = ZT0[512]; '
+    'Elem[result, offset, 64] = X[t, 64]; ZT0[512] = result. R7.1 '
+    'settles the verdict: a write narrower than the register does not '
+    'acquire a source, because rename does not know the '
+    'data-width-scope of the next reader. WHAT IS MISSING is not the '
+    'verdict but a MECHANICAL criterion: partial writeback coverage '
+    'is the same shape for merging-predicated SVE and single-lane '
+    'LD1, which METHOD.md requires to KEEP their read, and R7.1 '
+    'separates them only as a judgement about what the INSTRUCTION '
+    'takes as a source. MEASUREMENT that sizes the blast radius of '
+    'applying it as a blanket rule: 2,096 subjects have a destination '
+    'the reference also calls a source, and 2,052 of them AGREE with '
+    'the tracer today -- so a blanket rule would close 1 row and open '
+    'up to 2,052. 1 row.'),
  'DST+ref:ZERO': ('CLOSED -- TRACER FIXED',
     'the DESTINATION half of the same alias loss: cmp = subs Rd=31, '
     'cmn = adds Rd=31, tst = ands Rd=31. 16 rows at the start.'),

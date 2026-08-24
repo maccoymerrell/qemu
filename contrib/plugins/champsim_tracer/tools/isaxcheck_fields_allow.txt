@@ -999,11 +999,6 @@ aarch64 FM-miss-store ldxrh
 #   - PSEL's vector-select index read (the W register in p1.b[w12, 0])
 #     is absent from Capstone's detail.  Boundary twin:
 #     `aarch64 R-rd-missing psel +r#`.
-aarch64 FR-rd-missing psel +REG_GPR#
-aarch64 FR-rd-missing st64b +REG_GPR#
-aarch64 FR-rd-missing st64bv +REG_GPR#
-aarch64 FR-rd-missing st64bv0 +REG_GPR#
-aarch64 FR-wr-missing ld64b +REG_GPR#
 
 # LDG marks its address base register written in Capstone's detail; the
 # instruction has no writeback and only Xt is written.  Capstone
@@ -6109,6 +6104,9 @@ aarch64 FR-rd-phantom ldgm +REG_SYSID
 aarch64 FR-rd-phantom stgm +REG_SYSID
 aarch64 FR-rd-phantom stzgm +REG_SYSID
 aarch64 FR-rd-phantom subg +REG_SYS
+# st64bv0 sends ACCDATA_EL1 as the low 32 bits of its payload; see the
+# boundary allowlist.
+aarch64 FR-rd-phantom st64bv0 +REG_SYS
 aarch64 FR-rd-phantom sys +REG_SSP
 aarch64 FR-rd-phantom sysl +REG_SSP
 aarch64 FR-rd-phantom sysl +REG_SYS

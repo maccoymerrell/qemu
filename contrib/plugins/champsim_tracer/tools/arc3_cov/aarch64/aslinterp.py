@@ -235,6 +235,13 @@ class Interp:
         self.bound_reads = set()  # read ids that were parked in a variable
         self.consumed = set()     # read ids whose value reached a use
         self.wb_var_reads = set()  # ... or was written back to a register
+        # While not None, a use does not CONSUME: it parks its reads here
+        # for the caller to decide.  A pure function's argument reaches an
+        # architectural result only if the function's RESULT does, so
+        # consuming at the call site is what made `fmov w2, s1` claim an
+        # FPCR read -- IsMerging(fpcr) is called unconditionally and its
+        # answer is then never looked at.
+        self.defer_consume = None
 
     # -------------------------------------------------- entry points
     def run(self, stmts, env):
@@ -651,6 +658,14 @@ class Interp:
             self.access(lhs, env, 'w')
         elif k == 'slice':
             base = lhs[1]
+            # The slice BOUNDS are read even though the slice is being
+            # written: `mask<UInt(tag)> = '1'` depends on tag, and through
+            # it on the address register GMI computes the tag from.  They
+            # were never evaluated here, so nothing recorded that read.
+            for _p in lhs[2]:
+                for _e in _p[1:]:
+                    if isinstance(_e, tuple):
+                        self.eval(_e, env)
             if base[0] == 'var' and base[1] == 'PSTATE':
                 self.pstate(lhs[2], 'w', env)
             elif base[0] == 'index':
@@ -706,7 +721,10 @@ class Interp:
                     if rs:
                         # the value reached a use, and flows onward into
                         # whatever this expression is bound to
-                        self.consumed |= rs
+                        if self.defer_consume is None:
+                            self.consumed |= rs
+                        else:
+                            self.defer_consume |= rs
                         if self.ef.sink is not None:
                             self.ef.sink |= rs
                 return env[n]
@@ -1027,23 +1045,60 @@ class Interp:
             return UNK
         if name == 'ConstrainUnpredictableBool':
             return self.constrain_unpredictable(args, env)
-        vals = [self.eval(a, env) for a in args]
+        # Argument reads are held rather than consumed until it is known
+        # whether the callee did anything with them; see defer_consume.
+        # `consume` stays True for every path except a pure inline, so the
+        # default is the conservative one and only the case that is proved
+        # pure gets the benefit.
+        outer_defer = self.defer_consume
+        self.defer_consume = set()
+        try:
+            vals = [self.eval(a, env) for a in args]
+        except BaseException:
+            self.consumed |= self.defer_consume
+            self.defer_consume = outer_defer
+            raise
+        argreads = self.defer_consume
+        self.defer_consume = outer_defer
+        return self._call_body(name, args, vals, env, bracket, argreads)
+
+    def _call_body(self, name, args, vals, env, bracket, argreads):
+        """Dispatch a call whose arguments are evaluated but not yet spent.
+
+        `spend()` says the argument values reached an architectural result
+        inside this call, so their reads are live no matter what the caller
+        does with the answer.  Every path spends except one: a shared
+        function that was inlined and performed no architectural write, for
+        which the reads travel out through the return value instead, and
+        are live only if the RESULT is.
+        """
+        def spend():
+            if self.defer_consume is None:
+                self.consumed |= argreads
+            else:
+                self.defer_consume |= argreads
         b = _dispatch_feature(name)
         if b is not None:
+            spend()
             return b(self, vals, env)
         if name in ('FPCR', 'FPSR'):
+            spend()
             self.ef.add('r', 'FCSR', None)
             return UNK
         if name == 'AArch64.SysRegRead':
+            spend()
             self.sysreg_op(vals, 'r')
             return UNK
         if name == 'AArch64.SysRegWrite':
+            spend()
             self.sysreg_op(vals, 'w')
             return UNK
         if name in ('AArch64.SysInstr', 'AArch64.SysInstrWithResult'):
+            spend()
             self.sysreg_op(vals, 'r' if 'Result' in name else 'w')
             return UNK
         if name in REG_ACCESSORS and bracket:
+            spend()
             return UNK
         # inline a shared function when it is in the allowed set
         if self.inline_ok(name) and self.depth < 12:
@@ -1063,6 +1118,13 @@ class Interp:
                 # where their reads were consumed.
                 saved_reads = self.var_reads
                 self.var_reads = {}
+                # Whether the callee did anything ARCHITECTURAL, measured
+                # rather than assumed from the name: if it wrote a
+                # register or touched memory, the argument reached a
+                # result inside it and its reads are live.
+                before = (frozenset(self.ef.w), self.ef.mem_r, self.ef.mem_w,
+                          self.ef.tag_r, self.ef.tag_w,
+                          self.ef.gcs_r, self.ef.gcs_w)
                 try:
                     self.exec_block(stmts, sub)
                 except ReturnSig as r:
@@ -1073,6 +1135,24 @@ class Interp:
                     self.var_reads = saved_reads
                     self.depth -= 1
                     seen = self.frames.pop() + definite
+                    after = (frozenset(self.ef.w), self.ef.mem_r,
+                             self.ef.mem_w, self.ef.tag_r, self.ef.tag_w,
+                             self.ef.gcs_r, self.ef.gcs_w)
+                    if after != before:
+                        spend()
+                    elif (self.ef.sink is None
+                          and self.defer_consume is None):
+                        # Pure, but the answer is not being bound to
+                        # anything -- an `if` condition, a loop bound, a
+                        # bare call.  There is no container for the reads
+                        # to travel in, so withholding them would just
+                        # lose them: `if IsZero(X[t])` would stop
+                        # depending on Xt.  Consume.
+                        spend()
+                    elif self.defer_consume is not None:
+                        # still pure, and the caller is itself deferring:
+                        # hand the reads outward rather than dropping them
+                        self.defer_consume |= argreads
                 if not seen:
                     return UNK
                 first = seen[0]
@@ -1080,6 +1160,7 @@ class Interp:
                     if not (v is first or v == first):
                         return UNK
                 return first
+        spend()
         return UNK
 
     def constrain_unpredictable(self, args, env):

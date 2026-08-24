@@ -72,6 +72,14 @@ CATEGORIES = (
     'vocabulary-gap',           # no GenericRegId exists for this register
     'vocabulary-difference',    # same fact, different spelling
     'representative-artifact',  # the chosen probe encoding, not the opcode
+    'emulation-artefact',       # QEMU's execution differs from the ISA, and
+                                # the tracer records what the guest RAN.  Not
+                                # a tracer defect and not a reference defect:
+                                # both are right about different machines.
+                                # The store-conditional lowered onto a
+                                # cmpxchg, which really reads, is the case
+                                # this exists for (#177, and its riscv64 and
+                                # mipsel siblings).
     'needs-ruling',             # mechanism named, verdict awaiting the maintainer
     'unaccounted',              # no rule reaches this row
 )

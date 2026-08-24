@@ -6925,3 +6925,21 @@ x86_64 FR-wr-phantom wrgsbasel +REG_SEG4
 x86_64 FR-wr-phantom wrgsbaseq +REG_SEG4
 x86_64 FR-rd-missing monitorx +REG_GPR#
 x86_64 FR-rd-missing mwaitx +REG_GPR#
+
+# --- QEMU lowers the MIPS store-conditional onto tcg_gen_atomic_cmpxchg_tl
+#     (target/mips/tcg/translate.c:2219-2244), which performs a REAL load
+#     before the store, and the memop callback delivers it.  Capstone and
+#     LLVM both report the ARCHITECTURE, where a store-conditional writes
+#     and returns a status bit and does not read -- so the load arrived
+#     with no declared slot and rendered as an orphan, `ld(0x410180)`,
+#     while riscv64's `sc.d` (whose Capstone MEM operand happens to carry
+#     READ|WRITE) rendered the same access matched.  The decode boundary
+#     now declares the load on both ISAs; this is #177's decision applied
+#     where it was owed -- the trace records what executed.  `ll` / `lr.d`
+#     need nothing: neither reports the phantom store #177 removed.
+#     `scd` is handled in the code and is NOT listed here: it is MIPS64 and
+#     this sweep is 32-bit mipsel, so a row for it would be a rule that can
+#     never match -- which is what the dead-rule detector is for.
+mipsel FM-extra-load sc
+mipsel FM-extra-load sce
+

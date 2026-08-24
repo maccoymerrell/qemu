@@ -246,11 +246,6 @@ RISCV_EXEC = {
              note='the reference records several CSR writes that the tracer '
                   'folds onto one GenericRegId, which can hold one value'),
 
-    # target/riscv/insn_trans/trans_rva.c.inc:74 -- QEMU implements SC with
-    # tcg_gen_atomic_cmpxchg_tl, and the plugin observes the compare's READ.
-    # Architecturally SC performs a store only.  Whether a memory trace should
-    # carry it is a modelling question (a real core does probe the line), so
-    # this is named and left for the maintainer rather than assumed either way.
     # A CSR the reference writes that the guest's architecture does not have.
     # spike at this revision carries the matrix/Zvt extension and clears its
     # `mtype` (0xC23) inside vectorUnit_t::set_vl (vector_unit.cc:148-152), so
@@ -261,10 +256,20 @@ RISCV_EXEC = {
              note='the reference logs a write to a CSR outside the ISA the '
                   'guest was built for (spike Zvt mtype on every vsetvl)'),
 
+    # target/riscv/insn_trans/trans_rva.c.inc:74 -- QEMU implements SC with
+    # tcg_gen_atomic_cmpxchg_tl, which performs a REAL load, and the memop
+    # callback delivers it.  Architecturally a store-conditional writes and
+    # returns a status bit; it does not read.  DECIDED the way #177 decided
+    # the identical AArch64 case: the load is kept, because the trace records
+    # what EXECUTED and a delivered access with no slot to land in is worse
+    # than a superset the reference explains.  Spike models the architecture
+    # and QEMU ran the emulation; neither is wrong, and the row is a named
+    # TRACER-SUPERSET rather than an open question.
     'QEMU-SC-CMPXCHG':
-        Rule('QEMU-SC-CMPXCHG', 'needs-ruling', {SUPERSET, ORTHOGONAL},
-             note='QEMU lowers store-conditional to a cmpxchg; the tracer '
-                  'records that implementation read as a load'),
+        Rule('QEMU-SC-CMPXCHG', 'emulation-artefact', {SUPERSET},
+             note='QEMU lowers store-conditional onto tcg_gen_atomic_cmpxchg, '
+                  'which really reads the line; the tracer records the access '
+                  'the guest performed, which the architecture does not have'),
 }
 
 

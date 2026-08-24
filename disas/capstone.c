@@ -8407,6 +8407,77 @@ static void cap_fill_generic_operands(csh handle, const cs_insn *insn,
             }
         }
         /*
+         * QEMU's store-conditional READS the line it stores to, and the
+         * memop callback delivers that read.
+         *
+         * `sc`, `scd` and their EVA forms are lowered by
+         * `gen_st_cond()` (target/mips/tcg/translate.c:2219-2244) onto
+         * `tcg_gen_atomic_cmpxchg_tl`, which performs a REAL load before
+         * the store.  Architecturally a store-conditional writes and
+         * returns a status bit; it does not read.  Capstone reports the
+         * architecture -- the MEM operand is WRITE only -- so the
+         * template declared loads=0 stores=1 while the run delivered
+         * two accesses, and the load had NO SLOT TO LAND IN.
+         *
+         * Measured before this change, mipsel probe at 0x400144
+         * (`sc $t2, 0($a1)`), decoded:
+         *
+         *   st %gp10 -> st[%gp5](0x410180)  ld(0x410180)   memops_cp=2
+         *
+         * `ld(...)`, in parentheses, is the decoder's rendering of an
+         * ORPHANED runtime memop: an access that executed against no
+         * declared slot.  riscv64's `sc.d`, whose Capstone MEM operand
+         * happens to carry READ|WRITE, renders the same access as
+         * `ld[%gp31](0x111c0)` with its datum -- matched.  Two ISAs, one
+         * QEMU lowering, two different answers.
+         *
+         * THIS IS THE #177 DECISION APPLIED WHERE IT WAS OWED.  That
+         * commit corrected AArch64's load-exclusive, whose Capstone MEM
+         * operand claimed a store QEMU never performs, and deliberately
+         * left the STORE-exclusive alone: "QEMU implements STXR/STLXR
+         * with a cmpxchg helper that performs a REAL load, and the memop
+         * callback sees it ... trading a phantom slot for a delivered
+         * access with nowhere to land is worse, and the trace records
+         * what executed."  MIPS is the same instruction class under the
+         * same lowering and had the opposite treatment only because
+         * Capstone's flags happened to differ.
+         *
+         * What that leaves is the question #177 also left open and this
+         * does not close either: QEMU's store-conditional reads memory
+         * where the hardware does not, so a consumer sees a
+         * read-modify-write for an instruction the ISA says only writes.
+         * That is an emulation artefact, not a decoding one.  It is now
+         * named on both ISAs instead of showing up as an orphan on one
+         * of them, and the riscv64 execution leg charges it to
+         * `emulation-artefact` against Spike rather than to
+         * `needs-ruling`.
+         *
+         * The load-linked side needs nothing: `ll` reports mem r=1 w=0
+         * and `lr.d` likewise, so neither ISA has the phantom-store
+         * shape #177 removed from `ldxr`.
+         *
+         * Three mnemonics and no more: `sc`, `scd` (MIPS64) and the EVA
+         * `sce`.  There is no `scde` -- neither Capstone nor
+         * target/mips/tcg/translate.c has one -- so listing it would be
+         * a rule that matches nothing.
+         *
+         * Structural on both sides, like the accumulator rule below: the
+         * mnemonic must be in the family AND the operand must actually
+         * be a MEM operand that Capstone marked as a write.
+         */
+        if (!strcmp(insn->mnemonic, "sc") || !strcmp(insn->mnemonic, "scd")
+            || !strcmp(insn->mnemonic, "sce")) {
+            for (uint8_t i = 0; i < n; i++) {
+                qemu_plugin_operand *op = &out->operands[i];
+                if (op->type != QEMU_PLUGIN_OP_MEM
+                    || !(op->access & QEMU_PLUGIN_OP_ACC_WRITE)) {
+                    continue;
+                }
+                op->access |= QEMU_PLUGIN_OP_ACC_READ;
+                break;
+            }
+        }
+        /*
          * The accumulate half of a multiply-accumulate that names its
          * accumulator (see cap_mips_is_acc_rmw).  Structural on both
          * sides: the mnemonic must be in the family AND the operand must

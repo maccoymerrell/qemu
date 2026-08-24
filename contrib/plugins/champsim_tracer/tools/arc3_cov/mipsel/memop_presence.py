@@ -83,6 +83,17 @@ CLASSES = {
 #: Named here so the rows are accounted rather than counted twice.
 STATIC_DYNAMIC_SPLIT = {'pref', 'prefe', 'synci'}
 
+#: The store-conditional family.  QEMU lowers `sc` / `scd` / `sce` onto
+#: `tcg_gen_atomic_cmpxchg_tl` (target/mips/tcg/translate.c:2219-2244), which
+#: performs a REAL load before the store, and the memop callback delivers it.
+#: binutils is right that the ARCHITECTURE only stores; the tracer is right
+#: about what the guest RAN.  That is not a gap in the reference -- it models
+#: the instruction correctly -- so the row is charged to `emulation-artefact`
+#: rather than to `reference-gap`, which is where an unlabelled LD-EXTRA
+#: would land it.  Decided the same way #177 decided the identical AArch64
+#: case and applied to riscv64's `sc.d` in the same pass.
+QEMU_CMPXCHG_SC = {'sc', 'scd', 'sce'}
+
 
 def read_pinfo(rawdir):
     """name -> OR of every pinfo the enumerator saw for it, over all variants."""
@@ -180,6 +191,8 @@ def main():
         direction, category = CLASSES.get(k, ('UNACCOUNTED', 'unaccounted'))
         if k != 'AGREE' and mnem in STATIC_DYNAMIC_SPLIT:
             category = 'static-dynamic-split'
+        if k == 'LD-EXTRA' and mnem in QEMU_CMPXCHG_SC:
+            category = 'emulation-artefact'
         cat[k] += 1
         rows[k].append((oid, mnem, hx, refl, refs, fl, fs))
         out.append({'opcode_id': oid, 'mnemonic': mnem, 'hex': hx,

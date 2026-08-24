@@ -195,7 +195,137 @@ def adjudicate(hexs, xsrc, xdst):
                 src.add(r)
                 ADJ['ADJ-2 XED marks a read-modify operand write-only '
                     '(iced+LLVM over XED)'] += 1
+                # ADJ-2b: the same two references settle the OTHER half.
+                # Where neither of them names the register as a
+                # destination either, XED did not merely lose the read --
+                # it has the operand's ROLE inverted, and leaving the
+                # write standing would keep a result the instruction does
+                # not produce.  LLWPCB is the case: the register holds the
+                # ADDRESS of the control block the instruction loads.
+                if r not in iced['dst'] and r not in llvm['dst']:
+                    dst.discard(r)
+                    ADJ['ADJ-2b XED has the operand role INVERTED, not '
+                        'merely lost (iced+LLVM over XED)'] += 1
+    # -------------------------------------------------------------- x87
+    # XED models the x87 escapes with a BLANKET "writes X87STATUS, writes
+    # ST(0)" that is right for the arithmetic and wrong for four families.
+    # Each correction below is checked against the other two references AND
+    # against QEMU's own implementation, and each is COUNTED: a rule whose
+    # count falls to zero has stopped reaching its subject and is a finding,
+    # not a pass.
+    #
+    # iced-x86 cannot arbitrate the STATUS half on its own -- it prints
+    # RFLAGS where XED prints X87STATUS on EVERY x87 row (compare d800:
+    # XED `ST0,X87STATUS`, iced `RFLAGS,ST0`) -- so its RFLAGS is read as
+    # the status word, never as EFLAGS, and only its ST(n) evidence counts.
+    xmn = REF.get(hexs, {}).get('XED', {}).get('mn', '')
+    # ADJ-3: FTST compares ST(0) with 0.0 and writes only the condition
+    # codes.  iced (dst = status only) and LLVM MC (dst = X87STATUS) both
+    # contradict XED's ST0 destination.
+    if xmn == 'FTST' and 'ST0' in dst:
+        dst.discard('ST0')
+        ADJ['ADJ-3 FTST does not write ST(0) (iced+LLVM over XED)'] += 1
+    # ADJ-4: the non-waiting STORES of the control and status words only
+    # read them.  XED and LLVM MC both name X87STATUS a destination; QEMU
+    # settles it -- helper_fnstcw() returns env->fpuc and helper_fnstsw()
+    # returns a rearrangement of env->fpus, and neither assigns anything
+    # (target/i386/tcg/fpu_helper.c).  Following the reference here would
+    # plant a write the guest does not perform, which is the worse defect:
+    # a wrong dependency reads as agreement.
+    if xmn in ('FNSTCW', 'FNSTSW') and 'X87STATUS' in dst:
+        dst.discard('X87STATUS')
+        ADJ['ADJ-4 FNSTCW/FNSTSW read the status word and do not write it '
+            '(QEMU helper over XED+LLVM)'] += 1
+    # ADJ-5: FCMOVcc TESTS CF/ZF/PF and writes no flag.  XED declares its
+    # RFLAGS operand rw; LLVM MC names no flags at all, and iced's dst
+    # RFLAGS is the status-word rendering above rather than a claim about
+    # EFLAGS -- so no reference actually asserts an EFLAGS write.
+    if xmn.startswith('FCMOV') and 'RFLAGS' in dst:
+        dst.discard('RFLAGS')
+        ADJ['ADJ-5 FCMOVcc tests the flags and does not write them '
+            '(LLVM over XED)'] += 1
+    # ADJ-6: 3DNow! (0F 0F /r imm8).  Every operation in the map writes
+    # BOTH packed elements of its MMX destination, so no part of the old
+    # value survives and the register is not a source; XED declares the
+    # operand rw anyway.  iced-x86 and LLVM MC both name only the memory
+    # or register operand, which is the ADJ-2 protocol run in reverse and
+    # is scoped to this one escape rather than applied generally.
+    # ADJ-7: QEMU's group-7 decoder is PREFIX-BLIND on 0F 01 CA / CB, so
+    # F2 0F 01 CA -- which XED reads as FRED's ERETS -- is executed by the
+    # guest as CLAC, exactly as pre-FRED hardware executes it
+    # (target/i386/tcg/translate.c case 0xca / 0xcb take no prefix test,
+    # and QEMU has no FRED at all: no CPUID bit, no decode entry).  The
+    # reference is describing a machine this guest is not.  Replacing it
+    # with QEMU's own reading is the only honest comparison; the tracer
+    # follows the guest, and Capstone reads these bytes the same way.
+    if xmn in ('ERETS', 'ERETU') and _is_group7_prefixed(hexs):
+        src, dst = set(), {'RFLAGS'}
+        ADJ['ADJ-7 QEMU executes F2/F3 0F 01 CA as CLAC (it has no FRED); '
+            'the reference decodes a different machine'] += 1
+    # ADJ-8 is deliberately unused: VMFUNC's ECX is carried as a NAMED
+    # SUPERSET of XED in disas/capstone.c rather than adjudicated here,
+    # the same disposition MWAITX's RBX already has.
+    # ADJ-9: VIA PadLock XSTORE.  EDX carries the quality factor INTO the
+    # instruction and is not a result; ECX is the REP form's counter and
+    # the single-shot form has none.  XED alone says otherwise on both
+    # counts and iced-x86 and LLVM MC both contradict it.
+    if xmn in ('XSTORE', 'REP_XSTORE'):
+        if 'RDX' in dst:
+            dst.discard('RDX')
+            ADJ['ADJ-9 XSTORE reads the quality factor in EDX and does not '
+                'write it (iced+LLVM over XED)'] += 1
+        if xmn == 'XSTORE' and 'RCX' in src:
+            src.discard('RCX')
+            ADJ['ADJ-9 the single-shot XSTORE has no ECX counter '
+                '(iced+LLVM over XED)'] += 1
+    # ADJ-10: FFREEP tags ST(i) empty and pops.  It reads no data from the
+    # register it names, which is why disas/capstone.c drops the operand
+    # (cap_x86_is_x87_tag_only).  XED and LLVM MC both name it anyway
+    # because it is spelled as an operand; the dependency a renaming
+    # machine must respect is the tag word, and that is recorded.
+    if xmn == 'FFREEP':
+        for r in sorted(src):
+            if re.fullmatch(r'ST[0-7]', r):
+                src.discard(r)
+                ADJ['ADJ-10 FFREEP names a tag entry, not a value '
+                    '(the operand is not read)'] += 1
+    if _is_3dnow(hexs) and iced and iced['ok'] and llvm and llvm['ok']:
+        for r in sorted(src & dst):
+            if not re.fullmatch(r'MM[0-7]', r):
+                continue
+            if r in iced['src'] or r in llvm['src']:
+                continue
+            src.discard(r)
+            ADJ['ADJ-6 3DNow! writes its whole MMX destination, so it is '
+                'not also a source (iced+LLVM over XED)'] += 1
     return src, dst
+
+
+def _is_group7_prefixed(hexs):
+    """True for 66/F2/F3 0F 01 /r -- the group-7 code points QEMU decodes
+    without looking at the mandatory prefix at all."""
+    b = [int(hexs[i:i + 2], 16) for i in range(0, len(hexs) - 1, 2)]
+    i = 0
+    pfx = False
+    while i < len(b) and b[i] in (0x66, 0x67, 0xf0, 0xf2, 0xf3, 0x2e, 0x36,
+                                  0x3e, 0x26, 0x64, 0x65):
+        pfx = pfx or b[i] in (0x66, 0xf2, 0xf3)
+        i += 1
+    if i < len(b) and (b[i] & 0xf0) == 0x40:
+        i += 1
+    return pfx and b[i:i + 2] == [0x0f, 0x01]
+
+
+def _is_3dnow(hexs):
+    """True for the 0F 0F escape, past any legacy prefix / REX run."""
+    b = [int(hexs[i:i + 2], 16) for i in range(0, len(hexs) - 1, 2)]
+    i = 0
+    while i < len(b) and b[i] in (0x66, 0x67, 0xf0, 0xf2, 0xf3, 0x2e, 0x36,
+                                 0x3e, 0x26, 0x64, 0x65):
+        i += 1
+    if i < len(b) and (b[i] & 0xf0) == 0x40:
+        i += 1
+    return b[i:i + 2] == [0x0f, 0x0f]
 
 TR = {}
 with open(os.path.join(D, 'tracer_batch.tsv')) as f:

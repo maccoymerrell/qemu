@@ -219,6 +219,49 @@ def main():
     w('refuses when one goes stale.  The REACHABLE component is the hole.')
     w('')
 
+    # ------------------------------------------------ the three-valued split
+    # There are three verdicts and no fourth.  A row is COVERED (compared and
+    # agreeing, or disagreeing only as TRACER-SUPERSET), UNREACHABLE (shown
+    # per row that no configuration of QEMU can execute it), or UNCOVERED --
+    # a defect.  "Partial", "out of scope" and "not measured" are not
+    # verdicts, so ORTHOGONAL and every unprobed row without a per-row
+    # unreachability proof land in UNCOVERED and are named there.
+    w('=' * 78)
+    w('THE THREE-VALUED SPLIT.  COVERED / UNREACHABLE / UNCOVERED, and no')
+    w('fourth value.  UNREACHABLE is only claimable where the per-ISA harness')
+    w('carries the proof ON the row; everything else that is not COVERED is a')
+    w('defect and is counted as one.')
+    w('')
+    hdr3 = ('%-9s %10s %13s %11s %11s' %
+            ('ISA', 'COVERED', 'UNREACHABLE', 'UNCOVERED', 'total'))
+    w(hdr3)
+    w('-' * len(hdr3))
+    g3 = collections.Counter()
+    for isa, _, vcol, dtok, _, _ in ISAS:
+        rows, counts, _unp = per_isa[isa]
+        c = collections.Counter(r.direction for r in rows)
+        agree = counts.get('AGREE', 0) + counts.get('agree', 0)
+        cov = agree + c[tax.SUPERSET]
+        unreach = _unp['no']
+        unc = (c[tax.SUBSET] + c[tax.UNACCOUNTED] + c[tax.ORTHOGONAL] +
+               _unp['yes'])
+        g3['c'] += cov
+        g3['u'] += unreach
+        g3['x'] += unc
+        w('%-9s %10d %13d %11d %11d'
+          % (isa, cov, unreach, unc, cov + unreach + unc))
+    w('-' * len(hdr3))
+    w('%-9s %10d %13d %11d %11d'
+      % ('all four', g3['c'], g3['u'], g3['x'],
+         g3['c'] + g3['u'] + g3['x']))
+    w('')
+    w('UNCOVERED = TRACER-SUBSET + UNACCOUNTED + ORTHOGONAL + '
+      'REACHABLE-UNPROBED.')
+    w('ORTHOGONAL is in there deliberately: a different vocabulary for the')
+    w('same fact is a NAMED disagreement, not an agreement, and naming it is')
+    w('not the same as closing it.')
+    w('')
+
     # ------------------------------------------------- per-ISA cross-tables
     for isa, _, _, _, _, _ in ISAS:
         rows = per_isa[isa][0]

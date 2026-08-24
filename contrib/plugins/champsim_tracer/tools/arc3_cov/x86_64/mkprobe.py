@@ -33,7 +33,32 @@ print('EVEX mask-slot opcodes with aaa=000 : %d' % len(cand))
 print('variant keeps same iform and length : %d  (rejected %d)'
       % (len(accept), len(cand) - len(accept)))
 
-probe = {opid: accept.get(hexs, hexs) for opid, mnem, hexs, src in rows}
+# A PROBE ENCODING THE REFERENCE DECODER REFUSES IS NOT A PROBE.  The
+# denominator's encoding for XED_IFORM_UD0 is `0fff`, two bytes -- and UD0 is
+# 0F FF /r, so the ModRM is missing and XED's own decoder rejects what its own
+# tables produced.  The row then reaches the comparison as a "reference decode
+# gap", which is not a verdict: it is one opcode with no comparison at all.
+# Complete such an encoding with a register-form ModRM and accept the result
+# ONLY when XED then decodes it -- to a real iform, at the completed length.
+# A row that stays undecodable is left exactly as it was and stays visible.
+base_probe = {opid: accept.get(hexs, hexs) for opid, mnem, hexs, src in rows}
+allhex = sorted(set(base_probe.values()))
+dec = iforms(allhex)
+broken = [h for h in allhex if dec.get(h, ('0',))[0] != '1']
+fix = {}
+if broken:
+    cands = [h + 'c0' for h in broken]
+    got = iforms(cands)
+    for h, c in zip(broken, cands):
+        if got.get(c) and got[c][0] == '1' and int(got[c][1]) == len(c) // 2:
+            fix[h] = c
+print('probe encodings XED refuses          : %d' % len(broken))
+print('  completed with a ModRM and accepted: %d  %s'
+      % (len(fix), ' '.join('%s->%s' % kv for kv in sorted(fix.items())[:6])))
+if len(fix) != len(broken):
+    print('  STILL UNDECODABLE                  : %s'
+          % ' '.join(h for h in broken if h not in fix))
+probe = {opid: fix.get(h, h) for opid, h in base_probe.items()}
 json.dump(probe, open(os.path.join(D, 'probe_map.json'), 'w'))
 u = sorted(set(probe.values()))
 open(os.path.join(D, 'probe_uniq.hex'), 'w').write(''.join(h + '\n' for h in u))

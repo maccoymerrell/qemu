@@ -13,7 +13,8 @@ mkdir -p "$D"; cd "$D"
 
 # The harness is the TREE's copy; the working directory only holds evidence.
 cp "$T"/compare_attrib.py "$T"/qemu_tcg_scope.py "$T"/icedtsv.py \
-   "$T"/mkprobe.py "$T"/xediform.c "$T"/xl3.cc "$T"/reach_probe.c .
+   "$T"/mkprobe.py "$T"/xediform.c "$T"/xl3.cc "$T"/reach_probe.c \
+   "$T"/cpuiddump.c "$T"/qemu_reach_matrix.py .
 ln -sfn "$R/pylib" pylib                      # iced-x86 1.21.0
 
 # The tracer arm needs the fields columns in --batch (commit 5379a000ac).
@@ -43,28 +44,38 @@ $PY icedtsv.py probe_uniq.hex > iced.tsv 2> iced.err
 # rule has stopped reaching its subject -- a finding, not a pass.
 grep -h 'R7.1-NARROW' xl3.err iced.err
 
-# ---- reachability, MEASURED ------------------------------------------------
+# ---- reachability, MEASURED, in four legs -------------------------------
 # Whether a QEMU x86_64 guest can execute an encoding decides whether a decode
 # gap there costs anything.  It is not read off XED's extension string: that
 # guess called all 128 APX forms of BMI1/BMI2/ADOX_ADCX/LZCNT/MOVBE/RAO/
 # USER_MSR reachable, and QEMU TCG SIGILLs every one.  Each encoding the
-# tracer arm could not decode is EXECUTED under qemu-x86_64 instead, and
-# compare_attrib.py refuses to run without the result.
+# tracer arm could not decode is EXECUTED instead, and compare_attrib.py
+# refuses to run without the result.
 #
-# TWO THINGS THIS LEG CANNOT DO ALONE, both closed by qemu_tcg_scope.py:
+# ONE LEG IS NOT ENOUGH, and each of the three added here closes a specific
+# way the single leg could be wrong:
 #  * its INPUT is the rows the tracer's own decoder rejected ($2 != 1).  That
 #    is deliberate and stays -- reach_probe calls the bytes for real, and
 #    calling all 8,880 encodings in-process would run jumps, syscalls and
 #    halts -- but it does mean the decoder chose the sample, so the sample
 #    cannot also be the justification.
-#  * a SIGILL at CPL3 from a privileged opcode says "privilege", and a SIGSEGV
-#    (3 rows: JMPABS/PUSHP/POPP) says "the bytes were parsed as something
-#    else".  Neither says "QEMU does not implement it".
-# So every unreachable row must ALSO be charged to a citation read out of the
-# QEMU tree, and compare_attrib.py exits nonzero if any row is not.
+#  * -cpu max is ONE configuration.  reach_models.sh runs every 64-bit-capable
+#    CPU model QEMU has and then every CPUID flag forced on at once, so "no
+#    model advertises the feature" is counted rather than assumed, and it
+#    reads each model's CPUID out of the guest so the count is measured too.
+#  * qemu-x86_64 runs everything at CPL 3, so a SIGILL from a privileged
+#    opcode says "privilege".  sysprobe_run.sh executes the same encodings at
+#    CPL 0 in long mode under qemu-system-x86_64 and reports the exception
+#    vector, which removes the privilege reading entirely.
+#  * WHERE QEMU refused is discriminated by -d unimp: gen_unknown_opcode()
+#    logs ILLOPC and means the tables have no entry; its absence means QEMU
+#    decoded something and refused it later -- or ran it, which is the worst
+#    case and the one a signal alone cannot tell apart.
 gcc -O0 -Wall -static -o reach_probe reach_probe.c
 awk -F'\t' 'NR>1 && $2 != 1 { print $1 }' tracer_batch.tsv > reach_in.hex
-"$Q/build/qemu-x86_64" -cpu max ./reach_probe < reach_in.hex > reach.tsv
+"$T"/reach_models.sh "$D"                 # -> r_max_postfix, model_matrix, illopc, cpuid/
+"$T"/sysprobe_run.sh "$D" max             # -> cpl0.tsv
+cp r_max_postfix.tsv reach.tsv            # the single-leg name compare_attrib.py uses
 
 # ---- the exclusion, derived from QEMU rather than from the decoder ---------
 # Prints the feature vocabulary the decode tables can gate on, the CPUID
@@ -75,15 +86,28 @@ $PY qemu_tcg_scope.py
 # ---- compare ---------------------------------------------------------------
 $PY compare_attrib.py     # -> ../attrib.tsv, ../attrib_signatures.txt
 
+# ---- the three-valued verdict ---------------------------------------------
+# Every opcode ends COVERED, UNREACHABLE or UNCOVERED, with the evidence for
+# an UNREACHABLE row ON the row: the CPL3 signal, the count of CPU models it
+# ran under, the all-flags signal, the CPL0 vector, where QEMU refused, the
+# gating CPUID word, whether that word is inside a TCG_*_FEATURES mask, how
+# many configurations actually advertise it, and which builtin_x86_defs[]
+# models name it.  Exits 1 while any row is UNCOVERED -- which is the point.
+$PY qemu_reach_matrix.py --evidence "$D" --attrib ../attrib.tsv \
+    --meta ../opcodes_meta.tsv -o ../reach_matrix.tsv || true
+
 # ---- prove the gate can fire ----------------------------------------------
 # An agreement rate quoted off an instrument nobody has watched fail vouches
 # for nothing.  drop-src must cost exactly the agreeing rows of the damaged
 # mnemonic, against a baseline of 5835:
-#   movq 20   vmovq 13   vpsadbw 10   sqrtsd 2
+#   movq 20   vmovq 13   vpsadbw 10   sqrtsd 2   ud0 3
+ud0 is in the list on purpose too -- it is the family the UD0 misdecode
+# repair created, and a repair nobody has watched fail is a repair that
+# vouches for nothing.
 # sqrtsd is in the list on purpose -- it is an R7.1-SCALAR row, so it proves
 # the rows that rule closed are watched rather than blindly agreeing.
 cp tracer_batch.tsv tracer_batch.good.tsv
-for M in movq vmovq vpsadbw sqrtsd; do
+for M in movq vmovq vpsadbw sqrtsd ud0; do
   "$Q/build/contrib/plugins/isaxcheck" --isa=x86_64 --layer=fields \
       --falsify=drop-src:$M --batch < probe_uniq.hex > tracer_batch.tsv
   echo -n "falsify drop-src:$M -> "

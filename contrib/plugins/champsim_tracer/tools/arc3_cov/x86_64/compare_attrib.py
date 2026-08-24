@@ -273,12 +273,26 @@ reach_conflicts = []          # measurement and name test disagree
 reach_unmeasured = set()      # no execution verdict; the name test stood in
 
 def unreachable(ext, isa_set, hexs=None):
-    """True when no QEMU x86_64 guest can execute these bytes."""
+    """True when no QEMU x86_64 guest can execute these bytes.
+
+    The execution probe only runs the encodings the tracer could not decode
+    (REPRODUCE.sh), so most rows have no verdict.  Those fall back to the
+    QEMU-derived scope model, NOT to the extension-name guess: the name guess
+    is kept only to be contradicted out loud, and standing in for a
+    measurement is exactly the job it was found unfit for.
+
+    Measured 2026-08-23 on the 16 rows where the two fallbacks disagreed --
+    CET (WRSS/WRUSS/INCSSP/RSTORSSP/SAVEPREVSSP/SETSSBSY/CLRSSBSY), UINTR
+    (CLUI/STUI), TDX (SEAMCALL) and MOVDIR (MOVDIRI/MOVDIR64B): every one
+    SIGILLs under qemu-x86_64 -cpu max, so the scope model is right and the
+    name guess called all 16 reachable.  Controls in the same run ran clean
+    (endbr64, IBHF, prefetch, add), so the probe was not simply refusing.
+    """
     guess_unreach = name_guess_unreachable(ext, isa_set)
     ran = REACH.get(hexs)
     if ran is None:
         reach_unmeasured.add(hexs)
-        return guess_unreach
+        return tcgscope.classify(hexs, ext, isa_set) is not None
     if guess_unreach == ran:
         reach_conflicts.append((hexs, ext, isa_set, guess_unreach, ran))
     return not ran

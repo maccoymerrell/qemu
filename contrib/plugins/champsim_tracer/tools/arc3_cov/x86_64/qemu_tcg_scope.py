@@ -78,6 +78,12 @@ class QemuFacts(object):
             re.findall(r'X86_FEAT_([A-Za-z0-9_]+)', self.decode))
         # VEX.mmmmm values the 3-byte VEX prefix accepts.
         self.vex_maps = self._vex_maps()
+        # 0F escape opcodes QEMU decodes as an UNGATED NOP.  A feature whose
+        # encodings live in this hint space still EXECUTES on a TCG guest --
+        # the architectural effect is absent, the instruction is not -- so no
+        # feature argument may exclude them.  ENDBR64 is the case that caught
+        # this: CET has no CPUID bit in cpu.c, and f3 0f 1e fa runs anyway.
+        self.hint_nops = self._hint_nops()
 
     def _read(self, rel):
         p = os.path.join(self.root, rel)
@@ -99,6 +105,17 @@ class QemuFacts(object):
                 if not line.rstrip().endswith('\\'):
                     break
             out |= set(re.findall(r'CPUID_[A-Za-z0-9_]+', buf))
+        return out
+
+    def _hint_nops(self):
+        i = self.decode.index('X86OpEntry opcodes_0F[256]')
+        t = self.decode[i:self.decode.index('\n};', i)]
+        out = set()
+        for line in t.splitlines():
+            m = re.match(r'\s*\[(0x[0-9a-f]{2})\] = X86_OP_ENTRY1\(NOP,'
+                         r'\s*(?:nop|M),v\)(.*)', line)
+            if m and 'cpuid(' not in m.group(2):
+                out.add(m.group(1)[2:])
         return out
 
     def _vex_maps(self):
@@ -263,6 +280,12 @@ def classify(hexs, ext, isa_set, root=None):
         return Scope('OPERAND-FORM-REFUSED', _CITE['form'],
                      'nothing -- the memory forms of this opcode are already '
                      'reachable and already decoded by the tracer')
+    # The hint-NOP space executes whatever the feature bits say, so nothing
+    # below may exclude it.  Declining here is the point: ENDBR64, ENDBR32,
+    # RDSSPD/Q and PREFETCHRST2 all run on a TCG guest as NOPs even though
+    # cpu.c models no CET or MOVRS bit at all.
+    if op == '0f' and i + 1 < len(b) and b[i + 1] in f.hint_nops:
+        return None
 
     if isa_set.startswith('APX_') or ext.startswith('APX'):
         return Scope('QEMU-MODELS-NO-SUCH-FEATURE',
@@ -304,6 +327,10 @@ def selfcheck(root=None):
                    'the VEX-MAP-RESERVED exclusion is stale' % sorted(f.vex_maps))
     # An instrument that cannot fire proves nothing: the vocabulary parse must
     # find features TCG really does have.
+    if '1e' not in f.hint_nops or '0d' not in f.hint_nops:
+        bad.append('0F 1E / 0F 0D are no longer ungated NOP entries: the '
+                   'hint-NOP space may no longer execute unconditionally, and '
+                   'declining to exclude it is no longer justified')
     for must in ('AVX2', 'BMI1', 'SHA_NI', 'CMPCCXADD'):
         if must not in f.decoder_feats:
             bad.append('X86_FEAT_%s missing from the parsed decoder '

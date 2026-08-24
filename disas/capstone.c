@@ -7979,6 +7979,413 @@ bool cap_disas_plugin_detail(disassemble_info *info, uint64_t pc, size_t size,
 }
 
 /*
+ * ---------------------------------------------------------------------
+ * x86-64 DECODE-GAP REPAIR
+ *
+ * Everything above this point repairs what Capstone SAYS about an
+ * instruction.  This repairs the case where it says nothing: bytes a
+ * QEMU x86_64 guest executes and cs_disasm_iter() refuses outright.
+ * That failure is the most damaging shape the defect has -- the plugin
+ * boundary produces no qemu_plugin_insn_info at all, so the instruction
+ * reaches the trace with no opcode class, no register sets and no
+ * memops, and nothing downstream can tell the difference between "this
+ * instruction depends on nothing" and "this decoder could not read it".
+ *
+ * Measured against Intel XED over the whole x86_64 opcode space
+ * (contrib/plugins/champsim_tracer/tools/arc3_cov/x86_64), Capstone
+ * 6.0.0-Alpha7 rejects 349 opcodes whose XED extension QEMU advertises.
+ * 128 of those are the APX (EVEX-promoted) forms of otherwise-ordinary
+ * instructions, and no QEMU x86_64 guest can execute them -- QEMU TCG
+ * has no APX and every one of the 128 raises SIGILL when executed under
+ * qemu-x86_64 -cpu max.  The remaining 221 were executed the same way;
+ * 63 ran.  Those 63 are the whole reachable gap and are what this
+ * repairs, in seven families:
+ *
+ *   CMPccXADD (32)  VEX.128.66.0F38.W0/W1 E0..EF /r.  Capstone has no
+ *                   entry and no X86_INS_ id for the extension at all,
+ *                   yet TCG_7_1_EAX_FEATURES advertises CMPCCXADD.
+ *   x87 aliases (7) DC D0+i / DC D8+i / DD C8+i / DE D0+i / DF C8+i /
+ *                   DF D0+i / DF D8+i -- the reserved alias encodings of
+ *                   FCOM, FCOMP, FXCH and FSTP.  Capstone decodes the
+ *                   canonical spelling of each and refuses the alias.
+ *   hint NOPs (9)   0F 18 /0../3 and 0F 1A..1E, register form.  Capstone
+ *                   decodes 0F 18 /4../7 and 0F 19 but not these.
+ *   VEX.W=1 (6)     VPCMPESTRI/ESTRM/ISTRI in their 64-bit-operand form.
+ *   prefetch (5)    0F 0D /3../7, the reserved 3DNow! prefetch hints.
+ *   MOVSXD (2)      63 /r without REX.W.
+ *   SALC (1)        D6.  QEMU MODELS this (X86_OP_ENTRYw(SALC, 0,b) in
+ *                   decode-new.c.inc) where XED calls it an undefined
+ *                   byte, so it executes and must be described.
+ *
+ * Six of the seven are repaired by SURROGATE ENCODING rather than by a
+ * hand-written operand walk: the bytes are rewritten into an encoding
+ * that is architecturally equivalent in its register operands and that
+ * Capstone does decode, Capstone decodes THAT, and the result goes
+ * through the ordinary cap_fill_x86_operands() path -- so every access-
+ * flag workaround above applies unchanged and no second ModRM/SIB/VEX
+ * operand decoder is introduced that could drift from the first.  Each
+ * surrogate is chosen to have the SAME LENGTH as the encoding it stands
+ * in for, so insn_size stays the truth about the bytes.  Where the
+ * surrogate's identity or access flags differ from the real
+ * instruction's, the difference is named in the plan and applied
+ * afterwards; nothing else is touched.
+ *
+ * SALC has no equivalent of its length and is filled directly.
+ *
+ * All of this is a workaround for an upstream gap and should be
+ * re-measured on a Capstone version bump: an encoding Capstone learns to
+ * decode never reaches this code, so a family that stops firing is
+ * upstream having fixed it -- which the coverage harness will show as
+ * the row leaving the tracer_decode_fail bucket either way.
+ */
+
+/* ModRM/VEX register number -> Capstone id, for the two views this needs. */
+static const uint16_t cap_x86_gpr32_by_num[16] = {
+    X86_REG_EAX, X86_REG_ECX, X86_REG_EDX,  X86_REG_EBX,
+    X86_REG_ESP, X86_REG_EBP, X86_REG_ESI,  X86_REG_EDI,
+    X86_REG_R8D, X86_REG_R9D, X86_REG_R10D, X86_REG_R11D,
+    X86_REG_R12D, X86_REG_R13D, X86_REG_R14D, X86_REG_R15D,
+};
+static const uint16_t cap_x86_gpr64_by_num[16] = {
+    X86_REG_RAX, X86_REG_RCX, X86_REG_RDX, X86_REG_RBX,
+    X86_REG_RSP, X86_REG_RBP, X86_REG_RSI, X86_REG_RDI,
+    X86_REG_R8,  X86_REG_R9,  X86_REG_R10, X86_REG_R11,
+    X86_REG_R12, X86_REG_R13, X86_REG_R14, X86_REG_R15,
+};
+
+/* E0..EF condition suffixes, in encoding order (Intel SDM CMPccXADD). */
+static const char *const cap_x86_cmpccxadd_mnem[16] = {
+    "cmpoxadd",  "cmpnoxadd",  "cmpbxadd",  "cmpnbxadd",
+    "cmpzxadd",  "cmpnzxadd",  "cmpbexadd", "cmpnbexadd",
+    "cmpsxadd",  "cmpnsxadd",  "cmppxadd",  "cmpnpxadd",
+    "cmplxadd",  "cmpnlxadd",  "cmplexadd", "cmpnlexadd",
+};
+
+typedef struct CapX86Pfx {
+    unsigned op_at;     /* index of the first opcode byte */
+    uint8_t  rex;       /* the REX byte, 0 when absent */
+    bool     p66, pf2, pf3;
+} CapX86Pfx;
+
+/*
+ * Locate the opcode inside a legacy-prefix run.  Only the position and
+ * the three mandatory-prefix bits are needed; nothing here decodes an
+ * operand, so an unrecognised byte simply ends the run.
+ */
+static bool cap_x86_scan_prefixes(const uint8_t *d, size_t n, CapX86Pfx *p)
+{
+    unsigned i = 0;
+
+    memset(p, 0, sizeof(*p));
+    while (i < n) {
+        uint8_t b = d[i];
+        if (b == 0x66) { p->p66 = true; i++; continue; }
+        if (b == 0xf2) { p->pf2 = true; i++; continue; }
+        if (b == 0xf3) { p->pf3 = true; i++; continue; }
+        if (b == 0x67 || b == 0xf0 || b == 0x2e || b == 0x36 ||
+            b == 0x3e || b == 0x26 || b == 0x64 || b == 0x65) {
+            i++;
+            continue;
+        }
+        break;
+    }
+    /* A REX prefix is only a REX when it immediately precedes the opcode. */
+    if (i < n && (d[i] & 0xf0) == 0x40) {
+        p->rex = d[i];
+        i++;
+    }
+    p->op_at = i;
+    return i < n;
+}
+
+/*
+ * What a repaired decode has to change once Capstone has decoded the
+ * surrogate.  An empty plan (mnem NULL, insn_id 0, no flags) means the
+ * surrogate already describes the instruction exactly.
+ */
+typedef struct CapX86GapPlan {
+    uint8_t  bytes[16];   /* the surrogate encoding */
+    unsigned len;         /* bytes valid in ->bytes; == the true length */
+    const char *mnem;     /* true mnemonic, or NULL to keep Capstone's */
+    unsigned insn_id;     /* true X86_INS_*, or 0 to keep Capstone's */
+    bool     mem_rw;      /* the MEM operand is read-modify-write */
+    bool     dest_rw;     /* the written REG operand is also a source */
+    uint16_t extra_read;  /* Capstone reg id to add to regs_read[], 0 none */
+} CapX86GapPlan;
+
+/*
+ * Decide whether these bytes are one of the seven families and, if so,
+ * build the surrogate.  Returns false for everything else, which leaves
+ * the decode failed exactly as before.
+ */
+static bool cap_x86_gap_plan(const uint8_t *d, size_t n, CapX86GapPlan *r)
+{
+    CapX86Pfx p;
+    unsigned o, len;
+    uint8_t op, modrm;
+
+    memset(r, 0, sizeof(*r));
+    if (n < 1 || !cap_x86_scan_prefixes(d, n, &p)) {
+        return false;
+    }
+    o = p.op_at;
+    op = d[o];
+    len = MIN(n, sizeof(r->bytes));
+
+    /*
+     * VEX families.  A VEX prefix is only a VEX when no REX and no
+     * mandatory prefix precedes it, and C4 needs three payload bytes
+     * plus a ModRM.
+     */
+    if (op == 0xc4 && !p.rex && !p.p66 && !p.pf2 && !p.pf3 && o + 4 < n) {
+        unsigned map = d[o + 1] & 0x1f;
+        unsigned pp  = d[o + 2] & 0x03;
+        bool     w   = (d[o + 2] & 0x80) != 0;
+        bool     l   = (d[o + 2] & 0x04) != 0;
+        uint8_t  vop = d[o + 3];
+
+        modrm = d[o + 4];
+
+        /*
+         * CMPccXADD -- VEX.128.66.0F38.W0/W1 E0..EF /r, memory form only
+         * (the register form does not exist).  The surrogate is ANDN,
+         * VEX.LZ.0F38.W0/W1 F2 /r: the same three-operand
+         * (ModRM.reg, VEX.vvvv, ModRM.r/m) shape over the same register
+         * class at the same width, reached by clearing pp and swapping
+         * the opcode byte, so ModRM/SIB/displacement decoding and the
+         * instruction length are Capstone's own.
+         *
+         * ANDN and CMPccXADD differ in exactly two places, both stated
+         * here rather than left to a reader: ANDN's memory operand is a
+         * pure source where CMPccXADD's is read-modify-write, and ANDN's
+         * ModRM.reg is a pure destination where CMPccXADD's carries the
+         * loaded value back out and so is both.  The implicit RFLAGS
+         * write is common to both and needs no repair.
+         *
+         * insn_id: Capstone has no id for the extension, and insn_id is
+         * consumed only by the classification table's O(1) lookup.  XADD
+         * is what that table must be asked -- an atomic memory add whose
+         * register operand is exchanged with the loaded value -- and the
+         * mnemonic below stays the true one, so nothing downstream is
+         * told this instruction IS an xadd.
+         */
+        if (map == 0x02 && pp == 1 && !l && (vop & 0xf0) == 0xe0 &&
+            (modrm & 0xc0) != 0xc0) {
+            memcpy(r->bytes, d, len);
+            r->bytes[o + 2] &= (uint8_t)~0x03;
+            r->bytes[o + 3] = 0xf2;
+            r->len = len;
+            r->mnem = cap_x86_cmpccxadd_mnem[vop & 0x0f];
+            r->insn_id = X86_INS_XADD;
+            r->mem_rw = true;
+            r->dest_rw = true;
+            return true;
+        }
+
+        /*
+         * VPCMPESTRI / VPCMPESTRM / VPCMPISTRI / VPCMPISTRM in their
+         * VEX.W=1 form.  W selects whether the implicit length operands
+         * are read as RAX/RDX or EAX/EDX; it changes no operand's
+         * identity, so clearing it yields the same register sets from an
+         * encoding Capstone accepts.
+         */
+        if (map == 0x03 && pp == 1 && w && vop >= 0x60 && vop <= 0x63) {
+            memcpy(r->bytes, d, len);
+            r->bytes[o + 2] &= (uint8_t)0x7f;
+            r->len = len;
+            return true;
+        }
+        return false;
+    }
+
+    /*
+     * x87 alias escapes.  Each of these is a second encoding of an
+     * instruction Capstone decodes under its canonical escape byte, so
+     * the surrogate is that canonical spelling at the same length; the
+     * ST(i) operand rides in the low three bits of the ModRM byte and is
+     * carried across unchanged.
+     */
+    if (op >= 0xdc && op <= 0xdf && o + 1 < n && d[o + 1] >= 0xc0) {
+        uint8_t sop = 0, smod = 0;
+
+        modrm = d[o + 1];
+        if (op == 0xdc && modrm >= 0xd0) {
+            sop = 0xd8; smod = modrm;                 /* FCOM / FCOMP  */
+        } else if (op == 0xdd && modrm >= 0xc8 && modrm <= 0xcf) {
+            sop = 0xd9; smod = modrm;                 /* FXCH          */
+        } else if (op == 0xde && modrm >= 0xd0 && modrm <= 0xd7) {
+            sop = 0xd8; smod = modrm | 0x08;          /* FCOMP         */
+        } else if (op == 0xdf && modrm >= 0xc8 && modrm <= 0xcf) {
+            sop = 0xd9; smod = modrm;                 /* FXCH          */
+        } else if (op == 0xdf && modrm >= 0xd0 && modrm <= 0xdf) {
+            sop = 0xdd; smod = modrm | 0x08;          /* FSTP          */
+        }
+        if (sop) {
+            memcpy(r->bytes, d, len);
+            r->bytes[o] = sop;
+            r->bytes[o + 1] = smod;
+            r->len = len;
+            return true;
+        }
+        return false;
+    }
+
+    /* SALC.  No operands and no equivalent one-byte encoding: filled
+     * directly by the caller, which is what a zero-length plan means. */
+    if (op == 0xd6) {
+        r->len = 0;
+        r->insn_id = X86_INS_SALC;
+        r->mnem = "salc";
+        return true;
+    }
+
+    /* MOVSXD without REX.W: a 32-bit move, and the 8B /r encoding of
+     * that move has the identical ModRM shape and length.  Only the
+     * identity is restored afterwards -- MOVSXD is its own generic
+     * opcode class and must not be recorded as a plain MOV. */
+    if (op == 0x63 && !(p.rex & 0x08)) {
+        memcpy(r->bytes, d, len);
+        r->bytes[o] = 0x8b;
+        r->len = len;
+        r->mnem = "movslq";
+        r->insn_id = X86_INS_MOVSXD;
+        return true;
+    }
+
+    if (op != 0x0f || o + 2 >= n) {
+        return false;
+    }
+    modrm = d[o + 2];
+
+    /*
+     * Reserved hint NOPs.  0F 1F /r is the architecturally defined
+     * multi-byte NOP and has the same ModRM shape at the same length.
+     *
+     * XED gives 0F 18 one operand (the r/m) and 0F 1A..1E two (the r/m
+     * AND the ModRM.reg field), and 0F 1F -- the surrogate -- has one.
+     * The second register is therefore added back for the 1A..1E forms,
+     * because dropping it would make the trace's set a strict subset of
+     * the reference's, which is the one direction this project treats as
+     * a defect.
+     *
+     * A MANDATORY PREFIX TAKES THE WHOLE SPACE SOMEWHERE ELSE, so one
+     * carried here means these bytes are not a hint NOP and must not be
+     * repaired into one.  66/F3/F2 with 0F 1A and 0F 1B are the four MPX
+     * BND forms; F3 0F 1E /1 is RDSSPD / RDSSPQ, which READS the shadow
+     * stack pointer and WRITES its r/m register; F3 0F 1E FA / FB are
+     * ENDBR64 / ENDBR32.  Calling any of those a NOP would replace a
+     * missing register set with a WRONG one, which is the worse defect
+     * -- it reads as agreement.  This exclusion is not a guess: without
+     * it the boundary sweep reports 66 F3 0F 1E C8 as `nopw %ax` against
+     * LLVM's `rdsspd %eax`, losing the destination write outright.
+     *
+     * The test guards the 3DNow! prefetch family below as well.  0F 0D
+     * has no prefix-dependent meaning, so nothing is known to be lost
+     * there -- but a repair whose whole justification is that the code
+     * point is architecturally reserved has no business claiming a
+     * prefixed form nobody has enumerated.
+     */
+    if (p.p66 || p.pf2 || p.pf3) {
+        return false;
+    }
+    if (d[o + 1] == 0x18 && modrm >= 0xc0 && ((modrm >> 3) & 7) <= 3) {
+        memcpy(r->bytes, d, len);
+        r->bytes[o + 1] = 0x1f;
+        r->len = len;
+        return true;
+    }
+    if (d[o + 1] >= 0x1a && d[o + 1] <= 0x1e && modrm >= 0xc0) {
+        unsigned reg = ((modrm >> 3) & 7) | ((p.rex & 0x04) ? 8 : 0);
+
+        memcpy(r->bytes, d, len);
+        r->bytes[o + 1] = 0x1f;
+        r->len = len;
+        r->extra_read = (p.rex & 0x08) ? cap_x86_gpr64_by_num[reg]
+                                       : cap_x86_gpr32_by_num[reg];
+        return true;
+    }
+
+    /*
+     * Reserved 3DNow! prefetch hints, 0F 0D /3../7.  AMD defines every
+     * reserved code point in the group to behave as PREFETCH, and /0 is
+     * PREFETCH itself, so clearing the ModRM.reg field is both the
+     * surrogate and the architectural answer.  The register form is
+     * excluded deliberately: qemu-x86_64 raises SIGILL on 0F 0D /r with
+     * mod == 11, so there is nothing there to describe.
+     */
+    if (d[o + 1] == 0x0d && (modrm & 0xc0) != 0xc0 &&
+        ((modrm >> 3) & 7) >= 3) {
+        memcpy(r->bytes, d, len);
+        r->bytes[o + 2] = modrm & 0xc7;
+        r->len = len;
+        return true;
+    }
+
+    return false;
+}
+
+/*
+ * Apply the plan's corrections to a filled qemu_plugin_insn_info.  Runs
+ * after cap_fill_x86_operands() so that every access-flag workaround
+ * above has already had its say about the surrogate.
+ */
+static void cap_x86_gap_apply(csh handle, const CapX86GapPlan *r,
+                              struct qemu_plugin_insn_info *out)
+{
+    if (r->mnem) {
+        g_strlcpy(out->mnemonic, r->mnem, QEMU_PLUGIN_INSN_DETAIL_MNEMSZ);
+    }
+    if (r->insn_id) {
+        out->insn_id = r->insn_id;
+    }
+    for (uint8_t k = 0; k < out->n_operands; k++) {
+        qemu_plugin_operand *op = &out->operands[k];
+        if (r->mem_rw && op->type == QEMU_PLUGIN_OP_MEM) {
+            op->access = QEMU_PLUGIN_OP_ACC_READ | QEMU_PLUGIN_OP_ACC_WRITE;
+        }
+        if (r->dest_rw && op->type == QEMU_PLUGIN_OP_REG &&
+            (op->access & QEMU_PLUGIN_OP_ACC_WRITE)) {
+            op->access |= QEMU_PLUGIN_OP_ACC_READ;
+        }
+    }
+    if (r->extra_read &&
+        out->n_regs_read < QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS) {
+        uint8_t i = out->n_regs_read;
+
+        cap_copy_reg_name(out->regs_read[i],
+                          QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                          handle, r->extra_read, CS_ARCH_X86);
+        out->regs_read_id[i] = r->extra_read;
+        out->n_regs_read = i + 1;
+    }
+}
+
+/*
+ * SALC: AL := CF ? 0xFF : 0.  One byte, no ModRM, no explicit operand;
+ * the whole dependency is the implicit pair.
+ */
+static void cap_x86_gap_fill_salc(csh handle, const uint8_t *d, size_t n,
+                                  struct qemu_plugin_insn_info *out)
+{
+    CapX86Pfx p;
+
+    cap_x86_scan_prefixes(d, n, &p);
+    g_strlcpy(out->mnemonic, "salc", QEMU_PLUGIN_INSN_DETAIL_MNEMSZ);
+    out->op_str[0] = '\0';
+    out->insn_id = X86_INS_SALC;
+    out->insn_size = (uint8_t)(p.op_at + 1);
+    out->n_operands = 0;
+    out->n_regs_read = 1;
+    out->regs_read_id[0] = X86_REG_EFLAGS;
+    cap_copy_reg_name(out->regs_read[0], QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                      handle, X86_REG_EFLAGS, CS_ARCH_X86);
+    out->n_regs_write = 1;
+    out->regs_write_id[0] = X86_REG_AL;
+    cap_copy_reg_name(out->regs_write[0], QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                      handle, X86_REG_AL, CS_ARCH_X86);
+}
+
+/*
  * Decode raw instruction bytes with a standalone Capstone handle.
  *
  * Unlike cap_disas_plugin_detail() this does not need a disassemble_info
@@ -8047,13 +8454,40 @@ bool cap_disas_raw_detail(int cap_arch, unsigned int cap_mode,
     const uint8_t *code = data;
     size_t sz = data_size;
     uint64_t addr = pc;
+    CapX86GapPlan gap;
+    const CapX86GapPlan *repaired = NULL;
 
     if (insn->detail) {
         memset(insn->detail, 0, sizeof(*insn->detail));
     }
 
     if (!cs_disasm_iter(handle, &code, &sz, &addr, insn)) {
-        return false;   /* handle stays cached for the next call */
+        /*
+         * Capstone read nothing at all.  On x86-64 that is a decode gap
+         * rather than an invalid instruction for the seven families
+         * cap_x86_gap_plan() knows about; repair those and let the
+         * ordinary fill below describe the result.  Everything else
+         * fails exactly as before.
+         */
+        if (cap_arch != CS_ARCH_X86 || !(cap_mode & CS_MODE_64) ||
+            !cap_x86_gap_plan(data, data_size, &gap)) {
+            return false;   /* handle stays cached for the next call */
+        }
+        if (!gap.len) {
+            cap_x86_gap_fill_salc(handle, data, data_size, out);
+            cap_mutate_detail(out);
+            return true;
+        }
+        code = gap.bytes;
+        sz   = gap.len;
+        addr = pc;
+        if (insn->detail) {
+            memset(insn->detail, 0, sizeof(*insn->detail));
+        }
+        if (!cs_disasm_iter(handle, &code, &sz, &addr, insn)) {
+            return false;
+        }
+        repaired = &gap;
     }
 
     /* Copy mnemonic and operand string */
@@ -8108,6 +8542,10 @@ bool cap_disas_raw_detail(int cap_arch, unsigned int cap_mode,
         if (prof) {
             cap_prof_ns_operands += cap_prof_now() - t_op;
         }
+    }
+
+    if (repaired) {
+        cap_x86_gap_apply(handle, repaired, out);
     }
 
     cap_mutate_detail(out);

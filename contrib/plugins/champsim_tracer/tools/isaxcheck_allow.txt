@@ -664,6 +664,26 @@ x86_64 B-flow-presence iretw cs-no llvm-yes
 x86_64 B-flow-presence loop cs-no llvm-yes
 x86_64 B-flow-presence loope cs-no llvm-yes
 x86_64 B-flow-presence loopne cs-no llvm-yes
+
+# The x86-64 decode-gap repair (disas/capstone.c, cap_x86_gap_plan) gives the
+# boundary a decode for seven families of QEMU-executable bytes Capstone
+# 6.0.0-Alpha7 refuses outright.  LLVM MC refuses the same bytes, so every
+# repaired family arrives here as D-cs-only: the boundary now describes an
+# instruction the reference decoder cannot score.  That is the intended
+# trade -- an encoding the trace previously carried with NO opcode, NO
+# register set and NO memop is worth more described-but-unscored than
+# undescribed -- and each family is scored against Intel XED instead, in
+# contrib/plugins/champsim_tracer/tools/arc3_cov/x86_64.
+#
+# To check whether a line can go: re-run the boundary sweep after a Capstone
+# bump.  A family upstream has learned to decode stops reaching the repair,
+# and LLVM's verdict on it does not change, so the signature disappears from
+# this class and the DEAD-rule detector names the line.
+#   fcom / fcomp / fstp / fxch  the reserved x87 alias escapes
+#   nopq                        0F 18 /0../3 and 0F 1A..1E, register form
+#   prefetch                    0F 0D /3../7, the reserved 3DNow! hints
+#   salc                        D6, which QEMU models and XED calls an
+#                               undefined byte
 x86_64 D-cs-only addb
 x86_64 D-cs-only bndcl
 x86_64 D-cs-only bndcn
@@ -672,17 +692,24 @@ x86_64 D-cs-only bndldx
 x86_64 D-cs-only bndmk
 x86_64 D-cs-only bndmov
 x86_64 D-cs-only bndstx
+x86_64 D-cs-only fcom
+x86_64 D-cs-only fcomp
+x86_64 D-cs-only fstp
+x86_64 D-cs-only fxch
 x86_64 D-cs-only fxrstor
 x86_64 D-cs-only fxsave
 x86_64 D-cs-only int1
 x86_64 D-cs-only movq
 x86_64 D-cs-only nop
 x86_64 D-cs-only nopl
+x86_64 D-cs-only nopq
 x86_64 D-cs-only nopw
 x86_64 D-cs-only orl
 x86_64 D-cs-only orq
+x86_64 D-cs-only prefetch
 x86_64 D-cs-only rcll
 x86_64 D-cs-only rclq
+x86_64 D-cs-only salc
 x86_64 D-cs-only testb
 x86_64 D-cs-only testl
 x86_64 D-cs-only testq
@@ -836,6 +863,12 @@ x86_64 D-llvm-only xacquire
 x86_64 D-llvm-only xorps
 x86_64 D-llvm-only xrelease
 x86_64 D-size-mismatch addb
+# `f0 d6` -- LLVM decodes the LOCK prefix as a one-byte `lock` instruction
+# and stops; the boundary reads it as a prefix and reports the two-byte
+# SALC behind it.  Neither length describes something a guest executes:
+# LOCK on a non-lockable opcode raises #UD.  Same shape as the xacquire /
+# xrelease rows further down.
+x86_64 D-size-mismatch salc
 x86_64 D-size-mismatch ja
 x86_64 D-size-mismatch jae
 x86_64 D-size-mismatch jb
@@ -3830,22 +3863,6 @@ x86_64 R-wr-phantom repne stosw +r#
 # AVX2-heavy workload, and for the kmov* half specifically there is no
 # exposure at all under this QEMU -- the i386 TCG front end implements
 # no EVEX, so a KMOV cannot be translated and cannot reach a trace.
-x86_64 D-llvm-only cmpbexadd
-x86_64 D-llvm-only cmpbxadd
-x86_64 D-llvm-only cmplexadd
-x86_64 D-llvm-only cmplxadd
-x86_64 D-llvm-only cmpnbexadd
-x86_64 D-llvm-only cmpnbxadd
-x86_64 D-llvm-only cmpnlexadd
-x86_64 D-llvm-only cmpnlxadd
-x86_64 D-llvm-only cmpnoxadd
-x86_64 D-llvm-only cmpnpxadd
-x86_64 D-llvm-only cmpnsxadd
-x86_64 D-llvm-only cmpnzxadd
-x86_64 D-llvm-only cmpoxadd
-x86_64 D-llvm-only cmppxadd
-x86_64 D-llvm-only cmpsxadd
-x86_64 D-llvm-only cmpzxadd
 x86_64 D-llvm-only ldtilecfg
 x86_64 D-llvm-only sttilecfg
 x86_64 D-llvm-only tcmmimfp16ps
@@ -3868,10 +3885,6 @@ x86_64 D-llvm-only vcvtneeph2ps
 x86_64 D-llvm-only vcvtneobf162ps
 x86_64 D-llvm-only vcvtneoph2ps
 x86_64 D-llvm-only vpackusdw
-x86_64 D-llvm-only vpcmpestri
-x86_64 D-llvm-only vpcmpestrm
-x86_64 D-llvm-only vpcmpistri
-x86_64 D-llvm-only vpcmpistrm
 x86_64 D-llvm-only vpdpbssd
 x86_64 D-llvm-only vpdpbssds
 x86_64 D-llvm-only vpdpbsud

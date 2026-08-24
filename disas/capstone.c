@@ -8140,6 +8140,7 @@ typedef struct CapX86GapPlan {
     unsigned insn_id;     /* true X86_INS_*, or 0 to keep Capstone's */
     bool     mem_rw;      /* the MEM operand is read-modify-write */
     bool     dest_rw;     /* the written REG operand is also a source */
+    bool     no_reg_write;/* the surrogate writes a register and this does not */
     uint16_t extra_read;  /* Capstone reg id to add to regs_read[], 0 none */
 } CapX86GapPlan;
 
@@ -8351,6 +8352,31 @@ static bool cap_x86_gap_plan(const uint8_t *d, size_t n, CapX86GapPlan *r)
     }
 
     /*
+     * UD0, 0F FF /r.  Capstone 6.0.0-Alpha7 decodes it as TWO bytes with
+     * NO operands; it has a ModRM and is three or more.  Everything else
+     * that has an opinion agrees against Capstone -- XED and iced both
+     * read 3 bytes, binutils prints `ud0 %ebx,%ecx` for 0f ff cb, and
+     * QEMU's own [0xff] = X86_OP_ENTRYr(UD, nop,v) takes a ModRM operand
+     * -- so this is a wrong answer, not a missing one, and it costs the
+     * ModRM.reg and r/m registers AND the instruction length.
+     *
+     * The surrogate is BT, 0F A3 /r: the same two-byte opcode and ModRM
+     * shape, both operands READ, nothing written but flags.  The one
+     * difference is named and undone below -- BT writes RFLAGS and UD0
+     * writes nothing, which XED confirms (BT -> dst RFLAGS, UD0 -> dst
+     * empty, same operands otherwise, memory form included).
+     */
+    if (d[o + 1] == 0xff) {
+        memcpy(r->bytes, d, len);
+        r->bytes[o + 1] = 0xa3;
+        r->len = len;
+        r->mnem = "ud0";
+        r->insn_id = X86_INS_UD0;
+        r->no_reg_write = true;
+        return true;
+    }
+
+    /*
      * Reserved 3DNow! prefetch hints, 0F 0D /3../7.  AMD defines every
      * reserved code point in the group to behave as PREFETCH, and /0 is
      * PREFETCH itself, so clearing the ModRM.reg field is both the
@@ -8367,6 +8393,25 @@ static bool cap_x86_gap_plan(const uint8_t *d, size_t n, CapX86GapPlan *r)
     }
 
     return false;
+}
+
+/*
+ * Byte patterns Capstone decodes SUCCESSFULLY and wrongly, which a
+ * decode-failure test can never reach.  Kept to the single family that
+ * has been measured against three other decoders and against QEMU's own
+ * tables: 0F FF, UD0.
+ */
+static bool cap_x86_misdecoded(const uint8_t *d, size_t n)
+{
+    CapX86Pfx p;
+
+    if (!cap_x86_scan_prefixes(d, n, &p) || p.op_at + 2 >= n) {
+        return false;
+    }
+    if (p.p66 || p.pf2 || p.pf3) {
+        return false;
+    }
+    return d[p.op_at] == 0x0f && d[p.op_at + 1] == 0xff;
 }
 
 /*
@@ -8391,6 +8436,15 @@ static void cap_x86_gap_apply(csh handle, const CapX86GapPlan *r,
         if (r->dest_rw && op->type == QEMU_PLUGIN_OP_REG &&
             (op->access & QEMU_PLUGIN_OP_ACC_WRITE)) {
             op->access |= QEMU_PLUGIN_OP_ACC_READ;
+        }
+    }
+    if (r->no_reg_write) {
+        out->n_regs_write = 0;
+        for (uint8_t k = 0; k < out->n_operands; k++) {
+            qemu_plugin_operand *op = &out->operands[k];
+            if (op->type == QEMU_PLUGIN_OP_REG) {
+                op->access &= ~QEMU_PLUGIN_OP_ACC_WRITE;
+            }
         }
     }
     if (r->extra_read &&
@@ -8506,7 +8560,20 @@ bool cap_disas_raw_detail(int cap_arch, unsigned int cap_mode,
         memset(insn->detail, 0, sizeof(*insn->detail));
     }
 
+    /*
+     * Almost every repair below is reached because Capstone read NOTHING.
+     * UD0 is reached because Capstone reads the WRONG THING and reports
+     * success, which no failure test can catch; the byte pattern is the
+     * only signal there is, so it is tested before the decode rather than
+     * after it.
+     */
+    if (cap_arch == CS_ARCH_X86 && (cap_mode & CS_MODE_64) &&
+        cap_x86_misdecoded(data, data_size)) {
+        goto repair;
+    }
+
     if (!cs_disasm_iter(handle, &code, &sz, &addr, insn)) {
+    repair:
         /*
          * Capstone read nothing at all.  On x86-64 that is a decode gap
          * rather than an invalid instruction for the seven families

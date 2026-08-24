@@ -12,8 +12,8 @@ LC=/usr/bin/llvm-config-18
 mkdir -p "$D"; cd "$D"
 
 # The harness is the TREE's copy; the working directory only holds evidence.
-cp "$T"/compare_attrib.py "$T"/icedtsv.py "$T"/mkprobe.py \
-   "$T"/xediform.c "$T"/xl3.cc "$T"/reach_probe.c .
+cp "$T"/compare_attrib.py "$T"/qemu_tcg_scope.py "$T"/icedtsv.py \
+   "$T"/mkprobe.py "$T"/xediform.c "$T"/xl3.cc "$T"/reach_probe.c .
 ln -sfn "$R/pylib" pylib                      # iced-x86 1.21.0
 
 # The tracer arm needs the fields columns in --batch (commit 5379a000ac).
@@ -50,9 +50,27 @@ grep -h 'R7.1-NARROW' xl3.err iced.err
 # USER_MSR reachable, and QEMU TCG SIGILLs every one.  Each encoding the
 # tracer arm could not decode is EXECUTED under qemu-x86_64 instead, and
 # compare_attrib.py refuses to run without the result.
+#
+# TWO THINGS THIS LEG CANNOT DO ALONE, both closed by qemu_tcg_scope.py:
+#  * its INPUT is the rows the tracer's own decoder rejected ($2 != 1).  That
+#    is deliberate and stays -- reach_probe calls the bytes for real, and
+#    calling all 8,880 encodings in-process would run jumps, syscalls and
+#    halts -- but it does mean the decoder chose the sample, so the sample
+#    cannot also be the justification.
+#  * a SIGILL at CPL3 from a privileged opcode says "privilege", and a SIGSEGV
+#    (3 rows: JMPABS/PUSHP/POPP) says "the bytes were parsed as something
+#    else".  Neither says "QEMU does not implement it".
+# So every unreachable row must ALSO be charged to a citation read out of the
+# QEMU tree, and compare_attrib.py exits nonzero if any row is not.
 gcc -O0 -Wall -static -o reach_probe reach_probe.c
 awk -F'\t' 'NR>1 && $2 != 1 { print $1 }' tracer_batch.tsv > reach_in.hex
 "$Q/build/qemu-x86_64" -cpu max ./reach_probe < reach_in.hex > reach.tsv
+
+# ---- the exclusion, derived from QEMU rather than from the decoder ---------
+# Prints the feature vocabulary the decode tables can gate on, the CPUID
+# symbols inside the TCG_*_FEATURES masks, and the prefix facts; exits 1 when
+# any cited fact has stopped holding (e.g. QEMU gains EVEX or a new VEX map).
+$PY qemu_tcg_scope.py
 
 # ---- compare ---------------------------------------------------------------
 $PY compare_attrib.py     # -> ../attrib.tsv, ../attrib_signatures.txt

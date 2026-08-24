@@ -10,13 +10,22 @@ disagree.
 
 The headline is NOT the agreement rate.  It is
 
-    TRACER-SUBSET + UNACCOUNTED
+    TRACER-SUBSET + UNACCOUNTED + REACHABLE-UNPROBED
 
 the rows where the reference records something the tracer drops, plus the rows
-where nobody has yet said why the two differ.  A bare disagreement count is
+where nobody has yet said why the two differ, plus the rows a QEMU guest can
+execute and no comparison was ever made for.  A bare disagreement count is
 compatible with both the project's goal (we record MORE) and its one
 disqualifying failure (we record LESS), so it is not reported without the
 direction beside it.
+
+The third term used to sit outside the headline as a total.  It cannot: an
+opcode the tracer fails to decode drops EVERYTHING for that instruction, so it
+is the most severe form of the defect rather than a footnote to it.  It is
+also where a frozen number hid a moving one -- the x86_64 unprobed total read
+2713 in three consecutive reports while its composition moved 2479/234 to
+2363/349 reachable -- so the out-of-scope and reachable components are always
+printed side by side and never summed away.
 
 Usage:
     python coverage_report.py [--cov DIR] [--top N]
@@ -63,7 +72,13 @@ EXEC_REFERENCE = {
 
 
 def read(path, verdict_col, disagree, mnem_col, label_col):
-    """-> (rows, counts, unmapped_labels)"""
+    """-> (rows, counts, unprobed_split)
+
+    unprobed_split is {'no': n, 'yes': n}: an opcode with no comparison drops
+    EVERYTHING for its instruction, so whether a QEMU guest can execute it is
+    the difference between an out-of-scope row and the worst coverage hole in
+    the arc.  The two are never summed into one number here.
+    """
     with open(path, newline='') as f:
         first = f.readline()
         f.seek(0)
@@ -73,8 +88,17 @@ def read(path, verdict_col, disagree, mnem_col, label_col):
         txt = txt[1:]
     rd = csv.DictReader(txt.splitlines(), delimiter='\t')
     rows, counts = [], collections.Counter()
+    unpro = collections.Counter()
     for r in rd:
         counts[r[verdict_col]] += 1
+        if r[verdict_col].upper() == 'UNPROBED':
+            if 'qemu_tcg_reachable' not in r:
+                sys.exit('%s has UNPROBED rows and no qemu_tcg_reachable '
+                         'column: an unprobed opcode without a reachability '
+                         'verdict cannot be told apart from a coverage hole, '
+                         'and this report will not average over the '
+                         'difference' % path)
+            unpro[r['qemu_tcg_reachable']] += 1
         if r[verdict_col] != disagree:
             continue
         if 'direction' not in r:
@@ -84,7 +108,7 @@ def read(path, verdict_col, disagree, mnem_col, label_col):
             r.get('opcode_id', '?'), r.get(mnem_col, '?'),
             r.get(label_col, ''), r.get('set_relation', ''),
             r['direction'], r['category'], r['accounted'] == '1', None))
-    return rows, counts
+    return rows, counts, unpro
 
 
 def main():
@@ -126,59 +150,78 @@ def main():
     w('')
     for d in tax.DIRECTIONS:
         w('  %-16s %s' % (d, tax.DIRECTION_VERDICT[d]))
+    w('  %-16s an opcode a QEMU guest runs and the tracer never decoded: '
+      'the whole instruction is missing' % 'REACHABLE-UNPROBED')
     w('')
 
     # ------------------------------------------------------------- headline
-    w('THE NUMBER THAT MATTERS: TRACER-SUBSET + UNACCOUNTED, per ISA')
+    w('THE NUMBER THAT MATTERS: TRACER-SUBSET + UNACCOUNTED +')
+    w('REACHABLE-UNPROBED, per ISA')
     w('')
-    hdr = ('%-9s %8s %9s %9s %11s %9s %11s %13s'
+    hdr = ('%-9s %8s %9s %9s %11s %9s %11s %13s %10s'
            % ('ISA', 'probed', 'agree', 'disagree', 'SUPERSET', 'SUBSET',
-              'ORTHOGONAL', 'UNACCOUNTED'))
+              'ORTHOGONAL', 'UNACCOUNTED', 'HOLE'))
     w(hdr)
     w('-' * len(hdr))
     grand = collections.Counter()
     gcounts = collections.Counter()
     for isa, _, vcol, dtok, _, _ in ISAS:
-        rows, counts = per_isa[isa]
+        rows, counts, _unp = per_isa[isa]
         c = collections.Counter(r.direction for r in rows)
         agree = counts.get('AGREE', 0) + counts.get('agree', 0)
         unpro = counts.get('UNPROBED', 0) + counts.get('unprobed', 0)
         probed = agree + len(rows)
+        gcounts['hole'] += _unp['yes']
+        gcounts['outofscope'] += _unp['no']
         for k in tax.DIRECTIONS:
             grand[k] += c[k]
         gcounts['agree'] += agree
         gcounts['probed'] += probed
         gcounts['unprobed'] += unpro
         gcounts['disagree'] += len(rows)
-        w('%-9s %8d %9d %9d %11d %9d %11d %13d'
+        w('%-9s %8d %9d %9d %11d %9d %11d %13d %10d'
           % (isa, probed, agree, len(rows), c[tax.SUPERSET], c[tax.SUBSET],
-             c[tax.ORTHOGONAL], c[tax.UNACCOUNTED]))
+             c[tax.ORTHOGONAL], c[tax.UNACCOUNTED], _unp['yes']))
     w('-' * len(hdr))
-    w('%-9s %8d %9d %9d %11d %9d %11d %13d'
+    w('%-9s %8d %9d %9d %11d %9d %11d %13d %10d'
       % ('all four', gcounts['probed'], gcounts['agree'], gcounts['disagree'],
          grand[tax.SUPERSET], grand[tax.SUBSET], grand[tax.ORTHOGONAL],
-         grand[tax.UNACCOUNTED]))
+         grand[tax.UNACCOUNTED], gcounts['hole']))
     w('')
-    w('%-9s %s' % ('ISA', 'TRACER-SUBSET + UNACCOUNTED'))
+    w('HOLE = unprobed AND executable by a QEMU guest.  It is in the headline')
+    w('because it is the most severe form of the defect, not a footnote: a row')
+    w('the tracer cannot decode drops the ENTIRE instruction, every register')
+    w('and every memop, where a SUBSET row drops only part of one.')
+    w('')
+    w('%-9s %s' % ('ISA', 'TRACER-SUBSET + UNACCOUNTED + REACHABLE-UNPROBED'))
     for isa, _, _, _, _, _ in ISAS:
-        rows, _ = per_isa[isa]
+        rows, _c2, _unp = per_isa[isa]
         c = collections.Counter(r.direction for r in rows)
-        w('%-9s %d  (subset %d + unaccounted %d)'
-          % (isa, c[tax.SUBSET] + c[tax.UNACCOUNTED], c[tax.SUBSET],
-             c[tax.UNACCOUNTED]))
-    w('%-9s %d  (subset %d + unaccounted %d)'
-      % ('all four', grand[tax.SUBSET] + grand[tax.UNACCOUNTED],
-         grand[tax.SUBSET], grand[tax.UNACCOUNTED]))
+        w('%-9s %d  (subset %d + unaccounted %d + hole %d)'
+          % (isa, c[tax.SUBSET] + c[tax.UNACCOUNTED] + _unp['yes'],
+             c[tax.SUBSET], c[tax.UNACCOUNTED], _unp['yes']))
+    w('%-9s %d  (subset %d + unaccounted %d + hole %d)'
+      % ('all four',
+         grand[tax.SUBSET] + grand[tax.UNACCOUNTED] + gcounts['hole'],
+         grand[tax.SUBSET], grand[tax.UNACCOUNTED], gcounts['hole']))
     w('')
-    w('UNPROBED, counted here and nowhere else: %d.  An opcode with no'
-      % gcounts['unprobed'])
-    w('comparison has no direction; it is the most complete form of dropped')
-    w('information, not a row that agreed.')
+    # The unprobed TOTAL is never printed alone.  It sat frozen at 2713 across
+    # three x86_64 reports while its composition moved 2479/234 -> 2363/349
+    # reachable; a constant hid a 50% growth in the coverage hole.  Both
+    # components travel together, always.
+    w('UNPROBED, counted here and nowhere else: %d = %d out-of-scope + %d'
+      % (gcounts['unprobed'], gcounts['outofscope'], gcounts['hole']))
+    w('REACHABLE.  An opcode with no comparison has no direction; it is the')
+    w('most complete form of dropped information, not a row that agreed.  The')
+    w('out-of-scope component is only out of scope where the per-ISA harness')
+    w('charged it to a citation from the QEMU tree -- for x86_64 that is')
+    w('qemu_tcg_scope.py, which re-asserts every citation on every run and')
+    w('refuses when one goes stale.  The REACHABLE component is the hole.')
     w('')
 
     # ------------------------------------------------- per-ISA cross-tables
     for isa, _, _, _, _, _ in ISAS:
-        rows, _ = per_isa[isa]
+        rows = per_isa[isa][0]
         w('=' * 78)
         w(tax.render_crosstab(
             rows, '%s -- CROSS-TABULATION  direction x category' % isa))
@@ -195,7 +238,7 @@ def main():
 
     # ------------------------------------------------- unaccounted, by ISA
     for isa, _, _, _, _, _ in ISAS:
-        rows, _ = per_isa[isa]
+        rows = per_isa[isa][0]
         w('=' * 78)
         w('%s -- %s' % (isa, tax.render_unaccounted(rows, a.top).splitlines()[0]))
         w('')

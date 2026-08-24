@@ -41,6 +41,7 @@ for _p in (D, os.path.dirname(D), _TOOLS):
 else:
     sys.exit('arc3_taxonomy.py not found (set CST_ARC3_TOOLS)')
 import arc3_taxonomy as tax
+import qemu_tcg_scope as tcgscope
 import arc3_rules as taxrules
 
 # ---------------------------------------------------------------- vocabulary
@@ -255,6 +256,19 @@ if not REACH:
              'assumed.  Run REPRODUCE.sh, which builds reach_probe.c and '
              'executes every encoding under qemu-x86_64.')
 
+# The execution probe is fed the encodings the TRACER could not decode
+# (REPRODUCE.sh), and at CPL3 a SIGILL from a privileged opcode says
+# "privilege", not "unimplemented".  Neither leg is independent of the
+# decoder on its own, so every exclusion must ALSO carry a citation derived
+# from QEMU's own source; qemu_tcg_scope re-asserts those citations here and
+# a stale one stops the report rather than quietly excusing 2,000 rows.
+_stale = tcgscope.selfcheck()
+if _stale:
+    for _s in _stale:
+        sys.stderr.write('STALE SCOPE CITATION: %s\n' % _s)
+    sys.exit('the QEMU-derived scope model no longer matches the tree: the '
+             'unreachable rows are unjustified until it is repaired')
+
 reach_conflicts = []          # measurement and name test disagree
 reach_unmeasured = set()      # no execution verdict; the name test stood in
 
@@ -456,20 +470,63 @@ w('DENOMINATOR   x86_64 opcode space                 : %d' % len(opcodes))
 w('  ATTEMPTED   (a reference AND a tracer set exist): %d' % (n_agree + n_dis))
 w('  AGREE       (sets identical, both directions)   : %d' % n_agree)
 w('  DISAGREE                                        : %d' % n_dis)
-w('  UNPROBED                                        : %d' %
-  (n_unprobed_tracer + n_unprobed_ref))
+# The unprobed TOTAL is never printed on its own.  It sat frozen at 2713
+# across three reports while its composition moved 2479/234 -> 2363/349
+# reachable: the constant hid a 50% growth in the coverage hole.  Both
+# components are printed on the same line, always, so the next change cannot
+# hide inside a sum.
+_unp_unreach = sum(v for (_why, rc), v in unprobed_by_reach.items() if rc == 'no')
+_unp_reach = sum(v for (_why, rc), v in unprobed_by_reach.items() if rc == 'yes')
+_unp_hole = sum(v for (why, rc), v in unprobed_by_reach.items()
+                if why == 'tracer_decode_fail' and rc == 'yes')
+w('  UNPROBED  = out-of-scope + REACHABLE HOLE     : %d = %d + %d'
+  % (_unp_unreach + _unp_reach, _unp_unreach, _unp_reach))
 w('')
 w('UNPROBED BREAKDOWN  (an opcode that could not be probed is NOT an opcode')
 w('that agreed; it is reported here and counted nowhere else)')
 for (why, reach), n in sorted(unprobed_by_reach.items(), key=lambda kv: -kv[1]):
     w('  %-22s  qemu-tcg-reachable=%-3s : %5d' % (why, reach, n))
 w('')
-w('The 2363 unreachable rows are AVX512/AVX10/APX/AMX/ACE forms QEMU TCG does')
-w('not advertise, so no QEMU x86_64 guest can execute them.  The %d reachable'
-  % sum(v for (why, rc), v in unprobed_by_reach.items()
-        if why == 'tracer_decode_fail' and rc == 'yes'))
-w('ones are a real coverage hole -- the tracer\'s decoder rejects the bytes, so')
-w('the trace would carry no register sets at all.  By XED extension:')
+
+# ---------------------------------------------- the exclusion, from QEMU
+# Every unreachable row is charged to a mechanism read out of QEMU's own
+# source, not out of the tracer's failure to decode it, and not out of an
+# extension NAME.  A row this model cannot charge is an unjustified
+# exclusion and stops the report.
+_scope_mech = collections.Counter()
+_scope_cite = {}
+_uncited = []
+for r in rows:
+    if r[6] != 'UNPROBED' or r[5] != 'no':
+        continue
+    _sc = tcgscope.classify(r[4], r[3], META.get(r[0], {}).get('isa_set', ''))
+    if _sc is None:
+        _uncited.append(r)
+    else:
+        _scope_mech[_sc.mechanism] += 1
+        _scope_cite[_sc.mechanism] = _sc
+w('WHY THE %d OUT-OF-SCOPE ROWS ARE OUT OF SCOPE  (derived from the QEMU tree,'
+  % _unp_unreach)
+w('re-asserted at every run by qemu_tcg_scope.selfcheck; NOT from the tracer')
+w('failing to decode them and NOT from an XED extension name)')
+w('')
+for _m, _n in _scope_mech.most_common():
+    _sc = _scope_cite[_m]
+    w('  %-28s %5d' % (_m, _n))
+    w('      cite   : %s' % _sc.citation)
+    w('      reach  : %s' % _sc.remedy)
+w('')
+if _uncited:
+    w('  *** %d UNREACHABLE ROWS WITH NO QEMU CITATION ***' % len(_uncited))
+    for r in _uncited[:20]:
+        w('      %-14s %-18s %s' % (r[4], r[1], r[3]))
+w('')
+w('The %d REACHABLE unprobed rows are the coverage hole: a QEMU x86_64 guest'
+  % _unp_reach)
+w('runs them, and for the %d of those the TRACER rejects, the trace carries no'
+  % _unp_hole)
+w('register sets at all -- the most severe form of dropped information there')
+w('is.  By XED extension:')
 unp_ext = collections.Counter()
 for r in rows:
     if r[6] == 'UNPROBED' and r[5] == 'yes' and 'tracer' in r[7]:
@@ -533,6 +590,13 @@ w('  tracer decoder rejects the bytes, not reachable      : %d' %
 w('  reference decoder rejects the bytes                  : %d' %
   sum(v for (why, rc), v in unprobed_by_reach.items()
       if why == 'reference_decode_fail'))
+w('')
+w('')
+w('  the two legs of the exclusion, and neither is the decoder\'s opinion:')
+w('    executed under qemu-x86_64 -cpu max, SIGILL           : %d' % _unp_unreach)
+w('    charged to a QEMU source citation (qemu_tcg_scope)    : %d'
+  % sum(_scope_mech.values()))
+w('    unreachable rows with NO citation (must be 0)         : %d' % len(_uncited))
 w('')
 w('  reachability is MEASURED: every encoding above was executed under')
 w('  qemu-x86_64 -cpu max and SIGILL is QEMU\'s TCG front end refusing it')
@@ -705,3 +769,10 @@ w('                  AND MM<n>, which in hardware aliases ST(<n>), not XMM')
 txt = '\n'.join(out) + '\n'
 open(os.path.join(COV, 'attrib_signatures.txt'), 'w').write(txt)
 print(txt)
+
+# An exclusion that nothing in QEMU justifies is not an exclusion.  This is
+# the only place the report refuses: the rows it would otherwise drop are the
+# ones that cost EVERYTHING for their instruction.
+if _uncited:
+    sys.exit('%d unreachable rows carry no QEMU citation; they are '
+             'unjustified exclusions, not out-of-scope rows' % len(_uncited))

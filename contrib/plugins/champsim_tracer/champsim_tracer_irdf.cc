@@ -74,8 +74,44 @@ uint64_t g_n_agree    = 0;
 uint64_t g_n_disagree = 0;
 uint64_t g_n_unmapped = 0;   /* had a register neither side can name in common */
 
+/*
+ * The memop arm.
+ *
+ * The register arm above declines an instruction the moment QEMU's
+ * extraction is short of whole -- a helper, a field, an overflow.  The
+ * memop question must NOT inherit those refusals: n_mem_reads /
+ * n_mem_writes come from qemu_plugin_insn_dataflow_status(), which counts
+ * the qemu_ld / qemu_st ops the target emitted and answers even when the
+ * register extraction overflowed.  So every translated instruction is
+ * scored here, including the ones the register arm had to set aside.
+ *
+ * What is compared is the tracer's TEMPLATE-STATIC claim (max_dep_loads /
+ * max_dep_stores, walked out of the Capstone operand list) against the
+ * number of memory ops QEMU's own translation of the same bytes emitted.
+ * Neither is the runtime count -- a predicated or self-looping instruction
+ * issues fewer or more, and CST_FID_N_LOADS / N_STORES carry that -- so the
+ * comparison is of PRESENCE and of the static bound, which is exactly what
+ * the dep-mask layout is built from.
+ *
+ * A helper is the one case where QEMU's zero is not evidence of absence:
+ * an access performed inside a helper emits no qemu_ld/qemu_st, so it is
+ * counted apart rather than called a tracer overclaim.
+ */
+uint64_t g_m_agree     = 0;
+uint64_t g_m_disagree  = 0;
+uint64_t g_m_helper_lo = 0;  /* ir says fewer, and the insn calls a helper */
+uint64_t g_m_nostatus  = 0;  /* status refused outright */
+/* Truncation census.  STATUS section 5 records 0.011%/0.001% as a FLOOR:
+ * these count what this workload actually hit, per instruction and as a
+ * distinct-opcode set, so the floor stops being quoted as a bound. */
+uint64_t g_t_fields    = 0;
+uint64_t g_t_writes    = 0;
+uint64_t g_t_prov      = 0;
+
 GHashTable *g_sigs = nullptr;             /* char* -> count, boxed */
 GHashTable *g_unmapped_by_name = nullptr;
+GHashTable *g_msigs = nullptr;            /* memop disagreement signatures */
+GHashTable *g_trunc_by_mnem = nullptr;    /* opcodes that overflowed 8/8 */
 
 void tally(GHashTable **t, const char *key)
 {
@@ -210,6 +246,54 @@ void diff_names(const std::vector<uint8_t> &ir,
     }
 }
 
+/*
+ * Score one instruction's memop claim against QEMU's translation of it, and
+ * record whether the 8/8 dataflow capacity was exceeded.
+ *
+ * The tracer's static claim is decoded here rather than taken from the
+ * caller so that the template path is untouched by the presence of the
+ * instrument -- the same reason the register arm re-decodes.
+ */
+void score_memops(const qemu_plugin_insn_info *info,
+                  const qemu_plugin_dataflow_status *st)
+{
+    InsnFieldsScratch s;
+    char sig[192];
+
+    if (st->fields_truncated || st->writes_truncated || st->prov_truncated) {
+        g_t_fields += st->fields_truncated ? 1 : 0;
+        g_t_writes += st->writes_truncated ? 1 : 0;
+        g_t_prov   += st->prov_truncated ? 1 : 0;
+        tally(&g_trunc_by_mnem, info->mnemonic);
+    }
+
+    insn_fields_scratch_reset(&s);
+    decode_detail_to_generic(0, info, &s.f, nullptr);
+
+    unsigned tr_ld = s.f.max_dep_loads, tr_st = s.f.max_dep_stores;
+    unsigned ir_ld = st->n_mem_reads,   ir_st = st->n_mem_writes;
+
+    if (tr_ld == ir_ld && tr_st == ir_st) {
+        g_m_agree++;
+        return;
+    }
+    /*
+     * QEMU emitted fewer memops than the tracer claims AND the instruction
+     * calls a helper: the access, if there is one, happens inside the call
+     * where no qemu_ld/qemu_st exists to be counted.  Silence there is not
+     * evidence, so it is set aside by name instead of scored.
+     */
+    if (st->n_calls > 0 && ir_ld <= tr_ld && ir_st <= tr_st) {
+        g_m_helper_lo++;
+        return;
+    }
+    g_m_disagree++;
+    snprintf(sig, sizeof sig, "%s  ir(%u,%u) tracer(%u,%u)%s",
+             info->mnemonic, ir_ld, ir_st, tr_ld, tr_st,
+             st->n_calls > 0 ? " [helper]" : "");
+    tally(&g_msigs, sig);
+}
+
 void dump_tally(GString *report, GHashTable *t, const char *heading)
 {
     GList *keys;
@@ -263,8 +347,14 @@ void irdf_note_insn(const struct qemu_plugin_tb *tb, size_t idx,
     st.struct_size = sizeof(st);
     if (!qemu_plugin_insn_dataflow_status(tb, idx, &st)) {
         g_n_declined++;
+        g_m_nostatus++;
         return;
     }
+
+    /* The memop arm runs BEFORE the register arm's refusals, because none of
+     * them applies to it -- see the counter block. */
+    score_memops(info, &st);
+
     if (st.n_calls > 0) {
         g_n_helper++;
         return;
@@ -409,4 +499,24 @@ void irdf_report(GString *report)
     dump_tally(report, g_unmapped_by_name,
                "globals the tracer has no word for");
     dump_tally(report, g_sigs, "disagreement signatures");
+
+    g_string_append_printf(report,
+            "\n--- memops: QEMU's translation vs the tracer's static claim ---\n"
+            "scored:   %" PRIu64 " agree, %" PRIu64 " disagree\n"
+            "declined: %" PRIu64 " helper-low (ir has fewer AND the insn calls "
+            "a helper: an access inside the call emits no qemu_ld/qemu_st, so "
+            "silence is not evidence)\n"
+            "          %" PRIu64 " no status\n",
+            g_m_agree, g_m_disagree, g_m_helper_lo, g_m_nostatus);
+    dump_tally(report, g_msigs, "memop disagreement signatures");
+
+    g_string_append_printf(report,
+            "\ntruncation (INSN_DF_MAX_FIELDS=8 / INSN_DF_MAX_WRITES=8): "
+            "%" PRIu64 " fields, %" PRIu64 " writes, %" PRIu64 " prov; "
+            "%u distinct opcodes\n"
+            "  -- this bounds the REGISTER dataflow API only: memop recording "
+            "runs off the runtime memory callback and is not gated by it.\n",
+            g_t_fields, g_t_writes, g_t_prov,
+            g_trunc_by_mnem ? g_hash_table_size(g_trunc_by_mnem) : 0);
+    dump_tally(report, g_trunc_by_mnem, "opcodes that overflowed the 8/8 limits");
 }

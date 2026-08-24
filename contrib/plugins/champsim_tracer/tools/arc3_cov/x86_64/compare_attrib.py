@@ -206,6 +206,37 @@ def adjudicate(hexs, xsrc, xdst):
                     dst.discard(r)
                     ADJ['ADJ-2b XED has the operand role INVERTED, not '
                         'merely lost (iced+LLVM over XED)'] += 1
+    # ADJ-11: the ADJ-2 protocol in its third direction.  Where iced-x86 AND
+    # LLVM MC both name a register in a role XED gives it in NEITHER role,
+    # XED has not mis-labelled the operand -- it has LOST it, and two
+    # independent references outweigh one.  Measured subjects: MWAITX's EBX
+    # (the timer value read when ECX[1] is set), VMSAVE's RAX (the physical
+    # address of the VMCB), and the sixteen vector destinations of VZEROALL
+    # and VZEROUPPER, which XED reports as writing nothing at all.
+    xed_mn_for_adj = REF.get(hexs, {}).get('XED', {}).get('mn', '')
+    if iced and iced['ok'] and llvm and llvm['ok']:
+        both = src | dst
+        for r in sorted((iced['src'] & llvm['src']) - both):
+            src.add(r)
+            ADJ['ADJ-11 XED omits a register both other references name '
+                '(iced+LLVM over XED)'] += 1
+        for r in sorted((iced['dst'] & llvm['dst']) - both):
+            dst.add(r)
+            ADJ['ADJ-11 XED omits a register both other references name '
+                '(iced+LLVM over XED)'] += 1
+    # ADJ-12: LLDT and LTR read the DESCRIPTOR TABLE they load from.  The
+    # selector operand indexes the GDT, and QEMU's helpers say so literally
+    # -- helper_lldt() and helper_ltr() both open with `dt = &env->gdt`
+    # before writing env->ldt / env->tr (target/i386/tcg/seg_helper.c).  XED
+    # names the destination register and not the table it was fetched
+    # through; the tracer records the read at the decode boundary
+    # (disas/capstone.c, cap_x86_add_sysregs).  Both collapse to one
+    # GenericRegId, so the comparison sees it as a source the reference
+    # lacks rather than as a distinct register.
+    if xed_mn_for_adj in ('LLDT', 'LTR'):
+        src.add('GDTR')
+        ADJ['ADJ-12 LLDT/LTR read the GDT to fetch the descriptor '
+            '(QEMU helper over XED)'] += 1
     # -------------------------------------------------------------- x87
     # XED models the x87 escapes with a BLANKET "writes X87STATUS, writes
     # ST(0)" that is right for the arithmetic and wrong for four families.

@@ -8315,7 +8315,22 @@ static bool cap_x86_gap_plan(const uint8_t *d, size_t n, CapX86GapPlan *r)
      * point is architecturally reserved has no business claiming a
      * prefixed form nobody has enumerated.
      */
-    if (p.p66 || p.pf2 || p.pf3) {
+    /*
+     * ONE code point in the F3 half of that space is a reserved NOP and
+     * not an assignment: IBHF, F3 REX.W 0F 1E F8.  QEMU's decoder agrees
+     * -- [0x1e] = X86_OP_ENTRY1(NOP, nop,v) is ungated and prefix-blind,
+     * so a guest executes these bytes as a plain reserved NOP -- and XED
+     * decodes them as NOP reading the r/m and the ModRM.reg register,
+     * which is exactly what the repair below produces.  Measured, not
+     * assumed: qemu-x86_64 -cpu max RUNS f3 48 0f 1e f8 where it raises
+     * SIGILL on every other encoding in this arc's gap set, and the
+     * surrogate f3 48 0f 1f f8 keeps the F3 prefix, so the length stays
+     * 5.  The exception is written as ONE code point rather than as "F3
+     * with 0F 1E", because /1 is RDSSPD/RDSSPQ and FA/FB are
+     * ENDBR64/ENDBR32 and those must keep refusing.
+     */
+    if (!(p.pf3 && !p.p66 && !p.pf2 && d[o + 1] == 0x1e && modrm == 0xf8) &&
+        (p.p66 || p.pf2 || p.pf3)) {
         return false;
     }
     if (d[o + 1] == 0x18 && modrm >= 0xc0 && ((modrm >> 3) & 7) <= 3) {

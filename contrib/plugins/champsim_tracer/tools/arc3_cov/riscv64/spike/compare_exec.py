@@ -158,15 +158,37 @@ def zero_width(ins):
     return [n for n, v, w in ins.writes if w == 0]
 
 
+#: how many reference writes NONARCH_CSRS has actually removed.  A named
+#: exclusion that matches nothing is a justification nobody can check, so it
+#: is counted and the run refuses on a zero (see the emit.py precedent in the
+#: static harness, where a stale "neither decoder decodes this" kept two
+#: Zicfiss opcodes out of the denominator long after it stopped being true).
+NONARCH_DROPPED = collections.Counter()
+
+
 def fold_ref_csr(csr):
     """Reference CSR writes, grouped by the tracer id each folds onto.
 
     {tracer id: {spike csr name: value}}.  Grouping rather than collapsing is
     what lets the value axis say "one id, two architectural writes" instead of
     choosing one of them and calling the other agreement.
+
+    A CSR OUTSIDE THE ISA THE GUEST WAS BUILT FOR IS NOT PART OF THE
+    REFERENCE.  spike at this revision carries the matrix/Zvt extension and
+    clears its `mtype` (0xC23) inside `vectorUnit_t::set_vl`
+    (vector_unit.cc:148-152) as its own bookkeeping, so EVERY vsetvl logged a
+    write to a register RVV 1.0 does not have and the tracer correctly has no
+    id for.  Labelling that `REF-NONARCH-CSR` named the mechanism and left the
+    row a TRACER-SUBSET -- a permanent coverage hole charged to the tracer for
+    a simulator implementation detail.  It is dropped here instead, on the
+    reference side where it comes from, and the drop is counted so a
+    justification that stops matching cannot go unnoticed.
     """
     out = {}
     for name, val in csr.items():
+        if name in spike_ref.NONARCH_CSRS:
+            NONARCH_DROPPED[name] += 1
+            continue
         tid = None
         for k, members in spike_ref.FOLD_MEMBERS.items():
             if name in members:
@@ -261,11 +283,27 @@ def compare_insn(r, t):
                 SUBSET, 'VALUE-MISMATCH'))
 
     # --- memop-count
+    #
+    # A COUNT IS ORDERED AND A SET IS NOT, and spelling the counts as the
+    # tokens `ld=0` / `ld=1` and comparing them as sets got the direction
+    # WRONG: {ld=0,st=1} and {ld=1,st=1} are neither a subset nor a superset
+    # of one another, so a row where the tracer records strictly MORE
+    # accesses than the reference -- the store-conditional whose cmpxchg
+    # lowering really reads -- came out ORTHOGONAL, "different vocabulary for
+    # the same fact".  It is not a vocabulary difference; one side counted
+    # more, and which side is the whole result.  Compare the two axes as the
+    # numbers they are: >= on both with > on one is TRACER-SUPERSET, <= with
+    # < is TRACER-SUBSET, and only a genuine split -- more loads and fewer
+    # stores, or the reverse -- is ORTHOGONAL.
     rcnt = (len(r.loads), len(r.stores))
     tcnt = (len(t.loads), len(t.stores))
     if rcnt != tcnt:
-        rel = set_relation((), ['ld=%d' % rcnt[0], 'st=%d' % rcnt[1]],
-                           (), ['ld=%d' % tcnt[0], 'st=%d' % tcnt[1]])
+        if tcnt[0] >= rcnt[0] and tcnt[1] >= rcnt[1]:
+            rel = SUPERSET
+        elif tcnt[0] <= rcnt[0] and tcnt[1] <= rcnt[1]:
+            rel = SUBSET
+        else:
+            rel = ORTHOGONAL
         lab = 'QEMU-SC-CMPXCHG' if (is_sc(r.bits) and rcnt[0] == 0 and
                                     tcnt[0] == 1 and
                                     rcnt[1] == tcnt[1]) else None
@@ -487,11 +525,25 @@ def main():
     w(render_conflicts(classified))
     w(render_unaccounted(classified))
     w('')
+    # The reference-side exclusion, stated with its count.  A named exclusion
+    # that removed nothing is a justification nobody can check, so it counts
+    # against the headline rather than passing quietly.
+    w('REFERENCE-SIDE EXCLUSIONS -- CSRs outside the ISA the guest was')
+    w('built for, dropped where they come from and counted here')
+    stale = []
+    for name in sorted(spike_ref.NONARCH_CSRS):
+        k = NONARCH_DROPPED[name]
+        w('  %-12s %6d reference writes dropped%s'
+          % (name, k, '' if k else '   STALE: matched nothing'))
+        if not k:
+            stale.append(name)
+    w('')
     bad_unaligned = sum(1 for u in unaligned if u[2].startswith('UNEXPLAINED'))
     hl = sum(1 for r in classified
              if r.direction in (SUBSET, UNACCOUNTED)) + bad_unaligned
     if unproven:
         hl += len(unproven)          # an unproven axis is not a passing axis
+    hl += len(stale)
     w('HEADLINE  TRACER-SUBSET + UNACCOUNTED = %d' % hl)
 
     text = '\n'.join(out)

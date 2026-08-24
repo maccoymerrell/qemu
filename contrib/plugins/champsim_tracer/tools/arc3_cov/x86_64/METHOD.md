@@ -15,6 +15,7 @@ reported `UNMAPPED:<name>` and never silently agrees.
 | `icedtsv.py` | iced-x86 elaborator, same TSV schema |
 | `mkprobe.py` | per-opcode probe encodings (EVEX mask slots re-probed `aaa=001`) |
 | `xediform.c` | iform + length, for verifying a re-encoded variant is the same opcode |
+| `reach_probe.c` | executes an encoding under qemu-x86_64; SIGILL is TCG refusing it |
 | `compare_attrib.py` | the comparison, the adjudications, the mechanism roll-up |
 
 ## R7.1 is applied by CORRECTING THE REFERENCE
@@ -86,3 +87,27 @@ An agreement rate quoted off an instrument nobody has watched fail vouches
 for nothing.  `REPRODUCE.sh` damages the tracer arm with
 `--falsify=drop-src:<mnem>` and requires the agreement count to fall by
 exactly the agreeing rows of that mnemonic.
+
+## Reachability is measured, not named
+
+Whether a QEMU x86_64 guest can execute an encoding is what decides whether a
+tracer decode gap there costs anything, so the column is the verdict of
+running the bytes, not a test on XED's extension string.  `reach_probe.c`
+writes each encoding into an executable page and calls it; run under
+`qemu-x86_64 -cpu max`, a SIGILL is QEMU's own TCG front end refusing the
+opcode.  `compare_attrib.py` exits rather than run without `reach.tsv`.
+
+The name test it replaced is kept only to be contradicted, and its count of
+contradictions is printed.  It was wrong by 286 rows.  128 of them are APX:
+XED keeps a promoted instruction's ORIGINAL extension — `BMI1`, `BMI2`,
+`ADOX_ADCX`, `LZCNT`, `MOVBE`, `RAO`, `USER_MSR` — and carries APX only in the
+ISA-SET, so a test on the extension called every EVEX-promoted `andn`, `bextr`
+and `adcx` reachable when QEMU TCG has no APX at all.  The other 158 are
+AVX_VNNI, AVX_IFMA, SM3, SM4, SHA512, KEYLOCKER, RAO and the rest, none of
+which appears in `target/i386/tcg/decode-new.c.inc`.
+
+**What the probe cannot see**, and what the report therefore does not claim:
+an instruction QEMU implements only at CPL 0 would SIGILL here for the
+privilege rather than for the opcode.  Every SIGILL row was cross-checked
+against `decode-new.c.inc` and is absent from it entirely, so the two agree
+today; a future divergence is a finding, not a footnote.

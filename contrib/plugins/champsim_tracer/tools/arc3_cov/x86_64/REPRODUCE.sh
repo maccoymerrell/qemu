@@ -13,7 +13,7 @@ mkdir -p "$D"; cd "$D"
 
 # The harness is the TREE's copy; the working directory only holds evidence.
 cp "$T"/compare_attrib.py "$T"/icedtsv.py "$T"/mkprobe.py \
-   "$T"/xediform.c "$T"/xl3.cc .
+   "$T"/xediform.c "$T"/xl3.cc "$T"/reach_probe.c .
 ln -sfn "$R/pylib" pylib                      # iced-x86 1.21.0
 
 # The tracer arm needs the fields columns in --batch (commit 5379a000ac).
@@ -42,6 +42,17 @@ $PY icedtsv.py probe_uniq.hex > iced.tsv 2> iced.err
 # preserve-read they suppress, and print the counts.  A zero here means the
 # rule has stopped reaching its subject -- a finding, not a pass.
 grep -h 'R7.1-NARROW' xl3.err iced.err
+
+# ---- reachability, MEASURED ------------------------------------------------
+# Whether a QEMU x86_64 guest can execute an encoding decides whether a decode
+# gap there costs anything.  It is not read off XED's extension string: that
+# guess called all 128 APX forms of BMI1/BMI2/ADOX_ADCX/LZCNT/MOVBE/RAO/
+# USER_MSR reachable, and QEMU TCG SIGILLs every one.  Each encoding the
+# tracer arm could not decode is EXECUTED under qemu-x86_64 instead, and
+# compare_attrib.py refuses to run without the result.
+gcc -O0 -Wall -static -o reach_probe reach_probe.c
+awk -F'\t' 'NR>1 && $2 != 1 { print $1 }' tracer_batch.tsv > reach_in.hex
+"$Q/build/qemu-x86_64" -cpu max ./reach_probe < reach_in.hex > reach.tsv
 
 # ---- compare ---------------------------------------------------------------
 $PY compare_attrib.py     # -> ../attrib.tsv, ../attrib_signatures.txt

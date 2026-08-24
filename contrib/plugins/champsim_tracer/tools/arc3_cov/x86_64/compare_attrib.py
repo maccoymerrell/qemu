@@ -221,12 +221,53 @@ with open(os.path.join(COV, 'opcodes_meta.tsv')) as f:
         if len(p) >= 5:
             META[p[0]] = dict(iclass=p[1], isa_set=p[2], ext=p[3], cat=p[4])
 
-# ISA sets QEMU TCG does not advertise -- kept in the denominator, but a
-# tracer gap there is not reachable by a QEMU x86_64 guest.
-def unreachable(ext, isa_set):
+# ------------------------------------------------------------ reachability
+# Whether a QEMU x86_64 guest can execute an encoding decides whether a
+# tracer decode gap there costs anything, so it is MEASURED, not named:
+# reach.tsv carries the verdict of running each encoding under
+# qemu-x86_64 (reach_probe.c, driven by REPRODUCE.sh).
+#
+# The name test below is kept, but only as a CROSS-CHECK that is required
+# to disagree out loud.  It used to BE the answer, and it was wrong by 128
+# rows: XED keeps a promoted instruction's original extension (BMI1, BMI2,
+# ADOX_ADCX, LZCNT, MOVBE, RAO, USER_MSR) and carries APX only in the
+# isa-set, so `ext.startswith('APX')` called every APX form of an
+# ordinary instruction reachable.  QEMU TCG has no APX and SIGILLs all of
+# them, which is exactly what the measurement says and the name did not.
+def name_guess_unreachable(ext, isa_set):
     return (ext.startswith('AVX512') or ext.startswith('AVX10') or
-            ext.startswith('APX') or ext.startswith('AMX') or
-            ext == 'ACE')
+            ext.startswith('APX') or isa_set.startswith('APX') or
+            ext.startswith('AMX') or ext == 'ACE')
+
+REACH = {}
+_reach_path = os.path.join(D, 'reach.tsv')
+if os.path.exists(_reach_path):
+    with open(_reach_path) as f:
+        next(f)
+        for line in f:
+            q = line.rstrip('\n').split('\t')
+            if len(q) >= 2:
+                REACH[q[0]] = (q[1] == 'yes')
+# A check that cannot find its subject must fail rather than quietly fall
+# back to the guess it replaced.
+if not REACH:
+    sys.exit('reach.tsv missing or empty: reachability is measured, not '
+             'assumed.  Run REPRODUCE.sh, which builds reach_probe.c and '
+             'executes every encoding under qemu-x86_64.')
+
+reach_conflicts = []          # measurement and name test disagree
+reach_unmeasured = set()      # no execution verdict; the name test stood in
+
+def unreachable(ext, isa_set, hexs=None):
+    """True when no QEMU x86_64 guest can execute these bytes."""
+    guess_unreach = name_guess_unreachable(ext, isa_set)
+    ran = REACH.get(hexs)
+    if ran is None:
+        reach_unmeasured.add(hexs)
+        return guess_unreach
+    if guess_unreach == ran:
+        reach_conflicts.append((hexs, ext, isa_set, guess_unreach, ran))
+    return not ran
 
 def classtok(t):
     """Collapse register NUMBER so signatures group across the bank (C3:
@@ -297,7 +338,7 @@ for opid, mnem, enc_hex, srctab in opcodes:
     r = REF.get(hexs, {})
     xed = r.get('XED')
     t = TR.get(hexs)
-    reach = 'no' if unreachable(md['ext'], md['isa_set']) else 'yes'
+    reach = 'no' if unreachable(md['ext'], md['isa_set'], hexs) else 'yes'
 
     if t is None or not t['ok']:
         n_unprobed_tracer += 1
@@ -492,6 +533,20 @@ w('  tracer decoder rejects the bytes, not reachable      : %d' %
 w('  reference decoder rejects the bytes                  : %d' %
   sum(v for (why, rc), v in unprobed_by_reach.items()
       if why == 'reference_decode_fail'))
+w('')
+w('  reachability is MEASURED: every encoding above was executed under')
+w('  qemu-x86_64 -cpu max and SIGILL is QEMU\'s TCG front end refusing it')
+w('  (reach_probe.c).  A name test on XED\'s extension / isa-set is kept')
+w('  only to be contradicted out loud.')
+w('    encodings with an execution verdict     : %d' % len(REACH))
+w('    encodings the name test stood in for    : %d' % len(reach_unmeasured))
+w('    name test contradicted by the run       : %d' % len(reach_conflicts))
+for hx, ext, iset, guess, ran in reach_conflicts[:12]:
+    w('      %-16s %-16s %-18s name=%s run=%s' %
+      (hx, ext, iset, 'unreachable' if guess else 'reachable',
+       'ran' if ran else 'SIGILL'))
+if len(reach_conflicts) > 12:
+    w('      ... and %d more' % (len(reach_conflicts) - 12))
 w('')
 w('MEMOP ATTRIBUTION  (count / address / data for every load and store) is')
 w('HALF the deliverable and this harness does not measure any of it: the')

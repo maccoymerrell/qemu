@@ -1,0 +1,6 @@
+# QEMU's root .gitignore excludes *.patch, which is right for a tree where a
+# .patch is a stray `git format-patch` artefact.  Here it is the OPPOSITE: the
+# patch IS the deliverable -- the riscv64 execution leg refuses to run against
+# an unpatched Spike, so a tree without this file cannot reproduce the leg at
+# all.  Un-ignored deliberately, by name.
+!0001-commit-log-register-reads-and-load-data-width.patch

@@ -77,6 +77,26 @@ class Effects:
         self.unresolved = set()
         self.mem_r = 0
         self.mem_w = 0
+        # BYTES, alongside the access COUNT.  The count on its own is not a
+        # comparable quantity: the ASL decomposes an access into one Mem[]
+        # call per ELEMENT, QEMU's translation splits the same architectural
+        # access into whatever its memop lowering chose, and the tracer's
+        # template counts static memory OPERANDS -- three different splits of
+        # the same traffic.  What all three must agree on is how many bytes
+        # the instruction touches, so it is recorded.  `mem_bytes_unknown`
+        # trips when a Mem[] size argument does not evaluate concretely, so a
+        # byte total is never quoted as complete when it is not.
+        self.mem_rb = 0
+        self.mem_wb = 0
+        self.mem_bytes_unknown = 0
+        # Whether the ADDRESS argument of each Mem[] evaluated concretely.
+        # This is the axis a static reference is asked for and cannot give:
+        # an effective address is a runtime value, and the execute-ASL is
+        # evaluated with register contents unknown.  Counting it rather than
+        # asserting it is what turns "the reference has no address" from a
+        # claim about the harness into a measurement about static decode.
+        self.mem_addr_known = 0
+        self.mem_addr_unknown = 0
         # Allocation-tag memory (MTE) and Guarded-Control-Stack memory are
         # real traffic, but they are not the instruction's DATA access and
         # folding them into mem_r/mem_w made an atomic look like a 3-read
@@ -940,19 +960,41 @@ class Interp:
                 self.eval(a, env)
             return UNK
         if name in MEM_ACCESSORS or name in TAG_ACCESSORS:
-            for a in args:
-                self.eval(a, env)
+            # The argument values are kept from THIS walk and never
+            # re-evaluated: evaluating an address expression twice walks its
+            # register reads twice, and the point of reading the address at
+            # all is to observe the reference, not to perturb it.
+            memvals = [self.eval(a, env) for a in args]
             tag = name in TAG_ACCESSORS
+            nb = None
+            if not tag:
+                # Mem[address, size, accdesc]: args[0] is the effective
+                # address, args[1] the size in bytes.  The fixed-width
+                # 64-byte accessors state the size in the name instead.
+                if memvals:
+                    if as_int(memvals[0]) is None:
+                        self.ef.mem_addr_unknown += 1
+                    else:
+                        self.ef.mem_addr_known += 1
+                if name in ('MemLoad64B', 'MemStore64B', 'MemStore64BWithRet'):
+                    nb = 64
+                elif len(memvals) > 1:
+                    nb = as_int(memvals[1])
+                if nb is None:
+                    self.ef.mem_bytes_unknown += 1
+                    self.notes.add('mem-bytes-unknown:' + name)
             if rw == 'r':
                 if tag:
                     self.ef.tag_r += 1
                 else:
                     self.ef.mem_r += 1
+                    self.ef.mem_rb += nb or 0
             else:
                 if tag:
                     self.ef.tag_w += 1
                 else:
                     self.ef.mem_w += 1
+                    self.ef.mem_wb += nb or 0
             return UNK
         if name in REG_ACCESSORS:
             kind = REG_ACCESSORS[name]
@@ -1027,6 +1069,14 @@ class Interp:
             if chan == 'd':
                 ef.mem_r += dr
                 ef.mem_w += dw
+                # The table states a COUNT and cannot state a width: this
+                # arm fires precisely when the body that carried the size
+                # argument was cut.  Recording the count while silently
+                # adding nothing to the byte total would make an incomplete
+                # byte total look complete.
+                if dr or dw:
+                    ef.mem_bytes_unknown += dr + dw
+                    self.notes.add('mem-bytes-unknown:MEM_CALLS:' + name)
             elif chan == 't':
                 ef.tag_r += dr
                 ef.tag_w += dw

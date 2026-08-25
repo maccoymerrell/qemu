@@ -101,6 +101,32 @@ def main():
 
     opc = list(csv.DictReader(open(os.path.join(A.cov, 'opcodes.tsv')),
                               delimiter='\t'))
+
+    # AN ARM THAT DID NOT COVER EVERY SUBJECT IS NOT AN ARM.
+    # The arms are a UNION -- a row is reachable if it runs under ANY of them --
+    # so a subject MISSING from one arm is silently indistinguishable from a
+    # subject that arm refused, and it weakens the union without ever being
+    # noticed.  Measured 2026-08-25: a `za` arm that had completed 3,192 of
+    # 3,920 subjects adjudicated all 3,920 rows without a word.  A partial arm
+    # is a wrong answer, not a slow one.
+    _subjects = set(o['hex'] for o in opc)
+    _short = {name: len(_subjects - set(rows_))
+              for name, rows_ in arms.items()}
+    _bad = {n: k for n, k in _short.items() if k}
+    if _bad:
+        sys.exit('INCOMPLETE EL0 ARM -- %s.  The arms are a union, so a '
+                 'subject missing from one arm reads exactly like a subject '
+                 'that arm refused; finish the arm and adjudicate again.'
+                 % ', '.join('%s is missing %d of %d subjects'
+                             % (n, k, len(_subjects))
+                             for n, k in sorted(_bad.items())))
+    if el1:
+        _el1_short = len(_subjects - set(el1))
+        if _el1_short:
+            print('EL1 leg: %d of %d subjects NOT MEASURED (the machine wedged '
+                  'on them); every such row must carry an EL0 leg or be '
+                  'REFUSED below' % (_el1_short, len(_subjects)))
+
     fail = []
     tally = collections.Counter()
     by_arm = collections.Counter()

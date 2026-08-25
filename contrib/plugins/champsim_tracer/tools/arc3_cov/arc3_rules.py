@@ -230,6 +230,74 @@ RISCV_EXEC = {
              note='spike logs vector ELEMENT writes; a fully masked-off op '
                   'logs no destination at all'),
 
+    # riscv/vector_unit.h -- vectorUnit_t::elt() is ELEMENT triggered on the
+    # read side exactly as it is on the write side, so an instruction under a
+    # tail-undisturbed or mask-undisturbed policy READS its own destination
+    # register back to preserve the elements it does not produce.  That is a
+    # real architectural read of a real architectural source; the tracer's
+    # template names the operand registers and not the destination-as-source.
+    # It is charged to the tracer, not excused: an out-of-order model that
+    # renames vector registers needs this dependence.
+    'REF-VEC-TAIL-READ':
+        Rule('REF-VEC-TAIL-READ', 'tracer-defect', {SUBSET},
+             note='the destination vector register is architecturally a '
+                  'SOURCE under tail-/mask-undisturbed; the reference reads '
+                  'it and the tracer does not name it'),
+
+    # A vector register the reference read that is neither an operand the
+    # tracer names nor the destination -- kept as its own label so it can
+    # never be absorbed into the tail-read explanation without evidence.
+    'REF-VEC-ELEMENT-READ':
+        Rule('REF-VEC-ELEMENT-READ', 'needs-ruling', {SUBSET}, accounts=False,
+             note='the reference read a vector register the tracer does not '
+                  'name and that is not the instruction destination; kept '
+                  'separate so it can never be absorbed into the tail-read '
+                  'explanation without evidence'),
+
+    # riscv/insns/c_li.h -- `c.li rd, imm` is architecturally
+    # `addi rd, x0, imm`, but spike implements it as WRITE_RD(imm) and never
+    # touches READ_REG, so the architectural x0 operand is absent from the
+    # reference's read log.  The tracer names it.  The reference under-reports
+    # a source it does not model, which is a reference gap, not a tracer
+    # surplus of anything real.
+    'REF-C-IMM-NO-X0-READ':
+        Rule('REF-C-IMM-NO-X0-READ', 'reference-gap', {SUPERSET},
+             note='spike computes the compressed immediate forms directly '
+                  '(c_li.h: WRITE_RD(imm)) and never reads the x0 operand '
+                  'the encoding names'),
+
+    # A FENCE has no register operands; the tracer names REG_SYS -- the
+    # residual system-state id -- as its source so that a consumer can order
+    # against the barrier.  Spike models memory ordering as a property of its
+    # execution and has no register standing for it, so the reference cannot
+    # report the dependence at all.  The reference models this state not at
+    # all: a reference gap, not a tracer invention.
+    'REF-NO-ORDERING-STATE':
+        Rule('REF-NO-ORDERING-STATE', 'reference-gap', {SUPERSET},
+             note='the tracer names REG_SYS as a FENCE source so consumers '
+                  'can order against the barrier; spike has no register '
+                  'representing memory-ordering state'),
+
+    # The read-side twin of REF-VEC-ELEMENT-ONLY.  vectorUnit_t::elt() is
+    # ELEMENT triggered on the read side too, so a fully masked-off (or
+    # vl==0) vector operation reads no element of its operand registers and
+    # logs no vector source, though the encoding names exactly those
+    # registers and the tracer is right to keep naming them.
+    'REF-VEC-ELEMENT-READ-ONLY':
+        Rule('REF-VEC-ELEMENT-READ-ONLY', 'reference-gap', {SUPERSET},
+             note='spike logs vector ELEMENT reads; a fully masked-off op '
+                  'reads no element and so logs no source at all'),
+
+    # A source register both sides name, whose value the tracer's own
+    # published register model does not reproduce.  The model is the one
+    # format.rst 5.4 mandates for a consumer, so a mismatch means a consumer
+    # following the spec would compute the wrong operand.
+    'SRC-VALUE-MISMATCH':
+        Rule('SRC-VALUE-MISMATCH', 'tracer-defect', {SUBSET},
+             note='the register model format.rst 5.4 defines (REGFILE seed + '
+                  'destination snapshots) does not reproduce the operand '
+                  'value the run actually read'),
+
     # A register both sides name, with different values.  There is no
     # vocabulary reading of this: one of the two is wrong about what the
     # machine did, and it is not the machine.

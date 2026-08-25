@@ -79,6 +79,56 @@ def m_stdata(r, t):
     t.stores[0] = (a, d ^ 0xff, w)
 
 
+@mutation('reg-src-set', 'drop a source register from the tracer',
+          need=lambda r, t: bool([n for n in t.srcs
+                                  if n not in spike_ref.CSR_IDS]))
+def m_srcset(r, t):
+    for i, n in enumerate(t.srcs):
+        if n not in spike_ref.CSR_IDS:
+            t.srcs.pop(i)
+            return
+
+
+@mutation('reg-src-value', 'corrupt one SOURCE register value in the '
+                           'reconstructed register model',
+          need=lambda r, t: any(
+              t.src_vals.get(n) is not None
+              for n in t.srcs if n not in spike_ref.CSR_IDS))
+def m_srcval(r, t):
+    for n in t.srcs:
+        if n in spike_ref.CSR_IDS:
+            continue
+        kv = t.src_vals.get(n)
+        if kv is not None:
+            v, w = kv
+            t.src_vals[n] = (v ^ 0x1, w)
+            return
+
+
+@mutation('csr-src-set', 'drop a CSR source from the tracer',
+          need=lambda r, t: any(n in spike_ref.CSR_IDS for n in t.srcs))
+def m_csrsrcset(r, t):
+    t.srcs[:] = [n for n in t.srcs if n not in spike_ref.CSR_IDS]
+
+
+@mutation('load-data', 'corrupt one load DATUM on the tracer side',
+          need=lambda r, t: bool(t.loads))
+def m_lddata(r, t):
+    a, d, w = t.loads[0]
+    t.loads[0] = (a, d ^ 0xff, w)
+
+
+@mutation('memop-width', 'change one access WIDTH on the tracer side',
+          need=lambda r, t: bool(t.loads or t.stores))
+def m_memwidth(r, t):
+    if t.loads:
+        a, d, w = t.loads[0]
+        t.loads[0] = (a, d, 1 if w != 1 else 2)
+    else:
+        a, d, w = t.stores[0]
+        t.stores[0] = (a, d, 1 if w != 1 else 2)
+
+
 @mutation('csr-dst-set', 'drop a CSR destination from the tracer',
           need=lambda r, t: any(n in spike_ref.CSR_IDS
                                 for n, _, _ in t.writes))
@@ -158,7 +208,7 @@ def main():
 
     lo, hi = compare_exec.exec_ranges(args.guest)[0]
     ref = spike_ref.parse_commit_log(args.commits, lo, hi, priv=0)
-    trc = tracer_log.parse(args.decode, args.trace)
+    trc, _ = tracer_log.parse(args.decode, args.trace)
     _, unproven = run([(os.path.basename(args.guest), ref, trc)])
     return 1 if unproven else 0
 

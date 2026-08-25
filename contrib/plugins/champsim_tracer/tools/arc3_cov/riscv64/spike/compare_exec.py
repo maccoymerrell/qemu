@@ -3,18 +3,30 @@ ARC 3 -- riscv64 EXECUTION cross-check: the tracer against Spike, 1 to 1.
 
 Runs one guest binary twice -- once under ``spike`` + the RISC-V proxy kernel,
 once under ``qemu-riscv64`` with the ChampSim Tracer plugin -- and compares the
-two records of the SAME run, instruction by instruction, on five axes:
+two records of the SAME run, instruction by instruction, on every facet the
+execution leg owns:
 
-    reg-write   destination register and VALUE
-    memop-count loads and stores per instruction
-    memop-addr  effective address of each
-    store-data  value and width written
-    load-data   value and width read
+    reg-src-set    SOURCE registers named
+    reg-src-value  the VALUE each source held
+    csr-src-set    SOURCE CSRs named, at the tracer's fold granularity
+    reg-dst-set    destination registers named
+    reg-dst-value  the VALUE each destination received
+    csr-dst-set    destination CSRs, at the tracer's fold granularity
+    csr-dst-value  the value each such CSR received
+    memop-count    loads and stores per instruction
+    memop-addr     effective address of each
+    load-data      the datum each load returned
+    store-data     the datum each store wrote
+    memop-width    the byte width of every access, load and store
 
-A sixth axis, REGISTER READS, is not measured here and no number on this leg
-covers it: spike keeps no ``log_reg_read`` (see ``spike_ref``), so the
-execution reference is silent about sources.  Silence is not agreement, and it
-is reported as an unavailable axis rather than folded into a rate.
+NO AXIS HERE READS "NOT MEASURED".  The reference used to be silent about
+sources, load data and load width; it is now patched to state all three
+(``spike-patches/``), and ``spike_ref.require_patched`` refuses a log from a
+binary that is not.  The source-VALUE axis is measured against the register
+model ``format.rst`` §5.4 defines for a consumer -- the REGFILE seed plus the
+destination snapshots, replayed forward -- because the wire deliberately
+carries no source values; where that model cannot yet value a register the
+row is counted as MODEL-UNKNOWN and named, never scored as agreement.
 
 Every disagreeing row carries a DIRECTION and a CATEGORY through
 ``arc3_taxonomy``, so that "N disagree" is never the result.  The headline is
@@ -50,8 +62,10 @@ from arc3_rules import riscv_exec_rule
 #: CSRs are a third partition because the tracer folds several of them onto
 #: one GenericRegId, and that vocabulary question must not be allowed to
 #: dilute the register-file result in either direction.
-AXES = ('reg-dst-set', 'reg-dst-value', 'csr-dst-set', 'csr-dst-value',
-        'memop-count', 'memop-addr', 'store-data')
+AXES = ('reg-src-set', 'reg-src-value', 'csr-src-set',
+        'reg-dst-set', 'reg-dst-value', 'csr-dst-set', 'csr-dst-value',
+        'memop-count', 'memop-addr', 'load-data', 'store-data',
+        'memop-width')
 
 
 # ------------------------------------------------------------------- the ELF
@@ -129,6 +143,32 @@ def split_ref(ins):
             else:
                 arch[g] = val
     return arch, csr
+
+
+def split_ref_reads(ins):
+    """Spike's reads -> ({arch generic name: value}, {csr name: value}).
+
+    Same partition as `split_ref` uses for writes, for the same reason: a CSR
+    vocabulary question must not be allowed to move the register-file number
+    in either direction.
+    """
+    arch, csr = {}, {}
+    for name, val in ins.reads:
+        if spike_ref.bank(name) == 'csr':
+            csr[name.split('_', 1)[1]] = val
+        else:
+            g = spike_ref.to_generic(name)
+            if g is None:
+                csr['UNMAPPABLE:' + name] = val
+            else:
+                arch[g] = val
+    return arch, csr
+
+
+#: how many source-value comparisons the consumer register model could not
+#: make, by reason.  A comparison that could not happen is NOT an agreement,
+#: so it is counted apart and reported, never folded into the rate.
+SRC_VALUE_STATE = collections.Counter()
 
 
 def split_trc(ins):
@@ -220,11 +260,88 @@ def is_sc(bits):
     return (bits & 0x7f) == 0x2f and ((bits >> 27) & 0x1f) == 0x03
 
 
+def is_fence(bits):
+    """True for a FENCE / FENCE.I encoding (opcode 0001111).
+
+    Tested on the encoding, like `is_sc`, so the label is a measured property
+    of the instruction rather than a reading of a disassembler.
+    """
+    return (bits & 0x7f) == 0x0f
+
+
 def compare_insn(r, t):
     """One aligned instruction -> its disagreeing axes (possibly none)."""
     rows = []
     ra, rc = split_ref(r)
     ta, tc = split_trc(t)
+    rsa, rsc = split_ref_reads(r)
+    tsa = frozenset(n for n in t.srcs if n not in spike_ref.CSR_IDS)
+    tsc = frozenset(n for n in t.srcs if n in spike_ref.CSR_IDS)
+
+    # --- reg-src-set: WHICH architectural registers were READ.
+    #
+    # This axis exists only because the reference was patched to record its
+    # reads; before that it could not be measured on any ISA by execution.
+    row = _set_row(r.pc, 'reg-src-set', frozenset(rsa), tsa)
+    if row is not None:
+        only_ref = frozenset(rsa) - tsa
+        if only_ref and tsa <= frozenset(rsa):
+            if all(n.startswith('REG_VEC') for n in only_ref) and \
+                    all(n in ta for n in only_ref):
+                # spike reads the DESTINATION vector register back, element
+                # by element, to honour the tail-undisturbed policy.  It is a
+                # real architectural read, and it is a read of a register the
+                # same instruction writes.
+                row = row._replace(label='REF-VEC-TAIL-READ')
+            elif all(n.startswith('REG_VEC') for n in only_ref):
+                row = row._replace(label='REF-VEC-ELEMENT-READ')
+        only_trc = tsa - frozenset(rsa)
+        if only_trc and frozenset(rsa) <= tsa:
+            if all(n == 'REG_ZERO' for n in only_trc):
+                row = row._replace(label='REF-C-IMM-NO-X0-READ')
+            elif is_fence(r.bits) and all(n == 'REG_SYS' for n in only_trc):
+                row = row._replace(label='REF-NO-ORDERING-STATE')
+            elif all(n.startswith('REG_VEC') for n in only_trc):
+                row = row._replace(label='REF-VEC-ELEMENT-READ-ONLY')
+        rows.append(row)
+
+    # --- csr-src-set, at the tracer's fold granularity
+    grouped_src = fold_ref_csr(rsc)
+    row = _set_row(r.pc, 'csr-src-set', frozenset(grouped_src), tsc)
+    if row is not None:
+        unmap = [k for k in grouped_src if k.startswith('CSR:')]
+        if unmap and frozenset(grouped_src) - frozenset(unmap) <= tsc:
+            row = row._replace(label='REF-CSR-UNMAPPED')
+        rows.append(row)
+
+    # --- reg-src-value: the operand values a conforming consumer would have.
+    #
+    # Only registers BOTH sides name are compared, and only where the
+    # consumer register model can value them; everything else is counted in
+    # SRC_VALUE_STATE and reported as its own line.  Comparison is over the
+    # width the tracer PUBLISHED for that register's last write: the trace
+    # states w bytes, so w bytes is what it can be held to.
+    bad_src = []
+    for n in frozenset(rsa) & tsa:
+        known = t.src_vals.get(n)
+        if known is None:
+            SRC_VALUE_STATE['model-unknown'] += 1
+            continue
+        val, w = known
+        if w >= 8:
+            SRC_VALUE_STATE['compared-full'] += 1
+            mask = (1 << 64) - 1
+        else:
+            SRC_VALUE_STATE['compared-narrow'] += 1
+            mask = (1 << (8 * w)) - 1
+        if (rsa[n] & mask) != (val & mask):
+            bad_src.append((n, rsa[n] & mask, val & mask))
+    if bad_src:
+        rows.append(Disagreement(
+            r.pc, 'reg-src-value',
+            frozenset((n, v) for n, v, _ in bad_src),
+            frozenset((n, v) for n, _, v in bad_src),
+            SUBSET, 'SRC-VALUE-MISMATCH'))
 
     # --- reg-dst-set: WHICH architectural registers were written
     row = _set_row(r.pc, 'reg-dst-set', frozenset(ra), frozenset(ta))
@@ -310,7 +427,8 @@ def compare_insn(r, t):
         rows.append(Disagreement(r.pc, 'memop-count', rcnt, tcnt, rel, lab))
 
     # --- memop-addr
-    raddr = {('L', a) for a in r.loads} | {('S', a) for a, _, _ in r.stores}
+    raddr = {('L', a) for a, _, _ in r.loads} | \
+            {('S', a) for a, _, _ in r.stores}
     taddr = {('L', a) for a, _, _ in t.loads} | \
             {('S', a) for a, _, _ in t.stores}
     row = _set_row(r.pc, 'memop-addr', raddr, taddr)
@@ -321,9 +439,34 @@ def compare_insn(r, t):
             row = row._replace(label='QEMU-SC-CMPXCHG')
         rows.append(row)
 
-    # --- store-data: the one memop-value axis the reference exposes
+    # --- load-data: what the load RETURNED.  Measurable only because the
+    # reference was patched; upstream pushed a literal 0 in the data slot.
+    row = _set_row(r.pc, 'load-data',
+                   {(a, d) for a, d, _ in r.loads},
+                   {(a, d) for a, d, _ in t.loads})
+    if row is not None:
+        if is_sc(r.bits) and len(t.loads) > len(r.loads):
+            row = row._replace(label='QEMU-SC-CMPXCHG')
+        rows.append(row)
+
+    # --- store-data
     row = _set_row(r.pc, 'store-data', set(r.stores), set(t.stores))
     if row is not None:
+        rows.append(row)
+
+    # --- memop-width: the byte width of EVERY access, both directions.
+    # Its own axis rather than a component of the data axes, because a width
+    # can be wrong while the value happens to agree (a zero-extended datum
+    # reads the same at 4 bytes and at 8).
+    rwid = {('L', a, w) for a, _, w in r.loads} | \
+           {('S', a, w) for a, _, w in r.stores}
+    twid = {('L', a, w) for a, _, w in t.loads} | \
+           {('S', a, w) for a, _, w in t.stores}
+    row = _set_row(r.pc, 'memop-width', rwid, twid)
+    if row is not None:
+        if is_sc(r.bits) and twid - rwid and \
+                all(k == 'L' for k, _, _ in twid - rwid):
+            row = row._replace(label='QEMU-SC-CMPXCHG')
         rows.append(row)
 
     return rows
@@ -374,6 +517,7 @@ def main():
     unaligned = []
     corpus = []
     zw = collections.Counter()
+    provenance = collections.Counter()
     totals = collections.Counter()
     per_guest = []
 
@@ -385,8 +529,13 @@ def main():
 
         lo, hi = exec_ranges(guest)[0]
         ref = spike_ref.parse_commit_log(log, lo, hi, priv=0)
+        # A stale, unpatched spike would make three axes compare nothing
+        # against nothing and report agreement.  Refuse it by name.
+        spike_ref.require_patched(log, len(ref))
         traps = spike_ref.parse_traps(log)
-        trc = tracer_log.parse(args.decode, trace)
+        trc, prov = tracer_log.parse(args.decode, trace)
+        for k, v in prov.items():
+            provenance[k] += v
 
         corpus.append((os.path.basename(guest), ref, trc))
         pairs, ref_only, trc_only = align(ref, trc)
@@ -413,11 +562,13 @@ def main():
         for r, t in pairs:
             totals['reg_writes_ref'] += len(r.writes)
             totals['reg_writes_trc'] += len(t.writes)
+            totals['reg_reads_ref'] += len(r.reads)
+            totals['reg_reads_trc'] += len(t.srcs)
             totals['loads_ref'] += len(r.loads)
             totals['loads_trc'] += len(t.loads)
             totals['stores_ref'] += len(r.stores)
             totals['stores_trc'] += len(t.stores)
-            totals['load_data_trc_only'] += len(t.loads)
+
             for n in zero_width(t):
                 totals['zero_width_dst'] += 1
                 zw[n] += 1
@@ -458,7 +609,8 @@ def main():
     w('')
     w('TOTALS')
     for k in ('ref_insns', 'trc_insns', 'aligned', 'ref_only', 'trc_only',
-              'reg_writes_ref', 'reg_writes_trc', 'loads_ref', 'loads_trc',
+              'reg_writes_ref', 'reg_writes_trc',
+              'reg_reads_ref', 'reg_reads_trc', 'loads_ref', 'loads_trc',
               'stores_ref', 'stores_trc'):
         w('  %-20s %10d' % (k, totals[k]))
     w('')
@@ -481,17 +633,37 @@ def main():
         for n, c in sorted(zw.items()):
             w('    %-14s %5d occurrences' % (n, c))
     w('')
-    w('AXES THE EXECUTION REFERENCE DOES NOT EXPOSE -- not measured here,')
-    w('and not covered by any number above:')
-    w('  register reads   spike keeps no log_reg_read; the commit log has no')
-    w('                   source-operand information at all.  This axis stays')
-    w('                   with the static (Sail) leg.')
-    w('  load data        mmu.cc:313 pushes (addr, 0, len) and the printer')
-    w('                   emits only the address.  The tracer records the')
-    w('                   datum for all %d loads; the reference states none,'
-      % totals['load_data_trc_only'])
-    w('                   so this is tracer surplus, not agreement.')
-    w('  load width       in spike\'s tuple, never printed.')
+    w('SOURCE-VALUE COMPARISONS -- what the consumer register model of')
+    w('format.rst 5.4 (REGFILE seed + destination snapshots, replayed')
+    w('forward) could and could not value.  A comparison that could not be')
+    w('made is NOT an agreement and is never folded into the rate above.')
+    tot_sv = sum(SRC_VALUE_STATE.values())
+    for k in ('compared-full', 'compared-narrow', 'model-unknown'):
+        n = SRC_VALUE_STATE[k]
+        w('  %-16s %8d  (%.4f%% of %d)'
+          % (k, n, 100.0 * n / tot_sv if tot_sv else 0.0, tot_sv))
+    if SRC_VALUE_STATE['compared-narrow']:
+        w('  compared-narrow: the tracer published a width < 8 for that')
+        w('  register\'s last write, so only those bytes were held to.')
+    w('  Where each operand value CAME FROM in that model:')
+    for k in ('dst-snapshot', 'seed', 'arch-const', 'unknown'):
+        w('    %-16s %8d' % (k, provenance[k]))
+    w('    %-16s %8d  (registers the REGFILE record carried)'
+      % ('seed-registers', provenance['seed-registers']))
+    if not provenance['seed']:
+        w('    THE REGFILE SEED WAS NEVER CONSULTED on this corpus: every')
+        w('    operand was valued from a destination snapshot or is an')
+        w('    architectural constant.  The seed is therefore UNTESTED here')
+        w('    and no number above is evidence about it.')
+    if SRC_VALUE_STATE['model-unknown']:
+        w('  model-unknown: the trace had published no value for that')
+        w('  register at that point -- neither in the REGFILE seed nor in any')
+        w('  preceding destination snapshot.  Named, not scored.')
+    w('')
+    w('AXES THE EXECUTION REFERENCE DOES NOT EXPOSE:')
+    w('  none.  Register reads, load data and load width were the three, and')
+    w('  the reference is patched to state all three (spike-patches/).')
+    w('  spike_ref.require_patched refuses a log from a binary that is not.')
     w('')
     w('UNALIGNED INSTRUCTIONS -- every one named, none left as a bare count')
     if not unaligned:

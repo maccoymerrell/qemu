@@ -13,27 +13,41 @@ This is the whole contract, read off ``riscv/execute.cc``
 (``commit_log_print_insn``) and ``riscv/mmu.cc`` rather than off the manual,
 because the claim this harness is allowed to make is bounded by it.
 
+THE REFERENCE IS PATCHED.  Upstream Spike's commit log is
+destination-oriented and silent about sources, and its load records carry a
+literal ``0`` where the datum should be.  That silence bounded three facets of
+this leg to ``NONE``, and a reference gap is not a verdict, so the reference
+was changed rather than excused.  The patch, the Spike revision it applies to
+and the reasoning are in ``spike-patches/``.  ``require_patched()`` below
+refuses a commit log produced by an unpatched binary, so a stale Spike reports
+as an error instead of as three axes that quietly agree with nothing.
+
 EXPOSED
   * destination register writes -- bank, index and full value, for the
     integer file (``x``), the FP file (``f``), the vector file (``v``) and
     the CSRs (``c<num>_<name>``).  ``log_reg_write`` is keyed on the
     written register, so the log is destination-oriented by construction.
-  * memory READ address.  ``mmu.cc:313`` pushes ``(addr, 0, len)``.
+  * SOURCE register reads -- bank, index and full value, for the same four
+    banks, under the ``read`` token.  PATCHED IN: recorded at the decode
+    site (``READ_REG``/``READ_FREG``), at ``vectorUnit_t::elt`` for the
+    vector file, and at ``processor_t::get_csr`` for the CSR a ``csrr*``
+    addressed.  ``x0`` IS reported: an x0 source is a real fact about the
+    encoding, unlike an x0 destination.
+  * memory READ address, data AND width, under the ``memr`` token.
+    PATCHED IN: ``mmu.cc`` now records the bytes the load returned, and
+    the printer emits the datum at ``size << 3`` bits so the width is
+    recoverable from the hex digit count.
   * memory WRITE address, data AND width.  ``mmu.cc:406`` pushes
     ``(addr, data, size)`` and the printer emits the value at ``size << 3``
     bits, so the width is recoverable from the hex digit count.
   * the privilege level the instruction retired at.
 
 NOT EXPOSED -- and therefore never claimed by this harness
-  * REGISTER READS.  Spike keeps no ``log_reg_read``.  There is no source
-    operand information in the commit log at all.  The read axis is a
-    reference-gap on the execution leg; it stays with the static (Sail)
-    leg, and no result on this leg may be quoted as covering it.
-  * LOAD DATA.  The tuple ``mmu.cc:313`` pushes carries a literal ``0`` in
-    the data slot and the printer prints only ``std::get<0>``.  Load data
-    is therefore uncomparable here even though the tracer records it --
-    which is a one-sided surplus, not a disagreement.
-  * LOAD WIDTH.  ``len`` is in the tuple and is never printed.
+  * IMPLICIT CSR reads.  An FP operation reads ``frm`` through the
+    ``csr_t`` object rather than through ``get_csr``, and a vector
+    operation reads ``vl``/``vtype`` off the vector unit.  Those are not
+    operands and are deliberately not recorded; the CSR source axis
+    therefore covers exactly the CSR a ``csrr*`` instruction addressed.
   * ANY INSTRUCTION THAT TRAPS.  ``execute_insn_logged`` calls the printer
     only when the instruction completes, so a trapping instruction leaves
     no commit line.  The alignment in ``compare_exec.py`` therefore admits
@@ -54,17 +68,26 @@ _COMMIT = re.compile(
     r'^core\s+(?P<core>\d+):\s+(?P<priv>[0-3])\s+'
     r'0x(?P<pc>[0-9a-f]+)\s+\(0x(?P<bits>[0-9a-f]+)\)(?P<rest>.*)$')
 
-#: a register write: ``x5  0x…``, ``f0  0x…``, ``v3 0x…``, ``c768_mstatus 0x…``
-_REGW = re.compile(r'(?P<name>(?:[xfv]\s*\d+|c\d+_\S+))\s+0x(?P<val>[0-9a-f]+)')
+#: one effect token pair: a register NAME then its value.  Kept as a name
+#: test rather than a "everything that is not a section keyword" test, so a
+#: new token added to the log upstream cannot be silently eaten as a register.
+_REGNAME = re.compile(r'^(?:[xfv]\d+|c\d+_\S+)$')
 
-#: the vector shape header spike interleaves before the first vector write
-_VSHAPE = re.compile(r'\be\d+\s+m(?:f)?\d+\s+l\d+\b')
+#: the vector shape header spike interleaves before the first vector write:
+#: ``e64 m1 l2`` / ``e8 mf2 l16``.  Not a register, and skipped as such.
+_VSHAPE_TOK = re.compile(r'^(?:e\d+|mf?\d+|l\d+)$')
+
+#: tokens that open a section of the effect list.  Everything before the first
+#: one is the destination list; after it the role of each group is stated by
+#: the token itself, never inferred from arity or from ordering.
+_SECTIONS = ('read', 'memr', 'mem')
 
 
 class Insn(object):
     """One retired instruction, as the execution reference saw it."""
 
-    __slots__ = ('pc', 'bits', 'nbytes', 'priv', 'writes', 'loads', 'stores')
+    __slots__ = ('pc', 'bits', 'nbytes', 'priv', 'writes', 'reads',
+                 'loads', 'stores')
 
     def __init__(self, pc, bits, nbytes, priv):
         self.pc = pc
@@ -72,35 +95,78 @@ class Insn(object):
         self.nbytes = nbytes
         self.priv = priv
         self.writes = []      # [(spike_name, value)]
-        self.loads = []       # [addr]                 -- no data, no width
+        self.reads = []       # [(spike_name, value)]   -- PATCHED IN
+        self.loads = []       # [(addr, data, width_bytes)]
         self.stores = []      # [(addr, data, width_bytes)]
 
     def __repr__(self):
-        return 'Insn(pc=0x%x bits=0x%x w=%r ld=%r st=%r)' % (
-            self.pc, self.bits, self.writes, self.loads, self.stores)
+        return 'Insn(pc=0x%x bits=0x%x w=%r r=%r ld=%r st=%r)' % (
+            self.pc, self.bits, self.writes, self.reads,
+            self.loads, self.stores)
 
 
-def _parse_mem(rest):
-    """The ``mem`` groups.  One value -> a load; two -> a store.
+def _parse_effects(rest):
+    """The effect list of one commit line -> (writes, reads, loads, stores).
 
-    The arity is what separates the two, so no assumption about the order in
-    which spike emits loads and stores is needed (it emits loads first, but
-    relying on that would be relying on something the log does not state).
+    TOKEN-DIRECTED, not arity-directed.  Before the reference was patched a
+    load printed one value and a store two, so the parser separated them by
+    counting -- which stops being sound the moment a load carries its datum.
+    Every group now states its own role (`read`, `memr`, `mem`), and the
+    destination list is what precedes the first of those tokens.
     """
-    loads, stores = [], []
-    parts = rest.split('mem')
-    for chunk in parts[1:]:
-        vals = re.findall(r'0x([0-9a-f]+)', chunk)
-        if not vals:
-            continue
-        if len(vals) == 1:
-            loads.append(int(vals[0], 16))
+    toks = rest.split()
+    writes, reads, loads, stores = [], [], [], []
+    i, n = 0, len(toks)
+
+    while i < n and toks[i] not in _SECTIONS:
+        t = toks[i]
+        if _REGNAME.match(t) and i + 1 < n and toks[i + 1].startswith('0x'):
+            writes.append((t, int(toks[i + 1], 16)))
+            i += 2
         else:
-            addr = int(vals[0], 16)
-            # width is recoverable: the printer emits the datum at
-            # (size << 3) bits, i.e. 2 hex digits per byte.
-            stores.append((addr, int(vals[1], 16), len(vals[1]) // 2))
-    return loads, stores
+            # the vector shape header, or padding.  Anything else here is a
+            # token this parser does not know; it is skipped, and the
+            # `require_patched` gate plus the negative control are what keep
+            # a silently-dropped effect from reading as agreement.
+            i += 1
+
+    while i < n:
+        t = toks[i]
+        if t == 'read' and i + 2 < n:
+            reads.append((toks[i + 1], int(toks[i + 2], 16)))
+            i += 3
+        elif t in ('memr', 'mem') and i + 2 < n:
+            addr, data = toks[i + 1], toks[i + 2]
+            # the printer emits the datum at (size << 3) bits, i.e. 2 hex
+            # digits per byte, so the width is recoverable from the length.
+            rec = (int(addr, 16), int(data, 16), (len(data) - 2) // 2)
+            (loads if t == 'memr' else stores).append(rec)
+            i += 3
+        else:
+            i += 1
+    return writes, reads, loads, stores
+
+
+def require_patched(path, ninsns):
+    """Refuse a commit log that an UNPATCHED spike produced.
+
+    Three axes of this leg exist only because the reference was patched.  A
+    stale binary would produce a log with no `read` and no `memr` token at
+    all, and every one of those axes would then compare an empty reference
+    against an empty tracer projection and report agreement -- the exact
+    shape of check this project does not accept.  So it is an error, named.
+    """
+    if not ninsns:
+        return
+    with open(path, 'r', errors='replace') as fh:
+        blob = fh.read()
+    missing = [t for t in (' read ', ' memr ') if t not in blob]
+    if missing:
+        raise RuntimeError(
+            'this commit log carries no %s token: the spike that produced it '
+            'is not the patched one this leg requires (see spike-patches/'
+            'README.md, revision 262df8bfac33b0419688429dd066487744db5c79)'
+            % ' or '.join(t.strip() for t in missing))
 
 
 def parse_commit_log(path, pc_lo=None, pc_hi=None, priv=None):
@@ -126,13 +192,8 @@ def parse_commit_log(path, pc_lo=None, pc_hi=None, priv=None):
                 continue
             bits_s = m.group('bits')
             ins = Insn(pc, int(bits_s, 16), len(bits_s) // 2, p)
-            rest = m.group('rest')
-            reg_part = rest.split('mem', 1)[0]
-            reg_part = _VSHAPE.sub(' ', reg_part)
-            for rm in _REGW.finditer(reg_part):
-                ins.writes.append((rm.group('name').replace(' ', ''),
-                                   int(rm.group('val'), 16)))
-            ins.loads, ins.stores = _parse_mem(rest)
+            (ins.writes, ins.reads,
+             ins.loads, ins.stores) = _parse_effects(m.group('rest'))
             out.append(ins)
     return out
 

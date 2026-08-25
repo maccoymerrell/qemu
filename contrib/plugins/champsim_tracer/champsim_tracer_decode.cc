@@ -754,6 +754,45 @@ static void refine_alias_fields(const qemu_plugin_insn_info *info,
  * Capstone's structured output.  Opcode and branch type come from the
  * mnemonic classification table.
  */
+/*
+ * The MEM operand decode_synthetic_ea() would build an address from,
+ * WHEN that operand carries no access flag of its own.  Such an operand
+ * contributed no load and no store slot during the operand walk, yet the
+ * execution-time callback mints a memop from it -- so the template's
+ * static claim and the wire disagree unless a slot is allocated for it.
+ * Returns NULL when no synthetic EA is minted, or when the operand it
+ * would be minted from already owns a slot.
+ *
+ * The selection MIRRORS decode_synthetic_ea() below, including its
+ * narrower GEN_OP_FENCE rule; the two must be read together.
+ */
+static const qemu_plugin_operand *
+synthetic_ea_slotless_mem_operand(const qemu_plugin_insn_info *info,
+                                  uint8_t opcode)
+{
+    bool hint_class = opcode == GEN_OP_PREFETCH ||
+                      opcode == GEN_OP_CACHE_FLUSH ||
+                      opcode == GEN_OP_TLB_FLUSH;
+    if (!info || (!hint_class && opcode != GEN_OP_FENCE)) {
+        return nullptr;
+    }
+    for (uint8_t i = 0; i < info->n_operands; i++) {
+        const qemu_plugin_operand *op = &info->operands[i];
+        if (op->type != QEMU_PLUGIN_OP_MEM) {
+            continue;
+        }
+        bool accessed = (op->access & (QEMU_PLUGIN_OP_ACC_READ |
+                                       QEMU_PLUGIN_OP_ACC_WRITE)) != 0;
+        if (!hint_class && accessed) {
+            continue;       /* decode_synthetic_ea keeps looking too */
+        }
+        /* This is the operand the EA comes from.  It only needs a slot
+         * when the walk gave it none. */
+        return accessed ? nullptr : op;
+    }
+    return nullptr;
+}
+
 void decode_detail_to_generic(uint64_t pc,
                               const qemu_plugin_insn_info *info,
                               InsnFields *out,
@@ -1127,6 +1166,50 @@ void decode_detail_to_generic(uint64_t pc,
      */
     if (cls && cls->refine) {
         cls->refine(info, out);
+    }
+
+    /*
+     * A MEMOP THE TRACE PUBLISHES MUST BE A MEMOP THE TEMPLATE CLAIMS.
+     *
+     * The synthetic-EA class -- prefetch hints, cache maintenance by
+     * address, TLB maintenance by address -- performs no access QEMU's
+     * translation emits, so Capstone leaves the access flags on its MEM
+     * operand empty and the walk above allocates nothing.  The execution
+     * path does not agree: vcpu_insn_synth_ea_cb computes the address and
+     * g_mem_recorder.record_synthetic_load() puts an address-only memop on
+     * the wire for it.  Left as it was, the template said `loads=0` for an
+     * instruction whose entries carry a load, and a consumer sizing its
+     * dependency lane mask from that claim is given less than the guest
+     * did -- the one direction of disagreement this decoder is not allowed
+     * to have.
+     *
+     * The slot is a LOAD slot because that is the direction the recorder
+     * mints and the wire format has no third one; the memop carries an
+     * address and no data (data_size 0), which is exactly what `PRFM` and
+     * mipsel `PREF` have always published.  Nothing here claims the
+     * instruction reads memory: MIPS `SYNCI` lowers to a bare
+     * `ctx->base.is_jmp = DISAS_STOP` (target/mips/tcg/translate.c:14403)
+     * and AArch64 `DC CVAU` / `IC IVAU` are ARM_CP_NOP
+     * (target/arm/helper.c:5259-5310) -- no data crosses the interface in
+     * either direction, and the record exists so the cache model that
+     * consumes these traces learns WHICH LINE was operated on.
+     *
+     * Only the flagless operand qualifies.  A prefetch whose MEM operand
+     * Capstone does flag READ (mipsel `PREF`, AArch64 `PRFM`) already
+     * owns its slot, and allocating a second would double-count the one
+     * memop the callback mints.
+     */
+    if (const qemu_plugin_operand *sea_op =
+            synthetic_ea_slotless_mem_operand(info, out->opcode)) {
+        if (out->max_dep_loads < MAX_LOADS) {
+            uint64_t addr_mask = 0;
+            addr_mask |= add_src_cap_reg(out, out_names, sea_op->reg_id);
+            addr_mask |= add_src_cap_reg(out, out_names, sea_op->index_id);
+            addr_mask |= add_src_cap_reg(out, out_names, sea_op->segment_id);
+            out->load_addr_dep_mask[out->max_dep_loads] = addr_mask;
+            out->max_dep_loads++;
+            out->has_addr_deps = true;
+        }
     }
 
     /*

@@ -159,7 +159,25 @@ def main():
         src = set(r["ref_src"]); dst = set(r["ref_dst"])
         applied = []
 
-        if m in ("bc1f", "bc1t", "bc1fl", "bc1tl") and "REG_GPR1" in dst:
+        # L-AT -- LLVM declares an implicit def of $at on a MIPS branch
+        # because the ASSEMBLER may expand a long branch through it.  The
+        # INSTRUCTION writes no general register; `beq $4, $5, 4` is three
+        # explicit uses and nothing else, and the impDEF is a fact about
+        # llvm-mc's expansion, not about the encoding.
+        #
+        # SCOPE IS THE CLASS, NOT THE ROW, and this rule learned that the
+        # expensive way.  It used to name four mnemonics -- bc1f, bc1t,
+        # bc1fl, bc1tl -- while LLVM carries impDEF AT on 27, every one of
+        # them a branch and not one naming $1 as an operand.  The other 23
+        # were invisible only because the TRACER carried the same phantom $at
+        # write and the two agreed on a fact that was false on both sides.
+        # When 95a0d89e92 removed the tracer's phantom the reference kept its
+        # own and the class surfaced as 23 TRACER-SUBSET rows.
+        #
+        # So the test is the observed LLVM record, not a name: an implicit
+        # def of $at, on a branch, where $1 is not an explicit operand.
+        if ("REG_GPR1" in dst and "REG_GPR1" in set(r.get("imp_dst") or ())
+                and r.get("isBranch") and not re.search(r"\$1\b", r["asm"])):
             dst.discard("REG_GPR1"); applied.append("L-AT")
 
         if m in ("bposge32", "rddsp"):

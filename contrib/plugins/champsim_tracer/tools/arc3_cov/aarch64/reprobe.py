@@ -11,10 +11,17 @@ BIN = sys.argv[1] if len(sys.argv) > 1 else \
     '/mnt/md0/QEMU/qemu/build/contrib/plugins/isaxcheck'
 
 
-def main():
+def render(binary=None):
+    """Probe the live tracer and return the tracer_fields.tsv TEXT.
+
+    Split out from main() so a SCORER can re-derive this arm rather than
+    trust the file: compare.py calls it and refuses to score a
+    tracer_fields.tsv that does not match.
+    """
+    binary = binary or BIN
     hexes = [r['hex'] for r in
              csv.DictReader(open(BASE + '/opcodes.tsv'), delimiter='\t')]
-    p = subprocess.run([BIN, '--isa=aarch64', '--layer=fields', '--batch'],
+    p = subprocess.run([binary, '--isa=aarch64', '--layer=fields', '--batch'],
                        input='\n'.join(hexes) + '\n',
                        capture_output=True, text=True)
     if p.returncode != 0:
@@ -26,14 +33,21 @@ def main():
     if missing:
         sys.exit('batch dropped %d encodings, first %s' %
                  (len(missing), missing[:4]))
+    buf = []
+    for h in hexes:
+        r = seen[h]
+        fl = 'fields   ok=%s  %s  %s' % (r['f_ok'], r['f_opcode'],
+                                         r['f_branch'])
+        buf.append('%s\t0\t%s\tSRC{%s}\tDST{%s}\n' %
+                   (h, fl, r['f_src'], r['f_dst']))
+    return ''.join(buf), len(hexes)
+
+
+def main():
+    text, n = render()
     with open(BASE + '/tracer_fields.tsv', 'w') as out:
-        for h in hexes:
-            r = seen[h]
-            fl = 'fields   ok=%s  %s  %s' % (r['f_ok'], r['f_opcode'],
-                                             r['f_branch'])
-            out.write('%s\t0\t%s\tSRC{%s}\tDST{%s}\n' %
-                      (h, fl, r['f_src'], r['f_dst']))
-    print('reprobed %d encodings' % len(hexes))
+        out.write(text)
+    print('reprobed %d encodings' % n)
 
 
 if __name__ == '__main__':

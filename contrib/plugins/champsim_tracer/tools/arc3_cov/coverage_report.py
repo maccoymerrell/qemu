@@ -36,6 +36,7 @@ import os
 import sys
 import csv
 import argparse
+import time
 import collections
 
 _D = os.path.dirname(os.path.abspath(__file__))
@@ -128,6 +129,59 @@ def read(path, verdict_col, disagree, mnem_col, label_col):
     return rows, counts, unpro
 
 
+ISAXCHECK = os.environ.get(
+    'CST_ISAXCHECK',
+    '/mnt/md0/QEMU/qemu/build/contrib/plugins/isaxcheck')
+
+
+def refuse_if_stale(cov, allow_stale=False):
+    """Refuse to publish a headline computed before the tracer it scores.
+
+    THE FAILURE THIS EXISTS FOR: `12149 COVERED / 2698 UNREACHABLE / 0
+    UNCOVERED` was published and relayed to the maintainer, and at the tip it
+    read `12034 / 2698 / 115`.  The table was built four hours before the two
+    commits it claimed to measure, the isaxcheck GATE was green throughout --
+    correctly, it reads a different thing -- and nothing anywhere noticed.
+    This report cannot re-derive four heterogeneous legs in process (aarch64
+    walks the Arm MRA, riscv64 the Sail model, x86_64 four reachability legs
+    under qemu-system), so it does the other half of the maintainer's ruling:
+    it REFUSES, by name, when a per-ISA table is older than the binary whose
+    behaviour it describes.
+
+    The per-ISA harnesses hold the stronger check -- x86_64 and aarch64 each
+    re-probe and compare byte-for-byte, riscv64 and mipsel re-probe as part of
+    their run -- so a green result here means every leg was re-run AND their
+    tables post-date the build.
+    """
+    if not os.path.exists(ISAXCHECK):
+        sys.exit('CANNOT CHECK FRESHNESS: no isaxcheck at %s.  This report '
+                 'scores tables it did not build; without the binary it '
+                 'cannot tell a current table from a stale one, and a check '
+                 'that cannot find its subject must fail.  Build it or set '
+                 'CST_ISAXCHECK.' % ISAXCHECK)
+    bt = os.path.getmtime(ISAXCHECK)
+    stale = []
+    for isa, rel, _v, _d, _m, _l in ISAS:
+        q = os.path.join(cov, rel)
+        if os.path.exists(q) and os.path.getmtime(q) < bt:
+            stale.append((isa, q, os.path.getmtime(q)))
+    if not stale:
+        return
+    fmt = '%Y-%m-%d %H:%M:%S'
+    for isa, q, mt in stale:
+        sys.stderr.write('STALE LEG  %-8s %s\n            table  %s\n'
+                         '            binary %s\n'
+                         % (isa, q, time.strftime(fmt, time.localtime(mt)),
+                            time.strftime(fmt, time.localtime(bt))))
+    if allow_stale:
+        sys.stderr.write('--allow-stale given: publishing anyway.  The '
+                         'numbers below are NOT a measurement at this tip.\n')
+        return
+    sys.exit('%d of %d legs were scored before the tracer they describe was '
+             'built.  Re-run those legs; do not publish this table.'
+             % (len(stale), len(ISAS)))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--cov', default=DEFAULT_COV)
@@ -136,7 +190,13 @@ def main():
     ap.add_argument('--rows', default=None,
                     help='write EVERY unaccounted row here as a TSV, so the '
                          'top-N above never stands in for the full list')
+    ap.add_argument('--allow-stale', action='store_true',
+                    help='print the table even when a leg predates the '
+                         'binary, having said so on stderr first.  For '
+                         'inspecting a historical run, never for a verdict')
     a = ap.parse_args()
+
+    refuse_if_stale(a.cov, a.allow_stale)
 
     out = []
     w = out.append

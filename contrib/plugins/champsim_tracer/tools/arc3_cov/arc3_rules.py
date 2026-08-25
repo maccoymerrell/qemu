@@ -55,6 +55,29 @@ X86 = {
 
     'M5':  Rule('M5', 'tracer-defect', {SUBSET},
                 note='x87 implicit ST(0) / status-word dependency'),
+
+    # M5's SIBLING, and the reason it exists is recorded because the
+    # re-derivation is the finding.  0acd1e32e5 split REG_FPCW out of
+    # REG_FCSR.  Before the split the tracer's merged id AGREED with the
+    # reference's control-word claim on 31 x87 rows and MISSED a status-word
+    # claim on the rest; after it, the tracer names a control-word edge the
+    # reference names nowhere -- 112 rows, every one TRACER-SUPERSET, none
+    # TRACER-SUBSET.  Charging them to M5 asserted the tracer was DROPPING
+    # what it had in fact started NAMING.
+    #
+    # This does NOT account, and deliberately.  The direction is measured and
+    # the label is now true, but a mechanism is not named until the exclusion
+    # is DERIVED rather than enumerated: a helper reads the control word iff
+    # it consults env->fpuc or hands &env->fp_status to softfloat, decidable
+    # from target/i386/tcg/fpu_helper.c.  A rule keyed on "LLVM MC names
+    # X87CONTROL where XED does not" closed all 112 and opened 21 NEW
+    # TRACER-SUBSET rows by importing LLVM claims QEMU does not perform; it
+    # was written and reverted rather than shipped.  Until the derivation
+    # exists these rows stay UNACCOUNTED, which is the honest number.
+    'M5b': Rule('M5b', 'unaccounted', {SUPERSET}, accounts=False,
+                note='the tracer names an x87 control/status-word edge the '
+                     'reference does not; the mechanism is not derived until '
+                     'fpu_helper.c decides which helpers read env->fpuc'),
     'M6':  Rule('M6', 'vocabulary-gap', {SUBSET},
                 note='no GenericRegId exists for this register'),
 

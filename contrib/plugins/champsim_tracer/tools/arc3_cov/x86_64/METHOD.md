@@ -121,8 +121,8 @@ is general rather than x86-specific.
 two instruments reading two different things.  The gate sweeps encodings and
 compares the tracer against LLVM through an allowlist; the arm compares the
 tracer's `InsnFields` against XED/LLVM/iced over the opcode DENOMINATOR, out
-of `tracer_batch.tsv` on disk.  `compare_attrib.py` NEVER re-probes: it reads
-whatever tracer snapshot the working directory happens to hold.
+of `tracer_batch.tsv` on disk.  `compare_attrib.py` used to score whatever
+tracer snapshot the working directory happened to hold.
 
 Measured 2026-08-25: `0acd1e32e5` gave the x87 control word its own generic
 id and `fa05561046` changed what `FSTENV` writes.  Both verified themselves
@@ -146,3 +146,27 @@ points are
 and `coverage_report.py` afterwards.  The tell that this was skipped is a
 verdict whose numbers match the previous document exactly across a commit that
 changed the decode.
+
+### The tools no longer permit it
+
+Three of the entry points above now refuse rather than rely on the reader:
+
+* `compare_attrib.py` re-runs `isaxcheck --batch` itself and scores
+  `tracer_batch.tsv` only when the file is byte-identical to that fresh probe.
+  Anything else exits non-zero with `STALE TRACER TABLE`, naming how many rows
+  moved and both timestamps.  The whole 8,880-encoding probe costs ~0.13 s, so
+  there is no budget argument for trusting the cache.  The gate-can-fire
+  control declares its damage — `compare_attrib.py --falsify=drop-src:MNEM`
+  re-probes WITH the same damage — so the control is checked against a live
+  probe too, rather than being the hole in the rule.
+* `../aarch64/compare.py` does the same through `reprobe.render()`, and exits
+  with `STALE TRACER ARM`.
+* `../coverage_report.py` cannot re-derive four heterogeneous legs in process,
+  so it does the other half: it refuses, naming the leg, when any per-ISA
+  `attrib.tsv` is older than the `isaxcheck` binary it describes.
+  `--allow-stale` prints the table for inspecting a historical run and says on
+  stderr that the numbers are not a measurement at this tip.
+
+A mtime check alone would not have been enough and the proof is on record: a
+one-row perturbation of a table NEWER than the binary is caught by the content
+comparison and would pass any timestamp test.

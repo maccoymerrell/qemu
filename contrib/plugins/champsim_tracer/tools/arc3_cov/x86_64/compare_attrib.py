@@ -22,7 +22,7 @@ is not a register question -- RIP/REG_IP is dropped on both sides).
 
 Author: Maccoy Merrell.
 """
-import sys, os, re, json, collections
+import sys, os, re, json, collections, subprocess, time
 
 D = os.path.dirname(os.path.abspath(__file__))
 COV = os.path.dirname(D)
@@ -393,8 +393,102 @@ def _is_3dnow(hexs):
         i += 1
     return b[i:i + 2] == [0x0f, 0x0f]
 
+# ------------------------------------------------- the input must be LIVE
+# THE FAILURE THIS EXISTS FOR, and it happened: this report used to score
+# whatever `tracer_batch.tsv` the working directory held.  0acd1e32e5 split
+# REG_FPCW out of REG_FCSR and fa05561046 changed FNSTENV; both verified
+# themselves against the isaxcheck GATE, which was green and correctly so,
+# and neither re-ran THIS instrument.  A verdict was published off a table
+# built four hours before the commits it claimed to measure, and re-probing
+# at the same tip moved 119 of 8,880 rows.  A green gate is not evidence
+# about a table the gate does not read.
+#
+# So the table is no longer an input that is trusted: it is RE-DERIVED here,
+# from the live binary, and scoring proceeds only when the file on disk is
+# byte-identical to that fresh probe.  Anything else exits with a named
+# error.  The re-probe costs ~0.13 s over the whole 8,880-encoding probe
+# set, so there is no budget argument for trusting a cache instead.
+#
+# --falsify=MODE:MNEM re-probes WITH the same damage, which is how
+# REPRODUCE.sh's gate-can-fire control keeps working: that control's table is
+# checked against a live probe too, so the control is not a hole in this.
+ISAXCHECK = os.environ.get(
+    'CST_ISAXCHECK',
+    '/mnt/md0/QEMU/qemu/build/contrib/plugins/isaxcheck')
+
+
+def _probe_argv(falsify):
+    a = [ISAXCHECK, '--isa=x86_64', '--layer=fields', '--batch']
+    if falsify:
+        a.append('--falsify=' + falsify)
+    return a
+
+
+def reprobe_or_refuse(d, falsify=None):
+    """Re-run the tracer arm and require the table on disk to match it.
+
+    Returns the path of the verified table.  Never returns on a mismatch: a
+    stale table is a wrong answer, not a slow one.
+    """
+    tbl = os.path.join(d, 'tracer_batch.tsv')
+    hexes = os.path.join(d, 'probe_uniq.hex')
+    # A check that cannot find its subject must FAIL, never fall through to
+    # the cache it was added to distrust.
+    if not os.path.exists(ISAXCHECK):
+        sys.exit('CANNOT RE-PROBE: no isaxcheck at %s.  The tracer arm is '
+                 're-derived here rather than trusted from disk; build it '
+                 '(ninja -j 12 -C build contrib-plugins) or set '
+                 'CST_ISAXCHECK.' % ISAXCHECK)
+    if not os.path.exists(hexes):
+        sys.exit('CANNOT RE-PROBE: no probe_uniq.hex in %s.  Run mkprobe.py '
+                 '(REPRODUCE.sh does).' % d)
+    fresh = os.path.join(d, 'tracer_batch.fresh.tsv')
+    with open(hexes) as fi, open(fresh, 'w') as fo:
+        rc = subprocess.call(_probe_argv(falsify), stdin=fi, stdout=fo)
+    # The exit code comes from the process, never through a pipe.
+    if rc != 0:
+        sys.exit('CANNOT RE-PROBE: %s exited %d'
+                 % (' '.join(_probe_argv(falsify)), rc))
+    if not os.path.exists(tbl):
+        sys.exit('NO TRACER TABLE: %s does not exist.  A fresh probe is at '
+                 '%s; adopt it deliberately rather than have this report '
+                 'adopt it silently.' % (tbl, fresh))
+    a = open(tbl, 'rb').read()
+    b = open(fresh, 'rb').read()
+    if a == b:
+        os.unlink(fresh)
+        return tbl
+    # Name the damage precisely: how many rows moved, and both timestamps,
+    # because "older than the binary it scores" is the shape this takes.
+    al = a.decode('utf-8', 'replace').splitlines()
+    bl = b.decode('utf-8', 'replace').splitlines()
+    moved = sum(1 for x, y in zip(al, bl) if x != y) + abs(len(al) - len(bl))
+    fmt = '%Y-%m-%d %H:%M:%S'
+    sys.stderr.write(
+        'STALE TRACER TABLE -- %s does not match a fresh probe of the live '
+        'binary: %d of %d rows differ.\n'
+        '  table  mtime %s\n'
+        '  binary mtime %s  (%s)\n'
+        '  fresh probe left at %s\n'
+        % (tbl, moved, max(len(al), len(bl)),
+           time.strftime(fmt, time.localtime(os.path.getmtime(tbl))),
+           time.strftime(fmt, time.localtime(os.path.getmtime(ISAXCHECK))),
+           ISAXCHECK, fresh))
+    sys.exit('the attribution arm was NOT re-run after the tracer changed; '
+             'scoring the cached table would republish a number that is not '
+             'true at this tip.  Re-probe (REPRODUCE.sh) and score again.')
+
+
+_falsify = None
+for _a in sys.argv[1:]:
+    if _a.startswith('--falsify='):
+        _falsify = _a.split('=', 1)[1]
+    else:
+        sys.exit('usage: compare_attrib.py [--falsify=MODE:MNEM]')
+TRACER_BATCH = reprobe_or_refuse(D, _falsify)
+
 TR = {}
-with open(os.path.join(D, 'tracer_batch.tsv')) as f:
+with open(TRACER_BATCH) as f:
     cols = next(f).rstrip('\n').split('\t')
     ix = {c: i for i, c in enumerate(cols)}
     for line in f:
@@ -520,6 +614,19 @@ def mechanism(mnem, ext, smiss, sextra, dmiss, dextra, refd, trd, flagwhy):
     if any(x.startswith('UNMAPPED:') for x in allt):
         return 'M6 register outside the tracer vocabulary (system / model state)'
     if 'REG_FPR#' in allt or mnem.startswith('F'):
+        # M5 says the tracer MISSES an x87 dependency, so it is a claim
+        # about a TRACER-SUBSET row and nothing else.  0acd1e32e5 gave the
+        # control word its own id (REG_FPCW) and the split turned this
+        # whole class inside out: the tracer now names a control-word edge
+        # the reference does not, which is the OPPOSITE direction.  Charging
+        # those rows to M5 printed a sentence that was false about every one
+        # of them, and the taxonomy caught it only as a direction conflict.
+        # The two directions are two different questions and get two labels.
+        if not (sm or dm) and (se | de) and (se | de) <= {'REG_FPCW',
+                                                          'REG_FCSR'}:
+            return ('M5b x87 control/status word: the tracer names an edge '
+                    'on it that the reference does not; WHICH helpers really '
+                    'read env->fpuc is not yet derived')
         return 'M5 x87: implicit ST(0) / status-word dependency missing'
     if sm == {'REG_FLAGS'} and not (se or dm or de):
         # R7.1 removed the preserve-read on the reference side, so an RFLAGS
@@ -991,7 +1098,7 @@ w('Correlation over this sweep:')
 mrows = [r for r in rows if r[6] == 'DISAGREE' and 'REG_PRED' in r[7]]
 arows = [r for r in rows if r[6] == 'AGREE']
 unk = {}
-with open(os.path.join(D, 'tracer_batch.tsv')) as f:
+with open(TRACER_BATCH) as f:
     c2 = next(f).rstrip('\n').split('\t'); j = {c: i for i, c in enumerate(c2)}
     for line in f:
         q = line.rstrip('\n').split('\t')

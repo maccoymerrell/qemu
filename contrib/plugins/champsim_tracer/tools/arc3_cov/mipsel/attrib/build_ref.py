@@ -39,6 +39,14 @@ def llvm_sets(e):
     for r in e["impdef"]: dst |= canon_set(r)
     return drop(src), drop(dst)
 
+def canon_set_all(names):
+    """Canonicalise a list of LLVM register names into generic ids."""
+    out = set()
+    for r in names:
+        out |= canon_set(r)
+    return out
+
+
 BU_IMPLIED_SRC = {"RD_HI":"HI", "RD_LO":"LO", "RD_$31":"REG_LR", "RD_$29":"REG_SP",
                   "RD_$24":"REG_GPR24", "RD_$16":"REG_GPR16", "RD_CC":"FCC"}
 BU_IMPLIED_DST = {"WR_HI":"HI", "WR_LO":"LO", "WR_$31":"REG_LR", "WR_$29":"REG_SP",
@@ -65,7 +73,15 @@ for oid in sorted(L):
                      tr_opcode=tr["opcode"], tr_branch=tr["branch"],
                      loads=tr["loads"], stores=tr["stores"],
                      mayLoad=e["flags"].get("mayLoad"), mayStore=e["flags"].get("mayStore"),
-                     isCall=e["flags"].get("isCall"), isBranch=e["flags"].get("isBranch")))
+                     isCall=e["flags"].get("isCall"), isBranch=e["flags"].get("isBranch"),
+                     # The IMPLICIT halves of the LLVM record, kept as their
+                     # own fields.  An adjudication about an implicit operand
+                     # has to be able to SEE that the operand is implicit;
+                     # without this the L-AT rule could only be written as a
+                     # list of mnemonics, and a list is how 23 of its 27 rows
+                     # went unhandled.
+                     imp_src=sorted(canon_set_all(e["impuse"])),
+                     imp_dst=sorted(canon_set_all(e["impdef"]))))
 json.dump(rows, open(BASE + "rows_raw.json", "w"), indent=0)
 
 unmapped = collections.Counter()

@@ -125,11 +125,16 @@ $PY "$T"/qemu_decode_adjudicate.py --matrix ../reach_matrix.tsv \
 # NOTE THE SPELLINGS.  --falsify matches the mnemonic EXACTLY, so `smsw`
 # matches nothing and the tool says so with exit 2 -- take the exit code,
 # never the AGREE line, or an unchanged count reads as a passing control.
-ud0 is in the list on purpose too -- it is the family the UD0 misdecode
+# ud0 is in the list on purpose too -- it is the family the UD0 misdecode
 # repair created, and a repair nobody has watched fail is a repair that
 # vouches for nothing.
 # sqrtsd is in the list on purpose -- it is an R7.1-SCALAR row, so it proves
 # the rows that rule closed are watched rather than blindly agreeing.
+# compare_attrib.py RE-DERIVES the tracer table from the live binary and
+# refuses to score anything else, so the damaged table has to be declared:
+# --falsify makes the report re-probe WITH the same damage.  That keeps the
+# control honest in both directions -- run the damaged table without the flag
+# and the report refuses instead of quoting a number off it.
 cp tracer_batch.tsv tracer_batch.good.tsv
 for M in movq vmovq vpsadbw sqrtsd ud0 ud1 xlatb smswl lmsww \
          rdfsbasel lfsl cmpxchg8b; do
@@ -137,7 +142,7 @@ for M in movq vmovq vpsadbw sqrtsd ud0 ud1 xlatb smswl lmsww \
       --falsify=drop-src:$M --batch < probe_uniq.hex > tracer_batch.tsv \
       || { echo "falsify drop-src:$M did not reach its subject"; exit 1; }
   echo -n "falsify drop-src:$M -> "
-  $PY compare_attrib.py 2>/dev/null | grep -m1 '  AGREE  '
+  $PY compare_attrib.py --falsify=drop-src:$M 2>/dev/null | grep -m1 '  AGREE  '
 done
 cp tracer_batch.good.tsv tracer_batch.tsv
 $PY compare_attrib.py > /dev/null

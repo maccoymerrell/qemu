@@ -224,7 +224,41 @@ def ref_correct(x, rs, rd_):
     return rs, rd_
 
 
+def reprobe_or_refuse():
+    """The tracer arm is RE-DERIVED here, never trusted from disk.
+
+    THE FAILURE THIS EXISTS FOR: an arm scored off a file is an arm nobody
+    re-ran.  x86_64's attribution report published a verdict computed from a
+    `tracer_batch.tsv` built four hours before the commits it claimed to
+    measure, and this leg has the same shape -- `tracer_fields.tsv` is
+    written by reprobe.py and then read by whoever runs next.  The probe
+    costs well under a second over 3,920 encodings, so the file is checked
+    against a live one and a mismatch stops the report.
+    """
+    fn = BASE + '/tracer_fields.tsv'
+    try:
+        import reprobe
+    except ImportError:
+        sys.exit('CANNOT RE-PROBE: reprobe.py is not importable beside '
+                 'compare.py; the tracer arm cannot be verified and a check '
+                 'that cannot find its subject must fail')
+    fresh, _ = reprobe.render()
+    try:
+        have = open(fn).read()
+    except OSError:
+        sys.exit('NO TRACER ARM: %s does not exist.  Run reprobe.py.' % fn)
+    if have == fresh:
+        return
+    a, b = have.splitlines(), fresh.splitlines()
+    moved = sum(1 for x, y in zip(a, b) if x != y) + abs(len(a) - len(b))
+    sys.exit('STALE TRACER ARM -- %s does not match a fresh probe of the '
+             'live binary: %d of %d rows differ.  The attribution numbers '
+             'this report would print are not true at this tip; run '
+             'reprobe.py and score again.' % (fn, moved, max(len(a), len(b))))
+
+
 def main():
+    reprobe_or_refuse()
     rows = list(csv.DictReader(open(BASE + '/opcodes.tsv'), delimiter='\t'))
     ref = json.load(open(BASE + '/ref_mra.json'))
 

@@ -38,6 +38,7 @@ import wp_trace                                              # noqa: E402
 import wp_seed                                               # noqa: E402
 import spike_ref                                             # noqa: E402
 import compare_wp as C                                       # noqa: E402
+from axis_subjects import Subjects                           # noqa: E402
 
 
 def _pick(exc, pred):
@@ -149,7 +150,7 @@ def _clean_pairs(args, guest, limit):
         # prefix it DID retire; requiring the full length instead left the
         # memop axes with no subject at all.
         if len(ref) >= 4:
-            base, _cmp = C.compare_excursion(guest, ex, ref, gi)
+            base, _cmp, _sub = C.compare_excursion(guest, ex, ref, gi)
             # Cleanliness is judged PER AXIS, not globally: an excursion whose
             # store-conditional already reports a named TRACER-SUPERSET on
             # memop-count is still a sound subject for a reg-dst-value
@@ -158,6 +159,25 @@ def _clean_pairs(args, guest, limit):
             out.append((ex, ref, set(r.axis for r in base)))
     return out
 
+
+
+def why_not(sub, axis):
+    """Why a mutation did not fire, taken from the comparison it ran.
+
+    A bare "DID NOT FIRE" cannot be told apart from a blind axis, and that is
+    the one thing this control exists to rule out.  The per-axis SUBJECT
+    census the comparator now returns answers it mechanically: an axis that
+    performed ZERO comparisons on the mutated pair had nothing to score --
+    the reference stated no fact about that access -- while an axis that
+    performed comparisons and still said nothing is the serious case and says
+    so in those words.
+    """
+    n = sub.facts[axis]
+    if not n:
+        return ('DID NOT FIRE -- the axis compared NOTHING on this pair; '
+                'the reference states no such fact here')
+    return ('DID NOT FIRE -- the axis compared %d facts and none moved; '
+            'INTERROGATE THIS' % n)
 
 def run(args):
     pairs = []
@@ -177,14 +197,14 @@ def run(args):
             if fired[axis] or axis in dirty:
                 continue          # one firing mutation per axis is the bar
             attempted.add(axis)
-            rows, _cmp = C.compare_excursion(guest, m, ref,
-                                             C.excursion_gaps(m, []))
+            rows, _cmp, msub = C.compare_excursion(
+                guest, m, ref, C.excursion_gaps(m, []))
             hit = [r for r in rows if r.axis == axis and
                    r.verdict in (C.WP_DEFECT, C.RECON_GAP, C.UNACCOUNTED)]
             fired[axis] += bool(hit)
             lines.append('  %-14s %-14s %-40s %s'
                          % (axis, os.path.basename(guest), what,
-                            'FIRED' if hit else 'DID NOT FIRE'))
+                            'FIRED' if hit else why_not(msub, axis)))
 
     # ---- wp-entry-state.  It is scored in process_guest rather than in
     # compare_excursion, so it needs its own mutation or its zero would be
@@ -196,7 +216,7 @@ def run(args):
     vic = sorted(truth)[0]
     m.regs[vic] = (truth[vic] ^ 0x1234, 8)
     gaps = set()
-    erows, _es = C.entry_state_rows(guest, m, truth, gaps)
+    erows, _es, _sub = C.entry_state_rows(guest, m, truth, gaps)
     es_ok = any(r.axis == 'wp-entry-state' and r.verdict == C.RECON_GAP
                 for r in erows)
     lines.append('  %-14s %-14s %-40s %s'
@@ -245,9 +265,9 @@ def run(args):
     id_stats = collections.Counter({'wp-insns-declared': 100,
                                     'wp-insns-compared': 90})
     _t, id_true = C.render([], id_stats, collections.Counter(
-        {'reference-stopped-short': 10}), args.guest)
+        {'reference-stopped-short': 10}), args.guest, Subjects())
     _t, id_false = C.render([], id_stats, collections.Counter(
-        {'reference-stopped-short': 9}), args.guest)
+        {'reference-stopped-short': 9}), args.guest, Subjects())
     id_ok = id_true and not id_false
     id_line = ('  identity       --             '
                'lose one instruction from a named tail   %s'

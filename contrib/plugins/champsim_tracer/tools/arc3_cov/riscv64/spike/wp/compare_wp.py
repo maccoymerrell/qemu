@@ -60,6 +60,7 @@ from compare_exec import is_sc, is_fence                     # noqa: E402
 from arc3_taxonomy import (set_relation, EQUAL, SUPERSET,
                            SUBSET)                           # noqa: E402
 from arc3_rules import riscv_exec_rule                       # noqa: E402
+from axis_subjects import Subjects                           # noqa: E402
 
 #: every fact this leg checks about a wrong-path instruction.  Named in full
 #: so a report can never quote a subset as if it were the whole comparison.
@@ -297,6 +298,7 @@ def compare_excursion(guest, ex, ref, gapinfo):
     but only where the evidence names the specific register or address.
     """
     rows = []
+    sub = Subjects()
     reg_gaps = gapinfo['reg_gaps']
     unestablished = gapinfo['unestablished']
     n = len(ex.insns)
@@ -320,13 +322,16 @@ def compare_excursion(guest, ex, ref, gapinfo):
                         % (k, ','.join(sorted(reg_gaps)) or 'none')))
         n = k                      # beyond the split the streams are unrelated
 
+    sub.note('pc-sequence')
     for i in range(min(n, len(ref))):
         r, t = ref[i], ex.insns[i]
+        sub.note('insn-bits', t)
         if r.bits != t.bits:
             rows.append(Row(guest, ex.seq, i, t.pc, 'insn-bits', WP_DEFECT,
                             hex(r.bits), hex(t.bits), 'same PC, other bytes'))
             continue
         rw, tw = split_ref_writes(r), split_trc_writes(t)
+        sub.note('reg-dst-set', t)
         if frozenset(rw) != frozenset(tw):
             rel = set_relation((), sorted(rw), (), sorted(tw))
             if rel != EQUAL:
@@ -337,6 +342,7 @@ def compare_excursion(guest, ex, ref, gapinfo):
                                 v, sorted(rw), sorted(tw),
                                 '%s %s' % (rel, lab or '')))
         for k in frozenset(rw) & frozenset(tw):
+            sub.note('reg-dst-value', t)
             if rw[k] != tw[k]:
                 rows.append(Row(guest, ex.seq, i, t.pc, 'reg-dst-value',
                                 RECON_GAP if k in reg_gaps else WP_DEFECT,
@@ -344,6 +350,7 @@ def compare_excursion(guest, ex, ref, gapinfo):
                                 '%s=0x%x' % (k, tw[k]), ''))
         rs, ts = split_ref_reads(r), frozenset(
             x for x in t.srcs if x not in spike_ref.CSR_IDS)
+        sub.note('reg-src-set', t)
         if rs != ts:
             rel = set_relation((), sorted(rs), (), sorted(ts))
             if rel != EQUAL:
@@ -352,6 +359,7 @@ def compare_excursion(guest, ex, ref, gapinfo):
                                 v, sorted(rs), sorted(ts),
                                 '%s %s' % (rel, lab or '')))
         # --- memory
+        sub.note('memop-count', t)
         if len(r.loads) != len(t.loads) or len(r.stores) != len(t.stores):
             # QEMU lowers store-conditional onto tcg_gen_atomic_cmpxchg, which
             # really reads the line; the tracer records the access the guest
@@ -370,6 +378,7 @@ def compare_excursion(guest, ex, ref, gapinfo):
             for j, (rec, tec) in enumerate(zip(rl, tl)):
                 ra, rd, rw_ = rec
                 ta, td, tw_ = tec
+                sub.note('memop-addr', t)
                 if ra != ta:
                     gap = any(a in unestablished for a in range(ta, ta + 8))
                     rows.append(Row(guest, ex.seq, i, t.pc, 'memop-addr',
@@ -377,11 +386,14 @@ def compare_excursion(guest, ex, ref, gapinfo):
                                     else WP_DEFECT,
                                     '0x%x' % ra, '0x%x' % ta, kind))
                     continue
+                if tw_ is not None:
+                    sub.note('memop-width', t)
                 if tw_ is not None and rw_ != tw_:
                     rows.append(Row(guest, ex.seq, i, t.pc, 'memop-width',
                                     WP_DEFECT, rw_, tw_, kind))
                 if td is None:
                     continue
+                sub.note('load-data' if kind == 'load' else 'store-data', t)
                 w = min(rw_, tw_ or rw_)
                 mask = (1 << (8 * w)) - 1
                 if (rd & mask) != (td & mask):
@@ -392,7 +404,7 @@ def compare_excursion(guest, ex, ref, gapinfo):
                                     '0x%x' % rd, '0x%x' % td,
                                     'address never established by the wire'
                                     if unest else ''))
-    return rows, min(n, len(ref))
+    return rows, min(n, len(ref)), sub
 
 
 def entry_state_rows(guest, ex, truth, reg_gaps):
@@ -404,6 +416,7 @@ def entry_state_rows(guest, ex, truth, reg_gaps):
     call it an agreement.
     """
     rows, stats = [], collections.Counter()
+    sub = Subjects()
     for name, (val, w) in sorted(ex.regs.items()):
         if wp_seed.reg_to_riscv(name) is None:
             stats['tracer-only-id'] += 1
@@ -412,6 +425,7 @@ def entry_state_rows(guest, ex, truth, reg_gaps):
             stats['reference-silent'] += 1
             continue
         mask = (1 << (8 * w)) - 1 if 0 < w < 8 else (1 << 64) - 1
+        sub.note('wp-entry-state')
         if (truth[name] & mask) != (val & mask):
             stats['wrong'] += 1
             reg_gaps.add(name)
@@ -428,7 +442,7 @@ def entry_state_rows(guest, ex, truth, reg_gaps):
             rows.append(Row(guest, ex.seq, -1, ex.start_pc, 'wp-entry-state',
                             RECON_GAP, '%s=0x%x' % (name, truth[name]),
                             'ABSENT', 'the wire never stated this register'))
-    return rows, stats
+    return rows, stats, sub
 
 
 # ------------------------------------------------------------------ driver
@@ -474,6 +488,7 @@ def process_guest(args, guest, out):
 
     distinct = wp_trace.dedupe(exc)
     rows, stats, tails = [], collections.Counter(), collections.Counter()
+    sub = Subjects()
     stats['excursions-dynamic'] = len(exc)
     stats['excursions-distinct'] = len(distinct)
     stats['cp-aligned'] = len(trc2ref)
@@ -497,8 +512,9 @@ def process_guest(args, guest, out):
         ridx = trc2ref.get(ex.cp_index - 1)
         if ridx is not None:
             truth = snaps[ridx + 1]
-            erows, estats = entry_state_rows(guest, ex, truth,
-                                             gapinfo['reg_gaps'])
+            erows, estats, esub = entry_state_rows(guest, ex, truth,
+                                                   gapinfo['reg_gaps'])
+            sub.merge(esub)
             rows.extend(erows)
             for kk, vv in estats.items():
                 stats['entry-state:' + kk] += vv
@@ -514,7 +530,8 @@ def process_guest(args, guest, out):
             stats['excursion-trapped'] += 1
             tails['reference-retired-nothing'] += len(ex.insns)
             continue
-        r, compared = compare_excursion(guest, ex, ref, gapinfo)
+        r, compared, csub = compare_excursion(guest, ex, ref, gapinfo)
+        sub.merge(csub)
         rows.extend(r)
         stats['wp-insns-compared'] += compared
         tail = len(ex.insns) - compared
@@ -530,10 +547,10 @@ def process_guest(args, guest, out):
             stats['unmappable-id:' + u] += 1
     for kk, vv in tstats.items():
         stats['trace:' + kk] += vv
-    return rows, stats, tails
+    return rows, stats, tails, sub
 
 
-def render(rows, stats, tails, guests):
+def render(rows, stats, tails, guests, sub):
     out = []
     w = out.append
     w('=' * 74)
@@ -581,20 +598,8 @@ def render(rows, stats, tails, guests):
     w('')
     byv = collections.Counter(r.verdict for r in rows)
     bya = collections.Counter((r.axis, r.verdict) for r in rows)
-    hdr = ('%-16s %10s %19s %12s %16s %12s'
-           % ('axis', WP_DEFECT, RECON_GAP, SPIKE_LIMIT, SUPERSET_OK,
-              UNACCOUNTED))
-    w(hdr)
-    w('-' * len(hdr))
-    for ax in AXES + ('wp-entry-state',):
-        n = [bya[(ax, v)] for v in VERDICTS]
-        if not any(n):
-            continue
-        w('%-16s %10d %19d %12d %16d %12d' % ((ax,) + tuple(n)))
-    w('-' * len(hdr))
-    w('%-16s %10d %19d %12d %16d %12d'
-      % (('TOTAL',) + tuple(byv[v] for v in VERDICTS)))
-    w('')
+    for line in sub.render(AXES + ('wp-entry-state',), bya, VERDICTS):
+        w(line)
     w('THE NUMBER THAT MATTERS: WP-DEFECT + RECONSTRUCTION-GAP +')
     w('UNACCOUNTED = %d.  TRACER-SUPERSET rows are COVERED -- each carries a'
       % (byv[WP_DEFECT] + byv[RECON_GAP] + byv[UNACCOUNTED]))
@@ -646,12 +651,16 @@ def main():
 
     os.makedirs(a.outdir, exist_ok=True)
     rows, stats, tails = [], collections.Counter(), collections.Counter()
+    sub = Subjects()
     for g in a.guest:
-        r, s, t = process_guest(a, g, a.outdir)
+        r, s, t, f = process_guest(a, g, a.outdir)
         rows.extend(r)
         stats.update(s)
         tails.update(t)
-    txt, identity_ok = render(rows, stats, tails, a.guest)
+        sub.merge(f)
+    sub.write_tsv(os.path.join(a.outdir, 'axis_subjects.tsv'),
+                  AXES + ('wp-entry-state',))
+    txt, identity_ok = render(rows, stats, tails, a.guest, sub)
     sys.stdout.write(txt)
     open(os.path.join(a.outdir, 'REPORT.txt'), 'w').write(txt)
     if a.tsv:

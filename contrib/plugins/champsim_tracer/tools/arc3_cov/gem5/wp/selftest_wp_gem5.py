@@ -66,64 +66,97 @@ def mutations(ex):
 
     m = clone()
     m.insns[0].pc ^= 0x10
-    out.append(('pc-sequence', 'move the first WP PC by 0x10', m))
+    out.append(('pc-sequence', 'move the first WP PC by 0x10', m, 0))
 
     m = clone()
     m.insns[0].nbytes += 1
-    out.append(('insn-length', 'lengthen the first encoding by one byte', m))
+    out.append(('insn-length', 'lengthen the first encoding by one byte',
+                m, 0))
 
     for i, ins in enumerate(ex.insns):
         if ins.writes and _non_x87(ins):
             m = clone()
             m.insns[i].writes = []
             out.append(('reg-dst-set', 'drop the destination of insn %d' % i,
-                        m))
+                        m, i))
             m = clone()
             n, v, w = m.insns[i].writes[0]
             m.insns[i].writes[0] = (n, v ^ 0x5a5a, w)
             out.append(('reg-dst-value', 'corrupt the value of insn %d' % i,
-                        m))
+                        m, i))
             break
 
     for i, ins in enumerate(ex.insns):
         if len(ins.srcs) > 1:
             m = clone()
             m.insns[i].srcs = ins.srcs[1:]
-            out.append(('reg-src-set', 'drop a source of insn %d' % i, m))
+            out.append(('reg-src-set', 'drop a source of insn %d' % i, m, i))
             break
 
     # Loads and stores are walked SEPARATELY.  Taking "the first instruction
     # with a memop" leaves store-data with no mutation whenever that
     # instruction happens to be a load, which is how an axis ends up
     # unprovable without anyone noticing.
+    #
+    # WHY THIS WALKS EVERY INSTRUCTION AND NOT JUST THE FIRST ONE WITH A
+    # MEMOP.  It used to stop at the first, and on `p_wpmem` that is a
+    # ONE-BYTE `movzx` load: halving its width is `max(1, 1 // 2) == 1`, a
+    # mutation that changes NOTHING, so the axis could not possibly fire and
+    # the control printed DID NOT FIRE five times over -- once per pair --
+    # for a reason that was the harness's, not the tracer's.  A reader cannot
+    # tell that apart from a blind axis, which is the whole thing this
+    # control exists to rule out.
+    #
+    # Two rules follow, and they are the fix:
+    #   * a mutation that leaves the record IDENTICAL is never emitted.  A
+    #     no-op falsifier is not a falsifier.
+    #   * the walk continues to the next instruction instead of breaking, so
+    #     an axis with no subject on insn N can still find one on insn N+1 of
+    #     the SAME guest.
     for which, axis in (('loads', 'load-data'), ('stores', 'store-data')):
+        want = set(('memop-count', 'memop-addr', 'memop-width', axis))
+        # The DATA axes get up to three candidate subjects rather than one.
+        # A datum mutation can only be scored where the REFERENCE also states
+        # a datum for that access, and gem5 does not state one for every
+        # access it retires -- so a single candidate makes the control's
+        # verdict depend on which access happened to come first.  Three
+        # candidates in the same guest is the difference between "the axis is
+        # blind" and "this particular access has no reference datum".
+        data_left = 3
         for i, ins in enumerate(ex.insns):
+            if not want and not data_left:
+                break
             recs = getattr(ins, which)
             if not recs or not _non_x87(ins):
                 continue
-            m = clone()
-            getattr(m.insns[i], which).pop()
-            out.append(('memop-count',
-                        'drop the %s of insn %d' % (which[:-1], i), m))
-            m = clone()
-            a, d, sz = getattr(m.insns[i], which)[0]
-            getattr(m.insns[i], which)[0] = (a + 8, d, sz)
-            out.append(('memop-addr',
-                        'move the %s address of insn %d' % (which[:-1], i), m))
-            if sz:
+            a, d, sz = recs[0]
+            if 'memop-count' in want:
                 m = clone()
-                a, d, sz2 = getattr(m.insns[i], which)[0]
-                getattr(m.insns[i], which)[0] = (a, d, max(1, sz2 // 2))
+                getattr(m.insns[i], which).pop()
+                out.append(('memop-count',
+                            'drop the %s of insn %d' % (which[:-1], i), m, i))
+                want.discard('memop-count')
+            if 'memop-addr' in want:
+                m = clone()
+                getattr(m.insns[i], which)[0] = (a + 8, d, sz)
+                out.append(('memop-addr', 'move the %s address of insn %d'
+                            % (which[:-1], i), m, i))
+                want.discard('memop-addr')
+            if 'memop-width' in want and sz and max(1, sz // 2) != sz:
+                m = clone()
+                getattr(m.insns[i], which)[0] = (a, d, max(1, sz // 2))
                 out.append(('memop-width',
-                            'halve the %s width of insn %d' % (which[:-1], i),
-                            m))
-            if d is not None:
+                            'halve the %s width of insn %d (%d -> %d bytes)'
+                            % (which[:-1], i, sz, max(1, sz // 2)), m, i))
+                want.discard('memop-width')
+            if data_left and d is not None and (d ^ 0xff) != d:
                 m = clone()
-                a, d2, sz2 = getattr(m.insns[i], which)[0]
-                getattr(m.insns[i], which)[0] = (a, d2 ^ 0xff, sz2)
+                getattr(m.insns[i], which)[0] = (a, d ^ 0xff, sz)
                 out.append((axis, 'corrupt the %s datum of insn %d'
-                            % (which[:-1], i), m))
-            break
+                            % (which[:-1], i), m, i))
+                data_left -= 1
+                if not data_left:
+                    want.discard(axis)
     return out
 
 
@@ -160,12 +193,38 @@ def _pairs(args, envx, guest, limit):
         if len(ref) < 4:
             continue
         gi = C.excursion_gaps(ex, [])
-        base, _n, _t = C.compare_excursion(guest, ex, ref, gi, run.tail)
+        base, _n, _t, _sub = C.compare_excursion(guest, ex, ref, gi,
+                                                 run.tail)
         dirty = set(r.axis for r in base
                     if r.verdict in (C.WP_DEFECT, C.RECON_GAP, C.UNACCOUNTED))
         out.append((ex, ref, dirty, seed, run))
     return out
 
+
+
+def why_not(sub, axis, insn):
+    """Why a mutation did not fire, taken from the comparison it ran.
+
+    A bare "DID NOT FIRE" cannot be told apart from a blind axis, and that is
+    the one thing this control exists to rule out.  The per-axis SUBJECT
+    census the comparator now returns answers it mechanically, and it answers
+    it about THE INSTRUCTION THAT WAS MUTATED rather than about the axis in
+    general: an axis can compare five facts on a pair and still have compared
+    none of them on the access the mutation broke, because the reference
+    states no datum for that access.  Those are different sentences and only
+    one of them is a demand to interrogate the tracer.
+    """
+    enc = insn.bits.to_bytes(insn.nbytes, 'little').hex()
+    if not sub.facts[axis]:
+        return ('DID NOT FIRE -- the axis compared NOTHING on this pair; '
+                'the reference states no such fact anywhere in it')
+    if enc not in sub.enc[axis]:
+        return ('DID NOT FIRE -- the axis compared %d facts on this pair and '
+                'NONE of them on the mutated instruction; the reference '
+                'states no such fact for that access' % sub.facts[axis])
+    return ('DID NOT FIRE -- the axis compared %d facts, one of them on the '
+            'mutated instruction, and none moved; INTERROGATE THIS'
+            % sub.facts[axis])
 
 def run(args, envx):
     pairs = []
@@ -179,19 +238,19 @@ def run(args, envx):
     attempted = set()
     lines = []
     for guest, ex, ref, dirty, _seed, run_ in pairs:
-        for axis, what, m in mutations(ex):
+        for axis, what, m, idx in mutations(ex):
             if fired[axis] or axis in dirty:
                 continue          # one firing mutation per axis is the bar
             attempted.add(axis)
-            rows, _n, _t = C.compare_excursion(guest, m, ref,
-                                               C.excursion_gaps(m, []),
-                                               run_.tail)
+            rows, _n, _t, msub = C.compare_excursion(
+                guest, m, ref, C.excursion_gaps(m, []), run_.tail)
             hit = [r for r in rows if r.axis == axis and
                    r.verdict in (C.WP_DEFECT, C.RECON_GAP, C.UNACCOUNTED)]
             fired[axis] += bool(hit)
             lines.append('  %-14s %-12s %-44s %s'
                          % (axis, os.path.basename(guest), what,
-                            'FIRED' if hit else 'DID NOT FIRE'))
+                            'FIRED' if hit
+                            else why_not(msub, axis, m.insns[idx])))
 
     # ---- wp-entry-state.  It is scored in process_guest rather than in
     # compare_excursion, so it needs its own mutation or its zero would be
@@ -202,7 +261,7 @@ def run(args, envx):
     m = copy.deepcopy(ex)
     victim = sorted(truth)[0]
     m.regs[victim] = (truth[victim] ^ 0x1234, 8)
-    erows, _es = C.entry_state_rows(guest, m, truth, set())
+    erows, _es, _sub = C.entry_state_rows(guest, m, truth, set())
     es_ok = any(r.axis == 'wp-entry-state' and r.verdict == C.RECON_GAP
                 for r in erows)
     lines.append('  %-14s %-12s %-44s %s'

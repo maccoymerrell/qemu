@@ -364,3 +364,27 @@ def dedupe(excursions):
         seen[key] = [ex, 1]
         order.append(key)
     return [(seen[k][0], seen[k][1]) for k in order]
+
+
+def census(decode, trace):
+    """(cst_decode, .cst) -> {'cp': [(pc, bits, nbytes)], 'wp': [...]}.
+
+    The encoding census, taken straight off the disasm skeleton, with no
+    image and no reconstruction: what a leg EXERCISED is a property of the
+    trace alone, and asking for it must not require a simulator to be
+    installed.
+
+    It exists because an instruction COUNT is not a size.  704 declared
+    wrong-path instructions on x86_64 sounds large and a loop inflates it
+    for free; the number that bounds what the leg can support is how many
+    DISTINCT things it ran.  Returning the raw triples rather than a count
+    keeps the vocabulary question -- Capstone mnemonic, tracer generic
+    class, or bare encoding -- with the caller, which is where the three
+    answers differ.
+    """
+    out = {'cp': [], 'wp': []}
+    for blkinfo in _skeleton(decode, trace):
+        out['cp'].extend(blkinfo['cp'])
+        for wb in blkinfo['wp']:
+            out['wp'].extend(wb['insns'])
+    return out

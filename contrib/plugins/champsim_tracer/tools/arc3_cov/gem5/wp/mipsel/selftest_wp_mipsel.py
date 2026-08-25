@@ -177,7 +177,7 @@ def _subjects(args, binary, cfg, env, guest, limit):
         if len(ref) < 4:
             continue
         gi = C.excursion_gaps(ex, [])
-        base, _n = C.compare_excursion(guest, ex, ref, gi,
+        base, _n, _sub = C.compare_excursion(guest, ex, ref, gi,
                                        stopped=run.stopped)
         out.append((guest, ex, ref, set(r.axis for r in base),
                     elf, npro, boot))
@@ -201,7 +201,7 @@ def run(args, binary, cfg, env):
             if fired[axis] or axis in dirty:
                 continue          # one firing mutation per axis is the bar
             attempted.add(axis)
-            rows, _n = C.compare_excursion(guest, m, ref,
+            rows, _n, _sub = C.compare_excursion(guest, m, ref,
                                            C.excursion_gaps(m, []))
             hit = [r for r in rows if r.axis == axis and
                    r.verdict in (C.WP_DEFECT, C.RECON_GAP, C.UNACCOUNTED)]
@@ -219,7 +219,7 @@ def run(args, binary, cfg, env):
     m = copy.deepcopy(ex)
     victim = sorted(truth)[0]
     m.regs[victim] = (truth[victim] ^ 0x1234, 4)
-    erows, _es = C.entry_state_rows(guest, m, truth, set())
+    erows, _es, _sub = C.entry_state_rows(guest, m, truth, set())
     es_ok = any(r.axis == 'wp-entry-state' and r.verdict == C.RECON_GAP
                 for r in erows)
     lines.append('  %-16s %-10s %-46s %s'

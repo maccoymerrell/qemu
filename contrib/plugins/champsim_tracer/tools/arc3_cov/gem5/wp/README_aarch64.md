@@ -137,6 +137,25 @@ gone before the comparison and a disagreement is a real one.  A label applied
 to a whole axis rather than to a measured shape is exactly what
 `arc3_taxonomy` declares `accounts=False`, and it had hidden four axes.
 
+## A zero row count is not coverage on its own
+
+The verdict table carries a **FACTS** column: the number of comparisons each
+axis actually performed.  A hand-read "0 disagreements" says nothing about an
+axis that compared nothing, and this project has been caught by checks that
+reported success without verifying — so an axis whose fact count is 0 prints
+`INERT`, is listed by name, and is a demand for a better probe rather than a
+pass.  Measured over the full battery: 34,504 facts, no inert axis.
+
+## Determinism
+
+`rows.tsv` and `REPORT.txt` are byte-identical across `PYTHONHASHSEED=1` and
+`PYTHONHASHSEED=12345`.  Every set reaches a row already sorted by its printed
+form, because CPython randomises `set` iteration order per process and the
+correct-path gem5 leg was bitten by exactly that — two byte-identical
+measurements produced TSVs differing on 24 of 49 rows for no reason but the
+hash seed.  A reference nobody can diff against the last run is a reference
+nobody can check.
+
 ## Guests
 
 `probes_wp_a64.py` generates guests whose wrong path is worth measuring.  The

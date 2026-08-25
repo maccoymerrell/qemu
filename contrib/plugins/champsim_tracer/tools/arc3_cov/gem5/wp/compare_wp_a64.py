@@ -543,12 +543,16 @@ def align(ref, trc):
 def compare_excursion(guest, ex, refrows, gapinfo, stop_reason):
     """One excursion vs the reference run of the same state.
 
-    -> ([Row], uncompared tail, compared count).  The tail is returned rather
-    than inferred so the report can print
+    -> ([Row], uncompared tail, compared count, facts per axis).  The tail is
+    returned rather than inferred so the report can print
     ``sum-of-tails == declared - compared`` and leave no declared instruction
-    sitting unexplained.
+    sitting unexplained; the per-axis fact count is returned for the same
+    reason one step further in -- a zero row count on an axis that compared
+    NOTHING is survivorship bias, not coverage, and the report must be able
+    to tell the two apart.
     """
     rows = []
+    facts = collections.Counter()
     reg_gaps = gapinfo['reg_gaps']
     unestablished = gapinfo['unestablished']
     declared = len(ex.insns)
@@ -586,9 +590,11 @@ def compare_excursion(guest, ex, refrows, gapinfo, stop_reason):
                         ['0x%x' % p for p in trc_pcs], detail))
         n = k                      # beyond the split the streams are unrelated
 
+    facts['pc-sequence'] += 1
     compared = min(n, len(ref))
     for i in range(compared):
         r, t = ref[i], ex.insns[i]
+        facts['insn-bits'] += 1
         if r.bits != t.bits:
             rows.append(Row(guest, ex.seq, i, t.pc, 'insn-bits', WP_DEFECT,
                             hex(r.bits), hex(t.bits), 'same PC, other bytes'))
@@ -599,6 +605,7 @@ def compare_excursion(guest, ex, refrows, gapinfo, stop_reason):
         for axis, rs, ts in (('reg-dst-set', ra, ta),
                              ('flags-dst-set', rf, tf),
                              ('fpsr-dst-set', rp, tp)):
+            facts[axis] += 1
             if frozenset(rs) == frozenset(ts):
                 continue
             rel = set_relation((), sorted(rs), (), sorted(ts))
@@ -620,6 +627,7 @@ def compare_excursion(guest, ex, refrows, gapinfo, stop_reason):
             tv, tw = ta[k_]
             if not rw or not tw:
                 continue
+            facts['reg-dst-value'] += 1
             m = (1 << (8 * min(rw, tw))) - 1
             if (rv & m) != (tv & m):
                 rows.append(Row(guest, ex.seq, i, t.pc, 'reg-dst-value',
@@ -632,6 +640,7 @@ def compare_excursion(guest, ex, refrows, gapinfo, stop_reason):
         for axis, rs, ts in (('reg-src-set', rsa, tsa),
                              ('flags-src-set', rsf, tsf),
                              ('sys-src-set', rss, tss)):
+            facts[axis] += 1
             if rs == ts:
                 continue
             rel = set_relation((), sorted(rs), (), sorted(ts))
@@ -664,6 +673,8 @@ def compare_excursion(guest, ex, refrows, gapinfo, stop_reason):
         twid = (sum(sz or 0 for _a, _d, sz in t.loads),
                 sum(sz or 0 for _a, _d, sz in t.stores))
 
+        for _ax in ('memop-count', 'memop-addr', 'memop-width'):
+            facts[_ax] += 1
         mech = None
         if rb == tb and rcnt != tcnt:
             mech = 'SAME-BYTES-DIFFERENT-SPLIT'
@@ -720,8 +731,9 @@ def compare_excursion(guest, ex, refrows, gapinfo, stop_reason):
         for axis, rrec, trec in (('store-data', r.stores, t.stores),
                                  ('load-data', r.loads, t.loads)):
             rm, tm = bytemap(rrec), bytemap(trec)
-            diff = sorted(b for b in (frozenset(rm) & frozenset(tm))
-                          if rm[b] != tm[b])
+            both_b = frozenset(rm) & frozenset(tm)
+            facts[axis] += len(both_b)
+            diff = sorted(b for b in both_b if rm[b] != tm[b])
             if diff:
                 unest = any(b in unestablished for b in diff)
                 rows.append(Row(guest, ex.seq, i, t.pc, axis,
@@ -730,7 +742,7 @@ def compare_excursion(guest, ex, refrows, gapinfo, stop_reason):
                                 ['0x%x=0x%02x' % (b, tm[b]) for b in diff],
                                 'address never established by the wire'
                                 if unest else ''))
-    return rows, declared - compared, compared
+    return rows, declared - compared, compared, facts
 
 
 def entry_state_rows(guest, ex, truth, reg_gaps):
@@ -833,6 +845,7 @@ def process_guest(args, binary, cfg, env, guest, out):
     distinct = wp_trace.dedupe(exc)
     rows, stats = [], collections.Counter()
     tails = collections.Counter()
+    axisfacts = collections.Counter()
     stats['excursions-dynamic'] = len(exc)
     stats['excursions-distinct'] = len(distinct)
     stats['cp-aligned'] = len(trc2ref)
@@ -854,6 +867,7 @@ def process_guest(args, binary, cfg, env, guest, out):
             erows, estats = entry_state_rows(guest, ex, snaps[ridx + 1],
                                              gapinfo['reg_gaps'])
             rows.extend(erows)
+            axisfacts['wp-entry-state'] += estats['agree'] + estats['wrong']
             for kk, vv in estats.items():
                 stats['entry-state:' + kk] += vv
         else:
@@ -871,9 +885,11 @@ def process_guest(args, binary, cfg, env, guest, out):
             tails['reference-retired-nothing'] += len(ex.insns)
             stats['excursion-no-reference'] += 1
             continue
-        r, tail, compared = compare_excursion(guest, ex, refrows,
-                                              gapinfo, reason)
+        r, tail, compared, facts = compare_excursion(guest, ex, refrows,
+                                                     gapinfo, reason)
         rows.extend(r)
+        for kk, vv in facts.items():
+            axisfacts[kk] += vv
         if tail:
             tails['reference-stopped-short' if len(refrows) < len(ex.insns)
                   else 'pc-diverged'] += tail
@@ -887,10 +903,10 @@ def process_guest(args, binary, cfg, env, guest, out):
             stats['unmappable-id:' + u] += 1
     for kk, vv in tstats.items():
         stats['trace:' + kk] += vv
-    return rows, stats, tails
+    return rows, stats, tails, axisfacts
 
 
-def render(rows, stats, tails):
+def render(rows, stats, tails, axisfacts):
     out = []
     w = out.append
     w('=' * 74)
@@ -933,20 +949,32 @@ def render(rows, stats, tails):
     w('')
     byv = collections.Counter(r.verdict for r in rows)
     bya = collections.Counter((r.axis, r.verdict) for r in rows)
-    hdr = ('%-16s %10s %19s %12s %16s %12s'
-           % ('axis', WP_DEFECT, RECON_GAP, GEM5_LIMIT, SUPERSET_OK,
+    w('The FACTS column is the number of comparisons the axis actually')
+    w('performed.  A zero row count on an axis that compared NOTHING is')
+    w('survivorship bias, not coverage, and an axis reading 0 facts is')
+    w('marked INERT -- it is a demand for a better probe, never a pass.')
+    w('')
+    hdr = ('%-16s %9s %10s %19s %12s %16s %12s'
+           % ('axis', 'facts', WP_DEFECT, RECON_GAP, GEM5_LIMIT, SUPERSET_OK,
               UNACCOUNTED))
     w(hdr)
     w('-' * len(hdr))
+    inert = []
     for ax in AXES + ('wp-entry-state',):
         n = [bya[(ax, v)] for v in VERDICTS]
-        if not any(n):
-            continue
-        w('%-16s %10d %19d %12d %16d %12d' % ((ax,) + tuple(n)))
+        f = axisfacts[ax]
+        if not f:
+            inert.append(ax)
+        w('%-16s %9s %10d %19d %12d %16d %12d'
+          % ((ax, ('INERT' if not f else str(f))) + tuple(n)))
     w('-' * len(hdr))
-    w('%-16s %10d %19d %12d %16d %12d'
-      % (('TOTAL',) + tuple(byv[v] for v in VERDICTS)))
+    w('%-16s %9d %10d %19d %12d %16d %12d'
+      % (('TOTAL', sum(axisfacts.values())) + tuple(byv[v] for v in VERDICTS)))
     w('')
+    if inert:
+        w('INERT AXES (compared nothing; their zero is NOT a result): %s'
+          % ', '.join(inert))
+        w('')
     w('THE NUMBER THAT MATTERS: WP-DEFECT + RECONSTRUCTION-GAP +')
     w('UNACCOUNTED = %d.  TRACER-SUPERSET rows are COVERED -- each carries a'
       % (byv[WP_DEFECT] + byv[RECON_GAP] + byv[UNACCOUNTED]))
@@ -1026,17 +1054,18 @@ def main():
         fh.write('  gem5.opt: %s\n  se.py:    %s\n' % (binary, cfg))
 
     rows, stats = [], collections.Counter()
-    tails = collections.Counter()
+    tails, axisfacts = collections.Counter(), collections.Counter()
     for g in a.guest:
         try:
-            r, s, t = process_guest(a, binary, cfg, env, g, a.outdir)
+            r, s, t, f = process_guest(a, binary, cfg, env, g, a.outdir)
         except RuntimeError as exc:
             sys.stderr.write('%s\n' % exc)
             return 3
         rows.extend(r)
         stats.update(s)
         tails.update(t)
-    txt, identity_ok = render(rows, stats, tails)
+        axisfacts.update(f)
+    txt, identity_ok = render(rows, stats, tails, axisfacts)
     sys.stdout.write(txt)
     open(os.path.join(a.outdir, 'REPORT.txt'), 'w').write(txt)
     if a.tsv:

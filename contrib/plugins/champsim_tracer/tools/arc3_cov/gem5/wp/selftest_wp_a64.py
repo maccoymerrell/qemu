@@ -160,7 +160,7 @@ def _pairs(args, binary, cfg, env, guest, limit):
         if len(refrows) < 8:
             continue
         gi = C.excursion_gaps(ex, [])
-        base, _tail, _cmp = C.compare_excursion(guest, ex, refrows, gi, reason)
+        base = C.compare_excursion(guest, ex, refrows, gi, reason)[0]
         out.append((guest, ex, refrows, reason,
                     set(r.axis for r in base if r.verdict in RED)))
     return out
@@ -183,8 +183,8 @@ def run(args, binary, cfg, env):
             if fired[axis] or axis in dirty:
                 continue          # one firing mutation per axis is the bar
             attempted.add(axis)
-            rows, _t, _c = C.compare_excursion(guest, m, refrows,
-                                               C.excursion_gaps(m, []), reason)
+            rows = C.compare_excursion(guest, m, refrows,
+                                       C.excursion_gaps(m, []), reason)[0]
             hit = [r for r in rows if r.axis == axis and r.verdict in RED]
             fired[axis] += bool(hit)
             key = (axis, os.path.basename(guest), what)

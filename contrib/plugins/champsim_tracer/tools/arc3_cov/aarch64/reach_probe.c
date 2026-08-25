@@ -22,11 +22,30 @@
  * unreachable and would otherwise take the whole run down mid-file, which
  * is a silent truncation rather than a measurement.
  *
- * WHAT THIS CANNOT SEE, and the report must not claim it does: an
+ * THE ENABLE LEG.  A bare SIGILL also cannot separate "QEMU has no
+ * decoder" from "the architectural ENABLE STATE this encoding requires was
+ * not established".  The whole SME instruction set is UNDEFINED unless
+ * PSTATE.SM and/or PSTATE.ZA are set, and this harness executed every
+ * encoding with SVCR = 0, so an `smstart`-gated opcode refused for the
+ * PSTATE and not for the opcode.  `--pre` selects the state the child
+ * establishes before it calls the encoding:
+ *
+ *     off      SVCR = 0                    (the original leg, the default)
+ *     smstart  SVCR = SM|ZA                (streaming vector + ZA storage)
+ *     sm       SVCR = SM
+ *     za       SVCR = ZA
+ *
+ * An encoding is REACHABLE if it runs under ANY legal enable state, so the
+ * arms are a UNION and not a replacement: entering streaming mode makes the
+ * non-streaming-only SVE forms UNDEFINED in exactly the same way, and the
+ * `off` arm is what covers those.  The preamble is executed INSIDE the
+ * forked child, so an arm whose own preamble is unsupported dies per row
+ * rather than silently scoring the whole file.
+ *
+ * WHAT THIS STILL CANNOT SEE, and the report must not claim it does: an
  * encoding QEMU implements only at EL1 or above raises SIGILL here for
- * the privilege, not for the opcode.  Corroborate against
- * the target/arm/tcg decode files before quoting a row -- at the time of writing
- * every SIGILL row is absent from those files entirely.
+ * the privilege, not for the opcode.  That is the EL1 leg's question, and
+ * `sysreach.S` under qemu-system-aarch64 is the leg that answers it.
  *
  * Author: Maccoy Merrell
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -41,12 +60,51 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-int main(void)
+/* MSR (immediate) to the SVCR PSTATE fields.  Spelled as raw words so the
+ * harness builds with a toolchain that predates SME: binutils in this tree
+ * rejects `+sme` outright. */
+#define SMSTART_SMZA 0xd503477f
+#define SMSTART_SM   0xd503437f
+#define SMSTART_ZA   0xd503457f
+
+static uint32_t preamble_word(const char *name)
+{
+    if (!strcmp(name, "off")) {
+        return 0;
+    }
+    if (!strcmp(name, "smstart")) {
+        return SMSTART_SMZA;
+    }
+    if (!strcmp(name, "sm")) {
+        return SMSTART_SM;
+    }
+    if (!strcmp(name, "za")) {
+        return SMSTART_ZA;
+    }
+    fprintf(stderr, "unknown --pre arm '%s'\n", name);
+    exit(2);
+}
+
+int main(int argc, char **argv)
 {
     char line[64];
     int caught;
+    const char *pre_name = "off";
+    uint32_t pre = 0;
+    int i;
 
-    printf("hex\texec\tsignal\n");
+    for (i = 1; i < argc; i++) {
+        if (!strncmp(argv[i], "--pre=", 6)) {
+            pre_name = argv[i] + 6;
+        } else {
+            fprintf(stderr, "usage: reach_probe_a64 [--pre=off|smstart|sm|za]"
+                    " < encodings.hex\n");
+            return 2;
+        }
+    }
+    pre = preamble_word(pre_name);
+
+    printf("hex\texec\tsignal\tpre\n");
     while (fgets(line, sizeof line, stdin)) {
         uint32_t *page;
         pid_t pid;
@@ -77,9 +135,18 @@ int main(void)
             fprintf(stderr, "not a 4-byte a64 encoding: %s", line);
             return 2;
         }
-        memcpy(&page[0], raw, 4);
-        page[1] = 0xd65f03c0;                   /* ret */
-        __builtin___clear_cache((char *)page, (char *)page + 8);
+        /* The preamble rides in the SAME executable page, immediately
+         * ahead of the encoding, so no separate control transfer and no
+         * compiler-visible SME requirement is involved. */
+        if (pre) {
+            page[0] = pre;
+            memcpy(&page[1], raw, 4);
+            page[2] = 0xd65f03c0;               /* ret */
+        } else {
+            memcpy(&page[0], raw, 4);
+            page[1] = 0xd65f03c0;               /* ret */
+        }
+        __builtin___clear_cache((char *)page, (char *)page + 12);
 
         caught = 0;
         pid = fork();
@@ -123,7 +190,8 @@ int main(void)
             }
         }
         line[strcspn(line, "\r\n")] = '\0';
-        printf("%s\t%s\t%d\n", line, caught ? "no" : "yes", caught);
+        printf("%s\t%s\t%d\t%s\n", line, caught ? "no" : "yes", caught,
+               pre_name);
         fflush(stdout);
         munmap(page, 4096);
         munmap(scratch, 65536);

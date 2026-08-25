@@ -111,10 +111,39 @@ def main():
     ap.add_argument('--decode', default=None,
                     help='cst_decode disassembly of a real aarch64 run')
     ap.add_argument('--out', default=None)
+    ap.add_argument('--run-vl', type=int, default=None,
+                    help='SVE vector length IN BITS that the run in --decode '
+                         'executed at.  Given it, the vector-length-dependent '
+                         'rows are scored against the reference swept at that '
+                         'same length instead of being set aside.')
+    ap.add_argument('--ref-a-vl', type=int, default=None,
+                    help='vector length of --ref-a, when the sweep predates '
+                         'the metadata record')
     A = ap.parse_args()
 
     a = json.load(open(A.ref_a))
     b = json.load(open(A.ref_b))
+    meta = a.pop('__meta__', None)
+    b.pop('__meta__', None)
+    ref_a_vl = (meta or {}).get('vl', A.ref_a_vl)
+    if A.ref_a_vl is not None and meta and meta['vl'] != A.ref_a_vl:
+        sys.exit('--ref-a-vl %d contradicts the sweep\'s own record of %d'
+                 % (A.ref_a_vl, meta['vl']))
+    # A vector-length-dependent byte total is a real per-VL fact, and the run
+    # executed at ONE vector length.  Scoring those rows is therefore allowed
+    # -- but ONLY against the reference taken at the SAME length, and only
+    # when both lengths are stated.  Guessing either is how a comparison
+    # between two different machines gets reported as agreement.
+    score_vl = (A.run_vl is not None and ref_a_vl is not None
+                and A.run_vl == ref_a_vl)
+    if A.run_vl is not None and ref_a_vl is None:
+        sys.exit('--run-vl given but --ref-a carries no vector length and '
+                 '--ref-a-vl was not supplied: the two cannot be checked '
+                 'against each other, so the VL-dependent rows stay unscored')
+    if A.run_vl is not None and not score_vl:
+        sys.exit('the run executed at VL=%d and --ref-a was swept at VL=%d; '
+                 'scoring one against the other would compare two different '
+                 'machines' % (A.run_vl, ref_a_vl))
     opc = list(csv.DictReader(open(os.path.join(A.cov, 'opcodes.tsv')),
                               delimiter='\t'))
     trc = {r['hex']: r for r in csv.DictReader(open(A.batch), delimiter='\t')}
@@ -122,9 +151,13 @@ def main():
 
     fail = []
     both = vl_moved_mem = vl_moved_reg = 0
+    vl_undef_reg = vl_undef_mem = 0
+    notes_seen = 0
+    vlreg_rows = []
     countdiff = countdiff_vl = 0
     addr_known = addr_unknown = memsubj = 0
     scored = short = over = equal = unscorable = notmet = 0
+    vl_scored = 0
     notmet_fam = collections.Counter()
     rows = []
 
@@ -135,11 +168,32 @@ def main():
                 or RB.get('status') != 'ok' or not T:
             continue
         both += 1
+        # An encoding that is architecturally UNDEFINED at one of the two
+        # vector lengths does not have a register set there AT ALL: the
+        # reference reports the prologue it executed before reaching the
+        # ASL's own UNDEFINED statement.  Counting that as a set that MOVED
+        # with the vector length is the error open item 9 named -- it made
+        # 23 subjects look VL-conditional when 22 of them are constant
+        # across every vector length at which they are DEFINED.  The two
+        # cases are separated here and reported apart; a sweep whose rows
+        # carry no notes cannot make the separation and is refused below.
+        notes = (RA.get('notes') or []) + (RB.get('notes') or [])
+        if notes:
+            notes_seen += 1
+        undef_here = ('undefined-path' in (RA.get('notes') or [])
+                      or 'undefined-path' in (RB.get('notes') or []))
         if RA['src'] != RB['src'] or RA['dst'] != RB['dst']:
-            vl_moved_reg += 1
+            if undef_here:
+                vl_undef_reg += 1
+            else:
+                vl_moved_reg += 1
+                vlreg_rows.append((o['opcode_id'], T.get('b_mnem', '')))
         moved = RA['mr'] != RB['mr'] or RA['mw'] != RB['mw']
         if moved:
-            vl_moved_mem += 1
+            if undef_here:
+                vl_undef_mem += 1
+            else:
+                vl_moved_mem += 1
         if RA['mr'] or RA['mw']:
             memsubj += 1
             addr_known += RA.get('ak', 0)
@@ -156,7 +210,7 @@ def main():
         r = rt.get(h)
         if r is None or not (mr or mw):
             continue
-        if RA.get('bunk', 0) or moved:
+        if RA.get('bunk', 0) or (moved and not score_vl):
             unscorable += 1
             continue
         rb, wb = RA.get('mrb', 0), RA.get('mwb', 0)
@@ -178,6 +232,8 @@ def main():
             notmet_fam[T['b_mnem'].split()[0]] += 1
             continue
         scored += 1
+        if moved:
+            vl_scored += 1
         if got_r < rb or got_w < wb:
             short += 1
             fail.append('%s (%s): the run covered %d load / %d store bytes, '
@@ -197,7 +253,9 @@ def main():
     print()
     print('COUNT axis')
     print('  register src/dst sets that MOVED with VL       %5d' % vl_moved_reg)
+    print('    ... UNDEFINED at one VL, so not a moved set  %5d' % vl_undef_reg)
     print('  memop COUNTS that MOVED with VL                %5d' % vl_moved_mem)
+    print('    ... UNDEFINED at one VL, so not a moved count %4d' % vl_undef_mem)
     print('  presence-agree-countdiff rows                  %5d' % countdiff)
     print('    ... of which the reference number is VL-dependent  %5d'
           % countdiff_vl)
@@ -207,14 +265,18 @@ def main():
     print('  Mem[] accesses whose ADDRESS resolved          %5d' % addr_known)
     print('  Mem[] accesses whose ADDRESS did not resolve   %5d' % addr_unknown)
     print()
-    print('BYTE axis (reference complete, VL-independent, exercised by a run)')
+    print('BYTE axis (reference complete, exercised by a run%s)'
+          % (', VL-dependent rows scored at the run\'s own VL=%d' % A.run_vl
+             if score_vl else ', VL-independent only'))
     print('  scored                                         %5d' % scored)
     print('    tracer bytes == architecture bytes           %5d' % equal)
     print('    tracer bytes >  architecture bytes           %5d' % over)
     print('    tracer bytes <  architecture bytes           %5d  <-- must be 0'
           % short)
-    print('  not scorable (incomplete ref total or VL-dependent) %5d'
-          % unscorable)
+    print('    ... of them VL-dependent, scored at VL=%s %5d'
+          % (ref_a_vl if score_vl else '-', vl_scored))
+    print('  not scorable (incomplete ref total%s)      %5d'
+          % ('' if score_vl else ' or VL-dependent', unscorable))
     print('  access never fired on this run (condition false)     %5d'
           % notmet)
     if notmet:
@@ -224,8 +286,13 @@ def main():
         print('\n  covering MORE than the architecture states, first rows:')
         for r in rows[:8]:
             print('    %-30s %-10s arch(%d,%d) run(%d,%d)' % r)
+    if vlreg_rows:
+        print('\n  register sets that are GENUINELY vector-length dependent:')
+        for oid, mn in vlreg_rows[:12]:
+            print('    %-28s %s' % (oid, mn))
     if A.out:
         json.dump({'both': both, 'vl_moved_mem': vl_moved_mem,
+                   'vl_undef_reg': vl_undef_reg, 'vl_undef_mem': vl_undef_mem,
                    'vl_moved_reg': vl_moved_reg, 'countdiff': countdiff,
                    'countdiff_vl': countdiff_vl, 'mem_subjects': memsubj,
                    'addr_known': addr_known, 'addr_unknown': addr_unknown,
@@ -240,6 +307,11 @@ def main():
     if not memsubj:
         fail.append('no subject carried memory traffic -- the reference is '
                     'not being read')
+    if not notes_seen:
+        fail.append('neither sweep carries interpreter NOTES, so an encoding '
+                    'that is UNDEFINED at one vector length cannot be told '
+                    'from a register set that moved with it -- re-run the '
+                    'reference with mra_sweep.py, which records them')
     if fail:
         print('\nREFUSED:')
         for m in fail:

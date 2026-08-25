@@ -132,6 +132,12 @@ CONSTS = {
     # pinned to the architectural minimum so element loops have a concrete
     # trip count; no register INDEX in the A64 pseudocode depends on it.
     'CurrentVL': 512, 'CurrentSVL': 512,
+    # Architectural constants the shared pseudocode uses as literal sizes.
+    # TAG_GRANULE is the MTE allocation-tag granule: `Mem[address,
+    # TAG_GRANULE, accdesc] = Zeros(TAG_GRANULE * 8)` is how STZG and ST2G
+    # state the bytes they zero, and with the name unbound that size did not
+    # evaluate and the byte total came out incomplete.
+    'TAG_GRANULE': 16, 'LOG2_TAG_GRANULE': 4,
 }
 
 # PSTATE fields that are the condition flags
@@ -180,41 +186,121 @@ TAG_ACCESSORS = {'MemTag', 'AArch64.MemTag'}
 # shared pseudocode; the count is applied only if inlining the body did not
 # already account for the access, so a resolved body always wins over the
 # table and nothing is counted twice.
-# (reads, writes, channel).  Channel 'd' is the instruction's data access,
-# 't' allocation-tag memory, 'g' the Guarded Control Stack -- see the counter
-# comment on the effect record for why the three do not share a total.
+# (reads, writes, channel, width).  Channel 'd' is the instruction's data
+# access, 't' allocation-tag memory, 'g' the Guarded Control Stack -- see the
+# counter comment on the effect record for why the three do not share a total.
+#
+# WIDTH is what the table used to be unable to say, and saying it is what
+# makes a data-channel row SCORABLE on the byte axis.  A count with no width
+# forced `mem_bytes_unknown`, and a row whose byte total is incomplete cannot
+# be compared against a run.  Three spellings:
+#
+#     None        the width is not derivable here -- the byte total stays
+#                 incomplete and the row stays unscorable, honestly
+#     <int>       a fixed architectural byte count stated by the function
+#                 name itself (the 64-byte LS64 accessors)
+#     ('argb', i) argument i of the call IS the byte count.  This is the
+#                 shared pseudocode's own bottom edge: PhysMemRead and
+#                 PhysMemWrite both take `bytes` as their second argument,
+#                 and every wrapper that reaches them -- the whole LSE
+#                 atomic family through MemAtomic, LS64 through
+#                 MemLoad64B/MemStore64B -- passes a width it computed.
+#                 Taken from the argument VALUES the call already evaluated,
+#                 never re-evaluated: walking an argument expression twice
+#                 walks its register reads twice.
 MEM_CALLS = {
-    'MemAtomic':           (1, 1, 'd'),  # PhysMemRead + PhysMemWrite, one RMW
-    'MemAtomicRCW':        (1, 1, 'd'),
-    'MemLoad64B':          (1, 0, 'd'),  # LS64: one 64-byte read
-    'MemStore64B':         (0, 1, 'd'),
-    'MemStore64BWithRet':  (0, 1, 'd'),
-    'AArch64.MemZero':     (0, 1, 'd'),  # DC ZVA block
-    'AArch64.DataMemZero': (0, 1, 'd'),
-    'AArch64.TagMemZero':  (0, 1, 't'),
+    'MemAtomic':           (1, 1, 'd', None),  # PhysMemRead + PhysMemWrite
+    'MemAtomicRCW':        (1, 1, 'd', None),
+    'MemLoad64B':          (1, 0, 'd', 64),    # LS64: one 64-byte read
+    'MemStore64B':         (0, 1, 'd', 64),
+    'MemStore64BWithRet':  (0, 1, 'd', 64),
+    'AArch64.MemZero':     (0, 1, 'd', None),  # DC ZVA, block size is runtime
+    'AArch64.DataMemZero': (0, 1, 'd', None),
+    'AArch64.TagMemZero':  (0, 1, 't', None),
     # Guarded Control Stack.  GCSPUSHM -> AddGCSRecord -> one Mem[] store;
     # the Ex forms push/check a four-doubleword record.  Every one of these
     # sits behind `if GCSEnabled(PSTATE.EL)`, so the count is what the
     # instruction does WHEN GCS IS ENABLED, never unconditional -- which is
     # why it may not be added to the data total.
-    'GCSPUSHM':            (0, 1, 'g'),
-    'GCSPOPM':             (1, 0, 'g'),
-    'GCSPUSHX':            (0, 4, 'g'),
-    'GCSPOPX':             (4, 0, 'g'),
-    'GCSPOPCX':            (4, 0, 'g'),
-    'GCSSS1':              (0, 1, 'g'),
-    'GCSSS2':              (1, 1, 'g'),
-    'AddGCSRecord':        (0, 1, 'g'),
-    'AddGCSExRecord':      (0, 4, 'g'),
-    'LoadCheckGCSRecord':  (1, 0, 'g'),
-    'CheckGCSExRecord':    (4, 0, 'g'),
+    'GCSPUSHM':            (0, 1, 'g', 8),
+    'GCSPOPM':             (1, 0, 'g', 8),
+    'GCSPUSHX':            (0, 4, 'g', 8),
+    'GCSPOPX':             (4, 0, 'g', 8),
+    'GCSPOPCX':            (4, 0, 'g', 8),
+    'GCSSS1':              (0, 1, 'g', 8),
+    'GCSSS2':              (1, 1, 'g', 8),
+    'AddGCSRecord':        (0, 1, 'g', 8),
+    'AddGCSExRecord':      (0, 4, 'g', 8),
+    'LoadCheckGCSRecord':  (1, 0, 'g', 8),
+    'CheckGCSExRecord':    (4, 0, 'g', 8),
     # The leaves.  Present so that a body that DOES resolve is counted at
-    # the architecture's own bottom edge rather than at a wrapper.
-    'PhysMemRead':         (1, 0, 'd'),
-    'PhysMemWrite':        (0, 1, 'd'),
-    'PhysMemTagRead':      (1, 0, 't'),
-    'PhysMemTagWrite':     (0, 1, 't'),
+    # the architecture's own bottom edge rather than at a wrapper -- and it
+    # is at that bottom edge that the width is stated, as `bytes`.
+    'PhysMemRead':         (1, 0, 'd', ('argb', 1)),
+    'PhysMemWrite':        (0, 1, 'd', ('argb', 1)),
+    'PhysMemTagRead':      (1, 0, 't', None),
+    'PhysMemTagWrite':     (0, 1, 't', None),
 }
+
+#: An ASL function may be POLYMORPHIC IN A WIDTH: `bits(size) MemAtomic(...,
+#: bits(size) operand, ...)` derives `constant integer bytes = size DIV 8`
+#: from a `size` that is never a parameter -- it is inferred from the width of
+#: the argument the caller passed.  This interpreter carries values, not
+#: widths, so `size` was unbound, `bytes` was UNK, and every LSE atomic's byte
+#: total came out incomplete even though the width is stated by the encoding's
+#: own `size` field.
+#:
+#: The binding below closes that, and it is exact rather than a guess: in A64
+#: every caller of these functions is an instruction whose decode section
+#: defines `integer datasize` and whose execute section passes `bits(datasize)`
+#: operands, so the callee's `size` IS the caller's `datasize`.  A caller with
+#: no concrete `datasize` binds nothing and the row stays unscorable, which is
+#: the honest outcome and not a fabricated width.
+#: (width variable, caller variable holding it, argument index whose DECLARED
+#: type carries it).  The second source exists because not every caller
+#: computes a `datasize`: the 128-bit atomic families spell the operand's
+#: width as a literal type, `bits(128) store_value;`, and the width is then
+#: stated by the DECLARATION rather than by a variable.  Both sources are the
+#: architecture's own text; neither is inferred from a mnemonic.
+POLY_WIDTH_FROM_ENV = {
+    'MemAtomic':    ('size', 'datasize', 2),
+    'MemAtomicRCW': ('size', 'datasize', 2),
+}
+
+#: `bits(<width>)` in a declaration.  The width is an ARITHMETIC EXPRESSION,
+#: not just a name: CASP declares its operand `bits(2*datasize)` because the
+#: instruction swaps a REGISTER PAIR, and reading `datasize` there states half
+#: the access.  Matching only a bare name got that row wrong in the one
+#: direction the byte axis can catch -- the reference came out at 4 bytes for
+#: an 8-byte swap -- so the expression is evaluated rather than pattern-matched.
+_DECL_WIDTH = re.compile(r'^bits\s*\((.+)\)$', re.S)
+_WIDTH_SAFE = re.compile(r'^[A-Za-z_0-9+*() <-]+$')
+
+
+def decl_width(typ, env):
+    """Bit width stated by a declaration's type, or None.
+
+    Only integer arithmetic over declaration-time names is accepted; anything
+    else returns None and the caller leaves the width unstated rather than
+    guessing one."""
+    m = _DECL_WIDTH.match((typ or '').strip())
+    if not m:
+        return None
+    e = m.group(1).replace('DIV', '//')
+    if not _WIDTH_SAFE.match(e.replace('//', ' ')):
+        return None
+    names = set(re.findall(r'[A-Za-z_][A-Za-z_0-9]*', e))
+    ns = {}
+    for n in names:
+        v = as_int(env.get(n))
+        if v is None:
+            return None
+        ns[n] = v
+    try:
+        v = eval(e, {'__builtins__': {}}, ns)          # noqa: S307
+    except Exception:
+        return None
+    return v if isinstance(v, int) and 0 < v <= 4096 else None
 
 SYSREG_RE = re.compile(r'^[A-Z][A-Z0-9]*(_[A-Z0-9]+)*$')
 
@@ -237,6 +323,10 @@ class Interp:
         self.origin = {}          # var -> (read_id, kind, idx)
         self.cover = {}           # var -> set of covered bit ranges
         self.used = set()         # vars whose value was consumed
+        # Declared bit width of a local, kept because an ASL function that is
+        # polymorphic in a width derives its byte count from that width and
+        # never from a value.  See POLY_WIDTH_FROM_ENV.
+        self.varwidth = {}
         self.wb = {}              # (kind, idx) -> [width, covered set, read_ids]
         self.suppress_use = 0
         self.last_read_id = None
@@ -304,6 +394,13 @@ class Interp:
             self.assign(lhs, val, env)
         elif k == 'decl':
             self.last_read_id = None
+            if s[2]:
+                w = decl_width(s[1], env)
+                for nm in s[2]:
+                    if w is None:
+                        self.varwidth.pop(nm, None)
+                    else:
+                        self.varwidth[nm] = w
             with self._reads_of() as got:
                 val = self.eval(s[3], env) if s[3] is not None else UNK
             if s[2]:
@@ -1062,21 +1159,30 @@ class Interp:
             return self._call_inner(e, env, bracket)
         ef = self.ef
         before = (ef.mem_r, ef.mem_w, ef.tag_r, ef.tag_w, ef.gcs_r, ef.gcs_w)
-        r = self._call_inner(e, env, bracket)
+        argvals = []
+        r = self._call_inner(e, env, bracket, out_vals=argvals)
         if (ef.mem_r, ef.mem_w, ef.tag_r, ef.tag_w,
                 ef.gcs_r, ef.gcs_w) == before:
-            dr, dw, chan = MEM_CALLS[name]
+            dr, dw, chan, width = MEM_CALLS[name]
+            if isinstance(width, tuple):
+                i = width[1]
+                width = as_int(argvals[i]) if i < len(argvals) else None
             if chan == 'd':
                 ef.mem_r += dr
                 ef.mem_w += dw
-                # The table states a COUNT and cannot state a width: this
-                # arm fires precisely when the body that carried the size
-                # argument was cut.  Recording the count while silently
-                # adding nothing to the byte total would make an incomplete
-                # byte total look complete.
+                # A count with no width leaves the byte total INCOMPLETE, and
+                # recording the count while silently adding nothing to the
+                # total would make an incomplete total look complete.  The
+                # width is taken from the call's own argument where the
+                # architecture states one; where it does not, the row is
+                # marked unknown and stays unscorable rather than guessed.
                 if dr or dw:
-                    ef.mem_bytes_unknown += dr + dw
-                    self.notes.add('mem-bytes-unknown:MEM_CALLS:' + name)
+                    if width is None:
+                        ef.mem_bytes_unknown += dr + dw
+                        self.notes.add('mem-bytes-unknown:MEM_CALLS:' + name)
+                    else:
+                        ef.mem_rb += dr * width
+                        ef.mem_wb += dw * width
             elif chan == 't':
                 ef.tag_r += dr
                 ef.tag_w += dw
@@ -1086,7 +1192,7 @@ class Interp:
             self.notes.add('mem-call-table:' + name)
         return r
 
-    def _call_inner(self, e, env, bracket=False):
+    def _call_inner(self, e, env, bracket=False, out_vals=None):
         name, args = e[1], e[2]
         if name is None:
             self.eval(e[3], env)
@@ -1110,6 +1216,11 @@ class Interp:
             raise
         argreads = self.defer_consume
         self.defer_consume = outer_defer
+        if out_vals is not None:
+            # Handed back BEFORE dispatch so a nested call inside the body
+            # cannot overwrite this call's arguments.  MEM_CALLS reads the
+            # width off these values and never re-evaluates the expression.
+            out_vals.extend(vals)
         return self._call_body(name, args, vals, env, bracket, argreads)
 
     def _call_body(self, name, args, vals, env, bracket, argreads):
@@ -1156,6 +1267,23 @@ class Interp:
             if body is not None:
                 params, stmts = body
                 sub = dict(zip(params, vals))
+                pw = POLY_WIDTH_FROM_ENV.get(name)
+                if pw is not None and pw[0] not in sub:
+                    # The DECLARED type of the argument is the direct
+                    # statement of its width and wins; `datasize` is a
+                    # fallback for a caller that declared nothing.
+                    w = None
+                    src = ''
+                    if pw[2] < len(args) and args[pw[2]][0] == 'var':
+                        w = self.varwidth.get(args[pw[2]][1])
+                        src = 'decl:' + args[pw[2]][1]
+                    if w is None:
+                        w = as_int(env.get(pw[1]))
+                        src = pw[1]
+                    if w is not None:
+                        sub[pw[0]] = w
+                        self.notes.add('poly-width:%s:%s=%d(%s)'
+                                       % (name, pw[0], w, src))
                 self.depth += 1
                 self.frames.append([])
                 definite = []
@@ -1168,6 +1296,8 @@ class Interp:
                 # where their reads were consumed.
                 saved_reads = self.var_reads
                 self.var_reads = {}
+                saved_widths = self.varwidth
+                self.varwidth = {}
                 # Whether the callee did anything ARCHITECTURAL, measured
                 # rather than assumed from the name: if it wrote a
                 # register or touched memory, the argument reached a
@@ -1183,6 +1313,7 @@ class Interp:
                     pass
                 finally:
                     self.var_reads = saved_reads
+                    self.varwidth = saved_widths
                     self.depth -= 1
                     seen = self.frames.pop() + definite
                     after = (frozenset(self.ef.w), self.ef.mem_r,

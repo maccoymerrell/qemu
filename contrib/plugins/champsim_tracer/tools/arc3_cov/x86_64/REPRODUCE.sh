@@ -14,11 +14,12 @@ mkdir -p "$D"; cd "$D"
 # The harness is the TREE's copy; the working directory only holds evidence.
 cp "$T"/compare_attrib.py "$T"/qemu_tcg_scope.py "$T"/icedtsv.py \
    "$T"/mkprobe.py "$T"/xediform.c "$T"/xl3.cc "$T"/reach_probe.c \
-   "$T"/cpuiddump.c "$T"/qemu_reach_matrix.py .
+   "$T"/cpuiddump.c "$T"/qemu_reach_matrix.py "$T"/sysprobe_enables.py \
+   "$T"/x87_cw_probe.c "$T"/x87_cw_derive.py "$T"/x87_cw_exec.c .
 ln -sfn "$R/pylib" pylib                      # iced-x86 1.21.0
 
 # The tracer arm needs the fields columns in --batch (commit 5379a000ac).
-ninja -C "$Q/build" contrib-plugins
+ninja -j 12 -C "$Q/build" contrib-plugins
 
 # ---- probe set -------------------------------------------------------------
 # One row per opcode from the denominator.  For an EVEX opcode whose iform
@@ -91,6 +92,88 @@ cp r_max_postfix.tsv reach.tsv            # the single-leg name compare_attrib.p
 # symbols inside the TCG_*_FEATURES masks, and the prefix facts; exits 1 when
 # any cited fact has stopped holding (e.g. QEMU gains EVEX or a new VEX map).
 $PY qemu_tcg_scope.py
+
+# ---- the x87 control/status word, DERIVED FROM QEMU -----------------------
+# 112 x87 rows used to carry a label whose own text said the derivation was
+# missing, so they accounted for nothing and reported UNACCOUNTED.  Two
+# attempts to close them keyed on "LLVM MC names X87CONTROL where XED does
+# not"; that closed 102 and OPENED 21 new TRACER-SUBSET rows by importing
+# claims QEMU does not perform, and was reverted rather than shipped.
+#
+# The answer comes from QEMU instead, in two halves that never consult the
+# tracer.  x87_cw_probe places each x87 encoding at its own fixed address and
+# lets QEMU translate it, so the helper sequence is READ OFF AN OBSERVED TCG
+# OP DUMP rather than off the switch in gen_x87() by eye.  x87_cw_derive.py
+# then walks the call graph of target/i386/tcg/fpu_helper.c to a fixed point
+# over four axes -- does the sequence read env->fpuc, write it, read
+# env->fpus / fpstt / fptags, write them -- with the def-kill that makes
+# `fldcw` a pure WRITE of the control word rather than a read of it.
+#
+# compare_attrib.py charges a row to the mechanism only where this file
+# confirms the exact register in the exact direction the tracer states it,
+# and REFUSES to score at all when the file is older than the sources it is
+# derived from.
+gcc -O0 -Wall -static -o x87_cw_probe "$T"/x87_cw_probe.c
+# The subject list comes from the DENOMINATOR, never from ../attrib.tsv:
+# compare_attrib.py consumes this derivation, so taking its input from
+# compare_attrib.py's output would be a cycle, and the first draft of this
+# block was exactly that.
+$PY - <<'EOF'
+import csv, json
+meta = {r['#opcode_id']: r for r in
+        csv.DictReader(open('../opcodes_meta.tsv'), delimiter='\t')}
+probe = json.load(open('probe_map.json'))
+rows = [(probe[k], m['iclass'], probe[k], m['extension'])
+        for k, m in sorted(meta.items())
+        if k in probe and (m['extension'] == 'X87' or
+                           (m['iclass'].startswith('F') and
+                            m['extension'] != '3DNOW'))]
+seen, uniq = set(), []
+for r in rows:
+    if r[0] in seen:
+        continue
+    seen.add(r[0])
+    uniq.append(r)
+with open('x87_subjects.tsv', 'w') as f:
+    for r in uniq:
+        f.write('\t'.join(r) + '\t-\n')
+open('x87.hex', 'w').write(''.join(r[0] + '\n' for r in uniq))
+print('x87 subjects: %d' % len(uniq))
+EOF
+"$Q"/build/qemu-x86_64 -one-insn-per-tb -d op -D x87_op.txt \
+    ./x87_cw_probe < x87.hex > x87_probe_out.tsv
+$PY "$T"/x87_cw_derive.py --op x87_op.txt --subjects x87_subjects.tsv \
+    -o x87_qemu_axes.tsv
+
+# THE DERIVATION'S OWN CONTROL, and it is a second measurement rather than a
+# re-reading of the first: x87_cw_exec executes every encoding TWICE from an
+# identical starting state, differing only in the x87 control word (round
+# nearest / 64-bit precision against round toward zero / 24-bit), and
+# compares the whole 108-byte FNSAVE image with the control word and the
+# instruction pointers masked out.  A result that MOVES is a control-word
+# read, OBSERVED.  It can convict and cannot acquit, so the test that matters
+# is that it convicts NOTHING the derivation calls "no".
+gcc -O0 -Wall -static -o x87_cw_exec "$T"/x87_cw_exec.c
+"$Q"/build/qemu-x86_64 ./x87_cw_exec          < x87.hex > x87_diff.tsv
+"$Q"/build/qemu-x86_64 ./x87_cw_exec --inject < x87.hex > x87_diff_inject.tsv
+$PY - <<'EOF'
+import csv
+d = {r['probe_hex']: r for r in csv.DictReader(open('x87_qemu_axes.tsv'),
+                                               delimiter='\t')}
+m = {r['hex']: r['moved'] for r in csv.DictReader(open('x87_diff.tsv'),
+                                                  delimiter='\t')}
+inj = {r['hex']: r['moved'] for r in csv.DictReader(
+    open('x87_diff_inject.tsv'), delimiter='\t')}
+conv = [h for h, r in d.items() if r['cw_read'] == 'no' and m.get(h) == 'yes']
+fired = sum(1 for h, r in d.items() if r['cw_read'] == 'yes' and m.get(h) == 'yes')
+noise = [h for h, v in inj.items() if v == 'yes']
+print('differential: convicts %d derived-YES rows' % fired)
+print('              convicts %d derived-NO rows (must be 0)' % len(conv))
+print('              inject control moved %d rows (must be 0)' % len(noise))
+if conv or noise or not fired:
+    raise SystemExit('x87 differential control FAILED: %r %r fired=%d'
+                     % (conv, noise, fired))
+EOF
 
 # ---- compare ---------------------------------------------------------------
 $PY compare_attrib.py     # -> ../attrib.tsv, ../attrib_signatures.txt

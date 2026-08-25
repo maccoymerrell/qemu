@@ -111,11 +111,26 @@ X86_EXEC = {
     # already been burnt four times by an allowlist entry whose written
     # justification was factually false.  The register exists; the operand
     # never appears.
+    #
+    # AND THE REFERENCE BEING SILENT IS ONLY HALF OF IT.  A reference gap
+    # says the reference cannot state the fact; it does NOT say the fact is
+    # true, and TRACER-SUPERSET is a direction rather than a verdict -- the
+    # mipsel phantom $at write sat in that column for a whole arc.  So the
+    # other half is measured separately and from QEMU: every instruction
+    # behind these 50 rows was matched, by its gen_x87 dispatch key, to
+    # x87_cw_derive.py's per-encoding answer, and all 50 come back
+    # cw_read=yes.  The instructions are `flds`/`fldl`, `fstps`/`fstpl` and
+    # the register-form `fadd`/`fmul`/`fsub`, and QEMU reaches env->fpuc on
+    # every one of them -- through &env->fp_status into softfloat, which
+    # update_fp_status() wrote out of the control word.  The extra register
+    # is not merely unstateable by gem5; it is REAL.
     'REF-NO-X87-CONTROL-OPERAND':
         Rule('REF-NO-X87-CONTROL-OPERAND', 'reference-gap', {SUPERSET},
              note='gem5 enumerates misc_reg::Fcw but no x87 micro-op names '
                   'it; the control-word read is absent from every operand '
-                  'list, measured at zero occurrences over the whole leg'),
+                  'list, measured at zero occurrences over the whole leg, '
+                  'and the edge itself is confirmed TRUE independently by '
+                  'x87_cw_derive.py on all 50 rows'),
 
     # A vector destination gem5 wrote through the wide path is NAMED with no
     # value (`RW=[...=?]`), and a scalar SSE operation writes only the low

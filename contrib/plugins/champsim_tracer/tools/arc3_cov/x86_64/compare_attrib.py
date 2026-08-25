@@ -167,6 +167,71 @@ for h, rec in load_tool(os.path.join(D, 'iced.tsv')).items():
 # length.  probe_map.json records the choice per opcode.
 PROBE = json.load(open(os.path.join(D, 'probe_map.json')))
 
+# ------------------------------------------------- the x87 QEMU-derived axes
+# WHAT THIS REPLACES.  The x87 rows used to be charged to M5b, a label whose
+# own text said "WHICH helpers really read env->fpuc is not yet derived" --
+# i.e. a label that named the missing derivation instead of a mechanism, so
+# it accounted for nothing and its 112 rows were UNACCOUNTED.  Two earlier
+# attempts to close them keyed on "LLVM MC names X87CONTROL where XED does
+# not"; that closed 102 rows and OPENED 21 new TRACER-SUBSET rows by
+# importing LLVM claims QEMU does not perform, and was reverted rather than
+# shipped.
+#
+# The rule is now keyed on what QEMU ITSELF DOES, per encoding, derived by
+# x87_cw_derive.py in two halves that never consult the tracer: the helper
+# sequence read off an OBSERVED TCG op dump, and a call-graph fixed point
+# over target/i386/tcg/fpu_helper.c deciding whether a named helper reads or
+# writes env->fpuc and env->fpus / fpstt / fptags.  A row is charged to the
+# mechanism ONLY where the derivation confirms the exact register in the
+# exact direction the tracer states it.  Anything else keeps its own label
+# and stays UNACCOUNTED, which is what "a direction is not a verdict" means
+# in code rather than in prose.
+X87_AXES_TSV = os.environ.get('CST_X87_AXES',
+                              os.path.join(D, 'x87_qemu_axes.tsv'))
+X87_AXES = {}
+if os.path.exists(X87_AXES_TSV):
+    with open(X87_AXES_TSV) as _f:
+        _hdr = _f.readline().rstrip('\n').split('\t')
+        for _ln in _f:
+            _p = _ln.rstrip('\n').split('\t')
+            if len(_p) < len(_hdr):
+                continue
+            X87_AXES[_p[0]] = dict(zip(_hdr, _p))
+
+# The register the tracer names -> the (source-axis, destination-axis) pair
+# the derivation has to confirm before the row may be charged.
+X87_AXIS_OF = {
+    'REG_FPCW': ('cw_read', 'cw_write'),
+    'REG_FCSR': ('sw_read', 'sw_write'),
+}
+
+# THE SAME CLASS AS THE STALE TRACER TABLE, and it is refused the same way.
+# x87_qemu_axes.tsv is derived from target/i386/tcg/fpu_helper.c and from a
+# TCG op dump taken out of a built qemu-x86_64.  Either can move under it,
+# and a rule scored off a derivation older than the source it derives from
+# is the failure the previous verdict was published on.  There is no
+# timestamp-only test here that can be satisfied by touching a file: the
+# derivation records the mtimes it was taken at, and both are compared.
+X87_AXES_INPUTS = [
+    os.path.join(os.environ.get('CST_QEMU_ROOT', '/mnt/md0/QEMU/qemu'),
+                 'target/i386/tcg/fpu_helper.c'),
+    os.path.join(os.environ.get('CST_QEMU_ROOT', '/mnt/md0/QEMU/qemu'),
+                 'disas/capstone.c'),
+]
+if X87_AXES:
+    _stale_ax = [q for q in X87_AXES_INPUTS
+                 if os.path.exists(q) and
+                 os.path.getmtime(q) > os.path.getmtime(X87_AXES_TSV)]
+    if _stale_ax:
+        sys.exit('STALE x87 DERIVATION\n'
+                 '  %s\n'
+                 '  is older than %s\n'
+                 '  Re-run x87_cw_probe + x87_cw_derive.py (REPRODUCE.sh does\n'
+                 '  it); scoring 112 x87 rows off a derivation that predates\n'
+                 '  the source it derives from is exactly the defect that\n'
+                 '  published 12149/2698/0 when the tip read 12034/2698/115.'
+                 % (X87_AXES_TSV, ', '.join(_stale_ax)))
+
 # ------------------------------------------------------------ adjudication
 # XED is the ranked primary for x86_64.  Where iced-x86 AND LLVM MC both
 # contradict it and the architecture agrees with them, the correction is
@@ -598,7 +663,8 @@ def sigset(s):
 # ------------------------------------------------------- mechanism roll-up
 # 83 raw signatures collapse to a handful of causes.  Each row is charged to
 # exactly one mechanism, most specific first, so the counts sum to n_dis.
-def mechanism(mnem, ext, smiss, sextra, dmiss, dextra, refd, trd, flagwhy):
+def mechanism(mnem, ext, smiss, sextra, dmiss, dextra, refd, trd,
+              flagwhy, hexs=None):
     sm, se = {classtok(x) for x in smiss}, {classtok(x) for x in sextra}
     dm, de = {classtok(x) for x in dmiss}, {classtok(x) for x in dextra}
     allt = sm | se | dm | de
@@ -624,9 +690,34 @@ def mechanism(mnem, ext, smiss, sextra, dmiss, dextra, refd, trd, flagwhy):
         # The two directions are two different questions and get two labels.
         if not (sm or dm) and (se | de) and (se | de) <= {'REG_FPCW',
                                                           'REG_FCSR'}:
-            return ('M5b x87 control/status word: the tracer names an edge '
-                    'on it that the reference does not; WHICH helpers really '
-                    'read env->fpuc is not yet derived')
+            # THE DERIVATION DECIDES THIS ROW, not the direction and not the
+            # mnemonic.  Every register the tracer names beyond the reference
+            # is looked up in the axis QEMU's own helper sequence performs, in
+            # the direction the tracer states it.  All four answers have to be
+            # yes; one no and the row is a FALSE EDGE, which is the failure
+            # this rule exists to be able to report.
+            ax = X87_AXES.get(hexs) if hexs else None
+            if ax is None:
+                return ('M5b x87 control/status word: the tracer names an '
+                        'edge the reference does not, and x87_cw_derive.py '
+                        'has no row for this encoding, so no mechanism is '
+                        'derived')
+            bad, good = [], []
+            for reg, side in ([(classtok(r), 0) for r in sextra] +
+                              [(classtok(r), 1) for r in dextra]):
+                axis = X87_AXIS_OF.get(reg, (None, None))[side]
+                if axis is None:
+                    bad.append('%s/%s' % (reg, 'src' if side == 0 else 'dst'))
+                    continue
+                (good if ax.get(axis) == 'yes' else bad).append(
+                    '%s %s=%s' % (reg, axis, ax.get(axis)))
+            if bad:
+                return ('M5d x87 FALSE EDGE: the tracer names %s but QEMU '
+                        'never touches it there (helpers %s)'
+                        % ('; '.join(bad), ax.get('helpers', '?')))
+            return ('M5c x87 control/status word: QEMU performs the edge '
+                    '(%s) and the reference models no such operand' %
+                    '; '.join(good))
         return 'M5 x87: implicit ST(0) / status-word dependency missing'
     if sm == {'REG_FLAGS'} and not (se or dm or de):
         # R7.1 removed the preserve-read on the reference side, so an RFLAGS
@@ -787,7 +878,7 @@ for opid, mnem, enc_hex, srctab in opcodes:
     corro_count[corro] += 1
     sig_corro[sig][corro] += 1
     mech = mechanism(mnem, md['ext'], smiss, sextra, dmiss, dextra, refd, trd,
-                     xed.get('why', '-'))
+                     xed.get('why', '-'), hexs)
     mech_count[mech] += 1
     mech_corro[mech][corro] += 1
     mech_reach[mech][reach] += 1

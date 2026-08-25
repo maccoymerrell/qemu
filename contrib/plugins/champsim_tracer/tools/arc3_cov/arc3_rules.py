@@ -76,8 +76,51 @@ X86 = {
     # exists these rows stay UNACCOUNTED, which is the honest number.
     'M5b': Rule('M5b', 'unaccounted', {SUPERSET}, accounts=False,
                 note='the tracer names an x87 control/status-word edge the '
-                     'reference does not; the mechanism is not derived until '
-                     'fpu_helper.c decides which helpers read env->fpuc'),
+                     'reference does not, and x87_cw_derive.py has no row '
+                     'for the encoding, so no mechanism is derived'),
+
+    # M5c IS THE DERIVATION M5b SAID WAS MISSING, and it is per-row.
+    #
+    # The reference models no control-word operand on the x87 escapes at
+    # all; QEMU does, and says so in its own source.  x87_cw_derive.py reads
+    # the helper sequence for each encoding off an OBSERVED TCG op dump
+    # (qemu-x86_64 -one-insn-per-tb -d op) and then walks the call graph of
+    # target/i386/tcg/fpu_helper.c to a fixed point over four axes: does the
+    # sequence READ env->fpuc, WRITE it, READ env->fpus / fpstt / fptags,
+    # WRITE them.  A helper reads the control word when it evaluates
+    # env->fpuc undominated by a definition of it, or hands &env->fp_status
+    # to a softfloat routine that is not one of the three exception-flag
+    # accessors -- fp_status being the DECODED control word, written out of
+    # env->fpuc by update_fp_status().
+    #
+    # A row is charged here ONLY where the derivation confirms the exact
+    # register in the exact direction the tracer states it.  It is therefore
+    # not "the tracer carries more", which is a direction and not a verdict:
+    # it is the edge being TRUE, one encoding at a time.
+    #
+    # Measured over the 153-subject x87 denominator at the tip: the control
+    # word axes agree with the tracer on 153 of 153 rows -- 109 read, 12
+    # write -- with ZERO missing edges and ZERO false edges.  An independent
+    # execution differential (x87_cw_exec.c) that runs each encoding twice
+    # under two control words and compares the 108-byte FNSAVE image
+    # convicts 45 of the derived-YES rows and NONE of the derived-NO rows.
+    # It can convict and cannot acquit, which is why the 64 derived-YES rows
+    # it leaves silent are not counted against the derivation.
+    'M5c': Rule('M5c', 'reference-gap', {SUPERSET},
+                note='QEMU performs the x87 control/status-word edge in the '
+                     'direction the tracer states it, derived per encoding '
+                     'from fpu_helper.c and an observed TCG op dump; the '
+                     'reference models no such operand'),
+
+    # The tripwire, and it must stay even at zero rows.  If the tracer ever
+    # names a control- or status-word edge QEMU's helper sequence does not
+    # perform, that is a FALSE dependency edge -- the same class as the
+    # mipsel phantom $at write that hid inside TRACER-SUPERSET for the whole
+    # arc -- and it does NOT account, so the row reports UNCOVERED and the
+    # matrix exits non-zero.
+    'M5d': Rule('M5d', 'tracer-defect', ANY, accounts=False,
+                note='the tracer names an x87 edge QEMU never performs on '
+                     'that encoding: a FALSE edge, not a superset'),
     'M6':  Rule('M6', 'vocabulary-gap', {SUBSET},
                 note='no GenericRegId exists for this register'),
 

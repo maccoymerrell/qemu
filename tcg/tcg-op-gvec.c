@@ -140,6 +140,14 @@ void tcg_gen_gvec_2_ool(uint32_t dofs, uint32_t aofs,
 
     fn(a0, a1, desc);
 
+    {
+        /* CP-H: the constructor's own parameters name the roles. */
+        uint32_t df_off[] = { dofs, aofs };
+        uint8_t df_dir[] = { INSN_DF_WR, INSN_DF_RD };
+
+        insn_dataflow_note_gvec_ool(df_off, df_dir, 2, oprsz);
+    }
+
     tcg_temp_free_ptr(a0);
     tcg_temp_free_ptr(a1);
 }
@@ -160,6 +168,14 @@ void tcg_gen_gvec_2i_ool(uint32_t dofs, uint32_t aofs, TCGv_i64 c,
     tcg_gen_addi_ptr(a1, tcg_env, aofs);
 
     fn(a0, a1, c, desc);
+
+    {
+        /* CP-H: the constructor's own parameters name the roles. */
+        uint32_t df_off[] = { dofs, aofs };
+        uint8_t df_dir[] = { INSN_DF_WR, INSN_DF_RD };
+
+        insn_dataflow_note_gvec_ool(df_off, df_dir, 2, oprsz);
+    }
 
     tcg_temp_free_ptr(a0);
     tcg_temp_free_ptr(a1);
@@ -182,6 +198,14 @@ void tcg_gen_gvec_3_ool(uint32_t dofs, uint32_t aofs, uint32_t bofs,
     tcg_gen_addi_ptr(a2, tcg_env, bofs);
 
     fn(a0, a1, a2, desc);
+
+    {
+        /* CP-H: the constructor's own parameters name the roles. */
+        uint32_t df_off[] = { dofs, aofs, bofs };
+        uint8_t df_dir[] = { INSN_DF_WR, INSN_DF_RD, INSN_DF_RD };
+
+        insn_dataflow_note_gvec_ool(df_off, df_dir, 3, oprsz);
+    }
 
     tcg_temp_free_ptr(a0);
     tcg_temp_free_ptr(a1);
@@ -207,6 +231,14 @@ void tcg_gen_gvec_4_ool(uint32_t dofs, uint32_t aofs, uint32_t bofs,
     tcg_gen_addi_ptr(a3, tcg_env, cofs);
 
     fn(a0, a1, a2, a3, desc);
+
+    {
+        /* CP-H: the constructor's own parameters name the roles. */
+        uint32_t df_off[] = { dofs, aofs, bofs, cofs };
+        uint8_t df_dir[] = { INSN_DF_WR, INSN_DF_RD, INSN_DF_RD, INSN_DF_RD };
+
+        insn_dataflow_note_gvec_ool(df_off, df_dir, 4, oprsz);
+    }
 
     tcg_temp_free_ptr(a0);
     tcg_temp_free_ptr(a1);
@@ -236,6 +268,14 @@ void tcg_gen_gvec_5_ool(uint32_t dofs, uint32_t aofs, uint32_t bofs,
 
     fn(a0, a1, a2, a3, a4, desc);
 
+    {
+        /* CP-H: the constructor's own parameters name the roles. */
+        uint32_t df_off[] = { dofs, aofs, bofs, cofs, xofs };
+        uint8_t df_dir[] = { INSN_DF_WR, INSN_DF_RD, INSN_DF_RD, INSN_DF_RD, INSN_DF_RD };
+
+        insn_dataflow_note_gvec_ool(df_off, df_dir, 5, oprsz);
+    }
+
     tcg_temp_free_ptr(a0);
     tcg_temp_free_ptr(a1);
     tcg_temp_free_ptr(a2);
@@ -260,6 +300,14 @@ void tcg_gen_gvec_2_ptr(uint32_t dofs, uint32_t aofs,
 
     fn(a0, a1, ptr, desc);
 
+    {
+        /* CP-H: the constructor's own parameters name the roles. */
+        uint32_t df_off[] = { dofs, aofs };
+        uint8_t df_dir[] = { INSN_DF_WR, INSN_DF_RD };
+
+        insn_dataflow_note_gvec_ool(df_off, df_dir, 2, oprsz);
+    }
+
     tcg_temp_free_ptr(a0);
     tcg_temp_free_ptr(a1);
 }
@@ -282,6 +330,14 @@ void tcg_gen_gvec_3_ptr(uint32_t dofs, uint32_t aofs, uint32_t bofs,
     tcg_gen_addi_ptr(a2, tcg_env, bofs);
 
     fn(a0, a1, a2, ptr, desc);
+
+    {
+        /* CP-H: the constructor's own parameters name the roles. */
+        uint32_t df_off[] = { dofs, aofs, bofs };
+        uint8_t df_dir[] = { INSN_DF_WR, INSN_DF_RD, INSN_DF_RD };
+
+        insn_dataflow_note_gvec_ool(df_off, df_dir, 3, oprsz);
+    }
 
     tcg_temp_free_ptr(a0);
     tcg_temp_free_ptr(a1);
@@ -309,6 +365,14 @@ void tcg_gen_gvec_4_ptr(uint32_t dofs, uint32_t aofs, uint32_t bofs,
     tcg_gen_addi_ptr(a3, tcg_env, cofs);
 
     fn(a0, a1, a2, a3, ptr, desc);
+
+    {
+        /* CP-H: the constructor's own parameters name the roles. */
+        uint32_t df_off[] = { dofs, aofs, bofs, cofs };
+        uint8_t df_dir[] = { INSN_DF_WR, INSN_DF_RD, INSN_DF_RD, INSN_DF_RD };
+
+        insn_dataflow_note_gvec_ool(df_off, df_dir, 4, oprsz);
+    }
 
     tcg_temp_free_ptr(a0);
     tcg_temp_free_ptr(a1);
@@ -339,6 +403,14 @@ void tcg_gen_gvec_5_ptr(uint32_t dofs, uint32_t aofs, uint32_t bofs,
     tcg_gen_addi_ptr(a4, tcg_env, eofs);
 
     fn(a0, a1, a2, a3, a4, ptr, desc);
+
+    {
+        /* CP-H: the constructor's own parameters name the roles. */
+        uint32_t df_off[] = { dofs, aofs, bofs, cofs, eofs };
+        uint8_t df_dir[] = { INSN_DF_WR, INSN_DF_RD, INSN_DF_RD, INSN_DF_RD, INSN_DF_RD };
+
+        insn_dataflow_note_gvec_ool(df_off, df_dir, 5, oprsz);
+    }
 
     tcg_temp_free_ptr(a0);
     tcg_temp_free_ptr(a1);

@@ -138,6 +138,30 @@ uint64_t g_n_nonarch  = 0;   /* scored, but a QEMU-internal temp was excluded */
 uint64_t g_m_agree     = 0;
 uint64_t g_m_disagree  = 0;
 uint64_t g_m_helper_lo = 0;  /* ir says fewer, and the insn calls a helper */
+
+/*
+ * The CP-H ceiling arm.
+ *
+ * The question this answers is the one that has to be answered BEFORE any
+ * Capstone-derived dependency classifier is deleted: of the instructions a
+ * workload actually EXECUTES, what fraction can the emitter-stated dependency
+ * model describe exactly, what fraction only as an over-approximation, and
+ * what fraction not at all.  A retirement cannot be better than that number,
+ * and quoting a static opcode count in its place would answer a different
+ * question -- the encodings a target CAN decode, weighted equally, when what
+ * a consumer feels is the instructions that RUN, weighted by how often.
+ *
+ * So both are counted.  The static tallies below are per TRANSLATION; the
+ * scoreboards are incremented by an inline op on every EXECUTION, which is
+ * where the weighting comes from and why this is not another translate-time
+ * count wearing a dynamic label.
+ */
+uint64_t g_h_static[3]  = {0, 0, 0};   /* EXACT / APPROX / OPAQUE */
+uint64_t g_h_static_unknown = 0;       /* sum of n_helper_unknown */
+uint64_t g_h_static_unbounded = 0;     /* sum of n_helper_unbounded */
+uint64_t g_h_static_calls   = 0;       /* translated insns calling a helper */
+struct qemu_plugin_scoreboard *g_h_sb[3] = {nullptr, nullptr, nullptr};
+bool g_h_sb_failed = false;
 uint64_t g_m_nostatus  = 0;  /* status refused outright */
 /* Truncation census.  STATUS section 5 records 0.011%/0.001% as a FLOOR:
  * these count what this workload actually hit, per instruction and as a
@@ -445,6 +469,56 @@ void dump_tally(GString *report, GHashTable *t, const char *heading)
     g_list_free(keys);
 }
 
+/*
+ * The CP-H ceiling arm.  See the counter block for what the number is for.
+ *
+ * Each class gets its own scoreboard and each translated instruction is given
+ * an inline add into the one its model lands in, so the totals below are
+ * EXECUTIONS and not translations.  The scoreboards are created lazily and a
+ * failure to create them is recorded rather than silently producing a
+ * dynamic column of zeroes that reads like "nothing was approximate".
+ */
+void score_helper_model(const struct qemu_plugin_tb *tb, size_t idx,
+                        const qemu_plugin_dataflow_status *st)
+{
+    unsigned m = st->helper_model;
+
+    if (m > 2) {
+        /*
+         * A model this build does not know.  Charging it to one of the three
+         * would put an unknown answer inside a published fraction.
+         */
+        g_h_sb_failed = true;
+        return;
+    }
+    g_h_static[m]++;
+    g_h_static_unknown += st->n_helper_unknown;
+    g_h_static_unbounded += st->n_helper_unbounded;
+    g_h_static_calls += st->n_calls > 0 ? 1 : 0;
+
+    if (g_h_sb_failed) {
+        return;
+    }
+    if (g_h_sb[0] == nullptr) {
+        for (int i = 0; i < 3; i++) {
+            g_h_sb[i] = qemu_plugin_scoreboard_new(sizeof(uint64_t));
+            if (g_h_sb[i] == nullptr) {
+                g_h_sb_failed = true;
+                return;
+            }
+        }
+    }
+    struct qemu_plugin_insn *insn =
+        qemu_plugin_tb_get_insn(tb, idx);
+    if (insn == nullptr) {
+        g_h_sb_failed = true;
+        return;
+    }
+    qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
+        insn, QEMU_PLUGIN_INLINE_ADD_U64,
+        qemu_plugin_scoreboard_u64(g_h_sb[m]), 1);
+}
+
 } /* namespace */
 
 void irdf_note_insn(const struct qemu_plugin_tb *tb, size_t idx,
@@ -487,6 +561,13 @@ void irdf_note_insn(const struct qemu_plugin_tb *tb, size_t idx,
     /* The memop arm runs BEFORE the register arm's refusals, because none of
      * them applies to it -- see the counter block. */
     score_memops(info, &st);
+
+    /*
+     * The CP-H arm, likewise before the refusals: a helper is exactly what
+     * this arm is here to measure, so declining on one would leave the number
+     * defined over the instructions that did not need it.
+     */
+    score_helper_model(tb, idx, &st);
 
     if (st.n_calls > 0) {
         g_n_helper++;
@@ -673,4 +754,69 @@ void irdf_report(GString *report)
             g_t_fields, g_t_writes, g_t_prov,
             g_trunc_by_mnem ? g_hash_table_size(g_trunc_by_mnem) : 0);
     dump_tally(report, g_trunc_by_mnem, "opcodes that overflowed the 8/8 limits");
+
+    /* --- the CP-H ceiling --- */
+    uint64_t dyn[3] = {0, 0, 0};
+    uint64_t dyn_tot = 0, st_tot = 0;
+
+    for (int i = 0; i < 3; i++) {
+        if (g_h_sb[i]) {
+            dyn[i] = qemu_plugin_u64_sum(qemu_plugin_scoreboard_u64(g_h_sb[i]));
+        }
+        dyn_tot += dyn[i];
+        st_tot += g_h_static[i];
+    }
+
+    g_string_append_printf(report,
+            "\n--- CP-H: how much of the dependency model the EMITTERS state ---\n"
+            "This is the CEILING on retiring a decoder-derived dependency\n"
+            "classifier.  EXACT means every operand of every helper the\n"
+            "instruction called was named by the emitter that called it, with\n"
+            "its extent and its direction.  APPROX means the operand SET is\n"
+            "stated but at least one operand's DIRECTION is not, so it is\n"
+            "recorded as read-and-written -- sound in the pessimistic\n"
+            "direction, and NOT exact.  OPAQUE means the operand set was not\n"
+            "stated at all.\n");
+    if (st_tot == 0) {
+        g_string_append_printf(report, "no instruction was scored\n");
+        return;
+    }
+    static const char *const kName[3] = {"EXACT ", "APPROX", "OPAQUE"};
+    g_string_append_printf(report,
+            "                 translated            executed\n");
+    for (int i = 0; i < 3; i++) {
+        g_string_append_printf(report,
+                "  %s  %12" PRIu64 " %6.2f%%  %14" PRIu64 " %6.2f%%\n",
+                kName[i], g_h_static[i],
+                100.0 * (double)g_h_static[i] / (double)st_tot,
+                dyn[i],
+                dyn_tot ? 100.0 * (double)dyn[i] / (double)dyn_tot : 0.0);
+    }
+    g_string_append_printf(report,
+            "  total   %12" PRIu64 "          %14" PRIu64 "\n", st_tot, dyn_tot);
+    g_string_append_printf(report,
+            "  %" PRIu64 " of the translated instructions call a helper at all\n"
+            "  %" PRIu64 " (helper, pointer argument) pairs have no direction "
+            "written down; each is an operand recorded as read-and-written "
+            "because nothing states which\n"
+            "  %" PRIu64 " helper calls have no bounded footprint at all -- "
+            "handed the whole CPU state pointer, or not declared free of "
+            "global reads and writes, in which case QEMU's own register "
+            "allocator treats them as touching every register while the op "
+            "list names none of them, so the extracted sets are SHORT and not "
+            "merely coarse\n",
+            g_h_static_calls, g_h_static_unknown, g_h_static_unbounded);
+    if (g_h_sb_failed) {
+        g_string_append_printf(report,
+                "  WARNING: the execution-weighted column is INCOMPLETE -- a "
+                "scoreboard or an instruction handle was refused, so at least "
+                "one instruction was counted in the translated column and not "
+                "in the executed one.  Do not quote the executed percentages.\n");
+    } else if (dyn_tot == 0) {
+        g_string_append_printf(report,
+                "  WARNING: nothing was counted as executed.  A translated "
+                "instruction that never runs is ordinary; a whole run of them "
+                "is an instrument that did not fire, and the executed column "
+                "must not be read as a measurement.\n");
+    }
 }

@@ -58,6 +58,7 @@
 #include "tcg/perf.h"
 #include "tcg-has.h"
 #include "exec/oracle.h"
+#include "exec/insn-dataflow.h"
 #ifdef CONFIG_USER_ONLY
 #include "user/guest-base.h"
 #endif
@@ -1688,6 +1689,17 @@ void tcg_func_start(TCGContext *s)
     QTAILQ_INIT(&s->ops);
     QTAILQ_INIT(&s->free_ops);
     s->emit_before_op = NULL;
+
+    /*
+     * The op list is empty again, so every dataflow note's anchor has stopped
+     * naming anything.  This is the only place that is true of, and it has to
+     * be said here rather than at the end of the extraction: plugin
+     * instrumentation emits helper calls AFTER the extraction has run, and
+     * those notes would otherwise still be in the array when the next block
+     * is walked -- against TCGOps handed back out of the free list at the
+     * same addresses.
+     */
+    insn_dataflow_note_reset();
     QSIMPLEQ_INIT(&s->labels);
 
     tcg_debug_assert(s->addr_type <= TCG_TYPE_REG);
@@ -2536,6 +2548,19 @@ static void tcg_gen_callN(void *func, TCGHelperInfo *info,
     } else {
         QTAILQ_INSERT_TAIL(&tcg_ctx->ops, op, link);
     }
+
+    /*
+     * CP-H.  This is the only place a helper's LOGICAL arguments still exist:
+     * op->args carries the physical slots, with i128 already split in two and
+     * i32 arguments replaced by the extension temps created a few lines
+     * above, so a walk over the op sees neither which source parameter a temp
+     * came from nor what type it was declared as.  @info and @args say both.
+     *
+     * Taken after the insert so the op is in the list and can be the anchor;
+     * @op rather than the list tail because emit_before_op puts it in the
+     * middle.
+     */
+    insn_dataflow_note_helper(op, info, ret, (const void *const *)args);
 
     tcg_debug_assert(n_extend < ARRAY_SIZE(extend_free));
     for (i = 0; i < n_extend; ++i) {

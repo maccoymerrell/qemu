@@ -91,7 +91,7 @@
 
 #include "qemu/qemu-plugin.h"   /* for the plugin API export marker */
 
-#define QEMU_PLUGIN_DATAFLOW_VERSION 1
+#define QEMU_PLUGIN_DATAFLOW_VERSION 2
 
 /*
  * Returned by any set accessor whose instruction could not be extracted in
@@ -253,8 +253,53 @@ typedef struct qemu_plugin_dataflow_status {
     uint8_t  fields_truncated;  /* more fields than could be recorded */
     uint8_t  writes_truncated;  /* more writes than could carry provenance */
     uint8_t  prov_truncated;    /* provenance lost a field to slot exhaustion */
-    uint8_t  reserved;
+    /*
+     * How much of this instruction's HELPER work is stated and how much is
+     * standing in for it -- QEMU_PLUGIN_DF_HELPER_*.  An instruction that
+     * calls no helper is EXACT.
+     *
+     * n_calls above says only that a helper ran.  This says whether the
+     * operands attributed to it were named by the emitter that called it or
+     * assumed because nothing named them, which is the difference between a
+     * dependency edge that was measured and one that was assumed.
+     */
+    uint8_t  helper_model;
+    /*
+     * (helper, pointer argument) pairs on this instruction whose DIRECTION
+     * the per-helper usage table does not state, and which are therefore
+     * recorded as read-and-written.  A count rather than a flag, because the
+     * question a consumer eventually asks is how much of its dependency graph
+     * rests on the over-approximation, and a flag cannot answer that.
+     */
+    uint32_t n_helper_unknown;
+    /*
+     * Helper calls on this instruction whose FOOTPRINT nothing bounds -- the
+     * helper was handed the whole CPU state pointer, or it is not declared
+     * free of global reads and writes, in which case QEMU's own register
+     * allocator treats it as touching every register while the op list names
+     * none of them.  The reported read and write sets are then SHORT, not
+     * merely coarse.
+     */
+    uint32_t n_helper_unbounded;
 } qemu_plugin_dataflow_status;
+
+/*
+ * Every operand of every helper the instruction called was named by the
+ * emitter that called it: which env region, how many bytes, read or written.
+ */
+#define QEMU_PLUGIN_DF_HELPER_EXACT   0
+/*
+ * The operand SET is stated but at least one operand's DIRECTION is not, so
+ * it is reported as read-and-written.  Sound in the pessimistic direction --
+ * it can name an operand that was not touched, never omit one that was.
+ */
+#define QEMU_PLUGIN_DF_HELPER_APPROX  1
+/*
+ * A helper whose operand set was not stated at all.  The fields reported for
+ * it are whatever a walk over the ops could resolve, with unknown extent and
+ * unknown direction.
+ */
+#define QEMU_PLUGIN_DF_HELPER_OPAQUE  2
 
 QEMU_PLUGIN_API
 bool qemu_plugin_insn_dataflow_status(const struct qemu_plugin_tb *tb,

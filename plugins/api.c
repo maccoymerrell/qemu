@@ -452,6 +452,9 @@ bool qemu_plugin_insn_dataflow_status(const struct qemu_plugin_tb *tb,
     st.fields_truncated = d->fields_overflow;
     st.writes_truncated = d->writes_overflow;
     st.prov_truncated = insn_dataflow_prov_truncated();
+    st.helper_model = d->helper_model;
+    st.n_helper_unknown = d->n_helper_unknown;
+    st.n_helper_unbounded = d->n_helper_unbounded;
 
     want = out->struct_size;
     if (want == 0 || want > sizeof(st)) {

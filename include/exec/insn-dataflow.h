@@ -56,6 +56,9 @@
 /* Instructions writing more than this are vanishingly rare; overflow is flagged. */
 #define INSN_DF_MAX_WRITES  8
 
+/* tcg_gen_gvec_5_ool/_ptr is the widest: one destination and four sources. */
+#define INSN_DF_MAX_GVEC_OPERANDS 5
+
 typedef struct InsnDataflowField {
     uint32_t off;
     uint16_t size;
@@ -116,7 +119,58 @@ typedef struct InsnDataflow {
     uint8_t  n_mem_rd;
     uint8_t  n_mem_wr;
     uint8_t  n_calls;
+    /*
+     * CP-H -- how much of this instruction's helper work the emitter was
+     * able to state, and how much is an over-approximation standing in for
+     * it.  An instruction that calls no helper is EXACT trivially.
+     *
+     * This is a LABEL, not a verdict on correctness.  An APPROX set is still
+     * sound in the pessimistic direction -- it names operands that may not
+     * be touched, never omits ones that are -- but a consumer that treats it
+     * as exact will believe a dependency that is not there, so it is told.
+     */
+    uint8_t  helper_model;
+    /*
+     * How many (helper, pointer argument) pairs this instruction reached
+     * whose direction the per-helper usage table does not state.  A count,
+     * because "some" is the adjective this project keeps having to unlearn.
+     */
+    uint8_t  n_helper_unknown;
+    /*
+     * Helper calls on this instruction whose FOOTPRINT nothing bounds: the
+     * helper was handed tcg_env, or a pointer that is not tcg_env plus a
+     * constant, or it is not declared TCG_CALL_NO_RWG -- in which case QEMU's
+     * own liveness treats it as reading and writing EVERY global
+     * (la_global_kill / la_global_sync, tcg/tcg.c), while the op list names
+     * none of them.
+     */
+    uint8_t  n_helper_unbounded;
 } InsnDataflow;
+
+/*
+ * Every operand of every helper this instruction called is stated by the
+ * emitter: which env region, how many bytes, read or written.
+ */
+#define INSN_DF_HELPER_EXACT    0
+/*
+ * The operand SET is stated but at least one operand's DIRECTION is not, so
+ * it is recorded as read-and-written.  This is the residual DEPMAP_DESIGN.md
+ * names: the argument list gives operand IDENTITY, not per-argument USAGE.
+ */
+#define INSN_DF_HELPER_APPROX   1
+/*
+ * A helper whose FOOTPRINT nothing bounds.  Either an argument reaches
+ * arbitrary CPUArchState -- tcg_env itself, or a pointer that is not tcg_env
+ * plus a constant -- or the helper is not declared TCG_CALL_NO_RWG, which is
+ * QEMU stating that it reads and/or writes EVERY TCG global.  In the second
+ * case the op list names none of those accesses and the extracted read and
+ * write sets are SHORT of the truth, which is the one direction this code
+ * treats as an error rather than as a loss of accuracy.
+ *
+ * This is also what the pre-CP-H code produced for every helper, without
+ * saying so.
+ */
+#define INSN_DF_HELPER_OPAQUE   2
 
 #ifdef CONFIG_PLUGIN
 
@@ -173,6 +227,66 @@ void insn_dataflow_note_gvec(uint32_t dofs, uint32_t aofs, uint32_t bofs,
 void insn_dataflow_note_memop(const void *val_ts, const void *addr_ts,
                               unsigned size, bool is_store);
 
+/*
+ * CP-H -- the helper choke point.
+ *
+ * INDEX_op_call is the one op whose arguments do not describe themselves.
+ * The walk sees a list of temps and a count; it cannot say which of them the
+ * helper reads, which it writes, or how many bytes a pointer argument stands
+ * for.  So it did the only sound thing available to it and called every
+ * pointer argument read-and-written with an extent of zero, and unioned every
+ * input's provenance into every output -- which is dep_all_to_all, arrived at
+ * by necessity rather than by measurement.
+ *
+ * tcg_gen_callN has what the walk is missing.  TCGHelperInfo names the helper
+ * and states each argument's TYPE, and @args holds the LOGICAL arguments, one
+ * per source-level parameter, before i128 splitting and before the sign- and
+ * zero-extension temps that stand in for i32 arguments in op->args.  So the
+ * emitter states identity, and identity is what the walk cannot recover.
+ *
+ * It does NOT state usage.  Whether helper H reads, writes or both through
+ * its third argument is a static per-helper fact, and until it is written
+ * down the set is an over-approximation -- which is why it is LABELLED one
+ * (INSN_DF_HELPER_APPROX) rather than published as though it were exact.
+ *
+ * Capture only; no op is emitted, altered or suppressed.
+ */
+void insn_dataflow_note_helper(const void *call_op, const void *info,
+                               const void *ret_ts, const void *const *args);
+
+/*
+ * CP-H, the vector half -- the out-of-line gvec constructors.
+ *
+ * tcg_gen_gvec_3_ool(dofs, aofs, bofs, oprsz, ...) builds three pointers into
+ * env and hands them to a helper.  After the fact those are three identical
+ * pointer arguments; at the constructor they are a DESTINATION, two SOURCES
+ * and a WIDTH, because that is what the parameters are called and what the
+ * caller passed them for.  Saying so gives the field records their true
+ * extent and takes the fabricated write off every source operand.
+ *
+ * @dir[] carries INSN_DF_WR for the destination and INSN_DF_RD for the
+ * sources.  Whether the destination is ALSO read -- an accumulate -- is the
+ * per-helper fact above, and the consumer marks the instruction APPROX when
+ * the table does not state it.
+ *
+ * Anchored on the call the constructor has just emitted, so it is taken after
+ * @fn returns and not before.
+ */
+void insn_dataflow_note_gvec_ool(const uint32_t *off, const uint8_t *dir,
+                                 unsigned n, uint32_t oprsz);
+
+/*
+ * Drop every emitter note.
+ *
+ * Called from tcg_func_start(), which is where the op list is emptied and so
+ * where every note's anchor stops naming anything.  Without it a note taken
+ * AFTER the extraction ran -- and plugin instrumentation emits helper calls
+ * exactly there, from plugin_gen_tb_end() -- survives into the next
+ * translation, where TCGOps are handed out of a recycled pool and a stale
+ * anchor address can match a live op belonging to a different instruction.
+ */
+void insn_dataflow_note_reset(void);
+
 /* The result for instruction @i of the TB just translated, or NULL. */
 const InsnDataflow *insn_dataflow_get(unsigned i);
 
@@ -208,6 +322,20 @@ static inline void insn_dataflow_note_gvec(uint32_t dofs, uint32_t aofs,
 static inline void insn_dataflow_note_memop(const void *val_ts,
                                             const void *addr_ts,
                                             unsigned size, bool is_store)
+{ }
+
+static inline void insn_dataflow_note_helper(const void *call_op,
+                                             const void *info,
+                                             const void *ret_ts,
+                                             const void *const *args)
+{ }
+
+static inline void insn_dataflow_note_gvec_ool(const uint32_t *off,
+                                               const uint8_t *dir,
+                                               unsigned n, uint32_t oprsz)
+{ }
+
+static inline void insn_dataflow_note_reset(void)
 { }
 
 #endif /* CONFIG_PLUGIN */

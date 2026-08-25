@@ -46,6 +46,13 @@
 #include "tcg/tcg-op-common.h"
 #include "tcg/tcg-internal.h"
 #include "exec/insn-dataflow.h"
+/*
+ * For dh_typecode_ptr.  The typemask a helper carries is built out of these,
+ * so reading it with the same names the builder used is the only way the two
+ * cannot drift; a local `#define DF_TYPECODE_PTR 6` would compile forever
+ * after the encoding changed.
+ */
+#include "exec/helper-head.h.inc"
 
 /*
  * TCG's own cap on instructions per TB.  A TB cannot hold more, so the result
@@ -54,6 +61,55 @@
 #define INSN_DF_MAX_INSNS   512
 
 #define INSN_DF_NOT_ENV     INT64_MIN
+
+/*
+ * Emitter notes.
+ *
+ * Three choke points state facts the op list does not carry: CP4 the operands
+ * a gvec constructor folded away, CP-M which temp of a memop is the data and
+ * which the address, CP-H a helper's logical argument list.  All three are
+ * anchored on a TCGOp, so the instruction walk attributes a note to whichever
+ * instruction's op range contains its anchor and no op numbering is needed.
+ *
+ * They live in the per-context scratch and not at file scope.  Under MTTCG
+ * two vCPUs translate at the same time in two TCGContexts, so a file-scope
+ * note array is written by both and read as though it belonged to one -- the
+ * exact aliasing the scratch's own comment says it exists to avoid.
+ */
+#define DF_MAX_GVEC_NOTES     64
+#define DF_MAX_MEMOP_NOTES    64
+#define DF_MAX_HELPER_NOTES   64
+#define DF_MAX_HELPER_ARGS    8
+
+typedef struct DfGvecNote {
+    const TCGOp *anchor;
+    uint32_t dofs, aofs, bofs, oprsz;
+} DfGvecNote;
+
+typedef struct DfMemopNote {
+    const TCGOp *anchor;
+    const void *val_ts;
+    const void *addr_ts;
+    unsigned size;
+    bool is_store;
+} DfMemopNote;
+
+/* CP-H: one per helper call, carrying what tcg_gen_callN had and the op lost. */
+typedef struct DfHelperNote {
+    const TCGOp *anchor;
+    const char *name;                       /* TCGHelperInfo::name */
+    uint32_t flags;                         /* TCGHelperInfo::flags */
+    const TCGTemp *arg[DF_MAX_HELPER_ARGS];
+    uint8_t typecode[DF_MAX_HELPER_ARGS];
+    uint8_t nargs;
+    bool args_overflow;                     /* more logical args than we carry */
+    /* Roles the gvec constructor stated for this same call, if it was one. */
+    bool has_gvec;
+    unsigned gvec_n;
+    uint32_t gvec_off[INSN_DF_MAX_GVEC_OPERANDS];
+    uint8_t gvec_dir[INSN_DF_MAX_GVEC_OPERANDS];
+    uint32_t gvec_oprsz;
+} DfHelperNote;
 
 /*
  * Per-translation scratch.
@@ -99,6 +155,18 @@ struct InsnDataflowScratch {
     uint32_t slot_off[INSN_DF_MAX_FIELD_SLOTS];
     unsigned nslots;
     bool slots_overflow;
+
+    DfGvecNote gvec[DF_MAX_GVEC_NOTES];
+    unsigned n_gvec;
+    bool gvec_overflow;
+
+    DfMemopNote memop[DF_MAX_MEMOP_NOTES];
+    unsigned n_memop;
+    bool memop_overflow;
+
+    DfHelperNote helper[DF_MAX_HELPER_NOTES];
+    unsigned n_helper;
+    bool helper_overflow;
 };
 
 /*
@@ -123,6 +191,15 @@ static __thread struct InsnDataflowScratch *df;
 #define df_slot_off         (df->slot_off)
 #define df_nslots           (df->nslots)
 #define df_slots_overflow   (df->slots_overflow)
+#define df_gvec             (df->gvec)
+#define df_n_gvec           (df->n_gvec)
+#define df_gvec_overflow    (df->gvec_overflow)
+#define df_memop            (df->memop)
+#define df_n_memop          (df->n_memop)
+#define df_memop_overflow   (df->memop_overflow)
+#define df_helper           (df->helper)
+#define df_n_helper         (df->n_helper)
+#define df_helper_overflow  (df->helper_overflow)
 
 /*
  * Bind @df to the current translation context, allocating on first use.
@@ -365,6 +442,20 @@ static void df_emit(uint64_t pc, const InsnDataflow *d)
     }
     fprintf(f, "A 0x%" PRIx64 " ops=0 calls=%u opaque=%u\n",
             pc, d->n_calls, d->n_calls);
+    /*
+     * CP-H's verdict gets a record type of its own rather than three more
+     * fields on the A line.  This dump is written in the behavioural oracle's
+     * report format precisely so the two can be diffed against each other, and
+     * a line that carries fields the oracle's own A line cannot differs on
+     * every instruction -- which would make a whole-file diff useless for the
+     * thing it exists for.  An unknown line type is skipped by every reader of
+     * this format; a changed one is not.
+     */
+    if (d->n_calls) {
+        fprintf(f, "H 0x%" PRIx64 " model=%u unknown=%u unbounded=%u\n",
+                pc, d->helper_model, d->n_helper_unknown,
+                d->n_helper_unbounded);
+    }
 }
 
 static bool df_profiling(void)
@@ -559,6 +650,23 @@ static void df_add_field(InsnDataflow *d, uint32_t off, uint32_t size,
     d->n_fields++;
 }
 
+void insn_dataflow_note_reset(void)
+{
+    if (df_disabled()) {
+        return;
+    }
+    df_bind();
+    df_n_gvec = 0;
+    df_gvec_overflow = false;
+    df_n_memop = 0;
+    df_memop_overflow = false;
+    df_n_helper = 0;
+    df_helper_overflow = false;
+}
+
+static const DfHelperNote *df_find_helper(const TCGOp *op);
+static bool df_helper_usage_of(const char *name, unsigned argno, uint8_t *dir);
+
 /* Walk one instruction's ops: [first, end). */
 static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end)
 {
@@ -578,48 +686,222 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end)
         }
 
         if (op->opc == INDEX_op_call) {
+            const DfHelperNote *hn = df_find_helper(op);
+            /*
+             * CP-H.  Two passes, because the destination's provenance is the
+             * union of the SOURCES and the sources are not all known until
+             * every argument has been looked at.  The single pass this
+             * replaced added a field record as it went, so the first pointer
+             * argument -- which for every gvec helper is the DESTINATION --
+             * was given a provenance holding only itself: helper_gvec_add8's
+             * vd came out depending on vd and on neither vn nor vm.  A missed
+             * dependency, in the code whose own comment says a missed
+             * dependency is the one error it must not make.
+             */
+            uint32_t pf_off[DF_MAX_HELPER_ARGS];
+            uint32_t pf_size[DF_MAX_HELPER_ARGS];
+            uint8_t pf_dir[DF_MAX_HELPER_ARGS];
+            unsigned n_pf = 0;
+            uint8_t model = INSN_DF_HELPER_EXACT;
+
             nb_oargs = TCGOP_CALLO(op);
             nb_iargs = TCGOP_CALLI(op);
             d->n_calls++;
 
             memset(prov, 0, sizeof(prov));
+
+            /*
+             * Pass 1a: everything the op itself states.  The physical
+             * arguments are walked -- not the note's logical ones -- because
+             * an i128 argument is two temps with two provenances and only the
+             * physical list names both.
+             */
             for (unsigned i = 0; i < nb_iargs; i++) {
                 TCGTemp *ts = arg_temp(op->args[nb_oargs + i]);
-                int64_t eo;
 
                 df_or(prov, df_prov_of(ts - s->temps));
                 if (df_reg(ts, &idx)) {
                     df_bit(d->rd, idx);
                     df_bit(prov, idx);
                 }
+            }
+
+            /*
+             * Pass 1b: the pointer arguments, and what the emitter said about
+             * them.  A pointer into env is how a vector register, an x87
+             * stack slot or an FP status word reaches a helper -- the state
+             * the TCG-global namespace does not name.  tcg_env itself is not
+             * an operand: it is the first argument of nearly every helper
+             * there is.
+             */
+            if (hn) {
                 /*
-                 * A pointer into env: how a vector register reaches a gvec
-                 * helper.  The argument does not say whether the helper reads
-                 * or writes through it, so it is reported as both -- an
-                 * over-approximation the consumer can see is one, rather than
-                 * a guess that looks like a fact.  tcg_env itself does not
-                 * count: it is the first argument of nearly every helper
-                 * there is.
+                 * Before the operands: is the helper's footprint bounded at
+                 * all?
+                 *
+                 * TCG_CALL_NO_READ_GLOBALS / _NO_WRITE_GLOBALS are QEMU's own
+                 * statement about a helper, and the register allocator acts on
+                 * them: without them tcg_liveness_analysis() does
+                 * la_global_kill() -- every global is written -- or
+                 * la_global_sync() -- every global is read (tcg/tcg.c).  The
+                 * op list names none of those accesses, so for such a helper
+                 * the extracted read and write sets are SHORT OF THE TRUTH,
+                 * not merely coarse, and calling the instruction exactly
+                 * described would be the one error this file says it must not
+                 * make.  It is labelled instead; widening the sets to every
+                 * global is a change to what the extraction PUBLISHES and
+                 * belongs behind its own measurement.
                  */
-                if (ts != env_ts) {
+                if (!(hn->flags & TCG_CALL_NO_READ_GLOBALS)) {
+                    model = MAX(model, INSN_DF_HELPER_OPAQUE);
+                    d->n_helper_unbounded += d->n_helper_unbounded < 255;
+                }
+                for (unsigned k = 0; k < hn->nargs; k++) {
+                    const TCGTemp *ts = hn->arg[k];
+                    int64_t eo;
+                    uint8_t dir;
+                    uint32_t extent;
+                    int bit;
+
+                    if (ts == NULL || hn->typecode[k] != dh_typecode_ptr) {
+                        continue;
+                    }
+                    if (ts == env_ts) {
+                        /*
+                         * The whole CPU state pointer.  Nothing in the call
+                         * says which of CPUArchState the helper reaches
+                         * through it, so its operand set is not stated -- it
+                         * is merely not enumerated.  Treating this as "no
+                         * operand" is what made a helper-implemented x87
+                         * instruction come out looking exactly described:
+                         * helper_fsin(env) has no other argument at all, and
+                         * every access it makes to the x87 stack is invisible
+                         * here.
+                         */
+                        model = MAX(model, INSN_DF_HELPER_OPAQUE);
+                        d->n_helper_unbounded += d->n_helper_unbounded < 255;
+                        continue;
+                    }
+                    eo = df_envoff_of(ts - s->temps);
+                    if (eo == INSN_DF_NOT_ENV || eo < 0) {
+                        /*
+                         * A pointer whose value is not tcg_env plus a
+                         * constant: a fpstatus pointer passed down from the
+                         * translator, a guest pointer.  Nothing about the
+                         * region is known, so nothing is claimed about it --
+                         * but the helper does reach state through it, so the
+                         * instruction cannot be called exactly described.
+                         */
+                        model = MAX(model, INSN_DF_HELPER_OPAQUE);
+                        d->n_helper_unbounded += d->n_helper_unbounded < 255;
+                        continue;
+                    }
+                    extent = 0;
+                    dir = 0;
+                    /*
+                     * The gvec constructors pass their operand pointers as
+                     * the helper's first arguments, in order, so operand k IS
+                     * argument k.  Matching by OFFSET instead would be wrong
+                     * whenever two operands name the same register, which is
+                     * the ordinary shape of an accumulate: aarch64 sdot is
+                     * emitted as gvec_4_ool(rd, rn, rm, rd), and an
+                     * offset-keyed lookup answers the fourth argument -- a
+                     * genuine READ of rd -- with the first one's DESTINATION
+                     * role.  Measured: it double-counted sdot's unresolved
+                     * operands as 2 where there is 1.
+                     */
+                    if (hn->has_gvec && k < hn->gvec_n) {
+                        if (hn->gvec_off[k] != (uint32_t)eo) {
+                            /*
+                             * Argument k is not the pointer the constructor
+                             * built for operand k, so the correspondence this
+                             * code rests on does not hold for this helper.
+                             * Describe it with nothing rather than with
+                             * another operand's role.
+                             */
+                            model = MAX(model, INSN_DF_HELPER_OPAQUE);
+                        } else {
+                            dir = hn->gvec_dir[k];
+                            extent = hn->gvec_oprsz;
+                        }
+                    }
+                    if (dir == 0 && !df_helper_usage_of(hn->name, k, &dir)) {
+                        dir = 0;
+                    }
+                    if (dir == 0) {
+                        /* Nobody stated it.  Both directions, and say so. */
+                        dir = INSN_DF_RD | INSN_DF_WR;
+                        model = MAX(model, INSN_DF_HELPER_APPROX);
+                        d->n_helper_unknown += d->n_helper_unknown < 255;
+                    } else if ((dir & INSN_DF_WR) && !(dir & INSN_DF_RD) &&
+                               !df_helper_usage_of(hn->name, k, &dir)) {
+                        /*
+                         * The constructor stated a DESTINATION.  Whether the
+                         * helper also READS it -- an accumulate -- is the
+                         * per-helper fact, and with no row for it the read is
+                         * recorded and the instruction labelled.  The extent
+                         * stays exact either way, which is the part the walk
+                         * never had.
+                         */
+                        dir |= INSN_DF_RD;
+                        model = MAX(model, INSN_DF_HELPER_APPROX);
+                        d->n_helper_unknown += d->n_helper_unknown < 255;
+                    }
+                    if (n_pf < DF_MAX_HELPER_ARGS) {
+                        pf_off[n_pf] = (uint32_t)eo;
+                        pf_size[n_pf] = extent;
+                        pf_dir[n_pf] = dir;
+                        n_pf++;
+                    }
+                    if (dir & INSN_DF_RD) {
+                        bit = df_intern((uint32_t)eo);
+                        if (bit >= 0) {
+                            df_bit(prov, (unsigned)bit);
+                        }
+                    }
+                }
+                if (hn->args_overflow) {
+                    model = MAX(model, INSN_DF_HELPER_OPAQUE);
+                }
+            } else {
+                /*
+                 * No note: the note array overflowed, or a call reached the
+                 * op list by a route tcg_gen_callN does not serve.  Fall back
+                 * to what the walk alone can say, and label the instruction
+                 * with what that is worth.
+                 */
+                for (unsigned i = 0; i < nb_iargs; i++) {
+                    TCGTemp *ts = arg_temp(op->args[nb_oargs + i]);
+                    int64_t eo;
+
+                    if (ts == env_ts) {
+                        continue;
+                    }
                     eo = df_envoff_of(ts - s->temps);
                     if (eo != INSN_DF_NOT_ENV && eo >= 0) {
                         int bit = df_intern((uint32_t)eo);
 
-                        /*
-                         * The argument does not say whether the helper reads
-                         * or writes through the pointer, so both are recorded
-                         * and the region taints everything the call produces.
-                         * Over-recording here is the pessimistic direction.
-                         */
                         if (bit >= 0) {
                             df_bit(prov, (unsigned)bit);
                         }
-                        df_add_field(d, (uint32_t)eo, 0,
-                                     INSN_DF_RD | INSN_DF_WR, prov);
+                        if (n_pf < DF_MAX_HELPER_ARGS) {
+                            pf_off[n_pf] = (uint32_t)eo;
+                            pf_size[n_pf] = 0;
+                            pf_dir[n_pf] = INSN_DF_RD | INSN_DF_WR;
+                            n_pf++;
+                        }
                     }
                 }
+                model = MAX(model, INSN_DF_HELPER_OPAQUE);
+                d->n_helper_unbounded += d->n_helper_unbounded < 255;
             }
+
+            /* Pass 2: publish, now that the source set is complete. */
+            for (unsigned i = 0; i < n_pf; i++) {
+                df_add_field(d, pf_off[i], pf_size[i], pf_dir[i],
+                             (pf_dir[i] & INSN_DF_WR) ? prov : NULL);
+            }
+
             for (unsigned i = 0; i < nb_oargs; i++) {
                 TCGTemp *ts = arg_temp(op->args[i]);
 
@@ -629,6 +911,9 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end)
                 } else {
                     df_or(df_prov_of(ts - s->temps), prov);
                 }
+            }
+            if (model > d->helper_model) {
+                d->helper_model = model;
             }
             continue;
         }
@@ -774,23 +1059,13 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end)
  * note is a missing dependency, which is the direction that costs a consumer
  * correctness rather than accuracy.
  */
-#define DF_MAX_GVEC_NOTES 64
-
-typedef struct DfGvecNote {
-    const TCGOp *anchor;
-    uint32_t dofs, aofs, bofs, oprsz;
-} DfGvecNote;
-
-static DfGvecNote df_gvec[DF_MAX_GVEC_NOTES];
-static unsigned df_n_gvec;
-static bool df_gvec_overflow;
-
 void insn_dataflow_note_gvec(uint32_t dofs, uint32_t aofs, uint32_t bofs,
                              uint32_t oprsz)
 {
     if (df_disabled()) {
         return;
     }
+    df_bind();
     if (df_n_gvec >= DF_MAX_GVEC_NOTES) {
         df_gvec_overflow = true;
         return;
@@ -844,26 +1119,13 @@ static void df_apply_gvec_notes(InsnDataflow *d, TCGOp *first, TCGOp *end)
  * input, so the loaded value's provenance comes out as the address
  * registers.
  */
-#define DF_MAX_MEMOP_NOTES 64
-
-typedef struct DfMemopNote {
-    const TCGOp *anchor;
-    const void *val_ts;
-    const void *addr_ts;
-    unsigned size;
-    bool is_store;
-} DfMemopNote;
-
-static DfMemopNote df_memop[DF_MAX_MEMOP_NOTES];
-static unsigned df_n_memop;
-static bool df_memop_overflow;
-
 void insn_dataflow_note_memop(const void *val_ts, const void *addr_ts,
                               unsigned size, bool is_store)
 {
     if (df_disabled()) {
         return;
     }
+    df_bind();
     if (df_n_memop >= DF_MAX_MEMOP_NOTES) {
         df_memop_overflow = true;
         return;
@@ -874,6 +1136,166 @@ void insn_dataflow_note_memop(const void *val_ts, const void *addr_ts,
     df_memop[df_n_memop].size = size;
     df_memop[df_n_memop].is_store = is_store;
     df_n_memop++;
+}
+
+/*
+ * CP-H -- the per-helper usage table.
+ *
+ * The argument list gives operand IDENTITY.  It does not give USAGE: nothing
+ * in TCGHelperInfo says whether helper H reads through its third argument,
+ * writes through it, or both.  That is a STATIC PER-HELPER FACT -- bounded,
+ * enumerable, and written down here once rather than rediscovered at runtime.
+ *
+ * Two rules govern this table and they are not negotiable:
+ *
+ *   1. A row is a CLAIM ABOUT QEMU SOURCE and carries where it was read from.
+ *      A row whose justification is "it looks like an accumulate" is the
+ *      false-justification class this project has a standing memory entry
+ *      about, and is worse than no row: an absent row costs precision, a
+ *      wrong row costs correctness.
+ *   2. Absence is not "read-only".  A (helper, argument) pair with no row is
+ *      recorded as read-and-written and the instruction is labelled
+ *      INSN_DF_HELPER_APPROX, so a consumer can see the over-approximation
+ *      instead of inheriting it as fact.
+ *
+ * @argno is the LOGICAL argument index -- the helper's own parameter
+ * position, counting from zero and counting tcg_env if the helper takes it.
+ */
+typedef struct DfHelperUsage {
+    const char *name;
+    uint8_t argno;
+    uint8_t dir;
+} DfHelperUsage;
+
+static const DfHelperUsage df_helper_usage[] = {
+    /*
+     * Seeded empty on purpose.  The rows that belong here are the ones the
+     * four targets actually reach, and which those are is a measurement, not
+     * a guess -- see the ceiling report this table's `unknown` count feeds.
+     * Adding rows before measuring would be writing down the helpers that
+     * came to mind rather than the helpers that run.
+     */
+    { NULL, 0, 0 }
+};
+
+static bool df_helper_usage_of(const char *name, unsigned argno, uint8_t *dir)
+{
+    for (const DfHelperUsage *u = df_helper_usage; u->name; u++) {
+        if (u->argno == argno && !strcmp(u->name, name)) {
+            *dir = u->dir;
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * CP-H -- helper notes.  See insn_dataflow_note_helper() in the header.
+ */
+void insn_dataflow_note_helper(const void *call_op, const void *info_p,
+                               const void *ret_ts, const void *const *args)
+{
+    const TCGHelperInfo *info = info_p;
+    DfHelperNote *n;
+    unsigned nargs = 0;
+
+    if (df_disabled()) {
+        return;
+    }
+    df_bind();
+    if (df_n_helper >= DF_MAX_HELPER_NOTES) {
+        df_helper_overflow = true;
+        return;
+    }
+    n = &df_helper[df_n_helper];
+    memset(n, 0, sizeof(*n));
+    n->anchor = call_op;
+    n->name = info->name;
+    n->flags = info->flags;
+
+    /*
+     * How many LOGICAL arguments there are is not stored: info->nr_in counts
+     * physical slots, which is larger for i128 and unchanged for the extension
+     * temps.  in[].arg_idx maps each slot back to the parameter it came from,
+     * so the largest of those plus one is the count -- and it is exact rather
+     * than parsed out of the typemask, which stops at the first void field and
+     * cannot distinguish "no more arguments" from a void one.
+     */
+    for (unsigned i = 0; i < info->nr_in; i++) {
+        if (info->in[i].arg_idx + 1u > nargs) {
+            nargs = info->in[i].arg_idx + 1u;
+        }
+    }
+    if (nargs > DF_MAX_HELPER_ARGS) {
+        nargs = DF_MAX_HELPER_ARGS;
+        n->args_overflow = true;
+    }
+    for (unsigned k = 0; k < nargs; k++) {
+        /*
+         * Slot 0 of the typemask is the RETURN type, so parameter k is at
+         * slot k + 1 -- three bits each, dh_typecode_* in helper-head.h.inc.
+         */
+        n->typecode[k] = (info->typemask >> ((k + 1) * 3)) & 7;
+        n->arg[k] = args ? (const TCGTemp *)args[k] : NULL;
+    }
+    n->nargs = nargs;
+    (void)ret_ts;
+    df_n_helper++;
+}
+
+/*
+ * CP-H, the vector half.  Attaches to the call the constructor has just
+ * emitted, which is the note taken a moment ago by tcg_gen_callN.
+ */
+void insn_dataflow_note_gvec_ool(const uint32_t *off, const uint8_t *dir,
+                                 unsigned n, uint32_t oprsz)
+{
+    const TCGOp *last;
+    DfHelperNote *h;
+
+    if (df_disabled()) {
+        return;
+    }
+    df_bind();
+    if (df_n_helper == 0 || n > INSN_DF_MAX_GVEC_OPERANDS) {
+        /*
+         * No note to attach to: the helper note array overflowed, or the
+         * constructor gained an operand this code does not carry.  Either way
+         * the call keeps the unrefined treatment and says so, rather than
+         * being described by roles that were never recorded.
+         */
+        df_helper_overflow = true;
+        return;
+    }
+    last = QTAILQ_LAST(&tcg_ctx->ops);
+    h = &df_helper[df_n_helper - 1];
+    if (h->anchor != last) {
+        /*
+         * The constructor's helper is not the last op emitted.  That should
+         * not happen -- fn() emits the call and nothing after it -- and if it
+         * ever does, attaching the roles to the wrong call would describe one
+         * instruction with another's operands.
+         */
+        df_helper_overflow = true;
+        return;
+    }
+    h->has_gvec = true;
+    h->gvec_n = n;
+    h->gvec_oprsz = oprsz;
+    for (unsigned i = 0; i < n; i++) {
+        h->gvec_off[i] = off[i];
+        h->gvec_dir[i] = dir[i];
+    }
+}
+
+static const DfHelperNote *df_find_helper(const TCGOp *op)
+{
+    for (unsigned i = 0; i < df_n_helper; i++) {
+        if (df_helper[i].anchor == op) {
+            return &df_helper[i];
+        }
+    }
+    return NULL;
 }
 
 void insn_dataflow_extract(unsigned num_insns)
@@ -951,6 +1373,22 @@ void insn_dataflow_extract(unsigned num_insns)
     df_gvec_overflow = false;
     df_n_memop = 0;
     df_memop_overflow = false;
+    if (df_helper_overflow) {
+        /*
+         * A call whose operand set was never recorded is a call described by
+         * the fallback, and the fallback is the thing CP-H exists to replace.
+         * Say so on every instruction of the block rather than let one that
+         * happens to be exact claim it.
+         */
+        for (unsigned i = 0; i < df_ninsns; i++) {
+            if (df_out[i].helper_model < INSN_DF_HELPER_OPAQUE &&
+                df_out[i].n_calls) {
+                df_out[i].helper_model = INSN_DF_HELPER_OPAQUE;
+            }
+        }
+    }
+    df_n_helper = 0;
+    df_helper_overflow = false;
 
     if (prof) {
         df_prof_ns += df_now() - t0;

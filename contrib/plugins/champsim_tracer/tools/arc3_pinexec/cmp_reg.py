@@ -457,6 +457,16 @@ def has_seg_prefix(enc):
     return enc.startswith('64') or enc.startswith('65')
 
 
+#: Registers the KERNEL wrote across a syscall and no instruction published.
+#: qemu-user performs the write in the CPU loop, outside the translated
+#: instruction stream, so the tracer has no observation point for it and the
+#: comparison's shadow register file cannot learn the new value.  Emptied as
+#: soon as an instruction publishes the register again.
+kernel_written = set()
+#: what cpu_loop.c's EXCP_SYSCALL arm writes back that no instruction does.
+SYSCALL_KERNEL_WRITES = ('rax',)
+
+
 def classify_value(reg, qv, pv, w, inherited, enc):
     """Name the mechanism behind a cross-run register-value difference.
 
@@ -471,11 +481,24 @@ def classify_value(reg, qv, pv, w, inherited, enc):
         return ('MAPPING-POINTER', 'ORTHOGONAL')
     if enc == SYSCALL_ENC and reg in ('rcx', 'r11'):
         # ARCHITECTURAL DEFECT, and it is upstream QEMU's, not the plugin's.
-        # SYSCALL sets RCX <- RIP-of-next and R11 <- RFLAGS.  QEMU's
-        # linux-user helper_syscall (target/i386/tcg/user/seg_helper.c:29)
-        # raises EXCP_SYSCALL and never performs that clobber, so the
-        # registers the ISA says the instruction produces keep whatever they
-        # held.  The tracer NAMES them correctly and publishes QEMU's value.
+        # SYSCALL performs THREE register effects: RCX <- RIP-of-next,
+        # R11 <- RFLAGS, and RFLAGS <- RFLAGS & ~IA32_FMASK (SYSRET then
+        # restores RFLAGS from R11).  QEMU's linux-user helper_syscall
+        # (target/i386/tcg/user/seg_helper.c:29) raises EXCP_SYSCALL and
+        # cpu_loop.c's EXCP_SYSCALL arm (linux-user/i386/cpu_loop.c:241)
+        # writes back only env->regs[R_EAX] and env->eip -- so NONE of the
+        # three happens and all three registers keep whatever they held.
+        # The tracer NAMES them correctly and publishes QEMU's value.
+        #
+        # RCX and R11 are named HERE, ahead of every other rule, because
+        # SYSCALL clobbers them UNCONDITIONALLY: whatever else was true of
+        # this instruction's inputs, those two registers were going to
+        # differ.  RFLAGS is not in that position -- the flags going IN may
+        # already differ for an ordinary reason -- so it is named at the
+        # BOTTOM of this function, where it only claims rows nothing else
+        # explains.  Ordering it here instead moved 22 rows out of
+        # INHERITED-DIFFERING-INPUT and raised the criterion from 300 to
+        # 322, which is a rule taking credit for rows it did not earn.
         return ('QEMU-USER-SYSCALL-NO-RCX-R11-CLOBBER', 'TRACER-SUBSET')
     hs = is_host_specific(enc)
     if hs:
@@ -504,7 +527,141 @@ def classify_value(reg, qv, pv, w, inherited, enc):
         if mapping_of(a) is not None:
             return ('IN-MAPPING-WRONG-DELTA', 'UNACCOUNTED')
         return ('POINTER-OUTSIDE-EVERY-MEASURED-MAPPING', 'ORTHOGONAL')
+    if enc == SYSCALL_ENC and reg == 'flags':
+        # The third register of the SYSCALL clobber set named above, placed
+        # here rather than beside RCX/R11 for the reason given there.
+        # OBSERVED: `syscall` at 0x41740e published flags 0x206 --
+        # byte-identical to what `subq $8,%rsp` left three instructions
+        # earlier -- against the reference's 0x202.  Neither the entry mask
+        # nor the SYSRET restore happened, so the value never moved.
+        return ('QEMU-USER-SYSCALL-NO-RFLAGS-CLOBBER', 'TRACER-SUBSET')
+    if reg in kernel_written:
+        # THE SAME BOUNDARY, THE OTHER DIRECTION, AND ALSO UPSTREAM QEMU'S.
+        # cpu_loop.c DOES write the syscall's result: env->regs[R_EAX] = ret,
+        # at linux-user/i386/cpu_loop.c:257 -- but it does it in the CPU
+        # LOOP, outside any translated instruction, so no plugin instruction
+        # callback ever observes it and the value never reaches the wire.
+        # A consumer replaying this trace therefore has a stale RAX after
+        # every syscall: OBSERVED at 0x404387, where `test %eax,%eax` read
+        # the 0x9e that `movl $0x9e,%eax` had written for the syscall NUMBER
+        # while the reference had already seen the return value 0.
+        #
+        # COUNTED, not forgiven.  The dependency edge a consumer would build
+        # from this trace is wrong, which makes it a trace fact even though
+        # its cause is a missing QEMU observation point rather than anything
+        # the plugin decides.  The fix is upstream: qemu-user must make the
+        # cpu_loop syscall write-back visible to plugins (or the tracer must
+        # snapshot the destination after the exception returns), and until
+        # it does, this row is a defect with a named owner.
+        return ('QEMU-USER-SYSCALL-RESULT-WRITTEN-OUTSIDE-THE-INSN-STREAM',
+                'TRACER-SUBSET')
     return ('UNACCOUNTED', 'UNACCOUNTED')
+
+
+# ------------------------------------------------------- PROVENANCE
+#
+# WHY THIS IS SEPARATE FROM `tainted`, AND MUST STAY SEPARATE.
+#
+# `tainted` records a difference this comparison has EXPLAINED, and it feeds
+# `inherited`, which downgrades a later row to ORTHOGONAL.  An UNACCOUNTED
+# difference deliberately does NOT enter it: if it did, one real defect would
+# launder every value derived from it and the criterion would fall to zero
+# for the wrong reason.  That rule is right and is not touched here.
+#
+# But it leaves the residue unreadable.  A single unexplained root produces a
+# fan-out of unexplained descendants, and the report showed all of them as
+# peers -- 274 rows with no way to tell the one difference that arose here
+# from the two hundred that only carried it forward.  `unexplained` is the
+# missing half: it records where an UNACCOUNTED difference AROSE, so a later
+# row can NAME its ancestor without being FORGIVEN by it.  Nothing in here
+# ever reaches `inherited`, and no row's DIRECTION changes because of it --
+# only the mechanism it is reported under.
+#
+#   reg -> (enc, mnem, reg, pc)   the row that first left this register
+#                                 differing with no rule to explain it
+unexplained = {}
+#   page -> (enc, mnem, reg, pc)  a store whose DATA was such a register, so
+#                                 the cell it wrote now differs too, and the
+#                                 next load of it inherits through MEMORY --
+#                                 which this arm has no reference for.
+unexplained_mem = {}
+#: every ROOT, keyed by the (enc, reg) whose difference arose with nothing
+#: upstream of it, carrying how many rows are charged to it.
+root_census = collections.OrderedDict()
+MEMPAGE = 6          # 64-byte granule: a store and the load that reads it back
+
+#: prov_of()'s third answer.  Not a root (the difference came from outside)
+#: and not a known root either (this arm has no reference for the carrier).
+UNPAIRED = object()
+
+
+def prov_of(q, ps, c, unwitnessed):
+    """Where an UNACCOUNTED difference on @c at this instruction CAME FROM.
+
+    Returns (suffix, ancestor).  The suffix names the mechanism; the
+    ancestor is the root tuple to charge this row to, None when the row IS a
+    root, or UNPAIRED when the carrier is real but unnamed.
+
+    A row is a ROOT only when EVERY register input was COMPARED and AGREED
+    and no memory was read.  That is the only shape that can be a tracer
+    defect rather than a difference between two processes -- and it is why
+    @unwitnessed is a separate answer rather than folded into agreement: a
+    source the shadow file never held was never compared, so calling the row
+    a root would be claiming an agreement that was never measured.  That is
+    this project's dominant failure wearing this instrument's hat.
+    """
+    # The register itself already differed before this instruction ran.
+    src = unexplained.get(c)
+    if src is None:
+        for k in ps:
+            if k in unexplained:
+                src = unexplained[k]
+                break
+    if src is not None:
+        return ('-VIA-REG:' + src[0] + '/' + src[2], src)
+    # If it read a cell a differing store wrote, the difference travelled
+    # through MEMORY, which the REGISTER arm has no reference for --
+    # cmp_memop.py is the instrument that compares memory.
+    for a in q.get('la', ()):
+        m = unexplained_mem.get(a >> MEMPAGE)
+        if m is not None:
+            return ('-VIA-MEM:' + m[0] + '/' + m[2], m)
+    if unwitnessed:
+        return ('-VIA-REG:UNWITNESSED:' + ','.join(sorted(unwitnessed)),
+                UNPAIRED)
+    if q.get('nl'):
+        return ('-VIA-MEM:UNWITNESSED-CELL', UNPAIRED)
+    return ('-ROOT', None)
+
+
+def prov_charge(root, q, c, axis=None, qv=None, pv=None, w=None):
+    """Book one row against its ancestor, or open a new root.
+
+    A root carries its WITNESS -- the axis, and both sides' value -- because
+    a root is the only class in this residue that could be a tracer defect,
+    and a defect claim with no observed value behind it is a table row.
+    """
+    if root is UNPAIRED:
+        return None
+    if root is None:
+        key = (q['b'], c)
+        r = root_census.get(key)
+        if r is None:
+            r = root_census[key] = {'enc': q['b'], 'mnem': q['c'], 'reg': c,
+                                    'pc': q['pc'], 'n': 0, 'desc': 0,
+                                    'w': []}
+        r['n'] += 1
+        if len(r['w']) < 4:
+            m = (1 << (8 * (w or 8))) - 1
+            r['w'].append('%s @%s %s trc=%#x ref=%#x w=%d'
+                          % (axis, q['pc'], c, (qv or 0) & m, (pv or 0) & m,
+                             w or 8))
+        return (q['b'], q['c'], c, q['pc'])
+    key = (root[0], root[2])
+    r = root_census.get(key)
+    if r is not None:
+        r['desc'] += 1
+    return root
 
 
 # The tracer's own shadow register file, replayed from the destination
@@ -530,6 +687,9 @@ for pos, (pi, qj) in enumerate(pairs):
     if prev_qj is not None and qj != prev_qj + 1:
         shadow.clear()
         tainted.clear()
+        unexplained.clear()
+        unexplained_mem.clear()
+        kernel_written.clear()
         st['shadow_cleared'] += 1
     prev_qj = qj
     st['pairs'] += 1
@@ -576,6 +736,14 @@ for pos, (pi, qj) in enumerate(pairs):
     # legitimately is what decides how a destination difference is read.
     inherited = process_private_load(q) or is_host_specific(q['b']) is not None \
         or has_seg_prefix(q['b'])
+    # Sources this comparison could not compare at all: the shadow file never
+    # held them, so their agreement is unmeasured and must not be assumed.
+    # Computed BEFORE the source loop, not accumulated during it: a row
+    # scored early would otherwise be told about only the registers the loop
+    # had reached, and would call itself a root on the strength of a set that
+    # was still being built.
+    unwitnessed = set(c for c, (pv, _f, _g) in ps.items()
+                      if c != 'rip' and pv is not None and c not in shadow)
     for c, (pv, flags, got) in ps.items():
         if pv is None:
             st['srcval_ref_absent'] += 1
@@ -625,6 +793,12 @@ for pos, (pi, qj) in enumerate(pairs):
             if direction == 'ORTHOGONAL':
                 tainted.add(c)
                 inherited = True
+            elif direction == 'UNACCOUNTED':
+                suf, root = prov_of(q, ps, c, unwitnessed)
+                cat += suf
+                anc = prov_charge(root, q, c, 'srcval', qv, pv, w)
+                if anc is not None:
+                    unexplained.setdefault(c, anc)
             note(valsig, 'srcval', (q['b'], q['c'], c, cat, direction), qj)
 
     # ---- axis 3: DESTINATION VALUES -------------------------------------
@@ -663,19 +837,51 @@ for pos, (pi, qj) in enumerate(pairs):
             cat, direction = classify_value(c, qv, pv, w, inherited, q['b'])
             if direction == 'ORTHOGONAL':
                 tainted.add(c)
+            elif direction == 'UNACCOUNTED':
+                suf, root = prov_of(q, ps, c, unwitnessed)
+                cat += suf
+                anc = prov_charge(root, q, c, 'dstval', qv, pv, w)
+                # This destination now differs with no rule to explain it,
+                # whether the difference arose here or arrived through an
+                # input.  Either way the NEXT reader of this register is a
+                # descendant, not a second independent finding -- and it is
+                # charged to the ORIGINAL root, not to this row.
+                unexplained[c] = anc or (q['b'], q['c'], c, q['pc'])
+                # ... and so is the next reader of any cell this instruction
+                # stores it into.
+                for a in q.get('sa', ()):
+                    unexplained_mem[a >> MEMPAGE] = unexplained[c]
             note(valsig, 'dstval', (q['b'], q['c'], c, cat, direction), qj)
 
     # publish this instruction's destination writes into the shadow file
     for c, (qv, qw) in q['_sv'].items():
         shadow[c] = (qv, qw)
+        kernel_written.discard(c)
         if inherited:
             tainted.add(c)
+        # A destination the two runs AGREED on is no longer differing, so it
+        # must stop being named as an ancestor -- otherwise one root would
+        # be charged with every later row that happens to touch the register
+        # it once passed through, which is the opposite failure to the one
+        # this instrument exists to fix.
+        if c in unexplained and c in pd and c in q['_dv']:
+            pvv = pd[c][0]
+            if pvv is not None:
+                gw = min(qw or 8, pd[c][2], 8) or 8
+                if value_agrees(q['_dv'][c][0], pvv, gw):
+                    del unexplained[c]
     # a destination the tracer named WITHOUT a value invalidates the shadow
     # entry: the register changed and we do not know to what.
     for c in q['_d']:
         if c not in q['_sv']:
             shadow.pop(c, None)
             tainted.discard(c)
+            unexplained.pop(c, None)
+    # A syscall's result is written by the CPU loop, not by this or any
+    # instruction, so nothing above can have published it.  Mark it, so the
+    # next reader of that register is named rather than left unexplained.
+    if q['b'] == SYSCALL_ENC:
+        kernel_written.update(SYSCALL_KERNEL_WRITES)
 
 # ---------------------------------------------------------------- 5. report
 say("")
@@ -754,11 +960,37 @@ for kind in ('dstval', 'srcval', 'ripsrc', 'dstval_rep'):
     for sig, n in valsig[kind].most_common(A.maxreport):
         enc, cap, reg, cat, direction = sig
         vroll[direction] += n
-        say("    %-18s %-10s %-10s %-24s %-14s %8d"
+        say("    %-18s %-10s %-10s %-46s %-14s %8d"
             % (enc[:18], cap[:10], reg, cat, direction, n))
 for sig, n in valsig['dstval_absent'].most_common(A.maxreport):
     say("    %-18s %-10s %-10s reference has a value, tracer has none %8d"
         % (sig[0][:18], sig[1][:10], sig[2], n))
+
+say("")
+say("=== THE UNACCOUNTED RESIDUE, RESOLVED TO ITS ROOTS ===")
+say("  An UNACCOUNTED difference does not TAINT -- that rule stands, and is")
+say("  what stops one defect from laundering everything downstream of it.")
+say("  But it left the residue unreadable: a root and the two hundred rows")
+say("  that only carried it forward were reported as peers.  Every")
+say("  UNACCOUNTED row now names where its difference AROSE.  Its DIRECTION")
+say("  is unchanged and it is still counted in the criterion.")
+say("")
+_desc = sum(r['desc'] for r in root_census.values())
+_roots = sum(r['n'] for r in root_census.values())
+say("  roots %d (over %d distinct (encoding, register) sites) "
+    "| rows charged to a root %d" % (_roots, len(root_census), _desc))
+say("")
+say("  %-18s %-10s %-8s %-14s %8s %8s"
+    % ('ROOT ENCODING', 'MNEMONIC', 'REG', 'FIRST PC', 'ROOTS', 'DESCEND'))
+for key, r in sorted(root_census.items(),
+                     key=lambda kv: (-(kv[1]['n'] + kv[1]['desc']), kv[0])):
+    say("  %-18s %-10s %-8s %-14s %8d %8d"
+        % (r['enc'][:18], r['mnem'][:10], r['reg'], r['pc'], r['n'],
+           r['desc']))
+    for wline in r.get('w', ()):
+        say("        %s" % wline)
+if not root_census:
+    say("  (none)")
 
 say("")
 say("=== ROLL-UP ===")

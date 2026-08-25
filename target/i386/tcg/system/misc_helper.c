@@ -114,6 +114,25 @@ target_ulong helper_read_cr8(CPUX86State *env)
     }
 }
 
+/*
+ * MOV to CR3/CR4 with a reserved bit set.  Inside an SVM guest the write is
+ * an SVM_EXIT_ERR vmexit; OUTSIDE one it is #GP(0) (Intel SDM Vol.3 2.5,
+ * AMD APM Vol.2 3.1.3) and there is no VMCB to exit to.  Exiting
+ * unconditionally sends a bare-metal guest through do_vmexit() against
+ * env->vm_vmcb == 0: the "host" state is reloaded from physical address 0,
+ * so CR0, EFER and RIP all come back zero, the machine leaves long mode and
+ * never returns.  A guest that writes CR4.VMXE on a model without VMX -- the
+ * exact probe that decides whether an encoding is unimplemented or merely
+ * enable-gated -- hangs instead of taking the #GP the architecture promises.
+ */
+static G_NORETURN void cr_reserved_fault(CPUX86State *env, uintptr_t ra)
+{
+    if (env->hflags & HF_GUEST_MASK) {
+        cpu_vmexit(env, SVM_EXIT_ERR, 0, ra);
+    }
+    raise_exception_err_ra(env, EXCP0D_GPF, 0, ra);
+}
+
 void helper_write_crN(CPUX86State *env, int reg, target_ulong t0)
 {
     switch (reg) {
@@ -132,7 +151,7 @@ void helper_write_crN(CPUX86State *env, int reg, target_ulong t0)
     case 3:
         if ((env->efer & MSR_EFER_LMA) &&
                 (t0 & ((~0ULL) << env_archcpu(env)->phys_bits))) {
-            cpu_vmexit(env, SVM_EXIT_ERR, 0, GETPC());
+            cr_reserved_fault(env, GETPC());
         }
         if (!(env->efer & MSR_EFER_LMA)) {
             t0 &= 0xffffffffUL;
@@ -141,7 +160,7 @@ void helper_write_crN(CPUX86State *env, int reg, target_ulong t0)
         break;
     case 4:
         if (t0 & cr4_reserved_bits(env)) {
-            cpu_vmexit(env, SVM_EXIT_ERR, 0, GETPC());
+            cr_reserved_fault(env, GETPC());
         }
         if (((t0 ^ env->cr[4]) & CR4_LA57_MASK) &&
             (env->hflags & HF_CS64_MASK)) {

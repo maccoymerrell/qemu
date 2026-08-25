@@ -121,3 +121,24 @@ for M in movq vmovq vpsadbw sqrtsd ud0 ud1 xlatb smswl lmsww \
 done
 cp tracer_batch.good.tsv tracer_batch.tsv
 $PY compare_attrib.py > /dev/null
+
+# ---- audit the ILLOPC rows -------------------------------------------------
+# An UNREACHABLE row refused at NO-TABLE-ENTRY(ILLOPC) asserts two things, and
+# each has its own way of being false: that the BYTES are the instruction the
+# row names (the UD0 misdecode was exactly this failure), and that QEMU really
+# has no table entry for them.  illopc_audit.py re-decodes every such probe
+# under XED, LLVM MC, iced-x86 and objdump, and independently walks each
+# probe's prefix/map/opcode/ModRM shape through decode-new.c.inc AS IT IS ON
+# DISK to name the table, the slot and what occupies it.  A slot that turns
+# out to be OCCUPIED is fatal.
+#
+# PASS A RECENT objdump.  A distribution objdump lags the newest ISA
+# extensions by years -- Ubuntu's 2.42 does not know MOVRS, AMX-FP8,
+# AMX-MOVRS or the MSR_IMM forms, and its silence would read as "only one
+# decoder names this row".  2.45 settles all ten.  Repeat --objdump freely;
+# every one contributes a column.
+$PY "$T"/illopc_audit.py --matrix ../reach_matrix.tsv \
+    --xl3 xl3.tsv --iced iced.tsv --root "$Q" \
+    --objdump "${CST_OBJDUMP_NEW:-objdump}" --objdump objdump \
+    --allow-single-source "$T"/illopc_single_source.allow \
+    -o ../illopc_audit.tsv

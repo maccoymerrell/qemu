@@ -1,0 +1,8 @@
+# ARC 3 -- UNREACHABLE rows refused at NO-TABLE-ENTRY(ILLOPC) that only ONE
+# decoder names.  A row here is NOT excused: it still has to pass leg (b), and
+# it still has to have no decoder CONTRADICT it.  What it admits is that the
+# probe's identity rests on a single observation.
+#
+# The reason on each line is the MEASUREMENT, not the plausibility.
+#
+c4e2fb49c0 BSRINIT: XED alone decodes it (LLVM MC 18, iced-x86 1.21, binutils objdump 2.42 and 2.45, and Capstone 6.0.0-Alpha7/a9 all refuse the bytes -- none of them carries the ACE extension). Independent of the decoder path, XED's own datafile ace-1/ace-1-isa.xed.txt declares PATTERN "VV1 0x49 VF2 norexr_prefix V0F38 MOD[0b11] MOD=3 REG[0b000] RM[nnn] W1 VL128 mode64 NOVSR", and the probe matches it field for field: map=2, pp=F2, W=1, L=0, opcode 0x49, mod=3, reg=0, vvvv=1111. The QEMU citation for this row is derived from the byte shape alone -- opcodes_0F38_00toEF[0x49] has no initializer -- so the UNREACHABLE verdict does not depend on the name being right.

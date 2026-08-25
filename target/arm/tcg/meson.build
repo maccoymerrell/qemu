@@ -2,7 +2,7 @@ gen_a64 = [
   decodetree.process('a64.decode', extra_args: ['--static-decode=disas_a64']),
   decodetree.process('sve.decode', extra_args: '--decode=disas_sve'),
   decodetree.process('sme.decode', extra_args: '--decode=disas_sme'),
-  decodetree.process('sme-fa64.decode', extra_args: '--static-decode=disas_sme_fa64'),
+  decodetree.process('sme-fa64.decode', extra_args: ['--static-decode=disas_sme_fa64', '--no-ident']),
 ]
 
 gen_a32 = [

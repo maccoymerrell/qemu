@@ -4376,6 +4376,336 @@ def apply_regs_one(info: IsaInfo) -> None:
     info.header.write_text(new_text)
 
 
+# ---------------------------------------------------------------------------
+# QEMU decode identity (decodetree targets)
+#
+# The rows above are keyed on a Capstone instruction id: what a
+# DISASSEMBLER says about the bytes.  The rows below are keyed on what
+# QEMU itself dispatched on -- the decodetree pattern that matched, i.e.
+# the trans_<name>() the translator called.  See
+# include/qemu/qemu-plugin.h (qemu_plugin_insn_decode_id) for the
+# exported contract and
+# cst_runs/p3/arc3/DECODE_IDENTITY_CONTRACT.md for the cross-target one.
+#
+# The universe of identities is read out of the GENERATED decoders in a
+# build directory rather than re-derived from the .decode sources here.
+# Re-deriving would mean reimplementing decodetree's name qualification
+# and its FNV-1a, and a second implementation of an identifier is a
+# second identifier.  The generated table is what QEMU compiled.
+# ---------------------------------------------------------------------------
+
+# ISA key -> the linux-user target whose generated decoders define that
+# ISA's identity universe.  x86 is absent on purpose: i386 does not use
+# decodetree, and its identity comes from the X86_OP_ENTRY table instead.
+QEMU_IDENT_TARGETS: dict[str, str] = {
+    "aarch64": "aarch64-linux-user",
+    "riscv": "riscv64-linux-user",
+    "mips": "mipsel-linux-user",
+}
+
+IDENT_ROW_RE = re.compile(
+    r'^\s*\{\s*(0x[0-9a-f]+)u,\s*"([^"]+)"\s*\},\s*/\*\s*(\S+):(\d+)\s*\*/')
+
+
+@dataclass(frozen=True)
+class QemuIdent:
+    ident: int
+    name: str            # "disas_a64/ADD_i" -- decoder-qualified
+    src_file: str
+    src_line: int
+
+    @property
+    def decoder(self) -> str:
+        return self.name.split("/", 1)[0]
+
+    @property
+    def pattern(self) -> str:
+        return self.name.split("/", 1)[1]
+
+
+def parse_qemu_identities(build_dir: Path, isa: str) -> list[QemuIdent]:
+    """Read the identity universe out of one target's generated decoders.
+
+    Fails loudly rather than reporting a small number: a missing build
+    directory and an ISA with no identities are indistinguishable in a
+    count, and only one of them is a fact about QEMU.
+    """
+    target = QEMU_IDENT_TARGETS.get(isa)
+    if target is None:
+        raise SystemExit(f"{isa}: not a decodetree target, no QEMU identity universe")
+    apdir = build_dir / f"libqemu-{target}.a.p"
+    if not apdir.is_dir():
+        raise SystemExit(f"{apdir} does not exist -- build {target} first")
+    files = sorted(apdir.glob("decode-*.c.inc"))
+    if not files:
+        raise SystemExit(f"no generated decoders under {apdir}")
+    rows: list[QemuIdent] = []
+    for path in files:
+        for line in path.read_text().splitlines():
+            m = IDENT_ROW_RE.match(line)
+            if m:
+                rows.append(QemuIdent(int(m.group(1), 16), m.group(2),
+                                      m.group(3), int(m.group(4))))
+    if not rows:
+        raise SystemExit(
+            f"{apdir}: decoders carry no identity rows -- the tree was built "
+            f"with the export disabled, so any census here would read as "
+            f"'no identity exists' when the truth is 'nothing was measured'")
+    # decodetree checks for hash collisions WITHIN one .decode file; it
+    # cannot check across files because each is a separate invocation.
+    # The uniqueness the plugin API promises is per TARGET, so it has to
+    # be checked here, where the whole target is in view.
+    by_id: dict[int, list[str]] = {}
+    for r in rows:
+        by_id.setdefault(r.ident, []).append(r.name)
+    clashes = {k: v for k, v in by_id.items() if len(set(v)) > 1}
+    if clashes:
+        for k, v in sorted(clashes.items()):
+            print(f"  IDENT COLLISION 0x{k:08x}: {', '.join(sorted(set(v)))}")
+        raise SystemExit(
+            f"{isa}: {len(clashes)} cross-decoder identity collisions -- "
+            f"two different decode rules share one id, which breaks the "
+            f"uniqueness qemu_plugin_insn_decode_id() promises")
+    return rows
+
+
+def load_observed(paths: list[Path]) -> dict[int, dict[str, object]]:
+    """Fold idprobe TSV records into id -> {name, mnemonics: Counter}.
+
+    An idprobe record is one OBSERVED decode: QEMU translated those bytes
+    and named the rule it used.  That is the evidence a mapping claim
+    needs; a pattern name that merely looks like a mnemonic is not.
+    """
+    import collections
+    obs: dict[int, dict[str, object]] = {}
+    total = 0
+    for p in paths:
+        for line in Path(p).read_text().splitlines():
+            f = line.split("\t")
+            if len(f) < 5:
+                continue
+            ident = int(f[1])
+            if ident == 0:
+                total += 1
+                obs.setdefault(0, {"name": "-",
+                                   "mnem": collections.Counter()})
+                obs[0]["mnem"][f[4].split()[0] if f[4].strip() else "?"] += 1
+                continue
+            e = obs.setdefault(ident, {"name": f[2],
+                                       "mnem": collections.Counter()})
+            e["mnem"][f[4].split()[0] if f[4].strip() else "?"] += 1
+            total += 1
+    if total == 0:
+        raise SystemExit("no idprobe records read -- refusing to census nothing")
+    return obs
+
+
+def _norm_mnemonic(text: str) -> str:
+    """Fold the two spellings of one mnemonic onto a single key.
+
+    A Capstone CONSTANT cannot contain a dot, so the riscv extension
+    separator is spelled `_` there (RISCV_INS_FMADD_D) and `.` in the
+    disassembly (fmadd.d).  Joining on the raw text silently misses
+    every dotted riscv mnemonic and reports the miss as "QEMU has no
+    identity for this", which is the opposite of what is true.
+    """
+    return text.lower().replace(".", "_")
+
+
+def _mnemonic_to_const(info: IsaInfo) -> dict[str, str]:
+    """mnemonic text -> Capstone constant, for the rows the tables key on."""
+    out: dict[str, str] = {}
+    for const in enum_constants(info):
+        out.setdefault(_norm_mnemonic(c_mnemonic(const, info.prefix)), const)
+    return out
+
+
+# Provenance tiers for a QEMU-identity row.  They are kept apart because
+# they are different strengths of evidence and collapsing them would let
+# a name that merely LOOKS like a mnemonic pass for a decode that was
+# actually seen.
+QID_OBSERVED = "QID_OBSERVED"        # QEMU decoded it; mnemonic seen with it
+QID_NAME_MATCHED = "QID_NAME_MATCHED"  # pattern name matches a Capstone
+                                       # mnemonic, but no decode observed
+QID_NONE = "QID_NONE"                  # neither
+
+
+def _pattern_mnemonic_candidates(pattern: str) -> list[str]:
+    """Spellings of a decodetree pattern name to try against Capstone.
+
+    decodetree names are QEMU-source identifiers, not mnemonics: ADD_i,
+    LDR_v_i, c_fsw.  The trailing _<suffix> parts name the FORM (immediate,
+    vector, register), which Capstone folds into the operands rather than
+    the mnemonic, so they are peeled one at a time.  Nothing here invents
+    a name: every candidate is a prefix of the name QEMU wrote.
+    """
+    p = pattern.lower()
+    out = [p]
+    while "_" in p:
+        p = p.rsplit("_", 1)[0]
+        out.append(p)
+    return out
+
+
+def qemu_ident_rows(info: IsaInfo, idents: list[QemuIdent],
+                    obs: dict[int, dict[str, object]]):
+    """Join the identity universe to the mnemonic tables.
+
+    Returns (rows, stats).  A row is
+    (QemuIdent, Entry, tier, mnemonics-observed).
+    """
+    m2c = _mnemonic_to_const(info)
+    rows = []
+    for ident in sorted(idents, key=lambda r: r.ident):
+        seen = obs.get(ident.ident)
+        mnems: list[str] = []
+        tier = QID_NONE
+        entry = Entry("GEN_OP_UNKNOWN")
+        if seen:
+            mnems = [m for m, _ in seen["mnem"].most_common()]
+            consts = [m2c[_norm_mnemonic(m)] for m in mnems
+                      if _norm_mnemonic(m) in m2c]
+            if consts:
+                tier = QID_OBSERVED
+                entry = classify(info, consts[0])
+        if tier == QID_NONE:
+            for cand in _pattern_mnemonic_candidates(ident.pattern):
+                if _norm_mnemonic(cand) in m2c:
+                    tier = QID_NAME_MATCHED
+                    entry = classify(info, m2c[_norm_mnemonic(cand)])
+                    break
+        rows.append((ident, entry, tier, mnems))
+    return rows
+
+
+def qemu_ident_header_text(info: IsaInfo, rows) -> str:
+    guard = f"CHAMPSIM_TRACER_QEMU_IDENT_{info.key.upper()}_H"
+    out = [
+        f"#ifndef {guard}",
+        f"#define {guard}",
+        "",
+        "/*",
+        f" * QEMU decode-table identity for {info.key} -- auto-generated by",
+        f" * {Path(__file__).name} --qemu-ident.  Do not hand-edit a row.",
+        " *",
+        " * Each row is one decodetree pattern: the rule QEMU's own decoder",
+        " * dispatched on, keyed by the id qemu_plugin_insn_decode_id()",
+        " * reports.  Rows are sorted by id so a consumer can bisect.",
+        " *",
+        " * .tier says what the classification rests on, and the tiers are",
+        " * NOT interchangeable:",
+        " *   QID_OBSERVED      QEMU was seen decoding through this rule and",
+        " *                     the disassembler named the result",
+        " *   QID_NAME_MATCHED  the pattern name matches a Capstone mnemonic;",
+        " *                     no decode through it was ever observed",
+        " *   QID_NONE          neither -- residue, classification unknown",
+        " *",
+        " * SPDX-License-Identifier: GPL-2.0-or-later",
+        " * Author: Maccoy Merrell",
+        " */",
+        "",
+        '#include "champsim_tracer_generic_ids.h"',
+        "",
+        "enum QemuIdentTier {",
+        "    QID_NONE = 0,",
+        "    QID_NAME_MATCHED,",
+        "    QID_OBSERVED,",
+        "};",
+        "",
+        "struct QemuIdentRow {",
+        "    uint32_t id;",
+        "    const char *name;",
+        "    GenericOpcode opcode;",
+        "    BranchType branch_type;",
+        "    QemuIdentTier tier;",
+        "};",
+        "",
+        f"static const QemuIdentRow qemu_ident_{info.key}[] = {{",
+    ]
+    for ident, entry, tier, mnems in rows:
+        note = ""
+        if mnems:
+            note = "  /* " + ", ".join(mnems[:4]) + " */"
+        out.append(f'    {{ 0x{ident.ident:08x}u, "{ident.name}", '
+                   f'{entry.op}, {entry.branch}, {tier} }},{note}')
+    out += [
+        "};",
+        "",
+        f"static const size_t qemu_ident_{info.key}_count =",
+        f"    sizeof(qemu_ident_{info.key}) / sizeof(qemu_ident_{info.key}[0]);",
+        "",
+        f"#endif /* {guard} */",
+        "",
+    ]
+    return "\n".join(out)
+
+
+def qemu_ident_census(info: IsaInfo, idents: list[QemuIdent],
+                      obs: dict[int, dict[str, object]], rows,
+                      max_lines: int) -> None:
+    import collections
+    key = info.key
+    print(f"===== {key}: QEMU decode identity vs mnemonic table =====")
+    decoders = collections.Counter(i.decoder for i in idents)
+    print(f"identity universe            : {len(idents)} patterns in "
+          f"{len(decoders)} decoders")
+    for d, n in decoders.most_common():
+        print(f"    {d:<24} {n}")
+
+    unident = obs.get(0)
+    total_obs = sum(sum(e["mnem"].values()) for e in obs.values())
+    n_unident = sum(unident["mnem"].values()) if unident else 0
+    print(f"observed translated insns    : {total_obs}")
+    print(f"    carrying a QEMU identity : {total_obs - n_unident} "
+          f"({100.0 * (total_obs - n_unident) / total_obs:.3f}%)")
+    print(f"    carrying NONE (id 0)     : {n_unident} "
+          f"({100.0 * n_unident / total_obs:.3f}%)")
+    exercised = [i for i in idents if i.ident in obs]
+    print(f"identities exercised         : {len(exercised)} of {len(idents)}")
+
+    tiers = collections.Counter(t for _, _, t, _ in rows)
+    print("row provenance:")
+    for t in (QID_OBSERVED, QID_NAME_MATCHED, QID_NONE):
+        print(f"    {t:<18} {tiers.get(t, 0)}")
+
+    # Cardinality of the mnemonic <-> identity correspondence, counted
+    # only over decodes that were OBSERVED.  A name-matched row asserts
+    # nothing about cardinality and is excluded on purpose.
+    id2mn: dict[int, set] = {}
+    mn2id: dict[str, set] = {}
+    for ident, _, tier, mnems in rows:
+        if tier != QID_OBSERVED:
+            continue
+        id2mn[ident.ident] = set(mnems)
+        for m in mnems:
+            mn2id.setdefault(m, set()).add(ident.ident)
+    one_one = sum(1 for i, ms in id2mn.items()
+                  if len(ms) == 1 and len(mn2id[next(iter(ms))]) == 1)
+    many_one = sorted(((i, ms) for i, ms in id2mn.items() if len(ms) > 1),
+                      key=lambda x: -len(x[1]))
+    one_many = sorted(((m, ids) for m, ids in mn2id.items() if len(ids) > 1),
+                      key=lambda x: -len(x[1]))
+    print(f"observed correspondence over {len(id2mn)} exercised identities:")
+    print(f"    1:1  identity <-> mnemonic          : {one_one}")
+    print(f"    N:1  one identity, many mnemonics   : {len(many_one)}")
+    print(f"    1:N  one mnemonic, many identities  : {len(one_many)}")
+    for i, ms in many_one[:max_lines]:
+        nm = next(r.name for r in idents if r.ident == i)
+        print(f"        {nm:<28} {len(ms)}: {', '.join(sorted(ms)[:8])}")
+    for m, ids in one_many[:max_lines]:
+        names = sorted(next(r.name for r in idents if r.ident == i)
+                       for i in ids)
+        print(f"        {m:<16} {len(ids)}: {', '.join(names[:6])}")
+
+    # The residue, BY NAME.  A count would hide which rules the tracer
+    # would have nothing to say about.
+    residue = [ident for ident, _, tier, _ in rows if tier == QID_NONE]
+    print(f"RESIDUE -- identities with no mnemonic correspondence at all: "
+          f"{len(residue)}")
+    for ident in residue:
+        print(f"    {ident.name}  ({ident.src_file}:{ident.src_line})")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--isa", choices=sorted(ISAS), action="append", help="limit to one ISA; repeatable")
@@ -4383,11 +4713,38 @@ def main() -> int:
     parser.add_argument("--apply", action="store_true", help="rewrite mnemonic tables in place")
     parser.add_argument("--regs", action="store_true", help="audit/rewrite register tables instead of instruction tables")
     parser.add_argument("--max-lines", type=int, default=40, help="maximum diff rows per section")
+    parser.add_argument("--qemu-ident", action="store_true",
+                        help="census/regenerate tables keyed on QEMU's own decode identity "
+                             "(decodetree targets only)")
+    parser.add_argument("--build-dir", type=Path,
+                        help="QEMU build directory holding the generated decoders "
+                             "(required with --qemu-ident)")
+    parser.add_argument("--observed", type=Path, nargs="*", default=[],
+                        help="idprobe TSV files supplying OBSERVED decodes")
     args = parser.parse_args()
     if not args.diff and not args.apply:
         parser.error("choose --diff and/or --apply")
+    if args.qemu_ident and args.build_dir is None:
+        parser.error("--qemu-ident needs --build-dir")
     keys = args.isa or sorted(ISAS)
     total = 0
+    if args.qemu_ident:
+        for key in keys:
+            if key not in QEMU_IDENT_TARGETS:
+                print(f"===== {key}: not a decodetree target, skipped =====")
+                continue
+            info = ISAS[key]
+            idents = parse_qemu_identities(args.build_dir, key)
+            obs = load_observed(list(args.observed)) if args.observed else {}
+            rows = qemu_ident_rows(info, idents, obs)
+            if args.diff:
+                qemu_ident_census(info, idents, obs, rows,
+                                  max_lines=args.max_lines)
+            if args.apply:
+                out = PLUGIN_DIR / f"champsim_tracer_qemu_ident_{key}.h"
+                out.write_text(qemu_ident_header_text(info, rows))
+                print(f"wrote {out}")
+        return 0
     if args.diff:
         for key in keys:
             if args.regs:

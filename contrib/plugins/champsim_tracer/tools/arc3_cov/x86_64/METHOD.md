@@ -111,3 +111,38 @@ an instruction QEMU implements only at CPL 0 would SIGILL here for the
 privilege rather than for the opcode.  Every SIGILL row was cross-checked
 against `decode-new.c.inc` and is absent from it entirely, so the two agree
 today; a future divergence is a finding, not a footnote.
+
+## A GREEN isaxcheck GATE IS NOT A MEASUREMENT OF THIS ARM
+
+Recorded because it went wrong, in the verdict document itself, and the shape
+is general rather than x86-specific.
+
+`isaxcheck --isa=... --layer={boundary,fields}` and this attribution arm are
+two instruments reading two different things.  The gate sweeps encodings and
+compares the tracer against LLVM through an allowlist; the arm compares the
+tracer's `InsnFields` against XED/LLVM/iced over the opcode DENOMINATOR, out
+of `tracer_batch.tsv` on disk.  `compare_attrib.py` NEVER re-probes: it reads
+whatever tracer snapshot the working directory happens to hold.
+
+Measured 2026-08-25: `0acd1e32e5` gave the x87 control word its own generic
+id and `fa05561046` changed what `FSTENV` writes.  Both verified themselves
+against the gate, which was green, is green, and says nothing about this arm.
+Re-probing at HEAD moved **119 of the 8,880 rows**, and the published verdict
+— computed from a table written four hours before those commits — read
+`6182 COVERED / 2698 UNREACHABLE / 0 UNCOVERED` where the tip read
+`6065 / 2698 / 117`.
+
+SO: any change that touches `disas/capstone.c`, `champsim_tracer_decode.cc`,
+the generic register ids or a per-ISA mnemonic table must re-run the
+ATTRIBUTION arm of every affected ISA, not only the gate.  The four entry
+points are
+
+    x86_64   isaxcheck --isa=x86_64 --layer=fields --batch < probe_uniq.hex
+             > tracer_batch.tsv ; python compare_attrib.py ; python qemu_reach_matrix.py
+    aarch64  python ../aarch64/reprobe.py <isaxcheck> ; python ../aarch64/compare.py
+    riscv64  python ../riscv64/attrib/compare.py
+    mipsel   python ../mipsel/attrib/emit.py
+
+and `coverage_report.py` afterwards.  The tell that this was skipped is a
+verdict whose numbers match the previous document exactly across a commit that
+changed the decode.

@@ -1079,11 +1079,33 @@ void decode_detail_to_generic(uint64_t pc,
              * Count against the template-static MAX load/store totals,
              * which bound the dep-mask layout (loads at bits
              * [n_src_regs, n_src_regs+max_dep_loads); stores feed
-             * store_data_dep_mask[max_dep_stores]).  Runtime
-             * per-iteration counts can be smaller (conditional load
-             * that didn't fire) via CST_FID_N_LOADS/N_STORES, never
-             * larger.  LEA / prefetch-hint MEM operands lack both
-             * READ and WRITE — no real memop, don't count.
+             * store_data_dep_mask[max_dep_stores]).  LEA / prefetch-hint
+             * MEM operands lack both READ and WRITE — no real memop,
+             * don't count.
+             *
+             * THIS IS A COUNT OF STATIC MEMORY OPERANDS, NOT OF
+             * ACCESSES, and the runtime count is routinely LARGER.  One
+             * operand expands into as many architectural accesses as the
+             * form performs: `ld4 {v0.16b-v3.16b}, [x1]` is one Capstone
+             * MEM operand and was OBSERVED publishing 64 memops covering
+             * exactly 0x4919c0..0x4919ff, with `Memops over slot ceiling`
+             * and `CP orphan memops dropped` both 0
+             * (cst_runs/p3/arc3/staticdyn).  The comment that used to sit
+             * here said the runtime count could be smaller "never
+             * larger", which contradicted the header that defines these
+             * fields — champsim_tracer_mnemonics.h says in as many words
+             * that they are "deliberately NOT the same quantity" and
+             * names x86 XSAVEOPT, one static store operand issuing 88
+             * stores.  The header is right; the invariant was never true.
+             *
+             * The array this sizes is the per-STATIC-OPERAND address
+             * dependency (load_addr_dep_mask[] / store_addr_dep_mask[]),
+             * and one mask describes every access the operand expands
+             * into, because they all compute their address from the same
+             * input registers.  The per-ACCESS stream rides
+             * CST_FID_N_LOADS / CST_FID_N_STORES up to
+             * CST_FID_SLOT_COUNT, whose overflow has its own must-be-0
+             * counter (stats' memops_over_slot_ceiling).
              */
             if (op->access & QEMU_PLUGIN_OP_ACC_READ) {
                 if (out->max_dep_loads < MAX_LOADS) {

@@ -243,6 +243,25 @@ def mask(val, w):
     return val & ((1 << (8 * w)) - 1) if 0 < w < 8 else val
 
 
+def render(v):
+    """A stable text form for a row's two sides.
+
+    ``repr`` of a ``set``/``frozenset`` follows hash order, which CPython
+    randomises per process, so two identical measurements produced TSVs that
+    differed on 24 of 49 aarch64 rows for no reason but ``PYTHONHASHSEED``.
+    A reference nobody can diff against the last run is a reference nobody can
+    check.  Sorting by the printed form makes the ordering a property of the
+    content.
+    """
+    if isinstance(v, (set, frozenset)):
+        return '{%s}' % ', '.join(sorted(render(x) for x in v))
+    if isinstance(v, tuple):
+        return '(%s)' % ', '.join(render(x) for x in v)
+    if isinstance(v, list):
+        return '[%s]' % ', '.join(render(x) for x in v)
+    return repr(v)
+
+
 Disagreement = collections.namedtuple(
     'Disagreement', 'pc axis ref trc relation label')
 
@@ -564,7 +583,7 @@ def main():
                                d.axis, lab, d.relation, rule)
                 all_rows.append(row)
                 raw.append((os.path.basename(guest), d.pc, d.axis, d.relation,
-                            d.label or '', repr(d.ref), repr(d.trc),
+                            d.label or '', render(d.ref), render(d.trc),
                             r.disas))
 
     out = []

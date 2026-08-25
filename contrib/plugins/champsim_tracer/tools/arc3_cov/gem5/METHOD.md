@@ -278,3 +278,18 @@ through a pipe:
 Every decision the harness took about the loader path is written to
 `<outdir>/PREREQ.txt`, and gem5's own console output per guest to
 `<outdir>/<guest>.gem5.out`.
+
+## Determinism
+
+`rows.tsv` renders sets through `render()` rather than `repr()`.  CPython
+randomises `set` iteration order per process, and two byte-identical
+measurements previously produced TSVs differing on 24 of 49 aarch64 rows for
+no reason but `PYTHONHASHSEED`.  A reference nobody can diff against the last
+run is a reference nobody can check.  Verified across `PYTHONHASHSEED=1` and
+`PYTHONHASHSEED=12345`: `REPORT.txt` identical, `rows.tsv` identical.
+
+One row is *legitimately* not reproducible, and it is already adjudicated:
+`mrs x4, cntvct_el0` in `p_hint` reads the virtual counter, so the tracer
+publishes a fresh nanosecond timestamp every run while gem5 publishes 0.  Its
+category (`IMPLDEF-MACHINE-VALUE`), direction (`TRACER-SUBSET`) and its
+contribution to every headline are constant; only the printed value moves.

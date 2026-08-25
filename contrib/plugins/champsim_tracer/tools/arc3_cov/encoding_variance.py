@@ -132,6 +132,45 @@ def arity(row):
     return (src, dst)
 
 
+def mechanism(own, other):
+    """WHICH part of the dataflow moved, named.
+
+    Reported as a histogram rather than left to a reader of 545 signature
+    pairs.  The order is deliberate: a different generic opcode or branch
+    class is a bigger disagreement than a different register file, and a
+    register file is bigger than the disappearance of a general-purpose
+    operand -- so the FIRST field that differs names the row.
+    """
+    if own[:4] != other[:4]:
+        return 'CLASS-OR-BRANCH'
+    if own[4] != other[4] or own[5] != other[5]:
+        return 'MEMORY-FORM'
+    if own[6] != other[6]:
+        return 'LANE-MASK-FORM'
+    diff = (set(own[7]) ^ set(other[7])) | (set(own[8]) ^ set(other[8]))
+    if any(('SYS' in d or 'FCSR' in d or 'COPROC' in d or 'CTRL' in d
+            or 'DEBUG' in d) for d in diff):
+        return 'SYSTEM-SELECTOR'
+    if diff and diff <= set(('REG_SEG',)):
+        # x86 only, and the biggest single class there: a segment-override
+        # PREFIX is inside the iform's free space -- `64 d9 23` and
+        # `66 d9 20` are both three bytes and both `fldenv` -- and the
+        # prefixed form really does read a segment base the unprefixed one
+        # does not.  The tracer is right about both; the ROW stands for both
+        # and its one representative encoding proved only one.
+        return 'SEGMENT-OVERRIDE-PREFIX'
+    if diff and diff <= set(('REG_FPR', 'REG_VEC')):
+        # The vector-LENGTH field of a VEX/EVEX encoding is inside the row's
+        # free space, and the tracer gives the 128-bit register file and the
+        # wider one different generic ids -- `pabsb %xmm` writes REG_FPR and
+        # the 256/512-bit form writes REG_VEC.  Right on both, and the row
+        # covers both with one probe.
+        return 'VECTOR-WIDTH-FIELD'
+    if diff and diff <= set(('REG_GPR',)):
+        return 'ZERO-REGISTER-OPERAND'
+    return 'OTHER-REGISTER-FILE'
+
+
 def batch(isaxcheck, isa, encodings):
     """{hex: {column: value}} for every encoding, one process for the lot."""
     if not encodings:
@@ -331,6 +370,7 @@ def main():
 
     fals_fired = False
     disagree, crossed, per_row = [], [], {}
+    rowsig, rowverd, rowmech = {}, {}, {}
     for rid, _mn, h in rows:
         b0 = base.get(h)
         if not b0 or b0['f_ok'] != '1':
@@ -338,6 +378,7 @@ def main():
         sigs = collections.defaultdict(list)
         ars = set()
         sigs[signature(b0)].append(h)
+        rowsig[rid] = signature(b0)
         ars.add(arity(b0))
         # The falsifier must land on a sample the SIBLING RULE cannot explain
         # away, or the control proves nothing about the detector: a corrupted
@@ -384,8 +425,12 @@ def main():
             if unexplained:
                 unexplained[own] = sigs[own]
                 disagree.append((rid, b0['b_mnem'], unexplained))
+                rowverd[rid] = 'DISAGREE'
+                rowmech[rid] = ','.join(sorted(set(
+                    mechanism(own, sg) for sg in unexplained if sg != own)))
             else:
                 crossed.append((rid, b0['b_mnem'], len(sigs) - 1))
+                rowverd[rid] = 'CROSSED-TO-SIBLING'
 
     # ---------------------------------------------------------------- report
     out, w = [], None
@@ -456,6 +501,17 @@ def main():
       % sum(1 for _r, (_f, _s, _g, ar) in per_row.items() if ar > 1))
     w('')
     if disagree:
+        mech = collections.Counter()
+        for _rid, _mn, sigs in disagree:
+            own = rowsig[_rid]
+            for sig in sigs:
+                if sig != own:
+                    mech[mechanism(own, sig)] += 1
+        w('WHAT MOVED, over every disagreeing row (one count per extra')
+        w('signature, so a row with three signatures contributes two):')
+        for k, n in mech.most_common():
+            w('  %-26s %6d' % (k, n))
+        w('')
         w('EVERY DISAGREEING ROW, with the signatures it produced:')
         for rid, mnem, sigs in disagree[:80]:
             w('  %-40s %s   %d signatures' % (rid, mnem, len(sigs)))
@@ -481,14 +537,16 @@ def main():
     if a.tsv:
         with open(a.tsv, 'w') as fh:
             fh.write('opcode_id\tmnemonic\tfree_bits\tencodings_bound\t'
-                     'accepted\tsignatures\tarities\tverdict\n')
+                     'accepted\tsignatures\tarities\tverdict\t'
+                     'mechanism\n')
             for rid, mn, _h in rows:
                 if rid not in per_row:
                     continue
                 fb, acc, sg, ar = per_row[rid]
-                fh.write('%s\t%s\t%d\t%d\t%d\t%d\t%d\t%s\n'
+                fh.write('%s\t%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\n'
                          % (rid, mn, fb, 2 ** fb, acc, sg, ar,
-                            'DISAGREE' if sg > 1 else 'invariant'))
+                            rowverd.get(rid, 'invariant'),
+                            rowmech.get(rid, '')))
 
     if a.falsify:
         if not fals_fired:

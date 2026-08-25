@@ -173,6 +173,8 @@
     .op2 = glue(X86_TYPE_, op2_),                                 \
     .s2 = glue(X86_SIZE_, s2_),                                   \
     .is_decode = true,                                            \
+    .mnemonic = #op,                                              \
+    .slot = __LINE__,                                             \
     ## __VA_ARGS__                                                \
 }
 
@@ -195,6 +197,8 @@
     .s1 = glue(X86_SIZE_, s1_),                                   \
     .op2 = glue(X86_TYPE_, op2_),                                 \
     .s2 = glue(X86_SIZE_, s2_),                                   \
+    .mnemonic = #op,                                              \
+    .slot = __LINE__,                                             \
     ## __VA_ARGS__                                                \
 }
 
@@ -224,6 +228,39 @@
     X86_OP_ENTRY3(op, op0, s0, 2op, s0, None, None, ## __VA_ARGS__)
 #define X86_OP_ENTRY0(op, ...)                                    \
     X86_OP_ENTRY3(op, None, None, None, None, None, None, ## __VA_ARGS__)
+
+/*
+ * A decode function that picks the leaf generator itself -- instead of
+ * copying a whole X86_OP_ENTRY row over the entry -- has to state the
+ * leaf's identity too, or the entire group collapses onto the group
+ * row's own slot.  decode_group1 alone would make ADD, OR, ADC, SBB,
+ * AND, SUB, XOR and CMP a single identity, and those are the most
+ * frequently executed instructions there are.
+ */
+#define X86_OP_SET_GEN(entry_, op)                                \
+    do {                                                          \
+        (entry_)->gen = glue(gen_, op);                           \
+        (entry_)->mnemonic = #op;                                 \
+        (entry_)->slot = __LINE__;                                \
+    } while (0)
+
+#define X86_OP_CLEAR_GEN(entry_)                                  \
+    do {                                                          \
+        (entry_)->gen = NULL;                                     \
+        (entry_)->mnemonic = NULL;                                \
+        (entry_)->slot = 0;                                       \
+    } while (0)
+
+/* One row of a group decoder's leaf table; see X86OpLeaf. */
+#define X86_OP_LEAF(op)     { glue(gen_, op), #op, __LINE__ }
+#define X86_OP_LEAF_NONE    { NULL, NULL, 0 }
+
+#define X86_OP_SET_LEAF(entry_, leaf_)                            \
+    do {                                                          \
+        (entry_)->gen = (leaf_).gen;                              \
+        (entry_)->mnemonic = (leaf_).mnemonic;                    \
+        (entry_)->slot = (leaf_).slot;                            \
+    } while (0)
 
 #define cpuid(feat) .cpuid = X86_FEAT_##feat,
 #define nolea .special = X86_SPECIAL_NoLoadEA,
@@ -303,12 +340,18 @@ static inline const X86OpEntry *decode_by_prefix(DisasContext *s, const X86OpEnt
 
 static void decode_group8(DisasContext *s, CPUX86State *env, X86OpEntry *entry, uint8_t *b)
 {
-    static const X86GenFunc group8_gen[8] = {
-        NULL, NULL, NULL, NULL,
-        gen_BT, gen_BTS, gen_BTR, gen_BTC,
+    static const X86OpLeaf group8_gen[8] = {
+        X86_OP_LEAF_NONE,
+        X86_OP_LEAF_NONE,
+        X86_OP_LEAF_NONE,
+        X86_OP_LEAF_NONE,
+        X86_OP_LEAF(BT),
+        X86_OP_LEAF(BTS),
+        X86_OP_LEAF(BTR),
+        X86_OP_LEAF(BTC),
     };
     int op = (get_modrm(s, env) >> 3) & 7;
-    entry->gen = group8_gen[op];
+    X86_OP_SET_LEAF(entry, group8_gen[op]);
     if (op == 4) {
         /* prevent writeback and LOCK for BT */
         entry->op1 = entry->op0;
@@ -382,11 +425,14 @@ static void decode_group15(DisasContext *s, CPUX86State *env, X86OpEntry *entry,
 
 static void decode_group17(DisasContext *s, CPUX86State *env, X86OpEntry *entry, uint8_t *b)
 {
-    static const X86GenFunc group17_gen[8] = {
-        NULL, gen_BLSR, gen_BLSMSK, gen_BLSI,
+    static const X86OpLeaf group17_gen[8] = {
+        X86_OP_LEAF_NONE,
+        X86_OP_LEAF(BLSR),
+        X86_OP_LEAF(BLSMSK),
+        X86_OP_LEAF(BLSI),
     };
     int op = (get_modrm(s, env) >> 3) & 7;
-    entry->gen = group17_gen[op];
+    X86_OP_SET_LEAF(entry, group17_gen[op]);
 }
 
 static void decode_group12(DisasContext *s, CPUX86State *env, X86OpEntry *entry, uint8_t *b)
@@ -467,12 +513,12 @@ static void decode_0F70(DisasContext *s, CPUX86State *env, X86OpEntry *entry, ui
 static void decode_0F77(DisasContext *s, CPUX86State *env, X86OpEntry *entry, uint8_t *b)
 {
     if (!(s->prefix & PREFIX_VEX)) {
-        entry->gen = gen_EMMS;
+        X86_OP_SET_GEN(entry, EMMS);
     } else if (!s->vex_l) {
-        entry->gen = gen_VZEROUPPER;
+        X86_OP_SET_GEN(entry, VZEROUPPER);
         entry->vex_class = 8;
     } else {
-        entry->gen = gen_VZEROALL;
+        X86_OP_SET_GEN(entry, VZEROALL);
         entry->vex_class = 8;
     }
 }
@@ -491,11 +537,11 @@ static void decode_0F78(DisasContext *s, CPUX86State *env, X86OpEntry *entry, ui
 static void decode_0F79(DisasContext *s, CPUX86State *env, X86OpEntry *entry, uint8_t *b)
 {
     if (s->prefix & PREFIX_REPNZ) {
-        entry->gen = gen_INSERTQ_r; /* AMD extension */
+        X86_OP_SET_GEN(entry, INSERTQ_r); /* AMD extension */
     } else if (s->prefix & PREFIX_DATA) {
-        entry->gen = gen_EXTRQ_r; /* AMD extension */
+        X86_OP_SET_GEN(entry, EXTRQ_r); /* AMD extension */
     } else {
-        entry->gen = NULL;
+        X86_OP_CLEAR_GEN(entry);
     };
 }
 
@@ -1076,7 +1122,11 @@ static void decode_VxCOMISx(DisasContext *s, CPUX86State *env, X86OpEntry *entry
      * which X86_VEX_REPScalar exists, but here it has to be decoded by hand.
      */
     entry->s1 = entry->s2 = (s->prefix & PREFIX_DATA ? X86_SIZE_sd : X86_SIZE_ss);
-    entry->gen = (*b == 0x2E ? gen_VUCOMI : gen_VCOMI);
+    if (*b == 0x2E) {
+        X86_OP_SET_GEN(entry, VUCOMI);
+    } else {
+        X86_OP_SET_GEN(entry, VCOMI);
+    }
 }
 
 static void decode_sse_unary(DisasContext *s, CPUX86State *env, X86OpEntry *entry, uint8_t *b)
@@ -1086,9 +1136,9 @@ static void decode_sse_unary(DisasContext *s, CPUX86State *env, X86OpEntry *entr
         entry->s1 = X86_SIZE_None;
     }
     switch (*b) {
-    case 0x51: entry->gen = gen_VSQRT; break;
-    case 0x52: entry->gen = gen_VRSQRT; break;
-    case 0x53: entry->gen = gen_VRCP; break;
+    case 0x51: X86_OP_SET_GEN(entry, VSQRT); break;
+    case 0x52: X86_OP_SET_GEN(entry, VRSQRT); break;
+    case 0x53: X86_OP_SET_GEN(entry, VRCP); break;
     }
 }
 
@@ -1140,7 +1190,7 @@ static void decode_MOV_CR_DR(DisasContext *s, CPUX86State *env, X86OpEntry *entr
     get_modrm(s, env);
     s->modrm |= 0xC0;
 
-    entry->gen = gen_MOV;
+    X86_OP_SET_GEN(entry, MOV);
 }
 
 static const X86OpEntry opcodes_0F[256] = {
@@ -1457,11 +1507,18 @@ static void decode_63(DisasContext *s, CPUX86State *env, X86OpEntry *entry, uint
 
 static void decode_group1(DisasContext *s, CPUX86State *env, X86OpEntry *entry, uint8_t *b)
 {
-    static const X86GenFunc group1_gen[8] = {
-        gen_ADD, gen_OR, gen_ADC, gen_SBB, gen_AND, gen_SUB, gen_XOR, gen_SUB,
+    static const X86OpLeaf group1_gen[8] = {
+        X86_OP_LEAF(ADD),
+        X86_OP_LEAF(OR),
+        X86_OP_LEAF(ADC),
+        X86_OP_LEAF(SBB),
+        X86_OP_LEAF(AND),
+        X86_OP_LEAF(SUB),
+        X86_OP_LEAF(XOR),
+        X86_OP_LEAF(SUB),  /* CMP: same generator, its own row */
     };
     int op = (get_modrm(s, env) >> 3) & 7;
-    entry->gen = group1_gen[op];
+    X86_OP_SET_LEAF(entry, group1_gen[op]);
 
     if (op == 7) {
         /* prevent writeback for CMP */
@@ -1480,7 +1537,7 @@ static void decode_group1A(DisasContext *s, CPUX86State *env, X86OpEntry *entry,
         /* could be XOP prefix too */
         *entry = UNKNOWN_OPCODE;
     } else {
-        entry->gen = gen_POP;
+        X86_OP_SET_GEN(entry, POP);
         /* The address must use the value of ESP after the pop.  */
         s->popl_esp_hack = 1 << mo_pushpop(s, s->dflag);
     }
@@ -1488,12 +1545,18 @@ static void decode_group1A(DisasContext *s, CPUX86State *env, X86OpEntry *entry,
 
 static void decode_group2(DisasContext *s, CPUX86State *env, X86OpEntry *entry, uint8_t *b)
 {
-    static const X86GenFunc group2_gen[8] = {
-        gen_ROL, gen_ROR, gen_RCL, gen_RCR,
-        gen_SHL, gen_SHR, gen_SHL /* SAL, undocumented */, gen_SAR,
+    static const X86OpLeaf group2_gen[8] = {
+        X86_OP_LEAF(ROL),
+        X86_OP_LEAF(ROR),
+        X86_OP_LEAF(RCL),
+        X86_OP_LEAF(RCR),
+        X86_OP_LEAF(SHL),
+        X86_OP_LEAF(SHR),
+        X86_OP_LEAF(SHL),  /* SAL, undocumented: its own row */
+        X86_OP_LEAF(SAR),
     };
     int op = (get_modrm(s, env) >> 3) & 7;
-    entry->gen = group2_gen[op];
+    X86_OP_SET_LEAF(entry, group2_gen[op]);
     if (op == 7) {
         entry->special = X86_SPECIAL_SExtT0;
     } else {
@@ -1559,7 +1622,7 @@ static void decode_group11(DisasContext *s, CPUX86State *env, X86OpEntry *entry,
     if (op != 0) {
         *entry = UNKNOWN_OPCODE;
     } else {
-        entry->gen = gen_MOV;
+        X86_OP_SET_GEN(entry, MOV);
     }
 }
 
@@ -2830,6 +2893,14 @@ static void disas_insn(DisasContext *s, CPUState *cpu)
         !(s->prefix & (PREFIX_REPZ | PREFIX_REPNZ | PREFIX_DATA))) {
         gen_helper_enter_mmx(tcg_env);
     }
+
+    /*
+     * Every #UD / #GP check is behind us and this is the row QEMU is
+     * about to generate code from, so it is the row to publish.  Doing
+     * it earlier would hand plugins an identity for an instruction that
+     * faults instead of executing.
+     */
+    plugin_gen_record_insn_identity(decode.e.slot, decode.e.mnemonic);
 
     if (decode.e.special != X86_SPECIAL_NoLoadEA &&
         (decode.op[0].has_ea || decode.op[1].has_ea || decode.op[2].has_ea)) {

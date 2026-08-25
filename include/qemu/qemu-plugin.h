@@ -243,6 +243,13 @@ typedef uint64_t qemu_plugin_id_t;
  *   plugin can sample per-vCPU state (e.g. read guest memory through
  *   that vCPU's current address space) without cross-thread reads.
  *
+ * version 24:
+ * - added qemu_plugin_insn_decode_id and qemu_plugin_insn_decode_name:
+ *   QEMU's OWN decode-table identity for an instruction -- the slot
+ *   the target decoder dispatched on, and that slot's name in QEMU
+ *   source vocabulary.  This is what QEMU executed, as opposed to what
+ *   a disassembler says about the same bytes.
+ *
  * Where an entry above says a signature changed WITHOUT the version
  * constant moving, the version in force at the time names two
  * incompatible spellings of the same symbol and cannot be honoured
@@ -254,7 +261,7 @@ typedef uint64_t qemu_plugin_id_t;
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 23
+#define QEMU_PLUGIN_VERSION 24
 
 /*
  * The two values a signed vCPU index takes when it is not an index.
@@ -772,6 +779,68 @@ void *qemu_plugin_insn_haddr(const struct qemu_plugin_insn *insn);
  */
 QEMU_PLUGIN_API
 uint64_t qemu_plugin_insn_branch_target_pc(const struct qemu_plugin_insn *insn);
+
+
+/**
+ * qemu_plugin_insn_decode_id() - QEMU's decode-table slot for @insn
+ * @insn: opaque instruction handle from qemu_plugin_tb_get_insn()
+ *
+ * Returns the identifier of the decode-table slot QEMU's own target
+ * decoder dispatched on when it translated @insn -- the i386
+ * X86_OP_ENTRY row, the decodetree pattern, whichever the target uses.
+ * It is the identity QEMU acted on, not a disassembler's opinion of
+ * the same bytes.
+ *
+ * The value guarantees exactly three things and nothing more:
+ *
+ *  - instructions decoded through DIFFERENT slots get DIFFERENT ids
+ *  - instructions decoded through the SAME slot get the SAME id
+ *  - 0 means the target recorded no identity for this instruction
+ *
+ * It is stable for a given QEMU source tree and NOT stable across
+ * source edits, NOT dense, and NOT comparable between targets.  Do not
+ * persist it as a cross-version key; persist the name beside it, or a
+ * mapping the consumer builds itself.
+ *
+ * Returns: slot identifier, or 0 if the target recorded none.
+ */
+QEMU_PLUGIN_API
+uint32_t qemu_plugin_insn_decode_id(const struct qemu_plugin_insn *insn);
+
+/**
+ * qemu_plugin_insn_decode_name() - name of the decode-table slot
+ * @insn: opaque instruction handle from qemu_plugin_tb_get_insn()
+ *
+ * Returns the slot's name in QEMU's own source vocabulary: the `op`
+ * argument of the i386 X86_OP_ENTRY (so the gen_<op> it dispatches
+ * to), the decodetree pattern name (so the trans_<name> it dispatches
+ * to) elsewhere.  The string is a compile-time constant owned by QEMU
+ * and outlives the plugin; it must not be freed.
+ *
+ * THE NAME IS NOT UNIQUE, and it is not a mnemonic either.  On
+ * x86_64, 472 of the 854 decode-table slots share their name with at
+ * least one other slot -- `MOV` names 35 of them and `Jcc` names 32 --
+ * and over a mixed user-mode workload 85.6% of translated instructions
+ * carried a name that did not determine which slot decoded them.
+ * Worse, a slot's name is the generator QEMU dispatches to, which is
+ * not always the instruction: `cmp` decodes through slots named `SUB`
+ * and `test` through a slot named `AND`, because QEMU implements them
+ * with the flag-setting half of those generators and writes the
+ * discarded destination out of the row (X86_OP_ENTRYrr).  A consumer
+ * that tells decode rules apart by name alone is wrong by
+ * construction; pair it with qemu_plugin_insn_decode_id(), which is
+ * the unique half.
+ *
+ * Where a target's table itself is coarse the name is coarse with it,
+ * and that is reported rather than papered over: on i386 the whole x87
+ * escape space (root opcodes 0xD8..0xDF) is eight slots that all name
+ * `x87`, because gen_x87 switches on the modrm byte internally and
+ * QEMU's table has no finer identity to give.
+ *
+ * Returns: slot name, or NULL if the target recorded no identity.
+ */
+QEMU_PLUGIN_API
+const char *qemu_plugin_insn_decode_name(const struct qemu_plugin_insn *insn);
 
 /**
  * typedef qemu_plugin_meminfo_t - opaque memory transaction handle

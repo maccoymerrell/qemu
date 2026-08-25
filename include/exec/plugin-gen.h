@@ -44,6 +44,24 @@ void plugin_gen_disable_mem_helpers(void);
  */
 void plugin_gen_record_branch_target(uint64_t target_pc);
 
+/*
+ * plugin_gen_record_insn_identity: state QEMU's own decode-table
+ * identity for the instruction currently being translated.
+ *
+ * @id:   the decode-table SLOT.  Unique per slot within one build of
+ *        one target; 0 is reserved for "no identity".  Not stable
+ *        across source edits and not comparable across targets.
+ * @name: the slot's name in QEMU's own source vocabulary -- the
+ *        `op` of an X86_OP_ENTRY on i386, the decodetree pattern name
+ *        elsewhere.  Stable and greppable, but NOT unique: several
+ *        slots routinely share one name.
+ *
+ * Called by target translators at the point the slot is selected,
+ * immediately before code is generated from it.  Plugins consume the
+ * pair via qemu_plugin_insn_decode_id() / _decode_name().
+ */
+void plugin_gen_record_insn_identity(uint32_t id, const char *name);
+
 #else /* !CONFIG_PLUGIN */
 
 static inline
@@ -66,6 +84,10 @@ static inline void plugin_gen_disable_mem_helpers(void)
 { }
 
 static inline void plugin_gen_record_branch_target(uint64_t target_pc)
+{ }
+
+static inline void plugin_gen_record_insn_identity(uint32_t id,
+                                                   const char *name)
 { }
 
 #endif /* CONFIG_PLUGIN */

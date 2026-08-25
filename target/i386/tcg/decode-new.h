@@ -276,6 +276,20 @@ typedef void (*X86DecodeFunc)(struct DisasContext *s, CPUX86State *env, X86OpEnt
 /* Code generation function.  */
 typedef void (*X86GenFunc)(struct DisasContext *s, X86DecodedInsn *decode);
 
+/*
+ * A leaf generator together with the identity of the row that names
+ * it.  Group decoders index small tables of these instead of bare
+ * X86GenFunc, so that picking the generator also picks the identity;
+ * a bare function pointer cannot say which of a group's eight rows
+ * chose it, and two rows can legitimately share one generator
+ * (group1's SUB serves both SUB and CMP).
+ */
+typedef struct X86OpLeaf {
+    X86GenFunc  gen;
+    const char *mnemonic;
+    uint16_t    slot;
+} X86OpLeaf;
+
 struct X86OpEntry {
     /* Based on the is_decode flags.  */
     union {
@@ -302,6 +316,26 @@ struct X86OpEntry {
     unsigned     intercept:8;
     bool         has_intercept:1;
     bool         is_decode:1;
+
+    /*
+     * QEMU's own identity for this table slot, handed to plugins by
+     * plugin_gen_record_insn_identity().  Both are filled by the
+     * X86_OP_ENTRY* / X86_OP_GROUP* macros and by nothing else, so an
+     * entry a decode function builds field-by-field keeps the identity
+     * of the row that reached it -- which is the honest answer, since
+     * that row is the last thing the table itself said.
+     *
+     * mnemonic is the macro's `op` argument, i.e. the gen_<op> this
+     * slot dispatches to.  It is NOT unique: 472 of the 854 slots in
+     * decode-new.c.inc share a name with another slot.
+     *
+     * slot is the source line of the macro expansion in
+     * decode-new.c.inc.  Every one of the 854 sites sits on its own
+     * line, so it is unique, and it is greppable: sed -n '<slot>p'.
+     * 0 means the slot was never filled by a macro.
+     */
+    const char  *mnemonic;
+    uint16_t     slot;
 };
 
 typedef struct X86DecodedOp {

@@ -27,6 +27,14 @@ Plugin API additions
      instructions of speculative basic blocks, which need the
      same Capstone view of bytes that the in-flight TCG translator
      does not otherwise expose.
+   * ``qemu_plugin_insn_decode_id`` / ``qemu_plugin_insn_decode_name``
+     — QEMU's *own* identity for an instruction: the decode-table
+     slot the target decoder dispatched on, and that slot's name in
+     QEMU source vocabulary.  This is what QEMU executed, as
+     distinct from what a disassembler says about the same bytes.
+     See :ref:`qemu-decode-identity` for the contract the two
+     halves carry and for the reason a consumer may never use the
+     name alone.
    * ``qemu_plugin_insn_branch_target_pc`` — returns the static
      control-transfer target the per-ISA translator resolved for a
      branch instruction, or 0 for a non-branch or an indirect
@@ -479,6 +487,107 @@ Per-ISA translator call sites
      (the unconditional ``JAL``) and ``gen_branch`` (the B-type
      conditionals), using ``ctx->base.pc_next + imm``.  ``JALR``
      (indirect) is unaffected.
+
+.. _qemu-decode-identity:
+
+QEMU decode identity
+--------------------
+
+Every instruction QEMU executes was selected by a slot in one of
+QEMU's own decode tables — an ``X86_OP_ENTRY`` row on i386, a
+decodetree pattern elsewhere — and QEMU generates code by dispatching
+on that slot.  The slot is the identity QEMU acted on.  Nothing
+exported it to plugins, so a tracer had no choice but to re-derive an
+identity from the instruction bytes with a disassembler that is not
+the thing that ran.  This modification exports the slot.
+
+Per translated instruction the target translator states a pair:
+
+``id``
+   The slot.  It guarantees exactly three things: instructions
+   decoded through different slots get different ids, instructions
+   decoded through the same slot get the same id, and 0 means the
+   target recorded no identity.  It is stable for a given QEMU source
+   tree, and it is neither dense, nor stable across source edits, nor
+   comparable between targets.  Persist the name beside it, or a
+   mapping built by the consumer; never persist the id as a
+   cross-version key.
+
+``name``
+   The slot's name in QEMU's own source vocabulary — the ``op``
+   argument of the i386 ``X86_OP_ENTRY`` (hence the ``gen_<op>`` it
+   dispatches to), the decodetree pattern name (hence the
+   ``trans_<name>``) elsewhere.  Stable, greppable, and **not an
+   identity**.
+
+The name is not an identity in two separate ways, both measured
+rather than assumed.  It is not unique: 472 of the 854 identity-
+bearing slots in ``target/i386/tcg/decode-new.c.inc`` share a name
+with at least one other slot, ``MOV`` names 35 of them and ``Jcc``
+names 32, and over a mixed user-mode workload 85.5% of translated
+instructions carried a name that did not determine which slot decoded
+them.  And it is not always the instruction: ``cmp`` decodes through
+slots named ``SUB`` and ``test`` through a slot named ``AND``,
+because QEMU implements them with the flag-setting half of those
+generators and writes the discarded destination out of the row
+(``X86_OP_ENTRYrr``).  The slot is unambiguous in both cases.  A
+consumer keys on the pair, and on the id whenever two rows must be
+told apart.
+
+``include/qemu/plugin.h`` — ``struct qemu_plugin_insn``
+
+   Carries ``uint32_t decode_id`` and ``const char *decode_name``.
+   ``plugin_gen_insn_start`` clears both for every instruction: the
+   insn structs are pooled across translations, and a stale slot
+   surviving onto an unrelated instruction would be a fabricated
+   identity, which is worse than none.
+
+``include/exec/plugin-gen.h`` and ``accel/tcg/plugin-gen.c`` —
+``plugin_gen_record_insn_identity``
+
+   The translator-facing entry point, a no-op inline stub when
+   ``CONFIG_PLUGIN`` is unset.
+
+``plugins/api.c`` — ``qemu_plugin_insn_decode_id`` /
+``qemu_plugin_insn_decode_name``
+
+   Read the pair back out.
+
+i386: ``target/i386/tcg/decode-new.h`` and ``decode-new.c.inc``
+
+   ``struct X86OpEntry`` gains ``mnemonic`` and ``slot``, filled by
+   the ``X86_OP_ENTRY*`` and ``X86_OP_GROUP*`` macros from the
+   macro's own ``op`` argument and from ``__LINE__``.  Each of the
+   854 expansion sites sits on its own source line, so the slot is
+   unique and directly auditable: ``sed -n '<slot>p'`` on
+   ``decode-new.c.inc`` prints the row.
+   ``arc3_qemuid/static_census.py`` enforces that uniqueness and
+   fails if two slots ever share a line.
+
+   A decode function that picks its leaf generator itself, rather
+   than copying a whole row over the entry, has to state the leaf's
+   identity too.  ``X86_OP_SET_GEN`` and the ``X86OpLeaf`` tables
+   behind ``X86_OP_LEAF`` do that at the thirteen assignment sites
+   and four group tables where it applies.  Without them
+   ``decode_group1`` alone would give ``ADD``, ``OR``, ``ADC``,
+   ``SBB``, ``AND``, ``SUB``, ``XOR`` and ``CMP`` a single identity,
+   and those are the most frequently executed instructions there
+   are.
+
+   ``plugin_gen_record_insn_identity`` is called in ``disas_insn``
+   once every ``#UD`` and ``#GP`` check has passed and immediately
+   before code is generated from the row.  Calling it earlier would
+   publish an identity for an instruction that faults instead of
+   executing.
+
+   Where QEMU's own table is coarse, the export is coarse with it and
+   says so rather than inventing detail.  Root opcodes ``0xD8``
+   through ``0xDF`` — the whole x87 escape space — are eight slots
+   that all name ``x87``, because ``gen_x87`` switches on the modrm
+   byte internally; five further slots name ``multi0F`` for the
+   opcodes not yet converted to the new decoder.  Together they
+   accounted for 7 of 265,000 translated instructions on the census
+   workload.
 
 Never-split code sequences
 --------------------------

@@ -132,6 +132,20 @@ struct qemu_plugin_insn {
      * (those route through the plugin's BranchHistory instead).
      */
     uint64_t branch_target_pc;
+    /*
+     * QEMU's own decode-table identity for this instruction: the slot
+     * the target decoder dispatched on, and that slot's name in QEMU
+     * source vocabulary.  Populated by per-ISA translators via
+     * plugin_gen_record_insn_identity() at the point the slot is
+     * selected.  decode_id == 0 means "this target recorded nothing";
+     * decode_name is then NULL.
+     *
+     * decode_name is NOT unique -- on x86_64 472 of 854 table slots
+     * share a name with another slot.  decode_id is the unique half.
+     * See include/qemu/qemu-plugin.h for the full contract.
+     */
+    uint32_t decode_id;
+    const char *decode_name;
     GArray *insn_cbs;
     GArray *mem_cbs;
     uint8_t len;

@@ -593,6 +593,16 @@ uint64_t qemu_plugin_insn_branch_target_pc(const struct qemu_plugin_insn *insn)
     return insn->branch_target_pc;
 }
 
+uint32_t qemu_plugin_insn_decode_id(const struct qemu_plugin_insn *insn)
+{
+    return insn->decode_id;
+}
+
+const char *qemu_plugin_insn_decode_name(const struct qemu_plugin_insn *insn)
+{
+    return insn->decode_name;
+}
+
 void *qemu_plugin_insn_haddr(const struct qemu_plugin_insn *insn)
 {
     const DisasContextBase *db = tcg_ctx->plugin_db;

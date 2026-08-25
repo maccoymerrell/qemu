@@ -471,6 +471,13 @@ void plugin_gen_insn_start(CPUState *cpu, const DisasContextBase *db)
      * onto a later, unrelated insn.
      */
     insn->branch_target_pc = 0;
+    /*
+     * Same reuse hazard as branch_target_pc: a stale slot id surviving
+     * onto an unrelated insn would be a fabricated identity, which is
+     * worse than none.
+     */
+    insn->decode_id = 0;
+    insn->decode_name = NULL;
 
     tcg_gen_plugin_cb(PLUGIN_GEN_FROM_INSN);
 }
@@ -480,6 +487,15 @@ void plugin_gen_record_branch_target(uint64_t target_pc)
     struct qemu_plugin_insn *insn = tcg_ctx->plugin_insn;
     if (insn) {
         insn->branch_target_pc = target_pc;
+    }
+}
+
+void plugin_gen_record_insn_identity(uint32_t id, const char *name)
+{
+    struct qemu_plugin_insn *insn = tcg_ctx->plugin_insn;
+    if (insn) {
+        insn->decode_id = id;
+        insn->decode_name = name;
     }
 }
 

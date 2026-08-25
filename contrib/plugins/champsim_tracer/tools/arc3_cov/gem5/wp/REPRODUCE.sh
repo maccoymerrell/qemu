@@ -37,4 +37,5 @@ COMMON="--gem5-dir $GEM5_DIR --gem5-build $GEM5_DIR/build/X86 \
 "$PY" "$HERE/compare_wp_gem5.py" $COMMON --wpdepth 32 \
       -o "$OUT/final" --tsv "$OUT/final/rows.tsv" \
       "$OUT/probes/p_wpmem" "$OUT/probes/p_wpchain" "$OUT/probes/p_wpflag" \
-      "$OUT/probes/p_wpsse" "$OUT/probes/p_wpx87"
+      "$OUT/probes/p_wpsse" "$OUT/probes/p_wpx87" \
+      "$OUT/probes/p_wprmw"

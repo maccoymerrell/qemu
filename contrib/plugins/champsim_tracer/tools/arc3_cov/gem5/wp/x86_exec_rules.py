@@ -170,17 +170,72 @@ X86_EXEC = {
     # is FULL, `movi r13b, r13b, 0x1` does not and is partial -- which is why
     # this rule fires only on a register gem5 wrote NARROW.
     #
-    # BLIND SPOT, STATED: an 8/16-bit read-modify-write such as
-    # `add %al, %bl` is spelled by gem5 exactly like `setcc` -- narrow write,
-    # destination named in the operand slot it preserves -- and its read IS
-    # architectural.  Nothing in gem5's output separates them, so if the
-    # tracer ever dropped that source this rule would excuse it.  The leg's
-    # probes contain no such form; a probe that adds one must re-open this.
+    # THE BLIND SPOT THIS RULE ONCE HAD, AND HOW IT IS CLOSED.  An 8/16-bit
+    # read-modify-write such as `add %al, %bl` is spelled by gem5 EXACTLY
+    # like `setcc` -- narrow write, destination named in the operand slot it
+    # preserves -- and its read of the destination IS architectural.  The
+    # maintainer ruled on that case directly: "an instruction can have a
+    # register as both a source and destination, and that is perfectly valid
+    # (for example, an in-place ADD that doubles the quantity of a single
+    # register)".  R7.1 removes the PRESERVE read; it does not remove that
+    # one.  Nothing in gem5's output tells the two apart, so a rule resting
+    # on gem5's text alone would have forgiven a dropped architectural
+    # source, and the leg's probes contained no such form to catch it.
+    #
+    # `p_wprmw` now contains every arithmetic r/m8,r8 and r/m16,r16 form in
+    # four operand shapes, and the discriminator no longer comes from the
+    # reference at all: the row is decided by QEMU, per encoding, from an
+    # OBSERVED `-one-insn-per-tb -d op` dump (x86_64/qemu_preserve_oracle.py).
+    # A read is a PRESERVE read only where the translation merges the value
+    # back with `deposit_*` and the value reaches no other architectural
+    # state, or where a lazy-flags read is COPIED into the flags tuple and
+    # nowhere else:
+    #
+    #   setb %r12b   deposit_i64 r12,r12,loc0,$0,$8   r12 read ONCE, as the
+    #                                                 merge base -- PRESERVE
+    #   add %al,%bl  mov_i64 loc0,rbx / add / deposit rbx read into the ADDER
+    #                                                 and reaching cc_dst
+    #                                                 -- ARCHITECTURAL
+    #   inc %r14     call cc_compute_c -> mov cc_src  carried, not computed
+    #                                                 -- PRESERVE
+    #   adc %dil,%r8b call cc_compute_c -> add -> r8  reaches a GPR
+    #                                                 -- ARCHITECTURAL
+    #
+    # A register the oracle will not answer for -- x87, MXCSR and the vector
+    # file live at env offsets a helper reads without a TCG global use -- is
+    # REFUSED under REF-PRESERVE-READ-UNDECIDED, never excused.
     'REF-PRESERVE-READ-OVERNAMED':
         Rule('REF-PRESERVE-READ-OVERNAMED', 'reference-gap', {SUBSET},
-             note='gem5 names a preserve-read on a NARROW or PARTIAL write; '
-                  'R7.1 rules that a register is a source only where the '
-                  'instruction takes it as one, so the tracer is right'),
+             note='gem5 names a preserve-read on a NARROW or PARTIAL write '
+                  'and QEMU\'s own translation confirms the value is only '
+                  'merged back; R7.1 rules that a register is a source only '
+                  'where the instruction takes it as one, so the tracer is '
+                  'right'),
+
+    # The other half of the same question, and the reason the rule above can
+    # be trusted: where QEMU's translation reads the destination INTO the
+    # computation, the source is architectural and a tracer that did not name
+    # it is wrong.  This label exists so the RMW case is CONVICTED by name
+    # rather than falling into the generic unexplained bucket -- a reader of
+    # the report should be told which mechanism fired.
+    'TRACER-DROPPED-RMW-SOURCE':
+        Rule('TRACER-DROPPED-RMW-SOURCE', 'tracer-defect', {SUBSET},
+             accounts=False,
+             note='QEMU\'s translation reads this register into the '
+                  'computation -- an 8/16-bit read-modify-write, not a width '
+                  'merge -- so the source is architectural and the tracer '
+                  'dropped it'),
+
+    # REFUSAL, not excuse.  A rule that cannot separate a preserve-read from
+    # an architectural one on a given register must decline the row: the
+    # blind spot that produced this project's four false allowlist entries
+    # was exactly a rule answering where it could not see.
+    'REF-PRESERVE-READ-UNDECIDED':
+        Rule('REF-PRESERVE-READ-UNDECIDED', 'reference-gap', {SUBSET},
+             accounts=False,
+             note='the QEMU oracle has no answer for this register on this '
+                  'encoding -- helper-resident state, or an encoding the op '
+                  'dump never carried -- so the row is refused'),
 
     # The reference names an architectural register the tracer does not.  This
     # is the DISQUALIFYING direction and has no excusing rule by design: it is

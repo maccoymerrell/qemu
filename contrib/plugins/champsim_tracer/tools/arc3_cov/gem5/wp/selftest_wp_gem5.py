@@ -354,6 +354,14 @@ def main():
     a = ap.parse_args()
     os.makedirs(a.outdir, exist_ok=True)
     envx = C.Env(a)
+    # The comparator's REF-PRESERVE-READ-OVERNAMED gate is a QEMU-derived
+    # oracle, and without it every TRACER-SUBSET row is REFUSED.  The control
+    # scores the same rows the comparison does, so it builds the same oracle
+    # from the same guests -- a control run against a different rule than the
+    # measurement is not a control.
+    oracle, _log = C.QPO.build(a.qemu, a.guest,
+                               os.path.join(a.outdir, 'oracle'))
+    C.set_oracle(oracle)
     return run(a, envx)
 
 

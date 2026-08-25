@@ -115,6 +115,25 @@ Every one of these was found by running gem5, not assumed:
   inject a phantom source on every one of them.  `cmovcc` is NOT this case
   and keeps its destination-as-source (R4): gem5 spells its write at full
   width, which is how the two are told apart.
+
+  **THIS ONE IS NOT DECIDED BY gem5.**  An 8/16-bit read-modify-write --
+  `add %al, %bl`, and the maintainer's own example of an in-place `add` that
+  doubles one register -- is spelled by gem5 IDENTICALLY to `setcc`: narrow
+  destination, preserved register named in the slot it preserves.  Its read
+  is architectural.  A rule resting on gem5's text alone would forgive a
+  tracer that dropped it, so the discriminator comes from QEMU
+  (`x86_64/qemu_preserve_oracle.py`), per encoding, off an observed
+  `-one-insn-per-tb -d op` dump: a read is a PRESERVE read only where the
+  translation merges the value back with `deposit_*` and it reaches no other
+  architectural state, or where a lazy-flags read is copied into the flags
+  tuple and nowhere else.  A register the oracle cannot see -- x87, MXCSR and
+  the vector file live at env offsets a helper reads without a TCG global use
+  -- is `REF-PRESERVE-READ-UNDECIDED`, which is a REFUSAL and counts against
+  the leg; it is never an excuse.  `p_wprmw` carries every arithmetic
+  `r/m8,r8` and `r/m16,r16` form in four operand shapes so the rule has a
+  subject it could be wrong about, and `--inject-rmw-drop` (with
+  `--rule-gem5-only` as the falsification arm) proves the gate is
+  load-bearing rather than decorative.
 * **gem5 prints no encoding**, so the `insn-bits` axis the riscv64 leg scores
   becomes `insn-length` here — which on a variable-length ISA is the
   substantive question anyway.  Where neither the `rdip` fall-through nor a
@@ -126,6 +145,15 @@ Every one of these was found by running gem5, not assumed:
 requires the axis that owns it to fire.  **Eleven** axes plus the injection
 control, all firing, is the bar; an axis with no firing mutation reports
 `UNPROVEN` and its zero is not counted as a pass.
+
+A second, RULE-DIRECTED falsifier lives in the comparison itself.  A negative
+control on the axes does not test whether an ADJUDICATION forgives what it
+should convict, and `REF-PRESERVE-READ-OVERNAMED` is the rule with the most to
+forgive.  `--inject-rmw-drop` removes, on the tracer side, exactly the sources
+QEMU calls architectural on a register the same instruction writes, and the
+leg must report them as `TRACER-DROPPED-RMW-SOURCE`.  Run the same injection
+with `--rule-gem5-only` and the pre-gate rule EXCUSES them, which is what
+makes the closure a measurement rather than a claim.
 
 The **injection control** is the load-bearing one: it perturbs the state that
 is *installed* and requires gem5's own execution to change.  Without it, an

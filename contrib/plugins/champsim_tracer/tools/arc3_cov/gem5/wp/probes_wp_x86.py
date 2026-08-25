@@ -127,9 +127,12 @@ tail:
 """
 
 # Flag producers and flag consumers in the shadow.  `adc`, `sbb`, `setcc` and
-# `cmovcc` all READ the flags word; `inc` and `dec` write it only in part and
-# therefore read it too (R4: a partial write also reads what it preserves).
-# This is the probe the reg-src-set axis lives on.
+# `cmovcc` all READ the flags word, and `cmovcc` reads its DESTINATION too
+# (R4: a PREDICATED write preserves the whole old architectural value).
+# `inc` and `dec` write the word only in part and acquire NO source for the
+# bits they leave alone -- R7.1 superseded R4's partial half and rules the
+# opposite of what this comment used to say.  This is the probe the
+# reg-src-set axis lives on.
 PROBES['p_wpflag'] = """
 .section .text
 .globl _start
@@ -200,6 +203,92 @@ sshadow:
 # did the dependency chain of these instructions was absent; reaching them
 # here exercises code that had no execution reference at all.  Loads and
 # stores are 32-, 64- and 80-bit so the memop-width axis has x87 instances.
+# 8- and 16-bit READ-MODIFY-WRITE in the shadow.  THIS PROBE EXISTS TO GIVE A
+# RULE A SUBJECT IT COULD BE WRONG ABOUT.
+#
+# REF-PRESERVE-READ-OVERNAMED excuses a reference-only source when gem5 named
+# the destination in the slot it preserves and wrote it NARROW -- correct for
+# `setcc`, `inc`, `bt` and `mov r/m8, r8`, where R7.1 rules the merged-into
+# register is not a source.  `add %al, %bl` is spelled by gem5 IDENTICALLY --
+# `add bl, bl, al`, an 8-bit destination named in source slot 0 -- and its
+# read of %bl is ARCHITECTURAL: the instruction takes the destination as an
+# operand and doubles it when both names are the same register.  The
+# maintainer ruled on exactly this: "an instruction can have a register as
+# both a source and destination, and that is perfectly valid (for example, an
+# in-place ADD that doubles the quantity of a single register)."
+#
+# Without these forms in the probe set the rule adjudicates a population that
+# contains no counter-example, and a dropped architectural source would be
+# forgiven.  Every arithmetic RMW that has an r/m8,r8 and r/m16,r16 encoding
+# is here, in all four operand shapes (reg dest, memory dest, memory source,
+# and the same-register in-place form the maintainer named).
+PROBES['p_wprmw'] = """
+.section .text
+.globl _start
+_start:
+  movabs $arena, %r15
+  mov  $6, %ecx
+  xor  %rax, %rax
+rloop:
+  mov  (%r15), %rdx
+  add  %rdx, %rax
+  dec  %rcx
+  jnz  rloop
+rshadow:
+  mov  32(%r15), %rbx
+  mov  40(%r15), %rsi
+  mov  48(%r15), %r8
+  mov  56(%r15), %r9
+  mov  64(%r15), %r10
+  mov  72(%r15), %r11
+  mov  80(%r15), %rcx
+  mov  88(%r15), %rdx
+  mov  96(%r15), %rdi
+  # r/m8, r8 -- narrow register destination, architecturally read
+  add  %al, %bl
+  sub  %bl, %cl
+  and  %cl, %dl
+  or   %dl, %sil
+  xor  %sil, %dil
+  adc  %dil, %r8b
+  sbb  %r8b, %r9b
+  # r/m16, r16 -- the same question one width up
+  add  %ax, %bx
+  sub  %bx, %cx
+  and  %cx, %dx
+  or   %dx, %si
+  xor  %si, %di
+  adc  %di, %r10w
+  sbb  %r10w, %r11w
+  # the in-place form the maintainer named: one register, source AND dest
+  add  %bl, %bl
+  add  %r10w, %r10w
+  # r8, r/m8 and r16, r/m16 -- a MEMORY destination read and written
+  add  %al, 256(%r15)
+  sub  %bx, 258(%r15)
+  and  %cl, 260(%r15)
+  or   %dx, 262(%r15)
+  xor  %sil, 264(%r15)
+  adc  %di,  266(%r15)
+  sbb  %r9b, 268(%r15)
+  # r8, r/m8 and r16, r/m16 with the MEMORY operand as the source
+  add  272(%r15), %al
+  or   274(%r15), %bx
+  xor  276(%r15), %cl
+  and  278(%r15), %dx
+  sub  280(%r15), %sil
+  adc  282(%r15), %di
+  sbb  284(%r15), %r8b
+  # the narrow forms R7.1 governs, side by side with them in ONE probe so a
+  # discriminator that cannot tell the two apart is measured on both.
+  setb %r12b
+  seta %r13b
+  inc  %r14
+  bt   $3, %rbx
+  mov  %al, 288(%r15)
+  jmp  done
+"""
+
 PROBES['p_wpx87'] = """
 .section .text
 .globl _start

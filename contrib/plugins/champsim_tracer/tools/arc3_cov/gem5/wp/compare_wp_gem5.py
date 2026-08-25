@@ -62,12 +62,14 @@ import sys
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _COV = os.path.abspath(os.path.join(_HERE, '..', '..'))
 for _p in (_HERE, _COV, os.path.join(_COV, 'gem5'),
+           os.path.join(_COV, 'x86_64'),
            os.path.join(_COV, 'riscv64', 'spike', 'wp')):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
 import elfimage                                              # noqa: E402
 import wp_trace                                              # noqa: E402
+import qemu_preserve_oracle as QPO                           # noqa: E402
 import wp_seed_x86                                           # noqa: E402
 import gem5_wp_ref                                           # noqa: E402
 import gem5_env                                              # noqa: E402
@@ -148,7 +150,71 @@ def x87_is_rounded(v80, v64):
     return d == v64 or abs(d - v64) <= 1
 
 
-def adjudicate(rel, only_ref, only_trc, side, preserve=frozenset()):
+# ---------------------------------------------------------------- the oracle
+#
+# REF-PRESERVE-READ-OVERNAMED cannot be decided from gem5's text alone.  A
+# narrow write whose destination gem5 names in the slot it preserves is
+# spelled IDENTICALLY for `setz %al`, whose destination R7.1 rules is not a
+# source, and for `add %al, %bl`, whose destination the maintainer ruled IS
+# one: "an instruction can have a register as both a source and destination,
+# and that is perfectly valid (for example, an in-place ADD that doubles the
+# quantity of a single register)".  The instruction's OWN SEMANTICS separate
+# them and QEMU is the ground truth for those, so the rule is gated on
+# ``qemu_preserve_oracle``: the translation either reads the destination into
+# the computation or it only merges it back.
+#
+# A row the oracle will not answer is REFUSED, never excused.  Without a
+# wired oracle every SUBSET row is refused, which is why nothing here falls
+# back to gem5 alone.
+ORACLE = None
+
+# THE FALSIFICATION ARM.  Set False to restore the rule to what it was before
+# the gate existed -- gem5's text alone -- so that the injection control can
+# demonstrate the gate is LOAD-BEARING rather than decorative.  A rule whose
+# blind spot cannot be shown closed is still open, and the only way to show
+# it is to run the same injection with the gate off and watch the leg forgive
+# it.  This is a measurement arm, never a mode to measure in.
+GATE = True
+
+
+def set_oracle(o):
+    global ORACLE
+    ORACLE = o
+
+
+def _oracle_verdict(enc, surplus):
+    """(encoding hex, the registers gem5 named and the tracer did not)
+    -> 'preserve' | 'arch' | None (refused)."""
+    if not GATE:
+        return QPO.PRESERVE
+    if ORACLE is None or enc is None:
+        return None
+    seen = set()
+    for r in surplus:
+        v = ORACLE.ask(enc, r)
+        if v is None:
+            return None
+        seen.add(v)
+    if QPO.ARCH in seen:
+        return QPO.ARCH
+    return QPO.PRESERVE
+
+
+def _enc(t):
+    """A tracer instruction -> its encoding as lowercase hex, or None.
+
+    The oracle is keyed on the ENCODING and not on the PC: the same bytes
+    have the same TCG lowering wherever they sit, and a PC key would answer
+    from a DIFFERENT instruction if a wrong-path walk ever decoded at an
+    offset the correct path never took.
+    """
+    try:
+        return t.bits.to_bytes(t.nbytes, 'little').hex()
+    except (AttributeError, OverflowError, ValueError):
+        return None
+
+
+def adjudicate(rel, only_ref, only_trc, side, preserve=frozenset(), enc=None):
     """(measured direction, the surplus/deficit sets) -> (verdict, label).
 
     The direction is MEASURED by ``set_relation`` before any label is
@@ -190,12 +256,25 @@ def adjudicate(rel, only_ref, only_trc, side, preserve=frozenset()):
     elif rel == SUBSET:
         surplus = set(only_ref)
         if surplus and surplus <= set(preserve):
-            label = 'REF-PRESERVE-READ-OVERNAMED'
+            # gem5 SAYS preserve-read.  QEMU decides whether it is one.
+            v = _oracle_verdict(enc, surplus)
+            if v == QPO.PRESERVE:
+                label = 'REF-PRESERVE-READ-OVERNAMED'
+            elif v == QPO.ARCH:
+                label = 'TRACER-DROPPED-RMW-SOURCE'
+            else:
+                label = 'REF-PRESERVE-READ-UNDECIDED'
         else:
             label = 'REF-ONLY-UNEXPLAINED'
     rule = x86_exec_rule(label)
     if rule is not None and rel in rule.expect and rule.accounts:
         return (REF_SIDE if rel == SUBSET else SUPERSET_OK), label
+    if label == 'REF-PRESERVE-READ-UNDECIDED':
+        # A REFUSAL is not a conviction.  The rule declined to adjudicate the
+        # row, and calling that a tracer defect would be as wrong as calling
+        # it agreement -- it counts against the leg either way, but the
+        # report must say WHICH.
+        return UNACCOUNTED, label
     if rel == SUBSET:
         return WP_DEFECT, label
     return UNACCOUNTED, label
@@ -400,7 +479,8 @@ def compare_excursion(guest, ex, ref, gapinfo, run_note):
             rel = set_relation((), sorted(rw), (), sorted(tw))
             if rel != EQUAL:
                 v, lab = adjudicate(rel, frozenset(rw) - frozenset(tw),
-                                    frozenset(tw) - frozenset(rw), 'dst')
+                                    frozenset(tw) - frozenset(rw), 'dst',
+                                    enc=_enc(t))
                 rows.append(Row(guest, ex.seq, i, t.pc, 'reg-dst-set',
                                 v, sorted(rw), sorted(tw),
                                 '%s %s' % (rel, lab or '')))
@@ -470,7 +550,7 @@ def compare_excursion(guest, ex, ref, gapinfo, run_note):
             rel = set_relation((), sorted(rs), (), sorted(ts))
             if rel != EQUAL:
                 v, lab = adjudicate(rel, rs - ts, ts - rs, 'src',
-                                    r.preserve_reads)
+                                    r.preserve_reads, enc=_enc(t))
                 rows.append(Row(guest, ex.seq, i, t.pc, 'reg-src-set',
                                 v, sorted(rs), sorted(ts),
                                 '%s %s' % (rel, lab or '')))
@@ -572,12 +652,48 @@ class Env(object):
                           % len(V.MISC))
 
 
+def inject_rmw_drop(exc):
+    """THE FALSIFIER FOR REF-PRESERVE-READ-OVERNAMED.
+
+    Drop, on the TRACER side, exactly the sources the QEMU oracle calls
+    ARCHITECTURAL on a register the same instruction also writes -- the 8-
+    and 16-bit read-modify-write case the rule's blind spot used to forgive.
+    The rule is closed only if the leg CONVICTS this, so the injection is run
+    and its effect counted; an injection that removed nothing is a failed
+    control, not a pass.
+
+    -> Counter of 'encoding:register' actually dropped.
+    """
+    hit = collections.Counter()
+    for ex in exc:
+        for ins in ex.insns:
+            enc = _enc(ins)
+            if enc is None:
+                continue
+            written = set(w[0] for w in ins.writes)
+            keep = []
+            for r in ins.srcs:
+                if r in written and ORACLE is not None and \
+                        ORACLE.ask(enc, r) == QPO.ARCH:
+                    hit['%s:%s' % (enc, r)] += 1
+                    continue
+                keep.append(r)
+            ins.srcs = keep
+    return hit
+
+
 def process_guest(args, envx, guest, out):
     stem = os.path.join(out, os.path.basename(guest))
     trace = run_tracer(args.qemu, args.plugin, guest, stem, args.wpdepth)
     image, xranges, _entry = elfimage.load(guest)
     exc, cp, tstats = wp_trace.build(args.decode, trace, image)
     sel = guest_ranges(xranges)
+    if getattr(args, 'inject_rmw_drop', False):
+        got = inject_rmw_drop(exc)
+        envx.notes.append('INJECTION rmw-drop on %s: %d sources removed, %d '
+                          'distinct encoding:register  %s'
+                          % (os.path.basename(guest), sum(got.values()),
+                             len(got), ' '.join(sorted(got))[:400]))
 
     stats = collections.Counter()
     rows = []
@@ -837,10 +953,35 @@ def main():
     ap.add_argument('--timeout', type=int, default=900)
     ap.add_argument('-o', '--outdir', required=True)
     ap.add_argument('--tsv')
+    ap.add_argument('--rule-gem5-only', action='store_true',
+                    help='FALSIFICATION ARM: adjudicate '
+                         'REF-PRESERVE-READ-OVERNAMED from gem5\'s operand '
+                         'text alone, as the rule did before the QEMU gate.  '
+                         'Run WITH --inject-rmw-drop to see the blind spot '
+                         'forgive a dropped architectural source')
+    ap.add_argument('--inject-rmw-drop', action='store_true',
+                    help='NEGATIVE CONTROL: drop, on the tracer side, every '
+                         'source the QEMU oracle calls architectural on a '
+                         'register the instruction also writes.  The leg '
+                         'MUST report TRACER-DROPPED-RMW-SOURCE; a green run '
+                         'under this flag means the rule still forgives an '
+                         '8/16-bit read-modify-write')
     a = ap.parse_args()
 
     os.makedirs(a.outdir, exist_ok=True)
     envx = Env(a)
+    # The QEMU-side discriminator for REF-PRESERVE-READ-OVERNAMED, built from
+    # the SAME guests and the SAME qemu-x86_64 this run measures.  Without it
+    # every SUBSET row is refused rather than excused.
+    oracle, _olog = QPO.build(a.qemu, a.guest,
+                              os.path.join(a.outdir, 'oracle'))
+    set_oracle(oracle)
+    if a.rule_gem5_only:
+        global GATE
+        GATE = False
+        envx.notes.append('FALSIFICATION ARM: the QEMU gate on '
+                          'REF-PRESERVE-READ-OVERNAMED is OFF; the rule is '
+                          'adjudicating from gem5\'s operand text alone')
     rows = []
     stats, tails = collections.Counter(), collections.Counter()
     dropped, folded, merged = (collections.Counter(), collections.Counter(),

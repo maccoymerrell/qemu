@@ -111,8 +111,17 @@ _MISC_TO_GENERIC = {
     # The tracer maps X86_REG_FPSW onto REG_FCSR; gem5 splits the x87 control
     # and status words, and MXCSR is a third register again.  All three are
     # FP mode-and-status state and the tracer has ONE id for that role.
-    192: 'REG_FCSR', 193: 'REG_FCSR', 194: 'REG_FCSR', 195: 'REG_FCSR',
+    192: 'REG_FCSR', 194: 'REG_FCSR', 195: 'REG_FCSR',
     196: 'REG_FCSR', 201: 'REG_FCSR',
+    # THE x87 CONTROL WORD IS ITS OWN ID ON THE WIRE.  It read REG_FCSR here
+    # until the correct-path leg put an `fnstcw`/`fldcw` in front of the
+    # reference and gem5 answered with `miscellaneous:193`: the tracer names
+    # that register REG_FPCW -- split out of REG_FCSR at 0acd1e32e5 -- and a
+    # reference still folding the two would have scored a control-word write
+    # against a status-word write and called it agreement.  The wrong-path leg
+    # could not catch this: `miscellaneous:193` occurs ZERO times over its
+    # whole run, because no wrong-path probe transfers the control word.
+    193: 'REG_FPCW',
     204: 'REG_SYSFPEN',
     # gem5 keeps the x87 stack pointer in a misc register.  It is
     # architectural state (the TOP field of the status word) and folds onto
@@ -279,8 +288,20 @@ def rflags_from_cc(cc):
     if 1 in cc:                     # Cfof: CF OF, in place
         word |= cc[1] & (RFLAGS_CF | RFLAGS_OF)
         mask |= RFLAGS_CF | RFLAGS_OF
-    if 2 in cc:                     # Df: gem5 stores 1 or -1, not the bit
-        word |= RFLAGS_DF if (cc[2] & 0xffffffffffffffff) != 1 else 0
+    if 2 in cc:
+        # Df holds the DF BIT IN PLACE, not a direction of 1 or -1.  gem5 says
+        # so in two places: `regop.isa` assigns `dfBit = newFlags & DFBit` and
+        # `utility.cc:78` seeds the register with `val & DFBit`, where
+        # `misc.hh:68` defines `DFBit = 1 << 10` -- the RFLAGS position.
+        #
+        # THE RULE THIS REPLACED WAS FACTUALLY FALSE AND SET A PHANTOM DF.  It
+        # read `DF if cc[2] != 1`, so the ordinary case -- DF clear, cc[2] == 0
+        # -- reconstructed the word with DF SET.  Measured on the correct-path
+        # p_int probe: gem5 writes `condition_code:2=0x0` on all four of
+        # `clc`/`stc`/`cmc`/`cld` and the comparison charged the tracer with
+        # six flags-value defects that were the reconstruction's own.  The
+        # wrong-path leg never saw it because none of its probes writes cc[2].
+        word |= cc[2] & RFLAGS_DF
         mask |= RFLAGS_DF
     return word, mask
 

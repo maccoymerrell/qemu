@@ -52,10 +52,50 @@ import tracer_log
 from arc3_taxonomy import (set_relation, classify, render_crosstab,
                            render_conflicts, render_unaccounted, EQUAL,
                            SUBSET, SUPERSET, ORTHOGONAL, UNACCOUNTED)
+from axis_subjects import Subjects
 from gem5_rules import gem5_exec_rule
+sys.path.insert(0, os.path.join(HERE, 'wp'))
+from x86_exec_rules import x86_exec_rule                        # noqa: E402
+
+#: the verdict columns of the FACTS/SUBJECTS table.  They are the taxonomy's
+#: own directions plus UNACCOUNTED, so the census IS the verdict split rather
+#: than a second table a reader has to join to it by eye.
+VERDICTS = (SUPERSET, SUBSET, ORTHOGONAL, UNACCOUNTED)
+
+
+def exec_rule(label):
+    """The adjudication for a label, from either table.
+
+    The x86_64 arm shares its rules with the WRONG-PATH leg
+    (``x86_exec_rules.X86_EXEC``) rather than restating them: a mechanism of
+    gem5's x86 model -- no RIP operand, a partial flags write, an x87 status
+    word published for some instructions and not others -- is the same
+    mechanism whichever path reached it, and two copies of a justification is
+    two places for one of them to become false.
+    """
+    return gem5_exec_rule(label) or x86_exec_rule(label)
 
 AXES = ('reg-dst-set', 'reg-dst-value', 'flags-dst-set', 'fpsr-dst-set',
         'memop-count', 'memop-addr', 'memop-width', 'store-data', 'load-data')
+
+#: Axes an ISA does not HAVE, with the reason.  This is not an exemption list:
+#: an axis here is absent because the architecture has no such register, so
+#: there is no probe that could ever give it a subject, and reporting it as
+#: INERT would demand a probe that cannot exist.  Every other axis stays in,
+#: and INERT stays a failure.
+NO_SUCH_AXIS = {
+    # MIPS has no architectural flags register: comparisons write a GPR
+    # (`slt`) and branches test registers directly.  The tracer publishes no
+    # REG_FLAGS on this ISA and the reference names none, so the axis compares
+    # two empty sets on every instruction.  MEASURED: the negative control
+    # reports `DID NOT FIRE -- NO SUBJECT` for it on mipsel and FIRED for it
+    # on both other ISAs.
+    ('mipsel', 'flags-dst-set'): 'MIPS has no architectural flags register',
+}
+
+
+def axes_for(isa):
+    return tuple(a for a in AXES if (isa, a) not in NO_SUCH_AXIS)
 
 QEMU_BIN = {'aarch64': 'qemu-aarch64', 'mipsel': 'qemu-mipsel',
             'x86_64': 'qemu-x86_64'}
@@ -213,7 +253,13 @@ def run_tracer(qemu_dir, isa, guest, outdir):
 
 # --------------------------------------------------------------- the mapping
 FLAG_IDS = ('REG_FLAGS',)
-FPSR_IDS = ('REG_FCSR',)
+#: The FP mode-and-status partition.  ``REG_FPCW`` -- the x87 CONTROL word,
+#: which the wire gives its own id -- belongs here beside the status word and
+#: NOT in the architectural register file: gem5 models the two as separate
+#: misc registers with unrelated contents, so leaving the control word in the
+#: arch partition would compare a control-word set against a status-word set
+#: and call the difference a register-file disagreement.
+FPSR_IDS = ('REG_FCSR', 'REG_FPCW')
 
 #: The cache-maintenance destination the TRACE names.  Read out of the
 #: record's own write list, never off a mnemonic (R8.7).
@@ -365,19 +411,64 @@ def _maint_dest_label(ref, trc):
     return None
 
 
-def compare_insn(r, t, isa):
-    """One aligned instruction -> its disagreeing axes (possibly none)."""
+def _x86_dst_label(r, only_ref, only_trc):
+    """The x86_64 mechanism behind a destination-set disagreement, or None.
+
+    Every branch is a MECHANISM of gem5's x86 model observed in this leg's own
+    logs, and each is shared with the wrong-path leg's rule table rather than
+    restated here.
+    """
+    if not only_ref and only_trc == frozenset(('REG_IP',)):
+        # gem5 keeps the instruction pointer in the PCState; no operand list
+        # on any control transfer names it.
+        return 'REF-NO-RIP-OPERAND'
+    if not only_ref and r.uops == 1 and '(unimplemented)' in r.disas:
+        # gem5 warns once and retires the instruction with no effects at all.
+        # Measured in this leg: fwait, fninit, fsqrt, ffree, fincstp, fdecstp,
+        # prefetch_nta.  The row is the REFERENCE not modelling the
+        # instruction, and it must be named rather than read as a tracer
+        # superset with no reason.
+        return 'REF-UNIMPLEMENTED-INSN'
+    return None
+
+
+def compare_insn(r, t, isa, sub=None):
+    """One aligned instruction -> its disagreeing axes (possibly none).
+
+    ``sub`` is the per-axis FACT and SUBJECT census.  A fact is recorded where
+    a comparison is PERFORMED, not where one disagrees: an axis that compared
+    nothing reports the same clean zero as an axis that compared everything and
+    agreed, and only the fact count tells those two apart.  The subject is the
+    TRACER's instruction, which always carries its exact encoding -- gem5
+    prints none, so taking it from the reference would leave the census blind
+    on the one ISA whose encodings vary in length.
+    """
     rows = []
+    if sub is None:
+        sub = Subjects()
     ra, rf, rp = split_regs(r.writes)
     ta, tf, tp = split_regs(t.writes)
 
     # --- reg-dst-set
+    #
+    # A FACT IS A COMPARISON THAT HAD SOMETHING IN IT.  Two empty sets are not
+    # a comparison, and counting them would give an axis a denominator drawn
+    # from every instruction in the leg -- which is precisely the survivorship
+    # the census exists to expose.  Measured: mipsel's flags partition is
+    # empty on both sides of all 284 instructions, and with an unconditional
+    # count the axis reported 284 facts and never INERT.
+    if ra or ta:
+        sub.note('reg-dst-set', t)
     row = _set_row(r.pc, 'reg-dst-set', frozenset(ra), frozenset(ta))
     if row is not None:
         only_ref = frozenset(ra) - frozenset(ta)
         only_trc = frozenset(ta) - frozenset(ra)
         maint = _maint_dest_label(frozenset(ra), frozenset(ta))
-        if maint is not None:
+        x86lab = (_x86_dst_label(r, only_ref, only_trc)
+                  if isa == 'x86_64' else None)
+        if x86lab is not None:
+            row = row._replace(label=x86lab)
+        elif maint is not None:
             row = row._replace(label=maint)
         elif only_ref and not only_trc and \
                 all(n == 'REG_ZERO' for n in only_ref):
@@ -431,6 +522,7 @@ def compare_insn(r, t, isa):
         tv, tw = ta[n]
         if rw == 0 or tw == 0:
             continue                      # no value on one side: not a compare
+        sub.note('reg-dst-value', t)
         if mask(rv, min(rw, tw)) != mask(tv, min(rw, tw)):
             bad.append((n, rv, tv))
     if bad:
@@ -455,9 +547,40 @@ def compare_insn(r, t, isa):
             'IMPLDEF-MACHINE-VALUE' if implsrc else 'VALUE-MISMATCH'))
 
     # --- flags partition
+    if rf or tf:
+        sub.note('flags-dst-set', t)
     row = _set_row(r.pc, 'flags-dst-set', frozenset(rf), frozenset(tf))
     if row is not None:
-        rows.append(row._replace(label='FLAGS-GRANULARITY'))
+        # gem5 splits the flags word on BOTH ISAs but for different reasons,
+        # and the two mechanisms are not interchangeable: on AArch64 it is
+        # NZCV rendered as three registers (a spelling), on x86-64 it is five
+        # cc registers of which an instruction writes only the ones it
+        # changes (a partial write).  One label covering both would explain
+        # neither.
+        rows.append(row._replace(label='REF-FLAGS-PARTIAL'
+                                 if isa == 'x86_64' else 'FLAGS-GRANULARITY'))
+
+    # --- the flags VALUE, x86_64 only.
+    #
+    # gem5 holds no RFLAGS register: Zaps carries SF/ZF/AF/PF in their RFLAGS
+    # bit positions, Cfof carries CF/OF and Df carries DF, so a word can be
+    # REBUILT and compared -- and the mask says WHICH bits gem5 spoke about,
+    # so a bit it never wrote is never credited.  This is deliberately NOT
+    # done on the other two ISAs: there gem5's condition-code file is a SPLIT
+    # of one architectural register, its members carry no reconstructable
+    # word, and comparing the last one written against the tracer's whole
+    # NZCV would manufacture a value disagreement out of a spelling.
+    if isa == 'x86_64' and r.rflags_mask and tf:
+        tv, tw_ = list(tf.values())[0]
+        if tw_:
+            sub.note('reg-dst-value', t)
+            m = r.rflags_mask
+            if (r.rflags & m) != (tv & m):
+                rows.append(Disagreement(
+                    r.pc, 'reg-dst-value',
+                    frozenset((('REG_FLAGS', r.rflags & m),)),
+                    frozenset((('REG_FLAGS', tv & m),)),
+                    SUBSET, 'VALUE-MISMATCH'))
 
     # --- FP status partition.  Kept apart from the register file for the
     # same reason the flags are: gem5 does not model FPSCR as one register.
@@ -466,10 +589,26 @@ def compare_insn(r, t, isa):
     # publishes only that sub-field's value.  Comparing that against the
     # tracer's whole FPSR word is a granularity question, not a value one,
     # and it must not be allowed to dilute either result.
+    if rp or tp:
+        sub.note('fpsr-dst-set', t)
     row = _set_row(r.pc, 'fpsr-dst-set', frozenset(rp), frozenset(tp))
     if row is not None:
+        # On x86_64 the same partition holds the x87 status word, and gem5
+        # publishes a destination for it on SOME x87 instructions and not
+        # others -- FABS prints miscellaneous:194, FADD prints no misc
+        # destination at all -- while the architecture updates it on all of
+        # them.  That is a different mechanism from the AArch64 FPSCR split
+        # and carries its own rule.
+        x86lab = None
+        if isa == 'x86_64':
+            only_trc = frozenset(tp) - frozenset(rp)
+            only_ref = frozenset(rp) - frozenset(tp)
+            if not only_ref and only_trc:
+                x86lab = ('REF-UNIMPLEMENTED-INSN'
+                          if (r.uops == 1 and '(unimplemented)' in r.disas)
+                          else 'REF-X87-STATUS-NOT-PUBLISHED')
         rows.append(row._replace(
-            label=_maint_dest_label(frozenset(rp), frozenset(tp)) or
+            label=x86lab or _maint_dest_label(frozenset(rp), frozenset(tp)) or
             'FPSR-GRANULARITY'))
 
     # ------------------------------------------------------------- memops
@@ -493,7 +632,14 @@ def compare_insn(r, t, isa):
     tw = (sum(sz for _, _, sz in t.loads), sum(sz for _, _, sz in t.stores))
 
     mech = None
-    if (not r.loads and not r.stores) and (t.loads or t.stores) and \
+    if isa == 'x86_64' and r.uops == 1 and '(unimplemented)' in r.disas \
+            and not r.loads and not r.stores and (t.loads or t.stores):
+        # gem5 retires the instruction with no effects at all, so it issues no
+        # request either.  Named as the reference not modelling the
+        # instruction, which is a different fact from a hint it models as a
+        # no-op.
+        mech = 'REF-UNIMPLEMENTED-INSN'
+    elif (not r.loads and not r.stores) and (t.loads or t.stores) and \
             all(sz == 0 for _, _, sz in t.loads + t.stores):
         # The tracer mints a zero-width memop for a HINT the reference does
         # not execute at all.  gem5's MIPS says so out loud -- "Prefetching
@@ -527,6 +673,15 @@ def compare_insn(r, t, isa):
         # That is a store-exclusive lowered onto a compare-exchange, which
         # really reads.  The riscv64 leg found the same shape on `sc`.
         mech = 'QEMU-EXCLUSIVE-CMPXCHG'
+
+    # THE MEMOP DENOMINATOR IS INSTRUCTIONS THAT ACCESS MEMORY, not every
+    # aligned instruction.  Counting a fact for `add %rbx,%rax` would inflate
+    # all three memop axes with comparisons of two empty sets, which is the
+    # opposite of what the census is for.
+    if r.loads or r.stores or t.loads or t.stores:
+        sub.note('memop-count', t)
+        sub.note('memop-addr', t)
+        sub.note('memop-width', t)
 
     if rcnt != tcnt:
         if tcnt[0] >= rcnt[0] and tcnt[1] >= rcnt[1]:
@@ -563,6 +718,12 @@ def compare_insn(r, t, isa):
                              ('load-data', r.loads, t.loads)):
         rm, tm = bytemap(rrec), bytemap(trec)
         both_b = frozenset(rm) & frozenset(tm)
+        if both_b:
+            # Only an instruction that actually carried a byte BOTH sides
+            # valued is a subject of this axis.  Noting zero facts would still
+            # register the encoding and make the SUBJECTS column read as if
+            # every instruction in the leg had been a data-axis subject.
+            sub.note(axis, t, len(both_b))
         diff = frozenset(b for b in both_b if rm[b] != tm[b])
         if diff:
             rows.append(Disagreement(
@@ -574,9 +735,30 @@ def compare_insn(r, t, isa):
 
 
 # ---------------------------------------------------------------- alignment
-def align(ref, trc):
-    rk = [(i.pc, i.bits) for i in ref]
-    tk = [(i.pc, i.bits) for i in trc]
+def _key(isa):
+    """The alignment key, per ISA.
+
+    On a FIXED-WIDTH ISA the key is ``(pc, encoding)``: the encoding is read
+    out of the ELF both simulators were handed, so an alignment can never pair
+    two different instructions that happen to share an address.
+
+    x86-64 has no such key available on the reference side -- gem5 prints no
+    encoding, and reading one out of the file needs a LENGTH, which is the
+    very thing this leg wants to CHECK rather than assume.  So the key is the
+    PC alone and the length is verified afterwards, per instruction, against
+    the length gem5 derives from its own log.  Folding the length into the key
+    would turn a decoder disagreement into an alignment failure, which reports
+    as two unaligned instructions and names no mechanism.
+    """
+    if isa == 'x86_64':
+        return lambda i: (i.pc,)
+    return lambda i: (i.pc, i.bits)
+
+
+def align(ref, trc, isa='aarch64'):
+    k = _key(isa)
+    rk = [k(i) for i in ref]
+    tk = [k(i) for i in trc]
     sm = difflib.SequenceMatcher(a=rk, b=tk, autojunk=False)
     pairs, ref_only, trc_only = [], [], []
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
@@ -600,6 +782,12 @@ def main():
     ap.add_argument('--decode', required=True)
     ap.add_argument('-o', '--outdir', required=True)
     ap.add_argument('--tsv')
+    ap.add_argument('--pin-adjudicate', metavar='TSV',
+                    help='the per-row adjudication `cmp3_x86.py '
+                         '--adjudication` wrote.  Where gem5 and the tracer '
+                         'disagree and a THIRD reference on real silicon was '
+                         'asked, the row is labelled with what that witness '
+                         'answered -- in BOTH directions.')
     ap.add_argument('--python-home', metavar='PREFIX',
                     help='installation prefix of the interpreter gem5 was '
                          'BUILT against; its lib/ must hold the libpython '
@@ -609,6 +797,27 @@ def main():
     args = ap.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
+
+    #: (guest, pc, axis) -> the third witness's verdict.  ``what`` is dropped
+    #: from the key on purpose: this comparator's row is per AXIS, while the
+    #: adjudication is per axis AND register/direction, so a row is labelled
+    #: only when EVERY adjudicated key under it agrees on the verdict.  A row
+    #: whose keys disagree keeps no label and stays UNACCOUNTED.
+    pin_adj = {}
+    if args.pin_adjudicate:
+        seen_adj = collections.defaultdict(set)
+        with open(args.pin_adjudicate) as fh:
+            next(fh)
+            for line in fh:
+                f = line.rstrip('\n').split('\t')
+                if len(f) < 5:
+                    continue
+                seen_adj[(f[0], int(f[1], 16), f[2])].add(f[4])
+        for k, v in seen_adj.items():
+            v.discard('ALL-THREE-AGREE')
+            v.discard('PIN-VS-TRACER-NOT-COMPARED')
+            if len(v) == 1:
+                pin_adj[k] = v.pop()
 
     try:
         binary, cfg, g5env, notes = gem5_prereqs(
@@ -629,8 +838,18 @@ def main():
     totals = collections.Counter()
     unmapped = collections.Counter()
     dropped = {}
+    notes = collections.Counter()
     axis_ok = collections.Counter()
     axis_n = collections.Counter()
+    sub = Subjects()
+    #: every tracer instruction that was NOT compared, by NAME.  The identity
+    #: `sum of named tails == declared - compared` is asserted below, so a gap
+    #: between what the tracer declared and what this leg scored can never sit
+    #: unexplained -- which is how the aarch64 correct-path leg came to be
+    #: quoted over seven probes while its method documented eight.
+    tails = collections.Counter()
+    lenchk = collections.Counter()
+    lenbad = []
     raw = []
 
     for guest in args.guest:
@@ -646,18 +865,33 @@ def main():
         trace = run_tracer(args.qemu_dir, args.isa, guest, args.outdir)
         ref = gem5_ref.parse(log, guest, args.isa,
                              gem5_dir=args.gem5_dir,
-                             dropped=dropped)
+                             dropped=dropped, notes=notes)
         # tracer_log.parse also returns the source-value provenance the
         # riscv64 leg reports; this leg does not measure that axis.
         trc, _ = tracer_log.parse(args.decode, trace)
-        pairs, ref_only, trc_only = align(ref, trc)
+        pairs, ref_only, trc_only = align(ref, trc, args.isa)
         per_guest.append((os.path.basename(guest), len(ref), len(trc),
                           len(pairs), len(ref_only), len(trc_only)))
         for ins in ref_only:
             unaligned.append((os.path.basename(guest), ins.pc, 'REF-ONLY',
                               ins.disas))
-        for ins in trc_only:
-            unaligned.append((os.path.basename(guest), ins.pc, 'TRC-ONLY', ''))
+        # NAME every uncompared tracer instruction.  An instruction after the
+        # last aligned one is the reference having STOPPED -- gem5 SE mode
+        # handles `syscall` outside its instruction trace and the process
+        # exits, so the guest's last instruction has no reference.  One in the
+        # MIDDLE of the stream is a real alignment failure and is named as one
+        # so it cannot be absorbed by the tail.
+        aligned_ids = set(id(t) for _r, t in pairs)
+        last_al = max([j for j, i in enumerate(trc) if id(i) in aligned_ids],
+                      default=-1)
+        for j, ins in enumerate(trc):
+            if id(ins) in aligned_ids:
+                continue
+            why = ('REF-STOPPED-AT-GUEST-EXIT' if j > last_al
+                   else 'UNALIGNED-MID-STREAM')
+            tails[why] += 1
+            unaligned.append((os.path.basename(guest), ins.pc, 'TRC-ONLY',
+                              why))
 
         totals['ref_insns'] += len(ref)
         totals['trc_insns'] += len(trc)
@@ -671,21 +905,43 @@ def main():
             totals['trc_loads'] += len(t.loads)
             totals['ref_stores'] += len(r.stores)
             totals['trc_stores'] += len(t.stores)
-            bad = compare_insn(r, t, args.isa)
+            # --- INSTRUCTION LENGTH, x86_64 only.  gem5 prints no encoding,
+            # so where the instruction ENDS is the substantive decoder
+            # question on a variable-length ISA, and it is the fact the
+            # alignment key deliberately does NOT carry.  Checked here against
+            # the length the tracer published, counted, and any disagreement
+            # printed by name.
+            if args.isa == 'x86_64':
+                if r.length is None:
+                    lenchk['ref-states-none'] += 1
+                elif r.length == t.nbytes:
+                    lenchk['agree'] += 1
+                else:
+                    lenchk['disagree'] += 1
+                    lenbad.append((os.path.basename(guest), r.pc, r.length,
+                                   t.nbytes, r.disas))
+            bad = compare_insn(r, t, args.isa, sub)
             hit = set(d.axis for d in bad)
-            for ax in AXES:
+            for ax in axes_for(args.isa):
                 axis_n[ax] += 1
                 if ax not in hit:
                     axis_ok[ax] += 1
             for d in bad:
                 lab = d.label or 'NO-LABEL:' + d.axis
-                rule = gem5_exec_rule(d.label)
+                adj = pin_adj.get((os.path.basename(guest), d.pc, d.axis))
+                if adj == 'PIN-AGREES-WITH-TRACER':
+                    lab = 'REF-ADJUDICATED-BY-PIN'
+                elif adj == 'PIN-AGREES-WITH-GEM5':
+                    lab = 'TRACER-DEFECT-CONFIRMED-BY-PIN'
+                # The rule is looked up on the label the row ACTUALLY CARRIES,
+                # which is not the same thing as the label `compare_insn`
+                # proposed once a third reference has spoken about the row.
+                rule = exec_rule(lab)
                 row = classify('%s:0x%x' % (os.path.basename(guest), d.pc),
                                d.axis, lab, d.relation, rule)
                 all_rows.append(row)
                 raw.append((os.path.basename(guest), d.pc, d.axis, d.relation,
-                            d.label or '', render(d.ref), render(d.trc),
-                            r.disas))
+                            lab, render(d.ref), render(d.trc), r.disas))
 
     out = []
     out.append('ARC 3 -- %s EXECUTION cross-check: ChampSim Tracer vs gem5'
@@ -708,14 +964,74 @@ def main():
               'ref_loads', 'trc_loads', 'ref_stores', 'trc_stores'):
         out.append('  %-24s %8d' % (k, totals[k]))
     out.append('')
+    # ---------------------------------------------------- the identity
+    #
+    # DECLARED is what the tracer put on the wire; COMPARED is what this leg
+    # scored.  Every instruction in the difference is named, and the two are
+    # asserted to add up.  Without it a leg can quietly score a subset of its
+    # own probes and print a clean report -- which is exactly what the
+    # aarch64 correct-path leg did while its METHOD file documented eight
+    # probes and the run passed seven.
+    declared = totals['trc_insns']
+    compared = totals['aligned']
+    out.append('DECLARED vs COMPARED -- the identity, asserted')
+    out.append('  declared  %d      (instructions the tracer put on the wire)'
+               % declared)
+    out.append('  compared  %d      (instructions this leg scored)' % compared)
+    out.append('  gap       %d' % (declared - compared))
+    out.append('  uncompared, by NAME:')
+    for k, n in sorted(tails.items()):
+        out.append('    %-32s %d' % (k, n))
+    identity_ok = (sum(tails.values()) == declared - compared)
+    out.append('  IDENTITY  sum-of-named-uncompared == declared - compared '
+               ': %s' % ('HOLDS' if identity_ok else 'FAILS'))
+    out.append('')
+
+    axes = axes_for(args.isa)
+    for (i_, a_), why in sorted(NO_SUCH_AXIS.items()):
+        if i_ == args.isa:
+            out.append('AXIS NOT PRESENT ON THIS ISA: %s -- %s' % (a_, why))
+    out.append('')
     out.append('PER-AXIS AGREEMENT (over %d aligned instructions)'
                % totals['aligned'])
-    for ax in AXES:
+    for ax in axes:
         n, ok = axis_n[ax], axis_ok[ax]
         out.append('  %-16s %7d / %-7d   %s'
                    % (ax, ok, n,
                       'ALL AGREE' if ok == n else '%d disagree' % (n - ok)))
     out.append('')
+    out.append('PER-AXIS FACTS AND SUBJECTS')
+    out.append('')
+    bya = collections.Counter()
+    for r_ in all_rows:
+        bya[(r_.mnemonic, r_.direction)] += 1
+    for line in sub.render(axes, bya, VERDICTS):
+        out.append(line)
+    if args.isa == 'x86_64':
+        out.append('INSTRUCTION LENGTH -- checked, not aligned on')
+        out.append('  gem5 prints no encoding, so the alignment key is the PC '
+                   'alone and where the')
+        out.append('  instruction ENDS is verified separately: the reference '
+                   'derives a length from')
+        out.append('  the fall-through a control transfer\'s `rdip` micro-op '
+                   'publishes, and from the')
+        out.append('  next macro-op\'s PC otherwise.')
+        for k in ('agree', 'disagree', 'ref-states-none'):
+            out.append('    %-18s %d' % (k, lenchk[k]))
+        for g, pc, rl, tl, dis in lenbad[:40]:
+            out.append('    DISAGREE %-12s 0x%08x  ref=%s trc=%s  %s'
+                       % (g, pc, rl, tl, dis))
+        out.append('')
+    if notes:
+        out.append('REFERENCE-SIDE SUPPRESSIONS AND FOLDS, counted')
+        out.append('  A value the reference states in a representation the '
+                   'wire does not use is NOT')
+        out.append('  compared and NOT scored as agreement; it is suppressed '
+                   'here and counted, so an')
+        out.append('  exclusion that stops matching cannot go unnoticed.')
+        for k, n in sorted(notes.items(), key=lambda kv: -kv[1])[:40]:
+            out.append('    %8d  %s' % (n, k))
+        out.append('')
     if unaligned:
         out.append('UNALIGNED -- %d' % len(unaligned))
         for g, pc, kind, d in unaligned[:40]:
@@ -767,8 +1083,15 @@ def main():
 
     nsub = sum(1 for r in all_rows if r.direction == SUBSET)
     nun = sum(1 for r in all_rows if r.direction == UNACCOUNTED)
-    sys.stderr.write('SUBSET=%d UNACCOUNTED=%d\n' % (nsub, nun))
-    return 1 if (nsub or nun) else 0
+    inert = sub.inert(axes)
+    sys.stderr.write('SUBSET=%d UNACCOUNTED=%d INERT=%s IDENTITY=%s\n'
+                     % (nsub, nun, ','.join(inert) or 'none',
+                        'HOLDS' if identity_ok else 'FAILS'))
+    # An INERT axis and a broken identity are FAILURES, not footnotes.  An
+    # axis that compared nothing prints a clean zero that is survivorship
+    # bias, and a leg whose declared and compared counts do not add up has
+    # scored a subset of itself.  Both must be able to fail the run.
+    return 1 if (nsub or nun or inert or not identity_ok) else 0
 
 
 if __name__ == '__main__':

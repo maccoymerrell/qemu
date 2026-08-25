@@ -151,8 +151,33 @@ def parse(logpath, sel=None, dropped=None, folded=None, merged=None):
         pc = int(m.group(2), 16)
         upc = int(m.group(3)) if m.group(3) is not None else None
         rest = m.group(4)
-        new_insn = (cur is None or prev_pc != pc or upc is None or
-                    prev_upc is None or upc != prev_upc + 1)
+        # WHERE ONE ARCHITECTURAL INSTRUCTION BEGINS.
+        #
+        # gem5 says so itself: the first micro-op of a macro-op carries
+        # `IsFirstMicroop` in its instruction flags, and an uncracked
+        # instruction carries no micro-PC at all.  Reading that is exact.
+        #
+        # The rule this replaced -- "a new instruction when the micro-PC is
+        # not one more than the previous line's" -- assumed the micro-PC
+        # increases monotonically through a macro-op, and gem5's DIVIDE does
+        # not: `divq %rsi` emits `div1`, then `div2` REPEATEDLY at the SAME
+        # micro-PC while the quotient is developed.  Measured on the
+        # correct-path p_int probe, one `divq` and one `idivq` were split
+        # into SEVEN separate architectural instructions at two addresses,
+        # every one of them REF-ONLY, and the eight rows that produced were
+        # scored as an alignment failure rather than as one instruction.
+        mfl_new = _FL.search(rest)
+        fset_new = set(mfl_new.group(1).split('|')) if mfl_new else set()
+        if upc is None:
+            new_insn = True
+        elif fset_new:
+            new_insn = 'IsFirstMicroop' in fset_new
+        else:
+            # No flags column at all: fall back to the positional rule rather
+            # than merging everything after it into one instruction.
+            new_insn = (cur is None or prev_pc != pc or prev_upc is None or
+                        upc != prev_upc + 1)
+        new_insn = new_insn or cur is None
         prev_pc, prev_upc = pc, upc
         if new_insn:
             cur = Insn(pc)
@@ -334,6 +359,18 @@ def parse(logpath, sel=None, dropped=None, folded=None, merged=None):
     for i, ins in enumerate(out):
         if ins.length is not None:
             continue
+        # THE SEQUENTIAL FALLBACK IS ONLY VALID WHERE THE FLOW IS SEQUENTIAL.
+        # For a CONTROL TRANSFER the next macro-op's PC is the TARGET, not the
+        # fall-through, so the subtraction states the distance to somewhere
+        # else entirely.  Measured on the correct-path p_flow probe:
+        # `jmp *%r10` -- three bytes, and gem5 emits no `rdip` for the
+        # register-indirect form -- came back as length 7, the distance to its
+        # own target, and the leg reported a decoder disagreement about an
+        # instruction boundary that neither decoder had got wrong.  A control
+        # transfer with no `rdip` leaves the length UNKNOWN, which the report
+        # counts by name.
+        if ins.ctrl:
+            continue
         if i + 1 < len(out):
             d = out[i + 1].pc - ins.pc
             if 0 < d <= 15:
@@ -361,7 +398,25 @@ def _x87_name(raw_idx, top_before, top_after):
     i = raw_idx - 48
     tb = 0 if top_before is None else top_before
     ta = tb if top_after is None else top_after
-    return 'REG_FPR%d' % ((tb + i - ta) % 8)
+    # THE CONVERSION IS ONLY OWED ON A PUSH, AND APPLYING IT TO A POP NAMES
+    # THE WRONG REGISTER.
+    #
+    # gem5's stack-relative operand is always taken against the top BEFORE the
+    # instruction.  So is the ARCHITECTURE's, for every form that spells its
+    # destination -- `faddp %st, %st(1)` adds into ST(1) and pops, and ST(1)
+    # is read against the old top.  The one family that does not is the
+    # PUSHING one: FLD/FLD1/FLDZ/FLDPI define their destination as the NEW
+    # ST(0), which gem5 spells `%st(7)` against the old top.
+    #
+    # Converting unconditionally therefore fixed the push and broke the pop.
+    # Measured on the correct-path x87 probe: `faddp` and `fsubrp` came back
+    # as REG_FPR0 against the tracer's REG_FPR1 -- three ORTHOGONAL rows that
+    # read as the tracer naming the wrong x87 register and were the reader's
+    # own.  A push is identified from the tops themselves, not from a
+    # mnemonic: TOP decrements by one.
+    if ta == (tb - 1) % 8:
+        return 'REG_FPR%d' % ((tb + i - ta) % 8)
+    return 'REG_FPR%d' % (i % 8)
 
 
 def _finalize(insns, dropped, folded, merged):

@@ -1,4 +1,4 @@
-# ARC 3 -- the aarch64 and mipsel EXECUTION leg, against gem5
+# ARC 3 -- the aarch64, mipsel and x86_64 CORRECT-PATH EXECUTION leg, against gem5
 
 Author: Maccoy Merrell.
 
@@ -290,11 +290,161 @@ The X86 check was a real program, not a smoke test — `gcc -O2 -static`, a
     sum=333283335000
     Exiting @ tick 211059000 because exiting with last active thread context
 
-**X86 is built and proven to run; it is not yet scoreable.**
-`gem5_ref.REGMAP` has readers for `aarch64` and `mipsel` only, so
-`--isa x86_64` refuses by name rather than scoring unmapped registers as
-agreement.  Adding an `_x86_reg` reader next to `_arm_reg` / `_mips_reg` is
-the one remaining step.
+**X86 IS SCOREABLE.**  `gem5_ref.REGMAP` now carries an `x86_64` entry, and it
+is not a third transcription of the register vocabulary: it delegates to
+`wp/x86_vocab.py`, which the WRONG-PATH leg already uses, so the two legs
+cannot drift apart about which gem5 index is which architectural register.
+`gem5_ref.parse` dispatches the ISA to `gem5_x86_cp.py`, which ADAPTS the
+wrong-path reader rather than repeating it -- the x87 stack through `X87Top`,
+XMM as two 64-bit halves, RFLAGS reconstruction from three condition-code
+registers, merge-read suppression and contiguous-access folding are the same
+five decisions on both paths.
+
+Three things are different on the correct path and each is stated where it is
+done:
+
+* **ALIGNMENT IS ON THE PC ALONE.**  The fixed-width ISAs key on
+  `(pc, encoding)` with the encoding read out of the ELF at a four-byte
+  stride; x86-64 has no such key, because gem5 prints no encoding and reading
+  one from the file needs a LENGTH.  The length is therefore CHECKED rather
+  than assumed: gem5 states one from the fall-through a control transfer's
+  `rdip` micro-op publishes and from the next macro-op's PC otherwise, and the
+  report prints agree / disagree / not-stated.  Folding the length into the
+  key would turn a decoder disagreement into an alignment failure, which
+  names no mechanism.
+* **THE x87 REGISTER VALUE IS NOT COMPARED, AND THE SUPPRESSION IS COUNTED.**
+  gem5 holds the x87 file as `double` while the architecture and the wire hold
+  the 80-bit extended encoding, and the sidecar readback is further truncated
+  to the writing micro-op's data size -- measured on `flds`, `movfp %st(7),
+  %ufp1` publishes `floating_point:55=0x60000000` for a datum whose double is
+  `0x3916d00e60000000`.  The register is still compared on the SET axis.
+* **THE FLAGS WORD IS REBUILT PER INSTRUCTION.**  The wrong-path leg runs a
+  RUNNING reconstruction because it must compare against state it installed;
+  on the correct path every instruction is compared, so carrying a bit forward
+  buys nothing and costs correctness -- gem5's `popcnt` writes no `Zaps` at
+  all while the architecture CLEARS PF, and a running word charged the tracer
+  with a defect for a bit set three instructions earlier.
+
+## The contract every correct-path leg now meets
+
+`REPRODUCE_cp.sh <isa>` is the entry point and it runs four steps in order.
+
+1. **NINE AXES**, with a **FACTS and SUBJECTS census** per axis
+   (`axis_subjects.Subjects`, shared with the four wrong-path legs).  FACTS is
+   the number of comparisons the axis performed; SUBJECTS the number of
+   DISTINCT ENCODINGS that carried one.  A fact is only counted where the axis
+   had something to compare -- two empty register sets are not a comparison --
+   and an axis with zero facts prints **INERT**, which is a demand for a
+   better probe and never a pass.  INERT fails the run.
+   `NO_SUCH_AXIS` names the one axis an ISA does not HAVE: mipsel has no
+   architectural flags register, so `flags-dst-set` is absent there by the
+   architecture rather than exempted, and mipsel's contract is eight axes.
+2. **A NEGATIVE CONTROL, RUN FIRST** (`selftest_cp_gem5.py`).  Each axis is
+   broken in the TRACER record, on an instruction that carries a subject for
+   it, and must CONVICT -- FIRED means the axis's disagreement count strictly
+   increases against the same run's unmutated baseline.  The set axes carry
+   TWO mutations, drop and invent, because on some ISAs only one of them can
+   fire: on mipsel the tracer publishes an FP status destination the reference
+   does not, so DROPPING it makes the two sets agree and the mutation repairs
+   a known granularity difference instead of injecting a defect.
+3. **THE DECLARED == COMPARED IDENTITY, PRINTED AND ASSERTED.**  Every tracer
+   instruction not scored is named -- `REF-STOPPED-AT-GUEST-EXIT` for the
+   `syscall` gem5 SE mode handles outside its instruction trace,
+   `UNALIGNED-MID-STREAM` for anything else -- and the sum is asserted against
+   `declared - compared`.  A leg that cannot account for its own gap is how
+   the aarch64 leg came to be quoted over seven probes while this file
+   documented eight.
+4. **x86_64 ONLY: A THIRD REFERENCE.**  See below.
+
+## The third reference, and what it found
+
+`cmp3_x86.py` runs the SAME probes under PIN on real silicon and scores the
+three pairings against each other.  PIN is authoritative about a VALUE and
+useless about a SET -- `INS_RegR`/`INS_RegW` report the EXPLICIT operands, so
+it can convict a subset and never a superset -- so the register SET axis is
+not asked of it at all.
+
+It writes a per-row ADJUDICATION which `compare_exec_gem5.py --pin-adjudicate`
+reads back, and the adjudication is asymmetric ON PURPOSE: where PIN returns
+the TRACER's value the gem5 row is labelled `REF-ADJUDICATED-BY-PIN` and
+accounts; where PIN returns GEM5's value the row is labelled
+`TRACER-DEFECT-CONFIRMED-BY-PIN` and does NOT account.  A third reference can
+only convict the trace, never excuse it.  A key the tracer/PIN pairing never
+COMPARED is its own verdict -- silence is not agreement -- which is the honest
+answer for a prefetch whose width the wire states as 0 by construction.
+
+MEASURED over the six correct-path probes: **15 gem5/PIN disagreements, of
+which PIN returned the tracer's value on 13**, and the remaining two are the
+prefetch rows where all three tools give three different answers.
+
+## Reference limits this leg measured, and did not assume
+
+* **gem5's MXCSR carries no accumulated exception flags.**  `stmxcsr` after a
+  run of SSE arithmetic: gem5 `0x1f80`, the tracer `0x1fa9`, PIN `0x1fa9`.
+* **gem5's x87 status word carries only TOP.**  `fnstsw %ax`: gem5 `0x3000`,
+  the tracer `0x3020`, PIN `0x3020`.
+* **gem5's 4-byte x87 store publishes zero**, and its 64-bit x87 store
+  publishes a value neither the trace nor the machine holds.
+* **gem5's composed RFLAGS has no IF and no architecturally-fixed bit 1.**
+  `pushfq`: gem5 `0x46`, the tracer `0x246`, PIN `0x246`.
+* **gem5 sets AF after a shift where the machine clears it.**  The SDM leaves
+  AF UNDEFINED for `shl`/`shr`/`sar`/`rol`, and PIN read 0 from the machine
+  exactly as the tracer published it.
+* **gem5 does not implement `fwait`, `fninit`, `fsqrt`, `ffree`, `fincstp`,
+  `fdecstp` or `prefetch_nta`**: it warns once and retires the instruction
+  with no architectural effects at all (`REF-UNIMPLEMENTED-INSN`).  Because
+  such an instruction leaves the two machines DIVERGENT from that point on,
+  the x87 probe places them in a trailing section after everything that
+  depends on x87 state.
+* **A prefetch's extent is nobody's per-instruction fact.**  gem5 models
+  `prefetcht0` as a one-byte load, PIN reports the host's 64-byte line, and
+  the trace states an address and no width.  Three tools, three answers,
+  which is the measurement behind `docs/format.rst` 5.2.
+
+## Defects this leg found in its own instruments, each fixed at source
+
+Every one was invisible to the wrong-path legs, and every one is a silent
+corruption rather than an error:
+
+* `tracer_log._INSN_L` required TWO spaces after the byte column, and
+  `cst_decode` separates a >7-byte instruction from its mnemonic with ONE.
+  Every x86-64 instruction of 8 bytes or more was DROPPED from the stream, and
+  because the value stream is joined on POSITION, one drop re-attributed every
+  destination value after it.  Measured on `p_int`: 3 of 64 lines dropped and
+  49 register sets scored against the wrong instruction.  The reader now takes
+  the bytes as tokens AND asserts the per-block count against the `insns=` the
+  block header states.
+* That assertion immediately found a second one: `tracer_log`'s refusal to
+  parse a WRONG-PATH trace looked for `' WP '`, and the renderer writes
+  `; ..... wp[0] BB 6 ...`.  The guard was INERT and a wrong-path trace had
+  its WP instructions folded into the preceding correct-path block in silence.
+* `gem5_wp_ref`'s instruction delimiter assumed the micro-PC increases
+  monotonically through a macro-op.  gem5's DIVIDE repeats `div2` at the SAME
+  micro-PC; `divq`/`idivq` were split into seven separate architectural
+  instructions.  The delimiter now reads gem5's own `IsFirstMicroop` flag.
+* `_x87_name` converted gem5's stack-relative operand to the post-instruction
+  top unconditionally.  That is owed on a PUSH and wrong on a POP: `faddp`
+  came back as `REG_FPR0` against the tracer's `REG_FPR1`.
+* The instruction-length fallback subtracted the next macro-op's PC on a
+  CONTROL TRANSFER, where that PC is the TARGET.  `jmp *%r10` -- three bytes,
+  and gem5 emits no `rdip` for the register-indirect form -- came back as
+  length 7.
+* `x86_vocab.rflags_from_cc` read gem5's `Df` as a direction of 1 or -1.
+  gem5 stores the DF BIT IN PLACE (`regop.isa`: `dfBit = newFlags & DFBit`;
+  `misc.hh:68`: `DFBit = 1 << 10`), so the ordinary case -- DF clear, `Df` 0
+  -- reconstructed the word with DF SET and charged the tracer with six
+  flags-value defects.
+* `x86_vocab` mapped gem5's `misc_reg::Fcw` onto `REG_FCSR`.  The wire gives
+  the x87 CONTROL word its own id, `REG_FPCW`, and a reference folding the two
+  would have scored a control-word write against a status-word write and
+  called it agreement.  The wrong-path leg could not catch it:
+  `miscellaneous:193` occurs ZERO times over its whole run, because no
+  wrong-path probe transfers the control word.
+
+**All six shared-code changes are INERT on the x86_64 wrong-path leg**:
+`rows.tsv` is byte-identical to the banked baseline, 449 rows, 0 lines of
+diff.  The aarch64 correct-path leg's cross-tabulation and per-axis table are
+byte-identical to the banked run as well.
 
 ## Running it
 

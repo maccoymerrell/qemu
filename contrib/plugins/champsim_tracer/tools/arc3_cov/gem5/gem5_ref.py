@@ -50,6 +50,7 @@ Author: Maccoy Merrell.
 import os
 import re
 import struct
+import sys
 
 # ``  <tick>: system.cpu: T0 : 0x4000b0[.  1] :   <disasm> : <OpClass> : ...``
 _LINE = re.compile(
@@ -75,8 +76,16 @@ ARC3_AMO = 0x2000000000000000
 class Insn(object):
     """One executed architectural instruction as gem5 recorded it."""
 
+    #: ``length`` / ``rflags`` / ``rflags_mask`` / ``preserve_reads`` /
+    #: ``syscall`` are filled by the x86_64 arm only.  gem5 prints no encoding
+    #: and holds no RFLAGS register, so on a variable-length ISA the reference
+    #: states a LENGTH (checked, not aligned on) and a RECONSTRUCTED flags word
+    #: with a mask naming which bits it spoke about.  They are declared here,
+    #: rather than in a subclass, so that one comparator reads one record type.
     __slots__ = ('pc', 'bits', 'nbytes', 'writes', 'loads', 'stores',
-                 'uops', 'disas', 'srcs', 'unmapped', 'ctrl')
+                 'uops', 'disas', 'srcs', 'unmapped', 'ctrl',
+                 'length', 'rflags', 'rflags_mask', 'preserve_reads',
+                 'syscall')
 
     def __init__(self, pc, bits, nbytes):
         self.pc = pc
@@ -90,6 +99,11 @@ class Insn(object):
         self.disas = ''
         self.unmapped = []    # gem5 reg ids no vocabulary rule reaches
         self.ctrl = False     # gem5 calls this a control transfer
+        self.length = None    # x86_64 only: the length gem5 states, or None
+        self.rflags = None    # x86_64 only: the reconstructed flags word
+        self.rflags_mask = 0  # x86_64 only: which bits gem5 spoke about
+        self.preserve_reads = set()   # x86_64 only: R7.1 preserve reads
+        self.syscall = False
 
     def __repr__(self):
         return 'g5Insn(pc=0x%x uops=%d w=%r ld=%r st=%r)' % (
@@ -297,7 +311,23 @@ def _mips_reg(cls, idx):
     return None
 
 
-REGMAP = {'aarch64': _arm_reg, 'mipsel': _mips_reg}
+#: The x86_64 vocabulary is NOT transcribed a second time here.  It lives in
+#: ``wp/x86_vocab.py``, where the wrong-path leg also uses it, and a single
+#: table is the only way the two legs cannot drift apart on which gem5 index
+#: is which architectural register.  The wrapper exists because ``REGMAP`` is
+#: the correct-path comparator's own prerequisite gate: an ISA absent from it
+#: is REFUSED by name rather than scored with every register unmapped.
+_WP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'wp')
+if _WP_DIR not in sys.path:
+    sys.path.insert(0, _WP_DIR)
+import x86_vocab as _x86v                                       # noqa: E402
+
+
+def _x86_reg(cls, idx):
+    return _x86v.to_generic(cls, idx)
+
+
+REGMAP = {'aarch64': _arm_reg, 'mipsel': _mips_reg, 'x86_64': _x86_reg}
 
 
 def exec_ranges(path):
@@ -388,14 +418,26 @@ def _regs(field, mapper, sink, internal):
     return out
 
 
-def parse(logpath, elfpath, isa, gem5_dir=None, dropped=None):
+def parse(logpath, elfpath, isa, gem5_dir=None, dropped=None, notes=None):
     """(gem5 exec log, the guest ELF, isa) -> [Insn] in execution order.
 
     Micro-ops are folded onto their macro-op.  A new architectural instruction
     starts when the line has no micro-PC, or when its micro-PC is not one more
     than the previous line's -- which is what a loop back to the same PC looks
     like, and is why the PC alone cannot delimit them.
+
+    x86_64 is dispatched to ``gem5_x86_cp``, which adapts the WRONG-PATH leg's
+    x86 reader rather than repeating it.  The five decisions that reader had to
+    make -- the x87 stack through ``X87Top``, XMM as two halves, RFLAGS
+    reconstruction, merge-read suppression and contiguous-access folding -- are
+    the same on both paths, and a second implementation would be a second place
+    for them to drift.  The import is local so the two modules can refer to
+    each other without a cycle.
     """
+    if isa == 'x86_64':
+        import gem5_x86_cp
+        return gem5_x86_cp.parse(logpath, elfpath, dropped=dropped,
+                                 notes=notes)
     mapper = REGMAP[isa]
     if dropped is None:
         dropped = {}

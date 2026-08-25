@@ -232,6 +232,64 @@ GEM5_EXEC = {
              note='the reference executes an address-based hint or cache '
                   'maintenance operation as a no-op and issues no request'),
 
+    # A THIRD REFERENCE WAS ASKED, AND IT SIDED WITH THE TRACER.
+    #
+    # gem5 is a model; PIN observes a REAL execution of the same probe on real
+    # silicon.  Where gem5 and the tracer disagree about a VALUE and PIN
+    # returns the TRACER's value, the row is a defect of the reference and not
+    # of the trace, and this label says so with the measurement behind it
+    # rather than with an argument.  It is applied PER ROW, from
+    # `cmp3_x86.py --adjudication`, never from a pattern written by hand: the
+    # comparator is handed the third witness's answer for that exact
+    # (guest, pc, axis) and labels only the rows it covers.
+    #
+    # IT IS NOT SYMMETRIC.  Where PIN returns GEM5's value the row keeps a
+    # label that does NOT account (`TRACER-DEFECT-CONFIRMED-BY-PIN`), so a
+    # third reference can only ever convict the trace, never excuse it.
+    #
+    # MEASURED on the x86_64 correct-path leg: 9 of the 11 gem5/PIN
+    # disagreements were this -- gem5's MXCSR carrying no accumulated
+    # exception flags, its x87 status word carrying only TOP, its 4-byte x87
+    # store publishing zero, its 64-bit x87 store publishing a value neither
+    # the trace nor the machine holds, its composed RFLAGS missing IF, and AF
+    # after a shift, where the SDM leaves the bit UNDEFINED and PIN read 0
+    # from the machine exactly as the tracer published it.
+    'REF-ADJUDICATED-BY-PIN':
+        Rule('REF-ADJUDICATED-BY-PIN', 'reference-defect',
+             {SUPERSET, SUBSET, ORTHOGONAL},
+             note='a third reference -- PIN, on real silicon, running the '
+                  'same probe -- was asked and returned the TRACER value; '
+                  'the gem5 row is reference-side'),
+
+    # The other direction of the same instrument, and it deliberately does NOT
+    # account: a row PIN confirms against the trace is a tracer defect with a
+    # second witness, and it must stay in the disqualifying column.
+    'TRACER-DEFECT-CONFIRMED-BY-PIN':
+        Rule('TRACER-DEFECT-CONFIRMED-BY-PIN', 'tracer-defect',
+             {SUPERSET, SUBSET, ORTHOGONAL}, accounts=False,
+             note='PIN, on real silicon, returned the REFERENCE value; the '
+                  'trace is wrong and a second witness says so'),
+
+    # THE REFERENCE DOES NOT MODEL THE INSTRUCTION AT ALL.  gem5 prints
+    # `warn: instruction '<name>' unimplemented`, retires the instruction with
+    # NO effects -- no destination, no flags, no memory request -- and carries
+    # on.  Measured on the x86_64 correct-path probes: `fwait`, `fninit`,
+    # `fsqrt`, `ffree`, `fincstp`, `fdecstp` and `prefetch_nta`.  The row is
+    # emitted only where gem5's own disassembly column says `(unimplemented)`
+    # on a single-micro-op instruction, so it cannot be reached by an
+    # instruction gem5 models and merely disagrees about.
+    #
+    # IT IS NOT A LICENCE.  An unimplemented instruction leaves the machine
+    # state DIVERGENT from that point on, so a probe that keeps one in the
+    # middle of a dependence chain poisons every later comparison.  The x86_64
+    # probes place them last for that reason, and the leg reports the count.
+    'REF-UNIMPLEMENTED-INSN':
+        Rule('REF-UNIMPLEMENTED-INSN', 'reference-gap',
+             {SUPERSET, ORTHOGONAL},
+             note="gem5 warns 'instruction unimplemented' and retires it with "
+                  'no architectural effects; the tracer records what the '
+                  'instruction really does'),
+
     # gem5 keeps the MIPS FP condition-code bit inside FCSR and reports an
     # FCSR write; the tracer gives the condition code an id of its own.  Same
     # bit, two spellings.

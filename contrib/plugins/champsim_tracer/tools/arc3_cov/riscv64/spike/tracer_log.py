@@ -48,8 +48,60 @@ _MEM_L = re.compile(
 
 _BBHDR = re.compile(r'^;\s*-+\s*BB\s+(\d+)\s+entry\s+pc=0x([0-9a-f]+)\s+'
                     r'insns=(\d+)\s+seq=(\d+)\b')
-_INSN_L = re.compile(r'^0x([0-9a-f]+)\s*(?:<[^>]*>)?:\s+'
-                     r'((?:[0-9a-f]{2} )+)\s')
+
+#: The address prefix of a disassembly line.  The BYTE COLUMN IS NOT PARSED BY
+#: A REGEX, and that is a fix rather than a style choice.
+#:
+#: `cst_decode --format=disasm` sizes its byte column for the <=7-byte common
+#: case and pads to it; a LONGER instruction overflows the column and is
+#: separated from the mnemonic by exactly ONE space (`cst_decode_main.cc`'s
+#: `append_pad_to` says so in as many words).  The pattern this replaced ended
+#: `((?:[0-9a-f]{2} )+)\s` -- two whitespaces -- so every x86-64 instruction of
+#: 8 bytes or more MATCHED NOTHING and was dropped from the stream in silence.
+#: A dropped line is not merely a missing instruction: the legacy value stream
+#: is joined on the POSITION of the instruction within its block, so one drop
+#: re-attributes every destination value and every memop after it to the wrong
+#: instruction.  Measured on `p_int`: 3 of 64 lines dropped and 49 register
+#: sets scored against the wrong instruction.
+#:
+#: The bytes are therefore taken as tokens, and ``parse`` asserts the per-block
+#: count against the ``insns=`` the block header states, so a future column
+#: change can only produce a NAMED refusal.
+#: THE WRONG-PATH BLOCK HEADER, AS `--format=disasm` ACTUALLY WRITES IT.
+#:
+#: This guard existed before and did not work.  It looked for `' WP '` or a
+#: line beginning `'; ----- WP'`, and the renderer writes neither: a wrong-path
+#: block opens `; ..... wp[0] BB 6 n_insns=4 -----`.  So a trace taken with
+#: `wp` enabled was not refused -- its wrong-path instruction lines were
+#: appended to the preceding CORRECT-PATH block and scored as part of it, with
+#: the value stream then joined against the wrong positions.  Nothing reported
+#: anything: the refusal was inert and the corruption silent.
+#:
+#: It was found by the per-block count assertion below, which is the general
+#: form of the same protection -- 6 of 54 banked traces refuse with a line
+#: count that cannot be right, and every one of them is this.
+_WPHDR = re.compile(r'^;\s*\.+\s*wp\[')
+
+_INSN_PC = re.compile(r'^0x([0-9a-f]+)\s*(?:<[^>]*>)?:\s+(.*)$')
+_HEXBYTE = re.compile(r'^[0-9a-f]{2}$')
+
+
+def _insn_line(line):
+    """A disassembly line -> (pc, bits, nbytes), or None if it is not one."""
+    m = _INSN_PC.match(line)
+    if m is None:
+        return None
+    by = []
+    for tok in m.group(2).split():
+        if not _HEXBYTE.match(tok):
+            break
+        by.append(int(tok, 16))
+        if len(by) == 15:            # the longest an x86-64 instruction can be
+            break
+    if not by:
+        return None
+    b = bytes(by)
+    return int(m.group(1), 16), int.from_bytes(b, 'little'), len(b)
 
 
 class Insn(object):
@@ -106,23 +158,39 @@ def parse(decode, trace):
     """
     # ---- skeleton: entry -> [(pc, bits, nbytes)], from the disasm view
     order = []                       # [(tid, seq, [ (pc,bits,nbytes), ... ])]
+    declared = []                    # the `insns=` each block header states
     cur = None
     for line in _run(decode, trace, 'disasm'):
         h = _BBHDR.match(line)
         if h:
             cur = (int(h.group(1)), int(h.group(4)), [])
             order.append(cur)
+            declared.append(int(h.group(3)))
             continue
         if line.startswith(';'):
-            if ' WP ' in line or line.startswith('; ----- WP'):
+            if _WPHDR.match(line) or ' WP ' in line or \
+                    line.startswith('; ----- WP'):
                 raise RuntimeError('trace carries wrong-path blocks; '
                                    'run the tracer with wp=0')
             continue
-        m = _INSN_L.match(line)
-        if m and cur is not None:
-            by = bytes(int(b, 16) for b in m.group(2).split())
-            cur[2].append((int(m.group(1), 16),
-                           int.from_bytes(by, 'little'), len(by)))
+        rec = _insn_line(line) if cur is not None else None
+        if rec is not None:
+            cur[2].append(rec)
+
+    # THE COUNT IS ASSERTED, NOT ASSUMED.  The legacy value stream is joined on
+    # an instruction's POSITION inside its block, so a disassembly line this
+    # reader failed to parse does not lose one instruction -- it shifts every
+    # value after it onto a different instruction and reports a full, clean
+    # stream while doing it.  Refusing by name is the only way that class
+    # cannot come back silently.
+    for (tid, seq, lst), want in zip(order, declared):
+        if len(lst) != want:
+            raise RuntimeError(
+                'cst_decode --format=disasm block BB %d (seq %d) declares '
+                'insns=%d but %d instruction lines parsed.  The value stream '
+                'is joined on position, so scoring this would attribute every '
+                'later value to the wrong instruction.  Nothing is parsed.'
+                % (tid, seq, want, len(lst)))
 
     # ---- SOURCE registers: the template dictionary, keyed the way the
     # disasm block header keys it (BB <template id>, index within the block).

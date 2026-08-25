@@ -272,6 +272,37 @@ bool StillBuggy_SwpMemAccess(const cs_insn &insn)
      * READ|WRITE (it's the LSE atomic-swap family). Bug: access == 0. */
     return OpAccess_a64(insn, 2) == 0;
 }
+bool StillBuggy_VaCacheMaintNoMem(const cs_insn &insn)
+{
+    /* dc cvau, x0: Xt is the virtual address the maintained line is
+     * selected by, so the operand should be a MEM form.  Bug: Capstone
+     * models no memory operand anywhere in the DC/IC by-VA space and
+     * presents Xt as a plain register read. */
+    for (unsigned i = 0; i < insn.detail->arm64.op_count; i++) {
+        if (insn.detail->arm64.operands[i].type == AARCH64_OP_MEM) {
+            return false;
+        }
+    }
+    return true;
+}
+bool StillBuggy_GcsStoreNoMem(const cs_insn &insn)
+{
+    /* gcsstr x2, x1: the second operand is [Xn], the GCS slot written.
+     * Bug: Capstone models no memory operand at all (and its printer
+     * drops the brackets). */
+    for (unsigned i = 0; i < insn.detail->arm64.op_count; i++) {
+        if (insn.detail->arm64.operands[i].type == AARCH64_OP_MEM) {
+            return false;
+        }
+    }
+    return true;
+}
+bool StillBuggy_TagMultipleStoreRead(const cs_insn &insn)
+{
+    /* stzgm x2, [x1]: the MEM operand (index 1) is the block being
+     * written.  Bug: reported READ. */
+    return !(OpAccess_a64(insn, 1) & CS_AC_WRITE);
+}
 bool StillBuggy_ShiftImmAliasDropsImm(const cs_insn &insn)
 {
     /* lsl w0,w1,#3: the true alias is 3-operand (Rd,Rn,#imm). Bug:
@@ -444,6 +475,29 @@ const std::vector<Case> &Cases()
          CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN,
          {0x40, 0x80, 0x21, 0xb8},
          StillBuggy_SwpMemAccess},
+        {"cap_aarch64_is_va_cache_maint_sysop", "cap_fill_arm64_operands",
+         "6.0.0-Alpha7",
+         "DC/IC cache maintenance BY VIRTUAL ADDRESS (dc cvau, dc civac, "
+         "ic ivau, ...): no memory operand is modelled, so the address "
+         "the operation acts on is not decodable",
+         CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN,
+         {0x20, 0x7b, 0x0b, 0xd5},
+         StillBuggy_VaCacheMaintNoMem},
+        {"cap_fill_arm64_operands (GCSSTR)", "cap_fill_arm64_operands",
+         "6.0.0-Alpha7",
+         "GCSSTR / GCSSTTR: no memory operand is modelled, so the store "
+         "is not decodable (both operands are reported as plain register "
+         "reads)",
+         CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN,
+         {0x22, 0x0c, 0x1f, 0xd9},
+         StillBuggy_GcsStoreNoMem},
+        {"cap_aarch64_tag_multiple_store", "cap_fill_arm64_operands",
+         "6.0.0-Alpha7",
+         "STGM / STZGM: the MEM operand is the block being written but is "
+         "reported READ (the single-tag STG / STZG forms are correct)",
+         CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN,
+         {0x22, 0x00, 0x20, 0xd9},
+         StillBuggy_TagMultipleStoreRead},
         {"cap_aarch64_is_buggy_shift_imm_alias", "cap_fill_arm64_operands",
          "6.0.0", "LSL/LSR/ASR/ROR #imm alias of UBFM/SBFM/EXTR: the IMM "
          "operand is dropped from the structured array (op_count 2, not 3)",

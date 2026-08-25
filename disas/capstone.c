@@ -428,6 +428,7 @@ static bool cap_decode_aarch64_vas(unsigned vas,
                                    uint8_t *total_bytes);
 static uint8_t cap_lane_bytes_from_mnemonic(const char *mnem);
 static bool cap_aarch64_is_block_zero_sysop(const cs_arm64 *a64, uint8_t n);
+static bool cap_aarch64_is_va_cache_maint_sysop(const cs_arm64 *a64, uint8_t n);
 static bool cap_x86_is_extract_store(const char *mnem);
 static bool cap_x86_is_move_family(const char *mnem);
 static bool cap_x86_is_test(const char *mnem);
@@ -3433,6 +3434,93 @@ static bool cap_aarch64_is_block_zero_sysop(const cs_arm64 *a64, uint8_t n)
 }
 
 /*
+ * AArch64 cache maintenance BY VIRTUAL ADDRESS: Capstone models no
+ * memory operand, so the address the instruction was given goes
+ * nowhere.
+ *
+ * `DC CVAU, Xt` and `IC IVAU, Xt` name an effective address and act on
+ * the cache line that contains it.  They move no architectural data --
+ * QEMU implements every one of them as ARM_CP_NOP except `IC IVAU`,
+ * which under CONFIG_USER_ONLY invalidates translations rather than
+ * touching data (target/arm/helper.c:5199, :5259-5310) -- so there is
+ * no load and no store to report, and the Arm MRA agrees (mr=0, mw=0).
+ * What there IS, and what was being dropped, is the ADDRESS.  A cache
+ * model is the consumer of these traces; a cache-maintenance operation
+ * delivered to it without the line it operates on is not a reduced
+ * record, it is an unusable one.
+ *
+ * The tracer already has exactly one vocabulary for "an address the
+ * guest computed, with no data moved": the synthetic-EA class that
+ * `PRFM` / `PREF` / `SYNCI` ride on (decode_synthetic_ea() in
+ * champsim_tracer_decode.cc), which mints an address-only memop at
+ * execution time from a MEM operand.  It needs a MEM operand to fire.
+ * So present Xt as what the architecture says it is -- the base of a
+ * memory operand -- and leave the access flags EMPTY, which is the
+ * literal truth here and is also the discriminator the synthetic-EA
+ * decoder and the static-slot allocator both key on.  The DC ZVA arm
+ * above sets WRITE instead, because that one really does store.
+ *
+ * The set is closed over the operations whose register operand is a
+ * VIRTUAL ADDRESS.  Deliberately excluded:
+ *
+ *   - DC ZVA / DC GZVA: data-writing, handled as stores above.
+ *   - DC GVA: writes allocation tags rather than performing cache
+ *     maintenance; it belongs with ZVA, not here, and is left alone
+ *     until the tag-memory axis has a reference.
+ *   - the by-SET/WAY forms (DC ISW / CSW / CISW and the tag variants):
+ *     the register holds a set/way/level encoding, not an address.
+ *   - the by-PHYSICAL-ADDRESS forms (DC CIPAE / CIGDPAE): the register
+ *     holds a PA, and every address on the wire is virtual.
+ *   - IC IALLU / IALLUIS, AT, TLBI: no address operand at all (TLBI's
+ *     register is a packed VA-range-and-ASID descriptor, not an EA).
+ *
+ * Revisit when Capstone grows a memory operand for the DC/IC by-VA
+ * space; verify with `cstool -d arm64 207b0bd5` (dc cvau, x0), whose
+ * operands should then include a MEM form.
+ */
+static bool cap_aarch64_is_va_cache_maint_sysop(const cs_arm64 *a64, uint8_t n)
+{
+    if (n < 2) {
+        return false;
+    }
+    const cs_arm64_op *o = &a64->operands[0];
+
+    if (o->type == AARCH64_OP_SYSALIAS &&
+        o->sysop.sub_type == AARCH64_OP_DC) {
+        switch (o->sysop.alias.dc) {
+        case AARCH64_DC_IVAC:
+        case AARCH64_DC_CVAC:
+        case AARCH64_DC_CVAU:
+        case AARCH64_DC_CVAP:
+        case AARCH64_DC_CVADP:
+        case AARCH64_DC_CIVAC:
+        case AARCH64_DC_IGVAC:
+        case AARCH64_DC_IGDVAC:
+        case AARCH64_DC_CGVAC:
+        case AARCH64_DC_CGDVAC:
+        case AARCH64_DC_CGVAP:
+        case AARCH64_DC_CGDVAP:
+        case AARCH64_DC_CGVADP:
+        case AARCH64_DC_CGDVADP:
+        case AARCH64_DC_CIGVAC:
+        case AARCH64_DC_CIGDVAC:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    /* IC uses the SYSREG operand form, with the operation in
+     * sysop.reg.ic; only IVAU carries an address. */
+    if (o->type == AARCH64_OP_SYSREG &&
+        o->sysop.sub_type == AARCH64_OP_IC) {
+        return o->sysop.reg.ic == AARCH64_IC_IVAU;
+    }
+
+    return false;
+}
+
+/*
  * AArch64 MRS / MSR: the system register the instruction exists to move.
  *
  * `mrs x3, nzcv` reads PSTATE.NZCV into x3 and `msr nzcv, x3` writes it
@@ -5293,6 +5381,35 @@ static unsigned cap_aarch64_exclusive_mem_access(const char *mnem)
 }
 
 /*
+ * AArch64 tag-multiple stores: Capstone reports the destination as READ.
+ *
+ * `STGM Xt, [Xn]` and `STZGM Xt, [Xn]` write a whole tag-granule block.
+ * QEMU makes it literal -- trans_STGM / trans_STZGM call
+ * gen_helper_stgm_tags / gen_helper_stzgm_tags, and STZGM additionally
+ * runs gen_helper_dc_zva over the data (target/arm/tcg/translate-a64.c),
+ * so both are unambiguously WRITES.  Capstone 6.0.0-Alpha7 gives their
+ * sole MEM operand CS_AC_READ, which the operand walker then turns into
+ * a load lane: a store recorded as a load, the one shape of disagreement
+ * this project treats as disqualifying.  The Arm MRA convicts STZGM
+ * directly (mr=0, mw=1).
+ *
+ * The single-tag forms of the same family -- STG / STZG / ST2G / STZ2G
+ * -- are reported correctly (CS_AC_WRITE) and are not touched.  LDGM and
+ * LDG are genuine reads and are not touched either.
+ *
+ * Revisit / remove when Capstone is bumped past 6.0.0; verify with
+ * `cstool -d arm64 220020d9` (stzgm x2, [x1]), whose MEM operand must
+ * then show WRITE instead of READ.  Use a `cstool` built from
+ * `subprojects/capstone` (capstone.wrap's pinned revision), not a system
+ * package, or run `capstone_workaround_probe`
+ * (`cap_aarch64_tag_multiple_store` case); see docs/troubleshooting.rst.
+ */
+static bool cap_aarch64_tag_multiple_store(const char *mnem)
+{
+    return mnem && (!strcmp(mnem, "stgm") || !strcmp(mnem, "stzgm"));
+}
+
+/*
  * Extract per-operand detail for AArch64 into the plugin operand struct.
  */
 /*
@@ -5644,6 +5761,30 @@ static void cap_fill_arm64_operands(csh handle, unsigned int cap_mode,
      * up front so the Xt operand can be turned into the store target it
      * really is. */
     bool block_zero = cap_aarch64_is_block_zero_sysop(a64, n);
+    /* Same modelling gap, address-only half: the DC/IC operations that
+     * act on the cache line containing a virtual address.  See
+     * cap_aarch64_is_va_cache_maint_sysop. */
+    bool va_cache_maint = cap_aarch64_is_va_cache_maint_sysop(a64, n);
+    /*
+     * AArch64 GCSSTR / GCSSTTR: Capstone models no memory operand.
+     *
+     * `GCSSTR Xt, [Xn]` stores Xt to the Guarded Control Stack at the
+     * address in Xn.  Capstone 6.0.0-Alpha7 decodes both operands as
+     * plain registers with READ access -- its own printer drops the
+     * brackets ("gcsstr x2, x1") -- so the store had no memory operand
+     * to be built from and the template claimed no store at all, while
+     * the Arm MRA's execute-ASL resolves the row to mw=1.  The address
+     * register is the SECOND operand; promote it to the written memory
+     * operand it is.  QEMU implements no FEAT_GCS, so this is a
+     * static-claim correction with no execution counterpart to
+     * double-count against.
+     *
+     * Revisit when Capstone grows a memory operand for the GCS stores;
+     * verify with `cstool -d arm64 220c1fd9` (gcsstr x2, x1), whose
+     * operands should then include a MEM form.
+     */
+    bool gcs_store = (insn->id == AARCH64_INS_GCSSTR ||
+                      insn->id == AARCH64_INS_GCSSTTR) && n >= 2;
 
     for (uint8_t i = 0; i < n; i++) {
         const cs_arm64_op *cop = &a64->operands[i];
@@ -5688,6 +5829,19 @@ static void cap_fill_arm64_operands(csh handle, unsigned int cap_mode,
                 op->type   = QEMU_PLUGIN_OP_MEM;
                 op->access = QEMU_PLUGIN_OP_ACC_WRITE;
                 op->imm    = 0;
+            } else if (va_cache_maint) {
+                /* Xt is the address the line is selected by, and no
+                 * data crosses the interface: a MEM operand with no
+                 * access flag, which is what the synthetic-EA class
+                 * keys on (see cap_aarch64_is_va_cache_maint_sysop). */
+                op->type   = QEMU_PLUGIN_OP_MEM;
+                op->access = 0;
+                op->imm    = 0;
+            } else if (gcs_store && i == 1) {
+                /* [Xn], the GCS slot being written (see gcs_store). */
+                op->type   = QEMU_PLUGIN_OP_MEM;
+                op->access = QEMU_PLUGIN_OP_ACC_WRITE;
+                op->imm    = 0;
             }
             break;
         case ARM64_OP_IMM:
@@ -5725,6 +5879,10 @@ static void cap_fill_arm64_operands(csh handle, unsigned int cap_mode,
                     cap_aarch64_exclusive_mem_access(insn->mnemonic);
                 if (ex != 0) {
                     op->access = ex;
+                } else if (cap_aarch64_tag_multiple_store(insn->mnemonic)) {
+                    /* Reported READ; it is the block being written
+                     * (see cap_aarch64_tag_multiple_store). */
+                    op->access = QEMU_PLUGIN_OP_ACC_WRITE;
                 }
             }
             break;

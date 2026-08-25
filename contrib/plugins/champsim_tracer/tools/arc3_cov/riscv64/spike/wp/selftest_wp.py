@@ -149,7 +149,7 @@ def _clean_pairs(args, guest, limit):
         # prefix it DID retire; requiring the full length instead left the
         # memop axes with no subject at all.
         if len(ref) >= 4:
-            base = C.compare_excursion(guest, ex, ref, gi)
+            base, _cmp = C.compare_excursion(guest, ex, ref, gi)
             # Cleanliness is judged PER AXIS, not globally: an excursion whose
             # store-conditional already reports a named TRACER-SUPERSET on
             # memop-count is still a sound subject for a reg-dst-value
@@ -177,8 +177,8 @@ def run(args):
             if fired[axis] or axis in dirty:
                 continue          # one firing mutation per axis is the bar
             attempted.add(axis)
-            rows = C.compare_excursion(guest, m, ref,
-                                       C.excursion_gaps(m, []))
+            rows, _cmp = C.compare_excursion(guest, m, ref,
+                                             C.excursion_gaps(m, []))
             hit = [r for r in rows if r.axis == axis and
                    r.verdict in (C.WP_DEFECT, C.RECON_GAP, C.UNACCOUNTED)]
             fired[axis] += bool(hit)
@@ -237,6 +237,22 @@ def run(args):
                     % (os.path.basename(guest), victim,
                        'FIRED' if moved else 'DID NOT FIRE'))
 
+    # ---- the DECLARED-VS-COMPARED identity.  render() asserts that every
+    # declared wrong-path instruction is either compared or sits in a named
+    # tail; an assertion that cannot report a violation is not an assertion,
+    # so one is staged here.  The control drops a single instruction from
+    # one tail and requires the report to say so.
+    id_stats = collections.Counter({'wp-insns-declared': 100,
+                                    'wp-insns-compared': 90})
+    _t, id_true = C.render([], id_stats, collections.Counter(
+        {'reference-stopped-short': 10}), args.guest)
+    _t, id_false = C.render([], id_stats, collections.Counter(
+        {'reference-stopped-short': 9}), args.guest)
+    id_ok = id_true and not id_false
+    id_line = ('  identity       --             '
+               'lose one instruction from a named tail   %s'
+               % ('FIRED' if id_ok else 'DID NOT FIRE'))
+
     out = ['NEGATIVE CONTROL -- riscv64 wrong-path execution leg',
            '',
            'A green cross-check is a result only if every axis it scores CAN',
@@ -248,6 +264,7 @@ def run(args):
            '']
     out += lines
     out.append(inj_line)
+    out.append(id_line)
     out.append('')
     unproven = sorted(a for a in attempted if not fired[a])
     nomut = [a for a in C.AXES + ('wp-entry-state',)
@@ -263,10 +280,14 @@ def run(args):
     out.append('INJECTION CONTROL: %s'
                % ('FIRED -- the installed state determines what the simulator '
                   'executes' if inj_ok else 'UNPROVEN'))
+    out.append('IDENTITY CONTROL: %s'
+               % ('FIRED -- an unaccounted declared instruction is reported'
+                  if id_ok else 'UNPROVEN -- the identity cannot report a '
+                                'violation and its HOLDS means nothing'))
     txt = '\n'.join(out) + '\n'
     sys.stdout.write(txt)
     open(os.path.join(args.outdir, 'SELFTEST.txt'), 'w').write(txt)
-    return 0 if (not unproven and inj_ok and not nomut) else 1
+    return 0 if (not unproven and inj_ok and id_ok and not nomut) else 1
 
 
 def main():

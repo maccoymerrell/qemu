@@ -281,7 +281,16 @@ def split_trc_writes(ins):
 
 
 def compare_excursion(guest, ex, ref, gapinfo):
-    """One excursion vs the reference run of the same state -> [Row].
+    """One excursion vs the reference run of the same state.
+
+    -> ([Row], number of declared instructions actually COMPARED).  The
+    caller charges ``declared - compared`` to a named tail so the report can
+    assert ``sum-of-tails == declared - compared`` instead of leaving the
+    difference to be rediscovered by hand.  The count is taken AFTER the
+    pc-sequence truncation, not from ``min(len(ex.insns), len(ref))``:
+    beyond a PC divergence the two streams are unrelated and nothing past
+    the split is compared, so the wider expression counts instructions the
+    walk never looked at.
 
     ``gapinfo`` carries what the reconstruction could NOT establish, so a
     divergence can be charged to the wire rather than to the excursion --
@@ -383,7 +392,7 @@ def compare_excursion(guest, ex, ref, gapinfo):
                                     '0x%x' % rd, '0x%x' % td,
                                     'address never established by the wire'
                                     if unest else ''))
-    return rows
+    return rows, min(n, len(ref))
 
 
 def entry_state_rows(guest, ex, truth, reg_gaps):
@@ -464,7 +473,7 @@ def process_guest(args, guest, out):
     trc2ref = dict((t, r) for r, t in pairs if r is not None and t is not None)
 
     distinct = wp_trace.dedupe(exc)
-    rows, stats = [], collections.Counter()
+    rows, stats, tails = [], collections.Counter(), collections.Counter()
     stats['excursions-dynamic'] = len(exc)
     stats['excursions-distinct'] = len(distinct)
     stats['cp-aligned'] = len(trc2ref)
@@ -495,6 +504,7 @@ def process_guest(args, guest, out):
                 stats['entry-state:' + kk] += vv
         else:
             stats['entry-state:unaligned'] += 1
+        stats['wp-insns-declared'] += len(ex.insns)
         if not ref:
             rows.append(Row(guest, ex.seq, 0, ex.start_pc, 'pc-sequence',
                             SPIKE_LIMIT, 'no guest-range commit', '0x%x'
@@ -502,11 +512,15 @@ def process_guest(args, guest, out):
                             'the injected run retired nothing in the guest; '
                             'the first instruction trapped'))
             stats['excursion-trapped'] += 1
+            tails['reference-retired-nothing'] += len(ex.insns)
             continue
-        r = compare_excursion(guest, ex, ref, gapinfo)
+        r, compared = compare_excursion(guest, ex, ref, gapinfo)
         rows.extend(r)
-        stats['wp-insns-compared'] += min(len(ex.insns), len(ref))
-        stats['wp-insns-declared'] += len(ex.insns)
+        stats['wp-insns-compared'] += compared
+        tail = len(ex.insns) - compared
+        if tail:
+            tails['reference-stopped-short' if len(ref) < len(ex.insns)
+                  else 'pc-diverged'] += tail
         if not r:
             stats['excursions-clean'] += 1
         stats['unestablished-bytes'] += len(gapinfo['unestablished'])
@@ -516,10 +530,10 @@ def process_guest(args, guest, out):
             stats['unmappable-id:' + u] += 1
     for kk, vv in tstats.items():
         stats['trace:' + kk] += vv
-    return rows, stats
+    return rows, stats, tails
 
 
-def render(rows, stats, guests):
+def render(rows, stats, tails, guests):
     out = []
     w = out.append
     w('=' * 74)
@@ -539,6 +553,27 @@ def render(rows, stats, guests):
     w('-' * len(hdr))
     for k in sorted(stats):
         w('%-28s %10d' % (k, stats[k]))
+    w('')
+    dec, cmpd = stats['wp-insns-declared'], stats['wp-insns-compared']
+    w('=' * 74)
+    w('THE DECLARED-VS-COMPARED IDENTITY.  A gap here is never left to be')
+    w('rediscovered: every wrong-path instruction the tracer declared is')
+    w('either compared against the reference or sits in a NAMED tail.  The')
+    w('difference used to be printed as two numbers and reconciled by hand.')
+    w('Spike prints a commit line only on completion, so at the exit ecall')
+    w('an excursion runs into, the reference\'s pc-sequence ends while the')
+    w('tracer\'s continues -- that silence is the reference\'s, and it is')
+    w('already counted one SPIKE-LIMIT row at a time.')
+    w('')
+    w('  declared %d - compared %d = %d' % (dec, cmpd, dec - cmpd))
+    for k in sorted(tails):
+        w('  tail: %-40s %d' % (k, tails[k]))
+    w('  sum of uncompared tails                        %d'
+      % sum(tails.values()))
+    ok = (dec - cmpd) == sum(tails.values())
+    w('  IDENTITY %s'
+      % ('HOLDS' if ok else 'DOES NOT HOLD -- a declared instruction is '
+                            'unaccounted for'))
     w('')
     w('=' * 74)
     w('THE VERDICT SPLIT.  A divergence is a WP DEFECT, a RECONSTRUCTION GAP')
@@ -586,7 +621,7 @@ def render(rows, stats, guests):
             w('  ... %d more rows; use --tsv for the complete list'
               % (len(rows) - 400))
         w('')
-    return '\n'.join(out) + '\n'
+    return '\n'.join(out) + '\n', ok
 
 
 def main():
@@ -610,12 +645,13 @@ def main():
     a = ap.parse_args()
 
     os.makedirs(a.outdir, exist_ok=True)
-    rows, stats = [], collections.Counter()
+    rows, stats, tails = [], collections.Counter(), collections.Counter()
     for g in a.guest:
-        r, s = process_guest(a, g, a.outdir)
+        r, s, t = process_guest(a, g, a.outdir)
         rows.extend(r)
         stats.update(s)
-    txt = render(rows, stats, a.guest)
+        tails.update(t)
+    txt, identity_ok = render(rows, stats, tails, a.guest)
     sys.stdout.write(txt)
     open(os.path.join(a.outdir, 'REPORT.txt'), 'w').write(txt)
     if a.tsv:
@@ -628,7 +664,7 @@ def main():
                                     r.detail)) + '\n')
     bad = sum(1 for r in rows
               if r.verdict in (WP_DEFECT, RECON_GAP, UNACCOUNTED))
-    return 1 if bad else 0
+    return 1 if (bad or not identity_ok) else 0
 
 
 if __name__ == '__main__':

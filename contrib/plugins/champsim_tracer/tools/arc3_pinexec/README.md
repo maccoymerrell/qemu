@@ -16,7 +16,10 @@ the primary.
 
 | file | what it is |
 | --- | --- |
-| `champsim_memop_pintool.cpp` | the pintool: per dynamic instruction, per memory operand — COUNT, ADDRESS, WIDTH and DATA |
+| `champsim_memop_pintool.cpp` | the memop pintool: per dynamic instruction, per memory operand — COUNT, ADDRESS, WIDTH and DATA |
+| `champsim_reg_pintool.cpp` | the register pintool: per dynamic instruction, every source and destination register the ISA names — id, width, and VALUE |
+| `pinreglib.py` | reader for the register record, plus the shared register vocabulary |
+| `cmp_reg.py` | the register cross-check: src set, dst set, dst VALUE, src VALUE, rip-as-source |
 | `Makefile` | builds it against the PIN kit (`make PIN_ROOT=...`) |
 | `pinmemlib.py` | reader for the 392-byte reference record |
 | `qextract_mem.py` | `cst_decode --format=disasm --objdump` → one JSON object per correct-path instruction, carrying memop values (`lv`/`sv`) as well as addresses and widths |
@@ -25,11 +28,13 @@ the primary.
 | `negative_control.py` | injects one named memop defect class, so a green result has to be earned |
 | `adjudicate_x86.py` | settles a PIN/tracer register disagreement with a third decoder (iced-x86) |
 
-The register arm of the same pairing is `pin_compare/tool_wide/` (the widened
-ChampSim `input_instr`, 8 destination / 16 source registers) with
-`pin_repair3/_work/compare.py`.  It carries memory operands only as a
-de-duplicated effective address with no width and no value, which is why the
-memop half needed a tool of its own.
+The register arm used to be `pin_compare/tool_wide/` — the widened ChampSim
+`input_instr`, 8 destination / 16 source slots — with
+`pin_repair3/_work/compare.py`.  That record carries register IDENTIFIERS
+only, and its operand list came from `INS_RegR`/`INS_RegW`, which report the
+EXPLICIT operands.  `champsim_reg_pintool.cpp` supersedes it on both counts;
+see "The register arm" below.  `tool_wide` is still the arm that carries
+branch geometry and de-duplicated memop addresses.
 
 ## Running it
 
@@ -48,6 +53,60 @@ PYTHONPATH=. python cmp_memop.py --pin memop.bin --qemu qm.jsonl --anchor 0 --ou
 PYTHONPATH=. python memcheck_self.py --qemu qm.jsonl
 ```
 
+## The register arm
+
+```sh
+# reference half -- id AND value, explicit AND implicit
+setarch -R $PIN_ROOT/pin -t obj-intel64/champsim_reg_pintool.so \
+        -o reg.bin -s 0 -t 400000 -- ./prog
+
+# tracer half -- regdata=1 is what puts destination VALUES on the wire
+setarch -R qemu-x86_64 -plugin .../libchampsim_tracer.so,outfile=q,wp=0,memdata=1,regdata=1 ./prog
+cst_decode --format=disasm --objdump q.cst | python qextract_mem.py - 400000 > q.jsonl
+
+PYTHONPATH=. python cmp_reg.py --pin reg.bin --qemu q.jsonl \
+        --anchor 0 --qskip 1 --out cmp_reg.txt --maxreport 99999
+```
+
+Run both halves under the SAME minimal environment (`env -i VAR=1 ...`):
+the two processes place their stacks independently, and an environment block
+of a different length multiplies the number of distinct pointer deltas the
+comparison has to establish.
+
+Five axes, and what each is worth:
+
+| axis | reference | tracer side |
+| --- | --- | --- |
+| src register set | XED's FULL template operand list, explicit AND suppressed, plus memory base/index/segment and the RFLAGS read set | the wire's source refs |
+| dst register set | same list, write side | the wire's destination refs |
+| dst register VALUE | `PIN_GetContextRegval` at the NEXT instruction's IPOINT_BEFORE, i.e. after this one retired | `%r[0x../wN]` under `regdata=1` |
+| src register VALUE | the same call at this instruction's own IPOINT_BEFORE | RECONSTRUCTED: a shadow register file replayed from the tracer's own published destination writes |
+| rip as a source | the record's own `ip` | the record's own `pc`, under a code delta the pairing measured |
+
+Three things this arm gets right that the `INS_RegR` arm could not:
+
+**PIN's silence is now evidence.**  XED's template operand list is the decode
+tables' own account of what an instruction touches, suppressed operands
+included, so a register absent from it is a register the instruction does not
+name.  The old arm could convict a SUBSET and never a SUPERSET.
+
+**The decode sets CET.**  `xed3_operand_set_cet(&d, 1)` before `xed_decode`.
+Without it `f3 0f 1e fa` decodes as `nop edx, edi` — two register reads
+`endbr64` does not perform — and `f3 48 0f 1e c8` (`rdsspq`) as a
+register-reading nop.
+
+**A conditionally written operand is a source.**  The action comes from
+`xed_decoded_inst_operand_action`, and `CW`/`RCW` count as READ: when a
+`cmov`'s condition fails the destination keeps the value it already held, so
+that value flows to the result.  This is what iced-x86 encodes as
+`COND_WRITE`.
+
+Three reference corrections live in the pintool, each with its adjudication
+in the comment beside it: `push`/`pop`/`call`/`ret` step rSP (XED expresses
+that only through the `STACKPUSH`/`STACKPOP` pseudo-registers), `leave`
+WRITES rSP without reading it (XED marks it read-write; the SDM and iced-x86
+do not), and a string operation writes the pointer register it steps.
+
 ## How a disagreement is reported
 
 A bare disagree count is not a result.  Every disagreeing row carries a
@@ -62,13 +121,14 @@ direction:
 
 ## Two things the harness must not be allowed to do
 
-**PIN's silence is not evidence.**  `INS_RegR` reports EXPLICIT operands
-only, so a register PIN does not name is not a register we are wrong to
-name.  Only PIN's POSITIVE evidence counts, and even that is adjudicated
-against a third decoder rather than taken as an oracle — PIN's own decode is
-XED with the CET operand unset, which mis-decodes `endbr64` as
-`nop edx, edi` and `rdsspq` as a register-reading nop.  `adjudicate_x86.py`
-is where that adjudication happens.
+**PIN's silence was not evidence, and where it still is not, say so.**  On
+the OLD register arm (`tool_wide`, `INS_RegR`) PIN reported EXPLICIT operands
+only, so a register it did not name was not a register we were wrong to name;
+only its POSITIVE evidence counted, adjudicated against a third decoder by
+`adjudicate_x86.py`.  `champsim_reg_pintool.cpp` removes that limit — it
+walks XED's full template operand list with CET set — so on the register arm
+BOTH directions now carry evidence.  Any result still quoted from `tool_wide`
+carries the old one-directional caveat.
 
 **The delta model must not establish itself.**  The two runs are different
 processes: their images load identically (non-PIE static guest) but their
@@ -103,3 +163,24 @@ cannot by itself convict either instrument.  `memcheck_self.py` is what
 convicts it, because it needs no second process — it replays the stream's own
 stores and asserts that every later load of those bytes reads back what the
 stream itself recorded storing.
+
+## The register arm's negative controls
+
+`cmp_reg.py --mutate` injects one defect class into the TRACER side.
+
+| mutation | which instrument convicts it |
+| --- | --- |
+| `dropsrc` / `extrasrc` | `src register set` |
+| `dropdst` | `dst register set` |
+| `dstvalue` | `dst register VALUE` exact count, and the UNACCOUNTED roll-up |
+| `srcvalue` | `src register VALUE` exact count, and the UNACCOUNTED roll-up |
+
+A cross-run value comparison has an honest limit, and it is the same one the
+memop arm documents: where the two processes legitimately hold different
+values, a value difference cannot by itself convict either instrument.  The
+model that keeps it from laundering everything is the DELTA DOMAIN: a
+PIN-QEMU pointer delta is ESTABLISHED only with `--minsupport` witnesses AND
+a page domain disjoint from every stronger delta's, and a value inside an
+established page whose delta is WRONG is scored `IN-MAPPING-WRONG-DELTA` /
+UNACCOUNTED rather than absorbed as "both look like pointers".  That is what
+makes the `dstvalue` control fire.

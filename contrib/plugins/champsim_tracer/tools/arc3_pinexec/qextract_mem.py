@@ -22,6 +22,11 @@ Per record:
     sv   store DATA values, in dyn-param order, same encoding
     s    source register refs   (%gp0, %sp, %flags, ...)
     d    destination register refs
+    dv   destination register VALUES, {ref: [hex value, write width in bytes]},
+         from the `%r[0x<value>/w<n>]` column that `regdata=1` puts on the
+         wire.  A destination the wire named WITHOUT a value is absent from
+         this map rather than present with a zero -- a register whose value
+         was never captured must not read as a register whose value was 0.
     t    branch direction on the entry's terminator instruction
     tg   branch target PC on the terminator
 
@@ -59,6 +64,7 @@ re_memnoea = re.compile(r'\b(ld|st)\[([^\]]*)\](?!\()')
 re_untracked = re.compile(r'\b(ld|st)\((0x[0-9a-fA-F]+)(?:,w(\d+))?\)')
 re_val = re.compile(r'\b(ld|st)=(0x[0-9a-fA-F]+)(?:/w(\d+))?')
 re_dstreg = re.compile(r'(%[a-z][a-z0-9_]*)\[')
+re_dstval = re.compile(r'(%[a-z][a-z0-9_]*)\[(0x[0-9a-fA-F]+)(?:/w(\d+))?\]')
 re_reg = re.compile(r'%[a-z][a-z0-9_]*')
 re_grpsep = re.compile(r'\s\s;\s\s')
 re_marker = re.compile(r'\s\s;\s[\w@]+\s*$')
@@ -138,6 +144,7 @@ def parse_generic(gen):
 
     # --- operand text: groups, registers, inline memop addresses ---
     src, dst = set(), set()
+    dval = {}
     ila, isa = [], []
     n_noea = 0
     for grp in re_grpsep.split(ops):
@@ -151,11 +158,15 @@ def parse_generic(gen):
         src_txt, dst_txt = split_ops(grp)
         src.update(re_reg.findall(src_txt))
         dst.update(re_dstreg.findall(dst_txt))
+        for reg, val, w in re_dstval.findall(dst_txt):
+            dval[reg] = [val, int(w) if w else 0]
     # %mflags is a plugin-internal alias of the condition-code register and has
     # no independent architectural meaning.
     src.discard('%mflags')
     dst.discard('%mflags')
-    return (ila + la, isa + sa, lw, sw, lv, sv, sorted(src), sorted(dst), n_noea)
+    dval.pop('%mflags', None)
+    return (ila + la, isa + sa, lw, sw, lv, sv, sorted(src), sorted(dst), dval,
+            n_noea)
 
 
 def main():
@@ -207,7 +218,7 @@ def main():
             mnem, genops = gen, ''
         else:
             mnem, genops = gen[:sp], gen[sp:]
-        la, sa, lw, sw, lv, sv, src, dst, noea = parse_generic(genops)
+        la, sa, lw, sw, lv, sv, src, dst, dval, noea = parse_generic(genops)
         cur_seen += 1
         term = (cur_seen == cur_insns)
         if n < skip:
@@ -220,7 +231,7 @@ def main():
                'nl': len(lw), 'ns': len(sw),
                'la': la, 'sa': sa, 'lw': lw, 'sw': sw,
                'lv': lv, 'sv': sv,
-               's': src, 'd': dst}
+               's': src, 'd': dst, 'dv': dval}
         if noea:
             rec['ne'] = noea
         if term:

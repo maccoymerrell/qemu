@@ -168,7 +168,7 @@ there's room up to 255 entries before the format itself has to change.
 
       [X86_INS_AESENC] = { .opcode = GEN_OP_AES_ENC, .branch_type = BRANCH_NONE,
                            .flags = MF_NONE,
-                           .dep_refine = dep_all_to_all },
+                           .dep_refine = dep_passthrough },
 
    Running ``champsim_tracer_mnemonic_audit.py --isa <isa> --diff``
    reports any Capstone mnemonic missing a classification row — it

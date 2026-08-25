@@ -108,32 +108,173 @@ leg covers and they are stated rather than absorbed:
 * **gem5 MIPS never publishes HI/LO writes** to its instruction trace, so
   `mult`, `div`, `madd`, `mthi`, `mtlo` report no destination there.
 
+## The interpreter gem5 is built against, and the SIGSEGV that is not a bug
+
+`gem5.opt` embeds CPython.  On this host it carries
+
+    DT_NEEDED  libpython3.11.so.1.0
+    RUNPATH    (none)
+
+and the system interpreter is 3.12, so that library exists only inside the
+Anaconda installation scons found: the build log records `Using Python config:
+python3-config` / `Checking Python version... 3.11.5`, and `python3-config` on
+PATH resolves to `/home/maccoy-merrell/anaconda3/bin/python3.11-config`.  With
+no RUNPATH the loader cannot find it on its own, and the leg does not run.
+
+**The obvious remedy makes gem5 SEGFAULT, and that is worth writing down
+because it looks exactly like a broken gem5.**  Put the whole Anaconda `lib`
+on `LD_LIBRARY_PATH` and gem5 links, starts, runs its embedded interpreter,
+imports `m5`, builds SimObjects — and dies at the *first* `cprintf` to
+`std::cout`.  Observed under gdb:
+
+    Program received signal SIGSEGV
+    #0  gem5::cp::Print::Print (...)     at src/base/cprintf.cc:55
+        55     savedFlags = stream.flags();
+    #1  gem5::ccprintf<unsigned long>    at src/base/cprintf.hh:148
+    #3  gem5::fixClockFrequency ()       at src/sim/core.cc:108
+
+Anaconda ships `libstdc++.so.6` at `GLIBCXX_3.4.29`; the system one this gem5
+was compiled against is `GLIBCXX_3.4.33`.  gem5's own `verneed` asks for no
+more than `GLIBCXX_3.4.29`, so **nothing is missing and the loader is
+satisfied** — the failure is at run time, in the `std::ostream` state of a
+`std::cout` supplied by a library that is not the one gem5's translation units
+were built with.  Isolated one library at a time, with only `libpython` plus
+one candidate exposed:
+
+| exposed alongside libpython | gem5 exit |
+|---|---|
+| `libstdc++.so.6` | **139 (SIGSEGV)** — the cause, alone sufficient |
+| `libgcc_s.so.1` | 0 |
+| `libz.so.1` | 0 |
+
+So the interpreter is exposed through a **shim directory holding exactly one
+symlink** — the `libpython` soname gem5 asked for, and nothing else.  Every
+other library keeps resolving the way it did at link time.  `gem5_env.py`
+builds that shim, and it also *strips* from any inherited `LD_LIBRARY_PATH`
+every directory that supplies one of `gem5_env.ABI_LIBS`, naming each removal
+in `PREREQ.txt`.  The failure above cannot be reached by accident any more.
+
+## Prerequisites, and what happens when one is absent
+
+`compare_exec_gem5.py` resolves every prerequisite before it runs a single
+guest, and **exits 3 with a named absence** rather than handing the caller a
+signal.  A reference that dies on SIGSEGV leaves a facet cell reading `CITED`
+forever; a reference that says what it needs can be fixed in one step.
+
+| absence | what the harness does |
+|---|---|
+| `libpython<v>.so.1.0` not findable | names the soname, lists every directory searched, points at `--python-home` / `CST_GEM5_PYLIB` |
+| `build/<TARGET>/gem5.opt` not built | names the target and the `scons` line that builds it |
+| gem5 links but cannot run | runs `startproof.py` (below) and reports the signal with the `cprintf.cc:55` diagnosis |
+| no `gem5_ref.REGMAP` entry for the ISA | names the ISA and the function to add, instead of scoring unmapped registers as agreement |
+| gem5 exits non-zero, or exits 0 without `Exiting @ tick … because exiting with last active thread context`, or writes an empty `exec.log` | **refuses to score anything** — a truncated reference stream would read as tracer superset |
+
+`startproof.py` is why the third row works.  `gem5.opt --help` returns 0 under
+the broken loader path — measured — so a preflight built on it is **inert**.
+The start proof calls `m5.instantiate()`, which is what reaches
+`fixClockFrequency`, the frame the fault actually occupies.
+
+All five refusals were watched firing, deliberately, with the prerequisite
+removed:
+
+    control 1  run under /usr/bin/python3 (3.12), no CST_GEM5_PYLIB
+               -> rc=3, "MISSING PREREQUISITE: libpython3.11.so.1.0"
+    control 2  GEM5_BUILD pointed at an unbuilt RISCV target
+               -> "MISSING PREREQUISITE: gem5.opt for the RISCV target"
+    control 3  LD_LIBRARY_PATH=<anaconda>/lib, the poisoned path
+               -> sanitiser drops it, names the drop, gem5 starts
+    control 4  same, with gem5_env.ABI_LIBS emptied so the poison survives
+               -> "PREREQUISITE UNMET: ... start proof died on signal 11"
+    control 5  a REAL truncated run (se.py -I 5, gem5 exit 0)
+               -> "gem5 stopped ... for a reason that is NOT the guest
+                   reaching its own end: a thread reached the max
+                   instruction count.  Nothing is scored."
+
+Control 4 matters most: before the start proof was deepened it did **not**
+fire, and the check was inert.  That is the whole reason it is an
+`m5.instantiate()` script and not `--help`.
+
+## Building gem5
+
+Built with the same Anaconda interpreter that will run it, and with the shim
+already in place so scons' own `Python.h` conftest can link:
+
+    export PATH=/home/maccoy-merrell/anaconda3/bin:$PATH
+    mkdir -p /mnt/md0/QEMU/cst_runs/p3/arc3/gem5fix/pylib
+    ln -sf /home/maccoy-merrell/anaconda3/lib/libpython3.11.so.1.0 \
+           /mnt/md0/QEMU/cst_runs/p3/arc3/gem5fix/pylib/
+    export LD_LIBRARY_PATH=/mnt/md0/QEMU/cst_runs/p3/arc3/gem5fix/pylib
+
+    git clone --depth 1 https://github.com/gem5/gem5 && cd gem5
+    git apply /path/to/arc3_cov/gem5/gem5.patch
+    scons build/ARM/gem5.opt build/MIPS/gem5.opt build/X86/gem5.opt -j 64
+
+Without that `LD_LIBRARY_PATH` the *build* fails too, and misleadingly:
+
+    Checking Python version... conftest_...: error while loading shared
+    libraries: libpython3.11.so.1.0: cannot open shared object file
+    Error: Can't find a working Python installation
+
+Targets built at gem5 `62c7bf2` (v25.1.0.1) with the patch applied:
+
+| target | binary | status |
+|---|---|---|
+| `ARM` | `build/ARM/gem5.opt` | runs the aarch64 probe set to completion |
+| `MIPS` | `build/MIPS/gem5.opt` | runs the mipsel probe set to completion |
+| `X86` | `build/X86/gem5.opt` | runs a static glibc workload to completion |
+
+The X86 check was a real program, not a smoke test — `gcc -O2 -static`, a
+10,000-iteration loop, `printf`:
+
+    build/X86/gem5.opt -d <out> configs/deprecated/example/se.py \
+        --cpu-type=AtomicSimpleCPU -c hello_x86
+    sum=333283335000
+    Exiting @ tick 211059000 because exiting with last active thread context
+
+**X86 is built and proven to run; it is not yet scoreable.**
+`gem5_ref.REGMAP` has readers for `aarch64` and `mipsel` only, so
+`--isa x86_64` refuses by name rather than scoring unmapped registers as
+agreement.  Adding an `_x86_reg` reader next to `_arm_reg` / `_mips_reg` is
+the one remaining step.
+
 ## Running it
 
     ninja -C /mnt/md0/QEMU/qemu/build contrib-plugins
 
-    # gem5, once
-    git clone --depth 1 https://github.com/gem5/gem5 && cd gem5
-    git apply /path/to/arc3_cov/gem5/gem5.patch
-    scons build/ARM/gem5.opt build/MIPS/gem5.opt -j <n>
-
-    # probes
+    # probes, once
     python probes/mkprobes_aarch64.py <outdir>/probes_a64
     python probes/mkprobes_mipsel.py  <outdir>/probes_mipsel
 
-    # the comparison
-    CST_GEM5_PYLIB=<dir holding libpython3.11.so.1.0> \
-    python compare_exec_gem5.py --isa aarch64 \
-        --gem5-dir <gem5> --qemu-dir /mnt/md0/QEMU/qemu \
+    # the comparison -- no LD_LIBRARY_PATH, no CST_GEM5_PYLIB, no PYTHONHOME.
+    # Run under the interpreter gem5 was built against and the harness works
+    # the loader path out for itself.
+    cd contrib/plugins/champsim_tracer/tools/arc3_cov/gem5
+    /home/maccoy-merrell/anaconda3/bin/python compare_exec_gem5.py \
+        --isa aarch64 \
+        --gem5-dir /mnt/md0/QEMU/cst_runs/p3/arc3/gem5exec/gem5 \
+        --qemu-dir /mnt/md0/QEMU/qemu \
         --decode /mnt/md0/QEMU/qemu/build/contrib/plugins/cst_decode \
-        -o <outdir>/run_a64 --tsv <outdir>/run_a64/rows.tsv \
-        <outdir>/probes_a64/p_*
+        -o <outdir>/a64 --tsv <outdir>/a64/rows.tsv \
+        <probes_a64>/p_int <probes_a64>/p_mem <probes_a64>/p_simd \
+        <probes_a64>/p_atomic <probes_a64>/p_fp <probes_a64>/p_flow \
+        <probes_a64>/p_hint
 
-The exit code is the tool's own: non-zero while TRACER-SUBSET + UNACCOUNTED is
-non-zero.  Never take it through a pipe.
+`p_cache` is deliberately absent from the aarch64 set: gem5 panics on AArch64
+cache maintenance (above).  The mipsel set is `p_int p_mem p_fp p_flow`.
 
-gem5 links against the interpreter that built it.  If that is an Anaconda
-Python whose `libpython3.11.so.1.0` is not on the default loader path, put a
-symlink to it in a directory of its own and name that directory in
-`CST_GEM5_PYLIB` -- putting the whole Anaconda `lib` on `LD_LIBRARY_PATH`
-also puts its older `libstdc++` in front of the one gem5 was built with.
+If the run must happen under a *different* interpreter, pass
+`--python-home <prefix>` — the prefix whose `lib/` holds the soname in
+`gem5.opt`'s `DT_NEEDED`.  Only that one library is exposed; passing the
+prefix does **not** put its `lib/` on the loader path, for the reason above.
+
+Exit codes are the tool's own and must be taken from the process, never
+through a pipe:
+
+    0  no TRACER-SUBSET and no UNACCOUNTED row
+    1  scored, and the headline is non-zero
+    3  REFUSED -- a prerequisite is absent, or gem5 did not run to completion.
+       Nothing was scored and no facet cell may be written from the run.
+
+Every decision the harness took about the loader path is written to
+`<outdir>/PREREQ.txt`, and gem5's own console output per guest to
+`<outdir>/<guest>.gem5.out`.

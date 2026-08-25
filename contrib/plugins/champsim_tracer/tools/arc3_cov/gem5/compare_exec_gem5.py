@@ -37,6 +37,7 @@ import argparse
 import collections
 import difflib
 import os
+import re
 import subprocess
 import sys
 
@@ -46,6 +47,7 @@ sys.path.insert(0, os.path.join(HERE, '..'))
 sys.path.insert(0, os.path.join(HERE, '..', 'riscv64', 'spike'))
 
 import gem5_ref
+import gem5_env
 import tracer_log
 from arc3_taxonomy import (set_relation, classify, render_crosstab,
                            render_conflicts, render_unaccounted, EQUAL,
@@ -55,31 +57,141 @@ from gem5_rules import gem5_exec_rule
 AXES = ('reg-dst-set', 'reg-dst-value', 'flags-dst-set', 'fpsr-dst-set',
         'memop-count', 'memop-addr', 'memop-width', 'store-data', 'load-data')
 
-QEMU_BIN = {'aarch64': 'qemu-aarch64', 'mipsel': 'qemu-mipsel'}
-GEM5_BUILD = {'aarch64': 'ARM', 'mipsel': 'MIPS'}
+QEMU_BIN = {'aarch64': 'qemu-aarch64', 'mipsel': 'qemu-mipsel',
+            'x86_64': 'qemu-x86_64'}
+#: gem5 build target per ISA.  ``x86_64`` is listed because the X86 gem5.opt is
+#: BUILT and proven to run a real workload to completion -- but the reference
+#: PARSER has no x86 register vocabulary yet (``gem5_ref.REGMAP``), so naming
+#: it here buys a NAMED refusal instead of a KeyError three call levels down.
+GEM5_BUILD = {'aarch64': 'ARM', 'mipsel': 'MIPS', 'x86_64': 'X86'}
 
 DBG = ('ExecEnable,ExecUser,ExecKernel,ExecMicro,ExecEffAddr,ExecResult,'
        'ExecOpClass,ExecThread,ExecRegDelta,ExecFlags')
 
 
 # ------------------------------------------------------------------ the runs
-def run_gem5(gem5_dir, isa, guest, outdir):
-    binary = os.path.join(gem5_dir, 'build', GEM5_BUILD[isa], 'gem5.opt')
-    cfg = os.path.join(gem5_dir, 'configs/deprecated/example/se.py')
+#: The line gem5 prints when the simulated program reached its own end.  A run
+#: that does not print it did NOT run to completion, whatever its exit status
+#: says: gem5 exits 0 after a tick limit, after ``m5 exit`` from anywhere, and
+#: after a config-level abort that never entered the simulation loop.  Scoring
+#: a truncated instruction stream against a complete one manufactures
+#: TRACER-SUPERSET rows out of the harness's own failure, so this leg refuses
+#: to score at all unless the reason is a natural termination.
+GEM5_DONE = 'exiting with last active thread context'
+_EXIT_RE = re.compile(r'^Exiting @ tick (\d+) because (.*)$', re.M)
+
+
+def gem5_prereqs(gem5_dir, isa, cache_dir, python_home=None):
+    """Every named thing this leg needs before a single guest is run.
+
+    Raises ``gem5_env.MissingPrerequisite``, whose message names what is
+    absent.  It never returns a partially usable environment, and it never
+    lets the caller reach the point where a missing interpreter becomes a
+    SIGSEGV instead of a sentence.
+    """
+    if isa not in gem5_ref.REGMAP:
+        raise gem5_env.MissingPrerequisite(
+            'MISSING PREREQUISITE: a gem5 register vocabulary for %s.\n'
+            '  gem5_ref.REGMAP knows %s.  The %s gem5.opt builds and runs -- '
+            'that half is done --\n  but without a REGMAP entry every gem5 '
+            'register name would fall through as unmapped\n  and the '
+            'comparison would score agreement it never established.\n'
+            '  Fix: add the %s reader to gem5_ref.REGMAP, the way _arm_reg '
+            'and _mips_reg are built.'
+            % (isa, ', '.join(sorted(gem5_ref.REGMAP)), GEM5_BUILD[isa], isa))
+    binary = gem5_env.require_file(
+        os.path.join(gem5_dir, 'build', GEM5_BUILD[isa], 'gem5.opt'),
+        'gem5.opt for the %s target (build it: '
+        'scons build/%s/gem5.opt)' % (GEM5_BUILD[isa], GEM5_BUILD[isa]))
+    cfg = gem5_env.require_file(
+        os.path.join(gem5_dir, 'configs/deprecated/example/se.py'),
+        'gem5 syscall-emulation config se.py')
+    env, notes = gem5_env.gem5_environment(binary, cache_dir,
+                                           python_home=python_home)
+
+    # A POSITIVE start proof, and it has to be a deep one.  Resolving the
+    # soname is not the same as gem5 being able to run: the failure this whole
+    # module exists for happens AFTER a successful link and AFTER the embedded
+    # interpreter is up.  ``gem5.opt --help`` returns 0 under the broken
+    # loader path -- measured -- so a preflight built on it is INERT.
+    # ``startproof.py`` calls ``m5.instantiate()``, which is what reaches
+    # ``fixClockFrequency`` -> ``cprintf`` -> ``cp::Print::Print``, the frame
+    # the segfault actually occupies.
+    proof = gem5_env.require_file(os.path.join(HERE, 'startproof.py'),
+                                  'the gem5 start-proof config script')
+    p = subprocess.run([binary, '-d', os.path.join(cache_dir, 'startproof'),
+                        '--quiet', proof],
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                       env=env)
+    out = p.stdout.decode('utf-8', 'replace')
+    if p.returncode != 0 or 'ARC3-GEM5-START-OK' not in out:
+        how = ('died on signal %d' % -p.returncode if p.returncode < 0
+               else 'exited %d' % p.returncode)
+        raise gem5_env.MissingPrerequisite(
+            'PREREQUISITE UNMET: %s cannot run.  The start proof %s.\n'
+            '  The loader resolved every library it names, so this is an ABI '
+            'mismatch inside a\n  RESOLVED one, not an absence -- gem5 gets '
+            'as far as m5.instantiate() and faults at\n  '
+            'src/base/cprintf.cc:55 reading std::cout\'s format state.  On '
+            'this host the cause\n  is an LD_LIBRARY_PATH entry supplying a '
+            'libstdc++ that is not the one gem5 was\n  compiled against '
+            '(see gem5_env.ABI_LIBS).\n  Decisions taken:\n%s\n'
+            '  gem5 said:\n%s'
+            % (binary, how, '\n'.join('    ' + n for n in notes),
+               '\n'.join('    ' + l for l in out.splitlines()[-12:])))
+    return binary, cfg, env, notes
+
+
+def require_complete_run(returncode, tail, log, guest):
+    """Refuse, by name, unless gem5 ran the whole guest.
+
+    Split out of ``run_gem5`` so it can be exercised against a REAL truncated
+    gem5 run rather than a mocked one -- an instrument nobody has watched fire
+    vouches for nothing.
+    """
+    if returncode < 0:
+        raise gem5_env.MissingPrerequisite(
+            'gem5 DIED ON SIGNAL %d running %s.  Nothing is scored.\n%s'
+            % (-returncode, guest, tail[-1500:]))
+    if returncode != 0:
+        raise RuntimeError('gem5 exit %d on %s -- nothing is scored: %s'
+                           % (returncode, guest, tail[-1500:]))
+    if not os.path.exists(log):
+        raise RuntimeError('gem5 wrote no %s for %s -- nothing is scored: %s'
+                           % (log, guest, tail[-1500:]))
+
+    m = _EXIT_RE.search(tail)
+    if m is None:
+        raise RuntimeError(
+            'gem5 exited 0 on %s but never printed "Exiting @ tick ..." -- '
+            'the simulation\n  loop was not reached and the trace is not a '
+            'complete run.  Nothing is scored.\n%s' % (guest, tail[-1500:]))
+    if GEM5_DONE not in m.group(2):
+        raise RuntimeError(
+            'gem5 stopped on %s for a reason that is NOT the guest reaching '
+            'its own end:\n  "%s"\n  The instruction stream is truncated; '
+            'scoring it would read as tracer superset.\n  Nothing is scored.'
+            % (guest, m.group(2)))
+    if os.path.getsize(log) == 0:
+        raise RuntimeError(
+            'gem5 ran %s to completion but wrote an EMPTY exec.log -- the '
+            'debug flags produced\n  no reference. Nothing is scored.' % guest)
+
+
+def run_gem5(binary, cfg, env, isa, guest, outdir):
     d = os.path.join(outdir, os.path.basename(guest) + '.g5')
-    env = dict(os.environ)
-    env['LD_LIBRARY_PATH'] = os.environ.get('CST_GEM5_PYLIB', '') + \
-        os.pathsep + env.get('LD_LIBRARY_PATH', '')
     p = subprocess.run([binary, '-d', d, '--debug-flags=' + DBG,
                         '--debug-file=exec.log', cfg,
                         '--cpu-type=AtomicSimpleCPU', '-c', guest],
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                        env=env)
+    tail = p.stdout.decode('utf-8', 'replace')
+    with open(os.path.join(outdir,
+                           os.path.basename(guest) + '.gem5.out'), 'w') as fh:
+        fh.write(tail)
     log = os.path.join(d, 'exec.log')
-    if p.returncode != 0 or not os.path.exists(log):
-        raise RuntimeError('gem5 exit %d on %s: %s'
-                           % (p.returncode, guest,
-                              p.stdout.decode('utf-8', 'replace')[-1500:]))
+
+    require_complete_run(p.returncode, tail, log, guest)
     return log
 
 
@@ -361,15 +473,38 @@ def align(ref, trc):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('guest', nargs='+')
-    ap.add_argument('--isa', required=True, choices=('aarch64', 'mipsel'))
+    ap.add_argument('--isa', required=True,
+                    choices=tuple(sorted(GEM5_BUILD)))
     ap.add_argument('--gem5-dir', required=True)
     ap.add_argument('--qemu-dir', required=True)
     ap.add_argument('--decode', required=True)
     ap.add_argument('-o', '--outdir', required=True)
     ap.add_argument('--tsv')
+    ap.add_argument('--python-home', metavar='PREFIX',
+                    help='installation prefix of the interpreter gem5 was '
+                         'BUILT against; its lib/ must hold the libpython '
+                         'soname in gem5.opt\'s DT_NEEDED.  Only its '
+                         'libpython is exposed to the loader -- see '
+                         'gem5_env for why the whole lib/ must not be.')
     args = ap.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
+
+    try:
+        binary, cfg, g5env, notes = gem5_prereqs(
+            args.gem5_dir, args.isa, args.outdir,
+            python_home=args.python_home)
+    except gem5_env.MissingPrerequisite as exc:
+        sys.stderr.write('%s\n' % exc)
+        sys.stderr.write('REFUSING TO SCORE: the execution reference did not '
+                         'run.  No facet cell may be\n'
+                         'written from this invocation.\n')
+        return 3
+    with open(os.path.join(args.outdir, 'PREREQ.txt'), 'w') as fh:
+        fh.write('gem5 execution leg -- prerequisites, as resolved\n')
+        for n in notes:
+            fh.write('  %s\n' % n)
+        fh.write('  gem5.opt: %s\n  se.py:    %s\n' % (binary, cfg))
     all_rows, per_guest, unaligned = [], [], []
     totals = collections.Counter()
     unmapped = collections.Counter()
@@ -379,7 +514,15 @@ def main():
     raw = []
 
     for guest in args.guest:
-        log = run_gem5(args.gem5_dir, args.isa, guest, args.outdir)
+        try:
+            log = run_gem5(binary, cfg, g5env, args.isa, guest, args.outdir)
+        except (gem5_env.MissingPrerequisite, RuntimeError) as exc:
+            sys.stderr.write('%s\n' % exc)
+            sys.stderr.write('REFUSING TO SCORE: gem5 did not run %s to '
+                             'completion.  No facet cell may be\n'
+                             'written from this invocation.\n'
+                             % os.path.basename(guest))
+            return 3
         trace = run_tracer(args.qemu_dir, args.isa, guest, args.outdir)
         ref = gem5_ref.parse(log, guest, args.isa,
                              gem5_dir=args.gem5_dir,

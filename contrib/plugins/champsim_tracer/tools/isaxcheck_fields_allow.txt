@@ -1822,10 +1822,6 @@ x86_64 FR-rd-missing fmuls +REG_SEG0
 x86_64 FR-rd-missing fmuls +REG_SEG1
 x86_64 FR-rd-missing fnstcw +REG_SEG0
 x86_64 FR-rd-missing fnstcw +REG_SEG1
-x86_64 FR-rd-missing fnstenv +REG_FCSR,REG_SEG0
-x86_64 FR-rd-missing fnstenv +REG_FCSR,REG_SEG1
-x86_64 FR-rd-missing fnstsw +REG_FCSR,REG_SEG0
-x86_64 FR-rd-missing fnstsw +REG_FCSR,REG_SEG1
 x86_64 FR-rd-missing frstor +REG_SEG0
 x86_64 FR-rd-missing frstor +REG_SEG1
 x86_64 FR-rd-missing fstl +REG_SEG0
@@ -2258,28 +2254,8 @@ x86_64 FR-rd-missing punpcklwd +REG_SEG0
 x86_64 FR-rd-missing punpcklwd +REG_SEG1
 x86_64 FR-rd-missing pxor +REG_SEG0
 x86_64 FR-rd-missing pxor +REG_SEG1
-x86_64 FR-rd-missing rclb +REG_FLAGS,REG_SEG0
-x86_64 FR-rd-missing rclb +REG_FLAGS,REG_SEG1
-x86_64 FR-rd-missing rclb +REG_FLAGS,REG_SEG2
-x86_64 FR-rd-missing rclb +REG_FLAGS,REG_SEG5
-x86_64 FR-rd-missing rcll +REG_FLAGS,REG_SEG0
-x86_64 FR-rd-missing rcll +REG_FLAGS,REG_SEG1
-x86_64 FR-rd-missing rcll +REG_FLAGS,REG_SEG2
-x86_64 FR-rd-missing rcll +REG_FLAGS,REG_SEG5
-x86_64 FR-rd-missing rclq +REG_FLAGS,REG_SEG0
-x86_64 FR-rd-missing rclq +REG_FLAGS,REG_SEG1
-x86_64 FR-rd-missing rclw +REG_FLAGS,REG_SEG0
-x86_64 FR-rd-missing rclw +REG_FLAGS,REG_SEG1
-x86_64 FR-rd-missing rclw +REG_FLAGS,REG_SEG2
-x86_64 FR-rd-missing rclw +REG_FLAGS,REG_SEG5
 x86_64 FR-rd-missing rcpps +REG_SEG0
 x86_64 FR-rd-missing rcpps +REG_SEG1
-x86_64 FR-rd-missing rcrb +REG_FLAGS,REG_SEG0
-x86_64 FR-rd-missing rcrb +REG_FLAGS,REG_SEG1
-x86_64 FR-rd-missing rcrl +REG_FLAGS,REG_SEG0
-x86_64 FR-rd-missing rcrl +REG_FLAGS,REG_SEG1
-x86_64 FR-rd-missing rcrq +REG_FLAGS,REG_SEG0
-x86_64 FR-rd-missing rcrq +REG_FLAGS,REG_SEG1
 x86_64 FR-rd-missing rolb +REG_SEG0
 x86_64 FR-rd-missing rolb +REG_SEG1
 x86_64 FR-rd-missing roll +REG_SEG0
@@ -3105,10 +3081,6 @@ x86_64 FR-rd-phantom lretq +REG_SEG5,REG_SP
 x86_64 FR-rd-phantom lretw +REG_SEG5,REG_SP
 x86_64 FR-rd-phantom popq +REG_SP
 x86_64 FR-rd-phantom popw +REG_SP
-x86_64 FR-rd-phantom pushq +REG_SEG3
-x86_64 FR-rd-phantom pushq +REG_SEG4
-x86_64 FR-rd-phantom pushw +REG_SEG3
-x86_64 FR-rd-phantom pushw +REG_SEG4
 x86_64 FR-rd-phantom rep insb +REG_GPR#
 x86_64 FR-rd-phantom rep insl +REG_GPR#
 x86_64 FR-rd-phantom rep insw +REG_GPR#
@@ -3393,16 +3365,10 @@ x86_64 FM-miss-store sarl
 x86_64 FM-miss-store sarq
 x86_64 FM-miss-store sarw
 x86_64 FM-miss-store shlb
-x86_64 FM-miss-store shldl
-x86_64 FM-miss-store shldq
-x86_64 FM-miss-store shldw
 x86_64 FM-miss-store shll
 x86_64 FM-miss-store shlq
 x86_64 FM-miss-store shlw
 x86_64 FM-miss-store shrb
-x86_64 FM-miss-store shrdl
-x86_64 FM-miss-store shrdq
-x86_64 FM-miss-store shrdw
 x86_64 FM-miss-store shrl
 x86_64 FM-miss-store shrq
 x86_64 FM-miss-store shrw
@@ -3450,74 +3416,24 @@ x86_64 FM-miss-load fxsave64
 x86_64 FM-miss-store fxrstor
 x86_64 FM-miss-store fxrstor64
 x86_64 FR-rd-missing ffreep +REG_FPR#
-x86_64 FR-rd-missing fnstenv +REG_FCSR
-x86_64 FR-rd-missing fnstsw +REG_FCSR
 x86_64 FR-rd-missing fstp +REG_FPR#
 x86_64 FR-rd-phantom fadd +REG_FPR#
-x86_64 FR-rd-phantom fcmovb +REG_FPR#
-x86_64 FR-rd-phantom fcmovbe +REG_FPR#
-x86_64 FR-rd-phantom fcmove +REG_FPR#
-x86_64 FR-rd-phantom fcmovnb +REG_FPR#
-x86_64 FR-rd-phantom fcmovnbe +REG_FPR#
-x86_64 FR-rd-phantom fcmovne +REG_FPR#
-x86_64 FR-rd-phantom fcmovnu +REG_FPR#
-x86_64 FR-rd-phantom fcmovu +REG_FPR#
 x86_64 FR-rd-phantom fcom +REG_FPR#
 x86_64 FR-rd-phantom fcoml +REG_FPR#
-x86_64 FR-rd-phantom fcomp +REG_FPR#
-x86_64 FR-rd-phantom fcompl +REG_FPR#
-x86_64 FR-rd-phantom fcompp +REG_FPR#
-x86_64 FR-rd-phantom fcomps +REG_FPR#
 x86_64 FR-rd-phantom fcoms +REG_FPR#
 x86_64 FR-rd-phantom fdiv +REG_FPR#
 x86_64 FR-rd-phantom fdivr +REG_FPR#
 x86_64 FR-rd-phantom ficoml +REG_FPR#
-x86_64 FR-rd-phantom ficompl +REG_FPR#
-x86_64 FR-rd-phantom ficomps +REG_FPR#
 x86_64 FR-rd-phantom ficoms +REG_FPR#
 x86_64 FR-rd-phantom fmul +REG_FPR#
 x86_64 FR-rd-phantom fsub +REG_FPR#
 x86_64 FR-rd-phantom fsubr +REG_FPR#
 x86_64 FR-rd-phantom ftst +REG_FPR#
-x86_64 FR-rd-phantom fucompp +REG_FPR#
 x86_64 FR-rd-phantom fxam +REG_FPR#
-x86_64 FR-wr-missing f2xm1 +REG_FCSR
-x86_64 FR-wr-missing fadd +REG_FCSR
-x86_64 FR-wr-missing faddp +REG_FCSR
-x86_64 FR-wr-missing fbld +REG_FCSR
-x86_64 FR-wr-missing fbstp +REG_FCSR
-x86_64 FR-wr-missing fdecstp +REG_FCSR
-x86_64 FR-wr-missing fdiv +REG_FCSR
-x86_64 FR-wr-missing fdivp +REG_FCSR
-x86_64 FR-wr-missing fdivr +REG_FCSR
-x86_64 FR-wr-missing fdivrp +REG_FCSR
-x86_64 FR-wr-missing fincstp +REG_FCSR
-x86_64 FR-wr-missing fldenv +REG_FCSR
-x86_64 FR-wr-missing fldl2e +REG_FCSR
-x86_64 FR-wr-missing fldl2t +REG_FCSR
-x86_64 FR-wr-missing fldlg2 +REG_FCSR
-x86_64 FR-wr-missing fldln2 +REG_FCSR
-x86_64 FR-wr-missing fldpi +REG_FCSR
-x86_64 FR-wr-missing fmul +REG_FCSR
-x86_64 FR-wr-missing fmulp +REG_FCSR
 x86_64 FR-wr-missing fnop +REG_FCSR
 x86_64 FR-wr-missing fnstcw +REG_FCSR
 x86_64 FR-wr-missing fnstenv +REG_FCSR
 x86_64 FR-wr-missing fnstsw +REG_FCSR
-x86_64 FR-wr-missing fpatan +REG_FCSR
-x86_64 FR-wr-missing fprem +REG_FCSR
-x86_64 FR-wr-missing fprem1 +REG_FCSR
-x86_64 FR-wr-missing fptan +REG_FCSR
-x86_64 FR-wr-missing frndint +REG_FCSR
-x86_64 FR-wr-missing fscale +REG_FCSR
-x86_64 FR-wr-missing fsincos +REG_FCSR
-x86_64 FR-wr-missing fsub +REG_FCSR
-x86_64 FR-wr-missing fsubp +REG_FCSR
-x86_64 FR-wr-missing fsubr +REG_FCSR
-x86_64 FR-wr-missing fsubrp +REG_FCSR
-x86_64 FR-wr-missing fxtract +REG_FCSR
-x86_64 FR-wr-missing fyl2x +REG_FCSR
-x86_64 FR-wr-missing fyl2xp1 +REG_FCSR
 x86_64 FR-wr-phantom fcmovb +REG_FPR#
 x86_64 FR-wr-phantom fcmovbe +REG_FPR#
 x86_64 FR-wr-phantom fcmove +REG_FPR#
@@ -3600,9 +3516,7 @@ x86_64 FR-rd-missing bswapw +REG_FP_REG
 x86_64 FR-rd-missing bswapw +REG_GPR#
 x86_64 FR-rd-missing bswapw +REG_SP
 x86_64 FR-rd-missing clc +REG_FLAGS
-x86_64 FR-rd-missing cli +REG_FLAGS
 x86_64 FR-rd-missing clwb +REG_GPR#
-x86_64 FR-rd-missing cmc +REG_FLAGS
 x86_64 FR-rd-missing cvtpi2pd +REG_FP_REG,REG_VEC#
 x86_64 FR-rd-missing cvtpi2pd +REG_GPR#,REG_VEC#
 x86_64 FR-rd-missing cvtpi2pd +REG_SP,REG_VEC#
@@ -3614,16 +3528,7 @@ x86_64 FR-rd-missing cvtsi2ssl +REG_VEC#
 x86_64 FR-rd-missing cvtsi2ssq +REG_VEC#
 x86_64 FR-rd-missing cvtss2sd +REG_VEC#
 x86_64 FR-rd-missing movq +REG_FPR#
-x86_64 FR-rd-missing pcmpestrm +REG_GPR#
-x86_64 FR-rd-missing rclb +REG_FLAGS
-x86_64 FR-rd-missing rcll +REG_FLAGS
-x86_64 FR-rd-missing rclq +REG_FLAGS
-x86_64 FR-rd-missing rclw +REG_FLAGS
 x86_64 FR-rd-missing rcpss +REG_VEC#
-x86_64 FR-rd-missing rcrb +REG_FLAGS
-x86_64 FR-rd-missing rcrl +REG_FLAGS
-x86_64 FR-rd-missing rcrq +REG_FLAGS
-x86_64 FR-rd-missing rcrw +REG_FLAGS
 x86_64 FR-rd-missing rdpkru +REG_GPR#
 x86_64 FR-rd-missing rdrandl +REG_FP_REG
 x86_64 FR-rd-missing rdrandl +REG_GPR#
@@ -3635,12 +3540,9 @@ x86_64 FR-rd-missing rsqrtss +REG_VEC#
 x86_64 FR-rd-missing sqrtsd +REG_VEC#
 x86_64 FR-rd-missing sqrtss +REG_VEC#
 x86_64 FR-rd-missing stc +REG_FLAGS
-x86_64 FR-rd-missing sti +REG_FLAGS
-x86_64 FR-rd-missing vpcmpestrm +REG_GPR#
 x86_64 FR-rd-missing wrpkru +REG_GPR#
 x86_64 FR-rd-phantom cvtpi2pd +REG_FPR#
 x86_64 FR-rd-phantom movq +REG_VEC#
-x86_64 FR-wr-missing cli +REG_FLAGS
 x86_64 FR-wr-missing cvtpd2pi +REG_FP_REG
 x86_64 FR-wr-missing cvtpd2pi +REG_GPR#
 x86_64 FR-wr-missing cvtpd2pi +REG_SP
@@ -3650,30 +3552,7 @@ x86_64 FR-wr-missing cvttpd2pi +REG_SP
 x86_64 FR-wr-missing movq +REG_FP_REG
 x86_64 FR-wr-missing movq +REG_GPR#
 x86_64 FR-wr-missing movq +REG_SP
-x86_64 FR-wr-missing pcmpestrm +REG_FLAGS,REG_VEC#
-x86_64 FR-wr-missing pcmpistrm +REG_FLAGS,REG_VEC#
 x86_64 FR-wr-missing rdpkru +REG_GPR#
-x86_64 FR-wr-missing shldl +REG_FP_REG
-x86_64 FR-wr-missing shldl +REG_GPR#
-x86_64 FR-wr-missing shldl +REG_SP
-x86_64 FR-wr-missing shldq +REG_FP_REG
-x86_64 FR-wr-missing shldq +REG_GPR#
-x86_64 FR-wr-missing shldq +REG_SP
-x86_64 FR-wr-missing shldw +REG_FP_REG
-x86_64 FR-wr-missing shldw +REG_GPR#
-x86_64 FR-wr-missing shldw +REG_SP
-x86_64 FR-wr-missing shrdl +REG_FP_REG
-x86_64 FR-wr-missing shrdl +REG_GPR#
-x86_64 FR-wr-missing shrdl +REG_SP
-x86_64 FR-wr-missing shrdq +REG_FP_REG
-x86_64 FR-wr-missing shrdq +REG_GPR#
-x86_64 FR-wr-missing shrdq +REG_SP
-x86_64 FR-wr-missing shrdw +REG_FP_REG
-x86_64 FR-wr-missing shrdw +REG_GPR#
-x86_64 FR-wr-missing shrdw +REG_SP
-x86_64 FR-wr-missing sti +REG_FLAGS
-x86_64 FR-wr-missing vpcmpestrm +REG_FLAGS,REG_VEC#
-x86_64 FR-wr-missing vpcmpistrm +REG_FLAGS,REG_VEC#
 x86_64 FR-wr-missing wait +REG_FCSR
 x86_64 FR-wr-phantom cvtpd2pi +REG_FPR#
 x86_64 FR-wr-phantom cvttpd2pi +REG_FPR#
@@ -7013,3 +6892,344 @@ mipsel FR-wr-missing bz.h +REG_GPR#
 mipsel FR-wr-missing bz.v +REG_GPR#
 mipsel FR-wr-missing bz.w +REG_GPR#
 mipsel FR-wr-missing j +REG_GPR#
+
+# =====================================================================
+# FIELDS LAYER, x86_64: the dependencies the boundary carries and LLVM
+# MC's instruction descriptions do not.  Two independent groups, both
+# MEASURED at the tip and neither inherited.
+#
+# (A) THE x87 IMPLICIT SET.  disas/capstone.c recomputes it from the
+#     instruction bytes with QEMU's own gen_x87() dispatch key -- see
+#     cap_x86_x87_effects -- so every ST(0)/ST(1) access and every
+#     status-word read below is the operand set of the helper sequence
+#     QEMU emits for that (mod, op, rm).  LLVM MC models almost none of
+#     it: `fchs` carries no implicit operand although it negates ST(0),
+#     `fadds (%rax)` names neither the ST(0) read nor the ST(0) write,
+#     and `fst %st(1)` names st1 as a USE where the instruction assigns
+#     it.  `fcmov* +REG_FLAGS` is the same shape from the other side --
+#     FCMOVcc TESTS CF/ZF/PF and LLVM names no flag use.
+#     CHECK: read the gen_x87() case the encoding's (mod, op, rm)
+#     selects.  If the helpers there do not touch the register named in
+#     the qualifier, the boundary is wrong and the entry is a bug.
+#
+# (B) A PRE-EXISTING RED, now closed.  Ninety-five of the signatures
+#     below were unallowed at HEAD BEFORE any x87 work, with 69 dead
+#     rules beside them, and the gate had not been re-run since the
+#     repair that caused it: teaching the fields layer the EFLAGS
+#     bitmask mapping (disas/capstone.c, cap_x86_eflags_from_bitmask)
+#     turned `FR-rd-missing <shift> +REG_FLAGS` into
+#     `FR-rd-phantom <shift> +REG_FLAGS` and left the old shape behind.
+#     Each family is architecturally real:
+#       shift/rotate +REG_FLAGS read  -- a count of 0 leaves the flags
+#            UNCHANGED, so the flags word is an input (PRIOR_x -> READ)
+#       rcl/rcr                       -- read CF as the rotated-in bit
+#       popf +REG_FLAGS read          -- reserved bits, and IOPL/IF at
+#            CPL>0, are PRESERVED, so the old word is an input
+#       in/out +REG_FLAGS read        -- the #GP depends on IOPL
+#       lar/lsl/verr/verw +REG_FLAGS write -- all four set ZF (SDM)
+#       rsm +REG_FLAGS write          -- restores EFLAGS from SMRAM
+#       encls/enclu/enclv +REG_GPR#   -- the leaf number in EAX and the
+#            operands/returns in RBX/RCX/RDX; LLVM names nothing at all
+#       vmfunc/xabort/xbegin +REG_GPR# -- EAX (and ECX for VMFUNC) is a
+#            real operand of each; LLVM names nothing
+#       pushq/pushw %fs|%gs           -- the segment READ, the stack
+#            pointer, and the stack STORE, none of which LLVM models
+#       +REG_SEG0/1/2/5 on the READ side -- LLVM counts a CS/DS/ES/SS
+#            override as a register read; in 64-bit mode those bases are
+#            architecturally ZERO, so the override cannot reach the
+#            effective address and the boundary folds it away
+#     CHECK: each entry names one architectural fact; delete it when
+#     LLVM's MCInstrDesc starts carrying that fact.
+#
+# NOT COVERED HERE, deliberately: the x87 CONTROL-word (rounding-mode)
+# read that LLVM names on the arithmetic forms and the boundary does
+# not.  That is a separate open item, not folded into this block.
+# =====================================================================
+
+# (A) x87
+x86_64 FR-rd-missing fnstenv +REG_SEG0
+x86_64 FR-rd-missing fnstenv +REG_SEG1
+x86_64 FR-rd-missing fnstsw +REG_SEG0
+x86_64 FR-rd-missing fnstsw +REG_SEG1
+x86_64 FR-rd-phantom f2xm1 +REG_FPR#
+x86_64 FR-rd-phantom fabs +REG_FPR#
+x86_64 FR-rd-phantom faddl +REG_FPR#
+x86_64 FR-rd-phantom faddp +REG_FCSR
+x86_64 FR-rd-phantom faddp +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fadds +REG_FPR#
+x86_64 FR-rd-phantom fbld +REG_FCSR
+x86_64 FR-rd-phantom fbstp +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fchs +REG_FPR#
+x86_64 FR-rd-phantom fcmovb +REG_FLAGS
+x86_64 FR-rd-phantom fcmovb +REG_FLAGS,REG_FPR#
+x86_64 FR-rd-phantom fcmovbe +REG_FLAGS
+x86_64 FR-rd-phantom fcmovbe +REG_FLAGS,REG_FPR#
+x86_64 FR-rd-phantom fcmove +REG_FLAGS
+x86_64 FR-rd-phantom fcmove +REG_FLAGS,REG_FPR#
+x86_64 FR-rd-phantom fcmovnb +REG_FLAGS
+x86_64 FR-rd-phantom fcmovnb +REG_FLAGS,REG_FPR#
+x86_64 FR-rd-phantom fcmovnbe +REG_FLAGS
+x86_64 FR-rd-phantom fcmovnbe +REG_FLAGS,REG_FPR#
+x86_64 FR-rd-phantom fcmovne +REG_FLAGS
+x86_64 FR-rd-phantom fcmovne +REG_FLAGS,REG_FPR#
+x86_64 FR-rd-phantom fcmovnu +REG_FLAGS
+x86_64 FR-rd-phantom fcmovnu +REG_FLAGS,REG_FPR#
+x86_64 FR-rd-phantom fcmovu +REG_FLAGS
+x86_64 FR-rd-phantom fcmovu +REG_FLAGS,REG_FPR#
+x86_64 FR-rd-phantom fcomp +REG_FCSR
+x86_64 FR-rd-phantom fcomp +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fcompi +REG_FCSR
+x86_64 FR-rd-phantom fcompl +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fcompp +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fcomps +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fcos +REG_FPR#
+x86_64 FR-rd-phantom fdecstp +REG_FCSR
+x86_64 FR-rd-phantom fdivl +REG_FPR#
+x86_64 FR-rd-phantom fdivp +REG_FCSR
+x86_64 FR-rd-phantom fdivp +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fdivrl +REG_FPR#
+x86_64 FR-rd-phantom fdivrp +REG_FCSR
+x86_64 FR-rd-phantom fdivrp +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fdivrs +REG_FPR#
+x86_64 FR-rd-phantom fdivs +REG_FPR#
+x86_64 FR-rd-phantom ffreep +REG_FCSR
+x86_64 FR-rd-phantom fiaddl +REG_FPR#
+x86_64 FR-rd-phantom fiadds +REG_FPR#
+x86_64 FR-rd-phantom ficompl +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom ficomps +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fidivl +REG_FPR#
+x86_64 FR-rd-phantom fidivrl +REG_FPR#
+x86_64 FR-rd-phantom fidivrs +REG_FPR#
+x86_64 FR-rd-phantom fidivs +REG_FPR#
+x86_64 FR-rd-phantom fildl +REG_FCSR
+x86_64 FR-rd-phantom fildll +REG_FCSR
+x86_64 FR-rd-phantom filds +REG_FCSR
+x86_64 FR-rd-phantom fimull +REG_FPR#
+x86_64 FR-rd-phantom fimuls +REG_FPR#
+x86_64 FR-rd-phantom fincstp +REG_FCSR
+x86_64 FR-rd-phantom fistl +REG_FPR#
+x86_64 FR-rd-phantom fistpl +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fistpll +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fistps +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fists +REG_FPR#
+x86_64 FR-rd-phantom fisttpl +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fisttpll +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fisttps +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fisubl +REG_FPR#
+x86_64 FR-rd-phantom fisubrl +REG_FPR#
+x86_64 FR-rd-phantom fisubrs +REG_FPR#
+x86_64 FR-rd-phantom fisubs +REG_FPR#
+x86_64 FR-rd-phantom fld +REG_FCSR
+x86_64 FR-rd-phantom fld1 +REG_FCSR
+x86_64 FR-rd-phantom fldl +REG_FCSR
+x86_64 FR-rd-phantom fldl2e +REG_FCSR
+x86_64 FR-rd-phantom fldl2t +REG_FCSR
+x86_64 FR-rd-phantom fldlg2 +REG_FCSR
+x86_64 FR-rd-phantom fldln2 +REG_FCSR
+x86_64 FR-rd-phantom fldpi +REG_FCSR
+x86_64 FR-rd-phantom flds +REG_FCSR
+x86_64 FR-rd-phantom fldt +REG_FCSR
+x86_64 FR-rd-phantom fldz +REG_FCSR
+x86_64 FR-rd-phantom fmull +REG_FPR#
+x86_64 FR-rd-phantom fmulp +REG_FCSR
+x86_64 FR-rd-phantom fmulp +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fmuls +REG_FPR#
+x86_64 FR-rd-phantom fpatan +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fprem +REG_FPR#
+x86_64 FR-rd-phantom fprem1 +REG_FPR#
+x86_64 FR-rd-phantom fptan +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom frndint +REG_FPR#
+x86_64 FR-rd-phantom fucomp +REG_FCSR
+x86_64 FR-rd-phantom fucompi +REG_FCSR
+x86_64 FR-rd-phantom fucompp +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fxch +REG_FPR#
+x86_64 FR-rd-phantom fxtract +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fyl2x +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fyl2xp1 +REG_FCSR,REG_FPR#
+x86_64 FR-wr-phantom f2xm1 +REG_FPR#
+x86_64 FR-wr-phantom fabs +REG_FPR#
+x86_64 FR-wr-phantom fadd +REG_FPR#
+x86_64 FR-wr-phantom faddl +REG_FPR#
+x86_64 FR-wr-phantom faddp +REG_FPR#
+x86_64 FR-wr-phantom fadds +REG_FPR#
+x86_64 FR-wr-phantom fbld +REG_FPR#
+x86_64 FR-wr-phantom fchs +REG_FPR#
+x86_64 FR-wr-phantom fcos +REG_FPR#
+x86_64 FR-wr-phantom fdiv +REG_FPR#
+x86_64 FR-wr-phantom fdivl +REG_FPR#
+x86_64 FR-wr-phantom fdivp +REG_FPR#
+x86_64 FR-wr-phantom fdivr +REG_FPR#
+x86_64 FR-wr-phantom fdivrl +REG_FPR#
+x86_64 FR-wr-phantom fdivrp +REG_FPR#
+x86_64 FR-wr-phantom fdivrs +REG_FPR#
+x86_64 FR-wr-phantom fdivs +REG_FPR#
+x86_64 FR-wr-phantom fiaddl +REG_FPR#
+x86_64 FR-wr-phantom fiadds +REG_FPR#
+x86_64 FR-wr-phantom fidivl +REG_FPR#
+x86_64 FR-wr-phantom fidivrl +REG_FPR#
+x86_64 FR-wr-phantom fidivrs +REG_FPR#
+x86_64 FR-wr-phantom fidivs +REG_FPR#
+x86_64 FR-wr-phantom fildl +REG_FPR#
+x86_64 FR-wr-phantom fildll +REG_FPR#
+x86_64 FR-wr-phantom filds +REG_FPR#
+x86_64 FR-wr-phantom fimull +REG_FPR#
+x86_64 FR-wr-phantom fimuls +REG_FPR#
+x86_64 FR-wr-phantom fisubl +REG_FPR#
+x86_64 FR-wr-phantom fisubrl +REG_FPR#
+x86_64 FR-wr-phantom fisubrs +REG_FPR#
+x86_64 FR-wr-phantom fisubs +REG_FPR#
+x86_64 FR-wr-phantom fld +REG_FPR#
+x86_64 FR-wr-phantom fld1 +REG_FPR#
+x86_64 FR-wr-phantom fldl +REG_FPR#
+x86_64 FR-wr-phantom fldl2e +REG_FPR#
+x86_64 FR-wr-phantom fldl2t +REG_FPR#
+x86_64 FR-wr-phantom fldlg2 +REG_FPR#
+x86_64 FR-wr-phantom fldln2 +REG_FPR#
+x86_64 FR-wr-phantom fldpi +REG_FPR#
+x86_64 FR-wr-phantom flds +REG_FPR#
+x86_64 FR-wr-phantom fldt +REG_FPR#
+x86_64 FR-wr-phantom fldz +REG_FPR#
+x86_64 FR-wr-phantom fmul +REG_FPR#
+x86_64 FR-wr-phantom fmull +REG_FPR#
+x86_64 FR-wr-phantom fmulp +REG_FPR#
+x86_64 FR-wr-phantom fmuls +REG_FPR#
+x86_64 FR-wr-phantom fpatan +REG_FPR#
+x86_64 FR-wr-phantom fprem +REG_FPR#
+x86_64 FR-wr-phantom fprem1 +REG_FPR#
+x86_64 FR-wr-phantom fptan +REG_FPR#
+x86_64 FR-wr-phantom frndint +REG_FPR#
+x86_64 FR-wr-phantom fxch +REG_FPR#
+x86_64 FR-wr-phantom fxtract +REG_FPR#
+x86_64 FR-wr-phantom fyl2x +REG_FPR#
+x86_64 FR-wr-phantom fyl2xp1 +REG_FPR#
+
+# (B) the pre-existing EFLAGS / operand / segment families
+x86_64 FM-cs-mem-llvm-none pushq
+x86_64 FM-cs-mem-llvm-none pushw
+x86_64 FR-rd-missing fst +REG_FPR#
+x86_64 FR-rd-missing rclb +REG_SEG0
+x86_64 FR-rd-missing rclb +REG_SEG1
+x86_64 FR-rd-missing rclb +REG_SEG2
+x86_64 FR-rd-missing rclb +REG_SEG5
+x86_64 FR-rd-missing rcll +REG_SEG0
+x86_64 FR-rd-missing rcll +REG_SEG1
+x86_64 FR-rd-missing rcll +REG_SEG2
+x86_64 FR-rd-missing rcll +REG_SEG5
+x86_64 FR-rd-missing rclq +REG_SEG0
+x86_64 FR-rd-missing rclq +REG_SEG1
+x86_64 FR-rd-missing rclw +REG_SEG0
+x86_64 FR-rd-missing rclw +REG_SEG1
+x86_64 FR-rd-missing rclw +REG_SEG2
+x86_64 FR-rd-missing rclw +REG_SEG5
+x86_64 FR-rd-missing rcrb +REG_SEG0
+x86_64 FR-rd-missing rcrb +REG_SEG1
+x86_64 FR-rd-missing rcrl +REG_SEG0
+x86_64 FR-rd-missing rcrl +REG_SEG1
+x86_64 FR-rd-missing rcrq +REG_SEG0
+x86_64 FR-rd-missing rcrq +REG_SEG1
+x86_64 FR-rd-phantom encls +REG_GPR#
+x86_64 FR-rd-phantom enclu +REG_GPR#
+x86_64 FR-rd-phantom enclv +REG_GPR#
+x86_64 FR-rd-phantom fscale +REG_FPR#
+x86_64 FR-rd-phantom fsin +REG_FPR#
+x86_64 FR-rd-phantom fsincos +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fsqrt +REG_FPR#
+x86_64 FR-rd-phantom fst +REG_FPR#
+x86_64 FR-rd-phantom fstl +REG_FPR#
+x86_64 FR-rd-phantom fstp +REG_FCSR
+x86_64 FR-rd-phantom fstp +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fstpl +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fstps +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fstpt +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fsts +REG_FPR#
+x86_64 FR-rd-phantom fsubl +REG_FPR#
+x86_64 FR-rd-phantom fsubp +REG_FCSR
+x86_64 FR-rd-phantom fsubp +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fsubrl +REG_FPR#
+x86_64 FR-rd-phantom fsubrp +REG_FCSR
+x86_64 FR-rd-phantom fsubrp +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fsubrs +REG_FPR#
+x86_64 FR-rd-phantom fsubs +REG_FPR#
+x86_64 FR-rd-phantom inb +REG_FLAGS
+x86_64 FR-rd-phantom inl +REG_FLAGS
+x86_64 FR-rd-phantom inw +REG_FLAGS
+x86_64 FR-rd-phantom outb +REG_FLAGS
+x86_64 FR-rd-phantom outl +REG_FLAGS
+x86_64 FR-rd-phantom outw +REG_FLAGS
+x86_64 FR-rd-phantom popfq +REG_FLAGS
+x86_64 FR-rd-phantom popfw +REG_FLAGS
+x86_64 FR-rd-phantom pushq +REG_SEG3,REG_SP
+x86_64 FR-rd-phantom pushq +REG_SEG4,REG_SP
+x86_64 FR-rd-phantom pushw +REG_SEG3,REG_SP
+x86_64 FR-rd-phantom pushw +REG_SEG4,REG_SP
+x86_64 FR-rd-phantom rolb +REG_FLAGS
+x86_64 FR-rd-phantom roll +REG_FLAGS
+x86_64 FR-rd-phantom rolq +REG_FLAGS
+x86_64 FR-rd-phantom rolw +REG_FLAGS
+x86_64 FR-rd-phantom rorb +REG_FLAGS
+x86_64 FR-rd-phantom rorl +REG_FLAGS
+x86_64 FR-rd-phantom rorq +REG_FLAGS
+x86_64 FR-rd-phantom rorw +REG_FLAGS
+x86_64 FR-rd-phantom sarb +REG_FLAGS
+x86_64 FR-rd-phantom sarl +REG_FLAGS
+x86_64 FR-rd-phantom sarq +REG_FLAGS
+x86_64 FR-rd-phantom sarw +REG_FLAGS
+x86_64 FR-rd-phantom shlb +REG_FLAGS
+x86_64 FR-rd-phantom shldl +REG_FLAGS
+x86_64 FR-rd-phantom shldq +REG_FLAGS
+x86_64 FR-rd-phantom shldw +REG_FLAGS
+x86_64 FR-rd-phantom shll +REG_FLAGS
+x86_64 FR-rd-phantom shlq +REG_FLAGS
+x86_64 FR-rd-phantom shlw +REG_FLAGS
+x86_64 FR-rd-phantom shrb +REG_FLAGS
+x86_64 FR-rd-phantom shrdl +REG_FLAGS
+x86_64 FR-rd-phantom shrdq +REG_FLAGS
+x86_64 FR-rd-phantom shrdw +REG_FLAGS
+x86_64 FR-rd-phantom shrl +REG_FLAGS
+x86_64 FR-rd-phantom shrq +REG_FLAGS
+x86_64 FR-rd-phantom shrw +REG_FLAGS
+x86_64 FR-rd-phantom vmfunc +REG_GPR#
+x86_64 FR-rd-phantom xabort +REG_GPR#
+x86_64 FR-rd-phantom xbegin +REG_GPR#
+x86_64 FR-wr-phantom encls +REG_GPR#
+x86_64 FR-wr-phantom enclu +REG_GPR#
+x86_64 FR-wr-phantom enclv +REG_GPR#
+x86_64 FR-wr-phantom fscale +REG_FPR#
+x86_64 FR-wr-phantom fsin +REG_FPR#
+x86_64 FR-wr-phantom fsincos +REG_FPR#
+x86_64 FR-wr-phantom fsqrt +REG_FPR#
+x86_64 FR-wr-phantom fst +REG_FPR#
+x86_64 FR-wr-phantom fsub +REG_FPR#
+x86_64 FR-wr-phantom fsubl +REG_FPR#
+x86_64 FR-wr-phantom fsubp +REG_FPR#
+x86_64 FR-wr-phantom fsubr +REG_FPR#
+x86_64 FR-wr-phantom fsubrl +REG_FPR#
+x86_64 FR-wr-phantom fsubrp +REG_FPR#
+x86_64 FR-wr-phantom fsubrs +REG_FPR#
+x86_64 FR-wr-phantom fsubs +REG_FPR#
+x86_64 FR-wr-phantom larl +REG_FLAGS
+x86_64 FR-wr-phantom larq +REG_FLAGS
+x86_64 FR-wr-phantom larw +REG_FLAGS
+x86_64 FR-wr-phantom lsll +REG_FLAGS
+x86_64 FR-wr-phantom lslq +REG_FLAGS
+x86_64 FR-wr-phantom lslw +REG_FLAGS
+x86_64 FR-wr-phantom rsm +REG_FLAGS
+x86_64 FR-wr-phantom verr +REG_FLAGS
+x86_64 FR-wr-phantom verw +REG_FLAGS
+x86_64 FR-wr-phantom xabort +REG_GPR#
+
+# R7.1-SCALAR: the destination of a UNARY legacy scalar SSE form is a PURE
+# write.  ROUNDSS / ROUNDSD compute the low element from the source operand
+# alone; the only part of the destination that survives is the upper lane,
+# and a narrow write does not make a register a source -- rename does not
+# know the data-width scope of the next reader.  LLVM MC models the
+# preserve as a tied operand and so names the destination a USE; XED
+# declares the same thing (`REG0=XMM_R():rw`) and the project's own
+# reference arm already suppresses it under R7.1-SCALAR.  Capstone reports
+# these two read-modify-write ALONE in their family -- `sqrtsd`,
+# `cvtsd2ss`, `cvtsi2ss` and the rest of the unary set all come back
+# WRITE-only on the same operand shape -- so leaving it would put a false
+# RAW edge on every `roundsd` in a trace.  Removable when LLVM stops tying
+# the operand, which is not expected.
+x86_64 FR-rd-missing roundsd +REG_VEC#
+x86_64 FR-rd-missing roundss +REG_VEC#

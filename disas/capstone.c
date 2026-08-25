@@ -532,6 +532,66 @@ static void cap_x86_eflags_from_bitmask(csh handle, const cs_insn *insn,
                                        qemu_plugin_insn_info *out);
 static void cap_x86_add_sysregs(const cs_insn *insn,
                                 qemu_plugin_insn_info *out);
+/*
+ * -------------------------------------------------------------------------
+ * The x87 escape space: the implicit dataflow Capstone does not publish.
+ *
+ * Capstone-6.0.0-Alpha7 names the ARCHITECTURALLY EXPLICIT st(i) operand of
+ * an x87 instruction and almost nothing else.  `fadd %st(1)` comes back
+ * reading st1 and writing NOTHING -- no ST(0) read, no ST(0) write, no
+ * status word -- for an instruction whose entire effect is
+ * ST(0) <- ST(0) + ST(1).  `fld1` reports no destination at all.  The whole
+ * D9 E0..FF transcendental and constant group reports an empty operand list.
+ * A consumer reading those sets sees an FP program with no dependency chain
+ * through the x87 stack whatsoever.
+ *
+ * GROUND TRUTH IS QEMU'S OWN TRANSLATOR, and this table is keyed the way
+ * QEMU keys it.  gen_x87() (target/i386/tcg/translate.c) computes
+ *
+ *      mod = (modrm >> 6) & 3;
+ *      rm  = modrm & 7;
+ *      op  = ((b & 7) << 3) | ((modrm >> 3) & 7);
+ *
+ * and dispatches on exactly (mod == 3, op, rm).  cap_x86_x87_effects()
+ * recomputes those three from the instruction bytes and mirrors the same
+ * switch, so each row below is the operand set of the helper sequence QEMU
+ * emits for that case rather than a transcription of a manual:
+ *
+ *   gen_helper_*_ST0 / fp_arith_ST0_FT0   touches ST(0)
+ *   gen_helper_fp_arith_STN_ST0           reads ST(0), writes the named st(i)
+ *   gen_helper_fpush / fpop               moves env->fpstt -- the TOP field
+ *                                         of the status word -- so the status
+ *                                         word is read AND written
+ *   gen_helper_fcom_/fucom_ST0_FT0        writes the condition codes
+ *
+ * The status word is where TOP lives, so a push or a pop is a genuine
+ * read-modify-write of it and a later `fnstsw` must wait on it: the R7
+ * regfile-dependency test is satisfied for every edge stated here.  The
+ * x87 control and tag words fold onto the same generic id as the status
+ * word, so FLDENV / FNSTENV are stated through cap_x86_add_x87_env().
+ */
+#define X87F_R0    0x0001u   /* reads  ST(0) implicitly                    */
+#define X87F_W0    0x0002u   /* writes ST(0) implicitly                    */
+#define X87F_R1    0x0004u   /* reads  ST(1) implicitly                    */
+#define X87F_W1    0x0008u   /* writes ST(1) implicitly                    */
+#define X87F_SWR   0x0010u   /* reads  the status word                     */
+#define X87F_SWW   0x0020u   /* writes the status word                     */
+#define X87F_OPW   0x0040u   /* the LAST st(i) operand is a PURE write     */
+#define X87F_OPRW  0x0080u   /* the LAST st(i) operand is read-modify-write*/
+#define X87F_ENVR  0x0100u   /* reads  the control + tag words             */
+#define X87F_ENVW  0x0200u   /* writes the control + tag words             */
+#define X87F_ANY   0x03ffu
+
+/* fpush / fpop / fpop2 all move env->fpstt, which lives in the status word. */
+#define X87F_PUSH  (X87F_SWR | X87F_SWW)
+#define X87F_POP   (X87F_SWR | X87F_SWW)
+static void cap_x86_add_pcmpstr_implicit(const cs_insn *insn,
+                                        qemu_plugin_insn_info *out,
+                                        csh handle);
+static unsigned int cap_x86_x87_effects(const cs_insn *insn);
+static void cap_x86_add_x87_implicit(unsigned int fx,
+                                     qemu_plugin_insn_info *out, csh handle);
+static bool cap_x86_reg_is_x87_stack(unsigned int reg);
 
 /*
  * Extract per-operand detail for x86 into the plugin operand struct.
@@ -620,6 +680,23 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
      * it READ, and FRSTOR reports its memory SOURCE written — see
      * cap_x86_x87_mem_access. */
     uint8_t x87_mem = cap_x86_x87_mem_access(insn->mnemonic);
+    /* Capstone-6.0.0-Alpha7 publishes almost none of an x87 instruction's
+     * dataflow: no implicit ST(0), no status word on the register forms,
+     * and an empty operand list for the whole D9 E0..FF group.  The set is
+     * recomputed from the bytes with QEMU's own gen_x87() dispatch key --
+     * see cap_x86_x87_effects.  X87F_OPW / X87F_OPRW repair the access on
+     * the NAMED st(i), which is the destination of the `fxxx %st,%st(i)`,
+     * `fxxxp`, `fst`/`fstp %st(i)` and `fxch` forms and comes back READ. */
+    unsigned int x87fx = cap_x86_x87_effects(insn);
+    int x87_last_st = -1;
+    if (x87fx & (X87F_OPW | X87F_OPRW)) {
+        for (uint8_t i = 0; i < n; i++) {
+            if (x86->operands[i].type == X86_OP_REG &&
+                cap_x86_reg_is_x87_stack(x86->operands[i].reg)) {
+                x87_last_st = i;
+            }
+        }
+    }
     /* Capstone-6.0.0-Alpha7 bug: the AVX-512 mask-arithmetic KADD* /
      * KUNPCK* and the XOP VPERMIL2P* forms report access == 0 on every
      * operand — see cap_x86_is_mask_arith_dest_last.  Their dataflow is
@@ -870,6 +947,30 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
             } else if (fcmov && i == 0) {
                 op->access = QEMU_PLUGIN_OP_ACC_READ;
             }
+            /* Capstone-6.0.0-Alpha7 reports the XMM DESTINATION of the
+             * scalar ROUNDSS / ROUNDSD read-modify-write, alone in its
+             * family: `sqrtsd`, `cvtsd2ss`, `cvtsi2ss` and every other
+             * legacy scalar form that computes its result from the source
+             * alone come back WRITE-only on the same operand shape.  The
+             * rounding takes no input from the destination; the only part
+             * of it that survives is the upper lane, and a narrow write
+             * does not make a register a source (R7.1).  Left as reported,
+             * every `roundsd` in a trace carries a false RAW edge to
+             * whatever last wrote that register. */
+            if (scalar_round && i == n - 1) {
+                op->access = QEMU_PLUGIN_OP_ACC_WRITE;
+            }
+            /* The x87 destination register.  `fst %st(i)` and
+             * `fstp %st(i)` lower to gen_helper_fmov_STN_ST0, which
+             * assigns the named slot outright, so it is a PURE write;
+             * `fadd %st,%st(i)`, `faddp` and `fxch` read it as well. */
+            if (i == x87_last_st) {
+                if (x87fx & X87F_OPW) {
+                    op->access = QEMU_PLUGIN_OP_ACC_WRITE;
+                } else {
+                    op->access |= QEMU_PLUGIN_OP_ACC_WRITE;
+                }
+            }
             break;
         case X86_OP_IMM:
             op->type = QEMU_PLUGIN_OP_IMM;
@@ -994,6 +1095,8 @@ static void cap_fill_x86_operands(csh handle, const cs_insn *insn,
 
     cap_x86_eflags_from_bitmask(handle, insn, out);
     cap_x86_add_sysregs(insn, out);
+    cap_x86_add_x87_implicit(x87fx, out, handle);
+    cap_x86_add_pcmpstr_implicit(insn, out, handle);
 }
 
 /*
@@ -1175,6 +1278,314 @@ static void cap_x86_add_x87_env(qemu_plugin_insn_info *out, uint8_t access,
     cap_x86_add_sysreg(out, CAP_X86_SYSREG_X87TAG, access);
     if (with_mxcsr) {
         cap_x86_add_sysreg(out, CAP_X86_SYSREG_MXCSR, access);
+    }
+}
+
+
+
+static bool cap_x86_reg_is_x87_stack(unsigned int reg)
+{
+    return (reg >= X86_REG_ST0 && reg <= X86_REG_ST7) ||
+           (reg >= X86_REG_FP0 && reg <= X86_REG_FP7);
+}
+
+/*
+ * Byte index of the x87 escape opcode (0xd8..0xdf), or -1.  Same prefix
+ * skip as cap_x86_is_x87_escape, which is written in terms of this.
+ */
+static int cap_x86_x87_escape_at(const cs_insn *insn)
+{
+    uint16_t k = 0;
+
+    while (k < insn->size) {
+        uint8_t b = insn->bytes[k];
+        if (b == 0x26 || b == 0x2e || b == 0x36 || b == 0x3e ||
+            b == 0x64 || b == 0x65 || b == 0x66 || b == 0x67 ||
+            b == 0xf0 || b == 0xf2 || b == 0xf3 ||
+            (b >= 0x40 && b <= 0x4f)) {
+            k++;
+        } else {
+            return (b >= 0xd8 && b <= 0xdf) ? (int)k : -1;
+        }
+    }
+    return -1;
+}
+
+static unsigned int cap_x86_x87_effects(const cs_insn *insn)
+{
+    int k = cap_x86_x87_escape_at(insn);
+    uint8_t b, modrm;
+    int mod, rm, op;
+
+    if (k < 0 || (uint16_t)(k + 1) >= insn->size) {
+        return 0;
+    }
+    b     = insn->bytes[k];
+    modrm = insn->bytes[k + 1];
+    mod   = (modrm >> 6) & 3;
+    rm    = modrm & 7;
+    op    = ((b & 7) << 3) | ((modrm >> 3) & 7);
+
+    if (mod != 3) {
+        /* ---- memory forms ------------------------------------------- */
+        switch (op) {
+        case 0x00: case 0x01: case 0x02: case 0x03:
+        case 0x04: case 0x05: case 0x06: case 0x07:
+        case 0x10: case 0x11: case 0x12: case 0x13:
+        case 0x14: case 0x15: case 0x16: case 0x17:
+        case 0x20: case 0x21: case 0x22: case 0x23:
+        case 0x24: case 0x25: case 0x26: case 0x27:
+        case 0x30: case 0x31: case 0x32: case 0x33:
+        case 0x34: case 0x35: case 0x36: case 0x37:
+            /* fxxx{s,l} / fixxx{l,s}: the memory operand becomes FT0 and
+             * gen_helper_fp_arith_ST0_FT0(op & 7) combines it with ST(0).
+             * op1 == 2 is fcom (no result written), op1 == 3 is fcomp
+             * (fcom + gen_helper_fpop). */
+            if ((op & 7) == 2) {
+                return X87F_R0 | X87F_SWW;
+            }
+            if ((op & 7) == 3) {
+                return X87F_R0 | X87F_POP | X87F_SWW;
+            }
+            return X87F_R0 | X87F_W0 | X87F_SWW;
+        case 0x08: case 0x18: case 0x28: case 0x38:
+            /* flds / fildl / fldl / filds -- gen_helper_f{ld,ild}*_ST0
+             * after the implicit push the ST0 name performs. */
+            return X87F_PUSH | X87F_W0 | X87F_SWW;
+        case 0x09: case 0x19: case 0x29: case 0x39:
+            /* fisttp{s,l,ll} -- gen_helper_fistt*_ST0 then fpop. */
+            return X87F_R0 | X87F_POP | X87F_SWW;
+        case 0x0a: case 0x1a: case 0x2a: case 0x3a:
+            /* fsts / fistl / fstl / fists -- read ST(0), no pop. */
+            return X87F_R0 | X87F_SWW;
+        case 0x0b: case 0x1b: case 0x2b: case 0x3b:
+            /* fstps / fistpl / fstpl / fistps -- read ST(0) then fpop. */
+            return X87F_R0 | X87F_POP | X87F_SWW;
+        case 0x0c:
+            /* fldenv: do_fldenv() assigns fpuc, fpus, fpstt and every
+             * fptags[] entry and reads none of them. */
+            return X87F_ENVW | X87F_SWW;
+        case 0x0e:
+            /* fnstenv: do_fstenv() READS fpuc, fpus, fpstt and fptags[]
+             * and assigns nothing.  XED names only a status-word write;
+             * LLVM MC names the read as well and QEMU settles it. */
+            return X87F_ENVR | X87F_SWR;
+        case 0x1d: case 0x3d:
+            /* fldt (m80) / fildll -- gen_helper_fldt_ST0 / fildll_ST0. */
+            return X87F_PUSH | X87F_W0 | X87F_SWW;
+        case 0x1f: case 0x3f:
+            /* fstpt (m80) / fistpll -- ST0 then fpop. */
+            return X87F_R0 | X87F_POP | X87F_SWW;
+        case 0x2f:
+            /* fnstsw m16 -- helper_fnstsw() returns a rearrangement of
+             * env->fpus and assigns nothing. */
+            return X87F_SWR;
+        case 0x3c:
+            /* fbld -- gen_helper_fbld_ST0, which pushes. */
+            return X87F_PUSH | X87F_W0 | X87F_SWW;
+        case 0x3e:
+            /* fbstp -- gen_helper_fbst_ST0 then fpop. */
+            return X87F_R0 | X87F_POP | X87F_SWW;
+        /* 0x0d fldcw, 0x0f fnstcw, 0x2c frstor, 0x2e fnsave are already
+         * stated in full by cap_x86_add_sysregs(). */
+        default:
+            return 0;
+        }
+    }
+
+    /* ---- register forms --------------------------------------------- */
+    switch (op) {
+    case 0x00: case 0x01: case 0x04: case 0x05: case 0x06: case 0x07:
+        /* fxxx %st(i), %st -- fmov_FT0_STN(i) then fp_arith_ST0_FT0:
+         * ST(0) is both the other addend and the destination. */
+        return X87F_R0 | X87F_W0 | X87F_SWW;
+    case 0x20: case 0x21: case 0x24: case 0x25: case 0x26: case 0x27:
+        /* fxxx %st, %st(i) -- fp_arith_STN_ST0: reads ST(0), and the
+         * NAMED register is the destination as well as an addend. */
+        return X87F_R0 | X87F_OPRW | X87F_SWW;
+    case 0x30: case 0x31: case 0x34: case 0x35: case 0x36: case 0x37:
+        /* fxxxp %st, %st(i) -- the same, then fpop. */
+        return X87F_R0 | X87F_OPRW | X87F_POP | X87F_SWW;
+    case 0x02: case 0x22:
+        /* fcom %st(i) */
+        return X87F_R0 | X87F_SWW;
+    case 0x03: case 0x23: case 0x32:
+        /* fcomp %st(i) -- fcom then fpop. */
+        return X87F_R0 | X87F_POP | X87F_SWW;
+    case 0x08:
+        /* fld %st(i) -- fpush then fmov_ST0_STN. */
+        return X87F_PUSH | X87F_W0 | X87F_SWW;
+    case 0x09: case 0x29: case 0x39:
+        /* fxch %st(i) -- gen_helper_fxchg_ST0_STN swaps the two, so both
+         * are read and both are written. */
+        return X87F_R0 | X87F_W0 | X87F_OPRW | X87F_SWW;
+    case 0x0b: case 0x2b: case 0x3a: case 0x3b:
+        /* fstp %st(i) and its three undocumented aliases --
+         * fmov_STN_ST0 (a PURE write of the named register) then fpop. */
+        return X87F_R0 | X87F_OPW | X87F_POP | X87F_SWW;
+    case 0x0c:
+        switch (rm) {
+        case 0: case 1:
+            return X87F_R0 | X87F_W0 | X87F_SWW;   /* fchs, fabs      */
+        case 4: case 5:
+            return X87F_R0 | X87F_SWW;             /* ftst, fxam      */
+        default:
+            return 0;
+        }
+    case 0x0d:
+        /* fld1 / fldl2t / fldl2e / fldpi / fldlg2 / fldln2 / fldz --
+         * fpush then the constant into ST(0). */
+        return (rm <= 6) ? (X87F_PUSH | X87F_W0 | X87F_SWW) : 0;
+    case 0x0e:
+        switch (rm) {
+        case 0: return X87F_R0 | X87F_W0 | X87F_SWW;              /* f2xm1   */
+        case 1: return X87F_R0 | X87F_R1 | X87F_W1 |
+                       X87F_POP | X87F_SWW;                       /* fyl2x   */
+        case 2: return X87F_R0 | X87F_W0 | X87F_W1 |
+                       X87F_PUSH | X87F_SWW;                      /* fptan   */
+        case 3: return X87F_R0 | X87F_R1 | X87F_W1 |
+                       X87F_POP | X87F_SWW;                       /* fpatan  */
+        case 4: return X87F_R0 | X87F_W0 | X87F_W1 |
+                       X87F_PUSH | X87F_SWW;                      /* fxtract */
+        case 5: return X87F_R0 | X87F_R1 | X87F_W0 | X87F_SWW;    /* fprem1  */
+        default: return X87F_SWR | X87F_SWW;             /* fdecstp/fincstp */
+        }
+    case 0x0f:
+        switch (rm) {
+        case 0: return X87F_R0 | X87F_R1 | X87F_W0 | X87F_SWW;    /* fprem   */
+        case 1: return X87F_R0 | X87F_R1 | X87F_W1 |
+                       X87F_POP | X87F_SWW;                       /* fyl2xp1 */
+        case 3: return X87F_R0 | X87F_W0 | X87F_W1 |
+                       X87F_PUSH | X87F_SWW;                      /* fsincos */
+        case 5: return X87F_R0 | X87F_R1 | X87F_W0 | X87F_SWW;    /* fscale  */
+        default: return X87F_R0 | X87F_W0 | X87F_SWW;
+                                          /* fsqrt, frndint, fsin, fcos */
+        }
+    case 0x15:
+        /* fucompp -- fucom then TWO fpops. */
+        return (rm == 1) ? (X87F_R0 | X87F_R1 | X87F_POP | X87F_SWW) : 0;
+    case 0x1d: case 0x1e:
+        /* fucomi / fcomi -- read ST(0), write EFLAGS (Capstone's) and the
+         * status word; no pop. */
+        return X87F_R0 | X87F_SWW;
+    case 0x2a:
+        /* fst %st(i) -- fmov_STN_ST0 is a PURE write of the named
+         * register; Capstone reports it READ. */
+        return X87F_R0 | X87F_OPW | X87F_SWW;
+    case 0x2c:
+        return X87F_R0 | X87F_SWW;                        /* fucom %st(i)  */
+    case 0x2d:
+        return X87F_R0 | X87F_POP | X87F_SWW;             /* fucomp %st(i) */
+    case 0x33:
+        /* fcompp -- fcom then TWO fpops. */
+        return (rm == 1) ? (X87F_R0 | X87F_R1 | X87F_POP | X87F_SWW) : 0;
+    case 0x38:
+        /* ffreep %st(i) -- ffree_STN (tag word only, already stated by
+         * cap_x86_add_sysregs) then fpop. */
+        return X87F_POP;
+    case 0x3c:
+        /* fnstsw %ax */
+        return (rm == 0) ? X87F_SWR : 0;
+    case 0x3d: case 0x3e:
+        /* fucomip / fcomip -- the comparison then fpop. */
+        return X87F_R0 | X87F_POP | X87F_SWW;
+    /* 0x0a fnop, 0x1c (feni/fdisi/fclex/fninit/fsetpm), 0x28 ffree and
+     * 0x10..0x13 / 0x18..0x1b FCMOVcc are already stated in full -- the
+     * first three by cap_x86_add_sysregs(), FCMOVcc by cap_x86_is_cmov(). */
+    default:
+        return 0;
+    }
+}
+
+/*
+ * Publish the implicit half of an x87 instruction's register set.  The
+ * explicit st(i) operand's own access is repaired in the operand loop of
+ * cap_fill_x86_operands (X87F_OPW / X87F_OPRW).
+ */
+static void cap_x86_add_x87_implicit(unsigned int fx,
+                                     qemu_plugin_insn_info *out, csh handle)
+{
+    if (fx & X87F_R0) {
+        cap_x86_add_implicit(out, handle, X86_REG_ST0, false);
+    }
+    if (fx & X87F_W0) {
+        cap_x86_add_implicit(out, handle, X86_REG_ST0, true);
+    }
+    if (fx & X87F_R1) {
+        cap_x86_add_implicit(out, handle, X86_REG_ST1, false);
+    }
+    if (fx & X87F_W1) {
+        cap_x86_add_implicit(out, handle, X86_REG_ST1, true);
+    }
+    if (fx & X87F_SWR) {
+        cap_x86_add_implicit(out, handle, X86_REG_FPSW, false);
+    }
+    if (fx & X87F_SWW) {
+        cap_x86_add_implicit(out, handle, X86_REG_FPSW, true);
+    }
+    if (fx & X87F_ENVR) {
+        cap_x86_add_x87_env(out, CAP_X86_SYS_R, false);
+    }
+    if (fx & X87F_ENVW) {
+        cap_x86_add_x87_env(out, CAP_X86_SYS_W, false);
+    }
+}
+
+
+/*
+ * SSE4.2 string compare -- PCMPESTRI / PCMPESTRM / PCMPISTRI / PCMPISTRM
+ * and their VEX forms.  Capstone-6.0.0-Alpha7 publishes the two explicit
+ * operands and NOTHING else: no EFLAGS write, no result register, and on
+ * the explicit-length pair no length register either.  `pcmpistrm` comes
+ * back with an EMPTY write list for an instruction whose entire purpose is
+ * producing a mask.
+ *
+ * QEMU's helpers state the whole set (target/i386/ops_sse.h):
+ *
+ *   pcmpxstrx()            assigns CC_SRC                      -> EFLAGS
+ *   helper_pcmpestr[im]    pcmp_elen(env, R_EDX, ...) and
+ *                          pcmp_elen(env, R_EAX, ...)          -> EAX, EDX read
+ *   helper_pcmpxstri       env->regs[R_ECX] = ...              -> ECX write
+ *   helper_pcmpxstrm       env->xmm_regs[0].Q/B/W(...) = ...   -> XMM0 write
+ *
+ * The implicit-length pair takes its lengths from the operands themselves
+ * (pcmp_ilen), so only the explicit-length pair reads EAX and EDX.  LLVM MC
+ * names the EFLAGS write and the XMM0 write and corroborates both.
+ */
+static void cap_x86_add_pcmpstr_implicit(const cs_insn *insn,
+                                         qemu_plugin_insn_info *out,
+                                         csh handle)
+{
+    const char *m = insn->mnemonic;
+    bool explicit_len, mask_form;
+
+    if (!m || !m[0]) {
+        return;
+    }
+    if (m[0] == 'v') {
+        m++;
+    }
+    if (strncmp(m, "pcmp", 4) != 0 || strncmp(m + 5, "str", 3) != 0) {
+        return;
+    }
+    if (m[4] != 'e' && m[4] != 'i') {
+        return;
+    }
+    if (m[8] != 'i' && m[8] != 'm') {
+        return;
+    }
+    explicit_len = (m[4] == 'e');
+    mask_form    = (m[8] == 'm');
+
+    cap_x86_add_implicit(out, handle, X86_REG_EFLAGS, true);
+    if (explicit_len) {
+        cap_x86_add_implicit(out, handle, X86_REG_EAX, false);
+        cap_x86_add_implicit(out, handle, X86_REG_EDX, false);
+    }
+    if (mask_form) {
+        cap_x86_add_implicit(out, handle, X86_REG_XMM0, true);
+    } else {
+        cap_x86_add_implicit(out, handle, X86_REG_ECX, true);
     }
 }
 

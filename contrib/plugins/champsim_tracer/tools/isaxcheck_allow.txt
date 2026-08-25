@@ -1213,7 +1213,6 @@ x86_64 R-rd-missing movq +mm#
 x86_64 R-rd-missing nopl +r#
 x86_64 R-rd-missing nopq +r#
 x86_64 R-rd-missing nopw +r#
-x86_64 R-rd-missing pcmpestrm +r#
 x86_64 R-rd-missing rcpss +v#
 x86_64 R-rd-missing rsqrtss +v#
 x86_64 R-rd-missing sqrtsd +v#
@@ -1250,11 +1249,8 @@ x86_64 R-wr-missing bswapw +r#
 x86_64 R-wr-missing cvtpd2pi +r#
 x86_64 R-wr-missing cvttpd2pi +r#
 x86_64 R-wr-missing emms +mm#,st#
-x86_64 R-wr-missing fadd +fpsw
-x86_64 R-wr-missing faddp +fpsw
 x86_64 R-wr-missing femms +mm#,st#
 x86_64 R-wr-missing ffree +fpsw
-x86_64 R-wr-missing ffreep +fpsw
 # FFREE(P)'s st(i) is a tag-word selector, neither read nor written as
 # data; the boundary drops the operand outright (cap_x86_is_x87_tag_only,
 # disas/capstone.c), which the checker classes as an unmodelled operand.
@@ -1263,8 +1259,6 @@ x86_64 Z-unmodelled-op ffreep
 x86_64 R-wr-missing fxrstor64 +fpcw,fpsw
 x86_64 R-wr-missing fxrstor +fpcw,fpsw
 x86_64 R-wr-missing movq +r#
-x86_64 R-wr-missing pcmpestrm +flags,v#
-x86_64 R-wr-missing pcmpistrm +flags,v#
 x86_64 R-wr-missing wait +fpsw
 # The flag WRITE these five perform is real and LLVM MC omits it.  The
 # boundary now derives it from Capstone's own detail->x86.eflags bitmask,
@@ -1710,8 +1704,6 @@ x86_64 R-rd-missing fldl2t +fpcw
 x86_64 R-rd-missing fldt +fpcw
 x86_64 R-rd-missing fnsave +fpcw,fpsw
 x86_64 R-rd-missing fnstcw +fpcw
-x86_64 R-rd-missing fnstenv +fpcw,fpsw
-x86_64 R-rd-missing fnstsw +fpsw
 x86_64 R-rd-missing fstl +fpcw
 x86_64 R-rd-missing fstp +fpcw,st#
 x86_64 R-rd-missing fstpl +fpcw
@@ -1728,28 +1720,12 @@ x86_64 R-rd-missing fsubrs +fpcw
 x86_64 R-rd-missing fsubs +fpcw
 x86_64 R-rd-missing fyl2x +fpcw
 x86_64 R-rd-missing fyl2xp1 +fpcw
-x86_64 R-wr-missing fbld +fpsw
-x86_64 R-wr-missing fbstp +fpsw
-x86_64 R-wr-missing fdiv +fpsw
-x86_64 R-wr-missing fdivp +fpsw
-x86_64 R-wr-missing fdivr +fpsw
-x86_64 R-wr-missing fdivrp +fpsw
 x86_64 R-wr-missing fldcw +fpcw,fpsw
-x86_64 R-wr-missing fldenv +fpcw,fpsw
-x86_64 R-wr-missing fldl2t +fpsw
-x86_64 R-wr-missing fmul +fpsw
-x86_64 R-wr-missing fmulp +fpsw
 x86_64 R-wr-missing fnsave +fpcw,fpsw
 x86_64 R-wr-missing fnstcw +fpsw
 x86_64 R-wr-missing fnstenv +fpcw,fpsw
 x86_64 R-wr-missing fnstsw +fpsw
 x86_64 R-wr-missing frstor +fpcw,fpsw
-x86_64 R-wr-missing fsub +fpsw
-x86_64 R-wr-missing fsubp +fpsw
-x86_64 R-wr-missing fsubr +fpsw
-x86_64 R-wr-missing fsubrp +fpsw
-x86_64 R-wr-missing fyl2x +fpsw
-x86_64 R-wr-missing fyl2xp1 +fpsw
 
 # (d) Memory presence and direction on the newly reached members.  Two
 # shapes: the system-descriptor ops (LGDT / LIDT / INVLPG / the VMX
@@ -3053,40 +3029,18 @@ x86_64 R-rd-missing fxtract +fpcw
 x86_64 R-rd-phantom fadd +st#
 x86_64 R-rd-phantom fcom +st#
 x86_64 R-rd-phantom fcoml +st#
-x86_64 R-rd-phantom fcomp +st#
-x86_64 R-rd-phantom fcompl +st#
-x86_64 R-rd-phantom fcompp +st#
-x86_64 R-rd-phantom fcomps +st#
 x86_64 R-rd-phantom fcoms +st#
 x86_64 R-rd-phantom fdiv +st#
 x86_64 R-rd-phantom fdivr +st#
 x86_64 R-rd-phantom ficoml +st#
-x86_64 R-rd-phantom ficompl +st#
-x86_64 R-rd-phantom ficomps +st#
 x86_64 R-rd-phantom ficoms +st#
 x86_64 R-rd-phantom fmul +st#
 x86_64 R-rd-phantom fsub +st#
 x86_64 R-rd-phantom fsubr +st#
 x86_64 R-rd-phantom ftst +st#
-x86_64 R-rd-phantom fucompp +st#
 x86_64 R-rd-phantom fxam +st#
-x86_64 R-wr-missing f2xm1 +fpsw
-x86_64 R-wr-missing fdecstp +fpsw
-x86_64 R-wr-missing fincstp +fpsw
-x86_64 R-wr-missing fldl2e +fpsw
-x86_64 R-wr-missing fldlg2 +fpsw
-x86_64 R-wr-missing fldln2 +fpsw
-x86_64 R-wr-missing fldpi +fpsw
 x86_64 R-wr-missing fninit +fpcw
 x86_64 R-wr-missing fnop +fpsw
-x86_64 R-wr-missing fpatan +fpsw
-x86_64 R-wr-missing fprem +fpsw
-x86_64 R-wr-missing fprem1 +fpsw
-x86_64 R-wr-missing fptan +fpsw
-x86_64 R-wr-missing frndint +fpsw
-x86_64 R-wr-missing fscale +fpsw
-x86_64 R-wr-missing fsincos +fpsw
-x86_64 R-wr-missing fxtract +fpsw
 x86_64 R-wr-phantom fcmovb +st#
 x86_64 R-wr-phantom fcmovbe +st#
 x86_64 R-wr-phantom fcmove +st#
@@ -3974,9 +3928,6 @@ x86_64 M-miss-load vmaskmovps
 x86_64 M-miss-load vpmaskmovd
 x86_64 M-miss-load vpmaskmovq
 x86_64 M-miss-store vldmxcsr
-x86_64 R-rd-missing vpcmpestrm +r#
-x86_64 R-wr-missing vpcmpestrm +flags,v#
-x86_64 R-wr-missing vpcmpistrm +flags,v#
 
 # --- mipsel: the residual the `sa`-swept sweep reaches.
 #
@@ -4335,10 +4286,6 @@ x86_64 R-rd-missing fnsave +cs,fpcw,fpsw
 x86_64 R-rd-missing fnsave +ds,fpcw,fpsw
 x86_64 R-rd-missing fnstcw +cs,fpcw
 x86_64 R-rd-missing fnstcw +ds,fpcw
-x86_64 R-rd-missing fnstenv +cs,fpcw,fpsw
-x86_64 R-rd-missing fnstenv +ds,fpcw,fpsw
-x86_64 R-rd-missing fnstsw +cs,fpsw
-x86_64 R-rd-missing fnstsw +ds,fpsw
 x86_64 R-rd-missing frstor +cs
 x86_64 R-rd-missing frstor +ds
 x86_64 R-rd-missing fstpl +cs,fpcw
@@ -8858,3 +8805,231 @@ x86_64 R-wr-phantom xabort +r#
 mipsel M-extra-load sc
 mipsel M-extra-load sce
 
+# =====================================================================
+# x87 IMPLICIT DATAFLOW -- the boundary carries it and LLVM MC does not.
+#
+# disas/capstone.c publishes the implicit half of every x87 instruction's
+# register set, recomputed from the instruction bytes with QEMU's own
+# gen_x87() dispatch key (mod, op, rm) -- see cap_x86_x87_effects.  Each
+# access below is the operand set of the helper sequence QEMU emits:
+# gen_helper_*_ST0 touches ST(0), gen_helper_fp_arith_STN_ST0 writes the
+# named st(i), and gen_helper_fpush / fpop move env->fpstt, which is the
+# TOP field of the status word.
+#
+# LLVM MC's x87 descriptions model almost none of it.  `fchs` carries no
+# implicit operand at all in MCInstrDesc although it negates ST(0);
+# `fadds (%rax)` names fpcw and the memory operand and neither ST(0) read
+# nor ST(0) write; `fst %st(1)` names st1 as a USE where the instruction
+# assigns it.  So the boundary reports a `phantom' wherever it carries a
+# real x87 dependency LLVM omits, and 47 entries that used to sit above
+# recording the OPPOSITE defect -- Capstone missing the status-word write
+# -- are gone, which is the check that this block is the ratchet turning
+# and not a hole being widened.
+#
+# HOW TO CHECK WHETHER THIS BLOCK CAN SHRINK: for any entry here, read the
+# case in gen_x87() (target/i386/tcg/translate.c) that the encoding's
+# (mod, op, rm) selects.  If the helper sequence there does NOT touch the
+# register named in the qualifier, the boundary is wrong and the entry is
+# a bug to fix.  The block disappears entirely if LLVM MC ever models the
+# x87 stack in MCInstrDesc.
+#
+# NOT COVERED BY THIS BLOCK, and deliberately still open: the boundary
+# does NOT carry the x87 CONTROL-word (rounding-mode) read that LLVM does
+# name on the arithmetic forms.  Those are the pre-existing
+# `R-rd-missing f* +fpcw` entries above; they are a separate item and are
+# not merged into this justification.
+# =====================================================================
+x86_64 R-rd-missing fnstenv +cs,fpcw
+x86_64 R-rd-missing fnstenv +ds,fpcw
+x86_64 R-rd-missing fnstenv +fpcw
+x86_64 R-rd-missing fnstsw +cs
+x86_64 R-rd-missing fnstsw +ds
+x86_64 R-rd-missing fst +fpcw,st#
+x86_64 R-rd-missing fstp +fpcw
+x86_64 R-rd-phantom f2xm1 +st#
+x86_64 R-rd-phantom fabs +st#
+x86_64 R-rd-phantom faddl +st#
+x86_64 R-rd-phantom faddp +fpsw
+x86_64 R-rd-phantom faddp +fpsw,st#
+x86_64 R-rd-phantom fadds +st#
+x86_64 R-rd-phantom fbld +fpsw
+x86_64 R-rd-phantom fbstp +fpsw,st#
+x86_64 R-rd-phantom fchs +st#
+x86_64 R-rd-phantom fcomp +fpsw
+x86_64 R-rd-phantom fcomp +fpsw,st#
+x86_64 R-rd-phantom fcompi +fpsw
+x86_64 R-rd-phantom fcompl +fpsw,st#
+x86_64 R-rd-phantom fcompp +fpsw,st#
+x86_64 R-rd-phantom fcomps +fpsw,st#
+x86_64 R-rd-phantom fcos +st#
+x86_64 R-rd-phantom fdecstp +fpsw
+x86_64 R-rd-phantom fdivl +st#
+x86_64 R-rd-phantom fdivp +fpsw
+x86_64 R-rd-phantom fdivp +fpsw,st#
+x86_64 R-rd-phantom fdivrl +st#
+x86_64 R-rd-phantom fdivrp +fpsw
+x86_64 R-rd-phantom fdivrp +fpsw,st#
+x86_64 R-rd-phantom fdivrs +st#
+x86_64 R-rd-phantom fdivs +st#
+x86_64 R-rd-phantom ffreep +fpsw
+x86_64 R-rd-phantom fiaddl +st#
+x86_64 R-rd-phantom fiadds +st#
+x86_64 R-rd-phantom ficompl +fpsw,st#
+x86_64 R-rd-phantom ficomps +fpsw,st#
+x86_64 R-rd-phantom fidivl +st#
+x86_64 R-rd-phantom fidivrl +st#
+x86_64 R-rd-phantom fidivrs +st#
+x86_64 R-rd-phantom fidivs +st#
+x86_64 R-rd-phantom fildl +fpsw
+x86_64 R-rd-phantom fildll +fpsw
+x86_64 R-rd-phantom filds +fpsw
+x86_64 R-rd-phantom fimull +st#
+x86_64 R-rd-phantom fimuls +st#
+x86_64 R-rd-phantom fincstp +fpsw
+x86_64 R-rd-phantom fistl +st#
+x86_64 R-rd-phantom fistpl +fpsw,st#
+x86_64 R-rd-phantom fistpll +fpsw,st#
+x86_64 R-rd-phantom fistps +fpsw,st#
+x86_64 R-rd-phantom fists +st#
+x86_64 R-rd-phantom fisttpl +fpsw,st#
+x86_64 R-rd-phantom fisttpll +fpsw,st#
+x86_64 R-rd-phantom fisttps +fpsw,st#
+x86_64 R-rd-phantom fisubl +st#
+x86_64 R-rd-phantom fisubrl +st#
+x86_64 R-rd-phantom fisubrs +st#
+x86_64 R-rd-phantom fisubs +st#
+x86_64 R-rd-phantom fld +fpsw
+x86_64 R-rd-phantom fld1 +fpsw
+x86_64 R-rd-phantom fldl +fpsw
+x86_64 R-rd-phantom fldl2e +fpsw
+x86_64 R-rd-phantom fldl2t +fpsw
+x86_64 R-rd-phantom fldlg2 +fpsw
+x86_64 R-rd-phantom fldln2 +fpsw
+x86_64 R-rd-phantom fldpi +fpsw
+x86_64 R-rd-phantom flds +fpsw
+x86_64 R-rd-phantom fldt +fpsw
+x86_64 R-rd-phantom fldz +fpsw
+x86_64 R-rd-phantom fmull +st#
+x86_64 R-rd-phantom fmulp +fpsw
+x86_64 R-rd-phantom fmulp +fpsw,st#
+x86_64 R-rd-phantom fmuls +st#
+x86_64 R-rd-phantom fnstenv +fcsr
+x86_64 R-rd-phantom fpatan +fpsw,st#
+x86_64 R-rd-phantom fprem +st#
+x86_64 R-rd-phantom fprem1 +st#
+x86_64 R-rd-phantom fptan +fpsw,st#
+x86_64 R-rd-phantom frndint +st#
+x86_64 R-rd-phantom fscale +st#
+x86_64 R-rd-phantom fsin +st#
+x86_64 R-rd-phantom fsincos +fpsw,st#
+x86_64 R-rd-phantom fsqrt +st#
+x86_64 R-rd-phantom fst +st#
+x86_64 R-rd-phantom fstl +st#
+x86_64 R-rd-phantom fstp +fpsw
+x86_64 R-rd-phantom fstp +fpsw,st#
+x86_64 R-rd-phantom fstpl +fpsw,st#
+x86_64 R-rd-phantom fstps +fpsw,st#
+x86_64 R-rd-phantom fstpt +fpsw,st#
+x86_64 R-rd-phantom fsts +st#
+x86_64 R-rd-phantom fsubl +st#
+x86_64 R-rd-phantom fsubp +fpsw
+x86_64 R-rd-phantom fsubp +fpsw,st#
+x86_64 R-rd-phantom fsubrl +st#
+x86_64 R-rd-phantom fsubrp +fpsw
+x86_64 R-rd-phantom fsubrp +fpsw,st#
+x86_64 R-rd-phantom fsubrs +st#
+x86_64 R-rd-phantom fsubs +st#
+x86_64 R-rd-phantom fucomp +fpsw
+x86_64 R-rd-phantom fucompi +fpsw
+x86_64 R-rd-phantom fucompp +fpsw,st#
+x86_64 R-rd-phantom fxch +st#
+x86_64 R-rd-phantom fxtract +fpsw,st#
+x86_64 R-rd-phantom fyl2x +fpsw,st#
+x86_64 R-rd-phantom fyl2xp1 +fpsw,st#
+x86_64 R-wr-missing fldenv +fpcw
+x86_64 R-wr-phantom f2xm1 +st#
+x86_64 R-wr-phantom fabs +st#
+x86_64 R-wr-phantom fadd +st#
+x86_64 R-wr-phantom faddl +st#
+x86_64 R-wr-phantom faddp +st#
+x86_64 R-wr-phantom fadds +st#
+x86_64 R-wr-phantom fbld +st#
+x86_64 R-wr-phantom fchs +st#
+x86_64 R-wr-phantom fcos +st#
+x86_64 R-wr-phantom fdiv +st#
+x86_64 R-wr-phantom fdivl +st#
+x86_64 R-wr-phantom fdivp +st#
+x86_64 R-wr-phantom fdivr +st#
+x86_64 R-wr-phantom fdivrl +st#
+x86_64 R-wr-phantom fdivrp +st#
+x86_64 R-wr-phantom fdivrs +st#
+x86_64 R-wr-phantom fdivs +st#
+x86_64 R-wr-phantom fiaddl +st#
+x86_64 R-wr-phantom fiadds +st#
+x86_64 R-wr-phantom fidivl +st#
+x86_64 R-wr-phantom fidivrl +st#
+x86_64 R-wr-phantom fidivrs +st#
+x86_64 R-wr-phantom fidivs +st#
+x86_64 R-wr-phantom fildl +st#
+x86_64 R-wr-phantom fildll +st#
+x86_64 R-wr-phantom filds +st#
+x86_64 R-wr-phantom fimull +st#
+x86_64 R-wr-phantom fimuls +st#
+x86_64 R-wr-phantom fisubl +st#
+x86_64 R-wr-phantom fisubrl +st#
+x86_64 R-wr-phantom fisubrs +st#
+x86_64 R-wr-phantom fisubs +st#
+x86_64 R-wr-phantom fld +st#
+x86_64 R-wr-phantom fld1 +st#
+x86_64 R-wr-phantom fldenv +fcsr
+x86_64 R-wr-phantom fldl +st#
+x86_64 R-wr-phantom fldl2e +st#
+x86_64 R-wr-phantom fldl2t +st#
+x86_64 R-wr-phantom fldlg2 +st#
+x86_64 R-wr-phantom fldln2 +st#
+x86_64 R-wr-phantom fldpi +st#
+x86_64 R-wr-phantom flds +st#
+x86_64 R-wr-phantom fldt +st#
+x86_64 R-wr-phantom fldz +st#
+x86_64 R-wr-phantom fmul +st#
+x86_64 R-wr-phantom fmull +st#
+x86_64 R-wr-phantom fmulp +st#
+x86_64 R-wr-phantom fmuls +st#
+x86_64 R-wr-phantom fpatan +st#
+x86_64 R-wr-phantom fprem +st#
+x86_64 R-wr-phantom fprem1 +st#
+x86_64 R-wr-phantom fptan +st#
+x86_64 R-wr-phantom frndint +st#
+x86_64 R-wr-phantom fscale +st#
+x86_64 R-wr-phantom fsin +st#
+x86_64 R-wr-phantom fsincos +st#
+x86_64 R-wr-phantom fsqrt +st#
+x86_64 R-wr-phantom fst +st#
+x86_64 R-wr-phantom fsub +st#
+x86_64 R-wr-phantom fsubl +st#
+x86_64 R-wr-phantom fsubp +st#
+x86_64 R-wr-phantom fsubr +st#
+x86_64 R-wr-phantom fsubrl +st#
+x86_64 R-wr-phantom fsubrp +st#
+x86_64 R-wr-phantom fsubrs +st#
+x86_64 R-wr-phantom fsubs +st#
+x86_64 R-wr-phantom fxch +st#
+x86_64 R-wr-phantom fxtract +st#
+x86_64 R-wr-phantom fyl2x +st#
+x86_64 R-wr-phantom fyl2xp1 +st#
+
+# R7.1-SCALAR: the destination of a UNARY legacy scalar SSE form is a PURE
+# write.  ROUNDSS / ROUNDSD compute the low element from the source operand
+# alone; the only part of the destination that survives is the upper lane,
+# and a narrow write does not make a register a source -- rename does not
+# know the data-width scope of the next reader.  LLVM MC models the
+# preserve as a tied operand and so names the destination a USE; XED
+# declares the same thing (`REG0=XMM_R():rw`) and the project's own
+# reference arm already suppresses it under R7.1-SCALAR.  Capstone reports
+# these two read-modify-write ALONE in their family -- `sqrtsd`,
+# `cvtsd2ss`, `cvtsi2ss` and the rest of the unary set all come back
+# WRITE-only on the same operand shape -- so leaving it would put a false
+# RAW edge on every `roundsd` in a trace.  Removable when LLVM stops tying
+# the operand, which is not expected.
+x86_64 R-rd-missing roundsd +v#
+x86_64 R-rd-missing roundss +v#

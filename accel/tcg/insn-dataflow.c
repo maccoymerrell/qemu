@@ -1144,6 +1144,37 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
             if (bo != INSN_DF_NOT_ENV) {
                 int64_t eo = bo + (int64_t)op->args[2];
 
+                if (eo < 0) {
+                    /*
+                     * A NEGATIVE env offset is not guest state.  env points
+                     * at CPUArchState, which sits at sizeof(CPUState) inside
+                     * ArchCPU, so everything below it is QEMU's own
+                     * bookkeeping -- and one of those slots is the
+                     * INSTRUMENT'S: plugin_gen_mem_callbacks_i64() emits
+                     *
+                     *     st_i64 <loaded value>, env,
+                     *            offsetof(CPUState, neg.plugin_mem_value_low)
+                     *            - sizeof(CPUState)
+                     *
+                     * so that qemu_plugin_mem_value() can read it
+                     * (tcg/tcg-op-ldst.c:213).  Falling through to the
+                     * generic argument walk read that store's data operand
+                     * as an input of the guest instruction, which on the
+                     * targets whose translator loads STRAIGHT INTO A GLOBAL
+                     * -- aarch64 and riscv64 -- made every load name its own
+                     * destination as a source.  MEASURED on `ld a2,0(t6)`
+                     * with a2 never read again: `D r reg=x12/a2` beside
+                     * `D w reg=x12/a2 from=L0`.  x86_64 and mipsel load into
+                     * a temp first and were untouched, which is why the
+                     * defect read as an ISA quirk rather than as what it is.
+                     *
+                     * A dependency that exists only because someone was
+                     * watching is the one error this extractor must not
+                     * make: it is the map that is meant to REPLACE Capstone,
+                     * and it would have published the edge on every load.
+                     */
+                    continue;
+                }
                 if (eo >= 0) {
                     if (store) {
                         /*

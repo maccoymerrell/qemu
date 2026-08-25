@@ -83,7 +83,7 @@ class Insn(object):
                  'uops', 'disas', 'unmapped', 'ctrl', 'cc', 'rflags',
                  'rflags_mask', 'syscall', 'full_written', 'raw_reads',
                  'raw_writes', 'top_before', 'top_after', 'x87_valued',
-                 'half_seen')
+                 'half_seen', 'ufp')
 
     def __init__(self, pc):
         self.pc = pc
@@ -104,6 +104,7 @@ class Insn(object):
         self.raw_reads = []         # [(cls, idx, uop_seq, named_in_text)]
         self.raw_writes = []        # [(cls, idx, value|None, uop_seq)]
         self.half_seen = set()      # XMM halves this macro-op has written
+        self.ufp = None             # last micro-op FP scratch value written
         self.top_before = None
         self.top_after = None
         self.x87_valued = {}        # generic id -> gem5's 64-bit datum
@@ -209,6 +210,14 @@ def parse(logpath, sel=None, dropped=None, folded=None, merged=None):
                     continue
                 if g is V.INTERNAL:
                     dropped[lhs] += 1
+                    # The micro-op FP scratch is not architectural state, but
+                    # on an x87 LOAD it carries the converted datum before
+                    # the destination write publishes it -- which is the only
+                    # way to tell a reference PUBLICATION defect from a real
+                    # value disagreement.  Kept as evidence, never as a fact.
+                    if cls == 'floating_point' and 40 <= i < 48 \
+                            and rhs != '?':
+                        cur.ufp = int(rhs, 16)
                     continue
                 val = None if rhs == '?' else int(rhs, 16)
                 # A write is FULL-WIDTH when the destination operand carries

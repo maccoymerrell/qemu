@@ -389,12 +389,42 @@ def compare_excursion(guest, ex, ref, gapinfo, run_note):
                                 '%s=0x%x' % (kk, tv), _FCSR_VALUE_LIMIT))
                 continue
             if kk.startswith('REG_FPR') and rv != tv:
+                # An x87 value is only round-trip CONFIRMABLE where nothing
+                # but the load stood between the wire and the register.  Once
+                # an x87 ARITHMETIC instruction has run, gem5 computed the
+                # whole chain in double and the result is not the 80-bit one
+                # rounded -- it is a different number, and saying "rounding
+                # confirmed: NO" of it would read as an unexplained row when
+                # the explanation is the same named limit one step earlier.
+                arith = any(n.startswith('REG_FPR') for n in t.srcs)
+                if arith:
+                    note = ('%s: an x87 ARITHMETIC result, computed by gem5 '
+                            'in double throughout; not round-trip '
+                            'confirmable by construction' % _X87_VALUE_LIMIT)
+                elif x87_is_rounded(tv, rv):
+                    note = ('%s: CONFIRMED on this row -- the wire\'s 80-bit '
+                            'datum IS this 64-bit one rounded' %
+                            _X87_VALUE_LIMIT)
+                elif r.ufp is not None and x87_is_rounded(tv, r.ufp):
+                    # The reference disagrees WITH ITSELF: the load micro-op
+                    # published the converted datum into its FP scratch and
+                    # the destination write published something else.
+                    # Measured on `flds` (FLD m32): `ldfp87 %ufp1` prints
+                    # 0x41da678a80000000, which IS the wire's 80-bit datum
+                    # rounded, and `movfp %st(7), %ufp1` then publishes
+                    # 0x80000000 -- the raw four bytes from memory, not the
+                    # register's value.  The tracer is right; gem5's
+                    # destination publication is the outlier.
+                    note = ('REF-X87-DEST-PUBLISHES-RAW: gem5\'s own load '
+                            'micro-op published 0x%x, which IS the wire\'s '
+                            '80-bit datum rounded; its destination write '
+                            'published something else' % r.ufp)
+                else:
+                    note = ('%s: NOT confirmed and NOT an arithmetic result '
+                            '-- interrogate this row' % _X87_VALUE_LIMIT)
                 rows.append(Row(guest, ex.seq, i, t.pc, 'reg-dst-value',
                                 GEM5_LIMIT, '%s=0x%x' % (kk, rv),
-                                '%s=0x%x' % (kk, tv),
-                                '%s (rounding confirmed: %s)'
-                                % (_X87_VALUE_LIMIT,
-                                   'yes' if x87_is_rounded(tv, rv) else 'NO')))
+                                '%s=0x%x' % (kk, tv), note))
                 continue
             if kk == 'REG_FLAGS':
                 if r.rflags is None:
@@ -452,7 +482,9 @@ def compare_excursion(guest, ex, ref, gapinfo, run_note):
                     if x87 and kind == 'store':
                         rows.append(Row(guest, ex.seq, i, t.pc, axis,
                                         GEM5_LIMIT, '0x%x' % rd, '0x%x' % td,
-                                        _X87_VALUE_LIMIT))
+                                        '%s: a store OF an x87 register, so '
+                                        'the datum is gem5\'s double'
+                                        % _X87_VALUE_LIMIT))
                         continue
                     rows.append(Row(guest, ex.seq, i, t.pc, axis,
                                     RECON_GAP if unest else WP_DEFECT,

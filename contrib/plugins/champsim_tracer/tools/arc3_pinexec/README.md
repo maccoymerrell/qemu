@@ -184,3 +184,45 @@ a page domain disjoint from every stronger delta's, and a value inside an
 established page whose delta is WRONG is scored `IN-MAPPING-WRONG-DELTA` /
 UNACCOUNTED rather than absorbed as "both look like pointers".  That is what
 makes the `dstvalue` control fire.
+
+## What the register arm measures today
+
+396,044 byte-identical instruction pairs of a static, non-PIE x86_64 guest,
+both halves run under one minimal environment.  Every number below is read
+off `cmp_reg.py`, not asserted.
+
+| axis | probed | agreeing | SUPERSET | ORTHOGONAL | SUBSET | UNACCOUNTED |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| src register set | 396,044 | 396,043 | 0 | 1 | **0** | **0** |
+| dst register set | 396,044 | 396,044 | 0 | 0 | **0** | **0** |
+| dst register VALUE | 567,217 | 549,464 | — | 17,576 | 26 | 151 |
+| src register VALUE | 492,221 | 490,162 | — | 1,952 | 0 | 107 |
+| rip as a source | 46,634 | 46,632 | — | 0 | 0 | 2 |
+
+"agreeing" is exact plus same-pointer-under-an-ESTABLISHED-delta.  A
+further 258 destination reads are `REP-DEFERRED-WRITE` / ORTHOGONAL: the
+reference emits one record per REP iteration and the wire publishes the
+write once, on the entry that completes it.
+
+The one ORTHOGONAL set row is `xgetbv`: the reference names `XCR0`, the
+tracer names `REG_SYS`, which is the generic role XCR0 belongs to.  It is
+listed in `VOCAB_FOLD` so the fold is visible rather than silently equated.
+
+The 26 SUBSET rows are one named defect, and it is **upstream QEMU's**, not
+the plugin's.  `SYSCALL` sets `RCX <- RIP-of-next` and `R11 <- RFLAGS`.
+QEMU's linux-user `helper_syscall`
+(`target/i386/tcg/user/seg_helper.c:29`) raises `EXCP_SYSCALL` and never
+performs that clobber, so the two registers the ISA says the instruction
+produces keep whatever they held.  The tracer names them correctly and
+publishes the value QEMU has.  Fix path: perform the architectural clobber
+in the user-mode helper as the system-mode one does.  Not done here: it
+changes guest-visible architectural state and would invalidate banked
+golden traces.
+
+The 260 UNACCOUNTED value rows (0.025% of 1.06M probed) are one shape and
+its closure: a pointer whose page carries several distinct PIN-QEMU deltas
+at once — the vDSO/vvar data page, and one stack page — so no single delta
+is established for it, and every value later computed from it is
+unexplained too.  The measurement that would close them is a finer domain
+than a page: the two runs' mappings paired by their own contents rather
+than by address.

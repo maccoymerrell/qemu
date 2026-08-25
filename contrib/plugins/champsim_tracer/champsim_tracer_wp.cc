@@ -318,6 +318,36 @@ static uint32_t wp_append_fragment_insns(WpAccum &acc, BBTemplate *cur,
     static const InsnRegNames kEmptyRegNames{g_zero_regkeys,
                                              g_zero_regkeys};
 
+    /*
+     * A DELAY-SLOT TAIL HAS NO PER-INSN CALLBACK FOR ITS BRANCH.
+     *
+     * arm_reg_snap_cbs skips the callback that would capture canonical
+     * [n-2] when the TB ends [branch, delay slot], deferring the branch's
+     * snap to snap_prev_tail_dsts so its REG_IP dst can take the goto_tb
+     * successor override.  That deferral is CORRECT-PATH ONLY: it pushes
+     * into pending_reg_snaps.  On the wrong path nothing pushed a snap for
+     * that branch, so pulling one FIFO-wise underran the buffer and the walk
+     * substituted a zeroed RegSnap -- publishing the destination NAME with
+     * WIDTH 0, i.e. the register with no value.
+     *
+     * Measured, mipsel, gem5 wrong-path leg: `jal 0x400148` inside a WP
+     * excursion published `REG_LR:w=0` on every occurrence while the SAME
+     * instruction on the correct path published REG_LR=0x400140:w=4.  Only a
+     * branch that WRITES a register shows the symptom, which is why a
+     * conditional branch (no destination) hid it, and only a delay-slot ISA
+     * can reach it at all -- riscv64 and x86_64 have no such tail.
+     *
+     * The branch therefore takes the same live post-fragment read the
+     * fragment's own last insn takes, and the cursor is NOT advanced for it,
+     * because no callback ever occupied that slot.
+     */
+    auto snap_deferred = [&](uint32_t i) -> bool {
+        return cur->next_tb_fragment == nullptr &&
+               cur->n_insns >= 2 && i + 2 == cur->n_insns &&
+               cur->insn_fields[i].branch_type != BRANCH_NONE &&
+               cur->insn_fields[i + 1].branch_type == BRANCH_NONE;
+    };
+
     uint32_t appended_insns = 0;
     for (uint32_t i = 0; i < n_executed_in_cur; i++) {
         uint64_t insn_pc = cur->insn_pcs[i];
@@ -338,7 +368,8 @@ static uint32_t wp_append_fragment_insns(WpAccum &acc, BBTemplate *cur,
              * the WP snap cursor past its slot to keep alignment with
              * subsequent insns' captures. */
             if (g_features.wp_reg_data &&
-                i + 1 < n_executed_in_cur) {
+                i + 1 < n_executed_in_cur &&
+                !snap_deferred(i)) {
                 wp_snap_cursor +=
                     cur->insn_fields[i].n_dst_regs;
             }
@@ -380,7 +411,7 @@ static uint32_t wp_append_fragment_insns(WpAccum &acc, BBTemplate *cur,
         }
         if (g_features.wp_reg_data) {
             const InsnFields *f = &cur->insn_fields[i];
-            if (i + 1 < n_executed_in_cur) {
+            if (i + 1 < n_executed_in_cur && !snap_deferred(i)) {
                 /* Per-insn-accurate snap from the WP scratch buffer:
                  * captured at insn (i+1)'s pre-exec during the just-finished
                  * exec_tb, i.e. exactly the post-this-insn / pre-next-insn
@@ -401,8 +432,9 @@ static uint32_t wp_append_fragment_insns(WpAccum &acc, BBTemplate *cur,
                     }
                 }
             } else {
-                /* Last executed insn of this fragment: no successor pre-exec
-                 * hook inside the fragment to capture it.  Fall back to a
+                /* Last executed insn of this fragment, or the branch of a
+                 * delay-slot tail whose callback arm_reg_snap_cbs never
+                 * registered: no pre-exec hook captured it, so fall back to a
                  * live read from current (post-exec_tb) regfile state.  For
                  * a multi-fragment exec_tb this captures the
                  * post-everything-in-exec_tb state, so later fragments'

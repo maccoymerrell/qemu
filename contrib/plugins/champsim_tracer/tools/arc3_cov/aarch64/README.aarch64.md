@@ -1,7 +1,10 @@
 # ARC 3 coverage denominator — aarch64
 
 These scripts enumerate the A64 **opcode space** that the ARC 3 coverage
-claim is measured against.  They read the Arm Machine Readable
+claim is measured against.  They lived in a second top-level directory,
+`tools/arc3_coverage/`, next to the enumerator they belong to; they are
+aarch64-only and `adjudicate.py` in this directory already cites
+`build_opcodes.py` by name, so one directory is where they go.  They read the Arm Machine Readable
 Architecture XML (rank-1 reference for this ISA) and never consult
 Capstone, which is the subject under test (ruling R7).
 

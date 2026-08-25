@@ -518,6 +518,20 @@ void dep_passthrough(const struct qemu_plugin_insn_info *info, InsnFields *f)
      */
     if (f->max_dep_stores == 0 && f->max_dep_loads > 0
         && f->n_dst_regs > 1) {
+        /* Same isolation as the single-destination load form below:
+         * a source that is part of no address is a value this shape
+         * does not model, and binding every destination to the load
+         * slots alone would orphan it. */
+        uint64_t all_src_m = (f->n_src_regs >= 64)
+            ? ~(uint64_t)0
+            : (((uint64_t)1 << f->n_src_regs) - 1);
+        uint64_t addr_m = 0;
+        for (uint8_t l = 0; l < f->max_dep_loads; l++) {
+            addr_m |= f->load_addr_dep_mask[l];
+        }
+        if (all_src_m & ~addr_m) {
+            return;
+        }
         uint64_t m = 0;
         for (uint8_t l = 0; l < f->max_dep_loads; l++) {
             m |= ((uint64_t)1 << (f->n_src_regs + l));
@@ -532,6 +546,47 @@ void dep_passthrough(const struct qemu_plugin_insn_info *info, InsnFields *f)
     if (f->n_dst_regs == 1 && f->max_dep_stores == 0) {
         uint64_t m = 0;
         if (f->max_dep_loads > 0) {
+            /*
+             * THE LOAD FORM NEEDS THE SAME ISOLATION THE STORE FORM
+             * BELOW ALREADY DOES, and for the same reason.  The
+             * rm-form's contract (see the header comment) is
+             * src_regs = [base, index?] -- EVERY source is an
+             * addressing register, so binding dst[0] to the load slot
+             * alone loses nothing.  A MERGING load breaks that
+             * assumption: it carries a source that is not part of any
+             * address, and the destination is a function of it.
+             *
+             * Measured on mipsel `lwl r14, 3(r16)`, whose wire record
+             * is src=[REG_GPR14, REG_GPR16], dst=[REG_GPR14],
+             * max_dep_loads=1 -- REG_GPR14 is the value the load
+             * merges into.  Narrowing dst[0] to load_data[0] dropped
+             * it, so the register was DECLARED as a source and routed
+             * to no sink at all: a model reading the dependency map
+             * never saw the edge.  gem5 states the closure for r14 as
+             * {r14, r16} against the map's {r16}, and under R7 the
+             * merge needs the old value, so a renaming regfile has to
+             * respect it.
+             *
+             * So: isolate the non-addressing sources exactly as the
+             * store branch isolates its value source, and BAIL when
+             * any exists.  Bailing is not silence -- format.rst
+             * defines an absent HAS_REG block as the all-to-all
+             * over-approximation, and the reader synthesizes
+             * `all_inputs & ~addr_only_srcs`, which for `lwl` is
+             * {REG_GPR14, load_data[0]}: the correct answer.  A plain
+             * load has no non-addressing source, so nothing about it
+             * changes.
+             */
+            uint64_t all_src = (f->n_src_regs >= 64)
+                ? ~(uint64_t)0
+                : (((uint64_t)1 << f->n_src_regs) - 1);
+            uint64_t addr_mask = 0;
+            for (uint8_t l = 0; l < f->max_dep_loads; l++) {
+                addr_mask |= f->load_addr_dep_mask[l];
+            }
+            if (all_src & ~addr_mask) {
+                return;      /* merging / value-carrying load: bail */
+            }
             m = ((uint64_t)1 << f->n_src_regs);                        /* load[0] */
         } else if (f->n_src_regs > 0) {
             m = (uint64_t)1;                                           /* src_regs[0] */

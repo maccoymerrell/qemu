@@ -4448,9 +4448,19 @@ static void gen_mops_plugin_pc(DisasContext *s)
  * op is its TB's terminator, not buried mid-block — a SETP/SETM/SETE
  * trio no longer shares one TB), and makes a split execution's
  * instruction accounting exact (the re-entered TB contains only the
- * bulk op itself, never a tail of never-executed successors).  The
- * guest-visible semantics are unchanged; without a plugin nothing
- * changes at all.
+ * bulk op itself, never a tail of never-executed successors).  Without
+ * a plugin nothing changes at all.
+ *
+ * The architectural semantics are unchanged, but "guest-visible" is too
+ * strong a claim to leave standing: TB granularity is observable to a
+ * guest that modifies the instruction stream without the cache
+ * maintenance the architecture requires, and a bulk op whose destination
+ * covers the instructions right after it is exactly that guest.  Whether
+ * the stale or the rewritten successor executes then depends on whether
+ * the two shared a TB, so ending the TB here can change which one runs.
+ * That behaviour is CONSTRAINED UNPREDICTABLE by the architecture and is
+ * not specific to plugins: -one-insn-per-tb produces the identical
+ * outcome with no plugin loaded.
  */
 static void gen_mops_plugin_tb_end(DisasContext *s)
 {

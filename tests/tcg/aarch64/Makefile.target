@@ -28,6 +28,7 @@ config-cc.mak: Makefile
 	    $(call cc-option,-march=armv8.5-a,              CROSS_CC_HAS_ARMV8_5); \
 	    $(call cc-option,-mbranch-protection=standard,  CROSS_CC_HAS_ARMV8_BTI); \
 	    $(call cc-option,-march=armv8.5-a+memtag,       CROSS_CC_HAS_ARMV8_MTE); \
+	    $(call cc-option,-march=armv8.8-a+mops,        CROSS_CC_HAS_ARMV8_MOPS); \
 	    $(call cc-option,-Wa$(COMMA)-march=armv9-a+sme $$fnia, CROSS_AS_HAS_ARMV9_SME)) 3> config-cc.mak
 -include config-cc.mak
 
@@ -73,6 +74,15 @@ ifneq ($(CROSS_AS_HAS_ARMV9_SME),)
 SME_TESTS = sme-outprod1 sme-smopa-1 sme-smopa-2 sme-fmopa-1 sme-fmopa-2 sme-fmopa-3
 AARCH64_TESTS += $(SME_TESTS)
 $(SME_TESTS): CFLAGS += $(CROSS_AS_HAS_ARMV9_SME)
+endif
+
+# FEAT_MOPS: a bulk SET/CPY that faults on its host-pointer fast path must
+# deliver a guest fault, with or without a plugin asking for memory
+# callbacks.  Listed in ADDITIONAL_PLUGINS_TESTS because the plugin runs are
+# the point: without one the reporting path under test is never entered.
+ifneq ($(CROSS_CC_HAS_ARMV8_MOPS),)
+AARCH64_TESTS += mops-fault
+ADDITIONAL_PLUGINS_TESTS += mops-fault
 endif
 
 # System Registers Tests

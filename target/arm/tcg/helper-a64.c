@@ -838,6 +838,23 @@ illegal_return:
  * accesses instead of 256 sixteen-byte ones, and every glibc memcpy
  * would become a per-byte softmmu loop.
  *
+ * FAULTS.  @host is whatever the caller's trapless tlb_vaddr_to_host()
+ * returned, and in linux-user that is g2h() with no mapping check at
+ * all: reading it here can fault exactly as the caller's own bulk
+ * memmove()/memset() can, on the same byte, for the same reason.  The
+ * caller wraps its move in set_helper_retaddr() so that host SIGSEGV
+ * unwinds into the guest exception the instruction owes; this reporter
+ * takes the same protection around its reads (see @ra), because a
+ * dereference outside that bracket is indistinguishable from an
+ * emulator bug and kills the process with "QEMU internal SIGSEGV"
+ * instead — a plugin would then decide whether a guest run completes.
+ * The plugin callback itself is deliberately left OUTSIDE the bracket:
+ * a fault raised by plugin code is a host bug and must still say so.
+ *
+ * @ra: the caller's return address, or 0 when @host is QEMU's own
+ * memory (a flushed run buffer), which cannot fault on the guest's
+ * behalf and must not be able to claim a guest exception.
+ *
  * The value is assembled little-endian from memory order and the memop
  * is tagged MO_LE to match.  A bulk block transfer moves bytes, not
  * scalars, so it has no endianness of its own; memory order is the
@@ -888,7 +905,7 @@ illegal_return:
 static void arm_plugin_emit_pieces(CPUARMState *env, uint64_t addr,
                                    uint64_t size, const void *host,
                                    int memidx, enum qemu_plugin_mem_rw rw,
-                                   bool count)
+                                   bool count, uintptr_t ra)
 {
     CPUState *cs = env_cpu(env);
 
@@ -912,6 +929,24 @@ static void arm_plugin_emit_pieces(CPUARMState *env, uint64_t addr,
         bytes = 1u << sz;
 
         if (p) {
+            /*
+             * @host came from a trapless tlb_vaddr_to_host(), which in
+             * linux-user is g2h() with no mapping check: reading it can
+             * fault exactly as the caller's bulk memmove()/memset() can,
+             * and for exactly the same reason.  Take the same protection
+             * the caller takes for the move, so the host SIGSEGV unwinds
+             * into the guest exception the instruction owes instead of
+             * killing the emulator with "QEMU internal SIGSEGV".
+             *
+             * @ra is 0 when @host is QEMU's own memory (a flushed run
+             * buffer), which cannot fault; the bracket would then claim a
+             * guest fault for a genuine emulator bug, so do not take it.
+             * The plugin callback below always stays OUTSIDE the bracket
+             * for the same reason: a fault in plugin code is a host bug.
+             */
+            if (ra) {
+                set_helper_retaddr(ra);
+            }
             switch (sz) {
             case MO_8:
                 low = ldub_p(p);
@@ -929,6 +964,9 @@ static void arm_plugin_emit_pieces(CPUARMState *env, uint64_t addr,
                 low = ldq_le_p(p);
                 high = ldq_le_p(p + 8);
                 break;
+            }
+            if (ra) {
+                clear_helper_retaddr();
             }
             host = p + bytes;
         }
@@ -1000,7 +1038,7 @@ static void mops_run_flush(CPUARMState *env, MopsRun *run,
     if (run->active && run->hi > run->lo) {
         arm_plugin_emit_pieces(env, run->lo, run->hi - run->lo,
                                run->buf + (run->lo - run->buf_base),
-                               run->memidx, rw, true);
+                               run->memidx, rw, true, 0);
     }
     run->active = false;
 }
@@ -1119,7 +1157,7 @@ static void mops_acc_append(CPUARMState *env, MopsAccCtx *ctx, bool is_store,
 static void arm_plugin_bulk_mem_cb(CPUARMState *env, uint64_t addr,
                                    uint64_t size, const void *host,
                                    int memidx, enum qemu_plugin_mem_rw rw,
-                                   bool count)
+                                   bool count, uintptr_t ra)
 {
 #ifdef CONFIG_PLUGIN
     CPUState *cs = env_cpu(env);
@@ -1143,7 +1181,17 @@ static void arm_plugin_bulk_mem_cb(CPUARMState *env, uint64_t addr,
                 (addr - run->buf_base) + size <= TARGET_PAGE_SIZE;
 
             if (contig) {
+                /*
+                 * Reads @host: same unchecked pointer, same bracket, and
+                 * the same rule about @ra == 0 (see the reporter).
+                 */
+                if (ra) {
+                    set_helper_retaddr(ra);
+                }
                 memcpy(run->buf + (addr - run->buf_base), host, size);
+                if (ra) {
+                    clear_helper_retaddr();
+                }
                 if (run->descending) {
                     run->lo = addr;
                 } else {
@@ -1157,10 +1205,10 @@ static void arm_plugin_bulk_mem_cb(CPUARMState *env, uint64_t addr,
             mops_run_drop_stale(run);
         }
     }
-    arm_plugin_emit_pieces(env, addr, size, host, memidx, rw, count);
+    arm_plugin_emit_pieces(env, addr, size, host, memidx, rw, count, ra);
 #else
     (void)env; (void)addr; (void)size; (void)host; (void)memidx; (void)rw;
-    (void)count;
+    (void)count; (void)ra;
 #endif
 }
 
@@ -1285,7 +1333,7 @@ void HELPER(dc_zva)(CPUARMState *env, uint64_t vaddr_in)
             if (spec) {
                 env_cpu(env)->neg.plugin_mem_cbs = saved_cbs;
                 arm_plugin_emit_pieces(env, vaddr, blocklen, NULL, mmu_idx,
-                                       QEMU_PLUGIN_MEM_W, false);
+                                       QEMU_PLUGIN_MEM_W, false, 0);
             }
 #endif
             return;
@@ -1311,7 +1359,7 @@ void HELPER(dc_zva)(CPUARMState *env, uint64_t vaddr_in)
 #ifdef CONFIG_PLUGIN
         env_cpu(env)->neg.plugin_mem_cbs = saved_cbs;
         arm_plugin_emit_pieces(env, vaddr, blocklen, NULL, mmu_idx,
-                               QEMU_PLUGIN_MEM_W, false);
+                               QEMU_PLUGIN_MEM_W, false, 0);
 #endif
         return;
     }
@@ -1337,7 +1385,7 @@ void HELPER(dc_zva)(CPUARMState *env, uint64_t vaddr_in)
     memset(mem, 0, blocklen);
     clear_helper_retaddr();
     arm_plugin_bulk_mem_cb(env, vaddr, blocklen, mem, mmu_idx,
-                           QEMU_PLUGIN_MEM_W, false);
+                           QEMU_PLUGIN_MEM_W, false, ra);
 }
 
 void HELPER(unaligned_access)(CPUARMState *env, uint64_t addr,
@@ -1517,7 +1565,7 @@ static uint64_t set_step(CPUARMState *env, uint64_t toaddr,
     memset(mem, data, setsize);
     clear_helper_retaddr();
     arm_plugin_bulk_mem_cb(env, toaddr, setsize, mem, memidx,
-                           QEMU_PLUGIN_MEM_W, true);
+                           QEMU_PLUGIN_MEM_W, true, ra);
     return setsize;
 }
 
@@ -1571,7 +1619,7 @@ static uint64_t set_step_tags(CPUARMState *env, uint64_t toaddr,
     memset(mem, data, setsize);
     clear_helper_retaddr();
     arm_plugin_bulk_mem_cb(env, cleanaddr, setsize, mem, memidx,
-                           QEMU_PLUGIN_MEM_W, true);
+                           QEMU_PLUGIN_MEM_W, true, ra);
     mte_mops_set_tags(env, toaddr, setsize, *mtedesc);
     return setsize;
 }
@@ -2018,12 +2066,12 @@ static uint64_t copy_step(CPUARMState *env, uint64_t toaddr, uint64_t fromaddr,
      * reports the value each access actually saw.
      */
     arm_plugin_bulk_mem_cb(env, fromaddr, copysize, rmem, rmemidx,
-                           QEMU_PLUGIN_MEM_R, true);
+                           QEMU_PLUGIN_MEM_R, true, ra);
     set_helper_retaddr(ra);
     memmove(wmem, rmem, copysize);
     clear_helper_retaddr();
     arm_plugin_bulk_mem_cb(env, toaddr, copysize, wmem, wmemidx,
-                           QEMU_PLUGIN_MEM_W, true);
+                           QEMU_PLUGIN_MEM_W, true, ra);
     return copysize;
 }
 
@@ -2153,13 +2201,13 @@ static uint64_t copy_step_rev(CPUARMState *env, uint64_t toaddr,
      */
     arm_plugin_bulk_mem_cb(env, fromaddr - (copysize - 1), copysize,
                            rmem - (copysize - 1), rmemidx,
-                           QEMU_PLUGIN_MEM_R, true);
+                           QEMU_PLUGIN_MEM_R, true, ra);
     set_helper_retaddr(ra);
     memmove(wmem - (copysize - 1), rmem - (copysize - 1), copysize);
     clear_helper_retaddr();
     arm_plugin_bulk_mem_cb(env, toaddr - (copysize - 1), copysize,
                            wmem - (copysize - 1), wmemidx,
-                           QEMU_PLUGIN_MEM_W, true);
+                           QEMU_PLUGIN_MEM_W, true, ra);
     return copysize;
 }
 

@@ -85,7 +85,13 @@ BOUNDARY_REG = {
     'LDTR':       'REG_SYSMMU',
     'TR':         'REG_SYSMMU',
     'MXCSR':      'REG_FCSR',
-    'X87CONTROL': 'REG_FCSR',
+    # The x87 CONTROL word has its own id since 0acd1e32e5.  It was folded
+    # onto REG_FCSR with the status word, the tag word and MXCSR, and
+    # `fnstsw` reading it as FPSW while `fldcw` writes it as FPCW is two
+    # architecturally distinct registers on one id.  This row is the
+    # reference side learning the split; leaving it at REG_FCSR reports a
+    # vocabulary difference as a disagreement.
+    'X87CONTROL': 'REG_FPCW',
     'X87TAG':     'REG_FCSR',
     'MSRS':       'REG_SYS',
     'TSCAUX':     'REG_SYS',
@@ -263,7 +269,14 @@ def adjudicate(hexs, xsrc, xdst):
     # (target/i386/tcg/fpu_helper.c).  Following the reference here would
     # plant a write the guest does not perform, which is the worse defect:
     # a wrong dependency reads as agreement.
-    if xmn in ('FNSTCW', 'FNSTSW') and 'X87STATUS' in dst:
+    # EXTENDED to FLDCW by the same argument, read out of the same
+    # tree: helper_fldcw() is cpu_set_fpuc(env, val), which assigns
+    # env->fpuc and calls update_fp_status() and touches env->fpus
+    # nowhere (target/i386/cpu.h:2728).  XED AND LLVM MC both declare
+    # a status-word WRITE on FLDCW, and following either would plant a
+    # dependency the guest does not have -- ADJ-4's own argument, one
+    # instruction further on.
+    if xmn in ('FNSTCW', 'FNSTSW', 'FLDCW') and 'X87STATUS' in dst:
         dst.discard('X87STATUS')
         ADJ['ADJ-4 FNSTCW/FNSTSW read the status word and do not write it '
             '(QEMU helper over XED+LLVM)'] += 1

@@ -209,6 +209,40 @@ established page whose delta is WRONG is scored `IN-MAPPING-WRONG-DELTA` /
 UNACCOUNTED rather than absorbed as "both look like pointers".  That is what
 makes the `dstvalue` control fire.
 
+## The reference corrections, and the falsifier that convicts them
+
+The reference is CORRECTED where it is provably wrong, never labelled around
+(R7.1, R7.7).  Two corrections live in `champsim_reg_pintool.cpp`:
+
+* `xed3_operand_set_cet(&d, 1)` before the decode.  PIN's own decode leaves
+  the CET operand clear, and `f30f1efa` then decodes not as `endbr64` but as
+  `NOP_GPRv_GPRv_0F1E`, a two-register-reading nop.  The same unset bit turns
+  `rdsspq` into a phantom `rax,rcx` read.
+* `leave`'s rSP is scored a WRITE, not a read-write.  The SDM defines LEAVE as
+  `rSP <- rBP; POP rBP` — the incoming rSP is discarded, never read — and
+  iced-x86, a third decoder that is neither instrument, agrees.
+
+A correction is only worth as much as the control that shows it mattered.
+Rebuilding the pintool with both corrections REMOVED and re-pairing the same
+tracer stream (`item45/uncorrected/`) puts the whole class back:
+
+| register-SET disagreement | reference UNCORRECTED | reference CORRECTED |
+| --- | ---: | ---: |
+| `endbr64` `ref_only=rdi,rdx` TRACER-SUBSET | 197 | **0** |
+| `leave` `ref_only=rsp` TRACER-SUBSET | 19 | **0** |
+| `rdsspq` `ref_only=rax,rcx` UNACCOUNTED | 1 | **0** |
+| `rdsspq` dst `tracer_only=rax` TRACER-SUPERSET | 1 | **0** |
+| `xgetbv` `xcr0`→`sys` ORTHOGONAL (a vocabulary fold) | 1 | 1 |
+| src-set mismatched, all causes | 218 | **1** |
+| the criterion, `SUBSET + UNACCOUNTED` | 518 | **301** |
+
+Every removed row is the reference's defect, and every one of them scored the
+tracer as DROPPING a register it is right not to name.  On the corrected
+reference the register-SET axis has exactly one disagreeing row left, and it
+is an ORTHOGONAL vocabulary fold rather than information the tracer lacks:
+`SUBSET 0`, `SUPERSET 0`, `UNACCOUNTED 0` over 395,854 pairs.  The residual
+301 is entirely on the VALUE axes.
+
 ## What the register arm measures today
 
 396,044 byte-identical instruction pairs of a static, non-PIE x86_64 guest,

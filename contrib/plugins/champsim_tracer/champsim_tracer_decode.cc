@@ -1072,6 +1072,43 @@ void decode_detail_to_generic(uint64_t pc,
             add_src_cap_reg(out, out_names, info->regs_read_id[i]);
         }
         for (uint8_t i = 0; i < info->n_regs_write; i++) {
+            /*
+             * MIPS branches do not write $at, and LLVM's MIPS tables say
+             * they do.  Every conditional branch -- `bne`, `beq`, `bgez`,
+             * `bltz`, `blez`, `bgtz`, and the `b` macro -- carries an
+             * implicit definition of AT, which Capstone reports verbatim in
+             * regs_write.  Both decoders agree because both read the same
+             * table: `isaxcheck --isa=mipsel --hex=feff0915` prints WR{r1}
+             * on the Capstone line AND on the LLVM MC line, for
+             * `bne $t0, $t1`.  The implicit def is there for the
+             * long-branch expansion, where the ASSEMBLER may clobber $at
+             * while rewriting an out-of-range branch into a jump -- but
+             * that rewrite emits its own instructions, and the branch
+             * itself never touches the register.
+             *
+             * Published, this is a destination write that did not happen:
+             * it manufactures a WAW edge against every real producer of
+             * $at and a RAW edge into every consumer.  It measures as
+             * TRACER-SUPERSET, which is why nothing caught it until an
+             * execution reference was put beside the trace -- gem5 names
+             * no destination for these instructions, on all seven mipsel
+             * branch forms in `arc3_cov/gem5`.
+             *
+             * Upstream: LLVM's MIPS branch instruction definitions should
+             * not carry `Defs = [AT]`; the expansion that clobbers it is
+             * the assembler's, not the instruction's.  Dropped here, at the
+             * boundary, because the register table cannot express it -- the
+             * table is keyed by REGISTER and the discriminator is the
+             * INSTRUCTION.  Revisit on a Capstone bump.
+             */
+            if (trace_isa == TRACE_ISA_MIPS &&
+                out->branch_type != BRANCH_NONE) {
+                const RegClassification *rc =
+                    lookup_reg_class(info->regs_write_id[i]);
+                if (rc && !rc->n_regs && rc->reg_id == REG_GPR1) {
+                    continue;
+                }
+            }
             add_dst_cap_reg(out, out_names, info->regs_write_id[i]);
         }
     }

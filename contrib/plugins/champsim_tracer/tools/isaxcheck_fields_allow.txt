@@ -6954,3 +6954,62 @@ x86_64 FR-rd-missing mwaitx +REG_GPR#
 mipsel FM-extra-load sc
 mipsel FM-extra-load sce
 
+
+# MIPS BRANCHES DO NOT WRITE $at, AND LLVM'S MIPS TABLES SAY THEY DO.
+# Every branch form -- the conditional set (beq/bne/bgez/bltz/blez/bgtz and
+# their likely and zero-compare variants), the `b` and `j` macros, and the
+# MSA bz.*/bnz.* forms -- carries an implicit definition of AT in LLVM's
+# instruction descriptions, and Capstone reports it verbatim in regs_write.
+# Both decoders agree because both read the same table.
+#
+# The implicit def exists for the LONG-BRANCH EXPANSION, where the ASSEMBLER
+# may clobber $at while rewriting an out-of-range branch into a jump.  That
+# rewrite emits its own instructions; the branch itself never touches the
+# register.  Published in a trace, the write is a destination that did not
+# happen: it manufactures a WAW edge against every real producer of $at and a
+# RAW edge into every consumer.
+#
+# The dependency model drops it at the boundary (champsim_tracer_decode.cc,
+# in the implicit-regs fold, gated on TRACE_ISA_MIPS and a non-NONE
+# branch_type), so the fields layer records no destination where LLVM claims
+# one.  These rows are that repair, enumerated exactly.
+#
+# Measured, not argued: gem5 -- an execution reference that decodes MIPS
+# itself -- names NO destination for any of these instructions, and the
+# aarch64/mipsel execution leg (tools/arc3_cov/gem5) went from 10 rows of
+# `TRC-INVENTED-BRANCH-DEST` to none when the drop landed, with reg-dst-set
+# agreement moving 134/147 -> 144/147 over the same run.
+#
+# Upstream: LLVM's MIPS branch instruction definitions should not carry
+# `Defs = [AT]`; the clobber belongs to the assembler's expansion, not to the
+# instruction.  Revisit on a Capstone or LLVM bump -- these rows go DEAD the
+# moment either side stops claiming the write, and the gate fails on a dead
+# row, which is what keeps this comment honest.
+mipsel FR-wr-missing b +REG_GPR#
+mipsel FR-wr-missing beq +REG_GPR#
+mipsel FR-wr-missing beql +REG_GPR#
+mipsel FR-wr-missing beqz +REG_GPR#
+mipsel FR-wr-missing beqzl +REG_GPR#
+mipsel FR-wr-missing bgez +REG_GPR#
+mipsel FR-wr-missing bgezl +REG_GPR#
+mipsel FR-wr-missing bgtz +REG_GPR#
+mipsel FR-wr-missing bgtzl +REG_GPR#
+mipsel FR-wr-missing blez +REG_GPR#
+mipsel FR-wr-missing blezl +REG_GPR#
+mipsel FR-wr-missing bltz +REG_GPR#
+mipsel FR-wr-missing bltzl +REG_GPR#
+mipsel FR-wr-missing bne +REG_GPR#
+mipsel FR-wr-missing bnel +REG_GPR#
+mipsel FR-wr-missing bnez +REG_GPR#
+mipsel FR-wr-missing bnezl +REG_GPR#
+mipsel FR-wr-missing bnz.b +REG_GPR#
+mipsel FR-wr-missing bnz.d +REG_GPR#
+mipsel FR-wr-missing bnz.h +REG_GPR#
+mipsel FR-wr-missing bnz.v +REG_GPR#
+mipsel FR-wr-missing bnz.w +REG_GPR#
+mipsel FR-wr-missing bz.b +REG_GPR#
+mipsel FR-wr-missing bz.d +REG_GPR#
+mipsel FR-wr-missing bz.h +REG_GPR#
+mipsel FR-wr-missing bz.v +REG_GPR#
+mipsel FR-wr-missing bz.w +REG_GPR#
+mipsel FR-wr-missing j +REG_GPR#

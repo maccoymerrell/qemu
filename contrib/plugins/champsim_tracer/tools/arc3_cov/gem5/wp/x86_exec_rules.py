@@ -94,6 +94,29 @@ X86_EXEC = {
                   'x87 instructions and not for others; the architecture '
                   'updates it on all of them'),
 
+    # gem5's x86 misc-register enumeration DOES carry an x87 control word --
+    # `misc_reg::Fcw`, one past Mxcsr and one before Fsw, so index 193 in the
+    # same block whose 191 (X87Top), 194 (Fsw) and 195 (Ftw) this leg reads
+    # every excursion.  What is absent is any micro-op that USES it: over
+    # every gem5 run in this leg, `miscellaneous:193` occurs ZERO times on
+    # either side of any operand list, and `miscellaneous:192` (Mxcsr) zero
+    # times as well, against 990 occurrences each of 191 and 195 and 36 of
+    # 194.  gem5's x87 lowering carries no rounding mode, no precision
+    # control and no exception masks as operands, so the control-word read
+    # the tracer records as REG_FPCW is a dependency the reference cannot
+    # state -- not one it disagrees about.
+    #
+    # THE OBVIOUS WORDING IS FALSE AND MUST NOT BE USED: "gem5's x86 register
+    # file has no x87 control word at all" is wrong, and this project has
+    # already been burnt four times by an allowlist entry whose written
+    # justification was factually false.  The register exists; the operand
+    # never appears.
+    'REF-NO-X87-CONTROL-OPERAND':
+        Rule('REF-NO-X87-CONTROL-OPERAND', 'reference-gap', {SUPERSET},
+             note='gem5 enumerates misc_reg::Fcw but no x87 micro-op names '
+                  'it; the control-word read is absent from every operand '
+                  'list, measured at zero occurrences over the whole leg'),
+
     # A vector destination gem5 wrote through the wide path is NAMED with no
     # value (`RW=[...=?]`), and a scalar SSE operation writes only the low
     # half of an XMM register, leaving the word unknowable from one line.
@@ -104,16 +127,45 @@ X86_EXEC = {
              note='gem5 publishes XMM as two 64-bit halves; a scalar write '
                   'touches one and the word is not knowable from the line'),
 
-    # gem5 reads its own destination back on a partial-width write so the
-    # bytes it does not produce survive.  Measured: `mov di, m16` prints
-    # SR=[...,integer:7,...] -- rdi is a source of its own 16-bit load.  The
-    # tracer records the same dependency for a partial write (R4), so this is
-    # NOT a disagreement; the rule exists for the converse case, where the
-    # tracer names a partial-write source gem5's micro-op did not need.
+    # The converse direction of REF-PRESERVE-READ-OVERNAMED: the tracer names
+    # a source on a partial write that gem5's micro-op lowering did not need.
+    # R7.1 rules that direction a tracer over-naming, so it is kept as a
+    # SUPERSET label rather than folded into agreement.
     'REF-NO-PARTIAL-MERGE-READ':
         Rule('REF-NO-PARTIAL-MERGE-READ', 'reference-gap', {SUPERSET},
              note='gem5 reads the destination back only where its micro-op '
                   'lowering needs the merge'),
+
+    # R7.1, VERBATIM: "the fact that a register's upper contents may not be
+    # modified does not imply it is a source AND a destination for the
+    # instruction unless the instruction specifically takes it as a source."
+    # So `inc` preserving CF, `bt` writing one flag, `setz %al` preserving
+    # RAX[63:8] and `mov r/m8, r8` preserving the upper bytes acquire NO
+    # source.  gem5 models the preserve at the hardware level and names one;
+    # the direction is SUBSET and the row is REFERENCE-side with the tracer
+    # RIGHT.  Adding those edges would inject a phantom REG_FLAGS source on
+    # every dec/inc/bt and a phantom read-of-destination on every 8/16-bit
+    # write -- the same class as the mipsel conditional-branch phantom
+    # destination removed at 95a0d89e92.
+    #
+    # PREDICATION IS A DIFFERENT QUESTION AND IS NOT COVERED HERE.  `cmovcc`'s
+    # destination IS a source (R4): a false condition leaves the whole old
+    # architectural value in place.  The two are told apart by gem5's own
+    # destination spelling -- `mov r11, r11, r11` writes the 64-bit name and
+    # is FULL, `movi r13b, r13b, 0x1` does not and is partial -- which is why
+    # this rule fires only on a register gem5 wrote NARROW.
+    #
+    # BLIND SPOT, STATED: an 8/16-bit read-modify-write such as
+    # `add %al, %bl` is spelled by gem5 exactly like `setcc` -- narrow write,
+    # destination named in the operand slot it preserves -- and its read IS
+    # architectural.  Nothing in gem5's output separates them, so if the
+    # tracer ever dropped that source this rule would excuse it.  The leg's
+    # probes contain no such form; a probe that adds one must re-open this.
+    'REF-PRESERVE-READ-OVERNAMED':
+        Rule('REF-PRESERVE-READ-OVERNAMED', 'reference-gap', {SUBSET},
+             note='gem5 names a preserve-read on a NARROW or PARTIAL write; '
+                  'R7.1 rules that a register is a source only where the '
+                  'instruction takes it as one, so the tracer is right'),
 
     # The reference names an architectural register the tracer does not.  This
     # is the DISQUALIFYING direction and has no excusing rule by design: it is

@@ -85,8 +85,14 @@ WP_DEFECT = 'WP-DEFECT'
 RECON_GAP = 'RECONSTRUCTION-GAP'
 GEM5_LIMIT = 'GEM5-LIMIT'
 SUPERSET_OK = 'TRACER-SUPERSET'
+#: the SUBSET-direction counterpart: the REFERENCE states a fact the
+#: architecture does not, and a named rule says why.  Kept apart from
+#: TRACER-SUPERSET because the two are opposite directions and a report that
+#: spelled a reference artefact as a tracer superset would misname it.
+REF_SIDE = 'REFERENCE-SIDE'
 UNACCOUNTED = 'UNACCOUNTED'
-VERDICTS = (WP_DEFECT, RECON_GAP, GEM5_LIMIT, SUPERSET_OK, UNACCOUNTED)
+VERDICTS = (WP_DEFECT, RECON_GAP, GEM5_LIMIT, SUPERSET_OK, REF_SIDE,
+            UNACCOUNTED)
 
 Row = collections.namedtuple(
     'Row', 'guest seq idx pc axis verdict ref trc detail')
@@ -141,12 +147,18 @@ def x87_is_rounded(v80, v64):
     return d == v64 or abs(d - v64) <= 1
 
 
-def adjudicate(rel, only_ref, only_trc, side):
+def adjudicate(rel, only_ref, only_trc, side, preserve=frozenset()):
     """(measured direction, the surplus/deficit sets) -> (verdict, label).
 
     The direction is MEASURED by ``set_relation`` before any label is
     consulted; the label only explains a direction that was already
     established.  A direction with no rule is UNACCOUNTED and says so.
+
+    ``preserve`` is the set of registers gem5 read back ONLY to keep the bits
+    its own narrow write does not produce, measured per row from gem5's
+    operand text and slot positions (``gem5_wp_ref.Insn.preserve_reads``).
+    Under R7.1 those are not sources, so a SUBSET made up entirely of them is
+    the REFERENCE over-naming and not a tracer defect.
     """
     label = None
     if rel == SUPERSET:
@@ -169,13 +181,20 @@ def adjudicate(rel, only_ref, only_trc, side):
         elif rest == {'REG_FCSR'}:
             label = 'REF-X87-STATUS-NOT-PUBLISHED'
             rest = set()
+        elif rest == {'REG_FPCW'}:
+            label = 'REF-NO-X87-CONTROL-OPERAND'
+            rest = set()
         if rest:
             label = None            # something the rules do not reach
     elif rel == SUBSET:
-        label = 'REF-ONLY-UNEXPLAINED'
+        surplus = set(only_ref)
+        if surplus and surplus <= set(preserve):
+            label = 'REF-PRESERVE-READ-OVERNAMED'
+        else:
+            label = 'REF-ONLY-UNEXPLAINED'
     rule = x86_exec_rule(label)
     if rule is not None and rel in rule.expect and rule.accounts:
-        return SUPERSET_OK, label
+        return (REF_SIDE if rel == SUBSET else SUPERSET_OK), label
     if rel == SUBSET:
         return WP_DEFECT, label
     return UNACCOUNTED, label
@@ -441,7 +460,8 @@ def compare_excursion(guest, ex, ref, gapinfo, run_note):
         if rs != ts:
             rel = set_relation((), sorted(rs), (), sorted(ts))
             if rel != EQUAL:
-                v, lab = adjudicate(rel, rs - ts, ts - rs, 'src')
+                v, lab = adjudicate(rel, rs - ts, ts - rs, 'src',
+                                    r.preserve_reads)
                 rows.append(Row(guest, ex.seq, i, t.pc, 'reg-src-set',
                                 v, sorted(rs), sorted(ts),
                                 '%s %s' % (rel, lab or '')))
@@ -690,26 +710,29 @@ def render(rows, stats, tails, dropped, folded, merged, notes, guests):
     w('')
     byv = collections.Counter(r.verdict for r in rows)
     bya = collections.Counter((r.axis, r.verdict) for r in rows)
-    hdr = ('%-16s %10s %19s %12s %16s %12s'
-           % ('axis', WP_DEFECT, RECON_GAP, GEM5_LIMIT, SUPERSET_OK,
-              UNACCOUNTED))
+    cw = [max(len(v), 8) for v in VERDICTS]
+    fmt = '%-16s' + ''.join(' %%%ds' % c for c in cw)
+    dfmt = '%-16s' + ''.join(' %%%dd' % c for c in cw)
+    hdr = fmt % (('axis',) + VERDICTS)
     w(hdr)
     w('-' * len(hdr))
     for ax in AXES + ('wp-entry-state',):
         n = [bya[(ax, v)] for v in VERDICTS]
         if not any(n):
             continue
-        w('%-16s %10d %19d %12d %16d %12d' % ((ax,) + tuple(n)))
+        w(dfmt % ((ax,) + tuple(n)))
     w('-' * len(hdr))
-    w('%-16s %10d %19d %12d %16d %12d'
-      % (('TOTAL',) + tuple(byv[v] for v in VERDICTS)))
+    w(dfmt % (('TOTAL',) + tuple(byv[v] for v in VERDICTS)))
     w('')
     w('THE NUMBER THAT MATTERS: WP-DEFECT + RECONSTRUCTION-GAP +')
     w('UNACCOUNTED = %d.  TRACER-SUPERSET rows are COVERED -- each carries a'
       % (byv[WP_DEFECT] + byv[RECON_GAP] + byv[UNACCOUNTED]))
     w('named rule from x86_exec_rules.X86_EXEC saying why the reference')
-    w('cannot state the fact.  GEM5-LIMIT rows are the reference\'s own')
-    w('silence and are named one by one, never counted as agreement.')
+    w('cannot state the fact.  REFERENCE-SIDE rows are the opposite')
+    w('direction and carry a rule too: the reference states a fact the')
+    w('ARCHITECTURE does not, so the tracer is right and no edge is owed.')
+    w('GEM5-LIMIT rows are the reference\'s own silence and are named one by')
+    w('one, never counted as agreement.')
     w('')
     if dropped:
         w('REFERENCE-INTERNAL REGISTERS DROPPED (not architectural state; see')
@@ -724,9 +747,9 @@ def render(rows, stats, tails, dropped, folded, merged, notes, guests):
         w('temporary; the read is not an architectural dependency.  The rule')
         w('is mechanical -- the register was written by an EARLIER micro-op')
         w('of the same macro-op, or the micro-op does not NAME it as a source')
-        w('and the macro-op writes it at FULL architectural width -- so an')
-        w('8- or 16-bit destination write, which really does read what it')
-        w('preserves, is never suppressed.')
+        w('and the macro-op writes it at FULL architectural width.  A NARROW')
+        w('write is not suppressed here: gem5 still states the read, and R7.1')
+        w('rules on it at the comparison, as REF-PRESERVE-READ-OVERNAMED.')
         for k in sorted(merged, key=lambda x: -merged[x])[:16]:
             w('  %10d  %s' % (merged[k], k))
         w('')

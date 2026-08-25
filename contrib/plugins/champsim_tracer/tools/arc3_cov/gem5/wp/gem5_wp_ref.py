@@ -67,6 +67,7 @@ _S = re.compile(r'\sS=(\d+)')
 _MF = re.compile(r'\sMF=0x([0-9a-f]+)')
 _RW = re.compile(r'\sRW=\[([^\]]*)\]')
 _SR = re.compile(r'\sSR=\[([^\]]*)\]')
+_DR = re.compile(r'\sDR=\[([^\]]*)\]')
 _MD = re.compile(r'\sMD=0x([0-9a-f]+)')
 _FL = re.compile(r'\s\sflags=\(([^)]*)\)')
 
@@ -83,7 +84,7 @@ class Insn(object):
                  'uops', 'disas', 'unmapped', 'ctrl', 'cc', 'rflags',
                  'rflags_mask', 'syscall', 'full_written', 'raw_reads',
                  'raw_writes', 'top_before', 'top_after', 'x87_valued',
-                 'half_seen', 'ufp')
+                 'half_seen', 'ufp', 'preserve_reads')
 
     def __init__(self, pc):
         self.pc = pc
@@ -101,7 +102,8 @@ class Insn(object):
         self.rflags_mask = 0
         self.syscall = False
         self.full_written = set()   # gem5 (cls, idx) written at FULL width
-        self.raw_reads = []         # [(cls, idx, uop_seq, named_in_text)]
+        self.raw_reads = []         # [(cls, idx, uop_seq, named, same_slot)]
+        self.preserve_reads = set()  # generic ids read ONLY to be preserved
         self.raw_writes = []        # [(cls, idx, value|None, uop_seq)]
         self.half_seen = set()      # XMM halves this macro-op has written
         self.ufp = None             # last micro-op FP scratch value written
@@ -276,7 +278,23 @@ def parse(logpath, sel=None, dropped=None, folded=None, merged=None):
 
         msr = _SR.search(rest)
         if msr:
-            for tok in _split_tokens(msr.group(1)):
+            # gem5's DESTINATION list is positional and carries `invalid:0`
+            # placeholders, and a micro-op that PRESERVES part of a register
+            # declares the preserve source in the SLOT of the destination it
+            # preserves.  Measured on this leg's own runs: `inc r9` prints
+            # SR[2]=condition_code:1 against DR[2]=condition_code:1 while
+            # `adc rdi` prints SR[3]=condition_code:1 against DR[2] -- the
+            # first is a preserve, the second an architectural input, and
+            # the register identity alone cannot tell them apart.
+            mdr = _DR.search(rest)
+            drl = ([t.strip() for t in mdr.group(1).split(',')]
+                   if (mdr and mdr.group(1)) else [])
+            srl = [t.strip() for t in msr.group(1).split(',')]
+            for _slot, tok in enumerate(srl):
+                if not tok:
+                    continue
+                same_slot = (_slot < len(drl) and drl[_slot] == tok
+                             and not tok.startswith('invalid'))
                 cls, _, idx = tok.rpartition(':')
                 try:
                     i = int(idx)
@@ -309,7 +327,8 @@ def parse(logpath, sel=None, dropped=None, folded=None, merged=None):
                         named = ('%%mmx%d' % i) in after_comma
                 else:
                     named = True      # cc / misc carry no operand text
-                cur.raw_reads.append((cls, i, cur.uops, named))
+                cur.raw_reads.append((cls, i, cur.uops, named,
+                                      same_slot))
 
     _finalize(out, dropped, folded, merged)
     for i, ins in enumerate(out):
@@ -416,12 +435,32 @@ def _finalize(insns, dropped, folded, merged):
         wrote_by = {}
         for cls, i, _v, u in ins.raw_writes:
             wrote_by.setdefault((cls, i), u)
-        for cls, i, u, named in ins.raw_reads:
+        for cls, i, u, named, same_slot in ins.raw_reads:
             key = (cls, i)
             if cls == 'floating_point' and (i < 8 or 48 <= i < 56):
                 g = _x87_name(i, ins.top_before, ins.top_before)
             else:
                 g = V.to_generic(cls, i)
+            # (0) R7.1 -- a NARROW or PARTIAL write does not acquire a
+            #     preserve-read.  Verbatim: "the fact that a register's upper
+            #     contents may not be modified does not imply it is a source
+            #     AND a destination for the instruction unless the
+            #     instruction specifically takes it as a source."  gem5 models
+            #     the preserve at the hardware level and therefore names one;
+            #     the register is recorded here so the comparison can say
+            #     REFERENCE-side rather than tracer defect, and gem5's set is
+            #     left exactly as gem5 stated it.
+            #
+            #     What makes the write PARTIAL is gem5's own text: a
+            #     destination spelled `r9b`/`r13b`/`r10w` is not the 64-bit
+            #     name, and a condition-code or x87 status word is a packed
+            #     field register with no full-width spelling at all.  What
+            #     makes the read a PRESERVE is that gem5 either does not name
+            #     the register in the micro-op's operand text at all, or names
+            #     it in the SLOT of the destination it preserves.
+            if (key in wrote_by and key not in ins.full_written
+                    and (not named or same_slot)):
+                ins.preserve_reads.add(g)
             # (a) the value was produced by an EARLIER micro-op of this same
             #     macro-op -- gem5 forwarding through an architectural
             #     register it also uses as its temporary.

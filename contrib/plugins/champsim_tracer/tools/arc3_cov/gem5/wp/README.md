@@ -47,6 +47,7 @@ every correct-path **store** wrote.
 | `RECONSTRUCTION-GAP` | the trace does not carry enough state to rebuild the starting point — a finding about what the **wire** drops |
 | `GEM5-LIMIT` | the reference cannot state the fact.  Named one by one, with the observed text, and never quoted as agreement |
 | `TRACER-SUPERSET` | we record a fact the reference cannot, and a **named** rule from `x86_exec_rules.X86_EXEC` says why.  COVERED, not a defect |
+| `REFERENCE-SIDE` | the reference names architectural state the ARCHITECTURE does not, and a **named** rule says why.  The tracer is right and no edge is owed |
 | `UNACCOUNTED` | a disagreement nobody has explained.  MUST BE 0 |
 
 The gap verdict is assigned from **evidence, never from plausibility**.  A
@@ -95,6 +96,25 @@ Every one of these was found by running gem5, not assumed:
   leg cannot clear the x87 tag word.
 * **gem5 publishes an x87 status-word destination for `fabs`/`fchs` and not
   for `fadd`/`fmul`/`fsub`**, measured on the same run.
+* **gem5 never names its own x87 control word.**  `misc_reg::Fcw` exists in
+  the enumeration, one past `Mxcsr` and one before `Fsw`; over every run in
+  this leg `miscellaneous:193` occurs **zero** times in any operand list, and
+  `miscellaneous:192` (`Mxcsr`) zero times as well, against 990 occurrences
+  each of `191` (`X87Top`) and `195` (`Ftw`) and 36 of `194` (`Fsw`).  The
+  rounding mode, precision control and exception masks are not operands of
+  gem5's x87 lowering, so the `REG_FPCW` read is a fact the reference cannot
+  state.  The register EXISTS -- the tempting wording "gem5 has no x87
+  control word" is false and is not used.
+* **gem5 names a preserve-read on every NARROW write**, and R7.1 rules that
+  a register is a source only where the instruction takes it as one.  `inc`
+  reading the flags word it partially writes, `mov r/m8, r8` and `setcc r/m8`
+  reading the destination they merge into: measured as `SR`/`DR` entries in
+  the same operand slot, or as a read gem5's own micro-op text does not name,
+  against a destination gem5 did not spell at 64 bits.  Scored
+  `REFERENCE-SIDE`, never as a tracer defect -- adding those edges would
+  inject a phantom source on every one of them.  `cmovcc` is NOT this case
+  and keeps its destination-as-source (R4): gem5 spells its write at full
+  width, which is how the two are told apart.
 * **gem5 prints no encoding**, so the `insn-bits` axis the riscv64 leg scores
   becomes `insn-length` here — which on a variable-length ISA is the
   substantive question anyway.  Where neither the `rdip` fall-through nor a

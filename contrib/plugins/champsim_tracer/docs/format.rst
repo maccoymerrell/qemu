@@ -2182,6 +2182,8 @@ Field families (one canonical name each):
   that the initial-state REGFILE records and the DST_REG snapshots
   collectively define.
 
+.. _fmt-width-families:
+
 * **Width families** — the byte width of each captured value, for
   value-prediction consumers that need to know how many bytes a
   predicted register or memory value covers.  The width is not
@@ -2204,7 +2206,11 @@ Field families (one canonical name each):
   changes.  Values are clamped to ``CST_MAX_WIDE_BYTES``.  These
   families post-date the others; a trace produced without them is
   well-formed and decoders treat their absence as "width not
-  captured".
+  captured" — with one exception, which is a property of the opcode
+  and not of the field: a memop belonging to ``GEN_OP_PREFETCH``,
+  ``GEN_OP_CACHE_FLUSH`` or ``GEN_OP_TLB_FLUSH`` is address-only and
+  its width is ``0`` by construction.  See
+  :ref:`the synthesized memop <fmt-synthetic-ea-width>`.
 
 * **Vector lane-mask families** (four, one slot per operand, gated on
   the per-insn ``CST_INSN_FLAG_VEC`` bit — see §6 *Vector lane masks*):
@@ -2354,6 +2360,62 @@ dispatch on the opcode rather than treating the EA as a normal load.
 Instructions in these classes that have no memory operand (e.g. x86
 ``WBINVD``, AArch64 ``IC IALLU``) emit no synthesized address and stay
 classified under ``GEN_OP_FENCE``.
+
+.. _fmt-synthetic-ea-width:
+
+The synthesized memop is **address-only**, and its width is ``0``
+""
+
+A synthesized memop carries an address and no data. Its
+``CST_FID_LOAD_SIZE0`` is ``0`` — **by construction, and not because a
+width was omitted**. No data crosses the guest/host interface for any
+instruction in these three classes, so there is no value to size: the
+architecture-visible effect is on a cache line, a translation entry, or
+nothing at all.
+
+The extent of such an operation is a property of the **cache being
+modelled**, not of the instruction, and a trace cannot state it without
+picking somebody's geometry:
+
+* The guest's own architected line size is a per-CPU-model constant that
+  varies. Under ``qemu-aarch64`` the default ``max`` model reports
+  ``CTR_EL0 = 0x80038003`` — a 32-byte ``DminLine`` and ``IminLine`` —
+  while ``cortex-a57`` reports 64 bytes and ``a64fx`` reports 256.
+  Recording it would make the meaning of a trace depend silently on
+  ``-cpu``.
+* Even within one operation class the granule is not one number:
+  AArch64 D-side maintenance uses ``CTR_EL0.DminLine`` and I-side
+  maintenance ``CTR_EL0.IminLine``, which are separate fields;
+  ``GEN_OP_TLB_FLUSH`` acts on a *page* whose size follows the runtime
+  translation granule; and a prefetch's access size is
+  IMPLEMENTATION DEFINED by the architecture.
+* QEMU performs no access to measure. AArch64 ``DC CVAU`` / ``DC CVAC``
+  / ``DC CIVAC`` are ``ARM_CP_NOP``, ``IC IVAU`` is ``ARM_CP_NOP``
+  except under ``CONFIG_USER_ONLY`` (where it invalidates a translation
+  range and touches no data), MIPS ``SYNCI`` lowers to a bare
+  ``DISAS_STOP``, and x86 ``PREFETCH*`` translates to nothing.
+
+**What a consumer does instead, without guessing.** The address in
+``LOAD_ADDR[0]`` is the raw effective address the guest computed — it is
+*not* rounded down to a line — so a consumer aligns it to the geometry
+it is itself simulating, which is the only geometry that can be correct
+for it. The discriminator is the **opcode**, which is present in every
+trace: ``CST_FID_LOAD_SIZE0`` rides with ``LOAD_DATA`` and so is absent
+altogether from a trace produced without ``memdata``, and therefore may
+never be used to tell an address-only memop from a sized one. The rule
+is:
+
+  ``opcode ∈ {GEN_OP_PREFETCH, GEN_OP_CACHE_FLUSH, GEN_OP_TLB_FLUSH}``
+  → the memop in ``LOAD_ADDR[0]`` is an address, its width is
+  meaningless, and no ``LOAD_DATA`` is published for it.
+
+  any other opcode → a width of ``0`` means the width was not captured,
+  per :ref:`the width families <fmt-width-families>`.
+
+The exact operation — a D-side clean versus an I-side invalidate, both
+of which classify as ``GEN_OP_CACHE_FLUSH`` — is recoverable from the
+instruction bytes the block template carries, for a consumer that needs
+to distinguish them.
 
 LOAD / STORE as fall-through classifications
 """"""""""""""""""""""""""""""""""""""""""""

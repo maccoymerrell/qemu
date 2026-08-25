@@ -40,6 +40,15 @@ COMMON="--gem5-dir $GEM5_DIR --qemu $QEMU_BUILD/qemu-aarch64
 env -u LD_LIBRARY_PATH -u CST_GEM5_PYLIB -u PYTHONHOME \
   "$PY" "$HERE/selftest_wp_a64.py" $COMMON -o "$OUT/nc" $G
 
+# The axis control mutates only pairs whose baseline is clean on the axis it
+# targets, and every cache-maintenance row is dirty by construction -- so it
+# proves nothing about the four rules that account for them.  Those rules get
+# their own control, which breaks the trace's cache records the way a real
+# defect would and requires each rule to REFUSE.
+env -u LD_LIBRARY_PATH -u CST_GEM5_PYLIB -u PYTHONHOME \
+  "$PY" "$HERE/selftest_wp_cache_a64.py" $COMMON -o "$OUT/nc_cache" \
+      "$OUT/wpprobes/p_wpcache"
+
 env -u LD_LIBRARY_PATH -u CST_GEM5_PYLIB -u PYTHONHOME \
   "$PY" "$HERE/compare_wp_a64.py" $COMMON --wpdepth 32 --max 0 \
       -o "$OUT/final" --tsv "$OUT/rows.tsv" $G

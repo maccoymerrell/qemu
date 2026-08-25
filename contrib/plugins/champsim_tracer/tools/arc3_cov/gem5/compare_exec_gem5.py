@@ -215,6 +215,76 @@ def run_tracer(qemu_dir, isa, guest, outdir):
 FLAG_IDS = ('REG_FLAGS',)
 FPSR_IDS = ('REG_FCSR',)
 
+#: The cache-maintenance destination the TRACE names.  Read out of the
+#: record's own write list, never off a mnemonic (R8.7).
+MAINT_DEST = 'REG_SYSCACHE'
+
+
+def _addr_only(ins):
+    """At least one access, and NONE of them carries data.
+
+    Only ``record_synthetic_load`` mints a size-0 memop, so this is the
+    wire's own statement that the record is an ADDRESS and not an access --
+    the GEN_OP_PREFETCH / GEN_OP_CACHE_FLUSH / GEN_OP_TLB_FLUSH class of
+    docs/format.rst 5.2.
+    """
+    accs = ins.loads + ins.stores
+    return bool(accs) and all(sz == 0 for _a, _d, sz in accs)
+
+
+def _contig_pow2(recs):
+    """(base, span) when ``recs`` cover one contiguous power-of-two run."""
+    if not recs:
+        return None
+    lo = min(a for a, _d, _s in recs)
+    hi = max(a + max(sz, 1) for a, _d, sz in recs)
+    span = hi - lo
+    if span <= 0 or (span & (span - 1)) != 0 or lo % span:
+        return None
+    covered = set()
+    for a, _d, sz in recs:
+        covered.update(range(a, a + max(sz, 1)))
+    return (lo, span) if len(covered) == span else None
+
+
+def _zero_block(r, t):
+    """A zero-block write both sides performed, at two block sizes.
+
+    Store-only on both sides, each a contiguous power-of-two run aligned to
+    its own size, one containing the other, and the TRACE calling the
+    instruction a cache operation.  The containment is what makes it a
+    measurement: a trace that zeroed a different block fails it.
+    """
+    if r.loads or t.loads or not r.stores or not t.stores:
+        return False
+    if not any(n == MAINT_DEST for n, _v, _w in t.writes):
+        return False
+    rb, tb = _contig_pow2(r.stores), _contig_pow2(t.stores)
+    if rb is None or tb is None or rb == tb:
+        return False
+    (rl, rs), (tl, ts) = rb, tb
+    return ((rl >= tl and rl + rs <= tl + ts) or
+            (tl >= rl and tl + ts <= rl + rs))
+
+
+def _ref_covers_same_line(r, t):
+    """The reference's accesses are ONE contiguous granule containing ours.
+
+    The guard that keeps the address-only rules a measurement and not a
+    blanket: a trace that named the wrong line fails containment, earns no
+    label, and stays a defect.
+    """
+    ra = [a for a, _d, _s in r.loads + r.stores]
+    if not ra:
+        return False
+    lo = min(ra)
+    span = max(a + max(sz, 1) - lo for a, _d, sz in r.loads + r.stores)
+    if span <= 0 or (span & (span - 1)) != 0:
+        return False
+    if len(ra) != 1 and set(ra) != set(range(lo, lo + span)):
+        return False
+    return all(lo <= a < lo + span for a, _d, _s in t.loads + t.stores)
+
 
 def split_regs(writes):
     """[(id, value, width)] -> ({arch id: (value, width)}, {flag id: ...}).
@@ -275,6 +345,26 @@ def _set_row(pc, axis, ref, trc, label=None):
     return Disagreement(pc, axis, ref, trc, rel, label)
 
 
+def _maint_dest_label(ref, trc):
+    """The cache-maintenance destination, or None.
+
+    Called with the two whole sets; computes the difference itself so both
+    partitions (the arch file, where this leg puts REG_SYSCACHE, and the FP /
+    system one) can share one decision.  Two mechanisms, kept apart because
+    they are not the same fact: gem5 names NOTHING for a DC clean, and names
+    its own operation-titled misc register for IC IVAU.
+    """
+    only_ref = frozenset(ref) - frozenset(trc)
+    only_trc = frozenset(trc) - frozenset(ref)
+    if only_trc != frozenset((MAINT_DEST,)):
+        return None
+    if not only_ref:
+        return 'REF-NO-CACHE-MAINT-DEST'
+    if len(only_ref) == 1 and next(iter(only_ref)).startswith('MISC:'):
+        return 'CACHE-MAINT-DEST-SPELLING'
+    return None
+
+
 def compare_insn(r, t, isa):
     """One aligned instruction -> its disagreeing axes (possibly none)."""
     rows = []
@@ -286,7 +376,11 @@ def compare_insn(r, t, isa):
     if row is not None:
         only_ref = frozenset(ra) - frozenset(ta)
         only_trc = frozenset(ta) - frozenset(ra)
-        if only_ref and not only_trc and all(n == 'REG_ZERO' for n in only_ref):
+        maint = _maint_dest_label(frozenset(ra), frozenset(ta))
+        if maint is not None:
+            row = row._replace(label=maint)
+        elif only_ref and not only_trc and \
+                all(n == 'REG_ZERO' for n in only_ref):
             row = row._replace(label='REF-NAMES-ZERO-DEST')
         elif only_trc and not only_ref and \
                 all(n == 'REG_ZERO' for n in only_trc):
@@ -374,7 +468,9 @@ def compare_insn(r, t, isa):
     # and it must not be allowed to dilute either result.
     row = _set_row(r.pc, 'fpsr-dst-set', frozenset(rp), frozenset(tp))
     if row is not None:
-        rows.append(row._replace(label='FPSR-GRANULARITY'))
+        rows.append(row._replace(
+            label=_maint_dest_label(frozenset(rp), frozenset(tp)) or
+            'FPSR-GRANULARITY'))
 
     # ------------------------------------------------------------- memops
     #
@@ -404,6 +500,20 @@ def compare_insn(r, t, isa):
         # not implemented for MIPS", "instruction 'synci' unimplemented" --
         # so there is nothing on the reference side to compare against.
         mech = 'HINT-MEMOP-REF-SILENT'
+    elif _zero_block(r, t):
+        # Both really store, and they disagree only on the block size their
+        # own DCZID_EL0 defines.  Held to instructions the TRACE itself calls
+        # cache operations, so an ordinary store cannot reach it.
+        mech = 'DCZVA-BLOCK-IS-MACHINE-SIZE'
+    elif _addr_only(t) and _ref_covers_same_line(r, t):
+        # Both name the same granule, and they disagree only on whether the
+        # record carries the modelled cache's geometry.  WHICH of the two
+        # mechanisms is read off the trace's own write list: gem5's number
+        # for a DC clean is its System::cacheLineSize(), while its number for
+        # a prefetch is a decoder constant (8).  See gem5_rules.
+        mech = ('MAINT-EXTENT-IS-CACHE-GEOMETRY'
+                if any(n == MAINT_DEST for n, _v, _w in t.writes)
+                else 'PREFETCH-SIZE-IS-REF-CHOICE')
     elif rb == tb and rcnt != tcnt:
         # Byte-for-byte the same accesses, split into a different number of
         # requests.  Neither tool is wrong about what the instruction touched.
@@ -417,15 +527,6 @@ def compare_insn(r, t, isa):
         # That is a store-exclusive lowered onto a compare-exchange, which
         # really reads.  The riscv64 leg found the same shape on `sc`.
         mech = 'QEMU-EXCLUSIVE-CMPXCHG'
-    elif (r.loads or r.stores) and \
-            all(sz == 0 for _, _, sz in t.loads + t.stores) and \
-            all(sz > 0 for _, _, sz in r.loads + r.stores) and \
-            set(a for a, _, _ in t.loads + t.stores) == \
-            set(a for a, _, _ in r.loads + r.stores):
-        # Same address, and the tracer states NO WIDTH for it.  A prefetch:
-        # the access size is IMPLEMENTATION DEFINED, gem5 models 8 bytes and
-        # the tracer publishes 0, so a consumer cannot size the access.
-        mech = 'MEMOP-WIDTH-UNSTATED'
 
     if rcnt != tcnt:
         if tcnt[0] >= rcnt[0] and tcnt[1] >= rcnt[1]:

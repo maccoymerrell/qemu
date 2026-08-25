@@ -108,8 +108,40 @@ leg covers and they are stated rather than absorbed:
   is modelled as a plain `msr ic_ivau_xt, x21` and issues no request at all.
   So the reference is a THIRD opinion on the direction question mipsel
   `synci` raised: binutils says store, LLVM and QEMU say neither, gem5 says
-  store.  The one TRACER-SUBSET row it exposes is `memop-width`: the
-  synthetic-EA record carries width 0 where gem5 carries 64.
+  store.
+
+  WHERE THAT 64 COMES FROM, and why the trace does not adopt it.  gem5 takes
+  it from `sys->cacheLineSize()` -- `src/arch/arm/isa/insts/data64.isa:500`
+  -- which is `System.cache_line_size`, the SIMULATOR's configured geometry
+  (`src/sim/System.py:117`, default 64; `--cacheline_size` in
+  `configs/common/Options.py:199`).  It is not the guest's architected line.
+  QEMU reports that to the guest in `CTR_EL0`, and it is a per-CPU-model
+  constant that varies: measured by running a `CTR_EL0` reader under this
+  build's `qemu-aarch64`, the default `max` model answers 32 bytes,
+  `cortex-a57` / `-a72` / `-a76` / `neoverse-n1` / `-a710` answer 64 and
+  `a64fx` answers 256.  So the machine actually under measurement tells its
+  own guest **32** where gem5 says 64, and there is no single number to
+  carry.  The ruling is written into `docs/format.rst` 5.2: the synthesized
+  memop is address-only by construction, the extent belongs to the cache
+  being modelled, and a consumer dispatches on the opcode and applies its own
+  geometry.  The rows are accounted by `MAINT-EXTENT-IS-CACHE-GEOMETRY` and
+  `PREFETCH-SIZE-IS-REF-CHOICE`, which replaced the `needs-ruling` label
+  `MEMOP-WIDTH-UNSTATED`.
+
+  gem5's prefetch number is a THIRD, unrelated one: `LoadImm64("prfm",
+  "PRFM64_IMM", size=8, ...)`, `src/arch/arm/isa/insts/ldr64.isa:428-430`.
+  8 is a decoder constant, neither the line size gem5 models nor anything
+  the guest can observe, and the architecture leaves a prefetch's access
+  size IMPLEMENTATION DEFINED.  That is why the two mechanisms carry two
+  rules instead of one.
+
+* **`dc zva` is not maintenance and both tools really store**, at two
+  different block sizes, each architected in its own `DCZID_EL0`: gem5
+  computes `1ULL << (Dczid + 2)` (`data64.isa:468`) and answers 64 bytes,
+  while this build's `qemu-aarch64` answers `DCZID_EL0` = 7 -> 512 bytes on
+  the default `max` model (4 -> 64 on `cortex-a57`, 6 -> 256 on `a64fx`),
+  measured by running a reader.  Accounted by
+  `DCZVA-BLOCK-IS-MACHINE-SIZE`.
 
 * **`dc ivac` and `dc cvap` are still unimplemented in gem5** --
   `panic: Attempted to execute unimplemented instruction 'dc ivac'` and, for
@@ -288,6 +320,14 @@ the one remaining step.
 
 `p_cache` joined the aarch64 set once the gem5 SCTLR reset bug above was
 fixed; it was absent for as long as gem5 aborted on it.  The mipsel set is `p_int p_mem p_fp p_flow`.
+
+CORRECTION, 2026-08-25: for a while this file said `p_cache` was in the run
+set while the CANONICAL aarch64 run did not pass it -- the leg was scored
+over seven probes, not eight, and `p_cache`'s rows existed only in a
+separate one-guest run that reported 14 UNACCOUNTED.  A documented run set
+that is not the run set is a claim nobody measured.  The command above is
+now the command that was run, and its result is `UNACCOUNTED = 0` over 255
+aligned instructions.
 
 If the run must happen under a *different* interpreter, pass
 `--python-home <prefix>` — the prefix whose `lib/` holds the soname in

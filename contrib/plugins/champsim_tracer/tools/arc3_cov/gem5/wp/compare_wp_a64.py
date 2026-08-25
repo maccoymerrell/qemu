@@ -400,6 +400,48 @@ def _neon_pairwise(r, t):
             len(ra) == len(ta) + (len(ta) & 1))
 
 
+#: A cache-maintenance destination the TRACE names.  Read out of the trace's
+#: own write list rather than off a mnemonic (R8.7): the record is what says
+#: this instruction is maintenance, and a text match would stop working the
+#: day either tool renamed the operation.
+MAINT_DEST = 'REG_SYSCACHE'
+
+
+def _addr_only(ins):
+    """The trace performed at least one access and NONE of them carries data.
+
+    Only ``record_synthetic_load`` mints a size-0 memop, so this is the wire's
+    own statement that the record is an ADDRESS and not an access -- the
+    GEN_OP_PREFETCH / GEN_OP_CACHE_FLUSH / GEN_OP_TLB_FLUSH class of
+    docs/format.rst 5.2.
+    """
+    accs = ins.loads + ins.stores
+    return bool(accs) and all((sz or 0) == 0 for _a, _d, sz in accs)
+
+
+def _ref_covers_same_line(r, t):
+    """The reference's accesses are ONE contiguous granule containing ours.
+
+    This is the guard that keeps the address-only rules a measurement rather
+    than a blanket: the reference must describe a single contiguous run of a
+    power-of-two byte count, and every address the trace published must fall
+    INSIDE it.  A trace that named the wrong line fails containment, earns no
+    label, and stays a defect.
+    """
+    ra = sorted(a for a, _d, _s in r.loads + r.stores)
+    if not ra:
+        return False
+    lo = min(ra)
+    span = 0
+    for a, _d, sz in r.loads + r.stores:
+        span = max(span, a + max(sz or 0, 1) - lo)
+    if span <= 0 or (span & (span - 1)) != 0:
+        return False                      # not a granule
+    if set(ra) != set(range(lo, lo + span)) and len(ra) != 1:
+        return False                      # not contiguous, and not one record
+    return all(lo <= a < lo + span for a, _d, _s in t.loads + t.stores)
+
+
 def is_svc(bits):
     """``SVC #imm16``: 1101 0100 000 imm16 00001.
 
@@ -446,6 +488,16 @@ def label_for(axis, only_ref, only_trc, ref_ins, trc_ins):
             return 'REF-DISCARDS-ZERO-SRC'
         if only_ref and not only_trc and _atomic_dest_as_src(ref_ins, only_ref):
             return 'REF-ATOMIC-DEST-AS-SRC'
+    elif axis in ('fpsr-dst-set', 'reg-dst-set'):
+        # A cache-maintenance destination.  Two mechanisms, kept apart because
+        # they are not the same fact: gem5 names NOTHING for a DC clean, and
+        # names its own operation-titled misc register for IC IVAU.
+        if only_trc == frozenset((MAINT_DEST,)):
+            if not only_ref:
+                return 'REF-NO-CACHE-MAINT-DEST'
+            if len(only_ref) == 1 and \
+                    next(iter(only_ref)).startswith('MISC:'):
+                return 'CACHE-MAINT-DEST-SPELLING'
     elif axis == 'sys-src-set':
         # Held to the measured set.  A label applied to a whole AXIS rather
         # than to a measured shape is the kind arc3_taxonomy declares
@@ -676,7 +728,18 @@ def compare_excursion(guest, ex, refrows, gapinfo, stop_reason):
         for _ax in ('memop-count', 'memop-addr', 'memop-width'):
             facts[_ax] += 1
         mech = None
-        if rb == tb and rcnt != tcnt:
+        if _addr_only(t) and not r.loads and not r.stores:
+            # The reference executed the hint / maintenance operation as a
+            # no-op and issued no request at all.
+            mech = 'HINT-MEMOP-REF-SILENT'
+        elif _addr_only(t) and _ref_covers_same_line(r, t):
+            # Both name the same granule; they disagree only on whether the
+            # record carries the modelled cache's geometry.  WHICH mechanism
+            # is read off the trace's own write list, never off a mnemonic.
+            mech = ('MAINT-EXTENT-IS-CACHE-GEOMETRY'
+                    if any(n == MAINT_DEST for n, _v, _w in t.writes)
+                    else 'PREFETCH-SIZE-IS-REF-CHOICE')
+        elif rb == tb and rcnt != tcnt:
             mech = 'SAME-BYTES-DIFFERENT-SPLIT'
         elif (not r.loads and t.loads and
               set(a for a, _d, _s in t.loads) <=
@@ -684,11 +747,6 @@ def compare_excursion(guest, ex, refrows, gapinfo, stop_reason):
               [(a, sz) for a, _d, sz in t.stores] ==
               [(a, sz) for a, _d, sz in r.stores]):
             mech = 'QEMU-EXCLUSIVE-CMPXCHG'
-        elif ((r.loads or r.stores) and (t.loads or t.stores) and
-              all((sz or 0) == 0 for _a, _d, sz in t.loads + t.stores) and
-              set(a for a, _d, _s in t.loads + t.stores) ==
-              set(a for a, _d, _s in r.loads + r.stores)):
-            mech = 'MEMOP-WIDTH-UNSTATED'
 
         def memv(rel):
             rule = gem5_exec_rule(mech)

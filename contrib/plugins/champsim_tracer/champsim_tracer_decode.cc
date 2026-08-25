@@ -653,6 +653,8 @@ void report_undecodable_block(uint64_t pc)
  * Classify via direct insn_id array lookup (O(1)).  Returns the table
  * row (nullptr if out of range / no table) for the .refine callback.
  */
+extern thread_local bool g_dep_refine_suppressed;
+
 static const InsnClassification *classify_insn_id(
     const qemu_plugin_insn_info *info,
     uint8_t *opcode, uint8_t *branch_type, uint16_t *flags)
@@ -1457,9 +1459,56 @@ void decode_detail_to_generic(uint64_t pc,
      * falls back to all-to-all).  Refiner library in
      * champsim_tracer_mnemonic_tables.cc.
      */
-    if (cls && cls->dep_refine) {
+    if (cls && cls->dep_refine && !g_dep_refine_suppressed) {
         cls->dep_refine(info, out);
     }
+}
+
+/*
+ * Which refiner a row carries, by name, and the switch that withholds it.
+ *
+ * The names are taken from the function pointers themselves rather than from
+ * a string in the table, so the list cannot drift away from what actually
+ * runs: a refiner that is added and not listed here reports "dep_?" and is
+ * visible as an unnamed row in the measurement, which is the failure mode to
+ * prefer over a stale name that silently mislabels a verdict.
+ */
+/*
+ * THREAD-LOCAL, and it has to be.  Template build and the instrument's second
+ * decode both run at translation time, and under MTTCG two vCPUs translate at
+ * once -- a process-wide flag would let one thread's measurement withhold the
+ * refiner from another thread's real template, silently, in exactly the window
+ * the measurement is open.  Per-thread, the suppression cannot leave the
+ * thread that asked for it.
+ */
+thread_local bool g_dep_refine_suppressed = false;
+
+void dep_refine_set_suppressed(bool on)
+{
+    g_dep_refine_suppressed = on;
+}
+
+const char *dep_refine_name_for(const qemu_plugin_insn_info *info)
+{
+    uint8_t op = 0, br = 0;
+    uint16_t fl = 0;
+    const InsnClassification *cls = classify_insn_id(info, &op, &br, &fl);
+    if (!cls || !cls->dep_refine) {
+        return nullptr;
+    }
+    static const struct { InsnDepRefineFn fn; const char *name; } kTab[] = {
+        { dep_passthrough,                  "dep_passthrough" },
+        { dep_lea,                          "dep_lea" },
+        { dep_x86_stack_push,               "dep_x86_stack_push" },
+        { dep_x86_stack_pop,                "dep_x86_stack_pop" },
+        { dep_vec_struct_store,             "dep_vec_struct_store" },
+    };
+    for (const auto &e : kTab) {
+        if (e.fn == cls->dep_refine) {
+            return e.name;
+        }
+    }
+    return "dep_?";
 }
 
 /*

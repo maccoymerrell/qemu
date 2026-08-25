@@ -1719,6 +1719,26 @@ void decode_detail_to_generic(uint64_t pc,
                               InsnFields *out,
                               InsnRegNames *out_names);
 
+/*
+ * The .dep_refine surface, exposed for MEASUREMENT only.
+ *
+ * The retirement question -- does the emitter-stated dependency model give
+ * the same or a better answer than the row's Capstone-derived refiner --
+ * cannot be asked per refiner unless a decode can say WHICH refiner ran, and
+ * cannot be answered at all unless the same decode can be taken with the
+ * refiner withheld.  Both are here, and neither is on any path that writes a
+ * record: dep_refine_name_for() is a table lookup with no side effect, and
+ * the suppression flag is set by the irdf instrument around its own second
+ * decode and cleared again before it returns.
+ *
+ * The suppression flag is THREAD-LOCAL: template build and the instrument's
+ * second decode both run at translation time, and two vCPUs translate at once
+ * under MTTCG, so a process-wide flag could withhold a refiner from another
+ * thread's real template while the measurement is open.
+ */
+const char *dep_refine_name_for(const qemu_plugin_insn_info *info);
+void        dep_refine_set_suppressed(bool on);
+
 /* Defined in champsim_tracer_decode.cc */
 bool decode_synthetic_ea(const qemu_plugin_insn_info *info,
                          uint8_t opcode,

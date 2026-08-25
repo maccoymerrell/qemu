@@ -2281,11 +2281,23 @@ static uint64_t memop_data_lane_mask(const EntryView *ev, uint32_t i,
     unsigned slots_before = 0;   /* count of earlier memop slots that
                                   * also feed the same host register */
     if (!f->has_reg_deps) {
-        /* No precise refiner bound for this mnemonic; can't recover
-         * the per-memop -> per-register attribution.  Empty mask. */
-        return 0;
-    }
-    if (want_type == DYN_LOAD_ADDR) {
+        /*
+         * No dependency block is not no dependencies.  The format defines
+         * the absence as the all-to-all over-approximation, so the
+         * attribution below still has an answer -- and it is worth writing
+         * out what that answer IS, because the searches further down
+         * degenerate rather than fail.  With every bit set, the load search
+         * matches the first destination and counts every earlier load slot
+         * as feeding it; the store search takes the lowest set source bit,
+         * which is source slot 0, and likewise counts every earlier store.
+         * That is exactly this branch, stated directly:
+         */
+        host_reg_idx = 0;
+        host_lane_mask = (want_type == DYN_LOAD_ADDR)
+            ? (f->n_dst_regs ? f->dst_lane_mask[0] : 0)
+            : (f->n_src_regs ? f->src_lane_mask[0] : 0);
+        slots_before = slot;
+    } else if (want_type == DYN_LOAD_ADDR) {
         const uint64_t load_bit_k = (uint64_t)1 <<
             ((uint64_t)f->n_src_regs + (uint64_t)slot);
         for (uint8_t d = 0; d < f->n_dst_regs; d++) {

@@ -47,52 +47,15 @@ extern "C" {
  * tolerate broader-than-actual masks (false dependencies that hurt
  * accuracy) but not narrower ones (missed dependencies that break
  * regfile correctness).
- * ==================================================================== */
-
-static uint64_t all_inputs_mask(const InsnFields *f)
-{
-    uint64_t m = 0;
-    for (uint8_t i = 0; i < f->n_src_regs; i++) {
-        m |= ((uint64_t)1 << i);
-    }
-    for (uint8_t i = 0; i < f->max_dep_loads; i++) {
-        m |= ((uint64_t)1 << (f->n_src_regs + i));
-    }
-    if (f->has_immediate) {
-        m |= ((uint64_t)1 << (f->n_src_regs + f->max_dep_loads));
-    }
-    return m;
-}
-
-/*
- * dep_all_to_all: explicit catch-all.  Every architectural dst and
- * every store_data depends on every input the operand-walk surfaced.
  *
- * Functionally identical to the consumer-side default (which is what
- * "no HAS_REG block on the wire" maps to), but emitting it explicitly
- * tells the audit script the row was intentionally classified rather
- * than left as an unclassified gap.  Use this for ops genuinely
- * everything-touches-everything (CPUID, RDTSC fan-out, arithmetic
- * with implicit-flags writers we don't model yet).
- */
-void dep_all_to_all(const struct qemu_plugin_insn_info *info, InsnFields *f)
-{
-    (void)info;
-    if (f->n_dst_regs == 0 && f->max_dep_stores == 0) {
-        /* No architectural register/memory writes — nothing to
-         * express on the wire.  Skip the HAS_REG block; the consumer
-         * default already matches. */
-        return;
-    }
-    const uint64_t m = all_inputs_mask(f);
-    for (uint8_t d = 0; d < f->n_dst_regs; d++) {
-        f->dst_dep_mask[d] = m;
-    }
-    for (uint8_t s = 0; s < f->max_dep_stores && s < MAX_STORES; s++) {
-        f->store_data_dep_mask[s] = m;
-    }
-    f->has_reg_deps = true;
-}
+ * THERE IS NO FALLBACK REFINER.  A refiner that cannot state an edge
+ * returns without setting has_reg_deps, and the row publishes no
+ * dependency block -- which the format already defines as the
+ * all-to-all over-approximation.  The catch-all that used to write
+ * that mask out by hand was measured to publish exactly the reader's
+ * own default on every decode it was ever reached with, so it spent
+ * bytes to say nothing (cst_runs/p3/arc3/w11/VERDICT.md).
+ * ==================================================================== */
 
 /*
  * dep_passthrough: single value input flows to a single output —
@@ -337,14 +300,21 @@ static uint64_t addr_only_input_mask(const InsnFields *f, uint8_t n_stores)
  * until the SP retires).  Other dsts (CALL's IP write) stay on
  * the all-inputs over-approximation.
  *
- * If no stack-pointer candidate is found, bail to dep_all_to_all.
+ * If no stack-pointer candidate is found, the row states nothing.
  */
 void dep_x86_stack_push(const struct qemu_plugin_insn_info *info,
                         InsnFields *f)
 {
     int sp_src = find_stack_ptr_src(f, /*stack_op_is_store=*/true);
     if (sp_src < 0) {
-        dep_all_to_all(info, f);
+        /*
+         * Nothing to state.  A row that publishes no dependency block IS the
+         * all-to-all over-approximation as far as a reader is concerned
+         * (docs/format.rst: "Absence of CST_INSN_FLAG_HAS_DEP_BLOCK is the
+         * implicit all-to-all over-approximation"), so writing that mask out
+         * explicitly only spends bytes restating the reader's own default.
+         * Leave has_reg_deps false and return.
+         */
         return;
     }
     const uint64_t sp_bit = (uint64_t)1 << sp_src;
@@ -449,7 +419,14 @@ void dep_x86_stack_pop(const struct qemu_plugin_insn_info *info,
 {
     int sp_src = find_stack_ptr_src(f, /*stack_op_is_store=*/false);
     if (sp_src < 0) {
-        dep_all_to_all(info, f);
+        /*
+         * Nothing to state.  A row that publishes no dependency block IS the
+         * all-to-all over-approximation as far as a reader is concerned
+         * (docs/format.rst: "Absence of CST_INSN_FLAG_HAS_DEP_BLOCK is the
+         * implicit all-to-all over-approximation"), so writing that mask out
+         * explicitly only spends bytes restating the reader's own default.
+         * Leave has_reg_deps false and return.
+         */
         return;
     }
     const uint64_t sp_bit = (uint64_t)1 << sp_src;
@@ -595,10 +572,10 @@ void dep_passthrough(const struct qemu_plugin_insn_info *info, InsnFields *f)
             uint64_t all_src = ((uint64_t)1 << f->n_src_regs) - 1;
             uint64_t value_mask = all_src & ~addr_mask;
             if (!value_mask) {
-                /* Can't isolate a value src — fall back to the
-                 * conservative-correct all-to-all rather than emit a
-                 * wrong dep. */
-                dep_all_to_all(info, f);
+                /* Can't isolate a value src.  Say nothing rather than
+                 * emit a wrong dep: the reader's default for a row with
+                 * no block is the same conservative all-to-all this used
+                 * to write out by hand. */
                 return;
             }
             m = value_mask;
@@ -613,51 +590,7 @@ void dep_passthrough(const struct qemu_plugin_insn_info *info, InsnFields *f)
 }
 
 /*
- * dep_vec_struct_load: structured multi-register vector load whose
- * memops partition contiguously across the dst registers (AArch64
- * LD1 multi-reg, LDP, NEON LDxxV-multi, x86 register-pair forms).
- * The ISA semantics say lanes-per-reg consecutive memops feed each
- * dst in dst_regs[] order — the refiner expresses that on the wire
- * so each dst's dst_dep marks only its own load slots, and the
- * encoder's per-memop lane attribution can read the correct host
- * register out of dst_dep instead of falling back to a global
- * offset that ends up outside any one dst's per-register lane span.
- *
- * Shape conditions: n_dst_regs >= 1, max_dep_stores == 0,
- * max_dep_loads divisible by n_dst_regs.  Anything else falls back
- * to dep_all_to_all — interleaved structure loads (LD2/LD3/LD4 /
- * VPGATHER) need their own per-mnemonic refiner expressing their
- * own memop -> dst mapping.
- */
-void dep_vec_struct_load(const struct qemu_plugin_insn_info *info,
-                         InsnFields *f)
-{
-    if (f->n_dst_regs == 0 || f->max_dep_loads == 0
-        || f->max_dep_stores != 0
-        || (f->max_dep_loads % f->n_dst_regs) != 0) {
-        dep_all_to_all(info, f);
-        return;
-    }
-    unsigned loads_per_reg = f->max_dep_loads / f->n_dst_regs;
-    /* Address-mode srcs (base, index) feed every dst (every memop
-     * needs the address-mode regs to compute its EA). */
-    uint64_t addr_mask = 0;
-    for (uint8_t i = 0; i < f->n_src_regs; i++) {
-        addr_mask |= ((uint64_t)1 << i);
-    }
-    for (uint8_t d = 0; d < f->n_dst_regs && d < MAX_DST_REGS; d++) {
-        uint64_t mask = addr_mask;
-        for (unsigned k = 0; k < loads_per_reg; k++) {
-            unsigned slot = (unsigned)d * loads_per_reg + k;
-            mask |= ((uint64_t)1 << (f->n_src_regs + slot));
-        }
-        f->dst_dep_mask[d] = mask;
-    }
-    f->has_reg_deps = true;
-}
-
-/*
- * dep_vec_struct_store: mirror of dep_vec_struct_load for stores.
+ * dep_vec_struct_store: the one surviving structured-vector refiner.
  * Identifies the value-side vec srcs (src_lane_mask[i] != 0 — set
  * by the lane-shape pass for vec REG operands) and partitions
  * store_data_dep[s] across them.  Address-mode srcs (zero
@@ -667,9 +600,17 @@ void dep_vec_struct_load(const struct qemu_plugin_insn_info *info,
 void dep_vec_struct_store(const struct qemu_plugin_insn_info *info,
                           InsnFields *f)
 {
+    (void)info;
     if (f->n_src_regs == 0 || f->max_dep_stores == 0
         || f->max_dep_loads != 0) {
-        dep_all_to_all(info, f);
+        /*
+         * Nothing to state.  A row that publishes no dependency block IS the
+         * all-to-all over-approximation as far as a reader is concerned
+         * (docs/format.rst: "Absence of CST_INSN_FLAG_HAS_DEP_BLOCK is the
+         * implicit all-to-all over-approximation"), so writing that mask out
+         * explicitly only spends bytes restating the reader's own default.
+         * Leave has_reg_deps false and return.
+         */
         return;
     }
     /* Walk src_regs[] in template order, picking the vec-value
@@ -684,84 +625,19 @@ void dep_vec_struct_store(const struct qemu_plugin_insn_info *info,
         }
     }
     if (n_vec_src == 0 || (f->max_dep_stores % n_vec_src) != 0) {
-        dep_all_to_all(info, f);
+        /*
+         * Nothing to state.  A row that publishes no dependency block IS the
+         * all-to-all over-approximation as far as a reader is concerned
+         * (docs/format.rst: "Absence of CST_INSN_FLAG_HAS_DEP_BLOCK is the
+         * implicit all-to-all over-approximation"), so writing that mask out
+         * explicitly only spends bytes restating the reader's own default.
+         * Leave has_reg_deps false and return.
+         */
         return;
     }
     unsigned stores_per_src = f->max_dep_stores / n_vec_src;
     for (uint8_t s = 0; s < f->max_dep_stores && s < MAX_STORES; s++) {
         uint8_t which = vec_src_idx[s / stores_per_src];
-        f->store_data_dep_mask[s] = ((uint64_t)1 << which);
-    }
-    f->has_reg_deps = true;
-}
-
-/*
- * dep_vec_struct_load_interleaved: structured multi-register vector
- * load where the architectural element layout interleaves across the
- * destination registers (AArch64 LD2/LD3/LD4 multi-structure loads,
- * RISC-V V VLSEG2..VLSEG8 segment loads).  Memop slot k goes to
- * destination register (k % n_dst_regs) — slot 0 → dst[0], slot 1 →
- * dst[1], ..., slot n_dst_regs → dst[0] again at lane 1, etc.
- *
- * The sequential refiner dep_vec_struct_load above handles LD1
- * (whole-register-at-a-time) loads where slots partition contiguously
- * across dsts.  This one handles structure-deinterleave loads where
- * slots round-robin across dsts.
- */
-void dep_vec_struct_load_interleaved(
-    const struct qemu_plugin_insn_info *info, InsnFields *f)
-{
-    if (f->n_dst_regs == 0 || f->max_dep_loads == 0
-        || f->max_dep_stores != 0
-        || (f->max_dep_loads % f->n_dst_regs) != 0) {
-        dep_all_to_all(info, f);
-        return;
-    }
-    unsigned factor = f->n_dst_regs;
-    unsigned lanes_per_reg = f->max_dep_loads / factor;
-    uint64_t addr_mask = 0;
-    for (uint8_t i = 0; i < f->n_src_regs; i++) {
-        addr_mask |= ((uint64_t)1 << i);
-    }
-    for (uint8_t d = 0; d < f->n_dst_regs && d < MAX_DST_REGS; d++) {
-        uint64_t mask = addr_mask;
-        for (unsigned lane = 0; lane < lanes_per_reg; lane++) {
-            unsigned slot = lane * factor + (unsigned)d;
-            mask |= ((uint64_t)1 << (f->n_src_regs + slot));
-        }
-        f->dst_dep_mask[d] = mask;
-    }
-    f->has_reg_deps = true;
-}
-
-/*
- * dep_vec_struct_store_interleaved: mirror for interleaved stores
- * (ST2/ST3/ST4, VSSEG2..VSSEG8).  Store slot s sources from value
- * src (s % n_vec_value_srcs) at lane (s / n_vec_value_srcs).
- */
-void dep_vec_struct_store_interleaved(
-    const struct qemu_plugin_insn_info *info, InsnFields *f)
-{
-    if (f->n_src_regs == 0 || f->max_dep_stores == 0
-        || f->max_dep_loads != 0) {
-        dep_all_to_all(info, f);
-        return;
-    }
-    uint8_t vec_src_idx[MAX_SRC_REGS];
-    uint8_t n_vec_src = 0;
-    for (uint8_t i = 0; i < f->n_src_regs; i++) {
-        if (f->src_lane_mask[i] != 0) {
-            if (n_vec_src < MAX_SRC_REGS) {
-                vec_src_idx[n_vec_src++] = i;
-            }
-        }
-    }
-    if (n_vec_src == 0 || (f->max_dep_stores % n_vec_src) != 0) {
-        dep_all_to_all(info, f);
-        return;
-    }
-    for (uint8_t s = 0; s < f->max_dep_stores && s < MAX_STORES; s++) {
-        uint8_t which = vec_src_idx[(unsigned)s % n_vec_src];
         f->store_data_dep_mask[s] = ((uint64_t)1 << which);
     }
     f->has_reg_deps = true;

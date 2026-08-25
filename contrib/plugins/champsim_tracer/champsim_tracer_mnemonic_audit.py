@@ -173,15 +173,11 @@ ENTRY_RE = re.compile(
 # Used to validate that .dep_refine names referenced from per-ISA
 # tables actually exist; extend in lockstep with the C library.
 DEP_REFINERS: set[str] = {
-    "dep_all_to_all",
     "dep_passthrough",
     "dep_lea",
     "dep_x86_stack_push",
     "dep_x86_stack_pop",
-    "dep_vec_struct_load",
     "dep_vec_struct_store",
-    "dep_vec_struct_load_interleaved",
-    "dep_vec_struct_store_interleaved",
 }
 
 
@@ -193,6 +189,12 @@ DEP_REFINERS: set[str] = {
 # distinguish "true load" from "address-compute mem operand", so
 # this list is curated manually per ISA from the architectural
 # manuals.
+# The ISAs whose address-compute mnemonic arrives with a phantom load slot
+# for dep_lea to remove.  Only x86 does: LEA's operand is spelled as memory
+# and Capstone tags it read.  The other three spell the same computation with
+# an immediate and no MEM operand.
+ISA_ADDRESS_COMPUTE_PHANTOM_LOAD: frozenset[str] = frozenset({"x86"})
+
 ISA_ADDRESS_COMPUTE_INSNS: dict[str, set[str]] = {
     "x86":     {"X86_INS_LEA"},
     "aarch64": {"AARCH64_INS_ADR", "AARCH64_INS_ADRP"},
@@ -970,7 +972,17 @@ def _variants_by_canonical(isa: str) -> dict[str, tuple[CapVariant, ...]]:
     return {k: tuple(v) for k, v in out.items()}
 
 
-DEFAULT_DEP_REFINE = "dep_all_to_all"
+# No default refiner.
+#
+# A row without .dep_refine publishes no dependency block, and the format
+# defines that absence as the all-to-all over-approximation (docs/format.rst:
+# "Absence of CST_INSN_FLAG_HAS_DEP_BLOCK is the implicit all-to-all
+# over-approximation").  dep_all_to_all wrote that same over-approximation
+# out explicitly, so every row carrying it spent bytes restating the reader's
+# own default -- measured INERT on 48,179 of 48,179 decodes across four ISAs
+# and two workloads (cst_runs/p3/arc3/w11/VERDICT.md).  There is nothing for a
+# fallback to be, so there is no fallback.
+DEFAULT_DEP_REFINE = None
 
 
 def _count_access(variant: CapVariant, include_implicit: bool
@@ -1164,24 +1176,59 @@ def classify_dep_refine_explicit(info: IsaInfo, const_name: str,
     del entry  # not consulted; classification is pure Capstone-driven
 
     # 1. Hand-curated per-ISA override lists.
+    # dep_lea exists to UNDO a phantom load slot: Capstone tags x86 LEA's
+    # MEM operand CS_AC_READ, so the operand walk counts a load that never
+    # fires.  AArch64 ADR/ADRP and RISC-V AUIPC carry no MEM operand at all,
+    # so there is nothing to undo and the refiner republishes the default --
+    # measured inert on 1,732 of 1,732 decodes of those three rows.  Bind it
+    # only where the defect it repairs is present.
     if const_name in ISA_ADDRESS_COMPUTE_INSNS.get(info.key, set()):
-        return ("dep_lea", True)
+        if info.key in ISA_ADDRESS_COMPUTE_PHANTOM_LOAD:
+            return ("dep_lea", True)
+        # PINNED UNBOUND rather than left to fall through.  The shape
+        # classifier would promote ADR/ADRP/AUIPC to dep_passthrough, and
+        # that is a NEW claim rather than the removal this change is; the
+        # row keeps the over-approximation it already published.
+        return (None, True)
     if const_name in ISA_STACK_PUSH_INSNS.get(info.key, set()):
         return ("dep_x86_stack_push", True)
     if const_name in ISA_STACK_POP_INSNS.get(info.key, set()):
         return ("dep_x86_stack_pop", True)
-    if const_name in ISA_VEC_STRUCT_SEQUENTIAL_LOAD_INSNS.get(info.key,
-                                                              set()):
-        return ("dep_vec_struct_load", True)
-    if const_name in ISA_VEC_STRUCT_INTERLEAVED_LOAD_INSNS.get(info.key,
-                                                                set()):
-        return ("dep_vec_struct_load_interleaved", True)
+    # The two structured-vector LOAD refiners and the interleaved STORE
+    # refiner are gone.  They were written against a slot model the wire does
+    # not have: each needed max_dep_loads (or max_dep_stores) to be a multiple
+    # of the register count, i.e. one slot per element access.  The wire's
+    # slots count static memory OPERANDS -- docs/format.rst 4.5, "AArch64
+    # ld4 {v0.16b-v3.16b}, [x1] is one operand publishing 64 memops" -- so a
+    # structured access arrives with exactly ONE slot and the precondition
+    # cannot hold for any multi-register form.  Measured over every LD1/LD2/
+    # LD3/LD4 and ST2/ST3/ST4 shape on AArch64 NEON and SVE and every
+    # vlseg/vlsseg/vluxseg/vloxseg and vsseg/vsuxseg/vsoxseg form on RISC-V:
+    # 61 of 61 decodes bailed, on both ISAs, in every register count.
+    #
+    # dep_vec_struct_store survives because its precondition is on the VALUE
+    # sources rather than on the slot count, and a single-register ST1 form
+    # satisfies it: it names the stored register and not the address register
+    # as the datum, which is an edge the default does not have.
     if const_name in ISA_VEC_STRUCT_SEQUENTIAL_STORE_INSNS.get(info.key,
                                                                 set()):
         return ("dep_vec_struct_store", True)
-    if const_name in ISA_VEC_STRUCT_INTERLEAVED_STORE_INSNS.get(info.key,
-                                                                  set()):
-        return ("dep_vec_struct_store_interleaved", True)
+    # PINNED UNBOUND, for the same reason.  Measured: letting these 83 rows
+    # reach the shape classifier promotes them to dep_passthrough, whose
+    # rm-form rule states dst = load_data[0] -- and on an SVE predicated load
+    # that DROPS the governing predicate and the FP-enable the old refiner's
+    # over-approximation carried.  `ld1b {z0.b}, p0/z, [x0]` went from
+    #   %v0{0}=[%p0,%sysfpen,ld0]   to   %v0{0}=[ld0]
+    # in the decoded trace: a MISSED dependency, and one R7 convicts
+    # directly, since a pending write to p0 must resolve before the load may
+    # proceed.  Unbound, the row keeps what it published before.
+    if (const_name in ISA_VEC_STRUCT_SEQUENTIAL_LOAD_INSNS.get(info.key,
+                                                               set())
+            or const_name in ISA_VEC_STRUCT_INTERLEAVED_LOAD_INSNS.get(
+                info.key, set())
+            or const_name in ISA_VEC_STRUCT_INTERLEAVED_STORE_INSNS.get(
+                info.key, set())):
+        return (None, True)
     if const_name in ISA_DEP_PASSTHROUGH_LOAD_INSNS.get(info.key, set()):
         return ("dep_passthrough", True)
     if const_name in ISA_DEP_PASSTHROUGH_STORE_INSNS.get(info.key, set()):

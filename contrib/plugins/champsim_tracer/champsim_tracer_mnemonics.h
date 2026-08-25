@@ -236,7 +236,11 @@ typedef struct InsnFields {
      * @has_reg_deps true -> encoder sets CST_INSN_FLAG_HAS_DEP_BLOCK
      * and appends n_dst + max_dep_stores ULEB masks; false (default)
      * -> consumers fall back to implicit all-to-all dataflow.
-     * Populated by the row's optional .dep_refine.
+     * Populated by the row's optional .dep_refine, which sets it only
+     * when it has an edge to state: publishing the all-to-all mask
+     * explicitly costs bytes to repeat what the reader already
+     * assumes, and cst_decode collapses the two cases to the same
+     * rendering (cst_decode_main.cc, `effective`).
      *
      * Bit layout inside each register/load mask:
      *   bits [0, n_src_regs)                          src_reg[i]
@@ -395,9 +399,10 @@ typedef void (*InsnRefineFn)(const struct qemu_plugin_insn_info *info,
  * `.refine` populated, then writes dst_dep_mask[] /
  * store_data_dep_mask[], sets n_dep_stores, flips has_reg_deps.
  * Refiner library is small and shared (champsim_tracer_mnemonic_
- * tables.c).  .dep_refine NULL -> no HAS_REG block -> consumer uses
- * the legacy implicit all-to-all fallback (the audit coverage report
- * flags these).  Runs once per unique PC at template build, not hot.
+ * tables.c).  .dep_refine NULL -> no HAS_REG block, which the format
+ * defines as the all-to-all over-approximation, so a row states an
+ * edge or it states nothing -- there is no third thing to write out.
+ * Runs once per unique PC at template build, not hot.
  */
 typedef void (*InsnDepRefineFn)(const struct qemu_plugin_insn_info *info,
                                 InsnFields *fields);
@@ -410,8 +415,6 @@ typedef void (*InsnDepRefineFn)(const struct qemu_plugin_insn_info *info,
  * A small complementary set covers the full surface; the audit
  * classifier picks one refiner per Capstone id handling all variants.
  */
-void dep_all_to_all(const struct qemu_plugin_insn_info *info,
-                    InsnFields *fields);
 void dep_passthrough(const struct qemu_plugin_insn_info *info,
                      InsnFields *fields);
 void dep_lea(const struct qemu_plugin_insn_info *info,
@@ -420,14 +423,8 @@ void dep_x86_stack_push(const struct qemu_plugin_insn_info *info,
                         InsnFields *fields);
 void dep_x86_stack_pop(const struct qemu_plugin_insn_info *info,
                        InsnFields *fields);
-void dep_vec_struct_load(const struct qemu_plugin_insn_info *info,
-                         InsnFields *fields);
 void dep_vec_struct_store(const struct qemu_plugin_insn_info *info,
                           InsnFields *fields);
-void dep_vec_struct_load_interleaved(
-    const struct qemu_plugin_insn_info *info, InsnFields *fields);
-void dep_vec_struct_store_interleaved(
-    const struct qemu_plugin_insn_info *info, InsnFields *fields);
 
 /*
  * Instruction-level vector lane shape from the Capstone operand

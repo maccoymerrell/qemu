@@ -174,6 +174,97 @@ uint64_t g_h_static_unbounded = 0;     /* sum of n_helper_unbounded */
 uint64_t g_h_static_calls   = 0;       /* translated insns calling a helper */
 struct qemu_plugin_scoreboard *g_h_sb[3] = {nullptr, nullptr, nullptr};
 bool g_h_sb_failed = false;
+/*
+ * The PER-REFINER arm -- the measurement the retirement verdict is made of.
+ *
+ * The question is not "is .dep_refine right".  It is, per refiner: does
+ * anything downstream lose an edge if the row stops carrying it.  There are
+ * two ways a row can be losable and they are counted apart, because they have
+ * different proofs:
+ *
+ *   INERT   the refiner published exactly what a consumer assumes when there
+ *           is no HAS_REG block at all -- every destination depending on every
+ *           input, every stored value depending on every input, and the same
+ *           memop shape the operand walk left.  The wire contract says a
+ *           missing block means precisely that (champsim_tracer_mnemonics.h:
+ *           "false (default) -> consumers fall back to implicit all-to-all
+ *           dataflow"), so such a row costs bytes and states nothing.  This
+ *           is decidable WITHOUT the IR: it is a property of the refiner's
+ *           own output against the format's own default.
+ *   NARROWS the shape is unchanged but at least one mask is a proper SUBSET
+ *           of all-inputs.  An edge exists that the default does not have,
+ *           so the row is load-bearing unless something else states it.
+ *   RESHAPES the refiner changed the memop shape itself -- added store slots
+ *           (a push's implicit stores), removed load slots (an address
+ *           compute's phantom load).  The default cannot express a shape it
+ *           was never given; these rows are load-bearing by construction.
+ *   WIDENS  a mask carries a bit the all-inputs mask does not.  That is not a
+ *           refinement of anything and would be a defect; counted so that a
+ *           zero here is measured rather than assumed.
+ *
+ * The second decode runs with the refiner WITHHELD (dep_refine_set_suppressed)
+ * rather than by reimplementing the default here, so the two sides differ in
+ * exactly one thing: whether the refiner ran.
+ */
+struct RefTally {
+    uint64_t rows;
+    uint64_t inert;        /* published the default explicitly: bytes for nothing */
+    uint64_t silent;       /* published no block at all: costs nothing, says nothing */
+    uint64_t narrows;
+    uint64_t reshapes;
+    uint64_t widens;
+    uint64_t h_class[3];   /* the CP-H model of the same instruction */
+    uint64_t ma_agree, ma_disagree;   /* address provenance vs the emitters */
+    uint64_t md_agree, md_disagree;   /* store-data provenance              */
+    uint64_t mu_agree, mu_disagree;   /* load-to-use edge                   */
+};
+GHashTable *g_reftally = nullptr;      /* char* -> RefTally* */
+/*
+ * The SHAPE the operand walk handed each refiner, tallied per refiner.
+ *
+ * A verdict of INERT says the row stated nothing; it does not say why, and
+ * the two whys have different remedies.  A refiner can publish the default
+ * because the instruction genuinely has nothing to narrow, or because its
+ * own shape precondition did not hold and it bailed -- and a refiner whose
+ * precondition never holds is not imprecise, it is unreachable.  The shape
+ * is recorded rather than the predicate re-tested, so the evidence is what
+ * the walk produced and not a second copy of the refiner's own reasoning.
+ */
+GHashTable *g_refshape = nullptr;      /* char* -> count */
+const char *g_cur_refiner = nullptr;   /* set for the duration of one insn */
+
+RefTally *reftally_for(const char *name)
+{
+    if (!name) {
+        return nullptr;
+    }
+    if (!g_reftally) {
+        g_reftally = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                           g_free, g_free);
+    }
+    RefTally *t = (RefTally *)g_hash_table_lookup(g_reftally, name);
+    if (!t) {
+        t = g_new0(RefTally, 1);
+        g_hash_table_insert(g_reftally, g_strdup(name), t);
+    }
+    return t;
+}
+
+uint64_t all_inputs_of(const InsnFields *f)
+{
+    uint64_t m = 0;
+    for (uint8_t i = 0; i < f->n_src_regs; i++) {
+        m |= (uint64_t)1 << i;
+    }
+    for (uint8_t i = 0; i < f->max_dep_loads; i++) {
+        m |= (uint64_t)1 << (f->n_src_regs + i);
+    }
+    if (f->has_immediate) {
+        m |= (uint64_t)1 << (f->n_src_regs + f->max_dep_loads);
+    }
+    return m;
+}
+
 uint64_t g_m_nostatus  = 0;  /* status refused outright */
 /* Truncation census.  STATUS section 5 records 0.011%/0.001% as a FLOOR:
  * these count what this workload actually hit, per instruction and as a
@@ -704,8 +795,10 @@ void score_memop_deps(const struct qemu_plugin_tb *tb, size_t idx,
         diff_prov(ir_addr, tr_addr, store ? "staddr" : "ldaddr", sig);
         if (sig->len == mnem_len) {
             g_ma_agree++;
+            if (RefTally *rt = reftally_for(g_cur_refiner)) rt->ma_agree++;
         } else {
             g_ma_disagree++;
+            if (RefTally *rt = reftally_for(g_cur_refiner)) rt->ma_disagree++;
             tally(&g_masigs, sig->str);
         }
         g_string_free(sig, TRUE);
@@ -752,8 +845,10 @@ void score_memop_deps(const struct qemu_plugin_tb *tb, size_t idx,
         diff_prov(ir_data, tr_data, "stdata", sig);
         if (sig->len == mnem_len) {
             g_md_agree++;
+            if (RefTally *rt = reftally_for(g_cur_refiner)) rt->md_agree++;
         } else {
             g_md_disagree++;
+            if (RefTally *rt = reftally_for(g_cur_refiner)) rt->md_disagree++;
             tally(&g_mdsigs, sig->str);
         }
         g_string_free(sig, TRUE);
@@ -838,10 +933,12 @@ void score_memop_deps(const struct qemu_plugin_tb *tb, size_t idx,
             }
             if (ir_use == tr_use) {
                 g_mu_agree++;
+                if (RefTally *rt = reftally_for(g_cur_refiner)) rt->mu_agree++;
             } else {
                 char sig[192];
 
                 g_mu_disagree++;
+                if (RefTally *rt = reftally_for(g_cur_refiner)) rt->mu_disagree++;
                 snprintf(sig, sizeof sig, "%s  ir-load-use=%d tracer=%d",
                          info->mnemonic, (int)ir_use, (int)tr_use);
                 tally(&g_musigs, sig);
@@ -918,6 +1015,116 @@ void score_helper_model(const struct qemu_plugin_tb *tb, size_t idx,
         qemu_plugin_scoreboard_u64(g_h_sb[m]), 1);
 }
 
+/*
+ * One instruction's contribution to the per-refiner verdict.
+ *
+ * Two decodes of the same encoding, differing only in whether the row's
+ * refiner ran, and both taken here rather than borrowed from the template
+ * path -- the same reason the register and memop arms re-decode: the presence
+ * of the instrument must not change what the tracer builds.
+ */
+void score_refiner(const qemu_plugin_insn_info *info,
+                   const qemu_plugin_dataflow_status *st)
+{
+    const char *name = g_cur_refiner;
+
+    if (!name) {
+        return;
+    }
+    RefTally *t = reftally_for(name);
+    if (!t) {
+        return;
+    }
+    t->rows++;
+    if (st && st->helper_model < 3) {
+        t->h_class[st->helper_model]++;
+    }
+
+    InsnFieldsScratch on_s, off_s;
+    insn_fields_scratch_reset(&on_s);
+    decode_detail_to_generic(0, info, &on_s.f, nullptr);
+    dep_refine_set_suppressed(true);
+    insn_fields_scratch_reset(&off_s);
+    decode_detail_to_generic(0, info, &off_s.f, nullptr);
+    dep_refine_set_suppressed(false);
+
+    const InsnFields &on = on_s.f;
+    const InsnFields &off = off_s.f;
+
+    if (on.max_dep_loads != off.max_dep_loads ||
+        on.max_dep_stores != off.max_dep_stores ||
+        on.has_addr_deps != off.has_addr_deps) {
+        t->reshapes++;
+        char sig[128];
+        g_snprintf(sig, sizeof(sig),
+                   "%-34s ndst=%u nsrc=%u nload=%u nstore=%u",
+                   name, off.n_dst_regs, off.n_src_regs,
+                   off.max_dep_loads, off.max_dep_stores);
+        tally(&g_refshape, sig);
+        return;
+    }
+
+    /*
+     * Same shape.  The default a consumer applies to a row with no HAS_REG
+     * block is all-inputs on every destination and every stored value, so
+     * that is what the refiner's output is held against.
+     */
+    {
+        char sig[128];
+        g_snprintf(sig, sizeof(sig),
+                   "%-34s ndst=%u nsrc=%u nload=%u nstore=%u",
+                   name, off.n_dst_regs, off.n_src_regs,
+                   off.max_dep_loads, off.max_dep_stores);
+        tally(&g_refshape, sig);
+    }
+
+    const uint64_t dflt = all_inputs_of(&on);
+    bool narrower = false, wider = false;
+
+    for (uint8_t d = 0; d < on.n_dst_regs; d++) {
+        uint64_t m = on.dst_dep_mask[d];
+        if (m & ~dflt) {
+            wider = true;
+        }
+        if ((m & dflt) != dflt) {
+            narrower = true;
+        }
+    }
+    for (uint8_t k = 0; k < on.max_dep_stores && k < MAX_STORES; k++) {
+        uint64_t m = on.store_data_dep_mask[k];
+        if (m & ~dflt) {
+            wider = true;
+        }
+        if ((m & dflt) != dflt) {
+            narrower = true;
+        }
+    }
+    /*
+     * A row that publishes no block at all is INERT for the same reason a row
+     * publishing the default is: the consumer reads the same dependency set
+     * either way.  A refiner whose shape precondition did not hold takes
+     * this path, which is why the shape tally below is read beside it.
+     */
+    if (!on.has_reg_deps) {
+        /*
+         * Counted apart from INERT because the two have different costs.  A
+         * refiner that bailed published NO block, so the row spends no bytes
+         * to reach the reader's default; a refiner that published the
+         * default spent bytes to restate it.  Only the second is waste, and
+         * conflating them would let a harmless bail-out be quoted as one.
+         */
+        t->silent++;
+        return;
+    }
+    if (wider) {
+        t->widens++;
+    } else if (narrower) {
+        t->narrows++;
+    } else {
+        t->inert++;
+    }
+}
+
 } /* namespace */
 
 void irdf_note_insn(const struct qemu_plugin_tb *tb, size_t idx,
@@ -957,6 +1164,14 @@ void irdf_note_insn(const struct qemu_plugin_tb *tb, size_t idx,
         return;
     }
 
+    /*
+     * The refiner attribution is established BEFORE the memop arm, because
+     * that arm's verdicts are among the things being attributed: which
+     * refiner produced the store-data claim QEMU's emitters are being held
+     * against is the per-refiner half of the retirement question.
+     */
+    g_cur_refiner = dep_refine_name_for(info);
+
     /* The memop arm runs BEFORE the register arm's refusals, because none of
      * them applies to it -- see the counter block. */
     InsnFieldsScratch mem_s;
@@ -970,6 +1185,7 @@ void irdf_note_insn(const struct qemu_plugin_tb *tb, size_t idx,
      * defined over the instructions that did not need it.
      */
     score_helper_model(tb, idx, &st);
+    score_refiner(info, &st);
 
     if (st.n_calls > 0) {
         g_n_helper++;
@@ -1202,6 +1418,64 @@ void irdf_report(GString *report)
         dyn_tot += dyn[i];
         st_tot += g_h_static[i];
     }
+
+    /* --- the per-refiner verdict --- */
+    g_string_append_printf(report,
+            "\n--- .dep_refine, per refiner: what each row states over the "
+            "format's own default ---\n"
+            "INERT    the refiner published exactly what a consumer assumes "
+            "when a row carries NO dependency block: all-inputs on every "
+            "destination and every stored value, same memop shape.  Such a "
+            "row costs bytes and states nothing.\n"
+            "NARROWS  same shape, at least one mask a proper SUBSET of "
+            "all-inputs -- an edge the default does not have.\n"
+            "RESHAPES the refiner changed the memop shape (added a push's "
+            "implicit stores, removed an address-compute's phantom load).  "
+            "The default cannot express a shape it was never given.\n"
+            "WIDENS   a mask carrying a bit all-inputs does not.  Not a "
+            "refinement of anything; a zero here is measured, not assumed.\n"
+            "The h-EXACT/APPROX/OPAQUE columns are the CP-H model of the SAME "
+            "instructions -- what the emitter-stated model could say if the "
+            "row went away.\n"
+            "SILENT   the refiner bailed and published NO block.  Reaches the "
+            "same default, but spends no bytes doing it -- counted apart from "
+            "INERT because only INERT is waste.\n"
+            "%-30s %8s %8s %8s %8s %8s %7s | %8s %7s %8s\n",
+            "refiner", "rows", "inert", "silent", "narrows", "reshapes",
+            "widens", "h-EXACT", "h-APPRX", "h-OPAQUE");
+    if (g_reftally) {
+        GList *keys = g_hash_table_get_keys(g_reftally);
+        keys = g_list_sort(keys, (GCompareFunc)g_strcmp0);
+        for (GList *l = keys; l; l = l->next) {
+            const char *k = (const char *)l->data;
+            RefTally *t = (RefTally *)g_hash_table_lookup(g_reftally, k);
+            g_string_append_printf(report,
+                    "%-30s %8" PRIu64 " %8" PRIu64 " %8" PRIu64 " %8" PRIu64
+                    " %8" PRIu64 " %7" PRIu64 " | %8" PRIu64 " %7" PRIu64
+                    " %8" PRIu64 "\n",
+                    k, t->rows, t->inert, t->silent, t->narrows, t->reshapes,
+                    t->widens, t->h_class[0], t->h_class[1], t->h_class[2]);
+        }
+        g_string_append_printf(report,
+                "\nand the memop-dependency verdicts of the same rows, "
+                "against what QEMU's emitters stated:\n"
+                "%-34s %11s %11s %11s\n",
+                "refiner", "addr a/d", "sdata a/d", "load-use a/d");
+        for (GList *l = keys; l; l = l->next) {
+            const char *k = (const char *)l->data;
+            RefTally *t = (RefTally *)g_hash_table_lookup(g_reftally, k);
+            g_string_append_printf(report,
+                    "%-34s %5" PRIu64 "/%-5" PRIu64 " %5" PRIu64 "/%-5" PRIu64
+                    " %5" PRIu64 "/%-5" PRIu64 "\n",
+                    k, t->ma_agree, t->ma_disagree, t->md_agree,
+                    t->md_disagree, t->mu_agree, t->mu_disagree);
+        }
+        g_list_free(keys);
+    } else {
+        g_string_append_printf(report, "  (no row carried a refiner)\n");
+    }
+    dump_tally(report, g_refshape,
+               "the shape the operand walk handed each refiner");
 
     g_string_append_printf(report,
             "\n--- CP-H: how much of the dependency model the EMITTERS state ---\n"

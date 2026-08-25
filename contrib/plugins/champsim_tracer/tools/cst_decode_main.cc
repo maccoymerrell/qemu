@@ -1423,7 +1423,18 @@ void emit_disasm_trailing_meta(std::string &line, const DisasmContext &ctx,
         insn.insn_index_in_bb < insn.bb_template->insns.size()) {
         const cst::InsnTemplate &it =
             insn.bb_template->insns[insn.insn_index_in_bb];
-        if (it.has_reg_deps || it.has_addr_deps) {
+        /*
+         * Render whenever there is a sink, not only when the wire carried a
+         * block.  A template with no dependency block is not a template with
+         * no dependencies: the format defines that absence as the all-to-all
+         * over-approximation, and the annotation below already synthesises
+         * exactly that mask for any slot the wire left unstated.  Gating the
+         * whole annotation on the block's presence made an instruction that
+         * relies on the default look like one with nothing to say, which is
+         * the one reading the spec forbids.
+         */
+        if (!it.dst_regs.empty() || it.max_dep_stores > 0 ||
+            it.max_dep_loads > 0) {
             begin_item();
             emit_disasm_deps_annotation(line, it, insn, ctx);
         }

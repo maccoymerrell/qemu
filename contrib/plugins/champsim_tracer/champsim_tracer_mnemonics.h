@@ -70,6 +70,45 @@ typedef struct {
 } RegClassification;
 
 /*
+ * The same fact, keyed the other way round: one row per register in
+ * QEMU's GDB-stub namespace -- the namespace qemu_plugin_get_registers()
+ * reports and the one RegClassification.qemu_reg already names.
+ *
+ * RegClassification is keyed on a CAPSTONE enum value, which decides
+ * three things it has no business deciding.  A register QEMU carries
+ * but Capstone's enum cannot name has no row at all (on x86_64: mxcsr,
+ * fs_base/gs_base/k_gs_base, efer and the six x87 control/status words
+ * -- 12 registers QEMU holds exactly).  Which QEMU register's VALUE is
+ * published for a generic id was decided by Capstone enum ORDER, since
+ * the reverse index took "the first singleton row" walking that array.
+ * And two Capstone rows disagreeing about one register would each win
+ * wherever they were consulted.
+ *
+ * Keyed on QEMU there is one row per register, the unnamed registers
+ * have rows, and the disagreement cannot be expressed.  The
+ * Capstone-keyed table stays -- it is how a Capstone operand reaches a
+ * register -- but it is a ROUTE to these rows, cross-checked against
+ * them at install (qemu_reg_rows_install in champsim_tracer_decode.cc).
+ *
+ * Rows are auto-generated, sorted by (feature, name), and bisectable.
+ */
+enum QemuRegTier {
+    QREG_UNNAMED = 0,   /* QEMU carries it; no Capstone id names it */
+    QREG_ROUTED,        /* at least one Capstone register id maps here */
+};
+
+typedef struct {
+    const char *feature;
+    const char *name;
+    uint8_t     reg_id;                 /* GenericRegId, REG_NONE if none */
+    uint8_t     n_regs;                 /* non-zero for composite aliases */
+    uint8_t     regs[MAX_REG_ALIASES];  /* GenericRegId[] */
+    bool        is_int_flags;
+    uint16_t    cap_rows;               /* Capstone rows routing here */
+    uint8_t     tier;                   /* QemuRegTier */
+} QemuRegRow;
+
+/*
  * Decoded per-instruction generic fields.  In this header (not
  * champsim_tracer.h) so the C tables-TU refiners can mutate fields
  * without the rest of the tracer internals.
@@ -460,6 +499,10 @@ typedef struct {
 #include "champsim_tracer_mnemonics_aarch64.h"
 #include "champsim_tracer_mnemonics_riscv.h"
 #include "champsim_tracer_mnemonics_mips.h"
+#include "champsim_tracer_qemu_regs_x86.h"
+#include "champsim_tracer_qemu_regs_aarch64.h"
+#include "champsim_tracer_qemu_regs_riscv.h"
+#include "champsim_tracer_qemu_regs_mips.h"
 
 /* Classification table selectors (indexed by TraceISA).  Explicit
  * `extern` so the const namespace-scope arrays get external linkage
@@ -480,6 +523,24 @@ const unsigned isa_reg_class_size[] = {
     [TRACE_ISA_AARCH64] = AARCH64_REG_ENDING,
     [TRACE_ISA_RISCV]   = RISCV_REG_ENDING,
     [TRACE_ISA_MIPS]    = MIPS_REG_ENDING,
+};
+
+extern const QemuRegRow *const isa_qemu_regs[];
+const QemuRegRow *const isa_qemu_regs[] = {
+    [TRACE_ISA_UNKNOWN] = NULL,
+    [TRACE_ISA_X86]     = qemu_regs_x86,
+    [TRACE_ISA_AARCH64] = qemu_regs_aarch64,
+    [TRACE_ISA_RISCV]   = qemu_regs_riscv,
+    [TRACE_ISA_MIPS]    = qemu_regs_mips,
+};
+
+extern const unsigned isa_qemu_regs_count[];
+const unsigned isa_qemu_regs_count[] = {
+    [TRACE_ISA_UNKNOWN] = 0,
+    [TRACE_ISA_X86]     = (unsigned)qemu_regs_x86_count,
+    [TRACE_ISA_AARCH64] = (unsigned)qemu_regs_aarch64_count,
+    [TRACE_ISA_RISCV]   = (unsigned)qemu_regs_riscv_count,
+    [TRACE_ISA_MIPS]    = (unsigned)qemu_regs_mips_count,
 };
 
 extern const InsnClassification *const isa_insn_class[];
@@ -504,6 +565,8 @@ const unsigned isa_insn_class_size[] = {
 
 extern const RegClassification *const isa_reg_class[TRACE_ISA_MIPS + 1];
 extern const unsigned isa_reg_class_size[TRACE_ISA_MIPS + 1];
+extern const QemuRegRow *const isa_qemu_regs[TRACE_ISA_MIPS + 1];
+extern const unsigned isa_qemu_regs_count[TRACE_ISA_MIPS + 1];
 extern const InsnClassification *const isa_insn_class[TRACE_ISA_MIPS + 1];
 extern const unsigned isa_insn_class_size[TRACE_ISA_MIPS + 1];
 

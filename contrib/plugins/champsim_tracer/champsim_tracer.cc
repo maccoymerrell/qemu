@@ -11869,12 +11869,46 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     active_insn_table_size = isa_insn_class_size[trace_isa];
     active_reg_table = isa_reg_class[trace_isa];
     active_reg_table_size = isa_reg_class_size[trace_isa];
+    active_qemu_regs = isa_qemu_regs[trace_isa];
+    active_qemu_regs_count = isa_qemu_regs_count[trace_isa];
 
     /* Build the GenericRegId → QemuRegKey reverse index (needs the
-     * per-ISA reg table).  The multi-reg path (RISC-V V*M* tuples,
-     * future register groups) uses it to cover every constituent
-     * generic id, not just the leading one. */
+     * per-ISA QEMU register table).  The multi-reg path (RISC-V V*M*
+     * tuples, future register groups) uses it to cover every
+     * constituent generic id, not just the leading one. */
     build_qemu_reg_reverse_index();
+
+    /*
+     * The Capstone-keyed table is a ROUTE to the QEMU-keyed rows, not a
+     * second opinion about them.  Say so out loud at install: a
+     * disagreement means a stale or hand-edited table, and the
+     * generator already refuses to emit one.  Under CST_REG_INDEX_AUDIT
+     * also report whether re-anchoring the reverse index off QEMU moved
+     * any published register -- the instrument that makes "inert" a
+     * measurement rather than an assertion.
+     */
+    {
+        unsigned bad = qemu_reg_rows_check();
+        if (bad) {
+            fprintf(stderr, "champsim_tracer: %u capstone/QEMU register "
+                    "disagreements; the register tables are stale\n", bad);
+        }
+        if (getenv("CST_REG_INDEX_AUDIT")) {
+            unsigned drift = qemu_reg_reverse_index_drift();
+            fprintf(stderr, "champsim_tracer: reg-index audit: "
+                    "%u capstone/QEMU disagreements, %u reverse-index "
+                    "drifts, %u QEMU registers (%u reachable from a "
+                    "capstone operand)\n", bad, drift,
+                    active_qemu_regs_count,
+                    [] {
+                        unsigned n = 0;
+                        for (unsigned i = 0; i < active_qemu_regs_count; i++) {
+                            n += active_qemu_regs[i].tier == QREG_ROUTED;
+                        }
+                        return n;
+                    }());
+        }
+    }
 
     /* Pre-size the per-thread stats registry now, on the main thread,
      * before any vCPU runs.  This pins its backing buffer in the main

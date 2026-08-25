@@ -3873,10 +3873,22 @@ def qemu_riscv_reg_keys() -> dict[str, QemuRegKey]:
     return regs
 
 
+# MIPS' whole GDB-stub namespace is one feature and one XML file, so
+# unlike the other three it needs no synthesised additions: what
+# mips64-cpu.xml lists is what qemu_plugin_get_registers() reports.
+# qemu_mips_reg_key() below RENAMES into this namespace (Capstone's
+# HI0 -> `hi`, D<n> -> the `f<2n>`/`f<n>` pair member); this map is the
+# namespace ITSELF, which is what the QEMU-indexed table is keyed on.
+@lru_cache(maxsize=None)
+def qemu_mips_reg_keys() -> dict[str, QemuRegKey]:
+    return gdb_xml_reg_key_map(("mips64-cpu.xml",))
+
+
 QEMU_REG_KEYS = {
     "x86": qemu_x86_reg_keys,
     "aarch64": qemu_aarch64_reg_keys,
     "riscv": qemu_riscv_reg_keys,
+    "mips": qemu_mips_reg_keys,
 }
 
 
@@ -4377,6 +4389,206 @@ def apply_regs_one(info: IsaInfo) -> None:
 
 
 # ---------------------------------------------------------------------------
+# QEMU-indexed register tables
+#
+# The table above is keyed on a CAPSTONE register enum value and carries
+# a QEMU identity in each row.  That is backwards for everything except
+# the one path that arrives holding a Capstone operand: the CONTENT is
+# QEMU's -- .qemu_reg names a register in QEMU's GDB-stub namespace, the
+# same namespace qemu_plugin_get_registers() hands a plugin -- while the
+# KEY is a second decoder's enumeration.
+#
+# Three things follow from the key, and all three are measurable:
+#
+#  1. A register QEMU carries but Capstone's enum cannot NAME has no
+#     slot at all.  On x86_64 that is 12 registers, mxcsr and the x87
+#     control/status file (fctrl, ftag, fop, fioff, fiseg, fooff,
+#     foseg) among them -- state the ISA reads and writes, that QEMU
+#     holds exactly, and that no dependency edge can reach through this
+#     key.
+#  2. Which QEMU register's VALUE is published for a generic ID was
+#     decided by CAPSTONE ENUM ORDER: the plugin's reverse index takes
+#     "the first singleton row" walking the Capstone-indexed array.
+#  3. A Capstone row that disagreed with another row about the same
+#     QEMU register would simply win wherever it was consulted.  Keyed
+#     on QEMU there is one row per register and the disagreement cannot
+#     be expressed.
+#
+# So these rows invert the index: one row per register in QEMU's
+# namespace, sorted by (feature, name), carrying the generic ID.  The
+# Capstone-keyed table stays -- it is how a Capstone operand reaches a
+# register -- but it becomes a ROUTE to these rows rather than the
+# authority for their content, and the plugin cross-checks it against
+# them at install.
+# ---------------------------------------------------------------------------
+
+QREG_UNNAMED = 0
+QREG_ROUTED = 1
+
+
+@dataclass(frozen=True)
+class QemuRegRow:
+    feature: str
+    name: str
+    entry: RegEntry | None
+    cap_rows: tuple[str, ...]
+
+    @property
+    def tier(self) -> int:
+        return QREG_ROUTED if self.cap_rows else QREG_UNNAMED
+
+
+def qemu_reg_rows(info: IsaInfo) -> tuple[list[QemuRegRow], list[str]]:
+    """One row per QEMU register, plus the conflicts found building them.
+
+    A conflict is two Capstone rows naming the same QEMU register with
+    different generic content.  It is returned rather than raised so the
+    census can print every one; --apply refuses on a non-empty list,
+    because a table that cannot decide what a register IS must not be
+    emitted as though it had.
+    """
+    namespace = QEMU_REG_KEYS[info.key]()
+    by_key: dict[QemuRegKey, list[tuple[str, RegEntry]]] = {}
+    orphans: list[str] = []
+    known = set(namespace.values())
+    for const_name in enum_reg_constants(info):
+        entry = classify_reg(info, const_name)
+        if entry.ignored:
+            continue
+        key = qemu_reg_key(info, const_name)
+        if key is None:
+            continue
+        if key not in known:
+            # A Capstone row pointing at a register QEMU's namespace does
+            # not contain.  Reading it yields a null handle and a width-0
+            # field, so it is a defect, not a rounding error.
+            orphans.append(f"{const_name} -> {key.feature}:{key.name} "
+                           f"(not in QEMU's namespace)")
+            continue
+        by_key.setdefault(key, []).append((const_name, entry))
+
+    conflicts: list[str] = list(orphans)
+    rows: list[QemuRegRow] = []
+    for key in sorted(known, key=lambda k: (k.feature, k.name)):
+        routed = by_key.get(key, [])
+        entry = None
+        if routed:
+            distinct = {e for _, e in routed}
+            if len(distinct) > 1:
+                conflicts.append(
+                    f"{key.feature}:{key.name} claimed differently by "
+                    + ", ".join(f"{c}={e.primary}"
+                                + (f"+{list(e.aliases)}" if e.aliases else "")
+                                for c, e in sorted(routed)))
+            entry = routed[0][1]
+        rows.append(QemuRegRow(key.feature, key.name, entry,
+                               tuple(sorted(c for c, _ in routed))))
+    return rows, conflicts
+
+
+def format_qemu_reg_row(row: QemuRegRow) -> str:
+    tier = "QREG_ROUTED" if row.tier == QREG_ROUTED else "QREG_UNNAMED"
+    if row.entry is None:
+        body = ".reg_id = REG_NONE"
+    elif row.entry.aliases:
+        body = (f".reg_id = {row.entry.primary}, "
+                f".n_regs = {len(row.entry.aliases)}, "
+                f".regs = {{ {', '.join(row.entry.aliases)} }}")
+    else:
+        body = f".reg_id = {row.entry.primary}"
+    if row.entry is not None and row.entry.is_int_flags:
+        body += ", .is_int_flags = true"
+    comment = (f"  /* {len(row.cap_rows)} capstone row"
+               f"{'' if len(row.cap_rows) == 1 else 's'} */"
+               if row.cap_rows else "")
+    return (f"    {{ .feature = {c_string(row.feature)}, "
+            f".name = {c_string(row.name)}, "
+            f"{body}, .cap_rows = {len(row.cap_rows)}, "
+            f".tier = {tier} }},{comment}")
+
+
+def qemu_regs_header_text(info: IsaInfo, rows: list[QemuRegRow]) -> str:
+    guard = f"CHAMPSIM_TRACER_QEMU_REGS_{info.key.upper()}_H"
+    routed = sum(1 for r in rows if r.tier == QREG_ROUTED)
+    classified = sum(1 for r in rows if r.entry is not None)
+    lines = [
+        f"#ifndef {guard}",
+        f"#define {guard}",
+        "",
+        "/*",
+        f" * QEMU-indexed register table for {info.key} -- auto-generated by",
+        f" * {Path(__file__).name} --qemu-regs.  Do not hand-edit a row.",
+        " *",
+        " * One row per register in QEMU's GDB-stub namespace -- the",
+        " * namespace qemu_plugin_get_registers() reports -- sorted by",
+        " * (feature, name) so a consumer can bisect.  This is the",
+        " * authority for what generic dependency slot a register is;",
+        " * the Capstone-keyed table is a route to these rows and is",
+        " * cross-checked against them at install.",
+        " *",
+        " * .tier says whether the Capstone key can reach the row:",
+        " *   QREG_ROUTED   at least one Capstone register id maps here",
+        " *   QREG_UNNAMED  QEMU carries the register and Capstone's enum",
+        " *                 has no id for it, so no Capstone-fed operand",
+        " *                 can ever name it.  These rows are reachable",
+        " *                 only by QEMU identity.",
+        " *",
+        " * SPDX-License-Identifier: GPL-2.0-or-later",
+        " * Author: Maccoy Merrell",
+        " */",
+        "",
+        f"/* {info.key}: {len(rows)} QEMU registers, {routed} reachable from",
+        f" * Capstone, {len(rows) - routed} reachable only by QEMU identity,",
+        f" * {classified} carrying a generic id. */",
+        f"static const QemuRegRow qemu_regs_{info.key}[] = {{",
+    ]
+    lines.extend(format_qemu_reg_row(row) for row in rows)
+    lines.append("};")
+    lines.append("")
+    lines.append(f"static const size_t qemu_regs_{info.key}_count =")
+    lines.append(f"    sizeof(qemu_regs_{info.key}) / "
+                 f"sizeof(qemu_regs_{info.key}[0]);")
+    lines.append("")
+    lines.append(f"#endif /* {guard} */")
+    return "\n".join(lines) + "\n"
+
+
+def qemu_regs_census(info: IsaInfo, rows: list[QemuRegRow],
+                     conflicts: list[str], max_lines: int = 40) -> int:
+    routed = [r for r in rows if r.tier == QREG_ROUTED]
+    unnamed = [r for r in rows if r.tier == QREG_UNNAMED]
+    print(f"===== {info.key}: QEMU-indexed registers =====")
+    print(f"QEMU namespace: {len(rows)} registers")
+    print(f"  reachable from a Capstone operand: {len(routed)}")
+    print(f"  reachable ONLY by QEMU identity:   {len(unnamed)}")
+    for row in unnamed[:max_lines]:
+        print(f"      {row.feature}:{row.name}")
+    if len(unnamed) > max_lines:
+        print(f"      ... {len(unnamed) - max_lines} more")
+    fanin = sorted(routed, key=lambda r: -len(r.cap_rows))[:5]
+    print("  widest Capstone fan-in: "
+          + ", ".join(f"{r.name}={len(r.cap_rows)}" for r in fanin))
+    print(f"CONFLICTS (a register two Capstone rows describe differently, "
+          f"or a row naming no QEMU register): {len(conflicts)}")
+    for line in conflicts[:max_lines]:
+        print(f"    {line}")
+    return len(conflicts)
+
+
+def apply_qemu_regs_one(info: IsaInfo) -> int:
+    rows, conflicts = qemu_reg_rows(info)
+    if conflicts:
+        print(f"{info.key}: REFUSING to write -- {len(conflicts)} conflicts")
+        for line in conflicts:
+            print(f"    {line}")
+        return len(conflicts)
+    out = PLUGIN_DIR / f"champsim_tracer_qemu_regs_{info.key}.h"
+    out.write_text(qemu_regs_header_text(info, rows))
+    print(f"wrote {out}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # QEMU decode identity (decodetree targets)
 #
 # The rows above are keyed on a Capstone instruction id: what a
@@ -4713,6 +4925,9 @@ def main() -> int:
     parser.add_argument("--apply", action="store_true", help="rewrite mnemonic tables in place")
     parser.add_argument("--regs", action="store_true", help="audit/rewrite register tables instead of instruction tables")
     parser.add_argument("--max-lines", type=int, default=40, help="maximum diff rows per section")
+    parser.add_argument("--qemu-regs", action="store_true",
+                        help="census/regenerate the QEMU-indexed register tables "
+                             "(one row per register in QEMU's GDB-stub namespace)")
     parser.add_argument("--qemu-ident", action="store_true",
                         help="census/regenerate tables keyed on QEMU's own decode identity "
                              "(decodetree targets only)")
@@ -4728,6 +4943,16 @@ def main() -> int:
         parser.error("--qemu-ident needs --build-dir")
     keys = args.isa or sorted(ISAS)
     total = 0
+    if args.qemu_regs:
+        for key in keys:
+            info = ISAS[key]
+            rows, conflicts = qemu_reg_rows(info)
+            if args.diff:
+                total += qemu_regs_census(info, rows, conflicts,
+                                          max_lines=args.max_lines)
+            if args.apply:
+                total += apply_qemu_regs_one(info)
+        return 1 if total else 0
     if args.qemu_ident:
         for key in keys:
             if key not in QEMU_IDENT_TARGETS:

@@ -1502,6 +1502,9 @@ extern const InsnClassification *active_insn_table;
 extern unsigned active_insn_table_size;
 extern const RegClassification *active_reg_table;
 extern unsigned active_reg_table_size;
+/* The same registers keyed on QEMU identity; see QemuRegRow. */
+extern const QemuRegRow *active_qemu_regs;
+extern unsigned active_qemu_regs_count;
 
 /* Plugin configuration: parsed from -plugin args, immutable after
  * qemu_plugin_install. */
@@ -1728,6 +1731,17 @@ bool decode_synthetic_ea(const qemu_plugin_insn_info *info,
  * after active_reg_table is set; idempotent.  Defined in
  * champsim_tracer_decode.cc. */
 void build_qemu_reg_reverse_index(void);
+
+/* Look a register up BY QEMU IDENTITY -- the route a QEMU-fed operand
+ * takes, with no Capstone enum in between.  Defined in
+ * champsim_tracer_decode.cc. */
+const QemuRegRow *qemu_reg_row_find(const char *feature, const char *name);
+
+/* Cross-check the Capstone-keyed rows against the QEMU-keyed ones, and
+ * report whether the reverse index's winner moved when it was
+ * re-anchored off QEMU.  Both return a count of problems found. */
+unsigned qemu_reg_rows_check(void);
+unsigned qemu_reg_reverse_index_drift(void);
 
 /*
  * Wide regfile snapshot: opaque TLS scratch keyed by the active reg

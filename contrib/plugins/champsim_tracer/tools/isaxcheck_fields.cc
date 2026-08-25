@@ -119,15 +119,21 @@ bool isax_fields_init(const char *isa_name)
         return false;
     }
 
-    /* The same four assignments champsim_tracer.cc makes at install time,
+    /* The same assignments champsim_tracer.cc makes at install time,
      * followed by the same reverse-index build.  Kept in this order and
-     * with no additions on purpose: if the plugin grows a fifth thing it
-     * must set before decoding, the difference belongs here, visibly. */
+     * with no additions on purpose: if the plugin grows another thing it
+     * must set before decoding, the difference belongs here, visibly.
+     * The QEMU-indexed table is one such addition: since the reverse
+     * index is built off it, omitting it here would leave every generic
+     * id without a QEMU register and silently change what this tool
+     * sees relative to the plugin. */
     trace_isa = isa;
     active_insn_table = isa_insn_class[isa];
     active_insn_table_size = isa_insn_class_size[isa];
     active_reg_table = isa_reg_class[isa];
     active_reg_table_size = isa_reg_class_size[isa];
+    active_qemu_regs = isa_qemu_regs[isa];
+    active_qemu_regs_count = isa_qemu_regs_count[isa];
     build_qemu_reg_reverse_index();
     table_ready = active_insn_table && active_reg_table;
     return table_ready;

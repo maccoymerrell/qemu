@@ -53,42 +53,200 @@ static QemuRegKey g_qemu_reg_by_gen[REG_ID_COUNT];
  */
 static bool g_qemu_reg_gen_ambiguous[REG_ID_COUNT];
 
+/*
+ * The QEMU-indexed register table for the running ISA: one row per
+ * register in QEMU's GDB-stub namespace, sorted by (feature, name).
+ * Set beside active_reg_table at install.
+ */
+const QemuRegRow *active_qemu_regs = nullptr;
+unsigned          active_qemu_regs_count = 0;
+
+static int qemu_reg_row_cmp(const char *feature, const char *name,
+                            const QemuRegRow *row)
+{
+    int c = strcmp(feature, row->feature);
+    return c ? c : strcmp(name, row->name);
+}
+
+/*
+ * Find a register BY QEMU IDENTITY -- no Capstone enum involved.
+ *
+ * This is the lookup a QEMU-fed operand wants: the IR path resolves a
+ * TCG global or an env offset to a (feature, name) pair and asks what
+ * generic slot it is, without a second decoder's register enumeration
+ * standing in between.  Rows are sorted, so it bisects.
+ */
+const QemuRegRow *qemu_reg_row_find(const char *feature, const char *name)
+{
+    if (!active_qemu_regs || !feature || !name) {
+        return nullptr;
+    }
+    unsigned lo = 0, hi = active_qemu_regs_count;
+    while (lo < hi) {
+        unsigned mid = lo + (hi - lo) / 2;
+        int c = qemu_reg_row_cmp(feature, name, &active_qemu_regs[mid]);
+        if (c == 0) {
+            return &active_qemu_regs[mid];
+        }
+        if (c < 0) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    return nullptr;
+}
+
+/*
+ * Cross-check: every Capstone row that names a QEMU register must agree
+ * with that register's own row about what it IS.
+ *
+ * Without this the Capstone-keyed table is a second, independent
+ * statement of the same fact, and a defect in it reaches the wire
+ * silently wherever it happens to be consulted.  With it the
+ * Capstone key is a ROUTE and the QEMU row is the authority: a
+ * divergence is a build-time fact the generator already refuses to
+ * emit (qemu_reg_rows in champsim_tracer_mnemonic_audit.py), and this
+ * is the runtime restatement of the same guard against a stale or
+ * hand-edited table.  Returns the number of disagreements; the caller
+ * reports rather than silently continuing.
+ */
+unsigned qemu_reg_rows_check(void)
+{
+    unsigned bad = 0;
+    if (!active_reg_table || !active_qemu_regs) {
+        return 0;
+    }
+    for (unsigned i = 0; i < active_reg_table_size; i++) {
+        const RegClassification *rc = &active_reg_table[i];
+        if (!qemu_reg_key_valid(&rc->qemu_reg)) {
+            continue;
+        }
+        const QemuRegRow *row = qemu_reg_row_find(rc->qemu_reg.feature,
+                                                  rc->qemu_reg.name);
+        if (!row) {
+            fprintf(stderr, "champsim_tracer: capstone reg row %u names "
+                    "%s:%s, which QEMU does not carry\n",
+                    i, rc->qemu_reg.feature, rc->qemu_reg.name);
+            bad++;
+            continue;
+        }
+        if (row->reg_id != rc->reg_id || row->n_regs != rc->n_regs ||
+            row->is_int_flags != rc->is_int_flags ||
+            (rc->n_regs &&
+             memcmp(row->regs, rc->regs, rc->n_regs) != 0)) {
+            fprintf(stderr, "champsim_tracer: capstone reg row %u and "
+                    "QEMU register %s:%s disagree (%u vs %u)\n",
+                    i, rc->qemu_reg.feature, rc->qemu_reg.name,
+                    rc->reg_id, row->reg_id);
+            bad++;
+        }
+    }
+    return bad;
+}
+
+/*
+ * Build the GenericRegId -> QemuRegKey reverse index FROM THE QEMU
+ * TABLE.
+ *
+ * It used to be built by walking the Capstone-indexed array and taking
+ * the first singleton row, which made Capstone's ENUM ORDER decide
+ * which QEMU register's value is published for a generic id -- x86
+ * REG_GPR0 is named by AH, AL, AX, EAX and RAX, and the winner was
+ * whichever the enum listed first.  Walking QEMU's namespace instead
+ * makes the choice QEMU's, in QEMU's own (feature, name) order, and it
+ * reaches registers no Capstone id names at all.
+ *
+ * The ambiguity rule is unchanged and still load-bearing: where several
+ * DIFFERENT QEMU registers fold into one generic id (RISC-V REG_FCSR
+ * carries fflags, frm, vxrm and vxsat) no singleton is correct, and
+ * qemu_reg_for_row falls back to the row the decode actually matched.
+ */
 void build_qemu_reg_reverse_index(void)
 {
     for (unsigned i = 0; i < REG_ID_COUNT; i++) {
         g_qemu_reg_by_gen[i] = QemuRegKey{};
         g_qemu_reg_gen_ambiguous[i] = false;
     }
-    if (!active_reg_table || active_reg_table_size == 0) {
+    if (!active_qemu_regs || active_qemu_regs_count == 0) {
         return;
+    }
+    for (unsigned i = 0; i < active_qemu_regs_count; i++) {
+        const QemuRegRow *row = &active_qemu_regs[i];
+        if (row->n_regs != 0) {
+            /* Composite rows do not stand for one register's value;
+             * their constituents are named by their own rows. */
+            continue;
+        }
+        if (row->reg_id == REG_NONE || row->reg_id >= REG_ID_COUNT) {
+            continue;
+        }
+        QemuRegKey key = { row->feature, row->name };
+        if (!qemu_reg_key_valid(&g_qemu_reg_by_gen[row->reg_id])) {
+            g_qemu_reg_by_gen[row->reg_id] = key;
+        } else if (!cst_str_eq(g_qemu_reg_by_gen[row->reg_id].feature,
+                               key.feature) ||
+                   !cst_str_eq(g_qemu_reg_by_gen[row->reg_id].name,
+                               key.name)) {
+            g_qemu_reg_gen_ambiguous[row->reg_id] = true;
+        }
+    }
+}
+
+/*
+ * The pre-re-index build, kept as the instrument that PROVES the
+ * re-index changed no published value: it reconstructs the
+ * Capstone-enum-order winner and reports every generic id whose winner
+ * moved.  A non-zero count is a wire-visible change and must be named,
+ * not absorbed.
+ */
+unsigned qemu_reg_reverse_index_drift(void)
+{
+    QemuRegKey by_gen[REG_ID_COUNT] = {};
+    bool ambiguous[REG_ID_COUNT] = {};
+    unsigned drift = 0;
+
+    if (!active_reg_table || active_reg_table_size == 0) {
+        return 0;
     }
     for (unsigned i = 0; i < active_reg_table_size; i++) {
         const RegClassification *rc = &active_reg_table[i];
-        if (rc->n_regs != 0) {
-            /* Multi-reg rows don't carry a singleton QemuRegKey
-             * themselves — their constituent generic IDs are
-             * supplied by other rows that have the matching
-             * .reg_id with .qemu_reg set. */
+        if (rc->n_regs != 0 || !qemu_reg_key_valid(&rc->qemu_reg) ||
+            rc->reg_id >= REG_ID_COUNT) {
             continue;
         }
-        if (!qemu_reg_key_valid(&rc->qemu_reg)) {
-            continue;
-        }
-        if (rc->reg_id >= REG_ID_COUNT) {
-            continue;
-        }
-        /* First singleton row wins — Capstone aliases (x86
-         * AH/AL/AX/EAX/RAX → REG_GPR0) share one QemuRegKey; any is
-         * correct for value reads. */
-        if (!qemu_reg_key_valid(&g_qemu_reg_by_gen[rc->reg_id])) {
-            g_qemu_reg_by_gen[rc->reg_id] = rc->qemu_reg;
-        } else if (!cst_str_eq(g_qemu_reg_by_gen[rc->reg_id].feature,
+        if (!qemu_reg_key_valid(&by_gen[rc->reg_id])) {
+            by_gen[rc->reg_id] = rc->qemu_reg;
+        } else if (!cst_str_eq(by_gen[rc->reg_id].feature,
                                rc->qemu_reg.feature) ||
-                   !cst_str_eq(g_qemu_reg_by_gen[rc->reg_id].name,
+                   !cst_str_eq(by_gen[rc->reg_id].name,
                                rc->qemu_reg.name)) {
-            g_qemu_reg_gen_ambiguous[rc->reg_id] = true;
+            ambiguous[rc->reg_id] = true;
         }
     }
+    for (unsigned g = 0; g < REG_ID_COUNT; g++) {
+        bool old_valid = qemu_reg_key_valid(&by_gen[g]);
+        bool now_valid = qemu_reg_key_valid(&g_qemu_reg_by_gen[g]);
+        bool same = (old_valid == now_valid) &&
+                    ambiguous[g] == g_qemu_reg_gen_ambiguous[g] &&
+                    (!old_valid ||
+                     (cst_str_eq(by_gen[g].feature,
+                                 g_qemu_reg_by_gen[g].feature) &&
+                      cst_str_eq(by_gen[g].name,
+                                 g_qemu_reg_by_gen[g].name)));
+        if (!same) {
+            fprintf(stderr, "champsim_tracer: reg-index drift on generic %u: "
+                    "capstone-order %s:%s (amb=%d) vs qemu-order %s:%s "
+                    "(amb=%d)\n", g,
+                    old_valid ? by_gen[g].feature : "-",
+                    old_valid ? by_gen[g].name : "-", ambiguous[g],
+                    now_valid ? g_qemu_reg_by_gen[g].feature : "-",
+                    now_valid ? g_qemu_reg_by_gen[g].name : "-",
+                    g_qemu_reg_gen_ambiguous[g]);
+            drift++;
+        }
+    }
+    return drift;
 }
 
 /*

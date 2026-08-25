@@ -1698,7 +1698,7 @@ x86_64 R-rd-missing fsts +ss
 x86_64 R-wr-missing fldcw +fpsw
 x86_64 R-wr-missing fnsave +fpsw
 x86_64 R-wr-missing fnstcw +fpsw
-x86_64 R-wr-missing fnstenv +fpcw,fpsw
+x86_64 R-wr-missing fnstenv +fpsw
 x86_64 R-wr-missing fnstsw +fpsw
 x86_64 R-wr-missing frstor +fpsw
 

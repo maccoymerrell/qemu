@@ -2617,11 +2617,15 @@ x86_64 FR-rd-missing ficoms +REG_SEG5
 # does pass &env->fp_status to int64_to_floatx80, and LLVM, which names
 # FPCW on the identical `fildl`, does not name it here.
 #
-# `FR-wr-missing fnstenv +REG_FCSR,REG_FPCW` is NOT an LLVM artefact: SDM
-# Vol.1 8.1.10 has FNSTENV mask every FP exception after the save, and
-# do_fstenv() (target/i386/tcg/fpu_helper.c) reads env->fpuc and assigns
-# nothing.  It is tracked as a QEMU defect, not a decode one; the row
-# moves the day the helper does.
+# `FR-wr-missing fnstenv +REG_FCSR` is what is LEFT of a row that used to
+# read `+REG_FCSR,REG_FPCW`.  The control-word half was a QEMU defect, not
+# a decode one: SDM Vol.1 8.1.10 has FNSTENV mask every FP exception after
+# the save and do_fstenv() (target/i386/tcg/fpu_helper.c) assigned nothing,
+# so the helper now sets the masks and the boundary records the write --
+# see tests/tcg/i386/test-i386-fnstenv.c, which fails on the old helper and
+# passes on the new one and on real hardware.  The REG_FCSR half is LLVM's:
+# it marks FNSTENV as defining FPSW, and neither the SDM nor QEMU has the
+# instruction modify the status word.
 x86_64 FM-miss-store cldemote
 x86_64 FM-miss-store prefetchwt1
 x86_64 FR-rd-missing fld +REG_FPCW
@@ -2640,7 +2644,7 @@ x86_64 FR-rd-missing fstpt +REG_FPCW,REG_SEG1
 x86_64 FR-rd-missing fxch +REG_FPCW
 x86_64 FR-rd-phantom fbld +REG_FCSR,REG_FPCW
 x86_64 FR-wr-missing fldcw +REG_FCSR
-x86_64 FR-wr-missing fnstenv +REG_FCSR,REG_FPCW
+x86_64 FR-wr-missing fnstenv +REG_FCSR
 
 
 # (c) THE TRACER'S OWN CONTROL-FLOW TAXONOMY, which is a decision rather

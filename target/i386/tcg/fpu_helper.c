@@ -2487,6 +2487,23 @@ static void do_fstenv(X86Access *ac, target_ulong ptr, int data32)
         access_stw(ac, ptr + 10, env->fpdp);
         access_stw(ac, ptr + 12, env->fpds);
     }
+
+    /*
+     * SDM Vol.1 8.1.10: after saving the environment, FSTENV / FNSTENV
+     * mask ALL floating-point exceptions.  The instruction exists so an
+     * exception handler can save the state it was entered on and then run
+     * its own FP code without the still-pending condition re-signalling,
+     * and that only works if the masks are set on the way out.  The saved
+     * IMAGE carries the control word as it was, which is why this comes
+     * after the stores and not before them: FLDENV of that image restores
+     * the guest's original masks.
+     *
+     * FSAVE / FNSAVE reach this through do_fsave() and then re-initialise
+     * the unit outright (do_fninit sets fpuc to 0x37f), so the assignment
+     * is redundant there rather than wrong.  FXSAVE does NOT come through
+     * here and correctly leaves the control word alone.
+     */
+    cpu_set_fpuc(env, env->fpuc | FPUC_EM);
 }
 
 void helper_fstenv(CPUX86State *env, target_ulong ptr, int data32)

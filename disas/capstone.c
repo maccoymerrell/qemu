@@ -609,7 +609,8 @@ static void cap_x86_add_sysregs(const cs_insn *insn,
 #define X87F_ENVW  0x0200u   /* writes the control + tag words             */
 #define X87F_CWR   0x0400u   /* reads  the CONTROL word (rounding mode,
                               * precision control, exception masks)        */
-#define X87F_ANY   0x07ffu
+#define X87F_CWW   0x0800u   /* writes the CONTROL word                    */
+#define X87F_ANY   0x0fffu
 
 /* fpush / fpop / fpop2 all move env->fpstt, which lives in the status word. */
 #define X87F_PUSH  (X87F_SWR | X87F_SWW)
@@ -1396,9 +1397,13 @@ static unsigned int cap_x86_x87_effects(const cs_insn *insn)
             return X87F_ENVW | X87F_SWW;
         case 0x0e:
             /* fnstenv: do_fstenv() READS fpuc, fpus, fpstt and fptags[]
-             * and assigns nothing.  XED names only a status-word write;
-             * LLVM MC names the read as well and QEMU settles it. */
-            return X87F_ENVR | X87F_SWR;
+             * to build the image, and then MASKS every FP exception --
+             * `cpu_set_fpuc(env, env->fpuc | FPUC_EM)`, SDM Vol.1 8.1.10.
+             * So the control word is read AND written, and a later
+             * `fnstcw` must wait on the FNSTENV before it.  XED names
+             * only a status-word write; LLVM MC names the read as well
+             * and QEMU settles both halves. */
+            return X87F_ENVR | X87F_SWR | X87F_CWW;
         case 0x1d: case 0x3d:
             /* fldt (m80) / fildll -- gen_helper_fldt_ST0 / fildll_ST0.
              * do_fldt() copies the 80-bit pattern and touches no
@@ -1577,6 +1582,9 @@ static void cap_x86_add_x87_implicit(unsigned int fx,
     }
     if (fx & X87F_CWR) {
         cap_x86_add_sysreg(out, CAP_X86_SYSREG_X87CW, CAP_X86_SYS_R);
+    }
+    if (fx & X87F_CWW) {
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_X87CW, CAP_X86_SYS_W);
     }
     if (fx & X87F_ENVR) {
         cap_x86_add_x87_env(out, CAP_X86_SYS_R, false);

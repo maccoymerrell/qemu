@@ -5810,10 +5810,168 @@ static bool cap_aarch64_reads_zero_modifier(const char *mnem)
     return false;
 }
 
+/*
+ * AArch64 PACKED-MEMORY-OPERAND corrections.
+ *
+ * Capstone 6.0.0-Alpha7 builds ONE `cs_arm64_op` of type MEM out of TWO
+ * different things on three families, putting a register that is not an
+ * address input into `mem.base` or `mem.index`.  The consequence reaches
+ * the trace twice: the static store COUNT is inflated, and the
+ * address-dependency mask the operand walker builds from base+index+segment
+ * names registers the access does not compute its address from -- a
+ * fabricated AGU edge, the same class as the mipsel conditional-branch
+ * phantom destination removed at 95a0d89e92.
+ *
+ * FOUND by the address-dependency reference (arc3_cov/addrdep), which is
+ * the first reference this project ever pointed at the HAS_ADDR sub-block.
+ * Nothing else could see it: the register SETS are right on both sides
+ * (the registers are all named, just in the wrong role), and the memop
+ * ADDRESS axis compares values at execution, where a static operand
+ * miscount does not show.
+ *
+ *   STLUR / STLURB / STLURH   `stlur w3, [x2, #1]`
+ *       Capstone  op0 MEM{base=Rt, index=Xn, disp=0, W}
+ *                 op1 MEM{base=0,  index=0,  disp=D, W}
+ *       truth     op0 REG Rt (read)      op1 MEM{base=Xn, disp=D, W}
+ *       Observed: two static stores where the instruction makes one, and
+ *       store_addr_dep_mask[0] = {Rt, Xn} where the address depends on Xn
+ *       alone.  `str x3,[x2]` two rows away is modelled correctly, which
+ *       is what makes this a defect and not a representation.
+ *
+ *   STGP                      `stgp x4, x2, [x3, #0x10]`
+ *       Capstone  op0 MEM{base=Rt1, index=Rt2, disp=0, W}
+ *                 op1 MEM{base=Xn,  disp=D, W}
+ *       truth     op0/op1 REG Rt1, Rt2 (read)   op2 MEM{base=Xn, disp=D, W}
+ *       `stp w1,w0,[x2]` is modelled correctly.
+ *
+ *   MOPS CPY / CPYF families  `cpye [x17]!, [x25]!, x8!`   (96 encodings)
+ *       Capstone  op0 MEM{base=Xd, index=Xs, disp=0, R|W}
+ *       truth     op0 MEM{base=Xd, W}   op1 MEM{base=Xs, R}
+ *       The copy's DESTINATION and SOURCE are two accesses at two
+ *       addresses; packed into one operand, the walker gives the load and
+ *       the store the SAME address dependency {Xd, Xs} and each acquires
+ *       the other's base.  The UNION is right, which is why a reference
+ *       without a per-access direction cannot see this -- stated as a
+ *       blind spot where the aarch64 leg is scored.
+ *
+ * Each predicate tests the OBSERVED SHAPE as well as the instruction id,
+ * so a fixed Capstone -- whose operands would not match the shape -- falls
+ * straight through to the ordinary path instead of being re-broken here.
+ * Retest with contrib/plugins/champsim_tracer/tools/capstone_workaround_probe
+ * on a Capstone bump.
+ */
+static void cap_arm64_put_reg(csh handle, qemu_plugin_operand *op,
+                              unsigned reg, unsigned access)
+{
+    memset(op, 0, sizeof(*op));
+    op->type = QEMU_PLUGIN_OP_REG;
+    cap_copy_reg_name(op->reg_name, QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                      handle, reg, CS_ARCH_ARM64);
+    op->reg_id = reg;
+    op->access = access;
+    op->scale = 1;
+}
+
+static void cap_arm64_put_mem(csh handle, qemu_plugin_operand *op,
+                              unsigned base, int64_t disp, unsigned access)
+{
+    memset(op, 0, sizeof(*op));
+    op->type = QEMU_PLUGIN_OP_MEM;
+    cap_copy_reg_name(op->reg_name, QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ,
+                      handle, base, CS_ARCH_ARM64);
+    op->reg_id = base;
+    op->imm = disp;
+    op->access = access;
+    op->scale = 1;
+}
+
+/* True when @insn is one of the packed-operand forms and was rewritten. */
+static bool cap_arm64_unpack_mem_operands(csh handle, const cs_insn *insn,
+                                          qemu_plugin_insn_info *out)
+{
+    const cs_arm64 *a64 = &insn->detail->arm64;
+    const cs_arm64_op *o0 = &a64->operands[0];
+
+    if (a64->op_count < 2 || o0->type != AARCH64_OP_MEM ||
+        o0->mem.index == 0 || o0->mem.disp != 0) {
+        return false;
+    }
+
+    if ((insn->id == AARCH64_INS_STLUR || insn->id == AARCH64_INS_STLURB ||
+         insn->id == AARCH64_INS_STLURH) && a64->op_count == 2 &&
+        a64->operands[1].type == AARCH64_OP_MEM &&
+        a64->operands[1].mem.base == 0 && a64->operands[1].mem.index == 0) {
+        cap_arm64_put_reg(handle, &out->operands[0], o0->mem.base,
+                          QEMU_PLUGIN_OP_ACC_READ);
+        cap_arm64_put_mem(handle, &out->operands[1], o0->mem.index,
+                          a64->operands[1].mem.disp,
+                          QEMU_PLUGIN_OP_ACC_WRITE);
+        out->n_operands = 2;
+        return true;
+    }
+
+    if (insn->id == AARCH64_INS_STGP && a64->op_count == 2 &&
+        a64->operands[1].type == AARCH64_OP_MEM &&
+        a64->operands[1].mem.base != 0 &&
+        QEMU_PLUGIN_INSN_DETAIL_MAX_OPS >= 3) {
+        cap_arm64_put_reg(handle, &out->operands[0], o0->mem.base,
+                          QEMU_PLUGIN_OP_ACC_READ);
+        cap_arm64_put_reg(handle, &out->operands[1], o0->mem.index,
+                          QEMU_PLUGIN_OP_ACC_READ);
+        cap_arm64_put_mem(handle, &out->operands[2],
+                          a64->operands[1].mem.base,
+                          a64->operands[1].mem.disp,
+                          QEMU_PLUGIN_OP_ACC_WRITE);
+        out->n_operands = 3;
+        return true;
+    }
+
+    /* MOPS copy: the one operand carries the destination AND the source.
+     * Keyed on the mnemonic because the family is 96 instruction ids wide
+     * and every one of them spells the same shape; `cpy` also excludes the
+     * memory-SET forms, which have one address and are modelled correctly.
+     */
+    if (o0->access == (CS_AC_READ | CS_AC_WRITE) &&
+        strncmp(insn->mnemonic, "cpy", 3) == 0 &&
+        a64->op_count + 1 <= QEMU_PLUGIN_INSN_DETAIL_MAX_OPS) {
+        uint8_t n = MIN((uint8_t)(a64->op_count + 1),
+                        (uint8_t)QEMU_PLUGIN_INSN_DETAIL_MAX_OPS);
+        /* Carry the trailing operands (the size register) across unchanged,
+         * from the back, so the two new memory operands can take slots 0
+         * and 1 without overwriting anything still to be copied. */
+        for (uint8_t i = n; i-- > 2; ) {
+            const cs_arm64_op *src = &a64->operands[i - 1];
+            qemu_plugin_operand *dst = &out->operands[i];
+            memset(dst, 0, sizeof(*dst));
+            dst->access = src->access;
+            dst->scale = 1;
+            if (src->type == AARCH64_OP_REG) {
+                cap_arm64_put_reg(handle, dst, src->reg, src->access);
+            } else if (src->type == AARCH64_OP_IMM) {
+                dst->type = QEMU_PLUGIN_OP_IMM;
+                dst->imm = src->imm;
+            } else {
+                dst->type = QEMU_PLUGIN_OP_INVALID;
+            }
+        }
+        cap_arm64_put_mem(handle, &out->operands[0], o0->mem.base, 0,
+                          QEMU_PLUGIN_OP_ACC_WRITE);
+        cap_arm64_put_mem(handle, &out->operands[1], o0->mem.index, 0,
+                          QEMU_PLUGIN_OP_ACC_READ);
+        out->n_operands = n;
+        return true;
+    }
+    return false;
+}
+
 static void cap_fill_arm64_operands(csh handle, unsigned int cap_mode,
                                     const cs_insn *insn,
                                     qemu_plugin_insn_info *out)
 {
+    if (cap_arm64_unpack_mem_operands(handle, insn, out)) {
+        return;
+    }
+
     const cs_arm64 *a64 = &insn->detail->arm64;
     uint8_t n = MIN(a64->op_count, QEMU_PLUGIN_INSN_DETAIL_MAX_OPS);
     out->n_operands = n;

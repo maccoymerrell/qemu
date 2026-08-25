@@ -517,10 +517,9 @@ Decode by repeated outer-section unwrapping.
           n_dst              : u8
           src_regs[n_src]    : u8 each    ; resolve via encoding_maps.reg
           dst_regs[n_dst]    : u8 each    ; resolve via encoding_maps.reg
-          max_dep_loads      : u8         ; template-static MAX load count
-                                          ; (runtime per-iter count rides on
-                                          ; CST_FID_N_LOADS and can be smaller)
-          max_dep_stores     : u8         ; template-static MAX store count
+          max_dep_loads      : u8         ; static memory-OPERAND count
+                                          ; (not an access count -- see below)
+          max_dep_stores     : u8         ; static memory-OPERAND count
           if (flags & ids.insn_flag_has_imm):
             immediate        : SLEB
           insn_size          : u8         ; 0..16
@@ -535,6 +534,20 @@ Decode by repeated outer-section unwrapping.
           if (dep_block_flags & ids.dep_block_has_addr):
             load_addr_dep[0..max_dep_loads-1]    : ULEB each
             store_addr_dep[0..max_dep_stores-1]  : ULEB each
+        ``max_dep_loads`` and ``max_dep_stores`` count the instruction's
+        static memory OPERANDS, and they exist to size the per-operand
+        address-dependency arrays above.  They are not a bound on how
+        many accesses an execution performs, and the dynamic count is
+        frequently larger: one operand expands into as many accesses as
+        the form performs, so AArch64 ``ld4 {v0.16b-v3.16b}, [x1]`` is
+        one operand publishing 64 memops, and x86 ``XSAVEOPT`` is one
+        operand issuing tens of stores.  One address mask describes every
+        access an operand expands into, because they all compute their
+        address from the same input registers.  The per-access stream is
+        ``CST_FID_N_LOADS`` / ``CST_FID_N_STORES`` and the slot fields
+        they gate, bounded by ``CST_FID_SLOT_COUNT``; a consumer sizing a
+        per-access array must read those and never these.
+
         Mask array sizes all come from the outer template header
         (n_dst, max_dep_loads, max_dep_stores) — the dep block itself
         carries only dep_block_flags + the masks.  HAS_REG and HAS_ADDR

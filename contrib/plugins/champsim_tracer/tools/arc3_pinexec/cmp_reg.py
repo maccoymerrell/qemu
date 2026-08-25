@@ -77,6 +77,11 @@ AP.add_argument('--mutate', default=None,
                      'QEMU side -- dropsrc | extrasrc | dropdst | dstvalue | '
                      'srcvalue')
 AP.add_argument('--mutate-every', type=int, default=997)
+AP.add_argument('--summary', default=None,
+                help='APPEND one machine-parsable CONTROL SUMMARY line, '
+                     'carrying EVERY axis, to this file.  A negative control '
+                     'that does not report the axis it exists to convict '
+                     'proves nothing about that axis.')
 A = AP.parse_args()
 
 OUT = open(A.out, 'w') if A.out else sys.stdout
@@ -116,12 +121,20 @@ with open(A.qemu) as f:
             if c and w:
                 dv[c] = (int(val, 16), w)
         j['_dv'] = dv
+        # The SAME dict serves two different consumers: the destination-VALUE
+        # comparison (`_dv`) and the publication into the shadow register
+        # file that the SOURCE-VALUE axis reads back (`_sv`).  They are one
+        # object in the unmutated stream -- a tracer that published a wrong
+        # write is wrong on both -- and are split only so a control can
+        # corrupt ONE of them.
+        j['_sv'] = dv
         Q.append(j)
 NQ = len(Q)
 qb = [j['_b'] for j in Q]
 say("QEMU correct-path instructions loaded: %d" % NQ)
 
 # ------------------------------------------------------- negative control
+N_MUT = 0
 if A.mutate:
     n_mut = 0
     for k in range(0, NQ, A.mutate_every):
@@ -133,22 +146,33 @@ if A.mutate:
         elif A.mutate == 'dropdst' and j['_d']:
             j['_d'] = frozenset(sorted(j['_d'])[1:])
         elif A.mutate == 'dstvalue' and j['_dv']:
+            # A wrong published write: wrong where it is compared AND wrong
+            # everywhere it is later read, so both consumers see it.
             r = sorted(j['_dv'])[0]
             v, w = j['_dv'][r]
             j['_dv'] = dict(j['_dv'])
             j['_dv'][r] = (v ^ 0x8, w)
+            j['_sv'] = j['_dv']
         elif A.mutate == 'srcvalue' and j['_dv']:
-            # Corrupt the producer's published value: every later source read
-            # of that register must then disagree with PIN.
+            # ISOLATING the source-value axis.  Corrupt ONLY the value that
+            # reaches the shadow register file, leaving the destination
+            # comparison at this instruction untouched.  The dst-VALUE
+            # columns must then be BYTE-IDENTICAL to baseline while the
+            # src-VALUE columns move -- which is the only shape that
+            # convicts the shadow-regfile propagation rather than the
+            # destination comparison it was riding on.  Before this split
+            # `srcvalue` and `dstvalue` mutated the same field and differed
+            # only in XOR mask, so neither could speak for this axis alone.
             r = sorted(j['_dv'])[0]
             v, w = j['_dv'][r]
-            j['_dv'] = dict(j['_dv'])
-            j['_dv'][r] = (v ^ 0x4000, w)
+            j['_sv'] = dict(j['_dv'])
+            j['_sv'][r] = (v ^ 0x4000, w)
         else:
             continue
         n_mut += 1
     say("NEGATIVE CONTROL: mutation '%s' applied at %d QEMU instructions "
         "(every %d)" % (A.mutate, n_mut, A.mutate_every))
+    N_MUT = n_mut
     if n_mut == 0:
         say("FATAL: the mutation never fired -- it proves nothing")
         raise SystemExit(3)
@@ -642,14 +666,14 @@ for pos, (pi, qj) in enumerate(pairs):
             note(valsig, 'dstval', (q['b'], q['c'], c, cat, direction), qj)
 
     # publish this instruction's destination writes into the shadow file
-    for c, (qv, qw) in q['_dv'].items():
+    for c, (qv, qw) in q['_sv'].items():
         shadow[c] = (qv, qw)
         if inherited:
             tainted.add(c)
     # a destination the tracer named WITHOUT a value invalidates the shadow
     # entry: the register changed and we do not know to what.
     for c in q['_d']:
-        if c not in q['_dv']:
+        if c not in q['_sv']:
             shadow.pop(c, None)
             tainted.discard(c)
 
@@ -745,3 +769,34 @@ say("  VALUE rows: " + '  '.join("%s %d" % (k, v) for k, v in
 bad = roll['UNACCOUNTED'] + roll['TRACER-SUBSET'] + \
     vroll['UNACCOUNTED'] + vroll['TRACER-SUBSET'] + st['dstval_tracer_absent']
 say("  SUBSET + UNACCOUNTED (the criterion; must be 0): %d" % bad)
+
+# ------------------------------------------------- 6. the CONTROL SUMMARY
+# One line, every axis, machine-parsable.  A negative control is only
+# evidence for the axis it REPORTS: a summary that omits `src register
+# VALUE` cannot convict the src-VALUE axis no matter which field the
+# mutation touched, because the propagation from the corrupted producer
+# into the shadow register file is exactly what is unproven.  So every
+# axis appears in every row, control and baseline alike.
+SUMMARY = ("CONTROL SUMMARY  mutation=%-9s n_mut=%-7d pairs=%d"
+           " | src-set matched=%d mismatched=%d"
+           " | dst-set matched=%d mismatched=%d"
+           " | dst-VALUE probed=%d exact=%d pointer=%d mismatched=%d"
+           " | src-VALUE probed=%d exact=%d pointer=%d mismatched=%d"
+           " | rip-src probed=%d exact=%d mismatched=%d"
+           " | criterion=%d") % (
+    A.mutate or 'baseline', N_MUT, st['pairs'],
+    st['srcset_match'], st['srcset_mismatch'],
+    st['dstset_match'], st['dstset_mismatch'],
+    st['dstval_probed'], st['dstval_exact'], st['dstval_pointer'],
+    st['dstval_mismatch'],
+    st['srcval_probed'], st['srcval_exact'], st['srcval_pointer'],
+    st['srcval_mismatch'],
+    st['ripsrc_probed'], st['ripsrc_exact'], st['ripsrc_mismatch'],
+    bad)
+say("")
+say(SUMMARY)
+if A.summary:
+    # Append-and-close per run: the previous artifact was truncated
+    # mid-word because one long-lived handle held every row.
+    with open(A.summary, 'a') as _f:
+        _f.write(SUMMARY + '\n')

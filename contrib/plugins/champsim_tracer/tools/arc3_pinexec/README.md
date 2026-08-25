@@ -21,6 +21,7 @@ the primary.
 | `pinreglib.py` | reader for the register record, plus the shared register vocabulary |
 | `cmp_reg.py` | the register cross-check: src set, dst set, dst VALUE, src VALUE, rip-as-source |
 | `Makefile` | builds it against the PIN kit (`make PIN_ROOT=...`) |
+| `run_reg_arm.sh` | the register arm end to end: pintool build, both halves under one minimal environment, the pairing, and all five negative controls |
 | `pinmemlib.py` | reader for the 392-byte reference record |
 | `qextract_mem.py` | `cst_decode --format=disasm --objdump` → one JSON object per correct-path instruction, carrying memop values (`lv`/`sv`) as well as addresses and widths |
 | `cmp_memop.py` | the cross-check: COUNT / ADDRESS / WIDTH / DATA, every disagreement carrying a CATEGORY and a DIRECTION |
@@ -172,8 +173,31 @@ stream itself recorded storing.
 | --- | --- |
 | `dropsrc` / `extrasrc` | `src register set` |
 | `dropdst` | `dst register set` |
-| `dstvalue` | `dst register VALUE` exact count, and the UNACCOUNTED roll-up |
-| `srcvalue` | `src register VALUE` exact count, and the UNACCOUNTED roll-up |
+| `dstvalue` | `dst register VALUE` exact count — and, because a wrong published write is also wrong everywhere it is later read, `src register VALUE` with it |
+| `srcvalue` | `src register VALUE` exact count **alone**: it corrupts only the value that reaches the shadow register file, leaving the destination comparison byte-identical to baseline |
+
+`srcvalue` is the only control that isolates the SOURCE-value axis, and that
+is the point of it.  That axis is the one whose tracer side is RECONSTRUCTED —
+a shadow register file replayed from the tracer's own published destination
+writes — rather than read off the wire, so the thing needing proof is that the
+propagation from a corrupted producer actually reaches a later consumer.  A
+control that moves the destination comparison at the same time cannot show
+that; the movement could be the destination axis leaking sideways.  `srcvalue`
+therefore mutates `_sv` (the shadow publication) and not `_dv` (the
+destination comparison), and the shape that convicts is: dst-VALUE columns
+UNCHANGED, src-VALUE columns MOVED.
+
+Every run — control and baseline alike — appends one machine-parsable
+`CONTROL SUMMARY` line carrying **every** axis to `--summary FILE`.  A control
+row that does not report the axis it exists to convict is not evidence about
+that axis, whatever field the mutation touched.
+
+`run_reg_arm.sh <outdir>` runs the whole arm: it builds the pintool, runs both
+halves under one minimal environment, and pairs baseline plus all five
+controls through the `--anchor 0 --qskip 1` the pairing needs.  Without the
+anchor `cmp_reg.py` exits 2 with "no anchor; the pair is not aligned" rather
+than scoring a misaligned pair, which is the correct refusal and not something
+to route around.
 
 A cross-run value comparison has an honest limit, and it is the same one the
 memop arm documents: where the two processes legitimately hold different

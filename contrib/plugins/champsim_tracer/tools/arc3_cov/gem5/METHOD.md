@@ -84,10 +84,37 @@ from `T`.
 These are things gem5 cannot do, found by running it.  They bound what this
 leg covers and they are stated rather than absorbed:
 
-* **AArch64 cache maintenance aborts gem5.**  `dc cvau` in SE mode ends in
+* **AArch64 cache maintenance USED TO abort gem5, and the cause was gem5's
+  SE-mode reset value, not the instructions.**  `dc cvau` ended in
   `src/sim/faults.cc:103: panic: … Page table fault when accessing virtual
-  address 0x400`.  `probes/p_cache` exists and is deliberately NOT in the run
-  set; `EXEC_VERDICT.md` W3 stays on the static axis.
+  address 0x400`, and that 0x400 is not an address the program ever names --
+  it is `VBAR_EL1` (0 in SE mode) plus 0x400, the synchronous-exception-from-
+  a-lower-EL vector offset.  The instruction was TRAPPING.
+  `ISA::initializeMiscRegMetadata()` builds the SCTLR reset value in two
+  branches and sets `uci` and `dze` on the AArch32 one only, so under AArch64
+  every EL0 execution of DC CVAU / DC CVAC / DC CIVAC / IC IVAU fails
+  `checkFaultAccessAArch64SysReg`'s `!sctlr.uci` test.  Linux sets both bits
+  at boot, which is why the same static ELF runs fine under QEMU linux-user.
+  Fixed in `gem5.patch` (two lines), and `probes/p_cache` is now IN the run
+  set: measured per operation, `dc cvau` / `dc civac` / `dc cvac` /
+  `ic ivau` / `dc zva` all run to
+  `Exiting @ tick 3500 because exiting with last active thread context`,
+  where before the patch the first four aborted on signal 6 having logged
+  three instructions.  Evidence `cst_runs/p3/arc3/item789/gem5cache*/`.
+
+  What gem5 gives on the axis, now that it runs: `dc cvau, x21` logs
+  `A=0x410480 S=64` -- a line-aligned effective address and the cache-line
+  width, modelled as an `IsStore` with `Request::CLEAN` -- while `ic ivau`
+  is modelled as a plain `msr ic_ivau_xt, x21` and issues no request at all.
+  So the reference is a THIRD opinion on the direction question mipsel
+  `synci` raised: binutils says store, LLVM and QEMU say neither, gem5 says
+  store.  The one TRACER-SUBSET row it exposes is `memop-width`: the
+  synthetic-EA record carries width 0 where gem5 carries 64.
+
+* **`dc ivac` and `dc cvap` are still unimplemented in gem5** --
+  `panic: Attempted to execute unimplemented instruction 'dc ivac'` and, for
+  DC CVAP, `'msr'`.  Both are outside the EL0-visible set the UCI bit gates,
+  so they are out of `p_cache` rather than patched around.
 * **EL1 system registers abort gem5.**  `mrs x0, midr_el1` ->
   `src/arch/arm/faults.cc:787: panic: Attempted to execute unimplemented
   instruction 'mrs'`.  The EL0-visible ID registers (`ctr_el0`, `dczid_el0`,
@@ -257,10 +284,10 @@ the one remaining step.
         -o <outdir>/a64 --tsv <outdir>/a64/rows.tsv \
         <probes_a64>/p_int <probes_a64>/p_mem <probes_a64>/p_simd \
         <probes_a64>/p_atomic <probes_a64>/p_fp <probes_a64>/p_flow \
-        <probes_a64>/p_hint
+        <probes_a64>/p_hint <probes_a64>/p_cache
 
-`p_cache` is deliberately absent from the aarch64 set: gem5 panics on AArch64
-cache maintenance (above).  The mipsel set is `p_int p_mem p_fp p_flow`.
+`p_cache` joined the aarch64 set once the gem5 SCTLR reset bug above was
+fixed; it was absent for as long as gem5 aborted on it.  The mipsel set is `p_int p_mem p_fp p_flow`.
 
 If the run must happen under a *different* interpreter, pass
 `--python-home <prefix>` — the prefix whose `lib/` holds the soname in

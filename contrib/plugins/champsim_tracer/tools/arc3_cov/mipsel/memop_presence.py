@@ -96,8 +96,26 @@ QEMU_CMPXCHG_SC = {'sc', 'scd', 'sce'}
 
 
 def read_pinfo(rawdir):
-    """name -> OR of every pinfo the enumerator saw for it, over all variants."""
+    """Two indexes over the enumerator's rows: by ENCODING and by NAME.
+
+    The name index is what this harness started with, and it has a hole the
+    denominator falls straight into.  binutils spells the SPECIAL/funct=2
+    rotate `ror` (mips-opc.c row `{"ror", "d,w,<", 0x00200002, ...}`); the
+    denominator, which takes its subject names from the disassembler, spells
+    the same encoding `rotr`.  Under the name key `rotr` resolves only to the
+    two `mips_macros` pseudo-op rows, which carry no `pinfo` at all, so the
+    subject scored REF-UNPROBED while its reference row sat in the table with
+    `pinfo=0x9`.
+
+    The encoding is the thing both sides actually agree on, so it is tried
+    first -- but ONLY when it is unambiguous.  Aliases share encodings
+    (`0000a47c` is both `ext` and the R5900 `sq`), and OR-ing their flags
+    would manufacture a store on an instruction that has none.  A colliding
+    encoding falls back to the name chain rather than being merged.
+    """
     pin = collections.defaultdict(int)
+    enc = collections.defaultdict(int)
+    enc_names = collections.defaultdict(set)
     seen_any = False
     for v in '0123':
         path = os.path.join(rawdir, 'raw_v%s.tsv' % v)
@@ -109,12 +127,18 @@ def read_pinfo(rawdir):
                 if 'pinfo=' not in flags:
                     continue
                 seen_any = True
-                pin[r['name']] |= int(flags.split('pinfo=')[1].split(',')[0], 16)
+                p = int(flags.split('pinfo=')[1].split(',')[0], 16)
+                pin[r['name']] |= p
+                h = (r.get('enc_bytes_le') or '').strip()
+                if h:
+                    enc[h] |= p
+                    enc_names[h].add(r['name'])
     if not seen_any:
         sys.exit('no pinfo= column found under %s -- re-run mips_enum '
                  '(see METHOD.md); a reference that cannot be read must FAIL, '
                  'not score everything as agreement' % rawdir)
-    return pin
+    enc = {h: v for h, v in enc.items() if len(enc_names[h]) == 1}
+    return pin, enc
 
 
 def read_opcodes(path):
@@ -151,7 +175,7 @@ def main():
                     help='print every row of these classes')
     A = ap.parse_args()
 
-    pin = read_pinfo(A.raw)
+    pin, enc = read_pinfo(A.raw)
     opc = read_opcodes(A.opcodes)
     trc = tracer_batch(A.isaxcheck, [h for _, _, h in opc])
 
@@ -160,17 +184,21 @@ def main():
     out = []
     for oid, mnem, hx in opc:
         T = trc.get(hx)
-        # the enumerator keys on the bare mnemonic; the denominator on
-        # "mipsel.<mnemonic>"
-        # The denominator disambiguates same-named entries by appending the
-        # encoding ("mipsel.rddsp.7c0004b8"), so the enumerator's bare-mnemonic
-        # key needs both forms tried; the mnemonic column is the last resort.
-        key = oid.split('.', 1)[1] if oid.startswith('mipsel.') else oid
-        p = pin.get(key)
-        if p is None and '.' in key:
-            p = pin.get(key.rsplit('.', 1)[0])
+        # The ENCODING is the key both sides share, so it is tried first --
+        # only for encodings the enumerator names exactly once (see
+        # read_pinfo).  Everything else falls back to the name chain: the
+        # enumerator keys on the bare mnemonic while the denominator keys on
+        # "mipsel.<mnemonic>" and disambiguates same-named entries by
+        # appending the encoding ("mipsel.rddsp.7c0004b8"), so both forms are
+        # tried, and the mnemonic column is the last resort.
+        p = enc.get(hx)
         if p is None:
-            p = pin.get(mnem)
+            key = oid.split('.', 1)[1] if oid.startswith('mipsel.') else oid
+            p = pin.get(key)
+            if p is None and '.' in key:
+                p = pin.get(key.rsplit('.', 1)[0])
+            if p is None:
+                p = pin.get(mnem)
         if T is None or p is None:
             cat['REF-UNPROBED'] += 1
             rows['REF-UNPROBED'].append((oid, mnem, hx, None, None, None, None))

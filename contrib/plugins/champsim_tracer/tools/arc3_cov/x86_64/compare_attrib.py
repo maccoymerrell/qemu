@@ -267,6 +267,28 @@ def adjudicate(hexs, xsrc, xdst):
         dst.discard('X87STATUS')
         ADJ['ADJ-4 FNSTCW/FNSTSW read the status word and do not write it '
             '(QEMU helper over XED+LLVM)'] += 1
+    # ADJ-13: FNSTENV is ADJ-4's third member, and XED has it exactly
+    # backwards.  do_fstenv() (target/i386/tcg/fpu_helper.c) READS
+    # env->fpuc, env->fpus, env->fpstt and every env->fptags[] entry and
+    # stores them to memory; it ASSIGNS none of them.  XED declares
+    # X87STATUS a destination and no source at all.  LLVM MC names the
+    # read (`llvmRD{fpcw,fpsw,...}`) and is the third decoder that settles
+    # the source half; the destination half is ADJ-4's argument verbatim
+    # -- following the reference would plant a write the guest does not
+    # perform.
+    #
+    # RECORDED, because it is a real QEMU defect and not a decode
+    # question: SDM Vol.1 8.1.10 says FSTENV MASKS ALL FLOATING-POINT
+    # EXCEPTIONS after saving the environment, and do_fstenv() does not.
+    # A guest that relies on that masking behaves differently under TCG.
+    # The tracer follows the guest it is tracing; the QEMU bug is filed in
+    # TOTAL_COVERAGE.md rather than absorbed here.
+    if xmn == 'FNSTENV':
+        if 'X87STATUS' in dst:
+            dst.discard('X87STATUS')
+            ADJ['ADJ-13 FNSTENV reads the x87 environment and does not '
+                'write it (QEMU do_fstenv + LLVM MC over XED)'] += 1
+        src.add('X87STATUS')
     # ADJ-5: FCMOVcc TESTS CF/ZF/PF and writes no flag.  XED declares its
     # RFLAGS operand rw; LLVM MC names no flags at all, and iced's dst
     # RFLAGS is the status-word rendering above rather than a claim about

@@ -321,14 +321,26 @@ def main():
         ext = r['extension']
 
         # ---------------------------------------------- the compared rows
-        if r['verdict'] != 'UNPROBED':
-            v = (COVERED if r['direction'] in ('-', 'TRACER-SUPERSET')
-                 else UNCOVERED)
+        compared = r['verdict'] != 'UNPROBED'
+        if compared and r['direction'] in ('-', 'TRACER-SUPERSET'):
             why = ('compared: %s' % (r['direction'] if r['direction'] != '-'
                                      else 'AGREE'))
             out.append((opid, mn, isa_set, ext, h, '-', '-', '-', '-', '-',
-                        '-', '-', '-', '-', '-', why, v))
-            tally[v] += 1
+                        '-', '-', '-', '-', '-', why, COVERED))
+            tally[COVERED] += 1
+            continue
+        if compared and h not in cpl3:
+            # A comparison that DISAGREES is a defect unless the instruction
+            # cannot be executed at all, and that second question has to be
+            # MEASURED before it may be answered.  A row whose encoding never
+            # entered the reachability legs has no such measurement, so it
+            # stays UNCOVERED and says why -- never "probably unreachable".
+            out.append((opid, mn, isa_set, ext, h, '-', '-', '-', '-',
+                        'NOT-MEASURED', t.decoder_mentions(mn),
+                        '-', '-', '-', '-',
+                        'compared: %s, and the reachability legs were never '
+                        'run on this encoding' % r['direction'], UNCOVERED))
+            tally[UNCOVERED] += 1
             continue
 
         # ---------------------------------------------- the uncompared rows
@@ -384,16 +396,32 @@ def main():
                         'verdict' % r['mechanism'], UNCOVERED))
             tally[UNCOVERED] += 1
             continue
-        elif refusal == 'NONE-QEMU-EXECUTES-IT':
+        elif refusal == 'NONE-QEMU-EXECUTES-IT' and not compared:
             v = UNCOVERED
             why = ('QEMU EXECUTES these bytes and the tracer decodes nothing: '
                    'the whole instruction is dropped')
         elif c3 == 4 and c0 == 6 and mm['models_ran'] == '0' and af == 4:
+            # The same four-way proof decides a COMPARED row as well as an
+            # uncompared one.  A disagreement about an instruction NO QEMU
+            # guest can execute describes an instruction that can never enter
+            # a trace: it is unreachable, not a dropped fact.  The row still
+            # carries every leg, so the claim is checkable per instruction
+            # and collapses the moment QEMU learns to decode the bytes.
             v = UNREACHABLE
             why = ('#UD at CPL3 (-cpu max), #UD at CPL3 under all %s CPU '
                    'models, #UD at CPL3 with every CPUID flag forced, #UD at '
-                   'CPL0 in system mode; refused at %s'
-                   % (mm['models_probed'], refusal))
+                   'CPL0 in system mode; refused at %s%s'
+                   % (mm['models_probed'], refusal,
+                      ('; the comparison disagrees (%s) about an instruction '
+                       'no guest reaches' % r['direction']) if compared
+                      else ''))
+        elif compared:
+            v = UNCOVERED
+            why = ('compared: %s -- and the instruction IS reachable '
+                   '(cpl3=%s allflags=%s cpl0=%s models_ran=%s)'
+                   % (r['direction'], SIGNAME.get(c3, c3),
+                      SIGNAME.get(af, af), VECNAME.get(c0, c0),
+                      mm['models_ran']))
         else:
             v = UNCOVERED
             why = ('executes or faults inconsistently: cpl3=%s allflags=%s '

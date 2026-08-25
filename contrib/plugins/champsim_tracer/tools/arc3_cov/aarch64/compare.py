@@ -1,5 +1,6 @@
 """Compare the tracer's InsnFields register sets against the A64 reference."""
-import csv, json, collections, re, sys, os
+import csv
+import re, json, collections, re, sys, os
 
 BASE = '/mnt/md0/QEMU/cst_runs/_arc3_cov/aarch64'
 
@@ -160,6 +161,69 @@ def parse_set(field, fn):
     return out
 
 
+REFFIX = collections.Counter()
+
+
+def ref_correct(x, rs, rd_):
+    """Corrections applied to the REFERENCE, each with a third witness.
+
+    The project's settled policy for a proven reference defect is to CORRECT
+    the reference, not to label the row (R7.1, R7.3, R7.7).  Every rule here
+    is COUNTED: a rule whose count falls to zero has stopped reaching its
+    subject and is a finding, not a pass.
+    """
+    mn = x['mnemonic']
+    dis = x.get('llvm_disasm') or x.get('asm_template') or ''
+    if not dis:
+        # A rule that cannot find its subject must FAIL, not silently apply
+        # to everything: without the disassembly RF-3 cannot tell a
+        # register-less TLBI from `at s1e1r, x16`.
+        raise SystemExit('opcodes.tsv carries no disassembly column; RF-3 '
+                         'cannot decide whether a system instruction names '
+                         'an Xt operand')
+
+    # RF-1 (R7.1) -- MOVT writes 64 bits into the 512-byte ZT0 table and
+    # leaves the rest alone.  The MRA's execute ASL spells that as
+    # `result = ZT0; Elem[result, offset, 64] = X[t, 64]; ZT0[512] = result`,
+    # so ZT0 reads as a source.  R7.1 is binding and says the opposite: a
+    # narrow write does not make a register a source, because rename does
+    # not know the data-width scope of the next reader.  The tracer is
+    # right; this deletes the preserve-read the reference manufactured.
+    # SCOPE IS THE CLASS, not the row: MOVT is the only ZT0 form that
+    # writes PART of the table (LDR ZT0 writes all of it, STR ZT0 reads it).
+    if mn == 'movt' and 'ZT0' in rs and 'ZT0' in rd_:
+        rs.discard('ZT0')
+        REFFIX['RF-1 R7.1: MOVT\'s partial ZT0 write is not a ZT0 read'] += 1
+
+    # RF-2 -- the generic HINT subject's representative encoding is
+    # `hint #35`, which is UNALLOCATED: llvm-mc -mattr=+all prints a bare
+    # `hint #35` with no alias, Capstone prints `hint #0x23`, and QEMU's
+    # translate-a64 has no case for it, so a guest executes a NOP.  The MRA
+    # arm evaluates the HINT page's execute ASL, which covers the WHOLE hint
+    # space, so CHKFEAT's X16 traffic and its system-register write arrive
+    # on an encoding that performs neither.  The reference is describing a
+    # different instruction.
+    if x['opcode_id'] == 'HINT_HM_hints':
+        if rs or rd_:
+            REFFIX['RF-2 hint #35 is unallocated: a NOP, not CHKFEAT '
+                   '(LLVM +all and QEMU over the MRA hint page)'] += 1
+        rs, rd_ = set(), set()
+
+    # RF-3 -- a TLBI form with no Xt operand.  TLBI VMALLE1IS takes no
+    # register; the architecture requires Rt == 0b11111 in the encoding.
+    # The representative encoding carries Rt = 28, which is malformed, and
+    # the MRA arm reads the field anyway.  A reference reading an operand
+    # the disassembly does not name is reading the representative encoding,
+    # not the instruction.
+    if mn in ('tlbi', 'dc', 'ic', 'at') and not re.search(r',\s*[xw]\d', dis):
+        gp = set(y for y in rs if y.startswith('GPR'))
+        if gp:
+            rs -= gp
+            REFFIX['RF-3 a register-less system instruction has no Xt: the '
+                   'MRA read a RES1 encoding field'] += 1
+    return rs, rd_
+
+
 def main():
     rows = list(csv.DictReader(open(BASE + '/opcodes.tsv'), delimiter='\t'))
     ref = json.load(open(BASE + '/ref_mra.json'))
@@ -212,6 +276,7 @@ def main():
                 rank = '1:MRA'
                 rs = set(ref_tok(y) for y in r['src'])
                 rd_ = set(ref_tok(y) for y in r['dst'])
+                rs, rd_ = ref_correct(x, rs, rd_)
             elif lv and lv[2] == '1':
                 rank = '2:LLVM-MC'
                 rs, rd_ = set(ls), set(ld)
@@ -342,6 +407,13 @@ def main():
     for s, n in sigs.most_common(25):
         print('%6d  %s' % (n, s))
     print('MRA vs LLVM: same=%d differ=%d' % (xcheck[True], xcheck[False]))
+    print('REFERENCE CORRECTIONS (a rule that reaches nothing is a finding):')
+    for k, n in sorted(REFFIX.items()):
+        print('%6d  %s' % (n, k))
+    for k in ('RF-1', 'RF-2', 'RF-3'):
+        if not any(x.startswith(k) for x in REFFIX):
+            print('       0  %s -- INERT, it no longer reaches its subject'
+                  % k)
 
 
 if __name__ == '__main__':

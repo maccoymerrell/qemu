@@ -69,8 +69,22 @@ EXEC_REFERENCE = {
                'load width.  Correct path: riscv64/spike/compare_exec.py.  '
                'WRONG path: riscv64/spike/wp/compare_wp.py -- the only WP '
                'execution reference on any ISA.',
-    'aarch64': 'NONE.  No execution reference exists for this ISA.',
-    'mipsel':  'NONE.  No execution reference exists for this ISA.',
+    'aarch64': 'gem5 25.1.0.1 (execution), syscall-emulation, AtomicSimpleCPU, '
+               'patched to state every destination value, the bytes a store '
+               'moved, the access width and the access direction.  '
+               'gem5/compare_exec_gem5.py.  It is a PROBE-SIZED reference '
+               '(244 aligned instructions), not a coverage result.',
+    'mipsel':  'gem5 25.1.0.1 (execution), same harness and same patch, 147 '
+               'aligned instructions.  PROBE-SIZED, not a coverage result.',
+}
+
+#: Where a per-ISA harness has MEASURED reachability per encoding and written
+#: the evidence onto the row, the three-valued verdict is taken from that file
+#: rather than re-derived here.  UNREACHABLE is the one verdict this report
+#: must never compute for itself: it is a claim about what a QEMU guest can
+#: execute, and the only honest source for it is the run that tried.
+REACH_MATRIX = {
+    'x86_64': 'x86_64/reach_matrix.tsv',
 }
 
 
@@ -240,14 +254,31 @@ def main():
     w(hdr3)
     w('-' * len(hdr3))
     g3 = collections.Counter()
+    reach_src = {}
     for isa, _, vcol, dtok, _, _ in ISAS:
         rows, counts, _unp = per_isa[isa]
         c = collections.Counter(r.direction for r in rows)
-        agree = counts.get('AGREE', 0) + counts.get('agree', 0)
-        cov = agree + c[tax.SUPERSET]
-        unreach = _unp['no']
-        unc = (c[tax.SUBSET] + c[tax.UNACCOUNTED] + c[tax.ORTHOGONAL] +
-               _unp['yes'])
+        mpath = os.path.join(a.cov, REACH_MATRIX.get(isa, '\0'))
+        if isa in REACH_MATRIX and os.path.exists(mpath):
+            # The verdict column of a file that carries, per row, the CPL3
+            # signal, the count of CPU models the encoding ran under, the
+            # all-CPUID-flags signal, the CPL0 vector, where QEMU refused,
+            # the gating feature word and whether the decode tables name the
+            # mnemonic at all.
+            vt = collections.Counter()
+            with open(mpath) as f:
+                for r in csv.DictReader(f, delimiter='\t'):
+                    vt[r['verdict']] += 1
+            cov_, unreach, unc = (vt['COVERED'], vt['UNREACHABLE'],
+                                  vt['UNCOVERED'])
+            reach_src[isa] = mpath
+        else:
+            agree = counts.get('AGREE', 0) + counts.get('agree', 0)
+            cov_ = agree + c[tax.SUPERSET]
+            unreach = _unp['no']
+            unc = (c[tax.SUBSET] + c[tax.UNACCOUNTED] + c[tax.ORTHOGONAL] +
+                   _unp['yes'])
+        cov = cov_
         g3['c'] += cov
         g3['u'] += unreach
         g3['x'] += unc
@@ -258,6 +289,18 @@ def main():
       % ('all four', g3['c'], g3['u'], g3['x'],
          g3['c'] + g3['u'] + g3['x']))
     w('')
+    for isa in sorted(reach_src):
+        w('')
+        w('%s: the verdict above is READ OFF %s, which carries the four'
+          % (isa, reach_src[isa]))
+        w('reachability legs and the two QEMU-tree citations on EVERY row.  An')
+        w('UNREACHABLE row there means: SIGILL at CPL3 under -cpu max, SIGILL')
+        w('at CPL3 under every 64-bit-capable CPU model QEMU has, SIGILL with')
+        w('every CPUID flag forced on at once, AND #UD at CPL0 in long mode')
+        w('under qemu-system.  A row that fails any one of the four is')
+        w('UNCOVERED, whether or not a comparison was made for it.')
+    w('')
+    w('WHERE THE VERDICT IS NOT READ OFF A REACH MATRIX,')
     w('UNCOVERED = TRACER-SUBSET + UNACCOUNTED + ORTHOGONAL + '
       'REACHABLE-UNPROBED.')
     w('ORTHOGONAL is in there deliberately: a different vocabulary for the')

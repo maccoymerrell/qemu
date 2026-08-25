@@ -884,7 +884,37 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
     auto shift_out = [&](uint64_t m) -> uint64_t {
         return n_src >= 64 ? 0 : (m >> n_src);
     };
+    /*
+     * A register the instruction WRITES is never an addressing-ONLY source
+     * of its own new value.  `stp x29, x30, [sp, #-0x90]!` states no
+     * register block, so the reader falls back to the format's all-to-all
+     * default -- a correct over-approximation containing SP -- and the
+     * cleanup below then deleted SP because SP is the store's base,
+     * rendering `%%sp=[%%fpr,%%lr]`: a destination whose one true source is
+     * gone and whose remaining sources are the two registers the new SP has
+     * nothing to do with.  gem5 computes it as `subi sp, sp, 0x90`.  The
+     * same shape covers every post/pre-index writeback on AArch64 and
+     * `push`/`pop` on x86, which is to say every function prologue there
+     * is: measured on 118 distinct instruction identities of the mixed
+     * benchmark's first 1.5M instructions.
+     *
+     * The RESIDUAL, stated rather than absorbed: a source that is an
+     * addressing register AND a data operand without being a destination --
+     * `cmpq %%rdi, 0x28(%%rdi)` -- is still subtracted, and the flags then
+     * name only the loaded value.  Nothing in an absent register block can
+     * distinguish that source's two roles, so closing it means deciding
+     * whether the synthesized default may narrow the format's all-to-all at
+     * all.  That is a format question, not a rendering one.
+     */
     addr_only_srcs &= src_bits_mask;
+    for (size_t i = 0; i < insn.src_regs.size(); i++) {
+        for (uint64_t dr : insn.dst_regs) {
+            if (insn.src_regs[i] == dr) {
+                addr_only_srcs &= ~((uint64_t)1 << i);
+                break;
+            }
+        }
+    }
 
     uint64_t all_inputs = 0;
     for (size_t i = 0; i < inputs.size(); i++) {
@@ -892,15 +922,18 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
     }
     uint64_t default_mask = all_inputs & ~addr_only_srcs;
 
-    /* Addressing-src cleanup applies ONLY to a fully-saturated mask
-     * (dep_all_to_all / synthesized default): there an addressing reg
-     * is a false direct dep (it reaches the sink via the memop).  A
-     * strict subset is a precise refiner's deliberate output (e.g.
-     * dep_x86_stack_push's SP-dst = SP-src) and renders verbatim. */
-    auto effective = [&](uint64_t m) -> uint64_t {
-        return (m == all_inputs) ? (m & ~addr_only_srcs) : m;
-    };
-
+    /* The addressing-src cleanup belongs to the SYNTHESIZED default and
+     * to nothing else.  It used to be applied to any mask that happened
+     * to equal all_inputs, on the reasoning that such a mask could only
+     * have come from dep_all_to_all -- and dep_all_to_all was retired at
+     * 508b474fe2, so nothing publishes the saturated mask by accident any
+     * more.  What the test caught instead was a refiner STATING a set that
+     * is genuinely everything: `pushq $0` carries dst_dep=0x3 on the wire
+     * -- {SP, imm}, which is exactly right, SP is what SP-8 is computed
+     * from -- and the cleanup deleted the SP bit and rendered `%sp=[imm]`,
+     * a destination with no register source at all.  Measured against
+     * gem5's `subi rsp, rsp, 0x8` on ten distinct call sites of the mixed
+     * benchmark.  A STATED mask now renders verbatim, always. */
     auto dst_mask = [&](size_t d) {
         return d < insn.dst_dep_mask.size() ? insn.dst_dep_mask[d]
                                             : default_mask;
@@ -1000,9 +1033,10 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
             end++;
         }
         open_group();
-        /* effective(): saturated-only addressing-src cleanup.
-         * --show-lanes also filters inputs to this dst's lanes. */
-        render_input_set_laned(line, effective(mask), inputs,
+        /* The mask is already what it should be: stated on the wire, or
+         * the synthesized default with its addressing-src cleanup already
+         * applied.  --show-lanes also filters inputs to this dst's lanes. */
+        render_input_set_laned(line, mask, inputs,
                                ctx.show_lanes,
                                lane_at(insn.dst_lane_mask, d),
                                input_lane_mask, &placed);
@@ -1025,8 +1059,8 @@ bool emit_disasm_operands(std::string &line, const DisasmContext &ctx,
             end++;
         }
         open_group();
-        /* Same saturated-only addressing-src exclusion as dsts. */
-        render_input_set_laned(line, effective(mask), inputs,
+        /* Same rule as the dsts: stated verbatim, default already clean. */
+        render_input_set_laned(line, mask, inputs,
                                ctx.show_lanes,
                                lane_at(insn.store_data_lane_mask, s),
                                input_lane_mask, &placed);
@@ -1321,6 +1355,16 @@ void emit_disasm_deps_annotation(std::string &line,
     uint64_t src_bits = (n_src == 64) ? ~(uint64_t)0
                                        : (((uint64_t)1 << n_src) - 1);
     addr_only_srcs &= src_bits;
+    /* Same written-register exclusion as emit_disasm_operands, so the
+     * annotation cannot disagree with the arrows. */
+    for (size_t i = 0; i < it.src_regs.size(); i++) {
+        for (uint64_t dr : it.dst_regs) {
+            if (it.src_regs[i] == dr) {
+                addr_only_srcs &= ~((uint64_t)1 << i);
+                break;
+            }
+        }
+    }
 
     uint64_t all_inputs = src_bits;
     /* every load_data slot */
@@ -1333,11 +1377,9 @@ void emit_disasm_deps_annotation(std::string &line,
     }
     uint64_t default_mask = all_inputs & ~addr_only_srcs;
 
-    /* Same saturated-only `effective` rule as emit_disasm_operands
-     * so the annotation can't disagree with the arrows. */
-    auto effective = [&](uint64_t m) -> uint64_t {
-        return (m == all_inputs) ? (m & ~addr_only_srcs) : m;
-    };
+    /* Same rule as emit_disasm_operands, so the annotation cannot
+     * disagree with the arrows: the addressing-src cleanup is part of the
+     * SYNTHESIZED default and a stated mask renders verbatim. */
 
     bool wrote_reg = false;
     line.append("deps:");
@@ -1347,7 +1389,6 @@ void emit_disasm_deps_annotation(std::string &line,
     for (size_t d = 0; d < n_dst; d++) {
         uint64_t m = d < it.dst_dep_mask.size() ? it.dst_dep_mask[d]
                                                 : default_mask;
-        m = effective(m);
         line.push_back(' ');
         append_regref(&line, ctx, it.dst_regs[d]);
         if (ctx.show_lanes) {
@@ -1364,7 +1405,6 @@ void emit_disasm_deps_annotation(std::string &line,
         uint64_t m = s < it.store_data_dep_mask.size()
                          ? it.store_data_dep_mask[s]
                          : default_mask;
-        m = effective(m);   /* saturated-only addressing-src cleanup */
         line.append(" sdata");
         line.append(std::to_string(s));
         if (ctx.show_lanes) {

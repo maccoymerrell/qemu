@@ -68,6 +68,7 @@ import csv
 import sys
 import glob
 import argparse
+import time
 import collections
 
 QEMU_ROOT = os.environ.get('CST_QEMU_ROOT', '/mnt/md0/QEMU/qemu')
@@ -247,11 +248,31 @@ def main():
     E = a.evidence
     t = Tree(a.root)
 
+    # EVIDENCE OLDER THAN THE BINARY IT WAS TAKEN FROM IS NOT EVIDENCE.
+    # This file scores files a leg wrote; nothing in it used to check that the
+    # leg ran against the QEMU now on disk, and that is how a hand-MERGED
+    # evidence directory came to be scored as though a script had produced it
+    # (2026-08-25: the merged directory held 2,715 rows the current
+    # REPRODUCE.sh cannot generate, and the published UNREACHABLE column
+    # depended on the difference).  A stale leg is a wrong answer, not a slow
+    # one, so it refuses by name.
+    _bins = [os.path.join(a.root, 'build', b)
+             for b in ('qemu-x86_64', 'qemu-system-x86_64')]
+    _newest = max((os.path.getmtime(b) for b in _bins if os.path.exists(b)),
+                  default=None)
+
     def need(p):
         q = os.path.join(E, p)
         if not os.path.exists(q):
             sys.exit('%s: missing.  A verdict this file cannot measure is not '
                      'a verdict it may assume' % q)
+        if _newest is not None and os.path.getmtime(q) < _newest:
+            sys.exit('STALE LEG -- %s is older than the QEMU it is supposed to '
+                     'have been measured against (%s).  Re-run the leg; a '
+                     'reachability verdict taken from a different binary is '
+                     'not a verdict at this tip.'
+                     % (q, time.strftime('%Y-%m-%d %H:%M:%S',
+                                         time.localtime(_newest))))
         return q
 
     cpl3 = load_tsv(need('r_max_postfix.tsv'), 'hex')

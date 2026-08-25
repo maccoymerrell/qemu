@@ -73,7 +73,22 @@ grep -h 'R7.1-NARROW' xl3.err iced.err
 #    decoded something and refused it later -- or ran it, which is the worst
 #    case and the one a signal alone cannot tell apart.
 gcc -O0 -Wall -static -o reach_probe reach_probe.c
-awk -F'\t' 'NR>1 && $2 != 1 { print $1 }' tracer_batch.tsv > reach_in.hex
+# THE INPUT SET IS NOT "the rows the decoder rejected", AND THAT DEFECT COST A
+# RE-MEASUREMENT.  Written that way, this file could not reproduce its own
+# published table: the legs were run over the rejected rows only, while the
+# matrix also needs a reachability verdict for every row the COMPARISON left
+# TRACER-SUBSET, ORTHOGONAL or UNACCOUNTED -- a row the tracer decodes but
+# gets wrong still costs nothing if no QEMU guest can execute it.  Measured
+# 2026-08-25 at 04e25599b5: rejected rows 2649, rows the matrix could not
+# retire for want of a leg 49, and the published UNREACHABLE was 2698.  The
+# banked evidence directory happened to hold the union because it had been
+# MERGED by hand; nothing in this script produced it.
+#
+# So the set is a FIXPOINT, and the second pass is not optional: run the legs,
+# score, ask the matrix which rows it could not measure, add exactly those and
+# run again.  The loop ends when the matrix names none, and the final matrix
+# run below refuses if any remain.
+awk -F'\t' 'NR>1 && $2 != 1 { print $1 }' tracer_batch.tsv | sort -u > reach_in.hex
 "$T"/reach_models.sh "$D"                 # -> r_max_postfix, model_matrix, illopc, cpuid/
 "$T"/sysprobe_run.sh "$D" max             # -> cpl0.tsv
 #  * CPL 0 removes the PRIVILEGE reading of a #UD.  It does not remove the
@@ -185,8 +200,34 @@ $PY compare_attrib.py     # -> ../attrib.tsv, ../attrib_signatures.txt
 # gating CPUID word, whether that word is inside a TCG_*_FEATURES mask, how
 # many configurations actually advertise it, and which builtin_x86_defs[]
 # models name it.  Exits 1 while any row is UNCOVERED -- which is the point.
+# `|| true` here and in the second pass is deliberate -- the matrix exits 1
+# while any row is UNCOVERED and the steps below it still have to run -- but
+# the status is NOT discarded: the final gate at the bottom of this file reads
+# the verdict back out of the matrix and is this script's exit status.
 $PY qemu_reach_matrix.py --evidence "$D" --attrib ../attrib.tsv \
     --meta ../opcodes_meta.tsv -o ../reach_matrix.tsv || true
+
+# ---- the second pass of the fixpoint ---------------------------------------
+# Every row the matrix could not retire for want of a leg goes back through the
+# legs, and the matrix is re-run.  A row that is still NOT-MEASURED after this
+# is a leg that refused to reach its subject, not a row without a verdict.
+awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i}
+     NR>1 && $h["verdict"]=="UNCOVERED" && $h["qemu_refusal"]=="NOT-MEASURED" \
+     { print $h["probe_hex"] }' ../reach_matrix.tsv | sort -u > reach_add.hex
+if [ -s reach_add.hex ]; then
+  echo "second pass: $(wc -l < reach_add.hex) rows had no reachability leg"
+  sort -u reach_in.hex reach_add.hex > reach_in.next && mv reach_in.next reach_in.hex
+  "$T"/reach_models.sh "$D"
+  "$T"/sysprobe_run.sh "$D" max
+  "$T"/sysprobe_enab_run.sh "$D" max
+  cp r_max_postfix.tsv reach.tsv
+  $PY qemu_reach_matrix.py --evidence "$D" --attrib ../attrib.tsv \
+      --meta ../opcodes_meta.tsv -o ../reach_matrix.tsv || true
+  awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i}
+       NR>1 && $h["qemu_refusal"]=="NOT-MEASURED" { n++ }
+       END { if (n) { print "STILL NOT-MEASURED: " n; exit 1 } }' \
+      ../reach_matrix.tsv || exit 1
+fi
 
 # ---- attribute every DECODED-THEN-REFUSED row to a line of QEMU -----------
 # The legs above say WHERE the refusal is not (not privilege, not a CPU model,
@@ -250,3 +291,21 @@ $PY "$T"/illopc_audit.py --matrix ../reach_matrix.tsv \
     --objdump "${CST_OBJDUMP_NEW:-objdump}" --objdump objdump \
     --allow-single-source "$T"/illopc_single_source.allow \
     -o ../illopc_audit.tsv
+
+# ---- the gate, and it is this script's exit status -------------------------
+# A reproduce script that always exits 0 is a reproduce script that cannot
+# fail.  The three-valued verdict is read back out of the matrix it just
+# wrote, printed, and turned into the status of this file.
+$PY - <<'EOF' || exit 1
+import csv, collections
+c = collections.Counter(r['verdict'] for r in
+                        csv.DictReader(open('../reach_matrix.tsv'),
+                                       delimiter='\t'))
+tot = sum(c.values())
+for k in ('COVERED', 'UNREACHABLE', 'UNCOVERED'):
+    print('%-12s %6d' % (k, c[k]))
+print('%-12s %6d' % ('total', tot))
+if c['COVERED'] + c['UNREACHABLE'] + c['UNCOVERED'] != tot:
+    raise SystemExit('a fourth value appeared in the verdict column')
+raise SystemExit(1 if c['UNCOVERED'] else 0)
+EOF

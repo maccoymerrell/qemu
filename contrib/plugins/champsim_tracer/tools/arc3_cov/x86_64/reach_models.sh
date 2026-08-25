@@ -69,7 +69,10 @@ cat > .one.sh <<'ONE'
 echo "$2" | "$1" -cpu max -d unimp -D unimp/"$2".log ./reach_probe >/dev/null 2>&1
 ONE
 chmod +x .one.sh
-xargs -P "$(nproc)" -I{} ./.one.sh "$U" {} < reach_in.hex
+# HOST LOAD CEILING (2026-08-25 ruling): never -P $(nproc).  This host has
+# 144 cores and the maintainer can hear it; concurrent agents compose, so
+# the default is 12 and CST_JOBS raises it deliberately or not at all.
+xargs -P "${CST_JOBS:-12}" -I{} ./.one.sh "$U" {} < reach_in.hex
 : > illopc.tsv
 while read -r h; do
     if grep -q ILLOPC unimp/"$h".log; then echo -e "$h\t1"; else echo -e "$h\t0"; fi

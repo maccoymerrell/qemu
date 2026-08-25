@@ -13,7 +13,11 @@
 #      axis did not fire.
 #   3. THE COMPARISON.  Exit status is non-zero when TRACER-SUBSET or
 #      UNACCOUNTED is non-zero, when an axis is INERT, or when the
-#      declared/compared identity does not hold.
+#      declared/compared identity does not hold.  THAT STATUS IS THIS
+#      SCRIPT'S TOO.  It used to be swallowed by `|| echo`, so the wrapper
+#      exited 0 over a comparison that had exited 1, and a coverage table
+#      published "rc 0" for a leg carrying 14 TRACER-SUBSET rows.  Each step
+#      now records its own status and the worst one is this script's.
 #   4. x86_64 ONLY -- THE THIRD REFERENCE.  PIN, on real silicon, running the
 #      same probes.  It writes a per-row adjudication and the comparison is
 #      then RE-RUN with it, so that a gem5 row a third witness overturns is
@@ -54,13 +58,19 @@ for g in $SET; do GUESTS="$GUESTS $OUT/probes/$g"; done
 COMMON="--isa $ISA --gem5-dir $GEM5_DIR --qemu-dir $QEMU_DIR \
         --decode $QEMU_DIR/build/contrib/plugins/cst_decode"
 
+WORST=0
+note() {  # remember a step's status instead of discarding it
+    [ "$1" -gt "$WORST" ] && WORST=$1
+    echo "$2 rc=$1"
+}
+
 # 1. THE CONTROL.
 "$PY" "$HERE/selftest_cp_gem5.py" $COMMON -o "$OUT/selftest" $GUESTS
 
 # 2. THE COMPARISON.
 "$PY" "$HERE/compare_exec_gem5.py" $COMMON \
       -o "$OUT/final" --tsv "$OUT/final/rows.tsv" $GUESTS \
-    || echo "compare_exec_gem5 rc=$? (named rows; see $OUT/final/REPORT.txt)"
+    || note $? "compare_exec_gem5 (named rows; see $OUT/final/REPORT.txt)"
 
 # 3. x86_64: the third reference, then the comparison again with its answer.
 if [ "$ISA" = x86_64 ]; then
@@ -71,12 +81,13 @@ if [ "$ISA" = x86_64 ]; then
         --gem5-out "$OUT/final" -o "$OUT/three" \
         --tsv "$OUT/three/rows.tsv" \
         --adjudication "$OUT/three/adjud.tsv" $GUESTS \
-        || echo "cmp3_x86 rc=$? (see $OUT/three/REPORT.txt)"
+        || note $? "cmp3_x86 (see $OUT/three/REPORT.txt)"
     "$PY" "$HERE/compare_exec_gem5.py" $COMMON \
         --pin-adjudicate "$OUT/three/adjud.tsv" \
         -o "$OUT/adjudicated" --tsv "$OUT/adjudicated/rows.tsv" $GUESTS \
-        || echo "compare_exec_gem5 (adjudicated) rc=$? -- see \
+        || note $? "compare_exec_gem5 (adjudicated) -- see \
 $OUT/adjudicated/REPORT.txt"
 fi
 
-echo "done: $OUT"
+echo "done: $OUT  (worst step rc=$WORST)"
+exit "$WORST"

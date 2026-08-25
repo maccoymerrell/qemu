@@ -266,7 +266,10 @@ already in place so scons' own `Python.h` conftest can link:
 
     git clone --depth 1 https://github.com/gem5/gem5 && cd gem5
     git apply /path/to/arc3_cov/gem5/gem5.patch
-    scons build/ARM/gem5.opt build/MIPS/gem5.opt build/X86/gem5.opt -j 64
+    scons build/ARM/gem5.opt build/MIPS/gem5.opt build/X86/gem5.opt -j 12
+    # -j 12 and not -j 64: the host load ceiling is 50% of 144 cores and
+    # concurrent agents compose.  An unbounded scons here is what produced
+    # the observed load of 183.
 
 Without that `LD_LIBRARY_PATH` the *build* fails too, and misleadingly:
 

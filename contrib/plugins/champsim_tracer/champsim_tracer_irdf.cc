@@ -66,6 +66,41 @@ const char *g_refusal = nullptr;        /* why, if !g_live */
 std::vector<uint8_t>     g_gen_of_reg;
 std::vector<const char *> g_reg_names;
 
+/*
+ * A global that is not architectural state at all.
+ *
+ * QEMU allocates TCG globals for its OWN bookkeeping -- the address and
+ * value a load-exclusive stashed, the condition and target a MIPS branch
+ * carries into its delay slot -- and those are not registers the guest ISA
+ * has, so the tracer is right to have no word for them.  Before this list
+ * existed they were counted `unmapped` and the WHOLE instruction was then
+ * discarded unscored, which is how every `ldxr`/`stxr` and every MIPS
+ * conditional branch fell out of the comparison.
+ *
+ * EXCLUDING is not the same as INVENTING a mapping, and the difference is
+ * the one the file is built around: a fabricated fold would score a wrong
+ * answer as agreement, whereas declaring a QEMU-internal temp out of the
+ * architectural namespace removes a name neither side ever claimed.  The
+ * count is reported separately anyway, so a reader can see how many rows
+ * became scoreable because of this list and can disbelieve it if they
+ * disagree with an entry.
+ */
+bool nonarch_global(const char *n)
+{
+    static const char *const kInternal[] = {
+        /* target/arm: the load-exclusive monitor.  Not architectural. */
+        "exclusive_addr", "exclusive_val", "exclusive_high",
+        /* target/mips: the delay-slot branch machinery, and the LL monitor. */
+        "bcond", "btarget", "lladdr",
+    };
+    for (const char *k : kInternal) {
+        if (!strcmp(n, k)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Counters.  Every instruction lands in exactly one of the first three. */
 uint64_t g_n_declined = 0;   /* extraction incomplete: QEMU refused to answer */
 uint64_t g_n_helper   = 0;   /* went through a helper: the walk cannot see in */
@@ -73,6 +108,7 @@ uint64_t g_n_fields   = 0;   /* touched CPU state the register namespace omits *
 uint64_t g_n_agree    = 0;
 uint64_t g_n_disagree = 0;
 uint64_t g_n_unmapped = 0;   /* had a register neither side can name in common */
+uint64_t g_n_nonarch  = 0;   /* scored, but a QEMU-internal temp was excluded */
 
 /*
  * The memop arm.
@@ -123,30 +159,100 @@ void tally(GHashTable **t, const char *key)
 }
 
 /*
- * The non-architectural globals, folded where the fold is a fact.
+ * Where QEMU's TCG-global name and the tracer's word are the same fact under
+ * two spellings, folded -- and every entry here is a MEASUREMENT, taken from
+ * this instrument's own namespace dump on that ISA, not a guess.  The
+ * comment this replaces promised exactly that ("per-ISA folds get added as
+ * each ISA is measured, not guessed") and then only x86_64 was ever
+ * measured, so three of the four ISAs ran with a namespace map nobody had
+ * looked at.  What that cost is recorded on each entry.
  *
- * x86's flags live in four TCG globals holding a lazy representation --
- * cc_op selects how cc_dst/cc_src/cc_src2 are to be read.  All four ARE the
- * flags register, so all four fold to REG_FLAGS.  That is the only fold
- * asserted here: it is checked by the oracle report, where every flags-
- * bearing instruction touches exactly these names.
+ * x86_64: the flags live in four globals holding a lazy representation --
+ *   cc_op selects how cc_dst/cc_src/cc_src2 are to be read.  All four ARE
+ *   the flags register.
  *
- * Everything else with no tracer word -- x86's segment BASES (a base is not
- * the selector the tracer models) and the MPX bound registers -- is left
- * unmapped ON PURPOSE and reported by name, because inventing a mapping for
- * a register the tracer has no concept of would score a fabrication as
- * agreement.  Per-ISA folds get added as each ISA is measured, not guessed.
+ * aarch64: NZCV is four separate one-bit globals, which is the same shape as
+ *   x86's cc_* quartet and gets the same fold.  The tracer's word for them
+ *   is REG_FLAGS (the aarch64 table reaches it through the GDB-stub name
+ *   "cpsr", which is not what the TCG global is called).
+ *
+ * mipsel: the accumulators.  QEMU names them HI0..HI3 / LO0..LO3; the
+ *   tracer's GDB-stub names are "hi" and "lo", so only the DSP-free pair
+ *   would ever have matched by name and in fact none did.
+ *
+ * pc, on every target that has a global for it: the tracer's REG_IP.  Both
+ *   sides drop REG_IP before scoring -- whether QEMU materialises the pc is
+ *   a property of where the TB ended -- but mapping it is still what lets
+ *   the instruction be SCORED at all rather than discarded as unmapped.
+ *
+ * Left unmapped ON PURPOSE, and reported by name: x86's segment BASES (a
+ * base is not the selector the tracer models) and the MPX bound registers.
+ * Inventing a mapping for a register the tracer has no concept of would
+ * score a fabrication as agreement.
  */
 uint8_t fold_nonarch(const char *name)
 {
     if (!strcmp(name, "cc_op") || !strcmp(name, "cc_dst") ||
         !strcmp(name, "cc_src") || !strcmp(name, "cc_src2")) {
-        return REG_FLAGS;
+        return REG_FLAGS;                       /* x86_64 */
+    }
+    if (!strcmp(name, "NF") || !strcmp(name, "ZF") ||
+        !strcmp(name, "CF") || !strcmp(name, "VF")) {
+        return REG_FLAGS;                       /* aarch64 */
+    }
+    if (!strcmp(name, "pc")) {
+        return REG_IP;
+    }
+    /* mipsel: HI<n>/LO<n> are the accumulator halves.  REG_ACC<n> names the
+     * LOW half and REG_ACCHI<n> the HIGH half of the same accumulator, so
+     * the pairing is exact rather than a fold onto one word. */
+    bool hi = !strncmp(name, "HI", 2), lo = !strncmp(name, "LO", 2);
+    if ((hi || lo) && name[2] >= '0' && name[2] <= '3' && name[3] == '\0') {
+        unsigned n = (unsigned)(name[2] - '0');
+        return (uint8_t)((hi ? REG_ACCHI0 : REG_ACC0) + n);
     }
     return REG_ID_COUNT;
 }
 
-/* Reverse of build_qemu_reg_reverse_index(): a QEMU register name -> id. */
+/*
+ * Reverse of build_qemu_reg_reverse_index(): a QEMU register name -> id.
+ *
+ * QEMU spells a TCG global whatever its target's translator passed to
+ * tcg_global_mem_new, and two of the four targets do not use the bare
+ * architectural name.  RISC-V builds a COMPOUND name, "x5/t0", joining the
+ * numeric and ABI spellings; MIPS suffixes the accumulator INDEX, "HI0".
+ * The tracer's tables carry the GDB-stub name -- "t0", "hi" -- so a plain
+ * whole-string compare misses both.  On riscv64 it missed the ENTIRE
+ * general-purpose register file: measured at ab9f839075, 1 of 101 globals
+ * mapped and the instrument scored 0 instructions on every probe, an ISA
+ * reporting no disagreements because it was making no comparisons.
+ *
+ * So the compare is tried against the whole name and then against each
+ * '/'-separated alias within it.  An alias is matched EXACTLY (after the
+ * split), never as a prefix: a prefix rule would let "x1" match "x1h", the
+ * upper half of a 128-bit register, and fold two different globals onto one
+ * word.
+ */
+bool name_matches(const char *tracer_name, const char *qemu_name)
+{
+    if (!strcasecmp(tracer_name, qemu_name)) {
+        return true;
+    }
+    for (const char *p = qemu_name; *p; ) {
+        const char *slash = strchr(p, '/');
+        size_t len = slash ? (size_t)(slash - p) : strlen(p);
+        if (len == strlen(tracer_name) &&
+            !strncasecmp(tracer_name, p, len)) {
+            return true;
+        }
+        if (!slash) {
+            break;
+        }
+        p = slash + 1;
+    }
+    return false;
+}
+
 uint8_t generic_for_qemu_name(const char *name)
 {
     if (!active_reg_table || active_reg_table_size == 0) {
@@ -157,8 +263,8 @@ uint8_t generic_for_qemu_name(const char *name)
         if (rc->n_regs != 0 || !reg_key_valid(&rc->qemu_reg)) {
             continue;
         }
-        if (rc->qemu_reg.name && !strcasecmp(rc->qemu_reg.name, name) &&
-            rc->reg_id < REG_ID_COUNT) {
+        if (rc->qemu_reg.name && rc->reg_id < REG_ID_COUNT &&
+            name_matches(rc->qemu_reg.name, name)) {
             return rc->reg_id;
         }
     }
@@ -203,9 +309,14 @@ void irdf_init_locked(void)
 }
 
 /* Collect a bitmap into the tracer's vocabulary.  Returns false if the set
- * held a register with no tracer word -- the caller must not score it. */
+ * held a register with no tracer word -- the caller must not score it.
+ *
+ * A QEMU-INTERNAL temp (nonarch_global) is neither: it is dropped and
+ * @nonarch is raised, so the instruction stays scoreable and the reader is
+ * still told the drop happened.  See nonarch_global() for why excluding is
+ * not the same as inventing a fold. */
 bool to_generic(const uint64_t *words, std::vector<uint8_t> &out,
-                const char **unmapped_name)
+                const char **unmapped_name, bool *nonarch)
 {
     bool whole = true;
     out.clear();
@@ -215,6 +326,10 @@ bool to_generic(const uint64_t *words, std::vector<uint8_t> &out,
         }
         uint8_t gen = g_gen_of_reg[i];
         if (gen >= REG_ID_COUNT) {
+            if (g_reg_names[i] && nonarch_global(g_reg_names[i])) {
+                *nonarch = true;
+                continue;
+            }
             if (whole && unmapped_name) {
                 *unmapped_name = g_reg_names[i];
             }
@@ -404,12 +519,16 @@ void irdf_note_insn(const struct qemu_plugin_tb *tb, size_t idx,
 
     std::vector<uint8_t> ir_r, ir_w;
     const char *unmapped = nullptr;
-    bool whole = to_generic(rd.data(), ir_r, &unmapped);
-    whole &= to_generic(wr.data(), ir_w, &unmapped);
+    bool nonarch = false;
+    bool whole = to_generic(rd.data(), ir_r, &unmapped, &nonarch);
+    whole &= to_generic(wr.data(), ir_w, &unmapped, &nonarch);
     if (!whole) {
         g_n_unmapped++;
         tally(&g_unmapped_by_name, unmapped ? unmapped : "?");
         return;
+    }
+    if (nonarch) {
+        g_n_nonarch++;
     }
 
     /* The tracer's own answer for the same encoding, decoded here so the
@@ -462,6 +581,14 @@ void irdf_report(GString *report)
     std::lock_guard<std::mutex> lk(g_lock);
 
     g_string_append_printf(report, "\n=== irdf: QEMU IR dataflow vs the tracer's decode ===\n");
+    g_string_append_printf(report,
+            "WHAT THIS NUMBER IS: an INTERNAL-CONSISTENCY check, not a\n"
+            "reference.  Both sides derive from this tree -- QEMU's own\n"
+            "translation of the encoding, and the tracer's Capstone decode of\n"
+            "the same bytes -- so agreement is evidence that the two accounts\n"
+            "of one machine still match, and a disagreement convicts one of\n"
+            "them without saying which.  It does not belong in any coverage\n"
+            "total that sums independent references.\n");
     if (!g_tried) {
         g_string_append_printf(report, "irdf=1 but no instruction was ever translated\n");
         return;
@@ -488,13 +615,22 @@ void irdf_report(GString *report)
     g_string_append_printf(report,
             "declined: %" PRIu64 " helper (work inside a call the walk cannot "
             "see into)\n"
-            "          %" PRIu64 " field  (touched CPU state the register "
-            "namespace omits -- vector, x87, selectors)\n"
+            "          %" PRIu64 " field  (touched CPU state the TCG-GLOBAL "
+            "namespace omits -- vector, x87, selectors.  That is THIS WALK's "
+            "ceiling, not QEMU's: qemu_plugin_insn_fields() reported the "
+            "access with an env_offset and a size and this instrument "
+            "discarded it)\n"
             "          %" PRIu64 " incomplete (extraction ran out of room)\n"
             "          -- NONE of these is a disagreement\n",
             g_n_helper, g_n_fields, g_n_declined);
     g_string_append_printf(report, "unmapped: %" PRIu64 " (touched a global with no tracer word; "
                "reported, never scored)\n", g_n_unmapped);
+    g_string_append_printf(report,
+            "nonarch:  %" PRIu64 " of the scored instructions touched a "
+            "QEMU-INTERNAL temp that is not architectural state (the "
+            "load-exclusive monitor, the MIPS delay-slot branch machinery); "
+            "that name was dropped from the IR side and the instruction was "
+            "still scored\n", g_n_nonarch);
 
     dump_tally(report, g_unmapped_by_name,
                "globals the tracer has no word for");

@@ -353,14 +353,25 @@ def main():
 
         if c3 is None or c0 is None or mm is None:
             refusal = 'NOT-MEASURED'
+        elif c3 == 0 or c0 == 255:
+            # MEASURED FIRST, and this ordering is the point.  The 0x62 and
+            # 0xd5 arms below are the only two labels in this function that
+            # are read off a BYTE rather than off an observation, and a byte
+            # test cannot notice that QEMU ran the encoding.  Asked in the
+            # old order, an encoding QEMU EXECUTES was still labelled by its
+            # first byte and, being uncompared, excused as UNREACHABLE --
+            # the worst outcome in the taxonomy, a guest instruction the
+            # tracer decodes nothing for, wearing a label that says nobody
+            # can reach it.  That is not hypothetical: at d602d838cf's parent
+            # QEMU decoded 0xd5 as AAD and RAN JMPABS, PUSHP and POPP, and
+            # those three rows would have been laundered here.
+            refusal = 'NONE-QEMU-EXECUTES-IT'
+        elif illopc.get(h):
+            refusal = 'NO-TABLE-ENTRY(ILLOPC)'
         elif op == '62':
             refusal = 'EVEX-PREFIX-NOT-DECODED'
         elif op == 'd5':
             refusal = 'REX2-PREFIX-IS-AN-OPCODE'
-        elif illopc.get(h):
-            refusal = 'NO-TABLE-ENTRY(ILLOPC)'
-        elif c3 == 0 or c0 == 255:
-            refusal = 'NONE-QEMU-EXECUTES-IT'
         else:
             refusal = 'DECODED-THEN-REFUSED'
 

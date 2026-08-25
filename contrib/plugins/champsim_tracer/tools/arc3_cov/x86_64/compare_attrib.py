@@ -497,6 +497,51 @@ def mechanism(mnem, ext, smiss, sextra, dmiss, dextra, refd, trd, flagwhy):
                 'explicit read-modify RFLAGS operand)')
     if 'REG_FLAGS' in allt:
         return 'M3b flag dependency wrong in another shape'
+
+    # ---- named surpluses.  Each of these was sitting in M7, whose own note
+    # says it "groups genuine phantoms with MPX/NOP identity rows; the label
+    # cannot say which a given row is" -- which is why it does not account and
+    # its rows stayed UNACCOUNTED.  Each case below names ONE mechanism and
+    # applies the R7 regfile-dependency test to it: would a renaming regfile
+    # have to respect this edge for the instruction to execute correctly?
+    if (mnem in ('INT', 'INT1', 'INT3', 'INTO')
+            and (se | de) <= {'REG_SP'} and not (sm or dm)):
+        # A trap gate pushes SS:RSP, RFLAGS and CS:RIP before the handler runs
+        # (SDM Vol.3 6.12.1).  The pushes go to RSP's value and RSP is updated,
+        # so the edge is one a renaming regfile must respect -- R7, answered
+        # yes.  XED's iform describes the INSTRUCTION's explicit operands and
+        # models no gate stack traffic, so the reference cannot name it.
+        return ('M9 trap-gate stack traffic: the reference models the '
+                'instruction operands, not the gate\'s pushes')
+    if (mnem in ('GETSEC', 'VMFUNC')
+            and (se | de) <= {'REG_GPR#'} and not (sm or dm)):
+        # The register set of a leaf-dispatched instruction depends on the leaf
+        # selector (EAX for GETSEC, EAX/ECX for VMFUNC).  R1 says an
+        # instruction has exactly ONE set, determined by the instruction alone,
+        # so the set is the union over the leaves -- which is what the tracer
+        # records.  XED's iform names the dispatch registers only.
+        return ('M10 leaf-dispatched instruction: the set is the union over '
+                'the leaves, the reference names the dispatch registers')
+    if (ext == 'CET' and (se | de) <= {'REG_SSP', 'REG_SYS'}
+            and not (sm or dm)):
+        # SSP and the IA32_PLn_SSP MSRs are implicit operands of the
+        # shadow-stack instructions: SETSSBSY reads PL0_SSP and writes SSP,
+        # CLRSSBSY writes it, RSTORSSP and SAVEPREVSSP read and write it.  A
+        # renaming regfile must respect every one of those edges.  XED's
+        # iforms carry the memory operand and not the shadow-stack register.
+        return ('M11 CET shadow-stack state: SSP and the PLn_SSP MSR are '
+                'implicit operands the reference iform does not carry')
+    if (mnem == 'SYSRET' and ext == 'LONGMODE'
+            and se == {'REG_GPR#'} and not (sm or dm or de)):
+        # SYSRET loads RIP from RCX and RFLAGS from R11 (SDM Vol.2, SYSRET).
+        # The reference's OWN other iform is the evidence: XED_IFORM_SYSRET64
+        # names {RCX, R11} and AGREES with the tracer, while
+        # XED_IFORM_SYSRET names RCX alone against an identical tracer set.
+        # One reference, two iforms, one instruction: the outlier is the
+        # reference's.
+        return ('M12 SYSRET R11: the reference\'s own SYSRET64 iform names '
+                'the register its SYSRET iform omits')
+
     if se or de:
         return 'M7 tracer names a register the reference does not (phantom)'
     return 'M8 other missing register'

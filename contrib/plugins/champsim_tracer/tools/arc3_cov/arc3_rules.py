@@ -71,6 +71,31 @@ X86 = {
     # i.e. exactly the rows nobody has interrogated.
     'M8':  Rule('M8', 'unaccounted', ANY, accounts=False,
                 note='residual bucket; restates the direction, names no cause'),
+
+    # ---- surpluses split out of M7, each naming ONE mechanism.  M7 does not
+    # account because it groups genuine phantoms with identity rows; these do,
+    # because each answers the R7 regfile-dependency test for its own class.
+    'M9':  Rule('M9', 'reference-gap', {SUPERSET},
+                note='a trap gate pushes SS:RSP, RFLAGS and CS:RIP before the '
+                     'handler runs, so RSP is read and written; XED\'s iform '
+                     'describes the instruction operands and models no gate '
+                     'stack traffic'),
+    'M10': Rule('M10', 'reference-gap', {SUPERSET},
+                note='the register set of a leaf-dispatched instruction '
+                     '(GETSEC, VMFUNC) depends on the leaf selector; R1 gives '
+                     'the instruction ONE set, which is the union over the '
+                     'leaves, and the reference names the dispatch registers '
+                     'only'),
+    'M11': Rule('M11', 'reference-gap', {SUPERSET},
+                note='SSP and the IA32_PLn_SSP MSRs are implicit operands of '
+                     'the CET shadow-stack instructions; the reference iform '
+                     'carries the memory operand and not the shadow-stack '
+                     'register'),
+    'M12': Rule('M12', 'reference-defect', {SUPERSET},
+                note='SYSRET loads RFLAGS from R11; XED_IFORM_SYSRET64 names '
+                     'it and AGREES with the tracer while XED_IFORM_SYSRET '
+                     'omits it against an identical tracer set, so the '
+                     'reference disagrees with itself about one instruction'),
 }
 
 

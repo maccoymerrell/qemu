@@ -65,7 +65,10 @@ ISAS = [
 EXEC_REFERENCE = {
     'x86_64':  'PIN (execution).  INS_RegR is EXPLICIT-OPERAND ONLY, so PIN\'s '
                'silence proves nothing; only its positive evidence counts.',
-    'riscv64': 'Spike (execution), destination-oriented.  NOT WIRED IN.',
+    'riscv64': 'Spike (execution), patched to state reads, load data and '
+               'load width.  Correct path: riscv64/spike/compare_exec.py.  '
+               'WRONG path: riscv64/spike/wp/compare_wp.py -- the only WP '
+               'execution reference on any ISA.',
     'aarch64': 'NONE.  No execution reference exists for this ISA.',
     'mipsel':  'NONE.  No execution reference exists for this ISA.',
 }
@@ -299,6 +302,13 @@ def main():
     w('carries mem_r / mem_w per subject and the comparison never reads them.')
     w('The numbers above are register attribution only and must not be quoted')
     w('as memop coverage.')
+    w('')
+    w('THE WRONG PATH.  Every number above is a CORRECT-PATH number.  The')
+    w('wrong-path arm is scored by exactly one harness on exactly one ISA --')
+    w('riscv64/spike/wp/compare_wp.py, which rebuilds the architectural state')
+    w('a trace says holds at an excursion and runs a real simulator from it.')
+    w('On aarch64, mipsel and x86_64 a wrong-path divergence is still')
+    w('invisible, and no row in this table would move if one existed.')
     w('')
     w('EXECUTION.  Three of the four ISAs are scored against a STATIC decoder')
     w('or an executable specification, not against a real run:')

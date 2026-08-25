@@ -3376,15 +3376,17 @@ static inline uint64_t read_reg_u64(unsigned int cpu_index,
 
 static void vcpu_insn_synth_ea_cb(unsigned int cpu_index, void *udata)
 {
-    if (g_wp_in_progress) {
-        return;
-    }
-    if (!g_trace_segments.is_active_atomic()) {
-        return;
-    }
-    /* Async-interrupt exclusion: drop synthetic-EA loads issued by a
-     * suppressed async handler (see the memop recorder rationale). */
-    if (g_capture_mute) {
+    /* A wrong-path excursion records the same memops the correct path does;
+     * MemAccessRecorder::record_synthetic_load has had its wp_mode arm since
+     * the synthetic-EA class was introduced, and this callback was the only
+     * thing keeping it unreachable.  The segment and async-mute gates are
+     * correct-path questions -- an excursion runs inside an active segment by
+     * construction, and g_capture_mute belongs to the suppressed async
+     * handler, not to the excursion -- so they are skipped in WP exactly the
+     * way the recorder skips them. */
+    const bool wp_mode = g_wp_in_progress;
+    if (!wp_mode &&
+        (!g_trace_segments.is_active_atomic() || g_capture_mute)) {
         return;
     }
     const SynthEAInsnRef *ref = (const SynthEAInsnRef *)udata;

@@ -91,7 +91,9 @@ bool nonarch_global(const char *n)
         /* target/arm: the load-exclusive monitor.  Not architectural. */
         "exclusive_addr", "exclusive_val", "exclusive_high",
         /* target/mips: the delay-slot branch machinery, and the LL monitor. */
-        "bcond", "btarget", "lladdr",
+        "bcond", "btarget", "lladdr", "llval",
+        /* target/riscv: the load-reserved monitor. */
+        "load_res", "load_val",
     };
     for (const char *k : kInternal) {
         if (!strcmp(n, k)) {
@@ -202,6 +204,22 @@ uint8_t fold_nonarch(const char *name)
     }
     if (!strcmp(name, "pc")) {
         return REG_IP;
+    }
+    /*
+     * The last two spellings a '/'-alias split cannot reach, because QEMU and
+     * the GDB stub disagree about the NAME rather than about the form.  Both
+     * were found by reading this instrument's own dump, not predicted.
+     *
+     * aarch64: the TCG global is "lr"; the GDB core feature calls x30 "x30",
+     *   which is what the tracer's table carries.
+     * riscv64: the TCG global is "x8/s0", spelling x8 by its ABI name; the
+     *   RISC-V GDB stub calls x8 "fp", which is what the table carries.
+     */
+    if (!strcmp(name, "lr")) {
+        return REG_LR;
+    }
+    if (!strcmp(name, "x8/s0")) {
+        return REG_FP_REG;
     }
     /* mipsel: HI<n>/LO<n> are the accumulator halves.  REG_ACC<n> names the
      * LOW half and REG_ACCHI<n> the HIGH half of the same accumulator, so

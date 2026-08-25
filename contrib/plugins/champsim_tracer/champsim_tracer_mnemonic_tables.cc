@@ -536,9 +536,36 @@ void dep_passthrough(const struct qemu_plugin_insn_info *info, InsnFields *f)
         for (uint8_t l = 0; l < f->max_dep_loads; l++) {
             m |= ((uint64_t)1 << (f->n_src_regs + l));
         }
+        /*
+         * A WRITEBACK DESTINATION IS NOT PRODUCED BY THE LOAD.  The
+         * multi-destination shape is not only the register-list forms this
+         * branch was written for: a post/pre-index load reaches it too,
+         * because the base register it updates is a second destination.
+         * `ldr x1, [x0], #8` on AArch64 arrives n_dst_regs=2 with
+         * dst=[x1, x0], every source addressing, and binding EVERY
+         * destination to the load slot said x0 -- the incremented base --
+         * waits on memory.  It does not: its value is x0 + 8, available at
+         * AGU time, and a consumer told otherwise serialises the pointer
+         * walk of every strided loop behind its own load return.
+         *
+         * The writeback destination is exactly the destination that is also
+         * a SOURCE, and its inputs are exactly the address sources of the
+         * access plus the immediate displacement.  Measured against gem5's
+         * `addxi_uop x0, x0, #8` on 11 distinct instruction identities of
+         * the mixed benchmark's first 1.5M instructions, four AArch64
+         * families (LDR / LDRB / LDRSB / LDRSW).
+         */
+        const uint64_t wb_imm = f->has_immediate
+            ? ((uint64_t)1 << (f->n_src_regs + f->max_dep_loads)) : 0;
         for (uint8_t d = 0; d < f->n_dst_regs && d < MAX_DST_REGS;
              d++) {
-            f->dst_dep_mask[d] = m;
+            uint64_t self = 0;
+            for (uint8_t i = 0; i < f->n_src_regs; i++) {
+                if (f->src_regs[i] == f->dst_regs[d]) {
+                    self |= ((uint64_t)1 << i);
+                }
+            }
+            f->dst_dep_mask[d] = self ? (addr_m | self | wb_imm) : m;
         }
         f->has_reg_deps = true;
         return;

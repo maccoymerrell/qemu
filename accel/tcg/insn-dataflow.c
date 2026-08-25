@@ -89,9 +89,11 @@ typedef struct DfGvecNote {
 typedef struct DfMemopNote {
     const TCGOp *anchor;
     const void *val_ts;
+    unsigned nval;              /* consecutive temps the value occupies */
     const void *addr_ts;
     unsigned size;
     bool is_store;
+    int rec;                    /* which memop record this note filled, or -1 */
 } DfMemopNote;
 
 /* CP-H: one per helper call, carrying what tcg_gen_callN had and the op lost. */
@@ -242,7 +244,7 @@ static int df_intern(uint32_t off)
         }
     }
     if (df_nslots >= INSN_DF_MAX_FIELD_SLOTS ||
-        base + df_nslots >= INSN_DF_MAX_REGS) {
+        base + df_nslots >= INSN_DF_MEMOP_PROV_BASE) {
         df_slots_overflow = true;
         return -1;
     }
@@ -345,6 +347,46 @@ static FILE *df_dumping(void)
     return df_dump;
 }
 
+/*
+ * Print one provenance set: register names, @offset for an env field, and
+ * L<slot> for the value an access returned.
+ *
+ * The load-data bits have to be spelled or a load's destination prints
+ * `from=-`, which every reader of this dump takes to mean "came from
+ * nothing" -- the broken-dependency-chain signal.  A new namespace region
+ * that prints as absence would have turned every load into a false zeroing
+ * idiom.
+ */
+static void df_emit_prov(FILE *f, const uint64_t *pv, unsigned nregs)
+{
+    unsigned k = 0;
+
+    for (unsigned b = 0; b < INSN_DF_MAX_REGS; b++) {
+        unsigned slot;
+        bool ok;
+
+        if (!df_test(pv, b)) {
+            continue;
+        }
+        if (b < nregs) {
+            const char *rn = insn_dataflow_reg_name(b, NULL, NULL);
+
+            fprintf(f, "%s%s", k++ ? "," : "", rn ? rn : "?");
+        } else if (insn_dataflow_prov_memop(b, &slot)) {
+            fprintf(f, "%sL%u", k++ ? "," : "", slot);
+        } else {
+            uint32_t foff = insn_dataflow_prov_field(b, &ok);
+
+            if (ok) {
+                fprintf(f, "%s@%u", k++ ? "," : "", foff);
+            }
+        }
+    }
+    if (!k) {
+        fputc('-', f);
+    }
+}
+
 static void df_emit(uint64_t pc, const InsnDataflow *d)
 {
     FILE *f = df_dumping();
@@ -376,18 +418,7 @@ static void df_emit(uint64_t pc, const InsnDataflow *d)
             fprintf(f, "D 0x%" PRIx64 " w reg=%s off=%u size=%u via=arg "
                     "op=df argno=0 from=", pc, nm, off, size);
             if (pv) {
-                unsigned k = 0;
-
-                for (unsigned r = 0; r < n; r++) {
-                    if (df_test(pv, r)) {
-                        const char *rn = insn_dataflow_reg_name(r, NULL, NULL);
-
-                        fprintf(f, "%s%s", k++ ? "," : "", rn ? rn : "?");
-                    }
-                }
-                if (!k) {
-                    fputc('-', f);
-                }
+                df_emit_prov(f, pv, n);
             } else {
                 fputc('-', f);
             }
@@ -406,31 +437,9 @@ static void df_emit(uint64_t pc, const InsnDataflow *d)
                     "argno=0\n", pc, fl->off, fl->size);
         }
         if (fl->dir & INSN_DF_WR) {
-            unsigned k = 0;
-
             fprintf(f, "D 0x%" PRIx64 " w reg=? off=%u size=%u via=st op=df "
                     "argno=0 from=", pc, fl->off, fl->size);
-            for (unsigned b = 0; b < INSN_DF_MAX_REGS; b++) {
-                bool ok;
-                uint32_t foff;
-
-                if (!df_test(fl->prov, b)) {
-                    continue;
-                }
-                if (b < n) {
-                    const char *rn = insn_dataflow_reg_name(b, NULL, NULL);
-
-                    fprintf(f, "%s%s", k++ ? "," : "", rn ? rn : "?");
-                } else {
-                    foff = insn_dataflow_prov_field(b, &ok);
-                    if (ok) {
-                        fprintf(f, "%s@%u", k++ ? "," : "", foff);
-                    }
-                }
-            }
-            if (!k) {
-                fputc('-', f);
-            }
+            df_emit_prov(f, fl->prov, n);
             fputc('\n', f);
         }
     }
@@ -439,6 +448,30 @@ static void df_emit(uint64_t pc, const InsnDataflow *d)
     }
     for (unsigned i = 0; i < d->n_mem_wr; i++) {
         fprintf(f, "D 0x%" PRIx64 " w mem op=df\n", pc);
+    }
+    /*
+     * CP-M: the accesses as the emitters stated them.  A separate record
+     * type rather than more of the D lines above, because what it carries is
+     * the thing those lines cannot say -- which registers computed the
+     * ADDRESS, and separately which produced the DATA.
+     */
+    for (unsigned i = 0; i < d->n_memops; i++) {
+        const InsnDataflowMemop *mo = &d->memops[i];
+
+        fprintf(f, "M 0x%" PRIx64 " %s slot=%u size=%u addr=", pc,
+                mo->is_store ? "st" : "ld", i, mo->size);
+        df_emit_prov(f, mo->addr_prov, n);
+        fputs(" data=", f);
+        if (mo->is_store) {
+            df_emit_prov(f, mo->data_prov, n);
+        } else {
+            fprintf(f, "L%u", i);
+        }
+        fputc('\n', f);
+    }
+    if (d->memops_overflow || d->memops_unnoted) {
+        fprintf(f, "M 0x%" PRIx64 " incomplete overflow=%u unnoted=%u\n",
+                pc, d->memops_overflow, d->memops_unnoted);
     }
     fprintf(f, "A 0x%" PRIx64 " ops=0 calls=%u opaque=%u\n",
             pc, d->n_calls, d->n_calls);
@@ -521,6 +554,18 @@ static bool df_test(const uint64_t *p, unsigned bit)
 {
     return bit < INSN_DF_MAX_REGS && (p[bit / 64] & (1ULL << (bit % 64)));
 }
+
+/*
+ * The load-data bits, as a mask over the top provenance word.
+ *
+ * They are the top INSN_DF_MAX_MEMOPS bits of the namespace so that the
+ * whole region lives in one word and clearing it costs one AND -- which
+ * matters because it is cleared once per instruction, see
+ * df_settle_memop_prov().
+ */
+QEMU_BUILD_BUG_ON(INSN_DF_MEMOP_PROV_BASE / 64 != INSN_DF_REG_WORDS - 1);
+#define DF_MEMOP_WORD  (INSN_DF_REG_WORDS - 1)
+#define DF_MEMOP_MASK  (~0ULL << (INSN_DF_MEMOP_PROV_BASE % 64))
 
 /*
  * Is @ts a guest register?
@@ -667,12 +712,147 @@ void insn_dataflow_note_reset(void)
 static const DfHelperNote *df_find_helper(const TCGOp *op);
 static bool df_helper_usage_of(const char *name, unsigned argno, uint8_t *dir);
 
+/* Fold @n consecutive temps' provenance -- and their own bits -- into @dst. */
+static void df_prov_add_temps(uint64_t *dst, const void *tsv, unsigned n)
+{
+    TCGContext *s = tcg_ctx;
+    TCGTemp *ts = (TCGTemp *)(uintptr_t)tsv;
+
+    for (unsigned i = 0; i < n; i++) {
+        size_t ti = (size_t)((ts + i) - s->temps);
+        unsigned idx;
+
+        /*
+         * These pointers came from an emitter rather than from the op
+         * stream, so they are bounds-checked here and nowhere else.  A temp
+         * outside the array would otherwise read whatever follows it and
+         * call the result a dependency.
+         */
+        if (ti >= TCG_MAX_TEMPS) {
+            continue;
+        }
+        df_or(dst, df_prov_of(ti));
+        if (df_reg(ts + i, &idx)) {
+            df_bit(dst, idx);
+        }
+    }
+}
+
+/*
+ * Attribute one qemu_ld/qemu_st op to the note its emitter left, and for a
+ * load return the provenance bit that stands for the value it returned.
+ *
+ * Matching is by ORDER within the anchor ranges rather than by op identity,
+ * because one note can cover more than one op: a 128-bit access a host
+ * cannot perform atomically is emitted as two 64-bit ones by the same
+ * emitter, under one note that states the real width.  The note's anchor is
+ * the last op that existed when that emitter returned, so every memop op up
+ * to and including the anchor belongs to it, and @cursor walks the notes in
+ * step with the op walk.
+ *
+ * An op with no note is recorded as such rather than guessed at.  It would
+ * mean a path reached gen_ldst() without passing an emitter that states its
+ * operands, and from that point on the notes and the ops are out of step --
+ * so the alternative to saying so is attributing one access's address
+ * registers to a different access, which is a fabricated dependency wearing
+ * the shape of a real one.
+ */
+static int df_memop_apply(InsnDataflow *d, bool store, unsigned *cursor)
+{
+    DfMemopNote *n;
+    InsnDataflowMemop *m;
+
+    if (*cursor >= df_n_memop) {
+        d->memops_unnoted = 1;
+        return -1;
+    }
+    n = &df_memop[*cursor];
+    if (n->is_store != store || n->rec >= (int)d->n_memops) {
+        /*
+         * Either the note and the op disagree about the direction, or the
+         * note was already spent on a previous instruction -- both mean the
+         * two streams are no longer in step, and the record this would fill
+         * would describe a different access.
+         */
+        d->memops_unnoted = 1;
+        return -1;
+    }
+    if (n->rec < 0) {
+        if (d->n_memops >= INSN_DF_MAX_MEMOPS) {
+            d->memops_overflow = 1;
+            return -1;
+        }
+        n->rec = (int)d->n_memops++;
+        m = &d->memops[n->rec];
+        m->is_store = store;
+        m->size = n->size > UINT8_MAX ? UINT8_MAX : (uint8_t)n->size;
+        df_prov_add_temps(m->addr_prov, n->addr_ts, 1);
+        if (store) {
+            df_prov_add_temps(m->data_prov, n->val_ts, n->nval);
+        }
+    }
+    return store ? -1 : (int)(INSN_DF_MEMOP_PROV_BASE + n->rec);
+}
+
+/*
+ * Retire this instruction's load-data bits from the temp table.
+ *
+ * A load-data bit means "the value load slot k of THIS instruction
+ * returned", so it must not survive into the next instruction, where slot k
+ * is a different access.  The temps that carry it are the ones this
+ * instruction wrote, which is why the range is tracked as it goes rather
+ * than rediscovered by scanning all TCG_MAX_TEMPS.
+ *
+ * Leaving is not the same as dropping.  A value that outlives the
+ * instruction that loaded it -- a translator holding a loaded value in a
+ * temp across a guest instruction boundary -- keeps a dependency, and it is
+ * restated in the only namespace that survives the boundary: the registers
+ * that computed the address.  That is what the walk said before this choke
+ * point existed, so crossing the boundary costs the precision CP-M added and
+ * never a dependency.
+ */
+static void df_settle_memop_prov(const InsnDataflow *d, size_t lo, size_t hi)
+{
+    if (lo > hi) {
+        return;
+    }
+    for (size_t i = lo; i <= hi; i++) {
+        uint64_t *p;
+
+        if (df_stamp[i] != df_gen) {
+            continue;
+        }
+        p = df_prov[i];
+        if (!(p[DF_MEMOP_WORD] & DF_MEMOP_MASK)) {
+            continue;
+        }
+        for (unsigned k = 0; k < d->n_memops; k++) {
+            if (df_test(p, INSN_DF_MEMOP_PROV_BASE + k)) {
+                df_or(p, d->memops[k].addr_prov);
+            }
+        }
+        p[DF_MEMOP_WORD] &= ~DF_MEMOP_MASK;
+    }
+}
+
 /* Walk one instruction's ops: [first, end). */
-static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end)
+static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
+                    unsigned *memop_cursor)
 {
     TCGContext *s = tcg_ctx;
     TCGTemp *env_ts = tcgv_ptr_temp(tcg_env);
     uint64_t prov[INSN_DF_REG_WORDS];
+    TCGOp *prev_op = NULL;
+    /*
+     * The temps this instruction gave a LOAD-DATA bit to, as a range.
+     *
+     * Only those, not every temp it wrote: the range is what
+     * df_settle_memop_prov() walks at the end of the instruction, and
+     * tracking every write instead made that walk span most of the temp
+     * array on instructions that had no load at all -- measured at +24% on
+     * the extraction's own time, for a scan that could not find anything.
+     */
+    size_t tlo = TCG_MAX_TEMPS, thi = 0;
 
     for (TCGOp *op = first; op != end; op = QTAILQ_NEXT(op, link)) {
         const TCGOpDef *def = &tcg_op_defs[op->opc];
@@ -680,6 +860,19 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end)
         bool store;
         uint32_t size;
         int ld_field_bit = -1;
+        int memop_data_bit = -1;
+
+        /*
+         * A note's anchor is the last op its emitter had produced, so the
+         * cursor moves past it once that op has been walked.  Done here, on
+         * entry to the NEXT op, because the early continues below would
+         * otherwise skip it for an anchor that is a call or a discard.
+         */
+        while (prev_op != NULL && *memop_cursor < df_n_memop &&
+               df_memop[*memop_cursor].anchor == prev_op) {
+            (*memop_cursor)++;
+        }
+        prev_op = op;
 
         if (op->opc == INDEX_op_insn_start) {
             continue;
@@ -909,7 +1102,13 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end)
                     df_bit(d->wr, idx);
                     df_add_write(d, idx, prov);
                 } else {
-                    df_or(df_prov_of(ts - s->temps), prov);
+                    size_t ti = ts - s->temps;
+
+                    df_or(df_prov_of(ti), prov);
+                    if (prov[DF_MEMOP_WORD] & DF_MEMOP_MASK) {
+                        tlo = MIN(tlo, ti);
+                        thi = MAX(thi, ti);
+                    }
                 }
             }
             if (model > d->helper_model) {
@@ -969,12 +1168,14 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end)
         case INDEX_op_qemu_ld_i64:
         case INDEX_op_qemu_ld_i128:
             d->n_mem_rd++;
+            memop_data_bit = df_memop_apply(d, false, memop_cursor);
             break;
         case INDEX_op_qemu_st_i32:
         case INDEX_op_qemu_st_i64:
         case INDEX_op_qemu_st8_i32:
         case INDEX_op_qemu_st_i128:
             d->n_mem_wr++;
+            (void)df_memop_apply(d, true, memop_cursor);
             break;
         default:
             break;
@@ -991,6 +1192,20 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end)
             }
         }
 
+        /*
+         * What a load returned did not come from the registers that computed
+         * its address -- it came from memory, and the address is a separate
+         * dependency with a separate latency.  The op cannot say so (its
+         * only input IS the address temp), so the emitter's note does: the
+         * value's provenance becomes the bit standing for this access, and
+         * the address registers stay where they belong, in the access's own
+         * addr_prov and in the instruction's read set.
+         */
+        if (memop_data_bit >= 0) {
+            memset(prov, 0, sizeof(prov));
+            df_bit(prov, (unsigned)memop_data_bit);
+        }
+
         for (unsigned i = 0; i < nb_oargs; i++) {
             TCGTemp *ts = arg_temp(op->args[i]);
 
@@ -998,8 +1213,13 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end)
                 df_bit(d->wr, idx);
                 df_add_write(d, idx, prov);
             } else {
-                uint64_t *dp = df_prov_of(ts - s->temps);
+                size_t ti = ts - s->temps;
+                uint64_t *dp = df_prov_of(ti);
 
+                if (prov[DF_MEMOP_WORD] & DF_MEMOP_MASK) {
+                    tlo = MIN(tlo, ti);
+                    thi = MAX(thi, ti);
+                }
                 memcpy(dp, prov, sizeof(prov));
                 /*
                  * A load's value came from the field it loaded, which the
@@ -1045,6 +1265,12 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end)
             df_set_envoff(di, v);
         }
     }
+
+    while (prev_op != NULL && *memop_cursor < df_n_memop &&
+           df_memop[*memop_cursor].anchor == prev_op) {
+        (*memop_cursor)++;
+    }
+    df_settle_memop_prov(d, tlo, thi);
 }
 
 /*
@@ -1119,7 +1345,8 @@ static void df_apply_gvec_notes(InsnDataflow *d, TCGOp *first, TCGOp *end)
  * input, so the loaded value's provenance comes out as the address
  * registers.
  */
-void insn_dataflow_note_memop(const void *val_ts, const void *addr_ts,
+void insn_dataflow_note_memop(const void *val_ts, unsigned nval,
+                              const void *addr_ts,
                               unsigned size, bool is_store)
 {
     if (df_disabled()) {
@@ -1132,9 +1359,11 @@ void insn_dataflow_note_memop(const void *val_ts, const void *addr_ts,
     }
     df_memop[df_n_memop].anchor = QTAILQ_LAST(&tcg_ctx->ops);
     df_memop[df_n_memop].val_ts = val_ts;
+    df_memop[df_n_memop].nval = nval;
     df_memop[df_n_memop].addr_ts = addr_ts;
     df_memop[df_n_memop].size = size;
     df_memop[df_n_memop].is_store = is_store;
+    df_memop[df_n_memop].rec = -1;
     df_n_memop++;
 }
 
@@ -1303,6 +1532,7 @@ void insn_dataflow_extract(unsigned num_insns)
     TCGContext *s = tcg_ctx;
     TCGOp *op, *first = NULL;
     unsigned idx = 0;
+    unsigned memop_cursor;
     bool prof;
     int64_t t0;
 
@@ -1325,12 +1555,21 @@ void insn_dataflow_extract(unsigned num_insns)
     }
     memset(df_out, 0, num_insns * sizeof(df_out[0]));
 
+    /*
+     * One cursor for the whole block: the notes were made in emission order,
+     * the instructions are walked in that same order, and a memop op is
+     * matched to the note whose anchor range it falls in.  A local rather
+     * than file scope because it belongs to this translation, and a
+     * translation belongs to one context.
+     */
+    memop_cursor = 0;
+
     QTAILQ_FOREACH(op, &s->ops, link) {
         if (op->opc != INDEX_op_insn_start) {
             continue;
         }
         if (first != NULL && idx > 0) {
-            df_insn(&df_out[idx - 1], first, op);
+            df_insn(&df_out[idx - 1], first, op, &memop_cursor);
             df_apply_gvec_notes(&df_out[idx - 1], first, op);
         }
         if (idx >= num_insns) {
@@ -1341,7 +1580,7 @@ void insn_dataflow_extract(unsigned num_insns)
         first = QTAILQ_NEXT(op, link);
     }
     if (first != NULL && idx > 0) {
-        df_insn(&df_out[idx - 1], first, NULL);
+        df_insn(&df_out[idx - 1], first, NULL, &memop_cursor);
         df_apply_gvec_notes(&df_out[idx - 1], first, NULL);
     }
     df_ninsns = idx;
@@ -1367,6 +1606,18 @@ void insn_dataflow_extract(unsigned num_insns)
         /* Same direction as fields_overflow: say so rather than lose it. */
         for (unsigned i = 0; i < df_ninsns; i++) {
             df_out[i].fields_overflow = 1;
+        }
+    }
+    if (df_memop_overflow) {
+        /*
+         * The block ran out of note slots, so somewhere past that point an
+         * access has no note and the memop records are short.  Which
+         * instruction it was is not recoverable here, so every instruction
+         * in the block is marked: an over-broad refusal, never a quiet
+         * partial answer.
+         */
+        for (unsigned i = 0; i < df_ninsns; i++) {
+            df_out[i].memops_overflow = 1;
         }
     }
     df_n_gvec = 0;
@@ -1436,6 +1687,26 @@ uint32_t insn_dataflow_prov_field(unsigned bit, bool *valid)
  * instruction when the exhaustion happened in another is being told something
  * pessimistic, which is the direction this code errs in everywhere else.
  */
+/*
+ * Is @bit one of the load-data bits, and if so which of this instruction's
+ * accesses does it stand for?
+ *
+ * The caller still has to hold the memop records to make anything of the
+ * slot number, which is deliberate: a bit that resolves to an access the
+ * caller has not looked at is a bit it cannot attribute, and attributing it
+ * to a register instead is the mistake this whole region exists to prevent.
+ */
+bool insn_dataflow_prov_memop(unsigned bit, unsigned *slot)
+{
+    if (bit < INSN_DF_MEMOP_PROV_BASE || bit >= INSN_DF_MAX_REGS) {
+        return false;
+    }
+    if (slot) {
+        *slot = bit - INSN_DF_MEMOP_PROV_BASE;
+    }
+    return true;
+}
+
 bool insn_dataflow_prov_truncated(void)
 {
     return df && df_slots_overflow;

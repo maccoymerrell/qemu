@@ -8,11 +8,13 @@
  * PLUGIN_DF_SET accessors, which is the kind of stale claim that sends a
  * reader looking for work already done.)
  *
- * WHAT IS STILL NOT DONE, so the distinction stays visible: no plugin CALLS
- * any of this yet.  champsim_tracer still takes its register and memory
- * dataflow from Capstone; wiring it to these accessors -- and measuring the
- * two against each other on the same encodings -- is the remaining work of
- * the behavioural-oracle arc.
+ * WHAT IS STILL NOT DONE, so the distinction stays visible: champsim_tracer
+ * still takes the register and memory dataflow it PUBLISHES from Capstone.
+ * What it does call these for is the irdf instrument, which scores the two
+ * accounts against each other on every encoding it translates and writes the
+ * verdict to a log.  Reading is not substituting: nothing here reaches the
+ * wire, and the substitution is the remaining work of the behavioural-oracle
+ * arc.
  *
  * Why the API looks defensive
  * ---------------------------
@@ -192,6 +194,18 @@ unsigned qemu_plugin_insn_reg_kills(const struct qemu_plugin_tb *tb, size_t idx,
  * Returns words needed, as above; 0 with a successful call means the
  * provenance is empty.  @reg must be in the write set.
  */
+/*
+ * How many words a PROVENANCE set needs.
+ *
+ * Not the same as the register sets need.  A read or write set holds TCG
+ * globals only; a provenance set also holds the env byte ranges the block
+ * interned and the load-data bits, which live above the globals in the same
+ * namespace.  QEMU knows how wide that is and the plugin cannot, so it is
+ * asked for rather than assumed -- the same reason nregs is a call.
+ */
+QEMU_PLUGIN_API
+unsigned qemu_plugin_dataflow_prov_words(void);
+
 QEMU_PLUGIN_API
 unsigned qemu_plugin_insn_write_prov(const struct qemu_plugin_tb *tb,
                                      size_t idx, unsigned reg,
@@ -231,6 +245,79 @@ unsigned qemu_plugin_insn_field_prov(const struct qemu_plugin_tb *tb,
                                      uint64_t *words, unsigned nwords);
 QEMU_PLUGIN_API
 bool qemu_plugin_dataflow_prov_field(unsigned bit, uint32_t *env_offset);
+
+/*
+ * The guest memory accesses of an instruction, as the emitters stated them.
+ *
+ * A post-hoc walk over the ops cannot tell a load's DATA from its ADDRESS:
+ * qemu_ld carries the address temp as its only input, so the loaded value's
+ * provenance comes out as the address registers and `mov (%rbx),%rax` is
+ * indistinguishable from `mov %rbx,%rax`.  A store is worse -- it has no
+ * output at all, and its two inputs are the data and the address with
+ * nothing in the op to say which is which.  Both facts ARE stated, one call
+ * earlier, as separate parameters of tcg_gen_qemu_ld/st_*, and that is where
+ * these records come from.
+ *
+ * So a consumer gets the two dependencies apart: which registers computed
+ * the address, and separately which produced the value.  The load-to-use
+ * edge -- what a model of a memory hierarchy is built on -- exists only in
+ * that separation.
+ *
+ * Accesses are in the order the target emitted them.  ONE record can cover
+ * more than one op: a 128-bit access a host cannot perform atomically is
+ * emitted as two 64-bit ones, and it is one access of 16 bytes.
+ */
+typedef struct qemu_plugin_dataflow_memop {
+    uint32_t struct_size;       /* caller sets to sizeof(*this) */
+    uint32_t size;              /* access width in bytes */
+    uint32_t is_store;
+} qemu_plugin_dataflow_memop;
+
+/*
+ * Returns the number of accesses, writing them only if @nmemops is at least
+ * that many -- the same refuse-rather-than-truncate rule as the register
+ * sets, for the same reason.
+ *
+ * Returns QEMU_PLUGIN_DF_INCOMPLETE when the record set is not whole: more
+ * accesses than could be recorded, an access no emitter accounted for, or a
+ * provenance that lost a field to slot exhaustion.  A short list of accesses
+ * is the shape most likely to pass for a complete one.
+ */
+QEMU_PLUGIN_API
+unsigned qemu_plugin_insn_memops(const struct qemu_plugin_tb *tb, size_t idx,
+                                 qemu_plugin_dataflow_memop *out,
+                                 unsigned nmemops);
+
+/*
+ * The two provenance sets of one access, in the register namespace above.
+ *
+ *   addr  what computed the address.  Present for both directions.
+ *   data  what produced the value.  A STORE's data comes from registers and
+ *         is given here; a LOAD's does not come from registers at all -- it
+ *         came from memory -- and is stated instead by the loaded value's
+ *         own provenance bit, which qemu_plugin_dataflow_prov_memop() maps
+ *         back to this access.  data is empty for a load, and that emptiness
+ *         is a fact rather than a gap.
+ */
+QEMU_PLUGIN_API
+unsigned qemu_plugin_insn_memop_addr_prov(const struct qemu_plugin_tb *tb,
+                                          size_t idx, unsigned memop,
+                                          uint64_t *words, unsigned nwords);
+QEMU_PLUGIN_API
+unsigned qemu_plugin_insn_memop_data_prov(const struct qemu_plugin_tb *tb,
+                                          size_t idx, unsigned memop,
+                                          uint64_t *words, unsigned nwords);
+
+/*
+ * Is this provenance bit a loaded value, and if so which access produced it?
+ *
+ * The third region of the namespace, and the reason a write provenance can
+ * now say "this came from the load" rather than naming the address registers
+ * a second time.  A consumer that never asks cannot be misled: a bit that
+ * resolves to neither a register nor a field is one it must not attribute.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_dataflow_prov_memop(unsigned bit, unsigned *slot);
 
 /*
  * Anything the extraction could not represent.
@@ -281,6 +368,9 @@ typedef struct qemu_plugin_dataflow_status {
      * merely coarse.
      */
     uint32_t n_helper_unbounded;
+    uint8_t  memops_truncated;  /* more accesses than could be recorded */
+    uint8_t  memops_unnoted;    /* an access no emitter note accounted for */
+    uint8_t  reserved[2];
 } qemu_plugin_dataflow_status;
 
 /*

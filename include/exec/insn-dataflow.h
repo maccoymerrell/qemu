@@ -58,6 +58,30 @@
 
 /* tcg_gen_gvec_5_ool/_ptr is the widest: one destination and four sources. */
 #define INSN_DF_MAX_GVEC_OPERANDS 5
+/*
+ * Guest memory accesses recorded per instruction.  The widest real cases are
+ * AArch64's LD4/ST4 (four) and 32-bit x86's PUSHA (eight); beyond that the
+ * count is flagged rather than silently short.
+ */
+#define INSN_DF_MAX_MEMOPS  8
+
+/*
+ * The third region of the provenance namespace: the DATA a load returned.
+ *
+ * Bits below insn_dataflow_nregs() are TCG globals and the bits above it are
+ * interned env byte ranges (see below).  The top INSN_DF_MAX_MEMOPS bits are
+ * neither: bit INSN_DF_MEMOP_PROV_BASE + k means "the value load slot k
+ * returned", which is the fact a post-hoc walk cannot state at all.
+ *
+ * It has to be a region of the SAME namespace rather than a second bitmap
+ * for the reason the fields share it: a consumer asking "where did this
+ * value come from" must get one answer, and a value that came half from a
+ * register and half from a load is one answer, not two half-answers in two
+ * encodings.  The base is fixed rather than following nregs so that a
+ * consumer can classify a bit without a second call, and df_intern() stops
+ * interning at it so the two regions cannot collide.
+ */
+#define INSN_DF_MEMOP_PROV_BASE  (INSN_DF_MAX_REGS - INSN_DF_MAX_MEMOPS)
 
 typedef struct InsnDataflowField {
     uint32_t off;
@@ -74,6 +98,29 @@ typedef struct InsnDataflowField {
 
 #define INSN_DF_RD          1
 #define INSN_DF_WR          2
+
+/*
+ * One guest memory access, as the emitter stated it.
+ *
+ * @addr_prov and @data_prov are separate because they are separate
+ * parameters of tcg_gen_qemu_ld/st_*, and conflating them is exactly what
+ * this record exists to stop: the op stream carries a load's address temp as
+ * its only input, so a walk over the ops reports `mov (%rbx),%rax` and
+ * `mov %rbx,%rax` identically.  Load-to-use -- the edge a consumer modelling
+ * a memory hierarchy most needs -- does not survive that.
+ *
+ * @data_prov is meaningful for a STORE, where the value is an input the op
+ * carries.  A load's data provenance is not a set of registers at all: it is
+ * the load, and it is stated by giving the loaded value its own provenance
+ * bit (INSN_DF_MEMOP_PROV_BASE + slot) rather than by naming the address
+ * registers a second time.
+ */
+typedef struct InsnDataflowMemop {
+    uint8_t  is_store;
+    uint8_t  size;                          /* access width in bytes */
+    uint64_t addr_prov[INSN_DF_REG_WORDS];  /* what computed the address */
+    uint64_t data_prov[INSN_DF_REG_WORDS];  /* what produced it: stores */
+} InsnDataflowMemop;
 
 typedef struct InsnDataflowWrite {
     uint8_t  reg;                           /* index into the globals table */
@@ -145,6 +192,20 @@ typedef struct InsnDataflow {
      * none of them.
      */
     uint8_t  n_helper_unbounded;
+
+    /*
+     * The accesses themselves, in the order the target emitted them.
+     *
+     * n_mem_rd/n_mem_wr count qemu_ld/qemu_st ops; @n_memops counts the ones
+     * an emitter's note could be matched to.  They are equal in every case
+     * the extractor can account for, and @memops_unnoted says so when they
+     * are not rather than letting a consumer read the shorter array as
+     * though it described every access.
+     */
+    InsnDataflowMemop memops[INSN_DF_MAX_MEMOPS];
+    uint8_t  n_memops;
+    uint8_t  memops_overflow;   /* more accesses than there was room for */
+    uint8_t  memops_unnoted;    /* an access no emitter note accounted for */
 } InsnDataflow;
 
 /*
@@ -222,9 +283,23 @@ void insn_dataflow_note_gvec(uint32_t dofs, uint32_t aofs, uint32_t bofs,
  * `addr` is the address because they are separate parameters, and `mo`
  * states the width.  So it says so, and nothing downstream has to guess.
  *
+ * @val_ts and @addr_ts are TCGTemp pointers, typed void here only so that
+ * this header stays includable without tcg/tcg.h.  They are TEMPS, not the
+ * TCGv_* handles the emitters take: a TCGv_i32 is an OFFSET from tcg_ctx
+ * (see tcgv_i32_temp()), so passing one where a temp is expected records a
+ * pointer that matches no temp the walk will ever see.  The recording half
+ * of this choke point did exactly that and the mismatch was invisible
+ * because nothing read the notes yet.
+ *
+ * @nval is how many CONSECUTIVE temps hold the value, which the emitter
+ * knows and a reader cannot: an i128 is two temps, and on a 32-bit host so
+ * is an i64.  A store's data provenance is the union across all of them, and
+ * taking only the first would drop half of a 128-bit store's inputs.
+ *
  * Capture only; no op is emitted, altered or suppressed.
  */
-void insn_dataflow_note_memop(const void *val_ts, const void *addr_ts,
+void insn_dataflow_note_memop(const void *val_ts, unsigned nval,
+                              const void *addr_ts,
                               unsigned size, bool is_store);
 
 /*
@@ -293,6 +368,16 @@ const InsnDataflow *insn_dataflow_get(unsigned i);
 /* Number of TCG globals, i.e. how many bits of the sets are meaningful. */
 uint32_t insn_dataflow_prov_field(unsigned bit, bool *valid);
 
+/*
+ * Is @bit one of the load-data bits, and if so which access?
+ *
+ * The mirror of insn_dataflow_prov_field() for the third region of the
+ * namespace.  A consumer that does not ask still cannot be misled: a bit it
+ * cannot resolve is one it must not attribute to a register, which is the
+ * same rule the field bits already impose.
+ */
+bool insn_dataflow_prov_memop(unsigned bit, unsigned *slot);
+
 /* True if provenance lost a field to slot exhaustion in this translation. */
 bool insn_dataflow_prov_truncated(void);
 
@@ -319,7 +404,7 @@ static inline void insn_dataflow_note_gvec(uint32_t dofs, uint32_t aofs,
                                            uint32_t bofs, uint32_t oprsz)
 { }
 
-static inline void insn_dataflow_note_memop(const void *val_ts,
+static inline void insn_dataflow_note_memop(const void *val_ts, unsigned nval,
                                             const void *addr_ts,
                                             unsigned size, bool is_store)
 { }

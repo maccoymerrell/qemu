@@ -53,6 +53,18 @@ bool        g_tried   = false;
 bool        g_live    = false;
 unsigned    g_nregs   = 0;
 unsigned    g_nwords  = 0;
+/*
+ * How wide a PROVENANCE set is, which is not how wide a register set is: a
+ * provenance also carries the env byte ranges the block interned and the
+ * load-data bits, both of which live above the globals.  QEMU is asked
+ * rather than assumed, because the width is a property of its namespace.
+ */
+unsigned    g_prov_words = 0;
+
+/* Room for the accesses of one instruction; more than any encoding here
+ * makes, and a count above it is refused rather than read short. */
+#define QEMU_PLUGIN_IRDF_MAX_MEMOPS 16
+#define QEMU_PLUGIN_IRDF_MAX_FIELDS 16
 const char *g_refusal = nullptr;        /* why, if !g_live */
 
 /* TCG global index -> GenericRegId, or REG_ID_COUNT for "no tracer word".
@@ -169,6 +181,56 @@ uint64_t g_m_nostatus  = 0;  /* status refused outright */
 uint64_t g_t_fields    = 0;
 uint64_t g_t_writes    = 0;
 uint64_t g_t_prov      = 0;
+
+/*
+ * The memop DEPENDENCY arm -- CP-M's reader.
+ *
+ * The arm above compares HOW MANY accesses each side says an instruction
+ * makes.  This one compares what each says the accesses DEPEND ON, which is
+ * the fact the counts cannot carry and the one a consumer schedules on:
+ *
+ *   address   which registers computed it.  QEMU states this because `addr`
+ *             is a parameter of tcg_gen_qemu_ld/st_*; the tracer states it
+ *             structurally, from the base/index/segment registers of
+ *             Capstone's MEM operand.  Two independent derivations of one
+ *             fact, which is what makes the comparison worth taking.
+ *   data      what produced a stored value.  Same on the QEMU side; on the
+ *             tracer side it comes from .dep_refine, so an encoding with no
+ *             refiner has no claim to compare and is set aside by name.
+ *   load-use  whether a destination depends on the VALUE LOADED rather than
+ *             on the address registers.  This is the edge that did not exist
+ *             on the QEMU side at all until the emitters stated it.
+ *
+ * SCOPED TO ONE LOAD AND ONE STORE, deliberately.  Both sides list accesses
+ * in their own order -- QEMU's is emission order, the tracer's is Capstone
+ * operand order -- and nothing has established that those agree when an
+ * instruction has several of a kind.  Comparing slot k to slot k on faith
+ * would score a mis-pairing as a disagreement and, worse, could score two
+ * mis-pairings as an agreement.  Multi-access encodings are counted apart
+ * until the ordering is proven rather than assumed.
+ *
+ * The IMMEDIATE is out of scope on both arms: an address displacement is a
+ * constant, QEMU's provenance records constants as nothing (a value from a
+ * constant came from no register), and the tracer's addr masks never set the
+ * imm bit either.  Nothing is being papered over -- there is no claim on
+ * either side to compare.
+ */
+uint64_t g_ma_agree    = 0;   /* address provenance: agree                  */
+uint64_t g_ma_disagree = 0;
+uint64_t g_md_agree    = 0;   /* store-data provenance: agree               */
+uint64_t g_md_disagree = 0;
+uint64_t g_mu_agree    = 0;   /* load-to-use edge: both sides have it or not */
+uint64_t g_mu_disagree = 0;
+uint64_t g_mq_norecord = 0;   /* qemu declined to hand over whole records   */
+uint64_t g_mq_mismatch = 0;   /* records disagreed with the op counts       */
+uint64_t g_mq_multi    = 0;   /* several accesses of a kind: ordering unproven */
+uint64_t g_mq_field    = 0;   /* a provenance naming state the tracer cannot */
+uint64_t g_mq_unmapped = 0;   /* a global with no tracer word               */
+uint64_t g_mq_nodep    = 0;   /* tracer published no dep block to compare   */
+uint64_t g_mq_helper   = 0;   /* a helper could have done it where no op says */
+GHashTable *g_masigs = nullptr;
+GHashTable *g_mdsigs = nullptr;
+GHashTable *g_musigs = nullptr;
 
 GHashTable *g_sigs = nullptr;             /* char* -> count, boxed */
 GHashTable *g_unmapped_by_name = nullptr;
@@ -332,6 +394,11 @@ void irdf_init_locked(void)
         return;
     }
     g_nwords = (g_nregs + 63) / 64;
+    g_prov_words = qemu_plugin_dataflow_prov_words();
+    if (g_prov_words == 0) {
+        g_refusal = "qemu reports a zero-word provenance namespace";
+        return;
+    }
 
     g_gen_of_reg.assign(g_nregs, (uint8_t)REG_ID_COUNT);
     g_reg_names.assign(g_nregs, nullptr);
@@ -403,6 +470,11 @@ void diff_names(const std::vector<uint8_t> &ir,
     }
 }
 
+void score_memop_deps(const struct qemu_plugin_tb *tb, size_t idx,
+                      const qemu_plugin_insn_info *info,
+                      const qemu_plugin_dataflow_status *st,
+                      const InsnFieldsScratch &s);
+
 /*
  * Score one instruction's memop claim against QEMU's translation of it, and
  * record whether the 8/8 dataflow capacity was exceeded.
@@ -411,10 +483,10 @@ void diff_names(const std::vector<uint8_t> &ir,
  * caller so that the template path is untouched by the presence of the
  * instrument -- the same reason the register arm re-decodes.
  */
-void score_memops(const qemu_plugin_insn_info *info,
-                  const qemu_plugin_dataflow_status *st)
+bool score_memops(const qemu_plugin_insn_info *info,
+                  const qemu_plugin_dataflow_status *st,
+                  InsnFieldsScratch &s)
 {
-    InsnFieldsScratch s;
     char sig[192];
 
     if (st->fields_truncated || st->writes_truncated || st->prov_truncated) {
@@ -432,7 +504,7 @@ void score_memops(const qemu_plugin_insn_info *info,
 
     if (tr_ld == ir_ld && tr_st == ir_st) {
         g_m_agree++;
-        return;
+        return true;
     }
     /*
      * QEMU emitted fewer memops than the tracer claims AND the instruction
@@ -442,13 +514,340 @@ void score_memops(const qemu_plugin_insn_info *info,
      */
     if (st->n_calls > 0 && ir_ld <= tr_ld && ir_st <= tr_st) {
         g_m_helper_lo++;
-        return;
+        return false;
     }
     g_m_disagree++;
     snprintf(sig, sizeof sig, "%s  ir(%u,%u) tracer(%u,%u)%s",
              info->mnemonic, ir_ld, ir_st, tr_ld, tr_st,
              st->n_calls > 0 ? " [helper]" : "");
     tally(&g_msigs, sig);
+    return false;
+}
+
+/*
+ * One provenance set, translated into the tracer's vocabulary.
+ *
+ * @regs are generic register ids; @loads is a bitmask of the instruction's
+ * load slots whose VALUE this set depends on -- the third region of QEMU's
+ * namespace, and the thing that has no Capstone counterpart except through
+ * the tracer's own load-data mask bits.  A set naming env state the tracer
+ * has no word for raises @field, and one naming a global with no word raises
+ * !@whole; neither is scored, because a dropped name is a disagreement that
+ * would present as agreement.
+ */
+struct ProvSet {
+    std::vector<uint8_t> regs;
+    uint64_t    loads    = 0;
+    bool        field    = false;
+    bool        whole    = true;
+    const char *unmapped = nullptr;
+    bool        nonarch  = false;
+};
+
+void prov_to_set(const uint64_t *words, unsigned nwords, ProvSet &out)
+{
+    for (unsigned b = 0; b < nwords * 64; b++) {
+        unsigned slot;
+
+        if (!(words[b / 64] & (1ULL << (b % 64)))) {
+            continue;
+        }
+        if (b < g_nregs) {
+            uint8_t gen = g_gen_of_reg[b];
+
+            if (gen >= REG_ID_COUNT) {
+                if (g_reg_names[b] && nonarch_global(g_reg_names[b])) {
+                    out.nonarch = true;
+                    continue;
+                }
+                if (out.whole) {
+                    out.unmapped = g_reg_names[b];
+                }
+                out.whole = false;
+                continue;
+            }
+            out.regs.push_back(gen);
+        } else if (qemu_plugin_dataflow_prov_memop(b, &slot)) {
+            out.loads |= 1ULL << slot;
+        } else {
+            /*
+             * An env byte range: the vector file, the x87 stack, a status
+             * word.  The tracer names those registers, but inverting an env
+             * offset back to a register number needs the CPUArchState
+             * layout, which a plugin does not have and must not hard-code.
+             * So the set is set aside rather than compared minus a name.
+             */
+            out.field = true;
+        }
+    }
+    std::sort(out.regs.begin(), out.regs.end());
+    out.regs.erase(std::unique(out.regs.begin(), out.regs.end()),
+                   out.regs.end());
+    out.regs.erase(std::remove(out.regs.begin(), out.regs.end(),
+                               (uint8_t)REG_IP), out.regs.end());
+}
+
+/* The tracer's mask, in the same shape.  Bit layout per
+ * champsim_tracer_mnemonics.h: src slots, then load-data slots, then imm. */
+void mask_to_set(const InsnFields &f, uint64_t mask, ProvSet &out)
+{
+    for (unsigned i = 0; i < f.n_src_regs && i < 64; i++) {
+        if (mask & (1ULL << i)) {
+            out.regs.push_back(f.src_regs[i]);
+        }
+    }
+    for (unsigned k = 0; k < f.max_dep_loads; k++) {
+        unsigned bit = f.n_src_regs + k;
+
+        if (bit < 64 && (mask & (1ULL << bit))) {
+            out.loads |= 1ULL << k;
+        }
+    }
+    std::sort(out.regs.begin(), out.regs.end());
+    out.regs.erase(std::unique(out.regs.begin(), out.regs.end()),
+                   out.regs.end());
+    out.regs.erase(std::remove(out.regs.begin(), out.regs.end(),
+                               (uint8_t)REG_IP), out.regs.end());
+}
+
+/* Append every name the two sets do not share.  Empty means they agree. */
+void diff_prov(const ProvSet &ir, const ProvSet &tr, const char *tag,
+               GString *sig)
+{
+    diff_names(ir.regs, tr.regs, tag, sig);
+    for (unsigned k = 0; k < 64; k++) {
+        bool a = ir.loads & (1ULL << k), b = tr.loads & (1ULL << k);
+
+        if (a && !b) {
+            g_string_append_printf(sig, " ir-%s-extra:load%u", tag, k);
+        } else if (b && !a) {
+            g_string_append_printf(sig, " ir-%s-missing:load%u", tag, k);
+        }
+    }
+}
+
+/*
+ * CP-M's reader: compare what the EMITTERS said each access depends on
+ * against what the Capstone operand walk said.
+ *
+ * Called only when the two sides already agree on how many accesses there
+ * are, because a dependency comparison between differently-shaped access
+ * lists is not a comparison of anything.
+ */
+void score_memop_deps(const struct qemu_plugin_tb *tb, size_t idx,
+                      const qemu_plugin_insn_info *info,
+                      const qemu_plugin_dataflow_status *st,
+                      const InsnFieldsScratch &s)
+{
+    const InsnFields &f = s.f;
+    qemu_plugin_dataflow_memop mo[QEMU_PLUGIN_IRDF_MAX_MEMOPS];
+    unsigned n;
+
+    if (f.max_dep_loads == 0 && f.max_dep_stores == 0) {
+        return;                                 /* nothing to compare */
+    }
+    if (f.max_dep_loads > 1 || f.max_dep_stores > 1) {
+        g_mq_multi++;
+        return;
+    }
+
+    for (unsigned i = 0; i < QEMU_PLUGIN_IRDF_MAX_MEMOPS; i++) {
+        mo[i].struct_size = sizeof(mo[i]);
+    }
+    n = qemu_plugin_insn_memops(tb, idx, mo, QEMU_PLUGIN_IRDF_MAX_MEMOPS);
+    if (n == QEMU_PLUGIN_DF_INCOMPLETE || n > QEMU_PLUGIN_IRDF_MAX_MEMOPS) {
+        g_mq_norecord++;
+        return;
+    }
+    if (n != (unsigned)f.max_dep_loads + (unsigned)f.max_dep_stores) {
+        /*
+         * The op counts matched but the records do not: an access QEMU
+         * emitted has no record.  Counted apart rather than scored, since
+         * every pairing below would then be against the wrong access.
+         */
+        g_mq_mismatch++;
+        return;
+    }
+
+    std::vector<uint64_t> w(g_prov_words);
+    for (unsigned i = 0; i < n; i++) {
+        ProvSet ir_addr, tr_addr;
+        GString *sig;
+        gsize mnem_len;
+        bool store = mo[i].is_store != 0;
+
+        if (qemu_plugin_insn_memop_addr_prov(tb, idx, i, w.data(),
+                                             g_prov_words) != g_prov_words) {
+            g_mq_norecord++;
+            return;
+        }
+        prov_to_set(w.data(), g_prov_words, ir_addr);
+        if (ir_addr.field) {
+            g_mq_field++;
+            continue;
+        }
+        if (!ir_addr.whole) {
+            g_mq_unmapped++;
+            tally(&g_unmapped_by_name,
+                  ir_addr.unmapped ? ir_addr.unmapped : "?");
+            continue;
+        }
+        if (!f.has_addr_deps) {
+            g_mq_nodep++;
+            continue;
+        }
+        mask_to_set(f, store ? f.store_addr_dep_mask[0]
+                             : f.load_addr_dep_mask[0], tr_addr);
+
+        sig = g_string_new(info->mnemonic);
+        mnem_len = sig->len;
+        diff_prov(ir_addr, tr_addr, store ? "staddr" : "ldaddr", sig);
+        if (sig->len == mnem_len) {
+            g_ma_agree++;
+        } else {
+            g_ma_disagree++;
+            tally(&g_masigs, sig->str);
+        }
+        g_string_free(sig, TRUE);
+
+        if (!store) {
+            continue;
+        }
+
+        /* The stored VALUE.  The tracer only claims one when a refiner
+         * published a dep block; without one there is nothing to compare. */
+        if (qemu_plugin_insn_memop_data_prov(tb, idx, i, w.data(),
+                                             g_prov_words) != g_prov_words) {
+            g_mq_norecord++;
+            continue;
+        }
+        ProvSet ir_data, tr_data;
+        prov_to_set(w.data(), g_prov_words, ir_data);
+        if (ir_data.field) {
+            g_mq_field++;
+            continue;
+        }
+        if (!ir_data.whole) {
+            g_mq_unmapped++;
+            continue;
+        }
+        if (!f.has_reg_deps) {
+            g_mq_nodep++;
+            continue;
+        }
+        if (st->n_calls > 0) {
+            /*
+             * The value may have been produced inside the call, where no op
+             * names it.  x86 fnstcw is the case in point: the tracer says
+             * the stored value comes from the FPU control word and it does,
+             * but the IR never saw it because a helper wrote it.  Silence
+             * from a walk that did not look is not a disagreement.
+             */
+            g_mq_helper++;
+            continue;
+        }
+        mask_to_set(f, f.store_data_dep_mask[0], tr_data);
+        sig = g_string_new(info->mnemonic);
+        mnem_len = sig->len;
+        diff_prov(ir_data, tr_data, "stdata", sig);
+        if (sig->len == mnem_len) {
+            g_md_agree++;
+        } else {
+            g_md_disagree++;
+            tally(&g_mdsigs, sig->str);
+        }
+        g_string_free(sig, TRUE);
+    }
+
+    /*
+     * The load-to-use edge, as PRESENCE rather than per-register.
+     *
+     * "Does any destination of this instruction depend on the value the load
+     * returned, rather than on the registers that computed its address?"
+     * QEMU can only answer that because the emitter said which temp was the
+     * data; before CP-M the answer was structurally unavailable, since the
+     * loaded value's provenance WAS the address registers.
+     */
+    if (f.max_dep_loads == 1 && f.n_dst_regs > 0 && f.has_reg_deps) {
+        bool tr_use = false, ir_use = false;
+        unsigned nw;
+
+        if (st->n_calls > 0) {
+            /*
+             * A helper can consume the loaded value and write the
+             * destination itself -- x86 `divq (%rbx)` writes rax and rdx
+             * from inside helper_divq, so the walk sees no register write
+             * to carry a provenance at all.  Not evidence either way.
+             */
+            g_mq_helper++;
+            return;
+        }
+
+        for (unsigned d = 0; d < f.n_dst_regs; d++) {
+            unsigned bit = f.n_src_regs;
+
+            if (bit < 64 && (f.dst_dep_mask[d] & (1ULL << bit))) {
+                tr_use = true;
+            }
+        }
+        nw = qemu_plugin_insn_reg_writes(tb, idx, w.data(),
+                                         (unsigned)w.size());
+        if (nw != QEMU_PLUGIN_DF_INCOMPLETE && nw <= w.size()) {
+            std::vector<uint64_t> wr(w.begin(), w.begin() + nw);
+            std::vector<uint64_t> pw(g_prov_words);
+
+            for (unsigned r = 0; r < g_nregs && !ir_use; r++) {
+                if (!(wr[r / 64] & (1ULL << (r % 64)))) {
+                    continue;
+                }
+                if (qemu_plugin_insn_write_prov(tb, idx, r, pw.data(),
+                                                g_prov_words) != g_prov_words) {
+                    continue;
+                }
+                ProvSet p;
+                prov_to_set(pw.data(), g_prov_words, p);
+                if (p.loads) {
+                    ir_use = true;
+                }
+            }
+            /*
+             * A destination the TCG-global namespace does not name is still
+             * a destination: `movdqa (%rsi),%xmm0` writes the vector file,
+             * which QEMU reaches by env offset and reports as a FIELD.
+             * Scanning only the globals reported ir-load-use=0 for every
+             * vector load and scored the tracer wrong for saying otherwise
+             * -- a defect in this reader, not a disagreement about the
+             * machine, and the kind that would have been quoted as one.
+             */
+            unsigned nf = qemu_plugin_insn_fields(tb, idx, nullptr, 0);
+            if (nf != QEMU_PLUGIN_DF_INCOMPLETE && nf > 0 &&
+                nf <= QEMU_PLUGIN_IRDF_MAX_FIELDS && !ir_use) {
+                for (unsigned fi = 0; fi < nf && !ir_use; fi++) {
+                    ProvSet p;
+
+                    if (qemu_plugin_insn_field_prov(tb, idx, fi, pw.data(),
+                                                    g_prov_words)
+                        != g_prov_words) {
+                        continue;
+                    }
+                    prov_to_set(pw.data(), g_prov_words, p);
+                    if (p.loads) {
+                        ir_use = true;
+                    }
+                }
+            }
+            if (ir_use == tr_use) {
+                g_mu_agree++;
+            } else {
+                char sig[192];
+
+                g_mu_disagree++;
+                snprintf(sig, sizeof sig, "%s  ir-load-use=%d tracer=%d",
+                         info->mnemonic, (int)ir_use, (int)tr_use);
+                tally(&g_musigs, sig);
+            }
+        }
+    }
 }
 
 void dump_tally(GString *report, GHashTable *t, const char *heading)
@@ -560,7 +959,10 @@ void irdf_note_insn(const struct qemu_plugin_tb *tb, size_t idx,
 
     /* The memop arm runs BEFORE the register arm's refusals, because none of
      * them applies to it -- see the counter block. */
-    score_memops(info, &st);
+    InsnFieldsScratch mem_s;
+    if (score_memops(info, &st, mem_s)) {
+        score_memop_deps(tb, idx, info, &st, mem_s);
+    }
 
     /*
      * The CP-H arm, likewise before the refusals: a helper is exactly what
@@ -744,6 +1146,40 @@ void irdf_report(GString *report)
             "          %" PRIu64 " no status\n",
             g_m_agree, g_m_disagree, g_m_helper_lo, g_m_nostatus);
     dump_tally(report, g_msigs, "memop disagreement signatures");
+
+    g_string_append_printf(report,
+            "\n--- memop DEPENDENCIES: the emitters vs the operand walk ---\n"
+            "WHAT IS COMPARED: for each access, which registers QEMU's own\n"
+            "emitter said computed its ADDRESS and produced its DATA, against\n"
+            "the masks the tracer built from Capstone's MEM operand and its\n"
+            ".dep_refine.  These are two independent derivations of one fact,\n"
+            "which is what makes the comparison worth taking -- and it is\n"
+            "still an internal-consistency check, not a reference.\n"
+            "address:   %" PRIu64 " agree, %" PRIu64 " disagree\n"
+            "store data:%" PRIu64 " agree, %" PRIu64 " disagree\n"
+            "load-use:  %" PRIu64 " agree, %" PRIu64 " disagree  (does a "
+            "destination depend on the VALUE loaded rather than on the "
+            "address registers -- the edge that did not exist on the QEMU "
+            "side until the emitters stated it)\n"
+            "not scored: %" PRIu64 " several accesses of a kind (slot "
+            "ordering between the two lists is unproven, never assumed)\n"
+            "            %" PRIu64 " qemu withheld whole records\n"
+            "            %" PRIu64 " records disagreed with the op counts\n"
+            "            %" PRIu64 " a provenance named env state the tracer "
+            "cannot spell (vector file, x87, status words)\n"
+            "            %" PRIu64 " a global with no tracer word\n"
+            "            %" PRIu64 " the tracer published no dep block to "
+            "compare (no .dep_refine on the row)\n"
+            "            %" PRIu64 " the value could have been produced or "
+            "consumed inside a helper call, where no op names it -- silence "
+            "from a walk that did not look is not a disagreement\n",
+            g_ma_agree, g_ma_disagree, g_md_agree, g_md_disagree,
+            g_mu_agree, g_mu_disagree, g_mq_multi, g_mq_norecord,
+            g_mq_mismatch, g_mq_field, g_mq_unmapped, g_mq_nodep,
+            g_mq_helper);
+    dump_tally(report, g_masigs, "address-dependency disagreements");
+    dump_tally(report, g_mdsigs, "store-data-dependency disagreements");
+    dump_tally(report, g_musigs, "load-to-use disagreements");
 
     g_string_append_printf(report,
             "\ntruncation (INSN_DF_MAX_FIELDS=8 / INSN_DF_MAX_WRITES=8): "

@@ -239,6 +239,15 @@ plugin_gen_mem_callbacks_i128(TCGv_i128 val,
 static void tcg_gen_qemu_ld_i32_int(TCGv_i32 val, TCGTemp *addr,
                                     TCGArg idx, MemOp memop)
 {
+    /*
+     * The data operand as a TEMP, taken before anything below can
+     * rebind `val` to a byte-swap scratch that is freed again a few
+     * lines later.  A TCGv_* is an offset from tcg_ctx, not a temp
+     * pointer, so the conversion has to happen here rather than in
+     * the recorder.
+     */
+    TCGTemp *df_val = tcgv_i32_temp(val);
+
     MemOp orig_memop;
     MemOpIdx orig_oi, oi;
     TCGv_i64 copy_addr;
@@ -287,7 +296,7 @@ static void tcg_gen_qemu_ld_i32_int(TCGv_i32 val, TCGTemp *addr,
      * the loaded value depend on the address registers.  Stated here, it
      * survives.  Capture only.
      */
-    insn_dataflow_note_memop(val, addr, memop_size(memop), false);
+    insn_dataflow_note_memop(df_val, 1, addr, memop_size(memop), false);
 }
 
 void tcg_gen_qemu_ld_i32_chk(TCGv_i32 val, TCGTemp *addr, TCGArg idx,
@@ -301,6 +310,15 @@ void tcg_gen_qemu_ld_i32_chk(TCGv_i32 val, TCGTemp *addr, TCGArg idx,
 static void tcg_gen_qemu_st_i32_int(TCGv_i32 val, TCGTemp *addr,
                                     TCGArg idx, MemOp memop)
 {
+    /*
+     * The data operand as a TEMP, taken before anything below can
+     * rebind `val` to a byte-swap scratch that is freed again a few
+     * lines later.  A TCGv_* is an offset from tcg_ctx, not a temp
+     * pointer, so the conversion has to happen here rather than in
+     * the recorder.
+     */
+    TCGTemp *df_val = tcgv_i32_temp(val);
+
     TCGv_i32 swap = NULL;
     MemOpIdx orig_oi, oi;
     TCGOpcode opc;
@@ -348,7 +366,7 @@ static void tcg_gen_qemu_st_i32_int(TCGv_i32 val, TCGTemp *addr,
      * the loaded value depend on the address registers.  Stated here, it
      * survives.  Capture only.
      */
-    insn_dataflow_note_memop(val, addr, memop_size(memop), true);
+    insn_dataflow_note_memop(df_val, 1, addr, memop_size(memop), true);
 }
 
 void tcg_gen_qemu_st_i32_chk(TCGv_i32 val, TCGTemp *addr, TCGArg idx,
@@ -362,6 +380,15 @@ void tcg_gen_qemu_st_i32_chk(TCGv_i32 val, TCGTemp *addr, TCGArg idx,
 static void tcg_gen_qemu_ld_i64_int(TCGv_i64 val, TCGTemp *addr,
                                     TCGArg idx, MemOp memop)
 {
+    /*
+     * The data operand as a TEMP, taken before anything below can
+     * rebind `val` to a byte-swap scratch that is freed again a few
+     * lines later.  A TCGv_* is an offset from tcg_ctx, not a temp
+     * pointer, so the conversion has to happen here rather than in
+     * the recorder.
+     */
+    TCGTemp *df_val = tcgv_i64_temp(val);
+
     MemOp orig_memop;
     MemOpIdx orig_oi, oi;
     TCGv_i64 copy_addr;
@@ -423,7 +450,8 @@ static void tcg_gen_qemu_ld_i64_int(TCGv_i64 val, TCGTemp *addr,
      * the loaded value depend on the address registers.  Stated here, it
      * survives.  Capture only.
      */
-    insn_dataflow_note_memop(val, addr, memop_size(memop), false);
+    insn_dataflow_note_memop(df_val, TCG_TARGET_REG_BITS == 32 ? 2 : 1,
+                             addr, memop_size(memop), false);
 }
 
 void tcg_gen_qemu_ld_i64_chk(TCGv_i64 val, TCGTemp *addr, TCGArg idx,
@@ -437,6 +465,15 @@ void tcg_gen_qemu_ld_i64_chk(TCGv_i64 val, TCGTemp *addr, TCGArg idx,
 static void tcg_gen_qemu_st_i64_int(TCGv_i64 val, TCGTemp *addr,
                                     TCGArg idx, MemOp memop)
 {
+    /*
+     * The data operand as a TEMP, taken before anything below can
+     * rebind `val` to a byte-swap scratch that is freed again a few
+     * lines later.  A TCGv_* is an offset from tcg_ctx, not a temp
+     * pointer, so the conversion has to happen here rather than in
+     * the recorder.
+     */
+    TCGTemp *df_val = tcgv_i64_temp(val);
+
     TCGv_i64 swap = NULL;
     MemOpIdx orig_oi, oi;
     TCGTemp *addr_new;
@@ -486,7 +523,8 @@ static void tcg_gen_qemu_st_i64_int(TCGv_i64 val, TCGTemp *addr,
      * the loaded value depend on the address registers.  Stated here, it
      * survives.  Capture only.
      */
-    insn_dataflow_note_memop(val, addr, memop_size(memop), true);
+    insn_dataflow_note_memop(df_val, TCG_TARGET_REG_BITS == 32 ? 2 : 1,
+                             addr, memop_size(memop), true);
 }
 
 void tcg_gen_qemu_st_i64_chk(TCGv_i64 val, TCGTemp *addr, TCGArg idx,
@@ -591,6 +629,15 @@ static void maybe_free_addr64(TCGv_i64 a64)
 static void tcg_gen_qemu_ld_i128_int(TCGv_i128 val, TCGTemp *addr,
                                      TCGArg idx, MemOp memop)
 {
+    /*
+     * The data operand as a TEMP, taken before anything below can
+     * rebind `val` to a byte-swap scratch that is freed again a few
+     * lines later.  A TCGv_* is an offset from tcg_ctx, not a temp
+     * pointer, so the conversion has to happen here rather than in
+     * the recorder.
+     */
+    TCGTemp *df_val = tcgv_i128_temp(val);
+
     MemOpIdx orig_oi;
     TCGv_i64 ext_addr = NULL;
     TCGTemp *addr_new;
@@ -700,7 +747,8 @@ static void tcg_gen_qemu_ld_i128_int(TCGv_i128 val, TCGTemp *addr,
      * the loaded value depend on the address registers.  Stated here, it
      * survives.  Capture only.
      */
-    insn_dataflow_note_memop(val, addr, memop_size(memop), false);
+    insn_dataflow_note_memop(df_val, TCG_TARGET_REG_BITS == 32 ? 4 : 2,
+                             addr, memop_size(memop), false);
 }
 
 void tcg_gen_qemu_ld_i128_chk(TCGv_i128 val, TCGTemp *addr, TCGArg idx,
@@ -715,6 +763,15 @@ void tcg_gen_qemu_ld_i128_chk(TCGv_i128 val, TCGTemp *addr, TCGArg idx,
 static void tcg_gen_qemu_st_i128_int(TCGv_i128 val, TCGTemp *addr,
                                      TCGArg idx, MemOp memop)
 {
+    /*
+     * The data operand as a TEMP, taken before anything below can
+     * rebind `val` to a byte-swap scratch that is freed again a few
+     * lines later.  A TCGv_* is an offset from tcg_ctx, not a temp
+     * pointer, so the conversion has to happen here rather than in
+     * the recorder.
+     */
+    TCGTemp *df_val = tcgv_i128_temp(val);
+
     MemOpIdx orig_oi;
     TCGv_i64 ext_addr = NULL;
     TCGTemp *addr_new;
@@ -825,7 +882,8 @@ static void tcg_gen_qemu_st_i128_int(TCGv_i128 val, TCGTemp *addr,
      * the loaded value depend on the address registers.  Stated here, it
      * survives.  Capture only.
      */
-    insn_dataflow_note_memop(val, addr, memop_size(memop), true);
+    insn_dataflow_note_memop(df_val, TCG_TARGET_REG_BITS == 32 ? 4 : 2,
+                             addr, memop_size(memop), true);
 }
 
 void tcg_gen_qemu_st_i128_chk(TCGv_i128 val, TCGTemp *addr, TCGArg idx,

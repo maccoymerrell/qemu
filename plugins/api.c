@@ -318,6 +318,33 @@ static unsigned plugin_df_copy(const uint64_t *src, uint64_t *words,
     return n;
 }
 
+/*
+ * Copy a PROVENANCE set, which is not the same size as a register set.
+ *
+ * A read/write/kill set holds only TCG globals, so ceil(nregs/64) words hold
+ * it exactly.  A provenance set spans the whole namespace: globals, then the
+ * env byte ranges interned for the block, then the load-data bits at the top
+ * of it.  Sizing a provenance copy by nregs therefore drops every bit above
+ * the globals -- on x86_64, where nregs is 37, it copied ONE word and every
+ * field bit from 64 up and every load-data bit went missing, with the return
+ * value reporting the truncated size as the whole one.  That is the exact
+ * shape this API's own preamble refuses to hand out: a partial set that
+ * looks complete.
+ */
+static unsigned plugin_df_copy_prov(const uint64_t *src, uint64_t *words,
+                                    unsigned nwords)
+{
+    if (nwords >= INSN_DF_REG_WORDS && words != NULL) {
+        memcpy(words, src, INSN_DF_REG_WORDS * sizeof(uint64_t));
+    }
+    return INSN_DF_REG_WORDS;
+}
+
+unsigned qemu_plugin_dataflow_prov_words(void)
+{
+    return INSN_DF_REG_WORDS;
+}
+
 bool qemu_plugin_dataflow_abi_ok(uint32_t plugin_version,
                                  uint32_t field_struct_size,
                                  uint32_t status_struct_size)
@@ -379,7 +406,7 @@ unsigned qemu_plugin_insn_write_prov(const struct qemu_plugin_tb *tb,
     }
     for (unsigned i = 0; i < d->n_writes; i++) {
         if (d->writes[i].reg == reg) {
-            return plugin_df_copy(d->writes[i].prov, words, nwords);
+            return plugin_df_copy_prov(d->writes[i].prov, words, nwords);
         }
     }
     /* Not a register this instruction wrote: no provenance to give. */
@@ -429,7 +456,76 @@ unsigned qemu_plugin_insn_field_prov(const struct qemu_plugin_tb *tb,
     if (d == NULL || !plugin_df_complete(d) || field >= d->n_fields) {
         return QEMU_PLUGIN_DF_INCOMPLETE;
     }
-    return plugin_df_copy(d->fields[field].prov, words, nwords);
+    return plugin_df_copy_prov(d->fields[field].prov, words, nwords);
+}
+
+/*
+ * Are this instruction's ACCESS records whole?
+ *
+ * Separate from plugin_df_complete() because the two limits are separate: an
+ * instruction can exceed the register-write capacity while its accesses are
+ * recorded exactly, and the reverse.  Provenance truncation counts against
+ * both, since an access's addr_prov is a set in the same namespace and a
+ * short one is a dependency missing.
+ */
+static bool plugin_df_memops_complete(const InsnDataflow *d)
+{
+    return !d->memops_overflow && !d->memops_unnoted &&
+           !insn_dataflow_prov_truncated();
+}
+
+unsigned qemu_plugin_insn_memops(const struct qemu_plugin_tb *tb, size_t idx,
+                                 qemu_plugin_dataflow_memop *out,
+                                 unsigned nmemops)
+{
+    const InsnDataflow *d = plugin_df(tb, idx);
+
+    if (d == NULL || !plugin_df_memops_complete(d)) {
+        return QEMU_PLUGIN_DF_INCOMPLETE;
+    }
+    if (nmemops < d->n_memops || out == NULL) {
+        return d->n_memops;
+    }
+    for (unsigned i = 0; i < d->n_memops; i++) {
+        /*
+         * The caller stated its own struct size; write only that much, so a
+         * plugin built against an older header gets a correct prefix rather
+         * than a stomped stack.
+         */
+        uint32_t want = out[i].struct_size;
+        qemu_plugin_dataflow_memop m = {
+            .struct_size = sizeof(m),
+            .size = d->memops[i].size,
+            .is_store = d->memops[i].is_store,
+        };
+
+        if (want == 0 || want > sizeof(m)) {
+            want = sizeof(m);
+        }
+        memcpy(&out[i], &m, want);
+    }
+    return d->n_memops;
+}
+
+#define PLUGIN_DF_MEMOP_PROV(name, member)                                   \
+unsigned name(const struct qemu_plugin_tb *tb, size_t idx, unsigned memop,   \
+              uint64_t *words, unsigned nwords)                              \
+{                                                                            \
+    const InsnDataflow *d = plugin_df(tb, idx);                              \
+                                                                             \
+    if (d == NULL || !plugin_df_memops_complete(d) ||                        \
+        memop >= d->n_memops) {                                              \
+        return QEMU_PLUGIN_DF_INCOMPLETE;                                    \
+    }                                                                        \
+    return plugin_df_copy_prov(d->memops[memop].member, words, nwords);      \
+}
+
+PLUGIN_DF_MEMOP_PROV(qemu_plugin_insn_memop_addr_prov, addr_prov)
+PLUGIN_DF_MEMOP_PROV(qemu_plugin_insn_memop_data_prov, data_prov)
+
+bool qemu_plugin_dataflow_prov_memop(unsigned bit, unsigned *slot)
+{
+    return insn_dataflow_prov_memop(bit, slot);
 }
 
 bool qemu_plugin_insn_dataflow_status(const struct qemu_plugin_tb *tb,
@@ -455,6 +551,8 @@ bool qemu_plugin_insn_dataflow_status(const struct qemu_plugin_tb *tb,
     st.helper_model = d->helper_model;
     st.n_helper_unknown = d->n_helper_unknown;
     st.n_helper_unbounded = d->n_helper_unbounded;
+    st.memops_truncated = d->memops_overflow;
+    st.memops_unnoted = d->memops_unnoted;
 
     want = out->struct_size;
     if (want == 0 || want > sizeof(st)) {

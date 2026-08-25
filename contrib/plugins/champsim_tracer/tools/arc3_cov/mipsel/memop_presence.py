@@ -73,15 +73,68 @@ CLASSES = {
     'ST-MISSING':       ('TRACER-SUBSET',   'tracer-defect'),
     'LD-EXTRA':         ('TRACER-SUPERSET', 'reference-gap'),
     'ST-EXTRA':         ('TRACER-SUPERSET', 'reference-gap'),
-    'LD-MISSING+ST-EXTRA': ('ORTHOGONAL',   'vocabulary-difference'),
-    'ST-MISSING+LD-EXTRA': ('ORTHOGONAL',   'vocabulary-difference'),
 }
 
+#: The two DIRECTION-SWAP outcomes are deliberately absent from CLASSES, so a
+#: row that lands in one stays UNACCOUNTED until a mechanism is named for it.
+#: They used to be there, mapped to ORTHOGONAL / vocabulary-difference, and
+#: they were wrong twice over.
+#:
+#: They were DEAD: the classifier composes its key in the fixed order
+#: LD-MISSING, LD-EXTRA, ST-MISSING, ST-EXTRA, so the key it can actually
+#: build for "reference says store, tracer says load" is `LD-EXTRA+ST-MISSING`
+#: -- and the table spelled it `ST-MISSING+LD-EXTRA`, which nothing can ever
+#: produce.  No row had reached either entry, so nothing had exercised them.
+#:
+#: And had they been reachable they would have laundered a real defect.  A
+#: store recorded as a load is exactly the shape AArch64 `stzgm` had until
+#: 2026-08-25, where Capstone reported the written block READ; that was a
+#: decoder bug fixed at the boundary, not a difference of vocabulary.  A
+#: blanket ORTHOGONAL on the swap classes would have scored it as agreement in
+#: a different dialect.  The docstring above already stated the rule -- a row
+#: whose mechanism is not named has no direction anyone is entitled to claim
+#: -- and these two entries contradicted it.
+SWAP_CLASSES = {'LD-EXTRA+ST-MISSING', 'LD-MISSING+ST-EXTRA'}
+
 #: The hint / cache-maintenance class.  These instructions DO mint a runtime
-#: memop (decode_synthetic_ea), so the wire is not empty -- but the STATIC
-#: claim is zero, and the static claim is what the lane mask is built from.
-#: Named here so the rows are accounted rather than counted twice.
-STATIC_DYNAMIC_SPLIT = {'pref', 'prefe', 'synci'}
+#: memop (decode_synthetic_ea), so the wire is not empty.  Since 2026-08-25
+#: the STATIC claim matches it -- the template allocates the load slot the
+#: synthetic EA fills -- so `pref` and `cache` now AGREE and only the
+#: DIRECTION of `synci` still separates the two sides.
+STATIC_DYNAMIC_SPLIT = {'pref', 'prefe', 'synci', 'cache', 'cachee'}
+
+#: ADDRESS-ONLY CACHE MAINTENANCE, and the direction question settled.
+#:
+#: binutils flags `synci` INSN_STORE_MEMORY -- "Instruction stores value into
+#: memory" -- and has since 1993.  The tracer records one address-only memop
+#: for it, load-shaped, carrying no data.  That is the whole of the remaining
+#: disagreement: both sides say ONE access at the same effective address, and
+#: they name its direction differently.
+#:
+#: It is adjudicated from QEMU, which is this arc's ground truth, and not from
+#: the flag:
+#:
+#:   * QEMU emits NOTHING for `synci`.  Every regime lowers it to a bare
+#:     `ctx->base.is_jmp = DISAS_STOP` -- target/mips/tcg/translate.c:14403,
+#:     micromips_translate.c.inc:2420 and :2456, nanomips_translate.c.inc:3991
+#:     -- with no TCG memory op, no helper and no address computation.  There
+#:     is no store for the tracer to have dropped.
+#:   * LLVM MC, the rank-1 mipsel reference and this directory's naming
+#:     authority, reports mayLoad=0 mayStore=0 for the same encoding
+#:     (`isaxcheck --isa=mipsel --hex=00009f04`, the `llvm` line).
+#:   * binutils is not self-consistent across the construct: for three MIPS
+#:     operations that all name an effective address and all move no
+#:     architectural data, `pref` carries LM, `cache` carries neither flag,
+#:     and `synci` carries SM.
+#:
+#: So the reference's own flag is the outlier, and the surviving difference is
+#: a difference of vocabulary in a wire format that has two directions and
+#: needs a third.  The record is load-shaped because that is what
+#: MemAccessRecorder::record_synthetic_load() mints and what `prfm` / `pref`
+#: have always published; the information the consumer is owed -- WHICH LINE
+#: -- is present, and nothing is dropped.  Membership is by name, so a future
+#: row that merely happens to swap direction cannot inherit this ruling.
+CACHE_MAINT_ADDRESS_ONLY = {'synci', 'cache', 'cachee', 'pref', 'prefe'}
 
 #: The store-conditional family.  QEMU lowers `sc` / `scd` / `sce` onto
 #: `tcg_gen_atomic_cmpxchg_tl` (target/mips/tcg/translate.c:2219-2244), which
@@ -180,6 +233,14 @@ def main():
     trc = tracer_batch(A.isaxcheck, [h for _, _, h in opc])
 
     cat = collections.Counter()
+    #: (class, direction, category) -> count.  The headline is computed from
+    #: THIS, not from `cat`: the per-row overrides below (the SC family, the
+    #: address-only cache-maintenance ruling) are the whole point of the
+    #: taxonomy, and a headline summed over bare classes could not see any of
+    #: them.  It could not see `synci` in particular -- the row's direction
+    #: was being read out of a table keyed by a string the classifier never
+    #: builds.
+    adj = collections.Counter()
     rows = collections.defaultdict(list)
     out = []
     for oid, mnem, hx in opc:
@@ -217,11 +278,14 @@ def main():
             d.append('ST-EXTRA')
         k = '+'.join(d) if d else 'AGREE'
         direction, category = CLASSES.get(k, ('UNACCOUNTED', 'unaccounted'))
-        if k != 'AGREE' and mnem in STATIC_DYNAMIC_SPLIT:
+        if k in SWAP_CLASSES and mnem in CACHE_MAINT_ADDRESS_ONLY:
+            direction, category = ('ORTHOGONAL', 'cache-maintenance-direction')
+        elif k != 'AGREE' and mnem in STATIC_DYNAMIC_SPLIT:
             category = 'static-dynamic-split'
         if k == 'LD-EXTRA' and mnem in QEMU_CMPXCHG_SC:
             category = 'emulation-artefact'
         cat[k] += 1
+        adj[(k, direction, category)] += 1
         rows[k].append((oid, mnem, hx, refl, refs, fl, fs))
         out.append({'opcode_id': oid, 'mnemonic': mnem, 'hex': hx,
                     'ref_load': int(refl), 'ref_store': int(refs),
@@ -231,10 +295,8 @@ def main():
                     'category': category})
 
     tot = sum(cat.values())
-    sub = sum(c for k, c in cat.items()
-              if CLASSES.get(k, ('UNACCOUNTED',))[0] == 'TRACER-SUBSET')
-    una = sum(c for k, c in cat.items()
-              if k != 'REF-UNPROBED' and k not in CLASSES)
+    sub = sum(c for (_, d, _), c in adj.items() if d == 'TRACER-SUBSET')
+    una = sum(c for (_, d, _), c in adj.items() if d == 'UNACCOUNTED')
 
     print('=' * 78)
     print('mipsel MEMOP PRESENCE -- tracer static claim vs binutils pinfo')
@@ -252,11 +314,11 @@ def main():
     print()
     print('  %-24s %6s  %-16s %s' % ('class', 'count', 'direction', 'category'))
     print('  ' + '-' * 74)
-    for k, v in cat.most_common():
-        if k == 'REF-UNPROBED':
-            print('  %-24s %6d  %-16s %s' % (k, v, 'NONE', 'not-compared'))
-            continue
-        direction, category = CLASSES.get(k, ('UNACCOUNTED', 'unaccounted'))
+    if cat['REF-UNPROBED']:
+        print('  %-24s %6d  %-16s %s'
+              % ('REF-UNPROBED', cat['REF-UNPROBED'], 'NONE', 'not-compared'))
+    for (k, direction, category), v in sorted(adj.items(),
+                                              key=lambda kv: -kv[1]):
         print('  %-24s %6d  %-16s %s' % (k, v, direction, category))
 
     for k in cat:

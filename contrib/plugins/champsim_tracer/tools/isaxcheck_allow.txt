@@ -271,11 +271,33 @@ x86_64 R-wr-missing cwtd +r#
 # `ld(0x410180)` in parentheses instead of `ld[%gp5](0x410180)`.  x86_64
 # `prefetcht1` and aarch64 `prfm` declare loads=1 and always did.  The rule
 # is gone because the access is no longer 0, and the dead-rule detector is
-# what said so.  `synci`'s row stays: binutils calls it a STORE and the
-# synthesised record is a LOAD, which is a direction question this has not
-# answered.
+# what said so.
+#
+# `synci`'S DIRECTION IS NOW ANSWERED, and the answer is that there is no
+# store.  QEMU lowers MIPS SYNCI to a bare `ctx->base.is_jmp = DISAS_STOP`
+# with no TCG memory op and no address computation, in every regime
+# (target/mips/tcg/translate.c:14403, micromips_translate.c.inc:2420 and
+# :2456, nanomips_translate.c.inc:3991); LLVM MC reports mayLoad=0
+# mayStore=0; and binutils, the one reference that says STORE, gives the
+# same construct three different answers (`pref` LM, `cache` neither,
+# `synci` SM).  The synthesised record stays load-shaped -- an address with
+# data_size 0, which is what `prfm` and `pref` publish -- because the wire
+# has two directions and this needs a third.  Adjudicated in
+# arc3_cov/mipsel/memop_presence.py as `cache-maintenance-direction`.
+#
+# THE SAME TREATMENT NOW REACHES AArch64 CACHE MAINTENANCE BY VIRTUAL
+# ADDRESS.  `dc cvau, Xt` / `ic ivau, Xt` name an effective address and act
+# on the line containing it; Capstone models no memory operand for the whole
+# DC/IC alias space, so the boundary mints one from Xt with EMPTY access bits
+# (cap_aarch64_is_va_cache_maint_sysop in disas/capstone.c).  Empty is the
+# literal truth -- QEMU implements them as ARM_CP_NOP -- and it is what the
+# synthetic-EA class keys on.  LLVM reports no memory operand at all, hence
+# the M-cs-mem-llvm-none row for `ic`; `dc` already has one, for DC ZVA.
 aarch64 Z-access0 prf* MEM
 aarch64 M-miss-load prf*
+aarch64 Z-access0 dc MEM
+aarch64 Z-access0 ic MEM
+aarch64 M-cs-mem-llvm-none ic
 mipsel Z-access0 cache* MEM
 mipsel Z-access0 synci MEM
 mipsel M-cs-mem-llvm-none pref*
@@ -554,6 +576,14 @@ aarch64 B-flow-presence hvc cs-yes llvm-no
 aarch64 B-flow-presence smc cs-yes llvm-no
 aarch64 B-flow-presence svc cs-yes llvm-no
 aarch64 M-cs-mem-llvm-none dc
+# GCSSTR / GCSSTTR store Xt to the Guarded Control Stack at [Xn].  Capstone
+# models no memory operand (both operands come back as plain register reads
+# and its printer drops the brackets), so the boundary mints the written MEM
+# operand from Xn -- see the GCSSTR block in cap_fill_arm64_operands.  LLVM's
+# MCInstrDesc names no memory operand either; the Arm MRA's execute-ASL
+# resolves the row to mw=1, which is the side this follows.
+aarch64 M-cs-mem-llvm-none gcsstr
+aarch64 M-cs-mem-llvm-none gcssttr
 aarch64 M-cs-mem-llvm-none ld64b
 aarch64 M-cs-mem-llvm-none ldapursb
 aarch64 M-cs-mem-llvm-none ldapursh

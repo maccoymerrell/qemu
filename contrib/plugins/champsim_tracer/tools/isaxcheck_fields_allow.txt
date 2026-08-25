@@ -94,6 +94,19 @@ mipsel FM-cs-mem-llvm-none suxc1
 mipsel FM-cs-mem-llvm-none pref
 mipsel FM-cs-mem-llvm-none prefe
 
+# `cache` / `cachee` / `synci` are the same shape one step further out: a MEM
+# operand Capstone reports with NEITHER access bit, an address the guest
+# computed, and no data.  The fields side now declares the load lane the
+# synthetic-EA record fills, so the template stops claiming loads=0 for an
+# instruction whose entries carry a memop.  LLVM reports mayLoad=0 mayStore=0
+# for all three -- which for `synci` is also the evidence that binutils'
+# INSN_STORE_MEMORY is the outlier; QEMU emits nothing for it either
+# (target/mips/tcg/translate.c:14403).  Boundary twins: the
+# `mipsel M-cs-mem-llvm-none cache*` / `synci` rows.
+mipsel FM-cs-mem-llvm-none cache
+mipsel FM-cs-mem-llvm-none cachee
+mipsel FM-cs-mem-llvm-none synci
+
 # mayLoad / mayStore are LLVM SCHEDULING properties, not semantics, and
 # LLVM sets both across the MIPS DSP-ASE arithmetic space to pin
 # instruction order around DSPControl.  None of these instructions
@@ -908,10 +921,6 @@ aarch64 FM-llvm-mem-cs-none luti2 load
 aarch64 FM-llvm-mem-cs-none luti4 load
 aarch64 FM-llvm-mem-cs-none mov load store
 aarch64 FM-llvm-mem-cs-none nop load store
-aarch64 FM-llvm-mem-cs-none prfb load store
-aarch64 FM-llvm-mem-cs-none prfd load store
-aarch64 FM-llvm-mem-cs-none prfh load store
-aarch64 FM-llvm-mem-cs-none prfw load store
 aarch64 FM-llvm-mem-cs-none psb load store
 aarch64 FM-llvm-mem-cs-none pssbb load store
 aarch64 FM-llvm-mem-cs-none setffr store
@@ -937,6 +946,21 @@ aarch64 FM-cs-mem-llvm-none prfm
 aarch64 FM-cs-mem-llvm-none prfum
 aarch64 FM-cs-mem-llvm-none rprfm
 
+# The SVE prefetches (PRFB / PRFD / PRFH / PRFW) are the same design decision
+# and used to sit under `FM-llvm-mem-cs-none ... load store` -- LLVM claiming
+# both directions, the fields side claiming neither.  The fields side now
+# claims the load, because it always published one: the synthetic-EA callback
+# mints an address-only memop for every one of these forms and the template
+# had been declaring loads=0 underneath it.  What is left of the disagreement
+# is LLVM's mayStore, which is a SCHEDULING property on a hint that stores
+# nothing; the four `FM-llvm-mem-cs-none` rows are gone and the dead-rule
+# detector is what would have said so.  Verified --hex=22c08085 (prfd):
+# fields loads=1 stores=0, llvm mayLoad=1 mayStore=1.
+aarch64 FM-miss-store prfb
+aarch64 FM-miss-store prfd
+aarch64 FM-miss-store prfh
+aarch64 FM-miss-store prfw
+
 # LLVM description gaps in the other direction: instructions that DO
 # access memory with neither mayLoad nor mayStore set — DC ZVA (an
 # architectural store of zeros), the LRCPC2 unscaled-offset loads
@@ -944,6 +968,13 @@ aarch64 FM-cs-mem-llvm-none rprfm
 # stores (stgm / stzgm).  The fields side records the slots.  Boundary
 # twins: the `aarch64 M-cs-mem-llvm-none` rows for the same mnemonics.
 aarch64 FM-cs-mem-llvm-none dc
+# `ic ivau` joins `dc` for the same reason: cache maintenance BY VIRTUAL
+# ADDRESS now carries the line it acts on.  GCSSTR / GCSSTTR join the
+# store side: Capstone models no memory operand for them at all, LLVM names
+# none either, and the Arm MRA resolves the row to mw=1.
+aarch64 FM-cs-mem-llvm-none ic
+aarch64 FM-cs-mem-llvm-none gcsstr
+aarch64 FM-cs-mem-llvm-none gcssttr
 aarch64 FM-cs-mem-llvm-none ld64b
 aarch64 FM-cs-mem-llvm-none ldapursb
 aarch64 FM-cs-mem-llvm-none ldapursh

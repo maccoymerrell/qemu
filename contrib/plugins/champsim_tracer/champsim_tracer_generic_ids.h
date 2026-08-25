@@ -272,7 +272,7 @@ enum GenericRegId {
     REG_COPROC1  = 109,  /* implementation-defined coprocessor file 1 */
     /*
      * REG_SYSFPEN is the ENABLE gate, not a control word.  FPCR/fcsr
-     * (REG_FCSR) says how the FP datapath rounds; this says whether the
+     * (REG_FPCW) says how the FP datapath rounds; this says whether the
      * instruction runs at all -- AArch64 CPACR_EL1.FPEN / CPTR_EL2.FPEN
      * / CPTR_EL3.TFP, and the same role on the other ISAs (x86
      * CR4.OSXSAVE + XCR0, RISC-V mstatus.FS/VS).  It has an ID of its
@@ -282,7 +282,41 @@ enum GenericRegId {
      * behind it.
      */
     REG_SYSFPEN  = 110,  /* FP / vector execution-enable gate */
-    /* 111-128 unallocated — reserve for further behaviour classes. */
+    /*
+     * REG_FPCW is the FP CONTROL word, and it is a different register
+     * from the FP STATUS word on every architecture that has both.  It
+     * holds the rounding mode, the precision control and the exception
+     * masks; the status word holds the accrued exception flags, the
+     * condition codes and (x87) the stack top.  x86 keeps them in FPCW
+     * and FPSW, AArch64 in FPCR and FPSR, RISC-V addresses them as frm
+     * and fflags.
+     *
+     * They are split because EVERY FP arithmetic instruction reads the
+     * control word and writes the status word.  On one ID that is a
+     * read-modify-write of the same register on every FP instruction in
+     * the program, so a renaming regfile would order each one behind
+     * the one before it -- through a register the earlier instruction
+     * never modified.  R7's test answers it directly: the second `fadd`
+     * does not need the first one's accrued flags to compute its
+     * result, so the edge is not one the hardware would respect, and a
+     * fold that manufactures it is a mapping defect (R8.1).
+     *
+     * MEASURED at the time of the split, on decodes, not on table rows:
+     * aarch64 `fadd d0, d0, d0` recorded SRC{REG_VEC0,REG_FCSR} and
+     * DST{REG_VEC0,REG_FCSR} -- FPCR read and FPSR written, both
+     * REG_FCSR -- and riscv64 `fadd.s ft0, ft0, ft0` the same with frm
+     * and fflags.
+     *
+     * MXCSR is NOT here: it is one register that is control and status
+     * together, like MIPS fcr31 and RISC-V fcsr, and a register the
+     * hardware does not split is not one this vocabulary may split.
+     * Those keep REG_FCSR, where the read-modify-write they record is
+     * the one the architecture actually has.
+     */
+    REG_FPCW     = 111,  /* FP control word: rounding mode, precision,
+                          * exception masks (x86 FPCW, AArch64 FPCR,
+                          * RISC-V frm) */
+    /* 112-128 unallocated — reserve for further behaviour classes. */
     /* Vector/SIMD registers: 129-192 */
     REG_VEC0 = 129,
     REG_VEC1, REG_VEC2, REG_VEC3, REG_VEC4, REG_VEC5, REG_VEC6, REG_VEC7,
@@ -574,6 +608,7 @@ static inline const char *generic_reg_name(unsigned id)
     case REG_COPROC0:  return "REG_COPROC0";
     case REG_COPROC1:  return "REG_COPROC1";
     case REG_SYSFPEN:  return "REG_SYSFPEN";
+    case REG_FPCW:     return "REG_FPCW";
     case REG_FCSR:    return "REG_FCSR";
     case REG_VCTRL:   return "REG_VCTRL";
     case REG_TLS:     return "REG_TLS";

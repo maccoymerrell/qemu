@@ -1221,24 +1221,9 @@ x86_64 R-rd-missing cvtsi2sdq +v#
 x86_64 R-rd-missing cvtsi2ssl +v#
 x86_64 R-rd-missing cvtsi2ssq +v#
 x86_64 R-rd-missing cvtss2sd +v#
-x86_64 R-rd-missing faddl +fpcw
-x86_64 R-rd-missing fadds +fpcw
 x86_64 R-rd-missing ffreep +st#
-x86_64 R-rd-missing fiaddl +fpcw
-x86_64 R-rd-missing fiadds +fpcw
-x86_64 R-rd-missing fildl +fpcw
-x86_64 R-rd-missing filds +fpcw
-x86_64 R-rd-missing fimull +fpcw
-x86_64 R-rd-missing fimuls +fpcw
-x86_64 R-rd-missing fisttpl +fpcw
-x86_64 R-rd-missing fisttpll +fpcw
-x86_64 R-rd-missing fisttps +fpcw
-x86_64 R-rd-missing fldl +fpcw
-x86_64 R-rd-missing flds +fpcw
-x86_64 R-rd-missing fmull +fpcw
-x86_64 R-rd-missing fmuls +fpcw
-x86_64 R-rd-missing fxsave64 +fpcw,fpsw
-x86_64 R-rd-missing fxsave +fpcw,fpsw
+x86_64 R-rd-missing fxsave64 +fpsw
+x86_64 R-rd-missing fxsave +fpsw
 x86_64 R-rd-missing movq +mm#
 x86_64 R-rd-missing nopl +r#
 x86_64 R-rd-missing nopq +r#
@@ -1286,8 +1271,8 @@ x86_64 R-wr-missing ffree +fpsw
 # disas/capstone.c), which the checker classes as an unmodelled operand.
 # Deletable when the tracer models the x87 tag word, which it does not.
 x86_64 Z-unmodelled-op ffreep
-x86_64 R-wr-missing fxrstor64 +fpcw,fpsw
-x86_64 R-wr-missing fxrstor +fpcw,fpsw
+x86_64 R-wr-missing fxrstor64 +fpsw
+x86_64 R-wr-missing fxrstor +fpsw
 x86_64 R-wr-missing movq +r#
 x86_64 R-wr-missing wait +fpsw
 # The flag WRITE these five perform is real and LLVM MC omits it.  The
@@ -1702,60 +1687,20 @@ x86_64 Z-access0 lcallq MEM
 # word.  The tracer's x86 register classifier has no FPCW or FPSW slot to
 # put them in -- the same modelling difference already recorded for MXCSR at
 # the top of this file -- so the difference describes no defect.
-x86_64 R-rd-missing fbstp +fpcw
-x86_64 R-rd-missing fcoml +fpcw
-x86_64 R-rd-missing fcompl +fpcw
-x86_64 R-rd-missing fcompp +fpcw
-x86_64 R-rd-missing fcomps +fpcw
-x86_64 R-rd-missing fcoms +fpcw
-x86_64 R-rd-missing fdivl +fpcw
-x86_64 R-rd-missing fdivrl +fpcw
-x86_64 R-rd-missing fdivrs +fpcw
-x86_64 R-rd-missing fdivs +fpcw
-x86_64 R-rd-missing ficoml +fpcw
-x86_64 R-rd-missing ficompl +fpcw
-x86_64 R-rd-missing ficomps +fpcw
-x86_64 R-rd-missing ficoms +fpcw
-x86_64 R-rd-missing fidivl +fpcw
-x86_64 R-rd-missing fidivrl +fpcw
-x86_64 R-rd-missing fidivrs +fpcw
-x86_64 R-rd-missing fidivs +fpcw
-x86_64 R-rd-missing fildll +fpcw
-x86_64 R-rd-missing fistl +fpcw
-x86_64 R-rd-missing fistpl +fpcw
-x86_64 R-rd-missing fistpll +fpcw
-x86_64 R-rd-missing fistps +fpcw
-x86_64 R-rd-missing fists +fpcw
-x86_64 R-rd-missing fisubl +fpcw
-x86_64 R-rd-missing fisubrl +fpcw
-x86_64 R-rd-missing fisubrs +fpcw
-x86_64 R-rd-missing fisubs +fpcw
-x86_64 R-rd-missing fldl2t +fpcw
 x86_64 R-rd-missing fldt +fpcw
-x86_64 R-rd-missing fnsave +fpcw,fpsw
-x86_64 R-rd-missing fnstcw +fpcw
-x86_64 R-rd-missing fstl +fpcw
+x86_64 R-rd-missing fnsave +fpsw
 x86_64 R-rd-missing fstp +fpcw,st#
-x86_64 R-rd-missing fstpl +fpcw
-x86_64 R-rd-missing fstps +fpcw
 x86_64 R-rd-missing fstpt +fpcw
-x86_64 R-rd-missing fsts +fpcw
-x86_64 R-rd-missing fsts +cs,fpcw
-x86_64 R-rd-missing fsts +ds,fpcw
-x86_64 R-rd-missing fsts +es,fpcw
-x86_64 R-rd-missing fsts +fpcw,ss
-x86_64 R-rd-missing fsubl +fpcw
-x86_64 R-rd-missing fsubrl +fpcw
-x86_64 R-rd-missing fsubrs +fpcw
-x86_64 R-rd-missing fsubs +fpcw
-x86_64 R-rd-missing fyl2x +fpcw
-x86_64 R-rd-missing fyl2xp1 +fpcw
-x86_64 R-wr-missing fldcw +fpcw,fpsw
-x86_64 R-wr-missing fnsave +fpcw,fpsw
+x86_64 R-rd-missing fsts +cs
+x86_64 R-rd-missing fsts +ds
+x86_64 R-rd-missing fsts +es
+x86_64 R-rd-missing fsts +ss
+x86_64 R-wr-missing fldcw +fpsw
+x86_64 R-wr-missing fnsave +fpsw
 x86_64 R-wr-missing fnstcw +fpsw
 x86_64 R-wr-missing fnstenv +fpcw,fpsw
 x86_64 R-wr-missing fnstsw +fpsw
-x86_64 R-wr-missing frstor +fpcw,fpsw
+x86_64 R-wr-missing frstor +fpsw
 
 # (d) Memory presence and direction on the newly reached members.  Two
 # shapes: the system-descriptor ops (LGDT / LIDT / INVLPG / the VMX
@@ -3001,61 +2946,23 @@ x86_64 R-wr-phantom bnd lretw +cs,r#
 # hand-written corrections as it should before the execution-derived
 # capture replaces the source of all of them.  Named so it cannot be read
 # as vouched for; owed upstream with the CMOV/FCMOV report.
-x86_64 R-rd-missing f2xm1 +fpcw
-x86_64 R-rd-missing fadd +fpcw
-x86_64 R-rd-missing faddp +fpcw
-x86_64 R-rd-missing fcom +fpcw
-x86_64 R-rd-missing fcomi +fpcw
-x86_64 R-rd-missing fcomp +fpcw
-x86_64 R-rd-missing fcompi +fpcw
-x86_64 R-rd-missing fcos +fpcw
-x86_64 R-rd-missing fdiv +fpcw
-x86_64 R-rd-missing fdivp +fpcw
-x86_64 R-rd-missing fdivr +fpcw
-x86_64 R-rd-missing fdivrp +fpcw
-x86_64 R-rd-missing fistl +cs,fpcw
-x86_64 R-rd-missing fistl +ds,fpcw
-x86_64 R-rd-missing fistl +es,fpcw
-x86_64 R-rd-missing fistl +fpcw,ss
-x86_64 R-rd-missing fists +cs,fpcw
-x86_64 R-rd-missing fists +ds,fpcw
-x86_64 R-rd-missing fists +es,fpcw
-x86_64 R-rd-missing fists +fpcw,ss
+x86_64 R-rd-missing fistl +cs
+x86_64 R-rd-missing fistl +ds
+x86_64 R-rd-missing fistl +es
+x86_64 R-rd-missing fistl +ss
+x86_64 R-rd-missing fists +cs
+x86_64 R-rd-missing fists +ds
+x86_64 R-rd-missing fists +es
+x86_64 R-rd-missing fists +ss
 x86_64 R-rd-missing fld +fpcw
 x86_64 R-rd-missing fld1 +fpcw
-x86_64 R-rd-missing fldl2e +fpcw
-x86_64 R-rd-missing fldlg2 +fpcw
-x86_64 R-rd-missing fldln2 +fpcw
-x86_64 R-rd-missing fldpi +fpcw
 x86_64 R-rd-missing fldz +fpcw
-x86_64 R-rd-missing fmul +fpcw
-x86_64 R-rd-missing fmulp +fpcw
-x86_64 R-rd-missing fpatan +fpcw
-x86_64 R-rd-missing fprem +fpcw
-x86_64 R-rd-missing fprem1 +fpcw
-x86_64 R-rd-missing fptan +fpcw
-x86_64 R-rd-missing frndint +fpcw
-x86_64 R-rd-missing fscale +fpcw
-x86_64 R-rd-missing fsin +fpcw
-x86_64 R-rd-missing fsincos +fpcw
-x86_64 R-rd-missing fsqrt +fpcw
 x86_64 R-rd-missing fst +fpcw
-x86_64 R-rd-missing fstl +cs,fpcw
-x86_64 R-rd-missing fstl +ds,fpcw
-x86_64 R-rd-missing fstl +es,fpcw
-x86_64 R-rd-missing fstl +fpcw,ss
-x86_64 R-rd-missing fsub +fpcw
-x86_64 R-rd-missing fsubp +fpcw
-x86_64 R-rd-missing fsubr +fpcw
-x86_64 R-rd-missing fsubrp +fpcw
-x86_64 R-rd-missing ftst +fpcw
-x86_64 R-rd-missing fucom +fpcw
-x86_64 R-rd-missing fucomi +fpcw
-x86_64 R-rd-missing fucomp +fpcw
-x86_64 R-rd-missing fucompi +fpcw
-x86_64 R-rd-missing fucompp +fpcw
+x86_64 R-rd-missing fstl +cs
+x86_64 R-rd-missing fstl +ds
+x86_64 R-rd-missing fstl +es
+x86_64 R-rd-missing fstl +ss
 x86_64 R-rd-missing fxch +fpcw
-x86_64 R-rd-missing fxtract +fpcw
 x86_64 R-rd-phantom fadd +st#
 x86_64 R-rd-phantom fcom +st#
 x86_64 R-rd-phantom fcoml +st#
@@ -3069,7 +2976,6 @@ x86_64 R-rd-phantom fsub +st#
 x86_64 R-rd-phantom fsubr +st#
 x86_64 R-rd-phantom ftst +st#
 x86_64 R-rd-phantom fxam +st#
-x86_64 R-wr-missing fninit +fpcw
 x86_64 R-wr-missing fnop +fpsw
 x86_64 R-wr-phantom fcmovb +st#
 x86_64 R-wr-phantom fcmovbe +st#
@@ -4240,106 +4146,106 @@ x86_64 R-rd-missing divps +cs
 x86_64 R-rd-missing divps +ds
 x86_64 R-rd-missing divq +cs
 x86_64 R-rd-missing divq +ds
-x86_64 R-rd-missing faddl +cs,fpcw
-x86_64 R-rd-missing faddl +ds,fpcw
-x86_64 R-rd-missing fadds +cs,fpcw
-x86_64 R-rd-missing fadds +ds,fpcw
+x86_64 R-rd-missing faddl +cs
+x86_64 R-rd-missing faddl +ds
+x86_64 R-rd-missing fadds +cs
+x86_64 R-rd-missing fadds +ds
 x86_64 R-rd-missing fbld +cs
 x86_64 R-rd-missing fbld +ds
-x86_64 R-rd-missing fbstp +cs,fpcw
-x86_64 R-rd-missing fbstp +ds,fpcw
-x86_64 R-rd-missing fdivl +cs,fpcw
-x86_64 R-rd-missing fdivl +ds,fpcw
-x86_64 R-rd-missing fdivrl +cs,fpcw
-x86_64 R-rd-missing fdivrl +ds,fpcw
-x86_64 R-rd-missing fdivrs +cs,fpcw
-x86_64 R-rd-missing fdivrs +ds,fpcw
-x86_64 R-rd-missing fdivs +cs,fpcw
-x86_64 R-rd-missing fdivs +ds,fpcw
-x86_64 R-rd-missing fiaddl +cs,fpcw
-x86_64 R-rd-missing fiaddl +ds,fpcw
-x86_64 R-rd-missing fiadds +cs,fpcw
-x86_64 R-rd-missing fiadds +ds,fpcw
-x86_64 R-rd-missing fidivl +cs,fpcw
-x86_64 R-rd-missing fidivl +ds,fpcw
-x86_64 R-rd-missing fidivrl +cs,fpcw
-x86_64 R-rd-missing fidivrl +ds,fpcw
-x86_64 R-rd-missing fidivrs +cs,fpcw
-x86_64 R-rd-missing fidivrs +ds,fpcw
-x86_64 R-rd-missing fidivs +cs,fpcw
-x86_64 R-rd-missing fidivs +ds,fpcw
-x86_64 R-rd-missing fildl +cs,fpcw
-x86_64 R-rd-missing fildl +ds,fpcw
-x86_64 R-rd-missing fildll +cs,fpcw
-x86_64 R-rd-missing fildll +ds,fpcw
-x86_64 R-rd-missing filds +cs,fpcw
-x86_64 R-rd-missing filds +ds,fpcw
-x86_64 R-rd-missing fimull +cs,fpcw
-x86_64 R-rd-missing fimull +ds,fpcw
-x86_64 R-rd-missing fimuls +cs,fpcw
-x86_64 R-rd-missing fimuls +ds,fpcw
-x86_64 R-rd-missing fistpl +cs,fpcw
-x86_64 R-rd-missing fistpl +ds,fpcw
-x86_64 R-rd-missing fistpll +cs,fpcw
-x86_64 R-rd-missing fistpll +ds,fpcw
-x86_64 R-rd-missing fistps +cs,fpcw
-x86_64 R-rd-missing fistps +ds,fpcw
-x86_64 R-rd-missing fisttpl +cs,fpcw
-x86_64 R-rd-missing fisttpl +ds,fpcw
-x86_64 R-rd-missing fisttpll +cs,fpcw
-x86_64 R-rd-missing fisttpll +ds,fpcw
-x86_64 R-rd-missing fisttps +cs,fpcw
-x86_64 R-rd-missing fisttps +ds,fpcw
-x86_64 R-rd-missing fisubl +cs,fpcw
-x86_64 R-rd-missing fisubl +ds,fpcw
-x86_64 R-rd-missing fisubrl +cs,fpcw
-x86_64 R-rd-missing fisubrl +ds,fpcw
-x86_64 R-rd-missing fisubrs +cs,fpcw
-x86_64 R-rd-missing fisubrs +ds,fpcw
-x86_64 R-rd-missing fisubs +cs,fpcw
-x86_64 R-rd-missing fisubs +ds,fpcw
+x86_64 R-rd-missing fbstp +cs
+x86_64 R-rd-missing fbstp +ds
+x86_64 R-rd-missing fdivl +cs
+x86_64 R-rd-missing fdivl +ds
+x86_64 R-rd-missing fdivrl +cs
+x86_64 R-rd-missing fdivrl +ds
+x86_64 R-rd-missing fdivrs +cs
+x86_64 R-rd-missing fdivrs +ds
+x86_64 R-rd-missing fdivs +cs
+x86_64 R-rd-missing fdivs +ds
+x86_64 R-rd-missing fiaddl +cs
+x86_64 R-rd-missing fiaddl +ds
+x86_64 R-rd-missing fiadds +cs
+x86_64 R-rd-missing fiadds +ds
+x86_64 R-rd-missing fidivl +cs
+x86_64 R-rd-missing fidivl +ds
+x86_64 R-rd-missing fidivrl +cs
+x86_64 R-rd-missing fidivrl +ds
+x86_64 R-rd-missing fidivrs +cs
+x86_64 R-rd-missing fidivrs +ds
+x86_64 R-rd-missing fidivs +cs
+x86_64 R-rd-missing fidivs +ds
+x86_64 R-rd-missing fildl +cs
+x86_64 R-rd-missing fildl +ds
+x86_64 R-rd-missing fildll +cs
+x86_64 R-rd-missing fildll +ds
+x86_64 R-rd-missing filds +cs
+x86_64 R-rd-missing filds +ds
+x86_64 R-rd-missing fimull +cs
+x86_64 R-rd-missing fimull +ds
+x86_64 R-rd-missing fimuls +cs
+x86_64 R-rd-missing fimuls +ds
+x86_64 R-rd-missing fistpl +cs
+x86_64 R-rd-missing fistpl +ds
+x86_64 R-rd-missing fistpll +cs
+x86_64 R-rd-missing fistpll +ds
+x86_64 R-rd-missing fistps +cs
+x86_64 R-rd-missing fistps +ds
+x86_64 R-rd-missing fisttpl +cs
+x86_64 R-rd-missing fisttpl +ds
+x86_64 R-rd-missing fisttpll +cs
+x86_64 R-rd-missing fisttpll +ds
+x86_64 R-rd-missing fisttps +cs
+x86_64 R-rd-missing fisttps +ds
+x86_64 R-rd-missing fisubl +cs
+x86_64 R-rd-missing fisubl +ds
+x86_64 R-rd-missing fisubrl +cs
+x86_64 R-rd-missing fisubrl +ds
+x86_64 R-rd-missing fisubrs +cs
+x86_64 R-rd-missing fisubrs +ds
+x86_64 R-rd-missing fisubs +cs
+x86_64 R-rd-missing fisubs +ds
 x86_64 R-rd-missing fldcw +cs
 x86_64 R-rd-missing fldcw +ds
 x86_64 R-rd-missing fldenv +cs
 x86_64 R-rd-missing fldenv +ds
-x86_64 R-rd-missing fldl +cs,fpcw
-x86_64 R-rd-missing fldl +ds,fpcw
-x86_64 R-rd-missing flds +cs,fpcw
-x86_64 R-rd-missing flds +ds,fpcw
+x86_64 R-rd-missing fldl +cs
+x86_64 R-rd-missing fldl +ds
+x86_64 R-rd-missing flds +cs
+x86_64 R-rd-missing flds +ds
 x86_64 R-rd-missing fldt +cs,fpcw
 x86_64 R-rd-missing fldt +ds,fpcw
-x86_64 R-rd-missing fmull +cs,fpcw
-x86_64 R-rd-missing fmull +ds,fpcw
-x86_64 R-rd-missing fmuls +cs,fpcw
-x86_64 R-rd-missing fmuls +ds,fpcw
-x86_64 R-rd-missing fnsave +cs,fpcw,fpsw
-x86_64 R-rd-missing fnsave +ds,fpcw,fpsw
-x86_64 R-rd-missing fnstcw +cs,fpcw
-x86_64 R-rd-missing fnstcw +ds,fpcw
+x86_64 R-rd-missing fmull +cs
+x86_64 R-rd-missing fmull +ds
+x86_64 R-rd-missing fmuls +cs
+x86_64 R-rd-missing fmuls +ds
+x86_64 R-rd-missing fnsave +cs,fpsw
+x86_64 R-rd-missing fnsave +ds,fpsw
+x86_64 R-rd-missing fnstcw +cs
+x86_64 R-rd-missing fnstcw +ds
 x86_64 R-rd-missing frstor +cs
 x86_64 R-rd-missing frstor +ds
-x86_64 R-rd-missing fstpl +cs,fpcw
-x86_64 R-rd-missing fstpl +ds,fpcw
-x86_64 R-rd-missing fstps +cs,fpcw
-x86_64 R-rd-missing fstps +ds,fpcw
+x86_64 R-rd-missing fstpl +cs
+x86_64 R-rd-missing fstpl +ds
+x86_64 R-rd-missing fstps +cs
+x86_64 R-rd-missing fstps +ds
 x86_64 R-rd-missing fstpt +cs,fpcw
 x86_64 R-rd-missing fstpt +ds,fpcw
-x86_64 R-rd-missing fsubl +cs,fpcw
-x86_64 R-rd-missing fsubl +ds,fpcw
-x86_64 R-rd-missing fsubrl +cs,fpcw
-x86_64 R-rd-missing fsubrl +ds,fpcw
-x86_64 R-rd-missing fsubrs +cs,fpcw
-x86_64 R-rd-missing fsubrs +ds,fpcw
-x86_64 R-rd-missing fsubs +cs,fpcw
-x86_64 R-rd-missing fsubs +ds,fpcw
+x86_64 R-rd-missing fsubl +cs
+x86_64 R-rd-missing fsubl +ds
+x86_64 R-rd-missing fsubrl +cs
+x86_64 R-rd-missing fsubrl +ds
+x86_64 R-rd-missing fsubrs +cs
+x86_64 R-rd-missing fsubrs +ds
+x86_64 R-rd-missing fsubs +cs
+x86_64 R-rd-missing fsubs +ds
 x86_64 R-rd-missing fxrstor +cs
 x86_64 R-rd-missing fxrstor +ds
 x86_64 R-rd-missing fxrstor64 +cs
 x86_64 R-rd-missing fxrstor64 +ds
-x86_64 R-rd-missing fxsave +cs,fpcw,fpsw
-x86_64 R-rd-missing fxsave +ds,fpcw,fpsw
-x86_64 R-rd-missing fxsave64 +cs,fpcw,fpsw
-x86_64 R-rd-missing fxsave64 +ds,fpcw,fpsw
+x86_64 R-rd-missing fxsave +cs,fpsw
+x86_64 R-rd-missing fxsave +ds,fpsw
+x86_64 R-rd-missing fxsave64 +cs,fpsw
+x86_64 R-rd-missing fxsave64 +ds,fpsw
 x86_64 R-rd-missing idivb +cs
 x86_64 R-rd-missing idivb +ds
 x86_64 R-rd-missing idivl +cs
@@ -4858,30 +4764,30 @@ x86_64 R-rd-missing xsaves +cs
 x86_64 R-rd-missing xsaves +ds
 x86_64 R-rd-missing xsaves64 +cs
 x86_64 R-rd-missing xsaves64 +ds
-x86_64 R-rd-missing fcoml +cs,fpcw
-x86_64 R-rd-missing fcoml +ds,fpcw
-x86_64 R-rd-missing fcoml +es,fpcw
-x86_64 R-rd-missing fcoml +fpcw,ss
-x86_64 R-rd-missing fcompl +cs,fpcw
-x86_64 R-rd-missing fcompl +ds,fpcw
-x86_64 R-rd-missing fcomps +cs,fpcw
-x86_64 R-rd-missing fcomps +ds,fpcw
-x86_64 R-rd-missing fcoms +cs,fpcw
-x86_64 R-rd-missing fcoms +ds,fpcw
-x86_64 R-rd-missing fcoms +es,fpcw
-x86_64 R-rd-missing fcoms +fpcw,ss
-x86_64 R-rd-missing ficoml +cs,fpcw
-x86_64 R-rd-missing ficoml +ds,fpcw
-x86_64 R-rd-missing ficoml +es,fpcw
-x86_64 R-rd-missing ficoml +fpcw,ss
-x86_64 R-rd-missing ficompl +cs,fpcw
-x86_64 R-rd-missing ficompl +ds,fpcw
-x86_64 R-rd-missing ficomps +cs,fpcw
-x86_64 R-rd-missing ficomps +ds,fpcw
-x86_64 R-rd-missing ficoms +cs,fpcw
-x86_64 R-rd-missing ficoms +ds,fpcw
-x86_64 R-rd-missing ficoms +es,fpcw
-x86_64 R-rd-missing ficoms +fpcw,ss
+x86_64 R-rd-missing fcoml +cs
+x86_64 R-rd-missing fcoml +ds
+x86_64 R-rd-missing fcoml +es
+x86_64 R-rd-missing fcoml +ss
+x86_64 R-rd-missing fcompl +cs
+x86_64 R-rd-missing fcompl +ds
+x86_64 R-rd-missing fcomps +cs
+x86_64 R-rd-missing fcomps +ds
+x86_64 R-rd-missing fcoms +cs
+x86_64 R-rd-missing fcoms +ds
+x86_64 R-rd-missing fcoms +es
+x86_64 R-rd-missing fcoms +ss
+x86_64 R-rd-missing ficoml +cs
+x86_64 R-rd-missing ficoml +ds
+x86_64 R-rd-missing ficoml +es
+x86_64 R-rd-missing ficoml +ss
+x86_64 R-rd-missing ficompl +cs
+x86_64 R-rd-missing ficompl +ds
+x86_64 R-rd-missing ficomps +cs
+x86_64 R-rd-missing ficomps +ds
+x86_64 R-rd-missing ficoms +cs
+x86_64 R-rd-missing ficoms +ds
+x86_64 R-rd-missing ficoms +es
+x86_64 R-rd-missing ficoms +ss
 x86_64 R-wr-phantom notrack lcalll +r#
 
 # CAUSE 1/2 (continued) -- the NOTRACK and BND spellings of the same
@@ -5928,7 +5834,6 @@ mipsel R-rd-phantom lwre +r#
 #               reads `xsave`, LLVM reads `ptwriteq`) with the new token
 #               folded in -- the existing row repointed, not a new class.
 x86_64 R-rd-phantom fnsave +fcsr
-x86_64 R-rd-phantom fnstcw +fcsr
 x86_64 R-rd-phantom fxsave +fcsr
 x86_64 R-rd-phantom fxsave64 +fcsr
 x86_64 R-rd-phantom lldtw +sysmmu
@@ -5965,7 +5870,6 @@ x86_64 R-rd-phantom xsaves +sys
 x86_64 R-rd-phantom xsaves64 +sys
 x86_64 R-wr-phantom ffree +fcsr
 x86_64 R-wr-phantom ffreep +fcsr
-x86_64 R-wr-phantom fldcw +fcsr
 x86_64 R-wr-phantom fninit +fcsr
 x86_64 R-wr-phantom fnsave +fcsr
 x86_64 R-wr-phantom frstor +fcsr
@@ -8863,15 +8767,38 @@ mipsel M-extra-load sce
 # a bug to fix.  The block disappears entirely if LLVM MC ever models the
 # x87 stack in MCInstrDesc.
 #
-# NOT COVERED BY THIS BLOCK, and deliberately still open: the boundary
-# does NOT carry the x87 CONTROL-word (rounding-mode) read that LLVM does
-# name on the arithmetic forms.  Those are the pre-existing
-# `R-rd-missing f* +fpcw` entries above; they are a separate item and are
-# not merged into this justification.
+# THE CONTROL-WORD READ IS NOW CARRIED, and the rows it left behind are
+# below rather than above.  X87F_CWR (disas/capstone.c) names FPCW as a
+# SOURCE wherever QEMU's helper sequence consults it -- directly, on the
+# five constant loads that switch on `env->fpuc & FPU_RC_MASK`, or through
+# `env->fp_status`, which update_fp_status() fills from the rounding-mode
+# and precision fields of the same word and merge_exception_flags() reads
+# the masks out of.  245 `+fpcw` signatures became 16.
+#
+# WHAT SURVIVES IS THE OTHER DIRECTION, and it is LLVM's: MCInstrDesc
+# attaches an FPCW use to the WHOLE x87 space, including the forms whose
+# QEMU helper hands no float_status to anything and therefore reads no
+# control word.  Those are pure bit-pattern moves -- FLD / FST / FSTP
+# %st(i) (helper_fmov_*), FXCH (helper_fxchg_ST0_STN), FLD1 and FLDZ
+# (floatx80_one / floatx80_zero, exact in every rounding mode), and the
+# m80 pair FLDT / FSTPT (do_fldt / do_fstt copy the 80-bit encoding) --
+# so `R-rd-missing fld1 +fpcw` and its eleven siblings say that LLVM
+# models a read the machine does not perform.  `R-rd-phantom fbld
+# +fpcw,fpsw` is the same disagreement with the arrow reversed:
+# helper_fbld_ST0 DOES pass &env->fp_status to int64_to_floatx80, so the
+# boundary names the read, and LLVM -- which names FPCW on `fildl`, the
+# identical exact integer widening -- does not name it here.
+#
+# TO CHECK WHETHER ONE OF THESE CAN GO: read the helper the encoding's
+# (mod, op, rm) selects in gen_x87() and look for `env->fpuc` or
+# `env->fp_status` in it, resolving one level of call (fdiv_ST0_FT0
+# reaches helper_fdiv, fprem/fprem1 reach fprem_common, fyl2x/fyl2xp1
+# reach fyl2x_common).  If it is there and the entry says the boundary
+# omits the read, the boundary is wrong and the entry is a bug to fix.
 # =====================================================================
-x86_64 R-rd-missing fnstenv +cs,fpcw
-x86_64 R-rd-missing fnstenv +ds,fpcw
-x86_64 R-rd-missing fnstenv +fpcw
+x86_64 R-rd-phantom fbld +fpcw,fpsw
+x86_64 R-rd-missing fnstenv +cs
+x86_64 R-rd-missing fnstenv +ds
 x86_64 R-rd-missing fnstsw +cs
 x86_64 R-rd-missing fnstsw +ds
 x86_64 R-rd-missing fst +fpcw,st#
@@ -8882,7 +8809,6 @@ x86_64 R-rd-phantom faddl +st#
 x86_64 R-rd-phantom faddp +fpsw
 x86_64 R-rd-phantom faddp +fpsw,st#
 x86_64 R-rd-phantom fadds +st#
-x86_64 R-rd-phantom fbld +fpsw
 x86_64 R-rd-phantom fbstp +fpsw,st#
 x86_64 R-rd-phantom fchs +st#
 x86_64 R-rd-phantom fcomp +fpsw
@@ -8976,7 +8902,6 @@ x86_64 R-rd-phantom fxch +st#
 x86_64 R-rd-phantom fxtract +fpsw,st#
 x86_64 R-rd-phantom fyl2x +fpsw,st#
 x86_64 R-rd-phantom fyl2xp1 +fpsw,st#
-x86_64 R-wr-missing fldenv +fpcw
 x86_64 R-wr-phantom f2xm1 +st#
 x86_64 R-wr-phantom fabs +st#
 x86_64 R-wr-phantom fadd +st#

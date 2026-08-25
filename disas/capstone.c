@@ -567,9 +567,35 @@ static void cap_x86_add_sysregs(const cs_insn *insn,
  *
  * The status word is where TOP lives, so a push or a pop is a genuine
  * read-modify-write of it and a later `fnstsw` must wait on it: the R7
- * regfile-dependency test is satisfied for every edge stated here.  The
- * x87 control and tag words fold onto the same generic id as the status
- * word, so FLDENV / FNSTENV are stated through cap_x86_add_x87_env().
+ * regfile-dependency test is satisfied for every edge stated here.
+ * FLDENV / FNSTENV move the control and tag words together and are stated
+ * through cap_x86_add_x87_env().
+ *
+ * X87F_CWR IS THE CONTROL-WORD READ, and it is derived from QEMU the same
+ * way the rest of this table is rather than from the manual or from LLVM's
+ * MCInstrDesc.  The control word reaches an x87 helper by two routes:
+ * directly, where the helper switches on `env->fpuc & FPU_RC_MASK` (the
+ * five rounding-dependent constant loads FLDL2T / FLDL2E / FLDPI / FLDLG2
+ * / FLDLN2 do exactly that), and through `env->fp_status`, which is the
+ * DECODED FORM of the control word -- update_fp_status() writes the
+ * rounding mode and the precision control into it out of `env->fpuc`, and
+ * merge_exception_flags() consults `~env->fpuc & FPUC_EM` to decide
+ * whether a raised flag becomes an unmasked exception.  So a helper that
+ * hands `&env->fp_status` to softfloat, or that merges exception flags,
+ * READS the control word; one that only moves floatx80 bit patterns does
+ * not.  Resolved through the call graph (helper_fdiv_ST0_FT0 reaches
+ * helper_fdiv, fprem/fprem1 reach fprem_common, fyl2x/fyl2xp1 reach
+ * fyl2x_common), that criterion says YES for every arithmetic, compare,
+ * convert and transcendental form and NO for the pure moves: FLD %st(i),
+ * FST/FSTP %st(i), FXCH, FCHS, FABS, FLD1, FLDZ, FXAM, FFREE, FDECSTP /
+ * FINCSTP, FLDT/FSTPT (the m80 pair, which is a bit-pattern copy) and
+ * FNSTSW.
+ *
+ * It is a SOURCE and never a destination on these forms, which is why it
+ * needed an id of its own: on the status word's REG_FCSR, every x87
+ * arithmetic instruction would have read the register the one before it
+ * had just written and an FP program would serialise through an edge the
+ * hardware does not have.  See REG_FPCW in champsim_tracer_generic_ids.h.
  */
 #define X87F_R0    0x0001u   /* reads  ST(0) implicitly                    */
 #define X87F_W0    0x0002u   /* writes ST(0) implicitly                    */
@@ -581,7 +607,9 @@ static void cap_x86_add_sysregs(const cs_insn *insn,
 #define X87F_OPRW  0x0080u   /* the LAST st(i) operand is read-modify-write*/
 #define X87F_ENVR  0x0100u   /* reads  the control + tag words             */
 #define X87F_ENVW  0x0200u   /* writes the control + tag words             */
-#define X87F_ANY   0x03ffu
+#define X87F_CWR   0x0400u   /* reads  the CONTROL word (rounding mode,
+                              * precision control, exception masks)        */
+#define X87F_ANY   0x07ffu
 
 /* fpush / fpop / fpop2 all move env->fpstt, which lives in the status word. */
 #define X87F_PUSH  (X87F_SWR | X87F_SWW)
@@ -1211,7 +1239,7 @@ static const struct {
     [CAP_X86_SYSREG_LDTR]   = { "ldtr",   QEMU_PLUGIN_SYSREG_MMU },
     [CAP_X86_SYSREG_TR]     = { "tr",     QEMU_PLUGIN_SYSREG_MMU },
     [CAP_X86_SYSREG_MXCSR]  = { "mxcsr",  QEMU_PLUGIN_SYSREG_FPCTRL },
-    [CAP_X86_SYSREG_X87CW]  = { "fpcw",   QEMU_PLUGIN_SYSREG_FPCTRL },
+    [CAP_X86_SYSREG_X87CW]  = { "fpcw",   QEMU_PLUGIN_SYSREG_FPCW },
     [CAP_X86_SYSREG_X87TAG] = { "fptag",  QEMU_PLUGIN_SYSREG_FPCTRL },
     [CAP_X86_SYSREG_MSR]    = { "msr",    QEMU_PLUGIN_SYSREG_OTHER },
     [CAP_X86_SYSREG_TSC]    = { "tsc",    QEMU_PLUGIN_SYSREG_TIMER },
@@ -1343,25 +1371,25 @@ static unsigned int cap_x86_x87_effects(const cs_insn *insn)
              * op1 == 2 is fcom (no result written), op1 == 3 is fcomp
              * (fcom + gen_helper_fpop). */
             if ((op & 7) == 2) {
-                return X87F_R0 | X87F_SWW;
+                return X87F_R0 | X87F_SWW | X87F_CWR;
             }
             if ((op & 7) == 3) {
-                return X87F_R0 | X87F_POP | X87F_SWW;
+                return X87F_R0 | X87F_POP | X87F_SWW | X87F_CWR;
             }
-            return X87F_R0 | X87F_W0 | X87F_SWW;
+            return X87F_R0 | X87F_W0 | X87F_SWW | X87F_CWR;
         case 0x08: case 0x18: case 0x28: case 0x38:
             /* flds / fildl / fldl / filds -- gen_helper_f{ld,ild}*_ST0
              * after the implicit push the ST0 name performs. */
-            return X87F_PUSH | X87F_W0 | X87F_SWW;
+            return X87F_PUSH | X87F_W0 | X87F_SWW | X87F_CWR;
         case 0x09: case 0x19: case 0x29: case 0x39:
             /* fisttp{s,l,ll} -- gen_helper_fistt*_ST0 then fpop. */
-            return X87F_R0 | X87F_POP | X87F_SWW;
+            return X87F_R0 | X87F_POP | X87F_SWW | X87F_CWR;
         case 0x0a: case 0x1a: case 0x2a: case 0x3a:
             /* fsts / fistl / fstl / fists -- read ST(0), no pop. */
-            return X87F_R0 | X87F_SWW;
+            return X87F_R0 | X87F_SWW | X87F_CWR;
         case 0x0b: case 0x1b: case 0x2b: case 0x3b:
             /* fstps / fistpl / fstpl / fistps -- read ST(0) then fpop. */
-            return X87F_R0 | X87F_POP | X87F_SWW;
+            return X87F_R0 | X87F_POP | X87F_SWW | X87F_CWR;
         case 0x0c:
             /* fldenv: do_fldenv() assigns fpuc, fpus, fpstt and every
              * fptags[] entry and reads none of them. */
@@ -1372,21 +1400,26 @@ static unsigned int cap_x86_x87_effects(const cs_insn *insn)
              * LLVM MC names the read as well and QEMU settles it. */
             return X87F_ENVR | X87F_SWR;
         case 0x1d: case 0x3d:
-            /* fldt (m80) / fildll -- gen_helper_fldt_ST0 / fildll_ST0. */
-            return X87F_PUSH | X87F_W0 | X87F_SWW;
+            /* fldt (m80) / fildll -- gen_helper_fldt_ST0 / fildll_ST0.
+             * do_fldt() copies the 80-bit pattern and touches no
+             * float_status; fildll_ST0 converts through one. */
+            return X87F_PUSH | X87F_W0 | X87F_SWW |
+                   (op == 0x3d ? X87F_CWR : 0);
         case 0x1f: case 0x3f:
-            /* fstpt (m80) / fistpll -- ST0 then fpop. */
-            return X87F_R0 | X87F_POP | X87F_SWW;
+            /* fstpt (m80) / fistpll -- ST0 then fpop.  Same asymmetry:
+             * do_fstt() is a bit-pattern store, fistll_ST0 rounds. */
+            return X87F_R0 | X87F_POP | X87F_SWW |
+                   (op == 0x3f ? X87F_CWR : 0);
         case 0x2f:
             /* fnstsw m16 -- helper_fnstsw() returns a rearrangement of
              * env->fpus and assigns nothing. */
             return X87F_SWR;
         case 0x3c:
             /* fbld -- gen_helper_fbld_ST0, which pushes. */
-            return X87F_PUSH | X87F_W0 | X87F_SWW;
+            return X87F_PUSH | X87F_W0 | X87F_SWW | X87F_CWR;
         case 0x3e:
             /* fbstp -- gen_helper_fbst_ST0 then fpop. */
-            return X87F_R0 | X87F_POP | X87F_SWW;
+            return X87F_R0 | X87F_POP | X87F_SWW | X87F_CWR;
         /* 0x0d fldcw, 0x0f fnstcw, 0x2c frstor, 0x2e fnsave are already
          * stated in full by cap_x86_add_sysregs(). */
         default:
@@ -1399,20 +1432,20 @@ static unsigned int cap_x86_x87_effects(const cs_insn *insn)
     case 0x00: case 0x01: case 0x04: case 0x05: case 0x06: case 0x07:
         /* fxxx %st(i), %st -- fmov_FT0_STN(i) then fp_arith_ST0_FT0:
          * ST(0) is both the other addend and the destination. */
-        return X87F_R0 | X87F_W0 | X87F_SWW;
+        return X87F_R0 | X87F_W0 | X87F_SWW | X87F_CWR;
     case 0x20: case 0x21: case 0x24: case 0x25: case 0x26: case 0x27:
         /* fxxx %st, %st(i) -- fp_arith_STN_ST0: reads ST(0), and the
          * NAMED register is the destination as well as an addend. */
-        return X87F_R0 | X87F_OPRW | X87F_SWW;
+        return X87F_R0 | X87F_OPRW | X87F_SWW | X87F_CWR;
     case 0x30: case 0x31: case 0x34: case 0x35: case 0x36: case 0x37:
         /* fxxxp %st, %st(i) -- the same, then fpop. */
-        return X87F_R0 | X87F_OPRW | X87F_POP | X87F_SWW;
+        return X87F_R0 | X87F_OPRW | X87F_POP | X87F_SWW | X87F_CWR;
     case 0x02: case 0x22:
         /* fcom %st(i) */
-        return X87F_R0 | X87F_SWW;
+        return X87F_R0 | X87F_SWW | X87F_CWR;
     case 0x03: case 0x23: case 0x32:
         /* fcomp %st(i) -- fcom then fpop. */
-        return X87F_R0 | X87F_POP | X87F_SWW;
+        return X87F_R0 | X87F_POP | X87F_SWW | X87F_CWR;
     case 0x08:
         /* fld %st(i) -- fpush then fmov_ST0_STN. */
         return X87F_PUSH | X87F_W0 | X87F_SWW;
@@ -1428,58 +1461,76 @@ static unsigned int cap_x86_x87_effects(const cs_insn *insn)
         switch (rm) {
         case 0: case 1:
             return X87F_R0 | X87F_W0 | X87F_SWW;   /* fchs, fabs      */
-        case 4: case 5:
-            return X87F_R0 | X87F_SWW;             /* ftst, fxam      */
+        case 4:
+            /* ftst -- fldz_FT0 then fcom_ST0_FT0, which merges. */
+            return X87F_R0 | X87F_SWW | X87F_CWR;
+        case 5:
+            /* fxam -- reads the bit pattern, no float_status. */
+            return X87F_R0 | X87F_SWW;
         default:
             return 0;
         }
     case 0x0d:
         /* fld1 / fldl2t / fldl2e / fldpi / fldlg2 / fldln2 / fldz --
-         * fpush then the constant into ST(0). */
-        return (rm <= 6) ? (X87F_PUSH | X87F_W0 | X87F_SWW) : 0;
+         * fpush then the constant into ST(0).  The five middle ones pick
+         * their 80-bit pattern by switching on env->fpuc & FPU_RC_MASK;
+         * fld1 and fldz are exact in every rounding mode and read
+         * nothing. */
+        if (rm > 6) {
+            return 0;
+        }
+        return X87F_PUSH | X87F_W0 | X87F_SWW |
+               ((rm >= 1 && rm <= 5) ? X87F_CWR : 0);
     case 0x0e:
         switch (rm) {
-        case 0: return X87F_R0 | X87F_W0 | X87F_SWW;              /* f2xm1   */
+        case 0: return X87F_R0 | X87F_W0 | X87F_SWW |
+                       X87F_CWR;                                  /* f2xm1   */
         case 1: return X87F_R0 | X87F_R1 | X87F_W1 |
-                       X87F_POP | X87F_SWW;                       /* fyl2x   */
+                       X87F_POP | X87F_SWW | X87F_CWR;            /* fyl2x   */
         case 2: return X87F_R0 | X87F_W0 | X87F_W1 |
-                       X87F_PUSH | X87F_SWW;                      /* fptan   */
+                       X87F_PUSH | X87F_SWW | X87F_CWR;           /* fptan   */
         case 3: return X87F_R0 | X87F_R1 | X87F_W1 |
-                       X87F_POP | X87F_SWW;                       /* fpatan  */
+                       X87F_POP | X87F_SWW | X87F_CWR;            /* fpatan  */
         case 4: return X87F_R0 | X87F_W0 | X87F_W1 |
-                       X87F_PUSH | X87F_SWW;                      /* fxtract */
-        case 5: return X87F_R0 | X87F_R1 | X87F_W0 | X87F_SWW;    /* fprem1  */
+                       X87F_PUSH | X87F_SWW | X87F_CWR;           /* fxtract */
+        case 5: return X87F_R0 | X87F_R1 | X87F_W0 | X87F_SWW |
+                       X87F_CWR;                                  /* fprem1  */
         default: return X87F_SWR | X87F_SWW;             /* fdecstp/fincstp */
         }
     case 0x0f:
         switch (rm) {
-        case 0: return X87F_R0 | X87F_R1 | X87F_W0 | X87F_SWW;    /* fprem   */
+        case 0: return X87F_R0 | X87F_R1 | X87F_W0 | X87F_SWW |
+                       X87F_CWR;                                  /* fprem   */
         case 1: return X87F_R0 | X87F_R1 | X87F_W1 |
-                       X87F_POP | X87F_SWW;                       /* fyl2xp1 */
+                       X87F_POP | X87F_SWW | X87F_CWR;            /* fyl2xp1 */
         case 3: return X87F_R0 | X87F_W0 | X87F_W1 |
-                       X87F_PUSH | X87F_SWW;                      /* fsincos */
-        case 5: return X87F_R0 | X87F_R1 | X87F_W0 | X87F_SWW;    /* fscale  */
-        default: return X87F_R0 | X87F_W0 | X87F_SWW;
+                       X87F_PUSH | X87F_SWW | X87F_CWR;           /* fsincos */
+        case 5: return X87F_R0 | X87F_R1 | X87F_W0 | X87F_SWW |
+                       X87F_CWR;                                  /* fscale  */
+        default: return X87F_R0 | X87F_W0 | X87F_SWW | X87F_CWR;
                                           /* fsqrt, frndint, fsin, fcos */
         }
     case 0x15:
         /* fucompp -- fucom then TWO fpops. */
-        return (rm == 1) ? (X87F_R0 | X87F_R1 | X87F_POP | X87F_SWW) : 0;
+        return (rm == 1) ? (X87F_R0 | X87F_R1 | X87F_POP | X87F_SWW |
+                            X87F_CWR) : 0;
     case 0x1d: case 0x1e:
         /* fucomi / fcomi -- read ST(0), write EFLAGS (Capstone's) and the
          * status word; no pop. */
-        return X87F_R0 | X87F_SWW;
+        return X87F_R0 | X87F_SWW | X87F_CWR;
     case 0x2a:
         /* fst %st(i) -- fmov_STN_ST0 is a PURE write of the named
          * register; Capstone reports it READ. */
         return X87F_R0 | X87F_OPW | X87F_SWW;
     case 0x2c:
-        return X87F_R0 | X87F_SWW;                        /* fucom %st(i)  */
+        return X87F_R0 | X87F_SWW | X87F_CWR;             /* fucom %st(i)  */
     case 0x2d:
-        return X87F_R0 | X87F_POP | X87F_SWW;             /* fucomp %st(i) */
+        return X87F_R0 | X87F_POP | X87F_SWW |
+               X87F_CWR;                                  /* fucomp %st(i) */
     case 0x33:
         /* fcompp -- fcom then TWO fpops. */
-        return (rm == 1) ? (X87F_R0 | X87F_R1 | X87F_POP | X87F_SWW) : 0;
+        return (rm == 1) ? (X87F_R0 | X87F_R1 | X87F_POP | X87F_SWW |
+                            X87F_CWR) : 0;
     case 0x38:
         /* ffreep %st(i) -- ffree_STN (tag word only, already stated by
          * cap_x86_add_sysregs) then fpop. */
@@ -1489,7 +1540,7 @@ static unsigned int cap_x86_x87_effects(const cs_insn *insn)
         return (rm == 0) ? X87F_SWR : 0;
     case 0x3d: case 0x3e:
         /* fucomip / fcomip -- the comparison then fpop. */
-        return X87F_R0 | X87F_POP | X87F_SWW;
+        return X87F_R0 | X87F_POP | X87F_SWW | X87F_CWR;
     /* 0x0a fnop, 0x1c (feni/fdisi/fclex/fninit/fsetpm), 0x28 ffree and
      * 0x10..0x13 / 0x18..0x1b FCMOVcc are already stated in full -- the
      * first three by cap_x86_add_sysregs(), FCMOVcc by cap_x86_is_cmov(). */
@@ -1523,6 +1574,9 @@ static void cap_x86_add_x87_implicit(unsigned int fx,
     }
     if (fx & X87F_SWW) {
         cap_x86_add_implicit(out, handle, X86_REG_FPSW, true);
+    }
+    if (fx & X87F_CWR) {
+        cap_x86_add_sysreg(out, CAP_X86_SYSREG_X87CW, CAP_X86_SYS_R);
     }
     if (fx & X87F_ENVR) {
         cap_x86_add_x87_env(out, CAP_X86_SYS_R, false);

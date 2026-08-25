@@ -1845,8 +1845,6 @@ x86_64 FR-rd-missing fldl +REG_SEG0
 x86_64 FR-rd-missing fldl +REG_SEG1
 x86_64 FR-rd-missing flds +REG_SEG0
 x86_64 FR-rd-missing flds +REG_SEG1
-x86_64 FR-rd-missing fldt +REG_SEG0
-x86_64 FR-rd-missing fldt +REG_SEG1
 x86_64 FR-rd-missing fmull +REG_SEG0
 x86_64 FR-rd-missing fmull +REG_SEG1
 x86_64 FR-rd-missing fmuls +REG_SEG0
@@ -1863,8 +1861,6 @@ x86_64 FR-rd-missing fstpl +REG_SEG0
 x86_64 FR-rd-missing fstpl +REG_SEG1
 x86_64 FR-rd-missing fstps +REG_SEG0
 x86_64 FR-rd-missing fstps +REG_SEG1
-x86_64 FR-rd-missing fstpt +REG_SEG0
-x86_64 FR-rd-missing fstpt +REG_SEG1
 x86_64 FR-rd-missing fsts +REG_SEG0
 x86_64 FR-rd-missing fsts +REG_SEG1
 x86_64 FR-rd-missing fsts +REG_SEG2
@@ -2593,129 +2589,58 @@ x86_64 FR-rd-missing ficoms +REG_SEG2
 x86_64 FR-rd-missing ficoms +REG_SEG5
 
 
-# (b) THE x87 CONTROL WORD, which Capstone cannot name at all.  LLVM
-# attaches FPCW as a use to essentially the whole x87 space -- rounding
-# and precision control are inputs to every result -- and there is no
-# X86_REG_FPCW in Capstone 6.0.0-Alpha7's register enumeration (grep
+# (b) THE x87 CONTROL WORD, which the trace now carries.  There is still
+# no X86_REG_FPCW in Capstone 6.0.0-Alpha7's register enumeration (grep
 # subprojects/capstone/include/capstone/x86.h: FPSW is there, FPCW is
-# not).  The tracer's register table therefore has nothing to classify and
-# the trace carries no FLDCW -> x87-operation edge.
+# not), so the word does not arrive as a member of the register file; it
+# arrives as a SYSTEM register from the boundary, and REG_FPCW is the
+# generic id it lands on.  The FLDCW -> x87-operation edge this block used
+# to record as absent is in the trace: `fldcw (%rax)` writes REG_FPCW and
+# `fadds (%rax)` reads it, on separate ids from the status word every x87
+# instruction WRITES, so the edge exists and no FP program serialises
+# through a false one.
 #
-# NAMED AS A GAP, NOT VOUCHED FOR: an out-of-order model that wanted to
-# serialise x87 arithmetic behind a rounding-mode change cannot see the
-# dependency here.  Boundary twin: family (e) in isaxcheck_allow.txt,
-# whose comment carries the same measurement.  Owed upstream.
-x86_64 FN-unmapped-llvm-reg f2xm1 fpcw
-x86_64 FN-unmapped-llvm-reg fadd fpcw
-x86_64 FN-unmapped-llvm-reg faddl fpcw
-x86_64 FN-unmapped-llvm-reg faddp fpcw
-x86_64 FN-unmapped-llvm-reg fadds fpcw
-x86_64 FN-unmapped-llvm-reg fbstp fpcw
-x86_64 FN-unmapped-llvm-reg fcom fpcw
-x86_64 FN-unmapped-llvm-reg fcomi fpcw
-x86_64 FN-unmapped-llvm-reg fcoml fpcw
-x86_64 FN-unmapped-llvm-reg fcomp fpcw
-x86_64 FN-unmapped-llvm-reg fcompi fpcw
-x86_64 FN-unmapped-llvm-reg fcompl fpcw
-x86_64 FN-unmapped-llvm-reg fcompp fpcw
-x86_64 FN-unmapped-llvm-reg fcomps fpcw
-x86_64 FN-unmapped-llvm-reg fcoms fpcw
-x86_64 FN-unmapped-llvm-reg fcos fpcw
-x86_64 FN-unmapped-llvm-reg fdiv fpcw
-x86_64 FN-unmapped-llvm-reg fdivl fpcw
-x86_64 FN-unmapped-llvm-reg fdivp fpcw
-x86_64 FN-unmapped-llvm-reg fdivr fpcw
-x86_64 FN-unmapped-llvm-reg fdivrl fpcw
-x86_64 FN-unmapped-llvm-reg fdivrp fpcw
-x86_64 FN-unmapped-llvm-reg fdivrs fpcw
-x86_64 FN-unmapped-llvm-reg fdivs fpcw
-x86_64 FN-unmapped-llvm-reg fiaddl fpcw
-x86_64 FN-unmapped-llvm-reg fiadds fpcw
-x86_64 FN-unmapped-llvm-reg ficoml fpcw
-x86_64 FN-unmapped-llvm-reg ficompl fpcw
-x86_64 FN-unmapped-llvm-reg ficomps fpcw
-x86_64 FN-unmapped-llvm-reg ficoms fpcw
-x86_64 FN-unmapped-llvm-reg fidivl fpcw
-x86_64 FN-unmapped-llvm-reg fidivrl fpcw
-x86_64 FN-unmapped-llvm-reg fidivrs fpcw
-x86_64 FN-unmapped-llvm-reg fidivs fpcw
-x86_64 FN-unmapped-llvm-reg fildl fpcw
-x86_64 FN-unmapped-llvm-reg fildll fpcw
-x86_64 FN-unmapped-llvm-reg filds fpcw
-x86_64 FN-unmapped-llvm-reg fimull fpcw
-x86_64 FN-unmapped-llvm-reg fimuls fpcw
-x86_64 FN-unmapped-llvm-reg fistl fpcw
-x86_64 FN-unmapped-llvm-reg fistpl fpcw
-x86_64 FN-unmapped-llvm-reg fistpll fpcw
-x86_64 FN-unmapped-llvm-reg fistps fpcw
-x86_64 FN-unmapped-llvm-reg fists fpcw
-x86_64 FN-unmapped-llvm-reg fisttpl fpcw
-x86_64 FN-unmapped-llvm-reg fisttpll fpcw
-x86_64 FN-unmapped-llvm-reg fisttps fpcw
-x86_64 FN-unmapped-llvm-reg fisubl fpcw
-x86_64 FN-unmapped-llvm-reg fisubrl fpcw
-x86_64 FN-unmapped-llvm-reg fisubrs fpcw
-x86_64 FN-unmapped-llvm-reg fisubs fpcw
-x86_64 FN-unmapped-llvm-reg fld fpcw
-x86_64 FN-unmapped-llvm-reg fld1 fpcw
-x86_64 FN-unmapped-llvm-reg fldcw fpcw
-x86_64 FN-unmapped-llvm-reg fldenv fpcw
-x86_64 FN-unmapped-llvm-reg fldl fpcw
-x86_64 FN-unmapped-llvm-reg fldl2e fpcw
-x86_64 FN-unmapped-llvm-reg fldl2t fpcw
-x86_64 FN-unmapped-llvm-reg fldlg2 fpcw
-x86_64 FN-unmapped-llvm-reg fldln2 fpcw
-x86_64 FN-unmapped-llvm-reg fldpi fpcw
-x86_64 FN-unmapped-llvm-reg flds fpcw
-x86_64 FN-unmapped-llvm-reg fldt fpcw
-x86_64 FN-unmapped-llvm-reg fldz fpcw
-x86_64 FN-unmapped-llvm-reg fmul fpcw
-x86_64 FN-unmapped-llvm-reg fmull fpcw
-x86_64 FN-unmapped-llvm-reg fmulp fpcw
-x86_64 FN-unmapped-llvm-reg fmuls fpcw
-x86_64 FN-unmapped-llvm-reg fninit fpcw
-x86_64 FN-unmapped-llvm-reg fnsave fpcw
-x86_64 FN-unmapped-llvm-reg fnstcw fpcw
-x86_64 FN-unmapped-llvm-reg fnstenv fpcw
-x86_64 FN-unmapped-llvm-reg fpatan fpcw
-x86_64 FN-unmapped-llvm-reg fprem fpcw
-x86_64 FN-unmapped-llvm-reg fprem1 fpcw
-x86_64 FN-unmapped-llvm-reg fptan fpcw
-x86_64 FN-unmapped-llvm-reg frndint fpcw
-x86_64 FN-unmapped-llvm-reg frstor fpcw
-x86_64 FN-unmapped-llvm-reg fscale fpcw
-x86_64 FN-unmapped-llvm-reg fsin fpcw
-x86_64 FN-unmapped-llvm-reg fsincos fpcw
-x86_64 FN-unmapped-llvm-reg fsqrt fpcw
-x86_64 FN-unmapped-llvm-reg fst fpcw
-x86_64 FN-unmapped-llvm-reg fstl fpcw
-x86_64 FN-unmapped-llvm-reg fstp fpcw
-x86_64 FN-unmapped-llvm-reg fstpl fpcw
-x86_64 FN-unmapped-llvm-reg fstps fpcw
-x86_64 FN-unmapped-llvm-reg fstpt fpcw
-x86_64 FN-unmapped-llvm-reg fsts fpcw
-x86_64 FN-unmapped-llvm-reg fsub fpcw
-x86_64 FN-unmapped-llvm-reg fsubl fpcw
-x86_64 FN-unmapped-llvm-reg fsubp fpcw
-x86_64 FN-unmapped-llvm-reg fsubr fpcw
-x86_64 FN-unmapped-llvm-reg fsubrl fpcw
-x86_64 FN-unmapped-llvm-reg fsubrp fpcw
-x86_64 FN-unmapped-llvm-reg fsubrs fpcw
-x86_64 FN-unmapped-llvm-reg fsubs fpcw
-x86_64 FN-unmapped-llvm-reg ftst fpcw
-x86_64 FN-unmapped-llvm-reg fucom fpcw
-x86_64 FN-unmapped-llvm-reg fucomi fpcw
-x86_64 FN-unmapped-llvm-reg fucomp fpcw
-x86_64 FN-unmapped-llvm-reg fucompi fpcw
-x86_64 FN-unmapped-llvm-reg fucompp fpcw
-x86_64 FN-unmapped-llvm-reg fxch fpcw
-x86_64 FN-unmapped-llvm-reg fxrstor fpcw
-x86_64 FN-unmapped-llvm-reg fxrstor64 fpcw
-x86_64 FN-unmapped-llvm-reg fxsave fpcw
-x86_64 FN-unmapped-llvm-reg fxsave64 fpcw
-x86_64 FN-unmapped-llvm-reg fxtract fpcw
-x86_64 FN-unmapped-llvm-reg fyl2x fpcw
-x86_64 FN-unmapped-llvm-reg fyl2xp1 fpcw
+# The 111 `FN-unmapped-llvm-reg <mnem> fpcw` rows that used to sit here
+# are gone, and their disappearance is not the point -- the point is that
+# they were never a comparison.  A row saying "this tool cannot name the
+# register" would have read exactly the same if the boundary had lost the
+# operand outright.  build_name_to_generic() now indexes the token against
+# the tracer's own role mapping, so the two sides are compared and the
+# residue below is what they actually disagree about.
+#
+# WHAT IS LEFT IS LLVM'S BLANKET USE.  MCInstrDesc attaches FPCW to the
+# whole x87 space including the pure bit-pattern moves, whose QEMU helper
+# hands no float_status to anything: FLD / FST / FSTP %st(i)
+# (helper_fmov_*), FXCH, FLD1 and FLDZ, and the m80 pair FLDT / FSTPT
+# (do_fldt / do_fstt copy the encoding).  `FR-rd-phantom fbld
+# +REG_FCSR,REG_FPCW` is the same disagreement reversed -- helper_fbld_ST0
+# does pass &env->fp_status to int64_to_floatx80, and LLVM, which names
+# FPCW on the identical `fildl`, does not name it here.
+#
+# `FR-wr-missing fnstenv +REG_FCSR,REG_FPCW` is NOT an LLVM artefact: SDM
+# Vol.1 8.1.10 has FNSTENV mask every FP exception after the save, and
+# do_fstenv() (target/i386/tcg/fpu_helper.c) reads env->fpuc and assigns
+# nothing.  It is tracked as a QEMU defect, not a decode one; the row
+# moves the day the helper does.
+x86_64 FM-miss-store cldemote
+x86_64 FM-miss-store prefetchwt1
+x86_64 FR-rd-missing fld +REG_FPCW
+x86_64 FR-rd-missing fld1 +REG_FPCW
+x86_64 FR-rd-missing fldt +REG_FPCW
+x86_64 FR-rd-missing fldt +REG_FPCW,REG_SEG0
+x86_64 FR-rd-missing fldt +REG_FPCW,REG_SEG1
+x86_64 FR-rd-missing fldz +REG_FPCW
+x86_64 FR-rd-missing fst +REG_FPCW
+x86_64 FR-rd-missing fst +REG_FPCW,REG_FPR#
+x86_64 FR-rd-missing fstp +REG_FPCW
+x86_64 FR-rd-missing fstp +REG_FPCW,REG_FPR#
+x86_64 FR-rd-missing fstpt +REG_FPCW
+x86_64 FR-rd-missing fstpt +REG_FPCW,REG_SEG0
+x86_64 FR-rd-missing fstpt +REG_FPCW,REG_SEG1
+x86_64 FR-rd-missing fxch +REG_FPCW
+x86_64 FR-rd-phantom fbld +REG_FCSR,REG_FPCW
+x86_64 FR-wr-missing fldcw +REG_FCSR
+x86_64 FR-wr-missing fnstenv +REG_FCSR,REG_FPCW
 
 
 # (c) THE TRACER'S OWN CONTROL-FLOW TAXONOMY, which is a decision rather
@@ -3293,7 +3218,6 @@ x86_64 FM-cs-mem-llvm-none vmptrld
 x86_64 FM-cs-mem-llvm-none vmptrst
 x86_64 FM-cs-mem-llvm-none vmxon
 x86_64 FM-extra-load movq
-x86_64 FM-llvm-mem-cs-none cldemote load store
 x86_64 FM-llvm-mem-cs-none clrssbsy load store
 x86_64 FM-llvm-mem-cs-none emms load store
 x86_64 FM-llvm-mem-cs-none femms load store
@@ -3308,7 +3232,6 @@ x86_64 FM-llvm-mem-cs-none mwait load store
 x86_64 FM-llvm-mem-cs-none nopl load store
 x86_64 FM-llvm-mem-cs-none nopw load store
 x86_64 FM-llvm-mem-cs-none pause load store
-x86_64 FM-llvm-mem-cs-none prefetchwt1 load store
 x86_64 FM-llvm-mem-cs-none ptwritel load store
 x86_64 FM-llvm-mem-cs-none ptwriteq load store
 x86_64 FM-llvm-mem-cs-none rdfsbasel load store
@@ -3447,7 +3370,6 @@ x86_64 FM-miss-load fxsave64
 x86_64 FM-miss-store fxrstor
 x86_64 FM-miss-store fxrstor64
 x86_64 FR-rd-missing ffreep +REG_FPR#
-x86_64 FR-rd-missing fstp +REG_FPR#
 x86_64 FR-rd-phantom fadd +REG_FPR#
 x86_64 FR-rd-phantom fcom +REG_FPR#
 x86_64 FR-rd-phantom fcoml +REG_FPR#
@@ -3463,7 +3385,6 @@ x86_64 FR-rd-phantom ftst +REG_FPR#
 x86_64 FR-rd-phantom fxam +REG_FPR#
 x86_64 FR-wr-missing fnop +REG_FCSR
 x86_64 FR-wr-missing fnstcw +REG_FCSR
-x86_64 FR-wr-missing fnstenv +REG_FCSR
 x86_64 FR-wr-missing fnstsw +REG_FCSR
 x86_64 FR-wr-phantom fcmovb +REG_FPR#
 x86_64 FR-wr-phantom fcmovbe +REG_FPR#
@@ -4219,7 +4140,6 @@ x86_64 FR-rd-missing fxsave64 +REG_SEG1
 x86_64 FR-rd-missing rdsspq +REG_FP_REG
 x86_64 FR-rd-missing rdsspq +REG_GPR#
 x86_64 FR-rd-missing rdsspq +REG_SP
-x86_64 FR-rd-phantom fnstcw +REG_FCSR
 x86_64 FR-rd-phantom incsspd +REG_SSP
 x86_64 FR-rd-phantom incsspq +REG_SSP
 x86_64 FR-rd-phantom lldtw +REG_SYSMMU
@@ -6988,7 +6908,6 @@ x86_64 FR-rd-phantom faddl +REG_FPR#
 x86_64 FR-rd-phantom faddp +REG_FCSR
 x86_64 FR-rd-phantom faddp +REG_FCSR,REG_FPR#
 x86_64 FR-rd-phantom fadds +REG_FPR#
-x86_64 FR-rd-phantom fbld +REG_FCSR
 x86_64 FR-rd-phantom fbstp +REG_FCSR,REG_FPR#
 x86_64 FR-rd-phantom fchs +REG_FPR#
 x86_64 FR-rd-phantom fcmovb +REG_FLAGS
@@ -7137,7 +7056,6 @@ x86_64 FR-wr-phantom fyl2xp1 +REG_FPR#
 # (B) the pre-existing EFLAGS / operand / segment families
 x86_64 FM-cs-mem-llvm-none pushq
 x86_64 FM-cs-mem-llvm-none pushw
-x86_64 FR-rd-missing fst +REG_FPR#
 x86_64 FR-rd-missing rclb +REG_SEG0
 x86_64 FR-rd-missing rclb +REG_SEG1
 x86_64 FR-rd-missing rclb +REG_SEG2

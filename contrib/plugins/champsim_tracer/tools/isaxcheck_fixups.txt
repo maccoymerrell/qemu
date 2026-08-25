@@ -283,7 +283,6 @@ x86_64 W-rd-added nopw +REG_GPR#
 x86_64 W-wr-added bswapw +REG_FP_REG
 x86_64 W-wr-added bswapw +REG_GPR#
 x86_64 W-wr-added bswapw +REG_SP
-x86_64 W-wr-added fstpnce +REG_FPR#
 
 # CET shadow-stack ops.  Capstone reports their register operand with no
 # access bits at all (the `Z-access0` defect class), so the boundary loses

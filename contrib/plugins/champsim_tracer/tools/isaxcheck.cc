@@ -807,6 +807,22 @@ static void build_name_to_generic(void)
     }
     cs_close(&h);
     /*
+     * x86's FP CONTROL word reaches the dependency model as a SYSTEM
+     * register, not as a member of Capstone's x86 register file: there is
+     * no X86_REG_FPCW to walk above, so the loop cannot index the token
+     * LLVM prints for it and every x87 arithmetic form reported
+     * `FN-unmapped-llvm-reg <mnem> fpcw` -- "this tool cannot name the
+     * register", which said nothing about whether the two sides agreed
+     * and would have gone on saying nothing if the boundary had lost the
+     * operand entirely.  The id comes from the tracer's own role mapping
+     * rather than from a hand-written number, so it follows the
+     * classification instead of drifting away from it.
+     */
+    if (isa == ISA_X86_64) {
+        name_to_generic["fpcw"].insert(
+            isax_generic_sysreg(QEMU_PLUGIN_SYSREG_FPCW));
+    }
+    /*
      * ISAX_DUMP_AMBIG names the split tokens.  The bare count says a split
      * exists but not where, and the two causes need opposite responses: a
      * DELIBERATE fold (x86's six segment registers onto one REG_SEG bank,

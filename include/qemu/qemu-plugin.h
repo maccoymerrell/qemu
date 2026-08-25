@@ -1095,9 +1095,14 @@ char *qemu_plugin_insn_disas(const struct qemu_plugin_insn *insn);
 #define QEMU_PLUGIN_SYSREG_OTHER     0  /* the long tail: trap,
                                          * translation, counter, debug */
 #define QEMU_PLUGIN_SYSREG_FLAGS     1  /* condition flags (AArch64 NZCV) */
-#define QEMU_PLUGIN_SYSREG_FPCTRL    2  /* FP / fixed-point rounding-mode
-                                         * and status word (FPCR, FPSR,
-                                         * fcsr, frm, vxrm, ...) */
+#define QEMU_PLUGIN_SYSREG_FPCTRL    2  /* FP / fixed-point STATUS word,
+                                         * and the combined control-and-
+                                         * status register where the
+                                         * architecture has only one:
+                                         * AArch64 FPSR / FPMR, RISC-V
+                                         * fflags / fcsr / vcsr / vxsat /
+                                         * vxrm, x86 FPSW / FPTAG /
+                                         * MXCSR. */
 #define QEMU_PLUGIN_SYSREG_VECCTRL   3  /* vector configuration (vl,
                                          * vtype, vstart) */
 #define QEMU_PLUGIN_SYSREG_THREADPTR 4  /* userspace thread pointer
@@ -1155,6 +1160,25 @@ char *qemu_plugin_insn_disas(const struct qemu_plugin_insn *insn);
                                          * population, so it cannot share
                                          * an ID with state none of them
                                          * touch. */
+#define QEMU_PLUGIN_SYSREG_FPCW     14  /* the FP CONTROL word, where the
+                                         * architecture keeps it in a
+                                         * register DISTINCT from the
+                                         * accrued-status word: x86 FPCW,
+                                         * AArch64 FPCR, RISC-V frm.  It
+                                         * holds the rounding mode, the
+                                         * precision control and the
+                                         * exception masks, and every FP
+                                         * arithmetic instruction READS
+                                         * it while none writes it.  On
+                                         * QEMU_PLUGIN_SYSREG_FPCTRL it
+                                         * shared an ID with the status
+                                         * word those same instructions
+                                         * WRITE, so each one took a
+                                         * false read-after-write edge
+                                         * from the one before it and an
+                                         * FP program serialised through
+                                         * a register nothing had
+                                         * modified. */
 
 /* Operand access mode (bitmask) */
 #define QEMU_PLUGIN_OP_ACC_READ  1

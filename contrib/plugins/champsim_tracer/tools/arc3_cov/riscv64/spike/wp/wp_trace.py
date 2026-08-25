@@ -53,6 +53,20 @@ _BBHDR = re.compile(r'^;\s*-+\s*BB\s+(\d+)\s+entry\s+pc=0x([0-9a-f]+)\s+'
 _WPHDR = re.compile(r'^;\s*\.+\s*wp\[(\d+)\]\s+BB\s+(\d+)\s+n_insns=(\d+)')
 _INSN_L = re.compile(r'^0x([0-9a-f]+)\s*(?:<[^>]*>)?:\s+'
                      r'((?:[0-9a-f]{2} )+)\s')
+#: The byte column is PADDED, so on a fixed-width ISA the encoding is always
+#: followed by two spaces or more and the pattern above suffices.  A
+#: variable-length ISA overflows that column: cst_decode prints a 9-byte
+#: x86 instruction as `66 41 0f d6 a7 e0 01 00 00 mov`, with ONE space, and
+#: the pattern above then matches NOTHING -- the instruction vanished from
+#: the reconstruction silently, which is how an excursion came to be
+#: rebuilt with an instruction missing from the middle of it.
+#:
+#: The relaxed pattern is tried ONLY after the padded one fails, because it
+#: cannot tell a two-hex-character MNEMONIC (mipsel has `bc`) from another
+#: encoding byte.  Ordering it second means a fixed-width ISA never reaches
+#: it and the ambiguity cannot arise where it would matter.
+_INSN_L_TIGHT = re.compile(r'^0x([0-9a-f]+)\s*(?:<[^>]*>)?:\s+'
+                           r'((?:[0-9a-f]{2} )+)(?=[a-z])')
 
 # ----------------------------------------------------------------- legacy view
 _ENTRY_L = re.compile(r'^ENTRY\s+(\d+)\s')
@@ -165,7 +179,7 @@ def _skeleton(decode, trace):
             continue
         if line.startswith(';'):
             continue
-        m = _INSN_L.match(line)
+        m = _INSN_L.match(line) or _INSN_L_TIGHT.match(line)
         if m and cur is not None:
             by = bytes(int(b, 16) for b in m.group(2).split())
             rec = (int(m.group(1), 16), int.from_bytes(by, 'little'), len(by))

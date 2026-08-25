@@ -56,6 +56,25 @@ struct IsaxFieldsView {
     uint8_t max_dep_stores = 0;
     std::vector<uint8_t> src;       /* GenericRegId, in slot order */
     std::vector<uint8_t> dst;       /* GenericRegId, in slot order */
+    /*
+     * The HAS_ADDR sub-block: for each memop slot, which of this
+     * instruction's template inputs feed the ADDRESS computation.  Bit i
+     * below n_src_regs selects src[i]; the bit AT n_src_regs is the
+     * immediate (a displacement).  Load-data slots are deliberately absent
+     * from the layout -- an address is computed before any load fires --
+     * which is why this is a separate span from dst_dep_mask and not a
+     * projection of it.
+     *
+     * This is the facet a consumer needs to model address generation, and
+     * it is the one the tracer publishes that no reference had ever been
+     * asked about.  Carrying the raw mask rather than a flattened register
+     * set keeps the per-slot structure a comparison may or may not choose
+     * to use: gem5 and Spike crack a macro-op into a varying number of
+     * micro-ops, so a slot-for-slot comparison would score GRANULARITY,
+     * and only the per-direction UNION is a like-for-like question.
+     */
+    std::vector<uint64_t> load_addr_dep;   /* [max_dep_loads] */
+    std::vector<uint64_t> store_addr_dep;  /* [max_dep_stores] */
 };
 
 /* Select the per-ISA classification tables.  @isa_name is isaxcheck's

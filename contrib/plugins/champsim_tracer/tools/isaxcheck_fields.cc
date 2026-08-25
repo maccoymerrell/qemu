@@ -162,6 +162,10 @@ bool isax_fields_decode(const struct qemu_plugin_insn_info *info,
     out->max_dep_stores = f.max_dep_stores;
     out->src.assign(f.src_regs, f.src_regs + f.n_src_regs);
     out->dst.assign(f.dst_regs, f.dst_regs + f.n_dst_regs);
+    out->load_addr_dep.assign(f.load_addr_dep_mask,
+                              f.load_addr_dep_mask + f.max_dep_loads);
+    out->store_addr_dep.assign(f.store_addr_dep_mask,
+                               f.store_addr_dep_mask + f.max_dep_stores);
     return true;
 }
 

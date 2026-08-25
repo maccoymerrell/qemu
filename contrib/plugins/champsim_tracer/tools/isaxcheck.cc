@@ -895,6 +895,52 @@ static std::string gensetstr(const std::set<unsigned> &s)
     return r.empty() ? "-" : r;
 }
 
+/*
+ * One memop slot's ADDRESS-dependency mask, rendered in the same register
+ * vocabulary the f_src/f_dst columns use.
+ *
+ * The mask's bit layout is the HAS_ADDR sub-block's, not the register
+ * sub-block's: bit i below n_src names src[i], and the bit AT n_src is the
+ * immediate displacement.  There are no load-data bits, because an address
+ * is computed before any load of this instruction fires.
+ *
+ * The immediate is printed rather than dropped.  A base-plus-displacement
+ * access and a bare-base access have the same REGISTER set and are not the
+ * same address computation, and a reference that names the displacement
+ * (XED, iced-x86 and gem5 all do) would otherwise disagree with us for a
+ * reason that is not about registers at all.
+ */
+static std::string addrdepstr(uint64_t m, const std::vector<uint8_t> &src)
+{
+    std::string r;
+    for (size_t i = 0; i < src.size() && i < 64; i++) {
+        if (!(m & (1ull << i))) continue;
+        if (!r.empty()) r += ",";
+        r += isax_generic_reg_name(src[i]);
+    }
+    if (src.size() < 64 && (m & (1ull << src.size()))) {
+        if (!r.empty()) r += ",";
+        r += "IMM";
+    }
+    return r.empty() ? "-" : r;
+}
+
+/* The per-slot masks of one direction, slots separated by ';'.  An
+ * instruction with no memop on that side prints "-", which is the same
+ * token an empty slot prints -- the slot COUNT is already carried by
+ * f_loads / f_stores, so this column never has to encode it twice. */
+static std::string addrdepslots(const std::vector<uint64_t> &masks,
+                                const std::vector<uint8_t> &src)
+{
+    if (masks.empty()) return "-";
+    std::string r;
+    for (uint64_t m : masks) {
+        if (!r.empty()) r += ";";
+        r += addrdepstr(m, src);
+    }
+    return r;
+}
+
 /* GenericRegId -> the short class token the signature keys use, matching
  * the vocabulary norm_*() already produces for the registers that DO live
  * in the ISA's register file (`fcsr` on MIPS, for instance). */
@@ -1375,6 +1421,26 @@ static void falsify_apply(IsaxFieldsView &f)
         for (unsigned g : f.src)
             if (!isax_generic_reg_dropped(g)) { visible = true; break; }
         f.src.clear();
+        /* The address masks are INDICES INTO f.src.  Leaving them behind a
+         * cleared source list would not be a smaller dependency model, it
+         * would be a mask pointing at slots that no longer exist -- so the
+         * address columns are damaged with the set they are expressed in,
+         * and stay a truthful rendering of a damaged model. */
+        f.load_addr_dep.clear();
+        f.store_addr_dep.clear();
+        if (visible) falsify_mutated++;
+    } else if (falsify_mode == "drop-addr") {
+        /* The ADDRESS-dependency arm's own falsifier: erase which registers
+         * each access computes its address from, leaving the register sets
+         * and the memop COUNTS untouched.  A consumer scoring f_laddr /
+         * f_saddr needs a mutation only IT can see; drop-src moves the
+         * register columns too, so a red result under drop-src would not
+         * tell that consumer its own axis can go red. */
+        bool visible = false;
+        for (uint64_t m : f.load_addr_dep) if (m) { visible = true; break; }
+        for (uint64_t m : f.store_addr_dep) if (m) { visible = true; break; }
+        for (auto &m : f.load_addr_dep) m = 0;
+        for (auto &m : f.store_addr_dep) m = 0;
         if (visible) falsify_mutated++;
     } else if (falsify_mode == "add-dst" && !f.src.empty()) {
         uint8_t g = f.src[0];
@@ -2341,7 +2407,9 @@ static void usage(void)
         "                  sweep's compare / allowlist / exit-code machinery\n"
         "  --falsify=MODE:MNEM   (fields layer only) damage the dependency\n"
         "                  model's view of MNEM before comparing: drop-src\n"
-        "                  erases its reads, add-dst plants a phantom write.\n"
+        "                  erases its reads, add-dst plants a phantom write,\n"
+        "                  drop-addr erases which registers its accesses\n"
+        "                  compute their addresses from (--batch columns).\n"
         "                  Proves the gate can fire; never for real runs.\n"
         "                  Reports matched/mutated row counts and exits 2 --\n"
         "                  not 0, and not the gate's 1 -- when the name\n"
@@ -2406,9 +2474,10 @@ int main(int argc, char **argv)
             if (!colon || colon == spec || !colon[1]) { usage(); return 2; }
             falsify_mode.assign(spec, colon - spec);
             falsify_mnem = colon + 1;
-            if (falsify_mode != "drop-src" && falsify_mode != "add-dst") {
+            if (falsify_mode != "drop-src" && falsify_mode != "add-dst" &&
+                falsify_mode != "drop-addr") {
                 fprintf(stderr, "isaxcheck: --falsify mode must be "
-                        "drop-src or add-dst\n");
+                        "drop-src, add-dst or drop-addr\n");
                 return 2;
             }
             falsify_requested = true;
@@ -2429,6 +2498,17 @@ int main(int argc, char **argv)
     /* An arm that cannot reach the register classes is not an arm.  Both
      * conditions below make --falsify a guaranteed no-op, and a no-op that
      * exits 0 is the silent-false-success this option exists to remove. */
+    /* drop-addr damages ONLY the --batch address columns.  The sweep's
+     * compare() reads register sets and memop counts and would see nothing
+     * move, so falsify_refused() could not distinguish "the arm is blind"
+     * from "this mode does not reach this path" -- refuse instead. */
+    if (falsify_mode == "drop-addr" && !batch) {
+        fprintf(stderr, "isaxcheck: --falsify=drop-addr damages the address-"
+                "dependency masks, which only --batch emits -- the sweep "
+                "compares register sets and memop counts and would not read "
+                "the damage\n");
+        return 2;
+    }
     if (falsify_requested && !batch) {
         /* --hex prints its three views and returns before compare() unless
          * --check is given, so the damage would never reach a signature. */
@@ -2599,7 +2679,7 @@ int main(int argc, char **argv)
                "l_ok\tl_sz\tl_text\tl_ld\tl_st\tl_br\tl_call\tl_ret\t"
                "l_rd\tl_wr\t"
                "f_ok\tf_opcode\tf_branch\tf_cond\tf_atomic\tf_loads\tf_stores\t"
-               "f_lanekind\tf_src\tf_dst\n");
+               "f_lanekind\tf_src\tf_dst\tf_hasaddr\tf_laddr\tf_saddr\n");
         char line[256];
         while (fgets(line, sizeof line, stdin)) {
             char *p = line;
@@ -2636,7 +2716,7 @@ int main(int argc, char **argv)
                 if (ch == '\t' || ch == '\n' || ch == '\r') ch = ' ';
             printf("%s\t%d\t%u\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t"
                    "%s\t%s\t%d\t%u\t%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t"
-                   "%d\t%s\t%s\t%d\t%d\t%u\t%u\t%u\t%s\t%s\n",
+                   "%d\t%s\t%s\t%d\t%d\t%u\t%u\t%u\t%s\t%s\t%d\t%s\t%s\n",
                    hexbytes(b, n).c_str(), c.ok, c.size, c.mnem.c_str(),
                    c.ops.c_str(), c.has_mem, c.mem_read, c.mem_write,
                    c.mem_unknown, c.reg_unknown, c.has_invalid_op,
@@ -2649,7 +2729,10 @@ int main(int argc, char **argv)
                    isax_branch_name(f.branch_type), f.branch_conditional,
                    f.is_atomic, f.max_dep_loads, f.max_dep_stores,
                    f.lane_mask_kind,
-                   gensetstr(fs).c_str(), gensetstr(fd).c_str());
+                   gensetstr(fs).c_str(), gensetstr(fd).c_str(),
+                   f.has_addr_deps,
+                   addrdepslots(f.load_addr_dep, f.src).c_str(),
+                   addrdepslots(f.store_addr_dep, f.src).c_str());
         }
         if (!falsify_mnem.empty() && falsify_refused()) return 2;
         return 0;

@@ -75,6 +75,15 @@ gcc -O0 -Wall -static -o reach_probe reach_probe.c
 awk -F'\t' 'NR>1 && $2 != 1 { print $1 }' tracer_batch.tsv > reach_in.hex
 "$T"/reach_models.sh "$D"                 # -> r_max_postfix, model_matrix, illopc, cpuid/
 "$T"/sysprobe_run.sh "$D" max             # -> cpl0.tsv
+#  * CPL 0 removes the PRIVILEGE reading of a #UD.  It does not remove the
+#    ENABLE reading: an instruction QEMU implemented behind CR4.VMXE,
+#    EFER.SVME, XCR0 or an IA32_* enable MSR faults at CPL 0 exactly the way
+#    an unimplemented one does.  sysprobe_enab_run.sh runs the same encodings
+#    with every architectural enable SET AND PROVEN SET by reading the
+#    register back, and records the enables QEMU refuses with their own
+#    exception vector -- which is the stronger answer, because a refused
+#    enable is a gate that cannot open under any configuration.
+"$T"/sysprobe_enab_run.sh "$D" max        # -> cpl0_enab.tsv, enables.tsv
 cp r_max_postfix.tsv reach.tsv            # the single-leg name compare_attrib.py uses
 
 # ---- the exclusion, derived from QEMU rather than from the decoder ---------
@@ -95,6 +104,17 @@ $PY compare_attrib.py     # -> ../attrib.tsv, ../attrib_signatures.txt
 # models name it.  Exits 1 while any row is UNCOVERED -- which is the point.
 $PY qemu_reach_matrix.py --evidence "$D" --attrib ../attrib.tsv \
     --meta ../opcodes_meta.tsv -o ../reach_matrix.tsv || true
+
+# ---- attribute every DECODED-THEN-REFUSED row to a line of QEMU -----------
+# The legs above say WHERE the refusal is not (not privilege, not a CPU model,
+# not a CPUID flag, not an enable).  This says where it IS, per encoding:
+# NOT-IMPLEMENTED (no decode path), ENABLE-GATED-OFF (a path exists behind an
+# enable, so the row must be re-probed and may be a coverage hole) or
+# REFUSED-BY-MODEL (QEMU refuses the enable itself).  Citations are locators
+# resolved against the tree, so a fact that has stopped holding exits 1.
+$PY "$T"/qemu_decode_adjudicate.py --matrix ../reach_matrix.tsv \
+    --enables "$D"/enables.tsv --cpl0-enab "$D"/cpl0_enab.tsv \
+    -o ../decode_adjudication.tsv
 
 # ---- prove the gate can fire ----------------------------------------------
 # An agreement rate quoted off an instrument nobody has watched fail vouches

@@ -36,6 +36,16 @@ carries:
                          forced on at once
   exec_sys_cpl0          qemu-system-x86_64, long mode, CPL 0, paging and
                          XCR0 on, the exception vector the encoding took
+  exec_sys_cpl0_enabled  the same, with EVERY architectural enable QEMU
+                         accepts SET AND PROVEN SET by reading the register
+                         back -- CR4, EFER, XCR0 and the IA32_* enable MSRs.
+                         CPL 0 removes the PRIVILEGE reading of a #UD; it does
+                         not remove the ENABLE reading, because an instruction
+                         QEMU implemented behind CR4.VMXE or EFER.SVME would
+                         fault at CPL 0 exactly the way an unimplemented one
+                         does.  An enable QEMU REFUSES is recorded with its
+                         own exception vector, which is the stronger answer:
+                         there is no configuration in which the gate opens
   qemu_refusal           WHERE QEMU refused, discriminated by -d unimp:
                          gen_unknown_opcode() logs ILLOPC and means the decode
                          tables have no entry; its absence means QEMU decoded
@@ -247,6 +257,34 @@ def main():
     cpl3 = load_tsv(need('r_max_postfix.tsv'), 'hex')
     allfl = load_tsv(need('r_maxall_postfix.tsv'), 'hex')
     cpl0 = load_tsv(need('cpl0.tsv'), 'hex')
+    cpl0e = load_tsv(need('cpl0_enab.tsv'), 'hex')
+    enab = load_tsv(need('enables.tsv'), 'enable')
+
+    # R8.7 -- the enable leg is worth exactly the controls that convict it.
+    # An enable reported as HELD by a probe that cannot tell "QEMU took it"
+    # from "QEMU discarded it" would launder every row it touches.
+    import sysprobe_enables as EN                                 # noqa: E402
+    for nm in EN.MUST_HOLD:
+        if enab.get(nm, {}).get('held') != '1':
+            sys.exit('%s/enables.tsv: %s MUST be held and is not.  Every '
+                     'enable the leg reports as SET is then unproven, and the '
+                     'UNREACHABLE rows may not rest on it' % (E, nm))
+    for nm in EN.MUST_REFUSE:
+        if enab.get(nm, {}).get('held') != '0':
+            sys.exit('%s/enables.tsv: %s MUST be refused by QEMU and was '
+                     'held.  The readback does not discriminate' % (E, nm))
+    for nm, _k, _a1, _a2 in EN.ENABLES:
+        if nm not in enab:
+            sys.exit('%s/enables.tsv: %s was never attempted -- it wedged the '
+                     'machine.  An enable nobody could set is not an enable '
+                     'that was proven absent' % (E, nm))
+    _held = sorted(k for k, v in enab.items() if v['held'] == '1')
+    _ref = sorted('%s(vec=%s)' % (k, v['vector'])
+                  for k, v in enab.items() if v['held'] == '0')
+    print('enable leg: %d architectural enables held (%s); %d refused by QEMU '
+          '(%s)' % (len(_held), ' '.join(_held), len(_ref), ' '.join(_ref)))
+    _enab_note = ('%d enables held, %d refused by QEMU itself'
+                  % (len(_held), len(_ref)))
     matrix = load_tsv(need('model_matrix.tsv'), 'hex')
     illopc = {}
     with open(need('illopc.tsv')) as f:
@@ -326,7 +364,7 @@ def main():
             why = ('compared: %s' % (r['direction'] if r['direction'] != '-'
                                      else 'AGREE'))
             out.append((opid, mn, isa_set, ext, h, '-', '-', '-', '-', '-',
-                        '-', '-', '-', '-', '-', why, COVERED))
+                        '-', '-', '-', '-', '-', '-', why, COVERED))
             tally[COVERED] += 1
             continue
         if compared and h not in cpl3:
@@ -335,7 +373,7 @@ def main():
             # MEASURED before it may be answered.  A row whose encoding never
             # entered the reachability legs has no such measurement, so it
             # stays UNCOVERED and says why -- never "probably unreachable".
-            out.append((opid, mn, isa_set, ext, h, '-', '-', '-', '-',
+            out.append((opid, mn, isa_set, ext, h, '-', '-', '-', '-', '-',
                         'NOT-MEASURED', t.decoder_mentions(mn),
                         '-', '-', '-', '-',
                         'compared: %s, and the reachability legs were never '
@@ -347,13 +385,14 @@ def main():
         c3 = int(cpl3[h]['signal']) if h in cpl3 else None
         af = int(allfl[h]['signal']) if h in allfl else None
         c0 = int(cpl0[h]['cpl0_vec']) if h in cpl0 else None
+        c0e = int(cpl0e[h]['cpl0_enab_vec']) if h in cpl0e else None
         mm = matrix.get(h)
         b, i = strip_prefixes(h)
         op = b[i] if i < len(b) else ''
 
-        if c3 is None or c0 is None or mm is None:
+        if c3 is None or c0 is None or c0e is None or mm is None:
             refusal = 'NOT-MEASURED'
-        elif c3 == 0 or c0 == 255:
+        elif c3 == 0 or c0 == 255 or c0e == 255:
             # MEASURED FIRST, and this ordering is the point.  The 0x62 and
             # 0xd5 arms below are the only two labels in this function that
             # are read off a BYTE rather than off an observation, and a byte
@@ -400,7 +439,7 @@ def main():
             # rejected, so a row the tracer DOES decode never enters them.  It
             # is uncompared for the opposite reason -- no reference decodes it
             # -- and a reference gap is not a verdict either.
-            out.append((opid, mn, isa_set, ext, h, '-', '-', '-', '-',
+            out.append((opid, mn, isa_set, ext, h, '-', '-', '-', '-', '-',
                         refusal, t.decoder_mentions(mn), '-', '-', '-', '-',
                         'tracer decodes it, NO reference does (%s): the row '
                         'has no comparison and a reference gap is not a '
@@ -411,7 +450,8 @@ def main():
             v = UNCOVERED
             why = ('QEMU EXECUTES these bytes and the tracer decodes nothing: '
                    'the whole instruction is dropped')
-        elif c3 == 4 and c0 == 6 and mm['models_ran'] == '0' and af == 4:
+        elif (c3 == 4 and c0 == 6 and c0e == 6
+              and mm['models_ran'] == '0' and af == 4):
             # The same four-way proof decides a COMPARED row as well as an
             # uncompared one.  A disagreement about an instruction NO QEMU
             # guest can execute describes an instruction that can never enter
@@ -421,36 +461,41 @@ def main():
             v = UNREACHABLE
             why = ('#UD at CPL3 (-cpu max), #UD at CPL3 under all %s CPU '
                    'models, #UD at CPL3 with every CPUID flag forced, #UD at '
-                   'CPL0 in system mode; refused at %s%s'
-                   % (mm['models_probed'], refusal,
+                   'CPL0 in system mode, #UD at CPL0 with every architectural '
+                   'enable QEMU accepts held (%s); refused at %s%s'
+                   % (mm['models_probed'], _enab_note, refusal,
                       ('; the comparison disagrees (%s) about an instruction '
                        'no guest reaches' % r['direction']) if compared
                       else ''))
         elif compared:
             v = UNCOVERED
             why = ('compared: %s -- and the instruction IS reachable '
-                   '(cpl3=%s allflags=%s cpl0=%s models_ran=%s)'
+                   '(cpl3=%s allflags=%s cpl0=%s cpl0+enables=%s '
+                   'models_ran=%s)'
                    % (r['direction'], SIGNAME.get(c3, c3),
                       SIGNAME.get(af, af), VECNAME.get(c0, c0),
-                      mm['models_ran']))
+                      VECNAME.get(c0e, c0e), mm['models_ran']))
         else:
             v = UNCOVERED
             why = ('executes or faults inconsistently: cpl3=%s allflags=%s '
-                   'cpl0=%s models_ran=%s'
+                   'cpl0=%s cpl0+enables=%s models_ran=%s'
                    % (SIGNAME.get(c3, c3), SIGNAME.get(af, af),
-                      VECNAME.get(c0, c0), mm['models_ran']))
+                      VECNAME.get(c0, c0), VECNAME.get(c0e, c0e),
+                      mm['models_ran']))
 
         out.append((opid, mn, isa_set, ext, h,
                     SIGNAME.get(c3, str(c3)),
                     '%s/%s ran' % (mm['models_ran'], mm['models_probed']),
                     SIGNAME.get(af, str(af)),
                     VECNAME.get(c0, str(c0)),
+                    VECNAME.get(c0e, str(c0e)),
                     refusal, present, word, in_tcg, adv, naming, why, v))
         tally[v] += 1
 
     hdr = ('opcode_id', 'mnemonic', 'isa_set', 'extension', 'probe_hex',
            'exec_user_cpl3_max', 'exec_user_models', 'exec_user_allflags',
-           'exec_sys_cpl0', 'qemu_refusal', 'decode_new_mnemonic',
+           'exec_sys_cpl0', 'exec_sys_cpl0_enabled',
+           'qemu_refusal', 'decode_new_mnemonic',
            'cpuid_word', 'cpuid_in_tcg_mask', 'models_advertising_measured',
            'models_naming_in_cpu_c', 'evidence', 'verdict')
     with open(a.o, 'w') as f:

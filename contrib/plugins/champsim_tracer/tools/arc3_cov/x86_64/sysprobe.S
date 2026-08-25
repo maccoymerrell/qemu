@@ -134,6 +134,8 @@ long_entry:
     xsetbv
 
     call idt_init
+    leaq resume_point(%rip), %rax
+    movq %rax, resume_ptr(%rip)
 
     leaq msg_c32(%rip), %rdi
     call print_str
@@ -146,11 +148,17 @@ long_entry:
     movl $'\n', %edi
     call putc
 
+#ifdef ENABLE_LEG
+    call enab_stage
+#endif
+
     /* ---------------------------------------------------------- main loop */
     /* The probed instruction may write ANY register, so no loop state is
      * held in one: the cursor and the index live in memory and are reloaded
      * after every probe.  A loop counter in r15 was the first draft and an
      * encoding that wrote r15 would have silently truncated the run. */
+    leaq resume_point(%rip), %rax
+    movq %rax, resume_ptr(%rip)
     leaq enc_blob(%rip), %rax
     movq %rax, cursor(%rip)
     movq $0, idx(%rip)
@@ -222,6 +230,280 @@ done:
     outw %ax, %dx
 2:  hlt
     jmp 2b
+
+#ifdef ENABLE_LEG
+/* ------------------------------------------------- the ENABLE-BIT stage */
+/*
+ * WHY THIS STAGE EXISTS.  The CPL0 leg proves the refusal is not a PRIVILEGE
+ * refusal.  It does not prove the refusal is not an ENABLE refusal: an
+ * instruction QEMU implements behind CR4.VMXE, EFER.SVME, XCR0 or an
+ * IA32_* enable MSR would #UD at CPL 0 exactly the way an unimplemented one
+ * does, and the two are indistinguishable from the vector alone.
+ *
+ * So every architectural enable that could gate any probed encoding is set
+ * here BEFORE the encodings run, and each one is PROVEN to have taken by
+ * reading the register back.  An enable QEMU REFUSES is a stronger answer
+ * than one it accepts -- "QEMU has no such enable" -- and it is recorded
+ * with the exception vector the write took, not silently dropped.
+ *
+ * The table is generated (enabblob.S) so an enable that wedges the machine
+ * is skipped by name on the next pass, exactly like an encoding.
+ *
+ *   ENAB <name> <old> <new> <vector> <took>
+ *
+ * took==0 with vector==255 means QEMU accepted the write and DISCARDED it
+ * (its wrmsr default arm ignores unknown MSRs); took==0 with a vector means
+ * QEMU refused the enable outright.  Neither may be scored as "set".
+ */
+enab_stage:
+    movq $0, eidx(%rip)
+enab_loop:
+    movq eidx(%rip), %rax
+    cmpq enab_count(%rip), %rax
+    jae  enab_done
+    shlq $5, %rax
+    leaq enab_blob(%rip), %rcx
+    addq %rcx, %rax
+    movq %rax, erec(%rip)
+
+    leaq msg_enab(%rip), %rdi
+    call print_str
+    movq erec(%rip), %rax
+    movq 24(%rax), %rdi
+    call print_str
+    movl $'\t', %edi
+    call putc
+
+    movq erec(%rip), %rax
+    movq (%rax), %rax
+    cmpq $0, %rax
+    je   edo_cr4
+    cmpq $1, %rax
+    je   edo_msror
+    cmpq $2, %rax
+    je   edo_msrset
+    cmpq $3, %rax
+    je   edo_xcr0cpuid
+    jmp  edo_xcr0
+
+edo_cr4:                                /* a1 = CR4 bit index */
+    movq %cr4, %rax
+    movq %rax, eold(%rip)
+    movq erec(%rip), %r8
+    movq 8(%r8), %rcx
+    movq $1, %rax
+    shlq %cl, %rax
+    movq %rax, ebits(%rip)
+    movq eold(%rip), %rdi
+    orq  %rax, %rdi
+    call try_cr4
+    movq %rax, evec(%rip)
+    movq %cr4, %rax
+    movq %rax, enew(%rip)
+    jmp  etook_from_bits
+
+edo_msror:                              /* a1 = MSR, a2 = bits to OR in */
+    movq erec(%rip), %r8
+    movq 16(%r8), %rax
+    movq %rax, ebits(%rip)
+    movq 8(%r8), %rdi
+    call try_rdmsr
+    movq emsr_val(%rip), %rax
+    movq %rax, eold(%rip)
+    movq erec(%rip), %r8
+    movq 8(%r8), %rdi
+    movq eold(%rip), %rsi
+    orq  ebits(%rip), %rsi
+    call try_wrmsr
+    movq %rax, evec(%rip)
+    movq erec(%rip), %r8
+    movq 8(%r8), %rdi
+    call try_rdmsr
+    movq emsr_val(%rip), %rax
+    movq %rax, enew(%rip)
+    jmp  etook_from_bits
+
+edo_msrset:                             /* a1 = MSR, a2 = value to write */
+    movq erec(%rip), %r8
+    movq 16(%r8), %rax
+    movq %rax, ebits(%rip)
+    movq 8(%r8), %rdi
+    call try_rdmsr
+    movq emsr_val(%rip), %rax
+    movq %rax, eold(%rip)
+    movq erec(%rip), %r8
+    movq 8(%r8), %rdi
+    movq 16(%r8), %rsi
+    call try_wrmsr
+    movq %rax, evec(%rip)
+    movq erec(%rip), %r8
+    movq 8(%r8), %rdi
+    call try_rdmsr
+    movq emsr_val(%rip), %rax
+    movq %rax, enew(%rip)
+    jmp  etook_from_bits
+
+edo_xcr0cpuid:                          /* XCR0 <- every bit CPUID.0Dh names */
+    call try_xgetbv
+    movq emsr_val(%rip), %rax
+    movq %rax, eold(%rip)
+    movl $0xd, %eax
+    xorl %ecx, %ecx
+    cpuid
+    movl %eax, %esi
+    movl %edx, %edi
+    shlq $32, %rdi
+    orq  %rsi, %rdi
+    movq %rdi, ebits(%rip)
+    call try_xsetbv
+    movq %rax, evec(%rip)
+    call try_xgetbv
+    movq emsr_val(%rip), %rax
+    movq %rax, enew(%rip)
+    jmp  etook_from_bits
+
+edo_xcr0:                               /* a2 = XCR0 bits to OR in */
+    call try_xgetbv
+    movq emsr_val(%rip), %rax
+    movq %rax, eold(%rip)
+    movq erec(%rip), %r8
+    movq 16(%r8), %rax
+    movq %rax, ebits(%rip)
+    movq eold(%rip), %rdi
+    orq  %rax, %rdi
+    call try_xsetbv
+    movq %rax, evec(%rip)
+    call try_xgetbv
+    movq emsr_val(%rip), %rax
+    movq %rax, enew(%rip)
+    jmp  etook_from_bits
+
+etook_from_bits:
+    /* "it took" is a READBACK, never the absence of a fault: QEMU's wrmsr
+     * default arm ignores an unknown MSR silently, so a clean vector 255
+     * proves nothing on its own. */
+    movq enew(%rip), %rax
+    andq ebits(%rip), %rax
+    cmpq ebits(%rip), %rax
+    sete %al
+    movzbl %al, %eax
+    movq %rax, etook(%rip)
+
+    movq eold(%rip), %rdi
+    call print_hex64
+    movl $'\t', %edi
+    call putc
+    movq enew(%rip), %rdi
+    call print_hex64
+    movl $'\t', %edi
+    call putc
+    movq evec(%rip), %rdi
+    call print_dec
+    movl $'\t', %edi
+    call putc
+    movq etook(%rip), %rdi
+    call print_dec
+    movl $'\n', %edi
+    call putc
+
+    incq eidx(%rip)
+    jmp  enab_loop
+
+enab_done:
+    leaq msg_enabdone(%rip), %rdi
+    call print_str
+    ret
+
+/* Each try_* runs ONE architecturally-refusable write with the fault handler
+ * pointed at its own resume label, so a #GP is a measurement and not a
+ * triple fault.  rax = the vector taken, 0xFF when the write completed. */
+try_cr4:                                /* rdi = new CR4 */
+    movq %rsp, saved_rsp(%rip)
+    leaq 1f(%rip), %rax
+    movq %rax, resume_ptr(%rip)
+    movq $0xFF, last_vec(%rip)
+    movq %rdi, %cr4
+1:  movq saved_rsp(%rip), %rsp
+    movq last_vec(%rip), %rax
+    ret
+
+try_rdmsr:                              /* rdi = MSR -> emsr_val */
+    movq %rsp, saved_rsp(%rip)
+    leaq 1f(%rip), %rax
+    movq %rax, resume_ptr(%rip)
+    movq $0xFF, last_vec(%rip)
+    movq $0, emsr_val(%rip)
+    movl %edi, %ecx
+    rdmsr
+    shlq $32, %rdx
+    orq  %rdx, %rax
+    movq %rax, emsr_val(%rip)
+1:  movq saved_rsp(%rip), %rsp
+    movq last_vec(%rip), %rax
+    ret
+
+try_wrmsr:                              /* rdi = MSR, rsi = value */
+    movq %rsp, saved_rsp(%rip)
+    leaq 1f(%rip), %rax
+    movq %rax, resume_ptr(%rip)
+    movq $0xFF, last_vec(%rip)
+    movl %edi, %ecx
+    movq %rsi, %rax
+    movq %rsi, %rdx
+    shrq $32, %rdx
+    wrmsr
+1:  movq saved_rsp(%rip), %rsp
+    movq last_vec(%rip), %rax
+    ret
+
+try_xgetbv:                             /* -> emsr_val */
+    movq %rsp, saved_rsp(%rip)
+    leaq 1f(%rip), %rax
+    movq %rax, resume_ptr(%rip)
+    movq $0xFF, last_vec(%rip)
+    movq $0, emsr_val(%rip)
+    xorl %ecx, %ecx
+    xgetbv
+    shlq $32, %rdx
+    orq  %rdx, %rax
+    movq %rax, emsr_val(%rip)
+1:  movq saved_rsp(%rip), %rsp
+    movq last_vec(%rip), %rax
+    ret
+
+try_xsetbv:                             /* rdi = new XCR0 */
+    movq %rsp, saved_rsp(%rip)
+    leaq 1f(%rip), %rax
+    movq %rax, resume_ptr(%rip)
+    movq $0xFF, last_vec(%rip)
+    movq %rdi, %rax
+    movq %rdi, %rdx
+    shrq $32, %rdx
+    xorl %ecx, %ecx
+    xsetbv
+1:  movq saved_rsp(%rip), %rsp
+    movq last_vec(%rip), %rax
+    ret
+
+print_hex64:                            /* rdi = value, 16 digits */
+    pushq %rbx
+    pushq %r12
+    movq %rdi, %rbx
+    movq $16, %r12
+1:  testq %r12, %r12
+    je   2f
+    movq %rbx, %rax
+    shrq $60, %rax
+    leaq hexdigits(%rip), %r11
+    movzbl (%r11,%rax), %edi
+    call putc
+    shlq $4, %rbx
+    decq %r12
+    jmp  1b
+2:  popq %r12
+    popq %rbx
+    ret
+#endif /* ENABLE_LEG */
 
 /* ------------------------------------------------------------------- I/O */
 putc:                               /* edi = char */
@@ -316,7 +598,7 @@ isr_common:
     /* stack: [vec][err][rip][cs][rflags][rsp][ss] */
     movq (%rsp), %rax
     movq %rax, last_vec(%rip)
-    leaq resume_point(%rip), %rax
+    movq resume_ptr(%rip), %rax
     movq %rax, 16(%rsp)
     movq saved_rsp(%rip), %rax
     movq %rax, 40(%rsp)
@@ -356,6 +638,10 @@ gdtr:
 
 hexdigits: .ascii "0123456789abcdef"
 msg_done:  .asciz "DONE\n"
+#ifdef ENABLE_LEG
+msg_enab:     .asciz "ENAB\t"
+msg_enabdone: .asciz "ENABDONE\n"
+#endif
 msg_c32:   .asciz "CODE32-AAD/AAM\t"
 
     .align 8
@@ -383,6 +669,15 @@ enclen:     .skip 8
 code32_aad: .skip 8
 code32_aam: .skip 8
 saved_rsp:  .skip 8
+resume_ptr: .skip 8
+erec:       .skip 8
+eidx:       .skip 8
+eold:       .skip 8
+enew:       .skip 8
+ebits:      .skip 8
+evec:       .skip 8
+etook:      .skip 8
+emsr_val:   .skip 8
 decbuf:     .skip 32
 
     .section .rodata

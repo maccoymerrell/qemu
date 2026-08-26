@@ -21,21 +21,16 @@
  * Author: Maccoy Merrell
  */
 
-#include "champsim_tracer_generic_ids.h"
-
-enum QemuIdentTier {
-    QID_NONE = 0,
-    QID_NAME_MATCHED,
-    QID_OBSERVED,
-};
-
-struct QemuIdentRow {
-    uint32_t id;
-    const char *name;
-    GenericOpcode opcode;
-    BranchType branch_type;
-    QemuIdentTier tier;
-};
+/*
+ * enum QemuIdentTier and struct QemuIdentRow are declared ONCE, in
+ * champsim_tracer_mnemonics.h, exactly as QemuRegRow is for the
+ * sibling register tables.  A consumer routing by TraceISA includes
+ * all three of these headers in one translation unit, and a type
+ * emitted per file could not survive that -- the file guard is per
+ * ISA, so the second include redefined the enum and the struct.
+ * Nothing ever compiled them together to find out.
+ */
+#include "champsim_tracer_mnemonics.h"
 
 static const QemuIdentRow qemu_ident_riscv[] = {
     { 0x001f28a5u, "decode_xthead/th_srriw", GEN_OP_STORE, BRANCH_NONE, QID_NAME_MATCHED },
@@ -935,7 +930,7 @@ static const QemuIdentRow qemu_ident_riscv[] = {
     { 0xef13b90eu, "decode_insn32/vnmsub_vx", GEN_OP_VEC_MSUB, BRANCH_NONE, QID_NAME_MATCHED },
     { 0xef1e76deu, "decode_insn32/blt", GEN_OP_BRANCH, BRANCH_COND_DIRECT, QID_NAME_MATCHED },  /* bltz, bgt, bgtz */
     { 0xeffa5cc3u, "decode_insn16/cm_push", GEN_OP_PUSH, BRANCH_NONE, QID_NAME_MATCHED },
-    { 0xf0071f22u, "decode_insn32/bge", GEN_OP_BRANCH, BRANCH_COND_DIRECT, QID_NAME_MATCHED },  /* bgez, ble, blez */
+    { 0xf0071f22u, "decode_insn32/bge", GEN_OP_BRANCH, BRANCH_COND_DIRECT, QID_NAME_MATCHED },  /* bgez, blez, ble */
     { 0xf09166e0u, "decode_insn32/ctzw", GEN_OP_BITMANIP, BRANCH_NONE, QID_NAME_MATCHED },
     { 0xf0cb6804u, "decode_insn16/c64_illegal", GEN_OP_UNKNOWN, BRANCH_NONE, QID_NONE },
     { 0xf1a1f128u, "decode_insn32/vfwredusum_vs", GEN_OP_VEC_ADD, BRANCH_NONE, QID_NAME_MATCHED },

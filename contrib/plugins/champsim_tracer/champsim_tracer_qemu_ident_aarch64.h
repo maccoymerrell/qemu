@@ -21,21 +21,16 @@
  * Author: Maccoy Merrell
  */
 
-#include "champsim_tracer_generic_ids.h"
-
-enum QemuIdentTier {
-    QID_NONE = 0,
-    QID_NAME_MATCHED,
-    QID_OBSERVED,
-};
-
-struct QemuIdentRow {
-    uint32_t id;
-    const char *name;
-    GenericOpcode opcode;
-    BranchType branch_type;
-    QemuIdentTier tier;
-};
+/*
+ * enum QemuIdentTier and struct QemuIdentRow are declared ONCE, in
+ * champsim_tracer_mnemonics.h, exactly as QemuRegRow is for the
+ * sibling register tables.  A consumer routing by TraceISA includes
+ * all three of these headers in one translation unit, and a type
+ * emitted per file could not survive that -- the file guard is per
+ * ISA, so the second include redefined the enum and the struct.
+ * Nothing ever compiled them together to find out.
+ */
+#include "champsim_tracer_mnemonics.h"
 
 static const QemuIdentRow qemu_ident_aarch64[] = {
     { 0x00138a0du, "disas_neon_shared/VCADD", GEN_OP_UNKNOWN, BRANCH_NONE, QID_NONE },
@@ -2378,7 +2373,7 @@ static const QemuIdentRow qemu_ident_aarch64[] = {
     { 0xe88e8525u, "disas_vfp/VDIV_dp", GEN_OP_UNKNOWN, BRANCH_NONE, QID_NONE },
     { 0xe8d4195au, "disas_sve/REVH", GEN_OP_VEC_SHUF, BRANCH_NONE, QID_NAME_MATCHED },
     { 0xe901e5eau, "disas_t32/STRB_rr", GEN_OP_STORE, BRANCH_NONE, QID_NAME_MATCHED },
-    { 0xe9124bcdu, "disas_a64/CSEL", GEN_OP_CMOV, BRANCH_NONE, QID_OBSERVED },  /* csel, cset, csinc, cinc */
+    { 0xe9124bcdu, "disas_a64/CSEL", GEN_OP_CMOV, BRANCH_NONE, QID_OBSERVED },  /* csel, cset, csinc, csetm */
     { 0xe916485au, "disas_a64/FRINT64X_v", GEN_OP_FP_MOV, BRANCH_NONE, QID_NAME_MATCHED },
     { 0xe92c7a52u, "disas_a64/FCMGT_v", GEN_OP_FP_CMP, BRANCH_NONE, QID_NAME_MATCHED },
     { 0xe9336eecu, "disas_sve/PRF_rr", GEN_OP_UNKNOWN, BRANCH_NONE, QID_NONE },

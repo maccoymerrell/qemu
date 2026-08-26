@@ -44,6 +44,7 @@
 #include "champsim_tracer_stats.h"
 #include "champsim_tracer_stats_report.h"
 #include "champsim_tracer_irdf.h"
+#include "champsim_tracer_qemu_ident.h"
 #include "champsim_tracer_trace_segment_manager.h"
 #include "champsim_tracer_wp_thread_state.h"
 #include "champsim_tracer_writer.h"
@@ -10712,6 +10713,20 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         }
     }
 
+    /*
+     * The QEMU-identity reader, on the same pair and for the same reason:
+     * qemu_plugin_insn_decode_id() is keyed on the insn handle and this is
+     * the last point at which the handle still names this instruction.
+     * Unlike irdf this is NOT optional -- a generated table that only gets
+     * read when an option is passed is a table nobody reads.
+     */
+    for (uint32_t i = 0; i < raw_n_insns; i++) {
+        if (canonical_first[i]) {
+            qemu_ident_note(qemu_plugin_tb_get_insn(tb, i),
+                            &insn_info[canonical_index[i]]);
+        }
+    }
+
     /* Partition the TB's canonical insn stream at every non-final
      * branch terminator.  TCG and Capstone don't always agree on
      * which insns end control flow (e.g. MIPS conditional traps:
@@ -11387,6 +11402,7 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     }
     g_rt_gate.report(report);
     irdf_report(report);
+    qemu_ident_report(report);
 
     g_mutex_lock(&data_lock);
     append_stats_summary(report, "Cumulative", final_stats);
@@ -11877,6 +11893,22 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
      * tuples, future register groups) uses it to cover every
      * constituent generic id, not just the leading one. */
     build_qemu_reg_reverse_index();
+
+    /*
+     * Bind the QEMU decode-identity table for this ISA and run the two
+     * static properties its header promises (sorted by id, no duplicate
+     * id).  A defect here means the generated table is stale or was
+     * hand-edited; the bisect a consumer is told to use would silently
+     * miss rows.
+     */
+    {
+        unsigned bad = qemu_ident_install(trace_isa);
+        if (bad) {
+            fprintf(stderr, "champsim_tracer: %u qemu-ident table defects; "
+                    "regenerate with champsim_tracer_mnemonic_audit.py "
+                    "--qemu-ident --apply\n", bad);
+        }
+    }
 
     /*
      * The Capstone-keyed table is a ROUTE to the QEMU-keyed rows, not a

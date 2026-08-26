@@ -51,6 +51,7 @@ if get_option('plugins')
       'champsim_tracer/champsim_tracer_wp_thread_state.cc',
       'champsim_tracer/champsim_tracer_plugin_config.cc',
       'champsim_tracer/champsim_tracer_mnemonic_tables.cc',
+      'champsim_tracer/champsim_tracer_qemu_ident.cc',
     )
   champsim_tracer_cpp_args = ['-std=gnu++17',
                               '-Wno-missing-field-initializers',

@@ -1,0 +1,146 @@
+{
+ "x86_64": {
+  "lookup_tb_ptr": {
+   "env": {
+    "hflags": 1,
+    "eflags": 1,
+    "eip": 1,
+    "segs": 1
+   },
+   "env_where": {
+    "hflags": "../target/i386/cpu.h:2633",
+    "eflags": "../target/i386/cpu.h:2634",
+    "eip": "../target/i386/cpu.h:2637",
+    "segs": "../target/i386/cpu.h:2639"
+   },
+   "argdir": {
+    "0": "env"
+   },
+   "defined_at": "accel/tcg/cpu-exec.c HELPER(lookup_tb_ptr)",
+   "hand_justification": "The mechanical reader refuses this helper because tb_lookup() reaches tb_lookup_cmp(), which calls get_page_addr_code(desc->env, virt_page1) -- an INSTRUCTION FETCH address translation on the hash-table miss path (accel/tcg/cpu-exec.c tb_lookup_cmp).  The row below states the only CPUArchState access on the path that returns: cpu_get_tb_cpu_state(env, &pc, &cs_base, &flags) at ../target/i386/cpu.h:2630, whose read set is derived by the same reader and is listed here verbatim.  It writes nothing: no member appears on the left of an assignment in that function.  The fetch is not in the model on any instruction -- no instruction records reading its own encoding -- so leaving it out is the same treatment every other instruction already gets, not an exception made for this one. Every field below is marked DF_HF_XLAT: these are the members cpu_get_tb_cpu_state() reads to compute the TB LOOKUP KEY, not operands of the guest instruction that chained.  They are enumerated so the row accounts for the whole footprint, and not published, because a `ret` does not depend on the vector type register.",
+   "xlat": [
+    "eflags",
+    "eip",
+    "hflags",
+    "segs"
+   ]
+  }
+ },
+ "aarch64": {
+  "lookup_tb_ptr": {
+   "env": {
+    "hflags": 1,
+    "pc": 1,
+    "btype": 1,
+    "regs": 1,
+    "features": 1,
+    "v7m": 1,
+    "cp15": 1,
+    "vfp": 1,
+    "thumb": 1,
+    "condexec_bits": 1,
+    "pstate": 1
+   },
+   "env_where": {
+    "hflags": "../target/arm/helper.c:11774",
+    "pc": "../target/arm/helper.c:11777",
+    "btype": "../target/arm/helper.c:11779",
+    "regs": "../target/arm/helper.c:11782",
+    "features": "../target/arm/cpu.h:2493",
+    "v7m": "../target/arm/helper.c:11786",
+    "cp15": "../target/arm/helper.c:11817",
+    "vfp": "../target/arm/helper.c:11819",
+    "thumb": "../target/arm/helper.c:11827",
+    "condexec_bits": "../target/arm/helper.c:11828",
+    "pstate": "../target/arm/helper.c:11840"
+   },
+   "argdir": {
+    "0": "env"
+   },
+   "defined_at": "accel/tcg/cpu-exec.c HELPER(lookup_tb_ptr)",
+   "hand_justification": "The mechanical reader refuses this helper because tb_lookup() reaches tb_lookup_cmp(), which calls get_page_addr_code(desc->env, virt_page1) -- an INSTRUCTION FETCH address translation on the hash-table miss path (accel/tcg/cpu-exec.c tb_lookup_cmp).  The row below states the only CPUArchState access on the path that returns: cpu_get_tb_cpu_state(env, &pc, &cs_base, &flags) at ../target/arm/helper.c:11768, whose read set is derived by the same reader and is listed here verbatim.  It writes nothing: no member appears on the left of an assignment in that function.  The fetch is not in the model on any instruction -- no instruction records reading its own encoding -- so leaving it out is the same treatment every other instruction already gets, not an exception made for this one. Every field below is marked DF_HF_XLAT: these are the members cpu_get_tb_cpu_state() reads to compute the TB LOOKUP KEY, not operands of the guest instruction that chained.  They are enumerated so the row accounts for the whole footprint, and not published, because a `ret` does not depend on the vector type register.",
+   "xlat": [
+    "btype",
+    "condexec_bits",
+    "cp15",
+    "features",
+    "hflags",
+    "pc",
+    "pstate",
+    "regs",
+    "thumb",
+    "v7m",
+    "vfp"
+   ]
+  }
+ },
+ "riscv64": {
+  "lookup_tb_ptr": {
+   "env": {
+    "xl": 1,
+    "pc": 1,
+    "vtype": 1,
+    "vstart": 1,
+    "vl": 1,
+    "vill": 1,
+    "priv": 1,
+    "misa_ext": 1,
+    "senvcfg": 1,
+    "menvcfg": 1,
+    "elp": 1
+   },
+   "env_where": {
+    "xl": "../target/riscv/cpu_helper.c:146",
+    "pc": "../target/riscv/cpu_helper.c:146",
+    "vtype": "../target/riscv/cpu_helper.c:160",
+    "vstart": "../target/riscv/cpu_helper.c:164",
+    "vl": "../target/riscv/cpu_helper.c:164",
+    "vill": "../target/riscv/cpu_helper.c:166",
+    "priv": "../target/riscv/cpu_helper.c:76",
+    "misa_ext": "../target/riscv/cpu.h:572",
+    "senvcfg": "../target/riscv/cpu_helper.c:79",
+    "menvcfg": "../target/riscv/cpu_helper.c:81",
+    "elp": "../target/riscv/cpu_helper.c:186"
+   },
+   "argdir": {
+    "0": "env"
+   },
+   "defined_at": "accel/tcg/cpu-exec.c HELPER(lookup_tb_ptr)",
+   "hand_justification": "The mechanical reader refuses this helper because tb_lookup() reaches tb_lookup_cmp(), which calls get_page_addr_code(desc->env, virt_page1) -- an INSTRUCTION FETCH address translation on the hash-table miss path (accel/tcg/cpu-exec.c tb_lookup_cmp).  The row below states the only CPUArchState access on the path that returns: cpu_get_tb_cpu_state(env, &pc, &cs_base, &flags) at ../target/riscv/cpu_helper.c:138, whose read set is derived by the same reader and is listed here verbatim.  It writes nothing: no member appears on the left of an assignment in that function.  The fetch is not in the model on any instruction -- no instruction records reading its own encoding -- so leaving it out is the same treatment every other instruction already gets, not an exception made for this one. Every field below is marked DF_HF_XLAT: these are the members cpu_get_tb_cpu_state() reads to compute the TB LOOKUP KEY, not operands of the guest instruction that chained.  They are enumerated so the row accounts for the whole footprint, and not published, because a `ret` does not depend on the vector type register.",
+   "xlat": [
+    "elp",
+    "menvcfg",
+    "misa_ext",
+    "pc",
+    "priv",
+    "senvcfg",
+    "vill",
+    "vl",
+    "vstart",
+    "vtype",
+    "xl"
+   ]
+  }
+ },
+ "mipsel": {
+  "lookup_tb_ptr": {
+   "env": {
+    "active_tc": 1,
+    "hflags": 1
+   },
+   "env_where": {
+    "active_tc": "../target/mips/cpu.h:1432",
+    "hflags": "../target/mips/cpu.h:1434"
+   },
+   "argdir": {
+    "0": "env"
+   },
+   "defined_at": "accel/tcg/cpu-exec.c HELPER(lookup_tb_ptr)",
+   "hand_justification": "The mechanical reader refuses this helper because tb_lookup() reaches tb_lookup_cmp(), which calls get_page_addr_code(desc->env, virt_page1) -- an INSTRUCTION FETCH address translation on the hash-table miss path (accel/tcg/cpu-exec.c tb_lookup_cmp).  The row below states the only CPUArchState access on the path that returns: cpu_get_tb_cpu_state(env, &pc, &cs_base, &flags) at ../target/mips/cpu.h:1429, whose read set is derived by the same reader and is listed here verbatim.  It writes nothing: no member appears on the left of an assignment in that function.  The fetch is not in the model on any instruction -- no instruction records reading its own encoding -- so leaving it out is the same treatment every other instruction already gets, not an exception made for this one. Every field below is marked DF_HF_XLAT: these are the members cpu_get_tb_cpu_state() reads to compute the TB LOOKUP KEY, not operands of the guest instruction that chained.  They are enumerated so the row accounts for the whole footprint, and not published, because a `ret` does not depend on the vector type register.",
+   "xlat": [
+    "active_tc",
+    "hflags"
+   ]
+  }
+ }
+}

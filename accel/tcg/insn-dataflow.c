@@ -80,6 +80,12 @@
 #define DF_MAX_MEMOP_NOTES    64
 #define DF_MAX_HELPER_NOTES   64
 #define DF_MAX_HELPER_ARGS    8
+/*
+ * A row's env footprint can be much longer than the argument list -- x86's
+ * helper_cpuid reaches twenty members of CPUArchState -- so the staging
+ * arrays are sized for the footprint, not for the arguments.
+ */
+#define DF_MAX_HELPER_FIELDS  32
 
 typedef struct DfGvecNote {
     const TCGOp *anchor;
@@ -112,6 +118,65 @@ typedef struct DfHelperNote {
     uint8_t gvec_dir[INSN_DF_MAX_GVEC_OPERANDS];
     uint32_t gvec_oprsz;
 } DfHelperNote;
+
+/*
+ * One member of CPUArchState a helper reaches, and in which direction.
+ *
+ * This is what answers the OTHER half of the opacity, and it is the larger
+ * half.  A helper handed tcg_env can touch all of CPUArchState and the call
+ * says nothing about which of it -- helper_fsin(env) has no other argument at
+ * all.  So the members are enumerated, from the helper's own body, and the
+ * enumeration is what makes the footprint bounded.
+ */
+typedef struct DfHelperField {
+    uint32_t off;
+    uint32_t size;
+    uint8_t dir;
+    /*
+     * Whether this access is an OPERAND of the guest instruction or QEMU's
+     * own TRANSLATION CONTEXT.
+     *
+     * helper_lookup_tb_ptr's only CPUArchState reads are
+     * cpu_get_tb_cpu_state(), which computes the key QEMU looks the next
+     * translation up by: on riscv64 that is vtype, vl, vstart, misa_ext,
+     * menvcfg, priv and xl.  Publishing those as reads of the branch that
+     * chained would tell a consumer that `ret` depends on the vector type
+     * register, which is not true of the guest machine and is a fabricated
+     * edge -- and eleven of them per branch overran INSN_DF_MAX_FIELDS on
+     * every chained branch, measured: riscv64's truncation count went 0 ->
+     * 383 the first time this row shipped without the distinction.
+     *
+     * They are still ENUMERATED, because a row that omitted them would be
+     * claiming a footprint it had not accounted for.  They are not
+     * PUBLISHED, because the wire carries operands.
+     */
+    uint8_t kind;
+} DfHelperField;
+
+#define DF_HF_OPERAND   0
+#define DF_HF_XLAT      1
+
+typedef struct DfHelperUsage {
+    const char *name;
+    /*
+     * Per LOGICAL argument: the direction of that pointer argument, or 0 for
+     * "not stated".  Indexed by the helper's own parameter position, counting
+     * tcg_env if it takes one -- the same numbering hn->arg[] uses.
+     */
+    uint8_t argdir[DF_MAX_HELPER_ARGS];
+    /* The footprint through tcg_env, complete when @env_bounded. */
+    const DfHelperField *env;
+    uint8_t n_env;
+    /*
+     * True when @env is the WHOLE footprint: every CPUArchState member the
+     * helper reads or writes, on the path that returns.  A row is only
+     * written when the reader closed the body, so a row that exists says
+     * this; a helper the reader refused has NO ROW and stays opaque.
+     */
+    bool env_bounded;
+    const char *src;            /* where the row was read from */
+} DfHelperUsage;
+
 
 /*
  * Per-translation scratch.
@@ -711,6 +776,130 @@ void insn_dataflow_note_reset(void)
 
 static const DfHelperNote *df_find_helper(const TCGOp *op);
 static bool df_helper_usage_of(const char *name, unsigned argno, uint8_t *dir);
+static const DfHelperUsage *df_helper_usage_row(const char *name);
+
+/*
+ * CP-H census -- which helpers were reached, and WHY each one is not
+ * exactly described.
+ *
+ * The per-helper usage table is a written-down static fact, and which rows
+ * belong in it is a MEASUREMENT: the helpers a workload reaches, not the ones
+ * that come to mind.  The aggregate counters on InsnDataflow say how many
+ * calls were unbounded; they cannot say which helper, which argument, or
+ * which of the four reasons.  This says all four, so a row can be written
+ * against an observed call rather than against a table row.
+ *
+ * Translation-time only, behind an env var, and off by default.
+ */
+#define DF_CENSUS_MAX       1024
+
+/* Why a call was not exactly described.  A call can carry several. */
+#define DF_CR_NO_RWG        (1u << 0)   /* !TCG_CALL_NO_READ_GLOBALS */
+#define DF_CR_ENV           (1u << 1)   /* handed tcg_env itself */
+#define DF_CR_PTR           (1u << 2)   /* pointer that is not env+const */
+#define DF_CR_GVEC_MISMATCH (1u << 3)   /* gvec operand k != argument k */
+#define DF_CR_ARGS_OVERFLOW (1u << 4)   /* more logical args than we carry */
+/*
+ * May WRITE every global.  Read exactly as tcg_liveness_analysis() reads it:
+ * neither flag set is la_global_kill (every global written), NO_WG alone is
+ * la_global_sync (every global read, none written), NO_RWG is neither.  So
+ * "may write" is the absence of BOTH flags, not the absence of NO_WG -- a
+ * helper declared TCG_CALL_NO_RWG carries 0x1 and no 0x2, and testing 0x2
+ * alone would call it a global writer.
+ */
+#define DF_CR_NO_WRG        (1u << 5)
+
+typedef struct DfHelperCensus {
+    const char *name;
+    uint32_t flags;
+    uint8_t  nargs;
+    uint32_t reasons;           /* union of DF_CR_* over every call seen */
+    uint32_t ptr_args;          /* logical args that arrived as pointers */
+    uint32_t env_args;          /* logical args that were tcg_env */
+    uint32_t unknown_args;      /* pointer args with no direction written */
+    uint32_t stated_args;       /* pointer args a direction WAS stated for */
+    uint64_t calls;
+    uint64_t unknown_pairs;
+} DfHelperCensus;
+
+static DfHelperCensus df_census[DF_CENSUS_MAX];
+static unsigned df_n_census;
+static bool df_census_overflow;
+static QemuMutex df_census_lock;
+static bool df_census_on, df_census_read;
+static const char *df_census_path;
+
+static void df_census_dump_locked(void);
+
+static bool df_censusing(void)
+{
+    if (!df_census_read) {
+        const char *e = getenv("QEMU_DF_HELPER_CENSUS");
+
+        df_census_read = true;
+        if (e && *e) {
+            df_census_path = e;
+            df_census_on = true;
+            qemu_mutex_init(&df_census_lock);
+        }
+    }
+    return df_census_on;
+}
+
+/*
+ * Keyed on the NAME POINTER.  TCGHelperInfo::name is a string literal in the
+ * generated helper tables, so one helper is one pointer; comparing the
+ * pointer rather than the bytes keeps this off the translation hot path even
+ * when it is switched on.  A duplicate row would be visible in the dump as
+ * two rows with the same name, which is the failure this would produce and
+ * it has not been observed.
+ */
+static DfHelperCensus *df_census_row(const char *name, uint32_t flags,
+                                     uint8_t nargs)
+{
+    for (unsigned i = 0; i < df_n_census; i++) {
+        if (df_census[i].name == name) {
+            return &df_census[i];
+        }
+    }
+    if (df_n_census >= DF_CENSUS_MAX) {
+        df_census_overflow = true;
+        return NULL;
+    }
+    df_census[df_n_census].name = name;
+    df_census[df_n_census].flags = flags;
+    df_census[df_n_census].nargs = nargs;
+    return &df_census[df_n_census++];
+}
+
+/* Caller holds df_census_lock. */
+static void df_census_dump_locked(void)
+{
+    FILE *f;
+
+    if (!df_census_on || !df_census_path) {
+        return;
+    }
+    f = fopen(df_census_path, "w");
+    if (!f) {
+        return;
+    }
+    fprintf(f, "# qemu insn-dataflow CP-H helper census\n");
+    fprintf(f, "# target=%s\n", TARGET_NAME);
+    fprintf(f, "# overflow=%d rows=%u\n", (int)df_census_overflow, df_n_census);
+    fprintf(f, "# name\tcalls\tnargs\tflags\treasons\tptr_args\tenv_args\t"
+               "unknown_args\tstated_args\tunknown_pairs\n");
+    for (unsigned i = 0; i < df_n_census; i++) {
+        const DfHelperCensus *c = &df_census[i];
+
+        fprintf(f, "%s\t%" PRIu64 "\t%u\t0x%x\t0x%x\t0x%x\t0x%x\t0x%x\t0x%x\t"
+                "%" PRIu64 "\n",
+                c->name, c->calls, c->nargs, c->flags, c->reasons,
+                c->ptr_args, c->env_args, c->unknown_args, c->stated_args,
+                c->unknown_pairs);
+    }
+    fclose(f);
+}
 
 /* Fold @n consecutive temps' provenance -- and their own bits -- into @dst. */
 static void df_prov_add_temps(uint64_t *dst, const void *tsv, unsigned n)
@@ -891,11 +1080,13 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
              * dependency, in the code whose own comment says a missed
              * dependency is the one error it must not make.
              */
-            uint32_t pf_off[DF_MAX_HELPER_ARGS];
-            uint32_t pf_size[DF_MAX_HELPER_ARGS];
-            uint8_t pf_dir[DF_MAX_HELPER_ARGS];
+            uint32_t pf_off[DF_MAX_HELPER_FIELDS];
+            uint32_t pf_size[DF_MAX_HELPER_FIELDS];
+            uint8_t pf_dir[DF_MAX_HELPER_FIELDS];
             unsigned n_pf = 0;
             uint8_t model = INSN_DF_HELPER_EXACT;
+            DfHelperCensus *cen = NULL;
+            const DfHelperUsage *row = NULL;
 
             nb_oargs = TCGOP_CALLO(op);
             nb_iargs = TCGOP_CALLI(op);
@@ -945,9 +1136,40 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                  * global is a change to what the extraction PUBLISHES and
                  * belongs behind its own measurement.
                  */
-                if (!(hn->flags & TCG_CALL_NO_READ_GLOBALS)) {
-                    model = MAX(model, INSN_DF_HELPER_OPAQUE);
-                    d->n_helper_unbounded += d->n_helper_unbounded < 255;
+                if (df_censusing()) {
+                    qemu_mutex_lock(&df_census_lock);
+                    cen = df_census_row(hn->name, hn->flags, hn->nargs);
+                    if (cen) {
+                        cen->calls++;
+                        if (!(hn->flags & TCG_CALL_NO_READ_GLOBALS)) {
+                            cen->reasons |= DF_CR_NO_RWG;
+                        }
+                        if (!(hn->flags & (TCG_CALL_NO_WRITE_GLOBALS |
+                                           TCG_CALL_NO_READ_GLOBALS))) {
+                            cen->reasons |= DF_CR_NO_WRG;
+                        }
+                        if (hn->args_overflow) {
+                            cen->reasons |= DF_CR_ARGS_OVERFLOW;
+                        }
+                    }
+                }
+                row = df_helper_usage_row(hn->name);
+                /*
+                 * The written-down row answers BOTH halves of the opacity at
+                 * once, and it has to, because they are one question.  QEMU's
+                 * globals live in CPUArchState -- cpu_regs[] on x86 is
+                 * offsetof(CPUX86State, regs[R_EAX]) and so on -- so a
+                 * complete enumeration of the members a helper touches is
+                 * already a statement about every global it touches.  Having
+                 * one and still calling the helper unbounded because the
+                 * DECLARATION omits TCG_CALL_NO_RWG would be preferring the
+                 * flag over the body the flag summarises.
+                 */
+                if (!row || !row->env_bounded) {
+                    if (!(hn->flags & TCG_CALL_NO_READ_GLOBALS)) {
+                        model = MAX(model, INSN_DF_HELPER_OPAQUE);
+                        d->n_helper_unbounded += d->n_helper_unbounded < 255;
+                    }
                 }
                 for (unsigned k = 0; k < hn->nargs; k++) {
                     const TCGTemp *ts = hn->arg[k];
@@ -958,6 +1180,9 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
 
                     if (ts == NULL || hn->typecode[k] != dh_typecode_ptr) {
                         continue;
+                    }
+                    if (cen && k < 32) {
+                        cen->ptr_args |= 1u << k;
                     }
                     if (ts == env_ts) {
                         /*
@@ -971,8 +1196,44 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                          * every access it makes to the x87 stack is invisible
                          * here.
                          */
+                        if (row && row->env_bounded) {
+                            /*
+                             * The member list stands in for the pointer.  Each
+                             * one becomes a field record with its own
+                             * direction, so a consumer sees `helper_fldenv
+                             * writes fpuc, fpus, fpstt and fptags` rather than
+                             * `something happened inside a call`.
+                             */
+                            for (unsigned q = 0; q < row->n_env; q++) {
+                                if (row->env[q].kind == DF_HF_XLAT) {
+                                    continue;
+                                }
+                                if (n_pf >= DF_MAX_HELPER_FIELDS) {
+                                    model = MAX(model, INSN_DF_HELPER_OPAQUE);
+                                    break;
+                                }
+                                pf_off[n_pf] = row->env[q].off;
+                                pf_size[n_pf] = row->env[q].size;
+                                pf_dir[n_pf] = row->env[q].dir;
+                                n_pf++;
+                                if (row->env[q].dir & INSN_DF_RD) {
+                                    int b = df_intern(row->env[q].off);
+
+                                    if (b >= 0) {
+                                        df_bit(prov, (unsigned)b);
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                         model = MAX(model, INSN_DF_HELPER_OPAQUE);
                         d->n_helper_unbounded += d->n_helper_unbounded < 255;
+                        if (cen) {
+                            cen->reasons |= DF_CR_ENV;
+                            if (k < 32) {
+                                cen->env_args |= 1u << k;
+                            }
+                        }
                         continue;
                     }
                     eo = df_envoff_of(ts - s->temps);
@@ -987,6 +1248,9 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                          */
                         model = MAX(model, INSN_DF_HELPER_OPAQUE);
                         d->n_helper_unbounded += d->n_helper_unbounded < 255;
+                        if (cen) {
+                            cen->reasons |= DF_CR_PTR;
+                        }
                         continue;
                     }
                     extent = 0;
@@ -1013,6 +1277,9 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                              * another operand's role.
                              */
                             model = MAX(model, INSN_DF_HELPER_OPAQUE);
+                            if (cen) {
+                                cen->reasons |= DF_CR_GVEC_MISMATCH;
+                            }
                         } else {
                             dir = hn->gvec_dir[k];
                             extent = hn->gvec_oprsz;
@@ -1026,6 +1293,12 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                         dir = INSN_DF_RD | INSN_DF_WR;
                         model = MAX(model, INSN_DF_HELPER_APPROX);
                         d->n_helper_unknown += d->n_helper_unknown < 255;
+                        if (cen) {
+                            cen->unknown_pairs++;
+                            if (k < 32) {
+                                cen->unknown_args |= 1u << k;
+                            }
+                        }
                     } else if ((dir & INSN_DF_WR) && !(dir & INSN_DF_RD) &&
                                !df_helper_usage_of(hn->name, k, &dir)) {
                         /*
@@ -1039,8 +1312,16 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                         dir |= INSN_DF_RD;
                         model = MAX(model, INSN_DF_HELPER_APPROX);
                         d->n_helper_unknown += d->n_helper_unknown < 255;
+                        if (cen) {
+                            cen->unknown_pairs++;
+                            if (k < 32) {
+                                cen->unknown_args |= 1u << k;
+                            }
+                        }
+                    } else if (cen && k < 32) {
+                        cen->stated_args |= 1u << k;
                     }
-                    if (n_pf < DF_MAX_HELPER_ARGS) {
+                    if (n_pf < DF_MAX_HELPER_FIELDS) {
                         pf_off[n_pf] = (uint32_t)eo;
                         pf_size[n_pf] = extent;
                         pf_dir[n_pf] = dir;
@@ -1055,6 +1336,23 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                 }
                 if (hn->args_overflow) {
                     model = MAX(model, INSN_DF_HELPER_OPAQUE);
+                }
+                if (df_census_on) {
+                    /*
+                     * Rewritten in full on every call rather than at exit.
+                     * qemu-user leaves through _exit() -- exit_group() calls
+                     * preexit_cleanup() and then _exit(), which runs no
+                     * atexit handler and flushes no stdio -- so an at-exit
+                     * dump produces NO FILE AT ALL and the measurement
+                     * silently does not exist.  Observed: the first cut wrote
+                     * nothing on all four ISAs.  The cost is bounded by
+                     * TRANSLATIONS of a helper call, not executions of one --
+                     * about two thousand on this workload -- and the
+                     * instrument is off unless asked for.
+                     */
+                    df_census_dump_locked();
+                    qemu_mutex_unlock(&df_census_lock);
+                    cen = NULL;
                 }
             } else {
                 /*
@@ -1077,7 +1375,7 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                         if (bit >= 0) {
                             df_bit(prov, (unsigned)bit);
                         }
-                        if (n_pf < DF_MAX_HELPER_ARGS) {
+                        if (n_pf < DF_MAX_HELPER_FIELDS) {
                             pf_off[n_pf] = (uint32_t)eo;
                             pf_size[n_pf] = 0;
                             pf_dir[n_pf] = INSN_DF_RD | INSN_DF_WR;
@@ -1093,6 +1391,16 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
             for (unsigned i = 0; i < n_pf; i++) {
                 df_add_field(d, pf_off[i], pf_size[i], pf_dir[i],
                              (pf_dir[i] & INSN_DF_WR) ? prov : NULL);
+            }
+            /*
+             * A footprint that did not FIT is a footprint that was not
+             * published, and an instruction whose field list was truncated
+             * cannot be called exactly described no matter how complete the
+             * row behind it was.  Without this the enumeration would trade
+             * one silent short set for another.
+             */
+            if (d->fields_overflow) {
+                model = MAX(model, INSN_DF_HELPER_OPAQUE);
             }
 
             for (unsigned i = 0; i < nb_oargs; i++) {
@@ -1421,30 +1729,68 @@ void insn_dataflow_note_memop(const void *val_ts, unsigned nval,
  * @argno is the LOGICAL argument index -- the helper's own parameter
  * position, counting from zero and counting tcg_env if the helper takes it.
  */
-typedef struct DfHelperUsage {
-    const char *name;
-    uint8_t argno;
-    uint8_t dir;
-} DfHelperUsage;
-
+#if defined(TARGET_I386)
+#include "insn-dataflow-usage/i386.c.inc"
+#elif defined(TARGET_ARM)
+#include "insn-dataflow-usage/arm.c.inc"
+#elif defined(TARGET_RISCV)
+#include "insn-dataflow-usage/riscv.c.inc"
+#elif defined(TARGET_MIPS)
+#include "insn-dataflow-usage/mips.c.inc"
+#else
+/*
+ * No table for this target yet.  Not a defect and not a silent default: with
+ * no row every helper stays INSN_DF_HELPER_OPAQUE, which is exactly what the
+ * whole tree did before any table existed, and the label says so on every
+ * instruction that reaches one.
+ */
 static const DfHelperUsage df_helper_usage[] = {
-    /*
-     * Seeded empty on purpose.  The rows that belong here are the ones the
-     * four targets actually reach, and which those are is a measurement, not
-     * a guess -- see the ceiling report this table's `unknown` count feeds.
-     * Adding rows before measuring would be writing down the helpers that
-     * came to mind rather than the helpers that run.
-     */
-    { NULL, 0, 0 }
+    { NULL, { 0 }, NULL, 0, false, NULL }
 };
+#endif
+
+/*
+ * QEMU_DF_NO_USAGE_TABLE makes every lookup miss.  The A/B for this table has
+ * to be ONE BINARY: the workload is not bit-deterministic across processes --
+ * two runs of the same bench differ by hundreds of instructions -- so a
+ * before/after taken from two builds compares two different runs and any
+ * movement it shows is unattributable.  Measured: the first A/B moved
+ * aarch64's irdf disagreements by 19 and its agreements by 63 with the
+ * denominator itself moving, which is not a result.
+ */
+static bool df_notable, df_notable_read;
+
+static bool df_table_off(void)
+{
+    if (!df_notable_read) {
+        const char *e = getenv("QEMU_DF_NO_USAGE_TABLE");
+
+        df_notable_read = true;
+        df_notable = e && atoi(e) != 0;
+    }
+    return df_notable;
+}
+
+static const DfHelperUsage *df_helper_usage_row(const char *name)
+{
+    if (df_table_off()) {
+        return NULL;
+    }
+    for (const DfHelperUsage *u = df_helper_usage; u->name; u++) {
+        if (!strcmp(u->name, name)) {
+            return u;
+        }
+    }
+    return NULL;
+}
 
 static bool df_helper_usage_of(const char *name, unsigned argno, uint8_t *dir)
 {
-    for (const DfHelperUsage *u = df_helper_usage; u->name; u++) {
-        if (u->argno == argno && !strcmp(u->name, name)) {
-            *dir = u->dir;
-            return true;
-        }
+    const DfHelperUsage *u = df_helper_usage_row(name);
+
+    if (u && argno < DF_MAX_HELPER_ARGS && u->argdir[argno]) {
+        *dir = u->argdir[argno];
+        return true;
     }
     return false;
 }

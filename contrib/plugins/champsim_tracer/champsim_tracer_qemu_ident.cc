@@ -197,9 +197,98 @@ uint64_t g_br2_redispatch;        /* DIRECT to fall-through, uncond, no link */
  *            visible rather than looking like an absence.
  */
 uint64_t g_br2_pending;
+/*
+ * QEMU ended the block WITHOUT stating a successor: exit_tb and nothing
+ * else.  It is a REFUSAL, not an answer, and gets the treatment INCOMPLETE
+ * and PENDING get -- counted, not scored -- for the reason this file
+ * already commits to: a refusal is not a wrong answer and must not be
+ * charged as one.
+ *
+ * The regime that produces it in bulk is CF_NO_GOTO_TB (`-one-insn-per-tb`,
+ * `-d nochain`), where translator_use_goto_tb() declines unconditionally and
+ * the x86 translator lowers every branch to a bare exit_tb.  MEASURED on the
+ * mixed-C workload: 0 on all four ISAs in the shipped regime, 2,308 on
+ * x86_64 under `-one-insn-per-tb`, where they were being reported as
+ * disagreements about instructions QEMU had said nothing about.
+ *
+ * It is tested AFTER the identity adjudications, because x86 `syscall` also
+ * carries NOCHAIN and the syscall rule has a real answer for it.
+ */
+uint64_t g_br2_nochain;
 uint64_t g_br2_foreign;
 GHashTable *g_br2sig;
 GHashTable *g_br2_redisp_sig;
+
+/*
+ * THE TWO IDENTITY-KEYED ADJUDICATIONS.
+ *
+ * The ops say what the translator DID; the decode identity says which rule
+ * it dispatched on.  Two classes of instruction need both, because the
+ * transfer the ops carried out is not the transfer the ISA encodes -- and
+ * under R1 ("every instruction has EXACTLY ONE set ... determined by the
+ * instruction itself.  There are NO special cases where the CONTEXT of an
+ * instruction changes that set") and R2 ("we record ARCHITECTURAL (ISA)
+ * dependencies.  Not microarchitectural ones") the ISA is what the wire
+ * publishes.
+ *
+ * Both are keyed by qemu_plugin_insn_decode_id() -- QEMU's own decode
+ * identity, per J6 -- and NEITHER consults a Capstone id or a mnemonic
+ * string.  The tracer's own answer is not an input either: the adjudicated
+ * class is computed from the ops and the identity alone, so it is the same
+ * value a wire flip would publish, and the audit then scores it.
+ *
+ *   ctrl_syscall_ident   the ops carried out NO transfer because the
+ *                        instruction RAISES -- the helper does the
+ *                        transfer, not the translator -- and the identity
+ *                        row states BRANCH_SYSCALL_TYPE.  x86 `syscall`,
+ *                        aarch64 `svc`, riscv `ecall`, mips `syscall`.
+ *                        That QEMU's ops show no transfer is CONTEXT, which
+ *                        R1 excludes.
+ *
+ *   ctrl_folded_cond     the identity row states a CONDITIONAL branch and
+ *                        the ops carried out ONE unconditional static edge,
+ *                        because the condition was decidable at translation
+ *                        time and QEMU folded it.  mipsel `b label` IS
+ *                        `beq $zero,$zero,label`.  R3: an idiom is not a
+ *                        different instruction, and "the redundancy of that
+ *                        dependency is a microarchitectural optimization for
+ *                        a DOWNSTREAM SIMULATOR to model.  The tracer never
+ *                        resolves or elides it."  J2.3: "you are describing
+ *                        a QEMU optimization behavior, not reality."
+ *
+ * NOT a general licence to prefer the table.  The identity table's
+ * .branch_type column IS blurred by aliasing where one rule carries
+ * architecturally different instructions, which is why the branch arm reads
+ * the ops in the first place.  Each arm below fires only on a shape the ops
+ * cannot express at all -- no transfer, or one edge where the rule has two
+ * -- so a blurred row cannot move a row the ops already answered.
+ */
+uint64_t g_ctrl_syscall_ident;
+uint64_t g_ctrl_folded_cond;
+GHashTable *g_ctrl_syscall_sig;
+GHashTable *g_ctrl_folded_sig;
+
+/* The identity row for an id, or nullptr.  Rows are sorted and the sort is
+ * PROVEN at install, so the bisect cannot silently miss one. */
+const QemuIdentRow *ident_row(uint32_t id)
+{
+    if (id == 0 || !g_have_table) {
+        return nullptr;
+    }
+    unsigned lo = 0, hi = g_nrows;
+    while (lo < hi) {
+        unsigned mid = lo + (hi - lo) / 2;
+        if (g_rows[mid].id < id) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo >= g_nrows || g_rows[lo].id != id) {
+        return nullptr;
+    }
+    return &g_rows[lo];
+}
 
 /*
  * THE LINK REGISTER, LEARNED.
@@ -526,6 +615,44 @@ void qemu_ident_note_ctrl(const struct qemu_plugin_insn *insn,
                                    qemu_plugin_insn_ctrl_target_reg(insn),
                                    qemu_plugin_insn_ctrl_addr_reg(insn),
                                    &redispatch, pc, len, target);
+
+    /*
+     * The two identity-keyed adjudications, applied to QEMU's own answer
+     * before anything is scored.  See the block comment at
+     * g_ctrl_syscall_ident.
+     */
+    const QemuIdentRow *row = ident_row(info ? info->decode_id : 0u);
+    {
+        if (row && qbt == BRANCH_NONE &&
+            row->cls.branch_type == BRANCH_SYSCALL_TYPE) {
+            qbt = BRANCH_SYSCALL_TYPE;
+            g_ctrl_syscall_ident++;
+            if (g_detail) {
+                char sig[224];
+                g_snprintf(sig, sizeof(sig), "%-16s %-26s -> %s",
+                           info ? info->mnemonic : "-", row->name,
+                           branch_type_name_or_unknown(qbt));
+                tally(&g_ctrl_syscall_sig, sig);
+            }
+        } else if (row && qbt == BRANCH_DIRECT_JUMP &&
+                   !(f & QEMU_PLUGIN_CTRL_CONDITIONAL) &&
+                   row->cls.branch_type == BRANCH_COND_DIRECT) {
+            qbt = BRANCH_COND_DIRECT;
+            g_ctrl_folded_cond++;
+            if (g_detail) {
+                char sig[224];
+                g_snprintf(sig, sizeof(sig), "%-16s %-26s -> %s",
+                           info ? info->mnemonic : "-", row->name,
+                           branch_type_name_or_unknown(qbt));
+                tally(&g_ctrl_folded_sig, sig);
+            }
+        }
+        if (qbt == BRANCH_NONE && (f & QEMU_PLUGIN_CTRL_NOCHAIN)) {
+            g_br2_nochain++;
+            g_mutex_unlock(&g_lock);
+            return;
+        }
+    }
     g_br2_seen++;
     if (redispatch) {
         g_br2_redispatch++;
@@ -909,14 +1036,25 @@ void qemu_ident_report(GString *report)
             "  re-dispatch (static edge == next insn) %10" PRIu64 "\n"
             "  no classification exported             %10" PRIu64 "\n"
             "  walk refused (INCOMPLETE)              %10" PRIu64 "\n"
+            "  no successor stated (exit_tb only)     %10" PRIu64
+            "   (counted, NOT scored)\n"
             "  PENDING: block split branch from slot  %10" PRIu64
             "   (counted, NOT scored)\n"
             "  FOREIGN: slot of a previous block's br %10" PRIu64
-            "   (counted AND scored)\n",
+            "   (counted AND scored)\n"
+            "  adjudicated: ctrl_syscall_ident        %10" PRIu64
+            "   (identity says SYSCALL, the helper raises)\n"
+            "  adjudicated: ctrl_folded_cond          %10" PRIu64
+            "   (identity says CONDITIONAL, QEMU folded the edge)\n",
             g_br2_seen, g_br2_agree, g_br2_disagree, g_br2_redispatch,
-            g_br2_unavail, g_br2_incomplete, g_br2_pending, g_br2_foreign);
+            g_br2_unavail, g_br2_incomplete, g_br2_nochain, g_br2_pending,
+            g_br2_foreign, g_ctrl_syscall_ident, g_ctrl_folded_cond);
         if (g_detail) {
             dump_tally(report, g_br2sig, "branch-class disagreements", 40);
+            dump_tally(report, g_ctrl_syscall_sig,
+                       "ctrl_syscall_ident adjudications", 20);
+            dump_tally(report, g_ctrl_folded_sig,
+                       "ctrl_folded_cond adjudications", 20);
             dump_tally(report, g_br2_redisp_sig, "re-dispatch signatures", 20);
         } else {
             g_string_append_printf(report,

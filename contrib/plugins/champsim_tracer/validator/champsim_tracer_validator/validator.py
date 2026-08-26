@@ -3347,7 +3347,8 @@ def _a64_restore_alias_zero_reg(d, add, exp_src: set, exp_dst: set) -> None:
 
 
 def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
-                                add, exp_src: set, exp_dst: set) -> None:
+                                add, exp_src: set, exp_dst: set,
+                                exp_dst_explicit: set | None = None) -> None:
     """Mirror the decode-boundary corrections in `disas/capstone.c`.
 
     The oracle above builds its expectation from the RAW Capstone the
@@ -3359,8 +3360,16 @@ def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
     workaround it mirrors; see that file's comment for the encoding-level
     evidence and the retirement procedure, and `isaxcheck` for the
     exhaustive sweep that found them.
+
+    @exp_dst_explicit is the destination set as it stood BEFORE the
+    implicit `regs_write[]` fold — the corrections that drop a phantom
+    definition need it to tell an implicit def apart from the same
+    register named as an operand, which is the distinction the tracer
+    itself draws.
     """
     mnem = (getattr(d, "mnemonic", "") or "").lower()
+    if exp_dst_explicit is None:
+        exp_dst_explicit = set()
 
     if isa == "aarch64":
         # Register-form shift aliases: Capstone drops the third operand
@@ -3778,10 +3787,42 @@ def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
         names_cc = any(op.type == op_reg_kind and fcc0 <= op.reg <= fcc7
                        for op in ops)
         is_br = mnem in ("bc1t", "bc1f", "bc1tl", "bc1fl")
-        if is_br:
+        # The phantom $at write rides on EVERY MIPS branch, not just the
+        # four FP forms this block once named.  LLVM's MIPS branch
+        # classes carry `let Defs = [AT]` because the assembler's
+        # long-branch expansion may use $at as scratch while rewriting an
+        # out-of-range branch; that rewrite emits its OWN instructions
+        # and the branch itself never touches the register.  Capstone
+        # reports the def verbatim in regs_write, so `j`, `beqz` and the
+        # other 30 branch forms would be scored as owing a destination
+        # they do not write.
+        #
+        # QEMU is the adjudicator, and it is unambiguous:
+        # `gen_compute_branch` writes exactly one GPR, `cpu_gpr[blink]`,
+        # and the only assignments to `blink` anywhere in
+        # target/mips/tcg/translate.c are 0, 31 and `rt`.  Never 1.
+        # champsim_tracer_decode.cc drops the def for every branch on
+        # that evidence; the oracle mirrors the drop, or it scores the
+        # repair as a defect and would go green again if the repair were
+        # silently lost.
+        #
+        # The discriminator is Capstone's own instruction GROUPS, read
+        # here from the oracle's own disassembly — an oracle that
+        # imported the tracer's `branch_type` would agree with a wrong
+        # classification instead of checking it.  A sweep of 3,179,648
+        # mips32 encodings finds the implicit-$at writers to be exactly
+        # the 32 branch mnemonics and nothing else, so the group test is
+        # neither narrower nor wider than the class.
+        #
+        # Scoped to the IMPLICIT contribution exactly as the tracer
+        # scopes it: `jalr $at, $t0` NAMES $at as its link register and
+        # that architectural write has to survive the correction.
+        if any(d.group(g) for g in (_cs.CS_GRP_JUMP,
+                                    _cs.CS_GRP_BRANCH_RELATIVE,
+                                    _cs.CS_GRP_CALL, _cs.CS_GRP_RET)):
             phantom = set()
             add(phantom, at)
-            exp_dst -= phantom
+            exp_dst -= (phantom - exp_dst_explicit)
         if not names_cc:
             if mnem.startswith("c."):
                 add(exp_dst, fcc0)
@@ -4125,13 +4166,19 @@ def _check_static_reg_sets(
             # accumulator and RISC-V for the vector-configuration CSRs
             # (`vl`/`vtype`) and the FP rounding mode (`frm`), none of
             # which appear in an operand field.
+            # Snapshot the operand-derived destinations before the
+            # implicit fold: a boundary correction that drops a phantom
+            # definition must drop only the IMPLICIT one, never the same
+            # register named as an operand.
+            exp_dst_explicit = set(exp_dst)
             for cap_id in getattr(d, "regs_read", []) or []:
                 add(exp_src, cap_id)
             for cap_id in getattr(d, "regs_write", []) or []:
                 add(exp_dst, cap_id)
 
             _apply_boundary_corrections(isa, d, ops, op_reg_kind,
-                                        op_mem_kind, add, exp_src, exp_dst)
+                                        op_mem_kind, add, exp_src, exp_dst,
+                                        exp_dst_explicit)
 
             # Translate trace's numeric reg ids → symbolic names via
             # the trace's own ENCODINGS reg map.  Unknown ids (no entry
@@ -4165,9 +4212,6 @@ def _check_static_reg_sets(
                 n_skipped += 1
                 continue
             if isa == "riscv64" and mnemonic in ("beqz", "bnez", "ecall"):
-                n_skipped += 1
-                continue
-            if isa == "riscv64" and mnemonic in ("auipc", "lui"):
                 n_skipped += 1
                 continue
             # Aliased link forms hide ra completely in Capstone 6 (not

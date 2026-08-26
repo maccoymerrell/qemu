@@ -69,6 +69,33 @@ void plugin_gen_record_insn_identity(uint32_t id, const char *name);
  */
 void plugin_gen_record_tb_stop(void);
 
+/*
+ * plugin_gen_record_ctrl_deferred: the instruction now being translated
+ * performs a control transfer whose OPS ARE NOT ITS OWN.  A delay-slot
+ * architecture defers them: MIPS records the pending branch in
+ * ctx->hflags and leaves gen_branch() to emit the transfer at the end of
+ * the DELAY SLOT's translate_insn().
+ *
+ * Called by the translator right after it decodes such a branch.  Without
+ * it, ownership would be read off position in the op list, which puts the
+ * transfer on the slot and leaves the branch reading as a non-branch --
+ * measured as 1,991 of 6,549 mipsel classifications.
+ */
+void plugin_gen_record_ctrl_deferred(void);
+
+/*
+ * plugin_gen_record_ctrl_resume: the ops emitted from this point on, during
+ * the instruction now being translated, PERFORM the transfer deferred
+ * earlier.  Called immediately before the translator emits them.
+ *
+ * The ops go to the deferring instruction.  If the block ended between the
+ * branch and its slot, there is no deferring instruction in this block: the
+ * ops are then excluded from the current instruction's classification and it
+ * is marked QEMU_PLUGIN_CTRL_FOREIGN, rather than being credited with a
+ * transfer it does not perform.
+ */
+void plugin_gen_record_ctrl_resume(void);
+
 #else /* !CONFIG_PLUGIN */
 
 static inline
@@ -94,6 +121,12 @@ static inline void plugin_gen_record_branch_target(uint64_t target_pc)
 { }
 
 static inline void plugin_gen_record_tb_stop(void)
+{ }
+
+static inline void plugin_gen_record_ctrl_deferred(void)
+{ }
+
+static inline void plugin_gen_record_ctrl_resume(void)
 { }
 
 static inline void plugin_gen_record_insn_identity(uint32_t id,

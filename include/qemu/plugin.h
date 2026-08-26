@@ -195,6 +195,60 @@ struct qemu_plugin_insn {
      */
     int32_t  ctrl_link_reg;
     int32_t  ctrl_link_addr_reg;
+    /*
+     * A transfer whose ops this instruction did NOT emit.
+     *
+     * On MIPS the ops that carry out a branch are emitted by gen_branch(),
+     * which runs at the end of the DELAY SLOT's translate_insn().  Position
+     * in the op list therefore does not say whose transfer it is, and the
+     * translator is the only party that does: it calls
+     * plugin_gen_record_ctrl_deferred() on the branch and
+     * plugin_gen_record_ctrl_resume() on the slot, just before emitting
+     * them.
+     *
+     * ctrl_borrow_first/_last is the half-open (first, last] range of ops
+     * that were emitted during a LATER instruction but belong to THIS one.
+     * It is classified together with this instruction's own range, in
+     * program order, with one origin-propagation state running across both:
+     * the intervening slot's ops are skipped, which is not an approximation
+     * but the architecture -- a MIPS branch reads its target register at the
+     * branch, before the delay slot executes.
+     *
+     * ctrl_deferred says this instruction stated a deferral;
+     * ctrl_deferred_unresolved says the ops never arrived before the block
+     * ended (QEMU_PLUGIN_CTRL_PENDING).  ctrl_foreign says ops emitted
+     * during THIS instruction performed a deferral belonging to an
+     * instruction outside this block (QEMU_PLUGIN_CTRL_FOREIGN): they are
+     * excluded from this instruction's own classification, because they are
+     * not this instruction's behaviour.
+     */
+    const void *ctrl_borrow_first;
+    const void *ctrl_borrow_last;
+    bool ctrl_deferred;
+    bool ctrl_foreign;
+    /*
+     * This instruction's own range was closed EARLY, by
+     * plugin_gen_record_ctrl_resume(), and must not be re-opened.  Both
+     * places that would otherwise take the op list's tail have to honour it:
+     * plugin_gen_insn_end(), and plugin_gen_record_tb_stop() -- a delay slot
+     * is very often the last instruction in its block, so the tb_stop
+     * extension lands on exactly the instruction whose range was just
+     * truncated and hands the branch's ops straight back to it.
+     */
+    bool ctrl_last_pinned;
+    /*
+     * The instruction whose translate_insn() emitted the borrowed range --
+     * the delay slot.  Kept because it, not this instruction, ends the
+     * ARCHITECTURAL extent of the transfer: a MIPS call publishes
+     * branch + 8, past the slot, and a MIPS conditional branch's not-taken
+     * edge is that same address.  A fall-through taken as vaddr + len
+     * therefore matches neither, which loses the LINK bit on every jal /
+     * jalr / bal and lets the not-taken edge be published as the taken
+     * target.  The extent is derived from the lender rather than from a
+     * per-target constant, because the lender is the instruction the
+     * translator itself named.
+     */
+    const void *ctrl_borrow_lender;
 };
 
 /* A scoreboard is an array of values, indexed by vcpu_index */
@@ -207,6 +261,13 @@ struct qemu_plugin_scoreboard {
 struct qemu_plugin_tb {
     GPtrArray *insns;
     size_t n;
+
+    /*
+     * The instruction that stated a deferred control transfer and is still
+     * waiting for the ops that perform it.  NULL when nothing is pending.
+     * See ctrl_borrow_first in struct qemu_plugin_insn.
+     */
+    struct qemu_plugin_insn *ctrl_deferrer;
 
     /* if set, the TB calls helpers that might access guest memory */
     bool mem_helper;

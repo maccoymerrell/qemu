@@ -172,6 +172,24 @@ uint64_t g_br2_incomplete;        /* the walk refused                      */
 uint64_t g_br2_agree;
 uint64_t g_br2_disagree;
 uint64_t g_br2_redispatch;        /* DIRECT to fall-through, uncond, no link */
+/*
+ * THE SPLIT DELAY SLOT, and it is the delay-slot sibling of a page-straddling
+ * block rather than a new idea.  A MIPS branch's transfer is emitted while
+ * its delay slot is translated; when the block ENDS between the two, the
+ * translator's statement of ownership cannot be completed inside one block.
+ *
+ *   pending  the branch is in this block and the ops that perform its
+ *            transfer are not.  QEMU says it IS a transfer and cannot say
+ *            what kind, so the row is COUNTED AND NOT SCORED -- the same
+ *            treatment INCOMPLETE gets, and for the same reason: a refusal
+ *            is not a wrong answer and must not be charged as one.
+ *   foreign  ops emitted during this instruction performed the transfer of a
+ *            branch in the PREVIOUS block.  This instruction is classified
+ *            normally and IS scored; the count exists so the exclusion is
+ *            visible rather than looking like an absence.
+ */
+uint64_t g_br2_pending;
+uint64_t g_br2_foreign;
 GHashTable *g_br2sig;
 GHashTable *g_br2_redisp_sig;
 
@@ -481,6 +499,14 @@ void qemu_ident_note_ctrl(const struct qemu_plugin_insn *insn,
         g_mutex_unlock(&g_lock);
         return;
     }
+    if (f & QEMU_PLUGIN_CTRL_FOREIGN) {
+        g_br2_foreign++;
+    }
+    if (f & QEMU_PLUGIN_CTRL_PENDING) {
+        g_br2_pending++;
+        g_mutex_unlock(&g_lock);
+        return;
+    }
 
     bool redispatch = false;
     uint64_t target = qemu_plugin_insn_ctrl_target(insn);
@@ -516,7 +542,7 @@ void qemu_ident_note_ctrl(const struct qemu_plugin_insn *insn,
                        info ? info->mnemonic : "-",
                        branch_type_name_or_unknown(qbt),
                        branch_type_name_or_unknown(tracer_bt),
-                       f & 0x1ff, qname ? qname : "-");
+                       f & 0x7ff, qname ? qname : "-");
             tally(&g_br2sig, sig);
         }
     }
@@ -815,20 +841,29 @@ void qemu_ident_report(GString *report)
             "QEMU's answer is read off the ops that carried out the "
             "transfer: goto_tb is a compile-time successor, goto_ptr a "
             "computed one, two distinct goto_tb edges a choice, a constant "
-            "equal to (pc + len) published into a register or onto the stack "
-            "is a LINK, and a static successor equal to the instruction's own "
-            "address is a string operation's self-edge.  None of it is a "
-            "pattern NAME, which is what makes it immune to the alias "
-            "blurring that made the identity table's .branch_type column "
-            "unusable.\n"
+            "equal to the instruction's own ARCHITECTURAL CONTINUATION "
+            "published into a register or onto the stack is a LINK, and a "
+            "static successor equal to the instruction's own address is a "
+            "string operation's self-edge.  None of it is a pattern NAME, "
+            "which is what makes it immune to the alias blurring that made "
+            "the identity table's .branch_type column unusable.\n"
+            "The continuation is (pc + len) on most targets and PAST THE "
+            "DELAY SLOT on MIPS -- a mips call publishes pc + 8 and its "
+            "not-taken edge is that same address -- which QEMU states by "
+            "naming the slot that emitted the transfer, so no per-target "
+            "constant is assumed here.\n"
             "  scored                                 %10" PRIu64 "\n"
             "  agree                                  %10" PRIu64 "\n"
             "  DISAGREE                               %10" PRIu64 "\n"
             "  re-dispatch (static edge == next insn) %10" PRIu64 "\n"
             "  no classification exported             %10" PRIu64 "\n"
-            "  walk refused (INCOMPLETE)              %10" PRIu64 "\n",
+            "  walk refused (INCOMPLETE)              %10" PRIu64 "\n"
+            "  PENDING: block split branch from slot  %10" PRIu64
+            "   (counted, NOT scored)\n"
+            "  FOREIGN: slot of a previous block's br %10" PRIu64
+            "   (counted AND scored)\n",
             g_br2_seen, g_br2_agree, g_br2_disagree, g_br2_redispatch,
-            g_br2_unavail, g_br2_incomplete);
+            g_br2_unavail, g_br2_incomplete, g_br2_pending, g_br2_foreign);
         if (g_detail) {
             dump_tally(report, g_br2sig, "branch-class disagreements", 40);
             dump_tally(report, g_br2_redisp_sig, "re-dispatch signatures", 20);

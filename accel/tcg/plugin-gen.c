@@ -425,6 +425,7 @@ bool plugin_gen_tb_start(CPUState *cpu, const DisasContextBase *db)
         }
         ptb->n = 0;
         ptb->mem_helper = false;
+        ptb->ctrl_deferrer = NULL;
     } else {
         ptb = g_new0(struct qemu_plugin_tb, 1);
         tcg_ctx->plugin_tb = ptb;
@@ -489,6 +490,17 @@ void plugin_gen_insn_start(CPUState *cpu, const DisasContextBase *db)
     insn->ctrl_target = 0;
     insn->ctrl_target_reg = -1;
     insn->ctrl_addr_reg = -1;
+    /*
+     * Same reuse hazard once more: a stale borrowed range is a stale TCGOp
+     * pointer, and a stale deferral would credit this instruction with a
+     * transfer performed for a different one in an earlier block.
+     */
+    insn->ctrl_borrow_first = NULL;
+    insn->ctrl_borrow_last = NULL;
+    insn->ctrl_deferred = false;
+    insn->ctrl_foreign = false;
+    insn->ctrl_last_pinned = false;
+    insn->ctrl_borrow_lender = NULL;
 
     tcg_gen_plugin_cb(PLUGIN_GEN_FROM_INSN);
     /*
@@ -513,6 +525,77 @@ void plugin_gen_record_insn_identity(uint32_t id, const char *name)
     if (insn) {
         insn->decode_id = id;
         insn->decode_name = name;
+    }
+}
+
+/*
+ * A branch whose transfer is emitted later.  See plugin-gen.h.
+ *
+ * The deferral is recorded on the BLOCK, not on the instruction alone,
+ * because what resolves it is an op emitted while a DIFFERENT instruction is
+ * being translated.  One pending deferral at a time is all any delay-slot
+ * architecture has: a branch in a delay slot is architecturally undefined
+ * and QEMU raises a Reserved Instruction exception for it rather than
+ * translating a second one.  A second deferral would therefore mean the
+ * translator contradicted itself, and dropping the older one silently is
+ * exactly the class of failure this arc exists to remove -- so it is
+ * refused, and the older branch keeps its deferral and reports PENDING.
+ */
+void plugin_gen_record_ctrl_deferred(void)
+{
+    struct qemu_plugin_tb *ptb = tcg_ctx->plugin_tb;
+    struct qemu_plugin_insn *insn = tcg_ctx->plugin_insn;
+
+    if (!ptb || !insn) {
+        return;
+    }
+    insn->ctrl_deferred = true;
+    if (!ptb->ctrl_deferrer) {
+        ptb->ctrl_deferrer = insn;
+    }
+}
+
+/*
+ * The deferred transfer's ops start here.
+ *
+ * The current instruction's own range is CLOSED at this point rather than at
+ * plugin_gen_insn_end(): everything after this op belongs to the branch, and
+ * leaving it in the slot's range is the whole defect.  (On MIPS gen_branch()
+ * sets is_jmp = DISAS_NORETURN, so nothing of the slot's own follows it;
+ * were a target to emit more afterwards it would be attributed to the
+ * branch, which is why the close is stated here by the translator and not
+ * guessed at.)
+ *
+ * With no deferrer in this block the block ended between the branch and its
+ * slot.  The ops are then nobody's here: they are excluded from the current
+ * instruction, which is marked FOREIGN.  The alternative -- leaving them in
+ * its range -- is the original defect narrowed to one case, and a case that
+ * still reads as a branch on an instruction that is not one.
+ */
+void plugin_gen_record_ctrl_resume(void)
+{
+    struct qemu_plugin_tb *ptb = tcg_ctx->plugin_tb;
+    struct qemu_plugin_insn *insn = tcg_ctx->plugin_insn;
+    TCGOp *here;
+
+    if (!ptb || !insn || !insn->ctrl_first_op) {
+        return;
+    }
+    here = QTAILQ_LAST(&tcg_ctx->ops);
+    insn->ctrl_last_op = here;
+    insn->ctrl_last_pinned = true;
+
+    if (ptb->ctrl_deferrer && ptb->ctrl_deferrer != insn) {
+        ptb->ctrl_deferrer->ctrl_borrow_first = here;
+        ptb->ctrl_deferrer->ctrl_borrow_lender = insn;
+        /*
+         * The end is taken in plugin_gen_insn_end(), for the same reason the
+         * own-range end is: at that instant the tail is the last op the
+         * translator emitted and none of the block epilogue exists yet.
+         */
+        ptb->ctrl_deferrer->ctrl_borrow_last = NULL;
+    } else {
+        insn->ctrl_foreign = true;
     }
 }
 
@@ -548,6 +631,27 @@ void plugin_gen_record_tb_stop(void)
     if (!ptb || !insn) {
         return;
     }
+    /*
+     * A branch still waiting for its delay slot gets NOTHING from tb_stop.
+     * The block ended between the two, so what tb_stop emits is the
+     * re-dispatch to the slot -- a goto_tb whose successor is the branch's
+     * own fall-through -- and handing it to the branch would publish that
+     * address as the branch's target.  The instruction keeps its own range
+     * and is reported PENDING.
+     */
+    if (ptb->ctrl_deferrer == insn && !insn->ctrl_borrow_first) {
+        return;
+    }
+    /*
+     * And a delay slot gets nothing either.  Its range was closed at the op
+     * before the branch's transfer; re-taking the tail here would put those
+     * ops back, which is the defect this machinery exists to remove and is
+     * the common case rather than a corner, because a block usually ENDS at
+     * a branch and its slot.
+     */
+    if (insn->ctrl_last_pinned) {
+        return;
+    }
     if (insn->ctrl_first_op) {
         insn->ctrl_last_op = QTAILQ_LAST(&tcg_ctx->ops);
     }
@@ -557,6 +661,7 @@ void plugin_gen_insn_end(void)
 {
     const DisasContextBase *db = tcg_ctx->plugin_db;
     struct qemu_plugin_insn *pinsn = tcg_ctx->plugin_insn;
+    struct qemu_plugin_tb *ptb = tcg_ctx->plugin_tb;
 
     pinsn->len = db->fake_insn ? db->record_len : db->pc_next - pinsn->vaddr;
 
@@ -565,8 +670,18 @@ void plugin_gen_insn_end(void)
      * it here rather than inferring the range from the next insn_start: at
      * this instant the op list's tail is the last op translate_insn()
      * emitted, and nothing of the block's epilogue exists yet.
+     *
+     * Everything from plugin_gen_record_ctrl_resume() onwards belongs to the
+     * branch that deferred, so this instruction's own end was already taken
+     * there and the tail closes the BORROWED range instead.
      */
-    pinsn->ctrl_last_op = QTAILQ_LAST(&tcg_ctx->ops);
+    if (ptb && ptb->ctrl_deferrer && ptb->ctrl_deferrer->ctrl_borrow_first &&
+        !ptb->ctrl_deferrer->ctrl_borrow_last) {
+        ptb->ctrl_deferrer->ctrl_borrow_last = QTAILQ_LAST(&tcg_ctx->ops);
+        ptb->ctrl_deferrer = NULL;
+    } else if (!pinsn->ctrl_last_pinned) {
+        pinsn->ctrl_last_op = QTAILQ_LAST(&tcg_ctx->ops);
+    }
 
     tcg_gen_plugin_cb(PLUGIN_GEN_AFTER_INSN);
 }

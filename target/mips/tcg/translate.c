@@ -18924,8 +18924,15 @@ static void mips_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     DisasContext *ctx = container_of(dcbase, DisasContext, base);
     int insn_bytes;
     int is_slot;
+    bool was_slot;
 
     is_slot = ctx->hflags & MIPS_HFLAG_BMASK;
+    /*
+     * Taken BEFORE the forcing below, because the two cases it merges have
+     * different owners for the transfer gen_branch() emits.  See the
+     * plugin_gen_record_ctrl_* calls at the bottom of this function.
+     */
+    was_slot = is_slot != 0;
     ctx->decode_ident = MIPS_ID_NONE;
     if (ctx->insn_flags & ISA_NANOMIPS32) {
         ctx->opcode = translator_lduw(env, &ctx->base, ctx->base.pc_next);
@@ -18990,7 +18997,36 @@ static void mips_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
         }
     }
     if (is_slot) {
+        /*
+         * WHOSE TRANSFER THIS IS.  When is_slot was already set on entry,
+         * the branch is the PREVIOUS instruction and gen_branch() is
+         * emitting ITS transfer here, at the end of the delay (or forbidden)
+         * slot.  Nothing in the op list says so, and a consumer that reads
+         * ownership off position credits the slot with the branch and leaves
+         * the branch reading as an ordinary instruction -- measured at 1,991
+         * of 6,549 classifications on a mipsel workload, which is every
+         * delay-slot branch in it.
+         *
+         * When is_slot was FORCED to 1 above, the branch has neither a delay
+         * nor a forbidden slot and gen_branch() is emitting the transfer of
+         * the instruction just decoded, which is this one.  No statement is
+         * owed then, and making one would move the transfer off the
+         * instruction that performs it.
+         */
+        if (was_slot) {
+            plugin_gen_record_ctrl_resume();
+        }
         gen_branch(ctx, insn_bytes);
+    } else if (ctx->hflags & MIPS_HFLAG_BMASK) {
+        /*
+         * BMASK was clear on entry (is_slot was 0) and is set now, so the
+         * instruction just decoded is a branch that has armed its slot.  Its
+         * transfer will be emitted by the gen_branch() above during the NEXT
+         * instruction -- or not in this block at all, if the block ends
+         * here, which is the delay-slot sibling of a page-straddling block
+         * and is reported as QEMU_PLUGIN_CTRL_PENDING.
+         */
+        plugin_gen_record_ctrl_deferred();
     }
     if (ctx->base.is_jmp == DISAS_SEMIHOST) {
         generate_exception_err(ctx, EXCP_SEMIHOST, insn_bytes);

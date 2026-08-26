@@ -99,8 +99,26 @@ static void ctrl_one(struct qemu_plugin_insn *insn, Origin *orig,
     const TCGOp *last = insn->ctrl_last_op;
     const TCGOp *end;
     const TCGOp *op;
+    /*
+     * Program order, in up to two pieces.  The second is the range of ops a
+     * LATER instruction's translate_insn() emitted on this one's behalf --
+     * a MIPS branch's transfer, emitted by gen_branch() at the end of the
+     * delay slot.  See ctrl_borrow_first in include/qemu/plugin.h.
+     */
+    struct { const TCGOp *first, *last; } seg[2];
+    unsigned nseg = 0, si;
     uint32_t flags = QEMU_PLUGIN_CTRL_VALID;
-    uint64_t fallthrough = insn->vaddr + insn->len;
+    /*
+     * The instruction's ARCHITECTURAL continuation: the address a call it
+     * makes returns to, and the address its not-taken edge goes to.  Usually
+     * the next instruction, but a delay-slot branch's continuation is past
+     * the SLOT -- the slot is part of the branch's execution -- and the
+     * translator named the slot, so the extent is read off it rather than
+     * assumed.
+     */
+    const struct qemu_plugin_insn *lender = insn->ctrl_borrow_lender;
+    uint64_t fallthrough = lender ? lender->vaddr + lender->len
+                                  : insn->vaddr + insn->len;
     uint64_t target = 0;
     bool have_target = false;
     int32_t tgt_reg = -1, addr_reg = -1;
@@ -118,217 +136,261 @@ static void ctrl_one(struct qemu_plugin_insn *insn, Origin *orig,
     insn->ctrl_link_reg = -1;
     insn->ctrl_link_addr_reg = -1;
 
+    if (insn->ctrl_deferred && !insn->ctrl_borrow_first) {
+        /*
+         * The block ended between this branch and its delay slot, so the ops
+         * that perform the transfer were never emitted here.  It IS a
+         * transfer -- the translator said so -- but this block cannot say
+         * what kind, and inventing one from the re-dispatch tb_stop emitted
+         * would publish the fall-through as the branch's target.
+         */
+        flags |= QEMU_PLUGIN_CTRL_PENDING;
+    }
+    if (insn->ctrl_foreign) {
+        /*
+         * Ops emitted during this instruction performed a transfer belonging
+         * to an instruction outside this block.  They are excluded below --
+         * ctrl_last_op was closed before them -- and the exclusion is
+         * reported rather than left to look like an absence.
+         */
+        flags |= QEMU_PLUGIN_CTRL_FOREIGN;
+    }
+
     if (!first || !last) {
+        insn->ctrl_flags = flags;
         return;
     }
 
-    /*
-     * The range is HALF-OPEN against the op after @last, not closed against
-     * @last, and that is not a style choice.  A closed loop that tests
-     * `op == last` at the bottom never terminates when @last is not actually
-     * reachable from @first -- which is the ordinary case for an instruction
-     * whose transfer is emitted in tb_stop(), where the tail at
-     * plugin_gen_insn_end() IS the range's first op.  It then walks to the
-     * end of the block and reads every following instruction's ops as this
-     * one's, which reads as a branch on instructions that are not.  Measured:
-     * it put a control transfer on `nop`.
-     */
-    end = QTAILQ_NEXT(last, link);
+    seg[nseg].first = first;
+    seg[nseg].last = last;
+    nseg++;
+    if (insn->ctrl_borrow_first && insn->ctrl_borrow_last) {
+        seg[nseg].first = insn->ctrl_borrow_first;
+        seg[nseg].last = insn->ctrl_borrow_last;
+        nseg++;
+    }
 
+    /*
+     * ONE origin state across both segments, and the intervening delay
+     * slot's ops deliberately skipped.  That is not a shortcut: MIPS reads a
+     * branch's target register AT THE BRANCH, so the provenance the transfer
+     * ops should be read against is the one the branch left, not the one the
+     * slot went on to overwrite.  `jr $ra` in a block whose slot writes $ra
+     * still returns through the value $ra held at the branch, and this walk
+     * says so.
+     */
     memset(orig, 0, norig * sizeof(orig[0]));
 
-    for (op = QTAILQ_NEXT(first, link); op && op != end;
-         op = QTAILQ_NEXT(op, link)) {
-        const TCGOpDef *def = &tcg_op_defs[op->opc];
-        unsigned nb_oargs, nb_iargs;
+    for (si = 0; si < nseg; si++) {
+        /*
+         * The range is HALF-OPEN against the op after @last, not closed
+         * against @last, and that is not a style choice.  A closed loop that
+         * tests
+         * `op == last` at the bottom never terminates when @last is not
+         * actually reachable from @first -- the ordinary case for an
+         * instruction
+         * whose transfer is emitted in tb_stop(), where the tail at
+         * plugin_gen_insn_end() IS the range's first op.  It then walks to the
+         * end of the block and reads every following instruction's ops as this
+         * one's, which reads as a branch on instructions that are not.
+         * Measured: it put a control transfer on `nop`.
+         */
+        end = QTAILQ_NEXT(seg[si].last, link);
+        for (op = QTAILQ_NEXT(seg[si].first, link); op && op != end;
+             op = QTAILQ_NEXT(op, link)) {
+            const TCGOpDef *def = &tcg_op_defs[op->opc];
+            unsigned nb_oargs, nb_iargs;
 
-        switch (op->opc) {
-        case INDEX_op_goto_tb:
-            n_goto_tb++;
-            goto_tb_idx_seen |= 1u << (op->args[0] & 31);
-            in_goto_tb = true;
-            break;
+            switch (op->opc) {
+            case INDEX_op_goto_tb:
+                n_goto_tb++;
+                goto_tb_idx_seen |= 1u << (op->args[0] & 31);
+                in_goto_tb = true;
+                break;
 
-        case INDEX_op_goto_ptr:
-            saw_goto_ptr = true;
-            /*
-             * The target expression is whatever was last assigned to the PC
-             * global.  Its origin has been propagated forward to here.
-             */
-            if (pc_global >= 0 && (size_t)pc_global < norig) {
-                Origin o = orig[pc_global];
-                if (o.kind == ORIG_REG) {
-                    tgt_reg = o.reg;
-                } else if (o.kind == ORIG_LOAD) {
-                    flags |= QEMU_PLUGIN_CTRL_TGT_LOAD;
-                    addr_reg = o.reg;
-                } else if (o.kind == ORIG_CONST) {
-                    /*
-                     * A COMPILE-TIME successor reached through goto_ptr.
-                     * goto_tb is a CHAINING optimisation, not a semantic:
-                     * translator_use_goto_tb() declines whenever the target
-                     * is outside the block's page, and the translator then
-                     * emits the same constant into the PC and dispatches
-                     * through lookup_and_goto_ptr instead.  Measured on
-                     * glibc-linked guests, that is the COMMON case -- every
-                     * aarch64 `bl`, every x86 `callq`, every riscv `jal` in
-                     * the benchmark took it.  Reading goto_ptr as "indirect"
-                     * would call all of them computed branches.  What makes
-                     * a transfer direct is that its target is a constant,
-                     * and that is what is tested.
-                     */
-                    target = o.val;
-                    have_target = true;
-                    if (target == insn->vaddr) {
-                        flags |= QEMU_PLUGIN_CTRL_SELF;
+            case INDEX_op_goto_ptr:
+                saw_goto_ptr = true;
+                /*
+                 * The target expression is whatever was last assigned to the PC
+                 * global.  Its origin has been propagated forward to here.
+                 */
+                if (pc_global >= 0 && (size_t)pc_global < norig) {
+                    Origin o = orig[pc_global];
+                    if (o.kind == ORIG_REG) {
+                        tgt_reg = o.reg;
+                    } else if (o.kind == ORIG_LOAD) {
+                        flags |= QEMU_PLUGIN_CTRL_TGT_LOAD;
+                        addr_reg = o.reg;
+                    } else if (o.kind == ORIG_CONST) {
+                        /*
+                         * A COMPILE-TIME successor reached through goto_ptr.
+                         * goto_tb is a CHAINING optimisation, not a semantic:
+                         * translator_use_goto_tb() declines whenever the target
+                         * is outside the block's page, and the translator then
+                         * emits the same constant into the PC and dispatches
+                         * through lookup_and_goto_ptr instead.  Measured on
+                         * glibc-linked guests, that is the COMMON case --
+                         * every aarch64 `bl`, every x86 `callq`, every riscv
+                         * `jal` in the benchmark took it.  Reading goto_ptr
+                         * as "indirect"
+                         * would call all of them computed branches.  What makes
+                         * a transfer direct is that its target is a constant,
+                         * and that is what is tested.
+                         */
+                        target = o.val;
+                        have_target = true;
+                        if (target == insn->vaddr) {
+                            flags |= QEMU_PLUGIN_CTRL_SELF;
+                        }
+                        direct_by_value = true;
+                    } else {
+                        flags |= QEMU_PLUGIN_CTRL_INCOMPLETE;
                     }
-                    direct_by_value = true;
                 } else {
                     flags |= QEMU_PLUGIN_CTRL_INCOMPLETE;
                 }
+                break;
+
+            case INDEX_op_exit_tb:
+                saw_exit_tb = true;
+                in_goto_tb = false;
+                break;
+
+            default:
+                break;
+            }
+
+            if (op->opc == INDEX_op_call) {
+                nb_oargs = TCGOP_CALLO(op);
+                nb_iargs = TCGOP_CALLI(op);
             } else {
-                flags |= QEMU_PLUGIN_CTRL_INCOMPLETE;
-            }
-            break;
-
-        case INDEX_op_exit_tb:
-            saw_exit_tb = true;
-            in_goto_tb = false;
-            break;
-
-        default:
-            break;
-        }
-
-        if (op->opc == INDEX_op_call) {
-            nb_oargs = TCGOP_CALLO(op);
-            nb_iargs = TCGOP_CALLI(op);
-        } else {
-            nb_oargs = def->nb_oargs;
-            nb_iargs = def->nb_iargs;
-        }
-
-        /*
-         * LINK, and the PC global's identity, both come out of the ordinary
-         * operand walk rather than a per-op special case.
-         */
-        if (op->opc == INDEX_op_qemu_st_i32 || op->opc == INDEX_op_qemu_st_i64 ||
-            op->opc == INDEX_op_qemu_st8_i32 ||
-            op->opc == INDEX_op_qemu_st_i128) {
-            /* args[0] is the data being stored. */
-            const TCGTemp *dts = arg_temp(op->args[0]);
-            Origin o = origin_of(s, orig, dts);
-            if (o.kind == ORIG_CONST && o.val == fallthrough) {
-                const TCGTemp *ats = arg_temp(op->args[1]);
-                Origin ao = ats ? origin_of(s, orig, ats)
-                                : (Origin){ ORIG_NONE, -1, 0 };
-                flags |= QEMU_PLUGIN_CTRL_LINK;
-                if (ao.kind == ORIG_REG) {
-                    link_addr_reg = ao.reg;
-                }
-            }
-        }
-
-        /* Propagate origins across this op's outputs. */
-        if (nb_oargs > 0 && op->opc != INDEX_op_call) {
-            Origin src = { ORIG_NONE, -1, 0 };
-            bool src_set = false;
-
-            for (unsigned k = 0; k < nb_iargs; k++) {
-                const TCGTemp *its = arg_temp(op->args[nb_oargs + k]);
-                Origin o;
-
-                if (!its) {
-                    continue;
-                }
-                o = origin_of(s, orig, its);
-                if (o.kind == ORIG_NONE) {
-                    continue;
-                }
-                if (!src_set) {
-                    src = o;
-                    src_set = true;
-                } else if (o.kind == ORIG_REG && src.kind == ORIG_CONST) {
-                    /* a register input outranks a constant one */
-                    src = o;
-                }
+                nb_oargs = def->nb_oargs;
+                nb_iargs = def->nb_iargs;
             }
 
             /*
-             * A load's result is a load, not the origin of its address --
-             * but the address register is worth keeping, because it is what
-             * separates `ret` (through the stack pointer) from an indirect
-             * jump through a loaded function pointer.
+             * LINK, and the PC global's identity, both come out of the ordinary
+             * operand walk rather than a per-op special case.
              */
-            if (op->opc == INDEX_op_qemu_ld_i32 ||
-                op->opc == INDEX_op_qemu_ld_i64 ||
-                op->opc == INDEX_op_qemu_ld_i128) {
-                const TCGTemp *ats = arg_temp(op->args[nb_oargs]);
-                Origin ao = ats ? origin_of(s, orig, ats)
-                                : (Origin){ ORIG_NONE, -1, 0 };
-                src.kind = ORIG_LOAD;
-                src.reg = ao.kind == ORIG_REG ? ao.reg : -1;
-                src.val = 0;
-                src_set = true;
-            } else if (nb_iargs == 0) {
-                src.kind = ORIG_NONE;
-                src.reg = -1;
-                src.val = 0;
-            }
-
-            for (unsigned k = 0; k < nb_oargs; k++) {
-                const TCGTemp *ots = arg_temp(op->args[k]);
-                size_t oi;
-
-                if (!ots) {
-                    continue;
-                }
-                oi = ots - s->temps;
-                if (oi >= norig) {
-                    continue;
-                }
-                orig[oi] = src_set ? src : (Origin){ ORIG_NONE, -1, 0 };
-
-                /*
-                 * A constant assigned to a global between a goto_tb and its
-                 * exit_tb is the successor address, and the global it was
-                 * assigned to is the program counter.
-                 */
-                if (in_goto_tb && temp_is_global(s, ots) &&
-                    src_set && src.kind == ORIG_CONST) {
-                    if (pc_global < 0) {
-                        pc_global = (int32_t)oi;
-                    }
-                    if ((int32_t)oi == pc_global) {
-                        if (src.val == insn->vaddr) {
-                            flags |= QEMU_PLUGIN_CTRL_SELF;
-                        }
-                        if (!have_target || target == fallthrough) {
-                            target = src.val;
-                            have_target = true;
-                        }
-                    }
-                }
-
-                /*
-                 * LINK through a register: the fall-through address, as a
-                 * constant, assigned to a guest register.  Excluding the PC
-                 * itself, which every direct branch assigns.
-                 */
-                if (temp_is_global(s, ots) && src_set &&
-                    src.kind == ORIG_CONST && src.val == fallthrough &&
-                    (int32_t)oi != pc_global) {
+            if (op->opc == INDEX_op_qemu_st_i32 ||
+                op->opc == INDEX_op_qemu_st_i64 ||
+                op->opc == INDEX_op_qemu_st8_i32 ||
+                op->opc == INDEX_op_qemu_st_i128) {
+                /* args[0] is the data being stored. */
+                const TCGTemp *dts = arg_temp(op->args[0]);
+                Origin o = origin_of(s, orig, dts);
+                if (o.kind == ORIG_CONST && o.val == fallthrough) {
+                    const TCGTemp *ats = arg_temp(op->args[1]);
+                    Origin ao = ats ? origin_of(s, orig, ats)
+                                    : (Origin){ ORIG_NONE, -1, 0 };
                     flags |= QEMU_PLUGIN_CTRL_LINK;
-                    link_reg = (int32_t)oi;
+                    if (ao.kind == ORIG_REG) {
+                        link_addr_reg = ao.reg;
+                    }
                 }
             }
-        } else if (op->opc == INDEX_op_call) {
-            /* A helper's outputs have no origin this walk can state. */
-            for (unsigned k = 0; k < nb_oargs; k++) {
-                const TCGTemp *ots = arg_temp(op->args[k]);
-                size_t oi = ots ? (size_t)(ots - s->temps) : norig;
-                if (oi < norig) {
-                    orig[oi] = (Origin){ ORIG_NONE, -1, 0 };
+
+            /* Propagate origins across this op's outputs. */
+            if (nb_oargs > 0 && op->opc != INDEX_op_call) {
+                Origin src = { ORIG_NONE, -1, 0 };
+                bool src_set = false;
+
+                for (unsigned k = 0; k < nb_iargs; k++) {
+                    const TCGTemp *its = arg_temp(op->args[nb_oargs + k]);
+                    Origin o;
+
+                    if (!its) {
+                        continue;
+                    }
+                    o = origin_of(s, orig, its);
+                    if (o.kind == ORIG_NONE) {
+                        continue;
+                    }
+                    if (!src_set) {
+                        src = o;
+                        src_set = true;
+                    } else if (o.kind == ORIG_REG && src.kind == ORIG_CONST) {
+                        /* a register input outranks a constant one */
+                        src = o;
+                    }
+                }
+
+                /*
+                 * A load's result is a load, not the origin of its address --
+                 * but the address register is worth keeping, because it is what
+                 * separates `ret` (through the stack pointer) from an indirect
+                 * jump through a loaded function pointer.
+                 */
+                if (op->opc == INDEX_op_qemu_ld_i32 ||
+                    op->opc == INDEX_op_qemu_ld_i64 ||
+                    op->opc == INDEX_op_qemu_ld_i128) {
+                    const TCGTemp *ats = arg_temp(op->args[nb_oargs]);
+                    Origin ao = ats ? origin_of(s, orig, ats)
+                                    : (Origin){ ORIG_NONE, -1, 0 };
+                    src.kind = ORIG_LOAD;
+                    src.reg = ao.kind == ORIG_REG ? ao.reg : -1;
+                    src.val = 0;
+                    src_set = true;
+                } else if (nb_iargs == 0) {
+                    src.kind = ORIG_NONE;
+                    src.reg = -1;
+                    src.val = 0;
+                }
+
+                for (unsigned k = 0; k < nb_oargs; k++) {
+                    const TCGTemp *ots = arg_temp(op->args[k]);
+                    size_t oi;
+
+                    if (!ots) {
+                        continue;
+                    }
+                    oi = ots - s->temps;
+                    if (oi >= norig) {
+                        continue;
+                    }
+                    orig[oi] = src_set ? src : (Origin){ ORIG_NONE, -1, 0 };
+
+                    /*
+                     * A constant assigned to a global between a goto_tb and its
+                     * exit_tb is the successor address, and the global it was
+                     * assigned to is the program counter.
+                     */
+                    if (in_goto_tb && temp_is_global(s, ots) &&
+                        src_set && src.kind == ORIG_CONST) {
+                        if (pc_global < 0) {
+                            pc_global = (int32_t)oi;
+                        }
+                        if ((int32_t)oi == pc_global) {
+                            if (src.val == insn->vaddr) {
+                                flags |= QEMU_PLUGIN_CTRL_SELF;
+                            }
+                            if (!have_target || target == fallthrough) {
+                                target = src.val;
+                                have_target = true;
+                            }
+                        }
+                    }
+
+                    /*
+                     * LINK through a register: the fall-through address, as a
+                     * constant, assigned to a guest register.  Excluding the PC
+                     * itself, which every direct branch assigns.
+                     */
+                    if (temp_is_global(s, ots) && src_set &&
+                        src.kind == ORIG_CONST && src.val == fallthrough &&
+                        (int32_t)oi != pc_global) {
+                        flags |= QEMU_PLUGIN_CTRL_LINK;
+                        link_reg = (int32_t)oi;
+                    }
+                }
+            } else if (op->opc == INDEX_op_call) {
+                /* A helper's outputs have no origin this walk can state. */
+                for (unsigned k = 0; k < nb_oargs; k++) {
+                    const TCGTemp *ots = arg_temp(op->args[k]);
+                    size_t oi = ots ? (size_t)(ots - s->temps) : norig;
+                    if (oi < norig) {
+                        orig[oi] = (Origin){ ORIG_NONE, -1, 0 };
+                    }
                 }
             }
         }
@@ -428,6 +490,9 @@ void insn_ctrl_classify(struct qemu_plugin_tb *ptb)
          */
         insn->ctrl_first_op = NULL;
         insn->ctrl_last_op = NULL;
+        insn->ctrl_borrow_first = NULL;
+        insn->ctrl_borrow_last = NULL;
+        insn->ctrl_borrow_lender = NULL;
     }
 }
 

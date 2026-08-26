@@ -881,6 +881,41 @@ const char *qemu_plugin_insn_decode_name(const struct qemu_plugin_insn *insn);
  * INCOMPLETE is the failure direction rule applied here: it means the walk
  * met something it could not account for, and a consumer must treat the
  * whole classification as absent rather than as a negative answer.
+ *
+ * WHOSE OPS ARE THEY.  On a delay-slot architecture the ops that perform a
+ * branch's transfer are not emitted while the branch is translated: MIPS
+ * leaves them to gen_branch(), which runs at the end of the DELAY SLOT's
+ * translate_insn().  Position in the op list therefore does not settle
+ * ownership, and reading it as if it did puts the transfer on the slot and
+ * leaves the branch reading empty.  The translator states the ownership
+ * instead -- it is the only party that knows -- and the classification
+ * follows the statement, so the branch is classified from ITS OWN ops
+ * together with the ops emitted on its behalf, and the slot from the ops
+ * that are actually the slot's.
+ *
+ * Two bits report the case where the statement cannot be completed inside
+ * one block, which is the delay-slot sibling of a page-straddling block:
+ *
+ *   PENDING  this instruction deferred its transfer and the ops performing
+ *            it were never emitted in this block -- the block ended between
+ *            a branch and its delay slot.  The classification is INCOMPLETE
+ *            in the INCOMPLETE sense: whatever bits ARE set were read off
+ *            real ops, and at least one edge is missing, so a consumer must
+ *            not read an absent bit as a negative answer.  It must get the
+ *            class from the block that holds the slot.
+ *
+ *            PENDING therefore DOES occur together with TRANSFER, and the
+ *            case is not exotic: a MIPS R6 compact branch emits its TAKEN
+ *            edge itself and leaves only the not-taken edge to the forbidden
+ *            slot, so a block ending on one reads TRANSFER | DIRECT with
+ *            CONDITIONAL missing -- which is precisely the bit a consumer
+ *            must not conclude anything from.
+ *
+ *   FOREIGN  ops emitted during this instruction performed the deferred
+ *            transfer of an instruction that is NOT in this block, so they
+ *            have been excluded from this instruction's classification.
+ *            This instruction is not a branch; the one before this block is.
+ *            Its own ops are classified normally and that answer is complete.
  */
 #define QEMU_PLUGIN_CTRL_TRANSFER     (1u << 0)  /* ends control flow      */
 #define QEMU_PLUGIN_CTRL_DIRECT       (1u << 1)  /* a goto_tb successor    */
@@ -891,6 +926,11 @@ const char *qemu_plugin_insn_decode_name(const struct qemu_plugin_insn *insn);
 #define QEMU_PLUGIN_CTRL_TGT_LOAD     (1u << 6)  /* target came from a load */
 #define QEMU_PLUGIN_CTRL_NOCHAIN      (1u << 7)  /* exit_tb, no successor  */
 #define QEMU_PLUGIN_CTRL_INCOMPLETE   (1u << 8)  /* unaccounted-for op     */
+#define QEMU_PLUGIN_CTRL_PENDING      (1u << 9)  /* transfer deferred past
+                                                    the end of this block  */
+#define QEMU_PLUGIN_CTRL_FOREIGN      (1u << 10) /* ops here performed an
+                                                    earlier block's
+                                                    deferred transfer      */
 #define QEMU_PLUGIN_CTRL_VALID        (1u << 31) /* the walk ran           */
 
 /**

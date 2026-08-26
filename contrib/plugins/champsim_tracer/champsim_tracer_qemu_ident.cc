@@ -59,8 +59,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #include "champsim_tracer_qemu_ident.h"
+#include "champsim_tracer.h"
 
 /* The per-ISA classification tables, for the Capstone half of each row. */
 extern const InsnClassification *const isa_insn_class[];
@@ -88,6 +90,191 @@ uint64_t g_tier_seen[3];
 uint64_t g_op_agree, g_op_disagree;
 uint64_t g_br_agree, g_br_disagree;
 uint64_t g_op_row_unknown;     /* row says GEN_OP_UNKNOWN: nothing to check */
+
+/*
+ * THE LENGTH ARM.  Independent of the identity table -- it runs on all four
+ * targets, x86_64 included, because instruction length is a fact QEMU states
+ * for every instruction it translates whether or not a decodetree pattern
+ * named it.
+ *
+ * QEMU's answer is the translator's own pc advance (plugin_gen_insn_end:
+ * insn->len = db->pc_next - vaddr), i.e. the number of bytes the emulator
+ * consumed to produce the code it then ran.  Capstone's answer is cs_insn
+ * ->size for the same address.  They are scored against each other over a
+ * window WIDER than QEMU's answer wherever the TB supplies one, so Capstone
+ * is free to claim a longer instruction and be caught at it; where the
+ * window is exactly QEMU's length (the last instruction of a TB, whose
+ * successor bytes this pass does not have) Capstone is bounded by the
+ * number under test and the sample is tallied apart rather than counted as
+ * an agreement it could not have failed.
+ */
+uint64_t g_len_seen;          /* instructions with both answers available   */
+uint64_t g_len_agree;
+uint64_t g_len_disagree;
+uint64_t g_len_cap_failed;    /* Capstone would not decode the window       */
+uint64_t g_len_window_bound;  /* subset of seen: window == QEMU's own answer */
+uint64_t g_len_wide_seen;     /* subset of seen: window strictly wider       */
+uint64_t g_len_wide_disagree; /* the disagreements that a wide window found  */
+GHashTable *g_lensig;
+
+/*
+ * THE BRANCH ARM.  Also independent of the identity table, and for a
+ * stronger reason than the length arm's: what it scores against the tracer
+ * is not a decodetree row's .branch_type column -- e6711c158b measured that
+ * column and found it unusable, because one pattern carries architecturally
+ * different instructions (disas_a64/ORR_r is both `mov` and `orr`) and one
+ * column cannot be right for all of its traffic.
+ *
+ * This reads the ops the translator EMITTED instead.  A pattern name is a
+ * name; goto_tb, goto_ptr, a link constant and a self-edge are the transfer
+ * itself, and they do not blur across aliases -- `c.j` and `c.jal` share one
+ * decodetree pattern and one Capstone id, and differ in exactly the fact
+ * this arm reads, which is whether a link value was published.
+ */
+uint64_t g_br2_seen;              /* QEMU stated a classification         */
+uint64_t g_br2_unavail;           /* no VALID bit -- nothing to score      */
+uint64_t g_br2_incomplete;        /* the walk refused                      */
+uint64_t g_br2_agree;
+uint64_t g_br2_disagree;
+uint64_t g_br2_redispatch;        /* DIRECT to fall-through, uncond, no link */
+GHashTable *g_br2sig;
+GHashTable *g_br2_redisp_sig;
+
+/*
+ * THE LINK REGISTER, LEARNED.
+ *
+ * Not looked up.  Every instruction QEMU says published a return address
+ * names where it put it, so the set of link registers is the set of places
+ * calls have put one, and the set of stack pointers is the set of registers
+ * calls have addressed a return-address store through.  Two sets, filled by
+ * observation, and a return is then an indirect transfer whose target came
+ * out of one of them.
+ *
+ * The alternative was a name, and the name does not survive contact: on
+ * aarch64 the TCG global is `lr` while the register table -- QEMU's own,
+ * in the GDB stub's vocabulary -- calls the same register `x30`, so a
+ * name-keyed test silently fails to recognise every aarch64 return.  It DID
+ * fail, on 127 of them, before this replaced it.
+ */
+uint64_t g_link_reg_mask;        /* TCG globals a call has linked INTO      */
+uint64_t g_link_addr_mask;       /* TCG globals a call has stored THROUGH   */
+
+void note_link_site(int32_t link_reg, int32_t link_addr_reg)
+{
+    if (link_reg >= 0 && link_reg < 64) {
+        g_link_reg_mask |= 1ull << link_reg;
+    }
+    if (link_addr_reg >= 0 && link_addr_reg < 64) {
+        g_link_addr_mask |= 1ull << link_addr_reg;
+    }
+}
+
+bool is_link_reg(int32_t r)
+{
+    return r >= 0 && r < 64 && (g_link_reg_mask & (1ull << r));
+}
+
+bool is_stack_reg(int32_t r)
+{
+    return r >= 0 && r < 64 && (g_link_addr_mask & (1ull << r));
+}
+
+/* The generic register a TCG global index names, resolved once. */
+std::vector<uint8_t> g_ctrl_reg_gen;
+bool g_ctrl_regs_ready;
+
+uint8_t ctrl_reg_generic(int32_t idx)
+{
+    if (idx < 0) {
+        return REG_NONE;
+    }
+    if (!g_ctrl_regs_ready) {
+        unsigned n = qemu_plugin_dataflow_nregs();
+        g_ctrl_reg_gen.assign(n, (uint8_t)REG_NONE);
+        for (unsigned i = 0; i < n; i++) {
+            const char *nm = qemu_plugin_dataflow_reg_name(i, nullptr, nullptr);
+            g_ctrl_reg_gen[i] = nm ? generic_for_qemu_name(nm)
+                                   : (uint8_t)REG_NONE;
+        }
+        g_ctrl_regs_ready = true;
+    }
+    return (unsigned)idx < g_ctrl_reg_gen.size() ? g_ctrl_reg_gen[idx]
+                                                 : (uint8_t)REG_NONE;
+}
+
+/*
+ * The one place a NAME is turned into a CLASS, and it is TCG's vocabulary
+ * being combined, not an ISA's being looked up.  See the QEMU_PLUGIN_CTRL_*
+ * contract in qemu-plugin.h for why the combination is the consumer's job.
+ */
+uint8_t ctrl_branch_type(uint32_t f, int32_t tgt_reg, int32_t addr_reg,
+                         bool *redispatch, uint64_t pc, uint64_t len,
+                         uint64_t target)
+{
+    *redispatch = false;
+
+    if (!(f & QEMU_PLUGIN_CTRL_TRANSFER)) {
+        return BRANCH_NONE;
+    }
+
+    bool dir  = (f & QEMU_PLUGIN_CTRL_DIRECT) != 0;
+    bool ind  = (f & QEMU_PLUGIN_CTRL_INDIRECT) != 0;
+    bool cond = (f & QEMU_PLUGIN_CTRL_CONDITIONAL) != 0;
+    bool link = (f & QEMU_PLUGIN_CTRL_LINK) != 0;
+
+    /*
+     * A self-edge among the static successors is how QEMU continues a string
+     * operation: the instruction re-enters itself until its count runs out.
+     * That IS the tracer's BRANCH_REP and it is stated structurally, without
+     * a prefix byte being consulted.
+     */
+    if ((f & QEMU_PLUGIN_CTRL_SELF) && dir && !ind) {
+        return BRANCH_REP;
+    }
+
+    if (link) {
+        return ind ? BRANCH_INDIRECT_CALL : BRANCH_DIRECT_CALL;
+    }
+
+    if (ind) {
+        /*
+         * Learned first, named second.  ctrl_reg_generic() is kept as a
+         * second opinion for the case where a return is met before any call
+         * has been -- it cannot happen in a program that was entered by one,
+         * but a zero that depends on execution order is not a zero.
+         */
+        if (is_link_reg(tgt_reg)) {
+            return BRANCH_RETURN;
+        }
+        if ((f & QEMU_PLUGIN_CTRL_TGT_LOAD) && is_stack_reg(addr_reg)) {
+            return BRANCH_RETURN;
+        }
+        if (ctrl_reg_generic(tgt_reg) == REG_LR) {
+            return BRANCH_RETURN;
+        }
+        if ((f & QEMU_PLUGIN_CTRL_TGT_LOAD) &&
+            ctrl_reg_generic(addr_reg) == REG_SP) {
+            return BRANCH_RETURN;
+        }
+        return BRANCH_INDIRECT_JUMP;
+    }
+
+    if (cond) {
+        return BRANCH_COND_DIRECT;
+    }
+    /*
+     * An unconditional, unlinked, statically-known successor equal to the
+     * NEXT instruction is QEMU re-dispatching rather than the guest
+     * branching -- how a translator ends a block after a state change it
+     * cannot carry across (a cache maintenance op, an x86 segment reload).
+     * `jmp .+len` is architecturally a branch and lands here too, so the
+     * class is COUNTED rather than folded into BRANCH_NONE.
+     */
+    if (target == pc + len) {
+        *redispatch = true;
+    }
+    return BRANCH_DIRECT_JUMP;
+}
 
 /* Which rows were reached at all -- the table's live coverage. */
 GHashTable *g_rows_hit;        /* id -> (gpointer)1 */
@@ -236,6 +423,123 @@ unsigned qemu_ident_install(TraceISA isa)
     return bad;
 }
 
+void qemu_ident_note_ctrl(const struct qemu_plugin_insn *insn,
+                          const qemu_plugin_insn_info *info,
+                          uint8_t tracer_bt, const char *qname,
+                          uint64_t pc, uint8_t len)
+{
+    uint32_t f = qemu_plugin_insn_ctrl_flags(insn);
+
+    g_mutex_lock(&g_lock);
+    if (!(f & QEMU_PLUGIN_CTRL_VALID)) {
+        g_br2_unavail++;
+        g_mutex_unlock(&g_lock);
+        return;
+    }
+    if (f & QEMU_PLUGIN_CTRL_INCOMPLETE) {
+        g_br2_incomplete++;
+        g_mutex_unlock(&g_lock);
+        return;
+    }
+
+    bool redispatch = false;
+    uint64_t target = qemu_plugin_insn_ctrl_target(insn);
+    if (f & QEMU_PLUGIN_CTRL_LINK) {
+        note_link_site(qemu_plugin_insn_ctrl_link_reg(insn),
+                       qemu_plugin_insn_ctrl_link_addr_reg(insn));
+    }
+    uint8_t qbt = ctrl_branch_type(f,
+                                   qemu_plugin_insn_ctrl_target_reg(insn),
+                                   qemu_plugin_insn_ctrl_addr_reg(insn),
+                                   &redispatch, pc, len, target);
+    g_br2_seen++;
+    if (redispatch) {
+        g_br2_redispatch++;
+        if (g_detail) {
+            char sig[224];
+            g_snprintf(sig, sizeof(sig), "%-16s %-26s tracer=%s",
+                       info ? info->mnemonic : "-", qname ? qname : "-",
+                       branch_type_name_or_unknown(tracer_bt));
+            tally(&g_br2_redisp_sig, sig);
+        }
+        g_mutex_unlock(&g_lock);
+        return;
+    }
+    if (qbt == tracer_bt) {
+        g_br2_agree++;
+    } else {
+        g_br2_disagree++;
+        if (g_detail) {
+            char sig[256];
+            g_snprintf(sig, sizeof(sig),
+                       "%-16s qemu=%-18s tracer=%-18s flags=%03x %s",
+                       info ? info->mnemonic : "-",
+                       branch_type_name_or_unknown(qbt),
+                       branch_type_name_or_unknown(tracer_bt),
+                       f & 0x1ff, qname ? qname : "-");
+            tally(&g_br2sig, sig);
+        }
+    }
+    g_mutex_unlock(&g_lock);
+}
+
+void qemu_ident_note_length(uint64_t pc, uint8_t qlen, uint8_t caplen,
+                            uint8_t window_len, const char *cap_mnem,
+                            const char *qname, const uint8_t *bytes)
+{
+    g_mutex_lock(&g_lock);
+    if (caplen == 0) {
+        g_len_cap_failed++;
+        if (g_detail) {
+            char sig[224];
+            char hex[3 * 16 + 1];
+            unsigned n = window_len > 16 ? 16 : window_len;
+            for (unsigned i = 0; i < n; i++) {
+                g_snprintf(hex + 3 * i, 4, "%02x ", bytes[i]);
+            }
+            hex[3 * n] = 0;
+            g_snprintf(sig, sizeof(sig),
+                       "CAPSTONE REFUSED  qlen=%u qemu=%-24s [%s]",
+                       qlen, qname ? qname : "-", hex);
+            tally(&g_lensig, sig);
+        }
+        g_mutex_unlock(&g_lock);
+        return;
+    }
+
+    g_len_seen++;
+    bool wide = window_len > qlen;
+    if (wide) {
+        g_len_wide_seen++;
+    } else {
+        g_len_window_bound++;
+    }
+    if (caplen == qlen) {
+        g_len_agree++;
+    } else {
+        g_len_disagree++;
+        if (wide) {
+            g_len_wide_disagree++;
+        }
+        if (g_detail) {
+            char sig[256];
+            char hex[3 * 16 + 1];
+            unsigned n = window_len > 16 ? 16 : window_len;
+            for (unsigned i = 0; i < n; i++) {
+                g_snprintf(hex + 3 * i, 4, "%02x ", bytes[i]);
+            }
+            hex[3 * n] = 0;
+            g_snprintf(sig, sizeof(sig),
+                       "qemu=%u cap=%u  win=%u  %-14s %-24s [%s]",
+                       qlen, caplen, window_len,
+                       cap_mnem ? cap_mnem : "-", qname ? qname : "-", hex);
+            tally(&g_lensig, sig);
+        }
+    }
+    (void)pc;
+    g_mutex_unlock(&g_lock);
+}
+
 void qemu_ident_note(const struct qemu_plugin_insn *insn,
                      const qemu_plugin_insn_info *info)
 {
@@ -343,6 +647,67 @@ void qemu_ident_note(const struct qemu_plugin_insn *insn,
 
 void qemu_ident_report(GString *report)
 {
+    if (g_len_seen || g_len_cap_failed) {
+        g_string_append_printf(report,
+            "\n--- instruction LENGTH: the translator's pc advance against "
+            "the disassembler's ---\n"
+            "QEMU's answer is what the emulator consumed to produce the code "
+            "it ran (db->pc_next - vaddr).  Capstone's is cs_insn->size over "
+            "the same address.  Where the TB supplies bytes past the "
+            "instruction, Capstone is given them, so it is free to claim a "
+            "LONGER instruction and be caught at it; where it is not, the "
+            "sample is counted apart because Capstone was bounded by the "
+            "number under test.\n"
+            "  scored                                 %10" PRIu64 "\n"
+            "    of which given a WIDER window        %10" PRIu64 "\n"
+            "    of which bounded by QEMU's answer    %10" PRIu64 "\n"
+            "  agree                                  %10" PRIu64 "\n"
+            "  DISAGREE                               %10" PRIu64
+            "   (wide-window subset %" PRIu64 ")\n"
+            "  Capstone refused the window            %10" PRIu64 "\n",
+            g_len_seen, g_len_wide_seen, g_len_window_bound,
+            g_len_agree, g_len_disagree, g_len_wide_disagree,
+            g_len_cap_failed);
+        if (g_detail) {
+            dump_tally(report, g_lensig, "length disagreements", 40);
+        } else {
+            g_string_append_printf(report,
+                "  (set CST_QEMU_IDENT_AUDIT=1 for the per-encoding "
+                "disagreements)\n");
+        }
+    }
+
+    if (g_br2_seen || g_br2_unavail) {
+        g_string_append_printf(report,
+            "\n--- BRANCH class: the transfer the translator PERFORMED "
+            "against the one the mnemonic table names ---\n"
+            "QEMU's answer is read off the ops that carried out the "
+            "transfer: goto_tb is a compile-time successor, goto_ptr a "
+            "computed one, two distinct goto_tb edges a choice, a constant "
+            "equal to (pc + len) published into a register or onto the stack "
+            "is a LINK, and a static successor equal to the instruction's own "
+            "address is a string operation's self-edge.  None of it is a "
+            "pattern NAME, which is what makes it immune to the alias "
+            "blurring that made the identity table's .branch_type column "
+            "unusable.\n"
+            "  scored                                 %10" PRIu64 "\n"
+            "  agree                                  %10" PRIu64 "\n"
+            "  DISAGREE                               %10" PRIu64 "\n"
+            "  re-dispatch (static edge == next insn) %10" PRIu64 "\n"
+            "  no classification exported             %10" PRIu64 "\n"
+            "  walk refused (INCOMPLETE)              %10" PRIu64 "\n",
+            g_br2_seen, g_br2_agree, g_br2_disagree, g_br2_redispatch,
+            g_br2_unavail, g_br2_incomplete);
+        if (g_detail) {
+            dump_tally(report, g_br2sig, "branch-class disagreements", 40);
+            dump_tally(report, g_br2_redisp_sig, "re-dispatch signatures", 20);
+        } else {
+            g_string_append_printf(report,
+                "  (set CST_QEMU_IDENT_AUDIT=1 for the per-encoding "
+                "disagreements)\n");
+        }
+    }
+
     if (!g_have_table) {
         g_string_append_printf(report,
             "\n--- QEMU decode identity: no table for this target ---\n"

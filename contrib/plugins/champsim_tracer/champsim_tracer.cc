@@ -10720,10 +10720,84 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
      * Unlike irdf this is NOT optional -- a generated table that only gets
      * read when an option is passed is a table nobody reads.
      */
+    std::vector<const char *> qnames(canonical_n_insns, nullptr);
     for (uint32_t i = 0; i < raw_n_insns; i++) {
         if (canonical_first[i]) {
-            qemu_ident_note(qemu_plugin_tb_get_insn(tb, i),
-                            &insn_info[canonical_index[i]]);
+            struct qemu_plugin_insn *qi = qemu_plugin_tb_get_insn(tb, i);
+            uint32_t c = canonical_index[i];
+            qemu_ident_note(qi, &insn_info[c]);
+            qnames[c] = qemu_plugin_insn_decode_name(qi);
+
+            /*
+             * The branch arm needs the class the TRACER would publish, which
+             * is decode_detail_to_generic's answer and not the mnemonic
+             * table's raw row -- the per-instance alias repairs (riscv jal
+             * vs j, aarch64 b vs b.<cc>, mips jr $ra) are exactly the rows
+             * where the two accounts are worth comparing, so scoring the
+             * unrepaired row would be scoring a strawman.
+             */
+            /* Heap-backed: an InsnFieldsScratch in STATIC TLS overruns
+             * glibc's dlopen surplus and the .so stops loading. */
+            thread_local std::unique_ptr<InsnFieldsScratch> bt_s;
+            if (!bt_s) {
+                bt_s = std::make_unique<InsnFieldsScratch>();
+            }
+            insn_fields_scratch_reset(bt_s.get());
+            decode_detail_to_generic(insn_pcs[c], &insn_info[c], &bt_s->f,
+                                     nullptr);
+            qemu_ident_note_ctrl(qi, &insn_info[c], bt_s->f.branch_type,
+                                 qnames[c], insn_pcs[c], insn_sizes[c]);
+        }
+    }
+
+    /*
+     * The LENGTH arm of the same reader, and the reason it is here rather
+     * than beside the decode above: an honest comparison needs Capstone to
+     * be given MORE bytes than QEMU's answer, and the only place a wider
+     * window of REAL guest bytes exists without a second guest read is this
+     * TB's own canonical stream.  The instructions of a TB are contiguous,
+     * so the window for canonical insn k is k's bytes followed by k+1's,
+     * k+2's ... for as long as each starts exactly where the last ended.
+     * The final instruction of a TB has no successor here and is therefore
+     * bounded by the number under test -- counted, but counted apart.
+     *
+     * The decode above CANNOT serve: it hands cap_decode insn_sizes[out],
+     * which is QEMU's own answer, so Capstone there is incapable of
+     * returning anything longer and a comparison against it would be a
+     * measurement of the bound rather than of the decoder.
+     */
+    if (cst_cap_arch >= 0) {
+        for (uint32_t k = 0; k < canonical_n_insns; k++) {
+            uint8_t window[MAX_INSN_BYTES];
+            uint8_t wlen = 0;
+            uint64_t at = insn_pcs[k];
+            for (uint32_t j = k; j < canonical_n_insns && wlen < MAX_INSN_BYTES;
+                 j++) {
+                if (insn_pcs[j] != at) {
+                    break;      /* not contiguous: stop the window here */
+                }
+                uint8_t take = insn_sizes[j];
+                if ((uint32_t)wlen + take > MAX_INSN_BYTES) {
+                    take = (uint8_t)(MAX_INSN_BYTES - wlen);
+                }
+                memcpy(&window[wlen],
+                       &insn_bytes[(size_t)j * MAX_INSN_BYTES], take);
+                wlen = (uint8_t)(wlen + take);
+                at += insn_sizes[j];
+            }
+            if (wlen == 0) {
+                continue;
+            }
+            qemu_plugin_insn_info wide;
+            uint8_t caplen = 0;
+            const char *mnem = nullptr;
+            if (qemu_plugin_cap_decode(cst_cap_arch, cst_cap_mode, window,
+                                       wlen, insn_pcs[k], &wide)) {
+                caplen = wide.insn_size;
+                mnem = wide.mnemonic;
+            }
+            qemu_ident_note_length(insn_pcs[k], insn_sizes[k], caplen, wlen,
+                                   mnem, qnames[k], window);
         }
     }
 

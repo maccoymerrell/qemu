@@ -1714,6 +1714,13 @@ void altmint_conditional_alternate(const InsnFields *terminal,
 void report_undecodable_block(uint64_t pc);
 
 /* Defined in champsim_tracer_decode.cc */
+/*
+ * The generic dependency slot a QEMU register name denotes, resolved through
+ * the QEMU-indexed register tables.  Defined in champsim_tracer_irdf.cc.
+ * Returns REG_ID_COUNT when no table is installed or no row matches.
+ */
+uint8_t generic_for_qemu_name(const char *name);
+
 void decode_detail_to_generic(uint64_t pc,
                               const qemu_plugin_insn_info *info,
                               InsnFields *out,

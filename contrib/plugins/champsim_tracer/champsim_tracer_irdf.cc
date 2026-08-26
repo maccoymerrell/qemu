@@ -448,6 +448,15 @@ bool name_matches(const char *tracer_name, const char *qemu_name)
     return false;
 }
 
+}  /* namespace -- reopened below; the next function is shared. */
+
+/*
+ * The QEMU-register-name -> generic-slot lookup, out of the anonymous
+ * namespace because the branch arm in champsim_tracer_qemu_ident.cc resolves
+ * the same thing for a different reason: it has a TCG global index naming an
+ * indirect branch's target, and needs to know whether that register is the
+ * link register.  One authority, two readers.
+ */
 uint8_t generic_for_qemu_name(const char *name)
 {
     if (!active_reg_table || active_reg_table_size == 0) {
@@ -465,6 +474,8 @@ uint8_t generic_for_qemu_name(const char *name)
     }
     return REG_ID_COUNT;
 }
+
+namespace {
 
 void irdf_init_locked(void)
 {

@@ -1,7 +1,22 @@
 /*
  * idprobe: dump QEMU's own decode identity for every translated insn.
- * One line per translated instruction:
- *   <vaddr> <decode_id> <decode_name> | <capstone disas>
+ *
+ * One TAB-separated line per translated instruction:
+ *
+ *   <vaddr> <decode_id> <decode_name> <bytes> <disas> <capstone_insn_id>
+ *
+ * The last field is what lets the identity be joined to the tracer's
+ * classification EXACTLY.  Joining on the disassembly TEXT instead does
+ * not work and does not fail loudly: QEMU prints x86 in AT&T syntax with
+ * the operand size spelled into the mnemonic (`cmpq`, `testb`, `movl`)
+ * while the Capstone constants the tables are keyed on are unsuffixed,
+ * so every suffixed spelling silently finds no row -- and `movq` finds
+ * the WRONG one, the SSE X86_INS_MOVQ rather than the X86_INS_MOV that
+ * a 64-bit register move actually decodes to.  A text join therefore
+ * reports a real classification as missing on the ISA where most
+ * instructions carry a suffix, and reports a wrong one as present.
+ * The id is the same enum the tables index.  0 means the boundary
+ * refused the instruction, and that is recorded rather than dropped.
  */
 #include <inttypes.h>
 #include <stdio.h>
@@ -36,7 +51,12 @@ static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         for (size_t k = 0; k < len; k++) {
             fprintf(out, "%02x", buf[k]);
         }
-        fprintf(out, "\t%s\n", d ? d : "?");
+        qemu_plugin_insn_info detail;
+        uint32_t cap_id = 0;
+        if (qemu_plugin_insn_detail(insn, &detail)) {
+            cap_id = detail.insn_id;
+        }
+        fprintf(out, "\t%s\t%" PRIu32 "\n", d ? d : "?", cap_id);
         g_free(d);
     }
     g_mutex_unlock(&lock);

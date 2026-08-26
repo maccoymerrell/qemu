@@ -4137,6 +4137,52 @@ def format_empty_reg_entry(const_name: str) -> str:
     return f"    [{const_name}] = {{}},"
 
 
+def full_entry(info: IsaInfo, const_name: str,
+               existing: dict[str, Entry]) -> Entry | None:
+    """The COMPLETE classification of one Capstone constant.
+
+    Every field an InsnClassification row carries -- opcode, branch
+    type, flags, .refine, .dep_refine and the lane pair -- assembled in
+    one place.  It is factored out of generated_body because the
+    QEMU-identity tables carry the same payload under a different key,
+    and a second copy of this assembly would be a second answer: a row
+    that grew a .dep_refine under one key and not the other is the
+    exact defect a single source of truth exists to make impossible.
+
+    Returns None when the constant carries no classification at all.
+    """
+    new = classify(info, const_name)
+    old = existing.get(const_name)
+    if new.op == "GEN_OP_UNKNOWN" and old is None:
+        return None
+    if new.op == "GEN_OP_UNKNOWN" and old is not None:
+        new = old.without_refine()
+    refine = old.refine if old and old.refine else None
+    # Classifier-driven .refine: AArch64 has one Capstone insn id
+    # per mnemonic for both the scalar-FP and packed-vector forms
+    # (FDIV Dd vs FDIV Vd.2D).  The static table classifies the
+    # scalar FP_* op; refine_arm64_fp_vec promotes it to the VEC_*
+    # twin at decode when the operands show a vector arrangement.
+    # Only fills an otherwise-empty .refine (manual fixups win).
+    if (refine is None and info.key == "aarch64"
+            and new.op in FP_VEC_PROMOTE_OPS):
+        refine = "refine_arm64_fp_vec"
+    # AArch64 CMP / CMN / TST are aliases for the flag-writing
+    # SUBS / ADDS / ANDS forms with the destination register set
+    # to XZR / WZR.  Capstone returns the underlying SUBS/ADDS/ANDS
+    # insn id, so the static table picks GEN_OP_INT_SUB /
+    # GEN_OP_INT_ADD / GEN_OP_AND.  refine_arm64_cmp_alias detects
+    # the flag-only shape (REG_ZERO is the only register dst) and
+    # promotes opcode to CMP / TEST.  Only fills empty .refine.
+    if (refine is None and info.key == "aarch64"
+            and const_name in CMP_ALIAS_PROMOTE_INSNS):
+        refine = "refine_arm64_cmp_alias"
+    dep_refine = classify_dep_refine(info, const_name, new)
+    lane_kind, lane_par = classify_lane_info(info, const_name, new.op)
+    return Entry(new.op, new.branch, new.flags, refine, dep_refine,
+                 lane_kind, lane_par)
+
+
 def generated_body(info: IsaInfo, constants: list[str], existing: dict[str, Entry]) -> str:
     """Render the InsnClassification table body.
 
@@ -4160,39 +4206,11 @@ def generated_body(info: IsaInfo, constants: list[str], existing: dict[str, Entr
     # initialised. */
     lines.append(format_empty_entry(info.prefix + "INVALID"))
     for const_name in constants:
-        new = classify(info, const_name)
-        old = existing.get(const_name)
-        if new.op == "GEN_OP_UNKNOWN" and old is None:
+        new = full_entry(info, const_name, existing)
+        if new is None:
             lines.append(format_empty_entry(const_name))
             continue
-        if new.op == "GEN_OP_UNKNOWN" and old is not None:
-            new = old.without_refine()
-        refine = old.refine if old and old.refine else None
-        # Classifier-driven .refine: AArch64 has one Capstone insn id
-        # per mnemonic for both the scalar-FP and packed-vector forms
-        # (FDIV Dd vs FDIV Vd.2D).  The static table classifies the
-        # scalar FP_* op; refine_arm64_fp_vec promotes it to the VEC_*
-        # twin at decode when the operands show a vector arrangement.
-        # Only fills an otherwise-empty .refine (manual fixups win).
-        if (refine is None and info.key == "aarch64"
-                and new.op in FP_VEC_PROMOTE_OPS):
-            refine = "refine_arm64_fp_vec"
-        # AArch64 CMP / CMN / TST are aliases for the flag-writing
-        # SUBS / ADDS / ANDS forms with the destination register set
-        # to XZR / WZR.  Capstone returns the underlying SUBS/ADDS/ANDS
-        # insn id, so the static table picks GEN_OP_INT_SUB /
-        # GEN_OP_INT_ADD / GEN_OP_AND.  refine_arm64_cmp_alias detects
-        # the flag-only shape (REG_ZERO is the only register dst) and
-        # promotes opcode to CMP / TEST.  Only fills empty .refine.
-        if (refine is None and info.key == "aarch64"
-                and const_name in CMP_ALIAS_PROMOTE_INSNS):
-            refine = "refine_arm64_cmp_alias"
-        dep_refine = classify_dep_refine(info, const_name, new)
-        lane_kind, lane_par = classify_lane_info(info, const_name,
-                                                 new.op)
-        new = Entry(new.op, new.branch, new.flags, refine, dep_refine,
-                    lane_kind, lane_par)
-        if dep_refine:
+        if new.dep_refine:
             dep_assigned += 1
         lines.append(format_entry(const_name, new))
         emitted += 1
@@ -4662,6 +4680,31 @@ QEMU_IDENT_TARGETS: dict[str, str] = {
     "mips": "mipsel-linux-user",
 }
 
+# i386 is not a decodetree target and has no generated decoder to read.
+# Its identity universe is the SOURCE table QEMU dispatches on, and the
+# id is the source line of the macro expansion, so the universe is read
+# from the source file rather than from the build tree.
+QEMU_IDENT_SOURCE_TABLES: dict[str, str] = {
+    "x86": "target/i386/tcg/decode-new.c.inc",
+}
+
+# One X86_OP_* macro site.  Group 1 is the macro suffix (the emitter
+# fact), group 2 the first argument, group 3 the second -- for the
+# three-operand forms that is op0_, the DESTINATION template, and it is
+# spelled `None` on a row that produces no destination.
+X86_SLOT_RE = re.compile(
+    r'\bX86_OP_(ENTRY[0-4rw]{0,2}|GROUP[0-3rw]{0,2}|LEAF|SET_GEN)'
+    r'\s*\(\s*([A-Za-z0-9_]+)\s*(?:,\s*([A-Za-z0-9_]+))?')
+
+# Macro forms whose expansion sets op0 = None unconditionally, i.e. the
+# row states that QEMU computes a value and writes it nowhere.  This is
+# the emitter fact that separates `cmp` from `sub`: both dispatch to
+# gen_SUB and both are NAMED SUB, and only the operand template says
+# which one the row is.  X86_OP_ENTRY3 / ENTRY4 / GROUP3 take op0_ as an
+# argument instead, so they are decided per site from group 3.
+X86_NO_DEST_KINDS = frozenset(("ENTRYrr", "ENTRYr", "ENTRY0", "GROUP0"))
+X86_OP0_ARG_KINDS = frozenset(("ENTRY3", "ENTRY4", "GROUP3"))
+
 # Decoders a target has that decodetree does not generate.  Their identity
 # tables are in the source tree, in the same row format.
 QEMU_IDENT_HANDWRITTEN = {
@@ -4678,14 +4721,99 @@ class QemuIdent:
     name: str            # "disas_a64/ADD_i" -- decoder-qualified
     src_file: str
     src_line: int
+    # The EMITTER FACT, where the target's decode table carries one.  On
+    # i386 this is the X86_OP_* macro the row was written with, and the
+    # macro states the row's operand template: X86_OP_ENTRYrr expands to
+    # op0 = None, i.e. QEMU computes the result and throws it away.  That
+    # is how `cmp` is spelled through a slot named SUB, and it is the only
+    # thing in the table that says so.  decodetree targets carry
+    # "decodetree" -- their pattern name is the identity and there is no
+    # second fact to read.
+    kind: str = "decodetree"
 
     @property
     def decoder(self) -> str:
+        """The decode function the rule lives in.
+
+        decodetree qualifies every pattern with it (`disas_a64/ADD_i`);
+        i386's table is one file and its rows carry a bare generator
+        name, so the whole table is one decoder and says so.
+        """
+        if "/" not in self.name:
+            return "decode-new"
         return self.name.split("/", 1)[0]
 
     @property
     def pattern(self) -> str:
+        """The rule's own name, unqualified."""
+        if "/" not in self.name:
+            return self.name
         return self.name.split("/", 1)[1]
+
+
+def parse_x86_identities() -> list[QemuIdent]:
+    """Read i386's identity universe out of the decode table's SOURCE.
+
+    The i386 id IS the source line of the X86_OP_* expansion, so the
+    universe and the ids both come from the same scan, and the scan is
+    the only place the EMITTER FACT is visible: the macro suffix and,
+    for the three-operand forms, the op0_ argument.  Neither survives
+    into the build tree.
+
+    Fails loudly on a line carrying two slots, because that is the one
+    property the derivation depends on -- two rows on one line are one
+    id, and the export would be merging two decode rules silently.
+    """
+    path = ROOT / QEMU_IDENT_SOURCE_TABLES["x86"]
+    if not path.is_file():
+        raise SystemExit(f"{path} does not exist -- no i386 decode table to read")
+    rows: list[QemuIdent] = []
+    in_define = False
+    rel = str(path.relative_to(ROOT))
+    for lineno, line in enumerate(path.read_text().splitlines(), 1):
+        cont = line.endswith("\\")
+        # The macro DEFINITIONS expand X86_OP_ENTRY3 inside themselves;
+        # counting those would mint slots no row ever carries.
+        if line.lstrip().startswith("#define"):
+            in_define = cont
+            continue
+        if in_define:
+            in_define = cont
+            continue
+        for m in X86_SLOT_RE.finditer(line):
+            kind = m.group(1)
+            # X86_OP_SET_GEN(entry_, op) names the entry first and the
+            # generator second; every other form names the op first.
+            name = m.group(3) if kind == "SET_GEN" else m.group(2)
+            if kind in X86_OP0_ARG_KINDS and m.group(3) == "None":
+                kind = kind + "/noDest"
+            rows.append(QemuIdent(lineno, name, rel, lineno, kind))
+    if not rows:
+        raise SystemExit(
+            f"{path}: no X86_OP_* sites matched -- the scanner does not fit "
+            f"this source, and reporting an empty universe would read as "
+            f"'i386 has no decode identity' when the truth is 'nothing "
+            f"was measured'")
+    by_line: dict[int, list[str]] = {}
+    for r in rows:
+        by_line.setdefault(r.ident, []).append(r.name)
+    clashes = {k: v for k, v in by_line.items() if len(v) > 1}
+    if clashes:
+        for k, v in sorted(clashes.items()):
+            print(f"  SLOT COLLISION line {k}: {', '.join(v)}")
+        raise SystemExit(
+            f"x86: {len(clashes)} source lines carry more than one slot -- "
+            f"the exported id cannot tell them apart")
+    return rows
+
+
+def qemu_ident_universe(build_dir: Path | None, isa: str) -> list[QemuIdent]:
+    """The identity universe for one target, from wherever it lives."""
+    if isa in QEMU_IDENT_SOURCE_TABLES:
+        return parse_x86_identities()
+    if build_dir is None:
+        raise SystemExit(f"{isa}: a decodetree target needs --build-dir")
+    return parse_qemu_identities(build_dir, isa)
 
 
 def parse_qemu_identities(build_dir: Path, isa: str) -> list[QemuIdent]:
@@ -4750,34 +4878,142 @@ def parse_qemu_identities(build_dir: Path, isa: str) -> list[QemuIdent]:
     return rows
 
 
-def load_observed(paths: list[Path]) -> dict[int, dict[str, object]]:
-    """Fold idprobe TSV records into id -> {name, mnemonics: Counter}.
+# idprobe TSVs are named for the QEMU TARGET they came from, and the ids
+# inside are explicitly not comparable across targets.  Joining an
+# aarch64 TSV against the riscv universe would not fail -- it would
+# silently score one target's ids as another's residue -- so the routing
+# is by name and a file that names no target is refused rather than
+# guessed at.
+OBSERVED_ISA_TOKENS = {
+    "x86": ("x86", "i386"),
+    "aarch64": ("aarch64", "arm64"),
+    "riscv": ("riscv",),
+    "mips": ("mips",),
+}
 
-    An idprobe record is one OBSERVED decode: QEMU translated those bytes
-    and named the rule it used.  That is the evidence a mapping claim
-    needs; a pattern name that merely looks like a mnemonic is not.
+
+def _observed_matches_isa(path: Path, isa: str) -> bool:
+    stem = path.name.lower()
+    if not any(tok in stem for group in OBSERVED_ISA_TOKENS.values()
+               for tok in group):
+        raise SystemExit(
+            f"{path}: names no target, so which identity universe its ids "
+            f"belong to is a guess -- rename it to carry the target")
+    return any(tok in stem for tok in OBSERVED_ISA_TOKENS[isa])
+
+
+def enum_value_map(info: IsaInfo) -> dict[int, str]:
+    """Capstone insn-enum VALUE -> constant name.
+
+    The generated tables are designated arrays indexed by the enum
+    value, so the value is the key an observed decode arrives under.
+    Deriving it as "position in declaration order, INVALID = 0" is only
+    sound while the enum is dense, so that is CHECKED here rather than
+    assumed: an explicit initialiser anywhere in the instruction enum
+    would shift every constant after it and silently re-label the whole
+    observed set.
+    """
+    text = info.capstone_header.read_text()
+    start = text.index(info.prefix + "INVALID")
+    end = text.index(info.prefix + "ENDING", start)
+    body = text[start:end]
+    explicit = re.findall(re.escape(info.prefix) + r"[A-Z0-9_]+\s*=", body)
+    # INVALID = 0 is the one initialiser the derivation depends on.
+    explicit = [e for e in explicit if "INVALID" not in e]
+    if explicit:
+        raise SystemExit(
+            f"{info.capstone_header}: the {info.prefix}* enum carries "
+            f"explicit values ({', '.join(explicit[:4])}) -- position is no "
+            f"longer the value and every observed decode would be joined to "
+            f"the wrong row")
+    return {i + 1: c for i, c in enumerate(enum_constants(info))}
+
+
+def load_observed(paths: list[Path]) -> dict[int, dict[str, object]]:
+    """Fold idprobe TSV records into id -> {name, caps, mnem}.
+
+    An idprobe record is one OBSERVED decode: QEMU translated those
+    bytes, named the rule it used, and -- since the probe was extended
+    for this join -- reported the CAPSTONE ENUM VALUE the same bytes
+    decode to.  The enum value is what the classification tables are
+    indexed by, so the join is exact.
+
+    The disassembly TEXT is kept for the census to print and for
+    nothing else.  It is not a key: QEMU prints x86 in AT&T syntax with
+    the operand size spelled into the mnemonic, so `cmpq` and `testb`
+    match no Capstone constant at all while `movq` matches the WRONG
+    one.  A six-field record is therefore required; a five-field one is
+    the older probe and is refused rather than joined on text.
     """
     import collections
     obs: dict[int, dict[str, object]] = {}
     total = 0
     for p in paths:
-        for line in Path(p).read_text().splitlines():
+        for lineno, line in enumerate(Path(p).read_text().splitlines(), 1):
             f = line.split("\t")
             if len(f) < 5:
                 continue
+            # The record is parsed from BOTH ENDS, never by field index
+            # past the disassembly: a target's disassembly may itself
+            # contain tabs -- MIPS prints "move\tt9,ra" -- so field 5
+            # is the operand list there and not the Capstone id.  The
+            # id is the LAST field by construction.
+            if len(f) < 6:
+                raise SystemExit(
+                    f"{p}:{lineno}: five-field record -- this is the probe "
+                    f"from before the Capstone id was added, and joining it "
+                    f"would have to go through the disassembly text, which "
+                    f"is not a key.  Re-run idprobe.")
             ident = int(f[1])
-            if ident == 0:
-                total += 1
-                obs.setdefault(0, {"name": "-",
-                                   "mnem": collections.Counter()})
-                obs[0]["mnem"][f[4].split()[0] if f[4].strip() else "?"] += 1
-                continue
-            e = obs.setdefault(ident, {"name": f[2],
+            cap = int(f[-1])
+            disas = "\t".join(f[4:-1])
+            text = disas.split()[0] if disas.strip() else "?"
+            e = obs.setdefault(ident, {"name": f[2] if ident else "-",
+                                       "caps": collections.Counter(),
                                        "mnem": collections.Counter()})
-            e["mnem"][f[4].split()[0] if f[4].strip() else "?"] += 1
+            e["caps"][cap] += 1
+            e["mnem"][text] += 1
             total += 1
     if total == 0:
         raise SystemExit("no idprobe records read -- refusing to census nothing")
+    return obs
+
+
+def load_pairs(paths: list[Path]) -> dict[int, dict[str, object]]:
+    """Fold PAIR-CENSUS files into the same shape load_observed returns.
+
+    The pair census is written by the tracer itself
+    (CST_QEMU_IDENT_PAIRS=<path>) and carries exactly the join this
+    generator needs: (QEMU decode id, QEMU decode name, Capstone insn
+    id, count).  It is preferred over an idprobe TSV on every target
+    and REQUIRED on riscv64 and mipsel, where a standalone plugin's
+    qemu_plugin_insn_detail() reports insn_id 0 for every instruction --
+    QEMU enables its own Capstone for x86 and arm and not for those two,
+    so a probe written that way measures nothing and says so as a zero.
+
+    It carries no disassembly text, and does not need to: the text was
+    never the key.
+    """
+    import collections
+    obs: dict[int, dict[str, object]] = {}
+    total = 0
+    for path in paths:
+        for lineno, line in enumerate(Path(path).read_text().splitlines(), 1):
+            if line.startswith("#") or not line.strip():
+                continue
+            f = line.split("\t")
+            if len(f) != 4:
+                raise SystemExit(
+                    f"{path}:{lineno}: expected 4 fields, got {len(f)} -- "
+                    f"this is not a pair census")
+            ident, name, cap, count = int(f[0]), f[1], int(f[2]), int(f[3])
+            e = obs.setdefault(ident, {"name": name,
+                                       "caps": collections.Counter(),
+                                       "mnem": collections.Counter()})
+            e["caps"][cap] += count
+            total += count
+    if total == 0:
+        raise SystemExit("no pair records read -- refusing to census nothing")
     return obs
 
 
@@ -4809,6 +5045,9 @@ QID_OBSERVED = "QID_OBSERVED"        # QEMU decoded it; mnemonic seen with it
 QID_NAME_MATCHED = "QID_NAME_MATCHED"  # pattern name matches a Capstone
                                        # mnemonic, but no decode observed
 QID_NONE = "QID_NONE"                  # neither
+QID_SPLIT = "QID_SPLIT"                # observed, and the observations
+                                       # DISAGREE: this identity does not
+                                       # determine the classification
 
 
 def _pattern_mnemonic_candidates(pattern: str) -> list[str]:
@@ -4828,39 +5067,169 @@ def _pattern_mnemonic_candidates(pattern: str) -> list[str]:
     return out
 
 
-def qemu_ident_rows(info: IsaInfo, idents: list[QemuIdent],
-                    obs: dict[int, dict[str, object]]):
-    """Join the identity universe to the mnemonic tables.
+# The i386 emitter fact, and the only place a name is REFUSED because of
+# it.  `X86_OP_ENTRYrr` expands to op0 = None: QEMU computes the result
+# and the table writes it nowhere.  A row spelled that way whose name is
+# a value-producing two-operand ALU op is therefore NOT that op -- it is
+# the flags-only form, which is how `cmp` is spelled through a slot named
+# SUB and `test` through one named AND.  Those rows have to be OBSERVED;
+# the name may not stand in.
+#
+# The set is deliberately the group-1 ALU ops and nothing wider.  MUL,
+# IMUL, DIV and IDIV are ENTRYrr/ENTRYr as well and their destination is
+# architecturally implicit (rAX/rDX), so op0 = None there means "the
+# generator writes it itself", not "the result is discarded" -- refusing
+# those would be the gate mistaking a different fact for this one.
+X86_FLAGS_ONLY_REFUSED_OPS = frozenset((
+    "GEN_OP_INT_ADD", "GEN_OP_INT_SUB",
+    "GEN_OP_AND", "GEN_OP_OR", "GEN_OP_XOR",
+))
 
-    Returns (rows, stats).  A row is
-    (QemuIdent, Entry, tier, mnemonics-observed).
+
+def x86_emitter_refuses(ident: QemuIdent, entry: Entry) -> bool:
+    """Does the row's own operand template contradict its name?"""
+    if not (ident.kind == "ENTRYrr" or ident.kind.endswith("/noDest")):
+        return False
+    return entry.op in X86_FLAGS_ONLY_REFUSED_OPS
+
+
+@dataclass(frozen=True)
+class IdentRow:
+    """One QEMU decode identity, carrying the classification it keys."""
+    ident: QemuIdent
+    entry: Entry
+    tier: str
+    mnems: tuple[str, ...]          # observed disassembly text, for humans
+    # The observed CAPSTONE CONSTANTS, most frequent first.  This is the
+    # cardinality key and the disassembly text is not: QEMU prints x86 in
+    # AT&T syntax, so one constant appears as cmpb/cmpl/cmpq/cmpw and
+    # counting those as four would report an operand-size spelling as a
+    # four-way mapping disagreement.  Width is granularity; the constant
+    # is the row.
+    caps: tuple[str, ...] = ()
+    # Observed mnemonics that classify DIFFERENTLY from the row's own
+    # payload.  Non-empty means the Capstone key is FINER than QEMU's
+    # here: several architectural spellings decode through one rule and
+    # the tables give them different answers.  The row keeps the payload
+    # of the most frequently observed spelling and says so; it does not
+    # average two classifications into a third that describes neither.
+    split: tuple[tuple[Entry, tuple[str, ...]], ...] = ()
+    refused: str | None = None      # name the emitter fact refused
+
+
+def qemu_ident_rows(info: IsaInfo, idents: list[QemuIdent],
+                    obs: dict[int, dict[str, object]],
+                    existing: dict[str, Entry]) -> list[IdentRow]:
+    """Join the identity universe to the classification.
+
+    The identity is the KEY and the classification hangs off it.  Where
+    the payload comes from is the row's TIER and the two are not the
+    same strength of evidence:
+
+      QID_OBSERVED      QEMU was seen decoding through this rule; the
+                        payload is what the decoded instruction is.
+      QID_NAME_MATCHED  nothing was observed; the rule's own name in
+                        QEMU's source matches a known mnemonic, and the
+                        row's operand template does not contradict it.
+      QID_NONE          neither.  Residue, named in the census.
     """
     m2c = _mnemonic_to_const(info)
-    rows = []
+    v2c = enum_value_map(info)
+    rows: list[IdentRow] = []
     for ident in sorted(idents, key=lambda r: r.ident):
         seen = obs.get(ident.ident)
-        mnems: list[str] = []
+        mnems: tuple[str, ...] = ()
         tier = QID_NONE
         entry = Entry("GEN_OP_UNKNOWN")
+        split: list[tuple[Entry, tuple[str, ...]]] = []
+        caps: list[str] = []
+        refused = None
         if seen:
-            mnems = [m for m, _ in seen["mnem"].most_common()]
-            consts = [m2c[_norm_mnemonic(m)] for m in mnems
-                      if _norm_mnemonic(m) in m2c]
-            if consts:
+            mnems = tuple(m for m, _ in seen["mnem"].most_common())
+            # Ordered by how often QEMU decoded through this rule with
+            # that Capstone id.  The join is id -> id; the disassembly
+            # text below is only what the census prints.
+            payloads: dict[Entry, list[str]] = {}
+            for cap, _n in seen["caps"].most_common():
+                const = v2c.get(cap)
+                if const is None:
+                    continue
+                cand = full_entry(info, const, existing)
+                if cand is None:
+                    continue
+                caps.append(c_mnemonic(const, info.prefix))
+                payloads.setdefault(cand, []).append(
+                    c_mnemonic(const, info.prefix))
+            if len(payloads) == 1:
                 tier = QID_OBSERVED
-                entry = classify(info, consts[0])
+                entry = next(iter(payloads))
+            elif payloads:
+                # SEVERAL classifications through one rule.  The row does
+                # NOT pick one.
+                #
+                # It used to take the most frequently observed, and that
+                # was wrong in a way only a second run showed: x86 slot
+                # 0x6ca carries both spellings of the string move, and
+                # adding four short workloads flipped which was more
+                # common, so the SAME generator emitted a different table
+                # from the same source tree.  A generated file whose
+                # content depends on which programs happened to run is
+                # not reproducible, and a tie-break by count is a way of
+                # averaging while looking like a measurement.
+                #
+                # So the row states what is true -- this identity does
+                # not determine the classification -- and the census
+                # names every candidate.  Resolving it needs the
+                # instance, not the rule.
+                tier = QID_SPLIT
+                entry = Entry("GEN_OP_UNKNOWN")
+                split = sorted(((e, tuple(sorted(v)))
+                                for e, v in payloads.items()),
+                               key=lambda x: x[1])
         if tier == QID_NONE:
-            for cand in _pattern_mnemonic_candidates(ident.pattern):
-                if _norm_mnemonic(cand) in m2c:
-                    tier = QID_NAME_MATCHED
-                    entry = classify(info, m2c[_norm_mnemonic(cand)])
+            for cand_name in _pattern_mnemonic_candidates(ident.pattern):
+                const = m2c.get(_norm_mnemonic(cand_name))
+                if const is None:
+                    continue
+                cand = full_entry(info, const, existing)
+                if cand is None:
+                    continue
+                if info.key == "x86" and x86_emitter_refuses(ident, cand):
+                    refused = cand.op
                     break
-        rows.append((ident, entry, tier, mnems))
+                tier = QID_NAME_MATCHED
+                entry = cand
+                break
+        rows.append(IdentRow(ident, entry, tier, mnems,
+                             tuple(sorted(dict.fromkeys(caps))),
+                             tuple(split), refused))
     return rows
 
 
-def qemu_ident_header_text(info: IsaInfo, rows) -> str:
+def format_cls_init(entry: Entry) -> str:
+    """The InsnClassification initialiser for one identity row."""
+    parts = [f".opcode = {entry.op}",
+             f".branch_type = {entry.branch}",
+             f".flags = {entry.flags}"]
+    if entry.refine:
+        parts.append(f".refine = {entry.refine}")
+    if entry.dep_refine:
+        parts.append(f".dep_refine = {entry.dep_refine}")
+    if entry.lane_mask_kind != "LANE_MASK_KIND_NONE":
+        parts.append(f".lane_mask_kind = {entry.lane_mask_kind}")
+        parts.append(f".lane_parallel = {'true' if entry.lane_parallel else 'false'}")
+    return "{ " + ", ".join(parts) + " }"
+
+
+def qemu_ident_header_text(info: IsaInfo, rows: list[IdentRow]) -> str:
     guard = f"CHAMPSIM_TRACER_QEMU_IDENT_{info.key.upper()}_H"
+    src = (QEMU_IDENT_SOURCE_TABLES.get(info.key)
+           or f"the generated decoders of {QEMU_IDENT_TARGETS[info.key]}")
+    what = ("one X86_OP_* row of QEMU's own decode table, keyed by the "
+            "source line of\n * its macro expansion"
+            if info.key == "x86" else
+            "one decodetree pattern -- the trans_<name>() the\n"
+            " * translator dispatched to")
     out = [
         f"#ifndef {guard}",
         f"#define {guard}",
@@ -4869,17 +5238,33 @@ def qemu_ident_header_text(info: IsaInfo, rows) -> str:
         f" * QEMU decode-table identity for {info.key} -- auto-generated by",
         f" * {Path(__file__).name} --qemu-ident.  Do not hand-edit a row.",
         " *",
-        " * Each row is one decodetree pattern: the rule QEMU's own decoder",
-        " * dispatched on, keyed by the id qemu_plugin_insn_decode_id()",
-        " * reports.  Rows are sorted by id so a consumer can bisect.",
+        f" * Each row is {what}: the decision the emulator",
+        " * actually made, keyed by the id qemu_plugin_insn_decode_id()",
+        " * reports for an instruction decoded through it.  Rows are sorted",
+        " * by id so a consumer can bisect.  Universe read from",
+        f" *   {src}",
+        " *",
+        " * .cls is the SAME payload the Capstone-keyed table carries, from",
+        " * the SAME classifier (full_entry), under this key instead.  What",
+        " * changes is where the classification comes from, not what it says.",
         " *",
         " * .tier says what the classification rests on, and the tiers are",
         " * NOT interchangeable:",
         " *   QID_OBSERVED      QEMU was seen decoding through this rule and",
         " *                     the disassembler named the result",
-        " *   QID_NAME_MATCHED  the pattern name matches a Capstone mnemonic;",
-        " *                     no decode through it was ever observed",
+        " *   QID_NAME_MATCHED  the rule's name matches a known mnemonic, no",
+        " *                     decode through it was observed, and the row's",
+        " *                     own operand template does not contradict it",
         " *   QID_NONE          neither -- residue, classification unknown",
+        " *",
+        " * .cap_split marks a row where the Capstone key is FINER than this",
+        " * one: several spellings were observed decoding through the single",
+        " * rule and the tables classify them differently.  The row carries",
+        " * the most frequently observed spelling's payload and the trailing",
+        " * comment names the others.  It is a flag and not a fix -- the",
+        " * adjudication of which key is right belongs to the maintainer,",
+        " * and averaging two classifications into a third that describes",
+        " * neither is the one thing it must not do.",
         " *",
         " * SPDX-License-Identifier: GPL-2.0-or-later",
         " * Author: Maccoy Merrell",
@@ -4889,7 +5274,7 @@ def qemu_ident_header_text(info: IsaInfo, rows) -> str:
         " * enum QemuIdentTier and struct QemuIdentRow are declared ONCE, in",
         " * champsim_tracer_mnemonics.h, exactly as QemuRegRow is for the",
         " * sibling register tables.  A consumer routing by TraceISA includes",
-        " * all three of these headers in one translation unit, and a type",
+        " * all of these headers in one translation unit, and a type",
         " * emitted per file could not survive that -- the file guard is per",
         " * ISA, so the second include redefined the enum and the struct.",
         " * Nothing ever compiled them together to find out.",
@@ -4898,12 +5283,19 @@ def qemu_ident_header_text(info: IsaInfo, rows) -> str:
         "",
         f"static const QemuIdentRow qemu_ident_{info.key}[] = {{",
     ]
-    for ident, entry, tier, mnems in rows:
+    for r in rows:
         note = ""
-        if mnems:
-            note = "  /* " + ", ".join(mnems[:4]) + " */"
-        out.append(f'    {{ 0x{ident.ident:08x}u, "{ident.name}", '
-                   f'{entry.op}, {entry.branch}, {tier} }},{note}')
+        if r.split:
+            note = ("  /* SPLIT: " +
+                    "; ".join(f"{e.op} <- {', '.join(ms[:3])}"
+                              for e, ms in r.split) + " */")
+        elif r.mnems:
+            note = "  /* " + ", ".join(r.mnems[:4]) + " */"
+        elif r.refused:
+            note = f"  /* emitter refused the name -> {r.refused} */"
+        out.append(f'    {{ 0x{r.ident.ident:08x}u, "{r.ident.name}", '
+                   f'{r.tier}, {"true" if r.split else "false"},')
+        out.append(f'      {format_cls_init(r.entry)} }},{note}')
     out += [
         "};",
         "",
@@ -4917,69 +5309,121 @@ def qemu_ident_header_text(info: IsaInfo, rows) -> str:
 
 
 def qemu_ident_census(info: IsaInfo, idents: list[QemuIdent],
-                      obs: dict[int, dict[str, object]], rows,
-                      max_lines: int) -> None:
+                      obs: dict[int, dict[str, object]],
+                      rows: list[IdentRow], max_lines: int) -> int:
+    """The mapping census.  Returns the number of rows with NO payload."""
     import collections
     key = info.key
-    print(f"===== {key}: QEMU decode identity vs mnemonic table =====")
+    print(f"===== {key}: QEMU decode identity as the classification key =====")
     decoders = collections.Counter(i.decoder for i in idents)
-    print(f"identity universe            : {len(idents)} patterns in "
+    print(f"identity universe            : {len(idents)} rules in "
           f"{len(decoders)} decoders")
     for d, n in decoders.most_common():
         print(f"    {d:<24} {n}")
 
-    unident = obs.get(0)
-    total_obs = sum(sum(e["mnem"].values()) for e in obs.values())
-    n_unident = sum(unident["mnem"].values()) if unident else 0
-    print(f"observed translated insns    : {total_obs}")
-    print(f"    carrying a QEMU identity : {total_obs - n_unident} "
-          f"({100.0 * (total_obs - n_unident) / total_obs:.3f}%)")
-    print(f"    carrying NONE (id 0)     : {n_unident} "
-          f"({100.0 * n_unident / total_obs:.3f}%)")
-    exercised = [i for i in idents if i.ident in obs]
-    print(f"identities exercised         : {len(exercised)} of {len(idents)}")
+    if obs:
+        # Counted from the CAPS counter, which both sources fill; the
+        # mnemonic counter is idprobe-only and using it here would make
+        # a pair census read as zero observations.
+        total_obs = sum(sum(e["caps"].values()) for e in obs.values())
+        unident = obs.get(0)
+        print(f"observed translated insns    : {total_obs}")
+        if unident is not None:
+            n_unident = sum(unident["caps"].values())
+            print(f"    carrying a QEMU identity : {total_obs - n_unident} "
+                  f"({100.0 * (total_obs - n_unident) / total_obs:.3f}%)")
+            print(f"    carrying NONE (id 0)     : {n_unident} "
+                  f"({100.0 * n_unident / total_obs:.3f}%)")
+        else:
+            # A pair census is written from inside the identity reader,
+            # which returns on id == 0 before a pair exists to record.
+            # Printing 0 here would be a measurement this file cannot
+            # make, dressed as one it did.
+            print("    carrying NONE (id 0)     : not carried by this "
+                  "source; the tracer's own report counts it")
+        exercised = [i for i in idents if i.ident in obs]
+        print(f"identities exercised         : {len(exercised)} of {len(idents)}")
+    else:
+        print("observed translated insns    : NONE SUPPLIED -- every row "
+              "below rests on its name alone")
 
-    tiers = collections.Counter(t for _, _, t, _ in rows)
+    tiers = collections.Counter(r.tier for r in rows)
     print("row provenance:")
-    for t in (QID_OBSERVED, QID_NAME_MATCHED, QID_NONE):
+    for t in (QID_OBSERVED, QID_SPLIT, QID_NAME_MATCHED, QID_NONE):
         print(f"    {t:<18} {tiers.get(t, 0)}")
+    refused = [r for r in rows if r.refused]
+    if refused:
+        print(f"    names REFUSED by the row's own operand template: "
+              f"{len(refused)}")
+        for r in refused[:max_lines]:
+            print(f"        0x{r.ident.ident:08x} {r.ident.name} "
+                  f"[{r.ident.kind}] would have taken {r.refused}")
 
-    # Cardinality of the mnemonic <-> identity correspondence, counted
-    # only over decodes that were OBSERVED.  A name-matched row asserts
-    # nothing about cardinality and is excluded on purpose.
+    # ---- the mapping census proper, over OBSERVED decodes only.  A
+    # name-matched row asserts nothing about cardinality and is excluded
+    # on purpose: it has no second key to be compared against.
     id2mn: dict[int, set] = {}
     mn2id: dict[str, set] = {}
-    for ident, _, tier, mnems in rows:
-        if tier != QID_OBSERVED:
+    for r in rows:
+        if r.tier not in (QID_OBSERVED, QID_SPLIT):
             continue
-        id2mn[ident.ident] = set(mnems)
-        for m in mnems:
-            mn2id.setdefault(m, set()).add(ident.ident)
+        id2mn[r.ident.ident] = set(r.caps)
+        for m in r.caps:
+            mn2id.setdefault(m, set()).add(r.ident.ident)
     one_one = sum(1 for i, ms in id2mn.items()
                   if len(ms) == 1 and len(mn2id[next(iter(ms))]) == 1)
     many_one = sorted(((i, ms) for i, ms in id2mn.items() if len(ms) > 1),
                       key=lambda x: -len(x[1]))
     one_many = sorted(((m, ids) for m, ids in mn2id.items() if len(ids) > 1),
                       key=lambda x: -len(x[1]))
-    print(f"observed correspondence over {len(id2mn)} exercised identities:")
-    print(f"    1:1  identity <-> mnemonic          : {one_one}")
-    print(f"    N:1  one identity, many mnemonics   : {len(many_one)}")
-    print(f"    1:N  one mnemonic, many identities  : {len(one_many)}")
+    byid = {i.ident: i for i in idents}
+    print(f"MAPPING CENSUS over {len(id2mn)} exercised identities, counted "
+          f"in TABLE ROWS (Capstone constants), not in printed mnemonics:")
+    print(f"    1:1  identity <-> row               : {one_one}")
+    print(f"    N:1  one identity, many rows        : {len(many_one)}")
+    print(f"    1:N  one row, many identities       : {len(one_many)}")
     for i, ms in many_one[:max_lines]:
-        nm = next(r.name for r in idents if r.ident == i)
-        print(f"        {nm:<28} {len(ms)}: {', '.join(sorted(ms)[:8])}")
+        print(f"        {byid[i].name:<28} {len(ms)}: "
+              f"{', '.join(sorted(ms)[:8])}")
     for m, ids in one_many[:max_lines]:
-        names = sorted(next(r.name for r in idents if r.ident == i)
-                       for i in ids)
+        names = sorted(byid[i].name for i in ids)
         print(f"        {m:<16} {len(ids)}: {', '.join(names[:6])}")
 
-    # The residue, BY NAME.  A count would hide which rules the tracer
-    # would have nothing to say about.
-    residue = [ident for ident, _, tier, _ in rows if tier == QID_NONE]
-    print(f"RESIDUE -- identities with no mnemonic correspondence at all: "
-          f"{len(residue)}")
-    for ident in residue:
-        print(f"    {ident.name}  ({ident.src_file}:{ident.src_line})")
+    # ---- the rows where the two keys DISAGREE about the classification.
+    # This is the whole of what re-keying changes, and it is per row.
+    split = [r for r in rows if r.tier == QID_SPLIT]
+    print(f"SPLIT -- one identity, several classifications observed: "
+          f"{len(split)}")
+    def _delta(a: Entry, b: Entry) -> str:
+        """Name the fields two payloads disagree on, and only those."""
+        out = []
+        for f in ("op", "branch", "flags", "refine", "dep_refine",
+                  "lane_mask_kind", "lane_parallel"):
+            av, bv = getattr(a, f), getattr(b, f)
+            if av != bv:
+                out.append(f"{f}: {av} -> {bv}")
+        return "; ".join(out) or "(identical payload -- should not be split)"
+
+    for r in split:
+        print(f"    0x{r.ident.ident:08x} {r.ident.name}   "
+              f"-> row carries NO classification")
+        base = r.split[0][0]
+        for i, (e, ms) in enumerate(r.split):
+            print(f"        candidate {e.op:<22} <- {', '.join(ms)}")
+            if i:
+                print(f"                  {_delta(base, e)}")
+
+    # ---- the residue, BY NAME.  A count would hide which rules the
+    # tracer would have nothing to say about.
+    residue = [r for r in rows if r.tier == QID_NONE]
+    live = [r for r in residue if r.ident.ident in obs]
+    print(f"NO ROW -- identities with no classification at all: "
+          f"{len(residue)} ({len(live)} of them EXERCISED)")
+    for r in residue:
+        mark = "  <-- EXERCISED" if r.ident.ident in obs else ""
+        print(f"    {r.ident.name}  ({r.ident.src_file}:"
+              f"{r.ident.src_line}){mark}")
+    return len(live)
 
 
 def main() -> int:
@@ -4997,14 +5441,21 @@ def main() -> int:
                              "(decodetree targets only)")
     parser.add_argument("--build-dir", type=Path,
                         help="QEMU build directory holding the generated decoders "
-                             "(required with --qemu-ident)")
+                             "(required with --qemu-ident on a decodetree target)")
     parser.add_argument("--observed", type=Path, nargs="*", default=[],
                         help="idprobe TSV files supplying OBSERVED decodes")
+    parser.add_argument("--pairs", type=Path, nargs="*", default=[],
+                        help="pair-census files (CST_QEMU_IDENT_PAIRS output) "
+                             "supplying OBSERVED (identity, capstone-id) "
+                             "joins; preferred over --observed, and the only "
+                             "source that works on riscv64 and mipsel")
     args = parser.parse_args()
     if not args.diff and not args.apply:
         parser.error("choose --diff and/or --apply")
     if args.qemu_ident and args.build_dir is None:
-        parser.error("--qemu-ident needs --build-dir")
+        wanted = set(args.isa or sorted(ISAS))
+        if wanted - set(QEMU_IDENT_SOURCE_TABLES):
+            parser.error("--qemu-ident needs --build-dir for a decodetree target")
     keys = args.isa or sorted(ISAS)
     total = 0
     if args.qemu_regs:
@@ -5019,21 +5470,31 @@ def main() -> int:
         return 1 if total else 0
     if args.qemu_ident:
         for key in keys:
-            if key not in QEMU_IDENT_TARGETS:
-                print(f"===== {key}: not a decodetree target, skipped =====")
+            if key not in QEMU_IDENT_TARGETS and key not in QEMU_IDENT_SOURCE_TABLES:
+                print(f"===== {key}: no identity universe to read, skipped =====")
                 continue
             info = ISAS[key]
-            idents = parse_qemu_identities(args.build_dir, key)
-            obs = load_observed(list(args.observed)) if args.observed else {}
-            rows = qemu_ident_rows(info, idents, obs)
+            idents = qemu_ident_universe(args.build_dir, key)
+            # The observed set is per ISA: pointing every target at every
+            # TSV would join one target's ids against another's, and the
+            # ids are explicitly not comparable across targets.
+            pair_paths = [p for p in args.pairs
+                          if _observed_matches_isa(Path(p), key)]
+            if pair_paths:
+                obs = load_pairs(pair_paths)
+            else:
+                paths = [p for p in args.observed
+                         if _observed_matches_isa(Path(p), key)]
+                obs = load_observed(paths) if paths else {}
+            rows = qemu_ident_rows(info, idents, obs, parse_existing(info))
             if args.diff:
-                qemu_ident_census(info, idents, obs, rows,
-                                  max_lines=args.max_lines)
+                total += qemu_ident_census(info, idents, obs, rows,
+                                           max_lines=args.max_lines)
             if args.apply:
                 out = PLUGIN_DIR / f"champsim_tracer_qemu_ident_{key}.h"
                 out.write_text(qemu_ident_header_text(info, rows))
                 print(f"wrote {out}")
-        return 0
+        return 1 if args.diff and total else 0
     if args.diff:
         for key in keys:
             if args.regs:

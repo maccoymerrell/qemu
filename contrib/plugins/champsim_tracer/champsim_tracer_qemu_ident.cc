@@ -77,6 +77,27 @@ unsigned            g_cap_size;
 bool                g_have_table;      /* this ISA tabulates identities */
 bool                g_detail;          /* CST_QEMU_IDENT_AUDIT */
 
+/*
+ * THE PAIR CENSUS -- CST_QEMU_IDENT_PAIRS=<path>.
+ *
+ * One row per (QEMU decode identity, Capstone insn id) pair actually seen,
+ * with the count.  It exists because the generator that keys the tables on
+ * the identity needs to know which classification row each identity
+ * carries, and that join has to be id -> id: joining on the disassembly
+ * TEXT is unsound (QEMU prints x86 in AT&T syntax, so `cmpq` matches no
+ * constant and `movq` matches the wrong one).
+ *
+ * It is emitted from HERE, and not from a standalone probe, because this
+ * is the only place both halves come from the boundary the TABLES are
+ * keyed by.  A standalone plugin sees qemu_plugin_insn_detail(), whose
+ * Capstone is QEMU's own disassembler setup -- and that is enabled for
+ * x86 and arm and NOT for riscv or mips, where it returns insn_id 0 for
+ * every instruction.  A probe written that way reports "riscv has no
+ * classification" when what happened is that nothing was decoded.
+ */
+GHashTable         *g_pairs;           /* (id<<32|cap) -> count */
+GHashTable         *g_pair_names;      /* id -> interned QEMU name */
+
 GMutex g_lock;
 
 /* Scalars.  Always tallied: one bisect per translated instruction, at
@@ -86,10 +107,11 @@ uint64_t g_n_no_identity;      /* QEMU exported none (id == 0) */
 uint64_t g_n_row_missing;      /* id carried, no row -- STALE TABLE */
 uint64_t g_n_name_mismatch;    /* row found, name disagrees -- STALE TABLE */
 uint64_t g_n_scored;           /* row found and name agreed */
-uint64_t g_tier_seen[3];
+uint64_t g_tier_seen[4];
 uint64_t g_op_agree, g_op_disagree;
 uint64_t g_br_agree, g_br_disagree;
 uint64_t g_op_row_unknown;     /* row says GEN_OP_UNKNOWN: nothing to check */
+uint64_t g_br_row_unknown;     /* same row, same reason, branch class */
 
 /*
  * THE LENGTH ARM.  Independent of the identity table -- it runs on all four
@@ -383,6 +405,11 @@ unsigned qemu_ident_install(TraceISA isa)
 {
     g_mutex_init(&g_lock);
     g_detail = getenv("CST_QEMU_IDENT_AUDIT") != nullptr;
+    if (getenv("CST_QEMU_IDENT_PAIRS")) {
+        g_pairs = g_hash_table_new(g_direct_hash, g_direct_equal);
+        g_pair_names = g_hash_table_new_full(g_direct_hash, g_direct_equal,
+                                             nullptr, g_free);
+    }
 
     if (isa > TRACE_ISA_MIPS) {
         return 0;
@@ -543,7 +570,11 @@ void qemu_ident_note_length(uint64_t pc, uint8_t qlen, uint8_t caplen,
 void qemu_ident_note(const struct qemu_plugin_insn *insn,
                      const qemu_plugin_insn_info *info)
 {
-    if (!g_have_table || !insn) {
+    /*
+     * The pair census runs with no table: it is how the FIRST table for a
+     * target gets generated, and i386 has none until it does.
+     */
+    if ((!g_have_table && !g_pairs) || !insn) {
         return;
     }
 
@@ -561,6 +592,35 @@ void qemu_ident_note(const struct qemu_plugin_insn *insn,
      */
     if (id == 0) {
         g_n_no_identity++;
+        g_mutex_unlock(&g_lock);
+        return;
+    }
+
+    /*
+     * The pair is tallied HERE, above every table check, because both
+     * halves come from the running emulator and neither comes from the
+     * table: the QEMU id is what the translator exported and the
+     * Capstone id is what the boundary decoded.  A missing or stale row
+     * cannot change either one, and gating the census on a row existing
+     * would make the census unable to bootstrap the very table it feeds
+     * -- which is exactly the state i386 is in before its table is
+     * generated for the first time.
+     */
+    if (g_pairs) {
+        uint64_t key = ((uint64_t)id << 32)
+                     | (info ? (uint64_t)info->insn_id : 0);
+        gpointer k = GSIZE_TO_POINTER(key);
+        gpointer v = g_hash_table_lookup(g_pairs, k);
+        g_hash_table_insert(g_pairs, k,
+                            GSIZE_TO_POINTER(GPOINTER_TO_SIZE(v) + 1));
+        if (qname && !g_hash_table_contains(g_pair_names,
+                                            GUINT_TO_POINTER(id))) {
+            g_hash_table_insert(g_pair_names, GUINT_TO_POINTER(id),
+                                g_strdup(qname));
+        }
+    }
+
+    if (!g_have_table) {
         g_mutex_unlock(&g_lock);
         return;
     }
@@ -591,7 +651,7 @@ void qemu_ident_note(const struct qemu_plugin_insn *insn,
 
     g_n_scored++;
     g_hash_table_add(g_rows_hit, GUINT_TO_POINTER(id));
-    g_tier_seen[row->tier < 3 ? row->tier : 0]++;
+    g_tier_seen[row->tier < 4 ? row->tier : 0]++;
 
     /* The Capstone half of the same instruction, taken from the same table
      * the wire's opcode comes from. */
@@ -611,9 +671,9 @@ void qemu_ident_note(const struct qemu_plugin_insn *insn,
          * the enumerated-zero shape in reverse: a number that is large for
          * a reason having nothing to do with what it claims to measure.
          */
-        if (row->opcode == GEN_OP_UNKNOWN) {
+        if (row->cls.opcode == GEN_OP_UNKNOWN) {
             g_op_row_unknown++;
-        } else if (row->opcode == c->opcode) {
+        } else if (row->cls.opcode == c->opcode) {
             g_op_agree++;
         } else {
             g_op_disagree++;
@@ -621,13 +681,25 @@ void qemu_ident_note(const struct qemu_plugin_insn *insn,
                 char sig[224];
                 g_snprintf(sig, sizeof(sig), "%-34s qemu=%-18s cap=%-18s (%s)",
                            row->name,
-                           generic_opcode_name_or_unknown(row->opcode),
+                           generic_opcode_name_or_unknown(row->cls.opcode),
                            generic_opcode_name_or_unknown(c->opcode),
                            info->mnemonic);
                 tally(&g_opsig, sig);
             }
         }
-        if (row->branch_type == c->branch_type) {
+        /*
+         * Same rule for the branch class, and it has to be said in terms
+         * of the ROW rather than of BRANCH_NONE: a row that states no
+         * classification states no branch class either, and BRANCH_NONE
+         * is what "states none" looks like.  Scoring it turned every
+         * riscv64 `c.jr`/`c.jalr`/`c.ret` into a branch-class conflict --
+         * 442 of them on one small run -- when what had actually
+         * happened is that decode_insn16/jalr is a SPLIT row and the
+         * rule genuinely does not say which of the three it is.
+         */
+        if (row->cls.opcode == GEN_OP_UNKNOWN) {
+            g_br_row_unknown++;
+        } else if (row->cls.branch_type == c->branch_type) {
             g_br_agree++;
         } else {
             g_br_disagree++;
@@ -635,7 +707,7 @@ void qemu_ident_note(const struct qemu_plugin_insn *insn,
                 char sig[224];
                 g_snprintf(sig, sizeof(sig), "%-34s qemu=%-18s cap=%-18s (%s)",
                            row->name,
-                           branch_type_name_or_unknown(row->branch_type),
+                           branch_type_name_or_unknown(row->cls.branch_type),
                            branch_type_name_or_unknown(c->branch_type),
                            info->mnemonic);
                 tally(&g_brsig, sig);
@@ -645,8 +717,54 @@ void qemu_ident_note(const struct qemu_plugin_insn *insn,
     g_mutex_unlock(&g_lock);
 }
 
+/*
+ * Write the pair census.  Refuses to report success on an empty table:
+ * a file with a header and no rows is exactly what a run that decoded
+ * nothing produces, and the generator reading it would take that for
+ * "this ISA has no classification".
+ */
+static void write_pair_census(GString *report)
+{
+    const char *path = getenv("CST_QEMU_IDENT_PAIRS");
+    if (!g_pairs || !path) {
+        return;
+    }
+    unsigned n = g_hash_table_size(g_pairs);
+    if (n == 0) {
+        g_string_append_printf(report,
+            "\nqemu-ident pair census: NOTHING SCORED, %s not written -- "
+            "an empty census would read as 'no classification exists'\n",
+            path);
+        return;
+    }
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        g_string_append_printf(report,
+            "\nqemu-ident pair census: could not open %s\n", path);
+        return;
+    }
+    fprintf(f, "#decode_id\tdecode_name\tcap_insn_id\tcount\n");
+    GHashTableIter it;
+    gpointer k, v;
+    g_hash_table_iter_init(&it, g_pairs);
+    while (g_hash_table_iter_next(&it, &k, &v)) {
+        uint64_t key = GPOINTER_TO_SIZE(k);
+        uint32_t id  = (uint32_t)(key >> 32);
+        uint32_t cap = (uint32_t)key;
+        const char *nm = (const char *)g_hash_table_lookup(
+            g_pair_names, GUINT_TO_POINTER(id));
+        fprintf(f, "%" PRIu32 "\t%s\t%" PRIu32 "\t%zu\n",
+                id, nm ? nm : "-", cap, (size_t)GPOINTER_TO_SIZE(v));
+    }
+    fclose(f);
+    g_string_append_printf(report,
+        "\nqemu-ident pair census: %u (identity, capstone-id) pairs -> %s\n",
+        n, path);
+}
+
 void qemu_ident_report(GString *report)
 {
+    write_pair_census(report);
     if (g_len_seen || g_len_cap_failed) {
         g_string_append_printf(report,
             "\n--- instruction LENGTH: the translator's pc advance against "
@@ -745,20 +863,24 @@ void qemu_ident_report(GString *report)
     g_string_append_printf(report,
         "  table rows reached                     %10u of %u\n"
         "  tier of the rows that executed:  OBSERVED %" PRIu64
-        "   NAME_MATCHED %" PRIu64 "   NONE %" PRIu64 "\n"
+        "   SPLIT %" PRIu64 "   NAME_MATCHED %" PRIu64
+        "   NONE %" PRIu64 "\n"
         "    a NAME_MATCHED row that executes is a row the table "
         "UNDERSTATES; a NONE row that executes is live residue -- an "
-        "instruction with no QEMU-side name agreeing about what it is.\n",
+        "instruction with no QEMU-side name agreeing about what it is; "
+        "a SPLIT row that executes is a rule whose own observations "
+        "disagreed, so the identity alone does not classify it.\n",
         g_rows_hit ? g_hash_table_size(g_rows_hit) : 0, g_nrows,
-        g_tier_seen[QID_OBSERVED], g_tier_seen[QID_NAME_MATCHED],
-        g_tier_seen[QID_NONE]);
+        g_tier_seen[QID_OBSERVED], g_tier_seen[QID_SPLIT],
+        g_tier_seen[QID_NAME_MATCHED], g_tier_seen[QID_NONE]);
 
     g_string_append_printf(report,
         "  opcode     agree %10" PRIu64 "   disagree %10" PRIu64
         "   row unclassified %" PRIu64 "\n"
-        "  branchtype agree %10" PRIu64 "   disagree %10" PRIu64 "\n",
+        "  branchtype agree %10" PRIu64 "   disagree %10" PRIu64
+        "   row unclassified %" PRIu64 "\n",
         g_op_agree, g_op_disagree, g_op_row_unknown,
-        g_br_agree, g_br_disagree);
+        g_br_agree, g_br_disagree, g_br_row_unknown);
 
     if (!g_detail) {
         g_string_append_printf(report,

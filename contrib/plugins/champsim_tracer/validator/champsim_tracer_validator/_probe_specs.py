@@ -1460,7 +1460,21 @@ _register_probe('probe_implicit_acc', {
             {"src": ["REG_GPR0", "REG_GPR3"],
              "dst": ["REG_GPR0", "REG_GPR2", "REG_FLAGS"]},
             {},
-            {"src": ["REG_GPR1", "REG_GPR3"],
+            # `shlq %cl, %rbx` READS the flags as well as writing them.
+            # A shift or rotate whose count comes out zero leaves every
+            # flag untouched, so the old flag word is selected at run
+            # time and is a genuine input: QEMU emits exactly that,
+            # gen_shift_dynamic_flags() producing movcond(count == 0 ?
+            # cpu_cc_dst : new) for cc_dst, cc_src AND cc_op.  Capstone
+            # states none of it -- the eflags bitmask carries MODIFY and
+            # UNDEFINED only -- and the boundary restores the read
+            # (cap_x86_eflags_read_lost, disas/capstone.c, landed
+            # 1d7acff495).  The line is drawn where the architecture
+            # draws it: gen_shift_count() sets can_be_zero ONLY for the
+            # CL form, so the immediate-count sibling above (`shlq $3`,
+            # probe_exact_shl_ri) does NOT read the flags and does not
+            # carry this entry.
+            {"src": ["REG_FLAGS", "REG_GPR1", "REG_GPR3"],
              "dst": ["REG_GPR3", "REG_FLAGS"]},
         ]},
     'mipsel': {

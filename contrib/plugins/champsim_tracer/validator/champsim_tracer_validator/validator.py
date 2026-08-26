@@ -2871,6 +2871,12 @@ _RISCV_CSR_GENERIC = {
 # convention, 1 = read and 2 = write, as used by the operand walk.
 _X86_SYSREG_MMU = "REG_SYSMMU"
 _X86_SYSREG_FPCTRL = "REG_FCSR"
+# 0acd1e32e5 gave the x87 CONTROL word an id of its own: the rounding mode
+# an FP datapath READS is not the status word it WRITES, and one id holding
+# both made every `fldcw` look like a producer of the exception flags.  The
+# boundary's CAP_X86_SYSREG_X87CW carries QEMU_PLUGIN_SYSREG_FPCW; the TAG
+# word and MXCSR still carry FPCTRL, so only this one name moved.
+_X86_SYSREG_X87CW = "REG_FPCW"
 _X86_SYSREG_OTHER = "REG_SYS"
 _X86_SYSREG_TIMER = "REG_SYSTIMER"
 _X86_SYSREG_SHADOWSTK = "REG_SSP"
@@ -2896,6 +2902,7 @@ def _x86_sysreg_facts(insn_id: int) -> tuple[tuple[str, int], ...]:
         R, W, RW = 1, 2, 3
         MMU = _X86_SYSREG_MMU
         FP = _X86_SYSREG_FPCTRL
+        CW = _X86_SYSREG_X87CW
         OTH = _X86_SYSREG_OTHER
         TSC = _X86_SYSREG_TIMER
         SSP = _X86_SYSREG_SHADOWSTK
@@ -2914,16 +2921,19 @@ def _x86_sysreg_facts(insn_id: int) -> tuple[tuple[str, int], ...]:
             # The SSE control word.
             (("LDMXCSR", "VLDMXCSR"), ((FP, W),)),
             (("STMXCSR", "VSTMXCSR"), ((FP, R),)),
-            # The x87 control and tag words.  Both carry the FPCTRL
-            # role, so the generic set they produce is one id; the
-            # environment-moving forms name both and collapse here.
-            (("FLDCW",), ((FP, W),)),
-            (("FNSTCW",), ((FP, R),)),
+            # The x87 control and tag words.  They are DIFFERENT
+            # generic registers (CW vs FP); the environment-moving
+            # forms name both, which is cap_x86_add_x87_env(), and
+            # FFREE touches the tag word alone.  FXSAVE / FXRSTOR pass
+            # with_mxcsr=true, and MXCSR shares the FP id, so the pair
+            # they add collapses onto the two names already listed.
+            (("FLDCW",), ((CW, W),)),
+            (("FNSTCW",), ((CW, R),)),
             (("FFREE", "FFREEP"), ((FP, W),)),
-            (("FNINIT", "FRSTOR"), ((FP, W),)),
-            (("FNSAVE",), ((FP, RW),)),
-            (("FXSAVE", "FXSAVE64"), ((FP, R),)),
-            (("FXRSTOR", "FXRSTOR64"), ((FP, W),)),
+            (("FNINIT", "FRSTOR"), ((CW, W), (FP, W))),
+            (("FNSAVE",), ((CW, RW), (FP, RW))),
+            (("FXSAVE", "FXSAVE64"), ((CW, R), (FP, R))),
+            (("FXRSTOR", "FXRSTOR64"), ((CW, W), (FP, W))),
             # The MSR file: ECX picks the register at RUNTIME, so one
             # id for the whole file is what a decode can honestly say.
             (("RDMSR", "RDPMC"), ((OTH, R),)),
@@ -2967,6 +2977,278 @@ def _x86_sysreg_facts(insn_id: int) -> tuple[tuple[str, int], ...]:
                 tab[int(ins_id)] = facts
         _X86_SYSREG_FACTS = tab
     return _X86_SYSREG_FACTS.get(int(insn_id), ())
+
+
+# ---------------------------------------------------------------------------
+# The x87 implicit register set, and the EFLAGS dependency Capstone computes
+# but never publishes.  Both are boundary repairs with no Capstone-visible
+# trace, so the oracle can only see them by mirroring the encoding-level
+# decision the boundary makes -- keyed on the SAME bytes, and naming the
+# generic registers directly rather than importing the boundary's enum.
+#
+# Mirrors, in disas/capstone.c:
+#   cap_x86_x87_escape_at / cap_x86_is_x87_escape
+#   cap_x86_x87_effects_table / cap_x86_x87_effects / cap_x86_add_x87_implicit
+#   cap_x86_eflags_read_lost / cap_x86_eflags_bitmask_is_wrong
+#   cap_x86_eflags_from_bitmask
+# ---------------------------------------------------------------------------
+_X87F_R0, _X87F_W0, _X87F_R1, _X87F_W1 = 0x001, 0x002, 0x004, 0x008
+_X87F_SWR, _X87F_SWW = 0x010, 0x020
+_X87F_OPW, _X87F_OPRW = 0x040, 0x080
+_X87F_ENVR, _X87F_ENVW = 0x100, 0x200
+_X87F_CWR, _X87F_CWW = 0x400, 0x800
+# fpush / fpop both move env->fpstt, which lives in the status word.
+_X87F_PUSH = _X87F_SWR | _X87F_SWW
+_X87F_POP = _X87F_SWR | _X87F_SWW
+_X87F_STACK = (_X87F_R0 | _X87F_W0 | _X87F_R1 | _X87F_W1
+               | _X87F_OPW | _X87F_OPRW)
+
+_X86_PREFIX_BYTES = frozenset(
+    (0x26, 0x2e, 0x36, 0x3e, 0x64, 0x65, 0x66, 0x67, 0xf0, 0xf2, 0xf3)
+) | frozenset(range(0x40, 0x50))
+
+
+def _x86_x87_escape_at(raw: bytes) -> int:
+    """Byte index of the D8..DF escape opcode, or -1."""
+    k = 0
+    while k < len(raw):
+        b = raw[k]
+        if b in _X86_PREFIX_BYTES:
+            k += 1
+            continue
+        return k if 0xd8 <= b <= 0xdf else -1
+    return -1
+
+
+def _x86_x87_effects_table(raw: bytes) -> int:
+    k = _x86_x87_escape_at(raw)
+    if k < 0 or k + 1 >= len(raw):
+        return 0
+    b = raw[k]
+    modrm = raw[k + 1]
+    mod = (modrm >> 6) & 3
+    rm = modrm & 7
+    op = ((b & 7) << 3) | ((modrm >> 3) & 7)
+
+    R0, W0, R1, W1 = _X87F_R0, _X87F_W0, _X87F_R1, _X87F_W1
+    SWR, SWW = _X87F_SWR, _X87F_SWW
+    OPW, OPRW = _X87F_OPW, _X87F_OPRW
+    ENVR, ENVW = _X87F_ENVR, _X87F_ENVW
+    CWR, CWW = _X87F_CWR, _X87F_CWW
+    PUSH, POP = _X87F_PUSH, _X87F_POP
+
+    if mod != 3:
+        # ---- memory forms -------------------------------------------
+        if op in (0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                  0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+                  0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+                  0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37):
+            if (op & 7) == 2:
+                return R0 | SWW | CWR
+            if (op & 7) == 3:
+                return R0 | POP | SWW | CWR
+            return R0 | W0 | SWW | CWR
+        if op in (0x08, 0x18, 0x28, 0x38):
+            return PUSH | W0 | SWW | CWR
+        if op in (0x09, 0x19, 0x29, 0x39):
+            return R0 | POP | SWW | CWR
+        if op in (0x0a, 0x1a, 0x2a, 0x3a):
+            return R0 | SWW | CWR
+        if op in (0x0b, 0x1b, 0x2b, 0x3b):
+            return R0 | POP | SWW | CWR
+        if op == 0x0c:
+            return ENVW | SWW
+        if op == 0x0e:
+            return ENVR | SWR | CWW
+        if op in (0x1d, 0x3d):
+            return PUSH | W0 | SWW | (CWR if op == 0x3d else 0)
+        if op in (0x1f, 0x3f):
+            return R0 | POP | SWW | (CWR if op == 0x3f else 0)
+        if op == 0x2f:
+            return SWR
+        if op == 0x3c:
+            return PUSH | W0 | SWW | CWR
+        if op == 0x3e:
+            return R0 | POP | SWW | CWR
+        return 0
+
+    # ---- register forms ---------------------------------------------
+    if op in (0x00, 0x01, 0x04, 0x05, 0x06, 0x07):
+        return R0 | W0 | SWW | CWR
+    if op in (0x20, 0x21, 0x24, 0x25, 0x26, 0x27):
+        return R0 | OPRW | SWW | CWR
+    if op in (0x30, 0x31, 0x34, 0x35, 0x36, 0x37):
+        return R0 | OPRW | POP | SWW | CWR
+    if op in (0x02, 0x22):
+        return R0 | SWW | CWR
+    if op in (0x03, 0x23, 0x32):
+        return R0 | POP | SWW | CWR
+    if op == 0x08:
+        return PUSH | W0 | SWW
+    if op in (0x09, 0x29, 0x39):
+        return R0 | W0 | OPRW | SWW
+    if op in (0x0b, 0x2b, 0x3a, 0x3b):
+        return R0 | OPW | POP | SWW
+    if op == 0x0c:
+        if rm in (0, 1):
+            return R0 | W0 | SWW               # fchs, fabs
+        if rm == 4:
+            return R0 | SWW | CWR              # ftst
+        if rm == 5:
+            return R0 | SWW                    # fxam
+        return 0
+    if op == 0x0d:
+        # fld1 / fldl2t / fldl2e / fldpi / fldlg2 / fldln2 / fldz.  The
+        # five middle ones pick their 80-bit pattern by switching on
+        # env->fpuc & FPU_RC_MASK; fld1 and fldz are exact in every
+        # rounding mode and read nothing.
+        if rm > 6:
+            return 0
+        return PUSH | W0 | SWW | (CWR if 1 <= rm <= 5 else 0)
+    if op == 0x0e:
+        return {
+            0: R0 | W0 | SWW | CWR,                        # f2xm1
+            1: R0 | R1 | W1 | POP | SWW | CWR,             # fyl2x
+            2: R0 | W0 | W1 | PUSH | SWW | CWR,            # fptan
+            3: R0 | R1 | W1 | POP | SWW | CWR,             # fpatan
+            4: R0 | W0 | W1 | PUSH | SWW | CWR,            # fxtract
+            5: R0 | R1 | W0 | SWW | CWR,                   # fprem1
+        }.get(rm, SWR | SWW)                    # fdecstp / fincstp
+    if op == 0x0f:
+        return {
+            0: R0 | R1 | W0 | SWW | CWR,                   # fprem
+            1: R0 | R1 | W1 | POP | SWW | CWR,             # fyl2xp1
+            3: R0 | W0 | W1 | PUSH | SWW | CWR,            # fsincos
+            5: R0 | R1 | W0 | SWW | CWR,                   # fscale
+        }.get(rm, R0 | W0 | SWW | CWR)   # fsqrt, frndint, fsin, fcos
+    if op == 0x15:
+        return (R0 | R1 | POP | SWW | CWR) if rm == 1 else 0   # fucompp
+    if op in (0x1d, 0x1e):
+        return R0 | SWW | CWR                              # fucomi/fcomi
+    if op == 0x2a:
+        return R0 | OPW | SWW                              # fst %st(i)
+    if op == 0x2c:
+        return R0 | SWW | CWR                              # fucom %st(i)
+    if op == 0x2d:
+        return R0 | POP | SWW | CWR                        # fucomp %st(i)
+    if op == 0x33:
+        return (R0 | R1 | POP | SWW | CWR) if rm == 1 else 0    # fcompp
+    if op == 0x38:
+        return POP                                         # ffreep %st(i)
+    if op == 0x3c:
+        return SWR if rm == 0 else 0                       # fnstsw %ax
+    if op in (0x3d, 0x3e):
+        return R0 | POP | SWW | CWR                    # fucomip / fcomip
+    if op in (0x10, 0x11, 0x12, 0x13, 0x18, 0x19, 0x1a, 0x1b):
+        return SWR                                         # FCMOVcc
+    if op == 0x28:
+        return SWR                                         # ffree %st(i)
+    return 0
+
+
+def _x86_x87_effects(raw: bytes) -> int:
+    """The table, plus the read of TOP every slot-naming row implies."""
+    fx = _x86_x87_effects_table(raw)
+    if fx & _X87F_STACK:
+        fx |= _X87F_SWR
+    return fx
+
+
+def _x86_eflags_bitmask_is_wrong(stem: str) -> bool:
+    """The four families whose Capstone eflags bitmask is contradicted by
+    both XED and LLVM MC, so the boundary throws it away."""
+    if stem.startswith("sysexit") or stem == "prefetchw":
+        return True
+    if stem in ("movss", "movsd"):
+        return True
+    if stem.startswith("cmp") and len(stem) >= 5 \
+            and stem[-2:] in ("ps", "pd", "ss", "sd"):
+        return True
+    return False
+
+
+_X86_SHIFT_STEMS = ("rol", "ror", "rcl", "rcr", "shl", "sal", "shr", "sar",
+                    "shld", "shrd")
+
+
+def _x86_eflags_read_lost(d, ops, op_reg_kind, stem: str) -> bool:
+    """The EFLAGS READS missing from the bitmask AND from regs_read, so no
+    amount of reading Capstone recovers them.  Each is a dependency QEMU's
+    own translator emits; see disas/capstone.c for the citation per family."""
+    try:
+        import capstone as _cs
+    except Exception:
+        return False
+    if stem == "cmc":
+        return True
+    if stem.startswith(("rcl", "rcr")):
+        return True                       # rotate THROUGH carry
+    if stem.startswith("popf"):
+        return True                       # masked write
+    if stem in ("cli", "sti"):
+        return True
+    if stem.startswith("fcmov"):
+        return True
+    if (stem.startswith(("in", "out")) and len(stem) <= 4
+            and not stem.startswith(("ins", "outs", "inc", "int", "inv"))):
+        return True
+    for pfx in _X86_SHIFT_STEMS:
+        if not stem.startswith(pfx):
+            continue
+        # A shift or rotate whose COUNT is CL: the count can be zero, and
+        # a zero count preserves every flag.  The MEMORY forms drop the
+        # count operand from the operand list entirely, so CL survives
+        # only in the implicit read list -- look there too.
+        for op in ops:
+            if op.type == op_reg_kind and int(op.reg) == _cs.x86.X86_REG_CL:
+                return True
+        for r in (getattr(d, "regs_read", []) or []):
+            if int(r) in (_cs.x86.X86_REG_CL, _cs.x86.X86_REG_CX,
+                          _cs.x86.X86_REG_ECX, _cs.x86.X86_REG_RCX):
+                return True
+        return False
+    return False
+
+
+_X86_EFLAGS_READ_MASK: int | None = None
+_X86_EFLAGS_WRITE_MASK: int | None = None
+
+
+def _x86_eflags_masks() -> tuple[int, int]:
+    """(reads, writes) over Capstone's per-flag bitmask.
+
+    The mapping is fixed by the architecture, not chosen here:
+    TEST -> READ, PRIOR -> READ+WRITE, MODIFY / SET / RESET / UNDEFINED
+    -> WRITE.  PRIOR is a READ because the dependency model has ONE flags
+    register and a partial rewrite takes the preserved part as an input.
+    """
+    global _X86_EFLAGS_READ_MASK, _X86_EFLAGS_WRITE_MASK
+    if _X86_EFLAGS_READ_MASK is None:
+        try:
+            from capstone import x86 as _x
+        except Exception:
+            return 0, 0
+        def _or(prefix: str, flags) -> int:
+            acc = 0
+            for f in flags:
+                v = getattr(_x, "X86_EFLAGS_" + prefix + "_" + f, None)
+                if v is not None:
+                    acc |= int(v)
+            return acc
+        prior = _or("PRIOR", ("OF", "SF", "ZF", "AF", "PF", "CF",
+                              "TF", "IF", "DF", "NT"))
+        test = _or("TEST", ("OF", "SF", "ZF", "PF", "CF", "NT",
+                            "DF", "RF", "IF", "TF", "AF"))
+        modify = _or("MODIFY", ("AF", "CF", "SF", "ZF", "PF", "OF",
+                                "TF", "IF", "DF", "NT", "RF"))
+        reset = _or("RESET", ("OF", "CF", "DF", "IF", "SF", "AF", "TF",
+                              "NT", "PF", "RF", "ZF", "0F", "AC"))
+        setb = _or("SET", ("CF", "DF", "IF", "OF", "SF", "ZF", "AF", "PF"))
+        undef = _or("UNDEFINED", ("OF", "SF", "ZF", "PF", "AF", "CF"))
+        _X86_EFLAGS_READ_MASK = test | prior
+        _X86_EFLAGS_WRITE_MASK = modify | reset | setb | undef | prior
+    return _X86_EFLAGS_READ_MASK, _X86_EFLAGS_WRITE_MASK
+
 
 
 def _riscv_csr_access(raw: bytes) -> int:
@@ -3959,6 +4241,81 @@ def _apply_boundary_corrections(isa, d, ops, op_reg_kind, op_mem_kind,
                 exp_src.add(_name)
             if _acc & 2:
                 exp_dst.add(_name)
+
+        # ---- the x87 implicit set ------------------------------------
+        # QEMU addresses the x87 stack through the ST0 / ST1 macros at
+        # the top of fpu_helper.c, so the read of env->fpstt -- the TOP
+        # field of the status word, which decides WHICH physical
+        # register %st(0) denotes -- appears in no helper's own text and
+        # in nothing Capstone reports.  cap_x86_x87_effects() states it
+        # for every row that names a slot, and the rounding-mode read of
+        # the five FLDxx constant loads alongside it.  Mirrored from the
+        # same escape byte + ModRM the boundary decodes, so a repair that
+        # were dropped would turn this row red instead of going quiet.
+        _raw = bytes(getattr(d, "bytes", b"") or b"")
+        _fx = _x86_x87_effects(_raw)
+        if _fx:
+            try:
+                import capstone as _cs
+                if _fx & _X87F_R0:
+                    add(exp_src, _cs.x86.X86_REG_ST0)
+                if _fx & _X87F_W0:
+                    add(exp_dst, _cs.x86.X86_REG_ST0)
+                if _fx & _X87F_R1:
+                    add(exp_src, _cs.x86.X86_REG_ST1)
+                if _fx & _X87F_W1:
+                    add(exp_dst, _cs.x86.X86_REG_ST1)
+                if _fx & _X87F_SWR:
+                    add(exp_src, _cs.x86.X86_REG_FPSW)
+                if _fx & _X87F_SWW:
+                    add(exp_dst, _cs.x86.X86_REG_FPSW)
+            except Exception:
+                pass
+            # cap_x86_add_x87_env() names the CONTROL word and the TAG
+            # word together; with_mxcsr is false on every form the
+            # effects table reaches, and MXCSR shares the tag word's id
+            # in any case.
+            if _fx & _X87F_CWR:
+                exp_src.add(_X86_SYSREG_X87CW)
+            if _fx & _X87F_CWW:
+                exp_dst.add(_X86_SYSREG_X87CW)
+            if _fx & _X87F_ENVR:
+                exp_src.add(_X86_SYSREG_X87CW)
+                exp_src.add(_X86_SYSREG_FPCTRL)
+            if _fx & _X87F_ENVW:
+                exp_dst.add(_X86_SYSREG_X87CW)
+                exp_dst.add(_X86_SYSREG_FPCTRL)
+        # ---- the EFLAGS dependency Capstone computes and never
+        # publishes.  cs_x86 carries a per-flag bitmask that never
+        # reaches regs_read / regs_write, so a consumer reading only the
+        # register lists sees `cli`, `lar` and `shld` with no flag
+        # dependency at all.  Order matters and matches
+        # cap_x86_eflags_from_bitmask(): the enumerated lost READS are
+        # settled FIRST, because FCMOVcc lives in the x87 escape space
+        # and the union guard below would otherwise swallow it.
+        try:
+            import capstone as _cs
+            _EFL = _cs.x86.X86_REG_EFLAGS
+            if _x86_eflags_read_lost(d, ops, op_reg_kind, stem):
+                add(exp_src, _EFL)
+            # detail->x86.eflags is a UNION with fpu_flags, so the field
+            # is only EFLAGS off the x87 escape space; Capstone's own FPU
+            # group catches FWAIT, whose 0x9B opcode is outside it.
+            _x87 = _x86_x87_escape_at(_raw) >= 0
+            if not _x87:
+                for _g in (getattr(d, "groups", []) or []):
+                    if int(_g) == _cs.x86.X86_GRP_FPU:
+                        _x87 = True
+                        break
+            if not _x87 and not _x86_eflags_bitmask_is_wrong(stem):
+                _ef = int(getattr(d, "eflags", 0) or 0)
+                _rm, _wm = _x86_eflags_masks()
+                if _ef & _wm:
+                    add(exp_dst, _EFL)
+                if _ef & _rm:
+                    add(exp_src, _EFL)
+        except Exception:
+            pass
 
 
 def _check_call_return_store(

@@ -7,10 +7,15 @@
 #
 # Every step checks the rc at the point it is produced, never through a
 # pipe, and every census refuses an empty input rather than reporting a
-# zero it did not measure.  In particular the mipsel arm is EXPECTED to
-# find no identities (the MIPS base ISA is decoded by a hand-written
-# switch, not by decodetree) -- so "0 identities" is only accepted there
-# after the probe has proved it read a non-zero number of records.
+# zero it did not measure.
+#
+# All three arms are expected to identify effectively every translated
+# instruction.  The mipsel arm used to be the exception -- the MIPS base
+# ISA is a hand-written switch, not decodetree, so this script once
+# accepted "0 identities" there.  It no longer does:
+# scripts/mips_ident_instrument.py exports that switch's own case labels,
+# and a mipsel arm reporting no identities now means the instrumentation
+# was lost, which is a failure and is checked for below.
 #
 # Author: Maccoy Merrell
 set -u
@@ -96,6 +101,26 @@ for pair in aarch64:aarch64 riscv:riscv64 mips:mipsel; do
     [ $rc -ne 0 ] && { cat "$OUT/CENSUS_TABLE_$isa.txt"; rc_total=1; }
     grep -E "carrying|row provenance|QID_|1:1|N:1|1:N|RESIDUE" \
         "$OUT/CENSUS_TABLE_$isa.txt" | head -12
+done
+
+note "identified fraction per ISA -- the number the export exists to move"
+for t in aarch64 riscv64 mipsel; do
+    line=$(awk -F'\t' '{n++; if ($2 == 0) z++}
+                        END {printf "records=%d no-identity=%d identified=%.3f%%",
+                                    n, z+0, n ? 100.0*(n-(z+0))/n : 0}' \
+               "$OUT"/tsv_${t}_*.tsv)
+    echo "  $t  $line"
+    frac=$(awk -F'\t' '{n++; if ($2 == 0) z++}
+                        END {print (n && (n-(z+0)) * 100 >= n * 99) ? "ok" : "LOW"}' \
+               "$OUT"/tsv_${t}_*.tsv)
+    if [ "$frac" != ok ]; then
+        echo "  FAIL: $t identifies under 99% of translated instructions"
+        rc_total=1
+    fi
+    # An instruction with no identity is named, never counted: a bare
+    # total cannot be reviewed and cannot be shown to be the right ones.
+    awk -F'\t' '$2 == 0 {print "    UNIDENTIFIED " $5}' \
+        "$OUT"/tsv_${t}_*.tsv | sort | uniq -c | sort -rn | head -20
 done
 
 note "verdict"

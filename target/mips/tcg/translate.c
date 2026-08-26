@@ -1312,8 +1312,84 @@ static inline void restore_cpu_state(CPUMIPSState *env, DisasContext *ctx)
     }
 }
 
+/*
+ * QEMU's own decode identity, for the decoder decodetree cannot reach.
+ *
+ * The MIPS32/64 base ISA is not in decodetree.  It is a nest of
+ * hand-written switch statements, so the identity export that
+ * scripts/decodetree.py plants at every generated dispatch site reaches
+ * the vendor extensions and none of the base ISA -- measured 0.000%
+ * identified over 42,885 translated instructions on a workload that
+ * identifies 100% on aarch64 and riscv64.  The identity is nevertheless
+ * here: it is the `case OPC_*` label the switch dispatched on.
+ *
+ * scripts/mips_ident_instrument.py states it, mechanically, at every
+ * such label -- selecting the row FROM THE SWITCH'S OWN CONTROLLING
+ * EXPRESSION, so a case covering several labels says which one it
+ * committed to, and a fallthrough into a later case selects nothing
+ * rather than that case's first label.  The table it emits is
+ * translate_ident.c.inc.
+ *
+ * The row is held here and published once, at the end of the
+ * instruction, rather than at the moment it is chosen.  Two properties
+ * of this decoder force that:
+ *
+ *  - the decode is nested (major opcode -> function -> sub-opcode ->
+ *    generator), so several labels are committed to for one
+ *    instruction and the innermost one is the identity;
+ *
+ *  - a MIPS availability check does not decline the way a decodetree
+ *    trans_ function declines.  check_insn() and its siblings generate
+ *    the exception and translation CONTINUES, generating dead code from
+ *    labels further in.  Publishing eagerly would therefore publish a
+ *    decision the emulator did not take.  mips_ident_fault() poisons the
+ *    slot instead, and the poison is sticky for the rest of the
+ *    instruction.
+ */
+#include "translate_ident.c.inc"
+
+static void mips_ident(DisasContext *ctx, MipsIdent id)
+{
+    if (id != MIPS_ID_NONE && ctx->decode_ident != MIPS_ID_FAULTED) {
+        ctx->decode_ident = id;
+    }
+}
+
+/*
+ * The exceptions below are the ones raised at translation time because
+ * the encoding is not available on this CPU in this state -- the
+ * instruction faults instead of executing, so QEMU made no decode and
+ * none may be published.  Every other exception this translator raises
+ * is what a correctly decoded instruction DOES: EXCP_SYSCALL,
+ * EXCP_BREAK, EXCP_TRAP, EXCP_OVERFLOW, EXCP_SEMIHOST, EXCP_DBp.
+ */
+static void mips_ident_fault(DisasContext *ctx, int excp)
+{
+    switch (excp) {
+    case EXCP_RI:
+    case EXCP_CpU:
+    case EXCP_DSPDIS:
+    case EXCP_MSADIS:
+        ctx->decode_ident = MIPS_ID_FAULTED;
+        break;
+    default:
+        break;
+    }
+}
+
+static void mips_ident_publish(DisasContext *ctx)
+{
+    uint16_t id = ctx->decode_ident;
+
+    if (id != MIPS_ID_NONE && id != MIPS_ID_FAULTED) {
+        plugin_gen_record_insn_identity(mips_ident_tab[id].id,
+                                        mips_ident_tab[id].name);
+    }
+}
+
 void generate_exception_err(DisasContext *ctx, int excp, int err)
 {
+    mips_ident_fault(ctx, excp);
     save_cpu_state(ctx, 1);
     gen_helper_raise_exception_err(tcg_env, tcg_constant_i32(excp),
                                    tcg_constant_i32(err));
@@ -1322,6 +1398,7 @@ void generate_exception_err(DisasContext *ctx, int excp, int err)
 
 void generate_exception(DisasContext *ctx, int excp)
 {
+    mips_ident_fault(ctx, excp);
     gen_helper_raise_exception(tcg_env, tcg_constant_i32(excp));
 }
 
@@ -2049,33 +2126,52 @@ static void gen_ld(DisasContext *ctx, uint32_t opc,
     switch (opc) {
 #if defined(TARGET_MIPS64)
     case OPC_LWU:
+        mips_ident(ctx,
+            opc == OPC_LWU ? MIPS_ID_OPC_LWU :
+            MIPS_ID_NONE);
         tcg_gen_qemu_ld_tl(t0, t0, mem_idx, mo_endian(ctx) | MO_UL |
                            ctx->default_tcg_memop_mask);
         gen_store_gpr(t0, rt);
         break;
     case OPC_LD:
+        mips_ident(ctx,
+            opc == OPC_LD ? MIPS_ID_OPC_LD :
+            MIPS_ID_NONE);
         tcg_gen_qemu_ld_tl(t0, t0, mem_idx, mo_endian(ctx) | MO_UQ |
                            ctx->default_tcg_memop_mask);
         gen_store_gpr(t0, rt);
         break;
     case OPC_LLD:
     case R6_OPC_LLD:
+        mips_ident(ctx,
+            opc == OPC_LLD ? MIPS_ID_OPC_LLD :
+            opc == R6_OPC_LLD ? MIPS_ID_R6_OPC_LLD :
+            MIPS_ID_NONE);
         op_ld_lld(t0, t0, mem_idx, ctx);
         gen_store_gpr(t0, rt);
         break;
     case OPC_LDL:
+        mips_ident(ctx,
+            opc == OPC_LDL ? MIPS_ID_OPC_LDL :
+            MIPS_ID_NONE);
         t1 = tcg_temp_new();
         gen_load_gpr(t1, rt);
         gen_lxl(ctx, t1, t0, mem_idx, mo_endian(ctx) | MO_UQ);
         gen_store_gpr(t1, rt);
         break;
     case OPC_LDR:
+        mips_ident(ctx,
+            opc == OPC_LDR ? MIPS_ID_OPC_LDR :
+            MIPS_ID_NONE);
         t1 = tcg_temp_new();
         gen_load_gpr(t1, rt);
         gen_lxr(ctx, t1, t0, mem_idx, mo_endian(ctx) | MO_UQ);
         gen_store_gpr(t1, rt);
         break;
     case OPC_LDPC:
+        mips_ident(ctx,
+            opc == OPC_LDPC ? MIPS_ID_OPC_LDPC :
+            MIPS_ID_NONE);
         t1 = tcg_constant_tl(pc_relative_pc(ctx));
         gen_op_addr_add(ctx, t0, t0, t1);
         tcg_gen_qemu_ld_tl(t0, t0, mem_idx, mo_endian(ctx) | MO_UQ);
@@ -2083,53 +2179,92 @@ static void gen_ld(DisasContext *ctx, uint32_t opc,
         break;
 #endif
     case OPC_LWPC:
+        mips_ident(ctx,
+            opc == OPC_LWPC ? MIPS_ID_OPC_LWPC :
+            MIPS_ID_NONE);
         t1 = tcg_constant_tl(pc_relative_pc(ctx));
         gen_op_addr_add(ctx, t0, t0, t1);
         tcg_gen_qemu_ld_tl(t0, t0, mem_idx, mo_endian(ctx) | MO_SL);
         gen_store_gpr(t0, rt);
         break;
     case OPC_LWE:
+        mips_ident(ctx,
+            opc == OPC_LWE ? MIPS_ID_OPC_LWE :
+            MIPS_ID_NONE);
         mem_idx = MIPS_HFLAG_UM;
         /* fall through */
     case OPC_LW:
+        mips_ident(ctx,
+            opc == OPC_LW ? MIPS_ID_OPC_LW :
+            MIPS_ID_NONE);
         tcg_gen_qemu_ld_tl(t0, t0, mem_idx, mo_endian(ctx) | MO_SL |
                            ctx->default_tcg_memop_mask);
         gen_store_gpr(t0, rt);
         break;
     case OPC_LHE:
+        mips_ident(ctx,
+            opc == OPC_LHE ? MIPS_ID_OPC_LHE :
+            MIPS_ID_NONE);
         mem_idx = MIPS_HFLAG_UM;
         /* fall through */
     case OPC_LH:
+        mips_ident(ctx,
+            opc == OPC_LH ? MIPS_ID_OPC_LH :
+            MIPS_ID_NONE);
         tcg_gen_qemu_ld_tl(t0, t0, mem_idx, mo_endian(ctx) | MO_SW |
                            ctx->default_tcg_memop_mask);
         gen_store_gpr(t0, rt);
         break;
     case OPC_LHUE:
+        mips_ident(ctx,
+            opc == OPC_LHUE ? MIPS_ID_OPC_LHUE :
+            MIPS_ID_NONE);
         mem_idx = MIPS_HFLAG_UM;
         /* fall through */
     case OPC_LHU:
+        mips_ident(ctx,
+            opc == OPC_LHU ? MIPS_ID_OPC_LHU :
+            MIPS_ID_NONE);
         tcg_gen_qemu_ld_tl(t0, t0, mem_idx, mo_endian(ctx) | MO_UW |
                            ctx->default_tcg_memop_mask);
         gen_store_gpr(t0, rt);
         break;
     case OPC_LBE:
+        mips_ident(ctx,
+            opc == OPC_LBE ? MIPS_ID_OPC_LBE :
+            MIPS_ID_NONE);
         mem_idx = MIPS_HFLAG_UM;
         /* fall through */
     case OPC_LB:
+        mips_ident(ctx,
+            opc == OPC_LB ? MIPS_ID_OPC_LB :
+            MIPS_ID_NONE);
         tcg_gen_qemu_ld_tl(t0, t0, mem_idx, MO_SB);
         gen_store_gpr(t0, rt);
         break;
     case OPC_LBUE:
+        mips_ident(ctx,
+            opc == OPC_LBUE ? MIPS_ID_OPC_LBUE :
+            MIPS_ID_NONE);
         mem_idx = MIPS_HFLAG_UM;
         /* fall through */
     case OPC_LBU:
+        mips_ident(ctx,
+            opc == OPC_LBU ? MIPS_ID_OPC_LBU :
+            MIPS_ID_NONE);
         tcg_gen_qemu_ld_tl(t0, t0, mem_idx, MO_UB);
         gen_store_gpr(t0, rt);
         break;
     case OPC_LWLE:
+        mips_ident(ctx,
+            opc == OPC_LWLE ? MIPS_ID_OPC_LWLE :
+            MIPS_ID_NONE);
         mem_idx = MIPS_HFLAG_UM;
         /* fall through */
     case OPC_LWL:
+        mips_ident(ctx,
+            opc == OPC_LWL ? MIPS_ID_OPC_LWL :
+            MIPS_ID_NONE);
         t1 = tcg_temp_new();
         gen_load_gpr(t1, rt);
         gen_lxl(ctx, t1, t0, mem_idx, mo_endian(ctx) | MO_UL);
@@ -2137,9 +2272,15 @@ static void gen_ld(DisasContext *ctx, uint32_t opc,
         gen_store_gpr(t1, rt);
         break;
     case OPC_LWRE:
+        mips_ident(ctx,
+            opc == OPC_LWRE ? MIPS_ID_OPC_LWRE :
+            MIPS_ID_NONE);
         mem_idx = MIPS_HFLAG_UM;
         /* fall through */
     case OPC_LWR:
+        mips_ident(ctx,
+            opc == OPC_LWR ? MIPS_ID_OPC_LWR :
+            MIPS_ID_NONE);
         t1 = tcg_temp_new();
         gen_load_gpr(t1, rt);
         gen_lxr(ctx, t1, t0, mem_idx, mo_endian(ctx) | MO_UL);
@@ -2147,10 +2288,17 @@ static void gen_ld(DisasContext *ctx, uint32_t opc,
         gen_store_gpr(t1, rt);
         break;
     case OPC_LLE:
+        mips_ident(ctx,
+            opc == OPC_LLE ? MIPS_ID_OPC_LLE :
+            MIPS_ID_NONE);
         mem_idx = MIPS_HFLAG_UM;
         /* fall through */
     case OPC_LL:
     case R6_OPC_LL:
+        mips_ident(ctx,
+            opc == OPC_LL ? MIPS_ID_OPC_LL :
+            opc == R6_OPC_LL ? MIPS_ID_R6_OPC_LL :
+            MIPS_ID_NONE);
         op_ld_ll(t0, t0, mem_idx, ctx);
         gen_store_gpr(t0, rt);
         break;
@@ -2170,46 +2318,85 @@ static void gen_st(DisasContext *ctx, uint32_t opc, int rt,
     switch (opc) {
 #if defined(TARGET_MIPS64)
     case OPC_SD:
+        mips_ident(ctx,
+            opc == OPC_SD ? MIPS_ID_OPC_SD :
+            MIPS_ID_NONE);
         tcg_gen_qemu_st_tl(t1, t0, mem_idx, mo_endian(ctx) | MO_UQ |
                            ctx->default_tcg_memop_mask);
         break;
     case OPC_SDL:
+        mips_ident(ctx,
+            opc == OPC_SDL ? MIPS_ID_OPC_SDL :
+            MIPS_ID_NONE);
         gen_helper_0e2i(sdl, t1, t0, mem_idx);
         break;
     case OPC_SDR:
+        mips_ident(ctx,
+            opc == OPC_SDR ? MIPS_ID_OPC_SDR :
+            MIPS_ID_NONE);
         gen_helper_0e2i(sdr, t1, t0, mem_idx);
         break;
 #endif
     case OPC_SWE:
+        mips_ident(ctx,
+            opc == OPC_SWE ? MIPS_ID_OPC_SWE :
+            MIPS_ID_NONE);
         mem_idx = MIPS_HFLAG_UM;
         /* fall through */
     case OPC_SW:
+        mips_ident(ctx,
+            opc == OPC_SW ? MIPS_ID_OPC_SW :
+            MIPS_ID_NONE);
         tcg_gen_qemu_st_tl(t1, t0, mem_idx, mo_endian(ctx) | MO_UL |
                            ctx->default_tcg_memop_mask);
         break;
     case OPC_SHE:
+        mips_ident(ctx,
+            opc == OPC_SHE ? MIPS_ID_OPC_SHE :
+            MIPS_ID_NONE);
         mem_idx = MIPS_HFLAG_UM;
         /* fall through */
     case OPC_SH:
+        mips_ident(ctx,
+            opc == OPC_SH ? MIPS_ID_OPC_SH :
+            MIPS_ID_NONE);
         tcg_gen_qemu_st_tl(t1, t0, mem_idx, mo_endian(ctx) | MO_UW |
                            ctx->default_tcg_memop_mask);
         break;
     case OPC_SBE:
+        mips_ident(ctx,
+            opc == OPC_SBE ? MIPS_ID_OPC_SBE :
+            MIPS_ID_NONE);
         mem_idx = MIPS_HFLAG_UM;
         /* fall through */
     case OPC_SB:
+        mips_ident(ctx,
+            opc == OPC_SB ? MIPS_ID_OPC_SB :
+            MIPS_ID_NONE);
         tcg_gen_qemu_st_tl(t1, t0, mem_idx, MO_8);
         break;
     case OPC_SWLE:
+        mips_ident(ctx,
+            opc == OPC_SWLE ? MIPS_ID_OPC_SWLE :
+            MIPS_ID_NONE);
         mem_idx = MIPS_HFLAG_UM;
         /* fall through */
     case OPC_SWL:
+        mips_ident(ctx,
+            opc == OPC_SWL ? MIPS_ID_OPC_SWL :
+            MIPS_ID_NONE);
         gen_helper_0e2i(swl, t1, t0, mem_idx);
         break;
     case OPC_SWRE:
+        mips_ident(ctx,
+            opc == OPC_SWRE ? MIPS_ID_OPC_SWRE :
+            MIPS_ID_NONE);
         mem_idx = MIPS_HFLAG_UM;
         /* fall through */
     case OPC_SWR:
+        mips_ident(ctx,
+            opc == OPC_SWR ? MIPS_ID_OPC_SWR :
+            MIPS_ID_NONE);
         gen_helper_0e2i(swr, t1, t0, mem_idx);
         break;
     }
@@ -2265,6 +2452,9 @@ static void gen_flt_ldst(DisasContext *ctx, uint32_t opc, int ft,
      */
     switch (opc) {
     case OPC_LWC1:
+        mips_ident(ctx,
+            opc == OPC_LWC1 ? MIPS_ID_OPC_LWC1 :
+            MIPS_ID_NONE);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
             tcg_gen_qemu_ld_i32(fp0, t0, ctx->mem_idx, mo_endian(ctx) | MO_SL |
@@ -2273,6 +2463,9 @@ static void gen_flt_ldst(DisasContext *ctx, uint32_t opc, int ft,
         }
         break;
     case OPC_SWC1:
+        mips_ident(ctx,
+            opc == OPC_SWC1 ? MIPS_ID_OPC_SWC1 :
+            MIPS_ID_NONE);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
             gen_load_fpr32(ctx, fp0, ft);
@@ -2281,6 +2474,9 @@ static void gen_flt_ldst(DisasContext *ctx, uint32_t opc, int ft,
         }
         break;
     case OPC_LDC1:
+        mips_ident(ctx,
+            opc == OPC_LDC1 ? MIPS_ID_OPC_LDC1 :
+            MIPS_ID_NONE);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
             tcg_gen_qemu_ld_i64(fp0, t0, ctx->mem_idx, mo_endian(ctx) | MO_UQ |
@@ -2289,6 +2485,9 @@ static void gen_flt_ldst(DisasContext *ctx, uint32_t opc, int ft,
         }
         break;
     case OPC_SDC1:
+        mips_ident(ctx,
+            opc == OPC_SDC1 ? MIPS_ID_OPC_SDC1 :
+            MIPS_ID_NONE);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
             gen_load_fpr64(ctx, fp0, ft);
@@ -2313,6 +2512,10 @@ static void gen_cop1_ldst(DisasContext *ctx, uint32_t op, int rt,
         switch (op) {
         case OPC_LDC1:
         case OPC_SDC1:
+            mips_ident(ctx,
+                op == OPC_LDC1 ? MIPS_ID_OPC_LDC1 :
+                op == OPC_SDC1 ? MIPS_ID_OPC_SDC1 :
+                MIPS_ID_NONE);
             check_insn(ctx, ISA_MIPS2);
             /* Fallthrough */
         default:
@@ -2339,6 +2542,9 @@ static void gen_arith_imm(DisasContext *ctx, uint32_t opc,
     }
     switch (opc) {
     case OPC_ADDI:
+        mips_ident(ctx,
+            opc == OPC_ADDI ? MIPS_ID_OPC_ADDI :
+            MIPS_ID_NONE);
         {
             TCGv t0 = tcg_temp_new();
             TCGv t1 = tcg_temp_new();
@@ -2361,6 +2567,9 @@ static void gen_arith_imm(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_ADDIU:
+        mips_ident(ctx,
+            opc == OPC_ADDIU ? MIPS_ID_OPC_ADDIU :
+            MIPS_ID_NONE);
         if (rs != 0) {
             tcg_gen_addi_tl(cpu_gpr[rt], cpu_gpr[rs], uimm);
             tcg_gen_ext32s_tl(cpu_gpr[rt], cpu_gpr[rt]);
@@ -2370,6 +2579,9 @@ static void gen_arith_imm(DisasContext *ctx, uint32_t opc,
         break;
 #if defined(TARGET_MIPS64)
     case OPC_DADDI:
+        mips_ident(ctx,
+            opc == OPC_DADDI ? MIPS_ID_OPC_DADDI :
+            MIPS_ID_NONE);
         {
             TCGv t0 = tcg_temp_new();
             TCGv t1 = tcg_temp_new();
@@ -2390,6 +2602,9 @@ static void gen_arith_imm(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_DADDIU:
+        mips_ident(ctx,
+            opc == OPC_DADDIU ? MIPS_ID_OPC_DADDIU :
+            MIPS_ID_NONE);
         if (rs != 0) {
             tcg_gen_addi_tl(cpu_gpr[rt], cpu_gpr[rs], uimm);
         } else {
@@ -2413,6 +2628,9 @@ static void gen_logic_imm(DisasContext *ctx, uint32_t opc,
     uimm = (uint16_t)imm;
     switch (opc) {
     case OPC_ANDI:
+        mips_ident(ctx,
+            opc == OPC_ANDI ? MIPS_ID_OPC_ANDI :
+            MIPS_ID_NONE);
         if (likely(rs != 0)) {
             tcg_gen_andi_tl(cpu_gpr[rt], cpu_gpr[rs], uimm);
         } else {
@@ -2420,6 +2638,9 @@ static void gen_logic_imm(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_ORI:
+        mips_ident(ctx,
+            opc == OPC_ORI ? MIPS_ID_OPC_ORI :
+            MIPS_ID_NONE);
         if (rs != 0) {
             tcg_gen_ori_tl(cpu_gpr[rt], cpu_gpr[rs], uimm);
         } else {
@@ -2427,6 +2648,9 @@ static void gen_logic_imm(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_XORI:
+        mips_ident(ctx,
+            opc == OPC_XORI ? MIPS_ID_OPC_XORI :
+            MIPS_ID_NONE);
         if (likely(rs != 0)) {
             tcg_gen_xori_tl(cpu_gpr[rt], cpu_gpr[rs], uimm);
         } else {
@@ -2434,6 +2658,9 @@ static void gen_logic_imm(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_LUI:
+        mips_ident(ctx,
+            opc == OPC_LUI ? MIPS_ID_OPC_LUI :
+            MIPS_ID_NONE);
         if (rs != 0 && (ctx->insn_flags & ISA_MIPS_R6)) {
             /* OPC_AUI */
             tcg_gen_addi_tl(cpu_gpr[rt], cpu_gpr[rs], imm << 16);
@@ -2463,9 +2690,15 @@ static void gen_slt_imm(DisasContext *ctx, uint32_t opc,
     gen_load_gpr(t0, rs);
     switch (opc) {
     case OPC_SLTI:
+        mips_ident(ctx,
+            opc == OPC_SLTI ? MIPS_ID_OPC_SLTI :
+            MIPS_ID_NONE);
         tcg_gen_setcondi_tl(TCG_COND_LT, cpu_gpr[rt], t0, uimm);
         break;
     case OPC_SLTIU:
+        mips_ident(ctx,
+            opc == OPC_SLTIU ? MIPS_ID_OPC_SLTIU :
+            MIPS_ID_NONE);
         tcg_gen_setcondi_tl(TCG_COND_LTU, cpu_gpr[rt], t0, uimm);
         break;
     }
@@ -2487,13 +2720,22 @@ static void gen_shift_imm(DisasContext *ctx, uint32_t opc,
     gen_load_gpr(t0, rs);
     switch (opc) {
     case OPC_SLL:
+        mips_ident(ctx,
+            opc == OPC_SLL ? MIPS_ID_OPC_SLL :
+            MIPS_ID_NONE);
         tcg_gen_shli_tl(t0, t0, uimm);
         tcg_gen_ext32s_tl(cpu_gpr[rt], t0);
         break;
     case OPC_SRA:
+        mips_ident(ctx,
+            opc == OPC_SRA ? MIPS_ID_OPC_SRA :
+            MIPS_ID_NONE);
         tcg_gen_sari_tl(cpu_gpr[rt], t0, uimm);
         break;
     case OPC_SRL:
+        mips_ident(ctx,
+            opc == OPC_SRL ? MIPS_ID_OPC_SRL :
+            MIPS_ID_NONE);
         if (uimm != 0) {
             tcg_gen_ext32u_tl(t0, t0);
             tcg_gen_shri_tl(cpu_gpr[rt], t0, uimm);
@@ -2502,6 +2744,9 @@ static void gen_shift_imm(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_ROTR:
+        mips_ident(ctx,
+            opc == OPC_ROTR ? MIPS_ID_OPC_ROTR :
+            MIPS_ID_NONE);
         if (uimm != 0) {
             TCGv_i32 t1 = tcg_temp_new_i32();
 
@@ -2514,15 +2759,27 @@ static void gen_shift_imm(DisasContext *ctx, uint32_t opc,
         break;
 #if defined(TARGET_MIPS64)
     case OPC_DSLL:
+        mips_ident(ctx,
+            opc == OPC_DSLL ? MIPS_ID_OPC_DSLL :
+            MIPS_ID_NONE);
         tcg_gen_shli_tl(cpu_gpr[rt], t0, uimm);
         break;
     case OPC_DSRA:
+        mips_ident(ctx,
+            opc == OPC_DSRA ? MIPS_ID_OPC_DSRA :
+            MIPS_ID_NONE);
         tcg_gen_sari_tl(cpu_gpr[rt], t0, uimm);
         break;
     case OPC_DSRL:
+        mips_ident(ctx,
+            opc == OPC_DSRL ? MIPS_ID_OPC_DSRL :
+            MIPS_ID_NONE);
         tcg_gen_shri_tl(cpu_gpr[rt], t0, uimm);
         break;
     case OPC_DROTR:
+        mips_ident(ctx,
+            opc == OPC_DROTR ? MIPS_ID_OPC_DROTR :
+            MIPS_ID_NONE);
         if (uimm != 0) {
             tcg_gen_rotri_tl(cpu_gpr[rt], t0, uimm);
         } else {
@@ -2530,15 +2787,27 @@ static void gen_shift_imm(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_DSLL32:
+        mips_ident(ctx,
+            opc == OPC_DSLL32 ? MIPS_ID_OPC_DSLL32 :
+            MIPS_ID_NONE);
         tcg_gen_shli_tl(cpu_gpr[rt], t0, uimm + 32);
         break;
     case OPC_DSRA32:
+        mips_ident(ctx,
+            opc == OPC_DSRA32 ? MIPS_ID_OPC_DSRA32 :
+            MIPS_ID_NONE);
         tcg_gen_sari_tl(cpu_gpr[rt], t0, uimm + 32);
         break;
     case OPC_DSRL32:
+        mips_ident(ctx,
+            opc == OPC_DSRL32 ? MIPS_ID_OPC_DSRL32 :
+            MIPS_ID_NONE);
         tcg_gen_shri_tl(cpu_gpr[rt], t0, uimm + 32);
         break;
     case OPC_DROTR32:
+        mips_ident(ctx,
+            opc == OPC_DROTR32 ? MIPS_ID_OPC_DROTR32 :
+            MIPS_ID_NONE);
         tcg_gen_rotri_tl(cpu_gpr[rt], t0, uimm + 32);
         break;
 #endif
@@ -2560,6 +2829,9 @@ static void gen_arith(DisasContext *ctx, uint32_t opc,
 
     switch (opc) {
     case OPC_ADD:
+        mips_ident(ctx,
+            opc == OPC_ADD ? MIPS_ID_OPC_ADD :
+            MIPS_ID_NONE);
         {
             TCGv t0 = tcg_temp_new();
             TCGv t1 = tcg_temp_new();
@@ -2581,6 +2853,9 @@ static void gen_arith(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_ADDU:
+        mips_ident(ctx,
+            opc == OPC_ADDU ? MIPS_ID_OPC_ADDU :
+            MIPS_ID_NONE);
         if (rs != 0 && rt != 0) {
             tcg_gen_add_tl(cpu_gpr[rd], cpu_gpr[rs], cpu_gpr[rt]);
             tcg_gen_ext32s_tl(cpu_gpr[rd], cpu_gpr[rd]);
@@ -2593,6 +2868,9 @@ static void gen_arith(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_SUB:
+        mips_ident(ctx,
+            opc == OPC_SUB ? MIPS_ID_OPC_SUB :
+            MIPS_ID_NONE);
         {
             TCGv t0 = tcg_temp_new();
             TCGv t1 = tcg_temp_new();
@@ -2617,6 +2895,9 @@ static void gen_arith(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_SUBU:
+        mips_ident(ctx,
+            opc == OPC_SUBU ? MIPS_ID_OPC_SUBU :
+            MIPS_ID_NONE);
         if (rs != 0 && rt != 0) {
             tcg_gen_sub_tl(cpu_gpr[rd], cpu_gpr[rs], cpu_gpr[rt]);
             tcg_gen_ext32s_tl(cpu_gpr[rd], cpu_gpr[rd]);
@@ -2631,6 +2912,9 @@ static void gen_arith(DisasContext *ctx, uint32_t opc,
         break;
 #if defined(TARGET_MIPS64)
     case OPC_DADD:
+        mips_ident(ctx,
+            opc == OPC_DADD ? MIPS_ID_OPC_DADD :
+            MIPS_ID_NONE);
         {
             TCGv t0 = tcg_temp_new();
             TCGv t1 = tcg_temp_new();
@@ -2651,6 +2935,9 @@ static void gen_arith(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_DADDU:
+        mips_ident(ctx,
+            opc == OPC_DADDU ? MIPS_ID_OPC_DADDU :
+            MIPS_ID_NONE);
         if (rs != 0 && rt != 0) {
             tcg_gen_add_tl(cpu_gpr[rd], cpu_gpr[rs], cpu_gpr[rt]);
         } else if (rs == 0 && rt != 0) {
@@ -2662,6 +2949,9 @@ static void gen_arith(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_DSUB:
+        mips_ident(ctx,
+            opc == OPC_DSUB ? MIPS_ID_OPC_DSUB :
+            MIPS_ID_NONE);
         {
             TCGv t0 = tcg_temp_new();
             TCGv t1 = tcg_temp_new();
@@ -2685,6 +2975,9 @@ static void gen_arith(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_DSUBU:
+        mips_ident(ctx,
+            opc == OPC_DSUBU ? MIPS_ID_OPC_DSUBU :
+            MIPS_ID_NONE);
         if (rs != 0 && rt != 0) {
             tcg_gen_sub_tl(cpu_gpr[rd], cpu_gpr[rs], cpu_gpr[rt]);
         } else if (rs == 0 && rt != 0) {
@@ -2697,6 +2990,9 @@ static void gen_arith(DisasContext *ctx, uint32_t opc,
         break;
 #endif
     case OPC_MUL:
+        mips_ident(ctx,
+            opc == OPC_MUL ? MIPS_ID_OPC_MUL :
+            MIPS_ID_NONE);
         if (likely(rs != 0 && rt != 0)) {
             tcg_gen_mul_tl(cpu_gpr[rd], cpu_gpr[rs], cpu_gpr[rt]);
             tcg_gen_ext32s_tl(cpu_gpr[rd], cpu_gpr[rd]);
@@ -2725,15 +3021,27 @@ static void gen_cond_move(DisasContext *ctx, uint32_t opc,
     gen_load_gpr(t2, rs);
     switch (opc) {
     case OPC_MOVN:
+        mips_ident(ctx,
+            opc == OPC_MOVN ? MIPS_ID_OPC_MOVN :
+            MIPS_ID_NONE);
         tcg_gen_movcond_tl(TCG_COND_NE, cpu_gpr[rd], t0, t1, t2, cpu_gpr[rd]);
         break;
     case OPC_MOVZ:
+        mips_ident(ctx,
+            opc == OPC_MOVZ ? MIPS_ID_OPC_MOVZ :
+            MIPS_ID_NONE);
         tcg_gen_movcond_tl(TCG_COND_EQ, cpu_gpr[rd], t0, t1, t2, cpu_gpr[rd]);
         break;
     case OPC_SELNEZ:
+        mips_ident(ctx,
+            opc == OPC_SELNEZ ? MIPS_ID_OPC_SELNEZ :
+            MIPS_ID_NONE);
         tcg_gen_movcond_tl(TCG_COND_NE, cpu_gpr[rd], t0, t1, t2, t1);
         break;
     case OPC_SELEQZ:
+        mips_ident(ctx,
+            opc == OPC_SELEQZ ? MIPS_ID_OPC_SELEQZ :
+            MIPS_ID_NONE);
         tcg_gen_movcond_tl(TCG_COND_EQ, cpu_gpr[rd], t0, t1, t2, t1);
         break;
     }
@@ -2750,6 +3058,9 @@ static void gen_logic(DisasContext *ctx, uint32_t opc,
 
     switch (opc) {
     case OPC_AND:
+        mips_ident(ctx,
+            opc == OPC_AND ? MIPS_ID_OPC_AND :
+            MIPS_ID_NONE);
         if (likely(rs != 0 && rt != 0)) {
             tcg_gen_and_tl(cpu_gpr[rd], cpu_gpr[rs], cpu_gpr[rt]);
         } else {
@@ -2757,6 +3068,9 @@ static void gen_logic(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_NOR:
+        mips_ident(ctx,
+            opc == OPC_NOR ? MIPS_ID_OPC_NOR :
+            MIPS_ID_NONE);
         if (rs != 0 && rt != 0) {
             tcg_gen_nor_tl(cpu_gpr[rd], cpu_gpr[rs], cpu_gpr[rt]);
         } else if (rs == 0 && rt != 0) {
@@ -2768,6 +3082,9 @@ static void gen_logic(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_OR:
+        mips_ident(ctx,
+            opc == OPC_OR ? MIPS_ID_OPC_OR :
+            MIPS_ID_NONE);
         if (likely(rs != 0 && rt != 0)) {
             tcg_gen_or_tl(cpu_gpr[rd], cpu_gpr[rs], cpu_gpr[rt]);
         } else if (rs == 0 && rt != 0) {
@@ -2779,6 +3096,9 @@ static void gen_logic(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_XOR:
+        mips_ident(ctx,
+            opc == OPC_XOR ? MIPS_ID_OPC_XOR :
+            MIPS_ID_NONE);
         if (likely(rs != 0 && rt != 0)) {
             tcg_gen_xor_tl(cpu_gpr[rd], cpu_gpr[rs], cpu_gpr[rt]);
         } else if (rs == 0 && rt != 0) {
@@ -2809,9 +3129,15 @@ static void gen_slt(DisasContext *ctx, uint32_t opc,
     gen_load_gpr(t1, rt);
     switch (opc) {
     case OPC_SLT:
+        mips_ident(ctx,
+            opc == OPC_SLT ? MIPS_ID_OPC_SLT :
+            MIPS_ID_NONE);
         tcg_gen_setcond_tl(TCG_COND_LT, cpu_gpr[rd], t0, t1);
         break;
     case OPC_SLTU:
+        mips_ident(ctx,
+            opc == OPC_SLTU ? MIPS_ID_OPC_SLTU :
+            MIPS_ID_NONE);
         tcg_gen_setcond_tl(TCG_COND_LTU, cpu_gpr[rd], t0, t1);
         break;
     }
@@ -2837,21 +3163,33 @@ static void gen_shift(DisasContext *ctx, uint32_t opc,
     gen_load_gpr(t1, rt);
     switch (opc) {
     case OPC_SLLV:
+        mips_ident(ctx,
+            opc == OPC_SLLV ? MIPS_ID_OPC_SLLV :
+            MIPS_ID_NONE);
         tcg_gen_andi_tl(t0, t0, 0x1f);
         tcg_gen_shl_tl(t0, t1, t0);
         tcg_gen_ext32s_tl(cpu_gpr[rd], t0);
         break;
     case OPC_SRAV:
+        mips_ident(ctx,
+            opc == OPC_SRAV ? MIPS_ID_OPC_SRAV :
+            MIPS_ID_NONE);
         tcg_gen_andi_tl(t0, t0, 0x1f);
         tcg_gen_sar_tl(cpu_gpr[rd], t1, t0);
         break;
     case OPC_SRLV:
+        mips_ident(ctx,
+            opc == OPC_SRLV ? MIPS_ID_OPC_SRLV :
+            MIPS_ID_NONE);
         tcg_gen_ext32u_tl(t1, t1);
         tcg_gen_andi_tl(t0, t0, 0x1f);
         tcg_gen_shr_tl(t0, t1, t0);
         tcg_gen_ext32s_tl(cpu_gpr[rd], t0);
         break;
     case OPC_ROTRV:
+        mips_ident(ctx,
+            opc == OPC_ROTRV ? MIPS_ID_OPC_ROTRV :
+            MIPS_ID_NONE);
         {
             TCGv_i32 t2 = tcg_temp_new_i32();
             TCGv_i32 t3 = tcg_temp_new_i32();
@@ -2865,18 +3203,30 @@ static void gen_shift(DisasContext *ctx, uint32_t opc,
         break;
 #if defined(TARGET_MIPS64)
     case OPC_DSLLV:
+        mips_ident(ctx,
+            opc == OPC_DSLLV ? MIPS_ID_OPC_DSLLV :
+            MIPS_ID_NONE);
         tcg_gen_andi_tl(t0, t0, 0x3f);
         tcg_gen_shl_tl(cpu_gpr[rd], t1, t0);
         break;
     case OPC_DSRAV:
+        mips_ident(ctx,
+            opc == OPC_DSRAV ? MIPS_ID_OPC_DSRAV :
+            MIPS_ID_NONE);
         tcg_gen_andi_tl(t0, t0, 0x3f);
         tcg_gen_sar_tl(cpu_gpr[rd], t1, t0);
         break;
     case OPC_DSRLV:
+        mips_ident(ctx,
+            opc == OPC_DSRLV ? MIPS_ID_OPC_DSRLV :
+            MIPS_ID_NONE);
         tcg_gen_andi_tl(t0, t0, 0x3f);
         tcg_gen_shr_tl(cpu_gpr[rd], t1, t0);
         break;
     case OPC_DROTRV:
+        mips_ident(ctx,
+            opc == OPC_DROTRV ? MIPS_ID_OPC_DROTRV :
+            MIPS_ID_NONE);
         tcg_gen_andi_tl(t0, t0, 0x3f);
         tcg_gen_rotr_tl(cpu_gpr[rd], t1, t0);
         break;
@@ -2898,6 +3248,9 @@ static void gen_HILO(DisasContext *ctx, uint32_t opc, int acc, int reg)
 
     switch (opc) {
     case OPC_MFHI:
+        mips_ident(ctx,
+            opc == OPC_MFHI ? MIPS_ID_OPC_MFHI :
+            MIPS_ID_NONE);
 #if defined(TARGET_MIPS64)
         if (acc != 0) {
             tcg_gen_ext32s_tl(cpu_gpr[reg], cpu_HI[acc]);
@@ -2908,6 +3261,9 @@ static void gen_HILO(DisasContext *ctx, uint32_t opc, int acc, int reg)
         }
         break;
     case OPC_MFLO:
+        mips_ident(ctx,
+            opc == OPC_MFLO ? MIPS_ID_OPC_MFLO :
+            MIPS_ID_NONE);
 #if defined(TARGET_MIPS64)
         if (acc != 0) {
             tcg_gen_ext32s_tl(cpu_gpr[reg], cpu_LO[acc]);
@@ -2918,6 +3274,9 @@ static void gen_HILO(DisasContext *ctx, uint32_t opc, int acc, int reg)
         }
         break;
     case OPC_MTHI:
+        mips_ident(ctx,
+            opc == OPC_MTHI ? MIPS_ID_OPC_MTHI :
+            MIPS_ID_NONE);
         if (reg != 0) {
 #if defined(TARGET_MIPS64)
             if (acc != 0) {
@@ -2932,6 +3291,9 @@ static void gen_HILO(DisasContext *ctx, uint32_t opc, int acc, int reg)
         }
         break;
     case OPC_MTLO:
+        mips_ident(ctx,
+            opc == OPC_MTLO ? MIPS_ID_OPC_MTLO :
+            MIPS_ID_NONE);
         if (reg != 0) {
 #if defined(TARGET_MIPS64)
             if (acc != 0) {
@@ -2964,6 +3326,9 @@ static inline void gen_pcrel(DisasContext *ctx, int opc, target_ulong pc,
 
     switch (MASK_OPC_PCREL_TOP2BITS(opc)) {
     case OPC_ADDIUPC:
+        mips_ident(ctx,
+            MASK_OPC_PCREL_TOP2BITS(opc) == OPC_ADDIUPC ? MIPS_ID_OPC_ADDIUPC :
+            MIPS_ID_NONE);
         if (rs != 0) {
             offset = sextract32(ctx->opcode << 2, 0, 21);
             addr = addr_add(ctx, pc, offset);
@@ -2971,12 +3336,18 @@ static inline void gen_pcrel(DisasContext *ctx, int opc, target_ulong pc,
         }
         break;
     case R6_OPC_LWPC:
+        mips_ident(ctx,
+            MASK_OPC_PCREL_TOP2BITS(opc) == R6_OPC_LWPC ? MIPS_ID_R6_OPC_LWPC :
+            MIPS_ID_NONE);
         offset = sextract32(ctx->opcode << 2, 0, 21);
         addr = addr_add(ctx, pc, offset);
         gen_r6_ld(addr, rs, ctx->mem_idx, mo_endian(ctx) | MO_SL);
         break;
 #if defined(TARGET_MIPS64)
     case OPC_LWUPC:
+        mips_ident(ctx,
+            MASK_OPC_PCREL_TOP2BITS(opc) == OPC_LWUPC ? MIPS_ID_OPC_LWUPC :
+            MIPS_ID_NONE);
         check_mips_64(ctx);
         offset = sextract32(ctx->opcode << 2, 0, 21);
         addr = addr_add(ctx, pc, offset);
@@ -2986,6 +3357,9 @@ static inline void gen_pcrel(DisasContext *ctx, int opc, target_ulong pc,
     default:
         switch (MASK_OPC_PCREL_TOP5BITS(opc)) {
         case OPC_AUIPC:
+            mips_ident(ctx,
+                MASK_OPC_PCREL_TOP5BITS(opc) == OPC_AUIPC ? MIPS_ID_OPC_AUIPC :
+                MIPS_ID_NONE);
             if (rs != 0) {
                 offset = sextract32(ctx->opcode, 0, 16) << 16;
                 addr = addr_add(ctx, pc, offset);
@@ -2993,6 +3367,10 @@ static inline void gen_pcrel(DisasContext *ctx, int opc, target_ulong pc,
             }
             break;
         case OPC_ALUIPC:
+            mips_ident(ctx,
+                MASK_OPC_PCREL_TOP5BITS(opc) == OPC_ALUIPC ?
+                    MIPS_ID_OPC_ALUIPC :
+                MIPS_ID_NONE);
             if (rs != 0) {
                 offset = sextract32(ctx->opcode, 0, 16) << 16;
                 addr = ~0xFFFF & addr_add(ctx, pc, offset);
@@ -3004,6 +3382,16 @@ static inline void gen_pcrel(DisasContext *ctx, int opc, target_ulong pc,
         case R6_OPC_LDPC + (1 << 16):
         case R6_OPC_LDPC + (2 << 16):
         case R6_OPC_LDPC + (3 << 16):
+            mips_ident(ctx,
+                MASK_OPC_PCREL_TOP5BITS(opc) == R6_OPC_LDPC ?
+                    MIPS_ID_R6_OPC_LDPC :
+                MASK_OPC_PCREL_TOP5BITS(opc) == R6_OPC_LDPC + (1 << 16) ?
+                    MIPS_ID_R6_OPC_LDPC :
+                MASK_OPC_PCREL_TOP5BITS(opc) == R6_OPC_LDPC + (2 << 16) ?
+                    MIPS_ID_R6_OPC_LDPC :
+                MASK_OPC_PCREL_TOP5BITS(opc) == R6_OPC_LDPC + (3 << 16) ?
+                    MIPS_ID_R6_OPC_LDPC :
+                MIPS_ID_NONE);
             check_mips_64(ctx);
             offset = sextract32(ctx->opcode << 3, 0, 21);
             addr = addr_add(ctx, (pc & ~0x7), offset);
@@ -3036,6 +3424,9 @@ static void gen_r6_muldiv(DisasContext *ctx, int opc, int rd, int rs, int rt)
 
     switch (opc) {
     case R6_OPC_DIV:
+        mips_ident(ctx,
+            opc == R6_OPC_DIV ? MIPS_ID_R6_OPC_DIV :
+            MIPS_ID_NONE);
         {
             TCGv t2 = tcg_temp_new();
             TCGv t3 = tcg_temp_new();
@@ -3052,6 +3443,9 @@ static void gen_r6_muldiv(DisasContext *ctx, int opc, int rd, int rs, int rt)
         }
         break;
     case R6_OPC_MOD:
+        mips_ident(ctx,
+            opc == R6_OPC_MOD ? MIPS_ID_R6_OPC_MOD :
+            MIPS_ID_NONE);
         {
             TCGv t2 = tcg_temp_new();
             TCGv t3 = tcg_temp_new();
@@ -3068,6 +3462,9 @@ static void gen_r6_muldiv(DisasContext *ctx, int opc, int rd, int rs, int rt)
         }
         break;
     case R6_OPC_DIVU:
+        mips_ident(ctx,
+            opc == R6_OPC_DIVU ? MIPS_ID_R6_OPC_DIVU :
+            MIPS_ID_NONE);
         {
             tcg_gen_ext32u_tl(t0, t0);
             tcg_gen_ext32u_tl(t1, t1);
@@ -3078,6 +3475,9 @@ static void gen_r6_muldiv(DisasContext *ctx, int opc, int rd, int rs, int rt)
         }
         break;
     case R6_OPC_MODU:
+        mips_ident(ctx,
+            opc == R6_OPC_MODU ? MIPS_ID_R6_OPC_MODU :
+            MIPS_ID_NONE);
         {
             tcg_gen_ext32u_tl(t0, t0);
             tcg_gen_ext32u_tl(t1, t1);
@@ -3088,6 +3488,9 @@ static void gen_r6_muldiv(DisasContext *ctx, int opc, int rd, int rs, int rt)
         }
         break;
     case R6_OPC_MUL:
+        mips_ident(ctx,
+            opc == R6_OPC_MUL ? MIPS_ID_R6_OPC_MUL :
+            MIPS_ID_NONE);
         {
             TCGv_i32 t2 = tcg_temp_new_i32();
             TCGv_i32 t3 = tcg_temp_new_i32();
@@ -3098,6 +3501,9 @@ static void gen_r6_muldiv(DisasContext *ctx, int opc, int rd, int rs, int rt)
         }
         break;
     case R6_OPC_MUH:
+        mips_ident(ctx,
+            opc == R6_OPC_MUH ? MIPS_ID_R6_OPC_MUH :
+            MIPS_ID_NONE);
         {
             TCGv_i32 t2 = tcg_temp_new_i32();
             TCGv_i32 t3 = tcg_temp_new_i32();
@@ -3108,6 +3514,9 @@ static void gen_r6_muldiv(DisasContext *ctx, int opc, int rd, int rs, int rt)
         }
         break;
     case R6_OPC_MULU:
+        mips_ident(ctx,
+            opc == R6_OPC_MULU ? MIPS_ID_R6_OPC_MULU :
+            MIPS_ID_NONE);
         {
             TCGv_i32 t2 = tcg_temp_new_i32();
             TCGv_i32 t3 = tcg_temp_new_i32();
@@ -3118,6 +3527,9 @@ static void gen_r6_muldiv(DisasContext *ctx, int opc, int rd, int rs, int rt)
         }
         break;
     case R6_OPC_MUHU:
+        mips_ident(ctx,
+            opc == R6_OPC_MUHU ? MIPS_ID_R6_OPC_MUHU :
+            MIPS_ID_NONE);
         {
             TCGv_i32 t2 = tcg_temp_new_i32();
             TCGv_i32 t3 = tcg_temp_new_i32();
@@ -3129,6 +3541,9 @@ static void gen_r6_muldiv(DisasContext *ctx, int opc, int rd, int rs, int rt)
         break;
 #if defined(TARGET_MIPS64)
     case R6_OPC_DDIV:
+        mips_ident(ctx,
+            opc == R6_OPC_DDIV ? MIPS_ID_R6_OPC_DDIV :
+            MIPS_ID_NONE);
         {
             TCGv t2 = tcg_temp_new();
             TCGv t3 = tcg_temp_new();
@@ -3142,6 +3557,9 @@ static void gen_r6_muldiv(DisasContext *ctx, int opc, int rd, int rs, int rt)
         }
         break;
     case R6_OPC_DMOD:
+        mips_ident(ctx,
+            opc == R6_OPC_DMOD ? MIPS_ID_R6_OPC_DMOD :
+            MIPS_ID_NONE);
         {
             TCGv t2 = tcg_temp_new();
             TCGv t3 = tcg_temp_new();
@@ -3155,6 +3573,9 @@ static void gen_r6_muldiv(DisasContext *ctx, int opc, int rd, int rs, int rt)
         }
         break;
     case R6_OPC_DDIVU:
+        mips_ident(ctx,
+            opc == R6_OPC_DDIVU ? MIPS_ID_R6_OPC_DDIVU :
+            MIPS_ID_NONE);
         {
             tcg_gen_movcond_tl(TCG_COND_EQ, t1, t1,
                                tcg_constant_tl(0), tcg_constant_tl(1), t1);
@@ -3162,6 +3583,9 @@ static void gen_r6_muldiv(DisasContext *ctx, int opc, int rd, int rs, int rt)
         }
         break;
     case R6_OPC_DMODU:
+        mips_ident(ctx,
+            opc == R6_OPC_DMODU ? MIPS_ID_R6_OPC_DMODU :
+            MIPS_ID_NONE);
         {
             tcg_gen_movcond_tl(TCG_COND_EQ, t1, t1,
                                tcg_constant_tl(0), tcg_constant_tl(1), t1);
@@ -3169,18 +3593,30 @@ static void gen_r6_muldiv(DisasContext *ctx, int opc, int rd, int rs, int rt)
         }
         break;
     case R6_OPC_DMUL:
+        mips_ident(ctx,
+            opc == R6_OPC_DMUL ? MIPS_ID_R6_OPC_DMUL :
+            MIPS_ID_NONE);
         tcg_gen_mul_i64(cpu_gpr[rd], t0, t1);
         break;
     case R6_OPC_DMUH:
+        mips_ident(ctx,
+            opc == R6_OPC_DMUH ? MIPS_ID_R6_OPC_DMUH :
+            MIPS_ID_NONE);
         {
             TCGv t2 = tcg_temp_new();
             tcg_gen_muls2_i64(t2, cpu_gpr[rd], t0, t1);
         }
         break;
     case R6_OPC_DMULU:
+        mips_ident(ctx,
+            opc == R6_OPC_DMULU ? MIPS_ID_R6_OPC_DMULU :
+            MIPS_ID_NONE);
         tcg_gen_mul_i64(cpu_gpr[rd], t0, t1);
         break;
     case R6_OPC_DMUHU:
+        mips_ident(ctx,
+            opc == R6_OPC_DMUHU ? MIPS_ID_R6_OPC_DMUHU :
+            MIPS_ID_NONE);
         {
             TCGv t2 = tcg_temp_new();
             tcg_gen_mulu2_i64(t2, cpu_gpr[rd], t0, t1);
@@ -3207,6 +3643,9 @@ static void gen_div1_tx79(DisasContext *ctx, uint32_t opc, int rs, int rt)
 
     switch (opc) {
     case MMI_OPC_DIV1:
+        mips_ident(ctx,
+            opc == MMI_OPC_DIV1 ? MIPS_ID_MMI_OPC_DIV1 :
+            MIPS_ID_NONE);
         {
             TCGv t2 = tcg_temp_new();
             TCGv t3 = tcg_temp_new();
@@ -3225,6 +3664,9 @@ static void gen_div1_tx79(DisasContext *ctx, uint32_t opc, int rs, int rt)
         }
         break;
     case MMI_OPC_DIVU1:
+        mips_ident(ctx,
+            opc == MMI_OPC_DIVU1 ? MIPS_ID_MMI_OPC_DIVU1 :
+            MIPS_ID_NONE);
         {
             TCGv t2 = tcg_constant_tl(0);
             TCGv t3 = tcg_constant_tl(1);
@@ -3262,6 +3704,9 @@ static void gen_muldiv(DisasContext *ctx, uint32_t opc,
 
     switch (opc) {
     case OPC_DIV:
+        mips_ident(ctx,
+            opc == OPC_DIV ? MIPS_ID_OPC_DIV :
+            MIPS_ID_NONE);
         {
             TCGv t2 = tcg_temp_new();
             TCGv t3 = tcg_temp_new();
@@ -3280,6 +3725,9 @@ static void gen_muldiv(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_DIVU:
+        mips_ident(ctx,
+            opc == OPC_DIVU ? MIPS_ID_OPC_DIVU :
+            MIPS_ID_NONE);
         {
             TCGv t2 = tcg_constant_tl(0);
             TCGv t3 = tcg_constant_tl(1);
@@ -3293,6 +3741,9 @@ static void gen_muldiv(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_MULT:
+        mips_ident(ctx,
+            opc == OPC_MULT ? MIPS_ID_OPC_MULT :
+            MIPS_ID_NONE);
         {
             TCGv_i32 t2 = tcg_temp_new_i32();
             TCGv_i32 t3 = tcg_temp_new_i32();
@@ -3304,6 +3755,9 @@ static void gen_muldiv(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_MULTU:
+        mips_ident(ctx,
+            opc == OPC_MULTU ? MIPS_ID_OPC_MULTU :
+            MIPS_ID_NONE);
         {
             TCGv_i32 t2 = tcg_temp_new_i32();
             TCGv_i32 t3 = tcg_temp_new_i32();
@@ -3316,6 +3770,9 @@ static void gen_muldiv(DisasContext *ctx, uint32_t opc,
         break;
 #if defined(TARGET_MIPS64)
     case OPC_DDIV:
+        mips_ident(ctx,
+            opc == OPC_DDIV ? MIPS_ID_OPC_DDIV :
+            MIPS_ID_NONE);
         {
             TCGv t2 = tcg_temp_new();
             TCGv t3 = tcg_temp_new();
@@ -3330,6 +3787,9 @@ static void gen_muldiv(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_DDIVU:
+        mips_ident(ctx,
+            opc == OPC_DDIVU ? MIPS_ID_OPC_DDIVU :
+            MIPS_ID_NONE);
         {
             tcg_gen_movcond_tl(TCG_COND_EQ, t1, t1,
                                tcg_constant_tl(0), tcg_constant_tl(1), t1);
@@ -3338,13 +3798,22 @@ static void gen_muldiv(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_DMULT:
+        mips_ident(ctx,
+            opc == OPC_DMULT ? MIPS_ID_OPC_DMULT :
+            MIPS_ID_NONE);
         tcg_gen_muls2_i64(cpu_LO[acc], cpu_HI[acc], t0, t1);
         break;
     case OPC_DMULTU:
+        mips_ident(ctx,
+            opc == OPC_DMULTU ? MIPS_ID_OPC_DMULTU :
+            MIPS_ID_NONE);
         tcg_gen_mulu2_i64(cpu_LO[acc], cpu_HI[acc], t0, t1);
         break;
 #endif
     case OPC_MADD:
+        mips_ident(ctx,
+            opc == OPC_MADD ? MIPS_ID_OPC_MADD :
+            MIPS_ID_NONE);
         {
             TCGv_i64 t2 = tcg_temp_new_i64();
             TCGv_i64 t3 = tcg_temp_new_i64();
@@ -3359,6 +3828,9 @@ static void gen_muldiv(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_MADDU:
+        mips_ident(ctx,
+            opc == OPC_MADDU ? MIPS_ID_OPC_MADDU :
+            MIPS_ID_NONE);
         {
             TCGv_i64 t2 = tcg_temp_new_i64();
             TCGv_i64 t3 = tcg_temp_new_i64();
@@ -3375,6 +3847,9 @@ static void gen_muldiv(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_MSUB:
+        mips_ident(ctx,
+            opc == OPC_MSUB ? MIPS_ID_OPC_MSUB :
+            MIPS_ID_NONE);
         {
             TCGv_i64 t2 = tcg_temp_new_i64();
             TCGv_i64 t3 = tcg_temp_new_i64();
@@ -3389,6 +3864,9 @@ static void gen_muldiv(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_MSUBU:
+        mips_ident(ctx,
+            opc == OPC_MSUBU ? MIPS_ID_OPC_MSUBU :
+            MIPS_ID_NONE);
         {
             TCGv_i64 t2 = tcg_temp_new_i64();
             TCGv_i64 t3 = tcg_temp_new_i64();
@@ -3449,9 +3927,15 @@ static void gen_mul_txx9(DisasContext *ctx, uint32_t opc,
 
     switch (opc) {
     case MMI_OPC_MULT1:
+        mips_ident(ctx,
+            opc == MMI_OPC_MULT1 ? MIPS_ID_MMI_OPC_MULT1 :
+            MIPS_ID_NONE);
         acc = 1;
         /* Fall through */
     case OPC_MULT:
+        mips_ident(ctx,
+            opc == OPC_MULT ? MIPS_ID_OPC_MULT :
+            MIPS_ID_NONE);
         {
             TCGv_i32 t2 = tcg_temp_new_i32();
             TCGv_i32 t3 = tcg_temp_new_i32();
@@ -3466,9 +3950,15 @@ static void gen_mul_txx9(DisasContext *ctx, uint32_t opc,
         }
         break;
     case MMI_OPC_MULTU1:
+        mips_ident(ctx,
+            opc == MMI_OPC_MULTU1 ? MIPS_ID_MMI_OPC_MULTU1 :
+            MIPS_ID_NONE);
         acc = 1;
         /* Fall through */
     case OPC_MULTU:
+        mips_ident(ctx,
+            opc == OPC_MULTU ? MIPS_ID_OPC_MULTU :
+            MIPS_ID_NONE);
         {
             TCGv_i32 t2 = tcg_temp_new_i32();
             TCGv_i32 t3 = tcg_temp_new_i32();
@@ -3483,9 +3973,15 @@ static void gen_mul_txx9(DisasContext *ctx, uint32_t opc,
         }
         break;
     case MMI_OPC_MADD1:
+        mips_ident(ctx,
+            opc == MMI_OPC_MADD1 ? MIPS_ID_MMI_OPC_MADD1 :
+            MIPS_ID_NONE);
         acc = 1;
         /* Fall through */
     case MMI_OPC_MADD:
+        mips_ident(ctx,
+            opc == MMI_OPC_MADD ? MIPS_ID_MMI_OPC_MADD :
+            MIPS_ID_NONE);
         {
             TCGv_i64 t2 = tcg_temp_new_i64();
             TCGv_i64 t3 = tcg_temp_new_i64();
@@ -3503,9 +3999,15 @@ static void gen_mul_txx9(DisasContext *ctx, uint32_t opc,
         }
         break;
     case MMI_OPC_MADDU1:
+        mips_ident(ctx,
+            opc == MMI_OPC_MADDU1 ? MIPS_ID_MMI_OPC_MADDU1 :
+            MIPS_ID_NONE);
         acc = 1;
         /* Fall through */
     case MMI_OPC_MADDU:
+        mips_ident(ctx,
+            opc == MMI_OPC_MADDU ? MIPS_ID_MMI_OPC_MADDU :
+            MIPS_ID_NONE);
         {
             TCGv_i64 t2 = tcg_temp_new_i64();
             TCGv_i64 t3 = tcg_temp_new_i64();
@@ -3546,9 +4048,18 @@ static void gen_cl(DisasContext *ctx, uint32_t opc,
     switch (opc) {
     case OPC_CLO:
     case R6_OPC_CLO:
+        mips_ident(ctx,
+            opc == OPC_CLO ? MIPS_ID_OPC_CLO :
+            opc == R6_OPC_CLO ? MIPS_ID_R6_OPC_CLO :
+            MIPS_ID_NONE);
 #if defined(TARGET_MIPS64)
+        QEMU_FALLTHROUGH;  /* mips_ident */
     case OPC_DCLO:
     case R6_OPC_DCLO:
+        mips_ident(ctx,
+            opc == OPC_DCLO ? MIPS_ID_OPC_DCLO :
+            opc == R6_OPC_DCLO ? MIPS_ID_R6_OPC_DCLO :
+            MIPS_ID_NONE);
 #endif
         tcg_gen_not_tl(t0, t0);
         break;
@@ -3559,6 +4070,12 @@ static void gen_cl(DisasContext *ctx, uint32_t opc,
     case R6_OPC_CLO:
     case OPC_CLZ:
     case R6_OPC_CLZ:
+        mips_ident(ctx,
+            opc == OPC_CLO ? MIPS_ID_OPC_CLO :
+            opc == R6_OPC_CLO ? MIPS_ID_R6_OPC_CLO :
+            opc == OPC_CLZ ? MIPS_ID_OPC_CLZ :
+            opc == R6_OPC_CLZ ? MIPS_ID_R6_OPC_CLZ :
+            MIPS_ID_NONE);
         tcg_gen_ext32u_tl(t0, t0);
         tcg_gen_clzi_tl(t0, t0, TARGET_LONG_BITS);
         tcg_gen_subi_tl(t0, t0, TARGET_LONG_BITS - 32);
@@ -3568,6 +4085,12 @@ static void gen_cl(DisasContext *ctx, uint32_t opc,
     case R6_OPC_DCLO:
     case OPC_DCLZ:
     case R6_OPC_DCLZ:
+        mips_ident(ctx,
+            opc == OPC_DCLO ? MIPS_ID_OPC_DCLO :
+            opc == R6_OPC_DCLO ? MIPS_ID_R6_OPC_DCLO :
+            opc == OPC_DCLZ ? MIPS_ID_OPC_DCLZ :
+            opc == R6_OPC_DCLZ ? MIPS_ID_R6_OPC_DCLZ :
+            MIPS_ID_NONE);
         tcg_gen_clzi_i64(t0, t0, 64);
         break;
 #endif
@@ -3591,198 +4114,381 @@ static void gen_loongson_multimedia(DisasContext *ctx, int rd, int rs, int rt)
 
     switch (opc) {
     case OPC_PADDSH:
+        mips_ident(ctx,
+            opc == OPC_PADDSH ? MIPS_ID_OPC_PADDSH :
+            MIPS_ID_NONE);
         gen_helper_paddsh(t0, t0, t1);
         break;
     case OPC_PADDUSH:
+        mips_ident(ctx,
+            opc == OPC_PADDUSH ? MIPS_ID_OPC_PADDUSH :
+            MIPS_ID_NONE);
         gen_helper_paddush(t0, t0, t1);
         break;
     case OPC_PADDH:
+        mips_ident(ctx,
+            opc == OPC_PADDH ? MIPS_ID_OPC_PADDH :
+            MIPS_ID_NONE);
         gen_helper_paddh(t0, t0, t1);
         break;
     case OPC_PADDW:
+        mips_ident(ctx,
+            opc == OPC_PADDW ? MIPS_ID_OPC_PADDW :
+            MIPS_ID_NONE);
         gen_helper_paddw(t0, t0, t1);
         break;
     case OPC_PADDSB:
+        mips_ident(ctx,
+            opc == OPC_PADDSB ? MIPS_ID_OPC_PADDSB :
+            MIPS_ID_NONE);
         gen_helper_paddsb(t0, t0, t1);
         break;
     case OPC_PADDUSB:
+        mips_ident(ctx,
+            opc == OPC_PADDUSB ? MIPS_ID_OPC_PADDUSB :
+            MIPS_ID_NONE);
         gen_helper_paddusb(t0, t0, t1);
         break;
     case OPC_PADDB:
+        mips_ident(ctx,
+            opc == OPC_PADDB ? MIPS_ID_OPC_PADDB :
+            MIPS_ID_NONE);
         gen_helper_paddb(t0, t0, t1);
         break;
 
     case OPC_PSUBSH:
+        mips_ident(ctx,
+            opc == OPC_PSUBSH ? MIPS_ID_OPC_PSUBSH :
+            MIPS_ID_NONE);
         gen_helper_psubsh(t0, t0, t1);
         break;
     case OPC_PSUBUSH:
+        mips_ident(ctx,
+            opc == OPC_PSUBUSH ? MIPS_ID_OPC_PSUBUSH :
+            MIPS_ID_NONE);
         gen_helper_psubush(t0, t0, t1);
         break;
     case OPC_PSUBH:
+        mips_ident(ctx,
+            opc == OPC_PSUBH ? MIPS_ID_OPC_PSUBH :
+            MIPS_ID_NONE);
         gen_helper_psubh(t0, t0, t1);
         break;
     case OPC_PSUBW:
+        mips_ident(ctx,
+            opc == OPC_PSUBW ? MIPS_ID_OPC_PSUBW :
+            MIPS_ID_NONE);
         gen_helper_psubw(t0, t0, t1);
         break;
     case OPC_PSUBSB:
+        mips_ident(ctx,
+            opc == OPC_PSUBSB ? MIPS_ID_OPC_PSUBSB :
+            MIPS_ID_NONE);
         gen_helper_psubsb(t0, t0, t1);
         break;
     case OPC_PSUBUSB:
+        mips_ident(ctx,
+            opc == OPC_PSUBUSB ? MIPS_ID_OPC_PSUBUSB :
+            MIPS_ID_NONE);
         gen_helper_psubusb(t0, t0, t1);
         break;
     case OPC_PSUBB:
+        mips_ident(ctx,
+            opc == OPC_PSUBB ? MIPS_ID_OPC_PSUBB :
+            MIPS_ID_NONE);
         gen_helper_psubb(t0, t0, t1);
         break;
 
     case OPC_PSHUFH:
+        mips_ident(ctx,
+            opc == OPC_PSHUFH ? MIPS_ID_OPC_PSHUFH :
+            MIPS_ID_NONE);
         gen_helper_pshufh(t0, t0, t1);
         break;
     case OPC_PACKSSWH:
+        mips_ident(ctx,
+            opc == OPC_PACKSSWH ? MIPS_ID_OPC_PACKSSWH :
+            MIPS_ID_NONE);
         gen_helper_packsswh(t0, t0, t1);
         break;
     case OPC_PACKSSHB:
+        mips_ident(ctx,
+            opc == OPC_PACKSSHB ? MIPS_ID_OPC_PACKSSHB :
+            MIPS_ID_NONE);
         gen_helper_packsshb(t0, t0, t1);
         break;
     case OPC_PACKUSHB:
+        mips_ident(ctx,
+            opc == OPC_PACKUSHB ? MIPS_ID_OPC_PACKUSHB :
+            MIPS_ID_NONE);
         gen_helper_packushb(t0, t0, t1);
         break;
 
     case OPC_PUNPCKLHW:
+        mips_ident(ctx,
+            opc == OPC_PUNPCKLHW ? MIPS_ID_OPC_PUNPCKLHW :
+            MIPS_ID_NONE);
         gen_helper_punpcklhw(t0, t0, t1);
         break;
     case OPC_PUNPCKHHW:
+        mips_ident(ctx,
+            opc == OPC_PUNPCKHHW ? MIPS_ID_OPC_PUNPCKHHW :
+            MIPS_ID_NONE);
         gen_helper_punpckhhw(t0, t0, t1);
         break;
     case OPC_PUNPCKLBH:
+        mips_ident(ctx,
+            opc == OPC_PUNPCKLBH ? MIPS_ID_OPC_PUNPCKLBH :
+            MIPS_ID_NONE);
         gen_helper_punpcklbh(t0, t0, t1);
         break;
     case OPC_PUNPCKHBH:
+        mips_ident(ctx,
+            opc == OPC_PUNPCKHBH ? MIPS_ID_OPC_PUNPCKHBH :
+            MIPS_ID_NONE);
         gen_helper_punpckhbh(t0, t0, t1);
         break;
     case OPC_PUNPCKLWD:
+        mips_ident(ctx,
+            opc == OPC_PUNPCKLWD ? MIPS_ID_OPC_PUNPCKLWD :
+            MIPS_ID_NONE);
         gen_helper_punpcklwd(t0, t0, t1);
         break;
     case OPC_PUNPCKHWD:
+        mips_ident(ctx,
+            opc == OPC_PUNPCKHWD ? MIPS_ID_OPC_PUNPCKHWD :
+            MIPS_ID_NONE);
         gen_helper_punpckhwd(t0, t0, t1);
         break;
 
     case OPC_PAVGH:
+        mips_ident(ctx,
+            opc == OPC_PAVGH ? MIPS_ID_OPC_PAVGH :
+            MIPS_ID_NONE);
         gen_helper_pavgh(t0, t0, t1);
         break;
     case OPC_PAVGB:
+        mips_ident(ctx,
+            opc == OPC_PAVGB ? MIPS_ID_OPC_PAVGB :
+            MIPS_ID_NONE);
         gen_helper_pavgb(t0, t0, t1);
         break;
     case OPC_PMAXSH:
+        mips_ident(ctx,
+            opc == OPC_PMAXSH ? MIPS_ID_OPC_PMAXSH :
+            MIPS_ID_NONE);
         gen_helper_pmaxsh(t0, t0, t1);
         break;
     case OPC_PMINSH:
+        mips_ident(ctx,
+            opc == OPC_PMINSH ? MIPS_ID_OPC_PMINSH :
+            MIPS_ID_NONE);
         gen_helper_pminsh(t0, t0, t1);
         break;
     case OPC_PMAXUB:
+        mips_ident(ctx,
+            opc == OPC_PMAXUB ? MIPS_ID_OPC_PMAXUB :
+            MIPS_ID_NONE);
         gen_helper_pmaxub(t0, t0, t1);
         break;
     case OPC_PMINUB:
+        mips_ident(ctx,
+            opc == OPC_PMINUB ? MIPS_ID_OPC_PMINUB :
+            MIPS_ID_NONE);
         gen_helper_pminub(t0, t0, t1);
         break;
 
     case OPC_PCMPEQW:
+        mips_ident(ctx,
+            opc == OPC_PCMPEQW ? MIPS_ID_OPC_PCMPEQW :
+            MIPS_ID_NONE);
         gen_helper_pcmpeqw(t0, t0, t1);
         break;
     case OPC_PCMPGTW:
+        mips_ident(ctx,
+            opc == OPC_PCMPGTW ? MIPS_ID_OPC_PCMPGTW :
+            MIPS_ID_NONE);
         gen_helper_pcmpgtw(t0, t0, t1);
         break;
     case OPC_PCMPEQH:
+        mips_ident(ctx,
+            opc == OPC_PCMPEQH ? MIPS_ID_OPC_PCMPEQH :
+            MIPS_ID_NONE);
         gen_helper_pcmpeqh(t0, t0, t1);
         break;
     case OPC_PCMPGTH:
+        mips_ident(ctx,
+            opc == OPC_PCMPGTH ? MIPS_ID_OPC_PCMPGTH :
+            MIPS_ID_NONE);
         gen_helper_pcmpgth(t0, t0, t1);
         break;
     case OPC_PCMPEQB:
+        mips_ident(ctx,
+            opc == OPC_PCMPEQB ? MIPS_ID_OPC_PCMPEQB :
+            MIPS_ID_NONE);
         gen_helper_pcmpeqb(t0, t0, t1);
         break;
     case OPC_PCMPGTB:
+        mips_ident(ctx,
+            opc == OPC_PCMPGTB ? MIPS_ID_OPC_PCMPGTB :
+            MIPS_ID_NONE);
         gen_helper_pcmpgtb(t0, t0, t1);
         break;
 
     case OPC_PSLLW:
+        mips_ident(ctx,
+            opc == OPC_PSLLW ? MIPS_ID_OPC_PSLLW :
+            MIPS_ID_NONE);
         gen_helper_psllw(t0, t0, t1);
         break;
     case OPC_PSLLH:
+        mips_ident(ctx,
+            opc == OPC_PSLLH ? MIPS_ID_OPC_PSLLH :
+            MIPS_ID_NONE);
         gen_helper_psllh(t0, t0, t1);
         break;
     case OPC_PSRLW:
+        mips_ident(ctx,
+            opc == OPC_PSRLW ? MIPS_ID_OPC_PSRLW :
+            MIPS_ID_NONE);
         gen_helper_psrlw(t0, t0, t1);
         break;
     case OPC_PSRLH:
+        mips_ident(ctx,
+            opc == OPC_PSRLH ? MIPS_ID_OPC_PSRLH :
+            MIPS_ID_NONE);
         gen_helper_psrlh(t0, t0, t1);
         break;
     case OPC_PSRAW:
+        mips_ident(ctx,
+            opc == OPC_PSRAW ? MIPS_ID_OPC_PSRAW :
+            MIPS_ID_NONE);
         gen_helper_psraw(t0, t0, t1);
         break;
     case OPC_PSRAH:
+        mips_ident(ctx,
+            opc == OPC_PSRAH ? MIPS_ID_OPC_PSRAH :
+            MIPS_ID_NONE);
         gen_helper_psrah(t0, t0, t1);
         break;
 
     case OPC_PMULLH:
+        mips_ident(ctx,
+            opc == OPC_PMULLH ? MIPS_ID_OPC_PMULLH :
+            MIPS_ID_NONE);
         gen_helper_pmullh(t0, t0, t1);
         break;
     case OPC_PMULHH:
+        mips_ident(ctx,
+            opc == OPC_PMULHH ? MIPS_ID_OPC_PMULHH :
+            MIPS_ID_NONE);
         gen_helper_pmulhh(t0, t0, t1);
         break;
     case OPC_PMULHUH:
+        mips_ident(ctx,
+            opc == OPC_PMULHUH ? MIPS_ID_OPC_PMULHUH :
+            MIPS_ID_NONE);
         gen_helper_pmulhuh(t0, t0, t1);
         break;
     case OPC_PMADDHW:
+        mips_ident(ctx,
+            opc == OPC_PMADDHW ? MIPS_ID_OPC_PMADDHW :
+            MIPS_ID_NONE);
         gen_helper_pmaddhw(t0, t0, t1);
         break;
 
     case OPC_PASUBUB:
+        mips_ident(ctx,
+            opc == OPC_PASUBUB ? MIPS_ID_OPC_PASUBUB :
+            MIPS_ID_NONE);
         gen_helper_pasubub(t0, t0, t1);
         break;
     case OPC_BIADD:
+        mips_ident(ctx,
+            opc == OPC_BIADD ? MIPS_ID_OPC_BIADD :
+            MIPS_ID_NONE);
         gen_helper_biadd(t0, t0);
         break;
     case OPC_PMOVMSKB:
+        mips_ident(ctx,
+            opc == OPC_PMOVMSKB ? MIPS_ID_OPC_PMOVMSKB :
+            MIPS_ID_NONE);
         gen_helper_pmovmskb(t0, t0);
         break;
 
     case OPC_PADDD:
+        mips_ident(ctx,
+            opc == OPC_PADDD ? MIPS_ID_OPC_PADDD :
+            MIPS_ID_NONE);
         tcg_gen_add_i64(t0, t0, t1);
         break;
     case OPC_PSUBD:
+        mips_ident(ctx,
+            opc == OPC_PSUBD ? MIPS_ID_OPC_PSUBD :
+            MIPS_ID_NONE);
         tcg_gen_sub_i64(t0, t0, t1);
         break;
     case OPC_XOR_CP2:
+        mips_ident(ctx,
+            opc == OPC_XOR_CP2 ? MIPS_ID_OPC_XOR_CP2 :
+            MIPS_ID_NONE);
         tcg_gen_xor_i64(t0, t0, t1);
         break;
     case OPC_NOR_CP2:
+        mips_ident(ctx,
+            opc == OPC_NOR_CP2 ? MIPS_ID_OPC_NOR_CP2 :
+            MIPS_ID_NONE);
         tcg_gen_nor_i64(t0, t0, t1);
         break;
     case OPC_AND_CP2:
+        mips_ident(ctx,
+            opc == OPC_AND_CP2 ? MIPS_ID_OPC_AND_CP2 :
+            MIPS_ID_NONE);
         tcg_gen_and_i64(t0, t0, t1);
         break;
     case OPC_OR_CP2:
+        mips_ident(ctx,
+            opc == OPC_OR_CP2 ? MIPS_ID_OPC_OR_CP2 :
+            MIPS_ID_NONE);
         tcg_gen_or_i64(t0, t0, t1);
         break;
 
     case OPC_PANDN:
+        mips_ident(ctx,
+            opc == OPC_PANDN ? MIPS_ID_OPC_PANDN :
+            MIPS_ID_NONE);
         tcg_gen_andc_i64(t0, t1, t0);
         break;
 
     case OPC_PINSRH_0:
+        mips_ident(ctx,
+            opc == OPC_PINSRH_0 ? MIPS_ID_OPC_PINSRH_0 :
+            MIPS_ID_NONE);
         tcg_gen_deposit_i64(t0, t0, t1, 0, 16);
         break;
     case OPC_PINSRH_1:
+        mips_ident(ctx,
+            opc == OPC_PINSRH_1 ? MIPS_ID_OPC_PINSRH_1 :
+            MIPS_ID_NONE);
         tcg_gen_deposit_i64(t0, t0, t1, 16, 16);
         break;
     case OPC_PINSRH_2:
+        mips_ident(ctx,
+            opc == OPC_PINSRH_2 ? MIPS_ID_OPC_PINSRH_2 :
+            MIPS_ID_NONE);
         tcg_gen_deposit_i64(t0, t0, t1, 32, 16);
         break;
     case OPC_PINSRH_3:
+        mips_ident(ctx,
+            opc == OPC_PINSRH_3 ? MIPS_ID_OPC_PINSRH_3 :
+            MIPS_ID_NONE);
         tcg_gen_deposit_i64(t0, t0, t1, 48, 16);
         break;
 
     case OPC_PEXTRH:
+        mips_ident(ctx,
+            opc == OPC_PEXTRH ? MIPS_ID_OPC_PEXTRH :
+            MIPS_ID_NONE);
         tcg_gen_andi_i64(t1, t1, 3);
         tcg_gen_shli_i64(t1, t1, 4);
         tcg_gen_shr_i64(t0, t0, t1);
@@ -3790,30 +4496,54 @@ static void gen_loongson_multimedia(DisasContext *ctx, int rd, int rs, int rt)
         break;
 
     case OPC_ADDU_CP2:
+        mips_ident(ctx,
+            opc == OPC_ADDU_CP2 ? MIPS_ID_OPC_ADDU_CP2 :
+            MIPS_ID_NONE);
         tcg_gen_add_i64(t0, t0, t1);
         tcg_gen_ext32s_i64(t0, t0);
         break;
     case OPC_SUBU_CP2:
+        mips_ident(ctx,
+            opc == OPC_SUBU_CP2 ? MIPS_ID_OPC_SUBU_CP2 :
+            MIPS_ID_NONE);
         tcg_gen_sub_i64(t0, t0, t1);
         tcg_gen_ext32s_i64(t0, t0);
         break;
 
     case OPC_SLL_CP2:
+        mips_ident(ctx,
+            opc == OPC_SLL_CP2 ? MIPS_ID_OPC_SLL_CP2 :
+            MIPS_ID_NONE);
         shift_max = 32;
         goto do_shift;
     case OPC_SRL_CP2:
+        mips_ident(ctx,
+            opc == OPC_SRL_CP2 ? MIPS_ID_OPC_SRL_CP2 :
+            MIPS_ID_NONE);
         shift_max = 32;
         goto do_shift;
     case OPC_SRA_CP2:
+        mips_ident(ctx,
+            opc == OPC_SRA_CP2 ? MIPS_ID_OPC_SRA_CP2 :
+            MIPS_ID_NONE);
         shift_max = 32;
         goto do_shift;
     case OPC_DSLL_CP2:
+        mips_ident(ctx,
+            opc == OPC_DSLL_CP2 ? MIPS_ID_OPC_DSLL_CP2 :
+            MIPS_ID_NONE);
         shift_max = 64;
         goto do_shift;
     case OPC_DSRL_CP2:
+        mips_ident(ctx,
+            opc == OPC_DSRL_CP2 ? MIPS_ID_OPC_DSRL_CP2 :
+            MIPS_ID_NONE);
         shift_max = 64;
         goto do_shift;
     case OPC_DSRA_CP2:
+        mips_ident(ctx,
+            opc == OPC_DSRA_CP2 ? MIPS_ID_OPC_DSRA_CP2 :
+            MIPS_ID_NONE);
         shift_max = 64;
         goto do_shift;
     do_shift:
@@ -3823,10 +4553,18 @@ static void gen_loongson_multimedia(DisasContext *ctx, int rd, int rs, int rt)
         switch (opc) {
         case OPC_SLL_CP2:
         case OPC_DSLL_CP2:
+            mips_ident(ctx,
+                opc == OPC_SLL_CP2 ? MIPS_ID_OPC_SLL_CP2 :
+                opc == OPC_DSLL_CP2 ? MIPS_ID_OPC_DSLL_CP2 :
+                MIPS_ID_NONE);
             tcg_gen_shl_i64(t0, t0, t1);
             break;
         case OPC_SRA_CP2:
         case OPC_DSRA_CP2:
+            mips_ident(ctx,
+                opc == OPC_SRA_CP2 ? MIPS_ID_OPC_SRA_CP2 :
+                opc == OPC_DSRA_CP2 ? MIPS_ID_OPC_DSRA_CP2 :
+                MIPS_ID_NONE);
             /*
              * Since SRA is UndefinedResult without sign-extended inputs,
              * we can treat SRA and DSRA the same.
@@ -3834,10 +4572,16 @@ static void gen_loongson_multimedia(DisasContext *ctx, int rd, int rs, int rt)
             tcg_gen_sar_i64(t0, t0, t1);
             break;
         case OPC_SRL_CP2:
+            mips_ident(ctx,
+                opc == OPC_SRL_CP2 ? MIPS_ID_OPC_SRL_CP2 :
+                MIPS_ID_NONE);
             /* We want to shift in zeros for SRL; zero-extend first.  */
             tcg_gen_ext32u_i64(t0, t0);
             /* FALLTHRU */
         case OPC_DSRL_CP2:
+            mips_ident(ctx,
+                opc == OPC_DSRL_CP2 ? MIPS_ID_OPC_DSRL_CP2 :
+                MIPS_ID_NONE);
             tcg_gen_shr_i64(t0, t0, t1);
             break;
         }
@@ -3854,6 +4598,10 @@ static void gen_loongson_multimedia(DisasContext *ctx, int rd, int rs, int rt)
 
     case OPC_ADD_CP2:
     case OPC_DADD_CP2:
+        mips_ident(ctx,
+            opc == OPC_ADD_CP2 ? MIPS_ID_OPC_ADD_CP2 :
+            opc == OPC_DADD_CP2 ? MIPS_ID_OPC_DADD_CP2 :
+            MIPS_ID_NONE);
         {
             TCGv_i64 t2 = tcg_temp_new_i64();
             TCGLabel *lab = gen_new_label();
@@ -3874,6 +4622,10 @@ static void gen_loongson_multimedia(DisasContext *ctx, int rd, int rs, int rt)
 
     case OPC_SUB_CP2:
     case OPC_DSUB_CP2:
+        mips_ident(ctx,
+            opc == OPC_SUB_CP2 ? MIPS_ID_OPC_SUB_CP2 :
+            opc == OPC_DSUB_CP2 ? MIPS_ID_OPC_DSUB_CP2 :
+            MIPS_ID_NONE);
         {
             TCGv_i64 t2 = tcg_temp_new_i64();
             TCGLabel *lab = gen_new_label();
@@ -3893,6 +4645,9 @@ static void gen_loongson_multimedia(DisasContext *ctx, int rd, int rs, int rt)
         }
 
     case OPC_PMULUW:
+        mips_ident(ctx,
+            opc == OPC_PMULUW ? MIPS_ID_OPC_PMULUW :
+            MIPS_ID_NONE);
         tcg_gen_ext32u_i64(t0, t0);
         tcg_gen_ext32u_i64(t1, t1);
         tcg_gen_mul_i64(t0, t0, t1);
@@ -3900,22 +4655,38 @@ static void gen_loongson_multimedia(DisasContext *ctx, int rd, int rs, int rt)
 
     case OPC_SEQU_CP2:
     case OPC_SEQ_CP2:
+        mips_ident(ctx,
+            opc == OPC_SEQU_CP2 ? MIPS_ID_OPC_SEQU_CP2 :
+            opc == OPC_SEQ_CP2 ? MIPS_ID_OPC_SEQ_CP2 :
+            MIPS_ID_NONE);
         cond = TCG_COND_EQ;
         goto do_cc_cond;
         break;
     case OPC_SLTU_CP2:
+        mips_ident(ctx,
+            opc == OPC_SLTU_CP2 ? MIPS_ID_OPC_SLTU_CP2 :
+            MIPS_ID_NONE);
         cond = TCG_COND_LTU;
         goto do_cc_cond;
         break;
     case OPC_SLT_CP2:
+        mips_ident(ctx,
+            opc == OPC_SLT_CP2 ? MIPS_ID_OPC_SLT_CP2 :
+            MIPS_ID_NONE);
         cond = TCG_COND_LT;
         goto do_cc_cond;
         break;
     case OPC_SLEU_CP2:
+        mips_ident(ctx,
+            opc == OPC_SLEU_CP2 ? MIPS_ID_OPC_SLEU_CP2 :
+            MIPS_ID_NONE);
         cond = TCG_COND_LEU;
         goto do_cc_cond;
         break;
     case OPC_SLE_CP2:
+        mips_ident(ctx,
+            opc == OPC_SLE_CP2 ? MIPS_ID_OPC_SLE_CP2 :
+            MIPS_ID_NONE);
         cond = TCG_COND_LE;
     do_cc_cond:
         {
@@ -3954,6 +4725,9 @@ static void gen_loongson_lswc2(DisasContext *ctx, int rt,
     switch (MASK_LOONGSON_GSLSQ(ctx->opcode)) {
 #if defined(TARGET_MIPS64)
     case OPC_GSLQ:
+        mips_ident(ctx,
+            MASK_LOONGSON_GSLSQ(ctx->opcode) == OPC_GSLQ ? MIPS_ID_OPC_GSLQ :
+            MIPS_ID_NONE);
         t1 = tcg_temp_new();
         gen_base_offset_addr(ctx, t0, rs, lsq_offset);
         tcg_gen_qemu_ld_tl(t1, t0, ctx->mem_idx, mo_endian(ctx) | MO_UQ |
@@ -3965,6 +4739,10 @@ static void gen_loongson_lswc2(DisasContext *ctx, int rt,
         gen_store_gpr(t0, lsq_rt1);
         break;
     case OPC_GSLQC1:
+        mips_ident(ctx,
+            MASK_LOONGSON_GSLSQ(ctx->opcode) == OPC_GSLQC1 ?
+                MIPS_ID_OPC_GSLQC1 :
+            MIPS_ID_NONE);
         check_cp1_enabled(ctx);
         t1 = tcg_temp_new();
         gen_base_offset_addr(ctx, t0, rs, lsq_offset);
@@ -3977,6 +4755,9 @@ static void gen_loongson_lswc2(DisasContext *ctx, int rt,
         gen_store_fpr64(ctx, t0, lsq_rt1);
         break;
     case OPC_GSSQ:
+        mips_ident(ctx,
+            MASK_LOONGSON_GSLSQ(ctx->opcode) == OPC_GSSQ ? MIPS_ID_OPC_GSSQ :
+            MIPS_ID_NONE);
         t1 = tcg_temp_new();
         gen_base_offset_addr(ctx, t0, rs, lsq_offset);
         gen_load_gpr(t1, rt);
@@ -3988,6 +4769,10 @@ static void gen_loongson_lswc2(DisasContext *ctx, int rt,
                            ctx->default_tcg_memop_mask);
         break;
     case OPC_GSSQC1:
+        mips_ident(ctx,
+            MASK_LOONGSON_GSLSQ(ctx->opcode) == OPC_GSSQC1 ?
+                MIPS_ID_OPC_GSSQC1 :
+            MIPS_ID_NONE);
         check_cp1_enabled(ctx);
         t1 = tcg_temp_new();
         gen_base_offset_addr(ctx, t0, rs, lsq_offset);
@@ -4001,8 +4786,16 @@ static void gen_loongson_lswc2(DisasContext *ctx, int rt,
         break;
 #endif
     case OPC_GSSHFL:
+        mips_ident(ctx,
+            MASK_LOONGSON_GSLSQ(ctx->opcode) == OPC_GSSHFL ?
+                MIPS_ID_OPC_GSSHFL :
+            MIPS_ID_NONE);
         switch (MASK_LOONGSON_GSSHFLS(ctx->opcode)) {
         case OPC_GSLWLC1:
+            mips_ident(ctx,
+                MASK_LOONGSON_GSSHFLS(ctx->opcode) == OPC_GSLWLC1 ?
+                    MIPS_ID_OPC_GSLWLC1 :
+                MIPS_ID_NONE);
             check_cp1_enabled(ctx);
             gen_base_offset_addr(ctx, t0, rs, shf_offset);
             fp0 = tcg_temp_new_i32();
@@ -4014,6 +4807,10 @@ static void gen_loongson_lswc2(DisasContext *ctx, int rt,
             gen_store_fpr32(ctx, fp0, rt);
             break;
         case OPC_GSLWRC1:
+            mips_ident(ctx,
+                MASK_LOONGSON_GSSHFLS(ctx->opcode) == OPC_GSLWRC1 ?
+                    MIPS_ID_OPC_GSLWRC1 :
+                MIPS_ID_NONE);
             check_cp1_enabled(ctx);
             gen_base_offset_addr(ctx, t0, rs, shf_offset);
             fp0 = tcg_temp_new_i32();
@@ -4026,6 +4823,10 @@ static void gen_loongson_lswc2(DisasContext *ctx, int rt,
             break;
 #if defined(TARGET_MIPS64)
         case OPC_GSLDLC1:
+            mips_ident(ctx,
+                MASK_LOONGSON_GSSHFLS(ctx->opcode) == OPC_GSLDLC1 ?
+                    MIPS_ID_OPC_GSLDLC1 :
+                MIPS_ID_NONE);
             check_cp1_enabled(ctx);
             gen_base_offset_addr(ctx, t0, rs, shf_offset);
             t1 = tcg_temp_new();
@@ -4034,6 +4835,10 @@ static void gen_loongson_lswc2(DisasContext *ctx, int rt,
             gen_store_fpr64(ctx, t1, rt);
             break;
         case OPC_GSLDRC1:
+            mips_ident(ctx,
+                MASK_LOONGSON_GSSHFLS(ctx->opcode) == OPC_GSLDRC1 ?
+                    MIPS_ID_OPC_GSLDRC1 :
+                MIPS_ID_NONE);
             check_cp1_enabled(ctx);
             gen_base_offset_addr(ctx, t0, rs, shf_offset);
             t1 = tcg_temp_new();
@@ -4049,8 +4854,16 @@ static void gen_loongson_lswc2(DisasContext *ctx, int rt,
         }
         break;
     case OPC_GSSHFS:
+        mips_ident(ctx,
+            MASK_LOONGSON_GSLSQ(ctx->opcode) == OPC_GSSHFS ?
+                MIPS_ID_OPC_GSSHFS :
+            MIPS_ID_NONE);
         switch (MASK_LOONGSON_GSSHFLS(ctx->opcode)) {
         case OPC_GSSWLC1:
+            mips_ident(ctx,
+                MASK_LOONGSON_GSSHFLS(ctx->opcode) == OPC_GSSWLC1 ?
+                    MIPS_ID_OPC_GSSWLC1 :
+                MIPS_ID_NONE);
             check_cp1_enabled(ctx);
             t1 = tcg_temp_new();
             gen_base_offset_addr(ctx, t0, rs, shf_offset);
@@ -4060,6 +4873,10 @@ static void gen_loongson_lswc2(DisasContext *ctx, int rt,
             gen_helper_0e2i(swl, t1, t0, ctx->mem_idx);
             break;
         case OPC_GSSWRC1:
+            mips_ident(ctx,
+                MASK_LOONGSON_GSSHFLS(ctx->opcode) == OPC_GSSWRC1 ?
+                    MIPS_ID_OPC_GSSWRC1 :
+                MIPS_ID_NONE);
             check_cp1_enabled(ctx);
             t1 = tcg_temp_new();
             gen_base_offset_addr(ctx, t0, rs, shf_offset);
@@ -4070,6 +4887,10 @@ static void gen_loongson_lswc2(DisasContext *ctx, int rt,
             break;
 #if defined(TARGET_MIPS64)
         case OPC_GSSDLC1:
+            mips_ident(ctx,
+                MASK_LOONGSON_GSSHFLS(ctx->opcode) == OPC_GSSDLC1 ?
+                    MIPS_ID_OPC_GSSDLC1 :
+                MIPS_ID_NONE);
             check_cp1_enabled(ctx);
             t1 = tcg_temp_new();
             gen_base_offset_addr(ctx, t0, rs, shf_offset);
@@ -4077,6 +4898,10 @@ static void gen_loongson_lswc2(DisasContext *ctx, int rt,
             gen_helper_0e2i(sdl, t1, t0, ctx->mem_idx);
             break;
         case OPC_GSSDRC1:
+            mips_ident(ctx,
+                MASK_LOONGSON_GSSHFLS(ctx->opcode) == OPC_GSSDRC1 ?
+                    MIPS_ID_OPC_GSSDRC1 :
+                MIPS_ID_NONE);
             check_cp1_enabled(ctx);
             t1 = tcg_temp_new();
             gen_base_offset_addr(ctx, t0, rs, shf_offset);
@@ -4112,6 +4937,12 @@ static void gen_loongson_lsdc2(DisasContext *ctx, int rt,
     case OPC_GSLHX:
     case OPC_GSLWX:
     case OPC_GSLDX:
+        mips_ident(ctx,
+            opc == OPC_GSLBX ? MIPS_ID_OPC_GSLBX :
+            opc == OPC_GSLHX ? MIPS_ID_OPC_GSLHX :
+            opc == OPC_GSLWX ? MIPS_ID_OPC_GSLWX :
+            opc == OPC_GSLDX ? MIPS_ID_OPC_GSLDX :
+            MIPS_ID_NONE);
         /* prefetch, implement as NOP */
         if (rt == 0) {
             return;
@@ -4121,10 +4952,23 @@ static void gen_loongson_lsdc2(DisasContext *ctx, int rt,
     case OPC_GSSHX:
     case OPC_GSSWX:
     case OPC_GSSDX:
+        mips_ident(ctx,
+            opc == OPC_GSSBX ? MIPS_ID_OPC_GSSBX :
+            opc == OPC_GSSHX ? MIPS_ID_OPC_GSSHX :
+            opc == OPC_GSSWX ? MIPS_ID_OPC_GSSWX :
+            opc == OPC_GSSDX ? MIPS_ID_OPC_GSSDX :
+            MIPS_ID_NONE);
         break;
     case OPC_GSLWXC1:
+        mips_ident(ctx,
+            opc == OPC_GSLWXC1 ? MIPS_ID_OPC_GSLWXC1 :
+            MIPS_ID_NONE);
 #if defined(TARGET_MIPS64)
+        QEMU_FALLTHROUGH;  /* mips_ident */
     case OPC_GSLDXC1:
+        mips_ident(ctx,
+            opc == OPC_GSLDXC1 ? MIPS_ID_OPC_GSLDXC1 :
+            MIPS_ID_NONE);
 #endif
         check_cp1_enabled(ctx);
         /* prefetch, implement as NOP */
@@ -4133,8 +4977,15 @@ static void gen_loongson_lsdc2(DisasContext *ctx, int rt,
         }
         break;
     case OPC_GSSWXC1:
+        mips_ident(ctx,
+            opc == OPC_GSSWXC1 ? MIPS_ID_OPC_GSSWXC1 :
+            MIPS_ID_NONE);
 #if defined(TARGET_MIPS64)
+        QEMU_FALLTHROUGH;  /* mips_ident */
     case OPC_GSSDXC1:
+        mips_ident(ctx,
+            opc == OPC_GSSDXC1 ? MIPS_ID_OPC_GSSDXC1 :
+            MIPS_ID_NONE);
 #endif
         check_cp1_enabled(ctx);
         break;
@@ -4152,15 +5003,24 @@ static void gen_loongson_lsdc2(DisasContext *ctx, int rt,
 
     switch (opc) {
     case OPC_GSLBX:
+        mips_ident(ctx,
+            opc == OPC_GSLBX ? MIPS_ID_OPC_GSLBX :
+            MIPS_ID_NONE);
         tcg_gen_qemu_ld_tl(t0, t0, ctx->mem_idx, MO_SB);
         gen_store_gpr(t0, rt);
         break;
     case OPC_GSLHX:
+        mips_ident(ctx,
+            opc == OPC_GSLHX ? MIPS_ID_OPC_GSLHX :
+            MIPS_ID_NONE);
         tcg_gen_qemu_ld_tl(t0, t0, ctx->mem_idx, mo_endian(ctx) | MO_SW |
                            ctx->default_tcg_memop_mask);
         gen_store_gpr(t0, rt);
         break;
     case OPC_GSLWX:
+        mips_ident(ctx,
+            opc == OPC_GSLWX ? MIPS_ID_OPC_GSLWX :
+            MIPS_ID_NONE);
         gen_base_offset_addr(ctx, t0, rs, offset);
         if (rd) {
             gen_op_addr_add(ctx, t0, cpu_gpr[rd], t0);
@@ -4171,6 +5031,9 @@ static void gen_loongson_lsdc2(DisasContext *ctx, int rt,
         break;
 #if defined(TARGET_MIPS64)
     case OPC_GSLDX:
+        mips_ident(ctx,
+            opc == OPC_GSLDX ? MIPS_ID_OPC_GSLDX :
+            MIPS_ID_NONE);
         gen_base_offset_addr(ctx, t0, rs, offset);
         if (rd) {
             gen_op_addr_add(ctx, t0, cpu_gpr[rd], t0);
@@ -4181,6 +5044,9 @@ static void gen_loongson_lsdc2(DisasContext *ctx, int rt,
         break;
 #endif
     case OPC_GSLWXC1:
+        mips_ident(ctx,
+            opc == OPC_GSLWXC1 ? MIPS_ID_OPC_GSLWXC1 :
+            MIPS_ID_NONE);
         gen_base_offset_addr(ctx, t0, rs, offset);
         if (rd) {
             gen_op_addr_add(ctx, t0, cpu_gpr[rd], t0);
@@ -4192,6 +5058,9 @@ static void gen_loongson_lsdc2(DisasContext *ctx, int rt,
         break;
 #if defined(TARGET_MIPS64)
     case OPC_GSLDXC1:
+        mips_ident(ctx,
+            opc == OPC_GSLDXC1 ? MIPS_ID_OPC_GSLDXC1 :
+            MIPS_ID_NONE);
         gen_base_offset_addr(ctx, t0, rs, offset);
         if (rd) {
             gen_op_addr_add(ctx, t0, cpu_gpr[rd], t0);
@@ -4202,17 +5071,26 @@ static void gen_loongson_lsdc2(DisasContext *ctx, int rt,
         break;
 #endif
     case OPC_GSSBX:
+        mips_ident(ctx,
+            opc == OPC_GSSBX ? MIPS_ID_OPC_GSSBX :
+            MIPS_ID_NONE);
         t1 = tcg_temp_new();
         gen_load_gpr(t1, rt);
         tcg_gen_qemu_st_tl(t1, t0, ctx->mem_idx, MO_SB);
         break;
     case OPC_GSSHX:
+        mips_ident(ctx,
+            opc == OPC_GSSHX ? MIPS_ID_OPC_GSSHX :
+            MIPS_ID_NONE);
         t1 = tcg_temp_new();
         gen_load_gpr(t1, rt);
         tcg_gen_qemu_st_tl(t1, t0, ctx->mem_idx, mo_endian(ctx) | MO_UW |
                            ctx->default_tcg_memop_mask);
         break;
     case OPC_GSSWX:
+        mips_ident(ctx,
+            opc == OPC_GSSWX ? MIPS_ID_OPC_GSSWX :
+            MIPS_ID_NONE);
         t1 = tcg_temp_new();
         gen_load_gpr(t1, rt);
         tcg_gen_qemu_st_tl(t1, t0, ctx->mem_idx, mo_endian(ctx) | MO_UL |
@@ -4220,6 +5098,9 @@ static void gen_loongson_lsdc2(DisasContext *ctx, int rt,
         break;
 #if defined(TARGET_MIPS64)
     case OPC_GSSDX:
+        mips_ident(ctx,
+            opc == OPC_GSSDX ? MIPS_ID_OPC_GSSDX :
+            MIPS_ID_NONE);
         t1 = tcg_temp_new();
         gen_load_gpr(t1, rt);
         tcg_gen_qemu_st_tl(t1, t0, ctx->mem_idx, mo_endian(ctx) | MO_UQ |
@@ -4227,6 +5108,9 @@ static void gen_loongson_lsdc2(DisasContext *ctx, int rt,
         break;
 #endif
     case OPC_GSSWXC1:
+        mips_ident(ctx,
+            opc == OPC_GSSWXC1 ? MIPS_ID_OPC_GSSWXC1 :
+            MIPS_ID_NONE);
         fp0 = tcg_temp_new_i32();
         gen_load_fpr32(ctx, fp0, rt);
         tcg_gen_qemu_st_i32(fp0, t0, ctx->mem_idx, mo_endian(ctx) | MO_UL |
@@ -4234,6 +5118,9 @@ static void gen_loongson_lsdc2(DisasContext *ctx, int rt,
         break;
 #if defined(TARGET_MIPS64)
     case OPC_GSSDXC1:
+        mips_ident(ctx,
+            opc == OPC_GSSDXC1 ? MIPS_ID_OPC_GSSDXC1 :
+            MIPS_ID_NONE);
         t1 = tcg_temp_new();
         gen_load_fpr64(ctx, t1, rt);
         tcg_gen_qemu_st_i64(t1, t0, ctx->mem_idx, mo_endian(ctx) | MO_UQ |
@@ -4262,6 +5149,14 @@ static void gen_trap(DisasContext *ctx, uint32_t opc,
     case OPC_TLT:
     case OPC_TLTU:
     case OPC_TNE:
+        mips_ident(ctx,
+            opc == OPC_TEQ ? MIPS_ID_OPC_TEQ :
+            opc == OPC_TGE ? MIPS_ID_OPC_TGE :
+            opc == OPC_TGEU ? MIPS_ID_OPC_TGEU :
+            opc == OPC_TLT ? MIPS_ID_OPC_TLT :
+            opc == OPC_TLTU ? MIPS_ID_OPC_TLTU :
+            opc == OPC_TNE ? MIPS_ID_OPC_TNE :
+            MIPS_ID_NONE);
         /* Compare two registers */
         if (rs != rt) {
             gen_load_gpr(t0, rs);
@@ -4275,6 +5170,14 @@ static void gen_trap(DisasContext *ctx, uint32_t opc,
     case OPC_TLTI:
     case OPC_TLTIU:
     case OPC_TNEI:
+        mips_ident(ctx,
+            opc == OPC_TEQI ? MIPS_ID_OPC_TEQI :
+            opc == OPC_TGEI ? MIPS_ID_OPC_TGEI :
+            opc == OPC_TGEIU ? MIPS_ID_OPC_TGEIU :
+            opc == OPC_TLTI ? MIPS_ID_OPC_TLTI :
+            opc == OPC_TLTIU ? MIPS_ID_OPC_TLTIU :
+            opc == OPC_TNEI ? MIPS_ID_OPC_TNEI :
+            MIPS_ID_NONE);
         /* Compare register to immediate */
         if (rs != 0 || imm != 0) {
             gen_load_gpr(t0, rs);
@@ -4291,6 +5194,14 @@ static void gen_trap(DisasContext *ctx, uint32_t opc,
         case OPC_TGEI:  /* r0 >= 0  */
         case OPC_TGEU:  /* rs >= rs unsigned */
         case OPC_TGEIU: /* r0 >= 0  unsigned */
+            mips_ident(ctx,
+                opc == OPC_TEQ ? MIPS_ID_OPC_TEQ :
+                opc == OPC_TEQI ? MIPS_ID_OPC_TEQI :
+                opc == OPC_TGE ? MIPS_ID_OPC_TGE :
+                opc == OPC_TGEI ? MIPS_ID_OPC_TGEI :
+                opc == OPC_TGEU ? MIPS_ID_OPC_TGEU :
+                opc == OPC_TGEIU ? MIPS_ID_OPC_TGEIU :
+                MIPS_ID_NONE);
             /* Always trap */
 #ifdef CONFIG_USER_ONLY
             /* Pass the break code along to cpu_loop. */
@@ -4305,6 +5216,14 @@ static void gen_trap(DisasContext *ctx, uint32_t opc,
         case OPC_TLTIU: /* r0 < 0  unsigned  */
         case OPC_TNE:   /* rs != rs          */
         case OPC_TNEI:  /* r0 != 0           */
+            mips_ident(ctx,
+                opc == OPC_TLT ? MIPS_ID_OPC_TLT :
+                opc == OPC_TLTI ? MIPS_ID_OPC_TLTI :
+                opc == OPC_TLTU ? MIPS_ID_OPC_TLTU :
+                opc == OPC_TLTIU ? MIPS_ID_OPC_TLTIU :
+                opc == OPC_TNE ? MIPS_ID_OPC_TNE :
+                opc == OPC_TNEI ? MIPS_ID_OPC_TNEI :
+                MIPS_ID_NONE);
             /* Never trap: treat as NOP. */
             break;
         }
@@ -4314,26 +5233,50 @@ static void gen_trap(DisasContext *ctx, uint32_t opc,
         switch (opc) {
         case OPC_TEQ:
         case OPC_TEQI:
+            mips_ident(ctx,
+                opc == OPC_TEQ ? MIPS_ID_OPC_TEQ :
+                opc == OPC_TEQI ? MIPS_ID_OPC_TEQI :
+                MIPS_ID_NONE);
             tcg_gen_brcond_tl(TCG_COND_NE, t0, t1, l1);
             break;
         case OPC_TGE:
         case OPC_TGEI:
+            mips_ident(ctx,
+                opc == OPC_TGE ? MIPS_ID_OPC_TGE :
+                opc == OPC_TGEI ? MIPS_ID_OPC_TGEI :
+                MIPS_ID_NONE);
             tcg_gen_brcond_tl(TCG_COND_LT, t0, t1, l1);
             break;
         case OPC_TGEU:
         case OPC_TGEIU:
+            mips_ident(ctx,
+                opc == OPC_TGEU ? MIPS_ID_OPC_TGEU :
+                opc == OPC_TGEIU ? MIPS_ID_OPC_TGEIU :
+                MIPS_ID_NONE);
             tcg_gen_brcond_tl(TCG_COND_LTU, t0, t1, l1);
             break;
         case OPC_TLT:
         case OPC_TLTI:
+            mips_ident(ctx,
+                opc == OPC_TLT ? MIPS_ID_OPC_TLT :
+                opc == OPC_TLTI ? MIPS_ID_OPC_TLTI :
+                MIPS_ID_NONE);
             tcg_gen_brcond_tl(TCG_COND_GE, t0, t1, l1);
             break;
         case OPC_TLTU:
         case OPC_TLTIU:
+            mips_ident(ctx,
+                opc == OPC_TLTU ? MIPS_ID_OPC_TLTU :
+                opc == OPC_TLTIU ? MIPS_ID_OPC_TLTIU :
+                MIPS_ID_NONE);
             tcg_gen_brcond_tl(TCG_COND_GEU, t0, t1, l1);
             break;
         case OPC_TNE:
         case OPC_TNEI:
+            mips_ident(ctx,
+                opc == OPC_TNE ? MIPS_ID_OPC_TNE :
+                opc == OPC_TNEI ? MIPS_ID_OPC_TNEI :
+                MIPS_ID_NONE);
             tcg_gen_brcond_tl(TCG_COND_EQ, t0, t1, l1);
             break;
         }
@@ -4393,6 +5336,12 @@ static void gen_compute_branch(DisasContext *ctx, uint32_t opc,
     case OPC_BEQL:
     case OPC_BNE:
     case OPC_BNEL:
+        mips_ident(ctx,
+            opc == OPC_BEQ ? MIPS_ID_OPC_BEQ :
+            opc == OPC_BEQL ? MIPS_ID_OPC_BEQL :
+            opc == OPC_BNE ? MIPS_ID_OPC_BNE :
+            opc == OPC_BNEL ? MIPS_ID_OPC_BNEL :
+            MIPS_ID_NONE);
         /* Compare two registers */
         if (rs != rt) {
             gen_load_gpr(t0, rs);
@@ -4413,6 +5362,20 @@ static void gen_compute_branch(DisasContext *ctx, uint32_t opc,
     case OPC_BLTZAL:
     case OPC_BLTZALL:
     case OPC_BLTZL:
+        mips_ident(ctx,
+            opc == OPC_BGEZ ? MIPS_ID_OPC_BGEZ :
+            opc == OPC_BGEZAL ? MIPS_ID_OPC_BGEZAL :
+            opc == OPC_BGEZALL ? MIPS_ID_OPC_BGEZALL :
+            opc == OPC_BGEZL ? MIPS_ID_OPC_BGEZL :
+            opc == OPC_BGTZ ? MIPS_ID_OPC_BGTZ :
+            opc == OPC_BGTZL ? MIPS_ID_OPC_BGTZL :
+            opc == OPC_BLEZ ? MIPS_ID_OPC_BLEZ :
+            opc == OPC_BLEZL ? MIPS_ID_OPC_BLEZL :
+            opc == OPC_BLTZ ? MIPS_ID_OPC_BLTZ :
+            opc == OPC_BLTZAL ? MIPS_ID_OPC_BLTZAL :
+            opc == OPC_BLTZALL ? MIPS_ID_OPC_BLTZALL :
+            opc == OPC_BLTZL ? MIPS_ID_OPC_BLTZL :
+            MIPS_ID_NONE);
         /* Compare to zero */
         if (rs != 0) {
             gen_load_gpr(t0, rs);
@@ -4421,8 +5384,15 @@ static void gen_compute_branch(DisasContext *ctx, uint32_t opc,
         btgt = ctx->base.pc_next + insn_bytes + offset;
         break;
     case OPC_BPOSGE32:
+        mips_ident(ctx,
+            opc == OPC_BPOSGE32 ? MIPS_ID_OPC_BPOSGE32 :
+            MIPS_ID_NONE);
 #if defined(TARGET_MIPS64)
+        QEMU_FALLTHROUGH;  /* mips_ident */
     case OPC_BPOSGE64:
+        mips_ident(ctx,
+            opc == OPC_BPOSGE64 ? MIPS_ID_OPC_BPOSGE64 :
+            MIPS_ID_NONE);
         tcg_gen_andi_tl(t0, cpu_dspctrl, 0x7F);
 #else
         tcg_gen_andi_tl(t0, cpu_dspctrl, 0x3F);
@@ -4432,6 +5402,10 @@ static void gen_compute_branch(DisasContext *ctx, uint32_t opc,
         break;
     case OPC_J:
     case OPC_JAL:
+        mips_ident(ctx,
+            opc == OPC_J ? MIPS_ID_OPC_J :
+            opc == OPC_JAL ? MIPS_ID_OPC_JAL :
+            MIPS_ID_NONE);
         {
             /* Jump to immediate */
             int jal_mask = ctx->hflags & MIPS_HFLAG_M16 ? 0xF8000000
@@ -4441,12 +5415,19 @@ static void gen_compute_branch(DisasContext *ctx, uint32_t opc,
             break;
         }
     case OPC_JALX:
+        mips_ident(ctx,
+            opc == OPC_JALX ? MIPS_ID_OPC_JALX :
+            MIPS_ID_NONE);
         /* Jump to immediate */
         btgt = ((ctx->base.pc_next + insn_bytes) & (int32_t)0xF0000000) |
             (uint32_t)offset;
         break;
     case OPC_JR:
     case OPC_JALR:
+        mips_ident(ctx,
+            opc == OPC_JR ? MIPS_ID_OPC_JR :
+            opc == OPC_JALR ? MIPS_ID_OPC_JALR :
+            MIPS_ID_NONE);
         /* Jump to register */
         if (offset != 0 && offset != 16) {
             /*
@@ -4473,11 +5454,23 @@ static void gen_compute_branch(DisasContext *ctx, uint32_t opc,
         case OPC_BGEZL:   /* 0 >= 0 likely   */
         case OPC_BLEZ:    /* 0 <= 0          */
         case OPC_BLEZL:   /* 0 <= 0 likely   */
+            mips_ident(ctx,
+                opc == OPC_BEQ ? MIPS_ID_OPC_BEQ :
+                opc == OPC_BEQL ? MIPS_ID_OPC_BEQL :
+                opc == OPC_BGEZ ? MIPS_ID_OPC_BGEZ :
+                opc == OPC_BGEZL ? MIPS_ID_OPC_BGEZL :
+                opc == OPC_BLEZ ? MIPS_ID_OPC_BLEZ :
+                opc == OPC_BLEZL ? MIPS_ID_OPC_BLEZL :
+                MIPS_ID_NONE);
             /* Always take */
             ctx->hflags |= MIPS_HFLAG_B;
             break;
         case OPC_BGEZAL:  /* 0 >= 0          */
         case OPC_BGEZALL: /* 0 >= 0 likely   */
+            mips_ident(ctx,
+                opc == OPC_BGEZAL ? MIPS_ID_OPC_BGEZAL :
+                opc == OPC_BGEZALL ? MIPS_ID_OPC_BGEZALL :
+                MIPS_ID_NONE);
             /* Always take and link */
             blink = 31;
             ctx->hflags |= MIPS_HFLAG_B;
@@ -4485,9 +5478,17 @@ static void gen_compute_branch(DisasContext *ctx, uint32_t opc,
         case OPC_BNE:     /* rx != rx        */
         case OPC_BGTZ:    /* 0 > 0           */
         case OPC_BLTZ:    /* 0 < 0           */
+            mips_ident(ctx,
+                opc == OPC_BNE ? MIPS_ID_OPC_BNE :
+                opc == OPC_BGTZ ? MIPS_ID_OPC_BGTZ :
+                opc == OPC_BLTZ ? MIPS_ID_OPC_BLTZ :
+                MIPS_ID_NONE);
             /* Treat as NOP. */
             goto out;
         case OPC_BLTZAL:  /* 0 < 0           */
+            mips_ident(ctx,
+                opc == OPC_BLTZAL ? MIPS_ID_OPC_BLTZAL :
+                MIPS_ID_NONE);
             /*
              * Handle as an unconditional branch to get correct delay
              * slot checking.
@@ -4497,6 +5498,9 @@ static void gen_compute_branch(DisasContext *ctx, uint32_t opc,
             ctx->hflags |= MIPS_HFLAG_B;
             break;
         case OPC_BLTZALL: /* 0 < 0 likely */
+            mips_ident(ctx,
+                opc == OPC_BLTZALL ? MIPS_ID_OPC_BLTZALL :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(cpu_gpr[31], ctx->base.pc_next + 8);
             /* Skip the instruction in the delay slot */
             ctx->base.pc_next += 4;
@@ -4504,23 +5508,43 @@ static void gen_compute_branch(DisasContext *ctx, uint32_t opc,
         case OPC_BNEL:    /* rx != rx likely */
         case OPC_BGTZL:   /* 0 > 0 likely */
         case OPC_BLTZL:   /* 0 < 0 likely */
+            mips_ident(ctx,
+                opc == OPC_BNEL ? MIPS_ID_OPC_BNEL :
+                opc == OPC_BGTZL ? MIPS_ID_OPC_BGTZL :
+                opc == OPC_BLTZL ? MIPS_ID_OPC_BLTZL :
+                MIPS_ID_NONE);
             /* Skip the instruction in the delay slot */
             ctx->base.pc_next += 4;
             goto out;
         case OPC_J:
+            mips_ident(ctx,
+                opc == OPC_J ? MIPS_ID_OPC_J :
+                MIPS_ID_NONE);
             ctx->hflags |= MIPS_HFLAG_B;
             break;
         case OPC_JALX:
+            mips_ident(ctx,
+                opc == OPC_JALX ? MIPS_ID_OPC_JALX :
+                MIPS_ID_NONE);
             ctx->hflags |= MIPS_HFLAG_BX;
             /* Fallthrough */
         case OPC_JAL:
+            mips_ident(ctx,
+                opc == OPC_JAL ? MIPS_ID_OPC_JAL :
+                MIPS_ID_NONE);
             blink = 31;
             ctx->hflags |= MIPS_HFLAG_B;
             break;
         case OPC_JR:
+            mips_ident(ctx,
+                opc == OPC_JR ? MIPS_ID_OPC_JR :
+                MIPS_ID_NONE);
             ctx->hflags |= MIPS_HFLAG_BR;
             break;
         case OPC_JALR:
+            mips_ident(ctx,
+                opc == OPC_JALR ? MIPS_ID_OPC_JALR :
+                MIPS_ID_NONE);
             blink = rt;
             ctx->hflags |= MIPS_HFLAG_BR;
             break;
@@ -4532,64 +5556,118 @@ static void gen_compute_branch(DisasContext *ctx, uint32_t opc,
     } else {
         switch (opc) {
         case OPC_BEQ:
+            mips_ident(ctx,
+                opc == OPC_BEQ ? MIPS_ID_OPC_BEQ :
+                MIPS_ID_NONE);
             tcg_gen_setcond_tl(TCG_COND_EQ, bcond, t0, t1);
             goto not_likely;
         case OPC_BEQL:
+            mips_ident(ctx,
+                opc == OPC_BEQL ? MIPS_ID_OPC_BEQL :
+                MIPS_ID_NONE);
             tcg_gen_setcond_tl(TCG_COND_EQ, bcond, t0, t1);
             goto likely;
         case OPC_BNE:
+            mips_ident(ctx,
+                opc == OPC_BNE ? MIPS_ID_OPC_BNE :
+                MIPS_ID_NONE);
             tcg_gen_setcond_tl(TCG_COND_NE, bcond, t0, t1);
             goto not_likely;
         case OPC_BNEL:
+            mips_ident(ctx,
+                opc == OPC_BNEL ? MIPS_ID_OPC_BNEL :
+                MIPS_ID_NONE);
             tcg_gen_setcond_tl(TCG_COND_NE, bcond, t0, t1);
             goto likely;
         case OPC_BGEZ:
+            mips_ident(ctx,
+                opc == OPC_BGEZ ? MIPS_ID_OPC_BGEZ :
+                MIPS_ID_NONE);
             tcg_gen_setcondi_tl(TCG_COND_GE, bcond, t0, 0);
             goto not_likely;
         case OPC_BGEZL:
+            mips_ident(ctx,
+                opc == OPC_BGEZL ? MIPS_ID_OPC_BGEZL :
+                MIPS_ID_NONE);
             tcg_gen_setcondi_tl(TCG_COND_GE, bcond, t0, 0);
             goto likely;
         case OPC_BGEZAL:
+            mips_ident(ctx,
+                opc == OPC_BGEZAL ? MIPS_ID_OPC_BGEZAL :
+                MIPS_ID_NONE);
             tcg_gen_setcondi_tl(TCG_COND_GE, bcond, t0, 0);
             blink = 31;
             goto not_likely;
         case OPC_BGEZALL:
+            mips_ident(ctx,
+                opc == OPC_BGEZALL ? MIPS_ID_OPC_BGEZALL :
+                MIPS_ID_NONE);
             tcg_gen_setcondi_tl(TCG_COND_GE, bcond, t0, 0);
             blink = 31;
             goto likely;
         case OPC_BGTZ:
+            mips_ident(ctx,
+                opc == OPC_BGTZ ? MIPS_ID_OPC_BGTZ :
+                MIPS_ID_NONE);
             tcg_gen_setcondi_tl(TCG_COND_GT, bcond, t0, 0);
             goto not_likely;
         case OPC_BGTZL:
+            mips_ident(ctx,
+                opc == OPC_BGTZL ? MIPS_ID_OPC_BGTZL :
+                MIPS_ID_NONE);
             tcg_gen_setcondi_tl(TCG_COND_GT, bcond, t0, 0);
             goto likely;
         case OPC_BLEZ:
+            mips_ident(ctx,
+                opc == OPC_BLEZ ? MIPS_ID_OPC_BLEZ :
+                MIPS_ID_NONE);
             tcg_gen_setcondi_tl(TCG_COND_LE, bcond, t0, 0);
             goto not_likely;
         case OPC_BLEZL:
+            mips_ident(ctx,
+                opc == OPC_BLEZL ? MIPS_ID_OPC_BLEZL :
+                MIPS_ID_NONE);
             tcg_gen_setcondi_tl(TCG_COND_LE, bcond, t0, 0);
             goto likely;
         case OPC_BLTZ:
+            mips_ident(ctx,
+                opc == OPC_BLTZ ? MIPS_ID_OPC_BLTZ :
+                MIPS_ID_NONE);
             tcg_gen_setcondi_tl(TCG_COND_LT, bcond, t0, 0);
             goto not_likely;
         case OPC_BLTZL:
+            mips_ident(ctx,
+                opc == OPC_BLTZL ? MIPS_ID_OPC_BLTZL :
+                MIPS_ID_NONE);
             tcg_gen_setcondi_tl(TCG_COND_LT, bcond, t0, 0);
             goto likely;
         case OPC_BPOSGE32:
+            mips_ident(ctx,
+                opc == OPC_BPOSGE32 ? MIPS_ID_OPC_BPOSGE32 :
+                MIPS_ID_NONE);
             tcg_gen_setcondi_tl(TCG_COND_GE, bcond, t0, 32);
             goto not_likely;
 #if defined(TARGET_MIPS64)
         case OPC_BPOSGE64:
+            mips_ident(ctx,
+                opc == OPC_BPOSGE64 ? MIPS_ID_OPC_BPOSGE64 :
+                MIPS_ID_NONE);
             tcg_gen_setcondi_tl(TCG_COND_GE, bcond, t0, 64);
             goto not_likely;
 #endif
         case OPC_BLTZAL:
+            mips_ident(ctx,
+                opc == OPC_BLTZAL ? MIPS_ID_OPC_BLTZAL :
+                MIPS_ID_NONE);
             tcg_gen_setcondi_tl(TCG_COND_LT, bcond, t0, 0);
             blink = 31;
         not_likely:
             ctx->hflags |= MIPS_HFLAG_BC;
             break;
         case OPC_BLTZALL:
+            mips_ident(ctx,
+                opc == OPC_BLTZALL ? MIPS_ID_OPC_BLTZALL :
+                MIPS_ID_NONE);
             tcg_gen_setcondi_tl(TCG_COND_LT, bcond, t0, 0);
             blink = 31;
         likely:
@@ -4647,6 +5725,9 @@ static void gen_bitops(DisasContext *ctx, uint32_t opc, int rt,
     gen_load_gpr(t1, rs);
     switch (opc) {
     case OPC_EXT:
+        mips_ident(ctx,
+            opc == OPC_EXT ? MIPS_ID_OPC_EXT :
+            MIPS_ID_NONE);
         if (lsb + msb > 31) {
             goto fail;
         }
@@ -4662,12 +5743,21 @@ static void gen_bitops(DisasContext *ctx, uint32_t opc, int rt,
         break;
 #if defined(TARGET_MIPS64)
     case OPC_DEXTU:
+        mips_ident(ctx,
+            opc == OPC_DEXTU ? MIPS_ID_OPC_DEXTU :
+            MIPS_ID_NONE);
         lsb += 32;
         goto do_dext;
     case OPC_DEXTM:
+        mips_ident(ctx,
+            opc == OPC_DEXTM ? MIPS_ID_OPC_DEXTM :
+            MIPS_ID_NONE);
         msb += 32;
         goto do_dext;
     case OPC_DEXT:
+        mips_ident(ctx,
+            opc == OPC_DEXT ? MIPS_ID_OPC_DEXT :
+            MIPS_ID_NONE);
     do_dext:
         if (lsb + msb > 63) {
             goto fail;
@@ -4676,6 +5766,9 @@ static void gen_bitops(DisasContext *ctx, uint32_t opc, int rt,
         break;
 #endif
     case OPC_INS:
+        mips_ident(ctx,
+            opc == OPC_INS ? MIPS_ID_OPC_INS :
+            MIPS_ID_NONE);
         if (lsb > msb) {
             goto fail;
         }
@@ -4685,12 +5778,21 @@ static void gen_bitops(DisasContext *ctx, uint32_t opc, int rt,
         break;
 #if defined(TARGET_MIPS64)
     case OPC_DINSU:
+        mips_ident(ctx,
+            opc == OPC_DINSU ? MIPS_ID_OPC_DINSU :
+            MIPS_ID_NONE);
         lsb += 32;
         /* FALLTHRU */
     case OPC_DINSM:
+        mips_ident(ctx,
+            opc == OPC_DINSM ? MIPS_ID_OPC_DINSM :
+            MIPS_ID_NONE);
         msb += 32;
         /* FALLTHRU */
     case OPC_DINS:
+        mips_ident(ctx,
+            opc == OPC_DINS ? MIPS_ID_OPC_DINS :
+            MIPS_ID_NONE);
         if (lsb > msb) {
             goto fail;
         }
@@ -4720,6 +5822,9 @@ static void gen_bshfl(DisasContext *ctx, uint32_t op2, int rt, int rd)
     gen_load_gpr(t0, rt);
     switch (op2) {
     case OPC_WSBH:
+        mips_ident(ctx,
+            op2 == OPC_WSBH ? MIPS_ID_OPC_WSBH :
+            MIPS_ID_NONE);
         {
             TCGv t1 = tcg_temp_new();
             TCGv t2 = tcg_constant_tl(0x00FF00FF);
@@ -4733,13 +5838,22 @@ static void gen_bshfl(DisasContext *ctx, uint32_t op2, int rt, int rd)
         }
         break;
     case OPC_SEB:
+        mips_ident(ctx,
+            op2 == OPC_SEB ? MIPS_ID_OPC_SEB :
+            MIPS_ID_NONE);
         tcg_gen_ext8s_tl(cpu_gpr[rd], t0);
         break;
     case OPC_SEH:
+        mips_ident(ctx,
+            op2 == OPC_SEH ? MIPS_ID_OPC_SEH :
+            MIPS_ID_NONE);
         tcg_gen_ext16s_tl(cpu_gpr[rd], t0);
         break;
 #if defined(TARGET_MIPS64)
     case OPC_DSBH:
+        mips_ident(ctx,
+            op2 == OPC_DSBH ? MIPS_ID_OPC_DSBH :
+            MIPS_ID_NONE);
         {
             TCGv t1 = tcg_temp_new();
             TCGv t2 = tcg_constant_tl(0x00FF00FF00FF00FFULL);
@@ -4752,6 +5866,9 @@ static void gen_bshfl(DisasContext *ctx, uint32_t op2, int rt, int rd)
         }
         break;
     case OPC_DSHD:
+        mips_ident(ctx,
+            op2 == OPC_DSHD ? MIPS_ID_OPC_DSHD :
+            MIPS_ID_NONE);
         {
             TCGv t1 = tcg_temp_new();
             TCGv t2 = tcg_constant_tl(0x0000FFFF0000FFFFULL);
@@ -4839,10 +5956,16 @@ static void gen_bitswap(DisasContext *ctx, int opc, int rd, int rt)
     gen_load_gpr(t0, rt);
     switch (opc) {
     case OPC_BITSWAP:
+        mips_ident(ctx,
+            opc == OPC_BITSWAP ? MIPS_ID_OPC_BITSWAP :
+            MIPS_ID_NONE);
         gen_helper_bitswap(cpu_gpr[rd], t0);
         break;
 #if defined(TARGET_MIPS64)
     case OPC_DBITSWAP:
+        mips_ident(ctx,
+            opc == OPC_DBITSWAP ? MIPS_ID_OPC_DBITSWAP :
+            MIPS_ID_NONE);
         gen_helper_dbitswap(cpu_gpr[rd], t0);
         break;
 #endif
@@ -8519,6 +9642,9 @@ static void gen_cp0(CPUMIPSState *env, DisasContext *ctx, uint32_t opc,
     check_cp0_enabled(ctx);
     switch (opc) {
     case OPC_MFC0:
+        mips_ident(ctx,
+            opc == OPC_MFC0 ? MIPS_ID_OPC_MFC0 :
+            MIPS_ID_NONE);
         if (rt == 0) {
             /* Treat as NOP. */
             return;
@@ -8527,6 +9653,9 @@ static void gen_cp0(CPUMIPSState *env, DisasContext *ctx, uint32_t opc,
         opn = "mfc0";
         break;
     case OPC_MTC0:
+        mips_ident(ctx,
+            opc == OPC_MTC0 ? MIPS_ID_OPC_MTC0 :
+            MIPS_ID_NONE);
         {
             TCGv t0 = tcg_temp_new();
 
@@ -8537,6 +9666,9 @@ static void gen_cp0(CPUMIPSState *env, DisasContext *ctx, uint32_t opc,
         break;
 #if defined(TARGET_MIPS64)
     case OPC_DMFC0:
+        mips_ident(ctx,
+            opc == OPC_DMFC0 ? MIPS_ID_OPC_DMFC0 :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS3);
         if (rt == 0) {
             /* Treat as NOP. */
@@ -8546,6 +9678,9 @@ static void gen_cp0(CPUMIPSState *env, DisasContext *ctx, uint32_t opc,
         opn = "dmfc0";
         break;
     case OPC_DMTC0:
+        mips_ident(ctx,
+            opc == OPC_DMTC0 ? MIPS_ID_OPC_DMTC0 :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS3);
         {
             TCGv t0 = tcg_temp_new();
@@ -8557,6 +9692,9 @@ static void gen_cp0(CPUMIPSState *env, DisasContext *ctx, uint32_t opc,
         break;
 #endif
     case OPC_MFHC0:
+        mips_ident(ctx,
+            opc == OPC_MFHC0 ? MIPS_ID_OPC_MFHC0 :
+            MIPS_ID_NONE);
         check_mvh(ctx);
         if (rt == 0) {
             /* Treat as NOP. */
@@ -8566,6 +9704,9 @@ static void gen_cp0(CPUMIPSState *env, DisasContext *ctx, uint32_t opc,
         opn = "mfhc0";
         break;
     case OPC_MTHC0:
+        mips_ident(ctx,
+            opc == OPC_MTHC0 ? MIPS_ID_OPC_MTHC0 :
+            MIPS_ID_NONE);
         check_mvh(ctx);
         {
             TCGv t0 = tcg_temp_new();
@@ -8575,6 +9716,9 @@ static void gen_cp0(CPUMIPSState *env, DisasContext *ctx, uint32_t opc,
         opn = "mthc0";
         break;
     case OPC_MFTR:
+        mips_ident(ctx,
+            opc == OPC_MFTR ? MIPS_ID_OPC_MFTR :
+            MIPS_ID_NONE);
         check_cp0_enabled(ctx);
         if (rd == 0) {
             /* Treat as NOP. */
@@ -8585,12 +9729,18 @@ static void gen_cp0(CPUMIPSState *env, DisasContext *ctx, uint32_t opc,
         opn = "mftr";
         break;
     case OPC_MTTR:
+        mips_ident(ctx,
+            opc == OPC_MTTR ? MIPS_ID_OPC_MTTR :
+            MIPS_ID_NONE);
         check_cp0_enabled(ctx);
         gen_mttr(env, ctx, rd, rt, (ctx->opcode >> 5) & 1,
                  ctx->opcode & 0x7, (ctx->opcode >> 4) & 1);
         opn = "mttr";
         break;
     case OPC_TLBWI:
+        mips_ident(ctx,
+            opc == OPC_TLBWI ? MIPS_ID_OPC_TLBWI :
+            MIPS_ID_NONE);
         opn = "tlbwi";
         if (!env->tlb->helper_tlbwi) {
             goto die;
@@ -8598,6 +9748,9 @@ static void gen_cp0(CPUMIPSState *env, DisasContext *ctx, uint32_t opc,
         gen_helper_tlbwi(tcg_env);
         break;
     case OPC_TLBINV:
+        mips_ident(ctx,
+            opc == OPC_TLBINV ? MIPS_ID_OPC_TLBINV :
+            MIPS_ID_NONE);
         opn = "tlbinv";
         if (ctx->ie >= 2) {
             if (!env->tlb->helper_tlbinv) {
@@ -8607,6 +9760,9 @@ static void gen_cp0(CPUMIPSState *env, DisasContext *ctx, uint32_t opc,
         } /* treat as nop if TLBINV not supported */
         break;
     case OPC_TLBINVF:
+        mips_ident(ctx,
+            opc == OPC_TLBINVF ? MIPS_ID_OPC_TLBINVF :
+            MIPS_ID_NONE);
         opn = "tlbinvf";
         if (ctx->ie >= 2) {
             if (!env->tlb->helper_tlbinvf) {
@@ -8616,6 +9772,9 @@ static void gen_cp0(CPUMIPSState *env, DisasContext *ctx, uint32_t opc,
         } /* treat as nop if TLBINV not supported */
         break;
     case OPC_TLBWR:
+        mips_ident(ctx,
+            opc == OPC_TLBWR ? MIPS_ID_OPC_TLBWR :
+            MIPS_ID_NONE);
         opn = "tlbwr";
         if (!env->tlb->helper_tlbwr) {
             goto die;
@@ -8623,6 +9782,9 @@ static void gen_cp0(CPUMIPSState *env, DisasContext *ctx, uint32_t opc,
         gen_helper_tlbwr(tcg_env);
         break;
     case OPC_TLBP:
+        mips_ident(ctx,
+            opc == OPC_TLBP ? MIPS_ID_OPC_TLBP :
+            MIPS_ID_NONE);
         opn = "tlbp";
         if (!env->tlb->helper_tlbp) {
             goto die;
@@ -8630,6 +9792,9 @@ static void gen_cp0(CPUMIPSState *env, DisasContext *ctx, uint32_t opc,
         gen_helper_tlbp(tcg_env);
         break;
     case OPC_TLBR:
+        mips_ident(ctx,
+            opc == OPC_TLBR ? MIPS_ID_OPC_TLBR :
+            MIPS_ID_NONE);
         opn = "tlbr";
         if (!env->tlb->helper_tlbr) {
             goto die;
@@ -8637,6 +9802,9 @@ static void gen_cp0(CPUMIPSState *env, DisasContext *ctx, uint32_t opc,
         gen_helper_tlbr(tcg_env);
         break;
     case OPC_ERET: /* OPC_ERETNC */
+        mips_ident(ctx,
+            opc == OPC_ERET ? MIPS_ID_OPC_ERET :
+            MIPS_ID_NONE);
         if ((ctx->insn_flags & ISA_MIPS_R6) &&
             (ctx->hflags & MIPS_HFLAG_BMASK)) {
             goto die;
@@ -8657,6 +9825,9 @@ static void gen_cp0(CPUMIPSState *env, DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_DERET:
+        mips_ident(ctx,
+            opc == OPC_DERET ? MIPS_ID_OPC_DERET :
+            MIPS_ID_NONE);
         opn = "deret";
         check_insn(ctx, ISA_MIPS_R1);
         if ((ctx->insn_flags & ISA_MIPS_R6) &&
@@ -8672,6 +9843,9 @@ static void gen_cp0(CPUMIPSState *env, DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_WAIT:
+        mips_ident(ctx,
+            opc == OPC_WAIT ? MIPS_ID_OPC_WAIT :
+            MIPS_ID_NONE);
         opn = "wait";
         check_insn(ctx, ISA_MIPS3 | ISA_MIPS_R1);
         if ((ctx->insn_flags & ISA_MIPS_R6) &&
@@ -8715,23 +9889,35 @@ static void gen_compute_branch1(DisasContext *ctx, uint32_t op,
 
     switch (op) {
     case OPC_BC1F:
+        mips_ident(ctx,
+            op == OPC_BC1F ? MIPS_ID_OPC_BC1F :
+            MIPS_ID_NONE);
         tcg_gen_shri_i32(t0, fpu_fcr31, get_fp_bit(cc));
         tcg_gen_not_i32(t0, t0);
         tcg_gen_andi_i32(t0, t0, 1);
         tcg_gen_extu_i32_tl(bcond, t0);
         goto not_likely;
     case OPC_BC1FL:
+        mips_ident(ctx,
+            op == OPC_BC1FL ? MIPS_ID_OPC_BC1FL :
+            MIPS_ID_NONE);
         tcg_gen_shri_i32(t0, fpu_fcr31, get_fp_bit(cc));
         tcg_gen_not_i32(t0, t0);
         tcg_gen_andi_i32(t0, t0, 1);
         tcg_gen_extu_i32_tl(bcond, t0);
         goto likely;
     case OPC_BC1T:
+        mips_ident(ctx,
+            op == OPC_BC1T ? MIPS_ID_OPC_BC1T :
+            MIPS_ID_NONE);
         tcg_gen_shri_i32(t0, fpu_fcr31, get_fp_bit(cc));
         tcg_gen_andi_i32(t0, t0, 1);
         tcg_gen_extu_i32_tl(bcond, t0);
         goto not_likely;
     case OPC_BC1TL:
+        mips_ident(ctx,
+            op == OPC_BC1TL ? MIPS_ID_OPC_BC1TL :
+            MIPS_ID_NONE);
         tcg_gen_shri_i32(t0, fpu_fcr31, get_fp_bit(cc));
         tcg_gen_andi_i32(t0, t0, 1);
         tcg_gen_extu_i32_tl(bcond, t0);
@@ -8739,6 +9925,9 @@ static void gen_compute_branch1(DisasContext *ctx, uint32_t op,
         ctx->hflags |= MIPS_HFLAG_BL;
         break;
     case OPC_BC1FANY2:
+        mips_ident(ctx,
+            op == OPC_BC1FANY2 ? MIPS_ID_OPC_BC1FANY2 :
+            MIPS_ID_NONE);
         {
             TCGv_i32 t1 = tcg_temp_new_i32();
             tcg_gen_shri_i32(t0, fpu_fcr31, get_fp_bit(cc));
@@ -8749,6 +9938,9 @@ static void gen_compute_branch1(DisasContext *ctx, uint32_t op,
         }
         goto not_likely;
     case OPC_BC1TANY2:
+        mips_ident(ctx,
+            op == OPC_BC1TANY2 ? MIPS_ID_OPC_BC1TANY2 :
+            MIPS_ID_NONE);
         {
             TCGv_i32 t1 = tcg_temp_new_i32();
             tcg_gen_shri_i32(t0, fpu_fcr31, get_fp_bit(cc));
@@ -8759,6 +9951,9 @@ static void gen_compute_branch1(DisasContext *ctx, uint32_t op,
         }
         goto not_likely;
     case OPC_BC1FANY4:
+        mips_ident(ctx,
+            op == OPC_BC1FANY4 ? MIPS_ID_OPC_BC1FANY4 :
+            MIPS_ID_NONE);
         {
             TCGv_i32 t1 = tcg_temp_new_i32();
             tcg_gen_shri_i32(t0, fpu_fcr31, get_fp_bit(cc));
@@ -8773,6 +9968,9 @@ static void gen_compute_branch1(DisasContext *ctx, uint32_t op,
         }
         goto not_likely;
     case OPC_BC1TANY4:
+        mips_ident(ctx,
+            op == OPC_BC1TANY4 ? MIPS_ID_OPC_BC1TANY4 :
+            MIPS_ID_NONE);
         {
             TCGv_i32 t1 = tcg_temp_new_i32();
             tcg_gen_shri_i32(t0, fpu_fcr31, get_fp_bit(cc));
@@ -8822,10 +10020,16 @@ static void gen_compute_branch1_r6(DisasContext *ctx, uint32_t op,
 
     switch (op) {
     case OPC_BC1EQZ:
+        mips_ident(ctx,
+            op == OPC_BC1EQZ ? MIPS_ID_OPC_BC1EQZ :
+            MIPS_ID_NONE);
         tcg_gen_xori_i64(t0, t0, 1);
         ctx->hflags |= MIPS_HFLAG_BC;
         break;
     case OPC_BC1NEZ:
+        mips_ident(ctx,
+            op == OPC_BC1NEZ ? MIPS_ID_OPC_BC1NEZ :
+            MIPS_ID_NONE);
         /* t0 already set */
         ctx->hflags |= MIPS_HFLAG_BC;
         break;
@@ -9070,6 +10274,9 @@ static void gen_cp1(DisasContext *ctx, uint32_t opc, int rt, int fs)
 
     switch (opc) {
     case OPC_MFC1:
+        mips_ident(ctx,
+            opc == OPC_MFC1 ? MIPS_ID_OPC_MFC1 :
+            MIPS_ID_NONE);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
 
@@ -9079,6 +10286,9 @@ static void gen_cp1(DisasContext *ctx, uint32_t opc, int rt, int fs)
         gen_store_gpr(t0, rt);
         break;
     case OPC_MTC1:
+        mips_ident(ctx,
+            opc == OPC_MTC1 ? MIPS_ID_OPC_MTC1 :
+            MIPS_ID_NONE);
         gen_load_gpr(t0, rt);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
@@ -9088,10 +10298,16 @@ static void gen_cp1(DisasContext *ctx, uint32_t opc, int rt, int fs)
         }
         break;
     case OPC_CFC1:
+        mips_ident(ctx,
+            opc == OPC_CFC1 ? MIPS_ID_OPC_CFC1 :
+            MIPS_ID_NONE);
         gen_helper_1e0i(cfc1, t0, fs);
         gen_store_gpr(t0, rt);
         break;
     case OPC_CTC1:
+        mips_ident(ctx,
+            opc == OPC_CTC1 ? MIPS_ID_OPC_CTC1 :
+            MIPS_ID_NONE);
         gen_load_gpr(t0, rt);
         save_cpu_state(ctx, 0);
         gen_helper_0e2i(ctc1, t0, tcg_constant_i32(fs), rt);
@@ -9100,15 +10316,24 @@ static void gen_cp1(DisasContext *ctx, uint32_t opc, int rt, int fs)
         break;
 #if defined(TARGET_MIPS64)
     case OPC_DMFC1:
+        mips_ident(ctx,
+            opc == OPC_DMFC1 ? MIPS_ID_OPC_DMFC1 :
+            MIPS_ID_NONE);
         gen_load_fpr64(ctx, t0, fs);
         gen_store_gpr(t0, rt);
         break;
     case OPC_DMTC1:
+        mips_ident(ctx,
+            opc == OPC_DMTC1 ? MIPS_ID_OPC_DMTC1 :
+            MIPS_ID_NONE);
         gen_load_gpr(t0, rt);
         gen_store_fpr64(ctx, t0, fs);
         break;
 #endif
     case OPC_MFHC1:
+        mips_ident(ctx,
+            opc == OPC_MFHC1 ? MIPS_ID_OPC_MFHC1 :
+            MIPS_ID_NONE);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
 
@@ -9118,6 +10343,9 @@ static void gen_cp1(DisasContext *ctx, uint32_t opc, int rt, int fs)
         gen_store_gpr(t0, rt);
         break;
     case OPC_MTHC1:
+        mips_ident(ctx,
+            opc == OPC_MTHC1 ? MIPS_ID_OPC_MTHC1 :
+            MIPS_ID_NONE);
         gen_load_gpr(t0, rt);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
@@ -9240,14 +10468,23 @@ static void gen_sel_s(DisasContext *ctx, enum fopcode op1, int fd, int ft,
 
     switch (op1) {
     case OPC_SEL_S:
+        mips_ident(ctx,
+            op1 == OPC_SEL_S ? MIPS_ID_OPC_SEL_S :
+            MIPS_ID_NONE);
         tcg_gen_andi_i32(fp0, fp0, 1);
         tcg_gen_movcond_i32(TCG_COND_NE, fp0, fp0, t1, fp1, fp2);
         break;
     case OPC_SELEQZ_S:
+        mips_ident(ctx,
+            op1 == OPC_SELEQZ_S ? MIPS_ID_OPC_SELEQZ_S :
+            MIPS_ID_NONE);
         tcg_gen_andi_i32(fp1, fp1, 1);
         tcg_gen_movcond_i32(TCG_COND_EQ, fp0, fp1, t1, fp2, t1);
         break;
     case OPC_SELNEZ_S:
+        mips_ident(ctx,
+            op1 == OPC_SELNEZ_S ? MIPS_ID_OPC_SELNEZ_S :
+            MIPS_ID_NONE);
         tcg_gen_andi_i32(fp1, fp1, 1);
         tcg_gen_movcond_i32(TCG_COND_NE, fp0, fp1, t1, fp2, t1);
         break;
@@ -9273,14 +10510,23 @@ static void gen_sel_d(DisasContext *ctx, enum fopcode op1, int fd, int ft,
 
     switch (op1) {
     case OPC_SEL_D:
+        mips_ident(ctx,
+            op1 == OPC_SEL_D ? MIPS_ID_OPC_SEL_D :
+            MIPS_ID_NONE);
         tcg_gen_andi_i64(fp0, fp0, 1);
         tcg_gen_movcond_i64(TCG_COND_NE, fp0, fp0, t1, fp1, fp2);
         break;
     case OPC_SELEQZ_D:
+        mips_ident(ctx,
+            op1 == OPC_SELEQZ_D ? MIPS_ID_OPC_SELEQZ_D :
+            MIPS_ID_NONE);
         tcg_gen_andi_i64(fp1, fp1, 1);
         tcg_gen_movcond_i64(TCG_COND_EQ, fp0, fp1, t1, fp2, t1);
         break;
     case OPC_SELNEZ_D:
+        mips_ident(ctx,
+            op1 == OPC_SELNEZ_D ? MIPS_ID_OPC_SELNEZ_D :
+            MIPS_ID_NONE);
         tcg_gen_andi_i64(fp1, fp1, 1);
         tcg_gen_movcond_i64(TCG_COND_NE, fp0, fp1, t1, fp2, t1);
         break;
@@ -9299,6 +10545,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
     uint32_t func = ctx->opcode & 0x3f;
     switch (op1) {
     case OPC_ADD_S:
+        mips_ident(ctx,
+            op1 == OPC_ADD_S ? MIPS_ID_OPC_ADD_S :
+            MIPS_ID_NONE);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
             TCGv_i32 fp1 = tcg_temp_new_i32();
@@ -9310,6 +10559,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_SUB_S:
+        mips_ident(ctx,
+            op1 == OPC_SUB_S ? MIPS_ID_OPC_SUB_S :
+            MIPS_ID_NONE);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
             TCGv_i32 fp1 = tcg_temp_new_i32();
@@ -9321,6 +10573,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_MUL_S:
+        mips_ident(ctx,
+            op1 == OPC_MUL_S ? MIPS_ID_OPC_MUL_S :
+            MIPS_ID_NONE);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
             TCGv_i32 fp1 = tcg_temp_new_i32();
@@ -9332,6 +10587,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_DIV_S:
+        mips_ident(ctx,
+            op1 == OPC_DIV_S ? MIPS_ID_OPC_DIV_S :
+            MIPS_ID_NONE);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
             TCGv_i32 fp1 = tcg_temp_new_i32();
@@ -9343,6 +10601,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_SQRT_S:
+        mips_ident(ctx,
+            op1 == OPC_SQRT_S ? MIPS_ID_OPC_SQRT_S :
+            MIPS_ID_NONE);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
 
@@ -9352,6 +10613,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_ABS_S:
+        mips_ident(ctx,
+            op1 == OPC_ABS_S ? MIPS_ID_OPC_ABS_S :
+            MIPS_ID_NONE);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
 
@@ -9365,6 +10629,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_MOV_S:
+        mips_ident(ctx,
+            op1 == OPC_MOV_S ? MIPS_ID_OPC_MOV_S :
+            MIPS_ID_NONE);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
 
@@ -9373,6 +10640,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_NEG_S:
+        mips_ident(ctx,
+            op1 == OPC_NEG_S ? MIPS_ID_OPC_NEG_S :
+            MIPS_ID_NONE);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
 
@@ -9386,6 +10656,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_ROUND_L_S:
+        mips_ident(ctx,
+            op1 == OPC_ROUND_L_S ? MIPS_ID_OPC_ROUND_L_S :
+            MIPS_ID_NONE);
         check_cp1_64bitmode(ctx);
         {
             TCGv_i32 fp32 = tcg_temp_new_i32();
@@ -9401,6 +10674,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_TRUNC_L_S:
+        mips_ident(ctx,
+            op1 == OPC_TRUNC_L_S ? MIPS_ID_OPC_TRUNC_L_S :
+            MIPS_ID_NONE);
         check_cp1_64bitmode(ctx);
         {
             TCGv_i32 fp32 = tcg_temp_new_i32();
@@ -9416,6 +10692,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_CEIL_L_S:
+        mips_ident(ctx,
+            op1 == OPC_CEIL_L_S ? MIPS_ID_OPC_CEIL_L_S :
+            MIPS_ID_NONE);
         check_cp1_64bitmode(ctx);
         {
             TCGv_i32 fp32 = tcg_temp_new_i32();
@@ -9431,6 +10710,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_FLOOR_L_S:
+        mips_ident(ctx,
+            op1 == OPC_FLOOR_L_S ? MIPS_ID_OPC_FLOOR_L_S :
+            MIPS_ID_NONE);
         check_cp1_64bitmode(ctx);
         {
             TCGv_i32 fp32 = tcg_temp_new_i32();
@@ -9446,6 +10728,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_ROUND_W_S:
+        mips_ident(ctx,
+            op1 == OPC_ROUND_W_S ? MIPS_ID_OPC_ROUND_W_S :
+            MIPS_ID_NONE);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
 
@@ -9459,6 +10744,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_TRUNC_W_S:
+        mips_ident(ctx,
+            op1 == OPC_TRUNC_W_S ? MIPS_ID_OPC_TRUNC_W_S :
+            MIPS_ID_NONE);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
 
@@ -9472,6 +10760,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_CEIL_W_S:
+        mips_ident(ctx,
+            op1 == OPC_CEIL_W_S ? MIPS_ID_OPC_CEIL_W_S :
+            MIPS_ID_NONE);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
 
@@ -9485,6 +10776,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_FLOOR_W_S:
+        mips_ident(ctx,
+            op1 == OPC_FLOOR_W_S ? MIPS_ID_OPC_FLOOR_W_S :
+            MIPS_ID_NONE);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
 
@@ -9498,22 +10792,37 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_SEL_S:
+        mips_ident(ctx,
+            op1 == OPC_SEL_S ? MIPS_ID_OPC_SEL_S :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS_R6);
         gen_sel_s(ctx, op1, fd, ft, fs);
         break;
     case OPC_SELEQZ_S:
+        mips_ident(ctx,
+            op1 == OPC_SELEQZ_S ? MIPS_ID_OPC_SELEQZ_S :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS_R6);
         gen_sel_s(ctx, op1, fd, ft, fs);
         break;
     case OPC_SELNEZ_S:
+        mips_ident(ctx,
+            op1 == OPC_SELNEZ_S ? MIPS_ID_OPC_SELNEZ_S :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS_R6);
         gen_sel_s(ctx, op1, fd, ft, fs);
         break;
     case OPC_MOVCF_S:
+        mips_ident(ctx,
+            op1 == OPC_MOVCF_S ? MIPS_ID_OPC_MOVCF_S :
+            MIPS_ID_NONE);
         check_insn_opc_removed(ctx, ISA_MIPS_R6);
         gen_movcf_s(ctx, fs, fd, (ft >> 2) & 0x7, ft & 0x1);
         break;
     case OPC_MOVZ_S:
+        mips_ident(ctx,
+            op1 == OPC_MOVZ_S ? MIPS_ID_OPC_MOVZ_S :
+            MIPS_ID_NONE);
         check_insn_opc_removed(ctx, ISA_MIPS_R6);
         {
             TCGLabel *l1 = gen_new_label();
@@ -9529,6 +10838,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_MOVN_S:
+        mips_ident(ctx,
+            op1 == OPC_MOVN_S ? MIPS_ID_OPC_MOVN_S :
+            MIPS_ID_NONE);
         check_insn_opc_removed(ctx, ISA_MIPS_R6);
         {
             TCGLabel *l1 = gen_new_label();
@@ -9544,6 +10856,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_RECIP_S:
+        mips_ident(ctx,
+            op1 == OPC_RECIP_S ? MIPS_ID_OPC_RECIP_S :
+            MIPS_ID_NONE);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
 
@@ -9553,6 +10868,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_RSQRT_S:
+        mips_ident(ctx,
+            op1 == OPC_RSQRT_S ? MIPS_ID_OPC_RSQRT_S :
+            MIPS_ID_NONE);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
 
@@ -9562,6 +10880,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_MADDF_S:
+        mips_ident(ctx,
+            op1 == OPC_MADDF_S ? MIPS_ID_OPC_MADDF_S :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS_R6);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
@@ -9575,6 +10896,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_MSUBF_S:
+        mips_ident(ctx,
+            op1 == OPC_MSUBF_S ? MIPS_ID_OPC_MSUBF_S :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS_R6);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
@@ -9588,6 +10912,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_RINT_S:
+        mips_ident(ctx,
+            op1 == OPC_RINT_S ? MIPS_ID_OPC_RINT_S :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS_R6);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
@@ -9597,6 +10924,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_CLASS_S:
+        mips_ident(ctx,
+            op1 == OPC_CLASS_S ? MIPS_ID_OPC_CLASS_S :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS_R6);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
@@ -9606,6 +10936,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_MIN_S: /* OPC_RECIP2_S */
+        mips_ident(ctx,
+            op1 == OPC_MIN_S ? MIPS_ID_OPC_MIN_S :
+            MIPS_ID_NONE);
         if (ctx->insn_flags & ISA_MIPS_R6) {
             /* OPC_MIN_S */
             TCGv_i32 fp0 = tcg_temp_new_i32();
@@ -9630,6 +10963,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_MINA_S: /* OPC_RECIP1_S */
+        mips_ident(ctx,
+            op1 == OPC_MINA_S ? MIPS_ID_OPC_MINA_S :
+            MIPS_ID_NONE);
         if (ctx->insn_flags & ISA_MIPS_R6) {
             /* OPC_MINA_S */
             TCGv_i32 fp0 = tcg_temp_new_i32();
@@ -9652,6 +10988,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_MAX_S: /* OPC_RSQRT1_S */
+        mips_ident(ctx,
+            op1 == OPC_MAX_S ? MIPS_ID_OPC_MAX_S :
+            MIPS_ID_NONE);
         if (ctx->insn_flags & ISA_MIPS_R6) {
             /* OPC_MAX_S */
             TCGv_i32 fp0 = tcg_temp_new_i32();
@@ -9673,6 +11012,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_MAXA_S: /* OPC_RSQRT2_S */
+        mips_ident(ctx,
+            op1 == OPC_MAXA_S ? MIPS_ID_OPC_MAXA_S :
+            MIPS_ID_NONE);
         if (ctx->insn_flags & ISA_MIPS_R6) {
             /* OPC_MAXA_S */
             TCGv_i32 fp0 = tcg_temp_new_i32();
@@ -9696,6 +11038,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_CVT_D_S:
+        mips_ident(ctx,
+            op1 == OPC_CVT_D_S ? MIPS_ID_OPC_CVT_D_S :
+            MIPS_ID_NONE);
         check_cp1_registers(ctx, fd);
         {
             TCGv_i32 fp32 = tcg_temp_new_i32();
@@ -9707,6 +11052,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_CVT_W_S:
+        mips_ident(ctx,
+            op1 == OPC_CVT_W_S ? MIPS_ID_OPC_CVT_W_S :
+            MIPS_ID_NONE);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
 
@@ -9720,6 +11068,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_CVT_L_S:
+        mips_ident(ctx,
+            op1 == OPC_CVT_L_S ? MIPS_ID_OPC_CVT_L_S :
+            MIPS_ID_NONE);
         check_cp1_64bitmode(ctx);
         {
             TCGv_i32 fp32 = tcg_temp_new_i32();
@@ -9735,6 +11086,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_CVT_PS_S:
+        mips_ident(ctx,
+            op1 == OPC_CVT_PS_S ? MIPS_ID_OPC_CVT_PS_S :
+            MIPS_ID_NONE);
         check_ps(ctx);
         {
             TCGv_i64 fp64 = tcg_temp_new_i64();
@@ -9763,6 +11117,24 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
     case OPC_CMP_NGE_S:
     case OPC_CMP_LE_S:
     case OPC_CMP_NGT_S:
+        mips_ident(ctx,
+            op1 == OPC_CMP_F_S ? MIPS_ID_OPC_CMP_F_S :
+            op1 == OPC_CMP_UN_S ? MIPS_ID_OPC_CMP_UN_S :
+            op1 == OPC_CMP_EQ_S ? MIPS_ID_OPC_CMP_EQ_S :
+            op1 == OPC_CMP_UEQ_S ? MIPS_ID_OPC_CMP_UEQ_S :
+            op1 == OPC_CMP_OLT_S ? MIPS_ID_OPC_CMP_OLT_S :
+            op1 == OPC_CMP_ULT_S ? MIPS_ID_OPC_CMP_ULT_S :
+            op1 == OPC_CMP_OLE_S ? MIPS_ID_OPC_CMP_OLE_S :
+            op1 == OPC_CMP_ULE_S ? MIPS_ID_OPC_CMP_ULE_S :
+            op1 == OPC_CMP_SF_S ? MIPS_ID_OPC_CMP_SF_S :
+            op1 == OPC_CMP_NGLE_S ? MIPS_ID_OPC_CMP_NGLE_S :
+            op1 == OPC_CMP_SEQ_S ? MIPS_ID_OPC_CMP_SEQ_S :
+            op1 == OPC_CMP_NGL_S ? MIPS_ID_OPC_CMP_NGL_S :
+            op1 == OPC_CMP_LT_S ? MIPS_ID_OPC_CMP_LT_S :
+            op1 == OPC_CMP_NGE_S ? MIPS_ID_OPC_CMP_NGE_S :
+            op1 == OPC_CMP_LE_S ? MIPS_ID_OPC_CMP_LE_S :
+            op1 == OPC_CMP_NGT_S ? MIPS_ID_OPC_CMP_NGT_S :
+            MIPS_ID_NONE);
         check_insn_opc_removed(ctx, ISA_MIPS_R6);
         if (ctx->opcode & (1 << 6)) {
             gen_cmpabs_s(ctx, func - 48, ft, fs, cc);
@@ -9771,6 +11143,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_ADD_D:
+        mips_ident(ctx,
+            op1 == OPC_ADD_D ? MIPS_ID_OPC_ADD_D :
+            MIPS_ID_NONE);
         check_cp1_registers(ctx, fs | ft | fd);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -9783,6 +11158,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_SUB_D:
+        mips_ident(ctx,
+            op1 == OPC_SUB_D ? MIPS_ID_OPC_SUB_D :
+            MIPS_ID_NONE);
         check_cp1_registers(ctx, fs | ft | fd);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -9795,6 +11173,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_MUL_D:
+        mips_ident(ctx,
+            op1 == OPC_MUL_D ? MIPS_ID_OPC_MUL_D :
+            MIPS_ID_NONE);
         check_cp1_registers(ctx, fs | ft | fd);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -9807,6 +11188,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_DIV_D:
+        mips_ident(ctx,
+            op1 == OPC_DIV_D ? MIPS_ID_OPC_DIV_D :
+            MIPS_ID_NONE);
         check_cp1_registers(ctx, fs | ft | fd);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -9819,6 +11203,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_SQRT_D:
+        mips_ident(ctx,
+            op1 == OPC_SQRT_D ? MIPS_ID_OPC_SQRT_D :
+            MIPS_ID_NONE);
         check_cp1_registers(ctx, fs | fd);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -9829,6 +11216,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_ABS_D:
+        mips_ident(ctx,
+            op1 == OPC_ABS_D ? MIPS_ID_OPC_ABS_D :
+            MIPS_ID_NONE);
         check_cp1_registers(ctx, fs | fd);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -9843,6 +11233,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_MOV_D:
+        mips_ident(ctx,
+            op1 == OPC_MOV_D ? MIPS_ID_OPC_MOV_D :
+            MIPS_ID_NONE);
         check_cp1_registers(ctx, fs | fd);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -9852,6 +11245,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_NEG_D:
+        mips_ident(ctx,
+            op1 == OPC_NEG_D ? MIPS_ID_OPC_NEG_D :
+            MIPS_ID_NONE);
         check_cp1_registers(ctx, fs | fd);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -9866,6 +11262,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_ROUND_L_D:
+        mips_ident(ctx,
+            op1 == OPC_ROUND_L_D ? MIPS_ID_OPC_ROUND_L_D :
+            MIPS_ID_NONE);
         check_cp1_64bitmode(ctx);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -9880,6 +11279,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_TRUNC_L_D:
+        mips_ident(ctx,
+            op1 == OPC_TRUNC_L_D ? MIPS_ID_OPC_TRUNC_L_D :
+            MIPS_ID_NONE);
         check_cp1_64bitmode(ctx);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -9894,6 +11296,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_CEIL_L_D:
+        mips_ident(ctx,
+            op1 == OPC_CEIL_L_D ? MIPS_ID_OPC_CEIL_L_D :
+            MIPS_ID_NONE);
         check_cp1_64bitmode(ctx);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -9908,6 +11313,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_FLOOR_L_D:
+        mips_ident(ctx,
+            op1 == OPC_FLOOR_L_D ? MIPS_ID_OPC_FLOOR_L_D :
+            MIPS_ID_NONE);
         check_cp1_64bitmode(ctx);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -9922,6 +11330,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_ROUND_W_D:
+        mips_ident(ctx,
+            op1 == OPC_ROUND_W_D ? MIPS_ID_OPC_ROUND_W_D :
+            MIPS_ID_NONE);
         check_cp1_registers(ctx, fs);
         {
             TCGv_i32 fp32 = tcg_temp_new_i32();
@@ -9937,6 +11348,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_TRUNC_W_D:
+        mips_ident(ctx,
+            op1 == OPC_TRUNC_W_D ? MIPS_ID_OPC_TRUNC_W_D :
+            MIPS_ID_NONE);
         check_cp1_registers(ctx, fs);
         {
             TCGv_i32 fp32 = tcg_temp_new_i32();
@@ -9952,6 +11366,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_CEIL_W_D:
+        mips_ident(ctx,
+            op1 == OPC_CEIL_W_D ? MIPS_ID_OPC_CEIL_W_D :
+            MIPS_ID_NONE);
         check_cp1_registers(ctx, fs);
         {
             TCGv_i32 fp32 = tcg_temp_new_i32();
@@ -9967,6 +11384,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_FLOOR_W_D:
+        mips_ident(ctx,
+            op1 == OPC_FLOOR_W_D ? MIPS_ID_OPC_FLOOR_W_D :
+            MIPS_ID_NONE);
         check_cp1_registers(ctx, fs);
         {
             TCGv_i32 fp32 = tcg_temp_new_i32();
@@ -9982,22 +11402,37 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_SEL_D:
+        mips_ident(ctx,
+            op1 == OPC_SEL_D ? MIPS_ID_OPC_SEL_D :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS_R6);
         gen_sel_d(ctx, op1, fd, ft, fs);
         break;
     case OPC_SELEQZ_D:
+        mips_ident(ctx,
+            op1 == OPC_SELEQZ_D ? MIPS_ID_OPC_SELEQZ_D :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS_R6);
         gen_sel_d(ctx, op1, fd, ft, fs);
         break;
     case OPC_SELNEZ_D:
+        mips_ident(ctx,
+            op1 == OPC_SELNEZ_D ? MIPS_ID_OPC_SELNEZ_D :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS_R6);
         gen_sel_d(ctx, op1, fd, ft, fs);
         break;
     case OPC_MOVCF_D:
+        mips_ident(ctx,
+            op1 == OPC_MOVCF_D ? MIPS_ID_OPC_MOVCF_D :
+            MIPS_ID_NONE);
         check_insn_opc_removed(ctx, ISA_MIPS_R6);
         gen_movcf_d(ctx, fs, fd, (ft >> 2) & 0x7, ft & 0x1);
         break;
     case OPC_MOVZ_D:
+        mips_ident(ctx,
+            op1 == OPC_MOVZ_D ? MIPS_ID_OPC_MOVZ_D :
+            MIPS_ID_NONE);
         check_insn_opc_removed(ctx, ISA_MIPS_R6);
         {
             TCGLabel *l1 = gen_new_label();
@@ -10013,6 +11448,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_MOVN_D:
+        mips_ident(ctx,
+            op1 == OPC_MOVN_D ? MIPS_ID_OPC_MOVN_D :
+            MIPS_ID_NONE);
         check_insn_opc_removed(ctx, ISA_MIPS_R6);
         {
             TCGLabel *l1 = gen_new_label();
@@ -10028,6 +11466,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_RECIP_D:
+        mips_ident(ctx,
+            op1 == OPC_RECIP_D ? MIPS_ID_OPC_RECIP_D :
+            MIPS_ID_NONE);
         check_cp1_registers(ctx, fs | fd);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -10038,6 +11479,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_RSQRT_D:
+        mips_ident(ctx,
+            op1 == OPC_RSQRT_D ? MIPS_ID_OPC_RSQRT_D :
+            MIPS_ID_NONE);
         check_cp1_registers(ctx, fs | fd);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -10048,6 +11492,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_MADDF_D:
+        mips_ident(ctx,
+            op1 == OPC_MADDF_D ? MIPS_ID_OPC_MADDF_D :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS_R6);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -10061,6 +11508,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_MSUBF_D:
+        mips_ident(ctx,
+            op1 == OPC_MSUBF_D ? MIPS_ID_OPC_MSUBF_D :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS_R6);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -10074,6 +11524,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_RINT_D:
+        mips_ident(ctx,
+            op1 == OPC_RINT_D ? MIPS_ID_OPC_RINT_D :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS_R6);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -10083,6 +11536,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_CLASS_D:
+        mips_ident(ctx,
+            op1 == OPC_CLASS_D ? MIPS_ID_OPC_CLASS_D :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS_R6);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -10092,6 +11548,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_MIN_D: /* OPC_RECIP2_D */
+        mips_ident(ctx,
+            op1 == OPC_MIN_D ? MIPS_ID_OPC_MIN_D :
+            MIPS_ID_NONE);
         if (ctx->insn_flags & ISA_MIPS_R6) {
             /* OPC_MIN_D */
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -10115,6 +11574,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_MINA_D: /* OPC_RECIP1_D */
+        mips_ident(ctx,
+            op1 == OPC_MINA_D ? MIPS_ID_OPC_MINA_D :
+            MIPS_ID_NONE);
         if (ctx->insn_flags & ISA_MIPS_R6) {
             /* OPC_MINA_D */
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -10136,6 +11598,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_MAX_D: /*  OPC_RSQRT1_D */
+        mips_ident(ctx,
+            op1 == OPC_MAX_D ? MIPS_ID_OPC_MAX_D :
+            MIPS_ID_NONE);
         if (ctx->insn_flags & ISA_MIPS_R6) {
             /* OPC_MAX_D */
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -10157,6 +11622,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_MAXA_D: /* OPC_RSQRT2_D */
+        mips_ident(ctx,
+            op1 == OPC_MAXA_D ? MIPS_ID_OPC_MAXA_D :
+            MIPS_ID_NONE);
         if (ctx->insn_flags & ISA_MIPS_R6) {
             /* OPC_MAXA_D */
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -10195,6 +11663,24 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
     case OPC_CMP_NGE_D:
     case OPC_CMP_LE_D:
     case OPC_CMP_NGT_D:
+        mips_ident(ctx,
+            op1 == OPC_CMP_F_D ? MIPS_ID_OPC_CMP_F_D :
+            op1 == OPC_CMP_UN_D ? MIPS_ID_OPC_CMP_UN_D :
+            op1 == OPC_CMP_EQ_D ? MIPS_ID_OPC_CMP_EQ_D :
+            op1 == OPC_CMP_UEQ_D ? MIPS_ID_OPC_CMP_UEQ_D :
+            op1 == OPC_CMP_OLT_D ? MIPS_ID_OPC_CMP_OLT_D :
+            op1 == OPC_CMP_ULT_D ? MIPS_ID_OPC_CMP_ULT_D :
+            op1 == OPC_CMP_OLE_D ? MIPS_ID_OPC_CMP_OLE_D :
+            op1 == OPC_CMP_ULE_D ? MIPS_ID_OPC_CMP_ULE_D :
+            op1 == OPC_CMP_SF_D ? MIPS_ID_OPC_CMP_SF_D :
+            op1 == OPC_CMP_NGLE_D ? MIPS_ID_OPC_CMP_NGLE_D :
+            op1 == OPC_CMP_SEQ_D ? MIPS_ID_OPC_CMP_SEQ_D :
+            op1 == OPC_CMP_NGL_D ? MIPS_ID_OPC_CMP_NGL_D :
+            op1 == OPC_CMP_LT_D ? MIPS_ID_OPC_CMP_LT_D :
+            op1 == OPC_CMP_NGE_D ? MIPS_ID_OPC_CMP_NGE_D :
+            op1 == OPC_CMP_LE_D ? MIPS_ID_OPC_CMP_LE_D :
+            op1 == OPC_CMP_NGT_D ? MIPS_ID_OPC_CMP_NGT_D :
+            MIPS_ID_NONE);
         check_insn_opc_removed(ctx, ISA_MIPS_R6);
         if (ctx->opcode & (1 << 6)) {
             gen_cmpabs_d(ctx, func - 48, ft, fs, cc);
@@ -10203,6 +11689,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_CVT_S_D:
+        mips_ident(ctx,
+            op1 == OPC_CVT_S_D ? MIPS_ID_OPC_CVT_S_D :
+            MIPS_ID_NONE);
         check_cp1_registers(ctx, fs);
         {
             TCGv_i32 fp32 = tcg_temp_new_i32();
@@ -10214,6 +11703,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_CVT_W_D:
+        mips_ident(ctx,
+            op1 == OPC_CVT_W_D ? MIPS_ID_OPC_CVT_W_D :
+            MIPS_ID_NONE);
         check_cp1_registers(ctx, fs);
         {
             TCGv_i32 fp32 = tcg_temp_new_i32();
@@ -10229,6 +11721,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_CVT_L_D:
+        mips_ident(ctx,
+            op1 == OPC_CVT_L_D ? MIPS_ID_OPC_CVT_L_D :
+            MIPS_ID_NONE);
         check_cp1_64bitmode(ctx);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -10243,6 +11738,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_CVT_S_W:
+        mips_ident(ctx,
+            op1 == OPC_CVT_S_W ? MIPS_ID_OPC_CVT_S_W :
+            MIPS_ID_NONE);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
 
@@ -10252,6 +11750,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_CVT_D_W:
+        mips_ident(ctx,
+            op1 == OPC_CVT_D_W ? MIPS_ID_OPC_CVT_D_W :
+            MIPS_ID_NONE);
         check_cp1_registers(ctx, fd);
         {
             TCGv_i32 fp32 = tcg_temp_new_i32();
@@ -10263,6 +11764,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_CVT_S_L:
+        mips_ident(ctx,
+            op1 == OPC_CVT_S_L ? MIPS_ID_OPC_CVT_S_L :
+            MIPS_ID_NONE);
         check_cp1_64bitmode(ctx);
         {
             TCGv_i32 fp32 = tcg_temp_new_i32();
@@ -10274,6 +11778,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_CVT_D_L:
+        mips_ident(ctx,
+            op1 == OPC_CVT_D_L ? MIPS_ID_OPC_CVT_D_L :
+            MIPS_ID_NONE);
         check_cp1_64bitmode(ctx);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -10284,6 +11791,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_CVT_PS_PW:
+        mips_ident(ctx,
+            op1 == OPC_CVT_PS_PW ? MIPS_ID_OPC_CVT_PS_PW :
+            MIPS_ID_NONE);
         check_ps(ctx);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -10294,6 +11804,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_ADD_PS:
+        mips_ident(ctx,
+            op1 == OPC_ADD_PS ? MIPS_ID_OPC_ADD_PS :
+            MIPS_ID_NONE);
         check_ps(ctx);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -10306,6 +11819,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_SUB_PS:
+        mips_ident(ctx,
+            op1 == OPC_SUB_PS ? MIPS_ID_OPC_SUB_PS :
+            MIPS_ID_NONE);
         check_ps(ctx);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -10318,6 +11834,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_MUL_PS:
+        mips_ident(ctx,
+            op1 == OPC_MUL_PS ? MIPS_ID_OPC_MUL_PS :
+            MIPS_ID_NONE);
         check_ps(ctx);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -10330,6 +11849,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_ABS_PS:
+        mips_ident(ctx,
+            op1 == OPC_ABS_PS ? MIPS_ID_OPC_ABS_PS :
+            MIPS_ID_NONE);
         check_ps(ctx);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -10340,6 +11862,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_MOV_PS:
+        mips_ident(ctx,
+            op1 == OPC_MOV_PS ? MIPS_ID_OPC_MOV_PS :
+            MIPS_ID_NONE);
         check_ps(ctx);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -10349,6 +11874,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_NEG_PS:
+        mips_ident(ctx,
+            op1 == OPC_NEG_PS ? MIPS_ID_OPC_NEG_PS :
+            MIPS_ID_NONE);
         check_ps(ctx);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -10359,10 +11887,16 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_MOVCF_PS:
+        mips_ident(ctx,
+            op1 == OPC_MOVCF_PS ? MIPS_ID_OPC_MOVCF_PS :
+            MIPS_ID_NONE);
         check_ps(ctx);
         gen_movcf_ps(ctx, fs, fd, (ft >> 2) & 0x7, ft & 0x1);
         break;
     case OPC_MOVZ_PS:
+        mips_ident(ctx,
+            op1 == OPC_MOVZ_PS ? MIPS_ID_OPC_MOVZ_PS :
+            MIPS_ID_NONE);
         check_ps(ctx);
         {
             TCGLabel *l1 = gen_new_label();
@@ -10378,6 +11912,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_MOVN_PS:
+        mips_ident(ctx,
+            op1 == OPC_MOVN_PS ? MIPS_ID_OPC_MOVN_PS :
+            MIPS_ID_NONE);
         check_ps(ctx);
         {
             TCGLabel *l1 = gen_new_label();
@@ -10393,6 +11930,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_ADDR_PS:
+        mips_ident(ctx,
+            op1 == OPC_ADDR_PS ? MIPS_ID_OPC_ADDR_PS :
+            MIPS_ID_NONE);
         check_ps(ctx);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -10405,6 +11945,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_MULR_PS:
+        mips_ident(ctx,
+            op1 == OPC_MULR_PS ? MIPS_ID_OPC_MULR_PS :
+            MIPS_ID_NONE);
         check_ps(ctx);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -10417,6 +11960,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_RECIP2_PS:
+        mips_ident(ctx,
+            op1 == OPC_RECIP2_PS ? MIPS_ID_OPC_RECIP2_PS :
+            MIPS_ID_NONE);
         check_ps(ctx);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -10429,6 +11975,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_RECIP1_PS:
+        mips_ident(ctx,
+            op1 == OPC_RECIP1_PS ? MIPS_ID_OPC_RECIP1_PS :
+            MIPS_ID_NONE);
         check_ps(ctx);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -10439,6 +11988,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_RSQRT1_PS:
+        mips_ident(ctx,
+            op1 == OPC_RSQRT1_PS ? MIPS_ID_OPC_RSQRT1_PS :
+            MIPS_ID_NONE);
         check_ps(ctx);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -10449,6 +12001,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_RSQRT2_PS:
+        mips_ident(ctx,
+            op1 == OPC_RSQRT2_PS ? MIPS_ID_OPC_RSQRT2_PS :
+            MIPS_ID_NONE);
         check_ps(ctx);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -10461,6 +12016,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_CVT_S_PU:
+        mips_ident(ctx,
+            op1 == OPC_CVT_S_PU ? MIPS_ID_OPC_CVT_S_PU :
+            MIPS_ID_NONE);
         check_cp1_64bitmode(ctx);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
@@ -10471,6 +12029,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_CVT_PW_PS:
+        mips_ident(ctx,
+            op1 == OPC_CVT_PW_PS ? MIPS_ID_OPC_CVT_PW_PS :
+            MIPS_ID_NONE);
         check_ps(ctx);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -10481,6 +12042,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_CVT_S_PL:
+        mips_ident(ctx,
+            op1 == OPC_CVT_S_PL ? MIPS_ID_OPC_CVT_S_PL :
+            MIPS_ID_NONE);
         check_cp1_64bitmode(ctx);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
@@ -10491,6 +12055,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_PLL_PS:
+        mips_ident(ctx,
+            op1 == OPC_PLL_PS ? MIPS_ID_OPC_PLL_PS :
+            MIPS_ID_NONE);
         check_ps(ctx);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
@@ -10503,6 +12070,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_PLU_PS:
+        mips_ident(ctx,
+            op1 == OPC_PLU_PS ? MIPS_ID_OPC_PLU_PS :
+            MIPS_ID_NONE);
         check_ps(ctx);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
@@ -10515,6 +12085,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_PUL_PS:
+        mips_ident(ctx,
+            op1 == OPC_PUL_PS ? MIPS_ID_OPC_PUL_PS :
+            MIPS_ID_NONE);
         check_ps(ctx);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
@@ -10527,6 +12100,9 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
         }
         break;
     case OPC_PUU_PS:
+        mips_ident(ctx,
+            op1 == OPC_PUU_PS ? MIPS_ID_OPC_PUU_PS :
+            MIPS_ID_NONE);
         check_ps(ctx);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
@@ -10554,6 +12130,24 @@ static void gen_farith(DisasContext *ctx, enum fopcode op1,
     case OPC_CMP_NGE_PS:
     case OPC_CMP_LE_PS:
     case OPC_CMP_NGT_PS:
+        mips_ident(ctx,
+            op1 == OPC_CMP_F_PS ? MIPS_ID_OPC_CMP_F_PS :
+            op1 == OPC_CMP_UN_PS ? MIPS_ID_OPC_CMP_UN_PS :
+            op1 == OPC_CMP_EQ_PS ? MIPS_ID_OPC_CMP_EQ_PS :
+            op1 == OPC_CMP_UEQ_PS ? MIPS_ID_OPC_CMP_UEQ_PS :
+            op1 == OPC_CMP_OLT_PS ? MIPS_ID_OPC_CMP_OLT_PS :
+            op1 == OPC_CMP_ULT_PS ? MIPS_ID_OPC_CMP_ULT_PS :
+            op1 == OPC_CMP_OLE_PS ? MIPS_ID_OPC_CMP_OLE_PS :
+            op1 == OPC_CMP_ULE_PS ? MIPS_ID_OPC_CMP_ULE_PS :
+            op1 == OPC_CMP_SF_PS ? MIPS_ID_OPC_CMP_SF_PS :
+            op1 == OPC_CMP_NGLE_PS ? MIPS_ID_OPC_CMP_NGLE_PS :
+            op1 == OPC_CMP_SEQ_PS ? MIPS_ID_OPC_CMP_SEQ_PS :
+            op1 == OPC_CMP_NGL_PS ? MIPS_ID_OPC_CMP_NGL_PS :
+            op1 == OPC_CMP_LT_PS ? MIPS_ID_OPC_CMP_LT_PS :
+            op1 == OPC_CMP_NGE_PS ? MIPS_ID_OPC_CMP_NGE_PS :
+            op1 == OPC_CMP_LE_PS ? MIPS_ID_OPC_CMP_LE_PS :
+            op1 == OPC_CMP_NGT_PS ? MIPS_ID_OPC_CMP_NGT_PS :
+            MIPS_ID_NONE);
         if (ctx->opcode & (1 << 6)) {
             gen_cmpabs_ps(ctx, func - 48, ft, fs, cc);
         } else {
@@ -10586,6 +12180,9 @@ static void gen_flt3_ldst(DisasContext *ctx, uint32_t opc,
      */
     switch (opc) {
     case OPC_LWXC1:
+        mips_ident(ctx,
+            opc == OPC_LWXC1 ? MIPS_ID_OPC_LWXC1 :
+            MIPS_ID_NONE);
         check_cop1x(ctx);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
@@ -10596,6 +12193,9 @@ static void gen_flt3_ldst(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_LDXC1:
+        mips_ident(ctx,
+            opc == OPC_LDXC1 ? MIPS_ID_OPC_LDXC1 :
+            MIPS_ID_NONE);
         check_cop1x(ctx);
         check_cp1_registers(ctx, fd);
         {
@@ -10605,6 +12205,9 @@ static void gen_flt3_ldst(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_LUXC1:
+        mips_ident(ctx,
+            opc == OPC_LUXC1 ? MIPS_ID_OPC_LUXC1 :
+            MIPS_ID_NONE);
         check_cp1_64bitmode(ctx);
         tcg_gen_andi_tl(t0, t0, ~0x7);
         {
@@ -10615,6 +12218,9 @@ static void gen_flt3_ldst(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_SWXC1:
+        mips_ident(ctx,
+            opc == OPC_SWXC1 ? MIPS_ID_OPC_SWXC1 :
+            MIPS_ID_NONE);
         check_cop1x(ctx);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
@@ -10623,6 +12229,9 @@ static void gen_flt3_ldst(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_SDXC1:
+        mips_ident(ctx,
+            opc == OPC_SDXC1 ? MIPS_ID_OPC_SDXC1 :
+            MIPS_ID_NONE);
         check_cop1x(ctx);
         check_cp1_registers(ctx, fs);
         {
@@ -10632,6 +12241,9 @@ static void gen_flt3_ldst(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_SUXC1:
+        mips_ident(ctx,
+            opc == OPC_SUXC1 ? MIPS_ID_OPC_SUXC1 :
+            MIPS_ID_NONE);
         check_cp1_64bitmode(ctx);
         tcg_gen_andi_tl(t0, t0, ~0x7);
         {
@@ -10648,6 +12260,9 @@ static void gen_flt3_arith(DisasContext *ctx, uint32_t opc,
 {
     switch (opc) {
     case OPC_ALNV_PS:
+        mips_ident(ctx,
+            opc == OPC_ALNV_PS ? MIPS_ID_OPC_ALNV_PS :
+            MIPS_ID_NONE);
         check_ps(ctx);
         {
             TCGv t0 = tcg_temp_new();
@@ -10682,6 +12297,9 @@ static void gen_flt3_arith(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_MADD_S:
+        mips_ident(ctx,
+            opc == OPC_MADD_S ? MIPS_ID_OPC_MADD_S :
+            MIPS_ID_NONE);
         check_cop1x(ctx);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
@@ -10696,6 +12314,9 @@ static void gen_flt3_arith(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_MADD_D:
+        mips_ident(ctx,
+            opc == OPC_MADD_D ? MIPS_ID_OPC_MADD_D :
+            MIPS_ID_NONE);
         check_cop1x(ctx);
         check_cp1_registers(ctx, fd | fs | ft | fr);
         {
@@ -10711,6 +12332,9 @@ static void gen_flt3_arith(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_MADD_PS:
+        mips_ident(ctx,
+            opc == OPC_MADD_PS ? MIPS_ID_OPC_MADD_PS :
+            MIPS_ID_NONE);
         check_ps(ctx);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -10725,6 +12349,9 @@ static void gen_flt3_arith(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_MSUB_S:
+        mips_ident(ctx,
+            opc == OPC_MSUB_S ? MIPS_ID_OPC_MSUB_S :
+            MIPS_ID_NONE);
         check_cop1x(ctx);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
@@ -10739,6 +12366,9 @@ static void gen_flt3_arith(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_MSUB_D:
+        mips_ident(ctx,
+            opc == OPC_MSUB_D ? MIPS_ID_OPC_MSUB_D :
+            MIPS_ID_NONE);
         check_cop1x(ctx);
         check_cp1_registers(ctx, fd | fs | ft | fr);
         {
@@ -10754,6 +12384,9 @@ static void gen_flt3_arith(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_MSUB_PS:
+        mips_ident(ctx,
+            opc == OPC_MSUB_PS ? MIPS_ID_OPC_MSUB_PS :
+            MIPS_ID_NONE);
         check_ps(ctx);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -10768,6 +12401,9 @@ static void gen_flt3_arith(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_NMADD_S:
+        mips_ident(ctx,
+            opc == OPC_NMADD_S ? MIPS_ID_OPC_NMADD_S :
+            MIPS_ID_NONE);
         check_cop1x(ctx);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
@@ -10782,6 +12418,9 @@ static void gen_flt3_arith(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_NMADD_D:
+        mips_ident(ctx,
+            opc == OPC_NMADD_D ? MIPS_ID_OPC_NMADD_D :
+            MIPS_ID_NONE);
         check_cop1x(ctx);
         check_cp1_registers(ctx, fd | fs | ft | fr);
         {
@@ -10797,6 +12436,9 @@ static void gen_flt3_arith(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_NMADD_PS:
+        mips_ident(ctx,
+            opc == OPC_NMADD_PS ? MIPS_ID_OPC_NMADD_PS :
+            MIPS_ID_NONE);
         check_ps(ctx);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -10811,6 +12453,9 @@ static void gen_flt3_arith(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_NMSUB_S:
+        mips_ident(ctx,
+            opc == OPC_NMSUB_S ? MIPS_ID_OPC_NMSUB_S :
+            MIPS_ID_NONE);
         check_cop1x(ctx);
         {
             TCGv_i32 fp0 = tcg_temp_new_i32();
@@ -10825,6 +12470,9 @@ static void gen_flt3_arith(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_NMSUB_D:
+        mips_ident(ctx,
+            opc == OPC_NMSUB_D ? MIPS_ID_OPC_NMSUB_D :
+            MIPS_ID_NONE);
         check_cop1x(ctx);
         check_cp1_registers(ctx, fd | fs | ft | fr);
         {
@@ -10840,6 +12488,9 @@ static void gen_flt3_arith(DisasContext *ctx, uint32_t opc,
         }
         break;
     case OPC_NMSUB_PS:
+        mips_ident(ctx,
+            opc == OPC_NMSUB_PS ? MIPS_ID_OPC_NMSUB_PS :
+            MIPS_ID_NONE);
         check_ps(ctx);
         {
             TCGv_i64 fp0 = tcg_temp_new_i64();
@@ -11034,6 +12685,10 @@ static void gen_compute_compact_branch(DisasContext *ctx, uint32_t opc,
     /* compact branch */
     case OPC_BOVC: /* OPC_BEQZALC, OPC_BEQC */
     case OPC_BNVC: /* OPC_BNEZALC, OPC_BNEC */
+        mips_ident(ctx,
+            opc == OPC_BOVC ? MIPS_ID_OPC_BOVC :
+            opc == OPC_BNVC ? MIPS_ID_OPC_BNVC :
+            MIPS_ID_NONE);
         gen_load_gpr(t0, rs);
         gen_load_gpr(t1, rt);
         bcond_compute = 1;
@@ -11046,6 +12701,10 @@ static void gen_compute_compact_branch(DisasContext *ctx, uint32_t opc,
         break;
     case OPC_BLEZC: /* OPC_BGEZC, OPC_BGEC */
     case OPC_BGTZC: /* OPC_BLTZC, OPC_BLTC */
+        mips_ident(ctx,
+            opc == OPC_BLEZC ? MIPS_ID_OPC_BLEZC :
+            opc == OPC_BGTZC ? MIPS_ID_OPC_BGTZC :
+            MIPS_ID_NONE);
         gen_load_gpr(t0, rs);
         gen_load_gpr(t1, rt);
         bcond_compute = 1;
@@ -11054,6 +12713,10 @@ static void gen_compute_compact_branch(DisasContext *ctx, uint32_t opc,
         break;
     case OPC_BLEZALC: /* OPC_BGEZALC, OPC_BGEUC */
     case OPC_BGTZALC: /* OPC_BLTZALC, OPC_BLTUC */
+        mips_ident(ctx,
+            opc == OPC_BLEZALC ? MIPS_ID_OPC_BLEZALC :
+            opc == OPC_BGTZALC ? MIPS_ID_OPC_BGTZALC :
+            MIPS_ID_NONE);
         if (rs == 0 || rs == rt) {
             /* OPC_BLEZALC, OPC_BGEZALC */
             /* OPC_BGTZALC, OPC_BLTZALC */
@@ -11067,11 +12730,19 @@ static void gen_compute_compact_branch(DisasContext *ctx, uint32_t opc,
         break;
     case OPC_BC:
     case OPC_BALC:
+        mips_ident(ctx,
+            opc == OPC_BC ? MIPS_ID_OPC_BC :
+            opc == OPC_BALC ? MIPS_ID_OPC_BALC :
+            MIPS_ID_NONE);
         ctx->btarget = addr_add(ctx, ctx->base.pc_next + 4, offset);
         plugin_gen_record_branch_target((uint64_t)ctx->btarget);
         break;
     case OPC_BEQZC:
     case OPC_BNEZC:
+        mips_ident(ctx,
+            opc == OPC_BEQZC ? MIPS_ID_OPC_BEQZC :
+            opc == OPC_BNEZC ? MIPS_ID_OPC_BNEZC :
+            MIPS_ID_NONE);
         if (rs != 0) {
             /* OPC_BEQZC, OPC_BNEZC */
             gen_load_gpr(t0, rs);
@@ -11096,15 +12767,27 @@ static void gen_compute_compact_branch(DisasContext *ctx, uint32_t opc,
         /* Unconditional compact branch */
         switch (opc) {
         case OPC_JIALC:
+            mips_ident(ctx,
+                opc == OPC_JIALC ? MIPS_ID_OPC_JIALC :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(cpu_gpr[31], ctx->base.pc_next + 4 + m16_lowbit);
             /* Fallthrough */
         case OPC_JIC:
+            mips_ident(ctx,
+                opc == OPC_JIC ? MIPS_ID_OPC_JIC :
+                MIPS_ID_NONE);
             ctx->hflags |= MIPS_HFLAG_BR;
             break;
         case OPC_BALC:
+            mips_ident(ctx,
+                opc == OPC_BALC ? MIPS_ID_OPC_BALC :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(cpu_gpr[31], ctx->base.pc_next + 4 + m16_lowbit);
             /* Fallthrough */
         case OPC_BC:
+            mips_ident(ctx,
+                opc == OPC_BC ? MIPS_ID_OPC_BC :
+                MIPS_ID_NONE);
             ctx->hflags |= MIPS_HFLAG_B;
             break;
         default:
@@ -11122,6 +12805,9 @@ static void gen_compute_compact_branch(DisasContext *ctx, uint32_t opc,
 
         switch (opc) {
         case OPC_BLEZALC: /* OPC_BGEZALC, OPC_BGEUC */
+            mips_ident(ctx,
+                opc == OPC_BLEZALC ? MIPS_ID_OPC_BLEZALC :
+                MIPS_ID_NONE);
             if (rs == 0 && rt != 0) {
                 /* OPC_BLEZALC */
                 tcg_gen_brcondi_tl(tcg_invert_cond(TCG_COND_LE), t1, 0, fs);
@@ -11134,6 +12820,9 @@ static void gen_compute_compact_branch(DisasContext *ctx, uint32_t opc,
             }
             break;
         case OPC_BGTZALC: /* OPC_BLTZALC, OPC_BLTUC */
+            mips_ident(ctx,
+                opc == OPC_BGTZALC ? MIPS_ID_OPC_BGTZALC :
+                MIPS_ID_NONE);
             if (rs == 0 && rt != 0) {
                 /* OPC_BGTZALC */
                 tcg_gen_brcondi_tl(tcg_invert_cond(TCG_COND_GT), t1, 0, fs);
@@ -11146,6 +12835,9 @@ static void gen_compute_compact_branch(DisasContext *ctx, uint32_t opc,
             }
             break;
         case OPC_BLEZC: /* OPC_BGEZC, OPC_BGEC */
+            mips_ident(ctx,
+                opc == OPC_BLEZC ? MIPS_ID_OPC_BLEZC :
+                MIPS_ID_NONE);
             if (rs == 0 && rt != 0) {
                 /* OPC_BLEZC */
                 tcg_gen_brcondi_tl(tcg_invert_cond(TCG_COND_LE), t1, 0, fs);
@@ -11158,6 +12850,9 @@ static void gen_compute_compact_branch(DisasContext *ctx, uint32_t opc,
             }
             break;
         case OPC_BGTZC: /* OPC_BLTZC, OPC_BLTC */
+            mips_ident(ctx,
+                opc == OPC_BGTZC ? MIPS_ID_OPC_BGTZC :
+                MIPS_ID_NONE);
             if (rs == 0 && rt != 0) {
                 /* OPC_BGTZC */
                 tcg_gen_brcondi_tl(tcg_invert_cond(TCG_COND_GT), t1, 0, fs);
@@ -11171,6 +12866,10 @@ static void gen_compute_compact_branch(DisasContext *ctx, uint32_t opc,
             break;
         case OPC_BOVC: /* OPC_BEQZALC, OPC_BEQC */
         case OPC_BNVC: /* OPC_BNEZALC, OPC_BNEC */
+            mips_ident(ctx,
+                opc == OPC_BOVC ? MIPS_ID_OPC_BOVC :
+                opc == OPC_BNVC ? MIPS_ID_OPC_BNVC :
+                MIPS_ID_NONE);
             if (rs >= rt) {
                 /* OPC_BOVC, OPC_BNVC */
                 TCGv t2 = tcg_temp_new();
@@ -11221,9 +12920,15 @@ static void gen_compute_compact_branch(DisasContext *ctx, uint32_t opc,
             }
             break;
         case OPC_BEQZC:
+            mips_ident(ctx,
+                opc == OPC_BEQZC ? MIPS_ID_OPC_BEQZC :
+                MIPS_ID_NONE);
             tcg_gen_brcondi_tl(tcg_invert_cond(TCG_COND_EQ), t0, 0, fs);
             break;
         case OPC_BNEZC:
+            mips_ident(ctx,
+                opc == OPC_BNEZC ? MIPS_ID_OPC_BNEZC :
+                MIPS_ID_NONE);
             tcg_gen_brcondi_tl(tcg_invert_cond(TCG_COND_NE), t0, 0, fs);
             break;
         default:
@@ -11376,19 +13081,31 @@ static void gen_mips_lx(DisasContext *ctx, uint32_t opc,
 
     switch (opc) {
     case OPC_LBUX:
+        mips_ident(ctx,
+            opc == OPC_LBUX ? MIPS_ID_OPC_LBUX :
+            MIPS_ID_NONE);
         tcg_gen_qemu_ld_tl(t0, t0, ctx->mem_idx, MO_UB);
         gen_store_gpr(t0, rd);
         break;
     case OPC_LHX:
+        mips_ident(ctx,
+            opc == OPC_LHX ? MIPS_ID_OPC_LHX :
+            MIPS_ID_NONE);
         tcg_gen_qemu_ld_tl(t0, t0, ctx->mem_idx, mo_endian(ctx) | MO_SW);
         gen_store_gpr(t0, rd);
         break;
     case OPC_LWX:
+        mips_ident(ctx,
+            opc == OPC_LWX ? MIPS_ID_OPC_LWX :
+            MIPS_ID_NONE);
         tcg_gen_qemu_ld_tl(t0, t0, ctx->mem_idx, mo_endian(ctx) | MO_SL);
         gen_store_gpr(t0, rd);
         break;
 #if defined(TARGET_MIPS64)
     case OPC_LDX:
+        mips_ident(ctx,
+            opc == OPC_LDX ? MIPS_ID_OPC_LDX :
+            MIPS_ID_NONE);
         tcg_gen_qemu_ld_tl(t0, t0, ctx->mem_idx, mo_endian(ctx) | MO_UQ);
         gen_store_gpr(t0, rd);
         break;
@@ -11415,192 +13132,342 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
 
     switch (op1) {
     case OPC_ADDUH_QB_DSP:
+        mips_ident(ctx,
+            op1 == OPC_ADDUH_QB_DSP ? MIPS_ID_OPC_ADDUH_QB_DSP :
+            MIPS_ID_NONE);
         check_dsp_r2(ctx);
         switch (op2) {
         case OPC_ADDUH_QB:
+            mips_ident(ctx,
+                op2 == OPC_ADDUH_QB ? MIPS_ID_OPC_ADDUH_QB :
+                MIPS_ID_NONE);
             gen_helper_adduh_qb(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_ADDUH_R_QB:
+            mips_ident(ctx,
+                op2 == OPC_ADDUH_R_QB ? MIPS_ID_OPC_ADDUH_R_QB :
+                MIPS_ID_NONE);
             gen_helper_adduh_r_qb(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_ADDQH_PH:
+            mips_ident(ctx,
+                op2 == OPC_ADDQH_PH ? MIPS_ID_OPC_ADDQH_PH :
+                MIPS_ID_NONE);
             gen_helper_addqh_ph(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_ADDQH_R_PH:
+            mips_ident(ctx,
+                op2 == OPC_ADDQH_R_PH ? MIPS_ID_OPC_ADDQH_R_PH :
+                MIPS_ID_NONE);
             gen_helper_addqh_r_ph(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_ADDQH_W:
+            mips_ident(ctx,
+                op2 == OPC_ADDQH_W ? MIPS_ID_OPC_ADDQH_W :
+                MIPS_ID_NONE);
             gen_helper_addqh_w(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_ADDQH_R_W:
+            mips_ident(ctx,
+                op2 == OPC_ADDQH_R_W ? MIPS_ID_OPC_ADDQH_R_W :
+                MIPS_ID_NONE);
             gen_helper_addqh_r_w(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_SUBUH_QB:
+            mips_ident(ctx,
+                op2 == OPC_SUBUH_QB ? MIPS_ID_OPC_SUBUH_QB :
+                MIPS_ID_NONE);
             gen_helper_subuh_qb(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_SUBUH_R_QB:
+            mips_ident(ctx,
+                op2 == OPC_SUBUH_R_QB ? MIPS_ID_OPC_SUBUH_R_QB :
+                MIPS_ID_NONE);
             gen_helper_subuh_r_qb(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_SUBQH_PH:
+            mips_ident(ctx,
+                op2 == OPC_SUBQH_PH ? MIPS_ID_OPC_SUBQH_PH :
+                MIPS_ID_NONE);
             gen_helper_subqh_ph(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_SUBQH_R_PH:
+            mips_ident(ctx,
+                op2 == OPC_SUBQH_R_PH ? MIPS_ID_OPC_SUBQH_R_PH :
+                MIPS_ID_NONE);
             gen_helper_subqh_r_ph(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_SUBQH_W:
+            mips_ident(ctx,
+                op2 == OPC_SUBQH_W ? MIPS_ID_OPC_SUBQH_W :
+                MIPS_ID_NONE);
             gen_helper_subqh_w(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_SUBQH_R_W:
+            mips_ident(ctx,
+                op2 == OPC_SUBQH_R_W ? MIPS_ID_OPC_SUBQH_R_W :
+                MIPS_ID_NONE);
             gen_helper_subqh_r_w(cpu_gpr[ret], v1_t, v2_t);
             break;
         }
         break;
     case OPC_ABSQ_S_PH_DSP:
+        mips_ident(ctx,
+            op1 == OPC_ABSQ_S_PH_DSP ? MIPS_ID_OPC_ABSQ_S_PH_DSP :
+            MIPS_ID_NONE);
         switch (op2) {
         case OPC_ABSQ_S_QB:
+            mips_ident(ctx,
+                op2 == OPC_ABSQ_S_QB ? MIPS_ID_OPC_ABSQ_S_QB :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_absq_s_qb(cpu_gpr[ret], v2_t, tcg_env);
             break;
         case OPC_ABSQ_S_PH:
+            mips_ident(ctx,
+                op2 == OPC_ABSQ_S_PH ? MIPS_ID_OPC_ABSQ_S_PH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_absq_s_ph(cpu_gpr[ret], v2_t, tcg_env);
             break;
         case OPC_ABSQ_S_W:
+            mips_ident(ctx,
+                op2 == OPC_ABSQ_S_W ? MIPS_ID_OPC_ABSQ_S_W :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_absq_s_w(cpu_gpr[ret], v2_t, tcg_env);
             break;
         case OPC_PRECEQ_W_PHL:
+            mips_ident(ctx,
+                op2 == OPC_PRECEQ_W_PHL ? MIPS_ID_OPC_PRECEQ_W_PHL :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             tcg_gen_andi_tl(cpu_gpr[ret], v2_t, 0xFFFF0000);
             tcg_gen_ext32s_tl(cpu_gpr[ret], cpu_gpr[ret]);
             break;
         case OPC_PRECEQ_W_PHR:
+            mips_ident(ctx,
+                op2 == OPC_PRECEQ_W_PHR ? MIPS_ID_OPC_PRECEQ_W_PHR :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             tcg_gen_andi_tl(cpu_gpr[ret], v2_t, 0x0000FFFF);
             tcg_gen_shli_tl(cpu_gpr[ret], cpu_gpr[ret], 16);
             tcg_gen_ext32s_tl(cpu_gpr[ret], cpu_gpr[ret]);
             break;
         case OPC_PRECEQU_PH_QBL:
+            mips_ident(ctx,
+                op2 == OPC_PRECEQU_PH_QBL ? MIPS_ID_OPC_PRECEQU_PH_QBL :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_precequ_ph_qbl(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEQU_PH_QBR:
+            mips_ident(ctx,
+                op2 == OPC_PRECEQU_PH_QBR ? MIPS_ID_OPC_PRECEQU_PH_QBR :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_precequ_ph_qbr(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEQU_PH_QBLA:
+            mips_ident(ctx,
+                op2 == OPC_PRECEQU_PH_QBLA ? MIPS_ID_OPC_PRECEQU_PH_QBLA :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_precequ_ph_qbla(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEQU_PH_QBRA:
+            mips_ident(ctx,
+                op2 == OPC_PRECEQU_PH_QBRA ? MIPS_ID_OPC_PRECEQU_PH_QBRA :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_precequ_ph_qbra(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEU_PH_QBL:
+            mips_ident(ctx,
+                op2 == OPC_PRECEU_PH_QBL ? MIPS_ID_OPC_PRECEU_PH_QBL :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_preceu_ph_qbl(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEU_PH_QBR:
+            mips_ident(ctx,
+                op2 == OPC_PRECEU_PH_QBR ? MIPS_ID_OPC_PRECEU_PH_QBR :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_preceu_ph_qbr(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEU_PH_QBLA:
+            mips_ident(ctx,
+                op2 == OPC_PRECEU_PH_QBLA ? MIPS_ID_OPC_PRECEU_PH_QBLA :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_preceu_ph_qbla(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEU_PH_QBRA:
+            mips_ident(ctx,
+                op2 == OPC_PRECEU_PH_QBRA ? MIPS_ID_OPC_PRECEU_PH_QBRA :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_preceu_ph_qbra(cpu_gpr[ret], v2_t);
             break;
         }
         break;
     case OPC_ADDU_QB_DSP:
+        mips_ident(ctx,
+            op1 == OPC_ADDU_QB_DSP ? MIPS_ID_OPC_ADDU_QB_DSP :
+            MIPS_ID_NONE);
         switch (op2) {
         case OPC_ADDQ_PH:
+            mips_ident(ctx,
+                op2 == OPC_ADDQ_PH ? MIPS_ID_OPC_ADDQ_PH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_addq_ph(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDQ_S_PH:
+            mips_ident(ctx,
+                op2 == OPC_ADDQ_S_PH ? MIPS_ID_OPC_ADDQ_S_PH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_addq_s_ph(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDQ_S_W:
+            mips_ident(ctx,
+                op2 == OPC_ADDQ_S_W ? MIPS_ID_OPC_ADDQ_S_W :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_addq_s_w(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDU_QB:
+            mips_ident(ctx,
+                op2 == OPC_ADDU_QB ? MIPS_ID_OPC_ADDU_QB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_addu_qb(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDU_S_QB:
+            mips_ident(ctx,
+                op2 == OPC_ADDU_S_QB ? MIPS_ID_OPC_ADDU_S_QB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_addu_s_qb(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDU_PH:
+            mips_ident(ctx,
+                op2 == OPC_ADDU_PH ? MIPS_ID_OPC_ADDU_PH :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_addu_ph(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDU_S_PH:
+            mips_ident(ctx,
+                op2 == OPC_ADDU_S_PH ? MIPS_ID_OPC_ADDU_S_PH :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_addu_s_ph(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBQ_PH:
+            mips_ident(ctx,
+                op2 == OPC_SUBQ_PH ? MIPS_ID_OPC_SUBQ_PH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_subq_ph(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBQ_S_PH:
+            mips_ident(ctx,
+                op2 == OPC_SUBQ_S_PH ? MIPS_ID_OPC_SUBQ_S_PH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_subq_s_ph(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBQ_S_W:
+            mips_ident(ctx,
+                op2 == OPC_SUBQ_S_W ? MIPS_ID_OPC_SUBQ_S_W :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_subq_s_w(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBU_QB:
+            mips_ident(ctx,
+                op2 == OPC_SUBU_QB ? MIPS_ID_OPC_SUBU_QB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_subu_qb(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBU_S_QB:
+            mips_ident(ctx,
+                op2 == OPC_SUBU_S_QB ? MIPS_ID_OPC_SUBU_S_QB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_subu_s_qb(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBU_PH:
+            mips_ident(ctx,
+                op2 == OPC_SUBU_PH ? MIPS_ID_OPC_SUBU_PH :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_subu_ph(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBU_S_PH:
+            mips_ident(ctx,
+                op2 == OPC_SUBU_S_PH ? MIPS_ID_OPC_SUBU_S_PH :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_subu_s_ph(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDSC:
+            mips_ident(ctx,
+                op2 == OPC_ADDSC ? MIPS_ID_OPC_ADDSC :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_addsc(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDWC:
+            mips_ident(ctx,
+                op2 == OPC_ADDWC ? MIPS_ID_OPC_ADDWC :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_addwc(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_MODSUB:
+            mips_ident(ctx,
+                op2 == OPC_MODSUB ? MIPS_ID_OPC_MODSUB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_modsub(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_RADDU_W_QB:
+            mips_ident(ctx,
+                op2 == OPC_RADDU_W_QB ? MIPS_ID_OPC_RADDU_W_QB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_raddu_w_qb(cpu_gpr[ret], v1_t);
             break;
         }
         break;
     case OPC_CMPU_EQ_QB_DSP:
+        mips_ident(ctx,
+            op1 == OPC_CMPU_EQ_QB_DSP ? MIPS_ID_OPC_CMPU_EQ_QB_DSP :
+            MIPS_ID_NONE);
         switch (op2) {
         case OPC_PRECR_QB_PH:
+            mips_ident(ctx,
+                op2 == OPC_PRECR_QB_PH ? MIPS_ID_OPC_PRECR_QB_PH :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_precr_qb_ph(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_PRECRQ_QB_PH:
+            mips_ident(ctx,
+                op2 == OPC_PRECRQ_QB_PH ? MIPS_ID_OPC_PRECRQ_QB_PH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_precrq_qb_ph(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_PRECR_SRA_PH_W:
+            mips_ident(ctx,
+                op2 == OPC_PRECR_SRA_PH_W ? MIPS_ID_OPC_PRECR_SRA_PH_W :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             {
                 TCGv_i32 sa_t = tcg_constant_i32(v2);
@@ -11609,6 +13476,9 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
                 break;
             }
         case OPC_PRECR_SRA_R_PH_W:
+            mips_ident(ctx,
+                op2 == OPC_PRECR_SRA_R_PH_W ? MIPS_ID_OPC_PRECR_SRA_R_PH_W :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             {
                 TCGv_i32 sa_t = tcg_constant_i32(v2);
@@ -11617,14 +13487,23 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
                 break;
             }
         case OPC_PRECRQ_PH_W:
+            mips_ident(ctx,
+                op2 == OPC_PRECRQ_PH_W ? MIPS_ID_OPC_PRECRQ_PH_W :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_precrq_ph_w(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_PRECRQ_RS_PH_W:
+            mips_ident(ctx,
+                op2 == OPC_PRECRQ_RS_PH_W ? MIPS_ID_OPC_PRECRQ_RS_PH_W :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_precrq_rs_ph_w(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_PRECRQU_S_QB_PH:
+            mips_ident(ctx,
+                op2 == OPC_PRECRQU_S_QB_PH ? MIPS_ID_OPC_PRECRQU_S_QB_PH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_precrqu_s_qb_ph(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
@@ -11632,172 +13511,301 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
         break;
 #ifdef TARGET_MIPS64
     case OPC_ABSQ_S_QH_DSP:
+        mips_ident(ctx,
+            op1 == OPC_ABSQ_S_QH_DSP ? MIPS_ID_OPC_ABSQ_S_QH_DSP :
+            MIPS_ID_NONE);
         switch (op2) {
         case OPC_PRECEQ_L_PWL:
+            mips_ident(ctx,
+                op2 == OPC_PRECEQ_L_PWL ? MIPS_ID_OPC_PRECEQ_L_PWL :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             tcg_gen_andi_tl(cpu_gpr[ret], v2_t, 0xFFFFFFFF00000000ull);
             break;
         case OPC_PRECEQ_L_PWR:
+            mips_ident(ctx,
+                op2 == OPC_PRECEQ_L_PWR ? MIPS_ID_OPC_PRECEQ_L_PWR :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             tcg_gen_shli_tl(cpu_gpr[ret], v2_t, 32);
             break;
         case OPC_PRECEQ_PW_QHL:
+            mips_ident(ctx,
+                op2 == OPC_PRECEQ_PW_QHL ? MIPS_ID_OPC_PRECEQ_PW_QHL :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_preceq_pw_qhl(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEQ_PW_QHR:
+            mips_ident(ctx,
+                op2 == OPC_PRECEQ_PW_QHR ? MIPS_ID_OPC_PRECEQ_PW_QHR :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_preceq_pw_qhr(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEQ_PW_QHLA:
+            mips_ident(ctx,
+                op2 == OPC_PRECEQ_PW_QHLA ? MIPS_ID_OPC_PRECEQ_PW_QHLA :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_preceq_pw_qhla(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEQ_PW_QHRA:
+            mips_ident(ctx,
+                op2 == OPC_PRECEQ_PW_QHRA ? MIPS_ID_OPC_PRECEQ_PW_QHRA :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_preceq_pw_qhra(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEQU_QH_OBL:
+            mips_ident(ctx,
+                op2 == OPC_PRECEQU_QH_OBL ? MIPS_ID_OPC_PRECEQU_QH_OBL :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_precequ_qh_obl(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEQU_QH_OBR:
+            mips_ident(ctx,
+                op2 == OPC_PRECEQU_QH_OBR ? MIPS_ID_OPC_PRECEQU_QH_OBR :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_precequ_qh_obr(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEQU_QH_OBLA:
+            mips_ident(ctx,
+                op2 == OPC_PRECEQU_QH_OBLA ? MIPS_ID_OPC_PRECEQU_QH_OBLA :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_precequ_qh_obla(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEQU_QH_OBRA:
+            mips_ident(ctx,
+                op2 == OPC_PRECEQU_QH_OBRA ? MIPS_ID_OPC_PRECEQU_QH_OBRA :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_precequ_qh_obra(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEU_QH_OBL:
+            mips_ident(ctx,
+                op2 == OPC_PRECEU_QH_OBL ? MIPS_ID_OPC_PRECEU_QH_OBL :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_preceu_qh_obl(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEU_QH_OBR:
+            mips_ident(ctx,
+                op2 == OPC_PRECEU_QH_OBR ? MIPS_ID_OPC_PRECEU_QH_OBR :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_preceu_qh_obr(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEU_QH_OBLA:
+            mips_ident(ctx,
+                op2 == OPC_PRECEU_QH_OBLA ? MIPS_ID_OPC_PRECEU_QH_OBLA :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_preceu_qh_obla(cpu_gpr[ret], v2_t);
             break;
         case OPC_PRECEU_QH_OBRA:
+            mips_ident(ctx,
+                op2 == OPC_PRECEU_QH_OBRA ? MIPS_ID_OPC_PRECEU_QH_OBRA :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_preceu_qh_obra(cpu_gpr[ret], v2_t);
             break;
         case OPC_ABSQ_S_OB:
+            mips_ident(ctx,
+                op2 == OPC_ABSQ_S_OB ? MIPS_ID_OPC_ABSQ_S_OB :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_absq_s_ob(cpu_gpr[ret], v2_t, tcg_env);
             break;
         case OPC_ABSQ_S_PW:
+            mips_ident(ctx,
+                op2 == OPC_ABSQ_S_PW ? MIPS_ID_OPC_ABSQ_S_PW :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_absq_s_pw(cpu_gpr[ret], v2_t, tcg_env);
             break;
         case OPC_ABSQ_S_QH:
+            mips_ident(ctx,
+                op2 == OPC_ABSQ_S_QH ? MIPS_ID_OPC_ABSQ_S_QH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_absq_s_qh(cpu_gpr[ret], v2_t, tcg_env);
             break;
         }
         break;
     case OPC_ADDU_OB_DSP:
+        mips_ident(ctx,
+            op1 == OPC_ADDU_OB_DSP ? MIPS_ID_OPC_ADDU_OB_DSP :
+            MIPS_ID_NONE);
         switch (op2) {
         case OPC_RADDU_L_OB:
+            mips_ident(ctx,
+                op2 == OPC_RADDU_L_OB ? MIPS_ID_OPC_RADDU_L_OB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_raddu_l_ob(cpu_gpr[ret], v1_t);
             break;
         case OPC_SUBQ_PW:
+            mips_ident(ctx,
+                op2 == OPC_SUBQ_PW ? MIPS_ID_OPC_SUBQ_PW :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_subq_pw(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBQ_S_PW:
+            mips_ident(ctx,
+                op2 == OPC_SUBQ_S_PW ? MIPS_ID_OPC_SUBQ_S_PW :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_subq_s_pw(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBQ_QH:
+            mips_ident(ctx,
+                op2 == OPC_SUBQ_QH ? MIPS_ID_OPC_SUBQ_QH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_subq_qh(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBQ_S_QH:
+            mips_ident(ctx,
+                op2 == OPC_SUBQ_S_QH ? MIPS_ID_OPC_SUBQ_S_QH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_subq_s_qh(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBU_OB:
+            mips_ident(ctx,
+                op2 == OPC_SUBU_OB ? MIPS_ID_OPC_SUBU_OB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_subu_ob(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBU_S_OB:
+            mips_ident(ctx,
+                op2 == OPC_SUBU_S_OB ? MIPS_ID_OPC_SUBU_S_OB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_subu_s_ob(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBU_QH:
+            mips_ident(ctx,
+                op2 == OPC_SUBU_QH ? MIPS_ID_OPC_SUBU_QH :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_subu_qh(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBU_S_QH:
+            mips_ident(ctx,
+                op2 == OPC_SUBU_S_QH ? MIPS_ID_OPC_SUBU_S_QH :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_subu_s_qh(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_SUBUH_OB:
+            mips_ident(ctx,
+                op2 == OPC_SUBUH_OB ? MIPS_ID_OPC_SUBUH_OB :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_subuh_ob(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_SUBUH_R_OB:
+            mips_ident(ctx,
+                op2 == OPC_SUBUH_R_OB ? MIPS_ID_OPC_SUBUH_R_OB :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_subuh_r_ob(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_ADDQ_PW:
+            mips_ident(ctx,
+                op2 == OPC_ADDQ_PW ? MIPS_ID_OPC_ADDQ_PW :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_addq_pw(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDQ_S_PW:
+            mips_ident(ctx,
+                op2 == OPC_ADDQ_S_PW ? MIPS_ID_OPC_ADDQ_S_PW :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_addq_s_pw(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDQ_QH:
+            mips_ident(ctx,
+                op2 == OPC_ADDQ_QH ? MIPS_ID_OPC_ADDQ_QH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_addq_qh(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDQ_S_QH:
+            mips_ident(ctx,
+                op2 == OPC_ADDQ_S_QH ? MIPS_ID_OPC_ADDQ_S_QH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_addq_s_qh(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDU_OB:
+            mips_ident(ctx,
+                op2 == OPC_ADDU_OB ? MIPS_ID_OPC_ADDU_OB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_addu_ob(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDU_S_OB:
+            mips_ident(ctx,
+                op2 == OPC_ADDU_S_OB ? MIPS_ID_OPC_ADDU_S_OB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_addu_s_ob(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDU_QH:
+            mips_ident(ctx,
+                op2 == OPC_ADDU_QH ? MIPS_ID_OPC_ADDU_QH :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_addu_qh(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDU_S_QH:
+            mips_ident(ctx,
+                op2 == OPC_ADDU_S_QH ? MIPS_ID_OPC_ADDU_S_QH :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_addu_s_qh(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_ADDUH_OB:
+            mips_ident(ctx,
+                op2 == OPC_ADDUH_OB ? MIPS_ID_OPC_ADDUH_OB :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_adduh_ob(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_ADDUH_R_OB:
+            mips_ident(ctx,
+                op2 == OPC_ADDUH_R_OB ? MIPS_ID_OPC_ADDUH_R_OB :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_adduh_r_ob(cpu_gpr[ret], v1_t, v2_t);
             break;
         }
         break;
     case OPC_CMPU_EQ_OB_DSP:
+        mips_ident(ctx,
+            op1 == OPC_CMPU_EQ_OB_DSP ? MIPS_ID_OPC_CMPU_EQ_OB_DSP :
+            MIPS_ID_NONE);
         switch (op2) {
         case OPC_PRECR_OB_QH:
+            mips_ident(ctx,
+                op2 == OPC_PRECR_OB_QH ? MIPS_ID_OPC_PRECR_OB_QH :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_precr_ob_qh(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_PRECR_SRA_QH_PW:
+            mips_ident(ctx,
+                op2 == OPC_PRECR_SRA_QH_PW ? MIPS_ID_OPC_PRECR_SRA_QH_PW :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             {
                 TCGv_i32 ret_t = tcg_constant_i32(ret);
@@ -11805,6 +13813,9 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
                 break;
             }
         case OPC_PRECR_SRA_R_QH_PW:
+            mips_ident(ctx,
+                op2 == OPC_PRECR_SRA_R_QH_PW ? MIPS_ID_OPC_PRECR_SRA_R_QH_PW :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             {
                 TCGv_i32 sa_v = tcg_constant_i32(ret);
@@ -11812,22 +13823,37 @@ static void gen_mipsdsp_arith(DisasContext *ctx, uint32_t op1, uint32_t op2,
                 break;
             }
         case OPC_PRECRQ_OB_QH:
+            mips_ident(ctx,
+                op2 == OPC_PRECRQ_OB_QH ? MIPS_ID_OPC_PRECRQ_OB_QH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_precrq_ob_qh(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_PRECRQ_PW_L:
+            mips_ident(ctx,
+                op2 == OPC_PRECRQ_PW_L ? MIPS_ID_OPC_PRECRQ_PW_L :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_precrq_pw_l(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_PRECRQ_QH_PW:
+            mips_ident(ctx,
+                op2 == OPC_PRECRQ_QH_PW ? MIPS_ID_OPC_PRECRQ_QH_PW :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_precrq_qh_pw(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_PRECRQ_RS_QH_PW:
+            mips_ident(ctx,
+                op2 == OPC_PRECRQ_RS_QH_PW ? MIPS_ID_OPC_PRECRQ_RS_QH_PW :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_precrq_rs_qh_pw(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_PRECRQU_S_OB_QH:
+            mips_ident(ctx,
+                op2 == OPC_PRECRQU_S_OB_QH ? MIPS_ID_OPC_PRECRQU_S_OB_QH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_precrqu_s_ob_qh(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
@@ -11860,94 +13886,163 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
 
     switch (opc) {
     case OPC_SHLL_QB_DSP:
+        mips_ident(ctx,
+            opc == OPC_SHLL_QB_DSP ? MIPS_ID_OPC_SHLL_QB_DSP :
+            MIPS_ID_NONE);
         {
             op2 = MASK_SHLL_QB(ctx->opcode);
             switch (op2) {
             case OPC_SHLL_QB:
+                mips_ident(ctx,
+                    op2 == OPC_SHLL_QB ? MIPS_ID_OPC_SHLL_QB :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_shll_qb(cpu_gpr[ret], t0, v2_t, tcg_env);
                 break;
             case OPC_SHLLV_QB:
+                mips_ident(ctx,
+                    op2 == OPC_SHLLV_QB ? MIPS_ID_OPC_SHLLV_QB :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_shll_qb(cpu_gpr[ret], v1_t, v2_t, tcg_env);
                 break;
             case OPC_SHLL_PH:
+                mips_ident(ctx,
+                    op2 == OPC_SHLL_PH ? MIPS_ID_OPC_SHLL_PH :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_shll_ph(cpu_gpr[ret], t0, v2_t, tcg_env);
                 break;
             case OPC_SHLLV_PH:
+                mips_ident(ctx,
+                    op2 == OPC_SHLLV_PH ? MIPS_ID_OPC_SHLLV_PH :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_shll_ph(cpu_gpr[ret], v1_t, v2_t, tcg_env);
                 break;
             case OPC_SHLL_S_PH:
+                mips_ident(ctx,
+                    op2 == OPC_SHLL_S_PH ? MIPS_ID_OPC_SHLL_S_PH :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_shll_s_ph(cpu_gpr[ret], t0, v2_t, tcg_env);
                 break;
             case OPC_SHLLV_S_PH:
+                mips_ident(ctx,
+                    op2 == OPC_SHLLV_S_PH ? MIPS_ID_OPC_SHLLV_S_PH :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_shll_s_ph(cpu_gpr[ret], v1_t, v2_t, tcg_env);
                 break;
             case OPC_SHLL_S_W:
+                mips_ident(ctx,
+                    op2 == OPC_SHLL_S_W ? MIPS_ID_OPC_SHLL_S_W :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_shll_s_w(cpu_gpr[ret], t0, v2_t, tcg_env);
                 break;
             case OPC_SHLLV_S_W:
+                mips_ident(ctx,
+                    op2 == OPC_SHLLV_S_W ? MIPS_ID_OPC_SHLLV_S_W :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_shll_s_w(cpu_gpr[ret], v1_t, v2_t, tcg_env);
                 break;
             case OPC_SHRL_QB:
+                mips_ident(ctx,
+                    op2 == OPC_SHRL_QB ? MIPS_ID_OPC_SHRL_QB :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_shrl_qb(cpu_gpr[ret], t0, v2_t);
                 break;
             case OPC_SHRLV_QB:
+                mips_ident(ctx,
+                    op2 == OPC_SHRLV_QB ? MIPS_ID_OPC_SHRLV_QB :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_shrl_qb(cpu_gpr[ret], v1_t, v2_t);
                 break;
             case OPC_SHRL_PH:
+                mips_ident(ctx,
+                    op2 == OPC_SHRL_PH ? MIPS_ID_OPC_SHRL_PH :
+                    MIPS_ID_NONE);
                 check_dsp_r2(ctx);
                 gen_helper_shrl_ph(cpu_gpr[ret], t0, v2_t);
                 break;
             case OPC_SHRLV_PH:
+                mips_ident(ctx,
+                    op2 == OPC_SHRLV_PH ? MIPS_ID_OPC_SHRLV_PH :
+                    MIPS_ID_NONE);
                 check_dsp_r2(ctx);
                 gen_helper_shrl_ph(cpu_gpr[ret], v1_t, v2_t);
                 break;
             case OPC_SHRA_QB:
+                mips_ident(ctx,
+                    op2 == OPC_SHRA_QB ? MIPS_ID_OPC_SHRA_QB :
+                    MIPS_ID_NONE);
                 check_dsp_r2(ctx);
                 gen_helper_shra_qb(cpu_gpr[ret], t0, v2_t);
                 break;
             case OPC_SHRA_R_QB:
+                mips_ident(ctx,
+                    op2 == OPC_SHRA_R_QB ? MIPS_ID_OPC_SHRA_R_QB :
+                    MIPS_ID_NONE);
                 check_dsp_r2(ctx);
                 gen_helper_shra_r_qb(cpu_gpr[ret], t0, v2_t);
                 break;
             case OPC_SHRAV_QB:
+                mips_ident(ctx,
+                    op2 == OPC_SHRAV_QB ? MIPS_ID_OPC_SHRAV_QB :
+                    MIPS_ID_NONE);
                 check_dsp_r2(ctx);
                 gen_helper_shra_qb(cpu_gpr[ret], v1_t, v2_t);
                 break;
             case OPC_SHRAV_R_QB:
+                mips_ident(ctx,
+                    op2 == OPC_SHRAV_R_QB ? MIPS_ID_OPC_SHRAV_R_QB :
+                    MIPS_ID_NONE);
                 check_dsp_r2(ctx);
                 gen_helper_shra_r_qb(cpu_gpr[ret], v1_t, v2_t);
                 break;
             case OPC_SHRA_PH:
+                mips_ident(ctx,
+                    op2 == OPC_SHRA_PH ? MIPS_ID_OPC_SHRA_PH :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_shra_ph(cpu_gpr[ret], t0, v2_t);
                 break;
             case OPC_SHRA_R_PH:
+                mips_ident(ctx,
+                    op2 == OPC_SHRA_R_PH ? MIPS_ID_OPC_SHRA_R_PH :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_shra_r_ph(cpu_gpr[ret], t0, v2_t);
                 break;
             case OPC_SHRAV_PH:
+                mips_ident(ctx,
+                    op2 == OPC_SHRAV_PH ? MIPS_ID_OPC_SHRAV_PH :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_shra_ph(cpu_gpr[ret], v1_t, v2_t);
                 break;
             case OPC_SHRAV_R_PH:
+                mips_ident(ctx,
+                    op2 == OPC_SHRAV_R_PH ? MIPS_ID_OPC_SHRAV_R_PH :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_shra_r_ph(cpu_gpr[ret], v1_t, v2_t);
                 break;
             case OPC_SHRA_R_W:
+                mips_ident(ctx,
+                    op2 == OPC_SHRA_R_W ? MIPS_ID_OPC_SHRA_R_W :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_shra_r_w(cpu_gpr[ret], t0, v2_t);
                 break;
             case OPC_SHRAV_R_W:
+                mips_ident(ctx,
+                    op2 == OPC_SHRAV_R_W ? MIPS_ID_OPC_SHRAV_R_W :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_shra_r_w(cpu_gpr[ret], v1_t, v2_t);
                 break;
@@ -11960,109 +14055,190 @@ static void gen_mipsdsp_shift(DisasContext *ctx, uint32_t opc,
         }
 #ifdef TARGET_MIPS64
     case OPC_SHLL_OB_DSP:
+        mips_ident(ctx,
+            opc == OPC_SHLL_OB_DSP ? MIPS_ID_OPC_SHLL_OB_DSP :
+            MIPS_ID_NONE);
         op2 = MASK_SHLL_OB(ctx->opcode);
         switch (op2) {
         case OPC_SHLL_PW:
+            mips_ident(ctx,
+                op2 == OPC_SHLL_PW ? MIPS_ID_OPC_SHLL_PW :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_shll_pw(cpu_gpr[ret], v2_t, t0, tcg_env);
             break;
         case OPC_SHLLV_PW:
+            mips_ident(ctx,
+                op2 == OPC_SHLLV_PW ? MIPS_ID_OPC_SHLLV_PW :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_shll_pw(cpu_gpr[ret], v2_t, v1_t, tcg_env);
             break;
         case OPC_SHLL_S_PW:
+            mips_ident(ctx,
+                op2 == OPC_SHLL_S_PW ? MIPS_ID_OPC_SHLL_S_PW :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_shll_s_pw(cpu_gpr[ret], v2_t, t0, tcg_env);
             break;
         case OPC_SHLLV_S_PW:
+            mips_ident(ctx,
+                op2 == OPC_SHLLV_S_PW ? MIPS_ID_OPC_SHLLV_S_PW :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_shll_s_pw(cpu_gpr[ret], v2_t, v1_t, tcg_env);
             break;
         case OPC_SHLL_OB:
+            mips_ident(ctx,
+                op2 == OPC_SHLL_OB ? MIPS_ID_OPC_SHLL_OB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_shll_ob(cpu_gpr[ret], v2_t, t0, tcg_env);
             break;
         case OPC_SHLLV_OB:
+            mips_ident(ctx,
+                op2 == OPC_SHLLV_OB ? MIPS_ID_OPC_SHLLV_OB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_shll_ob(cpu_gpr[ret], v2_t, v1_t, tcg_env);
             break;
         case OPC_SHLL_QH:
+            mips_ident(ctx,
+                op2 == OPC_SHLL_QH ? MIPS_ID_OPC_SHLL_QH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_shll_qh(cpu_gpr[ret], v2_t, t0, tcg_env);
             break;
         case OPC_SHLLV_QH:
+            mips_ident(ctx,
+                op2 == OPC_SHLLV_QH ? MIPS_ID_OPC_SHLLV_QH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_shll_qh(cpu_gpr[ret], v2_t, v1_t, tcg_env);
             break;
         case OPC_SHLL_S_QH:
+            mips_ident(ctx,
+                op2 == OPC_SHLL_S_QH ? MIPS_ID_OPC_SHLL_S_QH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_shll_s_qh(cpu_gpr[ret], v2_t, t0, tcg_env);
             break;
         case OPC_SHLLV_S_QH:
+            mips_ident(ctx,
+                op2 == OPC_SHLLV_S_QH ? MIPS_ID_OPC_SHLLV_S_QH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_shll_s_qh(cpu_gpr[ret], v2_t, v1_t, tcg_env);
             break;
         case OPC_SHRA_OB:
+            mips_ident(ctx,
+                op2 == OPC_SHRA_OB ? MIPS_ID_OPC_SHRA_OB :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_shra_ob(cpu_gpr[ret], v2_t, t0);
             break;
         case OPC_SHRAV_OB:
+            mips_ident(ctx,
+                op2 == OPC_SHRAV_OB ? MIPS_ID_OPC_SHRAV_OB :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_shra_ob(cpu_gpr[ret], v2_t, v1_t);
             break;
         case OPC_SHRA_R_OB:
+            mips_ident(ctx,
+                op2 == OPC_SHRA_R_OB ? MIPS_ID_OPC_SHRA_R_OB :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_shra_r_ob(cpu_gpr[ret], v2_t, t0);
             break;
         case OPC_SHRAV_R_OB:
+            mips_ident(ctx,
+                op2 == OPC_SHRAV_R_OB ? MIPS_ID_OPC_SHRAV_R_OB :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_shra_r_ob(cpu_gpr[ret], v2_t, v1_t);
             break;
         case OPC_SHRA_PW:
+            mips_ident(ctx,
+                op2 == OPC_SHRA_PW ? MIPS_ID_OPC_SHRA_PW :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_shra_pw(cpu_gpr[ret], v2_t, t0);
             break;
         case OPC_SHRAV_PW:
+            mips_ident(ctx,
+                op2 == OPC_SHRAV_PW ? MIPS_ID_OPC_SHRAV_PW :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_shra_pw(cpu_gpr[ret], v2_t, v1_t);
             break;
         case OPC_SHRA_R_PW:
+            mips_ident(ctx,
+                op2 == OPC_SHRA_R_PW ? MIPS_ID_OPC_SHRA_R_PW :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_shra_r_pw(cpu_gpr[ret], v2_t, t0);
             break;
         case OPC_SHRAV_R_PW:
+            mips_ident(ctx,
+                op2 == OPC_SHRAV_R_PW ? MIPS_ID_OPC_SHRAV_R_PW :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_shra_r_pw(cpu_gpr[ret], v2_t, v1_t);
             break;
         case OPC_SHRA_QH:
+            mips_ident(ctx,
+                op2 == OPC_SHRA_QH ? MIPS_ID_OPC_SHRA_QH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_shra_qh(cpu_gpr[ret], v2_t, t0);
             break;
         case OPC_SHRAV_QH:
+            mips_ident(ctx,
+                op2 == OPC_SHRAV_QH ? MIPS_ID_OPC_SHRAV_QH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_shra_qh(cpu_gpr[ret], v2_t, v1_t);
             break;
         case OPC_SHRA_R_QH:
+            mips_ident(ctx,
+                op2 == OPC_SHRA_R_QH ? MIPS_ID_OPC_SHRA_R_QH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_shra_r_qh(cpu_gpr[ret], v2_t, t0);
             break;
         case OPC_SHRAV_R_QH:
+            mips_ident(ctx,
+                op2 == OPC_SHRAV_R_QH ? MIPS_ID_OPC_SHRAV_R_QH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_shra_r_qh(cpu_gpr[ret], v2_t, v1_t);
             break;
         case OPC_SHRL_OB:
+            mips_ident(ctx,
+                op2 == OPC_SHRL_OB ? MIPS_ID_OPC_SHRL_OB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_shrl_ob(cpu_gpr[ret], v2_t, t0);
             break;
         case OPC_SHRLV_OB:
+            mips_ident(ctx,
+                op2 == OPC_SHRLV_OB ? MIPS_ID_OPC_SHRLV_OB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_shrl_ob(cpu_gpr[ret], v2_t, v1_t);
             break;
         case OPC_SHRL_QH:
+            mips_ident(ctx,
+                op2 == OPC_SHRL_QH ? MIPS_ID_OPC_SHRL_QH :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_shrl_qh(cpu_gpr[ret], v2_t, t0);
             break;
         case OPC_SHRLV_QH:
+            mips_ident(ctx,
+                op2 == OPC_SHRLV_QH ? MIPS_ID_OPC_SHRLV_QH :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_shrl_qh(cpu_gpr[ret], v2_t, v1_t);
             break;
@@ -12098,109 +14274,193 @@ static void gen_mipsdsp_multiply(DisasContext *ctx, uint32_t op1, uint32_t op2,
 
     switch (op1) {
     case OPC_MUL_PH_DSP:
+        mips_ident(ctx,
+            op1 == OPC_MUL_PH_DSP ? MIPS_ID_OPC_MUL_PH_DSP :
+            MIPS_ID_NONE);
         check_dsp_r2(ctx);
         switch (op2) {
         case  OPC_MUL_PH:
+            mips_ident(ctx,
+                op2 == OPC_MUL_PH ? MIPS_ID_OPC_MUL_PH :
+                MIPS_ID_NONE);
             gen_helper_mul_ph(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case  OPC_MUL_S_PH:
+            mips_ident(ctx,
+                op2 == OPC_MUL_S_PH ? MIPS_ID_OPC_MUL_S_PH :
+                MIPS_ID_NONE);
             gen_helper_mul_s_ph(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_MULQ_S_W:
+            mips_ident(ctx,
+                op2 == OPC_MULQ_S_W ? MIPS_ID_OPC_MULQ_S_W :
+                MIPS_ID_NONE);
             gen_helper_mulq_s_w(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_MULQ_RS_W:
+            mips_ident(ctx,
+                op2 == OPC_MULQ_RS_W ? MIPS_ID_OPC_MULQ_RS_W :
+                MIPS_ID_NONE);
             gen_helper_mulq_rs_w(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         }
         break;
     case OPC_DPA_W_PH_DSP:
+        mips_ident(ctx,
+            op1 == OPC_DPA_W_PH_DSP ? MIPS_ID_OPC_DPA_W_PH_DSP :
+            MIPS_ID_NONE);
         switch (op2) {
         case OPC_DPAU_H_QBL:
+            mips_ident(ctx,
+                op2 == OPC_DPAU_H_QBL ? MIPS_ID_OPC_DPAU_H_QBL :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_dpau_h_qbl(t0, v1_t, v2_t, tcg_env);
             break;
         case OPC_DPAU_H_QBR:
+            mips_ident(ctx,
+                op2 == OPC_DPAU_H_QBR ? MIPS_ID_OPC_DPAU_H_QBR :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_dpau_h_qbr(t0, v1_t, v2_t, tcg_env);
             break;
         case OPC_DPSU_H_QBL:
+            mips_ident(ctx,
+                op2 == OPC_DPSU_H_QBL ? MIPS_ID_OPC_DPSU_H_QBL :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_dpsu_h_qbl(t0, v1_t, v2_t, tcg_env);
             break;
         case OPC_DPSU_H_QBR:
+            mips_ident(ctx,
+                op2 == OPC_DPSU_H_QBR ? MIPS_ID_OPC_DPSU_H_QBR :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_dpsu_h_qbr(t0, v1_t, v2_t, tcg_env);
             break;
         case OPC_DPA_W_PH:
+            mips_ident(ctx,
+                op2 == OPC_DPA_W_PH ? MIPS_ID_OPC_DPA_W_PH :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_dpa_w_ph(t0, v1_t, v2_t, tcg_env);
             break;
         case OPC_DPAX_W_PH:
+            mips_ident(ctx,
+                op2 == OPC_DPAX_W_PH ? MIPS_ID_OPC_DPAX_W_PH :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_dpax_w_ph(t0, v1_t, v2_t, tcg_env);
             break;
         case OPC_DPAQ_S_W_PH:
+            mips_ident(ctx,
+                op2 == OPC_DPAQ_S_W_PH ? MIPS_ID_OPC_DPAQ_S_W_PH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_dpaq_s_w_ph(t0, v1_t, v2_t, tcg_env);
             break;
         case OPC_DPAQX_S_W_PH:
+            mips_ident(ctx,
+                op2 == OPC_DPAQX_S_W_PH ? MIPS_ID_OPC_DPAQX_S_W_PH :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_dpaqx_s_w_ph(t0, v1_t, v2_t, tcg_env);
             break;
         case OPC_DPAQX_SA_W_PH:
+            mips_ident(ctx,
+                op2 == OPC_DPAQX_SA_W_PH ? MIPS_ID_OPC_DPAQX_SA_W_PH :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_dpaqx_sa_w_ph(t0, v1_t, v2_t, tcg_env);
             break;
         case OPC_DPS_W_PH:
+            mips_ident(ctx,
+                op2 == OPC_DPS_W_PH ? MIPS_ID_OPC_DPS_W_PH :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_dps_w_ph(t0, v1_t, v2_t, tcg_env);
             break;
         case OPC_DPSX_W_PH:
+            mips_ident(ctx,
+                op2 == OPC_DPSX_W_PH ? MIPS_ID_OPC_DPSX_W_PH :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_dpsx_w_ph(t0, v1_t, v2_t, tcg_env);
             break;
         case OPC_DPSQ_S_W_PH:
+            mips_ident(ctx,
+                op2 == OPC_DPSQ_S_W_PH ? MIPS_ID_OPC_DPSQ_S_W_PH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_dpsq_s_w_ph(t0, v1_t, v2_t, tcg_env);
             break;
         case OPC_DPSQX_S_W_PH:
+            mips_ident(ctx,
+                op2 == OPC_DPSQX_S_W_PH ? MIPS_ID_OPC_DPSQX_S_W_PH :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_dpsqx_s_w_ph(t0, v1_t, v2_t, tcg_env);
             break;
         case OPC_DPSQX_SA_W_PH:
+            mips_ident(ctx,
+                op2 == OPC_DPSQX_SA_W_PH ? MIPS_ID_OPC_DPSQX_SA_W_PH :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_dpsqx_sa_w_ph(t0, v1_t, v2_t, tcg_env);
             break;
         case OPC_MULSAQ_S_W_PH:
+            mips_ident(ctx,
+                op2 == OPC_MULSAQ_S_W_PH ? MIPS_ID_OPC_MULSAQ_S_W_PH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_mulsaq_s_w_ph(t0, v1_t, v2_t, tcg_env);
             break;
         case OPC_DPAQ_SA_L_W:
+            mips_ident(ctx,
+                op2 == OPC_DPAQ_SA_L_W ? MIPS_ID_OPC_DPAQ_SA_L_W :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_dpaq_sa_l_w(t0, v1_t, v2_t, tcg_env);
             break;
         case OPC_DPSQ_SA_L_W:
+            mips_ident(ctx,
+                op2 == OPC_DPSQ_SA_L_W ? MIPS_ID_OPC_DPSQ_SA_L_W :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_dpsq_sa_l_w(t0, v1_t, v2_t, tcg_env);
             break;
         case OPC_MAQ_S_W_PHL:
+            mips_ident(ctx,
+                op2 == OPC_MAQ_S_W_PHL ? MIPS_ID_OPC_MAQ_S_W_PHL :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_maq_s_w_phl(t0, v1_t, v2_t, tcg_env);
             break;
         case OPC_MAQ_S_W_PHR:
+            mips_ident(ctx,
+                op2 == OPC_MAQ_S_W_PHR ? MIPS_ID_OPC_MAQ_S_W_PHR :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_maq_s_w_phr(t0, v1_t, v2_t, tcg_env);
             break;
         case OPC_MAQ_SA_W_PHL:
+            mips_ident(ctx,
+                op2 == OPC_MAQ_SA_W_PHL ? MIPS_ID_OPC_MAQ_SA_W_PHL :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_maq_sa_w_phl(t0, v1_t, v2_t, tcg_env);
             break;
         case OPC_MAQ_SA_W_PHR:
+            mips_ident(ctx,
+                op2 == OPC_MAQ_SA_W_PHR ? MIPS_ID_OPC_MAQ_SA_W_PHR :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_maq_sa_w_phr(t0, v1_t, v2_t, tcg_env);
             break;
         case OPC_MULSA_W_PH:
+            mips_ident(ctx,
+                op2 == OPC_MULSA_W_PH ? MIPS_ID_OPC_MULSA_W_PH :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_mulsa_w_ph(t0, v1_t, v2_t, tcg_env);
             break;
@@ -12208,112 +14468,193 @@ static void gen_mipsdsp_multiply(DisasContext *ctx, uint32_t op1, uint32_t op2,
         break;
 #ifdef TARGET_MIPS64
     case OPC_DPAQ_W_QH_DSP:
+        mips_ident(ctx,
+            op1 == OPC_DPAQ_W_QH_DSP ? MIPS_ID_OPC_DPAQ_W_QH_DSP :
+            MIPS_ID_NONE);
         {
             int ac = ret & 0x03;
             tcg_gen_movi_i32(t0, ac);
 
             switch (op2) {
             case OPC_DMADD:
+                mips_ident(ctx,
+                    op2 == OPC_DMADD ? MIPS_ID_OPC_DMADD :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_dmadd(v1_t, v2_t, t0, tcg_env);
                 break;
             case OPC_DMADDU:
+                mips_ident(ctx,
+                    op2 == OPC_DMADDU ? MIPS_ID_OPC_DMADDU :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_dmaddu(v1_t, v2_t, t0, tcg_env);
                 break;
             case OPC_DMSUB:
+                mips_ident(ctx,
+                    op2 == OPC_DMSUB ? MIPS_ID_OPC_DMSUB :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_dmsub(v1_t, v2_t, t0, tcg_env);
                 break;
             case OPC_DMSUBU:
+                mips_ident(ctx,
+                    op2 == OPC_DMSUBU ? MIPS_ID_OPC_DMSUBU :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_dmsubu(v1_t, v2_t, t0, tcg_env);
                 break;
             case OPC_DPA_W_QH:
+                mips_ident(ctx,
+                    op2 == OPC_DPA_W_QH ? MIPS_ID_OPC_DPA_W_QH :
+                    MIPS_ID_NONE);
                 check_dsp_r2(ctx);
                 gen_helper_dpa_w_qh(v1_t, v2_t, t0, tcg_env);
                 break;
             case OPC_DPAQ_S_W_QH:
+                mips_ident(ctx,
+                    op2 == OPC_DPAQ_S_W_QH ? MIPS_ID_OPC_DPAQ_S_W_QH :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_dpaq_s_w_qh(v1_t, v2_t, t0, tcg_env);
                 break;
             case OPC_DPAQ_SA_L_PW:
+                mips_ident(ctx,
+                    op2 == OPC_DPAQ_SA_L_PW ? MIPS_ID_OPC_DPAQ_SA_L_PW :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_dpaq_sa_l_pw(v1_t, v2_t, t0, tcg_env);
                 break;
             case OPC_DPAU_H_OBL:
+                mips_ident(ctx,
+                    op2 == OPC_DPAU_H_OBL ? MIPS_ID_OPC_DPAU_H_OBL :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_dpau_h_obl(v1_t, v2_t, t0, tcg_env);
                 break;
             case OPC_DPAU_H_OBR:
+                mips_ident(ctx,
+                    op2 == OPC_DPAU_H_OBR ? MIPS_ID_OPC_DPAU_H_OBR :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_dpau_h_obr(v1_t, v2_t, t0, tcg_env);
                 break;
             case OPC_DPS_W_QH:
+                mips_ident(ctx,
+                    op2 == OPC_DPS_W_QH ? MIPS_ID_OPC_DPS_W_QH :
+                    MIPS_ID_NONE);
                 check_dsp_r2(ctx);
                 gen_helper_dps_w_qh(v1_t, v2_t, t0, tcg_env);
                 break;
             case OPC_DPSQ_S_W_QH:
+                mips_ident(ctx,
+                    op2 == OPC_DPSQ_S_W_QH ? MIPS_ID_OPC_DPSQ_S_W_QH :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_dpsq_s_w_qh(v1_t, v2_t, t0, tcg_env);
                 break;
             case OPC_DPSQ_SA_L_PW:
+                mips_ident(ctx,
+                    op2 == OPC_DPSQ_SA_L_PW ? MIPS_ID_OPC_DPSQ_SA_L_PW :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_dpsq_sa_l_pw(v1_t, v2_t, t0, tcg_env);
                 break;
             case OPC_DPSU_H_OBL:
+                mips_ident(ctx,
+                    op2 == OPC_DPSU_H_OBL ? MIPS_ID_OPC_DPSU_H_OBL :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_dpsu_h_obl(v1_t, v2_t, t0, tcg_env);
                 break;
             case OPC_DPSU_H_OBR:
+                mips_ident(ctx,
+                    op2 == OPC_DPSU_H_OBR ? MIPS_ID_OPC_DPSU_H_OBR :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_dpsu_h_obr(v1_t, v2_t, t0, tcg_env);
                 break;
             case OPC_MAQ_S_L_PWL:
+                mips_ident(ctx,
+                    op2 == OPC_MAQ_S_L_PWL ? MIPS_ID_OPC_MAQ_S_L_PWL :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_maq_s_l_pwl(v1_t, v2_t, t0, tcg_env);
                 break;
             case OPC_MAQ_S_L_PWR:
+                mips_ident(ctx,
+                    op2 == OPC_MAQ_S_L_PWR ? MIPS_ID_OPC_MAQ_S_L_PWR :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_maq_s_l_pwr(v1_t, v2_t, t0, tcg_env);
                 break;
             case OPC_MAQ_S_W_QHLL:
+                mips_ident(ctx,
+                    op2 == OPC_MAQ_S_W_QHLL ? MIPS_ID_OPC_MAQ_S_W_QHLL :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_maq_s_w_qhll(v1_t, v2_t, t0, tcg_env);
                 break;
             case OPC_MAQ_SA_W_QHLL:
+                mips_ident(ctx,
+                    op2 == OPC_MAQ_SA_W_QHLL ? MIPS_ID_OPC_MAQ_SA_W_QHLL :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_maq_sa_w_qhll(v1_t, v2_t, t0, tcg_env);
                 break;
             case OPC_MAQ_S_W_QHLR:
+                mips_ident(ctx,
+                    op2 == OPC_MAQ_S_W_QHLR ? MIPS_ID_OPC_MAQ_S_W_QHLR :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_maq_s_w_qhlr(v1_t, v2_t, t0, tcg_env);
                 break;
             case OPC_MAQ_SA_W_QHLR:
+                mips_ident(ctx,
+                    op2 == OPC_MAQ_SA_W_QHLR ? MIPS_ID_OPC_MAQ_SA_W_QHLR :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_maq_sa_w_qhlr(v1_t, v2_t, t0, tcg_env);
                 break;
             case OPC_MAQ_S_W_QHRL:
+                mips_ident(ctx,
+                    op2 == OPC_MAQ_S_W_QHRL ? MIPS_ID_OPC_MAQ_S_W_QHRL :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_maq_s_w_qhrl(v1_t, v2_t, t0, tcg_env);
                 break;
             case OPC_MAQ_SA_W_QHRL:
+                mips_ident(ctx,
+                    op2 == OPC_MAQ_SA_W_QHRL ? MIPS_ID_OPC_MAQ_SA_W_QHRL :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_maq_sa_w_qhrl(v1_t, v2_t, t0, tcg_env);
                 break;
             case OPC_MAQ_S_W_QHRR:
+                mips_ident(ctx,
+                    op2 == OPC_MAQ_S_W_QHRR ? MIPS_ID_OPC_MAQ_S_W_QHRR :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_maq_s_w_qhrr(v1_t, v2_t, t0, tcg_env);
                 break;
             case OPC_MAQ_SA_W_QHRR:
+                mips_ident(ctx,
+                    op2 == OPC_MAQ_SA_W_QHRR ? MIPS_ID_OPC_MAQ_SA_W_QHRR :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_maq_sa_w_qhrr(v1_t, v2_t, t0, tcg_env);
                 break;
             case OPC_MULSAQ_S_L_PW:
+                mips_ident(ctx,
+                    op2 == OPC_MULSAQ_S_L_PW ? MIPS_ID_OPC_MULSAQ_S_L_PW :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_mulsaq_s_l_pw(v1_t, v2_t, t0, tcg_env);
                 break;
             case OPC_MULSAQ_S_W_QH:
+                mips_ident(ctx,
+                    op2 == OPC_MULSAQ_S_W_QH ? MIPS_ID_OPC_MULSAQ_S_W_QH :
+                    MIPS_ID_NONE);
                 check_dsp(ctx);
                 gen_helper_mulsaq_s_w_qh(v1_t, v2_t, t0, tcg_env);
                 break;
@@ -12322,28 +14663,49 @@ static void gen_mipsdsp_multiply(DisasContext *ctx, uint32_t op1, uint32_t op2,
         break;
 #endif
     case OPC_ADDU_QB_DSP:
+        mips_ident(ctx,
+            op1 == OPC_ADDU_QB_DSP ? MIPS_ID_OPC_ADDU_QB_DSP :
+            MIPS_ID_NONE);
         switch (op2) {
         case OPC_MULEU_S_PH_QBL:
+            mips_ident(ctx,
+                op2 == OPC_MULEU_S_PH_QBL ? MIPS_ID_OPC_MULEU_S_PH_QBL :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_muleu_s_ph_qbl(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_MULEU_S_PH_QBR:
+            mips_ident(ctx,
+                op2 == OPC_MULEU_S_PH_QBR ? MIPS_ID_OPC_MULEU_S_PH_QBR :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_muleu_s_ph_qbr(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_MULQ_RS_PH:
+            mips_ident(ctx,
+                op2 == OPC_MULQ_RS_PH ? MIPS_ID_OPC_MULQ_RS_PH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_mulq_rs_ph(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_MULEQ_S_W_PHL:
+            mips_ident(ctx,
+                op2 == OPC_MULEQ_S_W_PHL ? MIPS_ID_OPC_MULEQ_S_W_PHL :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_muleq_s_w_phl(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_MULEQ_S_W_PHR:
+            mips_ident(ctx,
+                op2 == OPC_MULEQ_S_W_PHR ? MIPS_ID_OPC_MULEQ_S_W_PHR :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_muleq_s_w_phr(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_MULQ_S_PH:
+            mips_ident(ctx,
+                op2 == OPC_MULQ_S_PH ? MIPS_ID_OPC_MULQ_S_PH :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_mulq_s_ph(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
@@ -12351,24 +14713,42 @@ static void gen_mipsdsp_multiply(DisasContext *ctx, uint32_t op1, uint32_t op2,
         break;
 #ifdef TARGET_MIPS64
     case OPC_ADDU_OB_DSP:
+        mips_ident(ctx,
+            op1 == OPC_ADDU_OB_DSP ? MIPS_ID_OPC_ADDU_OB_DSP :
+            MIPS_ID_NONE);
         switch (op2) {
         case OPC_MULEQ_S_PW_QHL:
+            mips_ident(ctx,
+                op2 == OPC_MULEQ_S_PW_QHL ? MIPS_ID_OPC_MULEQ_S_PW_QHL :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_muleq_s_pw_qhl(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_MULEQ_S_PW_QHR:
+            mips_ident(ctx,
+                op2 == OPC_MULEQ_S_PW_QHR ? MIPS_ID_OPC_MULEQ_S_PW_QHR :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_muleq_s_pw_qhr(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_MULEU_S_QH_OBL:
+            mips_ident(ctx,
+                op2 == OPC_MULEU_S_QH_OBL ? MIPS_ID_OPC_MULEU_S_QH_OBL :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_muleu_s_qh_obl(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_MULEU_S_QH_OBR:
+            mips_ident(ctx,
+                op2 == OPC_MULEU_S_QH_OBR ? MIPS_ID_OPC_MULEU_S_QH_OBR :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_muleu_s_qh_obr(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_MULQ_RS_QH:
+            mips_ident(ctx,
+                op2 == OPC_MULQ_RS_QH ? MIPS_ID_OPC_MULQ_RS_QH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_mulq_rs_qh(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
@@ -12396,12 +14776,21 @@ static void gen_mipsdsp_bitinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
 
     switch (op1) {
     case OPC_ABSQ_S_PH_DSP:
+        mips_ident(ctx,
+            op1 == OPC_ABSQ_S_PH_DSP ? MIPS_ID_OPC_ABSQ_S_PH_DSP :
+            MIPS_ID_NONE);
         switch (op2) {
         case OPC_BITREV:
+            mips_ident(ctx,
+                op2 == OPC_BITREV ? MIPS_ID_OPC_BITREV :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_bitrev(cpu_gpr[ret], val_t);
             break;
         case OPC_REPL_QB:
+            mips_ident(ctx,
+                op2 == OPC_REPL_QB ? MIPS_ID_OPC_REPL_QB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             {
                 target_long result;
@@ -12415,6 +14804,9 @@ static void gen_mipsdsp_bitinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
             }
             break;
         case OPC_REPLV_QB:
+            mips_ident(ctx,
+                op2 == OPC_REPLV_QB ? MIPS_ID_OPC_REPLV_QB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             tcg_gen_ext8u_tl(cpu_gpr[ret], val_t);
             tcg_gen_shli_tl(t0, cpu_gpr[ret], 8);
@@ -12424,6 +14816,9 @@ static void gen_mipsdsp_bitinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
             tcg_gen_ext32s_tl(cpu_gpr[ret], cpu_gpr[ret]);
             break;
         case OPC_REPL_PH:
+            mips_ident(ctx,
+                op2 == OPC_REPL_PH ? MIPS_ID_OPC_REPL_PH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             {
                 imm = (ctx->opcode >> 16) & 0x03FF;
@@ -12434,6 +14829,9 @@ static void gen_mipsdsp_bitinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
             }
             break;
         case OPC_REPLV_PH:
+            mips_ident(ctx,
+                op2 == OPC_REPLV_PH ? MIPS_ID_OPC_REPLV_PH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             tcg_gen_ext16u_tl(cpu_gpr[ret], val_t);
             tcg_gen_shli_tl(t0, cpu_gpr[ret], 16);
@@ -12444,8 +14842,14 @@ static void gen_mipsdsp_bitinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
         break;
 #ifdef TARGET_MIPS64
     case OPC_ABSQ_S_QH_DSP:
+        mips_ident(ctx,
+            op1 == OPC_ABSQ_S_QH_DSP ? MIPS_ID_OPC_ABSQ_S_QH_DSP :
+            MIPS_ID_NONE);
         switch (op2) {
         case OPC_REPL_OB:
+            mips_ident(ctx,
+                op2 == OPC_REPL_OB ? MIPS_ID_OPC_REPL_OB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             {
                 target_long temp;
@@ -12458,6 +14862,9 @@ static void gen_mipsdsp_bitinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
                 break;
             }
         case OPC_REPL_PW:
+            mips_ident(ctx,
+                op2 == OPC_REPL_PW ? MIPS_ID_OPC_REPL_PW :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             {
                 target_long temp;
@@ -12470,6 +14877,9 @@ static void gen_mipsdsp_bitinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
                 break;
             }
         case OPC_REPL_QH:
+            mips_ident(ctx,
+                op2 == OPC_REPL_QH ? MIPS_ID_OPC_REPL_QH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             {
                 target_long temp;
@@ -12485,6 +14895,9 @@ static void gen_mipsdsp_bitinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
                 break;
             }
         case OPC_REPLV_OB:
+            mips_ident(ctx,
+                op2 == OPC_REPLV_OB ? MIPS_ID_OPC_REPLV_OB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             tcg_gen_ext8u_tl(cpu_gpr[ret], val_t);
             tcg_gen_shli_tl(t0, cpu_gpr[ret], 8);
@@ -12495,12 +14908,18 @@ static void gen_mipsdsp_bitinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
             tcg_gen_or_tl(cpu_gpr[ret], cpu_gpr[ret], t0);
             break;
         case OPC_REPLV_PW:
+            mips_ident(ctx,
+                op2 == OPC_REPLV_PW ? MIPS_ID_OPC_REPLV_PW :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             tcg_gen_ext32u_i64(cpu_gpr[ret], val_t);
             tcg_gen_shli_tl(t0, cpu_gpr[ret], 32);
             tcg_gen_or_tl(cpu_gpr[ret], cpu_gpr[ret], t0);
             break;
         case OPC_REPLV_QH:
+            mips_ident(ctx,
+                op2 == OPC_REPLV_QH ? MIPS_ID_OPC_REPLV_QH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             tcg_gen_ext16u_tl(cpu_gpr[ret], val_t);
             tcg_gen_shli_tl(t0, cpu_gpr[ret], 16);
@@ -12536,32 +14955,56 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
 
     switch (op1) {
     case OPC_CMPU_EQ_QB_DSP:
+        mips_ident(ctx,
+            op1 == OPC_CMPU_EQ_QB_DSP ? MIPS_ID_OPC_CMPU_EQ_QB_DSP :
+            MIPS_ID_NONE);
         switch (op2) {
         case OPC_CMPU_EQ_QB:
+            mips_ident(ctx,
+                op2 == OPC_CMPU_EQ_QB ? MIPS_ID_OPC_CMPU_EQ_QB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_cmpu_eq_qb(v1_t, v2_t, tcg_env);
             break;
         case OPC_CMPU_LT_QB:
+            mips_ident(ctx,
+                op2 == OPC_CMPU_LT_QB ? MIPS_ID_OPC_CMPU_LT_QB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_cmpu_lt_qb(v1_t, v2_t, tcg_env);
             break;
         case OPC_CMPU_LE_QB:
+            mips_ident(ctx,
+                op2 == OPC_CMPU_LE_QB ? MIPS_ID_OPC_CMPU_LE_QB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_cmpu_le_qb(v1_t, v2_t, tcg_env);
             break;
         case OPC_CMPGU_EQ_QB:
+            mips_ident(ctx,
+                op2 == OPC_CMPGU_EQ_QB ? MIPS_ID_OPC_CMPGU_EQ_QB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_cmpgu_eq_qb(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_CMPGU_LT_QB:
+            mips_ident(ctx,
+                op2 == OPC_CMPGU_LT_QB ? MIPS_ID_OPC_CMPGU_LT_QB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_cmpgu_lt_qb(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_CMPGU_LE_QB:
+            mips_ident(ctx,
+                op2 == OPC_CMPGU_LE_QB ? MIPS_ID_OPC_CMPGU_LE_QB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_cmpgu_le_qb(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_CMPGDU_EQ_QB:
+            mips_ident(ctx,
+                op2 == OPC_CMPGDU_EQ_QB ? MIPS_ID_OPC_CMPGDU_EQ_QB :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_cmpgu_eq_qb(t1, v1_t, v2_t);
             tcg_gen_mov_tl(cpu_gpr[ret], t1);
@@ -12570,6 +15013,9 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             tcg_gen_or_tl(cpu_dspctrl, cpu_dspctrl, t1);
             break;
         case OPC_CMPGDU_LT_QB:
+            mips_ident(ctx,
+                op2 == OPC_CMPGDU_LT_QB ? MIPS_ID_OPC_CMPGDU_LT_QB :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_cmpgu_lt_qb(t1, v1_t, v2_t);
             tcg_gen_mov_tl(cpu_gpr[ret], t1);
@@ -12578,6 +15024,9 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             tcg_gen_or_tl(cpu_dspctrl, cpu_dspctrl, t1);
             break;
         case OPC_CMPGDU_LE_QB:
+            mips_ident(ctx,
+                op2 == OPC_CMPGDU_LE_QB ? MIPS_ID_OPC_CMPGDU_LE_QB :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_cmpgu_le_qb(t1, v1_t, v2_t);
             tcg_gen_mov_tl(cpu_gpr[ret], t1);
@@ -12586,26 +15035,44 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
             tcg_gen_or_tl(cpu_dspctrl, cpu_dspctrl, t1);
             break;
         case OPC_CMP_EQ_PH:
+            mips_ident(ctx,
+                op2 == OPC_CMP_EQ_PH ? MIPS_ID_OPC_CMP_EQ_PH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_cmp_eq_ph(v1_t, v2_t, tcg_env);
             break;
         case OPC_CMP_LT_PH:
+            mips_ident(ctx,
+                op2 == OPC_CMP_LT_PH ? MIPS_ID_OPC_CMP_LT_PH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_cmp_lt_ph(v1_t, v2_t, tcg_env);
             break;
         case OPC_CMP_LE_PH:
+            mips_ident(ctx,
+                op2 == OPC_CMP_LE_PH ? MIPS_ID_OPC_CMP_LE_PH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_cmp_le_ph(v1_t, v2_t, tcg_env);
             break;
         case OPC_PICK_QB:
+            mips_ident(ctx,
+                op2 == OPC_PICK_QB ? MIPS_ID_OPC_PICK_QB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_pick_qb(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_PICK_PH:
+            mips_ident(ctx,
+                op2 == OPC_PICK_PH ? MIPS_ID_OPC_PICK_PH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_pick_ph(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_PACKRL_PH:
+            mips_ident(ctx,
+                op2 == OPC_PACKRL_PH ? MIPS_ID_OPC_PACKRL_PH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_packrl_ph(cpu_gpr[ret], v1_t, v2_t);
             break;
@@ -12613,80 +15080,140 @@ static void gen_mipsdsp_add_cmp_pick(DisasContext *ctx,
         break;
 #ifdef TARGET_MIPS64
     case OPC_CMPU_EQ_OB_DSP:
+        mips_ident(ctx,
+            op1 == OPC_CMPU_EQ_OB_DSP ? MIPS_ID_OPC_CMPU_EQ_OB_DSP :
+            MIPS_ID_NONE);
         switch (op2) {
         case OPC_CMP_EQ_PW:
+            mips_ident(ctx,
+                op2 == OPC_CMP_EQ_PW ? MIPS_ID_OPC_CMP_EQ_PW :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_cmp_eq_pw(v1_t, v2_t, tcg_env);
             break;
         case OPC_CMP_LT_PW:
+            mips_ident(ctx,
+                op2 == OPC_CMP_LT_PW ? MIPS_ID_OPC_CMP_LT_PW :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_cmp_lt_pw(v1_t, v2_t, tcg_env);
             break;
         case OPC_CMP_LE_PW:
+            mips_ident(ctx,
+                op2 == OPC_CMP_LE_PW ? MIPS_ID_OPC_CMP_LE_PW :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_cmp_le_pw(v1_t, v2_t, tcg_env);
             break;
         case OPC_CMP_EQ_QH:
+            mips_ident(ctx,
+                op2 == OPC_CMP_EQ_QH ? MIPS_ID_OPC_CMP_EQ_QH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_cmp_eq_qh(v1_t, v2_t, tcg_env);
             break;
         case OPC_CMP_LT_QH:
+            mips_ident(ctx,
+                op2 == OPC_CMP_LT_QH ? MIPS_ID_OPC_CMP_LT_QH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_cmp_lt_qh(v1_t, v2_t, tcg_env);
             break;
         case OPC_CMP_LE_QH:
+            mips_ident(ctx,
+                op2 == OPC_CMP_LE_QH ? MIPS_ID_OPC_CMP_LE_QH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_cmp_le_qh(v1_t, v2_t, tcg_env);
             break;
         case OPC_CMPGDU_EQ_OB:
+            mips_ident(ctx,
+                op2 == OPC_CMPGDU_EQ_OB ? MIPS_ID_OPC_CMPGDU_EQ_OB :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_cmpgdu_eq_ob(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_CMPGDU_LT_OB:
+            mips_ident(ctx,
+                op2 == OPC_CMPGDU_LT_OB ? MIPS_ID_OPC_CMPGDU_LT_OB :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_cmpgdu_lt_ob(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_CMPGDU_LE_OB:
+            mips_ident(ctx,
+                op2 == OPC_CMPGDU_LE_OB ? MIPS_ID_OPC_CMPGDU_LE_OB :
+                MIPS_ID_NONE);
             check_dsp_r2(ctx);
             gen_helper_cmpgdu_le_ob(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_CMPGU_EQ_OB:
+            mips_ident(ctx,
+                op2 == OPC_CMPGU_EQ_OB ? MIPS_ID_OPC_CMPGU_EQ_OB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_cmpgu_eq_ob(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_CMPGU_LT_OB:
+            mips_ident(ctx,
+                op2 == OPC_CMPGU_LT_OB ? MIPS_ID_OPC_CMPGU_LT_OB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_cmpgu_lt_ob(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_CMPGU_LE_OB:
+            mips_ident(ctx,
+                op2 == OPC_CMPGU_LE_OB ? MIPS_ID_OPC_CMPGU_LE_OB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_cmpgu_le_ob(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_CMPU_EQ_OB:
+            mips_ident(ctx,
+                op2 == OPC_CMPU_EQ_OB ? MIPS_ID_OPC_CMPU_EQ_OB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_cmpu_eq_ob(v1_t, v2_t, tcg_env);
             break;
         case OPC_CMPU_LT_OB:
+            mips_ident(ctx,
+                op2 == OPC_CMPU_LT_OB ? MIPS_ID_OPC_CMPU_LT_OB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_cmpu_lt_ob(v1_t, v2_t, tcg_env);
             break;
         case OPC_CMPU_LE_OB:
+            mips_ident(ctx,
+                op2 == OPC_CMPU_LE_OB ? MIPS_ID_OPC_CMPU_LE_OB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_cmpu_le_ob(v1_t, v2_t, tcg_env);
             break;
         case OPC_PACKRL_PW:
+            mips_ident(ctx,
+                op2 == OPC_PACKRL_PW ? MIPS_ID_OPC_PACKRL_PW :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_packrl_pw(cpu_gpr[ret], v1_t, v2_t);
             break;
         case OPC_PICK_OB:
+            mips_ident(ctx,
+                op2 == OPC_PICK_OB ? MIPS_ID_OPC_PICK_OB :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_pick_ob(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_PICK_PW:
+            mips_ident(ctx,
+                op2 == OPC_PICK_PW ? MIPS_ID_OPC_PICK_PW :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_pick_pw(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
         case OPC_PICK_QH:
+            mips_ident(ctx,
+                op2 == OPC_PICK_QH ? MIPS_ID_OPC_PICK_QH :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             gen_helper_pick_qh(cpu_gpr[ret], v1_t, v2_t, tcg_env);
             break;
@@ -12713,14 +15240,23 @@ static void gen_mipsdsp_append(CPUMIPSState *env, DisasContext *ctx,
 
     switch (op1) {
     case OPC_APPEND_DSP:
+        mips_ident(ctx,
+            op1 == OPC_APPEND_DSP ? MIPS_ID_OPC_APPEND_DSP :
+            MIPS_ID_NONE);
         switch (MASK_APPEND(ctx->opcode)) {
         case OPC_APPEND:
+            mips_ident(ctx,
+                MASK_APPEND(ctx->opcode) == OPC_APPEND ? MIPS_ID_OPC_APPEND :
+                MIPS_ID_NONE);
             if (sa != 0) {
                 tcg_gen_deposit_tl(cpu_gpr[rt], t0, cpu_gpr[rt], sa, 32 - sa);
             }
             tcg_gen_ext32s_tl(cpu_gpr[rt], cpu_gpr[rt]);
             break;
         case OPC_PREPEND:
+            mips_ident(ctx,
+                MASK_APPEND(ctx->opcode) == OPC_PREPEND ? MIPS_ID_OPC_PREPEND :
+                MIPS_ID_NONE);
             if (sa != 0) {
                 tcg_gen_ext32u_tl(cpu_gpr[rt], cpu_gpr[rt]);
                 tcg_gen_shri_tl(cpu_gpr[rt], cpu_gpr[rt], sa);
@@ -12730,6 +15266,9 @@ static void gen_mipsdsp_append(CPUMIPSState *env, DisasContext *ctx,
             tcg_gen_ext32s_tl(cpu_gpr[rt], cpu_gpr[rt]);
             break;
         case OPC_BALIGN:
+            mips_ident(ctx,
+                MASK_APPEND(ctx->opcode) == OPC_BALIGN ? MIPS_ID_OPC_BALIGN :
+                MIPS_ID_NONE);
             sa &= 3;
             if (sa != 0 && sa != 2) {
                 tcg_gen_shli_tl(cpu_gpr[rt], cpu_gpr[rt], 8 * sa);
@@ -12747,18 +15286,33 @@ static void gen_mipsdsp_append(CPUMIPSState *env, DisasContext *ctx,
         break;
 #ifdef TARGET_MIPS64
     case OPC_DAPPEND_DSP:
+        mips_ident(ctx,
+            op1 == OPC_DAPPEND_DSP ? MIPS_ID_OPC_DAPPEND_DSP :
+            MIPS_ID_NONE);
         switch (MASK_DAPPEND(ctx->opcode)) {
         case OPC_DAPPEND:
+            mips_ident(ctx,
+                MASK_DAPPEND(ctx->opcode) == OPC_DAPPEND ?
+                    MIPS_ID_OPC_DAPPEND :
+                MIPS_ID_NONE);
             if (sa != 0) {
                 tcg_gen_deposit_tl(cpu_gpr[rt], t0, cpu_gpr[rt], sa, 64 - sa);
             }
             break;
         case OPC_PREPENDD:
+            mips_ident(ctx,
+                MASK_DAPPEND(ctx->opcode) == OPC_PREPENDD ?
+                    MIPS_ID_OPC_PREPENDD :
+                MIPS_ID_NONE);
             tcg_gen_shri_tl(cpu_gpr[rt], cpu_gpr[rt], 0x20 | sa);
             tcg_gen_shli_tl(t0, t0, 64 - (0x20 | sa));
             tcg_gen_or_tl(cpu_gpr[rt], t0, t0);
             break;
         case OPC_PREPENDW:
+            mips_ident(ctx,
+                MASK_DAPPEND(ctx->opcode) == OPC_PREPENDW ?
+                    MIPS_ID_OPC_PREPENDW :
+                MIPS_ID_NONE);
             if (sa != 0) {
                 tcg_gen_shri_tl(cpu_gpr[rt], cpu_gpr[rt], sa);
                 tcg_gen_shli_tl(t0, t0, 64 - sa);
@@ -12766,6 +15320,10 @@ static void gen_mipsdsp_append(CPUMIPSState *env, DisasContext *ctx,
             }
             break;
         case OPC_DBALIGN:
+            mips_ident(ctx,
+                MASK_DAPPEND(ctx->opcode) == OPC_DBALIGN ?
+                    MIPS_ID_OPC_DBALIGN :
+                MIPS_ID_NONE);
             sa &= 7;
             if (sa != 0 && sa != 2 && sa != 4) {
                 tcg_gen_shli_tl(cpu_gpr[rt], cpu_gpr[rt], 8 * sa);
@@ -12805,82 +15363,136 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
 
     switch (op1) {
     case OPC_EXTR_W_DSP:
+        mips_ident(ctx,
+            op1 == OPC_EXTR_W_DSP ? MIPS_ID_OPC_EXTR_W_DSP :
+            MIPS_ID_NONE);
         check_dsp(ctx);
         switch (op2) {
         case OPC_EXTR_W:
+            mips_ident(ctx,
+                op2 == OPC_EXTR_W ? MIPS_ID_OPC_EXTR_W :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             tcg_gen_movi_tl(t1, v1);
             gen_helper_extr_w(cpu_gpr[ret], t0, t1, tcg_env);
             break;
         case OPC_EXTR_R_W:
+            mips_ident(ctx,
+                op2 == OPC_EXTR_R_W ? MIPS_ID_OPC_EXTR_R_W :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             tcg_gen_movi_tl(t1, v1);
             gen_helper_extr_r_w(cpu_gpr[ret], t0, t1, tcg_env);
             break;
         case OPC_EXTR_RS_W:
+            mips_ident(ctx,
+                op2 == OPC_EXTR_RS_W ? MIPS_ID_OPC_EXTR_RS_W :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             tcg_gen_movi_tl(t1, v1);
             gen_helper_extr_rs_w(cpu_gpr[ret], t0, t1, tcg_env);
             break;
         case OPC_EXTR_S_H:
+            mips_ident(ctx,
+                op2 == OPC_EXTR_S_H ? MIPS_ID_OPC_EXTR_S_H :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             tcg_gen_movi_tl(t1, v1);
             gen_helper_extr_s_h(cpu_gpr[ret], t0, t1, tcg_env);
             break;
         case OPC_EXTRV_S_H:
+            mips_ident(ctx,
+                op2 == OPC_EXTRV_S_H ? MIPS_ID_OPC_EXTRV_S_H :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             gen_helper_extr_s_h(cpu_gpr[ret], t0, v1_t, tcg_env);
             break;
         case OPC_EXTRV_W:
+            mips_ident(ctx,
+                op2 == OPC_EXTRV_W ? MIPS_ID_OPC_EXTRV_W :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             gen_helper_extr_w(cpu_gpr[ret], t0, v1_t, tcg_env);
             break;
         case OPC_EXTRV_R_W:
+            mips_ident(ctx,
+                op2 == OPC_EXTRV_R_W ? MIPS_ID_OPC_EXTRV_R_W :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             gen_helper_extr_r_w(cpu_gpr[ret], t0, v1_t, tcg_env);
             break;
         case OPC_EXTRV_RS_W:
+            mips_ident(ctx,
+                op2 == OPC_EXTRV_RS_W ? MIPS_ID_OPC_EXTRV_RS_W :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             gen_helper_extr_rs_w(cpu_gpr[ret], t0, v1_t, tcg_env);
             break;
         case OPC_EXTP:
+            mips_ident(ctx,
+                op2 == OPC_EXTP ? MIPS_ID_OPC_EXTP :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             tcg_gen_movi_tl(t1, v1);
             gen_helper_extp(cpu_gpr[ret], t0, t1, tcg_env);
             break;
         case OPC_EXTPV:
+            mips_ident(ctx,
+                op2 == OPC_EXTPV ? MIPS_ID_OPC_EXTPV :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             gen_helper_extp(cpu_gpr[ret], t0, v1_t, tcg_env);
             break;
         case OPC_EXTPDP:
+            mips_ident(ctx,
+                op2 == OPC_EXTPDP ? MIPS_ID_OPC_EXTPDP :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             tcg_gen_movi_tl(t1, v1);
             gen_helper_extpdp(cpu_gpr[ret], t0, t1, tcg_env);
             break;
         case OPC_EXTPDPV:
+            mips_ident(ctx,
+                op2 == OPC_EXTPDPV ? MIPS_ID_OPC_EXTPDPV :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             gen_helper_extpdp(cpu_gpr[ret], t0, v1_t, tcg_env);
             break;
         case OPC_SHILO:
+            mips_ident(ctx,
+                op2 == OPC_SHILO ? MIPS_ID_OPC_SHILO :
+                MIPS_ID_NONE);
             imm = (ctx->opcode >> 20) & 0x3F;
             tcg_gen_movi_tl(t0, ret);
             tcg_gen_movi_tl(t1, imm);
             gen_helper_shilo(t0, t1, tcg_env);
             break;
         case OPC_SHILOV:
+            mips_ident(ctx,
+                op2 == OPC_SHILOV ? MIPS_ID_OPC_SHILOV :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, ret);
             gen_helper_shilo(t0, v1_t, tcg_env);
             break;
         case OPC_MTHLIP:
+            mips_ident(ctx,
+                op2 == OPC_MTHLIP ? MIPS_ID_OPC_MTHLIP :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, ret);
             gen_helper_mthlip(t0, v1_t, tcg_env);
             break;
         case OPC_WRDSP:
+            mips_ident(ctx,
+                op2 == OPC_WRDSP ? MIPS_ID_OPC_WRDSP :
+                MIPS_ID_NONE);
             imm = (ctx->opcode >> 11) & 0x3FF;
             tcg_gen_movi_tl(t0, imm);
             gen_helper_wrdsp(v1_t, t0, tcg_env);
             break;
         case OPC_RDDSP:
+            mips_ident(ctx,
+                op2 == OPC_RDDSP ? MIPS_ID_OPC_RDDSP :
+                MIPS_ID_NONE);
             imm = (ctx->opcode >> 16) & 0x03FF;
             tcg_gen_movi_tl(t0, imm);
             gen_helper_rddsp(cpu_gpr[ret], t0, tcg_env);
@@ -12889,13 +15501,22 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
         break;
 #ifdef TARGET_MIPS64
     case OPC_DEXTR_W_DSP:
+        mips_ident(ctx,
+            op1 == OPC_DEXTR_W_DSP ? MIPS_ID_OPC_DEXTR_W_DSP :
+            MIPS_ID_NONE);
         check_dsp(ctx);
         switch (op2) {
         case OPC_DMTHLIP:
+            mips_ident(ctx,
+                op2 == OPC_DMTHLIP ? MIPS_ID_OPC_DMTHLIP :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, ret);
             gen_helper_dmthlip(v1_t, t0, tcg_env);
             break;
         case OPC_DSHILO:
+            mips_ident(ctx,
+                op2 == OPC_DSHILO ? MIPS_ID_OPC_DSHILO :
+                MIPS_ID_NONE);
             {
                 int shift = (ctx->opcode >> 19) & 0x7F;
                 int ac = (ctx->opcode >> 11) & 0x03;
@@ -12905,6 +15526,9 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
                 break;
             }
         case OPC_DSHILOV:
+            mips_ident(ctx,
+                op2 == OPC_DSHILOV ? MIPS_ID_OPC_DSHILOV :
+                MIPS_ID_NONE);
             {
                 int ac = (ctx->opcode >> 11) & 0x03;
                 tcg_gen_movi_tl(t0, ac);
@@ -12912,84 +15536,138 @@ static void gen_mipsdsp_accinsn(DisasContext *ctx, uint32_t op1, uint32_t op2,
                 break;
             }
         case OPC_DEXTP:
+            mips_ident(ctx,
+                op2 == OPC_DEXTP ? MIPS_ID_OPC_DEXTP :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             tcg_gen_movi_tl(t1, v1);
 
             gen_helper_dextp(cpu_gpr[ret], t0, t1, tcg_env);
             break;
         case OPC_DEXTPV:
+            mips_ident(ctx,
+                op2 == OPC_DEXTPV ? MIPS_ID_OPC_DEXTPV :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             gen_helper_dextp(cpu_gpr[ret], t0, v1_t, tcg_env);
             break;
         case OPC_DEXTPDP:
+            mips_ident(ctx,
+                op2 == OPC_DEXTPDP ? MIPS_ID_OPC_DEXTPDP :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             tcg_gen_movi_tl(t1, v1);
             gen_helper_dextpdp(cpu_gpr[ret], t0, t1, tcg_env);
             break;
         case OPC_DEXTPDPV:
+            mips_ident(ctx,
+                op2 == OPC_DEXTPDPV ? MIPS_ID_OPC_DEXTPDPV :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             gen_helper_dextpdp(cpu_gpr[ret], t0, v1_t, tcg_env);
             break;
         case OPC_DEXTR_L:
+            mips_ident(ctx,
+                op2 == OPC_DEXTR_L ? MIPS_ID_OPC_DEXTR_L :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             tcg_gen_movi_tl(t1, v1);
             gen_helper_dextr_l(cpu_gpr[ret], t0, t1, tcg_env);
             break;
         case OPC_DEXTR_R_L:
+            mips_ident(ctx,
+                op2 == OPC_DEXTR_R_L ? MIPS_ID_OPC_DEXTR_R_L :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             tcg_gen_movi_tl(t1, v1);
             gen_helper_dextr_r_l(cpu_gpr[ret], t0, t1, tcg_env);
             break;
         case OPC_DEXTR_RS_L:
+            mips_ident(ctx,
+                op2 == OPC_DEXTR_RS_L ? MIPS_ID_OPC_DEXTR_RS_L :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             tcg_gen_movi_tl(t1, v1);
             gen_helper_dextr_rs_l(cpu_gpr[ret], t0, t1, tcg_env);
             break;
         case OPC_DEXTR_W:
+            mips_ident(ctx,
+                op2 == OPC_DEXTR_W ? MIPS_ID_OPC_DEXTR_W :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             tcg_gen_movi_tl(t1, v1);
             gen_helper_dextr_w(cpu_gpr[ret], t0, t1, tcg_env);
             break;
         case OPC_DEXTR_R_W:
+            mips_ident(ctx,
+                op2 == OPC_DEXTR_R_W ? MIPS_ID_OPC_DEXTR_R_W :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             tcg_gen_movi_tl(t1, v1);
             gen_helper_dextr_r_w(cpu_gpr[ret], t0, t1, tcg_env);
             break;
         case OPC_DEXTR_RS_W:
+            mips_ident(ctx,
+                op2 == OPC_DEXTR_RS_W ? MIPS_ID_OPC_DEXTR_RS_W :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             tcg_gen_movi_tl(t1, v1);
             gen_helper_dextr_rs_w(cpu_gpr[ret], t0, t1, tcg_env);
             break;
         case OPC_DEXTR_S_H:
+            mips_ident(ctx,
+                op2 == OPC_DEXTR_S_H ? MIPS_ID_OPC_DEXTR_S_H :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             tcg_gen_movi_tl(t1, v1);
             gen_helper_dextr_s_h(cpu_gpr[ret], t0, t1, tcg_env);
             break;
         case OPC_DEXTRV_S_H:
+            mips_ident(ctx,
+                op2 == OPC_DEXTRV_S_H ? MIPS_ID_OPC_DEXTRV_S_H :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             gen_helper_dextr_s_h(cpu_gpr[ret], t0, v1_t, tcg_env);
             break;
         case OPC_DEXTRV_L:
+            mips_ident(ctx,
+                op2 == OPC_DEXTRV_L ? MIPS_ID_OPC_DEXTRV_L :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             gen_helper_dextr_l(cpu_gpr[ret], t0, v1_t, tcg_env);
             break;
         case OPC_DEXTRV_R_L:
+            mips_ident(ctx,
+                op2 == OPC_DEXTRV_R_L ? MIPS_ID_OPC_DEXTRV_R_L :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             gen_helper_dextr_r_l(cpu_gpr[ret], t0, v1_t, tcg_env);
             break;
         case OPC_DEXTRV_RS_L:
+            mips_ident(ctx,
+                op2 == OPC_DEXTRV_RS_L ? MIPS_ID_OPC_DEXTRV_RS_L :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             gen_helper_dextr_rs_l(cpu_gpr[ret], t0, v1_t, tcg_env);
             break;
         case OPC_DEXTRV_W:
+            mips_ident(ctx,
+                op2 == OPC_DEXTRV_W ? MIPS_ID_OPC_DEXTRV_W :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             gen_helper_dextr_w(cpu_gpr[ret], t0, v1_t, tcg_env);
             break;
         case OPC_DEXTRV_R_W:
+            mips_ident(ctx,
+                op2 == OPC_DEXTRV_R_W ? MIPS_ID_OPC_DEXTRV_R_W :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             gen_helper_dextr_r_w(cpu_gpr[ret], t0, v1_t, tcg_env);
             break;
         case OPC_DEXTRV_RS_W:
+            mips_ident(ctx,
+                op2 == OPC_DEXTRV_RS_W ? MIPS_ID_OPC_DEXTRV_RS_W :
+                MIPS_ID_NONE);
             tcg_gen_movi_tl(t0, v2);
             gen_helper_dextr_rs_w(cpu_gpr[ret], t0, v1_t, tcg_env);
             break;
@@ -13017,6 +15695,12 @@ static void decode_opc_special_r6(CPUMIPSState *env, DisasContext *ctx)
     case OPC_MULTU:
     case OPC_DIV:
     case OPC_DIVU:
+        mips_ident(ctx,
+            op1 == OPC_MULT ? MIPS_ID_OPC_MULT :
+            op1 == OPC_MULTU ? MIPS_ID_OPC_MULTU :
+            op1 == OPC_DIV ? MIPS_ID_OPC_DIV :
+            op1 == OPC_DIVU ? MIPS_ID_OPC_DIVU :
+            MIPS_ID_NONE);
         op2 = MASK_R6_MULDIV(ctx->opcode);
         switch (op2) {
         case R6_OPC_MUL:
@@ -13027,6 +15711,16 @@ static void decode_opc_special_r6(CPUMIPSState *env, DisasContext *ctx)
         case R6_OPC_MOD:
         case R6_OPC_DIVU:
         case R6_OPC_MODU:
+            mips_ident(ctx,
+                op2 == R6_OPC_MUL ? MIPS_ID_R6_OPC_MUL :
+                op2 == R6_OPC_MUH ? MIPS_ID_R6_OPC_MUH :
+                op2 == R6_OPC_MULU ? MIPS_ID_R6_OPC_MULU :
+                op2 == R6_OPC_MUHU ? MIPS_ID_R6_OPC_MUHU :
+                op2 == R6_OPC_DIV ? MIPS_ID_R6_OPC_DIV :
+                op2 == R6_OPC_MOD ? MIPS_ID_R6_OPC_MOD :
+                op2 == R6_OPC_DIVU ? MIPS_ID_R6_OPC_DIVU :
+                op2 == R6_OPC_MODU ? MIPS_ID_R6_OPC_MODU :
+                MIPS_ID_NONE);
             gen_r6_muldiv(ctx, op2, rd, rs, rt);
             break;
         default:
@@ -13037,10 +15731,18 @@ static void decode_opc_special_r6(CPUMIPSState *env, DisasContext *ctx)
         break;
     case OPC_SELEQZ:
     case OPC_SELNEZ:
+        mips_ident(ctx,
+            op1 == OPC_SELEQZ ? MIPS_ID_OPC_SELEQZ :
+            op1 == OPC_SELNEZ ? MIPS_ID_OPC_SELNEZ :
+            MIPS_ID_NONE);
         gen_cond_move(ctx, op1, rd, rs, rt);
         break;
     case R6_OPC_CLO:
     case R6_OPC_CLZ:
+        mips_ident(ctx,
+            op1 == R6_OPC_CLO ? MIPS_ID_R6_OPC_CLO :
+            op1 == R6_OPC_CLZ ? MIPS_ID_R6_OPC_CLZ :
+            MIPS_ID_NONE);
         if (rt == 0 && sa == 1) {
             /*
              * Major opcode and function field is shared with preR6 MFHI/MTHI.
@@ -13052,6 +15754,9 @@ static void decode_opc_special_r6(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case R6_OPC_SDBBP:
+        mips_ident(ctx,
+            op1 == R6_OPC_SDBBP ? MIPS_ID_R6_OPC_SDBBP :
+            MIPS_ID_NONE);
         if (is_uhi(ctx, extract32(ctx->opcode, 6, 20))) {
             ctx->base.is_jmp = DISAS_SEMIHOST;
         } else {
@@ -13065,6 +15770,10 @@ static void decode_opc_special_r6(CPUMIPSState *env, DisasContext *ctx)
 #if defined(TARGET_MIPS64)
     case R6_OPC_DCLO:
     case R6_OPC_DCLZ:
+        mips_ident(ctx,
+            op1 == R6_OPC_DCLO ? MIPS_ID_R6_OPC_DCLO :
+            op1 == R6_OPC_DCLZ ? MIPS_ID_R6_OPC_DCLZ :
+            MIPS_ID_NONE);
         if (rt == 0 && sa == 1) {
             /*
              * Major opcode and function field is shared with preR6 MFHI/MTHI.
@@ -13080,6 +15789,12 @@ static void decode_opc_special_r6(CPUMIPSState *env, DisasContext *ctx)
     case OPC_DMULTU:
     case OPC_DDIV:
     case OPC_DDIVU:
+        mips_ident(ctx,
+            op1 == OPC_DMULT ? MIPS_ID_OPC_DMULT :
+            op1 == OPC_DMULTU ? MIPS_ID_OPC_DMULTU :
+            op1 == OPC_DDIV ? MIPS_ID_OPC_DDIV :
+            op1 == OPC_DDIVU ? MIPS_ID_OPC_DDIVU :
+            MIPS_ID_NONE);
 
         op2 = MASK_R6_MULDIV(ctx->opcode);
         switch (op2) {
@@ -13091,6 +15806,16 @@ static void decode_opc_special_r6(CPUMIPSState *env, DisasContext *ctx)
         case R6_OPC_DMOD:
         case R6_OPC_DDIVU:
         case R6_OPC_DMODU:
+            mips_ident(ctx,
+                op2 == R6_OPC_DMUL ? MIPS_ID_R6_OPC_DMUL :
+                op2 == R6_OPC_DMUH ? MIPS_ID_R6_OPC_DMUH :
+                op2 == R6_OPC_DMULU ? MIPS_ID_R6_OPC_DMULU :
+                op2 == R6_OPC_DMUHU ? MIPS_ID_R6_OPC_DMUHU :
+                op2 == R6_OPC_DDIV ? MIPS_ID_R6_OPC_DDIV :
+                op2 == R6_OPC_DMOD ? MIPS_ID_R6_OPC_DMOD :
+                op2 == R6_OPC_DDIVU ? MIPS_ID_R6_OPC_DDIVU :
+                op2 == R6_OPC_DMODU ? MIPS_ID_R6_OPC_DMODU :
+                MIPS_ID_NONE);
             check_mips_64(ctx);
             gen_r6_muldiv(ctx, op2, rd, rs, rt);
             break;
@@ -13118,22 +15843,42 @@ static void decode_opc_special_tx79(CPUMIPSState *env, DisasContext *ctx)
     switch (op1) {
     case OPC_MOVN:         /* Conditional move */
     case OPC_MOVZ:
+        mips_ident(ctx,
+            op1 == OPC_MOVN ? MIPS_ID_OPC_MOVN :
+            op1 == OPC_MOVZ ? MIPS_ID_OPC_MOVZ :
+            MIPS_ID_NONE);
         gen_cond_move(ctx, op1, rd, rs, rt);
         break;
     case OPC_MFHI:          /* Move from HI/LO */
     case OPC_MFLO:
+        mips_ident(ctx,
+            op1 == OPC_MFHI ? MIPS_ID_OPC_MFHI :
+            op1 == OPC_MFLO ? MIPS_ID_OPC_MFLO :
+            MIPS_ID_NONE);
         gen_HILO(ctx, op1, 0, rd);
         break;
     case OPC_MTHI:
     case OPC_MTLO:          /* Move to HI/LO */
+        mips_ident(ctx,
+            op1 == OPC_MTHI ? MIPS_ID_OPC_MTHI :
+            op1 == OPC_MTLO ? MIPS_ID_OPC_MTLO :
+            MIPS_ID_NONE);
         gen_HILO(ctx, op1, 0, rs);
         break;
     case OPC_MULT:
     case OPC_MULTU:
+        mips_ident(ctx,
+            op1 == OPC_MULT ? MIPS_ID_OPC_MULT :
+            op1 == OPC_MULTU ? MIPS_ID_OPC_MULTU :
+            MIPS_ID_NONE);
         gen_mul_txx9(ctx, op1, rd, rs, rt);
         break;
     case OPC_DIV:
     case OPC_DIVU:
+        mips_ident(ctx,
+            op1 == OPC_DIV ? MIPS_ID_OPC_DIV :
+            op1 == OPC_DIVU ? MIPS_ID_OPC_DIVU :
+            MIPS_ID_NONE);
         gen_muldiv(ctx, op1, 0, rs, rt);
         break;
 #if defined(TARGET_MIPS64)
@@ -13141,11 +15886,20 @@ static void decode_opc_special_tx79(CPUMIPSState *env, DisasContext *ctx)
     case OPC_DMULTU:
     case OPC_DDIV:
     case OPC_DDIVU:
+        mips_ident(ctx,
+            op1 == OPC_DMULT ? MIPS_ID_OPC_DMULT :
+            op1 == OPC_DMULTU ? MIPS_ID_OPC_DMULTU :
+            op1 == OPC_DDIV ? MIPS_ID_OPC_DDIV :
+            op1 == OPC_DDIVU ? MIPS_ID_OPC_DDIVU :
+            MIPS_ID_NONE);
         check_insn_opc_user_only(ctx, INSN_R5900);
         gen_muldiv(ctx, op1, 0, rs, rt);
         break;
 #endif
     case OPC_JR:
+        mips_ident(ctx,
+            op1 == OPC_JR ? MIPS_ID_OPC_JR :
+            MIPS_ID_NONE);
         gen_compute_branch(ctx, op1, 4, rs, 0, 0, 4);
         break;
     default:            /* Invalid */
@@ -13168,19 +15922,34 @@ static void decode_opc_special_legacy(CPUMIPSState *env, DisasContext *ctx)
     switch (op1) {
     case OPC_MOVN:         /* Conditional move */
     case OPC_MOVZ:
+        mips_ident(ctx,
+            op1 == OPC_MOVN ? MIPS_ID_OPC_MOVN :
+            op1 == OPC_MOVZ ? MIPS_ID_OPC_MOVZ :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS4 | ISA_MIPS_R1 |
                    INSN_LOONGSON2E | INSN_LOONGSON2F);
         gen_cond_move(ctx, op1, rd, rs, rt);
         break;
     case OPC_MFHI:          /* Move from HI/LO */
     case OPC_MFLO:
+        mips_ident(ctx,
+            op1 == OPC_MFHI ? MIPS_ID_OPC_MFHI :
+            op1 == OPC_MFLO ? MIPS_ID_OPC_MFLO :
+            MIPS_ID_NONE);
         gen_HILO(ctx, op1, rs & 3, rd);
         break;
     case OPC_MTHI:
     case OPC_MTLO:          /* Move to HI/LO */
+        mips_ident(ctx,
+            op1 == OPC_MTHI ? MIPS_ID_OPC_MTHI :
+            op1 == OPC_MTLO ? MIPS_ID_OPC_MTLO :
+            MIPS_ID_NONE);
         gen_HILO(ctx, op1, rd & 3, rs);
         break;
     case OPC_MOVCI:
+        mips_ident(ctx,
+            op1 == OPC_MOVCI ? MIPS_ID_OPC_MOVCI :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS4 | ISA_MIPS_R1);
         if (env->CP0_Config1 & (1 << CP0C1_FP)) {
             check_cp1_enabled(ctx);
@@ -13192,10 +15961,18 @@ static void decode_opc_special_legacy(CPUMIPSState *env, DisasContext *ctx)
         break;
     case OPC_MULT:
     case OPC_MULTU:
+        mips_ident(ctx,
+            op1 == OPC_MULT ? MIPS_ID_OPC_MULT :
+            op1 == OPC_MULTU ? MIPS_ID_OPC_MULTU :
+            MIPS_ID_NONE);
         gen_muldiv(ctx, op1, rd & 3, rs, rt);
         break;
     case OPC_DIV:
     case OPC_DIVU:
+        mips_ident(ctx,
+            op1 == OPC_DIV ? MIPS_ID_OPC_DIV :
+            op1 == OPC_DIVU ? MIPS_ID_OPC_DIVU :
+            MIPS_ID_NONE);
         gen_muldiv(ctx, op1, 0, rs, rt);
         break;
 #if defined(TARGET_MIPS64)
@@ -13203,15 +15980,27 @@ static void decode_opc_special_legacy(CPUMIPSState *env, DisasContext *ctx)
     case OPC_DMULTU:
     case OPC_DDIV:
     case OPC_DDIVU:
+        mips_ident(ctx,
+            op1 == OPC_DMULT ? MIPS_ID_OPC_DMULT :
+            op1 == OPC_DMULTU ? MIPS_ID_OPC_DMULTU :
+            op1 == OPC_DDIV ? MIPS_ID_OPC_DDIV :
+            op1 == OPC_DDIVU ? MIPS_ID_OPC_DDIVU :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS3);
         check_mips_64(ctx);
         gen_muldiv(ctx, op1, 0, rs, rt);
         break;
 #endif
     case OPC_JR:
+        mips_ident(ctx,
+            op1 == OPC_JR ? MIPS_ID_OPC_JR :
+            MIPS_ID_NONE);
         gen_compute_branch(ctx, op1, 4, rs, 0, 0, 4);
         break;
     case OPC_SPIM:
+        mips_ident(ctx,
+            op1 == OPC_SPIM ? MIPS_ID_OPC_SPIM :
+            MIPS_ID_NONE);
 #ifdef MIPS_STRICT_STANDARD
         MIPS_INVAL("SPIM");
         gen_reserved_instruction(ctx);
@@ -13241,6 +16030,9 @@ static void decode_opc_special(CPUMIPSState *env, DisasContext *ctx)
     op1 = MASK_SPECIAL(ctx->opcode);
     switch (op1) {
     case OPC_SLL:          /* Shift with immediate */
+        mips_ident(ctx,
+            op1 == OPC_SLL ? MIPS_ID_OPC_SLL :
+            MIPS_ID_NONE);
         if (sa == 5 && rd == 0 &&
             rs == 0 && rt == 0) { /* PAUSE */
             if ((ctx->insn_flags & ISA_MIPS_R6) &&
@@ -13251,9 +16043,15 @@ static void decode_opc_special(CPUMIPSState *env, DisasContext *ctx)
         }
         /* Fallthrough */
     case OPC_SRA:
+        mips_ident(ctx,
+            op1 == OPC_SRA ? MIPS_ID_OPC_SRA :
+            MIPS_ID_NONE);
         gen_shift_imm(ctx, op1, rd, rt, sa);
         break;
     case OPC_SRL:
+        mips_ident(ctx,
+            op1 == OPC_SRL ? MIPS_ID_OPC_SRL :
+            MIPS_ID_NONE);
         switch ((ctx->opcode >> 21) & 0x1f) {
         case 1:
             /* rotr is decoded as srl on non-R2 CPUs */
@@ -13273,13 +16071,26 @@ static void decode_opc_special(CPUMIPSState *env, DisasContext *ctx)
     case OPC_ADDU:
     case OPC_SUB:
     case OPC_SUBU:
+        mips_ident(ctx,
+            op1 == OPC_ADD ? MIPS_ID_OPC_ADD :
+            op1 == OPC_ADDU ? MIPS_ID_OPC_ADDU :
+            op1 == OPC_SUB ? MIPS_ID_OPC_SUB :
+            op1 == OPC_SUBU ? MIPS_ID_OPC_SUBU :
+            MIPS_ID_NONE);
         gen_arith(ctx, op1, rd, rs, rt);
         break;
     case OPC_SLLV:         /* Shifts */
     case OPC_SRAV:
+        mips_ident(ctx,
+            op1 == OPC_SLLV ? MIPS_ID_OPC_SLLV :
+            op1 == OPC_SRAV ? MIPS_ID_OPC_SRAV :
+            MIPS_ID_NONE);
         gen_shift(ctx, op1, rd, rs, rt);
         break;
     case OPC_SRLV:
+        mips_ident(ctx,
+            op1 == OPC_SRLV ? MIPS_ID_OPC_SRLV :
+            MIPS_ID_NONE);
         switch ((ctx->opcode >> 6) & 0x1f) {
         case 1:
             /* rotrv is decoded as srlv on non-R2 CPUs */
@@ -13297,15 +16108,28 @@ static void decode_opc_special(CPUMIPSState *env, DisasContext *ctx)
         break;
     case OPC_SLT:          /* Set on less than */
     case OPC_SLTU:
+        mips_ident(ctx,
+            op1 == OPC_SLT ? MIPS_ID_OPC_SLT :
+            op1 == OPC_SLTU ? MIPS_ID_OPC_SLTU :
+            MIPS_ID_NONE);
         gen_slt(ctx, op1, rd, rs, rt);
         break;
     case OPC_AND:          /* Logic*/
     case OPC_OR:
     case OPC_NOR:
     case OPC_XOR:
+        mips_ident(ctx,
+            op1 == OPC_AND ? MIPS_ID_OPC_AND :
+            op1 == OPC_OR ? MIPS_ID_OPC_OR :
+            op1 == OPC_NOR ? MIPS_ID_OPC_NOR :
+            op1 == OPC_XOR ? MIPS_ID_OPC_XOR :
+            MIPS_ID_NONE);
         gen_logic(ctx, op1, rd, rs, rt);
         break;
     case OPC_JALR:
+        mips_ident(ctx,
+            op1 == OPC_JALR ? MIPS_ID_OPC_JALR :
+            MIPS_ID_NONE);
         gen_compute_branch(ctx, op1, 4, rs, rd, sa, 4);
         break;
     case OPC_TGE: /* Traps */
@@ -13314,10 +16138,21 @@ static void decode_opc_special(CPUMIPSState *env, DisasContext *ctx)
     case OPC_TLTU:
     case OPC_TEQ:
     case OPC_TNE:
+        mips_ident(ctx,
+            op1 == OPC_TGE ? MIPS_ID_OPC_TGE :
+            op1 == OPC_TGEU ? MIPS_ID_OPC_TGEU :
+            op1 == OPC_TLT ? MIPS_ID_OPC_TLT :
+            op1 == OPC_TLTU ? MIPS_ID_OPC_TLTU :
+            op1 == OPC_TEQ ? MIPS_ID_OPC_TEQ :
+            op1 == OPC_TNE ? MIPS_ID_OPC_TNE :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS2);
         gen_trap(ctx, op1, rs, rt, -1, extract32(ctx->opcode, 6, 10));
         break;
     case OPC_PMON:
+        mips_ident(ctx,
+            op1 == OPC_PMON ? MIPS_ID_OPC_PMON :
+            MIPS_ID_NONE);
         /* Pmon entry point, also R4010 selsl */
 #ifdef MIPS_STRICT_STANDARD
         MIPS_INVAL("PMON / selsl");
@@ -13327,12 +16162,21 @@ static void decode_opc_special(CPUMIPSState *env, DisasContext *ctx)
 #endif
         break;
     case OPC_SYSCALL:
+        mips_ident(ctx,
+            op1 == OPC_SYSCALL ? MIPS_ID_OPC_SYSCALL :
+            MIPS_ID_NONE);
         generate_exception_end(ctx, EXCP_SYSCALL);
         break;
     case OPC_BREAK:
+        mips_ident(ctx,
+            op1 == OPC_BREAK ? MIPS_ID_OPC_BREAK :
+            MIPS_ID_NONE);
         generate_exception_break(ctx, extract32(ctx->opcode, 6, 20));
         break;
     case OPC_SYNC:
+        mips_ident(ctx,
+            op1 == OPC_SYNC ? MIPS_ID_OPC_SYNC :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS2);
         gen_sync(extract32(ctx->opcode, 6, 5));
         break;
@@ -13343,11 +16187,20 @@ static void decode_opc_special(CPUMIPSState *env, DisasContext *ctx)
     case OPC_DSRA:
     case OPC_DSLL32:
     case OPC_DSRA32:
+        mips_ident(ctx,
+            op1 == OPC_DSLL ? MIPS_ID_OPC_DSLL :
+            op1 == OPC_DSRA ? MIPS_ID_OPC_DSRA :
+            op1 == OPC_DSLL32 ? MIPS_ID_OPC_DSLL32 :
+            op1 == OPC_DSRA32 ? MIPS_ID_OPC_DSRA32 :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS3);
         check_mips_64(ctx);
         gen_shift_imm(ctx, op1, rd, rt, sa);
         break;
     case OPC_DSRL:
+        mips_ident(ctx,
+            op1 == OPC_DSRL ? MIPS_ID_OPC_DSRL :
+            MIPS_ID_NONE);
         switch ((ctx->opcode >> 21) & 0x1f) {
         case 1:
             /* drotr is decoded as dsrl on non-R2 CPUs */
@@ -13366,6 +16219,9 @@ static void decode_opc_special(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case OPC_DSRL32:
+        mips_ident(ctx,
+            op1 == OPC_DSRL32 ? MIPS_ID_OPC_DSRL32 :
+            MIPS_ID_NONE);
         switch ((ctx->opcode >> 21) & 0x1f) {
         case 1:
             /* drotr32 is decoded as dsrl32 on non-R2 CPUs */
@@ -13387,17 +16243,30 @@ static void decode_opc_special(CPUMIPSState *env, DisasContext *ctx)
     case OPC_DADDU:
     case OPC_DSUB:
     case OPC_DSUBU:
+        mips_ident(ctx,
+            op1 == OPC_DADD ? MIPS_ID_OPC_DADD :
+            op1 == OPC_DADDU ? MIPS_ID_OPC_DADDU :
+            op1 == OPC_DSUB ? MIPS_ID_OPC_DSUB :
+            op1 == OPC_DSUBU ? MIPS_ID_OPC_DSUBU :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS3);
         check_mips_64(ctx);
         gen_arith(ctx, op1, rd, rs, rt);
         break;
     case OPC_DSLLV:
     case OPC_DSRAV:
+        mips_ident(ctx,
+            op1 == OPC_DSLLV ? MIPS_ID_OPC_DSLLV :
+            op1 == OPC_DSRAV ? MIPS_ID_OPC_DSRAV :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS3);
         check_mips_64(ctx);
         gen_shift(ctx, op1, rd, rs, rt);
         break;
     case OPC_DSRLV:
+        mips_ident(ctx,
+            op1 == OPC_DSRLV ? MIPS_ID_OPC_DSRLV :
+            MIPS_ID_NONE);
         switch ((ctx->opcode >> 6) & 0x1f) {
         case 1:
             /* drotrv is decoded as dsrlv on non-R2 CPUs */
@@ -13443,18 +16312,34 @@ static void decode_opc_special2_legacy(CPUMIPSState *env, DisasContext *ctx)
     case OPC_MADDU:
     case OPC_MSUB:
     case OPC_MSUBU:
+        mips_ident(ctx,
+            op1 == OPC_MADD ? MIPS_ID_OPC_MADD :
+            op1 == OPC_MADDU ? MIPS_ID_OPC_MADDU :
+            op1 == OPC_MSUB ? MIPS_ID_OPC_MSUB :
+            op1 == OPC_MSUBU ? MIPS_ID_OPC_MSUBU :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS_R1);
         gen_muldiv(ctx, op1, rd & 3, rs, rt);
         break;
     case OPC_MUL:
+        mips_ident(ctx,
+            op1 == OPC_MUL ? MIPS_ID_OPC_MUL :
+            MIPS_ID_NONE);
         gen_arith(ctx, op1, rd, rs, rt);
         break;
     case OPC_CLO:
     case OPC_CLZ:
+        mips_ident(ctx,
+            op1 == OPC_CLO ? MIPS_ID_OPC_CLO :
+            op1 == OPC_CLZ ? MIPS_ID_OPC_CLZ :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS_R1);
         gen_cl(ctx, op1, rd, rs);
         break;
     case OPC_SDBBP:
+        mips_ident(ctx,
+            op1 == OPC_SDBBP ? MIPS_ID_OPC_SDBBP :
+            MIPS_ID_NONE);
         if (is_uhi(ctx, extract32(ctx->opcode, 6, 20))) {
             ctx->base.is_jmp = DISAS_SEMIHOST;
         } else {
@@ -13469,6 +16354,10 @@ static void decode_opc_special2_legacy(CPUMIPSState *env, DisasContext *ctx)
 #if defined(TARGET_MIPS64)
     case OPC_DCLO:
     case OPC_DCLZ:
+        mips_ident(ctx,
+            op1 == OPC_DCLO ? MIPS_ID_OPC_DCLO :
+            op1 == OPC_DCLZ ? MIPS_ID_OPC_DCLZ :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS_R1);
         check_mips_64(ctx);
         gen_cl(ctx, op1, rd, rs);
@@ -13496,6 +16385,9 @@ static void decode_opc_special3_r6(CPUMIPSState *env, DisasContext *ctx)
     op1 = MASK_SPECIAL3(ctx->opcode);
     switch (op1) {
     case R6_OPC_PREF:
+        mips_ident(ctx,
+            op1 == R6_OPC_PREF ? MIPS_ID_R6_OPC_PREF :
+            MIPS_ID_NONE);
         if (rt >= 24) {
             /* hint codes 24-31 are reserved and signal RI */
             gen_reserved_instruction(ctx);
@@ -13503,18 +16395,30 @@ static void decode_opc_special3_r6(CPUMIPSState *env, DisasContext *ctx)
         /* Treat as NOP. */
         break;
     case R6_OPC_CACHE:
+        mips_ident(ctx,
+            op1 == R6_OPC_CACHE ? MIPS_ID_R6_OPC_CACHE :
+            MIPS_ID_NONE);
         check_cp0_enabled(ctx);
         if (ctx->hflags & MIPS_HFLAG_ITC_CACHE) {
             gen_cache_operation(ctx, rt, rs, imm);
         }
         break;
     case R6_OPC_SC:
+        mips_ident(ctx,
+            op1 == R6_OPC_SC ? MIPS_ID_R6_OPC_SC :
+            MIPS_ID_NONE);
         gen_st_cond(ctx, rt, rs, imm, mo_endian(ctx) | MO_SL, false);
         break;
     case R6_OPC_LL:
+        mips_ident(ctx,
+            op1 == R6_OPC_LL ? MIPS_ID_R6_OPC_LL :
+            MIPS_ID_NONE);
         gen_ld(ctx, op1, rt, rs, imm);
         break;
     case OPC_BSHFL:
+        mips_ident(ctx,
+            op1 == OPC_BSHFL ? MIPS_ID_OPC_BSHFL :
+            MIPS_ID_NONE);
         {
             if (rd == 0) {
                 /* Treat as NOP. */
@@ -13526,9 +16430,18 @@ static void decode_opc_special3_r6(CPUMIPSState *env, DisasContext *ctx)
             case OPC_ALIGN_1:
             case OPC_ALIGN_2:
             case OPC_ALIGN_3:
+                mips_ident(ctx,
+                    op2 == OPC_ALIGN ? MIPS_ID_OPC_ALIGN :
+                    op2 == OPC_ALIGN_1 ? MIPS_ID_OPC_ALIGN_1 :
+                    op2 == OPC_ALIGN_2 ? MIPS_ID_OPC_ALIGN_2 :
+                    op2 == OPC_ALIGN_3 ? MIPS_ID_OPC_ALIGN_3 :
+                    MIPS_ID_NONE);
                 gen_align(ctx, 32, rd, rs, rt, sa & 3);
                 break;
             case OPC_BITSWAP:
+                mips_ident(ctx,
+                    op2 == OPC_BITSWAP ? MIPS_ID_OPC_BITSWAP :
+                    MIPS_ID_NONE);
                 gen_bitswap(ctx, op2, rd, rt);
                 break;
             }
@@ -13536,6 +16449,9 @@ static void decode_opc_special3_r6(CPUMIPSState *env, DisasContext *ctx)
         break;
 #ifndef CONFIG_USER_ONLY
     case OPC_GINV:
+        mips_ident(ctx,
+            op1 == OPC_GINV ? MIPS_ID_OPC_GINV :
+            MIPS_ID_NONE);
         if (unlikely(ctx->gi <= 1)) {
             gen_reserved_instruction(ctx);
         }
@@ -13555,12 +16471,21 @@ static void decode_opc_special3_r6(CPUMIPSState *env, DisasContext *ctx)
 #endif
 #if defined(TARGET_MIPS64)
     case R6_OPC_SCD:
+        mips_ident(ctx,
+            op1 == R6_OPC_SCD ? MIPS_ID_R6_OPC_SCD :
+            MIPS_ID_NONE);
         gen_st_cond(ctx, rt, rs, imm, mo_endian(ctx) | MO_UQ, false);
         break;
     case R6_OPC_LLD:
+        mips_ident(ctx,
+            op1 == R6_OPC_LLD ? MIPS_ID_R6_OPC_LLD :
+            MIPS_ID_NONE);
         gen_ld(ctx, op1, rt, rs, imm);
         break;
     case OPC_DBSHFL:
+        mips_ident(ctx,
+            op1 == OPC_DBSHFL ? MIPS_ID_OPC_DBSHFL :
+            MIPS_ID_NONE);
         check_mips_64(ctx);
         {
             if (rd == 0) {
@@ -13577,9 +16502,22 @@ static void decode_opc_special3_r6(CPUMIPSState *env, DisasContext *ctx)
             case OPC_DALIGN_5:
             case OPC_DALIGN_6:
             case OPC_DALIGN_7:
+                mips_ident(ctx,
+                    op2 == OPC_DALIGN ? MIPS_ID_OPC_DALIGN :
+                    op2 == OPC_DALIGN_1 ? MIPS_ID_OPC_DALIGN_1 :
+                    op2 == OPC_DALIGN_2 ? MIPS_ID_OPC_DALIGN_2 :
+                    op2 == OPC_DALIGN_3 ? MIPS_ID_OPC_DALIGN_3 :
+                    op2 == OPC_DALIGN_4 ? MIPS_ID_OPC_DALIGN_4 :
+                    op2 == OPC_DALIGN_5 ? MIPS_ID_OPC_DALIGN_5 :
+                    op2 == OPC_DALIGN_6 ? MIPS_ID_OPC_DALIGN_6 :
+                    op2 == OPC_DALIGN_7 ? MIPS_ID_OPC_DALIGN_7 :
+                    MIPS_ID_NONE);
                 gen_align(ctx, 64, rd, rs, rt, sa & 7);
                 break;
             case OPC_DBITSWAP:
+                mips_ident(ctx,
+                    op2 == OPC_DBITSWAP ? MIPS_ID_OPC_DBITSWAP :
+                    MIPS_ID_NONE);
                 gen_bitswap(ctx, op2, rd, rt);
                 break;
             }
@@ -13606,6 +16544,9 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
     op1 = MASK_SPECIAL3(ctx->opcode);
     switch (op1) {
     case OPC_MUL_PH_DSP:
+        mips_ident(ctx,
+            op1 == OPC_MUL_PH_DSP ? MIPS_ID_OPC_MUL_PH_DSP :
+            MIPS_ID_NONE);
         /*
          * OPC_ADDUH_QB_DSP, OPC_MUL_PH_DSP have
          * the same mask and op1.
@@ -13625,12 +16566,32 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
             case OPC_SUBQH_R_PH:
             case OPC_SUBQH_W:
             case OPC_SUBQH_R_W:
+                mips_ident(ctx,
+                    op2 == OPC_ADDUH_QB ? MIPS_ID_OPC_ADDUH_QB :
+                    op2 == OPC_ADDUH_R_QB ? MIPS_ID_OPC_ADDUH_R_QB :
+                    op2 == OPC_ADDQH_PH ? MIPS_ID_OPC_ADDQH_PH :
+                    op2 == OPC_ADDQH_R_PH ? MIPS_ID_OPC_ADDQH_R_PH :
+                    op2 == OPC_ADDQH_W ? MIPS_ID_OPC_ADDQH_W :
+                    op2 == OPC_ADDQH_R_W ? MIPS_ID_OPC_ADDQH_R_W :
+                    op2 == OPC_SUBUH_QB ? MIPS_ID_OPC_SUBUH_QB :
+                    op2 == OPC_SUBUH_R_QB ? MIPS_ID_OPC_SUBUH_R_QB :
+                    op2 == OPC_SUBQH_PH ? MIPS_ID_OPC_SUBQH_PH :
+                    op2 == OPC_SUBQH_R_PH ? MIPS_ID_OPC_SUBQH_R_PH :
+                    op2 == OPC_SUBQH_W ? MIPS_ID_OPC_SUBQH_W :
+                    op2 == OPC_SUBQH_R_W ? MIPS_ID_OPC_SUBQH_R_W :
+                    MIPS_ID_NONE);
                 gen_mipsdsp_arith(ctx, op1, op2, rd, rs, rt);
                 break;
             case OPC_MUL_PH:
             case OPC_MUL_S_PH:
             case OPC_MULQ_S_W:
             case OPC_MULQ_RS_W:
+                mips_ident(ctx,
+                    op2 == OPC_MUL_PH ? MIPS_ID_OPC_MUL_PH :
+                    op2 == OPC_MUL_S_PH ? MIPS_ID_OPC_MUL_S_PH :
+                    op2 == OPC_MULQ_S_W ? MIPS_ID_OPC_MULQ_S_W :
+                    op2 == OPC_MULQ_RS_W ? MIPS_ID_OPC_MULQ_RS_W :
+                    MIPS_ID_NONE);
                 gen_mipsdsp_multiply(ctx, op1, op2, rd, rs, rt, 1);
                 break;
             default:
@@ -13643,14 +16604,26 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case OPC_LX_DSP:
+        mips_ident(ctx,
+            op1 == OPC_LX_DSP ? MIPS_ID_OPC_LX_DSP :
+            MIPS_ID_NONE);
         op2 = MASK_LX(ctx->opcode);
         switch (op2) {
 #if defined(TARGET_MIPS64)
         case OPC_LDX:
+            mips_ident(ctx,
+                op2 == OPC_LDX ? MIPS_ID_OPC_LDX :
+                MIPS_ID_NONE);
+            QEMU_FALLTHROUGH;  /* mips_ident */
 #endif
         case OPC_LBUX:
         case OPC_LHX:
         case OPC_LWX:
+            mips_ident(ctx,
+                op2 == OPC_LBUX ? MIPS_ID_OPC_LBUX :
+                op2 == OPC_LHX ? MIPS_ID_OPC_LHX :
+                op2 == OPC_LWX ? MIPS_ID_OPC_LWX :
+                MIPS_ID_NONE);
             gen_mips_lx(ctx, op2, rd, rs, rt);
             break;
         default:            /* Invalid */
@@ -13660,6 +16633,9 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case OPC_ABSQ_S_PH_DSP:
+        mips_ident(ctx,
+            op1 == OPC_ABSQ_S_PH_DSP ? MIPS_ID_OPC_ABSQ_S_PH_DSP :
+            MIPS_ID_NONE);
         op2 = MASK_ABSQ_S_PH(ctx->opcode);
         switch (op2) {
         case OPC_ABSQ_S_QB:
@@ -13675,6 +16651,21 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         case OPC_PRECEU_PH_QBR:
         case OPC_PRECEU_PH_QBLA:
         case OPC_PRECEU_PH_QBRA:
+            mips_ident(ctx,
+                op2 == OPC_ABSQ_S_QB ? MIPS_ID_OPC_ABSQ_S_QB :
+                op2 == OPC_ABSQ_S_PH ? MIPS_ID_OPC_ABSQ_S_PH :
+                op2 == OPC_ABSQ_S_W ? MIPS_ID_OPC_ABSQ_S_W :
+                op2 == OPC_PRECEQ_W_PHL ? MIPS_ID_OPC_PRECEQ_W_PHL :
+                op2 == OPC_PRECEQ_W_PHR ? MIPS_ID_OPC_PRECEQ_W_PHR :
+                op2 == OPC_PRECEQU_PH_QBL ? MIPS_ID_OPC_PRECEQU_PH_QBL :
+                op2 == OPC_PRECEQU_PH_QBR ? MIPS_ID_OPC_PRECEQU_PH_QBR :
+                op2 == OPC_PRECEQU_PH_QBLA ? MIPS_ID_OPC_PRECEQU_PH_QBLA :
+                op2 == OPC_PRECEQU_PH_QBRA ? MIPS_ID_OPC_PRECEQU_PH_QBRA :
+                op2 == OPC_PRECEU_PH_QBL ? MIPS_ID_OPC_PRECEU_PH_QBL :
+                op2 == OPC_PRECEU_PH_QBR ? MIPS_ID_OPC_PRECEU_PH_QBR :
+                op2 == OPC_PRECEU_PH_QBLA ? MIPS_ID_OPC_PRECEU_PH_QBLA :
+                op2 == OPC_PRECEU_PH_QBRA ? MIPS_ID_OPC_PRECEU_PH_QBRA :
+                MIPS_ID_NONE);
             gen_mipsdsp_arith(ctx, op1, op2, rd, rs, rt);
             break;
         case OPC_BITREV:
@@ -13682,6 +16673,13 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         case OPC_REPLV_QB:
         case OPC_REPL_PH:
         case OPC_REPLV_PH:
+            mips_ident(ctx,
+                op2 == OPC_BITREV ? MIPS_ID_OPC_BITREV :
+                op2 == OPC_REPL_QB ? MIPS_ID_OPC_REPL_QB :
+                op2 == OPC_REPLV_QB ? MIPS_ID_OPC_REPLV_QB :
+                op2 == OPC_REPL_PH ? MIPS_ID_OPC_REPL_PH :
+                op2 == OPC_REPLV_PH ? MIPS_ID_OPC_REPLV_PH :
+                MIPS_ID_NONE);
             gen_mipsdsp_bitinsn(ctx, op1, op2, rd, rt);
             break;
         default:
@@ -13691,6 +16689,9 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case OPC_ADDU_QB_DSP:
+        mips_ident(ctx,
+            op1 == OPC_ADDU_QB_DSP ? MIPS_ID_OPC_ADDU_QB_DSP :
+            MIPS_ID_NONE);
         op2 = MASK_ADDU_QB(ctx->opcode);
         switch (op2) {
         case OPC_ADDQ_PH:
@@ -13711,6 +16712,26 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         case OPC_ADDWC:
         case OPC_MODSUB:
         case OPC_RADDU_W_QB:
+            mips_ident(ctx,
+                op2 == OPC_ADDQ_PH ? MIPS_ID_OPC_ADDQ_PH :
+                op2 == OPC_ADDQ_S_PH ? MIPS_ID_OPC_ADDQ_S_PH :
+                op2 == OPC_ADDQ_S_W ? MIPS_ID_OPC_ADDQ_S_W :
+                op2 == OPC_ADDU_QB ? MIPS_ID_OPC_ADDU_QB :
+                op2 == OPC_ADDU_S_QB ? MIPS_ID_OPC_ADDU_S_QB :
+                op2 == OPC_ADDU_PH ? MIPS_ID_OPC_ADDU_PH :
+                op2 == OPC_ADDU_S_PH ? MIPS_ID_OPC_ADDU_S_PH :
+                op2 == OPC_SUBQ_PH ? MIPS_ID_OPC_SUBQ_PH :
+                op2 == OPC_SUBQ_S_PH ? MIPS_ID_OPC_SUBQ_S_PH :
+                op2 == OPC_SUBQ_S_W ? MIPS_ID_OPC_SUBQ_S_W :
+                op2 == OPC_SUBU_QB ? MIPS_ID_OPC_SUBU_QB :
+                op2 == OPC_SUBU_S_QB ? MIPS_ID_OPC_SUBU_S_QB :
+                op2 == OPC_SUBU_PH ? MIPS_ID_OPC_SUBU_PH :
+                op2 == OPC_SUBU_S_PH ? MIPS_ID_OPC_SUBU_S_PH :
+                op2 == OPC_ADDSC ? MIPS_ID_OPC_ADDSC :
+                op2 == OPC_ADDWC ? MIPS_ID_OPC_ADDWC :
+                op2 == OPC_MODSUB ? MIPS_ID_OPC_MODSUB :
+                op2 == OPC_RADDU_W_QB ? MIPS_ID_OPC_RADDU_W_QB :
+                MIPS_ID_NONE);
             gen_mipsdsp_arith(ctx, op1, op2, rd, rs, rt);
             break;
         case OPC_MULEU_S_PH_QBL:
@@ -13719,6 +16740,14 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         case OPC_MULEQ_S_W_PHL:
         case OPC_MULEQ_S_W_PHR:
         case OPC_MULQ_S_PH:
+            mips_ident(ctx,
+                op2 == OPC_MULEU_S_PH_QBL ? MIPS_ID_OPC_MULEU_S_PH_QBL :
+                op2 == OPC_MULEU_S_PH_QBR ? MIPS_ID_OPC_MULEU_S_PH_QBR :
+                op2 == OPC_MULQ_RS_PH ? MIPS_ID_OPC_MULQ_RS_PH :
+                op2 == OPC_MULEQ_S_W_PHL ? MIPS_ID_OPC_MULEQ_S_W_PHL :
+                op2 == OPC_MULEQ_S_W_PHR ? MIPS_ID_OPC_MULEQ_S_W_PHR :
+                op2 == OPC_MULQ_S_PH ? MIPS_ID_OPC_MULQ_S_PH :
+                MIPS_ID_NONE);
             gen_mipsdsp_multiply(ctx, op1, op2, rd, rs, rt, 1);
             break;
         default:            /* Invalid */
@@ -13729,10 +16758,17 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case OPC_CMPU_EQ_QB_DSP:
+        mips_ident(ctx,
+            op1 == OPC_CMPU_EQ_QB_DSP ? MIPS_ID_OPC_CMPU_EQ_QB_DSP :
+            MIPS_ID_NONE);
         op2 = MASK_CMPU_EQ_QB(ctx->opcode);
         switch (op2) {
         case OPC_PRECR_SRA_PH_W:
         case OPC_PRECR_SRA_R_PH_W:
+            mips_ident(ctx,
+                op2 == OPC_PRECR_SRA_PH_W ? MIPS_ID_OPC_PRECR_SRA_PH_W :
+                op2 == OPC_PRECR_SRA_R_PH_W ? MIPS_ID_OPC_PRECR_SRA_R_PH_W :
+                MIPS_ID_NONE);
             gen_mipsdsp_arith(ctx, op1, op2, rt, rs, rd);
             break;
         case OPC_PRECR_QB_PH:
@@ -13740,6 +16776,13 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         case OPC_PRECRQ_PH_W:
         case OPC_PRECRQ_RS_PH_W:
         case OPC_PRECRQU_S_QB_PH:
+            mips_ident(ctx,
+                op2 == OPC_PRECR_QB_PH ? MIPS_ID_OPC_PRECR_QB_PH :
+                op2 == OPC_PRECRQ_QB_PH ? MIPS_ID_OPC_PRECRQ_QB_PH :
+                op2 == OPC_PRECRQ_PH_W ? MIPS_ID_OPC_PRECRQ_PH_W :
+                op2 == OPC_PRECRQ_RS_PH_W ? MIPS_ID_OPC_PRECRQ_RS_PH_W :
+                op2 == OPC_PRECRQU_S_QB_PH ? MIPS_ID_OPC_PRECRQU_S_QB_PH :
+                MIPS_ID_NONE);
             gen_mipsdsp_arith(ctx, op1, op2, rd, rs, rt);
             break;
         case OPC_CMPU_EQ_QB:
@@ -13748,6 +16791,14 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         case OPC_CMP_EQ_PH:
         case OPC_CMP_LT_PH:
         case OPC_CMP_LE_PH:
+            mips_ident(ctx,
+                op2 == OPC_CMPU_EQ_QB ? MIPS_ID_OPC_CMPU_EQ_QB :
+                op2 == OPC_CMPU_LT_QB ? MIPS_ID_OPC_CMPU_LT_QB :
+                op2 == OPC_CMPU_LE_QB ? MIPS_ID_OPC_CMPU_LE_QB :
+                op2 == OPC_CMP_EQ_PH ? MIPS_ID_OPC_CMP_EQ_PH :
+                op2 == OPC_CMP_LT_PH ? MIPS_ID_OPC_CMP_LT_PH :
+                op2 == OPC_CMP_LE_PH ? MIPS_ID_OPC_CMP_LE_PH :
+                MIPS_ID_NONE);
             gen_mipsdsp_add_cmp_pick(ctx, op1, op2, rd, rs, rt, 0);
             break;
         case OPC_CMPGU_EQ_QB:
@@ -13759,6 +16810,17 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         case OPC_PICK_QB:
         case OPC_PICK_PH:
         case OPC_PACKRL_PH:
+            mips_ident(ctx,
+                op2 == OPC_CMPGU_EQ_QB ? MIPS_ID_OPC_CMPGU_EQ_QB :
+                op2 == OPC_CMPGU_LT_QB ? MIPS_ID_OPC_CMPGU_LT_QB :
+                op2 == OPC_CMPGU_LE_QB ? MIPS_ID_OPC_CMPGU_LE_QB :
+                op2 == OPC_CMPGDU_EQ_QB ? MIPS_ID_OPC_CMPGDU_EQ_QB :
+                op2 == OPC_CMPGDU_LT_QB ? MIPS_ID_OPC_CMPGDU_LT_QB :
+                op2 == OPC_CMPGDU_LE_QB ? MIPS_ID_OPC_CMPGDU_LE_QB :
+                op2 == OPC_PICK_QB ? MIPS_ID_OPC_PICK_QB :
+                op2 == OPC_PICK_PH ? MIPS_ID_OPC_PICK_PH :
+                op2 == OPC_PACKRL_PH ? MIPS_ID_OPC_PACKRL_PH :
+                MIPS_ID_NONE);
             gen_mipsdsp_add_cmp_pick(ctx, op1, op2, rd, rs, rt, 1);
             break;
         default:            /* Invalid */
@@ -13768,9 +16830,15 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case OPC_SHLL_QB_DSP:
+        mips_ident(ctx,
+            op1 == OPC_SHLL_QB_DSP ? MIPS_ID_OPC_SHLL_QB_DSP :
+            MIPS_ID_NONE);
         gen_mipsdsp_shift(ctx, op1, rd, rs, rt);
         break;
     case OPC_DPA_W_PH_DSP:
+        mips_ident(ctx,
+            op1 == OPC_DPA_W_PH_DSP ? MIPS_ID_OPC_DPA_W_PH_DSP :
+            MIPS_ID_NONE);
         op2 = MASK_DPA_W_PH(ctx->opcode);
         switch (op2) {
         case OPC_DPAU_H_QBL:
@@ -13795,6 +16863,30 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         case OPC_MAQ_SA_W_PHL:
         case OPC_MAQ_SA_W_PHR:
         case OPC_MULSA_W_PH:
+            mips_ident(ctx,
+                op2 == OPC_DPAU_H_QBL ? MIPS_ID_OPC_DPAU_H_QBL :
+                op2 == OPC_DPAU_H_QBR ? MIPS_ID_OPC_DPAU_H_QBR :
+                op2 == OPC_DPSU_H_QBL ? MIPS_ID_OPC_DPSU_H_QBL :
+                op2 == OPC_DPSU_H_QBR ? MIPS_ID_OPC_DPSU_H_QBR :
+                op2 == OPC_DPA_W_PH ? MIPS_ID_OPC_DPA_W_PH :
+                op2 == OPC_DPAX_W_PH ? MIPS_ID_OPC_DPAX_W_PH :
+                op2 == OPC_DPAQ_S_W_PH ? MIPS_ID_OPC_DPAQ_S_W_PH :
+                op2 == OPC_DPAQX_S_W_PH ? MIPS_ID_OPC_DPAQX_S_W_PH :
+                op2 == OPC_DPAQX_SA_W_PH ? MIPS_ID_OPC_DPAQX_SA_W_PH :
+                op2 == OPC_DPS_W_PH ? MIPS_ID_OPC_DPS_W_PH :
+                op2 == OPC_DPSX_W_PH ? MIPS_ID_OPC_DPSX_W_PH :
+                op2 == OPC_DPSQ_S_W_PH ? MIPS_ID_OPC_DPSQ_S_W_PH :
+                op2 == OPC_DPSQX_S_W_PH ? MIPS_ID_OPC_DPSQX_S_W_PH :
+                op2 == OPC_DPSQX_SA_W_PH ? MIPS_ID_OPC_DPSQX_SA_W_PH :
+                op2 == OPC_MULSAQ_S_W_PH ? MIPS_ID_OPC_MULSAQ_S_W_PH :
+                op2 == OPC_DPAQ_SA_L_W ? MIPS_ID_OPC_DPAQ_SA_L_W :
+                op2 == OPC_DPSQ_SA_L_W ? MIPS_ID_OPC_DPSQ_SA_L_W :
+                op2 == OPC_MAQ_S_W_PHL ? MIPS_ID_OPC_MAQ_S_W_PHL :
+                op2 == OPC_MAQ_S_W_PHR ? MIPS_ID_OPC_MAQ_S_W_PHR :
+                op2 == OPC_MAQ_SA_W_PHL ? MIPS_ID_OPC_MAQ_SA_W_PHL :
+                op2 == OPC_MAQ_SA_W_PHR ? MIPS_ID_OPC_MAQ_SA_W_PHR :
+                op2 == OPC_MULSA_W_PH ? MIPS_ID_OPC_MULSA_W_PH :
+                MIPS_ID_NONE);
             gen_mipsdsp_multiply(ctx, op1, op2, rd, rs, rt, 0);
             break;
         default:            /* Invalid */
@@ -13804,9 +16896,15 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case OPC_INSV_DSP:
+        mips_ident(ctx,
+            op1 == OPC_INSV_DSP ? MIPS_ID_OPC_INSV_DSP :
+            MIPS_ID_NONE);
         op2 = MASK_INSV(ctx->opcode);
         switch (op2) {
         case OPC_INSV:
+            mips_ident(ctx,
+                op2 == OPC_INSV ? MIPS_ID_OPC_INSV :
+                MIPS_ID_NONE);
             check_dsp(ctx);
             {
                 TCGv t0, t1;
@@ -13831,9 +16929,15 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case OPC_APPEND_DSP:
+        mips_ident(ctx,
+            op1 == OPC_APPEND_DSP ? MIPS_ID_OPC_APPEND_DSP :
+            MIPS_ID_NONE);
         gen_mipsdsp_append(env, ctx, op1, rt, rs, rd);
         break;
     case OPC_EXTR_W_DSP:
+        mips_ident(ctx,
+            op1 == OPC_EXTR_W_DSP ? MIPS_ID_OPC_EXTR_W_DSP :
+            MIPS_ID_NONE);
         op2 = MASK_EXTR_W(ctx->opcode);
         switch (op2) {
         case OPC_EXTR_W:
@@ -13848,15 +16952,38 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         case OPC_EXTPV:
         case OPC_EXTPDP:
         case OPC_EXTPDPV:
+            mips_ident(ctx,
+                op2 == OPC_EXTR_W ? MIPS_ID_OPC_EXTR_W :
+                op2 == OPC_EXTR_R_W ? MIPS_ID_OPC_EXTR_R_W :
+                op2 == OPC_EXTR_RS_W ? MIPS_ID_OPC_EXTR_RS_W :
+                op2 == OPC_EXTR_S_H ? MIPS_ID_OPC_EXTR_S_H :
+                op2 == OPC_EXTRV_S_H ? MIPS_ID_OPC_EXTRV_S_H :
+                op2 == OPC_EXTRV_W ? MIPS_ID_OPC_EXTRV_W :
+                op2 == OPC_EXTRV_R_W ? MIPS_ID_OPC_EXTRV_R_W :
+                op2 == OPC_EXTRV_RS_W ? MIPS_ID_OPC_EXTRV_RS_W :
+                op2 == OPC_EXTP ? MIPS_ID_OPC_EXTP :
+                op2 == OPC_EXTPV ? MIPS_ID_OPC_EXTPV :
+                op2 == OPC_EXTPDP ? MIPS_ID_OPC_EXTPDP :
+                op2 == OPC_EXTPDPV ? MIPS_ID_OPC_EXTPDPV :
+                MIPS_ID_NONE);
             gen_mipsdsp_accinsn(ctx, op1, op2, rt, rs, rd, 1);
             break;
         case OPC_RDDSP:
+            mips_ident(ctx,
+                op2 == OPC_RDDSP ? MIPS_ID_OPC_RDDSP :
+                MIPS_ID_NONE);
             gen_mipsdsp_accinsn(ctx, op1, op2, rd, rs, rt, 1);
             break;
         case OPC_SHILO:
         case OPC_SHILOV:
         case OPC_MTHLIP:
         case OPC_WRDSP:
+            mips_ident(ctx,
+                op2 == OPC_SHILO ? MIPS_ID_OPC_SHILO :
+                op2 == OPC_SHILOV ? MIPS_ID_OPC_SHILOV :
+                op2 == OPC_MTHLIP ? MIPS_ID_OPC_MTHLIP :
+                op2 == OPC_WRDSP ? MIPS_ID_OPC_WRDSP :
+                MIPS_ID_NONE);
             gen_mipsdsp_accinsn(ctx, op1, op2, rd, rs, rt, 0);
             break;
         default:            /* Invalid */
@@ -13867,6 +16994,9 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         break;
 #if defined(TARGET_MIPS64)
     case OPC_ABSQ_S_QH_DSP:
+        mips_ident(ctx,
+            op1 == OPC_ABSQ_S_QH_DSP ? MIPS_ID_OPC_ABSQ_S_QH_DSP :
+            MIPS_ID_NONE);
         op2 = MASK_ABSQ_S_QH(ctx->opcode);
         switch (op2) {
         case OPC_PRECEQ_L_PWL:
@@ -13886,6 +17016,25 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         case OPC_ABSQ_S_OB:
         case OPC_ABSQ_S_PW:
         case OPC_ABSQ_S_QH:
+            mips_ident(ctx,
+                op2 == OPC_PRECEQ_L_PWL ? MIPS_ID_OPC_PRECEQ_L_PWL :
+                op2 == OPC_PRECEQ_L_PWR ? MIPS_ID_OPC_PRECEQ_L_PWR :
+                op2 == OPC_PRECEQ_PW_QHL ? MIPS_ID_OPC_PRECEQ_PW_QHL :
+                op2 == OPC_PRECEQ_PW_QHR ? MIPS_ID_OPC_PRECEQ_PW_QHR :
+                op2 == OPC_PRECEQ_PW_QHLA ? MIPS_ID_OPC_PRECEQ_PW_QHLA :
+                op2 == OPC_PRECEQ_PW_QHRA ? MIPS_ID_OPC_PRECEQ_PW_QHRA :
+                op2 == OPC_PRECEQU_QH_OBL ? MIPS_ID_OPC_PRECEQU_QH_OBL :
+                op2 == OPC_PRECEQU_QH_OBR ? MIPS_ID_OPC_PRECEQU_QH_OBR :
+                op2 == OPC_PRECEQU_QH_OBLA ? MIPS_ID_OPC_PRECEQU_QH_OBLA :
+                op2 == OPC_PRECEQU_QH_OBRA ? MIPS_ID_OPC_PRECEQU_QH_OBRA :
+                op2 == OPC_PRECEU_QH_OBL ? MIPS_ID_OPC_PRECEU_QH_OBL :
+                op2 == OPC_PRECEU_QH_OBR ? MIPS_ID_OPC_PRECEU_QH_OBR :
+                op2 == OPC_PRECEU_QH_OBLA ? MIPS_ID_OPC_PRECEU_QH_OBLA :
+                op2 == OPC_PRECEU_QH_OBRA ? MIPS_ID_OPC_PRECEU_QH_OBRA :
+                op2 == OPC_ABSQ_S_OB ? MIPS_ID_OPC_ABSQ_S_OB :
+                op2 == OPC_ABSQ_S_PW ? MIPS_ID_OPC_ABSQ_S_PW :
+                op2 == OPC_ABSQ_S_QH ? MIPS_ID_OPC_ABSQ_S_QH :
+                MIPS_ID_NONE);
             gen_mipsdsp_arith(ctx, op1, op2, rd, rs, rt);
             break;
         case OPC_REPL_OB:
@@ -13894,6 +17043,14 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         case OPC_REPLV_OB:
         case OPC_REPLV_PW:
         case OPC_REPLV_QH:
+            mips_ident(ctx,
+                op2 == OPC_REPL_OB ? MIPS_ID_OPC_REPL_OB :
+                op2 == OPC_REPL_PW ? MIPS_ID_OPC_REPL_PW :
+                op2 == OPC_REPL_QH ? MIPS_ID_OPC_REPL_QH :
+                op2 == OPC_REPLV_OB ? MIPS_ID_OPC_REPLV_OB :
+                op2 == OPC_REPLV_PW ? MIPS_ID_OPC_REPLV_PW :
+                op2 == OPC_REPLV_QH ? MIPS_ID_OPC_REPLV_QH :
+                MIPS_ID_NONE);
             gen_mipsdsp_bitinsn(ctx, op1, op2, rd, rt);
             break;
         default:            /* Invalid */
@@ -13903,6 +17060,9 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case OPC_ADDU_OB_DSP:
+        mips_ident(ctx,
+            op1 == OPC_ADDU_OB_DSP ? MIPS_ID_OPC_ADDU_OB_DSP :
+            MIPS_ID_NONE);
         op2 = MASK_ADDU_OB(ctx->opcode);
         switch (op2) {
         case OPC_RADDU_L_OB:
@@ -13926,6 +17086,29 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         case OPC_ADDU_S_QH:
         case OPC_ADDUH_OB:
         case OPC_ADDUH_R_OB:
+            mips_ident(ctx,
+                op2 == OPC_RADDU_L_OB ? MIPS_ID_OPC_RADDU_L_OB :
+                op2 == OPC_SUBQ_PW ? MIPS_ID_OPC_SUBQ_PW :
+                op2 == OPC_SUBQ_S_PW ? MIPS_ID_OPC_SUBQ_S_PW :
+                op2 == OPC_SUBQ_QH ? MIPS_ID_OPC_SUBQ_QH :
+                op2 == OPC_SUBQ_S_QH ? MIPS_ID_OPC_SUBQ_S_QH :
+                op2 == OPC_SUBU_OB ? MIPS_ID_OPC_SUBU_OB :
+                op2 == OPC_SUBU_S_OB ? MIPS_ID_OPC_SUBU_S_OB :
+                op2 == OPC_SUBU_QH ? MIPS_ID_OPC_SUBU_QH :
+                op2 == OPC_SUBU_S_QH ? MIPS_ID_OPC_SUBU_S_QH :
+                op2 == OPC_SUBUH_OB ? MIPS_ID_OPC_SUBUH_OB :
+                op2 == OPC_SUBUH_R_OB ? MIPS_ID_OPC_SUBUH_R_OB :
+                op2 == OPC_ADDQ_PW ? MIPS_ID_OPC_ADDQ_PW :
+                op2 == OPC_ADDQ_S_PW ? MIPS_ID_OPC_ADDQ_S_PW :
+                op2 == OPC_ADDQ_QH ? MIPS_ID_OPC_ADDQ_QH :
+                op2 == OPC_ADDQ_S_QH ? MIPS_ID_OPC_ADDQ_S_QH :
+                op2 == OPC_ADDU_OB ? MIPS_ID_OPC_ADDU_OB :
+                op2 == OPC_ADDU_S_OB ? MIPS_ID_OPC_ADDU_S_OB :
+                op2 == OPC_ADDU_QH ? MIPS_ID_OPC_ADDU_QH :
+                op2 == OPC_ADDU_S_QH ? MIPS_ID_OPC_ADDU_S_QH :
+                op2 == OPC_ADDUH_OB ? MIPS_ID_OPC_ADDUH_OB :
+                op2 == OPC_ADDUH_R_OB ? MIPS_ID_OPC_ADDUH_R_OB :
+                MIPS_ID_NONE);
             gen_mipsdsp_arith(ctx, op1, op2, rd, rs, rt);
             break;
         case OPC_MULEQ_S_PW_QHL:
@@ -13933,6 +17116,13 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         case OPC_MULEU_S_QH_OBL:
         case OPC_MULEU_S_QH_OBR:
         case OPC_MULQ_RS_QH:
+            mips_ident(ctx,
+                op2 == OPC_MULEQ_S_PW_QHL ? MIPS_ID_OPC_MULEQ_S_PW_QHL :
+                op2 == OPC_MULEQ_S_PW_QHR ? MIPS_ID_OPC_MULEQ_S_PW_QHR :
+                op2 == OPC_MULEU_S_QH_OBL ? MIPS_ID_OPC_MULEU_S_QH_OBL :
+                op2 == OPC_MULEU_S_QH_OBR ? MIPS_ID_OPC_MULEU_S_QH_OBR :
+                op2 == OPC_MULQ_RS_QH ? MIPS_ID_OPC_MULQ_RS_QH :
+                MIPS_ID_NONE);
             gen_mipsdsp_multiply(ctx, op1, op2, rd, rs, rt, 1);
             break;
         default:            /* Invalid */
@@ -13942,10 +17132,17 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case OPC_CMPU_EQ_OB_DSP:
+        mips_ident(ctx,
+            op1 == OPC_CMPU_EQ_OB_DSP ? MIPS_ID_OPC_CMPU_EQ_OB_DSP :
+            MIPS_ID_NONE);
         op2 = MASK_CMPU_EQ_OB(ctx->opcode);
         switch (op2) {
         case OPC_PRECR_SRA_QH_PW:
         case OPC_PRECR_SRA_R_QH_PW:
+            mips_ident(ctx,
+                op2 == OPC_PRECR_SRA_QH_PW ? MIPS_ID_OPC_PRECR_SRA_QH_PW :
+                op2 == OPC_PRECR_SRA_R_QH_PW ? MIPS_ID_OPC_PRECR_SRA_R_QH_PW :
+                MIPS_ID_NONE);
             /* Return value is rt. */
             gen_mipsdsp_arith(ctx, op1, op2, rt, rs, rd);
             break;
@@ -13955,6 +17152,14 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         case OPC_PRECRQ_QH_PW:
         case OPC_PRECRQ_RS_QH_PW:
         case OPC_PRECRQU_S_OB_QH:
+            mips_ident(ctx,
+                op2 == OPC_PRECR_OB_QH ? MIPS_ID_OPC_PRECR_OB_QH :
+                op2 == OPC_PRECRQ_OB_QH ? MIPS_ID_OPC_PRECRQ_OB_QH :
+                op2 == OPC_PRECRQ_PW_L ? MIPS_ID_OPC_PRECRQ_PW_L :
+                op2 == OPC_PRECRQ_QH_PW ? MIPS_ID_OPC_PRECRQ_QH_PW :
+                op2 == OPC_PRECRQ_RS_QH_PW ? MIPS_ID_OPC_PRECRQ_RS_QH_PW :
+                op2 == OPC_PRECRQU_S_OB_QH ? MIPS_ID_OPC_PRECRQU_S_OB_QH :
+                MIPS_ID_NONE);
             gen_mipsdsp_arith(ctx, op1, op2, rd, rs, rt);
             break;
         case OPC_CMPU_EQ_OB:
@@ -13966,6 +17171,17 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         case OPC_CMP_EQ_PW:
         case OPC_CMP_LT_PW:
         case OPC_CMP_LE_PW:
+            mips_ident(ctx,
+                op2 == OPC_CMPU_EQ_OB ? MIPS_ID_OPC_CMPU_EQ_OB :
+                op2 == OPC_CMPU_LT_OB ? MIPS_ID_OPC_CMPU_LT_OB :
+                op2 == OPC_CMPU_LE_OB ? MIPS_ID_OPC_CMPU_LE_OB :
+                op2 == OPC_CMP_EQ_QH ? MIPS_ID_OPC_CMP_EQ_QH :
+                op2 == OPC_CMP_LT_QH ? MIPS_ID_OPC_CMP_LT_QH :
+                op2 == OPC_CMP_LE_QH ? MIPS_ID_OPC_CMP_LE_QH :
+                op2 == OPC_CMP_EQ_PW ? MIPS_ID_OPC_CMP_EQ_PW :
+                op2 == OPC_CMP_LT_PW ? MIPS_ID_OPC_CMP_LT_PW :
+                op2 == OPC_CMP_LE_PW ? MIPS_ID_OPC_CMP_LE_PW :
+                MIPS_ID_NONE);
             gen_mipsdsp_add_cmp_pick(ctx, op1, op2, rd, rs, rt, 0);
             break;
         case OPC_CMPGDU_EQ_OB:
@@ -13978,6 +17194,18 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         case OPC_PICK_OB:
         case OPC_PICK_PW:
         case OPC_PICK_QH:
+            mips_ident(ctx,
+                op2 == OPC_CMPGDU_EQ_OB ? MIPS_ID_OPC_CMPGDU_EQ_OB :
+                op2 == OPC_CMPGDU_LT_OB ? MIPS_ID_OPC_CMPGDU_LT_OB :
+                op2 == OPC_CMPGDU_LE_OB ? MIPS_ID_OPC_CMPGDU_LE_OB :
+                op2 == OPC_CMPGU_EQ_OB ? MIPS_ID_OPC_CMPGU_EQ_OB :
+                op2 == OPC_CMPGU_LT_OB ? MIPS_ID_OPC_CMPGU_LT_OB :
+                op2 == OPC_CMPGU_LE_OB ? MIPS_ID_OPC_CMPGU_LE_OB :
+                op2 == OPC_PACKRL_PW ? MIPS_ID_OPC_PACKRL_PW :
+                op2 == OPC_PICK_OB ? MIPS_ID_OPC_PICK_OB :
+                op2 == OPC_PICK_PW ? MIPS_ID_OPC_PICK_PW :
+                op2 == OPC_PICK_QH ? MIPS_ID_OPC_PICK_QH :
+                MIPS_ID_NONE);
             gen_mipsdsp_add_cmp_pick(ctx, op1, op2, rd, rs, rt, 1);
             break;
         default:            /* Invalid */
@@ -13987,9 +17215,15 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case OPC_DAPPEND_DSP:
+        mips_ident(ctx,
+            op1 == OPC_DAPPEND_DSP ? MIPS_ID_OPC_DAPPEND_DSP :
+            MIPS_ID_NONE);
         gen_mipsdsp_append(env, ctx, op1, rt, rs, rd);
         break;
     case OPC_DEXTR_W_DSP:
+        mips_ident(ctx,
+            op1 == OPC_DEXTR_W_DSP ? MIPS_ID_OPC_DEXTR_W_DSP :
+            MIPS_ID_NONE);
         op2 = MASK_DEXTR_W(ctx->opcode);
         switch (op2) {
         case OPC_DEXTP:
@@ -14010,11 +17244,36 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         case OPC_DEXTRV_W:
         case OPC_DEXTRV_R_W:
         case OPC_DEXTRV_RS_W:
+            mips_ident(ctx,
+                op2 == OPC_DEXTP ? MIPS_ID_OPC_DEXTP :
+                op2 == OPC_DEXTPDP ? MIPS_ID_OPC_DEXTPDP :
+                op2 == OPC_DEXTPDPV ? MIPS_ID_OPC_DEXTPDPV :
+                op2 == OPC_DEXTPV ? MIPS_ID_OPC_DEXTPV :
+                op2 == OPC_DEXTR_L ? MIPS_ID_OPC_DEXTR_L :
+                op2 == OPC_DEXTR_R_L ? MIPS_ID_OPC_DEXTR_R_L :
+                op2 == OPC_DEXTR_RS_L ? MIPS_ID_OPC_DEXTR_RS_L :
+                op2 == OPC_DEXTR_W ? MIPS_ID_OPC_DEXTR_W :
+                op2 == OPC_DEXTR_R_W ? MIPS_ID_OPC_DEXTR_R_W :
+                op2 == OPC_DEXTR_RS_W ? MIPS_ID_OPC_DEXTR_RS_W :
+                op2 == OPC_DEXTR_S_H ? MIPS_ID_OPC_DEXTR_S_H :
+                op2 == OPC_DEXTRV_L ? MIPS_ID_OPC_DEXTRV_L :
+                op2 == OPC_DEXTRV_R_L ? MIPS_ID_OPC_DEXTRV_R_L :
+                op2 == OPC_DEXTRV_RS_L ? MIPS_ID_OPC_DEXTRV_RS_L :
+                op2 == OPC_DEXTRV_S_H ? MIPS_ID_OPC_DEXTRV_S_H :
+                op2 == OPC_DEXTRV_W ? MIPS_ID_OPC_DEXTRV_W :
+                op2 == OPC_DEXTRV_R_W ? MIPS_ID_OPC_DEXTRV_R_W :
+                op2 == OPC_DEXTRV_RS_W ? MIPS_ID_OPC_DEXTRV_RS_W :
+                MIPS_ID_NONE);
             gen_mipsdsp_accinsn(ctx, op1, op2, rt, rs, rd, 1);
             break;
         case OPC_DMTHLIP:
         case OPC_DSHILO:
         case OPC_DSHILOV:
+            mips_ident(ctx,
+                op2 == OPC_DMTHLIP ? MIPS_ID_OPC_DMTHLIP :
+                op2 == OPC_DSHILO ? MIPS_ID_OPC_DSHILO :
+                op2 == OPC_DSHILOV ? MIPS_ID_OPC_DSHILOV :
+                MIPS_ID_NONE);
             gen_mipsdsp_accinsn(ctx, op1, op2, rd, rs, rt, 0);
             break;
         default:            /* Invalid */
@@ -14024,6 +17283,9 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case OPC_DPAQ_W_QH_DSP:
+        mips_ident(ctx,
+            op1 == OPC_DPAQ_W_QH_DSP ? MIPS_ID_OPC_DPAQ_W_QH_DSP :
+            MIPS_ID_NONE);
         op2 = MASK_DPAQ_W_QH(ctx->opcode);
         switch (op2) {
         case OPC_DPAU_H_OBL:
@@ -14038,6 +17300,20 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         case OPC_DPAQ_SA_L_PW:
         case OPC_DPSQ_SA_L_PW:
         case OPC_MULSAQ_S_L_PW:
+            mips_ident(ctx,
+                op2 == OPC_DPAU_H_OBL ? MIPS_ID_OPC_DPAU_H_OBL :
+                op2 == OPC_DPAU_H_OBR ? MIPS_ID_OPC_DPAU_H_OBR :
+                op2 == OPC_DPSU_H_OBL ? MIPS_ID_OPC_DPSU_H_OBL :
+                op2 == OPC_DPSU_H_OBR ? MIPS_ID_OPC_DPSU_H_OBR :
+                op2 == OPC_DPA_W_QH ? MIPS_ID_OPC_DPA_W_QH :
+                op2 == OPC_DPAQ_S_W_QH ? MIPS_ID_OPC_DPAQ_S_W_QH :
+                op2 == OPC_DPS_W_QH ? MIPS_ID_OPC_DPS_W_QH :
+                op2 == OPC_DPSQ_S_W_QH ? MIPS_ID_OPC_DPSQ_S_W_QH :
+                op2 == OPC_MULSAQ_S_W_QH ? MIPS_ID_OPC_MULSAQ_S_W_QH :
+                op2 == OPC_DPAQ_SA_L_PW ? MIPS_ID_OPC_DPAQ_SA_L_PW :
+                op2 == OPC_DPSQ_SA_L_PW ? MIPS_ID_OPC_DPSQ_SA_L_PW :
+                op2 == OPC_MULSAQ_S_L_PW ? MIPS_ID_OPC_MULSAQ_S_L_PW :
+                MIPS_ID_NONE);
             gen_mipsdsp_multiply(ctx, op1, op2, rd, rs, rt, 0);
             break;
         case OPC_MAQ_S_W_QHLL:
@@ -14054,6 +17330,22 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         case OPC_DMADDU:
         case OPC_DMSUB:
         case OPC_DMSUBU:
+            mips_ident(ctx,
+                op2 == OPC_MAQ_S_W_QHLL ? MIPS_ID_OPC_MAQ_S_W_QHLL :
+                op2 == OPC_MAQ_S_W_QHLR ? MIPS_ID_OPC_MAQ_S_W_QHLR :
+                op2 == OPC_MAQ_S_W_QHRL ? MIPS_ID_OPC_MAQ_S_W_QHRL :
+                op2 == OPC_MAQ_S_W_QHRR ? MIPS_ID_OPC_MAQ_S_W_QHRR :
+                op2 == OPC_MAQ_SA_W_QHLL ? MIPS_ID_OPC_MAQ_SA_W_QHLL :
+                op2 == OPC_MAQ_SA_W_QHLR ? MIPS_ID_OPC_MAQ_SA_W_QHLR :
+                op2 == OPC_MAQ_SA_W_QHRL ? MIPS_ID_OPC_MAQ_SA_W_QHRL :
+                op2 == OPC_MAQ_SA_W_QHRR ? MIPS_ID_OPC_MAQ_SA_W_QHRR :
+                op2 == OPC_MAQ_S_L_PWL ? MIPS_ID_OPC_MAQ_S_L_PWL :
+                op2 == OPC_MAQ_S_L_PWR ? MIPS_ID_OPC_MAQ_S_L_PWR :
+                op2 == OPC_DMADD ? MIPS_ID_OPC_DMADD :
+                op2 == OPC_DMADDU ? MIPS_ID_OPC_DMADDU :
+                op2 == OPC_DMSUB ? MIPS_ID_OPC_DMSUB :
+                op2 == OPC_DMSUBU ? MIPS_ID_OPC_DMSUBU :
+                MIPS_ID_NONE);
             gen_mipsdsp_multiply(ctx, op1, op2, rd, rs, rt, 0);
             break;
         default:            /* Invalid */
@@ -14063,9 +17355,15 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case OPC_DINSV_DSP:
+        mips_ident(ctx,
+            op1 == OPC_DINSV_DSP ? MIPS_ID_OPC_DINSV_DSP :
+            MIPS_ID_NONE);
         op2 = MASK_INSV(ctx->opcode);
         switch (op2) {
         case OPC_DINSV:
+            mips_ident(ctx,
+                op2 == OPC_DINSV ? MIPS_ID_OPC_DINSV :
+                MIPS_ID_NONE);
         {
             TCGv t0, t1;
 
@@ -14091,6 +17389,9 @@ static void decode_opc_special3_legacy(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case OPC_SHLL_OB_DSP:
+        mips_ident(ctx,
+            op1 == OPC_SHLL_OB_DSP ? MIPS_ID_OPC_SHLL_OB_DSP :
+            MIPS_ID_NONE);
         gen_mipsdsp_shift(ctx, op1, rd, rs, rt);
         break;
 #endif
@@ -14118,10 +17419,22 @@ static void decode_mmi(CPUMIPSState *env, DisasContext *ctx)
     case MMI_OPC_MADDU:
     case MMI_OPC_MADD1:
     case MMI_OPC_MADDU1:
+        mips_ident(ctx,
+            opc == MMI_OPC_MULT1 ? MIPS_ID_MMI_OPC_MULT1 :
+            opc == MMI_OPC_MULTU1 ? MIPS_ID_MMI_OPC_MULTU1 :
+            opc == MMI_OPC_MADD ? MIPS_ID_MMI_OPC_MADD :
+            opc == MMI_OPC_MADDU ? MIPS_ID_MMI_OPC_MADDU :
+            opc == MMI_OPC_MADD1 ? MIPS_ID_MMI_OPC_MADD1 :
+            opc == MMI_OPC_MADDU1 ? MIPS_ID_MMI_OPC_MADDU1 :
+            MIPS_ID_NONE);
         gen_mul_txx9(ctx, opc, rd, rs, rt);
         break;
     case MMI_OPC_DIV1:
     case MMI_OPC_DIVU1:
+        mips_ident(ctx,
+            opc == MMI_OPC_DIV1 ? MIPS_ID_MMI_OPC_DIV1 :
+            opc == MMI_OPC_DIVU1 ? MIPS_ID_MMI_OPC_DIVU1 :
+            MIPS_ID_NONE);
         gen_div1_tx79(ctx, opc, rs, rt);
         break;
     default:
@@ -14209,6 +17522,16 @@ static void decode_opc_special3(CPUMIPSState *env, DisasContext *ctx)
         case OPC_LHE:
         case OPC_LLE:
         case OPC_LWE:
+            mips_ident(ctx,
+                op1 == OPC_LWLE ? MIPS_ID_OPC_LWLE :
+                op1 == OPC_LWRE ? MIPS_ID_OPC_LWRE :
+                op1 == OPC_LBUE ? MIPS_ID_OPC_LBUE :
+                op1 == OPC_LHUE ? MIPS_ID_OPC_LHUE :
+                op1 == OPC_LBE ? MIPS_ID_OPC_LBE :
+                op1 == OPC_LHE ? MIPS_ID_OPC_LHE :
+                op1 == OPC_LLE ? MIPS_ID_OPC_LLE :
+                op1 == OPC_LWE ? MIPS_ID_OPC_LWE :
+                MIPS_ID_NONE);
             check_cp0_enabled(ctx);
             gen_ld(ctx, op1, rt, rs, imm);
             return;
@@ -14217,14 +17540,27 @@ static void decode_opc_special3(CPUMIPSState *env, DisasContext *ctx)
         case OPC_SBE:
         case OPC_SHE:
         case OPC_SWE:
+            mips_ident(ctx,
+                op1 == OPC_SWLE ? MIPS_ID_OPC_SWLE :
+                op1 == OPC_SWRE ? MIPS_ID_OPC_SWRE :
+                op1 == OPC_SBE ? MIPS_ID_OPC_SBE :
+                op1 == OPC_SHE ? MIPS_ID_OPC_SHE :
+                op1 == OPC_SWE ? MIPS_ID_OPC_SWE :
+                MIPS_ID_NONE);
             check_cp0_enabled(ctx);
             gen_st(ctx, op1, rt, rs, imm);
             return;
         case OPC_SCE:
+            mips_ident(ctx,
+                op1 == OPC_SCE ? MIPS_ID_OPC_SCE :
+                MIPS_ID_NONE);
             check_cp0_enabled(ctx);
             gen_st_cond(ctx, rt, rs, imm, mo_endian(ctx) | MO_SL, true);
             return;
         case OPC_CACHEE:
+            mips_ident(ctx,
+                op1 == OPC_CACHEE ? MIPS_ID_OPC_CACHEE :
+                MIPS_ID_NONE);
             check_eva(ctx);
             check_cp0_enabled(ctx);
             if (ctx->hflags & MIPS_HFLAG_ITC_CACHE) {
@@ -14232,6 +17568,9 @@ static void decode_opc_special3(CPUMIPSState *env, DisasContext *ctx)
             }
             return;
         case OPC_PREFE:
+            mips_ident(ctx,
+                op1 == OPC_PREFE ? MIPS_ID_OPC_PREFE :
+                MIPS_ID_NONE);
             check_cp0_enabled(ctx);
             /* Treat as NOP. */
             return;
@@ -14241,10 +17580,17 @@ static void decode_opc_special3(CPUMIPSState *env, DisasContext *ctx)
     switch (op1) {
     case OPC_EXT:
     case OPC_INS:
+        mips_ident(ctx,
+            op1 == OPC_EXT ? MIPS_ID_OPC_EXT :
+            op1 == OPC_INS ? MIPS_ID_OPC_INS :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS_R2);
         gen_bitops(ctx, op1, rt, rs, sa, rd);
         break;
     case OPC_BSHFL:
+        mips_ident(ctx,
+            op1 == OPC_BSHFL ? MIPS_ID_OPC_BSHFL :
+            MIPS_ID_NONE);
         op2 = MASK_BSHFL(ctx->opcode);
         switch (op2) {
         case OPC_ALIGN:
@@ -14252,6 +17598,13 @@ static void decode_opc_special3(CPUMIPSState *env, DisasContext *ctx)
         case OPC_ALIGN_2:
         case OPC_ALIGN_3:
         case OPC_BITSWAP:
+            mips_ident(ctx,
+                op2 == OPC_ALIGN ? MIPS_ID_OPC_ALIGN :
+                op2 == OPC_ALIGN_1 ? MIPS_ID_OPC_ALIGN_1 :
+                op2 == OPC_ALIGN_2 ? MIPS_ID_OPC_ALIGN_2 :
+                op2 == OPC_ALIGN_3 ? MIPS_ID_OPC_ALIGN_3 :
+                op2 == OPC_BITSWAP ? MIPS_ID_OPC_BITSWAP :
+                MIPS_ID_NONE);
             check_insn(ctx, ISA_MIPS_R6);
             decode_opc_special3_r6(env, ctx);
             break;
@@ -14268,11 +17621,22 @@ static void decode_opc_special3(CPUMIPSState *env, DisasContext *ctx)
     case OPC_DINSM:
     case OPC_DINSU:
     case OPC_DINS:
+        mips_ident(ctx,
+            op1 == OPC_DEXTM ? MIPS_ID_OPC_DEXTM :
+            op1 == OPC_DEXTU ? MIPS_ID_OPC_DEXTU :
+            op1 == OPC_DEXT ? MIPS_ID_OPC_DEXT :
+            op1 == OPC_DINSM ? MIPS_ID_OPC_DINSM :
+            op1 == OPC_DINSU ? MIPS_ID_OPC_DINSU :
+            op1 == OPC_DINS ? MIPS_ID_OPC_DINS :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS_R2);
         check_mips_64(ctx);
         gen_bitops(ctx, op1, rt, rs, sa, rd);
         break;
     case OPC_DBSHFL:
+        mips_ident(ctx,
+            op1 == OPC_DBSHFL ? MIPS_ID_OPC_DBSHFL :
+            MIPS_ID_NONE);
         op2 = MASK_DBSHFL(ctx->opcode);
         switch (op2) {
         case OPC_DALIGN:
@@ -14284,6 +17648,17 @@ static void decode_opc_special3(CPUMIPSState *env, DisasContext *ctx)
         case OPC_DALIGN_6:
         case OPC_DALIGN_7:
         case OPC_DBITSWAP:
+            mips_ident(ctx,
+                op2 == OPC_DALIGN ? MIPS_ID_OPC_DALIGN :
+                op2 == OPC_DALIGN_1 ? MIPS_ID_OPC_DALIGN_1 :
+                op2 == OPC_DALIGN_2 ? MIPS_ID_OPC_DALIGN_2 :
+                op2 == OPC_DALIGN_3 ? MIPS_ID_OPC_DALIGN_3 :
+                op2 == OPC_DALIGN_4 ? MIPS_ID_OPC_DALIGN_4 :
+                op2 == OPC_DALIGN_5 ? MIPS_ID_OPC_DALIGN_5 :
+                op2 == OPC_DALIGN_6 ? MIPS_ID_OPC_DALIGN_6 :
+                op2 == OPC_DALIGN_7 ? MIPS_ID_OPC_DALIGN_7 :
+                op2 == OPC_DBITSWAP ? MIPS_ID_OPC_DBITSWAP :
+                MIPS_ID_NONE);
             check_insn(ctx, ISA_MIPS_R6);
             decode_opc_special3_r6(env, ctx);
             break;
@@ -14297,9 +17672,15 @@ static void decode_opc_special3(CPUMIPSState *env, DisasContext *ctx)
         break;
 #endif
     case OPC_RDHWR:
+        mips_ident(ctx,
+            op1 == OPC_RDHWR ? MIPS_ID_OPC_RDHWR :
+            MIPS_ID_NONE);
         gen_rdhwr(ctx, rt, rd, extract32(ctx->opcode, 6, 3));
         break;
     case OPC_FORK:
+        mips_ident(ctx,
+            op1 == OPC_FORK ? MIPS_ID_OPC_FORK :
+            MIPS_ID_NONE);
         check_mt(ctx);
         {
             TCGv t0 = tcg_temp_new();
@@ -14311,6 +17692,9 @@ static void decode_opc_special3(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case OPC_YIELD:
+        mips_ident(ctx,
+            op1 == OPC_YIELD ? MIPS_ID_OPC_YIELD :
+            MIPS_ID_NONE);
         check_mt(ctx);
         {
             TCGv t0 = tcg_temp_new();
@@ -14344,9 +17728,15 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
     imm = (int16_t)ctx->opcode;
     switch (op) {
     case OPC_SPECIAL:
+        mips_ident(ctx,
+            op == OPC_SPECIAL ? MIPS_ID_OPC_SPECIAL :
+            MIPS_ID_NONE);
         decode_opc_special(env, ctx);
         break;
     case OPC_SPECIAL2:
+        mips_ident(ctx,
+            op == OPC_SPECIAL2 ? MIPS_ID_OPC_SPECIAL2 :
+            MIPS_ID_NONE);
 #if defined(TARGET_MIPS64)
         if ((ctx->insn_flags & INSN_R5900) && (ctx->insn_flags & ASE_MMI)) {
             decode_mmi(env, ctx);
@@ -14361,6 +17751,9 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         decode_opc_special2_legacy(env, ctx);
         break;
     case OPC_SPECIAL3:
+        mips_ident(ctx,
+            op == OPC_SPECIAL3 ? MIPS_ID_OPC_SPECIAL3 :
+            MIPS_ID_NONE);
 #if defined(TARGET_MIPS64)
         if (ctx->insn_flags & INSN_R5900) {
             decode_mmi_sq(env, ctx);    /* MMI_OPC_SQ */
@@ -14372,21 +17765,38 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
 #endif
         break;
     case OPC_REGIMM:
+        mips_ident(ctx,
+            op == OPC_REGIMM ? MIPS_ID_OPC_REGIMM :
+            MIPS_ID_NONE);
         op1 = MASK_REGIMM(ctx->opcode);
         switch (op1) {
         case OPC_BLTZL: /* REGIMM branches */
         case OPC_BGEZL:
         case OPC_BLTZALL:
         case OPC_BGEZALL:
+            mips_ident(ctx,
+                op1 == OPC_BLTZL ? MIPS_ID_OPC_BLTZL :
+                op1 == OPC_BGEZL ? MIPS_ID_OPC_BGEZL :
+                op1 == OPC_BLTZALL ? MIPS_ID_OPC_BLTZALL :
+                op1 == OPC_BGEZALL ? MIPS_ID_OPC_BGEZALL :
+                MIPS_ID_NONE);
             check_insn(ctx, ISA_MIPS2);
             check_insn_opc_removed(ctx, ISA_MIPS_R6);
             /* Fallthrough */
         case OPC_BLTZ:
         case OPC_BGEZ:
+            mips_ident(ctx,
+                op1 == OPC_BLTZ ? MIPS_ID_OPC_BLTZ :
+                op1 == OPC_BGEZ ? MIPS_ID_OPC_BGEZ :
+                MIPS_ID_NONE);
             gen_compute_branch(ctx, op1, 4, rs, -1, imm << 2, 4);
             break;
         case OPC_BLTZAL:
         case OPC_BGEZAL:
+            mips_ident(ctx,
+                op1 == OPC_BLTZAL ? MIPS_ID_OPC_BLTZAL :
+                op1 == OPC_BGEZAL ? MIPS_ID_OPC_BGEZAL :
+                MIPS_ID_NONE);
             if (ctx->insn_flags & ISA_MIPS_R6) {
                 if (rs == 0) {
                     /* OPC_NAL, OPC_BAL */
@@ -14404,15 +17814,29 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         case OPC_TLTIU:
         case OPC_TEQI:
         case OPC_TNEI:
+            mips_ident(ctx,
+                op1 == OPC_TGEI ? MIPS_ID_OPC_TGEI :
+                op1 == OPC_TGEIU ? MIPS_ID_OPC_TGEIU :
+                op1 == OPC_TLTI ? MIPS_ID_OPC_TLTI :
+                op1 == OPC_TLTIU ? MIPS_ID_OPC_TLTIU :
+                op1 == OPC_TEQI ? MIPS_ID_OPC_TEQI :
+                op1 == OPC_TNEI ? MIPS_ID_OPC_TNEI :
+                MIPS_ID_NONE);
             check_insn(ctx, ISA_MIPS2);
             check_insn_opc_removed(ctx, ISA_MIPS_R6);
             gen_trap(ctx, op1, rs, -1, imm, 0);
             break;
         case OPC_SIGRIE:
+            mips_ident(ctx,
+                op1 == OPC_SIGRIE ? MIPS_ID_OPC_SIGRIE :
+                MIPS_ID_NONE);
             check_insn(ctx, ISA_MIPS_R6);
             gen_reserved_instruction(ctx);
             break;
         case OPC_SYNCI:
+            mips_ident(ctx,
+                op1 == OPC_SYNCI ? MIPS_ID_OPC_SYNCI :
+                MIPS_ID_NONE);
             check_insn(ctx, ISA_MIPS_R2);
             /*
              * Break the TB to be able to sync copied instructions
@@ -14421,14 +17845,24 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
             ctx->base.is_jmp = DISAS_STOP;
             break;
         case OPC_BPOSGE32:    /* MIPS DSP branch */
+            mips_ident(ctx,
+                op1 == OPC_BPOSGE32 ? MIPS_ID_OPC_BPOSGE32 :
+                MIPS_ID_NONE);
 #if defined(TARGET_MIPS64)
+            QEMU_FALLTHROUGH;  /* mips_ident */
         case OPC_BPOSGE64:
+            mips_ident(ctx,
+                op1 == OPC_BPOSGE64 ? MIPS_ID_OPC_BPOSGE64 :
+                MIPS_ID_NONE);
 #endif
             check_dsp(ctx);
             gen_compute_branch(ctx, op1, 4, -1, -2, (int32_t)imm << 2, 4);
             break;
 #if defined(TARGET_MIPS64)
         case OPC_DAHI:
+            mips_ident(ctx,
+                op1 == OPC_DAHI ? MIPS_ID_OPC_DAHI :
+                MIPS_ID_NONE);
             check_insn(ctx, ISA_MIPS_R6);
             check_mips_64(ctx);
             if (rs != 0) {
@@ -14436,6 +17870,9 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
             }
             break;
         case OPC_DATI:
+            mips_ident(ctx,
+                op1 == OPC_DATI ? MIPS_ID_OPC_DATI :
+                MIPS_ID_NONE);
             check_insn(ctx, ISA_MIPS_R6);
             check_mips_64(ctx);
             if (rs != 0) {
@@ -14450,6 +17887,9 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case OPC_CP0:
+        mips_ident(ctx,
+            op == OPC_CP0 ? MIPS_ID_OPC_CP0 :
+            MIPS_ID_NONE);
         check_cp0_enabled(ctx);
         op1 = MASK_CP0(ctx->opcode);
         switch (op1) {
@@ -14459,9 +17899,22 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         case OPC_MTTR:
         case OPC_MFHC0:
         case OPC_MTHC0:
+            mips_ident(ctx,
+                op1 == OPC_MFC0 ? MIPS_ID_OPC_MFC0 :
+                op1 == OPC_MTC0 ? MIPS_ID_OPC_MTC0 :
+                op1 == OPC_MFTR ? MIPS_ID_OPC_MFTR :
+                op1 == OPC_MTTR ? MIPS_ID_OPC_MTTR :
+                op1 == OPC_MFHC0 ? MIPS_ID_OPC_MFHC0 :
+                op1 == OPC_MTHC0 ? MIPS_ID_OPC_MTHC0 :
+                MIPS_ID_NONE);
 #if defined(TARGET_MIPS64)
+            QEMU_FALLTHROUGH;  /* mips_ident */
         case OPC_DMFC0:
         case OPC_DMTC0:
+            mips_ident(ctx,
+                op1 == OPC_DMFC0 ? MIPS_ID_OPC_DMFC0 :
+                op1 == OPC_DMTC0 ? MIPS_ID_OPC_DMTC0 :
+                MIPS_ID_NONE);
 #endif
 #ifndef CONFIG_USER_ONLY
             gen_cp0(env, ctx, op1, rt, rd);
@@ -14483,11 +17936,32 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         case OPC_C0_D:
         case OPC_C0_E:
         case OPC_C0_F:
+            mips_ident(ctx,
+                op1 == OPC_C0 ? MIPS_ID_OPC_C0 :
+                op1 == OPC_C0_1 ? MIPS_ID_OPC_C0_1 :
+                op1 == OPC_C0_2 ? MIPS_ID_OPC_C0_2 :
+                op1 == OPC_C0_3 ? MIPS_ID_OPC_C0_3 :
+                op1 == OPC_C0_4 ? MIPS_ID_OPC_C0_4 :
+                op1 == OPC_C0_5 ? MIPS_ID_OPC_C0_5 :
+                op1 == OPC_C0_6 ? MIPS_ID_OPC_C0_6 :
+                op1 == OPC_C0_7 ? MIPS_ID_OPC_C0_7 :
+                op1 == OPC_C0_8 ? MIPS_ID_OPC_C0_8 :
+                op1 == OPC_C0_9 ? MIPS_ID_OPC_C0_9 :
+                op1 == OPC_C0_A ? MIPS_ID_OPC_C0_A :
+                op1 == OPC_C0_B ? MIPS_ID_OPC_C0_B :
+                op1 == OPC_C0_C ? MIPS_ID_OPC_C0_C :
+                op1 == OPC_C0_D ? MIPS_ID_OPC_C0_D :
+                op1 == OPC_C0_E ? MIPS_ID_OPC_C0_E :
+                op1 == OPC_C0_F ? MIPS_ID_OPC_C0_F :
+                MIPS_ID_NONE);
 #ifndef CONFIG_USER_ONLY
             gen_cp0(env, ctx, MASK_C0(ctx->opcode), rt, rd);
 #endif /* !CONFIG_USER_ONLY */
             break;
         case OPC_MFMC0:
+            mips_ident(ctx,
+                op1 == OPC_MFMC0 ? MIPS_ID_OPC_MFMC0 :
+                MIPS_ID_NONE);
 #ifndef CONFIG_USER_ONLY
             {
                 uint32_t op2;
@@ -14496,26 +17970,41 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
                 op2 = MASK_MFMC0(ctx->opcode);
                 switch (op2) {
                 case OPC_DMT:
+                    mips_ident(ctx,
+                        op2 == OPC_DMT ? MIPS_ID_OPC_DMT :
+                        MIPS_ID_NONE);
                     check_cp0_mt(ctx);
                     gen_helper_dmt(t0);
                     gen_store_gpr(t0, rt);
                     break;
                 case OPC_EMT:
+                    mips_ident(ctx,
+                        op2 == OPC_EMT ? MIPS_ID_OPC_EMT :
+                        MIPS_ID_NONE);
                     check_cp0_mt(ctx);
                     gen_helper_emt(t0);
                     gen_store_gpr(t0, rt);
                     break;
                 case OPC_DVPE:
+                    mips_ident(ctx,
+                        op2 == OPC_DVPE ? MIPS_ID_OPC_DVPE :
+                        MIPS_ID_NONE);
                     check_cp0_mt(ctx);
                     gen_helper_dvpe(t0, tcg_env);
                     gen_store_gpr(t0, rt);
                     break;
                 case OPC_EVPE:
+                    mips_ident(ctx,
+                        op2 == OPC_EVPE ? MIPS_ID_OPC_EVPE :
+                        MIPS_ID_NONE);
                     check_cp0_mt(ctx);
                     gen_helper_evpe(t0, tcg_env);
                     gen_store_gpr(t0, rt);
                     break;
                 case OPC_DVP:
+                    mips_ident(ctx,
+                        op2 == OPC_DVP ? MIPS_ID_OPC_DVP :
+                        MIPS_ID_NONE);
                     check_insn(ctx, ISA_MIPS_R6);
                     if (ctx->vp) {
                         gen_helper_dvp(t0, tcg_env);
@@ -14523,6 +18012,9 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
                     }
                     break;
                 case OPC_EVP:
+                    mips_ident(ctx,
+                        op2 == OPC_EVP ? MIPS_ID_OPC_EVP :
+                        MIPS_ID_NONE);
                     check_insn(ctx, ISA_MIPS_R6);
                     if (ctx->vp) {
                         gen_helper_evp(t0, tcg_env);
@@ -14530,6 +18022,9 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
                     }
                     break;
                 case OPC_DI:
+                    mips_ident(ctx,
+                        op2 == OPC_DI ? MIPS_ID_OPC_DI :
+                        MIPS_ID_NONE);
                     check_insn(ctx, ISA_MIPS_R2);
                     save_cpu_state(ctx, 1);
                     gen_helper_di(t0, tcg_env);
@@ -14541,6 +18036,9 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
                     ctx->base.is_jmp = DISAS_STOP;
                     break;
                 case OPC_EI:
+                    mips_ident(ctx,
+                        op2 == OPC_EI ? MIPS_ID_OPC_EI :
+                        MIPS_ID_NONE);
                     check_insn(ctx, ISA_MIPS_R2);
                     save_cpu_state(ctx, 1);
                     gen_helper_ei(t0, tcg_env);
@@ -14561,10 +18059,16 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
 #endif /* !CONFIG_USER_ONLY */
             break;
         case OPC_RDPGPR:
+            mips_ident(ctx,
+                op1 == OPC_RDPGPR ? MIPS_ID_OPC_RDPGPR :
+                MIPS_ID_NONE);
             check_insn(ctx, ISA_MIPS_R2);
             gen_load_srsgpr(rt, rd);
             break;
         case OPC_WRPGPR:
+            mips_ident(ctx,
+                op1 == OPC_WRPGPR ? MIPS_ID_OPC_WRPGPR :
+                MIPS_ID_NONE);
             check_insn(ctx, ISA_MIPS_R2);
             gen_store_srsgpr(rt, rd);
             break;
@@ -14575,6 +18079,9 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case OPC_BOVC: /* OPC_BEQZALC, OPC_BEQC, OPC_ADDI */
+        mips_ident(ctx,
+            op == OPC_BOVC ? MIPS_ID_OPC_BOVC :
+            MIPS_ID_NONE);
         if (ctx->insn_flags & ISA_MIPS_R6) {
             /* OPC_BOVC, OPC_BEQZALC, OPC_BEQC */
             gen_compute_compact_branch(ctx, op, rs, rt, imm << 2);
@@ -14585,25 +18092,45 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case OPC_ADDIU:
+        mips_ident(ctx,
+            op == OPC_ADDIU ? MIPS_ID_OPC_ADDIU :
+            MIPS_ID_NONE);
          gen_arith_imm(ctx, op, rt, rs, imm);
          break;
     case OPC_SLTI: /* Set on less than with immediate opcode */
     case OPC_SLTIU:
+        mips_ident(ctx,
+            op == OPC_SLTI ? MIPS_ID_OPC_SLTI :
+            op == OPC_SLTIU ? MIPS_ID_OPC_SLTIU :
+            MIPS_ID_NONE);
          gen_slt_imm(ctx, op, rt, rs, imm);
          break;
     case OPC_ANDI: /* Arithmetic with immediate opcode */
     case OPC_LUI: /* OPC_AUI */
     case OPC_ORI:
     case OPC_XORI:
+        mips_ident(ctx,
+            op == OPC_ANDI ? MIPS_ID_OPC_ANDI :
+            op == OPC_LUI ? MIPS_ID_OPC_LUI :
+            op == OPC_ORI ? MIPS_ID_OPC_ORI :
+            op == OPC_XORI ? MIPS_ID_OPC_XORI :
+            MIPS_ID_NONE);
          gen_logic_imm(ctx, op, rt, rs, imm);
          break;
     case OPC_J: /* Jump */
     case OPC_JAL:
+        mips_ident(ctx,
+            op == OPC_J ? MIPS_ID_OPC_J :
+            op == OPC_JAL ? MIPS_ID_OPC_JAL :
+            MIPS_ID_NONE);
          offset = (int32_t)(ctx->opcode & 0x3FFFFFF) << 2;
          gen_compute_branch(ctx, op, 4, rs, rt, offset, 4);
          break;
     /* Branch */
     case OPC_BLEZC: /* OPC_BGEZC, OPC_BGEC, OPC_BLEZL */
+        mips_ident(ctx,
+            op == OPC_BLEZC ? MIPS_ID_OPC_BLEZC :
+            MIPS_ID_NONE);
         if (ctx->insn_flags & ISA_MIPS_R6) {
             if (rt == 0) {
                 gen_reserved_instruction(ctx);
@@ -14617,6 +18144,9 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case OPC_BGTZC: /* OPC_BLTZC, OPC_BLTC, OPC_BGTZL */
+        mips_ident(ctx,
+            op == OPC_BGTZC ? MIPS_ID_OPC_BGTZC :
+            MIPS_ID_NONE);
         if (ctx->insn_flags & ISA_MIPS_R6) {
             if (rt == 0) {
                 gen_reserved_instruction(ctx);
@@ -14630,6 +18160,9 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case OPC_BLEZALC: /* OPC_BGEZALC, OPC_BGEUC, OPC_BLEZ */
+        mips_ident(ctx,
+            op == OPC_BLEZALC ? MIPS_ID_OPC_BLEZALC :
+            MIPS_ID_NONE);
         if (rt == 0) {
             /* OPC_BLEZ */
             gen_compute_branch(ctx, op, 4, rs, rt, imm << 2, 4);
@@ -14640,6 +18173,9 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case OPC_BGTZALC: /* OPC_BLTZALC, OPC_BLTUC, OPC_BGTZ */
+        mips_ident(ctx,
+            op == OPC_BGTZALC ? MIPS_ID_OPC_BGTZALC :
+            MIPS_ID_NONE);
         if (rt == 0) {
             /* OPC_BGTZ */
             gen_compute_branch(ctx, op, 4, rs, rt, imm << 2, 4);
@@ -14651,14 +18187,25 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         break;
     case OPC_BEQL:
     case OPC_BNEL:
+        mips_ident(ctx,
+            op == OPC_BEQL ? MIPS_ID_OPC_BEQL :
+            op == OPC_BNEL ? MIPS_ID_OPC_BNEL :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS2);
          check_insn_opc_removed(ctx, ISA_MIPS_R6);
         /* Fallthrough */
     case OPC_BEQ:
     case OPC_BNE:
+        mips_ident(ctx,
+            op == OPC_BEQ ? MIPS_ID_OPC_BEQ :
+            op == OPC_BNE ? MIPS_ID_OPC_BNE :
+            MIPS_ID_NONE);
          gen_compute_branch(ctx, op, 4, rs, rt, imm << 2, 4);
          break;
     case OPC_LL: /* Load and stores */
+        mips_ident(ctx,
+            op == OPC_LL ? MIPS_ID_OPC_LL :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS2);
         if (ctx->insn_flags & INSN_R5900) {
             check_insn_opc_user_only(ctx, INSN_R5900);
@@ -14672,6 +18219,16 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
     case OPC_LWPC:
     case OPC_LBU:
     case OPC_LHU:
+        mips_ident(ctx,
+            op == OPC_LWL ? MIPS_ID_OPC_LWL :
+            op == OPC_LWR ? MIPS_ID_OPC_LWR :
+            op == OPC_LB ? MIPS_ID_OPC_LB :
+            op == OPC_LH ? MIPS_ID_OPC_LH :
+            op == OPC_LW ? MIPS_ID_OPC_LW :
+            op == OPC_LWPC ? MIPS_ID_OPC_LWPC :
+            op == OPC_LBU ? MIPS_ID_OPC_LBU :
+            op == OPC_LHU ? MIPS_ID_OPC_LHU :
+            MIPS_ID_NONE);
          gen_ld(ctx, op, rt, rs, imm);
          break;
     case OPC_SWL:
@@ -14679,9 +18236,19 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
     case OPC_SB:
     case OPC_SH:
     case OPC_SW:
+        mips_ident(ctx,
+            op == OPC_SWL ? MIPS_ID_OPC_SWL :
+            op == OPC_SWR ? MIPS_ID_OPC_SWR :
+            op == OPC_SB ? MIPS_ID_OPC_SB :
+            op == OPC_SH ? MIPS_ID_OPC_SH :
+            op == OPC_SW ? MIPS_ID_OPC_SW :
+            MIPS_ID_NONE);
          gen_st(ctx, op, rt, rs, imm);
          break;
     case OPC_SC:
+        mips_ident(ctx,
+            op == OPC_SC ? MIPS_ID_OPC_SC :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS2);
         if (ctx->insn_flags & INSN_R5900) {
             check_insn_opc_user_only(ctx, INSN_R5900);
@@ -14689,6 +18256,9 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         gen_st_cond(ctx, rt, rs, imm, mo_endian(ctx) | MO_SL, false);
         break;
     case OPC_CACHE:
+        mips_ident(ctx,
+            op == OPC_CACHE ? MIPS_ID_OPC_CACHE :
+            MIPS_ID_NONE);
         check_cp0_enabled(ctx);
         check_insn(ctx, ISA_MIPS3 | ISA_MIPS_R1);
         if (ctx->hflags & MIPS_HFLAG_ITC_CACHE) {
@@ -14697,6 +18267,9 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         /* Treat as NOP. */
         break;
     case OPC_PREF:
+        mips_ident(ctx,
+            op == OPC_PREF ? MIPS_ID_OPC_PREF :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS4 | ISA_MIPS_R1 | INSN_R5900);
         /* Treat as NOP. */
         break;
@@ -14706,15 +18279,28 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
     case OPC_LDC1:
     case OPC_SWC1:
     case OPC_SDC1:
+        mips_ident(ctx,
+            op == OPC_LWC1 ? MIPS_ID_OPC_LWC1 :
+            op == OPC_LDC1 ? MIPS_ID_OPC_LDC1 :
+            op == OPC_SWC1 ? MIPS_ID_OPC_SWC1 :
+            op == OPC_SDC1 ? MIPS_ID_OPC_SDC1 :
+            MIPS_ID_NONE);
         gen_cop1_ldst(ctx, op, rt, rs, imm);
         break;
 
     case OPC_CP1:
+        mips_ident(ctx,
+            op == OPC_CP1 ? MIPS_ID_OPC_CP1 :
+            MIPS_ID_NONE);
         op1 = MASK_CP1(ctx->opcode);
 
         switch (op1) {
         case OPC_MFHC1:
         case OPC_MTHC1:
+            mips_ident(ctx,
+                op1 == OPC_MFHC1 ? MIPS_ID_OPC_MFHC1 :
+                op1 == OPC_MTHC1 ? MIPS_ID_OPC_MTHC1 :
+                MIPS_ID_NONE);
             check_cp1_enabled(ctx);
             check_insn(ctx, ISA_MIPS_R2);
             /* fall through */
@@ -14722,12 +18308,22 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         case OPC_CFC1:
         case OPC_MTC1:
         case OPC_CTC1:
+            mips_ident(ctx,
+                op1 == OPC_MFC1 ? MIPS_ID_OPC_MFC1 :
+                op1 == OPC_CFC1 ? MIPS_ID_OPC_CFC1 :
+                op1 == OPC_MTC1 ? MIPS_ID_OPC_MTC1 :
+                op1 == OPC_CTC1 ? MIPS_ID_OPC_CTC1 :
+                MIPS_ID_NONE);
             check_cp1_enabled(ctx);
             gen_cp1(ctx, op1, rt, rd);
             break;
 #if defined(TARGET_MIPS64)
         case OPC_DMFC1:
         case OPC_DMTC1:
+            mips_ident(ctx,
+                op1 == OPC_DMFC1 ? MIPS_ID_OPC_DMFC1 :
+                op1 == OPC_DMTC1 ? MIPS_ID_OPC_DMTC1 :
+                MIPS_ID_NONE);
             check_cp1_enabled(ctx);
             check_insn(ctx, ISA_MIPS3);
             check_mips_64(ctx);
@@ -14735,6 +18331,9 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
             break;
 #endif
         case OPC_BC1EQZ: /* OPC_BC1ANY2 */
+            mips_ident(ctx,
+                op1 == OPC_BC1EQZ ? MIPS_ID_OPC_BC1EQZ :
+                MIPS_ID_NONE);
             check_cp1_enabled(ctx);
             if (ctx->insn_flags & ISA_MIPS_R6) {
                 /* OPC_BC1EQZ */
@@ -14751,12 +18350,18 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
             }
             break;
         case OPC_BC1NEZ:
+            mips_ident(ctx,
+                op1 == OPC_BC1NEZ ? MIPS_ID_OPC_BC1NEZ :
+                MIPS_ID_NONE);
             check_cp1_enabled(ctx);
             check_insn(ctx, ISA_MIPS_R6);
             gen_compute_branch1_r6(ctx, MASK_CP1(ctx->opcode),
                                    rt, imm << 2, 4);
             break;
         case OPC_BC1ANY4:
+            mips_ident(ctx,
+                op1 == OPC_BC1ANY4 ? MIPS_ID_OPC_BC1ANY4 :
+                MIPS_ID_NONE);
             check_cp1_enabled(ctx);
             check_insn_opc_removed(ctx, ISA_MIPS_R6);
             check_cop1x(ctx);
@@ -14765,22 +18370,36 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
             }
             /* fall through */
         case OPC_BC1:
+            mips_ident(ctx,
+                op1 == OPC_BC1 ? MIPS_ID_OPC_BC1 :
+                MIPS_ID_NONE);
             check_cp1_enabled(ctx);
             check_insn_opc_removed(ctx, ISA_MIPS_R6);
             gen_compute_branch1(ctx, MASK_BC1(ctx->opcode),
                                 (rt >> 2) & 0x7, imm << 2);
             break;
         case OPC_PS_FMT:
+            mips_ident(ctx,
+                op1 == OPC_PS_FMT ? MIPS_ID_OPC_PS_FMT :
+                MIPS_ID_NONE);
             check_ps(ctx);
             /* fall through */
         case OPC_S_FMT:
         case OPC_D_FMT:
+            mips_ident(ctx,
+                op1 == OPC_S_FMT ? MIPS_ID_OPC_S_FMT :
+                op1 == OPC_D_FMT ? MIPS_ID_OPC_D_FMT :
+                MIPS_ID_NONE);
             check_cp1_enabled(ctx);
             gen_farith(ctx, ctx->opcode & FOP(0x3f, 0x1f), rt, rd, sa,
                        (imm >> 8) & 0x7);
             break;
         case OPC_W_FMT:
         case OPC_L_FMT:
+            mips_ident(ctx,
+                op1 == OPC_W_FMT ? MIPS_ID_OPC_W_FMT :
+                op1 == OPC_L_FMT ? MIPS_ID_OPC_L_FMT :
+                MIPS_ID_NONE);
         {
             int r6_op = ctx->opcode & FOP(0x3f, 0x1f);
             check_cp1_enabled(ctx);
@@ -14808,6 +18427,34 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
                 case R6_OPC_CMP_SOR_S:
                 case R6_OPC_CMP_SUNE_S:
                 case R6_OPC_CMP_SNE_S:
+                    mips_ident(ctx,
+                        r6_op == R6_OPC_CMP_AF_S ? MIPS_ID_R6_OPC_CMP_AF_S :
+                        r6_op == R6_OPC_CMP_UN_S ? MIPS_ID_R6_OPC_CMP_UN_S :
+                        r6_op == R6_OPC_CMP_EQ_S ? MIPS_ID_R6_OPC_CMP_EQ_S :
+                        r6_op == R6_OPC_CMP_UEQ_S ? MIPS_ID_R6_OPC_CMP_UEQ_S :
+                        r6_op == R6_OPC_CMP_LT_S ? MIPS_ID_R6_OPC_CMP_LT_S :
+                        r6_op == R6_OPC_CMP_ULT_S ? MIPS_ID_R6_OPC_CMP_ULT_S :
+                        r6_op == R6_OPC_CMP_LE_S ? MIPS_ID_R6_OPC_CMP_LE_S :
+                        r6_op == R6_OPC_CMP_ULE_S ? MIPS_ID_R6_OPC_CMP_ULE_S :
+                        r6_op == R6_OPC_CMP_SAF_S ? MIPS_ID_R6_OPC_CMP_SAF_S :
+                        r6_op == R6_OPC_CMP_SUN_S ? MIPS_ID_R6_OPC_CMP_SUN_S :
+                        r6_op == R6_OPC_CMP_SEQ_S ? MIPS_ID_R6_OPC_CMP_SEQ_S :
+                        r6_op == R6_OPC_CMP_SEUQ_S ?
+                            MIPS_ID_R6_OPC_CMP_SEUQ_S :
+                        r6_op == R6_OPC_CMP_SLT_S ? MIPS_ID_R6_OPC_CMP_SLT_S :
+                        r6_op == R6_OPC_CMP_SULT_S ?
+                            MIPS_ID_R6_OPC_CMP_SULT_S :
+                        r6_op == R6_OPC_CMP_SLE_S ? MIPS_ID_R6_OPC_CMP_SLE_S :
+                        r6_op == R6_OPC_CMP_SULE_S ?
+                            MIPS_ID_R6_OPC_CMP_SULE_S :
+                        r6_op == R6_OPC_CMP_OR_S ? MIPS_ID_R6_OPC_CMP_OR_S :
+                        r6_op == R6_OPC_CMP_UNE_S ? MIPS_ID_R6_OPC_CMP_UNE_S :
+                        r6_op == R6_OPC_CMP_NE_S ? MIPS_ID_R6_OPC_CMP_NE_S :
+                        r6_op == R6_OPC_CMP_SOR_S ? MIPS_ID_R6_OPC_CMP_SOR_S :
+                        r6_op == R6_OPC_CMP_SUNE_S ?
+                            MIPS_ID_R6_OPC_CMP_SUNE_S :
+                        r6_op == R6_OPC_CMP_SNE_S ? MIPS_ID_R6_OPC_CMP_SNE_S :
+                        MIPS_ID_NONE);
                     gen_r6_cmp_s(ctx, ctx->opcode & 0x1f, rt, rd, sa);
                     break;
                 case R6_OPC_CMP_AF_D:
@@ -14832,6 +18479,34 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
                 case R6_OPC_CMP_SOR_D:
                 case R6_OPC_CMP_SUNE_D:
                 case R6_OPC_CMP_SNE_D:
+                    mips_ident(ctx,
+                        r6_op == R6_OPC_CMP_AF_D ? MIPS_ID_R6_OPC_CMP_AF_D :
+                        r6_op == R6_OPC_CMP_UN_D ? MIPS_ID_R6_OPC_CMP_UN_D :
+                        r6_op == R6_OPC_CMP_EQ_D ? MIPS_ID_R6_OPC_CMP_EQ_D :
+                        r6_op == R6_OPC_CMP_UEQ_D ? MIPS_ID_R6_OPC_CMP_UEQ_D :
+                        r6_op == R6_OPC_CMP_LT_D ? MIPS_ID_R6_OPC_CMP_LT_D :
+                        r6_op == R6_OPC_CMP_ULT_D ? MIPS_ID_R6_OPC_CMP_ULT_D :
+                        r6_op == R6_OPC_CMP_LE_D ? MIPS_ID_R6_OPC_CMP_LE_D :
+                        r6_op == R6_OPC_CMP_ULE_D ? MIPS_ID_R6_OPC_CMP_ULE_D :
+                        r6_op == R6_OPC_CMP_SAF_D ? MIPS_ID_R6_OPC_CMP_SAF_D :
+                        r6_op == R6_OPC_CMP_SUN_D ? MIPS_ID_R6_OPC_CMP_SUN_D :
+                        r6_op == R6_OPC_CMP_SEQ_D ? MIPS_ID_R6_OPC_CMP_SEQ_D :
+                        r6_op == R6_OPC_CMP_SEUQ_D ?
+                            MIPS_ID_R6_OPC_CMP_SEUQ_D :
+                        r6_op == R6_OPC_CMP_SLT_D ? MIPS_ID_R6_OPC_CMP_SLT_D :
+                        r6_op == R6_OPC_CMP_SULT_D ?
+                            MIPS_ID_R6_OPC_CMP_SULT_D :
+                        r6_op == R6_OPC_CMP_SLE_D ? MIPS_ID_R6_OPC_CMP_SLE_D :
+                        r6_op == R6_OPC_CMP_SULE_D ?
+                            MIPS_ID_R6_OPC_CMP_SULE_D :
+                        r6_op == R6_OPC_CMP_OR_D ? MIPS_ID_R6_OPC_CMP_OR_D :
+                        r6_op == R6_OPC_CMP_UNE_D ? MIPS_ID_R6_OPC_CMP_UNE_D :
+                        r6_op == R6_OPC_CMP_NE_D ? MIPS_ID_R6_OPC_CMP_NE_D :
+                        r6_op == R6_OPC_CMP_SOR_D ? MIPS_ID_R6_OPC_CMP_SOR_D :
+                        r6_op == R6_OPC_CMP_SUNE_D ?
+                            MIPS_ID_R6_OPC_CMP_SUNE_D :
+                        r6_op == R6_OPC_CMP_SNE_D ? MIPS_ID_R6_OPC_CMP_SNE_D :
+                        MIPS_ID_NONE);
                     gen_r6_cmp_d(ctx, ctx->opcode & 0x1f, rt, rd, sa);
                     break;
                 default:
@@ -14856,6 +18531,10 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
     /* Compact branches [R6] and COP2 [non-R6] */
     case OPC_BC: /* OPC_LWC2 */
     case OPC_BALC: /* OPC_SWC2 */
+        mips_ident(ctx,
+            op == OPC_BC ? MIPS_ID_OPC_BC :
+            op == OPC_BALC ? MIPS_ID_OPC_BALC :
+            MIPS_ID_NONE);
         if (ctx->insn_flags & ISA_MIPS_R6) {
             /* OPC_BC, OPC_BALC */
             gen_compute_compact_branch(ctx, op, 0, 0,
@@ -14870,6 +18549,10 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         break;
     case OPC_BEQZC: /* OPC_JIC, OPC_LDC2 */
     case OPC_BNEZC: /* OPC_JIALC, OPC_SDC2 */
+        mips_ident(ctx,
+            op == OPC_BEQZC ? MIPS_ID_OPC_BEQZC :
+            op == OPC_BNEZC ? MIPS_ID_OPC_BNEZC :
+            MIPS_ID_NONE);
         if (ctx->insn_flags & ISA_MIPS_R6) {
             if (rs != 0) {
                 /* OPC_BEQZC, OPC_BNEZC */
@@ -14888,32 +18571,54 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case OPC_CP2:
+        mips_ident(ctx,
+            op == OPC_CP2 ? MIPS_ID_OPC_CP2 :
+            MIPS_ID_NONE);
         check_insn(ctx, ASE_LMMI);
         /* Note that these instructions use different fields.  */
         gen_loongson_multimedia(ctx, sa, rd, rt);
         break;
 
     case OPC_CP3:
+        mips_ident(ctx,
+            op == OPC_CP3 ? MIPS_ID_OPC_CP3 :
+            MIPS_ID_NONE);
         if (ctx->CP0_Config1 & (1 << CP0C1_FP)) {
             check_cp1_enabled(ctx);
             op1 = MASK_CP3(ctx->opcode);
             switch (op1) {
             case OPC_LUXC1:
             case OPC_SUXC1:
+                mips_ident(ctx,
+                    op1 == OPC_LUXC1 ? MIPS_ID_OPC_LUXC1 :
+                    op1 == OPC_SUXC1 ? MIPS_ID_OPC_SUXC1 :
+                    MIPS_ID_NONE);
                 check_insn(ctx, ISA_MIPS5 | ISA_MIPS_R2);
                 /* Fallthrough */
             case OPC_LWXC1:
             case OPC_LDXC1:
             case OPC_SWXC1:
             case OPC_SDXC1:
+                mips_ident(ctx,
+                    op1 == OPC_LWXC1 ? MIPS_ID_OPC_LWXC1 :
+                    op1 == OPC_LDXC1 ? MIPS_ID_OPC_LDXC1 :
+                    op1 == OPC_SWXC1 ? MIPS_ID_OPC_SWXC1 :
+                    op1 == OPC_SDXC1 ? MIPS_ID_OPC_SDXC1 :
+                    MIPS_ID_NONE);
                 check_insn(ctx, ISA_MIPS4 | ISA_MIPS_R2);
                 gen_flt3_ldst(ctx, op1, sa, rd, rs, rt);
                 break;
             case OPC_PREFX:
+                mips_ident(ctx,
+                    op1 == OPC_PREFX ? MIPS_ID_OPC_PREFX :
+                    MIPS_ID_NONE);
                 check_insn(ctx, ISA_MIPS4 | ISA_MIPS_R2);
                 /* Treat as NOP. */
                 break;
             case OPC_ALNV_PS:
+                mips_ident(ctx,
+                    op1 == OPC_ALNV_PS ? MIPS_ID_OPC_ALNV_PS :
+                    MIPS_ID_NONE);
                 check_insn(ctx, ISA_MIPS5 | ISA_MIPS_R2);
                 /* Fallthrough */
             case OPC_MADD_S:
@@ -14928,6 +18633,20 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
             case OPC_NMSUB_S:
             case OPC_NMSUB_D:
             case OPC_NMSUB_PS:
+                mips_ident(ctx,
+                    op1 == OPC_MADD_S ? MIPS_ID_OPC_MADD_S :
+                    op1 == OPC_MADD_D ? MIPS_ID_OPC_MADD_D :
+                    op1 == OPC_MADD_PS ? MIPS_ID_OPC_MADD_PS :
+                    op1 == OPC_MSUB_S ? MIPS_ID_OPC_MSUB_S :
+                    op1 == OPC_MSUB_D ? MIPS_ID_OPC_MSUB_D :
+                    op1 == OPC_MSUB_PS ? MIPS_ID_OPC_MSUB_PS :
+                    op1 == OPC_NMADD_S ? MIPS_ID_OPC_NMADD_S :
+                    op1 == OPC_NMADD_D ? MIPS_ID_OPC_NMADD_D :
+                    op1 == OPC_NMADD_PS ? MIPS_ID_OPC_NMADD_PS :
+                    op1 == OPC_NMSUB_S ? MIPS_ID_OPC_NMSUB_S :
+                    op1 == OPC_NMSUB_D ? MIPS_ID_OPC_NMSUB_D :
+                    op1 == OPC_NMSUB_PS ? MIPS_ID_OPC_NMSUB_PS :
+                    MIPS_ID_NONE);
                 check_insn(ctx, ISA_MIPS4 | ISA_MIPS_R2);
                 gen_flt3_arith(ctx, op1, sa, rs, rd, rt);
                 break;
@@ -14944,6 +18663,9 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
 #if defined(TARGET_MIPS64)
     /* MIPS64 opcodes */
     case OPC_LLD:
+        mips_ident(ctx,
+            op == OPC_LLD ? MIPS_ID_OPC_LLD :
+            MIPS_ID_NONE);
         if (ctx->insn_flags & INSN_R5900) {
             check_insn_opc_user_only(ctx, INSN_R5900);
         }
@@ -14952,6 +18674,12 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
     case OPC_LDR:
     case OPC_LWU:
     case OPC_LD:
+        mips_ident(ctx,
+            op == OPC_LDL ? MIPS_ID_OPC_LDL :
+            op == OPC_LDR ? MIPS_ID_OPC_LDR :
+            op == OPC_LWU ? MIPS_ID_OPC_LWU :
+            op == OPC_LD ? MIPS_ID_OPC_LD :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS3);
         check_mips_64(ctx);
         gen_ld(ctx, op, rt, rs, imm);
@@ -14959,11 +18687,19 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
     case OPC_SDL:
     case OPC_SDR:
     case OPC_SD:
+        mips_ident(ctx,
+            op == OPC_SDL ? MIPS_ID_OPC_SDL :
+            op == OPC_SDR ? MIPS_ID_OPC_SDR :
+            op == OPC_SD ? MIPS_ID_OPC_SD :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS3);
         check_mips_64(ctx);
         gen_st(ctx, op, rt, rs, imm);
         break;
     case OPC_SCD:
+        mips_ident(ctx,
+            op == OPC_SCD ? MIPS_ID_OPC_SCD :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS3);
         if (ctx->insn_flags & INSN_R5900) {
             check_insn_opc_user_only(ctx, INSN_R5900);
@@ -14972,6 +18708,9 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         gen_st_cond(ctx, rt, rs, imm, mo_endian(ctx) | MO_UQ, false);
         break;
     case OPC_BNVC: /* OPC_BNEZALC, OPC_BNEC, OPC_DADDI */
+        mips_ident(ctx,
+            op == OPC_BNVC ? MIPS_ID_OPC_BNVC :
+            MIPS_ID_NONE);
         if (ctx->insn_flags & ISA_MIPS_R6) {
             /* OPC_BNVC, OPC_BNEZALC, OPC_BNEC */
             gen_compute_compact_branch(ctx, op, rs, rt, imm << 2);
@@ -14983,12 +18722,18 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case OPC_DADDIU:
+        mips_ident(ctx,
+            op == OPC_DADDIU ? MIPS_ID_OPC_DADDIU :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS3);
         check_mips_64(ctx);
         gen_arith_imm(ctx, op, rt, rs, imm);
         break;
 #else
     case OPC_BNVC: /* OPC_BNEZALC, OPC_BNEC */
+        mips_ident(ctx,
+            op == OPC_BNVC ? MIPS_ID_OPC_BNVC :
+            MIPS_ID_NONE);
         if (ctx->insn_flags & ISA_MIPS_R6) {
             gen_compute_compact_branch(ctx, op, rs, rt, imm << 2);
         } else {
@@ -14998,6 +18743,9 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         break;
 #endif
     case OPC_DAUI: /* OPC_JALX */
+        mips_ident(ctx,
+            op == OPC_DAUI ? MIPS_ID_OPC_DAUI :
+            MIPS_ID_NONE);
         if (ctx->insn_flags & ISA_MIPS_R6) {
 #if defined(TARGET_MIPS64)
             /* OPC_DAUI */
@@ -15021,9 +18769,15 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case OPC_MDMX:
+        mips_ident(ctx,
+            op == OPC_MDMX ? MIPS_ID_OPC_MDMX :
+            MIPS_ID_NONE);
         /* MDMX: Not implemented. */
         break;
     case OPC_PCREL:
+        mips_ident(ctx,
+            op == OPC_PCREL ? MIPS_ID_OPC_PCREL :
+            MIPS_ID_NONE);
         check_insn(ctx, ISA_MIPS_R6);
         gen_pcrel(ctx, ctx->opcode, ctx->base.pc_next, rs);
         break;
@@ -15172,6 +18926,7 @@ static void mips_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     int is_slot;
 
     is_slot = ctx->hflags & MIPS_HFLAG_BMASK;
+    ctx->decode_ident = MIPS_ID_NONE;
     if (ctx->insn_flags & ISA_NANOMIPS32) {
         ctx->opcode = translator_lduw(env, &ctx->base, ctx->base.pc_next);
         insn_bytes = decode_isa_nanomips(env, ctx);
@@ -15179,6 +18934,19 @@ static void mips_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
         ctx->opcode = translator_ldl(env, &ctx->base, ctx->base.pc_next);
         insn_bytes = 4;
         decode_opc(env, ctx);
+        /*
+         * Published for the base ISA only.  The microMIPS, MIPS16e and
+         * nanoMIPS decoders reach the same generators by handing them a
+         * BASE-ISA opcode constant -- gen_arith(ctx, OPC_ADDU, ...) for
+         * microMIPS ADDU16, and hundreds more sites like it -- so a row
+         * chosen inside a generator on those paths names the base-ISA
+         * encoding and not the instruction that was decoded.  Those
+         * decoders have their own case labels and are their own export;
+         * until that export exists they publish nothing, which is the
+         * honest answer rather than a base-ISA name for a 16-bit
+         * encoding.
+         */
+        mips_ident_publish(ctx);
     } else if (ctx->insn_flags & ASE_MICROMIPS) {
         ctx->opcode = translator_lduw(env, &ctx->base, ctx->base.pc_next);
         insn_bytes = decode_isa_micromips(env, ctx);

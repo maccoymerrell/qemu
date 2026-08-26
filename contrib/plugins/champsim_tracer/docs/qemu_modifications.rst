@@ -589,6 +589,86 @@ i386: ``target/i386/tcg/decode-new.h`` and ``decode-new.c.inc``
    accounted for 7 of 265,000 translated instructions on the census
    workload.
 
+MIPS: ``target/mips/tcg/translate.c``, ``translate.h``,
+``translate_ident.c.inc``, ``scripts/mips_ident_instrument.py``
+
+   MIPS is the target where the identity is real but decodetree cannot
+   reach it.  All eight ``target/mips/tcg/*.decode`` files describe
+   vendor extensions — MSA, Octeon, TX79, VR54xx, Godson2, LCSR, rel6,
+   loong-ext — and the MIPS32/64 base ISA is decoded by a nest of
+   hand-written ``switch`` statements carrying 1,599 opcode case
+   labels.  The identity is the ``case OPC_*`` label the switch
+   dispatched on.
+
+   ``scripts/mips_ident_instrument.py`` states it in the source,
+   mechanically.  It emits ``translate_ident.c.inc`` — one row per
+   distinct opcode enumerator, named ``translate_mips/<OPC>`` and
+   keyed by the FNV-1a 32 of that name, the derivation
+   ``scripts/decodetree.py`` uses — and rewrites ``translate.c`` to
+   plant one ``mips_ident()`` selection after each group of opcode
+   labels.  The script is idempotent: it strips its own previous
+   output before re-emitting, so re-running it on an instrumented tree
+   reproduces that tree byte for byte.
+
+   **The selection reads the switch's own controlling expression.**  A
+   case group covering several labels therefore states which label it
+   committed to, and — because the selection ends in ``MIPS_ID_NONE``
+   rather than assuming the value is one of its labels — a fallthrough
+   from an earlier group into a later one selects nothing instead of
+   selecting the later group's first label.  ``OPC_LLD`` falling
+   through into the ``OPC_LDL`` / ``OPC_LDR`` / ``OPC_LWU`` / ``OPC_LD``
+   group keeps its own identity.
+
+   Where a preprocessor conditional splits a group — a label that
+   exists only under ``TARGET_MIPS64`` beside one that always exists —
+   the group is split into runs sharing one preprocessor context and
+   each run gets its own selection, compiled exactly where its labels
+   are.  The ``QEMU_FALLTHROUGH`` that then becomes necessary is placed
+   on the *more guarded* side of the directive, because a marker on the
+   less guarded side is left standing in front of ordinary code in the
+   build where the guard is false.
+
+   The row is held in ``DisasContext::decode_ident`` and published once
+   at the end of the instruction rather than at the moment it is
+   chosen.  Two properties of this decoder require that.  The decode is
+   nested — major opcode, then decode function, then sub-opcode, then
+   generator — so several labels are committed to for one instruction
+   and the innermost is the identity.  And a MIPS availability check
+   does not decline the way a decodetree ``trans_`` function declines:
+   ``check_insn()`` and its siblings generate the exception and
+   translation *continues*, emitting dead code from labels further in.
+   ``mips_ident_fault()``, called from ``generate_exception_err()`` and
+   ``generate_exception()`` for ``EXCP_RI``, ``EXCP_CpU``,
+   ``EXCP_DSPDIS`` and ``EXCP_MSADIS``, poisons the slot instead, and
+   the poison is sticky for the rest of the instruction.  Those four
+   are the exceptions raised because an encoding is *unavailable*;
+   ``EXCP_SYSCALL``, ``EXCP_BREAK``, ``EXCP_TRAP``, ``EXCP_OVERFLOW``
+   and ``EXCP_SEMIHOST`` are what a correctly decoded instruction does,
+   and do not poison.
+
+   The export is published for the base ISA only.  The microMIPS,
+   MIPS16e and nanoMIPS decoders reach the same generators by handing
+   them a *base-ISA* opcode constant — ``gen_arith(ctx, OPC_ADDU, ...)``
+   for microMIPS ``ADDU16`` is one of several hundred such sites — so a
+   row chosen inside a generator on those paths would name the base-ISA
+   encoding and not the instruction that was decoded.  Those decoders
+   have their own case labels and are their own export; until it
+   exists they publish nothing, which is the honest answer rather than
+   a 32-bit name for a 16-bit encoding.  The same holds for
+   ``mxu_translate.c``.
+
+   Measured on the four-cell workload that identifies 100% on aarch64
+   and riscv64: mipsel went from 0.000% identified over 42,885
+   translated instructions to 100.000% over 42,539, and 100.000% over a
+   543,166-instruction big-code workload.  The one deliberate exception
+   is the control: the same binary on ``-cpu 4Kc``, which has no FPU,
+   withholds the identity of exactly one instruction, ``sdc1
+   $f20,56(a0)``, which raises ``EXCP_CpU`` and never executes.  Cost,
+   measured the same way the decodetree legs measured theirs — fifteen
+   interleaved A/B repetitions, host instructions retired, run-to-run
+   spread 0.019% — is +21.95 host instructions per translated
+   instruction (+0.340%).
+
 Never-split code sequences
 --------------------------
 

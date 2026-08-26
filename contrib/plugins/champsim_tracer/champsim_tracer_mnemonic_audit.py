@@ -4662,6 +4662,12 @@ QEMU_IDENT_TARGETS: dict[str, str] = {
     "mips": "mipsel-linux-user",
 }
 
+# Decoders a target has that decodetree does not generate.  Their identity
+# tables are in the source tree, in the same row format.
+QEMU_IDENT_HANDWRITTEN = {
+    "mips": ["target/mips/tcg/translate_ident.c.inc"],
+}
+
 IDENT_ROW_RE = re.compile(
     r'^\s*\{\s*(0x[0-9a-f]+)u,\s*"([^"]+)"\s*\},\s*/\*\s*(\S+):(\d+)\s*\*/')
 
@@ -4698,8 +4704,24 @@ def parse_qemu_identities(build_dir: Path, isa: str) -> list[QemuIdent]:
     files = sorted(apdir.glob("decode-*.c.inc"))
     if not files:
         raise SystemExit(f"no generated decoders under {apdir}")
+    # A target's identity universe is not always all decodetree.  The MIPS
+    # base ISA is a hand-written switch, and scripts/mips_ident_instrument.py
+    # emits its rows into the SOURCE tree rather than the build tree,
+    # because the thing it instruments is source.  Reading only the
+    # generated decoders here would report that universe as absent, which
+    # is the exact shape of wrong answer this function exists to refuse.
+    handwritten = QEMU_IDENT_HANDWRITTEN.get(isa, [])
+    extra: list[Path] = []
+    for rel in handwritten:
+        path = ROOT / rel
+        if not path.is_file():
+            raise SystemExit(
+                f"{path} is missing -- {isa} has a hand-written decoder whose "
+                f"identity table has not been generated; run "
+                f"scripts/mips_ident_instrument.py")
+        extra.append(path)
     rows: list[QemuIdent] = []
-    for path in files:
+    for path in files + extra:
         for line in path.read_text().splitlines():
             m = IDENT_ROW_RE.match(line)
             if m:

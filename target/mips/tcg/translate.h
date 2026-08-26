@@ -51,6 +51,15 @@ typedef struct DisasContext {
     bool abs2008;
     bool mi;
     int gi;
+    /*
+     * QEMU's own decode identity for the instruction being translated --
+     * an index into mips_ident_tab[] in translate_ident.c.inc, held here
+     * rather than published as it is chosen because the hand-written
+     * decoder commits to several nested labels per instruction and can
+     * still decide, after committing, that the encoding was unavailable.
+     * See mips_ident() in translate.c.
+     */
+    uint16_t decode_ident;
 } DisasContext;
 
 #define DISAS_STOP       DISAS_TARGET_0

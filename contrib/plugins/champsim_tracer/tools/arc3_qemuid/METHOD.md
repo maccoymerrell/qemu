@@ -24,6 +24,15 @@
     loses, and where the slot is coarser or finer than the
     disassembler's mnemonic.
 
+`quad.py`
+:   The in-tree identity reader's four counters — read, no-identity,
+    missing-row, name-mismatch — recomputed offline from an idprobe TSV
+    and the generated `champsim_tracer_qemu_ident_<isa>.h`.  Those four
+    are a property of the export and the table, not of the tracer, so
+    they can be measured without loading a plugin.  It refuses an empty
+    input and refuses a table it could not parse, and it lists
+    unidentified instructions by opcode rather than counting them.
+
 `REPRODUCE.sh <out-dir> [build-dir]`
 :   Build, run, census, verdict.  Every rc is checked where it is
     produced; a workload cell that produces no records fails the run.
@@ -56,6 +65,30 @@ both measured:
 The second is the one that bites a reader who assumes a mnemonic.  The
 fix is not to invent better names: a name QEMU's source does not use
 would be fabrication.  The slot carries the identity.
+
+## MIPS: the decoder that is not a table
+
+The MIPS32/64 base ISA has no decode table to read.  All eight
+`target/mips/tcg/*.decode` files are vendor extensions, and the base ISA
+is a nest of hand-written `switch` statements carrying 1,599 opcode case
+labels.  Its identity is the `case OPC_*` label the switch dispatched
+on, and `scripts/mips_ident_instrument.py` states it in the source —
+mechanically, idempotently, selecting from the switch's own controlling
+expression so a multi-label case says which label it committed to.
+
+Two properties of that decoder make it read differently from a
+decodetree one, and both are visible in the census:
+
+  * the decode is **nested**, so several labels are committed to per
+    instruction and the innermost is the identity;
+  * an availability check does not decline the way `trans_` declines —
+    it generates the exception and translation continues — so the row
+    is held and published at the end of the instruction, and a
+    reserved-instruction or coprocessor-unusable exception poisons it.
+
+The negative control for that second property is a run of the same
+binary on `-cpu 4Kc`: no FPU, so one `sdc1` raises `EXCP_CpU`, never
+executes, and is the only instruction in the run with no identity.
 
 ## The granularity floor, stated rather than hidden
 

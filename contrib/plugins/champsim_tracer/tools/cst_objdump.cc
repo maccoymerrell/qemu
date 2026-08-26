@@ -105,11 +105,21 @@ constexpr size_t   MAX_RETRIES = 4096;
 
 /* ---- child process plumbing ----------------------------------------- */
 
-/* Run @prog with @args, capture stdout into @out, discard stderr.
+/* Close every descriptor above stderr except @keep.  cst_decode also
+ * runs a decompressor child, and its pipe ends have no business being
+ * duplicated into an unrelated disassembler. */
+void close_inherited_fds(int keep)
+{
+    if (keep > 3) syscall(SYS_close_range, 3u, (unsigned)keep - 1, 0u);
+    syscall(SYS_close_range, (unsigned)(keep < 3 ? 3 : keep + 1), ~0u, 0u);
+}
+
+/* Run @prog with @args, capture stdout into @out, discard stderr;
+ * @keep_fd is the only descriptor above stderr the child inherits.
  * True only when the child exited 0. */
 bool run_capture(const std::string &prog,
                  const std::vector<std::string> &args,
-                 std::string *out)
+                 int keep_fd, std::string *out)
 {
     int pfd[2];
     if (pipe(pfd) != 0) return false;
@@ -124,6 +134,7 @@ bool run_capture(const std::string &prog,
         close(pfd[1]);
         int devnull = open("/dev/null", O_WRONLY);
         if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
+        close_inherited_fds(keep_fd);
 
         std::vector<char *> argv;
         argv.push_back(const_cast<char *>(prog.c_str()));
@@ -174,6 +185,7 @@ public:
     }
 
     const std::string &path() const { return path_; }
+    int                fd()   const { return fd_; }
 
 private:
     bool create()
@@ -337,7 +349,7 @@ size_t ObjdumpRenderer::run_region(const std::vector<Key> &items) const
     args.push_back(blob.path());
 
     std::string out;
-    if (!run_capture(prog_, args, &out)) return items.size();
+    if (!run_capture(prog_, args, blob.fd(), &out)) return items.size();
 
     /* Index the request set so a printed line is only accepted when its
      * address AND its bytes are the ones we asked about. */

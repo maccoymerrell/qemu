@@ -551,32 +551,51 @@ Decode by repeated outer-section unwrapping.
         Mask array sizes all come from the outer template header
         (n_dst, max_dep_loads, max_dep_stores) — the dep block itself
         carries only dep_block_flags + the masks.  HAS_REG and HAS_ADDR
-        are independent: HAS_REG carries refiner-produced output deps
-        (per-dst-reg, per-store-data), HAS_ADDR carries per-memop address
-        deps (which src_regs feed the load/store address — so the
-        consumer can fire each memop without waiting on inputs
-        irrelevant to its address).  See Reference §3 for the bit layout
-        inside each mask.
+        are independent: HAS_REG carries per-dst-reg and per-store-data
+        output deps, HAS_ADDR carries per-memop address deps (which
+        src_regs feed the load/store address — so the consumer can fire
+        each memop without waiting on inputs irrelevant to its address).
+        See Reference §3 for the bit layout inside each mask.
 
-        The two blocks do not have the same SOURCE, and a consumer
-        reasoning about how much to trust each should know which.
-        HAS_REG is derived from the instruction's decoded operands.
-        HAS_ADDR is derived from QEMU's own translation: the address
-        provenance its ``tcg_gen_qemu_ld/st`` emitters stated for each
-        access, which is what the emulator computed rather than what a
-        decoder says the addressing mode names.  The difference is
-        visible on x86-64, where a RIP-relative access carries an EMPTY
-        address mask — ``gen_lea_modrm_1`` materialises that address
-        with ``tcg_gen_movi_tl`` after folding the program counter into
-        the displacement at translation time, so no register feeds it
-        and there is no producer for a consumer to wait on.
+        THE FOUR MASK ARRAYS DO NOT ALL HAVE THE SAME SOURCE, and a
+        consumer reasoning about how much to trust each should know
+        which.  Three of them — ``load_addr_dep``, ``store_addr_dep``
+        and ``store_data_dep`` — come from QEMU's own translation: the
+        address and data provenance its ``tcg_gen_qemu_ld/st`` emitters
+        stated for each access, which is what the emulator computed
+        rather than what a decoder says the operands name.  The fourth,
+        ``dst_dep``, is derived from the instruction's decoded operands.
 
-        A constructor that cannot state an instruction's address
-        dependency in full omits the HAS_ADDR block entirely rather than
-        emitting a mask with a contributor missing from it; the absent
-        block is the all-inputs default, and a short mask would let a
-        consumer issue an access ahead of a producer it actually
-        depends on.
+        Two consequences are visible on the wire.  On x86-64 a
+        RIP-relative access carries an EMPTY address mask —
+        ``gen_lea_modrm_1`` materialises that address with
+        ``tcg_gen_movi_tl`` after folding the program counter into the
+        displacement at translation time, so no register feeds it and
+        there is no producer for a consumer to wait on.  And on the
+        three targets with an architectural ZERO REGISTER, a store of
+        it names that register: ``str xzr, [x0]`` publishes
+        ``store_data_dep = {XZR}``, not an empty set.  QEMU models XZR,
+        x0 and $zero as constants and its op stream therefore says the
+        stored value came from nowhere; the emitters that resolve the
+        operand state the register anyway, because the encoding names it
+        and whether to break so redundant a dependency is a decision for
+        the consumer rather than a property of the machine.
+
+        A constructor that cannot state a family in full does not emit a
+        short mask for it.  For HAS_ADDR it omits the block; for
+        ``store_data_dep``, whose flag is shared with ``dst_dep`` and
+        therefore cannot be dropped alone, it writes the all-inputs
+        default explicitly.  Both reach the same place — the
+        over-approximation a consumer would have assumed — because a
+        mask with a contributor missing would let a consumer issue an
+        access ahead of a producer it actually depends on.
+
+        A published mask of ZERO is a stated fact and not an absent
+        block: it says this store's datum comes from no register, no
+        load slot of this instruction, and no immediate.  Where the
+        datum is the instruction's own immediate the immediate bit is
+        set instead, so an empty mask is reserved for the case where
+        the template carries no immediate slot to point at.
    4.6  Template profile block (consumed from tmpl_section,
         immediately after the last insn descriptor, present only when
         the `CST_FLAG_PROFILE` header bit is set — resolve the
@@ -3568,8 +3587,9 @@ Lane-granularity dependency resolution
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 The dep block above is **coarse** — when an instruction has no
-precise refiner its ``dst_dep`` / ``store_data_dep`` masks are the
-all-to-all over-approximation.  A consumer recovers the precise
+precise refiner its ``dst_dep`` mask, and any ``store_data_dep`` mask
+QEMU's emitters could not state in full, are the all-to-all
+over-approximation.  A consumer recovers the precise
 *per-lane* dependency by intersecting the coarse dep masks with the
 per-operand lane masks and the address masks, all of which are on
 the wire:

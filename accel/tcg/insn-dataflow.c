@@ -85,6 +85,14 @@
  * taken after are marked unnoted rather than silently short.
  */
 #define DF_MAX_ALIAS_NOTES    64
+/*
+ * Zero-register operands stated by an emitter (insn_dataflow_note_zero_reg).
+ * One per zero-register operand an instruction reads, so a TB of nothing but
+ * `sd x0` reaches one per instruction; past the cap the notes stop and a
+ * store taken after is marked unnoted rather than published with its data
+ * operand missing.
+ */
+#define DF_MAX_ZERO_NOTES     256
 #define DF_MAX_HELPER_NOTES   64
 #define DF_MAX_HELPER_ARGS    8
 /*
@@ -115,6 +123,13 @@ typedef struct DfMemopNote {
      */
     unsigned alias_n;
     bool alias_dropped;         /* an alias was lost to overflow before this */
+    /*
+     * The same scoping for the zero-register notes: how many had been stated
+     * when this note was taken.  A store's data temp is looked for only among
+     * those, so an operand read AFTER this access cannot retro-name its data.
+     */
+    unsigned zero_n;
+    bool zero_dropped;          /* a zero note was lost to overflow before this */
 } DfMemopNote;
 
 /*
@@ -259,6 +274,16 @@ struct InsnDataflowScratch {
     unsigned n_alias;
     bool alias_overflow;
 
+    /*
+     * CP-M, the zero-register half: the temps three targets' accessors hand
+     * back in place of a register the encoding named.  Pointers only -- there
+     * is one architectural zero register per target, so which one it is never
+     * has to be carried.
+     */
+    const void *zero[DF_MAX_ZERO_NOTES];
+    unsigned n_zero;
+    bool zero_overflow;
+
     DfHelperNote helper[DF_MAX_HELPER_NOTES];
     unsigned n_helper;
     bool helper_overflow;
@@ -295,6 +320,9 @@ static __thread struct InsnDataflowScratch *df;
 #define df_alias            (df->alias)
 #define df_n_alias          (df->n_alias)
 #define df_alias_overflow   (df->alias_overflow)
+#define df_zero             (df->zero)
+#define df_n_zero           (df->n_zero)
+#define df_zero_overflow    (df->zero_overflow)
 #define df_helper           (df->helper)
 #define df_n_helper         (df->n_helper)
 #define df_helper_overflow  (df->helper_overflow)
@@ -340,7 +368,7 @@ static int df_intern(uint32_t off)
         }
     }
     if (df_nslots >= INSN_DF_MAX_FIELD_SLOTS ||
-        base + df_nslots >= INSN_DF_MEMOP_PROV_BASE) {
+        base + df_nslots >= INSN_DF_ZERO_PROV_BIT) {
         df_slots_overflow = true;
         return -1;
     }
@@ -803,6 +831,8 @@ void insn_dataflow_note_reset(void)
     df_memop_overflow = false;
     df_n_alias = 0;
     df_alias_overflow = false;
+    df_n_zero = 0;
+    df_zero_overflow = false;
     df_n_helper = 0;
     df_helper_overflow = false;
 }
@@ -961,6 +991,28 @@ static void df_prov_add_temps(uint64_t *dst, const void *tsv, unsigned n)
 }
 
 /*
+ * Is any of the @n consecutive temps at @tsv one the emitter named as the
+ * architectural zero register, among the first @scope notes?
+ *
+ * @scope is the count taken when the access's own note was recorded, so a
+ * zero-register operand read by a LATER instruction cannot name this store's
+ * data -- the same discipline the address aliases use, for the same reason.
+ */
+static bool df_zero_reg_temp(const void *tsv, unsigned n, unsigned scope)
+{
+    const TCGTemp *ts = (const TCGTemp *)tsv;
+
+    for (unsigned i = 0; i < n; i++) {
+        for (unsigned k = 0; k < scope && k < df_n_zero; k++) {
+            if (df_zero[k] == (const void *)(ts + i)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/*
  * Attribute one qemu_ld/qemu_st op to the note its emitter left, and for a
  * load return the provenance bit that stands for the value it returned.
  *
@@ -1037,6 +1089,24 @@ static int df_memop_apply(InsnDataflow *d, bool store, unsigned *cursor)
         df_prov_add_temps(m->addr_prov, addr_ts, 1);
         if (store) {
             df_prov_add_temps(m->data_prov, n->val_ts, n->nval);
+            /*
+             * The architectural zero register, if that is what the data
+             * operand was.  Its temp holds a constant, so the walk above put
+             * NOTHING in data_prov and a consumer would read "this value came
+             * from nowhere" for an instruction whose encoding names where it
+             * came from.  See insn_dataflow_note_zero_reg().
+             */
+            if (df_zero_reg_temp(n->val_ts, n->nval, n->zero_n)) {
+                df_bit(m->data_prov, INSN_DF_ZERO_PROV_BIT);
+            } else if (n->zero_dropped) {
+                /*
+                 * A note this access might have needed was lost to overflow,
+                 * so the absence of the bit is not evidence of absence.  Same
+                 * treatment as a dropped address alias: reported unaccounted
+                 * rather than published as though the operand had been read.
+                 */
+                d->memops_unnoted = 1;
+            }
         }
     }
     return store ? -1 : (int)(INSN_DF_MEMOP_PROV_BASE + n->rec);
@@ -1764,7 +1834,49 @@ void insn_dataflow_note_memop(const void *val_ts, unsigned nval,
     df_memop[df_n_memop].rec = -1;
     df_memop[df_n_memop].alias_n = df_n_alias;
     df_memop[df_n_memop].alias_dropped = df_alias_overflow;
+    df_memop[df_n_memop].zero_n = df_n_zero;
+    df_memop[df_n_memop].zero_dropped = df_zero_overflow;
     df_n_memop++;
+}
+
+/*
+ * CP-M, the zero-register half.  See insn_dataflow_note_zero_reg() in the
+ * header for why the note is taken at the accessor and not at the access.
+ *
+ * The list is append-only for the translation and is searched by temp
+ * identity, scoped to the notes taken before the access being resolved.  On
+ * two of the three targets the accessor returns a FRESH temp, so identity is
+ * exact; on RISC-V it returns ctx->zero, which is tcg_constant_tl(0) and
+ * therefore the same temp every constant zero in the block resolves to.  What
+ * that costs is bounded and it is bounded in the harmless direction: the only
+ * way a store's data temp can BE that constant is for its data operand to
+ * have come from get_gpr(ctx, 0), because no RISC-V store takes an immediate
+ * datum.  A wrong attribution here would name a register that is architec-
+ * turally present and never written -- an edge no renaming regfile can stall
+ * on -- and the Capstone shadow in the plugin scores every published row, so
+ * the claim is measured rather than asserted.
+ */
+void insn_dataflow_note_zero_reg(const void *ts)
+{
+    if (df_disabled()) {
+        return;
+    }
+    df_bind();
+    if (df_n_zero >= DF_MAX_ZERO_NOTES) {
+        df_zero_overflow = true;
+        return;
+    }
+    /*
+     * Deduplicated, because the RISC-V accessor returns one shared temp and
+     * an undeduplicated list would fill with copies of it and then overflow,
+     * turning a fact the extractor holds into a refusal it does not need.
+     */
+    for (unsigned i = 0; i < df_n_zero; i++) {
+        if (df_zero[i] == ts) {
+            return;
+        }
+    }
+    df_zero[df_n_zero++] = ts;
 }
 
 /* CP-M, the address half.  See insn_dataflow_note_addr_alias() in the header. */

@@ -528,6 +528,11 @@ bool qemu_plugin_dataflow_prov_memop(unsigned bit, unsigned *slot)
     return insn_dataflow_prov_memop(bit, slot);
 }
 
+bool qemu_plugin_dataflow_prov_zero_reg(unsigned bit)
+{
+    return bit == INSN_DF_ZERO_PROV_BIT;
+}
+
 bool qemu_plugin_insn_dataflow_status(const struct qemu_plugin_tb *tb,
                                       size_t idx,
                                       qemu_plugin_dataflow_status *out)

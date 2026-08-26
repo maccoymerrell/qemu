@@ -10447,7 +10447,7 @@ struct TbScratch {
      * and this is the last scope in which that pair still names anything;
      * consumed one file later, where the src_regs[] slot layout the mask is
      * indexed against finally exists.  See champsim_tracer_qdep.h. */
-    std::unique_ptr<QDepAddr[]>              insn_qdep_addr;
+    std::unique_ptr<QDepInsn[]>              insn_qdep;
     std::unique_ptr<uint8_t[]>               insn_sizes;
     std::unique_ptr<uint8_t[]>               insn_bytes;   /* n * MAX_INSN_BYTES */
     std::unique_ptr<uint32_t[]>              canonical_index;
@@ -10460,7 +10460,7 @@ struct TbScratch {
         : insn_pcs(std::make_unique<uint64_t[]>(n)),
           insn_info(std::make_unique<qemu_plugin_insn_info[]>(n)),
           insn_branch_target_pcs(std::make_unique<uint64_t[]>(n)),
-          insn_qdep_addr(std::make_unique<QDepAddr[]>(n)),
+          insn_qdep(std::make_unique<QDepInsn[]>(n)),
           insn_sizes(std::make_unique<uint8_t[]>(n)),
           insn_bytes(std::make_unique<uint8_t[]>(n * MAX_INSN_BYTES)),
           canonical_index(std::make_unique<uint32_t[]>(n)),
@@ -10747,10 +10747,10 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
      * already taken, since by the time the builder runs the TB handle is
      * gone.
      */
-    QDepAddr *insn_qdep_addr = scratch.insn_qdep_addr.get();
+    QDepInsn *insn_qdep = scratch.insn_qdep.get();
     for (uint32_t i = 0; i < raw_n_insns; i++) {
         if (canonical_first[i]) {
-            qdep_note_insn(tb, i, &insn_qdep_addr[canonical_index[i]]);
+            qdep_note_insn(tb, i, &insn_qdep[canonical_index[i]]);
         }
     }
 
@@ -10881,7 +10881,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
      * create_tb_template (groups the six parallel per-insn arrays). */
     TbInsnView tb_view = {
         canonical_n_insns, insn_pcs, insn_info, insn_branch_target_pcs,
-        insn_qdep_addr, insn_sizes, insn_bytes,
+        insn_qdep, insn_sizes, insn_bytes,
     };
 
     uint64_t tb_start_pc = insn_pcs[0];

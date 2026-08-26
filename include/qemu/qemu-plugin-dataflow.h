@@ -93,7 +93,7 @@
 
 #include "qemu/qemu-plugin.h"   /* for the plugin API export marker */
 
-#define QEMU_PLUGIN_DATAFLOW_VERSION 2
+#define QEMU_PLUGIN_DATAFLOW_VERSION 3
 
 /*
  * Returned by any set accessor whose instruction could not be extracted in
@@ -318,6 +318,28 @@ unsigned qemu_plugin_insn_memop_data_prov(const struct qemu_plugin_tb *tb,
  */
 QEMU_PLUGIN_API
 bool qemu_plugin_dataflow_prov_memop(unsigned bit, unsigned *slot);
+
+/*
+ * Is this provenance bit the architectural ZERO REGISTER?
+ *
+ * The fourth region of the namespace, and it exists because three of the
+ * four targets have a register that QEMU models as a constant: AArch64's
+ * XZR, RISC-V's x0, MIPS' $zero have no TCG global, so an instruction that
+ * names one as an operand reads, in the op stream, from nothing.  The
+ * emitters that resolve the operand say so instead, and the fact arrives
+ * here as a bit like any other.
+ *
+ * WHAT IT IS NOT: a claim that a value depends on something that can change.
+ * It says the ENCODING named that register, which is what a consumer needs
+ * in order to decide for itself whether to break the dependency.  Deciding
+ * that here would put an emulator optimisation on the wire as a property of
+ * the machine.
+ *
+ * A consumer that does not ask is not misled, on the same rule as the memop
+ * region: a bit it cannot resolve is one it must not attribute to a register.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_dataflow_prov_zero_reg(unsigned bit);
 
 /*
  * Anything the extraction could not represent.

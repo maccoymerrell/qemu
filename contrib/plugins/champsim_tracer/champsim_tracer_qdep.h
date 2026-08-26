@@ -1,37 +1,73 @@
 /*
- * The wire's ADDRESS dependency, taken from the emitter that stated it.
+ * The wire's ADDRESS and STORE-DATA dependencies, from the emitters that
+ * stated them.
  *
  * Author: Maccoy Merrell
  *
  * WHAT THIS IS, and it is not another instrument.  champsim_tracer_irdf.cc
  * READS QEMU's dataflow and scores it against Capstone's; this file makes
- * QEMU's answer THE SOURCE of two of the wire's four dependency families --
- * `load_addr_dep_mask[]` and `store_addr_dep_mask[]`, the HAS_ADDR block of
- * the format's dependency sub-block.  Capstone's answer survives here only
- * as a shadow that is compared and counted; it does not reach the wire.
+ * QEMU's answer THE SOURCE of three of the wire's four dependency families:
  *
- * WHY THE ADDRESS FAMILIES AND NOT ALL FOUR.  Because these are the two
- * that were measured ready, and the measurement is the reason rather than
- * the decoration.  On the four-ISA workload at the tip, QEMU's emitter-
- * stated address provenance and the Capstone operand walk agreed on
- * 32,632 of 32,632 scored accesses -- x86_64 9,256, aarch64 6,618,
- * riscv64 8,431, mipsel 8,327, zero disagreements on any ISA.  Two
- * independent derivations of one fact that agree everywhere both can speak
- * is the condition under which changing which one feeds the wire is a
- * change of SOURCE and not a change of CONTENT.  The store-DATA family is
- * not in that condition (575 rows disagree, all of them one signature) and
- * is deliberately left where it is; a half-flipped family is worse than an
- * unflipped one.
+ *   load_addr_dep_mask[]   the format's HAS_ADDR block
+ *   store_addr_dep_mask[]  the format's HAS_ADDR block
+ *   store_data_dep_mask[]  half of the format's HAS_REG block
+ *
+ * Capstone's answer survives here only as a shadow that is compared and
+ * counted; it does not reach the wire.  The fourth family, `dst_dep_mask[]`,
+ * is not flipped and is still the refiners' -- see "the HAS_REG flag is
+ * shared" below for what that costs and why nothing is faked to hide it.
+ *
+ * WHY THE ADDRESS FAMILIES WENT FIRST.  Because they were the two measured
+ * ready, and the measurement was the reason rather than the decoration.  On
+ * the four-ISA workload the two derivations of the ADDRESS agreed on 32,632
+ * of 32,632 scored accesses, zero disagreements on any ISA -- the condition
+ * under which changing which one feeds the wire is a change of SOURCE and
+ * not of CONTENT.  The store-DATA family was NOT in that condition: 575 rows
+ * disagreed (aarch64 151, riscv64 215, mipsel 209) under exactly one
+ * signature, `ir-stdata-missing:REG_ZERO`, and it was held back for it.
+ *
+ * WHAT DECIDED THE 575, and it is a ruling and not a discovery.  `str xzr,
+ * [x0]` architecturally takes the zero register as its data operand.  QEMU
+ * folds XZR / x0 / $zero to a constant before the store emitter sees it, so
+ * the op stream said the stored value came from nothing.  Under R3 and J2.3
+ * that fold is a QEMU optimisation and not the machine: "the regs exist even
+ * if not consumed", and R7.3 is verbatim "REG_ZERO exists, so it should be
+ * specified.  We should not be dropping reg zero."  The tracer was RIGHT on
+ * all 575 and QEMU's answer was short.  So QEMU's answer was fixed at its
+ * emitter -- insn_dataflow_note_zero_reg(), taken in cpu_reg() /
+ * read_cpu_reg() / get_gpr() / get_gprh() / gen_load_gpr() /
+ * gen_load_gpr_hi(), the one place the register NUMBER is still in hand --
+ * rather than the ruling being worked around from the Capstone side, which
+ * would re-couple exactly what this arc decouples.
  *
  * THE FAILURE DIRECTION, which decides every rule below.  A mask that names
- * FEWER registers than really compute the address tells a consumer it may
- * issue an access before a producer has landed -- it reorders across an
- * edge the machine could not cross.  A mask that is absent tells the
- * consumer nothing and it falls back to the format's own default.  Those
- * are not symmetric, so wherever this extractor cannot state the address in
- * full it publishes NOTHING and counts the instruction.  It never publishes
- * a short mask, and it never silently falls back to the Capstone answer:
- * the fallback is the format default, by name, with a counter behind it.
+ * FEWER registers than really feed an address or a stored value tells a
+ * consumer it may issue before a producer has landed -- it reorders across
+ * an edge the machine could not cross.  A mask that is the format's own
+ * all-inputs default tells the consumer nothing it did not already assume.
+ * Those are not symmetric, so wherever this extractor cannot state a family
+ * IN FULL it publishes the default, by name, and counts the instruction.  It
+ * never publishes a short mask, and it never silently falls back to the
+ * Capstone answer it replaced.
+ *
+ * THE HAS_REG FLAG IS SHARED, and that bounds this flip in a way the address
+ * flip was not bounded.  One wire bit, `CST_DEP_BLOCK_HAS_REG`, governs
+ * `dst_dep[]` AND `store_data_dep[]` together (docs/format.rst).  So:
+ *
+ *   - When the flag is already set, `store_data_dep[]` is overwritten here:
+ *     with QEMU's mask when QEMU can state it, and otherwise with the
+ *     all-inputs default written out explicitly.  No Capstone value survives
+ *     in that field.
+ *   - When the flag is CLEAR, the field is not on the wire at all and the
+ *     consumer is already at the default.  Nothing is published and nothing
+ *     needs to be: there is no Capstone answer there to displace.
+ *
+ * What is NOT done is setting the flag in order to publish a store-data mask
+ * -- that would force an all-inputs `dst_dep[]` out of a family whose source
+ * has not moved, spending real wire bytes to say what absence already says.
+ * The rows where QEMU could have stated a mask the flag left unpublished are
+ * COUNTED and reported, so the size of that choice is a number rather than
+ * an argument.
  */
 #ifndef CHAMPSIM_TRACER_QDEP_H
 #define CHAMPSIM_TRACER_QDEP_H
@@ -44,15 +80,21 @@ struct qemu_plugin_tb;
 struct InsnFields;
 
 /*
- * How many distinct generic registers one access's address may depend on
- * before this extractor gives up on stating it.  Base + index + segment is
- * three on the widest addressing mode any of the four targets has; the
- * headroom is there so that a form nobody enumerated is REFUSED and counted
- * rather than silently truncated into a short mask.
+ * How many distinct generic registers one access's address -- or one store's
+ * datum -- may depend on before this extractor gives up on stating it.
+ * Base + index + segment is three on the widest addressing mode any of the
+ * four targets has, and a 128-bit store's datum is two halves; the headroom
+ * is there so that a form nobody enumerated is REFUSED and counted rather
+ * than silently truncated into a short mask.
  */
 #define QDEP_MAX_ADDR_REGS 8
 
-/* Why an instruction's address block is what it is.  Exactly one applies. */
+/* Why an instruction's dependency block is what it is.  Exactly one applies
+ * per family.  The address family cannot reach QDEP_R_EMU_MONITOR (R9's
+ * alias note already substitutes the guest register there); the data family
+ * cannot reach QDEP_R_UNREPRESENTABLE for a load-data bit, because a store's
+ * datum genuinely may be a value this same instruction loaded and the
+ * HAS_REG layout HAS load-data slots to say so. */
 enum QDepState : uint8_t {
     QDEP_NONE = 0,       /* not extracted (no dataflow ABI, or no accesses) */
     QDEP_OK,             /* QEMU stated it; the masks below are the wire's */
@@ -62,14 +104,32 @@ enum QDepState : uint8_t {
     QDEP_R_SHAPE,        /* a direction the tracer claims that QEMU did not emit */
     QDEP_R_FIELD,        /* provenance named env state with no generic word */
     QDEP_R_UNMAPPED,     /* provenance named a global with no generic word */
-    QDEP_R_WIDE,         /* more address regs than QDEP_MAX_ADDR_REGS */
-    QDEP_R_UNREPRESENTABLE, /* a named reg is in no src_regs[] slot to set */
+    QDEP_R_WIDE,         /* more regs than QDEP_MAX_ADDR_REGS */
+    QDEP_R_UNREPRESENTABLE, /* a named reg is in no slot to set */
+    /*
+     * The store-conditional lowerings hand the cmpxchg the reservation
+     * monitor's VALUE half -- cpu_exclusive_val / load_val / llval -- as one
+     * input of the datum it stores, because the datum genuinely is
+     * `movcond(old == cmpv ? newv : old)`.  That is the emulation-artefact
+     * category f46873a738 established for #177, not a decoding error and not
+     * a name this extractor may invent a generic word for.  Counted apart so
+     * it is never read as an ordinary unmapped-global gap.
+     */
+    QDEP_R_EMU_MONITOR,
+    /*
+     * Data family only: QEMU stated the datum in full, but the wire's
+     * HAS_REG flag is clear for this instruction, so there is no field to
+     * write it into.  NOT a refusal -- the consumer is at the same default
+     * it would have reached -- and counted separately so the cost of not
+     * promoting the flag is a measured number.
+     */
+    QDEP_NO_BLOCK,
     QDEP_STATE_COUNT
 };
 
 /*
- * One instruction's emitter-stated address dependency, in the tracer's
- * GENERIC register vocabulary.
+ * One instruction's emitter-stated dependencies, in the tracer's GENERIC
+ * register vocabulary.
  *
  * Generic rather than slot-indexed on purpose: the src_regs[] layout a mask
  * is indexed against does not exist until decode_detail_to_generic() has
@@ -77,41 +137,54 @@ enum QDepState : uint8_t {
  * later.  Carrying names instead of bit positions is what lets the two
  * halves stay where each has the information it needs.
  */
-struct QDepAddr {
-    uint8_t state;
+struct QDepInsn {
+    uint8_t state;          /* address family */
+    uint8_t data_state;     /* store-data family */
     bool    qemu_has_load;
     bool    qemu_has_store;
     uint8_t n_load_regs;
     uint8_t n_store_regs;
+    uint8_t n_data_regs;
     uint8_t load_regs[QDEP_MAX_ADDR_REGS];
     uint8_t store_regs[QDEP_MAX_ADDR_REGS];
+    uint8_t data_regs[QDEP_MAX_ADDR_REGS];
+    /*
+     * Which of THIS instruction's load slots the stored datum came from.
+     * A store's data provenance can name a value the same instruction
+     * loaded -- every read-modify-write does -- and the HAS_REG mask has a
+     * bit per load slot to carry it, so it is kept rather than refused.
+     */
+    uint8_t data_load_slots;
 };
 
 /*
- * Extract one instruction's address provenance at TRANSLATION time, while
- * @tb is live -- the dataflow accessors are keyed on (tb, idx) and there is
- * no later moment at which that pair still names anything.  Always safe to
- * call; writes QDEP_NONE and returns when the ABI handshake never succeeded.
+ * Extract one instruction's address and store-data provenance at TRANSLATION
+ * time, while @tb is live -- the dataflow accessors are keyed on (tb, idx)
+ * and there is no later moment at which that pair still names anything.
+ * Always safe to call; writes QDEP_NONE and returns when the ABI handshake
+ * never succeeded.
  */
 void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx,
-                    QDepAddr *out);
+                    QDepInsn *out);
 
 /*
  * Publish it.  Called from the template builder AFTER the operand walk and
  * any .dep_refine have run, because both of them write the very masks this
- * replaces -- dep_lea removes an address-compute's phantom load slot and
- * the x86 stack refiners add a push's implicit store slot, so a mask
- * written before them would be overwritten by them.
+ * replaces -- dep_lea removes an address-compute's phantom load slot, the
+ * x86 stack refiners add a push's implicit store slot, and every refiner
+ * that sets has_reg_deps writes store_data_dep_mask[] -- so a mask written
+ * before them would be overwritten by them.
  *
- * Compares the Capstone-derived mask it is about to replace and counts the
- * verdict, then either writes QEMU's answer or clears has_addr_deps so the
- * consumer reaches the format's default.
+ * Compares the Capstone-derived masks it is about to replace and counts the
+ * verdict per family, then either writes QEMU's answer or falls back to the
+ * format's default, by name.
  */
-void qdep_apply_addr(InsnFields *f, const QDepAddr *q, const char *mnem);
+void qdep_apply(InsnFields *f, const QDepInsn *q, const char *mnem);
 
 /* Append the census.  Always reported: the number of instructions whose
- * address block fell back to the format default is a fact about the trace,
- * not a debugging aid, and a fact nobody prints is a fact nobody checks. */
+ * dependency block fell back to the format default is a fact about the
+ * trace, not a debugging aid, and a fact nobody prints is a fact nobody
+ * checks. */
 void qdep_report(GString *report);
 
 #endif /* CHAMPSIM_TRACER_QDEP_H */

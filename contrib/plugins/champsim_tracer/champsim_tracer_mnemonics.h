@@ -243,6 +243,15 @@ typedef struct InsnFields {
      * assumes, and cst_decode collapses the two cases to the same
      * rendering (cst_decode_main.cc, `effective`).
      *
+     * THE TWO ARRAYS BELOW NO LONGER SHARE A SOURCE, although they
+     * still share this flag.  @dst_dep_mask is the refiner's.
+     * @store_data_dep_mask is overwritten by qdep_apply() with the data
+     * provenance QEMU's own store emitters stated -- or, where QEMU
+     * could not state it in full, with the all-inputs default written
+     * out, since the shared flag means this array cannot be dropped on
+     * its own.  The refiner's store-data answer never reaches the wire.
+     * See champsim_tracer_qdep.h for the rule and the refusal census.
+     *
      * Bit layout inside each register/load mask:
      *   bits [0, n_src_regs)                          src_reg[i]
      *   bits [n_src_regs, n_src_regs + max_dep_loads) load_data[i - n_src_regs]
@@ -265,7 +274,7 @@ typedef struct InsnFields {
      * stack refiners set store_addr_dep_mask[s] to the SP bit -- and
      * since the address flip the FINAL value comes from neither.  The
      * operand walk and the refiners still run and still write here; then
-     * qdep_apply_addr() overwrites what they wrote with the provenance
+     * qdep_apply() overwrites what they wrote with the provenance
      * QEMU's own tcg_gen_qemu_ld/st emitters stated for each access, or
      * clears has_addr_deps when it cannot state the instruction in full.
      * See champsim_tracer_qdep.h for the rule and the refusal census.

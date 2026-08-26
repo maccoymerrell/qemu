@@ -180,10 +180,11 @@ struct TbInsnView {
     const uint64_t              *pcs;
     const qemu_plugin_insn_info *info;
     const uint64_t              *branch_target_pcs;
-    /* Address provenance as QEMU's emitters stated it, taken while the TB
-     * handle was still live.  The source of the HAS_ADDR dependency block;
-     * see champsim_tracer_qdep.h. */
-    const QDepAddr              *qdep_addr;
+    /* Address and store-data provenance as QEMU's emitters stated it, taken
+     * while the TB handle was still live.  The source of the HAS_ADDR block
+     * and of the HAS_REG block's store_data_dep[]; see
+     * champsim_tracer_qdep.h. */
+    const QDepInsn              *qdep;
     const uint8_t               *sizes;
     const uint8_t               *bytes;   /* n * MAX_INSN_BYTES */
 
@@ -195,7 +196,7 @@ struct TbInsnView {
             pcs + first,
             info + first,
             branch_target_pcs + first,
-            qdep_addr + first,
+            qdep + first,
             sizes + first,
             bytes + (size_t)first * MAX_INSN_BYTES,
         };

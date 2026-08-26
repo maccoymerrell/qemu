@@ -1547,7 +1547,7 @@ BBTemplate *TemplateStore::create_tb_template(
     const uint64_t *insn_pcs                    = insns.pcs;
     const qemu_plugin_insn_info *insn_info      = insns.info;
     const uint64_t *insn_branch_target_pcs      = insns.branch_target_pcs;
-    const QDepAddr *insn_qdep_addr              = insns.qdep_addr;
+    const QDepInsn *insn_qdep              = insns.qdep;
     const uint8_t *insn_sizes                   = insns.sizes;
     const uint8_t *insn_bytes                   = insns.bytes;
 
@@ -1637,16 +1637,18 @@ BBTemplate *TemplateStore::create_tb_template(
                 scratch[i].f.taken_target_pc = insn_branch_target_pcs[i];
             }
             /*
-             * The HAS_ADDR block's source, applied HERE and not inside
+             * The source of the HAS_ADDR block and of the HAS_REG block's
+             * store_data_dep[], applied HERE and not inside
              * decode_detail_to_generic, because the operand walk and every
              * .dep_refine write the very masks this replaces -- dep_lea
-             * drops an address-compute's phantom load slot and the x86
-             * stack refiners add a push's implicit store slot.  A mask
+             * drops an address-compute's phantom load slot, the x86 stack
+             * refiners add a push's implicit store slot, and every refiner
+             * that sets has_reg_deps writes store_data_dep_mask[].  A mask
              * written before them would be overwritten by them, which is a
              * flip that silently does not happen.
              */
-            if (insn_qdep_addr) {
-                qdep_apply_addr(&scratch[i].f, &insn_qdep_addr[i],
+            if (insn_qdep) {
+                qdep_apply(&scratch[i].f, &insn_qdep[i],
                                 insn_info ? insn_info[i].mnemonic : nullptr);
             }
             srcs[i] = &scratch[i].f;

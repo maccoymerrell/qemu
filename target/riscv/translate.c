@@ -333,6 +333,20 @@ static TCGv get_gpr(DisasContext *ctx, int reg_num, DisasExtend ext)
     TCGv t;
 
     if (reg_num == 0) {
+        /*
+         * CP-M, the zero-register half.  x0 has no TCG global -- ctx->zero is
+         * a constant -- so `sd x0, 0(a0)` would state a data provenance of
+         * nothing at all, when the encoding names x0 as its data operand
+         * exactly the way it would name x5.  The register NUMBER is known
+         * here and nowhere later, so this is where it is said.
+         *
+         * ctx->zero is tcg_constant_tl(0), which is shared with every other
+         * constant zero in the block.  What that can cost is bounded: no
+         * RISC-V store takes an immediate datum, so the only way a store's
+         * data temp is this one is for its data operand to have been x0.
+         * Capture only; no op is emitted, altered or suppressed.
+         */
+        insn_dataflow_note_zero_reg(tcgv_tl_temp(ctx->zero));
         return ctx->zero;
     }
 
@@ -366,6 +380,8 @@ static TCGv get_gprh(DisasContext *ctx, int reg_num)
 {
     assert(get_xl(ctx) == MXL_RV128);
     if (reg_num == 0) {
+        /* CP-M, the zero-register half.  See get_gpr() above. */
+        insn_dataflow_note_zero_reg(tcgv_tl_temp(ctx->zero));
         return ctx->zero;
     }
     return cpu_gprh[reg_num];

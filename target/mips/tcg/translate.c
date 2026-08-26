@@ -1195,6 +1195,14 @@ void gen_load_gpr(TCGv t, int reg)
     assert(reg >= 0 && reg <= ARRAY_SIZE(cpu_gpr));
     if (reg == 0) {
         tcg_gen_movi_tl(t, 0);
+        /*
+         * CP-M, the zero-register half.  $zero has no TCG global -- cpu_gpr[0]
+         * is deliberately NULL -- so `sw $zero, 0($a0)` would state a data
+         * provenance of nothing at all, when the encoding names $zero as its
+         * data operand exactly the way it would name $t0.  The register NUMBER
+         * is known here and nowhere later.  Capture only.
+         */
+        insn_dataflow_note_zero_reg(tcgv_tl_temp(t));
     } else {
         tcg_gen_mov_tl(t, cpu_gpr[reg]);
     }
@@ -1214,6 +1222,8 @@ void gen_load_gpr_hi(TCGv_i64 t, int reg)
     assert(reg >= 0 && reg <= ARRAY_SIZE(cpu_gpr_hi));
     if (reg == 0) {
         tcg_gen_movi_i64(t, 0);
+        /* CP-M, the zero-register half.  See gen_load_gpr() above. */
+        insn_dataflow_note_zero_reg(tcgv_i64_temp(t));
     } else {
         tcg_gen_mov_i64(t, cpu_gpr_hi[reg]);
     }

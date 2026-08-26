@@ -531,6 +531,14 @@ TCGv_i64 cpu_reg(DisasContext *s, int reg)
     if (reg == 31) {
         TCGv_i64 t = tcg_temp_new_i64();
         tcg_gen_movi_i64(t, 0);
+        /*
+         * CP-M, the zero-register half.  XZR has no TCG global, so from here
+         * on this temp is indistinguishable from any other constant zero and
+         * `str xzr, [x0]` would state a data provenance of nothing at all.
+         * The register NUMBER is known exactly here and nowhere later, so
+         * this is where it is said.  Capture only.
+         */
+        insn_dataflow_note_zero_reg(tcgv_i64_temp(t));
         return t;
     } else {
         return cpu_X[reg];
@@ -558,6 +566,8 @@ TCGv_i64 read_cpu_reg(DisasContext *s, int reg, int sf)
         }
     } else {
         tcg_gen_movi_i64(v, 0);
+        /* CP-M, the zero-register half.  See cpu_reg() above. */
+        insn_dataflow_note_zero_reg(tcgv_i64_temp(v));
     }
     return v;
 }

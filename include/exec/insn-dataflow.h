@@ -83,6 +83,31 @@
  */
 #define INSN_DF_MEMOP_PROV_BASE  (INSN_DF_MAX_REGS - INSN_DF_MAX_MEMOPS)
 
+/*
+ * The fourth region: the architectural ZERO REGISTER.
+ *
+ * Three of the four targets this tree traces have one -- AArch64's XZR,
+ * RISC-V's x0, MIPS' $zero -- and NONE of them has a TCG global for it.
+ * `cpu_reg(s, 31)`, `get_gpr(ctx, 0, ...)` and `gen_load_gpr(t, 0)` each
+ * hand back a constant, so an instruction that names the zero register as
+ * an operand reads, in the op stream, from nothing at all.
+ *
+ * That is a QEMU optimisation and not the architecture.  `str xzr, [x0]`
+ * stores the value of XZR, which the encoding names as its data operand
+ * exactly the way `str x5, [x0]` names X5; that the value is known at
+ * translation time is the emulator's business and a downstream simulator's,
+ * not this record's.  So the emitters that resolve the operand -- the three
+ * accessors above, where the register NUMBER is still in hand -- say so, and
+ * the fact reaches a consumer as a provenance bit like any other.
+ *
+ * One bit rather than a global index because there is only one such
+ * register per target and it has no env storage to name: a global index
+ * would be a lie about where it lives.  It sits directly below the memop
+ * region so that df_intern() -- which already stops before that region --
+ * needs one bound moved and no new arithmetic.
+ */
+#define INSN_DF_ZERO_PROV_BIT    (INSN_DF_MEMOP_PROV_BASE - 1)
+
 typedef struct InsnDataflowField {
     uint32_t off;
     uint16_t size;
@@ -351,6 +376,38 @@ void insn_dataflow_note_memop(const void *val_ts, unsigned nval,
 void insn_dataflow_note_addr_alias(const void *alias_ts, const void *real_ts);
 
 /*
+ * CP-M, the ZERO-REGISTER half -- an operand QEMU resolves to a constant.
+ *
+ * `str xzr, [x0]`, `sd x0, 0(a0)` and `sw $zero, 0($a0)` all name a register
+ * as the data operand of a store, and all three translators resolve it to a
+ * constant before the store emitter ever sees it:
+ *
+ *   target/arm/tcg/translate-a64.c   cpu_reg(s, 31)      movi 0 into a temp
+ *   target/arm/tcg/translate-a64.c   read_cpu_reg(s, 31) movi 0 into a temp
+ *   target/riscv/translate.c         get_gpr(ctx, 0, _)  ctx->zero
+ *   target/mips/tcg/translate.c      gen_load_gpr(t, 0)  movi 0 into @t
+ *
+ * So the store's data provenance, read off the ops, is EMPTY -- and a
+ * consumer is told the stored value came from nowhere, when the instruction
+ * says where it came from and a renaming regfile has an entry for it.
+ *
+ * The note is taken AT THE ACCESSOR, which is the one place the register
+ * NUMBER is still known: by the time the value reaches tcg_gen_qemu_st_* it
+ * is a temp like any other and no amount of walking recovers which register
+ * it stood for.  @ts is the temp the accessor is about to return.
+ *
+ * It states an operand, not a value.  A consumer that wants to model the
+ * folding away is welcome to -- that is a microarchitectural decision, and
+ * making it here would put the emulator's optimisation on the wire as though
+ * it were the machine.
+ *
+ * @ts is a TCGTemp pointer, void here for the same reason
+ * insn_dataflow_note_memop()'s are.  Capture only; no op is emitted, altered
+ * or suppressed, and a target that never calls this is unaffected.
+ */
+void insn_dataflow_note_zero_reg(const void *ts);
+
+/*
  * CP-H -- the helper choke point.
  *
  * INDEX_op_call is the one op whose arguments do not describe themselves.
@@ -459,6 +516,9 @@ static inline void insn_dataflow_note_memop(const void *val_ts, unsigned nval,
 
 static inline void insn_dataflow_note_addr_alias(const void *alias_ts,
                                                 const void *real_ts)
+{ }
+
+static inline void insn_dataflow_note_zero_reg(const void *ts)
 { }
 
 static inline void insn_dataflow_note_helper(const void *call_op,

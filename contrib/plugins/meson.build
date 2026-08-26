@@ -32,6 +32,7 @@ if get_option('plugins')
       'champsim_tracer/champsim_tracer_wp.cc',
       'champsim_tracer/champsim_tracer_delay.cc',
       'champsim_tracer/champsim_tracer_irdf.cc',
+      'champsim_tracer/champsim_tracer_qdep.cc',
       'champsim_tracer/champsim_tracer_output.cc',
       'champsim_tracer/champsim_tracer_writer.cc',
       'champsim_tracer/champsim_tracer_branch_history.cc',

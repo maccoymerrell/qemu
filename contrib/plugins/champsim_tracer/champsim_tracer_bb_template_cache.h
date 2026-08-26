@@ -40,6 +40,7 @@
 #include <vector>
 
 #include "champsim_tracer.h"
+#include "champsim_tracer_qdep.h"
 
 struct BBTemplateDeleter {
     void operator()(BBTemplate *t) const noexcept;
@@ -169,7 +170,7 @@ struct RevisionSlot {
 
 /*
  * Read-only view of a contiguous run of canonical instructions (a whole TB
- * or a fragment slice).  Groups the six parallel per-insn arrays that
+ * or a fragment slice).  Groups the seven parallel per-insn arrays that
  * describe a translation so they travel together rather than as a
  * six-pointer parameter clump.  Non-owning: the backing arrays must outlive
  * the view.
@@ -179,6 +180,10 @@ struct TbInsnView {
     const uint64_t              *pcs;
     const qemu_plugin_insn_info *info;
     const uint64_t              *branch_target_pcs;
+    /* Address provenance as QEMU's emitters stated it, taken while the TB
+     * handle was still live.  The source of the HAS_ADDR dependency block;
+     * see champsim_tracer_qdep.h. */
+    const QDepAddr              *qdep_addr;
     const uint8_t               *sizes;
     const uint8_t               *bytes;   /* n * MAX_INSN_BYTES */
 
@@ -190,6 +195,7 @@ struct TbInsnView {
             pcs + first,
             info + first,
             branch_target_pcs + first,
+            qdep_addr + first,
             sizes + first,
             bytes + (size_t)first * MAX_INSN_BYTES,
         };

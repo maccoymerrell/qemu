@@ -1722,6 +1722,22 @@ void report_undecodable_block(uint64_t pc);
 uint8_t generic_for_qemu_name(const char *name);
 
 /*
+ * The second stage of that resolution, and it is a MEASUREMENT per entry
+ * rather than a guess -- every fold in it was read off a live namespace
+ * dump on the ISA it applies to.  QEMU's TCG-global spelling and the
+ * tracer's GDB-stub word are the same fact under two names in a handful of
+ * places (x86 cc_*, aarch64 NZCV, riscv64 "x8/s0" vs "fp", aarch64 "lr" vs
+ * "x30", the mipsel accumulator halves); this maps them.  REG_ID_COUNT for
+ * anything it does not name, which includes the x86 segment BASES and the
+ * MPX bounds, left unmapped ON PURPOSE -- inventing a word for a register
+ * the tracer has no concept of would publish a fabrication.
+ *
+ * Shared rather than duplicated: the irdf instrument and the qdep extractor
+ * both need it, and a second copy is a second map to drift.
+ */
+uint8_t fold_nonarch(const char *name);
+
+/*
  * Suppress the unknown-mnemonic warning and its counter for the duration of
  * a decode taken for measurement.  See champsim_tracer_decode.cc.
  */

@@ -552,11 +552,31 @@ Decode by repeated outer-section unwrapping.
         (n_dst, max_dep_loads, max_dep_stores) — the dep block itself
         carries only dep_block_flags + the masks.  HAS_REG and HAS_ADDR
         are independent: HAS_REG carries refiner-produced output deps
-        (per-dst-reg, per-store-data), HAS_ADDR carries walker-produced
-        per-memop address deps (which src_regs feed the load/store
-        address — so the consumer can fire each memop without waiting
-        on inputs irrelevant to its address).  See Reference §3 for
-        the bit layout inside each mask.
+        (per-dst-reg, per-store-data), HAS_ADDR carries per-memop address
+        deps (which src_regs feed the load/store address — so the
+        consumer can fire each memop without waiting on inputs
+        irrelevant to its address).  See Reference §3 for the bit layout
+        inside each mask.
+
+        The two blocks do not have the same SOURCE, and a consumer
+        reasoning about how much to trust each should know which.
+        HAS_REG is derived from the instruction's decoded operands.
+        HAS_ADDR is derived from QEMU's own translation: the address
+        provenance its ``tcg_gen_qemu_ld/st`` emitters stated for each
+        access, which is what the emulator computed rather than what a
+        decoder says the addressing mode names.  The difference is
+        visible on x86-64, where a RIP-relative access carries an EMPTY
+        address mask — ``gen_lea_modrm_1`` materialises that address
+        with ``tcg_gen_movi_tl`` after folding the program counter into
+        the displacement at translation time, so no register feeds it
+        and there is no producer for a consumer to wait on.
+
+        A constructor that cannot state an instruction's address
+        dependency in full omits the HAS_ADDR block entirely rather than
+        emitting a mask with a contributor missing from it; the absent
+        block is the all-inputs default, and a short mask would let a
+        consumer issue an access ahead of a producer it actually
+        depends on.
    4.6  Template profile block (consumed from tmpl_section,
         immediately after the last insn descriptor, present only when
         the `CST_FLAG_PROFILE` header bit is set — resolve the

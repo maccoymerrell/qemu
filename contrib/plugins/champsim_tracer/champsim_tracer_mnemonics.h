@@ -256,9 +256,22 @@ typedef struct InsnFields {
     /*
      * Intra-instruction address dataflow (HAS_ADDR sub-block).
      * Per-memop mask of which template inputs feed its address
-     * computation.  Populated structurally by the operand walker (NOT
-     * .dep_refine).  Addresses compute before any load fires, so the
-     * layout omits load_data slots:
+     * computation.
+     *
+     * SOURCED FROM QEMU, and the sentence this replaces was false twice
+     * over.  It said "populated structurally by the operand walker (NOT
+     * .dep_refine)"; the refiners have always written these masks --
+     * dep_lea drops an address-compute's phantom load slot and the x86
+     * stack refiners set store_addr_dep_mask[s] to the SP bit -- and
+     * since the address flip the FINAL value comes from neither.  The
+     * operand walk and the refiners still run and still write here; then
+     * qdep_apply_addr() overwrites what they wrote with the provenance
+     * QEMU's own tcg_gen_qemu_ld/st emitters stated for each access, or
+     * clears has_addr_deps when it cannot state the instruction in full.
+     * See champsim_tracer_qdep.h for the rule and the refusal census.
+     *
+     * Addresses compute before any load fires, so the layout omits
+     * load_data slots:
      *
      *   bits [0, n_src_regs)        src_reg[i]
      *   bit  n_src_regs             immediate

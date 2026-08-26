@@ -369,6 +369,9 @@ void tally(GHashTable **t, const char *key)
  * Inventing a mapping for a register the tracer has no concept of would
  * score a fabrication as agreement.
  */
+}  /* namespace -- reopened below; fold_nonarch is shared with the qdep TU,
+    * because two copies of a name map are two maps that drift apart. */
+
 uint8_t fold_nonarch(const char *name)
 {
     if (!strcmp(name, "cc_op") || !strcmp(name, "cc_dst") ||
@@ -408,6 +411,8 @@ uint8_t fold_nonarch(const char *name)
     }
     return REG_ID_COUNT;
 }
+
+namespace {
 
 /*
  * Reverse of build_qemu_reg_reverse_index(): a QEMU register name -> id.

@@ -44,6 +44,7 @@
 #include "champsim_tracer_stats.h"
 #include "champsim_tracer_stats_report.h"
 #include "champsim_tracer_irdf.h"
+#include "champsim_tracer_qdep.h"
 #include "champsim_tracer_qemu_ident.h"
 #include "champsim_tracer_trace_segment_manager.h"
 #include "champsim_tracer_wp_thread_state.h"
@@ -10439,6 +10440,12 @@ struct TbScratch {
     std::unique_ptr<uint64_t[]>              insn_pcs;
     std::unique_ptr<qemu_plugin_insn_info[]> insn_info;
     std::unique_ptr<uint64_t[]>              insn_branch_target_pcs;
+    /* Per-canonical-insn address provenance, as QEMU's emitters stated it.
+     * Collected here because the dataflow accessors are keyed on (tb, idx)
+     * and this is the last scope in which that pair still names anything;
+     * consumed one file later, where the src_regs[] slot layout the mask is
+     * indexed against finally exists.  See champsim_tracer_qdep.h. */
+    std::unique_ptr<QDepAddr[]>              insn_qdep_addr;
     std::unique_ptr<uint8_t[]>               insn_sizes;
     std::unique_ptr<uint8_t[]>               insn_bytes;   /* n * MAX_INSN_BYTES */
     std::unique_ptr<uint32_t[]>              canonical_index;
@@ -10451,6 +10458,7 @@ struct TbScratch {
         : insn_pcs(std::make_unique<uint64_t[]>(n)),
           insn_info(std::make_unique<qemu_plugin_insn_info[]>(n)),
           insn_branch_target_pcs(std::make_unique<uint64_t[]>(n)),
+          insn_qdep_addr(std::make_unique<QDepAddr[]>(n)),
           insn_sizes(std::make_unique<uint8_t[]>(n)),
           insn_bytes(std::make_unique<uint8_t[]>(n * MAX_INSN_BYTES)),
           canonical_index(std::make_unique<uint32_t[]>(n)),
@@ -10714,6 +10722,22 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
     }
 
     /*
+     * The address dependency the wire publishes, on the same (tb, idx) pair
+     * and for the same reason -- but this one is NOT optional and NOT an
+     * instrument.  It is the source of the HAS_ADDR block; see
+     * champsim_tracer_qdep.h.  Collected for every canonical instruction so
+     * that a template built from any fragment of this TB finds its record
+     * already taken, since by the time the builder runs the TB handle is
+     * gone.
+     */
+    QDepAddr *insn_qdep_addr = scratch.insn_qdep_addr.get();
+    for (uint32_t i = 0; i < raw_n_insns; i++) {
+        if (canonical_first[i]) {
+            qdep_note_insn(tb, i, &insn_qdep_addr[canonical_index[i]]);
+        }
+    }
+
+    /*
      * The QEMU-identity reader, on the same pair and for the same reason:
      * qemu_plugin_insn_decode_id() is keyed on the insn handle and this is
      * the last point at which the handle still names this instruction.
@@ -10840,7 +10864,7 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
      * create_tb_template (groups the six parallel per-insn arrays). */
     TbInsnView tb_view = {
         canonical_n_insns, insn_pcs, insn_info, insn_branch_target_pcs,
-        insn_sizes, insn_bytes,
+        insn_qdep_addr, insn_sizes, insn_bytes,
     };
 
     uint64_t tb_start_pc = insn_pcs[0];
@@ -11481,6 +11505,7 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
     }
     g_rt_gate.report(report);
     irdf_report(report);
+    qdep_report(report);
     qemu_ident_report(report);
 
     g_mutex_lock(&data_lock);

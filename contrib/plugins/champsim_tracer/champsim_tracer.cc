@@ -11779,11 +11779,22 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
             cfg.window_mode == PluginConfig::WIN_SYMBOL   ? "symbol" :
             cfg.window_mode == PluginConfig::WIN_SIMPOINT ? "simpoint" :
                                                             "the default";
+        /* The second clause needs the article the first one must not have:
+         * "icount is not a valid window" reads correctly and "a icount
+         * window" does not, while "the default" already carries its own
+         * determiner.  One selector cannot serve both slots, so there are
+         * two.  Caught by the four-target system smoke, which printed
+         * "a the default window". */
+        const char *named_a =
+            cfg.window_mode == PluginConfig::WIN_ICOUNT   ? "an icount" :
+            cfg.window_mode == PluginConfig::WIN_SYMBOL   ? "a symbol" :
+            cfg.window_mode == PluginConfig::WIN_SIMPOINT ? "a simpoint" :
+                                                            "the default";
         fprintf(stderr,
             "champsim_tracer: refusing to start — %s is not a valid window "
             "in system mode.\n"
             "  A full-system guest runs many processes through one "
-            "instruction stream, and\n  a %s window is a position on a "
+            "instruction stream, and\n  %s window is a position on a "
             "clock: it cannot say whose instructions\n  it is counting, so "
             "what it captures is not a trace of any one program.\n"
             "  System mode needs a MARKER ANCHOR: the program must execute a "
@@ -11800,7 +11811,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
             "simpoint\n  offsets position the capture on that clock).\n"
             "  Give the workload its markers — compile them in, or inject "
             "them with\n  cst_attach.\n",
-            named, named);
+            named, named_a);
         return -1;
     }
 

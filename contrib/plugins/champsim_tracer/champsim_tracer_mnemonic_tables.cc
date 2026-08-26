@@ -58,6 +58,65 @@ extern "C" {
  * ==================================================================== */
 
 /*
+ * PUBLISH, UNLESS THE ONLY THING THE MASKS SAY IS THE READER'S OWN DEFAULT.
+ *
+ * docs/format.rst: "Absence of ``CST_INSN_FLAG_HAS_DEP_BLOCK`` is the
+ * implicit all-to-all over-approximation."  A refiner whose masks come out
+ * equal to that over-approximation has stated nothing, and the bytes it
+ * spends stating it buy the consumer no edge it did not already have.  That
+ * is what retired dep_all_to_all and the three structured-vector refiners at
+ * 508b474fe2 (cst_runs/p3/arc3/w11/VERDICT.md) -- but retiring a whole ROW
+ * only removed the refiners that were degenerate on EVERY decode.  The same
+ * waste survives inside refiners that are load-bearing in general and
+ * degenerate on a particular shape, which is a property of the decode and
+ * not of the table row:
+ *
+ *     mov %rbx,%rax        rr-form, one input.  "dst[0] depends on
+ *                          src_regs[0]" IS all-inputs.
+ *     mov $1,%rax          ri-form, the immediate is the only input.
+ *     mov 0x404040,%eax    rm-form with an absolute address: no addressing
+ *                          register, so load_data[0] is the only input.
+ *
+ * So the test is made at the point of publication, where the shape is known,
+ * rather than at the point of classification, where it is not.  It is over
+ * EVERY sink because the block is all-or-nothing on the wire: one sink that
+ * narrows earns the block for all of them.
+ *
+ * A refiner that RESHAPES -- dep_lea deleting a phantom load slot, the stack
+ * refiners adding one -- still reshapes.  max_dep_loads / max_dep_stores /
+ * the address masks are published outside the register block, so bailing
+ * here costs the shape nothing and the consumer computes its default over
+ * the shape the refiner left.
+ */
+static bool dep_publish(InsnFields *f)
+{
+    uint64_t all_inputs = 0;
+    for (uint8_t i = 0; i < f->n_src_regs; i++) {
+        all_inputs |= (uint64_t)1 << i;
+    }
+    for (uint8_t i = 0; i < f->max_dep_loads; i++) {
+        all_inputs |= (uint64_t)1 << (f->n_src_regs + i);
+    }
+    if (f->has_immediate) {
+        all_inputs |= (uint64_t)1 << (f->n_src_regs + f->max_dep_loads);
+    }
+
+    for (uint8_t d = 0; d < f->n_dst_regs && d < MAX_DST_REGS; d++) {
+        if (f->dst_dep_mask[d] != all_inputs) {
+            f->has_reg_deps = true;
+            return true;
+        }
+    }
+    for (uint8_t s = 0; s < f->max_dep_stores && s < MAX_STORES; s++) {
+        if (f->store_data_dep_mask[s] != all_inputs) {
+            f->has_reg_deps = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
  * dep_passthrough: single value input flows to a single output —
  * either a register dst or a memory store, with internal dispatch
  * by runtime shape.  Behavior group covers the MOV / load / store
@@ -147,7 +206,7 @@ void dep_lea(const struct qemu_plugin_insn_info *info, InsnFields *f)
         m |= ((uint64_t)1 << f->n_src_regs);
     }
     f->dst_dep_mask[0] = m;
-    f->has_reg_deps = true;
+    dep_publish(f);
 }
 
 /*
@@ -393,7 +452,7 @@ void dep_x86_stack_push(const struct qemu_plugin_insn_info *info,
         f->dst_dep_mask[d] =
             ((int)d == sp_dst) ? sp_dep_mask : all_inputs;
     }
-    f->has_reg_deps = true;
+    dep_publish(f);
 }
 
 /*
@@ -490,7 +549,7 @@ void dep_x86_stack_pop(const struct qemu_plugin_insn_info *info,
             f->dst_dep_mask[d] = all_inputs;
         }
     }
-    f->has_reg_deps = true;
+    dep_publish(f);
 }
 
 void dep_passthrough(const struct qemu_plugin_insn_info *info, InsnFields *f)
@@ -567,7 +626,7 @@ void dep_passthrough(const struct qemu_plugin_insn_info *info, InsnFields *f)
             }
             f->dst_dep_mask[d] = self ? (addr_m | self | wb_imm) : m;
         }
-        f->has_reg_deps = true;
+        dep_publish(f);
         return;
     }
     if (f->n_dst_regs == 1 && f->max_dep_stores == 0) {
@@ -623,7 +682,7 @@ void dep_passthrough(const struct qemu_plugin_insn_info *info, InsnFields *f)
             return;
         }
         f->dst_dep_mask[0] = m;
-        f->has_reg_deps = true;
+        dep_publish(f);
         return;
     }
     if (f->n_dst_regs == 0 && f->max_dep_stores == 1) {
@@ -665,7 +724,7 @@ void dep_passthrough(const struct qemu_plugin_insn_info *info, InsnFields *f)
             return;
         }
         f->store_data_dep_mask[0] = m;
-        f->has_reg_deps = true;
+        dep_publish(f);
         return;
     }
     /* Shape outside this behavior group — bail. */
@@ -722,7 +781,7 @@ void dep_vec_struct_store(const struct qemu_plugin_insn_info *info,
         uint8_t which = vec_src_idx[s / stores_per_src];
         f->store_data_dep_mask[s] = ((uint64_t)1 << which);
     }
-    f->has_reg_deps = true;
+    dep_publish(f);
 }
 
 /*

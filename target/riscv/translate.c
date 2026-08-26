@@ -24,6 +24,7 @@
 #include "exec/helper-proto.h"
 #include "exec/helper-gen.h"
 #include "exec/plugin-gen.h"
+#include "exec/insn-dataflow.h"
 
 #include "exec/translator.h"
 #include "exec/cpu_ldst.h"

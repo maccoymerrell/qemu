@@ -27,6 +27,7 @@
 #include "internal.h"
 #include "exec/helper-proto.h"
 #include "exec/plugin-gen.h"
+#include "exec/insn-dataflow.h"
 #include "exec/translation-block.h"
 #include "semihosting/semihost.h"
 #include "trace.h"
@@ -2232,6 +2233,17 @@ static void gen_st_cond(DisasContext *ctx, int rt, int base, int offset,
     tcg_gen_br(done);
 
     gen_set_label(l1);
+    /*
+     * This label is reached only when addr and cpu_lladdr hold the same
+     * address -- that is what the brcond above tested -- and the cmpxchg
+     * below is handed cpu_lladdr, so the access would state its address
+     * provenance as the LL monitor, which no guest instruction writes,
+     * instead of as the base register.  The equality is proved on the way
+     * in, so it is stated on the way in.
+     */
+    insn_dataflow_note_addr_alias(tcgv_tl_temp(cpu_lladdr),
+                                  tcgv_tl_temp(addr));
+
     /* generate cmpxchg */
     val = tcg_temp_new();
     gen_load_gpr(val, rt);

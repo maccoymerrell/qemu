@@ -20,6 +20,7 @@
 
 #include "exec/exec-all.h"
 #include "exec/plugin-gen.h"
+#include "exec/insn-dataflow.h"
 #include "translate.h"
 #include "translate-a64.h"
 #include "qemu/log.h"
@@ -2970,6 +2971,17 @@ static void gen_store_exclusive(DisasContext *s, int rd, int rt, int rt2,
     /* See AArch64.ExclusiveMonitorsPass() and AArch64.IsExclusiveVA(). */
     clean_addr = clean_data_tbi(s, cpu_reg_sp(s, rn));
     tcg_gen_brcond_i64(TCG_COND_NE, clean_addr, cpu_exclusive_addr, fail_label);
+
+    /*
+     * Past that brcond, clean_addr and cpu_exclusive_addr hold the same
+     * address, and each cmpxchg below is emitted only on this edge.  They
+     * are handed cpu_exclusive_addr, so the access states its address
+     * provenance as the monitor -- a register no guest instruction writes --
+     * instead of as Xn.  The equality has just been proved here, so it is
+     * stated here.
+     */
+    insn_dataflow_note_addr_alias(tcgv_i64_temp(cpu_exclusive_addr),
+                                  tcgv_i64_temp(clean_addr));
 
     /*
      * The write, and any associated faults, only happen if the virtual

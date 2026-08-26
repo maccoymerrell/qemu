@@ -66,6 +66,16 @@ static bool gen_sc(DisasContext *ctx, arg_atomic *a, MemOp mop)
     tcg_gen_brcond_tl(TCG_COND_NE, load_res, src1, l1);
 
     /*
+     * Past that brcond, load_res and src1 hold the same address; the
+     * cmpxchg below is emitted only on this edge.  It is handed load_res,
+     * so the access states its address provenance as the reservation
+     * monitor -- which no guest instruction writes -- instead of as rs1.
+     * The equality has just been proved here, so it is stated here.
+     */
+    insn_dataflow_note_addr_alias(tcgv_tl_temp(load_res),
+                                  tcgv_tl_temp(src1));
+
+    /*
      * Note that the TCG atomic primitives are SC,
      * so we can ignore AQ/RL along this path.
      */

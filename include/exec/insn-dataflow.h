@@ -303,6 +303,54 @@ void insn_dataflow_note_memop(const void *val_ts, unsigned nval,
                               unsigned size, bool is_store);
 
 /*
+ * CP-M, the address half -- an access QEMU routes through a temp of its own.
+ *
+ * Three translators lower store-conditional onto a compare-exchange whose
+ * ADDRESS parameter is the reservation monitor rather than the register the
+ * guest instruction names:
+ *
+ *   target/arm/tcg/translate-a64.c:3008,3027,3045   cpu_exclusive_addr
+ *   target/mips/tcg/translate.c:2238                cpu_lladdr
+ *   target/riscv/insn_trans/trans_rva.c.inc:74      load_res
+ *
+ * So `stxr w2, w0, [x1]` states an address provenance of `exclusive_addr`
+ * and not of x1, and a consumer is handed an address dependency on a
+ * register no guest instruction ever writes -- while the edge a renaming
+ * regfile must actually respect, x1 to this store's address, is absent.  A
+ * short set is the one error direction that costs correctness rather than
+ * accuracy, so it is not left standing.
+ *
+ * The equality is not inferred and not pattern-matched.  Every one of those
+ * three sites is dominated by its own brcond comparing the monitor against
+ * the guest-derived temp, and the access is emitted only on the edge where
+ * they are equal:
+ *
+ *   translate-a64.c:2972   brcond NE clean_addr, cpu_exclusive_addr -> fail
+ *   translate.c:2230       brcond EQ addr,       cpu_lladdr         -> l1
+ *   trans_rva.c.inc:66     brcond NE load_res,   src1               -> l1
+ *
+ * The note is taken on that edge, so the emitter states a fact its own
+ * control flow has just proved: for the accesses that follow, @alias_ts and
+ * @real_ts hold the same address, and @real_ts is the one in the guest's
+ * namespace.  Address provenance is then read off @real_ts.
+ *
+ * It SUBSTITUTES rather than unions.  A monitor is not a register -- the
+ * reservation is a property of the instruction, not of any regfile entry --
+ * so naming it beside the guest register would keep exactly the dependency
+ * this exists to remove.
+ *
+ * Scoped to the accesses emitted after it: each memop note records how many
+ * aliases had been stated when it was taken, and resolution searches only
+ * those, most recent first.  Two store-conditionals in one TB therefore
+ * cannot borrow each other's address.
+ *
+ * @alias_ts and @real_ts are TCGTemp pointers, void here for the same reason
+ * insn_dataflow_note_memop()'s are.  Capture only; no op is emitted, altered
+ * or suppressed, and a target that never calls this is unaffected.
+ */
+void insn_dataflow_note_addr_alias(const void *alias_ts, const void *real_ts);
+
+/*
  * CP-H -- the helper choke point.
  *
  * INDEX_op_call is the one op whose arguments do not describe themselves.
@@ -407,6 +455,10 @@ static inline void insn_dataflow_note_gvec(uint32_t dofs, uint32_t aofs,
 static inline void insn_dataflow_note_memop(const void *val_ts, unsigned nval,
                                             const void *addr_ts,
                                             unsigned size, bool is_store)
+{ }
+
+static inline void insn_dataflow_note_addr_alias(const void *alias_ts,
+                                                const void *real_ts)
 { }
 
 static inline void insn_dataflow_note_helper(const void *call_op,

@@ -78,6 +78,13 @@
  */
 #define DF_MAX_GVEC_NOTES     64
 #define DF_MAX_MEMOP_NOTES    64
+/*
+ * Address aliases stated by an emitter (insn_dataflow_note_addr_alias).
+ * One per store-conditional, and a TB that reaches sixty-four of them has
+ * far more pressing problems; past that the notes stop and the accesses
+ * taken after are marked unnoted rather than silently short.
+ */
+#define DF_MAX_ALIAS_NOTES    64
 #define DF_MAX_HELPER_NOTES   64
 #define DF_MAX_HELPER_ARGS    8
 /*
@@ -100,7 +107,24 @@ typedef struct DfMemopNote {
     unsigned size;
     bool is_store;
     int rec;                    /* which memop record this note filled, or -1 */
+    /*
+     * How many address aliases had been stated when this note was taken.
+     * Resolution searches only those, newest first, so an alias states a fact
+     * about the accesses that FOLLOW it and about no others -- two
+     * store-conditionals in one TB cannot borrow each other's address.
+     */
+    unsigned alias_n;
+    bool alias_dropped;         /* an alias was lost to overflow before this */
 } DfMemopNote;
+
+/*
+ * CP-M, the address half: one temp an emitter will pass as an access address,
+ * and the temp in the guest's own namespace that it has just proved equal.
+ */
+typedef struct DfAliasNote {
+    const void *alias_ts;
+    const void *real_ts;
+} DfAliasNote;
 
 /* CP-H: one per helper call, carrying what tcg_gen_callN had and the op lost. */
 typedef struct DfHelperNote {
@@ -231,6 +255,10 @@ struct InsnDataflowScratch {
     unsigned n_memop;
     bool memop_overflow;
 
+    DfAliasNote alias[DF_MAX_ALIAS_NOTES];
+    unsigned n_alias;
+    bool alias_overflow;
+
     DfHelperNote helper[DF_MAX_HELPER_NOTES];
     unsigned n_helper;
     bool helper_overflow;
@@ -264,6 +292,9 @@ static __thread struct InsnDataflowScratch *df;
 #define df_memop            (df->memop)
 #define df_n_memop          (df->n_memop)
 #define df_memop_overflow   (df->memop_overflow)
+#define df_alias            (df->alias)
+#define df_n_alias          (df->n_alias)
+#define df_alias_overflow   (df->alias_overflow)
 #define df_helper           (df->helper)
 #define df_n_helper         (df->n_helper)
 #define df_helper_overflow  (df->helper_overflow)
@@ -770,6 +801,8 @@ void insn_dataflow_note_reset(void)
     df_gvec_overflow = false;
     df_n_memop = 0;
     df_memop_overflow = false;
+    df_n_alias = 0;
+    df_alias_overflow = false;
     df_n_helper = 0;
     df_helper_overflow = false;
 }
@@ -967,15 +1000,41 @@ static int df_memop_apply(InsnDataflow *d, bool store, unsigned *cursor)
         return -1;
     }
     if (n->rec < 0) {
+        const void *addr_ts = n->addr_ts;
+
         if (d->n_memops >= INSN_DF_MAX_MEMOPS) {
             d->memops_overflow = 1;
             return -1;
+        }
+        /*
+         * Resolve the address through the aliases stated BEFORE this note,
+         * newest first.  See insn_dataflow_note_addr_alias(): the three
+         * store-conditional lowerings hand the cmpxchg the reservation
+         * monitor, so without this the address provenance is the monitor --
+         * a name no guest instruction writes -- and the register the
+         * instruction actually addresses through is absent.
+         */
+        for (unsigned k = n->alias_n; k-- > 0; ) {
+            if (df_alias[k].alias_ts == addr_ts) {
+                addr_ts = df_alias[k].real_ts;
+                break;
+            }
+        }
+        if (n->alias_dropped) {
+            /*
+             * An alias this access might have needed was lost to overflow.
+             * The address set could be the monitor's rather than the guest's
+             * and there is no way to tell which from here, so the access is
+             * reported as unaccounted instead of published as though the
+             * substitution had been applied.
+             */
+            d->memops_unnoted = 1;
         }
         n->rec = (int)d->n_memops++;
         m = &d->memops[n->rec];
         m->is_store = store;
         m->size = n->size > UINT8_MAX ? UINT8_MAX : (uint8_t)n->size;
-        df_prov_add_temps(m->addr_prov, n->addr_ts, 1);
+        df_prov_add_temps(m->addr_prov, addr_ts, 1);
         if (store) {
             df_prov_add_temps(m->data_prov, n->val_ts, n->nval);
         }
@@ -1703,7 +1762,25 @@ void insn_dataflow_note_memop(const void *val_ts, unsigned nval,
     df_memop[df_n_memop].size = size;
     df_memop[df_n_memop].is_store = is_store;
     df_memop[df_n_memop].rec = -1;
+    df_memop[df_n_memop].alias_n = df_n_alias;
+    df_memop[df_n_memop].alias_dropped = df_alias_overflow;
     df_n_memop++;
+}
+
+/* CP-M, the address half.  See insn_dataflow_note_addr_alias() in the header. */
+void insn_dataflow_note_addr_alias(const void *alias_ts, const void *real_ts)
+{
+    if (df_disabled()) {
+        return;
+    }
+    df_bind();
+    if (df_n_alias >= DF_MAX_ALIAS_NOTES) {
+        df_alias_overflow = true;
+        return;
+    }
+    df_alias[df_n_alias].alias_ts = alias_ts;
+    df_alias[df_n_alias].real_ts = real_ts;
+    df_n_alias++;
 }
 
 /*
@@ -2001,6 +2078,8 @@ void insn_dataflow_extract(unsigned num_insns)
     df_gvec_overflow = false;
     df_n_memop = 0;
     df_memop_overflow = false;
+    df_n_alias = 0;
+    df_alias_overflow = false;
     if (df_helper_overflow) {
         /*
          * A call whose operand set was never recorded is a call described by

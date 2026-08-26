@@ -3175,6 +3175,8 @@ static_assert(MAX_DST_REGS <= 255,
 
 const InsnClassification *active_insn_table;
 unsigned active_insn_table_size;
+const QemuIdentRow *active_qemu_ident;
+unsigned active_qemu_ident_size;
 const RegClassification *active_reg_table;
 unsigned active_reg_table_size;
 
@@ -10574,6 +10576,21 @@ static uint32_t build_canonical_insns(struct qemu_plugin_tb *tb,
                                        insn_pcs[out],
                                        &insn_info[out]);
             }
+            /*
+             * QEMU's OWN identity for the same instruction, into the same
+             * struct.  AFTER the decode above, which memsets it.
+             *
+             * The tracer decodes RAW BYTES through its own Capstone
+             * arch/mode rather than through qemu_plugin_insn_detail(),
+             * because QEMU's per-target disassembler is not Capstone on
+             * riscv or mips.  That route has no insn handle and so cannot
+             * carry an identity -- which is exactly why it is taken here,
+             * where the handle is still in hand.  Set unconditionally: an
+             * instruction the boundary could not name still went through a
+             * decode-table slot, and the classifier's adjudicated rows are
+             * keyed on the slot, not on the name.
+             */
+            insn_info[out].decode_id = qemu_plugin_insn_decode_id(insn);
         }
 
         /* Per-memop callback fires unconditionally; the cb body
@@ -11986,6 +12003,8 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
     g_mutex_init(&unknown_warn_lock);
 
     active_insn_table = isa_insn_class[trace_isa];
+    active_qemu_ident = isa_qemu_ident[trace_isa];
+    active_qemu_ident_size = isa_qemu_ident_count[trace_isa];
     active_insn_table_size = isa_insn_class_size[trace_isa];
     active_reg_table = isa_reg_class[trace_isa];
     active_reg_table_size = isa_reg_class_size[trace_isa];

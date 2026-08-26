@@ -12,14 +12,22 @@
  * could move a byte of the wire.  J4 IS RETIRED -- J6 (2026-08-25) takes
  * Capstone off every correctness path including identification, and makes
  * this identity the intended SOURCE of the opcode taxonomy rather than a
- * key beside it.  What has not happened yet is the flip: the classifier
- * in champsim_tracer_decode.cc still keys on the Capstone insn_id, so as
- * of this writing nothing here moves a byte of the wire.  That is a
- * statement about where the work stands, NOT about where it is going.
+ * key beside it.
  *
- * Until the flip, the identity is a KEY that Capstone does not control,
- * and that key can be asked three questions Capstone cannot be asked
- * about itself:
+ * THE FLIP HAS STARTED, AND IT STARTED WHERE THE TWO KEYS DISAGREE.  The
+ * classifier in champsim_tracer_decode.cc still indexes the Capstone
+ * insn_id for the general case, because on every row where both keys can
+ * speak they say the same thing -- zero opcode and zero branch-class
+ * disagreements, four ISAs, measured.  The exception is the QID_SPLIT
+ * set: one QEMU rule, several Capstone constants, different answers.  For
+ * the subset of those that QEMU's own decode-table row settles, this file
+ * hands the classifier the surviving candidate through
+ * qemu_ident_adjudicated(), and THAT DOES move the wire.  Everything else
+ * here is still a reader.
+ *
+ * Beside that, the identity is a KEY that Capstone does not control, and
+ * that key can be asked three questions Capstone cannot be asked about
+ * itself:
  *
  *   1. IS THE TABLE CURRENT?  Every row carries the pattern's name.  QEMU
  *      reports the name too, at runtime, from the decoder that actually
@@ -804,6 +812,49 @@ static void write_pair_census(GString *report)
 void qemu_ident_report(GString *report)
 {
     write_pair_census(report);
+
+    /*
+     * The one place this identity reaches the wire.  Reported
+     * UNCONDITIONALLY, including when it is zero, because zero is the
+     * interesting number: it means no instruction in this run decoded
+     * through a rule the tables adjudicate, so the adjudication changed
+     * nothing here and no claim about it may be made from this run.
+     */
+    {
+        unsigned n_adj = 0, n_fired = 0, n_untallied = 0;
+        for (unsigned i = 0; i < g_nrows; i++) {
+            if (g_rows[i].tier == QID_ADJUDICATED) {
+                n_adj++;
+                if (i >= CST_QID_MAX_ROW_HITS) {
+                    n_untallied++;
+                } else if (qemu_ident_adjudicated_row_hits(i)) {
+                    n_fired++;
+                }
+            }
+        }
+        g_string_append_printf(report,
+            "\n--- ADJUDICATED rows: where QEMU's own decode-table row "
+            "settles a classification the Capstone key cannot express ---\n"
+            "  rows this ISA adjudicates             %10u\n"
+            "  of them REACHED by this run           %10u\n"
+            "  instructions classified through them  %10" PRIu64 "\n",
+            n_adj, n_fired, qemu_ident_adjudicated_hits());
+        if (n_untallied) {
+            g_string_append_printf(report,
+                "  rows past the per-row tally's size    %10u   "
+                "(counted in the total, not per row)\n", n_untallied);
+        }
+        for (unsigned i = 0; i < g_nrows && i < CST_QID_MAX_ROW_HITS; i++) {
+            if (g_rows[i].tier != QID_ADJUDICATED) {
+                continue;
+            }
+            uint64_t n = qemu_ident_adjudicated_row_hits(i);
+            g_string_append_printf(report,
+                "    0x%08x %-14s %10" PRIu64 "%s\n",
+                g_rows[i].id, g_rows[i].name, n,
+                n ? "" : "   NOT REACHED by this run");
+        }
+    }
     if (g_len_seen || g_len_cap_failed) {
         g_string_append_printf(report,
             "\n--- instruction LENGTH: the translator's pc advance against "

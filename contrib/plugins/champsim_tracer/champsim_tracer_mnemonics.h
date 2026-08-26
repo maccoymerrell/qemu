@@ -542,6 +542,21 @@ enum QemuIdentTier {
      * instance; the rule cannot do it.
      */
     QID_SPLIT,
+    /*
+     * Observed, the observations DISAGREED, and QEMU's own decode-table
+     * row settles which of them describes the rule -- one candidate is
+     * REFUTED by what the row states (it is wrong about what the
+     * instruction is) or strictly SUBSUMED by it (same classification,
+     * one side merely less precise).  .cls carries the surviving
+     * candidate's payload, from the same classifier as every other row,
+     * and the generated comment carries the QEMU source fact that
+     * decided it.
+     *
+     * The bar is deliberately narrow, and rows that do not meet it stay
+     * QID_SPLIT: two equally valid names for one operation are a ruling
+     * about the generic opcode space and not a fact QEMU states.
+     */
+    QID_ADJUDICATED,
 };
 
 struct QemuIdentRow {
@@ -551,11 +566,17 @@ struct QemuIdentRow {
     /*
      * The Capstone key is FINER than this one on this row: several
      * spellings were observed decoding through the single rule and the
-     * classifier gives them different answers.  .cls carries the most
-     * frequently observed one; the generated comment names the others.
-     * A consumer that must not silently pick between two behaviours
-     * tests this bit, and averaging them into a third that describes
-     * neither is the one thing it may not do.
+     * classifier gives them different answers.  It is a fact about the
+     * two KEYS and says nothing about whether the row was resolved --
+     * .tier is what says that, and a cap_split row may be QID_SPLIT
+     * (carrying no classification) or QID_ADJUDICATED (carrying the
+     * candidate QEMU's own row leaves standing).
+     *
+     * A QID_SPLIT row carries GEN_OP_UNKNOWN and nothing else.  Picking
+     * the most frequently observed candidate made the generated file
+     * depend on which programs happened to run, and averaging two
+     * classifications into a third that describes neither is the one
+     * thing it may not do.
      */
     bool     cap_split;
     /*

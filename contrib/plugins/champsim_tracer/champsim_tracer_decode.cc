@@ -5,6 +5,7 @@
  */
 
 #include <array>
+#include <atomic>
 #include <string.h>
 #include <stdlib.h>
 
@@ -667,14 +668,100 @@ void report_undecodable_block(uint64_t pc)
 /*
  * Classify via direct insn_id array lookup (O(1)).  Returns the table
  * row (nullptr if out of range / no table) for the .refine callback.
+ *
+ * QEMU'S OWN IDENTITY WINS WHERE THE TWO KEYS DISAGREE.  The Capstone
+ * constant and QEMU's decode-table slot are two accounts of the same
+ * instruction, and on every row where both can speak they agree -- zero
+ * opcode and zero branch-class disagreements over the census workloads,
+ * on all four ISAs.  The exception is the set of rules several Capstone
+ * constants decode through with different classifications, and there the
+ * Capstone key is not finer, it is WRONG: x86 slot 0x6ca is opcode 0xA5,
+ * the string move, and Capstone's X86_INS_MOVSD covers both that and the
+ * SSE scalar-double move, so `rep movsl` was published as a lane-parallel
+ * FP vector move.
+ *
+ * qemu_ident_adjudicated() answers for exactly the subset of those rules
+ * that QEMU's own table row settles -- tier QID_ADJUDICATED, generated,
+ * each carrying the source fact that decided it.  It returns nullptr for
+ * everything else, including id 0 (no identity recorded) and including
+ * the split rows still open, which keep the Capstone answer they had.
+ * See champsim_tracer_qemu_ident.h.
  */
 extern thread_local bool g_dep_refine_suppressed;
+
+/*
+ * Rows are sorted by id -- the generator emits them that way and the
+ * identity reader PROVES it at install (qemu_ident_install returns the
+ * count of out-of-order and duplicate ids, and a non-zero count is
+ * reported), so a bisect here cannot silently miss a row.
+ */
+static std::atomic<uint64_t> g_qid_adjudicated_hits{0};
+
+/*
+ * PER ROW, not only in total.  A single total cannot say WHICH
+ * adjudication a run exercised, and a row that never fires is a row
+ * whose ruling this run does not evidence -- which is a thing to report,
+ * not to leave to be inferred from a non-zero sum.  Indexed by the row's
+ * position in the (sorted, per-ISA) identity table.
+ */
+static std::atomic<uint64_t> g_qid_adjudicated_row_hits[CST_QID_MAX_ROW_HITS];
+
+const InsnClassification *qemu_ident_adjudicated(uint32_t id)
+{
+    if (id == 0 || !active_qemu_ident || active_qemu_ident_size == 0) {
+        return nullptr;
+    }
+    unsigned lo = 0, hi = active_qemu_ident_size;
+    while (lo < hi) {
+        unsigned mid = lo + (hi - lo) / 2;
+        if (active_qemu_ident[mid].id < id) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo >= active_qemu_ident_size || active_qemu_ident[lo].id != id) {
+        return nullptr;
+    }
+    const QemuIdentRow *row = &active_qemu_ident[lo];
+    if (row->tier != QID_ADJUDICATED) {
+        return nullptr;
+    }
+    g_qid_adjudicated_hits.fetch_add(1, std::memory_order_relaxed);
+    if (lo < CST_QID_MAX_ROW_HITS) {
+        g_qid_adjudicated_row_hits[lo].fetch_add(1,
+                                                 std::memory_order_relaxed);
+    }
+    return &row->cls;
+}
+
+uint64_t qemu_ident_adjudicated_hits(void)
+{
+    return g_qid_adjudicated_hits.load(std::memory_order_relaxed);
+}
+
+uint64_t qemu_ident_adjudicated_row_hits(unsigned row_index)
+{
+    if (row_index >= CST_QID_MAX_ROW_HITS) {
+        return 0;
+    }
+    return g_qid_adjudicated_row_hits[row_index].load(
+        std::memory_order_relaxed);
+}
 
 static const InsnClassification *classify_insn_id(
     const qemu_plugin_insn_info *info,
     uint8_t *opcode, uint8_t *branch_type, uint16_t *flags)
 {
     uint32_t id = info->insn_id;
+
+    const InsnClassification *adj = qemu_ident_adjudicated(info->decode_id);
+    if (adj) {
+        *opcode = adj->opcode;
+        *branch_type = adj->branch_type;
+        *flags = adj->flags;
+        return adj;
+    }
 
     if (active_insn_table && id < active_insn_table_size) {
         const InsnClassification *c = &active_insn_table[id];

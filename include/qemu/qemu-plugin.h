@@ -259,6 +259,14 @@ typedef uint64_t qemu_plugin_id_t;
  *   return address.  Additive: the accessors return zero / -1 on an
  *   instruction no target recorded a range for.
  *
+ * version 25:
+ * - qemu_plugin_insn_info grew a `decode_id` field, carrying what
+ *   qemu_plugin_insn_decode_id() reports for the same instruction.  The
+ *   struct is allocated by the CALLER and filled by QEMU, so a plugin
+ *   built against the version-24 layout would be written past: this is
+ *   an ABI break and the version moves for it, additive though the
+ *   field is.
+ *
  * Where an entry above says a signature changed WITHOUT the version
  * constant moving, the version in force at the time names two
  * incompatible spellings of the same symbol and cannot be honoured
@@ -270,7 +278,7 @@ typedef uint64_t qemu_plugin_id_t;
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 24
+#define QEMU_PLUGIN_VERSION 25
 
 /*
  * The two values a signed vCPU index takes when it is not an index.
@@ -1520,6 +1528,22 @@ typedef struct qemu_plugin_insn_info {
                         [QEMU_PLUGIN_INSN_DETAIL_REG_NAMESZ];
     uint16_t regs_read_id[QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS];
     uint16_t regs_write_id[QEMU_PLUGIN_INSN_DETAIL_MAX_IREGS];
+    /*
+     * QEMU's OWN identity for the same instruction, carried beside the
+     * disassembler's opinion of it: exactly what
+     * qemu_plugin_insn_decode_id() returns for the handle this detail
+     * was taken from, and 0 when the target recorded none.  See that
+     * function for what the value does and does not guarantee.
+     *
+     * It is here so that a consumer keyed on insn_id can tell, in one
+     * place, when the two accounts of one instruction disagree -- the
+     * Capstone constant is not always finer, and on x86 it is sometimes
+     * one constant covering two unrelated instructions.
+     *
+     * qemu_plugin_cap_decode() decodes raw bytes with no insn handle and
+     * therefore no identity, and leaves this 0.
+     */
+    uint32_t decode_id;
 } qemu_plugin_insn_info;
 
 /**

@@ -5048,6 +5048,95 @@ QID_NONE = "QID_NONE"                  # neither
 QID_SPLIT = "QID_SPLIT"                # observed, and the observations
                                        # DISAGREE: this identity does not
                                        # determine the classification
+QID_ADJUDICATED = "QID_ADJUDICATED"     # the observations disagreed and
+                                        # QEMU's own decode-table row settles
+                                        # which of them describes the rule
+
+
+# ---------------------------------------------------------------------------
+# QID_ADJUDICATED: the split rows QEMU's own table row decides
+# ---------------------------------------------------------------------------
+#
+# A QID_SPLIT row means several Capstone constants were observed decoding
+# through ONE QEMU rule and the classifier gives them different answers.
+# That is not always a question QEMU declines to answer.  Sometimes QEMU's
+# decode-table row REFUTES one of the candidates outright -- it states, in
+# the emulator's own source, what the rule is -- and then the row does
+# determine the classification and it is only the Capstone key that could
+# not express it.
+#
+# Every entry here is one such row.  The key is (isa, slot id); `winner` is
+# the Capstone constant whose payload describes what QEMU's rule does, and
+# it MUST be one of the constants actually observed through the rule -- the
+# generator refuses otherwise, so an adjudication cannot outlive the
+# evidence it was written against.  `why` is the QEMU source fact, and it is
+# emitted into the generated header beside the row.
+#
+# THE BAR FOR AN ENTRY, and it is deliberately narrow.  A candidate may be
+# adjudicated away only when the QEMU row REFUTES it (it is wrong about what
+# the instruction is) or strictly SUBSUMES it (same classification, one side
+# merely less precise).  Two equally valid names for one operation are NOT
+# adjudicable here: that is a taxonomy ruling about our own generic opcode
+# space, not a fact QEMU states, and a row in that shape stays QID_SPLIT
+# with its candidates named.  See docs and the ARC 3 verdict for the rows
+# left open on exactly that ground.
+QID_ADJUDICATIONS: dict[tuple[str, int], tuple[str, str]] = {
+    # 0x6ca = decode-new.c.inc:1738
+    #   [0xA5] = X86_OP_ENTRYrr(MOVS, Y,v, X,v)
+    # Opcode 0xA5 with the Y/X string-operand pair is the STRING MOVE, at
+    # operand size v.  Capstone's X86_INS_MOVSD covers two unrelated
+    # instructions -- this one and the SSE scalar-double move -- and its
+    # row carries the SSE one, so `rep movsl` was published as a
+    # lane-parallel FP vector move.  QEMU decodes the SSE movsd through
+    # VMOVSD_ld / VMOVLPx_st, which are different slots entirely; nothing
+    # about this rule is FP and nothing about it is lane-parallel.  The
+    # surviving candidate is the same string move at the other operand
+    # size, which is what the rule is.
+    ("x86", 0x6ca): ("X86_INS_MOVSQ",
+                     "decode-new.c.inc:1738 [0xA5] X86_OP_ENTRYrr(MOVS, Y,v, "
+                     "X,v) -- the string move; the SSE scalar-double move "
+                     "decodes through VMOVSD_ld/VMOVLPx_st, not here"),
+
+    # 0x54b = decode-new.c.inc:1355
+    #   [0x1e] = X86_OP_ENTRY1(NOP, nop,v)   /* reserved NOP */
+    # op0 has type `nop` and gen_NOP is #define'd to gen_MOV, so the row
+    # generates no architectural write at all: QEMU executes every 0F 1E
+    # encoding as a nop.  That is also what the architecture says with
+    # shadow stacks disabled, which they are on this CPU model -- RDSSPD/
+    # RDSSPQ is defined to be a NOP when CET_SS is off.  Capstone's
+    # X86_INS_RDSSPQ row names a destination write that neither QEMU nor
+    # the machine performs.
+    ("x86", 0x54b): ("X86_INS_ENDBR64",
+                     "decode-new.c.inc:1355 [0x1e] X86_OP_ENTRY1(NOP, nop,v) "
+                     "-- op0 type `nop`, gen_NOP = gen_MOV writes nothing; "
+                     "rdsspq is architecturally a NOP with CET_SS off"),
+
+    # 0x1ee / 0x1ef / 0x234 = decode-new.c.inc:494 / 495 / 564
+    #   X86_OP_ENTRY3(MOVDQ, V,x, None,None, W,x, vex1)       movdqa
+    #   X86_OP_ENTRY3(MOVDQ, V,x, None,None, W,x, vex4_unal)  movdqu
+    #   X86_OP_ENTRY3(MOVDQ, W,x, None,None, V,x, vex4_unal)  movdqu store
+    # The `vexN` class marks a row valid under BOTH the legacy and the VEX
+    # encoding, so one rule covers movdqa/vmovdqa (resp. movdqu/vmovdqu).
+    # The two candidates agree on everything the wire carries -- same
+    # opcode, same lane pair -- and differ only in whether .dep_refine is
+    # dep_passthrough or absent.  Absent is the all-inputs default; present
+    # is the same answer stated precisely, and it is the shape the rule
+    # has: one whole-vector value in, one out.  dep_passthrough bails by
+    # itself on any runtime shape outside that group, so adopting it can
+    # narrow a mask and cannot invent an edge.
+    ("x86", 0x1ee): ("X86_INS_MOVDQA",
+                     "decode-new.c.inc:494 X86_OP_ENTRY3(MOVDQ, V,x, "
+                     "None,None, W,x, vex1) -- one rule for the legacy and "
+                     "VEX spellings; the candidates differ only in whether "
+                     "the pass-through refiner is stated"),
+    ("x86", 0x1ef): ("X86_INS_MOVDQU",
+                     "decode-new.c.inc:495 X86_OP_ENTRY3(MOVDQ, V,x, "
+                     "None,None, W,x, vex4_unal) -- as 0x1ee, unaligned"),
+    ("x86", 0x234): ("X86_INS_MOVDQU",
+                     "decode-new.c.inc:564 X86_OP_ENTRY3(MOVDQ, W,x, "
+                     "None,None, V,x, vex4_unal) -- as 0x1ef, store "
+                     "direction"),
+}
 
 
 def _pattern_mnemonic_candidates(pattern: str) -> list[str]:
@@ -5115,6 +5204,11 @@ class IdentRow:
     # average two classifications into a third that describes neither.
     split: tuple[tuple[Entry, tuple[str, ...]], ...] = ()
     refused: str | None = None      # name the emitter fact refused
+    # Set when the observations disagreed AND QEMU's own decode-table row
+    # settles which of them describes the rule.  The text is the QEMU
+    # source fact that decided it, and it is emitted beside the row so the
+    # generated header carries the reason and not just the outcome.
+    adjudged: str | None = None
 
 
 def qemu_ident_rows(info: IsaInfo, idents: list[QemuIdent],
@@ -5144,12 +5238,14 @@ def qemu_ident_rows(info: IsaInfo, idents: list[QemuIdent],
         split: list[tuple[Entry, tuple[str, ...]]] = []
         caps: list[str] = []
         refused = None
+        adjudged = None
         if seen:
             mnems = tuple(m for m, _ in seen["mnem"].most_common())
             # Ordered by how often QEMU decoded through this rule with
             # that Capstone id.  The join is id -> id; the disassembly
             # text below is only what the census prints.
             payloads: dict[Entry, list[str]] = {}
+            observed_consts: list[str] = []
             for cap, _n in seen["caps"].most_common():
                 const = v2c.get(cap)
                 if const is None:
@@ -5157,6 +5253,7 @@ def qemu_ident_rows(info: IsaInfo, idents: list[QemuIdent],
                 cand = full_entry(info, const, existing)
                 if cand is None:
                     continue
+                observed_consts.append(const)
                 caps.append(c_mnemonic(const, info.prefix))
                 payloads.setdefault(cand, []).append(
                     c_mnemonic(const, info.prefix))
@@ -5186,6 +5283,37 @@ def qemu_ident_rows(info: IsaInfo, idents: list[QemuIdent],
                 split = sorted(((e, tuple(sorted(v)))
                                 for e, v in payloads.items()),
                                key=lambda x: x[1])
+                # ...unless QEMU's own decode-table row settles it.  The
+                # adjudication names the surviving candidate BY CAPSTONE
+                # CONSTANT, and the constant must be one this rule was
+                # actually observed decoding through -- an adjudication
+                # written against evidence that no longer exists is a
+                # stale ruling applied silently, so it is refused loudly
+                # instead.  The payload still comes from full_entry, the
+                # one classifier: adjudicating picks among candidates, it
+                # never hand-writes a row.
+                adj = QID_ADJUDICATIONS.get((info.key, ident.ident))
+                if adj is not None:
+                    winner, why = adj
+                    if winner not in observed_consts:
+                        raise SystemExit(
+                            f"{info.key}: adjudication for identity "
+                            f"0x{ident.ident:08x} ({ident.pattern}) names "
+                            f"{winner}, which was NOT observed decoding "
+                            f"through it (observed: "
+                            f"{', '.join(observed_consts) or 'nothing'}).  "
+                            f"The ruling is stale against this evidence; "
+                            f"re-adjudicate rather than re-run until it "
+                            f"passes.")
+                    won = full_entry(info, winner, existing)
+                    if won is None:
+                        raise SystemExit(
+                            f"{info.key}: adjudication for identity "
+                            f"0x{ident.ident:08x} names {winner}, which "
+                            f"carries no classification at all")
+                    tier = QID_ADJUDICATED
+                    entry = won
+                    adjudged = why
         if tier == QID_NONE:
             for cand_name in _pattern_mnemonic_candidates(ident.pattern):
                 const = m2c.get(_norm_mnemonic(cand_name))
@@ -5202,7 +5330,7 @@ def qemu_ident_rows(info: IsaInfo, idents: list[QemuIdent],
                 break
         rows.append(IdentRow(ident, entry, tier, mnems,
                              tuple(sorted(dict.fromkeys(caps))),
-                             tuple(split), refused))
+                             tuple(split), refused, adjudged))
     return rows
 
 
@@ -5255,16 +5383,31 @@ def qemu_ident_header_text(info: IsaInfo, rows: list[IdentRow]) -> str:
         " *   QID_NAME_MATCHED  the rule's name matches a known mnemonic, no",
         " *                     decode through it was observed, and the row's",
         " *                     own operand template does not contradict it",
+        " *   QID_SPLIT         several spellings were observed decoding",
+        " *                     through this one rule and the classifier",
+        " *                     gives them different answers, and nothing",
+        " *                     in QEMU's row picks between them.  The row",
+        " *                     carries NO classification (GEN_OP_UNKNOWN)",
+        " *                     and the trailing comment names every",
+        " *                     candidate -- resolving one needs the",
+        " *                     INSTANCE, not the rule",
+        " *   QID_ADJUDICATED   they disagreed and QEMU's own decode-table",
+        " *                     row settles it: one candidate is refuted or",
+        " *                     strictly subsumed by what the row states.",
+        " *                     The payload is that candidate's, from the",
+        " *                     same classifier, and the trailing comment",
+        " *                     carries the QEMU source fact that decided it",
         " *   QID_NONE          neither -- residue, classification unknown",
         " *",
         " * .cap_split marks a row where the Capstone key is FINER than this",
         " * one: several spellings were observed decoding through the single",
-        " * rule and the tables classify them differently.  The row carries",
-        " * the most frequently observed spelling's payload and the trailing",
-        " * comment names the others.  It is a flag and not a fix -- the",
-        " * adjudication of which key is right belongs to the maintainer,",
-        " * and averaging two classifications into a third that describes",
-        " * neither is the one thing it must not do.",
+        " * rule and the tables classify them differently.  It is a fact",
+        " * about the two KEYS and says nothing about whether the row was",
+        " * resolved -- read .tier for that.  A QID_SPLIT row carries no",
+        " * classification at all: picking the most frequently observed",
+        " * candidate made the generated file depend on which programs",
+        " * happened to run, and averaging two classifications into a third",
+        " * that describes neither is the one thing it may not do.",
         " *",
         " * SPDX-License-Identifier: GPL-2.0-or-later",
         " * Author: Maccoy Merrell",
@@ -5285,7 +5428,12 @@ def qemu_ident_header_text(info: IsaInfo, rows: list[IdentRow]) -> str:
     ]
     for r in rows:
         note = ""
-        if r.split:
+        if r.adjudged:
+            note = ("  /* ADJUDICATED from " +
+                    "; ".join(f"{e.op} <- {', '.join(ms[:3])}"
+                              for e, ms in r.split) +
+                    " -- " + r.adjudged + " */")
+        elif r.split:
             note = ("  /* SPLIT: " +
                     "; ".join(f"{e.op} <- {', '.join(ms[:3])}"
                               for e, ms in r.split) + " */")
@@ -5349,7 +5497,8 @@ def qemu_ident_census(info: IsaInfo, idents: list[QemuIdent],
 
     tiers = collections.Counter(r.tier for r in rows)
     print("row provenance:")
-    for t in (QID_OBSERVED, QID_SPLIT, QID_NAME_MATCHED, QID_NONE):
+    for t in (QID_OBSERVED, QID_ADJUDICATED, QID_SPLIT, QID_NAME_MATCHED,
+              QID_NONE):
         print(f"    {t:<18} {tiers.get(t, 0)}")
     refused = [r for r in rows if r.refused]
     if refused:
@@ -5365,7 +5514,7 @@ def qemu_ident_census(info: IsaInfo, idents: list[QemuIdent],
     id2mn: dict[int, set] = {}
     mn2id: dict[str, set] = {}
     for r in rows:
-        if r.tier not in (QID_OBSERVED, QID_SPLIT):
+        if r.tier not in (QID_OBSERVED, QID_ADJUDICATED, QID_SPLIT):
             continue
         id2mn[r.ident.ident] = set(r.caps)
         for m in r.caps:
@@ -5412,6 +5561,23 @@ def qemu_ident_census(info: IsaInfo, idents: list[QemuIdent],
             print(f"        candidate {e.op:<22} <- {', '.join(ms)}")
             if i:
                 print(f"                  {_delta(base, e)}")
+
+    adj = [r for r in rows if r.tier == QID_ADJUDICATED]
+    print(f"ADJUDICATED -- the split rows QEMU's own decode-table row "
+          f"decides: {len(adj)}")
+    for r in adj:
+        print(f"    0x{r.ident.ident:08x} {r.ident.name}   -> {r.entry.op}")
+        for e, ms in r.split:
+            if e == r.entry:
+                print(f"        KEPT      {e.op:<22} <- {', '.join(ms)}")
+                continue
+            # Name the fields the dropped candidate disagreed on, not only
+            # its opcode: several of these rows agree on the opcode and
+            # part on a refiner, and printing "REFUTED GEN_OP_VEC_MOV"
+            # against a KEPT GEN_OP_VEC_MOV says nothing about what moved.
+            print(f"        DROPPED   {e.op:<22} <- {', '.join(ms)}")
+            print(f"                  {_delta(r.entry, e)}")
+        print(f"        because: {r.adjudged}")
 
     # ---- the residue, BY NAME.  A count would hide which rules the
     # tracer would have nothing to say about.

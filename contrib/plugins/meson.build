@@ -209,17 +209,6 @@ if get_option('plugins')
     files('champsim_tracer/tools/isaxcheck_fields.cc',
           'champsim_tracer/champsim_tracer_decode.cc',
           'champsim_tracer/champsim_tracer_mnemonic_tables.cc',
-          # The QEMU-identity reader, for the adjudicated split rows the
-          # classifier now takes from it.  It is INERT here and that is
-          # stated rather than left to be assumed: isaxcheck decodes raw
-          # bytes through cap_disas_raw_detail(), which has no insn handle
-          # and therefore leaves qemu_plugin_insn_info::decode_id at 0, and
-          # qemu_ident_install() is never called so there is no table bound
-          # either.  Linking it anyway means a generated identity table
-          # that will not compile breaks this gate too; it does NOT mean
-          # the gate covers the adjudication, which needs a running
-          # translator.
-          'champsim_tracer/champsim_tracer_qemu_ident.cc',
           'champsim_tracer/champsim_tracer_reg_handle_cache.cc'),
     include_directories: ['../../include/qemu', '../../include',
                           'champsim_tracer'],

@@ -51,6 +51,18 @@
 TraceISA trace_isa = TRACE_ISA_UNKNOWN;
 bool target_big_endian = false;
 const InsnClassification *active_insn_table = nullptr;
+/*
+ * Bound below beside active_insn_table, and INERT here by
+ * construction rather than by omission: isaxcheck decodes raw bytes
+ * through cap_disas_raw_detail(), which has no insn handle, so
+ * qemu_plugin_insn_info::decode_id is always 0 and
+ * qemu_ident_adjudicated() returns nullptr on every call.  The gate
+ * therefore compiles the identity tables and links the lookup, and
+ * covers NEITHER -- the adjudicated rows need a running translator
+ * to reach.
+ */
+const QemuIdentRow *active_qemu_ident = nullptr;
+unsigned active_qemu_ident_size = 0;
 unsigned active_insn_table_size = 0;
 const RegClassification *active_reg_table = nullptr;
 unsigned active_reg_table_size = 0;
@@ -129,6 +141,8 @@ bool isax_fields_init(const char *isa_name)
      * sees relative to the plugin. */
     trace_isa = isa;
     active_insn_table = isa_insn_class[isa];
+    active_qemu_ident = isa_qemu_ident[isa];
+    active_qemu_ident_size = isa_qemu_ident_count[isa];
     active_insn_table_size = isa_insn_class_size[isa];
     active_reg_table = isa_reg_class[isa];
     active_reg_table_size = isa_reg_class_size[isa];

@@ -1500,6 +1500,51 @@ static inline bool cst_va_is_kernel_code(uint64_t pc)
 
 extern const InsnClassification *active_insn_table;
 extern unsigned active_insn_table_size;
+/*
+ * The same instructions keyed on QEMU'S OWN decode-table identity; see
+ * QemuIdentRow and champsim_tracer_qemu_ident_<isa>.h.  Bound beside
+ * active_insn_table, at the same sites, so the two accounts of one
+ * instruction can never be bound to different ISAs.
+ *
+ * The classifier reads it for exactly one purpose -- the QID_ADJUDICATED
+ * rows, where several Capstone constants decode through one QEMU rule
+ * with different classifications and QEMU's own row settles which of
+ * them describes it.  Rows are sorted by id; bisect.
+ */
+extern const QemuIdentRow *active_qemu_ident;
+extern unsigned active_qemu_ident_size;
+
+/*
+ * The classification QEMU's own decode-table row settles for @id, or
+ * nullptr when it settles nothing -- @id is 0 (no identity recorded, and
+ * an offline decode of raw bytes always is), no row carries it, or the
+ * row is any tier other than QID_ADJUDICATED.
+ *
+ * This is the one path by which the QEMU identity reaches the wire.
+ * Everywhere else the two keys agree, measured, so routing the agreeing
+ * rows through this one would move nothing.
+ */
+const InsnClassification *qemu_ident_adjudicated(uint32_t id);
+
+/*
+ * How many translated instructions took an adjudicated classification
+ * instead of the Capstone-keyed one.  Zero over a workload that contains
+ * an adjudicated row is a FINDING -- an inert change -- and not a pass.
+ */
+uint64_t qemu_ident_adjudicated_hits(void);
+
+/*
+ * The largest identity table is aarch64's 2,563 rows; the tally array is
+ * sized for the widest and a row past it simply is not tallied per-row
+ * (the total above still counts it).  Checked, not assumed: the reader
+ * reports any row it could not tally.
+ */
+#define CST_QID_MAX_ROW_HITS 4096
+
+/* Same tally, for ONE row of the active ISA's table, by its index in that
+ * table.  Lets the exit report say which adjudication a run exercised
+ * rather than only that some adjudication fired. */
+uint64_t qemu_ident_adjudicated_row_hits(unsigned row_index);
 extern const RegClassification *active_reg_table;
 extern unsigned active_reg_table_size;
 /* The same registers keyed on QEMU identity; see QemuRegRow. */

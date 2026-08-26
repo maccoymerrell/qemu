@@ -23,16 +23,31 @@
  *   QID_NAME_MATCHED  the rule's name matches a known mnemonic, no
  *                     decode through it was observed, and the row's
  *                     own operand template does not contradict it
+ *   QID_SPLIT         several spellings were observed decoding
+ *                     through this one rule and the classifier
+ *                     gives them different answers, and nothing
+ *                     in QEMU's row picks between them.  The row
+ *                     carries NO classification (GEN_OP_UNKNOWN)
+ *                     and the trailing comment names every
+ *                     candidate -- resolving one needs the
+ *                     INSTANCE, not the rule
+ *   QID_ADJUDICATED   they disagreed and QEMU's own decode-table
+ *                     row settles it: one candidate is refuted or
+ *                     strictly subsumed by what the row states.
+ *                     The payload is that candidate's, from the
+ *                     same classifier, and the trailing comment
+ *                     carries the QEMU source fact that decided it
  *   QID_NONE          neither -- residue, classification unknown
  *
  * .cap_split marks a row where the Capstone key is FINER than this
  * one: several spellings were observed decoding through the single
- * rule and the tables classify them differently.  The row carries
- * the most frequently observed spelling's payload and the trailing
- * comment names the others.  It is a flag and not a fix -- the
- * adjudication of which key is right belongs to the maintainer,
- * and averaging two classifications into a third that describes
- * neither is the one thing it must not do.
+ * rule and the tables classify them differently.  It is a fact
+ * about the two KEYS and says nothing about whether the row was
+ * resolved -- read .tier for that.  A QID_SPLIT row carries no
+ * classification at all: picking the most frequently observed
+ * candidate made the generated file depend on which programs
+ * happened to run, and averaging two classifications into a third
+ * that describes neither is the one thing it may not do.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  * Author: Maccoy Merrell

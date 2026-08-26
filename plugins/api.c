@@ -670,8 +670,21 @@ char *qemu_plugin_insn_disas(const struct qemu_plugin_insn *insn)
 bool qemu_plugin_insn_detail(const struct qemu_plugin_insn *insn,
                              qemu_plugin_insn_info *info)
 {
-    return plugin_disas_detail(tcg_ctx->cpu, tcg_ctx->plugin_db,
-                               insn->vaddr, insn->len, info);
+    bool ok = plugin_disas_detail(tcg_ctx->cpu, tcg_ctx->plugin_db,
+                                  insn->vaddr, insn->len, info);
+    /*
+     * QEMU's own answer, carried beside the disassembler's, for the same
+     * instruction and in the same struct.  It is set whether or not the
+     * disassembler managed a decode: an instruction the boundary cannot
+     * name still went through a decode-table slot, and reporting 0 there
+     * would hide the one identity that is never a guess.
+     *
+     * cap_disas_raw_detail() has no insn handle and therefore no
+     * identity, so a consumer decoding raw bytes gets 0 -- which is what
+     * the field means: no identity recorded.
+     */
+    info->decode_id = insn->decode_id;
+    return ok;
 }
 
 bool qemu_plugin_cap_decode(int cap_arch, unsigned int cap_mode,

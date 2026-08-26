@@ -62,6 +62,13 @@ void plugin_gen_record_branch_target(uint64_t target_pc);
  */
 void plugin_gen_record_insn_identity(uint32_t id, const char *name);
 
+/*
+ * plugin_gen_record_tb_stop: close the last instruction's op range over
+ * whatever ops->tb_stop() just emitted on its behalf.  Called from
+ * translator_loop() immediately after tb_stop() and before gen_tb_end().
+ */
+void plugin_gen_record_tb_stop(void);
+
 #else /* !CONFIG_PLUGIN */
 
 static inline
@@ -84,6 +91,9 @@ static inline void plugin_gen_disable_mem_helpers(void)
 { }
 
 static inline void plugin_gen_record_branch_target(uint64_t target_pc)
+{ }
+
+static inline void plugin_gen_record_tb_stop(void)
 { }
 
 static inline void plugin_gen_record_insn_identity(uint32_t id,

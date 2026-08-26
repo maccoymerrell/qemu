@@ -536,6 +536,10 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
 
     /* Emit code to exit the TB, as indicated by db->is_jmp.  */
     ops->tb_stop(db, cpu);
+    if (plugin_enabled) {
+        /* Those ops belong to the last instruction; see plugin-gen.c. */
+        plugin_gen_record_tb_stop();
+    }
     /* Never-split extension: bill at most the budget the TB was asked
      * for.  Identical to db->num_insns except when the atomic-sequence
      * continue-through pushed num_insns past the requested count — an

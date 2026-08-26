@@ -28,6 +28,7 @@
 #include "tcg/tcg-op.h"
 #include "exec/exec-all.h"
 #include "exec/plugin-gen.h"
+#include "exec/insn-ctrl.h"
 #include "exec/translator.h"
 
 enum plugin_gen_from {
@@ -478,8 +479,24 @@ void plugin_gen_insn_start(CPUState *cpu, const DisasContextBase *db)
      */
     insn->decode_id = 0;
     insn->decode_name = NULL;
+    /*
+     * Same reuse hazard again, and one more: a stale TCGOp pointer would be
+     * walked into a freed op list.  Cleared here and re-taken below.
+     */
+    insn->ctrl_first_op = NULL;
+    insn->ctrl_last_op = NULL;
+    insn->ctrl_flags = 0;
+    insn->ctrl_target = 0;
+    insn->ctrl_target_reg = -1;
+    insn->ctrl_addr_reg = -1;
 
     tcg_gen_plugin_cb(PLUGIN_GEN_FROM_INSN);
+    /*
+     * The marker just emitted is the range's anchor: this instruction's own
+     * ops are everything after it, up to the tail recorded in
+     * plugin_gen_insn_end().  See accel/tcg/insn-ctrl.h.
+     */
+    insn->ctrl_first_op = QTAILQ_LAST(&tcg_ctx->ops);
 }
 
 void plugin_gen_record_branch_target(uint64_t target_pc)
@@ -499,12 +516,57 @@ void plugin_gen_record_insn_identity(uint32_t id, const char *name)
     }
 }
 
+/*
+ * The transfer an instruction performs is NOT always emitted by
+ * translate_insn().  A target that sets db->is_jmp and returns leaves the
+ * goto_tb / lookup_and_goto_ptr to its tb_stop() hook, which runs once, after
+ * the loop, for the LAST instruction translated -- aarch64 `ret` and every
+ * DISAS_JUMP form take that route.  So the last instruction's op range is
+ * extended over tb_stop()'s output, and it is taken HERE rather than in
+ * plugin_gen_tb_end() because gen_tb_end() runs in between and appends the
+ * block's own interrupt-exit epilogue, which belongs to no instruction.
+ *
+ * A block that merely ran out of room also ends in a goto_tb emitted here,
+ * for an instruction that did not branch.  That is not hidden: the successor
+ * it names is the next instruction's address, and a consumer separates it
+ * from a real branch by exactly that.
+ */
+void plugin_gen_record_tb_stop(void)
+{
+    struct qemu_plugin_tb *ptb = tcg_ctx->plugin_tb;
+    struct qemu_plugin_insn *insn;
+
+    /*
+     * tcg_ctx->plugin_insn, NOT the array's tail.  ptb->insns is REUSED
+     * across translations and keeps whatever length the longest block so far
+     * needed, so its last element is routinely a stale instruction from an
+     * earlier block; extending THAT one gives the current block's tb_stop
+     * ops to an instruction that is not in this block at all, and leaves the
+     * one that branched with an empty range.
+     */
+    insn = tcg_ctx->plugin_insn;
+    if (!ptb || !insn) {
+        return;
+    }
+    if (insn->ctrl_first_op) {
+        insn->ctrl_last_op = QTAILQ_LAST(&tcg_ctx->ops);
+    }
+}
+
 void plugin_gen_insn_end(void)
 {
     const DisasContextBase *db = tcg_ctx->plugin_db;
     struct qemu_plugin_insn *pinsn = tcg_ctx->plugin_insn;
 
     pinsn->len = db->fake_insn ? db->record_len : db->pc_next - pinsn->vaddr;
+
+    /*
+     * TAKEN BEFORE the marker below, and this is the whole point of taking
+     * it here rather than inferring the range from the next insn_start: at
+     * this instant the op list's tail is the last op translate_insn()
+     * emitted, and nothing of the block's epilogue exists yet.
+     */
+    pinsn->ctrl_last_op = QTAILQ_LAST(&tcg_ctx->ops);
 
     tcg_gen_plugin_cb(PLUGIN_GEN_AFTER_INSN);
 }
@@ -522,6 +584,14 @@ void plugin_gen_tb_end(CPUState *cpu, size_t num_insns)
     /* translator may have removed instructions, update final count */
     g_assert(num_insns <= ptb->n);
     ptb->n = num_insns;
+
+    /*
+     * Read the control transfer QEMU performed for each instruction out of
+     * the ops that performed it -- BEFORE the translate callback, which is
+     * where a plugin reads the answer, and before plugin_gen_inject() below
+     * rewrites the op list the recorded ranges point into.
+     */
+    insn_ctrl_classify(ptb);
 
     /* collect instrumentation requests */
     qemu_plugin_tb_trans_cb(cpu, ptb);

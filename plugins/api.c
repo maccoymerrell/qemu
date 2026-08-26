@@ -603,6 +603,36 @@ const char *qemu_plugin_insn_decode_name(const struct qemu_plugin_insn *insn)
     return insn->decode_name;
 }
 
+uint32_t qemu_plugin_insn_ctrl_flags(const struct qemu_plugin_insn *insn)
+{
+    return insn->ctrl_flags;
+}
+
+uint64_t qemu_plugin_insn_ctrl_target(const struct qemu_plugin_insn *insn)
+{
+    return insn->ctrl_target;
+}
+
+int32_t qemu_plugin_insn_ctrl_target_reg(const struct qemu_plugin_insn *insn)
+{
+    return insn->ctrl_target_reg;
+}
+
+int32_t qemu_plugin_insn_ctrl_addr_reg(const struct qemu_plugin_insn *insn)
+{
+    return insn->ctrl_addr_reg;
+}
+
+int32_t qemu_plugin_insn_ctrl_link_reg(const struct qemu_plugin_insn *insn)
+{
+    return insn->ctrl_link_reg;
+}
+
+int32_t qemu_plugin_insn_ctrl_link_addr_reg(const struct qemu_plugin_insn *insn)
+{
+    return insn->ctrl_link_addr_reg;
+}
+
 void *qemu_plugin_insn_haddr(const struct qemu_plugin_insn *insn)
 {
     const DisasContextBase *db = tcg_ctx->plugin_db;

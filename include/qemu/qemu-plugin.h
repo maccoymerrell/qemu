@@ -249,6 +249,15 @@ typedef uint64_t qemu_plugin_id_t;
  *   the target decoder dispatched on, and that slot's name in QEMU
  *   source vocabulary.  This is what QEMU executed, as opposed to what
  *   a disassembler says about the same bytes.
+ * - added qemu_plugin_insn_ctrl_flags / _target / _target_reg /
+ *   _addr_reg / _link_reg / _link_addr_reg: the CONTROL TRANSFER QEMU
+ *   performed for an instruction, read back out of the ops it emitted
+ *   to perform it.  The identity above says what the decoder called
+ *   the instruction; this says what the translation of it DID, in
+ *   TCG's vocabulary rather than any ISA's -- a compile-time
+ *   successor, a computed one, a choice between two, a published
+ *   return address.  Additive: the accessors return zero / -1 on an
+ *   instruction no target recorded a range for.
  *
  * Where an entry above says a signature changed WITHOUT the version
  * constant moving, the version in force at the time names two
@@ -841,6 +850,119 @@ uint32_t qemu_plugin_insn_decode_id(const struct qemu_plugin_insn *insn);
  */
 QEMU_PLUGIN_API
 const char *qemu_plugin_insn_decode_name(const struct qemu_plugin_insn *insn);
+
+/*
+ * QEMU_PLUGIN_CTRL_* -- the control transfer QEMU's translator PERFORMED for
+ * an instruction, read back out of the ops it emitted to perform it.
+ *
+ * This is the behavioural half of what a decoder is usually asked for.  The
+ * vocabulary is TCG's rather than any ISA's, so the same bits mean the same
+ * thing on every target: goto_tb is a compile-time successor, goto_ptr is a
+ * computed one, two distinct goto_tb edges is a choice, and an exit_tb with
+ * neither is a block that ended without a successor QEMU will chain to.
+ *
+ * WHAT IT DELIBERATELY DOES NOT SAY.  It does not say "call", "return" or
+ * "conditional jump", because those are names for combinations and the
+ * combination is the consumer's to make:
+ *
+ *   a CALL is TRANSFER | LINK -- the instruction published its own
+ *   fall-through address, into a register or onto the stack, which is what
+ *   makes the transfer callable on every target.
+ *
+ *   a RETURN is TRANSFER | INDIRECT with a target whose provenance is the
+ *   ABI's link register (qemu_plugin_insn_ctrl_target_reg()) or a load
+ *   through the stack pointer (TGT_LOAD with ctrl_addr_reg naming it).
+ *   Which register that is, is a fact about the ABI and not about the
+ *   transfer, so it is reported and not interpreted.
+ *
+ *   a REP/string continuation is DIRECT | CONDITIONAL | SELF -- one of the
+ *   static successors is the instruction's own address.
+ *
+ * INCOMPLETE is the failure direction rule applied here: it means the walk
+ * met something it could not account for, and a consumer must treat the
+ * whole classification as absent rather than as a negative answer.
+ */
+#define QEMU_PLUGIN_CTRL_TRANSFER     (1u << 0)  /* ends control flow      */
+#define QEMU_PLUGIN_CTRL_DIRECT       (1u << 1)  /* a goto_tb successor    */
+#define QEMU_PLUGIN_CTRL_INDIRECT     (1u << 2)  /* a goto_ptr successor   */
+#define QEMU_PLUGIN_CTRL_CONDITIONAL  (1u << 3)  /* two successors         */
+#define QEMU_PLUGIN_CTRL_LINK         (1u << 4)  /* published pc + len     */
+#define QEMU_PLUGIN_CTRL_SELF         (1u << 5)  /* a successor == own pc  */
+#define QEMU_PLUGIN_CTRL_TGT_LOAD     (1u << 6)  /* target came from a load */
+#define QEMU_PLUGIN_CTRL_NOCHAIN      (1u << 7)  /* exit_tb, no successor  */
+#define QEMU_PLUGIN_CTRL_INCOMPLETE   (1u << 8)  /* unaccounted-for op     */
+#define QEMU_PLUGIN_CTRL_VALID        (1u << 31) /* the walk ran           */
+
+/**
+ * qemu_plugin_insn_ctrl_flags() - what control transfer QEMU performed
+ * @insn: instruction reference
+ *
+ * Returns a bitmask of QEMU_PLUGIN_CTRL_*.  Zero means the classification
+ * was never taken for this instruction; QEMU_PLUGIN_CTRL_VALID alone means
+ * it was taken and the instruction transfers no control.
+ */
+QEMU_PLUGIN_API
+uint32_t qemu_plugin_insn_ctrl_flags(const struct qemu_plugin_insn *insn);
+
+/**
+ * qemu_plugin_insn_ctrl_target() - the statically-known successor
+ * @insn: instruction reference
+ *
+ * The address a DIRECT transfer's taken edge assigns to the program
+ * counter, as the translator emitted it.  0 when there is no static
+ * successor.  Where a conditional branch has two, this is the one that is
+ * not the architectural fall-through.
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_insn_ctrl_target(const struct qemu_plugin_insn *insn);
+
+/**
+ * qemu_plugin_insn_ctrl_target_reg() - where an indirect target was read
+ * @insn: instruction reference
+ *
+ * The TCG global -- the same index space as qemu_plugin_dataflow_reg_name()
+ * -- the target expression of an INDIRECT transfer was read from, or -1 if
+ * the transfer is not indirect or the target reached the program counter by
+ * a route this does not resolve to a single register.
+ */
+QEMU_PLUGIN_API
+int32_t qemu_plugin_insn_ctrl_target_reg(const struct qemu_plugin_insn *insn);
+
+/**
+ * qemu_plugin_insn_ctrl_addr_reg() - the address of a loaded target
+ * @insn: instruction reference
+ *
+ * When QEMU_PLUGIN_CTRL_TGT_LOAD is set, the TCG global the load's address
+ * was computed from -- the stack pointer, for the ordinary return.  -1 when
+ * no load produced the target or its address named no single register.
+ */
+QEMU_PLUGIN_API
+int32_t qemu_plugin_insn_ctrl_addr_reg(const struct qemu_plugin_insn *insn);
+
+/**
+ * qemu_plugin_insn_ctrl_link_reg() - where the return address was published
+ * @insn: instruction reference
+ *
+ * When QEMU_PLUGIN_CTRL_LINK is set, the TCG global the fall-through
+ * constant was assigned to, or -1 when the instruction stored it to memory
+ * instead.  A consumer that collects this over the calls it sees LEARNS the
+ * ABI's link register rather than being told its name -- which matters
+ * because the name QEMU's TCG uses for a register and the name its GDB stub
+ * uses are not always the same one (aarch64: `lr` and `x30`).
+ */
+QEMU_PLUGIN_API
+int32_t qemu_plugin_insn_ctrl_link_reg(const struct qemu_plugin_insn *insn);
+
+/**
+ * qemu_plugin_insn_ctrl_link_addr_reg() - the stack a return address went to
+ * @insn: instruction reference
+ *
+ * When QEMU_PLUGIN_CTRL_LINK is set and the return address was STORED, the
+ * TCG global the store's address was computed from -- the stack pointer.
+ * Collected the same way and for the same reason as the link register.
+ */
+QEMU_PLUGIN_API
+int32_t qemu_plugin_insn_ctrl_link_addr_reg(const struct qemu_plugin_insn *insn);
 
 /**
  * typedef qemu_plugin_meminfo_t - opaque memory transaction handle

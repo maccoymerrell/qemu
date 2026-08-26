@@ -153,6 +153,48 @@ struct qemu_plugin_insn {
 
     /* if set, the instruction calls helpers that might access guest memory */
     bool mem_helper;
+    /*
+     * The op range this instruction's translate_insn() emitted, and the
+     * control-transfer classification read back out of it by
+     * insn_ctrl_classify() (accel/tcg/insn-ctrl.h).
+     *
+     * ctrl_first_op is the PLUGIN_GEN_FROM_INSN marker emitted by
+     * plugin_gen_insn_start(); the range starts at the op AFTER it.
+     * ctrl_last_op is the op list's tail at the moment translate_insn()
+     * returned, taken in plugin_gen_insn_end() before that function emits
+     * anything of its own.  Bounding by the NEXT insn_start instead would
+     * hand the block's epilogue -- the interrupt exit, and the goto_tb
+     * emitted when a block merely ran out of room -- to whichever
+     * instruction happened to be last, which reads as a branch.
+     *
+     * Both are TCGOp pointers into tcg_ctx->ops and are valid only until
+     * plugin_gen_inject() rewrites that list.  They are cleared once the
+     * classification has been taken.
+     *
+     * APPENDED, and every future addition must be too.  These fields were
+     * first written into the middle of the struct, above insn_cbs, and the
+     * result was a build in which one object still held the old offsets: the
+     * very next translation read insn_cbs out of ctrl_link_reg's bytes and
+     * handed the garbage to g_array_set_size().  It is the same failure the
+     * plugin dataflow ABI was designed around (see qemu-plugin-dataflow.h),
+     * met again inside QEMU's own tree, and the same rule answers it.
+     */
+    const void *ctrl_first_op;
+    const void *ctrl_last_op;
+    uint32_t ctrl_flags;        /* QEMU_PLUGIN_CTRL_* */
+    uint64_t ctrl_target;       /* the taken edge's constant, 0 if none */
+    int32_t  ctrl_target_reg;   /* TCG global the target was read from, -1 */
+    int32_t  ctrl_addr_reg;     /* the load's address register, -1 */
+    /*
+     * Where the LINK value went: the guest register the fall-through
+     * constant was assigned to, or -- when it was stored to memory -- the
+     * register the store's address was computed from.  Both -1 when the
+     * instruction publishes no return address.  This is what lets a consumer
+     * LEARN which register is the link register and which is the stack
+     * pointer, from the calls it sees, instead of being told their names.
+     */
+    int32_t  ctrl_link_reg;
+    int32_t  ctrl_link_addr_reg;
 };
 
 /* A scoreboard is an array of values, indexed by vcpu_index */

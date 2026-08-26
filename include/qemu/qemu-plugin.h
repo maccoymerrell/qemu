@@ -820,7 +820,7 @@ uint32_t qemu_plugin_insn_decode_id(const struct qemu_plugin_insn *insn);
  * qemu_plugin_insn_decode_name() - name of the decode-table slot
  * @insn: opaque instruction handle from qemu_plugin_tb_get_insn()
  *
- * Returns the slot's name in QEMU's own source vocabulary: the `op`
+ * Returns the slot's name in QEMU's own source vocabulary: the ``op``
  * argument of the i386 X86_OP_ENTRY (so the gen_<op> it dispatches
  * to), the decodetree pattern name (so the trans_<name> it dispatches
  * to) elsewhere.  The string is a compile-time constant owned by QEMU
@@ -828,12 +828,12 @@ uint32_t qemu_plugin_insn_decode_id(const struct qemu_plugin_insn *insn);
  *
  * THE NAME IS NOT UNIQUE, and it is not a mnemonic either.  On
  * x86_64, 472 of the 854 decode-table slots share their name with at
- * least one other slot -- `MOV` names 35 of them and `Jcc` names 32 --
+ * least one other slot -- ``MOV`` names 35 of them and ``Jcc`` names 32 --
  * and over a mixed user-mode workload 85.6% of translated instructions
  * carried a name that did not determine which slot decoded them.
  * Worse, a slot's name is the generator QEMU dispatches to, which is
- * not always the instruction: `cmp` decodes through slots named `SUB`
- * and `test` through a slot named `AND`, because QEMU implements them
+ * not always the instruction: ``cmp`` decodes through slots named ``SUB``
+ * and ``test`` through a slot named ``AND``, because QEMU implements them
  * with the flag-setting half of those generators and writes the
  * discarded destination out of the row (X86_OP_ENTRYrr).  A consumer
  * that tells decode rules apart by name alone is wrong by
@@ -843,7 +843,7 @@ uint32_t qemu_plugin_insn_decode_id(const struct qemu_plugin_insn *insn);
  * Where a target's table itself is coarse the name is coarse with it,
  * and that is reported rather than papered over: on i386 the whole x87
  * escape space (root opcodes 0xD8..0xDF) is eight slots that all name
- * `x87`, because gen_x87 switches on the modrm byte internally and
+ * ``x87``, because gen_x87 switches on the modrm byte internally and
  * QEMU's table has no finer identity to give.
  *
  * Returns: slot name, or NULL if the target recorded no identity.
@@ -948,7 +948,7 @@ int32_t qemu_plugin_insn_ctrl_addr_reg(const struct qemu_plugin_insn *insn);
  * instead.  A consumer that collects this over the calls it sees LEARNS the
  * ABI's link register rather than being told its name -- which matters
  * because the name QEMU's TCG uses for a register and the name its GDB stub
- * uses are not always the same one (aarch64: `lr` and `x30`).
+ * uses are not always the same one -- on aarch64 they are lr and x30.
  */
 QEMU_PLUGIN_API
 int32_t qemu_plugin_insn_ctrl_link_reg(const struct qemu_plugin_insn *insn);

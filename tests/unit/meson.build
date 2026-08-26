@@ -20,7 +20,6 @@ tests = {
   'test-string-output-visitor': [testqapi],
   'test-visitor-serialization': [testqapi],
   'test-bitmap': [],
-  'test-timer-rearm-bound': [],
   'test-resv-mem': [],
   # all code tested by test-x86-topo is inside topology.h
   'test-x86-topo': [],
@@ -50,6 +49,17 @@ tests = {
   'test-interval-tree': [],
   'test-fifo': [],
 }
+
+# util/qemu-timer.c -- which supplies timer_init_full(), timer_mod_ns(),
+# timerlist_run_timers() and qemu_clock_get_ns() -- is compiled into
+# libqemuutil only under the same condition (util/meson.build).  Declared
+# unconditionally, this test fails to LINK in any configuration that has
+# neither, which a linux-user-only target list is.
+if have_block or have_ga
+  tests += {
+    'test-timer-rearm-bound': [],
+  }
+endif
 
 if have_system or have_tools
   tests += {

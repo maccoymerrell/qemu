@@ -1,20 +1,28 @@
 """Prove that the IR-derived dataflow does not depend on Capstone's operands.
 
-Capstone is retained, permanently, for instruction identification.  What
-changes is not whether it is called but what is asked of it and acted on:
+SCOPE, AND THE RULING IT IS WRITTEN UNDER.  This file used to open by
+stating that Capstone is retained permanently for instruction
+identification.  That was ruling J4, and J4 is RETIRED -- superseded by J6
+(2026-08-25), under which Capstone leaves every correctness path, the
+identification J4 reserved included: bytes->identity, opcode taxonomy,
+branch classification, instruction length, and the mnemonic table's key.
+So nothing below is a statement that a Capstone dependency is permitted;
+what this checks is one PART of the exit, and the part it does not check
+is the larger one.
 
-    KEPT      decoding bytes to a mnemonic; the opcode taxonomy derived from
-              that mnemonic; branch classification; instruction length and the
-              boundary that follows from it -- everything the mnemonic table
-              exists to do, which is translating an ISA-specific instruction
-              into the generic format.
+    CHECKED HERE   that no Capstone operand, access flag or register-list
+                   error can reach the IR-derived dependency model.
 
-    REPLACED  register read and write sets; implicit operands; tied operands;
-              memory operand directions; lane masks; and every boundary
-              workaround whose purpose was repairing one of those.
+    NOT CHECKED    everything the tracer still takes from the boundary and
+                   publishes.  ``mnem`` is asserted to MOVE below, and that
+                   assertion is a measurement of the coupling that remains,
+                   not a licence for it.  Under J4 it was the one permitted
+                   coupling; under J6 it is a defect with a fix path.
 
-So a wrong mnemonic from Capstone is still a defect that reaches the trace.
-That is the one permitted coupling and it is deliberate, not residual.
+Pointing this check at a plugin-produced trace is what will gate the
+rewiring, and until that happens the wire's own answer is the number that
+matters: at cb05983200 every mutation mode below moves the .cst bytes on
+all four ISAs.
 
 The claim this checks is an absence: no path exists by which a Capstone
 operand, access flag, or register-list error can reach the dependency model.

@@ -7,12 +7,19 @@
  * an unread table is an unverified one: it cannot be stale, wrong or dead
  * in any way anybody finds out about.  This is what reads them.
  *
- * WHAT IT IS AND IS NOT.  It is NOT a second source of opcode truth.  J4
- * of the arc's rulings retains Capstone permanently for instruction
- * identification, so the wire's opcode still comes from the mnemonic
- * table and nothing here can move a byte of it.  What the QEMU identity
- * adds is a KEY that Capstone does not control, and that key can be asked
- * three questions Capstone cannot be asked about itself:
+ * WHAT IT IS AND IS NOT.  This header used to say that J4 retains
+ * Capstone permanently for instruction identification, so nothing here
+ * could move a byte of the wire.  J4 IS RETIRED -- J6 (2026-08-25) takes
+ * Capstone off every correctness path including identification, and makes
+ * this identity the intended SOURCE of the opcode taxonomy rather than a
+ * key beside it.  What has not happened yet is the flip: the classifier
+ * in champsim_tracer_decode.cc still keys on the Capstone insn_id, so as
+ * of this writing nothing here moves a byte of the wire.  That is a
+ * statement about where the work stands, NOT about where it is going.
+ *
+ * Until the flip, the identity is a KEY that Capstone does not control,
+ * and that key can be asked three questions Capstone cannot be asked
+ * about itself:
  *
  *   1. IS THE TABLE CURRENT?  Every row carries the pattern's name.  QEMU
  *      reports the name too, at runtime, from the decoder that actually
@@ -43,13 +50,19 @@
  * separates.  Both directions are counted so the coarser side of any
  * disagreement is visible instead of inferred.
  *
- * x86_64 HAS NO TABLE AND THAT IS REPORTED AS SUCH.  The i386 leg derives
- * its id from the source line of an X86_OP_ENTRY expansion; there is no
- * generated pattern universe to tabulate.  mipsel HAS a table whose rows
- * are all vendor extensions, because the MIPS32/64 base ISA is decoded by
- * a hand-written switch -- so the expected reading there is that almost
- * nothing carries an identity at all, and the reader states that instead
- * of burying it in a percentage.
+ * ALL FOUR ISAs TABULATE, and the two that once did not are the reason
+ * this paragraph is worth reading.  x86_64 was described here as having
+ * no table, because the i386 leg derives its id from the source line of
+ * an X86_OP_ENTRY expansion rather than a decodetree pattern; that was a
+ * statement about where the generator looked, and the universe is the
+ * decode table itself (cb05983200).  mipsel was described as carrying
+ * almost no identity at all, because its base ISA is a hand-written
+ * switch rather than decodetree; that switch is now instrumented
+ * (7e2e1baf07).  Measured at cb05983200 on a four-ISA workload, the
+ * share of translated instructions exporting NO identity is 0.0% on all
+ * four -- 2, 2, 0 and 0 instructions on x86_64, aarch64, riscv64 and
+ * mipsel.  The percentage is still printed rather than asserted, because
+ * a generated table can go stale between one build and the next.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  * Author: Maccoy Merrell
@@ -847,10 +860,11 @@ void qemu_ident_report(GString *report)
         "\n--- QEMU decode identity: the rule the translator dispatched on "
         "---\n"
         "The table is champsim_tracer_qemu_ident_<isa>.h, one row per "
-        "decodetree pattern, keyed by qemu_plugin_insn_decode_id().  It is "
-        "NOT a second source of opcode truth -- the wire's opcode still "
-        "comes from Capstone (ruling J4) and nothing here can move it.  What "
-        "it gives is a key Capstone does not control.\n"
+        "decode rule, keyed by qemu_plugin_insn_decode_id().  Under ruling "
+        "J6 this identity is the INTENDED source of the wire's opcode "
+        "taxonomy; it is not the source yet, so today the wire still "
+        "takes its opcode from Capstone and the numbers below measure "
+        "how ready the replacement is.\n"
         "  translated instructions read           %10" PRIu64 "\n"
         "  no identity exported (id == 0)         %10" PRIu64 "  %5.1f%%\n"
         "  id carried, NO ROW IN TABLE            %10" PRIu64 "  <- stale table\n"

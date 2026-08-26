@@ -128,6 +128,22 @@ static void ctrl_one(struct qemu_plugin_insn *insn, Origin *orig,
     bool direct_by_value = false;
     int32_t link_reg = -1, link_addr_reg = -1;
     unsigned goto_tb_idx_seen = 0;   /* bitmap of the indices used */
+    /*
+     * DISTINCT compile-time successors reached through goto_ptr.  A
+     * conditional branch does NOT always leave two goto_tb edges behind:
+     * translator_use_goto_tb() declines a destination outside the block's
+     * page (accel/tcg/translator.c), and when BOTH of a conditional
+     * branch's edges are declined the translator lowers both through
+     * lookup_and_goto_ptr with the successor as a constant.  Counting only
+     * goto_tb indices then reports such a branch as unconditional, which is
+     * the same undercount goto_tb_idx_seen exists to prevent, one lowering
+     * further down.  Four slots because no target emits more than two
+     * compile-time successors for one instruction and the third would
+     * already be a defect; an overflow degrades to "at least two", which is
+     * all the CONDITIONAL bit needs.
+     */
+    uint64_t const_succ[4];
+    unsigned n_const_succ = 0;
 
     insn->ctrl_flags = 0;
     insn->ctrl_target = 0;
@@ -237,9 +253,27 @@ static void ctrl_one(struct qemu_plugin_insn *insn, Origin *orig,
                          * a transfer direct is that its target is a constant,
                          * and that is what is tested.
                          */
-                        target = o.val;
-                        have_target = true;
-                        if (target == insn->vaddr) {
+                        unsigned ci;
+
+                        for (ci = 0; ci < n_const_succ; ci++) {
+                            if (const_succ[ci] == o.val) {
+                                break;
+                            }
+                        }
+                        if (ci == n_const_succ &&
+                            n_const_succ < ARRAY_SIZE(const_succ)) {
+                            const_succ[n_const_succ++] = o.val;
+                        }
+                        /*
+                         * Same preference the goto_tb arm applies: with two
+                         * successors in hand one of them IS the architectural
+                         * continuation, and the branch's target is the other.
+                         */
+                        if (!have_target || target == fallthrough) {
+                            target = o.val;
+                            have_target = true;
+                        }
+                        if (o.val == insn->vaddr) {
                             flags |= QEMU_PLUGIN_CTRL_SELF;
                         }
                         direct_by_value = true;
@@ -410,9 +444,16 @@ static void ctrl_one(struct qemu_plugin_insn *insn, Origin *orig,
          * goto_tb indices rather than goto_tb ops is deliberate: QEMU emits
          * one per edge and gives each edge its own index, so a repeated index
          * is one edge reached twice, not two edges.
+         *
+         * The third arm is the same statement one lowering down: two
+         * DISTINCT constant successors dispatched through goto_ptr are two
+         * edges the instruction chose between, and they are what a
+         * conditional branch leaves behind when translator_use_goto_tb()
+         * declines both of its destinations.
          */
         if (ctpop32(goto_tb_idx_seen) >= 2 ||
-            (n_goto_tb && saw_goto_ptr)) {
+            (n_goto_tb && saw_goto_ptr) ||
+            n_const_succ >= 2) {
             flags |= QEMU_PLUGIN_CTRL_CONDITIONAL;
         }
     } else if (saw_exit_tb) {

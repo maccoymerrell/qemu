@@ -577,9 +577,24 @@ static void assign_dst_lane(InsnFields *f, uint16_t cap_id, uint64_t lane)
     }
 }
 
+/*
+ * Set while an instruction is being decoded for MEASUREMENT rather than for
+ * the wire.  decode_detail_to_generic() is not a pure function of its
+ * scratch: an unclassified mnemonic bumps g_stats.unknown_insn_warnings and
+ * appends a line to the sidecar log.  A second call on the same instruction
+ * -- which is exactly what scoring the tracer's branch class against QEMU's
+ * needs -- therefore DOUBLES both, and the counter is one an acceptance gate
+ * reads.  An instrument that moves the number it is standing next to is not
+ * an instrument.
+ */
+thread_local bool g_unknown_warn_suppressed = false;
+
 static void warn_unknown_instruction(uint64_t pc, const char *reason,
                                      const char *mnem, const char *disas)
 {
+    if (g_unknown_warn_suppressed) {
+        return;
+    }
     g_mutex_lock(&unknown_warn_lock);
     g_stats.unknown_insn_warnings++;
 

@@ -10743,8 +10743,13 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
                 bt_s = std::make_unique<InsnFieldsScratch>();
             }
             insn_fields_scratch_reset(bt_s.get());
+            /* Measurement, not production: this instruction has already
+             * been decoded for the wire, and a second unclassified-mnemonic
+             * warning for it would double a counter a gate reads. */
+            g_unknown_warn_suppressed = true;
             decode_detail_to_generic(insn_pcs[c], &insn_info[c], &bt_s->f,
                                      nullptr);
+            g_unknown_warn_suppressed = false;
             qemu_ident_note_ctrl(qi, &insn_info[c], bt_s->f.branch_type,
                                  qnames[c], insn_pcs[c], insn_sizes[c]);
         }

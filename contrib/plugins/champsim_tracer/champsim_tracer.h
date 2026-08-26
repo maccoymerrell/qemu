@@ -1721,6 +1721,12 @@ void report_undecodable_block(uint64_t pc);
  */
 uint8_t generic_for_qemu_name(const char *name);
 
+/*
+ * Suppress the unknown-mnemonic warning and its counter for the duration of
+ * a decode taken for measurement.  See champsim_tracer_decode.cc.
+ */
+extern thread_local bool g_unknown_warn_suppressed;
+
 void decode_detail_to_generic(uint64_t pc,
                               const qemu_plugin_insn_info *info,
                               InsnFields *out,

@@ -162,12 +162,52 @@ static TCGv_i64 plugin_maybe_preserve_addr(TCGTemp *addr)
 }
 
 #ifdef CONFIG_PLUGIN
+/*
+ * A PLANTED OBSERVER EFFECT, for the check that looks for real ones.
+ *
+ * insn-dataflow.c reads the op list a translation produced, and when a plugin
+ * is attached that list also contains ops the PLUGIN LAYER emitted -- the
+ * value-save stores below, the address copy in maybe_extend_addr64(), the
+ * plugin_mem_cb op itself.  One of those once made every load on two targets
+ * name its own destination as a source (29e0f4e944), and it was found by
+ * accident: QEMU checking QEMU cannot see this class, because both halves
+ * read the same instrumented stream.
+ *
+ * The check is therefore a plugin-vs-NO-plugin diff of the extraction (see
+ * translator_df_unattached()).  A zero from that diff means something only if
+ * it could have been non-zero, so this puts one difference there on demand:
+ * one extra op, emitted only because a plugin is attached, on every memory
+ * access on every target.  An env READ rather than a write, because a store
+ * to any positive env offset would be guest state.
+ *
+ * Read once, off unless asked for, and never on a shipped path.
+ */
+static bool plugin_df_plant(void)
+{
+    static bool val, val_read;
+
+    if (unlikely(!val_read)) {
+        const char *e = getenv("QEMU_DF_PLANT_OE");
+
+        val = e && *e;
+        val_read = true;
+    }
+    return val;
+}
+
 static void
 plugin_gen_mem_callbacks(TCGv_i64 copy_addr, TCGTemp *orig_addr, MemOpIdx oi,
                          enum qemu_plugin_mem_rw rw)
 {
     if (tcg_ctx->plugin_insn != NULL) {
         qemu_plugin_meminfo_t info = make_plugin_meminfo(oi, rw);
+
+        if (unlikely(plugin_df_plant())) {
+            TCGv_i64 plant = tcg_temp_ebb_new_i64();
+
+            tcg_gen_ld_i64(plant, tcg_env, 0);
+            tcg_temp_free_i64(plant);
+        }
 
         if (tcg_ctx->addr_type == TCG_TYPE_I32) {
             if (!copy_addr) {

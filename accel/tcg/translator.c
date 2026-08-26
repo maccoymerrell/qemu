@@ -329,6 +329,29 @@ static void translator_nosplit_retreat(DisasContextBase *db, CPUState *cpu,
     /* Retreat point at pc_first or beyond the ring: give up. */
 }
 
+/*
+ * Should the dataflow extraction run with no plugin attached?
+ *
+ * Only when a dump has been asked for.  The extraction's product is read by
+ * plugins and by the dump; with no plugin there is no reader but the dump,
+ * so this neither costs nor changes anything in a normal unattached run.
+ *
+ * Read once: the environment cannot change under a running QEMU, and this
+ * sits on the translation path.
+ */
+static bool translator_df_unattached(void)
+{
+    static bool val, val_read;
+
+    if (unlikely(!val_read)) {
+        const char *e = getenv("QEMU_DF_DUMP");
+
+        val = e && *e;
+        val_read = true;
+    }
+    return val;
+}
+
 void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
                      vaddr pc, void *host_pc, const TranslatorOps *ops,
                      DisasContextBase *db)
@@ -549,6 +572,27 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
          */
         insn_dataflow_extract(db->num_insns);
         plugin_gen_tb_end(cpu, db->num_insns);
+    } else if (translator_df_unattached()) {
+        /*
+         * The extraction with NOTHING WATCHING.
+         *
+         * Every op the extraction reads was emitted by the target's
+         * translator -- except the ones the plugin layer adds BECAUSE a
+         * plugin is attached: the value-save stores in
+         * plugin_gen_mem_callbacks_*, the address copy in
+         * maybe_extend_addr64(), the plugin_mem_cb op itself, and the
+         * per-target publications gated on db->plugin_enabled.  An
+         * instrument that only ever runs alongside those ops cannot say
+         * which of its output they caused, and QEMU-checking-QEMU cannot
+         * say either, because both halves read the same instrumented
+         * stream.
+         *
+         * So the extraction is made runnable with no plugin at all,
+         * dump-only, and the two dumps are diffed.  A difference IS an
+         * observer effect; a zero is a result only because this arm exists
+         * and could have shown one.
+         */
+        insn_dataflow_extract(db->num_insns);
     }
 
     if (qemu_loglevel_mask(CPU_LOG_TB_IN_ASM)

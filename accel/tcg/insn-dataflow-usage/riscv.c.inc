@@ -10,6 +10,9 @@
  *            macro" -- and every field name below was accepted by
  *            offsetof(CPUArchState, ...) before it was written.
  *
+ * Every field name was accepted on EVERY configured target that
+ * compiles this file (they define TARGET_RISCV): riscv32-linux-user, riscv32-softmmu, riscv64-linux-user, riscv64-softmmu.
+ *
  * Rows refused, and therefore still OVER-APPROXIMATED at run time:
  *   csrr                     env passed to predicate(), not defined in this unit
  *   csrw                     env passed to predicate(), not defined in this unit

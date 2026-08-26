@@ -10,6 +10,9 @@
  *            macro" -- and every field name below was accepted by
  *            offsetof(CPUArchState, ...) before it was written.
  *
+ * Every field name was accepted on EVERY configured target that
+ * compiles this file (they define TARGET_MIPS): mips-linux-user, mips-softmmu, mips64-linux-user, mips64-softmmu, mips64el-linux-user, mips64el-softmmu, mipsel-linux-user, mipsel-softmmu, mipsn32-linux-user, mipsn32el-linux-user.
+ *
  * Rows refused, and therefore still OVER-APPROXIMATED at run time:
  *   (none)
  *

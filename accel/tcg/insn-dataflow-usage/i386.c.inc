@@ -10,6 +10,9 @@
  *            macro" -- and every field name below was accepted by
  *            offsetof(CPUArchState, ...) before it was written.
  *
+ * Every field name was accepted on EVERY configured target that
+ * compiles this file (they define TARGET_I386): i386-linux-user, i386-softmmu, x86_64-linux-user, x86_64-softmmu.
+ *
  * Rows refused, and therefore still OVER-APPROXIMATED at run time:
  *   (none)
  *

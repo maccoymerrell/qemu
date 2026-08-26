@@ -10,6 +10,15 @@
  *            macro" -- and every field name below was accepted by
  *            offsetof(CPUArchState, ...) before it was written.
  *
+ * Every field name was accepted on EVERY configured target that
+ * compiles this file (they define TARGET_ARM): aarch64-linux-user, aarch64-softmmu, aarch64_be-linux-user, arm-linux-user, arm-softmmu, armeb-linux-user.
+ *
+ * Rows emitted under a DERIVED guard -- the field is a member on
+ * only part of that family, and the macro named is the one whose
+ * truth set over the family is exactly the set that has it:
+ *   autia                  defined(TARGET_AARCH64)    keys
+ *   pacia                  defined(TARGET_AARCH64)    keys
+ *
  * Rows refused, and therefore still OVER-APPROXIMATED at run time:
  *   access_check_cp_reg      env passed to accessfn(), not defined in this unit
  *   sete                     env passed to stepfn(), not defined in this unit
@@ -40,6 +49,7 @@
  *     because a `ret` does not depend on the vector type register.
  */
 
+#if defined(TARGET_AARCH64)
 static const DfHelperField dfu_autia_env[] = {
     { offsetof(CPUArchState, aarch64), sizeof(((CPUArchState *)0)->aarch64), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/cpu.h:1312 */
     { offsetof(CPUArchState, cp15), sizeof(((CPUArchState *)0)->cp15), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/internals.h:406 */
@@ -50,6 +60,7 @@ static const DfHelperField dfu_autia_env[] = {
     { offsetof(CPUArchState, uncached_cpsr), sizeof(((CPUArchState *)0)->uncached_cpsr), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/internals.h:466 */
     { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/cpu.h:2676 */
 };
+#endif
 static const DfHelperField dfu_cpye_env[] = {
     { offsetof(CPUArchState, CF), sizeof(((CPUArchState *)0)->CF), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/tcg/helper-a64.c:1462 */
     { offsetof(CPUArchState, aarch64), sizeof(((CPUArchState *)0)->aarch64), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/cpu.h:1312 */
@@ -163,6 +174,7 @@ static const DfHelperField dfu_irg_env[] = {
 static const DfHelperField dfu_ldg_env[] = {
     { offsetof(CPUArchState, hflags), sizeof(((CPUArchState *)0)->hflags), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/internals.h:47 */
 };
+#if defined(TARGET_AARCH64)
 static const DfHelperField dfu_pacia_env[] = {
     { offsetof(CPUArchState, aarch64), sizeof(((CPUArchState *)0)->aarch64), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/cpu.h:1312 */
     { offsetof(CPUArchState, cp15), sizeof(((CPUArchState *)0)->cp15), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/internals.h:406 */
@@ -173,6 +185,7 @@ static const DfHelperField dfu_pacia_env[] = {
     { offsetof(CPUArchState, uncached_cpsr), sizeof(((CPUArchState *)0)->uncached_cpsr), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/internals.h:466 */
     { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/cpu.h:2676 */
 };
+#endif
 static const DfHelperField dfu_rebuild_hflags_a64_env[] = {
     { offsetof(CPUArchState, aarch64), sizeof(((CPUArchState *)0)->aarch64), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/cpu.h:1312 */
     { offsetof(CPUArchState, cp15), sizeof(((CPUArchState *)0)->cp15), INSN_DF_RD, DF_HF_OPERAND },   /* ../target/arm/helper.c:5631 */
@@ -206,9 +219,11 @@ static const DfHelperField dfu_lookup_tb_ptr_env[] = {
 };
 
 static const DfHelperUsage df_helper_usage[] = {
+#if defined(TARGET_AARCH64)
     { "autia", { 0 },
       dfu_autia_env, ARRAY_SIZE(dfu_autia_env), true,
       "../target/arm/tcg/pauth_helper.c:552" },
+#endif
     { "cpye", { 0 },
       dfu_cpye_env, ARRAY_SIZE(dfu_cpye_env), true,
       "../target/arm/tcg/helper-a64.c:2519" },
@@ -266,9 +281,11 @@ static const DfHelperUsage df_helper_usage[] = {
     { "lookup_cp_reg", { 0 },
       NULL, 0, true,
       "../target/arm/tcg/op_helper.c:930" },
+#if defined(TARGET_AARCH64)
     { "pacia", { 0 },
       dfu_pacia_env, ARRAY_SIZE(dfu_pacia_env), true,
       "../target/arm/tcg/pauth_helper.c:491" },
+#endif
     { "rbit64", { 0 },
       NULL, 0, true,
       "../target/arm/tcg/helper-a64.c:67" },

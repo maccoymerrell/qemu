@@ -118,31 +118,36 @@ if get_option('plugins')
     cpp_args: cst_tools_cpp_args,
     link_with: cst_tools_common,
     install: false)
-  # cst_decode uses Capstone for the --objdump-style disasm column.
-  # Pin to QEMU's bundled subprojects/capstone (built from
-  # capstone.wrap) rather than the project-default capstone variable
-  # which can resolve to a system pkg-config copy whose layout differs.
-  # Sticking with the subproject keeps cst_decode reproducible across
-  # hosts and matches the same Capstone build the plugin links against.
-  #
-  # The capstone integration lives in cst_objdump.cc; CST_HAVE_CAPSTONE
-  # toggles between the real backend (this build) and a no-op stub
-  # (used by downstream consumers who lift the decoder into their own
-  # tooling without a capstone dependency).
-  cst_capstone_dep = subproject('capstone', required: true) \
-                         .get_variable('capstone_dep')
+  # cst_decode's --objdump column is COSMETIC (ruling J6, 2026-08-25):
+  # nothing it renders reaches a verdict, a table or the wire.  It is
+  # produced by a binutils `objdump` CHILD PROCESS -- see
+  # champsim_tracer/tools/cst_objdump.h for why a subprocess rather
+  # than libopcodes (GPL-3.0 linkage) or Capstone (which J6 removes
+  # from the project).  So cst_decode links NOTHING for it: the
+  # disassembler is discovered at run time and the column disables
+  # itself, loudly, on a host that has none.
   t += executable(
     'cst_decode',
     files('champsim_tracer/tools/cst_decode_main.cc',
           'champsim_tracer/tools/cst_raw.cc',
           'champsim_tracer/tools/cst_objdump.cc'),
-    cpp_args: cst_tools_cpp_args + ['-DCST_HAVE_CAPSTONE=1'],
+    cpp_args: cst_tools_cpp_args,
     link_with: cst_tools_common,
-    dependencies: [cst_capstone_dep],
     install: false)
+  # ARC INSTRUMENTS, NOT VIEWERS.  The two targets below take Capstone
+  # as their MEASURED SUBJECT: capstone_workaround_probe retests the
+  # disas/capstone.c defect workarounds, and isaxcheck cross-checks the
+  # exact Capstone boundary the tracer consumes against LLVM MC.  They
+  # keep linking subprojects/capstone for exactly as long as that
+  # subject exists, and retire with it when the wire flip deletes the
+  # workarounds they probe.  Pinned to the bundled subprojects/capstone
+  # rather than the project-default capstone variable, which can
+  # resolve to a system pkg-config copy whose layout differs.
+  cst_capstone_dep = subproject('capstone', required: true) \
+                         .get_variable('capstone_dep')
   # cst_visualize: streams the same shared cst_decode walker and
   # accumulates a chosen metric into instruction-window bins, then
-  # writes an SVG.  No Capstone dependency — its only inputs are the
+  # writes an SVG.  No disassembler at all — its only inputs are the
   # numeric ids in the trace and the trace's own encoding maps.
   t += executable(
     'cst_visualize',
@@ -153,8 +158,9 @@ if get_option('plugins')
   # capstone_workaround_probe: retest harness for the Capstone-defect
   # workarounds catalogued in disas/capstone.c -- see that file and
   # docs/troubleshooting.rst ("Retiring a Capstone workaround") for the
-  # full retirement procedure this tool automates. Pins to the same
-  # subprojects/capstone build as cst_decode, for the same reason.
+  # full retirement procedure this tool automates.  ARC INSTRUMENT:
+  # Capstone is the SUBJECT here, not a viewer backend, so the link
+  # stays until the workarounds retire.
   t += executable(
     'capstone_workaround_probe',
     files('champsim_tracer/tools/capstone_workaround_probe.cc'),
@@ -203,6 +209,17 @@ if get_option('plugins')
     files('champsim_tracer/tools/isaxcheck_fields.cc',
           'champsim_tracer/champsim_tracer_decode.cc',
           'champsim_tracer/champsim_tracer_mnemonic_tables.cc',
+          # The QEMU-identity reader, for the adjudicated split rows the
+          # classifier now takes from it.  It is INERT here and that is
+          # stated rather than left to be assumed: isaxcheck decodes raw
+          # bytes through cap_disas_raw_detail(), which has no insn handle
+          # and therefore leaves qemu_plugin_insn_info::decode_id at 0, and
+          # qemu_ident_install() is never called so there is no table bound
+          # either.  Linking it anyway means a generated identity table
+          # that will not compile breaks this gate too; it does NOT mean
+          # the gate covers the adjudication, which needs a running
+          # translator.
+          'champsim_tracer/champsim_tracer_qemu_ident.cc',
           'champsim_tracer/champsim_tracer_reg_handle_cache.cc'),
     include_directories: ['../../include/qemu', '../../include',
                           'champsim_tracer'],

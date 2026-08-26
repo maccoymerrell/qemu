@@ -9,7 +9,8 @@
  * (wire types), cst_reader.h (pull reader + Source), cst_format.h/.cc
  * (container open + parse_header), cst_decode.h/.cc (this file:
  * BodyWalker + instructions_from_entry), cst_objdump.h/.cc (OPTIONAL
- * --objdump; no-op stub without -DCST_HAVE_CAPSTONE).  Plain C++17 +
+ * cosmetic --objdump column, rendered by a binutils objdump child
+ * process; disabled at run time when the host has none).  Plain C++17 +
  * a small POSIX set for cst_format.cc; no QEMU/glib.  Consumers can
  * feed the walker from their own byte source via Reader(const
  * uint8_t *, size_t, size_t) and skip the subprocess decompressor.

@@ -12,8 +12,9 @@ from the file.
   instruction.  ``--templates-only`` suppresses the body walk and emits
   one PC-sorted line per static template entry — the analogue of
   ``objdump -d`` over the captured templates.  ``--objdump`` adds a
-  side-by-side Capstone disassembly column so the generic-opcode line
-  can be cross-checked against ``objdump`` output.  ``--format=raw``
+  side-by-side native disassembly column, rendered by binutils
+  ``objdump`` itself, so the generic-opcode line can be read beside the
+  canonical ISA mnemonic.  ``--format=raw``
   swaps the disassembly for a byte-offset-annotated pseudo-wire dump of
   the raw header and body records, for debugging the format itself.
 
@@ -272,16 +273,46 @@ comment prefix.
    A trace with no self-modified code omits the section entirely.
 
 ``--objdump``
-   Add a side-by-side Capstone-disassembly column to each printed
-   line so the generic-opcode rendering can be cross-checked
-   against the canonical ISA mnemonic.  Combines with
-   ``--templates-only`` (templates side-by-side with Capstone) and
-   with the default body walk (per-execution lines side-by-side
-   with Capstone, but only the static template half is shown on
-   the Capstone side — ``objdump`` has no notion of the captured
-   dynamic values).  Capstone is taken from the bundled
-   ``subprojects/capstone`` so both sides come from the same
-   build the plugin links against.
+   Add a side-by-side native-disassembly column to each printed line
+   so the generic-opcode rendering can be read beside the canonical
+   ISA mnemonic.  Combines with ``--templates-only`` (templates
+   side-by-side with the disassembler) and with the default body walk
+   (per-execution lines side by side, but only the static template
+   half appears on the disassembler side — a disassembler has no
+   notion of the captured dynamic values).
+
+   The column is **cosmetic**.  Nothing it renders reaches a verdict,
+   a table or the wire: it is produced by a binutils ``objdump``
+   **child process**, so the disassembler cannot touch the decoder's
+   state at all, and every other byte ``cst_decode`` prints is
+   identical whether or not ``--objdump`` is passed.
+
+   The program is discovered at run time — no build-time dependency.
+   ``cst_decode`` tries the ISA's cross-binutils name first
+   (``x86_64-linux-gnu-objdump``, ``aarch64-linux-gnu-objdump``,
+   ``riscv64-linux-gnu-objdump``, ``mipsel-linux-gnu-objdump``) and
+   then plain ``objdump``, and it *probes* each candidate by
+   disassembling a known encoding of that ISA, so a host ``objdump``
+   built without the target is rejected rather than silently
+   rendering nothing.  ``$CST_OBJDUMP`` names a program explicitly.
+   When no candidate works the column is dropped with a diagnostic on
+   stderr and the rest of the output is unaffected.
+
+   Rendering is batched: every instruction in the templates section is
+   disassembled up front, grouped into contiguous address regions, so
+   a whole trace costs a handful of ``objdump`` runs rather than one
+   per line.  A line is accepted only when the byte column
+   ``objdump`` prints matches the exact instruction bytes it was asked
+   about, so a linear sweep that fell out of phase — x86 blocks that
+   overlap mid-instruction — produces a one-shot re-run, never a
+   mis-attributed rendering.  Bytes that genuinely do not decode print
+   as ``(undecoded)``.
+
+   The dialect is GNU binutils', not Capstone's: x86 mnemonics carry
+   no redundant operand-size suffix (``mov`` where Capstone printed
+   ``movq``), operands are unspaced, aarch64/riscv/mips immediates
+   follow objdump's radix conventions, and aliases such as
+   ``li at,-8`` are spelled the way the target assembler spells them.
 
 ``--show-deps``
    Append a trailing ``; deps:`` annotation giving the
@@ -788,10 +819,10 @@ re-user must respect:
   entries for values it actually uses; the in-tree writer
   enumerates the full canonical set as a convenience, not because
   the format demands it.
-* **Capstone is optional.**  Without ``-DCST_HAVE_CAPSTONE``
-  ``cst_objdump`` compiles to a stub and ``--objdump`` simply
-  disables — downstream re-users link cleanly without bundling
-  Capstone.
+* **No disassembler dependency.**  ``cst_objdump`` links nothing:
+  the cosmetic ``--objdump`` column shells out to binutils
+  ``objdump`` and disables itself when the host has none, so
+  downstream re-users inherit no decoder library at all.
 * **Bring your own byte source.**  A ``Reader`` can wrap any byte
   source; consumers may bypass ``cst_file_open`` / the ustar +
   decompressor machinery entirely.  Streaming readers pull through

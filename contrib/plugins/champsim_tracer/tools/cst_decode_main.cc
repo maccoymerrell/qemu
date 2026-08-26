@@ -27,7 +27,7 @@
  *   §4  Name -> mnemonic / regref      (mnem_from_genop, regref_from_name)
  *   §5  Branch-type helpers            (branch_is_none, branch_mnem_from_name)
  *   §6  Per-trace lookup tables        (DisasmTables, table_lookup)
- *   §7  Capstone wrapper               (ObjdumpRenderer)
+ *   §7  objdump wrapper                (ObjdumpRenderer)
  *   §8  Disasm renderer                (per-column emitters, render_disasm)
  *   §9  Templates-only renderer
  *   §10 Legacy renderer                (Python-compat output)
@@ -145,7 +145,7 @@ void append_byte_hex(std::string *out, uint8_t b)
 
 /* Pad @out with spaces up to column @target for the common case.  When
  * @out has *already reached or passed* @target -- e.g. a >7-byte x86
- * instruction overflowing BYTES_COL_PAD, or a long Capstone operand
+ * instruction overflowing BYTES_COL_PAD, or a long objdump operand
  * string overflowing OBJDUMP_COL_WIDTH -- still emit exactly one space
  * so the next column never runs directly into this one with zero
  * separation.  Without this, a 10..15-byte x86 instruction (raw bytes
@@ -473,7 +473,7 @@ inline const std::string *table_lookup(const std::vector<std::string> &t,
 }
 
 /* ====================================================================
- * §7  Capstone wrapper — ObjdumpRenderer lives in cst_objdump.{h,cc}.
+ * §7  objdump wrapper — ObjdumpRenderer lives in cst_objdump.{h,cc}.
  * ==================================================================== */
 
 /* ====================================================================
@@ -500,7 +500,7 @@ struct DisasmContext {
     const std::unordered_map<uint32_t, size_t> *by_id;
     const std::vector<cst::Template> *templates;
     const DisasmTables *t;
-    /* Optional Capstone-backed objdump column. */
+    /* Optional objdump-backed cosmetic disasm column. */
     const ObjdumpRenderer *od;
     /* --show-deps: append intra-instruction dep-mask annotation. */
     bool show_deps = false;
@@ -611,7 +611,7 @@ void emit_disasm_bytes_column(std::string &line,
     append_pad_to(&line, bytes_start + BYTES_COL_PAD);
 }
 
-/* Optional Capstone disasm column, "<text>     | ". */
+/* Optional cosmetic objdump column, "<text>     | ". */
 void emit_disasm_objdump_column(std::string &line,
                                 const ObjdumpRenderer &od,
                                 const cst::Instruction &insn)
@@ -2582,7 +2582,7 @@ void print_usage(FILE *err, const char *argv0)
         "                    byte offsets + format-spec step refs (debug)\n"
         "  --templates-only  print only the template dictionary,\n"
         "                    skip the body delta-replay\n"
-        "  --objdump         emit Capstone-rendered native disasm\n"
+        "  --objdump         emit objdump-rendered native disasm\n"
         "                    of each insn alongside the generic view\n"
         "  --show-deps       append intra-instruction dep masks as a\n"
         "                    trailing `; deps: d0=[s0,ld0] ...` comment\n"
@@ -2657,19 +2657,30 @@ int parse_options(int argc, char **argv, Options *opts)
     return 0;
 }
 
-/* Open Capstone for the trace's ISA when --objdump is set; returns
- * nullptr when objdump wasn't requested or the ISA is unsupported.
+/* Open the cosmetic disassembler for the trace's ISA when --objdump is
+ * set, and prime it with every instruction the templates section holds
+ * so the whole column costs a handful of objdump runs instead of one
+ * per line.  Returns nullptr when objdump wasn't requested, the ISA is
+ * unsupported, or no binutils objdump on this host disassembles it.
  * @od is provided as backing storage by the caller. */
 ObjdumpRenderer *open_objdump_renderer(ObjdumpRenderer *od,
                                        const Options &opts,
-                                       const cst::Header &h)
+                                       const cst::Header &h,
+                                       const std::vector<cst::Template> &tm)
 {
     if (!opts.show_objdump) return nullptr;
-    if (od->open(h.isa)) return od;
-    std::fprintf(stderr,
-        "cst_decode: --objdump unsupported for ISA=%u; "
-        "continuing without the objdump column\n", (unsigned)h.isa);
-    return nullptr;
+    if (!od->open(h.isa)) {
+        std::fprintf(stderr,
+            "cst_decode: --objdump found no binutils objdump able to "
+            "disassemble ISA=%u (set $CST_OBJDUMP to name one); "
+            "continuing without the objdump column\n", (unsigned)h.isa);
+        return nullptr;
+    }
+    for (const cst::Template &t : tm)
+        for (const cst::InsnTemplate &I : t.insns)
+            od->prefetch(I.pc, I.raw_bytes.data(), I.raw_bytes.size());
+    od->prefetch_run();
+    return od;
 }
 
 /* Walk the body section of @cf and dispatch to the requested
@@ -3276,7 +3287,7 @@ int run(const Options &opts)
     cst::Header h = cst::parse_header(cf->header(), &templates, &by_id);
 
     ObjdumpRenderer od;
-    ObjdumpRenderer *odp = open_objdump_renderer(&od, opts, h);
+    ObjdumpRenderer *odp = open_objdump_renderer(&od, opts, h, templates);
 
     if (opts.templates_only) {
         /* No body access at all — no decompressor spawned, no body

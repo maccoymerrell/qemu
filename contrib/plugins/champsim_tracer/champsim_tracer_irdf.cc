@@ -1290,6 +1290,29 @@ void irdf_enable(bool on)
     g_on = on;
 }
 
+/*
+ * A percentage that cannot lie by rounding.  "<0.01%" for a non-empty class
+ * that rounds to zero, ">99.99%" for a class that is not the whole
+ * population but rounds to a hundred.
+ */
+static void irdf_fmt_pct(char *buf, size_t n, uint64_t part, uint64_t tot)
+{
+    double p;
+
+    if (tot == 0) {
+        snprintf(buf, n, "%s", "  n/a ");
+        return;
+    }
+    p = 100.0 * (double)part / (double)tot;
+    if (part != 0 && p < 0.005) {
+        snprintf(buf, n, "%s", "<0.01%");
+    } else if (part != tot && p > 99.995) {
+        snprintf(buf, n, "%s", ">99.99%");
+    } else {
+        snprintf(buf, n, "%6.2f%%", p);
+    }
+}
+
 void irdf_report(GString *report)
 {
     if (!report || !g_on) {
@@ -1492,15 +1515,25 @@ void irdf_report(GString *report)
         return;
     }
     static const char *const kName[3] = {"EXACT ", "APPROX", "OPAQUE"};
+    /*
+     * A non-empty class must never print as 0.00%, and a class that is not
+     * the whole population must never print as 100.00%.  Two decimal places
+     * rounded x86_64's 610 opaque executions -- out of 68 million -- to
+     * "0.00%" and its EXACT column to "100.00%", which reads as a class that
+     * is empty when it is not.  That is this project's named dominant defect
+     * shape appearing in the report of the very measurement meant to be
+     * honest about what the model cannot describe.
+     */
     g_string_append_printf(report,
             "                 translated            executed\n");
     for (int i = 0; i < 3; i++) {
+        char sp[16], dp[16];
+
+        irdf_fmt_pct(sp, sizeof(sp), g_h_static[i], st_tot);
+        irdf_fmt_pct(dp, sizeof(dp), dyn[i], dyn_tot);
         g_string_append_printf(report,
-                "  %s  %12" PRIu64 " %6.2f%%  %14" PRIu64 " %6.2f%%\n",
-                kName[i], g_h_static[i],
-                100.0 * (double)g_h_static[i] / (double)st_tot,
-                dyn[i],
-                dyn_tot ? 100.0 * (double)dyn[i] / (double)dyn_tot : 0.0);
+                "  %s  %12" PRIu64 " %7s  %14" PRIu64 " %7s\n",
+                kName[i], g_h_static[i], sp, dyn[i], dp);
     }
     g_string_append_printf(report,
             "  total   %12" PRIu64 "          %14" PRIu64 "\n", st_tot, dyn_tot);

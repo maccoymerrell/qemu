@@ -553,6 +553,20 @@ told apart.
 
    Read the pair back out.
 
+``include/qemu/qemu-plugin.h`` — ``qemu_plugin_insn_info::decode_id``
+
+   The identity again, carried beside the disassembler's account of
+   the same instruction rather than only through an accessor, so a
+   consumer keyed on ``insn_id`` can see in one place where the two
+   accounts disagree.  ``qemu_plugin_insn_detail()`` fills it;
+   ``qemu_plugin_cap_decode()`` decodes raw bytes with no insn
+   handle and therefore leaves it 0, which is what the field's 0
+   means everywhere.
+
+   The struct is allocated by the caller and filled by QEMU, so
+   growing it is an ABI break whatever the field does: the plugin
+   API version moves 24 → 25 for it.
+
 i386: ``target/i386/tcg/decode-new.h`` and ``decode-new.c.inc``
 
    ``struct X86OpEntry`` gains ``mnemonic`` and ``slot``, filled by

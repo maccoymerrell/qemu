@@ -237,6 +237,50 @@ X86_EXEC = {
                   'encoding -- helper-resident state, or an encoding the op '
                   'dump never carried -- so the row is refused'),
 
+    # THE READ OF TOP, on the SOURCE axis.  QEMU addresses the x87 stack
+    # through `#define ST0 (env->fpregs[env->fpstt].d)`, so every form that
+    # names a slot reads env->fpstt -- the TOP field of the status word,
+    # which the tracer folds onto REG_FCSR.  gem5 resolves `%st(0)` to a
+    # PHYSICAL index at decode (src/arch/x86/regs/float.cc:
+    # `fpr((X87Top + (idx - NumRegs)) % 8)`) and prints the unflattened
+    # operand, so its operand list carries no TOP source to compare with.
+    #
+    # gem5's SILENCE is the same text whether the tracer is right or wrong,
+    # so it cannot supply the second half.  QEMU does, per ENCODING, through
+    # x87_cw_derive.StatusOracle -- the macros expanded, the call graph of
+    # fpu_helper.c walked to a fixed point, over an OBSERVED
+    # `-one-insn-per-tb -d op` dump.  A row this rule covers is a row that
+    # oracle answered YES on; a NO convicts and an UNKNOWN refuses, and both
+    # have their own label below.
+    'REF-X87-TOP-FOLDED-AT-DECODE':
+        Rule('REF-X87-TOP-FOLDED-AT-DECODE', 'reference-gap', {SUPERSET},
+             note='gem5 flattens the x87 stack slot to a physical register '
+                  'at decode and names no TOP source; QEMU reads env->fpstt '
+                  'through the ST0/ST(n) macros on this encoding, confirmed '
+                  'per encoding by x87_cw_derive.StatusOracle'),
+
+    # The converse, and it is a TRACER defect: the tracer named the status
+    # word as a source on an encoding QEMU reads no part of the status group
+    # on.  No rule excuses it.
+    'TRACER-X87-TOP-NOT-READ':
+        Rule('TRACER-X87-TOP-NOT-READ', 'tracer-defect', {SUPERSET},
+             accounts=False,
+             note='the tracer names REG_FCSR as a source on an encoding the '
+                  'QEMU status-group derivation says reads no part of '
+                  '{fpus, fpstt, fptags}'),
+
+    # REFUSAL, not excuse -- the same discipline as
+    # REF-PRESERVE-READ-UNDECIDED.  An encoding the op dump never carried, or
+    # one QEMU lowered with no helper call, leaves the walk with nothing to
+    # look at; "the walk did not look" is never reported as "the machine does
+    # not read it".
+    'REF-X87-TOP-UNDECIDED':
+        Rule('REF-X87-TOP-UNDECIDED', 'reference-gap', {SUPERSET},
+             accounts=False,
+             note='the QEMU x87 status-group oracle has no answer for this '
+                  'encoding -- no op dump, no helper call, or a helper with '
+                  'no body in the analysed sources -- so the row is refused'),
+
     # The reference names an architectural register the tracer does not.  This
     # is the DISQUALIFYING direction and has no excusing rule by design: it is
     # listed so that a harness cannot invent one silently.

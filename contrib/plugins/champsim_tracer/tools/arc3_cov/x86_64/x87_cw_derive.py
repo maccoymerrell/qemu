@@ -7,6 +7,13 @@ Answered from QEMU, in two halves that never consult the tracer:
   1. WHICH HELPERS the encoding runs.  Read off an OBSERVED TCG op dump
      (`qemu-x86_64 -one-insn-per-tb -d op`, x87_cw_probe.c), never off the
      switch in gen_x87() by eye.
+  0. WHAT THE HELPER'S TEXT ACTUALLY SAYS.  QEMU addresses the x87 stack
+     through the ST0 / ST1 / ST(n) macros, so `helper_fabs_ST0` reads
+     `env->fpstt` -- the TOP field -- without the field appearing anywhere
+     in its body.  Every macro whose expansion transitively mentions
+     `env->` is expanded to a fixed point BEFORE any of the questions
+     below is asked.  Nothing here may be answered off unexpanded text.
+
   2. WHETHER A NAMED HELPER READS THE CONTROL WORD.  Answered by walking
      the call graph of target/i386/tcg/fpu_helper.c (plus cc_helper.c and
      the cpu.h inlines) to a fixed point.
@@ -115,14 +122,157 @@ def split_functions(text):
     return out
 
 
+# ---------------------------------------------------------------- the macros
+#
+# THE READ THE SOURCE TEXT DOES NOT CONTAIN.  QEMU addresses the x87 stack
+# through three macros defined at the top of fpu_helper.c:
+#
+#     #define FT0    (env->ft0)
+#     #define ST0    (env->fpregs[env->fpstt].d)
+#     #define ST(n)  (env->fpregs[(env->fpstt + (n)) & 7].d)
+#     #define ST1    ST(1)
+#
+# so `helper_fabs_ST0` reads in full as `ST0 = floatx80_abs(ST0)` and the
+# read of `env->fpstt` -- the TOP field, which decides WHICH physical
+# register `%st(0)` denotes -- never appears in the function's own text.  A
+# reading that does not expand the macro concludes that fabs, fchs, fadd,
+# fcom, fst, fxch and every other stack-naming form is independent of the
+# top of stack.  That conclusion is a property of the reading, not of the
+# machine, and it is exactly the shape the maintainer ruled out: "if the
+# information is in a macro body, EXPAND THE MACRO."
+#
+# Expansion is DERIVED, never a table of four strings.  Every single-line
+# object-like and function-like macro in the analysed sources is collected;
+# the ones whose body reaches `env->` TRANSITIVELY -- which is how `ST1`,
+# whose body is just `ST(1)`, is caught -- are expanded to a fixed point in
+# every function body before any dataflow question is asked.  A future macro
+# that hides a field the same way is therefore covered without an edit here.
+
+
+_DEF = re.compile(r'(?m)^[ \t]*#[ \t]*define[ \t]+'
+                  r'([A-Za-z_][A-Za-z_0-9]*)(\(([^)]*)\))?[ \t]*(.*)$')
+_PP = re.compile(r'(?m)^[ \t]*#(?:[^\n\\]|\\\n)*$')
+
+
+def collect_macros(text):
+    """source text -> {name: (params or None, body)} for single-line macros."""
+    out = {}
+    for m in _DEF.finditer(text):
+        name, parens, params, body = m.group(1), m.group(2), m.group(3), \
+            m.group(4)
+        if body.rstrip().endswith('\\'):
+            continue                       # multi-line: not expanded here
+        out[name] = ([p.strip() for p in params.split(',')] if parens
+                     else None, body.strip())
+    return out
+
+
+def _reaching(macros):
+    """The macros whose expansion transitively mentions `env->`."""
+    hit = {n for n, (_, b) in macros.items() if 'env->' in b}
+    changed = True
+    while changed:
+        changed = False
+        for n, (_, b) in macros.items():
+            if n in hit:
+                continue
+            for w in re.findall(r'[A-Za-z_][A-Za-z_0-9]*', b):
+                if w in hit:
+                    hit.add(n)
+                    changed = True
+                    break
+    return hit
+
+
+def _args(text, i):
+    """text[i] == '(' -> (list of argument strings, index past the ')')."""
+    depth, j, start, args = 0, i, i + 1, []
+    while j < len(text):
+        c = text[j]
+        if c in '([':
+            depth += 1
+        elif c in ')]':
+            depth -= 1
+            if depth == 0:
+                args.append(text[start:j])
+                return args, j + 1
+        elif c == ',' and depth == 1:
+            args.append(text[start:j])
+            start = j + 1
+        j += 1
+    return None, i
+
+
+def expand_macros(text, macros, names, rounds=8):
+    """Expand `names` in `text` to a fixed point (bounded)."""
+    pat = re.compile(r'\b(%s)\b' % '|'.join(sorted(names, key=len,
+                                                   reverse=True)))
+    for _ in range(rounds):
+        out, i, hit = [], 0, False
+        while True:
+            m = pat.search(text, i)
+            if not m:
+                out.append(text[i:])
+                break
+            params, body = macros[m.group(1)]
+            k = m.end()
+            if params is None:
+                out.append(text[i:m.start()])
+                out.append('(' + body + ')')
+                i, hit = k, True
+                continue
+            j = k
+            while j < len(text) and text[j] in ' \t\n':
+                j += 1
+            if j >= len(text) or text[j] != '(':
+                out.append(text[i:k])       # a bare name, not an invocation
+                i = k
+                continue
+            args, end = _args(text, j)
+            if args is None or len(args) != len(params):
+                out.append(text[i:k])
+                i = k
+                continue
+            rep = body
+            for pn, av in zip(params, args):
+                rep = re.sub(r'\b%s\b' % re.escape(pn), '(' + av + ')', rep)
+            out.append(text[i:m.start()])
+            out.append('(' + rep + ')')
+            i, hit = end, True
+        text = ''.join(out)
+        if not hit:
+            break
+    return text
+
+
+def preprocess(text):
+    """strip comments, expand the env-reaching macros, drop the directives."""
+    text = strip_comments(text)
+    macros = collect_macros(text)
+    names = _reaching(macros)
+    text = _PP.sub('', text)
+    if names:
+        text = expand_macros(text, macros, names)
+    return text, {n: macros[n] for n in names}
+
+
 def load_functions(root):
-    fns = {}
+    fns, expanded = {}, {}
     for rel in SRC:
         p = os.path.join(root, rel)
         if not os.path.exists(p):
             sys.exit('x87_cw_derive: missing %s' % p)
-        fns.update(split_functions(strip_comments(open(p).read())))
-    return fns
+        text, used = preprocess(open(p).read())
+        expanded.update(used)
+        fns.update(split_functions(text))
+    # THE ASSERTION THAT MAKES THE EXPANSION A MEASUREMENT.  If QEMU ever
+    # stops hiding the TOP read behind a macro -- or renames the field --
+    # this run FAILS instead of quietly reporting that no x87 form reads the
+    # top of stack, which is the answer the un-expanded reading gave.
+    if not any('env->fpstt' in b for _, b in expanded.values()):
+        sys.exit('x87_cw_derive: no macro in %s expands to env->fpstt -- the '
+                 'stack-addressing macros have changed, re-derive' % SRC[0])
+    return fns, expanded
 
 
 # The three architectural registers the x87 environment instructions move,
@@ -262,7 +412,7 @@ def _fixpoint(fns, group):
 
 
 def build(root):
-    fns = load_functions(root)
+    fns, macros = load_functions(root)
 
     csf = fns.get('cpu_set_fpuc')
     if not csf:
@@ -277,7 +427,73 @@ def build(root):
     for g in GROUPS:
         r, w, rw, ww = _fixpoint(fns, g)
         axes[g] = dict(read=r, write=w, rwhy=rw, wwhy=ww)
-    return fns, axes
+    return fns, axes, macros
+
+
+# ------------------------------------------------------- the callable oracle
+#
+# The derivation above answers a table of 153 subjects placed at fixed
+# addresses by x87_cw_probe.  A CONSUMER -- the wrong-path leg -- needs the
+# same answer keyed by ENCODING, for whatever encodings its own guests
+# happened to contain, and it already runs every guest under
+# `-one-insn-per-tb -d op,in_asm` for the preserve oracle.  StatusOracle
+# reads those same dumps.
+#
+# IT REFUSES RATHER THAN GUESSES, on the same terms the preserve oracle
+# refuses: an encoding the dump never carried, an encoding QEMU lowered with
+# no helper call at all, or a helper whose body is not in the analysed
+# sources are all UNKNOWN.  "The walk did not look" is never reported as
+# "the machine does not read it" (R5).
+
+STATUS_READ = 'x87-status-read'
+STATUS_NOT_READ = 'x87-status-not-read'
+
+
+class StatusOracle(object):
+    """encoding hex -> does QEMU read {fpus, fpstt, fptags}?"""
+
+    def __init__(self, root=Q):
+        self.fns, self.axes, self.macros = build(root)
+        self.calls = {}             # enc -> [helper names], first dump wins
+        self.disas = {}
+        self.refused = collections.Counter()
+
+    def add_dump(self, path):
+        """Read a `-d op,in_asm` dump, keyed by encoding."""
+        import qemu_preserve_oracle as _QPO
+        for enc, e in _QPO.parse_dump(path).items():
+            if enc in self.calls:
+                continue
+            self.calls[enc] = [a[0] for name, a in e.ops
+                               if name == 'call' and a]
+            self.disas[enc] = e.disas
+
+    def _key(self, h):
+        if 'helper_' + h in self.fns:
+            return 'helper_' + h
+        return h if h in self.fns else None
+
+    def reads_status(self, enc):
+        """True | False | None (REFUSED)."""
+        helpers = self.calls.get(enc)
+        if not helpers:
+            # No dump for this encoding, or QEMU emitted no call at all.
+            # Neither is evidence that nothing is read: env->fpstt is not a
+            # TCG global, so the op list alone cannot state the fact.
+            self.refused['%s: %s' % (
+                self.disas.get(enc, enc),
+                'no op dump' if helpers is None else 'no helper call')] += 1
+            return None
+        out = False
+        for h in helpers:
+            k = self._key(h)
+            if k is None:
+                self.refused['%s: helper %s has no body in %s'
+                             % (self.disas.get(enc, enc), h,
+                                ', '.join(SRC))] += 1
+                return None
+            out = out or self.axes['status']['read'][k]
+        return out
 
 
 def read_blocks(op_path):
@@ -308,7 +524,7 @@ def main():
     ap.add_argument('-o', '--out', required=True)
     a = ap.parse_args()
 
-    fns, axes = build(a.root)
+    fns, axes, macros = build(a.root)
     blocks = read_blocks(a.op)
     base = int(a.base, 16)
     stride = int(a.stride, 16)
@@ -357,6 +573,8 @@ def main():
             cnt['%s_%s' % (g, k)] += (r[5 + n] == 'yes')
     n_bad = sum(1 for r in rows if r[5] == 'NO-BLOCK')
     print('x87_cw_derive: %d subjects' % len(rows))
+    print('  macros expanded before the walk (env-reaching, transitive): %s'
+          % ', '.join(sorted(macros)))
     for g, k in AX:
         print('  %-12s yes %3d   no %3d' % (
             '%s-%s' % (g, k), cnt['%s_%s' % (g, k)],

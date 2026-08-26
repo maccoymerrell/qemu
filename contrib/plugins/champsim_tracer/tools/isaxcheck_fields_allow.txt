@@ -3354,6 +3354,22 @@ x86_64 FR-wr-missing umwait +REG_FLAGS
 # tracer follows Capstone, which names the implicit ST(0) in every one of
 # these cases, and is right.
 #
+# EVERY ROW HERE NOW CARRIES REG_FCSR AS WELL, because the boundary states
+# the read of TOP.  QEMU addresses the x87 stack through
+# `#define ST0 (env->fpregs[env->fpstt].d)` (target/i386/tcg/fpu_helper.c),
+# so a form that names a slot depends on whatever last wrote the TOP field
+# of the status word -- an `fld` in between makes the next `%st(0)` a
+# different physical register, which is the R7 regfile-dependency test
+# answered yes.  The tracer folds the status word onto REG_FCSR; LLVM MC
+# names no TOP read on any x87 form, so 69 `+REG_FPR#` signatures became
+# `+REG_FCSR,REG_FPR#` and 13 encodings acquired a `+REG_FCSR` signature.
+# The claim is derived rather than asserted: x87_cw_derive.py expands those
+# macros and walks fpu_helper.c to a fixed point over an OBSERVED
+# `-one-insn-per-tb -d op` dump, and the boundary agrees with it on 151 of
+# its 153 x87 encodings -- the two it does not are FNOP and FWAIT, which
+# read env->fpus for the exception-summary bit rather than for TOP and name
+# no stack slot.
+#
 # The FCMOVcc rows read against a boundary this arc CORRECTED: Capstone
 # reported that family with its operand roles exchanged (ST(0) read,
 # ST(i) written, for an instruction that moves ST(i) into ST(0)), and
@@ -3374,19 +3390,88 @@ x86_64 FM-miss-load fxsave64
 x86_64 FM-miss-store fxrstor
 x86_64 FM-miss-store fxrstor64
 x86_64 FR-rd-missing ffreep +REG_FPR#
-x86_64 FR-rd-phantom fadd +REG_FPR#
-x86_64 FR-rd-phantom fcom +REG_FPR#
-x86_64 FR-rd-phantom fcoml +REG_FPR#
-x86_64 FR-rd-phantom fcoms +REG_FPR#
-x86_64 FR-rd-phantom fdiv +REG_FPR#
-x86_64 FR-rd-phantom fdivr +REG_FPR#
-x86_64 FR-rd-phantom ficoml +REG_FPR#
-x86_64 FR-rd-phantom ficoms +REG_FPR#
-x86_64 FR-rd-phantom fmul +REG_FPR#
-x86_64 FR-rd-phantom fsub +REG_FPR#
-x86_64 FR-rd-phantom fsubr +REG_FPR#
-x86_64 FR-rd-phantom ftst +REG_FPR#
-x86_64 FR-rd-phantom fxam +REG_FPR#
+x86_64 FR-rd-phantom f2xm1 +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fabs +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fadd +REG_FCSR
+x86_64 FR-rd-phantom fadd +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom faddl +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fadds +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fchs +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fcmovb +REG_FCSR,REG_FLAGS
+x86_64 FR-rd-phantom fcmovb +REG_FCSR,REG_FLAGS,REG_FPR#
+x86_64 FR-rd-phantom fcmovbe +REG_FCSR,REG_FLAGS
+x86_64 FR-rd-phantom fcmovbe +REG_FCSR,REG_FLAGS,REG_FPR#
+x86_64 FR-rd-phantom fcmove +REG_FCSR,REG_FLAGS
+x86_64 FR-rd-phantom fcmove +REG_FCSR,REG_FLAGS,REG_FPR#
+x86_64 FR-rd-phantom fcmovnb +REG_FCSR,REG_FLAGS
+x86_64 FR-rd-phantom fcmovnb +REG_FCSR,REG_FLAGS,REG_FPR#
+x86_64 FR-rd-phantom fcmovnbe +REG_FCSR,REG_FLAGS
+x86_64 FR-rd-phantom fcmovnbe +REG_FCSR,REG_FLAGS,REG_FPR#
+x86_64 FR-rd-phantom fcmovne +REG_FCSR,REG_FLAGS
+x86_64 FR-rd-phantom fcmovne +REG_FCSR,REG_FLAGS,REG_FPR#
+x86_64 FR-rd-phantom fcmovnu +REG_FCSR,REG_FLAGS
+x86_64 FR-rd-phantom fcmovnu +REG_FCSR,REG_FLAGS,REG_FPR#
+x86_64 FR-rd-phantom fcmovu +REG_FCSR,REG_FLAGS
+x86_64 FR-rd-phantom fcmovu +REG_FCSR,REG_FLAGS,REG_FPR#
+x86_64 FR-rd-phantom fcom +REG_FCSR
+x86_64 FR-rd-phantom fcom +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fcomi +REG_FCSR
+x86_64 FR-rd-phantom fcoml +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fcoms +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fcos +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fdiv +REG_FCSR
+x86_64 FR-rd-phantom fdiv +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fdivl +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fdivr +REG_FCSR
+x86_64 FR-rd-phantom fdivr +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fdivrl +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fdivrs +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fdivs +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom ffree +REG_FCSR
+x86_64 FR-rd-phantom fiaddl +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fiadds +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom ficoml +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom ficoms +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fidivl +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fidivrl +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fidivrs +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fidivs +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fimull +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fimuls +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fistl +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fists +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fisubl +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fisubrl +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fisubrs +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fisubs +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fmul +REG_FCSR
+x86_64 FR-rd-phantom fmul +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fmull +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fmuls +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fprem +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fprem1 +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom frndint +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fscale +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fsin +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fsqrt +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fst +REG_FCSR
+x86_64 FR-rd-phantom fst +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fstl +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fsts +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fsub +REG_FCSR
+x86_64 FR-rd-phantom fsub +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fsubl +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fsubr +REG_FCSR
+x86_64 FR-rd-phantom fsubr +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fsubrl +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fsubrs +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fsubs +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom ftst +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fucom +REG_FCSR
+x86_64 FR-rd-phantom fucomi +REG_FCSR
+x86_64 FR-rd-phantom fxam +REG_FCSR,REG_FPR#
+x86_64 FR-rd-phantom fxch +REG_FCSR
+x86_64 FR-rd-phantom fxch +REG_FCSR,REG_FPR#
 x86_64 FR-wr-missing fnop +REG_FCSR
 x86_64 FR-wr-missing fnstcw +REG_FCSR
 x86_64 FR-wr-missing fnstsw +REG_FCSR
@@ -6906,73 +6991,33 @@ x86_64 FR-rd-missing fnstenv +REG_SEG0
 x86_64 FR-rd-missing fnstenv +REG_SEG1
 x86_64 FR-rd-missing fnstsw +REG_SEG0
 x86_64 FR-rd-missing fnstsw +REG_SEG1
-x86_64 FR-rd-phantom f2xm1 +REG_FPR#
-x86_64 FR-rd-phantom fabs +REG_FPR#
-x86_64 FR-rd-phantom faddl +REG_FPR#
 x86_64 FR-rd-phantom faddp +REG_FCSR
 x86_64 FR-rd-phantom faddp +REG_FCSR,REG_FPR#
-x86_64 FR-rd-phantom fadds +REG_FPR#
 x86_64 FR-rd-phantom fbstp +REG_FCSR,REG_FPR#
-x86_64 FR-rd-phantom fchs +REG_FPR#
-x86_64 FR-rd-phantom fcmovb +REG_FLAGS
-x86_64 FR-rd-phantom fcmovb +REG_FLAGS,REG_FPR#
-x86_64 FR-rd-phantom fcmovbe +REG_FLAGS
-x86_64 FR-rd-phantom fcmovbe +REG_FLAGS,REG_FPR#
-x86_64 FR-rd-phantom fcmove +REG_FLAGS
-x86_64 FR-rd-phantom fcmove +REG_FLAGS,REG_FPR#
-x86_64 FR-rd-phantom fcmovnb +REG_FLAGS
-x86_64 FR-rd-phantom fcmovnb +REG_FLAGS,REG_FPR#
-x86_64 FR-rd-phantom fcmovnbe +REG_FLAGS
-x86_64 FR-rd-phantom fcmovnbe +REG_FLAGS,REG_FPR#
-x86_64 FR-rd-phantom fcmovne +REG_FLAGS
-x86_64 FR-rd-phantom fcmovne +REG_FLAGS,REG_FPR#
-x86_64 FR-rd-phantom fcmovnu +REG_FLAGS
-x86_64 FR-rd-phantom fcmovnu +REG_FLAGS,REG_FPR#
-x86_64 FR-rd-phantom fcmovu +REG_FLAGS
-x86_64 FR-rd-phantom fcmovu +REG_FLAGS,REG_FPR#
 x86_64 FR-rd-phantom fcomp +REG_FCSR
 x86_64 FR-rd-phantom fcomp +REG_FCSR,REG_FPR#
 x86_64 FR-rd-phantom fcompi +REG_FCSR
 x86_64 FR-rd-phantom fcompl +REG_FCSR,REG_FPR#
 x86_64 FR-rd-phantom fcompp +REG_FCSR,REG_FPR#
 x86_64 FR-rd-phantom fcomps +REG_FCSR,REG_FPR#
-x86_64 FR-rd-phantom fcos +REG_FPR#
 x86_64 FR-rd-phantom fdecstp +REG_FCSR
-x86_64 FR-rd-phantom fdivl +REG_FPR#
 x86_64 FR-rd-phantom fdivp +REG_FCSR
 x86_64 FR-rd-phantom fdivp +REG_FCSR,REG_FPR#
-x86_64 FR-rd-phantom fdivrl +REG_FPR#
 x86_64 FR-rd-phantom fdivrp +REG_FCSR
 x86_64 FR-rd-phantom fdivrp +REG_FCSR,REG_FPR#
-x86_64 FR-rd-phantom fdivrs +REG_FPR#
-x86_64 FR-rd-phantom fdivs +REG_FPR#
 x86_64 FR-rd-phantom ffreep +REG_FCSR
-x86_64 FR-rd-phantom fiaddl +REG_FPR#
-x86_64 FR-rd-phantom fiadds +REG_FPR#
 x86_64 FR-rd-phantom ficompl +REG_FCSR,REG_FPR#
 x86_64 FR-rd-phantom ficomps +REG_FCSR,REG_FPR#
-x86_64 FR-rd-phantom fidivl +REG_FPR#
-x86_64 FR-rd-phantom fidivrl +REG_FPR#
-x86_64 FR-rd-phantom fidivrs +REG_FPR#
-x86_64 FR-rd-phantom fidivs +REG_FPR#
 x86_64 FR-rd-phantom fildl +REG_FCSR
 x86_64 FR-rd-phantom fildll +REG_FCSR
 x86_64 FR-rd-phantom filds +REG_FCSR
-x86_64 FR-rd-phantom fimull +REG_FPR#
-x86_64 FR-rd-phantom fimuls +REG_FPR#
 x86_64 FR-rd-phantom fincstp +REG_FCSR
-x86_64 FR-rd-phantom fistl +REG_FPR#
 x86_64 FR-rd-phantom fistpl +REG_FCSR,REG_FPR#
 x86_64 FR-rd-phantom fistpll +REG_FCSR,REG_FPR#
 x86_64 FR-rd-phantom fistps +REG_FCSR,REG_FPR#
-x86_64 FR-rd-phantom fists +REG_FPR#
 x86_64 FR-rd-phantom fisttpl +REG_FCSR,REG_FPR#
 x86_64 FR-rd-phantom fisttpll +REG_FCSR,REG_FPR#
 x86_64 FR-rd-phantom fisttps +REG_FCSR,REG_FPR#
-x86_64 FR-rd-phantom fisubl +REG_FPR#
-x86_64 FR-rd-phantom fisubrl +REG_FPR#
-x86_64 FR-rd-phantom fisubrs +REG_FPR#
-x86_64 FR-rd-phantom fisubs +REG_FPR#
 x86_64 FR-rd-phantom fld +REG_FCSR
 x86_64 FR-rd-phantom fld1 +REG_FCSR
 x86_64 FR-rd-phantom fldl +REG_FCSR
@@ -6984,19 +7029,13 @@ x86_64 FR-rd-phantom fldpi +REG_FCSR
 x86_64 FR-rd-phantom flds +REG_FCSR
 x86_64 FR-rd-phantom fldt +REG_FCSR
 x86_64 FR-rd-phantom fldz +REG_FCSR
-x86_64 FR-rd-phantom fmull +REG_FPR#
 x86_64 FR-rd-phantom fmulp +REG_FCSR
 x86_64 FR-rd-phantom fmulp +REG_FCSR,REG_FPR#
-x86_64 FR-rd-phantom fmuls +REG_FPR#
 x86_64 FR-rd-phantom fpatan +REG_FCSR,REG_FPR#
-x86_64 FR-rd-phantom fprem +REG_FPR#
-x86_64 FR-rd-phantom fprem1 +REG_FPR#
 x86_64 FR-rd-phantom fptan +REG_FCSR,REG_FPR#
-x86_64 FR-rd-phantom frndint +REG_FPR#
 x86_64 FR-rd-phantom fucomp +REG_FCSR
 x86_64 FR-rd-phantom fucompi +REG_FCSR
 x86_64 FR-rd-phantom fucompp +REG_FCSR,REG_FPR#
-x86_64 FR-rd-phantom fxch +REG_FPR#
 x86_64 FR-rd-phantom fxtract +REG_FCSR,REG_FPR#
 x86_64 FR-rd-phantom fyl2x +REG_FCSR,REG_FPR#
 x86_64 FR-rd-phantom fyl2xp1 +REG_FCSR,REG_FPR#
@@ -7083,26 +7122,16 @@ x86_64 FR-rd-missing rcrq +REG_SEG1
 x86_64 FR-rd-phantom encls +REG_GPR#
 x86_64 FR-rd-phantom enclu +REG_GPR#
 x86_64 FR-rd-phantom enclv +REG_GPR#
-x86_64 FR-rd-phantom fscale +REG_FPR#
-x86_64 FR-rd-phantom fsin +REG_FPR#
 x86_64 FR-rd-phantom fsincos +REG_FCSR,REG_FPR#
-x86_64 FR-rd-phantom fsqrt +REG_FPR#
-x86_64 FR-rd-phantom fst +REG_FPR#
-x86_64 FR-rd-phantom fstl +REG_FPR#
 x86_64 FR-rd-phantom fstp +REG_FCSR
 x86_64 FR-rd-phantom fstp +REG_FCSR,REG_FPR#
 x86_64 FR-rd-phantom fstpl +REG_FCSR,REG_FPR#
 x86_64 FR-rd-phantom fstps +REG_FCSR,REG_FPR#
 x86_64 FR-rd-phantom fstpt +REG_FCSR,REG_FPR#
-x86_64 FR-rd-phantom fsts +REG_FPR#
-x86_64 FR-rd-phantom fsubl +REG_FPR#
 x86_64 FR-rd-phantom fsubp +REG_FCSR
 x86_64 FR-rd-phantom fsubp +REG_FCSR,REG_FPR#
-x86_64 FR-rd-phantom fsubrl +REG_FPR#
 x86_64 FR-rd-phantom fsubrp +REG_FCSR
 x86_64 FR-rd-phantom fsubrp +REG_FCSR,REG_FPR#
-x86_64 FR-rd-phantom fsubrs +REG_FPR#
-x86_64 FR-rd-phantom fsubs +REG_FPR#
 x86_64 FR-rd-phantom inb +REG_FLAGS
 x86_64 FR-rd-phantom inl +REG_FLAGS
 x86_64 FR-rd-phantom inw +REG_FLAGS

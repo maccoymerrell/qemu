@@ -2963,19 +2963,6 @@ x86_64 R-rd-missing fstl +ds
 x86_64 R-rd-missing fstl +es
 x86_64 R-rd-missing fstl +ss
 x86_64 R-rd-missing fxch +fpcw
-x86_64 R-rd-phantom fadd +st#
-x86_64 R-rd-phantom fcom +st#
-x86_64 R-rd-phantom fcoml +st#
-x86_64 R-rd-phantom fcoms +st#
-x86_64 R-rd-phantom fdiv +st#
-x86_64 R-rd-phantom fdivr +st#
-x86_64 R-rd-phantom ficoml +st#
-x86_64 R-rd-phantom ficoms +st#
-x86_64 R-rd-phantom fmul +st#
-x86_64 R-rd-phantom fsub +st#
-x86_64 R-rd-phantom fsubr +st#
-x86_64 R-rd-phantom ftst +st#
-x86_64 R-rd-phantom fxam +st#
 x86_64 R-wr-missing fnop +fpsw
 x86_64 R-wr-phantom fcmovb +st#
 x86_64 R-wr-phantom fcmovbe +st#
@@ -8685,22 +8672,6 @@ x86_64 R-rd-phantom pushw +gs,r#
 # -- so the read is all that was missing.  The `+st#` rows these replace
 # were deleted in the same commit; the st(i) half of the signature is
 # unchanged and only the flags joined it.
-x86_64 R-rd-phantom fcmovb +flags
-x86_64 R-rd-phantom fcmovb +flags,st#
-x86_64 R-rd-phantom fcmovbe +flags
-x86_64 R-rd-phantom fcmovbe +flags,st#
-x86_64 R-rd-phantom fcmove +flags
-x86_64 R-rd-phantom fcmove +flags,st#
-x86_64 R-rd-phantom fcmovnb +flags
-x86_64 R-rd-phantom fcmovnb +flags,st#
-x86_64 R-rd-phantom fcmovnbe +flags
-x86_64 R-rd-phantom fcmovnbe +flags,st#
-x86_64 R-rd-phantom fcmovne +flags
-x86_64 R-rd-phantom fcmovne +flags,st#
-x86_64 R-rd-phantom fcmovnu +flags
-x86_64 R-rd-phantom fcmovnu +flags,st#
-x86_64 R-rd-phantom fcmovu +flags
-x86_64 R-rd-phantom fcmovu +flags,st#
 
 # The leaf-dispatch instructions, whose whole dependency is a register
 # convention that Capstone publishes nowhere: ENCLS / ENCLU / ENCLV,
@@ -8767,6 +8738,29 @@ mipsel M-extra-load sce
 # a bug to fix.  The block disappears entirely if LLVM MC ever models the
 # x87 stack in MCInstrDesc.
 #
+# THE READ OF TOP IS NOW CARRIED, which is why 69 `+st#` signatures became
+# `+fpsw,st#` and 13 encodings acquired a `+fpsw` signature they did not
+# have.  QEMU addresses the x87 stack through
+# `#define ST0 (env->fpregs[env->fpstt].d)` (target/i386/tcg/fpu_helper.c),
+# so EVERY form that names a slot reads env->fpstt -- the TOP field of the
+# status word -- and an `fld` between two instructions makes the second
+# one's `%st(0)` a different physical register.  cap_x86_x87_effects() adds
+# X87F_SWR to any row carrying a stack bit, and states FCMOVcc and FFREE
+# separately because their slot arrives as a Capstone operand rather than as
+# one of those bits.  LLVM MC names no TOP read on any x87 form, so the edge
+# lands here.
+#
+# DERIVED AND MEASURED, not asserted: x87_cw_derive.py (arc3_cov/x86_64)
+# expands those macros -- unexpanded, the read is in no function body and
+# the tool answers `no` on every x87 form -- and walks fpu_helper.c to a
+# fixed point over an OBSERVED `-one-insn-per-tb -d op` dump.  Over its
+# 153-encoding x87 denominator it says 140 read {fpus, fpstt, fptags} and 13
+# do not, the thirteen being FLDCW, FNSTCW, FLDENV, FRSTOR, FXRSTOR, FNCLEX,
+# FNINIT and the three 8087 NOPs -- none of which names a stack slot.  The
+# boundary agrees with that derivation on 151 of the 153; the two it does
+# not are FNOP and FWAIT, which read env->fpus for the EXCEPTION-SUMMARY bit
+# rather than for TOP and name no stack slot, and are deliberately left out.
+#
 # THE CONTROL-WORD READ IS NOW CARRIED, and the rows it left behind are
 # below rather than above.  X87F_CWR (disas/capstone.c) names FPCW as a
 # SOURCE wherever QEMU's helper sequence consults it -- directly, on the
@@ -8796,64 +8790,94 @@ mipsel M-extra-load sce
 # reach fyl2x_common).  If it is there and the entry says the boundary
 # omits the read, the boundary is wrong and the entry is a bug to fix.
 # =====================================================================
-x86_64 R-rd-phantom fbld +fpcw,fpsw
 x86_64 R-rd-missing fnstenv +cs
 x86_64 R-rd-missing fnstenv +ds
 x86_64 R-rd-missing fnstsw +cs
 x86_64 R-rd-missing fnstsw +ds
 x86_64 R-rd-missing fst +fpcw,st#
 x86_64 R-rd-missing fstp +fpcw
-x86_64 R-rd-phantom f2xm1 +st#
-x86_64 R-rd-phantom fabs +st#
-x86_64 R-rd-phantom faddl +st#
+x86_64 R-rd-phantom f2xm1 +fpsw,st#
+x86_64 R-rd-phantom fabs +fpsw,st#
+x86_64 R-rd-phantom fadd +fpsw
+x86_64 R-rd-phantom fadd +fpsw,st#
+x86_64 R-rd-phantom faddl +fpsw,st#
 x86_64 R-rd-phantom faddp +fpsw
 x86_64 R-rd-phantom faddp +fpsw,st#
-x86_64 R-rd-phantom fadds +st#
+x86_64 R-rd-phantom fadds +fpsw,st#
+x86_64 R-rd-phantom fbld +fpcw,fpsw
 x86_64 R-rd-phantom fbstp +fpsw,st#
-x86_64 R-rd-phantom fchs +st#
+x86_64 R-rd-phantom fchs +fpsw,st#
+x86_64 R-rd-phantom fcmovb +flags,fpsw
+x86_64 R-rd-phantom fcmovb +flags,fpsw,st#
+x86_64 R-rd-phantom fcmovbe +flags,fpsw
+x86_64 R-rd-phantom fcmovbe +flags,fpsw,st#
+x86_64 R-rd-phantom fcmove +flags,fpsw
+x86_64 R-rd-phantom fcmove +flags,fpsw,st#
+x86_64 R-rd-phantom fcmovnb +flags,fpsw
+x86_64 R-rd-phantom fcmovnb +flags,fpsw,st#
+x86_64 R-rd-phantom fcmovnbe +flags,fpsw
+x86_64 R-rd-phantom fcmovnbe +flags,fpsw,st#
+x86_64 R-rd-phantom fcmovne +flags,fpsw
+x86_64 R-rd-phantom fcmovne +flags,fpsw,st#
+x86_64 R-rd-phantom fcmovnu +flags,fpsw
+x86_64 R-rd-phantom fcmovnu +flags,fpsw,st#
+x86_64 R-rd-phantom fcmovu +flags,fpsw
+x86_64 R-rd-phantom fcmovu +flags,fpsw,st#
+x86_64 R-rd-phantom fcom +fpsw
+x86_64 R-rd-phantom fcom +fpsw,st#
+x86_64 R-rd-phantom fcomi +fpsw
+x86_64 R-rd-phantom fcoml +fpsw,st#
 x86_64 R-rd-phantom fcomp +fpsw
 x86_64 R-rd-phantom fcomp +fpsw,st#
 x86_64 R-rd-phantom fcompi +fpsw
 x86_64 R-rd-phantom fcompl +fpsw,st#
 x86_64 R-rd-phantom fcompp +fpsw,st#
 x86_64 R-rd-phantom fcomps +fpsw,st#
-x86_64 R-rd-phantom fcos +st#
+x86_64 R-rd-phantom fcoms +fpsw,st#
+x86_64 R-rd-phantom fcos +fpsw,st#
 x86_64 R-rd-phantom fdecstp +fpsw
-x86_64 R-rd-phantom fdivl +st#
+x86_64 R-rd-phantom fdiv +fpsw
+x86_64 R-rd-phantom fdiv +fpsw,st#
+x86_64 R-rd-phantom fdivl +fpsw,st#
 x86_64 R-rd-phantom fdivp +fpsw
 x86_64 R-rd-phantom fdivp +fpsw,st#
-x86_64 R-rd-phantom fdivrl +st#
+x86_64 R-rd-phantom fdivr +fpsw
+x86_64 R-rd-phantom fdivr +fpsw,st#
+x86_64 R-rd-phantom fdivrl +fpsw,st#
 x86_64 R-rd-phantom fdivrp +fpsw
 x86_64 R-rd-phantom fdivrp +fpsw,st#
-x86_64 R-rd-phantom fdivrs +st#
-x86_64 R-rd-phantom fdivs +st#
+x86_64 R-rd-phantom fdivrs +fpsw,st#
+x86_64 R-rd-phantom fdivs +fpsw,st#
+x86_64 R-rd-phantom ffree +fpsw
 x86_64 R-rd-phantom ffreep +fpsw
-x86_64 R-rd-phantom fiaddl +st#
-x86_64 R-rd-phantom fiadds +st#
+x86_64 R-rd-phantom fiaddl +fpsw,st#
+x86_64 R-rd-phantom fiadds +fpsw,st#
+x86_64 R-rd-phantom ficoml +fpsw,st#
 x86_64 R-rd-phantom ficompl +fpsw,st#
 x86_64 R-rd-phantom ficomps +fpsw,st#
-x86_64 R-rd-phantom fidivl +st#
-x86_64 R-rd-phantom fidivrl +st#
-x86_64 R-rd-phantom fidivrs +st#
-x86_64 R-rd-phantom fidivs +st#
+x86_64 R-rd-phantom ficoms +fpsw,st#
+x86_64 R-rd-phantom fidivl +fpsw,st#
+x86_64 R-rd-phantom fidivrl +fpsw,st#
+x86_64 R-rd-phantom fidivrs +fpsw,st#
+x86_64 R-rd-phantom fidivs +fpsw,st#
 x86_64 R-rd-phantom fildl +fpsw
 x86_64 R-rd-phantom fildll +fpsw
 x86_64 R-rd-phantom filds +fpsw
-x86_64 R-rd-phantom fimull +st#
-x86_64 R-rd-phantom fimuls +st#
+x86_64 R-rd-phantom fimull +fpsw,st#
+x86_64 R-rd-phantom fimuls +fpsw,st#
 x86_64 R-rd-phantom fincstp +fpsw
-x86_64 R-rd-phantom fistl +st#
+x86_64 R-rd-phantom fistl +fpsw,st#
 x86_64 R-rd-phantom fistpl +fpsw,st#
 x86_64 R-rd-phantom fistpll +fpsw,st#
 x86_64 R-rd-phantom fistps +fpsw,st#
-x86_64 R-rd-phantom fists +st#
+x86_64 R-rd-phantom fists +fpsw,st#
 x86_64 R-rd-phantom fisttpl +fpsw,st#
 x86_64 R-rd-phantom fisttpll +fpsw,st#
 x86_64 R-rd-phantom fisttps +fpsw,st#
-x86_64 R-rd-phantom fisubl +st#
-x86_64 R-rd-phantom fisubrl +st#
-x86_64 R-rd-phantom fisubrs +st#
-x86_64 R-rd-phantom fisubs +st#
+x86_64 R-rd-phantom fisubl +fpsw,st#
+x86_64 R-rd-phantom fisubrl +fpsw,st#
+x86_64 R-rd-phantom fisubrs +fpsw,st#
+x86_64 R-rd-phantom fisubs +fpsw,st#
 x86_64 R-rd-phantom fld +fpsw
 x86_64 R-rd-phantom fld1 +fpsw
 x86_64 R-rd-phantom fldl +fpsw
@@ -8865,40 +8889,52 @@ x86_64 R-rd-phantom fldpi +fpsw
 x86_64 R-rd-phantom flds +fpsw
 x86_64 R-rd-phantom fldt +fpsw
 x86_64 R-rd-phantom fldz +fpsw
-x86_64 R-rd-phantom fmull +st#
+x86_64 R-rd-phantom fmul +fpsw
+x86_64 R-rd-phantom fmul +fpsw,st#
+x86_64 R-rd-phantom fmull +fpsw,st#
 x86_64 R-rd-phantom fmulp +fpsw
 x86_64 R-rd-phantom fmulp +fpsw,st#
-x86_64 R-rd-phantom fmuls +st#
+x86_64 R-rd-phantom fmuls +fpsw,st#
 x86_64 R-rd-phantom fnstenv +fcsr
 x86_64 R-rd-phantom fpatan +fpsw,st#
-x86_64 R-rd-phantom fprem +st#
-x86_64 R-rd-phantom fprem1 +st#
+x86_64 R-rd-phantom fprem +fpsw,st#
+x86_64 R-rd-phantom fprem1 +fpsw,st#
 x86_64 R-rd-phantom fptan +fpsw,st#
-x86_64 R-rd-phantom frndint +st#
-x86_64 R-rd-phantom fscale +st#
-x86_64 R-rd-phantom fsin +st#
+x86_64 R-rd-phantom frndint +fpsw,st#
+x86_64 R-rd-phantom fscale +fpsw,st#
+x86_64 R-rd-phantom fsin +fpsw,st#
 x86_64 R-rd-phantom fsincos +fpsw,st#
-x86_64 R-rd-phantom fsqrt +st#
-x86_64 R-rd-phantom fst +st#
-x86_64 R-rd-phantom fstl +st#
+x86_64 R-rd-phantom fsqrt +fpsw,st#
+x86_64 R-rd-phantom fst +fpsw
+x86_64 R-rd-phantom fst +fpsw,st#
+x86_64 R-rd-phantom fstl +fpsw,st#
 x86_64 R-rd-phantom fstp +fpsw
 x86_64 R-rd-phantom fstp +fpsw,st#
 x86_64 R-rd-phantom fstpl +fpsw,st#
 x86_64 R-rd-phantom fstps +fpsw,st#
 x86_64 R-rd-phantom fstpt +fpsw,st#
-x86_64 R-rd-phantom fsts +st#
-x86_64 R-rd-phantom fsubl +st#
+x86_64 R-rd-phantom fsts +fpsw,st#
+x86_64 R-rd-phantom fsub +fpsw
+x86_64 R-rd-phantom fsub +fpsw,st#
+x86_64 R-rd-phantom fsubl +fpsw,st#
 x86_64 R-rd-phantom fsubp +fpsw
 x86_64 R-rd-phantom fsubp +fpsw,st#
-x86_64 R-rd-phantom fsubrl +st#
+x86_64 R-rd-phantom fsubr +fpsw
+x86_64 R-rd-phantom fsubr +fpsw,st#
+x86_64 R-rd-phantom fsubrl +fpsw,st#
 x86_64 R-rd-phantom fsubrp +fpsw
 x86_64 R-rd-phantom fsubrp +fpsw,st#
-x86_64 R-rd-phantom fsubrs +st#
-x86_64 R-rd-phantom fsubs +st#
+x86_64 R-rd-phantom fsubrs +fpsw,st#
+x86_64 R-rd-phantom fsubs +fpsw,st#
+x86_64 R-rd-phantom ftst +fpsw,st#
+x86_64 R-rd-phantom fucom +fpsw
+x86_64 R-rd-phantom fucomi +fpsw
 x86_64 R-rd-phantom fucomp +fpsw
 x86_64 R-rd-phantom fucompi +fpsw
 x86_64 R-rd-phantom fucompp +fpsw,st#
-x86_64 R-rd-phantom fxch +st#
+x86_64 R-rd-phantom fxam +fpsw,st#
+x86_64 R-rd-phantom fxch +fpsw
+x86_64 R-rd-phantom fxch +fpsw,st#
 x86_64 R-rd-phantom fxtract +fpsw,st#
 x86_64 R-rd-phantom fyl2x +fpsw,st#
 x86_64 R-rd-phantom fyl2xp1 +fpsw,st#

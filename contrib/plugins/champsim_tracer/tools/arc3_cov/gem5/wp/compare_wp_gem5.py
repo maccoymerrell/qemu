@@ -70,6 +70,7 @@ for _p in (_HERE, _COV, os.path.join(_COV, 'gem5'),
 import elfimage                                              # noqa: E402
 import wp_trace                                              # noqa: E402
 import qemu_preserve_oracle as QPO                           # noqa: E402
+import x87_cw_derive as X87D                                 # noqa: E402
 import wp_seed_x86                                           # noqa: E402
 import gem5_wp_ref                                           # noqa: E402
 import gem5_env                                              # noqa: E402
@@ -177,9 +178,79 @@ ORACLE = None
 GATE = True
 
 
+#: THE x87 TOP GATE.  Its subject is the SOURCE-axis REG_FCSR the tracer
+#: names on every form that reads the top of the x87 stack, and gem5's
+#: silence about it is the same text whether the tracer is right or wrong:
+#: gem5 flattens `%st(0)` to a physical index at DECODE
+#: (src/arch/x86/regs/float.cc, `fpr((X87Top + (idx - NumRegs)) % 8)`), so a
+#: resolved operand carries no TOP source to compare against.  That the read
+#: is real therefore comes from QEMU or from nowhere -- ST0 expands to
+#: `env->fpregs[env->fpstt].d` and the read is in the macro, not in the
+#: helper's text.  Without a wired gate every such row is REFUSED, exactly
+#: as the preserve gate refuses.
+X87 = None
+X87_GATE = True
+
+
 def set_oracle(o):
     global ORACLE
     ORACLE = o
+
+
+def set_x87(o):
+    global X87
+    X87 = o
+
+
+def _x87_top_label(enc):
+    """The SOURCE-axis label for a tracer-only REG_FCSR, decided by QEMU.
+
+    Three outcomes and they must stay three.  A refusal is not a conviction
+    and a conviction is not a refusal; the report has to say which.
+    """
+    if not X87_GATE:
+        return 'REF-X87-TOP-FOLDED-AT-DECODE'
+    if X87 is None or enc is None:
+        return 'REF-X87-TOP-UNDECIDED'
+    v = X87.reads_status(enc)
+    if v is True:
+        return 'REF-X87-TOP-FOLDED-AT-DECODE'
+    if v is False:
+        return 'TRACER-X87-TOP-NOT-READ'
+    return 'REF-X87-TOP-UNDECIDED'
+
+
+def _superset_families(side, enc):
+    """[(does this register belong to the family, label)], for a SUPERSET.
+
+    PEELED FAMILY BY FAMILY rather than matched as one set.  A row whose
+    surplus is {REG_FCSR, REG_FPCW} carries TWO independent reference gaps --
+    gem5 resolves the stack slot at decode and names no TOP source, and its
+    x87 lowering carries no control-word operand at all -- and an
+    `elif rest == {...}` chain reaches neither, so the row reported
+    UNACCOUNTED with an EMPTY label: "the rules do not reach this" when in
+    fact two of them did.  Each entry removes only its own members; the row
+    accounts when the surplus EMPTIES and every named rule accounts on its
+    own.  None of these families overlap, so the order is not load-bearing.
+
+    REG_FCSR is TWO different gaps depending on the axis, which is why
+    `side` is consulted rather than one label serving both.  On the
+    DESTINATION axis it is gem5 publishing an x87 status-word write for
+    `fabs` and not for `fadd`.  On the SOURCE axis it is the read of TOP.
+    Calling both by the destination's name would put a measurement behind a
+    note that does not describe it.
+    """
+    return [
+        (lambda n: n == _RIP, 'REF-NO-RIP-OPERAND'),
+        (lambda n: n in _SEGS, 'REF-SEG-EFF-BASE-ONLY'),
+        (lambda n: n == 'REG_FLAGS', 'REF-FLAGS-PARTIAL'),
+        (lambda n: n.startswith('REG_VEC'), 'REF-XMM-HALF-ONLY'),
+        (lambda n: n.startswith('REG_FPR'), 'REF-X87-CONVERTED'),
+        (lambda n: n == 'REG_FCSR',
+         _x87_top_label(enc) if side == 'src'
+         else 'REF-X87-STATUS-NOT-PUBLISHED'),
+        (lambda n: n == 'REG_FPCW', 'REF-NO-X87-CONTROL-OPERAND'),
+    ]
 
 
 def _oracle_verdict(enc, surplus):
@@ -227,32 +298,17 @@ def adjudicate(rel, only_ref, only_trc, side, preserve=frozenset(), enc=None):
     Under R7.1 those are not sources, so a SUBSET made up entirely of them is
     the REFERENCE over-naming and not a tracer defect.
     """
-    label = None
+    label, labels = None, []
     if rel == SUPERSET:
         rest = set(only_trc)
-        if _RIP in rest:
-            label = 'REF-NO-RIP-OPERAND'
-            rest.discard(_RIP)
-        if rest and rest <= _SEGS:
-            label = 'REF-SEG-EFF-BASE-ONLY'
-            rest = set()
-        elif rest == {'REG_FLAGS'}:
-            label = 'REF-FLAGS-PARTIAL'
-            rest = set()
-        elif rest and all(n.startswith('REG_VEC') for n in rest):
-            label = 'REF-XMM-HALF-ONLY'
-            rest = set()
-        elif rest and all(n.startswith('REG_FPR') for n in rest):
-            label = 'REF-X87-CONVERTED'
-            rest = set()
-        elif rest == {'REG_FCSR'}:
-            label = 'REF-X87-STATUS-NOT-PUBLISHED'
-            rest = set()
-        elif rest == {'REG_FPCW'}:
-            label = 'REF-NO-X87-CONTROL-OPERAND'
-            rest = set()
+        for match, lab in _superset_families(side, enc):
+            hit = {n for n in rest if match(n)}
+            if hit:
+                labels.append(lab)
+                rest -= hit
         if rest:
-            label = None            # something the rules do not reach
+            labels = []             # something the rules do not reach
+        label = ' + '.join(labels) if labels else None
     elif rel == SUBSET:
         surplus = set(only_ref)
         if surplus and surplus <= set(preserve):
@@ -266,10 +322,17 @@ def adjudicate(rel, only_ref, only_trc, side, preserve=frozenset(), enc=None):
                 label = 'REF-PRESERVE-READ-UNDECIDED'
         else:
             label = 'REF-ONLY-UNEXPLAINED'
-    rule = x86_exec_rule(label)
-    if rule is not None and rel in rule.expect and rule.accounts:
+    # A SUPERSET row may carry several families, and it accounts only when
+    # EVERY named rule accounts on its own and expects the direction that was
+    # measured.  One refusing or convicting family is enough to hold the
+    # whole row open -- an accounted family cannot pay for an unaccounted one.
+    named = labels if labels else ([label] if label else [])
+    rules = [x86_exec_rule(n) for n in named]
+    if rules and all(r is not None and rel in r.expect and r.accounts
+                     for r in rules):
         return (REF_SIDE if rel == SUBSET else SUPERSET_OK), label
-    if label == 'REF-PRESERVE-READ-UNDECIDED':
+    if any(n in ('REF-PRESERVE-READ-UNDECIDED', 'REF-X87-TOP-UNDECIDED')
+           for n in named):
         # A REFUSAL is not a conviction.  The rule declined to adjudicate the
         # row, and calling that a tracer defect would be as wrong as calling
         # it agreement -- it counts against the leg either way, but the
@@ -682,6 +745,34 @@ def inject_rmw_drop(exc):
     return hit
 
 
+def inject_x87_top(exc):
+    """THE FALSIFIER FOR REF-X87-TOP-FOLDED-AT-DECODE.
+
+    The mirror of ``inject_rmw_drop``, on the other side of the same
+    question.  PLANT, on the TRACER side, a REG_FCSR source on every
+    instruction whose encoding the QEMU status-group oracle answers NO on --
+    an instruction that reads no part of {fpus, fpstt, fptags}.  gem5 names
+    no TOP source on ANY encoding, so its text cannot tell a planted read
+    from a real one, and the pre-gate rule excuses both.  The leg must report
+    these as TRACER-X87-TOP-NOT-READ; run the same injection under
+    ``--rule-gem5-only`` and the ungated rule forgives them, which is what
+    makes the gate a measurement rather than a decoration.
+
+    -> Counter of encodings actually given a planted source.
+    """
+    hit = collections.Counter()
+    for ex in exc:
+        for ins in ex.insns:
+            enc = _enc(ins)
+            if enc is None or 'REG_FCSR' in ins.srcs:
+                continue
+            if X87 is None or X87.reads_status(enc) is not False:
+                continue
+            ins.srcs = list(ins.srcs) + ['REG_FCSR']
+            hit[enc] += 1
+    return hit
+
+
 def process_guest(args, envx, guest, out):
     stem = os.path.join(out, os.path.basename(guest))
     trace = run_tracer(args.qemu, args.plugin, guest, stem, args.wpdepth)
@@ -692,6 +783,12 @@ def process_guest(args, envx, guest, out):
         got = inject_rmw_drop(exc)
         envx.notes.append('INJECTION rmw-drop on %s: %d sources removed, %d '
                           'distinct encoding:register  %s'
+                          % (os.path.basename(guest), sum(got.values()),
+                             len(got), ' '.join(sorted(got))[:400]))
+    if getattr(args, 'inject_x87_top', False):
+        got = inject_x87_top(exc)
+        envx.notes.append('INJECTION x87-top on %s: %d REG_FCSR sources '
+                          'planted over %d distinct encodings  %s'
                           % (os.path.basename(guest), sum(got.values()),
                              len(got), ' '.join(sorted(got))[:400]))
 
@@ -959,6 +1056,14 @@ def main():
                          'text alone, as the rule did before the QEMU gate.  '
                          'Run WITH --inject-rmw-drop to see the blind spot '
                          'forgive a dropped architectural source')
+    ap.add_argument('--inject-x87-top', action='store_true',
+                    help='NEGATIVE CONTROL: plant, on the tracer side, a '
+                         'REG_FCSR source on every encoding the QEMU '
+                         'status-group oracle says reads no part of '
+                         '{fpus, fpstt, fptags}.  The leg MUST report '
+                         'TRACER-X87-TOP-NOT-READ; a green run under this '
+                         'flag means the rule excuses a TOP read QEMU does '
+                         'not perform')
     ap.add_argument('--inject-rmw-drop', action='store_true',
                     help='NEGATIVE CONTROL: drop, on the tracer side, every '
                          'source the QEMU oracle calls architectural on a '
@@ -976,12 +1081,21 @@ def main():
     oracle, _olog = QPO.build(a.qemu, a.guest,
                               os.path.join(a.outdir, 'oracle'))
     set_oracle(oracle)
+    # The x87 half of the same question, off the SAME dumps.  It answers for
+    # state QEMU keeps at an env offset, which is precisely what the preserve
+    # oracle refuses on -- the two are complementary, not alternatives.
+    x87 = X87D.StatusOracle()
+    for _l in _olog:
+        x87.add_dump(_l)
+    set_x87(x87)
     if a.rule_gem5_only:
-        global GATE
+        global GATE, X87_GATE
         GATE = False
-        envx.notes.append('FALSIFICATION ARM: the QEMU gate on '
-                          'REF-PRESERVE-READ-OVERNAMED is OFF; the rule is '
-                          'adjudicating from gem5\'s operand text alone')
+        X87_GATE = False
+        envx.notes.append('FALSIFICATION ARM: the QEMU gates on '
+                          'REF-PRESERVE-READ-OVERNAMED and '
+                          'REF-X87-TOP-FOLDED-AT-DECODE are OFF; the rules '
+                          'are adjudicating from gem5\'s operand text alone')
     rows = []
     stats, tails = collections.Counter(), collections.Counter()
     dropped, folded, merged = (collections.Counter(), collections.Counter(),

@@ -96,6 +96,26 @@ Every one of these was found by running gem5, not assumed:
   leg cannot clear the x87 tag word.
 * **gem5 publishes an x87 status-word destination for `fabs`/`fchs` and not
   for `fadd`/`fmul`/`fsub`**, measured on the same run.
+* **gem5 states no read of the x87 TOP field**, because it resolves `%st(0)`
+  to a physical register at DECODE -- `fpr((X87Top + (idx - NumRegs)) % 8)`,
+  `src/arch/x86/regs/float.cc` -- and prints the unflattened operand.  QEMU
+  addresses the same stack through `#define ST0 (env->fpregs[env->fpstt].d)`,
+  so every form that names a slot reads TOP, and a renaming regfile must
+  respect the edge from whatever last wrote it (R7).  The tracer names that
+  read as `REG_FCSR`; the reference has nothing to match it with.
+
+  **THIS ONE IS NOT DECIDED BY gem5 EITHER.**  Its silence is the same text
+  whether the tracer is right or wrong, so the second half comes from QEMU:
+  `x87_cw_derive.StatusOracle` answers, per ENCODING, off the SAME observed
+  `-one-insn-per-tb -d op,in_asm` dumps the preserve oracle reads, with the
+  stack-addressing macros EXPANDED before the walk -- unexpanded, the read is
+  in no function body and the tool answers `no` on every x87 form.  A YES is
+  `REF-X87-TOP-FOLDED-AT-DECODE`, a NO is `TRACER-X87-TOP-NOT-READ` and
+  convicts, and an encoding the oracle cannot see is `REF-X87-TOP-UNDECIDED`,
+  a REFUSAL that counts against the leg.  `--inject-x87-top` plants a
+  `REG_FCSR` source on every encoding QEMU says reads no part of
+  `{fpus, fpstt, fptags}`, and `--rule-gem5-only` is the arm in which the
+  ungated rule forgives them.
 * **gem5 never names its own x87 control word.**  `misc_reg::Fcw` exists in
   the enumeration, one past `Mxcsr` and one before `Fsw`; over every run in
   this leg `miscellaneous:193` occurs **zero** times in any operand list, and
@@ -146,7 +166,7 @@ requires the axis that owns it to fire.  **Eleven** axes plus the injection
 control, all firing, is the bar; an axis with no firing mutation reports
 `UNPROVEN` and its zero is not counted as a pass.
 
-A second, RULE-DIRECTED falsifier lives in the comparison itself.  A negative
+Two further, RULE-DIRECTED falsifiers live in the comparison itself.  A negative
 control on the axes does not test whether an ADJUDICATION forgives what it
 should convict, and `REF-PRESERVE-READ-OVERNAMED` is the rule with the most to
 forgive.  `--inject-rmw-drop` removes, on the tracer side, exactly the sources
@@ -154,6 +174,13 @@ QEMU calls architectural on a register the same instruction writes, and the
 leg must report them as `TRACER-DROPPED-RMW-SOURCE`.  Run the same injection
 with `--rule-gem5-only` and the pre-gate rule EXCUSES them, which is what
 makes the closure a measurement rather than a claim.
+
+`--inject-x87-top` is the same shape on the SUPERSET side, for
+`REF-X87-TOP-FOLDED-AT-DECODE`.  It plants a `REG_FCSR` source on every
+encoding the QEMU status-group oracle answers NO on, and the leg must report
+`TRACER-X87-TOP-NOT-READ`; under `--rule-gem5-only` the ungated rule excuses
+every one of them, because gem5's operand text is silent about TOP on all
+encodings alike and cannot tell a planted read from a real one.
 
 The **injection control** is the load-bearing one: it perturbs the state that
 is *installed* and requires gem5's own execution to change.  Without it, an

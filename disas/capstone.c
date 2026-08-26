@@ -566,7 +566,11 @@ static void cap_x86_add_sysregs(const cs_insn *insn,
  *   gen_helper_fcom_/fucom_ST0_FT0        writes the condition codes
  *
  * The status word is where TOP lives, so a push or a pop is a genuine
- * read-modify-write of it and a later `fnstsw` must wait on it: the R7
+ * read-modify-write of it and a later `fnstsw` must wait on it -- and, for
+ * the same reason, EVERY form that NAMES a slot of the stack reads it,
+ * because TOP is what selects the slot.  That read is stated once, in
+ * cap_x86_x87_effects(), rather than repeated on forty rows of the table
+ * below; the comment on that function carries its derivation.  The R7
  * regfile-dependency test is satisfied for every edge stated here.
  * FLDENV / FNSTENV move the control and tag words together and are stated
  * through cap_x86_add_x87_env().
@@ -615,10 +619,19 @@ static void cap_x86_add_sysregs(const cs_insn *insn,
 /* fpush / fpop / fpop2 all move env->fpstt, which lives in the status word. */
 #define X87F_PUSH  (X87F_SWR | X87F_SWW)
 #define X87F_POP   (X87F_SWR | X87F_SWW)
+/*
+ * The bits that say "this row NAMES a slot of the x87 stack".  Every one of
+ * them implies a read of the status word, because the slot is selected by
+ * TOP and TOP is a field of it; cap_x86_x87_effects() adds X87F_SWR to any
+ * row carrying one.
+ */
+#define X87F_STACK (X87F_R0 | X87F_W0 | X87F_R1 | X87F_W1 | \
+                    X87F_OPW | X87F_OPRW)
 static void cap_x86_add_pcmpstr_implicit(const cs_insn *insn,
                                         qemu_plugin_insn_info *out,
                                         csh handle);
 static unsigned int cap_x86_x87_effects(const cs_insn *insn);
+static unsigned int cap_x86_x87_effects_table(const cs_insn *insn);
 static void cap_x86_add_x87_implicit(unsigned int fx,
                                      qemu_plugin_insn_info *out, csh handle);
 static bool cap_x86_reg_is_x87_stack(unsigned int reg);
@@ -1341,7 +1354,7 @@ static int cap_x86_x87_escape_at(const cs_insn *insn)
     return -1;
 }
 
-static unsigned int cap_x86_x87_effects(const cs_insn *insn)
+static unsigned int cap_x86_x87_effects_table(const cs_insn *insn)
 {
     int k = cap_x86_x87_escape_at(insn);
     uint8_t b, modrm;
@@ -1546,12 +1559,80 @@ static unsigned int cap_x86_x87_effects(const cs_insn *insn)
     case 0x3d: case 0x3e:
         /* fucomip / fcomip -- the comparison then fpop. */
         return X87F_R0 | X87F_POP | X87F_SWW | X87F_CWR;
-    /* 0x0a fnop, 0x1c (feni/fdisi/fclex/fninit/fsetpm), 0x28 ffree and
-     * 0x10..0x13 / 0x18..0x1b FCMOVcc are already stated in full -- the
-     * first three by cap_x86_add_sysregs(), FCMOVcc by cap_x86_is_cmov(). */
+    case 0x10: case 0x11: case 0x12: case 0x13:
+    case 0x18: case 0x19: case 0x1a: case 0x1b:
+        /* FCMOVcc %st(i), %st -- cap_x86_is_cmov() states the st(i) source
+         * and the ST(0) destination, so no X87F_STACK bit is set here and
+         * the read of TOP that SELECTS them would go unstated.
+         * gen_helper_fmov_ST0_STN(i) resolves both through env->fpstt at
+         * execution, so the status word is a source on these forms exactly
+         * as it is on the arithmetic ones.  Stated on its own line so that
+         * nothing cap_x86_is_cmov() already publishes is published twice. */
+        return X87F_SWR;
+    case 0x28:
+        /* ffree %st(i) -- helper_ffree_STN clears
+         * env->fptags[(env->fpstt + i) & 7].  cap_x86_add_sysregs() states
+         * the tag-word write; the env->fpstt read that picks WHICH tag it
+         * clears is stated here. */
+        return X87F_SWR;
+    /* 0x0a fnop and 0x1c (feni/fdisi/fclex/fninit/fsetpm) are already
+     * stated in full by cap_x86_add_sysregs(). */
     default:
         return 0;
     }
+}
+
+/*
+ * THE READ OF TOP, stated once for every row that names a stack slot.
+ *
+ * QEMU addresses the x87 stack through three macros at the top of
+ * target/i386/tcg/fpu_helper.c:
+ *
+ *     #define FT0    (env->ft0)
+ *     #define ST0    (env->fpregs[env->fpstt].d)
+ *     #define ST(n)  (env->fpregs[(env->fpstt + (n)) & 7].d)
+ *     #define ST1    ST(1)
+ *
+ * so `helper_fabs_ST0` is `ST0 = floatx80_abs(ST0)` in full, and the read
+ * of `env->fpstt` -- the TOP field of the status word, which decides WHICH
+ * physical register `%st(0)` denotes -- appears nowhere in the helper's own
+ * text.  A reading of the source that does not expand the macro concludes
+ * that fabs, fchs, fadd, fcom, fst, fxch and every other non-pushing form
+ * is independent of the top of stack.  That conclusion is a property of the
+ * reading, not of the machine.
+ *
+ * The R7 regfile-dependency test settles it: an `fld` between two
+ * instructions makes the second one's `%st(0)` a DIFFERENT physical
+ * register, so a renaming regfile must respect the edge from whatever last
+ * wrote TOP to every instruction that names a slot.  Only the forms that
+ * name no slot are exempt.
+ *
+ * DERIVED, NOT ASSERTED.  The subject is
+ * contrib/plugins/champsim_tracer/tools/arc3_cov/x86_64/x87_cw_derive.py,
+ * which expands those macros and walks fpu_helper.c to a fixed point over
+ * an OBSERVED `-one-insn-per-tb -d op` dump, and fails the run if the
+ * macros ever stop hiding the read.  Over its 153-encoding x87 denominator
+ * it reports 140 encodings reading {fpus, fpstt, fptags} and 13 not; the
+ * thirteen are FLDCW, FNSTCW, FLDENV, FRSTOR, FXRSTOR, FNCLEX, FNINIT and
+ * the three 8087 NOPs -- the pure control- and environment-word forms,
+ * none of which names a stack slot.
+ *
+ * NOT INCLUDED, and named rather than left silent: FNOP (D9 D0) and FWAIT
+ * (9B) both run helper_fwait, which reads env->fpus to test FPUS_SE.  That
+ * is the exception-summary bit and not TOP, neither instruction names a
+ * stack slot, and QEMU's own comment on the FNOP case says the check is
+ * there for a FreeBSD FPU probe -- a QEMU-modelling fact rather than an ISA
+ * one.  They are a different mechanism and are left to the question that
+ * owns them.
+ */
+static unsigned int cap_x86_x87_effects(const cs_insn *insn)
+{
+    unsigned int fx = cap_x86_x87_effects_table(insn);
+
+    if (fx & X87F_STACK) {
+        fx |= X87F_SWR;
+    }
+    return fx;
 }
 
 /*

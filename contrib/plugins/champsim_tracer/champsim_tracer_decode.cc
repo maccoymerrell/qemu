@@ -362,6 +362,17 @@ static inline const QemuRegKey *qemu_reg_for_generic(uint8_t gen_id)
 }
 
 /*
+ * The same resolution, published.  See champsim_tracer.h: the QEMU-owned
+ * source index can seat a register in src_regs[] that the Capstone operand
+ * walk never listed, and that slot needs the same key every walk-built slot
+ * carries or its VALUE never reaches the wire.
+ */
+const QemuRegKey *qemu_reg_key_for_generic(uint8_t gen_id)
+{
+    return qemu_reg_for_generic(gen_id);
+}
+
+/*
  * The QEMU register whose VALUE this table row stands for.  Both
  * candidates are pointer-stable -- the row lives in a static table and
  * the singleton in a static array -- so either can key the handle

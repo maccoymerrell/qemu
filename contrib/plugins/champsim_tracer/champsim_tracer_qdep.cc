@@ -384,6 +384,222 @@ uint64_t all_inputs_mask(const InsnFields *f)
     return m;
 }
 
+
+/*
+ * THE COORDINATE SYSTEM, and why it is rebuilt rather than read.
+ *
+ * A dependency mask on the wire is a set of BIT POSITIONS, and
+ * docs/format.rst fixes what a position means: "bits [0, n_src) depends on
+ * src_reg[i]".  So the mask says nothing on its own -- src_regs[] is the
+ * dictionary it is read through, and until this function existed that
+ * dictionary was built entirely by the Capstone operand walk.  Every
+ * register QEMU's emitters named was then LOOKED UP in Capstone's list to
+ * find the bit that would carry it.
+ *
+ * That is a live Capstone route into a QEMU-sourced block, and it was
+ * MEASURED rather than argued: under `QEMU_CAP_MUTATE=access`, 88 published
+ * address dependencies across x86_64, aarch64 and riscv64 named a DIFFERENT
+ * architectural register, because a flipped access flag moved a register
+ * out of src_regs[] and every later slot shifted down underneath a mask
+ * whose bit positions index it (ARC3_CLOSE.md 1.5).  J3's bar is verbatim
+ * "If we are still susceptible to Capstone artifacts, we didn't do it
+ * right", so the answer is not to document the coupling but to remove it.
+ *
+ * WHAT THIS DOES.  Every register QEMU's own emitters named -- the address
+ * provenance of each access, then the store datum's -- is seated at the
+ * HEAD of src_regs[], in QEMU's order, before anything the operand walk
+ * found.  The address mask is then a set of bit positions inside a run that
+ * QEMU alone decides the length, the order and the contents of, so its
+ * VALUE is a function of QEMU's answer and of nothing else.  Corrupting
+ * Capstone's operands can still change what follows the prefix; it cannot
+ * reach into it.
+ *
+ * IT IS A PERMUTATION, NOT A REPLACEMENT.  Nothing is dropped: the walk's
+ * sources that QEMU did not name keep their identity and follow the prefix
+ * in their original relative order, and a register QEMU named that the walk
+ * missed is APPENDED to the instruction's sources rather than being cause
+ * to refuse.  Every mask, lane array and register key that indexes a source
+ * slot is carried through the same permutation in the same step, so no
+ * consumer sees a mask and a dictionary from different orders.
+ *
+ * WHY HERE AND NOT IN THE WALK.  The refiners write source-slot masks and
+ * run between the walk and this file; a reindex before them would be undone
+ * by them.  qdep_apply() is the last writer, which is the only place the
+ * permutation can be applied once and be final.
+ *
+ * WHAT IT DOES NOT REACH, stated because a half-closed route reads like a
+ * closed one.  n_src_regs is still the walk's COUNT, so the load-data bits
+ * at [n_src, n_src + max_dep_loads) and the immediate bit above them still
+ * sit at Capstone-decided offsets.  The ADDRESS masks never set those bits
+ * -- their layout has no load-data slots and this extractor never sets
+ * their immediate -- so the address families are complete.  The STORE-DATA
+ * family sets both, and is therefore invariant in its register bits and not
+ * in the other two.  See champsim_tracer_qdep.h.
+ */
+bool reindex_src_for_qemu(InsnFields *f, InsnRegNames *rn,
+                          const uint8_t *q, uint8_t nq)
+{
+    uint8_t neworder[MAX_SRC_REGS];
+    uint8_t map[MAX_SRC_REGS];          /* old source slot -> new slot */
+    unsigned n = 0;
+    const unsigned nsrc_o = f->n_src_regs;
+    const unsigned mdl = f->max_dep_loads;
+
+    if (nsrc_o > MAX_SRC_REGS) {
+        return false;
+    }
+    for (uint8_t k = 0; k < nq; k++) {
+        if (n >= MAX_SRC_REGS) {
+            return false;
+        }
+        neworder[n++] = q[k];
+    }
+    for (unsigned i = 0; i < nsrc_o; i++) {
+        uint8_t r = f->src_regs[i];
+        bool seated = false;
+
+        for (uint8_t k = 0; k < nq; k++) {
+            if (q[k] == r) {
+                map[i] = k;
+                seated = true;
+                break;
+            }
+        }
+        if (seated) {
+            continue;
+        }
+        if (n >= MAX_SRC_REGS) {
+            return false;
+        }
+        map[i] = (uint8_t)n;
+        neworder[n++] = r;
+    }
+    const unsigned nsrc_n = n;
+    /*
+     * The widest bit either layout addresses is the register mask's
+     * immediate, one above the load-data run.  Refuse rather than write a
+     * mask whose top bit fell off the end of the word.
+     */
+    if (nsrc_o + mdl >= 64 || nsrc_n + mdl >= 64) {
+        return false;
+    }
+    if (nsrc_n == nsrc_o) {
+        bool moved = false;
+        for (unsigned i = 0; i < nsrc_o; i++) {
+            if (map[i] != i) {
+                moved = true;
+                break;
+            }
+        }
+        if (!moved) {
+            return true;        /* already QEMU's order; nothing to carry */
+        }
+    }
+
+    /*
+     * @nloads is max_dep_loads for a register mask and ZERO for an address
+     * mask, which is the whole difference between the two layouts -- and
+     * the immediate bit sits one above the run in both.
+     */
+    auto carry = [&](uint64_t m, unsigned nloads) -> uint64_t {
+        uint64_t o = 0;
+
+        for (unsigned i = 0; i < nsrc_o; i++) {
+            if (m & (1ULL << i)) {
+                o |= 1ULL << map[i];
+            }
+        }
+        for (unsigned k = 0; k < nloads; k++) {
+            if (m & (1ULL << (nsrc_o + k))) {
+                o |= 1ULL << (nsrc_n + k);
+            }
+        }
+        if (m & (1ULL << (nsrc_o + nloads))) {
+            o |= 1ULL << (nsrc_n + nloads);
+        }
+        return o;
+    };
+
+    for (uint8_t d = 0; d < f->n_dst_regs; d++) {
+        f->dst_dep_mask[d] = carry(f->dst_dep_mask[d], mdl);
+    }
+    for (uint8_t st = 0; st < f->max_dep_stores; st++) {
+        f->store_data_dep_mask[st] = carry(f->store_data_dep_mask[st], mdl);
+        f->store_addr_dep_mask[st] = carry(f->store_addr_dep_mask[st], 0);
+    }
+    for (uint8_t l = 0; l < f->max_dep_loads; l++) {
+        f->load_addr_dep_mask[l] = carry(f->load_addr_dep_mask[l], 0);
+    }
+
+    uint64_t lane[MAX_SRC_REGS];
+    const QemuRegKey *keys[MAX_SRC_REGS];
+    memset(lane, 0, sizeof(lane));
+    memset(keys, 0, sizeof(keys));
+    for (unsigned i = 0; i < nsrc_o; i++) {
+        lane[map[i]] = f->src_lane_mask[i];
+        if (rn && rn->src_qemu_reg_keys) {
+            keys[map[i]] = rn->src_qemu_reg_keys[i];
+        }
+    }
+    for (unsigned i = 0; i < nsrc_n; i++) {
+        f->src_regs[i] = neworder[i];
+        f->src_lane_mask[i] = lane[i];
+        if (rn && rn->src_qemu_reg_keys) {
+            /*
+             * A slot the walk never held has no key to carry, so it is
+             * resolved from the generic ID -- the same singleton the walk
+             * would have installed.  Without this the register would be on
+             * the wire as an identity with no readable value behind it.
+             */
+            rn->src_qemu_reg_keys[i] =
+                keys[i] ? keys[i] : qemu_reg_key_for_generic(neworder[i]);
+        }
+    }
+    f->n_src_regs = (uint8_t)nsrc_n;
+    return true;
+}
+
+/*
+ * The register list QEMU's emitters named for this instruction, in QEMU's
+ * own order: every access's address provenance first, in the order the
+ * accesses were emitted, then the store datum's.
+ *
+ * Both halves are included whenever QEMU stated them IN FULL, and the test
+ * is q->state / q->data_state as qdep_note_insn() left them -- the RAW
+ * per-family verdicts, before qdep_apply()'s shape and multi gates, which
+ * are the two places a Capstone-derived count still speaks.  Gating the
+ * prefix on those would make its LENGTH a function of Capstone's operand
+ * list and put back, one level up, exactly the coupling this removes.
+ */
+uint8_t qemu_named_regs(const QDepInsn *q, uint8_t *out)
+{
+    uint8_t n = 0;
+
+    auto take = [&](const uint8_t *regs, uint8_t cnt) {
+        for (uint8_t i = 0; i < cnt; i++) {
+            bool dup = false;
+            for (uint8_t k = 0; k < n; k++) {
+                if (out[k] == regs[i]) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup && n < MAX_SRC_REGS) {
+                out[n++] = regs[i];
+            }
+        }
+    };
+
+    if (q->state == QDEP_OK) {
+        take(q->load_regs, q->n_load_regs);
+        take(q->store_regs, q->n_store_regs);
+    }
+    if (q->data_state == QDEP_OK) {
+        take(q->data_regs, q->n_data_regs);
+    }
+    return n;
+}
+
 const char *state_name(unsigned s)
 {
     switch (s) {
@@ -398,6 +614,7 @@ const char *state_name(unsigned s)
     case QDEP_R_WIDE:           return "refused: more address registers than the record holds";
     case QDEP_R_UNREPRESENTABLE:return "refused: a named input occupies no slot to set";
     case QDEP_R_EMU_MONITOR:    return "refused: names the reservation monitor's value half (emulation artefact, #177 / f46873a738)";
+    case QDEP_R_REINDEX:        return "refused: QEMU's own source index does not fit (src slots or mask width)";
     case QDEP_NO_BLOCK:         return "stated by QEMU but the wire's HAS_REG flag is clear: consumer already at the default";
     default:                    return "?";
     }
@@ -528,7 +745,8 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
     }
 }
 
-void qdep_apply(InsnFields *f, const QDepInsn *q, const char *mnem)
+void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
+                const char *mnem)
 {
     unsigned state = q ? q->state : QDEP_NONE;
     unsigned dstate = q ? q->data_state : QDEP_NONE;
@@ -552,6 +770,37 @@ void qdep_apply(InsnFields *f, const QDepInsn *q, const char *mnem)
      * and QEMU's access list do not describe the same accesses, so neither
      * family's per-access pairing means anything.
      */
+    /*
+     * Seat QEMU's own register list at the head of src_regs[] FIRST, so
+     * every mask written below is written in a coordinate system QEMU owns.
+     * Done before the gates, not after: the gates only decide whether the
+     * masks are PUBLISHED, and the permutation has to be applied whether
+     * they are or not -- dst_dep_mask[] indexes the same slots and would
+     * otherwise be left reading the old order.
+     */
+    {
+        uint8_t qregs[MAX_SRC_REGS];
+        uint8_t nq = qemu_named_regs(q, qregs);
+
+        if (nq && !reindex_src_for_qemu(f, rn, qregs, nq)) {
+            /*
+             * The index could not be seated, so nothing below can be
+             * written in QEMU's coordinates.  Refuse both families rather
+             * than publish a mask indexed against the operand walk's order
+             * while claiming it is QEMU's.
+             */
+            f->has_addr_deps = false;
+            g_state[QDEP_R_REINDEX].fetch_add(1, std::memory_order_relaxed);
+            if (f->has_reg_deps) {
+                for (uint8_t st = 0; st < f->max_dep_stores; st++) {
+                    f->store_data_dep_mask[st] = all_inputs_mask(f);
+                }
+            }
+            g_dstate[QDEP_R_REINDEX].fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+
     bool shape_bad = false, multi = false;
     if ((f->max_dep_loads > 0) != q->qemu_has_load ||
         (f->max_dep_stores > 0) != q->qemu_has_store) {

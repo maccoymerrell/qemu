@@ -3542,6 +3542,16 @@ segment register whose base is added in (``mov %fs:0x28, %rax`` reads
 the instruction's ``src_reg`` entries).  Segment registers appear only
 in this role; no other ISA has segmented addressing.
 
+Slot order inside ``src_regs[]`` carries no semantic weight of its own
+— the array is the dictionary the masks are read through, and a
+consumer resolves a bit by index and never by position.  It is not
+arbitrary either: on an instruction whose memory-address inputs QEMU's
+own emitters stated, those inputs occupy the LEADING slots, in the
+order the accesses were emitted, ahead of the instruction's remaining
+sources.  A consumer gains nothing from relying on that and must not;
+it is recorded because it is what makes an address mask's value a
+function of the emitter's answer alone.
+
 Absence of ``CST_INSN_FLAG_HAS_DEP_BLOCK`` is the implicit all-to-all
 over-approximation: every dst / store depends on every src / load.
 Consumers that don't model intra-instruction dataflow can ignore

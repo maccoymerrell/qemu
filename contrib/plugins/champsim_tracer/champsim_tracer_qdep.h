@@ -50,6 +50,39 @@
  * never publishes a short mask, and it never silently falls back to the
  * Capstone answer it replaced.
  *
+ * AND THE MASK IS WRITTEN IN QEMU'S OWN COORDINATES, which is a separate
+ * property from the one above and was NOT true until 2026-08-26.  A mask is
+ * a set of BIT POSITIONS and docs/format.rst fixes what a position means --
+ * "bits [0, n_src) depends on src_reg[i]" -- so a mask whose VALUES came
+ * from QEMU while its INDEXING came from the Capstone operand walk was
+ * still reachable by a Capstone defect.  It was measured reachable: under
+ * `QEMU_CAP_MUTATE=access`, 88 published address masks changed VALUE
+ * (x86_64 60, aarch64 4, riscv64 24) because a flipped access flag moved a
+ * register out of src_regs[] and shifted every later slot underneath them.
+ * reindex_src_for_qemu() now seats QEMU's own register list at the head of
+ * src_regs[] before any mask is written, so an address mask's bits index a
+ * run whose length, order and contents QEMU alone decides.
+ *
+ * MEASURED AFTER, same battery, four ISAs, exec26/reindex/SCORE_address.txt:
+ * load_addr_dep and store_addr_dep move 0 rows on the implicit, memdir and
+ * access arms -- 0 value differences and 0 differences in the registers
+ * named.  On the unmutated arm the published dependency SETS over all
+ * 48,374 blocks are unchanged (SETPROOF.txt): this is a permutation of the
+ * coordinate system and not a change of content.
+ *
+ * WHAT IS STILL CAPSTONE'S, so this paragraph cannot be read as more than
+ * it says.  The mutation arms still SUPPRESS address blocks -- 8,980 of
+ * 10,272 on x86_64's access arm reach the format default instead of being
+ * published -- and the route is not the indexing.  It is
+ * `max_dep_loads` / `max_dep_stores`: template-header scalars that the
+ * Capstone operand walk counts, that this file's shape and multi gates
+ * compare QEMU's access list against, and that SIZE the mask arrays.  The
+ * same two scalars set the load-data and immediate bit offsets, so the
+ * STORE-DATA family is invariant in its register bits and not in those two.
+ * Re-sourcing them from QEMU is a content change and not a format change,
+ * but it moves the runtime memop slot layout as well as the wire, so it is
+ * its own pass, not a corollary of this one.
+ *
  * THE HAS_REG FLAG IS SHARED, and that bounds this flip in a way the address
  * flip was not bounded.  One wire bit, `CST_DEP_BLOCK_HAS_REG`, governs
  * `dst_dep[]` AND `store_data_dep[]` together (docs/format.rst).  So:
@@ -78,6 +111,7 @@
 
 struct qemu_plugin_tb;
 struct InsnFields;
+struct InsnRegNames;
 
 /*
  * How many distinct generic registers one access's address -- or one store's
@@ -116,6 +150,14 @@ enum QDepState : uint8_t {
      * it is never read as an ordinary unmapped-global gap.
      */
     QDEP_R_EMU_MONITOR,
+    /*
+     * The QEMU-owned source index could not be seated: placing QEMU's own
+     * register list at the head of src_regs[] would need more slots than
+     * MAX_SRC_REGS, or would push the immediate bit past bit 63.  Both
+     * families are refused, because after this the coordinate system the
+     * masks would be written in is still the operand walk's.
+     */
+    QDEP_R_REINDEX,
     /*
      * Data family only: QEMU stated the datum in full, but the wire's
      * HAS_REG flag is clear for this instruction, so there is no field to
@@ -179,7 +221,8 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx,
  * verdict per family, then either writes QEMU's answer or falls back to the
  * format's default, by name.
  */
-void qdep_apply(InsnFields *f, const QDepInsn *q, const char *mnem);
+void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
+                const char *mnem);
 
 /* Append the census.  Always reported: the number of instructions whose
  * dependency block fell back to the format default is a fact about the

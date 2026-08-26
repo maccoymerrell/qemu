@@ -2293,9 +2293,29 @@ static uint64_t memop_data_lane_mask(const EntryView *ev, uint32_t i,
          * That is exactly this branch, stated directly:
          */
         host_reg_idx = 0;
-        host_lane_mask = (want_type == DYN_LOAD_ADDR)
-            ? (f->n_dst_regs ? f->dst_lane_mask[0] : 0)
-            : (f->n_src_regs ? f->src_lane_mask[0] : 0);
+        if (want_type == DYN_LOAD_ADDR) {
+            host_lane_mask = f->n_dst_regs ? f->dst_lane_mask[0] : 0;
+        } else {
+            /*
+             * The FIRST VECTOR source, not source slot 0.  The explicit
+             * branch below picks the store's value register out of
+             * store_data_dep[], and a value register is by construction one
+             * with lanes; slot 0 is only the same thing when the source
+             * order happens to put it there.  It does not always: a store's
+             * address registers are sources too, they carry no lanes, and
+             * since the QEMU-owned source index (champsim_tracer_qdep.cc)
+             * seats them at the head they are frequently slot 0.  Taking
+             * slot 0 regardless would read a zero lane mask off an address
+             * register and drop the memop's lane partition entirely.
+             */
+            for (uint8_t i = 0; i < f->n_src_regs; i++) {
+                if (f->src_lane_mask[i]) {
+                    host_reg_idx = i;
+                    host_lane_mask = f->src_lane_mask[i];
+                    break;
+                }
+            }
+        }
         slots_before = slot;
     } else if (want_type == DYN_LOAD_ADDR) {
         const uint64_t load_bit_k = (uint64_t)1 <<

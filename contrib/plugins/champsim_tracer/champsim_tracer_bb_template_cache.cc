@@ -1648,7 +1648,9 @@ BBTemplate *TemplateStore::create_tb_template(
              * flip that silently does not happen.
              */
             if (insn_qdep) {
-                qdep_apply(&scratch[i].f, &insn_qdep[i],
+                qdep_apply(&scratch[i].f,
+                                with_names ? &nscratch[i].rn : nullptr,
+                                &insn_qdep[i],
                                 insn_info ? insn_info[i].mnemonic : nullptr);
             }
             srcs[i] = &scratch[i].f;

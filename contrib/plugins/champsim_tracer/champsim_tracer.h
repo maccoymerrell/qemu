@@ -665,7 +665,7 @@ typedef struct {
  * makes RegHandleCache::lookup's TLS pointer-cache hit cross-insn.
  * NULL: generic reg has no single directly-readable QEMU register.
  */
-typedef struct {
+typedef struct InsnRegNames {
     /* SPAN MEMBERS, sized by the sibling InsnFields' n_src_regs /
      * n_dst_regs and packed into the template's insn_fields_pool (see
      * champsim_tracer_mnemonics.h SPAN MEMBERS).  Empty or sentinel
@@ -1792,6 +1792,18 @@ void decode_detail_to_generic(uint64_t pc,
                               const qemu_plugin_insn_info *info,
                               InsnFields *out,
                               InsnRegNames *out_names);
+
+/*
+ * The QEMU register a generic slot stands for, or NULL when the generic ID
+ * folds a class with no single directly-readable QEMU register behind it.
+ *
+ * Exposed because the QEMU-owned source index (champsim_tracer_qdep.cc) can
+ * place a register in src_regs[] that the Capstone operand walk never
+ * listed, and a source slot with no key is a slot whose VALUE the register
+ * snapshotter cannot publish.  Resolving the key from the generic ID is how
+ * the new slot arrives as complete as the ones the walk built.
+ */
+const QemuRegKey *qemu_reg_key_for_generic(uint8_t gen_id);
 
 /*
  * The .dep_refine surface, exposed for MEASUREMENT only.

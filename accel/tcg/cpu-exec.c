@@ -917,11 +917,16 @@ bool cpu_plugin_exec_tb(CPUState *cpu)
          * the true excursion exit, so the correct path observes delivery
          * exactly as if the excursion had taken zero host time.
          */
+#ifdef CONFIG_PLUGIN
         if (cpu->plugin_spec_mode) {
             if (qatomic_xchg(&cpu->neg.icount_decr.u16.high, 0)) {
                 cpu->plugin_spec_kick_deferred = true;
             }
         }
+#endif /* CONFIG_PLUGIN -- plugin_spec_kick_deferred lives in that block of
+        * CPUState, and there is no excursion to defer a kick for without a
+        * plugin; the enclosing !CONFIG_USER_ONLY alone left a softmmu build
+        * configured --disable-plugins referencing a field it does not have. */
 #endif
 #ifndef CONFIG_USER_ONLY
         /*

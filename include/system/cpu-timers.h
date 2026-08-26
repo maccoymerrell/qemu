@@ -234,22 +234,6 @@ void cpu_plugin_spec_ticks_freeze(int cpu_index);
 void cpu_plugin_spec_ticks_thaw(int cpu_index);
 
 /**
- * vclock_agency_consume: run due QEMU_CLOCK_VIRTUAL timers in-thread
- * @cpu: the vCPU whose slice breakout this is
- * @breakout_site: site witness -- true = the slice-breakout site in
- * cpu_loop_exec_tb(), the ONLY product site; false survives so the
- * consume_dispatch counter can prove the retired dispatch-top site
- * stays gone (it must read 0 forever)
- *
- * The event-agency discipline's consumption body (see
- * qemu/vclock-agency.h): called from a vCPU-owned slice breakout when
- * the fresh qemu_clock_deadline_ns_all(VIRTUAL, ATTR_ALL) == 0 read
- * says a deadline is due.  Takes the BQL if not held; skips (and
- * counts) inside spec mode.
- */
-void vclock_agency_consume(CPUState *cpu, bool breakout_site);
-
-/**
  * cpu_plugin_tsc_lock_to_vclock: derive cpu_get_ticks() from cpu_get_clock()
  * @tsc_hz: slope of the lock, in ticks per second of QEMU_CLOCK_VIRTUAL
  *
@@ -274,6 +258,30 @@ void vclock_agency_consume(CPUState *cpu, bool breakout_site);
  */
 void cpu_plugin_tsc_lock_to_vclock(double tsc_hz);
 #endif
+
+/**
+ * vclock_agency_consume: run due QEMU_CLOCK_VIRTUAL timers in-thread
+ * @cpu: the vCPU whose slice breakout this is
+ * @breakout_site: site witness -- true = the slice-breakout site in
+ * cpu_loop_exec_tb(), the ONLY product site; false survives so the
+ * consume_dispatch counter can prove the retired dispatch-top site
+ * stays gone (it must read 0 forever)
+ *
+ * The event-agency discipline's consumption body (see
+ * qemu/vclock-agency.h): called from a vCPU-owned slice breakout when
+ * the fresh qemu_clock_deadline_ns_all(VIRTUAL, ATTR_ALL) == 0 read
+ * says a deadline is due.  Takes the BQL if not held; skips (and
+ * counts) inside spec mode.
+ *
+ * DECLARED OUTSIDE CONFIG_PLUGIN ON PURPOSE.  The definition in
+ * system/cpu-timers.c is unconditional and the sole call site --
+ * cpu_loop_exec_tb()'s slice breakout in accel/tcg/cpu-exec.c -- is
+ * guarded by !CONFIG_USER_ONLY alone, so a plugin-less system build
+ * compiles and calls it.  Declaring it beside the cpu_plugin_* group
+ * left that build with a definition and no prototype and it failed on
+ * -Werror=missing-prototypes.
+ */
+void vclock_agency_consume(CPUState *cpu, bool breakout_site);
 
 /*
  * return the time elapsed in VM between vm_start and vm_stop.

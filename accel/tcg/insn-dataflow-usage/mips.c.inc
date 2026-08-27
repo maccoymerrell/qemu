@@ -45,6 +45,71 @@
  *     operands of the guest instruction that chained. They are enumerated
  *     so the row accounts for the whole footprint, and not published,
  *     because a `ret` does not depend on the vector type register.
+ *   raise_exception:
+ *     MERGED with the row the mechanical reader DID derive for this helper,
+ *     whose fields (error_code) keep their derived citations above; the
+ *     fields below are the hand enumeration. R7.6: the state an
+ *     instruction's EXCEPTION writes is in that instruction's destination
+ *     set. The mechanical reader cannot reach it because the write is not
+ *     in the helper's body and not on any path the helper RETURNS from:
+ *     helper_raise_exception() sets cs->exception_index and env->error_code
+ *     and then calls cpu_loop_exit_restore()
+ *     (../target/mips/tcg/exception.c:163-166), which longjmps out; the CP0
+ *     state is written afterwards by mips_cpu_do_interrupt() during
+ *     exception DELIVERY. EXCP_SYSCALL
+ *     (../target/mips/tcg/system/tlb_helper.c:1354) and EXCP_TRAP (:1376)
+ *     both `goto set_EPC`, and the set_EPC path is the source for every
+ *     field below, cited per field. BOTH fields carry REG_SYSEXC, which is
+ *     the generic word the wire's destination slot for `syscall` and `teq`
+ *     already names -- the row makes QEMU's list carry what the wire has
+ *     been publishing, it does not add a destination the wire lacks. NOT
+ *     ENUMERATED, and each for a stated reason: env->CP0_EPC is written at
+ *     :1423 but the tracer's register vocabulary has no row spelling `epc`,
+ *     so naming it would produce a name that resolves to nothing (it is the
+ *     same REG_SYSEXC either way, so nothing is lost by the omission);
+ *     env->CP0_BadVAddr is NOT written on this path at all -- set_EPC only
+ *     READS it (:1479, :1500, in the TLB cases), and the address exceptions
+ *     that do write it arrive by a different route than a raise_exception
+ *     call; env->hflags and env->active_tc.PC are written by delivery
+ *     (:1440, :1443, and :1445/:1449/:1451/:1454) and are QEMU's own
+ *     control-flow bookkeeping for the handler entry, not architectural
+ *     destinations of the raising instruction -- R2 and J2.3, the same
+ *     discriminator R10.1 applies to the block-final pc write. The set
+ *     below is therefore what the source states AND the vocabulary can
+ *     name, and nothing else.
+ *   raise_exception_err:
+ *     MERGED with the row the mechanical reader DID derive for this helper,
+ *     whose fields (error_code) keep their derived citations above; the
+ *     fields below are the hand enumeration. The `_err` form of the same
+ *     helper, reaching the same do_raise_exception_err() and therefore the
+ *     same delivery. R7.6: the state an instruction's EXCEPTION writes is
+ *     in that instruction's destination set. The mechanical reader cannot
+ *     reach it because the write is not in the helper's body and not on any
+ *     path the helper RETURNS from: helper_raise_exception() sets
+ *     cs->exception_index and env->error_code and then calls
+ *     cpu_loop_exit_restore() (../target/mips/tcg/exception.c:163-166),
+ *     which longjmps out; the CP0 state is written afterwards by
+ *     mips_cpu_do_interrupt() during exception DELIVERY. EXCP_SYSCALL
+ *     (../target/mips/tcg/system/tlb_helper.c:1354) and EXCP_TRAP (:1376)
+ *     both `goto set_EPC`, and the set_EPC path is the source for every
+ *     field below, cited per field. BOTH fields carry REG_SYSEXC, which is
+ *     the generic word the wire's destination slot for `syscall` and `teq`
+ *     already names -- the row makes QEMU's list carry what the wire has
+ *     been publishing, it does not add a destination the wire lacks. NOT
+ *     ENUMERATED, and each for a stated reason: env->CP0_EPC is written at
+ *     :1423 but the tracer's register vocabulary has no row spelling `epc`,
+ *     so naming it would produce a name that resolves to nothing (it is the
+ *     same REG_SYSEXC either way, so nothing is lost by the omission);
+ *     env->CP0_BadVAddr is NOT written on this path at all -- set_EPC only
+ *     READS it (:1479, :1500, in the TLB cases), and the address exceptions
+ *     that do write it arrive by a different route than a raise_exception
+ *     call; env->hflags and env->active_tc.PC are written by delivery
+ *     (:1440, :1443, and :1445/:1449/:1451/:1454) and are QEMU's own
+ *     control-flow bookkeeping for the handler entry, not architectural
+ *     destinations of the raising instruction -- R2 and J2.3, the same
+ *     discriminator R10.1 applies to the block-final pc write. The set
+ *     below is therefore what the source states AND the vocabulary can
+ *     name, and nothing else.
  */
 
 static const DfHelperField dfu_cfc1_env[] = {
@@ -160,12 +225,6 @@ static const DfHelperField dfu_float_trunc_w_s_env[] = {
     { offsetof(CPUArchState, active_fpu.fp_status), sizeof(((CPUArchState *)0)->active_fpu.fp_status), INSN_DF_RD | INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/fpu_helper.c:517 */
     { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
 };
-static const DfHelperField dfu_raise_exception_env[] = {
-    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
-};
-static const DfHelperField dfu_raise_exception_err_env[] = {
-    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
-};
 static const DfHelperField dfu_swl_env[] = {
     { offsetof(CPUArchState, CP0_Config0), sizeof(((CPUArchState *)0)->CP0_Config0), INSN_DF_RD, DF_HF_OPERAND, 0 },   /* ../target/mips/internal.h:346 */
 };
@@ -175,6 +234,16 @@ static const DfHelperField dfu_swr_env[] = {
 static const DfHelperField dfu_lookup_tb_ptr_env[] = {
     { offsetof(CPUArchState, active_tc), sizeof(((CPUArchState *)0)->active_tc), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/mips/cpu.h:1432 */
     { offsetof(CPUArchState, hflags), sizeof(((CPUArchState *)0)->hflags), INSN_DF_RD, DF_HF_XLAT, 0 },   /* ../target/mips/cpu.h:1434 */
+};
+static const DfHelperField dfu_raise_exception_env[] = {
+    { offsetof(CPUArchState, CP0_Cause), sizeof(((CPUArchState *)0)->CP0_Cause), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/system/tlb_helper.c:1428 (BD set), :1430 (BD cleared), :1456 (ExcCode via mips_cause_set_field) */
+    { offsetof(CPUArchState, CP0_Status), sizeof(((CPUArchState *)0)->CP0_Status), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/system/tlb_helper.c:1432 (EXL set) */
+    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
+};
+static const DfHelperField dfu_raise_exception_err_env[] = {
+    { offsetof(CPUArchState, CP0_Cause), sizeof(((CPUArchState *)0)->CP0_Cause), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/system/tlb_helper.c:1428 (BD set), :1430 (BD cleared), :1456 (ExcCode via mips_cause_set_field) */
+    { offsetof(CPUArchState, CP0_Status), sizeof(((CPUArchState *)0)->CP0_Status), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/system/tlb_helper.c:1432 (EXL set) */
+    { offsetof(CPUArchState, error_code), sizeof(((CPUArchState *)0)->error_code), INSN_DF_WR, DF_HF_OPERAND, 0 },   /* ../target/mips/tcg/exception.c:164 */
 };
 static const DfHelperAccess dfu_swl_acc[] = {
     { INSN_DF_WR, 2, 1, 1, 1 },   /* ../target/mips/tcg/ldst_helper.c:77, 4 site(s) */
@@ -276,14 +345,6 @@ static const DfHelperUsage df_helper_usage[] = {
       dfu_float_trunc_w_s_env, ARRAY_SIZE(dfu_float_trunc_w_s_env), true,
       "../target/mips/tcg/fpu_helper.c:513",
       NULL, 0 },
-    { "raise_exception", { 0 }, { 0 },
-      dfu_raise_exception_env, ARRAY_SIZE(dfu_raise_exception_env), true,
-      "../target/mips/tcg/exception.c:54",
-      NULL, 0 },
-    { "raise_exception_err", { 0 }, { 0 },
-      dfu_raise_exception_err_env, ARRAY_SIZE(dfu_raise_exception_err_env), true,
-      "../target/mips/tcg/exception.c:48",
-      NULL, 0 },
     { "swl", { 0 }, { 0 },
       dfu_swl_env, ARRAY_SIZE(dfu_swl_env), true,
       "../target/mips/tcg/ldst_helper.c:71",
@@ -295,6 +356,14 @@ static const DfHelperUsage df_helper_usage[] = {
     { "lookup_tb_ptr", { 0 }, { 0 },
       dfu_lookup_tb_ptr_env, ARRAY_SIZE(dfu_lookup_tb_ptr_env), true,
       "accel/tcg/cpu-exec.c HELPER(lookup_tb_ptr)",
+      NULL, 0 },
+    { "raise_exception", { 0 }, { 0 },
+      dfu_raise_exception_env, ARRAY_SIZE(dfu_raise_exception_env), true,
+      "../target/mips/tcg/exception.c:54",
+      NULL, 0 },
+    { "raise_exception_err", { 0 }, { 0 },
+      dfu_raise_exception_err_env, ARRAY_SIZE(dfu_raise_exception_err_env), true,
+      "../target/mips/tcg/exception.c:48",
       NULL, 0 },
     { NULL, { 0 }, { 0 }, NULL, 0, false, NULL, NULL, 0 }
 };

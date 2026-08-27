@@ -19245,6 +19245,55 @@ void mips_tcg_init(void)
     if (TARGET_LONG_BITS == 32) {
         mxu_translate_init();
     }
+
+    /*
+     * The CP0 registers an EXCEPTION writes, for the dataflow extraction.
+     *
+     * No TCG global names these -- the translator never touches CP0_Cause,
+     * CP0_Status or CP0_BadVAddr, because the write is not performed by the
+     * translated code at all: `syscall` and `teq` emit a call to
+     * helper_raise_exception(), and the CP0 state is written afterwards by
+     * mips_cpu_do_interrupt() during exception DELIVERY.  Without this
+     * declaration that state arrives at a consumer as a bare CPUArchState
+     * byte range with no register name, so an instruction whose
+     * architectural destination IS the exception state has no write row to
+     * match and the whole destination family refuses (#218).
+     *
+     * R7.6 is the ruling that the delivery write set is in the raising
+     * instruction's set; the CP-H hand row on raise_exception states WHICH
+     * of these it writes and cites mips_cpu_do_interrupt() line by line.
+     * This declaration is only the naming half -- it says which register a
+     * given env offset IS, and says nothing about who writes it.
+     *
+     * The names are the GDB stub's (target/mips/gdbstub.c spells these
+     * "badvaddr", "status" and "cause"), which is the namespace
+     * insn_dataflow_reg_name() already answers in.  Declared here, beside
+     * the globals, in offsetof() and sizeof() -- the compiler reading
+     * CPUMIPSState rather than anyone typing a number.
+     *
+     * CP0_EPC is deliberately NOT declared: the delivery writes it, but the
+     * tracer's register vocabulary has no row spelling "epc", so naming the
+     * offset would produce a name that then maps to nothing.  A name that
+     * cannot be resolved is not better than no name -- it moves the refusal
+     * one gate later without answering anything -- and the three declared
+     * here already carry REG_SYSEXC, which is the one generic word all of
+     * this state shares.
+     */
+    insn_dataflow_declare_regfile("badvaddr", NULL,
+                                  offsetof(CPUMIPSState, CP0_BadVAddr),
+                                  sizeof(((CPUMIPSState *)0)->CP0_BadVAddr),
+                                  sizeof(((CPUMIPSState *)0)->CP0_BadVAddr),
+                                  1);
+    insn_dataflow_declare_regfile("status", NULL,
+                                  offsetof(CPUMIPSState, CP0_Status),
+                                  sizeof(((CPUMIPSState *)0)->CP0_Status),
+                                  sizeof(((CPUMIPSState *)0)->CP0_Status),
+                                  1);
+    insn_dataflow_declare_regfile("cause", NULL,
+                                  offsetof(CPUMIPSState, CP0_Cause),
+                                  sizeof(((CPUMIPSState *)0)->CP0_Cause),
+                                  sizeof(((CPUMIPSState *)0)->CP0_Cause),
+                                  1);
 }
 
 void mips_restore_state_to_opc(CPUState *cs,

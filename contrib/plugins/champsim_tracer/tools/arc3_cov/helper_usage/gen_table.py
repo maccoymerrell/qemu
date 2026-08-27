@@ -277,16 +277,58 @@ def emit(isa, derived, extra_rows, offsets, out, field_guard=None,
                                             if field_guard.get(f))))
         rows.append((name, v))
 
+    #
+    # A HAND ROW MERGES INTO THE DERIVED ROW OF THE SAME NAME; it does not
+    # sit beside it.  The consumer looks a helper up by name and takes the
+    # first match, so two rows spelled `raise_exception` would make one of
+    # them dead -- silently, and with no way to tell which.  Merging keeps
+    # BOTH statements: the mechanical reader's facts stay derived and stay
+    # attributed to the lines it read them from, and the hand enumeration
+    # ADDS the ones the reader could not reach.
+    #
+    # A FIELD THE TWO SIDES DISAGREE ABOUT IS A REFUSAL, not a precedence
+    # question.  If the reader says a helper reads `error_code` and a hand
+    # row says it writes it, one of them is wrong and picking either would
+    # publish an unexamined guess -- so the row is refused whole and the
+    # collision is named, which is the over-approximating direction this
+    # file errs in everywhere else.
+    #
+    merged, collided = dict(extra_rows), []
     for name, v in sorted(derived['rows'].items()):
         if v['status'] != 'OK':
-            refused.append((name, v.get('why', v.get('status'))))
+            if name not in merged:
+                refused.append((name, v.get('why', v.get('status'))))
             continue
-        take(name, v)
-    for name, v in sorted(extra_rows.items()):
+        h = merged.get(name)
+        if h is None:
+            take(name, v)
+            continue
+        bad = [f for f in set(v['env']) & set(h['env'])
+               if v['env'][f] != h['env'][f]]
+        if bad:
+            collided.append((name, sorted(bad)))
+            refused.append((name, 'hand row and derived row disagree about '
+                            'the direction of %s' % ','.join(sorted(bad))))
+            del merged[name]
+            continue
+        m = dict(v)
+        m['env'] = dict(v['env'], **h['env'])
+        m['env_where'] = dict(v.get('env_where', {}),
+                              **h.get('env_where', {}))
+        m['xlat'] = sorted(set(v.get('xlat', [])) | set(h.get('xlat', [])))
+        m['argdir'] = dict(v.get('argdir', {}), **h.get('argdir', {}))
+        m['hand_justification'] = h.get('hand_justification', '')
+        m['_merged_from_derived'] = sorted(v['env'])
+        merged[name] = m
+    for name, v in sorted(merged.items()):
         take(name, v, hand=True)
+    if collided:
+        for name, bad in collided:
+            print('%s: hand row %s REFUSED -- direction collision on %s'
+                  % (isa, name, ','.join(bad)))
 
     w = out.write
-    hand = set(extra_rows)
+    hand = set(merged)
     refused = [(n, why) for n, why in refused if n not in hand]
     w('/*\n * CP-H per-helper usage -- %s.  GENERATED, do not edit.\n'
       ' *\n'
@@ -337,7 +379,13 @@ def emit(isa, derived, extra_rows, offsets, out, field_guard=None,
         w(' *\n * Rows the mechanical reader refused and a HAND enumeration '
           'supplies.\n * Each carries its justification in full:\n')
         for n in sorted(hand):
-            j = extra_rows[n].get('hand_justification', '')
+            j = merged[n].get('hand_justification', '')
+            d = merged[n].get('_merged_from_derived')
+            if d:
+                j = ('MERGED with the row the mechanical reader DID derive '
+                     'for this helper, whose fields (%s) keep their derived '
+                     'citations above; the fields below are the hand '
+                     'enumeration. ' % ', '.join(d)) + j
             w(' *   %s:\n' % n)
             line = ''
             for word in j.split():

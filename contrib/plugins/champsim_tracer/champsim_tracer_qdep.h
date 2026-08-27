@@ -419,6 +419,21 @@ struct QDepInsn {
     uint8_t load_addr_regs[QDEP_MAX_ACCESS][QDEP_MAX_ADDR_REGS];
     uint8_t n_store_addr_regs[QDEP_MAX_ACCESS];
     uint8_t store_addr_regs[QDEP_MAX_ACCESS][QDEP_MAX_ADDR_REGS];
+    /*
+     * AND THE VERDICT IS PER ACCESS TOO, for the same reason the register
+     * lists are (#264).  @state is the FIRST refusal any access met and is
+     * what the census reports; it is not a statement about the others.
+     * Reading it as one refused every access of the instruction is how
+     * `rep stosq` came to publish no address at all: QEMU states slot 0's
+     * address as `rdi` in full and slot 1's as `rdi` plus an env byte range
+     * no target declares, and the second answer deleted the first.
+     *
+     * QDEP_OK here means QEMU stated THIS access's address; anything else
+     * names why it could not, and that slot alone reaches the format's
+     * default.
+     */
+    uint8_t load_addr_state[QDEP_MAX_ACCESS];
+    uint8_t store_addr_state[QDEP_MAX_ACCESS];
     uint8_t n_store_data_regs[QDEP_MAX_ACCESS];
     uint8_t store_data_regs[QDEP_MAX_ACCESS][QDEP_MAX_ADDR_REGS];
     /*

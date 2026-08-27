@@ -271,6 +271,46 @@ std::atomic<uint64_t> g_blk_mixed_default{0};
  */
 std::atomic<uint64_t> g_fact_stated{0};
 std::atomic<uint64_t> g_fact_carried{0};
+/* ==================================================================
+ * THE SAME CENSUS FOR THE **ADDRESS** BLOCK (#264).
+ *
+ * R12 gave the HAS_REG block's existence to QEMU's stated facts and left
+ * HAS_ADDR where it was, which is how `rep stosq` came to publish neither:
+ * the address family refused as a whole on the one access QEMU could not
+ * state, and the wire lost the one it had stated in full.  The rule is now
+ * the same rule -- the block exists when QEMU stated an address fact for an
+ * access of this instruction -- and it needs the same three-way census, or
+ * the flip is an argument rather than a measurement.
+ * ================================================================== */
+/* Every access's address was QEMU's: the block is wholly QEMU's. */
+std::atomic<uint64_t> g_addr_blk_qemu{0};
+/* SOME access's address was QEMU's and some was not.  The block exists --
+ * a stated fact causes it -- and the slots QEMU could not state publish the
+ * format's own all-inputs default WRITTEN OUT, exactly as the destination
+ * half does in decide_block()'s mirror-image case.  Never the refiner's
+ * mask: a family whose source has flipped may not have slots still quietly
+ * carrying the old one. */
+std::atomic<uint64_t> g_addr_blk_mixed{0};
+/* No access's address was QEMU's, so there is no fact to carry and no
+ * block.  The consumer is at the format's own all-to-all
+ * over-approximation, which is what it read before. */
+std::atomic<uint64_t> g_addr_blk_absent{0};
+/* Slots inside a MIXED block that went out at that default.  Counted only
+ * where the block EXISTS: an unstated slot on an instruction with no block
+ * publishes nothing at all, and folding the two together would put a number
+ * beside a sentence that is not about it. */
+std::atomic<uint64_t> g_addr_slot_default{0};
+/*
+ * The address side's must-be-0, and it is a difference for the same reason
+ * the register side's is: @g_addr_fact_stated counts an address QEMU stated
+ * where it is ESTABLISHED, in qdep_apply()'s per-access loop, and
+ * @g_addr_fact_carried counts it where it is CONSUMED, in decide_block() on
+ * the branch that turns the bit on.  A path that establishes an address and
+ * returns without reaching decide_block() -- the shape of the gate this
+ * change deletes -- leaves the two unequal.
+ */
+std::atomic<uint64_t> g_addr_fact_stated{0};
+std::atomic<uint64_t> g_addr_fact_carried{0};
 /*
  * The named-survivor list itself: every surviving row by MNEMONIC and by
  * the reason QEMU could not state it, which IS the coverage path -- the
@@ -1662,10 +1702,24 @@ const char *state_name(unsigned s)
  * ONE THING IT MAY NEVER DO is suppress a block QEMU's facts call for -- the
  * survivor test is consulted only where @qemu_dst and @qemu_sdata are both
  * false.  g_blk_qemu_unpublished is the must-be-0 that says so.
+ *
+ * AND THE **ADDRESS** BLOCK IS DECIDED HERE TOO, on the same rule (#264).
+ * @qemu_addr_facts is how many of this instruction's accesses QEMU stated an
+ * address for; one is enough, because one stated fact is a fact and the
+ * slots beside it publish the format's own default written out.  It lives
+ * here rather than in qdep_apply()'s address section for the reason R12
+ * exists: a block's EXISTENCE is one decision on one rule, and while the two
+ * bits were decided in two places one of them could -- and did -- delete an
+ * address QEMU had stated in full.  Grep for `has_addr_deps =` and this is
+ * the only line in the QEMU regime that writes it true.
  */
 void decide_block(InsnFields *f, bool qemu_dst, bool qemu_sdata,
+                  unsigned qemu_addr_facts,
                   const char *mnem, unsigned wstate, const char *why)
 {
+    f->has_addr_deps = qemu_addr_facts != 0;
+    g_addr_fact_carried.fetch_add(f->has_addr_deps ? qemu_addr_facts : 0u,
+                                  std::memory_order_relaxed);
     if (qemu_dst || qemu_sdata) {
         f->has_reg_deps = true;
         g_fact_carried.fetch_add((qemu_dst ? 1u : 0u) + (qemu_sdata ? 1u : 0u),
@@ -1893,12 +1947,29 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
             if (out->state == QDEP_NONE) {
                 out->state = QDEP_R_HELPER_UNSTATED;
             }
+            rc = QDEP_R_HELPER_UNSTATED;
+        } else {
+            rc = store
+                ? fold_prov(w.data(), out->store_addr_regs[a],
+                            &out->n_store_addr_regs[a], nullptr, nullptr)
+                : fold_prov(w.data(), out->load_addr_regs[a],
+                            &out->n_load_addr_regs[a], nullptr, nullptr);
         }
-        rc = store
-            ? fold_prov(w.data(), out->store_addr_regs[a],
-                        &out->n_store_addr_regs[a], nullptr, nullptr)
-            : fold_prov(w.data(), out->load_addr_regs[a],
-                        &out->n_load_addr_regs[a], nullptr, nullptr);
+        /*
+         * The verdict lands on THIS access.  @state still takes the first
+         * refusal, because the census reports one reason per instruction and
+         * the first one is the one that names the coverage path -- but it no
+         * longer decides the other slots.  A helper-performed access whose
+         * address travels through no argument is recorded as unstated here
+         * rather than only in @state: fold_prov() would have returned OK on
+         * its empty provenance, and an empty set means "not stated", never
+         * "depends on nothing".
+         */
+        if (store) {
+            out->store_addr_state[a] = (uint8_t)rc;
+        } else {
+            out->load_addr_state[a] = (uint8_t)rc;
+        }
         if (rc != QDEP_OK && out->state == QDEP_NONE) {
             out->state = rc;    /* first refusal wins; a later access
                                  * succeeding does not undo it */
@@ -2109,7 +2180,6 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
              * rather than publish a mask indexed against the operand walk's
              * order while claiming it is QEMU's.
              */
-            f->has_addr_deps = false;
             g_state[QDEP_R_REINDEX].fetch_add(1, std::memory_order_relaxed);
             g_dstate[QDEP_R_REINDEX].fetch_add(1, std::memory_order_relaxed);
             note_refusal(mnem, QDEP_R_REINDEX, "dst  ", nullptr);
@@ -2121,7 +2191,8 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
              * Capstone value may not reach the wire (fb92a61ea4), and that
              * widening predates this flip rather than arriving with it.
              */
-            decide_block(f, false, false, mnem, QDEP_R_REINDEX, nullptr);
+            decide_block(f, false, false, 0, mnem, QDEP_R_REINDEX,
+                         nullptr);
             if (f->has_reg_deps) {
                 for (uint8_t st = 0; st < f->max_dep_stores; st++) {
                     f->store_data_dep_mask[st] = all_inputs_mask(f);
@@ -2139,7 +2210,6 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
          * no claim here to refuse; where it is a refusal it is counted as
          * one, so the cost of the honest default is a number.
          */
-        f->has_addr_deps = false;
         if (mds_old != 0 || mdl_old != 0) {
             /* Something WAS claimed and is now unclaimed; say which. */
             unsigned r = (adm != QDEP_OK) ? adm : QDEP_NONE;
@@ -2156,7 +2226,7 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
          * No store slots, so the store-data family states nothing here and
          * the destination family is the whole question.
          */
-        decide_block(f, apply_dst(f, q, mnem, wstate, wwhy), false,
+        decide_block(f, apply_dst(f, q, mnem, wstate, wwhy), false, 0,
                      mnem, wstate, wwhy);
         return;
     }
@@ -2175,24 +2245,67 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
     memset(ld_mask, 0, sizeof(ld_mask));
     memset(st_mask, 0, sizeof(st_mask));
 
-    if (state == QDEP_OK) {
-        for (uint8_t k = 0; k < mdl_new && state == QDEP_OK; k++) {
-            if (!regs_to_mask(f, q->load_addr_regs[k],
-                              q->n_load_addr_regs[k], 0, &ld_mask[k],
-                              why, sizeof(why))) {
-                state = QDEP_R_UNREPRESENTABLE;
-            }
+    /*
+     * WHETHER QEMU STATED **THIS ACCESS**, one answer per slot (#264).
+     *
+     * It used to be one answer per instruction: the first access QEMU could
+     * not state refused the family, and every access it stated in full went
+     * out as no block at all.  `rep stosq` is that defect with a name --
+     * QEMU's own dump reads
+     *
+     *     M st slot=0 size=8 addr=rdi      data=rax
+     *     M st slot=1 size=8 addr=rdi,@172 data=rax
+     *
+     * @172 being env->df, an env byte range no target declares a register
+     * file for.  Slot 1's refusal deleted slot 0's `rdi`, and the wire lost
+     * an address QEMU had stated in full.  R12.1 is exactly the rule that
+     * forbids that: removing Capstone may not cost the trace information.
+     */
+    bool ld_ok[QDEP_MAX_ACCESS];
+    bool st_ok[QDEP_MAX_ACCESS];
+    memset(ld_ok, 0, sizeof(ld_ok));
+    memset(st_ok, 0, sizeof(st_ok));
+
+    if (state != QDEP_R_STATUS && state != QDEP_R_NORECORD) {
+        /*
+         * Those two say the LIST itself is unreadable, so there is no
+         * per-access answer to read; every other state is one access's
+         * reason and the loops below ask each slot for its own.
+         */
+        for (uint8_t k = 0; k < mdl_new; k++) {
+            ld_ok[k] = q->load_addr_state[k] == QDEP_OK &&
+                       regs_to_mask(f, q->load_addr_regs[k],
+                                    q->n_load_addr_regs[k], 0, &ld_mask[k],
+                                    why, sizeof(why));
         }
-        for (uint8_t k = 0; k < mds_new && state == QDEP_OK; k++) {
-            if (!regs_to_mask(f, q->store_addr_regs[k],
-                              q->n_store_addr_regs[k], 0, &st_mask[k],
-                              why, sizeof(why))) {
-                state = QDEP_R_UNREPRESENTABLE;
-            }
+        for (uint8_t k = 0; k < mds_new; k++) {
+            st_ok[k] = q->store_addr_state[k] == QDEP_OK &&
+                       regs_to_mask(f, q->store_addr_regs[k],
+                                    q->n_store_addr_regs[k], 0, &st_mask[k],
+                                    why, sizeof(why));
         }
     }
 
-    if (state == QDEP_OK) {
+    /*
+     * HOW MANY of this instruction's addresses QEMU stated, and whether that
+     * was all of them.  The count is the fact ESTABLISHED here, and it is
+     * handed to decide_block() to be carried; @addr_all decides only whether
+     * the block is wholly QEMU's or mixed.
+     */
+    unsigned addr_facts = 0;
+    bool addr_all = mdl_new + mds_new > 0;
+    for (uint8_t k = 0; k < mdl_new; k++) {
+        addr_facts += ld_ok[k] ? 1u : 0u;
+        addr_all &= ld_ok[k];
+    }
+    for (uint8_t k = 0; k < mds_new; k++) {
+        addr_facts += st_ok[k] ? 1u : 0u;
+        addr_all &= st_ok[k];
+    }
+    const bool addr_any = addr_facts != 0;
+    g_addr_fact_stated.fetch_add(addr_facts, std::memory_order_relaxed);
+
+    {
         /*
          * THE IMMEDIATE-PROVENANCE RULE, ON THE ADDRESS SIDE.
          *
@@ -2231,54 +2344,78 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
          * true as far as it goes.  Both halves are counted so the split is a
          * measurement.
          */
-        if (f->has_immediate) {
-            for (uint8_t k = 0; k < mdl_new; k++) {
-                if (ld_mask[k] == 0) {
-                    ld_mask[k] = 1ULL << f->n_src_regs;
-                    g_addr_imm.fetch_add(1, std::memory_order_relaxed);
-                }
+        for (uint8_t k = 0; k < mdl_new; k++) {
+            if (!ld_ok[k] || ld_mask[k] != 0) {
+                continue;
             }
-            for (uint8_t k = 0; k < mds_new; k++) {
-                if (st_mask[k] == 0) {
-                    st_mask[k] = 1ULL << f->n_src_regs;
-                    g_addr_imm.fetch_add(1, std::memory_order_relaxed);
-                }
+            if (f->has_immediate) {
+                ld_mask[k] = 1ULL << f->n_src_regs;
+                g_addr_imm.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                g_addr_empty_no_imm.fetch_add(1, std::memory_order_relaxed);
             }
-        } else {
-            for (uint8_t k = 0; k < mdl_new; k++) {
-                if (ld_mask[k] == 0) {
-                    g_addr_empty_no_imm.fetch_add(1,
-                                                  std::memory_order_relaxed);
-                }
+        }
+        for (uint8_t k = 0; k < mds_new; k++) {
+            if (!st_ok[k] || st_mask[k] != 0) {
+                continue;
             }
-            for (uint8_t k = 0; k < mds_new; k++) {
-                if (st_mask[k] == 0) {
-                    g_addr_empty_no_imm.fetch_add(1,
-                                                  std::memory_order_relaxed);
-                }
+            if (f->has_immediate) {
+                st_mask[k] = 1ULL << f->n_src_regs;
+                g_addr_imm.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                g_addr_empty_no_imm.fetch_add(1, std::memory_order_relaxed);
             }
         }
     }
 
-    if (state != QDEP_OK) {
+    /*
+     * EVERY SLOT IS WRITTEN, from QEMU where it stated the address and from
+     * the format's own all-inputs default where it did not.
+     *
+     * Written either way, and that is the point -- the same sentence the
+     * store-data half is published under.  A slot QEMU could not state may
+     * not be left carrying the refiner's mask, because a family whose source
+     * has flipped may not have rows quietly holding the old one; and the
+     * default is not a fabrication, it is bit-for-bit what a consumer
+     * assumes when no block exists at all.  Writing on an instruction that
+     * ends with no block costs nothing: the arrays are not serialised.
+     */
+    for (uint8_t k = 0; k < mdl_new; k++) {
+        f->load_addr_dep_mask[k] = ld_ok[k] ? ld_mask[k] : all_inputs_mask(f);
+    }
+    for (uint8_t k = 0; k < mds_new; k++) {
+        f->store_addr_dep_mask[k] = st_ok[k] ? st_mask[k] : all_inputs_mask(f);
+    }
+
+    if (!addr_all) {
         /*
-         * The format default, by name.  has_addr_deps false means the
-         * consumer assumes every input may feed every address, which is the
-         * over-approximation -- never a short mask, and never a silent
-         * return to the Capstone answer that used to be here.
+         * Say which slots did not reach QEMU's answer, and why the first of
+         * them did not.  A refusal is still reported by name -- the census
+         * is how the population shrinks -- but it no longer decides the
+         * block, and it no longer deletes the slots beside it.
          */
-        f->has_addr_deps = false;
-        note_refusal(mnem, state, "addr ", why);
-        g_state[state].fetch_add(1, std::memory_order_relaxed);
+        unsigned r = (state != QDEP_OK) ? state : QDEP_R_UNREPRESENTABLE;
+        if (addr_any) {
+            for (uint8_t k = 0; k < mdl_new; k++) {
+                if (!ld_ok[k]) {
+                    g_addr_slot_default.fetch_add(1,
+                                                  std::memory_order_relaxed);
+                }
+            }
+            for (uint8_t k = 0; k < mds_new; k++) {
+                if (!st_ok[k]) {
+                    g_addr_slot_default.fetch_add(1,
+                                                  std::memory_order_relaxed);
+                }
+            }
+        }
+        note_refusal(mnem, r, "addr ", why);
+        g_state[r].fetch_add(1, std::memory_order_relaxed);
+        (addr_any ? g_addr_blk_mixed : g_addr_blk_absent)
+            .fetch_add(1, std::memory_order_relaxed);
     } else {
-        for (uint8_t k = 0; k < mdl_new; k++) {
-            f->load_addr_dep_mask[k] = ld_mask[k];
-        }
-        for (uint8_t k = 0; k < mds_new; k++) {
-            f->store_addr_dep_mask[k] = st_mask[k];
-        }
-        f->has_addr_deps = true;
         g_state[QDEP_OK].fetch_add(1, std::memory_order_relaxed);
+        g_addr_blk_qemu.fetch_add(1, std::memory_order_relaxed);
     }
 
     /* ---------------- the store-data half of HAS_REG ---------------- */
@@ -2293,7 +2430,7 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
         g_dstate[dstate == QDEP_OK ? QDEP_NONE : dstate]
             .fetch_add(1, std::memory_order_relaxed);
         decide_block(f, apply_dst(f, q, mnem, wstate, wwhy), false,
-                     mnem, wstate, wwhy);
+                     addr_facts, mnem, wstate, wwhy);
         return;
     }
 
@@ -2377,7 +2514,8 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
      * stores, and a vacuous pass is not a fact about anything.
      */
     decide_block(f, apply_dst(f, q, mnem, wstate, wwhy),
-                 dstate == QDEP_OK && mds_new > 0, mnem, wstate, wwhy);
+                 dstate == QDEP_OK && mds_new > 0, addr_facts,
+                 mnem, wstate, wwhy);
 }
 
 void qdep_report(GString *report)
@@ -2464,6 +2602,50 @@ void qdep_report(GString *report)
             "               the four-ISA workload).  %" G_GUINT64_FORMAT " stated,"
             " %" G_GUINT64_FORMAT " carried\n",
             bq, bm, bmd, bs, ba, fs - fc, fs, fc);
+    }
+
+    {
+        uint64_t aq = g_addr_blk_qemu.load(std::memory_order_relaxed);
+        uint64_t am = g_addr_blk_mixed.load(std::memory_order_relaxed);
+        uint64_t aa = g_addr_blk_absent.load(std::memory_order_relaxed);
+        uint64_t ad = g_addr_slot_default.load(std::memory_order_relaxed);
+        uint64_t as_ = g_addr_fact_stated.load(std::memory_order_relaxed);
+        uint64_t ac = g_addr_fact_carried.load(std::memory_order_relaxed);
+
+        if (aq || am || aa) {
+            g_string_append_printf(report,
+                "\nthe HAS_ADDR block's EXISTENCE, per instruction (R12,"
+                " #264):\n"
+                "  %10" G_GUINT64_FORMAT "  QEMU stated every access's address and"
+                " the block carries them\n"
+                "  %10" G_GUINT64_FORMAT "  QEMU stated SOME of them: the block exists"
+                " because a stated fact\n"
+                "              causes it, and the %" G_GUINT64_FORMAT " slot(s) of"
+                " THOSE blocks it could not\n"
+                "               state publish the format's own all-inputs"
+                " default, written out --\n"
+                "               bit-for-bit what a consumer assumes with no"
+                " block at all.  The\n"
+                "               witness is x86_64's `rep stosq`: QEMU states"
+                " slot 0's address\n"
+                "               as rdi and slot 1's as rdi plus an undeclared"
+                " env range, and\n"
+                "               the second answer used to delete the first\n"
+                "  %10" G_GUINT64_FORMAT "  no block: QEMU stated no address here, so"
+                " the consumer is at\n"
+                "               the format's own all-to-all"
+                " over-approximation.  The refiner's\n"
+                "               masks are NOT published in its place --"
+                " 4a104e0be4 settled\n"
+                "               that, and this change does not reopen it\n"
+                "  %10" G_GUINT64_FORMAT "  QEMU addresses STATED minus CARRIED --"
+                " MUST BE 0.  An address\n"
+                "              established and not carried is an emission"
+                " gate standing\n"
+                "               between them.  %" G_GUINT64_FORMAT " stated,"
+                " %" G_GUINT64_FORMAT " carried\n",
+                aq, am, ad, aa, as_ - ac, as_, ac);
+        }
     }
 
     g_string_append(report, "\naddress families (HAS_ADDR):\n");

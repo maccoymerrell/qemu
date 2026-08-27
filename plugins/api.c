@@ -549,6 +549,11 @@ bool qemu_plugin_dataflow_prov_zero_reg(unsigned bit)
     return bit == INSN_DF_ZERO_PROV_BIT;
 }
 
+bool qemu_plugin_dataflow_prov_encoded_imm(unsigned bit)
+{
+    return bit == INSN_DF_IMM_PROV_BIT;
+}
+
 bool qemu_plugin_insn_dataflow_status(const struct qemu_plugin_tb *tb,
                                       size_t idx,
                                       qemu_plugin_dataflow_status *out)
@@ -579,6 +584,8 @@ bool qemu_plugin_insn_dataflow_status(const struct qemu_plugin_tb *tb,
     st.memops_addr_unstated = d->memops_addr_unstated;
     st.memops_data_unstated = d->memops_data_unstated;
     st.helper_writes_unbounded = d->helper_writes_unbounded;
+    st.imm_stated = d->imm_stated;
+    st.imm_reached = d->imm_reached;
 
     want = out->struct_size;
     if (want == 0 || want > sizeof(st)) {

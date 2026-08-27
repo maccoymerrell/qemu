@@ -123,6 +123,34 @@
  */
 #define INSN_DF_ZERO_PROV_BIT    (INSN_DF_MEMOP_PROV_BASE - 1)
 
+/*
+ * The fifth region: the instruction's ENCODED IMMEDIATE.
+ *
+ * A destination whose provenance names registers on an instruction that also
+ * carries an immediate poses a question no reading of the register set can
+ * answer: did the encoding contribute to this value, or not?  `add $5,(%rax)`
+ * and `ldr x0,[x1,#8]` are the two answers, and they are indistinguishable
+ * from the register set alone -- the first's FLAGS destination really does
+ * depend on the 5, and the second's loaded value does not depend on the 8,
+ * which belongs to the ADDRESS and is already carried there.
+ *
+ * So the fact is stated where it is a fact: at the DECODER, in the emitter
+ * that turns the encoding's immediate field into a TCG value.  It is
+ * emphatically NOT a bit for "a translation-time constant" -- QEMU
+ * synthesises those everywhere, for shift amounts it invented, for masks a
+ * lowering needed, for the length of the instruction -- and a bit that meant
+ * that would say nothing about the machine.
+ *
+ * The bit then travels the ordinary provenance dataflow, which is what makes
+ * the two cases separate themselves: the address's immediate lands in the
+ * address's provenance and the load's destination takes the memop bit
+ * instead, while an ALU immediate lands in the destination the ALU wrote.
+ *
+ * It sits directly below the zero-register bit for that bit's reason: the
+ * interning bound moves by one and no new arithmetic is needed.
+ */
+#define INSN_DF_IMM_PROV_BIT     (INSN_DF_ZERO_PROV_BIT - 1)
+
 typedef struct InsnDataflowField {
     uint32_t off;
     uint16_t size;
@@ -277,6 +305,31 @@ typedef struct InsnDataflow {
      * subset as though it were complete would be a missing dependency.
      */
     uint8_t  helper_writes_unbounded;
+
+    /*
+     * THE ENCODED IMMEDIATE, as a pair of facts rather than one.
+     *
+     * @imm_stated says a decoder on this instruction's path called
+     * insn_dataflow_note_encoded_imm() -- the instruction HAS an encoded
+     * immediate and the emitter said so.  @imm_reached says the temp it named
+     * was then read by an op of this instruction, so the bit had somewhere to
+     * go.
+     *
+     * Both are needed and neither implies the other.  Without @imm_stated a
+     * consumer cannot tell "the immediate did not feed this destination" from
+     * "no emitter on this path states immediates yet", and the second is a
+     * coverage hole that must not be published as the first.  Without
+     * @imm_reached it cannot tell that case from the one where the emitter
+     * DID state the immediate and QEMU then folded it away before any op saw
+     * it -- `addi rd,rs,0` becomes a mov, `andi rd,rs,0xff` becomes an
+     * extract -- where the absence of the bit is again the emulator's
+     * optimisation and not the machine's.
+     *
+     * Only @imm_stated && @imm_reached licenses reading a destination without
+     * the bit as "the encoding did not contribute to this value".
+     */
+    uint8_t  imm_stated;
+    uint8_t  imm_reached;
 
     /*
      * The accesses themselves, in the order the target emitted them.
@@ -544,6 +597,55 @@ void insn_dataflow_note_zero_reg(const void *ts);
 void insn_dataflow_note_folded_reg(const void *ts, const void *src_ts);
 
 /*
+ * CP-M, the ENCODED-IMMEDIATE half -- the value the instruction's own
+ * encoding names, as it becomes a TCG value.
+ *
+ * WHAT THIS IS FOR.  A wire consumer reading a destination's dependency mask
+ * has to know whether the instruction's immediate is one of that
+ * destination's sources.  Two candidate rules were tried against the two
+ * shapes on the workload and both failed: a blanket "the instruction carries
+ * an immediate, so every destination depends on it" is refuted by
+ * `ldr x0,[x1,#8]`, whose destination came from the LOAD and whose #8 is the
+ * ADDRESS's and already carried in the address's own provenance; and "it
+ * depends on the immediate unless the instruction has a load" is refuted by
+ * `add $5,(%rax)`, whose FLAGS destination does depend on the 5.  Neither
+ * question is answerable from the register set, and both are answerable from
+ * the dataflow -- once the immediate is IN it.
+ *
+ * WHERE IT IS STATED, and why nowhere else.  At the decoder, in the emitter
+ * that materialises the encoding's immediate field: x86's X86_OP_IMM operand
+ * load, the shared trans_ helpers that turn a decodetree `imm`/`shamt` field
+ * into an operand, MIPS' gen_* immediate arguments.  Those are the places
+ * where "this value is the instruction's immediate" is a FACT.  One level
+ * down it is not: tcg_constant_tl() is called by every part of QEMU for
+ * every reason, and a bit set there would mean "a constant appeared", which
+ * says nothing about the encoding.  @ts is the temp the emitter is about to
+ * use as the immediate operand.
+ *
+ * It states an OPERAND, not a value.  Whether a consumer models the
+ * immediate as a dependency at all is its decision; stating it here is what
+ * gives it one to make.
+ *
+ * THE ANCHOR MAKES IT A FACT ABOUT ONE INSTRUCTION, exactly as
+ * insn_dataflow_note_zero_reg()'s does and for a sharper version of the same
+ * reason: an immediate is usually a small integer, tcg_constant_tl() interns
+ * by value, and a block full of `addi rd,rs,8` and `slli rd,rs,3` resolves
+ * every 8 and every 3 to one temp apiece.  A note carrying only the temp
+ * would say "somewhere in this TB an 8 was an immediate" and would then
+ * name the encoding in the provenance of every later instruction that
+ * happened to use an 8 for a reason of QEMU's own.  So the note records the
+ * op the emitter had last produced, and the walk resolves a note only inside
+ * the instruction whose op range reached it.
+ *
+ * @ts is a TCGTemp pointer, void here for the same reason
+ * insn_dataflow_note_memop()'s is.  Capture only; no op is emitted, altered
+ * or suppressed, and a target that never calls this is unaffected -- its
+ * instructions report imm_stated = 0 and every consumer of the bit keeps
+ * refusing rather than reading the absence as an answer.
+ */
+void insn_dataflow_note_encoded_imm(const void *ts);
+
+/*
  * CP-H -- the helper choke point.
  *
  * INDEX_op_call is the one op whose arguments do not describe themselves.
@@ -737,6 +839,10 @@ static inline void insn_dataflow_note_zero_reg(const void *ts)
 static inline void insn_dataflow_note_folded_reg(const void *ts,
                                                  const void *src_ts)
 { }
+
+static inline void insn_dataflow_note_encoded_imm(const void *ts)
+{
+}
 
 static inline void insn_dataflow_note_helper(const void *call_op,
                                              const void *info,

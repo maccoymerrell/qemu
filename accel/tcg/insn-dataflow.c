@@ -109,6 +109,19 @@
  * published with its source missing.
  */
 #define DF_MAX_FOLD_NOTES     512
+/*
+ * Encoded-immediate operands stated by a decoder
+ * (insn_dataflow_note_encoded_imm).  One per immediate operand an
+ * instruction names, PER INSTRUCTION -- the note carries an anchor and is
+ * deduplicated against it, so a block of nothing but `addi rd,rs,8` takes
+ * one note per instruction rather than one for the block.  Sized like the
+ * zero-register notes and for the same reason: INSN_DF_MAX_INSNS
+ * instructions, a couple of immediate operands each.  Past the cap the notes
+ * stop and every instruction after is reported with imm_stated = 0, which is
+ * the "nobody said" state a consumer must refuse on rather than the "it did
+ * not contribute" state it must not infer.
+ */
+#define DF_MAX_IMM_NOTES      1024
 #define DF_MAX_HELPER_NOTES   64
 #define DF_MAX_HELPER_ARGS    8
 /*
@@ -216,6 +229,26 @@ typedef struct DfZeroNote {
     const void *ts;
     const TCGOp *anchor;
 } DfZeroNote;
+
+/*
+ * CP-M, the encoded-immediate half: one temp a DECODER is handing on as the
+ * value the instruction's encoding names, and the op the emitter had last
+ * produced when it said so.
+ *
+ * THE ANCHOR IS LOAD-BEARING HERE FOR A SHARPER REASON THAN IT IS FOR THE
+ * ZERO REGISTER.  Immediates are small integers and tcg_constant_tl() interns
+ * by value, so a TB of ordinary integer code resolves every `8` in it -- the
+ * displacement of one instruction, the shift count of another, the mask a
+ * third's lowering needed -- to a single temp.  A note carrying only that
+ * temp would put the ENCODING in the provenance of every later write that
+ * touched an 8 for a reason of QEMU's own, which is a fabricated dependency
+ * on a source that does not exist.  The anchor bounds the note to the
+ * instruction whose op range reached it, exactly as DfZeroNote's does.
+ */
+typedef struct DfImmNote {
+    const void *ts;
+    const TCGOp *anchor;
+} DfImmNote;
 
 /* CP-H: one per helper call, carrying what tcg_gen_callN had and the op lost. */
 typedef struct DfHelperNote {
@@ -444,6 +477,16 @@ struct InsnDataflowScratch {
     unsigned n_fold;
     bool fold_overflow;
 
+    /*
+     * CP-M, the encoded-immediate half: the temps a decoder handed on as the
+     * value its encoding names.  Pointers plus an anchor, no value: which
+     * immediate it was is the guest's business and the wire's immediate bit
+     * carries no payload.
+     */
+    DfImmNote imm[DF_MAX_IMM_NOTES];
+    unsigned n_imm;
+    bool imm_overflow;
+
     DfHelperNote helper[DF_MAX_HELPER_NOTES];
     unsigned n_helper;
     bool helper_overflow;
@@ -488,6 +531,9 @@ static __thread struct InsnDataflowScratch *df;
 #define df_fold             (df->fold)
 #define df_n_fold           (df->n_fold)
 #define df_fold_overflow    (df->fold_overflow)
+#define df_imm              (df->imm)
+#define df_n_imm            (df->n_imm)
+#define df_imm_overflow     (df->imm_overflow)
 #define df_helper           (df->helper)
 #define df_n_helper         (df->n_helper)
 #define df_helper_overflow  (df->helper_overflow)
@@ -550,7 +596,7 @@ static int df_intern(uint32_t off, uint32_t size)
         }
     }
     if (df_nslots >= INSN_DF_MAX_FIELD_SLOTS ||
-        base + df_nslots >= INSN_DF_ZERO_PROV_BIT) {
+        base + df_nslots >= INSN_DF_IMM_PROV_BIT) {
         df_slots_overflow = true;
         return -1;
     }
@@ -688,6 +734,13 @@ static void df_emit_prov(FILE *f, const uint64_t *pv, unsigned nregs)
              * `from=x10/a0`, naming one of two sources.
              */
             fprintf(f, "%sZERO", k++ ? "," : "");
+        } else if (b == INSN_DF_IMM_PROV_BIT) {
+            /*
+             * The instruction's own encoded immediate.  Rendered for the
+             * reason ZERO is: a dump that cannot show a fact the record
+             * carries reads as the record not carrying it.
+             */
+            fprintf(f, "%sIMM", k++ ? "," : "");
         } else if (insn_dataflow_prov_memop(b, &slot)) {
             fprintf(f, "%sL%u", k++ ? "," : "", slot);
         } else {
@@ -1040,6 +1093,8 @@ void insn_dataflow_note_reset(void)
     df_zero_overflow = false;
     df_n_fold = 0;
     df_fold_overflow = false;
+    df_n_imm = 0;
+    df_imm_overflow = false;
     df_n_helper = 0;
     df_helper_overflow = false;
 }
@@ -1231,6 +1286,31 @@ static bool df_zero_reg_temp(const void *tsv, unsigned n,
             if (df_zero[k].ts == (const void *)(ts + i)) {
                 return true;
             }
+        }
+    }
+    return false;
+}
+
+/*
+ * Is the temp at @tsv one a DECODER named as this instruction's encoded
+ * immediate, among the notes in [@lo, @hi)?
+ *
+ * One window only, and it is always the instruction's own -- unlike the
+ * zero-register notes there is no memop-prefix caller.  A store's data temp
+ * being the shared constant proves the operand was the zero register,
+ * because nothing else resolves to it; it proves nothing about an immediate,
+ * because a stored immediate and a shift count QEMU invented are the same
+ * interned temp.  So this is consulted from the op walk alone, inside the
+ * instruction whose emitter spoke.
+ */
+static bool df_imm_temp(const void *tsv, unsigned lo, unsigned hi)
+{
+    if (hi > df_n_imm) {
+        hi = df_n_imm;
+    }
+    for (unsigned k = lo; k < hi; k++) {
+        if (df_imm[k].ts == tsv) {
+            return true;
         }
     }
     return false;
@@ -1466,7 +1546,7 @@ static void df_settle_memop_prov(const InsnDataflow *d, size_t lo, size_t hi)
  */
 static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                     const TCGOp *marker, unsigned *memop_cursor,
-                    unsigned *zero_cursor)
+                    unsigned *zero_cursor, unsigned *imm_cursor)
 {
     TCGContext *s = tcg_ctx;
     TCGTemp *env_ts = tcgv_ptr_temp(tcg_env);
@@ -1491,9 +1571,19 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
      * resolved against a prefix.
      */
     unsigned zero_lo = *zero_cursor;
+    /*
+     * And the encoded-immediate notes belonging to THIS instruction, on the
+     * same discipline.  The low bound is what stops one instruction's
+     * immediate from naming the encoding in every later write that touched
+     * the same interned constant -- see DfImmNote.
+     */
+    unsigned imm_lo = *imm_cursor;
 
     while (*zero_cursor < df_n_zero && df_zero[*zero_cursor].anchor == marker) {
         (*zero_cursor)++;
+    }
+    while (*imm_cursor < df_n_imm && df_imm[*imm_cursor].anchor == marker) {
+        (*imm_cursor)++;
     }
 
     for (TCGOp *op = first; op != end; op = QTAILQ_NEXT(op, link)) {
@@ -1517,6 +1607,10 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
         while (prev_op != NULL && *zero_cursor < df_n_zero &&
                df_zero[*zero_cursor].anchor == prev_op) {
             (*zero_cursor)++;
+        }
+        while (prev_op != NULL && *imm_cursor < df_n_imm &&
+               df_imm[*imm_cursor].anchor == prev_op) {
+            (*imm_cursor)++;
         }
         prev_op = op;
 
@@ -2095,6 +2189,32 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
             TCGTemp *ts = arg_temp(op->args[nb_oargs + i]);
 
             df_or(prov, df_prov_of(ts - s->temps));
+            /*
+             * THE INSTRUCTION'S OWN ENCODED IMMEDIATE, stated by the decoder
+             * that materialised it.  Tested on its own rather than as a branch
+             * of the chain below, because the three facts are not exclusive:
+             * on a target whose zero register is a constant, `li a0,0`
+             * resolves BOTH the zero-register note and the immediate note to
+             * the one interned temp, and both are true of it -- the encoding
+             * names x0 and the encoding names 0.
+             *
+             * Bounded to this instruction's notes, which is the whole reason
+             * the notes carry an anchor: immediates intern by value and a
+             * prefix window would name the encoding in every later write that
+             * touched the same small integer.
+             */
+            if (df_imm_temp(ts, imm_lo, *imm_cursor)) {
+                df_bit(prov, INSN_DF_IMM_PROV_BIT);
+                /*
+                 * The note had somewhere to go.  Without this a consumer
+                 * cannot separate "the immediate does not feed this
+                 * destination" from "QEMU folded the immediate away before
+                 * any op saw it" -- `addi rd,rs,0` becomes a mov -- and the
+                 * second is the emulator's optimisation, which R7.3 forbids
+                 * publishing as the machine's.
+                 */
+                d->imm_reached = 1;
+            }
             if (df_reg(ts, &idx)) {
                 df_bit(d->rd, idx);
                 df_bit(prov, idx);
@@ -2206,6 +2326,19 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
     while (prev_op != NULL && *zero_cursor < df_n_zero &&
            df_zero[*zero_cursor].anchor == prev_op) {
         (*zero_cursor)++;
+    }
+    while (prev_op != NULL && *imm_cursor < df_n_imm &&
+           df_imm[*imm_cursor].anchor == prev_op) {
+        (*imm_cursor)++;
+    }
+    /*
+     * An instruction whose decoder spoke at all: stated even when the
+     * constant never reached an op, because the two facts answer different
+     * questions and folding them would put the coverage hole and the
+     * emulator's fold under one word again.
+     */
+    if (*imm_cursor > imm_lo) {
+        d->imm_stated = 1;
     }
     df_settle_memop_prov(d, tlo, thi);
 }
@@ -2366,6 +2499,49 @@ void insn_dataflow_note_zero_reg(const void *ts)
     df_zero[df_n_zero].ts = ts;
     df_zero[df_n_zero].anchor = anchor;
     df_n_zero++;
+}
+
+/*
+ * CP-M, the encoded-immediate half.  See insn_dataflow_note_encoded_imm() in
+ * the header for why the note is taken at the decoder and nowhere below it.
+ *
+ * Same list discipline as the zero-register notes -- append-only for the
+ * translation, searched by temp identity inside the window of notes this
+ * instruction took, deduplicated on the (temp, anchor) PAIR.  The pair is
+ * what makes `andi a0,a1,8` and `slli a2,a3,8` two facts rather than one:
+ * tcg_constant_tl(8) is one temp and each instruction states it about
+ * itself.  Deduplicating on the temp alone would collapse them into the
+ * first, which is the bug the zero-register notes had before the anchor
+ * existed.
+ *
+ * The anchor is taken unconditionally, including for a constant temp, for
+ * the reason insn_dataflow_note_zero_reg() gives at length: the anchor here
+ * is not guarding against a later write to the temp, it is recording WHICH
+ * INSTRUCTION said the word, and an interned constant is precisely the case
+ * where two instructions say it about the same temp.
+ */
+void insn_dataflow_note_encoded_imm(const void *ts)
+{
+    const TCGOp *anchor;
+
+    if (df_disabled()) {
+        return;
+    }
+    df_bind();
+    if (df_n_imm >= DF_MAX_IMM_NOTES) {
+        df_imm_overflow = true;
+        return;
+    }
+    anchor = QTAILQ_LAST(&tcg_ctx->ops);
+    for (unsigned i = df_n_imm; i-- > 0; ) {
+        if (df_imm[i].ts == ts && df_imm[i].anchor == anchor) {
+            return;
+        }
+        break;
+    }
+    df_imm[df_n_imm].ts = ts;
+    df_imm[df_n_imm].anchor = anchor;
+    df_n_imm++;
 }
 
 /*
@@ -2660,6 +2836,7 @@ void insn_dataflow_extract(unsigned num_insns)
     unsigned idx = 0;
     unsigned memop_cursor;
     unsigned zero_cursor;
+    unsigned imm_cursor;
     bool prof;
     int64_t t0;
 
@@ -2691,6 +2868,7 @@ void insn_dataflow_extract(unsigned num_insns)
      */
     memop_cursor = 0;
     zero_cursor = 0;
+    imm_cursor = 0;
 
     QTAILQ_FOREACH(op, &s->ops, link) {
         if (op->opc != INDEX_op_insn_start) {
@@ -2698,7 +2876,7 @@ void insn_dataflow_extract(unsigned num_insns)
         }
         if (first != NULL && idx > 0) {
             df_insn(&df_out[idx - 1], first, op, marker, &memop_cursor,
-                    &zero_cursor);
+                    &zero_cursor, &imm_cursor);
             df_apply_gvec_notes(&df_out[idx - 1], first, op);
         }
         if (idx >= num_insns) {
@@ -2716,7 +2894,7 @@ void insn_dataflow_extract(unsigned num_insns)
     }
     if (first != NULL && idx > 0) {
         df_insn(&df_out[idx - 1], first, NULL, marker, &memop_cursor,
-                &zero_cursor);
+                &zero_cursor, &imm_cursor);
         df_apply_gvec_notes(&df_out[idx - 1], first, NULL);
     }
     df_ninsns = idx;

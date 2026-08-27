@@ -93,7 +93,7 @@
 
 #include "qemu/qemu-plugin.h"   /* for the plugin API export marker */
 
-#define QEMU_PLUGIN_DATAFLOW_VERSION 6
+#define QEMU_PLUGIN_DATAFLOW_VERSION 7
 
 /*
  * Returned by any set accessor whose instruction could not be extracted in
@@ -406,6 +406,38 @@ QEMU_PLUGIN_API
 bool qemu_plugin_dataflow_prov_zero_reg(unsigned bit);
 
 /*
+ * Is @bit the INSTRUCTION'S OWN ENCODED IMMEDIATE?
+ *
+ * A destination whose dependency mask names registers on an instruction that
+ * also carries an immediate raises a question the register names cannot
+ * settle: is the encoding one of that destination's sources?  `add $5,(%rax)`
+ * says yes -- its FLAGS destination is computed from the 5 -- and
+ * `ldr x0,[x1,#8]` says no, because the 8 is the ADDRESS's and is carried in
+ * the address's own provenance, where a consumer that wants it will find it.
+ *
+ * So the emitters that turn an encoding's immediate field into a TCG value
+ * say so, and the bit then travels the ordinary dataflow: it lands wherever
+ * the immediate's value went and nowhere else.
+ *
+ * WHAT IT IS NOT: a bit for "a translation-time constant".  QEMU makes those
+ * everywhere and for its own reasons, and a bit that meant that would say
+ * nothing about the machine.  It is the ENCODING's immediate or it is not
+ * set.
+ *
+ * READ IT TOGETHER WITH imm_stated / imm_reached from the status.  The
+ * ABSENCE of this bit is only an answer when the instruction's decoder
+ * actually spoke and the value it named reached an op; otherwise absence
+ * means nobody looked, which a consumer must refuse on rather than read as
+ * "the encoding did not contribute".
+ *
+ * A consumer that does not ask is not misled, on the same rule as the memop
+ * and zero-register regions: a bit it cannot resolve is one it must not
+ * attribute to a register.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_dataflow_prov_encoded_imm(unsigned bit);
+
+/*
  * Anything the extraction could not represent.
  *
  * A consumer is never left to infer completeness from silence, and it is not
@@ -488,6 +520,24 @@ typedef struct qemu_plugin_dataflow_status {
      */
     uint8_t  helper_writes_unbounded;
     uint8_t  reserved[1];
+    /*
+     * THE ENCODED IMMEDIATE, as the two facts a consumer needs to read the
+     * absence of the immediate provenance bit.
+     *
+     * @imm_stated: a decoder on this instruction's path named its encoded
+     * immediate.  @imm_reached: the value it named was then read by an op of
+     * this instruction, so the bit had a route into the dataflow.
+     *
+     * Only when BOTH are set may a destination that does not carry the
+     * immediate bit be read as "the encoding did not contribute to this
+     * value".  With @imm_stated clear the target's decoder does not state
+     * immediates on this path at all and the absence means nothing; with it
+     * set and @imm_reached clear, QEMU folded the immediate away before
+     * emitting anything -- `addi rd,rs,0` becomes a move -- and the absence
+     * is the emulator's optimisation rather than the machine's.
+     */
+    uint8_t  imm_stated;
+    uint8_t  imm_reached;
 } qemu_plugin_dataflow_status;
 
 /*

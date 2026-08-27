@@ -498,6 +498,11 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx,
 void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
                 const char *mnem);
 
+/* The J3 mutation arm that scores the REFINER's destination masks: run in
+ * the window between the refiners and qdep_apply(), so what moves under it
+ * is what the wire still takes from Capstone.  See the definition. */
+void qdep_mutate_refiner_dst(InsnFields *f);
+
 /* Append the census.  Always reported: the number of instructions whose
  * dependency block fell back to the format default is a fact about the
  * trace, not a debugging aid, and a fact nobody prints is a fact nobody

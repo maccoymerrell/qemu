@@ -1664,6 +1664,7 @@ BBTemplate *TemplateStore::create_tb_template(
              * written before them would be overwritten by them, which is a
              * flip that silently does not happen.
              */
+            qdep_mutate_refiner_dst(&scratch[i].f);
             if (insn_qdep) {
                 qdep_apply(&scratch[i].f,
                                 with_names ? &nscratch[i].rn : nullptr,

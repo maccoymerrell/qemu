@@ -1393,6 +1393,43 @@ unsigned dst_precheck(const InsnFields *f, const QDepInsn *q,
     return QDEP_OK;
 }
 
+static bool qdep_mutate_is(const char *want)
+{
+    static const char *mode;
+    static bool read;
+
+    if (!read) {
+        mode = getenv("QEMU_DF_MUTATE");
+        read = true;
+    }
+    return mode && !strcmp(mode, want);
+}
+
+/*
+ * Move a published destination mask, without changing what it can express.
+ *
+ * The immediate bit is the one slot every layout has -- it sits above the
+ * source registers and the load-data band, so it exists whatever the
+ * template's shape -- and flipping it moves the mask's VALUE and its
+ * resolved NAME set together.  Non-emptiness is preserved in both
+ * directions because emptiness is a decision made elsewhere and must not
+ * be made here: an empty mask is how the encoding rule is spelled, and a
+ * mask that exists at all is what dep_publish() decided from the refiner's
+ * answer.  A mutation that emptied or filled one would move rows by moving
+ * a gate rather than a mask, and the movement would not be this family's.
+ */
+static uint64_t qdep_move_mask(const InsnFields *f, uint64_t m)
+{
+    unsigned imm = (unsigned)f->n_src_regs + f->max_dep_loads;
+    uint64_t b;
+
+    if (m == 0 || imm >= 63) {
+        return m;
+    }
+    b = 1ULL << imm;
+    return (m == b) ? (m | 1ULL) : (m ^ b);
+}
+
 /*
  * Publish the destination family, or say why it was not published.
  *
@@ -1539,7 +1576,35 @@ void apply_dst(InsnFields *f, const QDepInsn *q, const char *mnem,
                 g_dst_imm_absent.fetch_add(1, std::memory_order_relaxed);
             }
         }
-        f->dst_dep_mask[d] = m;
+        /*
+         * THE DESTINATION FAMILY'S J3 CONTROL (#249), and it is placed on
+         * the last line that writes a published mask because nothing
+         * earlier can serve.
+         *
+         * The `mnem` arm every other family's zero is scored against blanks
+         * the opcode taxonomy, and the refiner then emits no dep block at
+         * all: on aarch64, riscv64 and mipsel the control arm's whole
+         * subject vanished, so no dst zero on those ISAs was ever quotable.
+         * Two mutations further upstream were built and MEASURED before
+         * this one, and both are inert on at least one ISA for a reason
+         * worth keeping: scribbling the refiner's mask (`refmask`) moves
+         * only the rows this function REFUSED, and corrupting QEMU's write
+         * provenance (`wprov`, plugins/api.c) moves only the rows where
+         * QEMU's answer and the refiner's DIFFER -- and on aarch64 they
+         * agree, because a load's destination is `LOAD0` to both.  A
+         * control has to move where the two sources agree as well as where
+         * they do not, which is only possible after the choice between
+         * them has been made.  So the arm lands here, on the value that
+         * actually reaches the wire, and every QDEP_OK destination on every
+         * ISA is its subject.
+         *
+         * It is a control and not a test: it says the chain from this
+         * assignment to the scorer's key is live for this family on this
+         * ISA.  What the mask is SOURCED from is what the Capstone arms and
+         * the two upstream arms measure.
+         */
+        f->dst_dep_mask[d] = qdep_mutate_is("dstmask") ?
+                             qdep_move_mask(f, m) : m;
     }
     g_wstate[QDEP_OK].fetch_add(1, std::memory_order_relaxed);
 }
@@ -1798,6 +1863,35 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
         out->data_state = QDEP_OK;
     }
     note_dst(tb, idx, out, load_ord, n);
+}
+
+/*
+ * THE J3 CONTROL CANDIDATE THAT SCORES THE REFINER, not QEMU (#249).
+ *
+ * Every mask the destination family publishes is written twice: the row's
+ * `.dep_refine` writes one from Capstone's operand detail, and qdep_apply()
+ * below overwrites it with QEMU's provenance -- or does NOT, on the rows it
+ * refuses, where the refiner's answer is what reaches the wire.  Scribbling
+ * the refiner's mask HERE, in the window between the two writers, therefore
+ * moves exactly the destination slots the wire still takes from Capstone,
+ * and nothing else.  It is a measurement of the family's residual coupling
+ * with the sign of a control: rows that move are rows QEMU did not decide.
+ *
+ * NON-EMPTINESS IS PRESERVED, because emptiness is a decision elsewhere:
+ * dep_publish() reads the refiner's mask to decide whether a dep block
+ * exists at all (#242/#247), so a scribble that emptied a mask, or filled
+ * an empty one, would change which blocks are on the wire and the movement
+ * would be the block gate's rather than the mask's.  Flipping the immediate
+ * bit of a non-empty mask cannot do either.
+ */
+void qdep_mutate_refiner_dst(InsnFields *f)
+{
+    if (!qdep_mutate_is("refmask") || !f || !f->dst_dep_mask) {
+        return;
+    }
+    for (uint8_t d = 0; d < f->n_dst_regs; d++) {
+        f->dst_dep_mask[d] = qdep_move_mask(f, f->dst_dep_mask[d]);
+    }
 }
 
 void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,

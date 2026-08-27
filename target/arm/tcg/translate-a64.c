@@ -3347,6 +3347,19 @@ static void op_addr_ldstpair_pre(DisasContext *s, arg_ldstpair *a,
     }
 
     *dirty_addr = read_cpu_reg_sp(s, a->rn, 1);
+    /*
+     * CP-M, the ENCODED-IMMEDIATE half.  @offset is this instruction's
+     * scaled immediate field, and the ADDRESS is the one place it goes.
+     * `ldr x0,[x1,#8]` is the case that refutes reading "the instruction
+     * carries an immediate" as "every destination depends on it" -- and it
+     * only refutes it if the immediate is IN the dataflow to be found in the
+     * address and absent from the loaded value.
+     *
+     * tcg_gen_addi_i64() interns the constant, so naming it here names the
+     * temp the add is about to read.  Capture only; no op is emitted,
+     * altered or suppressed.  See insn_dataflow_note_encoded_imm().
+     */
+    insn_dataflow_note_encoded_imm(tcgv_i64_temp(tcg_constant_i64(offset)));
     if (!a->p) {
         tcg_gen_addi_i64(*dirty_addr, *dirty_addr, offset);
     }
@@ -3526,6 +3539,19 @@ static bool trans_STGP(DisasContext *s, arg_ldstpair *a)
     }
 
     dirty_addr = read_cpu_reg_sp(s, a->rn, 1);
+    /*
+     * CP-M, the ENCODED-IMMEDIATE half.  @offset is this instruction's
+     * scaled immediate field, and the ADDRESS is the one place it goes.
+     * `ldr x0,[x1,#8]` is the case that refutes reading "the instruction
+     * carries an immediate" as "every destination depends on it" -- and it
+     * only refutes it if the immediate is IN the dataflow to be found in the
+     * address and absent from the loaded value.
+     *
+     * tcg_gen_addi_i64() interns the constant, so naming it here names the
+     * temp the add is about to read.  Capture only; no op is emitted,
+     * altered or suppressed.  See insn_dataflow_note_encoded_imm().
+     */
+    insn_dataflow_note_encoded_imm(tcgv_i64_temp(tcg_constant_i64(offset)));
     if (!a->p) {
         tcg_gen_addi_i64(dirty_addr, dirty_addr, offset);
     }
@@ -3574,6 +3600,19 @@ static void op_addr_ldst_imm_pre(DisasContext *s, arg_ldst_imm *a,
     }
 
     *dirty_addr = read_cpu_reg_sp(s, a->rn, 1);
+    /*
+     * CP-M, the ENCODED-IMMEDIATE half.  @offset is this instruction's
+     * scaled immediate field, and the ADDRESS is the one place it goes.
+     * `ldr x0,[x1,#8]` is the case that refutes reading "the instruction
+     * carries an immediate" as "every destination depends on it" -- and it
+     * only refutes it if the immediate is IN the dataflow to be found in the
+     * address and absent from the loaded value.
+     *
+     * tcg_gen_addi_i64() interns the constant, so naming it here names the
+     * temp the add is about to read.  Capture only; no op is emitted,
+     * altered or suppressed.  See insn_dataflow_note_encoded_imm().
+     */
+    insn_dataflow_note_encoded_imm(tcgv_i64_temp(tcg_constant_i64(offset)));
     if (!a->p) {
         tcg_gen_addi_i64(*dirty_addr, *dirty_addr, offset);
     }
@@ -4634,6 +4673,14 @@ static bool gen_rri(DisasContext *s, arg_rri_sf *a,
     TCGv_i64 tcg_rd = rd_sp ? cpu_reg_sp(s, a->rd) : cpu_reg(s, a->rd);
     TCGv_i64 tcg_imm = tcg_constant_i64(a->imm);
 
+    /*
+     * CP-M, the ENCODED-IMMEDIATE half.  `a->imm` is the instruction's
+     * immediate field as decodetree extracted it, and this is the temp the
+     * arithmetic below reads it from.  Capture only; no op is emitted,
+     * altered or suppressed.  See insn_dataflow_note_encoded_imm().
+     */
+    insn_dataflow_note_encoded_imm(tcgv_i64_temp(tcg_imm));
+
     fn(tcg_rd, tcg_rn, tcg_imm);
     if (!a->sf) {
         tcg_gen_ext32u_i64(tcg_rd, tcg_rd);
@@ -4804,6 +4851,15 @@ static bool gen_rri_log(DisasContext *s, arg_rri_log *a, bool set_cc,
 
     tcg_rd = set_cc ? cpu_reg(s, a->rd) : cpu_reg_sp(s, a->rd);
     tcg_rn = cpu_reg(s, a->rn);
+
+    /*
+     * CP-M, the ENCODED-IMMEDIATE half.  @imm is the DBM field decoded into
+     * the bitmask the encoding names -- still the instruction's own
+     * immediate, and still a fact only this function is in a position to
+     * state.  tcg_constant_i64() interns by value, so this names the temp
+     * tcg_gen_andi_i64() and its siblings are about to materialise.
+     */
+    insn_dataflow_note_encoded_imm(tcgv_i64_temp(tcg_constant_i64(imm)));
 
     fn(tcg_rd, tcg_rn, imm);
     if (set_cc) {

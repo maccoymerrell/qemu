@@ -305,6 +305,18 @@ static void gen_load(DisasContext *s, X86DecodedInsn *decode, int opn, TCGv v)
         break;
     case X86_OP_IMM:
         tcg_gen_movi_tl(v, op->imm);
+        /*
+         * CP-M, the ENCODED-IMMEDIATE half.  This is x86's one operand-load
+         * path for an immediate: decode-new set op->imm from the instruction
+         * bytes (X86_OP_IMM, decode-new.c.inc) and @v is the temp every
+         * emitter downstream will read it from.  The note is taken AFTER the
+         * move, so the op it anchors to is the write that put the immediate
+         * in @v -- which is what bounds the fact to this instruction.
+         *
+         * Capture only; no op is emitted, altered or suppressed.  See
+         * insn_dataflow_note_encoded_imm().
+         */
+        insn_dataflow_note_encoded_imm(tcgv_tl_temp(v));
         break;
 
     case X86_OP_MMX:

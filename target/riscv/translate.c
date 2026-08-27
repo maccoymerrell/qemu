@@ -882,6 +882,19 @@ static bool gen_logic_imm_fn(DisasContext *ctx, arg_i *a,
     TCGv dest = dest_gpr(ctx, a->rd);
     TCGv src1 = get_gpr(ctx, a->rs1, EXT_NONE);
 
+    /*
+     * CP-M, the ENCODED-IMMEDIATE half.  This function's `a->imm` IS the
+     * instruction's immediate field, extracted by decodetree from the
+     * encoding -- the one place on this path where that is a fact rather
+     * than an inference.  tcg_constant_tl() interns by value, so naming it
+     * here names the very temp the emitter below is about to hand to TCG,
+     * whether it materialises it itself or tcg_gen_*i_tl() does.
+     *
+     * Capture only; no op is emitted, altered or suppressed.  See
+     * insn_dataflow_note_encoded_imm().
+     */
+    insn_dataflow_note_encoded_imm(tcgv_tl_temp(tcg_constant_tl(a->imm)));
+
     func(dest, src1, a->imm);
 
     if (get_xl(ctx) == MXL_RV128) {
@@ -927,6 +940,19 @@ static bool gen_arith_imm_fn(DisasContext *ctx, arg_i *a, DisasExtend ext,
     TCGv dest = dest_gpr(ctx, a->rd);
     TCGv src1 = get_gpr(ctx, a->rs1, ext);
 
+    /*
+     * CP-M, the ENCODED-IMMEDIATE half.  This function's `a->imm` IS the
+     * instruction's immediate field, extracted by decodetree from the
+     * encoding -- the one place on this path where that is a fact rather
+     * than an inference.  tcg_constant_tl() interns by value, so naming it
+     * here names the very temp the emitter below is about to hand to TCG,
+     * whether it materialises it itself or tcg_gen_*i_tl() does.
+     *
+     * Capture only; no op is emitted, altered or suppressed.  See
+     * insn_dataflow_note_encoded_imm().
+     */
+    insn_dataflow_note_encoded_imm(tcgv_tl_temp(tcg_constant_tl(a->imm)));
+
     if (get_ol(ctx) < MXL_RV128) {
         func(dest, src1, a->imm);
         gen_set_gpr(ctx, a->rd, dest);
@@ -951,6 +977,19 @@ static bool gen_arith_imm_tl(DisasContext *ctx, arg_i *a, DisasExtend ext,
     TCGv dest = dest_gpr(ctx, a->rd);
     TCGv src1 = get_gpr(ctx, a->rs1, ext);
     TCGv src2 = tcg_constant_tl(a->imm);
+
+    /*
+     * CP-M, the ENCODED-IMMEDIATE half.  This function's `a->imm` IS the
+     * instruction's immediate field, extracted by decodetree from the
+     * encoding -- the one place on this path where that is a fact rather
+     * than an inference.  tcg_constant_tl() interns by value, so naming it
+     * here names the very temp the emitter below is about to hand to TCG,
+     * whether it materialises it itself or tcg_gen_*i_tl() does.
+     *
+     * Capture only; no op is emitted, altered or suppressed.  See
+     * insn_dataflow_note_encoded_imm().
+     */
+    insn_dataflow_note_encoded_imm(tcgv_tl_temp(src2));
 
     if (get_ol(ctx) < MXL_RV128) {
         func(dest, src1, src2);
@@ -1027,6 +1066,19 @@ static bool gen_shift_imm_fn(DisasContext *ctx, arg_shift *a, DisasExtend ext,
     dest = dest_gpr(ctx, a->rd);
     src1 = get_gpr(ctx, a->rs1, ext);
 
+    /*
+     * CP-M, the ENCODED-IMMEDIATE half.  This function's `a->shamt` IS the
+     * instruction's immediate field, extracted by decodetree from the
+     * encoding -- the one place on this path where that is a fact rather
+     * than an inference.  tcg_constant_tl() interns by value, so naming it
+     * here names the very temp the emitter below is about to hand to TCG,
+     * whether it materialises it itself or tcg_gen_*i_tl() does.
+     *
+     * Capture only; no op is emitted, altered or suppressed.  See
+     * insn_dataflow_note_encoded_imm().
+     */
+    insn_dataflow_note_encoded_imm(tcgv_tl_temp(tcg_constant_tl(a->shamt)));
+
     if (max_len < 128) {
         func(dest, src1, a->shamt);
         gen_set_gpr(ctx, a->rd, dest);
@@ -1074,6 +1126,19 @@ static bool gen_shift_imm_tl(DisasContext *ctx, arg_shift *a, DisasExtend ext,
     dest = dest_gpr(ctx, a->rd);
     src1 = get_gpr(ctx, a->rs1, ext);
     src2 = tcg_constant_tl(a->shamt);
+
+    /*
+     * CP-M, the ENCODED-IMMEDIATE half.  This function's `a->shamt` IS the
+     * instruction's immediate field, extracted by decodetree from the
+     * encoding -- the one place on this path where that is a fact rather
+     * than an inference.  tcg_constant_tl() interns by value, so naming it
+     * here names the very temp the emitter below is about to hand to TCG,
+     * whether it materialises it itself or tcg_gen_*i_tl() does.
+     *
+     * Capture only; no op is emitted, altered or suppressed.  See
+     * insn_dataflow_note_encoded_imm().
+     */
+    insn_dataflow_note_encoded_imm(tcgv_tl_temp(src2));
 
     func(dest, src1, src2);
 

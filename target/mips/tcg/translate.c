@@ -2550,6 +2550,16 @@ static void gen_arith_imm(DisasContext *ctx, uint32_t opc,
          */
         return;
     }
+
+    /*
+     * CP-M, the ENCODED-IMMEDIATE half.  `uimm` is this instruction's encoded immediate
+     * field, sign- or zero-extended exactly as the emitters below will use
+     * it, so naming it here names the interned temp TCG will hand them.
+     * Capture only; no op is emitted, altered or suppressed.  See
+     * insn_dataflow_note_encoded_imm().
+     */
+    insn_dataflow_note_encoded_imm(tcgv_tl_temp(tcg_constant_tl(uimm)));
+
     switch (opc) {
     case OPC_ADDI:
         mips_ident(ctx,
@@ -2636,6 +2646,16 @@ static void gen_logic_imm(DisasContext *ctx, uint32_t opc,
         return;
     }
     uimm = (uint16_t)imm;
+
+    /*
+     * CP-M, the ENCODED-IMMEDIATE half.  `uimm` is this instruction's encoded immediate
+     * field, sign- or zero-extended exactly as the emitters below will use
+     * it, so naming it here names the interned temp TCG will hand them.
+     * Capture only; no op is emitted, altered or suppressed.  See
+     * insn_dataflow_note_encoded_imm().
+     */
+    insn_dataflow_note_encoded_imm(tcgv_tl_temp(tcg_constant_tl(uimm)));
+
     switch (opc) {
     case OPC_ANDI:
         mips_ident(ctx,
@@ -2698,6 +2718,16 @@ static void gen_slt_imm(DisasContext *ctx, uint32_t opc,
     }
     t0 = tcg_temp_new();
     gen_load_gpr(t0, rs);
+
+    /*
+     * CP-M, the ENCODED-IMMEDIATE half.  `uimm` is this instruction's encoded immediate
+     * field, sign- or zero-extended exactly as the emitters below will use
+     * it, so naming it here names the interned temp TCG will hand them.
+     * Capture only; no op is emitted, altered or suppressed.  See
+     * insn_dataflow_note_encoded_imm().
+     */
+    insn_dataflow_note_encoded_imm(tcgv_tl_temp(tcg_constant_tl(uimm)));
+
     switch (opc) {
     case OPC_SLTI:
         mips_ident(ctx,
@@ -2728,6 +2758,16 @@ static void gen_shift_imm(DisasContext *ctx, uint32_t opc,
 
     t0 = tcg_temp_new();
     gen_load_gpr(t0, rs);
+
+    /*
+     * CP-M, the ENCODED-IMMEDIATE half.  `uimm` is this instruction's encoded shift-amount
+     * field, sign- or zero-extended exactly as the emitters below will use
+     * it, so naming it here names the interned temp TCG will hand them.
+     * Capture only; no op is emitted, altered or suppressed.  See
+     * insn_dataflow_note_encoded_imm().
+     */
+    insn_dataflow_note_encoded_imm(tcgv_tl_temp(tcg_constant_tl(uimm)));
+
     switch (opc) {
     case OPC_SLL:
         mips_ident(ctx,

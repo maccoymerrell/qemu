@@ -2273,14 +2273,36 @@ def _reconstruct_insn_flags(ins: dict,
 
 def _resolve_dep_input_bit(name: str, n_src: int,
                            max_dep_loads: int,
-                           layout: str) -> int | None:
-    """Map an author dep-input name (\"src_reg[i]\", \"load_data[k]\",
-    \"imm\") to its bit position inside a dep mask.  @layout selects
-    the bit shape — REG-mask layouts (dst_dep / store_data_dep)
-    include the load_data range; ADDR-mask layouts (load_addr_dep /
-    store_addr_dep) omit it because addresses compute before any
-    load fires.  Returns None on unknown names so the caller can
-    surface a "typo in spec" error."""
+                           layout: str,
+                           src_names: list[str] | None = None) -> int | None:
+    """Map an author dep-input name to its bit position inside a dep mask.
+
+    Accepted names:
+
+      ``REG_*``        the slot of src_regs[] that HOLDS that register.
+                       Prefer this form.  A dep mask is a set of bit
+                       positions into src_regs[], so an expectation
+                       written as an INDEX is a statement about the
+                       order of that list, not about the dependency.
+                       The list's order is the tracer's to choose and it
+                       has already been deliberately re-ordered once:
+                       reindex_src_for_qemu() seats QEMU's own register
+                       list at the head, which moved a store's base
+                       register from slot 1 to slot 0 on all four ISAs.
+                       Index-written expectations then failed while the
+                       masks named exactly the right registers.  Naming
+                       the register says what was meant and survives the
+                       next permutation.
+      ``src_reg[i]``   the i-th slot.  Retained for the cases where the
+                       slot itself is the subject (repeated registers,
+                       or a probe testing slot layout).
+      ``load_data[k]`` / ``imm``   as before.
+
+    @layout selects the bit shape — REG-mask layouts (dst_dep /
+    store_data_dep) include the load_data range; ADDR-mask layouts
+    (load_addr_dep / store_addr_dep) omit it because addresses compute
+    before any load fires.  Returns None on unknown names so the caller
+    can surface a "typo in spec" error."""
     if name == "imm":
         if layout == "reg":
             return n_src + max_dep_loads
@@ -2289,6 +2311,14 @@ def _resolve_dep_input_bit(name: str, n_src: int,
         idx = int(name[len("src_reg["):-1])
         if 0 <= idx < n_src:
             return idx
+        return None
+    if name.startswith("REG_") and src_names:
+        # Exactly one slot must hold it: a register appearing twice
+        # makes "the slot of REG_x" ambiguous, and an ambiguous
+        # expectation must fail loudly rather than pick one.
+        hits = [i for i, s in enumerate(src_names) if s == name]
+        if len(hits) == 1 and hits[0] < n_src:
+            return hits[0]
         return None
     if layout == "reg" and name.startswith("load_data[") and name.endswith("]"):
         idx = int(name[len("load_data["):-1])
@@ -2299,7 +2329,8 @@ def _resolve_dep_input_bit(name: str, n_src: int,
 
 
 def _names_to_dep_mask(names: list[str], n_src: int,
-                       max_dep_loads: int, layout: str
+                       max_dep_loads: int, layout: str,
+                       src_names: list[str] | None = None
                        ) -> tuple[int, list[str]]:
     """Build a dep-mask integer from a list of input-name strings.
     Returns (mask, unknown_names).  Unknown names are surfaced so the
@@ -2307,7 +2338,8 @@ def _names_to_dep_mask(names: list[str], n_src: int,
     mask = 0
     unknown: list[str] = []
     for n in names:
-        bit = _resolve_dep_input_bit(n, n_src, max_dep_loads, layout)
+        bit = _resolve_dep_input_bit(n, n_src, max_dep_loads, layout,
+                                     src_names)
         if bit is None:
             unknown.append(n)
         else:
@@ -2563,6 +2595,13 @@ def _check_expected_insns(
 
                 # --- dependency masks ---
                 n_src = len(ins.get("src_regs") or [])
+                # Slot -> register NAME, so a dep expectation may name
+                # the register instead of pinning itself to this list's
+                # current order (see _resolve_dep_input_bit).
+                src_slot_names = [
+                    (reg_id_to_name.get(int(r)) or f"REG_{int(r)}")
+                    for r in (ins.get("src_regs") or [])
+                ]
                 n_dst = len(ins.get("dst_regs") or [])
                 mdl   = int(ins.get("n_loads", 0))
                 for field, wire_field, per_count, layout in (
@@ -2608,7 +2647,8 @@ def _check_expected_insns(
                             continue
                     for j, names in enumerate(declared):
                         exp_mask, unknown = _names_to_dep_mask(
-                            names or [], n_src, mdl, layout)
+                            names or [], n_src, mdl, layout,
+                            src_slot_names)
                         if unknown:
                             err("dep_input_name",
                                 f"blk_{bid} insn #{idx}: {field}[{j}] "

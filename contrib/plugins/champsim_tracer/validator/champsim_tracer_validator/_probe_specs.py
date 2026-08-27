@@ -1198,39 +1198,47 @@ _register_probe('probe_exact_load_rm', {
                                 dst_deps=[["load_data[0]"]])]},
 })
 
-# Plain register-base + zero-offset store.  Walker operand order
-# across all four ISAs is REG-src first, MEM-base added second, so
-# src_regs[] = [VALUE, BASE].  store_addr_deps points at index 1
-# (the base); store_data_deps points at index 0 (the value).
+# Plain register-base + zero-offset store.  The subject is WHICH
+# REGISTER each mask names -- the base for the address, the value for
+# the data -- so both are declared by NAME.
+#
+# They were declared as src_reg[1] / src_reg[0] until 2026-08-27, on a
+# comment that read "walker operand order across all four ISAs is
+# REG-src first, MEM-base added second, so src_regs[] = [VALUE, BASE]".
+# reindex_src_for_qemu() retired that premise by design: QEMU's own
+# register list is seated at the head of src_regs[], which puts the
+# base in slot 0.  The masks then named exactly the right registers and
+# the check failed anyway, on all four ISAs, because the expectation
+# was a statement about list order rather than about the dependency.
 _register_probe('probe_exact_store_rm', {
     'x86_64':  {'asm': '"movq %%rax, (%%rsp)"', 'clobbers': '"memory"',
                 'opcodes': ['MOV'],
                 'insns': [_insn("MOV", branch_type="NONE",
                                 src=["REG_GPR0", "REG_SP"],
                                 dst=[],
-                                store_addr_deps=[["src_reg[1]"]],
-                                store_data_deps=[["src_reg[0]"]])]},
+                                store_addr_deps=[["REG_SP"]],
+                                store_data_deps=[["REG_GPR0"]])]},
     'aarch64': {'asm': '"str x0, [sp]"', 'clobbers': '"memory"',
                 'opcodes': ['STORE'],
                 'insns': [_insn("STORE", branch_type="NONE",
                                 src=["REG_GPR0", "REG_SP"],
                                 dst=[],
-                                store_addr_deps=[["src_reg[1]"]],
-                                store_data_deps=[["src_reg[0]"]])]},
+                                store_addr_deps=[["REG_SP"]],
+                                store_data_deps=[["REG_GPR0"]])]},
     'riscv64': {'asm': '"sd t0, 0(sp)"', 'clobbers': '"memory"',
                 'opcodes': ['STORE'],
                 'insns': [_insn("STORE", branch_type="NONE",
                                 src=["REG_GPR5", "REG_SP"],
                                 dst=[],
-                                store_addr_deps=[["src_reg[1]"]],
-                                store_data_deps=[["src_reg[0]"]])]},
+                                store_addr_deps=[["REG_SP"]],
+                                store_data_deps=[["REG_GPR5"]])]},
     'mipsel':  {'asm': '"sw $t0, 0($sp)"', 'clobbers': '"memory"',
                 'opcodes': ['STORE'],
                 'insns': [_insn("STORE", branch_type="NONE",
                                 src=["REG_GPR8", "REG_SP"],
                                 dst=[],
-                                store_addr_deps=[["src_reg[1]"]],
-                                store_data_deps=[["src_reg[0]"]])]},
+                                store_addr_deps=[["REG_SP"]],
+                                store_data_deps=[["REG_GPR8"]])]},
 })
 
 # ============================================================================
@@ -1287,17 +1295,21 @@ _register_probe('probe_x86_rmw_direction', {'x86_64': {
     'clobbers': '"rax","cc","memory"',
     'opcodes': ['INT_ADD'],
     'insns': [
+        # Both forms address through (%rsp), so both masks name REG_SP.
+        # Declared by name rather than by slot: the store form used to
+        # say src_reg[1] on the premise that "the value reg walks
+        # first", which reindex_src_for_qemu() retired -- QEMU's list
+        # is seated at the head and the base is now slot 0 in BOTH
+        # forms.  The dependency never moved; only the ordering did.
         _insn("GEN_OP_INT_ADD",
               src=["REG_GPR0", "REG_SP"],
               dst=["REG_FLAGS"],
-              load_addr_deps=[["src_reg[1]"]],
-              store_addr_deps=[["src_reg[1]"]]),
-        # Load form: the MEM base walks first, so SP is src_reg[0]
-        # (the store form above walks the value reg first).
+              load_addr_deps=[["REG_SP"]],
+              store_addr_deps=[["REG_SP"]]),
         _insn("GEN_OP_INT_ADD",
               src=["REG_GPR0", "REG_SP"],
               dst=["REG_GPR0", "REG_FLAGS"],
-              load_addr_deps=[["src_reg[0]"]],
+              load_addr_deps=[["REG_SP"]],
               store_addr_deps=[],
               store_data_deps=[]),
     ]}})

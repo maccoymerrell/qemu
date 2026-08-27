@@ -21,7 +21,7 @@
  * it, and the difference is stated rather than smoothed over.  Where QEMU's
  * write provenance describes a destination in full the mask is QEMU's; where
  * it does not, the row keeps what the refiner wrote and is COUNTED by cause
- * -- QDEP_R_DST_UNSTATED_CONST, QDEP_R_DST_SELF, QDEP_R_DST_UNNAMED, each
+ * -- QDEP_R_DST_UNSTATED_CONST, QDEP_R_DST_UNNAMED, QDEP_R_DST_IMM_*, each
  * with the ruling or the missing mechanism that put it there.  That is a
  * shrinking work list with numbers attached, not a justification for the
  * remainder: qdep_report() prints every bucket on every run.
@@ -367,29 +367,6 @@ enum QDepState : uint8_t {
      * op stream exists.
      */
     QDEP_R_DST_IMM_FOLDED,
-    /*
-     * Destination family only.  QEMU's provenance for a destination names
-     * THAT DESTINATION, and R7.1 rules on exactly this:
-     *
-     *   "the fact that a register's upper contents may not be modified does
-     *    not imply it is a source AND a destination for the instruction
-     *    unless the instruction specifically takes it as a source."
-     *
-     * The emitter-stated model cannot answer "specifically takes it as a
-     * source", because a lowering that computes IN PLACE into the
-     * destination global reads that global whether the instruction does or
-     * not.  Witnessed, on a dump rather than argued -- riscv64 `flw fa0,
-     * 0(a6)` at 0x105d2 emits `nanbox_s(cpu_fpr[rd], cpu_fpr[rd])` and QEMU
-     * reports `w reg=f10/fa0 from=f10/fa0,L0`, so fa0 is in its own set for
-     * an instruction that takes no FP source at all.  Same shape on mipsel
-     * `lwc1`, aarch64 `ldrsb w1,[x2],#1` and x86 `mov %fs:0x610,%al`.
-     *
-     * A genuine accumulate -- `add %rax,%rbx` -- is indistinguishable from
-     * here, so the family refuses rather than guessing which self-reference
-     * is architectural.  The refiner's mask, which R7.1 adjudicated the
-     * tracer RIGHT on across 279 rows, is what stays.
-     */
-    QDEP_R_DST_SELF,
     QDEP_STATE_COUNT
 };
 

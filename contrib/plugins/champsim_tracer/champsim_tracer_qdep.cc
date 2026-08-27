@@ -165,6 +165,19 @@ std::atomic<uint64_t> g_dst_imm{0};
 std::atomic<uint64_t> g_dst_imm_feeds{0};
 std::atomic<uint64_t> g_dst_imm_absent{0};
 /*
+ * ACCUMULATES: destination slots published with the destination register in
+ * their own mask (#228).
+ *
+ * Counted because this population was a refusal until the emitter could say
+ * which self-reference is architectural, and a flip from "refused" to
+ * "published" that reports no number is a claim nobody can check.  Every row
+ * here is an instruction that takes its destination as a source -- R7's test
+ * says the regfile must respect the edge and R3 says the tracer does not
+ * elide it for being redundant.  The two shapes that are NOT this are gone
+ * before they reach here: see dst_precheck().
+ */
+std::atomic<uint64_t> g_dst_accum{0};
+/*
  * Every refused row by MNEMONIC and reason.  A refusal count that cannot say
  * WHICH instructions refused cannot be adjudicated, and an unadjudicated
  * refusal is a published all-inputs default nobody ever looks at again.  The
@@ -1141,15 +1154,33 @@ unsigned dst_precheck(const InsnFields *f, const QDepInsn *q,
             return QDEP_R_DST_UNNAMED;
         }
         /*
-         * R7.1's gate.  See QDEP_R_DST_SELF: a destination inside its own
-         * provenance is an in-place lowering as often as it is an
-         * accumulate, and nothing stated here separates them.
+         * A DESTINATION IN ITS OWN PROVENANCE IS NOW A DECISION AND NOT A
+         * DILEMMA, and this is where the old refusal stood.
+         *
+         * The two shapes it could not separate are separated at the emitter
+         * now.  An in-place LOWERING -- riscv64's `flw fa0,0(a6)` loading
+         * straight into cpu_fpr[rd] and NaN-boxing it there -- reads back a
+         * value THIS instruction produced, and df_written_prov() forwards
+         * that write's own provenance instead of naming the register, so the
+         * self-reference never arrives.  A narrow WRITEBACK -- `setne %al`,
+         * `mtc1` -- reads the register only to carry the bits it does not
+         * write, and insn_dataflow_note_preserve_read() says so at the
+         * writeback, so that read contributes nothing (R7.1: a register is a
+         * source when the INSTRUCTION takes it as one).
+         *
+         * What is left is the genuine accumulate: `add %rax,%rbx`, `push`
+         * and `pop` on RSP, `movk` on Xd, `lwl`/`lwr` merging into their
+         * destination, `cmovcc` preserving it on a false condition.  Every
+         * one of those is an edge a renaming regfile must respect (R7), and
+         * R3 forbids eliding a dependency because it looks redundant -- the
+         * tracer records it and a downstream simulator decides what to do
+         * with it.  So it PUBLISHES, and it is counted so the population is
+         * visible rather than assumed.
          */
         for (uint8_t z = 0; z < q->n_dst_dep_regs[k]; z++) {
             if (q->dst_dep_regs[k][z] == q->dst_reg[k]) {
-                g_snprintf(why, whysz, "%s in its own provenance",
-                           generic_reg_name_or_unknown(q->dst_reg[k]));
-                return QDEP_R_DST_SELF;
+                g_dst_accum.fetch_add(1, std::memory_order_relaxed);
+                break;
             }
         }
         /*
@@ -1409,7 +1440,6 @@ const char *state_name(unsigned s)
     case QDEP_R_DST_IMM_UNSTATED: return "refused: the instruction carries an immediate QEMU's provenance cannot mention, so a register-only mask would be short by the immediate bit";
     case QDEP_R_DST_IMM_UNSTATED_PATH: return "refused: the instruction carries an immediate NO DECODER ON ITS PATH STATES, so an absent immediate-provenance bit means nobody looked (#248 coverage)";
     case QDEP_R_DST_IMM_FOLDED: return "refused: the decoder stated this instruction's immediate and QEMU folded the value away before any op read it, so the absent bit is the emulator's optimisation";
-    case QDEP_R_DST_SELF:       return "refused: a destination is in its own provenance and R7.1 says only the INSTRUCTION's own source counts (in-place lowering)";
     default:                    return "?";
     }
 }
@@ -2082,6 +2112,16 @@ void qdep_report(GString *report)
         " (`ldr x0,[x1,#8]`)\n",
         g_dst_imm_feeds.load(std::memory_order_relaxed),
         g_dst_imm_absent.load(std::memory_order_relaxed));
+    g_string_append_printf(report,
+        "  %10" G_GUINT64_FORMAT "  destination SLOTS published with the DESTINATION"
+        " ITSELF in their mask:\n"
+        "              an accumulate, whose result depends on the"
+        " destination's prior value\n"
+        "               (R7/R3).  An in-place lowering's read-back and a"
+        " narrow writeback's\n"
+        "               preserve-read are struck out at QEMU's emitters and"
+        " are not in here\n",
+        g_dst_accum.load(std::memory_order_relaxed));
     for (unsigned s = 0; s < QDEP_STATE_COUNT; s++) {
         uint64_t v = g_wstate[s].load(std::memory_order_relaxed);
         if (v) {

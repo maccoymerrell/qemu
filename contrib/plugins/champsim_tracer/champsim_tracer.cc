@@ -3744,6 +3744,12 @@ struct AltMintStats {
     uint64_t depth_mints    = 0;  /* subset of mints from the depth>0 walk     */
     uint64_t skips_unmapped = 0;  /* target unmapped/undecodable              */
     uint64_t budget_hits    = 0;  /* mints skipped for the per-segment budget */
+    /* Every call into qemu_plugin_cap_decode() from the alternate path — the
+     * ONE Capstone consult the alternate templates are built from.  Counted
+     * at the call site and reported UNCONDITIONALLY, so a run that never
+     * enables minting still states the number rather than leaving the reader
+     * to infer a zero from a missing line. */
+    uint64_t cap_decodes    = 0;
 };
 static AltMintStats g_alt_mint;
 
@@ -3824,6 +3830,7 @@ static uint32_t alt_decode_one_bb(uint64_t pc,
             return 0;
         }
         qemu_plugin_insn_info info;
+        g_alt_mint.cap_decodes++;
         if (!qemu_plugin_cap_decode(cst_cap_arch, cst_cap_mode, p,
                                     (size_t)avail, at, &info)) {
             return 0;
@@ -11548,6 +11555,15 @@ static void plugin_exit(qemu_plugin_id_t id, void *p)
             g_alt_mint.budget_hits);
     }
 
+    /* UNCONDITIONAL, and that is the point.  alt_decode_one_bb() is the one
+     * place a correct-path capture could reach Capstone for a block the guest
+     * never ran; a line printed only when minting is on would be blind on the
+     * arm where the claim "it never fires" is actually made.  A default
+     * configuration reads 0 here, and reads it out loud. */
+    g_string_append_printf(report,
+        "Alternate-path Capstone decodes: %" PRIu64 "\n",
+        g_alt_mint.cap_decodes);
+
     qemu_plugin_outs(report->str);
 
     /* qemu_plugin_outs goes via qemu_log, whose target (stderr by
@@ -11963,6 +11979,61 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
      * never-executed fetch/decode space in user AND system mode alike.
      * static_depth=N (default) deepens that coverage from just the immediate
      * untaken side to its statically-known successors, N levels out. */
+    if (cfg.static_templates != 0) {
+        /* REFUSAL (a) — PROVENANCE.  The correct path builds its templates
+         * from QEMU's own ops: create_tb_template() carries insn_qdep[] and
+         * applies qdep_apply() (bb_template_cache.cc:1651), which is where the
+         * load-address, store-address and store-data dependency families take
+         * QEMU's answer.  The alternate path does not: commit_alt_bb()
+         * (bb_template_cache.cc:480) is handed InsnFields already filled in by
+         * decode_detail_to_generic() off a Capstone decode, and there is no
+         * second qdep_apply() call site.  Alternates therefore publish
+         * CAPSTONE's masks for exactly the families the correct path has
+         * flipped to QEMU — and they carry no wire flag (champsim_tracer.h),
+         * so a consumer reading the templates section cannot tell the two
+         * sources apart.
+         *
+         * That is a trace whose dependency provenance depends on which
+         * template a reader happens to land on, decided by an option.  No
+         * setting may change trace provenance implicitly, so this one refuses
+         * instead of doing it quietly.  The refusal lifts when the
+         * decode-on-demand facility replaces the Capstone alternate decode
+         * with a real translation, at which point alternates come from the
+         * same ops the correct path reads. */
+        fprintf(stderr,
+            "champsim_tracer: refusing to start — static_templates=1 would "
+            "put two dependency\n  sources in one templates section.  "
+            "Executed templates take their load-address,\n  store-address and "
+            "store-data dependencies from the ops QEMU emitted; a minted\n  "
+            "alternate is decoded by Capstone instead and never passes through "
+            "qdep_apply,\n  so it publishes Capstone's answer for those same "
+            "families.  Alternates carry no\n  wire flag, so nothing "
+            "downstream can separate them, and the trace would state a\n  "
+            "provenance it does not have.  Drop static_templates=1 (the "
+            "default) until the\n  never-executed path is minted from a real "
+            "translation.\n");
+        return -1;
+    }
+    if (cfg.static_templates != 0 && cst_cap_arch < 0) {
+        /* REFUSAL (b) — NO DECODER.  altmint_one() used to answer this case by
+         * returning false: a user who asked for never-executed coverage got a
+         * trace with none, and no word about it.  Silent degradation of an
+         * explicitly requested feature is its own defect, so it is a refusal
+         * now.
+         *
+         * ORDERING, deliberately: (a) is unconditional today and shadows this
+         * gate, so (b) cannot fire until (a) lifts.  It is written now, and
+         * placed AFTER (a), so that lifting (a) does not re-open the silent
+         * hole — not because the condition is thought unreachable.  A test of
+         * (b) has to remove (a) first. */
+        fprintf(stderr,
+            "champsim_tracer: refusing to start — static_templates=1 was asked "
+            "for, but this\n  guest ISA has no Capstone decoder in this "
+            "build, so no alternate could be\n  minted.  The capture would "
+            "run to completion and simply contain none of the\n  "
+            "never-executed coverage that was requested.\n");
+        return -1;
+    }
     g_features.alt_mint = (cfg.static_templates != 0);
     g_features.alt_depth = cfg.static_depth;
 

@@ -252,14 +252,18 @@ typedef struct InsnFields {
      * @has_reg_deps true -> encoder sets CST_INSN_FLAG_HAS_DEP_BLOCK
      * and appends n_dst + max_dep_stores ULEB masks; false (default)
      * -> consumers fall back to implicit all-to-all dataflow.
-     * Populated by the row's optional .dep_refine, which sets it only
-     * when it has an edge to state: publishing the all-to-all mask
-     * explicitly costs bytes to repeat what the reader already
-     * assumes, and cst_decode collapses the two cases to the same
-     * rendering (cst_decode_main.cc, `effective`).
+     *
+     * QEMU DECIDES THIS FLAG (R12).  qdep_apply() is its only real
+     * writer: the block exists when QEMU's emitters stated a dependency
+     * fact for the instruction -- a destination provenance it could
+     * state in full, or a store datum it could state in full.  The
+     * refiner writes a PROVISIONAL value into it (see
+     * @refiner_dep_stated) which survives only where qdep_apply() does
+     * not run at all, i.e. where there is no QEMU answer to prefer.
      *
      * THE TWO ARRAYS BELOW NO LONGER SHARE A SOURCE, although they
-     * still share this flag.  @dst_dep_mask is the refiner's.
+     * still share this flag.  @dst_dep_mask is QEMU's on every row
+     * QEMU could state and the refiner's on the named survivors.
      * @store_data_dep_mask is overwritten by qdep_apply() with the data
      * provenance QEMU's own store emitters stated -- or, where QEMU
      * could not state it in full, with the all-inputs default written
@@ -275,6 +279,29 @@ typedef struct InsnFields {
      * uint64_t so the imm bit fits when src + load slots stack up.
      */
     bool     has_reg_deps;
+    /*
+     * WHAT THE REFINER SAID, kept apart from what the wire does, so
+     * that Capstone can no longer DECIDE anything (R12) and no row it
+     * was right about is lost (R12.1).
+     *
+     * The refiner-mask test that used to write @has_reg_deps directly
+     * is unchanged in what it computes -- "these masks say something
+     * the reader's own all-to-all default does not" -- and changed
+     * completely in what it governs.  It now records only that the
+     * refiner had content, and qdep_apply() consults it in exactly one
+     * place: the NAMED-SURVIVOR route, for a row whose dependency facts
+     * QEMU cannot yet state.  Such a row publishes as it always did,
+     * counted by cause and by mnemonic, on a coverage list that
+     * shrinks as the emitters learn to state it; when that list empties
+     * this field and its consult go with it.
+     *
+     * It may never suppress a block QEMU's own facts call for.  That
+     * inversion -- the refiner deciding, qdep_apply() only able to FILL
+     * what the refiner had already chosen to emit -- is the defect R12
+     * closes, and champsim_tracer_qdep.h's QDEP_NO_BLOCK is the
+     * must-be-0 that says it has not come back.
+     */
+    bool     refiner_dep_stated;
     uint64_t *dst_dep_mask;         /* [n_dst_regs] */
     uint64_t *store_data_dep_mask;  /* [max_dep_stores] */
     /*

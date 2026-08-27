@@ -168,20 +168,33 @@
  * way.  One wire bit, `CST_DEP_BLOCK_HAS_REG`, governs `dst_dep[]` AND
  * `store_data_dep[]` together (docs/format.rst).  So:
  *
- *   - When the flag is already set, `store_data_dep[]` is overwritten here:
+ *   - `store_data_dep[]` is overwritten here whenever there is a store slot:
  *     with QEMU's mask when QEMU can state it, and otherwise with the
  *     all-inputs default written out explicitly.  No Capstone value survives
  *     in that field.
- *   - When the flag is CLEAR, the field is not on the wire at all and the
- *     consumer is already at the default.  Nothing is published and nothing
- *     needs to be: there is no Capstone answer there to displace.
  *
- * The destination half reads the same flag the same way, and neither half
- * SETS it: promoting a clear flag to carry a mask spends real wire bytes to
- * say what absence already says, and it would force the OTHER half of the
- * block to be written too.  The rows where QEMU could have stated a mask
- * that the flag left unpublished are COUNTED (QDEP_NO_BLOCK) in both
- * columns, so the size of that choice is a number rather than an argument.
+ * AND THE FLAG ITSELF IS SET HERE (R12).  It used to be the refiner's, set
+ * at template-construction time from Capstone's masks and read by both
+ * halves of this file as a precondition -- so a fact QEMU stated in full had
+ * no field to be written into unless Capstone had already decided to emit
+ * one.  qdep_apply() could FILL a block; it could not CAUSE one.  Measured,
+ * that inversion suppressed 15,763 QEMU-stated destination rows across four
+ * ISAs, took three `rep stosq` PCs' whole block away when their refiner mask
+ * collapsed to all-inputs, and left the encoded-immediate rule's decided
+ * rows undeliverable.
+ *
+ * The rule now is: the block exists when QEMU stated a dependency fact for
+ * the instruction -- a destination provenance stated in full, or a store
+ * datum stated in full.  Nothing Capstone says is an input to it.
+ *
+ * A row QEMU cannot yet state is NOT dropped.  It publishes exactly as it
+ * published before, as a NAMED SURVIVOR (R12.1: removing Capstone means zero
+ * information loss), counted per mnemonic under the cause that is also its
+ * coverage path.  That population is bounded, enumerated and shrinking; it
+ * is not a fallback rule and it is not an endpoint.  QDEP_NO_BLOCK, which
+ * used to hold the suppressed rows, is unreachable by construction, and the
+ * report's STATED-minus-CARRIED row is the must-be-0 that would catch the
+ * gate growing back.
  */
 #ifndef CHAMPSIM_TRACER_QDEP_H
 #define CHAMPSIM_TRACER_QDEP_H
@@ -284,11 +297,13 @@ enum QDepState : uint8_t {
      */
     QDEP_R_HELPER_UNSTATED,
     /*
-     * Data family only: QEMU stated the datum in full, but the wire's
-     * HAS_REG flag is clear for this instruction, so there is no field to
-     * write it into.  NOT a refusal -- the consumer is at the same default
-     * it would have reached -- and counted separately so the cost of not
-     * promoting the flag is a measured number.
+     * DEAD BY CONSTRUCTION SINCE R12, and kept so the name of the defect
+     * stays in the source.  It meant: QEMU stated the family in full, but
+     * the wire's HAS_REG flag was clear -- decided earlier, by the refiner
+     * -- so there was no field to write the answer into.  A QEMU fact now
+     * CAUSES the block, so nothing can reach this state; the report's
+     * STATED-minus-CARRIED row is the must-be-0 that says so with a number
+     * that could be otherwise.
      */
     QDEP_NO_BLOCK,
     /*

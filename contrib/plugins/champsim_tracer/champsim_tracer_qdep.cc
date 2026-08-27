@@ -219,6 +219,67 @@ std::atomic<uint64_t> g_dst_would_refuse_unbounded{0};
  */
 GHashTable *g_refusal_sig   = nullptr;   /* "mnem  reason" -> count */
 
+/* ==================================================================
+ * THE EMISSION CENSUS (R12 / R12.1)
+ *
+ * Per INSTRUCTION, not per slot: whether the HAS_REG block exists, and
+ * on whose authority.  The four buckets partition every instruction
+ * qdep_apply() decided for, so they sum to that population and a row
+ * cannot hide between them.
+ * ================================================================== */
+/* QEMU stated a dependency fact -- a destination provenance it could state
+ * in full, or a store datum it could state in full -- and the block exists
+ * because of that.  This is R12's rule and it is the only rule. */
+std::atomic<uint64_t> g_blk_qemu{0};
+/* QEMU stated nothing this instruction could carry, and the refiner had
+ * content.  The block publishes exactly as it published before the flip:
+ * a NAMED SURVIVOR under R12.1, on the coverage list dumped by mnemonic
+ * and cause below.  Never a default, never a drop, never an endpoint. */
+std::atomic<uint64_t> g_blk_survivor{0};
+/* Neither side had anything.  No block, and the format's own all-to-all
+ * over-approximation is what the consumer reads -- which is what it read
+ * before, for the same rows. */
+std::atomic<uint64_t> g_blk_absent{0};
+/* A QEMU-caused block (its store data is QEMU's) on an instruction whose
+ * DESTINATION slots QEMU could not state, so those slots still carry the
+ * refiner's masks.  Counted apart because such a block's two halves come
+ * from two sources and a consumer cannot tell which is which -- these are
+ * survivors too, and they are on the same coverage list. */
+std::atomic<uint64_t> g_blk_mixed{0};
+/*
+ * The same shape with no refiner answer either: the destination slots go out
+ * as the format's own all-inputs default, written out.  Not a survivor --
+ * there is nothing surviving -- and not a loss, because that default is
+ * bit-for-bit what the consumer read when the block did not exist.
+ */
+std::atomic<uint64_t> g_blk_mixed_default{0};
+/*
+ * THE MUST-BE-0, AND IT IS A DIFFERENCE RATHER THAN A TAUTOLOGY.
+ *
+ * @g_fact_stated counts a QEMU dependency fact where it is ESTABLISHED --
+ * once in apply_dst() for a destination family it wrote in full, once in
+ * the store-data tail for a datum it stated with a slot to state it in.
+ * @g_fact_carried counts the same facts where they are CONSUMED, inside
+ * decide_block(), on the branch that turns the block on.  Equal by
+ * construction only while every path through qdep_apply() ends in
+ * decide_block(); an early return that skips it -- which is precisely the
+ * shape of the gate R12 deleted, and precisely how it would come back --
+ * leaves a fact stated and not carried, and the difference is non-zero.
+ *
+ * Written as two counters and not one flag because a counter that can only
+ * be incremented next to the line that makes it impossible proves nothing.
+ */
+std::atomic<uint64_t> g_fact_stated{0};
+std::atomic<uint64_t> g_fact_carried{0};
+/*
+ * The named-survivor list itself: every surviving row by MNEMONIC and by
+ * the reason QEMU could not state it, which IS the coverage path -- the
+ * reason names the emitter or the decoder that has to learn to state the
+ * fact for the row to stop surviving.  R12.1 requires the census to exist;
+ * this is it.
+ */
+GHashTable *g_survivor_sig  = nullptr;   /* "mnem  reason" -> count */
+
 const char *state_name(unsigned s);
 
 void tally(GHashTable **t, const char *key)
@@ -265,6 +326,22 @@ void note_refusal(const char *mnem, unsigned st, const char *fam,
                               (detail && *detail) ? " -- " : "",
                               (detail && *detail) ? detail : "");
     tally(&g_refusal_sig, k);
+    g_free(k);
+}
+
+/*
+ * One named survivor, keyed the way the refusal census is keyed, because the
+ * reason a row survives IS the reason QEMU could not state it.  A survivor
+ * whose cause cannot be named is a survivor nobody can retire, and R12.1's
+ * "shrinking coverage work list" would be a phrase rather than a list.
+ */
+void note_survivor(const char *mnem, unsigned st, const char *detail)
+{
+    char *k = g_strdup_printf("%-10s %s%s%s", mnem ? mnem : "?",
+                              state_name(st),
+                              (detail && *detail) ? " -- " : "",
+                              (detail && *detail) ? detail : "");
+    tally(&g_survivor_sig, k);
     g_free(k);
 }
 
@@ -1305,15 +1382,16 @@ unsigned dst_precheck(const InsnFields *f, const QDepInsn *q,
             }
         }
     }
-    if (!f->has_reg_deps) {
-        /*
-         * The flag is clear, so dst_dep[] is not on the wire at all and the
-         * consumer is already at the all-inputs default.  Counted apart so
-         * the cost of not promoting the flag is a number -- and the prefix
-         * is not seated for it, because nothing will name those registers.
-         */
-        return QDEP_NO_BLOCK;
-    }
+    /*
+     * THE GATE THAT STOOD HERE IS DELETED (R12).  It read
+     * `if (!f->has_reg_deps) return QDEP_NO_BLOCK;` -- the refiner's answer,
+     * asked before QEMU's was known, and it discarded a destination
+     * provenance this function had just proved complete on 15,763 rows
+     * across four ISAs.  Whether the block exists is decided at the end of
+     * qdep_apply() from what QEMU stated; this function's job is only to say
+     * whether QEMU stated it.  QDEP_NO_BLOCK survives as the must-be-0 that
+     * catches the inversion coming back.
+     */
     return QDEP_OK;
 }
 
@@ -1378,15 +1456,15 @@ static uint64_t qdep_move_mask(const InsnFields *f, uint64_t m)
  * not with this flip.  The surviving population is counted by cause and by
  * mnemonic so the size of the decision is a measurement.
  */
-void apply_dst(InsnFields *f, const QDepInsn *q, const char *mnem,
+bool apply_dst(InsnFields *f, const QDepInsn *q, const char *mnem,
                unsigned wstate, const char *why)
 {
     if (wstate != QDEP_OK) {
-        if (wstate != QDEP_NONE && wstate != QDEP_NO_BLOCK) {
+        if (wstate != QDEP_NONE) {
             note_refusal(mnem, wstate, "dst  ", why);
         }
         g_wstate[wstate].fetch_add(1, std::memory_order_relaxed);
-        return;
+        return false;
     }
     /*
      * THE DESTINATION LIST IS STILL THE OPERAND WALK'S, and this is the one
@@ -1441,7 +1519,7 @@ void apply_dst(InsnFields *f, const QDepInsn *q, const char *mnem,
             note_refusal(mnem, QDEP_R_UNREPRESENTABLE, "dst  ", w2);
             g_wstate[QDEP_R_UNREPRESENTABLE]
                 .fetch_add(1, std::memory_order_relaxed);
-            return;
+            return false;
         }
         if (m == 0) {
             /*
@@ -1516,6 +1594,12 @@ void apply_dst(InsnFields *f, const QDepInsn *q, const char *mnem,
                              qdep_move_mask(f, m) : m;
     }
     g_wstate[QDEP_OK].fetch_add(1, std::memory_order_relaxed);
+    if (f->n_dst_regs == 0) {
+        /* Nothing was stated about anything; the pass is vacuous. */
+        return false;
+    }
+    g_fact_stated.fetch_add(1, std::memory_order_relaxed);
+    return true;
 }
 
 const char *state_name(unsigned s)
@@ -1540,6 +1624,100 @@ const char *state_name(unsigned s)
     case QDEP_R_DST_IMM_FOLDED: return "refused: the decoder stated this instruction's immediate and QEMU folded the value away before any op read it, so the absent bit is the emulator's optimisation";
     default:                    return "?";
     }
+}
+
+/*
+ * WHETHER THE DEPENDENCY BLOCK EXISTS.  QEMU DECIDES (R12).
+ *
+ *   "WE ARE REMOVING CAPSTONE.  WHY ARE WE LETTING CAPSTONE DECIDE THIS?"
+ *
+ * The rule is one line: a block exists when QEMU stated a dependency fact
+ * for this instruction.  @qemu_dst is that fact for the destination family
+ * -- dst_precheck() proved every wire destination has a QEMU write row and
+ * apply_dst() wrote every slot's mask from it -- and @qemu_sdata is that
+ * fact for the store-data family, QEMU's provenance for every store slot.
+ * Neither reads a Capstone mask; the refiner's answer is not an input to
+ * this decision and there is no "either side" arm.
+ *
+ * WHAT SURVIVES, AND WHY IT IS NOT AN EITHER-SIDE ARM (R12.1).
+ *
+ *   "Removing capstone does not mean an acceptance of degradation in our
+ *    trace.  We should lose NO information.  This whole ARC is about using
+ *    QEMU to derive the information we were getting from Capstone.  Do not
+ *    use this ruling as a justification for dropping information out of the
+ *    trace, because I know you will try to."
+ *
+ * A row QEMU cannot yet state is a row whose content nothing has adjudicated
+ * wrong.  Dropping its block would widen a real, published dependency set to
+ * the all-to-all default and call the widening a removal, which is exactly
+ * the move that ruling forbids.  So it publishes as it always did, and the
+ * difference from an either-side rule is that this population is BOUNDED,
+ * ENUMERATED and NAMED: @why is the reason QEMU could not state the row,
+ * which is also the coverage path that retires it, and every survivor lands
+ * in g_survivor_sig under its mnemonic and that reason.  The list shrinks as
+ * the emitters learn to state those facts; when it is empty this route and
+ * InsnFields::refiner_dep_stated are deleted.  It is an interim state with a
+ * direction, not an endpoint.
+ *
+ * ONE THING IT MAY NEVER DO is suppress a block QEMU's facts call for -- the
+ * survivor test is consulted only where @qemu_dst and @qemu_sdata are both
+ * false.  g_blk_qemu_unpublished is the must-be-0 that says so.
+ */
+void decide_block(InsnFields *f, bool qemu_dst, bool qemu_sdata,
+                  const char *mnem, unsigned wstate, const char *why)
+{
+    if (qemu_dst || qemu_sdata) {
+        f->has_reg_deps = true;
+        g_fact_carried.fetch_add((qemu_dst ? 1u : 0u) + (qemu_sdata ? 1u : 0u),
+                                 std::memory_order_relaxed);
+        if (!qemu_dst && f->n_dst_regs) {
+            /*
+             * The store datum is QEMU's and the destinations are not, so
+             * this block's two halves have two sources.
+             *
+             * AND THE DESTINATION HALF MUST STILL SAY SOMETHING TRUE.  A
+             * block that exists publishes every destination slot, and the
+             * bytes sitting in dst_dep_mask[] are not automatically an
+             * answer: where no refiner ever wrote them they are the array's
+             * zero initialisation, and publishing zero says "this
+             * destination depends on nothing", which is a CLAIM and a false
+             * one.  Measured on the three `rep stosq` PCs, whose block the
+             * store leg restores: RDI and RCX would have gone out as EMPTY.
+             * The block existing is a gain; a fabricated narrow mask riding
+             * in with it is not, and R12.1 no more permits inventing content
+             * than dropping it.
+             *
+             * So the two cases are separated.  A refiner that STATED the
+             * destinations keeps them -- that is the survivor clause, the
+             * content is what it always was, and nothing is lost.  A row
+             * with no stated destination answer publishes the format's own
+             * all-inputs default WRITTEN OUT, exactly as the store-data half
+             * does in the mirror-image case: the consumer reads precisely
+             * what it read when there was no block, so the destination half
+             * carries no new information and no false information either.
+             */
+            if (!f->refiner_dep_stated) {
+                for (uint8_t d = 0; d < f->n_dst_regs; d++) {
+                    f->dst_dep_mask[d] = all_inputs_mask(f);
+                }
+                g_blk_mixed_default.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                g_blk_mixed.fetch_add(1, std::memory_order_relaxed);
+                note_survivor(mnem, wstate, why);
+            }
+        } else {
+            g_blk_qemu.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
+    if (f->refiner_dep_stated) {
+        f->has_reg_deps = true;
+        g_blk_survivor.fetch_add(1, std::memory_order_relaxed);
+        note_survivor(mnem, wstate, why);
+        return;
+    }
+    f->has_reg_deps = false;
+    g_blk_absent.fetch_add(1, std::memory_order_relaxed);
 }
 
 }  /* namespace */
@@ -1822,6 +2000,13 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
          * operand walk left them: zeroing them here would gut every memory
          * annotation in the trace to say something this file did not learn.
          * The disablement itself is reported by name in qdep_report().
+         *
+         * has_reg_deps keeps the provisional value dep_publish() left in it.
+         * This is the one regime where the refiner's answer reaches the wire
+         * as a DECISION, and it is not R12's rule bending: R12 gives the
+         * block to QEMU's facts, and here QEMU stated no facts at all -- for
+         * any instruction, for the whole run.  Dropping every block instead
+         * would be the degradation R12.1 forbids, taken for no gain.
          */
         g_state[QDEP_NONE].fetch_add(1, std::memory_order_relaxed);
         g_dstate[QDEP_NONE].fetch_add(1, std::memory_order_relaxed);
@@ -1926,14 +2111,22 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
              */
             f->has_addr_deps = false;
             g_state[QDEP_R_REINDEX].fetch_add(1, std::memory_order_relaxed);
+            g_dstate[QDEP_R_REINDEX].fetch_add(1, std::memory_order_relaxed);
+            note_refusal(mnem, QDEP_R_REINDEX, "dst  ", nullptr);
+            g_wstate[QDEP_R_REINDEX].fetch_add(1, std::memory_order_relaxed);
+            /*
+             * QEMU stated nothing this row can carry, so the block is the
+             * survivor route's if the refiner had content.  The store masks
+             * are still widened to the default where one publishes: their
+             * Capstone value may not reach the wire (fb92a61ea4), and that
+             * widening predates this flip rather than arriving with it.
+             */
+            decide_block(f, false, false, mnem, QDEP_R_REINDEX, nullptr);
             if (f->has_reg_deps) {
                 for (uint8_t st = 0; st < f->max_dep_stores; st++) {
                     f->store_data_dep_mask[st] = all_inputs_mask(f);
                 }
             }
-            g_dstate[QDEP_R_REINDEX].fetch_add(1, std::memory_order_relaxed);
-            note_refusal(mnem, QDEP_R_REINDEX, "dst  ", nullptr);
-            g_wstate[QDEP_R_REINDEX].fetch_add(1, std::memory_order_relaxed);
             return;
         }
     }
@@ -1959,7 +2152,12 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
             g_state[QDEP_NONE].fetch_add(1, std::memory_order_relaxed);
             g_dstate[QDEP_NONE].fetch_add(1, std::memory_order_relaxed);
         }
-        apply_dst(f, q, mnem, wstate, wwhy);
+        /*
+         * No store slots, so the store-data family states nothing here and
+         * the destination family is the whole question.
+         */
+        decide_block(f, apply_dst(f, q, mnem, wstate, wwhy), false,
+                     mnem, wstate, wwhy);
         return;
     }
 
@@ -2086,10 +2284,16 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
     /* ---------------- the store-data half of HAS_REG ---------------- */
 
     if (mds_new == 0) {
-        /* No store slot: no store_data_dep[] array exists to write. */
+        /* No store slot: no store_data_dep[] array exists to write, so the
+         * store leg states no fact and the destinations are the whole
+         * question.  This exit is the one the STATED-minus-CARRIED row
+         * caught on its first run -- 3,031/1,270/1,486/1,593 facts
+         * established here and never carried to a decision -- which is the
+         * proof that row is a measurement and not a tautology. */
         g_dstate[dstate == QDEP_OK ? QDEP_NONE : dstate]
             .fetch_add(1, std::memory_order_relaxed);
-        apply_dst(f, q, mnem, wstate, wwhy);
+        decide_block(f, apply_dst(f, q, mnem, wstate, wwhy), false,
+                     mnem, wstate, wwhy);
         return;
     }
 
@@ -2140,31 +2344,20 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
         }
     }
 
-    if (!f->has_reg_deps) {
-        /*
-         * The HAS_REG flag is clear, so store_data_dep[] is not on the wire
-         * and the consumer is already at the all-inputs default.  Nothing to
-         * displace and nothing to write -- see champsim_tracer_qdep.h on why
-         * the flag is not promoted to carry a mask.  Counted in two buckets
-         * so the report can say how much precision that costs: QDEP_NO_BLOCK
-         * where QEMU HAD an answer, the refusal reason where it did not.
-         */
-        if (dstate != QDEP_OK) {
-            note_refusal(mnem, dstate, "sdata(HAS_REG clear, unpublished)",
-                         dwhy);
-        }
-        g_dstate[dstate == QDEP_OK ? QDEP_NO_BLOCK : dstate]
-            .fetch_add(1, std::memory_order_relaxed);
-        apply_dst(f, q, mnem, wstate, wwhy);
-        return;
-    }
-
     /*
+     * THE GATE THAT STOOD HERE IS DELETED (R12).  It read
+     * `if (!f->has_reg_deps) { ...; return; }` -- the refiner's answer,
+     * asked before QEMU's was known, and it threw away a store datum QEMU
+     * had stated in full because Capstone had chosen not to emit a block.
+     * A store datum QEMU can state IS a dependency fact, so it now CAUSES
+     * the block instead of needing one to already exist.
+     *
      * Written either way, and that is the point.  When QEMU stated the datum
      * the mask is QEMU's; when it could not, the mask is the format's own
      * all-inputs default written out.  What never happens is the Capstone
      * mask staying where it is -- a family whose source has flipped may not
-     * have rows still quietly carrying the old one.
+     * have rows still quietly carrying the old one.  Writing on a row that
+     * ends up with no block costs nothing: the array is not serialised.
      */
     for (uint8_t k = 0; k < mds_new; k++) {
         f->store_data_dep_mask[k] =
@@ -2174,8 +2367,17 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
         note_refusal(mnem, dstate, "sdata", dwhy);
     }
     g_dstate[dstate].fetch_add(1, std::memory_order_relaxed);
+    if (dstate == QDEP_OK && mds_new > 0) {
+        g_fact_stated.fetch_add(1, std::memory_order_relaxed);
+    }
 
-    apply_dst(f, q, mnem, wstate, wwhy);
+    /*
+     * The store leg states a fact only when there is a slot to state it in:
+     * `dstate` is vacuously QDEP_OK on an instruction with loads and no
+     * stores, and a vacuous pass is not a fact about anything.
+     */
+    decide_block(f, apply_dst(f, q, mnem, wstate, wwhy),
+                 dstate == QDEP_OK && mds_new > 0, mnem, wstate, wwhy);
 }
 
 void qdep_report(GString *report)
@@ -2208,7 +2410,61 @@ void qdep_report(GString *report)
         "which is the one place a Capstone answer still reaches the wire;\n"
         "it is counted by cause and by mnemonic below, because widening\n"
         "that remainder to the default is a decision that belongs with the\n"
-        "numbers for it and not with the flip.\n");
+        "numbers for it and not with the flip.\n"
+        "\n"
+        "WHETHER THE BLOCK EXISTS AT ALL IS ALSO QEMU'S (R12).  It exists\n"
+        "when QEMU stated a dependency fact for the instruction -- a\n"
+        "destination provenance or a store datum it could state in full.\n"
+        "The refiner's masks are not an input to that decision.  A row QEMU\n"
+        "cannot yet state publishes exactly as it did before, as a NAMED\n"
+        "SURVIVOR (R12.1: removing Capstone loses NO information), listed\n"
+        "below by mnemonic and by the cause that is also its coverage path.\n");
+
+    {
+        uint64_t bq = g_blk_qemu.load(std::memory_order_relaxed);
+        uint64_t bs = g_blk_survivor.load(std::memory_order_relaxed);
+        uint64_t bm = g_blk_mixed.load(std::memory_order_relaxed);
+        uint64_t bmd = g_blk_mixed_default.load(std::memory_order_relaxed);
+        uint64_t ba = g_blk_absent.load(std::memory_order_relaxed);
+        uint64_t fs = g_fact_stated.load(std::memory_order_relaxed);
+        uint64_t fc = g_fact_carried.load(std::memory_order_relaxed);
+
+        g_string_append_printf(report,
+            "\nthe HAS_REG block's EXISTENCE, per instruction (R12):\n"
+            "  %10" G_GUINT64_FORMAT "  QEMU stated a dependency fact and the block"
+            " carries it\n"
+            "  %10" G_GUINT64_FORMAT "  the same, with DESTINATION slots QEMU could not"
+            " state, which keep\n"
+            "              the refiner's masks -- one block, two sources, and"
+            " a survivor row\n"
+            "  %10" G_GUINT64_FORMAT "  the same with no refiner answer either: the"
+            " destination slots go out\n"
+            "              as the format's own all-inputs default, written"
+            " out.  Publishing the\n"
+            "               array's zero initialisation instead would claim"
+            " those destinations\n"
+            "               depend on nothing, which is a fabrication and not"
+            " a default\n"
+            "  %10" G_GUINT64_FORMAT "  NAMED SURVIVORS: QEMU stated nothing this row"
+            " could carry and the\n"
+            "              refiner had content, so it publishes as it always"
+            " did (R12.1).\n"
+            "               Every one is on the coverage list below; the list"
+            " shrinks, and\n"
+            "               when it empties this route is deleted\n"
+            "  %10" G_GUINT64_FORMAT "  no block: neither side had anything, consumer"
+            " at the format's\n"
+            "               own all-to-all over-approximation\n"
+            "  %10" G_GUINT64_FORMAT "  QEMU facts STATED minus CARRIED -- MUST BE 0."
+            "  A fact established\n"
+            "              and not carried is an emission gate standing"
+            " between them, which\n"
+            "               is the defect R12 deleted (it read 15,763"
+            " destination rows on\n"
+            "               the four-ISA workload).  %" G_GUINT64_FORMAT " stated,"
+            " %" G_GUINT64_FORMAT " carried\n",
+            bq, bm, bmd, bs, ba, fs - fc, fs, fc);
+    }
 
     g_string_append(report, "\naddress families (HAS_ADDR):\n");
     g_string_append_printf(report,
@@ -2346,6 +2602,8 @@ void qdep_report(GString *report)
                "globals a provenance named that have no generic word\n(per ACCESS, so an instruction refused on both an address and a datum\ncounts twice here and once above):");
     dump_tally(report, g_refusal_sig,
                "refused rows by mnemonic and reason (the format default,\nwritten out; `count` means the SLOT COUNT went to zero):");
+    dump_tally(report, g_survivor_sig,
+               "NAMED SURVIVORS by mnemonic and cause (R12.1) -- rows whose dep\nblock exists because the refiner had content QEMU cannot yet state.\nThe cause IS the coverage path: it names the emitter or decoder that\nhas to state the fact for the row to leave this list.  Nothing here is\ndropped, widened to a default, or refused as an endpoint:");
     dump_tally(report, g_monitor_name,
                "reservation-monitor value globals a store's datum named\n(the emulation-artefact category, #177 / f46873a738 -- NOT a decoder gap):");
     dump_tally(report, g_dst_unmapped_name,

@@ -4450,6 +4450,13 @@ def _check_static_reg_sets(
 ) -> list[Issue]:
     """Compare template src/dst register IDs to Capstone ground truth.
 
+    ONE-DIRECTIONAL ON THE SOURCE SIDE since the source list stopped
+    being Capstone's (R12).  A source Capstone names and the wire lacks
+    is still an error; sources the wire carries beyond Capstone's set
+    are QEMU-stated provenance registers, counted and named in the
+    summary rather than failed.  The destination side is unchanged --
+    that list IS still the operand walk's.
+
     Comparison is **by symbolic name** (REG_FLAGS, REG_PC, …) rather
     than numeric GenericRegId.  The trace's own ENCODINGS section
     supplies the per-trace `gen_id → name` mapping in
@@ -4490,6 +4497,8 @@ def _check_static_reg_sets(
     n_checked = 0
     n_errors = 0
     n_skipped = 0
+    n_surplus = 0
+    surplus_regs: set[str] = set()
     err_cap = 20
 
     def add(out: set[str], cap_id: int) -> None:
@@ -4653,6 +4662,39 @@ def _check_static_reg_sets(
             n_checked += 1
             if actual_src == exp_src and actual_dst == exp_dst:
                 continue
+            #
+            # THE SOURCE LIST IS NOT CAPSTONE'S ANY MORE, AND THIS CHECK
+            # IS A CAPSTONE ORACLE (R12 / J7).
+            #
+            # `src_regs[]` carries QEMU's own named registers at its head:
+            # the registers QEMU's emitters stated in a destination's or a
+            # datum's provenance are seated there so the masks written from
+            # that provenance have slots to point at.  Some of those are
+            # registers Capstone's operand walk and implicit arrays never
+            # list -- x86 `inc`/`dec` reading EFLAGS, because the result's
+            # CF is computed from the prior CF; `cmov` reading its own
+            # destination, because a false condition preserves it.  Those
+            # are edges a renaming regfile must respect (R7) and R3 forbids
+            # eliding them, so the wire is right and the expectation is
+            # short.
+            #
+            # The check keeps ALL of its power in the direction that would
+            # be information loss, and gives up exactly the direction that
+            # is a gain:
+            #
+            #   a Capstone-named source the wire does NOT carry  -> ERROR
+            #   a Capstone-named destination mismatch            -> ERROR
+            #   sources the wire carries and Capstone does not   -> counted
+            #
+            # It is counted and NAMED, per register, in the summary below,
+            # so the surplus is a number that can be read and adjudicated
+            # rather than a silence.  A blanket "extras are fine" would
+            # retire the oracle; this does not.
+            #
+            if actual_dst == exp_dst and exp_src < actual_src:
+                n_surplus += 1
+                surplus_regs.update(actual_src - exp_src)
+                continue
             n_errors += 1
             if n_errors <= err_cap:
                 issues.append(Issue(
@@ -4675,9 +4717,18 @@ def _check_static_reg_sets(
     issues.append(Issue(
         "static_reg_sets", "info",
         f"static register sets: ok={n_checked - n_errors} "
-        f"checked={n_checked} skipped={n_skipped} errors={n_errors}",
+        f"checked={n_checked} skipped={n_skipped} errors={n_errors} "
+        f"qemu_surplus_src={n_surplus}"
+        + (" [" + ",".join(sorted(surplus_regs)) + "]" if surplus_regs
+           else ""),
         {"checked": n_checked, "skipped": n_skipped,
-         "errors": n_errors},
+         "errors": n_errors, "qemu_surplus_src": n_surplus,
+         "qemu_surplus_regs": sorted(surplus_regs),
+         # Printed in full whenever it has an occupant, so the rows this
+         # check stopped failing are a number in every log rather than a
+         # silence.  A count that only lives in a detail dict nobody reads
+         # is the same as no count at all.
+         "notable": n_surplus > 0},
     ))
     return issues
 

@@ -3669,6 +3669,17 @@ over-approximation: every dst / store depends on every src / load.
 Consumers that don't model intra-instruction dataflow can ignore
 the block.
 
+The block is present on an instruction whose dependency facts the
+emulator's own emitters stated: a destination provenance stated in
+full, or a store datum stated in full.  A published mask that happens
+to equal the all-to-all default is therefore not a contradiction --
+it is the emulator saying so explicitly, and it reads the same to a
+consumer as the absent block does.  Where the emulator cannot yet
+state a row, the block still appears with whatever the instruction's
+decoder classification supplied, so a consumer never loses a
+dependency set it used to receive; those rows are counted per
+mnemonic and cause in the writer's own statistics report.
+
 Vector lane masks
 ^^^^^^^^^^^^^^^^^
 

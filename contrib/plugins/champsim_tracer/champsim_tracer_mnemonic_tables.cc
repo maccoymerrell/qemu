@@ -29,8 +29,11 @@ extern "C" {
  *
  * Each refiner reads what the generic operand-walk and any optional
  * `.refine` callback left in @f, then populates the dep masks and
- * trips has_reg_deps.  The bit layout for every mask matches the
- * wire-format spec:
+ * records, through dep_publish(), that it had content to state.
+ * WHETHER A BLOCK IS EMITTED IS NOT DECIDED HERE -- qdep_apply()
+ * decides it from QEMU's own facts (R12), and consults the refiner's
+ * record only on the named-survivor route (R12.1).  The bit layout for
+ * every mask matches the wire-format spec:
  *
  *   bits [0,             n_src_regs)                     src_reg[i]
  *   bits [n_src_regs,    n_src_regs + max_dep_loads)     load_data[i]
@@ -53,15 +56,51 @@ extern "C" {
  * regfile correctness).
  *
  * THERE IS NO FALLBACK REFINER.  A refiner that cannot state an edge
- * returns without setting has_reg_deps, and the row publishes no
- * dependency block -- which the format already defines as the
- * all-to-all over-approximation.  The catch-all that used to write
+ * returns without calling dep_publish(), so it contributes no survivor
+ * content; whether the row publishes a block is then entirely QEMU's
+ * answer, and where QEMU has none the format's own all-to-all
+ * over-approximation is what the consumer reads.  The catch-all that used to write
  * that mask out by hand was measured to publish exactly the reader's
  * own default on every decode it was ever reached with, so it spent
  * bytes to say nothing (cst_runs/p3/arc3/w11/VERDICT.md).
  * ==================================================================== */
 
 /*
+ * RECORD THAT THE REFINER HAD CONTENT.  IT NO LONGER DECIDES (R12).
+ *
+ * "Are we not removing Capstone?  I don't understand this question at all.
+ *  WE ARE REMOVING CAPSTONE.  WHY ARE WE LETTING CAPSTONE DECIDE THIS?"
+ *
+ * This function used to write InsnFields::has_reg_deps, and writing it here
+ * meant the dependency block's EXISTENCE was decided by the refiner's masks
+ * -- at template-construction time, before qdep_apply() had run.  qdep_apply()
+ * could then only FILL a block the refiner had already chosen to emit, never
+ * CAUSE one, so a fact QEMU stated in full had no field to be written into if
+ * Capstone's answer happened to be degenerate.  Measured on the workload that
+ * suppressed 15,763 QEMU-stated destination rows across four ISAs, took the
+ * three `rep stosq` PCs' whole block away when their refiner mask collapsed to
+ * all-inputs (#254), left the encoded-immediate rule's 1,931 decided rows
+ * undeliverable (#248) and made a zero-register destination block unemittable
+ * on three ISAs.
+ *
+ * So the DECISION is gone from here and lives in qdep_apply(), on QEMU's own
+ * facts.  What is left is a RECORD: this row's refiner had something to say.
+ * The test below is byte-for-byte the test that used to gate the wire, kept
+ * exactly because R12.1 forbids losing what it was right about --
+ *
+ *   "Removing capstone does not mean an acceptance of degradation in our
+ *    trace.  We should lose NO information."
+ *
+ * -- so a row QEMU cannot yet state publishes exactly as it published before,
+ * as a NAMED SURVIVOR counted by cause and by mnemonic in qdep_report().  The
+ * survivor list is a coverage list and it shrinks; when it empties, this
+ * function and the field it writes are deleted with it.
+ *
+ * has_reg_deps is also written here, as a PROVISIONAL value, for the one
+ * regime where qdep_apply() never runs at all: no dataflow ABI, no QEMU
+ * answer to prefer, and the refiner's is the only one there is.  Every path
+ * through qdep_apply() overwrites it.
+ *
  * PUBLISH, UNLESS THE ONLY THING THE MASKS SAY IS THE READER'S OWN DEFAULT.
  *
  * docs/format.rst: "Absence of ``CST_INSN_FLAG_HAS_DEP_BLOCK`` is the
@@ -107,12 +146,14 @@ static bool dep_publish(InsnFields *f)
 
     for (uint8_t d = 0; d < f->n_dst_regs && d < MAX_DST_REGS; d++) {
         if (f->dst_dep_mask[d] != all_inputs) {
+            f->refiner_dep_stated = true;
             f->has_reg_deps = true;
             return true;
         }
     }
     for (uint8_t s = 0; s < f->max_dep_stores && s < MAX_STORES; s++) {
         if (f->store_data_dep_mask[s] != all_inputs) {
+            f->refiner_dep_stated = true;
             f->has_reg_deps = true;
             return true;
         }
@@ -150,7 +191,7 @@ static bool dep_publish(InsnFields *f)
  *             src_regs=[base, index?])
  *     → store_data[0] depends on imm
  *
- * Bails (leaves has_reg_deps=false → no HAS_REG block on the wire)
+ * Bails (states no refiner content, so the block is QEMU's call alone)
  * for shapes outside this behavior group; the audit-side classifier
  * is responsible for not pointing a multi-output or fan-out insn id
  * at dep_passthrough in the first place.
@@ -376,7 +417,8 @@ void dep_x86_stack_push(const struct qemu_plugin_insn_info *info,
          * (docs/format.rst: "Absence of CST_INSN_FLAG_HAS_DEP_BLOCK is the
          * implicit all-to-all over-approximation"), so writing that mask out
          * explicitly only spends bytes restating the reader's own default.
-         * Leave has_reg_deps false and return.
+         * State no refiner content and return; whether a block
+         * exists is QEMU's answer (R12).
          */
         return;
     }
@@ -488,7 +530,8 @@ void dep_x86_stack_pop(const struct qemu_plugin_insn_info *info,
          * (docs/format.rst: "Absence of CST_INSN_FLAG_HAS_DEP_BLOCK is the
          * implicit all-to-all over-approximation"), so writing that mask out
          * explicitly only spends bytes restating the reader's own default.
-         * Leave has_reg_deps false and return.
+         * State no refiner content and return; whether a block
+         * exists is QEMU's answer (R12).
          */
         return;
     }
@@ -754,7 +797,8 @@ void dep_vec_struct_store(const struct qemu_plugin_insn_info *info,
          * (docs/format.rst: "Absence of CST_INSN_FLAG_HAS_DEP_BLOCK is the
          * implicit all-to-all over-approximation"), so writing that mask out
          * explicitly only spends bytes restating the reader's own default.
-         * Leave has_reg_deps false and return.
+         * State no refiner content and return; whether a block
+         * exists is QEMU's answer (R12).
          */
         return;
     }
@@ -776,7 +820,8 @@ void dep_vec_struct_store(const struct qemu_plugin_insn_info *info,
          * (docs/format.rst: "Absence of CST_INSN_FLAG_HAS_DEP_BLOCK is the
          * implicit all-to-all over-approximation"), so writing that mask out
          * explicitly only spends bytes restating the reader's own default.
-         * Leave has_reg_deps false and return.
+         * State no refiner content and return; whether a block
+         * exists is QEMU's answer (R12).
          */
         return;
     }

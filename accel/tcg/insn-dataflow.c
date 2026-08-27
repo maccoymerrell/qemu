@@ -88,12 +88,17 @@
 #define DF_MAX_ALIAS_NOTES    64
 /*
  * Zero-register operands stated by an emitter (insn_dataflow_note_zero_reg).
- * One per zero-register operand an instruction reads, so a TB of nothing but
- * `sd x0` reaches one per instruction; past the cap the notes stop and a
- * store taken after is marked unnoted rather than published with its data
- * operand missing.
+ * One per zero-register operand an instruction reads, PER INSTRUCTION -- the
+ * note carries an anchor and is deduplicated against it, so a TB of nothing
+ * but `add a0,a1,x0` takes one note per instruction rather than one for the
+ * whole block.  Sized for the block: INSN_DF_MAX_INSNS instructions, two
+ * zero-register operands each (`addu rd,$zero,$zero` is the shape that needs
+ * two).  Past the cap the notes stop, a store taken after is marked unnoted
+ * rather than published with its data operand missing, and a WRITE taken
+ * after is reported as an incomplete extraction rather than published with
+ * an empty provenance that would read as "came from nowhere".
  */
-#define DF_MAX_ZERO_NOTES     256
+#define DF_MAX_ZERO_NOTES     1024
 /*
  * Folded-register operands stated by an emitter (insn_dataflow_note_folded_reg).
  * One per such operand a block resolves.  Two emitters state them, both x86's:
@@ -183,6 +188,34 @@ typedef struct DfAliasNote {
     const void *alias_ts;
     const void *real_ts;
 } DfAliasNote;
+
+/*
+ * CP-M, the zero-register half: one temp an emitter is handing on in place of
+ * the architectural zero register, and the op the emitter had last produced
+ * when it said so.
+ *
+ * THE ANCHOR IS WHAT MAKES THE NOTE A FACT ABOUT ONE INSTRUCTION.  On RISC-V
+ * the accessor hands back `ctx->zero`, which is `tcg_constant_tl(0)` -- the
+ * same interned temp every constant zero in the block resolves to.  A note
+ * carrying only that temp says "somewhere in this TB a zero register was
+ * read", which is enough for the memop path, where the note is searched over
+ * the prefix taken before an access and the only way a store's data temp can
+ * BE that constant is for its data operand to have been the zero register.
+ *
+ * It is NOT enough for a register WRITE.  Every instruction writes something,
+ * and on any target a constant zero reaches an ordinary op for reasons that
+ * have nothing to do with the zero register.  Without an anchor the first
+ * `add a0,a1,x0` in a block would put the zero register in the provenance of
+ * every later write in it -- a fabricated dependency, and the one error
+ * direction this extractor may not take.  The anchor is the op the emitter
+ * had produced when the note was taken, so the walk can bound the notes to
+ * the instruction whose op range reached them, exactly as the memop cursor
+ * bounds its own.
+ */
+typedef struct DfZeroNote {
+    const void *ts;
+    const TCGOp *anchor;
+} DfZeroNote;
 
 /* CP-H: one per helper call, carrying what tcg_gen_callN had and the op lost. */
 typedef struct DfHelperNote {
@@ -371,7 +404,7 @@ struct InsnDataflowScratch {
      * is one architectural zero register per target, so which one it is never
      * has to be carried.
      */
-    const void *zero[DF_MAX_ZERO_NOTES];
+    DfZeroNote zero[DF_MAX_ZERO_NOTES];
     unsigned n_zero;
     bool zero_overflow;
 
@@ -619,6 +652,15 @@ static void df_emit_prov(FILE *f, const uint64_t *pv, unsigned nregs)
             const char *rn = insn_dataflow_reg_name(b, NULL, NULL);
 
             fprintf(f, "%s%s", k++ ? "," : "", rn ? rn : "?");
+        } else if (b == INSN_DF_ZERO_PROV_BIT) {
+            /*
+             * The architectural zero register.  Rendered because a dump that
+             * cannot show a fact the record carries reads as the record not
+             * carrying it -- which is exactly how this line came to be
+             * written: the bit was reaching writes[].prov and the dump said
+             * `from=x10/a0`, naming one of two sources.
+             */
+            fprintf(f, "%sZERO", k++ ? "," : "");
         } else if (insn_dataflow_prov_memop(b, &slot)) {
             fprintf(f, "%sL%u", k++ ? "," : "", slot);
         } else {
@@ -1130,19 +1172,35 @@ static void df_prov_add_temps(uint64_t *dst, const void *tsv, unsigned n)
 
 /*
  * Is any of the @n consecutive temps at @tsv one the emitter named as the
- * architectural zero register, among the first @scope notes?
+ * architectural zero register, among the notes in [@lo, @hi)?
  *
- * @scope is the count taken when the access's own note was recorded, so a
- * zero-register operand read by a LATER instruction cannot name this store's
- * data -- the same discipline the address aliases use, for the same reason.
+ * The two callers want two different windows and both are half-open ranges
+ * over the same append-ordered list.
+ *
+ * THE MEMOP PATH passes [0, note->zero_n): the count taken when the access's
+ * own note was recorded, so a zero-register operand read by a LATER
+ * instruction cannot name this store's data -- the same discipline the
+ * address aliases use, for the same reason.  It does not need the lower bound
+ * because a store's data temp cannot be the shared constant for any reason
+ * other than its data operand having been the zero register.
+ *
+ * THE WRITE PATH passes the window of notes taken INSIDE the instruction
+ * being walked, and needs the lower bound for the reason DfZeroNote's comment
+ * gives: a write is not a store, an ordinary op reaches a constant zero for
+ * reasons of its own, and a prefix window would let one instruction's zero
+ * register reach every write after it.
  */
-static bool df_zero_reg_temp(const void *tsv, unsigned n, unsigned scope)
+static bool df_zero_reg_temp(const void *tsv, unsigned n,
+                             unsigned lo, unsigned hi)
 {
     const TCGTemp *ts = (const TCGTemp *)tsv;
 
+    if (hi > df_n_zero) {
+        hi = df_n_zero;
+    }
     for (unsigned i = 0; i < n; i++) {
-        for (unsigned k = 0; k < scope && k < df_n_zero; k++) {
-            if (df_zero[k] == (const void *)(ts + i)) {
+        for (unsigned k = lo; k < hi; k++) {
+            if (df_zero[k].ts == (const void *)(ts + i)) {
                 return true;
             }
         }
@@ -1301,7 +1359,7 @@ static int df_memop_apply(InsnDataflow *d, bool store, unsigned *cursor)
              * from nowhere" for an instruction whose encoding names where it
              * came from.  See insn_dataflow_note_zero_reg().
              */
-            if (df_zero_reg_temp(n->val_ts, n->nval, n->zero_n)) {
+            if (df_zero_reg_temp(n->val_ts, n->nval, 0, n->zero_n)) {
                 df_bit(m->data_prov, INSN_DF_ZERO_PROV_BIT);
             } else if (n->zero_dropped) {
                 /*
@@ -1367,9 +1425,20 @@ static void df_settle_memop_prov(const InsnDataflow *d, size_t lo, size_t hi)
     }
 }
 
-/* Walk one instruction's ops: [first, end). */
+/*
+ * Walk one instruction's ops: [first, end).
+ *
+ * @marker is the INDEX_op_insn_start op that opens this instruction, which is
+ * NOT in [first, end) -- the driver hands the range starting one op later.
+ * The zero-register notes need it: an emitter states one from inside a
+ * trans_* function, and the common shape is `get_gpr(ctx, a->rs1)` on the
+ * first line, before the instruction has emitted an op of its own, so the op
+ * the note anchors to is this instruction's insn_start and nothing inside the
+ * range would ever match it.
+ */
 static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
-                    unsigned *memop_cursor)
+                    const TCGOp *marker, unsigned *memop_cursor,
+                    unsigned *zero_cursor)
 {
     TCGContext *s = tcg_ctx;
     TCGTemp *env_ts = tcgv_ptr_temp(tcg_env);
@@ -1385,6 +1454,19 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
      * the extraction's own time, for a scan that could not find anything.
      */
     size_t tlo = TCG_MAX_TEMPS, thi = 0;
+    /*
+     * The zero-register notes belonging to THIS instruction: [zero_lo,
+     * *zero_cursor).  The cursor is the block's, advanced past a note once
+     * the op it anchors to has been walked -- the same discipline the memop
+     * cursor runs under -- and the low bound freezes what earlier
+     * instructions already claimed.  See DfZeroNote on why a write may not be
+     * resolved against a prefix.
+     */
+    unsigned zero_lo = *zero_cursor;
+
+    while (*zero_cursor < df_n_zero && df_zero[*zero_cursor].anchor == marker) {
+        (*zero_cursor)++;
+    }
 
     for (TCGOp *op = first; op != end; op = QTAILQ_NEXT(op, link)) {
         const TCGOpDef *def = &tcg_op_defs[op->opc];
@@ -1403,6 +1485,10 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
         while (prev_op != NULL && *memop_cursor < df_n_memop &&
                df_memop[*memop_cursor].anchor == prev_op) {
             (*memop_cursor)++;
+        }
+        while (prev_op != NULL && *zero_cursor < df_n_zero &&
+               df_zero[*zero_cursor].anchor == prev_op) {
+            (*zero_cursor)++;
         }
         prev_op = op;
 
@@ -1954,6 +2040,24 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
             if (df_reg(ts, &idx)) {
                 df_bit(d->rd, idx);
                 df_bit(prov, idx);
+            } else if (df_zero_reg_temp(ts, 1, zero_lo, *zero_cursor)) {
+                /*
+                 * The architectural ZERO REGISTER, stated by the accessor
+                 * that resolved the operand.  Its temp holds a constant, so
+                 * the walk above put NOTHING in @prov and a write fed by it
+                 * would arrive at a consumer as a value that came from
+                 * nowhere -- which for a destination is indistinguishable
+                 * from the instruction's own immediate, and R7.3 rules that
+                 * the register the encoding names is not the emulator's to
+                 * drop.  The bit goes in the provenance and not in @d->rd:
+                 * the read set is indexed by TCG global and this register has
+                 * none, which is the whole reason it needs a bit of its own.
+                 *
+                 * Bounded to the notes this instruction took.  See
+                 * DfZeroNote -- a prefix would name the zero register in
+                 * every write after the first instruction that read it.
+                 */
+                df_bit(prov, INSN_DF_ZERO_PROV_BIT);
             }
         }
 
@@ -2040,6 +2144,10 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
     while (prev_op != NULL && *memop_cursor < df_n_memop &&
            df_memop[*memop_cursor].anchor == prev_op) {
         (*memop_cursor)++;
+    }
+    while (prev_op != NULL && *zero_cursor < df_n_zero &&
+           df_zero[*zero_cursor].anchor == prev_op) {
+        (*zero_cursor)++;
     }
     df_settle_memop_prov(d, tlo, thi);
 }
@@ -2149,20 +2257,27 @@ void insn_dataflow_note_memop(const void *val_ts, unsigned nval,
  * header for why the note is taken at the accessor and not at the access.
  *
  * The list is append-only for the translation and is searched by temp
- * identity, scoped to the notes taken before the access being resolved.  On
- * two of the three targets the accessor returns a FRESH temp, so identity is
- * exact; on RISC-V it returns ctx->zero, which is tcg_constant_tl(0) and
- * therefore the same temp every constant zero in the block resolves to.  What
- * that costs is bounded and it is bounded in the harmless direction: the only
- * way a store's data temp can BE that constant is for its data operand to
- * have come from get_gpr(ctx, 0), because no RISC-V store takes an immediate
- * datum.  A wrong attribution here would name a register that is architec-
- * turally present and never written -- an edge no renaming regfile can stall
- * on -- and the Capstone shadow in the plugin scores every published row, so
- * the claim is measured rather than asserted.
+ * identity within a window of notes.  On two of the three targets the
+ * accessor returns a FRESH temp, so identity is exact; on RISC-V it returns
+ * ctx->zero, which is tcg_constant_tl(0) and therefore the same temp every
+ * constant zero in the block resolves to -- which is why the note carries the
+ * op the emitter had last produced when it was taken.  See DfZeroNote: the
+ * anchor is what lets a register WRITE be resolved against the notes of its
+ * OWN instruction, and without it the shared constant would carry one
+ * instruction's zero register into every write after it.
+ *
+ * The anchor is taken unconditionally, including for a constant temp.  The
+ * folded-register notes leave it NULL there, because a constant is interned
+ * by value and no op can redefine it, so a note about one cannot go stale.
+ * That reasoning is about STALENESS and does not transfer: here the anchor is
+ * not guarding against a later write to the temp, it is recording WHICH
+ * INSTRUCTION said the word, and a constant temp is exactly the case where
+ * two instructions can say it about the same temp.
  */
 void insn_dataflow_note_zero_reg(const void *ts)
 {
+    const TCGOp *anchor;
+
     if (df_disabled()) {
         return;
     }
@@ -2171,17 +2286,28 @@ void insn_dataflow_note_zero_reg(const void *ts)
         df_zero_overflow = true;
         return;
     }
+    anchor = QTAILQ_LAST(&tcg_ctx->ops);
     /*
-     * Deduplicated, because the RISC-V accessor returns one shared temp and
-     * an undeduplicated list would fill with copies of it and then overflow,
-     * turning a fact the extractor holds into a refusal it does not need.
+     * Deduplicated against the NEWEST note only, and on the PAIR.  The RISC-V
+     * accessor returns one shared temp, so an undeduplicated list would fill
+     * with copies of it and then overflow, turning a fact the extractor holds
+     * into a refusal it does not need -- but deduplicating on the temp ALONE,
+     * which is what this did until the anchor existed, collapses every
+     * instruction's statement into the first one's and leaves the write path
+     * with a single block-wide note it cannot attribute to anybody.
+     *
+     * Newest-first rather than any-match, for DfFoldNote's reason: the same
+     * temp restated under a different anchor is a different fact.
      */
-    for (unsigned i = 0; i < df_n_zero; i++) {
-        if (df_zero[i] == ts) {
+    for (unsigned i = df_n_zero; i-- > 0; ) {
+        if (df_zero[i].ts == ts && df_zero[i].anchor == anchor) {
             return;
         }
+        break;
     }
-    df_zero[df_n_zero++] = ts;
+    df_zero[df_n_zero].ts = ts;
+    df_zero[df_n_zero].anchor = anchor;
+    df_n_zero++;
 }
 
 /*
@@ -2463,8 +2589,10 @@ void insn_dataflow_extract(unsigned num_insns)
 {
     TCGContext *s = tcg_ctx;
     TCGOp *op, *first = NULL;
+    const TCGOp *marker = NULL;
     unsigned idx = 0;
     unsigned memop_cursor;
+    unsigned zero_cursor;
     bool prof;
     int64_t t0;
 
@@ -2495,13 +2623,15 @@ void insn_dataflow_extract(unsigned num_insns)
      * translation belongs to one context.
      */
     memop_cursor = 0;
+    zero_cursor = 0;
 
     QTAILQ_FOREACH(op, &s->ops, link) {
         if (op->opc != INDEX_op_insn_start) {
             continue;
         }
         if (first != NULL && idx > 0) {
-            df_insn(&df_out[idx - 1], first, op, &memop_cursor);
+            df_insn(&df_out[idx - 1], first, op, marker, &memop_cursor,
+                    &zero_cursor);
             df_apply_gvec_notes(&df_out[idx - 1], first, op);
         }
         if (idx >= num_insns) {
@@ -2509,10 +2639,17 @@ void insn_dataflow_extract(unsigned num_insns)
             break;
         }
         idx++;
+        /*
+         * The op that OPENS this instruction, kept because an emitter states
+         * a zero-register note before the instruction has emitted an op of
+         * its own and the note then anchors here.  See df_insn().
+         */
+        marker = op;
         first = QTAILQ_NEXT(op, link);
     }
     if (first != NULL && idx > 0) {
-        df_insn(&df_out[idx - 1], first, NULL, &memop_cursor);
+        df_insn(&df_out[idx - 1], first, NULL, marker, &memop_cursor,
+                &zero_cursor);
         df_apply_gvec_notes(&df_out[idx - 1], first, NULL);
     }
     df_ninsns = idx;
@@ -2643,7 +2780,20 @@ bool insn_dataflow_prov_memop(unsigned bit, unsigned *slot)
 
 bool insn_dataflow_prov_truncated(void)
 {
-    return df && df_slots_overflow;
+    /*
+     * Block-wide, and deliberately over-broad: both flags say a provenance
+     * somewhere in this translation is missing a member it should carry, and
+     * neither can say which instruction.  An over-broad refusal is the
+     * direction that costs a consumer precision; a per-instruction guess
+     * would cost it a dependency.
+     *
+     * @df_zero_overflow is the zero-register notes' cap.  A write whose
+     * source operand was the architectural zero register would arrive with an
+     * empty provenance, which for a destination reads as "the value is a
+     * constant" -- exactly the claim that cannot be supported once a note has
+     * been dropped.
+     */
+    return df && (df_slots_overflow || df_zero_overflow);
 }
 
 /*

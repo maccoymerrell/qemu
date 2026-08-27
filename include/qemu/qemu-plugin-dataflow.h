@@ -425,7 +425,7 @@ typedef struct qemu_plugin_dataflow_status {
     uint32_t n_mem_writes;
     uint8_t  fields_truncated;  /* more fields than could be recorded */
     uint8_t  writes_truncated;  /* more writes than could carry provenance */
-    uint8_t  prov_truncated;    /* provenance lost a field to slot exhaustion */
+    uint8_t  prov_truncated;    /* a provenance lost a member to an array cap */
     /*
      * How much of this instruction's HELPER work is stated and how much is
      * standing in for it -- QEMU_PLUGIN_DF_HELPER_*.  An instruction that

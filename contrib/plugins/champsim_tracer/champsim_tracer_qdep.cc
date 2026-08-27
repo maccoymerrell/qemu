@@ -83,6 +83,32 @@ GHashTable *g_monitor_name  = nullptr;   /* reservation-monitor global -> count 
  */
 GHashTable *g_dst_unmapped_name = nullptr;
 /*
+ * A register QEMU DID give this file a generic word for, stated as WRITTEN
+ * by an instruction whose destination family is published -- and which the
+ * wire's own destination list does not carry.
+ *
+ * This is the direction of the two lists' disagreement that nothing counted.
+ * dst_precheck() covers the other one: a wire destination with no QEMU write
+ * row refuses the whole family (QDEP_R_DST_UNNAMED).  Its mirror was
+ * silently dropped, and a silently dropped population is one nobody can say
+ * is empty.  It is NOT empty: on the four-ISA workload it is 212 rows, and
+ * every one of them names REG_IP.
+ *
+ * REG_IP IS EXCLUDED ON PURPOSE, AND THE EXCLUSION IS THE POINT.  A
+ * translation block ends by writing the program counter, and QEMU attributes
+ * that write to whichever instruction happened to be last -- `lw` at 0x4fffe
+ * on mipsel is a page-final load, not a jump.  R2 and R3/J2.3 say a QEMU
+ * lowering is not the machine in the direction that DROPS an architectural
+ * fact; the same reading forbids ADDING one, so the PC write does not become
+ * a destination of a load.  Counted apart from the rest so that the claim
+ * "the exclusion is exactly one named class" is a measurement and the OTHER
+ * count is the tripwire: a non-REG_IP row here is a destination the machine
+ * writes and the wire does not name.
+ */
+GHashTable *g_dst_wire_missing = nullptr;   /* "mnem  REG" -> count */
+std::atomic<uint64_t> g_dst_wire_missing_pc{0};
+std::atomic<uint64_t> g_dst_wire_missing_other{0};
+/*
  * Every refused row by MNEMONIC and reason.  A refusal count that cannot say
  * WHICH instructions refused cannot be adjudicated, and an unadjudicated
  * refusal is a published all-inputs default nobody ever looks at again.  The
@@ -919,6 +945,36 @@ void apply_dst(InsnFields *f, const QDepInsn *q, const char *mnem,
         g_wstate[wstate].fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    /*
+     * THE DESTINATION LIST IS STILL THE OPERAND WALK'S, and this is the one
+     * place that can see it.  The masks below are QEMU's and are written in
+     * a source coordinate system QEMU owns; which SLOT each one belongs to,
+     * and how many slots exist, is `dst_regs[]` -- and that comes from the
+     * walk.  Counted here rather than argued about: see g_dst_wire_missing.
+     */
+    for (uint8_t k = 0; k < q->n_dst; k++) {
+        bool on_wire = false;
+
+        for (uint8_t d = 0; d < f->n_dst_regs; d++) {
+            if (f->dst_regs[d] == q->dst_reg[k]) {
+                on_wire = true;
+                break;
+            }
+        }
+        if (on_wire) {
+            continue;
+        }
+        if (q->dst_reg[k] == REG_IP) {
+            g_dst_wire_missing_pc.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            char *key = g_strdup_printf("%-10s %s", mnem ? mnem : "?",
+                                        generic_reg_name_or_unknown(
+                                            q->dst_reg[k]));
+            tally(&g_dst_wire_missing, key);
+            g_free(key);
+            g_dst_wire_missing_other.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     for (uint8_t d = 0; d < f->n_dst_regs; d++) {
         uint8_t k;
         uint64_t m = 0;
@@ -1531,6 +1587,31 @@ void qdep_report(GString *report)
         if (v) {
             g_string_append_printf(report, "  %10" G_GUINT64_FORMAT
                                    "  %s\n", v, state_name(s));
+        }
+    }
+    {
+        uint64_t pc_only = g_dst_wire_missing_pc.load(std::memory_order_relaxed);
+        uint64_t other = g_dst_wire_missing_other.load(std::memory_order_relaxed);
+
+        g_string_append_printf(report,
+            "\n  the wire's destination LIST against QEMU's writes, on the\n"
+            "  rows above that PUBLISHED (the direction dst_precheck does not\n"
+            "  cover -- `dst_regs[]` is still the operand walk's, and a mask\n"
+            "  seated on QEMU's coordinates does not change that):\n"
+            "  %10" G_GUINT64_FORMAT "  QEMU wrote REG_IP and the wire's list does not"
+            " carry it\n"
+            "              (a block ends by writing the pc and QEMU charges"
+            " that write to\n"
+            "               whichever instruction was last: a lowering, not"
+            " the machine)\n"
+            "  %10" G_GUINT64_FORMAT "  QEMU wrote some OTHER named register the wire"
+            " does not carry\n"
+            "              (MUST BE 0 -- a destination the machine writes and"
+            " the wire\n"
+            "               does not name)\n", pc_only, other);
+        if (other) {
+            dump_tally(report, g_dst_wire_missing,
+                       "  by mnemonic and register:");
         }
     }
     if (g_refusal) {

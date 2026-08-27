@@ -131,6 +131,39 @@
  * `swr`'s published store address on a stricter reading of the field than
  * the field has ever had -- measured, one row.
  *
+ * WHAT THE DESTINATION FAMILY'S COORDINATE SYSTEM IS, AND WHAT IT IS NOT.
+ * The paragraph above is about the bits INSIDE a mask, and it holds for
+ * `dst_dep[]` as it does for the other three: `qemu_named_regs()` seats the
+ * destinations' provenance into the prefix whenever the family will publish,
+ * so a published destination's inputs are named in a run QEMU decides.  It
+ * was MEASURED to hold -- under `QEMU_CAP_MUTATE=access`, keyed per
+ * destination REGISTER, 0 of 6,035 published rows on the four-ISA workload
+ * name a different input set.
+ *
+ * The mask ARRAY is a different question and it has a different answer.
+ * `dst_dep[d]` belongs to `dst_regs[d]`, and `dst_regs[]` is the operand
+ * walk's: which register a slot is for, and how many slots exist, is
+ * Capstone's answer and no seating inside this file changes that.  Witnessed
+ * rather than inferred -- riscv64 `c.mv` at 0x103ba, bytes `ae84`.  QEMU
+ * says the write is to x9 in both arms; corrupt Capstone's operand access
+ * flags and the wire's destination becomes x11, the roles of the two
+ * registers exchanged.  The family then refuses (QDEP_R_DST_UNNAMED,
+ * because QEMU has no write row for x11) and publishes the refiner's mask
+ * for a register the instruction does not write.  On the same arm 945
+ * published destinations leave the wire and 484 arrive, against 44 mask
+ * movements -- so a reading that scores the whole ARRAY attributes the
+ * LIST's movement to the MASK, which is the reading the first split of this
+ * family took.
+ *
+ * That flip is the admission half for this family, the analogue of what the
+ * access count became for the address families, and it is not taken here
+ * because taking it would LOSE rows: replacing `dst_regs[]` with QEMU's
+ * write list drops every destination QEMU names only as a CPUArchState byte
+ * range, which is the env-word gap, and the failure direction forbids
+ * dropping a destination the machine writes.  The other direction -- what
+ * QEMU writes and the wire's list does not carry -- is counted by
+ * qdep_report() and is one named class, the block-final pc write.
+ *
  * THE HAS_REG FLAG IS SHARED, and that bounds both halves of it the same
  * way.  One wire bit, `CST_DEP_BLOCK_HAS_REG`, governs `dst_dep[]` AND
  * `store_data_dep[]` together (docs/format.rst).  So:

@@ -4745,10 +4745,25 @@ class QemuIdent:
 
     @property
     def pattern(self) -> str:
-        """The rule's own name, unqualified."""
-        if "/" not in self.name:
-            return self.name
-        return self.name.split("/", 1)[1]
+        """The rule's own trans_ name, unqualified.
+
+        Both qualifications are stripped: the decode function in front,
+        and the pattern's own fixed bits behind.  decodetree appends the
+        bits wherever one trans_ function is reached from several
+        patterns -- riscv reaches trans_addi() from C.ADDI4SPN, C.ADDI,
+        C.LI, C.ADDI16SP and C.MV -- so the rows are distinct rules with
+        distinct ids while still naming the same QEMU function, and it is
+        that function name a Capstone mnemonic is matched against.
+        """
+        name = self.name if "/" not in self.name else self.name.split("/", 1)[1]
+        return name.split("@", 1)[0]
+
+    @property
+    def bits(self) -> str:
+        """The pattern's own fixed bits, or "" where the rule is the only
+        one reaching its trans_ function and needed no disambiguation."""
+        _, sep, bits = self.name.partition("@")
+        return bits if sep else ""
 
 
 def parse_x86_identities() -> list[QemuIdent]:

@@ -33,6 +33,7 @@ variablewidth = False
 ident_export = True
 ident_index = {}
 ident_rows = []
+ident_multi = {}
 fields = {}
 arguments = {}
 formats = {}
@@ -180,7 +181,26 @@ def ident_qual_name(pat):
        decoders tried in sequence and a bare pattern name is not unique
        across them (aarch64 runs disas_a64, disas_sme and disas_sve over
        the same 32 bits).  It is a property of the .decode sources, not
-       of a build, so a table keyed on it survives a QEMU rebuild."""
+       of a build, so a table keyed on it survives a QEMU rebuild.
+
+       Qualified AGAIN by the pattern's own fixed bits wherever one
+       trans_ function is reached from several patterns, because those
+       patterns are several DECODE RULES and not one.  A trans_ name is
+       an implementation detail of the translator -- riscv reaches
+       trans_addi() from five insn16 patterns that are C.ADDI4SPN,
+       C.ADDI, C.LI, C.ADDI16SP and C.MV, and aarch64 reaches trans_STP()
+       from the writeback form and the plain form -- and a consumer told
+       those are one identity has been told something QEMU does not
+       believe.  The bit pattern is what the .decode file states and what
+       the decoder matched on, so it is the same kind of fact as the name
+       and just as stable across a rebuild.
+
+       Names reached from exactly one pattern keep the bare form: a
+       qualification that says nothing is noise in every consumer's
+       table, and the overwhelming majority of rows are in that case."""
+    if ident_multi.get(pat.name, 0) > 1:
+        bits = str_match_bits(pat.fixedbits, pat.fixedmask).replace(' ', '')
+        return decode_function + '/' + pat.name + '@' + bits
     return decode_function + '/' + pat.name
 
 
@@ -198,34 +218,48 @@ def ident_hash(text):
 
 
 def build_ident_index():
-    """Give each distinct pattern name one row in this decoder's identity
-       table.  A pattern name can occur at several places in the decode
-       tree; those are the same instruction identity and share a row."""
+    """Give each distinct decode RULE one row in this decoder's identity
+       table.
+
+       A rule is a pattern, not a trans_ function.  Where several
+       patterns reach one trans_ function they are separate rules with
+       separate rows -- see ident_qual_name for why -- and the index is
+       therefore keyed by the qualified name, which is what distinguishes
+       them.  Two patterns that agree on BOTH the trans_ name and the
+       fixed bits are the same rule stated twice and do share a row."""
     global ident_index
     global ident_rows
+    global ident_multi
+    ident_multi = {}
+    for p in allpatterns:
+        ident_multi[p.name] = ident_multi.get(p.name, 0) + 1
     ident_index = {}
     ident_rows = []
     seen = {}
     for p in allpatterns:
-        if p.name in ident_index:
-            continue
         qual = ident_qual_name(p)
+        if qual in ident_index:
+            continue
         h = ident_hash(qual)
         if h in seen:
             error(p.lineno, 'decode identity hash collision between ',
                   seen[h], ' and ', qual)
         seen[h] = qual
-        ident_index[p.name] = len(ident_rows)
+        ident_index[qual] = len(ident_rows)
         ident_rows.append(p)
 
 
 def output_ident_table():
     output('/*\n'
-           ' * QEMU\'s own identity for each pattern in this decoder, handed\n'
-           ' * to plugins by plugin_gen_record_insn_identity() at the dispatch\n'
-           ' * site below.  The name is qualified by the decode function, so it\n'
-           ' * is unique across a target\'s decoders and stable across rebuilds;\n'
-           ' * the id is FNV-1a 32 of that name, so it is stable too.\n'
+           ' * QEMU\'s own identity for each decode RULE in this decoder,\n'
+           ' * handed to plugins by plugin_gen_record_insn_identity() at the\n'
+           ' * dispatch site below.  The name is qualified by the decode\n'
+           ' * function, so it is unique across a target\'s decoders, and by\n'
+           ' * the pattern\'s own fixed bits wherever one trans_ function is\n'
+           ' * reached from several patterns, because those are several rules\n'
+           ' * and not one.  Both halves are properties of the .decode source,\n'
+           ' * so the name is stable across rebuilds; the id is FNV-1a 32 of\n'
+           ' * that name, so it is stable too.\n'
            ' */\n')
     output('static const struct {\n'
            '    uint32_t id;\n'
@@ -685,7 +719,7 @@ class Pattern(General):
             # translation-dominated workload with a 0.01% run-to-run
             # spread.  The per-site form pays for it in .text, +12KB on
             # aarch64 (+0.25%).  Evidence: cst_runs/p3/arc3/dtid/COST3.txt.
-            idx = str(ident_index[self.name])
+            idx = str(ident_index[ident_qual_name(self)])
             output(ind, 'if (', translate_prefix, '_', self.name,
                    '(ctx, &u.f_', arg, ')) {'
                    ' plugin_gen_record_insn_identity(',

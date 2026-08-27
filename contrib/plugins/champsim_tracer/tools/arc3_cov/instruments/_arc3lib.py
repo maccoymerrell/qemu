@@ -22,6 +22,24 @@ ISAS = ("x86_64", "aarch64", "riscv64", "mipsel")
 #: unless the control moved in the same run.
 ARMS = ("implic", "memdir", "access", "mnem__")
 
+#: THE DESTINATION FAMILY'S ARMS, and they are not the same list (#249).
+#: `mnem__` cannot serve here: blanking the opcode taxonomy makes the refiner
+#: emit no dep block at all, so on aarch64 / riscv64 / mipsel the control arm
+#: had no subject and every dst zero on those ISAs was unquotable.  Two arms
+#: replace it and between them they partition the wire's destination
+#: population by SOURCE:
+#:
+#:   dstmsk  the CONTROL.  Moves the mask at the line that publishes it, so
+#:           its subject is every destination QEMU's provenance decided.
+#:   refmsk  a TEST arm.  Moves the REFINER's mask in the window before
+#:           qdep_apply() overwrites it, so its subject is every destination
+#:           the wire still takes from Capstone.
+#:
+#: The two are disjoint and exhaustive by construction, which is a standing
+#: self-check: their mover counts must sum to the scored row count.
+DST_ARMS = ("implic", "memdir", "access", "refmsk", "dstmsk")
+DST_CONTROL = "dstmsk"
+
 #: The four published dependency families.
 DEP_FAMILIES = ("dst_dep", "store_data_dep", "load_addr_dep", "store_addr_dep")
 
@@ -79,6 +97,28 @@ def require_subject(rows, label, reasons):
     if not rows:
         reasons.append("VACUITY FAILURE: %s -- the arm produced 0 rows.  An "
                        "empty side is a FAILURE, never a floor." % label)
+        return False
+    return True
+
+
+def require_overlap(rows, label, reasons):
+    """Record a vacuity failure when a comparison scored no shared subject.
+
+    THE SECOND FLOOR, one level below require_subject() (#249).  An arm can
+    produce a file full of rows and still share not one PC with the
+    reference -- measured, and not hypothetically: under the `access`
+    mutation the aarch64 and mipsel destination lists empty and refill with
+    a disjoint set, so the reference's 882 / 1,555 PCs and the arm's 457 /
+    959 intersect in ZERO.  The scorer printed `rows=0 name_moved=0` for
+    those cells, which passes require_subject() (the file is not empty) and
+    reads exactly like a clean inert arm.  A comparison whose scored
+    population is empty is a comparison with no subject, whatever the file
+    sizes were.
+    """
+    if rows == 0:
+        reasons.append("VACUITY FAILURE: %s -- the arm and the reference "
+                       "share no PC, so 0 rows were scored.  A comparison "
+                       "with an empty intersection is not a zero." % label)
         return False
     return True
 

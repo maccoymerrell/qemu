@@ -47,14 +47,59 @@ count by 219x.
 
 ## The control arm, and what an empty one hides
 
-`score_families.py` and `score_dst.py` both require the `mnem__` control to
-have moved something: a battery whose dependency columns are all zero says
-nothing unless something in the same run moved.  Under the `mnem` mutation
-on aarch64, riscv64 and mipsel every instruction is an unknown mnemonic and
-the tracer publishes **zero** `dst_dep` blocks, so the control arm's `.dkey`
-is empty on three of four ISAs.  The superseded `scoredst.py` printed
-`rows=0 name_moved=0 vanished=0` for those cells — which reads as a clean
-control and is in fact no control at all.  `score_dst.py` fails them.
+A battery whose dependency columns are all zero says nothing unless
+something in the same run moved, so every scorer here requires its control
+to have moved.  `score_families.py` uses `mnem__`.
+
+**`score_dst.py` does not, and could not (#249).**  Under the `mnem`
+mutation on aarch64, riscv64 and mipsel every instruction is an unknown
+mnemonic, the refiner emits no dep block, and the tracer publishes **zero**
+`dst_dep` blocks — so the destination family's control arm deleted the
+population it was the control for, and on x86_64, where 99 rows survived, it
+moved none of them.  Every dst zero ever scored against it was unquotable.
+The superseded `scoredst.py` printed `rows=0 name_moved=0 vanished=0` for
+the three empty cells, which reads as a clean control.
+
+The destination family's arms are therefore its own list, `L.DST_ARMS`, with
+`dstmsk` as `L.DST_CONTROL`:
+
+| arm | what it mutates | what its movers are |
+| --- | --- | --- |
+| `dstmsk` | the published mask, on the line that writes it (`apply_dst`) | every destination QEMU's provenance decided — **the control** |
+| `refmsk` | the refiner's mask, in the window before `qdep_apply` overwrites it | every destination the wire still takes from Capstone |
+
+The two are disjoint and exhaustive by construction, and measured at
+`6ec94b8c09` they sum exactly: x86_64 3,756 + 676 = 4,432; aarch64
+907 + 0 = 907; riscv64 2,266 + 0 = 2,266; mipsel 1,759 + 2 = 1,761.  That
+identity is the standing self-check — a row that neither arm moves is a
+published mask with no writer, and a row both move is a double write.
+
+Both are driven by `QEMU_DF_MUTATE`, the destination-side sibling of
+`QEMU_CAP_MUTATE`.  Two further candidates were built and MEASURED before
+these two were kept, and each lost for a reason worth not repeating:
+
+* `wracc` (Capstone, the write bit set on every operand) suppressed the
+  family outright on aarch64 and mipsel — `mnem`'s defect again, in a new
+  place.
+* `wprov` (QEMU, the write provenance corrupted at `plugins/api.c`'s two
+  exits) moved 636 / 0 / 352 / 206 rows.  It can only move a row where
+  QEMU's answer and the refiner's DIFFER, and on aarch64 they agree — a
+  load's destination is `LOAD0` to both — so its aarch64 zero means
+  agreement, not decoupling.  A zero that cannot be read is worse than no
+  arm.
+
+## The second empty subject: a full file that shares no PC
+
+`require_subject()` catches an arm with no rows.  It does not catch an arm
+whose rows are all at PCs the reference never published, and that
+comparison has no subject either.  Measured on this battery: under `access`
+the aarch64 and mipsel destination lists empty and refill with a disjoint
+set, so the reference's 882 / 1,555 PCs and the arm's 457 / 959 intersect in
+**zero**, and the scorer printed `rows=0 name_moved=0` — an inert-looking
+arm that had scored nothing at all.  `require_overlap()` names those as
+failures.  It follows that the `access` arm cannot state a destination-family
+zero on aarch64 or mipsel with this key, and that limit is a result, not a
+gap to be papered over.
 
 ## Why the census is not a scorer
 

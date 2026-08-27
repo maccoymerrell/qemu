@@ -148,6 +148,23 @@ std::atomic<uint64_t> g_addr_empty_no_imm{0};
  */
 std::atomic<uint64_t> g_dst_imm{0};
 /*
+ * The two DECIDED directions of the encoded-immediate rule (#248), on
+ * destination slots whose mask ALSO names registers -- the population that
+ * refused wholesale until the provenance bit existed.
+ *
+ * @g_dst_imm_feeds: the encoding reached this destination and the slot's mask
+ * takes the immediate bit beside its registers -- `add $5,(%rax)`'s flags.
+ * @g_dst_imm_absent: the decoder stated the immediate, an op read it, and it
+ * did not arrive here, so the register-only mask is COMPLETE and abstains
+ * from the bit -- `ldr x0,[x1,#8]`, whose #8 is the address's.
+ *
+ * Both are counted because a rule that only reports the direction it likes
+ * cannot be checked: the abstention is a published claim of completeness and
+ * is exactly as load-bearing as the bit.
+ */
+std::atomic<uint64_t> g_dst_imm_feeds{0};
+std::atomic<uint64_t> g_dst_imm_absent{0};
+/*
  * Every refused row by MNEMONIC and reason.  A refusal count that cannot say
  * WHICH instructions refused cannot be adjudicated, and an unadjudicated
  * refusal is a published all-inputs default nobody ever looks at again.  The
@@ -362,7 +379,7 @@ bool is_monitor_value(const char *nm)
  * there and a recorded slot here.
  */
 QDepState fold_prov(const uint64_t *words, uint8_t *regs, uint8_t *n,
-                    uint8_t *load_slots)
+                    uint8_t *load_slots, uint8_t *saw_imm)
 {
     for (unsigned b = 0; b < g_prov_words * 64; b++) {
         unsigned slot;
@@ -395,6 +412,27 @@ QDepState fold_prov(const uint64_t *words, uint8_t *regs, uint8_t *n,
              */
             if (!add_reg(regs, n, (uint8_t)REG_ZERO)) {
                 return QDEP_R_WIDE;
+            }
+        } else if (qemu_plugin_dataflow_prov_encoded_imm(b)) {
+            /*
+             * THE INSTRUCTION'S OWN ENCODED IMMEDIATE, stated by the decoder
+             * that materialised it (#248).  Not a register, so nothing is
+             * added to @regs; reported through @saw_imm to the one family
+             * that has a question only it can answer -- whether a
+             * destination whose mask names registers ALSO depends on the
+             * encoding.
+             *
+             * Consumed rather than refused on every arm, including the ones
+             * that pass NULL.  The address and store-data families reached
+             * their own settled reading of the encoding before this bit
+             * existed (4a104e0be4, fb92a61ea4) and both key it on the mask
+             * being EMPTY, which a bit that adds no register leaves it.
+             * Refusing here instead would have turned every RIP-relative
+             * address and every immediate store into a refusal for carrying
+             * a fact.
+             */
+            if (saw_imm) {
+                *saw_imm = 1;
             }
         } else if (qemu_plugin_dataflow_prov_memop(b, &slot)) {
             if (!load_slots) {
@@ -899,7 +937,8 @@ void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
             return;
         }
         rc = fold_prov(w.data(), out->dst_dep_regs[k],
-                       &out->n_dst_dep_regs[k], &memop_slots);
+                       &out->n_dst_dep_regs[k], &memop_slots,
+                       &out->dst_dep_imm[k]);
         if (rc == QDEP_OK) {
             /*
              * MEMOP ordinals into LOAD ordinals, exactly as the store-data
@@ -1009,7 +1048,8 @@ void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
                 return;
             }
             rc = fold_prov(w.data(), out->dst_dep_regs[k],
-                           &out->n_dst_dep_regs[k], &memop_slots);
+                           &out->n_dst_dep_regs[k], &memop_slots,
+                           &out->dst_dep_imm[k]);
             if (rc == QDEP_OK) {
                 for (unsigned m = 0; m < QDEP_MAX_ACCESS; m++) {
                     if (!(memop_slots & (1u << m))) {
@@ -1146,22 +1186,59 @@ unsigned dst_precheck(const InsnFields *f, const QDepInsn *q,
         } else if (f->has_immediate) {
             /*
              * The destination named registers AND the instruction carries an
-             * immediate QEMU's provenance cannot mention, so the mask this
-             * would publish is SHORT by the immediate bit -- and unlike the
-             * empty case there is no reading of "complete" that resolves it:
-             * the encoding is an ADDITIONAL candidate source beside registers
-             * QEMU did name, and nothing stated says whether it contributed.
+             * immediate.  The encoding is an ADDITIONAL candidate source
+             * beside the registers QEMU named, and no reading of "empty and
+             * complete" reaches it -- which is why this was a flat refusal
+             * until the ENCODED-IMMEDIATE PROVENANCE BIT existed (#248).
              *
-             * `ldr x0,[x1,#8]` is why a blanket bit is not the answer.  Its
-             * destination's value came from the LOAD; the #8 is the address's
-             * business and is already in load_addr_dep[].  Setting the bit
-             * here would state that the loaded value waits on the encoding
-             * and would put the address's arithmetic into the data mask --
-             * the one conflation the separate address and data provenances
-             * exist to prevent.
+             * Neither of the two rules that suggest themselves survives its
+             * counter-example.  A blanket bit is refuted by `ldr x0,[x1,#8]`:
+             * that destination's value came from the LOAD, and the #8 is the
+             * ADDRESS's, already carried in load_addr_dep[] -- setting the
+             * bit here would put the address's arithmetic into the data mask,
+             * the one conflation the separate provenances exist to prevent.
+             * And "it depends on the immediate unless there is a load" is
+             * refuted by `add $5,(%rax)`, whose FLAGS destination does depend
+             * on the 5.
+             *
+             * The BIT decides it, because it is a fact rather than a rule:
+             * the decoder that materialised the encoding's immediate said so,
+             * and the bit travelled the same dataflow every other provenance
+             * bit travels.  Where it arrived is the answer, in both
+             * directions.
              */
-            g_snprintf(why, whysz, "immediate no provenance can mention");
-            return QDEP_R_DST_IMM_UNSTATED;
+            if (q->dst_dep_imm[k]) {
+                /*
+                 * The encoding reached this destination.  Nothing is refused;
+                 * apply_dst() adds the immediate bit to this slot's mask.
+                 */
+            } else if (q->imm_stated && q->imm_reached) {
+                /*
+                 * The decoder stated the immediate, the value it named was
+                 * read by an op of this instruction, and it did not arrive
+                 * here.  The register-only mask IS complete: this is the
+                 * `ldr x0,[x1,#8]` case, and the #8 is in the address mask
+                 * where a consumer that wants it will find it.
+                 */
+            } else if (q->imm_stated) {
+                /*
+                 * Stated, but QEMU folded the value away before any op read
+                 * it -- `addi rd,rs,0` lowers to a move.  The bit had nowhere
+                 * to travel, so its absence is the emulator's optimisation
+                 * and not the machine's, which R7.3 forbids publishing.
+                 */
+                g_snprintf(why, whysz, "immediate folded before any op");
+                return QDEP_R_DST_IMM_FOLDED;
+            } else {
+                /*
+                 * No decoder on this instruction's path states its encoded
+                 * immediate yet.  The absence of the bit means nobody looked.
+                 * Refused, and counted per mnemonic so the coverage hole is a
+                 * LIST of decoder paths rather than an adjective.
+                 */
+                g_snprintf(why, whysz, "no decoder stated this immediate");
+                return QDEP_R_DST_IMM_UNSTATED_PATH;
+            }
         }
     }
     if (!f->has_reg_deps) {
@@ -1286,6 +1363,26 @@ void apply_dst(InsnFields *f, const QDepInsn *q, const char *mnem,
              */
             m = 1ULL << (f->n_src_regs + f->max_dep_loads);
             g_dst_imm.fetch_add(1, std::memory_order_relaxed);
+        } else if (f->has_immediate) {
+            /*
+             * THE ENCODING BESIDE REGISTERS (#248).  The mask is not empty,
+             * so the "empty and complete" reading above cannot reach this
+             * slot -- but the instruction carries an immediate, and whether
+             * that immediate is one of THIS destination's sources is a
+             * question the register names cannot settle.
+             *
+             * The encoded-immediate provenance bit settles it, and
+             * dst_precheck() has already refused every row where it could
+             * not: a row reaching here either carries the bit or was proven
+             * not to, so both branches are decisions and neither is a
+             * default.
+             */
+            if (q->dst_dep_imm[k]) {
+                m |= 1ULL << (f->n_src_regs + f->max_dep_loads);
+                g_dst_imm_feeds.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                g_dst_imm_absent.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         f->dst_dep_mask[d] = m;
     }
@@ -1310,6 +1407,8 @@ const char *state_name(unsigned s)
     case QDEP_R_DST_UNNAMED:    return "refused: a wire destination QEMU named only as env state, not as a TCG global (#218)";
     case QDEP_R_DST_UNSTATED_CONST: return "refused: a destination's value came from a constant that is neither the encoding nor the zero register";
     case QDEP_R_DST_IMM_UNSTATED: return "refused: the instruction carries an immediate QEMU's provenance cannot mention, so a register-only mask would be short by the immediate bit";
+    case QDEP_R_DST_IMM_UNSTATED_PATH: return "refused: the instruction carries an immediate NO DECODER ON ITS PATH STATES, so an absent immediate-provenance bit means nobody looked (#248 coverage)";
+    case QDEP_R_DST_IMM_FOLDED: return "refused: the decoder stated this instruction's immediate and QEMU folded the value away before any op read it, so the absent bit is the emulator's optimisation";
     case QDEP_R_DST_SELF:       return "refused: a destination is in its own provenance and R7.1 says only the INSTRUCTION's own source counts (in-place lowering)";
     default:                    return "?";
     }
@@ -1370,6 +1469,16 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
         out->state = out->data_state = out->dst_state = QDEP_R_STATUS;
         return;
     }
+
+    /*
+     * The two encoded-immediate facts, carried whole to the destination
+     * family (#248).  Not a refusal condition on their own: an instruction
+     * whose decoder never states an immediate is perfectly extractable in
+     * every other respect, and only the one rule that would read an ABSENT
+     * immediate bit as an answer has to know.
+     */
+    out->imm_stated = st.imm_stated;
+    out->imm_reached = st.imm_reached;
 
     for (unsigned i = 0; i < kMaxMemops; i++) {
         mo[i].struct_size = sizeof(mo[i]);
@@ -1472,9 +1581,9 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
         }
         rc = store
             ? fold_prov(w.data(), out->store_addr_regs[a],
-                        &out->n_store_addr_regs[a], nullptr)
+                        &out->n_store_addr_regs[a], nullptr, nullptr)
             : fold_prov(w.data(), out->load_addr_regs[a],
-                        &out->n_load_addr_regs[a], nullptr);
+                        &out->n_load_addr_regs[a], nullptr, nullptr);
         if (rc != QDEP_OK && out->state == QDEP_NONE) {
             out->state = rc;    /* first refusal wins; a later access
                                  * succeeding does not undo it */
@@ -1498,7 +1607,7 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
         }
         uint8_t memop_slots = 0;
         rc = fold_prov(w.data(), out->store_data_regs[a],
-                       &out->n_store_data_regs[a], &memop_slots);
+                       &out->n_store_data_regs[a], &memop_slots, nullptr);
         if (rc == QDEP_OK) {
             /*
              * Translate MEMOP ordinals into LOAD ordinals.  A bit naming an
@@ -1960,6 +2069,19 @@ void qdep_report(GString *report)
         "               appearing here means the note is not reaching the"
         " write\n",
         g_dst_imm.load(std::memory_order_relaxed));
+    g_string_append_printf(report,
+        "  %10" G_GUINT64_FORMAT "  destination SLOTS whose mask names registers AND"
+        " ALSO takes the\n"
+        "              immediate bit, because the decoder's"
+        " encoded-immediate note reached them\n"
+        "  %10" G_GUINT64_FORMAT "  the same shape, ABSTAINING: the note was stated, an"
+        " op read the\n"
+        "              value, and it did not arrive here -- the"
+        " register-only mask is complete\n"
+        "               and the encoding belongs to the ADDRESS"
+        " (`ldr x0,[x1,#8]`)\n",
+        g_dst_imm_feeds.load(std::memory_order_relaxed),
+        g_dst_imm_absent.load(std::memory_order_relaxed));
     for (unsigned s = 0; s < QDEP_STATE_COUNT; s++) {
         uint64_t v = g_wstate[s].load(std::memory_order_relaxed);
         if (v) {

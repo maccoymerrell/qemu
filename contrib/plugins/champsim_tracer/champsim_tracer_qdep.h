@@ -338,6 +338,36 @@ enum QDepState : uint8_t {
      */
     QDEP_R_DST_IMM_UNSTATED,
     /*
+     * Destination family only, and the HALF OF QDEP_R_DST_IMM_UNSTATED THAT
+     * SURVIVES THE PROVENANCE BIT.
+     *
+     * The encoded-immediate provenance bit (#248) answers the question above
+     * wherever a decoder states it: the bit travels the dataflow, so a
+     * destination that carries it depends on the encoding and one that does
+     * not, does not.  This state is what is left when the decoder on this
+     * instruction's path never stated the immediate at all -- QEMU reports
+     * imm_stated = 0 -- and the absence of the bit therefore means "nobody
+     * looked", which is not an answer.
+     *
+     * It is a COVERAGE hole and its size is the list of decoder paths still
+     * to be reached, per mnemonic, in the refusal census.
+     */
+    QDEP_R_DST_IMM_UNSTATED_PATH,
+    /*
+     * Destination family only.  The decoder DID state this instruction's
+     * encoded immediate and QEMU folded the value away before any op read
+     * it -- `addi rd,rs,0` becomes a move, `andi rd,rs,0xff` becomes an
+     * extract with the mask in the op's own argument rather than in a temp.
+     *
+     * The bit then has nowhere to travel, and its absence is the emulator's
+     * optimisation rather than a fact about the machine, which R7.3 forbids
+     * publishing.  Counted apart from the coverage hole above because the
+     * two have different fixes: that one is reached by stating more
+     * immediates, this one only by reading a fold QEMU performs before the
+     * op stream exists.
+     */
+    QDEP_R_DST_IMM_FOLDED,
+    /*
      * Destination family only.  QEMU's provenance for a destination names
      * THAT DESTINATION, and R7.1 rules on exactly this:
      *
@@ -438,6 +468,25 @@ struct QDepInsn {
     uint8_t n_dst_dep_regs[QDEP_MAX_DST];
     uint8_t dst_dep_regs[QDEP_MAX_DST][QDEP_MAX_ADDR_REGS];
     uint8_t dst_dep_load_slots[QDEP_MAX_DST];   /* by LOAD ordinal */
+    /*
+     * Did the INSTRUCTION'S ENCODED IMMEDIATE reach this destination?  One
+     * per destination register, because that is the question the wire asks:
+     * `ldr x0,[x1,#8]` answers no for x0 and `add $5,(%rax)` answers yes for
+     * the flags it writes, and both instructions carry an immediate.
+     */
+    uint8_t dst_dep_imm[QDEP_MAX_DST];
+    /*
+     * And the two facts that say whether a NO above is an answer.
+     *
+     * @imm_stated: a decoder on this instruction's path named its encoded
+     * immediate at all.  @imm_reached: the value it named was read by an op,
+     * so the bit had a route into the provenance.  Only with both set does
+     * an absent bit mean "the encoding did not contribute"; otherwise it
+     * means nobody looked, or QEMU folded the immediate away before the op
+     * stream existed, and the family keeps refusing.
+     */
+    uint8_t imm_stated;
+    uint8_t imm_reached;
 };
 
 /*

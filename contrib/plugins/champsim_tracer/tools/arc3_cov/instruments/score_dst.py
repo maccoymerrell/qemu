@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""The destination-family scorer, keyed per destination REGISTER.
+
+Supersedes exec27b/seating/scoredst.py and its per-wave copies.  Reads the
+`.dkey` files produced by `keyfacts.py --dst`.
+
+WHY NOT THE SLOT (#231).  `dst_dep[]` is an ARRAY with one mask per wire
+destination slot, and the slot list is the operand walk's.  Diffing the
+array reports movement whenever the WALK's destination list changes, which
+under an access-flag mutation is nearly every instruction -- and that
+movement swamps, and hides, whatever the masks themselves did.  Measured,
+the array-keyed form overstated the mover count by 219x: 17,520 array rows
+against 80 real per-register movers.  So each row is (pc, dst_dep@<REG>).
+A destination the mutated arm no longer has is VANISHED and counted apart:
+the dictionary effect stated as its own number instead of folded into the
+mask column.
+
+VACUITY (#235), AND IT IS NOT HYPOTHETICAL HERE.  Under the `mnem`
+mutation, aarch64 / riscv64 / mipsel publish ZERO dst_dep blocks -- every
+instruction is an unknown mnemonic -- so the control arm's `.dkey` is empty
+on three of four ISAs.  The pre-guard scorer printed `rows=0 name_moved=0
+... vanished=0` for those cells, which reads as "the control was clean" and
+is in fact "the control had no subject".  An empty arm is a FAILURE here.
+
+Usage:  score_dst.py <battery-dir> [--isas ...] [--arms ...]
+        score_dst.py --selftest
+"""
+import argparse
+import os
+import shutil
+import sys
+import tempfile
+
+sys.path.insert(0, __file__.rsplit("/", 1)[0])
+import _arc3lib as L  # noqa: E402
+
+
+def score_pair(base, cur):
+    bp = {pc for pc, _ in base}
+    cp = {pc for pc, _ in cur}
+    both = bp & cp
+    rows = nm = rw = van = new = 0
+    for (pc, k), v in base.items():
+        if pc not in both:
+            continue
+        rows += 1
+        got = cur.get((pc, k))
+        if got is None:
+            van += 1
+        else:
+            if got[0] != v[0]:
+                nm += 1
+            if got[1] != v[1]:
+                rw += 1
+    for (pc, k) in cur:
+        if pc in both and (pc, k) not in base:
+            new += 1
+    return [rows, nm, rw, van, new]
+
+
+def run(battery, isas, arms, quiet=False):
+    reasons = []
+    tot = {a: [0] * 5 for a in arms}
+    if not quiet:
+        print("%-8s %-7s %8s %8s %8s %9s %6s"
+              % ("isa", "arm", "rows", "namemvd", "rawmvd", "vanished", "new"))
+    for isa in isas:
+        bp = os.path.join(battery, "%s_none__.dkey" % isa)
+        base = L.load_key(bp)
+        if not L.require_subject(base, "%s reference arm none__ (%s)" % (isa, bp),
+                                 reasons):
+            continue
+        for arm in arms:
+            ap = os.path.join(battery, "%s_%s.dkey" % (isa, arm))
+            cur = L.load_key(ap)
+            if not L.require_subject(cur, "%s arm %s (%s)" % (isa, arm, ap),
+                                     reasons):
+                if not quiet:
+                    print("%-8s %-7s NOT SCORED -- vacuity" % (isa, arm))
+                continue
+            r = score_pair(base, cur)
+            if not quiet:
+                print("%-8s %-7s %8d %8d %8d %9d %6d"
+                      % (isa, arm, r[0], r[1], r[2], r[3], r[4]))
+            for i in range(5):
+                tot[arm][i] += r[i]
+    if not quiet:
+        print("")
+        for arm in arms:
+            t = tot[arm]
+            print("TOTAL x%d %-7s rows=%d name_moved=%d raw_moved=%d "
+                  "vanished=%d new=%d"
+                  % (len(isas), arm, t[0], t[1], t[2], t[3], t[4]))
+    rc = L.report_vacuity(reasons) if not quiet else (2 if reasons else 0)
+    if "mnem__" in arms and rc == 0 and tot["mnem__"][1] == 0:
+        if not quiet:
+            print("CONTROL FAILURE: the mnem arm moved no destination row.  "
+                  "The zeros in the other arms are not quotable against a "
+                  "control that did not move.")
+        rc = 1
+    return rc, tot
+
+
+# --------------------------------------------------------------------------
+# selftest
+
+def _cell(d, isa, arm, rows):
+    L.write_tsv(os.path.join(d, "%s_%s.dkey" % (isa, arm)), rows)
+
+
+def selftest():
+    checks = []
+    tmp = tempfile.mkdtemp(prefix="score_dst_selftest_")
+    try:
+        isa = "x86_64"
+        arms = ["access", "mnem__"]
+        base = {("0x1000", "dst_dep@rbx"): ("N=rcx", "R=0x1"),
+                ("0x1000", "dst_dep@rax"): ("N=IMM", "R=0x8"),
+                ("0x1004", "dst_dep@rdx"): ("N=rsi", "R=0x2")}
+        mnem = dict(base)
+        mnem[("0x1000", "dst_dep@rbx")] = ("N=rdx", "R=0x2")
+
+        d = os.path.join(tmp, "healthy"); os.makedirs(d)
+        _cell(d, isa, "none__", base); _cell(d, isa, "access", base)
+        _cell(d, isa, "mnem__", mnem)
+        rc, tot = run(d, [isa], arms, quiet=True)
+        checks.append(("healthy: rc=0, access inert, control live",
+                       rc == 0 and tot["access"][1] == 0 and tot["mnem__"][1] == 1,
+                       "rc=%d access_moved=%d control_moved=%d"
+                       % (rc, tot["access"][1], tot["mnem__"][1])))
+
+        # PLANTED DEFECT 1 -- VACUITY, the shape actually present in
+        # exec27b/seating, exec27b/verify and exec27c/writeprov.
+        d = os.path.join(tmp, "vacuous"); os.makedirs(d)
+        _cell(d, isa, "none__", base); _cell(d, isa, "access", base)
+        _cell(d, isa, "mnem__", {})
+        rc, tot = run(d, [isa], arms, quiet=True)
+        checks.append(("PLANTED empty control arm FAILS (was rows=0, clean)",
+                       rc != 0 and tot["mnem__"][0] == 0,
+                       "rc=%d control_rows=%d" % (rc, tot["mnem__"][0])))
+
+        # PLANTED DEFECT 2 -- DEAD CONTROL that is present but inert.
+        d = os.path.join(tmp, "deadctl"); os.makedirs(d)
+        _cell(d, isa, "none__", base); _cell(d, isa, "access", base)
+        _cell(d, isa, "mnem__", base)
+        rc, tot = run(d, [isa], arms, quiet=True)
+        checks.append(("PLANTED present-but-inert control FAILS",
+                       rc != 0 and tot["mnem__"][0] == 3,
+                       "rc=%d control_rows=%d moved=%d"
+                       % (rc, tot["mnem__"][0], tot["mnem__"][1])))
+
+        # PLANTED DEFECT 3 -- WRONG KEY.  Renaming the destination REGISTER
+        # while leaving the mask word alone must show as vanished+new, not
+        # as silence.  A slot-indexed key reports nothing here.
+        d = os.path.join(tmp, "wrongkey"); os.makedirs(d)
+        renamed = {(("0x1000", "dst_dep@r11") if k == ("0x1000", "dst_dep@rbx")
+                    else k): v for k, v in base.items()}
+        _cell(d, isa, "none__", base); _cell(d, isa, "access", renamed)
+        _cell(d, isa, "mnem__", mnem)
+        rc, tot = run(d, [isa], arms, quiet=True)
+        checks.append(("PLANTED destination rename shows vanished+new",
+                       rc == 0 and tot["access"][3] == 1 and tot["access"][4] == 1,
+                       "rc=%d vanished=%d new=%d (a slot key reports 0/0)"
+                       % (rc, tot["access"][3], tot["access"][4])))
+
+        # PLANTED DEFECT 4 -- FLOOR AS REGRESSION.  A PC absent from the arm
+        # is build noise and must not be charged as vanished.
+        d = os.path.join(tmp, "floor"); os.makedirs(d)
+        shrunk = {k: v for k, v in base.items() if k[0] != "0x1004"}
+        _cell(d, isa, "none__", base); _cell(d, isa, "access", shrunk)
+        _cell(d, isa, "mnem__", mnem)
+        rc, tot = run(d, [isa], arms, quiet=True)
+        checks.append(("PLANTED absent PC is FLOOR, not vanished",
+                       rc == 0 and tot["access"][3] == 0 and tot["access"][0] == 2,
+                       "rc=%d vanished=%d rows=%d"
+                       % (rc, tot["access"][3], tot["access"][0])))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return L.selftest_report("score_dst.py", checks)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("battery", nargs="?")
+    ap.add_argument("--isas", default=",".join(L.ISAS))
+    ap.add_argument("--arms", default=",".join(L.ARMS))
+    ap.add_argument("--selftest", action="store_true")
+    args = ap.parse_args()
+    if args.selftest:
+        return selftest()
+    if not args.battery:
+        L.die_usage("usage: score_dst.py <battery-dir>")
+    rc, _ = run(args.battery, args.isas.split(","), args.arms.split(","))
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

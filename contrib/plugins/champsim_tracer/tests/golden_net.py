@@ -211,7 +211,8 @@ def sha(b: bytes) -> str:
 VAL_GATE = (Path(__file__).resolve().parents[1] / "tools" / "val_gate.sh")
 
 
-def run_all(build: Path, wl: dict, out_dir: Path) -> int:
+def run_all(build: Path, wl: dict, out_dir: Path,
+            extra_args: tuple = ()) -> int:
     """generate+build+trace+analyze+validate for one workload (all its ISAs).
 
     Returns 0 only when val_gate.sh adjudicates the run green: the process
@@ -235,6 +236,7 @@ def run_all(build: Path, wl: dict, out_dir: Path) -> int:
     for isa in wl["isas"]:
         cmd += ["--isa", isa]
     cmd += wl["args"]
+    cmd += list(extra_args)
     proc = subprocess.run(cmd, cwd=VALIDATOR_DIR, env=PINNED_ENV,
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                           text=True)
@@ -783,6 +785,97 @@ def check(build: Path, root: Path, waivers: dict) -> int:
           f"{len(manifest.get('svg', {}))} svg goldens + "
           f"{len(manifest.get('svg_fixtures', {}))} fixture svg goldens "
           f"byte-identical; validator errors=0")
+    return 0
+
+
+NET_VALIDATE_BANNER = (
+    "net-validator arm; hash arm parked by standing hold"
+)
+
+#: Env var naming a workload whose validator invocation this run should
+#: deliberately break, so the gate can be shown to go red on demand.  The
+#: injection is a genuinely bad validator argument: the validator process
+#: really fails, val_gate.sh really adjudicates it, and the red travels the
+#: whole path a real regression would.  Nothing about the verdict is faked.
+FAULT_ENV = "CST_NET_VALIDATE_FAULT"
+FAULT_ARG = "--cst-net-validate-fault-injection"
+
+
+def net_validate(build: Path, root: Path, waivers: dict,
+                 only: list[str] | None = None) -> int:
+    """Run the net's VALIDATOR arm alone -- no hashes, no SVGs.
+
+    WHY THIS ARM STANDS ON ITS OWN.  The net's cells are the only subjects
+    the call_return_store check has ever had: the standalone battery reports
+    `checked=0` there, proven, so a class it cannot see is a class nothing
+    else was watching.  The hash arm is a separate question (it compares
+    bytes against a recorded reference and is parked by a standing hold),
+    and coupling the two meant the one arm with unique coverage could not be
+    run at all while the other was held.  So this mode runs the cells, hands
+    every run to val_gate.sh, and adjudicates ONLY the validator verdict.
+
+    Every line it prints is labelled, because a green from this arm is a
+    green about validator errors and about nothing else.
+
+    Baselines come from the manifest when one exists -- a cell with a known
+    pre-existing validator issue is compared to its recorded rc, so this
+    reports REGRESSIONS, not history.  With no manifest the bar is rc=0.
+    """
+    prov, rc = gate_build(build, system=False, waivers=waivers, mode="check")
+    if rc:
+        return rc
+    baselines = {}
+    if MANIFEST.exists():
+        cells = json.loads(MANIFEST.read_text()).get("cells", {})
+        for cell, rec in cells.items():
+            baselines[cell.split(":", 1)[0]] = max(
+                baselines.get(cell.split(":", 1)[0], 0),
+                rec.get("validate_rc", 0))
+    else:
+        print(f"[{NET_VALIDATE_BANNER}] no manifest: every cell's bar is rc=0")
+
+    fault = os.environ.get(FAULT_ENV, "").strip()
+    if fault:
+        print(f"[{NET_VALIDATE_BANNER}] FAULT INJECTION ARMED for workload "
+              f"{fault!r}: its validator run is given a bad argument on "
+              f"purpose.  A green here would mean the gate cannot see a "
+              f"failing cell.")
+
+    wls = [w for w in WORKLOADS if only is None or w["name"] in only]
+    if not wls:
+        print(f"[{NET_VALIDATE_BANNER}] REFUSING: --only matched no workload "
+              f"({only}).  A gate with no subject is a failure, not a pass.",
+              file=sys.stderr)
+        return 2
+    if root.exists():
+        shutil.rmtree(root)
+    fails, ran = [], 0
+    for wl in wls:
+        name = wl["name"]
+        extra = (FAULT_ARG,) if fault == name else ()
+        rc = run_all(build, wl, root / name, extra_args=extra)
+        ran += 1
+        base = baselines.get(name, 0)
+        verdict = "PASS" if rc == base else "FAIL"
+        if rc != base:
+            fails.append(f"{name}: validator rc={rc} (baseline {base}, "
+                         f"isas={','.join(wl['isas'])})")
+        print(f"[{NET_VALIDATE_BANNER}] {verdict} {name} "
+              f"rc={rc} baseline={base}")
+    if ran == 0:
+        print(f"[{NET_VALIDATE_BANNER}] REFUSING: 0 workloads ran.",
+              file=sys.stderr)
+        return 2
+    if fails:
+        print(f"\n=== NET-VALIDATOR ARM FAILED ({len(fails)} of {ran} "
+              f"workloads) ===")
+        print(f"    {NET_VALIDATE_BANNER}")
+        for f in fails:
+            print(f"  VALID {f}")
+        return 1
+    print(f"\nNET-VALIDATOR ARM GREEN: {ran} workload(s), validator errors=0 "
+          f"on every cell.")
+    print(f"    {NET_VALIDATE_BANNER} -- this says NOTHING about trace bytes.")
     return 0
 
 
@@ -1705,7 +1798,14 @@ def sys_check(build: Path, root: Path, waivers: dict) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("mode", choices=("capture", "check"))
+    ap.add_argument("mode", choices=("capture", "check", "validate"),
+                    help="capture/check drive the hash reference; `validate` "
+                         "runs the VALIDATOR arm alone (no hash comparison), "
+                         "which is the only arm with call_return_store "
+                         "coverage and is safe to run while the hash arm is "
+                         "held")
+    ap.add_argument("--only", action="append", default=None,
+                    help="validate mode: restrict to these workload names")
     ap.add_argument("--build-dir", type=Path, required=True)
     ap.add_argument("--system", action="store_true",
                     help="operate on the SYSTEM-mode cells (separate manifest "
@@ -1754,6 +1854,11 @@ def main() -> int:
                          "manifest alongside the hashes.")
     args = ap.parse_args()
     build = args.build_dir
+    if args.mode == "validate" and args.system:
+        print("golden_net: --system has no validate arm (the system net has "
+              "no validator cells of its own); use `check --system`.",
+              file=sys.stderr)
+        return 2
     if args.mode == "capture" and not (args.reason or "").strip():
         print("golden_net: capture refuses to overwrite a reference without "
               "--reason.\n  A recapture asserts the new bytes are correct; "
@@ -1804,6 +1909,9 @@ def main() -> int:
         sys_root = args.work_root / "sys"
         return sys_capture(build, sys_root, waivers) if args.mode == "capture" \
             else sys_check(build, sys_root, waivers)
+    if args.mode == "validate":
+        return net_validate(build, args.work_root / "netval", waivers,
+                            only=args.only)
     if args.mode == "capture":
         return capture(build, shared, waivers)
     return check(build, shared, waivers)

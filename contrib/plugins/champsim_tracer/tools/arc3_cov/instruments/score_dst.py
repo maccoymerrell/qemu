@@ -30,6 +30,17 @@ this battery, `access` and `memdir` on aarch64 and mipsel are exactly that
 list empties and refills, and the intersection is ZERO.  require_overlap()
 names those as failures too.
 
+AND THE EMPTY INTERSECTION WAS THE DEGENERATE CASE, NOT THE CONDITION
+(#257, re-measured 2026-08-27 at `685914abf2`).  The rows==0 test caught
+those cells only because the intersection was exactly zero at the sha it
+was written against.  The emission flip tripled the published destination
+population, the same arms began to intersect PARTIALLY, and the guard fell
+silent on cells that were no more quotable than before -- `access` covered
+45.6 / 20.6 / 32.7 / 17.0 % of the reference and printed clean zeros for
+three ISAs.  So the bar is now the SHARE COVERED (L.OVERLAP_FLOOR), the
+share is printed on every scored line, and a zero cannot be read without
+the population it was taken over.
+
 THE CONTROL IS `dstmsk`, NOT `mnem__` (#249).  The `mnem` arm is the wrong
 control for this family in the strongest sense: it does not merely fail to
 move the masks, it deletes them, because the block's existence is the
@@ -81,8 +92,9 @@ def run(battery, isas, arms, quiet=False):
     tot = {a: [0] * 5 for a in arms}
     live = {a: {} for a in arms}
     if not quiet:
-        print("%-8s %-7s %8s %8s %8s %9s %6s"
-              % ("isa", "arm", "rows", "namemvd", "rawmvd", "vanished", "new"))
+        print("%-8s %-7s %8s %8s %8s %9s %6s   %6s"
+              % ("isa", "arm", "rows", "namemvd", "rawmvd", "vanished",
+                 "new", "cover"))
     for isa in isas:
         bp = os.path.join(battery, "%s_none__.dkey" % isa)
         base = L.load_key(bp)
@@ -98,15 +110,20 @@ def run(battery, isas, arms, quiet=False):
                     print("%-8s %-7s NOT SCORED -- vacuity" % (isa, arm))
                 continue
             r = score_pair(base, cur)
+            nbase = len(base)
             if not L.require_overlap(r[0], "%s arm %s (%s)"
-                                     % (isa, arm, ap), reasons):
+                                     % (isa, arm, ap), reasons,
+                                     base_rows=nbase):
                 if not quiet:
-                    print("%-8s %-7s NOT SCORED -- vacuity (no shared PC)"
-                          % (isa, arm))
+                    print("%-8s %-7s NOT SCORABLE -- covers %d of %d "
+                          "reference rows (%.1f%%)"
+                          % (isa, arm, r[0], nbase,
+                             100.0 * r[0] / nbase if nbase else 0.0))
                 continue
             if not quiet:
-                print("%-8s %-7s %8d %8d %8d %9d %6d"
-                      % (isa, arm, r[0], r[1], r[2], r[3], r[4]))
+                print("%-8s %-7s %8d %8d %8d %9d %6d   %5.1f%%"
+                      % (isa, arm, r[0], r[1], r[2], r[3], r[4],
+                         100.0 * r[0] / nbase if nbase else 0.0))
             for i in range(5):
                 tot[arm][i] += r[i]
             if r[1]:
@@ -209,15 +226,44 @@ def selftest():
 
         # PLANTED DEFECT 4 -- FLOOR AS REGRESSION.  A PC absent from the arm
         # is build noise and must not be charged as vanished.
+        #
+        # The population is 400 rows, not 3, because the coverage floor is
+        # now a FRACTION (#257): one absent PC out of three is a 33 % hole
+        # and genuinely unquotable, while one out of four hundred is the
+        # build-order noise this check is about.  Sizing the toy like the
+        # real battery is what keeps the two failures distinguishable.
         d = os.path.join(tmp, "floor"); os.makedirs(d)
-        shrunk = {k: v for k, v in base.items() if k[0] != "0x1004"}
-        _cell(d, isa, "none__", base); _cell(d, isa, "access", shrunk)
-        _cell(d, isa, ctl, moved)
+        wide = {("0x%x" % (0x2000 + 4 * i), "dst_dep@rbx"): ("N=rcx", "R=0x1")
+                for i in range(400)}
+        wide_moved = dict(wide)
+        wide_moved[("0x2000", "dst_dep@rbx")] = ("N=rcx,IMM", "R=0x9")
+        shrunk = {k: v for k, v in wide.items() if k[0] != "0x2004"}
+        _cell(d, isa, "none__", wide); _cell(d, isa, "access", shrunk)
+        _cell(d, isa, ctl, wide_moved)
         rc, tot = run(d, [isa], arms, quiet=True)
         checks.append(("PLANTED absent PC is FLOOR, not vanished",
-                       rc == 0 and tot["access"][3] == 0 and tot["access"][0] == 2,
+                       rc == 0 and tot["access"][3] == 0
+                       and tot["access"][0] == 399,
                        "rc=%d vanished=%d rows=%d"
                        % (rc, tot["access"][3], tot["access"][0])))
+
+        # PLANTED DEFECT 4b -- THE PARTIAL INTERSECTION (#257).  The arm is a
+        # full file that shares a MINORITY of the reference's PCs and moves
+        # none of what it shares.  Before the coverage floor this printed a
+        # clean zero and exited 0 -- which is exactly what the battery's
+        # `access` cells did at 685914abf2, covering 17-46 % of the
+        # reference.  A zero over a fifth of the population is not a
+        # statement about the family, and this must FAIL.
+        d = os.path.join(tmp, "partial"); os.makedirs(d)
+        minority = {k: v for k, v in wide.items() if int(k[0], 16) < 0x2000 + 4 * 80}
+        _cell(d, isa, "none__", wide); _cell(d, isa, "access", minority)
+        _cell(d, isa, ctl, wide_moved)
+        rc, tot = run(d, [isa], arms, quiet=True)
+        checks.append(("PLANTED 20%-coverage arm FAILS (was a clean zero)",
+                       rc == 2 and tot["access"][0] == 0,
+                       "rc=%d access_rows=%d (scored rows are not "
+                       "accumulated for a refused cell)"
+                       % (rc, tot["access"][0])))
 
         # PLANTED DEFECT 5 -- THE EMPTY INTERSECTION (#249).  The arm is a
         # full file and shares no PC with the reference, which is the real

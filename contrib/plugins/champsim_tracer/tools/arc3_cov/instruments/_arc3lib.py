@@ -101,8 +101,17 @@ def require_subject(rows, label, reasons):
     return True
 
 
-def require_overlap(rows, label, reasons):
-    """Record a vacuity failure when a comparison scored no shared subject.
+#
+# THE SHARE OF THE REFERENCE A COMPARISON MUST COVER BEFORE ITS ZERO MEANS
+# ANYTHING.  Stated as a constant so the bar is a number in the source and
+# not a judgement made per wave.
+#
+OVERLAP_FLOOR = 0.99
+
+
+def require_overlap(rows, label, reasons, base_rows=None,
+                    floor=OVERLAP_FLOOR):
+    """Record a vacuity failure when a comparison scored too little subject.
 
     THE SECOND FLOOR, one level below require_subject() (#249).  An arm can
     produce a file full of rows and still share not one PC with the
@@ -114,12 +123,39 @@ def require_overlap(rows, label, reasons):
     reads exactly like a clean inert arm.  A comparison whose scored
     population is empty is a comparison with no subject, whatever the file
     sizes were.
+
+    AND AN EMPTY INTERSECTION IS THE DEGENERATE CASE, NOT THE CONDITION
+    (#257, measured 2026-08-27).  The rows==0 test caught those cells only
+    because the intersection happened to be exactly zero at the sha it was
+    written against.  At `685914abf2` the emission flip grew the published
+    destination population three-fold, the same arms began to intersect
+    PARTIALLY, and the guard fell silent while the cells stayed just as
+    unquotable: `access` covered 45.6 / 20.6 / 32.7 / 17.0 % of the
+    reference on x86_64 / aarch64 / riscv64 / mipsel and printed clean
+    zeros for three of them.  A zero over a fifth of the population is not
+    a statement about the family; the protection at rows==0 was accidental.
+
+    So the bar is the SHARE COVERED, with the empty case kept as its own
+    message because it is a different failure to read.  `base_rows` is the
+    reference's own row count; pass it and the fraction is checked, omit it
+    and only the degenerate case is (which is what the callers that predate
+    this did).
     """
     if rows == 0:
         reasons.append("VACUITY FAILURE: %s -- the arm and the reference "
                        "share no PC, so 0 rows were scored.  A comparison "
                        "with an empty intersection is not a zero." % label)
         return False
+    if base_rows:
+        cov = float(rows) / float(base_rows)
+        if cov < floor:
+            reasons.append("VACUITY FAILURE: %s -- the comparison covers "
+                           "%.1f%% of the reference (%d of %d rows), below "
+                           "the %.1f%% floor.  A zero over a subset this "
+                           "small is not a statement about the family."
+                           % (label, 100.0 * cov, rows, base_rows,
+                              100.0 * floor))
+            return False
     return True
 
 

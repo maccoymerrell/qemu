@@ -616,9 +616,24 @@ Decode by repeated outer-section unwrapping.
         the consumer rather than a property of the machine.
 
         A constructor that cannot state a family in full does not emit a
-        short mask for it.  For HAS_ADDR it omits the block; for
-        ``store_data_dep``, whose flag is shared with ``dst_dep`` and
-        therefore cannot be dropped alone, it writes the all-inputs
+        short mask for it.
+
+        For HAS_ADDR the question is asked PER ACCESS, because the flag
+        governs a slot array and one slot's answer is not a claim about
+        the next.  An access whose address the constructor stated in
+        full publishes that address.  An access it could not state
+        publishes the all-inputs default explicitly, in the slot the
+        access owns.  The block exists whenever at least one access was
+        stated, and is omitted only when none was — in which case the
+        consumer reads the same over-approximation from the flag's
+        absence.  ``rep stosq`` is the shape that settles it: its first
+        store's address is stated as ``RDI`` and its second's is
+        ``RDI`` plus a piece of emulator state the constructor has no
+        architectural word for, and the second answer does not delete
+        the first.
+
+        For ``store_data_dep``, whose flag is shared with ``dst_dep``
+        and therefore cannot be dropped alone, it writes the all-inputs
         default explicitly; for ``dst_dep`` under that same shared flag
         it leaves the decoded-operand mask in place, which states no
         more than the operands do and never less.  All reach the same

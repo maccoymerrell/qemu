@@ -4470,7 +4470,9 @@ def apply_regs_one(info: IsaInfo) -> None:
 #     control/status file (fctrl, ftag, fop, fioff, fiseg, fooff,
 #     foseg) among them -- state the ISA reads and writes, that QEMU
 #     holds exactly, and that no dependency edge can reach through this
-#     key.
+#     key.  Their generic ID comes from QEMU_ONLY_REG_IDS below instead,
+#     because "Capstone has no constant for it" is a fact about the
+#     ROUTE and REG_NONE would state it as a fact about the REGISTER.
 #  2. Which QEMU register's VALUE is published for a generic ID was
 #     decided by CAPSTONE ENUM ORDER: the plugin's reverse index takes
 #     "the first singleton row" walking the Capstone-indexed array.
@@ -4497,10 +4499,104 @@ class QemuRegRow:
     name: str
     entry: RegEntry | None
     cap_rows: tuple[str, ...]
+    # Non-empty only on a row whose ID came from QEMU_ONLY_REG_IDS: why that
+    # role dictates that ID, and whether the register is reachable at all.
+    reason: str = ""
 
     @property
     def tier(self) -> int:
         return QREG_ROUTED if self.cap_rows else QREG_UNNAMED
+
+
+# ---------------------------------------------------------------------------
+# The registers Capstone's enum cannot name, classified from QEMU's side.
+#
+# A row above gets its generic ID from whichever Capstone register constant
+# routes to it.  For a register no Capstone constant names there is no such
+# route, and the row was emitted REG_NONE -- which the plugin reads as "this
+# register HAS no generic word" and refuses a dependency on.  That is a true
+# statement about the ROUTE and a false one about the REGISTER: x86's `fctrl`
+# IS the x87 control word and REG_FPCW is exactly the word for it.
+#
+# So the fold R7.2 ruled for the Capstone-reachable system registers is
+# applied here to the unreachable ones, keyed on QEMU's own name.  Existing
+# IDs only, chosen by the register's ROLE:
+#
+#   the FP CONTROL word (rounding, precision, exception masks) -> REG_FPCW
+#   the rest of the FP control-and-status file                 -> REG_FCSR
+#
+# and the split between those two is the one champsim_tracer_generic_ids.h
+# already states and measured: every FP instruction READS the control word
+# and WRITES the status word, so one ID for both manufactures a
+# read-modify-write edge between consecutive unrelated FP instructions.
+# MXCSR is named there explicitly as REG_FCSR -- one register that is
+# control and status together, which the vocabulary may not split.
+#
+# `reason` is not decoration.  R8.7 requires an ID claim to show the
+# register OBSERVED on a decode rather than merely present in a table, and
+# five of these x87 rows CANNOT be observed on any decode: QEMU does not
+# model them.  target/i386/gdbstub.c returns a literal 0 for ftag, fiseg,
+# fioff, foseg, fooff and fop -- there is no CPUX86State field to write, so
+# no TCG operation names one and no provenance bit can ever carry one.  The
+# ID is still the right answer to "what IS this register", and the reason
+# column is where the row says the answer is unreachable, so a later reader
+# does not mistake its presence for a witness.
+#
+# Rows are keyed (feature, name) in QEMU's GDB-stub namespace, which is the
+# same key the table is sorted on.
+QEMU_ONLY_REG_IDS: dict[str, dict[tuple[str, str], tuple[str, str]]] = {
+    "x86": {
+        ("org.gnu.gdb.i386.core", "fctrl"): (
+            "REG_FPCW",
+            "x87 control word (env->fpuc); OBSERVED via the declared env "
+            "range -- fnstcw's store-data provenance",
+        ),
+        ("org.gnu.gdb.i386.core", "mxcsr"): (
+            "REG_FCSR",
+            "SSE control AND status in one register (env->mxcsr); "
+            "generic_ids.h names it REG_FCSR explicitly",
+        ),
+        ("org.gnu.gdb.i386.core", "ftag"): (
+            "REG_FCSR",
+            "x87 tag word: status.  UNREACHABLE -- QEMU keeps the unpacked "
+            "env->fptags[8] and gdbstub.c returns 0 for the packed word",
+        ),
+        ("org.gnu.gdb.i386.core", "fop"): (
+            "REG_FCSR",
+            "x87 last-opcode, part of the saved FP environment.  "
+            "UNREACHABLE -- gdbstub.c returns 0; QEMU has no field",
+        ),
+        ("org.gnu.gdb.i386.core", "fioff"): (
+            "REG_FCSR",
+            "x87 last-instruction offset, saved FP environment.  "
+            "UNREACHABLE -- gdbstub.c returns 0; QEMU has no field",
+        ),
+        ("org.gnu.gdb.i386.core", "fiseg"): (
+            "REG_FCSR",
+            "x87 last-instruction selector, saved FP environment.  "
+            "UNREACHABLE -- gdbstub.c returns 0; QEMU has no field",
+        ),
+        ("org.gnu.gdb.i386.core", "fooff"): (
+            "REG_FCSR",
+            "x87 last-data offset, saved FP environment.  "
+            "UNREACHABLE -- gdbstub.c returns 0; QEMU has no field",
+        ),
+        ("org.gnu.gdb.i386.core", "foseg"): (
+            "REG_FCSR",
+            "x87 last-data selector, saved FP environment.  "
+            "UNREACHABLE -- gdbstub.c returns 0; QEMU has no field",
+        ),
+    },
+}
+
+
+def qemu_only_reg_entry(info: IsaInfo,
+                        key: QemuRegKey) -> tuple[RegEntry | None, str]:
+    """The role-dictated ID for a register no Capstone constant names."""
+    row = QEMU_ONLY_REG_IDS.get(info.key, {}).get((key.feature, key.name))
+    if row is None:
+        return None, ""
+    return RegEntry(row[0]), row[1]
 
 
 def qemu_reg_rows(info: IsaInfo) -> tuple[list[QemuRegRow], list[str]]:
@@ -4534,9 +4630,11 @@ def qemu_reg_rows(info: IsaInfo) -> tuple[list[QemuRegRow], list[str]]:
 
     conflicts: list[str] = list(orphans)
     rows: list[QemuRegRow] = []
+    qemu_only = dict(QEMU_ONLY_REG_IDS.get(info.key, {}))
     for key in sorted(known, key=lambda k: (k.feature, k.name)):
         routed = by_key.get(key, [])
         entry = None
+        reason = ""
         if routed:
             distinct = {e for _, e in routed}
             if len(distinct) > 1:
@@ -4546,8 +4644,23 @@ def qemu_reg_rows(info: IsaInfo) -> tuple[list[QemuRegRow], list[str]]:
                                 + (f"+{list(e.aliases)}" if e.aliases else "")
                                 for c, e in sorted(routed)))
             entry = routed[0][1]
+            if (key.feature, key.name) in qemu_only:
+                # A rule for a register a Capstone constant DOES reach is a
+                # second opinion about the same row, which is the exact
+                # disagreement keying on QEMU was meant to make impossible.
+                conflicts.append(
+                    f"{key.feature}:{key.name} has a QEMU_ONLY_REG_IDS rule "
+                    f"but is reachable from {len(routed)} Capstone row(s)")
+        else:
+            entry, reason = qemu_only_reg_entry(info, key)
+        qemu_only.pop((key.feature, key.name), None)
         rows.append(QemuRegRow(key.feature, key.name, entry,
-                               tuple(sorted(c for c, _ in routed))))
+                               tuple(sorted(c for c, _ in routed)), reason))
+    # A rule naming no register in the namespace is dead: it can never fire,
+    # and a dead rule that reads as coverage is how an allowlist lies.
+    for feature, name in sorted(qemu_only):
+        conflicts.append(f"{feature}:{name} has a QEMU_ONLY_REG_IDS rule but "
+                         f"is not in QEMU's namespace")
     return rows, conflicts
 
 
@@ -4563,9 +4676,13 @@ def format_qemu_reg_row(row: QemuRegRow) -> str:
         body = f".reg_id = {row.entry.primary}"
     if row.entry is not None and row.entry.is_int_flags:
         body += ", .is_int_flags = true"
-    comment = (f"  /* {len(row.cap_rows)} capstone row"
-               f"{'' if len(row.cap_rows) == 1 else 's'} */"
-               if row.cap_rows else "")
+    if row.cap_rows:
+        comment = (f"  /* {len(row.cap_rows)} capstone row"
+                   f"{'' if len(row.cap_rows) == 1 else 's'} */")
+    elif row.reason:
+        comment = f"  /* {row.reason} */"
+    else:
+        comment = ""
     return (f"    {{ .feature = {c_string(row.feature)}, "
             f".name = {c_string(row.name)}, "
             f"{body}, .cap_rows = {len(row.cap_rows)}, "

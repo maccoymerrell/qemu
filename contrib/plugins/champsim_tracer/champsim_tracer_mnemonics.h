@@ -78,7 +78,9 @@ typedef struct {
  * three things it has no business deciding.  A register QEMU carries
  * but Capstone's enum cannot name has no row at all (on x86_64: mxcsr,
  * fs_base/gs_base/k_gs_base, efer and the six x87 control/status words
- * -- 12 registers QEMU holds exactly).  Which QEMU register's VALUE is
+ * -- 12 registers QEMU holds exactly), so keyed that way its generic ID
+ * could only ever be REG_NONE, however plainly its role names one.
+ * Which QEMU register's VALUE is
  * published for a generic id was decided by Capstone enum ORDER, since
  * the reverse index took "the first singleton row" walking that array.
  * And two Capstone rows disagreeing about one register would each win

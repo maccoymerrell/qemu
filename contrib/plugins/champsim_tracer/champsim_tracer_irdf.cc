@@ -461,23 +461,60 @@ bool name_matches(const char *tracer_name, const char *qemu_name)
  * the same thing for a different reason: it has a TCG global index naming an
  * indirect branch's target, and needs to know whether that register is the
  * link register.  One authority, two readers.
+ *
+ * THE NAME IS QEMU'S AND SO IS THE TABLE IT IS LOOKED UP IN.  This used to
+ * walk the CAPSTONE-KEYED array and read the `.qemu_reg` a row happened to
+ * carry, which made the answer depend on a second decoder having a constant
+ * for the register -- and where it has none, the walk ran off the end and
+ * the caller was told the register has no generic word.  That is not a
+ * property of the register: x86's `fctrl` is the x87 control word whether or
+ * not `X86_REG_FCTRL` exists, and it does not.  The QEMU-indexed rows have
+ * one entry per register in QEMU's own namespace and ARE the authority for
+ * what generic slot a register is (see QemuRegRow); the Capstone-keyed table
+ * is a route to them.  So the lookup reads the authority, and the route --
+ * along with the Capstone reachability of the register -- stops deciding
+ * whether the question can be answered at all.
+ *
+ * Keyed by NAME because that is all a caller holds: `insn_dataflow_reg_name`
+ * and `insn_dataflow_field_reg` answer in QEMU's GDB-stub spelling without a
+ * feature.  Two registers in different features sharing a spelling and
+ * disagreeing about their slot would make the name an ambiguous key, so that
+ * case REFUSES rather than taking the first -- the same rule
+ * build_qemu_reg_reverse_index() applies in the other direction.
  */
 uint8_t generic_for_qemu_name(const char *name)
 {
-    if (!active_reg_table || active_reg_table_size == 0) {
+    uint8_t found = REG_ID_COUNT;
+
+    if (!active_qemu_regs || active_qemu_regs_count == 0 || !name) {
         return REG_ID_COUNT;
     }
-    for (unsigned i = 0; i < active_reg_table_size; i++) {
-        const RegClassification *rc = &active_reg_table[i];
-        if (rc->n_regs != 0 || !reg_key_valid(&rc->qemu_reg)) {
+    for (unsigned i = 0; i < active_qemu_regs_count; i++) {
+        const QemuRegRow *row = &active_qemu_regs[i];
+
+        /*
+         * REG_NONE IS NOT AN ANSWER, and it is 0, so it passes every
+         * `< REG_ID_COUNT` test while meaning the opposite.  A QREG_UNNAMED
+         * row whose role the vocabulary has no class for (x86 `efer`,
+         * `fs_base`) carries it, and returning it seats a src slot spelled
+         * REG_NONE that a published mask then points at -- measured, on
+         * `mov %fs:0x28,%rax`, whose load-address mask named REG_NONE
+         * before this test existed.  Skipped like a row with no id at all,
+         * which is what the Capstone-keyed walk did by having no row.
+         */
+        if (row->n_regs != 0 || !row->name ||
+            row->reg_id == REG_NONE || row->reg_id >= REG_ID_COUNT) {
             continue;
         }
-        if (rc->qemu_reg.name && rc->reg_id < REG_ID_COUNT &&
-            name_matches(rc->qemu_reg.name, name)) {
-            return rc->reg_id;
+        if (!name_matches(row->name, name)) {
+            continue;
         }
+        if (found != REG_ID_COUNT && found != row->reg_id) {
+            return REG_ID_COUNT;        /* ambiguous spelling: no answer */
+        }
+        found = row->reg_id;
     }
-    return REG_ID_COUNT;
+    return found;
 }
 
 namespace {

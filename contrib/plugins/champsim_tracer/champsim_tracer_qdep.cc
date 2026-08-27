@@ -296,9 +296,16 @@ uint8_t generic_for_field_name(const char *nm)
     /*
      * REG_NONE is 0, so it passes every `< REG_ID_COUNT` test while meaning
      * the opposite: the register table carries the register and states that
-     * it has NO generic word (its QREG_UNNAMED rows -- x86's fctrl and
-     * mxcsr, aarch64's fpsr and fpcr).  Returning it would put a dependency
-     * on "REG_NONE" into a published mask, which is a fabricated edge.
+     * it has NO generic word.  Returning it would put a dependency on
+     * "REG_NONE" into a published mask, which is a fabricated edge.
+     *
+     * The rows that read that way are not the same set they were.  A row
+     * Capstone cannot name USED to be REG_NONE by construction, because its
+     * generic ID came from whichever Capstone constant routed to it and no
+     * constant did -- so x86's `fctrl` said "no word" while REG_FPCW is
+     * exactly the word for it.  QEMU_ONLY_REG_IDS in the generator answers
+     * that from QEMU's side; what still reaches here is a register whose
+     * ROLE the vocabulary has no class for (x86 efer, the segment bases).
      */
     if (gen == REG_NONE) {
         return REG_ID_COUNT;

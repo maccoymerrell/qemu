@@ -3967,6 +3967,55 @@ void tcg_x86_init(void)
                                   offsetof(CPUX86State, xmm_regs),
                                   sizeof(ZMMReg), sizeof(ZMMReg),
                                   ARRAY_SIZE(((CPUX86State *)0)->xmm_regs));
+
+    /*
+     * The x87 and SSE control/status file.
+     *
+     * Same reason as the vector file: no TCG global names these, so every
+     * dependency on one arrives as a CPUArchState byte offset, and only this
+     * file knows which register that offset is.  `fnstcw` is the witness --
+     * it stores env->fpuc and nothing else, and until this declaration its
+     * store-data provenance was an unnamed range.
+     *
+     * The names are the GDB stub's, which is the namespace
+     * insn_dataflow_reg_name() answers in.  Two of them are one register in
+     * two fields: target/i386/gdbstub.c builds `fstat` as
+     * (fpus & ~0x3800) | (fpstt & 7) << 11, because QEMU keeps the x87
+     * stack top out of the status word it stores.  Both are declared under
+     * that one name, since FPSW.TOP is architecturally part of FPSW, and an
+     * access that spans the two lands in neither file's extent and refuses.
+     *
+     * `ftag` is QEMU's UNPACKED tag array, one byte per stack slot, and the
+     * whole array is the one architectural tag word -- so it is declared as
+     * a single 8-byte register rather than eight.  (The gdbstub reports 0
+     * for the packed word rather than composing it; the storage here is
+     * nonetheless what x87 execution reads and writes.)
+     *
+     * env->fpregs[] -- the stack itself -- stays undeclared, for the reason
+     * stated above the vector file: it is indexed by PHYSICAL register while
+     * st0..st7 are relative to fpstt, so an offset does not name an ST(i)
+     * without a run-time top.
+     */
+    insn_dataflow_declare_regfile("fctrl", NULL,
+                                  offsetof(CPUX86State, fpuc),
+                                  sizeof(((CPUX86State *)0)->fpuc),
+                                  sizeof(((CPUX86State *)0)->fpuc), 1);
+    insn_dataflow_declare_regfile("fstat", NULL,
+                                  offsetof(CPUX86State, fpus),
+                                  sizeof(((CPUX86State *)0)->fpus),
+                                  sizeof(((CPUX86State *)0)->fpus), 1);
+    insn_dataflow_declare_regfile("fstat", NULL,
+                                  offsetof(CPUX86State, fpstt),
+                                  sizeof(((CPUX86State *)0)->fpstt),
+                                  sizeof(((CPUX86State *)0)->fpstt), 1);
+    insn_dataflow_declare_regfile("ftag", NULL,
+                                  offsetof(CPUX86State, fptags),
+                                  sizeof(((CPUX86State *)0)->fptags),
+                                  sizeof(((CPUX86State *)0)->fptags), 1);
+    insn_dataflow_declare_regfile("mxcsr", NULL,
+                                  offsetof(CPUX86State, mxcsr),
+                                  sizeof(((CPUX86State *)0)->mxcsr),
+                                  sizeof(((CPUX86State *)0)->mxcsr), 1);
 }
 
 static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)

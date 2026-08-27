@@ -2970,6 +2970,41 @@ than sources per insn so the cost is lower).
      src_regs = [ REG_A, REG_B, ... ]   static source identities only
      dst_regs = [ REG_C, ... ]
 
+.. _pc-as-destination:
+
+``REG_PC`` as a destination
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``dst_regs[]`` names every architectural register the instruction writes,
+and on a **block-terminal** instruction that includes the program counter.
+A translation block ends by writing the pc, and the write belongs to
+whichever instruction the block ended on — a branch usually, but at a page
+boundary an ordinary load or arithmetic instruction that no ISA manual
+calls a branch.  Both carry ``REG_PC`` in ``dst_regs[]``; the trace states
+the machine fact rather than the subset of it that happens to look like
+control flow.
+
+**The consumer contract.**  A pc write is control flow, and a consumer that
+models control flow from the entry stream and ``branch_type`` should drop
+``REG_PC`` from the destination list when it builds its dependency graph.
+Left in, it manufactures a serialising write-after-write chain through
+every block boundary that no real machine has.
+
+``branch_type`` remains the sole authority on what an instruction IS.  A
+page-final ``lw`` carrying ``REG_PC`` as a destination is
+``BRANCH_NONE``, exactly as it was before it carried one, and a consumer
+must never infer a branch from the destination list.  The same holds in
+reverse: the presence or absence of ``REG_PC`` says nothing about the
+instruction's class.
+
+Where the pc destination has a ``dst_dep[]`` mask, the mask is whatever
+the emitters stated about the value's provenance — the target registers of
+a real indirect branch, for instance.  Where they stated nothing, because
+the block-final pc is a constant the translator computed rather than a
+value derived from the instruction's inputs, the slot carries the format's
+all-inputs default.  It never carries the immediate bit: the next-PC is
+not a field of the instruction's encoding.
+
    delta fields for this instruction:
 
      CST_FID_DST_REG0  -> value of REG_C after execution

@@ -3889,12 +3889,21 @@ static uint32_t alt_assemble_bb(uint64_t pc,
                 }
                 n++;
                 advanced = true;
+                if (awaiting_delay_slot) {
+                    /* This fragment OPENED with the pending branch's delay
+                     * slot, and the BB ends ON that slot — not at the end of
+                     * whatever else QEMU happened to translate alongside it.
+                     * The two are the same fragment only when the split put
+                     * the slot alone; a page boundary between a branch and
+                     * its slot leaves the slot at the head of an ordinary
+                     * multi-instruction translation, and taking the whole
+                     * fragment would run the block straight through the
+                     * branch it was supposed to end at. */
+                    break;
+                }
             }
             next_pc = frag->fall_through_pc;
             if (awaiting_delay_slot) {
-                /* This fragment opened with the pending branch's delay slot;
-                 * the BB ends on it.  (A bare-branch fragment is the branch
-                 * alone, so the slot is the next fragment's first insn.) */
                 awaiting_delay_slot = false;
                 sealed = true;
                 break;

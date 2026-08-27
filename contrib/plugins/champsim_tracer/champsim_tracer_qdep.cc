@@ -1,12 +1,12 @@
 /*
- * The wire's address and store-data dependencies, from the emitters that
- * stated them.
+ * The wire's dependency families, from the emitters that stated them.
  *
  * Author: Maccoy Merrell
  *
  * See champsim_tracer_qdep.h for what this replaces, what the zero-register
- * ruling decided, and why the HAS_REG flag being shared bounds the third
- * family in a way the first two were not bounded.
+ * ruling decided, why the HAS_REG flag being shared bounds both halves of
+ * the register block, and which population of the DESTINATION family is
+ * QEMU's -- the rest keeps the refiner's mask and is counted by cause.
  */
 
 #include <algorithm>
@@ -49,6 +49,11 @@ std::vector<uint8_t>  g_gen_of_reg;      /* TCG global index -> GenericRegId */
  * different rows and one merged column could not say which. */
 std::atomic<uint64_t> g_state[QDEP_STATE_COUNT];
 std::atomic<uint64_t> g_dstate[QDEP_STATE_COUNT];
+/* The destination family's own column.  Third array for the same reason
+ * there are two: a row refused here is refused for reasons the other two
+ * cannot reach -- a wire destination QEMU named only as a CPUArchState byte
+ * range -- and a merged column could not say which family that was. */
+std::atomic<uint64_t> g_wstate[QDEP_STATE_COUNT];
 
 /*
  * THE CAPSTONE SHADOW IS GONE, and that is a deletion rather than an
@@ -68,6 +73,15 @@ std::atomic<uint64_t> g_dstate[QDEP_STATE_COUNT];
 GMutex g_tally_lock;
 GHashTable *g_unmapped_name = nullptr;   /* qemu global name -> count */
 GHashTable *g_monitor_name  = nullptr;   /* reservation-monitor global -> count */
+/*
+ * A TCG global QEMU stated a WRITE to that this file has no generic word
+ * for.  Not a refusal: a name the tracer's vocabulary does not contain
+ * cannot equal any `dst_regs[d]`, so it is never the slot a mask would be
+ * written for.  Tallied because "it cannot be a destination" is a claim
+ * about a population, and a population nobody counted is a population
+ * nobody checked.
+ */
+GHashTable *g_dst_unmapped_name = nullptr;
 /*
  * Every refused row by MNEMONIC and reason.  A refusal count that cannot say
  * WHICH instructions refused cannot be adjudicated, and an unadjudicated
@@ -590,7 +604,8 @@ uint64_t carry_load_band(uint64_t m, unsigned nsrc, unsigned old_n,
     return out;
 }
 
-uint8_t qemu_named_regs(const QDepInsn *q, uint8_t *out)
+uint8_t qemu_named_regs(const QDepInsn *q, uint8_t *out,
+                        const InsnFields *f, bool dst_ok)
 {
     uint8_t n = 0;
 
@@ -622,7 +637,316 @@ uint8_t qemu_named_regs(const QDepInsn *q, uint8_t *out)
             take(q->store_data_regs[a], q->n_store_data_regs[a]);
         }
     }
+    /*
+     * The DESTINATION family's inputs, last, and ONLY the rows that will
+     * actually be published.  Last rather than first so that an instruction
+     * whose destinations name nothing the memory families did not already
+     * name keeps the exact prefix -- and therefore the exact bit positions --
+     * it had before this family existed.
+     *
+     * @dst_ok is dst_precheck()'s verdict and @f is the slot list, because a
+     * register seated for a destination the WIRE does not have is a source
+     * on the wire that no dependency refers to.  See dst_precheck().
+     */
+    if (dst_ok && f) {
+        for (uint8_t d = 0; d < f->n_dst_regs; d++) {
+            for (uint8_t k = 0; k < q->n_dst; k++) {
+                if (q->dst_reg[k] == f->dst_regs[d]) {
+                    take(q->dst_dep_regs[k], q->n_dst_dep_regs[k]);
+                    break;
+                }
+            }
+        }
+    }
     return n;
+}
+
+/*
+ * THE DESTINATION FAMILY, read off the writes QEMU's emitters stated.
+ *
+ * `writes[]` carries, per TCG global this instruction defines, the set the
+ * value came from -- the same provenance namespace the address and store-data
+ * arms fold, so the same fold_prov() reads it and the same rules decide what
+ * it may not say.  Two things are different and both are deliberate:
+ *
+ *   THE LOAD BAND IS OPEN.  @load_slots is non-NULL, because a destination
+ *   genuinely may be a value this same instruction loaded -- that is what
+ *   every load instruction is -- and the HAS_REG layout has a bit per load
+ *   slot to carry it.  An ADDRESS mask has no such bits and refuses there.
+ *
+ *   THE ROWS ARE GENERIC, NOT GLOBAL.  Several globals stand for one
+ *   architectural register: x86 lowers the flags onto cc_op, cc_dst, cc_src
+ *   and cc_src2, and the wire has ONE destination slot for REG_FLAGS.  Its
+ *   dependency set is the UNION over the globals that make it up, which is
+ *   the only fold that cannot be short -- taking any one of them would drop
+ *   the inputs the others carry.
+ *
+ * A written global with no generic word is SKIPPED and tallied, not refused.
+ * It has no name in the tracer's vocabulary, so it cannot equal any
+ * `dst_regs[d]`, so no mask is ever written for it.  What DOES decide the
+ * family is the slot side, and that is decided in qdep_apply() where
+ * `dst_regs[]` exists: a wire destination with no row here refuses the whole
+ * instruction rather than leaving one slot to be filled from the answer this
+ * flip replaces.
+ */
+void note_dst(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out,
+              const uint8_t *load_ord, unsigned n_memops)
+{
+    const unsigned nw = (g_nregs + 63) / 64;
+    std::vector<uint64_t> wr(nw ? nw : 1);
+    unsigned got;
+
+    if (g_nregs == 0) {
+        out->dst_state = QDEP_R_NORECORD;
+        return;
+    }
+    got = qemu_plugin_insn_reg_writes(tb, idx, wr.data(), nw);
+    if (got == QEMU_PLUGIN_DF_INCOMPLETE || got != nw) {
+        out->dst_state = QDEP_R_NORECORD;
+        return;
+    }
+
+    std::vector<uint64_t> w(g_prov_words);
+    for (unsigned r = 0; r < g_nregs; r++) {
+        uint8_t gen, k;
+        uint8_t memop_slots = 0;
+        QDepState rc;
+
+        if (!(wr[r / 64] & (1ULL << (r % 64)))) {
+            continue;
+        }
+        gen = g_gen_of_reg[r];
+        if (gen >= REG_ID_COUNT) {
+            const char *nm =
+                qemu_plugin_dataflow_reg_name(r, nullptr, nullptr);
+            tally(&g_dst_unmapped_name, nm ? nm : "?");
+            continue;
+        }
+        for (k = 0; k < out->n_dst; k++) {
+            if (out->dst_reg[k] == gen) {
+                break;
+            }
+        }
+        if (k == out->n_dst) {
+            if (out->n_dst >= QDEP_MAX_DST) {
+                out->dst_state = QDEP_R_WIDE;
+                return;
+            }
+            out->dst_reg[out->n_dst++] = gen;
+        }
+        if (qemu_plugin_insn_write_prov(tb, idx, r, w.data(),
+                                        g_prov_words) != g_prov_words) {
+            out->dst_state = QDEP_R_NORECORD;
+            return;
+        }
+        rc = fold_prov(w.data(), out->dst_dep_regs[k],
+                       &out->n_dst_dep_regs[k], &memop_slots);
+        if (rc == QDEP_OK) {
+            /*
+             * MEMOP ordinals into LOAD ordinals, exactly as the store-data
+             * arm does it and for the same reason: QEMU numbers the
+             * load-data provenance bits by position in the WHOLE access
+             * list and the wire's load-data band is indexed by position
+             * among the LOADS.
+             */
+            for (unsigned m = 0; m < QDEP_MAX_ACCESS; m++) {
+                if (!(memop_slots & (1u << m))) {
+                    continue;
+                }
+                if (m >= n_memops || load_ord[m] == 0xFF) {
+                    rc = QDEP_R_UNREPRESENTABLE;
+                    break;
+                }
+                out->dst_dep_load_slots[k] |= (uint8_t)(1u << load_ord[m]);
+            }
+        }
+        if (rc != QDEP_OK) {
+            out->dst_state = rc;
+            return;
+        }
+    }
+    out->dst_state = QDEP_OK;
+}
+
+/*
+ * Publish the destination family, or say why it was not published.
+ *
+ * The matching runs HERE and not in note_dst() because it needs
+ * `dst_regs[]`, which does not exist until the template builder has run the
+ * operand walk.  What is matched is a GENERIC register on both sides: the
+ * wire's destination slot d names dst_regs[d], and QEMU's rows name the
+ * register each write folded to, so slot d takes the row for the same
+ * register no matter what ORDER either side enumerated in.  There is no
+ * k-th-of-one-is-k-th-of-the-other assumption to make.
+ *
+ * THE WHOLE FAMILY REFUSES ON ONE UNMATCHED SLOT.  A wire destination QEMU
+ * named only as a CPUArchState byte range -- x86's XMM and x87 files,
+ * aarch64's V registers -- has no row here (#218).  Filling the slots that
+ * DID match and leaving that one as the refiner left it would publish a
+ * block whose entries come from two sources, which is worse than either
+ * source alone: nothing downstream can tell which entry is which.
+ *
+ * AND A REFUSED FAMILY KEEPS WHAT THE REFINER WROTE.  Not the all-inputs
+ * default -- that is a WIDENING of a published mask, and widening the
+ * remainder is a separate decision that belongs with the numbers for it,
+ * not with this flip.  The surviving population is counted by cause and by
+ * mnemonic so the size of the decision is a measurement.
+ */
+/*
+ * WILL the destination family be written, and if not, why.
+ *
+ * Split out from the writing because the answer is needed BEFORE the source
+ * index is rebuilt.  qemu_named_regs() seats every register a published mask
+ * could name at the head of src_regs[], and seating one for a family that
+ * then publishes nothing puts a register on the wire that no dependency
+ * refers to.  That is not hypothetical: the first draft seated the PC write's
+ * provenance on every aarch64 `br x17`, whose wire destination list is EMPTY,
+ * and 1,786 instructions gained a REG_IP source with nothing pointing at it.
+ * The validator's static_reg_sets check failed on 11 of them, which is the
+ * gate doing its job -- and the reason this predicate exists.
+ *
+ * Every test here reads q, f->dst_regs[] and the two flags; none reads a bit
+ * position, so all of it is decidable before the permutation.  The one check
+ * that is NOT here is regs_to_mask()'s, and it cannot fail after the prefix
+ * is seated: the prefix is exactly the set of registers those masks name.
+ */
+unsigned dst_precheck(const InsnFields *f, const QDepInsn *q,
+                      char *why, size_t whysz)
+{
+    unsigned st = q->dst_state;
+
+    if (f->n_dst_regs == 0) {
+        return QDEP_NONE;       /* no slot: no dst_dep[] array to write */
+    }
+    if (f->n_dst_regs > MAX_DST_REGS) {
+        return QDEP_R_WIDE;
+    }
+    if (st != QDEP_OK) {
+        return st;
+    }
+    for (uint8_t d = 0; d < f->n_dst_regs; d++) {
+        uint8_t k;
+
+        for (k = 0; k < q->n_dst; k++) {
+            if (q->dst_reg[k] == f->dst_regs[d]) {
+                break;
+            }
+        }
+        if (k == q->n_dst) {
+            g_snprintf(why, whysz, "no QEMU write row for %s",
+                       generic_reg_name_or_unknown(f->dst_regs[d]));
+            return QDEP_R_DST_UNNAMED;
+        }
+        /*
+         * R7.1's gate.  See QDEP_R_DST_SELF: a destination inside its own
+         * provenance is an in-place lowering as often as it is an
+         * accumulate, and nothing stated here separates them.
+         */
+        for (uint8_t z = 0; z < q->n_dst_dep_regs[k]; z++) {
+            if (q->dst_dep_regs[k][z] == q->dst_reg[k]) {
+                g_snprintf(why, whysz, "%s in its own provenance",
+                           generic_reg_name_or_unknown(q->dst_reg[k]));
+                return QDEP_R_DST_SELF;
+            }
+        }
+        /*
+         * THE CONSTANT GATE.  The store-data family substitutes the immediate
+         * bit into an empty mask; this family may not, and the difference is
+         * which ways the set can be empty.
+         *
+         * A store's datum arrives on a provenance whose every short shape is
+         * already a refusal one gate earlier, so an empty set there leaves
+         * exactly one candidate: the encoding.  A destination's does not.  It
+         * can be empty because the value is the instruction's immediate,
+         * because the source operand was the architectural ZERO REGISTER
+         * whose note never reaches writes[].prov, or because the instruction
+         * genuinely breaks the chain.  Choosing between those would be a
+         * guess, and one of the three is the case R7.3 rules on by name.
+         */
+        if (q->n_dst_dep_regs[k] == 0 && q->dst_dep_load_slots[k] == 0) {
+            g_snprintf(why, whysz, "empty set for %s",
+                       generic_reg_name_or_unknown(q->dst_reg[k]));
+            return QDEP_R_DST_UNSTATED_CONST;
+        }
+    }
+    if (f->has_immediate) {
+        g_snprintf(why, whysz, "immediate no provenance can mention");
+        return QDEP_R_DST_UNSTATED_CONST;
+    }
+    if (!f->has_reg_deps) {
+        /*
+         * The flag is clear, so dst_dep[] is not on the wire at all and the
+         * consumer is already at the all-inputs default.  Counted apart so
+         * the cost of not promoting the flag is a number -- and the prefix
+         * is not seated for it, because nothing will name those registers.
+         */
+        return QDEP_NO_BLOCK;
+    }
+    return QDEP_OK;
+}
+
+/*
+ * Publish the destination family, or say why it was not published.
+ *
+ * The matching runs HERE and not in note_dst() because it needs
+ * `dst_regs[]`, which does not exist until the template builder has run the
+ * operand walk.  What is matched is a GENERIC register on both sides: the
+ * wire's destination slot d names dst_regs[d], and QEMU's rows name the
+ * register each write folded to, so slot d takes the row for the same
+ * register no matter what ORDER either side enumerated in.  There is no
+ * k-th-of-one-is-k-th-of-the-other assumption to make.
+ *
+ * THE WHOLE FAMILY REFUSES ON ONE UNMATCHED SLOT.  A wire destination QEMU
+ * named only as a CPUArchState byte range -- x86's XMM and x87 files,
+ * aarch64's V registers -- has no row here (#218).  Filling the slots that
+ * DID match and leaving that one as the refiner left it would publish a
+ * block whose entries come from two sources, which is worse than either
+ * source alone: nothing downstream can tell which entry is which.
+ *
+ * AND A REFUSED FAMILY KEEPS WHAT THE REFINER WROTE.  Not the all-inputs
+ * default -- that is a WIDENING of a published mask, and widening the
+ * remainder is a separate decision that belongs with the numbers for it,
+ * not with this flip.  The surviving population is counted by cause and by
+ * mnemonic so the size of the decision is a measurement.
+ */
+void apply_dst(InsnFields *f, const QDepInsn *q, const char *mnem,
+               unsigned wstate, const char *why)
+{
+    if (wstate != QDEP_OK) {
+        if (wstate != QDEP_NONE && wstate != QDEP_NO_BLOCK) {
+            note_refusal(mnem, wstate, "dst  ", why);
+        }
+        g_wstate[wstate].fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    for (uint8_t d = 0; d < f->n_dst_regs; d++) {
+        uint8_t k;
+        uint64_t m = 0;
+        char w2[64] = "";
+
+        for (k = 0; k < q->n_dst; k++) {
+            if (q->dst_reg[k] == f->dst_regs[d]) {
+                break;
+            }
+        }
+        if (k == q->n_dst ||
+            !regs_to_mask(f, q->dst_dep_regs[k], q->n_dst_dep_regs[k],
+                          q->dst_dep_load_slots[k], &m, w2, sizeof(w2))) {
+            /*
+             * Unreachable by construction -- the prefix seated exactly these
+             * registers -- so it is a REFUSAL and not a fallback: publishing
+             * the slots that did resolve would leave the rest carrying the
+             * answer this flip replaces, and the block would come from two
+             * sources at once.
+             */
+            note_refusal(mnem, QDEP_R_UNREPRESENTABLE, "dst  ", w2);
+            g_wstate[QDEP_R_UNREPRESENTABLE]
+                .fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        f->dst_dep_mask[d] = m;
+    }
+    g_wstate[QDEP_OK].fetch_add(1, std::memory_order_relaxed);
 }
 
 const char *state_name(unsigned s)
@@ -640,6 +964,9 @@ const char *state_name(unsigned s)
     case QDEP_R_REINDEX:        return "refused: QEMU's own source index does not fit (src slots or mask width)";
     case QDEP_R_HELPER_UNSTATED:return "refused: a helper-performed access whose operand travels through no argument (CP1)";
     case QDEP_NO_BLOCK:         return "stated by QEMU but the wire's HAS_REG flag is clear: consumer already at the default";
+    case QDEP_R_DST_UNNAMED:    return "refused: a wire destination QEMU named only as env state, not as a TCG global (#218)";
+    case QDEP_R_DST_UNSTATED_CONST: return "refused: a destination's value came from a constant QEMU's provenance cannot name -- an immediate, or the zero register R7.3 forbids dropping";
+    case QDEP_R_DST_SELF:       return "refused: a destination is in its own provenance and R7.1 says only the INSTRUCTION's own source counts (in-place lowering)";
     default:                    return "?";
     }
 }
@@ -663,7 +990,7 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
 
     st.struct_size = sizeof(st);
     if (!qemu_plugin_insn_dataflow_status(tb, idx, &st)) {
-        out->state = out->data_state = QDEP_R_NORECORD;
+        out->state = out->data_state = out->dst_state = QDEP_R_NORECORD;
         return;
     }
     /*
@@ -696,7 +1023,7 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
     if (st.memops_truncated || st.memops_unnoted ||
         st.fields_truncated || st.writes_truncated || st.prov_truncated ||
         st.n_helper_unbounded) {
-        out->state = out->data_state = QDEP_R_STATUS;
+        out->state = out->data_state = out->dst_state = QDEP_R_STATUS;
         return;
     }
 
@@ -705,7 +1032,7 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
     }
     n = qemu_plugin_insn_memops(tb, idx, mo, kMaxMemops);
     if (n == QEMU_PLUGIN_DF_INCOMPLETE || n > kMaxMemops) {
-        out->state = out->data_state = QDEP_R_NORECORD;
+        out->state = out->data_state = out->dst_state = QDEP_R_NORECORD;
         return;
     }
 
@@ -718,8 +1045,17 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
     out->have_list = true;
 
     if (n == 0) {
-        /* No accesses: nothing to state, for either family. */
+        /*
+         * No accesses: nothing to state for either MEMORY family.  The
+         * destination family does not read the access list and is extracted
+         * all the same -- an ALU instruction has no memop and is exactly
+         * where dst_dep[] carries the whole of the answer.
+         */
+        uint8_t no_loads[kMaxMemops];
+
+        memset(no_loads, 0xFF, sizeof(no_loads));
         out->state = out->data_state = QDEP_NONE;
+        note_dst(tb, idx, out, no_loads, 0);
         return;
     }
 
@@ -754,7 +1090,7 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
          * that direction rather than publish a truncated slot layout.
          */
         if ((store ? out->n_stores : out->n_loads) >= QDEP_MAX_ACCESS) {
-            out->state = out->data_state = QDEP_R_STATUS;
+            out->state = out->data_state = out->dst_state = QDEP_R_STATUS;
             out->have_list = false;
             return;
         }
@@ -773,7 +1109,7 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
          */
         if (qemu_plugin_insn_memop_addr_prov(tb, idx, i, w.data(),
                                              g_prov_words) != g_prov_words) {
-            out->state = out->data_state = QDEP_R_NORECORD;
+            out->state = out->data_state = out->dst_state = QDEP_R_NORECORD;
             out->have_list = false;
             return;
         }
@@ -854,6 +1190,7 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
     if (out->data_state == QDEP_NONE && out->n_stores > 0) {
         out->data_state = QDEP_OK;
     }
+    note_dst(tb, idx, out, load_ord, n);
 }
 
 void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
@@ -869,11 +1206,13 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
          */
         g_state[QDEP_NONE].fetch_add(1, std::memory_order_relaxed);
         g_dstate[QDEP_NONE].fetch_add(1, std::memory_order_relaxed);
+        g_wstate[QDEP_NONE].fetch_add(1, std::memory_order_relaxed);
         return;
     }
 
     unsigned state = q->state;
     unsigned dstate = q->data_state;
+    char wwhy[64] = "";
 
     /* ---------------- ADMISSION: the slot counts are QEMU's ------------- */
     /*
@@ -908,9 +1247,12 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
 
     /*
      * The register masks were written against the OLD load run and have to
-     * be re-seated onto the new one.  dst_dep_mask[] is the refiners' and is
-     * not rewritten below, so it is carried here; store_data_dep_mask[] is
-     * overwritten in full further down and needs no carry.
+     * be re-seated onto the new one.  store_data_dep_mask[] is overwritten
+     * in full further down and needs no carry; dst_dep_mask[] is overwritten
+     * only where QEMU could state it, so the carry is what keeps the rows it
+     * could NOT state readable in the new layout -- those keep the refiner's
+     * answer, and a refiner's answer indexed against a load run that no
+     * longer exists would name a slot that means something else.
      */
     if (mdl_old != mdl_new) {
         for (uint8_t d = 0; d < f->n_dst_regs; d++) {
@@ -921,10 +1263,48 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
         }
     }
 
+    /*
+     * Seat QEMU's own register list at the head of src_regs[], so every mask
+     * written below is written in a coordinate system QEMU owns.  Done after
+     * the counts and before the masks, because the permutation carries the
+     * load-data band with it and that band's width is the count just set.
+     *
+     * AND BEFORE THE NO-SLOT RETURN, which it was not until the destination
+     * family arrived.  An instruction with no memory access used to leave
+     * here with nothing to write; it now has a dst_dep[] to write, and a
+     * mask indexed against the operand walk's order while claiming to be
+     * QEMU's is exactly the coupling J3 measured and refused.
+     */
+    unsigned wstate = dst_precheck(f, q, wwhy, sizeof(wwhy));
+    {
+        uint8_t qregs[MAX_SRC_REGS];
+        uint8_t nq = qemu_named_regs(q, qregs, f, wstate == QDEP_OK);
+
+        if (nq && !reindex_src_for_qemu(f, rn, qregs, nq)) {
+            /*
+             * The index could not be seated, so nothing below can be
+             * written in QEMU's coordinates.  Refuse all three families
+             * rather than publish a mask indexed against the operand walk's
+             * order while claiming it is QEMU's.
+             */
+            f->has_addr_deps = false;
+            g_state[QDEP_R_REINDEX].fetch_add(1, std::memory_order_relaxed);
+            if (f->has_reg_deps) {
+                for (uint8_t st = 0; st < f->max_dep_stores; st++) {
+                    f->store_data_dep_mask[st] = all_inputs_mask(f);
+                }
+            }
+            g_dstate[QDEP_R_REINDEX].fetch_add(1, std::memory_order_relaxed);
+            note_refusal(mnem, QDEP_R_REINDEX, "dst  ", nullptr);
+            g_wstate[QDEP_R_REINDEX].fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+
     if (mdl_new == 0 && mds_new == 0) {
         /*
-         * No slots at all: neither block has an array to live in, whatever
-         * either side said.  Where that is QEMU's own answer -- an
+         * No slots at all: neither MEMORY block has an array to live in,
+         * whatever either side said.  Where that is QEMU's own answer -- an
          * instruction with no accesses -- it is not a refusal and there is
          * no claim here to refuse; where it is a refusal it is counted as
          * one, so the cost of the honest default is a number.
@@ -942,35 +1322,8 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
             g_state[QDEP_NONE].fetch_add(1, std::memory_order_relaxed);
             g_dstate[QDEP_NONE].fetch_add(1, std::memory_order_relaxed);
         }
+        apply_dst(f, q, mnem, wstate, wwhy);
         return;
-    }
-    /*
-     * Seat QEMU's own register list at the head of src_regs[], so every mask
-     * written below is written in a coordinate system QEMU owns.  Done after
-     * the counts and before the masks, because the permutation carries the
-     * load-data band with it and that band's width is the count just set.
-     */
-    {
-        uint8_t qregs[MAX_SRC_REGS];
-        uint8_t nq = qemu_named_regs(q, qregs);
-
-        if (nq && !reindex_src_for_qemu(f, rn, qregs, nq)) {
-            /*
-             * The index could not be seated, so nothing below can be
-             * written in QEMU's coordinates.  Refuse both families rather
-             * than publish a mask indexed against the operand walk's order
-             * while claiming it is QEMU's.
-             */
-            f->has_addr_deps = false;
-            g_state[QDEP_R_REINDEX].fetch_add(1, std::memory_order_relaxed);
-            if (f->has_reg_deps) {
-                for (uint8_t st = 0; st < f->max_dep_stores; st++) {
-                    f->store_data_dep_mask[st] = all_inputs_mask(f);
-                }
-            }
-            g_dstate[QDEP_R_REINDEX].fetch_add(1, std::memory_order_relaxed);
-            return;
-        }
     }
 
     /* ---------------- the HAS_ADDR block ---------------- */
@@ -1031,6 +1384,7 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
         /* No store slot: no store_data_dep[] array exists to write. */
         g_dstate[dstate == QDEP_OK ? QDEP_NONE : dstate]
             .fetch_add(1, std::memory_order_relaxed);
+        apply_dst(f, q, mnem, wstate, wwhy);
         return;
     }
 
@@ -1085,6 +1439,7 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
         }
         g_dstate[dstate == QDEP_OK ? QDEP_NO_BLOCK : dstate]
             .fetch_add(1, std::memory_order_relaxed);
+        apply_dst(f, q, mnem, wstate, wwhy);
         return;
     }
 
@@ -1103,31 +1458,41 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
         note_refusal(mnem, dstate, "sdata", dwhy);
     }
     g_dstate[dstate].fetch_add(1, std::memory_order_relaxed);
+
+    apply_dst(f, q, mnem, wstate, wwhy);
 }
 
 void qdep_report(GString *report)
 {
-    uint64_t total = 0, dtotal = 0;
+    uint64_t total = 0, dtotal = 0, wtotal = 0;
 
     for (unsigned s = 0; s < QDEP_STATE_COUNT; s++) {
         total += g_state[s].load(std::memory_order_relaxed);
         dtotal += g_dstate[s].load(std::memory_order_relaxed);
+        wtotal += g_wstate[s].load(std::memory_order_relaxed);
     }
-    if (total == 0 && dtotal == 0) {
+    if (total == 0 && dtotal == 0 && wtotal == 0) {
         return;
     }
 
     g_string_append(report,
-        "\n=== address and store-data dependencies: the source is QEMU's "
-        "emitters ===\n"
-        "Three of the template dependency sub-block's four families --\n"
-        "load_addr_dep[], store_addr_dep[] and store_data_dep[] -- are\n"
-        "written from the provenance QEMU's own tcg_gen_qemu_ld/st emitters\n"
-        "stated for each access, and the number of SLOTS each family has is\n"
-        "the length of that access list.  A row this extractor cannot state\n"
-        "IN FULL reaches the format's own default -- all-inputs for a mask,\n"
-        "ZERO slots for a count -- and never falls back to the Capstone\n"
-        "operand walk.  The refusal rows below are that default, counted.\n");
+        "\n=== template dependencies: the source is QEMU's emitters ===\n"
+        "All FOUR of the template dependency sub-block's families --\n"
+        "load_addr_dep[], store_addr_dep[], store_data_dep[] and\n"
+        "dst_dep[] -- are written from the provenance QEMU's own emitters\n"
+        "stated: the three memory families from what each\n"
+        "tcg_gen_qemu_ld/st named, and dst_dep[] from what each register\n"
+        "WRITE named.  The number of SLOTS the memory families have is the\n"
+        "length of that access list.\n"
+        "\n"
+        "A memory row this extractor cannot state IN FULL reaches the\n"
+        "format's own default -- all-inputs for a mask, ZERO slots for a\n"
+        "count -- and never falls back to the Capstone operand walk.  A\n"
+        "DESTINATION row it cannot state keeps what the refiner wrote,\n"
+        "which is the one place a Capstone answer still reaches the wire;\n"
+        "it is counted by cause and by mnemonic below, because widening\n"
+        "that remainder to the default is a decision that belongs with the\n"
+        "numbers for it and not with the flip.\n");
 
     g_string_append(report, "\naddress families (HAS_ADDR):\n");
     for (unsigned s = 0; s < QDEP_STATE_COUNT; s++) {
@@ -1146,6 +1511,17 @@ void qdep_report(GString *report)
                                    "  %s\n", v, state_name(s));
         }
     }
+    g_string_append(report,
+        "\ndestination family (the HAS_REG block's dst_dep[]);\n"
+        "every row NOT reading `PUBLISHED from QEMU's emitters` or\n"
+        "`no accesses / no dataflow ABI` still carries the refiner's mask:\n");
+    for (unsigned s = 0; s < QDEP_STATE_COUNT; s++) {
+        uint64_t v = g_wstate[s].load(std::memory_order_relaxed);
+        if (v) {
+            g_string_append_printf(report, "  %10" G_GUINT64_FORMAT
+                                   "  %s\n", v, state_name(s));
+        }
+    }
     if (g_refusal) {
         g_string_append_printf(report, "  extractor DISABLED: %s\n", g_refusal);
     }
@@ -1157,5 +1533,7 @@ void qdep_report(GString *report)
                "refused rows by mnemonic and reason (the format default,\nwritten out; `count` means the SLOT COUNT went to zero):");
     dump_tally(report, g_monitor_name,
                "reservation-monitor value globals a store's datum named\n(the emulation-artefact category, #177 / f46873a738 -- NOT a decoder gap):");
+    dump_tally(report, g_dst_unmapped_name,
+               "globals QEMU stated a WRITE to that have no generic word\n(skipped, not refused: a name the tracer's vocabulary does not contain\ncannot equal any dst_regs[d], so no mask is ever written for it):");
     g_mutex_unlock(&g_tally_lock);
 }

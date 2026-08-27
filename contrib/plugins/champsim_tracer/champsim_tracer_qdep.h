@@ -1,21 +1,30 @@
 /*
- * The wire's ADDRESS and STORE-DATA dependencies, from the emitters that
- * stated them.
+ * The wire's dependency families, from the emitters that stated them.
  *
  * Author: Maccoy Merrell
  *
  * WHAT THIS IS, and it is not another instrument.  champsim_tracer_irdf.cc
  * READS QEMU's dataflow and scores it against Capstone's; this file makes
- * QEMU's answer THE SOURCE of three of the wire's four dependency families:
+ * QEMU's answer THE SOURCE of all four of the wire's dependency families:
  *
  *   load_addr_dep_mask[]   the format's HAS_ADDR block
  *   store_addr_dep_mask[]  the format's HAS_ADDR block
  *   store_data_dep_mask[]  half of the format's HAS_REG block
+ *   dst_dep_mask[]         the other half
  *
- * Capstone's answer survives here only as a shadow that is compared and
- * counted; it does not reach the wire.  The fourth family, `dst_dep_mask[]`,
- * is not flipped and is still the refiners' -- see "the HAS_REG flag is
- * shared" below for what that costs and why nothing is faked to hide it.
+ * The first three are written from the provenance each tcg_gen_qemu_ld/st
+ * emitter stated for its access; the fourth from the provenance each
+ * register WRITE stated.  Capstone's answer reaches none of them on the rows
+ * this file publishes.
+ *
+ * THE DESTINATION FAMILY IS FLIPPED FOR A NAMED POPULATION, not for all of
+ * it, and the difference is stated rather than smoothed over.  Where QEMU's
+ * write provenance describes a destination in full the mask is QEMU's; where
+ * it does not, the row keeps what the refiner wrote and is COUNTED by cause
+ * -- QDEP_R_DST_UNSTATED_CONST, QDEP_R_DST_SELF, QDEP_R_DST_UNNAMED, each
+ * with the ruling or the missing mechanism that put it there.  That is a
+ * shrinking work list with numbers attached, not a justification for the
+ * remainder: qdep_report() prints every bucket on every run.
  *
  * WHY THE ADDRESS FAMILIES WENT FIRST.  Because they were the two measured
  * ready, and the measurement was the reason rather than the decoration.  On
@@ -122,9 +131,9 @@
  * `swr`'s published store address on a stricter reading of the field than
  * the field has ever had -- measured, one row.
  *
- * THE HAS_REG FLAG IS SHARED, and that bounds this flip in a way the address
- * flip was not bounded.  One wire bit, `CST_DEP_BLOCK_HAS_REG`, governs
- * `dst_dep[]` AND `store_data_dep[]` together (docs/format.rst).  So:
+ * THE HAS_REG FLAG IS SHARED, and that bounds both halves of it the same
+ * way.  One wire bit, `CST_DEP_BLOCK_HAS_REG`, governs `dst_dep[]` AND
+ * `store_data_dep[]` together (docs/format.rst).  So:
  *
  *   - When the flag is already set, `store_data_dep[]` is overwritten here:
  *     with QEMU's mask when QEMU can state it, and otherwise with the
@@ -134,12 +143,12 @@
  *     consumer is already at the default.  Nothing is published and nothing
  *     needs to be: there is no Capstone answer there to displace.
  *
- * What is NOT done is setting the flag in order to publish a store-data mask
- * -- that would force an all-inputs `dst_dep[]` out of a family whose source
- * has not moved, spending real wire bytes to say what absence already says.
- * The rows where QEMU could have stated a mask the flag left unpublished are
- * COUNTED and reported, so the size of that choice is a number rather than
- * an argument.
+ * The destination half reads the same flag the same way, and neither half
+ * SETS it: promoting a clear flag to carry a mask spends real wire bytes to
+ * say what absence already says, and it would force the OTHER half of the
+ * block to be written too.  The rows where QEMU could have stated a mask
+ * that the flag left unpublished are COUNTED (QDEP_NO_BLOCK) in both
+ * columns, so the size of that choice is a number rather than an argument.
  */
 #ifndef CHAMPSIM_TRACER_QDEP_H
 #define CHAMPSIM_TRACER_QDEP_H
@@ -171,6 +180,16 @@ struct InsnRegNames;
  * about which instruction was refused and why.
  */
 #define QDEP_MAX_ACCESS 8
+
+/*
+ * How many DISTINCT written registers this extractor holds per instruction.
+ *
+ * QEMU's own cap is INSN_DF_MAX_WRITES = 8 and a translation that exceeds it
+ * arrives with `writes_truncated` already set, which the status gate refuses
+ * one step earlier.  Sized to match so the two caps cannot disagree about
+ * which instruction was refused and why.
+ */
+#define QDEP_MAX_DST 8
 
 /* Why an instruction's dependency block is what it is.  Exactly one applies
  * per family.  The address family cannot reach QDEP_R_EMU_MONITOR (R9's
@@ -239,6 +258,73 @@ enum QDepState : uint8_t {
      * promoting the flag is a measured number.
      */
     QDEP_NO_BLOCK,
+    /*
+     * Destination family only.  The wire has a destination slot QEMU did not
+     * name as a written TCG global -- x86's vector file and x87 stack,
+     * aarch64's V registers and every FP status word are CPUArchState byte
+     * ranges rather than globals, and inverting an offset back to a register
+     * needs a layout a plugin does not have and must not hard-code (#218).
+     *
+     * The whole family refuses on it rather than the one slot, because a
+     * mask written for the slots that DID match would be published beside a
+     * slot left carrying the answer this flip replaces, and a block whose
+     * entries come from two sources is the shape nothing downstream can
+     * read.
+     */
+    QDEP_R_DST_UNNAMED,
+    /*
+     * Destination family only.  The value QEMU says this destination took is
+     * one QEMU's provenance CANNOT NAME, so the set it handed over is empty
+     * or missing a member and an empty set here is not evidence of absence.
+     * Two shapes, both measured, and they are one refusal because the cure
+     * is one thing -- a provenance that can name a constant:
+     *
+     *   THE INSTRUCTION'S OWN IMMEDIATE.  `add $8,%rsp` takes its result from
+     *   RSP and from the encoded 8.  QEMU's provenance is a set of REGISTERS
+     *   and interned env ranges; a tcg_constant contributes nothing to it, so
+     *   the extracted set is {RSP} and the wire's immediate bit -- which the
+     *   format has, and which the refiner sets -- would go dark.  496 x86_64
+     *   rows on the four-ISA workload.
+     *
+     *   THE ARCHITECTURAL ZERO REGISTER.  `li a0,5` is `addi a0,x0,5`, and
+     *   R7.3 is verbatim "REG_ZERO exists, so it should be specified.  We
+     *   should not be dropping reg zero."  insn_dataflow_note_zero_reg()
+     *   states it -- but the note is consumed at ONE place, the store-data
+     *   provenance of a memop (accel/tcg/insn-dataflow.c, `df_zero_reg_temp`
+     *   on `m->data_prov`), and never reaches writes[].prov.  So a register
+     *   WRITE whose source operand was x0 arrives here with an empty set.
+     *   805 riscv64 rows.
+     *
+     * Refused rather than filled in.  Substituting the immediate bit into an
+     * empty mask -- which the store-data family does, on a provenance whose
+     * every short shape is already a refusal -- would here be a GUESS between
+     * the three ways a destination's set can be empty, and one of the three
+     * is the zero register a standing ruling forbids dropping.
+     */
+    QDEP_R_DST_UNSTATED_CONST,
+    /*
+     * Destination family only.  QEMU's provenance for a destination names
+     * THAT DESTINATION, and R7.1 rules on exactly this:
+     *
+     *   "the fact that a register's upper contents may not be modified does
+     *    not imply it is a source AND a destination for the instruction
+     *    unless the instruction specifically takes it as a source."
+     *
+     * The emitter-stated model cannot answer "specifically takes it as a
+     * source", because a lowering that computes IN PLACE into the
+     * destination global reads that global whether the instruction does or
+     * not.  Witnessed, on a dump rather than argued -- riscv64 `flw fa0,
+     * 0(a6)` at 0x105d2 emits `nanbox_s(cpu_fpr[rd], cpu_fpr[rd])` and QEMU
+     * reports `w reg=f10/fa0 from=f10/fa0,L0`, so fa0 is in its own set for
+     * an instruction that takes no FP source at all.  Same shape on mipsel
+     * `lwc1`, aarch64 `ldrsb w1,[x2],#1` and x86 `mov %fs:0x610,%al`.
+     *
+     * A genuine accumulate -- `add %rax,%rbx` -- is indistinguishable from
+     * here, so the family refuses rather than guessing which self-reference
+     * is architectural.  The refiner's mask, which R7.1 adjudicated the
+     * tracer RIGHT on across 279 rows, is what stays.
+     */
+    QDEP_R_DST_SELF,
     QDEP_STATE_COUNT
 };
 
@@ -292,6 +378,31 @@ struct QDepInsn {
      * interleave, reading one as the other names a different slot.
      */
     uint8_t store_data_load_slots[QDEP_MAX_ACCESS];
+
+    /*
+     * THE DESTINATION FAMILY -- `dst_dep[]`, the other half of HAS_REG.
+     *
+     * One row per DISTINCT GENERIC register QEMU stated a write to, with the
+     * inputs that write's value came from.  Generic rather than TCG-global
+     * indexed because several globals stand for one architectural register
+     * -- x86's cc_op / cc_dst / cc_src / cc_src2 are all REG_FLAGS -- and
+     * the wire has ONE destination slot for that register, whose dependency
+     * set is the union over the globals that make it up.
+     *
+     * A written global with no generic word is not a row: it cannot equal
+     * any `dst_regs[d]`, so it can never be the slot a mask is written for.
+     * It is tallied by name so the population is visible rather than
+     * assumed, and the SLOT side is what decides the family -- a wire
+     * destination with no row here refuses the whole instruction
+     * (QDEP_R_DST_UNNAMED), which is the only direction that cannot publish
+     * a short mask.
+     */
+    uint8_t dst_state;
+    uint8_t n_dst;
+    uint8_t dst_reg[QDEP_MAX_DST];              /* generic id written */
+    uint8_t n_dst_dep_regs[QDEP_MAX_DST];
+    uint8_t dst_dep_regs[QDEP_MAX_DST][QDEP_MAX_ADDR_REGS];
+    uint8_t dst_dep_load_slots[QDEP_MAX_DST];   /* by LOAD ordinal */
 };
 
 /*

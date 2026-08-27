@@ -577,8 +577,19 @@ Decode by repeated outer-section unwrapping.
         and ``store_data_dep`` — come from QEMU's own translation: the
         address and data provenance its ``tcg_gen_qemu_ld/st`` emitters
         stated for each access, which is what the emulator computed
-        rather than what a decoder says the operands name.  The fourth,
-        ``dst_dep``, is derived from the instruction's decoded operands.
+        rather than what a decoder says the operands name.
+
+        The fourth, ``dst_dep``, comes from the same translation on the
+        instructions QEMU's write provenance describes in full — the
+        set each register WRITE was stated to have come from — and from
+        the instruction's decoded operands on the rest.  The rest is not
+        a leftover but a named set, and a run says how large it is: the
+        tracer's statistics report a ``destination family`` census whose
+        buckets are the reasons, among them a destination QEMU names
+        only as a ``CPUArchState`` byte range, a value taken from a
+        constant no provenance can mention, and a destination that
+        appears inside its own provenance because the lowering computed
+        in place.
 
         Two consequences are visible on the wire.  On x86-64 a
         RIP-relative access carries an EMPTY address mask —
@@ -599,7 +610,10 @@ Decode by repeated outer-section unwrapping.
         short mask for it.  For HAS_ADDR it omits the block; for
         ``store_data_dep``, whose flag is shared with ``dst_dep`` and
         therefore cannot be dropped alone, it writes the all-inputs
-        default explicitly.  Both reach the same place — the
+        default explicitly; for ``dst_dep`` under that same shared flag
+        it leaves the decoded-operand mask in place, which states no
+        more than the operands do and never less.  All reach the same
+        place — the
         over-approximation a consumer would have assumed — because a
         mask with a contributor missing would let a consumer issue an
         access ahead of a producer it actually depends on.

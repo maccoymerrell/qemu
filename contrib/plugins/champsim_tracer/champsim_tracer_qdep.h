@@ -464,6 +464,31 @@ struct QDepInsn {
      */
     uint8_t imm_stated;
     uint8_t imm_reached;
+    /*
+     * @writes_unbounded: QEMU wrote a register through a helper whose INDEX
+     * the source does not state -- aarch64 MOPS `cpyfe`/`sete`, whose
+     * destination is `env->xregs[mops_destreg(syndrome)]`.  749579ea65 made
+     * the CP-H reader say so instead of silently reporting a short set.
+     *
+     * IT IS NOT A REFUSAL CONDITION TODAY, and that is deliberate.  The
+     * #236 LIST FLIP -- replacing the wire's `dst_regs[]` with QEMU's write
+     * list -- has no honest answer for these rows: QEMU's list is short by a
+     * member it cannot name, so publishing it would DELETE an architectural
+     * destination, which is the one error direction this arc disqualifies.
+     * The flip must REFUSE the instruction rather than publish the short
+     * list, and this flag is what lets it.
+     *
+     * Carried and COUNTED before the flip exists so the size of that refusal
+     * is a measurement rather than an estimate: g_dst_would_refuse_unbounded
+     * is the population the flip's refuse route would take.  Counting it
+     * changes nothing on the wire, which is exactly why it can land first.
+     *
+     * R12.1: a refusal is an INTERIM state and never an endpoint.  These
+     * registers ARE nameable -- the index is in the instruction's own
+     * syndrome, which is where QEMU reads it -- so the coverage path is to
+     * state the index at the emitter and retire the refusal, not to keep it.
+     */
+    uint8_t writes_unbounded;
 };
 
 /*

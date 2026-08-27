@@ -198,6 +198,18 @@ std::atomic<uint64_t> g_dst_imm_absent{0};
  */
 std::atomic<uint64_t> g_dst_accum{0};
 /*
+ * THE #236 FLIP'S REFUSE ROUTE, COUNTED BEFORE THE FLIP EXISTS.
+ *
+ * An instruction whose wire destination list is non-empty AND whose QEMU
+ * write list is short by a register the source cannot name (aarch64 MOPS,
+ * `env->xregs[mops_destreg(syndrome)]`).  The flip cannot publish QEMU's
+ * list for these -- it would delete an architectural destination -- so the
+ * flip must REFUSE the instruction, and this is how many that is.
+ *
+ * Nothing is refused today: the row counts, the wire does not move.
+ */
+std::atomic<uint64_t> g_dst_would_refuse_unbounded{0};
+/*
  * Every refused row by MNEMONIC and reason.  A refusal count that cannot say
  * WHICH instructions refused cannot be adjudicated, and an unadjudicated
  * refusal is a published all-inputs default nobody ever looks at again.  The
@@ -1698,6 +1710,15 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
      */
     out->imm_stated = st.imm_stated;
     out->imm_reached = st.imm_reached;
+    /*
+     * The destination-side unbounded flag, carried but NOT acted on -- see
+     * QDepInsn::writes_unbounded.  It is deliberately not in the refusal
+     * test above: st.n_helper_unbounded there is about SOURCES the walk
+     * could not see, and refusing on it keeps a short mask off the wire.
+     * This one is about a DESTINATION QEMU wrote and could not name, which
+     * only matters once the wire's list is QEMU's -- i.e. at the flip.
+     */
+    out->writes_unbounded = st.helper_writes_unbounded;
 
     for (unsigned i = 0; i < kMaxMemops; i++) {
         mo[i].struct_size = sizeof(mo[i]);
@@ -1977,6 +1998,24 @@ void qdep_apply(InsnFields *f, InsnRegNames *rn, const QDepInsn *q,
      * QEMU's is exactly the coupling J3 measured and refused.
      */
     unsigned wstate = dst_precheck(f, q, wwhy, sizeof(wwhy));
+    /*
+     * THE #236 FLIP'S REFUSE ROUTE, COUNTED (not taken).
+     *
+     * Counted HERE and not in qdep_note_insn() because the question only
+     * exists where the wire has a destination list to replace: an
+     * instruction with no destination slot has nothing for the flip to get
+     * wrong.  `f->n_dst_regs` is that list, and it does not exist until the
+     * template builder has run.
+     *
+     * This is the population the flip would have to REFUSE rather than
+     * publish, because QEMU's write list is short by a register whose index
+     * the source does not state.  It is a lower bound on nothing and an
+     * upper bound on nothing -- it is exactly the set, and it is counted
+     * before the flip so the flip's cost is measured rather than argued.
+     */
+    if (q->writes_unbounded && f->n_dst_regs) {
+        g_dst_would_refuse_unbounded.fetch_add(1, std::memory_order_relaxed);
+    }
     /*
      * R10: seat the terminator's pc write BEFORE the source index is built,
      * so the new slot's provenance registers are in the prefix every mask
@@ -2352,6 +2391,25 @@ void qdep_report(GString *report)
         "               preserve-read are struck out at QEMU's emitters and"
         " are not in here\n",
         g_dst_accum.load(std::memory_order_relaxed));
+    g_string_append_printf(report,
+        "  %10" G_GUINT64_FORMAT "  destination rows the #236 LIST FLIP would have to"
+        " REFUSE:\n"
+        "              QEMU wrote a register through a helper whose INDEX the"
+        " source does\n"
+        "               not state (aarch64 MOPS, env->xregs[mops_destreg(syndrome)]),"
+        " so\n"
+        "               QEMU's list is SHORT and publishing it would DELETE an"
+        " architectural\n"
+        "               destination.  COUNTED, NOT REFUSED -- nothing here changes"
+        " the wire\n"
+        "               today; the row exists so the flip's refusal population is a"
+        "\n"
+        "               measurement.  R12.1: the refusal is INTERIM -- the index is"
+        " in the\n"
+        "               instruction's own syndrome, so stating it at the emitter"
+        " retires\n"
+        "               this row rather than making it permanent\n",
+        g_dst_would_refuse_unbounded.load(std::memory_order_relaxed));
     for (unsigned s = 0; s < QDEP_STATE_COUNT; s++) {
         uint64_t v = g_wstate[s].load(std::memory_order_relaxed);
         if (v) {

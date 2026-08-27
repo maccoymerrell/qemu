@@ -263,10 +263,49 @@ GHashTable *g_br2_redisp_sig;
  * cannot express at all -- no transfer, or one edge where the rule has two
  * -- so a blurred row cannot move a row the ops already answered.
  */
+/*
+ *   ctrl_redispatch_ident  the ops carried out ONE unconditional static
+ *                        edge to the instruction's own architectural
+ *                        continuation.  That shape is QEMU re-dispatching
+ *                        after a state change it cannot carry across AND
+ *                        an architectural `b .+4` AND a string
+ *                        operation's re-entry, and the ops cannot tell
+ *                        them apart -- MEASURED on the mixed-C workload,
+ *                        the same shape on the same run carried
+ *                        `aarch64 b` (a real branch to the next
+ *                        instruction, 16), `cpyfp`/`setp` (12),
+ *                        `str/sub/leaq/rdtsc/movl/nopl` (7).  The
+ *                        identity CAN tell them apart, because it names
+ *                        the rule the translator dispatched on, so the
+ *                        row answers where the ops decline.
+ *
+ *                        It fires only when the row carries a
+ *                        classification at all: a QID_SPLIT or QID_NONE
+ *                        row's BRANCH_NONE is the absence of an answer
+ *                        and publishing it would be manufacturing one.
+ *                        Those stay the NAMED REFUSAL they were.
+ */
 uint64_t g_ctrl_syscall_ident;
 uint64_t g_ctrl_folded_cond;
+uint64_t g_ctrl_redispatch_ident;
 GHashTable *g_ctrl_syscall_sig;
 GHashTable *g_ctrl_folded_sig;
+GHashTable *g_ctrl_redisp_ident_sig;
+
+/*
+ * THE REFUSALS, NAMED.
+ *
+ * Five ways this arm ends without an answer, and every one of them is
+ * counted under its own name with its own signature table.  A refusal
+ * that is only a number is a category a reader has to guess the contents
+ * of, and the wire flip these rows are staged for inherits whatever the
+ * audit could say about them -- so it has to be able to say what they
+ * ARE, not just how many.
+ */
+GHashTable *g_br2_unavail_sig;
+GHashTable *g_br2_incomplete_sig;
+GHashTable *g_br2_pending_sig;
+GHashTable *g_br2_nochain_sig;
 
 /* The identity row for an id, or nullptr.  Rows are sorted and the sort is
  * PROVEN at install, so the bisect cannot silently miss one. */
@@ -448,6 +487,26 @@ void tally(GHashTable **t, const char *key)
                         GUINT_TO_POINTER(GPOINTER_TO_UINT(v) + 1));
 }
 
+/*
+ * One refusal, recorded under its own name.  The signature carries the
+ * disassembly text and the QEMU rule so a reader can see WHAT was refused
+ * without re-running anything; the tracer's own class rides along because
+ * the refusal is exactly the row a wire flip would have to publish
+ * something for, and the value it publishes today is that one.
+ */
+void note_refusal(GHashTable **t, const qemu_plugin_insn_info *info,
+                  const char *qname, uint8_t tracer_bt, uint32_t f)
+{
+    if (!g_detail) {
+        return;
+    }
+    char sig[256];
+    g_snprintf(sig, sizeof(sig), "%-16s %-26s tracer=%-18s flags=%03x",
+               info ? info->mnemonic : "-", qname ? qname : "-",
+               branch_type_name_or_unknown(tracer_bt), f & 0x7ff);
+    tally(t, sig);
+}
+
 void note_pair(GHashTable **outer, uint32_t okey, uint32_t inner)
 {
     if (!*outer) {
@@ -588,11 +647,13 @@ void qemu_ident_note_ctrl(const struct qemu_plugin_insn *insn,
     g_mutex_lock(&g_lock);
     if (!(f & QEMU_PLUGIN_CTRL_VALID)) {
         g_br2_unavail++;
+        note_refusal(&g_br2_unavail_sig, info, qname, tracer_bt, f);
         g_mutex_unlock(&g_lock);
         return;
     }
     if (f & QEMU_PLUGIN_CTRL_INCOMPLETE) {
         g_br2_incomplete++;
+        note_refusal(&g_br2_incomplete_sig, info, qname, tracer_bt, f);
         g_mutex_unlock(&g_lock);
         return;
     }
@@ -601,6 +662,7 @@ void qemu_ident_note_ctrl(const struct qemu_plugin_insn *insn,
     }
     if (f & QEMU_PLUGIN_CTRL_PENDING) {
         g_br2_pending++;
+        note_refusal(&g_br2_pending_sig, info, qname, tracer_bt, f);
         g_mutex_unlock(&g_lock);
         return;
     }
@@ -622,11 +684,13 @@ void qemu_ident_note_ctrl(const struct qemu_plugin_insn *insn,
      * g_ctrl_syscall_ident.
      */
     const QemuIdentRow *row = ident_row(info ? info->decode_id : 0u);
+    bool ident_adjudicated = false;
     {
         if (row && qbt == BRANCH_NONE &&
             row->cls.branch_type == BRANCH_SYSCALL_TYPE) {
             qbt = BRANCH_SYSCALL_TYPE;
             g_ctrl_syscall_ident++;
+            ident_adjudicated = true;
             if (g_detail) {
                 char sig[224];
                 g_snprintf(sig, sizeof(sig), "%-16s %-26s -> %s",
@@ -639,6 +703,7 @@ void qemu_ident_note_ctrl(const struct qemu_plugin_insn *insn,
                    row->cls.branch_type == BRANCH_COND_DIRECT) {
             qbt = BRANCH_COND_DIRECT;
             g_ctrl_folded_cond++;
+            ident_adjudicated = true;
             if (g_detail) {
                 char sig[224];
                 g_snprintf(sig, sizeof(sig), "%-16s %-26s -> %s",
@@ -649,22 +714,81 @@ void qemu_ident_note_ctrl(const struct qemu_plugin_insn *insn,
         }
         if (qbt == BRANCH_NONE && (f & QEMU_PLUGIN_CTRL_NOCHAIN)) {
             g_br2_nochain++;
+            note_refusal(&g_br2_nochain_sig, info, qname, tracer_bt, f);
             g_mutex_unlock(&g_lock);
             return;
         }
     }
     g_br2_seen++;
+    /*
+     * THE THIRD IDENTITY-KEYED ADJUDICATION.  Same composition as the two
+     * above -- computed from the ops and qemu_plugin_insn_decode_id()
+     * alone, never a Capstone id and never a mnemonic string (J6) -- and
+     * fired on the one shape the ops cannot express: an unconditional
+     * static edge to the architectural continuation, which is three
+     * unrelated instructions wearing one face.
+     *
+     * ident_adjudicated guards against double-counting a row an earlier
+     * arm already answered; the row's own classification is what is
+     * published, so a rule with no classification refuses instead.
+     */
     if (redispatch) {
-        g_br2_redispatch++;
-        if (g_detail) {
-            char sig[224];
-            g_snprintf(sig, sizeof(sig), "%-16s %-26s tracer=%s",
-                       info ? info->mnemonic : "-", qname ? qname : "-",
-                       branch_type_name_or_unknown(tracer_bt));
-            tally(&g_br2_redisp_sig, sig);
+        if (ident_adjudicated) {
+            /* An earlier arm read the identity for this row already; the
+             * re-dispatch face is not what this instruction is, and the
+             * answer it produced stands.  Scored below. */
+        } else if (row && row->cls.opcode != GEN_OP_UNKNOWN) {
+            /*
+             * WHAT THE ROW IS ASKED, and it is deliberately ONE question:
+             * does this rule perform a transfer at all?  The ops have
+             * already settled the KIND -- they saw the link bit or its
+             * absence and the direct/indirect bits -- and the identity
+             * column is blurred exactly where one rule carries several
+             * instructions, so it may not overrule them on that.
+             *
+             *   BRANCH_NONE   the rule is not a transfer.  The edge is
+             *                 QEMU re-dispatching after a state change.
+             *   BRANCH_REP    the rule is a self-re-entering string
+             *                 operation; the static edge IS its re-entry,
+             *                 which no other class can express.
+             *   anything else the rule IS a branch and the ops' own class
+             *                 for it stands.
+             *
+             * MEASURED, and this is why the third arm is not a row-take:
+             * riscv `j label` decodes through decode_insn32/jal, whose row
+             * carries BRANCH_DIRECT_CALL because the SAME rule spells
+             * `jal ra, label`.  `j` is `jal x0, label` and publishes no
+             * link -- the ops say so, flags=003 with LINK clear -- so the
+             * row is REFUTED by the evidence the ops carry and the ops win.
+             */
+            uint8_t rowbt = row->cls.branch_type;
+            if (rowbt == BRANCH_NONE || rowbt == BRANCH_REP) {
+                qbt = rowbt;
+            }
+            g_ctrl_redispatch_ident++;
+            if (g_detail) {
+                char sig[224];
+                g_snprintf(sig, sizeof(sig), "%-16s %-26s -> %-18s %s",
+                           info ? info->mnemonic : "-", row->name,
+                           branch_type_name_or_unknown(qbt),
+                           (rowbt == qbt) ? "(rule)" : "(ops kind, rule row "
+                           "says transfer)");
+                tally(&g_ctrl_redisp_ident_sig, sig);
+            }
+        } else {
+            /* Neither the ops nor an identity row can say.  NAMED
+             * refusal: counted, not scored. */
+            g_br2_redispatch++;
+            if (g_detail) {
+                char sig[224];
+                g_snprintf(sig, sizeof(sig), "%-16s %-26s tracer=%s",
+                           info ? info->mnemonic : "-", qname ? qname : "-",
+                           branch_type_name_or_unknown(tracer_bt));
+                tally(&g_br2_redisp_sig, sig);
+            }
+            g_mutex_unlock(&g_lock);
+            return;
         }
-        g_mutex_unlock(&g_lock);
-        return;
     }
     if (qbt == tracer_bt) {
         g_br2_agree++;
@@ -1033,29 +1157,50 @@ void qemu_ident_report(GString *report)
             "  scored                                 %10" PRIu64 "\n"
             "  agree                                  %10" PRIu64 "\n"
             "  DISAGREE                               %10" PRIu64 "\n"
-            "  re-dispatch (static edge == next insn) %10" PRIu64 "\n"
-            "  no classification exported             %10" PRIu64 "\n"
-            "  walk refused (INCOMPLETE)              %10" PRIu64 "\n"
-            "  no successor stated (exit_tb only)     %10" PRIu64
-            "   (counted, NOT scored)\n"
-            "  PENDING: block split branch from slot  %10" PRIu64
-            "   (counted, NOT scored)\n"
             "  FOREIGN: slot of a previous block's br %10" PRIu64
             "   (counted AND scored)\n"
             "  adjudicated: ctrl_syscall_ident        %10" PRIu64
             "   (identity says SYSCALL, the helper raises)\n"
             "  adjudicated: ctrl_folded_cond          %10" PRIu64
-            "   (identity says CONDITIONAL, QEMU folded the edge)\n",
-            g_br2_seen, g_br2_agree, g_br2_disagree, g_br2_redispatch,
+            "   (identity says CONDITIONAL, QEMU folded the edge)\n"
+            "  adjudicated: ctrl_redispatch_ident     %10" PRIu64
+            "   (ops say `edge to the next insn`, identity says which)\n"
+            "REFUSALS -- counted, NOT scored.  A refusal is not a wrong\n"
+            "answer and must not be charged as one; each is named because\n"
+            "a wire flip has to publish something for these same rows.\n"
+            "  REFUSED no classification exported     %10" PRIu64
+            "   (CTRL_VALID clear: QEMU stated nothing)\n"
+            "  REFUSED walk INCOMPLETE                %10" PRIu64
+            "   (the op walk gave up on this block)\n"
+            "  REFUSED no successor stated            %10" PRIu64
+            "   (exit_tb only)\n"
+            "  REFUSED PENDING                        %10" PRIu64
+            "   (branch here, its transfer in the next block)\n"
+            "  REFUSED re-dispatch, no identity       %10" PRIu64
+            "   (edge == next insn and the rule carries no class)\n",
+            g_br2_seen, g_br2_agree, g_br2_disagree,
+            g_br2_foreign, g_ctrl_syscall_ident, g_ctrl_folded_cond,
+            g_ctrl_redispatch_ident,
             g_br2_unavail, g_br2_incomplete, g_br2_nochain, g_br2_pending,
-            g_br2_foreign, g_ctrl_syscall_ident, g_ctrl_folded_cond);
+            g_br2_redispatch);
         if (g_detail) {
             dump_tally(report, g_br2sig, "branch-class disagreements", 40);
             dump_tally(report, g_ctrl_syscall_sig,
                        "ctrl_syscall_ident adjudications", 20);
             dump_tally(report, g_ctrl_folded_sig,
                        "ctrl_folded_cond adjudications", 20);
-            dump_tally(report, g_br2_redisp_sig, "re-dispatch signatures", 20);
+            dump_tally(report, g_ctrl_redisp_ident_sig,
+                       "ctrl_redispatch_ident adjudications", 20);
+            dump_tally(report, g_br2_unavail_sig,
+                       "REFUSED: no classification exported", 20);
+            dump_tally(report, g_br2_incomplete_sig,
+                       "REFUSED: walk INCOMPLETE", 20);
+            dump_tally(report, g_br2_nochain_sig,
+                       "REFUSED: no successor stated (exit_tb only)", 20);
+            dump_tally(report, g_br2_pending_sig,
+                       "REFUSED: PENDING (split branch/slot)", 20);
+            dump_tally(report, g_br2_redisp_sig,
+                       "REFUSED: re-dispatch with no identity", 20);
         } else {
             g_string_append_printf(report,
                 "  (set CST_QEMU_IDENT_AUDIT=1 for the per-encoding "

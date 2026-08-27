@@ -29,6 +29,12 @@ void cpu_exec_step_atomic(CPUState *cpu);
 /* Plugin helpers for wrong-path speculative execution */
 bool cpu_plugin_exec_inline(CPUState *cpu);
 bool cpu_plugin_exec_tb(CPUState *cpu);
+#ifdef CONFIG_PLUGIN
+/* Translate (and keep) the block at @pc without executing it, so a plugin's
+ * translation-time callbacks state QEMU's answer for code the guest has not
+ * reached.  See the definition in accel/tcg/cpu-exec.c. */
+bool cpu_plugin_translate_tb(CPUState *cpu, vaddr pc);
+#endif
 size_t cpu_plugin_arch_state_size(void);
 void cpu_plugin_arch_state_restore(void *saved, size_t size);
 /*
@@ -98,6 +104,17 @@ void cpu_plugin_vclock_resume(CPUState *cpu);
  */
 extern unsigned long plugin_spec_reserve_opens;
 extern unsigned long plugin_spec_reserve_exhausted;
+/*
+ * Decode-on-demand translations (cpu_plugin_translate_tb) that could not get
+ * a TB because the code buffer was full.  The flag exists so that case
+ * DECLINES instead of taking tb_gen_code's ordinary tb_flush + cpu_loop_exit
+ * arm, which would longjmp out of the plugin callback the translation was
+ * driven from.  Counted so the decline is a number rather than a claim: it is
+ * the difference between a guard that holds and a guard nothing ever reached.
+ * Host-side, cross-vCPU, process-wide; read through
+ * qemu_plugin_decode_only_nobuf().
+ */
+extern unsigned long plugin_decode_only_nobuf;
 #endif /* CONFIG_PLUGIN */
 
 #define REAL_HOST_PAGE_ALIGN(addr) ROUND_UP((addr), qemu_real_host_page_size())

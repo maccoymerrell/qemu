@@ -301,6 +301,7 @@ static int setjmp_gen_code(CPUArchState *env, TranslationBlock *tb,
 #ifdef CONFIG_PLUGIN
 /* See the declarations in exec/cpu-common.h. */
 unsigned long plugin_spec_reserve_opens;
+unsigned long plugin_decode_only_nobuf;
 unsigned long plugin_spec_reserve_exhausted;
 #endif
 
@@ -338,6 +339,27 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
     tb = tcg_tb_alloc(tcg_ctx);
     if (unlikely(!tb)) {
 #ifdef CONFIG_PLUGIN
+        if (cpu->plugin_decode_only) {
+            /*
+             * The code buffer filled while translating a block ON DEMAND for
+             * a plugin -- a block the guest has not reached and may never
+             * reach.  The two arms below are both wrong for it: tb_flush +
+             * cpu_loop_exit longjmps out of the plugin callback frame this
+             * translation is driven from (with the plugin's locks held), and
+             * the spec reserve exists to let an in-flight wrong-path WALK
+             * finish, which is not what is in flight here.
+             *
+             * A decode-on-demand that cannot get a TB simply does not happen.
+             * Return NULL, exactly as the exhausted-reserve arm below does and
+             * with the same lock contract (mmap still held; the caller
+             * unlocks after tb_gen_code and handles NULL), and the caller
+             * declines to mint that block.  Tested before plugin_spec_mode so
+             * a decode-only translation nested inside an excursion never opens
+             * the reserve on the walk's behalf.
+             */
+            qatomic_inc(&plugin_decode_only_nobuf);
+            return NULL;
+        }
         if (cpu->plugin_spec_mode) {
             /*
              * The code buffer filled while translating a plugin wrong-path

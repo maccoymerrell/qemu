@@ -1551,13 +1551,32 @@ other approaches would force does not arise.
 
 At every branch the correct path or a wrong-path excursion resolves, the
 plugin checks whether the side NOT followed already has a template and,
-on a miss, decodes that one true BB through the same
-``qemu_plugin_cap_decode`` -> ``decode_detail_to_generic`` ->
-fragment-splitter path the dynamic path uses, then mints it.  The
-alternate is dictionary-only: no :class:`WPBBEntry`, no dynamic state,
-no body record, and no wire flag at all — a minted alternate is
-indistinguishable from any other block that simply never executed,
-because that is exactly what it is.
+on a miss asks QEMU to **translate** that code — ``qemu_plugin_translate_at``
+— then folds the per-fragment templates that translation produced into one
+true BB and mints it.  The alternate is dictionary-only: no
+:class:`WPBBEntry`, no dynamic state, no body record, and no wire flag at
+all — a minted alternate is indistinguishable from any other block that
+simply never executed, because that is exactly what it is.
+
+An alternate is therefore built by the same machinery as an executed
+block, from the same source.  ``qemu_plugin_translate_at`` runs a real
+translation, so ``vcpu_tb_trans`` fires with the full ``qemu_plugin_tb``
+and the per-instruction decode identity, the dataflow notes and the
+control notes arrive with it; ``create_tb_template`` carries them through
+``qdep_apply`` exactly as it does on the correct path, and a branch's
+declared target is the one the translator resolved rather than an
+immediate read out of the bytes.  That is not an optimisation but the
+point of the design: those facts are keyed on ``(tb, insn index)`` and
+exist only while that pair names something, so a translation is the only
+moment at which they can be had — a decoder run alongside QEMU can
+supply a name and a length and nothing else.  The alternate path
+consults no decoder of its own.
+
+The translation is **kept**.  An alternate exists because a consumer may
+fetch that block; if the guest later reaches it, the cached translation
+is a hit and ``vcpu_tb_trans`` is not called a second time for it, so
+the templates the alternate was minted from are literally the templates
+that block executes under.
 
 Two hook sites cover the two gaps a wrong path alone leaves:
 
@@ -1578,7 +1597,8 @@ Two hook sites cover the two gaps a wrong path alone leaves:
 
 From each freshly-minted alternate, ``static_depth=N`` (default 4)
 recursively mints its statically-known successors — the architectural
-fall-through always, and a direct branch's decoded target — as a DFS
+fall-through always, and a direct branch's translator-resolved target —
+as a DFS
 worklist bounded by the existing-template dedup (``alt_or_bb_covered``)
 and a per-segment mint budget (``CST_ALT_MINT_BUDGET``); an indirect
 terminator ends the chain.  Alternates live in a segment-scoped
@@ -1586,12 +1606,25 @@ terminator ends the chain.  Alternates live in a segment-scoped
 ``(asid_root, start_pc)``; at serialization an executed template always
 shadows a minted alternate at the same key, so the trace body is
 byte-identical whether or not the option is on — the delta is
-templates-section-only.  Guest bytes are read with the same probing
-``qemu_plugin_read_memory_vaddr`` the wrong path uses (mapped page ->
-decode; unmapped -> skipped and counted), so minting never demand-pages
-or perturbs the guest.  The exit-time summary reports the mechanism's
-``checks`` / ``mints`` / ``depth_mints`` / ``skips_unmapped`` /
-``budget_hits`` counters.
+templates-section-only.  The translation is driven through the same
+non-faulting instruction-fetch probe the wrong path's dispatch uses, so
+a target whose page is unmapped, non-executable or forbidden at the
+current privilege is declined and counted rather than demand-paged.  The
+exit-time summary reports the mechanism's ``checks`` / ``mints`` /
+``depth_mints`` / ``skips_unmapped`` / ``budget_hits`` counters and,
+beside them, where the mint source went: ``translates`` / ``declined``
+(QEMU would not translate) / ``no_chain`` (it translated, but the plugin
+built no templates for it) / ``unsealed`` (the fold reached its
+instruction cap without meeting a branch terminator).
+
+Two things the translation deliberately does NOT do.  It never opens a
+capture window: the translate-time marker scan is suppressed for a
+minted block, because a marker found in code the guest never ran would
+open — or, worse, close — a window on bytes that never executed.  And it
+never flushes the code buffer: a full buffer during a decode-on-demand
+translation returns no TB (``CPUState::plugin_decode_only``), so the mint
+is declined rather than taking the flush-and-longjmp path out of a
+plugin callback that is holding the tracer's locks.
 
 Opportunistic minting superseded an earlier eager executable-region
 *sweep* (``qemu_plugin_walk_exec_regions`` plus a late-mapping growth

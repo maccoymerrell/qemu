@@ -278,7 +278,7 @@ typedef uint64_t qemu_plugin_id_t;
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 25
+#define QEMU_PLUGIN_VERSION 26
 
 /*
  * The two values a signed vCPU index takes when it is not an index.
@@ -2333,6 +2333,44 @@ bool qemu_plugin_exec_inline_insn(void);
 QEMU_PLUGIN_API
 bool qemu_plugin_exec_tb(void);
 
+/**
+ * qemu_plugin_translate_at() - translate the block at @pc WITHOUT executing it
+ * @pc: guest virtual address of the block to translate
+ *
+ * Asks QEMU what it makes of code the guest has not reached.  A real
+ * translation runs, so every translation-time callback fires for it --
+ * vcpu_tb_trans with the full qemu_plugin_tb, per-instruction decode identity,
+ * the dataflow notes, the control notes.  Those facts are keyed on (tb, index)
+ * and exist at no other moment, which is why a translation is the only way to
+ * obtain them: a second decoder can supply a name and a length, not QEMU's.
+ *
+ * Nothing executes.  No instruction retires, no guest register or memory
+ * changes, and no execution callback fires.
+ *
+ * The block is KEPT in the code cache.  If the guest later reaches @pc the
+ * translation is a hit, and vcpu_tb_trans is NOT called a second time for it --
+ * a plugin must therefore treat what it learns here as the same translation it
+ * would have seen on first execution, because it is.
+ *
+ * Call it only from a vCPU EXECUTION callback.  Calling it from a translation
+ * callback re-enters translation on a context that is already translating; the
+ * implementation asserts rather than corrupting it.
+ *
+ * The translation context is the CALLING vCPU's current state (privilege,
+ * address space, and any mode bit the target folds into its translation
+ * flags).  For a fall-through or a same-mode branch target that is right by
+ * construction.  For a target that would execute in a different mode -- x86
+ * CS attributes, AArch32-vs-64, MIPS16/microMIPS ISA-mode -- it is not, and
+ * the caller is the only one that knows which it asked for.
+ *
+ * Returns true iff a translation now exists at @pc.  False means declined and
+ * nothing was mutated: the page is unmapped, non-executable or forbidden at
+ * this privilege (probed without demand-paging), translation itself faulted,
+ * or the code buffer is full.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_translate_at(uint64_t pc);
+
 /* ================ Speculative Store Buffer API ================ */
 
 /**
@@ -2795,6 +2833,24 @@ uint64_t qemu_plugin_spec_reserve_opens(void);
  */
 QEMU_PLUGIN_API
 uint64_t qemu_plugin_spec_reserve_exhausted(void);
+
+/**
+ * qemu_plugin_decode_only_nobuf() - decode-on-demand translations declined for
+ * a full code buffer
+ *
+ * qemu_plugin_translate_at() asks QEMU to translate a block the guest has not
+ * reached.  When the code buffer is full at that moment the translation is
+ * DECLINED and no TB is produced — the ordinary path there is a whole-cache
+ * flush followed by a longjmp back into the execution loop, which would
+ * abandon the plugin callback frame the translation was driven from.
+ *
+ * This is how many times that happened.  Zero means the case never arose, not
+ * that it is handled; a plugin that wants to prove the guard holds must make
+ * it fire (a small QEMU code-buffer size does).  Host-side, cross-vCPU,
+ * process-wide.
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_decode_only_nobuf(void);
 
 /**
  * qemu_plugin_spec_mem_faulted_take() - did the just-executed wrong-path memory

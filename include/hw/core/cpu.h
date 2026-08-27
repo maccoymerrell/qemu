@@ -802,6 +802,26 @@ struct CPUState {
      */
     bool plugin_flush_pending;
     /*
+     * Set while this vCPU is inside a plugin-driven DECODE-ONLY translation
+     * (cpu_plugin_translate_tb): QEMU is asked to translate a block the guest
+     * has not reached, so the plugin's translation-time callbacks fire and
+     * state their facts, and nothing is executed.
+     *
+     * It exists for one reason: tb_gen_code's buffer-full arm.  A correct-path
+     * translation that cannot allocate a TB does tb_flush + cpu_loop_exit,
+     * i.e. a longjmp -- and this translation is driven from inside a plugin
+     * exec callback, so that unwind would abandon the callback frame with the
+     * plugin's own locks held.  A decode-only translation that cannot get a TB
+     * simply does not happen: tb_gen_code returns NULL and the caller declines
+     * to mint.  It is tested BEFORE plugin_spec_mode so a decode-only
+     * translation never opens the wrong path's spec reserve on its behalf.
+     *
+     * Deliberately NOT plugin_spec_mode: that flag also selects CF_FORCE_SLOW,
+     * which changes cflags, which changes the TB hash key -- the translation
+     * would then describe a block the executor will never produce.
+     */
+    bool plugin_decode_only;
+    /*
      * Set while the guest virtual clock is paused for a wrong-path excursion
      * (qemu_plugin_spec_vtime_pause/resume).  Keeps the pause idempotent and
      * balanced across a fault-skip's spec_mode teardown/re-entry, so the

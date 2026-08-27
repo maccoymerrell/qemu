@@ -636,9 +636,21 @@ static void cpu_exec_longjmp_cleanup(CPUState *cpu)
      */
     if (tcg_ctx->gen_tb) {
         tb_unlock_pages(tcg_ctx->gen_tb);
-        tcg_ctx->gen_tb = NULL;
     }
 #endif
+    /*
+     * BOTH modes, and user mode needs it just as much.  tb_gen_code sets
+     * tcg_ctx->gen_tb before generating and clears it on the way out; a fault
+     * unwinding from inside skips that clear.  Softmmu noticed because the
+     * page locks leak with it; user mode has no page locks, so the stale
+     * pointer sat there silently -- a per-thread field still naming a
+     * translation that is no longer in flight.  Nothing read it that way
+     * until something asked "is this thread already translating?", and then
+     * it answered yes forever (found as an x86_64-user abort in
+     * cpu_plugin_translate_tb's re-entrancy assert, minting never-executed
+     * alternates after a guest translation fault).
+     */
+    tcg_ctx->gen_tb = NULL;
     if (bql_locked()) {
         bql_unlock();
     }
@@ -789,6 +801,16 @@ bool cpu_plugin_exec_inline(CPUState *cpu)
         if (have_mmap_lock()) {
             mmap_unlock();
         }
+        /*
+         * The user-mode half of the same leak the softmmu landing pad below
+         * fixes: tb_gen_code sets tcg_ctx->gen_tb and an unwind from inside it
+         * skips the clear.  There are no page locks to release here, so the
+         * stale pointer was invisible until an invariant check looked at it --
+         * but it is still a per-thread field describing a translation that is
+         * no longer in flight, and anything that reads it to mean "already
+         * translating" reads it wrong.
+         */
+        tcg_ctx->gen_tb = NULL;
 #endif
         cpu->running = saved_running;
         memcpy(&cpu->jmp_env, &saved_jmp_env, sizeof(sigjmp_buf));
@@ -979,14 +1001,142 @@ bool cpu_plugin_exec_tb(CPUState *cpu)
          */
         if (tcg_ctx->gen_tb) {
             tb_unlock_pages(tcg_ctx->gen_tb);
-            tcg_ctx->gen_tb = NULL;
         }
 #endif
+        /* BOTH modes: see cpu_exec_longjmp_cleanup.  User mode has no page
+         * locks to make the leak audible, but the stale pointer is the same
+         * one, and it survives every later translation on this thread. */
+        tcg_ctx->gen_tb = NULL;
         cpu->running = saved_running;
         memcpy(&cpu->jmp_env, &saved_jmp_env, sizeof(sigjmp_buf));
         return false;
     }
 }
+
+
+#ifdef CONFIG_PLUGIN
+/*
+ * Translate one block AT @pc without executing it, so a plugin can be told
+ * what QEMU makes of code the guest has not reached.
+ *
+ * Every translation-time plugin callback fires -- vcpu_tb_trans with the full
+ * qemu_plugin_tb, the per-instruction identity, the dataflow notes, the
+ * control notes -- because they are emitted by translator_loop() and this is a
+ * real translation.  That is the whole point: those facts are keyed on (tb,
+ * idx) and exist at no other moment, so the only way to have QEMU's answer for
+ * a never-executed block is to have QEMU translate it.
+ *
+ * The block is KEPT, not discarded.  A never-executed alternate is minted
+ * precisely because a consumer thinks it might run; if it later does, the
+ * cached TB is a hit and the plugin is not asked to translate it twice.
+ *
+ * Structure mirrors cpu_plugin_exec_tb() above, minus cpu_tb_exec(): the
+ * non-faulting instruction-fetch probe that declines an unmapped / NX /
+ * privilege-denied page without demand-paging, the sigsetjmp guard installed
+ * BEFORE tb_gen_code (translation can itself fault), the memory lock
+ * tb_gen_code asserts, and the fault landing pad that releases the TB's page
+ * locks -- omitting that last one is what once froze a vCPU at 100% utime
+ * under every plugin callback.
+ *
+ * cflags are curr_cflags(cpu) verbatim, with nothing added: the TB produced
+ * here must be the same TB the executor would produce at this PC, or keeping
+ * it warms nothing and the plugin is handed a translation the guest can never
+ * take.
+ *
+ * The translation context (cs_base/flags) is the CURRENT vCPU state, which is
+ * right by construction for a fall-through or a same-mode branch target and is
+ * NOT right for a target in a different mode.  Deciding that is the caller's:
+ * it knows which PC it asked about and why.
+ *
+ * Returns true iff a TB now exists at @pc.  False means declined -- unmapped
+ * or non-executable page, a translation-time fault, or a full code buffer --
+ * and nothing was mutated.
+ */
+bool cpu_plugin_translate_tb(CPUState *cpu, vaddr pc)
+{
+    CPUArchState *env = cpu_env(cpu);
+    TranslationBlock *tb;
+    vaddr cur_pc;
+    uint64_t cs_base;
+    uint32_t flags, cflags;
+    bool saved_running;
+    bool ok;
+
+    /*
+     * Invariant I1: a decode-on-demand runs from a vCPU EXEC callback, never
+     * from a translation callback and never off the vCPU thread.  tcg_ctx is
+     * per-thread and tcg_ctx->gen_tb is live for the duration of a
+     * translation, so re-entering tb_gen_code from inside one corrupts it.
+     * Asserted, not commented.
+     */
+    g_assert(cpu == current_cpu);
+    g_assert(tcg_ctx->gen_tb == NULL);
+
+    cpu_get_tb_cpu_state(env, &cur_pc, &cs_base, &flags);
+    cflags = curr_cflags(cpu);
+
+    void *host;
+    int pflags = probe_access_flags(env, pc, 1, MMU_INST_FETCH,
+                                    cpu_mmu_index(cpu, true),
+                                    true, &host, 0);
+    if (pflags & TLB_INVALID_MASK) {
+        return false;
+    }
+
+    saved_running = cpu->running;
+
+    sigjmp_buf saved_jmp_env;
+    memcpy(&saved_jmp_env, &cpu->jmp_env, sizeof(sigjmp_buf));
+
+    cpu->plugin_decode_only = true;
+    if (sigsetjmp(cpu->jmp_env, 0) == 0) {
+        tb = tb_lookup(cpu, pc, cs_base, flags, cflags);
+        if (tb == NULL) {
+            mmap_lock();
+            tb = tb_gen_code(cpu, pc, cs_base, flags, cflags);
+            mmap_unlock();
+        }
+        ok = (tb != NULL);
+    } else {
+        /*
+         * A translation-time fault landed here from INSIDE tb_gen_code (a
+         * translator_ld() crossing into an absent second page).  Release what
+         * the unwind skipped, exactly as cpu_plugin_exec_tb()'s pad does: the
+         * TB's PageDesc locks leak permanently otherwise and the next
+         * tb_gen_code touching that page spins forever below every plugin
+         * callback.
+         */
+        cpu->neg.can_do_io = true;
+        qemu_plugin_disable_mem_helpers(cpu);
+#ifdef CONFIG_USER_ONLY
+        clear_helper_retaddr();
+        if (have_mmap_lock()) {
+            mmap_unlock();
+        }
+#else
+        if (tcg_ctx->gen_tb) {
+            tb_unlock_pages(tcg_ctx->gen_tb);
+        }
+#endif
+        /*
+         * BOTH modes.  tb_gen_code sets tcg_ctx->gen_tb before generating and
+         * clears it after; an unwind from inside skips the clear, and there is
+         * no page-lock arm in user mode to have carried it.  A stale gen_tb
+         * makes the NEXT translation on this thread look like a re-entry into
+         * one already in flight, and the invariant assert above fires -- which
+         * is exactly how this was found (x86_64 user, static_templates=1: a
+         * never-executed alternate whose translation ran off the end of a
+         * mapping).
+         */
+        tcg_ctx->gen_tb = NULL;
+        ok = false;
+    }
+    cpu->plugin_decode_only = false;
+    cpu->running = saved_running;
+    memcpy(&cpu->jmp_env, &saved_jmp_env, sizeof(sigjmp_buf));
+    return ok;
+}
+#endif /* CONFIG_PLUGIN */
 
 #if defined(TARGET_RISCV) && defined(CONFIG_PLUGIN) && !defined(CONFIG_USER_ONLY)
 /*

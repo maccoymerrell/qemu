@@ -48,6 +48,47 @@ Plugin API additions
      wrong-path simulator consumes this so a not-taken branch's
      alternate edge can be traced even when the program never
      executes it.
+   * ``qemu_plugin_translate_at`` — translates the block at a given
+     guest address **without executing it**, so a plugin can be told
+     what QEMU makes of code the guest has not reached.  A real
+     translation runs, so every translation-time callback fires for
+     it: ``vcpu_tb_trans`` with the full ``qemu_plugin_tb``, the
+     per-instruction decode identity, the dataflow notes and the
+     control notes.  That is the only way to have those facts — they
+     are keyed on ``(tb, insn index)`` and exist at no other moment,
+     which is why a second decoder cannot stand in for them.  The
+     translation is KEPT: if the guest later reaches that address the
+     cached block is a hit and ``vcpu_tb_trans`` does not fire again,
+     so what the plugin was shown IS what executes.  ChampSim Tracer
+     mints never-executed alternate templates through it
+     (``static_templates=1``).
+
+     Three properties the entry point guarantees, each because the
+     alternative was a real failure mode:
+
+     * A **full code buffer declines the translation** rather than
+       flushing.  ``CPUState::plugin_decode_only`` is tested in
+       ``tb_gen_code``'s buffer-full arm ahead of the wrong-path
+       ``plugin_spec_mode`` arm, and returns no TB.  The ordinary arm
+       there is ``tb_flush`` + ``cpu_loop_exit`` — a longjmp, out of
+       the plugin callback frame that drove this translation, with
+       the plugin's locks held.
+     * The **fetch is probed without demand-paging**, exactly as the
+       wrong-path dispatch probes: an unmapped, non-executable or
+       privilege-denied page returns false and mutates nothing.
+     * A **translation-time fault is caught and its page locks
+       released**.  ``translator_ld()`` crossing into an absent second
+       page siglongjmps; the landing pad releases ``tcg_ctx->gen_tb``'s
+       page locks, without which the spinlock leaks and the next
+       ``tb_gen_code`` on that page spins forever below every plugin
+       callback.
+
+     It must be called from a vCPU **execution** callback.  Calling it
+     from a translation callback would re-enter translation on a
+     context that is already translating; the implementation asserts.
+     The translation context is the calling vCPU's current state, so
+     the caller is responsible for only asking about addresses that
+     would execute in that context.
    * ``qemu_plugin_request_tb_flush`` — drops QEMU's entire TB
      cache from a plugin callback so every subsequent execution
      re-translates through ``vcpu_tb_trans``.  ChampSim Tracer uses

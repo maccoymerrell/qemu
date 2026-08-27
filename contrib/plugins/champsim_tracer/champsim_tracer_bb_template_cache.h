@@ -500,6 +500,20 @@ public:
      * distinct-translation footprint (code size), not execution length;
      * SMC produces a new entry and leaves the dead one in place (rare,
      * bounded, never dereferenced once its QEMU TB is gone). */
+    /*
+     * The head fragment of the MOST RECENTLY registered chain at
+     * @tb_start_pc, with no count or byte test.  The byte-guarded form above
+     * is for dedup, where an old chain must not be reused for patched code;
+     * this one answers a different question -- "what did QEMU make of the
+     * block at this address" -- for a caller that has just driven a
+     * translation there and wants the templates it produced.  Most recent
+     * wins for exactly that reason: if the bytes did change, the translation
+     * the caller just forced is the last one registered.  Returns nullptr
+     * when nothing has been translated at that address in this space.
+     * Caller holds data_lock.
+     */
+    BBTemplate *lookup_tb_chain_head(uint64_t tb_start_pc) const;
+
     BBTemplate *lookup_tb_chain(uint64_t tb_start_pc, uint32_t total_n_insns,
                                 const uint8_t *insn_sizes,
                                 const uint8_t *insn_bytes);

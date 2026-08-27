@@ -1114,7 +1114,7 @@ static void wp_commit_bb(WpWalkState &st, BBTemplate *cur,
              * A branch INSIDE a wrong-path block resolves ONE direction (the
              * excursion follows commit_post_pc); its untaken side is never
              * walked, so an executed-only + wrong-path dictionary misses it.
-             * Decode+mint that side as a never-executed template.  No-op
+             * Translate+mint that side as a never-executed template.  No-op
              * unless the feature is on; the terminal is the last insn (or the
              * insn before a trailing delay slot).  data_lock is NOT held here
              * (released after the commit_true_bb_refs above), so altmint_pc's

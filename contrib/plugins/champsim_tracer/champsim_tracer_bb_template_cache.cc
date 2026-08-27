@@ -327,6 +327,23 @@ static BBTemplate *chain_index_scan(
     return nullptr;
 }
 
+BBTemplate *TemplateStore::lookup_tb_chain_head(uint64_t tb_start_pc) const
+{
+    BBKey key{store_live_asid_root(), tb_start_pc};
+    /* CODE index first, for the same reason lookup_tb_chain prefers it: a
+     * promoted chain leaves its SPEC-index entry stale.  Within an index the
+     * LAST registered chain is the newest translation at this address. */
+    if (auto it = tb_chain_dedup_.find(key); it != tb_chain_dedup_.end() &&
+        !it->second.empty()) {
+        return it->second.back();
+    }
+    if (auto it = spec_chain_index_.find(key); it != spec_chain_index_.end() &&
+        !it->second.empty()) {
+        return it->second.back();
+    }
+    return nullptr;
+}
+
 BBTemplate *TemplateStore::lookup_tb_chain(uint64_t tb_start_pc,
                                              uint32_t total_n_insns,
                                              const uint8_t *insn_sizes,

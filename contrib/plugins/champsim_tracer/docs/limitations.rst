@@ -715,9 +715,21 @@ workload actually executes, but it will under-cover a consumer that
 wants every reachable instruction decoded from a cold start.
 ``static_depth=N`` (default 4) extends each freshly-minted alternate
 along its statically-known successors — the fall-through always, and a
-direct branch's decoded target — to widen coverage per mint; an
-indirect terminator (indirect jump/call, return) has no static target,
-so that edge ends the walk.
+direct branch's translator-resolved target — to widen coverage per
+mint; an indirect terminator (indirect jump/call, return) has no static
+target, so that edge ends the walk.
+
+A second bound is the translation itself.  An alternate is minted from
+QEMU's translation of that code, and QEMU declines to translate a page
+that is unmapped, non-executable or forbidden at the privilege the
+branch was evaluated at — the mint is skipped and counted rather than
+demand-paging it into existence.  The translation also runs in the
+*calling* vCPU's context, which is right by construction for a
+fall-through or a same-mode branch target and would not be for a target
+that executes in a different mode (x86 ``CS`` attributes,
+AArch32-vs-64, MIPS16/microMIPS ISA-mode).  That is the same context
+discipline the wrong-path dispatch has always had, and it bounds
+alternates to the mode the branch was evaluated in.
 
 **Marker injection covers the tracer's four target ISAs, on Linux
 guests only.**  A workload with no compiled-in marker is traced by

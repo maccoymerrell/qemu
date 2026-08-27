@@ -1229,6 +1229,12 @@ bool qemu_plugin_exec_tb(void)
     return cpu_plugin_exec_tb(current_cpu);
 }
 
+bool qemu_plugin_translate_at(uint64_t pc)
+{
+    g_assert(current_cpu);
+    return cpu_plugin_translate_tb(current_cpu, (vaddr)pc);
+}
+
 /*
  * Bump-allocate (or reuse) the PluginSpecLine for @line_addr.  The
  * pool is a flat PluginSpecLine[] that grows on demand and is reset
@@ -1617,6 +1623,11 @@ uint64_t qemu_plugin_spec_reserve_opens(void)
 uint64_t qemu_plugin_spec_reserve_exhausted(void)
 {
     return qatomic_read(&plugin_spec_reserve_exhausted);
+}
+
+uint64_t qemu_plugin_decode_only_nobuf(void)
+{
+    return qatomic_read(&plugin_decode_only_nobuf);
 }
 
 bool qemu_plugin_spec_mem_faulted_take(void)

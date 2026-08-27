@@ -1383,8 +1383,9 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
      - Never-executed fetch/decode coverage by **opportunistic
        branch-alternate minting** (both user and system mode).  When on, at
        every branch the correct path or a wrong-path excursion evaluates, the
-       plugin decodes the branch's UNTAKEN side and mints it as an ordinary
-       never-executed template if not already covered — extending the
+       plugin asks QEMU to TRANSLATE the branch's UNTAKEN side and mints the
+       templates that translation produced as an ordinary never-executed
+       template if not already covered — extending the
        dictionary to the fall-through and branch-target space a
        *trace-inferred* wrong-path consumer needs (code fetched and decoded on
        a mispredicted path — predicted-not-taken fall-throughs, BTB-miss
@@ -1395,15 +1396,25 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
        wrong-path fork never launched (``wpprune``, budget,
        translation-unavail, ``wp=0``).
 
+       An alternate is built from QEMU's own translation of that code, by the
+       same path an executed block's template takes — ``vcpu_tb_trans`` →
+       ``create_tb_template`` → ``qdep_apply`` — so its identity, its length,
+       its control class and its dependency families come from the ops QEMU
+       emitted, and its branch target is the one the translator resolved.  The
+       alternate path consults no decoder of its own, and the translation is
+       kept, so a block that is later reached executes under the very
+       templates it was minted from.
+
        Coverage is *convergent, not eager*: it fills in as branches are seen
        over the run, so a rarely-taken branch's alternate appears once the
        branch is first evaluated.  It needs no region enumeration, so it is
        mode-independent — a system trace gets the same coverage as a user one.
-       Guest bytes are read with the same probing read the wrong path uses
-       (mapped page → decode; unmapped → skipped, counted), so enumeration
-       never demand-pages or perturbs the guest.  A per-segment mint budget
-       bounds the decode work; after warm-up the steady-state cost is one hash
-       lookup per evaluated branch.
+       The translation is driven through the same non-faulting
+       instruction-fetch probe the wrong path's dispatch uses (mapped and
+       executable → translate; otherwise → declined, counted), so minting
+       never demand-pages.  A per-segment mint budget bounds the translation
+       work; after warm-up the steady-state cost is one hash lookup per
+       evaluated branch.
 
        Alternates carry **no** wire flag — an alternate is indistinguishable
        from any other block that happened not to execute, because that is
@@ -1419,8 +1430,8 @@ in :doc:`quickstart`; this table is the at-a-glance contract.
      - Depth of the alternate-minting successor walk.  From each minted
        alternate BB, its statically-known successors are followed recursively
        up to ``N`` levels and minted along the way: the architectural
-       fall-through **always**, plus a direct branch's decoded target (both
-       edges of a direct terminator are statically known).  An **indirect**
+       fall-through **always**, plus a direct branch's translator-resolved
+       target (both edges of a direct terminator are statically known).  An **indirect**
        terminator has no static target, so that edge ends the chain.  ``0``
        mints only the immediate untaken side of each evaluated branch;
        higher ``N`` extends coverage from that one block toward the whole

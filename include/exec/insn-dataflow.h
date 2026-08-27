@@ -143,6 +143,37 @@ typedef struct InsnDataflowField {
 typedef struct InsnDataflowMemop {
     uint8_t  is_store;
     uint8_t  size;                          /* access width in bytes */
+    /*
+     * CP1.  The access is performed INSIDE a called helper, so no qemu_ld /
+     * qemu_st op names it and the three flags below say how much of it the
+     * helper's usage row could state.
+     *
+     * Without this the access list is SHORT for every helper-implemented
+     * access -- aarch64's MOPS copies and MIPS's unaligned stores move guest
+     * memory with the op list naming no access at all -- and a short list is
+     * the one error direction that costs a consumer correctness rather than
+     * accuracy.
+     */
+    uint8_t  by_helper;
+    /*
+     * The helper performs one OR MORE accesses of this direction through
+     * this address, and the number is data-dependent.  helper_swr stores one
+     * to four bytes according to the address's alignment; a count read off
+     * the static call sites would be a number nothing measured, so none is
+     * given.  @size is then the width of ONE access, not of the whole.
+     */
+    uint8_t  count_unbounded;
+    /*
+     * The address is not one of the helper's arguments -- aarch64's MOPS
+     * helpers address through env->xregs[] named by a syndrome word -- so
+     * @addr_prov is EMPTY and that emptiness is not evidence of absence.  A
+     * consumer that publishes an address dependency must refuse this access
+     * rather than read the empty set as "depends on nothing".
+     */
+    uint8_t  addr_unstated;
+    /* The same, for a STORE's value: it did not travel through an argument
+     * either, so @data_prov is empty and means "not stated", not "nothing". */
+    uint8_t  data_unstated;
     uint64_t addr_prov[INSN_DF_REG_WORDS];  /* what computed the address */
     uint64_t data_prov[INSN_DF_REG_WORDS];  /* what produced it: stores */
 } InsnDataflowMemop;
@@ -221,16 +252,30 @@ typedef struct InsnDataflow {
     /*
      * The accesses themselves, in the order the target emitted them.
      *
-     * n_mem_rd/n_mem_wr count qemu_ld/qemu_st ops; @n_memops counts the ones
-     * an emitter's note could be matched to.  They are equal in every case
-     * the extractor can account for, and @memops_unnoted says so when they
-     * are not rather than letting a consumer read the shorter array as
-     * though it described every access.
+     * n_mem_rd/n_mem_wr count qemu_ld/qemu_st OPS; @n_memops counts the
+     * ACCESSES, which is the larger set: an emitter-noted op contributes one,
+     * and so does each access a called helper performs itself, which no op
+     * names at all (CP1, @memops_by_helper).  For an instruction that calls
+     * no such helper the two agree, and @memops_unnoted says so when a
+     * qemu_ld/st op could not be matched rather than letting a consumer read
+     * the shorter array as though it described every access.
      */
     InsnDataflowMemop memops[INSN_DF_MAX_MEMOPS];
     uint8_t  n_memops;
     uint8_t  memops_overflow;   /* more accesses than there was room for */
     uint8_t  memops_unnoted;    /* an access no emitter note accounted for */
+    /*
+     * CP1 summaries over @memops, so a consumer can gate without walking.
+     *
+     * @memops_by_helper is a COUNT and not a flag for the reason the helper
+     * counters beside it are: the question a consumer ends up asking is how
+     * much of its access list came from a written-down row rather than from
+     * an op, and a flag cannot answer that.
+     */
+    uint8_t  memops_by_helper;
+    uint8_t  memops_count_unbounded;  /* >=1 helper access of unstated count */
+    uint8_t  memops_addr_unstated;    /* >=1 access whose address is unnamed */
+    uint8_t  memops_data_unstated;    /* >=1 store whose value is unnamed */
 } InsnDataflow;
 
 /*
@@ -433,6 +478,33 @@ void insn_dataflow_note_zero_reg(const void *ts);
  */
 void insn_dataflow_note_helper(const void *call_op, const void *info,
                                const void *ret_ts, const void *const *args);
+
+/*
+ * CP1 -- the ACCESSES a helper performs, and why they are stated here.
+ *
+ * tcg_gen_qemu_ld/st states an access because it emits one.  A helper that
+ * moves guest memory emits NO access op at all: aarch64's `cpyfp` calls
+ * do_cpyp(), which walks the copy with cpu_ldub_mmuidx_ra() /
+ * cpu_stb_mmuidx_ra(), and MIPS's `swr` calls helper_swr(), which stores one
+ * to four bytes byte-by-byte.  The op list is then EMPTY of accesses for an
+ * instruction that plainly performs them, and every consumer downstream --
+ * including the SHAPE gate that compares a decoder's operand list against
+ * QEMU's -- reads that emptiness as "there was no access".
+ *
+ * So the helper's usage row states them, in the same discipline the emitters
+ * use: a FACT stream, never a derivation.  What it states is what the call
+ * site knows -- the DIRECTION and, when the address travels through one of
+ * the helper's own arguments, WHICH argument.  What it does not state, it
+ * says it does not state: a helper whose access count is data-dependent
+ * carries count_unbounded rather than a fabricated number, and a helper that
+ * addresses through CPU state rather than through an argument carries
+ * addr_unstated rather than an empty address set that reads as "no
+ * dependency".
+ *
+ * There is no separate emitter call for this: the fact belongs to the
+ * HELPER, not to the call, and it is the same for every call site.  It is
+ * read off the row insn_dataflow_note_helper() already looks up.
+ */
 
 /*
  * CP-H, the vector half -- the out-of-line gvec constructors.

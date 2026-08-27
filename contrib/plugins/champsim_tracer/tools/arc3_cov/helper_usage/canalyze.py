@@ -205,6 +205,51 @@ CPU_TO_ENV = {'cpu_env', 'cpu_env_const'}
 ENV_MEMBER = 'env'
 
 
+# ---------------------------------------------------------------------------
+# CP1 -- the guest memory accesses a helper performs itself.
+#
+# QEMU's helpers reach guest memory through exactly one family of entry
+# points, declared in include/exec/cpu_ldst.h and spelled
+# cpu_<dir><width>[_<endian>]_<how>[_ra].  They all take the CPU state
+# pointer first and the guest ADDRESS second, and the store forms take the
+# VALUE third.  That shape is what makes the address argument nameable at
+# all; it is CHECKED here (argument 0 must be the env root) rather than
+# assumed, and a call that does not have it is not recorded.
+#
+# _code is excluded on purpose: an instruction fetch is not in the model on
+# any instruction -- no instruction records reading its own encoding -- so
+# recording one here would be an exception made for helpers alone.
+ACC_PREFIX = ('cpu_ld', 'cpu_st', 'cpu_atomic_')
+ACC_WIDTH = [
+    ('16', 16), ('ub', 1), ('sb', 1), ('uw', 2), ('sw', 2),
+    ('ul', 4), ('sl', 4), ('b', 1), ('w', 2), ('l', 4), ('q', 8), ('o', 16),
+]
+
+
+def _acc_of(name):
+    """(direction, width) for a guest-access primitive, or None.
+
+    The width is read off the name; a form this reader does not recognise
+    gets width 0, which the table publishes as "not stated" rather than as a
+    guess -- the count of bytes is not the fact the SHAPE gate needs, and
+    inventing one would put a number on the wire that nothing measured.
+    """
+    if '_code' in name:
+        return None
+    if name.startswith('cpu_atomic_'):
+        return (RD | WR, 0)
+    if name.startswith('cpu_ld'):
+        d, rest = RD, name[len('cpu_ld'):]
+    elif name.startswith('cpu_st'):
+        d, rest = WR, name[len('cpu_st'):]
+    else:
+        return None
+    for pfx, sz in ACC_WIDTH:
+        if rest.startswith(pfx):
+            return (d, sz)
+    return (d, 0)
+
+
 class Refusal(Exception):
     def __init__(self, why, where):
         super().__init__(why)
@@ -230,6 +275,14 @@ class Analysis:
         self.where = {}         # field -> "file:line"
         self.pending_derived = {}
         self.cpu_escapes = []   # unresolved callees reached via the CPU view
+        # CP1.  Guest memory accesses the helper performs ITSELF, keyed by
+        # (direction, address argument) -- see _guest_access().  The value
+        # carries the access width, whether the count is bounded, and the
+        # file:line it was read from.
+        self.mem_acc = {}
+        self._sframe = [{}]     # scalar parameter name -> argument index
+        self._pending_sroots = None
+        self._in_acc = 0        # depth inside an access primitive's own body
 
     def lookup(self, name):
         for u in self.units:
@@ -260,7 +313,29 @@ class Analysis:
         for pi, root in roots.items():
             if pi < len(params) and params[pi][0]:
                 taint[params[pi][0]] = (root, None)
-        self._scan(u, brace, end, taint, depth, fname)
+        # CP1's SCALAR frame, kept strictly beside the pointer taint above and
+        # never merged into it.  A guest address arrives in a helper as a
+        # target_ulong -- helper_swr(env, arg1, arg2, mem_idx) addresses
+        # through arg2 -- and roots_of() gives a root only to POINTER
+        # parameters, so the pointer taint cannot name it.  Merging the two
+        # would put a scalar into arg_dir[] and change the argument-direction
+        # column this pass must leave byte-identical, so they stay apart.
+        sr = self._pending_sroots
+        self._pending_sroots = None
+        if depth == 0:
+            # The helper's own signature IS the naming: every parameter that
+            # is not a pointer root is a candidate address or data argument,
+            # under the same index the usage table's argdir[] uses.
+            sr = {pi: pi for pi in range(len(params)) if pi not in roots}
+        sframe = {}
+        for pi, root in (sr or {}).items():
+            if pi < len(params) and params[pi][0]:
+                sframe[params[pi][0]] = root
+        self._sframe.append(sframe)
+        try:
+            self._scan(u, brace, end, taint, depth, fname)
+        finally:
+            self._sframe.pop()
 
     def _scan(self, u, brace, end, taint, depth, fname):
         toks, loc = u.toks, u.loc
@@ -491,6 +566,66 @@ class Analysis:
             self.arg_dir[root] = self.arg_dir.get(root, 0) | d
         return j
 
+    def _scalar_roots(self, u, args):
+        """Actual arguments that are a bare scalar this frame can name."""
+        toks = u.toks
+        out = {}
+        cur = self._sframe[-1]
+        for ai, grp in enumerate(args):
+            if len(grp) == 1:
+                t = toks[grp[0]]
+                if t[0] == 'id' and t[1] in cur:
+                    out[ai] = cur[t[1]]
+        return out
+
+    def _addr_root(self, u, grp):
+        """The one helper argument the address expression is built from.
+
+        `arg2` names it directly and `arg2 + 1 * dir` names it through
+        arithmetic; both are the same argument and both are accepted.  An
+        expression naming NO argument -- a MOPS helper addresses through
+        env->xregs[], not through anything it was passed -- and one naming
+        TWO are both reported as UNSTATED rather than resolved by preference,
+        because the wrong register in an address mask is worse than none.
+        """
+        cur = self._sframe[-1]
+        found = set()
+        for k in grp:
+            kind, txt = u.toks[k]
+            if kind == 'id' and txt in cur:
+                found.add(cur[txt])
+        return found.pop() if len(found) == 1 else None
+
+    def _guest_access(self, u, i, acc, args, fname):
+        d, size = acc
+        if self._in_acc:
+            # Already inside an access primitive's own body: the same access,
+            # seen a second time one level down.  Recording it again would
+            # turn one access into two.
+            return
+        addr = self._addr_root(u, args[1]) if len(args) > 1 else None
+        data = None
+        if (d & WR) and len(args) > 2:
+            data = self._addr_root(u, args[2])
+        key = (d, addr)
+        prev = self.mem_acc.get(key)
+        if prev is None:
+            self.mem_acc[key] = dict(dir=d, addr=addr, data=data, size=size,
+                                     unbounded=False, n=1,
+                                     where='%s:%d' % u.loc[i])
+        else:
+            # A second site of the same direction through the same argument.
+            # The number of accesses is then not one, and this reader does not
+            # try to count it: helper_swr stores one to four bytes depending
+            # on the address's alignment, and a count read off the static
+            # sites would be a number nothing measured.
+            prev['n'] += 1
+            prev['unbounded'] = True
+            if prev['size'] != size:
+                prev['size'] = 0
+            if prev['data'] != data:
+                prev['data'] = None
+
     def _call(self, u, i, cp, taint, depth, fname):
         toks = u.toks
         callee = toks[i][1]
@@ -511,6 +646,7 @@ class Analysis:
 
         cu, cf = self.lookup(callee)
         pass_roots = {}
+        acc = _acc_of(callee)
         for ai, grp in enumerate(args):
             if not grp:
                 continue
@@ -554,6 +690,8 @@ class Analysis:
                     toks[grp[1]][0] == 'id' and \
                     taint.get(toks[grp[1]][1], (None,))[0] == 'carrier':
                 pass_roots[ai] = 'carrier'
+        if acc and pass_roots.get(0) == 'env':
+            self._guest_access(u, i, acc, args, fname)
         if pass_roots:
             if cf is None:
                 if 'env' in pass_roots.values():
@@ -572,4 +710,12 @@ class Analysis:
                     if r not in ('env', 'cpu', 'carrier'):
                         self.arg_dir[r] = self.arg_dir.get(r, 0) | (RD | WR)
                 return
-            self._walk(cu, callee, pass_roots, depth + 1)
+            self._pending_sroots = self._scalar_roots(u, args)
+            if acc:
+                self._in_acc += 1
+            try:
+                self._walk(cu, callee, pass_roots, depth + 1)
+            finally:
+                self._pending_sroots = None
+                if acc:
+                    self._in_acc -= 1

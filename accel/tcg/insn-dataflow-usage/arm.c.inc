@@ -19,6 +19,26 @@
  *   autia                  defined(TARGET_AARCH64)    keys
  *   pacia                  defined(TARGET_AARCH64)    keys
  *
+ * CP1 -- helpers that perform GUEST MEMORY ACCESSES themselves.
+ * No qemu_ld/qemu_st op names these: the access happens inside
+ * the call, so without the row below QEMU's access list is SHORT
+ * for the instruction that called the helper.  Direction and the
+ * ADDRESS ARGUMENT are read off the call site; a count is NOT
+ * invented when the helper's access pattern is data-dependent.
+ *   cpye                 read  addr=UNSTATED data=-    count unbounded
+ *   cpye                 write addr=UNSTATED data=-    count unbounded
+ *   cpyfe                read  addr=UNSTATED data=-    count unbounded
+ *   cpyfe                write addr=UNSTATED data=-    count unbounded
+ *   cpyfm                read  addr=UNSTATED data=-    count unbounded
+ *   cpyfm                write addr=UNSTATED data=-    count unbounded
+ *   cpyfp                read  addr=UNSTATED data=-    count unbounded
+ *   cpyfp                write addr=UNSTATED data=-    count unbounded
+ *   cpym                 read  addr=UNSTATED data=-    count unbounded
+ *   cpym                 write addr=UNSTATED data=-    count unbounded
+ *   cpyp                 read  addr=UNSTATED data=-    count unbounded
+ *   cpyp                 write addr=UNSTATED data=-    count unbounded
+ *   dc_zva               write addr=UNSTATED data=-    one access
+ *
  * Rows refused, and therefore still OVER-APPROXIMATED at run time:
  *   access_check_cp_reg      env passed to accessfn(), not defined in this unit
  *   sete                     env passed to stepfn(), not defined in this unit
@@ -217,167 +237,246 @@ static const DfHelperField dfu_lookup_tb_ptr_env[] = {
     { offsetof(CPUArchState, v7m), sizeof(((CPUArchState *)0)->v7m), INSN_DF_RD, DF_HF_XLAT },   /* ../target/arm/helper.c:11786 */
     { offsetof(CPUArchState, vfp), sizeof(((CPUArchState *)0)->vfp), INSN_DF_RD, DF_HF_XLAT },   /* ../target/arm/helper.c:11819 */
 };
+static const DfHelperAccess dfu_cpye_acc[] = {
+    { INSN_DF_RD, DF_HA_NO_ARG, DF_HA_NO_ARG, 1, 1 },   /* ../target/arm/tcg/helper-a64.c:2022, 6 site(s) */
+    { INSN_DF_WR, DF_HA_NO_ARG, DF_HA_NO_ARG, 1, 1 },   /* ../target/arm/tcg/helper-a64.c:2037, 6 site(s) */
+};
+static const DfHelperAccess dfu_cpyfe_acc[] = {
+    { INSN_DF_RD, DF_HA_NO_ARG, DF_HA_NO_ARG, 1, 1 },   /* ../target/arm/tcg/helper-a64.c:2022, 6 site(s) */
+    { INSN_DF_WR, DF_HA_NO_ARG, DF_HA_NO_ARG, 1, 1 },   /* ../target/arm/tcg/helper-a64.c:2037, 6 site(s) */
+};
+static const DfHelperAccess dfu_cpyfm_acc[] = {
+    { INSN_DF_RD, DF_HA_NO_ARG, DF_HA_NO_ARG, 1, 1 },   /* ../target/arm/tcg/helper-a64.c:2022, 6 site(s) */
+    { INSN_DF_WR, DF_HA_NO_ARG, DF_HA_NO_ARG, 1, 1 },   /* ../target/arm/tcg/helper-a64.c:2037, 6 site(s) */
+};
+static const DfHelperAccess dfu_cpyfp_acc[] = {
+    { INSN_DF_RD, DF_HA_NO_ARG, DF_HA_NO_ARG, 1, 1 },   /* ../target/arm/tcg/helper-a64.c:2022, 6 site(s) */
+    { INSN_DF_WR, DF_HA_NO_ARG, DF_HA_NO_ARG, 1, 1 },   /* ../target/arm/tcg/helper-a64.c:2037, 6 site(s) */
+};
+static const DfHelperAccess dfu_cpym_acc[] = {
+    { INSN_DF_RD, DF_HA_NO_ARG, DF_HA_NO_ARG, 1, 1 },   /* ../target/arm/tcg/helper-a64.c:2022, 6 site(s) */
+    { INSN_DF_WR, DF_HA_NO_ARG, DF_HA_NO_ARG, 1, 1 },   /* ../target/arm/tcg/helper-a64.c:2037, 6 site(s) */
+};
+static const DfHelperAccess dfu_cpyp_acc[] = {
+    { INSN_DF_RD, DF_HA_NO_ARG, DF_HA_NO_ARG, 1, 1 },   /* ../target/arm/tcg/helper-a64.c:2022, 6 site(s) */
+    { INSN_DF_WR, DF_HA_NO_ARG, DF_HA_NO_ARG, 1, 1 },   /* ../target/arm/tcg/helper-a64.c:2037, 6 site(s) */
+};
+static const DfHelperAccess dfu_dc_zva_acc[] = {
+    { INSN_DF_WR, DF_HA_NO_ARG, DF_HA_NO_ARG, 1, 0 },   /* ../target/arm/tcg/helper-a64.c:1358, 1 site(s) */
+};
 
 static const DfHelperUsage df_helper_usage[] = {
 #if defined(TARGET_AARCH64)
     { "autia", { 0 },
       dfu_autia_env, ARRAY_SIZE(dfu_autia_env), true,
-      "../target/arm/tcg/pauth_helper.c:552" },
+      "../target/arm/tcg/pauth_helper.c:552",
+      NULL, 0 },
 #endif
     { "cpye", { 0 },
       dfu_cpye_env, ARRAY_SIZE(dfu_cpye_env), true,
-      "../target/arm/tcg/helper-a64.c:2519" },
+      "../target/arm/tcg/helper-a64.c:2519",
+      dfu_cpye_acc, ARRAY_SIZE(dfu_cpye_acc) },
     { "cpyfe", { 0 },
       dfu_cpyfe_env, ARRAY_SIZE(dfu_cpyfe_env), true,
-      "../target/arm/tcg/helper-a64.c:2525" },
+      "../target/arm/tcg/helper-a64.c:2525",
+      dfu_cpyfe_acc, ARRAY_SIZE(dfu_cpyfe_acc) },
     { "cpyfm", { 0 },
       dfu_cpyfm_env, ARRAY_SIZE(dfu_cpyfm_env), true,
-      "../target/arm/tcg/helper-a64.c:2433" },
+      "../target/arm/tcg/helper-a64.c:2433",
+      dfu_cpyfm_acc, ARRAY_SIZE(dfu_cpyfm_acc) },
     { "cpyfp", { 0 },
       dfu_cpyfp_env, ARRAY_SIZE(dfu_cpyfp_env), true,
-      "../target/arm/tcg/helper-a64.c:2335" },
+      "../target/arm/tcg/helper-a64.c:2335",
+      dfu_cpyfp_acc, ARRAY_SIZE(dfu_cpyfp_acc) },
     { "cpym", { 0 },
       dfu_cpym_env, ARRAY_SIZE(dfu_cpym_env), true,
-      "../target/arm/tcg/helper-a64.c:2427" },
+      "../target/arm/tcg/helper-a64.c:2427",
+      dfu_cpym_acc, ARRAY_SIZE(dfu_cpym_acc) },
     { "cpyp", { 0 },
       dfu_cpyp_env, ARRAY_SIZE(dfu_cpyp_env), true,
-      "../target/arm/tcg/helper-a64.c:2329" },
+      "../target/arm/tcg/helper-a64.c:2329",
+      dfu_cpyp_acc, ARRAY_SIZE(dfu_cpyp_acc) },
     { "dc_zva", { 0 },
       dfu_dc_zva_env, ARRAY_SIZE(dfu_dc_zva_env), true,
-      "../target/arm/tcg/helper-a64.c:1274" },
+      "../target/arm/tcg/helper-a64.c:1274",
+      dfu_dc_zva_acc, ARRAY_SIZE(dfu_dc_zva_acc) },
     { "exception_bkpt_insn", { 0 },
       dfu_exception_bkpt_insn_env, ARRAY_SIZE(dfu_exception_bkpt_insn_env), true,
-      "../target/arm/debug_helper.c:516" },
+      "../target/arm/debug_helper.c:516",
+      NULL, 0 },
     { "exception_with_syndrome", { 0 },
       dfu_exception_with_syndrome_env, ARRAY_SIZE(dfu_exception_with_syndrome_env), true,
-      "../target/arm/tcg/op_helper.c:536" },
+      "../target/arm/tcg/op_helper.c:536",
+      NULL, 0 },
     { "get_cp_reg64", { 0, 1 },
       NULL, 0, true,
-      "../target/arm/tcg/op_helper.c:1064" },
+      "../target/arm/tcg/op_helper.c:1064",
+      NULL, 0 },
     { "guarded_page_br", { 0 },
       dfu_guarded_page_br_env, ARRAY_SIZE(dfu_guarded_page_br_env), true,
-      "../target/arm/tcg/helper-a64.c:2561" },
+      "../target/arm/tcg/helper-a64.c:2561",
+      NULL, 0 },
     { "guarded_page_check", { 0 },
       dfu_guarded_page_check_env, ARRAY_SIZE(dfu_guarded_page_check_env), true,
-      "../target/arm/tcg/helper-a64.c:2547" },
+      "../target/arm/tcg/helper-a64.c:2547",
+      NULL, 0 },
     { "gvec_addp_b", { 3, 3, 3 },
       NULL, 0, true,
-      "../target/arm/tcg/vec_helper.c:2609" },
+      "../target/arm/tcg/vec_helper.c:2609",
+      NULL, 0 },
     { "gvec_umaxp_b", { 3, 3, 3 },
       NULL, 0, true,
-      "../target/arm/tcg/vec_helper.c:2619" },
+      "../target/arm/tcg/vec_helper.c:2619",
+      NULL, 0 },
     { "gvec_vfma_d", { 3, 3, 0, 3 },
       NULL, 0, true,
-      "../target/arm/tcg/vec_helper.c:1622" },
+      "../target/arm/tcg/vec_helper.c:1622",
+      NULL, 0 },
     { "gvec_vfma_s", { 3, 3, 0, 3 },
       NULL, 0, true,
-      "../target/arm/tcg/vec_helper.c:1621" },
+      "../target/arm/tcg/vec_helper.c:1621",
+      NULL, 0 },
     { "irg", { 0 },
       dfu_irg_env, ARRAY_SIZE(dfu_irg_env), true,
-      "../target/arm/tcg/mte_helper.c:222" },
+      "../target/arm/tcg/mte_helper.c:222",
+      NULL, 0 },
     { "ldg", { 0 },
       dfu_ldg_env, ARRAY_SIZE(dfu_ldg_env), true,
-      "../target/arm/tcg/mte_helper.c:301" },
+      "../target/arm/tcg/mte_helper.c:301",
+      NULL, 0 },
     { "lookup_cp_reg", { 0 },
       NULL, 0, true,
-      "../target/arm/tcg/op_helper.c:930" },
+      "../target/arm/tcg/op_helper.c:930",
+      NULL, 0 },
 #if defined(TARGET_AARCH64)
     { "pacia", { 0 },
       dfu_pacia_env, ARRAY_SIZE(dfu_pacia_env), true,
-      "../target/arm/tcg/pauth_helper.c:491" },
+      "../target/arm/tcg/pauth_helper.c:491",
+      NULL, 0 },
 #endif
     { "rbit64", { 0 },
       NULL, 0, true,
-      "../target/arm/tcg/helper-a64.c:67" },
+      "../target/arm/tcg/helper-a64.c:67",
+      NULL, 0 },
     { "rebuild_hflags_a64", { 0 },
       dfu_rebuild_hflags_a64_env, ARRAY_SIZE(dfu_rebuild_hflags_a64_env), true,
-      "../target/arm/tcg/hflags.c:494" },
+      "../target/arm/tcg/hflags.c:494",
+      NULL, 0 },
     { "rintd", { 0, 3 },
       NULL, 0, true,
-      "../target/arm/tcg/vfp_helper.c:1171" },
+      "../target/arm/tcg/vfp_helper.c:1171",
+      NULL, 0 },
     { "sdiv64", { 0 },
       NULL, 0, true,
-      "../target/arm/tcg/helper-a64.c:56" },
+      "../target/arm/tcg/helper-a64.c:56",
+      NULL, 0 },
     { "set_cp_reg64", { 0, 1 },
       NULL, 0, true,
-      "../target/arm/tcg/op_helper.c:1044" },
+      "../target/arm/tcg/op_helper.c:1044",
+      NULL, 0 },
     { "set_rmode", { 0, 3 },
       NULL, 0, true,
-      "../target/arm/tcg/vfp_helper.c:479" },
+      "../target/arm/tcg/vfp_helper.c:479",
+      NULL, 0 },
     { "st2g", { 0 },
       dfu_st2g_env, ARRAY_SIZE(dfu_st2g_env), true,
-      "../target/arm/tcg/mte_helper.c:429" },
+      "../target/arm/tcg/mte_helper.c:429",
+      NULL, 0 },
     { "stg", { 0 },
       dfu_stg_env, ARRAY_SIZE(dfu_stg_env), true,
-      "../target/arm/tcg/mte_helper.c:371" },
+      "../target/arm/tcg/mte_helper.c:371",
+      NULL, 0 },
     { "sve_whilel", { 3 },
       NULL, 0, true,
-      "../target/arm/tcg/sve_helper.c:4143" },
+      "../target/arm/tcg/sve_helper.c:4143",
+      NULL, 0 },
     { "udiv64", { 0 },
       NULL, 0, true,
-      "../target/arm/tcg/helper-a64.c:48" },
+      "../target/arm/tcg/helper-a64.c:48",
+      NULL, 0 },
     { "unaligned_access", { 0 },
       NULL, 0, true,
-      "../target/arm/tcg/helper-a64.c:1392" },
+      "../target/arm/tcg/helper-a64.c:1392",
+      NULL, 0 },
     { "vfp_addd", { 0, 0, 3 },
       NULL, 0, true,
-      "../target/arm/tcg/vfp_helper.c:278" },
+      "../target/arm/tcg/vfp_helper.c:278",
+      NULL, 0 },
     { "vfp_cmpd_a64", { 0, 0, 3 },
       NULL, 0, true,
-      "../target/arm/tcg/helper-a64.c:161" },
+      "../target/arm/tcg/helper-a64.c:161",
+      NULL, 0 },
     { "vfp_divd", { 0, 0, 3 },
       NULL, 0, true,
-      "../target/arm/tcg/vfp_helper.c:281" },
+      "../target/arm/tcg/vfp_helper.c:281",
+      NULL, 0 },
     { "vfp_fcvtds", { 0, 3 },
       NULL, 0, true,
-      "../target/arm/tcg/vfp_helper.c:377" },
+      "../target/arm/tcg/vfp_helper.c:377",
+      NULL, 0 },
     { "vfp_fcvtsd", { 0, 3 },
       NULL, 0, true,
-      "../target/arm/tcg/vfp_helper.c:382" },
+      "../target/arm/tcg/vfp_helper.c:382",
+      NULL, 0 },
     { "vfp_maxd", { 0, 0, 3 },
       NULL, 0, true,
-      "../target/arm/tcg/vfp_helper.c:283" },
+      "../target/arm/tcg/vfp_helper.c:283",
+      NULL, 0 },
     { "vfp_mind", { 0, 0, 3 },
       NULL, 0, true,
-      "../target/arm/tcg/vfp_helper.c:282" },
+      "../target/arm/tcg/vfp_helper.c:282",
+      NULL, 0 },
     { "vfp_muladdd", { 0, 0, 0, 3 },
       NULL, 0, true,
-      "../target/arm/tcg/vfp_helper.c:1117" },
+      "../target/arm/tcg/vfp_helper.c:1117",
+      NULL, 0 },
     { "vfp_muld", { 0, 0, 3 },
       NULL, 0, true,
-      "../target/arm/tcg/vfp_helper.c:280" },
+      "../target/arm/tcg/vfp_helper.c:280",
+      NULL, 0 },
     { "vfp_muls", { 0, 0, 3 },
       NULL, 0, true,
-      "../target/arm/tcg/vfp_helper.c:280" },
+      "../target/arm/tcg/vfp_helper.c:280",
+      NULL, 0 },
     { "vfp_sqrtd", { 0, 3 },
       NULL, 0, true,
-      "../target/arm/tcg/vfp_helper.c:298" },
+      "../target/arm/tcg/vfp_helper.c:298",
+      NULL, 0 },
     { "vfp_sqtod", { 0, 0, 3 },
       NULL, 0, true,
-      "../target/arm/tcg/vfp_helper.c:450" },
+      "../target/arm/tcg/vfp_helper.c:450",
+      NULL, 0 },
     { "vfp_sqtos", { 0, 0, 3 },
       NULL, 0, true,
-      "../target/arm/tcg/vfp_helper.c:456" },
+      "../target/arm/tcg/vfp_helper.c:456",
+      NULL, 0 },
     { "vfp_subd", { 0, 0, 3 },
       NULL, 0, true,
-      "../target/arm/tcg/vfp_helper.c:279" },
+      "../target/arm/tcg/vfp_helper.c:279",
+      NULL, 0 },
     { "vfp_tosqd", { 0, 0, 3 },
       NULL, 0, true,
-      "../target/arm/tcg/vfp_helper.c:450" },
+      "../target/arm/tcg/vfp_helper.c:450",
+      NULL, 0 },
     { "vfp_touqd", { 0, 0, 3 },
       NULL, 0, true,
-      "../target/arm/tcg/vfp_helper.c:453" },
+      "../target/arm/tcg/vfp_helper.c:453",
+      NULL, 0 },
     { "vfp_touqs", { 0, 0, 3 },
       NULL, 0, true,
-      "../target/arm/tcg/vfp_helper.c:459" },
+      "../target/arm/tcg/vfp_helper.c:459",
+      NULL, 0 },
     { "vfp_uqtod", { 0, 0, 3 },
       NULL, 0, true,
-      "../target/arm/tcg/vfp_helper.c:453" },
+      "../target/arm/tcg/vfp_helper.c:453",
+      NULL, 0 },
     { "yield", { 0 },
       NULL, 0, true,
-      "../target/arm/tcg/op_helper.c:498" },
+      "../target/arm/tcg/op_helper.c:498",
+      NULL, 0 },
     { "lookup_tb_ptr", { 0 },
       dfu_lookup_tb_ptr_env, ARRAY_SIZE(dfu_lookup_tb_ptr_env), true,
-      "accel/tcg/cpu-exec.c HELPER(lookup_tb_ptr)" },
-    { NULL, { 0 }, NULL, 0, false, NULL }
+      "accel/tcg/cpu-exec.c HELPER(lookup_tb_ptr)",
+      NULL, 0 },
+    { NULL, { 0 }, NULL, 0, false, NULL, NULL, 0 }
 };

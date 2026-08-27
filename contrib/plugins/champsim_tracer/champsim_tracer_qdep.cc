@@ -615,6 +615,7 @@ const char *state_name(unsigned s)
     case QDEP_R_UNREPRESENTABLE:return "refused: a named input occupies no slot to set";
     case QDEP_R_EMU_MONITOR:    return "refused: names the reservation monitor's value half (emulation artefact, #177 / f46873a738)";
     case QDEP_R_REINDEX:        return "refused: QEMU's own source index does not fit (src slots or mask width)";
+    case QDEP_R_HELPER_UNSTATED:return "refused: a helper-performed access whose operand travels through no argument (CP1)";
     case QDEP_NO_BLOCK:         return "stated by QEMU but the wire's HAS_REG flag is clear: consumer already at the default";
     default:                    return "?";
     }
@@ -704,19 +705,37 @@ void qdep_note_insn(const struct qemu_plugin_tb *tb, size_t idx, QDepInsn *out)
         }
         if (store) {
             out->qemu_has_store = true;
-            rc = fold_prov(w.data(), out->store_regs, &out->n_store_regs,
-                           nullptr);
         } else {
             out->qemu_has_load = true;
-            rc = fold_prov(w.data(), out->load_regs, &out->n_load_regs,
-                           nullptr);
         }
+        /*
+         * CP1.  A helper-performed access whose address is not one of the
+         * helper's arguments hands over an EMPTY provenance, and folding it
+         * would publish "this address depends on nothing" for an access that
+         * genuinely reads registers -- the short mask this file exists never
+         * to write.  The DIRECTION above is still recorded, because it is
+         * stated and an admission gate needs it; only the mask is refused.
+         */
+        if (mo[i].addr_unstated) {
+            if (out->state == QDEP_NONE) {
+                out->state = QDEP_R_HELPER_UNSTATED;
+            }
+        }
+        rc = store
+            ? fold_prov(w.data(), out->store_regs, &out->n_store_regs, nullptr)
+            : fold_prov(w.data(), out->load_regs, &out->n_load_regs, nullptr);
         if (rc != QDEP_OK && out->state == QDEP_NONE) {
             out->state = rc;    /* first refusal wins; a later access
                                  * succeeding does not undo it */
         }
 
         if (!store) {
+            continue;
+        }
+        if (mo[i].data_unstated) {
+            if (out->data_state == QDEP_NONE) {
+                out->data_state = QDEP_R_HELPER_UNSTATED;
+            }
             continue;
         }
         if (qemu_plugin_insn_memop_data_prov(tb, idx, i, w.data(),

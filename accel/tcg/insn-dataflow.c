@@ -195,6 +195,28 @@ typedef struct DfHelperField {
 #define DF_HF_OPERAND   0
 #define DF_HF_XLAT      1
 
+/*
+ * CP1.  One class of guest memory access a helper performs ITSELF.
+ *
+ * "Class" and not "access": the row is keyed by (direction, address
+ * argument), because that is the pair the call site states and the count is
+ * frequently not statable at all.  helper_swr stores between one and four
+ * bytes depending on the address's alignment, so its row says WR through
+ * argument 2, one byte at a time, count unbounded -- and says the count is
+ * unbounded rather than writing down 4, which is a property of the source
+ * text and not of any execution.
+ */
+typedef struct DfHelperAccess {
+    uint8_t dir;                /* INSN_DF_RD, INSN_DF_WR, or both */
+    uint8_t addr_arg;           /* LOGICAL argument carrying the address */
+    uint8_t data_arg;           /* LOGICAL argument carrying a stored value */
+    uint8_t size;               /* bytes per access; 0 = not stated */
+    uint8_t count_unbounded;    /* how MANY is data-dependent */
+} DfHelperAccess;
+
+/* The address (or data) does not travel through an argument at all. */
+#define DF_HA_NO_ARG    0xff
+
 typedef struct DfHelperUsage {
     const char *name;
     /*
@@ -214,6 +236,13 @@ typedef struct DfHelperUsage {
      */
     bool env_bounded;
     const char *src;            /* where the row was read from */
+    /*
+     * The guest memory this helper reaches.  NULL/0 means the reader found
+     * no access in the body it closed -- which for a row that exists is a
+     * measurement, since a row is only written when the body closed.
+     */
+    const DfHelperAccess *acc;
+    uint8_t n_acc;
 } DfHelperUsage;
 
 
@@ -1041,12 +1070,15 @@ static int df_memop_apply(InsnDataflow *d, bool store, unsigned *cursor)
         return -1;
     }
     n = &df_memop[*cursor];
-    if (n->is_store != store || n->rec >= (int)d->n_memops) {
+    if (n->is_store != store || n->rec >= (int)d->n_memops ||
+        (n->rec >= 0 && d->memops[n->rec].by_helper)) {
         /*
          * Either the note and the op disagree about the direction, or the
          * note was already spent on a previous instruction -- both mean the
          * two streams are no longer in step, and the record this would fill
-         * would describe a different access.
+         * would describe a different access.  The third test asks the same
+         * question of CP1's records: a helper-stated access has no note, so
+         * a note whose slot now holds one has landed on the wrong record.
          */
         d->memops_unnoted = 1;
         return -1;
@@ -1298,6 +1330,87 @@ static void df_insn(InsnDataflow *d, TCGOp *first, TCGOp *end,
                     if (!(hn->flags & TCG_CALL_NO_READ_GLOBALS)) {
                         model = MAX(model, INSN_DF_HELPER_OPAQUE);
                         d->n_helper_unbounded += d->n_helper_unbounded < 255;
+                    }
+                }
+                /*
+                 * CP1 -- the guest memory the helper reaches ITSELF.
+                 *
+                 * There is no qemu_ld/qemu_st op to match these against;
+                 * that is the whole reason they are here.  So they are
+                 * appended to the access list at the CALL, which is where
+                 * they happen in emission order, and each carries how much
+                 * of itself the row could state.
+                 */
+                for (unsigned k = 0; row && k < row->n_acc; k++) {
+                    const DfHelperAccess *ha = &row->acc[k];
+                    InsnDataflowMemop *m;
+                    const TCGTemp *ats = NULL, *dts = NULL;
+
+                    if (d->n_memops >= INSN_DF_MAX_MEMOPS) {
+                        d->memops_overflow = 1;
+                        break;
+                    }
+                    if (ha->addr_arg != DF_HA_NO_ARG &&
+                        ha->addr_arg < hn->nargs) {
+                        ats = hn->arg[ha->addr_arg];
+                    }
+                    if (ha->data_arg != DF_HA_NO_ARG &&
+                        ha->data_arg < hn->nargs) {
+                        dts = hn->arg[ha->data_arg];
+                    }
+                    m = &d->memops[d->n_memops++];
+                    m->is_store = (ha->dir & INSN_DF_WR) != 0;
+                    m->size = ha->size;
+                    m->by_helper = 1;
+                    m->count_unbounded = ha->count_unbounded;
+                    d->memops_by_helper += d->memops_by_helper < 255;
+                    if (ha->count_unbounded) {
+                        d->memops_count_unbounded = 1;
+                    }
+                    if (ats) {
+                        df_prov_add_temps(m->addr_prov, ats, 1);
+                    } else {
+                        /*
+                         * Not "no dependency": the address never travelled
+                         * through an argument, so nothing here can name it.
+                         * Said, rather than published as an empty set.
+                         */
+                        m->addr_unstated = 1;
+                        d->memops_addr_unstated = 1;
+                    }
+                    if (m->is_store) {
+                        if (dts) {
+                            df_prov_add_temps(m->data_prov, dts, 1);
+                        } else {
+                            m->data_unstated = 1;
+                            d->memops_data_unstated = 1;
+                        }
+                    }
+                    /*
+                     * A helper access that both reads and writes is ONE
+                     * access in the row and two on the wire's terms.  The
+                     * read half is added beside it rather than folded into
+                     * the store, because a consumer separating load-to-use
+                     * from store-to-load needs them apart.
+                     */
+                    if ((ha->dir & (INSN_DF_RD | INSN_DF_WR)) ==
+                        (INSN_DF_RD | INSN_DF_WR)) {
+                        if (d->n_memops >= INSN_DF_MAX_MEMOPS) {
+                            d->memops_overflow = 1;
+                            break;
+                        }
+                        m = &d->memops[d->n_memops++];
+                        m->is_store = 0;
+                        m->size = ha->size;
+                        m->by_helper = 1;
+                        m->count_unbounded = ha->count_unbounded;
+                        d->memops_by_helper += d->memops_by_helper < 255;
+                        if (ats) {
+                            df_prov_add_temps(m->addr_prov, ats, 1);
+                        } else {
+                            m->addr_unstated = 1;
+                            d->memops_addr_unstated = 1;
+                        }
                     }
                 }
                 for (unsigned k = 0; k < hn->nargs; k++) {
@@ -1934,7 +2047,7 @@ void insn_dataflow_note_addr_alias(const void *alias_ts, const void *real_ts)
  * instruction that reaches one.
  */
 static const DfHelperUsage df_helper_usage[] = {
-    { NULL, { 0 }, NULL, 0, false, NULL }
+    { NULL, { 0 }, NULL, 0, false, NULL, NULL, 0 }
 };
 #endif
 

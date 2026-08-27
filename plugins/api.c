@@ -497,6 +497,10 @@ unsigned qemu_plugin_insn_memops(const struct qemu_plugin_tb *tb, size_t idx,
             .struct_size = sizeof(m),
             .size = d->memops[i].size,
             .is_store = d->memops[i].is_store,
+            .by_helper = d->memops[i].by_helper,
+            .count_unbounded = d->memops[i].count_unbounded,
+            .addr_unstated = d->memops[i].addr_unstated,
+            .data_unstated = d->memops[i].data_unstated,
         };
 
         if (want == 0 || want > sizeof(m)) {
@@ -558,6 +562,10 @@ bool qemu_plugin_insn_dataflow_status(const struct qemu_plugin_tb *tb,
     st.n_helper_unbounded = d->n_helper_unbounded;
     st.memops_truncated = d->memops_overflow;
     st.memops_unnoted = d->memops_unnoted;
+    st.memops_by_helper = d->memops_by_helper;
+    st.memops_count_unbounded = d->memops_count_unbounded;
+    st.memops_addr_unstated = d->memops_addr_unstated;
+    st.memops_data_unstated = d->memops_data_unstated;
 
     want = out->struct_size;
     if (want == 0 || want > sizeof(st)) {

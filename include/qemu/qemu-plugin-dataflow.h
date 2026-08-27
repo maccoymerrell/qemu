@@ -93,7 +93,7 @@
 
 #include "qemu/qemu-plugin.h"   /* for the plugin API export marker */
 
-#define QEMU_PLUGIN_DATAFLOW_VERSION 3
+#define QEMU_PLUGIN_DATAFLOW_VERSION 4
 
 /*
  * Returned by any set accessor whose instruction could not be extracted in
@@ -271,6 +271,37 @@ typedef struct qemu_plugin_dataflow_memop {
     uint32_t struct_size;       /* caller sets to sizeof(*this) */
     uint32_t size;              /* access width in bytes */
     uint32_t is_store;
+    /*
+     * The access is performed INSIDE a helper the instruction called, and is
+     * stated by that helper's written-down usage row rather than by a
+     * qemu_ld/qemu_st emitter -- because there is no such op to state it.
+     * aarch64's MOPS copies and MIPS's unaligned stores move guest memory
+     * with the op list naming no access at all, so without these records the
+     * access list is SHORT for the instruction that called them, and short
+     * is the error direction that costs correctness rather than accuracy.
+     */
+    uint32_t by_helper;
+    /*
+     * The helper performs one OR MORE accesses of this direction through
+     * this address and the number is data-dependent, so no number is given.
+     * @size is then the width of ONE access.  A consumer sizing an array by
+     * the access count must read this record as "at least one".
+     */
+    uint32_t count_unbounded;
+    /*
+     * The address is not one of the helper's arguments, so nothing at the
+     * call site names it and this access's addr provenance is EMPTY.  That
+     * emptiness is NOT evidence of absence: a consumer publishing an address
+     * dependency must refuse this access rather than read it as "depends on
+     * nothing".
+     */
+    uint32_t addr_unstated;
+    /*
+     * The same for a STORE's VALUE: it did not travel through one of the
+     * helper's arguments, so the data provenance is empty and means "not
+     * stated" rather than "produced by nothing".
+     */
+    uint32_t data_unstated;
 } qemu_plugin_dataflow_memop;
 
 /*
@@ -392,6 +423,22 @@ typedef struct qemu_plugin_dataflow_status {
     uint32_t n_helper_unbounded;
     uint8_t  memops_truncated;  /* more accesses than could be recorded */
     uint8_t  memops_unnoted;    /* an access no emitter note accounted for */
+    /*
+     * Accesses on this instruction that a called HELPER performs itself,
+     * stated by its usage row because no op names them.  A count, so a
+     * consumer can say how much of its access list came from a written-down
+     * row rather than from an op.
+     */
+    uint8_t  memops_by_helper;
+    /*
+     * At least one of those accesses has an unstated count, or an unstated
+     * address.  Kept apart because they forbid different things: an unstated
+     * COUNT still lets a consumer say the direction happened, while an
+     * unstated ADDRESS forbids publishing an address dependency for it.
+     */
+    uint8_t  memops_count_unbounded;
+    uint8_t  memops_addr_unstated;
+    uint8_t  memops_data_unstated;
     uint8_t  reserved[2];
 } qemu_plugin_dataflow_status;
 

@@ -102,6 +102,13 @@ def derive(isa, helpers, ppdir, verbose=False):
                       argdir=argdir,
                       env={k: v for k, v in sorted(a.env_fields.items())},
                       env_where=a.where,
+                      # CP1: the GUEST MEMORY the helper reaches itself, which
+                      # no qemu_ld/st op names because there is none -- the
+                      # access happens inside the call.
+                      mem=sorted(a.mem_acc.values(),
+                                 key=lambda m: (m['dir'],
+                                                -1 if m['addr'] is None
+                                                else m['addr'])),
                       has_env='env' in roots.values())
     return out, failed
 

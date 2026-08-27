@@ -230,6 +230,24 @@ def emit(isa, derived, extra_rows, offsets, out, field_guard=None,
         for n, g, fl in sorted(guarded):
             w(' *   %-22s %-26s %s\n' % (n, g, ','.join(fl)))
         w(' *\n')
+    memrows = [(n, v['mem']) for n, v in rows if v.get('mem')]
+    if memrows:
+        w(' * CP1 -- helpers that perform GUEST MEMORY ACCESSES themselves.\n'
+          ' * No qemu_ld/qemu_st op names these: the access happens inside\n'
+          ' * the call, so without the row below QEMU\'s access list is SHORT\n'
+          ' * for the instruction that called the helper.  Direction and the\n'
+          ' * ADDRESS ARGUMENT are read off the call site; a count is NOT\n'
+          ' * invented when the helper\'s access pattern is data-dependent.\n')
+        for n, ms in sorted(memrows):
+            for m in ms:
+                w(' *   %-20s %-5s addr=%-4s data=%-4s %s\n'
+                  % (n, {1: 'read', 2: 'write', 3: 'rmw'}[m['dir']],
+                     'arg%d' % m['addr'] if m['addr'] is not None
+                     else 'UNSTATED',
+                     'arg%d' % m['data'] if m['data'] is not None
+                     else '-',
+                     'count unbounded' if m['unbounded'] else 'one access'))
+        w(' *\n')
     w(' * Rows refused, and therefore still OVER-APPROXIMATED at run time:\n')
     if not refused:
         w(' *   (none)\n')
@@ -266,6 +284,25 @@ def emit(isa, derived, extra_rows, offsets, out, field_guard=None,
         w('};\n')
         if v.get('_guard'):
             w('#endif\n')
+    for name, v in rows:
+        if not v.get('mem'):
+            continue
+        if v.get('_guard'):
+            w('#if %s\n' % v['_guard'])
+        w('static const DfHelperAccess dfu_%s_acc[] = {\n' % name)
+        for m in v['mem']:
+            a = m['addr']
+            d = m['data']
+            w('    { %s, %s, %s, %d, %d },'
+              '   /* %s, %d site(s) */\n'
+              % (DIRNAME[m['dir']],
+                 'DF_HA_NO_ARG' if a is None else str(a),
+                 'DF_HA_NO_ARG' if d is None else str(d),
+                 m['size'], 1 if m['unbounded'] else 0,
+                 m['where'], m['n']))
+        w('};\n')
+        if v.get('_guard'):
+            w('#endif\n')
     w('\nstatic const DfHelperUsage df_helper_usage[] = {\n')
     for name, v in rows:
         if v.get('_guard'):
@@ -283,10 +320,14 @@ def emit(isa, derived, extra_rows, offsets, out, field_guard=None,
               % (name, name))
         else:
             w('      NULL, 0, true,\n')
-        w('      "%s" },\n' % v.get('defined_at', '').replace('"', ''))
+        w('      "%s",\n' % v.get('defined_at', '').replace('"', ''))
+        if v.get('mem'):
+            w('      dfu_%s_acc, ARRAY_SIZE(dfu_%s_acc) },\n' % (name, name))
+        else:
+            w('      NULL, 0 },\n')
         if v.get('_guard'):
             w('#endif\n')
-    w('    { NULL, { 0 }, NULL, 0, false, NULL }\n};\n')
+    w('    { NULL, { 0 }, NULL, 0, false, NULL, NULL, 0 }\n};\n')
     return len(rows), refused, guarded
 
 

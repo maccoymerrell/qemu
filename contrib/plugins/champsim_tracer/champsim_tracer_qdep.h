@@ -159,6 +159,19 @@ enum QDepState : uint8_t {
      */
     QDEP_R_REINDEX,
     /*
+     * CP1.  QEMU stated that a called helper performs this access -- aarch64
+     * `cpyfp` copies guest memory, mipsel `swr` stores to it -- but the
+     * address (or, for the data family, the stored value) does NOT travel
+     * through one of the helper's arguments, so nothing at the call site
+     * names it.  The provenance QEMU hands over is EMPTY, and an empty set
+     * here means "not stated", never "depends on nothing".
+     *
+     * Counted apart from the other refusals because it is the one that says
+     * the DIRECTION is known and only the operand is not: an admission gate
+     * may act on the direction, while no mask may be published.
+     */
+    QDEP_R_HELPER_UNSTATED,
+    /*
      * Data family only: QEMU stated the datum in full, but the wire's
      * HAS_REG flag is clear for this instruction, so there is no field to
      * write it into.  NOT a refusal -- the consumer is at the same default
